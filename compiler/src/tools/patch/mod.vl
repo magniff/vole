@@ -32,10 +32,11 @@ use crate::base::{
     BUFS, FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, streq,
 };
+use crate::cli::events::{EV_FLAG, EV_MISSING, EV_OPTION, EV_WORD, events, flag, option};
 use crate::front::modules::file_of_pos;
 use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
-use crate::tools::edit::cli::{ambiguous, source_only, take_edit_option};
+use crate::tools::edit::cli::{ambiguous, edit_opts, source_only, take_edit_event};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
 use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted, std_rerun};
 use crate::tools::proc::{buf_cstr, read_file_if, read_stdin};
@@ -125,7 +126,7 @@ fn own_targets(first: i64) -> bool {
 
 // `edit patch ...`, and `edit insert --in ...`: the exit status (the
 // diagnostics are written by run_edit).
-pub fn run_patch(argc: i64, argv: **u8) -> i64 {
+pub fn run_patch(argc: i64, argv: **u8, gpa: Gpa) -> i64 {
     unsafe {
         let insert = streq(argv[2], c"insert");
         WHAT = if insert { c"insert --in" } else { c"patch" };
@@ -133,38 +134,51 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
         var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var anchor = 0 as *u8;
         var after = false;
-        var i = 3;
-        while i < argc {
-            let a = argv[i];
-            let valued = streq(a, c"--nth") || if insert {
-                streq(a, c"--in") || streq(a, c"--after") || streq(a, c"--before")
+        // (0.25: on std::cli, cli/events.vl)
+        var opts = edit_opts(gpa);
+        opts.push(option("nth", "N", "the N-th occurrence of OLD (insert: of ANCHOR)"));
+        if insert {
+            opts.push(option("in", "NAME", "the item to insert in"));
+            opts.push(option("after", "ANCHOR", "after the line ANCHOR"));
+            opts.push(option("before", "ANCHOR", "before the line ANCHOR"));
+        } else {
+            opts.push(option("old", "TEXT", "the text to change (pairs repeat)"));
+            opts.push(option("new", "TEXT", "its new text"));
+            opts.push(option("pairs", "FILE", "the pairs from FILE (or stdin)"));
+            opts.push(option("in", "NAME", "the pairs after it are NAME's"));
+        }
+        opts.push(flag("loose", "OLD with other indentation"));
+        opts.push(flag("all", "every occurrence of OLD"));
+        let line = events(if insert { "edit insert" } else { "edit patch" }, opts, "name", " -C ",
+            argc, argv, 3, gpa);
+        for e in line.iter() {
+            var ev = e;
+            let a = ev.value;
+            let valued = ev.name == "nth" || ev.name == "in" || ev.name == "after"
+                || ev.name == "before" || ev.name == "old" || ev.name == "new"
+                || ev.name == "pairs";
+            if ev.kind == EV_MISSING && valued {
+                let d = diag(c"error", c"edit.usage");
+                buf_str(d, a);
+                buf_str(d, c" needs a value\n");
+                return usage_try();
             }
-                else {
-                    streq(a, c"--old") || streq(a, c"--new") || streq(a, c"--pairs")
-                        || streq(a, c"--in")
-                };
-            if valued {
-                if i + 1 >= argc {
-                    let d = diag(c"error", c"edit.usage");
-                    buf_str(d, a);
-                    buf_str(d, c" needs a value\n");
-                    return usage_try();
-                }
-                let v = argv[i + 1];
-                if streq(a, c"--old") {
+            if ev.kind == EV_OPTION && valued {
+                let v = ev.value;
+                if ev.name == "old" {
                     if OLDS.count != NEWS.count {
                         return usage(c"each --old needs its --new");
                     }
                     OLDS.push(text_buffer(c_slice(v)));
                     PAIR_TARGET.push(CUR_TARGET);
-                } else if streq(a, c"--new") {
+                } else if ev.name == "new" {
                     if NEWS.count + 1 != OLDS.count {
                         return usage(c"each --new follows its --old");
                     }
                     NEWS.push(text_buffer(c_slice(v)));
-                } else if streq(a, c"--pairs") {
+                } else if ev.name == "pairs" {
                     PAIRS_FILE = v;
-                } else if streq(a, c"--nth") {
+                } else if ev.name == "nth" {
                     var n = 0;
                     var j = 0;
                     while v[j] >= '0' && v[j] <= '9' && n < 1000000 {
@@ -178,46 +192,44 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
                         return usage(c"one of --nth N and --all");
                     }
                     NTH = n;
-                } else if streq(a, c"--in") && !insert {
+                } else if ev.name == "in" && !insert {
                     // (0.15: the pairs after it are NAME's)
                     if OLDS.count != NEWS.count {
                         return usage(c"each --old needs its --new");
                     }
                     CUR_TARGET = target_index(c_slice(v));
-                } else if streq(a, c"--in") {
+                } else if ev.name == "in" {
                     names.push(v as i64);
                 } else {
                     if anchor != 0 as *u8 {
                         return usage(c"one --after or --before ANCHOR");
                     }
                     anchor = v;
-                    after = streq(a, c"--after");
+                    after = ev.name == "after";
                 }
-                i += 2;
                 continue;
             }
-            if streq(a, c"--loose") {
+            if ev.kind == EV_FLAG && ev.name == "loose" {
                 LOOSE = true;
-            } else if streq(a, c"--all") {
+            } else if ev.kind == EV_FLAG && ev.name == "all" {
                 if NTH != 0 {
                     return usage(c"one of --nth N and --all");
                 }
                 NTH = -1;
-            } else if take_edit_option(argc, argv, &i, &root) {
-            } else if a[0] == '-' && a[1] == '-' {
+            } else if take_edit_event(&ev, &root) {
+            } else if ev.kind != EV_WORD {
                 let d = diag(c"error", c"edit.usage");
                 buf_str(d, c"unknown option '");
-                buf_str(d, a);
+                buf_str(d, ev.value);
                 buf_str(d, c"'\n");
                 return usage_try();
-            } else if insert && root == 0 as *u8 && crate::base::is_source_path(a) {
-                root = a;
+            } else if insert && root == 0 as *u8 && crate::base::is_source_path(ev.value) {
+                root = ev.value;
             } else if insert {
                 return usage(c"insert --in NAME --after|--before ANCHOR < TEXT");
             } else {
-                names.push(a as i64);
+                names.push(ev.value as i64);
             }
-            i += 1;
         }
         if !insert && names.count == 2 && root == 0 as *u8
             && crate::base::is_source_path(names.data[1] as *u8) {
