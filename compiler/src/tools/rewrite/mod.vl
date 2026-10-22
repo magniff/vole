@@ -33,14 +33,14 @@ mod after;
 
 use crate::base::{
     BUFS, FILES, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, streq,
+    buf_write_fd,
 };
 use crate::front::ast::{KEEP_PARSED, NODE_COUNT, NodeKind, PARSED_COUNT};
 use crate::front::modules::file_of_pos;
 use crate::front::types::buf_type;
 use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
-use crate::tools::edit::cli::take_edit_option;
+use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, diags, program_errors, put_cword, put_root, put_word, try_end,
@@ -59,18 +59,21 @@ use pattern::{
 };
 
 use after::{drop_unused_imports, note_site_types, where_hints};
+use crate::cli::events::{
+    EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, events_twos, flag, option,
+};
 use crate::tools::query::command_line::load_program;
 use regex::re_valid;
 use subst::{S_LOCAL, S_PAT, S_REP, choose_fresh, find_substs, note_subst_holes, put_site};
 
 // ---- The command ----
 
-pub fn run_rewrite(argc: i64, argv: **u8) -> i64 {
+pub fn run_rewrite(argc: i64, argv: **u8, gpa: Gpa) -> i64 {
     // (0.21: --text, a text edit of the tree's files, textual/rewrite)
     if crate::tools::textual::rewrite::has_word(argc, argv, c"--text") {
         return crate::tools::textual::rewrite::run_text_rewrite(argc, argv);
     }
-    let status = run_rewrite_inner(argc, argv);
+    let status = run_rewrite_inner(argc, argv, gpa);
     write_diags();
     status
 }
@@ -221,7 +224,7 @@ fn next_is_hole(s: [u8], from: i64) -> bool {
     i < s.len && s[i] == '$'
 }
 
-fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
+fn run_rewrite_inner(argc: i64, argv: **u8, gpa: Gpa) -> i64 {
     unsafe {
         set_command(argc, argv);
         PROG = argv[0];
@@ -233,48 +236,56 @@ fn run_rewrite_inner(argc: i64, argv: **u8) -> i64 {
         var substs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var list = false;
         var ins = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var i = 2;
-        while i < argc {
-            let a = argv[i];
-            if streq(a, c"--where") && i + 1 < argc {
-                wheres.push(argv[i + 1] as i64);
-                i += 2;
+        // (0.25: on std::cli, cli/events.vl; --subst's two values: --2nd)
+        var table = edit_opts(gpa);
+        table.push(option("where", "'$v: TYPE'", "a hole's type or name"));
+        table.push(option("subst", "PATTERN",
+            "--subst PATTERN REPLACEMENT: inside the code the holes keep"));
+        table.push(option("2nd", "REPLACEMENT", "--subst's REPLACEMENT"));
+        table.push(flag("list", "a line per site"));
+        table.push(option("in", "FILE|MODULE|ITEM", "only there (repeated: the scopes add up)"));
+        let line = events_twos("rewrite", table, "word", " -C ", argc, argv, 2, " --subst ", gpa);
+        var k = 0;
+        while k < line.len() {
+            var ev = line[k].clone();
+            k += 1;
+            let a = ev.value;
+            if ev.kind == EV_OPTION && ev.name == "where" {
+                wheres.push(a as i64);
                 continue;
             }
-            if streq(a, c"--subst") {
-                if i + 2 >= argc {
+            if ev.name == "subst" && (ev.kind == EV_MISSING || ev.kind == EV_OPTION) {
+                if ev.kind == EV_MISSING || k >= line.len() || line[k].name != "2nd" {
                     return usage(c"--subst takes a PATTERN and its REPLACEMENT");
                 }
-                substs.push(argv[i + 1] as i64);
-                substs.push(argv[i + 2] as i64);
-                i += 3;
+                substs.push(a as i64);
+                substs.push(line[k].value as i64);
+                k += 1;
                 continue;
             }
-            if streq(a, c"--list") {
+            if ev.kind == EV_FLAG && ev.name == "list" {
                 list = true;
-                i += 1;
                 continue;
             }
-            if streq(a, c"--in") && i + 1 < argc {
+            if ev.kind == EV_OPTION && ev.name == "in" {
                 // (0.17: repeated, the scopes add up)
-                OPT_IN = argv[i + 1];
-                ins.push(argv[i + 1] as i64);
-                i += 2;
+                OPT_IN = a;
+                ins.push(a as i64);
                 continue;
             }
-            if take_edit_option(argc, argv, &i, &root) {
-                i += 1;
+            if ev.kind == EV_MISSING && (ev.name == "where" || ev.name == "in") {
+                ev.kind = EV_UNKNOWN;
+            } else if take_edit_event(&ev, &root) {
                 continue;
             }
-            if a[0] == '-' && a[1] == '-' {
+            if ev.kind != EV_WORD {
                 let d = diag(c"error", c"rewrite.usage");
                 buf_str(d, c"unknown option '");
-                buf_str(d, a);
+                buf_str(d, ev.value);
                 buf_str(d, c"' (--where, --subst, --list, --in, --dry-run, --no-check, --root)\n");
                 return 2;
             }
-            words.push(a as i64);
-            i += 1;
+            words.push(ev.value as i64);
         }
         if words.count >= 2 && root == 0 as *u8
             && crate::base::is_source_path(words.data[words.count - 1] as *u8)

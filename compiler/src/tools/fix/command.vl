@@ -4,9 +4,12 @@
 
 use crate::base::{
     BUFS, IntVec, OVERLAY, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, intern, streq,
+    buf_write_fd, intern,
 };
 use crate::base::diag::{FIX_AT_FILE, FIX_AT_LINE, SUGGESTED};
+use crate::cli::events::{
+    EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, events_in, flag, option,
+};
 use crate::front::ambient::AMBIENT_GPA;
 use crate::front::ast::{KEEP_PARSED, NODES};
 use crate::front::generics::{TPL_NONE, template_of_key};
@@ -21,7 +24,7 @@ use crate::tools::edit::apply::{
     CHECK_STRICT, LEFT_OK, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit,
     set_command, write_round,
 };
-use crate::tools::edit::cli::take_edit_option;
+use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::fix::{missing_use_edits, pub_edits, suggested_edits, unused_import_edits};
 use crate::tools::fixconv::{
     CC_DEREF, CC_INOUT_LOCAL, CC_MARKER, CC_PARAM_INOUT, CC_PARAM_LET, CC_PARAM_SINK, CC_RECEIVER,
@@ -308,21 +311,21 @@ fn put_count(out: i64, n: i64, one: *u8, many: *u8) {
     }
 }
 
-pub fn run_fix(argc: i64, argv: **u8) -> i64 {
-    let status = run_fix_inner(argc, argv, 0);
+pub fn run_fix(argc: i64, argv: **u8, gpa: Gpa) -> i64 {
+    let status = run_fix_inner(argc, argv, 0, gpa);
     write_diags();
     status
 }
 
 // `volec --fix-imports ROOT`, `--fix-unsafe ROOT` (`only`: F_IMPORTS,
 // F_UNSAFE): fix, quiet when there is nothing to do.
-pub fn run_fix_alias(argc: i64, argv: **u8, only: i64) -> i64 {
-    let status = run_fix_inner(argc, argv, only);
+pub fn run_fix_alias(argc: i64, argv: **u8, only: i64, gpa: Gpa) -> i64 {
+    let status = run_fix_inner(argc, argv, only, gpa);
     write_diags();
     status
 }
 
-fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
+fn run_fix_inner(argc: i64, argv: **u8, alias: i64, gpa: Gpa) -> i64 {
     unsafe {
         set_command(argc, argv);
         PROG = argv[0];
@@ -334,35 +337,49 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         var suggested = false;
         var at = 0 as *u8;
         var root = 0 as *u8;
-        var i = if alias != 0 { 1 } else { 2 };
-        while i < argc {
-            let a = argv[i];
-            if alias != 0 && (streq(a, c"--fix-imports") || streq(a, c"--fix-unsafe")) {
-                i += 1;
-                continue;
-            }
-            if streq(a, c"--round") {
+        // (0.25: on std::cli, cli/events.vl)
+        var table = edit_opts(gpa);
+        table.push(flag("round", "(the hook's round)"));
+        table.push(flag("suggested", "the errors' exact fixes"));
+        table.push(flag("values", "parameters to references (0.17)"));
+        table.push(flag("list-left", "each place a migration leaves"));
+        table.push(flag("tidy-edited", "the imports of the files edited, tidied"));
+        table.push(flag("fix-imports", "(0.8's spelling of --only imports)"));
+        table.push(flag("fix-unsafe", "(0.9's spelling of --only unsafe)"));
+        table.push(option("at", "FILE:LINE", "--suggested: one line's errors"));
+        table.push(option("in", "FILE|MODULE", "only there"));
+        table.push(option("use", "PATH::NAME", "the module to import NAME from"));
+        table.push(option("only", "KINDS", "imports,unused,pub,unsafe,suggested,..."));
+        table.push(option("overlay", "PATH", "--overlay PATH COPY: PATH read from COPY"));
+        table.push(option("overlay-copy", "COPY", "--overlay's COPY"));
+        var path = 0 as *u8;
+        let line = events_in("fix", table, "file", " -C ", argc, argv,
+            if alias != 0 { 1 } else { 2 }, true, gpa);
+        for e in line.iter() {
+            var ev = e;
+            let a = ev.value;
+            let flag_is = ev.kind == EV_FLAG;
+            let opt_is = ev.kind == EV_OPTION;
+            if flag_is && (ev.name == "fix-imports" || ev.name == "fix-unsafe") {
+                if alias != 0 {
+                    continue;
+                }
+            } else if flag_is && ev.name == "round" {
                 round = true;
-                i += 1;
                 continue;
-            }
-            if streq(a, c"--suggested") {
+            } else if flag_is && ev.name == "suggested" {
                 suggested = true;
-                i += 1;
                 continue;
-            }
-            if streq(a, c"--values") {
+            } else if flag_is && ev.name == "values" {
                 only = if only_arg == 0 as *u8 { F_VALUES } else { only | F_VALUES };
                 only_arg = c"values";
-                i += 1;
                 continue;
-            }
-            if streq(a, c"--at") && i + 1 < argc {
-                at = argv[i + 1];
+            } else if opt_is && ev.name == "at" {
+                at = a;
                 let s = c_slice(at);
-                var line = 0;
-                let n = file_line(s, &line);
-                if n <= 0 || line <= 0 {
+                var line_no = 0;
+                let n = file_line(s, &line_no);
+                if n <= 0 || line_no <= 0 {
                     let d = diag(c"error", c"fix.usage");
                     buf_str(d, c"--at takes FILE:LINE, the line of an error\n");
                     return 2;
@@ -371,43 +388,38 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                 buf_bytes(f, s[0..n]);
                 buf_byte(f, 0);
                 FIX_AT_FILE = BUFS[f].data;
-                FIX_AT_LINE = line;
-                i += 2;
+                FIX_AT_LINE = line_no;
                 continue;
-            }
-            if streq(a, c"--list-left") {
+            } else if flag_is && ev.name == "list-left" {
                 CONV_LIST_LEFT = true;
-                i += 1;
                 continue;
-            }
-            if streq(a, c"--tidy-edited") {
+            } else if flag_is && ev.name == "tidy-edited" {
                 TIDY_EDITED = true;
-                i += 1;
                 continue;
-            }
-            if streq(a, c"--in") && i + 1 < argc {
-                OPT_IN = argv[i + 1];
-                i += 2;
+            } else if opt_is && ev.name == "in" {
+                OPT_IN = a;
                 continue;
-            }
-            if streq(a, c"--use") && i + 1 < argc {
-                if !take_use(c_slice(argv[i + 1])) {
+            } else if opt_is && ev.name == "use" {
+                if !take_use(c_slice(a)) {
                     let d = diag(c"error", c"fix.usage");
                     buf_str(d, c"--use takes the path of an item, 'crate::a::b::name'\n");
                     return 2;
                 }
-                i += 2;
                 continue;
-            }
-            if streq(a, c"--overlay") && i + 2 < argc {
-                OVERLAY.push(argv[i + 1] as i64);
-                OVERLAY.push(argv[i + 2] as i64);
-                i += 3;
+            } else if opt_is && ev.name == "overlay" {
+                path = a;
+                if ev.at + 1 < argc {
+                    continue;
+                }
+                ev.kind = EV_UNKNOWN;
+                ev.value = c"--overlay";
+            } else if opt_is && ev.name == "overlay-copy" {
+                OVERLAY.push(path as i64);
+                OVERLAY.push(a as i64);
                 continue;
-            }
-            if streq(a, c"--only") && i + 1 < argc {
+            } else if opt_is && ev.name == "only" {
                 only = 0;
-                let v = argv[i + 1];
+                let v = a;
                 only_arg = v;
                 var k = 0;
                 // (a comma-separated list)
@@ -439,17 +451,17 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                     only |= bit;
                     k = if v[e] == ',' { e + 1 } else { e };
                 }
-                i += 2;
+                continue;
+            } else if ev.kind == EV_MISSING && (ev.name == "at" || ev.name == "in"
+                || ev.name == "use" || ev.name == "only" || ev.name == "overlay") {
+                ev.kind = EV_UNKNOWN;
+            } else if take_edit_event(&ev, &root) {
                 continue;
             }
-            if take_edit_option(argc, argv, &i, &root) {
-                i += 1;
-                continue;
-            }
-            if a[0] == '-' {
+            if ev.kind != EV_WORD || a[0] == '-' {
                 let d = diag(c"error", c"fix.usage");
                 buf_str(d, c"unknown option '");
-                buf_str(d, a);
+                buf_str(d, ev.value);
                 buf_str(d, c"'\n");
                 let out = try_begin(c"fix", c_slice(c""), false);
                 try_end(out);
@@ -463,7 +475,6 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                 return 2;
             }
             root = a;
-            i += 1;
         }
         if suggested {
             only = if only_arg == 0 as *u8 { F_SUGGESTS } else { only | F_SUGGESTS };
