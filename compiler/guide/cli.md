@@ -73,8 +73,14 @@ usage: tool [options] [file]... [command]
   arguments, for the order of different options (`-l m x.o -l z`). A
   name that is no Arg of that command panics.
 - An Arg: `.short('x')`, `.long("s")` (its name by default),
-  `.help(..)`, `.value_name("FILE")`, `.default(..)`, `.required()`,
-  `.multiple()` (a positional taking the rest). Options may repeat.
+  `.help(..)`, `.value_name("FILE")` (a positional's too, 0.25),
+  `.default(..)`, `.required()`, `.multiple()` (a positional taking the
+  rest), `.choices("fast|slow")` (0.25: another value is an error,
+  `try: --mode <fast|slow>`). Options may repeat.
+- (0.25) `Command::new_in(name, a)` takes any allocator, an arena too
+  (`arena_scope(gpa, |a| ..)`: nothing on the Gpa). A program's own
+  check fails in std::cli's form: `cmd.exit(CliError::custom("-b and -t
+  together", "-b"))`; `e.letter()`: the unknown letter of a cluster.
 
 ## Help and errors
 

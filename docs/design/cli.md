@@ -61,6 +61,15 @@ m.indices_of(n) -> [i64]                              (0.25) each value's (flag'
 
 ## 0.25
 
+`Command<A: Allocator = Gpa>`: `Command::new_in(name, a)` takes any
+allocator (an arena: a program under --check-alloc keeps its blocks'
+numbers); `exit` builds its text on it. `Arg::choices("fast|slow")`:
+another value is InvalidValue, whose try: line names them (`--mode
+<fast|slow>`), as the help does. `CliError::custom(message, try)`
+(kind Custom): a program's own check, printed as std::cli's errors are.
+`e.letter()`: the unknown letter of a cluster (`x` of `-vx`). A
+positional's `value_name` is its name in the usage and errors.
+
 `m.indices_of(name)`, clap's: the index among the arguments (the
 program's name is 0) of each value, or of each time a flag was given; a
 default has none. volec's own command line (compiler/src/cli/, on
@@ -75,6 +84,11 @@ value is optional (`--stats`, `--stats=functions`), an option with two
 values (`--overlay PATH COPY`), values and positionals starting with
 `-` (clap's `allow_hyphen_values`: `query grep '-> bool'`), and parsing
 on after an error (the tools report the NAMEs given with the error).
+
+Still to do (the examples' migration, cli-ex, found these too):
+mutually exclusive arguments (`conflicts_with`; sha256sum's -b and -t,
+the last winning, is `indices_of`), a required subcommand, aliases, env
+defaults, `--no-flag`, the terminal's width.
 
 ## Not in 0.24
 

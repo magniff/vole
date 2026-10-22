@@ -1,7 +1,7 @@
 // std::cli (0.24, docs/design/cli.md, guide cli): a command-line parser,
 // clap's builder without derive (the overview: below the first banner).
 
-use std::{Allocator, Buf, Display, Fmt, Gpa, Iterator, Option, Result, Vec, arena_scope};
+use std::{Allocator, Buf, Display, Fmt, Gpa, Iterator, Option, Result, Vec};
 use std::string::{FromStr, str};
 
 // ---- Arguments and commands (0.24) ----
@@ -55,6 +55,8 @@ pub struct Arg {
     has_default: bool,
     required: bool,
     multiple: bool,
+    // (0.25) the values it takes, `fast|slow` ("": any)
+    choices: str,
     cmd: i64,
 }
 
@@ -66,7 +68,8 @@ impl Arg {
         }
         Arg {
             name: name, kind: kind, short: 0, long: long, help: "", value_name: "",
-            default: "", has_default: false, required: false, multiple: false, cmd: 0,
+            default: "", has_default: false, required: false, multiple: false, choices: "",
+            cmd: 0,
         }
     }
 
@@ -128,6 +131,26 @@ impl Arg {
         self.multiple = true;
         self
     }
+
+    // (0.25) The values it takes, `"fast|slow"`: another is an InvalidValue
+    // error (`try: --mode <fast|slow>`); the help shows them.
+    pub fn choices(sink self, s: str) -> Arg {
+        self.choices = s;
+        self
+    }
+}
+
+// Whether v is one of choices (`fast|slow`; "": any).
+fn chosen(v: str, choices: str) -> bool {
+    if choices.len() == 0 {
+        return true;
+    }
+    for c in choices.split('|') {
+        if c == v {
+            return true;
+        }
+    }
+    false
 }
 
 // A command of the tree: its subcommands are those whose parent it is.
@@ -141,41 +164,43 @@ struct Cmd {
 // A program's command line: its name, arguments and subcommands. The
 // tree is kept flat, every command in `cmds` (the first is this one) and
 // every argument in `args` with its command's index.
-pub struct Command {
-    cmds: Vec<Cmd>,
-    args: Vec<Arg>,
+pub struct Command<CA: Allocator = Gpa> {
+    cmds: Vec<Cmd, CA>,
+    args: Vec<Arg, CA>,
     width: i64,
-    gpa: Gpa,
+    // (0.25: any allocator, an arena too; before, the Gpa)
+    alloc: CA,
 }
 
-impl Command {
-    // A command named name, its definition on gpa.
-    pub fn new_in(name: str, gpa: Gpa) -> Command {
-        var cmds: Vec<Cmd> = Vec::new_in(gpa);
+impl<CA: Allocator> Command<CA> {
+    // A command named name, its definition on allocator a (the Gpa, or an
+    // arena: 0.25).
+    pub fn new_in(name: str, a: CA) -> Command<CA> {
+        var cmds: Vec<Cmd, CA> = Vec::new_in(a);
         cmds.push(Cmd { name: name, about: "", version: "", parent: -1 });
-        Command { cmds: cmds, args: Vec::new_in(gpa), width: 80, gpa: gpa }
+        Command { cmds: cmds, args: Vec::new_in(a), width: 80, alloc: a }
     }
 
     // The help's line under the name.
-    pub fn about(sink self, s: str) -> Command {
+    pub fn about(sink self, s: str) -> Command<CA> {
         self.cmds[0].about = s;
         self
     }
 
     // Its version: `--version` (and `-V`) print `NAME VERSION`.
-    pub fn version(sink self, s: str) -> Command {
+    pub fn version(sink self, s: str) -> Command<CA> {
         self.cmds[0].version = s;
         self
     }
 
     // The help's width in columns (80).
-    pub fn width(sink self, n: i64) -> Command {
+    pub fn width(sink self, n: i64) -> Command<CA> {
         self.width = n;
         self
     }
 
     // Adds an argument.
-    pub fn arg(sink self, a: Arg) -> Command {
+    pub fn arg(sink self, a: Arg) -> Command<CA> {
         var x = a;
         x.cmd = 0;
         self.args.push(x);
@@ -183,7 +208,7 @@ impl Command {
     }
 
     // Adds a subcommand: `prog NAME ...`, m.subcommand().
-    pub fn subcommand(sink self, sub: sink Command) -> Command {
+    pub fn subcommand(sink self, sub: sink Command<CA>) -> Command<CA> {
         let base = self.cmds.len();
         for i in 0..sub.cmds.len() {
             var c = sub.cmds[i];
@@ -206,6 +231,11 @@ impl Command {
             }
         }
         -1
+    }
+
+    // The command of Matches level `level`.
+    fn cmds_of<A: Allocator>(self, level: i64, m: Matches<A>) -> i64 {
+        m.cmds[level]
     }
 
     fn has_subs(self, c: i64) -> bool {
@@ -233,6 +263,8 @@ pub enum CliErrorKind {
     FlagValue,
     MissingRequired,
     InvalidValue,
+    // (0.25) a program's own: CliError::custom
+    Custom,
 }
 
 // An error of parse (or Matches::get_as): Display gives its two lines,
@@ -267,6 +299,20 @@ impl CliError {
         e
     }
 
+    // (0.25) A program's own error, in std::cli's form: `error: MESSAGE`,
+    // `try: TRY` (none when ""), then the usage line (cmd.exit(e), exit
+    // code 2): `CliError::custom("-b and -t together", "-b FILE")`.
+    pub fn custom(message: str, try_line: str) -> CliError {
+        var e = CliError::new(CliErrorKind::Custom, 0, message);
+        e.hint = try_line;
+        e
+    }
+
+    // (0.25) The unknown letter of a cluster (`x` of `-vx`), else 0.
+    pub fn letter(self) -> u8 {
+        self.short
+    }
+
     // 0 for --help and --version, else 2 (a usage error, as clap's).
     pub fn exit_code(self) -> i32 {
         match self.kind {
@@ -288,7 +334,8 @@ impl Display for Spell {
         let a = self.a;
         if a.kind == POSITIONAL {
             f.byte('<');
-            f.str(a.name);
+            // (0.25: its value_name, when it has one)
+            f.str(if a.value_name.len() > 0 { a.value_name } else { a.name });
             f.byte('>');
             if a.multiple {
                 f.str("...");
@@ -319,6 +366,8 @@ impl Display for ValueName {
         f.byte('<');
         if self.a.value_name.len() > 0 {
             f.str(self.a.value_name);
+        } else if self.a.choices.len() > 0 {
+            f.str(self.a.choices);
         } else {
             for c in self.a.name.bytes() {
                 f.byte(if c >= 'a' && c <= 'z' { c - 32 } else if c == '-' { '_' } else { c });
@@ -391,6 +440,14 @@ impl Display for CliError {
                 f.str("'\ntry: ");
                 f.display(sp);
             }
+            CliErrorKind::Custom => {
+                f.str("error: ");
+                f.str(self.text);
+                if self.hint.len() > 0 {
+                    f.str("\ntry: ");
+                    f.str(self.hint);
+                }
+            }
             CliErrorKind::InvalidValue => {
                 f.str("error: invalid value '");
                 f.str(self.text);
@@ -446,7 +503,7 @@ fn near(d: i64, word: [u8]) -> bool {
     d <= most
 }
 
-impl Command {
+impl<CA: Allocator> Command<CA> {
     // The long option of c nearest to word: its name, or "".
     fn near_long(self, c: i64, word: str) -> str {
         var best: str = "";
@@ -514,10 +571,10 @@ impl Command {
     }
 
     // Parses args (the program's name first, as env::args() gives them),
-    // the Matches on the command's Gpa.
+    // the Matches on the command's allocator.
     #[no_io]
-    pub fn parse<I: Iterator<Item = str>>(self, args: sink I) -> Result<Matches, CliError> {
-        self.parse_in(args, self.gpa)
+    pub fn parse<I: Iterator<Item = str>>(self, args: sink I) -> Result<Matches<CA>, CliError> {
+        self.parse_in(args, self.alloc)
     }
 
     // Parses args, the Matches on allocator a.
@@ -703,6 +760,16 @@ impl Command {
         }
         m.finish(cur)?;
         m.group();
+        // (0.25) the values of arguments with choices
+        for s in 0..m.slots.len() {
+            let sl = m.slots[s];
+            for k in sl.start..sl.start + sl.len {
+                if !chosen(m.texts[k], sl.arg.choices) {
+                    return Err(CliError::of(CliErrorKind::InvalidValue, self.cmds_of(sl.level, m),
+                        m.texts[k], sl.arg));
+                }
+            }
+        }
         Ok(m)
     }
 }
@@ -743,7 +810,7 @@ pub struct Matches<A: Allocator = Gpa> {
 
 impl<A: Allocator> Matches<A> {
     // A new level for command c: a slot for each of its arguments.
-    fn enter(inout self, cmd: Command, c: i64) {
+    fn enter<CA: Allocator>(inout self, cmd: Command<CA>, c: i64) {
         self.level = self.names.len();
         self.names.push(cmd.cmds[c].name);
         self.cmds.push(c);
@@ -953,7 +1020,7 @@ fn wrap<A: Allocator>(out: inout Buf<A>, text: str, col: i64, indent: i64, width
     }
 }
 
-impl Command {
+impl<CA: Allocator> Command<CA> {
     // `git remote add`: the names from the root to c.
     fn path_into<A: Allocator>(self, c: i64, out: inout Buf<A>) {
         let p = self.cmds[c].parent;
@@ -984,7 +1051,7 @@ impl Command {
                     out.push_fmt(Spell { a: a });
                 } else {
                     out.push('[');
-                    out.push_str(a.name);
+                    out.push_str(if a.value_name.len() > 0 { a.value_name } else { a.name });
                     out.push(']');
                     if a.multiple {
                         out.push_str("...");
@@ -1175,19 +1242,17 @@ impl Command {
     // to stderr) and ends the program with e.exit_code().
     pub fn exit(self, e: CliError) -> ! {
         let code = e.exit_code();
-        arena_scope(self.gpa, |a| {
-            let text = self.render_in(e, a);
-            if code == 0 {
-                std::print(text.as_slice());
-            } else {
-                std::eprint(text.as_slice());
-            }
-        });
+        let text = self.render_in(e, self.alloc);
+        if code == 0 {
+            std::print(text.as_slice());
+        } else {
+            std::eprint(text.as_slice());
+        }
         std::process::exit(code)
     }
 
     // parse, and on an error (or --help, --version) cmd.exit(e).
-    pub fn parse_or_exit<I: Iterator<Item = str>>(self, args: sink I) -> Matches {
+    pub fn parse_or_exit<I: Iterator<Item = str>>(self, args: sink I) -> Matches<CA> {
         match self.parse(args) {
             Ok(m) => m,
             Err(e) => self.exit(e),
