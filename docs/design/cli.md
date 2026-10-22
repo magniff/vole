@@ -16,6 +16,7 @@ cmd.exit(e) -> !                                      prints, exits e.exit_code(
 cmd.help_in(a), cmd.render_in(e, a) -> Buf<A>
 m.flag(n) m.count(n) m.get(n) -> Option<str> m.values(n) -> [str]
 m.get_as::<T: FromStr>(n) -> Result<T, CliError> m.subcommand() -> Option<(str, Matches)>
+m.indices_of(n) -> [i64]                              (0.25) each value's (flag's) argument index
 ```
 
 ## Decisions
@@ -57,6 +58,23 @@ m.get_as::<T: FromStr>(n) -> Result<T, CliError> m.subcommand() -> Option<(str, 
    later `--help` still prints the help.
 7. **Gated.** Every section of std::cli is lazy behind the word `cli`
    (index.awk): a program that does not name it reads none of it.
+
+## 0.25
+
+`m.indices_of(name)`, clap's: the index among the arguments (the
+program's name is 0) of each value, or of each time a flag was given; a
+default has none. volec's own command line (compiler/src/cli/, on
+v0.24.0's std::cli) needs the order of different options' values (`-l`,
+`-L` and objects are linked in the order given; `edit patch`'s pairs
+after `--in NAME` are NAME's); until 0.26 builds it, it finds a value's
+place by the argv element the value views.
+
+What volec's layer makes up for (compiler/src/cli/mod.vl), candidates
+for later: a single-dash long option (`-framework`), an option whose
+value is optional (`--stats`, `--stats=functions`), an option with two
+values (`--overlay PATH COPY`), values and positionals starting with
+`-` (clap's `allow_hyphen_values`: `query grep '-> bool'`), and parsing
+on after an error (the tools report the NAMEs given with the error).
 
 ## Not in 0.24
 

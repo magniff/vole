@@ -68,8 +68,10 @@ usage: tool [options] [file]... [command]
   times; `m.get(name)`: the last value or the default, an
   `Option<str>`; `m.values(name)`: every value, a `[str]`;
   `m.get_as::<T>(name)`: parsed (`FromStr`), `Err(CliError)` naming the
-  argument; `m.subcommand()`: `Option<(str, Matches)>`. A name that is
-  no Arg of that command panics.
+  argument; `m.subcommand()`: `Option<(str, Matches)>`;
+  `m.indices_of(name)` (0.25): each value's (or flag's) index among the
+  arguments, for the order of different options (`-l m x.o -l z`). A
+  name that is no Arg of that command panics.
 - An Arg: `.short('x')`, `.long("s")` (its name by default),
   `.help(..)`, `.value_name("FILE")`, `.default(..)`, `.required()`,
   `.multiple()` (a positional taking the rest). Options may repeat.
