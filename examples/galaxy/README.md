@@ -66,11 +66,36 @@ Keys and mouse:
   star by star in f32 — *double-buffered like the GPU*: a reference
   that sweeps in place (Gauss–Seidel) reads half-updated neighbors and
   drifts from the GPU by whole partner terms, which looks like GPU
-  infidelity but is the reference's bug. The GPU and the double-
-  buffered CPU agree to the last bit (the comparison prints `physics
-  ok` under a 4e-3 relative tolerance). The frame's light is checked
-  structurally: the core sits at the center of the view, so the center
-  ninth of the frame must out-shine the corners.
+  infidelity but is the reference's bug. The reference keeps the exact
+  `sqrt` + divide for the weight where the kernel uses the fast
+  `inverseSqrt`, so the two differ by ulps per pair term — far under
+  the 4e-3 relative tolerance `physics ok` checks. The frame's light is
+  checked structurally: the core sits at the center of the view, so the
+  center ninth of the frame must out-shine the corners.
+
+## How fast
+
+Everything is one O(n²) step per frame, on the GPU only — measured on
+an Apple M5, one step per frame steady state:
+
+| stars | step (ms) | what it means for the frame |
+|---|---|---|
+| 8 192 | 0.9 | 60 fps with a whole frame to spare |
+| 16 384 | 2.4 | 60 fps comfortably |
+| 32 768 | 8.7 | 60 fps within the 16.7 ms budget |
+| 65 536 | 37 | ~27 fps — the direct sum's ceiling here |
+| 131 072 | 161 | a few fps |
+
+The kernel keeps the exact direct sum: one `@workgroup_size(256)`
+invocation per star, star loads double-buffered through workgroup
+memory (the next tile streams in while the group sums against the
+current one), four partners per inner turn so the four
+`inverseSqrt` chains overlap, and `g·m·inverseSqrt(r²·r²·r2)` for the
+weight — those changes more than doubled the direct sum against the
+naive loop (69.8 → 37 ms at 65 536 on this Mac). A direct sum cannot
+reach 60 fps at 65 536 stars on this class of GPU: about 4.3 billion
+pair terms per step against the instruction mix above. `--stars`
+chooses your trade; `--help` lists it.
 
 New to vole? `volec guide gpu` and `volec guide window` cover the APIs
 this example uses.

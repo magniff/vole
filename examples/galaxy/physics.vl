@@ -38,6 +38,19 @@ pub const SUBCIRC: f64 = 0.9;
 
 // The step's advance shader: src holds the state, dst receives it, and
 // every bound name must be used (std::gpu drops what it does not see).
+// The stars come in double-buffered workgroup tiles: the next tile loads
+// into the group's other 256-slot half while the workgroup sums against
+// the current one, so the load's wait hides under the ALU work and one
+// bar per round suffices. The inner loop walks four partners a turn
+// (four independent inverseSqrt chains overlap), with the terms still
+// added in the same j order the CPU reference uses; the tail tile is cut
+// short, which is what the reference's `for j in 0..n` does too. The
+// weight is g·m·(r²·r²·r2)^-½ — inverseSqrt instead of a sqrt and a
+// divide, the two slowest things the loop pays 64k×64k times; the CPU
+// keeps the exact sqrt + divide, so the two differ by ulps per pair
+// term — far below the check's tolerance, but no longer to the bit.
+// The tile carries just the sum's needs, place and mass (a vec4): a
+// pair term pulls 16 instead of 32 bytes of tile memory.
 pub const WGSL: [u8] = "struct P {\n\
     x: f32, y: f32, z: f32, m: f32,\n\
     vx: f32, vy: f32, vz: f32, hue: f32,\n\
@@ -46,25 +59,85 @@ pub const WGSL: [u8] = "struct P {\n\
     @group(0) @binding(0) var<uniform> u: Sim;\n\
     @group(0) @binding(1) var<storage, read> src: array<P>;\n\
     @group(0) @binding(2) var<storage, read_write> dst: array<P>;\n\
+    var<workgroup> tile: array<vec4<f32>, 512>;\n\
     @compute @workgroup_size(256)\n\
-    fn advance(@builtin(global_invocation_id) tid: vec3<u32>) {\n\
+    fn advance(@builtin(global_invocation_id) tid: vec3<u32>,\n\
+    @builtin(local_invocation_id) lid: vec3<u32>) {\n\
     let i = tid.x;\n\
-    if i >= u32(u.n) { return; }\n\
-    let s = src[i];\n\
+    let lane = lid.x;\n\
+    let n = u32(u.n);\n\
+    let tiles = (n + 255u) / 256u;\n\
+    let active = i < n;\n\
+    let s = src[min(i, n - 1u)];\n\
+    let softening = u.soft;\n\
+    let gravity = u.g;\n\
     var ax: f32 = 0.0;\n\
     var ay: f32 = 0.0;\n\
     var az: f32 = 0.0;\n\
-    for (var j: u32 = 0u; j < u32(u.n); j += 1u) {\n\
-    let t = src[j];\n\
-    let dx = t.x - s.x;\n\
-    let dy = t.y - s.y;\n\
-    let dz = t.z - s.z;\n\
-    let r2 = dx * dx + dy * dy + dz * dz + u.soft;\n\
-    let w = u.g * t.m / (r2 * sqrt(r2));\n\
+    if lane < n {\n\
+    let q0 = src[lane];\n\
+    tile[lane] = vec4<f32>(q0.x, q0.y, q0.z, q0.m);\n\
+    }\n\
+    workgroupBarrier();\n\
+    for (var ti: u32 = 0u; ti < tiles; ti += 1u) {\n\
+    let hb = (ti % 2u) * 256u;\n\
+    let k_end = min(256u, n - ti * 256u);\n\
+    let nxt = ti + 1u;\n\
+    let jnext = nxt * 256u + lane;\n\
+    if nxt < tiles {\n\
+    if jnext < n {\n\
+    let q = src[jnext];\n\
+    tile[(nxt % 2u) * 256u + lane] = vec4<f32>(q.x, q.y, q.z, q.m);\n\
+    }\n\
+    }\n\
+    if active {\n\
+    let quads = k_end / 4u;\n\
+    for (var t: u32 = 0u; t < quads; t += 1u) {\n\
+    let k = t * 4u;\n\
+    let pa = tile[hb + k];\n\
+    let dxa = pa.x - s.x;\n\
+    let dya = pa.y - s.y;\n\
+    let dza = pa.z - s.z;\n\
+    let r2a = dxa * dxa + dya * dya + dza * dza + softening;\n\
+    let wa = gravity * pa.w * inverseSqrt(r2a * r2a * r2a);\n\
+    let pb = tile[hb + k + 1u];\n\
+    let dxb = pb.x - s.x;\n\
+    let dyb = pb.y - s.y;\n\
+    let dzb = pb.z - s.z;\n\
+    let r2b = dxb * dxb + dyb * dyb + dzb * dzb + softening;\n\
+    let wb = gravity * pb.w * inverseSqrt(r2b * r2b * r2b);\n\
+    let pc = tile[hb + k + 2u];\n\
+    let dxc = pc.x - s.x;\n\
+    let dyc = pc.y - s.y;\n\
+    let dzc = pc.z - s.z;\n\
+    let r2c = dxc * dxc + dyc * dyc + dzc * dzc + softening;\n\
+    let wc = gravity * pc.w * inverseSqrt(r2c * r2c * r2c);\n\
+    let pd = tile[hb + k + 3u];\n\
+    let dxd = pd.x - s.x;\n\
+    let dyd = pd.y - s.y;\n\
+    let dzd = pd.z - s.z;\n\
+    let r2d = dxd * dxd + dyd * dyd + dzd * dzd + softening;\n\
+    let wd = gravity * pd.w * inverseSqrt(r2d * r2d * r2d);\n\
+    ax = ax + dxa * wa + dxb * wb + dxc * wc + dxd * wd;\n\
+    ay = ay + dya * wa + dyb * wb + dyc * wc + dyd * wd;\n\
+    az = az + dza * wa + dzb * wb + dzc * wc + dzd * wd;\n\
+    }\n\
+    let base = quads * 4u;\n\
+    for (var k: u32 = base; k < k_end; k += 1u) {\n\
+    let p = tile[hb + k];\n\
+    let dx = p.x - s.x;\n\
+    let dy = p.y - s.y;\n\
+    let dz = p.z - s.z;\n\
+    let r2 = dx * dx + dy * dy + dz * dz + softening;\n\
+    let w = gravity * p.w * inverseSqrt(r2 * r2 * r2);\n\
     ax = ax + dx * w;\n\
     ay = ay + dy * w;\n\
     az = az + dz * w;\n\
     }\n\
+    }\n\
+    workgroupBarrier();\n\
+    }\n\
+    if active {\n\
     var vx = (s.vx + ax * u.dt) * u.drag;\n\
     var vy = (s.vy + ay * u.dt) * u.drag;\n\
     var vz = (s.vz + az * u.dt) * u.drag;\n\
@@ -80,6 +153,7 @@ pub const WGSL: [u8] = "struct P {\n\
     vz = 0.0;\n\
     }\n\
     dst[i] = P(x, y, z, s.m, vx, vy, vz, s.hue);\n\
+    }\n\
     }\n";
 
 // The initial state: star 0 is the pinned core at the origin (mass
