@@ -1,0 +1,141 @@
+// galaxy's view (view.vl): the shader that draws the state as a sky of
+// stars, and the camera that looks at the disk.
+//
+// There are no vertex buffers: each of the four vertices of a star's
+// billboard is made from its own vertex_index and instance_index, with
+// the star's position and hue read straight out of the storage buffer
+// the physics last wrote. The billboard is camera-facing: built in view
+// space (yaw around the disk's axis, pitch over it) as a unit quad
+// scaled to `rad` in NDC, with depth = the distance between the camera
+// and the star along the camera's line of sight — perspective by hand:
+// nearer stars draw bigger, those behind the camera (depth < 0.4) are
+// clipped away. The fragment falls off as exp(−k·r²): a gaussian glow,
+// with the color from the star's hue mixed between a warm core and a
+// cool rim. Blending is additive, so overlapping stars sum into the
+// bright heart of the galaxy.
+
+import "math.h" as c;
+
+use std::gpu;
+use std::gpu::{
+    BindGroup, Blend, Buffer, BufferUsage, Color, Format, PassDesc, RenderPipeline, TextureView,
+    Topology,
+};
+
+use physics::Galaxy;
+
+// The billboard's radius in pixels on a full-height screen.
+pub const STAR_PX: f64 = 2.6;
+
+// The camera the example opens with: above the disk, tilted to see it,
+// far enough for rim to rim, zoomed so the disk fills three quarters of
+// the height.
+pub const CAM_YAW: f64 = 0.6;
+pub const CAM_PITCH: f64 = 0.9;
+pub const CAM_DIST: f64 = 34.0;
+pub const CAM_ZOOM: f64 = 0.06;
+
+pub static CLEAR: Color = Color::rgba(0.01, 0.015, 0.03, 1.0);
+
+// The fragment shader: a glow, colored by the star's hue.
+pub const WGSL: [u8] = "struct P {\n\
+    x: f32, y: f32, z: f32, m: f32,\n\
+    vx: f32, vy: f32, vz: f32, hue: f32,\n\
+    }\n\
+    struct Cam {\n\
+    cy: f32, sy: f32, cp: f32, sp: f32,\n\
+    dist: f32, foci: f32, asp: f32, rad: f32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> cam: Cam;\n\
+    @group(0) @binding(1) var<storage, read> src: array<P>;\n\
+    struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) @interpolate(flat) hue: f32,\n\
+    @location(1) uv: vec2<f32>,\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) star: u32) -> V {\n\
+    let s = src[star];\n\
+    let d = vec3<f32>(s.x, s.y, s.z);\n\
+    let bx = cam.cp * cam.sy;\n\
+    let bz = cam.cp * cam.cy;\n\
+    let depth = cam.dist - (bx * d.x + cam.sp * d.y + bz * d.z);\n\
+    var o: V;\n\
+    o.hue = s.hue;\n\
+    o.uv = vec2<f32>(0.0, 0.0);\n\
+    if depth < 0.4 {\n\
+    o.pos = vec4<f32>(3.0, 3.0, 3.0, 1.0);\n\
+    return o;\n\
+    }\n\
+    let k = cam.foci / depth;\n\
+    let xv = d.x * cam.cy - d.z * cam.sy;\n\
+    let yv = -cam.sy * cam.sp * d.x + cam.cp * d.y - cam.cy * cam.sp * d.z;\n\
+    let c = vec2<f32>(f32(vid & 1u), f32(vid >> 1u)) * 2.0 - vec2<f32>(1.0, 1.0);\n\
+    let r = cam.rad * (1.0 + s.m * 0.014);\n\
+    o.pos = vec4<f32>(vec2<f32>(xv * k / cam.asp, yv * k) + c * r, 0.5, 1.0);\n\
+    o.uv = c;\n\
+    return o;\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let r2 = dot(v.uv, v.uv);\n\
+    let a = exp(-r2 * 4.5);\n\
+    let warm = vec3<f32>(1.0, 0.82, 0.55);\n\
+    let cool = vec3<f32>(0.45, 0.62, 1.0);\n\
+    return vec4<f32>(mix(cool, warm, v.hue) * a, a);\n\
+    }\n";
+
+// The renderer: one pipeline into Bgra8Unorm (the surface's frames and
+// the self-check's readbacks), one uniform with the camera, one bind
+// group per side of the physics' ping-pong pair.
+pub struct Sky {
+    pub pipe: RenderPipeline,
+    pub ubuf: Buffer,
+    pub groups: [BindGroup; 2],
+}
+
+/// A sky for `g`: its two state buffers are the instances this shader
+/// reads (the group of index i reads buf[i], the physics' write side is
+/// the other one). Pipeline setup can fail: a shader the driver rejects.
+pub fn sky_new(dev: gpu::Device, g: Galaxy) -> Result<Sky, gpu::Error> {
+    let shader = dev.shader_wgsl(WGSL)?;
+    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm);
+    desc.topology(Topology::TriangleStrip);
+    desc.blend(Blend::additive());
+    let pipe = dev.render_pipeline(desc)?;
+    let ubuf = dev.buffer(dev.align_uniform(32),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let g0 = pipe.bind_layout(0);
+    let groups: [BindGroup; 2] = [
+        dev.bind_group(g0, [gpu::bind(0, ubuf), gpu::bind(1, g.buf[0])][..]),
+        dev.bind_group(g0, [gpu::bind(0, ubuf), gpu::bind(1, g.buf[1])][..]),
+    ];
+    Ok(Sky { pipe: pipe, ubuf: ubuf, groups: groups })
+}
+
+/// One frame: the camera uniform written, the stars drawn additively
+/// over the clear color, the work submitted. `which` selects the side of
+/// the ping-pong pair to draw (the galaxy's `cur`); `yaw` and `pitch`
+/// point the camera at the origin from `dist`, `zoom` scales it into the
+/// frame. Takes the camera angles every call: pitch and yaw live in the
+/// window's event loop, not here.
+impl Sky {
+    pub fn draw(self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        which: i64, count: i64, w: i64, h: i64,
+        yaw: f64, pitch: f64, dist: f64, zoom: f64) {
+        let b = unsafe { (c::cos(yaw), c::sin(yaw), c::cos(pitch), c::sin(pitch)) };
+        let sw: [f32; 8] = [
+            b.0 as f32, b.1 as f32, b.2 as f32, b.3 as f32,
+            dist as f32, (zoom * dist) as f32,
+            w as f32 / h as f32, (STAR_PX * 2.0 / h as f64) as f32,
+        ];
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(sw[..]));
+        let pipe = self.pipe;
+        let group = self.groups[which];
+        var enc = dev.encoder();
+        enc.render_pass(PassDesc::color(target, clear: CLEAR), |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.draw(0..4, 0..count);
+        });
+        queue.submit(enc.finish());
+    }
+}

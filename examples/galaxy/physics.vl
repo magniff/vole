@@ -1,0 +1,191 @@
+// galaxy's physics (physics.vl): the N-body kernel, and the state it
+// integrates.
+//
+// One compute shader advances every star each step: for star i it sums
+// the pull of every other star j (a direct O(n²) sum; n is a few
+// thousand, so the sum over the disk is still instant for a workgroup of
+// 256), integrates semi-implicit Euler (v += a·dt, then x += v·dt, which
+// stays on the orbit where plain Euler does not), and writes into the
+// other one of the two buffers (the ping-pong pair; the renderer reads
+// the same bytes the physics wrote).
+//
+// The disk starts with a uniform surface density (r = R·√u, thin in z)
+// moving on circular orbits: v = √(g·M(r)/r), with M(r) the pinned core's
+// mass plus the disk's own mass within r. The velocities are slightly
+// sub-circular (SUBCIRC) so the disk heats little, and hued outward: 1.0
+// (warm) at the core, 0 (blue) at the rim, the color the view.vl shader
+// mixes over.
+//
+// One star is 32 bytes: position, mass and speed with the hue packed in
+// (x, y, z, m, vx, vy, vz, hue) — two f32 registers of buffers, and the
+// ping-pong's other side is the state.
+
+import "math.h" as c;
+
+use std::{Gpa, Vec, gpu};
+use std::gpu::{BindGroup, Buffer, BufferUsage, ComputePipeline};
+use std::random::Xoshiro256pp;
+
+pub const WORKGROUP: i64 = 256;
+pub const G: f64 = 1.0;
+pub const SOFT: f64 = 0.36; // Plummer softening, ε = 0.6: ε²
+pub const CORE_MASS: f64 = 140.0;
+pub const DISK_R: f64 = 15.0;
+pub const RMIN: f64 = 1.5;
+
+// The step's advance shader: src holds the state, dst receives it, and
+// every bound name must be used (std::gpu drops what it does not see).
+pub const WGSL: [u8] = "struct P {\n\
+    x: f32, y: f32, z: f32, m: f32,\n\
+    vx: f32, vy: f32, vz: f32, hue: f32,\n\
+    }\n\
+    struct Sim { n: f32, dt: f32, g: f32, soft: f32, drag: f32 }\n\
+    @group(0) @binding(0) var<uniform> u: Sim;\n\
+    @group(0) @binding(1) var<storage, read> src: array<P>;\n\
+    @group(0) @binding(2) var<storage, read_write> dst: array<P>;\n\
+    @compute @workgroup_size(256)\n\
+    fn advance(@builtin(global_invocation_id) tid: vec3<u32>) {\n\
+    let i = tid.x;\n\
+    if i >= u32(u.n) { return; }\n\
+    let s = src[i];\n\
+    var ax: f32 = 0.0;\n\
+    var ay: f32 = 0.0;\n\
+    var az: f32 = 0.0;\n\
+    for (var j: u32 = 0u; j < u32(u.n); j += 1u) {\n\
+    let t = src[j];\n\
+    let dx = t.x - s.x;\n\
+    let dy = t.y - s.y;\n\
+    let dz = t.z - s.z;\n\
+    let r2 = dx * dx + dy * dy + dz * dz + u.soft;\n\
+    let w = u.g * t.m / (r2 * sqrt(r2));\n\
+    ax = ax + dx * w;\n\
+    ay = ay + dy * w;\n\
+    az = az + dz * w;\n\
+    }\n\
+    var vx = (s.vx + ax * u.dt) * u.drag;\n\
+    var vy = (s.vy + ay * u.dt) * u.drag;\n\
+    var vz = (s.vz + az * u.dt) * u.drag;\n\
+    var x = s.x + vx * u.dt;\n\
+    var y = s.y + vy * u.dt;\n\
+    var z = s.z + vz * u.dt;\n\
+    if i == 0u {\n\
+    x = 0.0;\n\
+    y = 0.0;\n\
+    z = 0.0;\n\
+    vx = 0.0;\n\
+    vy = 0.0;\n\
+    vz = 0.0;\n\
+    }\n\
+    dst[i] = P(x, y, z, s.m, vx, vy, vz, s.hue);\n\
+    }\n";
+
+// The initial state: star 0 is the pinned core at the origin (mass
+// CORE_MASS, warm); the disk follows, uniform in surface density, thin in
+// z, on near-circular orbits with a little radial jitter. The seed picks
+// the disk (std::random's Xoshiro256pp: the same seed, the same disk, on
+// every machine, so checks can compare against themselves).
+pub fn init_state(n: i64, seed: u64, gpa: Gpa) -> Vec<f32> {
+    var v: Vec<f32> = Vec::new_in(gpa);
+    v.push(0.0);
+    v.push(0.0);
+    v.push(0.0);
+    v.push(CORE_MASS as f32);
+    v.push(0.0);
+    v.push(0.0);
+    v.push(0.0);
+    v.push(1.0);
+    var rng = Xoshiro256pp::seed_from_u64(seed);
+    let disc = n - 1;
+    for _ in 0..disc {
+        let u1 = rng.unit_f64();
+        let u2 = rng.unit_f64();
+        let u3 = rng.unit_f64();
+        let u4 = rng.unit_f64();
+        let sq = unsafe { c::sqrt(u1) };
+        var r = DISK_R * sq;
+        if r < RMIN {
+            r = RMIN;
+        }
+        let a = u2 * 6.283185307179586;
+        let sa = unsafe { c::sin(a) };
+        let ca = unsafe { c::cos(a) };
+        let x = r * ca;
+        let y = r * sa;
+        let z = (u3 - 0.5) * 0.9;
+        // the mass within r: the core plus this disk annulus (the disk's
+        // stars are one unit of mass each)
+        let menc = CORE_MASS + disc as f64 * (r * r) / (DISK_R * DISK_R);
+        let vc = unsafe { c::sqrt(G * menc / r) } * 0.9;
+        let jit = (u4 - 0.5) * vc / 20.0;
+        v.push(x as f32);
+        v.push(y as f32);
+        v.push(z as f32);
+        v.push(1.0);
+        v.push((-sa * vc + ca * jit) as f32);
+        v.push((ca * vc + sa * jit) as f32);
+        v.push(0.0);
+        var hue = 1.0 - r / DISK_R;
+        if hue < 0.0 {
+            hue = 0.0;
+        }
+        v.push(hue as f32);
+    }
+    v
+}
+
+// The galaxy: everything it owns is device-side; `cur` says which of the
+// two buffers holds the current state (the renderer reads buf[cur]).
+pub struct Galaxy {
+    pub n: i64,
+    pub cur: i64,
+    pub buf: [Buffer; 2],
+    pub ubuf: Buffer,
+    pub pipe: ComputePipeline,
+    pub groups: [BindGroup; 2],
+}
+
+// Builds the pipeline and the two buffers with the initial state: buffer
+// pair must be storage (the kernel reads and writes it whole) and copy
+// source (self-check reads it back).
+pub fn galaxy_new(dev: gpu::Device, n: i64, seed: u64, gpa: Gpa) -> Result<Galaxy, gpu::Error> {
+    let shader = dev.shader_wgsl(WGSL)?;
+    let pipe = dev.compute_pipeline(shader, "advance")?;
+    let state = init_state(n, seed, gpa);
+    let bytes = n * 32;
+    let st = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
+    let buf: [Buffer; 2] = [
+        dev.buffer_init(gpu::bytes_of_f32(state.as_slice()), st),
+        dev.buffer_init(gpu::bytes_of_f32(state.as_slice()), st),
+    ];
+    let ubuf = dev.buffer(dev.align_uniform(20),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let g0 = pipe.bind_layout(0);
+    let groups: [BindGroup; 2] = [
+        dev.bind_group(g0, [gpu::bind(0, ubuf), gpu::bind(1, buf[0]), gpu::bind(2, buf[1])][..]),
+        dev.bind_group(g0, [gpu::bind(0, ubuf), gpu::bind(1, buf[1]), gpu::bind(2, buf[0])][..]),
+    ];
+    Ok(Galaxy {
+        n: n, cur: 0, buf: buf, ubuf: ubuf, pipe: pipe, groups: groups,
+    })
+}
+
+impl Galaxy {
+    /// One advance: the uniform rewritten, the kernel over every star,
+    /// the ping-pong's side flipped. `dt` is a fraction of a second,
+    /// `drag` damps the velocities (1.0 keeps them).
+    pub fn step(inout self, dev: gpu::Device, queue: inout gpu::Queue,
+        dt: f32, drag: f32) {
+        let sim: [f32; 5] = [self.n as f32, dt, G as f32, SOFT as f32, drag];
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(sim[..]));
+        let pipe = self.pipe;
+        let group = self.groups[self.cur];
+        var enc = dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.dispatch((self.n + WORKGROUP - 1) / WORKGROUP);
+        });
+        queue.submit(enc.finish());
+        self.cur = (self.cur + 1) % 2;
+    }
+}
