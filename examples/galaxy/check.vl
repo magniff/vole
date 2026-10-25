@@ -4,9 +4,11 @@
 // machines have) and read back.
 //
 // The CPU integrator is the kernel's arithmetic again, star by star in
-// f32 — the disk's forces barely change over a handful of steps, so a
-// same-math GPU and CPU agree well below a thousandth of a star's scale;
-// more than that does mean the two took different paths.
+// f32, double-buffered like the GPU (a sweep that updates in place reads
+// half-updated neighbors and drifts line by whole partner terms — a
+// reference bug that looks like GPU infidelity); a same-math GPU and CPU
+// agree below a ten-thousandth of a star's scale, more means the two
+// took different paths.
 //
 // The frame is checked for light where it must be: the pinned core sits
 // at the center of the view (the camera looks at the origin), so the
@@ -27,33 +29,33 @@ use view::{CAM_DIST, CAM_PITCH, CAM_YAW, CAM_ZOOM, sky_new};
 // ping-pong the kernel does: no star may see another's new position —
 // an in-place sweep reads half-updated neighbors and drifts from the
 // GPU line by whole partner terms).
-fn cpu_step(s: inout Vec<f32>, n: i64, dt: f32, drag: f32) {
+fn cpu_step(state: inout Vec<f32>, n: i64, dt: f32, drag: f32) {
     let g = G as f32;
     let soft = SOFT as f32;
-    var nxt = s.clone();
+    var next = state.clone();
     for i in 0..n {
         let b = i * 8;
         var ax: f32 = 0.0;
         var ay: f32 = 0.0;
         var az: f32 = 0.0;
-        let sx = s[b];
-        let sy = s[b + 1];
-        let sz = s[b + 2];
+        let sx = state[b];
+        let sy = state[b + 1];
+        let sz = state[b + 2];
         for j in 0..n {
             let q = j * 8;
-            let dx = s[q] - sx;
-            let dy = s[q + 1] - sy;
-            let dz = s[q + 2] - sz;
+            let dx = state[q] - sx;
+            let dy = state[q + 1] - sy;
+            let dz = state[q + 2] - sz;
             let r2 = dx * dx + dy * dy + dz * dz + soft;
             let rs = unsafe { c::sqrt(r2 as f64) as f32 };
-            let w = g * s[q + 3] / (r2 * rs);
+            let w = g * state[q + 3] / (r2 * rs);
             ax = ax + dx * w;
             ay = ay + dy * w;
             az = az + dz * w;
         }
-        let vx = (s[b + 4] + ax * dt) * drag;
-        let vy = (s[b + 5] + ay * dt) * drag;
-        let vz = (s[b + 6] + az * dt) * drag;
+        let vx = (state[b + 4] + ax * dt) * drag;
+        let vy = (state[b + 5] + ay * dt) * drag;
+        let vz = (state[b + 6] + az * dt) * drag;
         var x = sx + vx * dt;
         var y = sy + vy * dt;
         var z = sz + vz * dt;
@@ -62,32 +64,32 @@ fn cpu_step(s: inout Vec<f32>, n: i64, dt: f32, drag: f32) {
             y = 0.0;
             z = 0.0;
         }
-        nxt[b] = x;
-        nxt[b + 1] = y;
-        nxt[b + 2] = z;
-        nxt[b + 4] = vx;
-        nxt[b + 5] = vy;
-        nxt[b + 6] = vz;
+        next[b] = x;
+        next[b + 1] = y;
+        next[b + 2] = z;
+        next[b + 4] = vx;
+        next[b + 5] = vy;
+        next[b + 6] = vz;
     }
     for k in 0..n * 8 {
-        s[k] = nxt[k];
+        state[k] = next[k];
     }
 }
 
 // A BGRA frame as a PPM (P6): a readback's rows come with their 256-byte
 // stride, so the pixels are picked on it.
 fn write_ppm(path: [u8], px: [u8], w: i64, h: i64, stride: i64, gpa: Gpa) -> bool {
-    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    var ppm = format_in(f"P6\n{w} {h}\n255\n", gpa);
     for y in 0..h {
         let row = y * stride;
         for x in 0..w {
             let p = row + x * 4;
-            b.push(px[p + 2]);
-            b.push(px[p + 1]);
-            b.push(px[p]);
+            ppm.push(px[p + 2]);
+            ppm.push(px[p + 1]);
+            ppm.push(px[p]);
         }
     }
-    fs::write(path, b.as_slice()).is_ok()
+    fs::write(path, ppm.as_slice()).is_ok()
 }
 
 // The headless run: `stars` stars, `steps` steps of the physics, the CPU
@@ -107,8 +109,8 @@ pub fn run(stars: i64, steps: i64, seed: u64, w: i64, h: i64, out: [u8], gpa: Gp
             return 1;
         }
     };
-    var gal = match physics::galaxy_new(dev, stars, seed, gpa) {
-        Ok(g) => g,
+    var galaxy = match physics::galaxy_new(dev, stars, seed, gpa) {
+        Ok(built) => built,
         Err(e) => {
             eprintln(f"galaxy: the physics: {e}");
             return 1;
@@ -116,26 +118,27 @@ pub fn run(stars: i64, steps: i64, seed: u64, w: i64, h: i64, out: [u8], gpa: Gp
     };
     let dt = (1.0 / 60.0) as f32;
     for _ in 0..steps {
-        gal.step(dev, &queue, dt, 1.0);
+        galaxy.step(dev, &queue, dt, 1.0);
     }
 
     // the same steps, on the CPU, from the same start
-    var sim = init_state(stars, seed, gpa);
+    var cpu_state = init_state(stars, seed, gpa);
     for _ in 0..steps {
-        cpu_step(&sim, stars, dt, 1.0);
-    } let bytes = stars * 32;
-    var stage = dev.buffer(bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    let srcb = gal.buf[gal.cur];
-    var enc = dev.encoder();
-    enc.copy_buffer(srcb, 0, stage, 0, bytes);
-    queue.submit(enc.finish());
-    let got = gpu::f32s(stage.map_read(dev));
+        cpu_step(&cpu_state, stars, dt, 1.0);
+    }
+    let state_bytes = stars * 32;
+    var stage = dev.buffer(state_bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let current = galaxy.buf[galaxy.cur];
+    var copy_enc = dev.encoder();
+    copy_enc.copy_buffer(current, 0, stage, 0, state_bytes);
+    queue.submit(copy_enc.finish());
+    let gpu_state = gpu::f32s(stage.map_read(dev));
     var worst: f64 = 0.0;
     for i in 0..stars {
         let p = i * 8;
         for k in 0..3 {
-            let a = got[p + k] as f64;
-            let b = sim[p + k] as f64;
+            let a = gpu_state[p + k] as f64;
+            let b = cpu_state[p + k] as f64;
             let e = unsafe { c::fabs(a - b) / (1.0 + c::fabs(b)) };
             if e > worst {
                 worst = e;
@@ -149,15 +152,15 @@ pub fn run(stars: i64, steps: i64, seed: u64, w: i64, h: i64, out: [u8], gpa: Gp
     }
 
     // one frame of the last state, into a surface with no window
-    var sky = match sky_new(dev, gal) {
-        Ok(sk) => sk,
+    var sky = match sky_new(dev, galaxy) {
+        Ok(renderer) => renderer,
         Err(e) => {
             eprintln(f"galaxy: the view: {e}");
             return 1;
         }
     };
     var surf = match inst.surface(dev, RawSurface::Headless) {
-        Ok(sf) => sf,
+        Ok(headless) => headless,
         Err(e) => {
             eprintln(f"galaxy: no surface: {e}");
             return 1;
@@ -165,21 +168,21 @@ pub fn run(stars: i64, steps: i64, seed: u64, w: i64, h: i64, out: [u8], gpa: Gp
     };
     surf.configure(dev, w, h, format: Format::Bgra8Unorm, vsync: false);
     let frame = match surf.frame() {
-        Ok(fr) => fr,
+        Ok(shown) => shown,
         Err(e) => {
             eprintln(f"galaxy: no frame: {e}");
             return 1;
         }
     };
     let texview = frame.texture.view();
-    sky.draw(dev, &queue, texview, gal.cur, stars, w, h,
+    sky.draw(dev, &queue, texview, galaxy.cur, stars, w, h,
         CAM_YAW, CAM_PITCH, CAM_DIST, CAM_ZOOM);
     let stride = (w * 4 + 255) / 256 * 256;
-    var rb = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc2 = dev.encoder();
-    enc2.copy_texture_to_buffer(frame.texture, rb, stride);
-    queue.submit(enc2.finish());
-    let px = rb.map_read(dev);
+    var readback = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var frame_enc = dev.encoder();
+    frame_enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(frame_enc.finish());
+    let px = readback.map_read(dev);
 
     // the frame: how many pixels carry light, and how bright the center
     // is next to the corners: the camera looks at the origin, where the
@@ -189,17 +192,17 @@ pub fn run(stars: i64, steps: i64, seed: u64, w: i64, h: i64, out: [u8], gpa: Gp
     var corners: i64 = 0;
     for y in 0..h {
         for x in 0..w {
-            let p = y * stride + x * 4;
-            let s = px[p] as i64 + px[p + 1] as i64 + px[p + 2] as i64;
-            if s > 0 {
+            let pixel = y * stride + x * 4;
+            let lum = px[pixel] as i64 + px[pixel + 1] as i64 + px[pixel + 2] as i64;
+            if lum > 0 {
                 lit += 1;
             }
             let mx = x * 3 >= w && x * 3 < 2 * w;
             let my = y * 3 >= h && y * 3 < 2 * h;
             if mx && my {
-                mid += s;
+                mid += lum;
             } else if !mx && !my {
-                corners += s;
+                corners += lum;
             }
         }
     }

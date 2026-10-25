@@ -8,14 +8,17 @@ camera-facing glowing billboards — no vertex buffers, no textures.
 
 ```sh
 target/volec -O2 examples/galaxy/main.vl -o galaxy
-./galaxy                       # 4096 stars
+./galaxy                       # 8192 stars
 ./galaxy --stars 16384         # a heavier disk
 ./galaxy --headless            # no display needed: the self-check
 ./galaxy --headless --out g.ppm --size 960x600
 ```
 
 On a display with a window server the program opens a window and starts
-stepping; the title bar carries the frame rate. Keys and mouse:
+stepping; the title bar carries the frame rate. The camera opens
+perpendicular to the disk — straight down its axis, the galaxy flat in
+the frame — and the drag and the arrows tilt and spin it from there.
+Keys and mouse:
 
 | input | action |
 |---|---|
