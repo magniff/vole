@@ -1,0 +1,153 @@
+// Native depth-tested rendering of GPU-generated chunk meshes.
+
+import "math.h" as c;
+
+use std::gpu;
+use std::gpu::{BindLayout, Blend, Buffer, Format, PassDesc, RenderPipeline, Texture, TextureView};
+use std::gpu::types::BufferUsage;
+use std::gpu::types::TextureUsage::RENDER_ATTACHMENT;
+
+use camera::Camera;
+use shaders::RENDER_WGSL;
+use world::{CHUNK, MAX_VERTS, World};
+
+pub struct Renderer {
+    pipe: RenderPipeline,
+    water_pipe: RenderPipeline,
+    plant_pipe: RenderPipeline,
+    pub camera: Buffer,
+    depth: Texture,
+    pub width: i64,
+    pub height: i64,
+}
+
+pub fn renderer_new(dev: gpu::Device, width: i64, height: i64) -> Result<Renderer, gpu::Error> {
+    let shader = dev.shader_wgsl(RENDER_WGSL)?;
+    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm);
+    desc.depth();
+    let pipe = dev.render_pipeline(desc)?;
+    var water_desc = gpu::RenderDesc::new(shader, "vs_water", "fs_water", Format::Bgra8Unorm);
+    water_desc.depth(write: false);
+    water_desc.blend(Blend::alpha());
+    let water_pipe = dev.render_pipeline(water_desc)?;
+    var plant_desc = gpu::RenderDesc::new(shader, "vs_plant", "fs_plant", Format::Bgra8Unorm);
+    plant_desc.depth();
+    let plant_pipe = dev.render_pipeline(plant_desc)?;
+    let camera = dev.buffer(dev.align_uniform(36 * 4),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let depth = dev.texture(width, height, Format::Depth32Float,
+        usage: RENDER_ATTACHMENT);
+    Ok(Renderer {
+        pipe: pipe, water_pipe: water_pipe, plant_pipe: plant_pipe,
+        camera: camera, depth: depth, width: width, height: height,
+    })
+}
+
+fn visible(cam: Camera, cx: i64, cz: i64) -> bool {
+    let f = cam.forward();
+    let r = cam.right();
+    let dx = (cx * CHUNK + CHUNK / 2) as f64 - cam.x;
+    let dy = 24.0 - cam.y;
+    let dz = (cz * CHUNK + CHUNK / 2) as f64 - cam.z;
+    let depth = dx * f[0] + dy * f[1] + dz * f[2];
+    if depth < -55.0 || depth > 330.0 { return false; }
+    // UNSAFE: frustum tests need scalar absolute values through C math.
+    // SAFETY: all dot products are finite scalars and fabs has no memory effects.
+    let (side, vertical) = unsafe {
+        (
+            c::fabs(dx * r[0] + dy * r[1] + dz * r[2]),
+            c::fabs(dx * (f[1] * r[2] - f[2] * r[1])
+                + dy * (f[2] * r[0] - f[0] * r[2]) + dz * (f[0] * r[1] - f[1] * r[0])),
+        )
+    };
+    side < (depth + 55.0) * 1.1 + 40.0 && vertical < (depth + 55.0) * 0.9 + 45.0
+}
+
+impl Renderer {
+    pub fn layout(self) -> BindLayout { self.pipe.bind_layout(0) }
+
+    pub fn resize(inout self, dev: gpu::Device, width: i64, height: i64) {
+        self.width = width;
+        self.height = height;
+        self.depth = dev.texture(width, height, Format::Depth32Float,
+            usage: RENDER_ATTACHMENT);
+    }
+
+    pub fn draw(self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        world: World, cam: Camera, time: f64, debug: i64,
+        brush: [f64; 3], brush_radius: f64, editing: bool, sun_index: i64) -> i64 {
+        let f = cam.forward();
+        let r = cam.right();
+        let up = [
+            r[1] * f[2] - r[2] * f[1],
+            r[2] * f[0] - r[0] * f[2],
+            r[0] * f[1] - r[1] * f[0],
+        ];
+        var uniform: [f32; 36] = [0.0; 36];
+        uniform[0] = cam.x as f32;
+        uniform[1] = cam.y as f32;
+        uniform[2] = cam.z as f32;
+        uniform[3] = 1.0;
+        for i in 0..3 {
+            uniform[4 + i] = f[i] as f32;
+            uniform[8 + i] = r[i] as f32;
+            uniform[12 + i] = up[i] as f32;
+        }
+        uniform[16] = 0.62;
+        uniform[17] = self.width as f32 / self.height as f32;
+        uniform[18] = time as f32;
+        uniform[19] = debug as f32;
+        let suns = [
+            [-0.45, 0.82, 0.35], [0.45, 0.65, -0.55],
+            [-0.80, 0.35, -0.20], [0.20, 0.95, 0.10],
+        ];
+        let sun = suns[sun_index];
+        uniform[20] = sun[0] as f32;
+        uniform[21] = sun[1] as f32;
+        uniform[22] = sun[2] as f32;
+        uniform[23] = 1.05;
+        uniform[24] = world.seed as f32;
+        uniform[25] = 12.0;
+        uniform[26] = if editing { 1.0 } else { 0.0 };
+        uniform[28] = brush[0] as f32;
+        uniform[29] = brush[1] as f32;
+        uniform[30] = brush[2] as f32;
+        uniform[32] = brush_radius as f32;
+        queue.write_buffer(self.camera, 0, gpu::bytes_of_f32(uniform[..]));
+        let pipe = self.pipe;
+        let water_pipe = self.water_pipe;
+        let plant_pipe = self.plant_pipe;
+        let depth = self.depth.view();
+        var count = 0;
+        for chunk in world.chunks {
+            if visible(cam, chunk.cx, chunk.cz) { count += 1; }
+        }
+        var enc = dev.encoder();
+        let clear = gpu::Color::rgba(0.48, 0.65, 0.82, 1.0);
+        enc.render_pass(PassDesc::color(target, clear: clear).with_depth(depth), |pass| {
+            pass.set_pipeline(pipe);
+            for chunk in world.chunks {
+                if visible(cam, chunk.cx, chunk.cz) {
+                    pass.set_bind_group(0, chunk.render_group);
+                    pass.draw(0..MAX_VERTS, 0..1);
+                }
+            }
+            pass.set_pipeline(plant_pipe);
+            for chunk in world.chunks {
+                if visible(cam, chunk.cx, chunk.cz) {
+                    pass.set_bind_group(0, chunk.plant_group);
+                    pass.draw(0..12, 0..256);
+                }
+            }
+            pass.set_pipeline(water_pipe);
+            for chunk in world.chunks {
+                if visible(cam, chunk.cx, chunk.cz) {
+                    pass.set_bind_group(0, chunk.water_group);
+                    pass.draw(0..6144, 0..1);
+                }
+            }
+        });
+        queue.submit(enc.finish());
+        count
+    }
+}

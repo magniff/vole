@@ -1,0 +1,216 @@
+// Real GPU headless smoke check: the same terrain/mesh/render pipelines as the
+// native application, with small readbacks only for verification and PPM output.
+
+use std::{fs, gpu};
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+
+use camera::camera_default;
+use render::renderer_new;
+use world::{World, world_new};
+
+fn meta_value(world: inout World, dev: gpu::Device, index: i64, slot: i64) -> i64 {
+    gpu::u32s(world.chunks[index].meta.map_read(dev))[slot] as i64
+}
+
+fn vertex_count(world: inout World, dev: gpu::Device, index: i64) -> i64 {
+    meta_value(&world, dev, index, 0)
+}
+
+fn write_ppm(path: [u8], pixels: [u8], width: i64, height: i64,
+    stride: i64, gpa: Gpa) -> bool {
+    var ppm = format_in(f"P6\n{width} {height}\n255\n", gpa);
+    for y in 0..height {
+        for x in 0..width {
+            let p = y * stride + x * 4;
+            ppm.push(pixels[p + 2]);
+            ppm.push(pixels[p + 1]);
+            ppm.push(pixels[p]);
+        }
+    }
+    fs::write(path, ppm.as_slice()).is_ok()
+}
+
+/// Generation and steady-state rendering are measured separately. The render
+/// target is offscreen to avoid presentation pacing; one final readback syncs
+/// the GPU. No timestamp-query or GPU-time claim is made.
+pub fn benchmark(seed: u64, width: i64, height: i64, frames: i64, gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"voxel: no GPU: {e}");
+            return 1;
+        }
+    };
+    var world = match world_new(dev, seed, gpa) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln(f"voxel: terrain: {e}");
+            return 1;
+        }
+    };
+    var renderer = match renderer_new(dev, width, height) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"voxel: renderer: {e}");
+            return 1;
+        }
+    };
+    world.generate_initial(dev, &queue, renderer.layout(), renderer.camera);
+    let cam = camera_default();
+    let generation_clock = monotonic_now();
+    for _ in 0..16 {
+        world.update(dev, &queue, cam.x, cam.z, renderer.layout(), renderer.camera);
+    }
+    var vertices = 0;
+    for i in 0..world.chunks.len() {
+        vertices += vertex_count(&world, dev, i);
+    }
+    let generation_ms = monotonic_now().saturating_sub(generation_clock).as_secs_f64() * 1000.0;
+    let target_texture = dev.texture(width, height, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let target = target_texture.view();
+    let clock = monotonic_now();
+    var visible = 0;
+    for _ in 0..frames {
+        visible = renderer.draw(dev, &queue, target, world, cam, 1.0, 0,
+            [0.0, 0.0, 0.0], 0.0, false, 0);
+    }
+    let stride = (width * 4 + 255) / 256 * 256;
+    var readback = dev.buffer(stride * height, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(target_texture, readback, stride);
+    queue.submit(enc.finish());
+    let pixels = readback.map_read(dev);
+    let elapsed = monotonic_now().saturating_sub(clock).as_secs_f64();
+    var lit = 0;
+    for i in 0..width * height {
+        let p = i / width * stride + i % width * 4;
+        if pixels[p] as i64 + pixels[p + 1] as i64 + pixels[p + 2] as i64 > 30 { lit += 1; }
+    }
+    let generated_voxels = (world.chunks.len() - 9) as f64 * 49152.0;
+    println(f"benchmark {width}x{height}, {frames} frames, seed {seed}");
+    println(
+        f"generation {generation_ms:.2} ms, {world.chunks.len() - 9} chunks, {generated_voxels / generation_ms * 1000.0 / 1000000.0:.1} Mvoxels/s");
+    println(
+        f"render {elapsed * 1000.0 / frames as f64:.3} ms/frame, {frames as f64 / elapsed:.1} fps");
+    println(
+        f"world {world.chunks.len()} chunks, {visible} visible, {visible * 3} draws, {vertices / 3} mesh triangles");
+    if lit > width * height / 2 && vertices > 0 {
+        println("benchmark render ok");
+        return 0;
+    }
+    println("benchmark render FAIL");
+    1
+}
+
+pub fn run(seed: u64, width: i64, height: i64, out: [u8], gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"voxel: no GPU: {e}");
+            return 1;
+        }
+    };
+    var world = match world_new(dev, seed, gpa) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln(f"voxel: terrain: {e}");
+            return 1;
+        }
+    };
+    var renderer = match renderer_new(dev, width, height) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"voxel: renderer: {e}");
+            return 1;
+        }
+    };
+    world.generate_initial(dev, &queue, renderer.layout(), renderer.camera);
+    var surf = match inst.surface(dev, RawSurface::Headless) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"voxel: headless surface: {e}");
+            return 1;
+        }
+    };
+    surf.configure(dev, width, height, format: Format::Bgra8Unorm, vsync: false);
+    let frame = match surf.frame() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln(f"voxel: frame: {e}");
+            return 1;
+        }
+    };
+    let target = frame.texture.view();
+    let visible = renderer.draw(dev, &queue, target, world, camera_default(), 0.0, 0,
+        [0.0, 0.0, 0.0], 0.0, false, 0);
+    let stride = (width * 4 + 255) / 256 * 256;
+    var readback = dev.buffer(stride * height, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(enc.finish());
+    frame.present(&queue);
+    let pixels = readback.map_read(dev);
+    var lit = 0;
+    var varied = 0;
+    for y in 1..height {
+        for x in 1..width {
+            let p = y * stride + x * 4;
+            let q = p - 1;
+            if pixels[p] as i64 + pixels[p + 1] as i64 + pixels[p + 2] as i64 > 30 { lit += 1; }
+            if pixels[p] != pixels[q] || pixels[p + 1] != pixels[q + 1]
+                || pixels[p + 2] != pixels[q + 2] { varied += 1; }
+        }
+    }
+    let before = vertex_count(&world, dev, 0);
+    world.generate_initial(dev, &queue, renderer.layout(), renderer.camera);
+    let after = vertex_count(&world, dev, 0);
+    let deterministic = before == after && before > 0;
+    let edited = world.sculpt(dev, &queue, -24.0, 12.0, -24.0, 5.0, false);
+    let carved = vertex_count(&world, dev, 0);
+    world.chunks.remove(0);
+    let cam = camera_default();
+    for _ in 0..16 {
+        world.update(dev, &queue, cam.x, cam.z, renderer.layout(), renderer.camera);
+    }
+    var reloaded = 0;
+    for i in 0..world.chunks.len() {
+        if world.chunks[i].cx == -1 && world.chunks[i].cz == -1 { reloaded = i; }
+    }
+    let persisted = vertex_count(&world, dev, reloaded) == carved;
+    var water_faces = 0;
+    var plants = 0;
+    for i in 0..world.chunks.len() {
+        water_faces += meta_value(&world, dev, i, 1);
+        plants += meta_value(&world, dev, i, 2);
+    }
+    println(f"voxel {width}x{height}, {world.chunks.len()} chunks, {visible} visible");
+    println(f"mesh {before} vertices, deterministic regeneration {deterministic}");
+    println(f"edit {edited && before != carved}, unload/reload persistence {persisted}");
+    println(f"environment {water_faces} water faces, {plants} plants");
+    if out.len() > 0 {
+        if write_ppm(out, pixels, width, height, stride, gpa) {
+            println(f"wrote {out}");
+        } else {
+            return 1;
+        }
+    }
+    if lit > width * height / 2 && varied > width * height / 16 && deterministic
+        && edited && before != carved && persisted && water_faces > 0 && plants > 0 {
+        println("render ok");
+        return 0;
+    }
+    println(f"render FAIL ({lit} lit, {varied} varied, {before} vertices)");
+    1
+}
