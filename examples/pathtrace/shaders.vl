@@ -1,0 +1,614 @@
+// WGSL for the path tracer. The compute shader owns intersection, PBR material
+// sampling, rectangular area-light sampling, homogeneous fog, diagnostics and
+// progressive moments. The render shader tone-maps the same GPU buffers and
+// draws the compact instrument overlay; no full-image CPU readback is involved.
+
+pub const TRACE: [u8] = "struct Material {\n\
+    albedo: vec4<f32>,\n\
+    params: vec4<f32>,\n\
+    absorption: vec4<f32>,\n\
+    }\n\
+    struct Params {\n\
+    eye: vec4<f32>,\n\
+    target: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    config: vec4<f32>,\n\
+    flags: vec4<f32>,\n\
+    env: vec4<f32>,\n\
+    light_pos: vec4<f32>,\n\
+    light_color: vec4<f32>,\n\
+    light_size: vec4<f32>,\n\
+    materials: array<Material, 4>,\n\
+    }\n\
+    struct Hit {\n\
+    t: f32,\n\
+    p: vec3<f32>,\n\
+    n: vec3<f32>,\n\
+    id: u32,\n\
+    }\n\
+    struct Surface {\n\
+    normal: vec4<f32>,\n\
+    albedo: vec4<f32>,\n\
+    info: vec4<f32>,\n\
+    }\n\
+    struct LightSample {\n\
+    wi: vec3<f32>,\n\
+    distance: f32,\n\
+    pdf: f32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: Params;\n\
+    @group(0) @binding(1) var<storage, read_write> accum: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> gbuffer: array<Surface>;\n\
+    @group(0) @binding(3) var<storage, read_write> rays: array<vec4<f32>>;\n\
+    var<private> rng_state: u32;\n\
+    var<private> intersection_tests: u32;\n\
+    var<private> recording: bool;\n\
+    var<private> path_nodes: u32;\n\
+    fn rand() -> f32 {\n\
+    rng_state = rng_state * 747796405u + 2891336453u;\n\
+    var word = ((rng_state >> ((rng_state >> 28u) + 4u)) ^ rng_state) * 277803737u;\n\
+    word = (word >> 22u) ^ word;\n\
+    return f32(word) * 2.3283064365386963e-10;\n\
+    }\n\
+    fn unit_vector() -> vec3<f32> {\n\
+    let z = rand() * 2.0 - 1.0;\n\
+    let a = rand() * 6.28318530718;\n\
+    let r = sqrt(max(0.0, 1.0 - z * z));\n\
+    return vec3<f32>(r * cos(a), r * sin(a), z);\n\
+    }\n\
+    fn basis(n: vec3<f32>) -> mat3x3<f32> {\n\
+    var tangent = vec3<f32>(1.0, 0.0, 0.0);\n\
+    if abs(n.z) < 0.999 { tangent = vec3<f32>(0.0, 1.0, 0.0); }\n\
+    let x = normalize(cross(tangent, n));\n\
+    let y = cross(n, x);\n\
+    return mat3x3<f32>(x, y, n);\n\
+    }\n\
+    fn matte(albedo: vec3<f32>, roughness: f32, metallic: f32) -> Material {\n\
+    return Material(vec4<f32>(albedo, roughness),\n\
+    vec4<f32>(metallic, 1.45, 0.0, 0.0), vec4<f32>(1.0, 1.0, 1.0, 0.0));\n\
+    }\n\
+    fn light_material() -> Material {\n\
+    return Material(vec4<f32>(0.0), vec4<f32>(0.0),\n\
+    vec4<f32>(u.light_color.xyz * u.light_pos.w, 0.0));\n\
+    }\n\
+    fn miss() -> Hit {\n\
+    return Hit(1.0e20, vec3<f32>(0.0), vec3<f32>(0.0, 1.0, 0.0), 0u);\n\
+    }\n\
+    fn record_point(p: vec3<f32>, event: f32) {\n\
+    if recording && path_nodes < 15u {\n\
+    rays[path_nodes] = vec4<f32>(p, event);\n\
+    path_nodes += 1u;\n\
+    }\n\
+    }\n\
+    fn sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32,\n\
+    id: u32, best: Hit) -> Hit {\n\
+    intersection_tests += 1u;\n\
+    var h = best;\n\
+    let oc = ro - center;\n\
+    let b = dot(oc, rd);\n\
+    let c = dot(oc, oc) - radius * radius;\n\
+    let discriminant = b * b - c;\n\
+    if discriminant > 0.0 {\n\
+    let root = sqrt(discriminant);\n\
+    var t = -b - root;\n\
+    if t <= 0.0001 { t = -b + root; }\n\
+    if t > 0.0001 && t < h.t {\n\
+    let p = ro + rd * t;\n\
+    h = Hit(t, p, (p - center) / radius, id);\n\
+    }\n\
+    }\n\
+    return h;\n\
+    }\n\
+    fn plane(ro: vec3<f32>, rd: vec3<f32>, normal: vec3<f32>, d: f32,\n\
+    id: u32, best: Hit) -> Hit {\n\
+    intersection_tests += 1u;\n\
+    var h = best;\n\
+    let denominator = dot(rd, normal);\n\
+    if abs(denominator) > 0.000001 {\n\
+    let t = (d - dot(ro, normal)) / denominator;\n\
+    if t > 0.0001 && t < h.t {\n\
+    h = Hit(t, ro + rd * t, normal, id);\n\
+    }\n\
+    }\n\
+    return h;\n\
+    }\n\
+    fn area_light(ro: vec3<f32>, rd: vec3<f32>, best: Hit) -> Hit {\n\
+    intersection_tests += 1u;\n\
+    var h = best;\n\
+    if abs(rd.y) > 0.000001 {\n\
+    let t = (5.0 - ro.y) / rd.y;\n\
+    let p = ro + rd * t;\n\
+    if t > 0.0001 && t < h.t && abs(p.x - u.light_pos.x) <= u.light_size.x * 0.5\n\
+    && abs(p.z - u.light_pos.z) <= u.light_size.y * 0.5 {\n\
+    h = Hit(t, p, vec3<f32>(0.0, -1.0, 0.0), 9u);\n\
+    }\n\
+    }\n\
+    return h;\n\
+    }\n\
+    fn shadow_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32,\n\
+    max_t: f32) -> bool {\n\
+    intersection_tests += 1u;\n\
+    let oc = ro - center;\n\
+    let b = dot(oc, rd);\n\
+    let c = dot(oc, oc) - radius * radius;\n\
+    let discriminant = b * b - c;\n\
+    if discriminant <= 0.0 { return false; }\n\
+    let root = sqrt(discriminant);\n\
+    let near = -b - root;\n\
+    if near > 0.0001 && near < max_t { return true; }\n\
+    let far = -b + root;\n\
+    return far > 0.0001 && far < max_t;\n\
+    }\n\
+    fn shadow_plane(ro: vec3<f32>, rd: vec3<f32>, normal: vec3<f32>, d: f32,\n\
+    max_t: f32) -> bool {\n\
+    intersection_tests += 1u;\n\
+    let denominator = dot(rd, normal);\n\
+    if abs(denominator) <= 0.000001 { return false; }\n\
+    let t = (d - dot(ro, normal)) / denominator;\n\
+    return t > 0.0001 && t < max_t;\n\
+    }\n\
+    fn visible(ro: vec3<f32>, rd: vec3<f32>, distance: f32) -> bool {\n\
+    let max_t = distance - 0.001;\n\
+    if u.flags.y > 0.5 {\n\
+    if shadow_plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -2.2, max_t) { return false; }\n\
+    if shadow_plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -1.2, max_t) { return false; }\n\
+    for (var row: u32 = 0u; row < 4u; row += 1u) {\n\
+    for (var column: u32 = 0u; column < 4u; column += 1u) {\n\
+    let center = vec3<f32>((f32(column) - 1.5) * 1.20, (1.5 - f32(row)) * 1.05, 0.0);\n\
+    if shadow_sphere(ro, rd, center, 0.45, max_t) { return false; }\n\
+    }\n\
+    }\n\
+    return true;\n\
+    }\n\
+    if shadow_plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, max_t) { return false; }\n\
+    if shadow_plane(ro, rd, vec3<f32>(1.0, 0.0, 0.0), -4.2, max_t) { return false; }\n\
+    if shadow_plane(ro, rd, vec3<f32>(-1.0, 0.0, 0.0), -4.2, max_t) { return false; }\n\
+    if shadow_plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -3.2, max_t) { return false; }\n\
+    if shadow_sphere(ro, rd, vec3<f32>(-2.0, 0.0, 0.0), 1.0, max_t) { return false; }\n\
+    if shadow_sphere(ro, rd, vec3<f32>(0.0, 0.0, -0.35), 1.0, max_t) { return false; }\n\
+    if shadow_sphere(ro, rd, vec3<f32>(2.0, 0.0, 0.0), 1.0, max_t) { return false; }\n\
+    if shadow_sphere(ro, rd, vec3<f32>(0.0, -0.45, 2.1), 0.55, max_t) { return false; }\n\
+    return true;\n\
+    }\n\
+    fn grid_material(column: u32, row: u32) -> Material {\n\
+    let roughness = 0.035 + f32(row) * 0.30;\n\
+    let metallic = f32(column) / 3.0;\n\
+    let tint = mix(vec3<f32>(0.56, 0.60, 0.66), vec3<f32>(0.83, 0.55, 0.20), metallic);\n\
+    return matte(tint, roughness, metallic);\n\
+    }\n\
+    fn hit_material(h: Hit) -> Material {\n\
+    if h.id < 4u { return u.materials[h.id]; }\n\
+    if h.id == 4u {\n\
+    var mat = matte(vec3<f32>(0.42, 0.45, 0.50), 0.12, 0.72);\n\
+    let cell = floor(h.p.x * 0.65) + floor(h.p.z * 0.65);\n\
+    let parity = cell - 2.0 * floor(cell * 0.5);\n\
+    let color = mix(vec3<f32>(0.12, 0.14, 0.17), vec3<f32>(0.58, 0.61, 0.65), parity);\n\
+    mat.albedo = vec4<f32>(color, mat.albedo.w);\n\
+    return mat;\n\
+    }\n\
+    if h.id == 5u { return matte(vec3<f32>(0.62, 0.055, 0.035), 0.72, 0.0); }\n\
+    if h.id == 6u { return matte(vec3<f32>(0.035, 0.16, 0.62), 0.72, 0.0); }\n\
+    if h.id == 7u { return matte(vec3<f32>(0.56, 0.54, 0.49), 0.78, 0.0); }\n\
+    if h.id == 9u { return light_material(); }\n\
+    if h.id == 20u { return matte(vec3<f32>(0.34, 0.37, 0.42), 0.18, 0.65); }\n\
+    if h.id == 21u { return matte(vec3<f32>(0.42, 0.44, 0.48), 0.65, 0.0); }\n\
+    if h.id >= 30u {\n\
+    let cell = h.id - 30u;\n\
+    return grid_material(cell % 4u, cell / 4u);\n\
+    }\n\
+    return matte(vec3<f32>(0.0), 1.0, 0.0);\n\
+    }\n\
+    fn scene(ro: vec3<f32>, rd: vec3<f32>) -> Hit {\n\
+    var h = miss();\n\
+    if u.flags.y > 0.5 {\n\
+    h = plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -2.2, 20u, h);\n\
+    h = plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -1.2, 21u, h);\n\
+    for (var row: u32 = 0u; row < 4u; row += 1u) {\n\
+    for (var column: u32 = 0u; column < 4u; column += 1u) {\n\
+    let center = vec3<f32>((f32(column) - 1.5) * 1.20, (1.5 - f32(row)) * 1.05, 0.0);\n\
+    h = sphere(ro, rd, center, 0.45, 30u + row * 4u + column, h);\n\
+    }\n\
+    }\n\
+    return area_light(ro, rd, h);\n\
+    }\n\
+    h = plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, 4u, h);\n\
+    h = plane(ro, rd, vec3<f32>(1.0, 0.0, 0.0), -4.2, 5u, h);\n\
+    h = plane(ro, rd, vec3<f32>(-1.0, 0.0, 0.0), -4.2, 6u, h);\n\
+    h = plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -3.2, 7u, h);\n\
+    h = sphere(ro, rd, vec3<f32>(-2.0, 0.0, 0.0), 1.0, 0u, h);\n\
+    h = sphere(ro, rd, vec3<f32>(0.0, 0.0, -0.35), 1.0, 1u, h);\n\
+    h = sphere(ro, rd, vec3<f32>(2.0, 0.0, 0.0), 1.0, 2u, h);\n\
+    h = sphere(ro, rd, vec3<f32>(0.0, -0.45, 2.1), 0.55, 3u, h);\n\
+    return area_light(ro, rd, h);\n\
+    }\n\
+    fn sky(rd: vec3<f32>) -> vec3<f32> {\n\
+    let t = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);\n\
+    let gradient = mix(vec3<f32>(0.10, 0.13, 0.19), vec3<f32>(0.34, 0.46, 0.68), t);\n\
+    let lobe = max(0.0, dot(rd, normalize(vec3<f32>(-0.5, 0.65, 0.35))));\n\
+    let lobe2 = lobe * lobe;\n\
+    let lobe4 = lobe2 * lobe2;\n\
+    let lobe8 = lobe4 * lobe4;\n\
+    let studio = lobe8 * lobe8 * lobe2;\n\
+    return (gradient + vec3<f32>(1.0, 0.82, 0.62) * studio * 2.2) * u.env.x;\n\
+    }\n\
+    fn sample_light(p: vec3<f32>) -> LightSample {\n\
+    let q = u.light_pos.xyz + vec3<f32>((rand() - 0.5) * u.light_size.x, 0.0,\n\
+    (rand() - 0.5) * u.light_size.y);\n\
+    let delta = q - p;\n\
+    let distance2 = dot(delta, delta);\n\
+    let distance = sqrt(distance2);\n\
+    let wi = delta / distance;\n\
+    let cosine = max(0.0001, dot(vec3<f32>(0.0, -1.0, 0.0), -wi));\n\
+    let pdf = distance2 / (u.light_size.x * u.light_size.y * cosine);\n\
+    return LightSample(wi, distance, pdf);\n\
+    }\n\
+    fn transmittance(distance: f32) -> vec3<f32> {\n\
+    return exp(vec3<f32>(-u.env.y * distance));\n\
+    }\n\
+    fn fresnel(f0: vec3<f32>, cosine: f32) -> vec3<f32> {\n\
+    let one = 1.0 - cosine;\n\
+    let squared = one * one;\n\
+    return f0 + (vec3<f32>(1.0) - f0) * (squared * squared * one);\n\
+    }\n\
+    fn ggx_d(noh: f32, roughness: f32) -> f32 {\n\
+    let alpha = max(0.0001, roughness * roughness);\n\
+    let alpha2 = alpha * alpha;\n\
+    let d = noh * noh * (alpha2 - 1.0) + 1.0;\n\
+    return alpha2 / max(0.000001, 3.14159265359 * d * d);\n\
+    }\n\
+    fn eval_bsdf(n: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>, mat: Material) -> vec3<f32> {\n\
+    let nol = max(0.0, dot(n, wi));\n\
+    let nov = max(0.0001, dot(n, wo));\n\
+    let half = normalize(wo + wi);\n\
+    let noh = max(0.0, dot(n, half));\n\
+    let voh = max(0.0001, dot(wo, half));\n\
+    let f0 = mix(vec3<f32>(0.04), mat.albedo.xyz, mat.params.x);\n\
+    let f = fresnel(f0, voh);\n\
+    let d = ggx_d(noh, mat.albedo.w);\n\
+    let k = (mat.albedo.w + 1.0) * (mat.albedo.w + 1.0) * 0.125;\n\
+    let gv = nov * (1.0 - k) + k;\n\
+    let gl = nol * (1.0 - k) + k;\n\
+    let specular = d * f / (4.0 * gv * gl);\n\
+    let diffuse = (vec3<f32>(1.0) - f) * (1.0 - mat.params.x) * mat.albedo.xyz / 3.14159265359;\n\
+    return specular + diffuse;\n\
+    }\n\
+    fn direct_surface(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, mat: Material) -> vec3<f32> {\n\
+    let light = sample_light(p);\n\
+    let nol = max(0.0, dot(n, light.wi));\n\
+    if nol == 0.0 { return vec3<f32>(0.0); }\n\
+    if !visible(p + n * 0.001, light.wi, light.distance) { return vec3<f32>(0.0); }\n\
+    let brdf = eval_bsdf(n, wo, light.wi, mat);\n\
+    return brdf * u.light_color.xyz * (u.light_pos.w * nol / light.pdf) * transmittance(light.distance);\n\
+    }\n\
+    fn phase(cosine: f32) -> f32 {\n\
+    let g = u.env.z;\n\
+    let denominator = max(0.001, 1.0 + g * g - 2.0 * g * cosine);\n\
+    return (1.0 - g * g) / (12.56637061436 * denominator * sqrt(denominator));\n\
+    }\n\
+    fn sample_phase(direction: vec3<f32>) -> vec3<f32> {\n\
+    let g = u.env.z;\n\
+    var cosine = 1.0 - 2.0 * rand();\n\
+    if abs(g) > 0.001 {\n\
+    let ratio = (1.0 - g * g) / (1.0 - g + 2.0 * g * rand());\n\
+    cosine = (1.0 + g * g - ratio * ratio) / (2.0 * g);\n\
+    }\n\
+    let phi = rand() * 6.28318530718;\n\
+    let sine = sqrt(max(0.0, 1.0 - cosine * cosine));\n\
+    return normalize(basis(direction) * vec3<f32>(sine * cos(phi), sine * sin(phi), cosine));\n\
+    }\n\
+    fn direct_medium(p: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {\n\
+    let light = sample_light(p);\n\
+    if !visible(p, light.wi, light.distance) { return vec3<f32>(0.0); }\n\
+    return u.light_color.xyz * (u.light_pos.w * phase(dot(direction, light.wi)) / light.pdf)\n\
+    * transmittance(light.distance);\n\
+    }\n\
+    fn sample_ggx(n: vec3<f32>, roughness: f32) -> vec3<f32> {\n\
+    let alpha = max(0.0001, roughness * roughness);\n\
+    let phi = rand() * 6.28318530718;\n\
+    let r = rand();\n\
+    let cosine = sqrt((1.0 - r) / (1.0 + (alpha * alpha - 1.0) * r));\n\
+    let sine = sqrt(max(0.0, 1.0 - cosine * cosine));\n\
+    return normalize(basis(n) * vec3<f32>(sine * cos(phi), sine * sin(phi), cosine));\n\
+    }\n\
+    fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {\n\
+    var origin = ro;\n\
+    var direction = rd;\n\
+    var radiance = vec3<f32>(0.0);\n\
+    var throughput = vec3<f32>(1.0);\n\
+    var specular = false;\n\
+    var depth_traced = 0u;\n\
+    intersection_tests = 0u;\n\
+    if recording {\n\
+    path_nodes = 1u;\n\
+    rays[0] = vec4<f32>(ro, 0.0);\n\
+    }\n\
+    for (var bounce: u32 = 0u; bounce < 6u; bounce += 1u) {\n\
+    depth_traced = bounce + 1u;\n\
+    let h = scene(origin, direction);\n\
+    var medium = false;\n\
+    var travel = h.t;\n\
+    if u.env.y > 0.00001 {\n\
+    let free_flight = -log(max(0.000001, 1.0 - rand())) / u.env.y;\n\
+    if free_flight < h.t { medium = true; travel = free_flight; }\n\
+    }\n\
+    if medium {\n\
+    let p = origin + direction * travel;\n\
+    radiance += throughput * direct_medium(p, direction);\n\
+    if u.flags.z < 0.5 { break; }\n\
+    direction = sample_phase(direction);\n\
+    throughput *= vec3<f32>(0.94, 0.96, 0.99);\n\
+    origin = p + direction * 0.001;\n\
+    specular = false;\n\
+    record_point(p, 4.0);\n\
+    } else {\n\
+    if h.t > 1.0e19 {\n\
+    radiance += throughput * sky(direction);\n\
+    record_point(origin + direction * 20.0, 0.0);\n\
+    break;\n\
+    }\n\
+    let mat = hit_material(h);\n\
+    let front = dot(direction, h.n) < 0.0;\n\
+    var n = h.n;\n\
+    if !front { n = -n; }\n\
+    if sample == 0u && bounce == 0u {\n\
+    gbuffer[index].normal = vec4<f32>(n, h.t);\n\
+    gbuffer[index].albedo = vec4<f32>(mat.albedo.xyz, f32(h.id));\n\
+    }\n\
+    if h.id == 9u {\n\
+    if bounce == 0u || specular { radiance += throughput * mat.absorption.xyz; }\n\
+    record_point(h.p, 2.0);\n\
+    break;\n\
+    }\n\
+    if mat.absorption.w > 0.0 {\n\
+    radiance += throughput * mat.absorption.xyz * mat.absorption.w;\n\
+    record_point(h.p, 1.0);\n\
+    break;\n\
+    }\n\
+    if mat.params.z > 0.5 {\n\
+    if !front {\n\
+    let extinction = (vec3<f32>(1.0) - mat.absorption.xyz) * mat.params.w;\n\
+    throughput *= exp(-extinction * h.t);\n\
+    }\n\
+    var eta = mat.params.y;\n\
+    if front { eta = 1.0 / eta; }\n\
+    let cosine = min(1.0, max(0.0, dot(-direction, n)));\n\
+    var r0 = (1.0 - mat.params.y) / (1.0 + mat.params.y);\n\
+    r0 = r0 * r0;\n\
+    let one = 1.0 - cosine;\n\
+    let squared = one * one;\n\
+    let reflectance = r0 + (1.0 - r0) * squared * squared * one;\n\
+    let k = 1.0 - eta * eta * (1.0 - cosine * cosine);\n\
+    var refracted = vec3<f32>(0.0);\n\
+    if k >= 0.0 { refracted = eta * direction + (eta * cosine - sqrt(k)) * n; }\n\
+    if dot(refracted, refracted) == 0.0 || rand() < reflectance {\n\
+    direction = reflect(direction, n);\n\
+    record_point(h.p, 2.0);\n\
+    } else {\n\
+    direction = refracted;\n\
+    record_point(h.p, 3.0);\n\
+    }\n\
+    direction = normalize(direction);\n\
+    throughput *= mat.albedo.xyz;\n\
+    specular = true;\n\
+    } else {\n\
+    let wo = normalize(-direction);\n\
+    radiance += throughput * direct_surface(h.p, n, wo, mat);\n\
+    if u.flags.z < 0.5 {\n\
+    record_point(h.p, 1.0);\n\
+    break;\n\
+    }\n\
+    let specular_probability = 0.25 + 0.75 * mat.params.x;\n\
+    var next = normalize(n + unit_vector());\n\
+    if rand() < specular_probability {\n\
+    let micro_normal = sample_ggx(n, mat.albedo.w);\n\
+    next = reflect(direction, micro_normal);\n\
+    }\n\
+    let nol = max(0.0, dot(n, next));\n\
+    if nol <= 0.0 { break; }\n\
+    next = normalize(next);\n\
+    let half = normalize(wo + next);\n\
+    let noh = max(0.0, dot(n, half));\n\
+    let voh = max(0.0001, dot(wo, half));\n\
+    let specular_pdf = ggx_d(noh, mat.albedo.w) * noh / (4.0 * voh);\n\
+    let diffuse_pdf = nol / 3.14159265359;\n\
+    let pdf = specular_probability * specular_pdf + (1.0 - specular_probability) * diffuse_pdf;\n\
+    throughput *= eval_bsdf(n, wo, next, mat) * (nol / max(0.0001, pdf));\n\
+    direction = next;\n\
+    specular = false;\n\
+    record_point(h.p, 1.0);\n\
+    }\n\
+    origin = h.p + direction * 0.001;\n\
+    }\n\
+    if bounce >= 2u {\n\
+    let survival = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);\n\
+    if rand() > survival { break; }\n\
+    throughput /= survival;\n\
+    }\n\
+    }\n\
+    if sample == 0u {\n\
+    gbuffer[index].info = vec4<f32>(f32(intersection_tests), f32(depth_traced), 0.0, 0.0);\n\
+    }\n\
+    if recording { rays[17] = vec4<f32>(f32(path_nodes), 0.0, 0.0, 0.0); }\n\
+    return max(radiance, vec3<f32>(0.0));\n\
+    }\n\
+    @compute @workgroup_size(16, 16)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let width = u32(u.dims.x);\n\
+    let height = u32(u.dims.y);\n\
+    if gid.x >= width || gid.y >= height { return; }\n\
+    let sample = u32(u.dims.z);\n\
+    rng_state = (gid.x * 1973u + gid.y * 9277u + sample * 26699u) ^ 0x9E3779B9u;\n\
+    let aspect = u.dims.x / u.dims.y;\n\
+    let forward = normalize(u.target.xyz - u.eye.xyz);\n\
+    let right = normalize(cross(forward, vec3<f32>(0.0, 1.0, 0.0)));\n\
+    let up = cross(right, forward);\n\
+    let px = (f32(gid.x) + rand()) / u.dims.x;\n\
+    let py = (f32(gid.y) + rand()) / u.dims.y;\n\
+    let sx = (px * 2.0 - 1.0) * aspect * u.config.x;\n\
+    let sy = (1.0 - py * 2.0) * u.config.x;\n\
+    var origin = u.eye.xyz;\n\
+    var direction = normalize(forward + right * sx + up * sy);\n\
+    if u.config.y > 0.0 {\n\
+    let focal = origin + direction * (u.config.z / max(0.001, dot(direction, forward)));\n\
+    let angle = rand() * 6.28318530718;\n\
+    let radius = sqrt(rand()) * u.config.y;\n\
+    origin += right * (cos(angle) * radius) + up * (sin(angle) * radius);\n\
+    direction = normalize(focal - origin);\n\
+    }\n\
+    let index = gid.y * width + gid.x;\n\
+    let selected_x = u32(u.light_size.z * u.dims.x);\n\
+    let selected_y = u32(u.light_size.w * u.dims.y);\n\
+    recording = u.flags.x == 8.0 && gid.x == selected_x && gid.y == selected_y;\n\
+    let color = trace(origin, direction, index, sample);\n\
+    var sum = vec3<f32>(0.0);\n\
+    var moments = vec3<f32>(0.0);\n\
+    if sample > 0u {\n\
+    sum = accum[index * 3u].xyz;\n\
+    moments = accum[index * 3u + 1u].xyz;\n\
+    }\n\
+    let luminance = dot(color, vec3<f32>(0.3333333333));\n\
+    accum[index * 3u] = vec4<f32>(sum + color, 1.0);\n\
+    accum[index * 3u + 1u] = vec4<f32>(moments + vec3<f32>(luminance * luminance), 1.0);\n\
+    if sample == 0u { accum[index * 3u + 2u] = vec4<f32>(color, 1.0); }\n\
+    }\n";
+
+pub const DISPLAY: [u8] = "struct Material {\n\
+    albedo: vec4<f32>,\n\
+    params: vec4<f32>,\n\
+    absorption: vec4<f32>,\n\
+    }\n\
+    struct Params {\n\
+    eye: vec4<f32>,\n\
+    target: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    config: vec4<f32>,\n\
+    flags: vec4<f32>,\n\
+    env: vec4<f32>,\n\
+    light_pos: vec4<f32>,\n\
+    light_color: vec4<f32>,\n\
+    light_size: vec4<f32>,\n\
+    materials: array<Material, 4>,\n\
+    }\n\
+    struct Surface {\n\
+    normal: vec4<f32>,\n\
+    albedo: vec4<f32>,\n\
+    info: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: Params;\n\
+    @group(0) @binding(1) var<storage, read> accum: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> gbuffer: array<Surface>;\n\
+    @group(0) @binding(3) var<storage, read> rays: array<vec4<f32>>;\n\
+    struct Vertex {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) id: u32) -> Vertex {\n\
+    let x = f32((id << 1u) & 2u);\n\
+    let y = f32(id & 2u);\n\
+    var out: Vertex;\n\
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);\n\
+    out.uv = vec2<f32>(x, y);\n\
+    return out;\n\
+    }\n\
+    fn tone(color: vec3<f32>) -> vec3<f32> {\n\
+    let exposed = max(color * u.config.w, vec3<f32>(0.0));\n\
+    let mapped = exposed / (exposed + vec3<f32>(1.0));\n\
+    return pow(mapped, vec3<f32>(1.0 / 2.2));\n\
+    }\n\
+    fn heat(t: f32) -> vec3<f32> {\n\
+    let x = clamp(t, 0.0, 1.0);\n\
+    return vec3<f32>(clamp(2.0 * x, 0.0, 1.0),\n\
+    clamp(2.0 - 2.0 * abs(x - 0.5), 0.0, 1.0), clamp(1.0 - 2.0 * x, 0.0, 1.0));\n\
+    }\n\
+    fn project(p: vec3<f32>) -> vec3<f32> {\n\
+    let forward = normalize(u.target.xyz - u.eye.xyz);\n\
+    let right = normalize(cross(forward, vec3<f32>(0.0, 1.0, 0.0)));\n\
+    let up = cross(right, forward);\n\
+    let relative = p - u.eye.xyz;\n\
+    let depth = dot(relative, forward);\n\
+    let aspect = u.dims.x / u.dims.y;\n\
+    let x = dot(relative, right) / max(0.0001, depth * aspect * u.config.x);\n\
+    let y = dot(relative, up) / max(0.0001, depth * u.config.x);\n\
+    return vec3<f32>((x * 0.5 + 0.5) * u.dims.x, (0.5 - y * 0.5) * u.dims.y, depth);\n\
+    }\n\
+    fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {\n\
+    let ab = b - a;\n\
+    let t = clamp(dot(p - a, ab) / max(0.0001, dot(ab, ab)), 0.0, 1.0);\n\
+    return length(p - (a + ab * t));\n\
+    }\n\
+    @fragment fn fs(v: Vertex) -> @location(0) vec4<f32> {\n\
+    let width = u32(u.dims.x);\n\
+    let height = u32(u.dims.y);\n\
+    let x = min(width - 1u, u32(v.uv.x * u.dims.x));\n\
+    let y = min(height - 1u, u32(v.uv.y * u.dims.y));\n\
+    let index = y * width + x;\n\
+    let count = max(1.0, u.dims.z + 1.0);\n\
+    let average = accum[index * 3u].xyz / count;\n\
+    var linear = average;\n\
+    if u.env.w > 0.5 && v.uv.x < 0.5 { linear = accum[index * 3u + 2u].xyz; }\n\
+    var color = tone(linear);\n\
+    if u.env.w > 0.5 && abs(v.uv.x - 0.5) * u.dims.x < 0.7 {\n\
+    color = vec3<f32>(0.8, 0.9, 1.0);\n\
+    }\n\
+    let mode = u32(u.flags.x + 0.5);\n\
+    if mode == 1u { color = gbuffer[index].normal.xyz * 0.5 + vec3<f32>(0.5); }\n\
+    if mode == 2u { color = tone(gbuffer[index].albedo.xyz); }\n\
+    if mode == 3u { color = heat(1.0 - exp(-gbuffer[index].normal.w * 0.075)); }\n\
+    if mode == 4u { color = heat(gbuffer[index].info.x * 0.012); }\n\
+    if mode == 5u {\n\
+    let id = u32(gbuffer[index].albedo.w + 0.5);\n\
+    color = heat(fract(f32(id) * 0.61803398875));\n\
+    }\n\
+    if mode == 6u { color = heat(gbuffer[index].info.y / 6.0); }\n\
+    if mode == 7u {\n\
+    let mean = max(0.0001, dot(average, vec3<f32>(0.3333333333)));\n\
+    let m2 = accum[index * 3u + 1u].x / count;\n\
+    let standard_error = sqrt(max(0.0, m2 - mean * mean) / max(1.0, count - 1.0));\n\
+    color = heat(standard_error / max(0.03, mean));\n\
+    }\n\
+    let pixel = vec2<f32>(f32(x), f32(y));\n\
+    if mode == 8u {\n\
+    let nodes = u32(rays[17].x);\n\
+    for (var i: u32 = 0u; i < 14u; i += 1u) {\n\
+    if i + 1u < nodes {\n\
+    let a = project(rays[i].xyz);\n\
+    let b = project(rays[i + 1u].xyz);\n\
+    if a.z > 0.0 && b.z > 0.0 && segment_distance(pixel, a.xy, b.xy) < 1.6 {\n\
+    let event = rays[i + 1u].w;\n\
+    var ray_color = vec3<f32>(1.0, 0.85, 0.15);\n\
+    if event == 2.0 { ray_color = vec3<f32>(0.1, 0.9, 1.0); }\n\
+    if event == 3.0 { ray_color = vec3<f32>(1.0, 0.2, 0.85); }\n\
+    if event == 4.0 { ray_color = vec3<f32>(1.0, 0.45, 0.1); }\n\
+    color = ray_color;\n\
+    }\n\
+    }\n\
+    }\n\
+    let selected = u.light_size.zw * u.dims.xy;\n\
+    if abs(pixel.x - selected.x) < 0.8 || abs(pixel.y - selected.y) < 0.8 {\n\
+    if length(pixel - selected) < 8.0 { color = vec3<f32>(1.0); }\n\
+    }\n\
+    }\n\
+    if mode != 8u && pixel.x < 218.0 && pixel.y < 52.0 {\n\
+    color = mix(color, vec3<f32>(0.015, 0.02, 0.03), 0.82);\n\
+    if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 10.0 && pixel.y < 15.0 {\n\
+    color = vec3<f32>(0.12, 0.16, 0.22);\n\
+    if pixel.x < 10.0 + 194.0 * min(1.0, count / 512.0) {\n\
+    color = vec3<f32>(0.25, 0.75, 1.0);\n\
+    }\n\
+    }\n\
+    let selected_material = u.materials[u32(u.flags.w + 0.5)];\n\
+    if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 23.0 && pixel.y < 28.0 {\n\
+    color = selected_material.albedo.xyz;\n\
+    if pixel.x > 10.0 + 194.0 * selected_material.albedo.w {\n\
+    color = vec3<f32>(0.08, 0.09, 0.11);\n\
+    }\n\
+    }\n\
+    if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 35.0 && pixel.y < 40.0 {\n\
+    color = vec3<f32>(0.65, 0.72, 0.82);\n\
+    if pixel.x > 10.0 + 194.0 * selected_material.params.x {\n\
+    color = vec3<f32>(0.08, 0.09, 0.11);\n\
+    }\n\
+    }\n\
+    }\n\
+    return vec4<f32>(color, 1.0);\n\
+    }\n";
