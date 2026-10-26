@@ -97,3 +97,15 @@ Check and test only what a change touches, and widen at milestones:
   release N are used in `compiler/src` only from N+1.
 - No undefined behaviour, no wildcard imports; compile speed is measured
   every release.
+- `unsafe` must be justified. Try the safe way first (std's APIs, `Vec`,
+  slices, `str`, or a new safe std function); use `unsafe` only when
+  that is impossible, around the one operation that needs it, with a
+  comment right above it:
+
+  ```
+  // UNSAFE: why this cannot be safe (C or the OS, allocator internals, a measured hot path)
+  // SAFETY: why it is sound (bounds, lifetimes, aliasing, initialization, and what guarantees them)
+  ```
+
+  The same goes for an `unsafe fn` and an `extern` block. Never add
+  `unsafe` (or let `volec fix` add it) to silence an error.
