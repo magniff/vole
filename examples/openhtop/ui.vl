@@ -1,0 +1,733 @@
+// The frame: header meters, the process table, the status and the key bar.
+
+use crate::format::{
+    format_cpu_time, format_load, format_uptime, format_used_total, human_size, meter_bar,
+    sort_label, usage_color,
+};
+use crate::model::{Proc, Snapshot, State, copy_text, max, min, process_matches};
+use crate::text::cut_text;
+
+// The width at which the header becomes two panels (meters on the left,
+// tasks and load on the right); below it the header is two compact lines.
+const RICH_HEADER_MIN_WIDTH: i64 = 60;
+
+// The inside of a resource meter, and of a core bar; the label sits before.
+const METER_CELLS: i64 = 20;
+const CORE_CELLS: i64 = 10;
+const CORE_STEP: i64 = 15; // " 1[|||  12.3%]" and the space after it
+const CORE_PREFIX: i64 = 6; // "Cores "
+
+// The right panel of the rich header: a label in a field this wide, then
+// its value.
+const INFO_LABEL: i64 = 10;
+
+// ANSI styles. Red, yellow and green come from usage_color, by load.
+const STYLE_BOLD: [u8] = "\x1b[1m";
+const STYLE_CPU_LABEL: [u8] = "\x1b[1;32m";
+const STYLE_MEM_LABEL: [u8] = "\x1b[1;34m";
+const STYLE_SWP_LABEL: [u8] = "\x1b[1;35m";
+const STYLE_HEADER: [u8] = "\x1b[30;46m"; // black on cyan
+const STYLE_ACTIVE_HEADER: [u8] = "\x1b[1;30;47m"; // black on white, bold
+const STYLE_SELECTED: [u8] = "\x1b[1;30;46m"; // black on cyan, bold
+const STYLE_RUNNING: [u8] = "\x1b[1;32m";
+const STYLE_SLEEPING: [u8] = "\x1b[1;36m";
+const STYLE_STOPPED: [u8] = "\x1b[1;33m";
+const STYLE_ZOMBIE: [u8] = "\x1b[1;31m";
+const STYLE_INFO: [u8] = "\x1b[1;36m";
+const STYLE_SORT_VALUE: [u8] = "\x1b[1;32m";
+const STYLE_PAUSED: [u8] = "\x1b[30;43m"; // black on yellow
+const STYLE_KEY_BAR: [u8] = "\x1b[30;42m"; // black on green
+const STYLE_KEY_NUMBER: [u8] = "\x1b[1;30;47m"; // black on white, bold
+const STYLE_RESET: [u8] = "\x1b[0m";
+
+// ---- One line ----
+
+// One line being built: the bytes, the columns they take on screen (so a
+// style's escape sequences do not count), the width, and the base style a
+// nested style returns to (a table row's selection band stays under the
+// colored cells in it).
+struct Line {
+    buf: Buf,
+    vis: i64,
+    width: i64,
+    style: bool,
+    base: [u8; 32],
+    base_len: i64,
+}
+
+impl Line {
+    fn new(width: i64, gpa: Gpa) -> Line {
+        Line {
+            buf: Buf::with_capacity_in(width + 64, gpa),
+            vis: 0,
+            width: width,
+            style: false,
+            base: [0; 32],
+            base_len: 0,
+        }
+    }
+
+    fn reset(inout self) {
+        self.buf.clear();
+        self.vis = 0;
+        self.style = false;
+        self.base_len = 0;
+    }
+
+    fn text(inout self, s: [u8]) {
+        let room = self.width - self.vis;
+        if room <= 0 {
+            return;
+        }
+        let shown = cut_text(s, room);
+        self.buf.push_str(shown);
+        self.vis += shown.len;
+    }
+
+    fn spaces(inout self, n: i64) {
+        for _ in 0..n {
+            self.text(" ");
+        }
+    }
+
+    // s right-aligned in w columns, cut when it is longer.
+    fn right(inout self, s: [u8], w: i64) {
+        if s.len >= w {
+            self.text(s);
+        } else {
+            self.spaces(w - s.len);
+            self.text(s);
+        }
+    }
+
+    // s left-aligned in w columns, cut when it is longer.
+    fn left(inout self, s: [u8], w: i64) {
+        let start = self.vis;
+        self.text(cut_text(s, w));
+        let used = self.vis - start;
+        if used < w {
+            self.spaces(w - used);
+        }
+    }
+
+    fn begin(inout self, code: [u8]) {
+        self.buf.push_str(code);
+        self.style = true;
+    }
+
+    fn end(inout self) {
+        if self.style {
+            self.buf.push_str(STYLE_RESET);
+            self.style = false;
+        }
+        if self.base_len > 0 {
+            self.buf.push_str(self.base[..self.base_len]);
+            self.style = true;
+        }
+    }
+
+    // Every cell after this, and the padding to the width, sits on this
+    // style; a nested style returns to it at its end.
+    fn set_base(inout self, code: [u8]) {
+        self.base_len = copy_text(&self.base, code);
+        self.begin(code);
+    }
+
+    fn styled(inout self, s: [u8], code: [u8]) {
+        self.begin(code);
+        self.text(s);
+        self.end();
+    }
+
+    // Pad to the width, on the base style, then close every style.
+    fn pad(inout self) {
+        if self.vis < self.width {
+            self.spaces(self.width - self.vis);
+        }
+        self.base_len = 0;
+        if self.style {
+            self.buf.push_str(STYLE_RESET);
+            self.style = false;
+        }
+    }
+
+    fn as_slice(self) -> [u8] {
+        self.buf.as_slice()
+    }
+}
+
+fn flush_line(frame: inout Buf, line: inout Line) {
+    line.pad();
+    frame.push_str(line.as_slice());
+    // Raw mode turns output post-processing off, so a line break needs its
+    // carriage return: without it the next line starts in the last column
+    // and wraps, leaving a blank line between every row of the table.
+    frame.push('\r');
+    frame.push('\n');
+}
+
+// A value in a cell of the table, right-aligned; on the active sort
+// column, in the highlight color.
+fn value_cell(line: inout Line, text: [u8], width: i64, style: [u8], use_style: bool) {
+    if use_style {
+        line.begin(style);
+    }
+    line.right(text, width);
+    if use_style {
+        line.end();
+    }
+}
+
+fn heading(line: inout Line, text: [u8], width: i64, right_align: bool, active: bool) {
+    if active {
+        line.begin(STYLE_ACTIVE_HEADER);
+    }
+    if right_align {
+        line.right(text, width);
+    } else {
+        line.left(text, width);
+    }
+    if active {
+        line.end();
+    }
+}
+
+fn state_style(state: u8) -> [u8] {
+    if state == 'R' {
+        STYLE_RUNNING
+    } else if state == 'S' || state == 'I' || state == 'D' {
+        STYLE_SLEEPING
+    } else if state == 'T' {
+        STYLE_STOPPED
+    } else if state == 'Z' {
+        STYLE_ZOMBIE
+    } else {
+        STYLE_INFO
+    }
+}
+
+// ---- Layout ----
+
+// How many lines the header takes: three meters plus the core grid when
+// there is one, or two compact lines on a narrow terminal, and the core
+// grid in both cases.
+pub fn header_lines(snap: Snapshot, width: i64) -> i64 {
+    if width < RICH_HEADER_MIN_WIDTH {
+        return 2 + core_grid_lines(snap, width);
+    }
+    3 + core_grid_lines(snap, width)
+}
+
+// Every CPU the snapshot knows of: the loads it measured, or the count the
+// backend reported while the loads are still unknown (the very first
+// sample, or a machine whose counters could not be read).
+fn core_count(snap: Snapshot) -> i64 {
+    max(snap.core_pct.len, snap.cpus)
+}
+
+fn core_grid_lines(snap: Snapshot, width: i64) -> i64 {
+    let cores = core_count(snap);
+    let per_line = max((width - CORE_PREFIX) / CORE_STEP, 1);
+    (cores + per_line - 1) / per_line
+}
+
+// The process rows between the column names and the two bottom lines.
+pub fn process_rows(snap: Snapshot, width: i64, height: i64) -> i64 {
+    max(height - header_lines(snap, width) - 3, 1)
+}
+
+fn compact_level(width: i64) -> i64 {
+    if width >= 90 {
+        0
+    } else if width >= 60 {
+        1
+    } else {
+        2
+    }
+}
+
+// ---- The header ----
+
+fn tasks_text(snap: Snapshot, gpa: Gpa) -> Buf {
+    var text = format_in(f"{snap.procs.len()}", gpa);
+    if snap.n_threads > 0 {
+        text.push_fmt(f", {snap.n_threads} thr");
+    }
+    if snap.n_running > 0 {
+        text.push_fmt(f", {snap.n_running} running");
+    }
+    text
+}
+
+// A label at a column of the right panel, then the value, aligned after
+// every label.
+fn info_field(line: inout Line, state: State, column: i64, label: [u8], value: [u8]) {
+    if line.vis < column {
+        line.spaces(column - line.vis);
+    } else {
+        line.text("  ");
+    }
+    if state.color {
+        line.styled(label, STYLE_INFO);
+    } else {
+        line.text(label);
+    }
+    line.spaces(max(INFO_LABEL - label.len, 1));
+    line.text(value);
+}
+
+// " CPU[|||||||      37.4%]   Tasks: 7, 24 thr, 2 running".
+fn render_meter_line(snap: Snapshot, state: State, frame: inout Buf, line: inout Line,
+    width: i64, gpa: Gpa) {
+    let info_column = max(30, width / 2);
+    let tasks = tasks_text(snap, gpa);
+    line.reset();
+    line.text(" ");
+    if state.color {
+        line.styled("CPU", STYLE_CPU_LABEL);
+    } else {
+        line.text("CPU");
+    }
+    line.text(" ");
+    let cpu_value = format_in(f"{snap.cpu_pct:>5.1}%", gpa);
+    let cpu_meter = meter_bar(snap.cpu_pct, cpu_value.as_slice(), METER_CELLS, gpa);
+    if state.color {
+        line.styled(cpu_meter.as_slice(), usage_color(snap.cpu_pct));
+    } else {
+        line.text(cpu_meter.as_slice());
+    }
+    info_field(&line, state, info_column, "Tasks:", tasks.as_slice());
+    flush_line(&frame, &line);
+
+    let mem_pct = if snap.mem_total_kb > 0 {
+        snap.mem_used_kb as f64 * 100.0 / snap.mem_total_kb as f64
+    } else {
+        0.0
+    };
+    line.reset();
+    line.text(" ");
+    if state.color {
+        line.styled("Mem", STYLE_MEM_LABEL);
+    } else {
+        line.text("Mem");
+    }
+    line.text(" ");
+    let mem_value = format_used_total(snap.mem_used_kb, snap.mem_total_kb, gpa);
+    let mem_meter = meter_bar(mem_pct, mem_value.as_slice(), METER_CELLS, gpa);
+    if state.color {
+        line.styled(mem_meter.as_slice(), usage_color(mem_pct));
+    } else {
+        line.text(mem_meter.as_slice());
+    }
+    let load = format_load(snap.load, gpa);
+    info_field(&line, state, info_column, "Load avg:", load.as_slice());
+    flush_line(&frame, &line);
+
+    let swap_pct = if snap.swap_total_kb > 0 {
+        snap.swap_used_kb as f64 * 100.0 / snap.swap_total_kb as f64
+    } else {
+        0.0
+    };
+    line.reset();
+    line.text(" ");
+    if state.color {
+        line.styled("Swp", STYLE_SWP_LABEL);
+    } else {
+        line.text("Swp");
+    }
+    line.text(" ");
+    let swap_value = format_used_total(snap.swap_used_kb, snap.swap_total_kb, gpa);
+    let swap_meter = meter_bar(swap_pct, swap_value.as_slice(), METER_CELLS, gpa);
+    if state.color {
+        line.styled(swap_meter.as_slice(), usage_color(swap_pct));
+    } else {
+        line.text(swap_meter.as_slice());
+    }
+    let uptime = format_uptime(snap.uptime_s, gpa);
+    info_field(&line, state, info_column, "Uptime:", uptime.as_slice());
+    flush_line(&frame, &line);
+}
+
+// "Cores  1[|||  12.3%]  2[|     5.0%] ...", every CPU with its own
+// load, as many per line as fit. A CPU whose load is not measured yet
+// still gets its place, with "--%" in the bar.
+fn render_core_grid(snap: Snapshot, state: State, frame: inout Buf, line: inout Line,
+    width: i64, gpa: Gpa) {
+    let cores = core_count(snap);
+    let per_line = max((width - CORE_PREFIX) / CORE_STEP, 1);
+    var at = 0;
+    var first = true;
+    while at < cores {
+        line.reset();
+        line.text(if first { "Cores " } else { "      " });
+        var on_line = 0;
+        while at < cores && on_line < per_line {
+            let label = format_in(f"{at + 1:>2}", gpa);
+            line.text(label.as_slice());
+            if at < snap.core_pct.len {
+                let pct = snap.core_pct[at];
+                let value = format_in(f"{pct:>5.1}%", gpa);
+                let bar = meter_bar(pct, value.as_slice(), CORE_CELLS, gpa);
+                if state.color {
+                    line.styled(bar.as_slice(), usage_color(pct));
+                } else {
+                    line.text(bar.as_slice());
+                }
+            } else {
+                let bar = meter_bar(0.0, "  --%", CORE_CELLS, gpa);
+                line.text(bar.as_slice());
+            }
+            line.text(" ");
+            at += 1;
+            on_line += 1;
+        }
+        flush_line(&frame, &line);
+        first = false;
+    }
+}
+
+// A narrow terminal: the percentages in text, then the task count.
+fn render_compact_header(snap: Snapshot, state: State, frame: inout Buf, line: inout Line,
+    width: i64, gpa: Gpa) {
+    let mem_pct = if snap.mem_total_kb > 0 {
+        snap.mem_used_kb as f64 * 100.0 / snap.mem_total_kb as f64
+    } else {
+        0.0
+    };
+    let swap_pct = if snap.swap_total_kb > 0 {
+        snap.swap_used_kb as f64 * 100.0 / snap.swap_total_kb as f64
+    } else {
+        0.0
+    };
+    line.reset();
+    line.text(" CPU ");
+    let cpu = format_in(f"{snap.cpu_pct:>5.1}%", gpa);
+    if state.color {
+        line.styled(cpu.as_slice(), usage_color(snap.cpu_pct));
+    } else {
+        line.text(cpu.as_slice());
+    }
+    line.text("  Mem ");
+    let mem = format_in(f"{mem_pct:>5.1}%", gpa);
+    if state.color {
+        line.styled(mem.as_slice(), usage_color(mem_pct));
+    } else {
+        line.text(mem.as_slice());
+    }
+    line.text("  Swp ");
+    let swap = format_in(f"{swap_pct:>5.1}%", gpa);
+    if state.color {
+        line.styled(swap.as_slice(), usage_color(swap_pct));
+    } else {
+        line.text(swap.as_slice());
+    }
+    flush_line(&frame, &line);
+
+    line.reset();
+    line.text(" Tasks ");
+    let tasks = tasks_text(snap, gpa);
+    line.text(tasks.as_slice());
+    if width >= 52 {
+        line.text("  Load ");
+        let load = format_load(snap.load, gpa);
+        line.text(load.as_slice());
+    }
+    flush_line(&frame, &line);
+}
+
+fn render_header(snap: Snapshot, state: State, frame: inout Buf, line: inout Line,
+    width: i64, gpa: Gpa) {
+    if width >= RICH_HEADER_MIN_WIDTH {
+        render_meter_line(snap, state, &frame, &line, width, gpa);
+    } else {
+        render_compact_header(snap, state, &frame, &line, width, gpa);
+    }
+    render_core_grid(snap, state, &frame, &line, width, gpa);
+}
+
+// ---- The table ----
+
+fn render_columns(state: State, compact: i64, frame: inout Buf, line: inout Line) {
+    line.reset();
+    if state.color {
+        line.set_base(STYLE_HEADER);
+    }
+    heading(&line, "PID", 6, true, state.color && state.sort == 2);
+    if compact < 2 {
+        line.text(" ");
+        heading(&line, "USER", 9, false, false);
+    }
+    if compact == 0 {
+        heading(&line, "PRI", 4, true, false);
+        line.text(" ");
+        heading(&line, "NI", 4, true, false);
+        line.text(" ");
+        heading(&line, "VIRT", 7, true, false);
+        line.text(" ");
+        heading(&line, "RES", 7, true, false);
+        line.text(" ");
+        heading(&line, "SHR", 6, true, false);
+        line.text(" ");
+    }
+    line.text(" S ");
+    heading(&line, "CPU%", 6, true, state.color && state.sort == 0);
+    line.text(" ");
+    heading(&line, "MEM%", 6, true, state.color && state.sort == 1);
+    if compact < 2 {
+        line.text(" ");
+        heading(&line, "TIME+", 9, true, state.color && state.sort == 3);
+    }
+    line.text(" ");
+    heading(&line, "Command", 8, false, state.color && state.sort == 4);
+    flush_line(&frame, &line);
+}
+
+fn render_row(p: Proc, state: State, compact: i64, frame: inout Buf, line: inout Line, gpa: Gpa) {
+    let selected = state.color && p.pid == state.selected;
+    line.reset();
+    if selected {
+        line.set_base(STYLE_SELECTED);
+    }
+    let pid = format_in(f"{p.pid}", gpa);
+    value_cell(&line, pid.as_slice(), 6, STYLE_SORT_VALUE, state.color && state.sort == 2
+        && !selected);
+    if compact < 2 {
+        line.text(" ");
+        line.left(p.user(), 9);
+    }
+    if compact == 0 {
+        let pri = format_in(f"{p.pri}", gpa);
+        line.right(pri.as_slice(), 4);
+        line.text(" ");
+        let ni = format_in(f"{p.ni}", gpa);
+        line.right(ni.as_slice(), 4);
+        line.text(" ");
+        line.right(human_size(p.virt_kb, gpa).as_slice(), 7);
+        line.text(" ");
+        line.right(human_size(p.rss_kb, gpa).as_slice(), 7);
+        line.text(" ");
+        line.right(human_size(p.shr_kb, gpa).as_slice(), 6);
+        line.text(" ");
+    }
+    let state_text = format_in(f"{p.state:c}", gpa);
+    line.text(" ");
+    if state.color && !selected {
+        line.styled(state_text.as_slice(), state_style(p.state));
+    } else {
+        line.text(state_text.as_slice());
+    }
+    line.text(" ");
+    let cpu = format_in(f"{p.cpu_pct:>6.1}", gpa);
+    let cpu_style = if state.sort == 0 { STYLE_SORT_VALUE } else { usage_color(p.cpu_pct) };
+    value_cell(&line, cpu.as_slice(), 6, cpu_style, state.color && !selected);
+    line.text(" ");
+    let mem = format_in(f"{p.mem_pct:>6.1}", gpa);
+    let mem_style = if state.sort == 1 { STYLE_SORT_VALUE } else { usage_color(p.mem_pct) };
+    value_cell(&line, mem.as_slice(), 6, mem_style, state.color && !selected);
+    if compact < 2 {
+        line.text(" ");
+        let cpu_time = format_cpu_time(p.cpu_us, gpa);
+        value_cell(&line, cpu_time.as_slice(), 9, STYLE_SORT_VALUE, state.color
+            && state.sort == 3 && !selected);
+    }
+    line.text(" ");
+    if state.color && !selected && state.sort == 4 {
+        line.styled(p.name(), STYLE_SORT_VALUE);
+    } else {
+        line.text(p.name());
+    }
+    flush_line(&frame, &line);
+}
+
+fn render_help(frame: inout Buf, line: inout Line, rows: i64) -> i64 {
+    let help = [
+        "openhtop: the keys",
+        "",
+        "  F1, ?         this help",
+        "  F2, /         filter by command or user (Enter or Esc ends)",
+        "  F3, s         sort by CPU, MEM, PID, TIME+ or Command",
+        "  F4, r         reverse the order",
+        "  F5, p         pause the refreshes",
+        "  F9, x         send SIGTERM to the selected process (y confirms)",
+        "  F10, q        quit",
+        "  j/k, arrows   move one process",
+        "  PgUp/PgDn     a page at a time",
+        "  Home/End      the first and the last",
+    ];
+    var shown = 0;
+    for text in help {
+        if shown >= rows {
+            break;
+        }
+        line.reset();
+        line.text("  ");
+        line.text(text);
+        flush_line(&frame, &line);
+        shown += 1;
+    }
+    shown
+}
+
+fn render_status(snap: Snapshot, state: State, frame: inout Buf, line: inout Line, gpa: Gpa) {
+    line.reset();
+    if state.mode == 1 {
+        line.text(" filter: ");
+        if state.color {
+            line.styled("_", STYLE_BOLD);
+        } else {
+            line.text("_");
+        }
+        line.text("  Enter applies, Esc cancels");
+        flush_line(&frame, &line);
+        return;
+    }
+    if state.mode == 2 {
+        if state.color {
+            line.begin(STYLE_ZOMBIE);
+        }
+        line.text(format_in(f" send SIGTERM to {state.selected}? (y/N)", gpa).as_slice());
+        if state.color {
+            line.end();
+        }
+        flush_line(&frame, &line);
+        return;
+    }
+    if state.mode == 3 {
+        line.text(" help: any key closes it");
+        flush_line(&frame, &line);
+        return;
+    }
+
+    var at = -1;
+    for i in 0..snap.procs.len {
+        if snap.procs[i].pid == state.selected {
+            at = i;
+            break;
+        }
+    }
+    if at >= 0 {
+        let selected = snap.procs[at];
+        let pid = format_in(f"{selected.pid}", gpa);
+        if state.color {
+            line.styled(" PID ", STYLE_SELECTED);
+        } else {
+            line.text(" PID ");
+        }
+        line.text(pid.as_slice());
+        line.text("  ");
+        if state.color {
+            line.styled("User", STYLE_INFO);
+        } else {
+            line.text("User");
+        }
+        line.text(" ");
+        line.text(selected.user());
+        line.text("  ");
+        if state.color {
+            line.styled("Command", STYLE_INFO);
+        } else {
+            line.text("Command");
+        }
+        line.text(" ");
+        line.text(selected.name());
+    } else {
+        line.text(" no process selected");
+    }
+    line.text("  ");
+    if state.color {
+        line.styled("Sort", STYLE_INFO);
+    } else {
+        line.text("Sort");
+    }
+    line.text(" ");
+    line.text(sort_label(state.sort));
+    line.text(if state.reverse { " v" } else { " ^" });
+    if state.filter_len > 0 {
+        line.text("  filter ");
+        line.text(state.filter());
+    }
+    if state.paused {
+        if state.color {
+            line.styled("  PAUSED", STYLE_PAUSED);
+        } else {
+            line.text("  PAUSED");
+        }
+    }
+    if state.message_len > 0 {
+        line.text("  ");
+        line.text(state.message[..state.message_len]);
+    }
+    flush_line(&frame, &line);
+}
+
+fn render_key_bar(state: State, frame: inout Buf, line: inout Line, width: i64) {
+    let keys = ["F1", "F2", "F3", "F4", "F5", "F9", "F10"];
+    let labels = ["Help", "Filter", "Sort", "Reverse", "Pause", "Kill", "Quit"];
+    line.reset();
+    if state.color {
+        line.set_base(STYLE_KEY_BAR);
+    }
+    for i in 0..keys.len {
+        let chip = 1 + keys[i].len + 1 + labels[i].len + 1;
+        if line.vis + chip > width {
+            break;
+        }
+        line.spaces(1);
+        if state.color {
+            line.styled(keys[i], STYLE_KEY_NUMBER);
+        } else {
+            line.text(keys[i]);
+        }
+        line.text(" ");
+        line.text(labels[i]);
+        line.spaces(1);
+    }
+    flush_line(&frame, &line);
+}
+
+// The whole frame, in one Buf: the header, the column names, as many rows
+// as fit, the status and the function key bar. In a terminal it is written
+// at the home position; in --once mode it is the output.
+pub fn render(snap: Snapshot, state: State, width: i64, height: i64, gpa: Gpa) -> Buf {
+    let w = max(width, 40);
+    let h = max(height, 12);
+    let compact = compact_level(w);
+    var frame = Buf::with_capacity_in(w * h + 512, gpa);
+    var line = Line::new(w, gpa);
+
+    render_header(snap, state, &frame, &line, w, gpa);
+    render_columns(state, compact, &frame, &line);
+
+    let rows = process_rows(snap, w, h);
+    if state.mode == 3 {
+        let shown = render_help(&frame, &line, rows);
+        var left = rows - shown;
+        while left > 0 {
+            line.reset();
+            flush_line(&frame, &line);
+            left -= 1;
+        }
+    } else {
+        var at = 0;
+        var shown = 0;
+        for p in snap.procs.iter() {
+            if !process_matches(p, state.filter(), state.only_pid) {
+                continue;
+            }
+            if at >= state.offset && shown < rows {
+                render_row(p, state, compact, &frame, &line, gpa);
+                shown += 1;
+            }
+            at += 1;
+        }
+        while shown < rows {
+            line.reset();
+            flush_line(&frame, &line);
+            shown += 1;
+        }
+    }
+
+    render_status(snap, state, &frame, &line, gpa);
+    render_key_bar(state, &frame, &line, w);
+    frame
+}

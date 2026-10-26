@@ -1,0 +1,195 @@
+// The Linux backend: one snapshot from /proc.
+
+use std::{fs, parse_int};
+use std::num::parse_f64;
+
+use crate::model::{
+    Proc, Snapshot, USER_HZ, USER_MAX, User, copy_text, empty_snapshot, max, min, now_micros,
+};
+use crate::platform::{page_size_kb, read_load_average};
+use crate::text::{find_byte, first_token, rfind_byte, starts_with};
+
+// The digits after the first ':' of a line ("MemTotal:  16384 kB").
+fn number_after_colon(line: [u8]) -> i64 {
+    let at = find_byte(line, ':');
+    if at < 0 {
+        return 0;
+    }
+    parse_int(first_token(line[at + 1..])).unwrap_or(0)
+}
+
+// ---- Linux: /proc ----
+
+pub fn linux_snapshot(gpa: Gpa) -> Snapshot {
+    var snap = empty_snapshot(gpa);
+    snap.wall_us = now_micros();
+    read_linux_cpu(&snap, gpa);
+    read_linux_memory(&snap, gpa);
+    read_linux_uptime(&snap, gpa);
+    read_load_average(&snap);
+    read_linux_processes(&snap, gpa);
+    snap.cpus = if snap.core_total.len > 0 { snap.core_total.len } else { 1 };
+    snap
+}
+
+// /proc/stat's cpu lines: user nice system idle iowait irq softirq steal ...
+// (guest and guest_nice are already inside user and nice).
+fn read_linux_cpu(snap: inout Snapshot, gpa: Gpa) {
+    let text = match fs::read_to_string_in("/proc/stat", gpa) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        if !starts_with(line, "cpu") {
+            break;
+        }
+        let f = split_whitespace_in(line, gpa);
+        if f.len < 5 {
+            continue;
+        }
+        var total = 0;
+        let n = min(f.len, 8);
+        for i in 1..n {
+            total += parse_int(f[i]).unwrap_or(0);
+        }
+        var idle = parse_int(f[4]).unwrap_or(0);
+        if f.len > 5 {
+            idle += parse_int(f[5]).unwrap_or(0); // iowait is idle time too
+        }
+        if f[0] == "cpu" {
+            snap.ticks_total = total;
+            snap.ticks_idle = idle;
+        } else {
+            snap.core_total.push(total);
+            snap.core_idle.push(idle);
+        }
+    }
+}
+
+// /proc/meminfo: MemTotal, MemAvailable, SwapTotal, SwapFree (kB).
+fn read_linux_memory(snap: inout Snapshot, gpa: Gpa) {
+    let text = match fs::read_to_string_in("/proc/meminfo", gpa) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    var available = 0;
+    for line in text.lines() {
+        if starts_with(line, "MemTotal:") {
+            snap.mem_total_kb = number_after_colon(line);
+        } else if starts_with(line, "MemAvailable:") {
+            available = number_after_colon(line);
+        } else if starts_with(line, "SwapTotal:") {
+            snap.swap_total_kb = number_after_colon(line);
+        } else if starts_with(line, "SwapFree:") {
+            snap.swap_used_kb = snap.swap_total_kb - number_after_colon(line);
+        }
+    }
+    snap.mem_used_kb = max(snap.mem_total_kb - available, 0);
+}
+
+fn read_linux_uptime(snap: inout Snapshot, gpa: Gpa) {
+    let text = match fs::read_to_string_in("/proc/uptime", gpa) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    snap.uptime_s = parse_f64(first_token(text.as_slice())).unwrap_or(0.0);
+}
+
+fn field_int(f: [[u8]], i: i64) -> i64 {
+    if i >= 0 && i < f.len { parse_int(f[i]).unwrap_or(0) } else { 0 }
+}
+
+// The users in /etc/passwd, once per snapshot: name:password:uid:gid:...
+fn read_passwd_users(gpa: Gpa) -> Vec<User> {
+    var users: Vec<User> = Vec::new_in(gpa);
+    let text = match fs::read_in("/etc/passwd", gpa) {
+        Ok(v) => v,
+        Err(_) => return users,
+    };
+    for line in split_in(text.as_slice(), '\n', gpa) {
+        let f = split_in(line, ':', gpa);
+        if f.len >= 3 {
+            if let Ok(uid) = parse_int(f[2]) {
+                var u = User { uid: uid, name: [0; USER_MAX], name_len: 0 };
+                u.name_len = copy_text(&u.name, f[0]);
+                users.push(u);
+            }
+        }
+    }
+    users
+}
+
+// Every numeric directory of /proc is a process: its stat (state, parent,
+// times, priority, threads, sizes), statm (shared pages), status (uid),
+// cmdline (the title), and /etc/passwd (the user).
+fn read_linux_processes(snap: inout Snapshot, gpa: Gpa) {
+    let page_kb = page_size_kb();
+    let users = read_passwd_users(gpa);
+    let dir = match fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for entry in dir {
+        let e = match entry {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        if !e.is_dir() {
+            continue;
+        }
+        let pid = match parse_int(e.file_name().as_bytes()) {
+            Ok(p) => p as i32,
+            Err(_) => continue,
+        };
+        let stat_path = format_in(f"/proc/{pid}/stat", gpa);
+        let stat = match fs::read_to_string_in(stat_path.as_slice(), gpa) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let open = find_byte(stat.as_slice(), '(');
+        let close = rfind_byte(stat.as_slice(), ')');
+        if open < 0 || close <= open || close + 1 >= stat.as_slice().len {
+            continue;
+        }
+        let comm = stat.as_slice()[open + 1..close];
+        let f = split_whitespace_in(stat.as_slice()[close + 1..], gpa);
+        if f.len < 22 {
+            continue;
+        }
+        var p = Proc::empty();
+        p.pid = pid;
+        p.ppid = field_int(f, 1) as i32;
+        p.state = if f[0].len > 0 { f[0][0] } else { '?' };
+        p.pri = field_int(f, 15);
+        p.ni = field_int(f, 16);
+        p.threads = field_int(f, 17);
+        p.virt_kb = field_int(f, 20) / 1024;
+        p.rss_kb = field_int(f, 21) * page_kb;
+        p.cpu_us = (field_int(f, 11) + field_int(f, 12)) * 1000000 / USER_HZ;
+
+        let statm_path = format_in(f"/proc/{pid}/statm", gpa);
+        if let Ok(statm) = fs::read_to_string_in(statm_path.as_slice(), gpa) {
+            let sf = split_whitespace_in(statm.as_slice(), gpa);
+            p.shr_kb = field_int(sf, 2) * page_kb;
+        }
+
+        let status_path = format_in(f"/proc/{pid}/status", gpa);
+        if let Ok(status) = fs::read_to_string_in(status_path.as_slice(), gpa) {
+            for line in status.lines() {
+                if starts_with(line, "Uid:") {
+                    p.uid = field_int(split_whitespace_in(line, gpa), 1);
+                    break;
+                }
+            }
+        }
+
+        let cmd_path = format_in(f"/proc/{pid}/cmdline", gpa);
+        let raw: Vec<u8> = match fs::read_in(cmd_path.as_slice(), gpa) {
+            Ok(v) => v,
+            Err(_) => Vec::new_in(gpa),
+        };
+        p.set_cmdline(raw.as_slice(), comm);
+        p.set_user_from(p.uid, users.as_slice(), gpa);
+        snap.procs.push(p);
+    }
+}

@@ -1,0 +1,204 @@
+// Running: one frame for --once, or the interactive loop.
+
+use std::time;
+use std::sys::{SYS_SIGTERM, sys_kill, sys_make_raw, sys_tcgetattr, sys_tcsetattr};
+
+use crate::demo::demo_snapshot;
+use crate::model::{
+    FILTER_MAX, Flags, Key, Snapshot, State, clamp_offset, empty_snapshot, initial_state,
+    move_selection, now_micros, select_edge, sort_processes,
+};
+use crate::platform::{key_pressed, read_key, terminal_size, write_bytes};
+use crate::snapshot::read_snapshot;
+use crate::ui::{process_rows, render};
+
+fn handle_key(state: inout State, key: Key, snap: Snapshot, rows: i64, gpa: Gpa) {
+    if state.mode == 3 {
+        if key_pressed(key) {
+            state.mode = 0;
+        }
+        return;
+    }
+    if state.mode == 1 {
+        match key {
+            Key::Escape => state.mode = 0,
+            Key::Char('\n') | Key::Char('\r') => state.mode = 0,
+            Key::Char(8) | Key::Char(127) => if state.filter_len > 0 { state.filter_len -= 1 },
+            Key::Char(c) => if c >= 32 && c < 127 && state.filter_len < FILTER_MAX {
+                state.filter[state.filter_len] = c;
+                state.filter_len += 1;
+            },
+            _ => {}
+        }
+        return;
+    }
+    if state.mode == 2 {
+        match key {
+            Key::Char('y') | Key::Char('Y') => {
+                let pid = state.selected;
+                match sys_kill(pid, SYS_SIGTERM) {
+                    Ok(()) => {
+                        let msg = format_in(f"sent SIGTERM to {pid}", gpa);
+                        state.set_message(msg.as_slice());
+                    }
+                    Err(_) => state.set_message("kill failed"),
+                }
+                state.mode = 0;
+            }
+            Key::Char('n') | Key::Char('N') | Key::Escape => {
+                state.mode = 0;
+                state.set_message("kill cancelled");
+            }
+            _ => {}
+        }
+        return;
+    }
+    match key {
+        Key::Char('q') | Key::Char(3) | Key::Escape | Key::Function(10) => state.quit = true,
+        Key::Char('j') | Key::Down => move_selection(&state, snap, 1, gpa),
+        Key::Char('k') | Key::Up => move_selection(&state, snap, -1, gpa),
+        Key::PageDown => move_selection(&state, snap, rows, gpa),
+        Key::PageUp => move_selection(&state, snap, -rows, gpa),
+        Key::Home => select_edge(&state, snap, false, gpa),
+        Key::End => select_edge(&state, snap, true, gpa),
+        Key::Char('s') | Key::Function(3) => {
+            state.sort = (state.sort + 1) % 5;
+            state.offset = 0;
+        }
+        Key::Char('r') | Key::Function(4) => state.reverse = !state.reverse,
+        Key::Char('/') | Key::Function(2) => state.mode = 1,
+        Key::Char('x') | Key::Function(9) => if state.selected != 0 { state.mode = 2 },
+        Key::Char('p') | Key::Function(5) => state.paused = !state.paused,
+        Key::Char('?') | Key::Function(1) => state.mode = 3,
+        _ => {}
+    }
+}
+
+// ---- Modes of running ----
+
+fn render_once_frame(flags: Flags, gpa: Gpa) -> (Buf, i64, i64) {
+    let w = if flags.width > 0 { flags.width } else { 100 };
+    let h = if flags.height > 0 { flags.height } else { 24 };
+    var st = initial_state(flags);
+    st.width = w;
+    st.height = h;
+    var snap = empty_snapshot(gpa);
+    if flags.demo {
+        snap = demo_snapshot(gpa);
+    } else {
+        // Two samples 150 ms apart: the first alone has no interval to
+        // measure a process's CPU time over.
+        snap = read_snapshot(empty_snapshot(gpa), gpa);
+        time::sleep(time::Duration::new(0, 150000000));
+        snap = read_snapshot(snap, gpa);
+    }
+    sort_processes(&snap, st);
+    clamp_offset(&st, snap, process_rows(snap, w, h), gpa);
+    (render(snap, st, w, h, gpa), w, h)
+}
+
+// The frame with the blanks that pad each line to the width removed: what
+// --once writes, where there is nothing to erase (and tests can read).
+fn trim_line_padding(frame: Buf, gpa: Gpa) -> Buf {
+    var out = Buf::with_capacity_in(frame.len(), gpa);
+    let bytes = frame.as_slice();
+    var start = 0;
+    for i in 0..bytes.len {
+        if bytes[i] == '\n' {
+            var end = i;
+            while end > start && (bytes[end - 1] == ' ' || bytes[end - 1] == '\r') {
+                end -= 1;
+            }
+            out.push_str(bytes[start..end]);
+            out.push('\n');
+            start = i + 1;
+        }
+    }
+    if start < bytes.len {
+        out.push_str(bytes[start..]);
+    }
+    out
+}
+
+pub fn run_once(flags: Flags, gpa: Gpa) -> i32 {
+    let (frame, _, _) = render_once_frame(flags, gpa);
+    write_bytes(1, trim_line_padding(frame, gpa).as_slice());
+    0
+}
+
+pub fn run_tui(flags: Flags, gpa: Gpa) -> i32 {
+    let saved = match sys_tcgetattr(0) {
+        Ok(t) => t,
+        Err(_) => return run_once(flags, gpa),
+    };
+    var raw = saved;
+    sys_make_raw(&raw);
+    if sys_tcsetattr(0, raw).is_err() {
+        return run_once(flags, gpa);
+    }
+    write_bytes(1, "\x1b[?1049h\x1b[?25l");
+    defer {
+        write_bytes(1, "\x1b[?25h\x1b[?1049l");
+        sys_tcsetattr(0, saved);
+    };
+    tui_loop(flags, gpa)
+}
+
+fn tui_loop(flags: Flags, gpa: Gpa) -> i32 {
+    var state = initial_state(flags);
+    // Two samples before the first frame, as in --once, so CPU% has an
+    // interval to measure over from the start.
+    var snap = if flags.demo {
+        demo_snapshot(gpa)
+    } else {
+        let a = read_snapshot(empty_snapshot(gpa), gpa);
+        time::sleep(time::Duration::new(0, 150000000));
+        read_snapshot(a, gpa)
+    };
+    var first = true;
+    var next_us = now_micros() + state.interval_ms * 1000;
+    sort_processes(&snap, state);
+    loop {
+        let now = now_micros();
+        var timeout = 500;
+        if !state.paused {
+            let wait = next_us - now;
+            timeout = if wait <= 0 { 0 } else if wait > 500000 { 500 }
+                else { (wait / 1000) as i32 };
+        }
+        let key = read_key(timeout as i32);
+        let (w, h) = terminal_size(state);
+        state.width = w;
+        state.height = h;
+        let rows = process_rows(snap, w, h);
+        if key_pressed(key) {
+            handle_key(&state, key, snap, rows, gpa);
+        }
+        if state.quit {
+            return 0;
+        }
+        var refreshed = false;
+        if !state.paused && now_micros() >= next_us {
+            if !flags.demo {
+                let next = read_snapshot(snap, gpa);
+                snap = next;
+            }
+            sort_processes(&snap, state);
+            next_us = now_micros() + state.interval_ms * 1000;
+            refreshed = true;
+        }
+        clamp_offset(&state, snap, rows, gpa);
+        if refreshed || key_pressed(key) || first {
+            let frame = render(snap, state, w, h, gpa);
+            let bytes = frame.as_slice();
+            write_bytes(1, "\x1b[H");
+            // The last line's '\n' would scroll a full screen by one row;
+            // its '\r' is enough to park the cursor at the left.
+            if bytes.len > 0 {
+                write_bytes(1, bytes[..bytes.len - 1]);
+            }
+            write_bytes(1, "\x1b[J");
+            first = false;
+        }
+    }
+}
