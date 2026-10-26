@@ -18,7 +18,7 @@ loads the `.so`.
 |---|---|
 | `vole_hello.vl` | the whole module: `hello()`, its method table, and `PyInit_vole_hello` |
 | `Makefile` | builds the extension for a chosen Python, then checks the import |
-| `test_vole_hello.py` | imports the module in a fresh interpreter and compares the output |
+| `test_vole_hello.py` | imports the module, checks its documentation and calls `hello()` |
 
 ## Build and run
 
@@ -38,10 +38,10 @@ choose another explicitly when needed:
 make PYTHON=/usr/bin/python3
 ```
 
-The successful check ends with:
+The successful check prints the call's output:
 
 ```
-python extension ok: hello from vole
+hello from vole
 ```
 
 Use the same interpreter for manual imports; the extension suffix is
@@ -156,9 +156,9 @@ the same. `cc` is therefore not asked to find a Python library.
 ## Verified
 
 `make check` builds the object with Vole 0.25.1, links it with the
-Python 3.14 `LDSHARED`, imports the result in a fresh interpreter and
-compares the captured output:
+Python 3.14 `LDSHARED`, imports the result, checks the module and
+function documentation, and calls `hello()`:
 
 ```
-python extension ok: hello from vole
+hello from vole
 ```
