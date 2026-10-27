@@ -1,0 +1,572 @@
+// model.vl: the cheats agent's network — a small MLP over the 1630-float
+// stacked observation. The checkpoint is Burn's CompactRecorder format:
+// MessagePack whose tensors are little-endian f16, each shape `[in, out]`
+// row-major, so `out[j] = bias[j] + sum_i obs[i] * weight[i*out + j]`.
+//
+// forward gives the 18 action probabilities and the critic's value;
+// saliency replays it and backprops the chosen action's log-probability
+// to the observation, which the overlay uses to show what mattered.
+
+import "math.h" as c;
+
+use std::panic_str;
+use std::num::f32_from_bits;
+
+pub const NUM_ACTIONS: i64 = 18;
+
+fn expf(v: f32) -> f32 {
+    unsafe { c::expf(v) }
+}
+
+pub struct Linear {
+    w: Vec<f32>,
+    b: Vec<f32>,
+    in_dim: i64,
+    out_dim: i64,
+}
+
+pub struct Model {
+    fc1: Linear,
+    fc2: Linear,
+    fc3: Linear,
+    trunk: Linear,
+    policy: Linear,
+    value: Linear,
+}
+
+pub struct Net {
+    pub probs: [f32; 18],
+    pub value: f32,
+}
+
+fn empty_linear(gpa: Gpa) -> Linear {
+    Linear {
+        w: Vec::new_in(gpa),
+        b: Vec::new_in(gpa),
+        in_dim: 0,
+        out_dim: 0,
+    }
+}
+
+// --- the MessagePack reader -------------------------------------------
+
+struct Cur {
+    d: [u8],
+    i: i64,
+}
+
+fn cur_u8(rd: inout Cur) -> u8 {
+    let v = rd.d[rd.i];
+    rd.i += 1;
+    v
+}
+
+fn cur_take(rd: inout Cur, n: i64) -> [u8] {
+    let s = rd.d[rd.i..rd.i + n];
+    rd.i += n;
+    s
+}
+
+fn eqs(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn rd_map_len(rd: inout Cur) -> i64 {
+    let b = cur_u8(&rd) as i64;
+    if b >= 0x80 && b <= 0x8f {
+        b & 0xf
+    } else if b == 0xde {
+        ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64
+    } else {
+        ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64
+    }
+}
+
+fn rd_arr_len(rd: inout Cur) -> i64 {
+    let b = cur_u8(&rd) as i64;
+    if b >= 0x90 && b <= 0x9f {
+        b & 0xf
+    } else if b == 0xdc {
+        ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64
+    } else {
+        ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64
+    }
+}
+
+fn rd_str(rd: inout Cur) -> [u8] {
+    let b = cur_u8(&rd) as i64;
+    var n: i64 = 0;
+    if b >= 0xa0 && b <= 0xbf {
+        n = b & 0x1f;
+    } else if b == 0xd9 {
+        n = cur_u8(&rd) as i64;
+    } else if b == 0xda {
+        n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    } else {
+        n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    cur_take(&rd, n)
+}
+
+fn rd_bin(rd: inout Cur) -> [u8] {
+    let b = cur_u8(&rd) as i64;
+    var n: i64 = 0;
+    if b == 0xc4 {
+        n = cur_u8(&rd) as i64;
+    } else if b == 0xc5 {
+        n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    } else {
+        n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    cur_take(&rd, n)
+}
+
+fn rd_int(rd: inout Cur) -> i64 {
+    let b = cur_u8(&rd) as i64;
+    if b <= 0x7f {
+        return b;
+    }
+    if b >= 0xe0 {
+        return b - 256;
+    }
+    if b == 0xcc {
+        return cur_u8(&rd) as i64;
+    }
+    if b == 0xcd {
+        return ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    if b == 0xce {
+        return ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    if b == 0xcf {
+        return ((cur_u8(&rd) as i64) << 56) | ((cur_u8(&rd) as i64) << 48)
+            | ((cur_u8(&rd) as i64) << 40) | ((cur_u8(&rd) as i64) << 32)
+            | ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    if b == 0xd0 {
+        return cur_u8(&rd) as i8 as i64;
+    }
+    if b == 0xd1 {
+        return ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    if b == 0xd2 {
+        return ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    if b == 0xd3 {
+        return ((cur_u8(&rd) as i64) << 56) | ((cur_u8(&rd) as i64) << 48)
+            | ((cur_u8(&rd) as i64) << 40) | ((cur_u8(&rd) as i64) << 32)
+            | ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+    }
+    rd.i -= 1;
+    0
+}
+
+fn skip(rd: inout Cur) {
+    let b = cur_u8(&rd) as i64;
+    if b <= 0x7f || b >= 0xe0 {
+        return;
+    }
+    if b >= 0x80 && b <= 0x8f {
+        for _ in 0..(b & 0xf) {
+            skip(&rd);
+            skip(&rd);
+        }
+        return;
+    }
+    if b >= 0x90 && b <= 0x9f {
+        for _ in 0..(b & 0xf) {
+            skip(&rd);
+        }
+        return;
+    }
+    if b >= 0xa0 && b <= 0xbf {
+        rd.i += b & 0x1f;
+        return;
+    }
+    if b == 0xc0 || b == 0xc2 || b == 0xc3 {
+        return;
+    }
+    if b == 0xc4 {
+        let n = cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xc5 {
+        let n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xc6 {
+        let n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xca {
+        rd.i += 4;
+    } else if b == 0xcb {
+        rd.i += 8;
+    } else if b == 0xcc || b == 0xd0 {
+        rd.i += 1;
+    } else if b == 0xcd || b == 0xd1 {
+        rd.i += 2;
+    } else if b == 0xce || b == 0xd2 {
+        rd.i += 4;
+    } else if b == 0xcf || b == 0xd3 {
+        rd.i += 8;
+    } else if b == 0xd9 {
+        let n = cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xda {
+        let n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xdb {
+        let n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+            | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        rd.i += n;
+    } else if b == 0xdc || b == 0xdd {
+        var n: i64 = 0;
+        if b == 0xdc {
+            n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        } else {
+            n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+                | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        }
+        for _ in 0..n {
+            skip(&rd);
+        }
+    } else if b == 0xde || b == 0xdf {
+        var n: i64 = 0;
+        if b == 0xde {
+            n = ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        } else {
+            n = ((cur_u8(&rd) as i64) << 24) | ((cur_u8(&rd) as i64) << 16)
+                | ((cur_u8(&rd) as i64) << 8) | cur_u8(&rd) as i64;
+        }
+        for _ in 0..n {
+            skip(&rd);
+            skip(&rd);
+        }
+    }
+}
+
+// --- f16 to f32 (IEEE 754 binary16 to binary32) ------------------------
+
+fn f16_to_f32(h: u32) -> f32 {
+    let sign = (h & 0x8000) << 16;
+    var exp = (h >> 10) & 0x1f;
+    var mant = h & 0x3ff;
+    if exp == 0 {
+        if mant == 0 {
+            return f32_from_bits(sign);
+        }
+        // Subnormal: shift the leading one up into the mantissa.
+        var e: u32 = 127 - 15 + 1;
+        while (mant & 0x400) == 0 {
+            mant <<= 1;
+            e -= 1;
+        }
+        mant &= 0x3ff;
+        return f32_from_bits(sign | (e << 23) | (mant << 13));
+    }
+    if exp == 0x1f {
+        return f32_from_bits(sign | 0x7f800000 | (mant << 13));
+    }
+    exp = exp + (127 - 15);
+    f32_from_bits(sign | (exp << 23) | (mant << 13))
+}
+
+// --- tensors ----------------------------------------------------------
+
+struct Tensor {
+    vals: Vec<f32>,
+    dim0: i64,
+    dim1: i64,
+}
+
+fn parse_tensor(rd: inout Cur, gpa: Gpa) -> Tensor {
+    var vals: Vec<f32> = Vec::new_in(gpa);
+    var dim0: i64 = 0;
+    var dim1: i64 = 0;
+    let n = rd_map_len(&rd);
+    for _ in 0..n {
+        let k = rd_str(&rd);
+        if eqs(k, "param") {
+            let m = rd_map_len(&rd);
+            var bytes: [u8] = "";
+            for _ in 0..m {
+                let pk = rd_str(&rd);
+                if eqs(pk, "bytes") {
+                    bytes = rd_bin(&rd);
+                } else if eqs(pk, "shape") {
+                    let ndims = rd_arr_len(&rd);
+                    if ndims > 0 {
+                        dim0 = rd_int(&rd);
+                    }
+                    if ndims > 1 {
+                        dim1 = rd_int(&rd);
+                    }
+                    for _ in 2..ndims {
+                        skip(&rd);
+                    }
+                } else {
+                    skip(&rd);
+                }
+            }
+            let count = bytes.len() / 2;
+            for k2 in 0..count {
+                let lo = bytes[k2 * 2] as u32;
+                let hi = bytes[k2 * 2 + 1] as u32;
+                vals.push(f16_to_f32(lo | (hi << 8)));
+            }
+        } else {
+            skip(&rd);
+        }
+    }
+    Tensor { vals: vals, dim0: dim0, dim1: dim1 }
+}
+
+fn parse_linear(rd: inout Cur, gpa: Gpa) -> Linear {
+    var l = empty_linear(gpa);
+    let n = rd_map_len(&rd);
+    for _ in 0..n {
+        let k = rd_str(&rd);
+        if eqs(k, "weight") {
+            let t = parse_tensor(&rd, gpa);
+            l.w = t.vals;
+            l.in_dim = t.dim0;
+            l.out_dim = t.dim1;
+        } else if eqs(k, "bias") {
+            let t = parse_tensor(&rd, gpa);
+            l.b = t.vals;
+            if l.out_dim == 0 {
+                l.out_dim = t.dim0;
+            }
+        } else {
+            skip(&rd);
+        }
+    }
+    l
+}
+
+/// Reads the checkpoint at `path` (its `.mpk` appended when the file is
+/// not there, as Burn's recorder does).
+pub fn load(path: [u8], gpa: Gpa) -> Model {
+    var bytes: Vec<u8> = Vec::new_in(gpa);
+    match std::fs::read_in(path, gpa) {
+        Result::Ok(v) => bytes = v,
+        Result::Err(_) => {
+            var with_ext: Vec<u8> = Vec::with_capacity_in(path.len() + 4, gpa);
+            with_ext.extend_from_slice(path);
+            with_ext.extend_from_slice(".mpk");
+            match std::fs::read_in(with_ext.as_slice(), gpa) {
+                Result::Ok(v) => bytes = v,
+                Result::Err(_) => {
+                    panic_str("cannot read the model checkpoint");
+                }
+            }
+        }
+    }
+
+    var rd = Cur { d: bytes.as_slice(), i: 0 };
+    var fc1 = empty_linear(gpa);
+    var fc2 = empty_linear(gpa);
+    var fc3 = empty_linear(gpa);
+    var trunk = empty_linear(gpa);
+    var policy = empty_linear(gpa);
+    var value = empty_linear(gpa);
+
+    let n = rd_map_len(&rd);
+    for _ in 0..n {
+        let k = rd_str(&rd);
+        if eqs(k, "item") {
+            let m = rd_map_len(&rd);
+            for _ in 0..m {
+                let name = rd_str(&rd);
+                if eqs(name, "fc1") {
+                    fc1 = parse_linear(&rd, gpa);
+                } else if eqs(name, "fc2") {
+                    fc2 = parse_linear(&rd, gpa);
+                } else if eqs(name, "fc3") {
+                    fc3 = parse_linear(&rd, gpa);
+                } else if eqs(name, "trunk") {
+                    trunk = parse_linear(&rd, gpa);
+                } else if eqs(name, "policy_head") {
+                    policy = parse_linear(&rd, gpa);
+                } else if eqs(name, "value_head") {
+                    value = parse_linear(&rd, gpa);
+                } else {
+                    skip(&rd);
+                }
+            }
+        } else {
+            skip(&rd);
+        }
+    }
+
+    Model {
+        fc1: fc1,
+        fc2: fc2,
+        fc3: fc3,
+        trunk: trunk,
+        policy: policy,
+        value: value,
+    }
+}
+
+// --- the network ------------------------------------------------------
+
+fn linear_fwd(x: [f32], l: Linear, gpa: Gpa) -> Vec<f32> {
+    var out: Vec<f32> = Vec::filled_in(l.out_dim, 0.0f32, gpa);
+    for j in 0..l.out_dim {
+        out[j] = l.b[j];
+    }
+    for i in 0..l.in_dim {
+        let xi = x[i];
+        let base = i * l.out_dim;
+        for j in 0..l.out_dim {
+            out[j] += xi * l.w[base + j];
+        }
+    }
+    out
+}
+
+fn relu(v: inout Vec<f32>) {
+    for i in 0..v.len() {
+        if v[i] < 0.0 {
+            v[i] = 0.0;
+        }
+    }
+}
+
+fn softmax(logits: [f32]) -> [f32; 18] {
+    var mx = logits[0];
+    for i in 1..NUM_ACTIONS {
+        if logits[i] > mx {
+            mx = logits[i];
+        }
+    }
+    var out: [f32; 18] = [0.0; 18];
+    var sum: f32 = 0.0;
+    for i in 0..NUM_ACTIONS {
+        let e = expf(logits[i] - mx);
+        out[i] = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for i in 0..NUM_ACTIONS {
+        out[i] = out[i] * inv;
+    }
+    out
+}
+
+/// The 18 action probabilities and the value estimate for one frame
+/// pair.
+pub fn forward(m: Model, obs: [f32], gpa: Gpa) -> Net {
+    var h = linear_fwd(obs, m.fc1, gpa);
+    relu(&h);
+    var h2 = linear_fwd(h.as_slice(), m.fc2, gpa);
+    relu(&h2);
+    var h3 = linear_fwd(h2.as_slice(), m.fc3, gpa);
+    relu(&h3);
+    var t = linear_fwd(h3.as_slice(), m.trunk, gpa);
+    relu(&t);
+    let logits = linear_fwd(t.as_slice(), m.policy, gpa);
+    let v = linear_fwd(t.as_slice(), m.value, gpa);
+    var lg: [f32; 18] = [0.0; 18];
+    for i in 0..NUM_ACTIONS {
+        lg[i] = logits[i];
+    }
+    Net { probs: softmax(lg), value: v[0] }
+}
+
+/// d(input) of W^T for `l`, given d(output).
+fn mat_t_vec(l: Linear, d_out: [f32], gpa: Gpa) -> Vec<f32> {
+    var d: Vec<f32> = Vec::filled_in(l.in_dim, 0.0f32, gpa);
+    for i in 0..l.in_dim {
+        var s: f32 = 0.0;
+        let base = i * l.out_dim;
+        for j in 0..l.out_dim {
+            s += l.w[base + j] * d_out[j];
+        }
+        d[i] = s;
+    }
+    d
+}
+
+fn relu_back(d: inout Vec<f32>, pre: [f32]) {
+    for i in 0..d.len() {
+        if pre[i] <= 0.0 {
+            d[i] = 0.0;
+        }
+    }
+}
+
+/// The gradient of the chosen action's log-probability with respect to
+/// the stacked observation, one float per input.
+pub fn saliency(m: Model, obs: [f32], action: i64, gpa: Gpa) -> Vec<f32> {
+    var z1 = linear_fwd(obs, m.fc1, gpa);
+    relu(&z1);
+    var z2 = linear_fwd(z1.as_slice(), m.fc2, gpa);
+    relu(&z2);
+    var z3 = linear_fwd(z2.as_slice(), m.fc3, gpa);
+    relu(&z3);
+    var t = linear_fwd(z3.as_slice(), m.trunk, gpa);
+    relu(&t);
+    let logits = linear_fwd(t.as_slice(), m.policy, gpa);
+    var lg: [f32; 18] = [0.0; 18];
+    for i in 0..NUM_ACTIONS {
+        lg[i] = logits[i];
+    }
+    let probs = softmax(lg);
+
+    // d(log softmax)/d(logits) = one-hot(action) - probs.
+    var dlogits: Vec<f32> = Vec::filled_in(NUM_ACTIONS, 0.0f32, gpa);
+    for j in 0..NUM_ACTIONS {
+        dlogits[j] = -probs[j];
+    }
+    dlogits[action] += 1.0;
+
+    var dt = mat_t_vec(m.policy, dlogits.as_slice(), gpa);
+    relu_back(&dt, t.as_slice());
+    var dz3 = mat_t_vec(m.trunk, dt.as_slice(), gpa);
+    relu_back(&dz3, z3.as_slice());
+    var dz2 = mat_t_vec(m.fc3, dz3.as_slice(), gpa);
+    relu_back(&dz2, z2.as_slice());
+    var dz1 = mat_t_vec(m.fc2, dz2.as_slice(), gpa);
+    relu_back(&dz1, z1.as_slice());
+    mat_t_vec(m.fc1, dz1.as_slice(), gpa)
+}
+
+/// The `k` most likely actions by probability, best first.
+pub fn top_k(probs: [f32; 18], k: i64) -> [i64; 3] {
+    var idx: [i64; 3] = [0, 0, 0];
+    for s in 0..k {
+        var best: i64 = -1;
+        var bestp: f32 = -1.0;
+        for i in 0..NUM_ACTIONS {
+            var used = false;
+            for u in 0..s {
+                if idx[u] == i {
+                    used = true;
+                }
+            }
+            if !used && probs[i] > bestp {
+                bestp = probs[i];
+                best = i;
+            }
+        }
+        idx[s] = best;
+    }
+    idx
+}

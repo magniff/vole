@@ -1,0 +1,313 @@
+// draw.vl: the software frame the game paints into — a width by height
+// block of packed RGBA words — and the primitives the port shares with
+// the Rust client it mirrors: alpha-blended rectangles, circle outlines,
+// the rotated sprite blitter, and the 8-pixel bitmap font.
+//
+// A pixel is one u32, red in the low byte (r | g << 8 | b << 16 | a << 24),
+// which is also what the fullscreen shader in view.vl reads back. The
+// arithmetic (rounding, truncation, clamping) copies the Rust core so a
+// frame compares pixel for pixel.
+
+use crate::assets::{
+    GLYPH_ADV, GLYPH_BITS, GLYPH_COUNT, GLYPH_FIRST, GLYPH_H, GLYPH_W, GLYPH_YOFF, SPRITE_PALETTE,
+};
+import "math.h" as c;
+
+use std::gpu;
+use std::num::f32_from_bits;
+
+pub const GAME_W: i64 = 224;
+pub const GAME_H: i64 = 288;
+
+/// The sprite sheet's regions, as the Rust core names them: an x offset
+/// into the 392-wide sheet and a size.
+pub const PLAYER_X: i64 = 0;
+pub const YELLOW_F1_X: i64 = 16;
+pub const YELLOW_F2_X: i64 = 32;
+pub const RED_F1_X: i64 = 48;
+pub const RED_F2_X: i64 = 64;
+pub const GREEN_F1_X: i64 = 80;
+pub const GREEN_F2_X: i64 = 96;
+pub const BW_F1_X: i64 = 112;
+pub const BW_F2_X: i64 = 128;
+pub const BULLET_X: i64 = 144;
+pub const ENEMY_BULLET_X: i64 = 160;
+pub const LIVES_ICON_X: i64 = 176;
+pub const EXPLODE_X: i64 = 192;
+pub const SHOTGUN_X: i64 = 288;
+pub const POWERUP_X: i64 = 292;
+
+pub fn pack(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
+}
+
+pub struct Fb {
+    pub px: Vec<u32>,
+    pub w: i64,
+    pub h: i64,
+}
+
+pub fn fb_new(w: i64, h: i64, gpa: Gpa) -> Fb {
+    Fb { px: Vec::filled_in(w * h, 0u32, gpa), w: w, h: h }
+}
+
+impl Fb {
+    pub fn clear(inout self, r: u8, g: u8, b: u8, a: u8) {
+        let c = pack(r, g, b, a);
+        for i in 0..self.px.len() {
+            self.px[i] = c;
+        }
+    }
+
+    /// One pixel, alpha blended over what is there (alpha 1: stored).
+    fn put(inout self, x: i64, y: i64, sr: u8, sg: u8, sb: u8, sa: f32) {
+        if x < 0 || y < 0 || x >= self.w || y >= self.h {
+            return;
+        }
+        let i = y * self.w + x;
+        if sa >= 0.99 {
+            self.px[i] = pack(sr, sg, sb, 255);
+        } else if sa > 0.01 {
+            let old = self.px[i];
+            let inv = 1.0 - sa;
+            let r = (sr as f32 * sa + (old & 0xff) as f32 * inv) as u8;
+            let g = (sg as f32 * sa + ((old >> 8) & 0xff) as f32 * inv) as u8;
+            let b = (sb as f32 * sa + ((old >> 16) & 0xff) as f32 * inv) as u8;
+            self.px[i] = pack(r, g, b, 255);
+        }
+    }
+
+    /// A filled rectangle, alpha blended: the Rust `fill_rect`.
+    pub fn fill_rect(inout self, x: i64, y: i64, w: i64, h: i64, color: [f32; 4]) {
+        let x_end = x + w;
+        let y_end = y + h;
+        if x_end <= 0 || y_end <= 0 {
+            return;
+        }
+        let x0 = if x > 0 { x } else { 0 };
+        let y0 = if y > 0 { y } else { 0 };
+        let x1 = if x_end < self.w { x_end } else { self.w };
+        let y1 = if y_end < self.h { y_end } else { self.h };
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let sr = (color[0] * 255.0) as u8;
+        let sg = (color[1] * 255.0) as u8;
+        let sb = (color[2] * 255.0) as u8;
+        let sa = color[3];
+        if sa >= 0.99 {
+            let c = pack(sr, sg, sb, 255);
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    self.px[py * self.w + px] = c;
+                }
+            }
+        } else if sa > 0.01 {
+            let inv = 1.0 - sa;
+            let fa = sr as f32 * sa;
+            let fb = sg as f32 * sa;
+            let fc = sb as f32 * sa;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let i = py * self.w + px;
+                    let old = self.px[i];
+                    let r = (fa + (old & 0xff) as f32 * inv) as u8;
+                    let g = (fb + ((old >> 8) & 0xff) as f32 * inv) as u8;
+                    let b = (fc + ((old >> 16) & 0xff) as f32 * inv) as u8;
+                    self.px[i] = pack(r, g, b, 255);
+                }
+            }
+        }
+    }
+
+    /// A circle outline, alpha blended: the Rust `draw_circle`.
+    pub fn draw_circle(inout self, cx: f32, cy: f32, radius: f32,
+        thickness: f32, color: [f32; 4]) {
+        if color[3] < 0.01 {
+            return;
+        }
+        let r_outer = radius + thickness * 0.5;
+        let r_inner = radius - thickness * 0.5;
+        let outer_sq = r_outer * r_outer;
+        let inner_sq = r_inner * r_inner;
+
+        let fx = unsafe { c::floorf(cx - r_outer) } as i64;
+        let fy = unsafe { c::floorf(cy - r_outer) } as i64;
+        let tx = unsafe { c::ceilf(cx + r_outer) } as i64 + 1;
+        let ty = unsafe { c::ceilf(cy + r_outer) } as i64 + 1;
+        let min_x = if fx > 0 { fx } else { 0 };
+        let min_y = if fy > 0 { fy } else { 0 };
+        let max_x = if tx < self.w { tx } else { self.w };
+        let max_y = if ty < self.h { ty } else { self.h };
+
+        let sr = (color[0] * 255.0) as u8;
+        let sg = (color[1] * 255.0) as u8;
+        let sb = (color[2] * 255.0) as u8;
+        let sa = color[3];
+        let inv = 1.0 - sa;
+        let fa = sr as f32 * sa;
+        let fb = sg as f32 * sa;
+        let fc = sb as f32 * sa;
+        for py in min_y..max_y {
+            for px in min_x..max_x {
+                let dx = px as f32 + 0.5 - cx;
+                let dy = py as f32 + 0.5 - cy;
+                let dist = dx * dx + dy * dy;
+                if dist >= inner_sq && dist <= outer_sq {
+                    let i = py * self.w + px;
+                    let old = self.px[i];
+                    let r = (fa + (old & 0xff) as f32 * inv) as u8;
+                    let g = (fb + ((old >> 8) & 0xff) as f32 * inv) as u8;
+                    let b = (fc + ((old >> 16) & 0xff) as f32 * inv) as u8;
+                    self.px[i] = pack(r, g, b, 255);
+                }
+            }
+        }
+    }
+
+    /// A sprite from the decoded sheet, unrotated; `scale` 1 in the game.
+    pub fn sprite(inout self, region_x: i64, w: i64, h: i64,
+        x: f32, y: f32, scale: f32) {
+        let dx = unsafe { c::roundf(x) } as i64;
+        let dy = unsafe { c::roundf(y) } as i64;
+        let step = if scale > 1.0 { scale } else { 1.0 };
+        for row in 0..h {
+            for col in 0..w {
+                let idx = row * crate::assets::SPRITE_W + region_x + col;
+                let ci = crate::assets::SPRITE_INDEX_HEX[idx] as i64;
+                let c = SPRITE_PALETTE[ci];
+                let a = (c & 0xff) as f32 / 255.0;
+                if a < 0.01 {
+                    continue;
+                }
+                let r = ((c >> 24) & 0xff) as u8;
+                let g = ((c >> 16) & 0xff) as u8;
+                let b = ((c >> 8) & 0xff) as u8;
+                let px = dx + (col as f32 * scale) as i64;
+                let py = dy + (row as f32 * scale) as i64;
+                self.fill_rect(px, py, step as i64, step as i64, [
+                    r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a,
+                ]);
+            }
+        }
+    }
+
+    /// A sprite rotated by `angle` radians around its centre; the Rust
+    /// `draw_rotated`, inverse-mapped per destination pixel.
+    pub fn sprite_rotated(inout self, region_x: i64, w: i64, h: i64,
+        x: f32, y: f32, scale: f32, angle: f32) {
+        if (if angle < 0.0 { -angle } else { angle }) < 0.01 {
+            self.sprite(region_x, w, h, x, y, scale);
+            return;
+        }
+        let sw = w as f32;
+        let sh = h as f32;
+        let cx = sw * 0.5;
+        let cy = sh * 0.5;
+        let cos_a = unsafe { c::cosf(angle) };
+        let sin_a = unsafe { c::sinf(angle) };
+        let half = unsafe { c::sqrtf(cx * cx + cy * cy) } * scale;
+        let dest_cx = x + cx * scale;
+        let dest_cy = y + cy * scale;
+        let min_x = unsafe { c::floorf(dest_cx - half) } as i64;
+        let min_y = unsafe { c::floorf(dest_cy - half) } as i64;
+        let max_x = unsafe { c::ceilf(dest_cx + half) } as i64;
+        let max_y = unsafe { c::ceilf(dest_cy + half) } as i64;
+        for py in min_y..max_y {
+            for px in min_x..max_x {
+                let dx = (px as f32 + 0.5 - dest_cx) / scale;
+                let dy = (py as f32 + 0.5 - dest_cy) / scale;
+                let sx = cos_a * dx + sin_a * dy + cx;
+                let sy = -sin_a * dx + cos_a * dy + cy;
+                let si = unsafe { c::floorf(sx) } as i64;
+                let sj = unsafe { c::floorf(sy) } as i64;
+                if si < 0 || sj < 0 || si >= w || sj >= h {
+                    continue;
+                }
+                let idx = sj * crate::assets::SPRITE_W + region_x + si;
+                let ci = crate::assets::SPRITE_INDEX_HEX[idx] as i64;
+                let c = SPRITE_PALETTE[ci];
+                let a = (c & 0xff) as f32 / 255.0;
+                if a < 0.01 {
+                    continue;
+                }
+                let r = ((c >> 24) & 0xff) as u8;
+                let g = ((c >> 16) & 0xff) as u8;
+                let b = ((c >> 8) & 0xff) as u8;
+                self.fill_rect(px, py, 1, 1, [
+                    r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a,
+                ]);
+            }
+        }
+    }
+}
+
+// --- the bitmap font -----------------------------------------------------
+
+/// The offset of a glyph's rows in GLYPH_BITS: the heights of the ones
+/// before it. Each row is one byte, bit 7 the leftmost pixel.
+fn glyph_offset(i: i64) -> i64 {
+    var off: i64 = 0;
+    for k in 0..i {
+        off += GLYPH_H[k] as i64;
+    }
+    off
+}
+
+/// `s`'s width at `scale`: each glyph's advance, rounded, summed.
+pub fn text_width(s: [u8], scale: f32) -> f32 {
+    let sc = unsafe { c::roundf(scale) };
+    let step = if sc > 1.0 { sc } else { 1.0 };
+    var total: f32 = 0.0;
+    for i in 0..s.len() {
+        let ch = s[i] as i64;
+        let g = if ch >= GLYPH_FIRST && ch < GLYPH_FIRST + GLYPH_COUNT {
+            ch - GLYPH_FIRST
+        } else {
+            0
+        };
+        total += unsafe { c::roundf(f32_from_bits(GLYPH_ADV[g]) * step) };
+    }
+    total
+}
+
+/// Draw `s` at (x, y) with the 8-pixel font; Rust's `draw_text`.
+pub fn draw_text(fb: inout Fb, s: [u8], x: f32, y: f32, scale: f32,
+    color: [f32; 4]) {
+    let sc = unsafe { c::roundf(scale) };
+    let scl = if sc > 1.0 { sc } else { 1.0 };
+    var cursor = unsafe { c::roundf(x) };
+    let top = unsafe { c::roundf(y) };
+    for i in 0..s.len() {
+        let ch = s[i] as i64;
+        let g = if ch >= GLYPH_FIRST && ch < GLYPH_FIRST + GLYPH_COUNT {
+            ch - GLYPH_FIRST
+        } else {
+            0
+        };
+        let gw = GLYPH_W[g] as i64;
+        let gh = GLYPH_H[g] as i64;
+        let off = glyph_offset(g);
+        let gy = top + GLYPH_YOFF[g] as f32 * scl;
+        for row in 0..gh {
+            let bits = GLYPH_BITS[off + row];
+            for col in 0..gw {
+                if bits & (0x80 >> col) == 0 {
+                    continue;
+                }
+                let rx = (cursor + col as f32 * scl) as i64;
+                let ry = (gy + row as f32 * scl) as i64;
+                fb.fill_rect(rx, ry, scl as i64, scl as i64, color);
+            }
+        }
+        cursor += unsafe { c::roundf(f32_from_bits(GLYPH_ADV[g]) * scl) };
+    }
+}
+
+/// Centred in the 224-pixel game area (not in the panel-wide frame).
+pub fn draw_text_centered(fb: inout Fb, s: [u8], y: f32, scale: f32,
+    color: [f32; 4]) {
+    let w = text_width(s, scale);
+    let x = unsafe { c::roundf((GAME_W as f32 - w) / 2.0) };
+    draw_text(&fb, s, x, y, scale, color);
+}

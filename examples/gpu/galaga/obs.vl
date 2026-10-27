@@ -1,0 +1,320 @@
+// obs.vl: the observation the model reads — one 815-float frame of the
+// game state, exactly the layout neural-galaga-ai's obs.rs encodes:
+// the player's block, 36 enemy slots, 8 player bullets, 32 enemy bullets
+// and 12 shotgun balls (both sorted closest to the player first), 4
+// powerups, and 14 danger columns holding the soonest impact per column.
+//
+// Positions are normalized around the screen's centre by half its width
+// or height; the network sees a frame pair, so env keeps the previous
+// frame and stacks it in front (session.vl).
+
+use std::slice::sort_stable_by_in;
+
+use crate::game::{BULLET_SPEED, ENEMY_BULLET_SPEED, GAME_HEIGHT, GAME_WIDTH, PLAYER_SPEED, Step};
+
+pub const PLAYER_FLOATS: i64 = 17;
+pub const NUM_ENEMY_SLOTS: i64 = 36;
+pub const ENEMY_SLOT_FLOATS: i64 = 11;
+pub const ENEMY_BLOCK_FLOATS: i64 = NUM_ENEMY_SLOTS * ENEMY_SLOT_FLOATS;
+
+pub const NUM_PLAYER_BULLET_SLOTS: i64 = 8;
+pub const PLAYER_BULLET_SLOT_FLOATS: i64 = 5;
+pub const PLAYER_BULLET_BLOCK_FLOATS: i64 =
+    NUM_PLAYER_BULLET_SLOTS * PLAYER_BULLET_SLOT_FLOATS;
+
+pub const NUM_ENEMY_BULLET_SLOTS: i64 = 32;
+pub const ENEMY_BULLET_SLOT_FLOATS: i64 = 7;
+pub const ENEMY_BULLET_BLOCK_FLOATS: i64 =
+    NUM_ENEMY_BULLET_SLOTS * ENEMY_BULLET_SLOT_FLOATS;
+
+pub const NUM_SHOTGUN_SLOTS: i64 = 12;
+pub const SHOTGUN_SLOT_FLOATS: i64 = 8;
+pub const SHOTGUN_BLOCK_FLOATS: i64 = NUM_SHOTGUN_SLOTS * SHOTGUN_SLOT_FLOATS;
+
+pub const NUM_POWERUP_SLOTS: i64 = 4;
+pub const POWERUP_SLOT_FLOATS: i64 = 7;
+pub const POWERUP_BLOCK_FLOATS: i64 = NUM_POWERUP_SLOTS * POWERUP_SLOT_FLOATS;
+
+pub const NUM_DANGER_COLS: i64 = 14;
+
+pub const OBS_SIZE: i64 = PLAYER_FLOATS + ENEMY_BLOCK_FLOATS
+    + PLAYER_BULLET_BLOCK_FLOATS + ENEMY_BULLET_BLOCK_FLOATS + SHOTGUN_BLOCK_FLOATS
+    + POWERUP_BLOCK_FLOATS + NUM_DANGER_COLS;
+
+pub const ENEMIES_OFFSET: i64 = PLAYER_FLOATS;
+pub const PLAYER_BULLETS_OFFSET: i64 = ENEMIES_OFFSET + ENEMY_BLOCK_FLOATS;
+pub const ENEMY_BULLETS_OFFSET: i64 = PLAYER_BULLETS_OFFSET + PLAYER_BULLET_BLOCK_FLOATS;
+pub const SHOTGUN_OFFSET: i64 = ENEMY_BULLETS_OFFSET + ENEMY_BULLET_BLOCK_FLOATS;
+pub const POWERUPS_OFFSET: i64 = SHOTGUN_OFFSET + SHOTGUN_BLOCK_FLOATS;
+pub const DANGER_OFFSET: i64 = POWERUPS_OFFSET + POWERUP_BLOCK_FLOATS;
+
+pub const FRAME_SKIP: i64 = 2;
+pub const FRAME_STACK: i64 = 2;
+pub const STACKED_OBS_SIZE: i64 = FRAME_STACK * OBS_SIZE;
+
+const HALF_W: f32 = GAME_WIDTH / 2.0;
+const HALF_H: f32 = GAME_HEIGHT / 2.0;
+
+fn normalize_x(x: f32) -> f32 {
+    (x - HALF_W) / HALF_W
+}
+
+fn normalize_y(y: f32) -> f32 {
+    (y - HALF_H) / HALF_H
+}
+
+fn rel_x(x: f32, px: f32) -> f32 {
+    (x - px) / HALF_W
+}
+
+fn rel_y(y: f32, py: f32) -> f32 {
+    (y - py) / HALF_H
+}
+
+/// The shield's charge as the network reads it: none, critical,
+/// damaged, full.
+fn shield_strength(level: u8) -> f32 {
+    if level >= 3 {
+        1.0
+    } else if level == 2 {
+        0.66
+    } else if level == 1 {
+        0.33
+    } else {
+        0.0
+    }
+}
+
+fn clamp01(v: f32) -> f32 {
+    if v < 0.0 {
+        0.0
+    } else if v > 1.0 {
+        1.0
+    } else {
+        v
+    }
+}
+
+/// Frames until a downward projectile reaches the player's row,
+/// normalized: 0 imminent, 1 far.
+fn time_to_impact(y: f32, dy: f32, py: f32) -> f32 {
+    if dy <= 0.0 {
+        return 1.0;
+    }
+    let d = py - y;
+    if d <= 0.0 {
+        return 0.0;
+    }
+    clamp01((d / dy) / 120.0)
+}
+
+struct Cand {
+    d: f32,
+    i: i64,
+}
+
+fn by_distance(a: Cand, b: Cand) -> i64 {
+    if a.d < b.d {
+        -1
+    } else if a.d > b.d {
+        1
+    } else {
+        0
+    }
+}
+
+/// The screen column a projectile is in, as obs.rs computes it (a
+/// negative x saturates to the first column).
+fn danger_col(x: f32) -> i64 {
+    let w = GAME_WIDTH / NUM_DANGER_COLS as f32;
+    var c: i64 = 0;
+    if x > 0.0 {
+        c = (x / w) as i64;
+    }
+    if c > NUM_DANGER_COLS - 1 {
+        c = NUM_DANGER_COLS - 1;
+    }
+    c
+}
+
+/// One frame's observation, OBS_SIZE floats.
+pub fn encode(r: Step, gpa: Gpa) -> Vec<f32> {
+    var obs: Vec<f32> = Vec::filled_in(OBS_SIZE, 0.0f32, gpa);
+
+    let px = r.player_x + 8.0;
+    let py = r.player_y + 8.0;
+
+    // --- the player ---
+    obs[0] = normalize_x(r.player_x);
+    obs[1] = normalize_y(r.player_y);
+    obs[2] = r.player_speed / PLAYER_SPEED;
+    obs[3] = r.projectile_speed / BULLET_SPEED;
+    obs[4] = shield_strength(r.player_shield);
+    let lives = r.lives as f32 / 5.0;
+    obs[5] = if lives < 1.0 { lives } else { 1.0 };
+    obs[6] = if r.enemies_total > 0 {
+        r.enemies_killed as f32 / r.enemies_total as f32
+    } else {
+        0.0
+    };
+    obs[7] = if r.is_invulnerable { 0.0 } else { 1.0 };
+    obs[8] = r.fire_rate_stacks as f32 / 2.0;
+    obs[9] = r.speed_stacks as f32 / 2.0;
+    obs[10] = (r.bullet_count as f32 - 1.0) / 2.0;
+    for k in 0..5 {
+        let v = r.inventory[k] as f32 / 4.0;
+        obs[11 + k] = if v < 1.0 { v } else { 1.0 };
+    }
+    let cur = r.currency as f32 / 10.0;
+    obs[16] = if cur < 1.0 { cur } else { 1.0 };
+
+    // --- enemies, in formation order ---
+    for slot in 0..NUM_ENEMY_SLOTS {
+        if slot >= r.enemies.len() {
+            break;
+        }
+        let e = r.enemies[slot];
+        if !e.alive {
+            continue;
+        }
+        let base = ENEMIES_OFFSET + slot * ENEMY_SLOT_FLOATS;
+        obs[base] = 1.0;
+        obs[base + 1] = normalize_x(e.x);
+        obs[base + 2] = normalize_y(e.y);
+        let class = e.class as i64;
+        if class < 4 {
+            obs[base + 3 + class] = 1.0;
+        }
+        obs[base + 7] = shield_strength(e.shield);
+        obs[base + 8] = if e.is_diving { 1.0 } else { 0.0 };
+        obs[base + 9] = rel_x(e.x + 8.0, px);
+        obs[base + 10] = rel_y(e.y + 8.0, py);
+    }
+
+    // --- the player's own bullets, in flight order ---
+    var pb: i64 = 0;
+    for k in 0..r.bullets.len() {
+        let b = r.bullets[k];
+        if b.dy < 0.0 && pb < NUM_PLAYER_BULLET_SLOTS {
+            let base = PLAYER_BULLETS_OFFSET + pb * PLAYER_BULLET_SLOT_FLOATS;
+            obs[base] = 1.0;
+            obs[base + 1] = normalize_x(b.x);
+            obs[base + 2] = normalize_y(b.y);
+            obs[base + 3] = rel_x(b.x, px);
+            obs[base + 4] = rel_y(b.y, py);
+            pb += 1;
+        }
+    }
+
+    // --- enemy bullets, closest first ---
+    var eb: Vec<Cand> = Vec::new_in(gpa);
+    for k in 0..r.bullets.len() {
+        let b = r.bullets[k];
+        if b.dy >= 0.0 {
+            let dx = b.x - px;
+            let dy = b.y - py;
+            eb.push(Cand { d: dx * dx + dy * dy, i: k });
+        }
+    }
+    sort_stable_by_in(eb.as_mut_slice(), by_distance, gpa);
+    for slot in 0..NUM_ENEMY_BULLET_SLOTS {
+        if slot >= eb.len() {
+            break;
+        }
+        let b = r.bullets[eb[slot].i];
+        let base = ENEMY_BULLETS_OFFSET + slot * ENEMY_BULLET_SLOT_FLOATS;
+        obs[base] = 1.0;
+        obs[base + 1] = normalize_x(b.x);
+        obs[base + 2] = normalize_y(b.y);
+        obs[base + 3] = b.dy / ENEMY_BULLET_SPEED;
+        obs[base + 4] = rel_x(b.x, px);
+        obs[base + 5] = rel_y(b.y, py);
+        obs[base + 6] = time_to_impact(b.y, b.dy, py);
+    }
+
+    // --- shotgun balls, closest first ---
+    var sg: Vec<Cand> = Vec::new_in(gpa);
+    for k in 0..r.shotgun.len() {
+        let s = r.shotgun[k];
+        let dx = s.x - px;
+        let dy = s.y - py;
+        sg.push(Cand { d: dx * dx + dy * dy, i: k });
+    }
+    sort_stable_by_in(sg.as_mut_slice(), by_distance, gpa);
+    for slot in 0..NUM_SHOTGUN_SLOTS {
+        if slot >= sg.len() {
+            break;
+        }
+        let s = r.shotgun[sg[slot].i];
+        let base = SHOTGUN_OFFSET + slot * SHOTGUN_SLOT_FLOATS;
+        obs[base] = 1.0;
+        obs[base + 1] = normalize_x(s.x);
+        obs[base + 2] = normalize_y(s.y);
+        obs[base + 3] = s.dx / ENEMY_BULLET_SPEED;
+        obs[base + 4] = s.dy / ENEMY_BULLET_SPEED;
+        obs[base + 5] = rel_x(s.x, px);
+        obs[base + 6] = rel_y(s.y, py);
+        obs[base + 7] = time_to_impact(s.y, s.dy, py);
+    }
+
+    // --- powerups, in fall order (kinds 4 and 5 share the fourth slot,
+    // as obs.rs has it) ---
+    var pu: i64 = 0;
+    for k in 0..r.powerups.len() {
+        if pu >= NUM_POWERUP_SLOTS {
+            break;
+        }
+        let p = r.powerups[k];
+        let base = POWERUPS_OFFSET + pu * POWERUP_SLOT_FLOATS;
+        obs[base] = 1.0;
+        obs[base + 1] = normalize_x(p.x);
+        obs[base + 2] = normalize_y(p.y);
+        let kind = if (p.kind as i64) < 3 { p.kind as i64 } else { 3 };
+        obs[base + 3 + kind] = 1.0;
+        pu += 1;
+    }
+
+    // --- danger columns: the soonest impact in each ---
+    // The initialization is a `while` loop on purpose: as a `for` loop in
+    // this position it miscompiles at -O2 (a store runs off the end of the
+    // vector). See tools/agent-feedback.
+    var q: i64 = 0;
+    while q < NUM_DANGER_COLS {
+        obs[DANGER_OFFSET + q] = 1.0;
+        q += 1;
+    }
+
+    for k in 0..r.bullets.len() {
+        let b = r.bullets[k];
+        if b.dy <= 0.0 {
+            continue;
+        }
+        let col = danger_col(b.x);
+        let tti = time_to_impact(b.y, b.dy, py);
+        if tti < obs[DANGER_OFFSET + col] {
+            obs[DANGER_OFFSET + col] = tti;
+        }
+    }
+    for k in 0..r.shotgun.len() {
+        let s = r.shotgun[k];
+        if s.dy <= 0.0 {
+            continue;
+        }
+        let col = danger_col(s.x);
+        let tti = time_to_impact(s.y, s.dy, py);
+        if tti < obs[DANGER_OFFSET + col] {
+            obs[DANGER_OFFSET + col] = tti;
+        }
+    }
+
+    obs
+}
+
+/// The pair of frames the network sees: the previous frame, then this
+/// one.
+pub fn stack(prev: [f32], cur: [f32], gpa: Gpa) -> Vec<f32> {
+    var out: Vec<f32> = Vec::with_capacity_in(STACKED_OBS_SIZE, gpa);
+    out.extend_from_slice(prev);
+    out.extend_from_slice(cur);
+    out
+}

@@ -1,0 +1,342 @@
+// galaga: the neural-galaga "cheats" agent playing in a window — the
+// simulation, observation encoder, network and saliency (game.vl,
+// obs.vl, model.vl, infer.vl), the session's starfield composition and
+// the 368-pixel UI frame with its policy panel (render.vl), and the
+// fullscreen uploader (view.vl). This file is the command line, the
+// window, the phase machine and the keys.
+//
+//   space                pause / resume
+//   s                    one tick, while paused
+//   v                    saliency circles on / off
+//   1 … 9                start over at that wave
+//   m                    mute (the sound is not ported; the HUD says MUTE)
+//   q / Esc              quit
+//
+// The agent picks an action every other tick (FRAME_SKIP), from the
+// three most likely ones, and the panel on the right shows the policy,
+// the chosen action and the critic's value. A cleared wave shows "WAVE
+// CLEAR" for two seconds; a lost game reloads the checkpoint and starts
+// wave 1 again.
+//
+// Build it from the root of the repository (std::gpu and std::window
+// name the frameworks they link):
+//
+//   target/volec -O2 examples/gpu/galaga/main.vl -o galaga
+//   ./galaga
+//
+// With no display (CI, ssh), `--headless` runs check.vl: the encoder,
+// the network, the frames and the GPU path against the Rust client's
+// numbers, then lets the agent play --steps ticks.
+
+mod assets;
+mod check;
+mod draw;
+mod game;
+mod infer;
+mod model;
+mod obs;
+mod render;
+mod session;
+mod view;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use draw::{GAME_H, draw_text, fb_new};
+use game::STATUS_WAVE_COMPLETE;
+use infer::infer_new;
+use render::{
+    TOTAL_W, blit_game, draw_hud, draw_policy_panel, render_game_over, render_wave_clear,
+    saliency_circle,
+};
+use session::session_new;
+use view::viewer_new;
+
+const PHASE_PLAYING: u8 = 0;
+const PHASE_WAVE_CLEAR: u8 = 1;
+const PHASE_GAME_OVER: u8 = 2;
+
+const SIM_DT: f32 = 1.0 / 60.0;
+const FRAME_SKIP: i64 = 2;
+
+fn seed_now() -> u64 {
+    monotonic_now().as_nanos()
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("galaga", gpa)
+        .version("0.1")
+        .about("the neural-galaga cheats agent, playing in a window")
+        .arg(Arg::flag("headless").help("run the self-check instead of the window"))
+        .arg(Arg::option("model").value_name("FILE.mpk")
+            .default("examples/gpu/galaga/checkpoints/best.mpk")
+            .help("the checkpoint to play with"))
+        .arg(Arg::option("steps").value_name("N").default("0")
+            .help("headless: ticks to let the agent play after the checks"))
+        .arg(Arg::option("wave").value_name("N").default("1")
+            .help("headless: the wave to start at"))
+        .arg(Arg::flag("saliency")
+            .help("headless: compute saliency while playing"));
+    let m = cli.parse_or_exit(env::args());
+    let model = m.get("model").unwrap_or("examples/gpu/galaga/checkpoints/best.mpk");
+    let steps = m.get_as::<i64>("steps").unwrap_or(0);
+    let wave = m.get_as::<i64>("wave").unwrap_or(1);
+    let saliency = m.flag("saliency");
+
+    if m.flag("headless") {
+        if wave < 1 || wave > 99 {
+            eprintln("galaga: --wave wants 1..99");
+            return 2;
+        }
+        return check::run(model, steps, wave as u32, saliency, gpa);
+    }
+
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("galaga: no window server on this display (try --headless)");
+            return 1;
+        }
+    };
+    var desc = WindowDesc::new("Neural Galaga — Cheats AI", 920, 720);
+    desc.resizable = false;
+    var win = match app.window(desc) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("galaga: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"galaga: no GPU: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(owned) => owned,
+        Err(e) => {
+            eprintln(f"galaga: no surface for the window: {e}");
+            return 1;
+        }
+    };
+    let pixels = win.size();
+    surf.configure(dev, pixels.w, pixels.h);
+    var viewer = match viewer_new(dev) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln(f"galaga: {e}");
+            return 1;
+        }
+    };
+
+    var session = session_new(seed_now(), 1, gpa);
+    var infer = infer_new(model, gpa);
+    var fb = fb_new(TOTAL_W, GAME_H, gpa);
+    fb.clear(0, 0, 0, 255);
+
+    var phase: u8 = PHASE_PLAYING;
+    var timer: f32 = 0.0;
+    var cleared_wave: u32 = 1;
+    var over_score: i32 = 0;
+    var current_actions: u32 = 0;
+    var frameskip: i64 = 0;
+    var paused = false;
+    var step_once = false;
+    var show_saliency = false;
+    var muted = true;
+    var tick_accum: f32 = 0.0;
+    var last_clock = monotonic_now();
+
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = monotonic_now();
+                var dt = now.saturating_sub(last_clock).as_secs_f64() as f32;
+                last_clock = now;
+                if dt > 0.05 {
+                    dt = 0.05;
+                }
+
+                let playing = phase == PHASE_PLAYING;
+                if playing && !paused {
+                    tick_accum += dt;
+                } else {
+                    tick_accum = 0.0;
+                }
+
+                if playing {
+                    var guard: i64 = 0;
+                    loop {
+                        let normal = tick_accum >= SIM_DT;
+                        let manual = step_once;
+                        if !normal && !manual {
+                            break;
+                        }
+                        if normal {
+                            tick_accum -= SIM_DT;
+                        }
+                        step_once = false;
+                        guard += 1;
+                        if guard > 8 {
+                            break;
+                        }
+
+                        // The model decides every FRAME_SKIP ticks, as
+                        // it was trained to.
+                        if frameskip == 0 {
+                            current_actions = infer.pick_action(gpa);
+                        }
+                        frameskip = (frameskip + 1) % FRAME_SKIP;
+
+                        let r = session.step(current_actions, gpa);
+                        infer.update_obs(r, gpa);
+                        if show_saliency && frameskip == 0 {
+                            infer.compute_saliency(gpa);
+                        }
+
+                        if r.status == STATUS_WAVE_COMPLETE {
+                            cleared_wave = r.wave;
+                            phase = PHASE_WAVE_CLEAR;
+                            timer = 2.0;
+                            break;
+                        }
+                    }
+
+                    if phase == PHASE_PLAYING {
+                        blit_game(&fb, session.framebuffer());
+                        if session.is_done() {
+                            over_score = session.last_score();
+                            phase = PHASE_GAME_OVER;
+                            timer = 2.0;
+                        }
+                    }
+                } else if phase == PHASE_WAVE_CLEAR {
+                    timer -= dt;
+                    blit_game(&fb, session.framebuffer());
+                    render_wave_clear(&fb, cleared_wave, gpa);
+                    if timer <= 0.0 {
+                        phase = PHASE_PLAYING;
+                    }
+                } else if phase == PHASE_GAME_OVER {
+                    timer -= dt;
+                    // No blit: the last frame stays and dims each frame.
+                    render_game_over(&fb, over_score, gpa);
+                    if timer <= 0.0 {
+                        infer.reload(gpa);
+                        current_actions = 0;
+                        session = session_new(seed_now(), 1, gpa);
+                        phase = PHASE_PLAYING;
+                    }
+                }
+
+                if muted {
+                    draw_text(&fb, "MUTE", 190.0, 2.0, 1.0,
+                        [1.0, 0.3, 0.3, 0.6]);
+                }
+                if show_saliency {
+                    for i in 0..infer.targets.len() {
+                        let t = infer.targets[i];
+                        if t.importance < 0.05 {
+                            continue;
+                        }
+                        let radius = 4.0 + t.importance * 10.0;
+                        var alpha = t.importance * 0.9;
+                        if alpha < 0.1 {
+                            alpha = 0.1;
+                        } else if alpha > 0.9 {
+                            alpha = 0.9;
+                        }
+                        saliency_circle(&fb, t.x, t.y, radius, t.color, alpha);
+                        saliency_circle(&fb, t.x, t.y, radius + 1.0, t.color,
+                            alpha * 0.5);
+                    }
+                    draw_text(&fb, "SAL", 60.0, 2.0, 1.0,
+                        [0.3, 1.0, 1.0, 0.8]);
+                }
+
+                match infer.last_result.clone() {
+                    Option::Some(r) => draw_hud(&fb, r, gpa),
+                    Option::None => {}
+                }
+                draw_policy_panel(&fb, infer.probs, infer.value,
+                    infer.last_action, gpa);
+
+                match surf.frame() {
+                    Ok(frame) => {
+                        let texview = frame.texture.view();
+                        viewer.draw(dev, &queue, texview, fb.px.as_slice());
+                        frame.present(&queue);
+                    }
+                    Err(_) => {}
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                surf.configure(dev, size.w, size.h);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime && !k.repeat {
+                    match k.key {
+                        Logical::Named(Named::Escape) => {
+                            win.close();
+                            break;
+                        }
+                        Logical::Char(c) => {
+                            if c == 'q' as u32 {
+                                win.close();
+                                break;
+                            }
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                                if paused {
+                                    tick_accum = 0.0;
+                                }
+                            }
+                            if c == 's' as u32 && paused {
+                                step_once = true;
+                            }
+                            if c == 'v' as u32 {
+                                show_saliency = !show_saliency;
+                            }
+                            if c == 'm' as u32 {
+                                muted = !muted;
+                            }
+                            if c >= '1' as u32 && c <= '9' as u32 {
+                                current_actions = 0;
+                                session = session_new(seed_now(),
+                                    c - '0' as u32, gpa);
+                                phase = PHASE_PLAYING;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Close(_)) => {
+                win.close();
+                break;
+            }
+            Ok(Event::Quit) => {
+                win.close();
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                break;
+            }
+        }
+    }
+    0
+}
