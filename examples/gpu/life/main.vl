@@ -1,0 +1,426 @@
+// life: a massive Game of Life on the GPU, in a window — the grid, the
+// step and brush kernels (life.vl), the fullscreen renderer (view.vl),
+// and this file, the command line, the window, the camera and the event
+// loop. Every cell lives in a storage buffer; nothing but the camera
+// uniforms and the mouse coordinates is uploaded per frame.
+//
+//   left drag            draw (Shift+left erases)
+//   right drag           erase
+//   middle drag          pan
+//   scroll               zoom around the pointer
+//   space                pause / resume
+//   n or .               one generation
+//   r                    a new random field
+//   c                    clear
+//   g                    grid lines
+//   [ / ]                smaller / larger brush
+//   0 / Home             fit the whole grid
+//   + / -                zoom in / out
+//   f                    fullscreen
+//   q / Esc              quit
+//
+// The camera opens on the whole grid: 4096×4096 is 16.7 million cells,
+// about a fifth of a pixel each on a laptop screen, so it opens as a
+// field and scroll zooms into the cells. The title bar carries the
+// frame rate and the simulation rate.
+//
+// Build it from the root of the repository (std::gpu and std::window
+// name the frameworks they link):
+//
+//   target/volec -O2 examples/gpu/life/main.vl -o life
+//
+// On a display with no window server (ssh, CI), `--headless` runs
+// check.vl instead: the step against a CPU reference, the torus wrap,
+// seeding, painting and one rendered frame read back.
+
+mod check;
+mod life;
+mod view;
+
+import "math.h" as c;
+
+use std::{env, gpu, max, min};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, Window, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use life::{Life, life_new};
+use view::{Viewer, viewer_new};
+
+const MIN_ZOOM: f64 = 0.01;
+const MAX_ZOOM: f64 = 512.0;
+
+fn parse_size(s: str, dw: i64, dh: i64) -> (i64, i64) {
+    let (ws, hs) = match s.split_once("x") {
+        Some(pair) => pair,
+        None => ("0", "0"),
+    };
+    let w = ws.parse::<i64>().unwrap_or(dw);
+    let h = hs.parse::<i64>().unwrap_or(dh);
+    (w, h)
+}
+
+fn fit_zoom(side: i64, w: i64, h: i64) -> f64 {
+    let zx = w as f64 / side as f64;
+    let zy = h as f64 / side as f64;
+    let z = if zx < zy { zx } else { zy };
+    max(MIN_ZOOM, z)
+}
+
+fn clamp_zoom(z: f64) -> f64 {
+    min(MAX_ZOOM, max(MIN_ZOOM, z))
+}
+
+// The brush is a screen size; at high zoom that is less than a cell, so
+// keep at least enough of a radius that a click always lands on one.
+fn brush_cells(px: f64, zoom: f64) -> f64 {
+    max(0.75, px / zoom)
+}
+
+// The cell under a point in physical pixels (grid y grows downward, as
+// the window's y does).
+fn grid_at(px: f64, py: f64, cx: f64, cy: f64, zoom: f64,
+    w: i64, h: i64) -> (f64, f64) {
+    let gx = cx + (px - w as f64 * 0.5) / zoom;
+    let gy = cy + (py - h as f64 * 0.5) / zoom;
+    (gx, gy)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("life", gpa)
+        .version("0.1")
+        .about("a massive Game of Life, computed and drawn on the GPU")
+        .arg(Arg::flag("headless").help("run the self-check instead of the window"))
+        .arg(Arg::option("grid").value_name("N").default("4096")
+            .help("the field's side in cells (always square)"))
+        .arg(Arg::option("seed").value_name("N").default("1")
+            .help("the initial field's seed"))
+        .arg(Arg::option("density").value_name("F").default("0.16")
+            .help("the fraction of cells alive at the start, 0..1"))
+        .arg(Arg::option("tps").value_name("N").default("30")
+            .help("generations per second"))
+        .arg(Arg::option("brush").value_name("N").default("10")
+            .help("the brush's radius in pixels"))
+        .arg(Arg::option("steps").value_name("N").default("24")
+            .help("headless: generations to run"))
+        .arg(Arg::option("size").value_name("WxH").default("960x600")
+            .help("headless: the frame's size"))
+        .arg(Arg::option("out").value_name("FILE.ppm")
+            .help("headless: write the frame here as a PPM"))
+        .arg(Arg::flag("benchmark")
+            .help("headless: time generations on the full grid"));
+    let m = cli.parse_or_exit(env::args());
+    let grid = m.get_as::<i64>("grid").unwrap_or(4096);
+    if grid < 4 {
+        eprintln("life: --grid wants at least 4 cells a side");
+        return 2;
+    }
+    let seed = m.get_as::<u64>("seed").unwrap_or(1);
+    var density = m.get_as::<f64>("density").unwrap_or(0.16);
+    if density < 0.0 { density = 0.0; }
+    if density > 1.0 { density = 1.0; }
+    let tps = m.get_as::<i64>("tps").unwrap_or(30);
+    if tps < 1 {
+        eprintln("life: --tps wants at least 1");
+        return 2;
+    }
+    let brush_px = m.get_as::<f64>("brush").unwrap_or(10.0);
+    let (w, h) = parse_size(m.get("size").unwrap_or("960x600"), 960, 600);
+    if w < 1 || h < 1 {
+        eprintln("life: --size wants at least 1x1");
+        return 2;
+    }
+    let out = m.get("out").unwrap_or("");
+
+    if m.flag("headless") {
+        let steps = m.get_as::<i64>("steps").unwrap_or(24);
+        return check::run(grid, steps, seed, density, w, h, out,
+            m.flag("benchmark"), gpa);
+    }
+
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("life: no window server on this display (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("life", 1200, 800)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("life: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"life: no GPU: {e}");
+            return 1;
+        }
+    };
+    if grid * grid * 4 > dev.limits().max_buffer_size {
+        eprintln(f"life: {grid}x{grid} needs {grid * grid * 4} bytes, over the device's limit");
+        return 2;
+    }
+    var cells = match life_new(dev, grid, grid) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln(f"life: {e}");
+            return 1;
+        }
+    };
+    cells.reseed(dev, &queue, seed, density);
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(owned) => owned,
+        Err(e) => {
+            eprintln(f"life: no surface for the window: {e}");
+            return 1;
+        }
+    };
+    let pixels = win.size();
+    surf.configure(dev, pixels.w, pixels.h);
+    var viewer = match viewer_new(dev, cells) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln(f"life: {e}");
+            return 1;
+        }
+    };
+
+    var mut_seed = seed;
+    var cam_x = grid as f64 * 0.5;
+    var cam_y = grid as f64 * 0.5;
+    var zoom = fit_zoom(grid, surf.width, surf.height);
+    var paused = false;
+    var show_grid = true;
+    var brush = brush_px;
+    var mode: i64 = 0; // 0 none, 1 draw, 2 erase, 3 pan
+    var last_px: f64 = 0.0;
+    var last_py: f64 = 0.0;
+    var last_gx: f64 = 0.0;
+    var last_gy: f64 = 0.0;
+    var hover = false;
+    var hover_px: f64 = 0.0;
+    var hover_py: f64 = 0.0;
+    var carry: f64 = 0.0;
+    var last_clock = monotonic_now();
+    let started = monotonic_now();
+    var frames: i64 = 0;
+    var title_clock = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = monotonic_now();
+                var dt = now.saturating_sub(last_clock).as_millis() as f64 / 1000.0;
+                last_clock = now;
+                if dt > 0.1 { dt = 0.1; }
+                if !paused {
+                    carry += dt * tps as f64;
+                    var whole = carry as i64;
+                    carry -= whole as f64;
+                    if whole > 8 { whole = 8; }
+                    for _ in 0..whole {
+                        cells.step(dev, &queue);
+                    }
+                }
+                match surf.frame() {
+                    Ok(frame) => {
+                        let texview = frame.texture.view();
+                        let (hx, hy) = grid_at(hover_px, hover_py, cam_x, cam_y,
+                            zoom, surf.width, surf.height);
+                        let ring = if hover { brush_cells(brush, zoom) } else { 0.0 };
+                        let time = monotonic_now().saturating_sub(started).as_secs_f64();
+                        viewer.draw(dev, &queue, texview, cells.cur,
+                            cam_x, cam_y, zoom, surf.width, surf.height,
+                            grid, grid, hx, hy, ring, show_grid, time);
+                        frame.present(&queue);
+                        frames += 1;
+                    }
+                    Err(_) => {}
+                }
+                let elapsed = now.saturating_sub(title_clock);
+                if elapsed.as_millis() >= 1000 {
+                    let fps = frames as f64 / elapsed.as_secs_f64();
+                    let title = format_in(f"life — {grid}×{grid} — {fps:.0} fps — {tps} tps",
+                        gpa);
+                    win.set_title(title.as_slice());
+                    title_clock = monotonic_now();
+                    frames = 0;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                surf.configure(dev, size.w, size.h);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime {
+                    match k.key {
+                        Logical::Named(Named::Escape) => {
+                            win.close();
+                            break;
+                        }
+                        Logical::Named(Named::Home) => {
+                            cam_x = grid as f64 * 0.5;
+                            cam_y = grid as f64 * 0.5;
+                            zoom = fit_zoom(grid, surf.width, surf.height);
+                        }
+                        Logical::Char(c) => {
+                            if c == 'q' as u32 {
+                                win.close();
+                                break;
+                            }
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            }
+                            if c == 'n' as u32 || c == '.' as u32 {
+                                cells.step(dev, &queue);
+                            }
+                            if c == 'r' as u32 {
+                                mut_seed = mut_seed * 6364136223846793005u64
+                                    + 1442695040888963407u64;
+                                cells.reseed(dev, &queue, mut_seed, density);
+                            }
+                            if c == 'c' as u32 {
+                                cells.clear(dev, &queue);
+                            }
+                            if c == 'g' as u32 {
+                                show_grid = !show_grid;
+                            }
+                            if c == 'f' as u32 {
+                                win.set_fullscreen(!win.is_fullscreen());
+                            }
+                            if c == '0' as u32 {
+                                cam_x = grid as f64 * 0.5;
+                                cam_y = grid as f64 * 0.5;
+                                zoom = fit_zoom(grid, surf.width, surf.height);
+                            }
+                            if c == '+' as u32 || c == '=' as u32 {
+                                zoom = clamp_zoom(zoom * 1.25);
+                            }
+                            if c == '-' as u32 {
+                                zoom = clamp_zoom(zoom / 1.25);
+                            }
+                            if c == '[' as u32 {
+                                brush = max(1.0, brush / 1.35);
+                            }
+                            if c == ']' as u32 {
+                                brush = min(160.0, brush * 1.35);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Mouse(press)) => {
+                match press.action {
+                    MouseAction::Press => {
+                        hover = true;
+                        hover_px = press.x;
+                        hover_py = press.y;
+                        let (gx, gy) = grid_at(press.x, press.y, cam_x, cam_y,
+                            zoom, surf.width, surf.height);
+                        match press.button {
+                            Button::Left => {
+                                mode = if press.mods.shift() { 2 } else { 1 };
+                                last_gx = gx;
+                                last_gy = gy;
+                                let value = if mode == 2 { 0u32 } else { 1u32 };
+                                cells.paint(dev, &queue, gx, gy, gx, gy,
+                                    brush_cells(brush, zoom), value);
+                            }
+                            Button::Right => {
+                                mode = 2;
+                                last_gx = gx;
+                                last_gy = gy;
+                                cells.paint(dev, &queue, gx, gy, gx, gy,
+                                    brush_cells(brush, zoom), 0u32);
+                            }
+                            Button::Middle => {
+                                mode = 3;
+                                last_px = press.x;
+                                last_py = press.y;
+                            }
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Release => {
+                        mode = 0;
+                    }
+                    MouseAction::Move => {
+                        hover = true;
+                        hover_px = press.x;
+                        hover_py = press.y;
+                        if mode == 3 {
+                            cam_x -= (press.x - last_px) / zoom;
+                            cam_y -= (press.y - last_py) / zoom;
+                            if cam_x < 0.0 { cam_x = 0.0; }
+                            if cam_y < 0.0 { cam_y = 0.0; }
+                            if cam_x > grid as f64 { cam_x = grid as f64; }
+                            if cam_y > grid as f64 { cam_y = grid as f64; }
+                            last_px = press.x;
+                            last_py = press.y;
+                        } else {
+                            if mode == 1 || mode == 2 {
+                                let (gx, gy) = grid_at(press.x, press.y, cam_x,
+                                    cam_y, zoom, surf.width, surf.height);
+                                let value = if mode == 2 { 0u32 } else { 1u32 };
+                                cells.paint(dev, &queue, last_gx, last_gy,
+                                    gx, gy, brush_cells(brush, zoom), value);
+                                last_gx = gx;
+                                last_gy = gy;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Scroll(wheel)) => {
+                if hover {
+                    let (gx, gy) = grid_at(hover_px, hover_py, cam_x, cam_y,
+                        zoom, surf.width, surf.height);
+                    let expo = if wheel.precise {
+                        wheel.dy * 0.018
+                    } else {
+                        wheel.dy * 0.12
+                    };
+                    let next = clamp_zoom(zoom * unsafe { c::exp(expo) });
+                    cam_x = gx - (hover_px - surf.width as f64 * 0.5) / next;
+                    cam_y = gy - (hover_py - surf.height as f64 * 0.5) / next;
+                    zoom = next;
+                } else {
+                    let expo = if wheel.precise {
+                        wheel.dy * 0.018
+                    } else {
+                        wheel.dy * 0.12
+                    };
+                    zoom = clamp_zoom(zoom * unsafe { c::exp(expo) });
+                }
+                if cam_x < 0.0 { cam_x = 0.0; }
+                if cam_y < 0.0 { cam_y = 0.0; }
+                if cam_x > grid as f64 { cam_x = grid as f64; }
+                if cam_y > grid as f64 { cam_y = grid as f64; }
+            }
+            Ok(Event::Close(_)) => {
+                win.close();
+                break;
+            }
+            Ok(Event::Quit) => {
+                win.close();
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                break;
+            }
+        }
+    }
+    0
+}

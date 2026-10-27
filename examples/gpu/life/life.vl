@@ -1,0 +1,255 @@
+// life's simulation (life.vl): the grid, and the kernels that advance,
+// seed and paint it.
+//
+// The grid is one u32 per cell in a storage buffer: zero is dead, and a
+// living cell's value is its age (1..255). Two buffers are the pair the
+// step kernel ping-pongs between; the renderer reads whichever one
+// holds the current state. A step reads its cell and all eight
+// neighbours (wrapping at the edges: the world is a torus) and writes
+// the next generation into the other buffer. A living cell with two or
+// three neighbours survives and ages; a dead cell with exactly three is
+// born at age one.
+//
+// Seeding and painting are kernels too, so nothing the program does
+// with a 4096×4096 grid crosses the bus: a hash fills the cells, and a
+// brush writes a capsule (a segment swollen by the radius), which is
+// what makes a fast drag leave an unbroken line instead of dots.
+
+use std::gpu;
+use std::gpu::{BindGroup, Buffer, BufferUsage, ComputePipeline};
+use std::num::f32_to_bits;
+
+const WORKGROUP: i64 = 16;
+
+// Both entry points share one bind group: `spray` never reads `src`,
+// but the pipeline's layout still carries the binding (it gets the side
+// spray is not writing).
+//
+// Sim: grid size, the hash seed, mode (0 fill, 1 brush), the dispatch's
+// origin and size in cells, the brush's two endpoints and radius, the
+// fill density and the value the brush writes. The buffer is 64 bytes,
+// sixteen u32 words, so the f32 fields arrive as their bit patterns.
+pub const WGSL: [u8] = "struct Sim {\n\
+    w: u32, h: u32, seed: u32, mode: u32,\n\
+    ox: u32, oy: u32, bw: u32, bh: u32,\n\
+    bx: f32, by: f32, ex: f32, ey: f32,\n\
+    br: f32, density: f32, value: u32, pad: u32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> sim: Sim;\n\
+    @group(0) @binding(1) var<storage, read> src: array<u32>;\n\
+    @group(0) @binding(2) var<storage, read_write> dst: array<u32>;\n\
+    fn hash2(x: u32, y: u32, s: u32) -> u32 {\n\
+    var h = x * 374761393u + y * 668265263u + s * 2246822519u;\n\
+    h = (h ^ (h >> 13u)) * 1274126177u;\n\
+    h = h ^ (h >> 16u);\n\
+    return h;\n\
+    }\n\
+    @compute @workgroup_size(16, 16)\n\
+    fn step(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let x = id.x;\n\
+    let y = id.y;\n\
+    if (x >= sim.w || y >= sim.h) { return; }\n\
+    let w = sim.w;\n\
+    let h = sim.h;\n\
+    let xm = (x + w - 1u) % w;\n\
+    let xp = (x + 1u) % w;\n\
+    let ym = (y + h - 1u) % h;\n\
+    let yp = (y + 1u) % h;\n\
+    var n = 0u;\n\
+    if (src[ym * w + xm] != 0u) { n = n + 1u; }\n\
+    if (src[ym * w + x] != 0u) { n = n + 1u; }\n\
+    if (src[ym * w + xp] != 0u) { n = n + 1u; }\n\
+    if (src[y * w + xm] != 0u) { n = n + 1u; }\n\
+    if (src[y * w + xp] != 0u) { n = n + 1u; }\n\
+    if (src[yp * w + xm] != 0u) { n = n + 1u; }\n\
+    if (src[yp * w + x] != 0u) { n = n + 1u; }\n\
+    if (src[yp * w + xp] != 0u) { n = n + 1u; }\n\
+    let i = y * w + x;\n\
+    let a = src[i];\n\
+    var v = 0u;\n\
+    if (a != 0u) {\n\
+    if (n == 2u || n == 3u) { v = min(a + 1u, 255u); }\n\
+    } else {\n\
+    if (n == 3u) { v = 1u; }\n\
+    }\n\
+    dst[i] = v;\n\
+    }\n\
+    @compute @workgroup_size(16, 16)\n\
+    fn spray(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= sim.bw || id.y >= sim.bh) { return; }\n\
+    let x = sim.ox + id.x;\n\
+    let y = sim.oy + id.y;\n\
+    if (x >= sim.w || y >= sim.h) { return; }\n\
+    let i = y * sim.w + x;\n\
+    if (sim.mode == 0u) {\n\
+    let hsh = hash2(x, y, sim.seed);\n\
+    if (sim.density >= 1.0) {\n\
+    dst[i] = 1u + hsh % 7u;\n\
+    } else {\n\
+    if (sim.density > 0.0 && f32(hsh) < sim.density * 4294967296.0) {\n\
+    dst[i] = 1u + hsh % 7u;\n\
+    } else {\n\
+    dst[i] = 0u;\n\
+    }\n\
+    }\n\
+    } else {\n\
+    let px = f32(x) + 0.5;\n\
+    let py = f32(y) + 0.5;\n\
+    let ax = sim.ex - sim.bx;\n\
+    let ay = sim.ey - sim.by;\n\
+    let len2 = ax * ax + ay * ay;\n\
+    var t = 0.0;\n\
+    if (len2 > 0.000001) {\n\
+    t = ((px - sim.bx) * ax + (py - sim.by) * ay) / len2;\n\
+    if (t < 0.0) { t = 0.0; }\n\
+    if (t > 1.0) { t = 1.0; }\n\
+    }\n\
+    let qx = sim.bx + ax * t - px;\n\
+    let qy = sim.by + ay * t - py;\n\
+    if (qx * qx + qy * qy <= sim.br * sim.br) {\n\
+    if (sim.value == 0u) {\n\
+    dst[i] = 0u;\n\
+    } else {\n\
+    if (dst[i] == 0u) { dst[i] = 1u; }\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n";
+
+pub struct Life {
+    pub w: i64,
+    pub h: i64,
+    pub cells: i64,
+    pub cur: i64,
+    pub buf: [Buffer; 2],
+    pub ubuf: Buffer,
+    pub step_pipe: ComputePipeline,
+    pub step_groups: [BindGroup; 2],
+    pub spray_pipe: ComputePipeline,
+    pub spray_groups: [BindGroup; 2],
+}
+
+fn sim_words(w: i64, h: i64, seed: u32, mode: u32,
+    ox: i64, oy: i64, bw: i64, bh: i64,
+    bx: f64, by: f64, ex: f64, ey: f64,
+    br: f64, density: f64, value: u32) -> [u32; 16] {
+    return [
+        w as u32, h as u32, seed, mode,
+        ox as u32, oy as u32, bw as u32, bh as u32,
+        f32_to_bits(bx as f32), f32_to_bits(by as f32),
+        f32_to_bits(ex as f32), f32_to_bits(ey as f32),
+        f32_to_bits(br as f32), f32_to_bits(density as f32), value, 0u32,
+    ];
+}
+
+/// A life grid of `w` by `h` cells, its buffers zeroed. The caller seeds
+/// it (reseed or clear) before the first frame.
+pub fn life_new(dev: gpu::Device, w: i64, h: i64) -> Result<Life, gpu::Error> {
+    let shader = dev.shader_wgsl(WGSL)?;
+    let step_pipe = dev.compute_pipeline(shader, "step")?;
+    let spray_pipe = dev.compute_pipeline(shader, "spray")?;
+    let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
+    let bytes = w * h * 4;
+    let buf: [Buffer; 2] = [dev.buffer(bytes, usage), dev.buffer(bytes, usage)];
+    let ubuf = dev.buffer(dev.align_uniform(64),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let step_layout = step_pipe.bind_layout(0);
+    let step_groups: [BindGroup; 2] = [
+        dev.bind_group(step_layout,
+            [gpu::bind(0, ubuf), gpu::bind(1, buf[0]), gpu::bind(2, buf[1])][..]),
+        dev.bind_group(step_layout,
+            [gpu::bind(0, ubuf), gpu::bind(1, buf[1]), gpu::bind(2, buf[0])][..]),
+    ];
+    // spray never reads src, but the pipeline's layout still has the
+    // binding: give it the side it is not writing.
+    let spray_layout = spray_pipe.bind_layout(0);
+    let spray_groups: [BindGroup; 2] = [
+        dev.bind_group(spray_layout,
+            [gpu::bind(0, ubuf), gpu::bind(1, buf[1]), gpu::bind(2, buf[0])][..]),
+        dev.bind_group(spray_layout,
+            [gpu::bind(0, ubuf), gpu::bind(1, buf[0]), gpu::bind(2, buf[1])][..]),
+    ];
+    Ok(Life {
+        w: w, h: h, cells: w * h, cur: 0,
+        buf: buf, ubuf: ubuf,
+        step_pipe: step_pipe, step_groups: step_groups,
+        spray_pipe: spray_pipe, spray_groups: spray_groups,
+    })
+}
+
+impl Life {
+    /// One generation: every cell's eight neighbours counted, the next
+    /// state written to the other buffer, the current side flipped.
+    pub fn step(inout self, dev: gpu::Device, queue: inout gpu::Queue) {
+        let words = sim_words(self.w, self.h, 0u32, 0u32,
+            0, 0, self.w, self.h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0u32);
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        let pipe = self.step_pipe;
+        let group = self.step_groups[self.cur];
+        let gx = (self.w + WORKGROUP - 1) / WORKGROUP;
+        let gy = (self.h + WORKGROUP - 1) / WORKGROUP;
+        var enc = dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.dispatch(gx, gy);
+        });
+        queue.submit(enc.finish());
+        self.cur = (self.cur + 1) % 2;
+    }
+
+    /// A new field: every cell alive with probability `density`, born at
+    /// an age the hash picks (so the palette opens varied). Density 0
+    /// clears the grid.
+    pub fn reseed(inout self, dev: gpu::Device, queue: inout gpu::Queue,
+        seed: u64, density: f64) {
+        let words = sim_words(self.w, self.h, seed as u32, 0u32,
+            0, 0, self.w, self.h, 0.0, 0.0, 0.0, 0.0, 0.0, density, 0u32);
+        self.spray(dev, &queue, words, self.w, self.h);
+    }
+
+    pub fn clear(inout self, dev: gpu::Device, queue: inout gpu::Queue) {
+        self.reseed(dev, &queue, 0, 0.0);
+    }
+
+    /// Paints (value 1) or erases (value 0) a capsule in cell
+    /// coordinates: the segment (x0, y0)–(x1, y1) swollen by `radius`.
+    /// A drag is one dispatch over the capsule's bounding box, not one
+    /// per pixel it crossed.
+    pub fn paint(inout self, dev: gpu::Device, queue: inout gpu::Queue,
+        x0: f64, y0: f64, x1: f64, y1: f64, radius: f64, value: u32) {
+        let pad = radius + 1.0;
+        let xlo = if x0 < x1 { x0 } else { x1 };
+        let ylo = if y0 < y1 { y0 } else { y1 };
+        let xhi = if x0 < x1 { x1 } else { x0 };
+        let yhi = if y0 < y1 { y1 } else { y0 };
+        var ox = (xlo - pad) as i64;
+        var oy = (ylo - pad) as i64;
+        var ex = (xhi + pad) as i64 + 1;
+        var ey = (yhi + pad) as i64 + 1;
+        if ox < 0 { ox = 0; }
+        if oy < 0 { oy = 0; }
+        if ex > self.w { ex = self.w; }
+        if ey > self.h { ey = self.h; }
+        if ex <= ox || ey <= oy { return; }
+        let words = sim_words(self.w, self.h, 0u32, 1u32,
+            ox, oy, ex - ox, ey - oy, x0, y0, x1, y1, radius, 0.0, value);
+        self.spray(dev, &queue, words, ex - ox, ey - oy);
+    }
+
+    fn spray(inout self, dev: gpu::Device, queue: inout gpu::Queue,
+        words: [u32; 16], bw: i64, bh: i64) {
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        let pipe = self.spray_pipe;
+        let group = self.spray_groups[self.cur];
+        let gx = (bw + WORKGROUP - 1) / WORKGROUP;
+        let gy = (bh + WORKGROUP - 1) / WORKGROUP;
+        var enc = dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.dispatch(gx, gy);
+        });
+        queue.submit(enc.finish());
+    }
+}

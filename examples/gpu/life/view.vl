@@ -1,0 +1,154 @@
+// life's view (view.vl): the fullscreen shader that reads the cell
+// buffer and paints it, and the camera that decides which cells are on
+// screen.
+//
+// There is no vertex buffer: three vertices make a triangle that covers
+// the target, and each fragment turns its own position into a cell
+// coordinate through the camera (a centre in cells, a zoom in pixels per
+// cell). A living cell is coloured by its age, young cyan through old
+// amber; at low zoom nine taps average the cells one pixel covers, so a
+// 4096×4096 field seen whole looks like a field rather than confetti.
+// The grid lines appear once a cell is a few pixels wide, and the brush
+// is a ring around the pointer.
+
+use std::gpu;
+use std::gpu::{
+    BindGroup, Buffer, BufferUsage, Color, Format, PassDesc, RenderPipeline, TextureView,
+};
+
+use life::Life;
+
+pub static CLEAR: Color = Color::rgba(0.008, 0.011, 0.016, 1.0);
+
+pub const WGSL: [u8] = "struct View {\n\
+    cx: f32, cy: f32, zoom: f32, aspect: f32,\n\
+    gw: f32, gh: f32, sw: f32, sh: f32,\n\
+    bx: f32, by: f32, br: f32, grid: f32,\n\
+    time: f32, pad0: f32, pad1: f32, pad2: f32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> view: View;\n\
+    @group(0) @binding(1) var<storage, read> cells: array<u32>;\n\
+    struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vid: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (vid == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (vid == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    var o: V;\n\
+    o.pos = vec4<f32>(p, 0.0, 1.0);\n\
+    o.uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n\
+    return o;\n\
+    }\n\
+    fn cell_color(gx: f32, gy: f32) -> vec3<f32> {\n\
+    let fx = floor(gx);\n\
+    let fy = floor(gy);\n\
+    let ix = i32(fx);\n\
+    let iy = i32(fy);\n\
+    if (ix < 0 || iy < 0 || ix >= i32(view.gw) || iy >= i32(view.gh)) {\n\
+    return vec3<f32>(0.016, 0.020, 0.030);\n\
+    }\n\
+    let a = cells[u32(iy) * u32(view.gw) + u32(ix)];\n\
+    if (a == 0u) {\n\
+    return vec3<f32>(0.024, 0.030, 0.042);\n\
+    }\n\
+    let t = sqrt(min(f32(a) / 48.0, 1.0));\n\
+    let young = vec3<f32>(0.20, 0.92, 0.78);\n\
+    let old = vec3<f32>(1.00, 0.62, 0.16);\n\
+    let glow = 0.72 + 0.28 * t;\n\
+    return mix(young, old, t) * glow;\n\
+    }\n\
+    @fragment fn fs(i: V) -> @location(0) vec4<f32> {\n\
+    let px = i.uv.x * view.sw;\n\
+    let py = i.uv.y * view.sh;\n\
+    let gx = view.cx + (px - view.sw * 0.5) / view.zoom;\n\
+    let gy = view.cy + (py - view.sh * 0.5) / view.zoom;\n\
+    var col = cell_color(gx, gy);\n\
+    if (view.zoom < 1.0) {\n\
+    let s = 0.5 / view.zoom;\n\
+    var acc = cell_color(gx - s, gy - s);\n\
+    acc = acc + cell_color(gx, gy - s);\n\
+    acc = acc + cell_color(gx + s, gy - s);\n\
+    acc = acc + cell_color(gx - s, gy);\n\
+    acc = acc + col;\n\
+    acc = acc + cell_color(gx + s, gy);\n\
+    acc = acc + cell_color(gx - s, gy + s);\n\
+    acc = acc + cell_color(gx, gy + s);\n\
+    acc = acc + cell_color(gx + s, gy + s);\n\
+    col = acc / 9.0;\n\
+    }\n\
+    let gxf = gx - floor(gx);\n\
+    let gyf = gy - floor(gy);\n\
+    if (view.grid > 0.5 && view.zoom >= 3.0) {\n\
+    let lw = 1.0 / view.zoom;\n\
+    if (gxf < lw || gyf < lw) {\n\
+    col = mix(col, vec3<f32>(0.10, 0.14, 0.18), 0.55);\n\
+    }\n\
+    }\n\
+    if (view.br > 0.0) {\n\
+    let dx = gx - view.bx;\n\
+    let dy = gy - view.by;\n\
+    var edge = sqrt(dx * dx + dy * dy) - view.br;\n\
+    if (edge < 0.0) { edge = -edge; }\n\
+    let ring = 1.0 - min(edge * view.zoom * 0.6, 1.0);\n\
+    if (ring > 0.0) {\n\
+    col = mix(col, vec3<f32>(0.95, 1.0, 0.95), ring * 0.55);\n\
+    }\n\
+    if (dx * dx + dy * dy < view.br * view.br) {\n\
+    col = mix(col, vec3<f32>(0.80, 1.0, 0.90), 0.10);\n\
+    }\n\
+    }\n\
+    return vec4<f32>(col, 1.0);\n\
+    }\n";
+
+/// The renderer: one pipeline into Bgra8Unorm (the window's frames and
+/// the self-check's readbacks), one uniform with the camera, one bind
+/// group per side of the simulation's pair.
+pub struct Viewer {
+    pub pipe: RenderPipeline,
+    pub ubuf: Buffer,
+    pub groups: [BindGroup; 2],
+}
+
+pub fn viewer_new(dev: gpu::Device, life: Life) -> Result<Viewer, gpu::Error> {
+    let shader = dev.shader_wgsl(WGSL)?;
+    let pipe = dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs",
+        Format::Bgra8Unorm))?;
+    let ubuf = dev.buffer(dev.align_uniform(64),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let layout = pipe.bind_layout(0);
+    let groups: [BindGroup; 2] = [
+        dev.bind_group(layout, [gpu::bind(0, ubuf), gpu::bind(1, life.buf[0])][..]),
+        dev.bind_group(layout, [gpu::bind(0, ubuf), gpu::bind(1, life.buf[1])][..]),
+    ];
+    Ok(Viewer { pipe: pipe, ubuf: ubuf, groups: groups })
+}
+
+/// One frame: `cx`/`cy` is the cell at the centre of the frame, `zoom`
+/// pixels per cell, `brush` the ring's radius in cells (0 hides it).
+/// `which` is the simulation's current side.
+impl Viewer {
+    pub fn draw(self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        which: i64, cx: f64, cy: f64, zoom: f64,
+        w: i64, h: i64, gw: i64, gh: i64,
+        bx: f64, by: f64, brush: f64, show_grid: bool, time: f64) {
+        let grid: f32 = if show_grid { 1.0 } else { 0.0 };
+        let u: [f32; 16] = [
+            cx as f32, cy as f32, zoom as f32, w as f32 / h as f32,
+            gw as f32, gh as f32, w as f32, h as f32,
+            bx as f32, by as f32, brush as f32, grid,
+            time as f32, 0.0, 0.0, 0.0,
+        ];
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+        let pipe = self.pipe;
+        let group = self.groups[which];
+        var enc = dev.encoder();
+        enc.render_pass(PassDesc::color(target, clear: CLEAR), |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.draw(0..3, 0..1);
+        });
+        queue.submit(enc.finish());
+    }
+}
