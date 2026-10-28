@@ -63,7 +63,13 @@ edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
   `$VOLE_ROOT`, is looked for in the other programs under the current
   directory (`git grep` of its definition, tracked and untracked files):
   each gets a `try:` line, the command as it was run with `--root` (at
-  most 3, examples' before tests'). When one program defines it, a
+  most 3: the program the current directory is in first, when it is in
+  one's subdirectory, then the examples', then the rest; (0.25.2.2) never
+  one under evals/, tests/, target/ or a dot directory, nor anything from
+  under evals/: the 0.25.2.1 eval's `try:` lines named other agents'
+  programs). A std path (`std::window::Surface::frame`) never goes to
+  another program: std is every program's, and its nearest names answer
+  (`try: volec query show std::gpu::Surface::frame`). When one program defines it, a
   question of `query` is answered from there, with `note
   query.other-root: not in compiler/src/main.vl; answered from
   examples/gpu/life/main.vl (--root examples/gpu/life/main.vl)`.
@@ -317,7 +323,19 @@ types::{Color, ...};` in std::gpu) is found through it: `show
 std::gpu::Color` is std::gpu::types::Color, with `note query.reexport:
 std::gpu::Color is std::gpu::types::Color, which std::gpu re-exports`;
 `items std::gpu` lists them, `LINE  use  pub use Color =
-std::gpu::types::Color (struct)`. When more than 5 definitions match,
+std::gpu::types::Color (struct)`. (0.25.2.2) A module's own `use` too,
+when nothing else answers: `show std::gpu::wgsl::expr::Front::unary`
+is std::gpu::wgsl::front::Front::unary (`... which std::gpu::wgsl::expr
+imports (`use`)`). `FILE.vl::item` names the item of that file:
+`show sim.vl::Sim::snapshot_in` is crate::sim::Sim::snapshot_in, and
+an item written in that file of a type of another module (`draw.vl::
+Square::outline`, an `impl Square` in draw.vl); the FILE names its
+program as a FILE argument does, and with no such file here the other
+programs with one are asked. A trait impl's function answers to its
+type's path (`std::gpu::hal::metal::Metal::begin_render`, of `impl
+Render<Metal> for Metal`). A std item's `// use` line is the path a
+program can import (`// use std::gpu::Surface;`; it said `use
+std::Surface;`, which does not compile). When more than 5 definitions match,
 `show` prints only their paths, one per line, and fails (exit 1) with
 `error query.ambiguous` and a `try:` line showing the first.
 
@@ -1289,7 +1307,17 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   other exact fixes (a did-you-mean, a conversion, a `use`, a path: the
   0.25.2 eval's wrong fixes were all of these) are shown, not made: `fix
   --suggested --dry-run`'s changes and refusals under `suggested, not
-  applied (check each: ...)`, at most 10 lines.
+  applied (check each: ...)`, at most 10 lines. (0.25.2.2) Repeats of
+  one fix in a file are one line, `fixed 20 '&mut x' to '&x'
+  (conv.rust) in main.vl: lines 3, 7, ...`, and each file the hook
+  rewrote is named once after its changes, `the hook rewrote main.vl:
+  the 6 changes above, nothing else`: they are all it wrote (the 0.25.2.1
+  eval's `changed on disk` notices followed the agents' own `sed -i`,
+  `perl -pi` and Python edits, 31 of 34, and the hook's fixes, 3; no
+  formatter runs). Those shell edits of a `.vl` now trigger the check
+  too. A file the call left unformatted gets `main.vl is not formatted:
+  volec fmt main.vl` once, until it is formatted (`fmt --check`, a few
+  ms; VOLE_HOOK_FMT=0: off); the hook formats nothing.
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,
@@ -1310,7 +1338,13 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   and the block says so: `NOTHING on this line ran (N commands)`, the
   command blocked by its number and text, the reads and writes that
   are allowed, and `try the whole line: ...` with the blocked command
-  replaced by its query. The blocked record logs the `try:` commands it gave. After a
+  replaced by its query; (0.25.2.2) when a blocked read has no query
+  not in doubt, `try the line without it: ...`, the rest of the line as
+  typed (here-documents kept), to run as it is. A bounded line range of
+  any `.vl` runs: `sed -n 'A,Bp'`, `head`/`tail -n N`, `cat -n F | sed
+  -n ...`, at most 200 lines (`read-range`); a grep of a large file, a
+  read of several, and every write of the compiler's source are still
+  blocked. The blocked record logs the `try:` commands it gave. After a
   call: a `# no-query:` reason asking for line numbers for the Edit tool
   is answered with `edit insert --after NAME` and `query def NAME`; the
   hints of tools/agent-hooks/hints.txt (`repeat-query` after the third

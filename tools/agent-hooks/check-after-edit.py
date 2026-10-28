@@ -58,6 +58,22 @@ with the compiler's refusals (`fix --suggested --dry-run`):
 VOLE_HOOK_FIX=0: the hook names the fix and applies nothing, as
 before. Not at a turn's end (turn-end.py).
 
+(0.25.2.2, after the 0.25.2.1 GPU eval) Repeats of one fix in a file
+are one line, and each file the hook rewrote is named once, after its
+changes: they are all it wrote (no formatter runs; the eval's `changed on
+disk` notices followed the agents' own sed -i, perl -pi and Python
+edits, 31 of 34, and the hook's fixes, 3):
+
+    fixed 20 '&mut x' to '&x' (conv.rust) in main.vl: lines 3, 7, ...
+    the hook rewrote main.vl: the 20 changes above, nothing else (read it again before an Edit)
+
+Those shell edits trigger the check too (sed -i, perl -pi, a Python
+script that opens a .vl it names for writing). A file the call left
+unformatted gets one line, once until it is formatted (`fmt --check`, a
+few ms; VOLE_HOOK_FMT=0: off):
+
+    main.vl is not formatted: volec fmt main.vl (or --dry-run first: ...)
+
 and the compiler is run under the name the agent can type (`volec` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
@@ -398,21 +414,109 @@ def shown_exact(compiler, root, cwd):
     return diff_changes(got[1]) + [f"refused: {m}" for m in got[2]]
 
 
+# (0.25.2.2) An exact fix's change as the compiler's `try:` names it:
+# `edit patch FILE:LINE --old 'OLD' --new 'NEW'`.
+PATCH_TRY = re.compile(r"edit patch \S+ --old '([^']*)' --new '([^']*)'")
+QUOTED = re.compile(r"(?<!\w)'([^']+)'(?!\w)")
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+KEYWORDS = {"mut", "let", "var", "fn", "as", "in", "inout", "sink"}
+
+
+def fix_pattern(d):
+    """(0.25.2.2) The change an error's exact fix makes, with its names put
+    as x, y: ('&mut x', '&x') for `'&mut enc' is Rust's spelling`, ('x',
+    '&x') for a lent argument, ('let mut', 'var'): the key the report
+    groups repeated fixes by; None when the error does not say."""
+    old = new = None
+    for t in d.get("try") or []:
+        m = PATCH_TRY.search(t)
+        if m:
+            old, new = m.group(1), m.group(2)
+            break
+    if old is None:
+        q = QUOTED.findall(d.get("message") or "")
+        if len(q) < 2:
+            return None
+        old, new = q[0], q[-1]
+        # (`'&mut a' is ...: marked '&x'`: the message's own x)
+        ids = [w for w in WORD.findall(old) if w not in KEYWORDS]
+        if ids and re.search(r"\bx\b", new) and not re.search(r"\bx\b", old):
+            old = re.sub(r"\b%s\b" % ids[-1], "x", old)
+    # (the text both keep around the change: `(a` -> `(&a` is a -> &a)
+    while old and new and old[0] == new[0] and old[0] in "([{, ":
+        old, new = old[1:], new[1:]
+    while old and new and old[-1] == new[-1] and old[-1] in ")]}, ;":
+        old, new = old[:-1], new[:-1]
+    names = [w for w in dict.fromkeys(WORD.findall(old)) if w not in KEYWORDS and re.search(r"\b%s\b" % w, new)]
+    for k, w in enumerate(names[:3]):
+        v = "xyz"[k]
+        old = re.sub(r"\b%s\b" % w, v, old)
+        new = re.sub(r"\b%s\b" % w, v, new)
+    return old, new
+
+
+def same_file(a, b):
+    a, b = os.path.normpath(a or ""), os.path.normpath(b or "")
+    return a == b or a.endswith(os.sep + b) or b.endswith(os.sep + a)
+
+
 def fixed_report(fixed, changed, root_shown, lines=()):
     """(0.18.1) What the hook's fix did: a head, each change it made
-    (`FILE:LINE: OLD -> NEW`, 0.25.2.1), then each fixed error."""
+    (`FILE:LINE: OLD -> NEW`, 0.25.2.1), then each fixed error. (0.25.2.2)
+    Repeats of one fix in a file in one line (`fixed 20 '&mut x' to '&x'
+    (conv.rust) in main.vl: lines 3, 7, ...`; the 0.25.2.1 eval's sdftext
+    had 20 lines of them), and at the end each file the hook rewrote, with
+    how many changes, once: those changes are all the hook wrote (the
+    harness's `changed on disk` notice after it is about them)."""
     where = " " + root_shown if root_shown else ""
-    files = ", ".join(sorted({f for f, _ in changed if f})) or "the files"
     head = [f"volec fix{where}, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
-            f"unused at two checks; volec undo takes it back; positions as before it; {files} changed: read "
-            f"{'it' if ',' not in files else 'them'} again before an Edit):"]
-    out = head + [f"changed {x}" for x in lines]
+            f"unused at two checks; volec undo takes it back; positions as before it):"]
+    groups = {}
     for d in fixed:
+        pat = fix_pattern(d)
+        key = (d.get("file") or "", d.get("code") or "", pat) if pat else id(d)
+        groups.setdefault(key, []).append(d)
+    summed = [g for g in groups.values() if len(g) >= 2]
+    summed_ids = {id(d) for g in summed for d in g}
+    # (a change line is left out when every fixed error on its line is in
+    # a summary line)
+    on_line = {}
+    for d in fixed:
+        on_line.setdefault((os.path.normpath(d.get("file") or ""), d.get("line")), []).append(id(d))
+    kept = []
+    per_file = {}
+    for x in lines:
+        m = re.match(r"^(.+?):(\d+): ", x)
+        f, ln = (m.group(1), int(m.group(2))) if m else ("", 0)
+        ids = next((v for (ff, ll), v in on_line.items() if ll == ln and same_file(ff, f)), [])
+        if not (ids and all(i in summed_ids for i in ids)):
+            kept.append(x)
+        if not ids and f:
+            per_file[f] = per_file.get(f, 0) + 1
+    out = head + [f"changed {x}" for x in kept]
+    for d in fixed:
+        if id(d) in summed_ids:
+            continue
         pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
         fix = " | ".join(d.get("help") or []) or "its exact fix"
         out.append(f"fixed {pos}{d.get('message', '')} | {fix}")
+    for g in summed:
+        old, new = fix_pattern(g[0])
+        lns = sorted({d.get("line") for d in g if d.get("line")})
+        out.append(f"fixed {len(g)} '{old}' to '{new}' ({g[0].get('code', '')}) in {g[0].get('file') or 'the files'}: "
+                   f"line{'s' if len(lns) != 1 else ''} {', '.join(map(str, lns))}")
+    for d in fixed:
+        f = d.get("file") or ""
+        if f:
+            key = next((k for k in per_file if same_file(k, f)), f)
+            per_file[key] = per_file.get(key, 0) + 1
     if not fixed and not lines:
         out.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
+    files = sorted(set(per_file) | {f for f, _ in changed if f and not any(same_file(f, k) for k in per_file)})
+    for f in files:
+        n = per_file.get(f, 0)
+        count = f"the {n} changes above" if n > 1 else "the change above" if n else "the changes above"
+        out.append(f"the hook rewrote {f}: {count}, nothing else (read it again before an Edit)")
     return "\n".join(out)
 
 
@@ -510,14 +614,45 @@ WRITE_SUMMARY = re.compile(r"^(undid|patched|replaced|inserted|deleted|fixed|ren
 REDIRECT = re.compile(r"(?:^|[\s;])(?:\d?>>?|&>>?)\s*([^\s;|&<>]+\.vl)\b")
 
 
+# (0.25.2.2) A script writing a file: Python's `open(p, 'w')`,
+# `.write_text(`, and the .vl names its text quotes.
+PY_WRITES = re.compile(r"""open\([^)]*,\s*['"][wa]|\.write_text\(""")
+PY_VL = re.compile(r"""['"]([^'"\s]+\.vl)['"]""")
+
+
+def in_place(words):
+    """(0.25.2.2) Whether a sed or perl command rewrites its files (`sed
+    -i`, `perl -pi -e`): the 0.25.2.1 eval's agents edited with them, and
+    the hook did not check after."""
+    prog = os.path.basename(words[0]) if words else ""
+    if prog in ("sed", "gsed"):
+        return any(w == "-i" or w.startswith("-i") or w.startswith("--in-place") or
+                   (re.match(r"^-[a-zA-Z]+$", w) and "i" in w[1:]) for w in words[1:])
+    if prog == "perl":
+        return any(re.match(r"^-[0-9a-zA-Z]*i", w) for w in words[1:] if w.startswith("-"))
+    return False
+
+
 def shell_writes(command, cwd):
-    """[(path, directory)] of the .vl files a shell command writes."""
+    """[(path, directory)] of the .vl files a shell command writes: a
+    redirection, tee, cp, mv; (0.25.2.2) sed -i, perl -i, a Python script
+    (`python3 - <<EOF`, `python3 -c`) that opens a file to write and
+    names .vl files."""
     found = []
+    bodies = None
     for seg, words, here, assigns in tc.located(command, cwd):
         for m in REDIRECT.finditer(tc.HEREDOC.sub("<<HEREDOC\n", seg)):
             found.append((m.group(1), here, assigns))
         if words and words[0] in ("tee", "cp", "mv") and words[-1].endswith(".vl") and len(words) > 1:
             found.append((words[-1], here, assigns))
+        if words and in_place(words):
+            found += [(w, here, assigns) for w in words[1:] if w.endswith(".vl")]
+        if words and re.match(r"^python[0-9.]*$", os.path.basename(words[0])):
+            if bodies is None:
+                bodies = "\n".join(m.group(0) for m in tc.HEREDOC.finditer(command))
+            text = (" ".join(words[1:]) if "-c" in words else "") + "\n" + (bodies if "<<" in seg else "")
+            if PY_WRITES.search(text):
+                found += [(m.group(1), here, assigns) for m in PY_VL.finditer(text)]
     out = []
     for path, here, assigns in found:
         path = tc.expand(path.strip("'\""), assigns)
@@ -822,6 +957,9 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     if fixed_text and not text:
         text = f"volec check{' ' + shown if shown else ''}: 0 errors"
     texts = [t for t in (fixed_text, text, shown_text) if t]
+    fmt_text = fmt_note(compiler, run_dir, edited, st) if not at_turn_end else ""
+    if fmt_text:
+        texts.append(fmt_text)
     entry = {"errors": keys, "time": time.time(), "root": key_root, "unused": unused_keys}
     fp = hs.fingerprint(key_root)[0] if key_root else ""
     entry["fp"] = fp
@@ -872,6 +1010,31 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
                     rec["tests_passed"] = cur.get("passed", 0)
     roots[key] = entry
     return "\n".join(t for t in texts if t), rec
+
+
+def fmt_note(compiler, cwd, edited, st):
+    """(0.25.2.2) `FILE is not formatted: volec fmt FILE` for the file the
+    call changed, once until it is formatted (the 0.25.2.1 eval's cloth
+    learnt of `fmt` only from `fmt --check`); the hook formats nothing.
+    `volec fmt --check` takes a few ms. VOLE_HOOK_FMT=0: no note."""
+    if not edited or os.environ.get("VOLE_HOOK_FMT", "1") == "0" or not os.path.exists(edited):
+        return ""
+    full = os.path.abspath(edited)
+    arg = os.path.relpath(full, cwd) if full.startswith(cwd + os.sep) else full
+    r = run_typed(compiler, cwd, ["fmt", "--check", arg])
+    if r is None or r.returncode not in (0, 1):
+        return ""
+    said = st.setdefault("unformatted", [])
+    if r.returncode == 0 or "fmt.unformatted" not in r.stderr:
+        if full in said:
+            said.remove(full)
+        return ""
+    if full in said:
+        return ""
+    said.append(full)
+    name = volec_shown(compiler, cwd)
+    return (f"{arg} is not formatted: {name} fmt {arg} (or --dry-run first: the diff; the hook formats "
+            f"nothing, and says this once a file)")
 
 
 def volec_shown(compiler, cwd):

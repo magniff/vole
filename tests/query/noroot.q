@@ -7,9 +7,9 @@ try: volec query def nothing_defines_this path/to/main.vl
 ## (at most 3).
 $ def main
 error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+try: volec query def main --root xroots0252/examples/demo/main.vl
 try: volec query def main --root broken/main.vl
 try: volec query def main --root budget/main.vl
-try: volec query def main --root calls016/main.vl
 [exit 2]
 $ refs
 error query.usage: refs needs a NAME (a path or its end: f, m::f, T::f, T.field; or FILE:LINE)

@@ -250,6 +250,21 @@ try:
     case("cp onto a .vl", bash_at(elsewhere, f"cd {prog}; cp /x/u.vl util.vl")[:2],
          (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
     case("a .vl read is not a write", bash_at(prog, "cat util.vl > /dev/null"), None)
+    # (0.25.2.2) The 0.25.2.1 eval's agents edited with sed -i, perl -pi and
+    # Python; the hook did not check after them (31 of 34 `changed on disk`
+    # notices followed such an edit).
+    case("sed -i of a .vl", bash_at(prog, "sed -i '' 's/f/g/' util.vl && grep g util.vl")[:2],
+         (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
+    case("perl -0pi of a .vl", bash_at(prog, "perl -0pi -e 's/f/g/' util.vl")[:2],
+         (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
+    case("python heredoc writing a .vl", bash_at(elsewhere, f"cd {prog} && python3 - <<'EOF'\np = 'util.vl'\n"
+                                                 "s = open(p).read()\nopen(p, 'w').write(s)\nEOF")[:2],
+         (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
+    case("python -c writing a .vl", bash_at(prog, "python3 -c \"open('util.vl', 'w').write('x')\"")[:2],
+         (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
+    case("python reading a .vl is not a write", bash_at(prog, "python3 - <<'EOF'\nprint(open('util.vl').read())\nEOF"),
+         None)
+    case("sed -n is not a write", bash_at(prog, "sed -n 1,3p util.vl"), None)
 
     # (0.17) The delta: what changed since this session's last check of the
     # root; the tests when the program has them; the hint.
@@ -343,8 +358,10 @@ try:
         p = os.path.join(fdir3, "fix.calls")
         return open(p).read().strip().split("\n") if os.path.exists(p) else []
     head = ("volec fix main.vl, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
-            "unused at two checks; volec undo takes it back; positions as before it; main.vl changed: read it "
-            "again before an Edit):")
+            "unused at two checks; volec undo takes it back; positions as before it):")
+    # (0.25.2.2) each file the hook rewrote, once, after its changes
+    tail1 = "\nthe hook rewrote main.vl: the change above, nothing else (read it again before an Edit)"
+    tail2 = "\nthe hook rewrote main.vl: the 2 changes above, nothing else (read it again before an Edit)"
     shown = ("suggested, not applied (check each: a name, a conversion or an import can change what the code "
              "means; " + fake3 + " fix --suggested main.vl makes the changes, not the refused):")
     diff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -2,2 +2,2 @@"], ["-    bump(ui);"], ["-    let mut u = 0;"],
@@ -360,7 +377,7 @@ try:
           head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
           "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
           "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
-          "\nvolec check main.vl: 2 errors\ntry: volec fix --suggested main.vl   (1 of the errors: their exact "
+          + tail2 + "\nvolec check main.vl: 2 errors\ntry: volec fix --suggested main.vl   (1 of the errors: their exact "
           "fixes, one checked edit)\nmain.vl:4:5: error[type error] undefined variable 'prinln' | help: did you "
           "mean 'println'?\nmain.vl:6:5: error[type error] expected '[u8]', got 'i64'\n"
           + shown + "\n  main.vl:4: prinln(\"x\"); -> println(\"x\");"))
@@ -368,7 +385,28 @@ try:
     case("hook fix: all fixed, clean", ctx_of(run(ev, fake3)[1]),
          head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);"
          "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
+         + tail1 + "\nvolec check main.vl: 0 errors")
+    # (0.25.2.2) Repeats of one fix in one line, not a line each (the
+    # 0.25.2.1 eval's sdftext: about 20 `&mut` lines).
+    rust = [dict(diag("main.vl", 10 + k, "'&mut %s' is Rust's spelling; an inout argument (the callee may change "
+                      "it) is marked '&x'" % v, code="conv.rust"),
+                 **{"try": ["volec edit patch main.vl:%d --old '&mut %s' --new '&%s'" % (10 + k, v, v), sug]})
+            for k, v in enumerate("abc")]
+    rdiff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -10,3 +10,3 @@"]] + \
+        [["-    f(&mut %s);" % v] for v in "abc"] + [["+    f(&%s);" % v] for v in "abc"]
+    fake3_says(rust + [spell], [["fixed 4 suggested fixes", "main.vl", "+4 -4 lines"]] + rdiff +
+               [["@@ -3 +3 @@"], ["-    let mut u = 0;"], ["+    var u = 0;"]], [])
+    case("hook fix: repeats in one line, each file once", ctx_of(run(ev, fake3)[1]),
+         head + "\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
+         "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
+         "\nfixed 3 '&mut x' to '&x' (conv.rust) in main.vl: lines 10, 11, 12"
+         "\nthe hook rewrote main.vl: the 4 changes above, nothing else (read it again before an Edit)"
          "\nvolec check main.vl: 0 errors")
+    case("fix pattern: a lent argument", hook.fix_pattern(dict(marker, **{"try": [
+        "volec edit patch main.vl:2 --old '(ui' --new '(&ui'"]})), ("x", "&x"))
+    case("fix pattern: a spelling", hook.fix_pattern(dict(spell, **{"try": [
+        "volec edit patch main.vl:3 --old 'let mut' --new 'var'"]})), ("let mut", "var"))
+    case("fix pattern: from the message", hook.fix_pattern(rust[0] | {"try": []}), ("&mut x", "&x"))
     # (0.25.2.1) a did-you-mean is not made (the gpu2521 agent's
     # `readback` made `read_back`, the function the call was in); the
     # compiler's refusal is shown with the rest
@@ -417,7 +455,7 @@ try:
     got = ctx_of(run(uev, fake3, ustate)[1])
     case("hook fix: an import unused at two checks is removed", (fix_calls(), got),
          (["fix --only unused --in main.vl --diff main.vl --json"],
-          head + "\nchanged main.vl:1: - use std::I64_MAX;\nvolec check main.vl: 0 errors"))
+          head + "\nchanged main.vl:1: - use std::I64_MAX;" + tail1 + "\nvolec check main.vl: 0 errors"))
     case("diff changes: replaced, added, removed",
          hook.diff_changes(["--- a/x.vl", "+++ b/x.vl", "@@ -3,2 +3,3 @@", "-a", "-b", "+A", "+B", "+C",
                             "@@ -9 +10,0 @@", "-z"]),
@@ -520,6 +558,19 @@ try:
              (["changed main.vl:3: let mut y = 1 + \"a\"; -> var y = 1 + \"a\";",
                "fixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix",
                "  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True, False))
+        # (0.25.2.2) A file the call left unformatted: said once, until
+        # it is formatted; the hook formats nothing.
+        write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 =   1;\n    let y = x + 1;\n}\n")
+        fst = tempfile.mkdtemp(dir=tmp)
+        got = ctx_of(run(ev2, real, fst)[1])
+        case("real: not formatted, said", got.startswith("main.vl is not formatted: ") and " fmt main.vl " in got,
+             True)
+        case("real: not formatted, said once", run(ev2, real, fst)[1], "")
+        os.environ["VOLE_HOOK_FMT"] = "0"
+        case("real: VOLE_HOOK_FMT=0, no note", run(ev2, real)[1], "")
+        del os.environ["VOLE_HOOK_FMT"]
+        subprocess.run([real, "fmt", "main.vl"], cwd=prog, capture_output=True)
+        case("real: formatted, silent", run(ev2, real, fst)[1], "")
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):
