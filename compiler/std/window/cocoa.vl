@@ -41,8 +41,23 @@
 // - A headless session (ssh, no window server) makes NSApplication abort
 //   the process: CGSessionCopyCurrentDictionary is asked first, and
 //   App::new_in returns Err(NoDisplay).
+// - (0.25.2.1) The display link fires only for a window the display
+//   shows: none while the display is asleep (the screen locked, the
+//   person away), nor for a window that is covered, hidden, minimized or
+//   on another Space (occlusionState without Visible). A loop waiting for Frame would
+//   wait forever, so each request is also answered by a timer: at once
+//   10 a second when the window is occluded (FALLBACK_NS), after 3 s of
+//   silence otherwise (QUIET_NS), 60 a second with no display link; and
+//   after 3 s without a display frame one line on stderr says why.
+// - (0.25.2.1) A process started from a background shell is not made
+//   active (macOS 14's cooperative activation ignores
+//   activateIgnoringOtherApps: then): its window opens behind the
+//   active app's. It is ordered front regardless, as winit does (not
+//   made key: the focus stays where it is).
 
 // ---- The Cocoa backend (0.23) ----
+
+use std::time::monotonic_now;
 
 use keys::{
     first_char, mac_keycode, mac_logical, mac_modifier_down, mac_mods, utf16_to_byte, utf8_cut,
@@ -71,6 +86,8 @@ extern "C" {
     static NSPasteboardTypeString: *u8;
     static kCFRunLoopDefaultMode: *u8;
     fn CGSessionCopyCurrentDictionary() -> *u8;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> i32;
     fn CFRelease(o: *u8);
     fn CFRunLoopGetMain() -> *u8;
     fn CFRunLoopAddSource(rl: *u8, src: *u8, mode: *u8);
@@ -136,6 +153,27 @@ const EV_OTHER_DRAGGED: u64 = 27;
 // data1 of our wake-up NSEvent.
 const WAKE: i64 = 0x74616368;
 
+// (0.25.2.1) The frame timer (see the pitfalls above): an occluded
+// window's frames come 10 a second, a window without a display link's
+// 60, and a visible window's display link silent for 3 s is answered by
+// the timer too (and the diagnostic printed).
+const FALLBACK_NS: i64 = 100000000;
+const NO_LINK_NS: i64 = 16000000;
+const QUIET_NS: i64 = 3000000000;
+
+// (0.25.2.1) A window's frame request: whether one is pending and since
+// when, since when its display link has been silent while frames were
+// wanted, and whether the last frame came from the timer.
+struct Req {
+    id: i64,
+    win: *u8,
+    link: *u8,
+    pending: bool,
+    since: i64,
+    quiet: i64,
+    slow: bool,
+}
+
 // The view's instance variable "vole": the window id, the cursor
 // shape, the input method area (physical pixels).
 struct ViewData {
@@ -174,6 +212,10 @@ struct State {
     hook_ctx: *u8,
     in_hook: bool,
     watches: Vec<Watch>,
+    // (0.25.2.1) The windows' frame requests, and whether the no-frame
+    // diagnostic was printed (once per process).
+    reqs: Vec<Req>,
+    warned: bool,
     app: *u8,
     delegate: *u8,
     target: *u8,
@@ -451,7 +493,10 @@ extern "C" fn imp_frame(this: *u8, cmd: *u8, link: *u8) {
     // SAFETY: see st_live; `link` is the CADisplayLink that called us.
     unsafe {
         msg_v_b(link, sel(c"setPaused:"), true);
-        push(Event::Frame(view_id(this)));
+        // A request the timer answered already is not answered twice.
+        if ST.answered(link) {
+            push(Event::Frame(view_id(this)));
+        }
     }
 }
 
@@ -675,6 +720,24 @@ extern "C" fn imp_did_resign(this: *u8, cmd: *u8, note: *u8) {
     unsafe { push(Event::Focus(view_id(note_view(note)), false)); }
 }
 
+// (0.25.2.1) A window was covered, hidden or shown again (or the
+// display went to sleep): next_event looks at the frame requests
+// again, so a pending one is answered by the timer from now on.
+extern "C" fn imp_did_occlusion(this: *u8, cmd: *u8, note: *u8) {
+    if !st_live() {
+        return;
+    }
+    // UNSAFE: the App's State through the ST pointer, and a Cocoa
+    // message (postEvent:atStart:) on raw object pointers.
+    // SAFETY: see st_live; the wake-up event only ends the wait.
+    unsafe {
+        if ST.waiting && !ST.wake_posted {
+            ST.wake_posted = true;
+            post_wake(ST.app);
+        }
+    }
+}
+
 extern "C" fn imp_quit(this: *u8, cmd: *u8, sender: *u8) {
     push(Event::Quit);
 }
@@ -783,6 +846,7 @@ unsafe fn make_delegate_class() -> *u8 {
     add_v_p(c, sel(c"windowDidChangeBackingProperties:"), imp_did_backing, c"v@:@");
     add_v_p(c, sel(c"windowDidBecomeKey:"), imp_did_key, c"v@:@");
     add_v_p(c, sel(c"windowDidResignKey:"), imp_did_resign, c"v@:@");
+    add_v_p(c, sel(c"windowDidChangeOcclusionState:"), imp_did_occlusion, c"v@:@");
     add_v_p(c, sel(c"voleQuit:"), imp_quit, c"v@:@");
     objc_registerClassPair(c);
     c
@@ -820,6 +884,54 @@ pub fn has_display() -> bool {
         CFRelease(d);
         true
     }
+}
+
+// (0.25.2.1) The monotonic clock in nanoseconds.
+fn now_ns() -> i64 {
+    monotonic_now().as_nanos() as i64
+}
+
+// (0.25.2.1) Whether the window is not shown (occlusionState lacks
+// NSWindowOcclusionStateVisible, 1 << 1).
+// UNSAFE: an Objective-C message on a raw NSWindow pointer.
+// SAFETY: the caller passes a live NSWindow; occlusionState takes nothing
+// and returns an NSUInteger.
+unsafe fn occluded(win: *u8) -> bool {
+    (msg_u(win, sel(c"occlusionState")) & 2) == 0
+}
+
+// (0.25.2.1) Why a window's display link gives no frames, for the
+// diagnostic: the display asleep, the screen locked, or the window
+// occluded (`hidden`).
+// UNSAFE: CoreGraphics' C functions and Objective-C messages on the raw
+// CFDictionary and CFBoolean they return.
+// SAFETY: CGSessionCopyCurrentDictionary's result is a +1 dictionary or
+// null, released once after its last use; objectForKey: takes the NSString
+// (autoreleased in the pool popped before the release) and returns a
+// value the dictionary holds, or null, checked before boolValue;
+// CGDisplayIsAsleep takes any display id.
+unsafe fn quiet_reason(hidden: bool) -> [u8] {
+    // Asleep first: a locked screen still shows windows while it is awake.
+    if CGDisplayIsAsleep(CGMainDisplayID()) != 0 {
+        return "the display is asleep";
+    }
+    let d = CGSessionCopyCurrentDictionary();
+    if d != 0 as *u8 {
+        let pool = pool_push();
+        // The session dictionary (toll-free bridged to NSDictionary):
+        // its value for this key is a CFBoolean, or absent.
+        let v = msg_p_p(d, sel(c"objectForKey:"), nsstring("CGSSessionScreenIsLocked"));
+        let locked = v != 0 as *u8 && msg_b(v, sel(c"boolValue"));
+        pool_pop(pool);
+        CFRelease(d);
+        if locked {
+            return "the screen is locked";
+        }
+    }
+    if hidden {
+        return "covered, hidden, minimized or on another Space";
+    }
+    "the machine may be too loaded"
 }
 
 pub fn hide_cursor_until_moved() {
@@ -869,6 +981,8 @@ impl Cocoa {
                 hook_ctx: 0 as *u8,
                 in_hook: false,
                 watches: Vec::new_in(gpa),
+                reqs: Vec::new_in(gpa),
+                warned: false,
                 app: app,
                 delegate: delegate,
                 target: delegate,
@@ -896,6 +1010,9 @@ impl State {
         None
     }
 
+    // The next event within `ms` milliseconds (-1: however long it takes,
+    // 0: only what is ready). (0.25.2.1) The wait ends early when a frame
+    // request is due from the timer (late_frames).
     fn next_event(inout self, ms: i64) -> Option<Event> {
         match self.pop() {
             Some(e) => return Some(e),
@@ -911,21 +1028,54 @@ impl State {
                 self.watches[i].armed = true;
             }
         }
+        let end = if ms < 0 { -1 } else { now_ns() + ms * 1000000 };
+        loop {
+            let due = self.late_frames();
+            match self.pop() {
+                Some(e) => return Some(e),
+                None => {}
+            }
+            // Wait until the caller's end or the next request the timer
+            // answers, whichever comes first.
+            let now = now_ns();
+            var until = end;
+            if due >= 0 && (until < 0 || due < until) {
+                until = due;
+            }
+            let wait = if ms == 0 { 0 } else if until < 0 { -1 }
+                else if until > now { until - now } else { 0 };
+            self.pump(wait);
+            match self.pop() {
+                Some(e) => return Some(e),
+                None => {}
+            }
+            if ms == 0 || (end >= 0 && now_ns() >= end) {
+                let _ = self.late_frames();
+                return self.pop();
+            }
+        }
+    }
+
+    // Dispatches the NSEvents that come within `wait` nanoseconds (-1:
+    // until one comes; 0: those ready), stopping at the first that queues
+    // an Event.
+    fn pump(inout self, wait: i64) {
         // SAFETY: the event loop's AppKit calls with their documented
         // types, each batch in an autorelease pool; the date is
         // autoreleased in the outer pool, which outlives the loop.
         unsafe {
             let outer = pool_push();
-            let date = if ms < 0 {
+            let date = if wait < 0 {
                 msg_p(class(c"NSDate"), sel(c"distantFuture"))
-            } else if ms == 0 {
+            } else if wait == 0 {
                 msg_p(class(c"NSDate"), sel(c"distantPast"))
             } else {
-                msg_p_d(class(c"NSDate"), sel(c"dateWithTimeIntervalSinceNow:"), ms as f64 / 1000.0)
+                msg_p_d(class(c"NSDate"), sel(c"dateWithTimeIntervalSinceNow:"),
+                    wait as f64 / 1000000000.0)
             };
             loop {
                 let p = pool_push();
-                self.waiting = ms != 0;
+                self.waiting = wait != 0;
                 let ev = msg_p_uppb(self.app,
                     sel(c"nextEventMatchingMask:untilDate:inMode:dequeue:"), 0xFFFFFFFFFFFFFFFF,
                     date, NSDefaultRunLoopMode, true);
@@ -935,7 +1085,11 @@ impl State {
                     break;
                 }
                 if msg_u(ev, sel(c"type")) == EV_APP_DEFINED && msg_i(ev, sel(c"data1")) == WAKE {
+                    // Something to look at: an Event queued, or (0.25.2.1)
+                    // a window's occlusion changed (late_frames).
                     self.wake_posted = false;
+                    pool_pop(p);
+                    break;
                 } else {
                     msg_v_p(self.app, sel(c"sendEvent:"), ev);
                 }
@@ -946,7 +1100,107 @@ impl State {
             }
             pool_pop(outer);
         }
-        self.pop()
+    }
+
+    // (0.25.2.1) A frame was requested for window `win` (its display link
+    // is running).
+    fn request(inout self, win: *u8) {
+        let now = now_ns();
+        for i in 0..self.reqs.len() {
+            if self.reqs[i].win == win && !self.reqs[i].pending {
+                self.reqs[i].pending = true;
+                self.reqs[i].since = now;
+                if !self.reqs[i].slow {
+                    self.reqs[i].quiet = now;
+                }
+            }
+        }
+    }
+
+    // (0.25.2.1) The display link `link` fired: whether its window's
+    // request was still pending (true for a link not registered).
+    fn answered(inout self, link: *u8) -> bool {
+        for i in 0..self.reqs.len() {
+            if self.reqs[i].link == link {
+                let was = self.reqs[i].pending;
+                self.reqs[i].pending = false;
+                self.reqs[i].slow = false;
+                return was;
+            }
+        }
+        true
+    }
+
+    fn forget(inout self, win: *u8) {
+        var i = 0;
+        while i < self.reqs.len() {
+            if self.reqs[i].win == win {
+                self.reqs.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // (0.25.2.1) Answers the frame requests the display link cannot (see
+    // the pitfalls above): queues their Frames, prints the diagnostic
+    // once, and returns when the next pending one is due (ns, -1: none).
+    fn late_frames(inout self) -> i64 {
+        var next = -1;
+        if self.reqs.len() == 0 {
+            return next;
+        }
+        let now = now_ns();
+        for i in 0..self.reqs.len() {
+            let r = self.reqs[i];
+            if !r.pending {
+                continue;
+            }
+            // UNSAFE: a Cocoa message on the request's raw NSWindow.
+            // SAFETY: `r.win` is a live NSWindow (a request is forgotten
+            // when its window closes); occlusionState returns an
+            // NSUInteger.
+            let hidden = unsafe { occluded(r.win) };
+            let due = if r.link == 0 as *u8 {
+                r.since + NO_LINK_NS
+            } else if hidden {
+                r.since + FALLBACK_NS
+            } else if r.quiet + QUIET_NS > r.since + FALLBACK_NS {
+                r.quiet + QUIET_NS
+            } else {
+                r.since + FALLBACK_NS
+            };
+            if due > now {
+                if next < 0 || due < next {
+                    next = due;
+                }
+                continue;
+            }
+            if r.link != 0 as *u8 {
+                // UNSAFE: a Core Animation message on the raw display link.
+                // SAFETY: setPaused: on the display link the window
+                // retained (live while the request is registered): it does
+                // not answer this request again.
+                unsafe { msg_v_b(r.link, sel(c"setPaused:"), true); }
+                if !self.warned && now - r.quiet >= QUIET_NS {
+                    self.warned = true;
+                    // UNSAFE: quiet_reason's C and Objective-C calls.
+                    // SAFETY: see quiet_reason (it takes no pointer).
+                    let why = unsafe { quiet_reason(hidden) };
+                    if hidden {
+                        eprintln(
+                            f"window: no frame in 3 s: the window is occluded or not shown ({why}); frames come 10 a second until it shows (volec guide window)");
+                    } else {
+                        eprintln(
+                            f"window: no frame in 3 s from the display link ({why}); frames come 10 a second from a timer (volec guide window)");
+                    }
+                }
+            }
+            self.reqs[i].pending = false;
+            self.reqs[i].slow = r.link != 0 as *u8;
+            self.q.push(Event::Frame(WindowId { n: r.id }));
+        }
+        next
     }
 
     fn watch(inout self, fd: i32) -> bool {
@@ -1051,6 +1305,11 @@ impl super::Backend for Cocoa {
             msg_b_p(win, sel(c"makeFirstResponder:"), view);
             msg_v_p(win, sel(c"makeKeyAndOrderFront:"), 0 as *u8);
             msg_v_b(app, sel(c"activateIgnoringOtherApps:"), true);
+            // (0.25.2.1) Not made active (launched from a background
+            // shell): the window is shown in front all the same.
+            if !msg_b(app, sel(c"isActive")) {
+                msg_v(win, sel(c"orderFrontRegardless"));
+            }
             let sz = sync_layer(view);
             var link = 0 as *u8;
             if msg_b_p(view, sel(c"respondsToSelector:"), sel(c"displayLinkWithTarget:selector:")) {
@@ -1061,6 +1320,9 @@ impl super::Backend for Cocoa {
                     msg_p(class(c"NSRunLoop"), sel(c"mainRunLoop")), NSRunLoopCommonModes);
             }
             pool_pop(pool);
+            self.st[0].reqs.push(Req {
+                id: id.n, win: win, link: link, pending: false, since: 0, quiet: 0, slow: false,
+            });
             push(Event::Resize(id, sz));
             Ok(Window { id: id, ns: NsWindow { win: win, view: view, layer: layer, link: link } })
         }
@@ -1137,6 +1399,16 @@ impl NsWindow {
             // SAFETY: setPaused: on the display link this window retained.
             unsafe { msg_v_b(self.link, sel(c"setPaused:"), false); }
         }
+        // (0.25.2.1) Noted, for the timer that answers it if the display
+        // link does not (State::late_frames).
+        // UNSAFE: the App's State through the ST pointer (static mut).
+        // SAFETY: see st_live: checked non-null, on the main thread, and
+        // no other reference to the State is live during this call.
+        unsafe {
+            if ST != 0 as *State {
+                ST.request(self.win);
+            }
+        }
     }
 
     pub fn size(self) -> Size {
@@ -1212,6 +1484,9 @@ impl NsWindow {
             if self.link != 0 as *u8 {
                 msg_v(self.link, sel(c"invalidate"));
                 release(self.link);
+            }
+            if ST != 0 as *State {
+                ST.forget(self.win);
             }
             msg_v_p(self.win, sel(c"setDelegate:"), 0 as *u8);
             msg_v(self.win, sel(c"close"));

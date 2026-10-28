@@ -3,7 +3,8 @@
 # Cocoa: the key tables and text helpers (headless), then, when a window
 # server is there (NEEDS: display; VOLE_NO_DISPLAY_TESTS=1 skips),
 # a real window driven by synthesized events: its first size, frames on
-# request and none without, the CAMetalLayer presenting the renderer's
+# request and none without, (0.25.2.1) frames from the timer while it is
+# hidden and the no-frame diagnostic, the CAMetalLayer presenting the renderer's
 # grid, keys and text through interpretKeyEvents, an input method's
 # composition and commit, the mouse, the wheel, a resize, the clipboard
 # (restored), a watched pipe, close, Quit, and no CPU while idle.
@@ -66,6 +67,17 @@ awk '
     /^FAIL / { sub(/^FAIL /, ""); print "FAIL window_" $0; bad = 1; next }
     /^skip / { sub(/^skip /, ""); print "skip window_" $0; next }
 ' "$WORK/run.out"
+# (0.25.2.1) the no-frame diagnostic, printed (once) while frame_hidden
+# kept the window hidden for more than 3 s
+diag_status=0
+if grep -q '^ok frame_hidden$' "$WORK/run.out"; then
+    if grep -q '^window: no frame in 3 s' "$WORK/run.out"; then
+        echo "pass window_no_frame_diagnostic"
+    else
+        echo "FAIL window_no_frame_diagnostic: no 'window: no frame in 3 s' line on stderr"
+        diag_status=1
+    fi
+fi
 # (0.25.2) the time budgets missed: FAIL when idle, SKIP when loaded
 sh "$ROOT/tests/budget.sh" window_ "$WORK/run.out" || status=1
 if [ $status -ne 0 ] && ! grep -q -e '^FAIL' -e '^slow' "$WORK/run.out"; then
@@ -111,4 +123,4 @@ else
         app_status=1
     fi
 fi
-[ $status -eq 0 ] && [ $app_status -eq 0 ]
+[ $status -eq 0 ] && [ $app_status -eq 0 ] && [ $diag_status -eq 0 ]
