@@ -7,7 +7,9 @@
 // definitions are in std's text as the server writes it to a cache
 // directory (`.../vole/std-VERSION-HASH/`, docs/lsp.md); those files open
 // read-only. The compiler is vole.server.path (default `volec`, looked
-// up on PATH). Nothing here talks to the network or collects telemetry.
+// up on PATH); vole.includePaths and vole.cSources (0.25.2) tell it where
+// a C import's headers are and which C files the program is built with.
+// Nothing here talks to the network or collects telemetry.
 
 import * as fs from "fs";
 import * as path from "path";
@@ -82,8 +84,13 @@ async function startClient(_context: vscode.ExtensionContext): Promise<void> {
       { scheme: "untitled", language: "vole" },
     ],
     outputChannel: output,
+    // The project's C settings (vole.includePaths, vole.cSources): given at
+    // the start, and sent again when they change (didChangeConfiguration
+    // of the `vole` section), the server reading the program again.
+    initializationOptions: projectSettings(config),
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher("**/*.vl"),
+      configurationSection: "vole",
     },
   };
 
@@ -99,6 +106,19 @@ async function startClient(_context: vscode.ExtensionContext): Promise<void> {
     client = undefined;
     return;
   }
+}
+
+// What the server takes from the settings: paths as written (the server
+// takes relative ones from the workspace folder, the rootUri it is given).
+function projectSettings(config: vscode.WorkspaceConfiguration): {
+  includePaths: string[];
+  cSources: string[];
+} {
+  const paths = (key: string): string[] => {
+    const v = config.get<unknown>(key, []);
+    return Array.isArray(v) ? v.filter((p): p is string => typeof p === "string") : [];
+  };
+  return { includePaths: paths("includePaths"), cSources: paths("cSources") };
 }
 
 async function stopClient(): Promise<void> {

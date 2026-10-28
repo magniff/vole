@@ -216,6 +216,12 @@ try:
         recs = [json.loads(x) for x in fh]
     case("logged", [(r["kind"], r["errors"], r["codes"]) for r in recs],
          [("check-hook", 1, ["type error"])] * 2)
+    # (0.25.2) The end of every call this hook sees, for agent-tool-usage.py --calls.
+    end = hook.call_end({"tool_name": "Bash", "tool_use_id": "toolu_0123456789abcdefXYZ",
+                         "tool_response": {"stdout": "ok\n", "stderr": "", "interrupted": False}})
+    case("call-end record", (end["kind"], end["tool"], end["id"], end["out_bytes"], "exit" in end,
+                             isinstance(end["t"], float)),
+         ("call-end", "Bash", "3456789abcdefXYZ", 3, False, True))
     st, out = run(dict(ev, hook_event_name="PreToolUse"), fake)
     case("PreToolUse: nothing", (st, out), (0, ""))
     env_off = dict(os.environ, VOLE_CHECK_HOOK="0", VOLE_CHECK_COMPILER=fake)

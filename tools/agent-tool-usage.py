@@ -4,7 +4,15 @@ from the development transcripts, classified by what it was for, so that
 the common ones can become compiler queries (see docs/agents.md).
 
 usage: tools/agent-tool-usage.py TRANSCRIPT_DIR [--csv OUT.csv]
-       tools/agent-tool-usage.py --hook-log .git/agent-tools.jsonl
+       tools/agent-tool-usage.py --hook-log .git/agent-tools.jsonl [--calls]
+                                 [--worktree TEXT] [--since YYYY-MM-DD[THH:MM]]
+
+(0.25.2) --calls: where the time went, from the hooks' `call` and
+`call-end` records (every Bash, Read, Grep, Edit and Write call): per kind
+of call (a query, an edit, a check, a build, a test run, a program run,
+git, a shell read...), the calls, their time in all and the median, and
+the calls with no end (failed, interrupted, or a tool with no PostToolUse
+hook). --worktree and --since keep the records of one port.
 
 TRANSCRIPT_DIR holds the session transcripts (*.jsonl, subagents/ too).
 Prints a markdown report on stdout. Development tooling only: not part of
@@ -133,17 +141,98 @@ def iter_transcripts(root):
                 yield os.path.join(dirpath, f)
 
 
-def hook_report(path):
+def call_kind(tool, what):
+    """What a tool call was for: the volec command (`volec query`, `volec
+    edit`, `volec check`, `volec build`...), tests/run.sh, the bootstrap
+    or gate, git, a shell read, a program run, other; Read, Grep, Edit and
+    Write as themselves."""
+    if tool != "Bash":
+        return tool
+    w = what.strip()
+    w = re.sub(r"^(cd\s+\S+\s*(&&|;)\s*)+", "", w)
+    calls = tc.calls(w)
+    if calls:
+        sub = calls[0][0]
+        if sub in ("query", "edit", "refactor", "fix", "check", "test", "probe", "guide", "fmt", "undo", "rewrite",
+                   "explain", "reduce", "batch"):
+            return "volec " + sub
+        return "volec build"
+    first = re.split(r"[\s;|&]+", w, maxsplit=1)[0] if w else ""
+    base = os.path.basename(first)
+    if "tests/run.sh" in first or base == "run.sh":
+        return "tests/run.sh"
+    if base in ("bootstrap.sh", "gate.sh"):
+        return base
+    if base in ("git", "gh"):
+        return base
+    if base in ("grep", "rg", "sed", "cat", "head", "tail", "awk", "ls", "wc", "find"):
+        return "shell read"
+    if base.startswith("python"):
+        return "python"
+    if first.startswith(("./", "/tmp/", "target/")) or re.search(r"/(prog|a\.out)$", first):
+        return "program run"
+    if base in ("sleep", "until", "while"):
+        return "wait"
+    return "other"
+
+
+def call_report(recs):
+    """(0.25.2) The time of the tool calls, by kind: the `call` record a
+    PreToolUse hook writes paired with its `call-end` by id."""
+    ends = {r["id"]: r for r in recs if r.get("kind") == "call-end" and r.get("id")}
+    calls = [r for r in recs if r.get("kind") == "call"]
+    if not calls:
+        print("\nNo `call` records (the hooks log them from 0.25.2).")
+        return
+    by = defaultdict(list)
+    open_ = Counter()
+    for r in calls:
+        k = call_kind(r.get("tool", ""), r.get("what", ""))
+        e = ends.get(r.get("id"))
+        if e and isinstance(e.get("t"), (int, float)) and isinstance(r.get("t"), (int, float)):
+            by[k].append(max(0.0, e["t"] - r["t"]))
+        else:
+            by[k].append(None)
+            open_[k] += 1
+    total = sum(d for v in by.values() for d in v if d is not None)
+    print(f"\n## Where the time went ({len(calls)} calls, {total:.0f} s timed)\n")
+    print("| kind | calls | time (s) | share | median (s) | no end |\n|---|---|---|---|---|---|")
+    rows = sorted(by.items(), key=lambda kv: -sum(d for d in kv[1] if d is not None))
+    for k, v in rows:
+        ds = sorted(d for d in v if d is not None)
+        t = sum(ds)
+        med = ds[len(ds) // 2] if ds else 0.0
+        share = f"{100 * t / total:.0f}%" if total else "-"
+        print(f"| {k} | {len(v)} | {t:.1f} | {share} | {med:.2f} | {open_[k]} |")
+    slow = sorted(((ends[r["id"]]["t"] - r["t"], r) for r in calls
+                   if r.get("id") in ends and isinstance(r.get("t"), (int, float))), key=lambda x: -x[0])[:10]
+    if slow:
+        print("\nThe slowest calls:\n")
+        for d, r in slow:
+            print(f"- {d:.1f} s `{r.get('what', '')[:110]}`")
+
+
+def hook_report(path, calls=False, worktree=None, since=None):
     """Summary of the query-first hook's log (tools/agent-hooks/query-first.py):
     how often agents used `volec query`, were blocked, or went around it,
-    and why."""
+    and why; (0.25.2, calls) where the time of the tool calls went."""
     recs = []
     with open(path, errors="replace") as fh:
         for line in fh:
+            if worktree and worktree not in line:
+                continue
             try:
-                recs.append(json.loads(line))
+                r = json.loads(line)
             except ValueError:
-                pass
+                continue
+            if worktree and worktree not in (r.get("worktree") or ""):
+                continue
+            if since and (r.get("time") or "") < since:
+                continue
+            recs.append(r)
+    if calls:
+        call_report(recs)
+        return
     kinds = Counter(r.get("kind") for r in recs)
     print("## The query-first hook\n")
     print("| event | count |\n|---|---|")
@@ -298,7 +387,9 @@ def print_edit_report(counted, by_tool, other, reasons, per_agent):
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--hook-log":
-        hook_report(sys.argv[2])
+        def opt(name):
+            return sys.argv[sys.argv.index(name) + 1] if name in sys.argv[:-1] else None
+        hook_report(sys.argv[2], calls="--calls" in sys.argv, worktree=opt("--worktree"), since=opt("--since"))
         return
     if len(sys.argv) < 2:
         print(__doc__)

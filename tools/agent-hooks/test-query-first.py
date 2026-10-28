@@ -21,7 +21,9 @@ hook = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hook)
 
 LOGGED = []
-hook.log = lambda gd, record: LOGGED.append({**hook.IDENT, **record})
+CALLS = []
+# (0.25.2: the `call` record of every tool call apart, in CALLS)
+hook.log = lambda gd, record: (CALLS if record.get("kind") == "call" else LOGGED).append({**hook.IDENT, **record})
 hook.query_ready = lambda gd, cwd: True
 hook.git_dir = lambda cwd: "/nonexistent"
 
@@ -78,6 +80,24 @@ def case(name, got, want):
     else:
         FAILED += 1
         print(f"FAIL {name}:\n    want {want!r}\n    got  {got!r}")
+
+
+def calls_of(event):
+    CALLS.clear()
+    run(event)
+    return [(r["kind"], r["tool"], r["what"], r.get("id"), isinstance(r.get("t"), float)) for r in CALLS]
+
+
+# (0.25.2) Every tool call is logged at PreToolUse, for agent-tool-usage.py --calls.
+case("call logged: Bash", calls_of({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": HERE,
+                                    "tool_use_id": "toolu_0123456789abcdefXYZ",
+                                    "tool_input": {"command": "tests/run.sh nes"}}),
+     [("call", "Bash", "tests/run.sh nes", "3456789abcdefXYZ", True)])
+case("call logged: Read", calls_of({"hook_event_name": "PreToolUse", "tool_name": "Read", "cwd": HERE,
+                                    "tool_input": {"file_path": "/x/README.md"}}),
+     [("call", "Read", "/x/README.md", None, True)])
+case("call not logged after", calls_of({"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": HERE,
+                                        "tool_input": {"command": "ls"}, "tool_response": {"stdout": ""}}), [])
 
 
 def blocked(command):
@@ -169,6 +189,24 @@ case("sed -i -e with a line", "try: volec edit patch compiler/src/a.vl:12 --old 
 st, err = blocked("sed -i '' -e '12s/x - 1/x + 1/' compiler/src/a.vl")
 case("sed -i -e plain", "try: volec edit patch compiler/src/a.vl:12 --old 'x - 1' --new 'x + 1'" in err, True)
 case("sed -i test fixture", blocked("sed -i 's/a/b/' tests/run/loops.vl")[0], False)
+# (0.25.2) Any program's source is rewritten through the tools, as it is
+# read through them: an example's file (feedbacks/nes.md #7), with the
+# root its edit needs from where the command runs.
+st, err = blocked("cd ../.. && sed -i '' 's/let mut/var/' examples/nes/check.vl")
+case("sed -i example program", (st, err.splitlines()[0] if err else ""),
+     (True, "blocked hook.edit-tool: sed -i rewriting program source (examples/nes/check.vl)"))
+case("sed -i example program suggestion",
+     "try: volec edit patch examples/nes/check.vl --old 'let mut' --new var --all --root examples/nes/main.vl" in err,
+     True)
+case("python writes an example", blocked(
+    "cd ../.. && python3 - <<'EOF'\np = 'examples/nes/check.vl'\nopen(p, 'w').write('x')\nEOF")[0], True)
+case("sed -i a scratch program", blocked("sed -i 's/a/b/' /tmp/w/probe.vl")[0], False)
+# (0.25.2) A read of another program's file: its queries say --root.
+st, err = blocked("cd ../.. && grep -n 'let ' examples/nes/check.vl")
+case("read example program, items with root",
+     "try: volec query items crate::check --root examples/nes/main.vl" in err, True)
+case("read example program, grep with root",
+     "volec query grep 'let ' --root examples/nes/main.vl" in err, True)
 case("sed -i docs", blocked("sed -i '' 's/a/b/' docs/refactor.md AGENTS.md")[0], False)
 case("sed -i scratch copy", blocked("sed -i 's/a/b/' target/scratch/compiler/src/x.vl")[0], False)
 case("sed -i tmp copy", blocked("sed -i 's/a/b/' /tmp/w/compiler/src/x.vl")[0], False)

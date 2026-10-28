@@ -48,6 +48,33 @@ ROOT` alone too). Without it: `$VOLE_ROOT`, else `./main.vl`, else
 the file as the module loader names it (relative to the current
 directory when ROOT is).
 
+Program roots (0.25.2), for every command that reads a program (query,
+edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
+
+- `--root DIR` is `DIR/main.vl`; a ROOT that is a module of a program
+  (a `mod NAME;` of a main.vl above it declares it) is that program's
+  main.vl, and `query items FILE` lists that module.
+- With no ROOT, a `FILE` or `FILE:LINE` argument of another program than
+  the default one names it: `query context examples/nes/check.vl:233`,
+  `edit patch examples/nes/check.vl --old A --new B --all` and `probe
+  examples/nes/check.vl:235 x -- --check` work from the root of the
+  tree. Their `try:` lines then say `--root examples/nes/main.vl`.
+- A NAME the default program does not define, with no ROOT and no
+  `$VOLE_ROOT`, is looked for in the other programs under the current
+  directory (`git grep` of its definition, tracked and untracked files):
+  each gets a `try:` line, the command as it was run with `--root` (at
+  most 3, examples' before tests'). When one program defines it, a
+  question of `query` is answered from there, with `note
+  query.other-root: not in compiler/src/main.vl; answered from
+  examples/gpu/life/main.vl (--root examples/gpu/life/main.vl)`.
+
+```
+$ volec query context renderer_new
+error query.no-match: no definition 'renderer_new'
+try: volec query context renderer_new --root examples/gpu/pathtrace/main.vl
+try: volec query context renderer_new --root examples/gpu/voxel/main.vl
+```
+
 Several NAMEs are answered in one call, in turn (`show A B C`); refs and
 callers list the references to all of them together, each line naming
 its target. A NAME that matches nothing gets its diagnostic and the
@@ -914,6 +941,7 @@ when it was given, names quoted for the shell when they need it).
 | `query.program-errors` | warning | (the answer's) | the program has errors: their number, and the first one when nothing answered | the compilation that lists them all, one per line |
 | `query.program-errors` | error | 1 | the program could not be parsed at all | the same |
 | `query.no-root` | error | 2 | no ROOT, no `$VOLE_ROOT`, no `./main.vl` or `./compiler/src/main.vl` | the command with a root |
+| `query.other-root` | note | (the answer's) | (0.25.2) the NAME is not in the default program; one other program under the current directory defines it, and the answer is that program's | the command with its `--root` |
 | `query.bad-root` | error | 2 | ROOT cannot be read | the command without it, when a default root exists |
 | `query.usage` | error | 2 | no command, an unknown command or option, a missing NAME or option value, an extra argument | the command corrected (the nearest command, the option dropped, `--limit 60`), or `items` |
 

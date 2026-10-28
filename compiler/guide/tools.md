@@ -28,9 +28,13 @@ small queries.
 
 ## The program
 
-Commands find the program's root file from `--root FILE`, a last
-argument ending in `.vl`, `$VOLE_ROOT`, or `./main.vl`. The other
-files are the modules it loads.
+Commands find the program's root file from `--root FILE` (or `--root
+DIR`: its main.vl), a last argument ending in `.vl`, `$VOLE_ROOT`, or
+`./main.vl`. The other files are the modules it loads. A FILE or
+FILE:LINE argument names its own program from anywhere (`volec query
+context examples/nes/check.vl:233` from the tree's root), and a NAME
+the program lacks gets a `try:` with the `--root` of the program
+under the current directory that defines it.
 
 ## Reading
 
@@ -195,8 +199,11 @@ after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`), after
 the module's items, imports, the prelude and keywords, each with its
 signature, and its comment and effects when chosen; formatting, the
 buffer as `volec fmt` lays it out (the VS Code extension on save), no
-edits when it does not parse. The root: the nearest `main.vl`
-(docs/lsp.md).
+edits when it does not parse. The root: the nearest `main.vl` (up to
+the repository's top or the home directory), else the file itself
+(0.25.2). (0.25.2) Definition on a C import's string opens the header,
+on `c::NAME` its declaration there (a hover shows it); headers found
+through `-I` need the include paths (`vole.includePaths`; docs/lsp.md).
 
 ## Other compiler options
 

@@ -13,7 +13,8 @@
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
-# (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
+# and tests/runner/run.sh (the runner's own pieces, 0.25.2). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [FILTER]
 #
@@ -22,8 +23,8 @@
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos
 #                 (default: the host; x86_64-macos runs under Rosetta on
 #                 Apple silicon)
-#   -O LEVEL      the optimization level (0, 1 or 2; default: the
-#                 compiler's default)
+#   -O LEVEL      the optimization level (0, 1 or 2, also as -O0; default:
+#                 the compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs, or the
 #                 slots of $VOLE_JOBSERVER); the report is the same for
 #                 every JOBS
@@ -47,7 +48,26 @@
 #   // ARGS: a b c       command-line arguments (whitespace separated; 0.20:
 #                        @ROOT@ stands for the root of the tree)
 #   // STDIN: text       stdin, one directive per line, joined with '\n'
-#   // EXPECT: text      expected stdout, one directive per line
+#   // EXPECT: text      expected stdout, one directive per line; (0.25.2)
+#                        holes for what changes from run to run: {num} a
+#                        number (12, -3, 0.25, 1.5e-3), {int} an integer,
+#                        {..} any text within the line (tests/expect.awk):
+#                        `// EXPECT: a step: {num} ms`; a line with holes
+#                        still matches one line of the output
+#   // EXPECT-PPM: OUT REF [region X,Y,W,H] [tolerance N] [allow P%]
+#                        (0.25.2) after the run, the PPM image OUT (written
+#                        by the program, relative to its directory) is the
+#                        image REF (a P6 or P3 file, relative to the root,
+#                        tests/golden/ by convention): only its region when
+#                        one is given (REF is then the region's size), a
+#                        pixel the same when no channel differs by more
+#                        than N (default 0), up to P% of the pixels allowed
+#                        to differ (default 0). A failure says how many
+#                        differ, the worst one, and where the actual image
+#                        (cropped like REF) was kept: target/test-shots/
+#                        CASE.ppm, the file to copy over REF when the change
+#                        is wanted (tests/ppmdiff.sh compares by hand).
+#                        One directive per image
 #   // EXIT: 3           expected exit code (default 0)
 #   // STDERR: text      stderr contains text, one directive per line
 #   // ERROR: text       compilation must fail (exit code 1) with an error
@@ -113,8 +133,10 @@
 # directives (0.9's unsafe warnings are errors from 0.10; there are no
 # warnings at the moment).
 # Stdout is compared after removing trailing whitespace. Each program may
-# run for 20 seconds ($VOLE_TEST_TIMEOUT: another limit, for a loaded
-# machine). $VOLE_TEST_FLAGS (0.16): more compiler options for every
+# run for 20 seconds ($VOLE_TEST_TIMEOUT: another limit), extended while
+# the machine is loaded (0.25.2, tests/watchdog.sh: by the limit again, up
+# to 8 times, while the load average is above the CPUs); a program killed
+# at its limit fails with "timed out: killed after N s ...". $VOLE_TEST_FLAGS (0.16): more compiler options for every
 # case but those with NO-EXTRA-FLAGS (the gate's examples-checkalloc
 # step: --check-alloc).
 
@@ -142,7 +164,7 @@ DIAG=human
 LINKER=""
 
 usage() {
-    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -151,12 +173,16 @@ while [ $# -gt 0 ]; do
         -c) [ $# -ge 2 ] || usage; COMPILER=$2; shift 2 ;;
         -t) [ $# -ge 2 ] || usage; TARGET=$2; shift 2 ;;
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
+        -O[0-2]) OPT=$1; shift ;;
         -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
         -a) OUT=prog.s; shift ;;
         -k) [ $# -ge 2 ] || usage; LINKER=$2; shift 2 ;;
         -d) [ $# -ge 2 ] || usage; DIAG=$2; shift 2 ;;
         -h|--help) usage ;;
-        -*) usage ;;
+        -*)
+            # (0.25.2: one line, not the whole usage)
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT; tests/run.sh -h for more)" >&2
+            exit 2 ;;
         *) break ;;
     esac
 done
@@ -198,8 +224,19 @@ trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 FAILURES="$WORK/failures"
 TALLY="$WORK/tally"
+# (0.25.2) The skipped checks that say why (a `skip NAME: why` line of a
+# runner below, like the window tests' without a display giving frames):
+# printed before the summary, `SKIP NAME: why`, and counted apart.
+SKIPS="$WORK/skips"
 : >"$FAILURES"
 : >"$TALLY"
+: >"$SKIPS"
+
+# A skipped check of category $1, `NAME: why` (or `NAME (why)`) in $2.
+skipped() {
+    echo "$1 skip" >>"$TALLY"
+    echo "SKIP $2" >>"$SKIPS"
+}
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
 # compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
@@ -274,6 +311,73 @@ trimmed() {
     awk '{ text = text $0 "\n" } END { sub(/[ \t\r\n]+$/, "", text); printf "%s", text }' "$1"
 }
 
+# Whether $1/actual (the program's stdout, trimmed) matches $1/wanted (its
+# EXPECT lines): equal, or line by line with the holes {num}, {int} and
+# {..} filled (tests/expect.awk, 0.25.2); the first line that differs is
+# then in $1/expect.out.
+stdout_matches() {
+    : >"$1/expect.out"
+    cmp -s "$1/actual" "$1/wanted" && return 0
+    awk -v want="$1/wanted" -f "$ROOT/tests/expect.awk" "$1/actual" >"$1/expect.out"
+}
+
+# EXPECT-PPM (0.25.2): each image case directory $1's program wrote (OUT,
+# relative to the directory it ran in) against its reference (REF,
+# relative to the root), through tests/ppmdiff.sh. The actual image,
+# cropped like the reference, is kept as target/test-shots/CASE.ppm (a
+# second directive's as CASE-2.ppm) for a failure to point at.
+check_ppms() {
+    pd=$1
+    pn=${pd##*/}
+    k=0
+    while read -r pout pref prest; do
+        [ -n "$pout" ] || continue
+        k=$((k + 1))
+        popts=""
+        pwhat=""
+        # shellcheck disable=SC2086
+        set -- $prest
+        while [ $# -gt 0 ]; do
+            if [ $# -lt 2 ]; then
+                echo "EXPECT-PPM $pout: '$1' without a value (region X,Y,W,H, tolerance N, allow P%)" >"$pd/why"
+                return 1
+            fi
+            case "$1" in
+                region) popts="$popts -r $2" ;;
+                tolerance) popts="$popts -t $2" ;;
+                allow) popts="$popts -p ${2%\%}" ;;
+                *)
+                    echo "EXPECT-PPM $pout: unknown '$1' (region X,Y,W,H, tolerance N, allow P%)" >"$pd/why"
+                    return 1 ;;
+            esac
+            pwhat="$pwhat${pwhat:+, }$1 $2"
+            shift 2
+        done
+        if [ -z "$pref" ]; then
+            echo "EXPECT-PPM $pout: no reference (EXPECT-PPM: OUT REF [region X,Y,W,H] [tolerance N] [allow P%])" >"$pd/why"
+            return 1
+        fi
+        if [ ! -f "$pd/$pout" ]; then
+            { echo "EXPECT-PPM: the program wrote no $pout"; echo "--- stdout"; cat "$pd/stdout"; echo "--- stderr"; cat "$pd/stderr"; } >"$pd/why"
+            return 1
+        fi
+        mkdir -p "$ROOT/target/test-shots"
+        pshot="target/test-shots/$pn$([ $k -gt 1 ] && echo "-$k").ppm"
+        # shellcheck disable=SC2086
+        sh "$ROOT/tests/ppmdiff.sh" $popts -o "$pd/shot.$k.ppm" "$pd/$pout" "$ROOT/$pref" >"$pd/ppm.out" 2>&1
+        prc=$?
+        [ -f "$pd/shot.$k.ppm" ] && mv -f "$pd/shot.$k.ppm" "$ROOT/$pshot"
+        [ $prc -eq 0 ] && continue
+        {
+            echo "EXPECT-PPM $pout against $pref${pwhat:+ ($pwhat)}: $(cat "$pd/ppm.out")"
+            echo "the actual image: $pshot"
+            [ $prc -eq 1 ] || [ $prc -eq 3 ] && echo "try: cp $pshot $pref   (when the new image is the right one)"
+        } >"$pd/why"
+        return 1
+    done <"$pd/ppms"
+    return 0
+}
+
 # Runs $dir/prog with a timeout; sets RC.
 run_program() {
     dir=$1
@@ -288,14 +392,29 @@ run_program() {
         exec ./prog $(sed "s|@ROOT@|$ROOT|g" args) <stdin >stdout 2>stderr
     ) &
     pid=$!
-    # (0.22: a case's TIMEOUT directive multiplies the limit)
+    # (0.22: a case's TIMEOUT directive multiplies the limit; 0.25.2: the
+    # limit is extended while the machine is loaded, tests/watchdog.sh,
+    # and a program killed by it is a failure that says so: $dir/timedout)
     limit=$((TIMEOUT * $(cat "$dir/timeout" 2>/dev/null || echo 1)))
-    (sleep "$limit" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    rm -f "$dir/timedout"
+    sh "$ROOT/tests/watchdog.sh" "$limit" "$pid" "$dir/timedout" >/dev/null 2>&1 &
     watchdog=$!
-    wait "$pid"
+    wait "$pid" 2>/dev/null
     RC=$?
     kill "$watchdog" 2>/dev/null
     wait "$watchdog" 2>/dev/null
+}
+
+# After run_program: when the watchdog killed the program, the reason
+# (and what it printed) in $1/why; returns 1 then.
+timed_out() {
+    [ -s "$1/timedout" ] || return 1
+    {
+        echo "timed out: $(cat "$1/timedout")"
+        echo "--- stdout so far"; cat "$1/stdout" 2>/dev/null; echo
+        echo "--- stderr so far"; cat "$1/stderr" 2>/dev/null
+    } >"$1/why"
+    return 0
 }
 
 # Runs one case; prints nothing, returns 0 on success, and leaves the
@@ -384,14 +503,16 @@ check_case() {
         # (0.16) volec compiles the C files and links, as `cc` would
         # shellcheck disable=SC2086
         if ! VOLE_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
-            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            framework_hint "$dir/compile.out" >"$dir/why" \
+                || { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
     elif [ -n "$LINKER" ] && [ -z "$csources" ] && [ "$OUT" = prog.o ]; then
         # (0.25, -k) the compiler links
         # shellcheck disable=SC2086
         if ! "$COMPILER" --target "$TARGET" --linker="$LINKER" $OPT $FLAGS $PFLAGS "$source" -o "$dir/prog" >"$dir/compile.out" 2>&1; then
-            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            framework_hint "$dir/compile.out" >"$dir/why" \
+                || { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
     else
@@ -402,7 +523,8 @@ check_case() {
         fi
         # shellcheck disable=SC2086
         if ! cc_run $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
-            { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
+            framework_hint "$dir/link.out" >"$dir/why" \
+                || { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
             return 1
         fi
     fi
@@ -415,12 +537,13 @@ check_case() {
     fi
     [ "$(cat "$dir/build")" = 1 ] && return 0
     run_program "$dir"
+    timed_out "$dir" && return 1
     expected_exit=$(cat "$dir/exit")
     trimmed "$dir/stdout" >"$dir/actual"
     trimmed "$dir/expect" >"$dir/wanted"
-    if ! cmp -s "$dir/actual" "$dir/wanted"; then
+    if ! stdout_matches "$dir"; then
         {
-            echo "stdout mismatch"
+            echo "stdout mismatch ($(cat "$dir/expect.out"))"
             echo "--- expected"; cat "$dir/wanted"; echo
             echo "--- actual"; cat "$dir/actual"; echo
         } >"$dir/why"
@@ -436,6 +559,9 @@ check_case() {
             return 1
         fi
     done <"$dir/stderrs"
+    if [ -s "$dir/ppms" ] && ! check_ppms "$dir"; then
+        return 1
+    fi
     # (0.19) A program that may test the CPU at run time (std::arch::detect,
     # #[multiversion]) runs again with every optional feature disabled:
     # its fallback paths must print the same (docs/design/arch.md §2.5).
@@ -443,8 +569,9 @@ check_case() {
         RUN_ENV=VOLE_ARCH_DISABLE=all
         run_program "$dir"
         RUN_ENV=
+        timed_out "$dir" && return 1
         trimmed "$dir/stdout" >"$dir/actual"
-        if ! cmp -s "$dir/actual" "$dir/wanted" || [ "$RC" -ne "$expected_exit" ]; then
+        if ! stdout_matches "$dir" || [ "$RC" -ne "$expected_exit" ]; then
             {
                 echo "with VOLE_ARCH_DISABLE=all (the fallback paths): exit code $RC, stdout"
                 echo "--- expected"; cat "$dir/wanted"; echo
@@ -454,6 +581,19 @@ check_case() {
         fi
     fi
     return 0
+}
+
+# (0.25.2) A link that failed for the symbols of Apple's frameworks
+# (std::window, std::gpu: Metal, Cocoa, the Objective-C runtime): one line
+# naming the directives that link them, instead of the linker's list.
+# Fails (prints nothing) for any other link error.
+framework_hint() {
+    sym=$(awk '/^Undefined symbols/ { u = 1; next } u && /^  "/ { s = $1; gsub(/[",]/, "", s); print s; exit }' "$1")
+    case "$sym" in
+        _objc_*|_OBJC_*|_CF*|_NS*|_MTL*|_CA*|_CG*|_kCF*|_IOSurface*|_dispatch_*) ;;
+        *) return 1 ;;
+    esac
+    echo "link failed: undefined framework symbols (first: $sym): the program imports std::window or std::gpu; add the directives '// LINK: std::gpu and std::window name the frameworks they link' and '// REQUIRES: metal' to its case (as tests/examples/nes.test has)"
 }
 
 # FIXIMPORTS, FIXUNSAFE: a copy of case $1 (in $2/fix/run, next to a link
@@ -504,7 +644,10 @@ profile_case() {
         return 1
     fi
     run_program "$2"
-    if [ "$RC" -ne "$(cat "$2/exit")" ] || [ "$(trimmed "$2/stdout")" != "$(trimmed "$2/expect")" ]; then
+    timed_out "$2" && return 1
+    trimmed "$2/stdout" >"$2/actual"
+    trimmed "$2/expect" >"$2/wanted"
+    if [ "$RC" -ne "$(cat "$2/exit")" ] || ! stdout_matches "$2"; then
         { echo "the instrumented program (exit $RC) printed:"; cat "$2/stdout"; } >"$2/why"
         return 1
     fi
@@ -700,6 +843,11 @@ esac
 case std-own in
     *"$FILTER"*) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
 esac
+# (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
+# the golden-image comparison, the directives): category "runner".
+case runner in
+    *"$FILTER"*) sh "$ROOT/tests/runner/run.sh" >"$WORK/runner.out" 2>&1 & ;;
+esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case lsp in
     *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
@@ -832,6 +980,24 @@ case lsp in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
+        ;;
+esac
+
+# The runner's own checks (0.25.2, run above); category "runner".
+case runner in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "runner pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "runner fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/runner.out"
+        if ! grep -q '^pass' "$WORK/runner.out"; then
+            echo "runner fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL runner: tests/runner/run.sh reported nothing:"; sed 's/^/    /' "$WORK/runner.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        grep '^FAIL' "$WORK/runner.out" >>"$FAILURES"
         ;;
 esac
 
@@ -978,6 +1144,21 @@ case example_layout in
             fi
             count=$((count + 1))
         done
+        # (0.25.2) and every tests/examples case names files that exist: its
+        # SOURCE and CSOURCE (an example moved without its case fails here,
+        # by name, rather than as a compile error)
+        for t in "$ROOT"/tests/examples/*.test; do
+            [ -f "$t" ] || continue
+            missing=$(sed -n 's|^// \(C\{0,1\}SOURCE\): *||p' "$t" | while read -r p; do
+                [ -e "$ROOT/$p" ] || printf '%s ' "$p"
+            done)
+            if [ -n "$missing" ]; then
+                echo "example fail" >>"$TALLY"
+                printf 'FAIL example_layout %s:\n    names files that do not exist: %s(moved? update its SOURCE line)\n\n' \
+                    "tests/examples/${t##*/}" "$missing" >>"$FAILURES"
+                count=$((count + 1))
+            fi
+        done
         ;;
 esac
 
@@ -1123,10 +1304,11 @@ esac
 # spirv-val where it is installed; category "wgsl".
 case wgsl in
     *"$FILTER"*)
-        while read -r status _; do
+        while read -r status rest; do
             case "$status" in
                 pass) echo "wgsl pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "wgsl fail" >>"$TALLY"; count=$((count + 1)) ;;
+                skip) skipped wgsl "$rest"; count=$((count + 1)) ;;
             esac
         done <"$WORK/wgsl.out"
         if ! grep -q '^pass' "$WORK/wgsl.out"; then
@@ -1139,10 +1321,11 @@ esac
 # std::gpu's suite (run above); category "gpu".
 case gpu in
     *"$FILTER"*)
-        while read -r status _; do
+        while read -r status rest; do
             case "$status" in
                 pass) echo "gpu pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "gpu fail" >>"$TALLY"; count=$((count + 1)) ;;
+                skip) skipped gpu "$rest"; count=$((count + 1)) ;;
             esac
         done <"$WORK/gpu.out"
         if ! grep -q -E '^(pass|skip)' "$WORK/gpu.out"; then
@@ -1183,10 +1366,11 @@ case "$TARGET" in
     aarch64-macos)
         case window in
             *"$FILTER"*)
-                while read -r status _; do
+                while read -r status rest; do
                     case "$status" in
                         pass) echo "window pass" >>"$TALLY"; count=$((count + 1)) ;;
                         FAIL) echo "window fail" >>"$TALLY"; count=$((count + 1)) ;;
+                        skip) skipped window "$rest"; count=$((count + 1)) ;;
                     esac
                 done <"$WORK/window.out"
                 if ! grep -q '^pass' "$WORK/window.out"; then
@@ -1221,11 +1405,17 @@ esac
 
 [ $count -gt 0 ] || { echo "run.sh: no cases match '$FILTER'" >&2; exit 2; }
 cat "$FAILURES"
+# The cases whose REQUIRES does not hold, in one line; then the skips with
+# their reasons.
+nreq=$(grep -c ' skip$' "$TALLY")
+nwhy=$(wc -l <"$SKIPS" | tr -d ' ')
+[ "$((nreq - nwhy))" -gt 0 ] && echo "SKIP $((nreq - nwhy)) cases: their REQUIRES does not hold here"
+cat "$SKIPS"
 echo "tests for $TARGET with $("$COMPILER" --version 2>/dev/null || echo "$COMPILER"):"
 awk '
     { n[$1, $2]++; cats[$1] = 1; total[$2]++ }
     END {
-        printf "  %-10s %5s %6s %5s\n", "category", "pass", "xfail", "fail"
+        printf "  %-10s %5s %6s %5s %5s\n", "category", "pass", "xfail", "fail", "skip"
         for (c in cats) list = list c "\n"
         count = split(list, sorted, "\n")
         # Insertion sort, for awks without asort.
@@ -1235,11 +1425,11 @@ awk '
             }
         for (i = 1; i < count; i++) {
             c = sorted[i]
-            printf "  %-10s %5d %6d %5d\n", c, n[c, "pass"], n[c, "xfail"], n[c, "fail"]
+            printf "  %-10s %5d %6d %5d %5d\n", c, n[c, "pass"], n[c, "xfail"], n[c, "fail"], n[c, "skip"]
         }
-        printf "  %-10s %5d %6d %5d\n", "total", total["pass"], total["xfail"], total["fail"]
+        printf "  %-10s %5d %6d %5d %5d\n", "total", total["pass"], total["xfail"], total["fail"], total["skip"]
         if (total["skip"] > 0)
-            printf "  (%d skipped: their REQUIRES does not hold here)\n", total["skip"]
+            printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
 if grep -q ' fail$' "$TALLY"; then
