@@ -14,12 +14,14 @@ Edit, Write) and PostToolUse (Bash). Reads the hook event (JSON) on stdin.
   being worked on (examples/, bench/, a .vl elsewhere); a .vl under a
   tests/ directory (a test case, a refactoring fixture, an agent-eval
   task's data) is read freely, and logged as `read-fixture` (0.14).
-- A shell command that rewrites compiler source (a .vl file under
-  compiler/src or compiler/std) with `sed -i`, `perl -pi` or Python
-  (`.write(`) is blocked with the `volec edit patch` command that
-  does it, unless it carries `# no-tool: <reason>` (or `# no-query:`).
-  Test fixtures, docs and scratch copies (target/, /tmp) are not
-  affected.
+- A shell command that rewrites program source with `sed -i`, `perl
+  -pi` or Python (`.write(`) is blocked with the `volec edit patch`
+  command that does it (with `--root` for another program than cwd's),
+  unless it carries `# no-tool: <reason>` (or `# no-query:`). Program
+  source is what reads count as source (0.25.2; the compiler's only
+  before): compiler/src, compiler/std, examples/, bench/, a main.vl or a
+  module a `mod` line declares. Test fixtures, docs and scratch copies
+  (target/, /tmp) are not affected.
 - `volec query ...` calls are logged, with their outcome; `volec
   edit/refactor/fix/rewrite/undo` calls with whether they wrote. (0.15)
   volec is recognised through copies (`target/tc0`,
@@ -200,6 +202,22 @@ def log(gd, record):
             fh.write(json.dumps(record) + "\n")
     except OSError:
         pass
+
+
+def log_call(gd, event, tool, inp):
+    """(0.25.2) Every tool call this hook sees (PreToolUse: Bash, Read,
+    Grep, Edit, Write), one `call` record: the tool, what it was given
+    (the command, the file, the pattern; cut), its id and the time in
+    milliseconds. check-after-edit.py writes the `call-end` record of the
+    calls with a PostToolUse hook (Bash, Edit, Write): with the two,
+    tools/agent-tool-usage.py --calls says where a session's time went."""
+    what = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("path") or ""
+    rec = {"kind": "call", "tool": tool, "what": str(what)[:200], "t": round(time.time(), 3)}
+    if event.get("tool_use_id"):
+        rec["id"] = str(event["tool_use_id"])[-16:]
+    if tool == "Bash" and inp.get("run_in_background"):
+        rec["background"] = True
+    log(gd, rec)
 
 
 def query_ready(gd, cwd):
@@ -525,12 +543,34 @@ def in_place_operands(prog, args):
     return operands, script
 
 
-def source_rewrites(command):
+def program_source_paths(paths, cwd, base=""):
+    """(0.25.2) The paths that are program source, as reads judge it: the
+    compiler's (compiler/src, compiler/std), and any other .vl of a
+    program (examples/, bench/, a main.vl or a file a `mod` line declares:
+    file_kind's `source`); a test fixture, a scratch copy, a file that is
+    not there is not."""
+    out = []
+    for a in paths:
+        if compiler_paths(a):
+            out.append(a)
+            continue
+        if not a.endswith(".vl"):
+            continue
+        full = os.path.normpath(os.path.join(cwd or os.getcwd(), base, a))
+        if os.path.isfile(full) and file_kind(full, cwd, a) == "source":
+            out.append(a)
+    return out
+
+
+def source_rewrites(command, cwd=None):
     """(program, files, script) of each part of command that rewrites
-    compiler source in place: sed -i, perl -i, or Python writing a file
-    (its script is usually a here-document, so all of command counts)."""
+    program source in place (0.25.2: any program's, as reads count it:
+    examples/ and bench/ too; was the compiler's only): sed -i, perl -i,
+    or Python writing a file (its script is usually a here-document, so
+    all of command counts)."""
     found = []
     scratch_cwd = False
+    base = ""
     for seg in segments(command):
         try:
             words = shlex.split(seg, comments=True)
@@ -545,21 +585,23 @@ def source_rewrites(command):
         if prog == "cd" and args:
             # (relative paths after `cd target/x` are a scratch copy's)
             scratch_cwd = bool(SCRATCH.search(args[0].rstrip("/") + "/"))
+            base = os.path.join(base, args[0])
             continue
         if prog in ("sed", "perl") and in_place(prog, args):
             operands, script = in_place_operands(prog, args)
-            files = [a for a in operands if compiler_paths(a) and not (scratch_cwd and not a.startswith("/"))]
+            files = [a for a in program_source_paths(operands, cwd, base)
+                     if not (scratch_cwd and not a.startswith("/"))]
             if files:
-                found.append(("sed -i" if prog == "sed" else "perl -pi", files, script))
+                found.append(("sed -i" if prog == "sed" else "perl -pi", files, script, base))
     script = python_text(command)
     if script and re.search(r"\.write\(|write_text\(|write_bytes\(", script):
         targets = python_targets(script)
         if targets is None:
             files = compiler_paths(script)
         else:
-            files = [f for t in targets for f in compiler_paths(t)]
+            files = program_source_paths(targets, cwd, base)
         if files and not (scratch_cwd and not any(f.startswith("/") for f in files)):
-            found.append(("python", files, ""))
+            found.append(("python", files, "", base))
     return found
 
 
@@ -614,14 +656,21 @@ def python_targets(command):
     return None if unknown else targets
 
 
-def edit_suggestion(prog, files, script):
+def edit_suggestion(prog, files, script, cwd=None, base=""):
     """The volec command for a rewrite: `sed -i 'Ns/a/b/' FILE` of plain
     text is `edit patch FILE:N --old a --new b`; (0.18.1) without a line,
     every line's: `edit patch FILE --old a --new b --all`, one per file
     (at most 3). A regex (`\\b`, `.*`, `[..]`), `&` or several commands:
-    the general form."""
+    the general form. (0.25.2) A file of a program other than cwd's gets
+    its `--root`."""
     fs = [re.sub(r"^.*?(compiler/(?:src|std)/)", r"\1", f) for f in files]
     f = fs[0]
+    here = cwd or os.getcwd()
+    # (the root as seen from where the command runs, after its `cd`s)
+    run_in = os.path.normpath(os.path.join(here, base))
+    ra = root_args(os.path.normpath(os.path.join(run_in, files[0])), run_in) \
+        if not compiler_paths(files[0]) else []
+    root = (" " + " ".join(shlex.quote(x) for x in ra)) if ra else ""
     m = re.match(r"^(\d+)?s([/|#,])((?:\\.|(?!\2).)*)\2((?:\\.|(?!\2).)*)\2g?$", script or "")
     if prog == "sed -i" and m and not re.search(r"(?<!\\)[\^$*.\[\]+?(){}]|\\[bBwWsSdD<>]", m.group(3)) \
             and "&" not in m.group(4) and not re.search(r"\\[0-9n]", m.group(4)):
@@ -629,9 +678,9 @@ def edit_suggestion(prog, files, script):
         new = re.sub(r"\\(.)", r"\1", m.group(4))
         pair = f"--old {shlex.quote(old)} --new {shlex.quote(new)}"
         if m.group(1):
-            return f"volec edit patch {f}:{m.group(1)} {pair}"
-        return " ; ".join(f"volec edit patch {x} {pair} --all" for x in fs[:3])
-    return (f"volec edit patch {f}:LINE --old 'TEXT' --new 'TEXT' "
+            return f"volec edit patch {f}:{m.group(1)} {pair}{root}"
+        return " ; ".join(f"volec edit patch {x} {pair} --all{root}" for x in fs[:3])
+    return (f"volec edit patch {f}:LINE --old 'TEXT' --new 'TEXT'{root} "
             "(pairs repeat, or come on stdin; docs/refactor.md)")
 
 
@@ -725,6 +774,20 @@ def suggestion(prog, args):
     return "volec query show NAME | volec query items MODULE | volec query text FILE:A-B"
 
 
+def with_root(t, root):
+    """(0.25.2) Each `volec query ...` alternative of a try: text with
+    `root` (`--root R`) after its words, before a `(...)` remark."""
+    if not root:
+        return t
+    out = []
+    for alt in t.split(" | "):
+        if alt.startswith("volec query ") and "--root" not in alt:
+            k = alt.find(" (")
+            alt = alt + " " + root if k < 0 else alt[:k] + " " + root + alt[k:]
+        out.append(alt)
+    return " | ".join(out)
+
+
 def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=()):
     """(the message for a blocked read, its `try:` commands): which command
     of the line reads source (when the line has several, the others are
@@ -746,19 +809,29 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
     if len(parts) > 1:
         what += "; the others are not blocked)" if not others else ")"
     lines = ["blocked hook.query-first: %s reads .vl source" % what]
-    tries = [suggestion(prog, args)]
+    # (0.25.2) A file of another program than cwd's: every query says
+    # `--root`, so that each try: line works where the agent stands.
+    full0 = files[0][1] if files and files[0][1] else None
+    run_in = cwd or os.getcwd()
+    if full0 and not os.path.isabs(files[0][0]) and full0.endswith("/" + os.path.normpath(files[0][0])):
+        # (where the command runs, after its `cd`s: the file as typed is relative to it)
+        run_in = full0[:len(full0) - len(os.path.normpath(files[0][0])) - 1]
+    ra = root_args(full0, run_in) if full0 else None
+    root = " ".join(shlex.quote(x) for x in ra) if ra else ""
+    tries = [with_root(suggestion(prog, args), root)]
     for arg, full in files[:1]:
         n = lines_of(full) if full else None
         if n is not None and n < (1 << 30):
             mod = module_of(full) or arg
-            lines.append("%s is %s lines (a file under %d is read whole freely): `volec query items %s` "
-                         "lists its items, `volec query show NAME` one of them, `volec query show %s:LINE` "
-                         "the item at a line" % (arg, format(n, ","), SMALL_LINES, mod, arg))
+            rs = (" " + root) if root else ""
+            lines.append("%s is %s lines (a file under %d is read whole freely): `volec query items %s%s` "
+                         "lists its items, `volec query show NAME%s` one of them, `volec query show %s:LINE` "
+                         "the item at a line" % (arg, format(n, ","), SMALL_LINES, mod, rs, rs, arg))
             if mod != arg:
-                tries.append("volec query items %s" % mod)
+                tries.append(with_root("volec query items %s" % mod, root))
     lines += ["try: %s" % t for t in tries]
     for o in others:
-        t = suggestion(o[0], o[1])
+        t = with_root(suggestion(o[0], o[1]), root)
         tries.append(t)
         lines.append("also blocked: %s); try: %s" % (where(o[2]), t))
     if translated:
@@ -1516,6 +1589,8 @@ def main():
     phase = event.get("hook_event_name", "")
     tool = event.get("tool_name", "")
     inp = event.get("tool_input") or {}
+    if phase == "PreToolUse":
+        log_call(gd, event, tool, inp)
 
     if tool == "Bash":
         command = inp.get("command", "")
@@ -1549,9 +1624,9 @@ def main():
             return 0
         if any(c[0] == "query" for c in calls):
             log(gd, {"kind": "query", **via(calls), "command": command[:300]})
-        rewrites = source_rewrites(command)
+        rewrites = source_rewrites(command, cwd)
         if rewrites:
-            prog, files, script = rewrites[0]
+            prog, files, script, base = rewrites[0]
             esc = ESCAPE.search(command)
             if esc:
                 log(gd, {"kind": "edit-escape", "program": prog,
@@ -1563,9 +1638,10 @@ def main():
                 return 0
             log(gd, {"kind": "edit-blocked", "program": prog,
                      "files": files[:5], "command": command[:300]})
-            sys.stderr.write("blocked hook.edit-tool: %s rewriting compiler source (%s)\n"
+            what = "compiler" if compiler_paths(files[0]) else "program"
+            sys.stderr.write("blocked hook.edit-tool: %s rewriting %s source (%s)\n"
                              "try: %s | override: append '# no-tool: <why the tools are not enough>'\n"
-                             % (prog, files[0], edit_suggestion(prog, files, script)))
+                             % (prog, what, files[0], edit_suggestion(prog, files, script, cwd, base)))
             return 2
         fixtures, small, scratch = [], [], []
         reads = source_reads(command, cwd, fixtures, small, scratch)
