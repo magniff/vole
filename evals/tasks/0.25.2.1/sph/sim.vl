@@ -1,0 +1,358 @@
+// The GPU side of sph: the particles' buffers (made once, in new_in), one
+// compute pipeline per kernel and its bind group, and the picture. A
+// substep is cell, clear, count, scan, scatter (the neighbour grid by
+// counting sort, the prefix sum in between), density, force, integrate.
+// A frame is set_params, then the substeps and the picture in one
+// encoder; nothing is read back except where the headless checks ask.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage, Color};
+
+use cpu::{BOX_H, BOX_W, MU, N, RADIUS_SPACINGS, RESTITUTION, RHO0, SPACING, STIFF, STIR_K, STIR_R, VMAX, H};
+use shaders::{CELL, CLEAR, COMMON, COUNT, DENSITY, FORCE, INTEGRATE, RENDER, SCAN, SCATTER};
+
+// What a frame does to the particles, in the box's frame: the step, the
+// tilt (radians, the box turned counter-clockwise on the screen), and the
+// mouse's stirring (the mouse at (mx, my) metres, moving at (mvx, mvy)).
+pub struct Params {
+    pub dt: f64,
+    pub tilt: f64,
+    pub stir: bool,
+    pub mx: f64,
+    pub my: f64,
+    pub mvx: f64,
+    pub mvy: f64,
+}
+
+impl Params {
+    pub fn rest() -> Params {
+        Params { dt: cpu::SIM_DT, tilt: 0.0, stir: false, mx: 0.0, my: 0.0, mvx: 0.0, mvy: 0.0 }
+    }
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // the grid: cells across and down, the padded count the scan covers
+    pub cx: i64,
+    pub cy: i64,
+    pub cells: i64,
+    pub padded: i64,
+    // the uniforms: the step's (U), the view's (Vw) and the scan's length
+    ubuf: gpu::Buffer,
+    vwbuf: gpu::Buffer,
+    scbuf: gpu::Buffer,
+    pos: gpu::Buffer,
+    vel: gpu::Buffer,
+    acc: gpu::Buffer,
+    rho: gpu::Buffer,
+    cell: gpu::Buffer,
+    order: gpu::Buffer,
+    counts: gpu::Buffer,
+    starts: gpu::Buffer,
+    cursor: gpu::Buffer,
+    k_cell: gpu::ComputePipeline,
+    k_clear: gpu::ComputePipeline,
+    k_count: gpu::ComputePipeline,
+    k_scan: gpu::ComputePipeline,
+    k_scatter: gpu::ComputePipeline,
+    k_density: gpu::ComputePipeline,
+    k_force: gpu::ComputePipeline,
+    k_integrate: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    g_cell: gpu::BindGroup,
+    g_clear: gpu::BindGroup,
+    g_count: gpu::BindGroup,
+    g_scan: gpu::BindGroup,
+    g_scatter: gpu::BindGroup,
+    g_density: gpu::BindGroup,
+    g_force: gpu::BindGroup,
+    g_integrate: gpu::BindGroup,
+    g_render: gpu::BindGroup,
+}
+
+// A compute pipeline from the shader made of `parts` (its entry point main).
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// One kernel over `groups` workgroups.
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, groups: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch(groups);
+}
+
+// The particle kernels' workgroups (256 particles each).
+fn groups_of(n: i64) -> i64 {
+    (n + 255) / 256
+}
+
+// The uniform U, as 28 f32s (sim's layout in shaders.vl: the integers are
+// exact in f32). cp: poly6 4/(pi h^8), the spiky gradient 30/(pi h^5), the
+// viscosity's 40/(pi h^5).
+fn pack_u(p: Params, cx: i64, cy: i64, stir_ok: bool) -> [f32; 28] {
+    var w: [f32; 28] = [0.0; 28];
+    let (gx, gy) = cpu::gravity_box(p.tilt);
+    let pi = std::f64::consts::PI;
+    let h5 = H * H * H * H * H;
+    w[0] = N as f32;
+    w[1] = cx as f32;
+    w[2] = cy as f32;
+    w[3] = (cx * cy) as f32;
+    w[4] = H as f32;
+    w[5] = (H * H) as f32;
+    w[6] = p.dt as f32;
+    w[7] = RHO0 as f32;
+    w[8] = STIFF as f32;
+    w[9] = cpu::mass() as f32;
+    w[10] = MU as f32;
+    w[11] = if stir_ok { STIR_K as f32 } else { 0.0 };
+    w[12] = gx as f32;
+    w[13] = gy as f32;
+    w[14] = BOX_W as f32;
+    w[15] = BOX_H as f32;
+    w[16] = p.mx as f32;
+    w[17] = p.my as f32;
+    w[18] = p.mvx as f32;
+    w[19] = p.mvy as f32;
+    w[20] = STIR_R as f32;
+    w[21] = VMAX as f32;
+    w[22] = RESTITUTION as f32;
+    w[23] = 0.0;
+    w[24] = (4.0 / (pi * H * H * H * H * H * H * H * H)) as f32;
+    w[25] = (30.0 / (pi * h5)) as f32;
+    w[26] = (40.0 / (pi * h5)) as f32;
+    w[27] = 0.0;
+    w
+}
+
+impl Sim {
+    // The grid, the buffers and the pipelines of an N-particle tank, drawing
+    // into targets of `format`; the particles are at the lattice's start.
+    pub fn new_in(format: Format, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cx = cpu::cells_across(BOX_W);
+        let cy = cpu::cells_across(BOX_H);
+        let cells = cx * cy;
+        let pad = cpu::padded(cells);
+        let ubuf = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let vwbuf = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let sc: [u32; 4] = [pad as u32, 0, 0, 0];
+        let scbuf = dev.buffer_init(gpu::bytes_of_u32(sc[..]), BufferUsage::UNIFORM);
+        let pos = storage(dev, N * 8);
+        let vel = storage(dev, N * 8);
+        let acc = storage(dev, N * 8);
+        let rho = storage(dev, N * 4);
+        let cell = storage(dev, N * 4);
+        let order = storage(dev, N * 4);
+        let counts = storage(dev, pad * 4);
+        let starts = storage(dev, (pad + 1) * 4);
+        let cursor = storage(dev, pad * 4);
+
+        let k_cell = kernel(dev, [COMMON, CELL][..], gpa)?;
+        let k_clear = kernel(dev, [CLEAR][..], gpa)?;
+        let k_count = kernel(dev, [COUNT][..], gpa)?;
+        let k_scan = kernel(dev, [SCAN][..], gpa)?;
+        let k_scatter = kernel(dev, [SCATTER][..], gpa)?;
+        let k_density = kernel(dev, [COMMON, DENSITY][..], gpa)?;
+        let k_force = kernel(dev, [COMMON, FORCE][..], gpa)?;
+        let k_integrate = kernel(dev, [COMMON, INTEGRATE][..], gpa)?;
+        let rshader = dev.shader_wgsl(RENDER)?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", format))?;
+
+        let b = gpu::bind;
+        let g_cell = dev.bind_group(k_cell.bind_layout(0), [b(0, ubuf), b(1, pos), b(2, cell)][..]);
+        let g_clear = dev.bind_group(k_clear.bind_layout(0), [b(0, counts)][..]);
+        let g_count = dev.bind_group(k_count.bind_layout(0), [b(0, cell), b(1, counts)][..]);
+        let g_scan = dev.bind_group(k_scan.bind_layout(0),
+            [b(0, counts), b(1, starts), b(2, cursor), b(3, scbuf)][..]);
+        let g_scatter = dev.bind_group(k_scatter.bind_layout(0),
+            [b(0, cell), b(1, cursor), b(2, order)][..]);
+        let g_density = dev.bind_group(k_density.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(2, order), b(3, starts), b(4, rho)][..]);
+        let g_force = dev.bind_group(k_force.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(2, vel), b(3, order), b(4, starts), b(5, rho), b(6, acc)][..]);
+        let g_integrate = dev.bind_group(k_integrate.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(2, vel), b(3, acc)][..]);
+        let g_render = dev.bind_group(render.bind_layout(0), [b(0, vwbuf), b(1, pos), b(2, vel)][..]);
+
+        var s = Sim {
+            dev: dev, queue: queue, cx: cx, cy: cy, cells: cells, padded: pad,
+            ubuf: ubuf, vwbuf: vwbuf, scbuf: scbuf, pos: pos, vel: vel, acc: acc, rho: rho,
+            cell: cell, order: order, counts: counts, starts: starts, cursor: cursor,
+            k_cell: k_cell, k_clear: k_clear, k_count: k_count, k_scan: k_scan,
+            k_scatter: k_scatter, k_density: k_density, k_force: k_force,
+            k_integrate: k_integrate, render: render,
+            g_cell: g_cell, g_clear: g_clear, g_count: g_count, g_scan: g_scan,
+            g_scatter: g_scatter, g_density: g_density, g_force: g_force,
+            g_integrate: g_integrate, g_render: g_render,
+        };
+        s.reset(gpa);
+        s.set_params(Params::rest(), 1280, 720);
+        Ok(s)
+    }
+
+    // Every particle back to the lattice, at rest.
+    pub fn reset(inout self, gpa: Gpa) {
+        let lat = cpu::lattice(gpa);
+        self.queue.write_buffer(self.pos, 0, gpu::bytes_of_f32(lat.as_slice()));
+        var zeros: Vec<u8> = Vec::filled_in(N * 8, 0u8, gpa);
+        self.queue.write_buffer(self.vel, 0, zeros.as_slice());
+    }
+
+    // The uniforms of the next frame: the step's parameters and the view of
+    // a window of px_w x px_h pixels (written in queue order, so a frame in
+    // flight keeps its own).
+    pub fn set_params(inout self, p: Params, px_w: i64, px_h: i64) {
+        let w = pack_u(p, self.cx, self.cy, p.stir);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(w[..]));
+        let fw = px_w as f64;
+        let fh = px_h as f64;
+        let scale = cpu::fit_scale(fw, fh, p.tilt);
+        let c = p.tilt.cos();
+        let s = p.tilt.sin();
+        var v: [f32; 12] = [0.0; 12];
+        v[0] = (BOX_W / 2.0) as f32;
+        v[1] = (BOX_H / 2.0) as f32;
+        v[2] = c as f32;
+        v[3] = s as f32;
+        v[4] = (2.0 * scale / fw) as f32;
+        v[5] = (2.0 * scale / fh) as f32;
+        v[6] = (RADIUS_SPACINGS * SPACING) as f32;
+        v[7] = N as f32;
+        v[8] = BOX_W as f32;
+        v[9] = BOX_H as f32;
+        self.queue.write_buffer(self.vwbuf, 0, gpu::bytes_of_f32(v[..]));
+    }
+
+    // `substeps` substeps of the simulation, recorded into one compute pass.
+    pub fn step(inout self, substeps: i64, enc: inout gpu::Encoder) {
+        let ng = groups_of(N);
+        let gc = self.padded / 256;
+        enc.compute_pass(|pass| {
+            for _ in 0..substeps {
+                run(&pass, self.k_cell, self.g_cell, ng);
+                run(&pass, self.k_clear, self.g_clear, gc);
+                run(&pass, self.k_count, self.g_count, ng);
+                run(&pass, self.k_scan, self.g_scan, 1);
+                run(&pass, self.k_scatter, self.g_scatter, ng);
+                run(&pass, self.k_density, self.g_density, ng);
+                run(&pass, self.k_force, self.g_force, ng);
+                run(&pass, self.k_integrate, self.g_integrate, ng);
+            }
+        });
+    }
+
+    // The picture: the box's walls and the particles, coloured by speed.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let bg = Color::rgba(0.035, 0.04, 0.06, 1.0);
+        enc.render_pass(PassDesc::color(target, bg), |pass| {
+            pass.set_pipeline(self.render);
+            pass.set_bind_group(0, self.g_render);
+            pass.draw(0..6, 0..(N + 4));
+        });
+    }
+
+    // The neighbour grid alone, on the particles as they are: cell, clear,
+    // count, scan, scatter. The checks read it back.
+    pub fn sort_only(inout self) {
+        var enc = self.dev.encoder();
+        let ng = groups_of(N);
+        let gc = self.padded / 256;
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_cell, self.g_cell, ng);
+            run(&pass, self.k_clear, self.g_clear, gc);
+            run(&pass, self.k_count, self.g_count, ng);
+            run(&pass, self.k_scan, self.g_scan, 1);
+            run(&pass, self.k_scatter, self.g_scatter, ng);
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The sort against the CPU: the particles' cells, the histogram, the
+    // prefix sum and the order. Returns the wrong entries and the first.
+    pub fn check_sort(inout self, gpa: Gpa) -> (i64, Buf) {
+        self.sort_only();
+        let _ = self.queue.wait_idle();
+        let cell = gpu::u32s(self.cell.map_read(self.dev));
+        let counts = gpu::u32s(self.counts.map_read(self.dev));
+        let starts = gpu::u32s(self.starts.map_read(self.dev));
+        let order = gpu::u32s(self.order.map_read(self.dev));
+        cpu::check_sort(cell, counts, starts, order, self.cells, gpa)
+    }
+
+    // The scan on the GPU against the CPU, for `data` (any length): the
+    // number of wrong entries. Uses the scan kernel with its own buffers.
+    pub fn check_scan(inout self, data: [u32], gpa: Gpa) -> i64 {
+        let len = data.len() as i64;
+        let din = self.dev.buffer_init(gpu::bytes_of_u32(data), BufferUsage::STORAGE);
+        var sout = storage(self.dev, (len + 1) * 4);
+        let scur = storage(self.dev, len * 4);
+        let st: [u32; 4] = [len as u32, 0, 0, 0];
+        let sct = self.dev.buffer_init(gpu::bytes_of_u32(st[..]), BufferUsage::UNIFORM);
+        let b = gpu::bind;
+        let g = self.dev.bind_group(self.k_scan.bind_layout(0),
+            [b(0, din), b(1, sout), b(2, scur), b(3, sct)][..]);
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_scan, g, 1);
+        });
+        self.queue.submit(enc.finish());
+        let got = gpu::u32s(sout.map_read(self.dev));
+        let want = cpu::exclusive_scan(data, gpa);
+        var bad: i64 = 0;
+        for i in 0..(len + 1) {
+            if got[i] != want[i as usize] {
+                bad += 1;
+            }
+        }
+        bad
+    }
+
+    // The mean density over the particles (waits for the GPU).
+    pub fn mean_density(inout self) -> f64 {
+        let r = gpu::f32s(self.rho.map_read(self.dev));
+        cpu::mean(r)
+    }
+
+    // The particles outside the box, or not finite (waits for the GPU).
+    pub fn escaped(inout self) -> i64 {
+        let p = gpu::f32s(self.pos.map_read(self.dev));
+        cpu::escaped(p)
+    }
+
+    // The picture of the current state, w x h pixels, as a binary PPM
+    // (waits for the GPU): the window's screenshot, or the headless shot.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

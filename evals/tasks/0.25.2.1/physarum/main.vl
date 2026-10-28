@@ -1,0 +1,296 @@
+// Physarum (slime mould) on the GPU: a million agents sense a trail map
+// ahead and to both sides, turn toward it, move and deposit; the trail
+// diffuses and decays every step, and is drawn with a colour ramp.
+//
+//   physarum                          the window: keys, mouse (see README.md)
+//   physarum --headless [--steps N]   no window: the checks, then exit
+//   physarum --headless --shot F.ppm  the same, and the trail as a PPM
+//
+// sim.vl holds the buffers and the steps, shaders.vl the WGSL, tune.vl
+// the knobs, the pointer and the CPU side of the checks.
+
+mod shaders;
+mod sim;
+mod tune;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface};
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use sim::{MAX_AGENTS, Sim};
+use tune::{Pointer, Tune, knob_key, predicted_total, rel_err};
+
+// The mouse: food (left) or repellent (right) a disc of this radius, in
+// cells, adding this much a step.
+const POINTER_RADIUS: f32 = 8.0;
+const POINTER_AMOUNT: f32 = 6.0;
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The checks without a window: `steps` steps of a `size` x `size` map.
+// The trail's total is checked against the recurrence it must follow (each
+// step adds one unit an agent and decays by `decay`), and every agent
+// must stay inside the map.
+fn headless(n: i64, size: i64, steps: i64, every: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(size, size, n, Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    let t = Tune::new();
+    let none = Pointer::none();
+    println(f"physarum: {n} agents on a {size} x {size} map, {steps} steps");
+    println(f"  sensors {t.sensor_angle:.3} rad, {t.sensor_dist:.1} cells ahead; turn {t.turn:.3} rad; decay {t.decay:.3}; diffuse {t.diffuse:.2}");
+    s.reset();
+    println(f"  headings: mean resultant {s.heading_spread():.4} after the reset (random: about 1/sqrt(n) = {1.0 / (n as f64).sqrt():.4})");
+    let t0 = monotonic_now();
+    var pred = 0.0;
+    var worst = 0.0;
+    for i in 0..steps {
+        s.step(t, none);
+        pred = predicted_total(pred, n as f64, t.decay as f64);
+        if (i + 1) % every == 0 || i + 1 == steps {
+            let total = s.trail_total();
+            let err = rel_err(total, pred);
+            if err > worst {
+                worst = err;
+            }
+            println(f"  step {i + 1}: trail total {total:.6e}, the recurrence says {pred:.6e} (rel err {err:.1e})");
+        }
+    }
+    let ms = monotonic_now().saturating_sub(t0).as_secs_f64() * 1000.0 / steps as f64;
+    let inside = s.agents_inside();
+    let trail_ok = worst < 1e-3;
+    let inside_ok = inside == n;
+    println(f"trail: the total follows (1 - decay) x (total + agents) at every check, worst rel err {worst:.1e}: {verdict(trail_ok)}");
+    println(f"agents: {inside} of {n} inside the map: {verdict(inside_ok)}");
+    println(f"time: {ms:.2} ms a step (with the checks' read-backs)");
+    if shot.len() > 0 {
+        let img = s.snapshot_in(size, size, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"physarum: cannot write {shot}");
+            return 1;
+        }
+        println(f"shot: {shot}");
+    }
+    if trail_ok && inside_ok { 0 } else { 1 }
+}
+
+// The mouse and the keys between frames.
+struct Input {
+    left: bool,
+    right: bool,
+    x: f64,
+    y: f64,
+    paused: bool,
+    quit: bool,
+    reset: bool,
+    dirty: bool,
+}
+
+// A key: a knob's letter moves it, space pauses, r restarts, q quits.
+fn on_key(inp: inout Input, t: inout Tune, key: Logical) {
+    match key {
+        Logical::Char(c) => {
+            if c == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if c == 'r' as u32 {
+                inp.reset = true;
+            } else if c == 'q' as u32 {
+                inp.quit = true;
+            } else {
+                let k = knob_key(c);
+                if k >= 0 {
+                    t.adjust(k / 2, if k % 2 == 1 { 1 } else { -1 });
+                }
+            }
+            inp.dirty = true;
+        }
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+}
+
+// The window's title: the knobs' values, and whether it is paused.
+fn title_for(t: Tune, paused: bool, gpa: Gpa) -> Buf {
+    let p = if paused { " (paused)" } else { "" };
+    format_in(f"physarum  angle {t.sensor_angle:.2}  dist {t.sensor_dist:.0}  turn {t.turn:.2}  decay {t.decay:.2}  diffuse {t.diffuse:.1}{p}", gpa)
+}
+
+// The interactive run: a step and a frame per display frame, the
+// trail in the window. `frames` > 0 quits after that many (for checks).
+fn windowed(n: i64, size: i64, frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("physarum: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("physarum", size, size)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("physarum: no window");
+            return 1;
+        }
+    };
+    var s = match Sim::new_in(size, size, n, Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(s.dev, sz.w, sz.h);
+    s.reset();
+    var t = Tune::new();
+    var inp = Input { left: false, right: false, x: 0.0, y: 0.0, paused: false, quit: false,
+        reset: false, dirty: true };
+    let kx = size as f32 / sz.w as f32;
+    let ky = size as f32 / sz.h as f32;
+    var count = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if inp.reset {
+                    s.reset();
+                    inp.reset = false;
+                }
+                if inp.dirty {
+                    win.set_title(title_for(t, inp.paused, gpa).as_slice());
+                    inp.dirty = false;
+                }
+                let ptr = if inp.left {
+                    Pointer { x: inp.x as f32 * kx, y: inp.y as f32 * ky, radius: POINTER_RADIUS,
+                        amount: POINTER_AMOUNT }
+                } else if inp.right {
+                    Pointer { x: inp.x as f32 * kx, y: inp.y as f32 * ky, radius: POINTER_RADIUS,
+                        amount: -POINTER_AMOUNT }
+                } else {
+                    Pointer::none()
+                };
+                if !inp.paused {
+                    s.step(t, ptr);
+                }
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = s.dev.encoder();
+                        s.draw(&enc, f.texture.view());
+                        s.queue.submit(enc.finish());
+                        f.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                count += 1;
+                if frames > 0 && count >= frames {
+                    break;
+                }
+                if inp.quit {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        match m.button {
+                            Button::Left => inp.left = true,
+                            Button::Right => inp.right = true,
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Release => {
+                        match m.button {
+                            Button::Left => inp.left = false,
+                            Button::Right => inp.right = false,
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Move => {}
+                }
+                inp.x = m.x;
+                inp.y = m.y;
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    on_key(&inp, &t, k.key);
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit {
+            break;
+        }
+    }
+    if shot.len() > 0 {
+        let img = s.snapshot_in(size, size, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"physarum: cannot write {shot}");
+        }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("physarum", gpa)
+        .about("Physarum: a million agents lay and follow a trail, on the GPU")
+        .arg(Arg::flag("headless").help("no window: run the steps and print the checks"))
+        .arg(Arg::option("agents").value_name("N").default("1048576")
+            .help("the agents (up to 4194240)"))
+        .arg(Arg::option("size").value_name("N")
+            .help("the trail map's side in cells (default 1024)"))
+        .arg(Arg::option("steps").value_name("N").default("300").help("headless: the steps"))
+        .arg(Arg::option("every").value_name("N").default("50")
+            .help("headless: a trail check every N steps"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: the trail after the steps; window: the last frame, with --frames"));
+    let m = cli.parse_or_exit(env::args());
+    let headless_mode = m.flag("headless");
+    let n = parse_int(m.get("agents").unwrap_or("1048576")).unwrap_or(0);
+    let size = match m.get("size") {
+        Some(s) => parse_int(s).unwrap_or(0),
+        None => 1024,
+    };
+    let steps = parse_int(m.get("steps").unwrap_or("300")).unwrap_or(0);
+    let every = parse_int(m.get("every").unwrap_or("50")).unwrap_or(0);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    if n < 1000 || n > MAX_AGENTS {
+        eprintln(f"physarum: --agents 1000 to {MAX_AGENTS}");
+        return 2;
+    }
+    if size < 64 || size > 2048 {
+        eprintln("physarum: --size 64 to 2048");
+        return 2;
+    }
+    if headless_mode {
+        if steps < 1 || every < 1 {
+            eprintln("physarum: --steps and --every take 1 or more");
+            return 2;
+        }
+        return headless(n, size, steps, every, m.get("shot").unwrap_or(""), gpa);
+    }
+    windowed(n, size, frames, m.get("shot").unwrap_or(""), gpa)
+}

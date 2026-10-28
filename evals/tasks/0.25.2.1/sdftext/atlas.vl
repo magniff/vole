@@ -1,0 +1,219 @@
+// The SDF atlas: every glyph's signed distance field, computed on the CPU
+// once at startup, into one R8 texture of COLS x ROWS cells. A cell holds
+// one glyph's unit box with a margin of PAD texels; the value of a texel is
+// 0.5 on the stroke's edge, 1 inside the stroke and 0 SPREAD texels out.
+// The render shader samples it, so text stays crisp at any size and angle.
+
+use glyphs::{CHARS, STROKES, PAIRS};
+
+pub const CELL: i64 = 64;       // texels on a side of one glyph's cell
+pub const COLS: i64 = 8;
+pub const ROWS: i64 = 6;        // COLS * ROWS = 48 cells for the 41 glyphs
+pub const WIDTH: i64 = 512;     // COLS * CELL
+pub const HEIGHT: i64 = 384;    // ROWS * CELL
+const PAD: f64 = 8.0;           // texels from the cell's edge to the unit box
+const SCALE: f64 = 48.0;        // texels per unit (CELL - 2 * PAD)
+const HALF: f64 = 2.88;         // half the stroke's width, in texels (0.06 units)
+const SPREAD: f64 = 4.0;        // texels over which the value runs from 1 to 0
+
+// The glyph quad's margin beyond its unit box, as a fraction of the box.
+pub const MARGIN: f64 = 8.0 / 48.0;
+
+// One stroke segment on the unit box.
+pub struct Seg {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+// Every glyph's segments: glyph g's are segs[first[g]..first[g + 1]].
+pub struct Outline {
+    pub segs: Vec<Seg>,
+    pub first: Vec<i64>,
+}
+
+pub struct Atlas {
+    // WIDTH * HEIGHT bytes, row by row: the R8Unorm texture's texels.
+    pub px: Vec<u8>,
+}
+
+// The index of a character's glyph in CHARS (lower case is upper case; an
+// unknown character is the space, 0).
+pub fn glyph_index(c: u8) -> i64 {
+    var ch = c;
+    if c >= 97 && c <= 122 {
+        ch = c - 32;
+    }
+    for i in 0..CHARS.len() {
+        if CHARS[i] == ch {
+            return i;
+        }
+    }
+    0
+}
+
+// Reads STROKES into segments: a pair (x, y) continues the polyline unless
+// the one before it ended it (x = -1: pen up) or the glyph (x = -2).
+pub fn outline(gpa: Gpa) -> Outline {
+    var segs: Vec<Seg> = Vec::new_in(gpa);
+    var first: Vec<i64> = Vec::new_in(gpa);
+    first.push(0);
+    var have = false;
+    var px = 0.0;
+    var py = 0.0;
+    for k in 0..PAIRS {
+        let x = STROKES[2 * k] as f64;
+        let y = STROKES[2 * k + 1] as f64;
+        if x == -2.0 {
+            first.push(segs.len());
+            have = false;
+        } else if x == -1.0 {
+            have = false;
+        } else {
+            if have {
+                segs.push(Seg { x0: px, y0: py, x1: x, y1: y });
+            }
+            px = x;
+            py = y;
+            have = true;
+        }
+    }
+    Outline { segs: segs, first: first }
+}
+
+// The distance from (x, y) to a segment, in unit-box units.
+fn dist_seg(x: f64, y: f64, s: Seg) -> f64 {
+    let dx = s.x1 - s.x0;
+    let dy = s.y1 - s.y0;
+    let len2 = dx * dx + dy * dy;
+    var t = 0.0;
+    if len2 > 0.0 {
+        t = ((x - s.x0) * dx + (y - s.y0) * dy) / len2;
+    }
+    t = t.clamp(0.0, 1.0);
+    let ex = s.x0 + t * dx - x;
+    let ey = s.y0 + t * dy - y;
+    (ex * ex + ey * ey).sqrt()
+}
+
+// The distance from (x, y), in unit-box units, to glyph g's nearest stroke.
+pub fn glyph_distance(o: Outline, g: i64, x: f64, y: f64) -> f64 {
+    var best = 1000000.0;
+    for i in o.first[g]..o.first[g + 1] {
+        let d = dist_seg(x, y, Seg { x0: o.segs[i].x0, y0: o.segs[i].y0, x1: o.segs[i].x1, y1: o.segs[i].y1 });
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
+// The stored value of a distance (in unit-box units): 1 inside the stroke,
+// 0.5 on its edge, 0 at SPREAD texels outside it.
+fn value_of(d: f64) -> f64 {
+    let sd = d * SCALE - HALF;
+    (0.5 - sd / (2.0 * SPREAD)).clamp(0.0, 1.0)
+}
+
+// Builds the atlas: every texel of every glyph cell.
+pub fn build(gpa: Gpa) -> Atlas {
+    let o = outline(gpa);
+    var px: Vec<u8> = Vec::new_in(gpa);
+    for _ in 0..WIDTH * HEIGHT {
+        px.push(0);
+    }
+    for g in 0..CHARS.len() {
+        let col = g % COLS;
+        let row = g / COLS;
+        for ty in 0..CELL {
+            for tx in 0..CELL {
+                let x = (tx as f64 + 0.5 - PAD) / SCALE;
+                let y = (ty as f64 + 0.5 - PAD) / SCALE;
+                let v = value_of(glyph_distance(o, g, x, y));
+                px[(row * CELL + ty) * WIDTH + col * CELL + tx] = (v * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+    Atlas { px: px }
+}
+
+// The stored value at a point of glyph g's unit box, 0..1 (nearest texel).
+pub fn sample(a: Atlas, g: i64, x: f64, y: f64) -> f64 {
+    let tx = (PAD + x * SCALE).floor() as i64;
+    let ty = (PAD + y * SCALE).floor() as i64;
+    let col = g % COLS;
+    let row = g / COLS;
+    let cx = col * CELL + std::clamp(tx, 0, CELL - 1);
+    let cy = row * CELL + std::clamp(ty, 0, CELL - 1);
+    a.px[cy * WIDTH + cx] as f64 / 255.0
+}
+
+// Checks the atlas and prints one line per check. Returns the failures.
+//  - every glyph (not the space) has stroke texels, inside 0.5%..45% of its cell
+//  - a stroke's midpoint is inside (value > 0.75: 0.86 on the centre line), the
+//    cell's corner outside (value < 0.1)
+//  - a true distance field changes by at most one texel's distance per texel:
+//    neighbouring texels differ by at most ~0.18 of the range (46 of 255)
+pub fn report(a: Atlas, gpa: Gpa) -> i64 {
+    var failed = 0;
+    let o = outline(gpa);
+    var worst_step = 0;
+    var glyphs_ok = 0;
+    for g in 1..CHARS.len() {
+        var inside = 0;
+        for ty in 0..CELL {
+            for tx in 0..CELL {
+                if a.px[((g / COLS) * CELL + ty) * WIDTH + (g % COLS) * CELL + tx] > 127 {
+                    inside += 1;
+                }
+            }
+        }
+        let frac = inside as f64 / (CELL * CELL) as f64;
+        let s = o.first[g];
+        let mid_x = (o.segs[s].x0 + o.segs[s].x1) / 2.0;
+        let mid_y = (o.segs[s].y0 + o.segs[s].y1) / 2.0;
+        let mid = sample(a, g, mid_x, mid_y);
+        let corner = sample(a, g, -0.1, -0.1);
+        if frac >= 0.005 && frac <= 0.45 && mid > 0.75 && corner < 0.1 {
+            glyphs_ok += 1;
+        } else {
+            failed += 1;
+            println(f"glyph {g} (index in CHARS) fails: inside {frac:.3}, midpoint {mid:.2}, corner {corner:.2}");
+        }
+    }
+    println(f"atlas: {glyphs_ok} of {CHARS.len() - 1} glyphs pass (texels inside, stroke midpoint inside, corner outside)");
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH - 1 {
+            let d = std::abs(a.px[y * WIDTH + x] as i64 - a.px[y * WIDTH + x + 1] as i64);
+            if d > worst_step {
+                worst_step = d;
+            }
+        }
+    }
+    println(f"atlas: largest step between neighbouring texels {worst_step} of 255 (limit 46)");
+    if worst_step > 46 {
+        failed += 1;
+    }
+    failed
+}
+
+#[test]
+fn glyph_index_maps_letters_and_digits() {
+    assert_eq(glyph_index(65), 11);
+    assert_eq(glyph_index(97), 11);
+    assert_eq(glyph_index(48), 1);
+    assert_eq(glyph_index(35), 0);
+}
+
+#[test]
+fn stroke_is_inside_and_box_corner_outside(gpa: Gpa) {
+    let o = outline(gpa);
+    assert_eq(o.first.len(), 42);
+    // the 'I' stem runs down x = 0.5: its midpoint is inside the stroke
+    let i_glyph = glyph_index(73);
+    assert_eq(glyph_distance(o, i_glyph, 0.5, 0.5) < 0.001, true);
+    // on the centre line the value is 0.5 + HALF / (2 SPREAD) = 0.86
+    assert_eq(value_of(glyph_distance(o, i_glyph, 0.5, 0.5)) > 0.8, true);
+    assert_eq(value_of(glyph_distance(o, i_glyph, -0.1, -0.1)), 0.0);
+}

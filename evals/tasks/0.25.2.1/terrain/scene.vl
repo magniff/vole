@@ -1,0 +1,218 @@
+// The GPU side: the heightmap (made once by a compute kernel), the
+// terrain's index list (chosen on the CPU each frame by distance), the
+// sun's shadow map (a depth-only pass), and the lit terrain and water.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Compare, Blend, Format, IndexFormat, PassDesc, RenderDesc, TextureUsage};
+use math::{look_at, mul, norm3, perspective, ortho, scale3, add3};
+use terrain::{Mesh, BLOCK, BLOCKS, SEA, VERTS};
+use shaders::{noise_shader, terrain_shader, water_shader};
+
+pub const SHADOW_RES: i64 = 1024;
+// The sun's box: half its width, in world units around the terrain's middle.
+const SHADOW_HALF: f32 = 190.0;
+const SHADOW_BIAS: f32 = 0.0025;
+const FOG: f32 = 0.0022;
+const FOVY: f32 = 1.0;
+const UNIFORM_FLOATS: i64 = 44;
+const MAX_INDICES: i64 = BLOCKS * BLOCKS * BLOCK * BLOCK * 6;
+
+// An eye and the point it looks at, in world units (x and z over the grid,
+// y up; the heights are scaled by terrain::HEIGHT).
+pub struct Cam {
+    pub eye: [f32; 3],
+    pub target: [f32; 3],
+}
+
+// Fixed cameras for shots.
+pub fn camera(n: i64) -> Cam {
+    if n == 2 {
+        Cam { eye: [-70.0, 170.0, -40.0], target: [128.0, 0.0, 128.0] }
+    } else if n == 3 {
+        Cam { eye: [210.0, 26.0, 40.0], target: [90.0, 14.0, 200.0] }
+    } else {
+        Cam { eye: [30.0, 42.0, 30.0], target: [150.0, 14.0, 150.0] }
+    }
+}
+
+// The fly-over at time t (seconds): a slow circle around the island.
+pub fn flyover(t: f32) -> Cam {
+    let a = t * 0.06;
+    let eye = [128.0 + 150.0 * a.cos(), 70.0 + 14.0 * (t * 0.2).sin(), 128.0 + 150.0 * a.sin()];
+    Cam { eye: eye, target: [128.0 - 30.0 * a.cos(), 12.0, 128.0 - 30.0 * a.sin()] }
+}
+
+// The sun's direction (towards the sun), normalised once.
+pub fn sun_dir() -> [f32; 3] {
+    norm3([0.55, 0.62, 0.45])
+}
+
+pub struct Scene {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub w: i64,
+    pub h: i64,
+    pub heights: gpu::Buffer,
+    pub ubuf: gpu::Buffer,
+    pub ib: gpu::Buffer,
+    pub shadow: gpu::Texture,
+    pub depth: gpu::Texture,
+    pub noise: gpu::ComputePipeline,
+    pub shadow_pipe: gpu::RenderPipeline,
+    pub terrain_pipe: gpu::RenderPipeline,
+    pub water_pipe: gpu::RenderPipeline,
+    pub g_noise: gpu::BindGroup,
+    pub g_shadow: gpu::BindGroup,
+    pub g_terrain: gpu::BindGroup,
+    pub g_water: gpu::BindGroup,
+    pub mesh: Mesh,
+    pub uni: Vec<f32>,
+    pub light: [f32; 16],
+    pub sun: [f32; 3],
+    // Whether the terrain looks up the shadow map (off: the sun lights everything).
+    pub shadows: bool,
+}
+
+impl Scene {
+    // The pipelines and buffers for a w x h picture (in Bgra8Unorm).
+    pub fn new(dev: sink gpu::Device, queue: sink gpu::Queue, w: i64, h: i64, gpa: Gpa) -> Result<Scene, gpu::Error> {
+        let heights = dev.buffer(VERTS * VERTS * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let ubuf = dev.buffer(UNIFORM_FLOATS * 4, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let ib = dev.buffer(MAX_INDICES * 4, BufferUsage::INDEX | BufferUsage::COPY_DST);
+        let shadow = dev.texture(SHADOW_RES, SHADOW_RES, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING);
+        let depth = dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+
+        // Each shader is bound to a name first: a shader passed inline to a
+        // pipeline's constructor loses its entry points (see README.md).
+        let nsh = noise_shader(dev)?;
+        let noise = dev.compute_pipeline(nsh, "main")?;
+        let ssh = terrain_shader(dev)?;
+        let shadow_pipe = dev.render_pipeline(RenderDesc::depth_only(ssh, "vs_shadow"))?;
+        let tsh = terrain_shader(dev)?;
+        var tdesc = RenderDesc::new(tsh, "vs", "fs", Format::Bgra8Unorm);
+        tdesc.depth(Format::Depth32Float, Compare::Less, true);
+        let terrain_pipe = dev.render_pipeline(tdesc)?;
+        let wsh = water_shader(dev)?;
+        var wdesc = RenderDesc::new(wsh, "vs_water", "fs_water", Format::Bgra8Unorm);
+        wdesc.blend(Blend::alpha(), target: 0);
+        wdesc.depth(Format::Depth32Float, Compare::Less, false);
+        let water_pipe = dev.render_pipeline(wdesc)?;
+
+        let g_noise = dev.bind_group(noise.bind_layout(0), [gpu::bind(0, heights)][..]);
+        let g_shadow = dev.bind_group(shadow_pipe.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, heights)][..]);
+        let g_terrain = dev.bind_group(terrain_pipe.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, heights), gpu::bind_texture(2, shadow.view())][..]);
+        let g_water = dev.bind_group(water_pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+
+        // The sun looks at the middle of the island from far along its direction.
+        let sun = sun_dir();
+        let center: [f32; 3] = [128.0, 20.0, 128.0];
+        let eye = add3(center, scale3(sun, 300.0));
+        let light = mul(ortho(SHADOW_HALF, 1.0, 600.0), look_at(eye, center, [0.0, 1.0, 0.0]));
+
+        Ok(Scene {
+            dev: dev,
+            queue: queue,
+            w: w,
+            h: h,
+            heights: heights,
+            ubuf: ubuf,
+            ib: ib,
+            shadow: shadow,
+            depth: depth,
+            noise: noise,
+            shadow_pipe: shadow_pipe,
+            terrain_pipe: terrain_pipe,
+            water_pipe: water_pipe,
+            g_noise: g_noise,
+            g_shadow: g_shadow,
+            g_terrain: g_terrain,
+            g_water: g_water,
+            mesh: Mesh::new_in(gpa),
+            uni: Vec::with_capacity_in(UNIFORM_FLOATS, gpa),
+            light: light,
+            sun: sun,
+            shadows: true,
+        })
+    }
+
+    // Makes the heightmap: one compute dispatch, submitted and finished.
+    pub fn bake(inout self) {
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.noise);
+            pass.set_bind_group(0, self.g_noise);
+            pass.dispatch(17, 17); // 16 x 16 threads cover 257 x 257 points
+        });
+        self.queue.submit(enc.finish());
+        self.queue.wait_idle();
+    }
+
+    // A picture of a different size: the depth buffer follows it.
+    pub fn resize(inout self, w: i64, h: i64) {
+        self.w = w;
+        self.h = h;
+        self.depth = self.dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+    }
+
+    // Records one frame of `cam` into enc: the shadow pass, then the terrain
+    // and the water into target (a Bgra8Unorm view of the same size).
+    pub fn record(inout self, enc: inout gpu::Encoder, target: gpu::TextureView, cam: Cam) {
+        self.mesh.select(cam.eye);
+        let aspect = self.w as f32 / self.h as f32;
+        let view_proj = mul(perspective(FOVY, aspect, 0.5, 900.0), look_at(cam.eye, cam.target, [0.0, 1.0, 0.0]));
+        self.uni.clear();
+        put(&self.uni, view_proj);
+        put(&self.uni, self.light);
+        self.uni.push(cam.eye[0]);
+        self.uni.push(cam.eye[1]);
+        self.uni.push(cam.eye[2]);
+        self.uni.push(0.0);
+        self.uni.push(self.sun[0]);
+        self.uni.push(self.sun[1]);
+        self.uni.push(self.sun[2]);
+        self.uni.push(1.0);
+        self.uni.push(SEA);
+        self.uni.push(FOG);
+        self.uni.push(SHADOW_BIAS);
+        self.uni.push(if self.shadows { 1.0 } else { 0.0 });
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(self.uni.as_slice()));
+        self.queue.write_buffer(self.ib, 0, gpu::bytes_of_u32(self.mesh.indices.as_slice()));
+
+        let shadow_view = self.shadow.view();
+        enc.render_pass(PassDesc::depth_only(shadow_view), |pass| {
+            pass.set_pipeline(self.shadow_pipe);
+            pass.set_bind_group(0, self.g_shadow);
+            pass.set_index_buffer(self.ib, IndexFormat::Uint32, 0);
+            for c in self.mesh.chunks.iter() {
+                pass.draw_indexed(c.start..c.start + c.count, 0, 0..1);
+            }
+        });
+        let depth_view = self.depth.view();
+        let sky = gpu::Color::rgba(0.66, 0.77, 0.88, 1.0);
+        enc.render_pass(PassDesc::color(target, sky).with_depth(depth_view), |pass| {
+            pass.set_pipeline(self.terrain_pipe);
+            pass.set_bind_group(0, self.g_terrain);
+            pass.set_index_buffer(self.ib, IndexFormat::Uint32, 0);
+            for c in self.mesh.chunks.iter() {
+                pass.draw_indexed(c.start..c.start + c.count, 0, 0..1);
+            }
+            pass.set_pipeline(self.water_pipe);
+            pass.set_bind_group(0, self.g_water);
+            pass.draw(0..6, 0..1);
+        });
+    }
+
+    // The heightmap as the CPU reads it back (after bake; waits for the GPU).
+    pub fn read_heights(inout self) -> [f32] {
+        gpu::f32s(self.heights.map_read(self.dev))
+    }
+}
+
+// Appends a matrix's 16 floats.
+fn put(v: inout Vec<f32>, m: [f32; 16]) {
+    for x in m.iter() {
+        v.push(x);
+    }
+}

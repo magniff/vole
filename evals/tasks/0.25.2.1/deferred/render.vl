@@ -1,0 +1,274 @@
+// The GPU side: the buffers and textures (made once, in `new_in`), the
+// four pipelines and their bind groups, and the frame's encoding. A frame
+// is `upload` (the uniform, the lights, the tiles' counts cleared), then
+// `scene` (G-buffer, culling, lighting) and `composite` (the picture, or
+// a G-buffer view) into one encoder. Nothing is read back, except by the
+// headless calls `tile_stats` and `shot`.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Compare, Format, IndexFormat, PassDesc, TextureUsage, VertexFormat,
+    VertexLayout};
+use shaders::{COMP, CULL, FRAME, GBUF, LIGHT};
+
+// A tile is TILE x TILE pixels; a tile keeps MAX_PER_TILE lights (more
+// are dropped: the headless run counts them).
+pub const TILE: i64 = 16;
+pub const MAX_PER_TILE: i64 = 256;
+
+// The frame uniform: 48 floats, as the FRAME shader declares it.
+const FRAME_BYTES: i64 = 192;
+
+// The source of a shader: its parts, one after another.
+fn source(parts: [[u8]], gpa: Gpa) -> Buf {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    src
+}
+
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    let src = source(parts, gpa);
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+pub struct Renderer {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub w: i64,
+    pub h: i64,
+    pub tiles_x: i64,
+    pub tiles_y: i64,
+    pub nlights: i64,
+    pub near: f32,
+    pub far: f32,
+    exposure: f32,
+    frame_buf: gpu::Buffer,
+    light_buf: gpu::Buffer,
+    tile_count: gpu::Buffer,
+    tile_lights: gpu::Buffer,
+    tile_count_read: gpu::Buffer,
+    zeros: Vec<u8>,
+    vbuf: gpu::Buffer,
+    ibuf: gpu::Buffer,
+    index_count: i64,
+    albedo: gpu::Texture,
+    normal: gpu::Texture,
+    depth_lin: gpu::Texture,
+    depth_hw: gpu::Texture,
+    hdr: gpu::Texture,
+    target: gpu::Texture,
+    av: gpu::TextureView,
+    nv: gpu::TextureView,
+    dlv: gpu::TextureView,
+    dhv: gpu::TextureView,
+    hv: gpu::TextureView,
+    gbuf: gpu::RenderPipeline,
+    comp: gpu::RenderPipeline,
+    cull: gpu::ComputePipeline,
+    light: gpu::ComputePipeline,
+    g_gbuf: gpu::BindGroup,
+    g_cull: gpu::BindGroup,
+    g_light: gpu::BindGroup,
+    g_comp: gpu::BindGroup,
+}
+
+impl Renderer {
+    // A w x h renderer of the scene `verts` (9 floats a vertex) and `idx`,
+    // with `nlights` lights, on `dev` (its queue `queue`).
+    pub fn new_in(dev: sink gpu::Device, queue: sink gpu::Queue, w: i64, h: i64, nlights: i64,
+        verts: [f32], idx: [u32], gpa: Gpa) -> Result<Renderer, gpu::Error> {
+        let tiles_x = (w + TILE - 1) / TILE;
+        let tiles_y = (h + TILE - 1) / TILE;
+        let tiles = tiles_x * tiles_y;
+        let frame_buf = dev.buffer(FRAME_BYTES, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let light_buf = dev.buffer(nlights * 32, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let tile_count = dev.buffer(tiles * 4,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC);
+        let tile_lights = dev.buffer(tiles * MAX_PER_TILE * 4, BufferUsage::STORAGE);
+        let tile_count_read = dev.buffer(tiles * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var zeros: Vec<u8> = Vec::new_in(gpa);
+        for _ in 0..(tiles * 4) {
+            zeros.push(0);
+        }
+        let vbuf = dev.buffer_init(gpu::bytes_of_f32(verts), BufferUsage::VERTEX);
+        let ibuf = dev.buffer_init(gpu::bytes_of_u32(idx), BufferUsage::INDEX);
+
+        let usage = TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING;
+        let albedo = dev.texture(w, h, Format::Rgba8Unorm, usage: usage);
+        let normal = dev.texture(w, h, Format::Rgba8Unorm, usage: usage);
+        let depth_lin = dev.texture(w, h, Format::R32Float, usage: usage);
+        let depth_hw = dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+        let hdr = dev.texture(w, h, Format::Rgba32Float,
+            usage: TextureUsage::STORAGE_BINDING | TextureUsage::TEXTURE_BINDING);
+        let target = dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let av = albedo.view();
+        let nv = normal.view();
+        let dlv = depth_lin.view();
+        let dhv = depth_hw.view();
+        let hv = hdr.view();
+
+        // the G-buffer: target 0 albedo, 1 normal, 2 linear depth; the
+        // hardware depth test on the side
+        let gsrc = source([FRAME, GBUF][..], gpa);
+        let gshader = dev.shader_wgsl(gsrc.as_slice())?;
+        var gd = gpu::RenderDesc::new(gshader, "gvs", "gfs", Format::Rgba8Unorm);
+        gd.target(Format::Rgba8Unorm);
+        gd.target(Format::R32Float);
+        gd.depth(Format::Depth32Float, Compare::Less, true);
+        var layout = VertexLayout::new(36);
+        layout.attribute(0, VertexFormat::Float32x3, 0);
+        layout.attribute(1, VertexFormat::Float32x3, 12);
+        layout.attribute(2, VertexFormat::Float32x3, 24);
+        gd.vertex_buffer(layout);
+        let gbuf = dev.render_pipeline(gd)?;
+
+        let csrc = source([FRAME, COMP][..], gpa);
+        let cshader = dev.shader_wgsl(csrc.as_slice())?;
+        let comp = dev.render_pipeline(
+            gpu::RenderDesc::new(cshader, "cvs", "cfs", Format::Bgra8Unorm))?;
+
+        let cull = kernel(dev, [FRAME, CULL][..], gpa)?;
+        let light = kernel(dev, [FRAME, LIGHT][..], gpa)?;
+
+        let g_gbuf = dev.bind_group(gbuf.bind_layout(0), [gpu::bind(0, frame_buf)][..]);
+        let g_cull = dev.bind_group(cull.bind_layout(0), [gpu::bind(0, frame_buf),
+            gpu::bind(1, light_buf), gpu::bind(2, tile_count), gpu::bind(3, tile_lights)][..]);
+        let g_light = dev.bind_group(light.bind_layout(0), [gpu::bind(0, frame_buf),
+            gpu::bind(1, light_buf), gpu::bind(2, tile_count), gpu::bind(3, tile_lights),
+            gpu::bind_texture(4, av), gpu::bind_texture(5, nv), gpu::bind_texture(6, dlv),
+            gpu::bind_texture(7, hv)][..]);
+        let g_comp = dev.bind_group(comp.bind_layout(0), [gpu::bind(0, frame_buf),
+            gpu::bind_texture(1, hv), gpu::bind_texture(2, av), gpu::bind_texture(3, nv),
+            gpu::bind_texture(4, dlv)][..]);
+
+        Ok(Renderer {
+            dev: dev, queue: queue, w: w, h: h, tiles_x: tiles_x, tiles_y: tiles_y,
+            nlights: nlights, near: 0.1, far: 80.0, exposure: 1.1,
+            frame_buf: frame_buf, light_buf: light_buf, tile_count: tile_count,
+            tile_lights: tile_lights, tile_count_read: tile_count_read, zeros: zeros,
+            vbuf: vbuf, ibuf: ibuf, index_count: idx.len(),
+            albedo: albedo, normal: normal, depth_lin: depth_lin, depth_hw: depth_hw,
+            hdr: hdr, target: target, av: av, nv: nv, dlv: dlv, dhv: dhv, hv: hv,
+            gbuf: gbuf, comp: comp, cull: cull, light: light,
+            g_gbuf: g_gbuf, g_cull: g_cull, g_light: g_light, g_comp: g_comp,
+        })
+    }
+
+    // The frame's uniform (the camera's view and projection, the sun in
+    // view space, the view mode 0..3), the lights (8 floats each, see
+    // scene.vl's pack_lights), and the tiles' counts cleared.
+    pub fn upload(inout self, view: [f32; 16], proj: [f32; 16], sun: [f32; 3], mode: i64,
+        lights: [f32]) {
+        var fb: [f32; 48] = [0.0; 48];
+        for k in 0..16 {
+            fb[k] = view[k];
+            fb[16 + k] = proj[k];
+        }
+        fb[32] = self.w as f32;
+        fb[33] = self.h as f32;
+        fb[34] = self.tiles_x as f32;
+        fb[35] = self.tiles_y as f32;
+        fb[36] = proj[0];
+        fb[37] = proj[5];
+        fb[38] = self.near;
+        fb[39] = self.far;
+        fb[40] = self.nlights as f32;
+        fb[41] = MAX_PER_TILE as f32;
+        fb[42] = mode as f32;
+        fb[43] = self.exposure;
+        fb[44] = sun[0];
+        fb[45] = sun[1];
+        fb[46] = sun[2];
+        self.queue.write_buffer(self.frame_buf, 0, gpu::bytes_of_f32(fb[..]));
+        self.queue.write_buffer(self.light_buf, 0, gpu::bytes_of_f32(lights));
+        let z = self.zeros.as_slice();
+        self.queue.write_buffer(self.tile_count, 0, z);
+    }
+
+    // The scene: the G-buffer pass, the culling and the lighting (HDR).
+    pub fn scene(self, enc: inout gpu::Encoder) {
+        enc.render_pass(PassDesc::color(self.av).with_color(self.nv).with_color(self.dlv)
+            .with_depth(self.dhv), |pass| {
+            pass.set_pipeline(self.gbuf);
+            pass.set_bind_group(0, self.g_gbuf);
+            pass.set_vertex_buffer(0, self.vbuf);
+            pass.set_index_buffer(self.ibuf, IndexFormat::Uint32);
+            pass.draw_indexed(0..self.index_count, 0, 0..1);
+        });
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.cull);
+            pass.set_bind_group(0, self.g_cull);
+            pass.dispatch(self.tiles_x, self.tiles_y);
+        });
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.light);
+            pass.set_bind_group(0, self.g_light);
+            pass.dispatch(self.tiles_x, self.tiles_y);
+        });
+    }
+
+    // A whole frame: the scene, then the composite into `target`.
+    pub fn record(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        self.scene(&enc);
+        self.composite(&enc, target);
+    }
+
+    pub fn target_view(self) -> gpu::TextureView {
+        self.target.view()
+    }
+
+    // The picture (the lit frame or a G-buffer view) into `target`.
+    pub fn composite(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.comp);
+            pass.set_bind_group(0, self.g_comp);
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // Headless: a whole frame into the target and read back as a PPM.
+    pub fn shot(inout self, gpa: Gpa) -> Buf {
+        let stride = (self.w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * self.h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.scene(&enc);
+        self.composite(&enc, self.target.view());
+        enc.copy_texture_to_buffer(self.target, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{self.w} {self.h}\n255\n", gpa);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+
+    // Headless: the most lights any tile was offered, and how many tiles
+    // were offered more than MAX_PER_TILE (the rest are dropped).
+    pub fn tile_stats(inout self) -> (i64, i64) {
+        var enc = self.dev.encoder();
+        enc.copy_buffer(self.tile_count, 0, self.tile_count_read, 0, self.tiles_x * self.tiles_y * 4);
+        self.queue.submit(enc.finish());
+        let c = gpu::u32s(self.tile_count_read.map_read(self.dev));
+        var most: i64 = 0;
+        var over: i64 = 0;
+        for t in 0..c.len() {
+            let n = c[t] as i64;
+            if n > most {
+                most = n;
+            }
+            if n > MAX_PER_TILE {
+                over += 1;
+            }
+        }
+        (most, over)
+    }
+}

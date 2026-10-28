@@ -1,0 +1,208 @@
+// The check against reference/reference.json (read at run time): the
+// token ids of three prompts, the greedy continuation and the top-10
+// logits at each step, as transformers (float32, CPU) computed them.
+
+use std::num::parse_f32;
+use std::time::monotonic_now;
+use st::{parse_i64, skip_ws};
+use model::Net;
+use tok::Tok;
+
+// The position just after the first occurrence of key at or after from.
+pub fn find_from(s: [u8], from: i64, key: [u8]) -> i64 {
+    var i = from;
+    while i + key.len() <= s.len() {
+        if s[i..i + key.len()] == key {
+            return i + key.len();
+        }
+        i += 1;
+    }
+    panic("reference.json: a key is missing");
+}
+
+// The integers of the array whose '[' is before pos; pos after it.
+pub fn read_ints(s: [u8], pos: inout i64, out: inout Vec<i64>) {
+    skip_ws(s, &pos);
+    loop {
+        skip_ws(s, &pos);
+        if s[pos] == 93 {
+            pos += 1;
+            break;
+        }
+        if s[pos] == 44 {
+            pos += 1;
+            continue;
+        }
+        out.push(parse_i64(s, &pos));
+    }
+}
+
+// The floats of the array whose '[' is before pos; pos after it.
+pub fn read_floats(s: [u8], pos: inout i64, out: inout Vec<f32>) {
+    skip_ws(s, &pos);
+    loop {
+        skip_ws(s, &pos);
+        if s[pos] == 93 {
+            pos += 1;
+            break;
+        }
+        if s[pos] == 44 {
+            pos += 1;
+            continue;
+        }
+        let st = pos;
+        while s[pos] == 45 || s[pos] == 43 || s[pos] == 46 || s[pos] == 101 || s[pos] == 69
+            || (s[pos] >= 48 && s[pos] <= 57) {
+            pos += 1;
+        }
+        out.push(parse_f32(s[st..pos]).unwrap());
+    }
+}
+
+// The ids of the k largest values of xs, largest first.
+pub fn top_k(xs: [f32], k: i64, gpa: Gpa) -> Vec<i64> {
+    var best: Vec<i64> = Vec::new_in(gpa);
+    for i in 0..xs.len() {
+        if best.len() < k {
+            best.push(i);
+            var j = best.len() - 1;
+            while j > 0 && xs[best.get(j - 1)] < xs[best.get(j)] {
+                best.swap(j - 1, j);
+                j -= 1;
+            }
+        } else if xs[i] > xs[best.get(k - 1)] {
+            best.set(k - 1, i);
+            var j = k - 1;
+            while j > 0 && xs[best.get(j - 1)] < xs[best.get(j)] {
+                best.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+    best
+}
+
+// The chat template of one user message, thinking off (the template's
+// generation prompt with an empty think block).
+pub fn chat_text(msg: [u8], gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("<|im_start|>user\n");
+    b.push_str(msg);
+    b.push_str("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    b
+}
+
+// Greedy argmax of xs.
+pub fn argmax(xs: [f32]) -> i64 {
+    var best: i64 = 0;
+    for i in 1..xs.len() {
+        if xs[i] > xs[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+pub fn now_secs() -> f64 {
+    monotonic_now().as_secs_f64()
+}
+
+// Runs the three reference prompts; prints how close the GPU is.
+pub fn run_check(net: inout Net, t: Tok, gpa: Gpa) -> i32 {
+    let txt = std::fs::read_in("/Users/magniff/workspace/tachyon/evals/tasks/0.25.2.1/qwen35/reference/reference.json", gpa).unwrap();
+    let s = txt.as_slice();
+    var at = find_from(s, 0, "\"prompts\"");
+    let chat = chat_text("Write a haiku about a GPU.", gpa);
+    let texts = ["The capital of France is", "def fibonacci(n):\n    ", chat.as_slice()];
+    let names = ["plain", "code", "chat"];
+    var all_ok = true;
+    for pi in 0..3 {
+        var ref_ids: Vec<i64> = Vec::new_in(gpa);
+        at = find_from(s, at, "\"ids\": [");
+        read_ints(s, &at, &ref_ids);
+        let ids = t.encode(texts[pi], gpa);
+        var same = ids.len() == ref_ids.len();
+        for i in 0..ids.len() {
+            if same && ids.get(i) != ref_ids.get(i) {
+                same = false;
+            }
+        }
+        // the reference's steps: top-10 ids and logits per step
+        var top_ids: Vec<Vec<i64>> = Vec::new_in(gpa);
+        var top_vals: Vec<Vec<f32>> = Vec::new_in(gpa);
+        for _ in 0..24 {
+            var ti: Vec<i64> = Vec::new_in(gpa);
+            at = find_from(s, at, "\"top_ids\": [");
+            read_ints(s, &at, &ti);
+            var tv: Vec<f32> = Vec::new_in(gpa);
+            at = find_from(s, at, "\"top_logits\": [");
+            read_floats(s, &at, &tv);
+            top_ids.push(ti);
+            top_vals.push(tv);
+        }
+        var greedy: Vec<i64> = Vec::new_in(gpa);
+        at = find_from(s, at, "\"greedy_ids\": [");
+        read_ints(s, &at, &greedy);
+
+        // our run: the prompt, then 24 greedy tokens
+        net.reset();
+        var pos: i64 = 0;
+        let t0 = now_secs();
+        for i in 0..ids.len() {
+            net.step(ids.get(i), i, i + 1 == ids.len());
+            pos = i + 1;
+        }
+        var lg = net.logits();
+        let prefill = now_secs() - t0;
+        var matched: i64 = 0;
+        var worst: f64 = 0.0;
+        var first_bad: i64 = -1;
+        let t1 = now_secs();
+        for k in 0..24 {
+            let next = argmax(lg);
+            if next == greedy.get(k) {
+                matched += 1;
+            } else if first_bad < 0 {
+                first_bad = k;
+            }
+            for j in 0..10 {
+                let id = top_ids[k].get(j);
+                let d = (lg[id] as f64 - top_vals[k].get(j) as f64).abs();
+                if d > worst {
+                    worst = d;
+                }
+            }
+            if k < 23 {
+                net.step(next, pos, true);
+                pos += 1;
+                lg = net.logits();
+            }
+        }
+        let decode = now_secs() - t1;
+        if !same || matched != 24 {
+            all_ok = false;
+        }
+        let idv = if same { "match" } else { "DIFFER" };
+        println(f"{names[pi]}: {ids.len()} prompt tokens, ids {idv}; greedy {matched}/24 match; top-10 logits within {worst:.4} of the reference (its values are rounded to 1e-4)");
+        println(f"  prefill {ids.len()} tokens in {prefill:.3} s ({ids.len() as f64 / prefill:.1} tok/s); decode 24 tokens in {decode:.3} s ({24.0 / decode:.1} tok/s)");
+    }
+    if all_ok { 0 } else { 1 }
+}
+
+// Debug: the residual stream of the last token of the code prompt after
+// each layer, as the reference prints it (rms and the first 8 values).
+pub fn run_layers(net: inout Net, t: Tok, text: [u8], gpa: Gpa) {
+    let ids = t.encode(text, gpa);
+    for i in 0..ids.len() - 1 {
+        net.step(ids.get(i), i, false);
+    }
+    let rows = net.step_dbg(ids.get(ids.len() - 1), ids.len() - 1);
+    for k in 0..26 {
+        var ss: f64 = 0.0;
+        for i in 0..1024 {
+            let v = rows[k * 1024 + i] as f64;
+            ss += v * v;
+        }
+        println(f"{k} {(ss / 1024.0).sqrt():.5} {rows[k * 1024]:.5} {rows[k * 1024 + 1]:.5} {rows[k * 1024 + 2]:.5} {rows[k * 1024 + 3]:.5} {rows[k * 1024 + 4]:.5} {rows[k * 1024 + 5]:.5} {rows[k * 1024 + 6]:.5} {rows[k * 1024 + 7]:.5}");
+    }
+}

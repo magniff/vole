@@ -1,0 +1,283 @@
+// sim.vl: the lattice on the GPU. Two copies of the populations (and of the
+// dye) swap roles each step; k says which holds the current state. A step
+// is four kernels in one compute pass: collide, sample (the probe), stream
+// and dye. Nothing is read back during a frame; the mass check and the
+// probe are read only when asked for.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use lattice::initial_f;
+use shaders::{COLLIDE, COMMON, DYE, RENDER, SAMPLE, STREAM};
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub nx: i64,
+    pub ny: i64,
+    // which population and dye copy holds the current state (0 or 1)
+    pub k: i64,
+    // 1/tau; the inflow speed in cells a step; closed walls instead of
+    // inflow and outflow; dye injected at the inlet
+    pub omega: f64,
+    pub u_in: f64,
+    pub closed: bool,
+    pub dye_on: bool,
+    // the view of the picture: 0 speed, 1 vorticity, 2 dye, 3 pressure
+    pub view: i64,
+    // the cell (index y * nx + x) whose vertical speed the probe records
+    pub probe_cell: i64,
+    pub probe: gpu::Buffer,
+    ubuf: gpu::Buffer,
+    f0: gpu::Buffer,
+    f1: gpu::Buffer,
+    dye0: gpu::Buffer,
+    dye1: gpu::Buffer,
+    mask: gpu::Buffer,
+    mac: gpu::Buffer,
+    zeros: Vec<u8>,
+    k_collide: gpu::ComputePipeline,
+    k_stream: gpu::ComputePipeline,
+    k_dye: gpu::ComputePipeline,
+    k_sample: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    g_collide0: gpu::BindGroup,
+    g_collide1: gpu::BindGroup,
+    g_stream0: gpu::BindGroup,
+    g_stream1: gpu::BindGroup,
+    g_dye0: gpu::BindGroup,
+    g_dye1: gpu::BindGroup,
+    g_sample: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+}
+
+// The uniform's twelve words (struct P in shaders.vl). A slot below zero
+// means no sample this step.
+fn pack(nx: i64, ny: i64, omega: f64, u_in: f64, closed: bool, dye_on: bool, probe: i64,
+    slot: i64, view: i64) -> [u32; 12] {
+    var w: [u32; 12] = [0; 12];
+    let closed_n: i64 = if closed { 1 } else { 0 };
+    let dye_n: i64 = if dye_on { 1 } else { 0 };
+    w[0] = nx as u32;
+    w[1] = ny as u32;
+    w[2] = f32_to_bits(omega as f32);
+    w[3] = f32_to_bits(u_in as f32);
+    w[4] = closed_n as u32;
+    w[5] = dye_n as u32;
+    w[6] = probe as u32;
+    w[7] = if slot < 0 { 4294967295 } else { slot as u32 };
+    w[8] = view as u32;
+    w
+}
+
+// A storage buffer that can be copied to, and read back.
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// A compute pipeline from the WGSL made of `parts`.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+// One kernel over nx x ny cells (workgroups of 8 x 8).
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, nx: i64, ny: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch((nx + 7) / 8, (ny + 7) / 8);
+}
+
+// One single-invocation kernel.
+fn once(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch(1);
+}
+
+fn zero(q: inout gpu::Queue, b: gpu::Buffer, z: [u8]) {
+    q.write_buffer(b, 0, z[0..b.size()]);
+}
+
+// The sum of the densities of the fluid cells, from the n-cell populations
+// in f (population i of cell c at i * n + c); mask 1 marks the obstacle.
+fn fluid_mass(dev: gpu::Device, f: inout gpu::Buffer, n: i64, mask: [u32]) -> f64 {
+    let v = gpu::f32s(f.map_read(dev));
+    var total = 0.0;
+    for c in 0..n {
+        if mask[c] == 0 {
+            for i in 0..9 {
+                total += v[i * n + c] as f64;
+            }
+        }
+    }
+    total
+}
+
+impl Sim {
+    // An nx x ny lattice at rest in a stream of speed u_in, drawing into
+    // targets of `format`, with room for `probe_len` probe samples.
+    pub fn new_in(nx: i64, ny: i64, omega: f64, u_in: f64, closed: bool, probe_len: i64,
+        format: Format, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let n = nx * ny;
+        let ubuf = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let f0 = storage(dev, 9 * n * 4);
+        let f1 = storage(dev, 9 * n * 4);
+        let dye0 = storage(dev, n * 16);
+        let dye1 = storage(dev, n * 16);
+        let mask = storage(dev, n * 4);
+        let mac = storage(dev, n * 16);
+        let probe = storage(dev, probe_len * 4);
+        let zeros: Vec<u8> = Vec::filled_in(36 * n + 16, 0, gpa);
+        let init = initial_f(nx, ny, u_in, gpa);
+        queue.write_buffer(f0, 0, gpu::bytes_of_f32(init.as_slice()));
+        zero(&queue, dye0, zeros.as_slice());
+        zero(&queue, dye1, zeros.as_slice());
+        zero(&queue, mask, zeros.as_slice());
+
+        let k_collide = kernel(dev, [COMMON, COLLIDE][..], gpa)?;
+        let k_stream = kernel(dev, [COMMON, STREAM][..], gpa)?;
+        let k_dye = kernel(dev, [COMMON, DYE][..], gpa)?;
+        let k_sample = kernel(dev, [COMMON, SAMPLE][..], gpa)?;
+        var src = Buf::new_in(gpa);
+        src.push_str(COMMON);
+        src.push_str(RENDER);
+        let rshader = dev.shader_wgsl(src.as_slice())?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", format))?;
+
+        let b = gpu::bind;
+        let g_collide0 = dev.bind_group(k_collide.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, mask), b(3, mac)][..]);
+        let g_collide1 = dev.bind_group(k_collide.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, mask), b(3, mac)][..]);
+        let g_stream0 = dev.bind_group(k_stream.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, f1), b(3, mask)][..]);
+        let g_stream1 = dev.bind_group(k_stream.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, f0), b(3, mask)][..]);
+        let g_dye0 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, dye0), b(2, dye1), b(3, mac), b(4, mask)][..]);
+        let g_dye1 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, dye1), b(2, dye0), b(3, mac), b(4, mask)][..]);
+        let g_sample = dev.bind_group(k_sample.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, probe)][..]);
+        let g_render0 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, dye0), b(3, mask)][..]);
+        let g_render1 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, dye1), b(3, mask)][..]);
+
+        Ok(Sim {
+            dev: dev, queue: queue, nx: nx, ny: ny, k: 0, omega: omega, u_in: u_in,
+            closed: closed, dye_on: true, view: 2, probe_cell: 0, probe: probe,
+            ubuf: ubuf, f0: f0, f1: f1, dye0: dye0, dye1: dye1, mask: mask, mac: mac,
+            zeros: zeros, k_collide: k_collide, k_stream: k_stream,
+            k_dye: k_dye, k_sample: k_sample, render: render,
+            g_collide0: g_collide0, g_collide1: g_collide1, 
+            g_stream0: g_stream0, g_stream1: g_stream1,
+            g_dye0: g_dye0, g_dye1: g_dye1, g_sample: g_sample, g_render0: g_render0,
+            g_render1: g_render1,
+        })
+    }
+
+    // The uniform for the next submissions: the view and omega as they are,
+    // and the probe sample slot (below zero: none).
+    pub fn set_params(inout self, slot: i64) {
+        let words = pack(self.nx, self.ny, self.omega, self.u_in, self.closed, self.dye_on,
+            self.probe_cell, slot, self.view);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // The obstacle: one u32 a cell, 1 solid, 0 fluid.
+    pub fn set_mask(inout self, m: [u32]) {
+        self.queue.write_buffer(self.mask, 0, gpu::bytes_of_u32(m));
+    }
+
+    // Back to rest in the stream: the populations at their initial state,
+    // the dye cleared (the obstacle is kept).
+    pub fn reset(inout self, gpa: Gpa) {
+        let init = initial_f(self.nx, self.ny, self.u_in, gpa);
+        self.queue.write_buffer(self.f0, 0, gpu::bytes_of_f32(init.as_slice()));
+        let z = self.zeros.as_slice();
+        zero(&self.queue, self.dye0, z);
+        zero(&self.queue, self.dye1, z);
+        self.k = 0;
+    }
+
+    // One lattice step, encoded into enc: collide, sample, stream, dye.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let k = self.k;
+        let nx = self.nx;
+        let ny = self.ny;
+        enc.compute_pass(|pass| {
+            if k == 0 {
+                run(&pass, self.k_collide, self.g_collide0, nx, ny);
+            } else {
+                run(&pass, self.k_collide, self.g_collide1, nx, ny);
+            }
+            once(&pass, self.k_sample, self.g_sample);
+            if k == 0 {
+                run(&pass, self.k_stream, self.g_stream0, nx, ny);
+                run(&pass, self.k_dye, self.g_dye0, nx, ny);
+            } else {
+                run(&pass, self.k_stream, self.g_stream1, nx, ny);
+                run(&pass, self.k_dye, self.g_dye1, nx, ny);
+            }
+        });
+        self.k = 1 - k;
+    }
+
+    // The total density of the fluid cells (the obstacle's excluded), summed
+    // from the populations; waits for the GPU.
+    pub fn total_mass(inout self, mask: [u32]) -> f64 {
+        let n = self.nx * self.ny;
+        if self.k == 0 {
+            fluid_mass(self.dev, &self.f0, n, mask)
+        } else {
+            fluid_mass(self.dev, &self.f1, n, mask)
+        }
+    }
+
+    // The picture of the current state into target (the view as set).
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let k = self.k;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.render);
+            if k == 0 {
+                pass.set_bind_group(0, self.g_render0);
+            } else {
+                pass.set_bind_group(0, self.g_render1);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // The picture as a binary PPM (P6) of w x h pixels, waiting for the GPU.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

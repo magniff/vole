@@ -1,0 +1,269 @@
+// The simulation and its picture, all on the GPU: the agents (x, y, heading
+// and a pad: 16 bytes each), the deposit (one atomic u32 a cell), two
+// trail maps (f32 a cell, ping-pong), the parameters (one uniform). A step
+// is one submission of four compute dispatches: clear, agents, diffuse;
+// nothing is read back. Reading back (trail_total, agents_inside,
+// snapshot_in) waits for the GPU and is for the checks and the shots.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use shaders::{AGENTS, CLEAR, COMMON, DIFFUSE, INIT, RENDER};
+use tune::{Pointer, Tune};
+
+// The agents' speed, in map cells a step.
+const SPEED: f32 = 1.0;
+
+// Agents are dispatched in one row of workgroups of 64 (at most 65535 of
+// them), and the map's cells in one row of 256 (so the side is at most 2048).
+pub const MAX_AGENTS: i64 = 4194240;
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub w: i64,
+    pub h: i64,
+    pub n: i64,
+    // the number of steps taken: the random seed of the next one
+    pub step_no: i64,
+    // which trail is the newest (read by the picture and the agents)
+    pub cur: i64,
+    ubuf: gpu::Buffer,
+    agents: gpu::Buffer,
+    dep: gpu::Buffer,
+    trail_a: gpu::Buffer,
+    trail_b: gpu::Buffer,
+    zeros: Vec<f32>,
+    k_init: gpu::ComputePipeline,
+    k_clear: gpu::ComputePipeline,
+    k_agents: gpu::ComputePipeline,
+    k_diffuse: gpu::ComputePipeline,
+    k_render: gpu::RenderPipeline,
+    g_init: gpu::BindGroup,
+    g_clear: gpu::BindGroup,
+    g_agents0: gpu::BindGroup,
+    g_agents1: gpu::BindGroup,
+    g_diffuse0: gpu::BindGroup,
+    g_diffuse1: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+}
+
+// The WGSL of `parts` joined, as one source.
+fn source(parts: [[u8]], gpa: Gpa) -> Buf {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    src
+}
+
+fn compute(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    let shader = dev.shader_wgsl(source(parts, gpa).as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// The uniform as 16 words: n, w, h, seed; then the twelve floats of
+// Par in COMMON's order (the last two are padding).
+#[inline]
+fn pack(t: Tune, p: Pointer, n: i64, w: i64, h: i64, seed: i64) -> [u32; 16] {
+    var words: [u32; 16] = [0; 16];
+    words[0] = n as u32;
+    words[1] = w as u32;
+    words[2] = h as u32;
+    words[3] = seed as u32;
+    let fs: [f32; 12] = [
+        t.sensor_angle, t.sensor_dist, t.turn, SPEED, t.decay, t.diffuse, p.x, p.y, p.radius,
+        p.amount, 0.0, 0.0,
+    ];
+    for i in 0..12 {
+        words[4 + i] = f32_to_bits(fs[i]);
+    }
+    words
+}
+
+impl Sim {
+    // A w x h map with n agents, drawing into targets of `format`. Call
+    // reset before the first step.
+    pub fn new_in(w: i64, h: i64, n: i64, format: Format, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = w * h;
+        let ubuf = dev.buffer(64, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let agents = dev.buffer(n * 16, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ);
+        let dep = storage(dev, cells * 4);
+        let trail_a = storage(dev, cells * 4);
+        let trail_b = storage(dev, cells * 4);
+        var zeros: Vec<f32> = Vec::new_in(gpa);
+        for _ in 0..cells {
+            zeros.push(0.0);
+        }
+        let k_init = compute(dev, [COMMON, INIT][..], gpa)?;
+        let k_clear = compute(dev, [CLEAR][..], gpa)?;
+        let k_agents = compute(dev, [COMMON, AGENTS][..], gpa)?;
+        let k_diffuse = compute(dev, [COMMON, DIFFUSE][..], gpa)?;
+        let rshader = dev.shader_wgsl(source([COMMON, RENDER][..], gpa).as_slice())?;
+        let k_render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", format))?;
+        let g_init = dev.bind_group(k_init.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, agents)][..]);
+        let g_clear = dev.bind_group(k_clear.bind_layout(0), [gpu::bind(0, dep)][..]);
+        let g_agents0 = dev.bind_group(k_agents.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, agents), gpu::bind(2, trail_a), gpu::bind(3, dep)][..]);
+        let g_agents1 = dev.bind_group(k_agents.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, agents), gpu::bind(2, trail_b), gpu::bind(3, dep)][..]);
+        let g_diffuse0 = dev.bind_group(k_diffuse.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_a), gpu::bind(2, dep), gpu::bind(3, trail_b)][..]);
+        let g_diffuse1 = dev.bind_group(k_diffuse.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_b), gpu::bind(2, dep), gpu::bind(3, trail_a)][..]);
+        let g_render0 = dev.bind_group(k_render.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, trail_a)][..]);
+        let g_render1 = dev.bind_group(k_render.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, trail_b)][..]);
+        Ok(Sim {
+            dev: dev, queue: queue, w: w, h: h, n: n, step_no: 0, cur: 0,
+            ubuf: ubuf, agents: agents, dep: dep, trail_a: trail_a, trail_b: trail_b, zeros: zeros,
+            k_init: k_init, k_clear: k_clear, k_agents: k_agents, k_diffuse: k_diffuse,
+            k_render: k_render, g_init: g_init, g_clear: g_clear, g_agents0: g_agents0,
+            g_agents1: g_agents1, g_diffuse0: g_diffuse0, g_diffuse1: g_diffuse1,
+            g_render0: g_render0, g_render1: g_render1,
+        })
+    }
+
+    // Empty trails, and every agent at a random place with a random heading.
+    pub fn reset(inout self) {
+        let z = gpu::bytes_of_f32(self.zeros.as_slice());
+        self.queue.write_buffer(self.trail_a, 0, z);
+        self.queue.write_buffer(self.trail_b, 0, z);
+        self.step_no += 1;
+        let words = pack(Tune::new(), Pointer::none(), self.n, self.w, self.h, self.step_no);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        let groups = (self.n + 63) / 64;
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.k_init);
+            pass.set_bind_group(0, self.g_init);
+            pass.dispatch(groups);
+        });
+        self.queue.submit(enc.finish());
+        self.cur = 0;
+    }
+
+    // One step: the parameters written, then clear, agents and diffuse in
+    // one submission. The newest trail is `cur` afterwards.
+    pub fn step(inout self, t: Tune, p: Pointer) {
+        let words = pack(t, p, self.n, self.w, self.h, self.step_no);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        let cur = self.cur;
+        let cell_groups = (self.w * self.h + 255) / 256;
+        let agent_groups = (self.n + 63) / 64;
+        let gx = (self.w + 7) / 8;
+        let gy = (self.h + 7) / 8;
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.k_clear);
+            pass.set_bind_group(0, self.g_clear);
+            pass.dispatch(cell_groups);
+            pass.set_pipeline(self.k_agents);
+            if cur == 0 {
+                pass.set_bind_group(0, self.g_agents0);
+            } else {
+                pass.set_bind_group(0, self.g_agents1);
+            }
+            pass.dispatch(agent_groups);
+            pass.set_pipeline(self.k_diffuse);
+            if cur == 0 {
+                pass.set_bind_group(0, self.g_diffuse0);
+            } else {
+                pass.set_bind_group(0, self.g_diffuse1);
+            }
+            pass.dispatch(gx, gy);
+        });
+        self.queue.submit(enc.finish());
+        self.cur = 1 - cur;
+        self.step_no += 1;
+    }
+
+    // The mean resultant length of the agents' headings (waits for the
+    // GPU): near 0 when the headings are spread, near 1 when they agree.
+    pub fn heading_spread(inout self) -> f64 {
+        let a = gpu::f32s(self.agents.map_read(self.dev));
+        var sx = 0.0;
+        var sy = 0.0;
+        for i in 0..self.n {
+            let h = a[i * 4 + 2] as f64;
+            sx += h.cos();
+            sy += h.sin();
+        }
+        (sx * sx + sy * sy).sqrt() / self.n as f64
+    }
+
+    // The picture of the newest trail into `target`.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let k = self.cur;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.k_render);
+            if k == 0 {
+                pass.set_bind_group(0, self.g_render0);
+            } else {
+                pass.set_bind_group(0, self.g_render1);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // The sum of the newest trail (waits for the GPU).
+    pub fn trail_total(inout self) -> f64 {
+        var s = 0.0;
+        if self.cur == 0 {
+            for x in gpu::f32s(self.trail_a.map_read(self.dev)) {
+                s += x as f64;
+            }
+        } else {
+            for x in gpu::f32s(self.trail_b.map_read(self.dev)) {
+                s += x as f64;
+            }
+        }
+        s
+    }
+
+    // The agents whose position is inside the map (waits for the GPU).
+    pub fn agents_inside(inout self) -> i64 {
+        let a = gpu::f32s(self.agents.map_read(self.dev));
+        let w = self.w as f32;
+        let h = self.h as f32;
+        var k = 0;
+        for i in 0..self.n {
+            let x = a[i * 4];
+            let y = a[i * 4 + 1];
+            if x >= 0.0 && x < w && y >= 0.0 && y < h {
+                k += 1;
+            }
+        }
+        k
+    }
+
+    // The picture as a binary PPM of w x h pixels (waits for the GPU).
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

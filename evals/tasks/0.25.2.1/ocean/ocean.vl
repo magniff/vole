@@ -1,0 +1,353 @@
+// The ocean: the Phillips spectrum h0 (CPU, once, from a seed), and on the
+// GPU each frame its time evolution and a 2-D inverse FFT (Stockham,
+// log2 n stages per axis, ping-pong between two buffers), then the lit
+// mesh drawn 3 x 3 tiles of the patch. Shaders: shaders.vl.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Compare, Format, PassDesc, RenderDesc};
+use shaders::{EVAL, RENDER, STAGE};
+
+const TAU: f64 = 6.283185307179586;
+const G: f64 = 9.81;
+
+// The wave number of FFT index i of n (the upper half is negative), rad/m.
+pub fn wave(i: i64, n: i64, length: f64) -> f64 {
+    let m = if i < n / 2 { i } else { i - n };
+    TAU * m as f64 / length
+}
+
+// The Phillips spectrum P(k) for a wind of `wind` m/s along +x.
+pub fn phillips(kx: f64, kz: f64, wind: f64, amp: f64) -> f64 {
+    let k2 = kx * kx + kz * kz;
+    if k2 == 0.0 {
+        return 0.0;
+    }
+    let lw = wind * wind / G;
+    let k = k2.sqrt();
+    let c = kx / k;
+    let damp = (-1.0 / (k2 * lw * lw)).exp();
+    amp * damp * c * c / (k2 * k2)
+}
+
+// xorshift64, the seed of the spectrum's noise.
+pub struct Rng {
+    pub s: u64,
+}
+
+impl Rng {
+    // A uniform number in (0, 1).
+    pub fn next(inout self) -> f64 {
+        self.s ^= self.s << 13;
+        self.s ^= self.s >> 7;
+        self.s ^= self.s << 17;
+        ((self.s >> 11) as f64 + 0.5) / 9007199254740992.0
+    }
+}
+
+// Two independent standard normals (Box-Muller).
+pub fn gauss2(rng: inout Rng) -> (f64, f64) {
+    let u1 = rng.next();
+    let u2 = rng.next();
+    let r = (-2.0 * u1.ln()).sqrt();
+    let t = TAU * u2;
+    (r * t.cos(), r * t.sin())
+}
+
+// h0(k) on the n x n grid, row-major, as interleaved (re, im):
+// sqrt(P/2) times Gaussian noise. Mirror: h0(-k) is an independent draw.
+pub fn spectrum_h0(n: i64, length: f64, wind: f64, amp: f64, seed: u64, gpa: Gpa) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new_in(gpa);
+    var rng = Rng { s: seed };
+    for row in 0..n {
+        for col in 0..n {
+            let p = phillips(wave(col, n, length), wave(row, n, length), wind, amp);
+            let scale = (p / 2.0).sqrt();
+            let (g1, g2) = gauss2(&rng);
+            out.push(scale * g1);
+            out.push(scale * g2);
+        }
+    }
+    out
+}
+
+// The height spectrum H(k, t) on the same grid, the formula the GPU runs:
+// h0(k) e^{iwt} + conj(h0(-k)) e^{-iwt}, w = sqrt(g |k|).
+pub fn height_spectrum(h0: [f64], n: i64, length: f64, t: f64, gpa: Gpa) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new_in(gpa);
+    for row in 0..n {
+        for col in 0..n {
+            let idx = row * n + col;
+            let midx = ((n - row) % n) * n + (n - col) % n;
+            let kx = wave(col, n, length);
+            let kz = wave(row, n, length);
+            let w = (G * (kx * kx + kz * kz).sqrt()).sqrt();
+            let c = (w * t).cos();
+            let s = (w * t).sin();
+            let ar = h0[2 * idx];
+            let ai = h0[2 * idx + 1];
+            let mr = h0[2 * midx];
+            let mi = h0[2 * midx + 1];
+            out.push(ar * c - ai * s + mr * c - mi * s);
+            out.push(ar * s + ai * c - mi * c - mr * s);
+        }
+    }
+    out
+}
+
+// The camera: an orbit around (tx, 0, tz) at `dist`, `yaw` around y and
+// `pitch` above the water (radians).
+pub struct Camera {
+    pub yaw: f64,
+    pub pitch: f64,
+    pub dist: f64,
+    pub tx: f64,
+    pub tz: f64,
+}
+
+impl Camera {
+    pub fn start() -> Camera {
+        Camera { yaw: 1.5708, pitch: 0.14, dist: 40.0, tx: 0.0, tz: 0.0 }
+    }
+
+    pub fn eye(self) -> [f64; 3] {
+        let cp = self.pitch.cos();
+        [
+            self.tx + self.dist * cp * self.yaw.cos(),
+            self.dist * self.pitch.sin(),
+            self.tz + self.dist * cp * self.yaw.sin(),
+        ]
+    }
+
+    // The uniforms the render shader reads (shaders.vl RENDER's R).
+    pub fn uniforms(self, aspect: f64, lambda: f64, n: i64, length: f64) -> [f32; 28] {
+        let e = self.eye();
+        let target = [self.tx, 0.0, self.tz];
+        let fwd = unit3(sub3(target, e));
+        let right = unit3(cross3(fwd, [0.0, 1.0, 0.0]));
+        let up = cross3(right, fwd);
+        let sun = unit3([-0.5, 0.16, -0.85]);
+        let focal = 1.0 / (0.5 * 50.0 * TAU / 360.0).tan();
+        let near = 0.3;
+        let far = 4000.0;
+        [
+            e[0] as f32, e[1] as f32, e[2] as f32, 0.0,
+            right[0] as f32, right[1] as f32, right[2] as f32, 0.0,
+            up[0] as f32, up[1] as f32, up[2] as f32, 0.0,
+            fwd[0] as f32, fwd[1] as f32, fwd[2] as f32, 0.0,
+            focal as f32, aspect as f32, near as f32, far as f32,
+            sun[0] as f32, sun[1] as f32, sun[2] as f32, 0.0,
+            lambda as f32, length as f32, n as f32, 0.0,
+        ]
+    }
+}
+
+pub fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+pub fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+pub fn unit3(a: [f64; 3]) -> [f64; 3] {
+    let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    [a[0] / l, a[1] / l, a[2] / l]
+}
+
+// The GPU side: the spectrum and its transform in buffers a and b (three
+// fields of n x n complex each), the pipelines and the bind groups made
+// once. The field after a transform is in `a`.
+pub struct Ocean {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub n: i64,
+    pub length: f64,
+    pub stages: i64,
+    pub a: gpu::Buffer,
+    b: gpu::Buffer,
+    eval_u: gpu::Buffer,
+    eval_pipe: gpu::ComputePipeline,
+    eval_group: gpu::BindGroup,
+    stage_pipe: gpu::ComputePipeline,
+    stage_u: Vec<gpu::Buffer>,
+    stage_groups: Vec<gpu::BindGroup>,
+    render_u: gpu::Buffer,
+    render_pipe: gpu::RenderPipeline,
+    render_group: gpu::BindGroup,
+}
+
+impl Ocean {
+    // h0: the spectrum (interleaved re, im, n x n). Fails if the GPU has no
+    // compute or render, or a shader is rejected.
+    pub fn new_in(n: i64, length: f64, h0: [f64], format: Format, gpa: Gpa) -> Result<Ocean, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let nn = n * n;
+        var h0f: Vec<f32> = Vec::new_in(gpa);
+        for x in h0 {
+            h0f.push(x as f32);
+        }
+        let h0_buf = dev.buffer_init(gpu::bytes_of_f32(h0f.as_slice()), BufferUsage::STORAGE);
+        var zeros: Vec<f32> = Vec::new_in(gpa);
+        for _ in 0..(6 * nn) {
+            zeros.push(0.0);
+        }
+        let a = dev.buffer_init(gpu::bytes_of_f32(zeros.as_slice()),
+            BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ);
+        let b = dev.buffer(6 * nn * 4, BufferUsage::STORAGE);
+        let eval_u = dev.buffer(16, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let eval_shader = dev.shader_wgsl(EVAL)?;
+        let eval_pipe = dev.compute_pipeline(eval_shader, "evolve")?;
+        let eval_group = dev.bind_group(eval_pipe.bind_layout(0),
+            [gpu::bind(0, eval_u), gpu::bind(1, h0_buf), gpu::bind(2, a)][..]);
+        var l = 0;
+        var m = 1;
+        while m < n {
+            m = m * 2;
+            l = l + 1;
+        }
+        let stage_shader = dev.shader_wgsl(STAGE)?;
+        let stage_pipe = dev.compute_pipeline(stage_shader, "stage")?;
+        var stage_u: Vec<gpu::Buffer> = Vec::new_in(gpa);
+        var stage_groups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+        // the inverse's 2l stages first, then the forward's
+        for kind in 0..2 {
+            let inv: i64 = if kind == 0 { 1 } else { 0 };
+            for t in 0..(2 * l) {
+                let dir: i64 = if t < l { 0 } else { 1 };
+                let ns: i64 = 1 << (t % l);
+                let ub = dev.buffer_init(
+                    gpu::bytes_of_u32([n as u32, ns as u32, dir as u32, inv as u32][..]),
+                    BufferUsage::UNIFORM);
+                // even stages read a and write b, odd stages the other way
+                let g = if t % 2 == 0 {
+                    dev.bind_group(stage_pipe.bind_layout(0),
+                        [gpu::bind(0, ub), gpu::bind(1, a), gpu::bind(2, b)][..])
+                } else {
+                    dev.bind_group(stage_pipe.bind_layout(0),
+                        [gpu::bind(0, ub), gpu::bind(1, b), gpu::bind(2, a)][..])
+                };
+                stage_u.push(ub);
+                stage_groups.push(g);
+            }
+        }
+        let render_shader = dev.shader_wgsl(RENDER)?;
+        var desc = RenderDesc::new(render_shader, "vs", "fs", format);
+        desc.depth(Format::Depth32Float, Compare::Less, true);
+        let render_pipe = dev.render_pipeline(desc)?;
+        let render_u = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let render_group = dev.bind_group(render_pipe.bind_layout(0),
+            [gpu::bind(0, render_u), gpu::bind(1, a)][..]);
+        Ok(Ocean {
+            dev: dev, queue: queue, n: n, length: length, stages: l, a: a, b: b,
+            eval_u: eval_u, eval_pipe: eval_pipe, eval_group: eval_group,
+            stage_pipe: stage_pipe, stage_u: stage_u, stage_groups: stage_groups,
+            render_u: render_u, render_pipe: render_pipe, render_group: render_group,
+        })
+    }
+
+    // Records the time evolution at `time` and the inverse transform.
+    pub fn simulate(inout self, enc: inout gpu::Encoder, time: f64) {
+        self.queue.write_buffer(self.eval_u, 0,
+            gpu::bytes_of_f32([time as f32, self.length as f32, self.n as f32, 0.0][..]));
+        let pipe = self.eval_pipe;
+        let group = self.eval_group;
+        let g = (self.n + 7) / 8;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.dispatch(g, g);
+        });
+        self.transform(&enc, true);
+    }
+
+    // The 2-D FFT of the three fields in `a`, in place (the result is in
+    // `a`): inverse (unnormalised, +i) or forward (-i).
+    pub fn transform(self, enc: inout gpu::Encoder, inverse: bool) {
+        let base = if inverse { 0 } else { 2 * self.stages };
+        let n = self.n;
+        let gx = (n / 2 + 7) / 8;
+        let gy = (n + 7) / 8;
+        let pipe = self.stage_pipe;
+        for t in 0..(2 * self.stages) {
+            let group = self.stage_groups[base + t];
+            enc.compute_pass(|pass| {
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, group);
+                pass.dispatch(gx, gy, 3);
+            });
+        }
+    }
+
+    // The camera and the wave's choppiness (lambda) for the next draw.
+    pub fn set_view(inout self, cam: Camera, aspect: f64, lambda: f64) {
+        let u = cam.uniforms(aspect, lambda, self.n, self.length);
+        self.queue.write_buffer(self.render_u, 0, gpu::bytes_of_f32(u[..]));
+    }
+
+    // The mesh into `target` (cleared to the sky) with `depth` as its depth.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView, depth: gpu::TextureView) {
+        let pipe = self.render_pipe;
+        let group = self.render_group;
+        let verts = 6 * self.n * self.n;
+        enc.render_pass(PassDesc::color(target, gpu::Color::rgba(0.62, 0.74, 0.86, 1.0))
+            .with_depth(depth), |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.draw(0..verts, 0..9);
+        });
+    }
+}
+
+#[test]
+fn phillips_is_zero_at_zero_and_damped_at_high_k() {
+    assert_eq(phillips(0.0, 0.0, 8.0, 1.0), 0.0);
+    let lo = phillips(0.2, 0.0, 8.0, 1.0);
+    let hi = phillips(200.0, 0.0, 8.0, 1.0);
+    if !(lo > 0.0 && hi < lo) {
+        panic("phillips: must be positive and fall off at high k");
+    }
+}
+
+#[test]
+fn wave_numbers_fold_into_negative_half() {
+    let n = 8;
+    assert_eq(wave(0, n, 100.0), 0.0);
+    if !(wave(1, n, 100.0) > 0.0 && wave(7, n, 100.0) < 0.0 && wave(4, n, 100.0) < 0.0) {
+        panic("wave: indices above n/2 must be negative");
+    }
+    if wave(7, n, 100.0) != -wave(1, n, 100.0) {
+        panic("wave: index n-1 must mirror index 1");
+    }
+}
+
+#[test]
+fn stockham_stage_writes_every_index_once() {
+    // the index map of one stage, for n = 8, every ns: a permutation
+    let n = 8;
+    var ns = 1;
+    while ns < n {
+        var seen: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        for tid in 0..(n / 2) {
+            let idx = tid & (ns - 1);
+            let j = 2 * tid - idx;
+            seen[j] = seen[j] + 1;
+            seen[j + ns] = seen[j + ns] + 1;
+        }
+        for i in 0..n {
+            assert_eq(seen[i], 1);
+        }
+        ns = ns * 2;
+    }
+}
+
+#[test]
+fn rng_is_in_the_open_unit_interval() {
+    var rng = Rng { s: 88172645463325252 };
+    for _ in 0..1000 {
+        let x = rng.next();
+        if !(x > 0.0 && x < 1.0) {
+            panic("rng: outside (0, 1)");
+        }
+    }
+}

@@ -1,0 +1,274 @@
+// The numbers and the CPU side of sph: the constants, the start state,
+// the box's tilt and view, and the checks the GPU's sort, prefix sum and
+// density are compared with. Nothing here touches the GPU.
+
+// The lattice of particles at the start, and the grid: the tank is
+// BOX_W x BOX_H metres; the fluid fills its bottom with a lattice of
+// COLS x ROWS particles, SPACING apart.
+pub const COLS: i64 = 400;
+pub const ROWS: i64 = 256;
+pub const N: i64 = 102400;
+pub const SPACING: f64 = 0.005;
+pub const BOX_W: f64 = 2.0;
+pub const BOX_H: f64 = 1.4;
+// The smoothing length, and the grid's cell side (both H).
+pub const H: f64 = 0.015;
+pub const RHO0: f64 = 1000.0;
+// p = STIFF (rho - RHO0): a sound speed of 15 m/s.
+pub const STIFF: f64 = 225.0;
+pub const MU: f64 = 0.005;
+pub const GRAVITY: f64 = 9.81;
+// The largest substep: the CFL bound 0.25 H / c.
+pub const SIM_DT: f64 = 2.5e-4;
+pub const VMAX: f64 = 6.0;
+pub const RESTITUTION: f64 = 0.2;
+// The stirring force while the mouse is held: strength (1/s), radius (m).
+pub const STIR_K: f64 = 40.0;
+pub const STIR_R: f64 = 0.08;
+pub const TILT_MAX: f64 = 0.9;
+// The drawn particle's radius, in spacings.
+pub const RADIUS_SPACINGS: f64 = 0.85;
+
+pub fn mass() -> f64 {
+    RHO0 * SPACING * SPACING
+}
+
+// The number of cells across a length of the box (the grid's side is H).
+pub fn cells_across(len: f64) -> i64 {
+    (len / H).ceil() as i64
+}
+
+// A count of cells rounded up to whole workgroups of 256 (the scan's
+// tiles); the padding cells stay empty.
+pub fn padded(cells: i64) -> i64 {
+    (cells + 255) / 256 * 256
+}
+
+// The start state: particle k at column k % COLS, row k / COLS of the
+// lattice, its first row 0.02 m above the floor. Packed x0, y0, x1, ...
+pub fn lattice(gpa: Gpa) -> Vec<f32> {
+    var out: Vec<f32> = Vec::new_in(gpa);
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            out.push(((c as f64 + 0.5) * SPACING) as f32);
+            out.push((0.02 + (r as f64 + 0.5) * SPACING) as f32);
+        }
+    }
+    out
+}
+
+// The gravity in the box's frame when the box is tilted by `tilt` (radians,
+// counter-clockwise on the screen): world gravity is (0, -g) on the screen.
+pub fn gravity_box(tilt: f64) -> (f64, f64) {
+    (-GRAVITY * tilt.sin(), -GRAVITY * tilt.cos())
+}
+
+// Pixels per metre at which the tilted box fits the window (with a margin).
+pub fn fit_scale(px_w: f64, px_h: f64, tilt: f64) -> f64 {
+    let c = tilt.cos().abs();
+    let s = tilt.sin().abs();
+    let bw = c * BOX_W + s * BOX_H;
+    let bh = s * BOX_W + c * BOX_H;
+    (px_w / bw).min(px_h / bh) * 0.92
+}
+
+// A window pixel (from the top-left) to a point of the box, in metres.
+// The box's centre is the window's centre.
+pub fn to_box(px: f64, py: f64, px_w: f64, px_h: f64, tilt: f64) -> (f64, f64) {
+    let scale = fit_scale(px_w, px_h, tilt);
+    let dx = (px - px_w / 2.0) / scale;
+    let dy = (px_h / 2.0 - py) / scale;
+    let c = tilt.cos();
+    let s = tilt.sin();
+    (BOX_W / 2.0 + c * dx + s * dy, BOX_H / 2.0 - s * dx + c * dy)
+}
+
+// The exclusive prefix sum of xs, n + 1 values (the last one is the total).
+pub fn exclusive_scan(xs: [u32], gpa: Gpa) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new_in(gpa);
+    var run: u32 = 0;
+    for x in xs {
+        out.push(run);
+        run = run + x;
+    }
+    out.push(run);
+    out
+}
+
+// Random-looking small counts for the scan's test (an LCG, so it is the same
+// every run).
+pub fn test_counts(n: i64, gpa: Gpa) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new_in(gpa);
+    var s: u32 = 12345;
+    for _ in 0..n {
+        s = s * 1664525 + 1013904223;
+        out.push((s >> 24) % 9);
+    }
+    out
+}
+
+// The checks of a counting sort, against the particles' cells: counts is
+// the histogram of cell, starts its exclusive prefix sum, order a
+// permutation that lists each cell's particles in starts[c]..starts[c+1].
+// Returns the number of wrong entries, and the first one as text.
+pub fn check_sort(cell: [u32], counts: [u32], starts: [u32], order: [u32], cells: i64,
+    gpa: Gpa) -> (i64, Buf) {
+    var bad: i64 = 0;
+    var first = Buf::new_in(gpa);
+    let n = cell.len();
+    var hist: Vec<u32> = Vec::filled_in(cells, 0u32, gpa);
+    for i in 0..n {
+        hist[cell[i] as i64] = hist[cell[i] as i64] + 1;
+    }
+    for c in 0..cells {
+        if counts[c] != hist[c] {
+            if bad == 0 {
+                first.push_str(f"count of cell {c}: GPU {counts[c]}, CPU {hist[c]}");
+            }
+            bad += 1;
+        }
+    }
+    var run: u32 = 0;
+    for c in 0..cells {
+        if starts[c] != run {
+            if bad == 0 {
+                first.push_str(f"start of cell {c}: GPU {starts[c]}, CPU {run}");
+            }
+            bad += 1;
+        }
+        run = run + hist[c];
+    }
+    if starts[cells] != run || run != n as u32 {
+        bad += 1;
+    }
+    var seen: Vec<bool> = Vec::filled_in(n as i64, false, gpa);
+    for k in 0..n {
+        let j = order[k] as i64;
+        if j >= n as i64 || seen[j] {
+            if bad == 0 {
+                first.push_str(f"order[{k}] = {j}: not a permutation");
+            }
+            bad += 1;
+        } else {
+            seen[j] = true;
+        }
+    }
+    // each slot k of cell c holds a particle of cell c
+    for c in 0..cells {
+        for k in starts[c]..starts[c + 1] {
+            let j = order[k as i64] as i64;
+            if j < n as i64 && cell[j] as i64 != c {
+                if bad == 0 {
+                    first.push_str(f"order[{k}] = {j} is in cell {cell[j]}, not {c}");
+                }
+                bad += 1;
+            }
+        }
+    }
+    (bad, first)
+}
+
+// The mean and the spread of a density field over the particles.
+pub fn mean(xs: [f32]) -> f64 {
+    var s = 0.0;
+    for x in xs {
+        s += x as f64;
+    }
+    if xs.len() == 0 { 0.0 } else { s / xs.len() as f64 }
+}
+
+// How many particles (of the packed x, y pairs) are outside the box or not
+// finite.
+pub fn escaped(xy: [f32]) -> i64 {
+    var bad: i64 = 0;
+    var i: i64 = 0;
+    while i + 1 < xy.len() as i64 {
+        let x = xy[i] as f64;
+        let y = xy[i + 1] as f64;
+        if !(x >= 0.0 && x <= BOX_W && y >= 0.0 && y <= BOX_H) {
+            bad += 1;
+        }
+        i += 2;
+    }
+    bad
+}
+
+#[test]
+fn lattice_has_n_particles_inside_the_box(gpa: Gpa) {
+    let xy = lattice(gpa);
+    assert_eq(xy.len() as i64, 2 * N);
+    assert_eq(escaped(xy.as_slice()), 0);
+}
+
+#[test]
+fn mass_gives_the_rest_density_on_the_lattice() {
+    // a lattice particle's share of the rest density: mass / spacing^2
+    assert_eq(mass() / (SPACING * SPACING), RHO0);
+}
+
+#[test]
+fn the_grid_covers_the_box() {
+    let cx = cells_across(BOX_W);
+    let cy = cells_across(BOX_H);
+    assert_eq(cx, 134);
+    assert_eq(cy, 94);
+    assert_eq(padded(cx * cy), 12800);
+}
+
+#[test]
+fn gravity_points_down_when_level_and_turns_with_the_tilt() {
+    let (gx, gy) = gravity_box(0.0);
+    assert_eq(gx, 0.0);
+    assert_eq(gy, -GRAVITY);
+    let (tx, ty) = gravity_box(0.3);
+    // the box is turned by +0.3: gravity in the box has a component along -x
+    assert(tx < 0.0);
+    assert(ty < 0.0);
+    assert((tx * tx + ty * ty - GRAVITY * GRAVITY).abs() < 1e-9);
+}
+
+#[test]
+fn the_window_centre_is_the_box_centre() {
+    let (x, y) = to_box(640.0, 360.0, 1280.0, 720.0, 0.4);
+    assert((x - BOX_W / 2.0).abs() < 1e-9);
+    assert((y - BOX_H / 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn a_tilted_box_still_fits_the_window() {
+    // the box's corner, turned by the tilt and scaled, lies inside the window
+    let s = fit_scale(1280.0, 720.0, 0.9);
+    let c = 0.9_f64.cos();
+    let sn = 0.9_f64.sin();
+    let x = (c * BOX_W / 2.0 + sn * BOX_H / 2.0) * s;
+    let y = (sn * BOX_W / 2.0 + c * BOX_H / 2.0) * s;
+    assert(x <= 640.0);
+    assert(y <= 360.0);
+}
+
+#[test]
+fn exclusive_scan_is_the_running_total(gpa: Gpa) {
+    let xs: [u32] = [1, 2, 0, 3];
+    let out = exclusive_scan(xs, gpa);
+    assert_eq(out.len() as i64, 5);
+    assert_eq(out[0], 0);
+    assert_eq(out[1], 1);
+    assert_eq(out[2], 3);
+    assert_eq(out[3], 3);
+    assert_eq(out[4], 6);
+}
+
+#[test]
+fn check_sort_accepts_a_correct_sort_and_names_a_wrong_one(gpa: Gpa) {
+    // 4 particles in 3 cells: cells 2, 0, 2, 1
+    let cell: [u32] = [2, 0, 2, 1];
+    let counts: [u32] = [1, 1, 2];
+    let starts: [u32] = [0, 1, 2, 4];
+    let order: [u32] = [1, 3, 0, 2];
+    let (bad, _) = check_sort(cell, counts, starts, order, 3, gpa);
+    assert_eq(bad, 0);
+    let wrong: [u32] = [1, 0, 3, 2];
+    let (bad2, msg) = check_sort(cell, counts, starts, wrong, 3, gpa);
+    assert(bad2 > 0);
+    assert(msg.len() > 0);
+}
