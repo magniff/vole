@@ -11,7 +11,7 @@ per-frame image readback.
 From the repository root:
 
 ```sh
-target/volec -O2 examples/pathtrace/main.vl -o pathtrace
+target/volec -O2 examples/gpu/pathtrace/main.vl -o pathtrace
 ./pathtrace
 ```
 
@@ -149,7 +149,7 @@ checks and optional PPM output:
 Checks cover non-empty changing output, decreasing local pixel noise for
 progressive scenes, and exact reproduction of sample one after reset. Diagnostic
 modes intentionally have a static first-hit image and skip the noise-decrease
-assertion. `target/volec test examples/pathtrace/main.vl` also runs the Vole
+assertion. `target/volec test examples/gpu/pathtrace/main.vl` also runs the Vole
 state/clamping/default-restoration and high-DPI sizing tests.
 
 ## Reproducible benchmark

@@ -1556,7 +1556,10 @@ unroller would make of it: its work only, without checks or the loop's
 own instructions. `v.iter().map(|x| x * 3).sum()` and the dot product
 run 2.5 times faster scalar, unrolled by 4 with 4 accumulators, than as
 the 0.10 vector loop. Tiny bodies (at most 16 instructions) over lanes
-of 4 bytes or more run 4 copies per vector iteration (2 before). On
+of 4 bytes or more run 4 copies per vector iteration (2 before); the
+cost model weighs 4, 2 and 1 copies, never 3 (0.25.2: it weighed 3 too,
+and `trips & -(U*VF)` then rounded 510 trips of 3 copies of 4 lanes
+to 500, which the vector loop's `!=` exit never met). On
 x86-64, a 64-bit vector comparison costs as one done lane by lane.
 
 **Pairs of loads and stores** (AArch64). Instruction selection's

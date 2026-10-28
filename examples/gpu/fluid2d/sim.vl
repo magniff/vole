@@ -1,0 +1,497 @@
+// The simulation and its picture, all on the GPU: the buffers (made once,
+// in `new_in`), a compute pipeline and bind groups per kernel, and the
+// render pipeline. A frame is `set_params`, then `step` and `draw` into
+// one encoder: nothing is read back and nothing is allocated.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use font::GLYPHS;
+use shaders::{
+    ADVECT_DYE, ADVECT_VEL, BLOOM, BLUR, BLUR_X, BLUR_Y, COMMON, CONFINE, CURL, DIVERGENCE, JACOBI,
+    MEAN, PROJECT, RENDER, SAMPLE_DYE, SAMPLE_VEL, SOURCES,
+};
+use ui::{COLS, ROWS};
+
+// A stroke of the mouse: from (x0, y0) to (x1, y1) in cells, a push of
+// (fx, fy) cells per second, and dye of colour (r, g, b) (amount 0: none).
+pub struct Splat {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub fx: f32,
+    pub fy: f32,
+    pub radius: f32,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub amount: f32,
+}
+
+impl Splat {
+    pub fn none() -> Splat {
+        Splat {
+            x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, fx: 0.0, fy: 0.0, radius: 1.0, r: 0.0, g: 0.0,
+            b: 0.0,
+            amount: 0.0,
+        }
+    }
+}
+
+// What a step and a frame use (the shaders' `Params`).
+pub struct Params {
+    // seconds a step
+    pub dt: f32,
+    // the demo jets' clock, in seconds
+    pub time: f32,
+    pub vorticity: f32,
+    // what is kept of the dye and of the velocity each step
+    pub dye_keep: f32,
+    pub vel_keep: f32,
+    // the demo jets, 0 (off) to 1
+    pub emit: f32,
+    // the jets' speed, in grid heights a second
+    pub jet_speed: f32,
+    // 0 dye, 1 velocity, 2 pressure, 3 curl
+    pub view: i64,
+    pub bloom: f32,
+    pub shade: f32,
+    pub splats: [Splat; 2],
+    pub n_splats: i64,
+    // the overlay: where its text starts and a font pixel's size, in
+    // pixels; shown or not; the brush's colour for its swatch
+    pub ui_x: f32,
+    pub ui_y: f32,
+    pub ui_px: f32,
+    pub ui_shown: bool,
+    pub ui_cols: i64,
+    pub ui_rows: i64,
+    pub brush: (f32, f32, f32),
+}
+
+impl Params {
+    pub fn new() -> Params {
+        Params {
+            dt: 1.0 / 60.0, time: 0.0, vorticity: 10.0, dye_keep: 1.0, vel_keep: 1.0, emit: 1.0,
+            jet_speed: 0.55, view: 0, bloom: 0.8, shade: 1.0, splats: [Splat::none(); 2],
+            n_splats: 0, ui_x: 0.0, ui_y: 0.0, ui_px: 2.0, ui_shown: false, ui_cols: 0, ui_rows: 0,
+            brush: (1.0, 1.0, 1.0),
+        }
+    }
+}
+
+// The numbers the headless check prints.
+pub struct Measure {
+    // the root mean square of the divergence before and after the last
+    // step's projection (cells per second, per cell), and the largest
+    // after it
+    pub div_before: f64,
+    pub div_after: f64,
+    pub div_max: f64,
+    // the dye's total (r + g + b over the cells)
+    pub dye: f64,
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // cells across and down
+    pub w: i64,
+    pub h: i64,
+    // Jacobi iterations a step (even: the pressure ends in p0)
+    pub iters: i64,
+    // which dye buffer holds the current dye
+    pub parity: i64,
+    // the view of the last set_params
+    view: i64,
+    ubuf: gpu::Buffer,
+    u0: gpu::Buffer,
+    v0: gpu::Buffer,
+    u1: gpu::Buffer,
+    v1: gpu::Buffer,
+    p0: gpu::Buffer,
+    p1: gpu::Buffer,
+    div: gpu::Buffer,
+    div2: gpu::Buffer,
+    curl: gpu::Buffer,
+    dye0: gpu::Buffer,
+    dye1: gpu::Buffer,
+    glow0: gpu::Buffer,
+    glow1: gpu::Buffer,
+    glyphs: gpu::Buffer,
+    text: gpu::Buffer,
+    pmean: gpu::Buffer,
+    k_advect: gpu::ComputePipeline,
+    k_curl: gpu::ComputePipeline,
+    k_confine: gpu::ComputePipeline,
+    k_div: gpu::ComputePipeline,
+    k_jacobi: gpu::ComputePipeline,
+    k_project: gpu::ComputePipeline,
+    k_dye: gpu::ComputePipeline,
+    k_bloom: gpu::ComputePipeline,
+    k_blur_x: gpu::ComputePipeline,
+    k_blur_y: gpu::ComputePipeline,
+    k_mean: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    g_advect: gpu::BindGroup,
+    g_curl: gpu::BindGroup,
+    g_confine: gpu::BindGroup,
+    g_div: gpu::BindGroup,
+    g_div_after: gpu::BindGroup,
+    g_jac0: gpu::BindGroup,
+    g_jac1: gpu::BindGroup,
+    g_project: gpu::BindGroup,
+    // g_dyeK advects dyeK into the other; g_bloomK and g_renderK read dyeK
+    g_dye0: gpu::BindGroup,
+    g_dye1: gpu::BindGroup,
+    g_bloom0: gpu::BindGroup,
+    g_bloom1: gpu::BindGroup,
+    g_blur_x: gpu::BindGroup,
+    g_blur_y: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+    g_mean: gpu::BindGroup,
+    // zeros for `reset`, as long as the longest buffer
+    zeros: Vec<u8>,
+}
+
+// A compute pipeline from the shader made of `parts`.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// One kernel over nx x ny threads (workgroups of 8 x 8).
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, nx: i64, ny: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch((nx + 7) / 8, (ny + 7) / 8);
+}
+
+fn zero(q: inout gpu::Queue, b: gpu::Buffer, z: [u8]) {
+    q.write_buffer(b, 0, z[0..b.size()]);
+}
+
+fn rms(xs: [f32]) -> f64 {
+    var s = 0.0;
+    for x in xs {
+        s += x as f64 * x as f64;
+    }
+    if xs.len() == 0 { 0.0 } else { sqrt(s / xs.len() as f64) }
+}
+
+// Newton's square root (std has none without C; a few steps from a
+// good start are exact to f64's precision for these sums).
+fn sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    var r = if x > 1.0 { x / 2.0 } else { 1.0 };
+    for _ in 0..64 {
+        r = 0.5 * (r + x / r);
+    }
+    r
+}
+
+// The shaders' `Params` as 52 words: four u32s, twelve f32s, the two
+// splats (three vec4<f32> each), then the overlay's three vec4<f32>.
+#[pure]
+fn pack(p: Params, w: i64, h: i64, sw: i64, sh: i64) -> [u32; 52] {
+    var words: [u32; 52] = [0; 52];
+    words[0] = w as u32;
+    words[1] = h as u32;
+    words[2] = p.n_splats as u32;
+    words[3] = p.view as u32;
+    let fs: [f32; 12] = [
+        p.dt, p.time, p.vorticity, p.dye_keep, p.vel_keep, p.emit, sw as f32, sh as f32, p.bloom,
+        p.shade, p.jet_speed, 0.0,
+    ];
+    for i in 0..12 {
+        words[4 + i] = f32_to_bits(fs[i]);
+    }
+    for k in 0..2 {
+        let s = p.splats[k];
+        let v: [f32; 12] = [
+            s.x0, s.y0, s.x1, s.y1, s.fx, s.fy, s.radius, 0.0, s.r, s.g, s.b, s.amount,
+        ];
+        for i in 0..12 {
+            words[16 + k * 12 + i] = f32_to_bits(v[i]);
+        }
+    }
+    let (r, g, b) = p.brush;
+    let ui: [f32; 12] = [
+        p.ui_x, p.ui_y, p.ui_px, if p.ui_shown { 1.0 } else { 0.0 }, p.ui_cols as f32,
+        p.ui_rows as f32, COLS as f32, 0.0, r, g, b, 0.0,
+    ];
+    for i in 0..12 {
+        words[40 + i] = f32_to_bits(ui[i]);
+    }
+    words
+}
+
+impl Sim {
+    // A w x h grid at rest, on the system's GPU, drawing into targets of
+    // `format`.
+    pub fn new_in(w: i64, h: i64, iters: i64, format: Format, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = w * h;
+        let gw = (w + 3) / 4;
+        let gh = (h + 3) / 4;
+        let ubuf = dev.buffer(208, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let u0 = storage(dev, (w + 1) * h * 4);
+        let v0 = storage(dev, w * (h + 1) * 4);
+        let u1 = storage(dev, (w + 1) * h * 4);
+        let v1 = storage(dev, w * (h + 1) * 4);
+        let p0 = storage(dev, cells * 4);
+        let p1 = storage(dev, cells * 4);
+        let div = storage(dev, cells * 4);
+        let div2 = storage(dev, cells * 4);
+        let curl = storage(dev, cells * 4);
+        let dye0 = storage(dev, cells * 16);
+        let dye1 = storage(dev, cells * 16);
+        let glow0 = storage(dev, gw * gh * 16);
+        let glow1 = storage(dev, gw * gh * 16);
+        let glyphs = dev.buffer_init(gpu::bytes_of_u32(GLYPHS[..]),
+            BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let text = storage(dev, COLS * ROWS * 4);
+        let pmean = storage(dev, 16);
+
+        let k_advect = kernel(dev, [COMMON, SAMPLE_VEL, SOURCES, ADVECT_VEL][..], gpa)?;
+        let k_curl = kernel(dev, [COMMON, CURL][..], gpa)?;
+        let k_confine = kernel(dev, [COMMON, CONFINE][..], gpa)?;
+        let k_div = kernel(dev, [COMMON, DIVERGENCE][..], gpa)?;
+        let k_jacobi = kernel(dev, [COMMON, JACOBI][..], gpa)?;
+        let k_project = kernel(dev, [COMMON, PROJECT][..], gpa)?;
+        let k_dye = kernel(dev, [COMMON, SAMPLE_VEL, SOURCES, SAMPLE_DYE, ADVECT_DYE][..], gpa)?;
+        let k_bloom = kernel(dev, [COMMON, BLOOM][..], gpa)?;
+        let k_blur_x = kernel(dev, [COMMON, BLUR_X, BLUR][..], gpa)?;
+        let k_blur_y = kernel(dev, [COMMON, BLUR_Y, BLUR][..], gpa)?;
+        let k_mean = kernel(dev, [COMMON, MEAN][..], gpa)?;
+        var rsrc = Buf::new_in(gpa);
+        for p in [COMMON, SAMPLE_VEL, SAMPLE_DYE, RENDER] {
+            rsrc.push_str(p);
+        }
+        let rshader = dev.shader_wgsl(rsrc.as_slice())?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", format))?;
+
+        let b = gpu::bind;
+        let g_advect = dev.bind_group(k_advect.bind_layout(0),
+            [b(0, ubuf), b(1, u0), b(2, v0), b(3, u1), b(4, v1)][..]);
+        let g_curl = dev.bind_group(k_curl.bind_layout(0),
+            [b(0, ubuf), b(1, u1), b(2, v1), b(3, curl)][..]);
+        let g_confine = dev.bind_group(k_confine.bind_layout(0),
+            [b(0, ubuf), b(1, curl), b(2, u1), b(3, v1)][..]);
+        let g_div = dev.bind_group(k_div.bind_layout(0),
+            [b(0, ubuf), b(1, u1), b(2, v1), b(3, div)][..]);
+        let g_div_after = dev.bind_group(k_div.bind_layout(0),
+            [b(0, ubuf), b(1, u0), b(2, v0), b(3, div2)][..]);
+        let g_jac0 = dev.bind_group(k_jacobi.bind_layout(0),
+            [b(0, ubuf), b(1, p0), b(2, div), b(3, p1)][..]);
+        let g_jac1 = dev.bind_group(k_jacobi.bind_layout(0),
+            [b(0, ubuf), b(1, p1), b(2, div), b(3, p0)][..]);
+        let g_project = dev.bind_group(k_project.bind_layout(0),
+            [b(0, ubuf), b(1, u1), b(2, v1), b(3, p0), b(4, u0), b(5, v0)][..]);
+        let g_dye0 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, u0), b(2, v0), b(3, dye0), b(4, dye1)][..]);
+        let g_dye1 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, u0), b(2, v0), b(3, dye1), b(4, dye0)][..]);
+        let g_bloom0 = dev.bind_group(k_bloom.bind_layout(0),
+            [b(0, ubuf), b(1, dye0), b(2, glow0)][..]);
+        let g_bloom1 = dev.bind_group(k_bloom.bind_layout(0),
+            [b(0, ubuf), b(1, dye1), b(2, glow0)][..]);
+        let g_blur_x = dev.bind_group(k_blur_x.bind_layout(0),
+            [b(0, ubuf), b(1, glow0), b(2, glow1)][..]);
+        let g_blur_y = dev.bind_group(k_blur_y.bind_layout(0),
+            [b(0, ubuf), b(1, glow1), b(2, glow0)][..]);
+        let g_render0 = dev.bind_group(render.bind_layout(0),
+            [
+                b(0, ubuf), b(1, dye0), b(2, glow0), b(3, u0), b(4, v0), b(5, p0), b(6, curl),
+                b(7, glyphs), b(8, text), b(9, pmean),
+            ][..]);
+        let g_render1 = dev.bind_group(render.bind_layout(0),
+            [
+                b(0, ubuf), b(1, dye1), b(2, glow0), b(3, u0), b(4, v0), b(5, p0), b(6, curl),
+                b(7, glyphs), b(8, text), b(9, pmean),
+            ][..]);
+        let g_mean = dev.bind_group(k_mean.bind_layout(0), [b(0, ubuf), b(1, p0), b(2, pmean)][..]);
+        Ok(Sim {
+            dev: dev, queue: queue, w: w, h: h, iters: (iters + 1) / 2 * 2, parity: 0, view: 0,
+            ubuf: ubuf,
+            u0: u0, v0: v0, u1: u1, v1: v1, p0: p0, p1: p1, div: div, div2: div2, curl: curl,
+            dye0: dye0, dye1: dye1, glow0: glow0, glow1: glow1, glyphs: glyphs, text: text,
+            pmean: pmean, k_advect: k_advect, k_curl: k_curl,
+            k_confine: k_confine, k_div: k_div, k_jacobi: k_jacobi, k_project: k_project,
+            k_dye: k_dye, k_bloom: k_bloom, k_blur_x: k_blur_x, k_blur_y: k_blur_y, k_mean: k_mean,
+            render: render,
+            g_advect: g_advect, g_curl: g_curl, g_confine: g_confine, g_div: g_div,
+            g_div_after: g_div_after, g_jac0: g_jac0, g_jac1: g_jac1, g_project: g_project,
+            g_dye0: g_dye0, g_dye1: g_dye1, g_bloom0: g_bloom0, g_bloom1: g_bloom1,
+            g_blur_x: g_blur_x, g_blur_y: g_blur_y, g_render0: g_render0, g_render1: g_render1,
+            g_mean: g_mean,
+            zeros: Vec::filled_in(cells * 16 + 16, 0u8, gpa),
+        })
+    }
+
+    // The parameters of the next step and frame, for a target of sw x sh
+    // pixels (written in queue order: a frame in flight keeps its own).
+    pub fn set_params(inout self, p: Params, sw: i64, sh: i64) {
+        let words = pack(p, self.w, self.h, sw, sh);
+        self.view = p.view;
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // One step of the simulation, recorded into `enc`: advect the
+    // velocity and add the forces, confine the vorticity, project
+    // (divergence, Jacobi, gradient), advect the dye; then the glow.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let w = self.w;
+        let h = self.h;
+        let gw = (w + 3) / 4;
+        let gh = (h + 3) / 4;
+        let k = self.parity;
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_advect, self.g_advect, w + 1, h + 1);
+            run(&pass, self.k_curl, self.g_curl, w, h);
+            run(&pass, self.k_confine, self.g_confine, w + 1, h + 1);
+            run(&pass, self.k_div, self.g_div, w, h);
+            for i in 0..self.iters {
+                if i % 2 == 0 {
+                    run(&pass, self.k_jacobi, self.g_jac0, w, h);
+                } else {
+                    run(&pass, self.k_jacobi, self.g_jac1, w, h);
+                }
+            }
+            run(&pass, self.k_project, self.g_project, w + 1, h + 1);
+            if k == 0 {
+                run(&pass, self.k_dye, self.g_dye0, w, h);
+                run(&pass, self.k_bloom, self.g_bloom1, gw, gh);
+            } else {
+                run(&pass, self.k_dye, self.g_dye1, w, h);
+                run(&pass, self.k_bloom, self.g_bloom0, gw, gh);
+            }
+            run(&pass, self.k_blur_x, self.g_blur_x, gw, gh);
+            run(&pass, self.k_blur_y, self.g_blur_y, gw, gh);
+        });
+        self.parity = 1 - k;
+    }
+
+    // The overlay's text cells.
+    pub fn set_text(inout self, cells: [u32]) {
+        self.queue.write_buffer(self.text, 0, gpu::bytes_of_u32(cells));
+    }
+
+    // The picture of the current state into `target` (the pressure view
+    // first takes the pressure's mean).
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let k = self.parity;
+        if self.view == 2 {
+            enc.compute_pass(|pass| {
+                pass.set_pipeline(self.k_mean);
+                pass.set_bind_group(0, self.g_mean);
+                pass.dispatch(1);
+            });
+        }
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.render);
+            if k == 0 {
+                pass.set_bind_group(0, self.g_render0);
+            } else {
+                pass.set_bind_group(0, self.g_render1);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // The picture of the current state, w x h pixels, as a binary PPM
+    // (waits for the GPU): the window's screenshot.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+
+    // Everything back to rest: no velocity, no pressure, no dye.
+    pub fn reset(inout self) {
+        let z = self.zeros.as_slice();
+        zero(&self.queue, self.u0, z);
+        zero(&self.queue, self.v0, z);
+        zero(&self.queue, self.u1, z);
+        zero(&self.queue, self.v1, z);
+        zero(&self.queue, self.p0, z);
+        zero(&self.queue, self.p1, z);
+        zero(&self.queue, self.div, z);
+        zero(&self.queue, self.div2, z);
+        zero(&self.queue, self.curl, z);
+        zero(&self.queue, self.dye0, z);
+        zero(&self.queue, self.dye1, z);
+        zero(&self.queue, self.glow0, z);
+        zero(&self.queue, self.glow1, z);
+    }
+
+    // Waits for the GPU and reads the numbers of the headless check: the
+    // divergence the last step's projection started from (still in
+    // `div`) and the one it left (the divergence kernel run again, on the
+    // projected velocity), and the dye's total.
+    pub fn measure(inout self) -> Measure {
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_div, self.g_div_after, self.w, self.h);
+        });
+        self.queue.submit(enc.finish());
+        let before = rms(gpu::f32s(self.div.map_read(self.dev)));
+        let a = gpu::f32s(self.div2.map_read(self.dev));
+        var m = 0.0;
+        for x in a {
+            let y = if x < 0.0 { -x as f64 } else { x as f64 };
+            if y > m {
+                m = y;
+            }
+        }
+        let after = rms(a);
+        Measure { div_before: before, div_after: after, div_max: m, dye: self.dye_total() }
+    }
+
+    // The dye's total, r + g + b over the cells (waits for the GPU).
+    pub fn dye_total(inout self) -> f64 {
+        let _ = self.queue.wait_idle();
+        let d = if self.parity == 0 {
+            gpu::f32s(self.dye0.map_read(self.dev))
+        } else {
+            gpu::f32s(self.dye1.map_read(self.dev))
+        };
+        var s = 0.0;
+        for i in 0..d.len() {
+            if i % 4 != 3 {
+                s += d[i] as f64;
+            }
+        }
+        s
+    }
+}
