@@ -16,7 +16,7 @@
 # (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
 # and tests/runner/run.sh (the runner's own pieces, 0.25.2). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [FILTER...]
 #
 #   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
@@ -36,7 +36,12 @@
 #   -d FORMAT     the compiler's diagnostics: human (the default) or short
 #                 (--diagnostics=short, 0.11); the ERROR and WARNING
 #                 directives are written for human and hold for both
-#   FILTER        run only the cases whose name contains FILTER
+#   -f FILE       (0.25.2) more FILTERs, one per line (# comments)
+#   -l            (0.25.2) list what the FILTERs select, `case NAME` and
+#                 `suite NAME` (`leveled`: it takes -O), and run nothing
+#   FILTER...     run only the cases (and the suites and checks below)
+#                 whose name contains a FILTER; =NAME: only NAME (0.25.2:
+#                 several of them, and -f, select the union)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -162,6 +167,8 @@ JOBS=""
 OUT=prog.o
 DIAG=human
 LINKER=""
+FILTERS=""
+LIST=0
 
 usage() {
     sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -178,15 +185,81 @@ while [ $# -gt 0 ]; do
         -a) OUT=prog.s; shift ;;
         -k) [ $# -ge 2 ] || usage; LINKER=$2; shift 2 ;;
         -d) [ $# -ge 2 ] || usage; DIAG=$2; shift 2 ;;
+        -f)
+            [ $# -ge 2 ] || usage
+            [ -f "$2" ] || { echo "tests/run.sh: no filter file $2" >&2; exit 2; }
+            # (one filter per line; blank lines and # comments skipped)
+            FILTERS="$FILTERS$(sed 's/#.*//; s/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' "$2")
+"
+            shift 2 ;;
+        -l) LIST=1; shift ;;
         -h|--help) usage ;;
         -*)
             # (0.25.2: one line, not the whole usage)
-            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT; tests/run.sh -h for more)" >&2
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l; tests/run.sh -h for more)" >&2
             exit 2 ;;
         *) break ;;
     esac
 done
-FILTER=${1:-}
+# (0.25.2) Several FILTERs, and -f files of them, select the union.
+for f in "$@"; do
+    FILTERS="$FILTERS$f
+"
+done
+FILTER=$(printf '%s' "$FILTERS" | tr '\n' ' ' | sed 's/ $//')
+VOLE_RUN_FILTERS=$FILTERS
+export VOLE_RUN_FILTERS
+
+# The cases, `NAME FILE` per line, in order: every tests/run/*.vl,
+# tests/run/*/main.vl (a program of several modules, 0.5) and
+# tests/examples/*.test (example_NAME).
+all_cases() {
+    for file in "$ROOT"/tests/run/*.vl "$ROOT"/tests/run/*/main.vl "$ROOT"/tests/examples/*.test; do
+        [ -f "$file" ] || continue
+        base=${file##*/}
+        name=${base%.*}
+        case "$file" in
+            *.test) name="example_$name" ;;
+            */main.vl) name=${file%/main.vl}; name=${name##*/} ;;
+        esac
+        echo "$name $file"
+    done
+}
+# The lines of stdin whose first word the filters select (all of them
+# without a filter): a FILTER selects the names containing it, =NAME
+# only NAME.
+select_names() {
+    if [ -z "$VOLE_RUN_FILTERS" ]; then
+        cat
+        return
+    fi
+    awk 'BEGIN {
+            nf = split(ENVIRON["VOLE_RUN_FILTERS"], f, "\n")
+            for (i = 1; i <= nf; i++)
+                if (f[i] ~ /^=/) exact[substr(f[i], 2)] = 1
+                else if (f[i] != "") part[++np] = f[i]
+        }
+        $1 in exact { print; next }
+        { for (i = 1; i <= np; i++) if (index($1, part[i])) { print; next } }'
+}
+# `y` when the filters select the suite or check named $1.
+want() {
+    [ -n "$(echo "$1" | select_names)" ] && echo y
+}
+# The suites and checks besides the cases, each run where `case $(want
+# NAME)` is below (tests/runner/run.sh checks the two agree): what -l
+# lists. LEVELED: the ones that take -O (the others are the same at
+# every level).
+SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
+LEVELED="gpu arch-gen"
+if [ "$LIST" = 1 ]; then
+    all_cases | select_names | awk '{ print "case " $1 }'
+    for s in $SUITES; do
+        [ -z "$(want "$s")" ] && continue
+        case " $LEVELED " in *" $s "*) echo "suite $s leveled" ;; *) echo "suite $s" ;; esac
+    done
+    exit 0
+fi
 case "$DIAG" in
     # (0.15: a compiler whose stderr is not a terminal prints the short
     # form unless told otherwise)
@@ -792,88 +865,73 @@ fi
 
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
-: >"$CASES"
-for file in "$ROOT"/tests/run/*.vl "$ROOT"/tests/run/*/main.vl "$ROOT"/tests/examples/*.test; do
-    [ -f "$file" ] || continue
-    base=${file##*/}
-    name=${base%.*}
-    case "$file" in
-        *.test) name="example_$name" ;;
-        # A program of several modules: a directory with main.vl (0.5).
-        */main.vl) name=${file%/main.vl}; name=${name##*/} ;;
-    esac
-    case "$name" in
-        *"$FILTER"*) ;;
-        *) continue ;;
-    esac
-    echo "$name $file" >>"$CASES"
-done
+all_cases | select_names >"$CASES"
 
 # The tools' suites (below) run alongside the cases: they are serial, and
 # take seconds.
-case query in
-    *"$FILTER"*) "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1 & ;;
+case $(want query) in
+    y) "$ROOT/tests/query/run.sh" -c "$COMPILER" >"$WORK/query.out" 2>&1 & ;;
 esac
-case refactor in
-    *"$FILTER"*) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
+case $(want refactor) in
+    y) "$ROOT/tests/refactor/run.sh" -c "$COMPILER" >"$WORK/refactor.out" 2>&1 & ;;
 esac
-case guide in
-    *"$FILTER"*) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
+case $(want guide) in
+    y) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
 esac
 # (0.25) The book's blocks and sessions (tests/book/run.sh): category "book".
-case book in
-    *"$FILTER"*) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
+case $(want book) in
+    y) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
 esac
-case fmt in
-    *"$FILTER"*) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
+case $(want fmt) in
+    y) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
 esac
-case walkthrough in
-    *"$FILTER"*) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
+case $(want walkthrough) in
+    y) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
 esac
-case wgsl in
-    *"$FILTER"*) "$ROOT/tests/wgsl/run.sh" -c "$COMPILER" >"$WORK/wgsl.out" 2>&1 & ;;
+case $(want wgsl) in
+    y) "$ROOT/tests/wgsl/run.sh" -c "$COMPILER" >"$WORK/wgsl.out" 2>&1 & ;;
 esac
-case voltty in
-    *"$FILTER"*) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
+case $(want voltty) in
+    y) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
 esac
-case own-try in
-    *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
+case $(want own-try) in
+    y) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
 # (0.22) std through the own pass (tests/std/own.sh): category "std-own".
-case std-own in
-    *"$FILTER"*) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
+case $(want std-own) in
+    y) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
 esac
 # (0.25.2) std's moves checked as a program's (tests/std/moves.sh):
 # category "std-moves".
-case std-moves in
-    *"$FILTER"*) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
+case $(want std-moves) in
+    y) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
 esac
 # (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
 # the golden-image comparison, the directives): category "runner".
-case runner in
-    *"$FILTER"*) sh "$ROOT/tests/runner/run.sh" >"$WORK/runner.out" 2>&1 & ;;
+case $(want runner) in
+    y) sh "$ROOT/tests/runner/run.sh" >"$WORK/runner.out" 2>&1 & ;;
 esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
-case lsp in
-    *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
+case $(want lsp) in
+    y) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
 esac
 # (0.25) The link without cc, and its template (tests/link/run.sh):
 # category "link". (macOS and Linux hosts; the target's own)
-case link in
-    *"$FILTER"*) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
+case $(want link) in
+    y) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
 esac
 # (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
 # (skipped elsewhere); category "gpu".
-case gpu in
-    *"$FILTER"*)
+case $(want gpu) in
+    y)
         GPU_OPT=""
         [ -n "$OPT" ] && GPU_OPT="-O ${OPT#-O}"
         "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT >"$WORK/gpu.out" 2>&1 & ;;
 esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks".
-case hooks in
-    *"$FILTER"*)
+case $(want hooks) in
+    y)
         if command -v python3 >/dev/null 2>&1; then
             for t in "$ROOT"/tools/agent-hooks/test-*.py; do python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
         else
@@ -883,8 +941,8 @@ esac
 # (0.19) std::arch's generated programs (tests/arch/gen.sh): every
 # intrinsic against its reference, at run time and folded, at this
 # level (without -O: at -O0 and -O2).
-case arch-gen in
-    *"$FILTER"*)
+case $(want arch-gen) in
+    y)
         arch_levels=${OPT#-O}
         [ -n "$arch_levels" ] || arch_levels=0,2
         "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check >"$WORK/arch-gen.out" 2>&1 & ;;
@@ -892,19 +950,19 @@ esac
 # (0.19 T5) The x86-64 encoder against cc's assembler, byte for byte
 # (tests/arch/enc.sh: every instruction of insn_x86.def, extreme registers,
 # both widths, memory forms).
-case arch-enc in
-    *"$FILTER"*)
+case $(want arch-enc) in
+    y)
         "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" >"$WORK/arch-enc.out" 2>&1 & ;;
 esac
 # The window library and the terminal's renderer (0.23): macOS hosts,
 # for the host's own target only.
 case "$TARGET" in
     aarch64-macos)
-        case voltty_render in
-            *"$FILTER"*) "$ROOT/tests/voltty-render/run.sh" -c "$COMPILER" >"$WORK/voltty_render.out" 2>&1 & ;;
+        case $(want voltty_render) in
+            y) "$ROOT/tests/voltty-render/run.sh" -c "$COMPILER" >"$WORK/voltty_render.out" 2>&1 & ;;
         esac
-        case window in
-            *"$FILTER"*) "$ROOT/tests/window/run.sh" -c "$COMPILER" >"$WORK/window.out" 2>&1 & ;;
+        case $(want window) in
+            y) "$ROOT/tests/window/run.sh" -c "$COMPILER" >"$WORK/window.out" 2>&1 & ;;
         esac ;;
     *) : >"$WORK/voltty_render.out"; : >"$WORK/window.out" ;;
 esac
@@ -954,8 +1012,8 @@ done <"$CASES"
 
 # `volec query` (0.11): tests/query/run.sh (run above), its transcripts
 # and its checks on the compiler's own source; category "query".
-case query in
-    *"$FILTER"*)
+case $(want query) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "query pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -972,8 +1030,8 @@ esac
 
 # `volec lsp` (0.24): tests/lsp/run.sh (run above), its sessions and
 # its check on the compiler's own source; category "lsp".
-case lsp in
-    *"$FILTER"*)
+case $(want lsp) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "lsp pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -989,8 +1047,8 @@ case lsp in
 esac
 
 # The runner's own checks (0.25.2, run above); category "runner".
-case runner in
-    *"$FILTER"*)
+case $(want runner) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "runner pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1007,8 +1065,8 @@ case runner in
 esac
 
 # The link (0.25): tests/link/run.sh (run above); category "link".
-case link in
-    *"$FILTER"*)
+case $(want link) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "link pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1026,8 +1084,8 @@ esac
 # The refactoring tools (0.11: edit, undo, check, fix, lint, same-output,
 # the planning queries): tests/refactor/run.sh (run above); category
 # "refactor".
-case refactor in
-    *"$FILTER"*)
+case $(want refactor) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1046,8 +1104,8 @@ esac
 # `volec guide` (0.13): tests/guide/run.sh (run above), the guide's
 # examples compiled and run, its std section, its budget; category
 # "guide".
-case guide in
-    *"$FILTER"*)
+case $(want guide) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "guide pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1065,8 +1123,8 @@ esac
 # The book (0.25): tests/book/run.sh (run above), every vole block of
 # book/*.md compiled, its outputs, errors and shell sessions as printed;
 # category "book".
-case book in
-    *"$FILTER"*)
+case $(want book) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "book pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1084,8 +1142,8 @@ esac
 # The formatter (0.13): tests/fmt/run.sh (run above): the tree is
 # formatted (`fmt --all --check`), and formatting changes no program;
 # category "fmt".
-case fmt in
-    *"$FILTER"*)
+case $(want fmt) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "fmt pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1101,8 +1159,8 @@ case fmt in
 esac
 
 # category "hooks": the agent hooks' cases, a pass or FAIL line each
-case hooks in
-    *"$FILTER"*)
+case $(want hooks) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "hooks pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1118,8 +1176,8 @@ esac
 # README.md and a case in tests/examples (a .test whose SOURCE is its
 # main.vl); category "example". examples/tools/ (walkthroughs of the
 # tools, some failing to compile on purpose) has its own runner.
-case example_layout in
-    *"$FILTER"*)
+case $(want example_layout) in
+    y)
         for d in "$ROOT"/examples/*/ "$ROOT"/examples/*/*/; do
             [ -d "$d" ] || continue
             ex=${d%/}
@@ -1171,8 +1229,8 @@ esac
 # command `volec examples/.../main.vl -o NAME`, no extra files or flags.
 # Exceptions are only the examples whose point needs more (named with the
 # reason below). Category "example_build"; host target only (it links).
-case example_build in
-    *"$FILTER"*)
+case $(want example_build) in
+    y)
         case "$(uname -s)-$(uname -m)" in
             Darwin-arm64) eb_host=aarch64-macos ;;
             Darwin-x86_64) eb_host=x86_64-macos ;;
@@ -1223,8 +1281,8 @@ esac
 # (0.25.1) The README's example: its first code block under "## An
 # example" is tests/run/readme_example.vl after its header (compiled and
 # run as a case there); category "readme".
-case readme_sync in
-    *"$FILTER"*)
+case $(want readme_sync) in
+    y)
         readme_block=$(awk '/^## An example/ { s = 1; next } s && /^```/ { if (c) exit; c = 1; next } c' "$ROOT/README.md")
         readme_case=$(awk 'h { print; next } /^$/ { h = 1 }' "$ROOT/tests/run/readme_example.vl")
         if [ -n "$readme_block" ] && [ "$readme_block" = "$readme_case" ]; then
@@ -1241,8 +1299,8 @@ esac
 # each examples/tools/NAME/README.md (0.16: and each other
 # examples/GROUP/NAME/README.md with a console block) run as a
 # transcript; category "walkthrough".
-case walkthrough in
-    *"$FILTER"*)
+case $(want walkthrough) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "walkthrough pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1260,8 +1318,8 @@ esac
 # The try: lines of the own pass's diagnostics (0.17): tests/own-try/run.sh
 # (run above), each tests/own-try/NAME/ checked under --values=error and
 # each try: of its first error run; category "own-try".
-case own-try in
-    *"$FILTER"*)
+case $(want own-try) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "own-try pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1278,8 +1336,8 @@ case own-try in
 esac
 # std's own functions through the own pass (0.22, run above): one case,
 # "std-own"; its findings must be in tests/std/own.allowed.
-case std-own in
-    *"$FILTER"*)
+case $(want std-own) in
+    y)
         if grep -q '^pass std-own' "$WORK/std-own.out"; then
             echo "std-own pass" >>"$TALLY"
         else
@@ -1291,8 +1349,8 @@ case std-own in
 esac
 # std's moves outside its containers (0.25.2, run above): one case,
 # "std-moves".
-case std-moves in
-    *"$FILTER"*)
+case $(want std-moves) in
+    y)
         if grep -q '^pass std-moves' "$WORK/std-moves.out"; then
             echo "std-moves pass" >>"$TALLY"
         else
@@ -1305,8 +1363,8 @@ esac
 
 # std::arch's generated programs (0.19): tests/arch/gen.sh (run above);
 # category "arch-gen".
-case arch-gen in
-    *"$FILTER"*)
+case $(want arch-gen) in
+    y)
         wait
         if grep -q '^gen: ok' "$WORK/arch-gen.out"; then
             echo "arch-gen pass" >>"$TALLY"
@@ -1320,8 +1378,8 @@ esac
 
 # The x86-64 encodings (0.19 T5): tests/arch/enc.sh (run above); category
 # "arch-enc".
-case arch-enc in
-    *"$FILTER"*)
+case $(want arch-enc) in
+    y)
         wait
         if grep -q '^enc: ok' "$WORK/arch-enc.out"; then
             echo "arch-enc pass" >>"$TALLY"
@@ -1336,8 +1394,8 @@ esac
 # The shader compiler (0.22, std::gpu::wgsl): tests/wgsl/run.sh (run
 # above), its cases on the interpreter, on Metal (macOS) and through
 # spirv-val where it is installed; category "wgsl".
-case wgsl in
-    *"$FILTER"*)
+case $(want wgsl) in
+    y)
         while read -r status rest; do
             case "$status" in
                 pass) echo "wgsl pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1353,8 +1411,8 @@ case wgsl in
         ;;
 esac
 # std::gpu's suite (run above); category "gpu".
-case gpu in
-    *"$FILTER"*)
+case $(want gpu) in
+    y)
         while read -r status rest; do
             case "$status" in
                 pass) echo "gpu pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1376,8 +1434,8 @@ esac
 # reference; category "voltty_render".
 case "$TARGET" in
     aarch64-macos)
-        case voltty_render in
-            *"$FILTER"*)
+        case $(want voltty_render) in
+            y)
                 while read -r status rest; do
                     case "$status" in
                         pass) echo "voltty_render pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1399,8 +1457,8 @@ esac
 # "window".
 case "$TARGET" in
     aarch64-macos)
-        case window in
-            *"$FILTER"*)
+        case $(want window) in
+            y)
                 while read -r status rest; do
                     case "$status" in
                         pass) echo "window pass" >>"$TALLY"; count=$((count + 1)) ;;
@@ -1422,8 +1480,8 @@ esac
 # reduced cases and seeds against the oracle's recorded dumps, and 20
 # scripts of the differential fuzzer when cargo can build the oracle;
 # category "voltty".
-case voltty in
-    *"$FILTER"*)
+case $(want voltty) in
+    y)
         while read -r status _; do
             case "$status" in
                 pass) echo "voltty pass" >>"$TALLY"; count=$((count + 1)) ;;

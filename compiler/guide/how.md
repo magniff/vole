@@ -43,9 +43,9 @@ in `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the compil
 4. The guide: a sentence and a `tach` example with its `out` block in
    `compiler/guide/std.md` (the API listing at its end is generated);
    `compiler/guide/embed.sh`.
-5. `bootstrap/bootstrap.sh --dev` (the compiler with the new std), then
-   `tests/run.sh std_NAME`, `tests/run.sh -O 0 std_NAME`,
-   `tests/run.sh guide`.
+5. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
+   std), then `tests/run.sh std_NAME guide`, `tests/run.sh -O 0
+   std_NAME`; before reporting, `tests/affected.sh`.
 
 `volec undo` takes a std edit back (and embeds again).
 
@@ -89,8 +89,8 @@ To add an optimization pass.
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
    programs at every level); `--time-passes` for its compile time.
 4. Docs: the module table of `compiler/src/middle/README.md`,
-   `docs/optimizer.md`. Before committing: `bootstrap/gate.sh --quick`
-   (and `bench/run.sh`: no program may get slower).
+   `docs/optimizer.md`. Before reporting: `tests/affected.sh` (and
+   `bench/run.sh`: no program may get slower).
 
 ## add-diagnostic
 
@@ -170,8 +170,8 @@ The guide is `compiler/guide/TOPIC.md` (the topics and their order:
 `out` block with what it prints (an `in` block before it: its stdin; an
 `err` block: it must fail to compile); each is compiled and run.
 `tests/guide/run.sh -f compiler/guide/TOPIC.md` checks one topic as you
-write it; then `compiler/guide/embed.sh`, `bootstrap/bootstrap.sh --dev`
-and `tests/run.sh guide`. The core topic has a budget (the test says).
+write it; then `compiler/guide/embed.sh`, `bootstrap/bootstrap.sh --dev
+--no-suite` and `tests/run.sh guide`. The core topic has a budget (the test says).
 
 ## add-module
 

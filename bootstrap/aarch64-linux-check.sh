@@ -37,6 +37,9 @@
 #                  (tests/valgrind.sh, 0.18.1)
 #   --only STEPS   run these checks of bootstrap/gate.sh instead (after
 #                  the fixpoint), e.g. --only valgrind
+#   --slice "FILTER..."  (0.25.2) run only these tests/run.sh filters
+#                  instead of the checks, at each of --slice-levels
+#                  "0 2" (the default): tests/affected.sh --linux
 #   --cpus N       the container's CPUs (default 8, at most docker's)
 #   --rebuild-image  rebuild the image even if its recipe is unchanged
 #
@@ -57,6 +60,8 @@ OBJCHECK=0
 DEBUGGER=0
 VALGRIND=0
 ONLY=""
+SLICE=""
+SLICE_LEVELS="0 2"
 CPUS=8
 COMPILER=""
 REBUILD_IMAGE=0
@@ -77,6 +82,8 @@ for arg in "$@"; do
         cpus) CPUS=$arg; want=""; continue ;;
         compiler) COMPILER=$arg; want=""; continue ;;
         only) ONLY=$arg; want=""; continue ;;
+        slice) SLICE=$arg; want=""; continue ;;
+        slice_levels) SLICE_LEVELS=$arg; want=""; continue ;;
     esac
     case "$arg" in
         --worktree) WORKTREE=1; rest="$rest --worktree" ;;
@@ -89,12 +96,14 @@ for arg in "$@"; do
         --valgrind) VALGRIND=1 ;;
         --only) want=only ;;
         --only=*) ONLY=${arg#--only=} ;;
+        --slice) want=slice ;;
+        --slice-levels) want=slice_levels ;;
         --cpus) want=cpus ;;
         --cpus=*) CPUS=${arg#--cpus=} ;;
         --compiler) want=compiler ;;
         --compiler=*) COMPILER=${arg#--compiler=} ;;
         --rebuild-image) REBUILD_IMAGE=1 ;;
-        -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -131,7 +140,8 @@ ensure_image "$IMAGE" "$PLATFORM" "$ROOT/bootstrap/ci/linux-aarch64.Dockerfile"
 echo "==> on aarch64-linux, in the container ($CPUS CPUs)" >&2
 tar -C "$SNAP" -c -f - src volec.o | docker run --rm -i --name "$CONTAINER" --cpus "$CPUS" --platform "$PLATFORM" \
     -e CPUS="$CPUS" -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e OBJCHECK="$OBJCHECK" \
-    -e DEBUGGER="$DEBUGGER" -e VALGRIND="$VALGRIND" -e ONLY="$ONLY" "$IMAGE" sh -c '
+    -e DEBUGGER="$DEBUGGER" -e VALGRIND="$VALGRIND" -e ONLY="$ONLY" \
+    -e SLICE="$SLICE" -e SLICE_LEVELS="$SLICE_LEVELS" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -168,6 +178,20 @@ tar -C "$SNAP" -c -f - src volec.o | docker run --rm -i --name "$CONTAINER" --cp
     [ "$got" = "$want" ] || fail md5 "$start" "vole $got, md5sum $want"
     echo "md5 example: $got, same as md5sum"
     row md5 pass $(( $(date +%s) - start )) "the md5 example agrees with md5sum"
+    # (0.25.2) a slice of the suite instead of the checks
+    if [ -n "$SLICE" ]; then
+        bad=0
+        for l in $SLICE_LEVELS; do
+            start=$(date +%s)
+            if sh tests/run.sh -c target/volec -j "$CPUS" -O "$l" $SLICE; then
+                row "slice-O$l" pass $(( $(date +%s) - start )) "tests/run.sh -O$l on the slice"
+            else
+                row "slice-O$l" FAIL $(( $(date +%s) - start )) "tests/run.sh -O$l on the slice"
+                bad=1
+            fi
+        done
+        exit $bad
+    fi
     # The checks, at once.
     steps=suite-O2
     [ "$ALL_LEVELS" = 1 ] && steps="suite-O*"
