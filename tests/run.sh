@@ -22,8 +22,8 @@
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos
 #                 (default: the host; x86_64-macos runs under Rosetta on
 #                 Apple silicon)
-#   -O LEVEL      the optimization level (0, 1 or 2; default: the
-#                 compiler's default)
+#   -O LEVEL      the optimization level (0, 1 or 2, also as -O0; default:
+#                 the compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs, or the
 #                 slots of $VOLE_JOBSERVER); the report is the same for
 #                 every JOBS
@@ -151,12 +151,16 @@ while [ $# -gt 0 ]; do
         -c) [ $# -ge 2 ] || usage; COMPILER=$2; shift 2 ;;
         -t) [ $# -ge 2 ] || usage; TARGET=$2; shift 2 ;;
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
+        -O[0-2]) OPT=$1; shift ;;
         -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
         -a) OUT=prog.s; shift ;;
         -k) [ $# -ge 2 ] || usage; LINKER=$2; shift 2 ;;
         -d) [ $# -ge 2 ] || usage; DIAG=$2; shift 2 ;;
         -h|--help) usage ;;
-        -*) usage ;;
+        -*)
+            # (0.25.2: one line, not the whole usage)
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT; tests/run.sh -h for more)" >&2
+            exit 2 ;;
         *) break ;;
     esac
 done
@@ -384,14 +388,16 @@ check_case() {
         # (0.16) volec compiles the C files and links, as `cc` would
         # shellcheck disable=SC2086
         if ! VOLE_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
-            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            framework_hint "$dir/compile.out" >"$dir/why" \
+                || { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
     elif [ -n "$LINKER" ] && [ -z "$csources" ] && [ "$OUT" = prog.o ]; then
         # (0.25, -k) the compiler links
         # shellcheck disable=SC2086
         if ! "$COMPILER" --target "$TARGET" --linker="$LINKER" $OPT $FLAGS $PFLAGS "$source" -o "$dir/prog" >"$dir/compile.out" 2>&1; then
-            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            framework_hint "$dir/compile.out" >"$dir/why" \
+                || { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
     else
@@ -402,7 +408,8 @@ check_case() {
         fi
         # shellcheck disable=SC2086
         if ! cc_run $LINK_FLAGS -o "$dir/prog" "$dir/$OUT" $csources -lm >"$dir/link.out" 2>&1; then
-            { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
+            framework_hint "$dir/link.out" >"$dir/why" \
+                || { echo "$CC failed:"; cat "$dir/link.out"; } >"$dir/why"
             return 1
         fi
     fi
@@ -454,6 +461,19 @@ check_case() {
         fi
     fi
     return 0
+}
+
+# (0.25.2) A link that failed for the symbols of Apple's frameworks
+# (std::window, std::gpu: Metal, Cocoa, the Objective-C runtime): one line
+# naming the directives that link them, instead of the linker's list.
+# Fails (prints nothing) for any other link error.
+framework_hint() {
+    sym=$(awk '/^Undefined symbols/ { u = 1; next } u && /^  "/ { s = $1; gsub(/[",]/, "", s); print s; exit }' "$1")
+    case "$sym" in
+        _objc_*|_OBJC_*|_CF*|_NS*|_MTL*|_CA*|_CG*|_kCF*|_IOSurface*|_dispatch_*) ;;
+        *) return 1 ;;
+    esac
+    echo "link failed: undefined framework symbols (first: $sym): the program imports std::window or std::gpu; add the directives '// LINK: std::gpu and std::window name the frameworks they link' and '// REQUIRES: metal' to its case (as tests/examples/nes.test has)"
 }
 
 # FIXIMPORTS, FIXUNSAFE: a copy of case $1 (in $2/fix/run, next to a link
