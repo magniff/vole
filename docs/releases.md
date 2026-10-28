@@ -2229,8 +2229,12 @@ depend on it. (0.25.2) `// EXPECT:` lines take holes for what varies
 reference under `tests/golden/`, and a check that cannot run on this
 machine (the window tests while the screen is locked or the display
 asleep) is a `SKIP NAME: why` line and a `skip` column, never a pass;
-the gate lists the SKIP lines under its table. `tests/runner/run.sh`
-checks these pieces of the runner.
+the gate lists the SKIP lines under its table. A case's time limit
+(20 s, `TIMEOUT`, `$VOLE_TEST_TIMEOUT`) is extended by itself again, up
+to 8 times, while the load average is above the CPUs
+(`tests/watchdog.sh`: parallel agents made the litmus cases time out); a
+program killed at its limit fails with `timed out: killed after N s ...`.
+`tests/runner/run.sh` checks these pieces of the runner.
 
 The seed keeps its own tests, run with cargo:
 
