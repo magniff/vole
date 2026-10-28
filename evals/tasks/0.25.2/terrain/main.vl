@@ -1,0 +1,475 @@
+// terrain: a procedural fly-over on the GPU. The heightmap is fractal
+// noise, computed by a compute shader into a buffer the vertex shader
+// reads (no vertex buffer); the mesh is 8 x 8 tiles, each drawn at one of
+// four levels of detail by its distance to the camera; the sun casts
+// shadows from a depth-only pass; fog and materials (grass, rock, snow,
+// sand) by height and slope; water at sea level.
+//
+//   terrain                         the fly-over in a window (Space pauses)
+//   terrain --headless              no window: the checks, printed
+//   terrain --headless --shot F.ppm [--camera N]   one frame (N = 0, 1, 2)
+
+mod mat;
+mod mesh;
+mod shaders;
+
+use std::{env, fs, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{BufferUsage, Compare, Format, IndexFormat, PassDesc, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::Logical;
+
+use mesh::{Mesh, LODS, TILES, TILE, W};
+
+// the sun's direction (towards the sun), normalised by hand
+const SUN: [f32; 3] = [0.4057, 0.7603, 0.5071];
+const FOG: [f32; 3] = [0.70, 0.78, 0.86];
+const FOG_DENSITY: f32 = 0.0045;
+const SHADOW_SIZE: i64 = 2048;
+const SHOT: i64 = 512;
+// the overview camera: the default shot, and the shadow check's frame
+const OV_EYE: [f32; 3] = [-60.0, 110.0, -60.0];
+const OV_TARGET: [f32; 3] = [128.0, 0.0, 128.0];
+
+// Everything on the GPU: one device, the buffers, the textures and the
+// pipelines with their bind groups.
+struct Scene {
+    gpa: Gpa,
+    dev: gpu::Device,
+    queue: gpu::Queue,
+    mesh: Mesh,
+    heights: gpu::Buffer,
+    ubuf: gpu::Buffer,
+    ibuf: gpu::Buffer,
+    noise_pipe: gpu::ComputePipeline,
+    noise_group: gpu::BindGroup,
+    shadow_map: gpu::Texture,
+    shadow_dummy: gpu::Texture,
+    shadow_pipe: gpu::RenderPipeline,
+    shadow_group: gpu::BindGroup,
+    terrain_pipe: gpu::RenderPipeline,
+    terrain_group: gpu::BindGroup,
+    water_pipe: gpu::RenderPipeline,
+    water_group: gpu::BindGroup,
+}
+
+fn setup(dev: sink gpu::Device, queue: sink gpu::Queue, color: Format, mesh: sink Mesh, gpa: Gpa) -> Result<Scene, gpu::Error> {
+    let heights = dev.buffer(W * W * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let ubuf = dev.buffer(48 * 4, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let ibuf = dev.buffer_init(gpu::bytes_of_u32(mesh.indices.as_slice()), BufferUsage::INDEX);
+
+    let noise_shader = dev.shader_wgsl(shaders::NOISE)?;
+    let noise_pipe = dev.compute_pipeline(noise_shader, "main")?;
+    let noise_group = dev.bind_group(noise_pipe.bind_layout(0), [gpu::bind(0, heights)][..]);
+
+    let shadow_map = dev.texture(SHADOW_SIZE, SHADOW_SIZE, Format::Depth32Float,
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING);
+    let shadow_dummy = dev.texture(SHADOW_SIZE, SHADOW_SIZE, Format::R8Unorm, TextureUsage::RENDER_ATTACHMENT);
+
+    var sb = Buf::new_in(gpa);
+    sb.push_str(shaders::UNIFORM);
+    sb.push_str(shaders::GEOM);
+    sb.push_str(shaders::SHADOW);
+    let shadow_shader = dev.shader_wgsl(sb.as_slice())?;
+    var sdesc = gpu::RenderDesc::new(shadow_shader, "vs_shadow", "fs_shadow", Format::R8Unorm);
+    sdesc.depth(Format::Depth32Float, Compare::Less, true);
+    let shadow_pipe = dev.render_pipeline(sdesc)?;
+    let shadow_group = dev.bind_group(shadow_pipe.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, heights)][..]);
+
+    var tb = Buf::new_in(gpa);
+    tb.push_str(shaders::UNIFORM);
+    tb.push_str(shaders::GEOM);
+    tb.push_str(shaders::TERRAIN);
+    let terrain_shader = dev.shader_wgsl(tb.as_slice())?;
+    var tdesc = gpu::RenderDesc::new(terrain_shader, "vs", "fs", color);
+    tdesc.depth(Format::Depth32Float, Compare::Less, true);
+    let terrain_pipe = dev.render_pipeline(tdesc)?;
+    let terrain_group = dev.bind_group(terrain_pipe.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, heights), gpu::bind_texture(2, shadow_map.view())][..]);
+
+    var wb = Buf::new_in(gpa);
+    wb.push_str(shaders::UNIFORM);
+    wb.push_str(shaders::WATER);
+    let water_shader = dev.shader_wgsl(wb.as_slice())?;
+    var wdesc = gpu::RenderDesc::new(water_shader, "vs_water", "fs_water", color);
+    wdesc.blend(gpu::Blend::alpha(), 0);
+    wdesc.depth(Format::Depth32Float, Compare::Less, false);
+    let water_pipe = dev.render_pipeline(wdesc)?;
+    let water_group = dev.bind_group(water_pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+
+    Ok(Scene {
+        gpa: gpa,
+        dev: dev,
+        queue: queue,
+        mesh: mesh,
+        heights: heights,
+        ubuf: ubuf,
+        ibuf: ibuf,
+        noise_pipe: noise_pipe,
+        noise_group: noise_group,
+        shadow_map: shadow_map,
+        shadow_dummy: shadow_dummy,
+        shadow_pipe: shadow_pipe,
+        shadow_group: shadow_group,
+        terrain_pipe: terrain_pipe,
+        terrain_group: terrain_group,
+        water_pipe: water_pipe,
+        water_group: water_group,
+    })
+}
+
+// The noise: one compute pass fills the height buffer.
+fn make_heights(s: inout Scene) {
+    var enc = s.dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(s.noise_pipe);
+        pass.set_bind_group(0, s.noise_group);
+        pass.dispatch(33, 33); // 33 x 8 covers the 257 x 257 grid
+    });
+    s.queue.submit(enc.finish());
+}
+
+fn push_vec4(out: inout Vec<f32>, v: [f32; 3], w: f32) {
+    out.push(v[0]);
+    out.push(v[1]);
+    out.push(v[2]);
+    out.push(w);
+}
+
+// The uniform block: view-projection, sun view-projection, eye, sun,
+// fog, and misc = (time, shadow map size, shadows on, unused).
+fn uniform_block(eye: [f32; 3], target: [f32; 3], aspect: f32, shadows: bool, time: f32, gpa: Gpa) -> Vec<f32> {
+    let view = mat::look_at(eye, target, [0.0, 1.0, 0.0]);
+    let vp = mat::mul(mat::perspective(aspect, 0.5, 1200.0), view);
+    var out: Vec<f32> = Vec::new_in(gpa);
+    mat::push16(&out, vp);
+    mat::push16(&out, mat::sun_view_proj(SUN));
+    push_vec4(&out, eye, 1.0);
+    push_vec4(&out, SUN, 0.0);
+    push_vec4(&out, FOG, FOG_DENSITY);
+    let on: f32 = if shadows { 1.0 } else { 0.0 };
+    push_vec4(&out, [time, SHADOW_SIZE as f32, on], 0.0);
+    out
+}
+
+// One frame: the shadow pass (depth only), then the terrain, then the water.
+// Fills `lods` with each tile's level of detail, from the eye.
+fn render(s: inout Scene, eye: [f32; 3], target: [f32; 3], aspect: f32, shadows: bool, time: f32,
+          color: gpu::TextureView, depth: gpu::TextureView, lods: inout Vec<i64>) {
+    s.queue.write_buffer(s.ubuf, 0, gpu::bytes_of_f32(uniform_block(eye, target, aspect, shadows, time, s.gpa).as_slice()));
+    var spans: Vec<i64> = Vec::new_in(s.gpa);
+    for t in 0..TILES * TILES {
+        let cx = (t % TILES) as f32 * TILE as f32 + 16.0;
+        let cz = (t / TILES) as f32 * TILE as f32 + 16.0;
+        let dx = cx - eye[0];
+        let dz = cz - eye[2];
+        lods[t] = mesh::lod_for(dx * dx + eye[1] * eye[1] + dz * dz);
+        let (a, b) = s.mesh.range(t, lods[t]);
+        spans.push(a);
+        spans.push(b);
+    }
+    let shadow_view = s.shadow_map.view();
+    let dummy_view = s.shadow_dummy.view();
+    let color_view = color;
+    let sp = s.shadow_pipe;
+    let sg = s.shadow_group;
+    let tp = s.terrain_pipe;
+    let tg = s.terrain_group;
+    let wp = s.water_pipe;
+    let wg = s.water_group;
+    let ib = s.ibuf;
+    var enc = s.dev.encoder();
+    enc.render_pass(PassDesc::color(dummy_view).with_depth(shadow_view, 1.0, true), |pass| {
+        pass.set_pipeline(sp);
+        pass.set_bind_group(0, sg);
+        pass.set_index_buffer(ib, IndexFormat::Uint32, 0);
+        for t in 0..TILES * TILES {
+            pass.draw_indexed(spans[2 * t]..spans[2 * t + 1], 0, 0..1);
+        }
+    });
+    enc.render_pass(PassDesc::color(color_view, gpu::Color::rgba(FOG[0] as f64, FOG[1] as f64, FOG[2] as f64, 1.0))
+            .with_depth(depth, 1.0, false), |pass| {
+        pass.set_pipeline(tp);
+        pass.set_bind_group(0, tg);
+        pass.set_index_buffer(ib, IndexFormat::Uint32, 0);
+        for t in 0..TILES * TILES {
+            pass.draw_indexed(spans[2 * t]..spans[2 * t + 1], 0, 0..1);
+        }
+        pass.set_pipeline(wp);
+        pass.set_bind_group(0, wg);
+        pass.draw(0..6, 0..1);
+    });
+    s.queue.submit(enc.finish());
+}
+
+// The fly-over: four waypoints, eye and target, interpolated smoothly.
+fn fly(time: f32) -> ([f32; 3], [f32; 3]) {
+    let eyes: [[f32; 3]; 4] = [[30.0, 42.0, 30.0], [235.0, 30.0, 60.0], [210.0, 50.0, 235.0], [30.0, 32.0, 200.0]];
+    let targets: [[f32; 3]; 4] = [[110.0, 0.0, 120.0], [150.0, 4.0, 150.0], [120.0, 0.0, 140.0], [100.0, 2.0, 110.0]];
+    let seg_len: f32 = 12.0;
+    let p = time / seg_len;
+    let whole = (p / 4.0) as i64 * 4;
+    let x = p - whole as f32;
+    let seg = x as i64;
+    let f = x - seg as f32;
+    let k = f * f * (3.0 - 2.0 * f);
+    let next = (seg + 1) % 4;
+    let e = mat::add3(mat::scale3(eyes[seg], 1.0 - k), mat::scale3(eyes[next], k));
+    let t = mat::add3(mat::scale3(targets[seg], 1.0 - k), mat::scale3(targets[next], k));
+    (e, t)
+}
+
+// The mean and the range of the heights, read back from the GPU.
+fn height_stats(s: inout Scene) -> (f32, f32, f32, i64) {
+    let hs = gpu::f32s(s.heights.map_read(s.dev));
+    var lo: f32 = 1000.0;
+    var hi: f32 = -1000.0;
+    var sum: f32 = 0.0;
+    for i in 0..hs.len() {
+        let v = hs[i];
+        if v < lo {
+            lo = (v as f64) as f32;
+        }
+        if v > hi {
+            hi = (v as f64) as f32;
+        }
+        sum = sum + (v as f64) as f32;
+    }
+    (lo, hi, sum / hs.len() as f32, hs.len())
+}
+
+// Copy a rendered texture back: BGRA rows, SHOT x SHOT.
+fn read_back(s: inout Scene, tex: gpu::Texture, rb: inout gpu::Buffer) -> Vec<u8> {
+    var enc = s.dev.encoder();
+    enc.copy_texture_to_buffer(tex, rb, SHOT * 4);
+    s.queue.submit(enc.finish());
+    var out: Vec<u8> = Vec::new_in(s.gpa);
+    {
+        let px = rb.map_read(s.dev);
+        for i in 0..px.len() {
+            out.push(px[i]);
+        }
+    }
+    rb.unmap(s.dev);
+    out
+}
+
+fn luma(px: Vec<u8>, i: i64) -> f32 {
+    let b = px[i * 4] as f32;
+    let g = px[i * 4 + 1] as f32;
+    let r = px[i * 4 + 2] as f32;
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
+// A binary PPM (P6) of the BGRA pixels.
+fn write_ppm(path: [u8], px: Vec<u8>, gpa: Gpa) -> bool {
+    var out: Vec<u8> = Vec::new_in(gpa);
+    var hdr = Buf::new_in(gpa);
+    hdr.push_str(f"P6\n{SHOT} {SHOT}\n255\n");
+    let hs = hdr.as_slice();
+    for i in 0..hs.len() {
+        out.push(hs[i]);
+    }
+    for i in 0..SHOT * SHOT {
+        out.push(px[i * 4 + 2]);
+        out.push(px[i * 4 + 1]);
+        out.push(px[i * 4]);
+    }
+    match fs::write(path, out.as_slice()) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln(f"terrain: cannot write the image: {e}");
+            false
+        }
+    }
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+fn headless(shot: [u8], camera: i64, gpa: Gpa) -> Result<i32, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var s = setup(dev, queue, Format::Bgra8Unorm, Mesh::new_in(gpa), gpa)?;
+    make_heights(&s);
+    let (lo, hi, mean, count) = height_stats(&s);
+    let noise_ok = lo >= 0.0 && hi <= 1.0 && hi - lo > 0.3;
+    println(f"noise: {count} heights ({W} x {W}), min {lo:.3}, max {hi:.3}, mean {mean:.3}");
+    println(f"  verdict: range inside [0, 1] and spread over 0.3: {verdict(noise_ok)}");
+
+    // the camera of the shot: 0 overview, 1 low over the valley, 2 the fly-over's last waypoint
+    var eye: [f32; 3] = [-60.0, 110.0, -60.0];
+    var target: [f32; 3] = [128.0, 0.0, 128.0];
+    if camera == 1 {
+        eye = [205.0, 14.0, 200.0];
+        target = [120.0, 4.0, 120.0];
+    } else if camera == 2 {
+        eye = [235.0, 30.0, 60.0];
+        target = [150.0, 4.0, 150.0];
+    }
+
+    let color = s.dev.texture(SHOT, SHOT, Format::Bgra8Unorm, TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let depth = s.dev.texture(SHOT, SHOT, Format::Depth32Float, TextureUsage::RENDER_ATTACHMENT);
+    var rb = s.dev.buffer(SHOT * SHOT * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var lods: Vec<i64> = Vec::new_in(s.gpa);
+    for _ in 0..TILES * TILES {
+        lods.push(0);
+    }
+
+    render(&s, eye, target, 1.0, true, 0.0, color.view(), depth.view(), &lods);
+    let lit = read_back(&s, color, &rb);
+    var counts = [0, 0, 0, 0];
+    var tris = 0;
+    for t in 0..TILES * TILES {
+        counts[lods[t] as usize] += 1;
+        tris = tris + mesh::tris_per_tile(lods[t]);
+    }
+    println(f"terrain: {TILES} x {TILES} tiles of {TILE} x {TILE} quads, {LODS} levels of detail");
+    for l in 0..LODS {
+        println(f"  LOD {l}: {counts[l as usize]} tiles x {mesh::tris_per_tile(l)} triangles = {counts[l as usize] * mesh::tris_per_tile(l)}");
+    }
+    println(f"  drawn: {tris} terrain triangles (+ 2 water, + the skirts) for this camera; the index buffer holds {s.mesh.indices.len() / 3} triangles over all levels");
+    var levels = 0;
+    for l in 0..LODS {
+        if counts[l as usize] > 0 {
+            levels += 1;
+        }
+    }
+    let lod_ok = counts[0] + counts[1] + counts[2] + counts[3] == TILES * TILES && levels >= 2;
+    println(f"  verdict: at least two levels of detail in use at this camera: {verdict(lod_ok)}");
+
+    // the shadows, always from the overview camera: the same frame with the
+    // shadow map on and off
+    render(&s, OV_EYE, OV_TARGET, 1.0, true, 0.0, color.view(), depth.view(), &lods);
+    let lit_ov = read_back(&s, color, &rb);
+    render(&s, OV_EYE, OV_TARGET, 1.0, false, 0.0, color.view(), depth.view(), &lods);
+    let unlit = read_back(&s, color, &rb);
+    var shadowed = 0;
+    for i in 0..SHOT * SHOT {
+        if luma(lit_ov, i) < 0.9 * luma(unlit, i) {
+            shadowed += 1;
+        }
+    }
+    let frac = shadowed as f32 / (SHOT * SHOT) as f32;
+    println(f"shadows: {shadowed} of {SHOT * SHOT} pixels ({frac * 100.0:.2}%) darker by 10% or more with the shadow map");
+    let shadow_ok = shadowed > 0 && frac < 0.99;
+    println(f"  verdict: the sun casts some shadow, and not over the whole frame: {verdict(shadow_ok)}");
+
+    if shot.len() > 0 {
+        if write_ppm(shot, lit, gpa) {
+            println(f"shot: {shot} ({SHOT} x {SHOT}, camera {camera})");
+        }
+    }
+    let all = noise_ok && lod_ok && shadow_ok;
+    Ok(if all { 0 } else { 1 })
+}
+
+fn windowed(frames: i64, gpa: Gpa) -> Result<(), gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => return Ok(()), // no display (ssh, CI)
+    };
+    var win = match app.window(WindowDesc::new("terrain", 960, 600)) {
+        Ok(w) => w,
+        Err(_) => return Ok(()),
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let px = win.size();
+    surf.configure(dev, px.w, px.h);
+    var s = setup(dev, queue, Format::Bgra8Unorm, Mesh::new_in(gpa), gpa)?;
+    make_heights(&s);
+    var depth = s.dev.texture(px.w, px.h, Format::Depth32Float, TextureUsage::RENDER_ATTACHMENT);
+    var lods: Vec<i64> = Vec::new_in(gpa);
+    for _ in 0..TILES * TILES {
+        lods.push(0);
+    }
+    var time: f32 = 0.0;
+    var paused = false;
+    var drawn = 0;
+    var first = 0.0;
+    var last = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if !paused {
+                    time += 1.0 / 60.0;
+                }
+                let (eye, target) = fly(time);
+                let aspect = px.w as f32 / px.h as f32;
+                match surf.frame() {
+                    Ok(frame) => {
+                        render(&s, eye, target, aspect, true, time, frame.texture.view(),
+                            depth.view(), &lods);
+                        frame.present(&s.queue);
+                    }
+                    Err(_) => {} // SurfaceLost: configure again on Resize
+                }
+                drawn += 1;
+                let now = monotonic_now().as_nanos() as f64 / 1.0e9;
+                if drawn == 1 {
+                    first = now;
+                }
+                last = now;
+                if frames > 0 && drawn >= frames {
+                    let mean = (last - first) * 1000.0 / (drawn - 1) as f64;
+                    println(f"{drawn} frames, {mean:.2} ms a frame");
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, sz)) => {
+                surf.configure(s.dev, sz.w, sz.h);
+                depth = s.dev.texture(sz.w, sz.h, Format::Depth32Float, TextureUsage::RENDER_ATTACHMENT);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == 32 {
+                                paused = !paused;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("terrain", gpa)
+        .about("A procedural terrain fly-over on the GPU: a window, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: print the checks"))
+        .arg(Arg::option("shot").value_name("FILE.ppm").help("headless: write the frame as a PPM"))
+        .arg(Arg::option("camera").value_name("N").default("0").help("headless: the camera, 0 to 2"))
+        .arg(Arg::option("frames").value_name("N").default("0").help("window: quit after N frames"));
+    let m = cli.parse_or_exit(env::args());
+    if m.flag("headless") {
+        let camera = parse_int(m.get("camera").unwrap_or("0")).unwrap_or(0);
+        return match headless(m.get("shot").unwrap_or(""), camera, gpa) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln(f"terrain: {e}");
+                1
+            }
+        };
+    }
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    match windowed(frames, gpa) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln(f"terrain: {e}");
+            1
+        }
+    }
+}

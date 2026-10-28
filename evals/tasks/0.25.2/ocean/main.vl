@@ -1,0 +1,489 @@
+// ocean: Tessendorf's FFT ocean on the GPU (std::gpu, WGSL compute and
+// render), drawn into a window (std::window) with a camera to move.
+//
+//   ocean [--n N] [--wind V] [--frames N] [--shot FILE.ppm]   the window
+//   ocean --headless [--frames N] [--shot FILE.ppm]           the checks
+//
+// shaders.vl holds the WGSL, ocean.vl the GPU side, cpu.vl the CPU maths
+// (the reference DFT, the camera matrices). The headless run prints: the
+// FFT against a CPU DFT on a small grid, the height field against a CPU
+// sum of the spectrum at random points, and the height statistics.
+
+mod cpu;
+mod ocean;
+mod shaders;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use cpu::{Lcg, TAU, abs_f, cos_of, dft2, norm3, sin_of, sqrt_of};
+use ocean::{Ocean, View};
+
+// the patch's side in metres, and the grid's cells across (the mesh is
+// n x n vertices, one metre apart at 256 cells)
+const PATCH: f64 = 256.0;
+// the Phillips amplitude (metres^2 scale); tuned so the waves are ~1 m high
+const AMP: f64 = 0.0000005;
+// the headless picture's size
+const SHOT_W: i64 = 640;
+const SHOT_H: i64 = 360;
+// the time between headless frames, in seconds
+const DT: f64 = 1.0 / 30.0;
+
+// The camera: a position, a heading and a pitch (radians).
+pub struct Cam {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f64,
+    pub pitch: f64,
+}
+
+impl Cam {
+    pub fn forward(self) -> [f64; 3] {
+        [sin_of(self.yaw) * cos_of(self.pitch), sin_of(self.pitch),
+            -cos_of(self.yaw) * cos_of(self.pitch)]
+    }
+
+    // the horizontal direction to the right
+    pub fn right(self) -> [f64; 3] {
+        [cos_of(self.yaw), 0.0, sin_of(self.yaw)]
+    }
+
+    pub fn eye(self) -> [f64; 3] {
+        [self.x, self.y, self.z]
+    }
+
+    // what the GPU side draws from: the axes and a 60 degree lens
+    pub fn view(self) -> View {
+        View { eye: self.eye(), fwd: self.forward(), rgt: self.right(), fovy: 1.0472 }
+    }
+}
+
+// The sun's direction: above the horizon, ahead of the first camera.
+fn sun() -> [f64; 3] {
+    norm3([0.25, 0.32, -0.9])
+}
+
+// The first camera: 6 m up, a little above the water, looking down a bit.
+fn first_cam() -> Cam {
+    Cam { x: 0.0, y: 6.0, z: 30.0, yaw: 0.0, pitch: -0.12 }
+}
+
+// The spectrum's amplitude at a time, for the checks: sum over k of
+// H_k e^{i k . x} at the points, against the GPU's height field.
+fn spectral_height(h0: [f32], n: i64, t: f64, x: i64, y: i64, gpa: Gpa) -> f64 {
+    // h(x) = sum over k of H_k e^{2 pi i (kx x + ky y) / n}, H_k from h0 at t
+    var cs: Vec<f64> = Vec::new_in(gpa);
+    var sn: Vec<f64> = Vec::new_in(gpa);
+    for m in 0..n {
+        let ang = TAU * m as f64 / n as f64;
+        cs.push(cos_of(ang));
+        sn.push(sin_of(ang));
+    }
+    var acc = 0.0;
+    for ky in 0..n {
+        for kx in 0..n {
+            let i = ky * n + kx;
+            let j = ((n - ky) % n) * n + ((n - kx) % n);
+            let w = h0[i * 4 + 2] as f64 * t;
+            let c = cos_of(w);
+            let s = sin_of(w);
+            let a = h0[i * 4] as f64;
+            let b = h0[i * 4 + 1] as f64;
+            let cj = h0[j * 4] as f64;
+            let dj = -(h0[j * 4 + 1] as f64);
+            // H = h0(k) e^{iwt} + conj(h0(-k)) e^{-iwt}; its real part
+            let hr = a * c - b * s + (cj * c - dj * (-s));
+            let hi = a * s + b * c + (cj * (-s) + dj * c);
+            // the phase e^{2 pi i (kx x + ky y) / n}
+            let m = (kx * x + ky * y) % n;
+            let pc = cs[m];
+            let ps = sn[m];
+            acc = acc + hr * pc - hi * ps;
+        }
+    }
+    acc
+}
+
+// The height statistics: mean, rms, skewness, extremes.
+fn stats(h: [f32]) -> (f64, f64, f64, f64, f64) {
+    let count = h.len() as f64;
+    var sum = 0.0;
+    var lo = 1e30;
+    var hi = -1e30;
+    for v in h {
+        let x = v as f64;
+        sum = sum + x;
+        if x < lo {
+            lo = x;
+        }
+        if x > hi {
+            hi = x;
+        }
+    }
+    let mean = sum / count;
+    var s2 = 0.0;
+    var s3 = 0.0;
+    for v in h {
+        let d = v as f64 - mean;
+        s2 = s2 + d * d;
+        s3 = s3 + d * d * d;
+    }
+    let sd = sqrt_of(s2 / count);
+    let rms = sqrt_of(sum_sq(h) / count);
+    let skew = if sd > 0.0 { (s3 / count) / (sd * sd * sd) } else { 0.0 };
+    (mean, rms, skew, lo, hi)
+}
+
+fn sum_sq(h: [f32]) -> f64 {
+    var s = 0.0;
+    for v in h {
+        s = s + v as f64 * v as f64;
+    }
+    s
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The FFT on a small grid against the CPU DFT (all four lanes).
+fn fft_check(n: i64, gpa: Gpa) -> Result<bool, gpu::Error> {
+    var t = Ocean::new_in(n, PATCH, 10.0, AMP, gpa)?;
+    var g = Lcg { s: 12345 };
+    var data: Vec<f32> = Vec::new_in(gpa);
+    for _ in 0..n * n * 4 {
+        data.push((g.next() * 2.0 - 1.0) as f32);
+    }
+    let got = t.transform(data.as_slice(), gpa);
+    let want = dft2(data.as_slice(), n, gpa);
+    var scale = 0.0;
+    var err = 0.0;
+    for i in 0..want.len() {
+        let w = abs_f(want[i]);
+        if w > scale {
+            scale = w;
+        }
+        let e = abs_f(got[i] as f64 - want[i]);
+        if e > err {
+            err = e;
+        }
+    }
+    let rel = err / scale;
+    let ok = rel < 1e-4;
+    println(f"fft: {n} x {n} cells, 4 lanes: the GPU against the CPU DFT, largest error {err:.2e} ({rel:.2e} of {scale:.1}): {verdict(ok)}");
+    Ok(ok)
+}
+
+fn headless(n: i64, frames: i64, seed: i64, shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    var all_ok = fft_check(16, gpa)?;
+    if !fft_check(32, gpa)? {
+        all_ok = false;
+    }
+    var s = Ocean::new_in(n, PATCH, 10.0, AMP, gpa)?;
+    s.reset(seed);
+    var t = 0.0;
+    for _ in 0..frames {
+        s.set_time(t, seed);
+        var enc = s.dev.encoder();
+        s.record_sim(&enc);
+        s.queue.submit(enc.finish());
+        t += DT;
+    }
+    let tt = t - DT;
+    let h = s.heights(gpa);
+    let h0 = s.spectrum(gpa);
+    let (mean, rms, skew, lo, hi) = stats(h.as_slice());
+    // Parseval: mean of h^2 = sum over k of |H_k|^2, both computed from the
+    // spectrum on the CPU (the GPU's evolve and FFT must agree)
+    var spec_energy = 0.0;
+    for i in 0..n * n {
+        let kx = (i % n);
+        let ky = (i / n);
+        let j = ((n - ky) % n) * n + ((n - kx) % n);
+        let w = h0[i * 4 + 2] as f64 * tt;
+        let c = cos_of(w);
+        let sn = sin_of(w);
+        let a = h0[i * 4] as f64;
+        let b = h0[i * 4 + 1] as f64;
+        let cj = h0[j * 4] as f64;
+        let dj = -(h0[j * 4 + 1] as f64);
+        let hr = a * c - b * sn + (cj * c - dj * (-sn));
+        let hi = a * sn + b * c + (cj * (-sn) + dj * c);
+        spec_energy = spec_energy + hr * hr + hi * hi;
+    }
+    let parseval = (sum_sq(h.as_slice()) / (n * n) as f64) / spec_energy;
+    let parseval_ok = abs_f(parseval - 1.0) < 1e-3;
+    // the height at 16 points against the spectral sum on the CPU
+    var lcg = Lcg { s: 99 };
+    var worst = 0.0;
+    for _ in 0..16 {
+        let x = (lcg.next() * n as f64) as i64 % n;
+        let y = (lcg.next() * n as f64) as i64 % n;
+        let want = spectral_height(h0.as_slice(), n, tt, x, y, gpa);
+        let got = h[(y * n + x) as usize] as f64;
+        let e = abs_f(got - want);
+        if e > worst {
+            worst = e;
+        }
+    }
+    let point_ok = worst < 0.01 * rms;
+    let mean_ok = abs_f(mean) < 1e-3 * rms;
+    println(f"height: {n} x {n} cells, {frames} frames ({tt:.2} s): mean {mean:.2e}, rms {rms:.4} m, skew {skew:.3}, range {lo:.3} .. {hi:.3} m");
+    println(f"mean zero (k = 0 is not in the spectrum): {verdict(mean_ok)}");
+    println(f"Parseval: mean h^2 / sum |H_k|^2 = {parseval:.6}: {verdict(parseval_ok)}");
+    println(f"spectral sum at 16 points, worst |GPU - CPU| = {worst:.2e} m: {verdict(point_ok)}");
+    all_ok = all_ok && mean_ok && parseval_ok && point_ok;
+    if shot.len() > 0 {
+        let cam = first_cam();
+        let img = s.snapshot_in(SHOT_W, SHOT_H, cam.view(), sun(), gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"ocean: cannot write {shot}");
+            return Ok(1);
+        }
+        println(f"shot: {SHOT_W} x {SHOT_H} written to {shot}");
+    }
+    Ok(if all_ok { 0 } else { 1 })
+}
+
+// What the held keys do this frame: the camera's motion.
+struct Keys {
+    fwd: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    turn_l: bool,
+    turn_r: bool,
+    look_up: bool,
+    look_dn: bool,
+}
+
+fn on_key(k: inout Keys, key: Logical, down: bool) {
+    match key {
+        Logical::Char(c) => {
+            if c == 'w' as u32 {
+                k.fwd = down;
+            } else if c == 's' as u32 {
+                k.back = down;
+            } else if c == 'a' as u32 {
+                k.left = down;
+            } else if c == 'd' as u32 {
+                k.right = down;
+            } else if c == 'e' as u32 {
+                k.up = down;
+            } else if c == 'q' as u32 {
+                k.down = down;
+            }
+        }
+        Logical::Named(Named::ArrowLeft) => k.turn_l = down,
+        Logical::Named(Named::ArrowRight) => k.turn_r = down,
+        Logical::Named(Named::ArrowUp) => k.look_up = down,
+        Logical::Named(Named::ArrowDown) => k.look_dn = down,
+        _ => {}
+    }
+}
+
+fn secs(d: std::time::Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn windowed(n: i64, wind: f64, frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("ocean: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("ocean", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("ocean: no window");
+            return 1;
+        }
+    };
+    var s = match Ocean::new_in(n, PATCH, wind, AMP, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    s.reset(1);
+    let inst = gpu::Instance::new_in(gpa);
+    let sz = win.size();
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var depth = s.dev.texture(sz.w, sz.h, Format::Depth32Float,
+        usage: TextureUsage::RENDER_ATTACHMENT);
+    var cam = first_cam();
+    var keys = Keys {
+        fwd: false, back: false, left: false, right: false, up: false, down: false,
+        turn_l: false, turn_r: false, look_up: false, look_dn: false,
+    };
+    var paused = false;
+    var seed = 1;
+    var t = 0.0;
+    var prev = 0.0;
+    var start = 0.0;
+    var count = 0;
+    var first = 0.0;
+    let clock0 = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(clock0));
+                var dt = now - prev;
+                if count == 0 || dt > 0.1 {
+                    dt = 1.0 / 60.0;
+                }
+                prev = now;
+                if !paused {
+                    t += dt;
+                }
+                // the camera: walk and turn at a speed of 12 m/s and 1.2 rad/s
+                let step = 12.0 * dt;
+                let f = cam.forward();
+                let r = cam.right();
+                var mx = 0.0;
+                var mz = 0.0;
+                var my = 0.0;
+                if keys.fwd { mx += f[0] * step; mz += f[2] * step; }
+                if keys.back { mx -= f[0] * step; mz -= f[2] * step; }
+                if keys.right { mx += r[0] * step; mz += r[2] * step; }
+                if keys.left { mx -= r[0] * step; mz -= r[2] * step; }
+                if keys.up { my += step; }
+                if keys.down { my -= step; }
+                cam.x += mx;
+                cam.y += my;
+                cam.z += mz;
+                if keys.turn_l { cam.yaw -= 1.2 * dt; }
+                if keys.turn_r { cam.yaw += 1.2 * dt; }
+                if keys.look_up { cam.pitch = clamp_f(cam.pitch + 0.8 * dt, -1.4, 1.4); }
+                if keys.look_dn { cam.pitch = clamp_f(cam.pitch - 0.8 * dt, -1.4, 1.4); }
+                s.set_time(t, seed);
+                let (w, h) = (surf.width, surf.height);
+                s.set_camera(cam.view(), w, h, sun());
+                match surf.frame() {
+                    Ok(fr) => {
+                        var enc = s.dev.encoder();
+                        if !paused {
+                            s.record_sim(&enc);
+                        }
+                        s.record_draw(&enc, fr.texture.view(), depth.view());
+                        s.queue.submit(enc.finish());
+                        fr.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                count += 1;
+                if count == 1 {
+                    first = now;
+                }
+                if frames > 0 && count >= frames {
+                    let mean = (now - first) * 1000.0 / (count - 1) as f64;
+                    println(f"ocean: {n} x {n} cells, {sz.w} x {sz.h} pixels: {count} frames, {mean:.2} ms a frame");
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(sz.w, sz.h, cam.view(), sun(), gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"ocean: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'r' as u32 {
+                                seed += 1;
+                                s.reset(seed);
+                            } else if c == 'q' as u32 && k.mods.ctrl() {
+                                break;
+                            }
+                        }
+                        Logical::Named(Named::Escape) => break,
+                        _ => {}
+                    }
+                }
+                on_key(&keys, k.key, k.pressed);
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(s.dev, z.w, z.h);
+                depth = s.dev.texture(z.w, z.h, Format::Depth32Float,
+                    usage: TextureUsage::RENDER_ATTACHMENT);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        win.request_frame();
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+#[pure]
+fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("ocean", gpa)
+        .about("Tessendorf's FFT ocean on the GPU: a window to fly over, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: the FFT and height checks, then --shot"))
+        .arg(Arg::option("n").value_name("N").default("256")
+            .help("the grid's cells across (a power of two, 8..256)"))
+        .arg(Arg::option("wind").value_name("V").default("10")
+            .help("the wind's speed, m/s"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames; headless: the frames stepped (default 60)"))
+        .arg(Arg::option("seed").value_name("S").default("1").help("the random phases' seed"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the frame as a PPM image (headless, or with --frames)"));
+    let m = cli.parse_or_exit(env::args());
+    let n = parse_int(m.get("n").unwrap_or("256")).unwrap_or(0);
+    let seed = parse_int(m.get("seed").unwrap_or("1")).unwrap_or(1);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    let wind = match std::num::parse_f64(m.get("wind").unwrap_or("10")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("ocean: --wind takes a number");
+            return 2;
+        }
+    };
+    if n < 8 || n > 256 || (n & (n - 1)) != 0 {
+        eprintln("ocean: --n is a power of two, 8..256");
+        return 2;
+    }
+    let shot = m.get("shot").unwrap_or("");
+    if m.flag("headless") {
+        let steps = if frames > 0 { frames } else { 60 };
+        return match headless(n, steps, seed, shot, gpa) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln(f"ocean: {e}");
+                1
+            }
+        };
+    }
+    windowed(n, wind, frames, shot, gpa)
+}

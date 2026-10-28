@@ -1,0 +1,175 @@
+// safetensors: the file is read whole; its header (a JSON object of
+// tensors: dtype, shape, data_offsets) is scanned for the names, dtypes and
+// byte ranges. Tensors are read from the model folder at run time.
+
+pub struct Tensors {
+    file: Vec<u8>,
+    data: i64,          // where the tensor data starts in the file
+    names: Vec<u8>,     // every tensor name, back to back
+    name_at: Vec<i64>,
+    name_len: Vec<i64>,
+    dtype: Vec<i64>,    // 0 = BF16, 1 = F32, -1 = not a tensor
+    beg: Vec<i64>,      // the tensor's bytes: data + beg .. data + end
+    end: Vec<i64>,
+}
+
+fn bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The number at i (skipping spaces and commas first); i moves past it.
+fn scan_int(s: [u8], i: inout i64) -> i64 {
+    while i < s.len() && (s[i] < 48 || s[i] > 57) && s[i] != 45 {
+        i += 1;
+    }
+    var neg = false;
+    if i < s.len() && s[i] == 45 {
+        neg = true;
+        i += 1;
+    }
+    var v: i64 = 0;
+    while i < s.len() && s[i] >= 48 && s[i] <= 57 {
+        v = v * 10 + (s[i] - 48) as i64;
+        i += 1;
+    }
+    if neg { -v } else { v }
+}
+
+// The string at i (a quote); returns it as [start, end) and moves past it.
+fn scan_string(s: [u8], i: inout i64) -> [i64; 2] {
+    while i < s.len() && s[i] != 34 {
+        i += 1;
+    }
+    i += 1;
+    let st = i;
+    while i < s.len() && s[i] != 34 {
+        i += 1;
+    }
+    let out = [st, i];
+    i += 1;
+    out
+}
+
+pub fn read(path: [u8], gpa: Gpa) -> Option<Tensors> {
+    let file = match std::fs::read_in(path, gpa) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    if file.len() < 8 {
+        return None;
+    }
+    var hlen: i64 = 0;
+    for k in 0..8 {
+        hlen = hlen + ((file[k] as i64) << (8 * k));
+    }
+    let hdr = file.as_slice()[8..8 + hlen];
+    var t = Tensors {
+        file: Vec::new_in(gpa),
+        data: 8 + hlen,
+        names: Vec::new_in(gpa),
+        name_at: Vec::new_in(gpa),
+        name_len: Vec::new_in(gpa),
+        dtype: Vec::new_in(gpa),
+        beg: Vec::new_in(gpa),
+        end: Vec::new_in(gpa),
+    };
+    // Keys with an object value name a tensor; "dtype" and "data_offsets"
+    // inside it fill its record.
+    var i: i64 = 0;
+    let n = hdr.len();
+    while i < n {
+        if hdr[i] != 34 {
+            i += 1;
+            continue;
+        }
+        let key = scan_string(hdr, &i);
+        let k = hdr[key[0]..key[1]];
+        while i < n && hdr[i] != 58 {
+            i += 1;
+        }
+        i += 1;
+        while i < n && hdr[i] == 32 {
+            i += 1;
+        }
+        if i < n && hdr[i] == 123 {
+            i += 1;
+            t.name_at.push(t.names.len());
+            t.name_len.push(k.len());
+            for x in 0..k.len() {
+                t.names.push(k[x]);
+            }
+            t.dtype.push(-1);
+            t.beg.push(0);
+            t.end.push(0);
+        } else if bytes_eq(k, "dtype") {
+            let v = scan_string(hdr, &i);
+            let last = t.dtype.len() - 1;
+            let vs = hdr[v[0]..v[1]];
+            t.dtype[last] = if bytes_eq(vs, "BF16") { 0 } else if bytes_eq(vs, "F32") { 1 } else { -1 };
+        } else if bytes_eq(k, "data_offsets") {
+            while i < n && hdr[i] != 91 {
+                i += 1;
+            }
+            i += 1;
+            let a = scan_int(hdr, &i);
+            let b = scan_int(hdr, &i);
+            let last = t.beg.len() - 1;
+            t.beg[last] = a;
+            t.end[last] = b;
+        }
+    }
+    t.file = file;
+    Some(t)
+}
+
+impl Tensors {
+    // The record of a tensor by name, -1 if the file has none.
+    pub fn find(self, name: [u8]) -> i64 {
+        for r in 0..self.name_at.len() {
+            let at = self.name_at[r];
+            let l = self.name_len[r];
+            if l == name.len() {
+                var same = true;
+                for k in 0..l {
+                    if self.names[at + k] != name[k] {
+                        same = false;
+                        break;
+                    }
+                }
+                if same {
+                    return r;
+                }
+            }
+        }
+        -1
+    }
+
+    // The tensor's bytes, as stored.
+    pub fn bytes(self, r: i64) -> [u8] {
+        self.file.as_slice()[self.data + self.beg[r]..self.data + self.end[r]]
+    }
+
+    pub fn is_bf16(self, r: i64) -> bool {
+        self.dtype[r] == 0
+    }
+}
+
+// The bf16 bytes widened to f32 bytes (each value's bits in the high half).
+pub fn widen(src: [u8], out: inout Vec<u8>) {
+    var k: i64 = 0;
+    while k + 1 < src.len() {
+        out.push(0);
+        out.push(0);
+        out.push(src[k]);
+        out.push(src[k + 1]);
+        k += 2;
+    }
+}

@@ -1,0 +1,321 @@
+// cloth: position-based dynamics of a hanging sheet on the GPU (std::gpu,
+// WGSL compute kernels), drawn lit and two-sided into a window
+// (std::window). Drag the cloth with the left mouse button.
+//
+//   cloth                        the window
+//   cloth --headless [--frames N] [--wind] [--shot FILE.ppm]
+//                                no window: run, print the checks
+//
+// shaders.vl holds the WGSL, sim.vl the GPU side, geom.vl the CPU maths,
+// the camera, the start state and the checks.
+
+mod geom;
+mod shaders;
+mod sim;
+
+use std::env;
+use std::cli::{Arg, Command};
+use std::gpu;
+use std::gpu::{Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+use geom::{Camera, v3};
+use sim::{Sim, DT, SUB};
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAIL" }
+}
+
+fn headless(n: i64, frames: i64, iters: i64, wind: bool, shot: [u8], gpa: Gpa) -> i32 {
+    var cl = match Sim::new_in(n, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    let cam = Camera::new();
+    let aspect = 640.0 / 480.0;
+    let h = geom::WIDTH / (n - 1) as f64;
+    println(f"cloth: {n} x {n} particles, {SUB} substeps a frame, {iters} Jacobi iterations a substep");
+
+    // The constraint error after one frame, by iterations: it should fall.
+    println("constraint error after one frame (relative stretch of every edge):");
+    let ks: [i64; 5] = [2, 4, 8, 16, 32];
+    var falling = true;
+    var last = 1000000.0;
+    for q in 0..5 {
+        cl.reset(gpa);
+        cl.wind_on = false;
+        cl.step_frame(cam, aspect, ks[q]);
+        let p = cl.read_pos(gpa);
+        let s = geom::strain(p.as_slice(), n, h);
+        println(f"  {ks[q]} iterations: max {s.max:.4}  mean {s.mean:.5}");
+        if s.max >= last { falling = false; }
+        last = s.max;
+    }
+    println(f"constraint error falls with the iterations: {verdict(falling)}");
+
+    // The run: strain, energy, NaN count every second.
+    cl.reset(gpa);
+    cl.wind_on = wind;
+    println(f"run: {frames} frames, wind {verdict(true)}");
+    var bad_total = 0;
+    var e_hist: Vec<f64> = Vec::new_in(gpa);
+    var last_strain = 0.0;
+    var last_at = 0;
+    for fr in 1..frames + 1 {
+        cl.step_frame(cam, aspect, iters);
+        if fr % 60 == 0 {
+            let p = cl.read_pos(gpa);
+            let q = cl.read_prev(gpa);
+            let s = geom::strain(p.as_slice(), n, h);
+            let (ke, pe) = geom::energy(p.as_slice(), q.as_slice(), n, DT / SUB as f64);
+            let bad = geom::bad_count(p.as_slice());
+            bad_total = bad_total + bad;
+            e_hist.push(ke + pe);
+            last_strain = s.max;
+            last_at = s.at;
+            println(f"  t {fr / 60} s: strain max {s.max:.4} mean {s.mean:.5}  KE {ke:.3}  PE {pe:.3}  E {ke + pe:.3}  non-finite {bad}");
+        }
+    }
+    let nan_ok = bad_total == 0;
+    println(f"no NaN or runaway value: {verdict(nan_ok)}");
+
+    // Without wind nothing adds energy: after the first second the total
+    // must not rise above its value then (2% and a small absolute slack).
+    var energy_ok = true;
+    if !wind && e_hist.len() > 1 {
+        var top = e_hist[1];
+        for k in 2..e_hist.len() {
+            if e_hist[k] > top { top = e_hist[k]; }
+        }
+        energy_ok = top <= e_hist[1] * 1.02 + 0.05;
+    }
+    if wind {
+        println("energy: not checked for a rise (the wind does work on the cloth)");
+    } else {
+        println(f"energy never rises after 1 s (no wind): {verdict(energy_ok)}");
+    }
+    println(f"worst edge at the end: particle ({last_at % n}, {last_at / n}) of {n} x {n}");
+    println(f"stretch settles below 0.3 by the end (the solver is soft; see README): {verdict(last_strain < 0.3)}");
+
+    // Dragging, as the mouse does it: grab the middle particle, move it
+    // 0.25 along x over a second, let go. It must sit on the target.
+    let mid = (n / 2) * n + n / 2;
+    let before = cl.read_pos(gpa);
+    let p0 = geom::particle(before.as_slice(), mid);
+    let target = v3(p0.x + 0.25, p0.y, p0.z);
+    cl.grab_index = mid;
+    cl.grab_at = target;
+    for _ in 0..60 {
+        cl.step_frame(cam, aspect, iters);
+    }
+    let during = cl.read_pos(gpa);
+    let miss = geom::particle(during.as_slice(), mid).sub(target).len();
+    cl.grab_index = -1;
+    println(f"drag: particle {mid} from x {p0.x:.3} to x {target.x:.3} in 1 s, {miss:.5} from the target");
+    let drag_ok = miss < 0.01;
+    println(f"the dragged particle is on the pointer (within 0.01): {verdict(drag_ok)}");
+    let released = cl.read_pos(gpa);
+    let rs = geom::strain(released.as_slice(), n, h);
+    println(f"released: strain max {rs.max:.4} mean {rs.mean:.5}");
+
+    if shot.len() > 0 {
+        let img = cl.snapshot_in(cam, aspect, 640, 480, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"cloth: cannot write {shot}");
+            return 1;
+        }
+    }
+    if nan_ok && falling && energy_ok { 0 } else { 1 }
+}
+
+fn windowed(n: i64, iters: i64, max_frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("cloth: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("cloth", 1280, 800)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("cloth: no window");
+            return 1;
+        }
+    };
+    var cl = match Sim::new_in(n, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    var surf = match cl.inst.surface(cl.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(cl.dev, sz.w, sz.h);
+    var depth = cl.dev.texture(sz.w, sz.h, Format::Depth32Float,
+        usage: TextureUsage::RENDER_ATTACHMENT);
+    var cam = Camera::new();
+    var paused = false;
+    var quit = false;
+    var grabbing = false;
+    var grab_p = v3(0.0, 0.0, 0.0);
+    var grab_n = v3(0.0, 0.0, 1.0);
+    var mx = 0.0;
+    var my = 0.0;
+    var frames = 0;
+    let start = monotonic_now();
+    var first = 0.0;
+    win.request_frame();
+    loop {
+        let w = surf.width as f64;
+        let h = surf.height as f64;
+        let aspect = w / h;
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                // the dragged point stays on the plane through the grab,
+                // facing the camera, under the pointer
+                if grabbing {
+                    let (o, d) = cam.ray(mx, my, w, h, aspect);
+                    cl.grab_at = geom::plane_hit(o, d, grab_p, grab_n);
+                }
+                cl.write_uniforms(cam, aspect);
+                var enc = cl.dev.encoder();
+                if !paused {
+                    cl.encode_step(&enc, iters);
+                    cl.time = cl.time + DT;
+                }
+                match surf.frame() {
+                    Ok(frame) => {
+                        cl.encode_draw(&enc, frame.texture.view(), depth.view());
+                        cl.queue.submit(enc.finish());
+                        frame.present(&cl.queue);
+                    }
+                    Err(_) => {} // SurfaceLost: configure again on Resize
+                }
+                frames = frames + 1;
+                if frames == 1 {
+                    first = monotonic_now().saturating_sub(start).as_secs_f64();
+                }
+                if max_frames > 0 && frames >= max_frames {
+                    let total = monotonic_now().saturating_sub(start).as_secs_f64() - first;
+                    println(f"cloth: {frames} frames, {total * 1000.0 / (frames - 1) as f64:.2} ms a frame");
+                    if shot.len() > 0 {
+                        let img = cl.snapshot_in(cam, aspect, surf.width, surf.height, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"cloth: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                mx = m.x;
+                my = m.y;
+                match m.action {
+                    MouseAction::Press => match m.button {
+                        Button::Left => {
+                            let (o, d) = cam.ray(m.x, m.y, w, h, aspect);
+                            let pos = cl.read_pos(gpa);
+                            let k = geom::pick(pos.as_slice(), n, o, d, 0.12);
+                            if k >= 0 {
+                                grab_p = geom::particle(pos.as_slice(), k);
+                                grab_n = cam.forward();
+                                cl.grab_at = grab_p;
+                                cl.grab_index = k;
+                                grabbing = true;
+                            }
+                        }
+                        _ => {}
+                    },
+                    MouseAction::Release => match m.button {
+                        Button::Left => {
+                            grabbing = false;
+                            cl.grab_index = -1;
+                        }
+                        _ => {}
+                    },
+                    MouseAction::Move => {}
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'r' as u32 {
+                                cl.reset(gpa);
+                                grabbing = false;
+                            } else if c == 'w' as u32 {
+                                cl.wind_on = !cl.wind_on;
+                            } else if c == 'q' as u32 {
+                                quit = true;
+                            }
+                        }
+                        Logical::Named(Named::ArrowLeft) => cam.orbit(-1.0),
+                        Logical::Named(Named::ArrowRight) => cam.orbit(1.0),
+                        Logical::Named(Named::Escape) => quit = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(cl.dev, z.w, z.h);
+                depth = cl.dev.texture(z.w, z.h, Format::Depth32Float,
+                    usage: TextureUsage::RENDER_ATTACHMENT);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if quit { break; }
+    }
+    let _ = cl.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("cloth", gpa)
+        .about("Position-based cloth on the GPU: a window to drag it, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: run the frames, then print the checks"))
+        .arg(Arg::option("frames").value_name("N").default("600")
+            .help("headless: the frames to run; window: quit after N (0: never)"))
+        .arg(Arg::option("n").value_name("N").default("64")
+            .help("particles a side, 8..256"))
+        .arg(Arg::option("iters").value_name("N").default("32")
+            .help("Jacobi iterations a substep"))
+        .arg(Arg::flag("wind").help("headless: the wind blows"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the last frame as a PPM image"));
+    let m = cli.parse_or_exit(env::args());
+    let n = parse_int(m.get("n").unwrap_or("64")).unwrap_or(64);
+    let iters = parse_int(m.get("iters").unwrap_or("32")).unwrap_or(32);
+    let frames = parse_int(m.get("frames").unwrap_or("600")).unwrap_or(600);
+    let shot = m.get("shot").unwrap_or("");
+    if n < 8 || n > 256 || iters < 0 || frames < 0 {
+        eprintln("cloth: --n 8..256, --iters 0 or more, --frames 0 or more");
+        return 2;
+    }
+    if m.flag("headless") {
+        return headless(n, frames, iters, m.flag("wind"), shot, gpa);
+    }
+    windowed(n, iters, frames, shot, gpa)
+}
+
+#[test]
+fn verdict_words() {
+    assert_eq(verdict(true), "ok");
+    assert_eq(verdict(false), "FAIL");
+}
