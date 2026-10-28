@@ -10,7 +10,7 @@ presents depth-tested geometry through Vole's native `std::window` window.
 From the repository root:
 
 ```sh
-target/volec -O2 examples/voxel/main.vl -o voxel
+target/volec -O2 examples/gpu/voxel/main.vl -o voxel
 ./voxel
 ./voxel --seed 42
 ```
@@ -103,7 +103,7 @@ normal streaming path and checks the regenerated mesh count.
 ## Verification
 
 ```sh
-target/volec test examples/voxel/main.vl
+target/volec test examples/gpu/voxel/main.vl
 ./voxel --headless --size 320x200 --out voxel.ppm
 ```
 
