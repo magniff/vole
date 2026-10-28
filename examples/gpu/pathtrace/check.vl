@@ -1,0 +1,240 @@
+// Headless verification uses the same compute and presentation pipelines as
+// the window. Frames come from RawSurface::Headless and are read back through
+// std::gpu; no renderer or image-generation substitute is involved.
+
+use std::{fs, gpu};
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+
+use render::{Renderer, renderer_new};
+use state::{Lab, lab_default};
+
+fn capture(renderer: inout Renderer, dev: gpu::Device, queue: inout gpu::Queue,
+    surf: inout gpu::Surface, width: i64, height: i64, lab: Lab,
+    gpa: Gpa) -> Result<Vec<u8>, gpu::Error> {
+    let frame = surf.frame()?;
+    let target = frame.texture.view();
+    renderer.draw(dev, &queue, target, lab);
+    let stride = (width * 4 + 255) / 256 * 256;
+    var readback = dev.buffer(stride * height, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(enc.finish());
+    frame.present(&queue);
+    let pixels = readback.map_read(dev);
+    var image: Vec<u8> = Vec::new_in(gpa);
+    for y in 0..height {
+        let row = y * stride;
+        for x in 0..width * 4 {
+            image.push(pixels[row + x]);
+        }
+    }
+    Ok(image)
+}
+
+fn detail(image: [u8], width: i64, height: i64) -> f64 {
+    var total: i64 = 0;
+    var count: i64 = 0;
+    for y in 0..height {
+        for x in 1..width {
+            let a = (y * width + x) * 4;
+            let b = a - 4;
+            let la = image[a] as i64 + image[a + 1] as i64 + image[a + 2] as i64;
+            let lb = image[b] as i64 + image[b + 1] as i64 + image[b + 2] as i64;
+            var difference = la - lb;
+            if difference < 0 { difference = -difference; }
+            total += difference;
+            count += 1;
+        }
+    }
+    total as f64 / count as f64
+}
+
+fn write_ppm(path: [u8], image: [u8], width: i64, height: i64, gpa: Gpa) -> bool {
+    var ppm = format_in(f"P6\n{width} {height}\n255\n", gpa);
+    for i in 0..width * height {
+        let p = i * 4;
+        ppm.push(image[p + 2]);
+        ppm.push(image[p + 1]);
+        ppm.push(image[p]);
+    }
+    fs::write(path, ppm.as_slice()).is_ok()
+}
+
+/// Fixed-seed benchmark: initialization (including shader compilation) is
+/// measured separately from an uninterrupted sequence of offscreen GPU frames.
+/// This avoids presentation pacing. Wall time includes one final readback sync;
+/// std::gpu currently exposes no GPU timestamp queries.
+pub fn benchmark(samples: i64, width: i64, height: i64, gpa: Gpa) -> i32 {
+    benchmark_lab(samples, width, height, lab_default(), gpa)
+}
+
+pub fn benchmark_lab(samples: i64, width: i64, height: i64, lab: Lab, gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"pathtrace: no GPU: {e}");
+            return 1;
+        }
+    };
+    let init_clock = monotonic_now();
+    var renderer = match renderer_new(dev, width, height) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"pathtrace: renderer: {e}");
+            return 1;
+        }
+    };
+    let target_texture = dev.texture(width, height, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let target = target_texture.view();
+    let init_ms = monotonic_now().saturating_sub(init_clock).as_secs_f64() * 1000.0;
+    let clock = monotonic_now();
+    let stride = (width * 4 + 255) / 256 * 256;
+    var lit: i64 = 0;
+    for i in 0..samples {
+        renderer.draw(dev, &queue, target, lab);
+        if i + 1 == samples {
+            var readback = dev.buffer(stride * height,
+                BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+            var enc = dev.encoder();
+            enc.copy_texture_to_buffer(target_texture, readback, stride);
+            queue.submit(enc.finish());
+            let pixels = readback.map_read(dev);
+            for p in 0..width * height {
+                let at = p / width * stride + p % width * 4;
+                if pixels[at] as i64 + pixels[at + 1] as i64 + pixels[at + 2] as i64 > 24 {
+                    lit += 1;
+                }
+            }
+        }
+    }
+    let elapsed = monotonic_now().saturating_sub(clock).as_secs_f64();
+    println(f"benchmark {width}x{height}, {samples} samples, fixed seed");
+    println(f"initialization {init_ms:.2} ms (shaders + resources)");
+    println(
+        f"steady wall {elapsed * 1000.0 / samples as f64:.3} ms/sample, {samples as f64 / elapsed:.1} samples/s (includes final sync)");
+    println(
+        f"path throughput {width as f64 * height as f64 * samples as f64 / elapsed / 1000000.0:.2} Mpaths/s");
+    if lit > width * height / 2 {
+        println("benchmark render ok");
+        return 0;
+    }
+    println("benchmark render FAIL");
+    1
+}
+
+pub fn run(samples: i64, width: i64, height: i64, out: [u8], gpa: Gpa) -> i32 {
+    run_lab(samples, width, height, out, lab_default(), gpa)
+}
+
+pub fn run_lab(samples: i64, width: i64, height: i64, out: [u8], lab: Lab, gpa: Gpa) -> i32 {
+    println(f"pathtrace {width}x{height}, {samples} samples");
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"pathtrace: no GPU: {e}");
+            return 1;
+        }
+    };
+    var renderer = match renderer_new(dev, width, height) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"pathtrace: renderer: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::Headless) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"pathtrace: no headless surface: {e}");
+            return 1;
+        }
+    };
+    surf.configure(dev, width, height, format: Format::Bgra8Unorm, vsync: false);
+
+    let first = match capture(&renderer, dev, &queue, &surf, width, height, lab, gpa) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln(f"pathtrace: capture: {e}");
+            return 1;
+        }
+    };
+    var final_image = first.clone();
+    for _ in 1..samples {
+        final_image = match capture(&renderer, dev, &queue, &surf, width, height, lab, gpa) {
+            Ok(image) => image,
+            Err(e) => {
+                eprintln(f"pathtrace: capture: {e}");
+                return 1;
+            }
+        };
+    }
+
+    var lit: i64 = 0;
+    var changed: i64 = 0;
+    for i in 0..width * height {
+        let p = i * 4;
+        if final_image[p] as i64 + final_image[p + 1] as i64 + final_image[p + 2] as i64 > 24 {
+            lit += 1;
+        }
+        if first[p] != final_image[p] || first[p + 1] != final_image[p + 1]
+            || first[p + 2] != final_image[p + 2] {
+            changed += 1;
+        }
+    }
+    let render_ok = lit > width * height / 2 && (lab.debug != 0 || changed > width * height / 4);
+    if render_ok {
+        println("render ok");
+    } else {
+        println(f"render FAIL ({lit} lit, {changed} changed)");
+    }
+
+    let first_detail = detail(first.as_slice(), width, height);
+    let final_detail = detail(final_image.as_slice(), width, height);
+    let progress_ok = lab.debug != 0 || final_detail < first_detail;
+    if progress_ok {
+        println("progress ok");
+    } else {
+        println(f"progress FAIL (pixel detail {first_detail:.2} -> {final_detail:.2})");
+    }
+
+    if out.len() > 0 {
+        if write_ppm(out, final_image.as_slice(), width, height, gpa) {
+            println(f"wrote {out}");
+        } else {
+            eprintln(f"pathtrace: cannot write {out}");
+            return 1;
+        }
+    }
+
+    renderer.reset();
+    let restarted = match capture(&renderer, dev, &queue, &surf, width, height, lab, gpa) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln(f"pathtrace: reset capture: {e}");
+            return 1;
+        }
+    };
+    var reset_ok = renderer.samples == 1;
+    for i in 0..width * height * 4 {
+        if restarted[i] != first[i] { reset_ok = false; }
+    }
+    if reset_ok {
+        println("reset ok (sample one reproduced exactly)");
+    } else {
+        println("reset FAIL");
+    }
+    if render_ok && progress_ok && reset_ok { return 0; }
+    1
+}

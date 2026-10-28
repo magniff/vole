@@ -2,7 +2,7 @@
 
 `gradebook` reads a class's test scores and prints each student's
 average, grade and biggest swing between tests. It was written in a
-hurry, with Rust habits, and half-changed: it does not compile. Three
+hurry and half-changed: it does not compile. Three
 files, about 130 lines, nine errors.
 
 The session gets it to build the way an agent should: every error at
@@ -41,7 +41,7 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 $ volec explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter (raw since 0.18.1, V4; until then a non-`mut` one was a borrow, `&mut T`): make it `&T`, or `&mut T` when written through, with `volec fix --values ROOT` (every such parameter and its calls), then `fix --only unsafe` for what it keeps raw (indexed, compared, cast, stored, given to C).
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter that only reads or writes one value: make it a let parameter `x: T`, or `x: inout T` when written through (`volec refactor signature F --convention x inout`), and keep `*T` for what stays raw (indexed, compared, cast, stored, given to C).
 example:
     main.vl:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
 ```
@@ -59,8 +59,9 @@ show `edit patch`.) `--dry-run` shows the diff first:
 $ volec fix --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -9,0 +10 @@
+@@ -7,0 +8,2 @@
 +use std::I64_MIN;
++
 --- a/grades.vl
 +++ b/grades.vl
 @@ -21 +21 @@
@@ -70,12 +71,12 @@ $ volec fix --dry-run
 -        let d = abs((scores[i] - scores[i - 1]) as i32) as i64;
 +        let d = unsafe { abs((scores[i] - scores[i - 1]) as i32) as i64 };
 $ volec fix
-fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
+fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+4 -2 lines
 $ volec check
-main.vl:9:14: error[type error] unresolved import 'roster::add_score'
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
 main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
@@ -135,10 +136,10 @@ two-argument `enrol` and no `add_score`.
 
 ```console
 $ volec check
-main.vl:9:14: error[type error] unresolved import 'roster::add_score'
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
 main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 [exit 1]
 $ volec query show roster::enrol
 // crate::roster::enrol	roster.vl:16-19	effects: alloc(Gpa) panic
@@ -211,9 +212,9 @@ best: Ada (95); 3 students have 3 scores or more
 ok: built gradebook
 $ git diff --stat
  grades.vl |  6 +++---
- main.vl   |  1 +
+ main.vl   |  2 ++
  roster.vl | 21 +++++++++++++++++----
- 3 files changed, 21 insertions(+), 7 deletions(-)
+ 3 files changed, 22 insertions(+), 7 deletions(-)
 ```
 
 ## Why not by hand

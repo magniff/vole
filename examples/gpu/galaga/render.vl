@@ -1,0 +1,510 @@
+// render.vl: what surrounds the game — the battle starfield the session
+// composites behind it, the policy panel to its right, the wave-clear and
+// game-over overlays, the upgrade HUD, and the saliency rings.
+//
+// The starfield is a direct port of neural-galaga-core's stars and
+// nebulas (same seeds, same order of the pseudo-random draws, same
+// blend), so a composed frame matches the Rust client's. The panel and
+// the overlays are ports of the infer binary's drawing; the panel is 144
+// pixels wide, so the finished frame is 368×288.
+
+import "math.h" as c;
+
+use crate::draw::{Fb, GAME_H, GAME_W, draw_text, draw_text_centered};
+use crate::game::Step;
+
+const TAU: f32 = 6.2831855;
+const PI: f32 = 3.1415927;
+
+fn sinf(v: f32) -> f32 {
+    unsafe { c::sinf(v) }
+}
+
+fn cosf(v: f32) -> f32 {
+    unsafe { c::cosf(v) }
+}
+
+fn atan2f(y: f32, x: f32) -> f32 {
+    unsafe { c::atan2f(y, x) }
+}
+
+fn sqrtf(v: f32) -> f32 {
+    unsafe { c::sqrtf(v) }
+}
+
+fn floorf(v: f32) -> f32 {
+    unsafe { c::floorf(v) }
+}
+
+fn ceilf(v: f32) -> f32 {
+    unsafe { c::ceilf(v) }
+}
+
+fn roundf(v: f32) -> f32 {
+    unsafe { c::roundf(v) }
+}
+
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn minf(a: f32, b: f32) -> f32 {
+    if a < b { a } else { b }
+}
+
+fn maxf(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+// One step of the 32-bit linear congruential generator both Rust
+// starfields use; the arithmetic wraps.
+fn lcg_next(s: inout u32) -> u32 {
+    s = s * 1103515245u32 + 12345u32;
+    s
+}
+
+// --- the plain starfield ------------------------------------------------
+
+const STAR_LAYERS: i64 = 3;
+const STAR_COUNTS: [i64; 3] = [25, 15, 10];
+const STAR_SPEEDS: [f32; 3] = [5.0, 12.0, 25.0];
+const STAR_BRIGHT: [f32; 3] = [0.25, 0.50, 0.90];
+const STAR_SIZE: [f32; 3] = [1.0, 1.0, 1.0];
+
+pub struct Star {
+    x: f32,
+    y: f32,
+    speed: f32,
+    brightness: f32,
+    size: f32,
+    twinkle_phase: f32,
+    twinkle_speed: f32,
+}
+
+pub struct Starfield {
+    stars: Vec<Star>,
+}
+
+pub fn starfield_new(gpa: Gpa) -> Starfield {
+    var stars: Vec<Star> = Vec::with_capacity_in(50, gpa);
+    var seed: u32 = 12345;
+    for li in 0..STAR_LAYERS {
+        let count = STAR_COUNTS[li];
+        for i in 0..count {
+            let rx = lcg_next(&seed);
+            let x = (rx % GAME_W as u32) as f32;
+            let ry = lcg_next(&seed);
+            let y = (ry % GAME_H as u32) as f32;
+            let bright_var = STAR_BRIGHT[li]
+                * (0.7 + 0.3 * (i as f32 / count as f32));
+            let rp = lcg_next(&seed);
+            let twinkle_phase = (rp % 1000u32) as f32 / 1000.0 * TAU;
+            let rs = lcg_next(&seed);
+            let twinkle_speed = 1.5 + (rs % 1000u32) as f32 / 1000.0 * 3.5;
+            stars.push(Star {
+                x: x,
+                y: y,
+                speed: STAR_SPEEDS[li],
+                brightness: bright_var,
+                size: STAR_SIZE[li],
+                twinkle_phase: twinkle_phase,
+                twinkle_speed: twinkle_speed,
+            });
+        }
+    }
+    Starfield { stars: stars }
+}
+
+impl Starfield {
+    pub fn update(inout self, dt: f32) {
+        for i in 0..self.stars.len() {
+            self.stars[i].y += self.stars[i].speed * dt;
+            if self.stars[i].y > GAME_H as f32 {
+                self.stars[i].y -= GAME_H as f32 + self.stars[i].size;
+            }
+            self.stars[i].twinkle_phase += self.stars[i].twinkle_speed * dt;
+        }
+    }
+
+    pub fn draw(self, fb: inout Fb) {
+        for i in 0..self.stars.len() {
+            let st = self.stars[i];
+            let twinkle = 0.7 + 0.3 * sinf(st.twinkle_phase);
+            let b = st.brightness * twinkle;
+            let size = st.size as i64;
+            fb.fill_rect(st.x as i64, st.y as i64, size, size,
+                [b, b, minf(b * 1.1, 1.0), 1.0]);
+        }
+    }
+}
+
+// --- the battle starfield: stars and ten nebulas -------------------------
+
+fn hash_noise(x: i64, y: i64, seed: u32) -> f32 {
+    var h = (x as u32) * 374761393u32
+        + (y as u32) * 668265263u32
+        + seed * 1274126177u32;
+    h = (h ^ (h >> 13)) * 1103515245u32;
+    h = h ^ (h >> 16);
+    (h & 0xffffu32) as f32 / 65535.0
+}
+
+pub struct Nebula {
+    x: f32,
+    y: f32,
+    radius: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    alpha: f32,
+    speed: f32,
+    drift_phase: f32,
+    drift_speed: f32,
+    angle: f32,
+    stretch: f32,
+    noise_seed: u32,
+    lobes: u8,
+    lobe_phase: f32,
+}
+
+pub struct BattleStarfield {
+    stars: Starfield,
+    nebulas: Vec<Nebula>,
+}
+
+const NEBULA_COLORS: [[f32; 3]; 5] = [
+    [0.4, 0.1, 0.7],
+    [0.1, 0.2, 0.6],
+    [0.6, 0.1, 0.2],
+    [0.1, 0.4, 0.4],
+    [0.5, 0.3, 0.05],
+];
+
+fn nebula_f32(s: inout u32) -> f32 {
+    let v = lcg_next(&s) >> 16;
+    v as f32 / 65535.0
+}
+
+pub fn battle_starfield_new(gpa: Gpa) -> BattleStarfield {
+    var seed: u32 = 99887;
+    var nebulas: Vec<Nebula> = Vec::with_capacity_in(10, gpa);
+    for i in 0..10 {
+        let ci = ((nebula_f32(&seed) * 5.0) as i64) % 5;
+        let col = NEBULA_COLORS[ci];
+        let x = nebula_f32(&seed) * GAME_W as f32;
+        let y = nebula_f32(&seed) * GAME_H as f32;
+        let radius = 25.0 + nebula_f32(&seed) * 50.0;
+        let alpha = 0.09 + nebula_f32(&seed) * 0.12;
+        let speed = 0.5 + nebula_f32(&seed) * 2.0;
+        let drift_phase = nebula_f32(&seed) * TAU;
+        let drift_speed = 0.2 + nebula_f32(&seed) * 0.4;
+        let angle = nebula_f32(&seed) * PI;
+        let stretch = 1.2 + nebula_f32(&seed) * 0.8;
+        let lobes = 2 + (nebula_f32(&seed) * 4.0) as u8;
+        let lobe_phase = nebula_f32(&seed) * TAU;
+        nebulas.push(Nebula {
+            x: x,
+            y: y,
+            radius: radius,
+            r: col[0],
+            g: col[1],
+            b: col[2],
+            alpha: alpha,
+            speed: speed,
+            drift_phase: drift_phase,
+            drift_speed: drift_speed,
+            angle: angle,
+            stretch: stretch,
+            noise_seed: ((i + 1) * 7919) as u32,
+            lobes: lobes,
+            lobe_phase: lobe_phase,
+        });
+    }
+    BattleStarfield { stars: starfield_new(gpa), nebulas: nebulas }
+}
+
+impl BattleStarfield {
+    pub fn update(inout self, dt: f32) {
+        self.stars.update(dt);
+        for i in 0..self.nebulas.len() {
+            self.nebulas[i].y += self.nebulas[i].speed * dt;
+            self.nebulas[i].drift_phase += self.nebulas[i].drift_speed * dt;
+            if self.nebulas[i].y - self.nebulas[i].radius > GAME_H as f32 {
+                self.nebulas[i].y -= GAME_H as f32
+                    + self.nebulas[i].radius * 2.0;
+            }
+        }
+    }
+
+    pub fn draw(self, fb: inout Fb) {
+        // Nebulas first (behind the stars).
+        for i in 0..self.nebulas.len() {
+            let n = self.nebulas[i];
+            let drift_x = sinf(n.drift_phase) * 10.0;
+            let cx = n.x + drift_x;
+            let cy = n.y;
+            let outer = n.radius * n.stretch;
+
+            var min_x = floorf(cx - outer) as i64;
+            if min_x < 0 {
+                min_x = 0;
+            } else if min_x > fb.w {
+                min_x = fb.w;
+            }
+            var min_y = floorf(cy - outer) as i64;
+            if min_y < 0 {
+                min_y = 0;
+            } else if min_y > fb.h {
+                min_y = fb.h;
+            }
+            var max_x = ceilf(cx + outer) as i64 + 1;
+            if max_x < 0 {
+                max_x = 0;
+            } else if max_x > fb.w {
+                max_x = fb.w;
+            }
+            var max_y = ceilf(cy + outer) as i64 + 1;
+            if max_y < 0 {
+                max_y = 0;
+            } else if max_y > fb.h {
+                max_y = fb.h;
+            }
+
+            let cos_a = cosf(n.angle);
+            let sin_a = sinf(n.angle);
+
+            for py in min_y..max_y {
+                for px in min_x..max_x {
+                    let dx = px as f32 + 0.5 - cx;
+                    let dy = py as f32 + 0.5 - cy;
+                    let lx = (cos_a * dx + sin_a * dy) / n.stretch;
+                    let ly = -sin_a * dx + cos_a * dy;
+                    let dist = sqrtf(lx * lx + ly * ly);
+                    if dist >= n.radius {
+                        continue;
+                    }
+                    let norm_dist = dist / n.radius;
+                    let pixel_angle = atan2f(ly, lx);
+                    let lobe_mod = 1.0
+                        + 0.3 * sinf(pixel_angle * n.lobes as f32 + n.lobe_phase)
+                        + 0.15 * sinf(pixel_angle
+                            * (n.lobes as f32 * 2.0 + 1.0)
+                            + n.lobe_phase * 1.7);
+                    let effective_dist = norm_dist / maxf(lobe_mod, 0.3);
+                    if effective_dist >= 1.0 {
+                        continue;
+                    }
+                    let noise = hash_noise(px, py, n.noise_seed);
+                    let noise_factor = 0.5 + noise * 0.5;
+                    let falloff = (1.0 - effective_dist)
+                        * (1.0 - effective_dist);
+                    let a = n.alpha * falloff * noise_factor;
+                    if a > 0.003 {
+                        let color_noise = hash_noise(px + 1000, py + 1000,
+                            n.noise_seed);
+                        let color_var = 0.85 + color_noise * 0.3;
+                        let idx = py * fb.w + px;
+                        let old = fb.px[idx];
+                        let inv = 1.0 - a;
+                        let or_ = (old & 0xffu32) as f32;
+                        let og = ((old >> 8) & 0xffu32) as f32;
+                        let ob = ((old >> 16) & 0xffu32) as f32;
+                        let nr = (n.r * color_var * 255.0 * a + or_ * inv) as u8;
+                        let ng = (n.g * color_var * 255.0 * a + og * inv) as u8;
+                        let nb = (n.b * color_var * 255.0 * a + ob * inv) as u8;
+                        let oa = ((old >> 24) & 0xffu32) as u8;
+                        fb.px[idx] = ((nr as u32) | ((ng as u32) << 8)
+                            | ((nb as u32) << 16) | ((oa as u32) << 24));
+                    }
+                }
+            }
+        }
+        self.stars.draw(&fb);
+    }
+}
+
+// --- the UI frame -------------------------------------------------------
+
+pub const PANEL_WIDTH: i64 = 144;
+pub const TOTAL_W: i64 = GAME_W + PANEL_WIDTH;
+
+/// Copy the game's 224×288 frame into the left of the 368×288 UI frame.
+pub fn blit_game(dst: inout Fb, src: [u32]) {
+    for row in 0..GAME_H {
+        for col in 0..GAME_W {
+            dst.px[row * dst.w + col] = src[row * GAME_W + col];
+        }
+    }
+}
+
+fn dim_overlay(fb: inout Fb) {
+    fb.fill_rect(0, 0, GAME_W, GAME_H, [0.0, 0.0, 0.0, 0.6]);
+}
+
+pub fn render_wave_clear(fb: inout Fb, wave: u32, gpa: Gpa) {
+    dim_overlay(&fb);
+    draw_text_centered(&fb, "WAVE CLEAR", 110.0, 2.0, [1.0, 1.0, 0.2, 1.0]);
+    if wave > 0 {
+        let line = format_in(f"WAVE {wave - 1}", gpa);
+        draw_text_centered(&fb, line.as_slice(), 150.0, 1.0,
+            [0.6, 0.6, 0.6, 1.0]);
+    }
+}
+
+pub fn render_game_over(fb: inout Fb, score: i32, gpa: Gpa) {
+    dim_overlay(&fb);
+    draw_text_centered(&fb, "GAME OVER", 110.0, 2.0, [1.0, 0.2, 0.2, 1.0]);
+    let line = format_in(f"SCORE: {score}", gpa);
+    draw_text_centered(&fb, line.as_slice(), 150.0, 1.0,
+        [0.8, 0.8, 0.8, 1.0]);
+}
+
+const ACTION_NAMES: [[u8]; 18] = [
+    "NOP",
+    "LEFT",
+    "RIGHT",
+    "FIRE",
+    "LEFT+FIRE",
+    "RIGHT+FIRE",
+    "BUY RATE",
+    "BUY SPEED",
+    "BUY DBL",
+    "BUY TRP",
+    "BUY SHIELD",
+    "BUY LIFE",
+    "SELL RATE",
+    "SELL SPEED",
+    "SELL DBL",
+    "SELL TRP",
+    "SELL SHIELD",
+    "SELL LIFE",
+];
+
+/// The 144-pixel policy panel: one bar per action, its name and
+/// percentage over it, the chosen action highlighted, the critic's value
+/// below.
+pub fn draw_policy_panel(fb: inout Fb, probs: [f32; 18], value: f32,
+    action: i64, gpa: Gpa) {
+    let bar_h: i64 = 11;
+    let row_gap: i64 = 2;
+    let pad: i64 = 4;
+    let px = GAME_W;
+    let panel_h = GAME_H;
+
+    fb.fill_rect(px, 0, PANEL_WIDTH, panel_h, [0.04, 0.04, 0.08, 1.0]);
+    fb.fill_rect(px, 0, 1, panel_h, [0.25, 0.25, 0.35, 1.0]);
+
+    let fx = (px + pad) as f32;
+    draw_text(&fb, "POLICY", fx, 2.0, 1.0, [0.5, 0.8, 1.0, 1.0]);
+
+    let bar_x = px + pad;
+    let bar_max_w = PANEL_WIDTH - 2 * pad;
+    let row_stride = bar_h + row_gap;
+    let bars_y0: i64 = 14;
+
+    for i in 0..18 {
+        let yy = bars_y0 + i * row_stride;
+        fb.fill_rect(bar_x, yy, bar_max_w, bar_h,
+            [0.09, 0.09, 0.14, 1.0]);
+        let p = clampf(probs[i], 0.0, 1.0);
+        let w = roundf(p * bar_max_w as f32) as i64;
+        if w > 0 {
+            let col: [f32; 4] = if i == action {
+                [0.95, 0.65, 0.18, 1.0]
+            } else {
+                [0.25, 0.55, 0.95, 0.9]
+            };
+            fb.fill_rect(bar_x, yy, w, bar_h, col);
+        }
+        var pct = roundf(probs[i] * 100.0) as i64;
+        if pct < 0 {
+            pct = 0;
+        } else if pct > 100 {
+            pct = 100;
+        }
+        let name = ACTION_NAMES[i];
+        let label = format_in(f"{name} {pct:>2}%", gpa);
+        let text_col: [f32; 4] = if i == action {
+            [1.0, 1.0, 1.0, 1.0]
+        } else {
+            [0.85, 0.9, 1.0, 1.0]
+        };
+        draw_text(&fb, label.as_slice(), (bar_x + 2) as f32,
+            (yy + 2) as f32, 1.0, text_col);
+    }
+
+    let value_y = bars_y0 + 18 * row_stride + 4;
+    let neg = value < 0.0;
+    let av = if neg { -value } else { value };
+    let vs = if neg {
+        format_in(f"V  -{av:.2}", gpa)
+    } else {
+        format_in(f"V  +{av:.2}", gpa)
+    };
+    draw_text(&fb, vs.as_slice(), fx, value_y as f32, 1.0,
+        [0.4, 1.0, 0.5, 0.95]);
+}
+
+/// The upgrade inventory bottom-left: five counters and the currency,
+/// from the last step result.
+pub fn draw_hud(fb: inout Fb, r: Step, gpa: Gpa) {
+    let y_base = GAME_H as f32 - 28.0;
+    let label: [f32; 4] = [0.8, 0.8, 0.8, 0.7];
+    let dbl = if r.bullet_count >= 2 { 1u8 } else { 0u8 };
+    let trp = if r.bullet_count >= 3 { 1u8 } else { 0u8 };
+    let shl = if r.shield_level < 1 { r.shield_level } else { 1u8 };
+    hud_line(&fb, "RAT", r.fire_rate_stacks, r.inventory[0],
+        y_base, label, gpa);
+    hud_line(&fb, "SPD", r.speed_stacks, r.inventory[1],
+        y_base - 10.0, label, gpa);
+    hud_line(&fb, "DBL", dbl, r.inventory[2],
+        y_base - 20.0, label, gpa);
+    hud_line(&fb, "TRP", trp, r.inventory[3],
+        y_base - 30.0, label, gpa);
+    hud_line(&fb, "SHL", shl, r.inventory[4],
+        y_base - 40.0, label, gpa);
+    let money = format_in(f"$ {r.currency}", gpa);
+    draw_text(&fb, money.as_slice(), 2.0, y_base - 50.0, 1.0,
+        [1.0, 1.0, 0.3, 0.8]);
+}
+
+fn hud_line(fb: inout Fb, name: [u8], active: u8, stock: u8, y: f32,
+    color: [f32; 4], gpa: Gpa) {
+    let line = format_in(f"{name} {active}+{stock}", gpa);
+    draw_text(&fb, line.as_slice(), 2.0, y, 1.0, color);
+}
+
+/// An infer-style circle: `steps` samples around the rim, each blended
+/// (the Rust infer's `draw_circle`, not the core's filled-ring test).
+pub fn saliency_circle(fb: inout Fb, cx: f32, cy: f32, radius: f32,
+    color: [u8; 3], alpha: f32) {
+    var steps = (radius * 6.28) as i64;
+    if steps < 16 {
+        steps = 16;
+    }
+    for i in 0..steps {
+        let angle = (i as f32 / steps as f32) * TAU;
+        let px = roundf(cx + radius * cosf(angle)) as i64;
+        let py = roundf(cy + radius * sinf(angle)) as i64;
+        if px >= 0 && py >= 0 && px < fb.w && py < fb.h {
+            let idx = py * fb.w + px;
+            let old = fb.px[idx];
+            let inv = 1.0 - alpha;
+            let r = (old & 0xffu32) as f32 * inv
+                + color[0] as f32 * alpha;
+            let g = ((old >> 8) & 0xffu32) as f32 * inv
+                + color[1] as f32 * alpha;
+            let b = ((old >> 16) & 0xffu32) as f32 * inv
+                + color[2] as f32 * alpha;
+            let a = ((old >> 24) & 0xffu32) as u8;
+            fb.px[idx] = ((r as u8) as u32) | (((g as u8) as u32) << 8)
+                | (((b as u8) as u32) << 16) | ((a as u32) << 24);
+        }
+    }
+}

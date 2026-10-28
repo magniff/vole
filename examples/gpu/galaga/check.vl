@@ -1,0 +1,404 @@
+// check.vl: what runs with no window (CI, ssh) — the encoder, the
+// network and its gradients, the simulation, the composed session, the
+// panel and the overlays, and one frame through the real GPU pipeline
+// (RawSurface::Headless), each against a value the Rust client produced.
+//
+// The numbers below are the Rust reference's: fb_ref.rs for the game and
+// the session, the training env's encoder for the observation, and the
+// checkpoint's own forward/saliency for the network. They are exact for
+// the frames and the observation; the network's summed magnitude is
+// compared within a tolerance for the last digits of a dot product.
+//
+// Every name is printed as "NAME ok" so tests/examples/gpu-galaga.test
+// can look for them.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, RawSurface};
+use std::num::f32_to_bits;
+
+use crate::draw::{fb_new, pack};
+use crate::game::{Step, sim_new};
+use crate::infer::infer_new_seeded;
+use crate::model::{forward, load, saliency};
+use crate::obs::{OBS_SIZE, encode, stack};
+use crate::render::{
+    TOTAL_W, draw_hud, draw_policy_panel, render_game_over, render_wave_clear, saliency_circle,
+};
+use crate::session::session_new;
+use crate::view::{FB_H, FB_W, viewer_new};
+
+/// The observation's hash after every 60 two-tick steps of the seed-7
+/// run, then its final hash.
+const OBS_MARKS: [u64; 7] = [
+    0x2c8ba9c9df943358,
+    0xdb738255b4510902,
+    0x766fe625bd278b79,
+    0x76c3ed685fc68017,
+    0xb8467da24d1b777b,
+    0xf5c616bc0284acf0,
+    0x343e2e7b21c1b396,
+];
+const OBS_RESET: u64 = 0xd4fa48b0d8dd7005;
+const OBS_FINAL: u64 = 0x797598b6182d43f4;
+
+/// The game's own frame and the composed session frame at the checked
+/// ticks (Rust: examples/fb_ref.rs).
+const GAME_MARKS: [u64; 5] = [
+    0xcb5e2801105c2765,
+    0x0b6c04814e77f83e,
+    0x1504da1e9d680299,
+    0xd76dd0fe08484bf1,
+    0xc8c3eab4508b7a37,
+];
+const SESSION_MARKS: [u64; 5] = [
+    0x7a20d0afd5843a2b,
+    0x9dae184fb109fa8e,
+    0x47d6436bcf27c519,
+    0x613aabb2d12dfb8c,
+    0xaffdb6f34e643b45,
+];
+
+fn fnv_u32(px: [u32]) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for i in 0..px.len() {
+        let c = px[i];
+        for k in 0..4 {
+            h ^= ((c >> (k * 8)) & 0xff) as u64;
+            h = h * 0x100000001b3u64;
+        }
+    }
+    h
+}
+
+fn fnv_f32(v: [f32]) -> u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for i in 0..v.len() {
+        let b = f32_to_bits(v[i]);
+        for k in 0..4 {
+            h ^= ((b >> (k * 8)) & 0xff) as u64;
+            h = h * 0x100000001b3u64;
+        }
+    }
+    h
+}
+
+fn ok(name: [u8], good: bool, all_ok: inout bool) {
+    if good {
+        println(f"{name} ok");
+    } else {
+        println(f"{name} FAIL");
+        all_ok = false;
+    }
+}
+
+/// Count words of one exact colour in a region.
+fn count_color(px: [u32], w: i64, x0: i64, y0: i64, x1: i64, y1: i64,
+    c: u32) -> i64 {
+    var n: i64 = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if px[y * w + x] == c {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The encoder and the network: the seed-7 observation against the Rust
+/// env's hashes, then the checkpoint's forward and one saliency pass.
+fn check_net(model: [u8], gpa: Gpa, all_ok: inout bool) -> Vec<f32> {
+    var sim = sim_new(7655465419508447804u64, 1, gpa);
+    var r = sim.step(0, gpa);
+    var prev = encode(r, gpa);
+    let zeros = Vec::filled_in(OBS_SIZE, 0.0f32, gpa);
+    var last = stack(zeros.as_slice(), prev.as_slice(), gpa);
+    var obs_good = fnv_f32(last.as_slice()) == OBS_RESET;
+
+    let seq: [i64; 6] = [2, 2, 1, 0, 3, 1];
+    var mark: i64 = 0;
+    for i in 0..450 {
+        let m = crate::game::action_mask(seq[i % 6]);
+        r = sim.step(m, gpa);
+        r = sim.step(m, gpa);
+        let cur = encode(r, gpa);
+        last = stack(prev.as_slice(), cur.as_slice(), gpa);
+        prev = cur;
+        if (i + 1) % 60 == 0 {
+            if fnv_f32(last.as_slice()) != OBS_MARKS[mark] {
+                obs_good = false;
+            }
+            mark += 1;
+        }
+    }
+    if fnv_f32(last.as_slice()) != OBS_FINAL {
+        obs_good = false;
+    }
+    ok("obs", obs_good, &all_ok);
+
+    let m = load(model, gpa);
+    let net = forward(m, last.as_slice(), gpa);
+    // The Rust client's value for this observation, to the bit.
+    var net_good = f32_to_bits(net.value) == 0x40827a80;
+    var psum: f32 = 0.0;
+    for i in 0..18 {
+        psum += net.probs[i];
+    }
+    if psum < 0.9999 || psum > 1.0001 {
+        net_good = false;
+    }
+    ok("model", net_good, &all_ok);
+
+    let g = saliency(m, last.as_slice(), 3, gpa);
+    var l1: f32 = 0.0;
+    for i in 0..g.len() {
+        l1 += if g[i] < 0.0 { -g[i] } else { g[i] };
+    }
+    // 129.14203 here, 129.14222 in the Rust/autodiff pass.
+    var sal_good = g.len() == 1630 && l1 > 129.0 && l1 < 129.3;
+    ok("saliency", sal_good, &all_ok);
+    last
+}
+
+/// The simulation and the session: 900 ticks of a fixed action cycle,
+/// both frames against the Rust core.
+fn check_frames(gpa: Gpa, all_ok: inout bool) {
+    var s = session_new(7u64, 1, gpa);
+    let seq: [i64; 6] = [5, 2, 4, 0, 3, 1];
+    var game_good = true;
+    var session_good = true;
+    var mark: i64 = 0;
+    for k in 0..900 {
+        let r = s.step(crate::game::action_mask(seq[k % 6]), gpa);
+        if k < 2 || (k + 1) % 300 == 0 {
+            if fnv_u32(s.game_framebuffer()) != GAME_MARKS[mark] {
+                game_good = false;
+            }
+            if fnv_u32(s.framebuffer()) != SESSION_MARKS[mark] {
+                session_good = false;
+            }
+            mark += 1;
+        }
+        if k == 899 && (r.score != 6150 || r.lives != 3 || r.wave != 1) {
+            game_good = false;
+        }
+    }
+    ok("game fb", game_good, &all_ok);
+    ok("session", session_good, &all_ok);
+}
+
+/// The 368-wide UI frame's pieces, on a cleared frame with known
+/// inputs: the panel's bars and labels, the dimmed overlays, the HUD's
+/// lines, and a saliency ring.
+fn check_ui(gpa: Gpa, all_ok: inout bool) {
+    var fb = fb_new(TOTAL_W, 288, gpa);
+    fb.clear(0, 0, 0, 255);
+    var probs: [f32; 18] = [0.0; 18];
+    probs[3] = 1.0;
+    probs[5] = 0.5;
+    draw_policy_panel(&fb, probs, -1.25, 3, gpa);
+
+    let bg = pack(10, 10, 20, 255); // 0.04, 0.04, 0.08
+    let edge = pack(63, 63, 89, 255); // 0.25, 0.25, 0.35
+    let chosen = pack(242, 165, 45, 255); // 0.95, 0.65, 0.18 at alpha 1
+    let empty = pack(22, 22, 35, 255); // 0.09, 0.09, 0.14
+    var panel_good = true;
+    if fb.px[287 * TOTAL_W + 224 + 140] != bg {
+        panel_good = false;
+    }
+    if fb.px[100 * TOTAL_W + 224] != edge {
+        panel_good = false;
+    }
+    // Action 3's bar: the third row, full width, the highlight colour.
+    if fb.px[58 * TOTAL_W + 360] != chosen {
+        panel_good = false;
+    }
+    // Action 5's bar ends halfway; action 4's row is empty.
+    if fb.px[84 * TOTAL_W + 360] != empty {
+        panel_good = false;
+    }
+    // The value line puts text below the bars.
+    var value_px: i64 = 0;
+    for y in 250..266 {
+        for x in 228..364 {
+            if fb.px[y * TOTAL_W + x] != bg {
+                value_px += 1;
+            }
+        }
+    }
+    if value_px == 0 {
+        panel_good = false;
+    }
+    ok("panel", panel_good, &all_ok);
+
+    // The wave-clear overlay dims what is under it by 0.6; 39 is 100
+    // times the 0.4 as f32, truncated.
+    fb.clear(100, 150, 200, 255);
+    render_wave_clear(&fb, 4, gpa);
+    var overlay_good = fb.px[250 * TOTAL_W + 5] == pack(39, 59, 79, 255);
+    let yellow = count_color(fb.px.as_slice(), TOTAL_W, 0, 108, 224, 132,
+        pack(255, 255, 51, 255));
+    if yellow == 0 {
+        overlay_good = false;
+    }
+    // Game over: red, on a black frame.
+    fb.clear(0, 0, 0, 255);
+    render_game_over(&fb, 6150, gpa);
+    let red = count_color(fb.px.as_slice(), TOTAL_W, 0, 108, 224, 132,
+        pack(255, 51, 51, 255));
+    if red == 0 {
+        overlay_good = false;
+    }
+    // The HUD's inventory lines, then the money line in yellow.
+    fb.clear(0, 0, 0, 255);
+    var st = Step::empty(gpa);
+    st.fire_rate_stacks = 2;
+    st.inventory = [1, 2, 3, 4, 5];
+    st.currency = 250;
+    draw_hud(&fb, st, gpa);
+    let hud_grey = count_color(fb.px.as_slice(), TOTAL_W, 0, 190, 120, 268,
+        pack(142, 142, 142, 255));
+    var money_px: i64 = 0;
+    for y in 206..220 {
+        for x in 0..80 {
+            if fb.px[y * TOTAL_W + x] != 0 {
+                money_px += 1;
+            }
+        }
+    }
+    if hud_grey == 0 || money_px == 0 {
+        overlay_good = false;
+    }
+    // A saliency ring: its 0° sample lands exactly on the radius.
+    fb.clear(0, 0, 0, 255);
+    saliency_circle(&fb, 100.0, 100.0, 10.0, [255, 80, 80], 0.9);
+    if fb.px[100 * TOTAL_W + 110] == pack(0, 0, 0, 255) {
+        overlay_good = false;
+    }
+    ok("overlay", overlay_good, &all_ok);
+}
+
+/// One frame through the real pipeline into a headless surface the size
+/// of the UI frame: every pixel must come back as the framebuffer's,
+/// in the surface's BGRA byte order.
+fn check_gpu(gpa: Gpa, all_ok: inout bool) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"galaga: no GPU: {e}");
+            return 1;
+        }
+    };
+    var viewer = match viewer_new(dev) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln(f"galaga: the view: {e}");
+            return 1;
+        }
+    };
+    var fb = fb_new(FB_W, FB_H, gpa);
+    fb.clear(10, 20, 30, 255);
+    fb.fill_rect(0, 0, 16, 16, [255.0, 0.0, 0.0, 1.0]);
+    fb.fill_rect(FB_W - 16, FB_H - 16, 16, 16, [0.0, 255.0, 0.0, 1.0]);
+    fb.fill_rect(100, 100, 40, 40, [255.0, 255.0, 0.0, 1.0]);
+
+    var surf = match inst.surface(dev, RawSurface::Headless) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln(f"galaga: no surface: {e}");
+            return 1;
+        }
+    };
+    surf.configure(dev, FB_W, FB_H, format: Format::Bgra8Unorm, vsync: false);
+    let stride = (FB_W * 4 + 255) / 256 * 256;
+    let frame = match surf.frame() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln(f"galaga: no frame: {e}");
+            return 1;
+        }
+    };
+    let texview = frame.texture.view();
+    viewer.draw(dev, &queue, texview, fb.px.as_slice());
+    var readback = dev.buffer(stride * FB_H,
+        BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(enc.finish());
+    let px = readback.map_read(dev);
+
+    var bad: i64 = 0;
+    for y in 0..FB_H {
+        for x in 0..FB_W {
+            let p = y * stride + x * 4;
+            let c = fb.px[y * FB_W + x];
+            let r = (c & 0xff) as i64;
+            let g = ((c >> 8) & 0xff) as i64;
+            let b = ((c >> 16) & 0xff) as i64;
+            if px[p] as i64 != b || px[p + 1] as i64 != g
+                || px[p + 2] as i64 != r || px[p + 3] as i64 != 255 {
+                bad += 1;
+            }
+        }
+    }
+    ok("render", bad == 0, &all_ok);
+    0
+}
+
+/// The agent playing with no window: it shows the loop's cadence, the
+/// sampled actions and the final score.
+fn play(model: [u8], steps: i64, wave: u32, sal: bool, gpa: Gpa) -> i32 {
+    var inf = infer_new_seeded(model, 7655465419508447804u64, gpa);
+    var s = session_new(7655465419508447804u64, wave, gpa);
+    var counter: i64 = 0;
+    var actions: u32 = 0;
+    var last_score = 0;
+    var last_wave = wave;
+    var done = false;
+    for i in 0..steps {
+        if counter == 0 {
+            actions = inf.pick_action(gpa);
+        }
+        counter = (counter + 1) % 2;
+        let r = s.step(actions, gpa);
+        inf.update_obs(r, gpa);
+        if sal && counter == 0 {
+            inf.compute_saliency(gpa);
+        }
+        last_score = r.score;
+        last_wave = r.wave;
+        if s.is_done() {
+            done = true;
+            break;
+        }
+    }
+    println(f"play {steps} steps: score {last_score} wave {last_wave} done {done}");
+    if sal {
+        println(f"saliency targets {inf.targets.len()}");
+    }
+    0
+}
+
+pub fn run(model: [u8], steps: i64, wave: u32, sal: bool, gpa: Gpa) -> i32 {
+    var all_ok = true;
+    println(f"galaga check: {FB_W}x{FB_H}");
+    check_net(model, gpa, &all_ok);
+    check_frames(gpa, &all_ok);
+    check_ui(gpa, &all_ok);
+    let gpu_rc = check_gpu(gpa, &all_ok);
+    if gpu_rc != 0 {
+        return gpu_rc;
+    }
+    if steps > 0 {
+        play(model, steps, wave, sal, gpa);
+    }
+    if all_ok {
+        return 0;
+    }
+    1
+}

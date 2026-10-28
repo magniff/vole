@@ -11,7 +11,8 @@
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/link/run.sh
+# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
+# (the book's examples and sessions, 0.25) and tests/link/run.sh
 # (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [FILTER]
@@ -676,6 +677,10 @@ esac
 case guide in
     *"$FILTER"*) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
 esac
+# (0.25) The book's blocks and sessions (tests/book/run.sh): category "book".
+case book in
+    *"$FILTER"*) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
+esac
 case fmt in
     *"$FILTER"*) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
 esac
@@ -856,6 +861,7 @@ case refactor in
             case "$status" in
                 pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "refactor fail" >>"$TALLY"; count=$((count + 1)) ;;
+                xfail) echo "refactor xfail" >>"$TALLY"; count=$((count + 1)) ;;
             esac
         done <"$WORK/refactor.out"
         if ! grep -q '^pass' "$WORK/refactor.out"; then
@@ -882,6 +888,25 @@ case guide in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/guide.out" >>"$FAILURES"
+        ;;
+esac
+
+# The book (0.25): tests/book/run.sh (run above), every vole block of
+# book/*.md compiled, its outputs, errors and shell sessions as printed;
+# category "book".
+case book in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "book pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "book fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/book.out"
+        if ! grep -q '^pass' "$WORK/book.out"; then
+            echo "book fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/book.out" >>"$FAILURES"
         ;;
 esac
 
@@ -953,6 +978,60 @@ case example_layout in
             fi
             count=$((count + 1))
         done
+        ;;
+esac
+
+# (0.25.1) Every example builds the way a reader would build it: the one
+# command `volec examples/.../main.vl -o NAME`, no extra files or flags.
+# Exceptions are only the examples whose point needs more (named with the
+# reason below). Category "example_build"; host target only (it links).
+case example_build in
+    *"$FILTER"*)
+        case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64) eb_host=aarch64-macos ;;
+            Darwin-x86_64) eb_host=x86_64-macos ;;
+            Linux-x86_64) eb_host=x86_64-linux ;;
+            Linux-aarch64) eb_host=aarch64-linux ;;
+            *) eb_host="" ;;
+        esac
+        if [ "$TARGET" = "$eb_host" ]; then
+            for m in "$ROOT"/examples/*/main.vl "$ROOT"/examples/*/*/main.vl; do
+                [ -f "$m" ] || continue
+                ex=${m%/main.vl}
+                ex=${ex#"$ROOT"/examples/}
+                case "$ex" in
+                    tools | tools/*) continue ;;   # walkthroughs; some fail on purpose
+                    c-mixed-build) continue ;;     # its point is linking C sources
+                esac
+                # (a folder of a program's modules, not an example)
+                [ -f "${m%/main.vl}/../main.vl" ] && case "$ex" in */*) continue ;; esac
+                if "$COMPILER" "$m" -o "$WORK/example_build.bin" >"$WORK/example_build.out" 2>&1; then
+                    echo "example_build pass" >>"$TALLY"
+                else
+                    echo "example_build fail" >>"$TALLY"
+                    printf 'FAIL example_build %s:\n    `volec examples/%s/main.vl -o x` does not build:\n%s\n\n' \
+                        "$ex" "$ex" "$(tail -3 "$WORK/example_build.out" | sed 's/^/    /')" >>"$FAILURES"
+                fi
+                count=$((count + 1))
+            done
+        fi
+        ;;
+esac
+
+# (0.25.1) The README's example: its first code block under "## An
+# example" is tests/run/readme_example.vl after its header (compiled and
+# run as a case there); category "readme".
+case readme_sync in
+    *"$FILTER"*)
+        readme_block=$(awk '/^## An example/ { s = 1; next } s && /^```/ { if (c) exit; c = 1; next } c' "$ROOT/README.md")
+        readme_case=$(awk 'h { print; next } /^$/ { h = 1 }' "$ROOT/tests/run/readme_example.vl")
+        if [ -n "$readme_block" ] && [ "$readme_block" = "$readme_case" ]; then
+            echo "readme pass" >>"$TALLY"
+        else
+            echo "readme fail" >>"$TALLY"
+            printf 'FAIL readme_sync:\n    README.md "An example" differs from tests/run/readme_example.vl (after its header)\n\n' >>"$FAILURES"
+        fi
+        count=$((count + 1))
         ;;
 esac
 

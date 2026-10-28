@@ -1,0 +1,236 @@
+// voxel: deterministic procedural terrain generated and meshed on the GPU,
+// streamed around a free-fly camera and presented through Vole's native window.
+
+mod camera;
+mod check;
+mod render;
+mod shaders;
+mod world;
+
+use std::{clamp, env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use camera::{Camera, camera_default};
+use render::renderer_new;
+use world::world_new;
+
+fn brush_position(cam: Camera) -> [f64; 3] {
+    let f = cam.forward();
+    [cam.x + f[0] * 12.0, cam.y + f[1] * 12.0, cam.z + f[2] * 12.0]
+}
+
+fn parse_size(s: str) -> (i64, i64) {
+    let (ws, hs) = match s.split_once("x") {
+        Some(pair) => pair,
+        None => ("320", "200"),
+    };
+    (ws.parse::<i64>().unwrap_or(320), hs.parse::<i64>().unwrap_or(200))
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("voxel", gpa).version("0.1")
+        .about("a deterministic GPU-generated streaming voxel world")
+        .arg(Arg::option("seed").value_name("N").default("1").help("world seed"))
+        .arg(Arg::flag("headless").help("run the real GPU pipeline without a window"))
+        .arg(Arg::flag("benchmark").help("measure generation and offscreen rendering"))
+        .arg(Arg::option("frames").value_name("N").default("120").help("benchmark frame count"))
+        .arg(Arg::option("size").value_name("WxH").default("320x200"))
+        .arg(Arg::option("out").value_name("FILE.ppm"));
+    let m = cli.parse_or_exit(env::args());
+    let seed = m.get_as::<u64>("seed").unwrap_or(1);
+    if m.flag("headless") || m.flag("benchmark") {
+        let (width, height) = parse_size(m.get("size").unwrap_or("320x200"));
+        if m.flag("benchmark") {
+            return check::benchmark(seed, width, height, m.get_as::<i64>("frames").unwrap_or(120),
+                gpa);
+        }
+        return check::run(seed, width, height, m.get("out").unwrap_or(""), gpa);
+    }
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("voxel: no window server on this display");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("voxel", 1280, 800)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("voxel: could not create a window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"voxel: no GPU: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"voxel: no window surface: {e}");
+            return 1;
+        }
+    };
+    let size = win.size();
+    surf.configure(dev, size.w, size.h);
+    var world = match world_new(dev, seed, gpa) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln(f"voxel: terrain pipelines: {e}");
+            return 1;
+        }
+    };
+    var renderer = match renderer_new(dev, size.w, size.h) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"voxel: render pipeline: {e}");
+            return 1;
+        }
+    };
+    world.generate_initial(dev, &queue, renderer.layout(), renderer.camera);
+    var cam = camera_default();
+    var keys: [bool; 6] = [false; 6];
+    var dragging = false;
+    var last_x = 0.0;
+    var last_y = 0.0;
+    var debug = 0;
+    var editing = false;
+    var brush_radius = 3.0;
+    var sun_index = 0;
+    var previous = monotonic_now();
+    let start = previous;
+    var fps_clock = previous;
+    var frames = 0;
+    var frame_ms = 0.0;
+    println("voxel: native window + Metal GPU");
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = monotonic_now();
+                let dt = clamp(now.saturating_sub(previous).as_secs_f64(), 0.0, 0.05);
+                previous = now;
+                let forward = (if keys[0] { 1.0 } else { 0.0 }) - (if keys[1] { 1.0 } else { 0.0 });
+                let strafe = (if keys[3] { 1.0 } else { 0.0 }) - (if keys[2] { 1.0 } else { 0.0 });
+                let vertical = (if keys[4] { 1.0 } else { 0.0 }) - (if keys[5] { 1.0 }
+                    else { 0.0 });
+                cam.fly(dt, forward, strafe, vertical);
+                world.update(dev, &queue, cam.x, cam.z, renderer.layout(), renderer.camera);
+                match surf.frame() {
+                    Ok(frame) => {
+                        let target = frame.texture.view();
+                        let visible = renderer.draw(dev, &queue, target, world, cam,
+                            now.saturating_sub(start).as_secs_f64(), debug,
+                            brush_position(cam), brush_radius, editing, sun_index);
+                        frame.present(&queue);
+                        frames += 1;
+                        if now.saturating_sub(fps_clock).as_millis() >= 400 {
+                            let elapsed = now.saturating_sub(fps_clock).as_secs_f64();
+                            frame_ms = elapsed * 1000.0 / frames as f64;
+                            let title = format_in(
+                                f"voxel | {frame_ms:.1}ms | chunks {visible}/{world.chunks.len()} | draws {visible} | ~{visible * 2048} tris | seed {world.seed} | xyz {cam.x:.0} {cam.y:.0} {cam.z:.0}",
+                                gpa,
+                            );
+                            win.set_title(title.as_slice());
+                            fps_clock = now;
+                            frames = 0;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                if size.w > 0 && size.h > 0 {
+                    surf.configure(dev, size.w, size.h);
+                    renderer.resize(dev, size.w, size.h);
+                }
+            }
+            Ok(Event::Key(k)) => {
+                match k.key {
+                    Logical::Named(Named::Escape) => if k.pressed { win.close(); break; },
+                    Logical::Named(Named::Shift) => keys[5] = k.pressed,
+                    Logical::Named(Named::ArrowLeft) => if k.pressed {
+                        sun_index = (sun_index + 3) % 4;
+                    },
+                    Logical::Named(Named::ArrowRight) => if k.pressed {
+                        sun_index = (sun_index + 1) % 4;
+                    },
+                    Logical::Char(ch) => {
+                        if ch == 'w' as u32 { keys[0] = k.pressed; }
+                        if ch == 's' as u32 { keys[1] = k.pressed; }
+                        if ch == 'a' as u32 { keys[2] = k.pressed; }
+                        if ch == 'd' as u32 { keys[3] = k.pressed; }
+                        if ch == ' ' as u32 { keys[4] = k.pressed; }
+                        if k.pressed && !k.ime {
+                            if ch == 'q' as u32 { win.close(); break; }
+                            if ch == 'e' as u32 { editing = !editing; }
+                            if ch == 'f' as u32 { debug = if debug == 5 { 0 } else { 5 }; }
+                            if ch == 'r' as u32 {
+                                world.generate_initial(dev, &queue, renderer.layout(),
+                                    renderer.camera);
+                            }
+                            if ch == 'n' as u32 {
+                                world = match world_new(dev, world.seed + 1, gpa) {
+                                    Ok(w) => w,
+                                    Err(_) => break,
+                                };
+                                world.generate_initial(dev, &queue, renderer.layout(),
+                                    renderer.camera);
+                            }
+                        }
+                    }
+                    Logical::F(3) => if k.pressed { debug = (debug + 1) % 6; },
+                    _ => {}
+                }
+            }
+            Ok(Event::Mouse(mouse)) => {
+                match mouse.action {
+                    MouseAction::Press => {
+                        if editing
+                            && (mouse.button == Button::Left || mouse.button == Button::Right) {
+                            let brush = brush_position(cam);
+                            world.sculpt(dev, &queue, brush[0] as f32, brush[1] as f32,
+                                brush[2] as f32, brush_radius as f32,
+                                mouse.button == Button::Right);
+                        } else if mouse.button == Button::Left {
+                            dragging = true;
+                            last_x = mouse.x;
+                            last_y = mouse.y;
+                        }
+                    }
+                    MouseAction::Release => dragging = false,
+                    MouseAction::Move => if dragging {
+                        cam.look(mouse.x - last_x, mouse.y - last_y);
+                        last_x = mouse.x;
+                        last_y = mouse.y;
+                    },
+                }
+            }
+            Ok(Event::Scroll(wheel)) => {
+                if editing {
+                    brush_radius = clamp(brush_radius + wheel.dy * 0.25, 1.0, 10.0);
+                } else {
+                    cam.speed = clamp(cam.speed + wheel.dy, 4.0, 64.0);
+                }
+            }
+            Ok(Event::Close(_)) => { win.close(); break; }
+            Ok(Event::Quit) => { win.close(); break; }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    0
+}

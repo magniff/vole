@@ -1,0 +1,183 @@
+// bus.vl: the CPU's 64 KiB address space — 2 KiB of RAM (mirrored every
+// 2 KiB), the PPU's eight registers, the APU's holes, OAM DMA, the two
+// controllers, the cartridge's PRG RAM and banked PRG, and the open bus
+// those unmapped addresses read as. The CPU reaches memory only through
+// `bus_read` and `bus_write`, which is what makes a write to $2006 or a
+// read of $2002 do its side effect at the right moment.
+//
+// OAM DMA stalls the CPU 513 or 514 cycles; the stall is returned by
+// `bus_take_stall` and added to the next step's PPU catch-up, so the
+// picture keeps time across a $4014 write.
+
+use apu::{apu_new, Apu};
+use cart::Cart;
+use pad::{pad_new, Pad};
+use ppu::{ppu_new, ppu_oam_dma, ppu_read_reg, ppu_run, ppu_take_nmi, ppu_write_reg, Ppu};
+
+pub struct Bus {
+    ram: Vec<u8>,
+    pub cart: Cart,
+    pub ppu: Ppu,
+    pub apu: Apu,
+    pub pads: [Pad; 2],
+    open_bus: u8,
+    stall: i64,
+    // Bus accesses since the last `bus_take_accesses`: each one is a CPU
+    // cycle the PPU already ran for, so `run_frame` only ticks the
+    // internal cycles left over.
+    accesses: i64,
+    pub log_writes: bool,
+    pub log_budget: i64,
+    pub opcode: u8,
+}
+
+pub fn bus_new(cart: sink Cart, gpa: Gpa) -> Bus {
+    var ram: Vec<u8> = Vec::new_in(gpa);
+    for _ in 0..2048 {
+        ram.push(0);
+    }
+    Bus {
+        ram: ram,
+        cart: cart,
+        ppu: ppu_new(gpa),
+        apu: apu_new(),
+        pads: [pad_new(), pad_new()],
+        open_bus: 0,
+        stall: 0,
+        accesses: 0,
+        log_writes: false,
+        log_budget: 0,
+        opcode: 0,
+    }
+}
+
+pub fn bus_read(bus: inout Bus, addr: i64) -> u8 {
+    bus.accesses += 1;
+    ppu_run(&bus.ppu, &bus.cart, 3);
+    let a = addr & 0xffff;
+    if a < 0x2000 {
+        let v = bus.ram[a & 0x7ff];
+        bus.open_bus = v;
+        return v;
+    }
+    if a < 0x4000 {
+        let reg = a & 7;
+        if reg == 2 {
+            let s = ppu_read_reg(&bus.ppu, &bus.cart, 2);
+            if bus.log_writes && bus.log_budget > 0 {
+                eprintln(f"r 2002 -> {s:02x} sl={bus.ppu.scanline} dot={bus.ppu.dot} fr={bus.ppu.frame} op={bus.opcode:02x}");
+                bus.log_budget -= 1;
+            }
+            return (s & 0xe0) | (bus.open_bus & 0x1f);
+        }
+        if reg == 4 || reg == 7 {
+            let v = ppu_read_reg(&bus.ppu, &bus.cart, reg);
+            bus.open_bus = v;
+            return v;
+        }
+        return bus.open_bus;
+    }
+    if a < 0x4020 {
+        if a == 0x4015 {
+            return bus.apu.read_status(a);
+        }
+        if a == 0x4016 {
+            let v = 0x40 | bus.pads[0].read();
+            bus.open_bus = v;
+            return v;
+        }
+        if a == 0x4017 {
+            let v = 0x40 | bus.pads[1].read();
+            bus.open_bus = v;
+            return v;
+        }
+        return bus.open_bus;
+    }
+    let v = bus.cart.cpu_read(a);
+    bus.open_bus = v;
+    v
+}
+
+pub fn bus_write(bus: inout Bus, addr: i64, val: u8) {
+    bus.accesses += 1;
+    ppu_run(&bus.ppu, &bus.cart, 3);
+    let a = addr & 0xffff;
+    bus.open_bus = val;
+    if a < 0x2000 {
+        bus.ram[a & 0x7ff] = val;
+        return;
+    }
+    if a < 0x4000 {
+        if bus.log_writes && (((a & 7) <= 1) || ((a & 7) >= 6)) && bus.log_budget > 0 {
+            eprintln(f"w {a & 7} <- {val:02x} sl={bus.ppu.scanline} dot={bus.ppu.dot} fr={bus.ppu.frame} odd={bus.ppu.odd}");
+            bus.log_budget -= 1;
+        }
+        ppu_write_reg(&bus.ppu, &bus.cart, a & 7, val);
+        return;
+    }
+    if a == 0x4014 {
+        // 256 bytes from the page the value names, then the stall.
+        var page: [u8; 256] = [0; 256];
+        let base = (val as i64) << 8;
+        for i in 0..256 {
+            page[i] = bus_read(&bus, base + i);
+        }
+        ppu_oam_dma(&bus.ppu, page[..]);
+        bus.stall += 513;
+        return;
+    }
+    if a == 0x4016 {
+        bus.pads[0].write_strobe(val);
+        bus.pads[1].write_strobe(val);
+        return;
+    }
+    if a < 0x4020 {
+        bus.apu.write(a, val);
+        return;
+    }
+    bus.cart.cpu_write(a, val);
+}
+
+pub fn bus_take_stall(bus: inout Bus) -> i64 {
+    let n = bus.stall;
+    bus.stall = 0;
+    n
+}
+
+pub fn bus_take_accesses(bus: inout Bus) -> i64 {
+    let n = bus.accesses;
+    bus.accesses = 0;
+    n
+}
+
+pub fn bus_nmi_pending(bus: Bus) -> bool {
+    bus.ppu.nmi_pending
+}
+
+pub fn bus_nmi_ack(bus: inout Bus) {
+    ppu_take_nmi(&bus.ppu);
+}
+
+pub fn bus_irq_level(bus: Bus) -> bool {
+    bus.cart.irq() || bus.apu.irq()
+}
+
+pub fn bus_tick_ppu(bus: inout Bus, dots: i64) {
+    ppu_run(&bus.ppu, &bus.cart, dots);
+}
+
+pub fn bus_frame_done(bus: Bus) -> bool {
+    bus.ppu.frame_ready
+}
+
+pub fn bus_begin_frame(bus: inout Bus) {
+    bus.ppu.frame_ready = false;
+}
+
+pub fn bus_set_pad(bus: inout Bus, which: i64, mask: u8) {
+    bus.pads[which].set_buttons(mask);
+}
+
+pub fn bus_pad(bus: Bus, which: i64) -> u8 {
+    bus.pads[which].buttons()
+}

@@ -1,0 +1,393 @@
+// The data model: a process, a snapshot, and the interface state.
+
+use std::time;
+
+use crate::text::contains_text;
+
+// ---- The model ----
+
+const NAME_MAX: i64 = 112;
+pub const USER_MAX: i64 = 24;
+pub const FILTER_MAX: i64 = 64;
+const MSG_MAX: i64 = 96;
+
+// /proc reports CPU times in USER_HZ ticks: 100 on Linux, fixed by the
+// kernel whatever the hardware clock runs at.
+pub const USER_HZ: i64 = 100;
+
+// One process, as one snapshot saw it. Plain data (arrays, no Buf), so a
+// Proc is copied cheaply and a Vec<Proc> sorts in place.
+pub struct Proc {
+    pid: i32,
+    ppid: i32,
+    uid: i64,
+    name: [u8; NAME_MAX],
+    name_len: i64,
+    user: [u8; USER_MAX],
+    user_len: i64,
+    state: u8,
+    pri: i64,
+    ni: i64,
+    threads: i64,
+    virt_kb: i64,
+    rss_kb: i64,
+    shr_kb: i64,
+    cpu_us: i64,
+    cpu_pct: f64,
+    mem_pct: f64,
+}
+
+impl Proc {
+    fn empty() -> Proc {
+        Proc {
+            pid: 0,
+            ppid: 0,
+            uid: 0,
+            name: [0; NAME_MAX],
+            name_len: 0,
+            user: [0; USER_MAX],
+            user_len: 0,
+            state: '?',
+            pri: 0,
+            ni: 0,
+            threads: 0,
+            virt_kb: 0,
+            rss_kb: 0,
+            shr_kb: 0,
+            cpu_us: 0,
+            cpu_pct: 0.0,
+            mem_pct: 0.0,
+        }
+    }
+
+    fn name(self) -> [u8] {
+        self.name[..self.name_len]
+    }
+
+    fn user(self) -> [u8] {
+        self.user[..self.user_len]
+    }
+
+    fn set_name(inout self, s: [u8]) {
+        self.name_len = copy_text(&self.name, s);
+    }
+
+    fn set_user(inout self, s: [u8]) {
+        self.user_len = copy_text(&self.user, s);
+    }
+
+    // The command line, its NUL separators as spaces; the comm from stat
+    // when there is none (a kernel thread).
+    fn set_cmdline(inout self, raw: [u8], comm: [u8]) {
+        if raw.len == 0 {
+            self.set_name(comm);
+            return;
+        }
+        var n = 0;
+        for i in 0..raw.len {
+            if n >= NAME_MAX {
+                break;
+            }
+            let b = raw[i];
+            self.name[n] = if b == 0 { ' ' } else { b };
+            n += 1;
+        }
+        while n > 0 && self.name[n - 1] == ' ' {
+            n -= 1;
+        }
+        self.name_len = n;
+    }
+
+    // The user whose uid this is, from the users in /etc/passwd; the
+    // number itself when there is no entry.
+    fn set_user_from(inout self, uid: i64, users: [User], gpa: Gpa) {
+        for u in users {
+            if u.uid == uid {
+                self.set_user(u.name());
+                return;
+            }
+        }
+        let fallback = format_in(f"{uid}", gpa);
+        self.set_user(fallback.as_slice());
+    }
+}
+
+// One entry of /etc/passwd: the uid and the name. Plain data, so the
+// vector is read once and searched by every process.
+pub struct User {
+    uid: i64,
+    name: [u8; USER_MAX],
+    name_len: i64,
+}
+
+impl User {
+    fn name(self) -> [u8] {
+        self.name[..self.name_len]
+    }
+}
+
+// What one refresh saw. The *_total and *_idle vectors are the raw counters
+// of this snapshot, kept so the next one can subtract them; they make a
+// snapshot move-only (it owns them), which is why callers pass it by `let`.
+pub struct Snapshot {
+    procs: Vec<Proc>,
+    cpus: i64,
+    cpu_pct: f64,
+    core_pct: Vec<f64>,
+    ticks_total: i64,
+    ticks_idle: i64,
+    core_total: Vec<i64>,
+    core_idle: Vec<i64>,
+    mem_total_kb: i64,
+    mem_used_kb: i64,
+    swap_total_kb: i64,
+    swap_used_kb: i64,
+    load: [f64; 3],
+    uptime_s: f64,
+    wall_us: i64,
+    n_running: i64,
+    n_threads: i64,
+}
+
+pub fn empty_snapshot(gpa: Gpa) -> Snapshot {
+    Snapshot {
+        procs: Vec::new_in(gpa),
+        cpus: 1,
+        cpu_pct: 0.0,
+        core_pct: Vec::new_in(gpa),
+        ticks_total: 0,
+        ticks_idle: 0,
+        core_total: Vec::new_in(gpa),
+        core_idle: Vec::new_in(gpa),
+        mem_total_kb: 0,
+        mem_used_kb: 0,
+        swap_total_kb: 0,
+        swap_used_kb: 0,
+        load: [0.0, 0.0, 0.0],
+        uptime_s: 0.0,
+        wall_us: 0,
+        n_running: 0,
+        n_threads: 0,
+    }
+}
+
+// The program's settings, from the command line.
+pub struct Flags {
+    demo: bool,
+    once: bool,
+    color: bool,
+    width: i64,
+    height: i64,
+    interval_ms: i64,
+    sort: i64,
+    only_pid: i32,
+    filter: [u8; FILTER_MAX],
+    filter_len: i64,
+}
+
+// What reading the keyboard gave: a byte, a decoded arrow, or nothing
+// before the timeout.
+pub enum Key {
+    None,
+    Char(u8),
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Escape,
+    Function(i64),
+}
+
+// The interface's own state: what is selected, how the list is ordered,
+// what is typed in the filter, and which mode the keys are in (0 normal,
+// 1 filter, 2 kill, 3 help).
+pub struct State {
+    sort: i64,
+    reverse: bool,
+    selected: i32,
+    offset: i64,
+    filter: [u8; FILTER_MAX],
+    filter_len: i64,
+    mode: i64,
+    paused: bool,
+    message: [u8; MSG_MAX],
+    message_len: i64,
+    quit: bool,
+    interval_ms: i64,
+    only_pid: i32,
+    width: i64,
+    height: i64,
+    color: bool,
+}
+
+pub fn initial_state(flags: Flags) -> State {
+    State {
+        sort: flags.sort,
+        reverse: true,
+        selected: 0,
+        offset: 0,
+        filter: flags.filter,
+        filter_len: flags.filter_len,
+        mode: 0,
+        paused: false,
+        message: [0; MSG_MAX],
+        message_len: 0,
+        quit: false,
+        interval_ms: flags.interval_ms,
+        only_pid: flags.only_pid,
+        width: flags.width,
+        height: flags.height,
+        color: flags.color,
+    }
+}
+
+impl State {
+    fn set_message(inout self, s: [u8]) {
+        self.message_len = copy_text(&self.message, s);
+    }
+
+    fn filter(self) -> [u8] {
+        self.filter[..self.filter_len]
+    }
+}
+
+pub fn min(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+pub fn max(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+pub fn min_float(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+pub fn copy_text(dst: inout [u8], s: [u8]) -> i64 {
+    let n = min(dst.len, s.len);
+    for i in 0..n {
+        dst[i] = s[i];
+    }
+    n
+}
+
+pub fn now_micros() -> i64 {
+    time::monotonic_now().as_micros() as i64
+}
+
+// ---- What the list shows: filter, sort, selection ----
+
+pub fn process_matches(p: Proc, filter: [u8], only_pid: i32) -> bool {
+    if only_pid != 0 && p.pid != only_pid {
+        return false;
+    }
+    filter.len == 0 || contains_text(p.name(), filter) || contains_text(p.user(), filter)
+}
+
+fn matching_pids(snap: Snapshot, filter: [u8], only_pid: i32, gpa: Gpa) -> Vec<i32> {
+    var ids: Vec<i32> = Vec::new_in(gpa);
+    for p in snap.procs.iter() {
+        if process_matches(p, filter, only_pid) {
+            ids.push(p.pid);
+        }
+    }
+    ids
+}
+
+fn compare_floats(a: f64, b: f64) -> i64 {
+    if a < b { -1 } else if a > b { 1 } else { 0 }
+}
+
+pub fn sort_processes(snap: inout Snapshot, state: State) {
+    snap.procs.sort_by(|a, b| {
+        var c = 0;
+        if state.sort == 0 {
+            c = compare_floats(a.cpu_pct, b.cpu_pct);
+        } else if state.sort == 1 {
+            c = compare_floats(a.mem_pct, b.mem_pct);
+        } else if state.sort == 2 {
+            c = if a.pid < b.pid { -1 } else if a.pid > b.pid { 1 } else { 0 };
+        } else if state.sort == 3 {
+            c = if a.cpu_us < b.cpu_us { -1 } else if a.cpu_us > b.cpu_us { 1 } else { 0 };
+        } else {
+            c = cmp_of(a.name(), b.name());
+        }
+        if state.reverse { -c } else { c }
+    });
+}
+
+// Files the selected pid in the visible list the next key moves from.
+pub fn move_selection(state: inout State, snap: Snapshot, delta: i64, gpa: Gpa) {
+    let ids = matching_pids(snap, state.filter(), state.only_pid, gpa);
+    if ids.len == 0 {
+        state.selected = 0;
+        return;
+    }
+    var at = 0;
+    var found = false;
+    for i in 0..ids.len {
+        if ids[i] == state.selected {
+            at = i;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        state.selected = ids[0];
+        return;
+    }
+    var next = at + delta;
+    if next < 0 {
+        next = 0;
+    } else if next >= ids.len {
+        next = ids.len - 1;
+    }
+    state.selected = ids[next];
+}
+
+pub fn select_edge(state: inout State, snap: Snapshot, last: bool, gpa: Gpa) {
+    let ids = matching_pids(snap, state.filter(), state.only_pid, gpa);
+    if ids.len == 0 {
+        state.selected = 0;
+    } else if last {
+        state.selected = ids[ids.len - 1];
+    } else {
+        state.selected = ids[0];
+    }
+}
+
+// Keeps the selection inside the window and the window inside the list.
+pub fn clamp_offset(state: inout State, snap: Snapshot, rows: i64, gpa: Gpa) {
+    let ids = matching_pids(snap, state.filter(), state.only_pid, gpa);
+    if ids.len == 0 {
+        state.offset = 0;
+        state.selected = 0;
+        return;
+    }
+    var sel = -1;
+    for i in 0..ids.len {
+        if ids[i] == state.selected {
+            sel = i;
+            break;
+        }
+    }
+    if sel < 0 {
+        sel = 0;
+        state.selected = ids[0];
+    }
+    let max_off = max(ids.len - rows, 0);
+    if state.offset > max_off {
+        state.offset = max_off;
+    }
+    if state.offset < 0 {
+        state.offset = 0;
+    }
+    if sel < state.offset {
+        state.offset = sel;
+    }
+    if sel >= state.offset + rows {
+        state.offset = sel - rows + 1;
+    }
+}

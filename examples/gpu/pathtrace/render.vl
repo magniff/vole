@@ -1,0 +1,158 @@
+// GPU resources and frame submission. One compute invocation adds one path
+// sample to a pixel's radiance/moment slots; a full-screen triangle then reads
+// the same storage buffers and presents into the native window's surface.
+
+import "math.h" as c;
+
+use std::{gpu, max};
+use std::gpu::{
+    BindGroup, Buffer, BufferUsage, ComputePipeline, Format, PassDesc, RenderPipeline, TextureView,
+};
+
+use shaders::{DISPLAY, TRACE};
+use state::Lab;
+
+pub const CAM_YAW: f64 = 0.0;
+pub const CAM_PITCH: f64 = 0.18;
+pub const CAM_DIST: f64 = 8.0;
+pub const MAX_SAMPLES: i64 = 512;
+
+pub struct Renderer {
+    pub width: i64,
+    pub height: i64,
+    pub samples: i64,
+    accum: Buffer,
+    gbuffer: Buffer,
+    rays: Buffer,
+    params: Buffer,
+    trace_pipe: ComputePipeline,
+    trace_group: BindGroup,
+    draw_pipe: RenderPipeline,
+    draw_group: BindGroup,
+}
+
+pub fn renderer_new(dev: gpu::Device, width: i64, height: i64) -> Result<Renderer, gpu::Error> {
+    let trace_shader = dev.shader_wgsl(TRACE)?;
+    let trace_pipe = dev.compute_pipeline(trace_shader, "main")?;
+    let display_shader = dev.shader_wgsl(DISPLAY)?;
+    let display_desc = gpu::RenderDesc::new(display_shader, "vs", "fs", Format::Bgra8Unorm);
+    let display_pipe = dev.render_pipeline(display_desc)?;
+    let accum = dev.buffer(width * height * 48, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let gbuffer = dev.buffer(width * height * 48, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let rays = dev.buffer(18 * 16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let params = dev.buffer(dev.align_uniform(84 * 4),
+        BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let trace_group = dev.bind_group(trace_pipe.bind_layout(0), [
+        gpu::bind(0, params), gpu::bind(1, accum), gpu::bind(2, gbuffer), gpu::bind(3, rays),
+    ][..]);
+    let draw_group = dev.bind_group(display_pipe.bind_layout(0), [
+        gpu::bind(0, params), gpu::bind(1, accum), gpu::bind(2, gbuffer), gpu::bind(3, rays),
+    ][..]);
+    Ok(Renderer {
+        width: width, height: height, samples: 0, accum: accum, gbuffer: gbuffer, rays: rays,
+        params: params, trace_pipe: trace_pipe, trace_group: trace_group,
+        draw_pipe: display_pipe, draw_group: draw_group,
+    })
+}
+
+impl Renderer {
+    pub fn reset(inout self) {
+        self.samples = 0;
+    }
+
+    pub fn draw(inout self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        lab: Lab) {
+        self.submit(dev, &queue, target, lab, true, true);
+    }
+
+    /// Accumulate a small burst between native presentations. Each sample has
+    /// its own uniform write and ordered queue submission; only the last one is
+    /// shown by the window, avoiding the surface refresh-rate sampling cap.
+    pub fn draw_batch(inout self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        lab: Lab, count: i64) -> i64 {
+        let before = self.samples;
+        for i in 0..count {
+            if self.samples < MAX_SAMPLES {
+                let last = i + 1 == count || self.samples + 1 == MAX_SAMPLES;
+                self.submit(dev, &queue, target, lab, true, last);
+            }
+        }
+        self.samples - before
+    }
+
+    /// Re-present display-only changes (exposure, debug mode, comparison)
+    /// without adding a sample or invalidating accumulated radiance.
+    pub fn redraw(inout self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        lab: Lab) {
+        self.submit(dev, &queue, target, lab, false, true);
+    }
+
+    fn submit(inout self, dev: gpu::Device, queue: inout gpu::Queue, target: TextureView,
+        lab: Lab, advance: bool, display: bool) {
+        let cp = unsafe { c::cos(lab.pitch) };
+        let eye = [
+            lab.dist * unsafe { c::sin(lab.yaw) } * cp,
+            lab.dist * unsafe { c::sin(lab.pitch) },
+            lab.dist * unsafe { c::cos(lab.yaw) } * cp,
+        ];
+        var uniform: [f32; 84] = [0.0; 84];
+        uniform[0] = eye[0] as f32;
+        uniform[1] = eye[1] as f32;
+        uniform[2] = eye[2] as f32;
+        uniform[3] = 1.0;
+        uniform[7] = 1.0;
+        uniform[8] = self.width as f32;
+        uniform[9] = self.height as f32;
+        uniform[10] = if advance { self.samples as f32 } else { max(self.samples - 1, 0) as f32 };
+        uniform[12] = unsafe { c::tan(lab.fov * 3.141592653589793 / 360.0) } as f32;
+        uniform[13] = lab.aperture as f32;
+        uniform[14] = lab.focus as f32;
+        uniform[15] = lab.exposure as f32;
+        uniform[16] = lab.debug as f32;
+        uniform[17] = if lab.grid { 1.0 } else { 0.0 };
+        uniform[18] = if lab.gi { 1.0 } else { 0.0 };
+        uniform[19] = lab.selected as f32;
+        uniform[20] = lab.environment as f32;
+        uniform[21] = lab.fog_density as f32;
+        uniform[22] = lab.fog_anisotropy as f32;
+        uniform[23] = if lab.comparison { 1.0 } else { 0.0 };
+        uniform[24] = lab.light_x as f32;
+        uniform[25] = 5.0;
+        uniform[26] = lab.light_z as f32;
+        uniform[27] = lab.light_intensity as f32;
+        uniform[28] = lab.light_color[0];
+        uniform[29] = lab.light_color[1];
+        uniform[30] = lab.light_color[2];
+        uniform[32] = lab.light_width as f32;
+        uniform[33] = lab.light_height as f32;
+        uniform[34] = lab.select_x as f32;
+        uniform[35] = lab.select_y as f32;
+        for i in 0..4 {
+            for j in 0..12 {
+                uniform[36 + i * 12 + j] = lab.materials[i].data[j];
+            }
+        }
+        queue.write_buffer(self.params, 0, gpu::bytes_of_f32(uniform[..]));
+        let trace_pipe = self.trace_pipe;
+        let trace_group = self.trace_group;
+        let draw_pipe = self.draw_pipe;
+        let draw_group = self.draw_group;
+        var enc = dev.encoder();
+        if advance {
+            enc.compute_pass(|pass| {
+                pass.set_pipeline(trace_pipe);
+                pass.set_bind_group(0, trace_group);
+                pass.dispatch((self.width + 15) / 16, (self.height + 15) / 16);
+            });
+        }
+        if display {
+            enc.render_pass(PassDesc::color(target), |pass| {
+                pass.set_pipeline(draw_pipe);
+                pass.set_bind_group(0, draw_group);
+                pass.draw(0..3, 0..1);
+            });
+        }
+        queue.submit(enc.finish());
+        if advance { self.samples += 1; }
+    }
+}

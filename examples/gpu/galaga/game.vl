@@ -1,0 +1,1771 @@
+// game.vl: the deterministic simulation — the player, the formation and
+// its intro arc, dives, breathing; bullets, shotgun balls, powerups,
+// explosions, collisions, scoring and the upgrade economy. One `tick`
+// advances the world by exactly 1/60 s; `step` ticks, paints the 224×288
+// game frame and returns what the observation encoder and the UI read.
+//
+// This is a direct port of neural-galaga-core: the constants, the order
+// of every update, and the float expressions are the Rust core's, so a
+// seed and an action sequence replay to the same state and the same
+// pixels; check.vl holds the reference hashes.
+
+import "math.h" as c;
+
+use crate::draw;
+use crate::draw::{
+    BULLET_X, BW_F1_X, BW_F2_X, ENEMY_BULLET_X, EXPLODE_X, GAME_H, GAME_W, GREEN_F1_X, GREEN_F2_X,
+    LIVES_ICON_X, PLAYER_X, POWERUP_X, RED_F1_X, RED_F2_X, SHOTGUN_X, YELLOW_F1_X, YELLOW_F2_X,
+};
+
+pub const GAME_WIDTH: f32 = 224.0;
+pub const GAME_HEIGHT: f32 = 288.0;
+pub const FIXED_DT: f32 = 1.0 / 60.0;
+
+pub const PLAYER_WIDTH: f32 = 16.0;
+pub const PLAYER_HEIGHT: f32 = 16.0;
+pub const PLAYER_SPEED: f32 = 110.0;
+pub const PLAYER_Y: f32 = GAME_HEIGHT - 22.0;
+pub const PLAYER_LIVES: u32 = 3;
+pub const RESPAWN_INVULN: f32 = 2.0;
+
+pub const ENEMY_WIDTH: f32 = 16.0;
+pub const ENEMY_HEIGHT: f32 = 16.0;
+pub const ENEMY_ROWS: i64 = 4;
+pub const ENEMY_SPACING_X: f32 = 18.0;
+pub const ENEMY_SPACING_Y: f32 = 18.0;
+pub const ENEMY_START_Y: f32 = 40.0;
+pub const ENEMY_STEP: f32 = 4.0;
+pub const ENEMY_MOVE_INTERVAL: f32 = 0.5;
+pub const ENEMY_DIVE_SPEED: f32 = 80.0;
+pub const ENEMY_SHOOT_INTERVAL: f32 = 1.2;
+pub const ENEMY_BULLET_SPEED: f32 = 224.0;
+
+pub const BULLET_WIDTH: f32 = 4.0;
+pub const BULLET_HEIGHT: f32 = 8.0;
+pub const BULLET_SPEED: f32 = 359.0;
+pub const SHOOT_COOLDOWN: f32 = 0.25;
+pub const SHOTGUN_BALL_SIZE: f32 = 4.0;
+pub const LIVES_ICON_SPACING: f32 = 10.0;
+
+pub const EXPLOSION_FRAME_TICKS: u8 = 6;
+pub const EXPLOSION_FRAMES: u8 = 4;
+pub const TRAIL_LIFETIME: u8 = 5;
+pub const BURST_SIZE: u8 = 3;
+pub const BURST_TICK_INTERVAL: u8 = 4;
+pub const POWERUP_FALL_SPEED: f32 = 72.0;
+pub const POWERUP_SIZE: f32 = 16.0;
+
+pub const PI: f32 = 3.1415927;
+pub const TAU: f32 = 6.2831855;
+
+// One bit per action, so a tick's actions are a plain mask. The numbers
+// match the training environment's action indices through action_mask.
+pub const A_LEFT: u32 = 1;
+pub const A_RIGHT: u32 = 2;
+pub const A_FIRE: u32 = 4;
+pub const A_BUY_RATE: u32 = 8;
+pub const A_BUY_SPEED: u32 = 16;
+pub const A_BUY_DOUBLE: u32 = 32;
+pub const A_BUY_TRIPLE: u32 = 64;
+pub const A_BUY_SHIELD: u32 = 128;
+pub const A_BUY_LIFE: u32 = 256;
+pub const A_SELL_RATE: u32 = 512;
+pub const A_SELL_SPEED: u32 = 1024;
+pub const A_SELL_DOUBLE: u32 = 2048;
+pub const A_SELL_TRIPLE: u32 = 4096;
+pub const A_SELL_SHIELD: u32 = 8192;
+pub const A_SELL_LIFE: u32 = 16384;
+
+/// The environment's action index (0..18) as a mask.
+pub fn action_mask(i: i64) -> u32 {
+    match i {
+        1 => A_LEFT,
+        2 => A_RIGHT,
+        3 => A_FIRE,
+        4 => A_LEFT | A_FIRE,
+        5 => A_RIGHT | A_FIRE,
+        6 => A_BUY_RATE,
+        7 => A_BUY_SPEED,
+        8 => A_BUY_DOUBLE,
+        9 => A_BUY_TRIPLE,
+        10 => A_BUY_SHIELD,
+        11 => A_BUY_LIFE,
+        12 => A_SELL_RATE,
+        13 => A_SELL_SPEED,
+        14 => A_SELL_DOUBLE,
+        15 => A_SELL_TRIPLE,
+        16 => A_SELL_SHIELD,
+        17 => A_SELL_LIFE,
+        _ => 0,
+    }
+}
+
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn minf(a: f32, b: f32) -> f32 {
+    if a < b { a } else { b }
+}
+
+fn maxf(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+fn signumf(v: f32) -> f32 {
+    if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+fn sinf(v: f32) -> f32 {
+    unsafe { c::sinf(v) }
+}
+
+fn cosf(v: f32) -> f32 {
+    unsafe { c::cosf(v) }
+}
+
+fn atan2f(y: f32, x: f32) -> f32 {
+    unsafe { c::atan2f(y, x) }
+}
+
+// --- enemies -------------------------------------------------------------
+
+pub const DIVE_NONE: u8 = 0;
+pub const DIVE_DIVING: u8 = 1;
+pub const DIVE_RETURNING: u8 = 2;
+
+pub const SPAWN_WAITING: u8 = 0;
+pub const SPAWN_FLYING: u8 = 1;
+pub const SPAWN_ARRIVED: u8 = 2;
+
+// Enemy classes: green = 0 (weakest) through white = 3.
+pub const CLASS_GREEN: u8 = 0;
+pub const CLASS_YELLOW: u8 = 1;
+pub const CLASS_RED: u8 = 2;
+pub const CLASS_WHITE: u8 = 3;
+
+/// (score, bullet speed, fire weight, dive speed)
+pub fn class_stats(class: u8) -> (i32, f32, i32, f32) {
+    match class {
+        CLASS_YELLOW => (100, ENEMY_BULLET_SPEED, 2, ENEMY_DIVE_SPEED),
+        CLASS_RED => (200, ENEMY_BULLET_SPEED * 1.2, 3, ENEMY_DIVE_SPEED * 1.2),
+        CLASS_WHITE => (400, ENEMY_BULLET_SPEED * 1.4, 5, ENEMY_DIVE_SPEED * 1.5),
+        _ => (50, ENEMY_BULLET_SPEED * 0.8, 1, ENEMY_DIVE_SPEED * 0.8),
+    }
+}
+
+fn class_from_row(row: i64) -> u8 {
+    match row {
+        0 => CLASS_WHITE,
+        1 => CLASS_RED,
+        2 => CLASS_YELLOW,
+        _ => CLASS_GREEN,
+    }
+}
+
+fn sprite_row(class: u8) -> i64 {
+    match class {
+        CLASS_YELLOW => 1,
+        CLASS_RED => 0,
+        CLASS_GREEN => 2,
+        _ => 3,
+    }
+}
+
+fn enemy_dive_interval(wave: u32) -> f32 {
+    match wave {
+        1 => 2.5,
+        2 => 2.0,
+        3 => 1.5,
+        4 => 1.0,
+        5 => 0.5,
+        _ => 0.3,
+    }
+}
+
+pub struct Enemy {
+    pub x: f32,
+    pub y: f32,
+    pub alive: bool,
+    pub dive: u8,
+    pub dive_timer: f32,
+    pub dive_start_x: f32,
+    pub spin_angle: f32,
+    pub home_x: f32,
+    pub home_y: f32,
+    pub row: i64,
+    pub class: u8,
+    pub spawn: u8,
+    pub spawn_t: f32,
+    pub rotation: f32,
+    pub shield: u8,
+    pub shield_phase: u64,
+    pub wave: u8,
+    pub prev_x: f32,
+    pub prev_y: f32,
+    pub spawn_delay: f32,
+    pub spawn_index: i64,
+}
+
+pub struct EnemyFormation {
+    pub enemies: Vec<Enemy>,
+    direction: f32,
+    move_timer: f32,
+    pub offset_x: f32,
+    dive_timer: f32,
+    intro_timer: f32,
+    frame_counter: u64,
+    breath_cooldown: f32,
+    breath_timer: f32,
+    wave: u32,
+}
+
+fn row_cols(row: i64) -> i64 {
+    match row {
+        0 => 10,
+        1 => 8,
+        2 => 10,
+        _ => 8,
+    }
+}
+
+fn wave_row_class(wave: u32, row: i64) -> u8 {
+    let r = if wave >= 4 {
+        [CLASS_WHITE, CLASS_WHITE, CLASS_RED, CLASS_RED]
+    } else if wave == 3 {
+        [CLASS_WHITE, CLASS_RED, CLASS_RED, CLASS_YELLOW]
+    } else if wave == 2 {
+        [CLASS_WHITE, CLASS_RED, CLASS_YELLOW, CLASS_YELLOW]
+    } else {
+        [CLASS_WHITE, CLASS_RED, CLASS_YELLOW, CLASS_GREEN]
+    };
+    r[row]
+}
+
+pub fn formation_new(wave: u32, gpa: Gpa) -> EnemyFormation {
+    var enemies: Vec<Enemy> = Vec::with_capacity_in(36, gpa);
+    var wave_counters = [0i64, 0i64];
+    for row in 0..ENEMY_ROWS {
+        let cols = row_cols(row);
+        let row_width = (cols - 1) as f32 * ENEMY_SPACING_X + ENEMY_WIDTH;
+        let row_start_x = (GAME_WIDTH - row_width) / 2.0;
+        let y = ENEMY_START_Y + row as f32 * ENEMY_SPACING_Y;
+        for col in 0..cols {
+            let x = row_start_x + col as f32 * ENEMY_SPACING_X;
+            let w = if row < 2 { 0u8 } else { 1u8 };
+            let index_in_wave = wave_counters[w as i64];
+            wave_counters[w as i64] += 1;
+            let spawn_delay = index_in_wave as f32 * 0.06;
+            let class = wave_row_class(wave, row);
+            let row_from_bottom = ENEMY_ROWS - 1 - row;
+            let has_shield = row_from_bottom < (if wave < 4 { wave } else { 4 }) as i64;
+            let phase = enemies.len() as u64 * 7;
+            enemies.push(Enemy {
+                x: 0.0,
+                y: -ENEMY_HEIGHT,
+                alive: true,
+                dive: DIVE_NONE,
+                dive_timer: 0.0,
+                dive_start_x: 0.0,
+                spin_angle: 0.0,
+                home_x: x,
+                home_y: y,
+                row: row,
+                class: class,
+                spawn: SPAWN_WAITING,
+                spawn_t: 0.0,
+                rotation: 0.0,
+                shield: if has_shield { 3 } else { 0 },
+                shield_phase: phase,
+                wave: w,
+                prev_x: 0.0,
+                prev_y: -ENEMY_HEIGHT,
+                spawn_delay: spawn_delay,
+                spawn_index: index_in_wave,
+            });
+        }
+    }
+    EnemyFormation {
+        enemies: enemies,
+        direction: 1.0,
+        move_timer: ENEMY_MOVE_INTERVAL,
+        offset_x: 0.0,
+        dive_timer: enemy_dive_interval(wave),
+        intro_timer: 0.0,
+        frame_counter: 0,
+        breath_cooldown: 8.0,
+        breath_timer: 0.0,
+        wave: wave,
+    }
+}
+
+impl EnemyFormation {
+    pub fn intro_done(self) -> bool {
+        for i in 0..self.enemies.len() {
+            if self.enemies[i].spawn != SPAWN_ARRIVED {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn all_dead(self) -> bool {
+        for i in 0..self.enemies.len() {
+            if self.enemies[i].alive {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn reached_player(self) -> bool {
+        for i in 0..self.enemies.len() {
+            let e = self.enemies[i];
+            if e.alive && e.dive == DIVE_NONE && e.y + ENEMY_HEIGHT >= PLAYER_Y {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn update_rotation(inout self, i: i64) {
+        let dx = self.enemies[i].x - self.enemies[i].prev_x;
+        let dy = self.enemies[i].y - self.enemies[i].prev_y;
+        if dx * dx + dy * dy > 0.01 {
+            self.enemies[i].rotation = atan2f(dx, dy);
+        }
+        self.enemies[i].prev_x = self.enemies[i].x;
+        self.enemies[i].prev_y = self.enemies[i].y;
+    }
+
+    pub fn update_intro(inout self, dt: f32) {
+        self.intro_timer += dt;
+        let fly_in_speed: f32 = 1.0 / 4.0;
+        let mid = GAME_WIDTH / 2.0;
+        let stream_gap = ENEMY_WIDTH + 4.0;
+        let stream_x = [
+            mid - stream_gap / 2.0 - ENEMY_WIDTH / 2.0,
+            mid + stream_gap / 2.0 - ENEMY_WIDTH / 2.0,
+        ];
+        let column_gap = ENEMY_HEIGHT + 4.0;
+        for i in 0..self.enemies.len() {
+            let entry_x = stream_x[self.enemies[i].wave as i64];
+            if self.enemies[i].spawn == SPAWN_WAITING {
+                if self.intro_timer >= self.enemies[i].spawn_delay {
+                    self.enemies[i].spawn = SPAWN_FLYING;
+                    self.enemies[i].spawn_t = 0.0;
+                }
+                self.enemies[i].x = entry_x;
+                self.enemies[i].y = -(self.enemies[i].spawn_index as f32 + 1.0) * column_gap;
+            } else if self.enemies[i].spawn == SPAWN_FLYING {
+                self.enemies[i].spawn_t += fly_in_speed * dt;
+                if self.enemies[i].spawn_t >= 1.0 {
+                    self.enemies[i].x = self.enemies[i].home_x;
+                    self.enemies[i].y = self.enemies[i].home_y;
+                    self.enemies[i].spawn = SPAWN_ARRIVED;
+                } else {
+                    let p = self.enemies[i].spawn_t;
+                    if p < 0.3 {
+                        let phase_t = p / 0.3;
+                        let target_y = GAME_HEIGHT * 0.4;
+                        let start_y = -(self.enemies[i].spawn_index as f32 + 1.0)
+                            * column_gap;
+                        self.enemies[i].x = entry_x;
+                        self.enemies[i].y = start_y + phase_t * (target_y - start_y);
+                    } else if p < 0.8 {
+                        let phase_t = (p - 0.3) / 0.5;
+                        let mid_y = GAME_HEIGHT * 0.3;
+                        let angle = phase_t * PI * 1.2;
+                        let radius = GAME_WIDTH * 0.8;
+                        let dir: f32 = if self.enemies[i].wave == 0 { 1.0 } else { -1.0 };
+                        self.enemies[i].x = entry_x + dir * radius * sinf(angle);
+                        self.enemies[i].y = mid_y + radius * 0.6
+                            * (1.0 - cosf(angle));
+                    } else {
+                        let phase_t = (p - 0.8) / 0.2;
+                        let end_angle = PI * 1.2;
+                        let radius = GAME_WIDTH * 0.8;
+                        let dir: f32 = if self.enemies[i].wave == 0 { 1.0 } else { -1.0 };
+                        let mid_y = GAME_HEIGHT * 0.3;
+                        let end_x = entry_x + dir * radius * sinf(end_angle);
+                        let end_y = mid_y + radius * 0.6 * (1.0 - cosf(end_angle));
+                        let hx = self.enemies[i].home_x;
+                        let hy = self.enemies[i].home_y;
+                        self.enemies[i].x = end_x + phase_t * (hx - end_x);
+                        self.enemies[i].y = end_y + phase_t * (hy - end_y);
+                    }
+                }
+            }
+            self.update_rotation(i);
+        }
+    }
+
+    pub fn update_formation(inout self, dt: f32) {
+        self.move_timer -= dt;
+        if self.move_timer <= 0.0 {
+            self.move_timer = ENEMY_MOVE_INTERVAL;
+            self.offset_x += ENEMY_STEP * self.direction;
+            var min_x: f32 = 3.4028235e38;
+            var max_x: f32 = -3.4028235e38;
+            var any = false;
+            for i in 0..self.enemies.len() {
+                let e = self.enemies[i];
+                if e.alive && e.spawn == SPAWN_ARRIVED && e.dive == DIVE_NONE {
+                    let ex = e.home_x + self.offset_x;
+                    min_x = minf(min_x, ex);
+                    max_x = maxf(max_x, ex + ENEMY_WIDTH);
+                    any = true;
+                }
+            }
+            if any {
+                if max_x > GAME_WIDTH - 4.0 {
+                    self.offset_x -= max_x - (GAME_WIDTH - 4.0);
+                    self.direction = -1.0;
+                    for i in 0..self.enemies.len() {
+                        self.enemies[i].home_y += ENEMY_STEP;
+                    }
+                } else if min_x < 4.0 {
+                    self.offset_x += 4.0 - min_x;
+                    self.direction = 1.0;
+                    for i in 0..self.enemies.len() {
+                        self.enemies[i].home_y += ENEMY_STEP;
+                    }
+                }
+            }
+        }
+
+        if self.intro_done() {
+            if self.breath_timer > 0.0 {
+                self.breath_timer -= dt;
+                if self.breath_timer <= 0.0 {
+                    self.breath_timer = 0.0;
+                    self.breath_cooldown = 8.0;
+                }
+            } else {
+                self.breath_cooldown -= dt;
+                if self.breath_cooldown <= 0.0 {
+                    self.breath_timer = 3.0;
+                }
+            }
+        }
+        var breath: f32 = 0.0;
+        if self.breath_timer > 0.0 {
+            let progress = 1.0 - self.breath_timer / 3.0;
+            breath = sinf(progress * PI);
+        }
+
+        let t = self.frame_counter as f32;
+        let center_x = GAME_WIDTH / 2.0;
+        for i in 0..self.enemies.len() {
+            let e = self.enemies[i];
+            if e.alive && e.spawn == SPAWN_ARRIVED && e.dive == DIVE_NONE {
+                let phase = e.spawn_index as f32 * 1.8;
+                let bob_y = sinf(t * 0.07 + phase) * 2.0;
+                let breath_y = e.row as f32 * 6.0 * breath;
+                let dxc = e.home_x + ENEMY_WIDTH / 2.0 - center_x;
+                let inflate = dxc * 0.3 * breath;
+                let wiggle = sinf(t * 0.05 + e.row as f32 * 2.0) * 3.0 * breath;
+                self.enemies[i].x = e.home_x + self.offset_x + inflate + wiggle;
+                self.enemies[i].y = e.home_y + bob_y + breath_y;
+                self.enemies[i].rotation = 0.0;
+                self.enemies[i].prev_x = self.enemies[i].x;
+                self.enemies[i].prev_y = self.enemies[i].y;
+            }
+        }
+    }
+
+    pub fn trigger_dive(inout self, dt: f32) {
+        self.frame_counter += 1;
+        self.dive_timer -= dt;
+        if self.dive_timer <= 0.0 {
+            self.dive_timer = enemy_dive_interval(self.wave);
+            var candidates: Vec<i64> = Vec::new_in(self.enemies.allocator());
+            for i in 0..self.enemies.len() {
+                if self.enemies[i].alive && self.enemies[i].dive == DIVE_NONE {
+                    candidates.push(i);
+                }
+            }
+            if candidates.len() > 0 {
+                let idx = candidates[self.frame_counter % candidates.len() as u64];
+                let start_x = self.enemies[idx].x;
+                self.enemies[idx].dive = DIVE_DIVING;
+                self.enemies[idx].dive_timer = 0.0;
+                self.enemies[idx].dive_start_x = start_x;
+                self.enemies[idx].spin_angle = 0.0;
+            }
+        }
+    }
+
+    pub fn update_dives(inout self, dt: f32) {
+        for i in 0..self.enemies.len() {
+            if !self.enemies[i].alive {
+                continue;
+            }
+            if self.enemies[i].dive == DIVE_DIVING {
+                self.enemies[i].dive_timer += dt;
+                let t = self.enemies[i].dive_timer;
+                self.enemies[i].y += ENEMY_DIVE_SPEED * dt;
+                let start_x = self.enemies[i].dive_start_x;
+                self.enemies[i].x = start_x + sinf(t * 3.0) * 30.0;
+                self.enemies[i].x = clampf(self.enemies[i].x, 0.0,
+                    GAME_WIDTH - ENEMY_WIDTH);
+                if self.enemies[i].class == CLASS_RED {
+                    self.enemies[i].spin_angle += dt * 6.0;
+                    self.enemies[i].rotation = self.enemies[i].spin_angle;
+                    self.enemies[i].prev_x = self.enemies[i].x;
+                    self.enemies[i].prev_y = self.enemies[i].y;
+                }
+                if self.enemies[i].y > GAME_HEIGHT + ENEMY_HEIGHT {
+                    self.enemies[i].dive = DIVE_RETURNING;
+                    self.enemies[i].dive_timer = 0.0;
+                    let off = if self.offset_x < 0.0 { -self.offset_x } else { self.offset_x };
+                    self.enemies[i].y = self.enemies[i].home_y + minf(off, 40.0);
+                }
+            } else if self.enemies[i].dive == DIVE_RETURNING {
+                self.enemies[i].dive_timer += dt;
+                let home_x = self.enemies[i].home_x + self.offset_x;
+                let home_y = self.enemies[i].home_y;
+                let dx = home_x - self.enemies[i].x;
+                let dy = home_y - self.enemies[i].y;
+                let speed = ENEMY_DIVE_SPEED * 1.5;
+                let stepx = minf(speed, (if dx < 0.0 { -dx } else { dx }) / dt);
+                let stepy = minf(speed, (if dy < 0.0 { -dy } else { dy }) / dt);
+                self.enemies[i].x += signumf(dx) * stepx * dt;
+                self.enemies[i].y += signumf(dy) * stepy * dt;
+                let adx = if dx < 0.0 { -dx } else { dx };
+                let ady = if dy < 0.0 { -dy } else { dy };
+                if (adx < 5.0 && ady < 5.0) || self.enemies[i].dive_timer > 4.0 {
+                    self.enemies[i].x = home_x;
+                    self.enemies[i].y = home_y;
+                    self.enemies[i].rotation = 0.0;
+                    self.enemies[i].prev_x = self.enemies[i].x;
+                    self.enemies[i].prev_y = self.enemies[i].y;
+                    self.enemies[i].dive = DIVE_NONE;
+                }
+            }
+            if self.enemies[i].dive != DIVE_NONE {
+                self.update_rotation(i);
+            }
+        }
+    }
+}
+
+// --- entity records ------------------------------------------------------
+
+pub struct Bullet {
+    pub x: f32,
+    pub y: f32,
+    pub dy: f32,
+    pub active: bool,
+}
+
+pub struct ShotgunBall {
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub active: bool,
+    pub bounces_left: u8,
+}
+
+pub struct Explosion {
+    pub x: f32,
+    pub y: f32,
+    pub frame: u8,
+    pub timer: u8,
+}
+
+pub struct TrailParticle {
+    pub x: f32,
+    pub y: f32,
+    pub life: u8,
+    pub is_player: bool,
+}
+
+pub struct BurstQueue {
+    pub x: f32,
+    pub y: f32,
+    pub remaining: u8,
+    pub ticks_until_next: u8,
+}
+
+pub struct Powerup {
+    pub x: f32,
+    pub y: f32,
+    pub kind: u8,
+}
+
+pub const PU_LIFE: u8 = 0;
+pub const PU_RATE: u8 = 1;
+pub const PU_SPEED: u8 = 2;
+pub const PU_DOUBLE: u8 = 3;
+pub const PU_TRIPLE: u8 = 4;
+pub const PU_SHIELD: u8 = 5;
+
+fn aabb(ax: f32, ay: f32, aw: f32, ah: f32, bx: f32, by: f32, bw: f32,
+    bh: f32) -> bool {
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
+}
+
+pub struct PlayState {
+    pub player_x: f32,
+    pub player_y: f32,
+    shoot_cooldown: f32,
+    player_shield: u8,
+    player_shield_phase: u64,
+    pub formation: EnemyFormation,
+    pub bullets: Vec<Bullet>,
+    pub shotgun_balls: Vec<ShotgunBall>,
+    burst_queues: Vec<BurstQueue>,
+    pub explosions: Vec<Explosion>,
+    pub trail_particles: Vec<TrailParticle>,
+    pub powerups: Vec<Powerup>,
+    fire_rate_mult: f32,
+    pub fire_rate_stacks: u8,
+    speed_mult: f32,
+    pub speed_stacks: u8,
+    pub bullet_count: u8,
+    inv_rate: u8,
+    inv_speed: u8,
+    inv_double: u8,
+    inv_triple: u8,
+    inv_shield: u8,
+    pub currency: u32,
+    anim_timer: f32,
+    pub anim_frame: bool,
+    enemy_shoot_timer: f32,
+    pub frame_counter: u64,
+    pub score: i32,
+    pub lives: u32,
+    pub wave: u32,
+    invuln_timer: f32,
+    wave_complete_handled: bool,
+    pub wave_just_completed: bool,
+    pub lost: bool,
+}
+
+/// Shared shield charge: 3 full, 2 damaged, 1 critical (blinking), 0 none.
+pub fn shield_color(level: u8, phase: u64, frame: u64) -> [f32; 4] {
+    if level == 3 {
+        [1.0, 0.98, 1.0, 1.0]
+    } else if level == 2 {
+        [0.45, 0.45, 0.45, 1.0]
+    } else if level == 1 {
+        if ((frame + phase) / 10) % 2 == 0 {
+            [0.2, 0.2, 0.2, 1.0]
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        }
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+pub fn shield_radius(phase: u64, frame: u64) -> f32 {
+    let radii: [f32; 5] = [9.0, 10.0, 11.0, 10.0, 9.0];
+    let idx = ((frame + phase) / 6) % 5;
+    radii[idx]
+}
+
+impl PlayState {
+    pub fn new(seed: u64, wave: u32, gpa: Gpa) -> PlayState {
+        PlayState {
+            player_x: GAME_WIDTH / 2.0 - PLAYER_WIDTH / 2.0,
+            player_y: PLAYER_Y,
+            shoot_cooldown: 0.0,
+            player_shield: 3,
+            player_shield_phase: 0,
+            formation: formation_new(wave, gpa),
+            bullets: Vec::new_in(gpa),
+            shotgun_balls: Vec::new_in(gpa),
+            burst_queues: Vec::new_in(gpa),
+            explosions: Vec::new_in(gpa),
+            trail_particles: Vec::new_in(gpa),
+            powerups: Vec::new_in(gpa),
+            fire_rate_mult: 1.0,
+            fire_rate_stacks: 0,
+            speed_mult: 1.0,
+            speed_stacks: 0,
+            bullet_count: 2,
+            inv_rate: 0,
+            inv_speed: 0,
+            inv_double: 0,
+            inv_triple: 0,
+            inv_shield: 0,
+            currency: 0,
+            anim_timer: 0.0,
+            anim_frame: false,
+            enemy_shoot_timer: 0.0,
+            frame_counter: seed,
+            score: 0,
+            lives: PLAYER_LIVES,
+            wave: wave,
+            invuln_timer: RESPAWN_INVULN,
+            wave_complete_handled: false,
+            wave_just_completed: false,
+            lost: false,
+        }
+    }
+
+    /// Damage the player's shield; the caller picks up a spare when the
+    /// critical one breaks, exactly as the Rust client does.
+    fn shield_hit(inout self) -> bool {
+        if self.player_shield == 3 {
+            self.player_shield = 2;
+            true
+        } else if self.player_shield == 2 {
+            self.player_shield = 1;
+            true
+        } else if self.player_shield == 1 {
+            self.player_shield = 0;
+            false
+        } else {
+            false
+        }
+    }
+
+    fn consume_shield(inout self) {
+        if self.inv_shield > 0 {
+            self.inv_shield -= 1;
+            self.player_shield = 3;
+            self.player_shield_phase = self.frame_counter;
+        } else {
+            self.player_shield = 0;
+        }
+    }
+
+    fn kill_player(inout self, gpa: Gpa) {
+        self.score -= 500;
+        self.explosions.push(Explosion {
+            x: self.player_x + PLAYER_WIDTH / 2.0 - 12.0,
+            y: self.player_y + PLAYER_HEIGHT / 2.0 - 12.0,
+            frame: 0,
+            timer: EXPLOSION_FRAME_TICKS,
+        });
+        self.lives -= 1;
+        self.fire_rate_mult = 1.0;
+        self.fire_rate_stacks = 0;
+        self.speed_mult = 1.0;
+        self.speed_stacks = 0;
+        self.bullet_count = 1;
+        self.inv_rate = 0;
+        self.inv_speed = 0;
+        self.inv_double = 0;
+        self.inv_triple = 0;
+        self.inv_shield = 0;
+        self.currency = 0;
+        if self.lives == 0 {
+            self.lost = true;
+        } else {
+            self.player_x = GAME_WIDTH / 2.0 - PLAYER_WIDTH / 2.0;
+            self.player_shield = 0;
+            self.invuln_timer = RESPAWN_INVULN;
+            self.bullets.clear();
+        }
+        let _ = gpa;
+    }
+
+    fn apply_powerup(inout self, kind: u8) {
+        if kind == PU_LIFE {
+            self.lives += 1;
+        } else if kind == PU_RATE {
+            if self.fire_rate_stacks < 2 {
+                self.fire_rate_mult *= 0.8;
+                self.fire_rate_stacks += 1;
+            } else {
+                self.inv_rate = saturating_add(self.inv_rate);
+            }
+        } else if kind == PU_SPEED {
+            if self.speed_stacks < 2 {
+                self.speed_mult *= 1.1;
+                self.speed_stacks += 1;
+            } else {
+                self.inv_speed = saturating_add(self.inv_speed);
+            }
+        } else if kind == PU_DOUBLE {
+            if self.bullet_count < 2 {
+                self.bullet_count = 2;
+            } else {
+                self.inv_double = saturating_add(self.inv_double);
+            }
+        } else if kind == PU_TRIPLE {
+            if self.bullet_count < 3 {
+                self.bullet_count = 3;
+            } else {
+                self.inv_triple = saturating_add(self.inv_triple);
+            }
+        } else if kind == PU_SHIELD {
+            if self.player_shield == 0 {
+                self.player_shield = 3;
+                self.player_shield_phase = self.frame_counter;
+            } else {
+                self.inv_shield = saturating_add(self.inv_shield);
+            }
+        }
+    }
+
+    /// One fixed tick; the order of every stage is the Rust core's.
+    pub fn tick(inout self, actions: u32, gpa: Gpa) {
+        let dt = FIXED_DT;
+        self.wave_just_completed = false;
+        if self.lost {
+            return;
+        }
+        if self.invuln_timer > 0.0 {
+            self.invuln_timer -= dt;
+        }
+        self.frame_counter += 1;
+        self.score -= 1;
+
+        // explosions: advance once their frame's ticks run out
+        var i: i64 = 0;
+        while i < self.explosions.len() {
+            if self.explosions[i].timer == 0 {
+                self.explosions[i].frame += 1;
+                if self.explosions[i].frame >= EXPLOSION_FRAMES {
+                    self.explosions.remove(i);
+                    continue;
+                }
+                self.explosions[i].timer = EXPLOSION_FRAME_TICKS;
+            }
+            self.explosions[i].timer -= 1;
+            i += 1;
+        }
+
+        self.anim_timer += dt;
+        if self.anim_timer >= 0.3 {
+            self.anim_timer -= 0.3;
+            self.anim_frame = !self.anim_frame;
+        }
+
+        let effective_speed = PLAYER_SPEED * self.speed_mult;
+        let has_left = (actions & A_LEFT) != 0;
+        let has_right = (actions & A_RIGHT) != 0;
+        if has_left && !has_right {
+            self.player_x -= effective_speed * dt;
+        } else if has_right && !has_left {
+            self.player_x += effective_speed * dt;
+        }
+        self.player_x = clampf(self.player_x, 0.0, GAME_WIDTH - PLAYER_WIDTH);
+
+        // Buy: one purchase a tick, the first matching action wins.
+        var cost: i64 = -1;
+        if (actions & A_BUY_RATE) != 0 && self.fire_rate_stacks < 2 {
+            cost = 1;
+        } else if (actions & A_BUY_SPEED) != 0 && self.speed_stacks < 2 {
+            cost = 1;
+        } else if (actions & A_BUY_DOUBLE) != 0 && self.bullet_count < 2 {
+            cost = 1;
+        } else if (actions & A_BUY_TRIPLE) != 0 && self.bullet_count < 3 {
+            cost = 2;
+        } else if (actions & A_BUY_SHIELD) != 0 && self.player_shield == 0 {
+            cost = 2;
+        } else if (actions & A_BUY_LIFE) != 0 {
+            cost = 2;
+        }
+        if cost >= 0 && self.currency >= cost as u32 {
+            self.currency -= cost as u32;
+            if (actions & A_BUY_RATE) != 0 {
+                self.fire_rate_mult *= 0.8;
+                self.fire_rate_stacks += 1;
+            } else if (actions & A_BUY_SPEED) != 0 {
+                self.speed_mult *= 1.1;
+                self.speed_stacks += 1;
+            } else if (actions & A_BUY_DOUBLE) != 0 {
+                self.bullet_count = 2;
+            } else if (actions & A_BUY_TRIPLE) != 0 {
+                self.bullet_count = 3;
+            } else if (actions & A_BUY_SHIELD) != 0 {
+                self.player_shield = 3;
+                self.player_shield_phase = self.frame_counter;
+            } else if (actions & A_BUY_LIFE) != 0 {
+                self.lives += 1;
+            }
+        }
+
+        // Sell: inventory first, then the active upgrade.
+        var value: i64 = 0;
+        if (actions & A_SELL_RATE) != 0 {
+            if self.inv_rate > 0 {
+                self.inv_rate -= 1;
+                value = 1;
+            } else if self.fire_rate_stacks > 0 {
+                self.fire_rate_mult /= 0.8;
+                self.fire_rate_stacks -= 1;
+                value = 1;
+            }
+        } else if (actions & A_SELL_SPEED) != 0 {
+            if self.inv_speed > 0 {
+                self.inv_speed -= 1;
+                value = 1;
+            } else if self.speed_stacks > 0 {
+                self.speed_mult /= 1.1;
+                self.speed_stacks -= 1;
+                value = 1;
+            }
+        } else if (actions & A_SELL_DOUBLE) != 0 {
+            if self.inv_double > 0 {
+                self.inv_double -= 1;
+                value = 1;
+            } else if self.bullet_count == 2 {
+                self.bullet_count = 1;
+                value = 1;
+            }
+        } else if (actions & A_SELL_TRIPLE) != 0 {
+            if self.inv_triple > 0 {
+                self.inv_triple -= 1;
+                value = 1;
+            } else if self.bullet_count == 3 {
+                self.bullet_count = 2;
+                value = 1;
+            }
+        } else if (actions & A_SELL_SHIELD) != 0 {
+            if self.inv_shield > 0 {
+                self.inv_shield -= 1;
+                value = 1;
+            } else if self.player_shield == 3 {
+                self.player_shield = 0;
+                value = 1;
+            }
+        } else if (actions & A_SELL_LIFE) != 0 {
+            if self.lives > 1 {
+                self.lives -= 1;
+                value = 1;
+            }
+        }
+        if value > 0 {
+            self.currency += value as u32;
+        }
+
+        // Fire.
+        self.shoot_cooldown -= dt;
+        let cooldown = SHOOT_COOLDOWN * self.fire_rate_mult;
+        let speed = BULLET_SPEED * self.speed_mult;
+        if (actions & A_FIRE) != 0 && self.shoot_cooldown <= 0.0 {
+            self.shoot_cooldown = cooldown;
+            let cx = self.player_x + PLAYER_WIDTH / 2.0;
+            let by = self.player_y - BULLET_HEIGHT;
+            if self.bullet_count == 3 {
+                let offsets: [f32; 3] = [-5.0, 0.0, 5.0];
+                for k in 0..3 {
+                    self.bullets.push(Bullet {
+                        x: cx + offsets[k] - BULLET_WIDTH / 2.0,
+                        y: by,
+                        dy: -speed,
+                        active: true,
+                    });
+                }
+            } else if self.bullet_count == 2 {
+                let offsets: [f32; 2] = [-4.0, 4.0];
+                for k in 0..2 {
+                    self.bullets.push(Bullet {
+                        x: cx + offsets[k] - BULLET_WIDTH / 2.0,
+                        y: by,
+                        dy: -speed,
+                        active: true,
+                    });
+                }
+            } else {
+                self.bullets.push(Bullet {
+                    x: cx - BULLET_WIDTH / 2.0,
+                    y: by,
+                    dy: -speed,
+                    active: true,
+                });
+            }
+        }
+
+        // Bursts feed enemy bullets over consecutive ticks.
+        i = 0;
+        while i < self.burst_queues.len() {
+            if self.burst_queues[i].ticks_until_next == 0 {
+                let x = self.burst_queues[i].x;
+                let y = self.burst_queues[i].y;
+                self.bullets.push(Bullet {
+                    x: x,
+                    y: y,
+                    dy: ENEMY_BULLET_SPEED,
+                    active: true,
+                });
+                self.burst_queues[i].remaining -= 1;
+                self.burst_queues[i].ticks_until_next = BURST_TICK_INTERVAL;
+            } else {
+                self.burst_queues[i].ticks_until_next -= 1;
+            }
+            if self.burst_queues[i].remaining > 0 {
+                i += 1;
+            } else {
+                self.burst_queues.remove(i);
+            }
+        }
+
+        // Bullets move and leave a trail.
+        for k in 0..self.bullets.len() {
+            if self.bullets[k].active {
+                self.bullets[k].y += self.bullets[k].dy * dt;
+                if self.bullets[k].y < -BULLET_HEIGHT
+                    || self.bullets[k].y > GAME_HEIGHT {
+                    self.bullets[k].active = false;
+                }
+                if self.bullets[k].active {
+                    let tx = self.bullets[k].x + BULLET_WIDTH / 2.0;
+                    let ty = if self.bullets[k].dy < 0.0 {
+                        self.bullets[k].y + BULLET_HEIGHT
+                    } else {
+                        self.bullets[k].y
+                    };
+                    self.trail_particles.push(TrailParticle {
+                        x: tx,
+                        y: ty,
+                        life: TRAIL_LIFETIME,
+                        is_player: self.bullets[k].dy < 0.0,
+                    });
+                }
+            }
+        }
+
+        // Shotgun balls: move, bounce once, explode on a later wall.
+        for k in 0..self.shotgun_balls.len() {
+            if !self.shotgun_balls[k].active {
+                continue;
+            }
+            self.shotgun_balls[k].x += self.shotgun_balls[k].dx * dt;
+            self.shotgun_balls[k].y += self.shotgun_balls[k].dy * dt;
+            let hit_wall = self.shotgun_balls[k].x < 0.0
+                || self.shotgun_balls[k].x + SHOTGUN_BALL_SIZE > GAME_WIDTH;
+            if hit_wall {
+                if self.shotgun_balls[k].bounces_left > 0 {
+                    if self.shotgun_balls[k].x < 0.0 {
+                        self.shotgun_balls[k].x = -self.shotgun_balls[k].x;
+                        self.shotgun_balls[k].dx = -self.shotgun_balls[k].dx;
+                    } else {
+                        self.shotgun_balls[k].x = 2.0
+                            * (GAME_WIDTH - SHOTGUN_BALL_SIZE)
+                            - self.shotgun_balls[k].x;
+                        self.shotgun_balls[k].dx = -self.shotgun_balls[k].dx;
+                    }
+                    self.shotgun_balls[k].bounces_left -= 1;
+                } else if self.shotgun_balls[k].dx != 0.0 {
+                    self.explosions.push(Explosion {
+                        x: self.shotgun_balls[k].x + SHOTGUN_BALL_SIZE / 2.0 - 12.0,
+                        y: self.shotgun_balls[k].y + SHOTGUN_BALL_SIZE / 2.0 - 12.0,
+                        frame: 0,
+                        timer: EXPLOSION_FRAME_TICKS,
+                    });
+                    self.shotgun_balls[k].active = false;
+                }
+            }
+            if self.shotgun_balls[k].y < -SHOTGUN_BALL_SIZE
+                || self.shotgun_balls[k].y > GAME_HEIGHT + SHOTGUN_BALL_SIZE {
+                self.shotgun_balls[k].active = false;
+            }
+            if self.shotgun_balls[k].x < -SHOTGUN_BALL_SIZE
+                || self.shotgun_balls[k].x > GAME_WIDTH + SHOTGUN_BALL_SIZE {
+                self.shotgun_balls[k].active = false;
+            }
+            if self.shotgun_balls[k].active {
+                self.trail_particles.push(TrailParticle {
+                    x: self.shotgun_balls[k].x + SHOTGUN_BALL_SIZE / 2.0,
+                    y: self.shotgun_balls[k].y + SHOTGUN_BALL_SIZE / 2.0,
+                    life: TRAIL_LIFETIME,
+                    is_player: false,
+                });
+            }
+        }
+        i = 0;
+        while i < self.shotgun_balls.len() {
+            if self.shotgun_balls[i].active {
+                i += 1;
+            } else {
+                self.shotgun_balls.remove(i);
+            }
+        }
+
+        // Trails age one tick each.
+        i = 0;
+        while i < self.trail_particles.len() {
+            self.trail_particles[i].life -= 1;
+            if self.trail_particles[i].life > 0 {
+                i += 1;
+            } else {
+                self.trail_particles.remove(i);
+            }
+        }
+
+        if !self.formation.intro_done() {
+            self.formation.update_intro(dt);
+        }
+        self.formation.update_formation(dt);
+
+        // Player bullets against enemies (and their shields).
+        for b in 0..self.bullets.len() {
+            if !self.bullets[b].active || self.bullets[b].dy > 0.0 {
+                continue;
+            }
+            var hit: i64 = -1;
+            for e in 0..self.formation.enemies.len() {
+                let en = self.formation.enemies[e];
+                if !en.alive || en.spawn == SPAWN_WAITING {
+                    continue;
+                }
+                if aabb(self.bullets[b].x, self.bullets[b].y, BULLET_WIDTH,
+                    BULLET_HEIGHT, en.x, en.y, ENEMY_WIDTH, ENEMY_HEIGHT) {
+                    hit = e;
+                    break;
+                }
+            }
+            if hit < 0 {
+                continue;
+            }
+            self.bullets[b].active = false;
+            self.score += 50;
+            if self.formation.enemies[hit].shield > 0 {
+                let survived = self.enemy_shield_hit(hit);
+                let _ = survived;
+            } else {
+                let class = self.formation.enemies[hit].class;
+                let drop_powerup = (class == CLASS_RED || class == CLASS_WHITE)
+                    && self.frame_counter % 10 == 0;
+                if drop_powerup {
+                    let kind = ((self.frame_counter / 3) % 6) as u8;
+                    self.powerups.push(Powerup {
+                        x: self.formation.enemies[hit].x,
+                        y: self.formation.enemies[hit].y,
+                        kind: kind,
+                    });
+                }
+                self.formation.enemies[hit].alive = false;
+                self.score += class_stats(class).0;
+                self.explosions.push(Explosion {
+                    x: self.formation.enemies[hit].x + ENEMY_WIDTH / 2.0 - 12.0,
+                    y: self.formation.enemies[hit].y + ENEMY_HEIGHT / 2.0 - 12.0,
+                    frame: 0,
+                    timer: EXPLOSION_FRAME_TICKS,
+                });
+            }
+        }
+        i = 0;
+        while i < self.bullets.len() {
+            if self.bullets[i].active {
+                i += 1;
+            } else {
+                self.bullets.remove(i);
+            }
+        }
+
+        // Powerups fall, and are collected on the player.
+        for k in 0..self.powerups.len() {
+            self.powerups[k].y += POWERUP_FALL_SPEED * dt;
+        }
+        let px = self.player_x;
+        let py = self.player_y;
+        i = self.powerups.len() - 1;
+        while i >= 0 {
+            let p = self.powerups[i];
+            if p.y > GAME_HEIGHT {
+                self.powerups.remove(i);
+            } else if aabb(p.x, p.y, POWERUP_SIZE, POWERUP_SIZE, px, py,
+                PLAYER_WIDTH, PLAYER_HEIGHT) {
+                self.score += 500;
+                self.apply_powerup(p.kind);
+                self.powerups.remove(i);
+            }
+            i -= 1;
+        }
+
+        if self.formation.all_dead() && !self.wave_complete_handled {
+            self.wave_complete_handled = true;
+            self.wave_just_completed = true;
+            self.score += 5000;
+            while self.powerups.len() > 0 {
+                let p = self.powerups.remove(0);
+                self.score += 500;
+                self.apply_powerup(p.kind);
+            }
+            self.wave += 1;
+            self.formation = formation_new(self.wave, gpa);
+            self.bullets.clear();
+            self.shotgun_balls.clear();
+            self.burst_queues.clear();
+            self.invuln_timer = RESPAWN_INVULN;
+            self.wave_complete_handled = false;
+        }
+
+        // Enemy shooting: intro and diving enemies fire much more often.
+        var has_moving = false;
+        for k in 0..self.formation.enemies.len() {
+            let e = self.formation.enemies[k];
+            if e.alive && (e.dive != DIVE_NONE || e.spawn == SPAWN_FLYING) {
+                has_moving = true;
+            }
+        }
+        let shoot_rate: f32 = if has_moving { 5.0 } else { 1.0 };
+        self.enemy_shoot_timer -= dt * shoot_rate;
+        if self.enemy_shoot_timer <= 0.0 {
+            self.enemy_shoot_timer = ENEMY_SHOOT_INTERVAL;
+            var candidates: Vec<i64> = Vec::new_in(gpa);
+            for k in 0..self.formation.enemies.len() {
+                let e = self.formation.enemies[k];
+                if !e.alive || e.spawn == SPAWN_WAITING {
+                    continue;
+                }
+                if e.y < 0.0 || e.y > GAME_HEIGHT {
+                    continue;
+                }
+                let moving = e.dive != DIVE_NONE || e.spawn == SPAWN_FLYING;
+                var weight: i64 = 1;
+                if moving {
+                    weight = if e.class == CLASS_WHITE { 20 } else { 100 };
+                }
+                for _ in 0..weight {
+                    candidates.push(k);
+                }
+            }
+            if candidates.len() > 0 {
+                let shooter = candidates[self.frame_counter % candidates.len() as u64];
+                let e = self.formation.enemies[shooter];
+                let ex = e.x + ENEMY_WIDTH / 2.0;
+                let ey = e.y + ENEMY_HEIGHT;
+                let is_white = e.class == CLASS_WHITE;
+                let use_shotgun = is_white && self.frame_counter % 10 < 3;
+                if use_shotgun {
+                    let speed = ENEMY_BULLET_SPEED * 1.5;
+                    let angles: [f32; 3] = [60.0, 45.0, 30.0];
+                    for a in 0..3 {
+                        let rad = angles[a] * PI / 180.0;
+                        let dx = speed * sinf(rad);
+                        let dy = speed * cosf(rad);
+                        self.shotgun_balls.push(ShotgunBall {
+                            x: ex - SHOTGUN_BALL_SIZE / 2.0,
+                            y: ey,
+                            dx: -dx,
+                            dy: dy,
+                            active: true,
+                            bounces_left: 1,
+                        });
+                        self.shotgun_balls.push(ShotgunBall {
+                            x: ex - SHOTGUN_BALL_SIZE / 2.0,
+                            y: ey,
+                            dx: dx,
+                            dy: dy,
+                            active: true,
+                            bounces_left: 1,
+                        });
+                    }
+                } else if e.class == CLASS_RED {
+                    self.bullets.push(Bullet {
+                        x: ex - BULLET_WIDTH / 2.0,
+                        y: ey,
+                        dy: ENEMY_BULLET_SPEED,
+                        active: true,
+                    });
+                    self.burst_queues.push(BurstQueue {
+                        x: ex - BULLET_WIDTH / 2.0,
+                        y: ey,
+                        remaining: BURST_SIZE - 1,
+                        ticks_until_next: BURST_TICK_INTERVAL,
+                    });
+                } else {
+                    self.bullets.push(Bullet {
+                        x: ex - BULLET_WIDTH / 2.0,
+                        y: ey,
+                        dy: ENEMY_BULLET_SPEED,
+                        active: true,
+                    });
+                }
+            }
+        }
+
+        if !self.formation.intro_done() {
+            return;
+        }
+
+        self.formation.trigger_dive(dt);
+        self.formation.update_dives(dt);
+
+        // Red divers spiral-fire every 8 frames.
+        if self.frame_counter % 8 == 0 {
+            for k in 0..self.formation.enemies.len() {
+                let e = self.formation.enemies[k];
+                if !e.alive || e.class != CLASS_RED || e.dive != DIVE_DIVING {
+                    continue;
+                }
+                let speed = ENEMY_BULLET_SPEED * 1.2;
+                self.shotgun_balls.push(ShotgunBall {
+                    x: e.x + ENEMY_WIDTH / 2.0 - BULLET_WIDTH / 2.0,
+                    y: e.y + ENEMY_HEIGHT / 2.0,
+                    dx: sinf(e.spin_angle) * speed,
+                    dy: cosf(e.spin_angle) * speed,
+                    active: true,
+                    bounces_left: 1,
+                });
+            }
+        }
+        // Yellow divers fire a horizontal pair every 72 frames.
+        if self.frame_counter % 72 == 0 {
+            for k in 0..self.formation.enemies.len() {
+                let e = self.formation.enemies[k];
+                if !e.alive || e.class != CLASS_YELLOW || e.dive != DIVE_DIVING {
+                    continue;
+                }
+                let bx = e.x + ENEMY_WIDTH / 2.0 - SHOTGUN_BALL_SIZE / 2.0;
+                let by = e.y + ENEMY_HEIGHT / 2.0;
+                self.shotgun_balls.push(ShotgunBall {
+                    x: bx,
+                    y: by,
+                    dx: -ENEMY_BULLET_SPEED,
+                    dy: 0.0,
+                    active: true,
+                    bounces_left: 0,
+                });
+                self.shotgun_balls.push(ShotgunBall {
+                    x: bx,
+                    y: by,
+                    dx: ENEMY_BULLET_SPEED,
+                    dy: 0.0,
+                    active: true,
+                    bounces_left: 0,
+                });
+            }
+        }
+
+        let vulnerable = self.invuln_timer <= 0.0;
+        if vulnerable {
+            for k in 0..self.bullets.len() {
+                if !self.bullets[k].active || self.bullets[k].dy < 0.0 {
+                    continue;
+                }
+                if aabb(self.bullets[k].x, self.bullets[k].y, BULLET_WIDTH,
+                    BULLET_HEIGHT, self.player_x, self.player_y, PLAYER_WIDTH,
+                    PLAYER_HEIGHT) {
+                    self.bullets[k].active = false;
+                    if self.player_shield > 0 {
+                        if !self.shield_hit() {
+                            self.consume_shield();
+                        }
+                        self.score -= 200;
+                    } else {
+                        self.kill_player(gpa);
+                        return;
+                    }
+                }
+            }
+        }
+        if vulnerable {
+            for k in 0..self.shotgun_balls.len() {
+                if !self.shotgun_balls[k].active {
+                    continue;
+                }
+                if aabb(self.shotgun_balls[k].x, self.shotgun_balls[k].y,
+                    SHOTGUN_BALL_SIZE, SHOTGUN_BALL_SIZE, self.player_x,
+                    self.player_y, PLAYER_WIDTH, PLAYER_HEIGHT) {
+                    self.shotgun_balls[k].active = false;
+                    if self.player_shield > 0 {
+                        if !self.shield_hit() {
+                            self.consume_shield();
+                        }
+                        self.score -= 200;
+                    } else {
+                        self.kill_player(gpa);
+                        return;
+                    }
+                }
+            }
+        }
+        if vulnerable {
+            for k in 0..self.formation.enemies.len() {
+                let e = self.formation.enemies[k];
+                if e.alive && e.dive != DIVE_NONE && aabb(e.x, e.y,
+                    ENEMY_WIDTH, ENEMY_HEIGHT, self.player_x, self.player_y,
+                    PLAYER_WIDTH, PLAYER_HEIGHT) {
+                    if self.player_shield > 0 {
+                        if !self.shield_hit() {
+                            self.consume_shield();
+                        }
+                        self.score -= 200;
+                    } else {
+                        self.kill_player(gpa);
+                        return;
+                    }
+                }
+            }
+        }
+
+        i = 0;
+        while i < self.bullets.len() {
+            if self.bullets[i].active {
+                i += 1;
+            } else {
+                self.bullets.remove(i);
+            }
+        }
+
+        if self.formation.reached_player() {
+            self.lost = true;
+            return;
+        }
+    }
+
+    /// Hit an enemy's shield; a critical one breaks. Returns whether the
+    /// shield survived (the caller keeps the enemy either way).
+    fn enemy_shield_hit(inout self, e: i64) -> bool {
+        if self.formation.enemies[e].shield == 3 {
+            self.formation.enemies[e].shield = 2;
+            true
+        } else if self.formation.enemies[e].shield == 2 {
+            self.formation.enemies[e].shield = 1;
+            true
+        } else if self.formation.enemies[e].shield == 1 {
+            self.formation.enemies[e].shield = 0;
+            false
+        } else {
+            false
+        }
+    }
+}
+
+fn saturating_add(v: u8) -> u8 {
+    if v == 255 { 255 } else { v + 1 }
+}
+
+// --- what a step returns ------------------------------------------------
+
+pub const STATUS_INTRO: u8 = 0;
+pub const STATUS_PLAYING: u8 = 1;
+pub const STATUS_WAVE_COMPLETE: u8 = 2;
+pub const STATUS_LOST: u8 = 3;
+
+pub struct EnemyInfo {
+    pub x: f32,
+    pub y: f32,
+    pub alive: bool,
+    pub row: i64,
+    pub class: u8,
+    pub rotation: f32,
+    pub shield: u8,
+    pub is_diving: bool,
+}
+
+pub struct BulletInfo {
+    pub x: f32,
+    pub y: f32,
+    pub dy: f32,
+}
+
+pub struct ShotgunInfo {
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+pub struct ExplosionInfo {
+    pub x: f32,
+    pub y: f32,
+    pub frame: u8,
+}
+
+pub struct PowerupInfo {
+    pub x: f32,
+    pub y: f32,
+    pub kind: u8,
+}
+
+#[derive(Clone)]
+pub struct Step {
+    pub status: u8,
+    pub step: u64,
+    pub score: i32,
+    pub lives: u32,
+    pub wave: u32,
+    pub enemies_killed: i64,
+    pub enemies_total: i64,
+    pub player_x: f32,
+    pub player_y: f32,
+    pub player_shield: u8,
+    pub player_speed: f32,
+    pub projectile_speed: f32,
+    pub shield_level: u8,
+    pub is_invulnerable: bool,
+    pub fire_rate_stacks: u8,
+    pub speed_stacks: u8,
+    pub bullet_count: u8,
+    pub inventory: [u8; 5],
+    pub currency: u32,
+    pub enemies: Vec<EnemyInfo>,
+    pub bullets: Vec<BulletInfo>,
+    pub shotgun: Vec<ShotgunInfo>,
+    pub explosions: Vec<ExplosionInfo>,
+    pub powerups: Vec<PowerupInfo>,
+}
+
+impl Step {
+    pub fn empty(gpa: Gpa) -> Step {
+        Step {
+            status: STATUS_INTRO,
+            step: 0,
+            score: 0,
+            lives: 0,
+            wave: 1,
+            enemies_killed: 0,
+            enemies_total: 0,
+            player_x: 0.0,
+            player_y: 0.0,
+            player_shield: 0,
+            player_speed: 0.0,
+            projectile_speed: 0.0,
+            shield_level: 0,
+            is_invulnerable: false,
+            fire_rate_stacks: 0,
+            speed_stacks: 0,
+            bullet_count: 1,
+            inventory: [0, 0, 0, 0, 0],
+            currency: 0,
+            enemies: Vec::new_in(gpa),
+            bullets: Vec::new_in(gpa),
+            shotgun: Vec::new_in(gpa),
+            explosions: Vec::new_in(gpa),
+            powerups: Vec::new_in(gpa),
+        }
+    }
+}
+
+// --- the game as the UI sees it -----------------------------------------
+
+pub struct GameSim {
+    state: PlayState,
+    pub fb: draw::Fb,
+}
+
+pub fn sim_new(seed: u64, wave: u32, gpa: Gpa) -> GameSim {
+    GameSim {
+        state: PlayState::new(seed, wave, gpa),
+        fb: draw::fb_new(GAME_W, GAME_H, gpa),
+    }
+}
+
+impl GameSim {
+    pub fn reset_to_wave(inout self, wave: u32, gpa: Gpa) {
+        let seed = self.state.frame_counter * 6364136223846793005u64 + 1;
+        self.state = PlayState::new(seed, wave, gpa);
+    }
+
+    pub fn is_done(self) -> bool {
+        self.state.lost
+    }
+
+    pub fn lives(self) -> u32 {
+        self.state.lives
+    }
+
+    pub fn score(self) -> i32 {
+        self.state.score
+    }
+
+    pub fn step(inout self, actions: u32, gpa: Gpa) -> Step {
+        self.state.tick(actions, gpa);
+        self.render(gpa);
+
+        var killed: i64 = 0;
+        for i in 0..self.state.formation.enemies.len() {
+            if !self.state.formation.enemies[i].alive {
+                killed += 1;
+            }
+        }
+        let total = self.state.formation.enemies.len();
+
+        var status = STATUS_PLAYING;
+        if self.state.wave_just_completed {
+            status = STATUS_WAVE_COMPLETE;
+        } else if self.state.lost {
+            status = STATUS_LOST;
+        } else if !self.state.formation.intro_done() {
+            status = STATUS_INTRO;
+        }
+
+        var enemies: Vec<EnemyInfo> = Vec::with_capacity_in(total, gpa);
+        for i in 0..total {
+            let e = self.state.formation.enemies[i];
+            enemies.push(EnemyInfo {
+                x: e.x,
+                y: e.y,
+                alive: e.alive,
+                row: e.row,
+                class: e.class,
+                rotation: e.rotation,
+                shield: e.shield,
+                is_diving: e.dive == DIVE_DIVING,
+            });
+        }
+        var bullets: Vec<BulletInfo> = Vec::with_capacity_in(
+            self.state.bullets.len(), gpa);
+        for i in 0..self.state.bullets.len() {
+            let b = self.state.bullets[i];
+            if b.active {
+                bullets.push(BulletInfo { x: b.x, y: b.y, dy: b.dy });
+            }
+        }
+        var shotgun: Vec<ShotgunInfo> = Vec::with_capacity_in(
+            self.state.shotgun_balls.len(), gpa);
+        for i in 0..self.state.shotgun_balls.len() {
+            let b = self.state.shotgun_balls[i];
+            if b.active {
+                shotgun.push(ShotgunInfo { x: b.x, y: b.y, dx: b.dx, dy: b.dy });
+            }
+        }
+        var powerups: Vec<PowerupInfo> = Vec::with_capacity_in(
+            self.state.powerups.len(), gpa);
+        for i in 0..self.state.powerups.len() {
+            let p = self.state.powerups[i];
+            powerups.push(PowerupInfo { x: p.x, y: p.y, kind: p.kind });
+        }
+        var explosions: Vec<ExplosionInfo> = Vec::with_capacity_in(
+            self.state.explosions.len(), gpa);
+        for i in 0..self.state.explosions.len() {
+            let e = self.state.explosions[i];
+            explosions.push(ExplosionInfo { x: e.x, y: e.y, frame: e.frame });
+        }
+
+        Step {
+            status: status,
+            step: self.state.frame_counter,
+            score: self.state.score,
+            lives: self.state.lives,
+            wave: self.state.wave,
+            enemies_killed: killed,
+            enemies_total: total,
+            player_x: self.state.player_x,
+            player_y: self.state.player_y,
+            player_shield: self.state.player_shield,
+            player_speed: PLAYER_SPEED * self.state.speed_mult,
+            projectile_speed: BULLET_SPEED * self.state.speed_mult,
+            shield_level: self.state.player_shield,
+            is_invulnerable: self.state.invuln_timer > 0.0,
+            fire_rate_stacks: self.state.fire_rate_stacks,
+            speed_stacks: self.state.speed_stacks,
+            bullet_count: self.state.bullet_count,
+            inventory: [
+                self.state.inv_rate,
+                self.state.inv_speed,
+                self.state.inv_double,
+                self.state.inv_triple,
+                self.state.inv_shield,
+            ],
+            currency: self.state.currency,
+            enemies: enemies,
+            bullets: bullets,
+            shotgun: shotgun,
+            explosions: explosions,
+            powerups: powerups,
+        }
+    }
+
+    /// Paint the game layer: transparent where nothing is drawn, so the
+    /// session's starfield shows through.
+    fn render(inout self, gpa: Gpa) {
+        let fb = &self.fb;
+        fb.clear(0, 0, 0, 0);
+        let s = &self.state;
+
+        let draw_player = if s.lost && s.lives == 0 {
+            false
+        } else {
+            s.invuln_timer <= 0.0 || (s.invuln_timer * 10.0) as u32 % 2 == 0
+        };
+        if draw_player {
+            fb.sprite(PLAYER_X, 16, 16, s.player_x, s.player_y, 1.0);
+            if s.player_shield > 0 {
+                let color = shield_color(s.player_shield, s.player_shield_phase,
+                    s.frame_counter);
+                let radius = shield_radius(s.player_shield_phase, s.frame_counter);
+                fb.draw_circle(s.player_x + PLAYER_WIDTH / 2.0,
+                    s.player_y + PLAYER_HEIGHT / 2.0, radius, 1.0, color);
+            }
+        }
+
+        for i in 0..s.formation.enemies.len() {
+            let e = s.formation.enemies[i];
+            if !e.alive || e.spawn == SPAWN_WAITING {
+                continue;
+            }
+            let row = sprite_row(e.class);
+            let rx = if row == 0 {
+                if s.anim_frame { YELLOW_F2_X } else { YELLOW_F1_X }
+            } else if row == 1 {
+                if s.anim_frame { RED_F2_X } else { RED_F1_X }
+            } else if row == 2 {
+                if s.anim_frame { GREEN_F2_X } else { GREEN_F1_X }
+            } else {
+                if s.anim_frame { BW_F2_X } else { BW_F1_X }
+            };
+            fb.sprite_rotated(rx, 16, 16, e.x, e.y, 1.0, e.rotation);
+            if e.shield > 0 {
+                let color = shield_color(e.shield, e.shield_phase, s.frame_counter);
+                let radius = shield_radius(e.shield_phase, s.frame_counter);
+                fb.draw_circle(e.x + ENEMY_WIDTH / 2.0,
+                    e.y + ENEMY_HEIGHT / 2.0, radius, 1.0, color);
+            }
+        }
+
+        for i in 0..s.trail_particles.len() {
+            let p = s.trail_particles[i];
+            let fade = p.life as f32 / 5.0;
+            if p.is_player {
+                fb.fill_rect(p.x as i64, p.y as i64, 1, 1,
+                    [0.3, 0.7, 1.0, fade * 0.7]);
+            } else {
+                fb.fill_rect(p.x as i64, p.y as i64, 1, 1,
+                    [1.0, 0.5, 0.15, fade * 0.7]);
+            }
+        }
+
+        for i in 0..s.bullets.len() {
+            let b = s.bullets[i];
+            if !b.active {
+                continue;
+            }
+            if b.dy < 0.0 {
+                fb.sprite(BULLET_X, 4, 8, b.x, b.y, 1.0);
+            } else {
+                fb.sprite(ENEMY_BULLET_X, 4, 8, b.x, b.y, 1.0);
+            }
+        }
+        for i in 0..s.shotgun_balls.len() {
+            let b = s.shotgun_balls[i];
+            if b.active {
+                fb.sprite(SHOTGUN_X, 4, 4, b.x, b.y, 1.0);
+            }
+        }
+        for i in 0..s.powerups.len() {
+            let p = s.powerups[i];
+            let rx = POWERUP_X + p.kind as i64 * 16;
+            fb.sprite(rx, 16, 16, p.x, p.y, 1.0);
+        }
+        for i in 0..s.explosions.len() {
+            let e = s.explosions[i];
+            fb.sprite(EXPLODE_X + e.frame as i64 * 24, 24, 24, e.x, e.y, 1.0);
+        }
+
+        let hud = format_in(f"S:{s.score} | W:{s.wave}", gpa);
+        draw::draw_text(fb, hud.as_slice(), 2.0, 2.0, 1.0,
+            [0.7, 0.7, 0.7, 1.0]);
+        let lives_to_show = if s.lost { 0 } else { s.lives - 1 };
+        for i in 0..lives_to_show {
+            let lx = GAME_WIDTH - (i as f32 + 1.0) * LIVES_ICON_SPACING - 2.0;
+            let ly = GAME_HEIGHT - LIVES_ICON_SPACING;
+            fb.sprite(LIVES_ICON_X, 8, 8, lx, ly, 1.0);
+        }
+    }
+}

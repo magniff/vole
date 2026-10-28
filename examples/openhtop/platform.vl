@@ -1,0 +1,303 @@
+// The system beneath: C calls, commands, the terminal and its keys.
+
+use std::{SYS_TIOCGWINSZ, fs, parse_int};
+use std::process::Command as ProcCommand;
+use std::sys::{SYS_POLLIN, SysPollFd, sys_poll, sys_read, sys_write};
+
+use crate::model::{Key, Snapshot, State, max};
+
+extern "C" {
+    fn getloadavg(loadavg: *f64, nelem: i32) -> i32;
+    fn getpagesize() -> i32;
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+    fn dlopen(path: *u8, mode: i32) -> *u8;
+    fn dlsym(handle: *u8, name: *u8) -> *u8;
+}
+
+// struct winsize, the same on Linux and macOS (the request differs; std
+// exports the right one for the target).
+#[repr(C)]
+struct Winsize {
+    rows: u16,
+    cols: u16,
+    xpixel: u16,
+    ypixel: u16,
+}
+
+// The page size in kB: the unit of /proc's resident and shared counts.
+pub fn page_size_kb() -> i64 {
+    max(unsafe { getpagesize() } as i64 / 1024, 1)
+}
+
+// The bytes of a command's output, or None when it could not run or exited
+// non-zero.
+pub fn run_command(prog: [u8], args: [[u8]], gpa: Gpa) -> Option<Buf> {
+    var c = ProcCommand::new(prog);
+    for a in args {
+        c.arg(a);
+    }
+    match c.output_in(gpa) {
+        Ok(o) => if o.status.success() { Some(Buf::from_in(o.stdout.as_slice(), gpa)) }
+            else { None },
+        Err(_) => None,
+    }
+}
+
+// A command whose output is one integer, or fallback.
+pub fn run_int_command(prog: [u8], args: [[u8]], fallback: i64, gpa: Gpa) -> i64 {
+    match run_command(prog, args, gpa) {
+        Some(b) => parse_int(trim(b.as_slice())).unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
+pub fn linux_here() -> bool {
+    fs::exists("/proc/self/stat")
+}
+
+// getloadavg(3): the 1, 5 and 15 minute load averages, on both systems.
+pub fn read_load_average(snap: inout Snapshot) {
+    var load: [f64; 3] = [0.0, 0.0, 0.0];
+    let r = unsafe { getloadavg(&load as *f64, 3) };
+    if r >= 0 {
+        snap.load = load;
+    }
+}
+
+// ---- macOS: the load counters of every CPU ----
+
+// Mach's host_processor_info reports, for each logical CPU, the ticks it
+// has spent in user, system, idle and nice code. Those are not symbols
+// every system has, so they are looked up at run time: on Linux the
+// lookup finds nothing and /proc/stat answers instead, and the same
+// binary links on both.
+const RTLD_NOW: i32 = 2;
+const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
+const CPU_STATES: i64 = 4; // user, system, idle, nice
+
+// One address, read as whichever C function it names.
+#[repr(C)]
+union MachCall {
+    address: *u8,
+    host_self: extern "C" fn() -> u32,
+    processor_info: extern "C" fn(u32, i32, *u32, **i32, *u32) -> i32,
+    vm_deallocate: extern "C" fn(u32, u64, u64) -> i32,
+}
+
+fn mach_symbol(library: *u8, name: *u8) -> *u8 {
+    if !library.is_null() {
+        let found = unsafe { dlsym(library, name) };
+        if !found.is_null() {
+            return found;
+        }
+    }
+    // RTLD_DEFAULT: every library the process has loaded, whether or not
+    // dlopen(NULL) named it (libSystem carries the Mach calls on macOS).
+    unsafe { dlsym(-2 as *u8, name) }
+}
+
+fn resolve_mach_symbols(library: *u8) {
+    MACH_HOST_SELF = mach_symbol(library, c"mach_host_self");
+    MACH_PROCESSOR_INFO = mach_symbol(library, c"host_processor_info");
+    MACH_DEALLOCATE = mach_symbol(library, c"vm_deallocate");
+    MACH_TASK_SELF = mach_symbol(library, c"mach_task_self_");
+}
+
+// The symbols and the host port, looked up once: a refresh every second
+// should not leak a port right or a library handle.
+static var MACH_LOADED: bool = false;
+static var MACH_LIBRARY: *u8 = 0 as *u8;
+static var MACH_HOST_SELF: *u8 = 0 as *u8;
+static var MACH_PROCESSOR_INFO: *u8 = 0 as *u8;
+static var MACH_DEALLOCATE: *u8 = 0 as *u8;
+static var MACH_TASK_SELF: *u8 = 0 as *u8;
+static var HOST_PORT: u32 = 0;
+
+fn load_mach_symbols() {
+    if MACH_LOADED {
+        return;
+    }
+    MACH_LOADED = true;
+    // dlopen(NULL) is the running program and the libraries it already
+    // has: libSystem on macOS, libc on Linux.
+    MACH_LIBRARY = unsafe { dlopen(0 as *u8, RTLD_NOW) };
+    resolve_mach_symbols(MACH_LIBRARY);
+    if MACH_HOST_SELF.is_null() || MACH_PROCESSOR_INFO.is_null() {
+        // A static link or a stripped loader can leave libSystem out of
+        // that handle; open it by name before giving up.
+        let system = unsafe { dlopen(c"/usr/lib/libSystem.B.dylib", RTLD_NOW) };
+        if !system.is_null() {
+            MACH_LIBRARY = system;
+            resolve_mach_symbols(system);
+        }
+    }
+}
+
+// Fills totals (the ticks of all four states) and idle with one entry per
+// CPU, the same counters compute_usage_rates() reads from /proc/stat.
+// Returns the number of CPUs, or 0 when Mach is not there.
+pub fn read_macos_core_ticks(totals: inout Vec<i64>, idle: inout Vec<i64>) -> i64 {
+    load_mach_symbols();
+    if MACH_HOST_SELF.is_null() || MACH_PROCESSOR_INFO.is_null() {
+        return 0;
+    }
+    if HOST_PORT == 0 {
+        let host_self = unsafe { MachCall { address: MACH_HOST_SELF }.host_self };
+        HOST_PORT = unsafe { host_self() };
+    }
+    var cpu_count: u32 = 0;
+    var info: *i32 = 0 as *i32;
+    var info_count: u32 = 0;
+    let read = unsafe { MachCall { address: MACH_PROCESSOR_INFO }.processor_info };
+    let status = unsafe {
+        read(HOST_PORT, PROCESSOR_CPU_LOAD_INFO, &cpu_count, &info, &info_count)
+    };
+    if status != 0 || cpu_count == 0 || info.is_null() {
+        return 0;
+    }
+    var i = 0;
+    while i < cpu_count as i64 {
+        let base = i * CPU_STATES;
+        let user = unsafe { info[base] } as i64;
+        let system = unsafe { info[base + 1] } as i64;
+        let idle_ticks = unsafe { info[base + 2] } as i64;
+        let nice = unsafe { info[base + 3] } as i64;
+        totals.push(user + system + idle_ticks + nice);
+        idle.push(idle_ticks);
+        i += 1;
+    }
+    if !MACH_DEALLOCATE.is_null() && !MACH_TASK_SELF.is_null() {
+        // mach_task_self() is a macro for the mach_task_self_ port.
+        let task = unsafe { *(MACH_TASK_SELF as *u32) };
+        let release = unsafe { MachCall { address: MACH_DEALLOCATE }.vm_deallocate };
+        unsafe { release(task, info as u64, info_count as u64 * 4) };
+    }
+    cpu_count as i64
+}
+
+// ---- The terminal ----
+
+pub fn write_bytes(fd: i32, bytes: [u8]) {
+    var at = 0;
+    while at < bytes.len {
+        match sys_write(fd, bytes[at..]) {
+            Ok(n) => {
+                if n <= 0 {
+                    return;
+                }
+                at += n;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+pub fn terminal_size(state: State) -> (i64, i64) {
+    var ws = Winsize { rows: 0, cols: 0, xpixel: 0, ypixel: 0 };
+    let r = unsafe { ioctl(1, SYS_TIOCGWINSZ, &ws as *u8) };
+    var w = if r == 0 && ws.cols > 0 { ws.cols as i64 } else { 100 };
+    var h = if r == 0 && ws.rows > 0 { ws.rows as i64 } else { 24 };
+    if state.width > 0 {
+        w = state.width;
+    }
+    if state.height > 0 {
+        h = state.height;
+    }
+    (max(w, 40), max(h, 12))
+}
+
+pub fn key_pressed(k: Key) -> bool {
+    match k {
+        Key::None => false,
+        _ => true,
+    }
+}
+
+pub fn read_key(timeout_ms: i32) -> Key {
+    var fds: [SysPollFd; 1] = [SysPollFd { fd: 0, events: SYS_POLLIN, revents: 0 }];
+    let ready = match sys_poll(fds[..], timeout_ms) {
+        Ok(n) => n,
+        Err(_) => return Key::None,
+    };
+    if ready <= 0 {
+        return Key::None;
+    }
+    var bytes: [u8; 16] = [0; 16];
+    let count = match sys_read(0, &bytes[..]) {
+        Ok(n) => n,
+        Err(_) => return Key::None,
+    };
+    if count <= 0 {
+        return Key::None;
+    }
+    let first = bytes[0];
+    if first != 27 {
+        return Key::Char(first);
+    }
+    if count == 1 {
+        return Key::Escape;
+    }
+    if bytes[1] == 'O' && count >= 3 {
+        // SS3: the arrows on some terminals, F1 to F4 on most.
+        return match bytes[2] {
+            'A' => Key::Up,
+            'B' => Key::Down,
+            'C' => Key::None,
+            'D' => Key::None,
+            'H' => Key::Home,
+            'F' => Key::End,
+            'P' => Key::Function(1),
+            'Q' => Key::Function(2),
+            'R' => Key::Function(3),
+            'S' => Key::Function(4),
+            _ => Key::None,
+        };
+    }
+    if bytes[1] != '[' || count < 3 {
+        return Key::Escape;
+    }
+    let third = bytes[2];
+    if third == 'A' {
+        return Key::Up;
+    } else if third == 'B' {
+        return Key::Down;
+    } else if third == 'H' {
+        return Key::Home;
+    } else if third == 'F' {
+        return Key::End;
+    } else if third == 'Z' {
+        return Key::None;
+    }
+    // CSI with a number: "\x1b[5~", "\x1b[15~", "\x1b[1;5A" (the modifier
+    // is ignored). Home and End have two forms each.
+    var number = 0;
+    var at = 2;
+    var digits = false;
+    while at < count && bytes[at] >= '0' && bytes[at] <= '9' {
+        number = number * 10 + (bytes[at] - '0') as i64;
+        digits = true;
+        at += 1;
+    }
+    if !digits {
+        return Key::None;
+    }
+    match number {
+        1 | 7 => Key::Home,
+        4 | 8 => Key::End,
+        5 => Key::PageUp,
+        6 => Key::PageDown,
+        11 => Key::Function(1),
+        12 => Key::Function(2),
+        13 => Key::Function(3),
+        14 => Key::Function(4),
+        15 => Key::Function(5),
+        17 => Key::Function(6),
+        18 => Key::Function(7),
+        19 => Key::Function(8),
+        20 => Key::Function(9),
+        21 => Key::Function(10),
+        23 => Key::Function(11),
+        24 => Key::Function(12),
+        _ => Key::None,
+    }
+}

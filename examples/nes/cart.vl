@@ -1,0 +1,461 @@
+// cart.vl: the cartridge and its mapper — the banked PRG/CHR windows,
+// the nametable mirroring, the PRG RAM, and for MMC3 the scanline
+// counter that raises the CPU's IRQ. Eight mappers cover the library a
+// desktop NES emulator is expected to run: NROM (0), MMC1 (1), UxROM
+// (2), CNROM (3), MMC3 (4), AxROM (7), Color Dreams (11) and GxROM
+// (66). The bank windows are kept as 8 KiB PRG and 1 KiB CHR unit maps,
+// so every mapper is a table update and the hot read paths are one
+// multiply and one index.
+//
+// A game that writes a bank number past the end of its ROM gets the
+// modulo of it, not a crash: bad rip dumps and buggy homebrew are more
+// common than hardware that cared.
+
+use rom::{Rom, MIRROR_FOUR, MIRROR_HORIZONTAL, MIRROR_SINGLE_HIGH,
+    MIRROR_SINGLE_LOW, MIRROR_VERTICAL};
+
+const PRG_RAM_MIN: i64 = 8192;
+
+pub struct Cart {
+    prg: Vec<u8>,
+    chr: Vec<u8>,
+    chr_ram: bool,
+    prg_ram: Vec<u8>,
+    mapper: i64,
+    mirroring: i64,
+    prg_map: [i64; 4],
+    chr_map: [i64; 8],
+    // MMC1's serial port.
+    shift: i64,
+    shift_count: i64,
+    // MMC1's control register, MMC3's bank-select bits.
+    control: i64,
+    // MMC3.
+    bank_select: i64,
+    banks: [i64; 8],
+    irq_latch: i64,
+    irq_counter: i64,
+    irq_reload: bool,
+    irq_enabled: bool,
+    irq_pending: bool,
+}
+
+fn wrap_u(u: i64, n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    let m = u % n;
+    if m < 0 { m + n } else { m }
+}
+
+impl Cart {
+    pub fn new(rom: sink Rom, gpa: Gpa) -> Cart {
+        let prg_units = rom.prg.len() / 8192;
+        let chr_ram = rom.chr_ram;
+        let chr = rom.chr;
+        var prg_ram: Vec<u8> = Vec::new_in(gpa);
+        var ram_size = rom.prg_ram_size;
+        if ram_size < PRG_RAM_MIN {
+            ram_size = PRG_RAM_MIN;
+        }
+        for _ in 0..ram_size {
+            prg_ram.push(0);
+        }
+        var c = Cart {
+            prg: rom.prg,
+            chr: chr,
+            chr_ram: chr_ram,
+            prg_ram: prg_ram,
+            mapper: rom.mapper,
+            mirroring: rom.mirroring,
+            prg_map: [0; 4],
+            chr_map: [0; 8],
+            shift: 0,
+            shift_count: 0,
+            control: 0,
+            bank_select: 0,
+            banks: [0; 8],
+            irq_latch: 0,
+            irq_counter: 0,
+            irq_reload: false,
+            irq_enabled: false,
+            irq_pending: false,
+        };
+        c.reset(prg_units);
+        c
+    }
+
+    fn prg_units(self) -> i64 {
+        self.prg.len() / 8192
+    }
+
+    fn chr_units(self) -> i64 {
+        self.chr.len() / 1024
+    }
+
+    fn map_prg8(inout self, slot: i64, unit: i64) {
+        self.prg_map[slot] = wrap_u(unit, self.prg.len() / 8192);
+    }
+
+    fn map_chr8(inout self, slot: i64, unit: i64) {
+        self.chr_map[slot] = wrap_u(unit, self.chr.len() / 1024);
+    }
+
+    // Power-on banks: the first PRG bank at $8000 and, for mappers with
+    // a fixed high window, the last one at $C000.
+    fn reset(inout self, prg_units: i64) {
+        let last = prg_units - 1;
+        if self.mapper == 4 {
+            self.banks[6] = 0;
+            self.banks[7] = 1;
+        }
+        if self.mapper == 1 {
+            self.control = 0x0c;
+            self.shift = 0;
+            self.shift_count = 0;
+        }
+        self.irq_pending = false;
+        self.irq_enabled = false;
+        self.irq_counter = 0;
+        self.irq_reload = false;
+        self.refresh();
+        let _ = last;
+    }
+
+    // Recomputes both bank windows from the mapper's registers. Called
+    // once at power-on and after every register write: four or eight
+    // stores, never in the pixel path.
+    fn refresh(inout self) {
+        let last = self.prg.len() / 8192 - 1;
+        if self.mapper == 0 {
+            if last == 1 {
+                // A 16 KiB PRG chip is mirrored: $C000 repeats $8000.
+                self.map_prg8(0, 0);
+                self.map_prg8(1, 1);
+                self.map_prg8(2, 0);
+                self.map_prg8(3, 1);
+            } else {
+                for i in 0..4 {
+                    self.map_prg8(i, i);
+                }
+            }
+            for i in 0..8 {
+                self.map_chr8(i, i);
+            }
+        } else if self.mapper == 1 {
+            let mode = (self.control >> 2) & 3;
+            // The PRG register counts 16 KiB banks. Modes 0 and 1 map a
+            // 32 KiB window, where its low bit is ignored; modes 2 and 3
+            // map one 16 KiB bank, where it is not. A bank's first 8 KiB
+            // unit is twice its number.
+            if mode == 0 || mode == 1 {
+                let base = (self.mmc1_prg() & 0x0e) * 2;
+                for i in 0..4 {
+                    self.map_prg8(i, base + i);
+                }
+            } else if mode == 2 {
+                // First 16 KiB fixed at $8000, the register's bank at
+                // $C000.
+                self.map_prg8(0, 0);
+                self.map_prg8(1, 1);
+                let base = self.mmc1_prg() * 2;
+                self.map_prg8(2, base);
+                self.map_prg8(3, base + 1);
+            } else {
+                let base = self.mmc1_prg() * 2;
+                self.map_prg8(0, base);
+                self.map_prg8(1, base + 1);
+                self.map_prg8(2, last - 1);
+                self.map_prg8(3, last);
+            }
+            if (self.control & 0x10) == 0 {
+                // 8 KiB CHR
+                let base = (self.mmc1_chr0() & 0x1e) * 4;
+                for i in 0..8 {
+                    self.map_chr8(i, base + i);
+                }
+            } else {
+                let lo = (self.mmc1_chr0() & 0x1f) * 4;
+                let hi = (self.mmc1_chr1() & 0x1f) * 4;
+                for i in 0..4 {
+                    self.map_chr8(i, lo + i);
+                    self.map_chr8(i + 4, hi + i);
+                }
+            }
+            let m = self.control & 3;
+            if m == 0 { self.mirroring = MIRROR_SINGLE_LOW; }
+            else if m == 1 { self.mirroring = MIRROR_SINGLE_HIGH; }
+            else if m == 2 { self.mirroring = MIRROR_VERTICAL; }
+            else { self.mirroring = MIRROR_HORIZONTAL; }
+        } else if self.mapper == 2 {
+            let bank = self.control & 0x0f;
+            self.map_prg8(0, bank * 2);
+            self.map_prg8(1, bank * 2 + 1);
+            self.map_prg8(2, last - 1);
+            self.map_prg8(3, last);
+            for i in 0..8 {
+                self.map_chr8(i, i);
+            }
+        } else if self.mapper == 3 {
+            for i in 0..4 {
+                self.map_prg8(i, i);
+            }
+            let base = (self.control & 3) * 8;
+            for i in 0..8 {
+                self.map_chr8(i, base + i);
+            }
+        } else if self.mapper == 4 {
+            let prg_mode = (self.control >> 6) & 1;
+            if prg_mode == 0 {
+                self.map_prg8(0, self.banks[6]);
+                self.map_prg8(1, self.banks[7]);
+                self.map_prg8(2, last - 1);
+                self.map_prg8(3, last);
+            } else {
+                self.map_prg8(0, last - 1);
+                self.map_prg8(1, self.banks[7]);
+                self.map_prg8(2, self.banks[6]);
+                self.map_prg8(3, last);
+            }
+            let chr_mode = (self.control >> 7) & 1;
+            if chr_mode == 0 {
+                let r0 = self.banks[0] & 0xfe;
+                let r1 = self.banks[1] & 0xfe;
+                self.map_chr8(0, r0);
+                self.map_chr8(1, r0 + 1);
+                self.map_chr8(2, r1);
+                self.map_chr8(3, r1 + 1);
+                self.map_chr8(4, self.banks[2]);
+                self.map_chr8(5, self.banks[3]);
+                self.map_chr8(6, self.banks[4]);
+                self.map_chr8(7, self.banks[5]);
+            } else {
+                self.map_chr8(0, self.banks[2]);
+                self.map_chr8(1, self.banks[3]);
+                self.map_chr8(2, self.banks[4]);
+                self.map_chr8(3, self.banks[5]);
+                let r0 = self.banks[0] & 0xfe;
+                let r1 = self.banks[1] & 0xfe;
+                self.map_chr8(4, r0);
+                self.map_chr8(5, r0 + 1);
+                self.map_chr8(6, r1);
+                self.map_chr8(7, r1 + 1);
+            }
+        } else if self.mapper == 7 {
+            let base = (self.control & 0x07) * 4;
+            for i in 0..4 {
+                self.map_prg8(i, base + i);
+            }
+            for i in 0..8 {
+                self.map_chr8(i, i);
+            }
+            if (self.control & 0x10) != 0 {
+                self.mirroring = MIRROR_SINGLE_HIGH;
+            } else {
+                self.mirroring = MIRROR_SINGLE_LOW;
+            }
+        } else if self.mapper == 11 {
+            let base = (self.control & 0x03) * 4;
+            for i in 0..4 {
+                self.map_prg8(i, base + i);
+            }
+            let cbase = ((self.control >> 4) & 0x0f) * 8;
+            for i in 0..8 {
+                self.map_chr8(i, cbase + i);
+            }
+        } else if self.mapper == 66 {
+            let base = ((self.control >> 4) & 0x03) * 4;
+            for i in 0..4 {
+                self.map_prg8(i, base + i);
+            }
+            let cbase = (self.control & 0x03) * 8;
+            for i in 0..8 {
+                self.map_chr8(i, cbase + i);
+            }
+        }
+    }
+
+    fn mmc1_prg(self) -> i64 {
+        self.control >> 8
+    }
+
+    fn mmc1_chr0(self) -> i64 {
+        (self.control >> 16) & 0xff
+    }
+
+    fn mmc1_chr1(self) -> i64 {
+        (self.control >> 24) & 0xff
+    }
+
+    pub fn mirroring(self) -> i64 {
+        self.mirroring
+    }
+
+    pub fn mapper(self) -> i64 {
+        self.mapper
+    }
+
+    pub fn chr_is_ram(self) -> bool {
+        self.chr_ram
+    }
+
+    pub fn cpu_read(self, addr: i64) -> u8 {
+        if addr >= 0x8000 {
+            let slot = (addr - 0x8000) >> 13;
+            let unit = self.prg_map[slot];
+            let off = unit * 8192 + (addr & 0x1fff);
+            return self.prg[off];
+        }
+        if addr >= 0x6000 {
+            if self.prg_ram.len() == 0 {
+                return 0;
+            }
+            return self.prg_ram[(addr - 0x6000) % self.prg_ram.len()];
+        }
+        0
+    }
+
+    pub fn cpu_write(inout self, addr: i64, v: u8) {
+        if addr >= 0x6000 && addr < 0x8000 {
+            if self.prg_ram.len() > 0 {
+                let i = (addr - 0x6000) % self.prg_ram.len();
+                self.prg_ram[i] = v;
+            }
+            return;
+        }
+        if addr < 0x8000 {
+            return;
+        }
+        if self.mapper == 1 {
+            if (v & 0x80) != 0 {
+                self.shift = 0;
+                self.shift_count = 0;
+                self.control = (self.control & 0xffff) | 0x0c00;
+                self.refresh();
+                return;
+            }
+            self.shift = self.shift | ((v as i64 & 1) << self.shift_count);
+            self.shift_count += 1;
+            if self.shift_count == 5 {
+                let reg = (addr >> 13) & 3;
+                let value = self.shift & 0x1f;
+                self.shift = 0;
+                self.shift_count = 0;
+                if reg == 0 {
+                    self.control = (self.control & ~0xff) | value;
+                } else if reg == 1 {
+                    self.control = (self.control & ~(0xff << 16)) | (value << 16);
+                } else if reg == 2 {
+                    self.control = (self.control & ~(0xff << 24)) | (value << 24);
+                } else {
+                    self.control = (self.control & ~(0xff << 8)) | (value << 8);
+                }
+                self.refresh();
+            }
+            return;
+        }
+        if self.mapper == 0 {
+            return;
+        }
+        if self.mapper == 2 {
+            self.control = (v as i64) & 0x0f;
+            self.refresh();
+            return;
+        }
+        if self.mapper == 3 {
+            self.control = (v as i64) & 3;
+            self.refresh();
+            return;
+        }
+        if self.mapper == 7 {
+            self.control = (v as i64) & 0x1f;
+            self.refresh();
+            return;
+        }
+        if self.mapper == 11 || self.mapper == 66 {
+            self.control = v as i64;
+            self.refresh();
+            return;
+        }
+        if self.mapper == 4 {
+            if (addr & 1) == 0 {
+                if addr < 0xa000 {
+                    self.bank_select = (v as i64) & 7;
+                    self.control = (self.control & 0x3f) | (v as i64 & 0xc0);
+                    // The two mode bits take effect at once.
+                    self.refresh();
+                } else if addr < 0xc000 {
+                    self.mirroring = if (v & 1) != 0 { MIRROR_HORIZONTAL } else { MIRROR_VERTICAL };
+                } else if addr < 0xe000 {
+                    self.irq_latch = v as i64;
+                } else {
+                    self.irq_enabled = false;
+                    self.irq_pending = false;
+                }
+            } else {
+                if addr < 0xa000 {
+                    self.banks[self.bank_select] = v as i64;
+                    self.refresh();
+                } else if addr < 0xc000 {
+                    // PRG RAM protect: ignored (RAM is always writable).
+                } else if addr < 0xe000 {
+                    self.irq_counter = 0;
+                    self.irq_reload = true;
+                } else {
+                    self.irq_enabled = true;
+                }
+            }
+            return;
+        }
+    }
+
+    pub fn ppu_read(self, addr: i64) -> u8 {
+        let unit = self.chr_map[(addr >> 10) & 7];
+        self.chr[unit * 1024 + (addr & 0x3ff)]
+    }
+
+    pub fn ppu_write(inout self, addr: i64, v: u8) {
+        if self.chr_ram {
+            let unit = self.chr_map[(addr >> 10) & 7];
+            let i = unit * 1024 + (addr & 0x3ff);
+            self.chr[i] = v;
+        }
+    }
+
+    // One clock of MMC3's scanline counter: the PPU calls this on an
+    // accepted rising edge of A12 (bit 12 of the address it drives).
+    // The counter runs even while the IRQ is disabled, and the flag is
+    // only raised when the IRQ is enabled; a reload to 0 raises it too
+    // (revision B behaviour, what 5-MMC3.nes checks for).
+    pub fn clock_a12(inout self) {
+        if self.mapper != 4 {
+            return;
+        }
+        if self.irq_counter == 0 || self.irq_reload {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload = false;
+        } else {
+            self.irq_counter -= 1;
+        }
+        if self.irq_counter == 0 && self.irq_enabled {
+            self.irq_pending = true;
+        }
+    }
+
+    pub fn irq(self) -> bool {
+        self.irq_pending
+    }
+
+    pub fn ack_irq(inout self) {
+        self.irq_pending = false;
+    }
+
+    // A bank's first byte, for the headless bank-switch checks.
+    pub fn prg_byte(self, unit: i64, off: i64) -> u8 {
+        self.prg[unit * 8192 + off]
+    }
+
+    pub fn chr_byte(self, unit: i64, off: i64) -> u8 {
+        self.chr[unit * 1024 + off]
+    }
+}

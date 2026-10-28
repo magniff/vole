@@ -1,0 +1,319 @@
+// galaxy: an N-body simulation of a spinning galaxy, computed on the GPU
+// and rendered into a window — physics.vl's kernel advances every star
+// each step (a direct O(n²) sum: every star pulls every other), view.vl's
+// shader draws the state as camera-facing billboards, and this file is
+// the frame: the command line, the window, the event loop and the camera
+// the mouse and keys drive.
+//
+//   drag or the arrows   the camera (yaw, pitch)
+//   scroll               zoom
+//   space                pause
+//   , / .                slower / faster
+//   r                    a new disk (the seed rerolls)
+//   f                    fullscreen
+//   q or Esc             quit
+//
+// The title bar carries the frame rate (std::window; no text is drawn on
+// the GPU). Resize reconfigures the surface; a frame is drawn only when
+// the window asks for one.
+//
+// Build it from the root of the repository (std::gpu and std::window
+// name the frameworks they link):
+//
+//   target/volec -O2 examples/galaxy/main.vl -o galaxy
+//
+// On a display with no window server (ssh, CI), `--headless` runs
+// check.vl instead: the GPU's own physics compared against a CPU
+// reference and one frame checked and read back.
+
+mod check;
+mod physics;
+mod view;
+
+import "math.h" as c;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface};
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, Window, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use physics::{Galaxy, galaxy_new};
+use view::{CAM_DIST, CAM_PITCH, CAM_YAW, CAM_ZOOM, Sky, sky_new};
+
+fn parse_size(s: str) -> (i64, i64) {
+    let (ws, hs) = match s.split_once("x") {
+        Some(pair) => pair,
+        None => ("64", "48"),
+    };
+    let w = ws.parse::<i64>().unwrap_or(64);
+    let h = hs.parse::<i64>().unwrap_or(48);
+    (w, h)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("galaxy", gpa)
+        .version("0.1")
+        .about("an N-body galaxy, computed and drawn on the GPU")
+        .arg(Arg::flag("headless").help("run the self-check instead of the window"))
+        .arg(Arg::option("stars").value_name("N").default("8192")
+            .help("the stars in the disk (the core adds one)"))
+        .arg(Arg::option("seed").value_name("N").default("1")
+            .help("the disk's seed"))
+        .arg(Arg::option("speed").value_name("F").default("1")
+            .help("seconds of physics per frame-second"))
+        .arg(Arg::option("steps").value_name("N").default("8")
+            .help("headless: steps of the physics to run"))
+        .arg(Arg::option("size").value_name("WxH").default("64x48")
+            .help("headless: the frame's size"))
+        .arg(Arg::option("out").value_name("FILE.ppm")
+            .help("headless: write the frame here as a PPM"));
+    let m = cli.parse_or_exit(env::args());
+    let stars = m.get_as::<i64>("stars").unwrap_or(8192);
+    if stars < 2 {
+        eprintln("galaxy: --stars wants at least 2 (the core plus a star)");
+        return 2;
+    }
+    let seed = m.get_as::<u64>("seed").unwrap_or(1);
+    let speed = m.get_as::<f64>("speed").unwrap_or(1.0);
+    let (w, h) = parse_size(m.get("size").unwrap_or("64x48"));
+    let out = m.get("out").unwrap_or("");
+
+    if m.flag("headless") {
+        let steps = m.get_as::<i64>("steps").unwrap_or(8);
+        return check::run(stars, steps, seed, w, h, out, gpa);
+    }
+
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("galaxy: no window server on this display (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("galaxy", 960, 600)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("galaxy: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"galaxy: no GPU: {e}");
+            return 1;
+        }
+    };
+    var galaxy = match galaxy_new(dev, stars, seed, gpa) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln(f"galaxy: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(owned) => owned,
+        Err(e) => {
+            eprintln(f"galaxy: no surface for the window: {e}");
+            return 1;
+        }
+    };
+    let pixels = win.size();
+    surf.configure(dev, pixels.w, pixels.h);
+    var sky = match sky_new(dev, galaxy) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln(f"galaxy: {e}");
+            return 1;
+        }
+    };
+
+    var yaw = CAM_YAW;
+    var pitch = CAM_PITCH;
+    var dist = CAM_DIST;
+    let zoom = CAM_ZOOM;
+    var paused = false;
+    var time_scale = speed;
+    var carry: f64 = 0.0;
+    var dragging = false;
+    var last_x: f64 = 0.0;
+    var last_y: f64 = 0.0;
+    var rerolls: u64 = 0;
+    var drawn: i64 = 0;
+    var frame_clock = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                // step the physics: `time_scale` seconds of simulation
+                // per real second, whole steps only, so the trajectory
+                // does not depend on the frame rate (eight is about as
+                // much as a 1/60 s step can stay sane for a disk this
+                // hot)
+                if !paused {
+                    carry += time_scale;
+                    var whole_steps = carry as i64;
+                    carry -= whole_steps as f64;
+                    if whole_steps > 8 {
+                        whole_steps = 8;
+                    }
+                    let dt = (1.0 / 60.0) as f32;
+                    for _ in 0..whole_steps {
+                        galaxy.step(dev, &queue, dt, 1.0);
+                    }
+                }
+                match surf.frame() {
+                    Ok(frame) => {
+                        let texview = frame.texture.view();
+                        sky.draw(dev, &queue, texview, galaxy.cur, stars, surf.width,
+                            surf.height, yaw, pitch, dist, zoom);
+                        frame.present(&queue);
+                        drawn += 1;
+                    }
+                    Err(_) => {}
+                }
+                let now = monotonic_now();
+                let elapsed = now.saturating_sub(frame_clock);
+                if elapsed.as_millis() >= 1000 {
+                    let fps = drawn as f64 / elapsed.as_secs_f64();
+                    let title = format_in(f"galaxy — {stars} stars — {fps:.0} fps", gpa);
+                    win.set_title(title.as_slice());
+                    frame_clock = monotonic_now();
+                    drawn = 0;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                surf.configure(dev, size.w, size.h);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime {
+                    match k.key {
+                        Logical::Named(Named::Escape) => {
+                            win.close();
+                            break;
+                        }
+                        Logical::Named(Named::ArrowLeft) => {
+                            yaw -= 0.08;
+                        }
+                        Logical::Named(Named::ArrowRight) => {
+                            yaw += 0.08;
+                        }
+                        Logical::Named(Named::ArrowUp) => {
+                            pitch += 0.05;
+                            if pitch > 1.5 {
+                                pitch = 1.5;
+                            }
+                        }
+                        Logical::Named(Named::ArrowDown) => {
+                            pitch -= 0.05;
+                            if pitch < -1.5 {
+                                pitch = -1.5;
+                            }
+                        }
+                        Logical::Char(c) => {
+                            if c == 'q' as u32 {
+                                win.close();
+                                break;
+                            }
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            }
+                            if c == ',' as u32 {
+                                time_scale = time_scale / 1.6;
+                            }
+                            if c == '.' as u32 {
+                                time_scale = time_scale * 1.6;
+                            }
+                            if c == 'f' as u32 {
+                                win.set_fullscreen(!win.is_fullscreen());
+                            }
+                            if c == 'r' as u32 {
+                                rerolls = rerolls + 1;
+                                let next_seed = seed ^ (rerolls * 0x9E3779B97F4A7C15u64);
+                                if !reroll_inout(&galaxy, &sky, dev, next_seed, stars, gpa) {
+                                    eprintln("galaxy: could not build a new disk");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Mouse(press)) => {
+                match press.action {
+                    MouseAction::Press => {
+                        if press.button == Button::Left {
+                            dragging = true;
+                            last_x = press.x;
+                            last_y = press.y;
+                        }
+                    }
+                    MouseAction::Release => {
+                        dragging = false;
+                    }
+                    MouseAction::Move => {
+                        if dragging {
+                            yaw -= (press.x - last_x) * 0.008;
+                            pitch += (press.y - last_y) * 0.008;
+                            if pitch > 1.5 {
+                                pitch = 1.5;
+                            }
+                            if pitch < -1.5 {
+                                pitch = -1.5;
+                            }
+                            last_x = press.x;
+                            last_y = press.y;
+                        }
+                    }
+                }
+            }
+            Ok(Event::Scroll(wheel)) => {
+                dist = dist * unsafe { c::pow(0.94, wheel.dy) };
+                if dist < 6.0 {
+                    dist = 6.0;
+                }
+                if dist > 120.0 {
+                    dist = 120.0;
+                }
+            }
+            Ok(Event::Close(_)) => {
+                win.close();
+                break;
+            }
+            Ok(Event::Quit) => {
+                win.close();
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                break;
+            }
+        }
+    }
+    0
+}
+
+// A new disk on key `r`: both rebuilt (the sky reads the old buffers, so
+// the old sky goes with them) and installed only when both built.
+fn reroll_inout(galaxy: inout Galaxy, sky: inout Sky, dev: gpu::Device,
+    seed: u64, stars: i64, gpa: Gpa) -> bool {
+    let next_galaxy = match galaxy_new(dev, stars, seed, gpa) {
+        Ok(built) => built,
+        Err(_) => return false,
+    };
+    let next_sky = match sky_new(dev, next_galaxy) {
+        Ok(renderer) => renderer,
+        Err(_) => return false,
+    };
+    galaxy = next_galaxy;
+    sky = next_sky;
+    true
+}

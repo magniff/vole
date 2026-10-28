@@ -1,0 +1,519 @@
+// main.vl: an NES emulator — arguments, the window, the keyboard, and
+// the frame clock. The machine is nes.vl (CPU, bus, PPU, APU), the
+// cartridge format rom.vl, the mappers cart.vl, and the window's one
+// shader view.vl. `--headless` runs the built-in checks with no ROM (and
+// no window server), which is what tests/examples/nes.test runs.
+//
+//   nes GAME.nes                      play in a window
+//   nes GAME.nes --frames 600 --shot shot.ppm --headless
+//                                     run 600 frames, write the picture
+//   nes --check                       the checks: CPU, PPU, mappers, ROM
+//   nes GAME.nes --info               the header, then exit
+//
+// Controls: arrows move, X is A, Z is B, Enter starts, Right Shift
+// selects; player 2 is I/J/K/L and O/U for A/B, P to start, Y to select.
+// F1 resets, F2 pauses, Tab fast-forwards while held, F11 goes
+// fullscreen, Escape quits. There is no sound (std has no audio device
+// yet); see README.md for the accuracy limits and the mapper list.
+
+mod apu;
+mod bus;
+mod cart;
+mod check;
+mod cpu;
+mod nes;
+mod pad;
+mod ppu;
+mod rom;
+mod view;
+
+use std::cli::{Arg, Command, Matches};
+use std::env;
+use std::fs;
+use std::num::parse_i64_radix;
+use std::gpu;
+use std::gpu::RawSurface;
+use std::time::monotonic_now;
+use std::window::{App, Event, Window, WindowDesc};
+use std::window::keys::KeyCode;
+
+use bus::{bus_read, bus_take_accesses, bus_take_stall, bus_tick_ppu};
+use cpu::step;
+use nes::{nes_new, nes_reset, run_frame, Nes};
+use pad::{BTN_A, BTN_B, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_SELECT, BTN_START, BTN_UP};
+use ppu::PIXELS;
+use rom::{mapper_name, Rom};
+
+const FPS: f64 = 60.0988;
+
+struct Gfx {
+    inst: gpu::Instance,
+    dev: gpu::Device,
+    queue: gpu::Queue,
+    surf: gpu::Surface,
+    viewer: view::Viewer,
+}
+
+fn host_rom_path(m: Matches, gpa: Gpa) -> Option<Buf> {
+    match m.get("rom") {
+        Some(s) => {
+            var b = Buf::new_in(gpa);
+            b.push_str(s);
+            Some(b)
+        }
+        None => None,
+    }
+}
+
+// The buttons a physical key means for player `which` (0 or 1), or 0.
+fn pad_bit(code: KeyCode, which: i64) -> u8 {
+    if which == 0 {
+        match code {
+            KeyCode::ArrowUp => BTN_UP,
+            KeyCode::ArrowDown => BTN_DOWN,
+            KeyCode::ArrowLeft => BTN_LEFT,
+            KeyCode::ArrowRight => BTN_RIGHT,
+            KeyCode::KeyX => BTN_A,
+            KeyCode::KeyZ => BTN_B,
+            KeyCode::Enter => BTN_START,
+            KeyCode::ShiftRight => BTN_SELECT,
+            _ => 0,
+        }
+    } else {
+        match code {
+            KeyCode::KeyI => BTN_UP,
+            KeyCode::KeyK => BTN_DOWN,
+            KeyCode::KeyJ => BTN_LEFT,
+            KeyCode::KeyL => BTN_RIGHT,
+            KeyCode::KeyO => BTN_A,
+            KeyCode::KeyU => BTN_B,
+            KeyCode::KeyP => BTN_START,
+            KeyCode::KeyY => BTN_SELECT,
+            _ => 0,
+        }
+    }
+}
+
+fn print_info(rom: Rom) {
+    println(f"mapper {rom.mapper} ({mapper_name(rom.mapper)})");
+    println(f"PRG {rom.prg.len() / 1024} KiB, CHR {rom.chr.len() / 1024} KiB");
+    println(f"mirroring {rom.mirroring}, PRG RAM {rom.prg_ram_size / 1024} KiB");
+}
+
+fn write_ppm(path: [u8], px: [u32], gpa: Gpa) {
+    var out = Buf::new_in(gpa);
+    out.push_str("P6\n256 240\n255\n");
+    for p in px {
+        out.push((p & 0xff) as u8);
+        out.push(((p >> 8) & 0xff) as u8);
+        out.push(((p >> 16) & 0xff) as u8);
+    }
+    if fs::write(path, out.as_slice()).is_err() {
+        eprintln("nes: cannot write the picture");
+    }
+}
+
+fn fb_hash(px: [u32]) -> u64 {
+    var h: u64 = 1469598103934665603;
+    for p in px {
+        h = (h ^ (p as u64)) * 1099511628211;
+    }
+    h
+}
+
+// `--trace N`: the first N instructions in the shape nestest.log has,
+// so the CPU can be diffed against the reference log.
+fn trace(nes: inout Nes, n: i64) {
+    for _ in 0..n {
+        let c = nes.cpu;
+        let op = bus_read(&nes.bus, c.pc as i64);
+        println(f"{c.pc:04x} {op:02x} A:{c.a:02x} X:{c.x:02x} Y:{c.y:02x} P:{c.p:02x} SP:{c.sp:02x}");
+        let cyc = step(&nes.cpu, &nes.bus);
+        let stall = bus_take_stall(&nes.bus);
+        let accessed = bus_take_accesses(&nes.bus);
+        let total = cyc + stall;
+        nes.bus.apu.tick(total);
+        var extra = total - accessed;
+        if extra < 0 {
+            extra = 0;
+        }
+        if extra > 0 {
+            bus_tick_ppu(&nes.bus, extra * 3);
+        }
+        if nes.cpu.jammed {
+            return;
+        }
+    }
+}
+
+fn dump_chr(machine: Nes, path: [u8], gpa: Gpa) -> i32 {
+    var out = Buf::new_in(gpa);
+    for i in 0..8192 {
+        out.push(machine.bus.cart.ppu_read(i));
+    }
+    if fs::write(path, out.as_slice()).is_err() {
+        eprintln("nes: cannot write the CHR dump");
+        return 1;
+    }
+    0
+}
+
+fn headless(rom: sink Rom, frames: i64, shot: [u8], start_pc: i64,
+    state: bool, trace_n: i64, log_n: i64, chr_out: [u8], gpa: Gpa) -> i32 {
+    var machine = nes_new(rom, gpa);
+    if start_pc >= 0 {
+        machine.cpu.pc = start_pc as u16;
+    }
+    if trace_n > 0 {
+        trace(&machine, trace_n);
+    }
+    if log_n > 0 {
+        machine.bus.log_writes = true;
+        machine.bus.log_budget = log_n;
+    }
+    var total: i64 = 0;
+    var f: i64 = 0;
+    while f < frames {
+        total += run_frame(&machine);
+        f += 1;
+        if machine.cpu.jammed {
+            eprintln(f"nes: the CPU hit a JAM opcode at PC {machine.cpu.pc:04x} (frame {f})");
+            break;
+        }
+    }
+    if shot.len() > 0 {
+        write_ppm(shot, machine.bus.ppu.fb.as_slice(), gpa);
+    }
+    if chr_out.len() > 0 {
+        let _ = dump_chr(machine, chr_out, gpa);
+    }
+    if state {
+        let c = machine.cpu;
+        println(f"cpu pc={c.pc:04x} a={c.a:02x} x={c.x:02x} y={c.y:02x} sp={c.sp:02x} p={c.p:02x}");
+        var line = Buf::new_in(gpa);
+        for i in 0..64 {
+            line.push_fmt(f"{machine.bus.ram[i]:02x} ");
+        }
+        println(line.as_slice());
+        var ram = Buf::new_in(gpa);
+        for i in 0..48 {
+            ram.push_fmt(f"{machine.bus.cart.cpu_read(0x6000 + i):02x} ");
+        }
+        println(ram.as_slice());
+        var text = Buf::new_in(gpa);
+        for i in 4..2048 {
+            let ch = machine.bus.cart.cpu_read(0x6000 + i);
+            if ch >= 32 && ch < 127 {
+                text.push(ch);
+            } else if ch == 10 {
+                text.push(10);
+            }
+        }
+        println(text.as_slice());
+        println(f"ppu ctrl={machine.bus.ppu.ctrl:02x} mask={machine.bus.ppu.mask:02x} status={machine.bus.ppu.status:02x} pal0={machine.bus.ppu.palette[0]:02x} pal1={machine.bus.ppu.palette[1]:02x}");
+        var nt = Buf::new_in(gpa);
+        for row in 0..30 {
+            var n = 0;
+            for col in 0..32 {
+                if machine.bus.ppu.nametable_byte(row * 32 + col) != 0 {
+                    n += 1;
+                }
+            }
+            nt.push_fmt(f"{n} ");
+        }
+        println(nt.as_slice());
+        var seen = Buf::new_in(gpa);
+        var colors: [u32; 16] = [0; 16];
+        var nc = 0;
+        for i in 0..PIXELS {
+            let p = machine.bus.ppu.fb[i];
+            var found = false;
+            for k in 0..nc {
+                if colors[k] == p { found = true; }
+            }
+            if !found && nc < 16 {
+                colors[nc] = p;
+                nc += 1;
+            }
+        }
+        for k in 0..nc {
+            seen.push_fmt(f"{colors[k]:08x} ");
+        }
+        println(seen.as_slice());
+        println(f"px(0,0)={machine.bus.ppu.fb[0]:08x} px(128,120)={machine.bus.ppu.fb[120 * 256 + 128]:08x}");
+        var tiles = Buf::new_in(gpa);
+        for i in 128..160 {
+            tiles.push_fmt(f"{machine.bus.ppu.nametable_byte(i):02x} ");
+        }
+        println(tiles.as_slice());
+        let t0 = machine.bus.ppu.nametable_byte(132);
+        var bits = Buf::new_in(gpa);
+        for i in 0..16 {
+            bits.push_fmt(f"{machine.bus.cart.ppu_read((t0 as i64) * 16 + i):02x} ");
+        }
+        println(bits.as_slice());
+        var nz = 0;
+        for i in 0..8192 {
+            if machine.bus.cart.ppu_read(i) != 0 {
+                nz += 1;
+            }
+        }
+        println(f"chr nonzero {nz} writes {machine.bus.ppu.chr_writes}");
+        var cb = Buf::new_in(gpa);
+        for i in 0x200..0x220 {
+            cb.push_fmt(f"{machine.bus.cart.ppu_read(i):02x} ");
+        }
+        println(cb.as_slice());
+        var oam = Buf::new_in(gpa);
+        for i in 0..16 {
+            oam.push_fmt(f"{machine.bus.ppu.oam[i]:02x} ");
+        }
+        println(oam.as_slice());
+    }
+    let per = if f > 0 { total / f } else { 0 };
+    println(f"ran {f} frames, {per} cycles/frame, PC {machine.cpu.pc:04x} fb {fb_hash(machine.bus.ppu.fb.as_slice()):016x}");
+    if machine.cpu.jammed { 1 } else { 0 }
+}
+
+fn run_window(rom: sink Rom, scale: i64, gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("nes: no window server on this display (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("nes", 1024, 768)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("nes: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"nes: no GPU: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"nes: no surface for the window: {e}");
+            return 1;
+        }
+    };
+    let size = win.size();
+    surf.configure(dev, size.w, size.h);
+    var viewer = match view::viewer_new(dev) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln(f"nes: {e}");
+            return 1;
+        }
+    };
+
+    var machine = nes_new(rom, gpa);
+    var p1: u8 = 0;
+    var p2: u8 = 0;
+    var paused = false;
+    var fast = false;
+    var acc: f64 = 0.0;
+    var last = monotonic_now();
+    var frames: i64 = 0;
+    var title_clock = monotonic_now();
+    var dead = false;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = monotonic_now();
+                var dt = now.saturating_sub(last).as_secs_f64();
+                last = now;
+                if dt > 0.25 {
+                    dt = 0.25;
+                }
+                if !paused {
+                    let rate = if fast { FPS * 4.0 } else { FPS };
+                    acc += dt * rate;
+                    var steps = acc as i64;
+                    acc -= steps as f64;
+                    if steps > 8 {
+                        steps = 8;
+                    }
+                    for _ in 0..steps {
+                        run_frame(&machine);
+                        if machine.cpu.jammed {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                if dead {
+                    eprintln(f"nes: the CPU hit a JAM opcode at PC {machine.cpu.pc:04x}");
+                    win.close();
+                    break;
+                }
+                match surf.frame() {
+                    Ok(frame) => {
+                        let sc = if scale > 0 { scale } else { view::fit_scale(surf.width, surf.height) };
+                        viewer.draw(dev, &queue, frame.texture.view(),
+                            machine.bus.ppu.fb.as_slice(), surf.width, surf.height, sc);
+                        frame.present(&queue);
+                        frames += 1;
+                    }
+                    Err(_) => {}
+                }
+                let elapsed = now.saturating_sub(title_clock);
+                if elapsed.as_millis() >= 1000 {
+                    let fps = frames as f64 / elapsed.as_secs_f64();
+                    var title = Buf::new_in(gpa);
+                    title.push_str("nes — ");
+                    title.push_str(mapper_name(machine.bus.cart.mapper()));
+                    title.push_fmt(f" — {fps:.0} fps");
+                    if paused {
+                        title.push_str(" — paused");
+                    }
+                    win.set_title(title.as_slice());
+                    title_clock = monotonic_now();
+                    frames = 0;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, size)) => {
+                surf.configure(dev, size.w, size.h);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat && !k.ime {
+                    match k.code {
+                        KeyCode::Escape => {
+                            win.close();
+                            break;
+                        }
+                        KeyCode::F1 => {
+                            nes_reset(&machine);
+                        }
+                        KeyCode::F2 => {
+                            paused = !paused;
+                        }
+                        KeyCode::Tab => {
+                            fast = true;
+                        }
+                        KeyCode::F11 => {
+                            win.set_fullscreen(!win.is_fullscreen());
+                        }
+                        _ => {}
+                    }
+                }
+                let bit1 = pad_bit(k.code, 0);
+                if bit1 != 0 {
+                    if k.pressed { p1 = p1 | bit1; } else { p1 = p1 & ~bit1; }
+                    machine.bus.pads[0].set_buttons(p1);
+                }
+                let bit2 = pad_bit(k.code, 1);
+                if bit2 != 0 {
+                    if k.pressed { p2 = p2 | bit2; } else { p2 = p2 & ~bit2; }
+                    machine.bus.pads[1].set_buttons(p2);
+                }
+                if !k.pressed && k.code == KeyCode::Tab {
+                    fast = false;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("nes", gpa)
+        .version("0.1")
+        .about("an NES emulator: 6502, PPU, NROM/MMC1/UxROM/CNROM/MMC3/AxROM/Color Dreams/GxROM")
+        .arg(Arg::positional("rom").help("the .nes cartridge image"))
+        .arg(Arg::flag("check").help("run the built-in CPU, PPU, mapper and ROM checks"))
+        .arg(Arg::flag("info").help("print the cartridge header and exit"))
+        .arg(Arg::flag("headless").help("run frames without a window (with --shot: write a PPM)"))
+        .arg(Arg::option("frames").value_name("N").default("600")
+            .help("headless: frames to run"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: write the last frame as a PPM"))
+        .arg(Arg::option("pc").value_name("HEX")
+            .help("start at this address instead of the reset vector (test ROMs)"))
+        .arg(Arg::flag("state")
+            .help("headless: print the CPU registers and RAM $00-$0F at the end"))
+        .arg(Arg::option("trace").value_name("N").default("0")
+            .help("headless: print the first N instructions (nestest.log's shape)"))
+        .arg(Arg::option("log").value_name("N").default("0")
+            .help("headless: trace the first N PPU register writes and $2002 reads"))
+        .arg(Arg::option("dump-chr").value_name("FILE")
+            .help("headless: write the 8 KiB pattern tables"))
+        .arg(Arg::option("scale").value_name("N").default("0")
+            .help("window: pixel scale (0: the largest that fits)"));
+    let m = cli.parse_or_exit(env::args());
+
+    if m.flag("check") {
+        return check::run(gpa);
+    }
+    let path = match host_rom_path(m, gpa) {
+        Some(p) => p,
+        None => {
+            eprintln("nes: give a .nes ROM, or --check for the self-test");
+            return 2;
+        }
+    };
+    let rom = match rom::load(path.as_slice(), gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(e.as_slice());
+            return 2;
+        }
+    };
+    if m.flag("info") {
+        print_info(rom);
+        return 0;
+    }
+    let scale = m.get_as::<i64>("scale").unwrap_or(0);
+    if m.flag("headless") {
+        let frames = m.get_as::<i64>("frames").unwrap_or(600);
+        if frames < 1 {
+            eprintln("nes: --frames wants at least 1");
+            return 2;
+        }
+        var shot: Buf = Buf::new_in(gpa);
+        if let Some(s) = m.get("shot") {
+            shot.push_str(s);
+        }
+        var start_pc: i64 = -1;
+        if let Some(s) = m.get("pc") {
+            match parse_i64_radix(s, 16) {
+                Ok(v) => {
+                    if v >= 0 && v <= 0xffff {
+                        start_pc = v;
+                    } else {
+                        eprintln("nes: --pc wants an address in $0000-$FFFF");
+                        return 2;
+                    }
+                }
+                Err(_) => {
+                    eprintln("nes: --pc wants hexadecimal, like c000");
+                    return 2;
+                }
+            }
+        }
+        let trace_n = m.get_as::<i64>("trace").unwrap_or(0);
+        let log_n = m.get_as::<i64>("log").unwrap_or(0);
+        var chr_out: Buf = Buf::new_in(gpa);
+        if let Some(s) = m.get("dump-chr") {
+            chr_out.push_str(s);
+        }
+        return headless(rom, frames, shot.as_slice(), start_pc, m.flag("state"), trace_n, log_n, chr_out.as_slice(), gpa);
+    }
+    run_window(rom, scale, gpa)
+}

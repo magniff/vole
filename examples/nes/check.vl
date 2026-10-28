@@ -1,0 +1,507 @@
+// check.vl: the built-in checks, run by `nes --check` and by
+// tests/examples/nes.test. They need no ROM file and no window server:
+// a synthetic cartridge is assembled in memory for each one, and the
+// machine runs it.
+//
+// The checks are in four groups: the ROM parser (a good header, and the
+// five ways a file is rejected), the mappers (each bank window moved and
+// read back), the CPU (a small program whose result is a byte in RAM),
+// and the PPU and APU (palette and background rendering, sprite-0 hit,
+// vblank/NMI, the length counter and the frame IRQ). A final cartridge
+// runs the whole machine end to end.
+
+use apu::apu_new;
+use cart::Cart;
+use cpu::step;
+use nes::{nes_new, nes_reset, run_frame};
+use ppu::{ppu_new, ppu_read_reg, ppu_run, ppu_write_reg, Ppu};
+use rom::parse;
+
+struct Checks {
+    total: i64,
+    failed: i64,
+}
+
+fn expect(c: inout Checks, name: [u8], ok: bool) {
+    c.total += 1;
+    if ok {
+        return;
+    }
+    c.failed += 1;
+    eprint("FAIL: ");
+    eprintln(name);
+}
+
+fn contains(hay: [u8], needle: [u8]) -> bool {
+    if needle.len() > hay.len() {
+        return false;
+    }
+    for i in 0..(hay.len() - needle.len() + 1) {
+        var same = true;
+        for j in 0..needle.len() {
+            if hay[i + j] != needle[j] {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            return true;
+        }
+    }
+    false
+}
+
+fn header(gpa: Gpa, mapper: i64, prg_banks: i64, chr_banks: i64) -> Vec<u8> {
+    var d: Vec<u8> = Vec::new_in(gpa);
+    d.push('N' as u8);
+    d.push('E' as u8);
+    d.push('S' as u8);
+    d.push(0x1a);
+    d.push(prg_banks as u8);
+    d.push(chr_banks as u8);
+    d.push(((mapper & 0x0f) << 4) as u8);
+    d.push((mapper & 0xf0) as u8);
+    for _ in 0..8 {
+        d.push(0);
+    }
+    d
+}
+
+// PRG filled with its 8 KiB unit number, CHR with its 1 KiB unit
+// number, so a read says which window a mapper put where.
+fn banked_rom(gpa: Gpa, mapper: i64, prg_banks: i64, chr_banks: i64) -> Vec<u8> {
+    var d = header(gpa, mapper, prg_banks, chr_banks);
+    for i in 0..(prg_banks * 16384) {
+        d.push((i / 8192) as u8);
+    }
+    for i in 0..(chr_banks * 8192) {
+        d.push((i / 1024) as u8);
+    }
+    d
+}
+
+fn rom_of(bytes: [u8], gpa: Gpa) -> Cart {
+    let rom = parse(bytes, gpa).unwrap();
+    Cart::new(rom, gpa)
+}
+
+// --- the ROM parser ----------------------------------------------------
+
+fn check_rom(c: inout Checks, gpa: Gpa) {
+    let bytes = banked_rom(gpa, 0, 2, 1);
+    let ok = match parse(bytes.as_slice(), gpa) {
+        Ok(r) => r.mapper == 0 && r.prg.len() == 32768 && r.chr.len() == 8192
+            && !r.chr_ram && !r.nes2,
+        Err(_) => false,
+    };
+    expect(&c, "rom: a two-bank NROM header parses", ok);
+
+    var short = header(gpa, 0, 1, 1);
+    short.truncate(8);
+    let ok = match parse(short.as_slice(), gpa) {
+        Ok(_) => false,
+        Err(e) => contains(e.as_slice(), "too short"),
+    };
+    expect(&c, "rom: a short file is rejected", ok);
+
+    var bad = banked_rom(gpa, 0, 1, 1);
+    bad[1] = 'X' as u8;
+    let ok = match parse(bad.as_slice(), gpa) {
+        Ok(_) => false,
+        Err(e) => contains(e.as_slice(), "not an iNES image"),
+    };
+    expect(&c, "rom: a bad magic is rejected", ok);
+
+    var empty = header(gpa, 0, 0, 1);
+    for _ in 0..16384 {
+        empty.push(0);
+    }
+    let ok = match parse(empty.as_slice(), gpa) {
+        Ok(_) => false,
+        Err(e) => contains(e.as_slice(), "no PRG ROM"),
+    };
+    expect(&c, "rom: zero PRG banks is rejected", ok);
+
+    var cut = header(gpa, 0, 2, 1);
+    for _ in 0..16384 {
+        cut.push(0);
+    }
+    let ok = match parse(cut.as_slice(), gpa) {
+        Ok(_) => false,
+        Err(e) => contains(e.as_slice(), "truncated"),
+    };
+    expect(&c, "rom: a truncated file is rejected", ok);
+
+    let unsupported = banked_rom(gpa, 5, 1, 1);
+    let ok = match parse(unsupported.as_slice(), gpa) {
+        Ok(_) => false,
+        Err(e) => contains(e.as_slice(), "unsupported mapper 5"),
+    };
+    expect(&c, "rom: an unsupported mapper is rejected, and named", ok);
+
+    var ram = header(gpa, 0, 1, 0);
+    for _ in 0..16384 {
+        ram.push(0);
+    }
+    let ok = match parse(ram.as_slice(), gpa) {
+        Ok(r) => r.chr_ram && r.chr.len() == 8192,
+        Err(_) => false,
+    };
+    expect(&c, "rom: a header with no CHR ROM gives CHR RAM", ok);
+}
+
+// --- the mappers -------------------------------------------------------
+
+fn check_nrom(c: inout Checks, gpa: Gpa) {
+    var cart = rom_of(banked_rom(gpa, 0, 1, 1).as_slice(), gpa);
+    let ok = cart.cpu_read(0x8000) == 0 && cart.cpu_read(0xa000) == 1
+        && cart.cpu_read(0xc000) == 0 && cart.cpu_read(0xffff) == 1
+        && cart.ppu_read(0x0000) == 0 && cart.ppu_read(0x1fff) == 7
+        && cart.mirroring() == 0;
+    expect(&c, "nrom: a 16 KiB PRG chip is mirrored at $C000", ok);
+}
+
+fn check_uxrom(c: inout Checks, gpa: Gpa) {
+    var cart = rom_of(banked_rom(gpa, 2, 4, 1).as_slice(), gpa);
+    let reset = cart.cpu_read(0x8000) == 0 && cart.cpu_read(0xa000) == 1
+        && cart.cpu_read(0xc000) == 6;
+    cart.cpu_write(0x8000, 1);
+    let first = cart.cpu_read(0x8000) == 2 && cart.cpu_read(0xa000) == 3
+        && cart.cpu_read(0xc000) == 6;
+    cart.cpu_write(0x8000, 2);
+    let second = cart.cpu_read(0x8000) == 4 && cart.cpu_read(0xc000) == 6;
+    expect(&c, "uxrom: switches $8000 and fixes the last bank at $C000",
+        reset && first && second);
+}
+
+fn check_cnrom(c: inout Checks, gpa: Gpa) {
+    var cart = rom_of(banked_rom(gpa, 3, 2, 4).as_slice(), gpa);
+    let reset = cart.ppu_read(0x0000) == 0;
+    cart.cpu_write(0x8000, 2);
+    let first = cart.ppu_read(0x0000) == 16 && cart.ppu_read(0x1c00) == 23;
+    cart.cpu_write(0x8000, 3);
+    let second = cart.ppu_read(0x1000) == 28;
+    expect(&c, "cnrom: writes select an 8 KiB CHR bank", reset && first && second);
+}
+
+fn mmc1_serial(cart: inout Cart, addr: i64, value: i64) {
+    for b in 0..5 {
+        cart.cpu_write(addr, ((value >> b) & 1) as u8);
+    }
+}
+
+fn check_mmc1(c: inout Checks, gpa: Gpa) {
+    var cart = rom_of(banked_rom(gpa, 1, 8, 2).as_slice(), gpa);
+    // Power-on is control $0C: PRG mode 3, one-screen lower mirroring.
+    let power = cart.cpu_read(0x8000) == 0 && cart.cpu_read(0xa000) == 1
+        && cart.cpu_read(0xc000) == 14 && cart.cpu_read(0xe000) == 15
+        && cart.mirroring() == 3;
+    // Mode 3: the register's 16 KiB bank at $8000, the last fixed.
+    mmc1_serial(&cart, 0xe000, 5);
+    let mode3 = cart.cpu_read(0x8000) == 10 && cart.cpu_read(0xa000) == 11
+        && cart.cpu_read(0xc000) == 14;
+    // Control $0A: PRG mode 2, vertical mirroring.
+    mmc1_serial(&cart, 0x8000, 0x0a);
+    let mode2 = cart.cpu_read(0x8000) == 0 && cart.cpu_read(0xa000) == 1
+        && cart.cpu_read(0xc000) == 10 && cart.cpu_read(0xe000) == 11
+        && cart.mirroring() == 1;
+    // CHR 4 KiB mode, two 4 KiB registers.
+    mmc1_serial(&cart, 0x8000, 0x1a);
+    mmc1_serial(&cart, 0xa000, 2);
+    mmc1_serial(&cart, 0xc000, 3);
+    let chr = cart.ppu_read(0x0000) == 8 && cart.ppu_read(0x1000) == 12
+        && cart.ppu_read(0x1400) == 13;
+    cart.cpu_write(0x6000, 0x5a);
+    let ram = cart.cpu_read(0x6000) == 0x5a;
+    expect(&c, "mmc1: serial control, PRG modes 2 and 3, CHR mode, RAM",
+        power && mode3 && mode2 && chr && ram);
+}
+
+fn check_mmc3(c: inout Checks, gpa: Gpa) {
+    var cart = rom_of(banked_rom(gpa, 4, 8, 1).as_slice(), gpa);
+    let power = cart.cpu_read(0x8000) == 0 && cart.cpu_read(0xa000) == 1
+        && cart.cpu_read(0xc000) == 14 && cart.cpu_read(0xe000) == 15;
+    // R6 at $8000, R7 at $A000.
+    cart.cpu_write(0x8000, 6);
+    cart.cpu_write(0x8001, 2);
+    cart.cpu_write(0x8000, 7);
+    cart.cpu_write(0x8001, 3);
+    let prg = cart.cpu_read(0x8000) == 2 && cart.cpu_read(0xa000) == 3;
+    // PRG mode 1: the second-last unit fixed at $8000, R6 at $C000.
+    cart.cpu_write(0x8000, 0x40);
+    let mode1 = cart.cpu_read(0x8000) == 14 && cart.cpu_read(0xc000) == 2
+        && cart.cpu_read(0xe000) == 15;
+    // CHR mode 0: R0 even, two 1 KiB units.
+    cart.cpu_write(0x8000, 0x00);
+    cart.cpu_write(0x8001, 4);
+    let chr = cart.ppu_read(0x0000) == 4 && cart.ppu_read(0x0400) == 5;
+    // Scanline counter: reload 2, then three clocks to hit zero.
+    cart.cpu_write(0xc000, 2);
+    cart.cpu_write(0xc001, 0);
+    cart.cpu_write(0xe000, 0);
+    cart.cpu_write(0xe001, 0);
+    cart.clock_a12();
+    cart.clock_a12();
+    let early = !cart.irq();
+    cart.clock_a12();
+    let fired = cart.irq();
+    cart.ack_irq();
+    let acked = !cart.irq();
+    expect(&c, "mmc3: PRG/CHR windows and the A12 scanline IRQ",
+        power && prg && mode1 && chr && early && fired && acked);
+}
+
+// --- the CPU -----------------------------------------------------------
+
+// LDX #10; LDA #0; STA $10; CLC; loop: TXA; ADC $10; STA $10; DEX;
+// BNE loop; LDA #$42; STA $11; JMP self.
+const SUM_PROGRAM: [u8; 25] = [0xa2, 10, 0xa9, 0, 0x85, 0x10, 0x18, 0x8a,
+    0x65, 0x10, 0x85, 0x10, 0xca, 0xd0, 0xf8, 0xa9, 0x42, 0x85, 0x11,
+    0x4c, 0x13, 0x80, 0xea, 0xea, 0xea];
+
+fn program_rom(gpa: Gpa, program: [u8], mapper: i64, chr_banks: i64) -> Vec<u8> {
+    var d = header(gpa, mapper, 1, chr_banks);
+    for i in 0..16384 {
+        if i < program.len() {
+            d.push(program[i]);
+        } else {
+            d.push(0xea);
+        }
+    }
+    // Reset vector at $FFFC (offset $3FFC in the single 16 KiB bank).
+    d[16 + 0x3ffc] = 0x00;
+    d[16 + 0x3ffd] = 0x80;
+    for _ in 0..(chr_banks * 8192) {
+        d.push(0);
+    }
+    d
+}
+
+fn check_cpu(c: inout Checks, gpa: Gpa) {
+    let rom = parse(program_rom(gpa, SUM_PROGRAM, 0, 1).as_slice(), gpa).unwrap();
+    var machine = nes_new(rom, gpa);
+    nes_reset(&machine);
+    for _ in 0..80 {
+        let _ = step(&machine.cpu, &machine.bus);
+    }
+    let sum = bus::bus_read(&machine.bus, 0x10);
+    let mark = bus::bus_read(&machine.bus, 0x11);
+    let ok = sum == 55 && mark == 0x42 && machine.cpu.pc == 0x8013;
+    expect(&c, "cpu: a summing loop reaches 55 and the marker", ok);
+}
+
+// --- the PPU -----------------------------------------------------------
+
+fn ppu_addr(ppu: inout Ppu, cart: inout Cart, addr: i64) {
+    ppu_write_reg(&ppu, &cart, 6, (addr >> 8) as u8);
+    ppu_write_reg(&ppu, &cart, 6, (addr & 0xff) as u8);
+}
+
+fn ppu_palette(ppu: inout Ppu, cart: inout Cart) {
+    ppu_addr(&ppu, &cart, 0x3f00);
+    ppu_write_reg(&ppu, &cart, 7, 0x0f);
+    ppu_write_reg(&ppu, &cart, 7, 0x16);
+    ppu_write_reg(&ppu, &cart, 7, 0x2a);
+    ppu_write_reg(&ppu, &cart, 7, 0x12);
+    ppu_addr(&ppu, &cart, 0x3f11);
+    ppu_write_reg(&ppu, &cart, 7, 0x27);
+}
+
+// A cartridge whose tile 0 is solid colour 1 and tile 1 solid colour 2,
+// with both pattern planes arranged so the pixel value is exact.
+fn pattern_rom(gpa: Gpa) -> Vec<u8> {
+    var d = header(gpa, 0, 1, 1);
+    for _ in 0..16384 {
+        d.push(0xea);
+    }
+    for _ in 0..8192 {
+        d.push(0);
+    }
+    // CHR lives after the header + PRG; tile 0 is offset 0, tile 1 16.
+    let chr = 16 + 16384;
+    for i in 0..8 {
+        d[chr + i] = 0xff;
+        d[chr + 16 + i] = 0x00;
+        d[chr + 8 + 16 + i] = 0xff;
+    }
+    d
+}
+
+fn check_ppu(c: inout Checks, gpa: Gpa) {
+    let rom = parse(pattern_rom(gpa).as_slice(), gpa).unwrap();
+    var cart = Cart::new(rom, gpa);
+
+    // Palette and nametable are writable through $2006/$2007.
+    var ppu = ppu_new(gpa);
+    ppu_palette(&ppu, &cart);
+    let pal_ok = ppu.palette[0] == 0x0f && ppu.palette[1] == 0x16
+        && ppu.palette[2] == 0x2a && ppu.palette[0x11] == 0x27;
+    ppu_addr(&ppu, &cart, 0x2000);
+    ppu_write_reg(&ppu, &cart, 7, 7);
+    let nt_ok = ppu.nametable_byte(0) == 7;
+    expect(&c, "ppu: palette and nametable writes land", pal_ok && nt_ok);
+
+    // Background rendering: line 0 is tile 0 everywhere, so every pixel
+    // is palette entry 1. Changing that entry changes the pixel.
+    var p1 = ppu_new(gpa);
+    ppu_palette(&p1, &cart);
+    p1.scanline = 0;
+    p1.dot = 0;
+    ppu_write_reg(&p1, &cart, 1, 0x0a);
+    ppu_run(&p1, &cart, 2);
+    let c1 = p1.fb[0];
+    let flat = c1 == p1.fb[128] && c1 == p1.fb[255];
+    ppu_addr(&p1, &cart, 0x3f01);
+    ppu_write_reg(&p1, &cart, 7, 0x2a);
+    p1.scanline = 1;
+    p1.dot = 340;
+    ppu_run(&p1, &cart, 2);
+    let c2 = p1.fb[256];
+    ppu_write_reg(&p1, &cart, 1, 0x00);
+    p1.scanline = 2;
+    p1.dot = 340;
+    ppu_run(&p1, &cart, 2);
+    let cb = p1.fb[512];
+    expect(&c, "ppu: the background is tile 0 in palette entry 1",
+        flat && c1 != c2 && c1 != cb && c2 != cb);
+
+    // Sprite-0 hit: sprite 0 at (16, 16) over the nonzero background.
+    var p2 = ppu_new(gpa);
+    ppu_palette(&p2, &cart);
+    ppu_write_reg(&p2, &cart, 0, 0x00);
+    ppu_write_reg(&p2, &cart, 1, 0x1e);
+    p2.oam[0] = 16;
+    p2.oam[1] = 1;
+    p2.oam[2] = 0;
+    p2.oam[3] = 16;
+    p2.v = 0;
+    p2.t = 0;
+    p2.scanline = 16;
+    p2.dot = 340;
+    ppu_run(&p2, &cart, 2);
+    let hit = (ppu_read_reg(&p2, &cart, 2) & 0x40) != 0;
+    expect(&c, "ppu: sprite 0 hits the background at line 17", hit);
+
+    // Vblank and NMI: a fresh PPU reaches (241, 1) with both raised.
+    var p3 = ppu_new(gpa);
+    ppu_write_reg(&p3, &cart, 0, 0x80);
+    p3.scanline = 240;
+    p3.dot = 340;
+    ppu_run(&p3, &cart, 3);
+    // A $2002 read within three dots of the flag suppresses the NMI, so
+    // let that window pass before asking for both.
+    ppu_run(&p3, &cart, 3);
+    let vbl = (ppu_read_reg(&p3, &cart, 2) & 0x80) != 0;
+    let cleared = (ppu_read_reg(&p3, &cart, 2) & 0x80) == 0;
+    expect(&c, "ppu: vblank sets $2002 and an NMI, a read clears it",
+        vbl && cleared && p3.nmi_pending);
+}
+
+// --- the APU -----------------------------------------------------------
+
+fn check_apu(c: inout Checks) {
+    var apu = apu_new();
+    apu.write(0x4017, 0x40);
+    apu.write(0x4015, 0x01);
+    apu.write(0x4000, 0x10);
+    apu.write(0x4003, 0x18);
+    let loaded = (apu.read_status(0x4015) & 1) != 0;
+    apu.tick(14913);
+    let one = (apu.read_status(0x4015) & 1) != 0;
+    apu.tick(14916);
+    let zero = (apu.read_status(0x4015) & 1) == 0;
+    expect(&c, "apu: the length counter loads and reaches zero", loaded && one && zero);
+
+    var f = apu_new();
+    f.tick(29828);
+    let raised = f.irq();
+    let seen = (f.read_status(0x4015) & 0x40) != 0;
+    let acked = !f.irq();
+    f.write(0x4017, 0x40);
+    f.tick(60000);
+    let inhibited = !f.irq();
+    expect(&c, "apu: the 4-step frame IRQ, $4015 read and inhibit",
+        raised && seen && acked && inhibited);
+
+    var five = apu_new();
+    five.write(0x4017, 0x80);
+    five.tick(80000);
+    expect(&c, "apu: the 5-step mode raises no frame IRQ", !five.irq());
+}
+
+// --- end to end --------------------------------------------------------
+
+// A cartridge whose program writes the palette, resets the scroll,
+// enables the background and leaves $42 in $0200.
+const PAINT_PROGRAM: [u8; 40] = [
+    0xa9, 0x3f, 0x8d, 0x06, 0x20, 0xa9, 0x00, 0x8d, 0x06, 0x20,
+    0xa9, 0x0f, 0x8d, 0x07, 0x20, 0xa9, 0x16, 0x8d, 0x07, 0x20,
+    0xa9, 0x2a, 0x8d, 0x07, 0x20, 0xa9, 0x20, 0x8d, 0x06, 0x20,
+    0xa9, 0x00, 0x8d, 0x06, 0x20, 0xa9, 0x0a, 0x8d, 0x01, 0x20];
+
+fn paint_rom(gpa: Gpa) -> Vec<u8> {
+    var d = header(gpa, 0, 1, 1);
+    for i in 0..16384 {
+        if i < PAINT_PROGRAM.len() {
+            d.push(PAINT_PROGRAM[i]);
+        } else {
+            d.push(0xea);
+        }
+    }
+    d[16 + 0x3ffc] = 0x00;
+    d[16 + 0x3ffd] = 0x80;
+    for _ in 0..8192 {
+        d.push(0);
+    }
+    let chr = 16 + 16384;
+    for i in 0..8 {
+        d[chr + i] = 0xff;
+    }
+    // STA $0200 then a jump to itself.
+    d[16 + PAINT_PROGRAM.len()] = 0xa9;
+    d[16 + PAINT_PROGRAM.len() + 1] = 0x42;
+    d[16 + PAINT_PROGRAM.len() + 2] = 0x8d;
+    d[16 + PAINT_PROGRAM.len() + 3] = 0x00;
+    d[16 + PAINT_PROGRAM.len() + 4] = 0x02;
+    d[16 + PAINT_PROGRAM.len() + 5] = 0x4c;
+    d[16 + PAINT_PROGRAM.len() + 6] = (PAINT_PROGRAM.len() + 5) as u8;
+    d[16 + PAINT_PROGRAM.len() + 7] = 0x80;
+    d
+}
+
+fn check_end_to_end(c: inout Checks, gpa: Gpa) {
+    let rom = parse(paint_rom(gpa).as_slice(), gpa).unwrap();
+    var machine = nes_new(rom, gpa);
+    nes_reset(&machine);
+    // The machine starts on the pre-render line, so the first wrap is
+    // one line long; the second frame is the first full picture.
+    let _ = run_frame(&machine);
+    let _ = run_frame(&machine);
+    let marker = bus::bus_read(&machine.bus, 0x0200);
+    let fb = machine.bus.ppu.fb.as_slice();
+    let colour = fb[120 * 256 + 128];
+    let flat = colour == fb[0] && colour == fb[239 * 256 + 255];
+    expect(&c, "e2e: a painted cartridge runs a frame end to end",
+        marker == 0x42 && flat && colour != 0xff1c1c1c);
+}
+
+pub fn run(gpa: Gpa) -> i32 {
+    var c = Checks { total: 0, failed: 0 };
+    check_rom(&c, gpa);
+    check_nrom(&c, gpa);
+    check_uxrom(&c, gpa);
+    check_cnrom(&c, gpa);
+    check_mmc1(&c, gpa);
+    check_mmc3(&c, gpa);
+    check_cpu(&c, gpa);
+    check_ppu(&c, gpa);
+    check_apu(&c);
+    check_end_to_end(&c, gpa);
+    if c.failed == 0 {
+        println(f"ok: {c.total} NES checks passed");
+        0
+    } else {
+        println(f"failed: {c.failed} of {c.total} NES checks");
+        1
+    }
+}

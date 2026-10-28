@@ -1,0 +1,397 @@
+// life's self-check (check.vl): the kernels checked against a CPU
+// reference, the torus' edges, seeding and painting, and one rendered
+// frame read back — all without a window (RawSurface::Headless), which
+// is what CI has.
+//
+// The checks run on a small grid (at most 128 by 128) so the CPU
+// reference stays cheap even when --grid asks for millions of cells.
+// --benchmark builds a second, full-size grid and times generations on
+// it; --out writes the seeded field as a PPM to look at.
+
+use std::{Gpa, Vec, fs, gpu, max, min};
+use std::gpu::{BufferUsage, Format, RawSurface};
+use std::time::monotonic_now;
+
+use life::{Life, life_new};
+use view::{Viewer, viewer_new};
+
+fn count_alive(s: [u32]) -> i64 {
+    var n: i64 = 0;
+    for i in 0..s.len() {
+        if s[i] != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn alive_at(s: [u32], w: i64, x: i64, y: i64) -> bool {
+    s[y * w + x] != 0
+}
+
+fn same(a: [u32], b: [u32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The blinker returns to its shape with older cells: compare life, not
+// age.
+fn same_alive(a: [u32], b: [u32]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if (a[i] != 0) != (b[i] != 0) {
+            return false;
+        }
+    }
+    true
+}
+
+// The GPU's current side, copied out: mapping hands back a view of the
+// stage buffer, so the check gets its own copy before the buffer drops.
+fn snapshot(life: Life, dev: gpu::Device, queue: inout gpu::Queue, gpa: Gpa) -> Vec<u32> {
+    let bytes = life.cells * 4;
+    var stage = dev.buffer(bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_buffer(life.buf[life.cur], 0, stage, 0, bytes);
+    queue.submit(enc.finish());
+    let view = gpu::u32s(stage.map_read(dev));
+    var out: Vec<u32> = Vec::new_in(gpa);
+    for i in 0..life.cells {
+        out.push(view[i]);
+    }
+    out
+}
+
+// One generation exactly as the kernel computes it: eight neighbours,
+// the torus' edges, age capped at 255, a dead cell born at 1 on three.
+fn cpu_step(state: [u32], w: i64, h: i64, gpa: Gpa) -> Vec<u32> {
+    var next: Vec<u32> = Vec::new_in(gpa);
+    for _ in 0..w * h {
+        next.push(0u32);
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let xm = (x + w - 1) % w;
+            let xp = (x + 1) % w;
+            let ym = (y + h - 1) % h;
+            let yp = (y + 1) % h;
+            var n: i64 = 0;
+            if state[ym * w + xm] != 0 { n += 1; }
+            if state[ym * w + x] != 0 { n += 1; }
+            if state[ym * w + xp] != 0 { n += 1; }
+            if state[y * w + xm] != 0 { n += 1; }
+            if state[y * w + xp] != 0 { n += 1; }
+            if state[yp * w + xm] != 0 { n += 1; }
+            if state[yp * w + x] != 0 { n += 1; }
+            if state[yp * w + xp] != 0 { n += 1; }
+            let i = y * w + x;
+            if state[i] != 0 {
+                if n == 2 || n == 3 {
+                    next[i] = min(state[i] + 1, 255);
+                }
+            } else {
+                if n == 3 {
+                    next[i] = 1;
+                }
+            }
+        }
+    }
+    next
+}
+
+// A BGRA frame as a PPM (P6): a readback's rows carry their 256-byte
+// stride.
+fn write_ppm(path: [u8], px: [u8], w: i64, h: i64, stride: i64, gpa: Gpa) -> bool {
+    var ppm = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        let row = y * stride;
+        for x in 0..w {
+            let p = row + x * 4;
+            ppm.push(px[p + 2]);
+            ppm.push(px[p + 1]);
+            ppm.push(px[p]);
+        }
+    }
+    fs::write(path, ppm.as_slice()).is_ok()
+}
+
+// Waits for every submitted step with a four-byte copy: one map, one
+// fence, no full grid crossing the bus.
+fn wait_for_gpu(life: Life, dev: gpu::Device, queue: inout gpu::Queue) {
+    var done = dev.buffer(4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_buffer(life.buf[life.cur], 0, done, 0, 4);
+    queue.submit(enc.finish());
+    let _ = done.map_read(dev);
+}
+
+pub fn run(grid: i64, steps: i64, seed: u64, density: f64,
+    w: i64, h: i64, out: [u8], bench: bool, gpa: Gpa) -> i32 {
+    println(f"life {grid}x{grid}, {steps} steps");
+    let inst = gpu::Instance::new_in(gpa);
+    let opened = match inst.adapter() {
+        Ok(a) => a.device(),
+        Err(e) => Err(e),
+    };
+    let (dev, var queue) = match opened {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln(f"life: no GPU: {e}");
+            return 1;
+        }
+    };
+    let cg = max(8, min(grid, 128));
+    var cells = match life_new(dev, cg, cg) {
+        Ok(built) => built,
+        Err(e) => {
+            eprintln(f"life: the simulation: {e}");
+            return 1;
+        }
+    };
+    var all_ok = true;
+    let cx = cg / 2;
+    let cy = cg / 2;
+
+    // 1. a blinker: horizontal, vertical, horizontal again
+    cells.clear(dev, &queue);
+    cells.paint(dev, &queue, cx as f64 - 0.5, cy as f64 + 0.5,
+        cx as f64 + 1.5, cy as f64 + 0.5, 0.5, 1u32);
+    let born = snapshot(cells, dev, &queue, gpa);
+    var step_ok = count_alive(born.as_slice()) == 3
+        && alive_at(born.as_slice(), cg, cx - 1, cy)
+        && alive_at(born.as_slice(), cg, cx, cy)
+        && alive_at(born.as_slice(), cg, cx + 1, cy);
+    cells.step(dev, &queue);
+    let vertical = snapshot(cells, dev, &queue, gpa);
+    step_ok = step_ok && count_alive(vertical.as_slice()) == 3
+        && alive_at(vertical.as_slice(), cg, cx, cy - 1)
+        && alive_at(vertical.as_slice(), cg, cx, cy)
+        && alive_at(vertical.as_slice(), cg, cx, cy + 1);
+    cells.step(dev, &queue);
+    let horizontal = snapshot(cells, dev, &queue, gpa);
+    step_ok = step_ok && same_alive(horizontal.as_slice(), born.as_slice());
+    if step_ok {
+        println("step ok");
+    } else {
+        println("step FAIL (blinker)");
+        all_ok = false;
+    }
+
+    // 2. the torus: a vertical blinker on the left edge becomes a
+    // horizontal one that straddles the seam
+    cells.clear(dev, &queue);
+    cells.paint(dev, &queue, 0.5, cy as f64 - 0.5,
+        0.5, cy as f64 + 1.5, 0.5, 1u32);
+    cells.step(dev, &queue);
+    let wrapped = snapshot(cells, dev, &queue, gpa);
+    let wrap_ok = count_alive(wrapped.as_slice()) == 3
+        && alive_at(wrapped.as_slice(), cg, cg - 1, cy)
+        && alive_at(wrapped.as_slice(), cg, 0, cy)
+        && alive_at(wrapped.as_slice(), cg, 1, cy);
+    if wrap_ok {
+        println("wrap ok");
+    } else {
+        println("wrap FAIL (the seam)");
+        all_ok = false;
+    }
+
+    // 3. seeding: all alive dies of overcrowding, none alive is empty
+    cells.reseed(dev, &queue, seed, 1.0);
+    let full = snapshot(cells, dev, &queue, gpa);
+    cells.step(dev, &queue);
+    let empty = snapshot(cells, dev, &queue, gpa);
+    cells.reseed(dev, &queue, seed, 0.0);
+    let blank = snapshot(cells, dev, &queue, gpa);
+    let fill_ok = count_alive(full.as_slice()) == cg * cg
+        && count_alive(empty.as_slice()) == 0
+        && count_alive(blank.as_slice()) == 0;
+    if fill_ok {
+        println("fill ok");
+    } else {
+        println("fill FAIL (density 1 or 0)");
+        all_ok = false;
+    }
+
+    // 4. painting: a long segment is unbroken; the eraser takes it back
+    cells.clear(dev, &queue);
+    let py = cy;
+    cells.paint(dev, &queue, 2.5, py as f64 + 0.5,
+        cg as f64 - 2.5, py as f64 + 0.5, 0.5, 1u32);
+    let line = snapshot(cells, dev, &queue, gpa);
+    var paint_ok = true;
+    for x in 2..cg - 2 {
+        if !alive_at(line.as_slice(), cg, x, py) {
+            paint_ok = false;
+        }
+    }
+    if count_alive(line.as_slice()) != cg - 4 {
+        paint_ok = false;
+    }
+    cells.paint(dev, &queue, 2.5, py as f64 + 0.5,
+        cg as f64 - 2.5, py as f64 + 0.5, 2.0, 0u32);
+    let erased = snapshot(cells, dev, &queue, gpa);
+    paint_ok = paint_ok && count_alive(erased.as_slice()) == 0;
+    if paint_ok {
+        println("paint ok");
+    } else {
+        println("paint FAIL (segment or eraser)");
+        all_ok = false;
+    }
+
+    // 5. the evolution against the CPU, from the same seeded start
+    cells.reseed(dev, &queue, seed, density);
+    var cpu = snapshot(cells, dev, &queue, gpa);
+    for _ in 0..steps {
+        cells.step(dev, &queue);
+    }
+    let gpu_end = snapshot(cells, dev, &queue, gpa);
+    for _ in 0..steps {
+        cpu = cpu_step(cpu.as_slice(), cg, cg, gpa);
+    }
+    let reference_ok = same(gpu_end.as_slice(), cpu.as_slice());
+    if reference_ok {
+        println("reference ok");
+    } else {
+        println("reference FAIL (the CPU took another path)");
+        all_ok = false;
+    }
+
+    // 6. one frame: a disc at the centre, drawn at ten pixels a cell
+    // into a headless surface; the centre must be lit, the corners not
+    cells.clear(dev, &queue);
+    cells.paint(dev, &queue, cx as f64 + 0.5, cy as f64 + 0.5,
+        cx as f64 + 0.5, cy as f64 + 0.5, 1.5, 1u32);
+    var viewer = match viewer_new(dev, cells) {
+        Ok(renderer) => renderer,
+        Err(e) => {
+            eprintln(f"life: the view: {e}");
+            return 1;
+        }
+    };
+    var surf = match inst.surface(dev, RawSurface::Headless) {
+        Ok(headless) => headless,
+        Err(e) => {
+            eprintln(f"life: no surface: {e}");
+            return 1;
+        }
+    };
+    surf.configure(dev, w, h, format: Format::Bgra8Unorm, vsync: false);
+    let stride = (w * 4 + 255) / 256 * 256;
+    var mid: i64 = 0;
+    var corners: i64 = 0;
+    {
+        let frame = match surf.frame() {
+            Ok(shown) => shown,
+            Err(e) => {
+                eprintln(f"life: no frame: {e}");
+                return 1;
+            }
+        };
+        let texview = frame.texture.view();
+        let render_zoom = min(10.0, min(w as f64, h as f64) / 16.0);
+        viewer.draw(dev, &queue, texview, cells.cur,
+            cx as f64 + 0.5, cy as f64 + 0.5, render_zoom, w, h, cg, cg,
+            0.0, 0.0, 0.0, true, 0.0);
+        var readback = dev.buffer(stride * h,
+            BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var frame_enc = dev.encoder();
+        frame_enc.copy_texture_to_buffer(frame.texture, readback, stride);
+        queue.submit(frame_enc.finish());
+        let px = readback.map_read(dev);
+        for y in 0..h {
+            for x in 0..w {
+                let p = y * stride + x * 4;
+                let red = px[p + 2] as i64;
+                let mx = x * 3 >= w && x * 3 < 2 * w;
+                let my = y * 3 >= h && y * 3 < 2 * h;
+                if red > 30 {
+                    if mx && my {
+                        mid += 1;
+                    } else if !mx && !my {
+                        corners += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // --out gets the field, not the test's disc: a seeded world with a
+    // few generations behind it, fitted to the frame.
+    if out.len() > 0 {
+        cells.reseed(dev, &queue, seed, density);
+        for _ in 0..24 {
+            cells.step(dev, &queue);
+        }
+        let out_frame = match surf.frame() {
+            Ok(shown) => shown,
+            Err(e) => {
+                eprintln(f"life: no frame: {e}");
+                return 1;
+            }
+        };
+        let out_tex = out_frame.texture.view();
+        let fit = min(w as f64 / cg as f64, h as f64 / cg as f64);
+        viewer.draw(dev, &queue, out_tex, cells.cur,
+            cg as f64 * 0.5, cg as f64 * 0.5, fit, w, h, cg, cg,
+            0.0, 0.0, 0.0, false, 0.0);
+        var out_readback = dev.buffer(stride * h,
+            BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var out_enc = dev.encoder();
+        out_enc.copy_texture_to_buffer(out_frame.texture, out_readback, stride);
+        queue.submit(out_enc.finish());
+        let out_px = out_readback.map_read(dev);
+        if write_ppm(out, out_px, w, h, stride, gpa) {
+            println(f"wrote {out}");
+        } else {
+            eprintln(f"life: cannot write {out}");
+            return 1;
+        }
+    }
+    let render_ok = mid > 0 && corners == 0;
+    if render_ok {
+        println("render ok");
+    } else {
+        println(f"render FAIL ({mid} lit centre, {corners} lit corners)");
+        all_ok = false;
+    }
+
+    // 7. the full grid, timed: a second simulation at the requested size
+    if bench {
+        if grid * grid * 4 > dev.limits().max_buffer_size {
+            eprintln(f"life: {grid}x{grid} needs {grid * grid * 4} bytes, over the device's limit");
+            return 2;
+        }
+        var big = match life_new(dev, grid, grid) {
+            Ok(built) => built,
+            Err(e) => {
+                eprintln(f"life: the benchmark's grid: {e}");
+                return 1;
+            }
+        };
+        big.reseed(dev, &queue, seed, density);
+        big.step(dev, &queue);
+        let rounds: i64 = 12;
+        let started = monotonic_now();
+        for _ in 0..rounds {
+            big.step(dev, &queue);
+        }
+        wait_for_gpu(big, dev, &queue);
+        let ms = monotonic_now().saturating_sub(started).as_secs_f64() * 1000.0;
+        let per = ms / rounds as f64;
+        let rate = grid as f64 * grid as f64 * rounds as f64 / max(ms, 1.0) * 1000.0;
+        println(f"benchmark: {grid}x{grid}, {rounds} steps, {per:.2} ms/step, {rate:.0} cells/s");
+    }
+    if all_ok {
+        return 0;
+    }
+    1
+}

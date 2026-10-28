@@ -1,0 +1,239 @@
+// infer.vl: the agent — the network, the two-frame observation stack, the
+// top-3 sampling, and the per-entity saliency the overlay shows. A port
+// of the `InferState` in neural-galaga-ui's infer binary: the same
+// cadence, the same normalization, the same colours.
+//
+// The net is the cheats actor-critic (model.vl): 1630 floats in, 18
+// action log-probabilities and a value out. Actions are sampled from the
+// three most likely ones, renormalized; the client's own RNG stands in
+// for rand's.
+
+use std::random::Xoshiro256pp;
+
+use crate::game::{Step, action_mask};
+use crate::model::{Model, forward, load, saliency, top_k};
+use crate::obs::{
+    ENEMIES_OFFSET, ENEMY_BULLETS_OFFSET, ENEMY_BULLET_SLOT_FLOATS, ENEMY_SLOT_FLOATS,
+    NUM_ENEMY_BULLET_SLOTS, NUM_ENEMY_SLOTS, NUM_PLAYER_BULLET_SLOTS, NUM_POWERUP_SLOTS,
+    NUM_SHOTGUN_SLOTS, OBS_SIZE, PLAYER_BULLETS_OFFSET, PLAYER_BULLET_SLOT_FLOATS, POWERUPS_OFFSET,
+    POWERUP_SLOT_FLOATS, SHOTGUN_OFFSET, SHOTGUN_SLOT_FLOATS, encode, stack,
+};
+
+/// One circled entity: where it is, how much it mattered, and the
+/// colour the overlay rings it in.
+pub struct SaliencyTarget {
+    pub x: f32,
+    pub y: f32,
+    pub importance: f32,
+    pub color: [u8; 3],
+}
+
+pub struct Infer {
+    path: Buf,
+    model: Model,
+    prev_obs: Vec<f32>,
+    last_obs: Vec<f32>,
+    pub last_result: Option<Step>,
+    pub last_action: i64,
+    pub probs: [f32; 18],
+    pub value: f32,
+    pub targets: Vec<SaliencyTarget>,
+    rng: Xoshiro256pp,
+}
+
+pub fn infer_new(path: [u8], gpa: Gpa) -> Infer {
+    let model = load(path, gpa);
+    Infer {
+        path: Buf::from_in(path, gpa),
+        model: model,
+        prev_obs: Vec::filled_in(OBS_SIZE, 0.0f32, gpa),
+        last_obs: Vec::filled_in(OBS_SIZE, 0.0f32, gpa),
+        last_result: Option::None,
+        last_action: 0,
+        probs: [0.0; 18],
+        value: 0.0,
+        targets: Vec::new_in(gpa),
+        rng: Xoshiro256pp::from_entropy(),
+    }
+}
+
+/// The same, with the sampler seeded: the headless check needs a run it
+/// can repeat.
+pub fn infer_new_seeded(path: [u8], seed: u64, gpa: Gpa) -> Infer {
+    var inf = infer_new(path, gpa);
+    inf.rng = Xoshiro256pp::seed_from_u64(seed);
+    inf
+}
+
+impl Infer {
+    /// Reload the checkpoint from the same path — what the client does
+    /// when a game ends.
+    pub fn reload(inout self, gpa: Gpa) {
+        let m = load(self.path.as_slice(), gpa);
+        self.model = m;
+    }
+
+    pub fn update_obs(inout self, r: Step, gpa: Gpa) {
+        let cur = encode(r, gpa);
+        self.prev_obs = self.last_obs.take();
+        self.last_obs = cur;
+        self.last_result = Option::Some(r.clone());
+    }
+
+    fn stacked(self, gpa: Gpa) -> Vec<f32> {
+        stack(self.prev_obs.as_slice(), self.last_obs.as_slice(), gpa)
+    }
+
+    /// Sample from the three most likely actions, renormalized, and
+    /// return the chosen action's mask.
+    pub fn pick_action(inout self, gpa: Gpa) -> u32 {
+        let x = self.stacked(gpa);
+        let net = forward(self.model, x.as_slice(), gpa);
+        self.probs = net.probs;
+        self.value = net.value;
+
+        let top = top_k(net.probs, 3);
+        var sum = net.probs[top[0]] + net.probs[top[1]] + net.probs[top[2]];
+        if sum < 1e-8 {
+            sum = 1e-8;
+        }
+        let r = self.rng.unit_f64() as f32;
+        var cumsum: f32 = 0.0;
+        var action = top[2];
+        for i in 0..3 {
+            cumsum += net.probs[top[i]] / sum;
+            if r < cumsum {
+                action = top[i];
+                break;
+            }
+        }
+        self.last_action = action;
+        action_mask(action)
+    }
+
+    /// How much each entity on screen mattered to the last action: the
+    /// sum of the absolute gradient of its slot in the current frame's
+    /// observation, normalized so the largest is 1.
+    pub fn compute_saliency(inout self, gpa: Gpa) {
+        self.targets.clear();
+        let r = match self.last_result.clone() {
+            Option::Some(v) => v,
+            Option::None => return,
+        };
+        let x = self.stacked(gpa);
+        let g = saliency(self.model, x.as_slice(), self.last_action, gpa);
+
+        // Enemies.
+        for i in 0..NUM_ENEMY_SLOTS {
+            if i >= r.enemies.len() || !r.enemies[i].alive {
+                continue;
+            }
+            let imp = slot_importance(g.as_slice(),
+                ENEMIES_OFFSET + i * ENEMY_SLOT_FLOATS, ENEMY_SLOT_FLOATS);
+            self.targets.push(SaliencyTarget {
+                x: r.enemies[i].x + 8.0,
+                y: r.enemies[i].y + 8.0,
+                importance: imp,
+                color: [255, 80, 80],
+            });
+        }
+
+        // Player bullets (dy < 0), then enemy bullets (dy >= 0), in the
+        // order the game produced them.
+        var pb: i64 = 0;
+        for i in 0..r.bullets.len() {
+            let b = r.bullets[i];
+            if b.dy < 0.0 && pb < NUM_PLAYER_BULLET_SLOTS {
+                let imp = slot_importance(g.as_slice(),
+                    PLAYER_BULLETS_OFFSET + pb * PLAYER_BULLET_SLOT_FLOATS,
+                    PLAYER_BULLET_SLOT_FLOATS);
+                self.targets.push(SaliencyTarget {
+                    x: b.x + 2.0,
+                    y: b.y + 4.0,
+                    importance: imp,
+                    color: [60, 220, 255],
+                });
+                pb += 1;
+            }
+        }
+        var eb: i64 = 0;
+        for i in 0..r.bullets.len() {
+            let b = r.bullets[i];
+            if b.dy >= 0.0 && eb < NUM_ENEMY_BULLET_SLOTS {
+                let imp = slot_importance(g.as_slice(),
+                    ENEMY_BULLETS_OFFSET + eb * ENEMY_BULLET_SLOT_FLOATS,
+                    ENEMY_BULLET_SLOT_FLOATS);
+                self.targets.push(SaliencyTarget {
+                    x: b.x + 2.0,
+                    y: b.y + 4.0,
+                    importance: imp,
+                    color: [255, 220, 60],
+                });
+                eb += 1;
+            }
+        }
+
+        // Shotgun balls.
+        var sb: i64 = 0;
+        for i in 0..r.shotgun.len() {
+            if sb >= NUM_SHOTGUN_SLOTS {
+                break;
+            }
+            let s = r.shotgun[i];
+            let imp = slot_importance(g.as_slice(),
+                SHOTGUN_OFFSET + sb * SHOTGUN_SLOT_FLOATS,
+                SHOTGUN_SLOT_FLOATS);
+            self.targets.push(SaliencyTarget {
+                x: s.x + 2.0,
+                y: s.y + 2.0,
+                importance: imp,
+                color: [255, 160, 60],
+            });
+            sb += 1;
+        }
+
+        // Powerups.
+        var pu: i64 = 0;
+        for i in 0..r.powerups.len() {
+            if pu >= NUM_POWERUP_SLOTS {
+                break;
+            }
+            let p = r.powerups[i];
+            let imp = slot_importance(g.as_slice(),
+                POWERUPS_OFFSET + pu * POWERUP_SLOT_FLOATS,
+                POWERUP_SLOT_FLOATS);
+            self.targets.push(SaliencyTarget {
+                x: p.x + 8.0,
+                y: p.y + 8.0,
+                importance: imp,
+                color: [60, 255, 80],
+            });
+            pu += 1;
+        }
+
+        // Normalize to [0, 1]; an all-zero run keeps 0.
+        var max_imp: f32 = 0.0;
+        for i in 0..self.targets.len() {
+            if self.targets[i].importance > max_imp {
+                max_imp = self.targets[i].importance;
+            }
+        }
+        if max_imp < 1e-6 {
+            max_imp = 1e-6;
+        }
+        for i in 0..self.targets.len() {
+            self.targets[i].importance = self.targets[i].importance / max_imp;
+        }
+    }
+}
+
+/// The sum of absolute gradients over one entity's slot in the current
+/// frame (the second half of the stacked observation).
+fn slot_importance(g: [f32], offset: i64, n: i64) -> f32 {
+    var s: f32 = 0.0;
+    for i in 0..n {
+        let v = g[OBS_SIZE + offset + i];
+        s += if v < 0.0 { -v } else { v };
+    }
+    s
+}

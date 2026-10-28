@@ -1,0 +1,189 @@
+// rom.vl: the cartridge image — an iNES (or NES 2.0) file parsed into
+// its PRG ROM, CHR ROM and the header facts a mapper needs. Everything
+// here is checked before a byte is executed: a truncated file, a bad
+// magic or an unsupported mapper is an error the command line prints,
+// never a crash inside the emulator.
+//
+// The header is 16 bytes: `NES\x1a`, one byte of PRG banks (16 KiB
+// each), one of CHR banks (8 KiB each), then the flags. Trainer data
+// (512 bytes) sits between the header and PRG. NES 2.0 puts the high
+// mapper bits in the low nibble of its tenth byte; the old format only
+// has 8 mapper bits, which is all any NES game used.
+
+use std::fs;
+
+pub const MIRROR_HORIZONTAL: i64 = 0;
+pub const MIRROR_VERTICAL: i64 = 1;
+pub const MIRROR_FOUR: i64 = 2;
+pub const MIRROR_SINGLE_LOW: i64 = 3;
+pub const MIRROR_SINGLE_HIGH: i64 = 4;
+
+pub struct Rom {
+    pub prg: Vec<u8>,
+    pub chr: Vec<u8>,
+    pub mapper: i64,
+    pub mirroring: i64,
+    pub prg_ram_size: i64,
+    pub battery: bool,
+    pub nes2: bool,
+    // No CHR ROM: the 8 KiB is RAM the game fills through $2007.
+    pub chr_ram: bool,
+}
+
+fn fail(gpa: Gpa, msg: [u8]) -> Result<Rom, Buf> {
+    var b = Buf::new_in(gpa);
+    b.push_str(msg);
+    Err(b)
+}
+
+fn fail_path(gpa: Gpa, msg: [u8], path: [u8]) -> Result<Rom, Buf> {
+    var b = Buf::new_in(gpa);
+    b.push_str(msg);
+    b.push_str(path);
+    Err(b)
+}
+
+// The mappers cart.vl implements; the parser refuses the rest here so
+// the failure names the format rather than surfacing later as a
+// misread bank.
+pub fn mapper_supported(m: i64) -> bool {
+    m == 0 || m == 1 || m == 2 || m == 3 || m == 4 || m == 7 || m == 11 || m == 66
+}
+
+pub fn mapper_name(m: i64) -> [u8] {
+    if m == 0 { "NROM" }
+    else if m == 1 { "MMC1" }
+    else if m == 2 { "UxROM" }
+    else if m == 3 { "CNROM" }
+    else if m == 4 { "MMC3" }
+    else if m == 7 { "AxROM" }
+    else if m == 11 { "Color Dreams" }
+    else if m == 66 { "GxROM" }
+    else if m == 5 { "MMC5" }
+    else if m == 9 { "MMC2" }
+    else if m == 10 { "MMC4" }
+    else if m == 69 { "FME-7" }
+    else if m == 85 { "VRC7" }
+    else { "unknown" }
+}
+
+fn le16(d: [u8], i: i64) -> i64 {
+    (d[i] as i64) | ((d[i + 1] as i64) << 8)
+}
+
+fn copy_range(d: [u8], from: i64, n: i64, gpa: Gpa) -> Vec<u8> {
+    var v: Vec<u8> = Vec::with_capacity_in(n, gpa);
+    for i in 0..n {
+        v.push(d[from + i]);
+    }
+    v
+}
+
+pub fn parse(data: [u8], gpa: Gpa) -> Result<Rom, Buf> {
+    if data.len() < 16 {
+        return fail(gpa, "the file is too short to be an iNES image (no 16-byte header)");
+    }
+    if data[0] != 'N' as u8 || data[1] != 'E' as u8 || data[2] != 'S' as u8
+        || data[3] != 0x1a {
+        return fail(gpa, "not an iNES image: the file does not start with NES\\x1a");
+    }
+    let flags6 = data[6] as i64;
+    let flags7 = data[7] as i64;
+    let prg_banks = data[4] as i64;
+    let chr_banks = data[5] as i64;
+    if prg_banks == 0 {
+        return fail(gpa, "the header says the cartridge has no PRG ROM");
+    }
+    let nes2 = (flags7 & 0x0c) == 0x08;
+    var mapper = (flags6 >> 4) | (flags7 & 0xf0);
+    var prg_ram_banks = 1;
+    var four_screen = (flags6 & 0x08) != 0;
+    if nes2 {
+        mapper = mapper | (((data[8] as i64) & 0x0f) << 8);
+        prg_ram_banks = (data[10] as i64) & 0x0f;
+        if prg_ram_banks == 0 {
+            prg_ram_banks = 1;
+        }
+    }
+    let trainer = ((flags6 & 0x04) != 0) as i64;
+    let prg_size = prg_banks * 16384;
+    let chr_size = chr_banks * 8192;
+    let start = 16 + trainer * 512;
+    if start + prg_size + chr_size > data.len() {
+        return fail(gpa, "the file is truncated: the header promises more PRG or CHR ROM than it holds");
+    }
+    if !mapper_supported(mapper) {
+        var b = Buf::new_in(gpa);
+        b.push_str("unsupported mapper ");
+        b.push_int(mapper);
+        b.push_str(" (");
+        b.push_str(mapper_name(mapper));
+        b.push_str("); this emulator runs NROM, MMC1, UxROM, CNROM, MMC3, AxROM, Color Dreams and GxROM");
+        return Err(b);
+    }
+    var mirroring = flags6 & 1;
+    if four_screen {
+        mirroring = MIRROR_FOUR;
+    }
+    if nes2 && (flags6 & 0x08) != 0 {
+        mirroring = MIRROR_FOUR;
+    }
+    let prg = copy_range(data, start, prg_size, gpa);
+    var chr: Vec<u8> = Vec::new_in(gpa);
+    if chr_size > 0 {
+        chr = copy_range(data, start + prg_size, chr_size, gpa);
+    } else {
+        // A CHR RAM cartridge: 8 KiB the game writes through $2007.
+        for _ in 0..8192 {
+            chr.push(0);
+        }
+    }
+    Ok(Rom {
+        prg: prg,
+        chr: chr,
+        mapper: mapper,
+        mirroring: mirroring,
+        prg_ram_size: prg_ram_banks * 8192,
+        battery: (flags6 & 0x02) != 0,
+        chr_ram: chr_size == 0,
+        nes2: nes2,
+    })
+}
+
+// Reads the whole file, then parses it. The size cap keeps a mistyped
+// argument (a disk image, a directory entry that reports a huge size)
+// from being slurped into memory.
+pub fn load(path: [u8], gpa: Gpa) -> Result<Rom, Buf> {
+    let data = match fs::read_in(path, gpa) {
+        Ok(d) => d,
+        Err(_) => return fail_path(gpa, "cannot read the ROM file: ", path),
+    };
+    let size = data.len();
+    if size > 64 * 1024 * 1024 {
+        return fail(gpa, "the file is over 64 MiB, far larger than any NES cartridge image");
+    }
+    parse(data.as_slice(), gpa)
+}
+
+// A cartridge has at least one 16 KiB PRG bank; testing the header of a
+// file already in memory is the same check `load` makes.
+#[test]
+fn header_magic_is_checked(gpa: Gpa) {
+    var d: Vec<u8> = Vec::new_in(gpa);
+    for i in 0..16 {
+        d.push(0);
+    }
+    d[0] = 'N' as u8;
+    d[1] = 'E' as u8;
+    d[2] = 'S' as u8;
+    d[3] = 0x1a;
+    d[4] = 2;
+    d[5] = 1;
+    for i in 0..(32768 + 8192) {
+        d.push(0);
+    }
+    let rom = parse(d.as_slice(), gpa).unwrap();
+    assert_eq(rom.mapper, 0);
+    assert_eq(rom.prg.len(), 32768);
+    assert_eq(rom.chr.len(), 8192);
+}
