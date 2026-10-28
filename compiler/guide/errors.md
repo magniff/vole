@@ -142,7 +142,8 @@ let big = i64::MAX();
 error[type error] no associated function 'MAX' in 'i64' | help: a constant, without (): 'i64::MAX'
 ```
 `i64::MAX`, `u8::MIN`, ... are constants (0.15); integer types have no
-other associated items, and floats no limits (yet).
+other associated items. Floats have Rust's (0.25.2.1): `f64::EPSILON`,
+`f64::MAX`, `f64::NAN`, `f64::consts::PI` (`guide math`).
 
 ```tach
 let s = "add";
