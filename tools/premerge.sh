@@ -2,7 +2,7 @@
 # The checks a branch passes before it is merged into an integration
 # branch (AGENTS.md, "Before a merge"): run in the branch's worktree.
 #
-# usage: tools/premerge.sh [BASE]     (default: the release-* branch it forked from, else main)
+# usage: tools/premerge.sh [BASE]     (default: the nearest release-* branch it contains, else main)
 #
 #   base     the branch contains BASE's tip (else: merge BASE first)
 #   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
@@ -21,10 +21,11 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 
 BASE=${1:-}
 if [ -z "$BASE" ]; then
+    # the nearest one: the contained release-* branch fewest commits behind HEAD
     BASE=$(git for-each-ref --format='%(refname:short)' 'refs/heads/release-*' | while read -r b; do
         git merge-base --is-ancestor "$b" HEAD 2>/dev/null || continue
-        echo "$b"
-    done | tail -1)
+        echo "$(git rev-list --count "$b"..HEAD) $b"
+    done | sort -n | head -1 | cut -d' ' -f2)
     [ -n "$BASE" ] || BASE=main
 fi
 VOLEC=
