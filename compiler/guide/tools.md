@@ -95,7 +95,7 @@ an edit then `check`.
 
 | to | run |
 |---|---|
-| change text inside an item | `volec edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat) |
+| change text inside an item | `volec edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat; for hunks: several lines at other indentation match as `--loose`; the same change everywhere: `--all`; a whole item: `edit replace`) |
 | replace, add, remove an item | `volec edit replace NAME < new.vl`, `edit insert --after NAME < item.vl`, `edit delete NAME` |
 | add statements inside an item | `volec edit insert --in NAME --after 'ANCHOR' < text` |
 | several items at once, one edit | `volec edit apply items.vl`: `@@ NAME` then its new text, `@@ new after NAME`, `@@ delete NAME` (or `query show A B`'s output, edited) |

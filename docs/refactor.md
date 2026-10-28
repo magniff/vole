@@ -148,6 +148,14 @@ patched crate::middle::range::decide→compiler/src/middle/range.vl→+1 -1 line
   replacements must not overlap (`error patch.overlap`), and all pairs
   are one edit: checked once, written all or not at all, undone by one
   `undo`.
+- **It is for hunks** (0.25.2): a few lines found once. An OLD of
+  several lines that is not in TARGET as written but is, once, with
+  other indentation (copied from `query show` at another depth) is
+  matched as with `--loose`, NEW re-indented like the lines it replaces,
+  and `note patch.loose` says so; found several times that way, it is
+  `patch.no-match` with the lines where. The same change in many places
+  is `--all` (or `refactor rename`, `rewrite`); a whole item rewritten is
+  `edit replace NAME < item.vl`, which is checked as well.
 - **No match**: `error patch.no-match` with the line of TARGET nearest to
   OLD (by edit distance, blanks ignored), and `try:` the command with the
   part of that line nearest to OLD as OLD (or with `--loose` when OLD is
