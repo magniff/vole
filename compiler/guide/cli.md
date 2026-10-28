@@ -31,7 +31,7 @@ clusters `-vq`, `-ofile`, `-o file`, `-o=file`, `--out file`,
 `--out=file`, `--` (the rest is positional), `-` (a positional). An
 option takes the next argument even when it starts with `-` (`-n -5`).
 
-```tach
+```vole
 use std::cli::{Arg, Command};
 
 fn main(gpa: Gpa) -> i32 {
@@ -84,7 +84,7 @@ usage: tool [options] [file]... [command]
 
 ## Subcommands, aliases, values (0.25.2)
 
-```tach
+```vole
 use std::cli::{Arg, Command};
 
 fn main(gpa: Gpa) -> i32 {

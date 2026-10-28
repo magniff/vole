@@ -10,7 +10,7 @@ Import a header (its names are reached through the `as` name; every
 header of a program shares one C module, so one name serves them all),
 or declare the functions yourself. Every call is `unsafe`.
 
-```tach
+```vole
 import "stdio.h" as c;
 import "string.h" as c;
 
@@ -55,7 +55,7 @@ vole has 4 bytes, 1 0.125
 
 ## Layout: #[repr(C)]
 
-```tach
+```vole
 #[repr(C)]
 struct Header { tag: u8, size: u32 }          // C's field order and padding
 
@@ -97,7 +97,7 @@ exclusive loan of `x` for the call).
 symbol; only such a function is a C callback (a plain `fn` is another
 type).
 
-```tach
+```vole
 import "stdlib.h" as c;
 
 extern "C" fn by_value(a: *u8, b: *u8) -> i32 {
@@ -149,7 +149,7 @@ std::window bring libobjc and their frameworks, and a program without
 them links nothing more (keep the C library's functions in a block of
 their own). On the command line, `-framework NAME` adds a framework.
 
-```tach
+```vole
 #[link(lib = "m")]
 extern "C" {
     fn ilogb(x: f64) -> i32;
@@ -176,7 +176,7 @@ std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
 `unistd.h`, into a `Buf` or an array (not mixed with std's, which
 buffers):
 
-```tach
+```vole
 import "stdio.h" as c;
 
 fn main(gpa: Gpa) -> i32 {

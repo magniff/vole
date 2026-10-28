@@ -1,4 +1,4 @@
-# GPU: std::gpu (0.22; guide updated 0.25.2)
+# GPU: std::gpu (0.22; guide updated 0.25.2.2)
 
 `std::gpu` is compute and rendering on the GPU, on wgpu's model: an
 `Instance`, an `Adapter`, a `Device` and its `Queue`; `Buffer`s,
@@ -18,7 +18,7 @@ storage buffer, a render shader reads it into the window's frame. Each
 WGSL module is a `Shader`; `@group(g) @binding(b)` are the bind groups'
 numbers, made from `pipe.bind_layout(g)`.
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, RawSurface};
 use std::window::{App, Event, WindowDesc};
@@ -157,7 +157,7 @@ program can also write both by hand, as below.
 
 ## Compute
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
 
@@ -196,7 +196,7 @@ The same kernel in WGSL: `@group(g) @binding(b)` are the bind groups'
 numbers, and a runtime-sized array is bounds-checked against the buffer
 bound there.
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::BufferUsage;
 
@@ -231,163 +231,12 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 9 3969
 ```
 
-## Render to a texture
+## Rendering
 
-```tach
-use std::gpu;
-use std::gpu::{BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureUsage};
-
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
-    let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    let code = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vs(uint v [[vertex_id]]) { float2 p[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) }; return float4(p[v], 0, 1); }\nfragment float4 fs() { return float4(1, 0.5, 0, 1); }\n";
-    var refl = Reflection::new_in(gpa);
-    refl.vertex("vs", "vs");
-    refl.fragment("fs", "fs");
-    let src = ShaderSource::msl(code, refl);
-    let shader = dev.shader(src)?;
-    let desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm);
-    let pipe = dev.render_pipeline(desc)?;
-    let tex = dev.texture(8, 8, Format::Rgba8Unorm, usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
-    let view = tex.view();
-    var out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.render_pass(PassDesc::color(view), |pass| { // cleared to black, then drawn
-        pass.set_pipeline(pipe);
-        pass.draw(0..3, 0..1); // a triangle over the whole target
-    });
-    enc.copy_texture_to_buffer(tex, out, 256); // rows 256 bytes apart
-    queue.submit(enc.finish());
-    let px = out.map_read(dev);
-    println(f"{px[0]} {px[1]} {px[2]} {px[3]}");
-    Ok(())
-}
-```
-```out
-255 128 0 255
-```
-
-## Multiple render targets
-
-One pass can write several textures at once, a G-buffer: the pass
-names a color attachment for each (`PassDesc::color(a).with_color(b)`,
-at most 8), the pipeline a target of the same format for each, in the
-same order (`RenderDesc::new`'s format is target 0, then
-`desc.target(format)`), and the fragment shader returns a struct whose
-`@location(i)` member is written into attachment i.
-
-```tach
-use std::gpu;
-use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
-
-const GBUFFER: [u8] = "struct G {\n\
-    @location(0) albedo: vec4<f32>,\n\
-    @location(1) normal: vec4<f32>,\n\
-    @location(2) depth: f32,\n\
-    }\n\
-    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
-    var p = vec2<f32>(-1.0, -1.0);\n\
-    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
-    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
-    return vec4<f32>(p, 0.25, 1.0);\n\
-    }\n\
-    @fragment fn fs(@builtin(position) pos: vec4<f32>) -> G {\n\
-    return G(vec4<f32>(1.0, 0.5, 0.0, 1.0), vec4<f32>(0.0, 0.0, 1.0, 1.0), pos.z);\n\
-    }";
-
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
-    let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(GBUFFER)?;
-    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm); // target 0
-    desc.target(Format::Rgba8Unorm); // target 1
-    desc.target(Format::R32Float); // target 2
-    let pipe = dev.render_pipeline(desc)?;
-    let usage = TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC;
-    let albedo = dev.texture(8, 8, Format::Rgba8Unorm, usage: usage);
-    let normal = dev.texture(8, 8, Format::Rgba8Unorm, usage: usage);
-    let depth = dev.texture(8, 8, Format::R32Float, usage: usage);
-    let (av, nv, dv) = (albedo.view(), normal.view(), depth.view());
-    var outs = [
-        dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST),
-        dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST),
-        dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST),
-    ];
-    var enc = dev.encoder();
-    enc.render_pass(PassDesc::color(av).with_color(nv).with_color(dv), |pass| {
-        pass.set_pipeline(pipe);
-        pass.draw(0..3, 0..1); // one draw writes all three
-    });
-    enc.copy_texture_to_buffer(albedo, outs[0], 256);
-    enc.copy_texture_to_buffer(normal, outs[1], 256);
-    enc.copy_texture_to_buffer(depth, outs[2], 256);
-    queue.submit(enc.finish());
-    let a = outs[0].map_read_copy_in(dev, gpa);
-    let n = outs[1].map_read_copy_in(dev, gpa);
-    let d = gpu::f32s(outs[2].map_read(dev));
-    println(f"albedo {a[0]} {a[1]} {a[2]}, normal {n[0]} {n[1]} {n[2]}, depth {d[0]}");
-    Ok(())
-}
-```
-```out
-albedo 255 128 0, normal 0 0 255, depth 0.25
-```
-
-The pass's pipelines must fit it: `pass.set_pipeline` checks that the
-pipeline has as many color targets as the pass has color attachments,
-each of its attachment's format (`gpu.format`, naming the counts or the
-index), and a depth state only where the pass has a depth attachment.
-
-## Depth-only passes
-
-A shadow map is drawn with no color at all: `PassDesc::depth_only(view)`
-(cleared to 1.0 and stored, to be read afterwards) and a pipeline with
-no fragment stage and no color target, `RenderDesc::depth_only(shader,
-"vs")` (a `Depth32Float` test, `Compare::Less`, that writes). The shader
-needs only the vertex entry. The depth texture is then read by the next
-pass as a `texture_depth_2d` (`textureLoad`, or `textureSampleCompare`
-with a comparison sampler); it needs `TEXTURE_BINDING` for that.
-
-```tach
-use std::gpu;
-use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage, VertexFormat, VertexLayout};
-
-const SHADOW: [u8] = "@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {\n\
-    return vec4<f32>(p, 1.0);\n\
-    }";
-
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
-    let inst = gpu::Instance::new_in(gpa);
-    let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(SHADOW)?;
-    var desc = gpu::RenderDesc::depth_only(shader, "vs");
-    var layout = VertexLayout::new(12);
-    layout.attribute(0, VertexFormat::Float32x3, 0);
-    desc.vertex_buffer(layout);
-    let pipe = dev.render_pipeline(desc)?;
-    // one triangle over the left half of the map, at depth 0.25
-    let tri: [f32; 9] = [-1.0, -1.0, 0.25, 0.0, -1.0, 0.25, -1.0, 3.0, 0.25];
-    let vb = dev.buffer_init(gpu::bytes_of_f32(tri[..]), BufferUsage::VERTEX);
-    let map = dev.texture(8, 8, Format::Depth32Float,
-        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_SRC);
-    let view = map.view();
-    var out = dev.buffer(256 * 8, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    var enc = dev.encoder();
-    enc.render_pass(PassDesc::depth_only(view), |pass| {
-        pass.set_pipeline(pipe);
-        pass.set_vertex_buffer(0, vb);
-        pass.draw(0..3, 0..1);
-    });
-    enc.copy_texture_to_buffer(map, out, 256);
-    queue.submit(enc.finish());
-    let d = gpu::f32s(out.map_read(dev));
-    println(f"left {d[0]}, right {d[7]}"); // the right half keeps the clear value
-    Ok(())
-}
-```
-```out
-left 0.25, right 1
-```
+Render passes into textures, a textured quad (a vertex layout of several
+attributes, `write_texture`, a sampler), several color targets, and
+depth-only passes: `volec guide gpu-render`. A window's frame is drawn
+the same way (the first example, and `guide window`).
 
 ## Descriptors
 
@@ -402,7 +251,7 @@ defaults are wgpu's.
 | `PassDesc` | `PassDesc::color(view, clear: Color::rgba(r, g, b, a), load: Load::Clear)`; `PassDesc::depth_only(view, clear: 1.0, store: true)` | `.with_color(view, clear, load)` (the next color attachment, up to 8), `.with_depth(view, clear: 1.0, store: false)`; `colors: [Option<ColorAttachment>; 8]` and `color_count` (`ColorAttachment { view, load, clear, store }`; `Load::Clear`, `Keep`, `DontCare`), `depth: Option<DepthAttachment>` |
 | `TextureDesc` | `dev.texture(w, h, format, usage: .., layers: 1, mips: 1)` | `width`, `height`, `layers`, `mips`, `format`, `usage` |
 | `SamplerDesc` | `SamplerDesc::nearest()`, `::linear()` | `mag`, `min`, `mip` (`Filter`), `address_u/v/w` (`AddressMode`), `lod_min`, `lod_max`, `compare: Option<Compare>`, `anisotropy` (1..16) |
-| `Limits` | `dev.limits()`; `adapter.device(limits)` | wgpu's names: `max_buffer_size`, `max_bind_groups`, `max_bindings_per_group`, `min_uniform_buffer_offset_alignment`, `max_compute_workgroup_size_x`.., `max_compute_invocations_per_workgroup`, `max_compute_workgroups_per_dimension`.. |
+| `Limits` | `Limits::default()`, `adapter.limits()` (the most it takes), `dev.limits()`; `adapter.device(limits)` | wgpu's names: `max_buffer_size`, `max_bind_groups`, `max_bindings_per_group`, `min_uniform_buffer_offset_alignment`, `max_compute_workgroup_size_x`.., `max_compute_invocations_per_workgroup`, `max_compute_workgroups_per_dimension`.. (Buffer sizes, below) |
 
 ## Usages and formats
 
@@ -410,10 +259,20 @@ defaults are wgpu's.
   `MAP_WRITE`, `COPY_SRC`, `COPY_DST` (`queue.write_buffer`), `INDEX`,
   `VERTEX`, `UNIFORM`, `STORAGE`, `INDIRECT`. A storage buffer is
   `STORAGE` (`| MAP_READ` to read it back, `| COPY_DST` to write it from
-  the CPU).
+  the CPU). They are `u32` bit flags (`const`s of `BufferUsage`, not an
+  enum): a usage is a `u32`, `let u: u32 = BufferUsage::UNIFORM |
+  BufferUsage::COPY_DST;`, and `buf.usage & BufferUsage::STORAGE != 0`
+  tests one. `TextureUsage::` is the same.
 - **Texture usages** (`TextureUsage::`): `COPY_SRC`, `COPY_DST`,
   `TEXTURE_BINDING` (sampled), `STORAGE_BINDING` (a storable format),
   `RENDER_ATTACHMENT`.
+- **Storable formats** (`STORAGE_BINDING`, `texture_storage_2d<F,
+  write>`; `Format::is_storable` says the same): `R32Uint`, `R32Sint`,
+  `R32Float`, `Rgba8Unorm`, `Rgba8Uint`, `Rg32Float`, `Rgba16Float`,
+  `Rgba32Uint`, `Rgba32Float` (WGSL `r32uint` .. `rgba32float`).
+  Storage textures are written only (`write`), never read: a kernel that
+  reads its last frame reads it as a `texture_2d` (bound beside, from
+  another texture).
 - **Surface formats**: `surf.configure(dev, w, h, format, vsync: true)`
   takes `Format::Bgra8Unorm` (the default), `Bgra8UnormSrgb` or
   `Rgba16Float`; a pipeline drawing into the frame names the same one.
@@ -444,14 +303,17 @@ Groups are 0..3, 16 bindings a group. A layout comes from the pipeline,
 so a group made for one pipeline fits another only with the same
 bindings (`gpu.layout`).
 
-A layout holds the bindings the shader module **uses**, for all its
-entry points of the pipeline's stages together: a binding declared and
-used by no entry point is not in it, and one only a second entry point
-of the same module uses is. So a bind group with an entry for every
-declared binding fails, and `gpu.layout` names the layout's bindings:
+A layout holds the bindings the pipeline's **own entry points use**
+(its kernel; its vertex and fragment entry points), through the
+functions they call: WebGPU's `layout: "auto"`. A binding declared and
+used by none of them is not in it, nor one only another entry point of
+the module uses (0.25.2.2; before, every entry point of the module in
+the pipeline's stages added its bindings). So a bind group with an
+entry for every declared binding fails, and `gpu.layout` names the
+layout's bindings:
 
 ```text
-main.vl:135:17: gpu.layout: the layout has 2 bindings, 0 and 3, and binding 1 of the bind group does not fit them: ...
+main.vl:135:17: gpu.layout: the layout has 2 bindings, 0 and 3, and binding 1 of the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, ...
 ```
 
 `pipe.bind_layout(g).entries[i].binding` (i below `.count`) lists them.
@@ -466,16 +328,16 @@ and the kernel. The reasons:
   different entry points use them (`wgsl.binding: @group(0) @binding(0)
   is also 'a'`), so one module of many kernels needs a distinct binding
   for every buffer of every kernel.
-- The layout is the module's, so each kernel's bind group would need the
-  bindings the other kernels use.
-- One kernel per module keeps each kernel's bindings exactly what it
-  uses, and each bind group exactly those entries (the next example's
-  clear binds one buffer, the deposit two).
+- A kernel's own bind group then needs exactly what it uses, in either
+  shape (a pipeline's layout is its entry point's bindings): one module
+  of several kernels works too, each kernel with a group of its own
+  bindings (the next example's clear binds one buffer, the deposit
+  two).
 
 The helper the examples use: a compute pipeline from the module made of
 `parts` (a shared prefix and one kernel), its entry point `main`.
 
-```tach
+```vole
 use std::gpu;
 
 fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
@@ -496,7 +358,7 @@ IndexFormat::Uint16 or Uint32, offset)` and drawn with
 second range of `draw` and `draw_indexed` (`@builtin(instance_index)`,
 or a vertex buffer of `StepMode::Instance`).
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::{BufferUsage, Format, IndexFormat, PassDesc, TextureUsage, VertexFormat, VertexLayout};
 
@@ -561,12 +423,27 @@ padding written as zeros):
 | `array<T, N>` | T's | N x the stride (T's size rounded up to its align) |
 | `struct` | its largest member's | its members at their aligns, rounded up to its align |
 
+A uniform buffer is read only after something wrote it: `queue.write_buffer`
+(before the submit that reads it; its zeros from `dev.buffer` are no
+value), `dev.buffer_init(bytes, ..)`, a copy into it, or a kernel
+writing it as storage. A submit whose dispatch or draw reads one that
+nothing wrote stops at the `queue.submit` line (0.25.2.2; before, the
+kernel read zeros: a guard on `u.n` wrote nothing, silently):
+
+```text
+main.vl:52:5: gpu.unwritten: binding 0 of group 0 (a uniform buffer of 256 bytes) was never written: write it (queue.write_buffer) before submitting the first dispatch or draw that reads it ...
+```
+
+For the other bindings, a readback after the first step shows what a
+kernel saw (a storage buffer, `MAP_READ`, written from the uniform's
+fields), and `dev.buffer_init` gives a buffer its bytes when it is made.
+
 In a `var<uniform>`, an array's stride and a nested struct's offset are
 also multiples of 16 (`wgsl.layout`): use `vec4` elements, or move the
 data to a storage buffer. A uniform binding's offset is a multiple of
 `dev.align_uniform(1)` (256); `dev.align_uniform(n)` rounds a size up.
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::BufferUsage;
 
@@ -616,11 +493,47 @@ dimension of `dispatch` is at most
 `dev.limits().max_compute_workgroups_per_dimension` (65535): a large 1-D
 job is `dispatch(gx, gy)` with the index `id.y * gx * x + id.x`.
 
+## Buffer sizes
+
+A buffer is at most `dev.limits().max_buffer_size` bytes:
+`Limits::default()`'s 1 GiB, wgpu's model (its default is a size every
+adapter takes, 256 MiB there; more is asked for). Model weights of
+several GB ask for more when opening the device, up to the adapter's
+largest, `adapter.limits().max_buffer_size` (Metal's maxBufferLength,
+several GiB on Apple silicon); beyond it `device(lim)` stops with
+`gpu.limits` and both numbers. A buffer over the device's limit is
+`gpu.limits` at its `dev.buffer` line, with the size to ask for.
+
+```vole
+use std::gpu;
+use std::gpu::{BufferUsage, Limits};
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter()?;
+    var lim = Limits::default();
+    lim.max_buffer_size = 2 << 30; // 2 GiB
+    let (dev, var _queue) = adapter.device(lim)?;
+    println(f"{dev.limits().max_buffer_size >> 30} GiB, the adapter's {adapter.limits().max_buffer_size >= 2 << 30}");
+    let _small = dev.buffer(1 << 20, BufferUsage::STORAGE); // 1 MiB
+    Ok(())
+}
+```
+```out
+2 GiB, the adapter's true
+```
+
+`adapter.device(adapter.limits())` asks for all of it.
+
 ## Atomics
 
 Many invocations adding into one place (a histogram, particles
 depositing into a grid) need atomics: an `array<atomic<u32>>` (or
-`atomic<i32>`) in a `var<storage, read_write>`, changed with
+`atomic<i32>`) in a `var<storage, read_write>` (always `read_write`, even
+for a kernel that only `atomicLoad`s: WGSL allows atomics in no other
+storage access, since another invocation may write them meanwhile;
+`var<storage, read>` is `wgsl.type: atomics need 'var<storage,
+read_write>'`), changed with
 `atomicAdd(&a[i], v)`, `atomicSub`, `atomicMax`, `atomicMin`,
 `atomicExchange`, read with `atomicLoad` and set with `atomicStore`;
 `var<workgroup>` atomics too. A plain `a[i] = a[i] + 1u` from several
@@ -628,7 +541,7 @@ invocations loses updates. Clearing is a kernel of its own (or
 `queue.write_buffer` of zeros, or a `copy_buffer` from a zero buffer)
 before the next deposit; the CPU reads the buffer as plain `u32`s.
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::BufferUsage;
 
@@ -698,7 +611,12 @@ layouts: 2 and 1
 ```
 
 Dispatches in one compute pass run in order, each seeing the writes of
-the ones before (Metal's compute passes serialize them).
+the ones before (Metal's compute passes serialize them). Many
+dispatches in one `compute_pass` (and one submit) is the normal shape
+for a sequence of kernels, a model's layers or a simulation's steps:
+`set_pipeline` and `set_bind_group` between them are cheap, while a
+pass or a submit each costs more (an LLM's decoding gained about 10%
+from one pass a token instead of one a kernel).
 
 ## A compute simulation
 
@@ -719,7 +637,7 @@ The shape of a simulation step loop (particles, a fluid, a lattice):
   computed independently, element by element, not only a sum or a range
   (`guide testing#a-check-must-be-able-to-fail`).
 
-```tach
+```vole
 use std::gpu;
 use std::gpu::BufferUsage;
 
@@ -802,7 +720,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 std::gpu has no timestamp queries (no GPU-side clock): time the work on
 the CPU, around the submission and a wait for it to finish:
 
-```tach
+```vole
 use std::gpu;
 
 fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
@@ -844,10 +762,14 @@ the position in the WGSL, never a panic (`wgslc explain CODE`):
   `wgsl.recursion`, `wgsl.layout` (the uniform rules above),
   `wgsl.attr` (a workgroup size outside 1..1024), `wgsl.binding`, and
   the type and name errors of WGSL.
-- Names are never a problem: an identifier Metal keeps for itself
-  (`quad`, `float4`, `half`, `kernel`, `INFINITY`, `M_PI_F`, `assert`,
-  any C++ keyword) is renamed in the MSL; entry points keep their WGSL
-  names for `compute_pipeline` and `RenderDesc`.
+- Names are never a problem (0.25.2): an identifier Metal keeps for
+  itself (`quad`, `float4`, `half`, `kernel`, `INFINITY`, `M_PI_F`,
+  `assert`, `class`, `this`, `new`, `device`, any C++ keyword) is
+  renamed in the MSL (std::gpu::wgsl::msl's list), and WGSL's own
+  predeclared names (`array`, `vec4f`, `bitcast`) may be shadowed; entry
+  points keep their WGSL names for `compute_pipeline` and `RenderDesc`.
+  What is left to avoid is WGSL's keywords themselves (`fn`, `let`,
+  `var`, `loop`, `if`, `struct`, ...) and `_` alone: `wgsl.syntax`.
 - What Metal still rejects is a translator bug: `LINE:COL: error
   wgsl.target: Metal rejected the translation of fn NAME: ...` at that
   WGSL function, then Metal's log. Report it; rename or rewrite the
@@ -877,10 +799,11 @@ is (no adapter, a shader the driver rejects) is a `gpu::Error`.
 | `gpu.usage` | a buffer or texture used without the usage flag that allows it | add it at creation: `BufferUsage::STORAGE \| BufferUsage::COPY_SRC` |
 | `gpu.align` | offsets: 256 for uniform and storage bindings, 4 for copies; rows 256 | `dev.align_uniform(n)` |
 | `gpu.range` | an offset, size or draw range past its buffer or texture | the sizes |
-| `gpu.layout` | a bind group that does not match the pipeline's layout (the message names the layout's bindings) | make it from `pipe.bind_layout(i)`, one entry per binding the module uses |
+| `gpu.layout` | a bind group that does not match the pipeline's layout (the message names the layout's bindings) | make it from `pipe.bind_layout(i)`, one entry per binding the pipeline's entry points use |
 | `gpu.pipeline` | a draw or dispatch without a pipeline or a bind group it uses | `pass.set_pipeline`, `pass.set_bind_group` |
 | `gpu.format` | a format that does not fit: target, view, storage, shader kind | the pipeline's target format |
-| `gpu.limits` | a size or count above `dev.limits()` (what a shader asks, its workgroup size or bindings, is an `Err` instead) | smaller |
+| `gpu.limits` | a size or count above `dev.limits()` (what a shader asks, its workgroup size or bindings, is an `Err` instead); the message names the limit as `dev.limits().NAME` | smaller, or a larger `max_buffer_size` at `adapter.device(lim)` |
+| `gpu.unwritten` | a submit reads a uniform buffer nothing wrote (0.25.2.2) | `queue.write_buffer` before the submit, or `dev.buffer_init` |
 | `gpu.state` | a buffer used while mapped for writing | `buf.unmap(dev)` first |
 | `gpu.unsupported` | a capability the device lacks | check `dev.caps()` |
 

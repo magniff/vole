@@ -31,7 +31,7 @@ A parameter's convention says what the function does with the argument:
 | inout | `v: inout Vec<i64>` | may change it; the change reaches the caller | `fill(&v)`: `&` marks it |
 | sink | `v: sink Vec<i64>` | owns it (may change it, keeps or drops it) | `keep(v)`: v moves (a plain value is copied) |
 
-```tach
+```vole
 fn total(v: Vec<i64>) -> i64 {           // let: reads, no copy
     var s = 0;
     for x in v { s += x; }
@@ -146,7 +146,7 @@ returned out of the function that owns its memory (`own.escape`), or a
 `for` loop over a Vec that pushes to it, is an error, not undefined
 behaviour. Take the view again after the change, or keep an index:
 
-```tach
+```vole
 var v: Vec<i64> = Vec::new_in(gpa);
 v.push(1);
 let s = v.as_slice();

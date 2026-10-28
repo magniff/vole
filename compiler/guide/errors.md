@@ -24,7 +24,7 @@ error (short form, without the position), and the fix.
 
 ## Rust habits
 
-```tach
+```vole
 let s: String = String::new();
 ```
 ```err
@@ -35,7 +35,7 @@ takes an allocator: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`.
 A Rust type vole does not have gets the type to write as its `try:`:
 `char` (`u8`), `Box`, `Rc` (`*T`), `VecDeque`, `RefCell`.
 
-```tach
+```vole
 use std::cmp::max;
 ```
 ```err
@@ -48,7 +48,7 @@ std has a few of Rust's modules (0.20: `std::collections::HashMap`,
 `std::NAME` as well: `use std::{IoError, is_digit};` (`HashMap`,
 `read_line` and std's most used names are in the prelude: no `use`).
 
-```tach
+```vole
 fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
 ```
 ```err
@@ -67,7 +67,7 @@ parameter is read-only by default (let: `s: str`, `v: Vec<i64>`,
 nothing to write); `x: inout T` may change the caller's value, called
 with `&x`; `x: sink T` takes it. `*T` is the raw pointer.
 
-```tach
+```vole
 struct P { x: i64 }
 impl P { fn get(&self) -> i64 { self.x } }
 ```
@@ -77,7 +77,7 @@ error[parser error] expected identifier, got '&' | help: `self` for `&self`, `in
 `fn get(self) -> i64`; `fn bump(inout self)` to change it, `fn
 finish(sink self)` to take it (`self: *P` is the raw pointer).
 
-```tach
+```vole
 fn main() -> i32 { let mut x = 1; x += 1; x as i32 }
 ```
 ```err
@@ -89,7 +89,7 @@ replacement in its `try:` (`fix --suggested` makes them all): `&T` and
 access (`r`), `move ||` (`sink ||`), `static mut` (`static var`), `mut
 x: T` (`x: sink T`).
 
-```tach
+```vole
 fn main() -> i32 { var x = 1; let r = &mut x; 0 }
 ```
 ```err
@@ -98,7 +98,7 @@ error[conv.rust] '&mut x' is Rust's spelling; an inout argument (the callee may 
 `&x` lends `x` inout, to an `inout` parameter or an `inout r = &x;`
 local; nothing else takes `&`.
 
-```tach
+```vole
 println!("{}", 1);
 ```
 ```err
@@ -107,7 +107,7 @@ error[parser error] 'println!' is a macro call: vole has no macros | help: write
 `println(f"{x}")` (0.15, `volec guide formatting`). The help names
 what replaces `vec!`, `format!`, `assert!` and the others.
 
-```tach
+```vole
 'outer: for i in 0..3 { break 'outer; }
 ```
 ```err
@@ -116,7 +116,7 @@ error[tokenizer error] unterminated character literal | help: a label has no quo
 Labels have no quote: `outer: for i in 0..3 { break :outer; }` (the
 try: line is yours, respelled).
 
-```tach
+```vole
 let o: Option<i64> = Some(1);
 let Some(x) = o;
 ```
@@ -126,7 +126,7 @@ error[type error] refutable pattern in 'let'
 `let Some(x) = o else { return 1; };` (0.18.1, the else block must
 leave), or `let x = match o { Some(x) => x, None => 0 };`.
 
-```tach
+```vole
 let n = 5;
 let m = !n;
 ```
@@ -135,7 +135,7 @@ error[type error] expected 'bool', got 'i64'
 ```
 Bitwise not is `~n`.
 
-```tach
+```vole
 let big = i64::MAX();
 ```
 ```err
@@ -145,7 +145,7 @@ error[type error] no associated function 'MAX' in 'i64' | help: a constant, with
 other associated items. Floats have Rust's (0.25.2.1): `f64::EPSILON`,
 `f64::MAX`, `f64::NAN`, `f64::consts::PI` (`guide math`).
 
-```tach
+```vole
 let s = "add";
 match s { "add" => println("a"), _ => println("b") }
 ```
@@ -155,7 +155,7 @@ error[parser error] expected a pattern, got 'string literal'
 `if s == "add" { ... }`: patterns are integers, bytes, bools, variants,
 tuples.
 
-```tach
+```vole
 #[derive(PartialEq, Debug)]
 struct P { x: i64 }
 ```
@@ -165,7 +165,7 @@ error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Cl
 `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15): Eq is Rust's PartialEq
 and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
 
-```tach
+```vole
 fn f<T>(x: sink T) -> T where T: Ord { x }
 ```
 ```err
@@ -173,7 +173,7 @@ error[parser error] expected '{', got 'where'
 ```
 Bounds go in the list: `fn f<T: Ord>(x: T) -> T`.
 
-```tach
+```vole
 fn main() -> i32 {
     fn helper() -> i64 { 3 }
     helper() as i32
@@ -186,7 +186,7 @@ Move `helper` to the module level.
 
 ## Types
 
-```tach
+```vole
 let x = 1;
 x = 2;
 ```
@@ -195,7 +195,7 @@ error[type error] cannot assign to immutable variable 'x' | help: make it mutabl
 ```
 `var x = 1;`: a `let` binding does not change.
 
-```tach
+```vole
 let a: i64 = 1;
 let b: i32 = a;
 ```
@@ -206,7 +206,7 @@ Only widening is implicit (0.15: `i32` to `i64`, `u8` to `u32`, ...):
 narrowing is `a as i32`. The same for `1 + 1.0`, `u32` to `i32`, and
 for `main` returning an `i64` (`n as i32`).
 
-```tach
+```vole
 let b: u8 = 300;
 ```
 ```err
@@ -216,7 +216,7 @@ An unsuffixed literal takes the type the code around it gives: `if ok {
 line[i] } else { 0 }` is a `u8`, from the other branch; so are match arms
 and array elements beside a `u8`. Alone, a literal is `i64` (`f64`).
 
-```tach
+```vole
 const ORIGIN: (i64, i64) = (0, 0);
 fn main() -> i32 { 0 }
 ```
@@ -225,7 +225,7 @@ error[type error] constant 'ORIGIN' has type '(i64, i64)'; constants must be int
 ```
 `const GREETING: [u8] = "hello";` is a constant (0.14).
 
-```tach
+```vole
 let x = 1;
 if x { }
 ```
@@ -234,7 +234,7 @@ error[type error] expected 'bool', got 'i64'
 ```
 `if x != 0`.
 
-```tach
+```vole
 let a = 1;
 if 0 < a < 2 { }
 ```
@@ -243,7 +243,7 @@ error[parser error] comparison operators cannot be chained; use parentheses
 ```
 `if 0 < a && a < 2`.
 
-```tach
+```vole
 fn f() -> i64 { 1; }
 ```
 ```err
@@ -251,14 +251,14 @@ error[type error] function 'f' body has type '()', expected 'i64'
 ```
 The value is the last expression without `;`: `fn f() -> i64 { 1 }`.
 
-```tach
+```vole
 let x: i64;
 ```
 ```err
 error[parser error] 'let' without an initializer is not supported
 ```
 
-```tach
+```vole
 struct P { x: i64, y: i64 }
 fn make() -> P { P { x: 1 } }
 ```
@@ -266,7 +266,7 @@ fn make() -> P { P { x: 1 } }
 error[type error] missing field 'y' in struct 'P' constructor
 ```
 
-```tach
+```vole
 fn f(a: i64, b: i64) -> i64 { a + b }
 fn g() -> i64 { f(1) }
 ```
@@ -274,7 +274,7 @@ fn g() -> i64 { f(1) }
 error[type error] function 'f' expects 2 arguments, got 1
 ```
 
-```tach
+```vole
 enum E { A, B, C }
 fn f(e: E) -> i64 { match e { E::A => 1, E::B => 2 } }
 ```
@@ -285,7 +285,7 @@ The `try:` lists every missing pattern as an arm to paste (integers as
 ranges: `201..=255 => VALUE,`). An unreachable arm's help gives the line
 of the arm above that already matches all it matches.
 
-```tach
+```vole
 fn f() -> i64 { 1 }
 fn main() -> i32 { 0 }
 fn f() -> i64 { 2 }
@@ -297,7 +297,7 @@ The help says where the other one is, and the two `try:` lines delete
 either (`volec edit delete main.vl:3 main.vl`); to change an item
 in place, `volec edit replace f < new.vl` instead of adding a second.
 
-```tach
+```vole
 enum E { A(i64), B }
 fn f(e: E) -> i64 { match e { A(x) => x, B => 0 } }
 ```
@@ -306,7 +306,7 @@ error[type error] unknown variant 'A'
 ```
 `E::A(x)`, or `use E::{A, B};` once.
 
-```tach
+```vole
 enum Ev { Key { code: i64, shift: bool }, Quit }
 fn main() -> i32 {
     let e = Ev::Key(1, false);
@@ -319,7 +319,7 @@ error[type error] variant 'Ev::Key' has named fields; give them by name | try: E
 A struct-like variant (0.17) is built and matched by name, as in Rust:
 `Ev::Key { code: 1, shift: false }`, `Ev::Key { code, .. } => code`.
 
-```tach
+```vole
 enum Ev { Key { code: i64, shift: bool }, Quit }
 fn code(e: Ev) -> i64 {
     match e { Ev::Key { code } => code, Ev::Quit => 0 }
@@ -329,7 +329,7 @@ fn code(e: Ev) -> i64 {
 error[type error] the pattern of 'Ev::Key' does not mention field 'shift' | help: match it too, or end the pattern with '..' to leave the rest out | try: Ev::Key { code, .. }
 ```
 
-```tach
+```vole
 enum Ev { Key { code: i64, shift: bool }, Quit }
 fn code(e: Ev) -> i64 { e.code }
 ```
@@ -339,7 +339,7 @@ error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fi
 
 ## Slices, Vec, std
 
-```tach
+```vole
 var m: HashMap<i64, i64> = HashMap::new_in(gpa);
 let a = m[0];
 ```
@@ -350,7 +350,7 @@ error[type error] cannot index type 'HashMap<i64, i64>'
 their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
 `v.as_slice()[0]`, ..., checked.
 
-```tach
+```vole
 let n = 3;
 for x in n { }
 ```
@@ -362,7 +362,7 @@ an `iter` method returning one (`volec guide iterators`).
 
 A misspelt method, field or item gets the nearest name of its kind:
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 { var b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
@@ -373,7 +373,7 @@ An array, a Vec or a Buf goes where a slice of its elements does:
 `sum(a)` for `fn sum(s: [i64])` (0.20; `sum(&v)` for `s: inout [T]`).
 An array's length is `a.len()`.
 
-```tach
+```vole
 let e: IoError = IoError::Read;
 ```
 ```err
@@ -382,7 +382,7 @@ error[type error] unknown type 'IoError'
 `use std::IoError;` (the prelude's names need no import: `volec guide
 modules`).
 
-```tach
+```vole
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```
@@ -393,7 +393,7 @@ error[type error] the trait 'Hash' is not implemented for 'K' | help: required b
 
 ## Closures and iterators (0.14)
 
-```tach
+```vole
 let f = |x| x + 1;
 ```
 ```err
@@ -402,7 +402,7 @@ error[type error] cannot infer the type of closure parameter 'x'
 `|x: i64| x + 1`: in a `let`, nothing says what `x` is; as an argument
 for `F: Fn(i64) -> i64` or `fn(i64) -> i64` the type comes from there.
 
-```tach
+```vole
 fn run(f: fn(i64) -> i64) -> i64 { f(1) }
 fn main() -> i32 {
     let k = 2;
@@ -415,7 +415,7 @@ make the parameter generic
 A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
 F) -> i64`. One that captures nothing converts.
 
-```tach
+```vole
 fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { let x = 1; f(x) }
 fn main() -> i32 { apply(|a: *i64| 1); 0 }
 ```
@@ -426,7 +426,7 @@ A `*T` is a raw pointer, not a way to pass: a closure parameter is let
 as any other, so annotate the type the bound gives (`|a: i64|`), or
 leave it untyped.
 
-```tach
+```vole
 fn apply<F: Fn(i64)>(f: F) { f(1); }
 fn main() -> i32 {
     var total = 0;
@@ -440,7 +440,7 @@ FnMut
 `Fn` takes closures that assign no captured variable: bound `F:
 FnMut(i64)` (and take it `f: sink F`, which may be called).
 
-```tach
+```vole
 fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { f(1) }
 fn main() -> i32 {
     let f = {
@@ -458,7 +458,7 @@ The closure captures the `var j` inout, and `j` ends with the block:
 
 ## ?, conversions, arguments, formatting, derive (0.15)
 
-```tach
+```vole
 fn first(v: Option<i64>) -> i64 { let x = v?; x }
 ```
 ```err
@@ -468,7 +468,7 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `?` on an Option inside a function returning a Result needs the error:
 `v.ok_or(MyError::Missing)?`.
 
-```tach
+```vole
 use std::ParseIntError;
 enum AppError { Bad }
 fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
@@ -479,7 +479,7 @@ fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
 The help is the impl to add: `impl From<ParseIntError> for
 AppError { fn from(e: ParseIntError) -> AppError { ... } }`.
 
-```tach
+```vole
 struct M { m: i64 }
 impl Into<M> for i64 { fn into(self) -> M { M { m: self } } }
 ```
@@ -489,7 +489,7 @@ From
 Implement `From<i64> for M`; `Into` comes with it. `x.into()` needs the
 type it converts to: `let y: M = x.into();`.
 
-```tach
+```vole
 fn f(a: i64, b: i64) -> i64 { a + b }
 fn main() -> i32 { f(b: 1, 2) as i32 }
 ```
@@ -501,7 +501,7 @@ Named arguments follow the positional ones, in the parameters' order
 missing one without a default gets `try: f(1, b: VALUE)`, a misspelt
 name the nearest.
 
-```tach
+```vole
 trait T { fn f(x: i64 = 1) -> i64; }
 ```
 ```err
@@ -510,7 +510,7 @@ a default value is for a parameter of a function or an inherent method, not of a
 Defaults go on trailing parameters of `fn` items and inherent methods,
 not on trait or extern functions, closures or `fn` types.
 
-```tach
+```vole
 struct P { x: i64, y: i64 }
 fn main() -> i32 { let x = 1; let p = P { x, y }; p.x as i32 }
 ```
@@ -520,7 +520,7 @@ undefined variable 'y'
 The shorthand `P { x, y }` takes locals of the fields' names: write
 `y: VALUE`.
 
-```tach
+```vole
 #[derive(Debg)]
 struct P { x: i64 }
 ```
@@ -532,7 +532,7 @@ hand). Deriving a trait and implementing it too is a coherence error
 whose help is `remove Ord from #[derive]`; deriving `Eq` needs `==` on
 every field.
 
-```tach
+```vole
 struct P { x: i64 }
 fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
 ```
@@ -544,7 +544,7 @@ f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
 `#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
 fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 
-```tach
+```vole
 fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
 ```
 ```err
@@ -555,7 +555,7 @@ hole (the spec follows): parenthesize, `{(|x: i64| x + 1)(n)}`.
 
 ## Generics and traits
 
-```tach
+```vole
 fn biggest<T>(a: sink T, b: sink T) -> T { if a > b { a } else { b } }
 struct P { x: i64 }
 fn main() -> i32 { let p = biggest(P { x: 1 }, P { x: 2 }); 0 }
@@ -566,7 +566,7 @@ error[type error] comparison requires numeric type, got 'P' | note: in instantia
 A generic body is checked per use; the note names the instance.
 Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
 
-```tach
+```vole
 trait A { fn a(self) -> i64; fn b(self) -> i64; }
 struct S { }
 impl A for S { fn a(self) -> i64 { 1 } }
@@ -575,7 +575,7 @@ impl A for S { fn a(self) -> i64 { 1 } }
 error[type error] the impl of trait 'A' is missing 'b' | help: it has no default: write it in the impl
 ```
 
-```tach
+```vole
 trait A { fn a(self) -> i64; }
 fn f(x: &dyn A) -> i64 { 0 }
 ```
@@ -584,7 +584,7 @@ error[parser error] 'dyn' is a reserved keyword
 ```
 No trait objects: `fn f<T: A>(x: T)`, or an enum of the cases.
 
-```tach
+```vole
 struct K { n: i64 }
 impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
 fn main() -> i32 { 0 }
@@ -597,7 +597,7 @@ o: K) -> i64` (`*K` is a raw pointer).
 
 ## Modules and imports
 
-```tach
+```vole
 use std::*;
 ```
 ```err
@@ -605,7 +605,7 @@ error[module error] wildcard imports are not allowed
 ```
 `use std::{Buf, HashMap};`; `volec fix --only imports` writes them.
 
-```tach
+```vole
 mod m { pub fn helper() -> i64 { 1 } }
 fn main() -> i32 { helper() as i32 }
 ```
@@ -627,7 +627,7 @@ in main.vl. A module elsewhere (`crate::a::table`) is `unknown module
 stdin; the `mod` line that is there stays). A `mod` line for a file that
 is next to a submodule's file belongs in the root.
 
-```tach
+```vole
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
@@ -637,7 +637,7 @@ std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `volec
 guide std`.
 
-```tach
+```vole
 fn main() -> i32 { let total = 1; std::print_int(totl); 0 }
 ```
 ```err
@@ -647,7 +647,7 @@ A module and an item of the same name both work, as in Rust: after `mod
 eval; use eval::eval;`, `eval(x)` calls the function and `eval::NAME`
 goes through the module.
 
-```tach
+```vole
 mod m { fn hidden() -> i64 { 1 } }
 fn main() -> i32 { m::hidden() as i32 }
 ```
@@ -660,7 +660,7 @@ the reverse.
 
 ## unsafe
 
-```tach
+```vole
 extern "C" { fn abs(x: i32) -> i32; }
 fn main() -> i32 { abs(-3) }
 ```
@@ -671,7 +671,7 @@ error[unsafe] calling a C function is unsafe
 main.vl`, wraps every such place; the check hook prints it once at the
 head of its report, with how many errors it answers.
 
-```tach
+```vole
 fn helper() -> i64 { let v: Vec<i64> = Vec::new(); v.len() }
 fn main() -> i32 { helper() as i32 }
 ```
@@ -683,7 +683,7 @@ from here (this function's `gpa`, main's parameter, or one to add), and
 the `try:`, `volec fix --only alloc016 main.vl`, threads main's
 `gpa` down to every such call.
 
-```tach
+```vole
 struct P { x: i64 }
 fn main() -> i32 {
     var p = P { x: 1 };
@@ -699,7 +699,7 @@ A local declared `*P` holds a raw pointer. Use `p.x = 9;`, an inout
 local (`inout q = &p; q.x = 9;`, safe), or pass `&p` to a function
 taking `p: inout P`.
 
-```tach
+```vole
 struct P { x: i64 }
 fn one() -> i64 { 1 }
 fn get(n: i64, p: inout P) -> i64 { n + p.x }
@@ -715,7 +715,7 @@ unless something evaluated before it in the statement (`one()` here, a
 call) could see the difference: then name it first: `var t = P { x:
 one() }; get(one(), &t)`.
 
-```tach
+```vole
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
 fn main() -> i32 { let f = &factorial; f(5) as i32 }
 ```
@@ -726,7 +726,7 @@ A function's name is a `fn(i64) -> i64` value: `let f = factorial;`,
 then `f(5)`; `(*f)(5)` is `f(5)` too. `fix --suggested` drops the `&`
 (the `*`).
 
-```tach
+```vole
 fn first(p: *i64) -> i64 { p[1] }
 ```
 ```err
@@ -737,7 +737,7 @@ slice parameter (`v: Vec<i64>`, `v: inout Vec<i64>`) indexes its
 elements, checked and safe; through a `*T` it needs `unsafe`. To write
 one number for the caller, take `out: inout i64` and write `out = acc`.
 
-```tach
+```vole
 fn read(x: *i64) -> i64 { *x }
 ```
 ```err
@@ -749,7 +749,7 @@ A `*T` parameter is a raw pointer (0.18.1), as in Rust. Take it let,
 `unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
 method call and an index through it.
 
-```tach
+```vole
 unsafe fn danger() -> i64 { 1 }
 fn main() -> i32 { let f = danger; 0 }
 ```
@@ -758,7 +758,7 @@ error[unsafe] using an `unsafe fn` as a value is unsafe
 ```
 Call it in `unsafe`, or wrap it in a safe `fn`.
 
-```tach
+```vole
 fn main() -> i32 { std::print_cstr(c"x"); 0 }
 ```
 ```err
@@ -774,7 +774,7 @@ A parameter is let (read-only, the default), `inout` (it may change
 the caller's value: the call marks it `&x`) or `sink` (it takes the
 value). The call must say what the parameter says:
 
-```tach
+```vole
 struct P { x: i64 }
 fn bump(p: inout P) { p.x += 1; }
 fn main() -> i32 { var q = P { x: 1 }; bump(q); q.x as i32 }
@@ -786,7 +786,7 @@ error[conv.marker] 'q' is lent inout here (the callee may change it): mark it '&
 reads, the help's `volec refactor signature bump --convention p let`
 makes it a let parameter, with every call.
 
-```tach
+```vole
 fn total(v: Vec<i64>) -> i64 { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); total(&v) as i32 }
 ```
@@ -796,7 +796,7 @@ error[conv.marker_extra] '&' marks an argument the callee may change; 'v' is tak
 `total(v)`: a let parameter borrows `v` for the call, unmarked, and `v`
 stays the caller's.
 
-```tach
+```vole
 fn fill(v: Vec<i64>) { v.push(1); }
 ```
 ```err
@@ -807,7 +807,7 @@ A let parameter is read-only: take it `v: inout Vec<i64>` and call
 v inout`, changes both); a slice to sort in place is `s: inout [T]`,
 passed as `&v` or `&a[..]`.
 
-```tach
+```vole
 fn bump(n: inout i64) { n += 1; }
 fn main() -> i32 { let n = 1; bump(&n); n as i32 }
 ```
@@ -820,7 +820,7 @@ binding, a let parameter or receiver, or an immutable static are
 errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
 self`, `static var N`.
 
-```tach
+```vole
 fn keep(v: sink Vec<i64>) -> i64 { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
@@ -838,7 +838,7 @@ a `help:` with the fix and `try:` lines; `volec explain own.CODE` has
 each in full, `volec query own FILE:LINE:COL` the state of every
 local there.
 
-```tach
+```vole
 struct T { keys: Vec<i64> }
 impl T { fn rehash(inout self) { var old = self.keys; old.push(1); } }
 ```
@@ -888,7 +888,7 @@ prints, instead, the failing line and the calls that led to it
 wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
 (a signal, no message).
 
-```tach
+```vole
 enum Level { Low, High }
 
 fn main() -> i32 {

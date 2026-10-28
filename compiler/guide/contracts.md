@@ -7,7 +7,7 @@ release switch; `debug` clauses are the ones only test builds check.
 
 ## requires and ensures
 
-```tach
+```vole
 struct Stack { items: Vec<i64> }
 
 impl Stack {
@@ -82,7 +82,7 @@ bang spellings are accepted. Each operand is evaluated once; the
 message is `assertion failed: 'COND'` (or the message given) and the
 values:
 
-```tach
+```vole
 fn main() -> i32 {
     let k = std::parse_int("3").unwrap_or(0);
     assert_eq(k * 2, 6);

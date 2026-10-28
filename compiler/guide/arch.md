@@ -69,7 +69,7 @@ arguments and must be constants in the instruction's range:
 `vshrq_n_u8(v, 3)`, never Rust's `vshrq_n_u8::<3>(v)` (`arch.rust_form`
 says so, with the edit).
 
-```tach
+```vole
 use std::arch::aarch64::{vaddq_u8, vdupq_n_u8, vextq_u8, vgetq_lane_u8, vqsubq_u8};
 
 fn main() {
@@ -110,7 +110,7 @@ guard. `volec query features NAME` prints a function's requirement,
 `--why crc` the calls down to the intrinsic; `def`, `show` and `context`
 print it as `features: crc (inferred)` after its effects.
 
-```tach
+```vole
 use std::arch::aarch64::__crc32cb;
 use std::arch::detect;
 
@@ -180,7 +180,7 @@ hoisted out of loops). Inside, `has("dotprod")` is a constant per
 version, so it picks the code; a call only some versions can make must
 be under it (`arch.multiversion`). Its address can be taken.
 
-```tach
+```vole
 use std::arch::aarch64::{vaddvq_u32, vdotq_u32, vdupq_n_u32, vld1q_u8};
 use std::arch::has;
 
@@ -242,7 +242,7 @@ match" test for the loop. x86-64's `_mm_movemask_epi8` gives one bit a
 byte. Both branches can sit in one function: the other architecture's
 is checked and dropped.
 
-```tach
+```vole
 use std::arch::aarch64::{
     vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vmaxvq_u8, vreinterpret_u64_u8,
     vreinterpretq_u16_u8, vshrn_n_u16,
@@ -307,7 +307,7 @@ schedule four words at a time: the words of group g + 4 from those of
 groups g..g + 3. After the 16 groups the state adds the block's input
 state.
 
-```tach
+```vole
 use std::arch::aarch64::{
     uint32x4_t, vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8, vrev32q_u8, vsha256h2q_u32,
     vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
