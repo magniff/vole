@@ -28,9 +28,13 @@ small queries.
 
 ## The program
 
-Commands find the program's root file from `--root FILE`, a last
-argument ending in `.vl`, `$VOLE_ROOT`, or `./main.vl`. The other
-files are the modules it loads.
+Commands find the program's root file from `--root FILE` (or `--root
+DIR`: its main.vl), a last argument ending in `.vl`, `$VOLE_ROOT`, or
+`./main.vl`. The other files are the modules it loads. A FILE or
+FILE:LINE argument names its own program from anywhere (`volec query
+context examples/nes/check.vl:233` from the tree's root), and a NAME
+the program lacks gets a `try:` with the `--root` of the program
+under the current directory that defines it.
 
 ## Reading
 

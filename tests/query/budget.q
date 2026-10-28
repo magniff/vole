@@ -210,5 +210,5 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query examples [KIND...]   (items to start from for an "add an X" change; volec guide how)
 NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)
 --budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)
-ROOT: --root ROOT, a last argument ending in .vl, $VOLE_ROOT, ./main.vl, ./compiler/src/main.vl
+ROOT: --root ROOT|DIR, a last argument ending in .vl, $VOLE_ROOT, ./main.vl, ./compiler/src/main.vl; a FILE[:LINE] argument names its own program
 see docs/query.md and docs/refactor.md
