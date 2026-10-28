@@ -45,7 +45,8 @@ main.vl:22:16: pop on an empty stack: self.items.len() = 0
   drops and defers: a failure names the function. `result` is the value
   returned; `old(e)` is e evaluated at entry.
 - A failure reads `requires failed: 'COND' of 'f' (FILE:L:C): x = 4, ...`
-  (the integer operands' values). `else "text"` (or an f-string,
+  (the integer operands' values; a float's in millionths, `d = 707106e-6`,
+  0.25.2.1). `else "text"` (or an f-string,
   evaluated only on failure) replaces all before the values.
 - `debug requires` / `debug ensures` are checked only by `volec test`
   (and `--debug-contracts`): for conditions that cost more than the
