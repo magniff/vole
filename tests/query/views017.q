@@ -58,13 +58,9 @@ Vec<Ctl, ScopedArena>::as_slice	views(self) declared
 Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<State>::as_slice	views(self) declared
-Vec<Cmd>::as_slice	views(self) declared
-Vec<Arg>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
-Vec<Slot>::as_slice	views(self) declared
-Vec<str>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
 Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
@@ -113,14 +109,11 @@ Vec<u32>::push	views()
 Vec<Event>::push	views()
 Vec<State>::push	views()
 Vec<Watch>::push	views()
-Vec<Cmd>::push	views() stores(x) declared
-Vec<Arg>::push	views() stores(x) declared
 Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<(i64, u32)>::push	views()
 Vec<str>::push	views() stores(x) declared
 Vec<Path>::push	views() stores(x) declared
 Vec<Result<DirEntry, Error>>::push	views()
-Vec<Slot>::push	views() stores(x) declared
 $ views crate --why
 crate::first_word	views(s) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
@@ -140,7 +133,7 @@ std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count
 std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
 <std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
 <std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
-std::cli::Matches::count	../../compiler/std/cli.vl:824:12	method	pub fn count(self, name: str) -> i64
+std::cli::Matches::count	../../compiler/std/cli.vl:1409:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: volec query items

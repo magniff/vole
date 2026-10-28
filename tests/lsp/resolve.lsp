@@ -15,9 +15,9 @@
 > {"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":9}}}
 < {"jsonrpc":"2.0","id":4,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
 > {"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":20}}}
-< {"jsonrpc":"2.0","id":5,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":143,"character":11},"end":{"line":143,"character":18}}}}
+< {"jsonrpc":"2.0","id":5,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":321,"character":11},"end":{"line":321,"character":18}}}}
 > {"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":5,"character":20}}}
-< {"jsonrpc":"2.0","id":6,"result":{"contents":{"kind":"markdown","value":"```vole\npub struct Command\n```\n\nA program's command line: its name, arguments and subcommands. The\ntree is kept flat, every command in `cmds` (the first is this one) and\nevery argument in `args` with its command's index.\n\n`std::cli::Command` (struct)\n"},"range":{"start":{"line":5,"character":20},"end":{"line":5,"character":27}}}}
+< {"jsonrpc":"2.0","id":6,"result":{"contents":{"kind":"markdown","value":"```vole\npub struct Command<CA: Allocator = Gpa>\n```\n\nA program's command line: its name, arguments and subcommands. The\ntree is kept flat, every command in `cmds` (the first is this one) and\nevery argument in `args` with its command's index.\n\n`std::cli::Command` (struct)\n"},"range":{"start":{"line":5,"character":20},"end":{"line":5,"character":27}}}}
 > {"jsonrpc":"2.0","id":7,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":36}}}
 < {"jsonrpc":"2.0","id":7,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/thread.vl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
 > {"jsonrpc":"2.0","id":8,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":31}}}
@@ -69,11 +69,11 @@
 > {"jsonrpc":"2.0","id":30,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":76,"character":10}}}
 < {"jsonrpc":"2.0","id":30,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/thread.vl","range":{"start":{"line":195,"character":11},"end":{"line":195,"character":15}}}}
 > {"jsonrpc":"2.0","id":31,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":78,"character":23}}}
-< {"jsonrpc":"2.0","id":31,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":152,"character":11},"end":{"line":152,"character":17}}}}
+< {"jsonrpc":"2.0","id":31,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":332,"character":11},"end":{"line":332,"character":17}}}}
 > {"jsonrpc":"2.0","id":32,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":78,"character":40}}}
-< {"jsonrpc":"2.0","id":32,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":177,"character":11},"end":{"line":177,"character":14}}}}
+< {"jsonrpc":"2.0","id":32,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":380,"character":11},"end":{"line":380,"character":14}}}}
 > {"jsonrpc":"2.0","id":33,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":78,"character":49}}}
-< {"jsonrpc":"2.0","id":33,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":73,"character":11},"end":{"line":73,"character":15}}}}
+< {"jsonrpc":"2.0","id":33,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":159,"character":11},"end":{"line":159,"character":15}}}}
 > {"jsonrpc":"2.0","id":34,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":20}}}
 < {"jsonrpc":"2.0","id":34,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":107,"character":11},"end":{"line":107,"character":19}}}}
 > {"jsonrpc":"2.0","id":35,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":30}}}
