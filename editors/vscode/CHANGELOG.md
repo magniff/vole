@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased (vole 0.25.2)
+
+- Settings `vole.includePaths` (the build's `-I` directories, for
+  `import "header.h"`) and `vole.cSources` (the program's C files),
+  given to the server at the start and when they change.
+- From `volec lsp` 0.25.2: a file with no `main.vl` above it is checked
+  as a program of its own (its errors were not shown before); a file
+  that cannot be checked shows a note; go to definition on a C import's
+  string opens the header, on a name through its alias the header's
+  declaration (and a function's body in the C files); the hover shows
+  the C declaration.
+
 ## 0.25.1
 
 For vole 0.25.1.
