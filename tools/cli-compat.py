@@ -277,6 +277,15 @@ refactor extension .vl .vl
 refactor extension --bogus
 refactor extension -j
 refactor extension .vl .tl --dry-run main.vl
+check -I
+check -I inc main.vl
+check -Iinc main.vl
+check -I inc -Iother
+query refs report --root .
+query items stock.vl
+query def report main.vl:1
+test --root .
+probe --root . main.vl:1
 """.strip().split("\n")
 
 
