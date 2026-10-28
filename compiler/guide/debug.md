@@ -75,7 +75,7 @@ $ volec probe stats.vl:46 i m 'v[i]' --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
   #1  i = 1  m = 3  v[i] = 7
   #2  i = 1  m = 3  v[i] = 7
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
 ```
 
@@ -95,7 +95,10 @@ Values are printed by type. Integers, floats and bool print as values,
 element by element, pointers as addresses. A struct uses Debug when it
 has it, else prints field by field. The program is built from copies of
 its files with the probes written in (`--overlay`), so line numbers stay
-the same, and with `--trace`. Then it runs with `-- ARGS` and stdin from
+the same, and with `--trace`. The copies, the build and the outputs are
+never in the program's source tree: `target/scratch/probe/NAME/` of the
+checkout (NAME: the root's path, `-` for `/`), else
+`$TMPDIR/volec-probe/NAME/`; the copies are removed after the run. Then it runs with `-- ARGS` and stdin from
 `--input FILE` (or the command's own stdin), within `--timeout S` (10).
 The report lists each probe's count and values, then the exit status,
 the start of stdout and stderr.
@@ -114,7 +117,7 @@ its own flags:
 $ volec probe examples/nes/check.vl:235 mode1 prg power -- --check
 probe examples/nes/check.vl:235 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
   #1  mode1 = true  prg = true  power = true
-run: exit 0; stdout 1 line (examples/nes/.volec/probe/out)
+run: exit 0; stdout 1 line (target/scratch/probe/examples-nes-main.vl/out)
   | ok: 21 NES checks passed
 ```
 

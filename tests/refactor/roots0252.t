@@ -57,15 +57,23 @@ try: volec edit patch alpha/util.vl:2 --root alpha/main.vl --old 'let y = x + x;
 $ probe alpha/util.vl:2 x -- one two
 probe alpha/util.vl:2 (after `let y = x + x;`): 1 time
   #1  x = 21
-run: exit 0; stdout 1 line (alpha/.volec/probe/out)
+run: exit 0; stdout 1 line (target/scratch/probe/alpha-main.vl/out)
   | 48
 $ probe alpha/util.vl:3 y -- one two
 probe alpha/util.vl:3 (before `y`): 1 time
   #1  y = 42
-run: exit 0; stdout 1 line (alpha/.volec/probe/out)
+run: exit 0; stdout 1 line (target/scratch/probe/alpha-main.vl/out)
   | 48
 $ probe alpha/util.vl:5 t -- one two
 error probe.no-statement: alpha/util.vl:5 begins no statement and opens no block; a probe goes at a line that does
 try: volec probe --root alpha/main.vl alpha/util.vl:7 t -- one two
 try: volec probe --root alpha/main.vl alpha/util.vl:2 t -- one two
 [exit 1]
+## (0.25.2) The probes' copies are never in the source tree, and are gone
+## after the run (the build and outputs: target/scratch/probe/NAME/).
+% find . -name '*.probe' -o -name .volec | sort; ls -A alpha; ls target/scratch/probe/alpha-main.vl
+main.vl
+util.vl
+err
+out
+prog

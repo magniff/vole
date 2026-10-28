@@ -1221,8 +1221,10 @@ tests/refactor/testcmd.t has a transcript.
   from the powers of two each probe announces (`at least N`).
 - `volec reduce FILE --until 'CMD' [--out F] [--max-runs N]
   [--timeout S]` (tools/reduce.vl): delta debugging on lines; CMD
-  (`sh -c`, `{}` the candidate, which keeps FILE's name in
-  `.volec/reduce/`) exits 0 while the failure is there; each run in
+  (`sh -c`, `{}` the candidate, which keeps FILE's name in the
+  scratch directory: `target/scratch/reduce/` of the checkout, else
+  `$TMPDIR/volec-reduce/`; 0.25.2, never in the source tree) exits 0
+  while the failure is there; each run in
   a process group killed after S seconds (5).
 
 Codes: `probe.usage`, `probe.no-root`, `probe.no-file`,

@@ -33,7 +33,7 @@ $ probe stats.vl:46 i m 'v[i]' --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
   #1  i = 1  m = 3  v[i] = 7
   #2  i = 1  m = 3  v[i] = 7
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
   | a best 7
@@ -41,7 +41,7 @@ run: exit 0; stdout 4 lines (.volec/probe/out)
 $ probe stats.vl:44 v --input tests/crash.in
 probe stats.vl:44 (after `var m = v[0];`): 1 time
   #1  v = [3, 7]
-run: exit 101; stdout 1 line (.volec/probe/out)
+run: exit 101; stdout 1 line (target/scratch/probe/main.vl/out)
   | a best 7
 stderr:
   stats.vl:44:13: index out of bounds: index 0, length 0
@@ -52,7 +52,7 @@ $ probe stats.vl:35 i 'keys[i]' key 'values[i]' --input tests/ok.in --max 2
 probe stats.vl:35 (before `if keys[i] == key && values[i] > 0 {`): 9 times, the first 2 (--max N)
   #1  i = 0  keys[i] = "a"  key = "a"  values[i] = 3
   #2  i = 1  keys[i] = "b"  key = "a"  values[i] = 5
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
   | a best 7
@@ -60,7 +60,7 @@ run: exit 0; stdout 4 lines (.volec/probe/out)
 $ probe main.vl:24 i v --input tests/ok.in --max 1
 probe main.vl:24 (after `let v = stats::positive(gpa, values.as_slice(), ke...`): 3 times, the first 1 (--max N)
   #1  i = 0  v = [3, 7]
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
   | a best 7
@@ -70,7 +70,7 @@ probe main.vl:23 (each time round `while i < keys.len() {`): 3 times
   #1  i = 0
   #2  i = 1
   #3  i = 2
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
   | a best 7
@@ -79,7 +79,7 @@ run: exit 0; stdout 4 lines (.volec/probe/out)
 $ probe --count stats.vl:46 --count stats.vl:36 --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
 probe stats.vl:36 (before `out.push(values[i]);`): 5 times
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | b best 5
   | a best 7
@@ -89,7 +89,7 @@ run: exit 0; stdout 4 lines (.volec/probe/out)
 $ probe one.vl:8 p o t 'a[1..]' 'a[0] == a[0]' --root one.vl
 probe one.vl:8 (before `std::print_int(p.x);`): 1 time
   #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  a[1..] = [2, 3]  a[0] == a[0] = true
-run: exit 0; stdout 1 line (.volec/probe/out)
+run: exit 0; stdout 1 line (target/scratch/probe/one.vl/out)
   | 3
 ## mistakes
 $ probe stats.vl:1 x
