@@ -180,7 +180,7 @@ $ cat > count.vl <<'EOF'
 > }
 > EOF
 $ volec check count.vl
-count.vl:2:48: error[type error] undefined variable 'gpa'
+count.vl:2:48: error[type error] undefined variable 'gpa' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'count' and pass it down
 [exit 1]
 ```
 

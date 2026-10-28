@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.vl	6
-std	<std>	603
+std	<std>	605
 std::ops	<std>	5
 std::iter	<std>	68
 std::slice	<std>	37
@@ -25,6 +25,7 @@ std::io::buffered	<std>	37
 std::fmt	<std>	94
 std::num	<std>	83
 std::num::tables	<std>	4
+std::math	<std>	260
 std::convert	<std>	2
 std::clone	<std>	1
 std::random	<std>	17
@@ -43,7 +44,7 @@ std::sync::mpsc	<std>	24
 std::thread	<std>	43
 std::objc	<std>	50
 std::objc::foundation	<std>	67
-std::gpu	<std>	140
+std::gpu	<std>	160
 std::gpu::hal	<std>	7
 std::gpu::hal::metal	<std>	109
 std::gpu::hal::metal::bindings	<std>	776
@@ -74,7 +75,7 @@ std::fs	<std>	59
 std::env	<std>	21
 std::process	<std>	36
 std::window	<std>	48
-std::window::cocoa	<std>	115
+std::window::cocoa	<std>	130
 std::window::keys	<std>	27
 std::window::objc	<std>	88
 std::cli	<std>	109
