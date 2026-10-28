@@ -45,7 +45,8 @@ try:
     fdir = os.path.join(tmp, "fake")
     fake = os.path.join(fdir, "volec")
     write(fake, "#!/bin/sh\nif [ \"$1\" = test ]; then cat '%s/test.out'; exit 0; fi\n"
-                "cat '%s/check.out' >&2\n[ -s '%s/check.out' ] && exit 1\nexit 0\n" % (fdir, fdir, fdir))
+                "if [ \"$1\" = fmt ]; then [ -f '%s/fmt.bad' ] && exit 1; exit 0; fi\n"
+                "cat '%s/check.out' >&2\n[ -s '%s/check.out' ] && exit 1\nexit 0\n" % (fdir, fdir, fdir, fdir))
     os.chmod(fake, 0o755)
 
     def fake_says(check=(), test=""):
@@ -132,6 +133,57 @@ try:
                                  "tool_response": {"stdout": "deleted crate::f\tmain.vl\t-1 lines\n"}})
     out = hook("turn-end.py", dict(stop, cwd=other))[1]
     case("a root touched through cd", (reason(out) or "").split("\n")[0].endswith("main.vl: 1 error"), True)
+
+    # (0.25.2) The examples' checks: a checkout (git) with an example and
+    # its case; a fake tests/run.sh says what the case run prints.
+    co = os.path.join(tmp, "co")
+    write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {}\n")
+    write(os.path.join(co, "examples", "demo", "README.md"), "# demo\n")
+    write(os.path.join(co, "tests", "examples", "demo.test"), "// SOURCE: examples/demo/main.vl\n// EXPECT:\n")
+    write(os.path.join(co, "tests", "examples", "demo_help.test"), "// SOURCE: examples/demo/main.vl\n")
+    write(os.path.join(co, "tests", "run.sh"), "echo \"$3\" >>'%s/runs'\ncat '%s/run.out'\n"
+          "[ -s '%s/run.out' ] && exit 1\nexit 0\n" % (fdir, fdir, fdir))
+    git_env = dict(os.environ, GIT_COMMITTER_DATE="2001-01-01T00:00:00", GIT_AUTHOR_DATE="2001-01-01T00:00:00")
+    for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                                                 "-m", "start"]):
+        subprocess.run(["git", "-C", co] + args, env=git_env, capture_output=True)
+    ex_stop = dict(stop, session_id="ex", cwd=co)
+    fake_says([])
+    write(os.path.join(fdir, "run.out"), "")
+    case("examples: nothing changed, silent", hook("turn-end.py", ex_stop)[1], "")
+    write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {  }\n")
+    write(os.path.join(fdir, "fmt.bad"), "")
+    write(os.path.join(fdir, "run.out"), "FAIL example_demo:\n    stdout mismatch\n\ntests for x:\n  total 0 0 1\n")
+    st, out, ms = hook("turn-end.py", ex_stop)
+    case("examples: a changed example, unformatted and failing", (reason(out) or "").split("\n"),
+         ["turn-end: changed examples (examples/demo): 2 problems the suite would report",
+          "examples/demo/main.vl is not formatted; try: volec fmt examples/demo/main.vl",
+          "tests/run.sh example_demo fails:", "FAIL example_demo:", "    stdout mismatch"])
+    with open(os.path.join(fdir, "runs")) as fh:
+        case("examples: its cases run once, by their common name", fh.read(), "example_demo\n")
+    print(f"note: the turn-end hook with an example's checks takes {ms:.0f} ms (fakes)")
+    case("examples: the same state, not twice", hook("turn-end.py", ex_stop)[1], "")
+    os.remove(os.path.join(fdir, "fmt.bad"))
+    write(os.path.join(fdir, "run.out"), "")
+    write(os.path.join(co, "examples", "demo", "main.vl"), "fn main() {}\n")
+    case("examples: fixed, silent", hook("turn-end.py", ex_stop)[1], "")
+    subprocess.run(["git", "-C", co, "mv", "examples/demo", "examples/moved"], capture_output=True)
+    out = hook("turn-end.py", ex_stop)[1]
+    case("examples: moved without its cases", (reason(out) or "").split("\n"),
+         ["turn-end: changed examples (examples/moved): 3 problems the suite would report",
+          "tests/examples/demo.test names examples/demo/main.vl, which does not exist (moved? update its SOURCE line)",
+          "tests/examples/demo_help.test names examples/demo/main.vl, which does not exist (moved? update its SOURCE line)",
+          "examples/moved: no tests/examples/*.test has '// SOURCE: examples/moved/main.vl'"])
+    write(os.path.join(co, "examples", "moved", "README.md"), "# moved\n")
+    case("examples: VOLE_TURN_END_EXAMPLES=0, off", hook("turn-end.py", ex_stop, VOLE_TURN_END_EXAMPLES="0")[1], "")
+    subprocess.run(["git", "-C", co, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "moved"],
+                   capture_output=True)
+    write(os.path.join(co, "examples", "moved", "README.md"), "# moved\n\n")
+    subprocess.run(["git", "-C", co, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "readme"],
+                   capture_output=True)
+    out = hook("turn-end.py", ex_stop)[1]
+    case("examples: committed in this session, still seen", (reason(out) or "").split("\n")[0],
+         "turn-end: changed examples (examples/moved): 3 problems the suite would report")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

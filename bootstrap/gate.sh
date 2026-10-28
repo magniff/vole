@@ -580,7 +580,7 @@ note_of() {
     [ -f "$l" ] || return
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
-        suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
+        suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
         fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*)
             grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
@@ -629,6 +629,16 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;
     esac
+done
+# (0.25.2) The suites' skipped checks, with their reasons (a window test
+# without a display giving frames, ...): skipped is not passed.
+for s in $STEPS; do
+    case "$s" in suite-*|examples-checkalloc) ;; *) continue ;; esac
+    l="$RUN/$s.log"
+    [ -f "$l" ] && grep -q '^SKIP ' "$l" || continue
+    echo
+    echo "--- $s: skipped, not passed (log: $l)"
+    grep '^SKIP ' "$l" | head -20 | sed 's/^/    /'
 done
 [ $INSIDE -eq 1 ] || [ $FAILED -eq 0 ] || echo
 [ $FAILED -eq 0 ]

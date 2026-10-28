@@ -449,7 +449,9 @@ run_suite() { # <name> <tree> <tests> <dir> <bin>
         tail -40 "$4/tests.log" >&2
         die "$1: test suite failed (log: $4/tests.log)"
     fi
-    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" }' "$4/tests.log")
+    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$4/tests.log")
+    # (0.25.2) skipped is not passed: the reasons, where they are seen
+    grep '^SKIP ' "$4/tests.log" | sed "s/^/  $1: /" || true
 }
 
 SUMMARY="$WORK/summary"

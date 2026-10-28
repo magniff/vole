@@ -17,6 +17,7 @@
     if (key == "ARGS") args = value
     else if (key == "STDIN") stdin = stdin (nstdin++ ? "\n" : "") value
     else if (key == "EXPECT") expect = expect (nexpect++ ? "\n" : "") value
+    else if (key == "EXPECT-PPM") ppms = ppms value "\n"
     else if (key == "EXIT") exitcode = value + 0
     else if (key == "STDERR") stderrs = stderrs value "\n"
     else if (key == "ERROR") errors = errors value "\n"
@@ -51,6 +52,7 @@ END {
     printf "%s", args > (dir "/args")
     printf "%s", stdin > (dir "/stdin")
     printf "%s", expect > (dir "/expect")
+    printf "%s", ppms > (dir "/ppms")
     printf "%d", exitcode > (dir "/exit")
     printf "%s", stderrs > (dir "/stderrs")
     printf "%s", errors > (dir "/errors")
