@@ -289,7 +289,7 @@ while read -r f; do
         g=""
         [ "$o" = "$og" ] || g=-g
         read -r _ <&3
-        ( check "$f" "$o" "$WORK/$n" $g >"$WORK/$n.result"; echo >&3 ) &
+        ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$f" "$o" "$WORK/$n" $g >"$WORK/$n.result" ) &
     done
 done <"$list"
 wait

@@ -1927,10 +1927,12 @@ failed. Its logs are in `target/gate/<date>/` (`target/gate/last`), one
 file per step.
 
 ```
-$ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz
+$ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz, linux-smoke
 $ bootstrap/gate.sh                    # every step, modest fuzz counts
 $ bootstrap/gate.sh --release          # every step, the release's fuzz counts
-$ bootstrap/gate.sh --no-linux         # without the containers
+$ bootstrap/gate.sh --no-linux         # without the containers (--quick: without linux-smoke)
+$ bootstrap/gate.sh --quick --no-wait  # fail at once if another gate runs, rather than wait for it
+$ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps
 $ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
@@ -1988,9 +1990,52 @@ section and the name that pull it in, and `tests/std/core_sections.sh`,
 run by the suite, bounds their bytes); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
-the chain's compiler cross-compiles the tree). Inside each container the
-same steps run at once (`gate.sh --inside`), and their rows appear in the
-table under the container's. `bench` runs alone, at the end: benchmarks
+the chain's compiler cross-compiles the tree; 0.25.2: the suite at -O0
+and -O2, not -O1: the optimizer is the same for every target and -O1
+runs on macOS, while what is Linux's own, the ABI, libc and the link,
+-O0 and -O2 exercise; the three suites, objcheck and fuzz beside them
+made the row the gate's longest, 140 minutes). Inside each container the
+same steps run at once (`gate.sh --inside`), the longest started first,
+and their rows appear in the table under the container's.
+
+(0.25.2) `--quick` has a container row too, `linux-smoke`
+(`aarch64-linux-check.sh --smoke`): agents' quick gates passed on macOS
+while the tree failed in the container, which the release gate found 2.5
+hours in. The chain's compiler cross-compiles the tree, and in the
+container, after the fixpoint and the md5 check, the `smoke-*` steps
+run at -O2: `smoke-runner` (`tests/run.sh runner`: tests/runner/run.sh
+and the runner_* cases), `smoke-lsp`, `smoke-examples` (`example_build`:
+every example builds), `smoke-cases` (`tests/run.sh _`: every case,
+2,800 programs) and `smoke-walkthrough` and `smoke-book` (sessions that
+differed on Linux before). Not query's and refactor's transcripts (serial:
+6 and 8 minutes beside the rest), nor the formatter's: the full gate's
+container runs them. It runs beside the macOS steps, about 3 minutes on
+an idle machine. When docker is not running the row is `SKIP` (not pass), its note
+`colima is not running: colima start` — never a pass; `--no-linux` leaves
+it out, `--quick --no-x86` keeps it (x86_64 is another matter).
+
+(0.25.2) One gate at a time, across the worktrees of the repository: a
+gate takes the lock directory `gate.lock` in the git common dir (`git
+rev-parse --git-common-dir`), its `owner` file naming the gate (pid, the
+process's start time, worktree, arguments). A second gate prints one
+line, `gate: waiting for the gate in WORKTREE (pid N, since T, gate.sh
+ARGS): one gate at a time`, and starts when the first ends; with
+`--no-wait` it fails (exit 3) instead. A lock whose holder is gone (no
+such process, or another one with its pid) is taken over, saying so.
+Seven agents' gates and suites at once had put the load at 100 to 167 on
+12 cores. `bootstrap.sh --dev` and `tests/run.sh` take no lock (the
+inner loop); nor does the gate inside a container.
+
+(0.25.2) No silent hang: a release gate waited 2.5 hours on two runners
+blocked reading the slot FIFO, every slot lost with jobs killed before
+they gave theirs back. Every runner's job now gives its slot back
+however it ends (a trap on EXIT, and on HUP, INT and TERM), and the gate
+checks its steps (every 15 s; not the containers' rows, whose work is in
+the VM — the gate inside a container checks its own): a step none of
+whose processes used the CPU, started or ended for `$VOLE_GATE_STALL`
+seconds (default 600; `sleep` does not count) is stopped and fails, its
+note `stalled: ... with F of J slots free` (0 free: slots lost, e.g. a
+job killed with -9). `bench` runs alone, at the end: benchmarks
 need an idle machine.
 
 (0.15) x86_64 is off by default: `bootstrap/gate.conf` sets `X86=0`, so

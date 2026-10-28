@@ -11,10 +11,13 @@
 # usage: bootstrap/gate.sh [--quick | --release] [options]
 #
 #   --quick          a developer's smoke test (a few minutes): the chain,
-#                    the suite at -O2, a short fuzz; no containers
+#                    the suite at -O2, a short fuzz, and (0.25.2) the
+#                    linux-smoke row: the compiler cross-built for
+#                    aarch64-linux and a slice of the suite in the
+#                    container (SKIP, saying so, when colima is not running)
 #   (default)        every step, with modest fuzz counts
 #   --release        every step, with the release's fuzz counts
-#   --no-linux       without the containers
+#   --no-linux       without the containers (and without linux-smoke)
 #   --no-x86         without x86_64 (the x86_64-linux container); the
 #                    default since 0.15, set in bootstrap/gate.conf (X86=0)
 #                    or by $VOLE_GATE_X86 (0 or 1)
@@ -35,7 +38,14 @@
 #   --fresh          the x86_64-linux chain without its cache (a docker
 #                    volume): from nothing, as on a new machine
 #   -c COMPILER      test this compiler instead of building one (no chain)
-#   --list           print the steps and exit
+#   --no-wait        (0.25.2) fail at once when another gate of this
+#                    repository runs, instead of waiting for it (one gate at
+#                    a time, across all its worktrees: a lock directory in
+#                    the git common dir, gate.lock; a dead holder's lock is
+#                    taken over)
+#   --list           print the steps, in the order they start, and exit
+#   --self-test      check the gate's own machinery (the lock, the stall
+#                    check, the steps of each mode) and exit
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
@@ -69,7 +79,22 @@
 # rebuilt from their tags into an empty cache, compared with
 # bootstrap/chain-hashes/, 0.25; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
-# (bootstrap/aarch64-linux-check.sh); bench.
+# (bootstrap/aarch64-linux-check.sh: in the container, the fixpoint,
+# the suite at -O0 and -O2 (0.25.2: not -O1; the optimizer is the same
+# for every target and -O1 runs on macOS, while what is Linux's own, the
+# ABI, libc and the link, -O0 and -O2 exercise), fuzz, ABI, objcheck,
+# debug, (--release) valgrind; the longest started first);
+# linux-smoke (0.25.2, --quick: aarch64-linux-check.sh --smoke, the
+# cross-built compiler on the container's smoke-* steps: the runner's
+# self-test, the language server, the examples' builds, every case and
+# the walkthroughs' and book's sessions; a few minutes beside the macOS
+# steps); bench.
+#
+# (0.25.2) One gate at a time: a second one waits for the first, saying
+# whose it is (or, with --no-wait, fails). A step whose processes neither
+# use the CPU nor change for $VOLE_GATE_STALL seconds (default 600) is
+# stopped and fails, with the free slots of the pool: a hang (a slot lost
+# by a killed job) is reported, not waited for.
 #
 # Logs: target/gate/<date>/ (target/gate/last), one STEP.log per step;
 # failing random programs are kept in failures/STEP/ there.
@@ -88,6 +113,7 @@ VOLE_CODE_CACHE=off
 export VOLE_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+GATE_ARGS="$*"
 MODE=default
 # (0.16) Each test program may run for a minute, not 20 s: the gate runs
 # its steps side by side with the containers, and the heavier examples
@@ -114,6 +140,8 @@ COMPILER=""
 INSIDE=0
 SEED_BIN=""
 LIST=0
+NO_WAIT=0
+SELF_TEST=0
 
 die() {
     echo "gate: error: $*" >&2
@@ -145,7 +173,9 @@ while [ $# -gt 0 ]; do
         --seed) [ $# -ge 2 ] || die "--seed needs a binary"; SEED_BIN=$2; shift ;;
         --inside) INSIDE=1; LINUX=0 ;;
         --list) LIST=1 ;;
-        -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-wait) NO_WAIT=1 ;;
+        --self-test) SELF_TEST=1 ;;
+        -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
@@ -203,11 +233,20 @@ HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
+# (0.25.2) --quick's container row, and the steps it runs in the
+# container (gate.sh --inside --only 'smoke-*'; run_step says what they
+# are)
+SMOKE_STEPS="linux-smoke"
+INSIDE_SMOKE_STEPS="smoke-runner smoke-lsp smoke-examples smoke-cases smoke-walkthrough smoke-book"
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
-OTHER_STEPS="valgrind"
+OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
+# (the self-test's steps, only for it)
+[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
-    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost" ;;
+    quick)
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost"
+        [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
 [ "$MODE" != release ] || STEPS="$STEPS $RELEASE_STEPS"
@@ -216,7 +255,7 @@ if [ -n "$ONLY" ]; then
     # not file names)
     set -f
     selected=""
-    for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
+    for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $SMOKE_STEPS $OTHER_STEPS bench; do
         for p in $(echo "$ONLY" | tr ',' ' '); do
             # shellcheck disable=SC2254
             case "$s" in $p) selected="$selected $s"; break ;; esac
@@ -225,7 +264,7 @@ if [ -n "$ONLY" ]; then
     for p in $(echo "$ONLY" | tr ',' ' '); do
         [ "$p" = chain ] && continue
         found=0
-        for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
+        for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $SMOKE_STEPS $OTHER_STEPS bench; do
             # shellcheck disable=SC2254
             case "$s" in $p) found=1 ;; esac
         done
@@ -246,12 +285,176 @@ if [ -z "$COMPILER" ]; then
     [ $BENCH -eq 1 ] && CHAIN=1
     case ",$ONLY," in *,chain,*) CHAIN=1 ;; esac
 fi
+# (0.25.2) The longest steps first: the containers' rows, then the
+# runners with the most work (in the aarch64-linux container objcheck and
+# the suites were its critical path); the rest after them.
+LONG_FIRST="linux-aarch64 linux-smoke objcheck suite-O0 suite-O2 suite-O1 valgrind smoke-cases smoke-book compiler-memcheck stress-grow examples-checkalloc"
+ORDERED=""
+for s in $LONG_FIRST; do
+    case " $STEPS " in *" $s "*) ORDERED="$ORDERED $s" ;; esac
+done
+for s in $STEPS; do
+    case " $LONG_FIRST " in *" $s "*) ;; *) ORDERED="$ORDERED $s" ;; esac
+done
 if [ $LIST -eq 1 ]; then
+    # (in the order they start)
     [ $CHAIN -eq 1 ] && echo chain
-    for s in $STEPS; do echo "$s"; done
+    for s in $ORDERED; do echo "$s"; done
     [ $BENCH -eq 1 ] && echo bench
     exit 0
 fi
+
+# ---- The gate's own checks (--self-test) ----
+
+# (0.25.2) The lock, the stall check and the steps of each mode, each
+# checked on gates of the self-test's steps (selftest-*, a few seconds)
+# with a lock and run directories of their own.
+self_test() {
+    st=$(mktemp -d "${TMPDIR:-/tmp}/vole-gate-selftest.XXXXXX") || exit 2
+    trap 'rm -rf "$st"' EXIT
+    st_failed=0
+    st_row() { printf '  %-28s %s\n' "$1" "$2"; case "$2" in FAIL*) st_failed=1 ;; esac; }
+    g() { VOLE_GATE_SELFTEST=1 VOLE_GATE_LOCK="$st/gate.lock" VOLE_GATE_RUNS="$st/runs" sh "$0" -c /bin/sh "$@"; }
+    echo "gate: self-test (in $st)"
+    # The steps of each mode.
+    q=$(sh "$0" --quick --no-x86 --list | tr '\n' ' ')
+    case " $q " in *" linux-smoke "*) st_row "quick has linux-smoke" pass ;; *) st_row "quick has linux-smoke" "FAIL: $q" ;; esac
+    q=$(sh "$0" --quick --no-linux --list | tr '\n' ' ')
+    case " $q " in *" linux-smoke "*) st_row "--no-linux drops it" "FAIL: $q" ;; *) st_row "--no-linux drops it" pass ;; esac
+    q=$(sh "$0" --release --list | tr '\n' ' ')
+    case " $q " in
+        *" linux-smoke "*) st_row "release: no linux-smoke" "FAIL: $q" ;;
+        *" linux-aarch64 "*) st_row "release: no linux-smoke" pass ;;
+        *) st_row "release: no linux-smoke" "FAIL: no linux-aarch64: $q" ;;
+    esac
+    # A second gate waits for the first, saying whose it is, then runs.
+    g --only selftest-sleep >"$st/a.out" 2>&1 &
+    first=$!
+    i=0
+    while [ ! -f "$st/gate.lock/owner" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    # (the first gate's pid, as its lock says)
+    a=$(sed -n 's/^pid=//p' "$st/gate.lock/owner")
+    if g --no-wait --only selftest-sleep >"$st/nowait.out" 2>&1; then
+        st_row "--no-wait while held" "FAIL: it ran"
+    elif grep -q "pid $a" "$st/nowait.out"; then
+        st_row "--no-wait while held" "pass ($(head -1 "$st/nowait.out" | cut -c1-60)...)"
+    else
+        st_row "--no-wait while held" "FAIL: $(head -1 "$st/nowait.out")"
+    fi
+    if g --only selftest-sleep >"$st/b.out" 2>&1 && grep -q "waiting for the gate .*pid $a" "$st/b.out"; then
+        st_row "a second gate waits" pass
+    else
+        st_row "a second gate waits" "FAIL: $(head -3 "$st/b.out" | tr '\n' ' ')"
+    fi
+    wait $first || st_row "the first gate" "FAIL: $(tail -3 "$st/a.out" | tr '\n' ' ')"
+    [ ! -d "$st/gate.lock" ] && st_row "the lock is released" pass || st_row "the lock is released" "FAIL: $st/gate.lock is left"
+    # A dead holder's lock is taken over.
+    sh -c 'exit 0' &
+    dead=$!
+    wait $dead
+    mkdir "$st/gate.lock"
+    printf 'pid=%s\nstart=gone\nworktree=/nowhere\nargs=--quick\n' "$dead" >"$st/gate.lock/owner"
+    if g --no-wait --only selftest-sleep >"$st/stale.out" 2>&1 && grep -q 'took over' "$st/stale.out"; then
+        st_row "a dead holder's lock" pass
+    else
+        st_row "a dead holder's lock" "FAIL: $(head -3 "$st/stale.out" | tr '\n' ' ')"
+    fi
+    # Without docker running, linux-smoke is a skip that says so.
+    mkdir "$st/bin"
+    printf '#!/bin/sh\necho "Cannot connect to the Docker daemon" >&2\nexit 1\n' >"$st/bin/docker"
+    chmod +x "$st/bin/docker"
+    if PATH="$st/bin:$PATH" g --only linux-smoke >"$st/nodocker.out" 2>&1 \
+        && grep -q 'linux-smoke .*SKIP .*colima is not running: colima start' "$st/nodocker.out"; then
+        st_row "no docker: linux-smoke skips" pass
+    else
+        st_row "no docker: linux-smoke skips" "FAIL: $(grep 'linux-smoke ' "$st/nodocker.out" | tail -1)"
+    fi
+    # A slot lost by a killed job: the step waiting for it is stopped and
+    # fails, and the gate ends.
+    s0=$(date +%s)
+    VOLE_GATE_STALL=4 g -j 1 --only selftest-leak,selftest-slow >"$st/leak.out" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q 'selftest-leak .*FAIL' "$st/leak.out" && grep -q 'stalled' "$st/leak.out" \
+        && grep -q 'selftest-slow .*pass' "$st/leak.out"; then
+        st_row "a lost slot is reported" "pass (in $(( $(date +%s) - s0 )) s)"
+    else
+        st_row "a lost slot is reported" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/leak.out" | tr '\n' ' ')"
+    fi
+    if [ $st_failed -eq 0 ]; then echo "gate: self-test: ok"; else echo "gate: self-test: FAIL (outputs in $st)"; trap - EXIT; fi
+    exit $st_failed
+}
+[ $SELF_TEST -eq 0 ] || self_test
+
+# ---- One gate at a time ----
+
+# (0.25.2) A lock directory for all the worktrees of the repository (in
+# the git common dir): its owner file names the gate holding it (pid, the
+# process's start time, worktree, arguments). Another gate waits for it,
+# saying whose it is, or with --no-wait fails; a lock whose holder is gone
+# (no such process, or another process with its pid) is taken over. Not
+# taken inside a container, nor by bootstrap.sh --dev (the inner loop).
+LOCK=${VOLE_GATE_LOCK:-}
+if [ -z "$LOCK" ]; then
+    common=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [ -n "$common" ]; then LOCK="$common/gate.lock"; else LOCK="$ROOT/target/gate.lock"; fi
+fi
+LOCK_HELD=0
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g; s/^ //; s/ $//'; }
+owner_field() { sed -n "s/^$1=//p" "$LOCK/owner" 2>/dev/null | head -1; }
+# The holder is alive: its pid runs, and is the same process.
+holder_alive() { # <pid> <start>
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+    [ "$2" = "$(proc_start "$1")" ]
+}
+release_lock() {
+    [ $LOCK_HELD -eq 1 ] && [ "$(owner_field pid)" = $$ ] && rm -rf "$LOCK"
+    LOCK_HELD=0
+}
+take_lock() {
+    tl_said=""
+    tl_since=$(date +%s)
+    tl_missing=0
+    mkdir -p "$(dirname "$LOCK")"
+    while :; do
+        if mkdir "$LOCK" 2>/dev/null; then
+            printf 'pid=%s\nstart=%s\nworktree=%s\nsince=%s\nargs=%s\n' $$ "$(proc_start $$)" "$ROOT" \
+                "$(date '+%H:%M:%S')" "$GATE_ARGS" >"$LOCK/owner.new" && mv "$LOCK/owner.new" "$LOCK/owner"
+            LOCK_HELD=1
+            [ -z "$tl_said" ] || echo "gate: the lock is ours, after $(( $(date +%s) - tl_since )) s"
+            return 0
+        fi
+        pid=$(owner_field pid)
+        if [ -z "$pid" ]; then
+            # (being written; or its gate died before writing it)
+            tl_missing=$((tl_missing + 1))
+            if [ $tl_missing -ge 3 ]; then
+                mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null && rm -rf "$LOCK.stale.$$"
+                echo "gate: took over the lock $LOCK (no owner)"
+                tl_missing=0
+            fi
+            sleep 2
+            continue
+        fi
+        tl_missing=0
+        who="the gate in $(owner_field worktree) (pid $pid, since $(owner_field since), gate.sh $(owner_field args))"
+        if ! holder_alive "$pid" "$(owner_field start)"; then
+            # (moved away first, so only one of several waiters takes it;
+            # the owner checked again, the lock may have just changed hands)
+            if [ "$(owner_field pid)" = "$pid" ] && mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+                rm -rf "$LOCK.stale.$$"
+                echo "gate: took over the lock of $who: it is gone"
+            fi
+            continue
+        fi
+        [ $NO_WAIT -eq 0 ] || { echo "gate: error: $who holds the gate lock ($LOCK); without --no-wait this waits for it" >&2; exit 3; }
+        if [ "$tl_said" != "$pid" ]; then
+            echo "gate: waiting for $who: one gate at a time ($LOCK; --no-wait fails instead)"
+            tl_said=$pid
+        fi
+        sleep 3
+    done
+}
+[ $INSIDE -eq 1 ] || { take_lock; trap release_lock EXIT; }
 
 # ---- The run's directory, the slots ----
 
@@ -259,10 +462,10 @@ if [ $INSIDE -eq 1 ]; then
     RUN="$ROOT/target/gate/inside"
     rm -rf "$RUN"
 else
-    RUN="$ROOT/target/gate/$(date +%Y%m%d-%H%M%S)"
+    RUN="${VOLE_GATE_RUNS:-$ROOT/target/gate}/$(date +%Y%m%d-%H%M%S)"
 fi
 mkdir -p "$RUN"
-[ $INSIDE -eq 1 ] || ln -sfn "$(basename "$RUN")" "$ROOT/target/gate/last"
+[ $INSIDE -eq 1 ] || ln -sfn "$(basename "$RUN")" "${VOLE_GATE_RUNS:-$ROOT/target/gate}/last"
 rm -f "$RUN/jobs"
 mkfifo "$RUN/jobs"
 exec 9<>"$RUN/jobs"
@@ -437,9 +640,49 @@ run_step() {
         linux-aarch64)
             command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 \
                 || { echo "docker is not running (start it, e.g. colima start; or --no-linux)"; return 1; }
+            # (0.25.2) the suite at -O0 and -O2, not -O1: the optimizer is
+            # the same for every target and -O1 runs on macOS; what is
+            # Linux's own (the ABI, libc, the link) -O0 and -O2 exercise.
+            # It was a third of the row, the gate's longest.
             sh "$ROOT/bootstrap/aarch64-linux-check.sh" --worktree --dev --compiler "$C" --cpus "$CPUS" \
-                --all-levels --fuzz="$AFZ" --abi="$AAB" --objcheck --debugger \
+                --levels=0,2 --fuzz="$AFZ" --abi="$AAB" --objcheck --debugger \
                 $([ "$MODE" = release ] && echo --valgrind) </dev/null ;;
+        linux-smoke)
+            # (0.25.2) --quick's look at Linux: the compiler cross-built for
+            # aarch64-linux, then in the container the smoke-* steps (no
+            # fixpoint, no fuzz: the full gate's linux-aarch64 has them).
+            # Not run is said, not passed.
+            command -v docker >/dev/null 2>&1 \
+                || { echo "docker is not installed (brew install colima docker; colima start)"; return 77; }
+            docker info >/dev/null 2>&1 || { echo "colima is not running: colima start"; return 77; }
+            sh "$ROOT/bootstrap/aarch64-linux-check.sh" --worktree --dev --compiler "$C" --cpus "$CPUS" \
+                --smoke </dev/null ;;
+        # (0.25.2) linux-smoke's steps, in the container, at -O2: the test
+        # runner's own checks (tests/runner/run.sh, the runner_* cases),
+        # the language server's sessions, every example built
+        # (example_build), every case (all their names have a `_`: 2,800
+        # programs, about a minute) and the walkthroughs' and the book's
+        # sessions, which differed on Linux before. Not query's and
+        # refactor's transcripts (serial, 6 and 8 minutes beside the rest),
+        # the formatter's (the same on every host) or the other tools'
+        # small suites: the full gate's linux-aarch64 runs them.
+        smoke-runner) sh "$ROOT/tests/run.sh" -c "$C" -O 2 runner ;;
+        smoke-lsp) sh "$ROOT/tests/run.sh" -c "$C" -O 2 lsp ;;
+        smoke-examples) sh "$ROOT/tests/run.sh" -c "$C" -O 2 example_build ;;
+        smoke-cases) sh "$ROOT/tests/run.sh" -c "$C" -O 2 _ ;;
+        smoke-walkthrough|smoke-book) sh "$ROOT/tests/run.sh" -c "$C" -O 2 "${1#smoke-}" ;;
+        # (the self-test's steps: a few seconds; a slot taken and never
+        # given back, as by a job killed with -9; a step busy for a while)
+        selftest-sleep) sleep 3; echo "selftest: slept 3 s" ;;
+        selftest-leak)
+            exec 3<>"$VOLE_JOBSERVER"
+            read -r _ <&3
+            echo "selftest: took the slot, and wait for another"
+            read -r _ <&3 ;;
+        selftest-slow)
+            e=$(( $(date +%s) + 7 ))
+            while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e6) i++ }'; done
+            echo "selftest: busy, done" ;;
         bench)
             previous=$(find_previous)
             seed=$(find_seed)
@@ -457,23 +700,126 @@ STARTED=""
 REPORTED=""
 
 start() { # <step>
+    now >"$RUN/$1.start"
     (
+        # (the gate's lock is not this subshell's to release)
+        LOCK_HELD=0
         s=$(now)
         run_step "$1" </dev/null >"$RUN/$1.log" 2>&1
         rc=$?
         echo "$rc $(( $(now) - s ))" >"$RUN/$1.status"
     ) &
+    echo $! >"$RUN/$1.pid"
     STARTED="$STARTED $1"
+}
+
+# ---- Stalls (0.25.2) ----
+
+# A step none of whose processes used the CPU, started or ended for
+# $VOLE_GATE_STALL seconds (default 600) has stalled: a release gate once
+# waited 2.5 hours on runners whose slots had all been lost with killed
+# jobs. Such a step is stopped and fails, saying how many slots were
+# free. (Not the containers' rows: their work is in the VM, and the gate
+# inside a container checks its own steps. `sleep` does not count: a
+# step that only sleeps is waiting.)
+STALL=${VOLE_GATE_STALL:-600}
+case "$STALL" in ''|*[!0-9]*|0) STALL=600 ;; esac
+STALL_EVERY=15
+[ "$STALL" -ge 60 ] || STALL_EVERY=1
+STALL_NEXT=0
+
+# The processes: pid, parent, CPU time, command (ps; in a container
+# without ps, /proc).
+proc_table() {
+    if command -v ps >/dev/null 2>&1; then
+        ps -A -o pid= -o ppid= -o time= -o comm= 2>/dev/null
+    elif [ -d /proc/self ]; then
+        cat /proc/[0-9]*/stat 2>/dev/null | awk '{
+            l = $0; i = index(l, "("); j = 0
+            for (k = length(l); k > i; k--) if (substr(l, k, 1) == ")") { j = k; break }
+            if (j == 0) next
+            split(substr(l, j + 2), f, " ")
+            print $1, f[2], f[12] + f[13], substr(l, i + 1, j - i - 1)
+        }'
+    fi
+}
+
+# The free slots of the pool (the bytes in its FIFO), or "?".
+free_slots() {
+    case "$(uname -s)" in Darwin) fionread=1074030207 ;; Linux) fionread=21531 ;; *) echo "?"; return ;; esac
+    perl -e 'open(my $f, "+<", $ARGV[0]) or exit 1; my $n = pack("L", 0);
+        ioctl($f, $ARGV[1], $n) or exit 1; print unpack("L", $n), "\n"' "$RUN/jobs" "$fionread" 2>/dev/null || echo "?"
+}
+
+# Kills step $1's processes (its subshell and everything below it):
+# TERM, which lets the runners' jobs give their slots back, then KILL.
+kill_tree() { # <pid>
+    kt=$(proc_table | awk -v root="$1" '
+        { parent[$1] = $2 }
+        END {
+            for (p in parent) {
+                q = p
+                while ((q in parent) && q != root && q > 1) q = parent[q]
+                if (q == root) print p
+            }
+        }')
+    [ -n "$kt" ] || return 0
+    # shellcheck disable=SC2086
+    kill -TERM $kt 2>/dev/null
+    sleep 2
+    # shellcheck disable=SC2086
+    kill -KILL $kt 2>/dev/null
+}
+
+check_stalls() {
+    t=$(now)
+    [ "$t" -ge "$STALL_NEXT" ] || return 0
+    STALL_NEXT=$((t + STALL_EVERY))
+    roots=""
+    for s in $STARTED; do
+        case " $REPORTED " in *" $s "*) continue ;; esac
+        case "$s" in linux-*) continue ;; esac
+        [ -f "$RUN/$s.status" ] || [ ! -f "$RUN/$s.pid" ] || roots="$roots $s=$(cat "$RUN/$s.pid")"
+    done
+    [ -n "$roots" ] || return 0
+    # One signature per step: its processes (but sleep) and their CPU times.
+    proc_table | awk -v roots="$roots" '
+        BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) { split(r[i], kv, "="); step[kv[2]] = kv[1] } }
+        { parent[$1] = $2; line[$1] = $1 ":" $3; if ($0 ~ /(^| |\/)sleep$/) skip[$1] = 1 }
+        END {
+            for (p in parent) {
+                if (p in skip) continue
+                q = p
+                while (!(q in step) && (q in parent) && q > 1) q = parent[q]
+                if (q in step) sig[step[q]] = sig[step[q]] " " line[p]
+            }
+            for (i = 1; i <= n; i++) { split(r[i], kv, "="); print kv[1], (kv[1] in sig ? sig[kv[1]] : "") }
+        }' >"$RUN/stall.sigs"
+    while read -r s sig; do
+        if [ ! -f "$RUN/$s.sig" ] || [ "$(cat "$RUN/$s.sig")" != "$sig" ]; then
+            printf '%s\n' "$sig" >"$RUN/$s.sig"
+            echo "$t" >"$RUN/$s.sigt"
+            continue
+        fi
+        [ $(( t - $(cat "$RUN/$s.sigt") )) -ge "$STALL" ] || continue
+        free=$(free_slots)
+        why="stalled: no process of it ran, started or ended for $STALL s, with $free of $JOBS slots free$([ "$free" = 0 ] && echo ' (slots lost with killed jobs?)'); stopped"
+        [ $INSIDE -eq 1 ] || echo "  $s: $why" >&2
+        kill_tree "$(cat "$RUN/$s.pid")"
+        echo "--- $s: $why" >>"$RUN/$s.log"
+        echo "$why" >"$RUN/$s.stalled"
+        echo "1 $(( t - $(cat "$RUN/$s.start") ))" >"$RUN/$s.status"
+    done <"$RUN/stall.sigs"
 }
 
 mmss() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
 
-result_of() { # <step>: pass, FAIL, skip or "not run"
+result_of() { # <step>: pass, FAIL, SKIP or "not run"
     if [ -f "$RUN/$1.status" ]; then
         read -r rc _ <"$RUN/$1.status"
         case "$rc" in
             0) echo pass ;;
-            77) echo skip ;;
+            77) echo SKIP ;;
             *) echo FAIL ;;
         esac
     else
@@ -501,6 +847,7 @@ wait_all() {
     poll
     while [ $RUNNING -gt 0 ]; do
         sleep 1
+        check_stalls
         poll
     done
 }
@@ -556,11 +903,12 @@ if [ $CHAIN -eq 1 ]; then
     start chain
     while [ ! -f "$RUN/chain.status" ]; do
         sleep 1
+        check_stalls
     done
     poll
 fi
 if [ $CHAIN -eq 0 ] || [ "$(result_of chain)" = pass ]; then
-    for s in $STEPS; do
+    for s in $ORDERED; do
         [ "$s" = linux-x86_64 ] || start "$s"
     done
 fi
@@ -578,17 +926,24 @@ GATE_SECS=$(( $(now) - GATE_START ))
 note_of() {
     l="$RUN/$1.log"
     [ -f "$l" ] || return
+    [ -f "$RUN/$1.stalled" ] && { cat "$RUN/$1.stalled"; return; }
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
-        suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
+        suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
         fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*)
             grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
-        linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
+        # (no rows: it failed before the container's steps, e.g. docker)
+        linux-*)
+            if grep -q '^gate-row' "$l"; then
+                grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "SKIP" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }'
+            elif [ "$(result_of "$1")" != SKIP ]; then
+                grep -E 'error' "$l" | tail -1
+            fi ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
-    [ "$(result_of "$1")" = skip ] && tail -1 "$l"
+    [ "$(result_of "$1")" = SKIP ] && tail -1 "$l"
 }
 
 ROWS="$RUN/rows"
@@ -598,7 +953,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     r=$(result_of "$s")
     secs=0
     [ -f "$RUN/$s.status" ] && read -r _ secs <"$RUN/$s.status"
-    case "$r" in pass|skip) ;; *) FAILED=$((FAILED + 1)) ;; esac
+    case "$r" in pass|SKIP) ;; *) FAILED=$((FAILED + 1)) ;; esac
     printf '%s\t%s\t%s\t%s\n' "$s" "$r" "$secs" "$(note_of "$s" | head -1)" >>"$ROWS"
     # The containers' own steps, under theirs.
     case "$s" in
@@ -617,13 +972,13 @@ printf '  %-28s %-7s %7s\n' "total (wall)" "$([ $FAILED -eq 0 ] && echo pass || 
 
 # The failures' details.
 for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo bench); do
-    case "$(result_of "$s")" in pass|skip) continue ;; esac
+    case "$(result_of "$s")" in pass|SKIP) continue ;; esac
     echo
     echo "--- $s: $(result_of "$s") (log: $RUN/$s.log)"
     l="$RUN/$s.log"
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
-        suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
+        suite-*|smoke-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
         fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|voltty-fuzz|compiler-memcheck|chain-*) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         compile-cost) cat "$l" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
@@ -633,7 +988,7 @@ done
 # (0.25.2) The suites' skipped checks, with their reasons (a window test
 # without a display giving frames, ...): skipped is not passed.
 for s in $STEPS; do
-    case "$s" in suite-*|examples-checkalloc) ;; *) continue ;; esac
+    case "$s" in suite-*|smoke-*|examples-checkalloc) ;; *) continue ;; esac
     l="$RUN/$s.log"
     [ -f "$l" ] && grep -q '^SKIP ' "$l" || continue
     echo

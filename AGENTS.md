@@ -90,8 +90,12 @@ Check and test only what a change touches, and widen at milestones:
   name contains FILTER; `-O 0` for another level);
 - the whole suite (`tests/run.sh`) only at milestones;
 - before committing a big change: `bootstrap/gate.sh --quick` (the chain
-  from the working tree, the suite at -O2, a short fuzz in every mode, a
-  few minutes; one table at the end);
+  from the working tree, the suite at -O2, a short fuzz in every mode,
+  and the `linux-smoke` row: the compiler cross-built for aarch64-linux
+  and, in the container, the runner's checks, the LSP, the examples'
+  builds, every case and the walkthroughs; a few minutes; one table at
+  the end; `SKIP` there, not pass, when colima is not running:
+  `colima start`);
 - a release: `bootstrap/gate.sh --release`, then `gate.sh --only bench`
   on an idle machine ([docs/releases.md](docs/releases.md), "The gate").
 
@@ -113,8 +117,9 @@ Check and test only what a change touches, and widen at milestones:
   `tests/run.sh example example_build`; moving an example moves its case.
 - **Linux too:** a change to tests/, the runner, std, the LSP or anything
   platform-specific is checked in the Linux container before it is called
-  done (`bootstrap/gate.sh --only linux-aarch64`; colima must run).
-  `--quick` alone is macOS only.
+  done: `--quick`'s `linux-smoke` row at least, the full container
+  row (`bootstrap/gate.sh --only linux-aarch64`) for the runner or a
+  platform-specific change; colima must run.
 - **Before a merge into an integration branch:** `tools/premerge.sh` in
   the branch's worktree (base contained, unsafe justified, fmt, every
   touched program checks clean, the embedded std up to date, example
@@ -124,8 +129,11 @@ Check and test only what a change touches, and widen at milestones:
   answered item by item with the command or count that shows it (e.g.
   "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
 - **Mind the machine:** at most five agents build and test the compiler
-  at once, and one gate runs at a time; under heavy load, timing results
-  are not evidence (the runner SKIPs time budgets with the load).
+  at once, and one gate runs at a time: `gate.sh` takes a lock for all
+  worktrees and a second gate waits, saying whose gate runs (`--no-wait`
+  fails instead; `bootstrap.sh --dev` and `tests/run.sh` take none).
+  Under heavy load, timing results are not evidence (the runner SKIPs
+  time budgets with the load).
 
 ## Conventions
 
