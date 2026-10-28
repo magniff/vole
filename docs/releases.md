@@ -61,8 +61,64 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.1 | `v0.25.1` | 0.25.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | one standard style, applied to the whole tree: `volec fmt` groups imports (`std`, `crate`, the rest) and writes trailing commas in lists whose closing bracket starts a line; docs/style.md, `guide fmt` |
 | 0.25.2 | `v0.25.2` | 0.25.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | soundness fixes found by real programs (the -O2 vector loop unrolled by 3, an assignment's let-argument temporaries, std's move exemption narrowed); volec's command line on std::cli; `use.unused`; program roots for the tools; the language server for single files and C headers; WGSL's MSL reserved names; four test tiers, `tools/premerge.sh`, a commit hook, a Linux smoke row and a gate that cannot hang |
 | 0.25.2.1 | `v0.25.2.1` | 0.25.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the first GPU eval: `f(make()?)?`'s empty argument fixed; float math in std, in vole; std::gpu multiple render targets and depth-only passes; frames for an occluded window; twelve diagnostics; `fix --suggested` and the hooks made safe |
+| 0.25.2.2 | `v0.25.2.2` | 0.25.2.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the second GPU eval: a `requires` call's `?` arguments kept to the call; std::gpu layouts per entry point, `gpu.unwritten`, more storage formats, limits named; integer methods; ten diagnostics; `query show` across programs; the hooks quieter and clearer |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.2.2
+
+The second round of the GPU eval (evals/tasks/0.25.2.1: the same ten
+tasks on 0.25.2.1; agent time 121 against 165 minutes, tool calls 586
+against 849, hook blocks 5 against 53) and what it found.
+
+- **Soundness**: a call to a function with a `requires` clause binds its
+  arguments in a block of its own, checked apart from ordinary blocks,
+  so the drop pass never kept a `?` argument or a temporary there to the
+  call: `dev.compute_pipeline(dev.shader_wgsl(SRC)?, "main")?` passed a
+  shader with no entry points (two agents; one lost 15 turns), and a
+  render pipeline's the same. A struct literal's `let` field given
+  `make()?` or a returning match was lent from a dropped binding. Both
+  since 0.24; tools/sinksweep/argsweep.py adds `requires` callees and
+  arguments through a call or a struct literal: 13,440 cases (3,619 of
+  the new ones wrong on 0.25.2.1).
+- **std::gpu**:
+  - a pipeline's layout is the bindings its own entry points use, through
+    the functions they call (WebGPU's `layout: "auto"`); it was every
+    binding of the module's entry points of its stages, so two pipelines
+    of one module could not have different bind groups.
+    examples/gpu/life and voxel pass each pipeline only its bindings;
+  - `gpu.unwritten`: a submit whose dispatch or draw reads a uniform
+    buffer nothing wrote stops, naming the binding (three agents read
+    zeros from one and lost turns to it);
+  - Rgba16Float, Rgba8Uint and Rg32Float storage textures work (std
+    called them storable; the translator refused them);
+  - `gpu.limits` names the limit as a program writes it and how to raise
+    it; `adapter.limits()` is the adapter's largest, and `device(lim)`
+    refuses more; `Limits::default()` keeps 1 GiB buffers, as wgpu keeps
+    a portable minimum.
+- **Integers** have `abs`, `signum`, `min`, `max`, `clamp` and
+  `pow(u32)` as methods (std::num's `Int`, as `Float` for floats).
+- **Diagnostics**: a `std::` path to a prelude name (`std::num::parse_int`)
+  says it is in the prelude, `std::heap_gpa()` that main takes the
+  allocator; own.move_out of a field an `if` or `match` picks says to
+  use it in each branch (not `std::take`, which would empty it); `*x` of
+  a `for` loop's variable; `use cpu;` for a module in scope; a slice
+  `static` gets its length (`static T: [f32; 5]`, an exact fix); a
+  module of constants as a type (`gpu::BufferUsage`: its values are
+  `u32`); `volec check` of a file not yet a module, `volec test` of two
+  files; an Option pattern on a Result.
+- **Tools**: `query show`'s other-program suggestions prefer the
+  caller's program and examples, never evals/ or tests/; every method of
+  std::gpu and std::window resolves (203 of 501 did not); `FILE.vl::item`.
+  The check hook writes one line for repeated fixes, says which files it
+  rewrote, checks `sed -i`/`perl -pi`/Python writes of a `.vl`, and notes
+  an unformatted file; a blocked compound line comes with the line
+  without its blocked part; reads of up to 200 lines of any `.vl` run.
+- **The guide**: `guide gpu-render` (the render sections, with a textured
+  quad), buffer sizes and limits, one compute pass for many dispatches,
+  atomics need read_write, the reserved names, uniforms before their
+  first write, HiDPI units in `guide window`, integers in `guide math`,
+  `parse_int`'s Result; fences say `vole`.
 
 ### What's new in 0.25.2.1
 
