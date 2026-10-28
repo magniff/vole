@@ -2223,7 +2223,14 @@ cargo. Its directives (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`,
 `// CHECK-NOT:`, `// CHECK-OPT:`, `// STDERR:`, `// CSOURCE:`) are described
 at its top. A release's suite must pass at every optimization level. The
 runners take `-j N` (default: the number of CPUs); their reports do not
-depend on it.
+depend on it. (0.25.2) `// EXPECT:` lines take holes for what varies
+(`{num}`, `{int}`, `{..}`), `// EXPECT-PPM: OUT REF [region X,Y,W,H]
+[tolerance N] [allow P%]` compares an image the program wrote with a
+reference under `tests/golden/`, and a check that cannot run on this
+machine (the window tests while the screen is locked or the display
+asleep) is a `SKIP NAME: why` line and a `skip` column, never a pass;
+the gate lists the SKIP lines under its table. `tests/runner/run.sh`
+checks these pieces of the runner.
 
 The seed keeps its own tests, run with cargo:
 

@@ -120,7 +120,9 @@ To add a test case.
 - A program: `tests/run/CATEGORY_NAME.vl` (the category is the name
   up to its first `_`: `std_`, `opt_`, `err_`...), or
   `tests/run/NAME/main.vl` for several modules. Directives in `//`
-  comments: `EXPECT:` (stdout, a line each), `STDIN:`, `ARGS:`,
+  comments: `EXPECT:` (stdout, a line each; holes `{num}`, `{int}`,
+  `{..}` for what varies), `EXPECT-PPM:` (an image; `volec guide
+  testing`), `STDIN:`, `ARGS:`,
   `EXIT:`, `STDERR:`, `ERROR:` (compiling fails with that message),
   `CHECK:` / `CHECK-NOT:` (the IR), `FLAGS:`; the header of
   `tests/run.sh` lists them all. Cases compile with `--deny-warnings`.
