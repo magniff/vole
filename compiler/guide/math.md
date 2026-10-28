@@ -1,4 +1,4 @@
-# Float math (0.25.2.1)
+# Float math (0.25.2.1), and integers' (0.25.2.2)
 
 f32 and f64 have Rust's methods: `x.sqrt()`, `x.sin()`, `y.atan2(x)`,
 `x.powi(2)`, `a.max(b)`, with no `use` (they are std::math's trait
@@ -6,7 +6,7 @@ f32 and f64 have Rust's methods: `x.sqrt()`, `x.sin()`, `y.atan2(x)`,
 `unsafe`, no `import "math.h"`, the same results on every target; all
 `#[pure]`.
 
-```tach
+```vole
 fn main() -> i32 {
     let x = 2.0;
     let a: f32 = 0.5;
@@ -51,6 +51,31 @@ rounding functions, min and max exact; powi a few more), with C99's
 special values: `(0.0).atan2(-1.0)` is pi, `pow(x,
 0.0)` is 1 even for NaN. f32's are f64's rounded once.
 
+## Integers
+
+The integer types (`i8` to `i64`, `u8` to `u64`) have Float's `abs`,
+`signum`, `min(y)`, `max(y)`, `clamp(lo, hi)`, and `pow(exp: u32)`, as
+methods with no `use` (std::num's trait `Int`, 0.25.2.2). They wrap as
+integers do: `i64::MIN.abs()` is `i64::MIN`, a `pow` past the type's
+range wraps; `clamp` never panics (`lo > hi`: hi). std's functions
+`std::min(a, b)`, `std::max`, `std::clamp(x, lo, hi)` (any `Ord`
+type) and `std::abs(x)` (an i64) do the same.
+
+```vole
+fn main() -> i32 {
+    let x: i64 = -7;
+    let n: u32 = 3;
+    let px: i32 = 300;
+    println(f"{x.abs()} {x.signum()} {x.min(0)} {x.max(0)} {px.clamp(0, 255)} {(2).pow(10)} {n.pow(2)}");
+    println(f"{std::max(x, 1)} {std::clamp(px, 0, 255)} {std::abs(x)}");
+    0
+}
+```
+```out
+7 -1 -7 0 255 1024 9
+1 255 7
+```
+
 ## Constants
 
 Rust's names, as `i64::MAX` is: `f64::EPSILON`, `f64::MAX`,
@@ -62,7 +87,7 @@ Rust's names, as `i64::MAX` is: `f64::EPSILON`, `f64::MAX`,
 `FRAC_1_SQRT_2`, for f32 too (`f32::consts::PI` is an f32). They are
 literals: `const TURN: f64 = f64::consts::TAU;` works.
 
-```tach
+```vole
 let half_turn: f32 = f32::consts::PI;
 println(f"{half_turn} {f64::MAX > 1e308} {f64::MIN_POSITIVE:e}");
 ```
@@ -77,7 +102,7 @@ println(f"{half_turn} {f64::MAX > 1e308} {f64::MIN_POSITIVE:e}");
 constants as f64s (`math::PI`, `math::TAU`, `math::E`, ...), for code
 written C's way:
 
-```tach
+```vole
 use std::math;
 use std::math::{PI, sqrt};
 

@@ -66,7 +66,7 @@ A parser over tokens that view the input, and a lexer over text its
 caller owns, are `views(*self)`: what they return outlives the next
 call. This checks clean:
 
-```tach
+```vole
 struct Tok { text: [u8], kind: i64 }
 struct Parser { toks: Vec<Tok>, pos: i64 }
 

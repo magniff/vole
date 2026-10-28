@@ -4,9 +4,10 @@
 // a type as written (a name, a path, an alias, a generic instance) to a
 // type.
 
-use crate::base::{IntVec, buf_new};
+use crate::base::{IntVec, SYMS, buf_fmt, buf_new, buf_slice, buf_str, sym_text};
 use crate::base::diag::{
-    err_begin, err_end, err_end_soft, err_help, err_int, err_str, err_sym, error_count,
+    err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_int, err_str,
+    err_sym, err_try_fmt, error_count,
 };
 use crate::front::assoc::{is_projection_node, resolve_projection_node};
 use crate::front::ast::{FN_SIG_FAILED, NODES, NODE_REF, NODE_REF_MUT, NodeKind, REPR_C, child};
@@ -29,17 +30,18 @@ use crate::front::generics::{
 use crate::front::generics::instantiate::push_written_targs;
 use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::modules::lookup::{
-    B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item, lookup_name,
-    note_c_use, path_module,
+    B_ITEM, B_MODULE, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item,
+    lookup_name, note_c_use, path_module,
 };
 use crate::front::parser::UNDERSCORE;
 use crate::front::traits::SYM_TRAIT;
 use crate::front::types::{
-    ALIAS_BUSY, ALIAS_TYPE, CONST_COUNT, ENUMS, ENUM_COUNT, FNS, FN_COUNT, REF_MUT, REF_SHARED,
-    STATICS, STATIC_COUNT, STRUCTS, STRUCT_COUNT, SYM_ALIAS, SYM_ENUM, SYM_PRIMITIVE, SYM_STRUCT,
-    TLISTS, TSCRATCH, TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, VARIANTS, array_of, enum_type,
-    enum_variant, err_type, fn_param, is_ffi_field, is_ffi_safe, item_node_of, make_type,
-    mut_slice_of, ptr_to, ref_to, slice_of, struct_field, struct_type, type_elem, variant_field,
+    ALIAS_BUSY, ALIAS_TYPE, CONSTS, CONST_COUNT, ENUMS, ENUM_COUNT, FNS, FN_COUNT, REF_MUT,
+    REF_SHARED, STATICS, STATIC_COUNT, STRUCTS, STRUCT_COUNT, SYM_ALIAS, SYM_ENUM, SYM_PRIMITIVE,
+    SYM_STRUCT, TLISTS, TSCRATCH, TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, VARIANTS, array_of,
+    buf_type, enum_type, enum_variant, err_type, fn_param, is_ffi_field, is_ffi_safe, item_node_of,
+    make_type, mut_slice_of, ptr_to, ref_to, slice_of, struct_field, struct_type, type_elem,
+    variant_field,
 };
 use crate::tools::query::command_line::{qnote, qnote_self};
 
@@ -355,6 +357,25 @@ pub fn check_static(s: i64) {
     unsafe {
         let item = STATICS[s].node;
         let ty = STATICS[s].ty;
+        let init = NODES[item].c;
+        if TYPES[ty].kind == TyKind::Slice && NODES[init].kind == NodeKind::Array {
+            // (0.25.2.2, eval 0.25.2.1: sdftext) `static S: [f32] = [...];`:
+            // the array, of the literal's length, as the fix
+            let arr = buf_new();
+            buf_str(arr, c"[");
+            buf_type(arr, TYPES[ty].a);
+            buf_fmt(arr, f"; {NODES[init].count}]");
+            let name = SYMS[NODES[item].a].text;
+            err_begin(NODES[NODES[item].b].start);
+            err_fmt(f"static '{name}' has slice type '");
+            err_type(ty);
+            err_fmt(f"': a static holds an array, of the literal's {NODES[init].count} elements");
+            err_help_fmt(
+                f"`static {name}: {buf_slice(arr)} = [...];` (`{name}[i]` reads one, `{name}[..]` is the slice)");
+            err_fix(NODES[NODES[item].b].start, NODES[NODES[item].b].end, buf_slice(arr));
+            err_end_soft();
+            return;
+        }
         let errors = error_count();
         check_const_expr(NODES[item].c, ty);
         // (0.16: not after an error in it, a #[sealed] literal's)
@@ -496,6 +517,22 @@ fn resolve_type_name(n: i64) -> i64 {
         }
         let key = type_name_key(n);
         if key < 0 {
+            // (0.25.2.2) a module of constants: their type
+            let mb = lookup_name(
+                if NODES[n].count > 0 { path_module(n, NODES[n].count) } else { CUR_MOD }, name,
+                CUR_MOD);
+            if binding_kind(mb) == B_MODULE {
+                let tb = buf_new();
+                var cname: [u8] = "";
+                for c in 0..CONST_COUNT {
+                    if module_of(CONSTS[c].node) == binding_value(mb) && CONSTS[c].ty > 0 {
+                        buf_type(tb, CONSTS[c].ty);
+                        cname = SYMS[NODES[CONSTS[c].node].a].text;
+                        break;
+                    }
+                }
+                module_type_error(NODES[n].start, name, cname, buf_slice(tb));
+            }
             unknown_name_error(NODES[n].start, c"unknown type '", name);
         }
         let tpl = template_of_key(key);
@@ -623,6 +660,20 @@ pub fn resolve_named(name: i64, pos: i64) -> i64 {
             access_error(b, pos, name);
         }
         if binding_kind(b) != B_ITEM {
+            // (0.25.2.2) a module of constants: their type
+            let mb = lookup_name(CUR_MOD, name, CUR_MOD);
+            if binding_kind(mb) == B_MODULE {
+                let tb = buf_new();
+                var cname: [u8] = "";
+                for c in 0..CONST_COUNT {
+                    if module_of(CONSTS[c].node) == binding_value(mb) && CONSTS[c].ty > 0 {
+                        buf_type(tb, CONSTS[c].ty);
+                        cname = SYMS[NODES[CONSTS[c].node].a].text;
+                        break;
+                    }
+                }
+                module_type_error(pos, name, cname, buf_slice(tb));
+            }
             unknown_name_error(pos, c"unknown type '", name);
         }
         let key = binding_value(b);
@@ -643,6 +694,26 @@ pub fn resolve_named(name: i64, pos: i64) -> i64 {
         }
         resolve_key(key, name, pos)
     }
+}
+
+// (0.25.2.2, eval 0.25.2.1: cloth) A type that names a module (`u:
+// gpu::BufferUsage`): when the module holds constants (std::gpu's
+// BufferUsage, u32 flags: one is `cname`, of type `ct`), their type is the
+// type meant.
+fn module_type_error(pos: i64, name: i64, cname: [u8], ct: [u8]) -> ! {
+    err_begin(pos);
+    err_str(c"unknown type '");
+    err_sym(name);
+    err_str(c"'");
+    let t = sym_text(name);
+    if ct.len > 0 {
+        err_help_fmt(
+            f"'{t}' is a module of constants, not a type: its constants ('{t}::{cname}', ...) are '{ct}', so a value of them is a '{ct}' (`x: {ct}`)");
+        err_try_fmt(ct);
+    } else {
+        err_help_fmt(f"'{t}' is a module, not a type: its items are `{t}::NAME`");
+    }
+    err_end()
 }
 
 // The struct, enum or alias with key `key`.

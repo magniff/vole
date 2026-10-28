@@ -205,9 +205,13 @@ The three kinds of 0.17 (§2.1 there) decide what each convention costs:
   and for a branch's value lent to a let parameter that the branch itself
   binds (`count(match make() { Ok(s) => s, Err(e) => return Err(e) }, 8)`,
   an `if let`, a block's local, the `?` in an `if`): it is moved into a
-  temporary of the statement, not lent and dropped with its arm. A view of a temporary used after the temporary
-  is dropped is `own.escape`, naming the temporary; in a loop each
-  iteration's temporary is its own.
+  temporary of the statement, not lent and dropped with its arm.
+  (0.25.2.2) All of it holds for a call of a function with a `requires`
+  clause (`dev.compute_pipeline(dev.shader_wgsl(src)?, "e")?`), whose
+  arguments are bound before its check, and for a struct literal's let
+  field (`Desc { s: make()?, n: 1 }`). A view of a temporary used after
+  the temporary is dropped is `own.escape`, naming the temporary; in a
+  loop each iteration's temporary is its own.
 
 ### 2.3 What a convention means to the own pass
 

@@ -5,7 +5,7 @@ parameters. A generic item is a template: each use with new type
 arguments makes a separate copy (monomorphization), checked and
 optimized as if written by hand. No boxing, no dynamic dispatch.
 
-```tach
+```vole
 struct Stack<T> { items: Vec<T> }
 
 impl<T> Stack<T> {

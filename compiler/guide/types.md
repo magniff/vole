@@ -30,7 +30,7 @@ must fit: `let b: u8 = 300;` is an error.
 
 Every operation is defined, the same at every optimization level:
 
-```tach
+```vole
 let max: i64 = 9223372036854775807;
 let b: u8 = 250;
 let s: u32 = 1;
@@ -57,7 +57,7 @@ call; integers have none (`i64::MAX` and `MIN` aside).
 
 ## Arrays and slices
 
-```tach
+```vole
 var grid = [[0; 3]; 2];           // [[i64; 3]; 2]
 grid[1][2] = 5;
 let copy = grid;                  // arrays are values: copied whole
@@ -94,7 +94,7 @@ code, or cast through `i64`. Through an access to a Vec, a Buf or a
 slice, `p[i]` is that element, checked; through a raw pointer it is
 `unsafe`.
 
-```tach
+```vole
 struct Counter { n: i64 }
 
 fn bump(c: inout Counter) { c.n += 1; }  // an access: safe
@@ -131,7 +131,7 @@ and T's literal patterns, but none of T's methods (`distinct.method`):
 pointers, and structs, tuples and arrays of them; not owned (a Vec, a
 type with a Drop impl) nor a view (a slice, an access field) (`distinct.kind`).
 
-```tach
+```vole
 type NodeId = distinct i64;
 type Meters = distinct f64;
 
@@ -165,7 +165,7 @@ C compiler does, so they see it where that compiler is clang (macOS);
 with gcc (most Linux systems) a header has no such qualifier and its
 pointers import as `*T`. Any `*T` has `p.is_null()`.
 
-```tach
+```vole
 use std::NonNull;
 
 struct Node { value: i64, next: Option<NonNull<Node>> }
@@ -190,7 +190,7 @@ fn main() {
 
 ## Enums as integers
 
-```tach
+```vole
 #[repr(u8)]
 enum Level { Low = 1, Mid = 5, High = 9 }
 
@@ -234,7 +234,7 @@ ones. `T::from_bits(v)` reinterprets a vector of the same size, with no
 instruction. The CPU's own instructions on them (NEON, SSE, AVX2, CRC,
 AES, SHA) are `std::arch`'s: `volec guide arch`.
 
-```tach
+```vole
 let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
 let v = v4f32::load(xs[..], 0) * v4f32::splat(2.0);
 std::print_int(v.sum() as i64);

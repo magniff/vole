@@ -20,7 +20,7 @@ volec try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
 
 ## The language in one program
 
-```tach
+```vole
 import "stdio.h" as c;                 // a C header; its names under c::
 use std::is_digit;                     // std items by name (never *)
 
@@ -98,14 +98,16 @@ and names: `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)`. The prelude (no
 `use`) has `Option`, `Result`, `Vec`, `Buf`, `HashMap`, `BinaryHeap` and
 `MinHeap` (priority queues: `pop` the largest, the smallest), `print`,
 `println`, `format_in`, `Gpa`, `read_line`, `read_stdin_in`, `Scanner`,
-`parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
+`parse_int` (`parse_int(s)` is a `Result<i64, ParseIntError>`: take
+it with `.unwrap_or(0)`, `?`, or `match` on `Ok(n)` and `Err(e)`),
+`trim`, `split_in`, `split_whitespace_in`, `sort`,
 `sort_by`, `sort_stable_by`, `cmp_of`, `Fmt`, `panic`, `unreachable`;
 the rest of std is `use std::{...}`; `use lexer::Tok;` in a module
 reaches its sibling `lexer`.
 
 ## std: what programs use most
 
-```tach
+```vole
 struct Item { name: [u8], qty: i64 }
 
 fn add(v: inout Vec<Item>, it: Item) { v.push(it); }   // called as add(&items, ..)
