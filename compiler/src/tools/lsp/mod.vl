@@ -21,7 +21,7 @@
 
 use crate::base::{
     BUFS, IntVec, OVERLAY, STDERR, STDOUT, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
-    buf_clear, buf_fmt, buf_new, buf_slice, buf_str, getcwd, getenv, write,
+    buf_clear, buf_fmt, buf_new, buf_slice, buf_str, cstr, getcwd, getenv, write,
 };
 use crate::base::json::buf_json_str;
 use crate::front::stdtree::is_std_tree;
@@ -218,65 +218,96 @@ fn uri_path(uri: [u8]) -> [u8] {
 // directory, a file neither on disk nor open, or one of std's source
 // (in_std_tree).
 pub fn root_of(path: [u8]) -> i64 {
-    unsafe {
-        var end = path.len;
+    var end = path.len;
+    while end > 0 && path[end - 1] != '/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return -1;
+    }
+    let home = home_dir();
+    // path[0..end] is a directory with its `/`
+    loop {
+        let cand = buf_new();
+        buf_bytes(cand, path[0..end]);
+        buf_str(cand, ROOT_STEM);
+        buf_str(cand, SOURCE_EXT);
+        if path_exists(buf_slice(cand)) {
+            return cand;
+        }
+        if end <= 1 || search_stops_at(path[0..end], buf_slice(home)) {
+            break;
+        }
+        end -= 1;
         while end > 0 && path[end - 1] != '/' {
             end -= 1;
         }
         if end == 0 {
-            return -1;
+            break;
         }
-        let home = getenv(c"HOME");
-        // path[0..end] is a directory with its `/`
-        loop {
-            let cand = buf_new();
-            buf_bytes(cand, path[0..end]);
-            buf_str(cand, ROOT_STEM);
-            buf_str(cand, SOURCE_EXT);
-            if access(buf_cstr(cand), 0) == 0 {
-                return cand;
-            }
-            if end <= 1 || search_stops_at(path[0..end], home) {
-                break;
-            }
-            end -= 1;
-            while end > 0 && path[end - 1] != '/' {
-                end -= 1;
-            }
-            if end == 0 {
-                break;
-            }
-        }
-        // (a file that is neither on disk nor open, or one of std's source
-        // in the vole repository: none)
-        let own = buf_new();
-        buf_bytes(own, path);
-        if access(buf_cstr(own), 0) != 0 && doc_index(path) < 0 || in_std_tree(path) {
-            return -1;
-        }
-        own
     }
+    // (a file that is neither on disk nor open, or one of std's source in
+    // the vole repository: none)
+    if !path_exists(path) && doc_index(path) < 0 || in_std_tree(path) {
+        return -1;
+    }
+    let own = buf_new();
+    buf_bytes(own, path);
+    own
 }
 
 // Whether the search for a root stops at directory dir (with its `/`):
-// the top of a repository, or the home directory (home: $HOME, or null).
-fn search_stops_at(dir: [u8], home: *u8) -> bool {
-    unsafe {
-        let git = buf_new();
-        buf_bytes(git, dir);
-        buf_str(git, c".git");
-        if access(buf_cstr(git), 0) == 0 {
-            return true;
-        }
-        if home == 0 as *u8 || home[0] == 0 {
-            return false;
-        }
-        var h = c_slice(home);
-        while h.len > 1 && h[h.len - 1] == '/' {
-            h = h[0..h.len - 1];
-        }
-        dir.len == h.len + 1 && dir[0..h.len] == h
+// the top of a repository, or the home directory (home: $HOME, empty
+// when it is not set).
+fn search_stops_at(dir: [u8], home: [u8]) -> bool {
+    let git = buf_new();
+    buf_bytes(git, dir);
+    buf_str(git, c".git");
+    if path_exists(buf_slice(git)) {
+        return true;
     }
+    var h = home;
+    while h.len > 1 && h[h.len - 1] == '/' {
+        h = h[0..h.len - 1];
+    }
+    h.len > 0 && dir.len == h.len + 1 && dir[0..h.len] == h
+}
+
+// Whether a file or a directory is at path (std::fs: stat).
+fn path_exists(path: [u8]) -> bool {
+    std::fs::metadata(path).is_ok()
+}
+
+// $HOME (a buffer; empty when it is not set).
+fn home_dir() -> i64 {
+    let b = buf_new();
+    // UNSAFE: getenv is C's, through base (std::env reads the environment
+    // into an allocator's memory; the compiler has no std allocator).
+    // SAFETY: the name is a NUL-terminated literal; getenv returns null or
+    // a NUL-terminated string the environment owns, copied at once (the
+    // server never changes its environment).
+    let home = unsafe { getenv(c"HOME") };
+    if home != 0 as *u8 {
+        buf_bytes(b, cstr(home));
+    }
+    b
+}
+
+// The server's working directory (a buffer; empty when it cannot be
+// read).
+pub fn cwd_dir() -> i64 {
+    let b = buf_new();
+    let cwd = alloc_zeroed(4096);
+    // UNSAFE: getcwd is C's, through base (std::env::current_dir_in needs a
+    // std allocator; the compiler has none).
+    // SAFETY: cwd is 4096 zeroed bytes and 4096 is the size given: getcwd
+    // writes at most that, NUL-terminated, or returns null (then cwd is
+    // not read).
+    let got = unsafe { getcwd(cwd, 4096) };
+    if got != 0 as *u8 {
+        buf_bytes(b, cstr(cwd));
+    }
+    b
 }
 
 // Whether the file at path is one of std's source files (in the vole
@@ -310,8 +341,8 @@ static var INC_GIVEN: i64 = -1;
 
 // The C sources as the client gave them (one a line); -1: none given.
 static var SRC_GIVEN: i64 = -1;
-// (0.25.2) The C files the program is built with (vole.cSources: C
-// strings), where the worker looks for a C function's body.
+// (0.25.2) The C files the program is built with (vole.cSources:
+// buffers of their paths), where the worker looks for a C function's body.
 pub static var C_SOURCES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The directory of the workspace (a buffer, -1: none): the client's
@@ -321,90 +352,78 @@ static var WS_ROOT: i64 = -1;
 
 // The workspace's directory onto b (the server's own when there is none).
 fn put_ws_root(b: i64) {
-    unsafe {
-        if WS_ROOT >= 0 && buf_slice(WS_ROOT).len > 0 {
-            buf_bytes(b, buf_slice(WS_ROOT));
-            return;
-        }
-        let cwd = alloc_zeroed(4096);
-        if getcwd(cwd, 4096) != 0 as *u8 {
-            buf_str(b, cwd);
-        }
+    if WS_ROOT >= 0 && buf_slice(WS_ROOT).len > 0 {
+        buf_bytes(b, buf_slice(WS_ROOT));
+        return;
     }
+    buf_bytes(b, buf_slice(cwd_dir()));
 }
 
 // The directory a setting's path p names (a buffer, empty for an empty
 // p): `${workspaceFolder}` and a relative path from the workspace's
 // directory, `~/` from the home directory.
 fn setting_path(p: [u8]) -> i64 {
-    unsafe {
-        let b = buf_new();
-        let wf = "${workspaceFolder}";
-        if p.len == 0 {
-            return b;
-        }
-        if p.len >= wf.len && p[0..wf.len] == wf {
-            put_ws_root(b);
-            buf_bytes(b, p[wf.len..p.len]);
-        } else if p[0] == '~' && (p.len == 1 || p[1] == '/') {
-            let home = getenv(c"HOME");
-            if home != 0 as *u8 {
-                buf_str(b, home);
-            }
-            buf_bytes(b, p[1..p.len]);
-        } else if p[0] == '/' {
-            buf_bytes(b, p);
-        } else {
-            put_ws_root(b);
-            buf_byte(b, '/');
-            buf_bytes(b, p);
-        }
-        b
+    let b = buf_new();
+    let wf = "${workspaceFolder}";
+    if p.len == 0 {
+        return b;
     }
+    if p.len >= wf.len && p[0..wf.len] == wf {
+        put_ws_root(b);
+        buf_bytes(b, p[wf.len..p.len]);
+    } else if p[0] == '~' && (p.len == 1 || p[1] == '/') {
+        buf_bytes(b, buf_slice(home_dir()));
+        buf_bytes(b, p[1..p.len]);
+    } else if p[0] == '/' {
+        buf_bytes(b, p);
+    } else {
+        put_ws_root(b);
+        buf_byte(b, '/');
+        buf_bytes(b, p);
+    }
+    b
 }
 
 // The paths of the JSON array at `at` in msg, a setting of paths (which:
 // 0 vole.includePaths, 1 vole.cSources; from initializationOptions or a
 // workspace/didChangeConfiguration's settings): the include paths are
 // the directories `import "header.h"` searches first, as a build's -I
-// (C_INCLUDE_DIRS), the C sources the C files the program is built with
-// (C_SOURCES: where go to definition finds a C function's body); both
-// the worker's when it reads the program, read again when they changed.
-// Not an array: no change.
+// (C_INCLUDE_DIRS, C strings), the C sources the C files the program is
+// built with (C_SOURCES, buffers: where go to definition finds a C
+// function's body); both the worker's when it reads the program, read
+// again when they changed. Not an array: no change.
 fn set_paths(msg: [u8], at: i64, which: i64) {
-    unsafe {
-        var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !elements(msg, at, &items) {
-            return;
+    var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    if !elements(msg, at, &items) {
+        return;
+    }
+    let given = buf_new();
+    for i in 0..items.count {
+        str_into(msg, items.get(i), given);
+        buf_byte(given, '\n');
+    }
+    let before = if which == 0 { INC_GIVEN } else { SRC_GIVEN };
+    if before >= 0 && buf_slice(before) == buf_slice(given) || before < 0 && items.count == 0 {
+        return;
+    }
+    var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..items.count {
+        let p = buf_new();
+        str_into(msg, items.get(i), p);
+        let full = setting_path(buf_slice(p));
+        if buf_slice(full).len > 0 {
+            paths.push(if which == 0 { buf_cstr(full) as i64 } else { full });
         }
-        let given = buf_new();
-        for i in 0..items.count {
-            str_into(msg, items.data[i], given);
-            buf_byte(given, '\n');
-        }
-        let before = if which == 0 { INC_GIVEN } else { SRC_GIVEN };
-        if before >= 0 && buf_slice(before) == buf_slice(given) || before < 0 && items.count == 0 {
-            return;
-        }
-        var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..items.count {
-            let p = buf_new();
-            str_into(msg, items.data[i], p);
-            let full = setting_path(buf_slice(p));
-            if buf_slice(full).len > 0 {
-                paths.push(buf_cstr(full) as i64);
-            }
-        }
-        if which == 0 {
-            INC_GIVEN = given;
-            C_INCLUDE_DIRS = paths;
-        } else {
-            SRC_GIVEN = given;
-            C_SOURCES = paths;
-        }
-        if ROOT >= 0 {
-            mark_dirty(0);
-        }
+    }
+    if which == 0 {
+        INC_GIVEN = given;
+        C_INCLUDE_DIRS = paths;
+    } else {
+        SRC_GIVEN = given;
+        C_SOURCES = paths;
+    }
+    if ROOT >= 0 {
+        mark_dirty(0);
     }
 }
 
@@ -557,7 +576,7 @@ fn worker_gone() {
         if W_PID > 0 && !W_PUBLISHED && W_ROOT >= 0 {
             // (0.25.2: it ended before its diagnostics: never silence)
             for i in 0..COMING.count {
-                SHOWN.push(COMING.data[i]);
+                SHOWN.push(COMING.get(i));
                 SHOWN_ROOT.push(W_ROOT);
             }
             COMING.count = 0;
@@ -666,7 +685,7 @@ fn worker_frames() -> bool {
                 // (0.25.2) the open documents the program has no file of
                 W_PUBLISHED = true;
                 for i in 0..DOC_PATH.count {
-                    note_if_unchecked(buf_slice(DOC_PATH.data[i]));
+                    note_if_unchecked(buf_slice(DOC_PATH.get(i)));
                 }
             } else if kind == 'f' {
                 // (0.25.2) the program's files
@@ -693,45 +712,43 @@ fn worker_frames() -> bool {
 // batch just published, W_ROOT) and not in that batch; (0.25.2) the
 // ones of another program are kept, until it is read again.
 fn clear_stale() {
-    unsafe {
-        var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var kept_root = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..SHOWN.count {
-            let u = buf_slice(SHOWN.data[i]);
-            var coming = false;
-            for j in 0..COMING.count {
-                if buf_slice(COMING.data[j]) == u {
-                    coming = true;
-                }
-            }
-            var again = false;
-            for j in 0..i {
-                if buf_slice(SHOWN.data[j]) == u {
-                    again = true;
-                }
-            }
-            if coming || again {
-                continue;
-            }
-            if !same_root(SHOWN_ROOT.data[i], W_ROOT) {
-                kept.push(SHOWN.data[i]);
-                kept_root.push(SHOWN_ROOT.data[i]);
-                continue;
-            }
-            let b = buf_new();
-            buf_str(b, c"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
-            buf_json_str(b, u);
-            buf_str(b, c",\"diagnostics\":[]}}");
-            send_message(buf_slice(b));
-        }
-        SHOWN = kept;
-        SHOWN_ROOT = kept_root;
+    var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var kept_root = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..SHOWN.count {
+        let u = buf_slice(SHOWN.get(i));
+        var coming = false;
         for j in 0..COMING.count {
-            SHOWN.push(COMING.data[j]);
-            SHOWN_ROOT.push(W_ROOT);
+            if buf_slice(COMING.get(j)) == u {
+                coming = true;
+            }
         }
-        COMING.count = 0;
+        var again = false;
+        for j in 0..i {
+            if buf_slice(SHOWN.get(j)) == u {
+                again = true;
+            }
+        }
+        if coming || again {
+            continue;
+        }
+        if !same_root(SHOWN_ROOT.get(i), W_ROOT) {
+            kept.push(SHOWN.get(i));
+            kept_root.push(SHOWN_ROOT.get(i));
+            continue;
+        }
+        let b = buf_new();
+        buf_str(b, c"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+        buf_json_str(b, u);
+        buf_str(b, c",\"diagnostics\":[]}}");
+        send_message(buf_slice(b));
     }
+    SHOWN = kept;
+    SHOWN_ROOT = kept_root;
+    for j in 0..COMING.count {
+        SHOWN.push(COMING.get(j));
+        SHOWN_ROOT.push(W_ROOT);
+    }
+    COMING.count = 0;
 }
 
 // Whether roots a and b (buffers, -1: none) are the same.
@@ -815,20 +832,18 @@ fn note_if_unchecked(path: [u8]) {
 // crashed reading the program): a note on each open document of its
 // program.
 fn note_stopped() {
-    unsafe {
-        for i in 0..DOC_PATH.count {
-            let p = buf_slice(DOC_PATH.data[i]);
-            if is_std_path(p) || !same_root(root_of(p), W_ROOT) {
-                continue;
-            }
-            let t = buf_new();
-            buf_str(t, c"not checked: volec stopped while reading the program ");
-            buf_bytes(t, buf_slice(W_ROOT));
-            buf_str(t, c" (an internal error)\nhelp: `volec check ");
-            buf_bytes(t, buf_slice(W_ROOT));
-            buf_str(t, c"` shows where; the next change reads it again");
-            publish_note(p, true, "lsp.stopped", buf_slice(t), W_ROOT);
+    for i in 0..DOC_PATH.count {
+        let p = buf_slice(DOC_PATH.get(i));
+        if is_std_path(p) || !same_root(root_of(p), W_ROOT) {
+            continue;
         }
+        let t = buf_new();
+        buf_str(t, c"not checked: volec stopped while reading the program ");
+        buf_bytes(t, buf_slice(W_ROOT));
+        buf_str(t, c" (an internal error)\nhelp: `volec check ");
+        buf_bytes(t, buf_slice(W_ROOT));
+        buf_str(t, c"` shows where; the next change reads it again");
+        publish_note(p, true, "lsp.stopped", buf_slice(t), W_ROOT);
     }
 }
 
@@ -1099,7 +1114,7 @@ fn initialize(id: [u8], msg: [u8], params: i64) {
             var folders = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             if elements(msg, member(msg, params, "workspaceFolders"), &folders)
                 && folders.count > 0 {
-                ws = uri_path(str_at(msg, member(msg, folders.data[0], "uri")));
+                ws = uri_path(str_at(msg, member(msg, folders.get(0), "uri")));
             }
         }
         if ws.len > 0 {
