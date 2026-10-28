@@ -73,6 +73,7 @@ written to disk), and the MMC3 scanline IRQ for split screens.
 | `pad.vl` | one standard controller: strobe and shift register |
 | `view.vl` | the WGSL shader and the integer-scaled fullscreen pass |
 | `check.vl` | the built-in checks (`--check`), on synthetic cartridges |
+| `run-roms.sh` | the conformance ROMs in a directory, one line each (below) |
 
 ## Time
 
@@ -119,6 +120,44 @@ which are in this repository):
 | `mmc3_test_2` 1–5 | Passed (6 is the other chip revision; see below) |
 | `sprite_hit_tests` 01–07 | "PASSED" |
 | `sprite_overflow_tests` 5 (Emulator) | Passed; 1–4 need the overflow bug (see below) |
+
+### Conformance ROMs
+
+`run-roms.sh` runs whatever test ROMs are in a directory you give it
+(download the suites yourself; none are committed) and prints one line
+per ROM:
+
+```sh
+examples/nes/run-roms.sh ~/nes-test-roms        # builds the emulator first
+examples/nes/run-roms.sh -n ./nes -k ~/nes-test-roms
+```
+
+```text
+pass nestest/nestest.nes: all 8991 instructions match nestest.log
+pass instr_test-v5/all_instrs.nes: $6000 = 00: All 16 tests passed
+xfail cpu_interrupts_v2/rom_singles/2-nmi_and_brk.nes: $6000 = 01
+look sprite_hit_tests/01.basics.nes: no $6000 status and no 01.basics.ppm: its last frame is 01.basics.shot.ppm
+run-roms: 2 passed, 0 failed, 1 known failures, 1 without a verdict
+```
+
+Every `*.nes` under the directory is checked the first way that
+applies:
+
+- **`nestest.nes` with `nestest.log` beside it**: run from `$C000` with
+  `--trace`, each instruction's PC, opcode, A, X, Y, P and SP against
+  the log's; a failure names the first line that differs.
+- **A ROM that reports at `$6000`** (blargg's protocol: the signature
+  `DE B0 61` at `$6001`, the status at `$6000`, `$80` while running and
+  0 for passed, the message at `$6004`): run headless with `--state`
+  for `NAME.frames` frames (a file beside the ROM; default 3000, `-f`).
+- **A ROM with `NAME.ppm` beside it** (the suites that report only on
+  screen): its last frame (`--shot`) must be that image. Without one
+  the ROM gets no verdict, `look`, and its last frame is kept as
+  `NAME.shot.ppm`: look at it, and rename it to `NAME.ppm` once it shows
+  the pass screen.
+
+The failures listed under "The limits" below are `xfail`; the script
+exits 1 when any other ROM fails.
 
 ## The limits
 

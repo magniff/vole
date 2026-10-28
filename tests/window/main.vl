@@ -35,7 +35,7 @@ use render::input::{
 };
 use render::objc::{
     Point, Range, Rect, class, msg_b, msg_i, msg_p, msg_p_p, msg_p_u, msg_p_utudipiif,
-    msg_p_utudipppbh, msg_r_gP, msg_v_p, msg_v_pg, msg_v_pgg, msg_v_z, nsstring, pool_pop,
+    msg_p_utudipppbh, msg_r_gP, msg_u, msg_v_p, msg_v_pg, msg_v_pgg, msg_v_z, nsstring, pool_pop,
     pool_push, sel,
 };
 use render::objc::Size as NsSize;
@@ -53,6 +53,10 @@ extern "C" {
         w3: i32) -> *u8;
 
     fn CFRelease(o: *u8);
+
+    fn CGSessionCopyCurrentDictionary() -> *u8;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsAsleep(display: u32) -> i32;
 }
 
 struct T {
@@ -67,6 +71,95 @@ impl T {
             println(f"FAIL {name}: {why}");
             self.failed += 1;
         }
+    }
+
+    // (0.25.2) A check that cannot run here: `skip NAME: why`, which the
+    // runner counts apart (never as a pass).
+    fn skip<N: Display, D: Display>(inout self, name: sink N, why: sink D) {
+        println(f"skip {name}: {why}");
+    }
+}
+
+// ---- whether frames can come ---------------------------------------------
+
+// (0.25.2) Why the display can give no frames now (a nonzero code, see
+// no_frames_why), or 0 when it should: a display link fires only for a
+// visible window on an awake display of the console's session. `win` is
+// an NSWindow to ask for its occlusion state, or null.
+// VOLE_TEST_NO_FRAMES (set to anything) pretends there are none (the
+// runner's check of its SKIP outcome).
+fn no_frames_code(win: *u8) -> i64 {
+    if std::env::var_is_set("VOLE_TEST_NO_FRAMES") {
+        return 1;
+    }
+    // UNSAFE: CoreGraphics' C function, returning a raw CFDictionary.
+    // SAFETY: it takes nothing; the result is a +1 dictionary or null,
+    // released below and not used after.
+    let d = unsafe { CGSessionCopyCurrentDictionary() };
+    if d == 0 as *u8 {
+        return 2;
+    }
+    let pool = pool_push();
+    var code = 0;
+    if session_flag(d, "CGSSessionScreenIsLocked") == 1 {
+        code = 3;
+    } else if session_flag(d, "kCGSSessionOnConsoleKey") == 0 {
+        code = 4;
+    }
+    pool_pop(pool);
+    // UNSAFE: CoreFoundation's release, on a raw pointer.
+    // SAFETY: `d` is the +1 dictionary from above, released once.
+    unsafe { CFRelease(d); }
+    if code != 0 {
+        return code;
+    }
+    // UNSAFE: CoreGraphics' C function.
+    // SAFETY: it takes nothing and returns the main display's id.
+    let main = unsafe { CGMainDisplayID() };
+    // UNSAFE: CoreGraphics' C function.
+    // SAFETY: it takes a display id (any value is accepted) and returns
+    // a boolean_t.
+    if unsafe { CGDisplayIsAsleep(main) } != 0 {
+        return 5;
+    }
+    if win != 0 as *u8 {
+        // UNSAFE: an Objective-C message on the window's raw pointer.
+        // SAFETY: `win` is a live NSWindow (the caller's); occlusionState
+        // returns an NSUInteger, bit 1 NSWindowOcclusionStateVisible.
+        let occ = unsafe { msg_u(win, sel(c"occlusionState")) };
+        if (occ & 2) == 0 {
+            return 6;
+        }
+    }
+    0
+}
+
+// (0.25.2) A boolean of the session dictionary `d`: 1, 0, or -1 when the
+// key is not there.
+fn session_flag(d: *u8, key: [u8]) -> i64 {
+    let k = nsstring(key);
+    // UNSAFE: an Objective-C message on the dictionary's raw pointer.
+    // SAFETY: `d` is the caller's live NSDictionary (toll-free bridged
+    // CFDictionary); objectForKey: takes the NSString `k` (autoreleased in
+    // the caller's pool) and returns an object or null.
+    let v = unsafe { msg_p_p(d, sel(c"objectForKey:"), k) };
+    if v == 0 as *u8 {
+        return -1;
+    }
+    // UNSAFE: an Objective-C message on the value's raw pointer.
+    // SAFETY: the session dictionary's values for these keys are
+    // CFBooleans (NSNumbers), alive while `d` is; boolValue returns a BOOL.
+    if unsafe { msg_b(v, sel(c"boolValue")) } { 1 } else { 0 }
+}
+
+fn no_frames_why(code: i64) -> [u8] {
+    match code {
+        1 => "VOLE_TEST_NO_FRAMES=1 (pretended, to check the runner's SKIP)",
+        2 => "no window server session",
+        3 => "the screen is locked",
+        4 => "the session is not the console's (another user is logged in on it)",
+        5 => "the display is asleep",
+        _ => "the test window is not visible (occluded)",
     }
 }
 
@@ -477,39 +570,70 @@ fn test_display(t: inout T, gpa: Gpa) {
         _ => t.check("window_first_size", false, "no Resize"),
     }
 
-    // Frames come only when asked for.
+    // Frames come only when asked for. (0.25.2: a loaded machine may take
+    // seconds; none at all while the display cannot give frames is a
+    // skip, with the reason, and so are the checks that need frames.)
     let t0 = clock_ms();
-    win.request_frame();
-    let f = wait_for(&app, 1000, is_frame, &other);
-    let dt = clock_ms() - t0;
-    t.check("frame_on_request", f.is_some(), f"no Frame in {dt} ms");
-    let none = wait_for(&app, 150, is_frame, &other);
-    t.check("frame_not_unasked", none.is_none(), "a Frame without request_frame");
+    var frames = no_frames_code(win.ns.win);
+    if frames == 1 {
+        t.skip("frame_on_request", no_frames_why(frames));
+    } else {
+        win.request_frame();
+        var f = wait_for(&app, 1000, is_frame, &other);
+        if f.is_none() {
+            f = wait_for(&app, 4000, is_frame, &other);
+        }
+        let dt = clock_ms() - t0;
+        if f.is_some() {
+            frames = 0;
+            t.check("frame_on_request", true, "");
+            let none = wait_for(&app, 150, is_frame, &other);
+            t.check("frame_not_unasked", none.is_none(), "a Frame without request_frame");
+        } else {
+            frames = no_frames_code(win.ns.win);
+            if frames != 0 {
+                t.skip("frame_on_request", f"no Frame in {dt} ms: {no_frames_why(frames)}");
+            } else {
+                t.check("frame_on_request", false,
+                    f"no Frame in {dt} ms (the display is awake, unlocked, the window visible)");
+            }
+        }
+    }
 
     // The window's surface presents the renderer's grid (std::gpu).
     let sz = win.size();
-    match Renderer::new_in("Menlo", 13.0, sz.scale, Format::Bgra8Unorm, gpa) {
-        Err(e) => t.check("layer_present", false, e.as_slice()),
-        Ok(rr) => {
-            var r = rr;
-            match surface(r, win, sz.w, sz.h, gpa) {
-                None => t.check("layer_present", false, "no surface for the window's layer"),
-                Some(sf) => {
-                    var surf = sf;
-                    var s = Screen::new_in(sz.h / r.cell_h(), sz.w / r.cell_w(), gpa);
-                    s.text(0, 0, "vole: std::window on Cocoa", named(2));
-                    s.text(1, 0, "one instanced draw per frame", named(DEFAULT_FG));
-                    r.set_cursor(CursorView { line: 2, col: 0, shape: CURSOR_BLOCK });
-                    var shown = 0;
-                    for _ in 0..3 {
-                        win.request_frame();
-                        if wait_for(&app, 1000, is_frame, &other).is_some()
-                            && present(&r, &s, &surf) {
-                            shown += 1;
+    if frames != 0 {
+        t.skip("layer_present", no_frames_why(frames));
+    } else {
+        match Renderer::new_in("Menlo", 13.0, sz.scale, Format::Bgra8Unorm, gpa) {
+            Err(e) => t.check("layer_present", false, e.as_slice()),
+            Ok(rr) => {
+                var r = rr;
+                match surface(r, win, sz.w, sz.h, gpa) {
+                    None => t.check("layer_present", false, "no surface for the window's layer"),
+                    Some(sf) => {
+                        var surf = sf;
+                        var s = Screen::new_in(sz.h / r.cell_h(), sz.w / r.cell_w(), gpa);
+                        s.text(0, 0, "vole: std::window on Cocoa", named(2));
+                        s.text(1, 0, "one instanced draw per frame", named(DEFAULT_FG));
+                        r.set_cursor(CursorView { line: 2, col: 0, shape: CURSOR_BLOCK });
+                        var shown = 0;
+                        for _ in 0..3 {
+                            win.request_frame();
+                            if wait_for(&app, 3000, is_frame, &other).is_some()
+                                && present(&r, &s, &surf) {
+                                shown += 1;
+                            }
+                        }
+                        r.wait_idle();
+                        let why = no_frames_code(win.ns.win);
+                        if shown < 3 && why != 0 {
+                            t.skip("layer_present",
+                                f"{shown} of 3 frames presented: {no_frames_why(why)}");
+                        } else {
+                            t.check("layer_present", shown == 3, f"{shown} of 3 frames presented");
                         }
                     }
-                    r.wait_idle();
-                    t.check("layer_present", shown == 3, f"{shown} of 3 frames presented");
                 }
             }
         }
@@ -815,11 +939,54 @@ fn demo(gpa: Gpa) -> i32 {
     0
 }
 
+// (0.25.2) `main probe`: whether a window gets frames here now, for the
+// runner to tell a failure from a display that gives none (tests/window/
+// run.sh, after the voltty app drew nothing): `frames: ok`, or `frames:
+// none: WHY` with WHY a reason no frames can come (no_frames_why), or
+// `frames: none (the display is awake, unlocked, the window visible)`.
+fn probe(gpa: Gpa) -> i32 {
+    if !std::window::cocoa::has_display() {
+        println(f"frames: none: {no_frames_why(2)}");
+        return 0;
+    }
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            println("frames: none: NSApplication failed");
+            return 0;
+        }
+    };
+    var win = match app.window(WindowDesc::new("vole frame probe", 160, 120)) {
+        Ok(w) => w,
+        Err(_) => {
+            println("frames: none: no window");
+            return 0;
+        }
+    };
+    var other = 0;
+    let _ = wait_for(&app, 2000, is_resize, &other);
+    win.request_frame();
+    if wait_for(&app, 3000, is_frame, &other).is_some() {
+        println("frames: ok");
+        return 0;
+    }
+    let why = no_frames_code(win.ns.win);
+    if why != 0 {
+        println(f"frames: none: {no_frames_why(why)}");
+    } else {
+        println("frames: none (the display is awake, unlocked, the window visible)");
+    }
+    0
+}
+
 fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
     // SAFETY: argv holds argc NUL-terminated strings.
     let mode = if argc > 1 { unsafe { render::objc::cstr(argv[1]) } } else { "test" };
     if mode == "demo" {
         return demo(gpa);
+    }
+    if mode == "probe" {
+        return probe(gpa);
     }
     var t = T { failed: 0 };
     test_keys(&t);

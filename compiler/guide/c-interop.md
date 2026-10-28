@@ -49,8 +49,9 @@ vole has 4 bytes, 1 0.125
 - What headers cannot give: function-like macros, `static inline`
   functions, `errno` (call `__error()` on macOS, `__errno_location()` on
   Linux).
-- `-I DIR` adds an include directory; `import "./mine.h" as c;` is
-  relative to the importing file.
+- `-I DIR` adds an include directory (`volec check -I DIR` too, 0.25.2;
+  the language server's `vole.includePaths`); `import "./mine.h" as c;`
+  is relative to the importing file.
 
 ## Layout: #[repr(C)]
 

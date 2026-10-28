@@ -149,10 +149,44 @@ async function main() {
 
     await c.request("shutdown", null);
     c.notify("exit", null);
-    console.log(`ok: volec lsp (${compiler}): formatting, completion, resolve`);
+    await includePaths(compiler, dir);
+    console.log(`ok: volec lsp (${compiler}): formatting, completion, resolve, include paths`);
   } finally {
     c.proc.kill();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// (0.25.2) vole.includePaths as the extension gives them
+// (initializationOptions, relative to the workspace folder): a header
+// found only there; go to definition on the import's string opens it,
+// on a function through the alias lands on its declaration.
+async function includePaths(compiler, top) {
+  const dir = path.join(top, "inc-project");
+  fs.mkdirSync(path.join(dir, "inc"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "inc", "gadget.h"), "/* a header */\nint gadget_size(int n);\n");
+  const text = 'import "gadget.h" as g;\n\nfn main() {\n    let n = unsafe { g::gadget_size(2) };\n    println(f"{n}");\n}\n';
+  const file = path.join(dir, "main.vl");
+  fs.writeFileSync(file, text);
+  const uri = `file://${file}`;
+  const c = new Client(compiler, dir);
+  try {
+    await c.request("initialize", {
+      processId: process.pid,
+      rootUri: `file://${dir}`,
+      capabilities: {},
+      initializationOptions: { includePaths: ["inc"], cSources: [] },
+    });
+    c.notify("initialized", {});
+    c.notify("textDocument/didOpen", { textDocument: { uri, languageId: "vole", version: 1, text } });
+    const h = await c.request("textDocument/definition", { textDocument: { uri }, position: { line: 0, character: 9 } });
+    assert.strictEqual(h.result && h.result.uri, `file://${path.join(dir, "inc", "gadget.h")}`, JSON.stringify(h));
+    const d = await c.request("textDocument/definition", { textDocument: { uri }, position: { line: 3, character: 24 } });
+    assert.strictEqual(d.result && d.result.range.start.line, 1, JSON.stringify(d));
+    await c.request("shutdown", null);
+    c.notify("exit", null);
+  } finally {
+    c.proc.kill();
   }
 }
 

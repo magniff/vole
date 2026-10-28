@@ -1,4 +1,4 @@
-# volec lsp: the language server (0.24; every name resolves, 0.25; completion and formatting, 0.25.1)
+# volec lsp: the language server (0.24; every name resolves, 0.25; completion and formatting, 0.25.1; C imports, 0.25.2)
 
 `volec lsp` is a language server: an editor runs it and speaks the
 Language Server Protocol with it over stdin and stdout. It answers from
@@ -13,12 +13,13 @@ dependency: its JSON is read in place and written by hand.
 
 | LSP | what it answers with |
 |---|---|
-| `initialize` | the capabilities below; `positionEncoding` `utf-8` when the client offers it (`general.positionEncodings`), else `utf-16` |
+| `initialize` | the capabilities below; `positionEncoding` `utf-8` when the client offers it (`general.positionEncodings`), else `utf-16`. (0.25.2) `rootUri` (else the first of `workspaceFolders`): the workspace's directory, which relative settings are taken from; `initializationOptions`: the project's settings (below) |
+| `workspace/didChangeConfiguration` (0.25.2) | the project's settings again, `settings.vole` (or `settings`): the program is read again when they changed |
 | `textDocument/didOpen`, `didChange` (full text), `didSave`, `didClose` | the open documents' texts, kept in memory: the program is read with them in place of their files (unsaved edits count) |
-| `textDocument/publishDiagnostics` | after an open, a change (150 ms after the last one) and a save: every error and warning of `check`, per file; the code (`type error`, `effect`, ...), the message with its `help:` and `note:` lines, the range of the token at the position, and the `try:` lines as the related information. A file whose errors are gone gets an empty list |
-| `textDocument/definition` | the definition of the name under the cursor: a function, method, type, field, variant, const, static, module, or a local (its `let` or parameter); an operator's function (`a + b` of a type implementing `Add`: its `add`); a type parameter's declaration (`T` of `fn f<T: Ord>`); `std::` (std's first file), `crate::` (the root). In std: its file, written to a cache (below) |
+| `textDocument/publishDiagnostics` | after an open, a change (150 ms after the last one) and a save: every error and warning of `check`, per file; the code (`type error`, `effect`, ...), the message with its `help:` and `note:` lines, the range of the token at the position, and the `try:` lines as the related information. A file whose errors are gone gets an empty list; (0.25.2) one of another program keeps its diagnostics until that program is read again. A document that is not checked gets one note (an information diagnostic at its start) saying why and what to do, never silence (below) |
+| `textDocument/definition` | the definition of the name under the cursor: a function, method, type, field, variant, const, static, module, or a local (its `let` or parameter); an operator's function (`a + b` of a type implementing `Add`: its `add`); a type parameter's declaration (`T` of `fn f<T: Ord>`); `std::` (std's first file), `crate::` (the root). In std: its file, written to a cache (below). (0.25.2) The string of `import "h.h" as c;`: the header it reads; a name imported from C (`c::malloc`, `py::PyObject`, a field, a constant, a macro): its declaration in the header that has it, a function also its body in the program's C files (below) |
 | `textDocument/references` | every reference `query refs` finds (calls, uses, writes, imports, patterns, struct literals), with the definition when `includeDeclaration`; of a local, its declaration and uses; of a type parameter, its uses in the item; of a function an operator calls, the operators too. In the program's files; from a file of std's, in std's too |
-| `textDocument/hover` | a definition's signature; a function's effects, declared or inferred, with why (below), and its CPU features; the comment above it; its path. A local or an expression: its type (one per instance in a generic function, six at most). A type parameter: its bounds. A keyword or convention (`let`, `var`, `inout`, `sink`, `fn`, `self`, `requires`, `ensures`, `result`...), an attribute (`#[derive]`, `#[pure]`, `#[test]`...) or a primitive type (`i64`, `u8`...): a line or two of the guide, with the topic to read |
+| `textDocument/hover` | a definition's signature; a function's effects, declared or inferred, with why (below), and its CPU features; the comment above it; its path. A local or an expression: its type (one per instance in a generic function, six at most). A type parameter: its bounds. A keyword or convention (`let`, `var`, `inout`, `sink`, `fn`, `self`, `requires`, `ensures`, `result`...), an attribute (`#[derive]`, `#[pure]`, `#[test]`...) or a primitive type (`i64`, `u8`...): a line or two of the guide, with the topic to read. (0.25.2) A name imported from C: its declaration as the header writes it, and where; an import's string: the header's path |
 | `textDocument/documentSymbol` | the file's definitions, as `query items` lists them, with their fields, variants and trait functions as children; ranges in the file (a file of std's too) |
 | `workspace/symbol` | the definitions whose names match the query: the program's (its letters in order, case ignored), then std's (holding it); 256 at most, with their module as `containerName` |
 | `textDocument/completion` (0.25.1) | on the editor's text as it is, parsing or not: after `.` the receiver's fields and methods, after `::` a module's items, an enum's variants, a type's functions, else the names in scope, the prelude and keywords (below); each with its kind and signature; a call's parameters as snippet placeholders when the client takes snippets. Triggered by `.` and `:` |
@@ -181,9 +182,110 @@ setting overrides).
 ## The program it reads
 
 The root is the nearest `main.vl` in the document's directory or one
-above it, the rule the tools and their hooks use. The extension is one
-constant, `SOURCE_EXT` in `tools/lsp/mod.vl`. One program at a time: a
-document of another program makes it the program read.
+above it, the rule the tools and their hooks use; (0.25.2) the search
+stops at the top of a repository (a directory holding `.git`) or at
+the home directory, whichever it meets first, so a `main.vl` in a
+parent of the project (a scratch file in `~`) is not taken for its
+root. With none, the document is a program of its own, as `volec check
+FILE` reads it: a library of one file (`examples/python-ext/
+vole_hello.vl`, built with `volec -c`) has its errors published like
+any program's. A file of std's (below) belongs to the program read; one
+of std's source in the vole repository is not checked alone (a note).
+The extension is one constant, `SOURCE_EXT` in `tools/lsp/mod.vl`.
+
+One program at a time: a document of another program makes it the
+program read; (0.25.2) the other program's diagnostics stay shown until
+it is read again.
+
+Never silence (0.25.2): a document that cannot be checked gets one
+note, an information diagnostic on its first line, with the reason and
+what to do:
+
+| code | when | what it says to do |
+|---|---|---|
+| `lsp.not-in-program` | the file is under a program's `main.vl` but no `mod` item reaches it (the program read has no such file) | add `mod NAME;` to the module above it, or `volec check FILE` |
+| `lsp.not-a-file` | the document is no file on disk (`untitled:`) | save it as a `.vl` file |
+| `lsp.std-source` | a file of std's source in the vole repository (`compiler/std`, a directory holding `std.vl` and `embed.sh`): std is no program of its own | open or check a program that uses it |
+| `lsp.stopped` | the worker ended before it published the diagnostics (an internal error) | `volec check ROOT` shows where; the next change reads it again |
+
+A failed C import (`header not found: Python.h`, without the include
+path it needs) is an error at the import, and the program's other
+errors are still published: those that do not depend on what the header
+declares (a name through its alias is a failed name, whose uses are
+not reported again).
+
+## C imports (0.25.2)
+
+### The project's settings
+
+A C import searches what a build's does: the program's `-I DIR`
+directories first, then the C compiler's (the SDK, the system's include
+paths; `compiler/src/front/cpp`). A build gets `-I` on its command line
+(`volec -c -I $PY_INCLUDE vole_hello.vl`), and so does `volec check -I
+DIR`; the server gets them from the client, as settings:
+
+| setting | what |
+|---|---|
+| `includePaths` | the directories `import "header.h"` searches first (a build's `-I`) |
+| `cSources` | the C files the program is built with (`volec main.vl ring.c`): where go to definition finds a C function's body |
+
+Each is an array of paths: absolute, `~/...` (the home directory),
+`${workspaceFolder}/...` or relative, both from the workspace's
+directory (`rootUri`). They come in `initializationOptions`
+(`{"includePaths": [..], "cSources": [..]}`) and again in
+`workspace/didChangeConfiguration` (`{"settings": {"vole":
+{"includePaths": [..]}}}`); a change reads the program again. The VS
+Code extension sends its settings `vole.includePaths` and
+`vole.cSources` so (`.vscode/settings.json` holds them per project):
+
+```json
+{
+  "vole.includePaths": ["/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Headers"],
+  "vole.cSources": ["ring.c"]
+}
+```
+
+Another client puts the same object in its initialization options
+(Neovim: `init_options = { includePaths = { ... } }` in `vim.lsp.start`).
+
+### Definitions and hovers
+
+- The string of `import "stdlib.h" as c;`: go to definition opens the
+  header the import reads, found as the build finds it; a hover shows
+  its path.
+- A name used through the alias (`py::PySys_WriteStdout(..)`,
+  `c::malloc`, `py::PyObject`, `py::METH_NOARGS`, a field of an
+  imported struct): go to definition lands on its name in the header
+  that declares it, a nested include as well (`sysmodule.h`,
+  `malloc/_malloc.h`); a function's body in the program's C files
+  comes first when there is one: those of `cSources`, and the C file
+  beside a header imported by a relative path (`import "./ring.h"`:
+  `ring.c`). A hover adds the declaration as the header writes it (at
+  most 12 lines; a macro with its continued lines) and where:
+
+```
+fn PySys_WriteStdout(p0: *u8, ...)
+```
+```c
+PyAPI_FUNC(void) PySys_WriteStdout(const char *format, ...)
+                 Py_GCC_ATTRIBUTE((format(printf, 1, 2)));
+```
+declared in `sysmodule.h:17` (C)
+
+How: the preprocessor's tokens carry their file and line, so while the
+worker reads the program (`C_KEEP_ORIGINS`; a build does not keep
+them) the C import notes where each declaration it reads is
+(`front/cpp: origin_note`): a function's, variable's or typedef's name
+and the lines of its declaration, a struct's tag and its body, an
+enumerator, a field, a macro's `#define`; the vole text it writes for
+them is marked item by item (`C_EMIT_AT`), so a definition in that
+text maps back to its declaration. A function's body is found by a
+scan of the C file (`NAME (...) {` at its top level, outside comments,
+strings and directives), not by preprocessing it. The cost is a few
+table entries per declaration, lost in the time the headers take to
+read (Python.h and the system headers it includes: 300 to 600 ms with
+or without them, at a load average of about 100); a definition or a
+hover is under 1 ms.
 
 ## How it works
 
@@ -258,7 +360,7 @@ vim.api.nvim_create_autocmd('FileType', {
     })
   end,
 })
-vim.filetype.add({ extension = { tach = 'vole' } })
+vim.filetype.add({ extension = { vl = 'vole' } })
 ```
 
 Helix (`languages.toml`):
@@ -271,7 +373,7 @@ args = ["lsp"]
 [[language]]
 name = "vole"
 scope = "source.vole"
-file-types = ["tach"]
+file-types = ["vl"]
 roots = ["main.vl"]
 language-servers = ["volec"]
 ```
@@ -301,12 +403,24 @@ edit and from one that read the edited text (the same answers), and
 for resolve and signature help; `format.lsp` formats a text, a range,
 a broken text (no edits) and a file not opened. The VS Code extension's
 `npm test` runs `test/lsp.test.js`: the requests VS Code sends on save
-and while typing.
+and while typing, and (0.25.2) the include paths it gives.
+
+(0.25.2) `alone.lsp`: a file with no `main.vl` above it (its errors,
+an unsafe operation among them), an untitled document (its note);
+`cimport.lsp` (the program `prog-cimport`, its header in `inc/`): the
+header not found and the errors still published, the settings given,
+definitions and hovers of the import's string, a function (its body in
+`inc/widget.c`), a macro and a struct, and a file beside `main.vl` that
+no `mod` names (its note). `system-header`: `c::malloc` of `stdlib.h`
+lands on a line declaring it, wherever the machine's headers are.
 
 ## Known limits
 
-- One program at a time; a document outside any program (no `main.vl`
-  above it) gets empty answers.
+- One program at a time (a document of another program makes it the
+  program read).
+- A C file is not checked, and a header is not a document of the
+  server: its names have no hover there. A C function's body is found
+  by a scan, not the preprocessor (a body a macro writes is not found).
 - In a file of std's, a local's definition and references are not
   found (a generic function of std is checked per instance); its items'
   are. A builtin operator (`+` of integers) has no definition.

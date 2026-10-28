@@ -29,7 +29,7 @@ these first:
 | an unfamiliar item: its source, callers and what it calls, in one call | `target/volec query context NAME` (replaces show + refs + def) |
 | the source of an item; a whole small file | `target/volec query show NAME`; `query show FILE.vl` (a file under 300 lines is cheaper read whole) |
 | every use of a name | `target/volec query refs NAME` (`--count`, `--in FILE`) |
-| change a few lines of an item, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` |
+| change a few lines of an item, checked | `target/volec edit patch NAME --old 'TEXT' --new 'TEXT'` (`--all`: every match, in an item or a FILE) |
 | replace, add, remove an item | `target/volec edit replace\|insert\|delete NAME` (`< text`) |
 | rename, move, change a signature, field or variant everywhere | `target/volec refactor rename\|move\|signature\|field\|variant ...` |
 | missing imports, `pub`, `unsafe` blocks | `target/volec fix` |
@@ -46,6 +46,11 @@ table: [docs/query.md](docs/query.md#every-command-at-a-glance-for-agents);
 the edits in [docs/refactor.md](docs/refactor.md). NAME is `foo`,
 `module::foo`, `Type::method`, `Struct.field` or `FILE:LINE`; a problem
 is one line, `error CODE: message`, then `try:` lines to run as they are.
+The program is the compiler's from the tree's root; an example's (any
+program's) when a FILE or FILE:LINE argument is one of its files, or
+with `--root DIR` (`query context examples/nes/check.vl:233`, `probe
+examples/nes/check.vl:235 x -- --check`); a NAME the default program
+lacks gets the `try:` of the program that defines it.
 
 **Query and edit with `target/tools/volec` while you change the
 compiler**: `bootstrap/bootstrap.sh --dev` copies its build there only
@@ -68,7 +73,8 @@ undo` takes it back; `VOLE_HOOK_FIX=0`: off). `check` and a build
 print `ok: ...` when there is no error. `turn-end.py` checks once more when you stop and
 blocks the stop once if errors are left. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside
-never-instantiated generic fns"`.
+never-instantiated generic fns"`; `tools/agent-feedback --find WORDS`
+says whether someone has seen it already (`--list`: the last ones).
 
 ## The inner loop
 

@@ -51,6 +51,18 @@ language server, `volec lsp`.
   "[vole]": { "editor.formatOnSave": false }
   ```
 
+- **C imports** (0.25.2): F12 on the string of `import "Python.h" as
+  py;` opens the header the import reads; F12 on a name used through the
+  alias (`py::PySys_WriteStdout`, `c::malloc`, a struct, a field, a
+  macro) opens its declaration in the header that has it (a nested
+  include too), and a C function's body in the program's C files; the
+  hover shows the C declaration. Headers found only through `-I` need
+  `vole.includePaths` (below).
+- **Every file is checked** (0.25.2): a file with no `main.vl` above it
+  (up to the repository's top or your home directory) is a program of
+  its own, as `volec check FILE` reads it; a file the server cannot
+  check (not a module of its program, unsaved) shows a note saying why.
+
 The extension makes no network requests and collects no telemetry.
 
 ## Settings
@@ -60,10 +72,26 @@ The extension makes no network requests and collects no telemetry.
 | `vole.server.path` | `volec` | the compiler: a name looked up on PATH, or a path (relative to the first workspace folder) |
 | `vole.server.args` | `["lsp"]` | the arguments that start the server |
 | `vole.server.enabled` | `true` | `false` keeps highlighting only |
+| `vole.includePaths` | `[]` | (0.25.2) the directories `import "header.h"` searches first, as the build's `-I DIR` (relative to the workspace folder; `~/`, `${workspaceFolder}`) |
+| `vole.cSources` | `[]` | (0.25.2) the C files the program is built with (`volec main.vl ring.c`): F12 on a C function also opens its body there |
 | `vole.trace.server` | `off` | `messages` or `verbose` logs the protocol to the Vole output |
 
 Commands: **Vole: Restart Language Server**, **Vole: Show Language
-Server Output**. Changing a `vole.server.*` setting restarts the server.
+Server Output**. Changing a `vole.server.*` setting restarts the server;
+a change of `vole.includePaths` or `vole.cSources` is sent to it, and
+the program is checked again.
+
+Per project, in `.vscode/settings.json` (a CPython extension module
+built with `volec -c -I $PY_INCLUDE`, as `examples/python-ext`):
+
+```json
+{
+  "vole.includePaths": ["/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Headers"]
+}
+```
+
+`python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])'`
+prints the directory.
 
 ## Building
 
@@ -99,7 +127,8 @@ vscode-tmgrammar-test's format:
 `test/package.test.js` checks the manifest (the formatter defaults),
 `test/lsp.test.js` asks `volec lsp` ($VOLEC, else the repository's
 `target/volec`, else `volec` on PATH) what VS Code asks on save and
-while typing: formatting, completion, resolve.
+while typing: formatting, completion, resolve, and a definition through
+the include paths the extension gives.
 
 `python3 test/tmgrammar.py` checks them and the token snapshots in
 `test/snapshots/` with a small TextMate tokenizer in Python, so the
