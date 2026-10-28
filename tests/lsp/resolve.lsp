@@ -75,9 +75,9 @@
 > {"jsonrpc":"2.0","id":33,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":78,"character":49}}}
 < {"jsonrpc":"2.0","id":33,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/cli.vl","range":{"start":{"line":73,"character":11},"end":{"line":73,"character":15}}}}
 > {"jsonrpc":"2.0","id":34,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":20}}}
-< {"jsonrpc":"2.0","id":34,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":107,"character":11},"end":{"line":107,"character":19}}}}
+< {"jsonrpc":"2.0","id":34,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":106,"character":11},"end":{"line":106,"character":19}}}}
 > {"jsonrpc":"2.0","id":35,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":79,"character":30}}}
-< {"jsonrpc":"2.0","id":35,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":112,"character":11},"end":{"line":112,"character":17}}}}
+< {"jsonrpc":"2.0","id":35,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/gpu/mod.vl","range":{"start":{"line":111,"character":11},"end":{"line":111,"character":17}}}}
 ## allocators: main's Gpa, arenas, a fixed buffer, the Allocator bound
 > {"jsonrpc":"2.0","id":36,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":63,"character":13}}}
 < {"jsonrpc":"2.0","id":36,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":102,"character":11},"end":{"line":102,"character":14}}}}

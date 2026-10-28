@@ -110,7 +110,9 @@ pub fn scale(s: Shape, k: i64) -> Shape {
     Shape { w: s.w * k, h: s.h * k }
 }
 $ check
-ok: 0 errors in main.vl
+main.vl:4:27: warning[use.unused] unused import 'perimeter': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+main.vl:4:38: warning[use.unused] unused import 'scale': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+ok: 0 errors, 2 warnings in main.vl
 ## Undo, resolve by resolve.
 $ undo
 undid resolved main.vl:4-8 (text)	main.vl	+1 -5 lines

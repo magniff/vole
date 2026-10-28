@@ -32,21 +32,24 @@
 pub mod command;
 
 use crate::base::{
-    FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
+    FILES, FILE_COUNT, IntVec, SRC, SYMS, SYM_COUNT, buf_byte, buf_bytes, buf_new, buf_slice,
+    buf_str, intern, sym_text,
 };
-use crate::base::diag::{SUGGESTED, err_pos, fix_at_ok};
+use crate::base::diag::{
+    SUGGESTED, buf_tool_command, err_pos, fix_at_ok, name_failed, report_error_tries,
+};
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::modules::{
-    C_MODULE, MODULES, STD_MODULE, file_of_pos, module_count, module_of, within_std,
-};
+use crate::front::modules::{C_MODULE, MODULES, file_of_pos, module_count, module_of, within_std};
 use crate::front::modules::lookup::{B_PRIVATE, binding_kind, binding_value};
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::item_node_of;
+use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::edit::items::{after_line, indent_of, node_head};
 use crate::tools::fix::command::choose_path;
+use crate::tools::query::c_slice;
 use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF};
 use crate::tools::query::diagnostics::sym_less;
 use crate::tools::query::positions::{line_end, line_start};
@@ -340,20 +343,102 @@ fn brace_after(from: i64, to: i64) -> bool {
 
 // ---- Unused imports ----
 
-// Whether identifier `name` is written in file f outside SRC[a..b).
-fn named_in_file(name: i64, f: i64, a: i64, b: i64) -> bool {
-    unsafe {
-        let lo = crate::tools::query::positions::token_at(FILES[f].start);
-        var i = lo;
-        while i < TOK_COUNT && TOKS[i].start < FILES[f].end {
-            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
-                && (TOKS[i].start < a || TOKS[i].start >= b) {
-                return true;
-            }
-            i += 1;
-        }
-        false
+// Whether identifier `name` is written in the module of file f outside
+// Use node u.
+// (0.25.2: `check` reports unused imports; the times each file writes
+// each imported name are counted in one pass over the tokens, which are
+// not in position order: std's sections, derived impls and test code are
+// lexed after the files.)
+fn named_in_file(name: i64, f: i64, u: i64) -> bool {
+    if NAMED_TOKENS != TOK_COUNT || NAMED_SYMS < SYM_COUNT {
+        count_imported_names();
     }
+    // (by module: a module may have several files, std's root its flat/
+    // ones, a root given with other files)
+    let total = NAMED.get(named_key(name, file_at_index(f).module));
+    // (the times u itself writes it: its path's words, its names)
+    var inside = 0;
+    let path = node_at(node_at(u).c);
+    for i in 0..path.count {
+        if node_at(child(node_at(u).c, i)).a == name {
+            inside += 1;
+        }
+    }
+    for k in 0..node_at(u).count {
+        let id = node_at(child(u, k));
+        if id.a == name {
+            inside += 1;
+        }
+        if id.b == name {
+            inside += 1;
+        }
+    }
+    total > inside
+}
+
+// (file, symbol) -> how often the file writes the symbol, for the names
+// the program's imports bring; made for NAMED_TOKENS tokens.
+static var NAMED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var NAMED_TOKENS: i64 = -1;
+static var NAMED_SYMS: i64 = 0;
+
+fn named_key(name: i64, m: i64) -> i64 {
+    name * 1048576 + m + 1
+}
+
+fn count_imported_names() {
+    NAMED = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    NAMED_TOKENS = TOK_COUNT;
+    NAMED_SYMS = SYM_COUNT;
+    // (the names imported: the only ones counted)
+    var wanted = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for u in 1..NODE_COUNT {
+        let n = node_at(u);
+        if n.kind == NodeKind::Use && n.d != 2 {
+            for k in 0..n.count {
+                let id = node_at(child(u, k));
+                wanted.put((if id.b != 0 { id.b } else { id.a }) + 1, 1);
+            }
+        }
+    }
+    // (the tokens come in runs, each in one file)
+    var module = 0;
+    var lo = 0;
+    var hi = 0;
+    for i in 0..TOK_COUNT {
+        let t = token_at_index(i);
+        if t.kind != Tok::Ident || wanted.get(t.value as i64 + 1) == 0 {
+            continue;
+        }
+        if t.start < lo || t.start >= hi {
+            let file = file_at_index(file_of_pos(t.start));
+            module = file.module;
+            lo = file.start;
+            hi = file.end;
+        }
+        let key = named_key(t.value as i64, module);
+        NAMED.put(key, NAMED.get(key) + 1);
+    }
+}
+
+// Node n, token i, file f (copies).
+fn node_at(n: i64) -> crate::front::ast::Node {
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast).
+    // SAFETY: n is a node made (0 <= n < NODE_COUNT: a Use node, its path or
+    // a name of it), and the table is not freed while the program is checked.
+    unsafe { NODES[n] }
+}
+
+fn token_at_index(i: i64) -> crate::front::lexer::Token {
+    // UNSAFE: TOKS is the lexer's table of tokens, a raw pointer.
+    // SAFETY: 0 <= i < TOK_COUNT (the caller's loop), the tokens lexed.
+    unsafe { TOKS[i] }
+}
+
+fn file_at_index(f: i64) -> crate::base::SourceFile {
+    // UNSAFE: FILES is the table of the files read, a raw pointer.
+    // SAFETY: f is file_of_pos's answer, 0 <= f < FILE_COUNT.
+    unsafe { FILES[f] }
 }
 
 // The edits removing the imports nothing in their file names (a name
@@ -379,7 +464,7 @@ fn unused_import_edits(only_report: *IntVec) -> i64 {
                 let local = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
                 // (an import other modules import or name through is used:
                 // `use crate::name` reaching the root's import, 0.12)
-                if !named_in_file(local, f, NODES[u].start, NODES[u].end)
+                if !named_in_file(local, f, u)
                     && !reached_through(module_of(u), local) {
                     unused.push(k);
                 }
@@ -557,6 +642,39 @@ fn pub_edits() -> i64 {
 // The imports nothing names (query unused): their Ident nodes, into out.
 pub fn unused_imports(out: *IntVec) {
     unused_import_edits(out);
+}
+
+// (0.25.2) `check` and a build: each import nothing in its file names is
+// a warning, `use.unused` (an error with --deny-warnings), whose try:
+// line removes them all; not std's, not a `pub use`, not one that failed
+// (an error already).
+pub fn report_unused_imports() {
+    var ids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    // (every one: a query's --in, not read yet when the program is
+    // checked, is for its own answer)
+    let opt_in = OPT_IN;
+    OPT_IN = 0 as *u8;
+    unused_import_edits(&ids);
+    OPT_IN = opt_in;
+    if ids.count == 0 {
+        return;
+    }
+    let tries = buf_new();
+    buf_tool_command(tries, c_slice(c"fix --only unused"), true);
+    for id in (&ids).items() {
+        let n = node_at(id);
+        let local = if n.b != 0 { n.b } else { n.a };
+        if name_failed(local) {
+            continue;
+        }
+        let msg = buf_new();
+        buf_str(msg, c"unused import '");
+        buf_bytes(msg, sym_text(local));
+        buf_str(msg, c"': nothing in this file names it");
+        buf_byte(msg, 0);
+        report_error_tries(n.start, 7001, c"use.unused", buf_slice(msg).ptr,
+            c"remove it (`volec fix` removes every unused import)", buf_slice(tries), true);
+    }
 }
 
 // ---- Suggested fixes (0.18) ----
