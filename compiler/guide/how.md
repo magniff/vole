@@ -43,9 +43,9 @@ in `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the compil
 4. The guide: a sentence and a `tach` example with its `out` block in
    `compiler/guide/std.md` (the API listing at its end is generated);
    `compiler/guide/embed.sh`.
-5. `bootstrap/bootstrap.sh --dev` (the compiler with the new std), then
-   `tests/run.sh std_NAME`, `tests/run.sh -O 0 std_NAME`,
-   `tests/run.sh guide`.
+5. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
+   std), then `tests/run.sh std_NAME guide`, `tests/run.sh -O 0
+   std_NAME`; before reporting, `tests/affected.sh`.
 
 `volec undo` takes a std edit back (and embeds again).
 
@@ -89,8 +89,8 @@ To add an optimization pass.
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
    programs at every level); `--time-passes` for its compile time.
 4. Docs: the module table of `compiler/src/middle/README.md`,
-   `docs/optimizer.md`. Before committing: `bootstrap/gate.sh --quick`
-   (and `bench/run.sh`: no program may get slower).
+   `docs/optimizer.md`. Before reporting: `tests/affected.sh` (and
+   `bench/run.sh`: no program may get slower).
 
 ## add-diagnostic
 
@@ -120,7 +120,9 @@ To add a test case.
 - A program: `tests/run/CATEGORY_NAME.vl` (the category is the name
   up to its first `_`: `std_`, `opt_`, `err_`...), or
   `tests/run/NAME/main.vl` for several modules. Directives in `//`
-  comments: `EXPECT:` (stdout, a line each), `STDIN:`, `ARGS:`,
+  comments: `EXPECT:` (stdout, a line each; holes `{num}`, `{int}`,
+  `{..}` for what varies), `EXPECT-PPM:` (an image; `volec guide
+  testing`), `STDIN:`, `ARGS:`,
   `EXIT:`, `STDERR:`, `ERROR:` (compiling fails with that message),
   `CHECK:` / `CHECK-NOT:` (the IR), `FLAGS:`; the header of
   `tests/run.sh` lists them all. Cases compile with `--deny-warnings`.
@@ -137,11 +139,14 @@ To add a test case.
 
 To add a volec command, or a query command.
 
-A command (`volec NAME ...`): `pub fn run_NAME(argc: i64, argv:
-**u8) -> i64` (diagnostics with `diag`, written with `write_diags()`
-before it returns), and its line in the chain of
-`crate::tools::commands::run_command`: `if streq(word, c"NAME") {
-return run_NAME(argc, argv); }` (`batch` runs it too). Its `--help`: a
+A command (`volec NAME ...`): its arguments, `pub fn NAME_leaf(gpa:
+Gpa) -> Leaf` (a table of `flag`s and `option`s, `cli::line`), and `pub
+fn run_NAME(c: Call) -> i64` reading `c.evs` (its arguments in the
+line's order) or `c.m` (their Matches); diagnostics with `diag`, written
+with `write_diags()` before it returns. Its name in `tops` and its leaf
+in `leaf_of` (`compiler/src/cli/tree.vl`, volec's Command tree), and its
+line in `run_call` (`compiler/src/tools/commands.vl`): `if name ==
+"NAME" { return run_NAME(c); }` (`batch` runs it too). Its `--help`: a
 `Help { cmd: "NAME", text: "..." }` row in `compiler/src/tools/help.vl`
 (15 lines at most; `HELP_COUNT` and the array's length one more), and
 the command in the list `tests/guide/run.sh` checks `--help` for.
@@ -165,8 +170,8 @@ The guide is `compiler/guide/TOPIC.md` (the topics and their order:
 `out` block with what it prints (an `in` block before it: its stdin; an
 `err` block: it must fail to compile); each is compiled and run.
 `tests/guide/run.sh -f compiler/guide/TOPIC.md` checks one topic as you
-write it; then `compiler/guide/embed.sh`, `bootstrap/bootstrap.sh --dev`
-and `tests/run.sh guide`. The core topic has a budget (the test says).
+write it; then `compiler/guide/embed.sh`, `bootstrap/bootstrap.sh --dev
+--no-suite` and `tests/run.sh guide`. The core topic has a budget (the test says).
 
 ## add-module
 

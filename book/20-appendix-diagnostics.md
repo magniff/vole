@@ -100,6 +100,7 @@ format
 | `unsafe` | an unsafe operation outside `unsafe` (chapter 15) |
 | `effect` | a broken effect promise (chapter 12) |
 | `profile`, `format` | warnings: a stale profile (`volec guide tools`), a string that looks like an f-string |
+| `use.unused` | a warning: an import nothing in its file names (`volec fix --only unused` removes it) |
 
 Newer checks have *codes* with a family prefix and a dot. The code is
 stable: its message may be reworded, but the code stays, so it's what

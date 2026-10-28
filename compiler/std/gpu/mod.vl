@@ -30,7 +30,6 @@ pub mod wgsl;
 
 use std::iter::Range;
 
-use hal::{Api, Render};
 use hal::metal as backend;
 pub use hal::{Caps, RawSurface};
 pub use shader::{
@@ -303,6 +302,13 @@ impl Device {
         requires src.kind == self.caps.shader_kind
         else "gpu.format: the shader is not of this device's ShaderKind (dev.caps().shader_kind)"
         {
+        // (what the shader asks of the device is the shader's error, not
+        // a contract: it may come from WGSL text the program reads)
+        if src.reflection.sizes.len() > MAX_SIZES {
+            return Err(Error::Shader(format_in(
+                f"gpu.limits: {src.reflection.sizes.len()} runtime-sized storage bindings; at most {MAX_SIZES} (the sizes buffer)",
+                self.gpa)));
+        }
         var err = Buf::new_in(self.gpa);
         match N::create_shader(self.raw, src, &err) {
             Some(s) => {
@@ -314,8 +320,6 @@ impl Device {
                         workgroup: e.workgroup, sizes_slot: e.sizes_slot,
                     });
                 }
-                assert(src.reflection.sizes.len() <= MAX_SIZES,
-                    "gpu.limits: at most 16 runtime-sized bindings (the sizes buffer)");
                 var sizes: Vec<GroupBinding> = Vec::new_in(self.gpa);
                 sizes.extend_from_slice(src.reflection.sizes.as_slice());
                 var bindings: Vec<Binding> = Vec::new_in(self.gpa);
@@ -334,7 +338,9 @@ impl Device {
     /// this device (MSL on Metal), and its reflection (entry points,
     /// bindings and their slots, vertex inputs, the sizes buffer) feeds
     /// pipeline creation as dev.shader's does. A rejected shader is
-    /// Error::Shader with the compiler's `LINE:COL: error wgsl.CODE: ...`.
+    /// Error::Shader with the compiler's `LINE:COL: error wgsl.CODE: ...`;
+    /// one Metal rejects, `LINE:COL: error wgsl.target: ...` at the WGSL
+    /// function, then Metal's log. Nothing about the shader panics.
     pub fn shader_wgsl(self, src: [u8]) -> Result<Shader, Error> {
         if self.caps.shader_kind != ShaderKind::Msl {
             return Err(Error::Shader(Buf::from_in(
@@ -357,7 +363,20 @@ impl Device {
             Ok(r) => {
                 // (0.20: a temporary passed to a let parameter is rejected)
                 let s = ShaderSource::msl(code.as_slice(), r);
-                self.shader(s)
+                match self.shader(s) {
+                    Ok(sh) => Ok(sh),
+                    Err(Error::Shader(log)) => {
+                        // Metal rejected WGSL the translator took: the
+                        // message at the WGSL function, then Metal's
+                        var m = Buf::new_in(self.gpa);
+                        if wgsl::target_error(src, refl, log.as_slice(), &m) {
+                            m.push_str("\n");
+                        }
+                        m.push_str(log.as_slice());
+                        Err(Error::Shader(m))
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(m) => Err(Error::Shader(m)),
         }
@@ -378,16 +397,22 @@ impl Device {
         };
         let wg = e.workgroup;
         let l = self.limits;
-        assert(wg[0] >= 1 && wg[1] >= 1 && wg[2] >= 1,
-            "gpu.limits: a workgroup size is at least 1");
-        assert(wg[0] <= l.max_compute_workgroup_size_x && wg[1] <= l.max_compute_workgroup_size_y
-            && wg[2] <= l.max_compute_workgroup_size_z, "gpu.limits: workgroup size");
-        assert(wg[0] * wg[1] * wg[2] <= l.max_compute_invocations_per_workgroup,
-            "gpu.limits: invocations per workgroup");
+        // (the shader's sizes against the device's: the shader's error)
+        if wg[0] < 1 || wg[1] < 1 || wg[2] < 1 || wg[0] > l.max_compute_workgroup_size_x
+            || wg[1] > l.max_compute_workgroup_size_y || wg[2] > l.max_compute_workgroup_size_z
+            || wg[0] * wg[1] * wg[2] > l.max_compute_invocations_per_workgroup {
+            return Err(Error::Pipeline(format_in(
+                f"gpu.limits: '{entry}' has @workgroup_size({wg[0]}, {wg[1]}, {wg[2]}); the device takes at most ({l.max_compute_workgroup_size_x}, {l.max_compute_workgroup_size_y}, {l.max_compute_workgroup_size_z}), {l.max_compute_invocations_per_workgroup} in all (dev.limits())",
+                self.gpa)));
+        }
+        if e.sizes_slot >= 31 {
+            return Err(Error::Pipeline(format_in(
+                f"gpu.limits: '{entry}' binds {e.sizes_slot} buffers; at most 30",
+                self.gpa)));
+        }
         var err = Buf::new_in(self.gpa);
         match N::create_compute_pipeline(self.raw, shader.raw, e, &err) {
             Some(p) => {
-                assert(e.sizes_slot < 31, "gpu.limits: the sizes buffer's slot is below 31");
                 var out = ComputePipeline {
                     raw: p, layouts: Layouts::new(), workgroup: wg,
                     sizes: StageSizes::of(shader, e.sizes_slot),
@@ -463,13 +488,16 @@ impl Device {
                 "gpu.format: the depth state needs a depth format"),
             None => {}
         }
+        // (the sizes buffer's slot stays below the vertex buffers: 30 - i)
+        if vs.sizes_slot >= 31 - st.buffer_count || fs.sizes_slot >= 31 {
+            return Err(Error::Pipeline(format_in(
+                f"gpu.limits: the shader's buffers ({vs.sizes_slot} in '{desc.vs}', {fs.sizes_slot} in '{desc.fs}') and {st.buffer_count} vertex buffers take more than Metal's 31 slots",
+                self.gpa)));
+        }
         var err = Buf::new_in(self.gpa);
         match N::create_render_pipeline(self.raw, desc.vertex.raw, vs, desc.fragment.raw, fs,
             desc.has_fs, st, &err) {
             Some(p) => {
-                // (the sizes buffer's slot stays below the vertex buffers: 30 - i)
-                assert(vs.sizes_slot < 31 - st.buffer_count && fs.sizes_slot < 31,
-                    "gpu.limits: the sizes buffer's slot is below the vertex buffers' (30 - i)");
                 var out = RenderPipeline {
                     raw: p, layouts: Layouts::new(), state: st,
                     vs_sizes: StageSizes::of(desc.vertex, vs.sizes_slot),

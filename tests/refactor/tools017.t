@@ -1,6 +1,7 @@
 ## The tools' fixes of 0.17 (tests/refactor/tools017/).
 $ check
-ok: 0 errors in main.vl
+calc.vl:4:17: warning[use.unused] unused import 'area': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+ok: 0 errors, 1 warning in main.vl
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines

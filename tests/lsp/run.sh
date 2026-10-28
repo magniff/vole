@@ -171,7 +171,8 @@ for case in "$HERE"/*.lsp; do
     dir=$(cd "$dir" && pwd -P)
     # (0.25: a session of its own program: tests/lsp/prog-NAME/)
     if [ -d "$HERE/prog-$name" ]; then
-        cp "$HERE/prog-$name"/*.vl "$dir/"
+        # (0.25.2: with its other files, a C header in a directory)
+        cp -R "$HERE/prog-$name/." "$dir/"
     else
         cp "$HERE"/prog/*.vl "$dir/"
     fi
@@ -272,6 +273,48 @@ if [ -z "$why" ]; then
     echo "pass std-cache"
 else
     echo "FAIL std-cache"
+    echo "    $why"
+    STATUS=1
+fi
+
+# (0.25.2) A system header (stdlib.h, where it is depends on the machine):
+# go to definition on `c::malloc` lands on a line of a header declaring
+# it, and a hover shows that C declaration (glibc's is written
+# `malloc (size_t __size)`, macOS's `malloc(size_t __size)`).
+sdir="$WORK/syshdr"
+mkdir -p "$sdir"
+sdir=$(cd "$sdir" && pwd -P)
+printf '%s\n' 'import "stdlib.h" as c;' '' 'fn main() {' \
+    '    let p = unsafe { c::malloc(8) };' '    unsafe { c::free(p); }' '}' >"$sdir/main.vl"
+su="file://$sdir/main.vl"
+{
+    frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+    frame "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
+    frame "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":3,\"character\":24}}}"
+    frame "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"$su\"},\"position\":{\"line\":0,\"character\":9}}}"
+    frame '{"jsonrpc":"2.0","id":5,"method":"shutdown"}'
+    frame '{"jsonrpc":"2.0","method":"exit"}'
+} >"$WORK/sys.in"
+(cd "$sdir" && XDG_CACHE_HOME="$sdir/.cache" exec "$COMPILER" lsp <"$WORK/sys.in" >"$WORK/sys.out" 2>&1)
+rc=$?
+tr -d '\r' <"$WORK/sys.out" | sed 's/Content-Length: [0-9]*$//' | sed '/^$/d' >"$WORK/sys.answers"
+loc=$(sed -n 's/.*"id":2,"result":{"uri":"file:\/\/\([^"]*\.h\)","range":{"start":{"line":\([0-9]*\).*/\1 \2/p' "$WORK/sys.answers")
+hdr=${loc% *}
+line=${loc##* }
+why=
+if [ "$rc" != 0 ] || [ -z "$loc" ]; then
+    why="no definition in a header: $(grep '"id":2' "$WORK/sys.answers" | cut -c1-200)"
+elif ! sed -n "$((line + 1))p" "$hdr" | grep -q malloc; then
+    why="$hdr:$((line + 1)) does not declare malloc"
+elif ! grep '"id":3' "$WORK/sys.answers" | grep -q '```c\\n.*malloc *(.*declared in `'; then
+    why="the hover has no C declaration: $(grep '"id":3' "$WORK/sys.answers" | cut -c1-300)"
+elif ! grep -q '"id":4,"result":{"uri":"file://[^"]*/stdlib.h"' "$WORK/sys.answers"; then
+    why="the import's string does not open stdlib.h: $(grep '"id":4' "$WORK/sys.answers" | cut -c1-200)"
+fi
+if [ -z "$why" ]; then
+    echo "pass system-header"
+else
+    echo "FAIL system-header"
     echo "    $why"
     STATUS=1
 fi

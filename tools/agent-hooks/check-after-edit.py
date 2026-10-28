@@ -751,14 +751,41 @@ def volec_shown(compiler, cwd):
         else compiler
 
 
+def call_end(event):
+    """(0.25.2) The `call-end` record of a tool call (query-first.py wrote
+    its `call` record): the tool, its id, the time in milliseconds, its
+    exit status when the harness gives one, whether it was interrupted,
+    the size of its output."""
+    resp = event.get("tool_response")
+    rec = {"kind": "call-end", "tool": event.get("tool_name", ""), "t": round(time.time(), 3)}
+    if event.get("tool_use_id"):
+        rec["id"] = str(event["tool_use_id"])[-16:]
+    if isinstance(resp, dict):
+        for k in ("exit_code", "exitCode", "returnCode", "code"):
+            if isinstance(resp.get(k), int):
+                rec["exit"] = resp[k]
+                break
+        if resp.get("interrupted"):
+            rec["interrupted"] = True
+        rec["out_bytes"] = len(resp.get("stdout") or "") + len(resp.get("stderr") or "")
+        if (resp.get("stderr") or "").startswith("error"):
+            rec["error"] = True
+    elif resp is not None:
+        rec["out_bytes"] = len(str(resp))
+    return rec
+
+
 def main():
-    if os.environ.get("VOLE_CHECK_HOOK") == "0":
-        return 0
     try:
         event = json.load(sys.stdin)
     except ValueError:
         return 0
     if event.get("hook_event_name", "PostToolUse") != "PostToolUse":
+        return 0
+    if not os.environ.get("VOLE_CHECK_HOOK_LOG"):
+        # (the eval's log is of checks only; its transcripts have the calls)
+        record(event, os.path.abspath(event.get("cwd") or os.getcwd()), call_end(event))
+    if os.environ.get("VOLE_CHECK_HOOK") == "0":
         return 0
     found = trigger(event)
     if not found:

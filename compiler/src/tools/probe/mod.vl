@@ -28,12 +28,15 @@ use crate::base::{
     FILES, IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     streq,
 };
+use crate::cli::line::{Call, EV_MISSING, EV_WORD, Leaf, is_opt, option, short_option, table};
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
 use crate::front::cpp::directives::file_exists;
 use crate::tools::probe::code::{copy_with_probes, has};
 use crate::tools::probe::run::{report, run_program};
-use crate::tools::proc::{buf_cstr, make_dirs, read_file_if, run_capture, write_file_if};
-use crate::tools::query::{c_slice, find_root, parse_count};
+use crate::tools::proc::{
+    buf_cstr, read_file_if, remove_file, run_capture, scratch_dir, write_file_if,
+};
+use crate::tools::query::{c_slice, parse_count};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, put_word, try_begin, try_end, write_diags,
@@ -43,7 +46,6 @@ use crate::tools::query::positions::{LINES, line_end, line_index};
 use crate::tools::query::refs::file_text;
 
 extern "C" {
-    fn getenv(name: *u8) -> *u8;
     fn fork() -> i32;
     fn execvp(file: *u8, argv: **u8) -> i32;
     fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
@@ -105,8 +107,8 @@ fn probe(k: i64) -> *Probe {
     unsafe { PROBES.data[k] as *Probe }
 }
 
-pub fn run_probe(argc: i64, argv: **u8) -> i64 {
-    let status = probe_inner(argc, argv);
+pub fn run_probe(c: Call) -> i64 {
+    let status = probe_inner(c);
     write_diags();
     status
 }
@@ -160,91 +162,103 @@ fn new_probe(site: *u8) -> *Probe {
     }
 }
 
-fn probe_inner(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        PROG = argv[0];
-        TOOL = 0 as *u8;
-        var root = 0 as *u8;
-        var last = 0 as *Probe;
-        var i = 2;
-        while i < argc {
-            let a = argv[i];
-            if streq(a, c"--") {
-                for k in i + 1..argc {
-                    ARGS.push(argv[k] as i64);
-                }
-                break;
+// `probe`'s arguments (0.25.2: a leaf of volec's Command tree, cli/tree.vl).
+// The program's arguments: the words after the first `--` that is no
+// option's value, the values of `args` (cli::line::WordIter: 0.25.1's
+// std::cli has no Arg::last).
+pub fn probe_leaf(gpa: Gpa) -> Leaf {
+    var opts = table(gpa);
+    opts.push(option("max", "N", "at most N hits printed per probe"));
+    opts.push(option("timeout", "S", "the run stopped after S seconds"));
+    opts.push(option("input", "FILE", "the program's stdin"));
+    opts.push(option("root", "ROOT", "the program's root file"));
+    opts.push(short_option("O", "N", "the level the program is built at"));
+    opts.push(option("count", "FILE:LINE", "how many times the line runs"));
+    opts.push(option("args", "ARGS", "-- ARGS: the program's arguments"));
+    Leaf::new(opts, "probe", " -O ").with_last("args", "--args")
+}
+
+fn probe_inner(c: Call) -> i64 {
+    PROG = c.prog();
+    TOOL = 0 as *u8;
+    var root = 0 as *u8;
+    var last = 0 as *Probe;
+    for ev in c.evs.iter() {
+        let a = ev.value;
+        if is_opt(ev, "args") {
+            ARGS.push(a as i64);
+            continue;
+        }
+        if ev.kind == EV_MISSING {
+            return usage(c"a value is needed after", a);
+        }
+        if is_opt(ev, "max") || is_opt(ev, "timeout") {
+            let n = parse_count(a);
+            if n <= 0 {
+                return usage(c"a number is needed after",
+                    if ev.name == "max" { c"--max" } else { c"--timeout" });
             }
-            let valued = streq(a, c"--max") || streq(a, c"--timeout") || streq(a, c"--input")
-                || streq(a, c"--root") || streq(a, c"-O") || streq(a, c"--count");
-            if valued && i + 1 >= argc {
-                return usage(c"a value is needed after", a);
-            }
-            if streq(a, c"--max") || streq(a, c"--timeout") {
-                let n = parse_count(argv[i + 1]);
-                if n <= 0 {
-                    return usage(c"a number is needed after", a);
-                }
-                if streq(a, c"--max") {
-                    MAX_HITS = n;
-                } else {
-                    TIMEOUT = n;
-                }
-                i += 2;
-                continue;
-            }
-            if streq(a, c"--input") {
-                INPUT = argv[i + 1];
-                i += 2;
-                continue;
-            }
-            if streq(a, c"--root") {
-                root = argv[i + 1];
-                ROOT_GIVEN = root;
-                i += 2;
-                continue;
-            }
-            if streq(a, c"-O") || streq(a, c"-O0") || streq(a, c"-O1") || streq(a, c"-O2") {
-                if streq(a, c"-O") {
-                    let b = buf_new();
-                    buf_str(b, c"-O");
-                    buf_str(b, argv[i + 1]);
-                    OPT = buf_cstr(b);
-                    i += 1;
-                } else {
-                    OPT = a;
-                }
-                i += 1;
-                continue;
-            }
-            if streq(a, c"--count") {
-                if site_line(argv[i + 1]) < 1 {
-                    return usage(c"--count takes FILE:LINE, not", argv[i + 1]);
-                }
-                new_probe(argv[i + 1]);
-                last = 0 as *Probe;
-                i += 2;
-                continue;
-            }
-            if a[0] == '-' && a[1] != 0 && site_line(a) < 1 {
-                return usage(c"unknown option", a);
-            }
-            if site_line(a) >= 1 {
-                last = new_probe(a);
-            } else if last == 0 as *Probe {
-                return usage(c"an expression needs a FILE:LINE before it:", a);
+            if ev.name == "max" {
+                MAX_HITS = n;
             } else {
+                TIMEOUT = n;
+            }
+            continue;
+        }
+        if is_opt(ev, "input") {
+            INPUT = a;
+            continue;
+        }
+        if is_opt(ev, "root") {
+            root = a;
+            ROOT_GIVEN = root;
+            continue;
+        }
+        if is_opt(ev, "O") {
+            let b = buf_new();
+            buf_str(b, c"-O");
+            buf_str(b, a);
+            OPT = buf_cstr(b);
+            continue;
+        }
+        if ev.kind == EV_WORD && (ev.text == "-O0" || ev.text == "-O1" || ev.text == "-O2") {
+            OPT = a;
+            continue;
+        }
+        if is_opt(ev, "count") {
+            if site_line(a) < 1 {
+                return usage(c"--count takes FILE:LINE, not", a);
+            }
+            new_probe(a);
+            last = 0 as *Probe;
+            continue;
+        }
+        if ev.kind != EV_WORD
+            || (ev.text.starts_with("-") && ev.text.len() > 1 && site_line(a) < 1) {
+            return usage(c"unknown option", a);
+        }
+        if site_line(a) >= 1 {
+            last = new_probe(a);
+        } else if last == 0 as *Probe {
+            return usage(c"an expression needs a FILE:LINE before it:", a);
+        } else {
+            // UNSAFE: a probe is a raw pointer into PROBES (probe.vl keeps
+            // them so, for run.vl's C-level table).
+            // SAFETY: last is new_probe's result, not null here (checked
+            // above), and PROBES' probes live until the program exits.
+            unsafe {
                 last.exprs.push(a as i64);
             }
-            i += 1;
         }
+    }
+    unsafe {
         if PROBES.count == 0 {
             return usage(c"no FILE:LINE given", 0 as *u8);
         }
         if PROBES.count > PROBES_MAX {
             return usage(c"at most 32 probes", 0 as *u8);
         }
-        var r = find_root(root);
+        var r = crate::tools::query::roots::program_root(root);
         if r == 0 as *u8 && file_exists(probe(0).site_file()) {
             // (no main.vl: the probed file is the root)
             r = probe(0).site_file();
@@ -401,6 +415,7 @@ fn locate(p: inout Probe) -> bool {
                     for x in 0..p.exprs.count {
                         put_word(t, c_slice(p.exprs.data[x] as *u8));
                     }
+                    put_run_args(t);
                     try_end(t);
                     shown += 1;
                 }
@@ -408,6 +423,24 @@ fn locate(p: inout Probe) -> bool {
             dist += 1;
         }
         false
+    }
+}
+
+// (0.25.2) The run's own words, after a `try:` line's probes: `--input
+// FILE`, `-- ARGS...`, as given.
+fn put_run_args(t: i64) {
+    if INPUT != 0 as *u8 {
+        put_word(t, c_slice(c"--input"));
+        put_word(t, c_slice(INPUT));
+    }
+    if ARGS.count > 0 {
+        put_word(t, c_slice(c"--"));
+    }
+    for a in ARGS.items() {
+        // UNSAFE: ARGS keeps the words as i64s; an integer cast to a pointer
+        // SAFETY: each is a pointer probe_inner pushed, a word of argv
+        let w = unsafe { a as *u8 };
+        put_word(t, c_slice(w));
     }
 }
 
@@ -693,30 +726,11 @@ fn starts(s: [u8], p: [u8]) -> bool {
     s.len >= p.len && s[0..p.len] == p
 }
 
-// The directory of the copies and the build: .volec/probe next to the
-// root, else $TMPDIR/volec-probe.
+// The directory of the copies and the build: out of the program's
+// source tree (0.25.2, proc::scratch_dir: the checkout's target/, else
+// $TMPDIR), by the root.
 fn work_dir(root: *u8) -> *u8 {
-    unsafe {
-        let s = c_slice(root);
-        var slash = s.len;
-        while slash > 0 && s[slash - 1] != '/' {
-            slash -= 1;
-        }
-        let b = buf_new();
-        buf_bytes(b, s[0..slash]);
-        buf_bytes(b, ".volec/probe");
-        let local = buf_cstr(b);
-        if make_dirs(local) {
-            return local;
-        }
-        let t = buf_new();
-        let tmp = getenv(c"TMPDIR");
-        buf_str(t, if tmp != 0 as *u8 && tmp[0] != 0 { tmp } else { c"/tmp" });
-        buf_bytes(t, "/volec-probe");
-        let dir = buf_cstr(t);
-        make_dirs(dir);
-        dir
-    }
+    scratch_dir(root, "probe")
 }
 
 fn path_in(dir: *u8, name: [u8]) -> *u8 {
@@ -727,7 +741,25 @@ fn path_in(dir: *u8, name: [u8]) -> *u8 {
     buf_cstr(b)
 }
 
+// The probes run (run_probes_in), then their copies of the sources
+// removed: the build and the outputs stay for the report to name.
 fn run_probes(root: *u8) -> i64 {
+    let status = run_probes_in(root);
+    let dir = work_dir(root);
+    var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    probe_files(&files);
+    for j in 0..files.count {
+        let b = buf_new();
+        buf_str(b, dir);
+        buf_bytes(b, "/copy");
+        buf_int(b, j);
+        buf_bytes(b, ".probe");
+        remove_file(buf_cstr(b));
+    }
+    status
+}
+
+fn run_probes_in(root: *u8) -> i64 {
     unsafe {
         let dir = work_dir(root);
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };

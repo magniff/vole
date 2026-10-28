@@ -23,6 +23,21 @@ compiler/src/main.vl, else its main.vl):
   and the errors; never twice for the same sources (the state records
   the fingerprint it reported on).
 
+(0.25.2) Then the examples' own checks, for the example programs of the
+checkout (examples/.../main.vl) this session changed: uncommitted changes
+(git status) or ones committed since the session began (git log). The
+examples that landed broken were caught by the suite only after the
+commit; these are the parts of it that concern the changed examples:
+
+- `volec fmt --check` of each changed .vl file;
+- a tests/examples case whose SOURCE is the example's main.vl, and no case
+  naming a SOURCE or CSOURCE that does not exist (a moved example);
+- the example's cases, `tests/run.sh example_NAME` (the slow part: once
+  per state of the changed files, like the rest).
+
+Reported like errors, once per state. VOLE_TURN_END_EXAMPLES=0 turns
+these off, =quick keeps all but running the cases.
+
 VOLE_TURN_END=0 turns it off; VOLE_CHECK_TESTS=0 leaves the tests
 out. Logged as `turn-end` records where the check hook logs. Development
 tooling only.
@@ -92,6 +107,144 @@ def needs_check(event, st, root, start):
     return not (entry.get("fp") == fp and clean and tested), fp
 
 
+EXAMPLE_TIMEOUT = 300
+EXAMPLE_LINES = 25
+
+
+def git_paths(top, args):
+    """The paths a git command lists (NUL separated), relative to top."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", top] + args, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    return [p for p in r.stdout.split("\0") if p.strip()]
+
+
+def changed_example_paths(top, start):
+    """The paths under examples/ and tests/examples/ changed in this session:
+    uncommitted (git status, both sides of a rename), or committed since
+    the session began."""
+    paths = set()
+    for entry in git_paths(top, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
+                                 "examples", "tests/examples"]):
+        # `XY path`, and after a rename's entry its old path alone
+        paths.add(entry[3:] if len(entry) > 3 and entry[2] == " " else entry)
+    if start:
+        for p in git_paths(top, ["log", "-z", f"--since=@{int(start)}", "--name-only", "--format=", "--",
+                                 "examples", "tests/examples"]):
+            paths.add(p.strip("\n"))
+    return sorted(p for p in paths if p)
+
+
+def example_root(top, rel):
+    """The example program (the folder of the nearest main.vl, under
+    examples/, not examples/tools/) a changed path belongs to, relative to
+    top; None outside one."""
+    if not rel.startswith("examples/") or rel.startswith("examples/tools/"):
+        return None
+    d = os.path.dirname(rel)
+    while d.startswith("examples/"):
+        if os.path.exists(os.path.join(top, d, "main.vl")):
+            return d
+        d = os.path.dirname(d)
+    return None
+
+
+def example_cases(top):
+    """{source path: [case names]} and the problems of tests/examples: each
+    SOURCE or CSOURCE that does not exist."""
+    cases, missing = {}, []
+    d = os.path.join(top, "tests", "examples")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return cases, missing
+    for n in names:
+        if not n.endswith(".test"):
+            continue
+        try:
+            with open(os.path.join(d, n), errors="replace") as fh:
+                lines = fh.read(8192).splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            for key in ("// SOURCE:", "// CSOURCE:"):
+                if line.startswith(key):
+                    p = line[len(key):].strip()
+                    if key == "// SOURCE:":
+                        cases.setdefault(p, []).append(n[:-len(".test")])
+                    if p and not os.path.exists(os.path.join(top, p)):
+                        missing.append(f"tests/examples/{n} names {p}, which does not exist "
+                                       f"(moved? update its {key[3:-1]} line)")
+    return cases, missing
+
+
+def example_checks(event, st, top, start):
+    """The examples' checks (the docstring above) for checkout top; the
+    report, or None."""
+    import subprocess
+    mode = os.environ.get("VOLE_TURN_END_EXAMPLES", "1")
+    if mode == "0" or not os.path.isdir(os.path.join(top, "tests", "examples")):
+        return None
+    changed = changed_example_paths(top, start)
+    if not changed:
+        return None
+    parts = []
+    for rel in changed:
+        try:
+            s_ = os.stat(os.path.join(top, rel))
+            parts.append(f"{rel}:{s_.st_mtime_ns}:{s_.st_size}")
+        except OSError:
+            parts.append(f"{rel}:gone")
+    fp = cae.hs.digest(parts + [mode])
+    seen = st.setdefault("turn_end_examples", {})
+    if seen.get(top) == fp:
+        return None
+    seen[top] = fp
+    cases, problems = example_cases(top)
+    roots = sorted({r for r in (example_root(top, rel) for rel in changed) if r})
+    compiler = cae.compiler_for(top, root=os.path.join(top, roots[0], "main.vl")) if roots else None
+    t0 = time.time()
+    for root in roots:
+        if compiler:
+            for rel in changed:
+                if rel.endswith(".vl") and example_root(top, rel) == root and os.path.exists(os.path.join(top, rel)):
+                    r = cae.run_typed(compiler, top, ["fmt", "--check", rel])
+                    if r is not None and r.returncode != 0:
+                        problems.append(f"{rel} is not formatted; try: volec fmt {rel}")
+        names = cases.get(f"{root}/main.vl", [])
+        if not names:
+            problems.append(f"{root}: no tests/examples/*.test has '// SOURCE: {root}/main.vl'")
+            continue
+        if mode == "quick" or not compiler or not os.path.exists(os.path.join(top, "tests", "run.sh")):
+            continue
+        for base in sorted({n.split("_")[0] for n in names}):
+            try:
+                r = subprocess.run(["sh", os.path.join(top, "tests", "run.sh"), "-c", compiler, f"example_{base}"],
+                                   cwd=top, capture_output=True, text=True, timeout=EXAMPLE_TIMEOUT)
+            except (OSError, subprocess.TimeoutExpired):
+                problems.append(f"tests/run.sh example_{base}: did not finish in {EXAMPLE_TIMEOUT} s")
+                continue
+            if r.returncode != 0:
+                out = []
+                for line in r.stdout.splitlines():
+                    if line.startswith("tests for "):
+                        break
+                    if line.strip():
+                        out.append(line)
+                problems.append(f"tests/run.sh example_{base} fails:\n" + "\n".join(out[:EXAMPLE_LINES]))
+    cae.record(event, top, {"kind": "turn-end-examples", "examples": roots, "problems": len(problems),
+                            "ms": int((time.time() - t0) * 1000)})
+    if not problems:
+        return None
+    return (f"turn-end: changed examples ({', '.join(roots) or 'tests/examples'}): "
+            f"{len(problems)} problem{'s' if len(problems) != 1 else ''} the suite would report\n"
+            + "\n".join(problems))
+
+
 def main():
     if os.environ.get("VOLE_TURN_END") == "0" or os.environ.get("VOLE_CHECK_HOOK") == "0":
         return 0
@@ -137,6 +290,15 @@ def main():
             if shown.startswith(".."):
                 shown = root
             reports.append(f"turn-end: unchecked changes in {shown}: {', '.join(what)}\n{text}".rstrip())
+    tops = []
+    for r in candidates(event, st) + [os.path.abspath(event.get("cwd") or os.getcwd())]:
+        top = cae.checkout_root(r)
+        if top and top not in tops:
+            tops.append(top)
+    for top in tops:
+        rep = example_checks(event, st, top, start)
+        if rep:
+            reports.append(rep)
     cae.hs.save(event, st)
     if reports:
         json.dump({"decision": "block", "reason": "\n".join(reports)}, sys.stdout)

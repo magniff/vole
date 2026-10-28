@@ -1,0 +1,532 @@
+// fluid2d: Stam's Stable Fluids in 2D, all on the GPU (std::gpu, WGSL
+// compute kernels), drawn into a window (std::window) every frame.
+//
+//   fluid2d [--rows N] [--iters N]               the window: drag to stir
+//   fluid2d --headless [--steps N] [--check]     no window: the numbers
+//
+// sim.vl holds the GPU side, shaders.vl the WGSL, ui.vl the overlay
+// panel and font.vl its font. The frame loop reads nothing back from the
+// GPU and allocates nothing; the headless mode reads back once, at the
+// end, to check that the projection leaves the flow divergence-free and
+// that the dye is carried, not lost.
+
+mod font;
+mod shaders;
+mod sim;
+mod ui;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface, Surface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use sim::{Params, Sim, Splat};
+use ui::{Overlay, VIEWS};
+
+// The brush's colours after the rainbow (0): hues.
+const BRUSHES: [f32; 6] = [0.0, 0.08, 0.16, 0.33, 0.55, 0.78];
+
+#[pure]
+fn hue(h: f32) -> (f32, f32, f32) {
+    (channel(h, 0.0), channel(h, 2.0 / 3.0), channel(h, 1.0 / 3.0))
+}
+
+// One channel of a fully saturated hue (h in turns).
+fn channel(h: f32, k: f32) -> f32 {
+    var x = h + k;
+    x = x - floor_f32(x);
+    var y = x * 6.0 - 3.0;
+    if y < 0.0 {
+        y = -y;
+    }
+    y = y - 1.0;
+    if y < 0.0 { 0.0 } else if y > 1.0 { 1.0 } else { y }
+}
+
+fn floor_f32(x: f32) -> f32 {
+    let t = x as i64 as f32;
+    if t > x { t - 1.0 } else { t }
+}
+
+// What is kept after dt seconds of a fade at `rate` a second.
+#[pure]
+fn fade(rate: f64, dt: f64) -> f32 {
+    (1.0 / (1.0 + rate * dt)) as f32
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+// The headless run: `steps` steps on a rows x rows grid, the demo jets on
+// for the first half and off for the second; then the numbers.
+fn headless(rows: i64, steps: i64, iters: i64, check: bool, gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(rows, rows, iters, Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"fluid2d: {e}");
+            return 1;
+        }
+    };
+    var p = Params::new();
+    let half = steps / 2;
+    var dye_mid = 0.0;
+    for i in 0..steps {
+        p.time = i as f32 * p.dt;
+        p.emit = if i < half { 1.0 } else { 0.0 };
+        s.set_params(p, 1, 1);
+        var enc = s.dev.encoder();
+        s.step(&enc);
+        s.queue.submit(enc.finish());
+        if i == half - 1 {
+            dye_mid = s.dye_total();
+        }
+    }
+    let m = s.measure();
+    let ratio = if m.div_before > 0.0 { m.div_after / m.div_before } else { 0.0 };
+    let kept = if dye_mid > 0.0 { m.dye / dye_mid } else { 0.0 };
+    let incompressible = ratio < 0.05;
+    let conserved = kept > 0.9 && kept < 1.1;
+    if check {
+        println(f"{rows} x {rows} cells, {steps} steps, {s.iters} Jacobi iterations a step");
+        println(f"divergence after projection under 5% of before: {verdict(incompressible)}");
+        println(f"dye kept within 10% while it is only carried: {verdict(conserved)}");
+    } else {
+        println(
+            f"grid:       {rows} x {rows} cells, {steps} steps (jets for {half}), {s.iters} Jacobi iterations a step");
+        println(
+            f"divergence: {m.div_before:.3e} before the last projection, {m.div_after:.3e} after (rms, {ratio * 100.0:.2}%); largest {m.div_max:.3e}");
+        println(
+            f"dye:        {dye_mid:.1} when the jets stopped, {m.dye:.1} {steps - half} steps later ({kept * 100.0:.2}%)");
+    }
+    if incompressible && conserved { 0 } else { 1 }
+}
+
+// The GPU's time for a step, and for a step and a picture of the
+// window's size, on the window's grid (16:9, `rows` down): the mean of
+// `steps` submitted back to back.
+fn bench(rows: i64, steps: i64, iters: i64, gpa: Gpa) -> i32 {
+    let cols = (rows * 16 + 4) / 9;
+    var s = match Sim::new_in(cols, rows, iters, Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"fluid2d: {e}");
+            return 1;
+        }
+    };
+    let (pw, ph) = (2560, 1440);
+    let target = s.dev.texture(pw, ph, Format::Bgra8Unorm, usage: TextureUsage::RENDER_ATTACHMENT);
+    var p = Params::new();
+    var ms: [f64; 2] = [0.0, 0.0];
+    for round in 0..2 {
+        let t0 = monotonic_now();
+        for i in 0..steps {
+            p.time = i as f32 * p.dt;
+            s.set_params(p, pw, ph);
+            var enc = s.dev.encoder();
+            s.step(&enc);
+            if round == 1 {
+                s.draw(&enc, target.view());
+            }
+            s.queue.submit(enc.finish());
+        }
+        let _ = s.queue.wait_idle();
+        ms[round] = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / steps as f64;
+    }
+    println(
+        f"{cols} x {rows} cells, {s.iters} Jacobi iterations: {ms[0]:.2} ms a step, {ms[1]:.2} ms with a {pw} x {ph} picture");
+    0
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The mouse, the keys and the panel's settings, between frames.
+struct Input {
+    // a button held: left stirs with dye, right without
+    left: bool,
+    right: bool,
+    x: f64,
+    y: f64,
+    px: f64,
+    py: f64,
+    // when the user last stirred (seconds on the frame clock)
+    last: f64,
+    paused: bool,
+    view: i64,
+    brush: i64,
+    // the brush's radius, in 0.5% of the grid's height
+    size: i64,
+    // the dye's fade, a second
+    fade: f64,
+    vorticity: f64,
+    jets: bool,
+    bloom: bool,
+    shade: bool,
+    reset: bool,
+    quit: bool,
+    // the overlay changed: write it again
+    dirty: bool,
+}
+
+// What a key does.
+fn on_key(inp: inout Input, o: inout Overlay, key: Logical) {
+    match key {
+        Logical::Char(c) => {
+            if c == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if c == 'r' as u32 {
+                inp.reset = true;
+            } else if c == 'v' as u32 {
+                inp.view = (inp.view + 1) % 4;
+            } else if c >= '1' as u32 && c <= '4' as u32 {
+                inp.view = (c - '1' as u32) as i64;
+            } else if c == 'c' as u32 {
+                inp.brush = (inp.brush + 1) % (BRUSHES.len() + 1);
+            } else if c == 'e' as u32 {
+                inp.jets = !inp.jets;
+            } else if c == 'b' as u32 {
+                inp.bloom = !inp.bloom;
+            } else if c == 'l' as u32 {
+                inp.shade = !inp.shade;
+            } else if c == 'h' as u32 {
+                o.hide();
+            } else if c == '?' as u32 || c == '/' as u32 {
+                o.toggle();
+            } else if c == 'q' as u32 {
+                inp.quit = true;
+            }
+        }
+        Logical::Named(Named::Tab) => o.toggle(),
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+    inp.dirty = true;
+}
+
+// A click on the panel's [-] or [+] of control k.
+fn on_control(inp: inout Input, s: inout Sim, k: i64, d: i64) {
+    if k == ui::JACOBI {
+        s.iters = clamp(s.iters + 10 * d, 0, 200);
+    } else if k == ui::VORTICITY {
+        inp.vorticity = clamp_f(inp.vorticity + 2.0 * d as f64, 0.0, 40.0);
+    } else if k == ui::BRUSH {
+        inp.size = clamp(inp.size + d, 1, 12);
+    } else if k == ui::FADE {
+        inp.fade = clamp_f(inp.fade + 0.05 * d as f64, 0.0, 2.0);
+    }
+    inp.dirty = true;
+}
+
+#[pure]
+fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+#[pure]
+fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+// The brush's colour at `time` (the rainbow turns).
+#[pure]
+fn brush_color(inp: Input, time: f32) -> (f32, f32, f32) {
+    if inp.brush == 0 { hue(time * 0.11) } else { hue(BRUSHES[inp.brush - 1]) }
+}
+
+// The splat of the mouse's stroke since the last frame, in cells.
+#[pure]
+fn stroke(inp: Input, s: Sim, sw: i64, sh: i64, dt: f32, time: f32) -> Splat {
+    let kx = s.w as f64 / sw as f64;
+    let ky = s.h as f64 / sh as f64;
+    let x0 = (inp.px * kx) as f32;
+    let y0 = (inp.py * ky) as f32;
+    let x1 = (inp.x * kx) as f32;
+    let y1 = (inp.y * ky) as f32;
+    let (r, g, b) = brush_color(inp, time);
+    Splat {
+        x0: x0, y0: y0, x1: x1, y1: y1, fx: (x1 - x0) / dt * 0.9, fy: (y1 - y0) / dt * 0.9,
+        radius: 0.005 * inp.size as f32 * s.h as f32, r: r, g: g, b: b,
+        amount: if inp.left { 0.8 } else { 0.0 },
+    }
+}
+
+// One frame: the parameters, a step (unless paused) and the picture, in
+// one submission, then presented. Nothing is read back, and nothing
+// allocated: every buffer and bind group was made by Sim::new_in, and
+// the parameters are packed by a #[pure] function. (#[no_alloc] cannot
+// be checked here: a call into Objective-C, which Metal is, may run any
+// code, so the compiler gives it every effect.)
+fn frame(s: inout Sim, surf: inout Surface, p: Params, step: bool) {
+    s.set_params(p, surf.width, surf.height);
+    match surf.frame() {
+        Ok(f) => {
+            var enc = s.dev.encoder();
+            if step {
+                s.step(&enc);
+            }
+            s.draw(&enc, f.texture.view());
+            s.queue.submit(enc.finish());
+            f.present(&s.queue);
+        }
+        Err(_) => {}
+    }
+}
+
+fn windowed(rows: i64, iters: i64, vorticity: f64, view: i64, panel: i64, max_frames: i64,
+    shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("fluid2d: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("fluid2d", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("fluid2d: no window");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    let cols = (rows * sz.w + sz.h / 2) / sz.h;
+    var s = match Sim::new_in(cols, rows, iters, Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"fluid2d: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"fluid2d: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input {
+        left: false, right: false, x: 0.0, y: 0.0, px: 0.0, py: 0.0, last: -100.0, paused: false,
+        view: view, brush: 0, size: 4, fade: 0.3, vorticity: vorticity, jets: true, bloom: true,
+        shade: true, reset: false, quit: false, dirty: true,
+    };
+    var o = Overlay::new();
+    if panel == ui::EXPANDED {
+        o.toggle();
+    } else if panel == ui::HIDDEN {
+        o.hide();
+    }
+    let at = ui::place(sz.scale);
+    var p = Params::new();
+    let start = monotonic_now();
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    // the frame rate over the last half second
+    var fps = 0.0;
+    var ms = 0.0;
+    var fps_frames = 0;
+    var fps_since = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                // the step follows the display's clock (60 or 120 Hz),
+                // within limits that keep it stable after a stall
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 { dt = 1.0 / 60.0; }
+                if dt < 1.0 / 240.0 { dt = 1.0 / 240.0; }
+                prev = now;
+                if inp.reset {
+                    s.reset();
+                    inp.reset = false;
+                }
+                let step = !inp.paused;
+                if step { clock += dt; }
+                p.dt = dt as f32;
+                // the dye fades in a few seconds, the flow more slowly
+                p.dye_keep = fade(inp.fade, dt);
+                p.vel_keep = fade(0.08, dt);
+                p.vorticity = inp.vorticity as f32;
+                p.time = clock as f32;
+                p.view = inp.view;
+                p.bloom = if inp.bloom { 0.8 } else { 0.0 };
+                p.shade = if inp.shade { 1.0 } else { 0.0 };
+                // the jets fade out while the user stirs, and back in 3 s after
+                let want = if inp.jets && now - inp.last > 3.0 { 1.0 } else { 0.0 };
+                let k = if dt * 1.5 > 1.0 { 1.0 } else { dt * 1.5 };
+                p.emit = p.emit + (want as f32 - p.emit) * k as f32;
+                if p.emit < 0.001 { p.emit = 0.0; }
+                p.n_splats = 0;
+                if (inp.left || inp.right) && step {
+                    p.splats[0] = stroke(inp, s, surf.width, surf.height, p.dt, p.time);
+                    p.n_splats = 1;
+                }
+                inp.px = inp.x;
+                inp.py = inp.y;
+                p.brush = brush_color(inp, p.time);
+                p.ui_x = at.x as f32;
+                p.ui_y = at.y as f32;
+                p.ui_px = at.px as f32;
+                p.ui_shown = o.mode != ui::HIDDEN;
+                p.ui_cols = o.cols();
+                p.ui_rows = o.rows();
+                fps_frames += 1;
+                if now - fps_since >= 0.5 {
+                    fps = fps_frames as f64 / (now - fps_since);
+                    ms = 1000.0 / fps;
+                    fps_since = now;
+                    fps_frames = 0;
+                    inp.dirty = true;
+                }
+                if inp.dirty && o.mode != ui::HIDDEN {
+                    o.compose(ui::Status {
+                        fps: fps, ms: ms, w: s.w, h: s.h, iters: s.iters, view: inp.view,
+                        brush: inp.brush, paused: inp.paused, jets: inp.jets,
+                        vorticity: inp.vorticity, size: inp.size, fade: inp.fade,
+                    });
+                    s.set_text(o.cells[..]);
+                    inp.dirty = false;
+                }
+                frame(&s, &surf, p, step);
+                frames += 1;
+                if frames == 1 { first = now; }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"{s.w} x {s.h} cells, {s.iters} Jacobi iterations, {sz.w} x {sz.h} pixels: {frames} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(surf.width, surf.height, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"fluid2d: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        match ui::hit(o, at, m.x, m.y) {
+                            Some((k, d)) => if k >= 0 { on_control(&inp, &s, k, d) },
+                            None => {
+                                match m.button {
+                                    Button::Left => inp.left = true,
+                                    Button::Right => inp.right = true,
+                                    _ => {}
+                                }
+                                inp.x = m.x;
+                                inp.y = m.y;
+                                inp.px = m.x;
+                                inp.py = m.y;
+                            }
+                        }
+                    }
+                    MouseAction::Release => {
+                        match m.button {
+                            Button::Left => inp.left = false,
+                            Button::Right => inp.right = false,
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Move => {
+                        inp.x = m.x;
+                        inp.y = m.y;
+                    }
+                }
+                if inp.left || inp.right {
+                    inp.last = secs(monotonic_now().saturating_sub(start));
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    on_key(&inp, &o, k.key);
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("fluid2d", gpa)
+        .about("Stable Fluids on the GPU: a window to stir, or the headless check")
+        .arg(Arg::flag("headless").help("no window: run --steps steps, then print the numbers"))
+        .arg(Arg::option("steps")
+            .default("400")
+            .help("headless: the steps (jets for the first half)"))
+        .arg(Arg::flag("check").help("headless: print only the checks' verdicts"))
+        .arg(
+            Arg::flag("bench").help(
+                "headless: time the steps on the window's grid, print ms a step"))
+        .arg(Arg::option("rows")
+            .value_name("N")
+            .help("the grid's rows (window and --bench: 720; headless: 256)"))
+        .arg(Arg::option("iters").value_name("N").default("40").help("Jacobi iterations a step"))
+        .arg(Arg::option("vorticity").value_name("X").default("10")
+            .help("the vorticity confinement's strength (0: none)"))
+        .arg(Arg::option("view").value_name("NAME").default("dye")
+            .help("window: the first view: dye, velocity, pressure or curl"))
+        .arg(Arg::option("panel").value_name("MODE").default("compact")
+            .help("window: the overlay: compact, expanded or hidden"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("window: with --frames, the last frame as a PPM image"));
+    let m = cli.parse_or_exit(env::args());
+    let headless_mode = m.flag("headless");
+    let rows = match m.get("rows") {
+        Some(r) => parse_int(r).unwrap_or(0),
+        None => if headless_mode && !m.flag("bench") { 256 } else { 720 },
+    };
+    let iters = parse_int(m.get("iters").unwrap_or("40")).unwrap_or(40);
+    let steps = parse_int(m.get("steps").unwrap_or("400")).unwrap_or(400);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    if rows < 8 || rows > 4096 || iters < 0 || steps < 2 {
+        eprintln("fluid2d: --rows 8..4096, --iters 0 or more, --steps 2 or more");
+        return 2;
+    }
+    if headless_mode {
+        if m.flag("bench") {
+            return bench(rows, steps, iters, gpa);
+        }
+        return headless(rows, steps, iters, m.flag("check"), gpa);
+    }
+    let name = m.get("view").unwrap_or("dye");
+    var view = -1;
+    for i in 0..VIEWS.len() {
+        if VIEWS[i] == name {
+            view = i;
+        }
+    }
+    if view < 0 {
+        eprintln(f"fluid2d: no view named {name} (dye, velocity, pressure, curl)");
+        return 2;
+    }
+    let vort = match std::num::parse_f64(m.get("vorticity").unwrap_or("10")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("fluid2d: --vorticity takes a number");
+            return 2;
+        }
+    };
+    let pm = m.get("panel").unwrap_or("compact");
+    let panel = if pm == "expanded" { ui::EXPANDED } else if pm == "hidden" { ui::HIDDEN }
+        else { ui::COMPACT };
+    windowed(rows, iters, vort, view, panel, frames, m.get("shot").unwrap_or(""), gpa)
+}

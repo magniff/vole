@@ -229,7 +229,8 @@ check_block() {
     [ -f "$d/stdin" ] || : >"$d/stdin"
     ( cd "$d" && exec ./prog <stdin >run.out 2>&1 ) &
     pid=$!
-    (sleep 20 && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    # (0.25.2: extended while the machine is loaded)
+    sh "$ROOT/tests/watchdog.sh" 20 "$pid" >/dev/null 2>&1 &
     watchdog=$!
     wait "$pid"
     rc=$?
@@ -424,6 +425,28 @@ if [ "$size" -le 21500 ] && [ "$page" -le 4500 ] \
     result pass guide-std-index
 else
     result FAIL guide-std-index "volec guide std --whole is $size bytes (21500 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+fi
+
+# (0.25.2) The GPU words agents searched for find guide gpu first: its
+# index buffers (and the line saying there are no indirect draws), bind
+# groups, uniform layout, workgroups, usages and formats.
+why=""
+for q in "index buffer:index-buffers" "indirect:index-buffers" "storage buffer:" \
+    "bind group:bind-groups" "uniform:uniform-and-storage-layout" "workgroup:workgroups" \
+    "surface format:usages-and-formats" "buffer usage:usages-and-formats"; do
+    words=${q%%:*}
+    want=${q#*:}
+    # shellcheck disable=SC2086
+    first=$("$COMPILER" guide --find $words 2>&1 | grep '^# ' | head -1)
+    case "$first" in
+        "# gpu#$want"*) ;;
+        *) why="$why '$words' -> '$first';" ;;
+    esac
+done
+if [ -z "$why" ]; then
+    result pass guide-find-gpu
+else
+    result FAIL guide-find-gpu "not guide gpu first:$why"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the

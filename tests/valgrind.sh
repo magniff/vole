@@ -100,7 +100,7 @@ case "compiler/src/main.vl" in
     *"$FILTER"*)
         n=$((n + 1))
         read -r _ <&3
-        ( check compiler/src/main.vl 2 "$WORK/$n" -j4 >"$WORK/$n.result"; echo >&3 ) & ;;
+        ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check compiler/src/main.vl 2 "$WORK/$n" -j4 >"$WORK/$n.result" ) & ;;
 esac
 while read -r f; do
     # The case's FLAGS (tests/directives.awk, as tests/run.sh reads them).
@@ -113,7 +113,7 @@ while read -r f; do
         n=$((n + 1))
         read -r _ <&3
         # shellcheck disable=SC2086
-        ( check "$f" "$o" "$WORK/$n" $flags >"$WORK/$n.result"; echo >&3 ) &
+        ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$f" "$o" "$WORK/$n" $flags >"$WORK/$n.result" ) &
     done
 done <"$list"
 wait

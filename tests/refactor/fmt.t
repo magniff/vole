@@ -136,6 +136,7 @@ example:
 $ explain fmt
 fmt.bad-in	error, exit 1
 fmt.no-file	error, exit 1
+fmt.no-git	error, exit 1
 fmt.none	note, exit 0
 fmt.skipped	note, exit 0
 fmt.unformatted	error, exit 1

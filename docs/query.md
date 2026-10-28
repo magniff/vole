@@ -48,6 +48,33 @@ ROOT` alone too). Without it: `$VOLE_ROOT`, else `./main.vl`, else
 the file as the module loader names it (relative to the current
 directory when ROOT is).
 
+Program roots (0.25.2), for every command that reads a program (query,
+edit, refactor, fix, check, probe, test; `tools/query/roots.vl`):
+
+- `--root DIR` is `DIR/main.vl`; a ROOT that is a module of a program
+  (a `mod NAME;` of a main.vl above it declares it) is that program's
+  main.vl, and `query items FILE` lists that module.
+- With no ROOT, a `FILE` or `FILE:LINE` argument of another program than
+  the default one names it: `query context examples/nes/check.vl:233`,
+  `edit patch examples/nes/check.vl --old A --new B --all` and `probe
+  examples/nes/check.vl:235 x -- --check` work from the root of the
+  tree. Their `try:` lines then say `--root examples/nes/main.vl`.
+- A NAME the default program does not define, with no ROOT and no
+  `$VOLE_ROOT`, is looked for in the other programs under the current
+  directory (`git grep` of its definition, tracked and untracked files):
+  each gets a `try:` line, the command as it was run with `--root` (at
+  most 3, examples' before tests'). When one program defines it, a
+  question of `query` is answered from there, with `note
+  query.other-root: not in compiler/src/main.vl; answered from
+  examples/gpu/life/main.vl (--root examples/gpu/life/main.vl)`.
+
+```
+$ volec query context renderer_new
+error query.no-match: no definition 'renderer_new'
+try: volec query context renderer_new --root examples/gpu/pathtrace/main.vl
+try: volec query context renderer_new --root examples/gpu/voxel/main.vl
+```
+
 Several NAMEs are answered in one call, in turn (`show A B C`); refs and
 callers list the references to all of them together, each line naming
 its target. A NAME that matches nothing gets its diagnostic and the
@@ -914,6 +941,7 @@ when it was given, names quoted for the shell when they need it).
 | `query.program-errors` | warning | (the answer's) | the program has errors: their number, and the first one when nothing answered | the compilation that lists them all, one per line |
 | `query.program-errors` | error | 1 | the program could not be parsed at all | the same |
 | `query.no-root` | error | 2 | no ROOT, no `$VOLE_ROOT`, no `./main.vl` or `./compiler/src/main.vl` | the command with a root |
+| `query.other-root` | note | (the answer's) | (0.25.2) the NAME is not in the default program; one other program under the current directory defines it, and the answer is that program's | the command with its `--root` |
 | `query.bad-root` | error | 2 | ROOT cannot be read | the command without it, when a default root exists |
 | `query.usage` | error | 2 | no command, an unknown command or option, a missing NAME or option value, an extra argument | the command corrected (the nearest command, the option dropped, `--limit 60`), or `items` |
 
@@ -1099,6 +1127,11 @@ The program is built into `.volec/test/prog` next to ROOT when a
 `.vl` file under ROOT's directory is newer than the build, or the
 compiler or `-O` level differs; each run's stdout and stderr stay there
 (`NAME.got`, `NAME.err`). A case may run `--timeout S` seconds (10).
+(0.25.2) A run stopped by the limit that used under half of it in
+processor time (wait4's user and system time) was waiting, not running:
+other processes had the processors, or a disk or swap stalled it; it
+runs again, at most twice, and its last run is judged. A loop is still
+stopped after S seconds, once.
 
 ```text
 $ volec test --timeout 1
@@ -1188,8 +1221,10 @@ tests/refactor/testcmd.t has a transcript.
   from the powers of two each probe announces (`at least N`).
 - `volec reduce FILE --until 'CMD' [--out F] [--max-runs N]
   [--timeout S]` (tools/reduce.vl): delta debugging on lines; CMD
-  (`sh -c`, `{}` the candidate, which keeps FILE's name in
-  `.volec/reduce/`) exits 0 while the failure is there; each run in
+  (`sh -c`, `{}` the candidate, which keeps FILE's name in the
+  scratch directory: `target/scratch/reduce/` of the checkout, else
+  `$TMPDIR/volec-reduce/`; 0.25.2, never in the source tree) exits 0
+  while the failure is there; each run in
   a process group killed after S seconds (5).
 
 Codes: `probe.usage`, `probe.no-root`, `probe.no-file`,

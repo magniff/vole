@@ -13,8 +13,15 @@
 # usage: tests/window/run.sh [-c COMPILER] [-v]
 #   -v   print the bench lines too
 #
-# Prints `pass NAME` or `FAIL NAME` (and why) for each check; exits 1 if
-# one failed.
+# Prints `pass NAME` or `FAIL NAME` (and why) for each check, or (0.25.2)
+# `skip NAME: why` for one that cannot run here: the display tests without
+# a window server, and the checks that need frames while the display can
+# give none (the screen locked, the display asleep, the window occluded:
+# main.vl's no_frames_code; VOLE_TEST_NO_FRAMES=1 pretends it). A check
+# that gets no frames while the display could give them is a FAIL. A time
+# budget missed (`slow NAME`: idle CPU) is a FAIL on an idle machine and a
+# skip on a loaded one (tests/budget.sh). Exits 1
+# if one failed.
 
 set -u
 LC_ALL=C
@@ -57,9 +64,11 @@ status=$?
 awk '
     /^ok / { print "pass window_" $2; next }
     /^FAIL / { sub(/^FAIL /, ""); print "FAIL window_" $0; bad = 1; next }
-    /^skip / { print "pass window (" $0 ")"; next }
+    /^skip / { sub(/^skip /, ""); print "skip window_" $0; next }
 ' "$WORK/run.out"
-if [ $status -ne 0 ] && ! grep -q '^FAIL' "$WORK/run.out"; then
+# (0.25.2) the time budgets missed: FAIL when idle, SKIP when loaded
+sh "$ROOT/tests/budget.sh" window_ "$WORK/run.out" || status=1
+if [ $status -ne 0 ] && ! grep -q -e '^FAIL' -e '^slow' "$WORK/run.out"; then
     echo "FAIL window_run: exit $status"
     tail -5 "$WORK/run.out" | sed 's/^/    /'
     exit 1
@@ -70,7 +79,9 @@ fi
 # has ink (bytes other than the background's 0x18). With a display only.
 app_status=0
 if grep -q '^skip display' "$WORK/run.out"; then
-    echo "pass window (voltty_app skipped: no display)"
+    echo "skip window_voltty_app: no display"
+elif grep -q '^skip frame_on_request' "$WORK/run.out"; then
+    echo "skip window_voltty_app: no frames ($(sed -n 's/^skip frame_on_request: //p' "$WORK/run.out"))"
 elif ! (cd "$ROOT" && "$COMPILER" -O2 examples/voltty/app/main.vl -o "$WORK/voltty") \
         >"$WORK/app-build.out" 2>&1; then
     echo "FAIL window_voltty_app_build:"
@@ -91,8 +102,11 @@ else
     [ -f "$WORK/app.ppm" ] && ink=$(tr -d '\030' <"$WORK/app.ppm" | wc -c | tr -d ' ')
     if [ "$ink" -gt 2000 ]; then
         echo "pass window_voltty_app"
+    elif probe=$(cd "$ROOT" && "$WORK/prog" probe 2>&1) && case "$probe" in "frames: none: "*) true ;; *) false ;; esac; then
+        # (0.25.2) no frames here now: a skip, with the probe's reason
+        echo "skip window_voltty_app: no text drawn, and ${probe#frames: none: }"
     else
-        echo "FAIL window_voltty_app: no text drawn ($ink bytes of ink)"
+        echo "FAIL window_voltty_app: no text drawn ($ink bytes of ink; the frame probe: ${probe:-not run})"
         sed 's/^/    /' "$WORK/app.out" | head -5
         app_status=1
     fi

@@ -129,10 +129,10 @@ for how in $hows; do
     case "$SRC" in
         *"$FILTER"*)
             n=$((n + 1)); read -r _ <&3
-            ( check "$how" "$SRC" 0 "$n" >"$WORK/$n.result"; echo >&3 ) &
+            ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$how" "$SRC" 0 "$n" >"$WORK/$n.result" ) &
             if [ "$how" = checkalloc ]; then
                 n=$((n + 1)); read -r _ <&3
-                ( check "$how" "$SRC" 2 "$n" -j4 >"$WORK/$n.result"; echo >&3 ) &
+                ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$how" "$SRC" 2 "$n" -j4 >"$WORK/$n.result" ) &
             fi ;;
     esac
     while read -r f; do
@@ -144,7 +144,7 @@ for how in $hows; do
         for o in 0 2; do
             n=$((n + 1)); read -r _ <&3
             # shellcheck disable=SC2086
-            ( check "$how" "$f" "$o" "$n" $flags >"$WORK/$n.result"; echo >&3 ) &
+            ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$how" "$f" "$o" "$n" $flags >"$WORK/$n.result" ) &
         done
     done <"$list"
 done

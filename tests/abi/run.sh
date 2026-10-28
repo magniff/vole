@@ -142,7 +142,7 @@ last=$((FIRST + COUNT))
 seed=$FIRST
 while [ "$seed" -lt "$last" ]; do
     read -r _ <&3
-    ( test_seed "$seed"; echo >&3 ) &
+    ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; test_seed "$seed" ) &
     seed=$((seed + 1))
 done
 wait

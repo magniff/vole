@@ -12,6 +12,7 @@ use crate::base::{
     IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, getenv, streq,
 };
+use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 use crate::front::cpp::directives::file_exists;
 use crate::tools::proc::{buf_cstr, read_file_if, rename_file, write_file_if};
 use crate::tools::query::c_slice;
@@ -25,7 +26,7 @@ use crate::tools::testrun::{
 extern "C" {
     fn fork() -> i32;
     fn execvp(file: *u8, argv: **u8) -> i32;
-    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn wait4(pid: i32, status: *i32, options: i32, usage: *i64) -> i32;
     fn open(path: *u8, flags: i32) -> i32;
     fn creat(path: *u8, mode: i32) -> i32;
     fn dup2(from: i32, to: i32) -> i32;
@@ -33,7 +34,6 @@ extern "C" {
     fn alarm(seconds: u32) -> u32;
     fn _exit(code: i32) -> !;
     fn chmod(path: *u8, mode: i32) -> i32;
-    fn sysconf(name: i32) -> i64;
     fn getenv(name: *u8) -> *u8;
 }
 
@@ -57,8 +57,9 @@ const LEVEL_CASES: i64 = 20;
 
 // A process to run: argv, stdin from `input` (0: /dev/null), stdout and
 // stderr into files; its exit status (128 + a signal, -1 past the time
-// limit).
-pub struct Job { argv: **u8, input: *u8, out: *u8, err: *u8, pid: i32, status: i64 }
+// limit); reruns: the times it was run again after its time limit passed
+// while it was waiting, not running (run_jobs).
+pub struct Job { argv: **u8, input: *u8, out: *u8, err: *u8, pid: i32, status: i64, reruns: i64 }
 
 pub static var JOBS: *Job = 0 as *Job;
 static var JOB_COUNT: i64 = 0;
@@ -75,7 +76,7 @@ pub fn add_job(argv: **u8, input: *u8, out: *u8, err: *u8) -> i64 {
             JOBS = bigger;
             JOB_CAP = cap;
         }
-        JOBS[JOB_COUNT] = Job { argv, input, out, err, pid: 0, status: 0 };
+        JOBS[JOB_COUNT] = Job { argv, input, out, err, pid: 0, status: 0, reruns: 0 };
         JOB_COUNT += 1;
         JOB_COUNT - 1
     }
@@ -113,12 +114,19 @@ fn start_job(j: i64) {
 }
 
 // Runs jobs from..JOB_COUNT, as many at once as there are processors.
+// (0.25.2) A job stopped by its time limit having run for less than half
+// of it (its user and system time, from wait4) spent the limit waiting,
+// not running: other processes had the processors (a loaded machine), or
+// it was stalled behind a disk or swap. It is run again, at most twice, and judged by its
+// last run; a program that loops is stopped once, as before.
 pub fn run_jobs(from: i64) {
+    let host = crate::host_target();
+    let most = crate::middle::threads::processors(host == T_AARCH64_MACOS
+        || host == T_X86_64_MACOS);
+    // (struct rusage, 144 bytes on both: ru_utime and ru_stime first, each
+    // a struct timeval of an i64 tv_sec and a tv_usec in the low 32 bits)
+    let usage = alloc_array::<i64>(18);
     unsafe {
-        var most = sysconf(58);
-        if most < 1 {
-            most = 4;
-        }
         var next = from;
         var running = 0;
         while next < JOB_COUNT || running > 0 {
@@ -133,7 +141,10 @@ pub fn run_jobs(from: i64) {
                 break;
             }
             var status = 0 as i32;
-            let pid = waitpid(-1, &status, 0);
+            // UNSAFE: wait4 is C's; no std function gives a child's resource usage.
+            // SAFETY: usage holds 18 i64s, the 144 bytes of struct rusage on
+            // macOS and Linux (64-bit); status is a local i32.
+            let pid = wait4(-1, &status, 0, usage);
             if pid <= 0 {
                 break;
             }
@@ -144,6 +155,16 @@ pub fn run_jobs(from: i64) {
                         else if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) };
                     JOBS[j].pid = 0;
                     running -= 1;
+                    let ran_us = (usage[0] + usage[2]) * 1000000 + (usage[1] & 0xffffffff) + (
+                        usage[3] & 0xffffffff);
+                    if JOBS[j].status == -1 && JOBS[j].reruns < 2
+                        && ran_us * 2 < TIMEOUT * 1000000 {
+                        JOBS[j].reruns += 1;
+                        start_job(j);
+                        if JOBS[j].pid > 0 {
+                            running += 1;
+                        }
+                    }
                 }
             }
         }

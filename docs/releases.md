@@ -59,8 +59,78 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
 | 0.25.0 | `v0.25.0` | 0.24.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | compile speed (the resolve scans, a line index, the lexer, data as bytes, the assembler, `ld` run directly, an in-house Mach-O linker by default on aarch64-macos: the -O0 self-compile and `check` near half the instructions, a hello world linked 4 times faster) and a semantics audit (five red-team audits, about 1,600 probes kept as tests, a value-semantics fuzzer as the gate's `fuzz-sem`; about 30 families of soundness bugs of released versions fixed: views, exclusivity, drops, threads, the optimizer); the Vole Book (book/, every example checked); std::cli across the examples; `#[link]` and `-framework`; every name resolved in the language server; the chain rebuilt from the seed and checked against recorded hashes (`chain-fresh`, `chain-diverse`) |
 | 0.25.1 | `v0.25.1` | 0.25.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | one standard style, applied to the whole tree: `volec fmt` groups imports (`std`, `crate`, the rest) and writes trailing commas in lists whose closing bracket starts a line; docs/style.md, `guide fmt` |
+| 0.25.2 | `v0.25.2` | 0.25.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | soundness fixes found by real programs (the -O2 vector loop unrolled by 3, an assignment's let-argument temporaries, std's move exemption narrowed); volec's command line on std::cli; `use.unused`; program roots for the tools; the language server for single files and C headers; WGSL's MSL reserved names; four test tiers, `tools/premerge.sh`, a commit hook, a Linux smoke row and a gate that cannot hang |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.2
+
+Bugs that real programs found (the showcase examples and agents' large
+ports; the fuzzers had not), the tools agents asked for, and a faster,
+steadier way to test.
+
+- **Soundness** (each also in 0.25.1):
+  - `-O2`'s vector loop could be unrolled by 3, but the trip mask
+    `trips & -(U*VF)` needs a power of two: a loop of 14 iterations ran
+    past its end. It unrolls by 4, 2 or 1 now; 1,173 generated loops
+    (tools/loopsweep) are tests.
+  - `t = t.add(size(leaf_of(gpa)))`: an owned assignment whose right side
+    lends a temporary to a `let` argument read a function's address
+    instead of the value, at every level (or gave a false error). The
+    checked right side's temporaries are no longer hoisted twice, and
+    they drop after the old value (conventions.md, 2.2). 233 of 330
+    generated sink/inout cases (tools/sinksweep) printed wrong values
+    before; `fuzz-sem --assign-calls` finds it on 0.25.1.
+  - std's exemption from the move checks is gone except for std's root,
+    `std::iter` and `std::collections`; the survey found no double free
+    left (tests/std/moves.sh). `std::gpu::wgsl`'s
+    `let f = m.functions[h]` double frees fixed.
+  - `requires`/`ensures` arguments resolve in the caller's module.
+- **volec's command line is std::cli**: `fn main(gpa)` reads
+  `std::env::args_os()`, one command tree (cli/tree.vl); the same
+  behaviour on 1,334 command lines; a non-UTF-8 argument is exit 1.
+  std::cli gained `global`, `alias`, `hide`, `num_values`,
+  `default_missing`, `allow_hyphen_values`, `last`, `conflicts_with`,
+  `subcommand_required` and the errors `MissingSubcommand` and
+  `ArgumentConflict`.
+- **Diagnostics**: unused imports are a warning, `use.unused` (an error
+  under `--deny-warnings`; 79 removed from the tree); a mismatch names
+  the literal default at its `let`; `str::from_utf8(b)?` is suggested
+  only where it type-checks; `fix --suggested` reads edited std.
+- **Tools**: query and edit work on any program, not only the compiler's
+  (`--root DIR`, or a FILE argument's own program; `note
+  query.other-root`); `edit patch` matches at other indentation
+  (`patch.loose`); `fmt --changed`, `--since REV`; probe and reduce keep
+  their scratch copies out of the source tree; `agent-feedback --list`,
+  `--find`.
+- **The language server**: a file outside any program is its own root;
+  info diagnostics say why a file is not checked; `-I DIR`,
+  `vole.includePaths` and `vole.cSources`; go-to-definition on header
+  strings and `c::`/`py::` names, hovers with the C prototype.
+- **WGSL**: the 498 MSL reserved names a shader could not use are
+  renamed; device-limit asserts are `Error::Shader` and
+  `Error::Pipeline`; `wgsl.target` errors point at the WGSL; `guide gpu`.
+- **Examples**: examples/gpu/fluid2d (Stable Fluids, in a window and
+  headless), examples/nes (an NES emulator), galaxy, pathtrace and voxel
+  under examples/gpu.
+- **Testing in tiers** (AGENTS.md, "The inner loop"):
+  `bootstrap.sh --dev --no-suite` (build and fixpoint in seconds,
+  `target/tools/volec` kept), `tests/affected.sh` (the tests a branch's
+  paths name in tests/affected.map, `--list`, `--linux`), `tests/run.sh`
+  with several filters, `=NAME`, `-f FILE`, `-l`; `tools/premerge.sh` and
+  the commit hook tools/git-hooks/pre-commit (unsafe justified, fmt,
+  checks, stdsrc, example sources). The runner: `// EXPECT-PPM`, EXPECT
+  holes, SKIP with a reason off macOS for window and GPU programs, load-aware
+  time budgets and watchdog; `volec test` reruns a case that timed out
+  while starved of CPU.
+- **The gate**: a `linux-smoke` row in `--quick`; one gate at a time
+  across worktrees; the job slots come back when a job is killed, and a
+  row that stalls fails instead of hanging; the Linux release row runs
+  -O0 and -O2 (-O1 stays on macOS), its long jobs first; chain-fresh
+  skips the last release's suite when every rebuilt compiler is the
+  recorded bytes.
+- **Breaking**: an unused `use` is a warning (an error with
+  `--deny-warnings`). A non-UTF-8 argument to volec is an error.
 
 ### What's new in 0.25.1
 
@@ -1918,6 +1988,23 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
    its tag, then HEAD.
 6. Now (and not before) the compiler's source may use the new feature.
 
+### Who tests what (0.25.2)
+
+Every run of the whole suite costs every agent sharing the machine, so
+each level of testing runs once, by the one it names (AGENTS.md, "The
+inner loop"):
+
+1. an agent while working: `bootstrap/bootstrap.sh --dev --no-suite`
+   (the build and its fixpoint, no suite), then the cases it touches
+   (`tests/run.sh FILTER...`);
+2. an agent before reporting: `tools/premerge.sh` and
+   `tests/affected.sh` (the paths changed since the branch's base,
+   looked up in `tests/affected.map`, run at -O0 and -O2; `--linux` in
+   the aarch64-linux container when the change is platform-relevant);
+3. the integrator, once per merge batch: the whole `tests/run.sh` and
+   `bootstrap/gate.sh --quick`;
+4. a release: `bootstrap/gate.sh --release`.
+
 ### The gate
 
 `bootstrap/gate.sh` runs the whole gate in one command, as parallel as
@@ -1927,10 +2014,12 @@ failed. Its logs are in `target/gate/<date>/` (`target/gate/last`), one
 file per step.
 
 ```
-$ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz
+$ bootstrap/gate.sh --quick            # before committing a big change: chain, suite at -O2, a short fuzz, linux-smoke
 $ bootstrap/gate.sh                    # every step, modest fuzz counts
 $ bootstrap/gate.sh --release          # every step, the release's fuzz counts
-$ bootstrap/gate.sh --no-linux         # without the containers
+$ bootstrap/gate.sh --no-linux         # without the containers (--quick: without linux-smoke)
+$ bootstrap/gate.sh --quick --no-wait  # fail at once if another gate runs, rather than wait for it
+$ bootstrap/gate.sh --self-test        # the gate's own machinery: the lock, the stall check, the modes' steps
 $ bootstrap/gate.sh --with-x86         # with x86_64 (off by default since 0.15)
 $ bootstrap/gate.sh --only 'fuzz-*,objcheck'   # some steps (--list shows them)
 $ bootstrap/gate.sh --release --bench  # the gate, then the benchmarks alone
@@ -1988,9 +2077,54 @@ section and the name that pull it in, and `tests/std/core_sections.sh`,
 run by the suite, bounds their bytes); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
-the chain's compiler cross-compiles the tree). Inside each container the
-same steps run at once (`gate.sh --inside`), and their rows appear in the
-table under the container's. `bench` runs alone, at the end: benchmarks
+the chain's compiler cross-compiles the tree; 0.25.2: the suite at -O0
+and -O2, not -O1: the optimizer is the same for every target and -O1
+runs on macOS, while what is Linux's own, the ABI, libc and the link,
+-O0 and -O2 exercise; the three suites, objcheck and fuzz beside them
+made the row the gate's longest, 140 minutes). Inside each container the
+same steps run at once (`gate.sh --inside`), the longest started first,
+and their rows appear in the table under the container's.
+
+(0.25.2) `--quick` has a container row too, `linux-smoke`
+(`aarch64-linux-check.sh --smoke`): agents' quick gates passed on macOS
+while the tree failed in the container, which the release gate found 2.5
+hours in. The chain's compiler cross-compiles the tree, and in the
+container, after the fixpoint and the md5 check, the `smoke-*` steps
+run at -O2: `smoke-runner` (`tests/run.sh runner`: tests/runner/run.sh
+and the runner_* cases), `smoke-lsp`, `smoke-examples` (`example_build`:
+every example builds), `smoke-cases` (`tests/run.sh _`: every case,
+2,800 programs) and `smoke-walkthrough` and `smoke-book` (sessions that
+differed on Linux before). Not query's and refactor's transcripts (serial:
+6 and 8 minutes beside the rest), nor the formatter's: the full gate's
+container runs them. It runs beside the macOS steps, about 3 minutes on
+an idle machine. When docker is not running the row is `SKIP` (not pass), its note
+`colima is not running: colima start` — never a pass; `--no-linux` leaves
+it out, `--quick --no-x86` keeps it (x86_64 is another matter).
+
+(0.25.2) One gate at a time, across the worktrees of the repository: a
+gate takes the lock directory `gate.lock` in the git common dir (`git
+rev-parse --git-common-dir`), its `owner` file naming the gate (pid, the
+process's start time, worktree, arguments). A second gate prints one
+line, `gate: waiting for the gate in WORKTREE (pid N, since T, gate.sh
+ARGS): one gate at a time`, and starts when the first ends; with
+`--no-wait` it fails (exit 3) instead. A lock whose holder is gone (no
+such process, or another one with its pid) is taken over, saying so.
+Seven agents' gates and suites at once had put the load at 100 to 167 on
+12 cores. `bootstrap.sh --dev` and `tests/run.sh` take no lock (the
+inner loop); nor does the gate inside a container.
+
+(0.25.2) No silent hang: a release gate waited 2.5 hours on two runners
+blocked reading the slot FIFO, every slot lost with jobs killed before
+they gave theirs back. Every runner's job now gives its slot back
+however it ends (a trap on EXIT, and on HUP, INT and TERM; semfuzz
+counts the slots it holds and writes them back when killed or at exit),
+and the gate
+checks its steps (every 15 s; not the containers' rows, whose work is in
+the VM — the gate inside a container checks its own): a step none of
+whose processes used the CPU, started or ended for `$VOLE_GATE_STALL`
+seconds (default 600; `sleep` does not count) is stopped and fails, its
+note `stalled: ... with F of J slots free` (0 free: slots lost, e.g. a
+job killed with -9). `bench` runs alone, at the end: benchmarks
 need an idle machine.
 
 (0.15) x86_64 is off by default: `bootstrap/gate.conf` sets `X86=0`, so
@@ -2112,7 +2246,7 @@ Nothing else is trusted: no binary built before, no cache.
 | check | what it shows | where |
 |---|---|---|
 | the fixpoint | each compiler, built by its builder and then by itself, emits the same bytes | every bootstrap step |
-| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache | `gate.sh --only chain-fresh`, part of `--release` |
+| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST --history none`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache; (0.25.2) no suite runs when they agree (the bytes are those whose suite passed at the release), and the last release's runs when one differs (chain-fresh fails then anyway) | `gate.sh --only chain-fresh`, part of `--release` |
 | `chain-diverse` | HEAD's compiler by three paths: the normal chain (-O2); a path with no optimizer before the last step (the previous release at -O0, then HEAD at -O0, which builds HEAD at -O2); and the chain at -j1. The paths must end in the same bytes, and the -O2-built and -O0-built compilers must give the same output on the whole corpus (`same-output`) | `gate.sh --only chain-diverse`, part of `--release` |
 | `valgrind` | the compiler's own -O2 self-compile (at -j4) and the opt_, own_ and contract_ cases plus examples, under memcheck: no invalid read or write, no use of an uninitialised value | aarch64-linux container, `--release` |
 | `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
@@ -2196,6 +2330,9 @@ $ target/volec compiler/src/main.vl -o volec.s   # the compiler (its root file),
 $ cc -arch arm64 -o volec volec.s -lm
 $ tests/run.sh -c ./volec                            # the test suite, for the host
 $ tests/run.sh -c ./volec prog_                      # only cases named *prog_*
+$ tests/run.sh -c ./volec prog_ =lsp -f more.txt     # (0.25.2) the union: *prog_*, the lsp suite, a file's filters
+$ tests/run.sh -l opt_loop                           # (0.25.2) what a filter selects, run nothing
+$ tests/affected.sh --list                           # (0.25.2) the tests the branch's changes touch (tests/affected.map)
 $ tests/run.sh -c ./volec -t x86_64-macos            # x86-64, under Rosetta
 $ tests/run.sh -c ./volec -O 0                       # at another optimization level
 $ tests/fuzz/run.sh -c ./volec -n 500                # random programs, -O0 vs -O1 vs -O2
@@ -2223,7 +2360,26 @@ cargo. Its directives (`// EXPECT:`, `// EXIT:`, `// ARGS:`, `// STDIN:`,
 `// CHECK-NOT:`, `// CHECK-OPT:`, `// STDERR:`, `// CSOURCE:`) are described
 at its top. A release's suite must pass at every optimization level. The
 runners take `-j N` (default: the number of CPUs); their reports do not
-depend on it.
+depend on it. (0.25.2) `// EXPECT:` lines take holes for what varies
+(`{num}`, `{int}`, `{..}`), `// EXPECT-PPM: OUT REF [region X,Y,W,H]
+[tolerance N] [allow P%]` compares an image the program wrote with a
+reference under `tests/golden/`, and a check that cannot run on this
+machine (the window tests while the screen is locked or the display
+asleep) is a `SKIP NAME: why` line and a `skip` column, never a pass;
+the gate lists the SKIP lines under its table. A case's time limit
+(20 s, `TIMEOUT`, `$VOLE_TEST_TIMEOUT`) is extended by itself again, up
+to 8 times, while the load average is above the CPUs
+(`tests/watchdog.sh`: parallel agents made the litmus cases time out); a
+program killed at its limit fails with `timed out: killed after N s ...`.
+The load and the CPUs are `tests/load.sh`'s: on Linux the CPUs are the
+cgroup's quota when it is lower (a container's `--cpus`). In the
+linux-aarch64 container the load average is the virtual machine's: a
+host loaded by other work is invisible there (its stolen time counts as
+running), so `volec test` judges a case stopped by `--timeout` by the
+processor time it used: under half the limit, it was waiting, and runs
+again (twice at most). Off macOS, `example_build` skips the examples on
+std::gpu and std::window (`SKIP example_build NAME: ...`).
+`tests/runner/run.sh` checks these pieces of the runner.
 
 The seed keeps its own tests, run with cargo:
 
@@ -2296,6 +2452,9 @@ a lock whose holder is gone, or older than
 --clean            empty the cache first
 --out PATH         also copy the final compiler to PATH
 --history MODE     fast (the default): every release's fixpoint, the last
-                   one's suite; full: every release's suite too
+                   one's suite; full: every release's suite too; none
+                   (0.25.2): no release's suite
 --no-head-tests    build HEAD and check its fixpoint, not its suite
+--no-suite         (0.25.2) the agent's build: --no-head-tests and
+                   --history none; target/tools/volec is not replaced
 ```

@@ -28,12 +28,13 @@ mod conv;
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_clear, buf_int, buf_new,
-    buf_slice, buf_str, buf_write_fd, load_sources, streq,
+    buf_slice, buf_str, buf_write_fd, load_sources,
 };
+use crate::cli::line::{Call, EV_FLAG, EV_WORD, Leaf, flag, is_opt, option};
 use crate::front::lexer::init_lexer;
 use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{SKIP_CHECK, apply_edit, set_command};
-use crate::tools::edit::cli::take_edit_option;
+use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::fmt::layout::{COMMAS_CHANGED, RANGED, lay_out, write_layout};
 use crate::tools::fmt::pieces::{
     BAD_AT, BAD_MESSAGE, FT, P_END, P_KIND, P_START, line_of, read_pieces, same_pieces,
@@ -234,8 +235,8 @@ pub fn format_source(text: [u8]) -> i64 {
     }
 }
 
-pub fn run_fmt(argc: i64, argv: **u8) -> i64 {
-    let status = run_fmt_inner(argc, argv);
+pub fn run_fmt(c: Call) -> i64 {
+    let status = run_fmt_inner(c);
     write_diags();
     status
 }
@@ -420,42 +421,128 @@ fn try_fmt(option: *u8, f: i64) {
     }
 }
 
-fn run_fmt_inner(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        set_command(argc, argv);
-        PROG = argv[0];
-        TOOL = 0 as *u8;
-        FORMAT_EDITS = false;
-        var root = 0 as *u8;
-        var check = false;
-        var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var module = 0 as *u8;
-        var i = 2;
-        while i < argc {
-            let a = argv[i];
-            if streq(a, c"--check") {
-                check = true;
-            } else if streq(a, c"--all") {
-                ALL = true;
-                let dirs = [c"compiler", c"tests", c"examples", c"bench", c"tools"];
-                for k in 0..5 {
-                    if is_dir(dirs[k]) {
-                        paths.push(dirs[k] as i64);
-                    }
-                }
-            } else if take_edit_option(argc, argv, &i, &root) {
-                // (--dry-run, --show, --root ROOT)
-            } else if a[0] == '-' {
-                return usage(c"unknown option", a);
-            } else if crate::base::is_source_path(a) || is_dir(a) || has_slash(a) {
-                paths.push(a as i64);
-            } else if module == 0 as *u8 {
-                module = a;
-            } else {
-                return usage(c"one MODULE (or FILEs and DIRs), not also", a);
-            }
-            i += 1;
+// (0.25.2, feedbacks/galaga.md #8) `fmt --changed`: the .vl files changed
+// since git's HEAD (in the work tree or the index) and the new ones git
+// does not track (and does not ignore); `--since REV`: changed since REV.
+// So a focused branch formats what it touched, not the files `--all`
+// would find untidy elsewhere. Paths relative to the current directory,
+// into paths, the transcript tests' programs left out (as by --all);
+// false after the diagnostic when git cannot tell.
+fn changed_vl_files(rev: *u8, paths: inout IntVec) -> bool {
+    let listing = buf_new();
+    let others = buf_new();
+    if git_paths(rev, listing) != 0 || git_paths(0 as *u8, others) != 0 {
+        let d = diag(c"error", c"fmt.no-git");
+        buf_str(d, c"git cannot tell which files changed since ");
+        buf_str(d, rev);
+        buf_str(d, c": no checkout here, or no such revision\n");
+        return false;
+    }
+    add_vl_paths(buf_slice(listing), &paths);
+    add_vl_paths(buf_slice(others), &paths);
+    true
+}
+
+// `git diff --name-only --relative REV` (not the deleted files), or with
+// rev 0 `git ls-files --others --exclude-standard`, NUL-separated, into
+// out; git's exit status.
+fn git_paths(rev: *u8, out: i64) -> i64 {
+    let args = crate::base::alloc_array::<*u8>(9);
+    let words: [*u8; 8] = if rev != 0 as *u8 {
+        [c"git", c"diff", c"--name-only", c"--relative", c"--diff-filter=d", c"-z", rev, c"--"]
+    } else {
+        [c"git", c"ls-files", c"-z", c"--others", c"--exclude-standard", c"--", 0 as *u8,
+            0 as *u8]
+    };
+    for k in 0..8 {
+        // UNSAFE: run_capture takes a C argv, a raw array of C strings that a
+        // null ends.
+        // SAFETY: args has 9 zeroed slots; k < 8 is written, slot 8 stays
+        // null.
+        unsafe { args[k] = words[k]; }
+    }
+    crate::tools::proc::run_capture(args, out)
+}
+
+// The .vl paths of NUL-separated listing t, but the transcript tests'.
+fn add_vl_paths(t: [u8], paths: inout IntVec) {
+    var i = 0;
+    while i < t.len {
+        var e = i;
+        while e < t.len && t[e] != 0 {
+            e += 1;
         }
+        let p = t[i..e];
+        if p.len > 3 && p[p.len - 3..p.len] == ".vl" {
+            let b = buf_new();
+            buf_bytes(b, p);
+            let c = crate::tools::proc::buf_cstr(b);
+            if !fixture(c) {
+                paths.push(c as i64);
+            }
+        }
+        i = e + 1;
+    }
+}
+
+// `fmt`'s arguments (0.25.2: a leaf of volec's Command tree, cli/tree.vl).
+pub fn fmt_leaf(gpa: Gpa) -> Leaf {
+    var table = edit_opts(gpa);
+    table.push(flag("check", "only say which files are not laid out"));
+    table.push(flag("all", "the tree: compiler, tests, examples, bench"));
+    table.push(flag("changed", "the .vl files changed since git's HEAD"));
+    table.push(option("since", "REV", "the .vl files changed since REV"));
+    Leaf::new(table, "path", " -C ")
+}
+
+fn run_fmt_inner(c: Call) -> i64 {
+    set_command(c.line);
+    PROG = c.prog();
+    TOOL = 0 as *u8;
+    FORMAT_EDITS = false;
+    var root = 0 as *u8;
+    var check = false;
+    var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var module = 0 as *u8;
+    for e in c.evs.iter() {
+        var ev = e;
+        let a = ev.value;
+        if ev.kind == EV_FLAG && ev.name == "check" {
+            check = true;
+        } else if ev.kind == EV_FLAG && ev.name == "all" {
+            ALL = true;
+            let dirs = [c"compiler", c"tests", c"examples", c"bench", c"tools"];
+            for k in 0..5 {
+                if is_dir(dirs[k]) {
+                    paths.push(dirs[k] as i64);
+                }
+            }
+        } else if (ev.kind == EV_FLAG && ev.name == "changed") || is_opt(ev, "since") {
+            // (0.25.2) what git says changed, since HEAD or REV
+            let rev = if ev.kind == EV_FLAG { c"HEAD" } else { a };
+            if !changed_vl_files(rev, &paths) {
+                return 1;
+            }
+            if paths.count == 0 {
+                let d = diag(c"note", c"fmt.none");
+                buf_str(d, c"no .vl file changed since ");
+                buf_str(d, rev);
+                buf_byte(d, '\n');
+                return 0;
+            }
+        } else if take_edit_event(&ev, &root) {
+            // (--dry-run, --show, --root ROOT)
+        } else if ev.kind != EV_WORD || ev.text.starts_with("-") {
+            return usage(c"unknown option", ev.value);
+        } else if crate::base::is_source_path(a) || is_dir(a) || has_slash(a) {
+            paths.push(a as i64);
+        } else if module == 0 as *u8 {
+            module = a;
+        } else {
+            return usage(c"one MODULE (or FILEs and DIRs), not also", a);
+        }
+    }
+    unsafe {
         if paths.count > 0 && module != 0 as *u8 {
             return usage(
                 c"FILEs and DIRs, or a MODULE of the program, not both: no file or directory",

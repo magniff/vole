@@ -61,3 +61,13 @@ pub fn is_space(b: u8) -> bool {
 $ check
 compiler/std/flat/io.vl:22:5: error[type error] undefined variable 'Nothing'
 [exit 1]
+## (0.25.2) fix reads them too: an error with an exact fix in the edited
+## std is fixed, not "nothing to fix".
+% printf '\npub fn narrow(a: i64) -> i32 {\n    a\n}\n' >> compiler/std/flat/io.vl
+$ fix --suggested --dry-run
+--- a/compiler/std/flat/io.vl
++++ b/compiler/std/flat/io.vl
+@@ -26 +26 @@
+-    a
++    a as i32
+note check.std-files: std's files differ from this compiler's std: checked with compiler/std (bootstrap/bootstrap.sh --dev builds them in)

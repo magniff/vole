@@ -43,12 +43,13 @@ use crate::base::{
     FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
     streq,
 };
+use crate::cli::line::{Call, EV_MISSING, EV_UNKNOWN, EV_WORD, Leaf, flag, long_of, option, word_of};
 use crate::front::ast::{KEEP_PARSED, NODES, NodeKind, PARSED_COUNT};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::cli::{ambiguous, source_only, take_edit_option};
+use crate::tools::edit::cli::{ambiguous, edit_opts, source_only, take_edit_event};
 use crate::tools::edit::items::{after_line, indent_of};
 use crate::tools::query::{c_slice, resolve_name};
 use crate::tools::query::command_line::load_program;
@@ -146,53 +147,109 @@ fn try_show_at(pos: i64) {
     }
 }
 
+// The options of `refactor SUB` (signature, field, variant,
+// extract-function, inline) and their numbers of values: `--add=1
+// --rename=2 --keep=0`, a flag (0), an option (1) and an option of two
+// values (2).
+pub fn shape_options(sub: str) -> *u8 {
+    if sub == "signature" {
+        c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1 --fill-calls=0 --convention=2"
+    } else if sub == "field" {
+        c"--add=1 --remove=1 --rename=2 --type=2 --default=1"
+    } else if sub == "variant" {
+        c"--add=1 --arm=1 --arm-in=2 --remove=1 --rename=2"
+    } else if sub == "extract-function" {
+        c"--lines=1 --to=1"
+    } else {
+        c"--at=1 --keep=0"
+    }
+}
+
+// `refactor SUB`'s arguments, for shape_options(SUB) (0.25.2: a leaf of
+// volec's Command tree, cli/tree.vl): the edit options and these.
+pub fn shape_leaf(options: *u8, gpa: Gpa) -> Leaf {
+    var table = edit_opts(gpa);
+    let twos = buf_new();
+    for w in word_of(options).split(' ') {
+        match w.strip_prefix("--") {
+            Option::Some(spec) => match spec.split_once('=') {
+                Option::Some((name, n)) => {
+                    if n == "0" {
+                        table.push(flag(name, ""));
+                    } else {
+                        table.push(option(name, "VALUE", ""));
+                    }
+                    if n == "2" {
+                        buf_str(twos, c" --");
+                        buf_bytes(twos, name.as_bytes());
+                    }
+                }
+                Option::None => {}
+            },
+            Option::None => {}
+        }
+    }
+    buf_str(twos, c" ");
+    let two_list = str::from_utf8(buf_slice(twos)).unwrap_or("");
+    if two_list.len() > 1 {
+        table.push(option("2nd", "VALUE", "the second value of an option of two"));
+    }
+    Leaf::new(table, "word", " -C ").with_twos(if two_list.len() > 1 { two_list } else { "" })
+}
+
 // The options and words of `refactor SUB NAME ...`: the edit options are
 // taken, `--x` options with `values` values each go to `opts` (the option,
 // then its values), the rest to `words`. False after a usage error.
-fn take_args(argc: i64, argv: **u8, options: *u8, root: **u8, words: inout IntVec,
-    opts: inout IntVec) -> bool {
-    unsafe {
-        var i = 3;
-        while i < argc {
-            let a = argv[i];
-            if take_edit_option(argc, argv, &i, root) {
-                i += 1;
-                continue;
-            }
-            if a[0] == '-' && a[1] == '-' {
-                let n = option_values(options, a);
-                if n < 0 {
-                    let d = diag(c"error", c"refactor.usage");
-                    buf_str(d, c"unknown option '");
-                    buf_str(d, a);
-                    buf_str(d, c"' of refactor ");
-                    buf_str(d, SUB);
-                    buf_byte(d, '\n');
-                    return false;
-                }
-                if i + n >= argc {
-                    let d = diag(c"error", c"refactor.usage");
-                    buf_str(d, a);
-                    buf_str(d, if n == 1 { c" needs a value\n" } else { c" needs two values\n" });
-                    return false;
-                }
-                opts.push(a as i64);
-                for k in 0..n {
-                    opts.push(argv[i + 1 + k] as i64);
-                }
-                i += n + 1;
-                continue;
-            }
-            words.push(a as i64);
-            i += 1;
+fn take_args(c: Call, options: *u8, root: inout *u8, words: inout IntVec, opts: inout IntVec)
+    -> bool {
+    let evs = c.evs.clone();
+    // (the second word: the root when it is a source file)
+    var second = 0 as *u8;
+    var k = 0;
+    while k < evs.len() {
+        var ev = evs[k].clone();
+        k += 1;
+        if take_edit_event(&ev, &root) {
+            continue;
         }
-        if words.count == 2 && *root == 0 as *u8
-            && crate::base::is_source_path(words.data[1] as *u8) {
-            *root = words.data[1] as *u8;
-            words.count = 1;
+        if ev.kind == EV_WORD {
+            if words.count == 1 {
+                second = ev.value;
+            }
+            words.push(ev.value as i64);
+            continue;
         }
-        true
+        if ev.kind == EV_UNKNOWN {
+            let d = diag(c"error", c"refactor.usage");
+            buf_str(d, c"unknown option '");
+            buf_str(d, ev.value);
+            buf_str(d, c"' of refactor ");
+            buf_str(d, SUB);
+            buf_byte(d, '\n');
+            return false;
+        }
+        let name = long_of(ev);
+        let n = option_values(options, name);
+        if ev.kind == EV_MISSING || n == 2 && (k >= evs.len() || evs[k].name != "2nd") {
+            let d = diag(c"error", c"refactor.usage");
+            buf_str(d, if ev.kind == EV_MISSING { ev.value } else { name });
+            buf_str(d, if n == 1 { c" needs a value\n" } else { c" needs two values\n" });
+            return false;
+        }
+        opts.push(name as i64);
+        if n >= 1 {
+            opts.push(ev.value as i64);
+        }
+        if n == 2 {
+            opts.push(evs[k].value as i64);
+            k += 1;
+        }
     }
+    if words.count == 2 && root == 0 as *u8 && crate::base::is_source_path(second) {
+        root = second;
+        words.count = 1;
+    }
+    true
 }
 
 // The number of values of option `a` in `options` (`--add=1 --at=1 ...`),

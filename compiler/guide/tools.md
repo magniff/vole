@@ -28,9 +28,13 @@ small queries.
 
 ## The program
 
-Commands find the program's root file from `--root FILE`, a last
-argument ending in `.vl`, `$VOLE_ROOT`, or `./main.vl`. The other
-files are the modules it loads.
+Commands find the program's root file from `--root FILE` (or `--root
+DIR`: its main.vl), a last argument ending in `.vl`, `$VOLE_ROOT`, or
+`./main.vl`. The other files are the modules it loads. A FILE or
+FILE:LINE argument names its own program from anywhere (`volec query
+context examples/nes/check.vl:233` from the tree's root), and a NAME
+the program lacks gets a `try:` with the `--root` of the program
+under the current directory that defines it.
 
 ## Reading
 
@@ -95,7 +99,7 @@ an edit then `check`.
 
 | to | run |
 |---|---|
-| change text inside an item | `volec edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat) |
+| change text inside an item | `volec edit patch NAME --old 'TEXT' --new 'TEXT'` (pairs repeat; for hunks: several lines at other indentation match as `--loose`; the same change everywhere: `--all`; a whole item: `edit replace`) |
 | replace, add, remove an item | `volec edit replace NAME < new.vl`, `edit insert --after NAME < item.vl`, `edit delete NAME` |
 | add statements inside an item | `volec edit insert --in NAME --after 'ANCHOR' < text` |
 | several items at once, one edit | `volec edit apply items.vl`: `@@ NAME` then its new text, `@@ new after NAME`, `@@ delete NAME` (or `query show A B`'s output, edited) |
@@ -143,7 +147,9 @@ FAIL big: stdout differs at line 3 (10 lines expected, 9 printed)
 
 `volec test big small` runs the cases whose names contain a word;
 `--full` every failure in full; `--input FILE` (`-`: stdin) one run,
-its output and exit status; `--timeout S` per case (10). Output is
+its output and exit status; `--timeout S` per case (10; one stopped
+by it having run under half of S, waiting on a loaded machine, runs
+again, twice at most). Output is
 compared with `\r\n` as `\n` and trailing whitespace at the end left
 out. In the vole tree, `volec test FILTER` rebuilds
 `target/volec` when the source is newer and runs `tests/run.sh
@@ -195,8 +201,11 @@ after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`), after
 the module's items, imports, the prelude and keywords, each with its
 signature, and its comment and effects when chosen; formatting, the
 buffer as `volec fmt` lays it out (the VS Code extension on save), no
-edits when it does not parse. The root: the nearest `main.vl`
-(docs/lsp.md).
+edits when it does not parse. The root: the nearest `main.vl` (up to
+the repository's top or the home directory), else the file itself
+(0.25.2). (0.25.2) Definition on a C import's string opens the header,
+on `c::NAME` its declaration there (a hover shows it); headers found
+through `-I` need the include paths (`vole.includePaths`; docs/lsp.md).
 
 ## Other compiler options
 

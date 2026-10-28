@@ -165,3 +165,23 @@ types, like a property).
 Items, then statements, are cut by halves, then one by one; the result
 is `PROG.min.vl`. For an input instead: `volec reduce FILE --until
 'CMD'` (guide debug).
+
+## tests/run.sh cases
+
+The compiler's own suite (`tests/run.sh`) checks programs by `//`
+directives; its header lists them all. Two help with programs whose
+output varies:
+
+```text
+// EXPECT: 320 x 180 cells: {num} ms a step, {int} x {int} picture
+// EXPECT-PPM: out.ppm tests/golden/NAME.ppm region 16,8,32,32 tolerance 8 allow 1%
+```
+
+- `EXPECT` holes: `{num}` a number, `{int}` an integer, `{..}` any
+  text within the line; each line still matches one line.
+- `EXPECT-PPM OUT REF`: the PPM the program wrote (OUT, in its run
+  directory) against REF (the region's size), a channel off by at most
+  the tolerance, up to `allow` of the pixels off. A failure gives the
+  count, the worst pixel and `try: cp target/test-shots/CASE.ppm REF`.
+- A check that cannot run here (window tests with no display frames:
+  the screen locked) is `SKIP NAME: why`, counted apart, never a pass.

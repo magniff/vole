@@ -15,8 +15,10 @@ saw, which part of an input matters. None of them edits the source.
 2. Read the trace. Its first frame, `FILE:LINE  function`, is the
    failing statement. `volec query show FILE:LINE` prints its item.
 3. See the values without editing:
-   `volec probe FILE:LINE EXPR... --input FILE`. Probe the lines
-   above the failure, then the callers in the trace. `--count FILE:LINE`
+   `volec probe FILE:LINE EXPR... -- ARGS` (or `--input FILE` for
+   stdin). It runs any program, an example too, from anywhere: the
+   FILE names its program (the nearest `main.vl` that declares it).
+   Probe the lines above the failure, then the callers in the trace. `--count FILE:LINE`
    says how often a line runs (a loop that never ends, a branch never
    taken).
 4. If the input is too big to reason about, shrink it:
@@ -73,7 +75,7 @@ $ volec probe stats.vl:46 i m 'v[i]' --input tests/ok.in
 probe stats.vl:46 (before `if v[i] > m {`): 2 times
   #1  i = 1  m = 3  v[i] = 7
   #2  i = 1  m = 3  v[i] = 7
-run: exit 0; stdout 4 lines (.volec/probe/out)
+run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
 ```
 
@@ -93,7 +95,10 @@ Values are printed by type. Integers, floats and bool print as values,
 element by element, pointers as addresses. A struct uses Debug when it
 has it, else prints field by field. The program is built from copies of
 its files with the probes written in (`--overlay`), so line numbers stay
-the same, and with `--trace`. Then it runs with `-- ARGS` and stdin from
+the same, and with `--trace`. The copies, the build and the outputs are
+never in the program's source tree: `target/scratch/probe/NAME/` of the
+checkout (NAME: the root's path, `-` for `/`), else
+`$TMPDIR/volec-probe/NAME/`; the copies are removed after the run. Then it runs with `-- ARGS` and stdin from
 `--input FILE` (or the command's own stdin), within `--timeout S` (10).
 The report lists each probe's count and values, then the exit status,
 the start of stdout and stderr.
@@ -103,8 +108,21 @@ Several probes go in one run: `volec probe a.vl:10 x a.vl:20 y`.
 not in scope at its line is an error (`probe.expr`), so probe a later
 line for a value made later.
 
-In the vole tree the program is the compiler itself. To see what it
-does when compiling a test:
+`probe` runs any vole program, not only a `tests/` case: the program is
+the one FILE belongs to (its `main.vl`, or `--root ROOT`), its
+arguments come after `--`. From the root of the tree, an example run with
+its own flags:
+
+```text
+$ volec probe examples/nes/check.vl:235 mode1 prg power -- --check
+probe examples/nes/check.vl:235 (before `cart.cpu_write(0x8000, 0x00);`): 1 time
+  #1  mode1 = true  prg = true  power = true
+run: exit 0; stdout 1 line (target/scratch/probe/examples-nes-main.vl/out)
+  | ok: 21 NES checks passed
+```
+
+In the vole tree the default program is the compiler itself. To see what
+it does when compiling a test:
 
 ```text
 volec probe compiler/src/front/check/interp.vl:633 h t -- case.vl -o /tmp/p

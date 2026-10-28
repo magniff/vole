@@ -66,6 +66,18 @@ The module and function also carry their documentation:
 'Print hello from Vole.'
 ```
 
+### In an editor
+
+`volec check` needs the same include directory as the build (`volec
+check -I "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
+vole_hello.vl`), and so does the language server: in VS Code, set
+`vole.includePaths` to that directory (`.vscode/settings.json`;
+[docs/lsp.md](../../docs/lsp.md#c-imports-0252)). Then the file's errors
+show as you type, F12 on `"Python.h"` opens the header and F12 on
+`py::PySys_WriteStdout` its declaration in `sysmodule.h`. Without it the
+import is `header not found: Python.h`, and the errors that do not
+depend on the header are still shown.
+
 ## How it works
 
 ### Python's declarations, imported

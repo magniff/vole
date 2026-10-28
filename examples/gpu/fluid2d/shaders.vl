@@ -1,0 +1,491 @@
+// The WGSL of fluid2d, compiled at run time by std::gpu::wgsl. Each
+// kernel is its own shader: COMMON (the parameters and the grid's
+// indexing), the helpers it uses, then its bindings and entry point
+// (sim.vl puts them together).
+//
+// The grid is a MAC grid of W x H cells, y down: the pressure, the
+// divergence, the curl and the dye at cell centres; u (the x velocity) on
+// the vertical faces, (W + 1) x H of them, v on the horizontal ones,
+// W x (H + 1). Face u(i, j) sits at (i, j + 0.5), v(i, j) at (i + 0.5, j),
+// cell (i, j)'s centre at (i + 0.5, j + 0.5). Velocities are in cells
+// per second. Walls on all four sides: the faces on the border stay 0.
+
+// The parameters (sim.vl's `Params`, written once a frame) and the
+// index of a cell or face, clamped to the grid.
+pub const COMMON: [u8] = "struct Splat {\n\
+    seg: vec4<f32>,\n\
+    force: vec4<f32>,\n\
+    color: vec4<f32>,\n\
+    }\n\
+    struct Params {\n\
+    w: u32, h: u32, n_splats: u32, view: u32,\n\
+    dt: f32, time: f32, vorticity: f32, dye_keep: f32,\n\
+    vel_keep: f32, emit: f32, sw: f32, sh: f32,\n\
+    bloom: f32, shade: f32, jet_speed: f32, r1: f32,\n\
+    splats: array<Splat, 2>,\n\
+    ui: vec4<f32>,\n\
+    ui2: vec4<f32>,\n\
+    brush: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> prm: Params;\n\
+    const TAU: f32 = 6.2831853;\n\
+    fn gw() -> i32 { return i32(prm.w); }\n\
+    fn gh() -> i32 { return i32(prm.h); }\n\
+    fn cell(i: i32, j: i32) -> u32 {\n\
+    return u32(clamp(j, 0, gh() - 1) * gw() + clamp(i, 0, gw() - 1));\n\
+    }\n\
+    fn uface(i: i32, j: i32) -> u32 {\n\
+    return u32(clamp(j, 0, gh() - 1) * (gw() + 1) + clamp(i, 0, gw()));\n\
+    }\n\
+    fn vface(i: i32, j: i32) -> u32 {\n\
+    return u32(clamp(j, 0, gh()) * gw() + clamp(i, 0, gw() - 1));\n\
+    }\n\
+    fn hue(h: f32) -> vec3<f32> {\n\
+    let k = vec3<f32>(0.0, 2.0 / 3.0, 1.0 / 3.0);\n\
+    let x = abs(fract(vec3<f32>(h, h, h) + k) * 6.0 - 3.0) - 1.0;\n\
+    return clamp(x, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));\n\
+    }\n";
+
+// Bilinear samples of u and v (globals `uf` and `vf`), the velocity at a
+// point, and the semi-Lagrangian backtrace from a point (second-order
+// Runge-Kutta), kept inside the walls.
+pub const SAMPLE_VEL: [u8] = "fn sample_u(p: vec2<f32>) -> f32 {\n\
+    let q = p - vec2<f32>(0.0, 0.5);\n\
+    let b = floor(q);\n\
+    let t = q - b;\n\
+    let i = i32(b.x);\n\
+    let j = i32(b.y);\n\
+    let a = mix(uf[uface(i, j)], uf[uface(i + 1, j)], t.x);\n\
+    let c = mix(uf[uface(i, j + 1)], uf[uface(i + 1, j + 1)], t.x);\n\
+    return mix(a, c, t.y);\n\
+    }\n\
+    fn sample_v(p: vec2<f32>) -> f32 {\n\
+    let q = p - vec2<f32>(0.5, 0.0);\n\
+    let b = floor(q);\n\
+    let t = q - b;\n\
+    let i = i32(b.x);\n\
+    let j = i32(b.y);\n\
+    let a = mix(vf[vface(i, j)], vf[vface(i + 1, j)], t.x);\n\
+    let c = mix(vf[vface(i, j + 1)], vf[vface(i + 1, j + 1)], t.x);\n\
+    return mix(a, c, t.y);\n\
+    }\n\
+    fn vel(p: vec2<f32>) -> vec2<f32> { return vec2<f32>(sample_u(p), sample_v(p)); }\n\
+    fn backtrace(p: vec2<f32>) -> vec2<f32> {\n\
+    let mid = p - 0.5 * prm.dt * vel(p);\n\
+    let q = p - prm.dt * vel(mid);\n\
+    return clamp(q, vec2<f32>(0.0, 0.0), vec2<f32>(f32(prm.w), f32(prm.h)));\n\
+    }\n";
+
+// The sources: the demo's three jets (`prm.emit` from 0 to 1), circling
+// the centre and swinging, each with its own slowly turning hue; and up
+// to two splats from the mouse, each a stroke from seg.xy to seg.zw with
+// a force (cells per second, added once) and a colour (alpha: how much).
+pub const SOURCES: [u8] = "fn jet_angle(k: f32) -> f32 { return prm.time * 0.23 + k * TAU / 3.0; }\n\
+    fn jet_pos(k: f32) -> vec2<f32> {\n\
+    let a = jet_angle(k);\n\
+    let c = vec2<f32>(f32(prm.w), f32(prm.h)) * 0.5;\n\
+    let r = 0.33 * f32(min(prm.w, prm.h));\n\
+    return c + r * vec2<f32>(cos(a), sin(a));\n\
+    }\n\
+    fn jet_vel(k: f32) -> vec2<f32> {\n\
+    let d = jet_angle(k) + 3.14159 + 0.55 + 0.75 * sin(prm.time * 0.61 + k * 2.3);\n\
+    return prm.jet_speed * f32(prm.h) * vec2<f32>(cos(d), sin(d));\n\
+    }\n\
+    fn jet_radius() -> f32 { return 0.011 * f32(prm.h); }\n\
+    fn jet_color(k: f32) -> vec3<f32> {\n\
+    let t = k / 3.0 + prm.time * 0.017;\n\
+    return 0.85 * (vec3<f32>(0.5, 0.5, 0.5) + 0.5 * cos(TAU * (vec3<f32>(t, t, t) + vec3<f32>(0.0, 0.33, 0.67))));\n\
+    }\n\
+    fn jet_weight(p: vec2<f32>, k: f32) -> f32 {\n\
+    let d = p - jet_pos(k);\n\
+    let r = jet_radius();\n\
+    return prm.emit * exp(-dot(d, d) / (r * r));\n\
+    }\n\
+    fn splat_weight(p: vec2<f32>, s: u32) -> f32 {\n\
+    let a = prm.splats[s].seg.xy;\n\
+    let ab = prm.splats[s].seg.zw - a;\n\
+    let l = dot(ab, ab);\n\
+    var t = 0.0;\n\
+    if l > 0.000001 { t = clamp(dot(p - a, ab) / l, 0.0, 1.0); }\n\
+    let d = p - (a + ab * t);\n\
+    let r = prm.splats[s].force.z;\n\
+    return exp(-dot(d, d) / (r * r));\n\
+    }\n\
+    fn add_vel(p: vec2<f32>, x0: vec2<f32>) -> vec2<f32> {\n\
+    var x = x0;\n\
+    if prm.emit > 0.0 {\n\
+    for (var k = 0; k < 3; k++) {\n\
+    let g = jet_weight(p, f32(k));\n\
+    x = mix(x, jet_vel(f32(k)), min(g * 0.5, 1.0));\n\
+    }\n\
+    }\n\
+    for (var s = 0u; s < prm.n_splats; s++) {\n\
+    x = x + splat_weight(p, s) * prm.splats[s].force.xy;\n\
+    }\n\
+    return x;\n\
+    }\n\
+    fn add_dye(p: vec2<f32>, d0: vec3<f32>) -> vec3<f32> {\n\
+    var d = d0;\n\
+    if prm.emit > 0.0 {\n\
+    for (var k = 0; k < 3; k++) {\n\
+    let g = jet_weight(p, f32(k));\n\
+    d = mix(d, jet_color(f32(k)), min(g * 0.3, 1.0));\n\
+    }\n\
+    }\n\
+    for (var s = 0u; s < prm.n_splats; s++) {\n\
+    let g = splat_weight(p, s) * prm.splats[s].color.w;\n\
+    d = mix(d, prm.splats[s].color.xyz, min(g, 1.0));\n\
+    }\n\
+    return d;\n\
+    }\n";
+
+// Advection of the velocity, and the forces: each face's value is the
+// velocity found where the flow carries from, plus the sources there.
+pub const ADVECT_VEL: [u8] = "@group(0) @binding(1) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> u_out: array<f32>;\n\
+    @group(0) @binding(4) var<storage, read_write> v_out: array<f32>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i <= gw() && j < gh() {\n\
+    var x = 0.0;\n\
+    if i > 0 && i < gw() {\n\
+    let p = vec2<f32>(f32(i), f32(j) + 0.5);\n\
+    let b = backtrace(p);\n\
+    x = add_vel(p, vec2<f32>(sample_u(b), 0.0) * prm.vel_keep).x;\n\
+    }\n\
+    u_out[uface(i, j)] = x;\n\
+    }\n\
+    if i < gw() && j <= gh() {\n\
+    var y = 0.0;\n\
+    if j > 0 && j < gh() {\n\
+    let p = vec2<f32>(f32(i) + 0.5, f32(j));\n\
+    let b = backtrace(p);\n\
+    y = add_vel(p, vec2<f32>(0.0, sample_v(b)) * prm.vel_keep).y;\n\
+    }\n\
+    v_out[vface(i, j)] = y;\n\
+    }\n\
+    }\n";
+
+// The curl (vorticity) at each cell centre, from the centred velocities.
+pub const CURL: [u8] = "@group(0) @binding(1) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> curl: array<f32>;\n\
+    fn uc(i: i32, j: i32) -> f32 { return 0.5 * (uf[uface(i, j)] + uf[uface(i + 1, j)]); }\n\
+    fn vc(i: i32, j: i32) -> f32 { return 0.5 * (vf[vface(i, j)] + vf[vface(i, j + 1)]); }\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < gw() && j < gh() {\n\
+    curl[cell(i, j)] = 0.5 * ((vc(i + 1, j) - vc(i - 1, j)) - (uc(i, j + 1) - uc(i, j - 1)));\n\
+    }\n\
+    }\n";
+
+// Vorticity confinement (Fedkiw, Stam and Jensen): a force at each cell
+// along N x w, N the direction in which |curl| grows, added to the faces
+// beside it. It gives back the small swirls the grid smooths away.
+pub const CONFINE: [u8] = "@group(0) @binding(1) var<storage, read> curl: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> u_io: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> v_io: array<f32>;\n\
+    fn force(i: i32, j: i32) -> vec2<f32> {\n\
+    let w = curl[cell(i, j)];\n\
+    let gx = 0.5 * (abs(curl[cell(i + 1, j)]) - abs(curl[cell(i - 1, j)]));\n\
+    let gy = 0.5 * (abs(curl[cell(i, j + 1)]) - abs(curl[cell(i, j - 1)]));\n\
+    let n = vec2<f32>(gx, gy) / (length(vec2<f32>(gx, gy)) + 0.00001);\n\
+    return prm.vorticity * w * vec2<f32>(n.y, -n.x);\n\
+    }\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i > 0 && i < gw() && j < gh() {\n\
+    let k = uface(i, j);\n\
+    u_io[k] = u_io[k] + prm.dt * 0.5 * (force(i - 1, j).x + force(i, j).x);\n\
+    }\n\
+    if i < gw() && j > 0 && j < gh() {\n\
+    let k = vface(i, j);\n\
+    v_io[k] = v_io[k] + prm.dt * 0.5 * (force(i, j - 1).y + force(i, j).y);\n\
+    }\n\
+    }\n";
+
+// The divergence of each cell: what flows out of it through its four
+// faces (cells per second, per cell).
+pub const DIVERGENCE: [u8] = "@group(0) @binding(1) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> div: array<f32>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < gw() && j < gh() {\n\
+    div[cell(i, j)] = uf[uface(i + 1, j)] - uf[uface(i, j)] + vf[vface(i, j + 1)] - vf[vface(i, j)];\n\
+    }\n\
+    }\n";
+
+// One Jacobi iteration of the pressure equation, sum over the neighbours
+// n of (p[n] - p) = div: a wall is no neighbour (its face's velocity is
+// fixed at 0), which is the Neumann condition.
+pub const JACOBI: [u8] = "@group(0) @binding(1) var<storage, read> p_in: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> div: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> p_out: array<f32>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < gw() && j < gh() {\n\
+    var s = 0.0;\n\
+    var n = 0.0;\n\
+    if i > 0 { s += p_in[cell(i - 1, j)]; n += 1.0; }\n\
+    if i < gw() - 1 { s += p_in[cell(i + 1, j)]; n += 1.0; }\n\
+    if j > 0 { s += p_in[cell(i, j - 1)]; n += 1.0; }\n\
+    if j < gh() - 1 { s += p_in[cell(i, j + 1)]; n += 1.0; }\n\
+    p_out[cell(i, j)] = (s - div[cell(i, j)]) / max(n, 1.0);\n\
+    }\n\
+    }\n";
+
+// The projection: each inner face's velocity minus the pressure's
+// difference across it; what is left has no divergence (as far as the
+// pressure has converged).
+pub const PROJECT: [u8] = "@group(0) @binding(1) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read> pr: array<f32>;\n\
+    @group(0) @binding(4) var<storage, read_write> u_out: array<f32>;\n\
+    @group(0) @binding(5) var<storage, read_write> v_out: array<f32>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i <= gw() && j < gh() {\n\
+    var x = 0.0;\n\
+    if i > 0 && i < gw() { x = uf[uface(i, j)] - (pr[cell(i, j)] - pr[cell(i - 1, j)]); }\n\
+    u_out[uface(i, j)] = x;\n\
+    }\n\
+    if i < gw() && j <= gh() {\n\
+    var y = 0.0;\n\
+    if j > 0 && j < gh() { y = vf[vface(i, j)] - (pr[cell(i, j)] - pr[cell(i, j - 1)]); }\n\
+    v_out[vface(i, j)] = y;\n\
+    }\n\
+    }\n";
+
+// A bilinear sample of the dye (global `dye_in`, at cell centres).
+pub const SAMPLE_DYE: [u8] = "fn sample_dye(p: vec2<f32>) -> vec3<f32> {\n\
+    let q = p - vec2<f32>(0.5, 0.5);\n\
+    let b = floor(q);\n\
+    let t = q - b;\n\
+    let i = i32(b.x);\n\
+    let j = i32(b.y);\n\
+    let a = mix(dye_in[cell(i, j)].xyz, dye_in[cell(i + 1, j)].xyz, t.x);\n\
+    let c = mix(dye_in[cell(i, j + 1)].xyz, dye_in[cell(i + 1, j + 1)].xyz, t.x);\n\
+    return mix(a, c, t.y);\n\
+    }\n";
+
+// Advection of the dye by the projected velocity, and the sources' dye.
+pub const ADVECT_DYE: [u8] = "@group(0) @binding(1) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read> dye_in: array<vec4<f32>>;\n\
+    @group(0) @binding(4) var<storage, read_write> dye_out: array<vec4<f32>>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < gw() && j < gh() {\n\
+    let p = vec2<f32>(f32(i) + 0.5, f32(j) + 0.5);\n\
+    let d = sample_dye(backtrace(p)) * prm.dye_keep;\n\
+    dye_out[cell(i, j)] = vec4<f32>(add_dye(p, d), 0.0);\n\
+    }\n\
+    }\n";
+
+// The glow: the dye's bright parts, a quarter of the grid each way.
+pub const BLOOM: [u8] = "@group(0) @binding(1) var<storage, read> dye_in: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> glow: array<vec4<f32>>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let bw = (gw() + 3) / 4;\n\
+    let bh = (gh() + 3) / 4;\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < bw && j < bh {\n\
+    var c = vec3<f32>(0.0, 0.0, 0.0);\n\
+    for (var b = 0; b < 4; b++) {\n\
+    for (var a = 0; a < 4; a++) {\n\
+    c += dye_in[cell(i * 4 + a, j * 4 + b)].xyz;\n\
+    }\n\
+    }\n\
+    let t = vec3<f32>(1.0, 1.0, 1.0) - exp(-2.0 * c / 16.0);\n\
+    let m = max(t.x, max(t.y, t.z));\n\
+    glow[u32(j * bw + i)] = vec4<f32>(t * smoothstep(0.25, 0.9, m), 0.0);\n\
+    }\n\
+    }\n";
+
+// A 9-tap Gaussian blur of the glow along DIR (BLUR_X or BLUR_Y before it).
+pub const BLUR_X: [u8] = "const DIR: vec2<i32> = vec2<i32>(1, 0);\n";
+pub const BLUR_Y: [u8] = "const DIR: vec2<i32> = vec2<i32>(0, 1);\n";
+pub const BLUR: [u8] = "@group(0) @binding(1) var<storage, read> g_in: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> g_out: array<vec4<f32>>;\n\
+    fn at(i: i32, j: i32, bw: i32, bh: i32) -> vec3<f32> {\n\
+    return g_in[u32(clamp(j, 0, bh - 1) * bw + clamp(i, 0, bw - 1))].xyz;\n\
+    }\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let bw = (gw() + 3) / 4;\n\
+    let bh = (gh() + 3) / 4;\n\
+    let i = i32(id.x);\n\
+    let j = i32(id.y);\n\
+    if i < bw && j < bh {\n\
+    let wt = array<f32, 5>(0.2270270, 0.1945946, 0.1216216, 0.0540541, 0.0162162);\n\
+    var c = at(i, j, bw, bh) * wt[0];\n\
+    for (var k = 1; k < 5; k++) {\n\
+    let o = DIR * k * 2;\n\
+    c += (at(i + o.x, j + o.y, bw, bh) + at(i - o.x, j - o.y, bw, bh)) * wt[k];\n\
+    }\n\
+    g_out[u32(j * bw + i)] = vec4<f32>(c, 0.0);\n\
+    }\n\
+    }\n";
+
+// The picture: a triangle over the window; each pixel samples the grid
+// (bilinear, so the dye is smooth at any window size). Views: 0 the dye,
+// lit as a height field, with its glow; 1 the velocity, hue from its
+// direction and brightness from its speed; 2 the pressure, blue below
+// and orange above; 3 the curl.
+pub const RENDER: [u8] = "@group(0) @binding(1) var<storage, read> dye_in: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> glow: array<vec4<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> uf: array<f32>;\n\
+    @group(0) @binding(4) var<storage, read> vf: array<f32>;\n\
+    @group(0) @binding(5) var<storage, read> pr: array<f32>;\n\
+    @group(0) @binding(6) var<storage, read> curl: array<f32>;\n\
+    @group(0) @binding(7) var<storage, read> glyphs: array<u32>;\n\
+    @group(0) @binding(8) var<storage, read> text: array<u32>;\n\
+    @group(0) @binding(9) var<storage, read> pmean: array<f32>;\n\
+    struct VOut { @builtin(position) pos: vec4<f32> }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    var o: VOut;\n\
+    let x = f32((vi << 1u) & 2u);\n\
+    let y = f32(vi & 2u);\n\
+    o.pos = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);\n\
+    return o;\n\
+    }\n\
+    fn tone(c: vec3<f32>) -> vec3<f32> { return vec3<f32>(1.0, 1.0, 1.0) - exp(-2.2 * c); }\n\
+    fn sample_glow(p: vec2<f32>) -> vec3<f32> {\n\
+    let bw = (gw() + 3) / 4;\n\
+    let bh = (gh() + 3) / 4;\n\
+    let q = p / 4.0 - vec2<f32>(0.5, 0.5);\n\
+    let b = floor(q);\n\
+    let t = q - b;\n\
+    let i = clamp(i32(b.x), 0, bw - 1);\n\
+    let j = clamp(i32(b.y), 0, bh - 1);\n\
+    let i1 = min(i + 1, bw - 1);\n\
+    let j1 = min(j + 1, bh - 1);\n\
+    let a = mix(glow[u32(j * bw + i)].xyz, glow[u32(j * bw + i1)].xyz, t.x);\n\
+    let c = mix(glow[u32(j1 * bw + i)].xyz, glow[u32(j1 * bw + i1)].xyz, t.x);\n\
+    return mix(a, c, t.y);\n\
+    }\n\
+    fn sample_cell(p: vec2<f32>, which: u32) -> f32 {\n\
+    let q = p - vec2<f32>(0.5, 0.5);\n\
+    let b = floor(q);\n\
+    let t = q - b;\n\
+    let i = i32(b.x);\n\
+    let j = i32(b.y);\n\
+    var x = vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
+    if which == 0u {\n\
+    x = vec4<f32>(pr[cell(i, j)], pr[cell(i + 1, j)], pr[cell(i, j + 1)], pr[cell(i + 1, j + 1)]);\n\
+    } else {\n\
+    x = vec4<f32>(curl[cell(i, j)], curl[cell(i + 1, j)], curl[cell(i, j + 1)], curl[cell(i + 1, j + 1)]);\n\
+    }\n\
+    return mix(mix(x.x, x.y, t.x), mix(x.z, x.w, t.x), t.y);\n\
+    }\n\
+    fn ink(k: u32) -> vec3<f32> {\n\
+    if k == 1u { return vec3<f32>(0.47, 0.5, 0.56); }\n\
+    if k == 2u { return vec3<f32>(0.45, 0.85, 1.0); }\n\
+    if k == 3u { return vec3<f32>(1.0, 0.62, 0.25); }\n\
+    if k == 4u { return vec3<f32>(1.0, 1.0, 1.0); }\n\
+    return vec3<f32>(0.84, 0.86, 0.9);\n\
+    }\n\
+    fn overlay(px: vec2<f32>, c: vec3<f32>) -> vec3<f32> {\n\
+    if prm.ui.w < 0.5 { return c; }\n\
+    let fp = prm.ui.z;\n\
+    let q = (px - prm.ui.xy) / fp;\n\
+    let size = vec2<f32>(prm.ui2.x * 6.0, prm.ui2.y * 8.0);\n\
+    let half = size * 0.5 + vec2<f32>(2.0, 2.0);\n\
+    let e = abs(q - size * 0.5) - half + vec2<f32>(2.0, 2.0);\n\
+    let d = length(max(e, vec2<f32>(0.0, 0.0))) + min(max(e.x, e.y), 0.0) - 2.0;\n\
+    if d * fp > 1.0 { return c; }\n\
+    let inside = clamp(0.5 - d * fp, 0.0, 1.0);\n\
+    var o = mix(c, vec3<f32>(0.02, 0.024, 0.035), 0.62 * inside);\n\
+    let rim = clamp(1.0 - abs(d * fp + 1.0), 0.0, 1.0);\n\
+    o = mix(o, vec3<f32>(0.3, 0.33, 0.4), 0.35 * rim);\n\
+    if q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y { return o; }\n\
+    let col = u32(q.x / 6.0);\n\
+    let row = u32(q.y / 8.0);\n\
+    let cell = text[row * u32(prm.ui2.z) + col];\n\
+    let ch = cell & 255u;\n\
+    let gx = i32(floor(q.x)) - i32(col) * 6;\n\
+    let gy = i32(floor(q.y)) - i32(row) * 8;\n\
+    if ch == 1u {\n\
+    if gy >= 0 && gy < 7 { o = prm.brush.xyz; }\n\
+    return o;\n\
+    }\n\
+    if ch < 32u || ch > 126u || gx > 4 || gy < 0 || gy > 6 { return o; }\n\
+    let g = (ch - 32u) * 2u;\n\
+    var bits = 0u;\n\
+    if gx < 4 { bits = glyphs[g] >> (u32(gx) * 8u); } else { bits = glyphs[g + 1u]; }\n\
+    if ((bits >> u32(gy)) & 1u) == 1u { o = ink((cell >> 8u) & 255u); }\n\
+    return o;\n\
+    }\n\
+    fn lum(p: vec2<f32>) -> f32 { return dot(tone(sample_dye(p)), vec3<f32>(0.3, 0.55, 0.15)); }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    let uv = v.pos.xy / vec2<f32>(prm.sw, prm.sh);\n\
+    let p = uv * vec2<f32>(f32(prm.w), f32(prm.h));\n\
+    let edge = uv * (vec2<f32>(1.0, 1.0) - uv);\n\
+    let vig = pow(clamp(edge.x * edge.y * 18.0, 0.0, 1.0), 0.22);\n\
+    let bg = mix(vec3<f32>(0.0008, 0.001, 0.002), vec3<f32>(0.004, 0.005, 0.011), vig);\n\
+    var c = vec3<f32>(0.0, 0.0, 0.0);\n\
+    if prm.view == 0u {\n\
+    let d = tone(sample_dye(p));\n\
+    let e = 1.5;\n\
+    let gx = lum(p + vec2<f32>(e, 0.0)) - lum(p - vec2<f32>(e, 0.0));\n\
+    let gy = lum(p + vec2<f32>(0.0, e)) - lum(p - vec2<f32>(0.0, e));\n\
+    let n = normalize(vec3<f32>(-gx * 6.0, -gy * 6.0, 1.0));\n\
+    let l = normalize(vec3<f32>(-0.4, -0.6, 0.7));\n\
+    let diff = clamp(dot(n, l), 0.0, 1.0);\n\
+    let shade = mix(1.0, 0.55 + 0.6 * diff, prm.shade);\n\
+    let spec = pow(clamp(dot(reflect(-l, n), vec3<f32>(0.0, 0.0, 1.0)), 0.0, 1.0), 24.0) * prm.shade;\n\
+    c = d * shade + vec3<f32>(spec, spec, spec) * 0.25 * length(d) + sample_glow(p) * prm.bloom;\n\
+    } else if prm.view == 1u {\n\
+    let w = vel(p);\n\
+    let s = length(w) / (0.25 * f32(prm.h));\n\
+    let h = atan2(w.y, w.x) / TAU + 0.5;\n\
+    c = hue(h) * (1.0 - exp(-2.0 * s));\n\
+    } else if prm.view == 2u {\n\
+    let x = (sample_cell(p, 0u) - pmean[0]) * 0.03;\n\
+    let k = x / (abs(x) + 1.0);\n\
+    c = select(vec3<f32>(0.2, 0.5, 1.0) * -k, vec3<f32>(1.0, 0.55, 0.15) * k, k > 0.0);\n\
+    } else {\n\
+    let x = sample_cell(p, 1u) * 0.08;\n\
+    let k = x / (abs(x) + 1.0);\n\
+    c = select(vec3<f32>(0.1, 0.8, 0.7) * -k, vec3<f32>(0.95, 0.3, 0.6) * k, k > 0.0);\n\
+    }\n\
+    let o = pow(bg + c, vec3<f32>(0.4545, 0.4545, 0.4545));\n\
+    return vec4<f32>(overlay(v.pos.xy, o), 1.0);\n\
+    }\n";
+
+// The pressure's mean, for the pressure view (a pressure is defined up to
+// a constant, which drifts): one workgroup sums the cells.
+pub const MEAN: [u8] = "@group(0) @binding(1) var<storage, read> pr: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> pmean: array<f32>;\n\
+    var<workgroup> part: array<f32, 256>;\n\
+    @compute @workgroup_size(256)\n\
+    fn main(@builtin(local_invocation_index) li: u32) {\n\
+    let n = prm.w * prm.h;\n\
+    var s = 0.0;\n\
+    for (var k = li; k < n; k += 256u) { s += pr[k]; }\n\
+    part[li] = s;\n\
+    workgroupBarrier();\n\
+    for (var st = 128u; st > 0u; st = st >> 1u) {\n\
+    if li < st { part[li] += part[li + st]; }\n\
+    workgroupBarrier();\n\
+    }\n\
+    if li == 0u { pmean[0] = part[0] / f32(n); }\n\
+    }\n";

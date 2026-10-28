@@ -7,7 +7,7 @@ real window (`std::window` + `std::gpu`, Metal on macOS) as
 camera-facing glowing billboards — no vertex buffers, no textures.
 
 ```sh
-target/volec -O2 examples/galaxy/main.vl -o galaxy
+target/volec -O2 examples/gpu/galaxy/main.vl -o galaxy
 ./galaxy                       # 8192 stars
 ./galaxy --stars 16384         # a heavier disk
 ./galaxy --headless            # no display needed: the self-check

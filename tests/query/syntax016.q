@@ -61,12 +61,12 @@ std::gpu::wgsl::builtins	<std>	35
 std::gpu::wgsl::entry	<std>	8
 std::gpu::wgsl::bounds	<std>	10
 std::gpu::wgsl::uniformity	<std>	1
-std::gpu::wgsl::msl	<std>	81
+std::gpu::wgsl::msl	<std>	88
 std::gpu::wgsl::spirv	<std>	1
 std::gpu::wgsl::interp	<std>	89
 std::gpu::wgsl::dump	<std>	12
 std::gpu::wgsl::job	<std>	13
-std::gpu::wgsl::api	<std>	26
+std::gpu::wgsl::api	<std>	30
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
@@ -76,7 +76,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	115
 std::window::keys	<std>	27
 std::window::objc	<std>	88
-std::cli	<std>	71
+std::cli	<std>	109
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
