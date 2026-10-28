@@ -95,6 +95,38 @@ Check and test only what a change touches, and widen at milestones:
 - a release: `bootstrap/gate.sh --release`, then `gate.sh --only bench`
   on an idle machine ([docs/releases.md](docs/releases.md), "The gate").
 
+## Before you commit, before a merge
+
+- **Start from green.** Branch from the integration branch (`release-X`),
+  not from a main nobody has checked; if your base fails tests, say which
+  ones and fix or report them before your own work, so that your results
+  are not mixed with inherited failures.
+- **The commit hook** (`git config core.hooksPath tools/git-hooks`, once
+  per clone) refuses a commit that adds `unsafe` without its `UNSAFE:`/
+  `SAFETY:` comments, stages an unformatted `.vl`, changes `compiler/std`
+  without the regenerated `compiler/src/front/stdsrc.vl`, or adds an
+  example case whose SOURCE does not exist. It runs for every committer,
+  under any agent harness (Claude Code's hooks do not run under opencode
+  or other tools; git's do).
+- **A change to an example** also needs its `tests/examples/*.test` case
+  (`// REQUIRES: metal` and `// LINK:` for std::gpu/std::window) and
+  `tests/run.sh example example_build`; moving an example moves its case.
+- **Linux too:** a change to tests/, the runner, std, the LSP or anything
+  platform-specific is checked in the Linux container before it is called
+  done (`bootstrap/gate.sh --only linux-aarch64`; colima must run).
+  `--quick` alone is macOS only.
+- **Before a merge into an integration branch:** `tools/premerge.sh` in
+  the branch's worktree (base contained, unsafe justified, fmt, every
+  touched program checks clean, the embedded std up to date, example
+  cases' sources exist), then the branch's own `tests/run.sh` and
+  `gate.sh --quick`.
+- **Report what was asked, checkably:** a task's "Done means" list is
+  answered item by item with the command or count that shows it (e.g.
+  "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
+- **Mind the machine:** at most five agents build and test the compiler
+  at once, and one gate runs at a time; under heavy load, timing results
+  are not evidence (the runner SKIPs time budgets with the load).
+
 ## Conventions
 
 - Commit as `git -c user.name=magniff -c user.email=tinysnippets@gmail.com
