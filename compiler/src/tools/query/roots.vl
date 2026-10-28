@@ -19,9 +19,11 @@
 // The command line is the one run_command was given (note_command), so a
 // command's own option parsing needs no change.
 
-use crate::base::{STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd};
+use crate::base::{
+    STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd,
+};
 use crate::front::cpp::directives::file_exists;
-use crate::tools::proc::{buf_cstr, read_file_if, run_capture};
+use crate::tools::proc::{absolute_path, buf_cstr, read_file_if, run_capture};
 use crate::tools::query::{c_slice, find_root};
 use crate::tools::query::defs::last_segment;
 use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, diag, diags, put_cword, put_word, try_end};
@@ -48,11 +50,25 @@ pub fn note_command(argc: i64, argv: **u8) {
     CMD_ARGV = argv;
 }
 
-// Word k of the command line (0 <= k < CMD_ARGC).
+// Word k of the command line ("" past its end).
 fn word(k: i64) -> *u8 {
-    // UNSAFE: the command line is C's argv, an array of C strings
-    // SAFETY: run_command's argv holds argc strings and k < CMD_ARGC
+    if k < 0 || k >= CMD_ARGC {
+        return c"";
+    }
+    // UNSAFE: the command line is C's argv, a raw array of C strings
+    // SAFETY: run_command's argv holds CMD_ARGC strings, and 0 <= k < CMD_ARGC
     unsafe { CMD_ARGV[k] }
+}
+
+// Element k of a command line being built, an array of n C strings
+// (alloc_array), set to w; nothing past its end.
+fn set_word(argv: **u8, n: i64, k: i64, w: *u8) {
+    if k < 0 || k >= n {
+        return;
+    }
+    // UNSAFE: a write through a raw pointer, the array exec and run_capture take
+    // SAFETY: argv has n elements (alloc_array) and 0 <= k < n
+    unsafe { argv[k] = w; }
 }
 
 fn cstr_of(s: [u8]) -> *u8 {
@@ -191,17 +207,7 @@ fn file_of_arg(a: [u8]) -> [u8] {
 
 // Whether paths a and b name the same file.
 fn same_file(a: *u8, b: *u8) -> bool {
-    // UNSAFE: realpath is C's
-    // SAFETY: a and b are C strings; a null buffer makes realpath allocate
-    // the result, read only while it lives (never freed)
-    let ra = unsafe { realpath(a, 0 as *u8) };
-    // UNSAFE: as above
-    // SAFETY: as above
-    let rb = unsafe { realpath(b, 0 as *u8) };
-    if ra == 0 as *u8 || rb == 0 as *u8 {
-        return c_slice(a) == c_slice(b);
-    }
-    c_slice(ra) == c_slice(rb)
+    c_slice(absolute_path(a)) == c_slice(absolute_path(b))
 }
 
 // Whether std's files hold path p (std is a program's always: stdedit).
@@ -288,15 +294,14 @@ pub fn program_root(given: *u8) -> *u8 {
 // ---- A NAME of another program ----
 
 // Whether the root is the default one, chosen by nobody: no ROOT, no
-// VOLE_ROOT (a question asked of another program goes to it).
+// VOLE_ROOT (find_root then names ./main.vl, ./compiler/src/main.vl or
+// none; a question asked of another program goes to it).
 fn default_root_used() -> bool {
     if ROOT_GIVEN != 0 as *u8 || ROOT_INFERRED {
         return false;
     }
-    // UNSAFE: getenv is C's
-    // SAFETY: a C string's name; the result is read before any setenv
-    let env = unsafe { getenv(c"VOLE_ROOT") };
-    env == 0 as *u8 || c_slice(env).len == 0
+    let d = find_root(0 as *u8);
+    d == 0 as *u8 || c_slice(d) == "main.vl" || c_slice(d) == "compiler/src/main.vl"
 }
 
 // The .vl files under the current directory with a match of extended
@@ -306,16 +311,12 @@ fn default_root_used() -> bool {
 // ignores (a release's tree extracted under target/), `grep -r` less the
 // build's and the tools' directories; never of the home directory or /.
 fn files_matching(pattern: *u8) -> [u8] {
+    // (the null after the words: alloc_array's zeroes)
     let args = crate::base::alloc_array::<*u8>(5);
-    // UNSAFE: the command line of sh, an array of C strings
-    // SAFETY: args has 5 elements, 0 to 4 written, the last null
-    unsafe {
-        args[0] = c"sh";
-        args[1] = c"-c";
-        args[2] = c"{ if git rev-parse --git-dir >/dev/null 2>&1 && ! git check-ignore -q . 2>/dev/null; then git grep -l -w -E --untracked -e \"$0\" -- '*.vl'; elif [ \"$PWD\" != \"$HOME\" ] && [ \"$PWD\" != / ]; then grep -rlwE --include='*.vl' --exclude-dir=.git --exclude-dir=target --exclude-dir=.claude --exclude-dir=.volec --exclude-dir=node_modules -e \"$0\" -- .; fi; } 2>/dev/null | LC_ALL=C sort";
-        args[3] = pattern;
-        args[4] = 0 as *u8;
-    }
+    set_word(args, 5, 0, c"sh");
+    set_word(args, 5, 1, c"-c");
+    set_word(args, 5, 2, c"{ if git rev-parse --git-dir >/dev/null 2>&1 && ! git check-ignore -q . 2>/dev/null; then git grep -l -w -E --untracked -e \"$0\" -- '*.vl'; elif [ \"$PWD\" != \"$HOME\" ] && [ \"$PWD\" != / ]; then grep -rlwE --include='*.vl' --exclude-dir=.git --exclude-dir=target --exclude-dir=.claude --exclude-dir=.volec --exclude-dir=node_modules -e \"$0\" -- .; fi; } 2>/dev/null | LC_ALL=C sort");
+    set_word(args, 5, 3, pattern);
     let listing = buf_new();
     if run_capture(args, listing) != 0 {
         return buf_slice(listing)[0..0];
@@ -450,17 +451,17 @@ pub fn other_root() {
     buf_str(d, c")\n");
     buf_write_fd(out, STDERR);
     buf_clear(out);
-    let argv = crate::base::alloc_array::<*u8>(CMD_ARGC + 3);
-    // UNSAFE: the new command line, an array of C strings for execvp
-    // SAFETY: argv has CMD_ARGC + 3 elements: the command's words, then
-    // `--root`, the root and a null
-    unsafe {
-        for k in 0..CMD_ARGC {
-            argv[k] = word(k);
-        }
-        argv[CMD_ARGC] = c"--root";
-        argv[CMD_ARGC + 1] = OTHER_ROOT;
-        argv[CMD_ARGC + 2] = 0 as *u8;
-        execvp(argv[0], argv);
+    // (the command's words, `--root`, the root; the null after them:
+    // alloc_array's zeroes)
+    let n = CMD_ARGC + 3;
+    let argv = crate::base::alloc_array::<*u8>(n);
+    for k in 0..CMD_ARGC {
+        set_word(argv, n, k, word(k));
     }
+    set_word(argv, n, CMD_ARGC, c"--root");
+    set_word(argv, n, CMD_ARGC + 1, OTHER_ROOT);
+    // UNSAFE: execvp is C's
+    // SAFETY: argv is a null-ended array of C strings (above), its first
+    // the program as this one was run
+    unsafe { execvp(word(0), argv); }
 }
