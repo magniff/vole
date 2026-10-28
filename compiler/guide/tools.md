@@ -195,8 +195,11 @@ after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`), after
 the module's items, imports, the prelude and keywords, each with its
 signature, and its comment and effects when chosen; formatting, the
 buffer as `volec fmt` lays it out (the VS Code extension on save), no
-edits when it does not parse. The root: the nearest `main.vl`
-(docs/lsp.md).
+edits when it does not parse. The root: the nearest `main.vl` (up to
+the repository's top or the home directory), else the file itself
+(0.25.2). (0.25.2) Definition on a C import's string opens the header,
+on `c::NAME` its declaration there (a hover shows it); headers found
+through `-I` need the include paths (`vole.includePaths`; docs/lsp.md).
 
 ## Other compiler options
 
