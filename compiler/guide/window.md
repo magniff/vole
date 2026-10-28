@@ -40,6 +40,17 @@ fn main(gpa: Gpa) -> i32 {
   `win.request_frame()`, `size()`, `raw_surface()` (the CAMetalLayer),
   `set_title`, `set_cursor`, `hide_cursor_while_typing`,
   `set_ime_area(x, y, w, h)`, `set_fullscreen`, `focused`, `close`.
+- **Frames when the window is not shown** (0.25.2.1): the display gives
+  no frames while it is asleep (the screen locked, the person away), or
+  while the window is covered, hidden, minimized or on another Space. A
+  request is then answered by a timer, 10 frames a second (60 without a
+  display link), so a `--frames N` loop still ends; after 3 s without a
+  display frame stderr gets one line, `window: no frame in 3 s: the
+  window is occluded or not shown (the display is asleep); ...`. Frame
+  times measured then are the timer's (100 ms), not the GPU's: time a
+  GPU program headless or with the display awake. A program started
+  from a background shell is not made active: its window is ordered
+  front regardless.
 - **Keys and text**: a key that types something is a `Key` with
   `text_follows`, then a `Text`. Encode keys that do not (arrows, Return,
   Control-letters); send `Text` as it is. `ime` marks keys an input

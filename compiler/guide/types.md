@@ -50,9 +50,10 @@ println("");
 ```
 
 Floats are IEEE 754 without fast-math; `1.0 / 0.0` is infinity, and
-`NaN != NaN`. There are no `MIN`/`MAX` constants, no `abs`, `pow` or
-`sqrt` methods: write them, or call C's math functions
-(`import "math.h" as m;`, `unsafe { m::sqrt(x) }`).
+`NaN != NaN`. Floats have Rust's methods and constants (0.25.2.1):
+`x.sqrt()`, `x.sin()`, `x.abs()`, `x.powi(2)`, `a.max(b)`, `f64::EPSILON`,
+`f64::MAX`, `f64::consts::PI` (`volec guide math`), in vole, with no C
+call; integers have none (`i64::MAX` and `MIN` aside).
 
 ## Arrays and slices
 
@@ -74,7 +75,9 @@ Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
 `a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
 `index out of bounds: index I, length N` and exits with 101. An array
 has its length too: `a.len()` (0.17), or slice it: `a[..].len()`. A function taking `[T]` gets
-`a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
+`a[..]`, not `a`. An array literal where a slice of numbers goes takes
+its element type (0.25.2.1): `let xs: [u32] = [1, 2, 3];`, `sum([1, 2])`
+for `xs: [u32]`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
 ## Accesses and pointers

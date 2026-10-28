@@ -1,0 +1,347 @@
+// The ocean on the GPU: the Phillips spectrum h0 (made once by `reset`),
+// its evolution to time t and the inverse FFT of the height and the
+// horizontal displacements (ping-pong buffers: evolve writes a0 and b0,
+// the row and column passes go a0 -> a1 -> a0 and b0 -> b1 -> b0), and
+// the mesh drawn from them. A frame is `set_time`, `set_camera`, then
+// `record_sim` and `record_draw` into one encoder.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Compare, Format, IndexFormat, PassDesc, TextureUsage};
+
+use cpu::{cos_of, cross3, look_at, mat_mul, perspective, sin_of};
+use shaders::{COMMON, EVOLVE, FFT, INIT, RENDER};
+
+const GRAVITY: f64 = 9.81;
+
+// A camera: where it is, its axes (forward, right, up: unit, orthogonal)
+// and its vertical field of view in radians.
+pub struct View {
+    pub eye: [f64; 3],
+    pub fwd: [f64; 3],
+    pub rgt: [f64; 3],
+    pub fovy: f64,
+}
+
+pub struct Ocean {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // grid cells across and down (a power of two, 8..256)
+    pub n: i64,
+    // the patch's side in metres (cell = patch / n)
+    pub patch: f64,
+    // the wind (m/s), the Phillips amplitude, the wind's direction (unit)
+    pub wind: f64,
+    pub amp: f64,
+    pub wdx: f64,
+    pub wdz: f64,
+    // the choppy factor: how far the horizontal displacement goes
+    pub lambda: f64,
+    h0: gpu::Buffer,
+    par: gpu::Buffer,
+    par_row: gpu::Buffer,
+    par_col: gpu::Buffer,
+    cam: gpu::Buffer,
+    pub a0: gpu::Buffer,
+    pub b0: gpu::Buffer,
+    a1: gpu::Buffer,
+    b1: gpu::Buffer,
+    index: gpu::Buffer,
+    index_count: i64,
+    init_p: gpu::ComputePipeline,
+    evolve_p: gpu::ComputePipeline,
+    fft_p: gpu::ComputePipeline,
+    render_p: gpu::RenderPipeline,
+    sky_p: gpu::RenderPipeline,
+    g_sky: gpu::BindGroup,
+    g_init: gpu::BindGroup,
+    g_evolve: gpu::BindGroup,
+    g_row_a: gpu::BindGroup,
+    g_col_a: gpu::BindGroup,
+    g_row_b: gpu::BindGroup,
+    g_col_b: gpu::BindGroup,
+    g_render: gpu::BindGroup,
+}
+
+// A compute pipeline from the WGSL made of `parts`, entry point `entry`.
+fn kernel(dev: gpu::Device, parts: [[u8]], entry: [u8], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, entry)
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// The kernels' parameters, in the order of the WGSL struct Par.
+fn pack(n: i64, patch: f64, time: f64, seed: i64, lambda: f64, amp: f64, wind: f64, wdx: f64,
+    wdz: f64, vertical: bool) -> [f32; 12] {
+    var log2n = 0;
+    while (1 << log2n) < n {
+        log2n += 1;
+    }
+    [
+        n as f32, log2n as f32, if vertical { 1.0 } else { 0.0 }, seed as f32, patch as f32,
+        time as f32, GRAVITY as f32, lambda as f32, amp as f32, wind as f32, wdx as f32,
+        wdz as f32,
+    ]
+}
+
+impl Ocean {
+    pub fn new_in(n: i64, patch: f64, wind: f64, amp: f64, gpa: Gpa) -> Result<Ocean, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let cells = n * n;
+        let cells_bytes = cells * 16;
+        // the wind blows along +x, a little toward +z
+        let wdx = 0.96;
+        let wdz = 0.28;
+        let lambda = 1.0;
+        let par = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let par_row = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let par_col = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let cam = dev.buffer(160, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        queue.write_buffer(par_row, 0, gpu::bytes_of_f32(pack(n, patch, 0.0, 0, lambda, amp,
+            wind, wdx, wdz, false)[..]));
+        queue.write_buffer(par_col, 0, gpu::bytes_of_f32(pack(n, patch, 0.0, 0, lambda, amp,
+            wind, wdx, wdz, true)[..]));
+        let h0 = storage(dev, cells_bytes);
+        let a0 = storage(dev, cells_bytes);
+        let b0 = storage(dev, cells_bytes);
+        let a1 = storage(dev, cells_bytes);
+        let b1 = storage(dev, cells_bytes);
+        // the mesh: n x n vertices, two triangles a quad
+        var idx: Vec<u32> = Vec::new_in(gpa);
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let v00 = (y * n + x) as u32;
+                let v10 = v00 + 1;
+                let v01 = v00 + n as u32;
+                let v11 = v01 + 1;
+                idx.push(v00);
+                idx.push(v01);
+                idx.push(v10);
+                idx.push(v10);
+                idx.push(v01);
+                idx.push(v11);
+            }
+        }
+        let index = dev.buffer_init(gpu::bytes_of_u32(idx.as_slice()), BufferUsage::INDEX);
+        let index_count = idx.len();
+        let init_p = kernel(dev, [COMMON, INIT][..], "init", gpa)?;
+        let evolve_p = kernel(dev, [COMMON, EVOLVE][..], "evolve", gpa)?;
+        let fft_p = kernel(dev, [COMMON, FFT][..], "fft", gpa)?;
+        // the mesh (depth-tested) and the sky behind it (depth test passes, no write)
+        let rshader = dev.shader_wgsl(RENDER)?;
+        var rdesc = gpu::RenderDesc::new(rshader, "vs", "fs", Format::Bgra8Unorm);
+        rdesc.depth(Format::Depth32Float, Compare::Less, true);
+        let render_p = dev.render_pipeline(rdesc)?;
+        let sshader = dev.shader_wgsl(RENDER)?;
+        var sdesc = gpu::RenderDesc::new(sshader, "sky_vs", "sky_fs", Format::Bgra8Unorm);
+        sdesc.depth(Format::Depth32Float, Compare::Always, false);
+        let sky_p = dev.render_pipeline(sdesc)?;
+        // one shader module: the sky's layout has the mesh's bindings too
+        let g_sky = dev.bind_group(sky_p.bind_layout(0),
+            [gpu::bind(0, cam), gpu::bind(1, a0), gpu::bind(2, b0)][..]);
+        let g_init = dev.bind_group(init_p.bind_layout(0), [gpu::bind(0, par), gpu::bind(1, h0)][..]);
+        let g_evolve = dev.bind_group(evolve_p.bind_layout(0),
+            [gpu::bind(0, par), gpu::bind(1, h0), gpu::bind(2, a0), gpu::bind(3, b0)][..]);
+        let g_row_a = dev.bind_group(fft_p.bind_layout(0),
+            [gpu::bind(0, par_row), gpu::bind(1, a0), gpu::bind(2, a1)][..]);
+        let g_col_a = dev.bind_group(fft_p.bind_layout(0),
+            [gpu::bind(0, par_col), gpu::bind(1, a1), gpu::bind(2, a0)][..]);
+        let g_row_b = dev.bind_group(fft_p.bind_layout(0),
+            [gpu::bind(0, par_row), gpu::bind(1, b0), gpu::bind(2, b1)][..]);
+        let g_col_b = dev.bind_group(fft_p.bind_layout(0),
+            [gpu::bind(0, par_col), gpu::bind(1, b1), gpu::bind(2, b0)][..]);
+        let g_render = dev.bind_group(render_p.bind_layout(0),
+            [gpu::bind(0, cam), gpu::bind(1, a0), gpu::bind(2, b0)][..]);
+        Ok(Ocean {
+            dev: dev, queue: queue, n: n, patch: patch, wind: wind, amp: amp, wdx: wdx, wdz: wdz,
+            lambda: lambda, h0: h0, par: par, par_row: par_row, par_col: par_col, cam: cam,
+            a0: a0, b0: b0, a1: a1, b1: b1, index: index, index_count: index_count,
+            init_p: init_p, evolve_p: evolve_p, fft_p: fft_p, render_p: render_p,
+            sky_p: sky_p, g_sky: g_sky,
+            g_init: g_init, g_evolve: g_evolve, g_row_a: g_row_a, g_col_a: g_col_a,
+            g_row_b: g_row_b, g_col_b: g_col_b, g_render: g_render,
+        })
+    }
+
+    // Draws a new h0 (the Phillips spectrum with random phases from `seed`).
+    pub fn reset(inout self, seed: i64) {
+        let p = pack(self.n, self.patch, 0.0, seed, self.lambda, self.amp, self.wind, self.wdx,
+            self.wdz, false);
+        self.queue.write_buffer(self.par, 0, gpu::bytes_of_f32(p[..]));
+        var enc = self.dev.encoder();
+        let k = self.init_p;
+        let g = self.g_init;
+        let n8 = self.n / 8;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(k);
+            pass.set_bind_group(0, g);
+            pass.dispatch(n8, n8);
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The time of the next evolve (seconds), written before the frame's submit.
+    pub fn set_time(inout self, t: f64, seed: i64) {
+        let p = pack(self.n, self.patch, t, seed, self.lambda, self.amp, self.wind, self.wdx,
+            self.wdz, false);
+        self.queue.write_buffer(self.par, 0, gpu::bytes_of_f32(p[..]));
+    }
+
+    // The camera for a w x h picture and the sun's direction: the
+    // view-projection matrix (column-major), the eye, the sun, the axes and
+    // (n, cell size, tan of half the field of view, aspect). 40 numbers.
+    pub fn set_camera(inout self, v: View, w: i64, h: i64, sun: [f64; 3]) {
+        let aspect = w as f64 / h as f64;
+        let up = cross3(v.rgt, v.fwd);
+        let target = [v.eye[0] + v.fwd[0], v.eye[1] + v.fwd[1], v.eye[2] + v.fwd[2]];
+        let vp = mat_mul(perspective(v.fovy, aspect, 0.5, 3000.0),
+            look_at(v.eye, target, [0.0, 1.0, 0.0]));
+        let cell = self.patch / self.n as f64;
+        let tan = sin_of(v.fovy / 2.0) / cos_of(v.fovy / 2.0);
+        var c: [f32; 40] = [0.0; 40];
+        for i in 0..16 {
+            c[i] = vp[i];
+        }
+        for i in 0..3 {
+            c[16 + i] = v.eye[i] as f32;
+            c[20 + i] = sun[i] as f32;
+            c[24 + i] = v.fwd[i] as f32;
+            c[28 + i] = v.rgt[i] as f32;
+            c[32 + i] = up[i] as f32;
+        }
+        c[19] = 1.0;
+        c[36] = self.n as f32;
+        c[37] = cell as f32;
+        c[38] = tan as f32;
+        c[39] = aspect as f32;
+        self.queue.write_buffer(self.cam, 0, gpu::bytes_of_f32(c[..]));
+    }
+
+    // The evolution and the inverse FFT, recorded into `enc`: h0 -> spectra
+    // -> the height and displacement fields in a0 and b0.
+    pub fn record_sim(inout self, enc: inout gpu::Encoder) {
+        let k = self.evolve_p;
+        let g = self.g_evolve;
+        let row = self.fft_p;
+        let gra = self.g_row_a;
+        let gca = self.g_col_a;
+        let grb = self.g_row_b;
+        let gcb = self.g_col_b;
+        let n = self.n;
+        let n8 = n / 8;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(k);
+            pass.set_bind_group(0, g);
+            pass.dispatch(n8, n8);
+            pass.set_pipeline(row);
+            pass.set_bind_group(0, gra);
+            pass.dispatch(n);
+            pass.set_bind_group(0, gca);
+            pass.dispatch(n);
+            pass.set_bind_group(0, grb);
+            pass.dispatch(n);
+            pass.set_bind_group(0, gcb);
+            pass.dispatch(n);
+        });
+    }
+
+    // The mesh, recorded into `enc`, drawn into `target` with `depth`.
+    pub fn record_draw(inout self, enc: inout gpu::Encoder, target: gpu::TextureView,
+        depth: gpu::TextureView) {
+        let sky = self.sky_p;
+        let gs = self.g_sky;
+        let pipe = self.render_p;
+        let g = self.g_render;
+        let idx = self.index;
+        let count = self.index_count;
+        enc.render_pass(PassDesc::color(target).with_depth(depth), |pass| {
+            pass.set_pipeline(sky);
+            pass.set_bind_group(0, gs);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, g);
+            pass.set_index_buffer(idx, IndexFormat::Uint32, 0);
+            pass.draw_indexed(0..count, 0, 0..1);
+        });
+    }
+
+    // The height at every cell, row by row (waits for the GPU).
+    pub fn heights(inout self, gpa: Gpa) -> Vec<f32> {
+        var out: Vec<f32> = Vec::new_in(gpa);
+        let v = gpu::f32s(self.a0.map_read(self.dev));
+        var i = 0;
+        while i < v.len() {
+            out.push(v[i]);
+            i += 4;
+        }
+        out
+    }
+
+    // h0 of every cell: (re, im, omega, 0), four f32s a cell (waits for the GPU).
+    pub fn spectrum(inout self, gpa: Gpa) -> Vec<f32> {
+        var out: Vec<f32> = Vec::new_in(gpa);
+        for x in gpu::f32s(self.h0.map_read(self.dev)) {
+            out.push(x);
+        }
+        out
+    }
+
+    // The FFT alone, for the checks: `data` (four f32s a cell) goes in a0,
+    // the row and column passes run on it (a0 -> a1 -> a0), and a0 comes back.
+    // Needs a grid of n cells made by new_in with this Ocean's n.
+    pub fn transform(inout self, data: [f32], gpa: Gpa) -> Vec<f32> {
+        self.queue.write_buffer(self.a0, 0, gpu::bytes_of_f32(data));
+        var enc = self.dev.encoder();
+        let row = self.fft_p;
+        let gra = self.g_row_a;
+        let gca = self.g_col_a;
+        let n = self.n;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(row);
+            pass.set_bind_group(0, gra);
+            pass.dispatch(n);
+            pass.set_bind_group(0, gca);
+            pass.dispatch(n);
+        });
+        self.queue.submit(enc.finish());
+        var out: Vec<f32> = Vec::new_in(gpa);
+        for x in gpu::f32s(self.a0.map_read(self.dev)) {
+            out.push(x);
+        }
+        out
+    }
+
+    // The picture of the current state, w x h pixels, as a binary PPM (the
+    // sun and the camera as given). Waits for the GPU.
+    pub fn snapshot_in(inout self, w: i64, h: i64, v: View, sun: [f64; 3], gpa: Gpa) -> Buf {
+        self.set_camera(v, w, h, sun);
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let depth = self.dev.texture(w, h, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.record_draw(&enc, tex.view(), depth.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

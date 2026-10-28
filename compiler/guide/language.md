@@ -56,7 +56,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
 | `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
 | `!x` on integers | `~x`; `!` is for `bool` only |
-| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); no methods on numbers: write the expression, or call C |
+| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers none |
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |

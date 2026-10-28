@@ -1,0 +1,95 @@
+// The GPU side: one pipeline draws every frame. The vertices (text.vl)
+// are written into one vertex buffer; the uniform carries the target's
+// size; the atlas is a read-only storage buffer the fragment shader
+// samples bilinearly and turns into an anti-aliased edge.
+
+use std::gpu;
+use std::gpu::{Blend, BufferUsage, Color, Format, Load, PassDesc, VertexFormat, VertexLayout};
+
+// The vertex buffer's capacity, in vertices (32 bytes each).
+pub const MAX_VERTICES: i64 = 32768;
+
+// The shader's atlas is glyphs::ATLAS_W by ATLAS_H (768 by 192): its
+// constants are written in the text below.
+const SHADER: [u8] = "struct U { screen: vec4<f32> }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    @group(0) @binding(1) var<storage, read> atlas: array<f32>;\n\
+    struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+    @location(1) color: vec4<f32>,\n\
+    }\n\
+    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> V {\n\
+    let ndc = vec2<f32>(pos.x / u.screen.x * 2.0 - 1.0, 1.0 - pos.y / u.screen.y * 2.0);\n\
+    return V(vec4<f32>(ndc, 0.0, 1.0), uv, color);\n\
+    }\n\
+    fn texel(x: f32, y: f32) -> f32 {\n\
+    let ix = clamp(i32(floor(x)), 0, 767);\n\
+    let iy = clamp(i32(floor(y)), 0, 191);\n\
+    return atlas[u32(iy) * 768u + u32(ix)];\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let p = v.uv - vec2<f32>(0.5, 0.5);\n\
+    let f = fract(p);\n\
+    let base = floor(p);\n\
+    let a = texel(base.x, base.y);\n\
+    let b = texel(base.x + 1.0, base.y);\n\
+    let c = texel(base.x, base.y + 1.0);\n\
+    let d = texel(base.x + 1.0, base.y + 1.0);\n\
+    let value = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n\
+    let w = fwidth(value) * 0.75;\n\
+    let alpha = smoothstep(0.5 - w, 0.5 + w, value);\n\
+    let glyph = vec4<f32>(v.color.rgb, v.color.a * alpha);\n\
+    return select(glyph, v.color, v.uv.x < 0.0);\n\
+    }\n";
+
+pub struct Gfx {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pipe: gpu::RenderPipeline,
+    ubuf: gpu::Buffer,
+    vbuf: gpu::Buffer,
+    group: gpu::BindGroup,
+}
+
+// The pipeline for targets of format, with the atlas uploaded.
+pub fn make(dev: sink gpu::Device, queue: sink gpu::Queue, format: Format, atlas: [f32]) -> Result<Gfx, gpu::Error> {
+    let shader = dev.shader_wgsl(SHADER)?;
+    var desc = gpu::RenderDesc::new(shader, "vs", "fs", format);
+    var layout = VertexLayout::new(32);
+    layout.attribute(0, VertexFormat::Float32x2, 0);
+    layout.attribute(1, VertexFormat::Float32x2, 8);
+    layout.attribute(2, VertexFormat::Float32x4, 16);
+    desc.vertex_buffer(layout);
+    desc.blend(Blend::alpha(), target: 0);
+    let pipe = dev.render_pipeline(desc)?;
+    let ubuf = dev.buffer(dev.align_uniform(16), BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let abuf = dev.buffer_init(gpu::bytes_of_f32(atlas), BufferUsage::STORAGE);
+    let vbuf = dev.buffer(MAX_VERTICES * 32, BufferUsage::VERTEX | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, abuf)][..]);
+    Ok(Gfx { dev: dev, queue: queue, pipe: pipe, ubuf: ubuf, vbuf: vbuf, group: group })
+}
+
+// Records one frame into view (w by h pixels): the vertices, cleared to
+// clear first. The caller submits the commands.
+pub fn draw(g: inout Gfx, view: gpu::TextureView, verts: [f32], w: i64, h: i64, clear: Color) -> gpu::Commands {
+    let n = verts.len() / 8;
+    assert(n <= MAX_VERTICES, "too many vertices for the buffer");
+    g.queue.write_buffer(g.ubuf, 0, gpu::bytes_of_f32([w as f32, h as f32, 0.0, 0.0][..]));
+    if n > 0 {
+        g.queue.write_buffer(g.vbuf, 0, gpu::bytes_of_f32(verts));
+    }
+    let pipe = g.pipe;
+    let group = g.group;
+    let vbuf = g.vbuf;
+    var enc = g.dev.encoder();
+    enc.render_pass(PassDesc::color(view, clear: clear, load: Load::Clear), |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        if n > 0 {
+            pass.set_vertex_buffer(0, vbuf);
+            pass.draw(0..n, 0..1);
+        }
+    });
+    enc.finish()
+}

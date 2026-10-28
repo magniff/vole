@@ -1,0 +1,242 @@
+// The Physarum simulation on the GPU: the agents, the trail (two grids,
+// ping-pong), the fixed-point deposit grid, one pipeline per kernel and
+// the picture. A step is four kernels in one compute pass: agents (sense,
+// turn, move, deposit), diffuse (blur, decay, food), clear_dep. Nothing is
+// read back during a frame; the headless checks read the buffers once.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+
+use shaders::{AGENTS, CLEAR, COMMON, DIFFUSE, INIT, RENDER};
+use tune::{pack, Tune};
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // the trail grid: gw x gh cells
+    pub gw: i64,
+    pub gh: i64,
+    // the agents
+    pub n: i64,
+    // which trail buffer holds the current trail (0 or 1)
+    pub cur: i64,
+    ubuf: gpu::Buffer,
+    agents: gpu::Buffer,
+    dep: gpu::Buffer,
+    t0: gpu::Buffer,
+    t1: gpu::Buffer,
+    k_init: gpu::ComputePipeline,
+    k_agents: gpu::ComputePipeline,
+    k_diffuse: gpu::ComputePipeline,
+    k_clear: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    g_init: gpu::BindGroup,
+    g_agents0: gpu::BindGroup,
+    g_agents1: gpu::BindGroup,
+    g_diffuse0: gpu::BindGroup,
+    g_diffuse1: gpu::BindGroup,
+    g_clear: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+    // zeros for `reset`, as long as one trail grid
+    zeros: Vec<u8>,
+}
+
+// A compute pipeline from the shader made of `parts`, entry point `entry`.
+fn kernel(dev: gpu::Device, parts: [[u8]], entry: [u8], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, entry)
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// One kernel over `groups` workgroups of 256 threads.
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, groups: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch(groups);
+}
+
+fn groups_for(n: i64) -> i64 {
+    (n + 255) / 256
+}
+
+fn zero(q: inout gpu::Queue, b: gpu::Buffer, z: [u8]) {
+    q.write_buffer(b, 0, z[0..b.size()]);
+}
+
+impl Sim {
+    // A gw x gh trail with n agents, on the system's GPU.
+    pub fn new_in(gw: i64, gh: i64, n: i64, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = gw * gh;
+        let ubuf = dev.buffer(80, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let agents = storage(dev, n * 16);
+        let dep = storage(dev, cells * 4);
+        let t0 = storage(dev, cells * 4);
+        let t1 = storage(dev, cells * 4);
+
+        let k_init = kernel(dev, [COMMON, INIT][..], "init_agents", gpa)?;
+        let k_agents = kernel(dev, [COMMON, AGENTS][..], "agents_step", gpa)?;
+        let k_diffuse = kernel(dev, [COMMON, DIFFUSE][..], "diffuse", gpa)?;
+        let k_clear = kernel(dev, [COMMON, CLEAR][..], "clear_dep", gpa)?;
+        var rsrc = Buf::new_in(gpa);
+        rsrc.push_str(COMMON);
+        rsrc.push_str(RENDER);
+        let rshader = dev.shader_wgsl(rsrc.as_slice())?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", Format::Bgra8Unorm))?;
+
+        let b = gpu::bind;
+        let g_init = dev.bind_group(k_init.bind_layout(0), [b(0, ubuf), b(1, agents)][..]);
+        let g_agents0 = dev.bind_group(k_agents.bind_layout(0),
+            [b(0, ubuf), b(1, t0), b(2, dep), b(3, agents)][..]);
+        let g_agents1 = dev.bind_group(k_agents.bind_layout(0),
+            [b(0, ubuf), b(1, t1), b(2, dep), b(3, agents)][..]);
+        let g_diffuse0 = dev.bind_group(k_diffuse.bind_layout(0),
+            [b(0, ubuf), b(1, t0), b(2, dep), b(3, t1)][..]);
+        let g_diffuse1 = dev.bind_group(k_diffuse.bind_layout(0),
+            [b(0, ubuf), b(1, t1), b(2, dep), b(3, t0)][..]);
+        let g_clear = dev.bind_group(k_clear.bind_layout(0), [b(0, ubuf), b(1, dep)][..]);
+        let g_render0 = dev.bind_group(render.bind_layout(0), [b(0, ubuf), b(1, t0)][..]);
+        let g_render1 = dev.bind_group(render.bind_layout(0), [b(0, ubuf), b(1, t1)][..]);
+
+        var s = Sim {
+            dev: dev, queue: queue, gw: gw, gh: gh, n: n, cur: 0,
+            ubuf: ubuf, agents: agents, dep: dep, t0: t0, t1: t1,
+            k_init: k_init, k_agents: k_agents, k_diffuse: k_diffuse, k_clear: k_clear,
+            render: render,
+            g_init: g_init, g_agents0: g_agents0, g_agents1: g_agents1,
+            g_diffuse0: g_diffuse0, g_diffuse1: g_diffuse1, g_clear: g_clear,
+            g_render0: g_render0, g_render1: g_render1,
+            zeros: Vec::filled_in(cells * 4, 0u8, gpa),
+        };
+        s.reset();
+        Ok(s)
+    }
+
+    // The uniform block of the next step (written in queue order, so a
+    // step already submitted keeps the values it was given). `px, py` is
+    // the pointer in cells; mode 0 none, 1 food, 2 repel.
+    pub fn set_params(inout self, t: Tune, px: f64, py: f64, mode: i64, seed: i64) {
+        let words = pack(t, self.gw, self.gh, self.n, seed, px, py, mode);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // One step, recorded into `enc`: the agents move and deposit, the trail
+    // diffuses into the other grid, the deposit grid is cleared.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let n = self.n;
+        let cells = self.gw * self.gh;
+        let cur = self.cur;
+        enc.compute_pass(|pass| {
+            if cur == 0 {
+                run(&pass, self.k_agents, self.g_agents0, groups_for(n));
+                run(&pass, self.k_diffuse, self.g_diffuse0, groups_for(cells));
+            } else {
+                run(&pass, self.k_agents, self.g_agents1, groups_for(n));
+                run(&pass, self.k_diffuse, self.g_diffuse1, groups_for(cells));
+            }
+            run(&pass, self.k_clear, self.g_clear, groups_for(cells));
+        });
+        self.cur = 1 - cur;
+    }
+
+    // The picture of the current trail into `target`.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let k = self.cur;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.render);
+            if k == 0 {
+                pass.set_bind_group(0, self.g_render0);
+            } else {
+                pass.set_bind_group(0, self.g_render1);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // Everything back to the start: the agents in a disc at the centre
+    // with random headings, no trail.
+    pub fn reset(inout self) {
+        let z = self.zeros.as_slice();
+        zero(&self.queue, self.t0, z);
+        zero(&self.queue, self.t1, z);
+        self.cur = 0;
+        // the init kernel reads the grid and the agent count from the
+        // uniform block, so it must be written before the kernel runs
+        let words = pack(Tune::new(), self.gw, self.gh, self.n, 0, -1.0, -1.0, 0);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        var enc = self.dev.encoder();
+        let n = self.n;
+        let cells = self.gw * self.gh;
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_init, self.g_init, groups_for(n));
+            run(&pass, self.k_clear, self.g_clear, groups_for(cells));
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The picture as a binary PPM of gw x gh pixels (waits for the GPU).
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+
+    // The sum of the trail over the cells (waits for the GPU).
+    pub fn trail_total(inout self) -> f64 {
+        let _ = self.queue.wait_idle();
+        let t = if self.cur == 0 {
+            gpu::f32s(self.t0.map_read(self.dev))
+        } else {
+            gpu::f32s(self.t1.map_read(self.dev))
+        };
+        var s = 0.0;
+        for x in t {
+            s += x as f64;
+        }
+        s
+    }
+
+    // How many agents are not inside the grid (or have no position at all).
+    pub fn outside(inout self) -> i64 {
+        let _ = self.queue.wait_idle();
+        let a = gpu::f32s(self.agents.map_read(self.dev));
+        let gw = self.gw as f32;
+        let gh = self.gh as f32;
+        var bad: i64 = 0;
+        var i = 0;
+        while i + 3 < a.len() {
+            let x = a[i];
+            let y = a[i + 1];
+            if !(x >= 0.0 && x < gw && y >= 0.0 && y < gh) {
+                bad += 1;
+            }
+            i += 4;
+        }
+        bad
+    }
+}

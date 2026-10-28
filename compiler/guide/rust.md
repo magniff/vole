@@ -219,7 +219,8 @@ fn main() -> i32 {
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |
 | `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
 | `!x` (bitwise not) | `~x` |
-| `x.pow(n)`, `x.abs()`, `f.sqrt()` | write it, or C's `pow`, `labs`, `sqrt` (`import "math.h" as m;`) |
+| `f.sqrt()`, `f.sin()`, `f.powi(n)`, `f64::consts::PI`, `f64::EPSILON` | the same (0.25.2.1, `guide math`), in vole: no C, no `unsafe` |
+| `x.pow(n)`, `x.abs()` on integers | write it (`std::abs(x)` for an i64) |
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |

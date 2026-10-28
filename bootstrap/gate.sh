@@ -569,9 +569,12 @@ run_step() {
         # (0.25) value semantics: seeded (the same programs every run of
         # a mode), failing ones shrunk and kept with their expected output;
         # 0.25.2: as many again with --assign-calls (owned
-        # assignments whose right side is a call, lending temporaries)
+        # assignments whose right side is a call, lending temporaries);
+        # 0.25.2.1: and with --try-args (arguments that may return, `?`
+        # or a match's arm, in calls whose result is `?`'d)
         fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls ;;
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls \
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

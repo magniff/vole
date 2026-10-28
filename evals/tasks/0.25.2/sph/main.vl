@@ -1,0 +1,460 @@
+// sph: a 2D smoothed-particle hydrodynamics fluid of 102 400 particles, the
+// neighbour search on the GPU (a counting sort by grid cell, its prefix sum
+// in a compute kernel), the density, pressure and viscosity forces and the
+// integration, all in WGSL kernels; the particles are drawn in a window,
+// coloured by speed, in a box you can tilt and stir with the mouse.
+//
+//   sph                                   the window (drag: stir; right drag or arrows: tilt)
+//   sph --headless [--steps N] [--shot F] no window: the checks, a PPM picture of the end
+//
+// sim.vl holds the GPU side, shaders.vl the WGSL and cpu.vl the constants,
+// the starting lattice and the CPU references the checks compare with.
+
+mod cpu;
+mod shaders;
+mod sim;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use cpu::{cell_of, cos, exclusive_scan, sin, DT, GX, GY, HH, HW, N, RHO0};
+use sim::{Frame, Sim};
+
+// The headless picture's size: w * 4 must be a multiple of 256.
+const SHOT_W: i64 = 1280;
+const SHOT_H: i64 = 720;
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The mouse position in the world (the view's extents ext_x, ext_y).
+fn to_world(mx: f64, my: f64, w: i64, h: i64, ext_x: f64, ext_y: f64) -> (f32, f32) {
+    let x = (mx / w as f64 * 2.0 - 1.0) * ext_x;
+    let y = (1.0 - my / h as f64 * 2.0) * ext_y;
+    (x as f32, y as f32)
+}
+
+// The sort's check: the GPU's counts, cell ids, prefix sum and order
+// against the CPU's, for the particles where they are now. Prints one
+// line per check; true when all pass.
+fn sort_check(s: inout Sim, gpa: Gpa) -> bool {
+    var enc = s.dev.encoder();
+    s.sort(&enc);
+    s.queue.submit(enc.finish());
+    let pos = gpu::f32s(s.pos.map_read(s.dev));
+    let cells = GX * GY;
+    let gcount = gpu::u32s(s.counts.map_read(s.dev));
+    let gstart = gpu::u32s(s.starts.map_read(s.dev));
+    let gcell = gpu::u32s(s.cell.map_read(s.dev));
+    let gorder = gpu::u32s(s.order.map_read(s.dev));
+    // the CPU's histogram, cell of each particle, and prefix sum
+    var hist: Vec<u32> = Vec::new_in(gpa);
+    for _ in 0..cells {
+        hist.push(0);
+    }
+    var cell_bad: i64 = 0;
+    for i in 0..N {
+        let c = cell_of(pos[2 * i], pos[2 * i + 1]);
+        hist[c] = hist[c] + 1;
+        if c != gcell[i] as i64 {
+            cell_bad += 1;
+        }
+    }
+    var count_bad: i64 = 0;
+    for c in 0..cells {
+        if hist[c] != gcount[c] {
+            count_bad += 1;
+        }
+    }
+    let scan = exclusive_scan(hist.as_slice(), gpa);
+    var scan_bad: i64 = 0;
+    for c in 0..cells {
+        if scan[c] != gstart[c] {
+            scan_bad += 1;
+        }
+    }
+    // the order: a permutation of the particles, nondecreasing in cell
+    var seen: Vec<u32> = Vec::new_in(gpa);
+    for _ in 0..N {
+        seen.push(0);
+    }
+    var perm_bad: i64 = 0;
+    var order_bad: i64 = 0;
+    var prev_cell: i64 = -1;
+    for k in 0..N {
+        let p = gorder[k] as i64;
+        if p < 0 || p >= N {
+            perm_bad += 1;
+        } else {
+            seen[p] = seen[p] + 1;
+            let c = gcell[p] as i64;
+            if c < prev_cell {
+                order_bad += 1;
+            }
+            prev_cell = c;
+        }
+    }
+    for i in 0..N {
+        if seen[i] != 1 {
+            perm_bad += 1;
+        }
+    }
+    println(f"sort: {N} particles into {cells} cells; cell ids vs CPU: {cell_bad} differ; counts vs CPU histogram: {count_bad} cells differ");
+    println(f"prefix sum (GPU) vs CPU exclusive scan: {scan_bad} of {cells} entries differ");
+    println(f"order: {perm_bad} entries not a permutation, {order_bad} out of cell order; verdict {verdict(cell_bad == 0 && count_bad == 0 && scan_bad == 0 && perm_bad == 0 && order_bad == 0)}");
+    cell_bad == 0 && count_bad == 0 && scan_bad == 0 && perm_bad == 0 && order_bad == 0
+}
+
+// The mean density as a ratio to the rest density, over all the particles
+// and over the bulk (the particles at 90% or more of it: a free surface's
+// particles lack neighbours, so they read low). Returns the bulk's mean.
+fn density_line(s: inout Sim, step: i64) -> f64 {
+    let r = gpu::f32s(s.rho.map_read(s.dev));
+    var sum: f64 = 0.0;
+    var bulk_sum: f64 = 0.0;
+    var near: i64 = 0;
+    for i in 0..N {
+        sum = sum + r[i] as f64;
+        if r[i] > 0.9 * RHO0 {
+            bulk_sum = bulk_sum + r[i] as f64;
+            near += 1;
+        }
+    }
+    let all = sum / N as f64 / RHO0 as f64;
+    let bulk = if near > 0 { bulk_sum / near as f64 / RHO0 as f64 } else { 0.0 };
+    println(f"step {step:>6}: mean density {all:.4} x rest over all particles; bulk {bulk:.4} x rest over the {near * 100 / N}% at 90% or more");
+    bulk
+}
+
+// The headless run: `steps` steps, the box tilting on one sine period over
+// the run (at most 0.2 rad: its walls move slower than the fluid), then the
+// checks and a picture of the end.
+fn headless(steps: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    println(f"sph: {N} particles, {steps} steps of {DT} s ({steps as f64 * DT as f64:.3} s), grid {GX} x {GY} cells of {cpu::H} m");
+    let checks = [steps / 4, steps / 2, steps];
+    var means: [f64; 3] = [0.0, 0.0, 0.0];
+    var k = 0;
+    var angle: f64 = 0.0;
+    var max_speed: f64 = 0.0;
+    var f = Frame::rest(SHOT_W as f32 / SHOT_H as f32);
+    var i: i64 = 0;
+    while i < steps {
+        // ten steps a submission: the box's tilt is set for each of them
+        angle = 0.2 * sin(6.2831853 * i as f64 / steps as f64);
+        f.cs = cos(angle) as f32;
+        f.sn = sin(angle) as f32;
+        s.set_frame(f);
+        var enc = s.dev.encoder();
+        for _ in 0..10 {
+            s.step(&enc);
+        }
+        s.queue.submit(enc.finish());
+        i += 10;
+        if k < 3 && i >= checks[k] {
+            means[k] = density_line(&s, i);
+            k += 1;
+        }
+    }
+    // the sort and its check, on where the particles are now
+    let sorted = sort_check(&s, gpa);
+    let v = gpu::f32s(s.vel.map_read(s.dev));
+    var sum_speed: f64 = 0.0;
+    for j in 0..N {
+        let sp = sqrt_f64(v[2 * j] as f64 * v[2 * j] as f64 + v[2 * j + 1] as f64 * v[2 * j + 1] as f64);
+        sum_speed = sum_speed + sp;
+        if sp > max_speed {
+            max_speed = sp;
+        }
+    }
+    println(f"speed: mean {sum_speed / N as f64:.3} m/s, largest {max_speed:.3} m/s");
+    // where the fastest are: the count above 5 and 10 m/s, and the top one
+    var fast5: i64 = 0;
+    var fast10: i64 = 0;
+    var top: i64 = 0;
+    var top_sp: f64 = 0.0;
+    for j in 0..N {
+        let sp = sqrt_f64(v[2 * j] as f64 * v[2 * j] as f64 + v[2 * j + 1] as f64 * v[2 * j + 1] as f64);
+        if sp > 5.0 { fast5 += 1; }
+        if sp > 10.0 { fast10 += 1; }
+        if sp > top_sp {
+            top_sp = sp;
+            top = j;
+        }
+    }
+    let rr = gpu::f32s(s.rho.map_read(s.dev));
+    let tp = gpu::f32s(s.pos.map_read(s.dev));
+    println(f"fast: {fast5} above 5 m/s, {fast10} above 10 m/s; the fastest at ({tp[2 * top]:.4}, {tp[2 * top + 1]:.4}) with density {rr[top] as f64 / RHO0 as f64:.3} x rest");
+    // no particle escaped the box (in its frame), none is NaN
+    let pos = gpu::f32s(s.pos.map_read(s.dev));
+    var escaped: i64 = 0;
+    let c = f.cs as f64;
+    let sn = f.sn as f64;
+    for j in 0..N {
+        let x = pos[2 * j] as f64;
+        let y = pos[2 * j + 1] as f64;
+        let lx = c * x + sn * y;
+        let ly = -sn * x + c * y;
+        if !(lx >= -HW as f64 - 1e-4 && lx <= HW as f64 + 1e-4 && ly >= -HH as f64 - 1e-4 && ly <= HH as f64 + 1e-4) {
+            escaped += 1;
+        }
+    }
+    println(f"escape: {escaped} particles outside the box (the tilt now {angle:.3} rad); verdict {verdict(escaped == 0)}");
+    let settled = means[2] > 0.95 && means[2] < 1.05;
+    println(f"density: mean {means[2]:.4} x rest density at the end, verdict {verdict(settled)}");
+    if shot.len() > 0 {
+        s.set_frame(f);
+        let ppm = s.snapshot_in(SHOT_W, SHOT_H, gpa);
+        if std::fs::write(shot, ppm.as_slice()).is_err() {
+            eprintln(f"sph: cannot write {shot}");
+            return 1;
+        }
+        println(f"wrote {shot}");
+    }
+    if sorted && escaped == 0 && settled { 0 } else { 1 }
+}
+
+// Square root by Newton's method (std has no sqrt without C).
+fn sqrt_f64(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    var r = if x > 1.0 { x / 2.0 } else { 1.0 };
+    for _ in 0..64 {
+        r = 0.5 * (r + x / r);
+    }
+    r
+}
+
+// The window: stir with the left button, tilt with the right (or the
+// arrows), pause, reset, speed up or slow down the steps a frame.
+fn windowed(steps0: i64, max_frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sph: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("sph", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("sph: no window");
+            return 1;
+        }
+    };
+    var s = match Sim::new_in(gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    var surf = match s.inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(s.dev, sz.w, sz.h);
+    var steps = steps0;
+    var left = false;
+    var right = false;
+    var mx: f64 = 0.0;
+    var my: f64 = 0.0;
+    var pwx: f32 = 0.0;
+    var pwy: f32 = 0.0;
+    var target: f64 = 0.0;
+    var angle: f64 = 0.0;
+    var paused = false;
+    var quit = false;
+    var reset = false;
+    var prev: f64 = 0.0;
+    var frames: i64 = 0;
+    var first: f64 = 0.0;
+    var fps_frames: i64 = 0;
+    var fps_since: f64 = 0.0;
+    var fps: f64 = 0.0;
+    let start = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var fdt = now - prev;
+                if frames == 0 || fdt > 1.0 / 30.0 { fdt = 1.0 / 60.0; }
+                if fdt < 1.0 / 240.0 { fdt = 1.0 / 240.0; }
+                prev = now;
+                if reset {
+                    s.reset();
+                    reset = false;
+                    angle = 0.0;
+                    target = 0.0;
+                }
+                if right {
+                    target = clamp_f((mx / surf.width as f64 * 2.0 - 1.0) * 0.5, -0.5, 0.5);
+                }
+                // the tilt is paced in sim time (12 a second of it): the
+                // steps a frame carry the sim far slower than the clock
+                angle = angle + (target - angle) * clamp_f(12.0 * steps as f64 * DT as f64, 0.0, 1.0);
+                let aspect = surf.width as f32 / surf.height as f32;
+                var f = Frame::rest(aspect);
+                f.cs = cos(angle) as f32;
+                f.sn = sin(angle) as f32;
+                let (wx, wy) = to_world(mx, my, surf.width, surf.height, f.ext_x as f64, f.ext_y as f64);
+                if left {
+                    f.stirx = wx;
+                    f.stiry = wy;
+                    f.stirr = 0.1;
+                    f.stiramt = 0.05;
+                    f.stirvx = clamp_f(((wx - pwx) as f64) / fdt, -4.0, 4.0) as f32;
+                    f.stirvy = clamp_f(((wy - pwy) as f64) / fdt, -4.0, 4.0) as f32;
+                }
+                pwx = wx;
+                pwy = wy;
+                s.set_frame(f);
+                match surf.frame() {
+                    Ok(fr) => {
+                        var enc = s.dev.encoder();
+                        if !paused {
+                            for _ in 0..steps {
+                                s.step(&enc);
+                            }
+                        }
+                        s.draw(&enc, fr.texture.view());
+                        s.queue.submit(enc.finish());
+                        fr.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames == 1 { first = now; }
+                fps_frames += 1;
+                if now - fps_since >= 0.5 {
+                    fps = fps_frames as f64 / (now - fps_since);
+                    fps_since = now;
+                    fps_frames = 0;
+                    let state = if paused { " paused" } else { "" };
+                    let title = format_in(f"sph: {N} particles, {steps} steps a frame, {fps:.1} fps{state}", gpa);
+                    win.set_title(title.as_slice());
+                }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(f"sph: {N} particles, {steps} steps a frame, {frames} frames, {mean:.2} ms a frame");
+                    if shot.len() > 0 {
+                        var g = Frame::rest(SHOT_W as f32 / SHOT_H as f32);
+                        g.cs = f.cs;
+                        g.sn = f.sn;
+                        s.set_frame(g);
+                        let ppm = s.snapshot_in(SHOT_W, SHOT_H, gpa);
+                        if std::fs::write(shot, ppm.as_slice()).is_err() {
+                            eprintln(f"sph: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                mx = m.x;
+                my = m.y;
+                match m.action {
+                    MouseAction::Press => {
+                        if m.button == Button::Left { left = true; }
+                        if m.button == Button::Right { right = true; }
+                    }
+                    MouseAction::Release => {
+                        if m.button == Button::Left { left = false; }
+                        if m.button == Button::Right { right = false; }
+                    }
+                    MouseAction::Move => {}
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'r' as u32 {
+                                reset = true;
+                            } else if c == '+' as u32 || c == '=' as u32 {
+                                steps = if steps < 32 { steps + 1 } else { 32 };
+                            } else if c == '-' as u32 {
+                                steps = if steps > 1 { steps - 1 } else { 1 };
+                            } else if c == 'q' as u32 {
+                                quit = true;
+                            }
+                        }
+                        Logical::Named(Named::ArrowLeft) => target = clamp_f(target - 0.1, -0.5, 0.5),
+                        Logical::Named(Named::ArrowRight) => target = clamp_f(target + 0.1, -0.5, 0.5),
+                        Logical::Named(Named::Escape) => quit = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if quit { break; }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("sph", gpa)
+        .about("2D SPH fluid on the GPU: a window to stir and tilt, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: run --steps steps, the checks, and --shot"))
+        .arg(Arg::option("steps").value_name("N")
+            .help("headless: the steps of the run (default 8000); window: the steps a frame, 1..32 (default 16)"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the picture (headless: of the end; window: with --frames, the last frame)"));
+    let m = cli.parse_or_exit(env::args());
+    let headless_mode = m.flag("headless");
+    let steps = parse_int(m.get("steps").unwrap_or(if headless_mode { "8000" } else { "16" })).unwrap_or(0);
+    if steps <= 0 {
+        eprintln("sph: --steps takes a whole number");
+        return 2;
+    }
+    let shot = m.get("shot").unwrap_or("");
+    if headless_mode {
+        if steps < 10 {
+            eprintln("sph: --steps 10 or more");
+            return 2;
+        }
+        return headless(steps, shot, gpa);
+    }
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    windowed(clamp_i(steps, 1, 32), frames, shot, gpa)
+}
+
+fn clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}

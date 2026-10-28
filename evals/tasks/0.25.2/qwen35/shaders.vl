@@ -1,0 +1,281 @@
+// The WGSL compute kernels of the Qwen3.5 forward pass, one module with one
+// entry point per kernel. Weights are bf16 (two per u32 word, read as f32 in
+// the kernel); activations and states are f32. Each entry's bindings are in
+// group 0 (see model.vl for the buffers).
+//
+//   mv      y[yoff + r] = W[r] . x          W bf16 (rows x cols), one row per workgroup
+//   norm    RMSNorm of heads of a vector, (1 + w) or w as the flag says
+//   rope    RoPE on the first 64 dims of the 8 query and 2 key heads, the
+//           keys and the values into the KV cache at pos
+//   attn    causal attention over pos+1 keys, GQA 8 over 2, output gated by sigmoid
+//   conv    the causal depthwise conv1d (kernel 4) with its state, then SiLU
+//   delta   the gated delta rule: L2-normed q, k, decay, beta, the state
+//           update per head, then the gated RMSNorm with z
+//   addv    dst += src
+//   swiglu  out = silu(g) * u
+
+pub const WGSL_MV: [u8] = "struct MvP { rows: u32, cols: u32, yoff: u32, pad: u32 }\n\
+@group(0) @binding(0) var<uniform> mvp: MvP;\n\
+@group(0) @binding(1) var<storage, read> mvw: array<u32>;\n\
+@group(0) @binding(2) var<storage, read> mvx: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> mvy: array<f32>;\n\
+var<workgroup> mvpart: array<f32, 64>;\n\
+fn bf16at(i: u32) -> f32 {\n\
+    let word = mvw[i >> 1u];\n\
+    let h = (word >> ((i & 1u) << 4u)) & 0xffffu;\n\
+    return bitcast<f32>(h << 16u);\n\
+}\n\
+@compute @workgroup_size(64)\n\
+fn mv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let r = wg.y * 256u + wg.x;\n\
+    let t = lid.x;\n\
+    var s: f32 = 0.0;\n\
+    if (r < mvp.rows) {\n\
+        let base = r * mvp.cols;\n\
+        var c = t;\n\
+        loop {\n\
+            if (c >= mvp.cols) { break; }\n\
+            s = s + bf16at(base + c) * mvx[c];\n\
+            c = c + 64u;\n\
+        }\n\
+    }\n\
+    mvpart[t] = s;\n\
+    workgroupBarrier();\n\
+    var st: u32 = 32u;\n\
+    loop {\n\
+        if (st == 0u) { break; }\n\
+        if (t < st) { mvpart[t] = mvpart[t] + mvpart[t + st]; }\n\
+        workgroupBarrier();\n\
+        st = st >> 1u;\n\
+    }\n\
+    if (t == 0u && r < mvp.rows) { mvy[mvp.yoff + r] = mvpart[0]; }\n\
+}\n\
+";
+
+pub const WGSL_NORM: [u8] = "struct NP { dim: u32, stride: u32, zc: u32, ooff: u32 }\n\
+@group(0) @binding(0) var<uniform> np: NP;\n\
+@group(0) @binding(1) var<storage, read> nx: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> nw: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> ny: array<f32>;\n\
+var<workgroup> npart: array<f32, 256>;\n\
+@compute @workgroup_size(256)\n\
+fn norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let h = wg.x;\n\
+    let t = lid.x;\n\
+    let ib = h * np.stride;\n\
+    var s: f32 = 0.0;\n\
+    var i = t;\n\
+    loop {\n\
+        if (i >= np.dim) { break; }\n\
+        let v = nx[ib + i];\n\
+        s = s + v * v;\n\
+        i = i + 256u;\n\
+    }\n\
+    npart[t] = s;\n\
+    workgroupBarrier();\n\
+    var st: u32 = 128u;\n\
+    loop {\n\
+        if (st == 0u) { break; }\n\
+        if (t < st) { npart[t] = npart[t] + npart[t + st]; }\n\
+        workgroupBarrier();\n\
+        st = st >> 1u;\n\
+    }\n\
+    let inv = inverseSqrt(npart[0] / f32(np.dim) + 0.000001);\n\
+    i = t;\n\
+    loop {\n\
+        if (i >= np.dim) { break; }\n\
+        var g = nw[i];\n\
+        if (np.zc == 1u) { g = 1.0 + g; }\n\
+        ny[np.ooff + h * np.dim + i] = nx[ib + i] * inv * g;\n\
+        i = i + 256u;\n\
+    }\n\
+}\n\
+";
+
+pub const WGSL_ROPE: [u8] = "@group(0) @binding(0) var<storage, read> rmeta: array<u32>;\n\
+@group(0) @binding(1) var<storage, read> rqkn: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> rqr: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> rkc: array<f32>;\n\
+@group(0) @binding(4) var<storage, read_write> rvc: array<f32>;\n\
+@group(0) @binding(5) var<storage, read> rvr: array<f32>;\n\
+@compute @workgroup_size(256)\n\
+fn rope(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let hh = wg.x;\n\
+    let d = lid.x;\n\
+    let pos = rmeta[0];\n\
+    if (hh == 10u) {\n\
+        rvc[pos * 512u + d] = rvr[d];\n\
+        rvc[pos * 512u + d + 256u] = rvr[d + 256u];\n\
+        return;\n\
+    }\n\
+    var base: u32 = 2048u + (hh - 8u) * 256u;\n\
+    if (hh < 8u) { base = hh * 256u; }\n\
+    let x = rqkn[base + d];\n\
+    var r = x;\n\
+    if (d < 64u) {\n\
+        let i = f32(d & 31u);\n\
+        let ang = f32(pos) * pow(10000000.0, -(2.0 * i) / 64.0);\n\
+        let c = cos(ang);\n\
+        let s = sin(ang);\n\
+        if (d < 32u) {\n\
+            r = x * c - rqkn[base + d + 32u] * s;\n\
+        } else {\n\
+            r = x * c + rqkn[base + d - 32u] * s;\n\
+        }\n\
+    }\n\
+    if (hh < 8u) {\n\
+        rqr[hh * 256u + d] = r;\n\
+    } else {\n\
+        rkc[pos * 512u + (hh - 8u) * 256u + d] = r;\n\
+    }\n\
+}\n\
+";
+
+pub const WGSL_ATTN: [u8] = "@group(0) @binding(0) var<storage, read> ameta: array<u32>;\n\
+@group(0) @binding(1) var<storage, read> aqr: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> akc: array<f32>;\n\
+@group(0) @binding(3) var<storage, read> avc: array<f32>;\n\
+@group(0) @binding(4) var<storage, read> aqg: array<f32>;\n\
+@group(0) @binding(5) var<storage, read_write> aao: array<f32>;\n\
+var<workgroup> asc: array<f32, 2048>;\n\
+var<workgroup> adenom: f32;\n\
+@compute @workgroup_size(256)\n\
+fn attn(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let h = wg.x;\n\
+    let t = lid.x;\n\
+    let g = h / 4u;\n\
+    let n = ameta[0] + 1u;\n\
+    var k = t;\n\
+    loop {\n\
+        if (k >= n) { break; }\n\
+        var dot: f32 = 0.0;\n\
+        for (var d = 0u; d < 256u; d = d + 1u) {\n\
+            dot = dot + aqr[h * 256u + d] * akc[k * 512u + g * 256u + d];\n\
+        }\n\
+        asc[k] = dot * 0.0625;\n\
+        k = k + 256u;\n\
+    }\n\
+    workgroupBarrier();\n\
+    if (t == 0u) {\n\
+        var mx: f32 = asc[0];\n\
+        for (var j = 1u; j < n; j = j + 1u) { mx = max(mx, asc[j]); }\n\
+        var sum: f32 = 0.0;\n\
+        for (var j = 0u; j < n; j = j + 1u) {\n\
+            let e = exp(asc[j] - mx);\n\
+            asc[j] = e;\n\
+            sum = sum + e;\n\
+        }\n\
+        adenom = sum;\n\
+    }\n\
+    workgroupBarrier();\n\
+    var acc: f32 = 0.0;\n\
+    for (var j = 0u; j < n; j = j + 1u) {\n\
+        acc = acc + asc[j] * avc[j * 512u + g * 256u + t];\n\
+    }\n\
+    let gate = aqg[h * 512u + 256u + t];\n\
+    aao[h * 256u + t] = (acc / adenom) * (1.0 / (1.0 + exp(-gate)));\n\
+}\n\
+";
+
+pub const WGSL_CONV: [u8] = "@group(0) @binding(0) var<storage, read> cqkv: array<f32>;\n\
+@group(0) @binding(1) var<storage, read> cwt: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> cst: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> cout: array<f32>;\n\
+@compute @workgroup_size(64)\n\
+fn conv(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let c = id.x;\n\
+    if (c >= 6144u) { return; }\n\
+    let s0 = cst[c * 3u];\n\
+    let s1 = cst[c * 3u + 1u];\n\
+    let s2 = cst[c * 3u + 2u];\n\
+    let xv = cqkv[c];\n\
+    let acc = cwt[c * 4u] * s0 + cwt[c * 4u + 1u] * s1 + cwt[c * 4u + 2u] * s2 + cwt[c * 4u + 3u] * xv;\n\
+    cst[c * 3u] = s1;\n\
+    cst[c * 3u + 1u] = s2;\n\
+    cst[c * 3u + 2u] = xv;\n\
+    cout[c] = acc / (1.0 + exp(-acc));\n\
+}\n\
+";
+
+pub const WGSL_DELTA: [u8] = "@group(0) @binding(0) var<storage, read> dq: array<f32>;\n\
+@group(0) @binding(1) var<storage, read> dbb: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> daa: array<f32>;\n\
+@group(0) @binding(3) var<storage, read> dz: array<f32>;\n\
+@group(0) @binding(4) var<storage, read> dalog: array<f32>;\n\
+@group(0) @binding(5) var<storage, read> ddtb: array<f32>;\n\
+@group(0) @binding(6) var<storage, read> dnw: array<f32>;\n\
+@group(0) @binding(7) var<storage, read_write> dS: array<f32>;\n\
+@group(0) @binding(8) var<storage, read_write> dy: array<f32>;\n\
+var<workgroup> drq: array<f32, 128>;\n\
+var<workgroup> drk: array<f32, 128>;\n\
+var<workgroup> dqs: array<f32, 128>;\n\
+var<workgroup> dks: array<f32, 128>;\n\
+var<workgroup> dos: array<f32, 128>;\n\
+@compute @workgroup_size(128)\n\
+fn delta(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let h = wg.x;\n\
+    let j = lid.x;\n\
+    let qraw = dq[h * 128u + j];\n\
+    let kraw = dq[2048u + h * 128u + j];\n\
+    let v = dq[4096u + h * 128u + j];\n\
+    drq[j] = qraw;\n\
+    drk[j] = kraw;\n\
+    workgroupBarrier();\n\
+    var sq: f32 = 0.0;\n\
+    var sk: f32 = 0.0;\n\
+    for (var i = 0u; i < 128u; i = i + 1u) {\n\
+        sq = sq + drq[i] * drq[i];\n\
+        sk = sk + drk[i] * drk[i];\n\
+    }\n\
+    dqs[j] = qraw * inverseSqrt(sq + 0.000001) * 0.08838834764831845;\n\
+    dks[j] = kraw * inverseSqrt(sk + 0.000001);\n\
+    workgroupBarrier();\n\
+    let beta = 1.0 / (1.0 + exp(-dbb[h]));\n\
+    let xa = daa[h] + ddtb[h];\n\
+    let sp = select(log(1.0 + exp(xa)), xa, xa > 20.0);\n\
+    let dec = exp(-exp(dalog[h]) * sp);\n\
+    let base = h * 16384u + j;\n\
+    var kvm: f32 = 0.0;\n\
+    for (var i = 0u; i < 128u; i = i + 1u) {\n\
+        let s = dS[base + i * 128u] * dec;\n\
+        dS[base + i * 128u] = s;\n\
+        kvm = kvm + s * dks[i];\n\
+    }\n\
+    let dl = (v - kvm) * beta;\n\
+    var o: f32 = 0.0;\n\
+    for (var i = 0u; i < 128u; i = i + 1u) {\n\
+        let s = dS[base + i * 128u] + dks[i] * dl;\n\
+        dS[base + i * 128u] = s;\n\
+        o = o + s * dqs[i];\n\
+    }\n\
+    dos[j] = o;\n\
+    workgroupBarrier();\n\
+    var ss: f32 = 0.0;\n\
+    for (var i = 0u; i < 128u; i = i + 1u) { ss = ss + dos[i] * dos[i]; }\n\
+    let inv = inverseSqrt(ss / 128.0 + 0.000001);\n\
+    let z = dz[h * 128u + j];\n\
+    dy[h * 128u + j] = dnw[j] * (o * inv) * (z / (1.0 + exp(-z)));\n\
+}\n\
+";
+
+pub const WGSL_ADD: [u8] = "struct AP { n: u32, pad0: u32, pad1: u32, pad2: u32 }\n\
+@group(0) @binding(0) var<uniform> addp: AP;\n\
+@group(0) @binding(1) var<storage, read> addsrc: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> adddst: array<f32>;\n\
+@compute @workgroup_size(64)\n\
+fn addv(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x < addp.n) { adddst[id.x] = adddst[id.x] + addsrc[id.x]; }\n\
+}\n\
+";
+
+pub const WGSL_SWIGLU: [u8] = "@group(0) @binding(0) var<storage, read> sgate: array<f32>;\n\
+@group(0) @binding(1) var<storage, read> sup: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> sout: array<f32>;\n\
+@compute @workgroup_size(64)\n\
+fn swiglu(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i < 3584u) {\n\
+        let g = sgate[i];\n\
+        sout[i] = g / (1.0 + exp(-g)) * sup[i];\n\
+    }\n\
+}\n";

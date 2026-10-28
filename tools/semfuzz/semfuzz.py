@@ -34,6 +34,11 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                 itself (`t3 = f1(gpa, t3, mk(2))`: moved, lent, `&t3`),
                 and owned temporaries lent to its let parameters (as
                 --known's temp_let_arg) where a place could be
+  --try-args    (0.25.2.1) arguments that may return: `x?` or `match x {
+                Ok(q) => q, Err(q) => return Err(q) }` lent to a let
+                parameter or moved to a sink one, in a call whose own
+                result is `?`'d or not (`chk(tchk(t, 3)?, 5)?`), and a
+                later argument that returns after an owned one is moved
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -610,7 +615,15 @@ def eval_args(it, fr, args):
             else:
                 out.append(v)
         else:
-            out.append(a.x.ev(it, fr))
+            try:
+                out.append(a.x.ev(it, fr))
+            except ReturnEx:
+                # (0.25.2.1: an argument that returns, `tchk(t, chk(p, 3)?)`:
+                # the values moved in before it are dropped, the last first)
+                for v in reversed(out):
+                    if not isinstance(v, (Cell, AliasCell, AttrPlace, IdxPlace)):
+                        it.drop(v)
+                raise
     return out
 
 
@@ -1125,6 +1138,26 @@ class Unres(E):
         if self.kind == 'OI':
             return -7 if v.val is None else v.val
         return v.val if v.ok else wrap(-v.val)
+
+
+class Q(E):
+    """(0.25.2.1) `x?` of a Result<_, i64> in a function returning
+    Result<i64, i64>, or (as_match) `match x { Ok(q) => q, Err(q) => return
+    Err(q) }`: an expression that may return."""
+    def __init__(self, x, as_match=False):
+        self.x = x
+        self.as_match = as_match
+
+    def code(self):
+        if self.as_match:
+            return 'match %s { Ok(q) => q, Err(q) => return Err(q) }' % self.x.code()
+        return '%s?' % self.x.code()
+
+    def ev(self, it, fr):
+        v = self.x.ev(it, fr)
+        if not v.ok:
+            raise ReturnEx(RV(False, v.val))
+        return v.val
 
 
 class CloCall(E):
@@ -1907,10 +1940,11 @@ class Ctx:
 
 
 class Gen:
-    def __init__(self, seed, known=False, size=24, assign_calls=False):
+    def __init__(self, seed, known=False, size=24, assign_calls=False, try_args=False):
         self.r = random.Random(seed)
         self.known = known
         self.assign_calls = assign_calls
+        self.try_args = try_args
         self.in_assign = False
         self.size = size
         self.nid = 0
@@ -2472,7 +2506,8 @@ class Gen:
             (1, self.st_shadow),
             (2 if c.loop > 0 else 0, self.st_break),
             (2 if depth < 7 else 0, self.st_return),
-            (3 if c.ret in ('OI', 'RI') else 0, self.st_question),
+            (3 if c.ret == 'OI' else 8 if c.ret == 'RI' and self.try_args
+             else 3 if c.ret == 'RI' else 0, self.st_question),
             (1, self.st_drop),
         ]
         tot = sum(x for x, _ in w)
@@ -2863,6 +2898,10 @@ class Gen:
                     return q
             return None
         # RI
+        if self.try_args and self.chance(0.85):
+            q = self.try_arg(c)
+            if q is not None:
+                return q
         if r < 0.5:
             tp = self.t_places(c)
             if tp:
@@ -2874,6 +2913,43 @@ class Gen:
         x = self.texpr(c, 1)
         q = Question(n, Call('tchk', [Arg('sink', x), Arg('val', Lit(self.r.randint(0, 12)))]))
         self.declare(c, n, 'T', False)
+        return q
+
+    def try_arg(self, c):
+        """(0.25.2.1, --try-args) A statement whose call takes an argument
+        that may return (Q)."""
+        lim = lambda: Lit(self.r.randint(0, 12))
+        form = self.r.randint(0, 3)
+        if form == 3:
+            # `let t = tchk(x, chk(p, 4)?)?;`: x moved in, then the second
+            # argument returns
+            tp = self.t_places(c)
+            if not tp:
+                return None
+            p = self.r.choice(tp)
+            x = self.texpr(c, 1, {p.root()})
+            leaves = Q(Call('chk', [Arg('let', p), Arg('val', lim())]), self.chance(0.3))
+            n = self.name('t')
+            q = Question(n, Call('tchk', [Arg('sink', x), Arg('val', leaves)]))
+            self.declare(c, n, 'T', False)
+            return q
+        inner = Q(Call('tchk', [Arg('sink', self.texpr(c, 1)), Arg('val', lim())]), self.chance(0.4))
+        if form == 0:
+            # `let n = chk(tchk(x, 3)?, 5)?;`: lent to a let parameter
+            n = self.name('n')
+            q = Question(n, Call('chk', [Arg('let', inner), Arg('val', lim())]))
+            self.declare(c, n, 'i', False)
+            return q
+        if form == 1:
+            # `let t = tchk(tchk(x, 3)?, 5)?;`: moved to a sink one
+            n = self.name('t')
+            q = Question(n, Call('tchk', [Arg('sink', inner), Arg('val', lim())]))
+            self.declare(c, n, 'T', False)
+            return q
+        # `let n = obs(tchk(x, 3)?);`: the call's result not `?`'d
+        n = self.name('n')
+        q = Decl(n, False, None, Call('obs', [Arg('let', inner)]))
+        self.declare(c, n, 'i', False)
         return q
 
     def st_drop(self, c):
@@ -3165,6 +3241,7 @@ class Gen:
     def gen_fn(self):
         name = 'f%d' % (len(self.fns) + 1)
         ret = self.r.choice(['T', 'T', 'V', 'i'] if self.assign_calls
+                            else ['RI', 'RI', 'RI', 'i', 'T'] if self.try_args
                             else ['i', 'i', 'T', 'V', 'OI', 'RI'])
         c = Ctx(ret)
         params = []
@@ -3176,11 +3253,11 @@ class Gen:
             pn = self.name('a')
             params.append((pn, conv, ty))
             self.declare(c, pn, ty, conv in ('inout', 'sink'), kind=conv if ty != 'i' else 'let')
-        body = self.gen_block(c, self.r.randint(2, 8), tail_fn=self.ret_expr)
+        body = self.gen_block(c, self.r.randint(4 if self.try_args else 2, 8), tail_fn=self.ret_expr)
         return GenFn(name, params, ret, body)
 
     def program(self):
-        for _ in range(self.r.randint(2 if self.assign_calls else 0, 3)):
+        for _ in range(self.r.randint(2 if self.assign_calls or self.try_args else 0, 3)):
             f = self.gen_fn()
             if f.body.tail is not None:
                 self.fns.append(f)
@@ -3441,13 +3518,14 @@ def main():
     ap.add_argument('--shrink', type=int, default=None)
     ap.add_argument('--size', type=int, default=24)
     ap.add_argument('--assign-calls', action='store_true')
+    ap.add_argument('--try-args', action='store_true')
     ap.add_argument('-h', '--help', action='store_true')
     a = ap.parse_args()
     if a.help:
         print(__doc__)
         return 0
     if a.print is not None:
-        prog = Gen(a.print, a.known, a.size, a.assign_calls).program()
+        prog = Gen(a.print, a.known, a.size, a.assign_calls, a.try_args).program()
         print(prog.code())
         try:
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(prog.expect()).splitlines()))
@@ -3460,7 +3538,7 @@ def main():
         return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
-        prog = Gen(a.shrink, a.known, a.size, a.assign_calls).program()
+        prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args).program()
         kind, detail = check_program(volec, prog, work, 'p')
         print('// %s: %s' % (kind, detail))
         if kind not in ('ok', 'invalid'):
@@ -3475,7 +3553,7 @@ def main():
     lock = threading.Lock()
 
     def one(seed):
-        prog = Gen(seed, a.known, a.size, a.assign_calls).program()
+        prog = Gen(seed, a.known, a.size, a.assign_calls, a.try_args).program()
         d = os.path.join(work, 's%d' % seed)
         os.makedirs(d, exist_ok=True)
         with slots:
@@ -3492,7 +3570,7 @@ def main():
                 pass
             if kind != 'invalid' and not a.no_shrink:
                 with slots:
-                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls).program(), kind, d)
+                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args).program(), kind, d)
                 with open(base + '.min.vl', 'w') as f:
                     f.write(small.code())
                 with open(base + '.min.expect', 'w') as f:

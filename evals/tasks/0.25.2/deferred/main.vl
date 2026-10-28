@@ -1,0 +1,186 @@
+// deferred: a deferred renderer on std::gpu, drawn into a window (std::window).
+// The scene is generated cubes, spheres and a floor; 512 coloured point
+// lights orbit over it. Frame: update, cull (lights per 16 x 16 tile, compute),
+// three G-buffer passes, lighting, tone mapping. Keys 1 albedo, 2 normal,
+// 3 depth, 0 the lit frame; Escape quits.
+//
+//   deferred                              the window
+//   deferred --frames 600                 the window, quit after 600 frames, print ms a frame
+//   deferred --headless [--frames N] [--shot FILE.ppm]
+//                                         no window: time N frames; --shot writes the lit
+//                                         frame and each G-buffer view
+
+mod render;
+mod scene;
+mod shaders;
+
+use std::{env, fs, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::gpu::wgsl::uniformity::check;
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::KeyCode;
+
+use render::Renderer;
+
+const W: i64 = 1280;
+const H: i64 = 720;
+
+// `shot` with a suffix before its .ppm: shot.ppm + "-albedo" = shot-albedo.ppm.
+fn with_suffix(shot: [u8], suffix: [u8], gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    let n = shot.len();
+    let stop = if n > 4 && shot[n - 4] == '.' { n - 4 } else { n };
+    b.push_str(shot[0..stop]);
+    b.push_str(suffix);
+    if stop == n {
+        b.push_str(".ppm");
+    } else {
+        b.push_str(shot[stop..n]);
+    }
+    b
+}
+
+fn windowed(frames: i64, shot: [u8], gpa: Gpa) -> Result<(), gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("deferred: no window server (try --headless)");
+            return Ok(());
+        }
+    };
+    var win = match app.window(WindowDesc::new("deferred", W, H)) {
+        Ok(w) => w,
+        Err(_) => return Ok(()),
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let px = win.size();
+    surf.configure(dev, px.w, px.h);
+    var r = Renderer::new_in(dev, &queue, px.w, px.h, gpa)?;
+
+    var mode: i64 = 0;
+    var n: i64 = 0;
+    var t0 = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let time = n as f32 / 60.0;
+                match surf.frame() {
+                    Ok(frame) => {
+                        r.frame(&queue, frame.texture.view(), time, mode);
+                        frame.present(&queue);
+                    }
+                    Err(_) => {}
+                }
+                n = n + 1;
+                if n == 1 {
+                    t0 = monotonic_now();
+                }
+                if frames > 0 && n > frames {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, s)) => {
+                r.resize(&surf, s.w, s.h);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.code {
+                        KeyCode::Digit0 => mode = 0,
+                        KeyCode::Digit1 => mode = 1,
+                        KeyCode::Digit2 => mode = 2,
+                        KeyCode::Digit3 => mode = 3,
+                        KeyCode::Escape => break,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    if frames > 0 && n > 1 {
+        let ms = monotonic_now().saturating_sub(t0).as_secs_f64() * 1000.0 / ((n - 1) as f64);
+        println(f"deferred: {n - 1} frames in the window, {ms} ms a frame");
+    }
+    if shot.len() > 0 {
+        let out = r.offscreen(px.w, px.h);
+        r.frame(&queue, out.view(), n as f32 / 60.0, mode);
+        let ppm = r.read_ppm(&queue, out, gpa);
+        match fs::write(shot, ppm.as_slice()) {
+            Ok(_) => println(f"deferred: wrote {shot}"),
+            Err(_) => eprintln("deferred: cannot write the shot"),
+        }
+    }
+    Ok(())
+}
+
+fn headless(frames: i64, check: bool, shot: [u8], gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var r = Renderer::new_in(dev, &queue, W, H, gpa)?;
+    let out = r.offscreen(W, H);
+
+    // one frame first: the pipelines' first use is not timed
+    r.frame(&queue, out.view(), 0.0, 0);
+    queue.wait_idle()?;
+    let t0 = monotonic_now();
+    for f in 0..frames {
+        r.frame(&queue, out.view(), (f as f32 + 1.0) / 60.0, 0);
+    }
+    queue.wait_idle()?;
+    let secs = monotonic_now().saturating_sub(t0).as_secs_f64();
+    let ms = secs * 1000.0 / (frames as f64);
+    println(f"deferred --headless: {scene::NLIGHTS} lights, {scene::NOBJS} objects, {W}x{H}, {frames} frames: {ms} ms a frame");
+
+    if check {
+        r.frame(&queue, out.view(), (frames as f32 + 1.0) / 60.0, 0);
+        let report = r.check_culling(&queue, gpa);
+        println(report.as_slice());
+    }
+
+    if shot.len() > 0 {
+        let views = ["", "-albedo", "-normal", "-depth"];
+        for m in 0..4 {
+            r.frame(&queue, out.view(), 0.0, m);
+            let ppm = r.read_ppm(&queue, out, gpa);
+            let path = with_suffix(shot, views[m as usize], gpa);
+            match fs::write(path.as_slice(), ppm.as_slice()) {
+                Ok(_) => println(f"wrote {path.as_slice()}"),
+                Err(_) => eprintln("deferred: cannot write a shot"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("deferred", gpa)
+        .about("A deferred renderer: 512 moving point lights, culled per tile on the GPU")
+        .arg(Arg::flag("headless").help("no window: time the frames, write --shot"))
+        .arg(Arg::option("frames").value_name("N").default("120")
+            .help("headless: frames timed; window: quit after N frames and print ms a frame"))
+        .arg(Arg::flag("check").help("headless: check the light culling against the frame's pixels"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("write the frame (headless: and each G-buffer view) as PPM"));
+    let m = cli.parse_or_exit(env::args());
+    let frames = parse_int(m.get("frames").unwrap_or("120")).unwrap_or(120);
+    let shot = m.get("shot").unwrap_or("");
+    let res = if m.flag("headless") {
+        headless(frames, m.flag("check"), shot, gpa)
+    } else {
+        windowed(frames, shot, gpa)
+    };
+    match res {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln(f"deferred: {e}");
+            1
+        }
+    }
+}

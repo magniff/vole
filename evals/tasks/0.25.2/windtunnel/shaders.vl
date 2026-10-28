@@ -1,0 +1,312 @@
+// The WGSL of the lattice-Boltzmann wind tunnel (D2Q9, BGK collision).
+// Each kernel is HEAD + FUNCS + its own bindings and entry, so a shader
+// declares exactly the bindings it reads and writes.
+//
+// Populations: f0 and f1 hold 9 values per cell (cell c, direction k at
+// c * 9 + k); a step collides the current one in place, streams it into
+// the other (pull form, halfway bounce-back at solids), then computes the
+// macroscopic fields and advects the dye.
+
+pub const HEAD: [u8] = "struct U {\n\
+    w: u32, h: u32, closed: u32, view: u32,\n\
+    omega: f32, inflow: f32, dye_keep: f32, slotn: u32,\n\
+    probe_at: u32, init_solid: u32, cyl_on: u32, cyl_x: f32,\n\
+    cyl_y: f32, cyl_r: f32, bx0: f32, by0: f32,\n\
+    bx1: f32, by1: f32, brad: f32, bmode: u32,\n\
+    pad0: u32, pad1: u32, pad2: u32, pad3: u32,\n\
+}\n\
+@group(0) @binding(0) var<uniform> u: U;\n";
+
+// The lattice: direction k's velocity (ex, ey), its opposite, its weight
+// and the equilibrium distribution.
+pub const FUNCS: [u8] = "fn ex(k: u32) -> i32 {\n\
+    if (k == 1u || k == 5u || k == 8u) { return 1; }\n\
+    if (k == 3u || k == 6u || k == 7u) { return -1; }\n\
+    return 0;\n\
+}\n\
+fn ey(k: u32) -> i32 {\n\
+    if (k == 2u || k == 5u || k == 6u) { return 1; }\n\
+    if (k == 4u || k == 7u || k == 8u) { return -1; }\n\
+    return 0;\n\
+}\n\
+fn opp(k: u32) -> u32 {\n\
+    if (k == 0u) { return 0u; }\n\
+    if (k <= 4u) { return (k + 1u) % 4u + 1u; }\n\
+    return (k - 3u) % 4u + 5u;\n\
+}\n\
+fn weight(k: u32) -> f32 {\n\
+    if (k == 0u) { return 0.4444444444; }\n\
+    if (k <= 4u) { return 0.1111111111; }\n\
+    return 0.0277777778;\n\
+}\n\
+fn feq(k: u32, rho: f32, ux: f32, uy: f32) -> f32 {\n\
+    let cu = 3.0 * (f32(ex(k)) * ux + f32(ey(k)) * uy);\n\
+    return weight(k) * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * (ux * ux + uy * uy));\n\
+}\n";
+
+// Sets the grid (cylinder and walls into `solid` when init_solid), the
+// flow at rest or the closed-box perturbation, and clears the dye.
+pub const INIT: [u8] = "@group(0) @binding(1) var<storage, read_write> f0: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> f1: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> solid: array<u32>;\n\
+@group(0) @binding(4) var<storage, read_write> dye0: array<vec4<f32>>;\n\
+@group(0) @binding(5) var<storage, read_write> dye1: array<vec4<f32>>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i >= u.w || j >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    if (u.init_solid == 1u) {\n\
+        var s = 0u;\n\
+        if (j == 0u || j == u.h - 1u) { s = 1u; }\n\
+        if (u.cyl_on == 1u) {\n\
+            let dx = f32(i) + 0.5 - u.cyl_x;\n\
+            let dy = f32(j) + 0.5 - u.cyl_y;\n\
+            if (dx * dx + dy * dy <= u.cyl_r * u.cyl_r) { s = 1u; }\n\
+        }\n\
+        solid[c] = s;\n\
+    }\n\
+    var ux = u.inflow;\n\
+    var uy = 0.0;\n\
+    if (u.closed == 1u) {\n\
+        ux = 0.03 * sin(6.2831853 * 3.0 * f32(i) / f32(u.w));\n\
+        uy = 0.03 * sin(6.2831853 * 2.0 * f32(j) / f32(u.h));\n\
+    }\n\
+    for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+        f0[c * 9u + k] = feq(k, 1.0, ux, uy);\n\
+        f1[c * 9u + k] = feq(k, 1.0, ux, uy);\n\
+    }\n\
+    dye0[c] = vec4<f32>(0.0);\n\
+    dye1[c] = vec4<f32>(0.0);\n\
+}\n";
+
+// The mouse stroke: every cell within the brush radius of the segment
+// (bx0, by0)-(bx1, by1) becomes solid (bmode 1) or fluid at rest (2).
+// The walls and the first and last two columns stay as they are.
+pub const STROKE: [u8] = "@group(0) @binding(1) var<storage, read_write> solid: array<u32>;\n\
+@group(0) @binding(2) var<storage, read_write> f0: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> f1: array<f32>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i < 2u || i + 2u >= u.w || j < 1u || j + 1u >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    let px = f32(i) + 0.5;\n\
+    let py = f32(j) + 0.5;\n\
+    let vx = u.bx1 - u.bx0;\n\
+    let vy = u.by1 - u.by0;\n\
+    let len2 = vx * vx + vy * vy;\n\
+    var t = 0.0;\n\
+    if (len2 > 0.0) { t = clamp(((px - u.bx0) * vx + (py - u.by0) * vy) / len2, 0.0, 1.0); }\n\
+    let qx = u.bx0 + t * vx - px;\n\
+    let qy = u.by0 + t * vy - py;\n\
+    if (qx * qx + qy * qy > u.brad * u.brad) { return; }\n\
+    if (u.bmode == 1u) { solid[c] = 1u; }\n\
+    if (u.bmode == 2u && solid[c] == 1u) {\n\
+        solid[c] = 0u;\n\
+        for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+            f0[c * 9u + k] = feq(k, 1.0, u.inflow, 0.0);\n\
+            f1[c * 9u + k] = feq(k, 1.0, u.inflow, 0.0);\n\
+        }\n\
+    }\n\
+}\n";
+
+// BGK collision on the fluid cells, in place.
+pub const COLLIDE: [u8] = "@group(0) @binding(1) var<storage, read_write> f: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> solid: array<u32>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i >= u.w || j >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    if (solid[c] == 1u) { return; }\n\
+    var rho = 0.0;\n\
+    var mx = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+        let fk = f[c * 9u + k];\n\
+        rho = rho + fk;\n\
+        mx = mx + fk * f32(ex(k));\n\
+        my = my + fk * f32(ey(k));\n\
+    }\n\
+    let ux = mx / rho;\n\
+    let uy = my / rho;\n\
+    for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+        let fk = f[c * 9u + k];\n\
+        f[c * 9u + k] = fk - u.omega * (fk - feq(k, rho, ux, uy));\n\
+    }\n\
+}\n";
+
+// Streaming, pull form: f_k(x) comes from x - e_k. A solid source, or the
+// grid's edge in a closed box, bounces the particle back. In the channel
+// the two open edges are Zou-He conditions: the inflow sets the speed at
+// the first column (the three populations that come from outside are
+// solved from the rest), the outflow sets the density to 1 at the last
+// (its three outside populations solved likewise). Each population is
+// read once, so mass is conserved except where the flow leaves.
+pub const STREAM: [u8] = "@group(0) @binding(1) var<storage, read> src: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;\n\
+@group(0) @binding(3) var<storage, read> solid: array<u32>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i >= u.w || j >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    if (solid[c] == 1u) {\n\
+        for (var k: u32 = 0u; k < 9u; k = k + 1u) { dst[c * 9u + k] = src[c * 9u + opp(k)]; }\n\
+        return;\n\
+    }\n\
+    for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+        let si = i32(i) - ex(k);\n\
+        let sj = i32(j) - ey(k);\n\
+        if (si < 0 || si >= i32(u.w) || sj < 0 || sj >= i32(u.h)) {\n\
+            dst[c * 9u + k] = src[c * 9u + opp(k)];\n\
+        } else {\n\
+            let s = u32(sj) * u.w + u32(si);\n\
+            if (solid[s] == 1u) {\n\
+                dst[c * 9u + k] = src[c * 9u + opp(k)];\n\
+            } else {\n\
+                dst[c * 9u + k] = src[s * 9u + k];\n\
+            }\n\
+        }\n\
+    }\n\
+    if (u.closed == 0u && i == 0u) {\n\
+        let rho = (dst[c * 9u] + dst[c * 9u + 2u] + dst[c * 9u + 4u] + 2.0 * (dst[c * 9u + 3u] + dst[c * 9u + 6u] + dst[c * 9u + 7u])) / (1.0 - u.inflow);\n\
+        let m = rho * u.inflow;\n\
+        dst[c * 9u + 1u] = dst[c * 9u + 3u] + 0.6666667 * m;\n\
+        dst[c * 9u + 5u] = dst[c * 9u + 7u] + 0.5 * (dst[c * 9u + 4u] - dst[c * 9u + 2u]) + m / 6.0;\n\
+        dst[c * 9u + 8u] = dst[c * 9u + 6u] + 0.5 * (dst[c * 9u + 2u] - dst[c * 9u + 4u]) + m / 6.0;\n\
+    }\n\
+    if (u.closed == 0u && i == u.w - 1u) {\n\
+        let ux = dst[c * 9u] + dst[c * 9u + 2u] + dst[c * 9u + 4u] + 2.0 * (dst[c * 9u + 1u] + dst[c * 9u + 5u] + dst[c * 9u + 8u]) - 1.0;\n\
+        dst[c * 9u + 3u] = dst[c * 9u + 1u] - 0.6666667 * ux;\n\
+        dst[c * 9u + 6u] = dst[c * 9u + 8u] + 0.5 * (dst[c * 9u + 4u] - dst[c * 9u + 2u]) - ux / 6.0;\n\
+        dst[c * 9u + 7u] = dst[c * 9u + 5u] + 0.5 * (dst[c * 9u + 2u] - dst[c * 9u + 4u]) - ux / 6.0;\n\
+    }\n\
+}\n";
+
+// The macroscopic fields per cell: (density, ux, uy, solid).
+pub const MACRO: [u8] = "@group(0) @binding(1) var<storage, read> f: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> solid: array<u32>;\n\
+@group(0) @binding(3) var<storage, read_write> mac: array<vec4<f32>>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i >= u.w || j >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    if (solid[c] == 1u) {\n\
+        mac[c] = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n\
+        return;\n\
+    }\n\
+    var rho = 0.0;\n\
+    var mx = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k: u32 = 0u; k < 9u; k = k + 1u) {\n\
+        let fk = f[c * 9u + k];\n\
+        rho = rho + fk;\n\
+        mx = mx + fk * f32(ex(k));\n\
+        my = my + fk * f32(ey(k));\n\
+    }\n\
+    mac[c] = vec4<f32>(rho, mx / rho, my / rho, 0.0);\n\
+}\n";
+
+// The dye: semi-Lagrangian advection along the flow (bilinear), with
+// coloured stripes injected in the first two columns of the channel.
+pub const DYE: [u8] = "@group(0) @binding(1) var<storage, read> mac: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read> solid: array<u32>;\n\
+@group(0) @binding(3) var<storage, read> din: array<vec4<f32>>;\n\
+@group(0) @binding(4) var<storage, read_write> dout: array<vec4<f32>>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let j = id.y;\n\
+    if (i >= u.w || j >= u.h) { return; }\n\
+    let c = j * u.w + i;\n\
+    if (solid[c] == 1u) {\n\
+        dout[c] = vec4<f32>(0.0);\n\
+        return;\n\
+    }\n\
+    if (u.closed == 0u && i < 2u) {\n\
+        let band = j * 8u / u.h;\n\
+        var col = vec3<f32>(0.0);\n\
+        if (band % 2u == 0u) {\n\
+            let kind = (band / 2u) % 3u;\n\
+            if (kind == 0u) { col = vec3<f32>(1.0, 0.35, 0.2); }\n\
+            else if (kind == 1u) { col = vec3<f32>(0.2, 0.8, 1.0); }\n\
+            else { col = vec3<f32>(0.6, 1.0, 0.3); }\n\
+        }\n\
+        dout[c] = vec4<f32>(col, 0.0);\n\
+        return;\n\
+    }\n\
+    let m = mac[c];\n\
+    let bx = f32(i) - m.y;\n\
+    let by = f32(j) - m.z;\n\
+    let x0f = floor(bx);\n\
+    let y0f = floor(by);\n\
+    let tx = bx - x0f;\n\
+    let ty = by - y0f;\n\
+    let xa = clamp(i32(x0f), 0, i32(u.w) - 1);\n\
+    let xb = clamp(i32(x0f) + 1, 0, i32(u.w) - 1);\n\
+    let ya = clamp(i32(y0f), 0, i32(u.h) - 1);\n\
+    let yb = clamp(i32(y0f) + 1, 0, i32(u.h) - 1);\n\
+    let v00 = din[u32(ya) * u.w + u32(xa)];\n\
+    let v10 = din[u32(ya) * u.w + u32(xb)];\n\
+    let v01 = din[u32(yb) * u.w + u32(xa)];\n\
+    let v11 = din[u32(yb) * u.w + u32(xb)];\n\
+    let top = mix(v00, v10, tx);\n\
+    let bot = mix(v01, v11, tx);\n\
+    dout[c] = mix(top, bot, ty) * u.dye_keep;\n\
+}\n";
+
+// The probe: the transverse velocity at one cell, into a ring of 65536
+// samples (one per step).
+pub const PROBE: [u8] = "@group(0) @binding(1) var<storage, read> mac: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read_write> series: array<f32>;\n\
+@compute @workgroup_size(1)\n\
+fn main() {\n\
+    series[u.slotn & 65535u] = mac[u.probe_at].z;\n\
+}\n";
+
+// The picture: the cells as pixels (row 0 at the top). Views: 0 speed,
+// 1 vorticity (red turning one way, blue the other), 2 dye.
+pub const RENDER: [u8] = "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
+}\n\
+@group(0) @binding(1) var<storage, read> mac: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read> solid: array<u32>;\n\
+@group(0) @binding(3) var<storage, read> dye: array<vec4<f32>>;\n\
+fn jet(t: f32) -> vec3<f32> {\n\
+    return clamp(vec3<f32>(1.5 - abs(4.0 * t - 3.0), 1.5 - abs(4.0 * t - 2.0), 1.5 - abs(4.0 * t - 1.0)), vec3<f32>(0.0), vec3<f32>(1.0));\n\
+}\n\
+@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let ci = clamp(i32(v.uv.x * f32(u.w)), 0, i32(u.w) - 1);\n\
+    let cj = clamp(i32(v.uv.y * f32(u.h)), 0, i32(u.h) - 1);\n\
+    let c = u32(cj) * u.w + u32(ci);\n\
+    if (solid[c] == 1u) { return vec4<f32>(0.25, 0.26, 0.28, 1.0); }\n\
+    if (u.view == 0u) {\n\
+        let s = length(mac[c].yz);\n\
+        return vec4<f32>(jet(clamp(s / 0.13, 0.0, 1.0)), 1.0);\n\
+    }\n\
+    if (u.view == 1u) {\n\
+        let il = max(ci - 1, 0);\n\
+        let ir = min(ci + 1, i32(u.w) - 1);\n\
+        let jd = max(cj - 1, 0);\n\
+        let ju = min(cj + 1, i32(u.h) - 1);\n\
+        let dvdx = (mac[u32(cj) * u.w + u32(ir)].z - mac[u32(cj) * u.w + u32(il)].z) / f32(ir - il);\n\
+        let dudy = (mac[u32(ju) * u.w + u32(ci)].y - mac[u32(jd) * u.w + u32(ci)].y) / f32(ju - jd);\n\
+        let s = clamp((dvdx - dudy) / 0.02, -1.0, 1.0);\n\
+        var base = vec3<f32>(0.1, 0.35, 0.95);\n\
+        if (s > 0.0) { base = vec3<f32>(0.95, 0.3, 0.1); }\n\
+        return vec4<f32>(mix(vec3<f32>(0.06, 0.06, 0.08), base, abs(s)), 1.0);\n\
+    }\n\
+    return vec4<f32>(dye[c].rgb + vec3<f32>(0.03), 1.0);\n\
+}\n";

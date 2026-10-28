@@ -1,0 +1,351 @@
+// sdftext: text from a signed-distance-field atlas on the GPU, and a small
+// immediate-mode UI on it. The window is the demo; --headless runs the
+// same page with scripted input, checks the atlas and the widgets, and
+// with --shot FILE.ppm writes the frame as a PPM image.
+
+mod glyphs;
+mod mathx;
+mod typeset;
+mod gfx;
+mod ui;
+mod page;
+
+use std::env;
+use std::fs;
+use std::gpu;
+use std::gpu::{Color, Format, RawSurface, TextureUsage, BufferUsage};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+use ui::Ui;
+use page::Page;
+
+// The headless frame: the page at 2 device pixels per logical unit.
+const SCALE: f64 = 2.0;
+
+// One frame of the page: lay it out, then the frame's events are done.
+fn run_frame(ui: inout Ui, page: inout Page) {
+    ui.begin(ui.xf.k);
+    page::build(&ui, &page);
+    ui.end_frame();
+}
+
+// A check's line; false when it fails.
+fn check(name: [u8], ok: bool) -> bool {
+    if ok {
+        println(f"PASS {name}");
+    } else {
+        println(f"FAIL {name}");
+    }
+    ok
+}
+
+// The atlas: every glyph's inked share (texels above 0.5) and the
+// spread of the field's values. A glyph must be drawn and not a block.
+fn check_atlas(atlas: [f32]) -> bool {
+    var all = true;
+    var lo: f64 = 1.0;
+    var hi: f64 = 0.0;
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while i < glyphs::CHARSET.len() {
+        let c = glyphs::CHARSET[i];
+        let ox = (i % glyphs::COLS) * glyphs::CELL;
+        let oy = (i / glyphs::COLS) * glyphs::CELL;
+        var inked: i64 = 0;
+        var ty: i64 = 0;
+        while ty < glyphs::CELL {
+            var tx: i64 = 0;
+            while tx < glyphs::CELL {
+                let v = atlas[(oy + ty) * glyphs::ATLAS_W + ox + tx] as f64;
+                if v > 0.5 {
+                    inked += 1;
+                }
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+                tx += 1;
+            }
+            ty += 1;
+        }
+        let share = inked as f64 / (glyphs::CELL * glyphs::CELL) as f64;
+        if c != ' ' {
+            n += 1;
+            if share < 0.002 || share > 0.5 {
+                println(f"  glyph {i} inked share {share} is out of range");
+                all = false;
+            }
+        }
+        i += 1;
+    }
+    println(f"atlas: {n} glyphs, values {lo} .. {hi}");
+    check("atlas: every glyph is drawn, none is a block", all)
+        && check("atlas: field runs from 0 outside to above 0.7 inside a stroke", lo == 0.0 && hi > 0.7)
+}
+
+// The scripted session: the widgets react to the pointer, the wheel and
+// the keys as a person would drive them.
+fn script(ui: inout Ui, page: inout Page) -> bool {
+    var ok = true;
+    run_frame(&ui, &page);
+
+    // a click on CLICK +1
+    ui.move_to(page::CLICK_X + 40.0, page::CLICK_Y + 20.0);
+    ui.press();
+    run_frame(&ui, &page);
+    ui.release();
+    run_frame(&ui, &page);
+    ok = check("button: one click counts one", page.count == 1) && ok;
+
+    // drag the slider from 20% to 80%
+    ui.move_to(page::SLIDER_X + 0.2 * page::SLIDER_W, page::SLIDER_Y + 6.0);
+    ui.press();
+    run_frame(&ui, &page);
+    ui.move_to(page::SLIDER_X + 0.8 * page::SLIDER_W, page::SLIDER_Y + 6.0);
+    run_frame(&ui, &page);
+    ui.release();
+    run_frame(&ui, &page);
+    ok = check("slider: dragged to 80%", page.size > 0.79 && page.size < 0.81) && ok;
+
+    // focus the text field, type, and backspace once
+    ui.move_to(page::FIELD_X + 50.0, page::FIELD_Y + 18.0);
+    ui.press();
+    run_frame(&ui, &page);
+    ui.release();
+    ui.type_text("hello");
+    run_frame(&ui, &page);
+    ui.back();
+    run_frame(&ui, &page);
+    ok = check("text field: typed hello, one backspace", page.name.as_slice() == "hell") && ok;
+
+    // the wheel scrolls two rows; a click on the third visible row selects it
+    ui.move_to(page::LIST_X + 100.0, page::LIST_Y + 100.0);
+    ui.scroll(-2.0 * ui::ROW);
+    run_frame(&ui, &page);
+    ok = check("list: wheel scrolls two rows", page.list.scroll > 51.9 && page.list.scroll < 52.1) && ok;
+    ui.move_to(page::LIST_X + 100.0, page::LIST_Y + 10.0);
+    ui.press();
+    run_frame(&ui, &page);
+    ui.release();
+    run_frame(&ui, &page);
+    ok = check("list: a click selects the row under the pointer", page.list.selected == 2) && ok;
+
+    // typing with the field unfocused goes nowhere
+    ui.move_to(10.0, 10.0);
+    ui.press();
+    run_frame(&ui, &page);
+    ui.release();
+    ui.type_text("xyz");
+    run_frame(&ui, &page);
+    ok = check("text field: unfocused, it takes no typing", page.name.as_slice() == "hell") && ok;
+    ok
+}
+
+// The PPM image of an RGBA8 frame of w by h, rows padded to bpr bytes.
+fn ppm(gpa: Gpa, px: [u8], w: i64, h: i64, bpr: i64) -> Buf {
+    var out = Buf::new_in(gpa);
+    out.push_str("P6\n");
+    out.push_int(w);
+    out.push(' ' as u8);
+    out.push_int(h);
+    out.push_str("\n255\n");
+    var y: i64 = 0;
+    while y < h {
+        var x: i64 = 0;
+        while x < w {
+            let at = y * bpr + x * 4;
+            out.push(px[at]);
+            out.push(px[at + 1]);
+            out.push(px[at + 2]);
+            x += 1;
+        }
+        y += 1;
+    }
+    out
+}
+
+fn run_headless(gpa: Gpa, shot: [u8]) -> Result<bool, gpu::Error> {
+    let atlas = glyphs::build_atlas(gpa);
+    var ok = check_atlas(atlas.as_slice());
+
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var g = gfx::make(dev, queue, Format::Rgba8Unorm, atlas.as_slice())?;
+
+    let w = page::WIDTH * 2;
+    let h = page::HEIGHT * 2;
+    var ui = Ui::new(gpa);
+    ui.xf = typeset::Xf::plain(SCALE);
+    var page = Page::new(gpa);
+    ok = script(&ui, &page) && ok;
+
+    // the final frame: the page as it is now
+    ui.begin(SCALE);
+    page::build(&ui, &page);
+    ui.end_frame();
+    let tex = g.dev.texture(w, h, Format::Rgba8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let cmds = gfx::draw(&g, tex.view(), ui.verts.as_slice(), w, h, Color::rgba(0.055, 0.063, 0.082, 1.0));
+    g.queue.submit(cmds);
+
+    // the frame back to the CPU: rows are padded to 256 bytes
+    let bpr: i64 = 6400;
+    var out = g.dev.buffer(bpr * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = g.dev.encoder();
+    enc.copy_texture_to_buffer(tex, out, bpr);
+    g.queue.submit(enc.finish());
+    let px = out.map_read(g.dev);
+    let vertices = ui.verts.len() / 8;
+    println(f"frame: {w}x{h}, {vertices} vertices");
+
+    if shot.len() > 0 {
+        let image = ppm(gpa, px, w, h, bpr);
+        match fs::write(shot, image.as_slice()) {
+            Ok(_) => println(f"wrote {shot}"),
+            Err(e) => {
+                eprintln(f"sdftext: {e}");
+                ok = false;
+            }
+        }
+    }
+    Ok(ok)
+}
+
+fn run_window(gpa: Gpa, frames: i64) -> Result<(), gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sdftext: no window server (try --headless)");
+            return Ok(());
+        }
+    };
+    var win = match app.window(WindowDesc::new("SDF text", page::WIDTH, page::HEIGHT)) {
+        Ok(w) => w,
+        Err(_) => return Ok(()),
+    };
+    let atlas = glyphs::build_atlas(gpa);
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let start = win.size();
+    var pw = start.w;
+    var ph = start.h;
+    var scale = start.scale;
+    surf.configure(dev, pw, ph);
+    var g = gfx::make(dev, queue, Format::Bgra8Unorm, atlas.as_slice())?;
+    var ui = Ui::new(gpa);
+    var page = Page::new(gpa);
+    var drawn: i64 = 0;
+    win.request_frame();
+    loop {
+        let ev = match app.wait() {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        match ev {
+            Event::Frame(_) => {
+                ui.xf = typeset::Xf::plain(scale);
+                run_frame(&ui, &page);
+                match surf.frame() {
+                    Ok(frame) => {
+                        let cmds = gfx::draw(&g, frame.texture.view(), ui.verts.as_slice(), pw, ph,
+                            Color::rgba(0.055, 0.063, 0.082, 1.0));
+                        g.queue.submit(cmds);
+                        frame.present(&g.queue);
+                    }
+                    Err(_) => {}
+                }
+                drawn += 1;
+                if frames >= 0 && drawn >= frames {
+                    break;
+                }
+                win.request_frame();
+            }
+            Event::Mouse(m) => {
+                ui.move_to(m.x / scale, m.y / scale);
+                match m.button {
+                    Button::Left => match m.action {
+                        MouseAction::Press => ui.press(),
+                        MouseAction::Release => ui.release(),
+                        MouseAction::Move => {}
+                    },
+                    _ => {}
+                }
+            }
+            Event::Scroll(s) => {
+                if s.precise {
+                    ui.scroll(s.dy / scale);
+                } else {
+                    ui.scroll(s.dy * 24.0);
+                }
+            }
+            Event::Key(k) => {
+                if k.pressed {
+                    match k.key {
+                        Logical::Named(Named::Backspace) => ui.back(),
+                        Logical::Named(Named::Escape) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Event::Text(t) => ui.type_text(t.bytes[0..t.len as i64]),
+            Event::Resize(_, s) => {
+                pw = s.w;
+                ph = s.h;
+                scale = s.scale;
+                surf.configure(g.dev, pw, ph);
+            }
+            Event::Close(_) | Event::Quit => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn main(gpa: Gpa) -> i32 {
+    var headless = false;
+    var shot: [u8] = "";
+    var frames: i64 = -1;
+    var args = env::args();
+    let _name = args.next();
+    while let Some(a) = args.next() {
+        if a == "--headless" {
+            headless = true;
+        } else if a == "--shot" {
+            if let Some(f) = args.next() {
+                shot = f;
+            }
+        } else if a == "--frames" {
+            if let Some(n) = args.next() {
+                frames = parse_int(n).unwrap_or(-1);
+            }
+        }
+    }
+    if headless {
+        return match run_headless(gpa, shot) {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(e) => {
+                eprintln(f"sdftext: {e}");
+                1
+            }
+        };
+    }
+    match run_window(gpa, frames) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            1
+        }
+    }
+}
+
+#[test]
+fn the_headless_script_is_the_widgets_contract(gpa: Gpa) {
+    var ui = Ui::new(gpa);
+    var page = Page::new(gpa);
+    script(&ui, &page);
+    assert_eq(page.count, 1);
+}
