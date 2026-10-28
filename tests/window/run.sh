@@ -18,7 +18,9 @@
 # a window server, and the checks that need frames while the display can
 # give none (the screen locked, the display asleep, the window occluded:
 # main.vl's no_frames_code; VOLE_TEST_NO_FRAMES=1 pretends it). A check
-# that gets no frames while the display could give them is a FAIL. Exits 1
+# that gets no frames while the display could give them is a FAIL. A time
+# budget missed (`slow NAME`: idle CPU) is a FAIL on an idle machine and a
+# skip on a loaded one (tests/budget.sh). Exits 1
 # if one failed.
 
 set -u
@@ -64,7 +66,9 @@ awk '
     /^FAIL / { sub(/^FAIL /, ""); print "FAIL window_" $0; bad = 1; next }
     /^skip / { sub(/^skip /, ""); print "skip window_" $0; next }
 ' "$WORK/run.out"
-if [ $status -ne 0 ] && ! grep -q '^FAIL' "$WORK/run.out"; then
+# (0.25.2) the time budgets missed: FAIL when idle, SKIP when loaded
+sh "$ROOT/tests/budget.sh" window_ "$WORK/run.out" || status=1
+if [ $status -ne 0 ] && ! grep -q -e '^FAIL' -e '^slow' "$WORK/run.out"; then
     echo "FAIL window_run: exit $status"
     tail -5 "$WORK/run.out" | sed 's/^/    /'
     exit 1
