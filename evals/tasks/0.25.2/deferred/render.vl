@@ -1,0 +1,346 @@
+// The renderer: the GPU objects and one frame's passes. The frame is
+//   update (compute), cull (compute, a workgroup per tile),
+//   geometry x3 (albedo, normal, world position + view depth: one color
+//   target a pass, since std::gpu's PassDesc takes one; each pass has its
+//   own depth buffer), lighting (fragment, the tile's lights), view
+// (fragment: tone mapping or one G-buffer), all in one encoder.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Compare, Format, PassDesc, RenderPass, TextureUsage,
+    VertexFormat, VertexLayout};
+
+use scene::{CUBE_VERTS, MAXL, NCUBES, NOBJS, NLIGHTS, NSPHERES, SPHERE_VERTS, TILE,
+    VERT_BYTES};
+use shaders::{COMMON, CULL, FULLSCREEN, GEN, GEO, LIGHT, UPDATE, VIEW};
+
+// The WGSL of one module: the shared declarations, then the kernel(s).
+fn source(gpa: Gpa, a: [u8], b: [u8]) -> Buf {
+    var s = Buf::new_in(gpa);
+    s.push_str(COMMON);
+    s.push_str(a);
+    s.push_str(b);
+    s
+}
+
+// The per-size objects: the tile lists and the G-buffers, and the bind
+// groups that use them.
+pub struct Screen {
+    pub w: i64,
+    pub h: i64,
+    pub tiles_x: i64,
+    pub tiles_y: i64,
+    pub depth: gpu::Texture,
+    pub albedo: gpu::Texture,
+    pub normal: gpu::Texture,
+    pub pos: gpu::Texture,
+    pub hdr: gpu::Texture,
+    pub tile_count: gpu::Buffer,
+    pub tile_list: gpu::Buffer,
+    pub cull_group: gpu::BindGroup,
+    pub light_group: gpu::BindGroup,
+    pub view_group: gpu::BindGroup,
+}
+
+pub struct Renderer {
+    dev: gpu::Device,
+    ubuf: gpu::Buffer,
+    lights: gpu::Buffer,
+    objs: gpu::Buffer,
+    verts: gpu::Buffer,
+    gen: gpu::ComputePipeline,
+    update: gpu::ComputePipeline,
+    cull: gpu::ComputePipeline,
+    geo_albedo: gpu::RenderPipeline,
+    geo_normal: gpu::RenderPipeline,
+    geo_pos: gpu::RenderPipeline,
+    light: gpu::RenderPipeline,
+    view: gpu::RenderPipeline,
+    update_group: gpu::BindGroup,
+    geo_group: gpu::BindGroup,
+    pub screen: Screen,
+}
+
+// One geometry pipeline: the vertex stage of GEO and the fragment entry `fs`,
+// one color target, depth tested. The shader lives as long as the call.
+fn geo_pipe(dev: gpu::Device, gpa: Gpa, fs: [u8], format: Format)
+        -> Result<gpu::RenderPipeline, gpu::Error> {
+    let shader = dev.shader_wgsl(source(gpa, GEO, "").as_slice())?;
+    var d = gpu::RenderDesc::new(shader, "geo_vs", fs, format);
+    var layout = VertexLayout::new(VERT_BYTES);
+    layout.attribute(0, VertexFormat::Float32x3, 0);
+    layout.attribute(1, VertexFormat::Float32x3, 12);
+    d.vertex_buffer(layout);
+    d.depth(Format::Depth32Float, Compare::Less, true);
+    dev.render_pipeline(d)
+}
+
+fn make_screen(dev: gpu::Device, w: i64, h: i64, ubuf: gpu::Buffer, lights: gpu::Buffer,
+        cull: gpu::ComputePipeline, light: gpu::RenderPipeline, view: gpu::RenderPipeline) -> Screen {
+    let tiles_x = (w + TILE - 1) / TILE;
+    let tiles_y = (h + TILE - 1) / TILE;
+    let depth = dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+    let sampled = TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING;
+    let albedo = dev.texture(w, h, Format::Rgba8Unorm, usage: sampled);
+    let normal = dev.texture(w, h, Format::Rgba16Float, usage: sampled);
+    let pos = dev.texture(w, h, Format::Rgba32Float, usage: sampled | TextureUsage::COPY_SRC);
+    let hdr = dev.texture(w, h, Format::Rgba16Float, usage: sampled);
+    let tile_count = dev.buffer(tiles_x * tiles_y * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let tile_list = dev.buffer(tiles_x * tiles_y * MAXL * 4,
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let cull_group = dev.bind_group(cull.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, lights), gpu::bind(2, tile_count),
+         gpu::bind(3, tile_list)][..]);
+    let light_group = dev.bind_group(light.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, lights), gpu::bind(2, tile_count),
+         gpu::bind(3, tile_list), gpu::bind_texture(4, albedo.view()),
+         gpu::bind_texture(5, normal.view()), gpu::bind_texture(6, pos.view())][..]);
+    let view_group = dev.bind_group(view.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind_texture(1, hdr.view()),
+         gpu::bind_texture(2, albedo.view()), gpu::bind_texture(3, normal.view()),
+         gpu::bind_texture(4, pos.view())][..]);
+    Screen { w: w, h: h, tiles_x: tiles_x, tiles_y: tiles_y, depth: depth, albedo: albedo,
+        normal: normal, pos: pos, hdr: hdr, tile_count: tile_count, tile_list: tile_list,
+        cull_group: cull_group, light_group: light_group, view_group: view_group }
+}
+
+// The meshes' draws: the cubes, the spheres, the floor (one cube), by the
+// instance ranges of scene.vl's object order.
+fn draw_scene(pass: inout RenderPass, pipe: gpu::RenderPipeline, group: gpu::BindGroup,
+        verts: gpu::Buffer) {
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, group);
+    pass.set_vertex_buffer(0, verts, 0);
+    pass.draw(0..CUBE_VERTS, 0..NCUBES);
+    pass.set_vertex_buffer(0, verts, CUBE_VERTS * VERT_BYTES);
+    pass.draw(0..SPHERE_VERTS, NCUBES..NCUBES + NSPHERES);
+    pass.set_vertex_buffer(0, verts, 0);
+    pass.draw(0..CUBE_VERTS, NCUBES + NSPHERES..NOBJS);
+}
+
+impl Renderer {
+    pub fn new_in(dev: sink gpu::Device, queue: inout gpu::Queue, w: i64, h: i64, gpa: Gpa)
+            -> Result<Renderer, gpu::Error> {
+        let ubuf = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let light_data = scene::light_records(gpa);
+        let lights = dev.buffer_init(gpu::bytes_of_f32(light_data.as_slice()),
+            BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+        let obj_data = scene::object_records(gpa);
+        let objs = dev.buffer_init(gpu::bytes_of_f32(obj_data.as_slice()), BufferUsage::STORAGE);
+        let verts = dev.buffer((CUBE_VERTS + SPHERE_VERTS) * VERT_BYTES,
+            BufferUsage::STORAGE | BufferUsage::VERTEX);
+
+        let gen_shader = dev.shader_wgsl(source(gpa, GEN, "").as_slice())?;
+        let gen = dev.compute_pipeline(gen_shader, "gen")?;
+        let upd_shader = dev.shader_wgsl(source(gpa, UPDATE, "").as_slice())?;
+        let update = dev.compute_pipeline(upd_shader, "update")?;
+        let cull_shader = dev.shader_wgsl(source(gpa, CULL, "").as_slice())?;
+        let cull = dev.compute_pipeline(cull_shader, "cull")?;
+        let light_shader = dev.shader_wgsl(source(gpa, FULLSCREEN, LIGHT).as_slice())?;
+        let light = dev.render_pipeline(gpu::RenderDesc::new(light_shader, "fs_vs", "light_fs",
+            Format::Rgba16Float))?;
+        let view_shader = dev.shader_wgsl(source(gpa, FULLSCREEN, VIEW).as_slice())?;
+        let view = dev.render_pipeline(gpu::RenderDesc::new(view_shader, "fs_vs", "view_fs",
+            Format::Bgra8Unorm))?;
+        let geo_albedo = geo_pipe(dev, gpa, "geo_albedo", Format::Rgba8Unorm)?;
+        let geo_normal = geo_pipe(dev, gpa, "geo_normal", Format::Rgba16Float)?;
+        let geo_pos = geo_pipe(dev, gpa, "geo_pos", Format::Rgba32Float)?;
+
+        let gen_group = dev.bind_group(gen.bind_layout(0), [gpu::bind(0, verts)][..]);
+        let update_group = dev.bind_group(update.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, lights), gpu::bind(2, objs)][..]);
+        let geo_group = dev.bind_group(geo_albedo.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, objs)][..]);
+        let screen = make_screen(dev, w, h, ubuf, lights, cull, light, view);
+
+        // the meshes, generated once on the GPU
+        var enc = dev.encoder();
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(gen);
+            pass.set_bind_group(0, gen_group);
+            pass.dispatch((CUBE_VERTS + SPHERE_VERTS + 63) / 64);
+        });
+        queue.submit(enc.finish());
+
+        Ok(Renderer { dev: dev, ubuf: ubuf, lights: lights, objs: objs, verts: verts,
+            gen: gen, update: update, cull: cull, geo_albedo: geo_albedo,
+            geo_normal: geo_normal, geo_pos: geo_pos, light: light, view: view,
+            update_group: update_group, geo_group: geo_group, screen: screen })
+    }
+
+    // A texture to draw into and read back (headless, --shot).
+    pub fn offscreen(inout self, w: i64, h: i64) -> gpu::Texture {
+        self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC)
+    }
+
+    // The G-buffers and the tile lists for a new size (a window resize).
+    pub fn resize(inout self, surf: inout gpu::Surface, w: i64, h: i64) {
+        surf.configure(self.dev, w, h);
+        self.screen = make_screen(self.dev, w, h, self.ubuf, self.lights, self.cull,
+            self.light, self.view);
+    }
+
+    // One frame into `target` (a surface frame or an offscreen texture): the
+    // lights and objects move to `time`, then the passes. `mode`: 0 the
+    // lit frame, 1 albedo, 2 normal, 3 depth.
+    pub fn frame(inout self, queue: inout gpu::Queue, target: gpu::TextureView, time: f32,
+            mode: i64) {
+        let g = scene::globals(self.screen.w, self.screen.h, time, mode);
+        queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(g[..]));
+        var enc = self.dev.encoder();
+
+        let upd = self.update;
+        let ug = self.update_group;
+        let nmax = if NLIGHTS > NOBJS { NLIGHTS } else { NOBJS };
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(upd);
+            pass.set_bind_group(0, ug);
+            pass.dispatch((nmax + 63) / 64);
+        });
+
+        let cul = self.cull;
+        let cg = self.screen.cull_group;
+        let tx = self.screen.tiles_x;
+        let ty = self.screen.tiles_y;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(cul);
+            pass.set_bind_group(0, cg);
+            pass.dispatch(tx, ty);
+        });
+
+        let verts = self.verts;
+        let geo = self.geo_group;
+        let ga = self.geo_albedo;
+        let gn = self.geo_normal;
+        let gp = self.geo_pos;
+        enc.render_pass(PassDesc::color(self.screen.albedo.view())
+                .with_depth(self.screen.depth.view(), 1.0, false), |pass| {
+            draw_scene(&pass, ga, geo, verts);
+        });
+        enc.render_pass(PassDesc::color(self.screen.normal.view())
+                .with_depth(self.screen.depth.view(), 1.0, false), |pass| {
+            draw_scene(&pass, gn, geo, verts);
+        });
+        enc.render_pass(PassDesc::color(self.screen.pos.view(), Color::rgba(0.0, 0.0, 0.0, 1.0e9))
+                .with_depth(self.screen.depth.view(), 1.0, false), |pass| {
+            draw_scene(&pass, gp, geo, verts);
+        });
+
+        let lt = self.light;
+        let lg = self.screen.light_group;
+        enc.render_pass(PassDesc::color(self.screen.hdr.view()), |pass| {
+            pass.set_pipeline(lt);
+            pass.set_bind_group(0, lg);
+            pass.draw(0..3, 0..1);
+        });
+
+        let vw = self.view;
+        let vg = self.screen.view_group;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(vw);
+            pass.set_bind_group(0, vg);
+            pass.draw(0..3, 0..1);
+        });
+        queue.submit(enc.finish());
+    }
+
+    // Reads back the last frame's lights, tile lists and world positions and
+    // checks the culling: every light whose sphere holds a sampled pixel's
+    // position must be in that pixel's tile list (a tile that overflowed
+    // MAXL is exempt and counted). Samples every third pixel.
+    pub fn check_culling(inout self, queue: inout gpu::Queue, gpa: Gpa) -> Buf {
+        let w = self.screen.w;
+        let h = self.screen.h;
+        let tx = self.screen.tiles_x;
+        let ty = self.screen.tiles_y;
+        let ntiles = tx * ty;
+        var lb = self.dev.buffer(NLIGHTS * 64, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var cb = self.dev.buffer(ntiles * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var tb = self.dev.buffer(ntiles * MAXL * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var pb = self.dev.buffer(w * h * 16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        enc.copy_buffer(self.lights, 0, lb, 0, NLIGHTS * 64);
+        enc.copy_buffer(self.screen.tile_count, 0, cb, 0, ntiles * 4);
+        enc.copy_buffer(self.screen.tile_list, 0, tb, 0, ntiles * MAXL * 4);
+        enc.copy_texture_to_buffer(self.screen.pos, pb, w * 16);
+        queue.submit(enc.finish());
+
+        let lp = gpu::f32s(lb.map_read(self.dev));
+        let cnt = gpu::u32s(cb.map_read(self.dev));
+        let lst = gpu::u32s(tb.map_read(self.dev));
+        let pf = gpu::f32s(pb.map_read(self.dev));
+
+        var maxc: i64 = 0;
+        var overflow: i64 = 0;
+        var total: i64 = 0;
+        for t in 0..ntiles {
+            let c = cnt[t] as i64;
+            total = total + c;
+            if c > maxc {
+                maxc = c;
+            }
+            if c > MAXL {
+                overflow = overflow + 1;
+            }
+        }
+        var sampled: i64 = 0;
+        var hits: i64 = 0;
+        var misses: i64 = 0;
+        for sy in 0..h / 3 {
+            for sx in 0..w / 3 {
+                let x = sx * 3;
+                let y = sy * 3;
+                let p = (y * w + x) * 4;
+                if pf[p + 3] < 1.0e8 {
+                    let t = (y / TILE) * tx + x / TILE;
+                    let c = cnt[t] as i64;
+                    let k = if c < MAXL { c } else { MAXL };
+                    sampled = sampled + 1;
+                    for i in 0..NLIGHTS {
+                        let b = i * 16 + 12;
+                        let dx = lp[b] - pf[p];
+                        let dy = lp[b + 1] - pf[p + 1];
+                        let dz = lp[b + 2] - pf[p + 2];
+                        let r = lp[b + 3];
+                        if dx * dx + dy * dy + dz * dz < r * r {
+                            var found = false;
+                            for j in 0..k {
+                                if lst[t * MAXL + j] == i as u32 {
+                                    found = true;
+                                }
+                            }
+                            if found {
+                                hits = hits + 1;
+                            } else if c <= MAXL {
+                                misses = misses + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        format_in(f"culling: {sampled} pixels, {hits} lit-by pairs, {misses} missed, most lights in a tile {maxc} (average {total / ntiles}), {overflow} tiles over {MAXL}", gpa)
+    }
+
+    // The texture as a binary PPM (P6), waiting for the GPU.
+    pub fn read_ppm(inout self, queue: inout gpu::Queue, tex: gpu::Texture, gpa: Gpa) -> Buf {
+        let w = tex.width();
+        let h = tex.height();
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        enc.copy_texture_to_buffer(tex, out, stride);
+        queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}
