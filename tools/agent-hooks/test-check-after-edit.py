@@ -494,7 +494,9 @@ try:
 
     # The real compiler, when it has --json (0.15): a clean program is
     # silent, an error is reported; and the latency on a cache hit.
-    real = os.path.join(REPO, "target", "volec")
+    # (0.25.2.1) The compiler under test when tests/run.sh says which
+    # (VOLE_TEST_COMPILER): target/volec may be an older build then.
+    real = os.environ.get("VOLE_TEST_COMPILER") or os.path.join(REPO, "target", "volec")
     probe = subprocess.run([real, "check", "--json", "/nonexistent.vl"], capture_output=True, text=True) \
         if os.access(real, os.X_OK) else None
     if probe is not None and "unknown option" not in probe.stderr:

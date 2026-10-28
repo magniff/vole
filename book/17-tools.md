@@ -311,14 +311,16 @@ exist:
 $ volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}'
 report.vl:29:42: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
 error edit.breaks: 1 new error; nothing written
+note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}' --no-check
 ```
 
 The error says what would go wrong, tagged `[edited: ...]` to show it
-comes from our change, and `edit.breaks` says nothing was written. The
-`try:` line offers `--no-check`, which writes the edit anyway; that's
-for the rare case when you'll fix the error with a second edit right
-after. `--dry-run` on any edit prints the change as a diff without
+comes from our change, and `edit.breaks` says nothing was written. When
+the error is one a second edit would fix (here, adding `share` above),
+the `edit.together` note says how to make both in one call: several
+`--old`/`--new` pairs, checked together at the end. The `try:` line
+offers `--no-check`, which writes this edit alone anyway. `--dry-run` on any edit prints the change as a diff without
 writing it.
 
 For bigger changes, `volec edit replace NAME` replaces a whole item with
