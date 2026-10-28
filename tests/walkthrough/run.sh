@@ -30,7 +30,8 @@
 # HOME and git's configuration are the runner's own (git's defaults: a
 # conflict looks the same on every machine).
 #
-# Prints `pass NAME` or `FAIL NAME` (and why) for each; exits 1 if one
+# Prints `pass NAME` or `FAIL NAME` (and why) for each, or `skip NAME:
+# why` (an example on std::gpu or std::window off macOS); exits 1 if one
 # failed.
 
 set -u
@@ -175,11 +176,19 @@ for readme in "$ROOT"/examples/*/*/README.md; do
         case " $ONLY " in *" $name "*) ;; *) continue ;; esac
     fi
     names="$names $name"
+    # (0.25.2) Off macOS, an example on std::gpu, std::window or std::objc
+    # (Metal, Cocoa, libobjc) does not link: a skip, with why.
+    if [ "$(uname -s)" != Darwin ] && find "$(dirname "$readme")" -name '*.vl' -exec cat {} + \
+            | grep -vE '^[[:space:]]*//' | grep -qE 'std::(gpu|window|objc)|use std::\{[^}]*(gpu|window|objc)::'; then
+        mkdir -p "$WORK/meta-$name"
+        echo "skip $name: std::gpu and std::window need macOS (Metal, Cocoa)" >"$WORK/meta-$name/result"
+        continue
+    fi
     run_one "$readme" &
 done
 wait
 for name in $names; do
     cat "$WORK/meta-$name/result" 2>/dev/null || echo "FAIL $name: no result"
-    grep -q '^pass' "$WORK/meta-$name/result" 2>/dev/null || STATUS=1
+    grep -qE '^(pass|skip)' "$WORK/meta-$name/result" 2>/dev/null || STATUS=1
 done
 exit $STATUS

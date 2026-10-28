@@ -1127,6 +1127,11 @@ The program is built into `.volec/test/prog` next to ROOT when a
 `.vl` file under ROOT's directory is newer than the build, or the
 compiler or `-O` level differs; each run's stdout and stderr stay there
 (`NAME.got`, `NAME.err`). A case may run `--timeout S` seconds (10).
+(0.25.2) A run stopped by the limit that used under half of it in
+processor time (wait4's user and system time) was waiting, not running:
+other processes had the processors, or a disk or swap stalled it; it
+runs again, at most twice, and its last run is judged. A loop is still
+stopped after S seconds, once.
 
 ```text
 $ volec test --timeout 1

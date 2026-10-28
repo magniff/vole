@@ -134,37 +134,52 @@ esac
 
 # ---- the load-aware time limit (tests/watchdog.sh) ----
 
-# dog NAME LOAD EXTEND: a 30-second sleep under a 1-second limit, the
-# load average pretended; prints the watchdog's line and the seconds.
+# dog NAME LOAD EXTEND: a 600-second sleep under a 1-second limit, the
+# load average pretended; prints the seconds it took, the sleep's exit
+# status (137: killed) and the watchdog's line. The seconds are checked
+# only against the limit (at least) and the sleep (well before it ends):
+# on a loaded machine, or in a container whose host is (the gate's
+# linux-aarch64 row), a second of the watchdog's can take many.
 dog() {
     rm -f "$WORK/dog.$1"
-    sleep 30 &
+    sleep 600 &
     spid=$!
     t0=$(date +%s)
     VOLE_WATCHDOG_LOAD=$2 VOLE_WATCHDOG_EXTEND=$3 sh "$ROOT/tests/watchdog.sh" 1 "$spid" "$WORK/dog.$1"
     wait "$spid" 2>/dev/null
-    echo "$(($(date +%s) - t0)) $(cat "$WORK/dog.$1" 2>/dev/null)"
+    rc=$?
+    echo "$(($(date +%s) - t0)) $rc $(cat "$WORK/dog.$1" 2>/dev/null)"
 }
-got=$(dog idle 0 8)
-case "$got" in
-    [1-3]" killed after 1 s, the limit (load average 0 on "*) ok watchdog_idle ;;
-    *) bad watchdog_idle "got '$got'" ;;
-esac
-got=$(dog loaded 100000 2)
-case "$got" in
-    [3-6]" killed after 3 s: the limit, 1 s, extended 2 times while the load average was above the "*" CPUs (now 100000): a hang, or a machine loaded beyond that") ok watchdog_loaded ;;
-    *) bad watchdog_loaded "got '$got'" ;;
-esac
+# in_time NAME MIN WANT GOT: GOT is `SECONDS 137 WANT...`, SECONDS at
+# least MIN and under 300
+in_time() {
+    secs=${4%% *}
+    rest=${4#* }
+    case "$rest" in
+        "137 "$3) [ "$secs" -ge "$2" ] && [ "$secs" -lt 300 ] && ok "$1" && return ;;
+    esac
+    bad "$1" "got '$4'"
+}
+in_time watchdog_idle 1 "killed after 1 s, the limit (load average 0 on "*" CPUs): a hang, or too slow" "$(dog idle 0 8)"
+in_time watchdog_loaded 3 "killed after 3 s: the limit, 1 s, extended 2 times while the load average was above the "*" CPUs (now 100000): a hang, or a machine loaded beyond that" \
+    "$(dog loaded 100000 2)"
 # a program that ends in time: no line, and the watchdog ends with it
+# (long before its limit)
 sleep 1 &
 spid=$!
 t0=$(date +%s)
-sh "$ROOT/tests/watchdog.sh" 20 "$spid" "$WORK/dog.quick"
-if [ $(($(date +%s) - t0)) -le 3 ] && [ ! -e "$WORK/dog.quick" ]; then
+sh "$ROOT/tests/watchdog.sh" 600 "$spid" "$WORK/dog.quick"
+if [ $(($(date +%s) - t0)) -lt 300 ] && [ ! -e "$WORK/dog.quick" ]; then
     ok watchdog_in_time
 else
     bad watchdog_in_time "waited $(($(date +%s) - t0)) s, wrote '$(cat "$WORK/dog.quick" 2>/dev/null)'"
 fi
+# the CPUs and the load, as tests/load.sh reads them here
+got=$(VOLE_TEST_LOAD= sh "$ROOT/tests/load.sh")
+case "$got" in
+    "load "[0-9]*" on "[1-9]*" CPUs") ok load_line ;;
+    *) bad load_line "got '$got'" ;;
+esac
 
 # ---- time budgets (tests/budget.sh, tests/load.sh) ----
 

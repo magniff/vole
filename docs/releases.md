@@ -2301,6 +2301,14 @@ the gate lists the SKIP lines under its table. A case's time limit
 to 8 times, while the load average is above the CPUs
 (`tests/watchdog.sh`: parallel agents made the litmus cases time out); a
 program killed at its limit fails with `timed out: killed after N s ...`.
+The load and the CPUs are `tests/load.sh`'s: on Linux the CPUs are the
+cgroup's quota when it is lower (a container's `--cpus`). In the
+linux-aarch64 container the load average is the virtual machine's: a
+host loaded by other work is invisible there (its stolen time counts as
+running), so `volec test` judges a case stopped by `--timeout` by the
+processor time it used: under half the limit, it was waiting, and runs
+again (twice at most). Off macOS, `example_build` skips the examples on
+std::gpu and std::window (`SKIP example_build NAME: ...`).
 `tests/runner/run.sh` checks these pieces of the runner.
 
 The seed keeps its own tests, run with cargo:

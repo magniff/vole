@@ -1243,6 +1243,10 @@ case $(want example_build) in
             *) eb_host="" ;;
         esac
         if [ "$TARGET" = "$eb_host" ]; then
+            # (0.25.2) Off macOS, the examples on std::gpu, std::window or
+            # std::objc (Metal, Cocoa, libobjc) are skipped, with why: the
+            # ones naming them in code (not a comment), or whose case says
+            # `// REQUIRES: metal`.
             for m in "$ROOT"/examples/*/main.vl "$ROOT"/examples/*/*/main.vl; do
                 [ -f "$m" ] || continue
                 ex=${m%/main.vl}
@@ -1253,6 +1257,18 @@ case $(want example_build) in
                 esac
                 # (a folder of a program's modules, not an example)
                 [ -f "${m%/main.vl}/../main.vl" ] && case "$ex" in */*) continue ;; esac
+                case "$TARGET" in
+                    *-macos) ;;
+                    *)
+                        if find "${m%/main.vl}" -name '*.vl' -exec cat {} + | grep -vE '^[[:space:]]*//' \
+                                | grep -qE 'std::(gpu|window|objc)|use std::\{[^}]*(gpu|window|objc)::' \
+                                || grep -lxF "// SOURCE: examples/$ex/main.vl" "$ROOT"/tests/examples/*.test 2>/dev/null \
+                                    | xargs grep -qx '// REQUIRES: metal' 2>/dev/null; then
+                            skipped example_build "example_build $ex: std::gpu and std::window need macOS (Metal, Cocoa)"
+                            count=$((count + 1))
+                            continue
+                        fi ;;
+                esac
                 if "$COMPILER" "$m" -o "$WORK/example_build.bin" >"$WORK/example_build.out" 2>&1; then
                     echo "example_build pass" >>"$TALLY"
                 else
@@ -1289,17 +1305,18 @@ esac
 # transcript; category "walkthrough".
 case $(want walkthrough) in
     y)
-        while read -r status _; do
+        while read -r status rest; do
             case "$status" in
                 pass) echo "walkthrough pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "walkthrough fail" >>"$TALLY"; count=$((count + 1)) ;;
+                skip) skipped walkthrough "walkthrough $rest"; count=$((count + 1)) ;;
             esac
         done <"$WORK/walkthrough.out"
-        if ! grep -q '^pass' "$WORK/walkthrough.out"; then
+        if ! grep -qE '^(pass|skip)' "$WORK/walkthrough.out"; then
             echo "walkthrough fail" >>"$TALLY"
             count=$((count + 1))
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|skip)/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
         ;;
 esac
 

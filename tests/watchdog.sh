@@ -13,8 +13,9 @@
 # limit, the extensions and the load), for the runner's failure message;
 # it exits by itself as soon as PID is gone. Used by tests/run.sh and the
 # runners of tests/book, tests/guide and tests/fuzz.
-# $VOLE_WATCHDOG_LOAD stands for the load average (tests/runner/run.sh
-# checks the extensions with it).
+# The load and the CPUs are tests/load.sh's (on Linux, a container's CPU
+# quota). $VOLE_WATCHDOG_LOAD stands for the load average
+# (tests/runner/run.sh checks the extensions with it).
 
 LC_ALL=C
 export LC_ALL
@@ -25,29 +26,19 @@ PID=$2
 FILE=${3:-}
 EXTEND=${VOLE_WATCHDOG_EXTEND:-8}
 
-cpus() {
-    n=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-    case "$n" in ''|*[!0-9]*) echo 1 ;; *) echo "$n" ;; esac
-}
-
-load1() {
-    if [ -n "${VOLE_WATCHDOG_LOAD:-}" ]; then
-        echo "$VOLE_WATCHDOG_LOAD"
-        return
-    fi
-    l=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1 }')
-    [ -n "$l" ] || l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
-    echo "${l:-0}"
-}
+LOAD_SH="$(dirname "$0")/load.sh"
 
 waited=0
 deadline=$LIMIT
 ext=0
 while kill -0 "$PID" 2>/dev/null; do
     if [ "$waited" -ge "$deadline" ]; then
-        load=$(load1)
-        ncpu=$(cpus)
-        if [ "$ext" -lt "$EXTEND" ] && awk -v l="$load" -v n="$ncpu" 'BEGIN { exit !(l + 0 > n + 0) }'; then
+        # tests/load.sh: `load L on N CPUs`, and whether L is above N
+        line=$(VOLE_TEST_LOAD=${VOLE_WATCHDOG_LOAD:-${VOLE_TEST_LOAD:-}} sh "$LOAD_SH")
+        loaded=$?
+        load=$(echo "$line" | awk '{ print $2 }')
+        ncpu=$(echo "$line" | awk '{ print $4 }')
+        if [ "$ext" -lt "$EXTEND" ] && [ "$loaded" -eq 0 ]; then
             ext=$((ext + 1))
             deadline=$((deadline + LIMIT))
             continue
