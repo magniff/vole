@@ -1,0 +1,264 @@
+// The WGSL of sph, compiled at run time by std::gpu::wgsl. One module per
+// kernel (a layout is the bindings a module uses, so each kernel's bind
+// group has exactly its entries): COMMON (the uniform and the grid's
+// cell index) and the kernel's own bindings and entry point.
+//
+// The particles: pos, vel (metres, metres a second), acc; rho (kg/m^2
+// in 2D); cell (the grid cell of each particle), counts, starts and
+// cursor (per cell, the counting sort), order (particles sorted by cell).
+// Kernels per substep: cell, clear, count, scan (the prefix sum),
+// scatter (the sort), density, force (pressure and viscosity), integrate.
+
+// The uniform (sim.vl packs it as 28 f32s; the integers are exact in f32).
+// cp: the 2D kernels' constants: poly6 4/(pi h^8), spiky 30/(pi h^5)
+// (its gradient), and the viscosity's Laplacian 40/(pi h^5) times (h - r).
+pub const COMMON: [u8] = "const PI: f32 = 3.14159265;\n\
+    struct U {\n\
+    n: f32, cells_x: f32, cells_y: f32, cells: f32,\n\
+    h: f32, h2: f32, dt: f32, rho0: f32,\n\
+    k: f32, mass: f32, mu: f32, stir: f32,\n\
+    g: vec2<f32>, bx: vec2<f32>,\n\
+    mouse: vec2<f32>, mouse_v: vec2<f32>,\n\
+    stir_r: f32, vmax: f32, restitution: f32, pad: f32,\n\
+    cp: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    fn cell_xy(p: vec2<f32>) -> vec2<i32> {\n\
+    let cx = clamp(i32(floor(p.x / u.h)), 0, i32(u.cells_x) - 1);\n\
+    let cy = clamp(i32(floor(p.y / u.h)), 0, i32(u.cells_y) - 1);\n\
+    return vec2<i32>(cx, cy);\n\
+    }\n";
+
+// cell[i] = the grid cell of particle i.
+pub const CELL: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> cell: array<u32>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= arrayLength(&cell)) { return; }\n\
+    let c = cell_xy(pos[i]);\n\
+    cell[i] = u32(c.y) * u32(u.cells_x) + u32(c.x);\n\
+    }\n";
+
+// counts[c] = 0 for every cell (the padded length).
+pub const CLEAR: [u8] = "@group(0) @binding(0) var<storage, read_write> counts: array<atomic<u32>>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    if (gid.x < arrayLength(&counts)) { atomicStore(&counts[gid.x], 0u); }\n\
+    }\n";
+
+// counts[c] += 1 for each particle in cell c: the histogram.
+pub const COUNT: [u8] = "@group(0) @binding(0) var<storage, read> cell: array<u32>;\n\
+    @group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    if (gid.x >= arrayLength(&cell)) { return; }\n\
+    atomicAdd(&counts[cell[gid.x]], 1u);\n\
+    }\n";
+
+// The exclusive prefix sum of counts (len values) into starts (len + 1:
+// starts[len] is the total) and cursor (a copy of starts, for the
+// scatter). One workgroup walks the array in tiles of 256, a
+// Hillis-Steele scan inside each tile, the running total carried along.
+pub const SCAN: [u8] = "@group(0) @binding(0) var<storage, read> counts: array<u32>;\n\
+    @group(0) @binding(1) var<storage, read_write> starts: array<u32>;\n\
+    @group(0) @binding(2) var<storage, read_write> cursor: array<u32>;\n\
+    struct Sc { len: u32, pad0: u32, pad1: u32, pad2: u32 }\n\
+    @group(0) @binding(3) var<uniform> sc: Sc;\n\
+    var<workgroup> tile: array<u32, 256>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let t = lid.x;\n\
+    let n = sc.len;\n\
+    var carry: u32 = 0u;\n\
+    for (var base: u32 = 0u; base < n; base = base + 256u) {\n\
+    let i = base + t;\n\
+    var x: u32 = 0u;\n\
+    if (i < n) { x = counts[i]; }\n\
+    tile[t] = x;\n\
+    workgroupBarrier();\n\
+    for (var off: u32 = 1u; off < 256u; off = off * 2u) {\n\
+    var y: u32 = 0u;\n\
+    if (t >= off) { y = tile[t - off]; }\n\
+    workgroupBarrier();\n\
+    tile[t] = tile[t] + y;\n\
+    workgroupBarrier();\n\
+    }\n\
+    let ex = tile[t] - x + carry;\n\
+    if (i < n) { starts[i] = ex; cursor[i] = ex; }\n\
+    workgroupBarrier();\n\
+    carry = carry + tile[255];\n\
+    workgroupBarrier();\n\
+    }\n\
+    if (t == 0u) { starts[n] = carry; }\n\
+    }\n";
+
+// order[slot] = i: each particle takes the next slot of its cell.
+pub const SCATTER: [u8] = "@group(0) @binding(0) var<storage, read> cell: array<u32>;\n\
+    @group(0) @binding(1) var<storage, read_write> cursor: array<atomic<u32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> order: array<u32>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= arrayLength(&cell)) { return; }\n\
+    let slot = atomicAdd(&cursor[cell[i]], 1u);\n\
+    order[slot] = i;\n\
+    }\n";
+
+// rho[i] = sum over neighbours j (the 3 x 3 cells around i) of m W_poly6(r).
+pub const DENSITY: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> order: array<u32>;\n\
+    @group(0) @binding(3) var<storage, read> starts: array<u32>;\n\
+    @group(0) @binding(4) var<storage, read_write> rho: array<f32>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= u32(u.n)) { return; }\n\
+    let p = pos[i];\n\
+    let c = cell_xy(p);\n\
+    let nx = i32(u.cells_x);\n\
+    let ny = i32(u.cells_y);\n\
+    var sum = 0.0;\n\
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {\n\
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {\n\
+    let cx = c.x + dx;\n\
+    let cy = c.y + dy;\n\
+    if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) { continue; }\n\
+    let cc = u32(cy * nx + cx);\n\
+    for (var k: u32 = starts[cc]; k < starts[cc + 1u]; k = k + 1u) {\n\
+    let d = p - pos[order[k]];\n\
+    let r2 = dot(d, d);\n\
+    if (r2 < u.h2) {\n\
+    let t = u.h2 - r2;\n\
+    sum = sum + u.cp.x * t * t * t;\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n\
+    rho[i] = sum * u.mass;\n\
+    }\n";
+
+// acc[i]: gravity, the pressure (symmetric form, p = k (rho - rho0), no
+// tension), the viscosity, and the mouse's stirring while it is held.
+pub const FORCE: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> order: array<u32>;\n\
+    @group(0) @binding(4) var<storage, read> starts: array<u32>;\n\
+    @group(0) @binding(5) var<storage, read> rho: array<f32>;\n\
+    @group(0) @binding(6) var<storage, read_write> acc: array<vec2<f32>>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= u32(u.n)) { return; }\n\
+    let p = pos[i];\n\
+    let v = vel[i];\n\
+    let ri = rho[i];\n\
+    let pi_term = max(u.k * (ri - u.rho0), 0.0) / (ri * ri);\n\
+    let c = cell_xy(p);\n\
+    let nx = i32(u.cells_x);\n\
+    let ny = i32(u.cells_y);\n\
+    var fp = vec2<f32>(0.0, 0.0);\n\
+    var fv = vec2<f32>(0.0, 0.0);\n\
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {\n\
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {\n\
+    let cx = c.x + dx;\n\
+    let cy = c.y + dy;\n\
+    if (cx < 0 || cy < 0 || cx >= nx || cy >= ny) { continue; }\n\
+    let cc = u32(cy * nx + cx);\n\
+    for (var k: u32 = starts[cc]; k < starts[cc + 1u]; k = k + 1u) {\n\
+    let j = order[k];\n\
+    if (j == i) { continue; }\n\
+    let d = p - pos[j];\n\
+    let r2 = dot(d, d);\n\
+    if (r2 < u.h2 && r2 > 1e-12) {\n\
+    let r = sqrt(r2);\n\
+    let t = u.h - r;\n\
+    let rj = rho[j];\n\
+    let pj_term = max(u.k * (rj - u.rho0), 0.0) / (rj * rj);\n\
+    fp = fp + (pi_term + pj_term) * (u.cp.y * t * t / r) * d;\n\
+    fv = fv + (vel[j] - v) * (u.cp.z * t / rj);\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n\
+    var a = u.g + u.mass * fp + (u.mass * u.mu) * fv;\n\
+    if (u.stir > 0.0) {\n\
+    let rm = length(p - u.mouse);\n\
+    if (rm < u.stir_r) {\n\
+    let w = 1.0 - rm / u.stir_r;\n\
+    a = a + u.stir * w * w * (u.mouse_v - v);\n\
+    }\n\
+    }\n\
+    acc[i] = a;\n\
+    }\n";
+
+// Semi-implicit Euler, a speed cap, and the walls of the box (the
+// particle is held on the wall and its normal velocity reflected, damped).
+pub const INTEGRATE: [u8] = "@group(0) @binding(1) var<storage, read_write> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> vel: array<vec2<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> acc: array<vec2<f32>>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if (i >= u32(u.n)) { return; }\n\
+    var v = vel[i] + acc[i] * u.dt;\n\
+    let sp = length(v);\n\
+    if (sp > u.vmax) { v = v * (u.vmax / sp); }\n\
+    var x = pos[i] + v * u.dt;\n\
+    if (x.x < 0.0) { x.x = 0.0; if (v.x < 0.0) { v.x = -v.x * u.restitution; } }\n\
+    if (x.x > u.bx.x) { x.x = u.bx.x; if (v.x > 0.0) { v.x = -v.x * u.restitution; } }\n\
+    if (x.y < 0.0) { x.y = 0.0; if (v.y < 0.0) { v.y = -v.y * u.restitution; } }\n\
+    if (x.y > u.bx.y) { x.y = u.bx.y; if (v.y > 0.0) { v.y = -v.y * u.restitution; } }\n\
+    pos[i] = x;\n\
+    vel[i] = v;\n\
+    }\n";
+
+// The picture: one instance per particle (a quad, a disc in the
+// fragment), then four instances for the box's walls. The box is turned
+// by the tilt: c the box's centre, cs = (cos, sin) of the tilt, kk the
+// NDC per metre on each axis.
+pub const RENDER: [u8] = "struct Vw { c: vec2<f32>, cs: vec2<f32>, kk: vec2<f32>, radius: f32, n: f32, bx: vec2<f32>, pad: vec2<f32> }\n\
+    @group(0) @binding(0) var<uniform> vw: Vw;\n\
+    @group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;\n\
+    struct OutV { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) col: vec3<f32>, @location(2) kind: f32 }\n\
+    fn palette(t0: f32) -> vec3<f32> {\n\
+    let t = clamp(t0, 0.0, 1.0);\n\
+    let a = vec3<f32>(0.08, 0.18, 0.55);\n\
+    let b = vec3<f32>(0.10, 0.72, 0.90);\n\
+    let c = vec3<f32>(0.98, 0.88, 0.22);\n\
+    let d = vec3<f32>(1.00, 0.98, 0.94);\n\
+    if (t < 0.33) { return mix(a, b, t / 0.33); }\n\
+    if (t < 0.66) { return mix(b, c, (t - 0.33) / 0.33); }\n\
+    return mix(c, d, (t - 0.66) / 0.34);\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> OutV {\n\
+    var corners = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0));\n\
+    let q = corners[vi];\n\
+    let n = u32(vw.n);\n\
+    var world = vec2<f32>(0.0, 0.0);\n\
+    var col = vec3<f32>(0.0, 0.0, 0.0);\n\
+    var kind = 0.0;\n\
+    if (ii < n) {\n\
+    world = pos[ii] + q * vw.radius;\n\
+    col = palette(length(vel[ii]) / 3.0);\n\
+    } else {\n\
+    let w = vw.bx.x;\n\
+    let hh = vw.bx.y;\n\
+    var ea = array<vec2<f32>, 4>(vec2<f32>(0.0, 0.0), vec2<f32>(w, 0.0), vec2<f32>(w, hh), vec2<f32>(0.0, hh));\n\
+    var eb = array<vec2<f32>, 4>(vec2<f32>(w, 0.0), vec2<f32>(w, hh), vec2<f32>(0.0, hh), vec2<f32>(0.0, 0.0));\n\
+    let e = ii - n;\n\
+    let a = ea[e];\n\
+    let b = eb[e];\n\
+    let dir = normalize(b - a);\n\
+    let nrm = vec2<f32>(-dir.y, dir.x);\n\
+    let half_len = length(b - a) * 0.5 + 0.006;\n\
+    world = (a + b) * 0.5 + dir * (q.x * half_len) + nrm * (q.y * 0.006);\n\
+    col = vec3<f32>(0.70, 0.76, 0.86);\n\
+    kind = 1.0;\n\
+    }\n\
+    let rel = world - vw.c;\n\
+    let r = vec2<f32>(vw.cs.x * rel.x - vw.cs.y * rel.y, vw.cs.y * rel.x + vw.cs.x * rel.y);\n\
+    var o: OutV;\n\
+    o.clip = vec4<f32>(r * vw.kk, 0.0, 1.0);\n\
+    o.uv = q;\n\
+    o.col = col;\n\
+    o.kind = kind;\n\
+    return o;\n\
+    }\n\
+    @fragment fn fs(o: OutV) -> @location(0) vec4<f32> {\n\
+    if (o.kind < 0.5 && dot(o.uv, o.uv) > 1.0) { discard; }\n\
+    return vec4<f32>(o.col, 1.0);\n\
+    }\n";

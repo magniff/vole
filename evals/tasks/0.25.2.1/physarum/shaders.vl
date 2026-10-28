@@ -1,0 +1,148 @@
+// The WGSL of physarum, compiled at run time by std::gpu::wgsl. Each
+// kernel is its own module (sim.vl joins COMMON and one kernel): the
+// bindings a module uses are then exactly the ones its bind groups give.
+//
+// Per step: clear the deposit buffer, then each agent senses the trail
+// ahead and to both sides (SENSE), turns toward the strongest, moves and
+// atomically adds DEP fixed-point units into the deposit cell (AGENTS);
+// then the trail is blurred and mixed with its old value, decayed, and
+// the mouse's food or repellent is added (DIFFUSE). The trail is
+// double-buffered: each step reads one and writes the other.
+
+// The uniform (sim.vl packs it, 64 bytes), and the helpers every kernel
+// uses: a hash for the random numbers and the torus indexing (the map
+// wraps at its edges, so no agent leaves it and the blur wraps too).
+pub const COMMON: [u8] = "struct Par {\n\
+    n: u32, w: u32, h: u32, seed: u32,\n\
+    sensor_angle: f32, sensor_dist: f32, turn: f32, speed: f32,\n\
+    decay: f32, diffuse: f32, mouse_x: f32, mouse_y: f32,\n\
+    mouse_r: f32, mouse_amt: f32, pad0: f32, pad1: f32,\n\
+    }\n\
+    struct Agent { x: f32, y: f32, ang: f32, pad: f32 }\n\
+    const DEP: u32 = 1024u;\n\
+    const TAU: f32 = 6.2831853;\n\
+    fn mix32(x0: u32) -> u32 {\n\
+    var x = x0;\n\
+    x = x ^ (x >> 16u);\n\
+    x = x * 0x7feb352du;\n\
+    x = x ^ (x >> 15u);\n\
+    x = x * 0x846ca68bu;\n\
+    x = x ^ (x >> 16u);\n\
+    return x;\n\
+    }\n\
+    fn rnd(s: u32) -> f32 { return f32(mix32(mix32(s) + 0x9e3779b9u) >> 8u) / 16777216.0; }\n\
+    fn wrapf(v: f32, m: f32) -> f32 {\n\
+    var r = v - m * floor(v / m);\n\
+    if (r < 0.0 || r >= m) { r = 0.0; }\n\
+    return r;\n\
+    }\n";
+
+// The agents' start: a uniform position on the map, a random heading.
+pub const INIT: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+    @group(0) @binding(1) var<storage, read_write> agents: array<Agent>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= P.n) { return; }\n\
+    let s = id.x * 4u + P.seed * 2654435761u;\n\
+    let x = rnd(s) * f32(P.w);\n\
+    let y = rnd(s + 1u) * f32(P.h);\n\
+    let a = rnd(s + 2u) * TAU;\n\
+    agents[id.x] = Agent(wrapf(x, f32(P.w)), wrapf(y, f32(P.h)), a, 0.0);\n\
+    }\n";
+
+// Zero the deposit buffer, one atomic a thread.
+pub const CLEAR: [u8] = "@group(0) @binding(0) var<storage, read_write> dep: array<atomic<u32>>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x < arrayLength(&dep)) { atomicStore(&dep[id.x], 0u); }\n\
+    }\n";
+
+// Sense, turn, move, deposit. The sensors read the trail a sensor
+// distance ahead; the agent turns toward the strongest of the three (ties
+// by a coin), as in Jones's Physarum model.
+pub const AGENTS: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+    @group(0) @binding(1) var<storage, read_write> agents: array<Agent>;\n\
+    @group(0) @binding(2) var<storage, read> trail: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> dep: array<atomic<u32>>;\n\
+    fn cell(x: f32, y: f32) -> u32 {\n\
+    let cx = min(u32(floor(wrapf(x, f32(P.w)))), P.w - 1u);\n\
+    let cy = min(u32(floor(wrapf(y, f32(P.h)))), P.h - 1u);\n\
+    return cy * P.w + cx;\n\
+    }\n\
+    fn sense(x: f32, y: f32, ang: f32) -> f32 {\n\
+    return trail[cell(x + cos(ang) * P.sensor_dist, y + sin(ang) * P.sensor_dist)];\n\
+    }\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= P.n) { return; }\n\
+    var a = agents[id.x];\n\
+    let f = sense(a.x, a.y, a.ang);\n\
+    let l = sense(a.x, a.y, a.ang + P.sensor_angle);\n\
+    let r = sense(a.x, a.y, a.ang - P.sensor_angle);\n\
+    if (f >= l && f >= r) {\n\
+    } else if (l > r) {\n\
+    a.ang = a.ang + P.turn;\n\
+    } else if (r > l) {\n\
+    a.ang = a.ang - P.turn;\n\
+    } else if (rnd(id.x * 2u + P.seed * 7919u + 1u) < 0.5) {\n\
+    a.ang = a.ang + P.turn;\n\
+    } else {\n\
+    a.ang = a.ang - P.turn;\n\
+    }\n\
+    a.ang = a.ang - TAU * floor(a.ang / TAU);\n\
+    a.x = wrapf(a.x + cos(a.ang) * P.speed, f32(P.w));\n\
+    a.y = wrapf(a.y + sin(a.ang) * P.speed, f32(P.h));\n\
+    agents[id.x] = a;\n\
+    atomicAdd(&dep[cell(a.x, a.y)], DEP);\n\
+    }\n";
+
+// The trail: each cell's old value plus its deposit (both on the torus),
+// blurred by a 3 x 3 kernel and mixed with the blur by `diffuse`; then
+// the mouse's food (amount > 0) or repellent (< 0) with a linear fall-off
+// to its radius; then decay. The blur keeps the sum, so the total moves
+// only by the deposits and the decay.
+pub const DIFFUSE: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+    @group(0) @binding(1) var<storage, read> src: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> dep: array<atomic<u32>>;\n\
+    @group(0) @binding(3) var<storage, read_write> dst: array<f32>;\n\
+    fn value(x: i32, y: i32) -> f32 {\n\
+    let w = i32(P.w);\n\
+    let h = i32(P.h);\n\
+    let i = u32(((y + h) % h) * w + (x + w) % w);\n\
+    return src[i] + f32(atomicLoad(&dep[i])) / 1024.0;\n\
+    }\n\
+    @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= P.w || id.y >= P.h) { return; }\n\
+    let x = i32(id.x);\n\
+    let y = i32(id.y);\n\
+    let c = value(x, y);\n\
+    let edge = value(x - 1, y) + value(x + 1, y) + value(x, y - 1) + value(x, y + 1);\n\
+    let corner = value(x - 1, y - 1) + value(x + 1, y - 1) + value(x - 1, y + 1) + value(x + 1, y + 1);\n\
+    let blur = (4.0 * c + 2.0 * edge + corner) / 16.0;\n\
+    var v = mix(c, blur, P.diffuse);\n\
+    let d = distance(vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5), vec2<f32>(P.mouse_x, P.mouse_y));\n\
+    if (d < P.mouse_r) { v = v + P.mouse_amt * (1.0 - d / P.mouse_r); }\n\
+    dst[id.y * P.w + id.x] = max(v, 0.0) * (1.0 - P.decay);\n\
+    }\n";
+
+// The picture: a full-screen triangle; each pixel reads its trail cell
+// and maps it through a colour ramp (black, teal, pale yellow).
+pub const RENDER: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+    @group(0) @binding(1) var<storage, read> trail: array<f32>;\n\
+    struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
+    }\n\
+    fn palette(t: f32) -> vec3<f32> {\n\
+    let a = vec3<f32>(0.02, 0.02, 0.06);\n\
+    let b = vec3<f32>(0.04, 0.55, 0.60);\n\
+    let c = vec3<f32>(1.0, 0.95, 0.65);\n\
+    if (t < 0.5) { return mix(a, b, t * 2.0); }\n\
+    return mix(b, c, (t - 0.5) * 2.0);\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let q = clamp(v.uv * vec2<f32>(f32(P.w), f32(P.h)), vec2<f32>(0.0), vec2<f32>(f32(P.w) - 1.0, f32(P.h) - 1.0));\n\
+    let c = vec2<u32>(q);\n\
+    let t = trail[c.y * P.w + c.x];\n\
+    return vec4<f32>(palette(1.0 - exp(-0.06 * t)), 1.0);\n\
+    }\n";

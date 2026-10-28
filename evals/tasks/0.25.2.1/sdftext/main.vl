@@ -1,0 +1,321 @@
+// sdftext: text from a signed-distance-field atlas on the GPU, and a small
+// immediate-mode UI (buttons, a slider, a text field, a scrolling list) in
+// the same page. The atlas is built on the CPU at startup from a vector
+// font (glyphs.vl) by atlas.vl; draw.vl builds the frame's triangles and
+// gfx.vl draws them with the SDF shader; ui.vl holds the widgets and
+// demo.vl lays out the page.
+//
+//   sdftext                          the window: click, drag, type, scroll
+//   sdftext --frames N --shot F.ppm  the window for N frames, then the page as PPM
+//   sdftext --headless [--shot F.ppm] the atlas checks, a scripted run of the
+//                                    widgets (checked), and the page as PPM
+
+mod glyphs;
+mod atlas;
+mod draw;
+mod gfx;
+mod ui;
+mod demo;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use demo::{Demo, H, ID_FIELD, W};
+use draw::Canvas;
+
+// One frame: the page is laid out and drawn into view.
+fn render(demo: inout Demo, cv: inout Canvas, g: inout gfx::Gfx, view: gpu::TextureView,
+    gpa: Gpa) {
+    cv.reset();
+    demo.frame(&cv, gpa);
+    g.draw(cv, W as i64, H as i64, view);
+}
+
+// A press and a release of the left button over the pointer's place.
+fn click(demo: inout Demo, cv: inout Canvas, g: inout gfx::Gfx, view: gpu::TextureView,
+    gpa: Gpa) {
+    demo.ui.inp.pressed = true;
+    demo.ui.inp.down = true;
+    render(&demo, &cv, &g, view, gpa);
+    demo.ui.inp.down = false;
+    demo.ui.inp.released = true;
+    render(&demo, &cv, &g, view, gpa);
+}
+
+// The width, in pixels, of the edge band of the stem of an I at `size`: the
+// pixels across the middle row whose red is neither the ground nor the ink.
+// An SDF edge stays a pixel or two wide at any size; a bitmap's grows.
+fn edge_band(g: inout gfx::Gfx, size: f64, gpa: Gpa) -> i64 {
+    var cv = Canvas::new_in(gpa, 1.0);
+    cv.text("I", 20.0, 20.0, size, 0.0, ui::INK);
+    let w = 320;
+    let h = 200;
+    let img = g.snapshot_in(cv, w, h, gpa);
+    let header = format_in(f"P6\n{w} {h}\n255\n", gpa).len();
+    let px = img.as_slice();
+    let y = (20.0 + size * 0.5) as i64;
+    var band = 0;
+    for x in 0..w {
+        let r = px[header + (y * w + x) * 3];
+        if r > 30 && r < 220 {
+            band += 1;
+        }
+    }
+    band
+}
+
+fn check(ok: bool, what: [u8], fails: inout i64) {
+    if ok {
+        println(f"PASS {what}");
+    } else {
+        println(f"FAIL {what}");
+        fails += 1;
+    }
+}
+
+fn headless(shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    var fails = 0;
+    let t0 = monotonic_now();
+    let a = atlas::build(gpa);
+    let built_ms = monotonic_now().saturating_sub(t0).as_secs_f64() * 1000.0;
+    println(f"atlas: built {atlas::WIDTH}x{atlas::HEIGHT} in {built_ms:.2} ms on the CPU");
+    fails += atlas::report(a, gpa);
+
+    var g = gfx::Gfx::new_in(a.px.as_slice(), gpa)?;
+    let back = g.atlas_readback_in(gpa);
+    var differ = 0;
+    for i in 0..a.px.len() {
+        if back[i] != a.px[i] {
+            differ += 1;
+        }
+    }
+    println(f"atlas: {back.len()} texels read back from the GPU, {differ} differ from the CPU's");
+    check(back.len() == a.px.len() && differ == 0, "the GPU holds the atlas the CPU built", &fails);
+
+    let target = g.dev.texture(W as i64, H as i64, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let view = target.view();
+    var cv = Canvas::new_in(gpa, 1.0);
+    var demo = Demo::new_in(gpa);
+
+    // the counter: hover, then two clicks on +
+    render(&demo, &cv, &g, view, gpa);
+    let p = demo::plus_at(W);
+    demo.ui.inp.mx = p[0] + p[2] / 2.0;
+    demo.ui.inp.my = p[1] + p[3] / 2.0;
+    render(&demo, &cv, &g, view, gpa);
+    check(demo.ui.hot == demo::ID_PLUS, "the pointer over + is hot", &fails);
+    click(&demo, &cv, &g, view, gpa);
+    click(&demo, &cv, &g, view, gpa);
+    println(f"counter after two clicks on +: {demo.count}");
+    check(demo.count == 2, "two clicks on + make the count 2", &fails);
+    let mi = demo::minus_at(W);
+    demo.ui.inp.mx = mi[0] + mi[2] / 2.0;
+    demo.ui.inp.my = mi[1] + mi[3] / 2.0;
+    click(&demo, &cv, &g, view, gpa);
+    check(demo.count == 1, "a click on - makes it 1", &fails);
+
+    // the slider: press at the middle, drag to 80%, release
+    let s = demo::slider_at(W);
+    demo.ui.inp.mx = s[0] + s[2] * 0.5;
+    demo.ui.inp.my = s[1] + s[3] / 2.0;
+    demo.ui.inp.pressed = true;
+    demo.ui.inp.down = true;
+    render(&demo, &cv, &g, view, gpa);
+    demo.ui.inp.pressed = false;
+    demo.ui.inp.mx = s[0] + s[2] * 0.8;
+    render(&demo, &cv, &g, view, gpa);
+    demo.ui.inp.down = false;
+    demo.ui.inp.released = true;
+    render(&demo, &cv, &g, view, gpa);
+    println(f"slider after dragging to 80%: {demo.slider:.3}");
+    check((demo.slider - 0.8).abs() < 0.01, "the slider follows the pointer to 0.80", &fails);
+
+    // the text field: click, type, backspace
+    let f = demo::field_at(W);
+    demo.ui.inp.mx = f[0] + 20.0;
+    demo.ui.inp.my = f[1] + f[3] / 2.0;
+    click(&demo, &cv, &g, view, gpa);
+    check(demo.ui.focus == ID_FIELD, "a click in the field gives it focus", &fails);
+    for b in "vole sdf".bytes() {
+        demo.ui.inp.typed.push(b);
+    }
+    render(&demo, &cv, &g, view, gpa);
+    demo.ui.inp.backspace = true;
+    render(&demo, &cv, &g, view, gpa);
+    println(f"field after typing \"vole sdf\" and Backspace: \"{demo.field.as_slice()}\"");
+    check(demo.field.as_slice() == "vole sd", "the field holds \"vole sd\"", &fails);
+
+    // the list: wheel down 3 lines, then click the row under the pointer
+    let l = demo::list_at(W);
+    demo.ui.inp.mx = l[0] + 100.0;
+    demo.ui.inp.my = l[1] + 53.0;
+    demo.ui.inp.wheel = -3.0;
+    render(&demo, &cv, &g, view, gpa);
+    println(f"list scrolled to {demo.scroll} px");
+    click(&demo, &cv, &g, view, gpa);
+    println(f"list: row {demo.selected} selected");
+    check(demo.selected == 11, "the list shows row 11 under the pointer after 3 lines", &fails);
+    demo.ui.inp.mx = -1.0;
+    demo.ui.inp.my = -1.0;
+    demo.ui.inp.backspace = false;
+
+    // crisp at any size: the edge band of an I stays about the same width
+    let small = edge_band(&g, 12.0, gpa);
+    let mid = edge_band(&g, 40.0, gpa);
+    let big = edge_band(&g, 120.0, gpa);
+    println(f"edge band of an I: {small} px at 12, {mid} px at 40, {big} px at 120");
+    check(small >= 1 && small <= 4 && mid <= 4 && big <= 4, "the edge stays 1 to 4 px wide at 12, 40 and 120 px", &fails);
+
+    // the page itself, as a PPM
+    if shot.len() > 0 {
+        cv.reset();
+        demo.frame(&cv, gpa);
+        let img = g.snapshot_in(cv, W as i64, H as i64, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"sdftext: cannot write {shot}");
+            return Ok(1);
+        }
+        println(f"wrote {shot}");
+    }
+    if fails == 0 {
+        println(f"all checks pass: {fails} failures");
+    } else {
+        println(f"checks failed: {fails} failures");
+    }
+    Ok(if fails == 0 { 0 } else { 1 })
+}
+
+fn windowed(frames: i64, shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sdftext: no window server (try --headless)");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("sdftext", W as i64, H as i64)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("sdftext: no window");
+            return Ok(1);
+        }
+    };
+    let sz = win.size();
+    let k = sz.scale;
+    let a = atlas::build(gpa);
+    var g = gfx::Gfx::new_in(a.px.as_slice(), gpa)?;
+    var surf = g.inst.surface(g.dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    var pw = sz.w;
+    var ph = sz.h;
+    surf.configure(g.dev, pw, ph);
+    var cv = Canvas::new_in(gpa, k);
+    var demo = Demo::new_in(gpa);
+    var done = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                cv.reset();
+                demo.frame(&cv, gpa);
+                match surf.frame() {
+                    Ok(f) => {
+                        g.draw(cv, pw, ph, f.texture.view());
+                        f.present(&g.queue);
+                    }
+                    Err(_) => {}
+                }
+                done += 1;
+                if frames > 0 && done >= frames {
+                    if shot.len() > 0 {
+                        let img = g.snapshot_in(cv, pw, ph, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"sdftext: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                demo.ui.inp.mx = m.x / k;
+                demo.ui.inp.my = m.y / k;
+                match m.action {
+                    MouseAction::Press => {
+                        match m.button {
+                            Button::Left => {
+                                demo.ui.inp.pressed = true;
+                                demo.ui.inp.down = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Release => {
+                        match m.button {
+                            Button::Left => {
+                                demo.ui.inp.released = true;
+                                demo.ui.inp.down = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Move => {}
+                }
+            }
+            Ok(Event::Scroll(s)) => {
+                demo.ui.inp.wheel += if s.precise { s.dy / 24.0 } else { s.dy };
+            }
+            Ok(Event::Text(t)) => {
+                for i in 0..(t.len as i64) {
+                    demo.ui.inp.typed.push(t.bytes[i]);
+                }
+            }
+            Ok(Event::Key(kk)) => {
+                if kk.pressed {
+                    match kk.key {
+                        Logical::Named(Named::Backspace) => demo.ui.inp.backspace = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                pw = z.w;
+                ph = z.h;
+                surf.configure(g.dev, pw, ph);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    Ok(0)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("sdftext", gpa)
+        .about("SDF text and a small UI on the GPU: a window, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: the atlas checks, a scripted run, the numbers"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the page as a PPM image (headless, or the window with --frames)"));
+    let m = cli.parse_or_exit(env::args());
+    let shot = m.get("shot").unwrap_or("");
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    let result = if m.flag("headless") {
+        headless(shot, gpa)
+    } else {
+        windowed(frames, shot, gpa)
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            1
+        }
+    }
+}

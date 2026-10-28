@@ -1,0 +1,335 @@
+// sph: smoothed particle hydrodynamics on the GPU (std::gpu, WGSL compute
+// kernels), 102,400 particles in a tank drawn into a window (std::window).
+// The neighbour search is a grid by counting sort (a histogram, a prefix
+// sum, a scatter), all on the GPU.
+//
+//   sph                          the window: drag the mouse to stir, arrows tilt
+//   sph --headless [--frames N]  no window: the checks, and --shot FILE.ppm
+//
+// cpu.vl holds the constants and the CPU side of the checks, sim.vl the
+// GPU side, shaders.vl the WGSL.
+
+mod cpu;
+mod shaders;
+mod sim;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use sim::{Params, Sim};
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The headless run's tilt and stir, by frame: the box rocks (2 s a turn),
+// and the mouse circles the middle of the tank for the second second.
+fn scripted(f: i64) -> Params {
+    let t = f as f64 / 60.0;
+    var p = Params::rest();
+    p.tilt = 0.35 * (2.0 * std::f64::consts::PI * t / 2.0).sin();
+    if t >= 0.5 && t < 2.0 {
+        let a = 3.0 * (t - 0.5);
+        let r = 0.35;
+        let mx = cpu::BOX_W / 2.0 + r * a.cos();
+        let my = cpu::BOX_H / 2.0 + r * a.sin();
+        p.stir = true;
+        p.mx = mx;
+        p.my = my;
+        p.mvx = -3.0 * r * a.sin();
+        p.mvy = 3.0 * r * a.cos();
+    }
+    p
+}
+
+// The headless run: the sort and the scan checked against the CPU, then
+// `frames` frames of 1/60 s of the scripted tank, the density and the
+// escapes read back; then the shot.
+fn headless(frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    println(f"particles {cpu::N}, grid {s.cx} x {s.cy} cells of {cpu::H} m, padded to {s.padded}");
+    let (bad0, msg0) = s.check_sort(gpa);
+    println(f"sort at the start (counts, prefix sum, order vs CPU): {bad0} wrong {msg0.as_slice()}");
+    let scan_bad = s.check_scan(cpu::test_counts(100003, gpa).as_slice(), gpa);
+    println(f"prefix sum of 100003 counts vs CPU: {scan_bad} wrong");
+    let sub_dt = cpu::SIM_DT;
+    let substeps = ((1.0 / 60.0) / sub_dt).ceil() as i64;
+    println(f"{substeps} substeps of {1.0 / 60.0 / substeps as f64 * 1000.0:.3} ms a frame");
+    var mean0 = 0.0;
+    var mean_prev = 0.0;
+    var mean_end = 0.0;
+    let t0 = monotonic_now();
+    for f in 0..frames {
+        var p = scripted(f);
+        p.dt = (1.0 / 60.0) / substeps as f64;
+        s.set_params(p, 1280, 720);
+        var enc = s.dev.encoder();
+        s.step(substeps, &enc);
+        s.queue.submit(enc.finish());
+        if f == 0 {
+            mean0 = s.mean_density();
+            mean_prev = mean0;
+        }
+        if f % 30 == 29 {
+            mean_prev = mean_end;
+            mean_end = s.mean_density();
+            println(f"  frame {f + 1}: mean density {mean_end:.1} ({(mean_end / cpu::RHO0 - 1.0) * 100.0:.2}% of rest)");
+        }
+    }
+    mean_end = s.mean_density();
+    let _ = s.queue.wait_idle();
+    let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / frames as f64;
+    let (bad1, msg1) = s.check_sort(gpa);
+    let esc = s.escaped();
+    let dev_end = (mean_end / cpu::RHO0 - 1.0).abs();
+    let settle = (mean_end - mean_prev).abs() / cpu::RHO0;
+    let steady = dev_end < 0.05 && settle < 0.01;
+    println(f"{frames} frames: {ms:.2} ms a frame ({substeps} substeps each)");
+    println(f"sort after the run (wrong entries): {bad1} {msg1.as_slice()}");
+    println(f"mean density: {mean0:.1} at the first frame, {mean_end:.1} at the end ({dev_end * 100.0:.2}% off rest)");
+    println(f"density settling: the last 30 frames moved it {settle * 100.0:.3}% of rest");
+    println(f"particles outside the box or not finite: {esc}");
+    if shot.len() > 0 {
+        let img = s.snapshot_in(1280, 720, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"sph: cannot write {shot}");
+            return 1;
+        }
+        println(f"shot: {shot}");
+    }
+    let ok = bad0 == 0 && bad1 == 0 && scan_bad == 0 && esc == 0 && steady;
+    println(f"checks: sort {verdict(bad0 == 0 && bad1 == 0)}, prefix sum {verdict(scan_bad == 0)}, escapes {verdict(esc == 0)}, density {verdict(steady)}");
+    if ok { 0 } else { 1 }
+}
+
+// The mouse, the keys and the tilt, between frames.
+struct Input {
+    left: bool,
+    // the arrow keys: -1 tilts left, 1 right, 0 none
+    tilt_dir: i64,
+    tilt: f64,
+    // the pointer, in window pixels
+    x: f64,
+    y: f64,
+    paused: bool,
+    reset: bool,
+    quit: bool,
+}
+
+fn on_key(inp: inout Input, key: Logical, pressed: bool) {
+    match key {
+        Logical::Char(c) => {
+            if pressed && c == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if pressed && c == 'r' as u32 {
+                inp.reset = true;
+            } else if pressed && c == 'q' as u32 {
+                inp.quit = true;
+            }
+        }
+        Logical::Named(Named::ArrowLeft) => inp.tilt_dir = if pressed { -1 } else { 0 },
+        Logical::Named(Named::ArrowRight) => inp.tilt_dir = if pressed { 1 } else { 0 },
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+}
+
+// The window: the frame loop steps the tank by the frame's time (in
+// substeps of at most SIM_DT; at most `max_substeps`), draws it, and
+// reads the mouse and keys between frames.
+fn windowed(max_substeps: i64, frames_max: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sph: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("sph", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("sph: no window");
+            return 1;
+        }
+    };
+    var s = match Sim::new_in(Format::Bgra8Unorm, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let sz = win.size();
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input {
+        left: false, tilt_dir: 0, tilt: 0.0, x: 0.0, y: 0.0, paused: false, reset: false,
+        quit: false,
+    };
+    let start = monotonic_now();
+    var prev = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    var last_mx = cpu::BOX_W / 2.0;
+    var last_my = cpu::BOX_H / 2.0;
+    var last_bx = 0.0;
+    var last_by = 0.0;
+    var substeps_sum = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                // the step follows the display's clock, within limits that
+                // keep it stable after a stall
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 {
+                    dt = 1.0 / 60.0;
+                }
+                if dt < 1.0 / 240.0 {
+                    dt = 1.0 / 240.0;
+                }
+                prev = now;
+                inp.tilt = (inp.tilt + inp.tilt_dir as f64 * 0.9 * dt).clamp(-cpu::TILT_MAX, cpu::TILT_MAX);
+                if inp.reset {
+                    s.reset(gpa);
+                    inp.reset = false;
+                }
+                let (mx, my) = cpu::to_box(inp.x, inp.y, surf.width as f64, surf.height as f64, inp.tilt);
+                var mvx = (mx - last_mx) / dt;
+                var mvy = (my - last_my) / dt;
+                mvx = mvx.clamp(-4.0, 4.0);
+                mvy = mvy.clamp(-4.0, 4.0);
+                last_mx = mx;
+                last_my = my;
+                // the substeps: the frame's time in steps of at most SIM_DT
+                var substeps = if inp.paused { 0 } else { (dt / cpu::SIM_DT).ceil() as i64 };
+                if substeps > max_substeps {
+                    substeps = max_substeps;
+                }
+                let sub_dt = if substeps > 0 { dt / substeps as f64 } else { cpu::SIM_DT };
+                let p = Params {
+                    dt: sub_dt, tilt: inp.tilt, stir: inp.left && !inp.paused, mx: mx, my: my,
+                    mvx: mvx, mvy: mvy,
+                };
+                s.set_params(p, surf.width, surf.height);
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = s.dev.encoder();
+                        s.step(substeps, &enc);
+                        s.draw(&enc, f.texture.view());
+                        s.queue.submit(enc.finish());
+                        f.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                substeps_sum += substeps;
+                if frames == 1 {
+                    first = now;
+                }
+                if frames_max > 0 && frames >= frames_max {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"{frames} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps), {substeps_sum / frames} substeps a frame, {cpu::N} particles");
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(surf.width, surf.height, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"sph: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        if m.button == Button::Left {
+                            inp.left = true;
+                        }
+                    }
+                    MouseAction::Release => {
+                        if m.button == Button::Left {
+                            inp.left = false;
+                        }
+                    }
+                    MouseAction::Move => {}
+                }
+                inp.x = m.x;
+                inp.y = m.y;
+            }
+            Ok(Event::Key(k)) => {
+                if !k.repeat {
+                    on_key(&inp, k.key, k.pressed);
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit {
+            break;
+        }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("sph", gpa)
+        .about("Smoothed particle hydrodynamics on the GPU: a tank of 102,400 particles")
+        .arg(Arg::flag("headless").help("no window: the checks, then --shot"))
+        .arg(Arg::option("frames").value_name("N").default("120")
+            .help("headless: frames of 1/60 s (the scripted tilt and stir); window: quit after N frames"))
+        .arg(Arg::option("substeps").value_name("N").default("80")
+            .help("window: the most substeps a frame (the frame's time in steps of 0.25 ms)"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the last frame as a PPM image (headless, or window with --frames)"));
+    let m = cli.parse_or_exit(env::args());
+    let frames = match parse_int(m.get("frames").unwrap_or("120")) {
+        Ok(x) => x,
+        Err(_) => 120,
+    };
+    let subs = match parse_int(m.get("substeps").unwrap_or("80")) {
+        Ok(x) => x,
+        Err(_) => 80,
+    };
+    if frames < 0 || subs < 1 {
+        eprintln("sph: --frames 0 or more, --substeps 1 or more");
+        return 2;
+    }
+    if m.flag("headless") {
+        if frames < 1 {
+            eprintln("sph: --headless needs --frames 1 or more");
+            return 2;
+        }
+        return headless(frames, m.get("shot").unwrap_or(""), gpa);
+    }
+    windowed(subs, frames, m.get("shot").unwrap_or(""), gpa)
+}

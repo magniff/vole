@@ -1,0 +1,361 @@
+// The model files' formats: the JSON the safetensors header and
+// vocab.json use (objects, arrays, strings, integers), safetensors
+// itself, and StrMap, a string-keyed table over one arena of bytes.
+
+// The byte at p, as a number.
+pub fn byte_at(s: [u8], p: i64) -> i64 {
+    s[p] as i64
+}
+
+pub fn skip_ws(s: [u8], p: inout i64) {
+    while p < s.len() && (s[p] == 32 || s[p] == 10 || s[p] == 13 || s[p] == 9) {
+        p += 1;
+    }
+}
+
+// Skips one JSON value of any kind.
+pub fn skip_value(s: [u8], p: inout i64) {
+    skip_ws(s, &p);
+    let c = s[p];
+    if c == 123 || c == 91 {
+        // { or [: skip to the matching close, strings and all
+        var depth = 0;
+        loop {
+            let d = s[p];
+            if d == 34 {
+                var q = p;
+                skip_string(s, &q);
+                p = q;
+                continue;
+            }
+            if d == 123 || d == 91 {
+                depth += 1;
+            }
+            if d == 125 || d == 93 {
+                depth -= 1;
+            }
+            p += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    } else if c == 34 {
+        skip_string(s, &p);
+    } else {
+        while p < s.len() && s[p] != 44 && s[p] != 125 && s[p] != 93 && s[p] != 32 && s[p] != 10 {
+            p += 1;
+        }
+    }
+}
+
+// Skips a string; p at its opening quote, after it on return.
+fn skip_string(s: [u8], p: inout i64) {
+    p += 1;
+    while s[p] != 34 {
+        if s[p] == 92 {
+            p += 2;
+        } else {
+            p += 1;
+        }
+    }
+    p += 1;
+}
+
+// The integer at p (an optional minus sign first).
+pub fn parse_i64(s: [u8], p: inout i64) -> i64 {
+    skip_ws(s, &p);
+    var neg = false;
+    if s[p] == 45 {
+        neg = true;
+        p += 1;
+    }
+    var v: i64 = 0;
+    while p < s.len() && s[p] >= 48 && s[p] <= 57 {
+        v = v * 10 + (s[p] - 48) as i64;
+        p += 1;
+    }
+    if neg { 0 - v } else { v }
+}
+
+fn hex_digit(c: u8) -> i64 {
+    if c >= 48 && c <= 57 {
+        (c - 48) as i64
+    } else if c >= 97 && c <= 102 {
+        (c - 97 + 10) as i64
+    } else {
+        (c - 65 + 10) as i64
+    }
+}
+
+fn hex4(s: [u8], p: i64) -> i64 {
+    hex_digit(s[p]) * 4096 + hex_digit(s[p + 1]) * 256 + hex_digit(s[p + 2]) * 16
+        + hex_digit(s[p + 3])
+}
+
+// Appends the UTF-8 bytes of code point cp.
+pub fn push_utf8(out: inout Buf, cp: i64) {
+    if cp < 128 {
+        out.push(cp as u8);
+    } else if cp < 2048 {
+        out.push((192 + cp / 64) as u8);
+        out.push((128 + cp % 64) as u8);
+    } else if cp < 65536 {
+        out.push((224 + cp / 4096) as u8);
+        out.push((128 + (cp / 64) % 64) as u8);
+        out.push((128 + cp % 64) as u8);
+    } else {
+        out.push((240 + cp / 262144) as u8);
+        out.push((128 + (cp / 4096) % 64) as u8);
+        out.push((128 + (cp / 64) % 64) as u8);
+        out.push((128 + cp % 64) as u8);
+    }
+}
+
+// A JSON string at p (its opening quote) decoded into `out`, escapes
+// and all; p after the closing quote on return.
+pub fn parse_string(s: [u8], p: inout i64, out: inout Buf) {
+    p += 1;
+    while s[p] != 34 {
+        if s[p] == 92 {
+            p += 1;
+            let e = s[p];
+            if e == 117 {
+                var cp = hex4(s, p + 1);
+                p += 4;
+                if cp >= 55296 && cp < 56320 && s[p + 1] == 92 && s[p + 2] == 117 {
+                    let lo = hex4(s, p + 3);
+                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                    p += 6;
+                }
+                push_utf8(&out, cp);
+            } else if e == 110 {
+                out.push(10);
+            } else if e == 116 {
+                out.push(9);
+            } else if e == 114 {
+                out.push(13);
+            } else if e == 98 {
+                out.push(8);
+            } else if e == 102 {
+                out.push(12);
+            } else {
+                out.push(e);
+            }
+            p += 1;
+        } else {
+            out.push(s[p]);
+            p += 1;
+        }
+    }
+    p += 1;
+}
+
+// A string-keyed table: the keys' bytes in one arena, each key's id,
+// value and a hash table over them (open addressing).
+pub struct StrMap {
+    arena: Buf,
+    at: Vec<i64>,
+    len: Vec<i64>,
+    val: Vec<i64>,
+    slots: Vec<i64>,
+    mask: i64,
+}
+
+fn fnv(key: [u8]) -> i64 {
+    var h: u64 = 1469598103934665603;
+    for b in key {
+        h = (h ^ (b as u64)) * 1099511628211;
+    }
+    (h >> 8) as i64
+}
+
+impl StrMap {
+    pub fn new_in(gpa: Gpa, n: i64) -> StrMap {
+        var size: i64 = 16;
+        while size < 2 * n {
+            size = size * 2;
+        }
+        StrMap {
+            arena: Buf::new_in(gpa),
+            at: Vec::new_in(gpa),
+            len: Vec::new_in(gpa),
+            val: Vec::new_in(gpa),
+            slots: Vec::filled_in(size, 0, gpa),
+            mask: size - 1,
+        }
+    }
+
+    pub fn count(self) -> i64 {
+        self.val.len()
+    }
+
+    // The key with id `id` (its bytes, a view).
+    pub fn key(self, id: i64) -> [u8] {
+        let all = self.arena.as_slice();
+        let a = self.at.get(id);
+        all[a..a + self.len.get(id)]
+    }
+
+    pub fn val_of(self, id: i64) -> i64 {
+        self.val.get(id)
+    }
+
+    // The id of key, or -1.
+    pub fn find(self, key: [u8]) -> i64 {
+        var i = fnv(key) & self.mask;
+        loop {
+            let s = self.slots[i];
+            if s == 0 {
+                return -1;
+            }
+            if self.key(s - 1) == key {
+                return s - 1;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    // The value of key, or -1.
+    pub fn get(self, key: [u8]) -> i64 {
+        let id = self.find(key);
+        if id < 0 { -1 } else { self.val.get(id) }
+    }
+
+    // Adds key (not already present) with value v; its id.
+    pub fn add(inout self, key: [u8], v: i64) -> i64 {
+        let id = self.val.len();
+        self.at.push(self.arena.len());
+        self.len.push(key.len());
+        self.arena.push_str(key);
+        self.val.push(v);
+        var i = fnv(key) & self.mask;
+        while self.slots[i] != 0 {
+            i = (i + 1) & self.mask;
+        }
+        self.slots[i] = id + 1;
+        id
+    }
+}
+
+// A safetensors tensor: its name's id in the StrMap, its dtype (bf16 or
+// f32), its byte offset in the file, its element count and shape.
+pub struct Tensor {
+    pub bf16: bool,
+    pub at: i64,
+    pub n: i64,
+    pub rows: i64,
+    pub cols: i64,
+}
+
+// The header of a safetensors file (`file`'s bytes): the tensors, by
+// name (a StrMap whose values index `tensors`), and the data's start.
+pub struct Header {
+    pub names: StrMap,
+    pub tensors: Vec<Tensor>,
+}
+
+// Parses the safetensors header of `file`.
+pub fn parse_header(file: [u8], gpa: Gpa) -> Header {
+    var hlen: i64 = 0;
+    for i in 0..8 {
+        hlen = hlen + (file[i] as i64) * pow2(8 * i);
+    }
+    let base = 8 + hlen;
+    var names = StrMap::new_in(gpa, 1024);
+    var tensors: Vec<Tensor> = Vec::new_in(gpa);
+    var p: i64 = 8;
+    skip_ws(file[0..base], &p);
+    p += 1; // {
+    var name: Buf = Buf::new_in(gpa);
+    loop {
+        skip_ws(file[0..base], &p);
+        if file[p] == 125 {
+            break;
+        }
+        if file[p] == 44 {
+            p += 1;
+            continue;
+        }
+        name.clear();
+        parse_string(file[0..base], &p, &name);
+        skip_ws(file[0..base], &p);
+        p += 1; // :
+        if name.as_slice() == "__metadata__" {
+            skip_value(file[0..base], &p);
+            continue;
+        }
+        var t = Tensor { bf16: false, at: 0, n: 0, rows: 1, cols: 1 };
+        var shape: Vec<i64> = Vec::new_in(gpa);
+        skip_ws(file[0..base], &p);
+        p += 1; // {
+        var key: Buf = Buf::new_in(gpa);
+        loop {
+            skip_ws(file[0..base], &p);
+            if file[p] == 125 {
+                p += 1;
+                break;
+            }
+            if file[p] == 44 {
+                p += 1;
+                continue;
+            }
+            key.clear();
+            parse_string(file[0..base], &p, &key);
+            skip_ws(file[0..base], &p);
+            p += 1; // :
+            skip_ws(file[0..base], &p);
+            if key.as_slice() == "dtype" {
+                var dt: Buf = Buf::new_in(gpa);
+                parse_string(file[0..base], &p, &dt);
+                t.bf16 = dt.as_slice() == "BF16";
+            } else if key.as_slice() == "shape" {
+                p += 1; // [
+                loop {
+                    skip_ws(file[0..base], &p);
+                    if file[p] == 93 {
+                        p += 1;
+                        break;
+                    }
+                    if file[p] == 44 {
+                        p += 1;
+                        continue;
+                    }
+                    shape.push(parse_i64(file[0..base], &p));
+                }
+            } else if key.as_slice() == "data_offsets" {
+                p += 1; // [
+                let a = parse_i64(file[0..base], &p);
+                p += 1; // ,
+                let b = parse_i64(file[0..base], &p);
+                t.at = base + a;
+                t.n = b - a;
+                p += 1; // ]
+            } else {
+                skip_value(file[0..base], &p);
+            }
+        }
+        t.n = if t.bf16 { t.n / 2 } else { t.n / 4 };
+        if shape.len() == 1 {
+            t.cols = shape.get(0);
+        } else if shape.len() >= 2 {
+            t.rows = shape.get(0);
+            t.cols = shape.get(shape.len() - 1);
+            var k = 1;
+            while k + 1 < shape.len() {
+                t.cols = t.cols * shape.get(k);
+                k += 1;
+            }
+        }
+        names.add(name.as_slice(), tensors.len());
+        tensors.push(t);
+    }
+    Header { names: names, tensors: tensors }
+}
+
+fn pow2(k: i64) -> i64 {
+    var v: i64 = 1;
+    for _ in 0..k {
+        v = v * 2;
+    }
+    v
+}

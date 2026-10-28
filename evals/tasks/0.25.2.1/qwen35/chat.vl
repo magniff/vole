@@ -1,0 +1,347 @@
+// The chat: the conversation in the model's chat template, the reply
+// streamed one token per frame (one decode step on the GPU each), the
+// transcript and the input line drawn on a CPU canvas, which the window
+// shows through one fullscreen triangle that samples its pixels.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, RawSurface};
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+use std::time::monotonic_now;
+use model::{MAXSEQ, Net};
+use tok::Tok;
+use gen::{Rng, sample};
+use canvas::{Canvas, H, W};
+
+// Ink and paper.
+const PAPER: u32 = 0x101418;
+const INK: u32 = 0xE6EAF0;
+const DIM: u32 = 0x8A96A6;
+const USER: u32 = 0x7FB8FF;
+const MODEL: u32 = 0x9EE6A6;
+const RULE: u32 = 0x2A323C;
+
+// The picture's shader: one triangle over the window, each fragment
+// reading its canvas pixel from a storage buffer.
+const SHOW: [u8] = "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
+}\n\
+@group(0) @binding(0) var<storage, read> px: array<u32>;\n\
+@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let x = min(u32(v.uv.x * 1024.0), 1023u);\n\
+    let y = min(u32(v.uv.y * 640.0), 639u);\n\
+    let c = px[y * 1024u + x];\n\
+    return vec4<f32>(f32((c >> 16u) & 255u) / 255.0, f32((c >> 8u) & 255u) / 255.0, f32(c & 255u) / 255.0, 1.0);\n\
+}\n";
+
+pub struct Chat {
+    // the conversation so far, in the chat template (what the model reads)
+    pub convo: Vec<u8>,
+    // the transcript as shown ("you: ", "qwen: " and the replies)
+    pub shown: Vec<u8>,
+    // the line being typed
+    pub input: Vec<u8>,
+    // the reply being streamed: its state between frames
+    pub active: bool,
+    pub pos: i64,
+    pub tok: i64,
+    pub reply: Vec<u8>,
+    pub n: i64,
+    pub t_start: f64,
+    // the last reply's speeds: prefill tokens a second, decode tokens a second
+    pub prefill_tps: f64,
+    pub decode_tps: f64,
+    pub temp: f64,
+    pub top_p: f64,
+    pub max_new: i64,
+    pub rng: Rng,
+    pub gpa: Gpa,
+}
+
+pub fn now_secs() -> f64 {
+    monotonic_now().as_secs_f64()
+}
+
+impl Chat {
+    pub fn new_in(temp: f64, top_p: f64, seed: u64, gpa: Gpa) -> Chat {
+        Chat {
+            convo: Vec::new_in(gpa), shown: Vec::new_in(gpa), input: Vec::new_in(gpa),
+            active: false, pos: 0, tok: 0, reply: Vec::new_in(gpa), n: 0, t_start: 0.0,
+            prefill_tps: 0.0, decode_tps: 0.0, temp: temp, top_p: top_p, max_new: 400,
+            rng: Rng::new(seed), gpa: gpa,
+        }
+    }
+
+    // Sends the typed line: the user's turn, then the prompt is prefilled
+    // and the first token sampled. Nothing happens while a reply streams.
+    pub fn send(inout self, net: inout Net, t: Tok) {
+        if self.active || self.input.len() == 0 {
+            return;
+        }
+        self.convo.extend_from_slice("<|im_start|>user\n");
+        self.convo.extend_from_slice(self.input.as_slice());
+        self.convo.extend_from_slice("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        self.shown.extend_from_slice("you: ");
+        self.shown.extend_from_slice(self.input.as_slice());
+        self.shown.extend_from_slice("\nqwen: ");
+        self.input.clear();
+        let ids = t.encode(self.convo.as_slice(), self.gpa);
+        if ids.len() + self.max_new + 2 >= MAXSEQ {
+            // the context is full: start the conversation over
+            self.convo.clear();
+            self.shown.extend_from_slice("(context full: a new conversation)\nqwen: ");
+            return;
+        }
+        net.reset();
+        let t0 = now_secs();
+        for i in 0..ids.len() - 1 {
+            net.step(ids.get(i), i, false);
+        }
+        net.step(ids.get(ids.len() - 1), ids.len() - 1, true);
+        let first = sample(net.logits(), self.temp, self.top_p, &self.rng, self.gpa);
+        self.prefill_tps = ids.len() as f64 / (now_secs() - t0);
+        self.pos = ids.len();
+        self.tok = first;
+        self.n = 0;
+        self.reply.clear();
+        self.active = true;
+        self.t_start = now_secs();
+    }
+
+    // One frame of a reply: its token is shown and fed, the next sampled.
+    pub fn advance(inout self, net: inout Net, t: Tok) {
+        if !self.active {
+            return;
+        }
+        if self.tok == tok::EOS_TEXT || self.tok == tok::IM_END || self.n >= self.max_new
+            || self.pos + 1 >= MAXSEQ {
+            self.finish();
+            return;
+        }
+        let piece = t.decode([self.tok], self.gpa);
+        self.shown.extend_from_slice(piece.as_slice());
+        self.reply.extend_from_slice(piece.as_slice());
+        self.n += 1;
+        net.step(self.tok, self.pos, true);
+        self.pos += 1;
+        self.tok = sample(net.logits(), self.temp, self.top_p, &self.rng, self.gpa);
+        self.decode_tps = self.n as f64 / (now_secs() - self.t_start);
+    }
+
+    fn finish(inout self) {
+        self.convo.extend_from_slice(self.reply.as_slice());
+        self.convo.extend_from_slice("<|im_end|>\n");
+        self.shown.push(10);
+        self.shown.push(10);
+        self.active = false;
+    }
+
+    // Typed text, Backspace, and the input line's end.
+    pub fn type_bytes(inout self, b: [u8]) {
+        if self.input.len() + b.len() < 400 {
+            self.input.extend_from_slice(b);
+        }
+    }
+
+    pub fn backspace(inout self) {
+        if self.input.len() == 0 {
+            return;
+        }
+        var k = self.input.len() - 1;
+        while k > 0 && (self.input.get(k) & 192) == 128 {
+            k -= 1;
+        }
+        self.input.truncate(k);
+    }
+}
+
+// The transcript's rows (start offsets into `shown`, wrapped at `cols`).
+fn rows_of(shown: [u8], cols: i64, gpa: Gpa) -> Vec<i64> {
+    var rs: Vec<i64> = Vec::new_in(gpa);
+    rs.push(0);
+    var col: i64 = 0;
+    for i in 0..shown.len() {
+        let b = shown[i];
+        if b == 10 {
+            rs.push(i + 1);
+            col = 0;
+        } else if (b & 192) != 128 {
+            if col == cols {
+                rs.push(i);
+                col = 0;
+            }
+            col += 1;
+        }
+    }
+    rs
+}
+
+// The picture: header, the last rows of transcript, the input line.
+pub fn draw(c: inout Canvas, chat: Chat, t_secs: f64, gpa: Gpa) {
+    c.clear(PAPER);
+    c.text(16, 14, 2, "Qwen3.5-0.8B, on the GPU (vole, std::gpu)", INK);
+    var stats = Buf::new_in(gpa);
+    if chat.active {
+        stats.push_str(format_in(f"{chat.decode_tps:.1} tok/s, {chat.n} tokens", gpa).as_slice());
+    } else if chat.n > 0 {
+        stats.push_str(format_in(f"last reply {chat.decode_tps:.1} tok/s, prefill {chat.prefill_tps:.1} tok/s", gpa).as_slice());
+    }
+    c.text(W - 16 - 6 * 2 * (stats.len()), 14, 2, stats.as_slice(), MODEL);
+    c.rect(16, 46, W - 32, 2, RULE);
+    let top: i64 = 58;
+    let bottom: i64 = H - 64;
+    let cols: i64 = (W - 32) / 12;
+    let rows_avail: i64 = (bottom - top) / 16;
+    let rs = rows_of(chat.shown.as_slice(), cols, gpa);
+    let all = chat.shown.as_slice();
+    let first = if rs.len() > rows_avail { rs.len() - rows_avail } else { 0 };
+    for r in first..rs.len() {
+        let a = rs.get(r);
+        var e = if r + 1 < rs.len() { rs.get(r + 1) } else { all.len() };
+        if e > a && all[e - 1] == 10 {
+            e -= 1;
+        }
+        // the speaker's name in its colour
+        var ink = INK;
+        if a < all.len() && (all[a] == 121 || all[a] == 113) {
+            ink = if all[a] == 121 { USER } else { MODEL };
+        }
+        c.text(16, top + (r - first) * 16, 2, all[a..e], ink);
+    }
+    c.rect(16, H - 52, W - 32, 2, RULE);
+    var line = Buf::new_in(gpa);
+    let inp = chat.input.as_slice();
+    let inmax = (W - 32) / 12 - 3;
+    let from = if inp.len() > inmax { inp.len() - inmax } else { 0 };
+    line.push_str("> ");
+    line.push_str(inp[from..inp.len()]);
+    if chat.active {
+        line.push_str("   (writing...)");
+    } else {
+        line.push_str("_");
+    }
+    c.text(16, H - 40, 2, line.as_slice(), INK);
+}
+
+// The window: the chat, until Escape or the window closes. `--frames N`
+// quits after N frames (a check) and prints the mean frame time.
+pub fn window(net: inout Net, t: Tok, first: [u8], frames_max: i64, temp: f64, top_p: f64,
+    seed: u64, gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("qwen35: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("Qwen3.5-0.8B", W, H)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("qwen35: no window");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(net.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"qwen35: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(net.dev, sz.w, sz.h);
+    let shader = match net.dev.shader_wgsl(SHOW) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"qwen35: {e}");
+            return 1;
+        }
+    };
+    let desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm);
+    let draw_pipe = match net.dev.render_pipeline(desc) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln(f"qwen35: {e}");
+            return 1;
+        }
+    };
+    var canvas = Canvas::new_in(gpa);
+    let pxbuf = net.dev.buffer(W * H * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+    let group = net.dev.bind_group(draw_pipe.bind_layout(0), [gpu::bind(0, pxbuf)][..]);
+    var chat = Chat::new_in(temp, top_p, seed, gpa);
+    chat.type_bytes(first);
+    var auto_send = first.len() > 0;
+    var frames: i64 = 0;
+    var started = 0.0;
+    var quit = false;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if auto_send {
+                    auto_send = false;
+                    chat.send(&net, t);
+                }
+                if frames == 0 {
+                    started = now_secs();
+                }
+                chat.advance(&net, t);
+                draw(&canvas, chat, now_secs(), gpa);
+                net.queue.write_buffer(pxbuf, 0, gpu::bytes_of_u32(canvas.px.as_slice()));
+                match surf.frame() {
+                    Ok(frame) => {
+                        let target = frame.texture.view();
+                        var enc = net.dev.encoder();
+                        enc.render_pass(PassDesc::color(target), |pass| {
+                            pass.set_pipeline(draw_pipe);
+                            pass.set_bind_group(0, group);
+                            pass.draw(0..3, 0..1);
+                        });
+                        net.queue.submit(enc.finish());
+                        frame.present(&net.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames_max > 0 && frames >= frames_max {
+                    let mean = (now_secs() - started) / (frames - 1) as f64;
+                    println(f"frames {frames}, mean frame {mean * 1000.0:.2} ms");
+                    quit = true;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Named(Named::Enter) => chat.send(&net, t),
+                        Logical::Named(Named::Backspace) => chat.backspace(),
+                        Logical::Named(Named::Escape) => quit = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Text(tx)) => {
+                var b: Vec<u8> = Vec::new_in(gpa);
+                for i in 0..tx.len as i64 {
+                    b.push(tx.bytes[i]);
+                }
+                chat.type_bytes(b.as_slice());
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(net.dev, z.w, z.h),
+            Ok(Event::Close(_)) => quit = true,
+            Ok(Event::Quit) => quit = true,
+            _ => {}
+        }
+        if quit {
+            break;
+        }
+    }
+    0
+}
+

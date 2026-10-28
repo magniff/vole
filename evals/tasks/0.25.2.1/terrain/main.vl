@@ -1,0 +1,268 @@
+// terrain: a procedural fly-over. A heightmap of fractal noise is made on
+// the GPU, drawn as a block mesh with distance-based level of detail, lit
+// by a sun whose shadow map is a depth-only pass, with fog, materials by
+// height and slope, and water at sea level.
+//
+//   terrain                          the fly-over in a window
+//   terrain --frames N               the same, quitting after N frames
+//   terrain --headless               no window: the checks, printed
+//   terrain --headless --cam N --shot FILE.ppm
+//                                    one fixed camera (1, 2 or 3) written as a PPM
+//
+// math.vl: vectors and matrices. terrain.vl: the grid, LOD and index lists.
+// shaders.vl: the WGSL. scene.vl: the GPU objects and a frame's passes.
+
+mod math;
+mod scene;
+mod shaders;
+mod terrain;
+
+use std::{env, gpu};
+use std::fs::File;
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::window::{App, Event, WindowDesc};
+
+use scene::{camera, flyover, Scene};
+use terrain::{BLOCKS, BLOCK, CELLS, LOD_STEPS, SEA, Mesh};
+
+const SHOT_W: i64 = 640;
+const SHOT_H: i64 = 360;
+
+// The heightmap's range, its mean, and the share of it under sea level.
+fn heightmap_report(h: [f32]) -> (f32, f32, f32, f32) {
+    var lo: f32 = 1.0;
+    var hi: f32 = 0.0;
+    var sum: f32 = 0.0;
+    var under: i64 = 0;
+    for v in h.iter() {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+        sum += v;
+        if v < SEA {
+            under += 1;
+        }
+    }
+    let n = h.len() as f32;
+    (lo, hi, sum / n, under as f32 / n)
+}
+
+// Checks that the mesh's triangles per level are what its blocks chose:
+// every block drawn, and a block at step s has (16 / s)^2 cells of 2 triangles.
+fn lod_report(m: inout Mesh) -> bool {
+    var ok = true;
+    var blocks: [i64; 4] = [0, 0, 0, 0];
+    for c in m.chunks.iter() {
+        blocks[terrain::level_of(c.step) as usize] += 1;
+    }
+    var total: i64 = 0;
+    for l in 0..LOD_STEPS {
+        let s = 1 << l;
+        let per = (BLOCK / s) * (BLOCK / s) * 2;
+        total += blocks[l as usize];
+        if m.tris[l as usize] != blocks[l as usize] * per {
+            ok = false;
+        }
+        println(f"  step {s}: {blocks[l as usize]} blocks, {m.tris[l as usize]} triangles");
+    }
+    if total != BLOCKS * BLOCKS {
+        ok = false;
+    }
+    println(f"  total: {total} blocks, {m.triangles()} triangles, {m.indices.len()} indices");
+    ok
+}
+
+// One fixed camera's picture, as BGRA bytes (the readback of the target).
+fn grab(sc: inout Scene, n: i64, gpa: Gpa) -> Result<Vec<u8>, gpu::Error> {
+    let target = sc.dev.texture(SHOT_W, SHOT_H, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    var out = sc.dev.buffer(SHOT_W * SHOT_H * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = sc.dev.encoder();
+    sc.record(&enc, target.view(), camera(n));
+    enc.copy_texture_to_buffer(target, out, SHOT_W * 4);
+    sc.queue.submit(enc.finish());
+    Ok(out.map_read_copy_in(sc.dev, gpa))
+}
+
+// One fixed camera as a PPM file, with its picture's numbers.
+fn shot(sc: inout Scene, n: i64, path: [u8], gpa: Gpa) -> Result<bool, gpu::Error> {
+    let px = grab(&sc, n, gpa)?;
+    var rgb: Vec<u8> = Vec::with_capacity_in(SHOT_W * SHOT_H * 3, gpa);
+    var sums: [i64; 3] = [0, 0, 0];
+    var water: i64 = 0;
+    for i in 0..(SHOT_W * SHOT_H) {
+        let b = px[(i * 4) as usize];
+        let g = px[(i * 4 + 1) as usize];
+        let r = px[(i * 4 + 2) as usize];
+        rgb.push(r);
+        rgb.push(g);
+        rgb.push(b);
+        sums[0] += r as i64;
+        sums[1] += g as i64;
+        sums[2] += b as i64;
+        if b as i64 > r as i64 + 30 {
+            water += 1;
+        }
+    }
+    let n_px = SHOT_W * SHOT_H;
+    println(f"  camera {n}: {SHOT_W} x {SHOT_H}, mean rgb {sums[0] / n_px} {sums[1] / n_px} {sums[2] / n_px}, bluish {water * 100 / n_px}%");
+    var f = match File::create(path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln(f"terrain: cannot create {path}");
+            return Ok(false);
+        }
+    };
+    let header = format_in(f"P6\n{SHOT_W} {SHOT_H}\n255\n", gpa);
+    let _ = f.write(header.as_slice());
+    let _ = f.write(rgb.as_slice());
+    println(f"  wrote {path}");
+    Ok(sums[0] + sums[1] + sums[2] > 0)
+}
+
+// The sun's shadows, checked: the same view with them on and off. Returns
+// the share of the picture they darken.
+fn shadow_share(sc: inout Scene, n: i64, gpa: Gpa) -> Result<f32, gpu::Error> {
+    sc.shadows = true;
+    let lit = grab(&sc, n, gpa)?;
+    sc.shadows = false;
+    let flat = grab(&sc, n, gpa)?;
+    sc.shadows = true;
+    var dark: i64 = 0;
+    for i in 0..(SHOT_W * SHOT_H) {
+        let k = (i * 4) as usize;
+        let a = lit[k] as i64 + lit[k + 1] as i64 + lit[k + 2] as i64;
+        let b = flat[k] as i64 + flat[k + 1] as i64 + flat[k + 2] as i64;
+        if b - a > 60 {
+            dark += 1;
+        }
+    }
+    Ok(dark as f32 / (SHOT_W * SHOT_H) as f32)
+}
+
+fn headless(shot_path: [u8], shot_cam: i64, gpa: Gpa) -> Result<i32, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var sc = Scene::new(dev, queue, SHOT_W, SHOT_H, gpa)?;
+    sc.bake();
+    var all = true;
+
+    println("noise: a fractal heightmap, made on the GPU");
+    let (lo, hi, mean, under) = heightmap_report(sc.read_heights());
+    println(f"  {CELLS + 1} x {CELLS + 1} points: min {lo:.3}, max {hi:.3}, mean {mean:.3}, {under * 100.0:.1}% under sea level ({SEA})");
+    let noise_ok = lo >= 0.0 && hi <= 1.0 && hi - lo > 0.5 && under > 0.05 && under < 0.6;
+    println(f"  range ok: {noise_ok}");
+    all = all && noise_ok;
+
+    println("lod: triangles per block step, by camera");
+    for n in 1..4 {
+        sc.mesh.select(camera(n).eye);
+        println(f"camera {n}:");
+        let ok = lod_report(&sc.mesh);
+        all = all && ok;
+    }
+
+    println("shadows: the sun's shadow map, on and off in each camera's view");
+    for n in 1..4 {
+        let share = shadow_share(&sc, n, gpa)?;
+        let ok = share > 0.005 && share < 0.6;
+        println(f"  camera {n}: {share * 100.0:.1}% of the picture is in shadow");
+        all = all && ok;
+    }
+
+    if shot_path.len() > 0 {
+        let wrote = shot(&sc, shot_cam, shot_path, gpa)?;
+        all = all && wrote;
+    }
+
+    println(f"checks: {if all { "all ok" } else { "FAILED" }}");
+    Ok(if all { 0 } else { 1 })
+}
+
+fn window_mode(frames: i64, gpa: Gpa) -> Result<i32, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("terrain: no display; use --headless");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("terrain", 960, 540)) {
+        Ok(w) => w,
+        Err(_) => return Ok(1),
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let px = win.size();
+    surf.configure(dev, px.w, px.h);
+    var sc = Scene::new(dev, queue, px.w, px.h, gpa)?;
+    sc.bake();
+    var t: f32 = 0.0;
+    var n: i64 = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                t += 1.0 / 60.0;
+                n += 1;
+                match surf.frame() {
+                    Ok(frame) => {
+                        var enc = sc.dev.encoder();
+                        sc.record(&enc, frame.texture.view(), flyover(t));
+                        sc.queue.submit(enc.finish());
+                        frame.present(&sc.queue);
+                    }
+                    Err(_) => {}
+                }
+                if frames > 0 && n >= frames {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, s)) => {
+                surf.configure(sc.dev, s.w, s.h);
+                sc.resize(s.w, s.h);
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    Ok(0)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    var is_headless = false;
+    var shot_path: [u8] = "".as_bytes();
+    var shot_cam: i64 = 1;
+    var frames: i64 = 0;
+    var prev = "";
+    for a in env::args().skip(1) {
+        if prev == "--shot" {
+            shot_path = a.as_bytes();
+        } else if prev == "--cam" {
+            shot_cam = parse_int(a).unwrap_or(1);
+        } else if prev == "--frames" {
+            frames = parse_int(a).unwrap_or(0);
+        }
+        if a == "--headless" {
+            is_headless = true;
+        }
+        prev = a;
+    }
+    let r = if is_headless {
+        headless(shot_path, shot_cam, gpa)
+    } else {
+        window_mode(frames, gpa)
+    };
+    match r {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln(f"terrain: {e}");
+            1
+        }
+    }
+}

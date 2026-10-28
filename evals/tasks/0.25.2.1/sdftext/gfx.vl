@@ -1,0 +1,132 @@
+// The GPU side: one render pipeline draws the canvas's triangles. A solid
+// vertex is its colour; a glyph vertex samples the SDF atlas (one R8
+// texture, uploaded once) and its edge is antialiased from the screen-space
+// derivative of the distance, so the edge stays one pixel wide at any scale.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage, VertexFormat, VertexLayout};
+use atlas::{HEIGHT, WIDTH};
+use draw::{Canvas, FLOATS, MAX_VERTS};
+
+const SHADER: [u8] = "struct U { size: vec2<f32>, pad: vec2<f32> }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    @group(0) @binding(1) var atlas: texture_2d<f32>;\n\
+    @group(0) @binding(2) var samp: sampler;\n\
+    struct VIn {\n\
+    @location(0) pos: vec2<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+    @location(2) color: vec4<f32>,\n\
+    @location(3) mode: f32,\n\
+    }\n\
+    struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+    @location(1) color: vec4<f32>,\n\
+    @location(2) mode: f32,\n\
+    }\n\
+    @vertex fn vs(i: VIn) -> V {\n\
+    let ndc = vec2<f32>(i.pos.x / u.size.x * 2.0 - 1.0, 1.0 - i.pos.y / u.size.y * 2.0);\n\
+    return V(vec4<f32>(ndc, 0.0, 1.0), i.uv, i.color, i.mode);\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let d = textureSampleLevel(atlas, samp, v.uv, 0.0).r;\n\
+    let w = fwidth(d);\n\
+    let glyph = smoothstep(0.5 - w, 0.5 + w, d);\n\
+    let a = mix(1.0, glyph, v.mode);\n\
+    return vec4<f32>(v.color.rgb, v.color.a * a);\n\
+    }\n";
+
+pub struct Gfx {
+    pub inst: gpu::Instance,
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pipe: gpu::RenderPipeline,
+    group: gpu::BindGroup,
+    verts: gpu::Buffer,
+    unif: gpu::Buffer,
+    atlas: gpu::Texture,
+}
+
+impl Gfx {
+    // The device, the atlas texture (px: WIDTH * HEIGHT bytes) and the pipeline.
+    pub fn new_in(px: [u8], gpa: Gpa) -> Result<Gfx, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let atlas = dev.texture(WIDTH, HEIGHT, Format::R8Unorm,
+            usage: TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST | TextureUsage::COPY_SRC);
+        queue.write_texture(atlas, px, WIDTH);
+        let sampler = dev.sampler(gpu::SamplerDesc::linear());
+        let shader = dev.shader_wgsl(SHADER)?;
+        var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm);
+        var layout = VertexLayout::new(FLOATS * 4);
+        layout.attribute(0, VertexFormat::Float32x2, 0);
+        layout.attribute(1, VertexFormat::Float32x2, 8);
+        layout.attribute(2, VertexFormat::Float32x4, 16);
+        layout.attribute(3, VertexFormat::Float32, 32);
+        desc.vertex_buffer(layout);
+        desc.blend(gpu::Blend::alpha(), target: 0);
+        let pipe = dev.render_pipeline(desc)?;
+        let unif = dev.buffer(16, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let verts = dev.buffer(MAX_VERTS * FLOATS * 4, BufferUsage::VERTEX | BufferUsage::COPY_DST);
+        let group = dev.bind_group(pipe.bind_layout(0),
+            [gpu::bind(0, unif), gpu::bind_texture(1, atlas.view()), gpu::bind_sampler(2, sampler)][..]);
+        Ok(Gfx { inst: inst, dev: dev, queue: queue, pipe: pipe, group: group, verts: verts,
+            unif: unif, atlas: atlas })
+    }
+
+    // Draws the canvas into target (w x h pixels), cleared to a dark grey.
+    pub fn draw(inout self, cv: Canvas, w: i64, h: i64, target: gpu::TextureView) {
+        let u: [f32; 4] = [w as f32, h as f32, 0.0, 0.0];
+        self.queue.write_buffer(self.unif, 0, gpu::bytes_of_f32(u[..]));
+        let n = cv.vertex_count();
+        if n > 0 {
+            self.queue.write_buffer(self.verts, 0, gpu::bytes_of_f32(cv.v.as_slice()));
+        }
+        let pipe = self.pipe;
+        let group = self.group;
+        let vb = self.verts;
+        var enc = self.dev.encoder();
+        let clear = gpu::Color { r: 0.06, g: 0.07, b: 0.09, a: 1.0 };
+        enc.render_pass(PassDesc::color(target, clear), |pass| {
+            if n > 0 {
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(0, group);
+                pass.set_vertex_buffer(0, vb);
+                pass.draw(0..n, 0..1);
+            }
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // Draws the canvas into a new w x h texture and reads it back as a PPM.
+    pub fn snapshot_in(inout self, cv: Canvas, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        self.draw(cv, w, h, tex.view());
+        var enc = self.dev.encoder();
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+
+    // The atlas as the GPU holds it, read back (WIDTH * HEIGHT bytes).
+    pub fn atlas_readback_in(inout self, gpa: Gpa) -> Vec<u8> {
+        var out = self.dev.buffer(WIDTH * HEIGHT, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        enc.copy_texture_to_buffer(self.atlas, out, WIDTH);
+        self.queue.submit(enc.finish());
+        out.map_read_copy_in(self.dev, gpa)
+    }
+}

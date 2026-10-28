@@ -1,0 +1,214 @@
+// lattice.vl: the D2Q9 lattice and the CPU side of the wind tunnel: the
+// constants the WGSL shares, the initial state, the obstacle shapes, the
+// Reynolds number, and the shedding frequency the headless check measures.
+
+// The velocities c_i (x to the right, y down): rest, E, S, W, N, SE, SW, NW, NE.
+pub const CX: [i64; 9] = [0, 1, 0, -1, 0, 1, -1, -1, 1];
+pub const CY: [i64; 9] = [0, 0, 1, 0, -1, 1, 1, -1, -1];
+// The weights, and the opposite direction of each.
+pub const W: [f64; 9] = [4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0];
+pub const OPP: [i64; 9] = [0, 3, 4, 1, 2, 7, 8, 5, 6];
+
+// The equilibrium population of direction i at density rho and velocity (ux, uy).
+pub fn equilibrium(i: i64, rho: f64, ux: f64, uy: f64) -> f64 {
+    let cu = 3.0 * (CX[i] as f64 * ux + CY[i] as f64 * uy);
+    W[i] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * (ux * ux + uy * uy))
+}
+
+// omega (= 1/tau) for the Reynolds number re of a flow of speed u past a
+// body d cells wide: nu = u d / re and tau = 3 nu + 1/2.
+pub fn omega_for(re: f64, u: f64, d: f64) -> f64 {
+    let nu = u * d / re;
+    1.0 / (3.0 * nu + 0.5)
+}
+
+// The Reynolds number that omega gives at speed u and width d.
+pub fn reynolds_of(omega: f64, u: f64, d: f64) -> f64 {
+    let nu = (1.0 / omega - 0.5) / 3.0;
+    u * d / nu
+}
+
+// The populations at rest in a stream of speed u, with a faint transverse
+// ripple that starts the shedding. Population i of cell c is at i * cells + c.
+pub fn initial_f(nx: i64, ny: i64, u: f64, gpa: Gpa) -> Vec<f32> {
+    let cells = nx * ny;
+    var f: Vec<f32> = Vec::filled_in(9 * cells, 0.0, gpa);
+    for c in 0..cells {
+        let ripple = 0.001 * (((c * 7919) % 1009) as f64 / 1009.0 - 0.5);
+        for i in 0..9 {
+            f[i * cells + c] = equilibrium(i, 1.0, u, ripple) as f32;
+        }
+    }
+    f
+}
+
+// A cell index's coordinate, kept inside 0..hi-1.
+fn clampi(x: i64, hi: i64) -> i64 {
+    if x < 0 { 0 } else if x > hi - 1 { hi - 1 } else { x }
+}
+
+// Sets the cells within r of (cx, cy) to value: 1 an obstacle, 0 fluid.
+pub fn disk(mask: inout Vec<u32>, nx: i64, ny: i64, cx: f64, cy: f64, r: f64, value: u32) {
+    let x0 = clampi(((cx - r).floor()) as i64, nx);
+    let x1 = clampi(((cx + r).ceil()) as i64, nx);
+    let y0 = clampi(((cy - r).floor()) as i64, ny);
+    let y1 = clampi(((cy + r).ceil()) as i64, ny);
+    for y in y0..y1 + 1 {
+        for x in x0..x1 + 1 {
+            let dx = x as f64 - cx;
+            let dy = y as f64 - cy;
+            if dx * dx + dy * dy <= r * r {
+                mask[y * nx + x] = value;
+            }
+        }
+    }
+}
+
+// Paints the segment (x0, y0) to (x1, y1) with disks of radius r.
+pub fn stroke(mask: inout Vec<u32>, nx: i64, ny: i64, x0: f64, y0: f64, x1: f64, y1: f64,
+    r: f64, value: u32) {
+    let len = ((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)).sqrt();
+    var n = (len / (0.5 * r)).ceil() as i64;
+    if n < 1 {
+        n = 1;
+    }
+    for k in 0..n + 1 {
+        let t = k as f64 / n as f64;
+        disk(&mask, nx, ny, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, value);
+    }
+}
+
+// The default obstacle: one disk of radius r at (cx, cy), the rest fluid.
+pub fn cylinder(nx: i64, ny: i64, cx: f64, cy: f64, r: f64, gpa: Gpa) -> Vec<u32> {
+    var mask: Vec<u32> = Vec::filled_in(nx * ny, 0, gpa);
+    disk(&mask, nx, ny, cx, cy, r, 1);
+    mask
+}
+
+// The Strouhal number f d / u of a signal sampled once a step: f is the
+// rate of its upward crossings of the mean, from the first to the last.
+// 0 when there are fewer than two crossings.
+pub fn strouhal(samples: [f32], d: f64, u: f64) -> f64 {
+    let n = samples.len();
+    if n < 3 {
+        return 0.0;
+    }
+    var mean = 0.0;
+    for x in samples {
+        mean += x as f64;
+    }
+    mean = mean / n as f64;
+    var count = 0;
+    var first = 0.0;
+    var last = 0.0;
+    for i in 1..n {
+        let a = samples[i - 1] as f64 - mean;
+        let b = samples[i] as f64 - mean;
+        if a < 0.0 && b >= 0.0 {
+            let t = (i - 1) as f64 + (-a) / (b - a);
+            if count == 0 {
+                first = t;
+            }
+            last = t;
+            count += 1;
+        }
+    }
+    if count < 2 {
+        return 0.0;
+    }
+    let freq = (count - 1) as f64 / (last - first);
+    freq * d / u
+}
+
+// The signal's largest minus smallest value.
+pub fn amplitude(samples: [f32]) -> f64 {
+    var lo = 0.0;
+    var hi = 0.0;
+    var first = true;
+    for x in samples {
+        let v = x as f64;
+        if first || v < lo {
+            lo = v;
+        }
+        if first || v > hi {
+            hi = v;
+        }
+        first = false;
+    }
+    hi - lo
+}
+
+#[test]
+fn weights_sum_to_one() {
+    var s = 0.0;
+    for w in W {
+        s += w;
+    }
+    assert((s - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn equilibrium_carries_its_density_and_momentum() {
+    var rho = 0.0;
+    var mx = 0.0;
+    var my = 0.0;
+    for i in 0..9 {
+        let e = equilibrium(i, 1.2, 0.05, -0.02);
+        rho += e;
+        mx += e * CX[i] as f64;
+        my += e * CY[i] as f64;
+    }
+    assert((rho - 1.2).abs() < 1e-12);
+    assert((mx - 1.2 * 0.05).abs() < 1e-12);
+    assert((my + 1.2 * 0.02).abs() < 1e-12);
+}
+
+#[test]
+fn opposite_directions_are_opposite() {
+    for i in 0..9 {
+        assert(CX[OPP[i]] == -CX[i] && CY[OPP[i]] == -CY[i]);
+    }
+}
+
+#[test]
+fn reynolds_round_trips() {
+    let w = omega_for(100.0, 0.1, 24.0);
+    assert((reynolds_of(w, 0.1, 24.0) - 100.0).abs() < 1e-9);
+}
+
+#[test]
+fn strouhal_of_a_sine_is_its_frequency(gpa: Gpa) {
+    // one period in 50 steps: f = 1/50 a step, so St = 0.02 * 24 / 0.1 = 4.8
+    var s: Vec<f32> = Vec::new_in(gpa);
+    for i in 0..4000 {
+        s.push((6.283185307179586 * i as f64 / 50.0).sin() as f32);
+    }
+    let st = strouhal(s.as_slice(), 24.0, 0.1);
+    assert((st - 4.8).abs() < 0.02);
+}
+
+#[test]
+fn a_stroke_paints_and_erases(gpa: Gpa) {
+    var m: Vec<u32> = Vec::filled_in(40 * 20, 0, gpa);
+    stroke(&m, 40, 20, 5.0, 10.0, 30.0, 10.0, 2.0, 1);
+    assert(m[10 * 40 + 5] == 1 && m[10 * 40 + 30] == 1 && m[10 * 40 + 17] == 1);
+    assert(m[0] == 0 && m[19 * 40 + 39] == 0);
+    stroke(&m, 40, 20, 5.0, 10.0, 30.0, 10.0, 2.0, 0);
+    var n = 0;
+    for v in m.as_slice() {
+        n += v as i64;
+    }
+    assert(n == 0);
+}
+
+#[test]
+fn a_disk_has_the_right_area(gpa: Gpa) {
+    let m = cylinder(64, 64, 32.0, 32.0, 10.0, gpa);
+    var n = 0;
+    for v in m.as_slice() {
+        n += v as i64;
+    }
+    // pi r^2 = 314.2; the cells whose centres lie inside
+    assert(n > 290 && n < 340);
+}

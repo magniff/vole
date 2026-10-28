@@ -1,0 +1,180 @@
+// The WGSL: the heightmap's compute kernel, and one module for the
+// terrain (its depth-only shadow pass, lit and shadowed, and the water).
+// Each pipeline's bindings are the ones its entry points use.
+
+use std::gpu;
+
+const NOISE: [u8] = "@group(0) @binding(0) var<storage, read_write> heights: array<f32>;\n\
+    fn hash(p: vec2<i32>) -> f32 {\n\
+    var h = u32(p.x) * 374761393u + u32(p.y) * 668265263u;\n\
+    h = (h ^ (h >> 13u)) * 1274126177u;\n\
+    h = h ^ (h >> 16u);\n\
+    return f32(h & 0xffffu) / 65535.0;\n\
+    }\n\
+    fn vnoise(p: vec2<f32>) -> f32 {\n\
+    let i = vec2<i32>(floor(p));\n\
+    let f = fract(p);\n\
+    let u = f * f * (3.0 - 2.0 * f);\n\
+    let a = hash(i);\n\
+    let b = hash(i + vec2<i32>(1, 0));\n\
+    let c = hash(i + vec2<i32>(0, 1));\n\
+    let d = hash(i + vec2<i32>(1, 1));\n\
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);\n\
+    }\n\
+    fn fbm(p0: vec2<f32>) -> f32 {\n\
+    var p = p0;\n\
+    var sum = 0.0;\n\
+    var amp = 0.5;\n\
+    var norm = 0.0;\n\
+    for (var o = 0; o < 6; o = o + 1) {\n\
+    sum = sum + amp * vnoise(p);\n\
+    norm = norm + amp;\n\
+    p = p * 2.03 + vec2<f32>(17.1, 9.2);\n\
+    amp = amp * 0.5;\n\
+    }\n\
+    return sum / norm;\n\
+    }\n\
+    @compute @workgroup_size(16, 16) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= 257u || id.y >= 257u) { return; }\n\
+    let p = vec2<f32>(f32(id.x), f32(id.y)) / 90.0;\n\
+    let base = fbm(p);\n\
+    let ridge = 1.0 - abs(2.0 * fbm(p * 2.3 + vec2<f32>(5.2, 1.3)) - 1.0);\n\
+    var h = 0.75 * base + 0.25 * ridge * ridge;\n\
+    h = clamp(0.5 + (h - 0.5) * 2.2, 0.0, 1.0);\n\
+    heights[id.y * 257u + id.x] = h;\n\
+    }\n";
+
+const TERRAIN: [u8] = "struct U {\n\
+    view_proj: mat4x4<f32>,\n\
+    light_vp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    @group(0) @binding(1) var<storage, read> heights: array<f32>;\n\
+    @group(0) @binding(2) var shadow_map: texture_depth_2d;\n\
+    const HS: f32 = 60.0;\n\
+    fn height_at(x0: i32, z0: i32) -> f32 {\n\
+    let x = clamp(x0, 0, 256);\n\
+    let z = clamp(z0, 0, 256);\n\
+    return heights[u32(z * 257 + x)] * HS;\n\
+    }\n\
+    fn normal_at(x: i32, z: i32) -> vec3<f32> {\n\
+    let dx = (height_at(x + 1, z) - height_at(x - 1, z)) * 0.5;\n\
+    let dz = (height_at(x, z + 1) - height_at(x, z - 1)) * 0.5;\n\
+    return normalize(vec3<f32>(-dx, 1.0, -dz));\n\
+    }\n\
+    struct VOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) wpos: vec3<f32>,\n\
+    @location(1) n: vec3<f32>,\n\
+    @location(2) lpos: vec4<f32>,\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    let x = i32(vi % 257u);\n\
+    let z = i32(vi / 257u);\n\
+    let p = vec3<f32>(f32(x), height_at(x, z), f32(z));\n\
+    return VOut(u.view_proj * vec4<f32>(p, 1.0), p, normal_at(x, z), u.light_vp * vec4<f32>(p, 1.0));\n\
+    }\n\
+    @vertex fn vs_shadow(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {\n\
+    let x = i32(vi % 257u);\n\
+    let z = i32(vi / 257u);\n\
+    let p = vec3<f32>(f32(x), height_at(x, z), f32(z));\n\
+    return u.light_vp * vec4<f32>(p, 1.0);\n\
+    }\n\
+    fn shadow_at(lpos: vec4<f32>) -> f32 {\n\
+    let ndc = lpos.xyz / lpos.w;\n\
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);\n\
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return 1.0; }\n\
+    let dims = vec2<i32>(textureDimensions(shadow_map));\n\
+    let c = vec2<i32>(uv * vec2<f32>(dims));\n\
+    var lit = 0.0;\n\
+    for (var dy = -1; dy <= 1; dy = dy + 1) {\n\
+    for (var dx = -1; dx <= 1; dx = dx + 1) {\n\
+    let q = clamp(c + vec2<i32>(dx, dy), vec2<i32>(0), dims - vec2<i32>(1));\n\
+    let stored = textureLoad(shadow_map, q, 0);\n\
+    if (ndc.z - u.misc.z <= stored) { lit = lit + 1.0; }\n\
+    }\n\
+    }\n\
+    return lit / 9.0;\n\
+    }\n\
+    fn fog(col: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {\n\
+    let d = length(wpos - u.eye.xyz);\n\
+    let f = clamp(1.0 - exp(-d * u.misc.y), 0.0, 1.0);\n\
+    return mix(col, vec3<f32>(0.66, 0.77, 0.88), f);\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    let n = normalize(v.n);\n\
+    let h = v.wpos.y / HS;\n\
+    let slope = 1.0 - n.y;\n\
+    let grass = vec3<f32>(0.22, 0.40, 0.12);\n\
+    let rock = vec3<f32>(0.42, 0.38, 0.35);\n\
+    let snow = vec3<f32>(0.94, 0.96, 1.0);\n\
+    let sand = vec3<f32>(0.62, 0.56, 0.40);\n\
+    var col = mix(grass, rock, smoothstep(0.28, 0.50, slope));\n\
+    col = mix(col, snow, smoothstep(0.66, 0.74, h) * (1.0 - smoothstep(0.35, 0.60, slope)));\n\
+    col = mix(sand, col, smoothstep(u.misc.x, u.misc.x + 0.03, h));\n\
+    let sun = normalize(u.sun.xyz);\n\
+    let ndl = max(dot(n, sun), 0.0);\n\
+    let sh = mix(1.0, shadow_at(v.lpos), u.misc.w);\n\
+    let light = vec3<f32>(0.30, 0.34, 0.42) + vec3<f32>(1.0, 0.93, 0.80) * ndl * sh * u.sun.w;\n\
+    return vec4<f32>(fog(col * light, v.wpos), 1.0);\n\
+    }\n\
+";
+
+// The water has a module of its own (the terrain module's bindings would
+// otherwise be in its layout).
+const WATER: [u8] = "struct U {\n\
+    view_proj: mat4x4<f32>,\n\
+    light_vp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    const HS: f32 = 60.0;\n\
+    struct VOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) wpos: vec3<f32>,\n\
+    @location(1) n: vec3<f32>,\n\
+    @location(2) lpos: vec4<f32>,\n\
+    }\n\
+    fn fog(col: vec3<f32>, wpos: vec3<f32>) -> vec3<f32> {\n\
+    let d = length(wpos - u.eye.xyz);\n\
+    let f = clamp(1.0 - exp(-d * u.misc.y), 0.0, 1.0);\n\
+    return mix(col, vec3<f32>(0.66, 0.77, 0.88), f);\n\
+    }\n\
+    @vertex fn vs_water(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    var x = 0.0;\n\
+    var z = 0.0;\n\
+    if (vi == 1u || vi == 4u || vi == 5u) { x = 1.0; }\n\
+    if (vi == 2u || vi == 3u || vi == 5u) { z = 1.0; }\n\
+    let p = vec3<f32>(-120.0 + 496.0 * x, u.misc.x * HS, -120.0 + 496.0 * z);\n\
+    return VOut(u.view_proj * vec4<f32>(p, 1.0), p, vec3<f32>(0.0, 1.0, 0.0), vec4<f32>(0.0));\n\
+    }\n\
+    @fragment fn fs_water(v: VOut) -> @location(0) vec4<f32> {\n\
+    let view = normalize(u.eye.xyz - v.wpos);\n\
+    let fres = pow(1.0 - max(view.y, 0.0), 3.0);\n\
+    let sun = normalize(u.sun.xyz);\n\
+    let r = reflect(-sun, vec3<f32>(0.0, 1.0, 0.0));\n\
+    let spec = pow(max(dot(r, view), 0.0), 80.0) * u.sun.w;\n\
+    let col = mix(vec3<f32>(0.04, 0.22, 0.32), vec3<f32>(0.42, 0.60, 0.70), fres) + vec3<f32>(spec);\n\
+    return vec4<f32>(fog(col, v.wpos), 0.9);\n\
+    }\n";
+
+// The noise kernel's module: a compute shader over the heightmap.
+pub fn noise_shader(dev: gpu::Device) -> Result<gpu::Shader, gpu::Error> {
+    dev.shader_wgsl(NOISE)
+}
+
+// The terrain module: the shadow pass's vertex entry, and the lit terrain
+// (vs, fs).
+pub fn terrain_shader(dev: gpu::Device) -> Result<gpu::Shader, gpu::Error> {
+    dev.shader_wgsl(TERRAIN)
+}
+
+// The water: vs_water and fs_water, in a module of their own.
+pub fn water_shader(dev: gpu::Device) -> Result<gpu::Shader, gpu::Error> {
+    dev.shader_wgsl(WATER)
+}

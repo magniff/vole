@@ -1,0 +1,165 @@
+// The canvas: one frame's triangles, built on the CPU. Coordinates are in
+// logical units (k pixels each, 2 on a Retina display); a vertex is nine
+// floats in pixels: x, y, u, v, r, g, b, a, mode. mode 0 is a solid colour,
+// mode 1 a glyph, whose colour is the atlas's value (see the shader in gfx.vl).
+
+use atlas::{glyph_index, CELL, COLS, HEIGHT, MARGIN, WIDTH};
+
+pub const FLOATS: i64 = 9;      // floats a vertex
+pub const MAX_VERTS: i64 = 60000;
+const ADVANCE: f64 = 0.9;       // a glyph's advance, in its cap heights
+
+// A quadrilateral: its box in logical units, and the atlas box it shows.
+struct Quad {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    u0: f64,
+    v0: f64,
+    u1: f64,
+    v1: f64,
+}
+
+pub struct Canvas {
+    pub v: Vec<f32>,
+    pub k: f64,
+    clipping: bool,
+    cx0: f64,
+    cy0: f64,
+    cx1: f64,
+    cy1: f64,
+}
+
+impl Canvas {
+    pub fn new_in(gpa: Gpa, k: f64) -> Canvas {
+        Canvas { v: Vec::new_in(gpa), k: k, clipping: false, cx0: 0.0, cy0: 0.0, cx1: 0.0, cy1: 0.0 }
+    }
+
+    pub fn reset(inout self) {
+        self.v.clear();
+        self.clipping = false;
+    }
+
+    pub fn vertex_count(self) -> i64 {
+        self.v.len() / FLOATS
+    }
+
+    // Everything after this is drawn inside the logical rectangle only.
+    pub fn clip(inout self, x: f64, y: f64, w: f64, h: f64) {
+        self.clipping = true;
+        self.cx0 = x;
+        self.cy0 = y;
+        self.cx1 = x + w;
+        self.cy1 = y + h;
+    }
+
+    pub fn unclip(inout self) {
+        self.clipping = false;
+    }
+
+    fn put(inout self, x: f64, y: f64, u: f64, v: f64, c: [f32; 4], mode: f64) {
+        self.v.push((x * self.k) as f32);
+        self.v.push((y * self.k) as f32);
+        self.v.push(u as f32);
+        self.v.push(v as f32);
+        self.v.push(c[0]);
+        self.v.push(c[1]);
+        self.v.push(c[2]);
+        self.v.push(c[3]);
+        self.v.push(mode as f32);
+    }
+
+    // Two triangles for a quadrilateral whose corners are p = [x, y] in
+    // order top-left, top-right, bottom-right, bottom-left, with the atlas
+    // coordinates uv in the same order.
+    fn quad4(inout self, p: [f64; 8], uv: [f64; 8], c: [f32; 4], mode: f64) {
+        if self.v.len() / FLOATS + 6 > MAX_VERTS {
+            return;
+        }
+        self.put(p[0], p[1], uv[0], uv[1], c, mode);
+        self.put(p[2], p[3], uv[2], uv[3], c, mode);
+        self.put(p[4], p[5], uv[4], uv[5], c, mode);
+        self.put(p[0], p[1], uv[0], uv[1], c, mode);
+        self.put(p[4], p[5], uv[4], uv[5], c, mode);
+        self.put(p[6], p[7], uv[6], uv[7], c, mode);
+    }
+
+    // An axis-aligned quad, cut to the clip rectangle (its atlas box is cut
+    // in proportion, so a glyph half out of the clip shows the other half).
+    fn boxed(inout self, q: Quad, c: [f32; 4], mode: f64) {
+        var b = q;
+        if self.clipping {
+            let fx0 = q.x0.max(self.cx0);
+            let fy0 = q.y0.max(self.cy0);
+            let fx1 = q.x1.min(self.cx1);
+            let fy1 = q.y1.min(self.cy1);
+            if fx1 <= fx0 || fy1 <= fy0 {
+                return;
+            }
+            let su = (q.u1 - q.u0) / (q.x1 - q.x0);
+            let sv = (q.v1 - q.v0) / (q.y1 - q.y0);
+            b = Quad {
+                x0: fx0,
+                y0: fy0,
+                x1: fx1,
+                y1: fy1,
+                u0: q.u0 + (fx0 - q.x0) * su,
+                v0: q.v0 + (fy0 - q.y0) * sv,
+                u1: q.u0 + (fx1 - q.x0) * su,
+                v1: q.v0 + (fy1 - q.y0) * sv,
+            };
+        }
+        self.quad4(
+            [b.x0, b.y0, b.x1, b.y0, b.x1, b.y1, b.x0, b.y1],
+            [b.u0, b.v0, b.u1, b.v0, b.u1, b.v1, b.u0, b.v1],
+            c, mode);
+    }
+
+    // A solid rectangle (logical units).
+    pub fn rect(inout self, x: f64, y: f64, w: f64, h: f64, c: [f32; 4]) {
+        self.boxed(Quad { x0: x, y0: y, x1: x + w, y1: y + h, u0: 0.0, v0: 0.0, u1: 0.0, v1: 0.0 }, c, 0.0);
+    }
+
+    // The advance of a string: its glyphs' pen moves, in logical units.
+    pub fn text_width(s: [u8], size: f64) -> f64 {
+        s.len() as f64 * ADVANCE * size
+    }
+
+    // A line of text whose top-left corner (of the first cap box) is (x, y),
+    // its cap height `size` logical units, turned by `angle` radians about
+    // that corner. Each glyph is one quad showing its atlas cell (the SDF).
+    pub fn text(inout self, s: [u8], x: f64, y: f64, size: f64, angle: f64, c: [f32; 4]) {
+        let cs = angle.cos();
+        let sn = angle.sin();
+        let m = MARGIN * size;
+        let e = (1.0 + MARGIN) * size;
+        for i in 0..s.len() {
+            let g = glyph_index(s[i]);
+            let col = g % COLS;
+            let row = g / COLS;
+            let u0 = (col * CELL) as f64 / WIDTH as f64;
+            let u1 = ((col + 1) * CELL) as f64 / WIDTH as f64;
+            let v0 = (row * CELL) as f64 / HEIGHT as f64;
+            let v1 = ((row + 1) * CELL) as f64 / HEIGHT as f64;
+            let ox = i as f64 * ADVANCE * size;
+            // the quad's corners, relative to (x, y) before the turn
+            let lx0 = ox - m;
+            let lx1 = ox + e;
+            let ly0 = 0.0 - m;
+            let ly1 = e;
+            if angle == 0.0 {
+                self.boxed(Quad { x0: x + lx0, y0: y + ly0, x1: x + lx1, y1: y + ly1,
+                    u0: u0, v0: v0, u1: u1, v1: v1 }, c, 1.0);
+            } else {
+                self.quad4(
+                    [x + lx0 * cs - ly0 * sn, y + lx0 * sn + ly0 * cs,
+                     x + lx1 * cs - ly0 * sn, y + lx1 * sn + ly0 * cs,
+                     x + lx1 * cs - ly1 * sn, y + lx1 * sn + ly1 * cs,
+                     x + lx0 * cs - ly1 * sn, y + lx0 * sn + ly1 * cs],
+                    [u0, v0, u1, v0, u1, v1, u0, v1],
+                    c, 1.0);
+            }
+        }
+    }
+}

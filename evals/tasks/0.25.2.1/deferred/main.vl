@@ -1,0 +1,271 @@
+// deferred: a deferred renderer on std::gpu (WGSL compute and render, on
+// Metal) in a window (std::window), or headless. A G-buffer pass writes
+// albedo, normal and linear depth (plus the hardware depth test); a
+// compute pass culls 512 orbiting coloured point lights into 16 x 16 pixel
+// tiles; a compute pass lights every pixel from its tile's lights; and a
+// render pass tone maps the result, or shows a G-buffer view.
+//
+//   deferred                          the window: 1/2/3/4 or v: the view; space: pause
+//   deferred --headless               no window: the frame time, the tile stats
+//   deferred --headless --shot F.ppm  also the final frame and the G-buffer views
+
+mod render;
+mod scene;
+mod shaders;
+
+use std::{env, fs, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use render::{MAX_PER_TILE, Renderer};
+use scene::{Orbit, build_scene, make_lights, norm3, pack_lights, perspective, view_matrix, xform_dir};
+
+const LIGHTS: i64 = 512;
+const WIDTH: i64 = 1280;
+const HEIGHT: i64 = 720;
+const FOV: f32 = 0.8;
+
+// The views, in the order the keys cycle them (the shader's view modes).
+fn view_name(mode: i64) -> [u8] {
+    if mode == 0 {
+        "final"
+    } else if mode == 1 {
+        "albedo"
+    } else if mode == 2 {
+        "normal"
+    } else {
+        "depth"
+    }
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+// Uploads the frame at time t: the camera, the lights' positions in view
+// space, the sun, and the view mode.
+fn upload_frame(r: inout Renderer, lights: [Orbit], lbuf: inout Vec<f32>, t: f32, mode: i64) {
+    let view = view_matrix();
+    let proj = perspective(FOV, r.w as f32 / r.h as f32, r.near, r.far);
+    pack_lights(lights, t, view, &lbuf);
+    let sun = norm3(xform_dir(view, [0.4, 1.0, 0.3]));
+    r.upload(view, proj, sun, mode, lbuf.as_slice());
+}
+
+// `base` without a trailing .ppm, then the view's name, then .ppm.
+fn view_path(base: [u8], name: [u8], gpa: Gpa) -> Buf {
+    var stem = base;
+    if base.len() > 4 && base[base.len() - 4..base.len()] == ".ppm" {
+        stem = base[0..base.len() - 4];
+    }
+    format_in(f"{stem}-{name}.ppm", gpa)
+}
+
+// The headless run: the frames timed (after a warm-up), the tile stats,
+// and the pictures.
+fn headless(frames: i64, shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    let mesh = build_scene(gpa);
+    var r = Renderer::new_in(dev, queue, WIDTH, HEIGHT, LIGHTS, mesh.verts.as_slice(),
+        mesh.idx.as_slice(), gpa)?;
+    let lights = make_lights(LIGHTS, gpa);
+    var lbuf: Vec<f32> = Vec::new_in(gpa);
+    for _ in 0..(LIGHTS * 8) {
+        lbuf.push(0.0);
+    }
+    for i in 0..10 {
+        upload_frame(&r, lights.as_slice(), &lbuf, i as f32 / 60.0, 0);
+        var enc = r.dev.encoder();
+        r.record(&enc, r.target_view());
+        r.queue.submit(enc.finish());
+    }
+    let _ = r.queue.wait_idle();
+    let t0 = monotonic_now();
+    for i in 0..frames {
+        upload_frame(&r, lights.as_slice(), &lbuf, (10 + i) as f32 / 60.0, 0);
+        var enc = r.dev.encoder();
+        r.record(&enc, r.target_view());
+        r.queue.submit(enc.finish());
+    }
+    let _ = r.queue.wait_idle();
+    let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / frames as f64;
+    let (most, over) = r.tile_stats();
+    println(f"deferred: {WIDTH} x {HEIGHT}, {LIGHTS} lights, {render::TILE} px tiles: {ms:.3} ms a frame over {frames} frames (GPU: scene, cull, light, tone map)");
+    println(f"tiles: most lights offered to one tile {most} (cap {MAX_PER_TILE}), tiles over the cap {over}");
+    if shot.len() > 0 {
+        for mode in 0..4 {
+            upload_frame(&r, lights.as_slice(), &lbuf, 10.0 / 60.0, mode);
+            let img = r.shot(gpa);
+            var direct = Buf::new_in(gpa);
+            direct.push_str(shot);
+            let path = if mode == 0 { direct } else { view_path(shot, view_name(mode), gpa) };
+            if fs::write(path.as_slice(), img.as_slice()).is_err() {
+                eprintln(f"deferred: cannot write {view_name(mode)}");
+                return Ok(1);
+            }
+        }
+        println(f"wrote {shot} and its views: albedo, normal, depth");
+    }
+    Ok(0)
+}
+
+// The window: the frame at the display's clock; keys pick the view.
+fn windowed(max_frames: i64, shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("deferred: no window server (try --headless)");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("deferred", WIDTH, HEIGHT)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("deferred: no window");
+            return Ok(1);
+        }
+    };
+    let sz = win.size();
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    surf.configure(dev, sz.w, sz.h);
+    let mesh = build_scene(gpa);
+    var r = Renderer::new_in(dev, queue, sz.w, sz.h, LIGHTS, mesh.verts.as_slice(),
+        mesh.idx.as_slice(), gpa)?;
+    let lights = make_lights(LIGHTS, gpa);
+    var lbuf: Vec<f32> = Vec::new_in(gpa);
+    for _ in 0..(LIGHTS * 8) {
+        lbuf.push(0.0);
+    }
+    var mode: i64 = 0;
+    var paused = false;
+    var quit = false;
+    let start = monotonic_now();
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames: i64 = 0;
+    var first = 0.0;
+    var since = 0.0;
+    var since_frames: i64 = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 {
+                    dt = 1.0 / 60.0;
+                }
+                prev = now;
+                if !paused {
+                    clock += dt;
+                }
+                upload_frame(&r, lights.as_slice(), &lbuf, clock as f32, mode);
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = r.dev.encoder();
+                        r.record(&enc, f.texture.view());
+                        r.queue.submit(enc.finish());
+                        f.present(&r.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                since_frames += 1;
+                if frames == 1 {
+                    first = now;
+                }
+                if now - since >= 0.5 && frames > 1 {
+                    let ms = (now - since) * 1000.0 / since_frames as f64;
+                    win.set_title(format_in(f"deferred: {ms:.2} ms a frame, view {view_name(mode)}", gpa).as_slice());
+                    since = now;
+                    since_frames = 0;
+                }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(f"deferred: {WIDTH} x {HEIGHT}, {LIGHTS} lights: {frames} frames, {mean:.2} ms a frame");
+                    if shot.len() > 0 {
+                        let img = r.shot(gpa);
+                        if fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"deferred: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if quit {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == '1' as u32 {
+                                mode = 0;
+                            } else if c == '2' as u32 {
+                                mode = 1;
+                            } else if c == '3' as u32 {
+                                mode = 2;
+                            } else if c == '4' as u32 {
+                                mode = 3;
+                            } else if c == 'v' as u32 {
+                                mode = (mode + 1) % 4;
+                            } else if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'q' as u32 {
+                                quit = true;
+                            }
+                        }
+                        Logical::Named(Named::Escape) => quit = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if quit {
+            break;
+        }
+    }
+    let _ = r.queue.wait_idle();
+    Ok(0)
+}
+
+fn run(gpa: Gpa) -> Result<i32, gpu::Error> {
+    let cli = Command::new_in("deferred", gpa)
+        .about("a deferred renderer: G-buffer, tiled light culling, 512 point lights")
+        .arg(Arg::flag("headless").help("no window: time the frames and print the tile stats"))
+        .arg(Arg::option("frames").value_name("N").default("120")
+            .help("headless: frames timed; window: quit after N frames (0: until closed)"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the final frame as PPM; headless also FILE-albedo/normal/depth.ppm"));
+    let m = cli.parse_or_exit(env::args());
+    let frames = parse_int(m.get("frames").unwrap_or("120")).unwrap_or(120);
+    if frames < 0 {
+        eprintln("deferred: --frames takes 0 or more");
+        return Ok(2);
+    }
+    let shot = m.get("shot").unwrap_or("");
+    if m.flag("headless") {
+        return headless(if frames == 0 { 1 } else { frames }, shot, gpa);
+    }
+    windowed(frames, shot, gpa)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    match run(gpa) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln(f"deferred: {e}");
+            1
+        }
+    }
+}

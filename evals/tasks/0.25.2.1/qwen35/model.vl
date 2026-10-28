@@ -1,0 +1,474 @@
+// The Qwen3.5-0.8B forward pass on the GPU: the weights (bf16, the whole
+// safetensors file as one buffer), the small f32 tables (norm weights
+// already plus one, the gate's -exp(A_log), dt_bias, the conv taps, the
+// RoPE frequencies), and the activations, KV caches and recurrent
+// states in one f32 buffer `s`. Each token is one encoder of kernel
+// passes (kern.vl); the token and its position are written to `s`
+// before it, so the passes are recorded once, at `Net::new_in`.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Limits};
+use std::num::f32_from_bits;
+
+use kern::module_text;
+use st::{Header, Tensor, parse_header};
+
+pub const HIDDEN: i64 = 1024;
+pub const VOCAB: i64 = 248320;
+pub const LAYERS: i64 = 24;
+pub const INTER: i64 = 3584;
+pub const MAXSEQ: i64 = 2048;
+// the kernels, by kind (kern.vl's module_text)
+const K_EMBED: i64 = 0;
+const K_RMS: i64 = 1;
+const K_MATVEC: i64 = 2;
+const K_CONV: i64 = 3;
+const K_DELTA: i64 = 4;
+const K_GNORM: i64 = 5;
+const K_SPLITQ: i64 = 6;
+const K_ROPE: i64 = 7;
+const K_KVW: i64 = 8;
+const K_SCORES: i64 = 9;
+const K_SOFTMAX: i64 = 10;
+const K_ATTN: i64 = 11;
+const K_SWIGLU: i64 = 12;
+const KINDS: i64 = 13;
+
+// One dispatch: the kernel (an index into Net.pipes), its bind group
+// (into Net.groups) and the workgroup counts.
+pub struct Op {
+    pub k: i64,
+    pub g: i64,
+    pub gx: i64,
+    pub gy: i64,
+}
+
+// The offsets (in f32s) of the activations and states in `s`.
+pub struct Lay {
+    pub x: i64,
+    pub xn: i64,
+    pub qkv: i64,
+    pub zb: i64,
+    pub bb: i64,
+    pub aa: i64,
+    pub cv: i64,
+    pub core: i64,
+    pub gn: i64,
+    pub g: i64,
+    pub u: i64,
+    pub act: i64,
+    pub qg: i64,
+    pub qq: i64,
+    pub gate: i64,
+    pub kp: i64,
+    pub vp: i64,
+    pub sc: i64,
+    pub ao: i64,
+    pub tokpos: i64,
+    pub logits: i64,
+    pub kc: i64,
+    pub vc: i64,
+    pub rs: i64,
+    pub cs: i64,
+    pub total: i64,
+}
+
+pub fn layout() -> Lay {
+    var o: i64 = 0;
+    let x = o; o += HIDDEN;
+    let xn = o; o += HIDDEN;
+    let qkv = o; o += 6144;
+    let zb = o; o += 2048;
+    let bb = o; o += 16;
+    let aa = o; o += 16;
+    let cv = o; o += 6144;
+    let core = o; o += 2048;
+    let gn = o; o += 2048;
+    let g = o; o += INTER;
+    let u = o; o += INTER;
+    let act = o; o += INTER;
+    let qg = o; o += 4096;
+    let qq = o; o += 2048;
+    let gate = o; o += 2048;
+    let kp = o; o += 512;
+    let vp = o; o += 512;
+    let sc = o; o += 8 * MAXSEQ;
+    let ao = o; o += 2048;
+    let tokpos = o; o += 2;
+    let logits = o; o += VOCAB;
+    let kc = o; o += 6 * MAXSEQ * 512;
+    let vc = o; o += 6 * MAXSEQ * 512;
+    let rs = o; o += 18 * 16 * 128 * 128;
+    let cs = o; o += 18 * 6144 * 3;
+    Lay {
+        x: x, xn: xn, qkv: qkv, zb: zb, bb: bb, aa: aa, cv: cv, core: core, gn: gn, g: g,
+        u: u, act: act, qg: qg, qq: qq, gate: gate, kp: kp, vp: vp, sc: sc, ao: ao,
+        tokpos: tokpos, logits: logits, kc: kc, vc: vc, rs: rs, cs: cs, total: o,
+    }
+}
+
+pub struct Net {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub lay: Lay,
+    gpa: Gpa,
+    pub sbuf: gpu::Buffer,
+    lbuf: gpu::Buffer,
+    dbuf: gpu::Buffer,
+    // the op counts after the embedding, each layer, and the final norm
+    ends: Vec<i64>,
+    pipes: Vec<gpu::ComputePipeline>,
+    groups: Vec<gpu::BindGroup>,
+    unis: Vec<gpu::Buffer>,
+    ops: Vec<Op>,
+}
+
+// f32 from a bf16 value's bits (its high half).
+fn bf16_at(file: [u8], at: i64) -> f32 {
+    let bits = (file[at] as u32) | ((file[at + 1] as u32) << 8);
+    f32_from_bits(bits << 16)
+}
+
+// Appends a bf16 tensor's values to fv (plus one: as the zero-centred
+// norms' weights, 1 + w); returns its offset.
+fn take_bf(fv: inout Vec<f32>, file: [u8], t: Tensor, plus_one: bool) -> i64 {
+    let start = fv.len();
+    for k in 0..t.n {
+        let v = bf16_at(file, t.at + 2 * k);
+        fv.push(if plus_one { 1.0 + v } else { v });
+    }
+    start
+}
+
+// Appends an f32 tensor's values (times `scale`); returns its offset.
+fn take_f32(fv: inout Vec<f32>, file: [u8], t: Tensor, neg_exp: bool) -> i64 {
+    let start = fv.len();
+    for k in 0..t.n {
+        let at = t.at + 4 * k;
+        let bits = (file[at] as u32) | ((file[at + 1] as u32) << 8) | ((file[at + 2] as u32) << 16)
+            | ((file[at + 3] as u32) << 24);
+        let v = f32_from_bits(bits);
+        fv.push(if neg_exp { 0.0 - v.exp() } else { v });
+    }
+    start
+}
+
+// The tensor called name (a Buf's bytes).
+fn tensor(h: inout Header, name: [u8]) -> Tensor {
+    let i = h.names.get(name);
+    if i < 0 {
+        panic("qwen35: a tensor is missing from the file");
+    }
+    h.tensors[i]
+}
+
+// The halfword offset of a bf16 tensor in the file's buffer.
+fn half_at(t: Tensor) -> i64 {
+    t.at / 2
+}
+
+// Everything the builder needs while the ops are recorded.
+struct Build {
+    dev: gpu::Device,
+    wbuf: gpu::Buffer,
+    fbuf: gpu::Buffer,
+    sbuf: gpu::Buffer,
+    pipes: Vec<gpu::ComputePipeline>,
+    groups: Vec<gpu::BindGroup>,
+    unis: Vec<gpu::Buffer>,
+    ops: Vec<Op>,
+}
+
+impl Build {
+    // One dispatch of kernel `kind` with parameters p (the uniform q),
+    // gx x gy workgroups; w: it reads the weights, f: the f32 table.
+    fn op(inout self, kind: i64, p: [u32; 8], gx: i64, gy: i64, w: bool, f: bool) {
+        let ub = self.dev.buffer_init(gpu::bytes_of_u32(p[..]), BufferUsage::UNIFORM);
+        let layout = self.pipes[kind].bind_layout(0);
+        let group = if w {
+            self.dev.bind_group(layout, [gpu::bind(0, ub), gpu::bind(1, self.wbuf), gpu::bind(3, self.sbuf)][..])
+        } else if f {
+            self.dev.bind_group(layout, [gpu::bind(0, ub), gpu::bind(2, self.fbuf), gpu::bind(3, self.sbuf)][..])
+        } else {
+            self.dev.bind_group(layout, [gpu::bind(0, ub), gpu::bind(3, self.sbuf)][..])
+        };
+        self.unis.push(ub);
+        self.groups.push(group);
+        self.ops.push(Op { k: kind, g: self.groups.len() - 1, gx: gx, gy: gy });
+    }
+}
+
+fn u8s(v: [i64; 8]) -> [u32; 8] {
+    [v[0] as u32, v[1] as u32, v[2] as u32, v[3] as u32, v[4] as u32, v[5] as u32, v[6] as u32,
+        v[7] as u32]
+}
+
+// A matrix-vector product: rows x cols bf16 at half offset w, input at
+// s[inp], output at s[out] (added when acc).
+fn matvec(b: inout Build, w: i64, inp: i64, out: i64, rows: i64, cols: i64, acc: bool) {
+    let gx = if rows <= 4096 { rows } else { 4096 };
+    let gy = (rows + gx - 1) / gx;
+    b.op(K_MATVEC, u8s([w, inp, out, rows, cols, if acc { 1 } else { 0 }, gx, 0]), gx, gy, true, false);
+}
+
+// RMSNorm of `rows` rows of length `len`: input, output, weight (fw).
+fn rms(b: inout Build, inp: i64, out: i64, wf: i64, len: i64, rows: i64) {
+    b.op(K_RMS, u8s([inp, out, wf, len, 0, 0, 0, 0]), rows, 1, false, true);
+}
+
+impl Net {
+    // Loads the model from `dir` (its safetensors file) into the GPU.
+    pub fn new_in(dir: [u8], gpa: Gpa) -> Result<Net, gpu::Error> {
+        var path = Buf::new_in(gpa);
+        path.push_str(dir);
+        path.push_str("/model.safetensors-00001-of-00001.safetensors");
+        let file = std::fs::read_in(path.as_slice(), gpa).unwrap();
+        var h = parse_header(file.as_slice(), gpa);
+
+        // the f32 table
+        var fv: Vec<f32> = Vec::new_in(gpa);
+        var ids: Vec<i64> = Vec::new_in(gpa);
+        var name = Buf::new_in(gpa);
+        let fb = file.as_slice();
+        // the table: per layer (in order), then the final norm and RoPE
+        var off_in: Vec<i64> = Vec::new_in(gpa);
+        var off_post: Vec<i64> = Vec::new_in(gpa);
+        var off_conv: Vec<i64> = Vec::new_in(gpa);
+        var off_nega: Vec<i64> = Vec::new_in(gpa);
+        var off_dt: Vec<i64> = Vec::new_in(gpa);
+        var off_gn: Vec<i64> = Vec::new_in(gpa);
+        var off_qn: Vec<i64> = Vec::new_in(gpa);
+        var off_kn: Vec<i64> = Vec::new_in(gpa);
+        for l in 0..LAYERS {
+            name.clear();
+            let pre = format_in(f"model.language_model.layers.{l}.", gpa);
+            name.push_str(pre.as_slice());
+            name.push_str("input_layernorm.weight");
+            off_in.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), true));
+            name.clear();
+            name.push_str(pre.as_slice());
+            name.push_str("post_attention_layernorm.weight");
+            off_post.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), true));
+            if l % 4 == 3 {
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("self_attn.q_norm.weight");
+                off_qn.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), true));
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("self_attn.k_norm.weight");
+                off_kn.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), true));
+                off_conv.push(0);
+                off_nega.push(0);
+                off_dt.push(0);
+                off_gn.push(0);
+            } else {
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.conv1d.weight");
+                off_conv.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), false));
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.A_log");
+                off_nega.push(take_f32(&fv, fb, tensor(&h, name.as_slice()), true));
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.dt_bias");
+                off_dt.push(take_bf(&fv, fb, tensor(&h, name.as_slice()), false));
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.norm.weight");
+                off_gn.push(take_f32(&fv, fb, tensor(&h, name.as_slice()), false));
+                off_qn.push(0);
+                off_kn.push(0);
+            }
+        }
+        name.clear();
+        name.push_str("model.language_model.norm.weight");
+        let off_final = take_bf(&fv, fb, tensor(&h, name.as_slice()), true);
+        var rope: [f32; 32] = [0.0; 32];
+        for i in 0..32 {
+            let e = (2.0 * i as f64) / 64.0;
+            rope[i] = (1.0 / (10000000.0_f64).powf(e)) as f32;
+        }
+        let off_rope = fv.len();
+        fv.extend_from_slice(rope[..]);
+        name.clear();
+        name.push_str("model.language_model.embed_tokens.weight");
+        let emb = tensor(&h, name.as_slice());
+
+        // the device, with buffers up to the file's size
+        let inst = gpu::Instance::new_in(gpa);
+        var lim = Limits::default();
+        lim.max_buffer_size = 4 * 1024 * 1024 * 1024;
+        let (dev, var queue) = inst.adapter()?.device(lim)?;
+        let wbuf = dev.buffer_init(file.as_slice(), BufferUsage::STORAGE);
+        let fbuf = dev.buffer_init(gpu::bytes_of_f32(fv.as_slice()), BufferUsage::STORAGE);
+        let lay = layout();
+        var zeros: Vec<f32> = Vec::filled_in(lay.total, 0.0, gpa);
+        let sbuf = dev.buffer_init(gpu::bytes_of_f32(zeros.as_slice()),
+            BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST);
+        zeros.clear();
+        let lbuf = dev.buffer(VOCAB * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        let dbuf = dev.buffer(26 * 4096, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var ends: Vec<i64> = Vec::new_in(gpa);
+
+        var pipes: Vec<gpu::ComputePipeline> = Vec::new_in(gpa);
+        for kind in 0..KINDS {
+            let text = module_text(kind, gpa);
+            let shader = dev.shader_wgsl(text.as_slice())?;
+            pipes.push(dev.compute_pipeline(shader, "main")?);
+        }
+
+        var b = Build { dev: dev, wbuf: wbuf, fbuf: fbuf, sbuf: sbuf, pipes: pipes,
+            groups: Vec::new_in(gpa), unis: Vec::new_in(gpa), ops: Vec::new_in(gpa) };
+        let x = lay.x;
+        let embed_at = half_at(emb);
+        b.op(K_EMBED, u8s([embed_at, x, lay.tokpos, 0, 0, 0, 0, 0]), 16, 1, true, false);
+        ends.push(b.ops.len());
+        var li: i64 = 0;
+        var fi: i64 = 0;
+        for l in 0..LAYERS {
+            name.clear();
+            let pre = format_in(f"model.language_model.layers.{l}.", gpa);
+            rms(&b, x, lay.xn, off_in[l], HIDDEN, 1);
+            name.clear();
+            name.push_str(pre.as_slice());
+            if l % 4 == 3 {
+                // gated full attention
+                let kc_l = lay.kc + fi * MAXSEQ * 512;
+                let vc_l = lay.vc + fi * MAXSEQ * 512;
+                name.push_str("self_attn.q_proj.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.qg, 4096, HIDDEN,
+                    false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("self_attn.k_proj.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.kp, 512, HIDDEN,
+                    false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("self_attn.v_proj.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.vp, 512, HIDDEN,
+                    false);
+                b.op(K_SPLITQ, u8s([lay.qg, lay.qq, lay.gate, 0, 0, 0, 0, 0]), 32, 1, false, false);
+                rms(&b, lay.qq, lay.qq, off_qn[l], 256, 8);
+                rms(&b, lay.kp, lay.kp, off_kn[l], 256, 2);
+                b.op(K_ROPE, u8s([lay.qq, lay.kp, lay.tokpos + 1, off_rope, 0, 0, 0, 0]), 10, 1, false, true);
+                b.op(K_KVW, u8s([lay.kp, lay.vp, kc_l, vc_l, lay.tokpos + 1, 0, 0, 0]), 8, 1, false, false);
+                b.op(K_SCORES, u8s([lay.qq, kc_l, lay.sc, lay.tokpos + 1, 0, 0, 0, 0]), 32, 8, false, false);
+                b.op(K_SOFTMAX, u8s([lay.sc, lay.tokpos + 1, 0, 0, 0, 0, 0, 0]), 1, 1, false, false);
+                b.op(K_ATTN, u8s([lay.sc, vc_l, lay.gate, lay.ao, lay.tokpos + 1, 0, 0, 0]), 32, 1, false, false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("self_attn.o_proj.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.ao, x, HIDDEN, 2048, true);
+                fi += 1;
+            } else {
+                // Gated DeltaNet
+                let rs_l = lay.rs + li * 16 * 128 * 128;
+                let cs_l = lay.cs + li * 6144 * 3;
+                name.push_str("linear_attn.in_proj_qkv.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.qkv, 6144, HIDDEN,
+                    false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.in_proj_z.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.zb, 2048, HIDDEN,
+                    false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.in_proj_b.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.bb, 16, HIDDEN, false);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.in_proj_a.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.aa, 16, HIDDEN, false);
+                b.op(K_CONV, u8s([lay.qkv, lay.cv, cs_l, off_conv[l], 0, 0, 0, 0]), 96, 1, false, true);
+                b.op(K_DELTA, u8s([lay.cv, lay.bb, lay.aa, off_nega[l], off_dt[l], rs_l, lay.core, 0]), 16, 1, false, true);
+                b.op(K_GNORM, u8s([lay.core, lay.zb, off_gn[l], lay.gn, 0, 0, 0, 0]), 16, 1, false, true);
+                name.clear();
+                name.push_str(pre.as_slice());
+                name.push_str("linear_attn.out_proj.weight");
+                matvec(&b, half_at(tensor(&h, name.as_slice())), lay.gn, x, HIDDEN, 2048, true);
+                li += 1;
+            }
+            // the MLP
+            rms(&b, x, lay.xn, off_post[l], HIDDEN, 1);
+            name.clear();
+            name.push_str(pre.as_slice());
+            name.push_str("mlp.gate_proj.weight");
+            matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.g, INTER, HIDDEN, false);
+            name.clear();
+            name.push_str(pre.as_slice());
+            name.push_str("mlp.up_proj.weight");
+            matvec(&b, half_at(tensor(&h, name.as_slice())), lay.xn, lay.u, INTER, HIDDEN, false);
+            b.op(K_SWIGLU, u8s([lay.g, lay.u, lay.act, 0, 0, 0, 0, 0]), 56, 1, false, false);
+            name.clear();
+            name.push_str(pre.as_slice());
+            name.push_str("mlp.down_proj.weight");
+            matvec(&b, half_at(tensor(&h, name.as_slice())), lay.act, x, HIDDEN, INTER, true);
+            ends.push(b.ops.len());
+        }
+        rms(&b, x, lay.xn, off_final, HIDDEN, 1);
+        ends.push(b.ops.len());
+        matvec(&b, embed_at, lay.xn, lay.logits, VOCAB, HIDDEN, false);
+        Ok(Net { dev: b.dev, queue: queue, lay: lay, gpa: gpa, sbuf: b.sbuf, lbuf: lbuf,
+            dbuf: dbuf, ends: ends, pipes: b.pipes, groups: b.groups, unis: b.unis, ops: b.ops })
+    }
+
+    // Runs the token at position pos; the logits are read with `logits`
+    // when want is set.
+    pub fn step(inout self, tok: i64, pos: i64, want: bool) {
+        let words = [tok as u32, pos as u32];
+        self.queue.write_buffer(self.sbuf, self.lay.tokpos * 4, gpu::bytes_of_u32(words[..]));
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            for op in self.ops.iter() {
+                pass.set_pipeline(self.pipes[op.k]);
+                pass.set_bind_group(0, self.groups[op.g]);
+                pass.dispatch(op.gx, op.gy);
+            }
+        });
+        if want {
+            enc.copy_buffer(self.sbuf, self.lay.logits * 4, self.lbuf, 0, VOCAB * 4);
+        }
+        self.queue.submit(enc.finish());
+    }
+
+    // Clears the KV caches and the recurrent and conv states: a new prompt.
+    pub fn reset(inout self) {
+        let n = self.lay.total - self.lay.kc;
+        var zeros: Vec<f32> = Vec::filled_in(n, 0.0, self.gpa);
+        self.queue.write_buffer(self.sbuf, self.lay.kc * 4, gpu::bytes_of_f32(zeros.as_slice()));
+    }
+
+    // Runs the token at pos and returns the residual stream after the
+    // embedding, each layer and the final norm: 26 rows of 1024 (for the
+    // debug check against the reference's hidden states).
+    pub fn step_dbg(inout self, tok: i64, pos: i64) -> [f32] {
+        let words = [tok as u32, pos as u32];
+        self.queue.write_buffer(self.sbuf, self.lay.tokpos * 4, gpu::bytes_of_u32(words[..]));
+        var enc = self.dev.encoder();
+        for i in 0..self.ops.len() {
+            enc.compute_pass(|pass| {
+                pass.set_pipeline(self.pipes[self.ops[i].k]);
+                pass.set_bind_group(0, self.groups[self.ops[i].g]);
+                pass.dispatch(self.ops[i].gx, self.ops[i].gy);
+            });
+            for k in 0..self.ends.len() {
+                if self.ends[k] == i + 1 {
+                    let src = if k + 1 == self.ends.len() { self.lay.xn } else { self.lay.x };
+                    enc.copy_buffer(self.sbuf, src * 4, self.dbuf, k * 4096, 4096);
+                }
+            }
+        }
+        self.queue.submit(enc.finish());
+        gpu::f32s(self.dbuf.map_read(self.dev))
+    }
+
+    // The logits of the last step (waits for the GPU).
+    pub fn logits(inout self) -> [f32] {
+        gpu::f32s(self.lbuf.map_read(self.dev))
+    }
+}

@@ -1,0 +1,327 @@
+// The WGSL kernels of the Qwen3.5 forward pass, one module each. Every
+// module reads its parameters from a uniform `q` (eight u32s, offsets
+// into the activation buffer `s` (f32s), the bf16 weights `wt` (u32
+// words, two bf16 each, little-endian) and the f32 table `fw`), and
+// declares only the bindings it uses: 0 q, 1 wt, 2 fw, 3 s.
+
+const PRM: [u8] = "struct Prm { a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32, }\n\
+@group(0) @binding(0) var<uniform> q: Prm;\n\
+@group(0) @binding(3) var<storage, read_write> s: array<f32>;\n";
+
+const WT: [u8] = "@group(0) @binding(1) var<storage, read> wt: array<u32>;\n\
+fn wbf(h: u32) -> f32 {\n\
+    let word = wt[h >> 1u];\n\
+    let sh = (h & 1u) * 16u;\n\
+    return bitcast<f32>(((word >> sh) & 0xffffu) << 16u);\n\
+}\n";
+
+const FW: [u8] = "@group(0) @binding(2) var<storage, read> fw: array<f32>;\n";
+
+// A sum over 128 threads (a workgroup of 128), returned to all.
+const SUM128: [u8] = "var<workgroup> red: array<f32, 128>;\n\
+fn sum128(j: u32, v: f32) -> f32 {\n\
+    red[j] = v;\n\
+    workgroupBarrier();\n\
+    var st: u32 = 64u;\n\
+    while (st > 0u) {\n\
+        if (j < st) { red[j] = red[j] + red[j + st]; }\n\
+        workgroupBarrier();\n\
+        st = st / 2u;\n\
+    }\n\
+    let r = red[0];\n\
+    workgroupBarrier();\n\
+    return r;\n\
+}\n";
+
+// embed: x[i] = embedding row of the token at s[c] (bf16 at wt[a]).
+const K_EMBED: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let i = g.x;\n\
+    if (i >= 1024u) { return; }\n\
+    let tok = bitcast<u32>(s[q.c]);\n\
+    s[q.b + i] = wbf(q.a + tok * 1024u + i);\n\
+}\n";
+
+// rms (zero-centred weights are in fw already): one row of length d per
+// workgroup; a = input, b = output, c = weight in fw.
+const K_RMS: [u8] = "@compute @workgroup_size(128)\n\
+fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let bi = q.a + w.x * q.d;\n\
+    let bo = q.b + w.x * q.d;\n\
+    var acc: f32 = 0.0;\n\
+    var i = l.x;\n\
+    while (i < q.d) {\n\
+        let v = s[bi + i];\n\
+        acc = acc + v * v;\n\
+        i = i + 128u;\n\
+    }\n\
+    let ss = sum128(l.x, acc);\n\
+    let inv = inverseSqrt(ss / f32(q.d) + 1e-6);\n\
+    i = l.x;\n\
+    while (i < q.d) {\n\
+        s[bo + i] = s[bi + i] * inv * fw[q.c + i];\n\
+        i = i + 128u;\n\
+    }\n\
+}\n";
+
+// matvec: out[c.. + r] = W[a + r * e ..] . s[b ..] (f = 1: added to out),
+// one workgroup per row r = wid.x + wid.y * g, rows d, cols e.
+const K_MATVEC: [u8] = "var<workgroup> part: array<f32, 64>;\n\
+@compute @workgroup_size(64)\n\
+fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let row = w.x + w.y * q.g;\n\
+    var acc: f32 = 0.0;\n\
+    if (row < q.d) {\n\
+        // two bf16s per word: the row starts at an even halfword (the\n\
+        // columns are even), so each pair is one aligned u32\n\
+        var c = l.x * 2u;\n\
+        while (c < q.e) {\n\
+            let w = wt[(q.a + row * q.e + c) >> 1u];\n\
+            let lo = bitcast<f32>((w & 0xffffu) << 16u);\n\
+            let hi = bitcast<f32>(w & 0xffff0000u);\n\
+            acc = acc + lo * s[q.b + c] + hi * s[q.b + c + 1u];\n\
+            c = c + 128u;\n\
+        }\n\
+    }\n\
+    part[l.x] = acc;\n\
+    workgroupBarrier();\n\
+    var st: u32 = 32u;\n\
+    while (st > 0u) {\n\
+        if (l.x < st) { part[l.x] = part[l.x] + part[l.x + st]; }\n\
+        workgroupBarrier();\n\
+        st = st / 2u;\n\
+    }\n\
+    if (l.x == 0u && row < q.d) {\n\
+        if (q.f == 1u) {\n\
+            s[q.c + row] = s[q.c + row] + part[0];\n\
+        } else {\n\
+            s[q.c + row] = part[0];\n\
+        }\n\
+    }\n\
+}\n";
+
+// The causal depthwise conv over the 6144 channels, with its state
+// (3 past inputs per channel at c) and SiLU: a = input, b = output,
+// c = state, d = the weights (4 per channel) in fw.
+const K_CONV: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let c = g.x;\n\
+    if (c >= 6144u) { return; }\n\
+    let st = q.c + c * 3u;\n\
+    let s0 = s[st];\n\
+    let s1 = s[st + 1u];\n\
+    let s2 = s[st + 2u];\n\
+    let cur = s[q.a + c];\n\
+    let w4 = q.d + c * 4u;\n\
+    let y = fw[w4] * s0 + fw[w4 + 1u] * s1 + fw[w4 + 2u] * s2 + fw[w4 + 3u] * cur;\n\
+    s[st] = s1;\n\
+    s[st + 1u] = s2;\n\
+    s[st + 2u] = cur;\n\
+    s[q.b + c] = y / (1.0 + exp(-y));\n\
+}\n";
+
+// The gated delta rule, one workgroup of 128 threads per value head h
+// (thread j is value dimension j): a = conv output (q, k, v), b = beta's
+// pre-activation (16), c = a's (16), d = -exp(A_log) (fw), e = dt_bias
+// (fw), f = the state (128 x 128 per head, rows = key dimension), g = the
+// output (2048).
+const K_DELTA: [u8] = "var<workgroup> qsh: array<f32, 128>;\n\
+var<workgroup> ksh: array<f32, 128>;\n\
+@compute @workgroup_size(128)\n\
+fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let h = w.x;\n\
+    let j = l.x;\n\
+    let qv = s[q.a + h * 128u + j];\n\
+    let kv = s[q.a + 2048u + h * 128u + j];\n\
+    let qn = sum128(j, qv * qv);\n\
+    qsh[j] = qv * inverseSqrt(qn + 1e-6) * 0.08838834764831845;\n\
+    let kn = sum128(j, kv * kv);\n\
+    ksh[j] = kv * inverseSqrt(kn + 1e-6);\n\
+    workgroupBarrier();\n\
+    let bb = s[q.b + h];\n\
+    let aa = s[q.c + h];\n\
+    let beta = 1.0 / (1.0 + exp(-bb));\n\
+    let x = aa + fw[q.e + h];\n\
+    var sp = x;\n\
+    if (x <= 20.0) { sp = log(1.0 + exp(x)); }\n\
+    let decay = exp(fw[q.d + h] * sp);\n\
+    let base = q.f + h * 16384u;\n\
+    var kvm: f32 = 0.0;\n\
+    for (var i: u32 = 0u; i < 128u; i = i + 1u) {\n\
+        let idx = base + i * 128u + j;\n\
+        let sv = s[idx] * decay;\n\
+        s[idx] = sv;\n\
+        kvm = kvm + sv * ksh[i];\n\
+    }\n\
+    let delta = (s[q.a + 4096u + h * 128u + j] - kvm) * beta;\n\
+    var o: f32 = 0.0;\n\
+    for (var i: u32 = 0u; i < 128u; i = i + 1u) {\n\
+        let idx = base + i * 128u + j;\n\
+        let sv = s[idx] + ksh[i] * delta;\n\
+        s[idx] = sv;\n\
+        o = o + sv * qsh[i];\n\
+    }\n\
+    s[q.g + h * 128u + j] = o;\n\
+}\n";
+
+// The gated RMSNorm per value head: out = w * y / rms(y) * silu(z):
+// a = y (2048), b = z (2048), c = w (fw), d = out.
+const K_GNORM: [u8] = "@compute @workgroup_size(128)\n\
+fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let j = l.x;\n\
+    let h = w.x;\n\
+    let y = s[q.a + h * 128u + j];\n\
+    let ss = sum128(j, y * y);\n\
+    let z = s[q.b + h * 128u + j];\n\
+    let silu = z / (1.0 + exp(-z));\n\
+    s[q.d + h * 128u + j] = fw[q.c + j] * (y * inverseSqrt(ss / 128.0 + 1e-6)) * silu;\n\
+}\n";
+
+// The query half of the full attention's q_proj: per head 256 query
+// values then 256 gate values: a = q_proj output, b = query (2048),
+// c = gate (2048).
+const K_SPLITQ: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let idx = g.x;\n\
+    if (idx >= 2048u) { return; }\n\
+    let src = q.a + (idx / 256u) * 512u + idx % 256u;\n\
+    s[q.b + idx] = s[src];\n\
+    s[q.c + idx] = s[src + 256u];\n\
+}\n";
+
+// RoPE on the first 64 dims of 8 query heads (a = query, 2048) and 2 key
+// heads (b = key, 512), pairs (i, i + 32) at the position in s[c] (as
+// u32); d = the inverse frequencies (32) in fw.
+const K_ROPE: [u8] = "@compute @workgroup_size(32)\n\
+fn main(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let hh = w.x;\n\
+    let i = l.x;\n\
+    let pos = f32(bitcast<u32>(s[q.c]));\n\
+    let ang = pos * fw[q.d + i];\n\
+    let c = cos(ang);\n\
+    let sn = sin(ang);\n\
+    var base = q.b + (hh - 8u) * 256u;\n\
+    if (hh < 8u) { base = q.a + hh * 256u; }\n\
+    let x0 = s[base + i];\n\
+    let x1 = s[base + i + 32u];\n\
+    s[base + i] = x0 * c - x1 * sn;\n\
+    s[base + i + 32u] = x1 * c + x0 * sn;\n\
+}\n";
+
+// Writes the key (a, 512, already rotated) and the value (b) of the
+// token at s[e] into the caches c (keys) and d (values) at that position.
+const K_KVW: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let idx = g.x;\n\
+    if (idx >= 512u) { return; }\n\
+    let pos = bitcast<u32>(s[q.e]);\n\
+    s[q.c + pos * 512u + idx] = s[q.a + idx];\n\
+    s[q.d + pos * 512u + idx] = s[q.b + idx];\n\
+}\n";
+
+// The attention scores of query head h (y) at key position p (x) into
+// s[c + h * 2048 + p], scaled by 1/sqrt(256); a = query, b = key cache
+// (of this layer), c = scores, d = the position word.
+const K_SCORES: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let p = g.x;\n\
+    let h = g.y;\n\
+    let pos = bitcast<u32>(s[q.d]);\n\
+    if (p > pos) { return; }\n\
+    let kb = q.b + p * 512u + (h / 4u) * 256u;\n\
+    var dot: f32 = 0.0;\n\
+    for (var d: u32 = 0u; d < 256u; d = d + 1u) {\n\
+        dot = dot + s[q.a + h * 256u + d] * s[kb + d];\n\
+    }\n\
+    s[q.c + h * 2048u + p] = dot * 0.0625;\n\
+}\n";
+
+// Softmax over positions 0..pos for each of the 8 heads: a = scores,
+// b = the position word. One workgroup of 8 threads (thread = head).
+const K_SOFTMAX: [u8] = "@compute @workgroup_size(8)\n\
+fn main(@builtin(local_invocation_id) l: vec3<u32>) {\n\
+    let h = l.x;\n\
+    let pos = bitcast<u32>(s[q.b]);\n\
+    let base = q.a + h * 2048u;\n\
+    var m: f32 = -3.0e38;\n\
+    for (var p: u32 = 0u; p <= pos; p = p + 1u) { m = max(m, s[base + p]); }\n\
+    var sum: f32 = 0.0;\n\
+    for (var p: u32 = 0u; p <= pos; p = p + 1u) {\n\
+        let e = exp(s[base + p] - m);\n\
+        s[base + p] = e;\n\
+        sum = sum + e;\n\
+    }\n\
+    for (var p: u32 = 0u; p <= pos; p = p + 1u) { s[base + p] = s[base + p] / sum; }\n\
+}\n";
+
+// The attention output per (head, dim) idx: sum_p prob * value, times
+// sigmoid(gate): a = scores, b = value cache (this layer), c = gate
+// (2048), d = out (2048), e = the position word.
+const K_ATTN: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let idx = g.x;\n\
+    if (idx >= 2048u) { return; }\n\
+    let h = idx / 256u;\n\
+    let d = idx % 256u;\n\
+    let pos = bitcast<u32>(s[q.e]);\n\
+    let vb = q.b + (h / 4u) * 256u + d;\n\
+    var acc: f32 = 0.0;\n\
+    for (var p: u32 = 0u; p <= pos; p = p + 1u) {\n\
+        acc = acc + s[q.a + h * 2048u + p] * s[vb + p * 512u];\n\
+    }\n\
+    let gate = 1.0 / (1.0 + exp(-s[q.c + idx]));\n\
+    s[q.d + idx] = acc * gate;\n\
+}\n";
+
+// SiLU(gate) * up: a = gate (3584), b = up, c = out.
+const K_SWIGLU: [u8] = "@compute @workgroup_size(64)\n\
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {\n\
+    let i = g.x;\n\
+    if (i >= 3584u) { return; }\n\
+    let gv = s[q.a + i];\n\
+    s[q.c + i] = gv / (1.0 + exp(-gv)) * s[q.b + i];\n\
+}\n";
+
+// The kernels' module texts, by kind, as the model builds them.
+pub fn module_text(kind: i64, gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str(PRM);
+    if kind == 0 {
+        b.push_str(WT);
+        b.push_str(K_EMBED);
+    } else if kind == 1 {
+        b.push_str(FW);
+        b.push_str(SUM128);
+        b.push_str(K_RMS);
+    } else if kind == 2 {
+        b.push_str(WT);
+        b.push_str(K_MATVEC);
+    } else if kind == 3 {
+        b.push_str(FW);
+        b.push_str(K_CONV);
+    } else if kind == 4 {
+        b.push_str(FW);
+        b.push_str(SUM128);
+        b.push_str(K_DELTA);
+    } else if kind == 5 {
+        b.push_str(FW);
+        b.push_str(SUM128);
+        b.push_str(K_GNORM);
+    } else if kind == 6 {
+        b.push_str(K_SPLITQ);
+    } else if kind == 7 {
+        b.push_str(FW);
+        b.push_str(K_ROPE);
+    } else if kind == 8 {
+        b.push_str(K_KVW);
+    } else if kind == 9 {
+        b.push_str(K_SCORES);
+    } else if kind == 10 {
+        b.push_str(K_SOFTMAX);
+    } else if kind == 11 {
+        b.push_str(K_ATTN);
+    } else {
+        b.push_str(K_SWIGLU);
+    }
+    b
+}

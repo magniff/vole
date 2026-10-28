@@ -1,0 +1,146 @@
+mod st;
+mod tok;
+mod kern;
+mod model;
+mod check;
+mod gen;
+mod font;
+mod canvas;
+mod chat;
+
+#[cfg(test)]
+mod tests;
+
+use std::env;
+use std::cli::{Arg, Command};
+use model::Net;
+use gen::{Rng, sample};
+use tok::Tok;
+use canvas::Canvas;
+
+const DIR: [u8] = "/Users/magniff/workspace/tachyon/evals/tasks/0.25.2.1/qwen35/model";
+
+fn secs() -> f64 {
+    check::now_secs()
+}
+
+// The headless run: the continuation of prompt (the chat template around
+// it unless raw), streamed to stdout, with the speeds on stderr; with
+// shot, the chat as a PPM picture.
+fn headless(t: Tok, net: inout Net, prompt: [u8], max: i64, temp: f64, top_p: f64, seed: u64,
+    raw: bool, shot: [u8], gpa: Gpa) -> i32 {
+    var text = Buf::new_in(gpa);
+    if raw {
+        text.push_str(prompt);
+    } else {
+        let c = check::chat_text(prompt, gpa);
+        text.push_str(c.as_slice());
+    }
+    let ids = t.encode(text.as_slice(), gpa);
+    if ids.len() == 0 {
+        eprintln("qwen35: the prompt is empty");
+        return 2;
+    }
+    var rng = Rng::new(seed);
+    net.reset();
+    let t0 = secs();
+    for i in 0..ids.len() - 1 {
+        net.step(ids.get(i), i, false);
+    }
+    net.step(ids.get(ids.len() - 1), ids.len() - 1, true);
+    let lg0 = net.logits();
+    let prefill = secs() - t0;
+    var pos = ids.len();
+    var tok = sample(lg0, temp, top_p, &rng, gpa);
+    var n: i64 = 0;
+    var reply: Vec<u8> = Vec::new_in(gpa);
+    let t1 = secs();
+    loop {
+        if tok == tok::EOS_TEXT || tok == tok::IM_END || n >= max {
+            break;
+        }
+        let piece = t.decode([tok], gpa);
+        print(piece.as_slice());
+        reply.extend_from_slice(piece.as_slice());
+        n += 1;
+        net.step(tok, pos, true);
+        pos += 1;
+        tok = sample(net.logits(), temp, top_p, &rng, gpa);
+    }
+    let decode = secs() - t1;
+    println("");
+    eprintln(f"prefill {ids.len()} tokens in {prefill:.3} s ({ids.len() as f64 / prefill:.1} tok/s); decode {n} tokens in {decode:.3} s ({n as f64 / decode:.1} tok/s)");
+    if shot.len() > 0 {
+        var cv = Canvas::new_in(gpa);
+        cv.clear(0x101418);
+        cv.text(16, 14, 2, "Qwen3.5-0.8B, on the GPU (vole, std::gpu)", 0xE6EAF0);
+        var you = Buf::new_in(gpa);
+        you.push_str("you: ");
+        you.push_str(prompt);
+        cv.text(16, 58, 2, you.as_slice(), 0x7FB8FF);
+        cv.text(16, 90, 2, "qwen: ", 0x9EE6A6);
+        var r = 0;
+        var line: Vec<u8> = Vec::new_in(gpa);
+        for b in reply.as_slice() {
+            if b == 10 || line.len() >= 80 {
+                cv.text(16 + 6 * 2 * 6, 90 + r * 16, 2, line.as_slice(), 0xE6EAF0);
+                line.clear();
+                r += 1;
+            }
+            if b != 10 {
+                line.push(b);
+            }
+        }
+        cv.text(16 + 6 * 2 * 6, 90 + r * 16, 2, line.as_slice(), 0xE6EAF0);
+        if cv.write_ppm(shot, gpa) {
+            eprintln(f"wrote {shot}");
+        }
+    }
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("qwen35", gpa)
+        .about("Qwen3.5-0.8B on the GPU: the chat window, or --headless")
+        .arg(Arg::flag("headless").help("no window: print the reply to --prompt"))
+        .arg(Arg::flag("check").help("headless: check against reference/reference.json"))
+        .arg(Arg::option("prompt").value_name("TEXT").help("the user's message (window: sent at once)"))
+        .arg(Arg::option("tokens").value_name("N").default("64").help("headless: tokens to generate"))
+        .arg(Arg::option("temp").value_name("T").default("0").help("temperature (0: greedy; the window 0.7)"))
+        .arg(Arg::option("top-p").value_name("P").default("1").help("nucleus cut for sampling (window 0.9)"))
+        .arg(Arg::option("seed").value_name("N").default("1").help("the sampler's seed"))
+        .arg(Arg::option("frames").value_name("N").default("0").help("window: quit after N frames"))
+        .arg(Arg::option("shot").value_name("FILE.ppm").help("headless: the chat as a PPM picture"))
+        .arg(Arg::flag("raw").help("headless: the prompt without the chat template"))
+        .arg(Arg::flag("layers").help("the hidden state after each layer (debug)"));
+    let m = cli.parse_or_exit(env::args());
+    let t = tok::Tok::load(DIR, gpa);
+    var net = match Net::new_in(DIR, gpa) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln(f"qwen35: {e}");
+            return 1;
+        }
+    };
+    if m.flag("layers") {
+        check::run_layers(&net, t, "def fibonacci(n):\n    ", gpa);
+        return 0;
+    }
+    let prompt = m.get("prompt").unwrap_or("");
+    if m.flag("headless") || m.flag("check") {
+        if m.flag("check") {
+            return check::run_check(&net, t, gpa);
+        }
+        let max = parse_int(m.get("tokens").unwrap_or("64")).unwrap_or(64);
+        let temp = std::num::parse_f64(m.get("temp").unwrap_or("0")).unwrap_or(0.0);
+        let top_p = std::num::parse_f64(m.get("top-p").unwrap_or("1")).unwrap_or(1.0);
+        let seed = parse_int(m.get("seed").unwrap_or("1")).unwrap_or(1) as u64;
+        return headless(t, &net, if prompt.len() > 0 { prompt } else { "Hello" }, max, temp,
+            top_p, seed, m.flag("raw"), m.get("shot").unwrap_or(""), gpa);
+    }
+    let temp = std::num::parse_f64(m.get("temp").unwrap_or("0.7")).unwrap_or(0.7);
+    let top_p = std::num::parse_f64(m.get("top-p").unwrap_or("0.9")).unwrap_or(0.9);
+    let seed = parse_int(m.get("seed").unwrap_or("1")).unwrap_or(1) as u64;
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    chat::window(&net, t, prompt, frames, temp, top_p, seed, gpa)
+}

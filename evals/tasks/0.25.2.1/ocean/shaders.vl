@@ -1,0 +1,174 @@
+// The WGSL of the ocean, one module per pipeline (a layout is the
+// bindings of its module). Complex numbers are vec2<f32> (re, im).
+// Field buffers hold three n x n fields back to back: 0 the height h,
+// 1 and 2 the horizontal displacements Dx and Dz (Tessendorf's choppy
+// waves), each row-major, index = row * n + col; col is x, row is z.
+
+// Time evolution: h(k,t) = h0(k) e^{i w t} + conj(h0(-k)) e^{-i w t},
+// w = sqrt(g |k|); Dx = -i kx/|k| h, Dz = -i kz/|k| h.
+pub const EVAL: [u8] = "struct E { time: f32, length: f32, n: f32, pad: f32 }\n\
+    @group(0) @binding(0) var<uniform> e: E;\n\
+    @group(0) @binding(1) var<storage, read> h0: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> spec: array<vec2<f32>>;\n\
+    fn fold(i: u32, n: u32) -> f32 {\n\
+    var k = f32(i);\n\
+    if (i >= n / 2u) { k = f32(i) - f32(n); }\n\
+    return k;\n\
+    }\n\
+    @compute @workgroup_size(8, 8) fn evolve(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(e.n);\n\
+    if (id.x >= n || id.y >= n) { return; }\n\
+    let c = id.x;\n\
+    let r = id.y;\n\
+    let idx = r * n + c;\n\
+    let midx = ((n - r) % n) * n + (n - c) % n;\n\
+    let tau = 6.283185307179586;\n\
+    let kx = tau * fold(c, n) / e.length;\n\
+    let kz = tau * fold(r, n) / e.length;\n\
+    let k = sqrt(kx * kx + kz * kz);\n\
+    let w = sqrt(9.81 * k);\n\
+    let a = h0[idx];\n\
+    let m = h0[midx];\n\
+    let ph = w * e.time;\n\
+    let c0 = cos(ph);\n\
+    let s0 = sin(ph);\n\
+    let t1 = vec2<f32>(a.x * c0 - a.y * s0, a.x * s0 + a.y * c0);\n\
+    let t2 = vec2<f32>(m.x * c0 - m.y * s0, -m.y * c0 - m.x * s0);\n\
+    let hh = t1 + t2;\n\
+    var dx = vec2<f32>(0.0, 0.0);\n\
+    var dz = vec2<f32>(0.0, 0.0);\n\
+    if (k > 0.0) {\n\
+    dx = (kx / k) * vec2<f32>(hh.y, -hh.x);\n\
+    dz = (kz / k) * vec2<f32>(hh.y, -hh.x);\n\
+    }\n\
+    spec[idx] = hh;\n\
+    spec[n * n + idx] = dx;\n\
+    spec[2u * n * n + idx] = dz;\n\
+    }\n";
+
+// One Stockham radix-2 stage of a 1-D FFT along every row (dir 0) or
+// column (dir 1) of the three fields, src -> dst (ping-pong). inv 1 is
+// the inverse (+i), 0 the forward (-i); unnormalised. Thread (x, y, z):
+// x the butterfly, y the line, z the field.
+pub const STAGE: [u8] = "struct S { n: u32, ns: u32, dir: u32, inv: u32 }\n\
+    @group(0) @binding(0) var<uniform> s: S;\n\
+    @group(0) @binding(1) var<storage, read> src: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> dst: array<vec2<f32>>;\n\
+    @compute @workgroup_size(8, 8) fn stage(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = s.n;\n\
+    let half = n / 2u;\n\
+    if (id.x >= half || id.y >= n || id.z >= 3u) { return; }\n\
+    let tid = id.x;\n\
+    let line = id.y;\n\
+    let base = id.z * n * n;\n\
+    var off = base + line * n;\n\
+    var stride = 1u;\n\
+    if (s.dir == 1u) {\n\
+    off = base + line;\n\
+    stride = n;\n\
+    }\n\
+    var sgn = -1.0;\n\
+    if (s.inv == 1u) { sgn = 1.0; }\n\
+    let idx = tid & (s.ns - 1u);\n\
+    let a = src[off + tid * stride];\n\
+    let b0 = src[off + (tid + half) * stride];\n\
+    let ang = sgn * 6.283185307179586 * f32(idx) / f32(2u * s.ns);\n\
+    let wc = cos(ang);\n\
+    let ws = sin(ang);\n\
+    let b = vec2<f32>(b0.x * wc - b0.y * ws, b0.x * ws + b0.y * wc);\n\
+    let j = 2u * tid - idx;\n\
+    dst[off + j * stride] = a + b;\n\
+    dst[off + (j + s.ns) * stride] = a - b;\n\
+    }\n";
+
+// The mesh: each quad of the n x n height field, drawn 3 x 3 tiles
+// (instances). A vertex displaces its sample by -lambda D, takes its
+// normal and the Jacobian (foam where the surface folds over).
+// Camera: eye, right, up, fwd; lens = (focal, aspect, near, far);
+// sun = direction to the sun; wave = (lambda, patch length, n, _).
+pub const RENDER: [u8] = "struct R {\n\
+    eye: vec4<f32>,\n\
+    rgt: vec4<f32>,\n\
+    upv: vec4<f32>,\n\
+    fwd: vec4<f32>,\n\
+    lens: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    wave: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> r: R;\n\
+    @group(0) @binding(1) var<storage, read> field: array<vec2<f32>>;\n\
+    struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) normal: vec3<f32>,\n\
+    @location(2) foam: f32,\n\
+    }\n\
+    fn disp(i: i32, j: i32) -> vec3<f32> {\n\
+    let n = i32(r.wave.z);\n\
+    let wi = ((i % n) + n) % n;\n\
+    let wj = ((j % n) + n) % n;\n\
+    let nn = u32(r.wave.z) * u32(r.wave.z);\n\
+    let idx = u32(wj * n + wi);\n\
+    let s = r.wave.y / r.wave.z;\n\
+    let h = field[idx].x;\n\
+    let dx = field[nn + idx].x;\n\
+    let dz = field[2u * nn + idx].x;\n\
+    return vec3<f32>(f32(i) * s - r.wave.x * dx, h, f32(j) * s - r.wave.x * dz);\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> V {\n\
+    let n = u32(r.wave.z);\n\
+    let q = vi / 6u;\n\
+    let corner = vi % 6u;\n\
+    var dx = 0;\n\
+    var dy = 0;\n\
+    if (corner == 1u || corner == 2u || corner == 4u) { dx = 1; }\n\
+    if (corner == 2u || corner == 4u || corner == 5u) { dy = 1; }\n\
+    let i = i32(q % n) + dx;\n\
+    let j = i32(q / n) + dy;\n\
+    let tx = f32(i32(inst % 3u) - 1) * r.wave.y;\n\
+    let tz = f32(i32(inst / 3u) - 1) * r.wave.y;\n\
+    let p = disp(i, j);\n\
+    let tgx = disp(i + 1, j) - disp(i - 1, j);\n\
+    let tgz = disp(i, j + 1) - disp(i, j - 1);\n\
+    let s = r.wave.y / r.wave.z;\n\
+    let nrm = normalize(cross(tgz, tgx));\n\
+    let jac = (tgx.x * tgz.z - tgx.z * tgz.x) / (4.0 * s * s);\n\
+    let world = p + vec3<f32>(tx, 0.0, tz);\n\
+    let rel = world - r.eye.xyz;\n\
+    let xc = dot(rel, r.rgt.xyz);\n\
+    let yc = dot(rel, r.upv.xyz);\n\
+    let zc = dot(rel, r.fwd.xyz);\n\
+    let f = r.lens.x;\n\
+    let a = r.lens.w / (r.lens.w - r.lens.z);\n\
+    var o: V;\n\
+    o.pos = vec4<f32>(xc * f / r.lens.y, yc * f, a * (zc - r.lens.z), zc);\n\
+    o.world = world;\n\
+    o.normal = nrm;\n\
+    o.foam = 1.0 - smoothstep(-0.05, 0.2, jac);\n\
+    return o;\n\
+    }\n\
+    fn sky(d: vec3<f32>) -> vec3<f32> {\n\
+    let sun = normalize(r.sun.xyz);\n\
+    let t = clamp(d.y, 0.0, 1.0);\n\
+    var col = mix(vec3<f32>(0.62, 0.74, 0.86), vec3<f32>(0.16, 0.34, 0.68), pow(t, 0.5));\n\
+    let s = max(dot(d, sun), 0.0);\n\
+    col = col + vec3<f32>(1.0, 0.92, 0.75) * (pow(s, 900.0) * 10.0 + pow(s, 24.0) * 0.3);\n\
+    return col;\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let n = normalize(v.normal);\n\
+    let to_eye = normalize(r.eye.xyz - v.world);\n\
+    let cosv = max(dot(n, to_eye), 0.0);\n\
+    let fres = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);\n\
+    let refl = reflect(-to_eye, n);\n\
+    let sun = normalize(r.sun.xyz);\n\
+    let body = vec3<f32>(0.006, 0.05, 0.07);\n\
+    var col = mix(body, sky(refl), fres);\n\
+    let hv = normalize(sun + to_eye);\n\
+    col = col + vec3<f32>(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 500.0) * 1.2;\n\
+    col = mix(col, vec3<f32>(0.9, 0.94, 0.96), v.foam * 0.8);\n\
+    let dist = length(r.eye.xyz - v.world);\n\
+    let fog = clamp(dist / 1200.0, 0.0, 1.0);\n\
+    col = mix(col, vec3<f32>(0.62, 0.74, 0.86), fog * fog);\n\
+    return vec4<f32>(col, 1.0);\n\
+    }\n";

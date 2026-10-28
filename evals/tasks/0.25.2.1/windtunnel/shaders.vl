@@ -1,0 +1,193 @@
+// shaders.vl: the WGSL of the lattice, one module per kernel. Each is
+// COMMON (the uniform and the D2Q9 helpers) followed by its own bindings
+// and entry point; the binding numbers are the sim's bind groups'.
+
+// The uniform: the grid, 1/tau, the inflow speed, the walls' mode, the
+// dye, the probe's cell and sample slot (0xffffffff: none), the view.
+pub const COMMON: [u8] = "struct P {\n\
+    nx: u32, ny: u32, omega: f32, u_in: f32,\n\
+    closed: u32, dye_on: u32, probe: u32, slot: u32,\n\
+    view: u32, pad0: u32, pad1: u32, pad2: u32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> p: P;\n\
+    fn ci(i: u32) -> vec2<i32> {\n\
+    var c = array<vec2<i32>, 9>(vec2<i32>(0, 0), vec2<i32>(1, 0), vec2<i32>(0, 1),\n\
+    vec2<i32>(-1, 0), vec2<i32>(0, -1), vec2<i32>(1, 1), vec2<i32>(-1, 1),\n\
+    vec2<i32>(-1, -1), vec2<i32>(1, -1));\n\
+    return c[i];\n\
+    }\n\
+    fn wi(i: u32) -> f32 {\n\
+    var w = array<f32, 9>(4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,\n\
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0);\n\
+    return w[i];\n\
+    }\n\
+    fn oi(i: u32) -> u32 {\n\
+    var o = array<u32, 9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);\n\
+    return o[i];\n\
+    }\n\
+    fn feq(i: u32, rho: f32, u: vec2<f32>) -> f32 {\n\
+    let cu = 3.0 * dot(vec2<f32>(ci(i)), u);\n\
+    return wi(i) * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * dot(u, u));\n\
+    }\n";
+
+// BGK collision in place, with the obstacle's cells left alone; writes the
+// density and velocity of each fluid cell to mac (rho, ux, uy, 0).
+pub const COLLIDE: [u8] = "@group(0) @binding(1) var<storage, read_write> f: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> mask: array<u32>;\n\
+    @group(0) @binding(3) var<storage, read_write> mac: array<vec4<f32>>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= p.nx || id.y >= p.ny) { return; }\n\
+    let n = p.nx * p.ny;\n\
+    let cell = id.y * p.nx + id.x;\n\
+    if (mask[cell] != 0u) { mac[cell] = vec4<f32>(1.0, 0.0, 0.0, 0.0); return; }\n\
+    var fi: array<f32, 9>;\n\
+    var rho: f32 = 0.0;\n\
+    var m = vec2<f32>(0.0, 0.0);\n\
+    for (var i = 0u; i < 9u; i++) {\n\
+    let v = f[i * n + cell];\n\
+    fi[i] = v;\n\
+    rho += v;\n\
+    m += vec2<f32>(ci(i)) * v;\n\
+    }\n\
+    let u = m / rho;\n\
+    mac[cell] = vec4<f32>(rho, u.x, u.y, 0.0);\n\
+    for (var i = 0u; i < 9u; i++) {\n\
+    f[i * n + cell] = fi[i] + p.omega * (feq(i, rho, u) - fi[i]);\n\
+    }\n\
+    }\n";
+
+// Streaming: each population moves one cell along its direction (pulled
+// from the cell behind). A wall is bounce-back; the left edge is the inflow
+// (or a wall, closed), the right edge the outflow (or a wall, closed). An
+// obstacle reflects the population back into its cell; an obstacle's own
+// cells are kept at rest.
+pub const STREAM: [u8] = "@group(0) @binding(1) var<storage, read> src: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> dst: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read> mask: array<u32>;\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= p.nx || id.y >= p.ny) { return; }\n\
+    let n = p.nx * p.ny;\n\
+    let cell = id.y * p.nx + id.x;\n\
+    let solid = mask[cell] != 0u;\n\
+    for (var i = 0u; i < 9u; i++) {\n\
+    let c = ci(i);\n\
+    let o = oi(i);\n\
+    var v: f32 = wi(i);\n\
+    if (!solid) {\n\
+    let sx = i32(id.x) - c.x;\n\
+    let sy = i32(id.y) - c.y;\n\
+    if (sy < 0 || sy >= i32(p.ny)) {\n\
+    v = src[o * n + cell];\n\
+    } else if (sx < 0) {\n\
+    if (p.closed != 0u) { v = src[o * n + cell]; }\n\
+    else { v = feq(i, 1.0, vec2<f32>(p.u_in, 0.0)); }\n\
+    } else if (sx >= i32(p.nx)) {\n\
+    if (p.closed != 0u) { v = src[o * n + cell]; }\n\
+    else { v = src[i * n + cell]; }\n\
+    } else {\n\
+    let s = u32(sy) * p.nx + u32(sx);\n\
+    if (mask[s] != 0u) { v = src[o * n + cell]; }\n\
+    else { v = src[i * n + s]; }\n\
+    }\n\
+    }\n\
+    dst[i * n + cell] = v;\n\
+    }\n\
+    }\n";
+
+// Dye: advected by the velocity (semi-Lagrangian, bilinear); injected at the
+// inlet as coloured bands, 12 cells tall, every other band.
+pub const DYE: [u8] = "@group(0) @binding(1) var<storage, read> dye_in: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> dye_out: array<vec4<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> mac: array<vec4<f32>>;\n\
+    @group(0) @binding(4) var<storage, read> mask: array<u32>;\n\
+    fn at(x: i32, y: i32) -> vec4<f32> {\n\
+    let cx = clamp(x, 0, i32(p.nx) - 1);\n\
+    let cy = clamp(y, 0, i32(p.ny) - 1);\n\
+    return dye_in[u32(cy) * p.nx + u32(cx)];\n\
+    }\n\
+    fn band(b: u32) -> vec4<f32> {\n\
+    let t = f32(b) * 0.13;\n\
+    let c = 0.5 + 0.5 * cos(6.2831853 * (vec3<f32>(t) + vec3<f32>(0.0, 0.33, 0.67)));\n\
+    return vec4<f32>(c, 1.0);\n\
+    }\n\
+    @compute @workgroup_size(8, 8)\n\
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= p.nx || id.y >= p.ny) { return; }\n\
+    let cell = id.y * p.nx + id.x;\n\
+    if (mask[cell] != 0u) { dye_out[cell] = vec4<f32>(0.0); return; }\n\
+    let m = mac[cell];\n\
+    let px = f32(id.x) - m.y;\n\
+    let py = f32(id.y) - m.z;\n\
+    let x0 = floor(px);\n\
+    let y0 = floor(py);\n\
+    let fx = px - x0;\n\
+    let fy = py - y0;\n\
+    let ix = i32(x0);\n\
+    let iy = i32(y0);\n\
+    var d = mix(mix(at(ix, iy), at(ix + 1, iy), fx), mix(at(ix, iy + 1), at(ix + 1, iy + 1), fx), fy);\n\
+    if (p.dye_on != 0u && id.x < 3u) {\n\
+    let b = id.y / 12u;\n\
+    if (b % 2u == 0u) { d = band(b); } else { d = vec4<f32>(0.0); }\n\
+    }\n\
+    dye_out[cell] = d;\n\
+    }\n";
+
+// The probe: the vertical speed of one cell, into the sample slot if there is one.
+pub const SAMPLE: [u8] = "@group(0) @binding(1) var<storage, read> mac: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> probe: array<f32>;\n\
+    @compute @workgroup_size(1)\n\
+    fn main() {\n\
+    if (p.slot < arrayLength(&probe)) { probe[p.slot] = mac[p.probe].z; }\n\
+    }\n";
+
+// The picture: a full-screen triangle; each fragment shows its cell's
+// speed, vorticity, dye or pressure (solid cells grey).
+pub const RENDER: [u8] = "@group(0) @binding(1) var<storage, read> mac: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> dye: array<vec4<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> mask: array<u32>;\n\
+    struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    var q = vec2<f32>(-1.0, -1.0);\n\
+    if (vi == 1u) { q = vec2<f32>(3.0, -1.0); }\n\
+    if (vi == 2u) { q = vec2<f32>(-1.0, 3.0); }\n\
+    return VOut(vec4<f32>(q, 0.0, 1.0), vec2<f32>(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5));\n\
+    }\n\
+    fn heat(t: f32) -> vec3<f32> {\n\
+    let x = clamp(t, 0.0, 1.0);\n\
+    return clamp(vec3<f32>(1.5 - abs(4.0 * x - 3.0), 1.5 - abs(4.0 * x - 2.0), 1.5 - abs(4.0 * x - 1.0)), vec3<f32>(0.0), vec3<f32>(1.0));\n\
+    }\n\
+    fn diverge(t: f32) -> vec3<f32> {\n\
+    let x = clamp(t, -1.0, 1.0);\n\
+    if (x >= 0.0) { return vec3<f32>(1.0, 1.0 - 0.85 * x, 1.0 - 0.95 * x); }\n\
+    return vec3<f32>(1.0 + 0.95 * x, 1.0 + 0.85 * x, 1.0);\n\
+    }\n\
+    fn cell_at(x: i32, y: i32) -> vec4<f32> {\n\
+    let cx = clamp(x, 0, i32(p.nx) - 1);\n\
+    let cy = clamp(y, 0, i32(p.ny) - 1);\n\
+    return mac[u32(cy) * p.nx + u32(cx)];\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    let fx = min(i32(v.uv.x * f32(p.nx)), i32(p.nx) - 1);\n\
+    let fy = min(i32(v.uv.y * f32(p.ny)), i32(p.ny) - 1);\n\
+    let cell = u32(fy) * p.nx + u32(fx);\n\
+    if (mask[cell] != 0u) { return vec4<f32>(0.20, 0.21, 0.25, 1.0); }\n\
+    var c = vec3<f32>(0.0);\n\
+    if (p.view == 0u) {\n\
+    let m = mac[cell];\n\
+    c = heat(length(vec2<f32>(m.y, m.z)) / 0.12);\n\
+    } else if (p.view == 1u) {\n\
+    let r = cell_at(fx + 1, fy);\n\
+    let l = cell_at(fx - 1, fy);\n\
+    let dn = cell_at(fx, fy + 1);\n\
+    let up = cell_at(fx, fy - 1);\n\
+    let curl = 0.5 * (r.z - l.z) - 0.5 * (dn.y - up.y);\n\
+    c = diverge(curl / 0.012);\n\
+    } else if (p.view == 2u) {\n\
+    c = dye[cell].xyz;\n\
+    } else {\n\
+    c = diverge((mac[cell].x - 1.0) * 150.0);\n\
+    }\n\
+    return vec4<f32>(c, 1.0);\n\
+    }\n";

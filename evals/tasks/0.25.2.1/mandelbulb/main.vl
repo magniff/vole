@@ -1,0 +1,502 @@
+// mandelbulb: a Mandelbulb and a quaternion Julia set, raymarched on the
+// GPU by one WGSL fragment shader (shader.vl, std::gpu). Distance
+// estimation, soft shadows and ambient occlusion; a fly camera (camera.vl)
+// with the mouse and the keys, and the power changed live.
+//
+//   mandelbulb [--power P] [--julia] [--iters N] [--frames N] [--shot F.ppm]
+//              the window (--frames N quits after N frames and prints the
+//              mean frame time; --shot writes the last frame)
+//   mandelbulb --headless [--size N] [--frames N] [--view K] [--shot F.ppm]
+//              no window: three fixed views, the hit fraction, brightness
+//              and a checksum of each, their GPU time, and a PPM of view K
+
+mod camera;
+mod shader;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{BufferUsage, Format, PassDesc, RawSurface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use camera::{Cam, v3};
+
+// What the picture shows: the fractal and its settings.
+struct Look {
+    julia: bool,
+    power: f64,
+    iters: i64,
+    shadows: bool,
+    ao: bool,
+    // white where a ray hits, black elsewhere (the headless hit check)
+    debug: bool,
+}
+
+// The power is clamped to 2..12: below 2 the bulb is not a surface.
+fn clamp_power(p: f64) -> f64 {
+    p.clamp(2.0, 12.0)
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn flag(b: bool) -> f64 {
+    if b { 1.0 } else { 0.0 }
+}
+
+// The Julia constant at time t: it drifts slowly, so the set changes.
+fn julia_c(t: f64) -> [f64; 4] {
+    [-0.2 + 0.1 * (0.3 * t).sin(), 0.6 + 0.1 * (0.5 * t).cos(), 0.2 + 0.05 * (0.7 * t).sin(), 0.2]
+}
+
+// The uniform block of shader.vl, in WGSL's layout (28 f32s, 112 bytes).
+fn uniforms(w: i64, h: i64, t: f64, look: Look, cam: Cam) -> [f32; 28] {
+    let e = cam.eye();
+    let (fw, rt, up) = cam.basis();
+    let focal = 1.6;
+    let c = julia_c(t);
+    return [
+        w as f32, h as f32, t as f32, look.power as f32,
+        e.x as f32, e.y as f32, e.z as f32, flag(look.julia) as f32,
+        fw.x as f32, fw.y as f32, fw.z as f32, focal as f32,
+        rt.x as f32, rt.y as f32, rt.z as f32, 0.0,
+        up.x as f32, up.y as f32, up.z as f32, 0.0,
+        c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32,
+        look.iters as f32, flag(look.shadows) as f32, flag(look.ao) as f32, flag(look.debug) as f32,
+    ];
+}
+
+fn make_pipeline(dev: gpu::Device) -> Result<gpu::RenderPipeline, gpu::Error> {
+    let sh = dev.shader_wgsl(shader::SHADE)?;
+    dev.render_pipeline(gpu::RenderDesc::new(sh, "vs", "fs", Format::Bgra8Unorm))
+}
+
+// One frame of the fractal into `target`, submitted (not waited for).
+fn draw(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::RenderPipeline,
+    group: gpu::BindGroup, target: gpu::TextureView) {
+    var enc = dev.encoder();
+    enc.render_pass(PassDesc::color(target), |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.draw(0..3, 0..1);
+    });
+    queue.submit(enc.finish());
+}
+
+// The row stride of a readback: rows are 256-byte aligned.
+fn stride_of(w: i64) -> i64 {
+    (w * 4 + 255) / 256 * 256
+}
+
+// The current uniforms rendered into a fresh w x h texture and read back
+// as a PPM (RGB, from the BGRA texture). Waits for the GPU.
+fn snapshot(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::RenderPipeline,
+    group: gpu::BindGroup, w: i64, h: i64, gpa: Gpa) -> Result<Buf, gpu::Error> {
+    let tex = dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let stride = stride_of(w);
+    var out = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    draw(dev, &queue, pipe, group, tex.view());
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(tex, out, stride);
+    queue.submit(enc.finish());
+    let px = out.map_read(dev);
+    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            b.push(px[i + 2]);
+            b.push(px[i + 1]);
+            b.push(px[i]);
+        }
+    }
+    Ok(b)
+}
+
+// The numbers of an RGB PPM from snapshot: the bytes after its header
+// (header_len), and over them the share of pure white pixels (the hit
+// check's image), the mean brightness, and an FNV-1a checksum.
+// The decimal digits of n (n >= 0).
+fn digits(n: i64) -> i64 {
+    var k = 1;
+    var x = n;
+    while x >= 10 {
+        x = x / 10;
+        k += 1;
+    }
+    k
+}
+
+// "P6\n" + w + " " + h + "\n255\n" in bytes.
+fn header_len(w: i64, h: i64) -> i64 {
+    3 + digits(w) + 1 + digits(h) + 5
+}
+
+fn hit_share(img: [u8], w: i64, h: i64) -> f64 {
+    let at = header_len(w, h);
+    var white = 0;
+    let n = w * h;
+    for i in 0..n {
+        let j = at + i * 3;
+        if img[j] == 255 && img[j + 1] == 255 && img[j + 2] == 255 {
+            white += 1;
+        }
+    }
+    white as f64 / n as f64
+}
+
+fn brightness(img: [u8], w: i64, h: i64) -> f64 {
+    let at = header_len(w, h);
+    var sum = 0;
+    for j in at..img.len() {
+        sum += img[j] as i64;
+    }
+    sum as f64 / ((img.len() - at) as f64 * 255.0)
+}
+
+fn checksum(img: [u8], w: i64, h: i64) -> u64 {
+    let at = header_len(w, h);
+    var hash: u64 = 14695981039346656037;
+    for j in at..img.len() {
+        hash = (hash ^ img[j] as u64) * 1099511628211;
+    }
+    hash
+}
+
+// The three fixed views of the headless run, with the base settings.
+fn view_of(k: i64, base: Look) -> (Cam, Look) {
+    var look = base;
+    if k == 0 {
+        look.julia = false;
+        look.power = 8.0;
+        return (Cam::at(v3(0.0, 0.0, 0.0), 0.7, 0.25, 3.8), look);
+    }
+    if k == 1 {
+        look.julia = false;
+        look.power = 5.0;
+        return (Cam::at(v3(0.0, 0.05, 0.0), 2.1, -0.1, 2.2), look);
+    }
+    look.julia = true;
+    return (Cam::at(v3(0.0, 0.0, 0.0), 0.3, 0.15, 3.4), look);
+}
+
+fn headless(base: Look, size: i64, frames: i64, view: i64, shot: [u8], gpa: Gpa)
+    -> Result<i32, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    let pipe = make_pipeline(dev)?;
+    let ubuf = dev.buffer(dev.align_uniform(112), BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+    let target = dev.texture(size, size, Format::Bgra8Unorm, usage: TextureUsage::RENDER_ATTACHMENT);
+    var ok = 0;
+    for k in 0..3 {
+        let (cam, look) = view_of(k, base);
+        var mask = look;
+        mask.debug = true;
+        let um = uniforms(size, size, 0.0, mask, cam);
+        queue.write_buffer(ubuf, 0, gpu::bytes_of_f32(um[..]));
+        let hits = snapshot(dev, &queue, pipe, group, size, size, gpa)?;
+        let share = hit_share(hits.as_slice(), size, size);
+        let u = uniforms(size, size, 0.0, look, cam);
+        queue.write_buffer(ubuf, 0, gpu::bytes_of_f32(u[..]));
+        let img = snapshot(dev, &queue, pipe, group, size, size, gpa)?;
+        let bright = brightness(img.as_slice(), size, size);
+        let sum = checksum(img.as_slice(), size, size);
+        // timing: the mean of rounds of `frames` frames; round 0 warms up
+        var best = 1.0e9;
+        var total = 0.0;
+        for round in 0..4 {
+            let t0 = monotonic_now();
+            for _ in 0..frames {
+                draw(dev, &queue, pipe, group, target.view());
+            }
+            let _ = queue.wait_idle();
+            let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / frames as f64;
+            if round > 0 {
+                total += ms;
+                if ms < best { best = ms; }
+            }
+        }
+        let mean = total / 3.0;
+        let name = if look.julia { "quaternion Julia set" } else { "Mandelbulb" };
+        println(f"view {k}: {name}, power {look.power:.2}, c {julia_c(0.0)[0]:.2}, {julia_c(0.0)[1]:.2} (t = 0)");
+        println(f"  pixels hit: {share * 100.0:.1}%  brightness: {bright:.3}  checksum: {sum}");
+        println(f"  {size} x {size} with {look.iters} iterations, shadows {look.shadows}, ao {look.ao}: best {best:.2} ms, mean {mean:.2} ms a frame ({frames} frames a round)");
+        if share > 0.05 && bright > 0.02 {
+            ok += 1;
+        }
+        if k == view && shot.len() > 0 {
+            if std::fs::write(shot, img.as_slice()).is_err() {
+                eprintln(f"mandelbulb: cannot write {shot}");
+            }
+        }
+    }
+    if ok == 3 { Ok(0) } else { Ok(1) }
+}
+
+// What the keys and the mouse have asked for, between frames.
+struct Input {
+    fwd: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    rise: bool,
+    down: bool,
+    turn_l: bool,
+    turn_r: bool,
+    pitch_u: bool,
+    pitch_d: bool,
+    drag: bool,
+    mx: f64,
+    my: f64,
+    auto: bool,
+    paused: bool,
+    quit: bool,
+}
+
+fn axis(a: bool, b: bool) -> f64 {
+    flag(a) - flag(b)
+}
+
+// A key going down or up. Movement keys are held; the others act on press.
+fn on_key(inp: inout Input, cam: inout Cam, look: inout Look, key: Logical, down: bool) {
+    match key {
+        Logical::Char(c) => {
+            if c == 'w' as u32 { inp.fwd = down; }
+            else if c == 's' as u32 { inp.back = down; }
+            else if c == 'a' as u32 { inp.left = down; }
+            else if c == 'd' as u32 { inp.right = down; }
+            else if c == 'e' as u32 { inp.rise = down; }
+            else if c == 'q' as u32 { inp.down = down; }
+            else if !down { }
+            else if c == 'j' as u32 { look.julia = !look.julia; }
+            else if c == 'i' as u32 { look.shadows = !look.shadows; }
+            else if c == 'o' as u32 { look.ao = !look.ao; }
+            else if c == 'f' as u32 { inp.auto = !inp.auto; }
+            else if c == ' ' as u32 { inp.paused = !inp.paused; }
+            else if c == 'r' as u32 { cam.reset(); }
+            else if c == '[' as u32 { look.power = clamp_power(look.power - 0.25); }
+            else if c == ']' as u32 { look.power = clamp_power(look.power + 0.25); }
+            else if c == '=' as u32 || c == '+' as u32 { cam.zoom(-0.1); }
+            else if c == '-' as u32 { cam.zoom(0.1); }
+        }
+        Logical::Named(Named::ArrowLeft) => inp.turn_l = down,
+        Logical::Named(Named::ArrowRight) => inp.turn_r = down,
+        Logical::Named(Named::ArrowUp) => inp.pitch_u = down,
+        Logical::Named(Named::ArrowDown) => inp.pitch_d = down,
+        Logical::Named(Named::Escape) => {
+            if down { inp.quit = true; }
+        }
+        _ => {}
+    }
+}
+
+fn windowed(look0: Look, frames: i64, shot: [u8], gpa: Gpa) -> Result<i32, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("mandelbulb: no window server (try --headless)");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("mandelbulb", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("mandelbulb: no window");
+            return Ok(1);
+        }
+    };
+    let sz = win.size();
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    surf.configure(dev, sz.w, sz.h);
+    let pipe = make_pipeline(dev)?;
+    let ubuf = dev.buffer(dev.align_uniform(112), BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+    var cam = Cam::at(v3(0.0, 0.0, 0.0), 0.6, 0.25, 3.0);
+    var look = look0;
+    var inp = Input {
+        fwd: false, back: false, left: false, right: false, rise: false, down: false,
+        turn_l: false, turn_r: false, pitch_u: false, pitch_d: false,
+        drag: false, mx: 0.0, my: 0.0, auto: false, paused: false, quit: false,
+    };
+    let start = monotonic_now();
+    var prev = 0.0;
+    var clock = 0.0;
+    var done = 0;
+    var first = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var dt = now - prev;
+                if done == 0 || dt > 1.0 / 30.0 { dt = 1.0 / 60.0; }
+                if dt < 1.0 / 240.0 { dt = 1.0 / 240.0; }
+                prev = now;
+                if !inp.paused { clock += dt; }
+                if inp.auto {
+                    // a slow orbit and a drift through the set
+                    cam.turn(0.12 * dt, 0.0);
+                    cam.want.target = v3(0.3 * (0.21 * clock).sin(), 0.2 * (0.17 * clock).sin(),
+                        0.3 * (0.13 * clock).sin());
+                    cam.want.dist = 2.6 + 0.8 * (0.2 * clock).sin();
+                } else {
+                    cam.fly(axis(inp.fwd, inp.back), axis(inp.right, inp.left),
+                        axis(inp.rise, inp.down), dt);
+                    cam.turn(1.2 * axis(inp.turn_r, inp.turn_l) * dt,
+                        0.9 * axis(inp.pitch_u, inp.pitch_d) * dt);
+                }
+                cam.ease(dt);
+                let u = uniforms(surf.width, surf.height, clock, look, cam);
+                queue.write_buffer(ubuf, 0, gpu::bytes_of_f32(u[..]));
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = dev.encoder();
+                        enc.render_pass(PassDesc::color(f.texture.view()), |pass| {
+                            pass.set_pipeline(pipe);
+                            pass.set_bind_group(0, group);
+                            pass.draw(0..3, 0..1);
+                        });
+                        queue.submit(enc.finish());
+                        f.present(&queue);
+                    }
+                    Err(_) => {} // SurfaceLost: configure again on Resize
+                }
+                done += 1;
+                if done == 1 { first = now; }
+                if frames > 1 && done >= frames {
+                    let mean = (now - first) * 1000.0 / (done - 1) as f64;
+                    println(f"{surf.width} x {surf.height} pixels, {look.iters} iterations: {done} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    if shot.len() > 0 {
+                        let img = snapshot(dev, &queue, pipe, group, surf.width, surf.height, gpa)?;
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"mandelbulb: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        match m.button {
+                            Button::Left => {
+                                inp.drag = true;
+                                inp.mx = m.x;
+                                inp.my = m.y;
+                            }
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Release => {
+                        match m.button {
+                            Button::Left => inp.drag = false,
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Move => {
+                        if inp.drag {
+                            cam.turn(-(m.x - inp.mx) * 0.006, (m.y - inp.my) * 0.006);
+                        }
+                        inp.mx = m.x;
+                        inp.my = m.y;
+                    }
+                }
+            }
+            Ok(Event::Key(k)) => on_key(&inp, &cam, &look, k.key, k.pressed),
+            Ok(Event::Resize(_, z)) => surf.configure(dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = queue.wait_idle();
+    Ok(0)
+}
+
+fn print_controls() {
+    println("drag: orbit; arrows: orbit by keys; w/s: fly forward/back; a/d: strafe");
+    println("q/e: down/up; + and -: zoom; r: reset the camera; f: auto fly on/off");
+    println("[ and ]: the Mandelbulb's power down/up; j: Julia set on/off");
+    println("i: soft shadows; o: ambient occlusion; space: pause the clock; Esc: quit");
+}
+
+fn run(gpa: Gpa) -> Result<i32, gpu::Error> {
+    let cli = Command::new_in("mandelbulb", gpa)
+        .about("a Mandelbulb and a quaternion Julia set, raymarched on the GPU")
+        .arg(Arg::flag("headless").help("no window: three fixed views, their checks and timing"))
+        .arg(Arg::option("size").value_name("N").default("512").help("headless: the picture's side"))
+        .arg(Arg::option("frames").value_name("N").default("20")
+            .help("headless: frames a timing round; window: quit after N frames and print the mean"))
+        .arg(Arg::option("view").value_name("K").default("0").help("headless: the view --shot writes"))
+        .arg(Arg::option("power").value_name("P").default("8").help("the Mandelbulb's power (2 to 12)"))
+        .arg(Arg::flag("julia").help("start on the quaternion Julia set"))
+        .arg(Arg::option("iters").value_name("N").default("9").help("the estimator's iterations"))
+        .arg(Arg::flag("no-shadows").help("no soft shadows"))
+        .arg(Arg::flag("no-ao").help("no ambient occlusion"))
+        .arg(Arg::option("shot").value_name("FILE.ppm").help("write a frame as a PPM image"));
+    let m = cli.parse_or_exit(env::args());
+    let power = match std::num::parse_f64(m.get("power").unwrap_or("8")) {
+        Ok(x) => clamp_power(x),
+        Err(_) => {
+            eprintln("mandelbulb: --power takes a number");
+            return Ok(2);
+        }
+    };
+    let iters = parse_int(m.get("iters").unwrap_or("9")).unwrap_or(9);
+    if iters < 1 || iters > 64 {
+        eprintln("mandelbulb: --iters 1..64");
+        return Ok(2);
+    }
+    let base = Look {
+        julia: m.flag("julia"),
+        power: power,
+        iters: iters,
+        shadows: !m.flag("no-shadows"),
+        ao: !m.flag("no-ao"),
+        debug: false,
+    };
+    let frames = parse_int(m.get("frames").unwrap_or("20")).unwrap_or(20);
+    let shot = m.get("shot").unwrap_or("");
+    if m.flag("headless") {
+        let size = parse_int(m.get("size").unwrap_or("512")).unwrap_or(512);
+        let view = parse_int(m.get("view").unwrap_or("0")).unwrap_or(0);
+        if size < 64 || size > 4096 || frames < 1 || view < 0 || view > 2 {
+            eprintln("mandelbulb: --size 64..4096, --frames 1 or more, --view 0..2");
+            return Ok(2);
+        }
+        return headless(base, size, frames, view, shot, gpa);
+    }
+    print_controls();
+    windowed(base, frames, shot, gpa)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    match run(gpa) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln(f"mandelbulb: {e}");
+            1
+        }
+    }
+}
+
+#[test]
+fn power_is_clamped_to_a_surface() {
+    assert_eq(clamp_power(1.0), 2.0);
+    assert_eq(clamp_power(8.0), 8.0);
+    assert_eq(clamp_power(40.0), 12.0);
+}
+
+#[test]
+fn ppm_header_and_checksum_are_stable() {
+    assert_eq(header_len(2, 1), 11);
+    assert_eq(header_len(1280, 720), 16);
+}

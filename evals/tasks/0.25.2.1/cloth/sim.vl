@@ -1,0 +1,259 @@
+// The cloth on the GPU: the particle buffers, the four compute kernels
+// (predict, solve, collide, normals), and the draw of the cloth, the sphere
+// and the floor. A frame is set_uniform, then step (SUBSTEPS substeps of
+// predict and ITERS solver iterations, all in one encoder), then draw.
+// Nothing is read back except when the caller asks for positions.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Compare, Format, PassDesc, TextureUsage};
+
+use cpu::initial_positions;
+use shaders::{CLOTH, COLLIDE, COMMON, NORMAL, PREDICT, SOLID, SOLVE};
+
+pub const SUBSTEPS: i64 = 4;
+// The solver's iterations a substep. Even: each solve/collide pair ends in pos0.
+pub const ITERS: i64 = 128;
+// The sphere's mesh (32 x 24 quads, two triangles each), then the floor's two.
+const SPHERE_VERTS: i64 = 4608;
+
+pub struct Cloth {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // the grid's side: n x n particles
+    pub n: i64,
+    ubuf: gpu::Buffer,
+    pos0: gpu::Buffer,
+    pos1: gpu::Buffer,
+    prev: gpu::Buffer,
+    nrm: gpu::Buffer,
+    k_predict: gpu::ComputePipeline,
+    k_solve: gpu::ComputePipeline,
+    k_collide: gpu::ComputePipeline,
+    k_normal: gpu::ComputePipeline,
+    g_predict: gpu::BindGroup,
+    g_solve01: gpu::BindGroup,
+    g_solve10: gpu::BindGroup,
+    g_collide1: gpu::BindGroup,
+    g_collide0: gpu::BindGroup,
+    g_normal: gpu::BindGroup,
+    cloth: gpu::RenderPipeline,
+    solid: gpu::RenderPipeline,
+    g_cloth: gpu::BindGroup,
+    g_solid: gpu::BindGroup,
+}
+
+// One WGSL module from its parts.
+fn wgsl(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::Shader, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    dev.shader_wgsl(src.as_slice())
+}
+
+// One compute kernel: `main` of its module.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    let shader = wgsl(dev, parts, gpa)?;
+    dev.compute_pipeline(shader, "main")
+}
+
+// One kernel over `count` particles (workgroups of 64).
+fn run1(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, count: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch((count + 63) / 64);
+}
+
+// A storage buffer of f32s the CPU can read back.
+fn particles(dev: gpu::Device, start: [f32], extra: u32) -> gpu::Buffer {
+    dev.buffer_init(gpu::bytes_of_f32(start),
+        BufferUsage::STORAGE | BufferUsage::MAP_READ | BufferUsage::COPY_DST | extra)
+}
+
+// The floats of a mapped buffer, copied into a Vec.
+fn floats_in(dev: gpu::Device, b: inout gpu::Buffer, gpa: Gpa) -> Vec<f32> {
+    let f = gpu::f32s(b.map_read(dev));
+    var out: Vec<f32> = Vec::with_capacity_in(f.len(), gpa);
+    for x in f {
+        out.push(x);
+    }
+    out
+}
+
+impl Cloth {
+    // An n x n cloth at rest, drawn into targets of `format` (with depth).
+    pub fn new_in(n: i64, format: Format, gpa: Gpa) -> Result<Cloth, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = n * n;
+        let ubuf = dev.buffer(208, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let start = initial_positions(n, gpa);
+        let pos0 = particles(dev, start.as_slice(), BufferUsage::COPY_SRC);
+        let pos1 = particles(dev, start.as_slice(), BufferUsage::COPY_SRC);
+        let prev = particles(dev, start.as_slice(), BufferUsage::COPY_SRC);
+        var up0: Vec<f32> = Vec::with_capacity_in(cells * 4, gpa);
+        for _ in 0..cells {
+            up0.push(0.0);
+            up0.push(0.0);
+            up0.push(1.0);
+            up0.push(0.0);
+        }
+        let nrm = particles(dev, up0.as_slice(), BufferUsage::COPY_SRC);
+
+        let k_predict = kernel(dev, [COMMON, PREDICT][..], gpa)?;
+        let k_solve = kernel(dev, [COMMON, SOLVE][..], gpa)?;
+        let k_collide = kernel(dev, [COMMON, COLLIDE][..], gpa)?;
+        let k_normal = kernel(dev, [COMMON, NORMAL][..], gpa)?;
+        let b = gpu::bind;
+        let g_predict = dev.bind_group(k_predict.bind_layout(0),
+            [b(0, ubuf), b(1, pos0), b(2, prev), b(3, nrm)][..]);
+        let g_solve01 = dev.bind_group(k_solve.bind_layout(0),
+            [b(0, ubuf), b(1, pos0), b(2, pos1)][..]);
+        let g_solve10 = dev.bind_group(k_solve.bind_layout(0),
+            [b(0, ubuf), b(1, pos1), b(2, pos0)][..]);
+        let g_collide1 = dev.bind_group(k_collide.bind_layout(0), [b(0, ubuf), b(1, pos1)][..]);
+        let g_collide0 = dev.bind_group(k_collide.bind_layout(0), [b(0, ubuf), b(1, pos0)][..]);
+        let g_normal = dev.bind_group(k_normal.bind_layout(0),
+            [b(0, ubuf), b(1, pos0), b(2, nrm)][..]);
+
+        var dcloth = gpu::RenderDesc::new(wgsl(dev, [COMMON, CLOTH][..], gpa)?, "vs_cloth",
+            "fs_cloth", format);
+        dcloth.depth(Format::Depth32Float, Compare::Less, true);
+        let cloth = dev.render_pipeline(dcloth)?;
+        var dsolid = gpu::RenderDesc::new(wgsl(dev, [COMMON, SOLID][..], gpa)?, "vs_solid",
+            "fs_solid", format);
+        dsolid.depth(Format::Depth32Float, Compare::Less, true);
+        let solid = dev.render_pipeline(dsolid)?;
+        let g_cloth = dev.bind_group(cloth.bind_layout(0), [b(0, ubuf), b(1, pos0), b(2, nrm)][..]);
+        let g_solid = dev.bind_group(solid.bind_layout(0), [b(0, ubuf)][..]);
+
+        Ok(Cloth {
+            dev: dev, queue: queue, n: n, ubuf: ubuf, pos0: pos0, pos1: pos1, prev: prev, nrm: nrm,
+            k_predict: k_predict, k_solve: k_solve, k_collide: k_collide, k_normal: k_normal,
+            g_predict: g_predict, g_solve01: g_solve01, g_solve10: g_solve10,
+            g_collide1: g_collide1, g_collide0: g_collide0, g_normal: g_normal,
+            cloth: cloth, solid: solid, g_cloth: g_cloth, g_solid: g_solid,
+        })
+    }
+
+    // This frame's uniform (cpu::pack).
+    pub fn set_uniform(inout self, words: [f32; 52]) {
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(words[..]));
+    }
+
+    // Put the particles back at `start` (x, y, z, inverse mass), at rest.
+    pub fn reset(inout self, start: [f32]) {
+        self.queue.write_buffer(self.pos0, 0, gpu::bytes_of_f32(start));
+        self.queue.write_buffer(self.pos1, 0, gpu::bytes_of_f32(start));
+        self.queue.write_buffer(self.prev, 0, gpu::bytes_of_f32(start));
+    }
+
+    // One frame of physics: SUBSTEPS substeps, then the normals. The
+    // uniform's step is the substep.
+    pub fn step(inout self) {
+        let cells = self.n * self.n;
+        let kp = self.k_predict;
+        let ks = self.k_solve;
+        let kc = self.k_collide;
+        let kn = self.k_normal;
+        let gp = self.g_predict;
+        let g01 = self.g_solve01;
+        let g10 = self.g_solve10;
+        let c1 = self.g_collide1;
+        let c0 = self.g_collide0;
+        let gn = self.g_normal;
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            for _ in 0..SUBSTEPS {
+                run1(&pass, kp, gp, cells);
+                for _ in 0..(ITERS / 2) {
+                    run1(&pass, ks, g01, cells);
+                    run1(&pass, kc, c1, cells);
+                    run1(&pass, ks, g10, cells);
+                    run1(&pass, kc, c0, cells);
+                }
+            }
+            run1(&pass, kn, gn, cells);
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The solver alone, `iters` iterations (even): no prediction, no
+    // normals. The solver test runs it on a jittered start.
+    pub fn relax(inout self, iters: i64) {
+        let cells = self.n * self.n;
+        let ks = self.k_solve;
+        let kc = self.k_collide;
+        let g01 = self.g_solve01;
+        let g10 = self.g_solve10;
+        let c1 = self.g_collide1;
+        let c0 = self.g_collide0;
+        var enc = self.dev.encoder();
+        enc.compute_pass(|pass| {
+            for _ in 0..(iters / 2) {
+                run1(&pass, ks, g01, cells);
+                run1(&pass, kc, c1, cells);
+                run1(&pass, ks, g10, cells);
+                run1(&pass, kc, c0, cells);
+            }
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The particles (x, y, z, w) and their last substep's start (prev), read back.
+    pub fn positions_in(inout self, gpa: Gpa) -> Vec<f32> {
+        floats_in(self.dev, &self.pos0, gpa)
+    }
+
+    pub fn prev_in(inout self, gpa: Gpa) -> Vec<f32> {
+        floats_in(self.dev, &self.prev, gpa)
+    }
+
+    // A depth target for a w x h picture.
+    pub fn depth_for(self, w: i64, h: i64) -> gpu::Texture {
+        self.dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT)
+    }
+
+    // The sphere, the floor and the cloth, into color (cleared) with depth.
+    pub fn draw(self, enc: inout gpu::Encoder, color: gpu::TextureView, depth: gpu::TextureView) {
+        let sp = self.solid;
+        let gs = self.g_solid;
+        let cp = self.cloth;
+        let gc = self.g_cloth;
+        let tris = (self.n - 1) * (self.n - 1) * 6;
+        enc.render_pass(PassDesc::color(color, Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 })
+            .with_depth(depth), |pass| {
+            pass.set_pipeline(sp);
+            pass.set_bind_group(0, gs);
+            pass.draw(0..(SPHERE_VERTS + 6), 0..1);
+            pass.set_pipeline(cp);
+            pass.set_bind_group(0, gc);
+            pass.draw(0..tris, 0..1);
+        });
+    }
+
+    // The picture of the current state, w x h pixels, as a binary PPM
+    // (waits for the GPU).
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let dtex = self.depth_for(w, h);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view(), dtex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}
