@@ -163,10 +163,10 @@ std::objc::Pool::push	../../compiler/std/objc/mod.vl:216:12	method	pub fn push()
 std::string::String::push	../../compiler/std/string.vl:1204:12	method	pub fn push(inout self, cp: u32)
 std::path::PathBuf::push	../../compiler/std/path.vl:249:12	method	pub fn push(inout self, p: [u8])
 std::window::cocoa::push	../../compiler/std/window/cocoa.vl:202:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io global panic diverge unsafe
-std::cli::Matches::push	../../compiler/std/cli.vl:766:8	method	fn push(inout self, s: i64, text: str)
+std::cli::Matches::push	../../compiler/std/cli.vl:1241:8	method	fn push(inout self, s: i64, text: str, at: i64)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-187	std::Vec::push
+192	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.vl
 40:10	call	main	mine.push(v.len());

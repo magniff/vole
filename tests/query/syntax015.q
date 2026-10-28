@@ -77,7 +77,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	115
 std::window::keys	<std>	27
 std::window::objc	<std>	88
-std::cli	<std>	71
+std::cli	<std>	109
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

@@ -1,30 +1,40 @@
-// The commands that change a program (0.11; docs/refactor.md), in one
-// table: `volec COMMAND ...` and each line of a `volec refactor
-// --script FILE` reach them from here, so a command added here works in
-// scripts too.
+// volec's commands (0.11; docs/refactor.md), on one Command tree (0.25.2,
+// cli/tree.vl): `volec COMMAND ...` (main), each command of a batch and
+// each line of a `volec refactor --script FILE` are read with the tree and
+// run from here, by the name Matches::subcommand() gives, so a command
+// added to the tree and here works in batches and scripts too.
 //
-//   run_tool       the top-level commands a script may run: edit, fix,
-//                  rewrite, refactor
+//   run_command    main's and batch's lines: every command (-1: a build's
+//                  line); `batch` itself only from main
+//   run_tool       a script's lines: edit, fix, rewrite, refactor
+//   run_alias      0.8's `--fix-imports` and 0.9's `--fix-unsafe`: fix
 //   run_refactor   `refactor SUB ...`: one row per subcommand
 //
-// A command is `fn(argc: i64, argv: **u8) -> i64` (argv[1] is its word,
-// argv[2] a refactor's subcommand), returns the exit status and prints
+// A command is `fn(c: Call) -> i64` (cli/line.vl: its line, its Matches,
+// its arguments in the line's order), returns the exit status and prints
 // its diagnostics itself; it changes the program through the edit engine
-// (edit.vl: edit_replace, edit_new_file, then apply_edit or
-// prepare_edit and finish_edit), which a script's step makes write
-// copies only (STEP_REPORT).
+// (edit.vl: edit_replace, edit_new_file, then apply_edit or prepare_edit
+// and finish_edit), which a script's step makes write copies only
+// (STEP_REPORT).
 
-use crate::base::{buf_str, streq};
+use std::Option;
+use std::string::str;
+
+use crate::base::{buf_bytes, buf_str};
+use crate::cli::line::{Call, Line};
+use crate::cli::tree::{call_of, fix_alias_call, is_command};
 use crate::guide::run_guide;
+use crate::tools::batch::run_batch;
 use crate::tools::edit::cli::{run_check, run_edit, run_undo_command};
 use crate::tools::edit::stdedit::{names_std_path, rerun_in_std_tree};
 use crate::tools::explain::run_explain;
-use crate::tools::fix::command::run_fix;
+use crate::tools::fix::command::{run_fix, run_fix_alias};
 use crate::tools::fmt::run_fmt;
 use crate::tools::plan::run_lint;
 use crate::tools::probe::run_probe;
 use crate::tools::query::run_query;
 use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, try_end, write_diags};
+use crate::tools::query::roots::note_command;
 use crate::tools::reduce::run_reduce;
 use crate::tools::refactor_mod::cli::run_refactor_mod;
 use crate::tools::refactor_shape::extract::run_extract;
@@ -39,23 +49,142 @@ use crate::tools::snippet::run_try;
 use crate::tools::testrun::run_test;
 use crate::tools::v018::run_fuzz;
 
-// A top-level command a script may run: its exit status, or -1 when
-// `word` is none.
-pub fn run_tool(word: *u8, argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        if streq(word, c"edit") {
-            return run_edit(argc, argv);
+// (0.15) `volec WORD ...` for every tool command (main's and batch's;
+// `batch` only when `batch` says so): its exit status, or -1 when word 1
+// is none (a compilation, or batch in a batch).
+pub fn run_command(line: Line, batch: bool, gpa: Gpa) -> i64 {
+    let top = line.word(1);
+    if line.len() < 2 || !is_command(top) || (top == "batch" && !batch) {
+        return -1;
+    }
+    // (0.25.2: the FILE arguments that name a program, tools/query/roots.vl)
+    note_command(line);
+    run_call(call_of(line, gpa))
+}
+
+// Whether a script may run `word` (a top-level command of run_tool).
+pub fn is_tool(word: str) -> bool {
+    word == "edit" || word == "fix" || word == "rewrite" || word == "refactor"
+}
+
+// A script's line: its exit status, or -1 when word 1 is no command a
+// script runs.
+pub fn run_tool(line: Line, gpa: Gpa) -> i64 {
+    if !is_tool(line.word(1)) {
+        return -1;
+    }
+    run_call(call_of(line, gpa))
+}
+
+// (0.8's --fix-imports and 0.9's --fix-unsafe, anywhere in a build's line:
+// `fix --only imports`, `--only unsafe`) The exit status, or -1 when the
+// line has neither.
+pub fn run_alias(line: Line, gpa: Gpa) -> i64 {
+    for k in 1..line.len() {
+        if line.word(k) == "--fix-imports" {
+            return run_fix_alias(fix_alias_call(line, gpa), 1);
         }
-        if streq(word, c"fix") {
-            return run_fix(argc, argv);
+        if line.word(k) == "--fix-unsafe" {
+            return run_fix_alias(fix_alias_call(line, gpa), 8);
         }
-        if streq(word, c"rewrite") {
-            return run_rewrite(argc, argv);
+    }
+    -1
+}
+
+// The command c's line names (the root's subcommand), run.
+fn run_call(c: Call) -> i64 {
+    let name = match c.root.subcommand_name() {
+        Option::Some(n) => n,
+        Option::None => return -1,
+    };
+    // `volec query ...` (0.11): questions about a program.
+    if name == "query" {
+        // (0.18: the run-time checks left, tools/query/checks.vl)
+        if sub_name(c) == "checks" {
+            return crate::tools::query::checks::run_query_checks(c);
         }
-        if streq(word, c"refactor") {
-            return run_refactor(argc, argv);
-        }
-        -1
+        return run_query(c);
+    }
+    // The tools for agents (0.11): changing a program by name, its
+    // front end's errors.
+    if name == "edit" {
+        return run_edit(c);
+    }
+    if name == "undo" {
+        return run_undo_command(c);
+    }
+    if name == "check" {
+        return run_check(c);
+    }
+    if name == "fix" {
+        return run_fix(c);
+    }
+    if name == "lint" {
+        return run_lint(c);
+    }
+    if name == "guide" {
+        return run_guide(c);
+    }
+    if name == "assemble" {
+        // (0.19: the compiler's assembler on a .s file, tools/assemble.vl)
+        return crate::tools::assemble::run_assemble(c);
+    }
+    if name == "lsp" {
+        // (0.24: the language server, tools/lsp)
+        return crate::tools::lsp::run_lsp();
+    }
+    if name == "same-output" {
+        return run_same_output(c);
+    }
+    if name == "fmt" {
+        return run_fmt(c);
+    }
+    if name == "explain" {
+        return run_explain(c);
+    }
+    if name == "test" {
+        // (0.17: build and run the tests, a summary; tools/testrun.vl)
+        return run_test(c);
+    }
+    if name == "reduce" {
+        // (0.17: a failing input made small, tools/reduce.vl)
+        return run_reduce(c);
+    }
+    if name == "fuzz" {
+        // (0.18 T3: coverage-guided fuzzing of #[fuzz] functions, tools/v018.vl)
+        return run_fuzz(c);
+    }
+    if name == "probe" {
+        // (0.17: values printed at lines, tools/probe.vl)
+        return run_probe(c);
+    }
+    if name == "try" {
+        // (0.15: a snippet run, tools/snippet.vl)
+        return run_try(c);
+    }
+    // (0.11, phase 2: the refactorings, rewrite, scripts)
+    if name == "refactor" {
+        return run_refactor(c);
+    }
+    if name == "rewrite" {
+        return run_rewrite(c);
+    }
+    // (0.15: several commands in one call, tools/batch.vl)
+    if name == "batch" {
+        return run_batch(c);
+    }
+    -1
+}
+
+// The name of the subcommand of c's command (`refs` of `query refs`), or
+// "": none of the tree's.
+fn sub_name(c: Call) -> str {
+    match c.root.subcommand() {
+        Option::Some((_, m)) => match m.subcommand_name() {
+            Option::Some(n) => n,
+            Option::None => "",
+        },
+        Option::None => "",
     }
 }
 
@@ -65,161 +194,57 @@ fn refactor_names() -> *u8 {
 }
 
 // `volec refactor SUB ...`.
-pub fn run_refactor(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        let sub = if argc >= 3 { argv[2] } else { c"" };
-        // (0.20) std's modules and items: in std's files
-        if names_std_path(argc, argv) {
-            return rerun_in_std_tree(argc, argv);
-        }
-        // Phase 2b (refactor_shape.vl, script.vl).
-        if streq(sub, c"signature") {
-            return run_signature(argc, argv);
-        }
-        if streq(sub, c"field") {
-            return run_field(argc, argv);
-        }
-        if streq(sub, c"variant") {
-            return run_variant(argc, argv);
-        }
-        if streq(sub, c"extract-function") {
-            return run_extract(argc, argv);
-        }
-        if streq(sub, c"inline") {
-            return run_inline(argc, argv);
-        }
-        // (0.21: a program's, a directory's or the tree's files renamed, for 0.24)
-        if streq(sub, c"extension") {
-            return crate::tools::textual::extension::run_extension(argc, argv);
-        }
-        if streq(sub, c"--script") {
-            return run_script(argc, argv);
-        }
-        // Phase 2a (refactor_mod.vl, refactor_move.vl).
-        if streq(sub, c"rename") {
-            return run_refactor_mod(argc, argv);
-        }
-        if streq(sub, c"move") {
-            return run_refactor_mod(argc, argv);
-        }
-        if streq(sub, c"new-module") {
-            return run_refactor_mod(argc, argv);
-        }
-        if streq(sub, c"move-module") {
-            return run_refactor_mod(argc, argv);
-        }
-        if streq(sub, c"split") {
-            return run_refactor_mod(argc, argv);
-        }
-        PROG = argv[0];
-        let d = diag(c"error", c"refactor.usage");
-        if argc < 3 {
-            buf_str(d, c"no command (");
-        } else {
-            buf_str(d, c"unknown command '");
-            buf_str(d, sub);
-            buf_str(d, c"' (");
-        }
-        buf_str(d, refactor_names());
-        buf_str(d, c")\n");
-        let out = diags();
-        buf_str(out, c"try:");
-        put_cword(out, PROG);
-        buf_str(out, c" refactor signature NAME --add 'x: i64 = 0' --dry-run");
-        try_end(out);
-        write_diags();
-        2
+pub fn run_refactor(c: Call) -> i64 {
+    // (0.20) std's modules and items: in std's files
+    if names_std_path(c.line) {
+        return rerun_in_std_tree(c.line);
     }
-}
-
-// Whether a script may run `word` (a top-level command of run_tool).
-pub fn is_tool(word: *u8) -> bool {
-    unsafe {
-        streq(word, c"edit") || streq(word, c"fix") || streq(word, c"rewrite")
-            || streq(word, c"refactor")
+    let sub = sub_name(c);
+    // Phase 2b (refactor_shape.vl, script.vl).
+    if sub == "signature" {
+        return run_signature(c);
     }
-}
-
-// (0.15) `volec WORD ...` for every tool command (main's and batch's):
-// its exit status, or -1 when argv[1] is none (a compilation, or batch
-// itself).
-pub fn run_command(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        if argc < 2 {
-            return -1;
-        }
-        let word = argv[1];
-        // (0.25.2: the FILE arguments that name a program, tools/query/roots.vl)
-        crate::tools::query::roots::note_command(argc, argv);
-        // `volec query ...` (0.11): questions about a program.
-        if streq(word, c"query") {
-            // (0.18: the run-time checks left, tools/query/checks.vl)
-            if argc > 2 && streq(argv[2], c"checks") {
-                return crate::tools::query::checks::run_query_checks(argc, argv);
-            }
-            return run_query(argc, argv);
-        }
-        // The tools for agents (0.11): changing a program by name, its
-        // front end's errors.
-        if streq(word, c"edit") {
-            return run_edit(argc, argv);
-        }
-        if streq(word, c"undo") {
-            return run_undo_command(argc, argv);
-        }
-        if streq(word, c"check") {
-            return run_check(argc, argv);
-        }
-        if streq(word, c"fix") {
-            return run_fix(argc, argv);
-        }
-        if streq(word, c"lint") {
-            return run_lint(argc, argv);
-        }
-        if streq(word, c"guide") {
-            return run_guide(argc, argv);
-        }
-        if streq(word, c"assemble") {
-            // (0.19: the compiler's assembler on a .s file, tools/assemble.vl)
-            return crate::tools::assemble::run_assemble(argc, argv);
-        }
-        if streq(word, c"lsp") {
-            // (0.24: the language server, tools/lsp)
-            return crate::tools::lsp::run_lsp(argc, argv);
-        }
-        if streq(word, c"same-output") {
-            return run_same_output(argc, argv);
-        }
-        if streq(word, c"fmt") {
-            return run_fmt(argc, argv);
-        }
-        if streq(word, c"explain") {
-            return run_explain(argc, argv);
-        }
-        if streq(word, c"test") {
-            // (0.17: build and run the tests, a summary; tools/testrun.vl)
-            return run_test(argc, argv);
-        }
-        if streq(word, c"reduce") {
-            // (0.17: a failing input made small, tools/reduce.vl)
-            return run_reduce(argc, argv);
-        }
-        if streq(word, c"fuzz") {
-            // (0.18 T3: coverage-guided fuzzing of #[fuzz] functions, tools/v018.vl)
-            return run_fuzz(argc, argv);
-        }
-        if streq(word, c"probe") {
-            // (0.17: values printed at lines, tools/probe.vl)
-            return run_probe(argc, argv);
-        }
-        if streq(word, c"try") {
-            // (0.15: a snippet run, tools/snippet.vl)
-            return run_try(argc, argv);
-        }
-        // (0.11, phase 2: the refactorings, rewrite, scripts)
-        if streq(word, c"refactor") || streq(word, c"rewrite") {
-            return run_tool(word, argc, argv);
-        }
-        -1
+    if sub == "field" {
+        return run_field(c);
     }
+    if sub == "variant" {
+        return run_variant(c);
+    }
+    if sub == "extract-function" {
+        return run_extract(c);
+    }
+    if sub == "inline" {
+        return run_inline(c);
+    }
+    // (0.21: a program's, a directory's or the tree's files renamed, for 0.24)
+    if sub == "extension" {
+        return crate::tools::textual::extension::run_extension(c);
+    }
+    // (`refactor --script FILE`, the tree's `refactor script`: cli/tree.vl)
+    if sub == "script" {
+        return run_script(c);
+    }
+    // Phase 2a (refactor_mod.vl, refactor_move.vl).
+    if sub == "rename" || sub == "move" || sub == "new-module" || sub == "move-module"
+        || sub == "split" {
+        return run_refactor_mod(c);
+    }
+    PROG = c.prog();
+    let d = diag(c"error", c"refactor.usage");
+    if c.line.len() < 3 {
+        buf_str(d, c"no command (");
+    } else {
+        buf_str(d, c"unknown command '");
+        buf_bytes(d, c.word(2).as_bytes());
+        buf_str(d, c"' (");
+    }
+    buf_str(d, refactor_names());
+    buf_str(d, c")\n");
+    let out = diags();
+    buf_str(out, c"try:");
+    put_cword(out, PROG);
+    buf_str(out, c" refactor signature NAME --add 'x: i64 = 0' --dry-run");
+    try_end(out);
+    write_diags();
+    2
 }

@@ -1,0 +1,426 @@
+// A build's command line (0.25, on std::cli): `volec [OPTIONS] FILE.vl...
+// [x.c|x.o|x.a|-l NAME|-L DIR]... [-o OUT]`. The options set the
+// compiler's globals; what main needs after them is a Build. Errors keep
+// 0.24's text and status (1): a missing value prints the usage line, an
+// option that is no option is read as a file (`error: cannot read
+// --bogus`), as before.
+
+use std::{Gpa, arena_scope};
+use std::cli::{Arg, CliError, CliErrorKind, Command, Matches};
+use std::string::str;
+
+use crate::arch::features::arch_option;
+use crate::back::codecache::cc_option;
+use crate::back::dwarf::DEBUG_INFO;
+use crate::back::emit::stats::STATS;
+use crate::back::mc_arm64::atomic::A64_LSE_FLAG;
+use crate::back::objfile::{OUTPUT_MODE, OUT_ASM, OUT_OBJECT};
+use crate::back::objfile::output::{
+    add_framework, add_link_arg, add_link_include, is_link_input, set_linker,
+};
+use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
+use crate::base::{IntVec, OVERLAY, die, die2};
+use crate::base::diag::{DENY_WARNINGS, DIAG_SHORT};
+use crate::base::target::target_of_name;
+use crate::base::timer::TIME_PASSES;
+use crate::cli::{c_of, short_of};
+use crate::cli::line::{Line, WordIter};
+use crate::front::cheader::EMIT_HEADER;
+use crate::front::contracts::flags::{DEBUG_CONTRACTS, NO_POSITIONS};
+use crate::front::effects::PRINT_EFFECTS;
+use crate::front::stdalloc::CHECK_ALLOC_MODE;
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR};
+use crate::middle::effects_verify::VERIFY_EFFECTS;
+use crate::middle::egraph::EGRAPH;
+use crate::middle::gvn::NOALIAS_OFF;
+use crate::middle::ifconv::IFCONV;
+use crate::middle::ipo::PRINT_ATTRS;
+use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
+use crate::middle::opt::OPT_LEVEL;
+use crate::middle::parallel::{JOBS, parse_jobs};
+use crate::middle::profile::{PROFILE_GENERATE, PROFILE_USE};
+use crate::middle::slp::SLP;
+use crate::middle::trace::TRACE;
+use crate::middle::unsafecheck::CHECK_UNSAFE;
+use crate::middle::vectorize::VECTORIZE;
+use crate::middle::vectorize::unroll::UNROLL_RUNTIME;
+
+// What a build's command line gives main, the globals aside.
+pub struct Build {
+    pub inputs: IntVec,
+    pub output: *u8,
+    pub output_given: bool,
+    pub tokens_only: bool,
+    pub target: i64,
+    pub include_dirs: IntVec,
+    pub emit_imports: bool,
+    pub vec_stats: bool,
+    // what to do instead of a build: 0 none, 1 --version, 2 --check-rules
+    pub instead: i64,
+}
+
+// The usage line a build's error prints (exit 1).
+pub fn usage() -> ! {
+    die(c"usage: volec [--target aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos] [-O0|-O1|-O2] [-g] [--emit-ir] [--verify-ir] [--emit-imports] [--emit-header] [-I dir] [--deny-warnings] [--diagnostics=short|human] [--json] <file.vl>... [x.c|x.o|x.a|-l name|-L dir]... [-S|--emit-asm|-c] [-o out.o|out.s|program] | volec guide [TOPIC|--list] (the language) | volec query|edit|undo|check|fix|fmt|lint|same-output|explain ... (docs/query.md, docs/refactor.md, docs/fmt.md) | volec --tokens <file.vl> | volec --version")
+}
+
+// A flag of a build: `--NAME`.
+fn flag(name: str, help: str) -> Arg {
+    Arg::flag(name).help(help)
+}
+
+// A one-letter option or flag of a build: `-x`, no long form.
+fn short_only(a: Arg, c: u8) -> Arg {
+    a.short(c).long("")
+}
+
+// Every option of a build.
+pub fn build_command(gpa: Gpa) -> Command {
+    Command::new_in("volec", gpa)
+        .about("compile FILE.vl... (one program) to an executable, an object or assembly")
+        .arg(Arg::positional("input").multiple()
+            .help("the program's files, and objects, archives and C files for the link"))
+        .arg(short_only(Arg::option("out"), 'o').value_name("FILE")
+            .help("the output: a program, FILE.o (an object), FILE.s (assembly) [default: a.o]"))
+        .arg(Arg::option("target").value_name("T")
+            .help("aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos [default: the host]"))
+        .arg(short_only(Arg::option("opt"), 'O').value_name("LEVEL")
+            .help("the optimization level, 0, 1 or 2: -O0 (default -O2; docs/optimizer.md)"))
+        .arg(short_only(Arg::option("cpu"), 'C').value_name("KEY=VALUE")
+            .help("target-cpu=NAME|native, target-feature=+x,-y (docs/design/arch.md)"))
+        .arg(short_only(Arg::option("jobs"), 'j').value_name("N")
+            .help("the threads code generation may use (the output is the same)"))
+        .arg(flag("emit-asm", "write assembly (as an output named .s)").short('S'))
+        .arg(short_only(Arg::flag("object"), 'c').help("write an object"))
+        .arg(short_only(Arg::flag("debug"), 'g').help("debug information: DWARF line tables"))
+        .arg(short_only(Arg::option("include"), 'I').value_name("DIR")
+            .help("a directory for `import`ed C headers"))
+        .arg(short_only(Arg::option("lib"), 'l').value_name("NAME").help("a library for the link"))
+        .arg(short_only(Arg::option("libdir"), 'L').value_name("DIR")
+            .help("a directory of libraries for the link"))
+        .arg(Arg::option("framework").value_name("NAME")
+            .help("-framework NAME: a macOS framework for the link"))
+        .arg(Arg::option("linker").value_name("NAME")
+            .help("--linker=system|cc|internal: the system's linker run directly (the default), through cc, or the compiler's own"))
+        .arg(Arg::option("diagnostics").value_name("FORM")
+            .help("--diagnostics=short|human: one line per error (the default when stderr is no terminal) or the long form"))
+        .arg(flag("deny-warnings", "make warnings errors"))
+        .arg(flag("tokens", "print the tokens of one file"))
+        .arg(flag("version", "print the release and the host target"))
+        .arg(flag("emit-ir", "write the optimized IR instead (stdout without -o)"))
+        .arg(flag("emit-mir", "write the machine IR instead (stdout without -o)"))
+        .arg(flag("emit-header", "write the program's C header instead"))
+        .arg(flag("emit-imports",
+            "write what `import`ed C headers declare (as vole source) instead"))
+        .arg(flag("verify-ir", "check the IR after every pass"))
+        .arg(flag("print-after-all", "print the IR after every pass (stderr)"))
+        .arg(flag("print-attrs", "print the inferred function attributes (-O2, stderr)"))
+        .arg(flag("time-passes", "print the CPU time of each phase (stderr)"))
+        .arg(flag("trace", "failure traces: a crash prints its line and callers"))
+        .arg(Arg::option("atomics").value_name("KIND")
+            .help(
+                "--atomics=lse|llsc: AArch64 atomics as LSE instructions or exclusive-pair loops"))
+        .arg(flag("verify-regalloc", "check the register allocation"))
+        .arg(flag("print-regalloc", "print the register allocation"))
+        .arg(Arg::option("stats").value_name("WHAT")
+            .help("--stats: the code's sizes; --stats=functions: each function's"))
+        .arg(flag("no-ifconv", "no if-conversion in loops (to compare)"))
+        .arg(flag("no-vectorize", "no loop vectorization (to compare)"))
+        .arg(flag("no-unroll-runtime",
+            "no unrolling of loops whose trip count is known at run time only (to compare)"))
+        .arg(flag("no-slp", "no SLP vectorization (to compare)"))
+        .arg(flag("no-egraph", "no rewrite rules in GVN (to compare)"))
+        .arg(flag("no-noalias", "no facts from reference parameters (to measure them)"))
+        .arg(flag("check-unsafe",
+            "check unsafe code's raw-pointer accesses at run time (-O1, -O2)"))
+        .arg(flag("check-alloc", "the checking general-purpose allocator"))
+        .arg(flag("verify-effects", "check the effects against the IR (-O1, -O2)"))
+        .arg(flag("print-effects", "print every function's effects"))
+        .arg(flag("vec-stats", "print the vectorizer's counts (stderr)"))
+        .arg(Arg::option("profile-generate").value_name("FILE")
+            .help("instrument the program: it writes its blocks' counts to FILE at exit"))
+        .arg(Arg::option("profile-use").value_name("FILE").help("optimize with the counts of FILE"))
+        .arg(Arg::option("overlay").value_name("PATH")
+            .help("--overlay PATH COPY: PATH read from COPY"))
+        .arg(Arg::option("overlay-copy").value_name("COPY"))
+        .arg(Arg::option("print-checks").value_name("FILTER")
+            .help("print the run-time checks left after the optimizer (--print-checks=FILTER)"))
+        .arg(flag("no-positions", "the run-time checks without their positions"))
+        .arg(flag("debug-contracts", "the contracts checked in debug form"))
+        .arg(flag("test-build", "the tests, with a test main (what `volec test` builds)"))
+        .arg(flag("coverage", "a counter per block, for `volec fuzz`"))
+        .arg(flag("check-rules", "check the rewrite rules on random values"))
+        .arg(flag("allow-unsafe", "removed in 0.10"))
+        .arg(flag("no-cache", "no code cache"))
+        .arg(Arg::option("cache").value_name("ON").help("--cache=on|off: the code cache"))
+}
+
+// An option's value that is none of its values: read as a file, as
+// before (`error: cannot read --linker=ld`, `cannot read -O3`); a value
+// given apart, the option (`-O main.vl`: `cannot read -O`).
+fn cannot_read(line: Line, value: str, spelling: str) -> ! {
+    let whole = line.whole_word(value);
+    let shown = if whole.as_bytes().ptr == value.as_bytes().ptr && whole.len() == value.len() {
+        spelling
+    } else {
+        whole
+    };
+    die2(c"cannot read ", c_of(shown))
+}
+
+// The build's error for e (exit 1).
+fn build_error(line: Line, e: CliError) -> ! {
+    match e.kind {
+        CliErrorKind::MissingValue => {
+            let name = short_of(e.text);
+            if name == "j" {
+                die(c"-j wants a number of threads: -j4, or -j 1 for one")
+            }
+            if name == "C" {
+                die(c"-C takes target-cpu=NAME or target-feature=+x,-y (docs/design/arch.md)")
+            }
+            usage()
+        }
+        _ => cannot_read(line, e.text, e.text),
+    }
+}
+
+// Whether `-c` is given after the last `-S` (or `--emit-asm`): the last
+// of them is the output's kind.
+fn object_last(line: Line) -> bool {
+    var object = false;
+    for k in 1..line.len() {
+        let s = line.word(k);
+        if s == "-c" {
+            object = true;
+        } else if s == "-S" || s == "--emit-asm" {
+            object = false;
+        }
+    }
+    object
+}
+
+// Sets the globals of m's options and gives the rest.
+fn apply(line: Line, m: Matches<std::ScopedArena>) -> Build {
+    var b = Build {
+        inputs: IntVec { data: 0 as *i64, count: 0, cap: 0 }, output: c"a.o", output_given: false,
+        tokens_only: m.flag("tokens"), target: 0,
+        include_dirs: IntVec { data: 0 as *i64, count: 0, cap: 0 }, emit_imports: false,
+        vec_stats: false, instead: 0,
+    };
+    if m.flag("no-cache") {
+        cc_option(c"--no-cache");
+    }
+    for v in m.values("cache") {
+        if v != "on" && v != "off" {
+            cannot_read(line, v, "--cache");
+        }
+        cc_option(if v == "on" { c"--cache=on" } else { c"--cache=off" });
+    }
+    match m.get("out") {
+        Option::Some(v) => {
+            b.output = c_of(v);
+            b.output_given = true;
+        }
+        Option::None => {}
+    }
+    for v in m.values("target") {
+        b.target = target_of_name(c_of(v));
+        if b.target == 0 {
+            die2(c"unknown target (expected aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos): ", c_of(v));
+        }
+    }
+    // (0.19) `-C target-cpu=NAME|native`, `-C target-feature=+x,-y`
+    // (arch/features.vl)
+    for v in m.values("cpu") {
+        if !arch_option(c_of(v)) {
+            die(c"-C takes target-cpu=NAME or target-feature=+x,-y (docs/design/arch.md)");
+        }
+    }
+    for v in m.values("opt") {
+        if v != "0" && v != "1" && v != "2" {
+            cannot_read(line, v, "-O");
+        }
+        OPT_LEVEL = (v.as_bytes()[0] - '0') as i64;
+    }
+    // (0.18.1) -j N or -jN: the threads code generation may use (the
+    // output is the same whatever their number; middle::parallel).
+    for v in m.values("jobs") {
+        JOBS = parse_jobs(c_of(v));
+        if JOBS < 1 {
+            die(c"-j wants a number of threads: -j4, or -j 1 for one");
+        }
+    }
+    if m.flag("emit-asm") || m.flag("object") {
+        OUTPUT_MODE = if m.flag("object") && (!m.flag("emit-asm") || object_last(line)) {
+            OUT_OBJECT
+        } else {
+            OUT_ASM
+        };
+    }
+    EMIT_IR = EMIT_IR || m.flag("emit-ir");
+    EMIT_MIR = EMIT_MIR || m.flag("emit-mir");
+    PRINT_AFTER_ALL = PRINT_AFTER_ALL || m.flag("print-after-all");
+    PRINT_ATTRS = PRINT_ATTRS || m.flag("print-attrs");
+    TIME_PASSES = TIME_PASSES || m.flag("time-passes");
+    DEBUG_INFO = DEBUG_INFO || m.flag("debug");
+    // (0.17) `--overlay PATH COPY`: PATH is read from COPY (as
+    // check's; volec probe builds a program so).
+    let paths = m.values("overlay");
+    let copies = m.values("overlay-copy");
+    if paths.len() != copies.len() {
+        usage();
+    }
+    for k in 0..paths.len() {
+        OVERLAY.push(c_of(paths[k]) as i64);
+        OVERLAY.push(c_of(copies[k]) as i64);
+    }
+    // (0.17) Failure traces (middle/trace.vl).
+    TRACE = TRACE || m.flag("trace");
+    VERIFY_IR = VERIFY_IR || m.flag("verify-ir");
+    // (0.21) AArch64 atomics: LSE instructions or exclusive-pair loops
+    // (the target's default: LSE on macOS, loops on Linux).
+    for v in m.values("atomics") {
+        if v != "lse" && v != "llsc" {
+            cannot_read(line, v, "--atomics");
+        }
+        A64_LSE_FLAG = if v == "lse" { 1 } else { 0 };
+    }
+    // (0.25) The linker (back::objfile::output): the system's, run
+    // directly (the default), through cc, or the compiler's own.
+    for v in m.values("linker") {
+        if v != "system" && v != "cc" && v != "internal" {
+            cannot_read(line, v, "--linker");
+        }
+        set_linker(c_of(v));
+    }
+    VERIFY_REGALLOC = VERIFY_REGALLOC || m.flag("verify-regalloc");
+    for v in m.values("stats") {
+        if v != "all" && v != "functions" {
+            cannot_read(line, v, "--stats");
+        }
+        STATS = if v == "all" { 1 } else { 2 };
+    }
+    PRINT_REGALLOC = PRINT_REGALLOC || m.flag("print-regalloc");
+    for v in m.values("include") {
+        b.include_dirs.push(c_of(v) as i64);
+        add_link_include(c_of(v));
+    }
+    // (0.25) `-framework NAME`: a macOS framework for the link (Linux
+    // leaves it out), as an extern block's #[link(framework = ...)].
+    for v in m.values("framework") {
+        add_framework(v.as_bytes());
+    }
+    // (0.16) For the link: `-l NAME`, `-L DIR` (or -lNAME, -LDIR),
+    // objects, archives, shared libraries and C files, given to cc
+    // in their order (back::objfile::output): in the line's order.
+    let libs = m.values("lib");
+    let dirs = m.values("libdir");
+    let inputs = m.values("input");
+    var li = 0;
+    var di = 0;
+    var ii = 0;
+    loop {
+        let at_l = if li < libs.len() { line.at(libs[li]) } else { line.len() };
+        let at_d = if di < dirs.len() { line.at(dirs[di]) } else { line.len() };
+        let at_i = if ii < inputs.len() { line.at(inputs[ii]) } else { line.len() };
+        if li >= libs.len() && di >= dirs.len() && ii >= inputs.len() {
+            break;
+        }
+        if li < libs.len() && at_l <= at_d && at_l <= at_i {
+            add_link_arg('l', c_of(libs[li]));
+            li += 1;
+        } else if di < dirs.len() && at_d <= at_i {
+            add_link_arg('L', c_of(dirs[di]));
+            di += 1;
+        } else {
+            let p = c_of(inputs[ii]);
+            if is_link_input(p) {
+                add_link_arg(' ', p);
+            } else {
+                b.inputs.push(p as i64);
+            }
+            ii += 1;
+        }
+    }
+    EMIT_HEADER = EMIT_HEADER || m.flag("emit-header");
+    b.emit_imports = m.flag("emit-imports");
+    if m.flag("no-ifconv") {
+        IFCONV = false;
+    }
+    if m.flag("no-vectorize") {
+        VECTORIZE = false;
+    }
+    if m.flag("no-unroll-runtime") {
+        UNROLL_RUNTIME = false;
+    }
+    if m.flag("no-slp") {
+        SLP = false;
+    }
+    // (0.18: --print-checks[=FILTER], --no-positions, --debug-contracts,
+    // --test-build, --coverage; front/contracts/flags.vl)
+    match m.get("print-checks") {
+        Option::Some(v) => crate::tools::query::checks::PRINT_CHECKS = c_of(v),
+        Option::None => {}
+    }
+    NO_POSITIONS = NO_POSITIONS || m.flag("no-positions");
+    DEBUG_CONTRACTS = DEBUG_CONTRACTS || m.flag("debug-contracts");
+    crate::front::tests::TEST_BUILD = crate::front::tests::TEST_BUILD || m.flag("test-build");
+    crate::middle::coverage::COVERAGE = crate::middle::coverage::COVERAGE || m.flag("coverage");
+    CHECK_UNSAFE = CHECK_UNSAFE || m.flag("check-unsafe");
+    // (0.16: the checking general-purpose allocator: std's Gpa is
+    // compiler/std/alloc_check.vl)
+    CHECK_ALLOC_MODE = CHECK_ALLOC_MODE || m.flag("check-alloc");
+    // (0.17: reference parameters' facts off, to measure them; they
+    // hold only under --values=error, middle/gvn.vl)
+    NOALIAS_OFF = NOALIAS_OFF || m.flag("no-noalias");
+    b.vec_stats = m.flag("vec-stats");
+    // (0.16: the effects checked against the IR, -O1 and -O2; every
+    // function's effects, after checking)
+    VERIFY_EFFECTS = VERIFY_EFFECTS || m.flag("verify-effects");
+    PRINT_EFFECTS = PRINT_EFFECTS || m.flag("print-effects");
+    match m.get("profile-use") {
+        Option::Some(v) => PROFILE_USE = c_of(v),
+        Option::None => {}
+    }
+    match m.get("profile-generate") {
+        Option::Some(v) => PROFILE_GENERATE = c_of(v),
+        Option::None => {}
+    }
+    if m.flag("no-egraph") {
+        EGRAPH = false;
+    }
+    DENY_WARNINGS = DENY_WARNINGS || m.flag("deny-warnings");
+    for v in m.values("diagnostics") {
+        if v != "short" && v != "human" {
+            cannot_read(line, v, "--diagnostics");
+        }
+        DIAG_SHORT = v == "short";
+    }
+    if m.flag("allow-unsafe") {
+        // 0.9's option is gone: no bootstrap interface passes it to
+        // 0.10 (see volec-0.10 in bootstrap/releases.toml).
+        die(c"--allow-unsafe was removed in 0.10: unsafe operations outside unsafe code are errors; `volec fix --only unsafe` puts them in unsafe blocks");
+    }
+    if m.flag("check-rules") {
+        b.instead = 2;
+    } else if m.flag("version") {
+        b.instead = 1;
+    }
+    b
+}
+
+// A build's command line, words 1.. of line: the globals set, the rest
+// given; an error ends the program (exit 1). The Matches are on an arena.
+// (The root of volec's Command tree, cli/tree.vl, is this Command; a
+// build's line is read with it alone: a word of a build that names a
+// command, `volec test`... after a FILE, stays a FILE.)
+pub fn read_build(line: Line, gpa: Gpa) -> Build {
+    let cmd = build_command(gpa);
+    arena_scope(gpa, |a| {
+        match cmd.parse_in(WordIter::build(line, "volec"), a) {
+            Ok(m) => apply(line, m),
+            Err(e) => build_error(line, e),
+        }
+    })
+}

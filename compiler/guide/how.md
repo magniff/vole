@@ -139,11 +139,14 @@ To add a test case.
 
 To add a volec command, or a query command.
 
-A command (`volec NAME ...`): `pub fn run_NAME(argc: i64, argv:
-**u8) -> i64` (diagnostics with `diag`, written with `write_diags()`
-before it returns), and its line in the chain of
-`crate::tools::commands::run_command`: `if streq(word, c"NAME") {
-return run_NAME(argc, argv); }` (`batch` runs it too). Its `--help`: a
+A command (`volec NAME ...`): its arguments, `pub fn NAME_leaf(gpa:
+Gpa) -> Leaf` (a table of `flag`s and `option`s, `cli::line`), and `pub
+fn run_NAME(c: Call) -> i64` reading `c.evs` (its arguments in the
+line's order) or `c.m` (their Matches); diagnostics with `diag`, written
+with `write_diags()` before it returns. Its name in `tops` and its leaf
+in `leaf_of` (`compiler/src/cli/tree.vl`, volec's Command tree), and its
+line in `run_call` (`compiler/src/tools/commands.vl`): `if name ==
+"NAME" { return run_NAME(c); }` (`batch` runs it too). Its `--help`: a
 `Help { cmd: "NAME", text: "..." }` row in `compiler/src/tools/help.vl`
 (15 lines at most; `HELP_COUNT` and the array's length one more), and
 the command in the list `tests/guide/run.sh` checks `--help` for.

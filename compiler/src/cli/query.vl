@@ -1,0 +1,211 @@
+// `volec query CMD ...`'s options (0.25, on std::cli; 0.25.2: a leaf of
+// volec's Command tree, cli/tree.vl). They set the query's globals; the
+// NAMEs and ROOT, and the last bad option, go back to run_query_inner,
+// which reports it as before (`error query.usage: unknown option '--cnt'`,
+// `--in needs a FILE or MODULE`, with the try: line of the NAMEs given). A
+// word with one '-' but `-i` and `-C` is a NAME (`query grep '-> bool'`);
+// a valued option's value may not start with '-'.
+
+use std::Vec;
+use std::string::str;
+
+use crate::base::IntVec;
+use crate::base::timer::TIME_PASSES;
+use crate::cli::c_of;
+use crate::cli::line::{Call, EV_MISSING, Leaf, Opt, flag, option, short_option};
+use crate::front::stdtree::STD_TREE;
+use crate::tools::query::{OPT_MAX_LINES, OPT_OVER, parse_count};
+use crate::tools::query::budget::OPT_BUDGET;
+use crate::tools::query::callees::{OPT_TRANSITIVE, OPT_WRITES};
+use crate::tools::query::diagnostics::OPT_EXACT;
+use crate::tools::query::effects::{OPT_HAS, OPT_WHY};
+use crate::tools::query::grep::{G_CODE, G_COMMENT, G_STRING, OPT_NOCASE, OPT_WHERE, OPT_WORD};
+use crate::tools::query::refs::{OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT};
+use crate::tools::query::sections::OPT_BANNERS;
+use crate::tools::query::values::OPT_VIEWS_WHY;
+use crate::tools::query_text::WITH_COMMENTS;
+
+// What the options leave to run_query_inner.
+pub struct QueryArgs {
+    // the NAMEs (C strings, argv's), ROOT among them
+    pub args: IntVec,
+    // --root ROOT
+    pub root: *u8,
+    // the last bad option as written (0: none); bad_value: it lacks its
+    // value (or the value is no number), else it is unknown
+    pub bad: *u8,
+    pub bad_value: bool,
+}
+
+// The options of `query CMD` (`views`: --why is a flag).
+pub fn query_leaf(views: bool, gpa: Gpa) -> Leaf {
+    var o: Vec<Opt> = Vec::new_in(gpa);
+    o.push(option("root", "ROOT", "the program's root file"));
+    o.push(option("in", "FILE|MODULE|ITEM", "only the uses there"));
+    o.push(option("kind", "KIND,...", "read, write, call, init, type, use, mod, pat, def"));
+    o.push(option("limit", "N", "at most N lines"));
+    o.push(option("budget", "TOKENS", "the answer cut to about N tokens"));
+    o.push(option("over", "N", "stats: the items over N lines"));
+    o.push(option("max-lines", "N", "deps: the module's size to plan for"));
+    o.push(option("writes", "TABLE", "callees: the functions that write TABLE"));
+    o.push(option("has", "EFFECT", "effects: the functions with EFFECT"));
+    if views {
+        o.push(flag("why", "why each result views what it does"));
+    } else {
+        o.push(option("why", "EFFECT", "why it has EFFECT (effects), FEATURE (features)"));
+    }
+    o.push(option("std-tree", "DIR", "std from its files in DIR"));
+    o.push(short_option("C", "OPTION", "features: the build's -C"));
+    o.push(flag("count", "how many, per file"));
+    o.push(flag("transitive", "callees: what they call too"));
+    o.push(flag("exact", "the NAME as written, not its end"));
+    o.push(flag("all", "everything, no limit or budget"));
+    o.push(flag("time-passes", "the time of each phase (stderr)"));
+    o.push(flag("with-comments", "show: the comments above"));
+    o.push(flag("comments", "grep: in comments; items: the banners"));
+    o.push(flag("code", "grep: in code"));
+    o.push(flag("strings", "grep: in string literals"));
+    o.push(flag("word", "grep: a whole word"));
+    var i = flag("ignore-case", "grep: any case");
+    i.short = 'i';
+    o.push(i);
+    Leaf::new(o, "name", " -i -C ")
+}
+
+// The last bad option so far: (its word's index, its text, whether it lacks
+// its value).
+struct Worst {
+    at: i64,
+    text: *u8,
+    value: bool,
+}
+
+fn note(w: inout Worst, at: i64, text: *u8, value: bool) {
+    if at >= w.at {
+        w.at = at;
+        w.text = text;
+        w.value = value;
+    }
+}
+
+// The value of option `name` (spelled `--name`), when it has one that
+// does not start with '-' (else noted as bad).
+fn value_of(c: Call, name: str, spelled: *u8, w: inout Worst) -> *u8 {
+    var out = 0 as *u8;
+    for v in c.m.values(name) {
+        let real = c.line.given(v);
+        let k = c.line.at(real);
+        if real.len() == 0 || real.as_bytes()[0] == '-' {
+            note(&w, k - 1, spelled, true);
+        } else {
+            out = c_of(real);
+        }
+    }
+    out
+}
+
+// A count option's value (-1: not given, or bad and noted).
+fn count_of(c: Call, name: str, spelled: *u8, w: inout Worst) -> i64 {
+    var n = -1;
+    for v in c.m.values(name) {
+        let real = c.line.given(v);
+        let k = c.line.at(real);
+        let x = if real.len() == 0 || real.as_bytes()[0] == '-' { -1 }
+            else { parse_count(c_of(real)) };
+        if x < 0 {
+            note(&w, k - 1, spelled, true);
+        } else {
+            n = x;
+        }
+    }
+    n
+}
+
+fn apply(c: Call, views: bool) -> QueryArgs {
+    var w = Worst { at: -1, text: 0 as *u8, value: false };
+    match c.last_error() {
+        Option::Some(bad) => note(&w, bad.at, bad.value, bad.kind == EV_MISSING),
+        Option::None => {}
+    }
+    OPT_COUNT = OPT_COUNT || c.m.flag("count");
+    OPT_TRANSITIVE = OPT_TRANSITIVE || c.m.flag("transitive");
+    OPT_EXACT = OPT_EXACT || c.m.flag("exact");
+    OPT_ALL = OPT_ALL || c.m.flag("all");
+    TIME_PASSES = TIME_PASSES || c.m.flag("time-passes");
+    WITH_COMMENTS = WITH_COMMENTS || c.m.flag("with-comments");
+    if c.m.flag("comments") {
+        OPT_WHERE |= G_COMMENT;
+        OPT_BANNERS = true;
+    }
+    if c.m.flag("code") {
+        OPT_WHERE |= G_CODE;
+    }
+    if c.m.flag("strings") {
+        OPT_WHERE |= G_STRING;
+    }
+    OPT_WORD = OPT_WORD || c.m.flag("word");
+    // (0.21: VOLE and Vole too)
+    OPT_NOCASE = OPT_NOCASE || c.m.flag("ignore-case");
+    // (0.17: `query views --why`, a flag)
+    if views {
+        OPT_VIEWS_WHY = OPT_VIEWS_WHY || c.m.flag("why");
+    }
+    // (0.19: -C, the build's features, for `query features`)
+    for v in c.m.values("C") {
+        crate::arch::features::arch_option(c_of(c.line.given(v)));
+    }
+    let given_in = value_of(c, "in", c"--in", &w);
+    if given_in != 0 as *u8 {
+        OPT_IN = given_in;
+    }
+    let root = value_of(c, "root", c"--root", &w);
+    let kind = value_of(c, "kind", c"--kind", &w);
+    if kind != 0 as *u8 {
+        OPT_KIND = kind;
+    }
+    let writes = value_of(c, "writes", c"--writes", &w);
+    if writes != 0 as *u8 {
+        OPT_WRITES = writes;
+    }
+    let has = value_of(c, "has", c"--has", &w);
+    if has != 0 as *u8 {
+        OPT_HAS = has;
+    }
+    if !views {
+        let why = value_of(c, "why", c"--why", &w);
+        if why != 0 as *u8 {
+            OPT_WHY = why;
+        }
+    }
+    // (0.17: std from its files; front/stdtree.vl)
+    let tree = value_of(c, "std-tree", c"--std-tree", &w);
+    if tree != 0 as *u8 {
+        STD_TREE = tree;
+    }
+    let limit = count_of(c, "limit", c"--limit", &w);
+    if limit >= 0 {
+        OPT_LIMIT = limit;
+    }
+    let over = count_of(c, "over", c"--over", &w);
+    if over >= 0 {
+        OPT_OVER = over;
+    }
+    let budget = count_of(c, "budget", c"--budget", &w);
+    if budget >= 0 {
+        OPT_BUDGET = budget;
+    }
+    let lines = count_of(c, "max-lines", c"--max-lines", &w);
+    if lines >= 0 {
+        OPT_MAX_LINES = lines;
+    }
+    var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for v in c.m.values("name") {
+        args.push(c_of(c.line.given(v)) as i64);
+    }
+    QueryArgs { args: args, root: root, bad: w.text, bad_value: w.value }
+}
+
+// `volec query CMD ARGS...`: the Call's (words 3.. of its line).
+pub fn read_query(c: Call) -> QueryArgs {
+    apply(c, c.word(2) == "views")
+}

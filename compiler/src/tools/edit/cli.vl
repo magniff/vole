@@ -2,10 +2,12 @@
 // `undo` and `check`; an item's text replaced, inserted next to another,
 // or deleted with its lines.
 
+use std::Vec;
+
 use crate::arch::features::arch_options_given;
 use crate::base::{
     BUFS, FILES, FILE_COUNT, IntVec, OVERLAY, SRC, SYMS, _setjmp, alloc_zeroed, buf_byte, buf_bytes,
-    buf_fmt, buf_int, buf_new, buf_slice, buf_str, streq,
+    buf_fmt, buf_int, buf_new, buf_slice, buf_str,
 };
 use crate::base::diag::{
     DIAG_SHORT, ERR_BAIL, RECOVER_DEPTH, error_count, flush_warnings, print_ok, warning_count,
@@ -13,14 +15,19 @@ use crate::base::diag::{
 };
 use crate::base::target::target_of_name;
 use crate::base::timer::{TIME_PASSES, timer_report};
+use crate::cli::c_of;
+use crate::cli::line::{
+    Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, Ev, Leaf, Opt, flag, is_flag, is_opt,
+    option, short_option, table,
+};
 use crate::front::modules::file_of_pos;
 use crate::front::own::diag::OWN_REPORT_PRINT;
 use crate::front::stdtree::{STD_TREE, find_std_tree, std_files_differ};
 use crate::tools::conflicts::resolve::run_resolve;
 use crate::tools::edit::{
-    ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
+    DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
 };
-use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, try_replaced};
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command, try_replaced};
 use crate::tools::edit::applyfile::run_apply;
 use crate::tools::edit::items::{
     after_line, blank_line, indent_of, item_head, item_tail, item_text, keyword_head, leading,
@@ -50,8 +57,8 @@ use crate::tools::query_text::{region_spans, region_target};
 
 // ---- The commands ----
 
-pub fn run_edit(argc: i64, argv: **u8) -> i64 {
-    let status = run_edit_inner(argc, argv);
+pub fn run_edit(c: Call) -> i64 {
+    let status = run_edit_inner(c);
     write_diags();
     timer_report();
     status
@@ -68,120 +75,142 @@ fn usage(message: *u8) -> i64 {
     }
 }
 
-// The options the editing commands share: --dry-run, --no-check, --show,
-// --exact, --root R, --target T, --std-tree DIR. Whether a[i] is one (*i moves past its
-// value).
-pub fn take_edit_option(argc: i64, argv: **u8, i: inout i64, root: **u8) -> bool {
-    unsafe {
-        let a = argv[i];
-        if streq(a, c"--dry-run") {
+// (0.25, on std::cli: cli/line.vl) The options the editing commands
+// share, for their tables: --dry-run, --show, --time-passes, --no-check,
+// --exact, -C, --root R, --target T, --std-tree DIR.
+pub fn edit_opts(gpa: Gpa) -> Vec<Opt> {
+    var o: Vec<Opt> = Vec::new_in(gpa);
+    o.push(flag("dry-run", "the diff only, nothing written"));
+    o.push(flag("show", "the diff after"));
+    o.push(flag("no-check", "write despite new errors"));
+    o.push(flag("exact", "the NAME as written, not its end"));
+    o.push(option("root", "ROOT", "the program's root file"));
+    o.push(option("target", "T", "the target the program is checked for"));
+    o.push(option("std-tree", "DIR", "std from its files in DIR"));
+    o.push(short_option("C", "OPTION", "target-cpu=, target-feature=: which calls are legal"));
+    o.push(flag("time-passes", "the time of each phase (stderr)"));
+    o
+}
+
+// Takes ev when it is one of edit_opts' (as take_edit_option): whether it
+// was. Their missing values are unknown options, as before (and `-C`
+// without a valid value is a word).
+pub fn take_edit_event(ev: inout Ev, root: inout *u8) -> bool {
+    if ev.kind == EV_MISSING {
+        if ev.name == "C" {
+            ev.kind = EV_WORD;
+        } else if ev.name == "root" || ev.name == "target" || ev.name == "std-tree" {
+            ev.kind = EV_UNKNOWN;
+        }
+        return false;
+    }
+    if ev.kind == EV_FLAG {
+        if ev.name == "dry-run" {
             DRY_RUN = true;
-        } else if streq(a, c"--show") {
+        } else if ev.name == "show" {
             SHOW = true;
-        } else if streq(a, c"--time-passes") {
+        } else if ev.name == "time-passes" {
             TIME_PASSES = true;
-        } else if streq(a, c"--no-check") {
+        } else if ev.name == "no-check" {
             NO_CHECK = true;
-        } else if streq(a, c"--exact") {
+        } else if ev.name == "exact" {
             OPT_EXACT = true;
-        } else if streq(a, c"-C") && i + 1 < argc
-            && crate::arch::features::arch_option(argv[i + 1]) {
-            // (0.19: -C target-cpu=, -C target-feature=: which calls are
-            // legal)
-            i += 1;
-        } else if (streq(a, c"--root") || streq(a, c"--target") || streq(a, c"--std-tree"))
-            && i + 1 < argc {
-            if streq(a, c"--root") {
-                *root = argv[i + 1];
-            } else if streq(a, c"--std-tree") {
-                // (0.17: std from its files, stdtree.vl; stdedit.vl)
-                STD_TREE = argv[i + 1];
-            } else {
-                TARGET_NAME = argv[i + 1];
-                TARGET = target_of_name(TARGET_NAME);
-            }
-            i += 1;
         } else {
             return false;
         }
-        true
+        return true;
     }
-}
-
-// Whether word is one of argv[3..].
-fn has_arg(argc: i64, argv: **u8, word: *u8) -> bool {
-    for i in 3..argc {
-        if unsafe { streq(argv[i], word) } {
+    if ev.kind != EV_OPTION {
+        return false;
+    }
+    if ev.name == "C" {
+        // (0.19: -C target-cpu=, -C target-feature=: which calls are
+        // legal)
+        if crate::arch::features::arch_option(ev.value) {
             return true;
         }
+        ev.kind = EV_WORD;
+        ev.text = "-C";
+        ev.value = c"-C";
+        return false;
     }
-    false
+    if ev.name == "root" {
+        root = ev.value;
+    } else if ev.name == "std-tree" {
+        // (0.17: std from its files, stdtree.vl; stdedit.vl)
+        STD_TREE = ev.value;
+    } else if ev.name == "target" {
+        TARGET_NAME = ev.value;
+        TARGET = target_of_name(TARGET_NAME);
+    } else {
+        return false;
+    }
+    true
 }
 
 // `edit replace|insert|delete ...` (`patch`, `insert --in`: patch.vl).
-fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        PROG = argv[0];
-        TOOL = c"edit";
-        ARGC = argc;
-        ARGV = argv;
-        if argc < 3 {
-            return usage(c"no command (patch, apply, replace, insert, delete)");
-        }
-        let cmd = argv[2];
-        // (0.17: a std file named, `edit patch compiler/std/io.vl:102`:
-        // the edit runs on std's files; stdedit.vl)
-        if names_std_file(argc, argv) {
-            return rerun_in_std_tree(argc, argv);
-        }
-        if streq(cmd, c"patch") || (streq(cmd, c"insert") && has_arg(argc, argv, c"--in")) {
-            return run_patch(argc, argv);
-        }
-        if streq(cmd, c"resolve") {
-            return run_resolve(argc, argv);
-        }
-        if streq(cmd, c"wrap") {
-            return run_wrap(argc, argv);
-        }
-        if streq(cmd, c"new-file") {
-            return run_new_file(argc, argv);
-        }
-        if streq(cmd, c"apply") {
-            return run_apply(argc, argv);
-        }
-        let replace = streq(cmd, c"replace");
-        let insert = streq(cmd, c"insert");
-        let delete = streq(cmd, c"delete");
-        if !replace && !insert && !delete {
+fn run_edit_inner(c: Call) -> i64 {
+    PROG = c.prog();
+    TOOL = c"edit";
+    set_command(c.line);
+    if c.line.len() < 3 {
+        return usage(c"no command (patch, apply, replace, insert, delete)");
+    }
+    let cmd = c.line.c(2);
+    let word = c.word(2);
+    // (0.17: a std file named, `edit patch compiler/std/io.vl:102`:
+    // the edit runs on std's files; stdedit.vl)
+    if names_std_file(c.line) {
+        return rerun_in_std_tree(c.line);
+    }
+    // (the leaf of `edit insert --in` is patch's: cli/tree.vl)
+    if word == "patch" || (word == "insert" && c.line.has("--in")) {
+        return run_patch(c);
+    }
+    if word == "resolve" {
+        return run_resolve(c);
+    }
+    if word == "wrap" {
+        return run_wrap(c);
+    }
+    if word == "new-file" {
+        return run_new_file(c);
+    }
+    if word == "apply" {
+        return run_apply(c);
+    }
+    let replace = word == "replace";
+    let insert = word == "insert";
+    let delete = word == "delete";
+    if !replace && !insert && !delete {
+        let d = diag(c"error", c"edit.usage");
+        buf_str(d, c"unknown command '");
+        buf_str(d, cmd);
+        buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
+        return 2;
+    }
+    var after = false;
+    var before = false;
+    var root = 0 as *u8;
+    var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for e in c.evs.iter() {
+        var ev = e;
+        if ev.kind == EV_FLAG && ev.name == "after" {
+            after = true;
+        } else if ev.kind == EV_FLAG && ev.name == "before" {
+            before = true;
+        } else if take_edit_event(&ev, &root) {
+        } else if ev.kind == EV_WORD {
+            names.push(ev.value as i64);
+        } else {
             let d = diag(c"error", c"edit.usage");
-            buf_str(d, c"unknown command '");
-            buf_str(d, cmd);
-            buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
+            buf_str(d, c"unknown option '");
+            buf_str(d, ev.value);
+            buf_str(d, c"'\n");
             return 2;
         }
-        var after = false;
-        var before = false;
-        var root = 0 as *u8;
-        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        var i = 3;
-        while i < argc {
-            let a = argv[i];
-            if streq(a, c"--after") {
-                after = true;
-            } else if streq(a, c"--before") {
-                before = true;
-            } else if take_edit_option(argc, argv, &i, &root) {
-            } else if a[0] == '-' && a[1] == '-' {
-                let d = diag(c"error", c"edit.usage");
-                buf_str(d, c"unknown option '");
-                buf_str(d, a);
-                buf_str(d, c"'\n");
-                return 2;
-            } else {
-                names.push(a as i64);
-            }
-            i += 1;
-        }
+    }
+    unsafe {
         if names.count == 2 && root == 0 as *u8
             && crate::base::is_source_path(names.data[1] as *u8) {
             root = names.data[1] as *u8;
@@ -258,7 +287,7 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
         if FILES[f].path[0] == '<' {
             // (0.17: std, in the repository: in its files; stdedit.vl)
             if std_rerun(f) {
-                return rerun_in_std_tree(argc, argv);
+                return rerun_in_std_tree(c.line);
             }
             let e = diag(c"error", c"edit.not-source");
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
@@ -612,23 +641,51 @@ pub fn ambiguous(what: *u8, name: [u8], matches: IntVec) {
     }
 }
 
+// `edit replace|insert|delete`'s arguments (0.25.2: a leaf of volec's
+// Command tree, cli/tree.vl).
+pub fn edit_leaf(gpa: Gpa) -> Leaf {
+    var opts = edit_opts(gpa);
+    opts.push(flag("after", "insert after NAME"));
+    opts.push(flag("before", "insert before NAME"));
+    Leaf::new(opts, "name", " -C ")
+}
+
+// `undo`'s arguments (another option is ignored).
+pub fn undo_leaf(gpa: Gpa) -> Leaf {
+    var opts = table(gpa);
+    opts.push(flag("force", "take it back even when the files changed since"));
+    Leaf::new(opts, "root", "")
+}
+
 // `volec undo [--force] [ROOT]`.
-pub fn run_undo_command(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        PROG = argv[0];
-        var force = false;
-        var from = 0 as *u8;
-        for i in 2..argc {
-            if streq(argv[i], c"--force") {
-                force = true;
-            } else if argv[i][0] != '-' {
-                from = argv[i];
-            }
+pub fn run_undo_command(c: Call) -> i64 {
+    PROG = c.prog();
+    var force = false;
+    var from = 0 as *u8;
+    for ev in c.evs.iter() {
+        if is_flag(ev, "force") {
+            force = true;
+        } else if ev.kind == EV_WORD && !ev.text.starts_with("-") {
+            from = ev.value;
         }
+    }
+    unsafe {
         let status = run_undo(force, from);
         write_diags();
         status
     }
+}
+
+// `check`'s arguments (0.25.2: a leaf of volec's Command tree, cli/tree.vl).
+pub fn check_leaf(gpa: Gpa) -> Leaf {
+    var opts = edit_opts(gpa);
+    opts.push(option("overlay", "PATH", "--overlay PATH COPY: PATH read from COPY"));
+    opts.push(option("overlay-copy", "COPY", "--overlay's COPY"));
+    opts.push(option("diagnostics", "FORM", "--diagnostics=short|human"));
+    // (0.25.2) `-I DIR` (or -IDIR): where `import "header.h"` looks first,
+    // as for a build
+    opts.push(short_option("I", "DIR", "where import \"header.h\" looks first"));
+    Leaf::new(opts, "file", " -C -I ").with_twos(" --overlay ")
 }
 
 // (0.17) std's files in the repository edited since this compiler was
@@ -654,48 +711,52 @@ pub fn std_tree_if_edited() {
 // end (parse, resolve, check, unsafe check), every error, one per line;
 // exit 1 when there is one. (`--overlay FILE COPY` reads COPY for FILE:
 // how an edit is checked before it is written.)
-pub fn run_check(argc: i64, argv: **u8) -> i64 {
-    unsafe {
-        PROG = argv[0];
-        DIAG_SHORT = true;
-        crate::front::tests::CHECK_TESTS = true;
-        var root = 0 as *u8;
-        var i = 2;
-        while i < argc {
-            let a = argv[i];
-            if streq(a, c"--overlay") && i + 2 < argc {
-                OVERLAY.push(argv[i + 1] as i64);
-                OVERLAY.push(argv[i + 2] as i64);
-                i += 3;
-                continue;
-            }
-            // (0.25.2) `-I DIR` (or -IDIR): where `import "header.h"` looks
-            // first, as for a build
-            if streq(a, c"-I") && i + 1 < argc {
-                C_INCLUDE_DIRS.push(argv[i + 1] as i64);
-                i += 2;
-                continue;
-            }
-            if a[0] == '-' && a[1] == 'I' && a[2] != 0 {
-                C_INCLUDE_DIRS.push(&a[2] as i64);
-                i += 1;
-                continue;
-            }
-            if streq(a, c"--diagnostics=human") || streq(a, c"--diagnostics=short") {
-                DIAG_SHORT = streq(a, c"--diagnostics=short");
-            } else if take_edit_option(argc, argv, &i, &root) {
-            } else if a[0] == '-' {
-                let d = diag(c"error", c"check.usage");
-                buf_str(d, c"unknown option '");
-                buf_str(d, a);
-                buf_str(d, c"'\n");
-                write_diags();
-                return 2;
+pub fn run_check(c: Call) -> i64 {
+    PROG = c.prog();
+    DIAG_SHORT = true;
+    crate::front::tests::CHECK_TESTS = true;
+    var root = 0 as *u8;
+    var path = 0 as *u8;
+    var bad = 0 as *u8;
+    for e in c.evs.iter() {
+        var ev = e;
+        let token = c.word(ev.at);
+        let joined = ev.text;
+        if is_opt(ev, "I") {
+            C_INCLUDE_DIRS.push(ev.value as i64);
+        } else if ev.kind == EV_WORD && joined.len() > 2 && joined.starts_with("-I") {
+            C_INCLUDE_DIRS.push(c_of(joined.strip_prefix("-I").unwrap()) as i64);
+        } else if ev.kind == EV_OPTION && ev.name == "overlay" {
+            path = ev.value;
+        } else if ev.kind == EV_OPTION && ev.name == "overlay-copy" {
+            OVERLAY.push(path as i64);
+            OVERLAY.push(ev.value as i64);
+            path = 0 as *u8;
+        } else if ev.kind == EV_OPTION && ev.name == "diagnostics" {
+            if token == "--diagnostics=human" || token == "--diagnostics=short" {
+                DIAG_SHORT = token == "--diagnostics=short";
             } else {
-                root = a;
+                bad = if token.starts_with("-") { c.line.c(ev.at) } else { c.line.c(ev.at - 1) };
             }
-            i += 1;
+        } else if take_edit_event(&ev, &root) {
+        } else if ev.kind == EV_WORD && !ev.text.starts_with("-") {
+            root = ev.value;
+        } else {
+            bad = ev.value;
         }
+        if bad == 0 as *u8 && path != 0 as *u8 && ev.at + 1 >= c.line.len() {
+            bad = c"--overlay";
+        }
+        if bad != 0 as *u8 {
+            let d = diag(c"error", c"check.usage");
+            buf_str(d, c"unknown option '");
+            buf_str(d, bad);
+            buf_str(d, c"'\n");
+            write_diags();
+            return 2;
+        }
+    }
+    unsafe {
         // (0.17: std's files edited: checked with them, front/stdtree.vl)
         std_tree_if_edited();
         ROOT_GIVEN = root;
