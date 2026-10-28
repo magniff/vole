@@ -20,10 +20,11 @@
 // command's own option parsing needs no change.
 
 use crate::base::{
-    STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd,
+    IntVec, STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd,
 };
+use crate::cli::line::{Line, c_word_at, c_words};
 use crate::front::cpp::directives::file_exists;
-use crate::tools::proc::{absolute_path, buf_cstr, read_file_if, run_capture};
+use crate::tools::proc::{absolute_path, buf_cstr, exec_words, read_file_if, run_capture};
 use crate::tools::query::{c_slice, find_root};
 use crate::tools::query::defs::last_segment;
 use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, diag, diags, put_cword, put_word, try_end};
@@ -32,12 +33,11 @@ use crate::tools::query::names::is_name_char;
 extern "C" {
     fn getenv(name: *u8) -> *u8;
     fn realpath(path: *u8, resolved: *u8) -> *u8;
-    fn execvp(file: *u8, argv: **u8) -> i32;
+    fn execvp(file: *u8, args: **u8) -> i32;
 }
 
-// The command line of the command being run (run_command's argc, argv).
-static var CMD_ARGC: i64 = 0;
-static var CMD_ARGV: **u8 = 0 as **u8;
+// The words of the command being run (run_command's line), as C strings.
+static var CMD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Whether ROOT_GIVEN was found here, not given: `try:` lines then say
 // `--root ROOT` (put_root).
 pub static var ROOT_INFERRED: bool = false;
@@ -45,30 +45,26 @@ pub static var ROOT_INFERRED: bool = false;
 // none, or several), for run_query to answer from.
 static var OTHER_ROOT: *u8 = 0 as *u8;
 
-pub fn note_command(argc: i64, argv: **u8) {
-    CMD_ARGC = argc;
-    CMD_ARGV = argv;
+pub fn note_command(line: Line) {
+    CMD = c_words(line);
+}
+
+// The words of the command being run (C strings, a copy), to run it
+// again.
+pub fn command_words() -> IntVec {
+    var out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in 0..CMD.count {
+        out.push(CMD.get(k));
+    }
+    out
 }
 
 // Word k of the command line ("" past its end).
 fn word(k: i64) -> *u8 {
-    if k < 0 || k >= CMD_ARGC {
+    if k < 0 || k >= CMD.count {
         return c"";
     }
-    // UNSAFE: the command line is C's argv, a raw array of C strings
-    // SAFETY: run_command's argv holds CMD_ARGC strings, and 0 <= k < CMD_ARGC
-    unsafe { CMD_ARGV[k] }
-}
-
-// Element k of a command line being built, an array of n C strings
-// (alloc_array), set to w; nothing past its end.
-fn set_word(argv: **u8, n: i64, k: i64, w: *u8) {
-    if k < 0 || k >= n {
-        return;
-    }
-    // UNSAFE: a write through a raw pointer, the array exec and run_capture take
-    // SAFETY: argv has n elements (alloc_array) and 0 <= k < n
-    unsafe { argv[k] = w; }
+    c_word_at(CMD, k)
 }
 
 fn cstr_of(s: [u8]) -> *u8 {
@@ -249,7 +245,7 @@ pub fn root_named(given: *u8) -> *u8 {
 // names, when it is not the default program (ROOT_GIVEN is set to it, for
 // the `try:` lines); 0 otherwise.
 pub fn root_of_args() -> *u8 {
-    for k in 2..CMD_ARGC {
+    for k in 2..CMD.count {
         let a = c_slice(word(k));
         if a == "--" {
             break;
@@ -311,12 +307,12 @@ fn default_root_used() -> bool {
 // ignores (a release's tree extracted under target/), `grep -r` less the
 // build's and the tools' directories; never of the home directory or /.
 fn files_matching(pattern: *u8) -> [u8] {
-    // (the null after the words: alloc_array's zeroes)
-    let args = crate::base::alloc_array::<*u8>(5);
-    set_word(args, 5, 0, c"sh");
-    set_word(args, 5, 1, c"-c");
-    set_word(args, 5, 2, c"{ if git rev-parse --git-dir >/dev/null 2>&1 && ! git check-ignore -q . 2>/dev/null; then git grep -l -w -E --untracked -e \"$0\" -- '*.vl'; elif [ \"$PWD\" != \"$HOME\" ] && [ \"$PWD\" != / ]; then grep -rlwE --include='*.vl' --exclude-dir=.git --exclude-dir=target --exclude-dir=.claude --exclude-dir=.volec --exclude-dir=node_modules -e \"$0\" -- .; fi; } 2>/dev/null | LC_ALL=C sort");
-    set_word(args, 5, 3, pattern);
+    var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    words.push(c"sh" as i64);
+    words.push(c"-c" as i64);
+    words.push(c"{ if git rev-parse --git-dir >/dev/null 2>&1 && ! git check-ignore -q . 2>/dev/null; then git grep -l -w -E --untracked -e \"$0\" -- '*.vl'; elif [ \"$PWD\" != \"$HOME\" ] && [ \"$PWD\" != / ]; then grep -rlwE --include='*.vl' --exclude-dir=.git --exclude-dir=target --exclude-dir=.claude --exclude-dir=.volec --exclude-dir=node_modules -e \"$0\" -- .; fi; } 2>/dev/null | LC_ALL=C sort" as i64);
+    words.push(pattern as i64);
+    let args = exec_words(words);
     let listing = buf_new();
     if run_capture(args, listing) != 0 {
         return buf_slice(listing)[0..0];
@@ -390,7 +386,7 @@ fn try_with_root(root: [u8]) {
     let out = diags();
     buf_str(out, c"try:");
     put_cword(out, PROG);
-    for k in 1..CMD_ARGC {
+    for k in 1..CMD.count {
         put_word(out, c_slice(word(k)));
     }
     buf_str(out, c" --root");
@@ -451,17 +447,13 @@ pub fn other_root() {
     buf_str(d, c")\n");
     buf_write_fd(out, STDERR);
     buf_clear(out);
-    // (the command's words, `--root`, the root; the null after them:
-    // alloc_array's zeroes)
-    let n = CMD_ARGC + 3;
-    let argv = crate::base::alloc_array::<*u8>(n);
-    for k in 0..CMD_ARGC {
-        set_word(argv, n, k, word(k));
-    }
-    set_word(argv, n, CMD_ARGC, c"--root");
-    set_word(argv, n, CMD_ARGC + 1, OTHER_ROOT);
+    // (the command's words, `--root`, the root)
+    var words = command_words();
+    words.push(c"--root" as i64);
+    words.push(OTHER_ROOT as i64);
+    let args = exec_words(words);
     // UNSAFE: execvp is C's
-    // SAFETY: argv is a null-ended array of C strings (above), its first
-    // the program as this one was run
-    unsafe { execvp(word(0), argv); }
+    // SAFETY: args is a null-ended array of C strings (exec_words), its
+    // first the program as this one was run
+    unsafe { execvp(word(0), args); }
 }

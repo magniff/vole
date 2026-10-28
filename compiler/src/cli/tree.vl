@@ -1,0 +1,305 @@
+// volec's command line as one std::cli Command tree (0.25.2). The root is
+// a build's Command (build.vl: `volec FILE.vl...`), every other command
+// one of its subcommands (`query`, `edit`, `check`...), and `query`,
+// `edit` and `refactor` have theirs (`query refs`, `edit patch`, `refactor
+// rename`). A command's arguments are its leaf (line.vl's Leaf: its
+// options, its words), defined next to the command (`check_leaf` by
+// run_check); the tree is made of the leaves, so what a command reads is
+// what the tree says it reads.
+//
+// A line is read with the tree along the commands it names at fixed
+// places, words 1 and 2, as volec read them before (route), and run by
+// the name Matches::subcommand() gives (tools/commands.vl). What 0.25.1's
+// std::cli (this compiler's builder's) lacks is made up here and in
+// line.vl, to go when 0.25.2 builds the compiler (0.25.3; see
+// docs/design/cli.md):
+//
+//   - a parent's word 2 that names none of its subcommands (`query bogus`)
+//     is read as the parent's hidden subcommand `(other)`, whose leaf is
+//     the parent's own: std::cli would take a later word that names a
+//     subcommand (`query bogus refs`) as that subcommand;
+//   - `refactor --script FILE` is the tree's `refactor script`, and 0.8's
+//     `--fix-imports` and 0.9's `--fix-unsafe` (anywhere in a build's
+//     line) are `fix` from word 1;
+//   - the options the editing commands share (edit_opts) are each
+//     subcommand's (0.25.2: Arg::global);
+//   - a build's line is read with the root alone (build.vl: read_build),
+//     so that a FILE named as a command stays a FILE.
+
+use std::Gpa;
+use std::cli::{Arg, Command};
+use std::string::str;
+
+use crate::cli::build::build_command;
+use crate::cli::line::{Call, FLAG, Leaf, Line, Opt, no_leaf, parse, word_of};
+
+// The top-level commands.
+fn tops() -> [str; 20] {
+    ["query", "edit", "undo", "check", "fix", "lint", "guide", "assemble", "lsp", "same-output",
+        "fmt", "explain", "test", "reduce", "fuzz", "probe", "try", "refactor", "rewrite", "batch"]
+}
+
+// The subcommands of `edit`.
+fn edit_subs() -> [str; 8] {
+    ["patch", "insert", "replace", "delete", "wrap", "new-file", "apply", "resolve"]
+}
+
+// The subcommands of `refactor` (`script`: `--script`).
+fn refactor_subs() -> [str; 12] {
+    ["rename", "move", "new-module", "move-module", "split", "signature", "field", "variant",
+        "extract-function", "inline", "extension", "script"]
+}
+
+// A parent's subcommand for a word 2 that is none of its others.
+fn other() -> str {
+    "(other)"
+}
+
+// Whether word is a top-level command.
+pub fn is_command(word: str) -> bool {
+    for t in tops() {
+        if t == word {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether word is a subcommand of command top (one with subcommands).
+fn is_sub(top: str, word: str) -> bool {
+    if top == "query" {
+        if word == "checks" {
+            return true;
+        }
+        for i in 0..crate::tools::query::N_COMMANDS {
+            if word_of(crate::tools::query::command_name(i)) == word {
+                return true;
+            }
+        }
+        return false;
+    }
+    if top == "edit" {
+        for s in edit_subs() {
+            if s == word {
+                return true;
+            }
+        }
+        return false;
+    }
+    if top == "refactor" {
+        for s in refactor_subs() {
+            if s == word {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether command top has subcommands.
+fn has_subs(top: str) -> bool {
+    top == "query" || top == "edit" || top == "refactor"
+}
+
+// Where a line's command is: the command (word 1), its subcommand ("":
+// none) and the index of its first argument.
+struct Route {
+    top: str,
+    sub: str,
+    from: i64,
+}
+
+fn route(line: Line) -> Route {
+    let top = line.word(1);
+    if !has_subs(top) {
+        return Route { top: top, sub: "", from: 2 };
+    }
+    let w = line.word(2);
+    if top == "refactor" && w == "--script" {
+        return Route { top: top, sub: "script", from: 3 };
+    }
+    // (a word 2 that is an option or a NAME is a word of the parent's own
+    // leaf, as before: arguments are read from word 3)
+    Route { top: top, sub: if is_sub(top, w) && w != "script" { w } else { other() }, from: 3 }
+}
+
+// The arguments of command top's subcommand sub ("": top's own; `(other)`: a
+// parent's own); line chooses between two leaves of one name (`edit
+// insert --in` is patch's, `rewrite --text` the textual rewrite's).
+fn leaf_of(top: str, sub: str, line: Line, gpa: Gpa) -> Leaf {
+    if top == "query" {
+        if sub == "checks" {
+            return crate::tools::query::checks::checks_leaf(gpa);
+        }
+        if sub == "conflicts" {
+            return crate::tools::conflicts::conflicts_leaf(gpa);
+        }
+        if sub == "arch" || sub == "intrinsics" {
+            return crate::tools::query::intrinsics::arch_leaf(gpa);
+        }
+        return crate::cli::query::query_leaf(sub == "views", gpa);
+    }
+    if top == "edit" {
+        if sub == "patch" || (sub == "insert" && line.has("--in")) {
+            return crate::tools::patch::patch_leaf(sub == "insert", gpa);
+        }
+        if sub == "resolve" {
+            return crate::tools::conflicts::resolve::resolve_leaf(gpa);
+        }
+        if sub == "wrap" {
+            return crate::tools::edit::wrap::wrap_leaf(gpa);
+        }
+        if sub == "new-file" {
+            return crate::tools::edit::newfile::new_file_leaf(gpa);
+        }
+        if sub == "apply" {
+            return crate::tools::edit::applyfile::apply_leaf(gpa);
+        }
+        return crate::tools::edit::cli::edit_leaf(gpa);
+    }
+    if top == "refactor" {
+        if sub == "rename" || sub == "move" || sub == "new-module" || sub == "move-module"
+            || sub == "split" {
+            return crate::tools::refactor_mod::cli::refactor_mod_leaf(gpa);
+        }
+        if sub == "signature" || sub == "field" || sub == "variant" || sub == "extract-function"
+            || sub == "inline" {
+            return crate::tools::refactor_shape::shape_leaf(
+                crate::tools::refactor_shape::shape_options(sub), gpa);
+        }
+        if sub == "extension" {
+            return crate::tools::textual::extension::extension_leaf(gpa);
+        }
+        if sub == "script" {
+            return crate::tools::script::script_leaf(gpa);
+        }
+        return no_leaf(gpa);
+    }
+    if top == "undo" {
+        return crate::tools::edit::cli::undo_leaf(gpa);
+    }
+    if top == "check" {
+        return crate::tools::edit::cli::check_leaf(gpa);
+    }
+    if top == "fix" {
+        return crate::tools::fix::command::fix_leaf(gpa);
+    }
+    if top == "lint" {
+        return crate::tools::plan::lint_leaf(gpa);
+    }
+    if top == "guide" {
+        return crate::guide::guide_leaf(gpa);
+    }
+    if top == "assemble" {
+        return crate::tools::assemble::assemble_leaf(gpa);
+    }
+    if top == "same-output" {
+        return crate::tools::sameout::same_output_leaf(gpa);
+    }
+    if top == "fmt" {
+        return crate::tools::fmt::fmt_leaf(gpa);
+    }
+    if top == "explain" {
+        return crate::tools::explain::explain_leaf(gpa);
+    }
+    if top == "test" {
+        return crate::tools::testrun::test_leaf(gpa);
+    }
+    if top == "reduce" {
+        return crate::tools::reduce::reduce_leaf(gpa);
+    }
+    if top == "fuzz" {
+        return crate::tools::testrun::fuzz::fuzz_leaf(gpa);
+    }
+    if top == "probe" {
+        return crate::tools::probe::probe_leaf(gpa);
+    }
+    if top == "try" {
+        return crate::tools::snippet::try_leaf(gpa);
+    }
+    if top == "rewrite" {
+        if line.has("--text") {
+            return crate::tools::textual::rewrite::text_rewrite_leaf(gpa);
+        }
+        return crate::tools::rewrite::rewrite_leaf(gpa);
+    }
+    if top == "batch" {
+        return crate::tools::batch::batch_leaf(gpa);
+    }
+    // (lsp: no arguments)
+    no_leaf(gpa)
+}
+
+// The Command `name` reading leaf's arguments.
+fn command_of(name: str, leaf: Leaf, gpa: Gpa) -> Command {
+    var cmd = Command::new_in(name, gpa);
+    for o in leaf.opts.iter() {
+        cmd = cmd.arg(arg_of(o));
+    }
+    cmd.arg(Arg::positional(leaf.word).multiple())
+}
+
+// opt as an Arg.
+fn arg_of(o: Opt) -> Arg {
+    var a = if o.kind == FLAG { Arg::flag(o.name) } else { Arg::option(o.name) };
+    a = a.help(o.help);
+    if o.value_name.len() > 0 {
+        a = a.value_name(o.value_name);
+    }
+    if o.short != 0 {
+        a = a.short(o.short);
+        if o.name.len() == 1 {
+            // (an option with a one-letter form only, `-C`)
+            a = a.long("");
+        }
+    }
+    a
+}
+
+// cmd (command top) with its subcommand sub.
+fn with_sub(cmd: sink Command, top: str, sub: str, line: Line, gpa: Gpa) -> Command {
+    let leaf = leaf_of(top, sub, line, gpa);
+    let c = command_of(sub, leaf, gpa);
+    cmd.subcommand(c)
+}
+
+// The tree (line chooses between two leaves of one name).
+pub fn volec_tree(line: Line, gpa: Gpa) -> Command {
+    var root = build_command(gpa);
+    for top in tops() {
+        var cmd = if has_subs(top) { Command::new_in(top, gpa) }
+            else { command_of(top, leaf_of(top, "", line, gpa), gpa) };
+        if top == "query" {
+            for i in 0..crate::tools::query::N_COMMANDS {
+                cmd = with_sub(cmd, top, word_of(crate::tools::query::command_name(i)), line, gpa);
+            }
+            cmd = with_sub(cmd, top, "checks", line, gpa);
+        } else if top == "edit" {
+            for sub in edit_subs() {
+                cmd = with_sub(cmd, top, sub, line, gpa);
+            }
+        } else if top == "refactor" {
+            for sub in refactor_subs() {
+                cmd = with_sub(cmd, top, sub, line, gpa);
+            }
+        }
+        if has_subs(top) {
+            cmd = with_sub(cmd, top, other(), line, gpa);
+        }
+        root = root.subcommand(cmd);
+    }
+    root
+}
+
+// The Call of a command's line (word 1 is_command): read with the tree.
+pub fn call_of(line: Line, gpa: Gpa) -> Call {
+    let r = route(line);
+    parse(volec_tree(line, gpa), line, r.top, r.sub, r.from, leaf_of(r.top, r.sub, line, gpa),
+        gpa)
+}
+
+// The Call of `fix` for a build's line with `--fix-imports` or
+// `--fix-unsafe`: its arguments from word 1.
+pub fn fix_alias_call(line: Line, gpa: Gpa) -> Call {
+    parse(volec_tree(line, gpa), line, "fix", "", 1, leaf_of("fix", "", line, gpa), gpa)
+}

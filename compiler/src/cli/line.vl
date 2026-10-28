@@ -1,0 +1,606 @@
+// A command line and its parse on volec's Command tree (0.25.2).
+//
+// A Line is the words of a command line, the program's name first:
+// std::env::args()'s (main), or a batch's or a script's line. Its words
+// are std::cli's arguments (WordIter); the values std::cli gives view
+// them, so a value's place in the line is the word it views (`at`): the
+// order of different options' values (`edit patch`'s pairs after `--in`,
+// the link's `-l`, `-L` and objects), which 0.25.1's Matches do not keep
+// (0.25.2's `indices_of` does: 0.25.3, built by 0.25.2, can drop `at`).
+//
+// `parse` reads a line with the tree (tree.vl) along a path of commands
+// named at fixed places (`volec query refs ...`: words 1 and 2), as volec
+// read them before; it goes on after an error (the word is taken out and
+// the rest read again), so a command still reports its first, or last,
+// bad option with what else it was given. The Call it gives a command
+// holds the Matches of its own level and its arguments in the line's
+// order (Ev): its flags, option values, words and errors.
+
+use std::{Gpa, Iterator, Option, Vec};
+use std::cli::{CliErrorKind, Command, Matches};
+use std::string::str;
+
+use crate::base::{IntVec, buf_bytes, buf_new, cstr};
+use crate::cli::{c_of, short_of};
+use crate::tools::proc::buf_cstr;
+
+// A command's arguments in the line's order (0.25): the commands whose
+// meaning depends on the order of their options (`edit patch NAME --old A
+// --new B --in OTHER --old C --new D`: the pairs after `--in` are OTHER's;
+// `each --new follows its --old`) read these events in order. A command
+// lists its options in a table of Opts (its Leaf); parse (below) puts each
+// flag, option value, word and error in the line's order.
+
+pub const FLAG: i64 = 0;
+pub const OPTION: i64 = 1;
+
+// An option of a command: `--NAME` (and `-S` when short is S), a flag or
+// an option with a value.
+#[derive(Clone)]
+pub struct Opt {
+    pub name: str,
+    pub short: u8,
+    pub kind: i64,
+    pub value_name: str,
+    pub help: str,
+}
+
+// A flag `--name`.
+pub fn flag(name: str, help: str) -> Opt {
+    Opt { name: name, short: 0, kind: FLAG, value_name: "", help: help }
+}
+
+// An option `--name VALUE`.
+pub fn option(name: str, value_name: str, help: str) -> Opt {
+    Opt { name: name, short: 0, kind: OPTION, value_name: value_name, help: help }
+}
+
+// An option with a one-letter form only, `-c VALUE` (its name: `c`).
+pub fn short_option(c: str, value_name: str, help: str) -> Opt {
+    Opt { name: c, short: c.as_bytes()[0], kind: OPTION, value_name: value_name, help: help }
+}
+
+// What an event is.
+pub const EV_FLAG: i64 = 0;
+pub const EV_OPTION: i64 = 1;
+pub const EV_WORD: i64 = 2;
+// an option that is none (`--bogus`, `--dry-run=1`): value is the token
+pub const EV_UNKNOWN: i64 = 3;
+// an option without its value at the end: name is its name
+pub const EV_MISSING: i64 = 4;
+
+// One flag, option, word or error of a command line, at its word `at`.
+#[derive(Clone)]
+pub struct Ev {
+    pub at: i64,
+    pub kind: i64,
+    // the option's name (an Opt's), "" for a word or an unknown option
+    pub name: str,
+    // the option's value or the word (a dash word with its '-'), the
+    // unknown option as given; and as a C string, for the compiler's tables
+    pub text: str,
+    pub value: *u8,
+}
+
+// Whether ev is option or flag `name`.
+pub fn is(ev: Ev, name: str) -> bool {
+    (ev.kind == EV_FLAG || ev.kind == EV_OPTION || ev.kind == EV_MISSING) && ev.name == name
+}
+
+// An Option of the value of ev, for `match`.
+pub fn value_of(ev: Ev) -> Option<*u8> {
+    if ev.kind == EV_OPTION { Option::Some(ev.value) } else { Option::None }
+}
+
+// Whether ev is flag `name`.
+pub fn is_flag(ev: Ev, name: str) -> bool {
+    ev.kind == EV_FLAG && ev.name == name
+}
+
+// Whether ev is a value of option `name`.
+pub fn is_opt(ev: Ev, name: str) -> bool {
+    ev.kind == EV_OPTION && ev.name == name
+}
+
+// Whether ev is option `name` without its value (at the end).
+pub fn is_missing(ev: Ev, name: str) -> bool {
+    ev.kind == EV_MISSING && ev.name == name
+}
+
+// A table of options, empty, for a command's `push`es.
+pub fn table(gpa: Gpa) -> Vec<Opt> {
+    Vec::new_in(gpa)
+}
+
+// ev's option as `--NAME` (a C string): for a command line made again
+// (`--timeout=5` is `--timeout 5` there).
+pub fn long_of(ev: Ev) -> *u8 {
+    let b = buf_new();
+    buf_bytes(b, "--".as_bytes());
+    buf_bytes(b, ev.name.as_bytes());
+    buf_cstr(b)
+}
+
+// The words of a command line, the program's name first.
+#[derive(Clone)]
+pub struct Line {
+    pub words: [str],
+}
+
+impl Line {
+    // The number of words (the program's name counted).
+    pub fn len(self) -> i64 {
+        self.words.len
+    }
+
+    // Word k, or "" past the end.
+    pub fn word(self, k: i64) -> str {
+        if k >= 0 && k < self.words.len { self.words[k] } else { "" }
+    }
+
+    // Word k as a C string (a copy), for the compiler's tables.
+    pub fn c(self, k: i64) -> *u8 {
+        c_of(self.word(k))
+    }
+
+    // Whether a word after the program's name is w.
+    pub fn has(self, w: str) -> bool {
+        for k in 1..self.words.len {
+            if self.words[k] == w {
+                return true;
+            }
+        }
+        false
+    }
+
+    // The index of the word that s views (a value, or an option as
+    // written), or -1 (a default, a spelling WordIter made).
+    pub fn at(self, s: str) -> i64 {
+        let p = s.as_bytes().ptr as i64;
+        for k in 0..self.words.len {
+            let w = self.words[k].as_bytes();
+            let start = w.ptr as i64;
+            if p >= start && p <= start + w.len {
+                return k;
+            }
+        }
+        -1
+    }
+
+    // The word that s views, whole (`--emit-ir=x` for its `x`), or s.
+    pub fn whole_word(self, s: str) -> str {
+        let k = self.at(s);
+        if k < 0 { s } else { self.words[k] }
+    }
+
+    // A value as given: a dash word with its '-' back (WordIter gives
+    // `-> bool` as `> bool`, a positional).
+    pub fn given(self, v: str) -> str {
+        let k = self.at(v);
+        if k < 0 {
+            return v;
+        }
+        let w = self.words[k];
+        if v.as_bytes().ptr as i64 == w.as_bytes().ptr as i64 + 1 && w.starts_with("-") {
+            return w;
+        }
+        v
+    }
+
+    // The words from k on, as a line of their own after `name` (a
+    // command's own line: `probe`'s ARGS after `--`).
+    pub fn from(self, k: i64) -> [str] {
+        if k >= self.words.len { self.words[self.words.len..] } else { self.words[k..] }
+    }
+}
+
+// A C string's text as a word of a line (a batch's or a script's words;
+// one that is not UTF-8: "").
+pub fn word_of(p: *u8) -> str {
+    str::from_utf8(cstr(p)).unwrap_or("")
+}
+
+// The line's words as C strings (copies), for a static (which holds no
+// views) and for running the command again.
+pub fn c_words(line: Line) -> IntVec {
+    var out = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for w in line.words {
+        out.push(c_of(w) as i64);
+    }
+    out
+}
+
+// Word k of words (c_words'), a C string.
+pub fn c_word_at(words: IntVec, k: i64) -> *u8 {
+    let p = words.get(k);
+    // UNSAFE: an IntVec (the compiler's own array) holds the C strings'
+    // pointers as integers.
+    // SAFETY: p is one c_words (or a caller of exec_words) pushed: a C
+    // string's pointer, never freed.
+    unsafe { p as *u8 }
+}
+
+// How a command's arguments are read (its leaf of the tree): its options,
+// the name of its words, the words with one '-' that are its short options
+// (` -i -C `: any other is a word, `query grep '-> bool'`), its options of
+// two values (` --overlay `, ` --rename --type `), and the option the words
+// after `--` are values of (`probe ... -- ARGS`; "": none).
+#[derive(Clone)]
+pub struct Leaf {
+    pub opts: Vec<Opt>,
+    pub word: str,
+    pub shorts: str,
+    pub twos: str,
+    pub last: str,
+    pub last_long: str,
+}
+
+impl Leaf {
+    // A leaf of opts, its words named word, its short options shorts.
+    pub fn new(opts: sink Vec<Opt>, word: str, shorts: str) -> Leaf {
+        Leaf { opts: opts, word: word, shorts: shorts, twos: "", last: "", last_long: "" }
+    }
+
+    // With options of two values (` --rename --type `; ` --overlay `).
+    pub fn with_twos(sink self, twos: str) -> Leaf {
+        self.twos = twos;
+        self
+    }
+
+    // The words after `--` as values of option `last` (an Opt of opts),
+    // spelled `long` (`--args`).
+    pub fn with_last(sink self, last: str, long: str) -> Leaf {
+        self.last = last;
+        self.last_long = long;
+        self
+    }
+
+    // Whether s (`--max`, `-O`) is an option of the leaf that takes the
+    // next word as its value.
+    fn takes_value(self, s: str) -> bool {
+        let b = s.as_bytes();
+        for o in self.opts.iter() {
+            if o.kind != OPTION {
+                continue;
+            }
+            if b.len == o.name.len() + 2 && s.strip_prefix("--").unwrap_or("") == o.name {
+                return true;
+            }
+            if o.short != 0 && b.len == 2 && b[0] == '-' && b[1] == o.short {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// A leaf of no options and no words (a command that reads none).
+pub fn no_leaf(gpa: Gpa) -> Leaf {
+    Leaf::new(Vec::new_in(gpa), "word", "")
+}
+
+// The line's words as std::cli's arguments: `name`, the commands' names
+// (`query`, `refs`), then the command's own words from `from` on, those of
+// `skip` left out, these spellings rewritten on the way (0.25.1's std::cli
+// has no rule for them; 0.25.2's has, see docs/design/cli.md):
+//   a dash word          given without its '-', a positional (0.25.2:
+//                        Arg::allow_hyphen_values)
+//   `--rename A B`       an option of two values: `--rename A --2nd B`, or
+//                        `--overlay PATH --overlay-copy COPY` (num_values)
+//   `-- ARGS`            each word after it as `--LAST WORD`, the leaf's
+//                        option `last` (Arg::last)
+//   a build's `-framework`, `--stats`, `--print-checks`: `--framework`,
+//                        `--stats=all`, `--print-checks=` (a long option
+//                        with one dash; default_missing)
+pub struct WordIter {
+    line: Line,
+    top: str,
+    sub: str,
+    p: i64,
+    i: i64,
+    name: str,
+    first: bool,
+    build: bool,
+    // after an option of two values: 1 when the first is next, 2 when
+    // `second` is
+    overlay: i64,
+    twos: str,
+    second: str,
+    shorts: str,
+    dash_words: bool,
+    leaf: Option<Leaf>,
+    // the word after an option is its value; after `--`, each word is
+    // `--LAST WORD` (1: `--LAST` given, the word next)
+    valued: bool,
+    trailing: bool,
+    held: bool,
+    skip: Option<Vec<i64>>,
+}
+
+impl WordIter {
+    // The line's words from `from` on, after `name` and the commands top
+    // and sub ("": none).
+    pub fn new(line: Line, top: str, sub: str, from: i64, leaf: sink Leaf, skip: sink Vec<i64>)
+        -> WordIter {
+        WordIter {
+            line: line, top: top, sub: sub, p: 0, i: from, name: line.word(0), first: true,
+            build: false, overlay: 0, twos: leaf.twos,
+            second: if leaf.twos == " --overlay " { "--overlay-copy" } else { "--2nd" },
+            shorts: leaf.shorts, dash_words: true, leaf: Option::Some(leaf), valued: false,
+            trailing: false, held: false, skip: Option::Some(skip),
+        }
+    }
+
+    // A build's line: its rewrites, no dash words.
+    pub fn build(line: Line, name: str) -> WordIter {
+        WordIter {
+            line: line, top: "", sub: "", p: 0, i: 1, name: name, first: true, build: true,
+            overlay: 0, twos: " --overlay ", second: "--overlay-copy", shorts: "",
+            dash_words: false, leaf: Option::None, valued: false, trailing: false, held: false,
+            skip: Option::None,
+        }
+    }
+}
+
+impl Iterator for WordIter {
+    type Item = str;
+
+    fn next(inout self) -> Option<str> {
+        if self.first {
+            self.first = false;
+            return Option::Some(self.name);
+        }
+        if self.p == 0 {
+            self.p = 1;
+            if self.top.len() > 0 {
+                return Option::Some(self.top);
+            }
+        }
+        if self.p == 1 {
+            self.p = 2;
+            if self.sub.len() > 0 {
+                return Option::Some(self.sub);
+            }
+        }
+        let n = self.line.words.len;
+        if self.overlay == 2 && self.i < n {
+            self.overlay = 0;
+            return Option::Some(self.second);
+        }
+        while self.i < n && skips(self.skip, self.i) {
+            self.i += 1;
+        }
+        if self.i >= n {
+            return Option::None;
+        }
+        let s = self.line.words[self.i];
+        if self.trailing {
+            if !self.held {
+                self.held = true;
+                return Option::Some(self.trailing_option());
+            }
+            self.held = false;
+            self.i += 1;
+            return Option::Some(s);
+        }
+        self.i += 1;
+        let was_valued = self.valued;
+        self.valued = false;
+        if !was_valued && s == "--" {
+            match self.leaf {
+                Option::Some(l) => if l.last.len() > 0 {
+                    self.trailing = true;
+                    return self.next();
+                },
+                Option::None => {}
+            }
+        }
+        match self.leaf {
+            Option::Some(l) => if !was_valued && self.overlay == 0 && l.takes_value(s) {
+                self.valued = true;
+            },
+            Option::None => {}
+        }
+        if self.dash_words && self.overlay == 0 && !was_valued && is_dash_word(s, self.shorts) {
+            // (Line::given gives it back with its '-')
+            return Option::Some(s.strip_prefix("-").unwrap());
+        }
+        if self.overlay == 1 {
+            self.overlay = 2;
+            return Option::Some(s);
+        }
+        if self.overlay == 0 && self.twos.len() > 0 && in_words(s, self.twos) {
+            self.overlay = 1;
+            self.valued = false;
+        }
+        if self.build {
+            if s == "-framework" {
+                return Option::Some("--framework");
+            }
+            if s == "--stats" {
+                return Option::Some("--stats=all");
+            }
+            if s == "--print-checks" {
+                return Option::Some("--print-checks=");
+            }
+        }
+        Option::Some(s)
+    }
+}
+
+impl WordIter {
+    // `--LAST`, the option the words after `--` are values of.
+    fn trailing_option(self) -> str {
+        match self.leaf {
+            Option::Some(l) => l.last_long,
+            Option::None => "--",
+        }
+    }
+}
+
+// Whether k is one of skip's.
+fn skips(skip: Option<Vec<i64>>, k: i64) -> bool {
+    match skip {
+        Option::Some(v) => v.contains(k),
+        Option::None => false,
+    }
+}
+
+// Whether s is one of the words of list (` --a --b `).
+fn in_words(s: str, list: str) -> bool {
+    for w in list.split(' ') {
+        if w.len() > 0 && w == s {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether s is a word with one '-' (`-x`, `-> bool`) that is none of
+// shorts (` -i -C `).
+fn is_dash_word(s: str, shorts: str) -> bool {
+    let b = s.as_bytes();
+    if b.len < 2 || b[0] != '-' || b[1] == '-' {
+        return false;
+    }
+    for w in shorts.split(' ') {
+        if w == s {
+            return false;
+        }
+    }
+    true
+}
+
+// A command's arguments, parsed: its line, the index of its first
+// argument, the Matches of the line (`root`: the program's level, whose
+// subcommand() is the command) and of the command's own level (`m`), and
+// its arguments in the line's order.
+pub struct Call {
+    pub line: Line,
+    pub from: i64,
+    pub root: Matches,
+    pub m: Matches,
+    pub evs: Vec<Ev>,
+    pub gpa: Gpa,
+}
+
+impl Call {
+    // The program's name as a C string (PROG, the try: lines' first word).
+    pub fn prog(self) -> *u8 {
+        self.line.c(0)
+    }
+
+    // Word k of the line ("" past the end).
+    pub fn word(self, k: i64) -> str {
+        self.line.word(k)
+    }
+
+    // The last error among the arguments (EV_UNKNOWN, EV_MISSING), if any.
+    pub fn last_error(self) -> Option<Ev> {
+        var out: Option<Ev> = Option::None;
+        for ev in self.evs.iter() {
+            if ev.kind == EV_UNKNOWN || ev.kind == EV_MISSING {
+                out = Option::Some(ev);
+            }
+        }
+        out
+    }
+}
+
+// The line read with tree, the commands top and sub ("": none) named at
+// words 1 and 2 (or spelled otherwise: `refactor --script` is `refactor
+// script`), the command's arguments from `from` on being leaf's: a Call.
+// An error does not stop the reading: its word is left out and the rest
+// read again, the error an event where it is.
+pub fn parse(tree: Command, line: Line, top: str, sub: str, from: i64, leaf: Leaf, gpa: Gpa)
+    -> Call {
+    var errs: Vec<Ev> = Vec::new_in(gpa);
+    var skip: Vec<i64> = Vec::new_in(gpa);
+    loop {
+        let it = WordIter::new(line, top, sub, from, leaf.clone(), skip.clone());
+        match tree.parse_in(it, gpa) {
+            Ok(m) => {
+                // (top is a command: the root's subcommand)
+                var level = match m.subcommand() {
+                    Option::Some((_, s)) => s,
+                    Option::None => std::panic_str("volec: a command named is not matched"),
+                };
+                if sub.len() > 0 {
+                    level = match level.subcommand() {
+                        Option::Some((_, s)) => s,
+                        Option::None => std::panic_str("volec: a command named is not matched"),
+                    };
+                }
+                let evs = events_of(line, from, leaf, level, errs, gpa);
+                return Call { line: line, from: from, root: m, m: level, evs: evs, gpa: gpa };
+            }
+            Err(e) => {
+                let k = line.at(e.text);
+                if k < from || skip.contains(k) {
+                    std::panic_str("volec: an error of the command line at no argument");
+                }
+                skip.push(k);
+                let w = line.words[k];
+                if e.kind == CliErrorKind::MissingValue {
+                    errs.push(Ev { at: k, kind: EV_MISSING, name: short_of(w), text: w, value: c_of(w) });
+                } else {
+                    errs.push(Ev { at: k, kind: EV_UNKNOWN, name: "", text: w, value: c_of(w) });
+                }
+            }
+        }
+    }
+}
+
+// The events of m (the command's level), errs among them, in the line's
+// order: each option's values and the words at the words they view, each
+// flag at a word that spells it and no value, word or error has.
+fn events_of(line: Line, from: i64, leaf: Leaf, m: Matches, errs: sink Vec<Ev>, gpa: Gpa)
+    -> Vec<Ev> {
+    var out = errs;
+    var taken: Vec<i64> = Vec::new_in(gpa);
+    for k in 0..out.len() {
+        taken.push(out[k].at);
+    }
+    for o in leaf.opts.iter() {
+        if o.kind == OPTION {
+            for v in m.values(o.name) {
+                let g = line.given(v);
+                let at = line.at(g);
+                taken.push(at);
+                out.push(Ev { at: at, kind: EV_OPTION, name: o.name, text: g, value: c_of(g) });
+            }
+        }
+    }
+    for v in m.values(leaf.word) {
+        let g = line.given(v);
+        let at = line.at(g);
+        taken.push(at);
+        out.push(Ev { at: at, kind: EV_WORD, name: "", text: g, value: c_of(g) });
+    }
+    for o in leaf.opts.iter() {
+        if o.kind == FLAG && m.count(o.name) > 0 {
+            for k in from..line.words.len {
+                if taken.contains(k) {
+                    continue;
+                }
+                let s = line.words[k];
+                let b = s.as_bytes();
+                let long = b.len == o.name.len() + 2
+                    && s.strip_prefix("--").unwrap_or("") == o.name;
+                let short = o.short != 0 && b.len == 2 && b[0] == '-' && b[1] == o.short;
+                if long || short {
+                    out.push(Ev { at: k, kind: EV_FLAG, name: o.name, text: s, value: c_of(s) });
+                }
+            }
+        }
+    }
+    // in the line's order (an insertion sort: a command line is short)
+    for i in 1..out.len() {
+        var j = i;
+        while j > 0 && out[j - 1].at > out[j].at {
+            out.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    out
+}

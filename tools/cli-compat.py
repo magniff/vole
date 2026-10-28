@@ -286,6 +286,18 @@ query items stock.vl
 query def report main.vl:1
 test --root .
 probe --root . main.vl:1
+probe main.vl:2 1 -- a b
+probe main.vl:2 --max 1 -- --max x
+probe main.vl:2 --input -- -x
+query bogus refs
+query bogus report
+query --help report
+refactor script x
+refactor --script
+--fix-imports main.vl
+main.vl --fix-unsafe --dry-run
+edit insert report --in report --after x
+edit insert report --after
 """.strip().split("\n")
 
 
