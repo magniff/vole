@@ -364,7 +364,7 @@ mkdir -p "$WORK"
 } | sort -u >"$WORK/reached"
 [ -s "$WORK/reached" ] || { echo "threads-writes: query callees found nothing"; exit 1; }
 # Every static, as a query path.
-grep -rn '^ *\(pub \)\{0,1\}static mut [A-Za-z_0-9]* *:' compiler/src | awk -F: '{
+grep -rn --exclude-dir=.volec '^ *\(pub \)\{0,1\}static mut [A-Za-z_0-9]* *:' compiler/src | awk -F: '{
     file = $1; sub(/^compiler\/src\//, "", file); sub(/\.vl$/, "", file); sub(/\/mod$/, "", file)
     gsub(/\//, "::", file)
     line = $0; sub(/^[^:]*:[^:]*:/, "", line)

@@ -778,7 +778,7 @@ fi
 
 # (0.21) Every VOLE_X the compiler reads (a c"VOLE_X" literal) is
 # also read as VOLE_X, the name from 0.24: it is in base::ENV_NAMES.
-for v in $(grep -rhoE 'c"VOLE_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"VOLE_//; s/"$//' | sort -u); do
+for v in $(grep -rhoE --exclude-dir=.volec 'c"VOLE_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"VOLE_//; s/"$//' | sort -u); do
     if ! grep -q "c\"$v\"" "$ROOT/compiler/src/base/mod.vl"; then
         echo "error: VOLE_$v is read by the compiler but not as VOLE_$v: add \"$v\" to ENV_NAMES (compiler/src/base/mod.vl)" >&2
         exit 1
