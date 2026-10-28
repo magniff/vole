@@ -10,6 +10,7 @@ means and how to fix it.
 volec fmt [FILE|DIR]... [--check] [--dry-run] [--show]
 volec fmt [MODULE] [--root ROOT] [--check] [--dry-run] [--show]
 volec fmt --all [--check] [--dry-run]
+volec fmt --changed|--since REV [--check] [--dry-run]   (0.25.2)
 volec explain [CODE|TOOL|--list]
 ```
 
@@ -23,6 +24,15 @@ for query). `--all` is every `.vl` file under `compiler/`, `tests/`,
 programs of the tools' transcript tests (`tests/query/`,
 `tests/refactor/`), whose text is what they test (untidy imports for
 `fix`, a layout for `fmt`).
+
+(0.25.2) `--changed` is the `.vl` files git says changed since HEAD (in
+the work tree or the index), and the new ones it does not track or
+ignore; `--since REV` those changed since REV (`--since main`: a
+branch's). A focused branch formats what it touched, not files `--all`
+finds untidy elsewhere (feedbacks/galaga.md #8). The transcript tests'
+programs are left out as by `--all`; with none changed it is `note
+fmt.none: no .vl file changed since HEAD`; outside a checkout, `error
+fmt.no-git`.
 
 They are written as one edit of the edit engine ([refactor.md](refactor.md)):
 journaled (`volec undo` takes it back), `--dry-run` prints the diff

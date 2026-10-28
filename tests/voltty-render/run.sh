@@ -4,16 +4,19 @@
 # colour emoji, coverage against ref/*.pgm), and a grid rendered to a
 # texture through Metal, compared with the CPU reference renderer
 # (cpu.vl) and with ref/golden-block.ppm; damage tracking (rows rebuilt
-# and copied, images equal to a full redraw); the bench (prints, no
-# gate). main.vl is built at -O2 (std links its frameworks) and run
+# and copied, images equal to a full redraw); the bench (prints, and its
+# encode budget). main.vl is built at -O2 at every suite level (std links
+# its frameworks; the budgets are -O2's) and run
 # from the root. macOS only: elsewhere every check is skipped (the Linux
 # renderer, FreeType and Vulkan, is another task).
 #
 # usage: tests/voltty-render/run.sh [-c COMPILER] [-v]
 #   -v   print the bench lines too
 #
-# Prints `pass NAME` or `FAIL NAME` (and why) for each check; exits 1 if
-# one failed.
+# Prints `pass NAME` or `FAIL NAME` (and why) for each check, or `skip
+# NAME: why` (0.25.2: no GPU; a time budget missed on a loaded machine,
+# tests/budget.sh: the glyphs' raster time, the full redraw's encode;
+# on an idle machine that is a FAIL). Exits 1 if one failed.
 
 set -u
 LC_ALL=C
@@ -63,9 +66,11 @@ status=$?
 awk '
     /^ok / { print "pass voltty_render_" $2; next }
     /^FAIL / { sub(/^FAIL /, ""); print "FAIL voltty_render_" $0; bad = 1; next }
-    /^skip / { print "pass voltty_render (" $0 ")"; next }
+    /^skip / { sub(/^skip /, ""); print "skip voltty_render_" $0; next }
 ' "$WORK/run.out"
-if [ $status -ne 0 ] && ! grep -q '^FAIL' "$WORK/run.out"; then
+# (0.25.2) the time budgets missed: FAIL when idle, SKIP when loaded
+sh "$ROOT/tests/budget.sh" voltty_render_ "$WORK/run.out" || status=1
+if [ $status -ne 0 ] && ! grep -q -e '^FAIL' -e '^slow' "$WORK/run.out"; then
     echo "FAIL voltty_render_run: exit $status"
     tail -5 "$WORK/run.out" | sed 's/^/    /'
     exit 1

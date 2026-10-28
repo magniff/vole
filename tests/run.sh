@@ -1362,10 +1362,11 @@ case "$TARGET" in
     aarch64-macos)
         case voltty_render in
             *"$FILTER"*)
-                while read -r status _; do
+                while read -r status rest; do
                     case "$status" in
                         pass) echo "voltty_render pass" >>"$TALLY"; count=$((count + 1)) ;;
                         FAIL) echo "voltty_render fail" >>"$TALLY"; count=$((count + 1)) ;;
+                        skip) skipped voltty_render "$rest"; count=$((count + 1)) ;;
                     esac
                 done <"$WORK/voltty_render.out"
                 if ! grep -q '^pass' "$WORK/voltty_render.out"; then

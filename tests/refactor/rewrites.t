@@ -1,6 +1,8 @@
 ## volec rewrite (tests/refactor/rewrites/).
 $ check
-ok: 0 errors in main.vl
+main.vl:5:32: warning[use.unused] unused import 'square': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+main.vl:5:40: warning[use.unused] unused import 'trace': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+ok: 0 errors, 2 warnings in main.vl
 ## A typed hole: only the calls whose $v the checker typed *IntVec.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
 --- a/main.vl

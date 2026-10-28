@@ -1,6 +1,8 @@
 ## volec refactor signature|field|variant (tests/refactor/shapes/).
 $ check
-ok: 0 errors in main.vl
+main.vl:4:19: warning[use.unused] unused import 'Pair': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+main.vl:4:32: warning[use.unused] unused import 'Shape': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
+ok: 0 errors, 2 warnings in main.vl
 ## --- signature ---
 ## A parameter added: the definition, and each call with the value.
 $ refactor signature area --add 'scale: i64 = 1' --fill-calls --dry-run

@@ -3,7 +3,8 @@
 # decide an outcome without a compiler, on small fixtures made here: the
 # EXPECT holes (tests/expect.awk), the golden-image comparison
 # (tests/ppmdiff.sh), the directives' parse (tests/directives.awk) and
-# the load-aware time limit (tests/watchdog.sh).
+# the load-aware time limit (tests/watchdog.sh) and the time budgets
+# (tests/budget.sh).
 # The same directives on real programs are tests/run/runner_*.vl.
 #
 # usage: tests/runner/run.sh
@@ -164,6 +165,25 @@ if [ $(($(date +%s) - t0)) -le 3 ] && [ ! -e "$WORK/dog.quick" ]; then
 else
     bad watchdog_in_time "waited $(($(date +%s) - t0)) s, wrote '$(cat "$WORK/dog.quick" 2>/dev/null)'"
 fi
+
+# ---- time budgets (tests/budget.sh, tests/load.sh) ----
+
+printf 'ok fast\nslow bench_x: took 552 us (budget 500 us)\n' >"$WORK/slow.out"
+got=$(VOLE_TEST_LOAD=0 sh "$ROOT/tests/budget.sh" t_ "$WORK/slow.out"; echo "rc=$?")
+case "$got" in
+    "FAIL t_bench_x: took 552 us (budget 500 us)
+rc=1") ok budget_idle_fails ;;
+    *) bad budget_idle_fails "got '$got'" ;;
+esac
+got=$(VOLE_TEST_LOAD=100000 sh "$ROOT/tests/budget.sh" t_ "$WORK/slow.out"; echo "rc=$?")
+case "$got" in
+    "skip t_bench_x: machine loaded (load 100000 on "*" CPUs): took 552 us (budget 500 us)
+rc=0") ok budget_loaded_skips ;;
+    *) bad budget_loaded_skips "got '$got'" ;;
+esac
+printf 'ok fast\n' >"$WORK/fast.out"
+got=$(VOLE_TEST_LOAD=0 sh "$ROOT/tests/budget.sh" t_ "$WORK/fast.out"; echo "rc=$?")
+[ "$got" = "rc=0" ] && ok budget_within || bad budget_within "got '$got'"
 
 # ---- the directives ----
 

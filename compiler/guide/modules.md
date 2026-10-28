@@ -91,7 +91,9 @@ their names, as do `extern "C"` items and `#[link_name]`s.
 
 - `volec fix --only imports` adds the `use` lines a program is
   missing (its own items', and std's outside the prelude),
-  and `--only unused` removes unused ones.
+  and `--only unused` removes unused ones. (0.25.2) `check` and a build
+  warn about each, `use.unused` (an error with `--deny-warnings`): an
+  import nothing in its file names; not a `pub use`.
 - `volec query items` lists every module; `query items MODULE` its
   items with signatures.
 - `volec refactor move a::f --to crate::b` moves items, fixing

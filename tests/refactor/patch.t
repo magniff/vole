@@ -107,12 +107,11 @@ error edit.no-text: no --old/--new pairs, and none on stdin
 try: volec edit patch sum_to --old OLD --new NEW
 [exit 2]
 ## --loose: other indentation; NEW indented like the text it replaces.
+## (0.25.2) An OLD of several lines found once that way is matched so
+## without it, with a note.
 $ edit patch clamp < $T/inputs/clamp_loose.patch
-error patch.no-match: OLD 1 is not in crate::calc::clamp as written; with other blanks, at line 8
-try: volec edit patch clamp --pairs .git/vole-edits/try-1.pairs --loose
-[exit 1]
-$ edit patch clamp --loose < $T/inputs/clamp_loose.patch
 patched crate::calc::clamp	calc.vl	+1 -0 lines
+note patch.loose: OLD 1 matched with other indentation at line 8; NEW re-indented like it (--loose)
 % git diff
 diff --git a/calc.vl b/calc.vl
 index 92630d6..768545e 100644
