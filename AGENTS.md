@@ -35,7 +35,7 @@ these first:
 | missing imports, `pub`, `unsafe` blocks | `target/volec fix` |
 | the errors' exact fixes (an error with `try: volec fix --suggested`: a did-you-mean, a conversion, a path, a `use`, a `pub`), instead of sed | `target/volec fix --suggested` (one checked edit, then the errors left; `--dry-run`, `--show`, `--at FILE:LINE`) |
 | a bug: where it fails, the values at a line, which change broke a test | `target/volec guide debug` (`test` prints a crash's line and callers; `probe FILE:LINE EXPR... -- ARGS`; `reduce`) |
-| build and test what a change touches | `bootstrap/bootstrap.sh --dev`, `tests/run.sh FILTER` (the inner loop, below) |
+| build and test what a change touches | `bootstrap/bootstrap.sh --dev --no-suite`, `tests/run.sh FILTER...`, `tests/affected.sh` (the inner loop, below) |
 
 Everything else (`query grep|items|type|effects|impact`, `edit apply`,
 `rewrite`, `refactor extract-function|inline|split`, `batch`, `undo`):
@@ -53,8 +53,9 @@ examples/nes/check.vl:235 x -- --check`); a NAME the default program
 lacks gets the `try:` of the program that defines it.
 
 **Query and edit with `target/tools/volec` while you change the
-compiler**: `bootstrap/bootstrap.sh --dev` copies its build there only
-after the fixpoint and the suite pass, so it always works (your own
+compiler**: only a build whose suite passed goes there (`bootstrap.sh
+--dev` with its suite; `--no-suite` leaves it, or copies the main
+checkout's when the worktree has none), so it always works (your own
 builds replace `target/volec`, and a broken one breaks `query`).
 
 **Hooks.** `tools/agent-hooks/query-first.py` blocks shell commands that
@@ -78,26 +79,42 @@ says whether someone has seen it already (`--list`: the last ones).
 
 ## The inner loop
 
-Check and test only what a change touches, and widen at milestones:
+Every suite run costs every agent on the machine: test what a change
+touches, and leave the whole suite to the one who merges. Four tiers,
+each run once by the one it names; **an agent runs tiers 1 and 2 only,
+never the whole suite or a gate unless its task says so**:
 
-- in a fresh git worktree, `bootstrap/bootstrap.sh --dev` builds
-  `target/volec` in about 20 s: the releases come from the main
-  checkout's cache, only HEAD is built; when its suite passes it is also
-  `target/tools/volec`, the binary to query and edit with;
+1. **While working (agent):** `bootstrap/bootstrap.sh --dev --no-suite`
+   builds `target/volec` in seconds (under 20 s) in a fresh worktree (the releases
+   come from the main checkout's cache, only the working tree is built
+   and its fixpoint checked; no suite runs, and `target/tools/volec`
+   stays the last build whose suite passed). After an edit: the check
+   hook's errors (or `target/volec check`), then only the cases the
+   change concerns: `tests/run.sh FILTER...` (names containing a
+   FILTER; `=NAME` one name; `-f FILE` a list; `-l` lists them), or
+   `tests/affected.sh -O 2` for what the branch touches so far.
+2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
+   ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
+   the paths changed since the branch's base, at -O0 and -O2 (`--list`
+   prints the plan and why each item is in it; a changed test runs
+   itself; an unknown path gets the smoke set). When `--list` says
+   `linux: platform-relevant`, `tests/affected.sh --linux` runs the
+   same plan in the aarch64-linux container too (colima must run).
+3. **Per merge batch (integrator):** after merging the batch into the
+   integration branch, one `tests/run.sh` and one `bootstrap/gate.sh
+   --quick` (the chain, the suite at -O2, a short fuzz in every mode,
+   and the `linux-smoke` row: the compiler cross-built for
+   aarch64-linux and, in the container, the runner's checks, the LSP,
+   the examples' builds, every case, the walkthroughs and the book;
+   `SKIP`, not pass, when colima is not running: `colima start`), and
+   `bootstrap/bootstrap.sh --dev` there, which installs a tested
+   `target/tools/volec`.
+4. **A release:** one `bootstrap/gate.sh --release`, then `gate.sh
+   --only bench` on an idle machine ([docs/releases.md](docs/releases.md),
+   "The gate").
 
-- after an edit: the check hook's errors (or `target/volec check`
-  when the hook is not there) and the cases it concerns, `tests/run.sh FILTER` (cases whose
-  name contains FILTER; `-O 0` for another level);
-- the whole suite (`tests/run.sh`) only at milestones;
-- before committing a big change: `bootstrap/gate.sh --quick` (the chain
-  from the working tree, the suite at -O2, a short fuzz in every mode,
-  and the `linux-smoke` row: the compiler cross-built for aarch64-linux
-  and, in the container, the runner's checks, the LSP, the examples'
-  builds, every case and the walkthroughs; a few minutes; one table at
-  the end; `SKIP` there, not pass, when colima is not running:
-  `colima start`);
-- a release: `bootstrap/gate.sh --release`, then `gate.sh --only bench`
-  on an idle machine ([docs/releases.md](docs/releases.md), "The gate").
+A test that fails in the plan is yours until shown otherwise: rerun it
+alone (`tests/run.sh =NAME`) before calling it load or inherited.
 
 ## Before you commit, before a merge
 
@@ -116,15 +133,16 @@ Check and test only what a change touches, and widen at milestones:
   (`// REQUIRES: metal` and `// LINK:` for std::gpu/std::window) and
   `tests/run.sh example example_build`; moving an example moves its case.
 - **Linux too:** a change to tests/, the runner, std, the LSP or anything
-  platform-specific is checked in the Linux container before it is called
-  done: `--quick`'s `linux-smoke` row at least, the full container
-  row (`bootstrap/gate.sh --only linux-aarch64`) for the runner or a
-  platform-specific change; colima must run.
-- **Before a merge into an integration branch:** `tools/premerge.sh` in
-  the branch's worktree (base contained, unsafe justified, fmt, every
-  touched program checks clean, the embedded std up to date, example
-  cases' sources exist), then the branch's own `tests/run.sh` and
-  `gate.sh --quick`.
+  platform-specific (`tests/affected.sh --list` says `linux:
+  platform-relevant`) runs its plan in the Linux container before it is
+  called done: `tests/affected.sh --linux` (colima must run). The whole
+  container row (`bootstrap/gate.sh --only linux-aarch64`) is tier 3's.
+- **Before reporting (tier 2):** `tools/premerge.sh` in the branch's
+  worktree (base contained, unsafe justified, fmt, every touched program
+  checks clean, the embedded std up to date, example cases' sources
+  exist) prints `premerge: ok`, and `tests/affected.sh` passes; report
+  its plan line (`plan: N of M cases; ...`) and result. No full suite,
+  no gate: the integrator runs one per merge batch (tier 3).
 - **Report what was asked, checkably:** a task's "Done means" list is
   answered item by item with the command or count that shows it (e.g.
   "argv uses in compiler/src: 0, `volec query refs arg_at --count`").

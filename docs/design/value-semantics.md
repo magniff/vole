@@ -890,7 +890,7 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
   - A match reached through a reference, an index or a static, and a `for` loop's element, bind by reference instead (`BYREF`): nothing is dropped, and moving such a binding is `own.move_out`. These are binding modes without `&T` binding types, which wait for reference type arguments (0.17.1).
   - The binding of a `for` loop over `next()` is neither dropped nor by reference (`ARM_FOR_NEXT`) until T4 settles what iterators yield.
   - A temporary discarded by `e;` becomes `{ let __own_tmp = e; }`.
-  - `p = rhs` on an owned place becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`. The `=o` read is flagged `ASSIGN_OLD`: it takes p's state, and the drop of the old value uses that state. The desugaring is skipped when the place is reached through a raw pointer (such a write drops nothing, as `ptr::write` does) or through an index (the old value leaks, which is safe).
+  - `p = rhs` on an owned place becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`. The `=o` read is flagged `ASSIGN_OLD`: it takes p's state, and the drop of the old value uses that state. (0.25.2) The right side's temporaries are the outer block's: they drop after the old value, at the end of the assignment. The desugaring is skipped when the place is reached through a raw pointer (such a write drops nothing, as `ptr::write` does) or through an index (the old value leaks, which is safe).
 - **Glue** (glue.vl) is untyped AST that the checker checks in place, rather than generated functions:
   - a Drop impl gives `x.drop()`, then the fields;
   - an enum gives a `match` (`GLUE_MATCH`) whose bindings drop through the arm mechanism above;

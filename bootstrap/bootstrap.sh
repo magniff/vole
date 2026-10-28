@@ -57,11 +57,22 @@
 #                      fixpoint, but runs the test suite of the last one
 #                      only; `full` runs every release's suite too, an
 #                      occasional complete replay (with --clean: from
-#                      nothing). A result in the cache counts for both
-#                      when it holds what the mode asks for.
+#                      nothing); (0.25.2) `none` runs no release's suite,
+#                      only the fixpoints (bootstrap/chain-fresh.sh, whose
+#                      check is that every rebuilt release emits the bytes
+#                      already tested at its release). A result in the
+#                      cache counts for every mode when it holds what the
+#                      mode asks for.
 #   --no-head-tests    (0.11) build HEAD and check its fixpoint, but leave
 #                      its test suite to the caller (bootstrap/gate.sh runs
 #                      it at every level)
+#   --no-suite         (0.25.2) the agent's build (AGENTS.md, tier 1): HEAD
+#                      built and its fixpoint checked, installed as
+#                      target/volec, no test suite run (HEAD's, and the
+#                      releases' unless --history says: `none`);
+#                      target/tools/volec, the last build whose suite
+#                      passed, is left as it is (made, when there is none,
+#                      from the main checkout's)
 #
 # See docs/releases.md.
 
@@ -82,6 +93,9 @@ CLEAN=0
 OUT=""
 HISTORY=fast
 RUN_HEAD_TESTS=1
+NO_SUITE=0
+TOOLS_FROM=""
+HISTORY_GIVEN=0
 
 die() {
     echo "bootstrap: error: $*" >&2
@@ -121,10 +135,11 @@ while [ $# -gt 0 ]; do
         --cache) [ $# -ge 2 ] || die "--cache needs a directory"; CACHE=$2; shift ;;
         --clean) CLEAN=1 ;;
         --out) [ $# -ge 2 ] || die "--out needs a path"; OUT=$2; shift ;;
-        --history) [ $# -ge 2 ] || die "--history needs fast or full"; HISTORY=$2; shift ;;
-        --history=*) HISTORY=${1#--history=} ;;
+        --history) [ $# -ge 2 ] || die "--history needs fast, full or none"; HISTORY=$2; HISTORY_GIVEN=1; shift ;;
+        --history=*) HISTORY=${1#--history=}; HISTORY_GIVEN=1 ;;
         --no-head-tests) RUN_HEAD_TESTS=0 ;;
-        -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-suite) RUN_HEAD_TESTS=0; NO_SUITE=1 ;;
+        -h|--help) sed -n '2,/^# See docs/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
     shift
@@ -143,9 +158,11 @@ if [ -z "$CACHE" ] && [ $CLEAN -eq 0 ]; then
     fi
 fi
 [ -n "$CACHE" ] || CACHE=$LOCAL_CACHE
+# (--no-suite: no release's suite either, unless --history asks for one)
+[ $NO_SUITE -eq 1 ] && [ $HISTORY_GIVEN -eq 0 ] && HISTORY=none
 case "$HISTORY" in
-    fast|full) ;;
-    *) die "--history is fast or full, not '$HISTORY'" ;;
+    fast|full|none) ;;
+    *) die "--history is fast, full or none, not '$HISTORY'" ;;
 esac
 
 # ---- The host ----
@@ -532,7 +549,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
     # (In the cache, `ok` holds the result of the release's suite;
     # `fixpoint` says it was built and reached its fixpoint.)
     run_tests=0
-    if [ "$HISTORY" = full ] || [ "$version" = "$LAST_RELEASE" ]; then
+    if [ "$HISTORY" = full ] || { [ "$HISTORY" = fast ] && [ "$version" = "$LAST_RELEASE" ]; }; then
         run_tests=1
     fi
     # (what the cache holds is read without the lock: `fixpoint` and `ok`
@@ -543,7 +560,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
         TEST_TOTAL=$(cat "$dir/ok")
     elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
         step "$version: $tag ($short), built and its fixpoint checked before (cached)"
-        TEST_TOTAL="not run (--history fast)"
+        TEST_TOTAL="not run (--history $HISTORY)"
     else
         lock "$dir"
         if [ -f "$dir/ok" ]; then
@@ -551,7 +568,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
             TEST_TOTAL=$(cat "$dir/ok")
         elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
             step "$version: $tag ($short), built by another run (cached)"
-            TEST_TOTAL="not run (--history fast)"
+            TEST_TOTAL="not run (--history $HISTORY)"
         elif [ -f "$dir/fixpoint" ] && [ -x "$dir/$bin" ] && [ -d "$dir/tree" ]; then
             run_suite "$version" "$dir/tree" "$tests" "$dir" "$bin" </dev/null
             echo "$TEST_TOTAL" >"$dir/ok.new"
@@ -566,7 +583,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
             if [ $run_tests -eq 1 ]; then
                 echo "$TEST_TOTAL" >"$dir.building/ok"
             else
-                TEST_TOTAL="not run (--history fast)"
+                TEST_TOTAL="not run (--history $HISTORY)"
             fi
             publish "$dir"
         fi
@@ -601,7 +618,11 @@ if [ $STOPPED -eq 0 ]; then
     fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
         "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS" "$HEAD_BIN" "$HEAD_EXT"
-    [ "$RUN_HEAD_TESTS" = 1 ] || TEST_TOTAL="left to the caller (--no-head-tests)"
+    if [ $NO_SUITE -eq 1 ]; then
+        TEST_TOTAL="not run (--no-suite)"
+    elif [ "$RUN_HEAD_TESTS" != 1 ]; then
+        TEST_TOTAL="left to the caller (--no-head-tests)"
+    fi
     note "head     $head_desc, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     FINAL="$head_dir/$HEAD_BIN"
     mkdir -p "$ROOT/target"
@@ -614,6 +635,17 @@ if [ $STOPPED -eq 0 ]; then
         mkdir -p "$ROOT/target/tools"
         cp "$FINAL" "$ROOT/target/tools/$HEAD_BIN.new"
         mv -f "$ROOT/target/tools/$HEAD_BIN.new" "$ROOT/target/tools/$HEAD_BIN"
+    elif [ $NO_SUITE -eq 1 ] && [ ! -x "$ROOT/target/tools/$HEAD_BIN" ]; then
+        # (0.25.2) --no-suite in a worktree without one: the main
+        # checkout's, a tested build, rather than this untested one
+        common=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+        main_tools="$(dirname "$common")/target/tools/$HEAD_BIN"
+        if [ -n "$common" ] && [ "$(dirname "$common")" != "$ROOT" ] && [ -x "$main_tools" ]; then
+            mkdir -p "$ROOT/target/tools"
+            cp "$main_tools" "$ROOT/target/tools/$HEAD_BIN.new"
+            mv -f "$ROOT/target/tools/$HEAD_BIN.new" "$ROOT/target/tools/$HEAD_BIN"
+            TOOLS_FROM=$main_tools
+        fi
     fi
 fi
 
@@ -641,6 +673,16 @@ if [ -n "$CROSS" ]; then
     echo "compiler for $CROSS: $ROOT/target/$CROSS/$HEAD_BIN.o${OUT:+, also $OUT}; for $HOST: $ROOT/target/$HEAD_BIN"
 elif [ $STOPPED -eq 0 ]; then
     echo "compiler: $ROOT/target/$HEAD_BIN ($("$FINAL" --version))${OUT:+, also $OUT}"
+    if [ $NO_SUITE -eq 1 ]; then
+        if [ -n "$TOOLS_FROM" ]; then
+            tools_is="copied from $TOOLS_FROM ($("$ROOT/target/tools/$HEAD_BIN" --version 2>/dev/null)), a tested build, as this worktree had none"
+        elif [ -x "$ROOT/target/tools/$HEAD_BIN" ]; then
+            tools_is="kept: $("$ROOT/target/tools/$HEAD_BIN" --version 2>/dev/null), the last build whose suite passed"
+        else
+            tools_is="not there (a build with its suite makes it: bootstrap.sh --dev)"
+        fi
+        echo "suite skipped (--no-suite): built and fixpoint checked only; target/$HEAD_BIN installed; target/tools/$HEAD_BIN $tools_is; test what the change touches: tests/affected.sh"
+    fi
 else
     echo "compiler: $FINAL ($("$FINAL" --version))${OUT:+, also $OUT}"
 fi

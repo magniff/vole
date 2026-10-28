@@ -4,7 +4,7 @@
 # EXPECT holes (tests/expect.awk), the golden-image comparison
 # (tests/ppmdiff.sh), the directives' parse (tests/directives.awk) and
 # the load-aware time limit (tests/watchdog.sh) and the time budgets
-# (tests/budget.sh).
+# (tests/budget.sh), and (0.25.2) tests/run.sh's filters and tests/affected.map.
 # The same directives on real programs are tests/run/runner_*.vl.
 #
 # usage: tests/runner/run.sh
@@ -200,5 +200,44 @@ if [ "$(cat "$WORK/d/expect")" = "took {num} ms" ] && [ "$(wc -l <"$WORK/d/ppms"
 else
     bad directives_ppm "expect '$(cat "$WORK/d/expect")', ppms '$(cat "$WORK/d/ppms")'"
 fi
+
+# ---- the filters and the plan (tests/run.sh -l, tests/affected.sh) ----
+
+# Every `case $(want NAME)` of run.sh is in its SUITES (what -l lists),
+# and every one of SUITES has its site.
+sites=$(sed -n 's/^ *case \$(want \([a-z_-]*\)) in$/\1/p' "$ROOT/tests/run.sh" | sort -u | tr '\n' ' ')
+listed=$(sed -n 's/^SUITES="\(.*\)"$/\1/p' "$ROOT/tests/run.sh" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+[ -n "$sites" ] && [ "$sites" = "$listed" ] && ok filters_suites_listed \
+    || bad filters_suites_listed "the want sites '$sites' are not SUITES '$listed'"
+# A FILTER selects the names containing it, =NAME one name, -f a file's.
+got=$(sh "$ROOT/tests/run.sh" -l runner_ =runner | sort | tr '\n' ',')
+want=$(ls "$ROOT"/tests/run/ | sed -n 's/^\(runner_[^.]*\)\.vl$/case \1/p'; echo "suite runner")
+want=$(printf '%s\n' "$want" | sort | tr '\n' ',')
+[ "$got" = "$want" ] && ok filters_union || bad filters_union "got '$got', expected '$want'"
+printf '# a comment\n=readme_sync\n\n=example_helloworld  \n' >"$WORK/filters"
+got=$(sh "$ROOT/tests/run.sh" -l -f "$WORK/filters" | tr '\n' ',')
+[ "$got" = "case example_helloworld,suite readme_sync," ] && ok filters_file || bad filters_file "got '$got'"
+# tests/affected.map: every set, cmd and prefix it names exists.
+problems=$(awk '
+    { sub(/#.*/, "") }
+    NF == 0 { next }
+    $1 == "set" { sets[$2] = 1; for (i = 3; i <= NF; i++) use[$i] = 1; next }
+    $1 == "cmd" { cmds[$2] = 1; next }
+    { prefixes[$1] = 1; for (i = 2; i <= NF; i++) use[$i] = 1 }
+    END {
+        for (u in use) {
+            if (u ~ /^@(self|example|mentions|none)$/) continue
+            if (u ~ /^@/ && !(substr(u, 2) in sets)) print "no set " u
+            if (u ~ /^!/ && !(substr(u, 2) in cmds)) print "no cmd " u
+        }
+        for (p in prefixes) print "prefix " p
+    }' "$ROOT/tests/affected.map" | while read -r kind what; do
+        if [ "$kind" != prefix ]; then
+            echo "$kind $what"
+        elif [ "$what" != "*" ] && [ ! -e "$ROOT/$what" ]; then
+            echo "no path $what"
+        fi
+    done)
+[ -z "$problems" ] && ok affected_map || bad affected_map "$(echo $problems)"
 
 exit $BAD

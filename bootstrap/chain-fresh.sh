@@ -9,13 +9,19 @@
 # A difference means that a cached or recorded compiler is not what its
 # tag's source and its builder make today. HEAD is not built here (the
 # gate's chain step builds it, from the last release).
+# (0.25.2) With --history fast no release's suite runs: a rebuilt compiler
+# that emits the recorded and cached bytes is the compiler whose suite
+# passed at its release, so the hashes are the check. When one differs,
+# the suite runs then (the last release's, as bootstrap.sh's fast mode
+# does) and chain-fresh fails anyway.
 #
 # usage: bootstrap/chain-fresh.sh [-w DIR] [--history fast|full]
 #        bootstrap/chain-fresh.sh --record [CACHE]
 #
 #   -w DIR       the fresh cache (default target/chain-fresh; emptied)
-#   --history    bootstrap.sh's: fast (the default) checks every release's
-#                fixpoint and the last one's suite; full runs every suite
+#   --history    fast (the default) checks every release's fixpoint and
+#                its bytes, and runs a suite only when they differ; full
+#                runs every release's suite (bootstrap.sh's)
 #   --record     write the record from CACHE (default: the shared cache,
 #                as bootstrap.sh finds it), building nothing; a release
 #                adds its line when it is tagged
@@ -95,7 +101,10 @@ fi
 rm -rf "$W"
 mkdir -p "$W"
 echo "chain-fresh: the seed and every release up to $LAST, from their tags, into $W"
-sh "$ROOT/bootstrap/bootstrap.sh" --cache "$W" --clean --until "${LAST#v}" --history "$HISTORY" </dev/null \
+# (fast: the fixpoints only; the suite below, if the bytes differ)
+CHAIN_HISTORY=$HISTORY
+[ "$HISTORY" = fast ] && CHAIN_HISTORY=none
+sh "$ROOT/bootstrap/bootstrap.sh" --cache "$W" --clean --until "${LAST#v}" --history "$CHAIN_HISTORY" </dev/null \
     >"$W/bootstrap.log" 2>&1 || { tail -30 "$W/bootstrap.log"; echo "chain-fresh: the fresh chain failed (log: $W/bootstrap.log)"; exit 1; }
 SHARED=$(shared_cache)
 FAILED=0
@@ -120,5 +129,19 @@ for t in $TAGS; do
     fi
 done
 grep -h '^  ' "$W/bootstrap.log" | sed -n '/seed/,$p' | head -40
+if [ $FAILED -ne 0 ] && [ "$CHAIN_HISTORY" = none ]; then
+    # The bytes differ: what the suite says of the rebuilt compilers (the
+    # entries are there; bootstrap.sh runs the last one's suite on them).
+    echo "chain-fresh: the bytes differ, so the suite runs: bootstrap.sh --history fast on $W"
+    if sh "$ROOT/bootstrap/bootstrap.sh" --cache "$W" --until "${LAST#v}" --history fast </dev/null \
+        >"$W/suite.log" 2>&1; then
+        echo "chain-fresh: $LAST's suite passes with the rebuilt compiler (the bytes still differ)"
+    else
+        tail -30 "$W/suite.log"
+        echo "chain-fresh: $LAST's suite fails with the rebuilt compiler (log: $W/suite.log)"
+    fi
+fi
 [ $FAILED -eq 0 ] || { echo "chain-fresh: the rebuilt chain differs (kept in $W)"; exit 1; }
+[ "$CHAIN_HISTORY" = none ] \
+    && echo "chain-fresh: suite skipped: every rebuilt release emits the bytes recorded and cached (SHA-256), the compilers whose suites passed at their release"
 echo "chain-fresh: $n releases rebuilt from the seed, each the same bytes as recorded and as cached"

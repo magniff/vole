@@ -567,8 +567,11 @@ run_step() {
         fuzz-arch) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -A ;;
         fuzz-guard) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -G ;;
         # (0.25) value semantics: seeded (the same programs every run of
-        # a mode), failing ones shrunk and kept with their expected output
-        fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" ;;
+        # a mode), failing ones shrunk and kept with their expected output;
+        # 0.25.2: as many again with --assign-calls (owned
+        # assignments whose right side is a call, lending temporaries)
+        fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

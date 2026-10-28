@@ -29,6 +29,11 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
   --print SEED  print the program of SEED and its expected output
   --shrink SEED check SEED, and print it shrunk if it fails
   --size N      statements in run's body, about (default 24)
+  --assign-calls  (0.25.2) assignments whose right side is a call of the
+                header's functions, often taking the assigned variable
+                itself (`t3 = f1(gpa, t3, mk(2))`: moved, lent, `&t3`),
+                and owned temporaries lent to its let parameters (as
+                --known's temp_let_arg) where a place could be
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -1899,9 +1904,11 @@ class Ctx:
 
 
 class Gen:
-    def __init__(self, seed, known=False, size=24):
+    def __init__(self, seed, known=False, size=24, assign_calls=False):
         self.r = random.Random(seed)
         self.known = known
+        self.assign_calls = assign_calls
+        self.in_assign = False
         self.size = size
         self.nid = 0
         self.nobs = 0
@@ -2327,12 +2334,12 @@ class Gen:
                     ps = [p for p in self.v_places(c) if p.root() not in used]
                 else:
                     ps = [PVar(v.name) for v in self.readable(c, ty) if v.name not in used]
-                if ps:
+                if ps and not (self.in_assign and ty == 'T' and self.chance(0.4)):
                     p = self.r.choice(ps)
                     used.add(p.root())
                     args.append(Arg('let', p))
                     continue
-                if self.known and ty == 'T':
+                if (self.known or self.in_assign) and ty == 'T':
                     args.append(Arg('let', Mk(self.int_k(c))))
                     continue
                 return None
@@ -2442,7 +2449,7 @@ class Gen:
             (10, self.st_print),
             (5, self.st_consume),
             (9, self.st_vec),
-            (4, self.st_assign),
+            (12 if self.assign_calls else 4, self.st_assign),
             (2, self.st_swap),
             (5 if depth < 5 else 0, self.st_if),
             (3 if depth < 4 and c.loop < 2 else 0, self.st_loop),
@@ -2677,6 +2684,8 @@ class Gen:
 
     def st_assign(self, c):
         ty = self.r.choice(['T', 'T', 'V', 'O', 'E', 'S', 'G', 'Tu'])
+        if self.assign_calls and self.chance(0.7):
+            ty = self.r.choice(['T', 'T', 'V'])
         if ty in ('S', 'Tu', 'G') and self.chance(0.6):
             # a field: revives a moved one, or drops the old value
             fs = {'S': ('t', 'w'), 'Tu': ('0', '1'), 'G': ('t',)}[ty]
@@ -2696,6 +2705,21 @@ class Gen:
             return None
         v = self.r.choice(vs)
         used = {v.name}
+        if self.assign_calls and ty in ('T', 'V') and self.chance(0.5):
+            # (0.25.2: `t = f(gpa, t, mk(1))`, the right side a call that may
+            # take t itself; the assignment's desugaring rechecks it)
+            fs = [f for f in self.fns if f.ret == ty]
+            for _ in range(3 if fs else 0):
+                self.in_assign = True
+                try:
+                    x = self.gen_call(c, self.r.choice(fs), set() if self.chance(0.6) else set(used))
+                finally:
+                    self.in_assign = False
+                if x is not None:
+                    v.st = 'L'
+                    if v.fst:
+                        v.fst = {f: 'L' for f in v.fst}
+                    return Assign(PVar(v.name), x)
         if ty == 'T':
             x = self.texpr(c, 0, used)
         elif ty == 'V':
@@ -3137,7 +3161,8 @@ class Gen:
 
     def gen_fn(self):
         name = 'f%d' % (len(self.fns) + 1)
-        ret = self.r.choice(['i', 'i', 'T', 'V', 'OI', 'RI'])
+        ret = self.r.choice(['T', 'T', 'V', 'i'] if self.assign_calls
+                            else ['i', 'i', 'T', 'V', 'OI', 'RI'])
         c = Ctx(ret)
         params = []
         for _ in range(self.r.randint(1, 3)):
@@ -3152,7 +3177,7 @@ class Gen:
         return GenFn(name, params, ret, body)
 
     def program(self):
-        for _ in range(self.r.randint(0, 3)):
+        for _ in range(self.r.randint(2 if self.assign_calls else 0, 3)):
             f = self.gen_fn()
             if f.body.tail is not None:
                 self.fns.append(f)
@@ -3378,13 +3403,14 @@ def main():
     ap.add_argument('--print', type=int, default=None)
     ap.add_argument('--shrink', type=int, default=None)
     ap.add_argument('--size', type=int, default=24)
+    ap.add_argument('--assign-calls', action='store_true')
     ap.add_argument('-h', '--help', action='store_true')
     a = ap.parse_args()
     if a.help:
         print(__doc__)
         return 0
     if a.print is not None:
-        prog = Gen(a.print, a.known, a.size).program()
+        prog = Gen(a.print, a.known, a.size, a.assign_calls).program()
         print(prog.code())
         try:
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(prog.expect()).splitlines()))
@@ -3397,7 +3423,7 @@ def main():
         return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
-        prog = Gen(a.shrink, a.known, a.size).program()
+        prog = Gen(a.shrink, a.known, a.size, a.assign_calls).program()
         kind, detail = check_program(volec, prog, work, 'p')
         print('// %s: %s' % (kind, detail))
         if kind not in ('ok', 'invalid'):
@@ -3412,7 +3438,7 @@ def main():
     lock = threading.Lock()
 
     def one(seed):
-        prog = Gen(seed, a.known, a.size).program()
+        prog = Gen(seed, a.known, a.size, a.assign_calls).program()
         d = os.path.join(work, 's%d' % seed)
         os.makedirs(d, exist_ok=True)
         with slots:
@@ -3429,7 +3455,7 @@ def main():
                 pass
             if kind != 'invalid' and not a.no_shrink:
                 with slots:
-                    small = shrink(volec, Gen(seed, a.known, a.size).program(), kind, d)
+                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls).program(), kind, d)
                 with open(base + '.min.vl', 'w') as f:
                     f.write(small.code())
                 with open(base + '.min.expect', 'w') as f:
