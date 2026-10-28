@@ -40,6 +40,7 @@ compiler/src/front/stdsrc.vl:0
 $ edit patch Option::unwrap_or --old 'Option::None => other,' --new 'Option::None => true,'
 compiler/std/std.vl:13:29: error[type error] expected 'i64', got 'bool' | note: in instantiation of 'Option<i64>::unwrap_or' at compiler/std/std.vl:10:9  [edited: std::Option::unwrap_or]
 error edit.breaks: 1 new error; nothing written
+note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch Option::unwrap_or --old 'Option::None => other,' --new 'Option::None => true,' --no-check
 [exit 1]
 ## By its file and line, as queries print it.
@@ -63,11 +64,11 @@ compiler/std/flat/io.vl:22:5: error[type error] undefined variable 'Nothing'
 [exit 1]
 ## (0.25.2) fix reads them too: an error with an exact fix in the edited
 ## std is fixed, not "nothing to fix".
-% printf '\npub fn narrow(a: i64) -> i32 {\n    a\n}\n' >> compiler/std/flat/io.vl
+% printf '\npub fn widen(a: i32) -> f64 {\n    a\n}\n' >> compiler/std/flat/io.vl
 $ fix --suggested --dry-run
 --- a/compiler/std/flat/io.vl
 +++ b/compiler/std/flat/io.vl
 @@ -26 +26 @@
 -    a
-+    a as i32
++    a as f64
 note check.std-files: std's files differ from this compiler's std: checked with compiler/std (bootstrap/bootstrap.sh --dev builds them in)

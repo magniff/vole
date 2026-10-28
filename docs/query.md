@@ -312,7 +312,12 @@ pub fn run_gvn(fi: i64) -> bool {
 ```
 
 A struct or enum shows its whole declaration (not its impl blocks);
-`Type::method` shows the method. When more than 5 definitions match,
+`Type::method` shows the method. (0.25.2.1) A name a module re-exports (`pub use
+types::{Color, ...};` in std::gpu) is found through it: `show
+std::gpu::Color` is std::gpu::types::Color, with `note query.reexport:
+std::gpu::Color is std::gpu::types::Color, which std::gpu re-exports`;
+`items std::gpu` lists them, `LINE  use  pub use Color =
+std::gpu::types::Color (struct)`. When more than 5 definitions match,
 `show` prints only their paths, one per line, and fails (exit 1) with
 `error query.ambiguous` and a `try:` line showing the first.
 
@@ -858,6 +863,14 @@ names them. No hit: `note query.empty`. (0.17) A hit in a comment right
 above an item (its doc comment, no blank line between) is that item's
 (`route::ride_cost`, a field's `Entry.line`), not the module's.
 
+(0.25.2.1) `--in DIR` or `--root DIR`, a directory of programs (one
+main.vl each below it, `examples/gpu`), greps each of them, its hits
+under each file, then `note query.programs: N hits in the M programs
+under DIR`: a shader's WGSL in a string (`query grep workgroupBarrier
+--in examples/gpu/fluid2d`, a program directory, is its main.vl). Other
+queries on such a directory: `error query.bad-root`, with a `try:` line
+per program.
+
 ## type (0.13)
 
 `type FILE:LINE:COL` prints the type the checker gave the innermost
@@ -1262,12 +1275,21 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   did-you-mean name with one candidate, a missing `use` or `pub`, a
   conversion) are fixed by the hook: it runs `fix --suggested --json
   ROOT` (one checked, journaled edit), checks again, and prints a head
-  line (`volec fix --suggested main.vl, run by the hook (volec
-  undo takes it back; ...)`), a `fixed FILE:L:C: MESSAGE | FIX` line per
-  error it fixed, then the errors left. A refused fix leaves the report
-  as before, with its `try:`; VOLE_HOOK_FIX=0 turns it off; the
-  record says `hook_fixed`. (The 0.18 eval: the `try:` was offered 43
-  times and run once.)
+  line (`volec fix main.vl, run by the hook (only mechanical fixes:
+  ...; volec undo takes it back; ...)`), a `fixed FILE:L:C: MESSAGE |
+  FIX` line per error it fixed, then the errors left. A refused fix
+  leaves the report as before, with its `try:`; VOLE_HOOK_FIX=0 turns
+  it off; the record says `hook_fixed`. (The 0.18 eval: the `try:` was
+  offered 43 times and run once.) (0.25.2.1) Only the mechanical
+  classes are made: `fix --suggested --codes
+  conv.marker,conv.marker_extra,conv.rust --diff` (a call's `&`
+  marker, Rust's spellings), and `fix --only unused --in FILE` for an
+  import unused at this check and the last (not one just written); each
+  change is a `changed FILE:LINE: OLD -> NEW` line after the head. The
+  other exact fixes (a did-you-mean, a conversion, a `use`, a path: the
+  0.25.2 eval's wrong fixes were all of these) are shown, not made: `fix
+  --suggested --dry-run`'s changes and refusals under `suggested, not
+  applied (check each: ...)`, at most 10 lines.
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,
@@ -1276,11 +1298,19 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
 - **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
   read of `.vl` source, judging each command of a line on its own (in
   the directory its `cd`s lead to, `$VAR`s assigned on the line
-  expanded); a whole file under 300 lines is read freely with `cat`,
-  `head`, `tail`, `sed -n`; a larger one gets its length and `query items
-  MODULE`; a `.vl` file outside any program's module tree (a probe, a
-  scratch copy: not a main.vl, not declared by a `mod` line) is not
-  source. The blocked record logs the `try:` commands it gave. After a
+  expanded); a whole file under 300 lines is read freely (any reader:
+  `cat`, `head`, `tail`, `sed -n`, `grep`, `awk`); a larger one gets its
+  length and `query items MODULE`; a `.vl` file outside any program's
+  module tree (a probe, a scratch copy: not a main.vl, not declared by a
+  `mod` line) is not source. (0.25.2.1) Only the compiler's own source
+  (compiler/src, compiler/std) is guarded: a program's `.vl` (an
+  example, a test, the agent's own program) is read and rewritten
+  freely (`read-program` in the log; the 0.25.2 eval's agents lost turns
+  to blocked `grep`s of their own files). A blocked line ran nothing,
+  and the block says so: `NOTHING on this line ran (N commands)`, the
+  command blocked by its number and text, the reads and writes that
+  are allowed, and `try the whole line: ...` with the blocked command
+  replaced by its query. The blocked record logs the `try:` commands it gave. After a
   call: a `# no-query:` reason asking for line numbers for the Edit tool
   is answered with `edit insert --after NAME` and `query def NAME`; the
   hints of tools/agent-hooks/hints.txt (`repeat-query` after the third

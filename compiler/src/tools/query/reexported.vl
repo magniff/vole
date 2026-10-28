@@ -1,0 +1,288 @@
+// (0.25.2.1) The items a module re-exports (`pub use types::{Color,
+// ...};`): `query show std::gpu::Color` is std::gpu::types::Color, and
+// `query items std::gpu` lists the names it re-exports, as a program
+// names them (`gpu::Color::rgba` compiles; the 0.25.2 eval's `query show
+// std::gpu::Color` found nothing). Read from the source text, so the
+// tools' cache answers it too.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+};
+use crate::front::modules::{MODULES, module_at, within_std};
+use crate::tools::proc::same_bytes;
+use crate::tools::query::defs::{DEFS, find_defs, kind_name, mod_fqn_text};
+use crate::tools::query::positions::line_of;
+
+// The `pub use` statements of module m: their first byte and the byte
+// after their `;`, in pairs.
+fn pub_uses_of(m: i64, out: inout IntVec) {
+    // UNSAFE: SRC (the sources' text) and FILES are the compiler's raw tables.
+    // SAFETY: q < end, FILES[f].end, within SRC; f < FILE_COUNT; the 8 bytes compared are below end.
+    unsafe {
+        for f in 0..FILE_COUNT {
+            var p = FILES[f].start;
+            let end = FILES[f].end;
+            while p < end {
+                var q = p;
+                while q < end && (SRC[q] == ' ' || SRC[q] == '\t') {
+                    q += 1;
+                }
+                if q + 8 <= end && same_bytes(SRC[q..q + 8], "pub use ") && module_at(q) == m {
+                    var e = q;
+                    while e < end && SRC[e] != ';' {
+                        e += 1;
+                    }
+                    out.push(q);
+                    out.push(if e < end { e + 1 } else { e });
+                }
+                while p < end && SRC[p] != '\n' {
+                    p += 1;
+                }
+                p += 1;
+            }
+        }
+    }
+}
+
+// The names one `pub use` (SRC[s..e)) brings, as (the path before the
+// names, the name, the name it is seen by) slices of a buffer's text:
+// triples of (start, end) pairs into `parts`, over buffer `text`.
+fn use_names(s: i64, e: i64, text: i64, parts: inout IntVec) {
+    // UNSAFE: SRC, the sources' text, is a raw pointer; parts's data too.
+    // SAFETY: s + 8 <= i < e: inside the `pub use` statement pub_uses_of found.
+    unsafe {
+        // (the statement without `pub use `, its `;` and its blanks)
+        for i in s + 8..e {
+            let c = SRC[i];
+            if c != ' ' && c != '\t' && c != '\n' && c != ';' {
+                buf_byte(text, c);
+            }
+            else if c == ' ' && i + 3 < e && SRC[i + 1] == 'a' && SRC[i + 2] == 's'
+                && SRC[i + 3] == ' ' {
+                // (`X as Y`: kept as `X@Y`)
+                buf_byte(text, '@');
+            }
+        }
+        let t = buf_slice(text);
+        // (`as`'s letters after the `@` dropped: `X@asY` -> X, Y)
+        var brace = -1;
+        for i in 0..t.len {
+            if t[i] == '{' && brace < 0 {
+                brace = i;
+            }
+        }
+        var ps = 0;
+        var pe = 0;
+        var ls = 0;
+        var le = 0;
+        if brace >= 2 {
+            ps = 0;
+            pe = brace - 2;
+            ls = brace + 1;
+            le = t.len;
+            while le > ls && t[le - 1] == '}' {
+                le -= 1;
+            }
+        } else {
+            var cut = -1;
+            for i in 1..t.len {
+                if t[i] == ':' && t[i - 1] == ':' {
+                    cut = i;
+                }
+            }
+            if cut < 0 {
+                return;
+            }
+            ps = 0;
+            pe = cut - 1;
+            ls = cut + 1;
+            le = t.len;
+        }
+        var a = ls;
+        for i in ls..le + 1 {
+            if i == le || t[i] == ',' {
+                if i > a {
+                    var at = -1;
+                    for j in a..i {
+                        if t[j] == '@' {
+                            at = j;
+                        }
+                    }
+                    parts.push(ps);
+                    parts.push(pe);
+                    if at < 0 {
+                        parts.push(a);
+                        parts.push(i);
+                        parts.push(a);
+                        parts.push(i);
+                    } else {
+                        // (`X@asY`)
+                        parts.push(a);
+                        parts.push(at);
+                        parts.push(if at + 3 <= i { at + 3 } else { i });
+                        parts.push(i);
+                    }
+                }
+                a = i + 1;
+            }
+        }
+    }
+}
+
+// The definitions path `prefix::name` (written in module m) names, into
+// out: from m, its parent, the root of m's tree (crate or std), as
+// written.
+fn defs_from(m: i64, prefix: [u8], name: [u8], tail: [u8], out: inout IntVec) {
+    // UNSAFE: MODULES is the module table, a raw pointer (front/modules).
+    // SAFETY: m is a module index (0 < m < module_count()), its parent one too.
+    unsafe {
+        for k in 0..4 {
+            let full = buf_new();
+            var base = -2;
+            if k == 0 {
+                base = m;
+            } else if k == 1 {
+                base = if m > 0 { MODULES[m].parent } else { -2 };
+            } else if k == 2 {
+                base = -1;
+            }
+            if prefix.len >= 6 && same_bytes(prefix[0..6], "super:") && m > 0 {
+                if k > 0 {
+                    return;
+                }
+                buf_bytes(full, mod_fqn_text(MODULES[m].parent));
+                buf_bytes(full, prefix[5..prefix.len]);
+            } else if prefix.len >= 4 && same_bytes(prefix[0..4], "self") {
+                if k > 0 {
+                    return;
+                }
+                buf_bytes(full, mod_fqn_text(m));
+                buf_bytes(full, prefix[4..prefix.len]);
+            } else if base >= 0 {
+                buf_bytes(full, mod_fqn_text(base));
+                buf_str(full, c"::");
+                buf_bytes(full, prefix);
+            } else if base == -1 {
+                buf_str(full, if within_std(m) { c"std::" } else { c"crate::" });
+                buf_bytes(full, prefix);
+            } else if k == 3 {
+                buf_bytes(full, prefix);
+            } else {
+                continue;
+            }
+            buf_str(full, c"::");
+            buf_bytes(full, name);
+            buf_bytes(full, tail);
+            find_defs(buf_slice(full), true, &out);
+            if out.count > 0 {
+                return;
+            }
+        }
+    }
+}
+
+// NAME (`std::gpu::Color`, `std::gpu::Color::rgba`) through a module's
+// re-export: the definitions it names, into out; the module re-exporting
+// (-1: none).
+pub fn reexport_defs(name: [u8], out: inout IntVec) -> i64 {
+    // UNSAFE: MODULES is the module table; IntVec data are raw pointers.
+    // SAFETY: m < module_count(); uses and parts are read below their counts.
+    unsafe {
+        var cut = name.len - 1;
+        while cut > 1 {
+            if name[cut] == ':' && name[cut - 1] == ':' {
+                let mod_name = name[0..cut - 1];
+                let rest = name[cut + 1..name.len];
+                var h = 0;
+                while h + 1 < rest.len && !(rest[h] == ':' && rest[h + 1] == ':') {
+                    h += 1;
+                }
+                if h + 1 >= rest.len {
+                    h = rest.len;
+                }
+                let head = rest[0..h];
+                let tail = rest[h..rest.len];
+                for m in 0..crate::front::modules::module_count() {
+                    if MODULES[m].name < 0 && m != 0 {
+                        continue;
+                    }
+                    // (a crate module as a program names it: `paint` for crate::paint)
+                    let fq = mod_fqn_text(m);
+                    let bare = fq.len > 7 && same_bytes(fq[0..7], "crate::")
+                        && same_bytes(fq[7..fq.len], mod_name);
+                    if !same_bytes(fq, mod_name) && !bare {
+                        continue;
+                    }
+                    var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                    pub_uses_of(m, &uses);
+                    var u = 0;
+                    while u + 1 < uses.count {
+                        let text = buf_new();
+                        var parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                        use_names(uses.data[u], uses.data[u + 1], text, &parts);
+                        let t = buf_slice(text);
+                        var k = 0;
+                        while k + 5 < parts.count {
+                            let seen = t[parts.data[k + 4]..parts.data[k + 5]];
+                            if same_bytes(seen, head) {
+                                defs_from(m, t[parts.data[k]..parts.data[k + 1]],
+                                    t[parts.data[k + 2]..parts.data[k + 3]], tail, &out);
+                                if out.count > 0 {
+                                    return m;
+                                }
+                            }
+                            k += 6;
+                        }
+                        u += 2;
+                    }
+                }
+            }
+            cut -= 1;
+        }
+        -1
+    }
+}
+
+// `query items`' lines of the names module m re-exports: `LINE<TAB>use<TAB>
+// pub use NAME = PATH (KIND)`, one a name.
+pub fn put_reexports(out: i64, m: i64) {
+    // UNSAFE: SYMS, DEFS (query/defs) and IntVec data are raw pointers.
+    // SAFETY: d is a definition find_defs gave (< DEFS' count); parts read in sixes below its count.
+    unsafe {
+        var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        pub_uses_of(m, &uses);
+        var u = 0;
+        while u + 1 < uses.count {
+            let text = buf_new();
+            var parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            use_names(uses.data[u], uses.data[u + 1], text, &parts);
+            let t = buf_slice(text);
+            var k = 0;
+            while k + 5 < parts.count {
+                let prefix = t[parts.data[k]..parts.data[k + 1]];
+                let name = t[parts.data[k + 2]..parts.data[k + 3]];
+                let seen = t[parts.data[k + 4]..parts.data[k + 5]];
+                var found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                defs_from(m, prefix, name, t[0..0], &found);
+                buf_int(out, line_of(uses.data[u]));
+                buf_str(out, c"\tuse\tpub use ");
+                buf_bytes(out, seen);
+                buf_str(out, c" = ");
+                if found.count > 0 {
+                    let d = found.data[0];
+                    buf_bytes(out, crate::base::SYMS[DEFS[d].fqn].text);
+                    buf_str(out, c" (");
+                    buf_str(out, kind_name(DEFS[d].kind));
+                    buf_byte(out, ')');
+                } else {
+                    buf_bytes(out, prefix);
+                    buf_str(out, c"::");
+                    buf_bytes(out, name);
+                }
+                buf_byte(out, '\n');
+                k += 6;
+            }
+            u += 2;
+        }
+    }
+}

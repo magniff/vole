@@ -20,7 +20,8 @@
 // command's own option parsing needs no change.
 
 use crate::base::{
-    IntVec, STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd,
+    IntVec, STDERR, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd,
 };
 use crate::cli::line::{Line, c_word_at, c_words};
 use crate::front::cpp::directives::file_exists;
@@ -254,6 +255,23 @@ pub fn root_of_args() -> *u8 {
             continue;
         }
         let f = file_of_arg(a);
+        if f.len == 0 && c_slice(word(k - 1)) == "--in" && program_dir(a) {
+            // (0.25.2.1: `--in DIR`, a program's directory: its main.vl)
+            let m = buf_new();
+            buf_bytes(m, a);
+            if a[a.len - 1] != '/' {
+                buf_byte(m, '/');
+            }
+            buf_str(m, c"main.vl");
+            let r = buf_cstr(m);
+            let default = find_root(0 as *u8);
+            if default != 0 as *u8 && same_file(r, default) {
+                return 0 as *u8;
+            }
+            ROOT_GIVEN = r;
+            ROOT_INFERRED = true;
+            return r;
+        }
         if f.len == 0 || in_std(f) {
             continue;
         }
@@ -271,6 +289,156 @@ pub fn root_of_args() -> *u8 {
         return r;
     }
     0 as *u8
+}
+
+// (0.25.2.1) Whether a is a directory with a main.vl (a program's).
+fn program_dir(a: [u8]) -> bool {
+    if a.len == 0 || !crate::tools::fmt::is_dir(cstr_of(a)) {
+        return false;
+    }
+    let m = buf_new();
+    buf_bytes(m, a);
+    buf_str(m, c"/main.vl");
+    file_exists(buf_cstr(m))
+}
+
+// (0.25.2.1) The directory of programs a command names, or 0: its ROOT, a
+// directory with no main.vl (`--root examples/gpu`), or with no ROOT an
+// `--in` of one; the 0.25.2 eval's `query grep atomic --root examples/gpu`
+// read nothing and found 0 hits.
+pub fn programs_dir(root: *u8) -> *u8 {
+    if root != 0 as *u8 {
+        let r = c_slice(root);
+        if crate::tools::fmt::is_dir(root) && !program_dir(r) {
+            return root;
+        }
+        return 0 as *u8;
+    }
+    for k in 2..CMD.count {
+        let a = c_slice(word(k));
+        if (a == "--in" && k + 1 < CMD.count) || (a.len > 5 && a[0..5] == "--in=") {
+            let v = if a == "--in" { c_slice(word(k + 1)) } else { a[5..a.len] };
+            if v.len > 0 && crate::tools::fmt::is_dir(cstr_of(v)) && !program_dir(v) {
+                let l = programs_under(v);
+                if l.len > 0 {
+                    return cstr_of(v);
+                }
+            }
+        }
+    }
+    0 as *u8
+}
+
+// The main.vl files under directory dir (not in target/ or .git/), a
+// buffer's text of lines, sorted; at most 40.
+fn programs_under(dir: [u8]) -> [u8] {
+    var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    words.push(c"sh" as i64);
+    words.push(c"-c" as i64);
+    words.push(c"find \"$0\" -name main.vl -not -path '*/target/*' -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort | head -40" as i64);
+    words.push(cstr_of(dir) as i64);
+    let listing = buf_new();
+    if run_capture(exec_words(words), listing) != 0 {
+        return buf_slice(listing)[0..0];
+    }
+    buf_slice(listing)
+}
+
+// A command on a directory of programs (programs_dir): `grep` asks each
+// program under it in turn (its output, then a note naming them), any
+// other command says which they are, a `try:` line each. The exit status.
+pub fn over_programs(dir: *u8, grep: bool) -> i64 {
+    let list = programs_under(c_slice(dir));
+    if list.len == 0 {
+        let d = diag(c"error", c"query.bad-root");
+        buf_str(d, c"'");
+        buf_str(d, dir);
+        buf_str(d, c"' is a directory with no main.vl, and no program under it\n");
+        return 2;
+    }
+    if !grep {
+        let d = diag(c"error", c"query.bad-root");
+        buf_str(d, c"'");
+        buf_str(d, dir);
+        buf_str(d, c"' is a directory of programs, not one: name one of them\n");
+        var shown = 0;
+        var i = 0;
+        while i < list.len && shown < 5 {
+            var e = i;
+            while e < list.len && list[e] != '\n' {
+                e += 1;
+            }
+            try_with_root(list[i..e]);
+            shown += 1;
+            i = e + 1;
+        }
+        return 2;
+    }
+    let out = buf_new();
+    var n = 0;
+    var hits = 0;
+    var i = 0;
+    while i < list.len {
+        var e = i;
+        while e < list.len && list[e] != '\n' {
+            e += 1;
+        }
+        let root = list[i..e];
+        i = e + 1;
+        if root.len == 0 {
+            continue;
+        }
+        n += 1;
+        // (the command's words, less its --root and an --in of dir, with
+        // `--root ROOT`)
+        var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var k = 0;
+        while k < CMD.count {
+            let a = c_slice(word(k));
+            if k >= 2 && (a == "--root" || a == "--in") && k + 1 < CMD.count
+                && (a == "--root" || c_slice(word(k + 1)) == c_slice(dir)) {
+                k += 2;
+                continue;
+            }
+            if k >= 2 && a.len > 7 && a[0..7] == "--root=" {
+                k += 1;
+                continue;
+            }
+            words.push(word(k) as i64);
+            k += 1;
+        }
+        words.push(c"--root" as i64);
+        words.push(cstr_of(root) as i64);
+        let got = buf_new();
+        run_capture(exec_words(words), got);
+        // (its hits; not its `0 hits` note, nor its warnings)
+        let t = buf_slice(got);
+        var p = 0;
+        while p < t.len {
+            var q = p;
+            while q < t.len && t[q] != '\n' {
+                q += 1;
+            }
+            let l = t[p..q];
+            if l.len > 0 && !(l.len > 5 && (l[0..5] == "note " || l[0..5] == "warni")) {
+                buf_bytes(out, l);
+                buf_byte(out, '\n');
+                if l[0] != '#' {
+                    hits += 1;
+                }
+            }
+            p = q + 1;
+        }
+    }
+    buf_write_fd(out, crate::base::STDOUT);
+    let d = diag(c"note", c"query.programs");
+    buf_int(d, hits);
+    buf_str(d, if hits == 1 { c" hit in the " } else { c" hits in the " });
+    buf_int(d, n);
+    buf_str(d, if n == 1 { c" program under " } else { c" programs under " });
+    buf_str(d, dir);
+    buf_str(d, c" (each main.vl: its code, comments and strings)\n");
+    0
 }
 
 // The root of the command's program: ROOT given (root_named), else one a
@@ -386,8 +554,17 @@ fn try_with_root(root: [u8]) {
     let out = diags();
     buf_str(out, c"try:");
     put_cword(out, PROG);
-    for k in 1..CMD.count {
-        put_word(out, c_slice(word(k)));
+    var k = 1;
+    while k < CMD.count {
+        // (a directory --root it replaces: left out)
+        let a = c_slice(word(k));
+        if a == "--root" && k + 1 < CMD.count && crate::tools::fmt::is_dir(word(k + 1))
+            && !program_dir(c_slice(word(k + 1))) {
+            k += 2;
+            continue;
+        }
+        put_word(out, a);
+        k += 1;
     }
     buf_str(out, c" --root");
     put_word(out, root);

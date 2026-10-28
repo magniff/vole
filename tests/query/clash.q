@@ -425,6 +425,28 @@ $ items sys
 15318	fn	pub fn sys_clock_gettime(clock: i32) -> (i64, i64)
 15328	fn	pub fn sys_nanosleep(secs: i64, nanos: i64, left: inout SysTimespec) -> Result<(), i32>
 15335	fn	pub fn sys_getentropy(buf: inout [u8]) -> Result<(), i32>
+14166	use	pub use SYS_CLOCK_MONOTONIC = std::SYS_CLOCK_MONOTONIC (const)
+14166	use	pub use SYS_EAGAIN = std::SYS_EAGAIN (const)
+14166	use	pub use SYS_ELOOP = std::SYS_ELOOP (const)
+14166	use	pub use SYS_ENAMETOOLONG = std::SYS_ENAMETOOLONG (const)
+14166	use	pub use SYS_ENOSYS = std::SYS_ENOSYS (const)
+14166	use	pub use SYS_ENOTEMPTY = std::SYS_ENOTEMPTY (const)
+14166	use	pub use SYS_ENOTSUP = std::SYS_ENOTSUP (const)
+14166	use	pub use SYS_ETIMEDOUT = std::SYS_ETIMEDOUT (const)
+14166	use	pub use SYS_O_APPEND = std::SYS_O_APPEND (const)
+14166	use	pub use SYS_O_CLOEXEC = std::SYS_O_CLOEXEC (const)
+14166	use	pub use SYS_O_CREAT = std::SYS_O_CREAT (const)
+14166	use	pub use SYS_O_DIRECTORY = std::SYS_O_DIRECTORY (const)
+14166	use	pub use SYS_O_EXCL = std::SYS_O_EXCL (const)
+14166	use	pub use SYS_O_NOCTTY = std::SYS_O_NOCTTY (const)
+14166	use	pub use SYS_O_NONBLOCK = std::SYS_O_NONBLOCK (const)
+14166	use	pub use SYS_O_TRUNC = std::SYS_O_TRUNC (const)
+14166	use	pub use SYS_PATH_MAX = std::SYS_PATH_MAX (const)
+14166	use	pub use SYS_SIGCHLD = std::SYS_SIGCHLD (const)
+14166	use	pub use SYS_TIOCGWINSZ = std::SYS_TIOCGWINSZ (const)
+14166	use	pub use SYS_TIOCSCTTY = std::SYS_TIOCSCTTY (const)
+14166	use	pub use SYS_TIOCSWINSZ = std::SYS_TIOCSWINSZ (const)
+14166	use	pub use TARGET_OS = std::TARGET_OS (const)
 $ def helpr
 error query.no-match: no definition 'helpr'
 try: volec query def crate::a::helper

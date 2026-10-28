@@ -378,8 +378,9 @@ mkdir -p "$WORK/std"
 "$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
 printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.vl"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.vl) >"$WORK/std/items" 2>&1; then
-    # (0.18: the index's signatures leave std's clauses out)
-    awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
+    # (0.18: the index's signatures leave std's clauses out; 0.25.2.1: a
+    # re-export, `pub use NAME = PATH`, is its item's, listed there)
+    awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / && $3 !~ /^pub use / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
         grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
