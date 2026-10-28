@@ -47,6 +47,7 @@ fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(n: sink i64) -> i64 { n += 1; n }  // sink: the callee's own, mutable
 fn twice(v: inout Vec<i64>) { v.push(v.len()); }   // inout: called as twice(&v)
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
+fn hi(out: inout Buf) { out.push_str("hi"); }   // Buf: the `use` above
 
 impl Point {
     fn len2(self) -> i64 { self.x * self.x + self.y * self.y }   // self: let

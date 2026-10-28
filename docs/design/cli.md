@@ -79,10 +79,10 @@ program's name is 0) of each value, or of each time a flag was given; a
 default has none. volec's own command line (compiler/src/cli/, on
 0.25.1's std::cli, whose API is 0.24's) needs the order of different options' values (`-l`,
 `-L` and objects are linked in the order given; `edit patch`'s pairs
-after `--in NAME` are NAME's); until 0.26 builds it, it finds a value's
-place by the argv element the value views.
+after `--in NAME` are NAME's); until 0.25.2 builds it (0.25.3), it finds
+a value's place by the word of its line the value views.
 
-What volec's layer makes up for (compiler/src/cli/mod.vl), candidates
+What volec's layer makes up for (compiler/src/cli/line.vl), candidates
 for later: a single-dash long option (`-framework`) and parsing on after
 an error (the tools report the NAMEs given with the error); 0.25.2 has
 the rest (an optional value, two values, values starting with `-`).
@@ -132,19 +132,51 @@ compiler/src/cli/, can drop them once a release has them):
 - The commands' table of a help was already one aligned line each, name
   then about; hidden ones are left out.
 
-volec's own command line is on std::cli in 0.25.2, every command: a
-build's options are one Command (compiler/src/cli/build.vl), `query`'s
-another (cli/query.vl), and each other command lists its options in a
-table read as events in argv's order (cli/events.vl: the flags, values,
-words and errors, so that a command keeps its old messages, try: lines
-and exit statuses; tools/cli-compat.py compares two volecs on the
-transcripts, the docs' command lines and some 300 bad inputs). The
-compiler is built by the previous release, so it uses 0.25.1's API;
-the layer's rewrites (`--overlay PATH COPY`, `--stats[=F]`, dash words,
-the words after probe's `--`) become 0.25.2's `num_values`,
-`default_missing`, `allow_hyphen_values` and `last` when 0.26 builds
-it. Two changes for the better: `--name=value` is taken wherever `--name
-value` is, and `--` ends the options of every command.
+volec's own command line is one std::cli Command tree in 0.25.2
+(compiler/src/cli/tree.vl): main reads std::env's arguments (no argc or
+argv), the root is a build's Command (cli/build.vl), every other command
+a subcommand of it, `query`, `edit` and `refactor` with theirs; each
+command's arguments are its leaf, a table of options next to the command
+(`check_leaf` by `run_check`), and the tree is made of the leaves. A
+line is read with the tree along the commands named at words 1 and 2,
+as before, and run by the name `Matches::subcommand()` gives
+(tools/commands.vl); a command is `fn run_X(c: Call)`: its line, its
+level's Matches, and its arguments in the line's order (cli/line.vl:
+the flags, values, words and errors, so that a command keeps its old
+messages, try: lines and exit statuses; tools/cli-compat.py compares
+two volecs on the transcripts, the docs' command lines and some 300 bad
+inputs). Two changes for the better: `--name=value` is taken wherever
+`--name value` is, and `--` ends the options of every command; a word
+that is not UTF-8 is an error (it was read as an empty word).
+
+The compiler is built by the previous release, so it uses 0.25.1's API.
+What that lacks is made up in cli/line.vl and cli/tree.vl, to go when
+0.25.2 builds the compiler (0.25.3):
+
+- a value's place in the line, by the word it views (`Line::at`): the
+  order of different options' values (`indices_of`);
+- a parse that goes on after an error, the word left out and the rest
+  read again (`parse`), so a command reports its bad option with what
+  else it was given;
+- the line's words rewritten on their way to std::cli (`WordIter`): a
+  dash word as a positional (`allow_hyphen_values`), `--rename A B` and
+  `--overlay PATH COPY` as `--rename A --2nd B` (`num_values`), the
+  words after probe's `--` as `--args WORD` (`last`), a build's
+  `--stats` and `--print-checks` (`default_missing`) and `-framework`
+  (a single-dash long option: no rule yet);
+- the options the editing commands share are each subcommand's
+  (`global`); `--json`, `--values=` and `--syntax=` are taken out of
+  the line before the tree reads it, and `--help` routed (tools/help.vl);
+- a parent's word 2 that names none of its subcommands is the parent's
+  hidden subcommand `(other)` (std::cli would take a later word naming
+  a subcommand as that subcommand); `refactor --script` is the tree's
+  `refactor script`, 0.8's `--fix-imports` and 0.9's `--fix-unsafe` are
+  `fix` from word 1;
+- two leaves of one name chosen from the line: `edit insert --in` is
+  patch's, `rewrite --text` the textual rewrite's (`conflicts_with`,
+  subcommands of their own);
+- a build's line is read with the root alone, so that a FILE named as a
+  command stays a FILE.
 
 Matches now keeps one vector of pairs (slot, argument index) while
 parsing and the indices by slot after it, in place of 0.25's three: a

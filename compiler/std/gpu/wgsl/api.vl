@@ -3,7 +3,7 @@
 // SPIR-V), on an arena of its own (docs/design/gpu.md §2.10: everything a
 // translation allocates is freed when it ends; no io, no globals).
 
-use std::{Buf, Gpa, ScopedArena, Vec, arena_scope};
+use std::{Allocator, Buf, Gpa, ScopedArena, Vec, arena_scope};
 
 use front::new_front;
 
@@ -52,17 +52,25 @@ pub struct EntryInfo {
 // component count, as WebGPU's vertex formats (`float32x3`: f32, 3).
 pub struct InputInfo { location: i64, scalar: u8, components: i64 }
 
+// Where a function of the output starts (msl_line, 1-based, in the
+// target's text) and the byte offset of its WGSL declaration: what maps
+// a target compiler's message back to the WGSL (target_error).
+pub struct SourceLine { msl_line: i64, pos: i64 }
+
 // A translated module's interface, in (group, binding) order; `sizes`
 // lists the runtime-sized storage bindings (indices into `bindings`) in
-// the order of the sizes buffer.
+// the order of the sizes buffer; `lines`, where each function of the
+// output starts (MSL only).
 pub struct Reflection {
     entries: Vec<EntryInfo>, bindings: Vec<BindingInfo>, inputs: Vec<InputInfo>, sizes: Vec<i64>,
+    lines: Vec<SourceLine>,
 }
 
 pub fn new_reflection(gpa: Gpa) -> Reflection {
     Reflection {
         entries: Vec::new_in(gpa), bindings: Vec::new_in(gpa), inputs: Vec::new_in(gpa),
         sizes: Vec::new_in(gpa),
+        lines: Vec::new_in(gpa),
     }
 }
 
@@ -72,6 +80,7 @@ pub fn reflect(m: ir::Module, a: ScopedArena, refl: inout Reflection, gpa: Gpa) 
     refl.bindings.clear();
     refl.inputs.clear();
     refl.sizes.clear();
+    refl.lines.clear();
     for e in 0..m.entries.len() {
         let en = m.entries[e];
         var name = Buf::new_in(gpa);
@@ -81,7 +90,7 @@ pub fn reflect(m: ir::Module, a: ScopedArena, refl: inout Reflection, gpa: Gpa) 
             sizes_slot: -1,
         });
         if en.stage == ir::STAGE_VERTEX {
-            let f = m.functions[en.func];
+            let f = m.functions.get(en.func);
             for k in 0..f.params.len() {
                 let pt = m.types[f.params[k].ty];
                 if pt.kind == ir::TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
@@ -180,6 +189,70 @@ pub fn line_col(src: [u8], pos: i64) -> (i64, i64) {
         }
     }
     (line, col)
+}
+
+// A target compiler's rejection of the translation of src (Metal's log:
+// `program_source:LINE:COL: error: TEXT` lines) as one line at the WGSL:
+// `LINE:COL: error wgsl.target: ... fn NAME: TEXT (MSL LINE:COL)`, at the
+// declaration of the function whose MSL holds the first error (refl.lines).
+// False, out unchanged, when the log has no error line in a function.
+pub fn target_error<A: Allocator>(src: [u8], refl: Reflection, log: [u8], out: inout Buf<A>)
+    -> bool {
+    let key = "program_source:";
+    var i = 0;
+    while i + key.len <= log.len {
+        if (i == 0 || log[i - 1] == '\n') && log[i..i + key.len] == key {
+            let (ml, a) = number_at(log, i + key.len);
+            let (mc, b) = number_at(log, a + 1);
+            let tag = ": error: ";
+            if ml > 0 && a < log.len && log[a] == ':' && b + tag.len <= log.len
+                && log[b..b + tag.len] == tag {
+                var e = b + tag.len;
+                while e < log.len && log[e] != '\n' {
+                    e += 1;
+                }
+                // the last function starting at or before the line
+                var pos = -1;
+                for k in 0..refl.lines.len() {
+                    if refl.lines[k].msl_line <= ml {
+                        pos = refl.lines[k].pos;
+                    }
+                }
+                if pos < 0 {
+                    return false;
+                }
+                let (l, c) = line_col(src, pos);
+                out.push_fmt(f"{l}:{c}: error wgsl.target: Metal rejected the translation of fn ");
+                out.push_str(name_at(src, pos));
+                out.push_fmt(f": {log[b + tag.len..e]} (MSL {ml}:{mc})");
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The decimal number at s[i..] and the index after it (0 and i: none).
+fn number_at(s: [u8], i: i64) -> (i64, i64) {
+    var n = 0;
+    var j = i;
+    while j < s.len && s[j] >= '0' && s[j] <= '9' && n < 1000000000 {
+        n = n * 10 + (s[j] - '0') as i64;
+        j += 1;
+    }
+    (n, j)
+}
+
+// The identifier at src[pos..] (a function's position is its name's).
+fn name_at(src: [u8], pos: i64) -> [u8] {
+    let i = if pos < src.len { pos } else { src.len };
+    var j = i;
+    while j < src.len && (src[j] == '_' || src[j] >= 'a' && src[j] <= 'z' || src[j] >= 'A'
+        && src[j] <= 'Z' || src[j] >= '0' && src[j] <= '9') {
+        j += 1;
+    }
+    src[i..j]
 }
 
 pub fn fill_error(fr: front::Front, err: inout ShaderError) {

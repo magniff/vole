@@ -29,7 +29,7 @@ Write}` is two lines here: `use std::io;` and `use std::io::Write;`.
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::{BufReader, BufWriter, Write, writeln};
+use std::io::{BufReader, BufWriter, writeln};
 use std::process::Command;
 
 fn run(gpa: Gpa) -> io::Result<()> {

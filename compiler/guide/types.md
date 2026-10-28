@@ -3,7 +3,7 @@
 | type | |
 |---|---|
 | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize` | integers; literals are `i64` unless the context or a suffix says |
-| `f32`, `f64` | IEEE floats; literals are `f64` |
+| `f32`, `f64` | IEEE floats; literals are `f64` unless the context or a suffix says: `let c = [1.0, 0.5];` is `[f64; 2]` (annotate: `let c: [f32; 2] = ..`; 0.25.2: a mismatch from it names the `let`) |
 | `bool` | `true`, `false` |
 | `()` | the unit type |
 | `!` | never: `return`, `break`, `loop` without `break`, `fn f() -> !` |

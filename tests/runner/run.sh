@@ -2,7 +2,8 @@
 # The test runner's own checks (0.25.2): the pieces of tests/run.sh that
 # decide an outcome without a compiler, on small fixtures made here: the
 # EXPECT holes (tests/expect.awk), the golden-image comparison
-# (tests/ppmdiff.sh) and the directives' parse (tests/directives.awk).
+# (tests/ppmdiff.sh), the directives' parse (tests/directives.awk) and
+# the load-aware time limit (tests/watchdog.sh).
 # The same directives on real programs are tests/run/runner_*.vl.
 #
 # usage: tests/runner/run.sh
@@ -129,6 +130,40 @@ case "$(head -c 11 "$WORK/crop.ppm" | tr '\n' ' ')" in
     "P6 4 3 255 ") ok ppm_crop_p6 ;;
     *) bad ppm_crop_p6 "the crop's header is '$(head -c 11 "$WORK/crop.ppm" | tr '\n' ' ')'" ;;
 esac
+
+# ---- the load-aware time limit (tests/watchdog.sh) ----
+
+# dog NAME LOAD EXTEND: a 30-second sleep under a 1-second limit, the
+# load average pretended; prints the watchdog's line and the seconds.
+dog() {
+    rm -f "$WORK/dog.$1"
+    sleep 30 &
+    spid=$!
+    t0=$(date +%s)
+    VOLE_WATCHDOG_LOAD=$2 VOLE_WATCHDOG_EXTEND=$3 sh "$ROOT/tests/watchdog.sh" 1 "$spid" "$WORK/dog.$1"
+    wait "$spid" 2>/dev/null
+    echo "$(($(date +%s) - t0)) $(cat "$WORK/dog.$1" 2>/dev/null)"
+}
+got=$(dog idle 0 8)
+case "$got" in
+    [1-3]" killed after 1 s, the limit (load average 0 on "*) ok watchdog_idle ;;
+    *) bad watchdog_idle "got '$got'" ;;
+esac
+got=$(dog loaded 100000 2)
+case "$got" in
+    [3-6]" killed after 3 s: the limit, 1 s, extended 2 times while the load average was above the "*" CPUs (now 100000): a hang, or a machine loaded beyond that") ok watchdog_loaded ;;
+    *) bad watchdog_loaded "got '$got'" ;;
+esac
+# a program that ends in time: no line, and the watchdog ends with it
+sleep 1 &
+spid=$!
+t0=$(date +%s)
+sh "$ROOT/tests/watchdog.sh" 20 "$spid" "$WORK/dog.quick"
+if [ $(($(date +%s) - t0)) -le 3 ] && [ ! -e "$WORK/dog.quick" ]; then
+    ok watchdog_in_time
+else
+    bad watchdog_in_time "waited $(($(date +%s) - t0)) s, wrote '$(cat "$WORK/dog.quick" 2>/dev/null)'"
+fi
 
 # ---- the directives ----
 

@@ -15,6 +15,10 @@ $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
 Vec<u64>::get	views()
 Vec<Vec<u64>>::get	views()
+Vec<Function, ScopedArena>::get	views(*self) parametric
+Vec<JobBuffer, ScopedArena>::get	views(*self) parametric
+Vec<JobTexture, ScopedArena>::get	views(*self) parametric
+Vec<Vec<u32, ScopedArena>, ScopedArena>::get	views(*self) parametric
 Vec<Tok>::as_slice	views(self) declared
 Vec<u64>::as_slice	views(self) declared
 Vec<[i64; 2]>::as_slice	views(self) declared
@@ -30,13 +34,13 @@ Vec<Type, ScopedArena>::as_slice	views(self) declared
 Vec<StructMember, ScopedArena>::as_slice	views(self) declared
 Vec<i64, ScopedArena>::as_slice	views(self) declared
 Vec<Block, ScopedArena>::as_slice	views(self) declared
-Vec<Function, ScopedArena>::as_slice	views(self) declared
 Vec<Param, ScopedArena>::as_slice	views(self) declared
 Vec<u8, ScopedArena>::as_slice	views(self) declared
 Vec<[u8], ScopedArena>::as_slice	views(self) declared
 Vec<Global, ScopedArena>::as_slice	views(self) declared
 Vec<Decl, ScopedArena>::as_slice	views(self) declared
 Vec<Expr, ScopedArena>::as_slice	views(self) declared
+Vec<Function, ScopedArena>::as_slice	views(self) declared
 Vec<Entry, ScopedArena>::as_slice	views(self) declared
 Vec<Stmt, ScopedArena>::as_slice	views(self) declared
 Vec<Case, ScopedArena>::as_slice	views(self) declared
@@ -47,20 +51,21 @@ Vec<Fact, ScopedArena>::as_slice	views(self) declared
 Vec<Vec<bool, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<bool, ScopedArena>::as_slice	views(self) declared
 Vec<Nm, ScopedArena>::as_slice	views(self) declared
-Vec<JobBuffer, ScopedArena>::as_slice	views(self) declared
 Vec<u32, ScopedArena>::as_slice	views(self) declared
-Vec<JobTexture, ScopedArena>::as_slice	views(self) declared
 Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<FnInfo, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
+Vec<SourceLine>::as_slice	views(self) declared
 Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<State>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
+Vec<JobBuffer, ScopedArena>::as_slice	views(self) declared
+Vec<JobTexture, ScopedArena>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
 Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
@@ -92,6 +97,7 @@ Vec<Val, ScopedArena>::push	views() stores(x) declared
 Vec<Fact, ScopedArena>::push	views() stores(x) declared
 Vec<Nm, ScopedArena>::push	views() stores(x) declared
 Vec<Vec<bool, ScopedArena>, ScopedArena>::push	views() stores(x) declared
+Vec<SourceLine>::push	views()
 Vec<bool, ScopedArena>::push	views() stores(x) declared
 Vec<FnInfo, ScopedArena>::push	views() stores(x) declared
 Vec<Vec<u32, ScopedArena>, ScopedArena>::push	views() stores(x) declared
@@ -127,7 +133,7 @@ $ def pick intern count
 crate::pick	views017/main.vl:16:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks) declared
 crate::intern	views017/main.vl:27:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
 std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:528:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
-std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:243:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
+std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:368:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
 crate::count	views017/main.vl:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64
 std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64

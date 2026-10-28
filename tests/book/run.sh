@@ -265,7 +265,8 @@ with_timeout() {
     shift
     "$@" &
     pid=$!
-    (sleep "$t" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    # (0.25.2: extended while the machine is loaded)
+    sh "$ROOT/tests/watchdog.sh" "$t" "$pid" >/dev/null 2>&1 &
     dog=$!
     wait "$pid"
     rc=$?

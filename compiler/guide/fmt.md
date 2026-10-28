@@ -2,7 +2,8 @@
 
 One layout, no options: `volec fmt FILE|MODULE` writes it, `--check`
 lists the files not in it (exit 1), `--dry-run` shows the diff, `--all`
-the tree. The edits of `edit`, `fix` and `refactor` land formatted. In
+the tree, `--changed` (0.25.2) the `.vl` files changed since git's HEAD
+(`--since REV`: since REV), not the untidy files of others. The edits of `edit`, `fix` and `refactor` land formatted. In
 full: docs/style.md.
 
 ```text

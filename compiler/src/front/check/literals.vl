@@ -1,0 +1,352 @@
+// (0.25.2, feedbacks/galaga.md #2) Mismatches whose cause is a literal's
+// default type: `let col = if c { [1.0, 0.0, 0.0, 1.0] } else { .. };`
+// makes col `[f64; 4]` (a float literal is f64, an integer one i64, where
+// nothing gives their type), and each use of col where `[f32; 4]` goes
+// failed far from the `let`, with no word of it. The first such error says
+// where the type came from and gives the annotation to write (its try:
+// line, and the fix `volec fix --suggested` makes); the later ones from
+// the same `let` are not reported again while that error stands: one
+// error per cause.
+
+use crate::base::{IntVec, SourceFile, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::diag::{
+    ERR_HELP, buf_file_line, buf_position, err_fix, err_help, err_help_fmt, err_try_tool,
+    error_recorded_at,
+};
+use crate::front::ast::{NODES, Node, NodeKind};
+use crate::front::check::{CUR_FN, LOCALS, Res};
+use crate::front::modules::file_of_pos;
+use crate::front::types::{
+    FNS, TYPES, TY_F64, TY_I64, TyKind, Type, array_of, buf_type, is_float, is_integer, type_elem,
+};
+
+// The `let`s whose cause was reported: the position of the name in the
+// `let`, then that of the error, in pairs.
+static var NOTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// What literal_let found, for literal_help: the name's start and end, the
+// `let`'s start, the end of its `=`, the type to write.
+static var NAME_START: i64 = -1;
+static var NAME_END: i64 = -1;
+static var LET_START: i64 = -1;
+static var EQ_END: i64 = -1;
+static var WANT: i64 = 0;
+static var HAD: i64 = 0;
+
+// For the mismatch at node n (a value of type actual where expected goes):
+// whether its cause is the defaulted literals of a local's unannotated
+// `let` (its name, or an element of it, `col[1]`); then literal_help may
+// add the cause. Returns 1 for that, 2 when that `let`'s cause is reported
+// already (the caller drops the error), 0 otherwise.
+pub fn literal_let(n: i64, expected: i64, actual: i64) -> i64 {
+    NAME_START = -1;
+    if n <= 0 || expected <= 0 || actual <= 0 || CUR_FN < 0 {
+        return 0;
+    }
+    let e = node(n);
+    var ident = n;
+    var want = expected;
+    if e.kind == NodeKind::Index {
+        ident = e.a;
+    } else if e.kind != NodeKind::Ident {
+        return 0;
+    }
+    let id = node(ident);
+    if id.kind != NodeKind::Ident || id.res != Res::Local {
+        return 0;
+    }
+    let had = local_type(id.y);
+    if e.kind == NodeKind::Index {
+        let h = type_info(had);
+        if h.kind != TyKind::Array || h.a != actual {
+            return 0;
+        }
+        want = array_of(expected, h.b);
+    } else if had != actual {
+        return 0;
+    }
+    // (only literals' types apart: f64 for another float, i64 for
+    // another integer)
+    var floats = false;
+    var ints = false;
+    if !defaulted_apart(had, want, &floats, &ints) || !(floats || ints) {
+        return 0;
+    }
+    if !find_let(id.a, id.start, node(fn_node(CUR_FN)).start) {
+        return 0;
+    }
+    if !init_has_literal(EQ_END, floats, ints) {
+        NAME_START = -1;
+        return 0;
+    }
+    WANT = want;
+    HAD = had;
+    var k = 0;
+    while k + 1 < NOTED.count {
+        if int_at(NOTED, k) == NAME_START && error_recorded_at(int_at(NOTED, k + 1)) {
+            return 2;
+        }
+        k += 2;
+    }
+    1
+}
+
+// The cause of the error at pos being made, after literal_let gave 1: a
+// help naming the `let`, its try: line (the annotation, an edit patch)
+// and its fix.
+pub fn literal_help(pos: i64) {
+    if NAME_START < 0 {
+        return;
+    }
+    NOTED.push(NAME_START);
+    NOTED.push(pos);
+    let name = src_text(NAME_START, NAME_END);
+    let had = buf_new();
+    buf_type(had, HAD);
+    let want = buf_new();
+    buf_type(want, WANT);
+    let at = buf_new();
+    buf_position(at, LET_START);
+    if buf_slice(ERR_HELP).len > 0 {
+        err_help(c"; ");
+    }
+    err_help_fmt(f"'{name}' is '{buf_slice(had)}' from its literals at {buf_slice(at)} (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, '{name}: {buf_slice(want)}'");
+    let old = src_text(LET_START, EQ_END);
+    if !has_quote(old) {
+        let cmd = buf_new();
+        buf_str(cmd, c"edit patch ");
+        buf_file_line(cmd, LET_START);
+        buf_str(cmd, c" --old '");
+        buf_bytes(cmd, old);
+        buf_str(cmd, c"' --new '");
+        buf_bytes(cmd, src_text(LET_START, NAME_END));
+        buf_str(cmd, c": ");
+        buf_bytes(cmd, buf_slice(want));
+        buf_bytes(cmd, src_text(NAME_END, EQ_END));
+        buf_str(cmd, c"'");
+        err_try_tool(buf_slice(cmd), true);
+    }
+    let fix = buf_new();
+    buf_str(fix, c": ");
+    buf_bytes(fix, buf_slice(want));
+    err_fix(NAME_END, NAME_END, buf_slice(fix));
+}
+
+// Whether types a (the local's) and b (the one wanted) differ only where a
+// has a literal's default type, f64 for another float (floats) or i64 for
+// another integer (ints), through arrays and tuples.
+fn defaulted_apart(a: i64, b: i64, floats: inout bool, ints: inout bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if a == TY_F64 && is_float(b) {
+        floats = true;
+        return true;
+    }
+    if a == TY_I64 && is_integer(b) {
+        ints = true;
+        return true;
+    }
+    if a <= 0 || b <= 0 {
+        return false;
+    }
+    let ta = type_info(a);
+    let tb = type_info(b);
+    if ta.kind != tb.kind {
+        return false;
+    }
+    if ta.kind == TyKind::Array {
+        return ta.b == tb.b && defaulted_apart(ta.a, tb.a, &floats, &ints);
+    }
+    if ta.kind == TyKind::Tuple && ta.count == tb.count {
+        for i in 0..ta.count {
+            if !defaulted_apart(type_elem(a, i), type_elem(b, i), &floats, &ints) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// The nearest `let NAME =` or `var NAME =` (no type written) before pos,
+// after from (the function's start): sets LET_START, NAME_START, NAME_END
+// and EQ_END (after the `=`).
+fn find_let(name: i64, pos: i64, from: i64) -> bool {
+    let text = crate::base::sym_text(name);
+    var p = pos - text.len;
+    while p > from + 3 {
+        if word_at(p, text) {
+            var k = p - 1;
+            while k > from && src(k) == ' ' {
+                k -= 1;
+            }
+            // (`let` or `var` before it, a word of its own)
+            if k >= from + 2 && k + 1 < p && (keyword_ends(k, "let") || keyword_ends(k, "var")) {
+                var q = p + text.len;
+                while src(q) == ' ' {
+                    q += 1;
+                }
+                if src(q) != '=' || src(q + 1) == '=' {
+                    // (a type written, `let x: T`, or a pattern)
+                    return false;
+                }
+                LET_START = k - 2;
+                NAME_START = p;
+                NAME_END = p + text.len;
+                EQ_END = q + 1;
+                return true;
+            }
+        }
+        p -= 1;
+    }
+    false
+}
+
+// Whether the word text is at p (not inside a longer name).
+fn word_at(p: i64, text: [u8]) -> bool {
+    for i in 0..text.len {
+        if src(p + i) != text[i] {
+            return false;
+        }
+    }
+    !ident_byte(src(p - 1)) && !ident_byte(src(p + text.len))
+}
+
+// Whether keyword kw (three letters) ends at k, a word of its own.
+fn keyword_ends(k: i64, kw: [u8]) -> bool {
+    src(k - 2) == kw[0] && src(k - 1) == kw[1] && src(k) == kw[2] && !ident_byte(src(k - 3))
+}
+
+// Whether the initializer from p to its `;` has a literal without a
+// suffix: a float one (with floats), an integer one (with ints).
+fn init_has_literal(p: i64, floats: bool, ints: bool) -> bool {
+    let end = file_info(file_of_pos(p)).end;
+    var depth = 0;
+    var i = p;
+    while i < end {
+        let c = src(i);
+        if c == '(' || c == '[' || c == '{' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '}' {
+            depth -= 1;
+        } else if c == ';' && depth <= 0 {
+            return false;
+        } else if c == '"' {
+            // (a string's text is no literal)
+            i += 1;
+            while i < end && src(i) != '"' {
+                if src(i) == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if is_digit(c) && !ident_byte(src(i - 1)) && src(i - 1) != '.' {
+            var j = i;
+            while j < end && (is_digit(src(j)) || src(j) == '_') {
+                j += 1;
+            }
+            var float = false;
+            if src(j) == '.' && is_digit(src(j + 1)) {
+                float = true;
+                j += 1;
+                while j < end && (is_digit(src(j)) || src(j) == '_') {
+                    j += 1;
+                }
+            }
+            // (a suffix, `1.0f32`, `2u8`, gives the type; `0x..`: a word)
+            if !ident_byte(src(j)) && (float && floats || !float && ints) {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn ident_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c) || c == '_'
+}
+
+fn has_quote(text: [u8]) -> bool {
+    for c in text {
+        if c == '\'' {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- The tables, read ----
+
+fn node(n: i64) -> Node {
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast).
+    // SAFETY: n is a node of the expression being checked or of a function
+    // (0 < n < NODE_COUNT), and the table lives while the program is checked.
+    unsafe { NODES[n] }
+}
+
+fn fn_node(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is CUR_FN, the function being checked (0 <= f < FN_COUNT).
+    unsafe { FNS[f].node }
+}
+
+fn local_type(l: i64) -> i64 {
+    // UNSAFE: LOCALS is the checker's table of locals, a raw pointer.
+    // SAFETY: l is the local an identifier resolved to (its node's y), below
+    // LOCAL_COUNT.
+    unsafe { LOCALS[l].ty }
+}
+
+fn type_info(t: i64) -> Type {
+    // UNSAFE: TYPES is the table of types, a raw pointer.
+    // SAFETY: t is a type made (0 < t < the number of types), a local's or
+    // the one expected.
+    unsafe { TYPES[t] }
+}
+
+fn file_info(f: i64) -> SourceFile {
+    // UNSAFE: FILES is the table of the files read, a raw pointer.
+    // SAFETY: f is file_of_pos's answer, below FILE_COUNT.
+    unsafe { crate::base::FILES[f] }
+}
+
+// The byte at p of the source, 0 outside the current function's file.
+fn src(p: i64) -> u8 {
+    let f = file_info(file_of_pos(fn_start()));
+    if p < f.start || p >= f.end {
+        return 0;
+    }
+    // UNSAFE: SRC is the buffer of every file read, a raw pointer.
+    // SAFETY: f.start <= p < f.end, inside one file's text, which SRC holds
+    // whole.
+    unsafe { crate::base::SRC[p] }
+}
+
+fn src_text(a: i64, b: i64) -> [u8] {
+    let f = file_info(file_of_pos(a));
+    if a < f.start || b > f.end || b < a {
+        return "";
+    }
+    // UNSAFE: SRC is the buffer of every file read, a raw pointer.
+    // SAFETY: f.start <= a <= b <= f.end, one file's text, which SRC holds
+    // whole and keeps while the program is checked.
+    unsafe { crate::base::SRC[a..b] }
+}
+
+fn fn_start() -> i64 {
+    node(fn_node(CUR_FN)).start
+}
+
+fn int_at(v: IntVec, k: i64) -> i64 {
+    // UNSAFE: an IntVec's data is a raw buffer (base::IntVec).
+    // SAFETY: 0 <= k < v.count (the caller's loop).
+    unsafe { v.data[k] }
+}
