@@ -65,12 +65,12 @@ std::gpu::wgsl::builtins	<std>	35
 std::gpu::wgsl::entry	<std>	8
 std::gpu::wgsl::bounds	<std>	10
 std::gpu::wgsl::uniformity	<std>	1
-std::gpu::wgsl::msl	<std>	81
+std::gpu::wgsl::msl	<std>	88
 std::gpu::wgsl::spirv	<std>	1
 std::gpu::wgsl::interp	<std>	89
 std::gpu::wgsl::dump	<std>	12
 std::gpu::wgsl::job	<std>	13
-std::gpu::wgsl::api	<std>	26
+std::gpu::wgsl::api	<std>	30
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
