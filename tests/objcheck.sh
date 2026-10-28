@@ -176,6 +176,14 @@ check() { # <file> <level> <dir> [-g]
     # links, as for examples/gpu's `-l objc`.)
     libs=$(echo " $flags" | grep -o -- ' -[lL] *[^ -][^ ]*' | tr '\n' ' ')
     flags=$(echo " $flags" | sed 's/ -[lL] *[^ -][^ ]*//g')
+    # (0.25.2: a case with `// LINK:` is linked by volec from its
+    # #[link] attributes, which an object does not carry: both links get
+    # every framework and library that std and the program's directory name.)
+    if [ "$(cat "$WORK/directives/$(echo "$f" | tr / _)/link" 2>/dev/null)" = 1 ]; then
+        libs="$libs $(grep -rhoE '#\[link\([^]]*\)\]' "$ROOT/compiler/std" "$(dirname "$f")" --include='*.vl' |
+            grep -oE '(framework|lib) = "[^"]*"' |
+            sed 's/^framework = "\(.*\)"$/-framework \1/; s/^lib = "\(.*\)"$/-l\1/' | sort -u | tr '\n' ' ')"
+    fi
     # (--check-unsafe needs the IR: -O1 for -O0, as tests/run.sh does.)
     case "$o:$flags" in 0:*--check-unsafe*) o=1 ;; esac
     # shellcheck disable=SC2086

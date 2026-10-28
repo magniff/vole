@@ -2577,3 +2577,29 @@ best of 7 wall and fewest instructions, load 2.6 to 3.3:
 On the same input (0.25.0's compiler/src) v0.24.0 peaks at 449 MB at
 -O0 linked and 386 MB in `check`: 0.25.0's -O0 is 27 MB higher, its
 `check` 32 MB lower; the rest is the source's own growth.
+
+### 0.25.2
+
+The release gate (`gate.sh --release --no-x86`, 55:11 wall at load up
+to 90; 0.25's took 54:59 and its pre-release run this time hung for
+2.5 h on a lost jobserver slot, fixed in this release). Every row passed
+but two, both the gate's own:
+- objcheck on macOS: the seven programs on std::gpu and std::window
+  (examples/gpu/*, examples/nes; their cases say `// LINK:`) are linked
+  by volec from their `#[link]` attributes, which an object does not
+  carry, so objcheck's two `cc` links missed the frameworks. Both links
+  now get the frameworks and libraries std and the program name; the 28
+  compilations then give the same programs;
+- chain-fresh: 0.25.1's release never recorded its build2.o in
+  bootstrap/chain-hashes, so the row ran 0.25.1's own suite, whose
+  window tests (the runner before this release's load handling) missed
+  their deadlines at load 88. The rebuilt 0.25.1 was the cache's bytes
+  (bf050f19); with the record added, all 28 rebuilt releases match it.
+Neither fix touches the compiler; both were checked on this run's
+outputs instead of a second gate. The suite 4046 at each level (85
+XFAIL, 1 SKIP without spirv-val), aarch64-linux 3557 at -O0 and -O2,
+threads 8116, incremental 172 series, objcheck 5152 (macOS) and 5124
+(Linux), compiler-memcheck 599, valgrind 299 clean, fuzz-sem with
+`--assign-calls`, every fuzz and ABI row on both systems. compile-cost
+against v0.25.1: a hello world 1.00x, std 1.01x, check of the compiler
+1.07x (std::cli in volec's own command line, unused-import tracking).
