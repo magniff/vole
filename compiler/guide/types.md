@@ -50,9 +50,10 @@ println("");
 ```
 
 Floats are IEEE 754 without fast-math; `1.0 / 0.0` is infinity, and
-`NaN != NaN`. There are no `MIN`/`MAX` constants, no `abs`, `pow` or
-`sqrt` methods: write them, or call C's math functions
-(`import "math.h" as m;`, `unsafe { m::sqrt(x) }`).
+`NaN != NaN`. Floats have Rust's methods and constants (0.25.2.1):
+`x.sqrt()`, `x.sin()`, `x.abs()`, `x.powi(2)`, `a.max(b)`, `f64::EPSILON`,
+`f64::MAX`, `f64::consts::PI` (`volec guide math`), in vole, with no C
+call; integers have none (`i64::MAX` and `MIN` aside).
 
 ## Arrays and slices
 
