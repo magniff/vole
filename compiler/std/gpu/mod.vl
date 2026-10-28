@@ -217,6 +217,90 @@ fn layout_key(entries: [Binding]) -> u64 {
     if h == 0 { 1 } else { h }
 }
 
+// (0.25.2.1) bind_group's checks. A contract's message holds only integers, so bind_group's name the
+// layout's bindings by number: the i-th (-1: none).
+fn layout_at(l: BindLayout, i: i64) -> i64 {
+    if i >= 0 && i < l.count { l.entries[i].binding } else { -1 }
+}
+
+// The first binding at which entries and the layout differ: an entry for
+// a binding the layout lacks, a binding of the layout with no entry or
+// with two; -1 when they fit.
+fn layout_fit(l: BindLayout, entries: [BindEntry]) -> i64 {
+    for e in entries {
+        var n = 0;
+        for k in 0..l.count {
+            if l.entries[k].binding == e.binding { n += 1; }
+        }
+        if n == 0 { return e.binding; }
+    }
+    for k in 0..l.count {
+        var n = 0;
+        for e in entries {
+            if e.binding == l.entries[k].binding { n += 1; }
+        }
+        if n != 1 { return l.entries[k].binding; }
+    }
+    -1
+}
+
+// bind_group's rules for each entry (bind_fault's `rule`).
+const BF_KIND: i64 = 0;
+const BF_UNIFORM: i64 = 1;
+const BF_STORAGE: i64 = 2;
+const BF_MAPPED: i64 = 3;
+const BF_ALIGN: i64 = 4;
+const BF_RANGE: i64 = 5;
+const BF_TEXTURE: i64 = 6;
+const BF_SAMPLER: i64 = 7;
+
+// The first binding whose entry breaks `rule` against the layout's
+// binding (the entries fit the layout: layout_fit); -1: none.
+fn bind_fault(l: BindLayout, entries: [BindEntry], lim: Limits, rule: i64) -> i64 {
+    for k in 0..l.count {
+        let b = l.entries[k];
+        for e in entries {
+            if e.binding != b.binding { continue; }
+            let bad = match e.res {
+                Resource::Buffer(buf, offset, size) => {
+                    let uniform = b.ty == BindingType::Uniform;
+                    let align = if uniform { lim.min_uniform_buffer_offset_alignment }
+                        else { lim.min_storage_buffer_offset_alignment };
+                    let n = if size < 0 { buf.size - offset } else { size };
+                    if rule == BF_KIND { !b.ty.is_buffer() }
+                    else if rule == BF_UNIFORM { uniform && buf.usage & BufferUsage::UNIFORM == 0 }
+                    else if rule == BF_STORAGE {
+                        b.ty.is_buffer() && !uniform && buf.usage & BufferUsage::STORAGE == 0
+                    }
+                    else if rule == BF_MAPPED { buf.mapped }
+                    else if rule == BF_ALIGN { align > 0 && offset % align != 0 }
+                    else if rule == BF_RANGE {
+                        offset < 0 || n < b.min_size || offset + n > buf.size
+                    }
+                    else { false }
+                }
+                Resource::Texture(v) => {
+                    let need = if b.ty
+                        == BindingType::StorageTexture { TextureUsage::STORAGE_BINDING }
+                        else { TextureUsage::TEXTURE_BINDING };
+                    if rule == BF_KIND { !b.ty.is_texture() }
+                    else if rule == BF_TEXTURE { v.usage & need == 0 }
+                    else { false }
+                }
+                Resource::Sampler(s) => {
+                    if rule == BF_KIND { !b.ty.is_sampler() }
+                    else if rule == BF_SAMPLER {
+                        s.comparison != (b.ty == BindingType::ComparisonSampler)
+                    }
+                    else { false }
+                }
+            };
+            if bad { return b.binding; }
+        }
+    }
+    -1
+}
+
 impl Device {
     pub fn limits(self) -> Limits {
         self.limits
@@ -433,6 +517,8 @@ impl Device {
         requires desc.state.target_count >= 0
         && desc.state.target_count <= self.limits.max_color_attachments
         else "gpu.limits: color targets"
+        requires desc.state.target_count > 0 || desc.state.depth.is_some()
+        else "gpu.format: a pipeline with no color target draws only depth: give it a depth state (desc.depth(), or RenderDesc::depth_only)"
         {
         let vs = match desc.vertex.entry(desc.vs, ShaderStage::VERTEX) {
             Some(e) => e,
@@ -516,60 +602,58 @@ impl Device {
     }
 
     /// A bind group for `layout` (from `pipe.bind_layout(i)`): one entry per
-    /// binding of the layout, in any order.
+    /// binding of the layout, in any order. A layout holds the bindings of
+    /// group i that the pipeline's shader module uses: those its entry
+    /// points of the pipeline's stages use, all of them together (a
+    /// binding declared and never used is not in it; one a second entry
+    /// point of the module uses is).
     pub fn bind_group(self, layout: BindLayout, entries: [BindEntry]) -> BindGroup
-        requires entries.len() == layout.count
-        else "gpu.layout: a bind group has one entry for each binding of its layout"
+        requires layout_fit(layout, entries) < 0 || layout.count != 0
+        else f"gpu.layout: the layout of group {layout.group} has no bindings: no entry point of the pipeline's shader module uses one of group {layout.group}, and the bind group has {entries.len()} entries: bind nothing for this group, or use the bindings in the shader"
+        requires layout_fit(layout, entries) < 0 || layout.count != 1
+        else f"gpu.layout: the layout has 1 binding, {layout_at(layout, 0)}, and binding {layout_fit(layout, entries)} of the bind group does not fit it: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        requires layout_fit(layout, entries) < 0 || layout.count != 2
+        else f"gpu.layout: the layout has 2 bindings, {layout_at(layout, 0)} and {layout_at(layout, 1)}, and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        requires layout_fit(layout, entries) < 0 || layout.count != 3
+        else f"gpu.layout: the layout has 3 bindings, {layout_at(layout, 0)}, {layout_at(layout, 1)} and {layout_at(layout, 2)}, and the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        requires layout_fit(layout, entries) < 0
+        else f"gpu.layout: the layout has {layout.count} bindings, the first {layout_at(layout, 0)} (all: pipe.bind_layout(g).entries[i].binding), and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        requires bind_fault(layout, entries, self.limits, BF_KIND) < 0
+        else f"gpu.layout: the resource at binding {bind_fault(layout, entries, self.limits, BF_KIND)} is not of the shader's kind there: gpu::bind (a buffer) for var<uniform> and var<storage>, gpu::bind_texture for a texture, gpu::bind_sampler for a sampler"
+        requires bind_fault(layout, entries, self.limits, BF_UNIFORM) < 0
+        else f"gpu.usage: the buffer at binding {bind_fault(layout, entries, self.limits, BF_UNIFORM)} is a var<uniform> in the shader and was made without BufferUsage::UNIFORM"
+        requires bind_fault(layout, entries, self.limits, BF_STORAGE) < 0
+        else f"gpu.usage: the buffer at binding {bind_fault(layout, entries, self.limits, BF_STORAGE)} is a var<storage> in the shader and was made without BufferUsage::STORAGE"
+        requires bind_fault(layout, entries, self.limits, BF_MAPPED) < 0
+        else f"gpu.state: the buffer at binding {bind_fault(layout, entries, self.limits, BF_MAPPED)} is mapped: unmap it first"
+        requires bind_fault(layout, entries, self.limits, BF_ALIGN) < 0
+        else f"gpu.align: the offset at binding {bind_fault(layout, entries, self.limits, BF_ALIGN)} is not a multiple of the device's alignment (dev.align_uniform(n))"
+        requires bind_fault(layout, entries, self.limits, BF_RANGE) < 0
+        else f"gpu.range: the range at binding {bind_fault(layout, entries, self.limits, BF_RANGE)} reaches past its buffer, or is smaller than the shader's type there"
+        requires bind_fault(layout, entries, self.limits, BF_TEXTURE) < 0
+        else f"gpu.usage: the texture at binding {bind_fault(layout, entries, self.limits, BF_TEXTURE)} was made without TextureUsage::TEXTURE_BINDING (sampled) or STORAGE_BINDING (a storage texture), as the shader uses it"
+        requires bind_fault(layout, entries, self.limits, BF_SAMPLER) < 0
+        else f"gpu.layout: the sampler at binding {bind_fault(layout, entries, self.limits, BF_SAMPLER)} is a comparison sampler where the shader has a plain one, or the reverse (SamplerDesc's compare)"
         {
         var g = N::bind_group_new(self.raw);
         var bytes = GroupBytes::new();
         for k in 0..layout.count {
             let b = layout.entries[k];
-            var found = 0;
             for e in entries {
                 if e.binding != b.binding { continue; }
-                found += 1;
                 match e.res {
                     Resource::Buffer(buf, offset, size) => {
-                        assert(b.ty.is_buffer(),
-                            "gpu.layout: a buffer at a binding that is not one");
-                        let need = if b.ty == BindingType::Uniform { BufferUsage::UNIFORM }
-                            else { BufferUsage::STORAGE };
-                        assert(buf.usage & need != 0, "gpu.usage: a buffer bound as uniform or storage was created without that usage");
-                        assert(!buf.mapped, "gpu.state: the buffer is mapped: unmap it first");
-                        let align = if b.ty
-                            == BindingType::Uniform {
-                            self.limits.min_uniform_buffer_offset_alignment
-                        } else { self.limits.min_storage_buffer_offset_alignment };
-                        assert(offset % align == 0, "gpu.align: a binding's offset is a multiple of the device's alignment (dev.align_uniform(n))");
                         let n = if size < 0 { buf.size - offset } else { size };
-                        assert(offset >= 0 && n >= b.min_size && offset + n <= buf.size, "gpu.range: a binding reaches past its buffer, or is smaller than the shader's");
                         N::bind_group_buffer(&g, b, buf.raw, offset, n);
-                        assert(bytes.count < MAX_SIZES,
-                            "gpu.limits: at most 16 buffers in a bind group");
+                        // (at most 16 bindings in a layout, each given once)
                         bytes.binding[bytes.count] = b.binding;
                         bytes.bytes[bytes.count] = n;
                         bytes.count += 1;
                     }
-                    Resource::Texture(v) => {
-                        assert(b.ty.is_texture(),
-                            "gpu.layout: a texture at a binding that is not one");
-                        let need = if b.ty
-                            == BindingType::StorageTexture { TextureUsage::STORAGE_BINDING }
-                            else { TextureUsage::TEXTURE_BINDING };
-                        assert(v.usage & need != 0,
-                            "gpu.usage: a texture bound without TEXTURE_BINDING or STORAGE_BINDING");
-                        N::bind_group_texture(&g, b, v.raw);
-                    }
-                    Resource::Sampler(s) => {
-                        assert(b.ty.is_sampler(),
-                            "gpu.layout: a sampler at a binding that is not one");
-                        assert(s.comparison == (b.ty == BindingType::ComparisonSampler), "gpu.layout: a comparison sampler where a plain one is bound, or the reverse");
-                        N::bind_group_sampler(&g, b, s.raw);
-                    }
+                    Resource::Texture(v) => N::bind_group_texture(&g, b, v.raw),
+                    Resource::Sampler(s) => N::bind_group_sampler(&g, b, s.raw),
                 }
             }
-            assert(found == 1, "gpu.layout: each binding of the layout is given once");
         }
         BindGroup { raw: g, key: layout.key, bytes: bytes }
     }
@@ -597,7 +681,7 @@ impl Queue {
     /// run (and after the ones submitted before).
     pub fn write_buffer(inout self, buf: Buffer, offset: i64, bytes: [u8])
         requires buf.usage & BufferUsage::COPY_DST != 0
-        else "gpu.usage: write_buffer needs COPY_DST"
+        else f"gpu.usage: write_buffer's buffer ({buf.size} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made"
         requires offset % 4 == 0 && bytes.len() % 4 == 0
         else "gpu.align: write_buffer's offset and size are multiples of 4"
         requires offset >= 0 && offset + bytes.len() <= buf.size
@@ -652,12 +736,29 @@ impl Buffer {
 
     /// The buffer's bytes once the GPU has finished every submitted
     /// command (it waits): a view of the buffer, which cannot be used
-    /// while the view is.
+    /// while the view is. The view lives no longer than the buffer: a
+    /// function may return it when the buffer is its caller's (an inout
+    /// or let parameter), not when the buffer is its own local; then
+    /// return a copy, `map_read_copy_in(dev, gpa)`.
     pub fn map_read(inout self, dev: Device) -> [u8]
-        requires self.usage & BufferUsage::MAP_READ != 0 else "gpu.usage: map_read needs MAP_READ"
-    {
+        requires self.usage & BufferUsage::MAP_READ != 0
+        else f"gpu.usage: map_read's buffer ({self.size} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made"
+        {
         N::device_wait_idle(dev.raw);
         N::map_read(dev.raw, &self.raw)
+    }
+
+    /// The buffer's bytes, as map_read, copied into a new Vec on
+    /// allocator a: they outlive the buffer (return them from the function
+    /// that made it). `gpu::f32s(v.as_slice())` views them as f32s.
+    pub fn map_read_copy_in<A: Allocator>(inout self, dev: Device, a: sink A) -> Vec<u8, A>
+        requires self.usage & BufferUsage::MAP_READ != 0
+        else f"gpu.usage: map_read_copy_in's buffer ({self.size} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made"
+        {
+        N::device_wait_idle(dev.raw);
+        var out: Vec<u8, A> = Vec::with_capacity_in(self.size, a);
+        out.extend_from_slice(N::map_read(dev.raw, &self.raw));
+        out
     }
 
     /// The buffer's bytes to write, once the GPU has finished with it; the
@@ -994,7 +1095,22 @@ impl RenderDesc {
         }
     }
 
-    /// No fragment stage (depth only).
+    /// A depth-only pipeline (a shadow map): the vertex entry `vs`, no
+    /// fragment stage, no color target, a depth test of `format` that
+    /// writes. It draws in a `PassDesc::depth_only` pass.
+    pub fn depth_only(shader: Shader, vs: [u8], format: Format = Format::Depth32Float,
+        compare: Compare = Compare::Less) -> RenderDesc {
+        var d = RenderDesc {
+            vertex: shader, vs: vs, fragment: shader, fs: "", has_fs: false,
+            state: PipelineState::new(Format::Rgba8Unorm),
+        };
+        d.state.target_count = 0;
+        d.state.depth = Some(DepthState { format: format, write: true, compare: compare });
+        d
+    }
+
+    /// No fragment stage and no color target (depth only; with
+    /// `.depth(..)`, or use `RenderDesc::depth_only`).
     pub fn no_fragment(inout self) {
         self.has_fs = false;
         self.state.target_count = 0;
@@ -1148,21 +1264,53 @@ pub struct DepthAttachment {
     pub store: bool,
 }
 
-/// A render pass's attachments: one color target, maybe a depth one
-/// (several color targets: 0.22.x).
+/// A render pass's attachments: color attachments 0..color_count (at
+/// most 8, `@location(i)` of the fragment shader writes the i-th), and
+/// maybe a depth one. A pass has at least one of them: a depth-only pass
+/// (a shadow map) has no color attachment (0.25.2.1).
 pub struct PassDesc {
-    pub color: ColorAttachment,
+    pub colors: [Option<ColorAttachment>; 8],
+    pub color_count: i64,
     pub depth: Option<DepthAttachment>,
 }
 
 impl PassDesc {
     /// One color attachment, cleared to `clear` (or kept: load =
-    /// Load::Keep) and stored.
+    /// Load::Keep) and stored; `.with_color` adds more.
     pub fn color(view: TextureView, clear: Color = Color::black(), load: Load = Load::Clear) -> PassDesc {
+        var colors: [Option<ColorAttachment>; 8] = [None; 8];
+        colors[0] = Some(ColorAttachment { view: view, load: load, clear: clear, store: true });
+        PassDesc { colors: colors, color_count: 1, depth: None }
+    }
+
+    /// No color attachment, only depth: a shadow map's pass, drawn with a
+    /// `RenderDesc::depth_only` pipeline. Stored by default, to be read
+    /// afterwards.
+    pub fn depth_only(view: TextureView, clear: f64 = 1.0, store: bool = true) -> PassDesc {
         PassDesc {
-            color: ColorAttachment { view: view, load: load, clear: clear, store: true },
-            depth: None,
+            colors: [None; 8], color_count: 0,
+            depth: Some(DepthAttachment {
+                view: view, load: Load::Clear, clear: clear, store: store,
+            }),
         }
+    }
+
+    /// Another color attachment, after the ones there: multiple render
+    /// targets (a G-buffer), `PassDesc::color(albedo).with_color(normal)`;
+    /// the fragment shader's `@location(i)` writes the i-th, and the
+    /// pipeline has a target of the same format for each
+    /// (`RenderDesc::target`).
+    pub fn with_color(self, view: TextureView, clear: Color = Color::black(),
+        load: Load = Load::Clear) -> PassDesc
+        requires self.color_count < MAX_COLOR_TARGETS
+        else f"gpu.limits: a pass has at most 8 color attachments; this one has {self.color_count}"
+        {
+        var d = self;
+        d.colors[d.color_count] = Some(ColorAttachment {
+            view: view, load: load, clear: clear, store: true,
+        });
+        d.color_count += 1;
+        d
     }
 
     pub fn with_depth(self, view: TextureView, clear: f64 = 1.0, store: bool = false) -> PassDesc {
@@ -1174,10 +1322,69 @@ impl PassDesc {
     }
 }
 
+// What render_pass checks of a PassDesc's color attachments (the index of
+// the first one that breaks the rule, -1: none): 0, without
+// RENDER_ATTACHMENT; 1, not a renderable color format; 2, of another size
+// than the first attachment (color, else depth).
+fn color_fault(desc: PassDesc, rule: i64) -> i64 {
+    var w = -1;
+    var h = -1;
+    for i in 0..desc.color_count {
+        match desc.colors[i] {
+            Some(c) => {
+                let v = c.view;
+                if rule == 0 && v.usage & TextureUsage::RENDER_ATTACHMENT == 0 { return i; }
+                if rule == 1 && (!v.format.is_renderable() || v.format.is_depth()) { return i; }
+                if w < 0 {
+                    w = v.width;
+                    h = v.height;
+                }
+                if rule == 2 && (v.width != w || v.height != h) { return i; }
+            }
+            None => {}
+        }
+    }
+    -1
+}
+
+// What render_pass checks of the depth attachment: 1, no
+// RENDER_ATTACHMENT; 2, not a depth format; 3, not the color
+// attachments' size; 0, none (or no depth attachment).
+fn depth_attachment_fault(desc: PassDesc) -> i64 {
+    match desc.depth {
+        Some(d) => {
+            if d.view.usage & TextureUsage::RENDER_ATTACHMENT == 0 { return 1; }
+            if !d.view.format.is_depth() { return 2; }
+            if d.view.width != pass_side(desc, false) || d.view.height != pass_side(desc, true) {
+                return 3;
+            }
+            0
+        }
+        None => 0,
+    }
+}
+
+// The width (or height, `height`) of a pass's attachments: the first
+// color one's, else the depth one's.
+fn pass_side(desc: PassDesc, height: bool) -> i64 {
+    if desc.color_count > 0 {
+        match desc.colors[0] {
+            Some(c) => return if height { c.view.height } else { c.view.width },
+            None => {}
+        }
+    }
+    match desc.depth {
+        Some(d) => if height { d.view.height } else { d.view.width },
+        None => 0,
+    }
+}
+
 pub struct RenderPass {
     raw: backend::RenderEncoder,
     binds: Bindings,
-    format: Format,
+    // the color attachments' formats, 0..color_count
+    formats: [Format; 8],
+    color_count: i64,
     depth: Option<Format>,
     width: i64,
     height: i64,
@@ -1194,16 +1401,43 @@ pub struct RenderPass {
     groups: [GroupBytes; 4],
 }
 
+// The first color target of a pipeline whose format differs from the
+// pass's attachment at that index (-1: none; the counts are checked
+// first).
+fn target_fault(formats: [Format; 8], count: i64, st: PipelineState) -> i64 {
+    for i in 0..count {
+        if i < st.target_count && st.targets[i].format != formats[i] { return i; }
+    }
+    -1
+}
+
+// 1 when the pipeline has a depth state the pass has no attachment for,
+// 2 when the formats differ, 0 when they fit.
+fn depth_fault(pass_depth: Option<Format>, st: PipelineState) -> i64 {
+    match st.depth {
+        Some(d) => match pass_depth {
+            Some(f) => if f == d.format { 0 } else { 2 },
+            None => 1,
+        },
+        None => 0,
+    }
+}
+
 impl RenderPass {
-    pub fn set_pipeline(inout self, p: RenderPipeline) {
+    /// The pipeline must fit the pass: a color target for each color
+    /// attachment, of its format and in its order, and a depth state of
+    /// the depth attachment's format when it tests depth.
+    pub fn set_pipeline(inout self, p: RenderPipeline)
+        requires p.state.target_count == self.color_count
+        else f"gpu.format: the pipeline has {p.state.target_count} color targets and the pass {self.color_count} color attachments: give the pipeline one target per attachment, in order (RenderDesc::new's format, then desc.target(format); none: RenderDesc::depth_only), or the pass one attachment per target (PassDesc::color(view).with_color(view2))"
+        requires target_fault(self.formats, self.color_count, p.state) < 0
+        else f"gpu.format: the pipeline's color target {target_fault(self.formats, self.color_count, p.state)} has another format than the pass's color attachment {target_fault(self.formats, self.color_count, p.state)}: the target's format (RenderDesc::new, desc.target) is the texture's (dev.texture)"
+        requires depth_fault(self.depth, p.state) != 1
+        else "gpu.format: the pipeline tests depth (desc.depth) and the pass has no depth attachment: add one (.with_depth(view)), or drop the pipeline's depth state"
+        requires depth_fault(self.depth, p.state) != 2
+        else "gpu.format: the pipeline's depth format differs from the pass's depth attachment"
+        {
         let st = p.state;
-        assert(st.target_count == 1 && st.targets[0].format == self.format,
-            "gpu.format: the pipeline's color target format differs from the pass's");
-        match st.depth {
-            Some(d) => assert(self.depth == Some(d.format),
-                "gpu.format: the pipeline's depth format differs from the pass's"),
-            None => {}
-        }
         self.binds.set_pipeline(p.layouts);
         self.vs_sizes = p.vs_sizes;
         self.fs_sizes = p.fs_sizes;
@@ -1341,26 +1575,43 @@ impl Encoder {
     }
 
     /// Runs f with a render pass into desc's attachments; the pass ends
-    /// when f returns.
+    /// when f returns. Its pipelines fit its attachments (set_pipeline).
     pub fn render_pass<F: FnMut(inout RenderPass)>(inout self, desc: PassDesc, f: sink F)
         requires self.caps.render
         else "gpu.unsupported: this device does not render (dev.caps().render)"
-        requires desc.color.view.usage & TextureUsage::RENDER_ATTACHMENT != 0
-        else "gpu.usage: a render target needs RENDER_ATTACHMENT"
-        requires desc.color.view.format.is_renderable() && !desc.color.view.format.is_depth()
-        else "gpu.format: the color target's format"
+        requires desc.color_count > 0 || desc.depth.is_some()
+        else "gpu.state: a render pass needs a color or a depth attachment (PassDesc::color, PassDesc::depth_only)"
+        requires desc.color_count >= 0 && desc.color_count <= self.limits.max_color_attachments
+        else f"gpu.limits: {desc.color_count} color attachments; the device takes at most {self.limits.max_color_attachments}"
+        requires color_fault(desc, 0) < 0
+        else f"gpu.usage: color attachment {color_fault(desc, 0)} needs a texture made with TextureUsage::RENDER_ATTACHMENT"
+        requires color_fault(desc, 1) < 0
+        else f"gpu.format: color attachment {color_fault(desc, 1)} has a format a pass cannot draw into (a depth format goes in .with_depth)"
+        requires color_fault(desc, 2) < 0
+        else f"gpu.range: color attachment {color_fault(desc, 2)} has another size than attachment 0: a pass's attachments have one size"
+        requires depth_attachment_fault(desc) != 1
+        else "gpu.usage: the depth attachment needs a texture made with TextureUsage::RENDER_ATTACHMENT"
+        requires depth_attachment_fault(desc) != 2
+        else "gpu.format: the depth attachment's texture has no depth format (Format::Depth32Float)"
+        requires depth_attachment_fault(desc) != 3
+        else "gpu.range: the depth attachment's size differs from the color attachments'"
         {
-        let c = desc.color;
         var p = N::pass_new();
-        N::pass_color(&p, 0, c.view.raw, c.load, c.clear, c.store);
+        var formats: [Format; 8] = [Format::Rgba8Unorm; 8];
+        for i in 0..desc.color_count {
+            match desc.colors[i] {
+                Some(c) => {
+                    N::pass_color(&p, i, c.view.raw, c.load, c.clear, c.store);
+                    formats[i] = c.view.format;
+                }
+                None => {}
+            }
+        }
+        let width = pass_side(desc, false);
+        let height = pass_side(desc, true);
         var depth: Option<Format> = None;
         match desc.depth {
             Some(d) => {
-                assert(d.view.usage & TextureUsage::RENDER_ATTACHMENT != 0,
-                    "gpu.usage: a depth target needs RENDER_ATTACHMENT");
-                assert(d.view.format.is_depth(), "gpu.format: the depth target's format");
-                assert(d.view.width == c.view.width && d.view.height == c.view.height,
-                    "gpu.range: the depth target's size differs from the color target's");
                 N::pass_depth(&p, d.view.raw, d.load, d.clear, d.store);
                 depth = Some(d.view.format);
             }
@@ -1369,10 +1620,11 @@ impl Encoder {
         var pass = RenderPass {
             raw: N::begin_render(&self.raw, p),
             binds: Bindings::new(),
-            format: c.view.format,
+            formats: formats,
+            color_count: desc.color_count,
             depth: depth,
-            width: c.view.width,
-            height: c.view.height,
+            width: width,
+            height: height,
             vertex_bytes: [-1; 8],
             index_bytes: 0,
             index_size: 0,
@@ -1390,8 +1642,10 @@ impl Encoder {
     /// Copies size bytes between buffers.
     pub fn copy_buffer(inout self, src: Buffer, src_offset: i64, dst: Buffer,
         dst_offset: i64, size: i64)
-        requires src.usage & BufferUsage::COPY_SRC != 0 && dst.usage & BufferUsage::COPY_DST != 0
-        else "gpu.usage: copy_buffer needs COPY_SRC and COPY_DST"
+        requires src.usage & BufferUsage::COPY_SRC != 0
+        else f"gpu.usage: copy_buffer's source, its first argument (a buffer of {src.size} bytes), was made without BufferUsage::COPY_SRC: add it where that buffer is made (dev.buffer(size, usage | BufferUsage::COPY_SRC))"
+        requires dst.usage & BufferUsage::COPY_DST != 0
+        else f"gpu.usage: copy_buffer's destination, its third argument (a buffer of {dst.size} bytes), was made without BufferUsage::COPY_DST: add it where that buffer is made (dev.buffer(size, usage | BufferUsage::COPY_DST))"
         requires src_offset % 4 == 0 && dst_offset % 4 == 0 && size % 4 == 0
         else "gpu.align: copy offsets and sizes are multiples of 4"
         requires src_offset >= 0 && dst_offset >= 0 && size >= 0 && src_offset + size <= src.size
@@ -1408,8 +1662,9 @@ impl Encoder {
         bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
         layer: i64 = 0)
         requires tex.desc.usage & TextureUsage::COPY_SRC != 0
-        && buf.usage & BufferUsage::COPY_DST != 0
-        else "gpu.usage: the copy needs COPY_SRC on the texture and COPY_DST on the buffer"
+        else "gpu.usage: copy_texture_to_buffer's texture was made without TextureUsage::COPY_SRC: add it in dev.texture(.., usage: ..)"
+        requires buf.usage & BufferUsage::COPY_DST != 0
+        else f"gpu.usage: copy_texture_to_buffer's buffer ({buf.size} bytes) was made without BufferUsage::COPY_DST: add it where that buffer is made"
         requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
         else "gpu.align: bytes_per_row is a multiple of 256"
         requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
@@ -1433,9 +1688,10 @@ impl Encoder {
     pub fn copy_buffer_to_texture(inout self, buf: Buffer, tex: Texture,
         bytes_per_row: i64, offset: i64 = 0, x: i64 = 0, y: i64 = 0, w: i64 = -1, h: i64 = -1,
         layer: i64 = 0)
+        requires buf.usage & BufferUsage::COPY_SRC != 0
+        else f"gpu.usage: copy_buffer_to_texture's buffer ({buf.size} bytes) was made without BufferUsage::COPY_SRC: add it where that buffer is made"
         requires tex.desc.usage & TextureUsage::COPY_DST != 0
-        && buf.usage & BufferUsage::COPY_SRC != 0
-        else "gpu.usage: the copy needs COPY_SRC on the buffer and COPY_DST on the texture"
+        else "gpu.usage: copy_buffer_to_texture's texture was made without TextureUsage::COPY_DST: add it in dev.texture(.., usage: ..)"
         requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
         else "gpu.align: bytes_per_row is a multiple of 256"
         requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
