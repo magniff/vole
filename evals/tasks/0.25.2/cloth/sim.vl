@@ -1,0 +1,244 @@
+// sim.vl: the GPU side. Each frame is SUB substeps; a substep integrates
+// (gravity, wind, damping, the dragged particle), then runs ITERS Jacobi
+// iterations of the distance constraints, which ping-pong between two
+// position buffers, and the sphere and floor are projected in. ITERS is
+// made even so the result always lands in pos_a. Normals come from the
+// final positions, and the frame is drawn from them.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Compare, Format, PassDesc, TextureUsage};
+use std::fmt::format_in;
+use geom::{V3, v3, Camera};
+use shaders::{INTEGRATE, JACOBI, NORMALS, CLOTH, SOLID};
+
+pub const SUB: i64 = 8;
+pub const DT: f64 = 1.0 / 60.0;
+const WIND_ACC: f64 = 7.0;   // the wind's acceleration, along +z
+const DAMP: f64 = 0.9995;     // velocity kept per substep
+
+fn f(x: f64) -> f32 { x as f32 }
+
+pub struct Sim {
+    pub inst: gpu::Instance,
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub n: i64,
+    pub time: f64,
+    pub wind_on: bool,
+    pub grab_index: i64,   // -1: nothing is dragged
+    pub grab_at: V3,
+    pub stretch: f64,
+    pub bend: f64,
+    par: gpu::Buffer,
+    cam: gpu::Buffer,
+    pos_a: gpu::Buffer,
+    pos_b: gpu::Buffer,
+    prev: gpu::Buffer,
+    nrm: gpu::Buffer,
+    rb: gpu::Buffer,
+    integ: gpu::ComputePipeline,
+    jac: gpu::ComputePipeline,
+    norm: gpu::ComputePipeline,
+    g_int: gpu::BindGroup,
+    g_ab: gpu::BindGroup,
+    g_ba: gpu::BindGroup,
+    g_norm: gpu::BindGroup,
+    cloth: gpu::RenderPipeline,
+    solid: gpu::RenderPipeline,
+    g_cloth: gpu::BindGroup,
+    g_solid: gpu::BindGroup,
+}
+
+impl Sim {
+    pub fn new_in(n: i64, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let count = n * n;
+        let bytes = count * 16;
+        let par = dev.buffer(96, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let cam = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let pos_a = dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST);
+        let pos_b = dev.buffer(bytes, BufferUsage::STORAGE);
+        let prev = dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST);
+        let nrm = dev.buffer(bytes, BufferUsage::STORAGE);
+        let rb = dev.buffer(bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+
+        // each shader is bound to a name first: a temporary passed straight
+        // to compute_pipeline has no entry points there (no compute entry point)
+        let integ_sh = dev.shader_wgsl(INTEGRATE)?;
+        let integ = dev.compute_pipeline(integ_sh, "integrate")?;
+        let jac_sh = dev.shader_wgsl(JACOBI)?;
+        let jac = dev.compute_pipeline(jac_sh, "jacobi")?;
+        let norm_sh = dev.shader_wgsl(NORMALS)?;
+        let norm = dev.compute_pipeline(norm_sh, "normals")?;
+        let g_int = dev.bind_group(integ.bind_layout(0),
+            [gpu::bind(0, par), gpu::bind(1, pos_a), gpu::bind(2, prev)][..]);
+        let g_ab = dev.bind_group(jac.bind_layout(0),
+            [gpu::bind(0, par), gpu::bind(1, pos_a), gpu::bind(2, pos_b)][..]);
+        let g_ba = dev.bind_group(jac.bind_layout(0),
+            [gpu::bind(0, par), gpu::bind(1, pos_b), gpu::bind(2, pos_a)][..]);
+        let g_norm = dev.bind_group(norm.bind_layout(0),
+            [gpu::bind(0, par), gpu::bind(1, pos_a), gpu::bind(2, nrm)][..]);
+
+        let cloth_sh = dev.shader_wgsl(CLOTH)?;
+        var cd = gpu::RenderDesc::new(cloth_sh, "cloth_vs", "cloth_fs", Format::Bgra8Unorm);
+        cd.depth(Format::Depth32Float, Compare::Less, true);
+        let cloth = dev.render_pipeline(cd)?;
+        let solid_sh = dev.shader_wgsl(SOLID)?;
+        var sd = gpu::RenderDesc::new(solid_sh, "solid_vs", "solid_fs", Format::Bgra8Unorm);
+        sd.depth(Format::Depth32Float, Compare::Less, true);
+        let solid = dev.render_pipeline(sd)?;
+        let g_cloth = dev.bind_group(cloth.bind_layout(0),
+            [gpu::bind(0, cam), gpu::bind(1, pos_a), gpu::bind(2, nrm)][..]);
+        let g_solid = dev.bind_group(solid.bind_layout(0), [gpu::bind(0, cam)][..]);
+
+        var sim = Sim {
+            inst: inst, dev: dev, queue: queue, n: n, time: 0.0, wind_on: true,
+            grab_index: -1, grab_at: v3(0.0, 0.0, 0.0), stretch: 1.0, bend: 0.6,
+            par: par, cam: cam, pos_a: pos_a, pos_b: pos_b, prev: prev, nrm: nrm, rb: rb,
+            integ: integ, jac: jac, norm: norm, g_int: g_int, g_ab: g_ab, g_ba: g_ba,
+            g_norm: g_norm, cloth: cloth, solid: solid, g_cloth: g_cloth, g_solid: g_solid,
+        };
+        sim.reset(gpa);
+        Ok(sim)
+    }
+
+    // The start state: the sheet hung from its top edge, at rest.
+    pub fn reset(inout self, gpa: Gpa) {
+        let init = geom::initial(self.n, gpa);
+        self.queue.write_buffer(self.pos_a, 0, gpu::bytes_of_f32(init.as_slice()));
+        self.queue.write_buffer(self.prev, 0, gpu::bytes_of_f32(init.as_slice()));
+        self.grab_index = -1;
+        self.time = 0.0;
+    }
+
+    // The uniforms for this frame: the parameters and the camera.
+    pub fn write_uniforms(inout self, cam: Camera, aspect: f64) {
+        let n = self.n;
+        let h = geom::WIDTH / (n - 1) as f64;
+        let on = if self.wind_on { 1.0 } else { 0.0 };
+        let p: [f32; 24] = [
+            f(0.0), f(-9.8), f(0.0), f(DT / SUB as f64),
+            f(0.0), f(0.0), f(WIND_ACC), f(0.0),
+            f(geom::SPH_X), f(geom::SPH_Y), f(geom::SPH_Z), f(geom::SPH_R),
+            f(self.grab_at.x), f(self.grab_at.y), f(self.grab_at.z), f(self.grab_index as f64),
+            f(n as f64), f(h), f(self.stretch), f(self.bend),
+            f(geom::FLOOR), f(DAMP), f(self.time), f(on),
+        ];
+        self.queue.write_buffer(self.par, 0, gpu::bytes_of_f32(p[..]));
+        let vp = geom::to_f32(cam.view_proj(aspect));
+        let e = cam.eye();
+        let c: [f32; 28] = [
+            vp[0], vp[1], vp[2], vp[3], vp[4], vp[5], vp[6], vp[7],
+            vp[8], vp[9], vp[10], vp[11], vp[12], vp[13], vp[14], vp[15],
+            f(e.x), f(e.y), f(e.z), f(n as f64),
+            f(0.4), f(1.0), f(0.6), f(0.0),
+            f(geom::SPH_X), f(geom::SPH_Y), f(geom::SPH_Z), f(geom::SPH_R),
+        ];
+        self.queue.write_buffer(self.cam, 0, gpu::bytes_of_f32(c[..]));
+    }
+
+    // The compute part of one frame, into enc: SUB substeps of integration
+    // and iters Jacobi iterations each, then the normals.
+    pub fn encode_step(inout self, enc: inout gpu::Encoder, iters: i64) {
+        let groups = (self.n * self.n + 63) / 64;
+        let it = iters + iters % 2;
+        enc.compute_pass(|pass| {
+            for _ in 0..SUB {
+                pass.set_pipeline(self.integ);
+                pass.set_bind_group(0, self.g_int);
+                pass.dispatch(groups);
+                for k in 0..it {
+                    pass.set_pipeline(self.jac);
+                    if k % 2 == 0 {
+                        pass.set_bind_group(0, self.g_ab);
+                    } else {
+                        pass.set_bind_group(0, self.g_ba);
+                    }
+                    pass.dispatch(groups);
+                }
+            }
+        });
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.norm);
+            pass.set_bind_group(0, self.g_norm);
+            pass.dispatch(groups);
+        });
+    }
+
+    // One frame of physics, without drawing.
+    pub fn step_frame(inout self, cam: Camera, aspect: f64, iters: i64) {
+        self.write_uniforms(cam, aspect);
+        var enc = self.dev.encoder();
+        self.encode_step(&enc, iters);
+        self.queue.submit(enc.finish());
+        self.time = self.time + DT;
+    }
+
+    // The cloth and the sphere and floor, into a render pass of enc.
+    pub fn encode_draw(self, enc: inout gpu::Encoder, color: gpu::TextureView, depth: gpu::TextureView) {
+        let cells = 6 * (self.n - 1) * (self.n - 1);
+        enc.render_pass(PassDesc::color(color).with_depth(depth, 1.0, false), |pass| {
+            pass.set_pipeline(self.solid);
+            pass.set_bind_group(0, self.g_solid);
+            pass.draw(0..9222, 0..1);
+            pass.set_pipeline(self.cloth);
+            pass.set_bind_group(0, self.g_cloth);
+            pass.draw(0..cells, 0..1);
+        });
+    }
+
+    // Copies the positions (vec4s) to the CPU.
+    pub fn read_pos(inout self, gpa: Gpa) -> Vec<f32> {
+        var enc = self.dev.encoder();
+        enc.copy_buffer(self.pos_a, 0, self.rb, 0, self.n * self.n * 16);
+        self.queue.submit(enc.finish());
+        let bytes = self.rb.map_read(self.dev);
+        let fl = gpu::f32s(bytes);
+        var out: Vec<f32> = Vec::new_in(gpa);
+        for k in 0..fl.len() {
+            out.push(fl[k]);
+        }
+        out
+    }
+
+    // The previous substep's positions (with the inverse masses in w).
+    pub fn read_prev(inout self, gpa: Gpa) -> Vec<f32> {
+        var enc = self.dev.encoder();
+        enc.copy_buffer(self.prev, 0, self.rb, 0, self.n * self.n * 16);
+        self.queue.submit(enc.finish());
+        let bytes = self.rb.map_read(self.dev);
+        let fl = gpu::f32s(bytes);
+        var out: Vec<f32> = Vec::new_in(gpa);
+        for k in 0..fl.len() {
+            out.push(fl[k]);
+        }
+        out
+    }
+
+    // The picture as a binary PPM, w x h pixels (waits for the GPU).
+    pub fn snapshot_in(inout self, cam: Camera, aspect: f64, w: i64, h: i64, gpa: Gpa) -> Buf {
+        self.write_uniforms(cam, aspect);
+        let color = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let depth = self.dev.texture(w, h, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.encode_draw(&enc, color.view(), depth.view());
+        enc.copy_texture_to_buffer(color, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

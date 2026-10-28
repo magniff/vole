@@ -1,0 +1,244 @@
+// The WGSL of sph, compiled at run time by std::gpu::wgsl. sim.vl joins
+// PARAMS, BUFS and one kernel into each compute shader (every kernel has
+// the same bind group layout), and DRAW_BUFS with DRAW into the draw
+// shader. The particles' data lives in storage buffers:
+//   pos, vel, acc (vec2), rho (f32), cell (u32, a particle's cell),
+//   counts (atomic u32 per cell), starts (exclusive prefix sum of counts),
+//   cursor (atomic, a scatter's write slot per cell), order (particles
+//   sorted by cell).
+// Units: metres and seconds; the box is centred on the origin, the grid
+// covers [-1, 1]^2 in cells of side h.
+
+pub const PARAMS: [u8] = "struct Params {\n\
+    n: f32, gx: f32, gy: f32, origin: f32,\n\
+    inv_h: f32, h: f32, h2: f32, mass: f32,\n\
+    rho0: f32, stiff: f32, visc: f32, gravx: f32,\n\
+    gravy: f32, dt: f32, cs: f32, sn: f32,\n\
+    hw: f32, hh: f32, stirx: f32, stiry: f32,\n\
+    stirvx: f32, stirvy: f32, stirr: f32, stiramt: f32,\n\
+    vmax: f32, psize: f32, ext_x: f32, ext_y: f32,\n\
+    pad0: f32, pad1: f32, pad2: f32, pad3: f32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> prm: Params;\n\
+    fn cell_of(p: vec2<f32>) -> u32 {\n\
+    let cx = clamp(i32(floor((p.x - prm.origin) * prm.inv_h)), 0, i32(prm.gx) - 1);\n\
+    let cy = clamp(i32(floor((p.y - prm.origin) * prm.inv_h)), 0, i32(prm.gy) - 1);\n\
+    return u32(cy * i32(prm.gx) + cx);\n\
+    }\n";
+
+pub const BUFS: [u8] = "@group(0) @binding(1) var<storage, read_write> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> vel: array<vec2<f32>>;\n\
+    @group(0) @binding(3) var<storage, read_write> acc: array<vec2<f32>>;\n\
+    @group(0) @binding(4) var<storage, read_write> rho: array<f32>;\n\
+    @group(0) @binding(5) var<storage, read_write> cell: array<u32>;\n\
+    @group(0) @binding(6) var<storage, read_write> counts: array<atomic<u32>>;\n\
+    @group(0) @binding(7) var<storage, read_write> starts: array<u32>;\n\
+    @group(0) @binding(8) var<storage, read_write> cursor: array<atomic<u32>>;\n\
+    @group(0) @binding(9) var<storage, read_write> order: array<u32>;\n";
+
+// counts[c] = 0 for every cell.
+pub const K_CLEAR: [u8] = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let c = id.x;\n\
+    if (c < u32(prm.gx * prm.gy)) { atomicStore(&counts[c], 0u); }\n\
+    }\n";
+
+// Each particle's cell, and one count for it.
+pub const K_BIN: [u8] = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(prm.n)) { return; }\n\
+    let c = cell_of(pos[i]);\n\
+    cell[i] = c;\n\
+    atomicAdd(&counts[c], 1u);\n\
+    }\n";
+
+// The exclusive prefix sum of counts into starts (and cursor), in one
+// workgroup: the cells in tiles of 256, each tile scanned in shared memory
+// (Hillis-Steele) and offset by the total of the tiles before it.
+pub const K_SCAN: [u8] = "var<workgroup> tmp: array<u32, 256>;\n\
+    @compute @workgroup_size(256) fn main(@builtin(local_invocation_id) lid: vec3<u32>) {\n\
+    let t = lid.x;\n\
+    let total = u32(prm.gx * prm.gy);\n\
+    let tiles = (total + 255u) / 256u;\n\
+    var carry: u32 = 0u;\n\
+    for (var tile: u32 = 0u; tile < tiles; tile = tile + 1u) {\n\
+    let idx = tile * 256u + t;\n\
+    var v: u32 = 0u;\n\
+    if (idx < total) { v = atomicLoad(&counts[idx]); }\n\
+    tmp[t] = v;\n\
+    workgroupBarrier();\n\
+    for (var off: u32 = 1u; off < 256u; off = off * 2u) {\n\
+    var add: u32 = 0u;\n\
+    if (t >= off) { add = tmp[t - off]; }\n\
+    workgroupBarrier();\n\
+    tmp[t] = tmp[t] + add;\n\
+    workgroupBarrier();\n\
+    }\n\
+    let excl = tmp[t] - v + carry;\n\
+    if (idx < total) {\n\
+    starts[idx] = excl;\n\
+    atomicStore(&cursor[idx], excl);\n\
+    }\n\
+    workgroupBarrier();\n\
+    carry = carry + tmp[255];\n\
+    workgroupBarrier();\n\
+    }\n\
+    }\n";
+
+// Each particle takes the next slot of its cell: order is sorted by cell.
+pub const K_SCATTER: [u8] = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(prm.n)) { return; }\n\
+    let slot = atomicAdd(&cursor[cell[i]], 1u);\n\
+    order[slot] = i;\n\
+    }\n";
+
+// The density: poly6 over the neighbours in the 3 x 3 cells around.
+pub const K_DENSITY: [u8] = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(prm.n)) { return; }\n\
+    let p = pos[i];\n\
+    let c = cell[i];\n\
+    let cx = i32(c % u32(prm.gx));\n\
+    let cy = i32(c / u32(prm.gx));\n\
+    let h2 = prm.h2;\n\
+    let kp = 4.0 / (3.14159265 * h2 * h2 * h2 * h2);\n\
+    var sum: f32 = 0.0;\n\
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {\n\
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {\n\
+    let nx = cx + dx;\n\
+    let ny = cy + dy;\n\
+    if (nx < 0 || ny < 0 || nx >= i32(prm.gx) || ny >= i32(prm.gy)) { continue; }\n\
+    let nc = u32(ny * i32(prm.gx) + nx);\n\
+    let s = starts[nc];\n\
+    let e = s + atomicLoad(&counts[nc]);\n\
+    for (var k: u32 = s; k < e; k = k + 1u) {\n\
+    let d = p - pos[order[k]];\n\
+    let r2 = dot(d, d);\n\
+    if (r2 < h2) {\n\
+    let t = h2 - r2;\n\
+    sum = sum + t * t * t;\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n\
+    rho[i] = sum * prm.mass * kp;\n\
+    }\n";
+
+// The forces per unit mass: gravity, the symmetric pressure (spiky
+// gradient) and the viscosity (its Laplacian, with the neighbours'
+// velocities), into acc.
+pub const K_FORCE: [u8] = "fn pressure(r: f32) -> f32 {\n\
+    return max(0.0, prm.stiff * (r - prm.rho0)) / (r * r);\n\
+    }\n\
+    @compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(prm.n)) { return; }\n\
+    let p = pos[i];\n\
+    let v = vel[i];\n\
+    let pi = pressure(rho[i]);\n\
+    let c = cell[i];\n\
+    let cx = i32(c % u32(prm.gx));\n\
+    let cy = i32(c / u32(prm.gx));\n\
+    let h = prm.h;\n\
+    let h5 = h * h * h * h * h;\n\
+    let kg = 30.0 / (3.14159265 * h5);\n\
+    let kl = 40.0 / (3.14159265 * h5);\n\
+    var f = vec2<f32>(0.0, 0.0);\n\
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {\n\
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {\n\
+    let nx = cx + dx;\n\
+    let ny = cy + dy;\n\
+    if (nx < 0 || ny < 0 || nx >= i32(prm.gx) || ny >= i32(prm.gy)) { continue; }\n\
+    let nc = u32(ny * i32(prm.gx) + nx);\n\
+    let s = starts[nc];\n\
+    let e = s + atomicLoad(&counts[nc]);\n\
+    for (var k: u32 = s; k < e; k = k + 1u) {\n\
+    let j = order[k];\n\
+    let d = p - pos[j];\n\
+    let r2 = dot(d, d);\n\
+    if (j != i && r2 < prm.h2 && r2 > 1e-14) {\n\
+    let r = sqrt(r2);\n\
+    let q = h - r;\n\
+    let rj = rho[j];\n\
+    let pj = pressure(rj);\n\
+    f = f + d * (prm.mass * (pi + pj) * kg * q * q / r);\n\
+    f = f + (vel[j] - v) * (prm.visc * prm.mass * kl * q / rj);\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n\
+    acc[i] = f + vec2<f32>(prm.gravx, prm.gravy);\n\
+    }\n";
+
+// Semi-implicit Euler, the mouse's stir, then the walls of the tilted box:
+// the particle is moved to the box's frame, clamped there with a bounce,
+// and back.
+pub const K_INTEGRATE: [u8] = "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(prm.n)) { return; }\n\
+    var v = vel[i] + acc[i] * prm.dt;\n\
+    let d = pos[i] - vec2<f32>(prm.stirx, prm.stiry);\n\
+    let r = length(d);\n\
+    if (prm.stirr > 0.0 && r < prm.stirr) {\n\
+    let k = clamp(prm.stiramt * (1.0 - r / prm.stirr), 0.0, 1.0);\n\
+    v = mix(v, vec2<f32>(prm.stirvx, prm.stirvy), k);\n\
+    }\n\
+    var p = pos[i] + v * prm.dt;\n\
+    let c = prm.cs;\n\
+    let s = prm.sn;\n\
+    var lp = vec2<f32>(c * p.x + s * p.y, -s * p.x + c * p.y);\n\
+    var lv = vec2<f32>(c * v.x + s * v.y, -s * v.x + c * v.y);\n\
+    if (lp.x < -prm.hw) { lp.x = -prm.hw; if (lv.x < 0.0) { lv.x = -0.3 * lv.x; } }\n\
+    if (lp.x > prm.hw) { lp.x = prm.hw; if (lv.x > 0.0) { lv.x = -0.3 * lv.x; } }\n\
+    if (lp.y < -prm.hh) { lp.y = -prm.hh; if (lv.y < 0.0) { lv.y = -0.3 * lv.y; } }\n\
+    if (lp.y > prm.hh) { lp.y = prm.hh; if (lv.y > 0.0) { lv.y = -0.3 * lv.y; } }\n\
+    p = vec2<f32>(c * lp.x - s * lp.y, s * lp.x + c * lp.y);\n\
+    v = vec2<f32>(c * lv.x - s * lv.y, s * lv.x + c * lv.y);\n\
+    pos[i] = p;\n\
+    vel[i] = v;\n\
+    }\n";
+
+// The draw shader: a quad per particle (instances 0..n) coloured by speed,
+// then four thin quads for the box's walls (instances n..n+4).
+pub const DRAW_BUFS: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;\n";
+
+pub const DRAW: [u8] = "struct V { @builtin(position) at: vec4<f32>, @location(0) col: vec3<f32>, }\n\
+    fn corner(k: u32) -> vec2<f32> {\n\
+    var l = vec2<f32>(-prm.hw, -prm.hh);\n\
+    if (k == 1u) { l = vec2<f32>(prm.hw, -prm.hh); }\n\
+    if (k == 2u) { l = vec2<f32>(prm.hw, prm.hh); }\n\
+    if (k == 3u) { l = vec2<f32>(-prm.hw, prm.hh); }\n\
+    return vec2<f32>(prm.cs * l.x - prm.sn * l.y, prm.sn * l.x + prm.cs * l.y);\n\
+    }\n\
+    fn ramp(s: f32) -> vec3<f32> {\n\
+    let a = vec3<f32>(0.10, 0.25, 0.80);\n\
+    let b = vec3<f32>(0.20, 0.85, 0.95);\n\
+    let c = vec3<f32>(1.00, 0.90, 0.40);\n\
+    let d = vec3<f32>(0.95, 0.20, 0.15);\n\
+    if (s < 0.33) { return mix(a, b, s / 0.33); }\n\
+    if (s < 0.66) { return mix(b, c, (s - 0.33) / 0.33); }\n\
+    return mix(c, d, clamp((s - 0.66) / 0.34, 0.0, 1.0));\n\
+    }\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> V {\n\
+    var quad = array<vec2<f32>, 6>(vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));\n\
+    let n = u32(prm.n);\n\
+    var world = vec2<f32>(0.0, 0.0);\n\
+    var col = vec3<f32>(0.55, 0.58, 0.62);\n\
+    if (ii < n) {\n\
+    world = pos[ii] + quad[vi] * prm.psize;\n\
+    col = ramp(clamp(length(vel[ii]) / prm.vmax, 0.0, 1.0));\n\
+    } else {\n\
+    let e = ii - n;\n\
+    let a = corner(e);\n\
+    let b = corner((e + 1u) % 4u);\n\
+    let dir = b - a;\n\
+    let nrm = normalize(vec2<f32>(-dir.y, dir.x)) * 0.0035;\n\
+    let t = quad[vi].x * 0.5 + 0.5;\n\
+    world = a + dir * t + nrm * quad[vi].y;\n\
+    }\n\
+    return V(vec4<f32>(world.x / prm.ext_x, world.y / prm.ext_y, 0.0, 1.0), col);\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(v.col, 1.0);\n\
+    }\n";

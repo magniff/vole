@@ -1,0 +1,283 @@
+// geom.vl: the CPU side's maths, in f64. std has no sqrt or trig yet
+// (only C's, behind unsafe), so sqrt is Newton's method and the camera
+// turns by constant steps. Also the cloth's start state, the camera, the
+// pick and the numbers the headless mode checks.
+
+pub const WIDTH: f64 = 2.0;   // the cloth's side at rest
+pub const TOP: f64 = 2.4;     // the height of its top edge
+pub const FLOOR: f64 = 0.0;
+pub const SPH_X: f64 = 0.0;
+pub const SPH_Y: f64 = 0.9;
+pub const SPH_Z: f64 = 0.5;   // in front of the sheet's plane (z = 0), clear of it
+pub const SPH_R: f64 = 0.45;
+pub const TAN_HALF: f64 = 0.36397; // tan(20 degrees): a 40 degree lens
+
+pub fn sqrt64(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0; }
+    var g = x;
+    if g < 1.0 { g = 1.0; }
+    for _ in 0..200 {
+        g = 0.5 * (g + x / g);
+    }
+    g
+}
+
+pub fn near(a: f64, b: f64) -> bool {
+    let d = a - b;
+    d < 1e-9 && d > -1e-9
+}
+
+pub struct V3 { pub x: f64, pub y: f64, pub z: f64 }
+
+pub fn v3(x: f64, y: f64, z: f64) -> V3 {
+    V3 { x: x, y: y, z: z }
+}
+
+impl V3 {
+    pub fn add(self, o: V3) -> V3 { v3(self.x + o.x, self.y + o.y, self.z + o.z) }
+    pub fn sub(self, o: V3) -> V3 { v3(self.x - o.x, self.y - o.y, self.z - o.z) }
+    pub fn scale(self, s: f64) -> V3 { v3(self.x * s, self.y * s, self.z * s) }
+    pub fn dot(self, o: V3) -> f64 { self.x * o.x + self.y * o.y + self.z * o.z }
+    pub fn cross(self, o: V3) -> V3 {
+        v3(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
+    }
+    pub fn len(self) -> f64 { sqrt64(self.dot(self)) }
+    pub fn norm(self) -> V3 {
+        let l = self.len();
+        if l > 0.0 { self.scale(1.0 / l) } else { self }
+    }
+}
+
+// 4x4 matrices are column-major, as WGSL reads them: element (row r,
+// column c) is m[c * 4 + r].
+pub fn mat_mul(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
+    var c = [0.0; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            var sum = 0.0;
+            for k in 0..4 {
+                sum = sum + a[k * 4 + row] * b[col * 4 + k];
+            }
+            c[col * 4 + row] = sum;
+        }
+    }
+    c
+}
+
+pub fn to_f32(m: [f64; 16]) -> [f32; 16] {
+    var r: [f32; 16] = [0.0; 16];
+    for k in 0..16 {
+        r[k] = m[k] as f32;
+    }
+    r
+}
+
+// The camera looks at target from target + off, with a fixed up axis.
+pub struct Camera { pub target: V3, pub off: V3 }
+
+impl Camera {
+    pub fn new() -> Camera {
+        Camera { target: v3(0.0, 1.15, 0.0), off: v3(0.0, 0.35, 4.9) }
+    }
+    pub fn eye(self) -> V3 { self.target.add(self.off) }
+    pub fn forward(self) -> V3 { self.target.sub(self.eye()).norm() }
+    // Turns the camera about the vertical axis: dir is +1 or -1, 0.05 rad.
+    pub fn orbit(inout self, dir: f64) {
+        let c = 0.99875026;
+        let s = 0.04997917 * dir;
+        let o = self.off;
+        self.off = v3(c * o.x + s * o.z, o.y, -s * o.x + c * o.z);
+    }
+    pub fn view_proj(self, aspect: f64) -> [f64; 16] {
+        let e = self.eye();
+        let fw = self.forward();
+        let s = fw.cross(v3(0.0, 1.0, 0.0)).norm();
+        let u = s.cross(fw);
+        let view = [s.x, u.x, -fw.x, 0.0,
+                    s.y, u.y, -fw.y, 0.0,
+                    s.z, u.z, -fw.z, 0.0,
+                    -s.dot(e), -u.dot(e), fw.dot(e), 1.0];
+        // depth 0..1, as Metal clips
+        let near_z = 0.05;
+        let far_z = 60.0;
+        let proj = [1.0 / (TAN_HALF * aspect), 0.0, 0.0, 0.0,
+                    0.0, 1.0 / TAN_HALF, 0.0, 0.0,
+                    0.0, 0.0, far_z / (near_z - far_z), -1.0,
+                    0.0, 0.0, far_z * near_z / (near_z - far_z), 0.0];
+        mat_mul(proj, view)
+    }
+    // The ray through pixel (px, py) of a w x h window: origin and unit direction.
+    pub fn ray(self, px: f64, py: f64, w: f64, h: f64, aspect: f64) -> (V3, V3) {
+        let fw = self.forward();
+        let s = fw.cross(v3(0.0, 1.0, 0.0)).norm();
+        let u = s.cross(fw);
+        let nx = (2.0 * px / w - 1.0) * TAN_HALF * aspect;
+        let ny = (1.0 - 2.0 * py / h) * TAN_HALF;
+        (self.eye(), fw.add(s.scale(nx)).add(u.scale(ny)).norm())
+    }
+}
+
+// Where the ray o + t d meets the plane through p0 with normal n.
+pub fn plane_hit(o: V3, d: V3, p0: V3, n: V3) -> V3 {
+    let den = d.dot(n);
+    if den < 1e-9 && den > -1e-9 { return p0; }
+    let t = p0.sub(o).dot(n) / den;
+    o.add(d.scale(t))
+}
+
+pub fn particle(p: [f32], k: i64) -> V3 {
+    let b = k * 4;
+    v3(p[b] as f64, p[b + 1] as f64, p[b + 2] as f64)
+}
+
+// The free particle nearest the ray (within reach), or -1.
+pub fn pick(p: [f32], n: i64, o: V3, d: V3, reach: f64) -> i64 {
+    var best = -1;
+    var best_d = reach;
+    for k in 0..n * n {
+        if p[k * 4 + 3] > 0.0 {
+            let q = particle(p, k);
+            let t = q.sub(o).dot(d);
+            if t > 0.0 {
+                let dist = q.sub(o.add(d.scale(t))).len();
+                if dist < best_d {
+                    best_d = dist;
+                    best = k;
+                }
+            }
+        }
+    }
+    best
+}
+
+// The start: a vertical sheet in the plane z = 0, hung from its top edge.
+// Two corners of the top row are pinned (inverse mass 0). Each particle
+// is x, y, z, inverse mass.
+pub fn initial(n: i64, gpa: Gpa) -> Vec<f32> {
+    var out: Vec<f32> = Vec::new_in(gpa);
+    let h = WIDTH / (n - 1) as f64;
+    for j in 0..n {
+        for i in 0..n {
+            let x = (i as f64 - (n - 1) as f64 / 2.0) * h;
+            let y = TOP - j as f64 * h;
+            let pinned = j == 0 && (i == 0 || i == n - 1);
+            let w = if pinned { 0.0 } else { 1.0 };
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(0.0);
+            out.push(w as f32);
+        }
+    }
+    out
+}
+
+fn dist(p: [f32], a: i64, b: i64) -> f64 {
+    particle(p, a).sub(particle(p, b)).len()
+}
+
+// at: the particle at the worst edge's start (j * n + i)
+pub struct Strain { pub max: f64, pub mean: f64, pub edges: i64, pub at: i64 }
+
+// The relative stretch |d / rest - 1| of every structural edge (rest h)
+// and bend edge (rest 2h), each counted once.
+pub fn strain(p: [f32], n: i64, h: f64) -> Strain {
+    var mx = 0.0;
+    var at = 0;
+    var sum = 0.0;
+    var cnt = 0;
+    for j in 0..n {
+        for i in 0..n {
+            let a = j * n + i;
+            for k in 0..4 {
+                let di = if k == 0 { 1 } else if k == 2 { 2 } else { 0 };
+                let dj = if k == 1 { 1 } else if k == 3 { 2 } else { 0 };
+                let ii = i + di;
+                let jj = j + dj;
+                if ii < n && jj < n {
+                    let rest = if k < 2 { h } else { 2.0 * h };
+                    let e = dist(p, a, jj * n + ii) / rest - 1.0;
+                    let ae = if e < 0.0 { -e } else { e };
+                    if ae > mx {
+                        mx = ae;
+                        at = a;
+                    }
+                    sum = sum + ae;
+                    cnt = cnt + 1;
+                }
+            }
+        }
+    }
+    Strain { max: mx, mean: sum / cnt as f64, edges: cnt, at: at }
+}
+
+// Kinetic energy (from the last substep's motion, unit mass per free
+// particle) and gravitational potential (g = 9.8).
+pub fn energy(p: [f32], q: [f32], n: i64, dt: f64) -> (f64, f64) {
+    var ke = 0.0;
+    var pe = 0.0;
+    for k in 0..n * n {
+        if p[k * 4 + 3] > 0.0 {
+            let v = particle(p, k).sub(particle(q, k)).scale(1.0 / dt);
+            ke = ke + 0.5 * v.dot(v);
+            pe = pe + 9.8 * particle(p, k).y;
+        }
+    }
+    (ke, pe)
+}
+
+// How many values are NaN or far outside the cloth.
+pub fn bad_count(p: [f32]) -> i64 {
+    var bad = 0;
+    for k in 0..p.len() {
+        let x = p[k];
+        if !(x == x) || x > 1000.0 || x < -1000.0 {
+            bad = bad + 1;
+        }
+    }
+    bad
+}
+
+#[test]
+fn sqrt_is_right() {
+    assert_eq(near(sqrt64(16.0), 4.0), true);
+    assert_eq(sqrt64(2.0) > 1.4142 && sqrt64(2.0) < 1.4143, true);
+}
+
+#[test]
+fn camera_centre_projects_to_the_middle() {
+    let cam = Camera::new();
+    let m = cam.view_proj(1.5);
+    let t = cam.target;
+    let x = m[0] * t.x + m[4] * t.y + m[8] * t.z + m[12];
+    let y = m[1] * t.x + m[5] * t.y + m[9] * t.z + m[13];
+    let w = m[3] * t.x + m[7] * t.y + m[11] * t.z + m[15];
+    assert_eq(near(x / w, 0.0) && near(y / w, 0.0), true);
+}
+
+#[test]
+fn rest_grid_has_no_strain() {
+    // a 2 x 2 grid at rest: 4 structural edges, no bend edges
+    let h = 0.5;
+    let a: [f32; 16] = [0.0, 0.0, 0.0, 1.0,  0.5, 0.0, 0.0, 1.0,  0.0, 0.0, 0.5, 1.0,  0.5, 0.0, 0.5, 1.0];
+    let s = strain(a[..], 2, h);
+    assert_eq(s.max < 1e-6, true);
+    assert_eq(s.edges, 4);
+}
+
+#[test]
+fn stretched_edge_shows_in_strain() {
+    let h = 0.5;
+    // the bottom edge is twice its rest length: relative stretch 1
+    let a: [f32; 16] = [0.0, 0.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,  0.0, 0.5, 0.0, 1.0,  0.5, 0.5, 0.0, 1.0];
+    let s = strain(a[..], 2, h);
+    assert_eq(s.max > 0.99, true);
+    assert_eq(s.at, 0);
+}
+
+#[test]
+fn ray_at_the_middle_picks_the_nearest_particle() {
+    let a: [f32; 16] = [0.0, 0.0, 0.0, 1.0,  0.5, 0.0, 0.0, 1.0,  0.0, 0.5, 0.0, 1.0,  0.5, 0.5, 0.0, 1.0];
+    let o = v3(0.45, 0.02, 5.0);
+    let d = v3(0.0, 0.0, -1.0);
+    assert_eq(pick(a[..], 2, o, d, 0.2), 1);
+}

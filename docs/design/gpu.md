@@ -1161,3 +1161,52 @@ of 60 encodings: Objective-C 256 µs; std::gpu 266 µs (1.04x, goal
 1.5%, goal 3%); wgpu 30.0.1 498 µs (std::gpu 1.9x faster). A program
 that uses neither std::gpu nor std::objc compiles in the same time as on
 release-0.20 (their sections are lazy and gated).
+
+## 0.25.2.1: what the first GPU eval asked for
+
+Ten agents wrote GPU demos with 0.25.2 (evals/tasks/0.25.2/SUMMARY.md).
+What changed in std::gpu for them (no WGSL checking in `volec check`:
+WGSL becomes part of the language later, as a whole feature):
+
+- **Multiple render targets.** `PassDesc` holds up to 8 color
+  attachments (`colors: [Option<ColorAttachment>; 8]`, `color_count`);
+  `PassDesc::color(view)` is the first, as before, and
+  `.with_color(view, clear, load)` adds the next. Metal's backend
+  already took an attachment index (`hal::Render::pass_color(p, i,
+  ..)`): only the public API was one target. `RenderPass::set_pipeline`
+  requires the pipeline's targets to be the pass's attachments, count
+  and format at each index, and its depth state to have a depth
+  attachment (`gpu.format`, naming the counts or the index). A G-buffer
+  is one pass, not one pass a target (deferred drew its geometry three
+  times).
+- **Depth-only passes.** `PassDesc::depth_only(view, clear, store: true)`
+  has no color attachment, and `RenderDesc::depth_only(shader, vs,
+  format, compare)` no fragment stage and no color target; a pipeline
+  with no target and no depth state, and a pass with no attachment at
+  all, are contract failures. Terrain had invented a dummy R8 target for
+  its shadow map.
+- **Errors that name what is wrong.** A contract's message holds only
+  integers (and at most three of them), so they name by number:
+  `gpu.layout` gives the layout's bindings and the first binding that
+  does not fit, and says what a layout is (the bindings the module's
+  entry points in the pipeline's stages use, together); bind_group's
+  per-entry rules (kind, usage, mapped, alignment, range, sampler) moved
+  from asserts in its body, which named a line of std, to requires that
+  name the binding at the caller's line; copy_buffer's `gpu.usage`
+  names the buffer (source or destination, its size) and the usage it
+  lacks; render_pass's checks name the attachment's index. The WGSL
+  error for two variables of one module at one binding says what to do
+  (one module per kernel, or distinct bindings); nothing new is checked.
+- **map_read's lifetime.** The view lives no longer than the buffer: a
+  function returns it only when the buffer is its caller's.
+  `buf.map_read_copy_in(dev, a) -> Vec<u8, A>` copies, for a function
+  that owns its readback buffer.
+- **The guide** (`volec guide gpu`): multiple render targets, depth-only
+  passes, layouts and one module per kernel, WGSL atomics (a deposit
+  and a clear), a compute simulation (ping-pong buffers, per-step
+  uniforms, a check against a CPU reference), and timing: wall time
+  around a submission and its wait, since there are no timestamp
+  queries. `volec guide testing` has "a check must be able to fail".
+- **Tests.** tests/gpu: render_mrt (three formats in one pass, every
+  texel), render_depth_only (the depth test across two draws, every
+  texel), contract_targets, contract_layout, contract_copy.

@@ -1,0 +1,186 @@
+// Qwen3.5-0.8B (text only) on the GPU, in vole.
+//
+//   qwen35                               the chat window (std::window)
+//   qwen35 --headless --check            the reference prompts: ids, logits, greedy text
+//   qwen35 --headless --prompt TEXT [--tokens N] [--chat] [--temp T --top-p P --seed S]
+//                                        the continuation, and the tokens/s
+//                                        (temperature 0, the default, is greedy)
+//   qwen35 --headless --shot FILE.ppm [--say TEXT]   the chat window's picture
+//   qwen35 --frames N [--say TEXT]       the window, quits after N frames (a test)
+//
+// The model folder is model/ (read at run time). tokenizer.vl is the BPE,
+// template.vl the chat turn, weights.vl the safetensors reader, shaders.vl
+// the WGSL kernels, model.vl the GPU side, sample.vl the next token,
+// check.vl the comparison with reference/reference.json, window.vl the chat
+// window (font.vl its font).
+
+mod check;
+mod font;
+mod model;
+mod sample;
+mod shaders;
+mod template;
+mod tokenizer;
+mod weights;
+mod window;
+
+use std::env;
+use std::time::monotonic_now;
+
+use model::Model;
+use sample::{next_token, parse_f64};
+use template::user_turn;
+use tokenizer::Tokenizer;
+
+const MODEL_DIR: [u8] = "model";
+const REFERENCE: [u8] = "reference/reference.json";
+
+// Headless generation: the prompt's ids, then up to n tokens (stopping at an
+// end-of-text token). Prints the text and the speeds.
+fn generate(model: inout Model, tk: Tokenizer, prompt: [u8], n: i64, temp: f64, top_p: f64,
+            seed: u64, gpa: Gpa) -> i32 {
+    let ids = tk.encode(prompt, gpa);
+    if ids.len() == 0 {
+        eprintln("qwen35: empty prompt");
+        return 1;
+    }
+    if ids.len() + n > model::MAXCTX {
+        eprintln(f"qwen35: the prompt and the tokens are more than {model::MAXCTX} positions");
+        return 1;
+    }
+    model.reset();
+    var rng = seed;
+    let t0 = monotonic_now();
+    var pos: i64 = 0;
+    for k in 0..ids.len() {
+        model.step(ids[k], pos, k == ids.len() - 1);
+        pos += 1;
+    }
+    var logits = model.read_logits();
+    let t1 = monotonic_now();
+    var out: Vec<i64> = Vec::new_in(gpa);
+    for _ in 0..n {
+        let next = next_token(logits, temp, top_p, &rng, gpa);
+        out.push(next);
+        if next == tokenizer::IM_END || next == tokenizer::ENDOFTEXT {
+            break;
+        }
+        model.step(next, pos, true);
+        pos += 1;
+        logits = model.read_logits();
+    }
+    let t2 = monotonic_now();
+    let text = tk.decode(out.as_slice(), gpa);
+    print(text.as_slice());
+    println("");
+    let pre = t1.saturating_sub(t0).as_secs_f64();
+    let dec = t2.saturating_sub(t1).as_secs_f64();
+    eprintln(f"prefill: {ids.len()} tokens in {pre:.3} s = {ids.len() as f64 / pre:.1} tokens/s");
+    eprintln(f"decode:  {out.len()} tokens in {dec:.3} s = {out.len() as f64 / dec:.1} tokens/s");
+    0
+}
+
+fn push_str(v: inout Vec<u8>, s: [u8]) {
+    for k in 0..s.len() {
+        v.push(s[k]);
+    }
+}
+
+fn parse_int(s: [u8]) -> i64 {
+    var v: i64 = 0;
+    for k in 0..s.len() {
+        if s[k] >= 48 && s[k] <= 57 {
+            v = v * 10 + (s[k] - 48) as i64;
+        }
+    }
+    v
+}
+
+fn main(gpa: Gpa) -> i32 {
+    var headless = false;
+    var check_mode = false;
+    var chat = false;
+    var prompt: Vec<u8> = Vec::new_in(gpa);
+    var say: Vec<u8> = Vec::new_in(gpa);
+    var shot_path: Vec<u8> = Vec::new_in(gpa);
+    var tokens: i64 = 32;
+    var frames: i64 = 0;
+    var temp: f64 = 0.0;
+    var top_p: f64 = 1.0;
+    var seed: u64 = 88172645463325252;
+    var have_prompt = false;
+    var args = env::args();
+    let _exe = args.next();
+    loop {
+        let a = match args.next() {
+            Some(s) => s,
+            None => break,
+        };
+        if a == "--headless" {
+            headless = true;
+        } else if a == "--check" {
+            check_mode = true;
+        } else if a == "--chat" {
+            chat = true;
+        } else if a == "--prompt" || a == "--say" || a == "--shot" || a == "--temp"
+            || a == "--top-p" || a == "--seed" || a == "--tokens" || a == "--frames" {
+            let s = match args.next() {
+                Some(s) => s,
+                None => return 2,
+            };
+            if a == "--prompt" {
+                push_str(&prompt, s.as_bytes());
+                have_prompt = true;
+            } else if a == "--say" {
+                push_str(&say, s.as_bytes());
+            } else if a == "--shot" {
+                push_str(&shot_path, s.as_bytes());
+            } else if a == "--temp" {
+                temp = parse_f64(s.as_bytes());
+            } else if a == "--top-p" {
+                top_p = parse_f64(s.as_bytes());
+            } else if a == "--seed" {
+                seed = parse_int(s.as_bytes()) as u64;
+            } else if a == "--tokens" {
+                tokens = parse_int(s.as_bytes());
+            } else {
+                frames = parse_int(s.as_bytes());
+            }
+        } else {
+            eprintln(f"qwen35: unknown argument {a}");
+            return 2;
+        }
+    }
+    let tk = match tokenizer::load(MODEL_DIR, gpa) {
+        Some(t) => t,
+        None => {
+            eprintln("qwen35: cannot read the tokenizer in model/");
+            return 1;
+        }
+    };
+    var model = match Model::load(MODEL_DIR, gpa) {
+        Some(m) => m,
+        None => {
+            eprintln("qwen35: cannot load the model from model/ (no GPU?)");
+            return 1;
+        }
+    };
+    if !headless {
+        return window::run(model, tk, frames, say.as_slice(), temp, top_p, seed, gpa);
+    }
+    if shot_path.len() > 0 {
+        return window::shot(model, tk, say.as_slice(), shot_path.as_slice(), temp, top_p, seed, gpa);
+    }
+    if check_mode {
+        return check::run(&model, tk, REFERENCE, gpa);
+    }
+    if !have_prompt {
+        eprintln("qwen35: give --prompt TEXT or --check");
+        return 2;
+    }
+    if chat {
+        let turn = user_turn(prompt.as_slice(), gpa);
+        return generate(&model, tk, turn.as_slice(), tokens, temp, top_p, seed, gpa);
+    }
+    generate(&model, tk, prompt.as_slice(), tokens, temp, top_p, seed, gpa)
+}

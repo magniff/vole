@@ -1,0 +1,249 @@
+// The WGSL of the ocean, one module per kernel. Every number in the
+// uniforms is an f32 (the integer ones are exact below 2^24).
+
+// The parameters of the kernels: grid size n (a power of two, at most
+// 256), log2 n, vertical (the FFT runs down the columns), the RNG seed,
+// the patch's side in metres, the time in seconds, gravity, the choppy
+// factor lambda, the Phillips amplitude, the wind speed and direction.
+pub const COMMON: [u8] = "struct Par {\n\
+    n: f32,\n\
+    log2n: f32,\n\
+    vertical: f32,\n\
+    seed: f32,\n\
+    patch: f32,\n\
+    time: f32,\n\
+    gravity: f32,\n\
+    lambda: f32,\n\
+    amp: f32,\n\
+    wind: f32,\n\
+    wdx: f32,\n\
+    wdz: f32,\n\
+}\n\
+fn signed_index(i: u32, n: u32) -> f32 {\n\
+    if (i < n / 2u) { return f32(i); }\n\
+    return f32(i) - f32(n);\n\
+}\n\
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {\n\
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n\
+}\n";
+
+// h0(k): the Phillips spectrum's amplitude with Gaussian random phases,
+// stored as (re, im, omega, 0) per cell, omega = sqrt(g k).
+pub const INIT: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+@group(0) @binding(1) var<storage, read_write> h0: array<vec4<f32>>;\n\
+fn hash(x0: u32) -> u32 {\n\
+    var x = x0;\n\
+    x = x ^ (x >> 16u);\n\
+    x = x * 0x7feb352du;\n\
+    x = x ^ (x >> 15u);\n\
+    x = x * 0x846ca68bu;\n\
+    x = x ^ (x >> 16u);\n\
+    return x;\n\
+}\n\
+fn unit(h: u32) -> f32 {\n\
+    return (f32(h >> 8u) + 0.5) / 16777216.0;\n\
+}\n\
+@compute @workgroup_size(8, 8)\n\
+fn init(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(P.n);\n\
+    if (id.x >= n || id.y >= n) { return; }\n\
+    let i = id.y * n + id.x;\n\
+    let tau = 6.2831853;\n\
+    let kx = signed_index(id.x, n) * tau / P.patch;\n\
+    let kz = signed_index(id.y, n) * tau / P.patch;\n\
+    let k2 = kx * kx + kz * kz;\n\
+    var amp = 0.0;\n\
+    var omega = 0.0;\n\
+    if (k2 > 0.0) {\n\
+        let k = sqrt(k2);\n\
+        omega = sqrt(P.gravity * k);\n\
+        // Phillips: A exp(-1/(k L)^2) / k^4 * (k^ . w^)^2, L = V^2 / g,\n\
+        // with a small damping of the tiniest waves\n\
+        let l = P.wind * P.wind / P.gravity;\n\
+        let kw = (kx * P.wdx + kz * P.wdz) / k;\n\
+        amp = P.amp * exp(-1.0 / (k2 * l * l)) / (k2 * k2) * kw * kw * exp(-k2 * 1e-6);\n\
+    }\n\
+    let s = sqrt(amp * 0.5);\n\
+    let base = hash(i ^ hash(u32(P.seed)));\n\
+    let u1 = unit(base);\n\
+    let u2 = unit(hash(base + 0x68e31da4u));\n\
+    let r = sqrt(-2.0 * log(u1));\n\
+    let th = tau * u2;\n\
+    h0[i] = vec4<f32>(r * cos(th) * s, r * sin(th) * s, omega, 0.0);\n\
+}\n";
+
+// At time t: H(k) = h0(k) e^{i w t} + conj(h0(-k)) e^{-i w t} (the height
+// spectrum), and the horizontal displacements' spectra -i k/|k| H, times
+// lambda. Written to spec_h = (H, Dx) and spec_z = (Dz, 0) per cell.
+pub const EVOLVE: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+@group(0) @binding(1) var<storage, read> h0: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read_write> spec_h: array<vec4<f32>>;\n\
+@group(0) @binding(3) var<storage, read_write> spec_z: array<vec4<f32>>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn evolve(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(P.n);\n\
+    if (id.x >= n || id.y >= n) { return; }\n\
+    let i = id.y * n + id.x;\n\
+    let j = ((n - id.y) % n) * n + ((n - id.x) % n);\n\
+    let a = h0[i];\n\
+    let b = h0[j];\n\
+    let w = a.z * P.time;\n\
+    let c = cos(w);\n\
+    let s = sin(w);\n\
+    let h = cmul(a.xy, vec2<f32>(c, s)) + cmul(vec2<f32>(b.x, -b.y), vec2<f32>(c, -s));\n\
+    let tau = 6.2831853;\n\
+    let kx = signed_index(id.x, n) * tau / P.patch;\n\
+    let kz = signed_index(id.y, n) * tau / P.patch;\n\
+    let k = sqrt(kx * kx + kz * kz);\n\
+    var dx = vec2<f32>(0.0, 0.0);\n\
+    var dz = vec2<f32>(0.0, 0.0);\n\
+    if (k > 0.0) {\n\
+        // -i * H = (H.y, -H.x)\n\
+        let mi = vec2<f32>(h.y, -h.x);\n\
+        dx = mi * (P.lambda * kx / k);\n\
+        dz = mi * (P.lambda * kz / k);\n\
+    }\n\
+    spec_h[i] = vec4<f32>(h, dx);\n\
+    spec_z[i] = vec4<f32>(dz, 0.0, 0.0);\n\
+}\n";
+
+// The inverse FFT of one line (a row, or a column when vertical > 0.5):
+// one workgroup of 256 threads per line, radix 2 in workgroup memory,
+// unnormalised (sum over k of X_k e^{+2 pi i k x / n}). Both complex
+// numbers of a vec4 are transformed.
+pub const FFT: [u8] = "@group(0) @binding(0) var<uniform> P: Par;\n\
+@group(0) @binding(1) var<storage, read> src: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4<f32>>;\n\
+var<workgroup> buf: array<vec4<f32>, 256>;\n\
+fn at(l: u32, i: u32, n: u32, vert: bool) -> u32 {\n\
+    if (vert) { return i * n + l; }\n\
+    return l * n + i;\n\
+}\n\
+fn bitrev(x: u32, bits: u32) -> u32 {\n\
+    var r = 0u;\n\
+    var v = x;\n\
+    for (var b = 0u; b < bits; b = b + 1u) {\n\
+        r = (r << 1u) | (v & 1u);\n\
+        v = v >> 1u;\n\
+    }\n\
+    return r;\n\
+}\n\
+@compute @workgroup_size(256)\n\
+fn fft(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {\n\
+    let t = lid.x;\n\
+    let n = u32(P.n);\n\
+    let bits = u32(P.log2n);\n\
+    let vert = P.vertical > 0.5;\n\
+    let l = wid.x;\n\
+    if (t < n) { buf[t] = src[at(l, bitrev(t, bits), n, vert)]; }\n\
+    workgroupBarrier();\n\
+    for (var st = 0u; st < bits; st = st + 1u) {\n\
+        let hl = 1u << st;\n\
+        let m = hl << 1u;\n\
+        if (t < n / 2u) {\n\
+            let j = t % hl;\n\
+            let k = (t / hl) * m;\n\
+            let ang = 6.2831853 * f32(j) / f32(m);\n\
+            let w = vec2<f32>(cos(ang), sin(ang));\n\
+            let a = buf[k + j];\n\
+            let b = buf[k + j + hl];\n\
+            let bw = vec4<f32>(cmul(b.xy, w), cmul(b.zw, w));\n\
+            buf[k + j] = a + bw;\n\
+            buf[k + j + hl] = a - bw;\n\
+        }\n\
+        workgroupBarrier();\n\
+    }\n\
+    if (t < n) { dst[at(l, t, n, vert)] = buf[t]; }\n\
+}\n";
+
+// The mesh: each vertex is a grid point displaced by the height and the
+// horizontal displacement, its normal from the displaced neighbours, its
+// foam from the Jacobian of the horizontal mapping. The camera's
+// matrix, eye, sun direction and (n, cell size, time, 0) are in `cam`.
+pub const RENDER: [u8] = "struct Cam {\n\
+    vp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    fwd: vec4<f32>,\n\
+    rgt: vec4<f32>,\n\
+    upv: vec4<f32>,\n\
+    cfg: vec4<f32>,\n\
+}\n\
+@group(0) @binding(0) var<uniform> C: Cam;\n\
+@group(0) @binding(1) var<storage, read> hs: array<vec4<f32>>;\n\
+@group(0) @binding(2) var<storage, read> dzs: array<vec4<f32>>;\n\
+struct Out {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) normal: vec3<f32>,\n\
+    @location(2) foam: f32,\n\
+}\n\
+fn grid_point(ix: i32, iy: i32) -> vec3<f32> {\n\
+    let n = i32(C.cfg.x);\n\
+    let x = (ix + n) % n;\n\
+    let y = (iy + n) % n;\n\
+    let idx = u32(y * n + x);\n\
+    let a = hs[idx];\n\
+    let b = dzs[idx];\n\
+    let cell = C.cfg.y;\n\
+    let base = vec3<f32>(f32(ix - n / 2) * cell, 0.0, f32(iy - n / 2) * cell);\n\
+    return base + vec3<f32>(a.z, a.x, b.x);\n\
+}\n\
+@vertex fn vs(@builtin(vertex_index) vid: u32) -> Out {\n\
+    let n = i32(C.cfg.x);\n\
+    let ix = i32(vid) % n;\n\
+    let iy = i32(vid) / n;\n\
+    let p = grid_point(ix, iy);\n\
+    let tx = grid_point(ix + 1, iy) - grid_point(ix - 1, iy);\n\
+    let tz = grid_point(ix, iy + 1) - grid_point(ix, iy - 1);\n\
+    let nrm = normalize(cross(tz, tx));\n\
+    // 1 on flat water; below 0.5 the surface folds over itself\n\
+    let cell = C.cfg.y;\n\
+    let jac = (tx.x * tz.z - tx.z * tz.x) / (4.0 * cell * cell);\n\
+    let foam = clamp((0.6 - jac) * 2.5, 0.0, 1.0);\n\
+    return Out(C.vp * vec4<f32>(p, 1.0), p, nrm, foam);\n\
+}\n\
+fn sky(r: vec3<f32>, sun: vec3<f32>) -> vec3<f32> {\n\
+    let up = clamp(r.y, 0.0, 1.0);\n\
+    let horizon = vec3<f32>(0.72, 0.80, 0.88);\n\
+    let zenith = vec3<f32>(0.18, 0.38, 0.74);\n\
+    var c = mix(horizon, zenith, pow(up, 0.45));\n\
+    let s = max(dot(r, sun), 0.0);\n\
+    c = c + vec3<f32>(1.0, 0.92, 0.75) * (pow(s, 6.0) * 0.35 + pow(s, 3000.0) * 30.0);\n\
+    return c;\n\
+}\n\
+@fragment fn fs(v: Out) -> @location(0) vec4<f32> {\n\
+    let n = normalize(v.normal);\n\
+    let eye = C.eye.xyz;\n\
+    let to_eye = eye - v.world;\n\
+    let dist = length(to_eye);\n\
+    let view = to_eye / dist;\n\
+    let sun = normalize(C.sun.xyz);\n\
+    let r = reflect(-view, n);\n\
+    let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, view), 0.0), 5.0);\n\
+    let body = vec3<f32>(0.004, 0.045, 0.07);\n\
+    var col = mix(body, sky(r, sun), fres);\n\
+    let h = normalize(sun + view);\n\
+    col = col + vec3<f32>(1.0, 0.95, 0.82) * pow(max(dot(n, h), 0.0), 900.0) * 0.9;\n\
+    col = mix(col, vec3<f32>(0.9, 0.93, 0.95), v.foam * 0.8);\n\
+    let haze = vec3<f32>(0.72, 0.80, 0.88);\n\
+    col = mix(col, haze, smoothstep(90.0, 230.0, dist));\n\
+    return vec4<f32>(col, 1.0);\n\
+}\n\
+// The sky behind the mesh: a full-screen triangle, each pixel's view ray.\n\
+// It writes no depth, so the mesh is drawn over it.\n\
+struct SkyOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) ndc: vec2<f32>,\n\
+}\n\
+@vertex fn sky_vs(@builtin(vertex_index) vid: u32) -> SkyOut {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (vid == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (vid == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return SkyOut(vec4<f32>(p, 0.0, 1.0), p);\n\
+}\n\
+@fragment fn sky_fs(v: SkyOut) -> @location(0) vec4<f32> {\n\
+    let t = C.cfg.z;\n\
+    let dir = normalize(C.fwd.xyz + v.ndc.x * t * C.cfg.w * C.rgt.xyz + v.ndc.y * t * C.upv.xyz);\n\
+    return vec4<f32>(sky(dir, normalize(C.sun.xyz)), 1.0);\n\
+}\n";

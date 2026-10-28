@@ -75,7 +75,9 @@ Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
 `a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
 `index out of bounds: index I, length N` and exits with 101. An array
 has its length too: `a.len()` (0.17), or slice it: `a[..].len()`. A function taking `[T]` gets
-`a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
+`a[..]`, not `a`. An array literal where a slice of numbers goes takes
+its element type (0.25.2.1): `let xs: [u32] = [1, 2, 3];`, `sum([1, 2])`
+for `xs: [u32]`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
 ## Accesses and pointers

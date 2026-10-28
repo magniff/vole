@@ -4,6 +4,11 @@ Tests are written in the language (0.18) and run by `volec test`,
 which builds them at -O0 and at -O2 and compares the two. Other builds
 leave test items out; `check` and the queries see them.
 
+A test that allocates takes the allocator as its parameter, as `main`
+does: `#[test] fn t(gpa: Gpa) { var v = Vec::new_in(gpa); .. }` (there
+is no `Gpa::default()` or `Gpa::new()`; the test runner gives the gpa,
+and checks that the test frees what it allocates).
+
 ## #[test]
 
 ```tach
@@ -54,6 +59,54 @@ fn main() -> i32 {
 - `assert_snapshot(x)` compares `{x:?}` with
   `tests/snapshots/MODULE__TEST__N.snap`; the first run writes it, a
   change fails with the first differing line, `--accept` rewrites it.
+
+## A check must be able to fail
+
+A test, a `--check` mode, a verdict a demo prints: each is worth what it
+can catch. One that passes whatever the code does proves nothing, and
+reporting it as verified misleads. Before trusting a check:
+
+- **Break the code on purpose once and see the check fail.** Flip a
+  sign, drop a term, skip the kernel's write, start a loop one step late;
+  run the check; it must fail. Then undo the break. A check that still
+  passes tests nothing.
+- **Compare with an independent reference**: a CPU version written
+  apart from the code under test, a closed form, a published value;
+  exactly where the arithmetic is exact (integers, a sort, a scan), and
+  within a stated tolerance where it is not. "Not black", "no NaN" and
+  "in range" are smoke tests, not checks of the result.
+- **Check what the clamp or the construction does not already
+  guarantee.** Positions clamped into a box are always inside it, so "no
+  particle escapes" holds by construction: check what the walls must do
+  instead (the velocity reflected, mass conserved). A total the update
+  renormalizes is conserved whatever the physics; a quantity that
+  settles in a few steps "grows" for any run. Ask: what wrong program
+  passes this?
+
+```tach
+// The update clamps x into 0..1.
+fn step(x: f64, v: f64, dt: f64) -> f64 {
+    let y = x + v * dt;
+    if y < 0.0 { 0.0 } else if y > 1.0 { 1.0 } else { y }
+}
+
+// Weak: true for any step that clamps, right or wrong inside.
+#[test]
+fn stays_inside() {
+    assert(step(0.5, 100.0, 1.0) <= 1.0);
+}
+
+// Able to fail: the exact motion where the clamp does not act (break
+// step's `v * dt` into `v` and this fails; stays_inside still passes).
+#[test]
+fn moves_by_v_dt() {
+    assert_eq(step(0.25, 0.5, 0.5), 0.5);
+}
+
+fn main() -> i32 {
+    0
+}
+```
 
 ## #[property]
 

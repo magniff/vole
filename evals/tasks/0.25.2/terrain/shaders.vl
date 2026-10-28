@@ -1,0 +1,170 @@
+// The WGSL of the terrain. The module sources are assembled from parts so
+// the terrain and its shadow pass share one vertex function.
+
+// The noise: fractal value noise, written to a 257 x 257 height buffer.
+pub const NOISE: [u8] = "@group(0) @binding(0) var<storage, read_write> heights: array<f32>;\n\
+fn hash(p: vec2<f32>) -> f32 {\n\
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);\n\
+}\n\
+fn vnoise(p: vec2<f32>) -> f32 {\n\
+    let i = floor(p);\n\
+    let f = fract(p);\n\
+    let w = f * f * (vec2<f32>(3.0, 3.0) - 2.0 * f);\n\
+    let a = hash(i);\n\
+    let b = hash(i + vec2<f32>(1.0, 0.0));\n\
+    let c = hash(i + vec2<f32>(0.0, 1.0));\n\
+    let d = hash(i + vec2<f32>(1.0, 1.0));\n\
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);\n\
+}\n\
+fn fbm(p0: vec2<f32>) -> f32 {\n\
+    var p = p0;\n\
+    var amp = 0.5;\n\
+    var sum = 0.0;\n\
+    var norm = 0.0;\n\
+    for (var i = 0; i < 6; i = i + 1) {\n\
+        sum = sum + amp * vnoise(p);\n\
+        norm = norm + amp;\n\
+        p = mat2x2<f32>(1.6, 1.2, -1.2, 1.6) * p;\n\
+        amp = amp * 0.5;\n\
+    }\n\
+    return sum / norm;\n\
+}\n\
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= 257u || id.y >= 257u) { return; }\n\
+    let p = vec2<f32>(f32(id.x), f32(id.y)) * 0.0125 + vec2<f32>(3.7, 1.1);\n\
+    heights[id.y * 257u + id.x] = fbm(p);\n\
+}\n";
+
+// The uniform block, as the CPU writes it: 48 f32s.
+pub const UNIFORM: [u8] = "struct U {\n\
+    vp: mat4x4<f32>,\n\
+    svp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    fog: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+}\n\
+@group(0) @binding(0) var<uniform> u: U;\n";
+
+// The height buffer and the terrain's vertex geometry. A vertex is a grid
+// point id (its row-major index in the 257 x 257 grid); ids with the skirt
+// flag are the same point dropped down, which hides the cracks between
+// tiles of different level of detail.
+pub const GEOM: [u8] = "@group(0) @binding(1) var<storage, read> heights: array<f32>;\n\
+const W: u32 = 257u;\n\
+const GRID: u32 = 256u;\n\
+const SKIRT_FLAG: u32 = 16777216u;\n\
+const SKIRT_DROP: f32 = 40.0;\n\
+const SCALE: f32 = 90.0;\n\
+const LEVEL: f32 = 0.42;\n\
+struct TP {\n\
+    p: vec3<f32>,\n\
+    n: vec3<f32>,\n\
+}\n\
+fn terrain_point(id: u32) -> TP {\n\
+    let skirt = id >= SKIRT_FLAG;\n\
+    let g = id & (SKIRT_FLAG - 1u);\n\
+    let x = g % W;\n\
+    let z = g / W;\n\
+    let xl = max(x, 1u) - 1u;\n\
+    let xr = min(x + 1u, GRID);\n\
+    let zl = max(z, 1u) - 1u;\n\
+    let zr = min(z + 1u, GRID);\n\
+    let dx = (heights[z * W + xr] - heights[z * W + xl]) * SCALE / f32(xr - xl);\n\
+    let dz = (heights[zr * W + x] - heights[zl * W + x]) * SCALE / f32(zr - zl);\n\
+    var y = (heights[g] - LEVEL) * SCALE;\n\
+    if (skirt) { y = y - SKIRT_DROP; }\n\
+    return TP(vec3<f32>(f32(x), y, f32(z)), normalize(vec3<f32>(-dx, 1.0, -dz)));\n\
+}\n";
+
+// The shadow pass: depth only (its color target is a dummy).
+pub const SHADOW: [u8] = "@vertex fn vs_shadow(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {\n\
+    let t = terrain_point(id);\n\
+    return u.svp * vec4<f32>(t.p, 1.0);\n\
+}\n\
+@fragment fn fs_shadow() -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(1.0, 1.0, 1.0, 1.0);\n\
+}\n";
+
+// The terrain: vertex, then fragment with the shadow map, fog and the
+// materials by height and slope.
+pub const TERRAIN: [u8] = "@group(0) @binding(2) var shadow: texture_depth_2d;\n\
+struct VOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) p: vec3<f32>,\n\
+    @location(1) n: vec3<f32>,\n\
+}\n\
+@vertex fn vs(@builtin(vertex_index) id: u32) -> VOut {\n\
+    let t = terrain_point(id);\n\
+    var o: VOut;\n\
+    o.pos = u.vp * vec4<f32>(t.p, 1.0);\n\
+    o.p = t.p;\n\
+    o.n = t.n;\n\
+    return o;\n\
+}\n\
+fn tap(q: vec2<i32>, z: f32) -> f32 {\n\
+    let size = i32(u.misc.y);\n\
+    let c = clamp(q, vec2<i32>(0, 0), vec2<i32>(size - 1, size - 1));\n\
+    let d = textureLoad(shadow, c, 0);\n\
+    if (z - 0.002 <= d) { return 1.0; }\n\
+    return 0.0;\n\
+}\n\
+fn lit_at(p: vec3<f32>) -> f32 {\n\
+    if (u.misc.z < 0.5) { return 1.0; }\n\
+    let c = u.svp * vec4<f32>(p, 1.0);\n\
+    let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5) * u.misc.y;\n\
+    let b = vec2<i32>(floor(uv));\n\
+    let z = c.z;\n\
+    var s = tap(b + vec2<i32>(-1, -1), z) + tap(b + vec2<i32>(0, -1), z) + tap(b + vec2<i32>(1, -1), z);\n\
+    s = s + tap(b + vec2<i32>(-1, 0), z) + tap(b, z) + tap(b + vec2<i32>(1, 0), z);\n\
+    s = s + tap(b + vec2<i32>(-1, 1), z) + tap(b + vec2<i32>(0, 1), z) + tap(b + vec2<i32>(1, 1), z);\n\
+    return s / 9.0;\n\
+}\n\
+@fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    let n = normalize(v.n);\n\
+    let h = v.p.y;\n\
+    let slope = n.y;\n\
+    let grass = vec3<f32>(0.22, 0.42, 0.13);\n\
+    let rock = vec3<f32>(0.42, 0.39, 0.36);\n\
+    let snow = vec3<f32>(0.93, 0.95, 0.98);\n\
+    let sand = vec3<f32>(0.62, 0.56, 0.38);\n\
+    let rock_amt = 1.0 - smoothstep(0.62, 0.8, slope);\n\
+    let snow_amt = smoothstep(24.0, 30.0, h) * smoothstep(0.7, 0.85, slope);\n\
+    let sand_amt = 1.0 - smoothstep(0.5, 3.0, h);\n\
+    var col = mix(grass, rock, rock_amt);\n\
+    col = mix(col, sand, sand_amt);\n\
+    col = mix(col, snow, snow_amt);\n\
+    let ndl = max(dot(n, u.sun.xyz), 0.0);\n\
+    let lit = lit_at(v.p);\n\
+    let light = vec3<f32>(0.32, 0.36, 0.42) + vec3<f32>(1.0, 0.92, 0.78) * ndl * lit;\n\
+    var c = col * light;\n\
+    let dist = length(v.p - u.eye.xyz);\n\
+    let f = 1.0 - exp(-dist * u.fog.w);\n\
+    c = mix(c, u.fog.xyz, f);\n\
+    return vec4<f32>(c, 1.0);\n\
+}\n";
+
+// The water: a sea-level square over the whole terrain, alpha blended.
+pub const WATER: [u8] = "struct WV {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) p: vec3<f32>,\n\
+}\n\
+@vertex fn vs_water(@builtin(vertex_index) id: u32) -> WV {\n\
+    let k = id % 6u;\n\
+    var cx = -128.0;\n\
+    var cz = -128.0;\n\
+    if (k == 1u || k == 2u || k == 4u) { cx = 384.0; }\n\
+    if (k == 2u || k == 4u || k == 5u) { cz = 384.0; }\n\
+    let p = vec3<f32>(cx, 0.0, cz);\n\
+    return WV(u.vp * vec4<f32>(p, 1.0), p);\n\
+}\n\
+@fragment fn fs_water(v: WV) -> @location(0) vec4<f32> {\n\
+    let view = normalize(u.eye.xyz - v.p);\n\
+    let half_v = normalize(view + u.sun.xyz);\n\
+    let spec = pow(max(half_v.y, 0.0), 300.0);\n\
+    var c = vec3<f32>(0.04, 0.22, 0.30) + vec3<f32>(1.0, 0.95, 0.8) * spec * 0.8;\n\
+    let dist = length(v.p - u.eye.xyz);\n\
+    let f = 1.0 - exp(-dist * u.fog.w);\n\
+    c = mix(c, u.fog.xyz, f);\n\
+    return vec4<f32>(c, 0.82);\n\
+}\n";
