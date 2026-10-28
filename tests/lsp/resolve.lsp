@@ -99,7 +99,7 @@
 < {"jsonrpc":"2.0","id":44,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":16,"character":10},"end":{"line":16,"character":19}}}}
 ## a trait's method through an iterator; through a generic's bound
 > {"jsonrpc":"2.0","id":45,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":21}}}
-< {"jsonrpc":"2.0","id":45,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":599,"character":11},"end":{"line":599,"character":15}}}}
+< {"jsonrpc":"2.0","id":45,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":607,"character":11},"end":{"line":607,"character":15}}}}
 > {"jsonrpc":"2.0","id":46,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":21}}}
 < {"jsonrpc":"2.0","id":46,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn iter(self) -> SliceIter<T>\neffects: none (inferred, of Vec<i64>::iter)\nfeatures: none\n```\n\nIts items, by value (a view: valid until the vector grows or is\nfreed).\n\n`std::Vec::iter` (method)\n"},"range":{"start":{"line":81,"character":21},"end":{"line":81,"character":25}}}}
 > {"jsonrpc":"2.0","id":47,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":28}}}

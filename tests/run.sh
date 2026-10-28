@@ -843,6 +843,11 @@ esac
 case std-own in
     *"$FILTER"*) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
 esac
+# (0.25.2) std's moves checked as a program's (tests/std/moves.sh):
+# category "std-moves".
+case std-moves in
+    *"$FILTER"*) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
+esac
 # (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
 # the golden-image comparison, the directives): category "runner".
 case runner in
@@ -1264,6 +1269,19 @@ case std-own in
         else
             echo "std-own fail" >>"$TALLY"
             { echo "FAIL std-own:"; sed 's/^/    /' "$WORK/std-own.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
+        ;;
+esac
+# std's moves outside its containers (0.25.2, run above): one case,
+# "std-moves".
+case std-moves in
+    *"$FILTER"*)
+        if grep -q '^pass std-moves' "$WORK/std-moves.out"; then
+            echo "std-moves pass" >>"$TALLY"
+        else
+            echo "std-moves fail" >>"$TALLY"
+            { echo "FAIL std-moves:"; sed 's/^/    /' "$WORK/std-moves.out"; } >>"$FAILURES"
         fi
         count=$((count + 1))
         ;;
