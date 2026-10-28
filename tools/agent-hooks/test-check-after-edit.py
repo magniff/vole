@@ -251,7 +251,7 @@ try:
          (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))
     case("a .vl read is not a write", bash_at(prog, "cat util.vl > /dev/null"), None)
     # (0.25.2.2) The 0.25.2.1 eval's agents edited with sed -i, perl -pi and
-    # Python; the hook did not check after them (31 of 34 `changed on disk`
+    # Python; the hook did not check after them (27 of 30 `changed on disk`
     # notices followed such an edit).
     case("sed -i of a .vl", bash_at(prog, "sed -i '' 's/f/g/' util.vl && grep g util.vl")[:2],
          (os.path.join(prog, "util.vl"), os.path.join(prog, "main.vl")))

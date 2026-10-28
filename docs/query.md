@@ -1313,7 +1313,7 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   rewrote is named once after its changes, `the hook rewrote main.vl:
   the 6 changes above, nothing else`: they are all it wrote (the 0.25.2.1
   eval's `changed on disk` notices followed the agents' own `sed -i`,
-  `perl -pi` and Python edits, 31 of 34, and the hook's fixes, 3; no
+  `perl -pi` and Python edits, 27 of 30, and the hook's fixes, 3; no
   formatter runs). Those shell edits of a `.vl` now trigger the check
   too. A file the call left unformatted gets `main.vl is not formatted:
   volec fmt main.vl` once, until it is formatted (`fmt --check`, a few

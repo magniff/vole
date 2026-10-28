@@ -62,7 +62,7 @@ before. Not at a turn's end (turn-end.py).
 are one line, and each file the hook rewrote is named once, after its
 changes: they are all it wrote (no formatter runs; the eval's `changed on
 disk` notices followed the agents' own sed -i, perl -pi and Python
-edits, 31 of 34, and the hook's fixes, 3):
+edits, 27 of 30, and the hook's fixes, 3):
 
     fixed 20 '&mut x' to '&x' (conv.rust) in main.vl: lines 3, 7, ...
     the hook rewrote main.vl: the 20 changes above, nothing else (read it again before an Edit)
