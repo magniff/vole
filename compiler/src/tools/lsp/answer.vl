@@ -20,33 +20,40 @@
 // \t ID` (workspaceSymbol: the query in PATH); each answer goes back as a
 // frame `KIND LENGTH\n` then the JSON message: `r` a response, `n` a
 // notification (publishDiagnostics), `e` (empty) the end of the
-// diagnostics.
+// diagnostics; (0.25.2) `f` the program's files, one path a line, before
+// them.
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDERR, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
-    buf_fmt, buf_int, buf_new, buf_slice, buf_str, cstr,
+    buf_fmt, buf_int, buf_new, buf_slice, buf_str, cstr, sym_text,
 };
 use crate::base::diag::{DIAG_SHORT, diag_records, short_diagnostic};
 use crate::base::json::buf_json_str;
 use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NodeKind, child};
 use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
+use crate::front::cimport::IMPORTED_START;
+use crate::front::cpp::{
+    C_EMIT_AT, C_IMPORT_PATHS, C_IMPORT_POS, C_KEEP_ORIGINS, C_ORIGINS, ctok_place,
+};
+use crate::front::cpp::input::cfile_path;
 use crate::front::effects::{
     ALLOCATORS, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_UNKNOWN,
     EFF_UNSAFE, EFF_VISIBLE, effects_text, fn_effects,
 };
 use crate::front::effects::check::buf_decl;
 use crate::front::effects::why::{effect_name, step_text};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, is_ident_byte};
 use crate::front::modules::file_of_pos;
 use crate::front::types::{FNS, FN_COUNT, buf_type};
 use crate::middle::lower::ssa::HMap;
-use crate::tools::lsp::{TIMING, now_us, write_all};
+use crate::tools::lsp::{C_SOURCES, TIMING, cwd_dir, now_us, write_all};
 use crate::tools::lsp::json::{at_path, str_into};
 use crate::tools::lsp::stdfiles::{
     STD_F, put_segment_path, segment_by_path, segment_from, segment_name, segment_of, segment_to,
     std_files_ready,
 };
 use crate::tools::lsp::words::{attribute_text, bound_text, keyword_text, primitive_text};
+use crate::tools::proc::{buf_cstr, read_file_if};
 use crate::tools::query::{QF_CALL, QF_DEF, QF_USE, parse_digits};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{
@@ -59,7 +66,7 @@ use crate::tools::query::features::put_def_features;
 use crate::tools::query::positions::{line_start, sort_by_position, token_at};
 use crate::tools::query::refs::collect_all_refs;
 use crate::tools::query::show::{put_signature, text_start};
-use crate::tools::query::typeat::{TypedIndex, typed_index, typed_nodes_at, typed_nodes_in};
+use crate::tools::query::typeat::{TypedIndex, typed_index, typed_nodes_in};
 use crate::tools::refactor_mod::local::decl_name_pos;
 
 // The worker's state: how positions are counted, the line starts of every
@@ -113,11 +120,25 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
         OUT_FD = output;
         PROG = c"volec";
         ROOT_GIVEN = root;
+        // (0.25.2) where the declarations imported from C are
+        C_KEEP_ORIGINS = true;
         let t0 = now_us();
         LOADED = load_program(root, 0);
         lap("load", t0);
         let t1 = now_us();
         index_lines();
+        if LOADED {
+            // (0.25.2) the program's files, for the server's notes on the
+            // documents it has none of
+            let files = buf_new();
+            for f in 0..FILE_COUNT {
+                if FILES[f].path[0] != '<' {
+                    buf_str(files, FILES[f].path);
+                    buf_byte(files, '\n');
+                }
+            }
+            send('f', buf_slice(files));
+        }
         publish_diagnostics();
         lap("diagnostics", t1);
         // (what the requests look up, made before the first comes)
@@ -546,6 +567,17 @@ fn token_starting(pos: i64) -> i64 {
 // The text of token t.
 fn tok_text(t: i64) -> [u8] {
     unsafe { SRC[TOKS[t].start..TOKS[t].end] }
+}
+
+// The kind of token t (Eof past the tokens).
+fn tok_kind(t: i64) -> Tok {
+    if t < 0 || t >= TOK_COUNT {
+        return Tok::Eof;
+    }
+    // UNSAFE: the tokens are in TOKS, the lexer's raw array.
+    // SAFETY: 0 <= t < TOK_COUNT (checked above): a token the lexer wrote;
+    // the worker lexes nothing after it read the program, so TOKS stays.
+    unsafe { TOKS[t].kind }
 }
 
 // Whether token kind k is a keyword (`fn`, `let`, `var`, `inout`...; not
@@ -1231,10 +1263,428 @@ fn decl_of_use(n: i64) -> i64 {
     }
 }
 
+// ---- C imports (0.25.2)
+
+// The header read last (its path and text, buffers; -1: none).
+static var HDR_PATH: i64 = -1;
+static var HDR_TEXT: i64 = -1;
+// The most lines of a C declaration a hover shows.
+const C_LINES_MAX: i64 = 12;
+
+// The text of the header at path (empty when it cannot be read), the
+// last one kept.
+fn header_text(path: [u8]) -> [u8] {
+    if HDR_PATH >= 0 && buf_slice(HDR_PATH) == path {
+        return buf_slice(HDR_TEXT);
+    }
+    HDR_PATH = buf_new();
+    buf_bytes(HDR_PATH, path);
+    HDR_TEXT = buf_new();
+    let p = buf_new();
+    buf_bytes(p, path);
+    read_file_if(buf_cstr(p), HDR_TEXT);
+    buf_slice(HDR_TEXT)
+}
+
+// The start of line `line` (from 1) in text, or -1.
+fn text_line(text: [u8], line: i64) -> i64 {
+    var at = 0;
+    var n = 1;
+    while n < line && at < text.len {
+        if text[at] == '\n' {
+            n += 1;
+        }
+        at += 1;
+    }
+    if n == line && at < text.len { at } else { -1 }
+}
+
+// The end of the line starting at `at` in text (its '\n' or the end).
+fn text_line_end(text: [u8], at: i64) -> i64 {
+    var e = at;
+    while e < text.len && text[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+// The absolute path of a header's path p (a buffer): relative ones from
+// the server's directory; `.` and `..` segments taken out (as the editor
+// names the file).
+fn header_path(p: [u8]) -> i64 {
+    let raw = buf_new();
+    if p.len == 0 || p[0] != '/' {
+        buf_bytes(raw, buf_slice(cwd_dir()));
+        buf_byte(raw, '/');
+    }
+    buf_bytes(raw, p);
+    let s = buf_slice(raw);
+    // the segments kept: (start, end) in s, in pairs
+    var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var i = 0;
+    while i < s.len {
+        while i < s.len && s[i] == '/' {
+            i += 1;
+        }
+        var j = i;
+        while j < s.len && s[j] != '/' {
+            j += 1;
+        }
+        let seg = s[i..j];
+        if seg == ".." {
+            if kept.count >= 2 {
+                kept.pop();
+                kept.pop();
+            }
+        } else if seg.len > 0 && seg != "." {
+            kept.push(i);
+            kept.push(j);
+        }
+        i = j;
+    }
+    let b = buf_new();
+    var k = 0;
+    while k + 1 < kept.count {
+        buf_byte(b, '/');
+        buf_bytes(b, s[kept.get(k)..kept.get(k + 1)]);
+        k += 2;
+    }
+    b
+}
+
+// The place (C_ORIGINS) of the declaration imported from C whose vole
+// text holds position pos, or -1.
+fn c_origin_at(pos: i64) -> i64 {
+    let n = C_EMIT_AT.count / 2;
+    if IMPORTED_START < 0 || pos < IMPORTED_START || n == 0
+        || file_of_pos(pos) != file_of_pos(IMPORTED_START) {
+        return -1;
+    }
+    let off = pos - IMPORTED_START;
+    if C_EMIT_AT.get(0) > off {
+        return -1;
+    }
+    // (the last mark at or before off)
+    var lo = 0;
+    var hi = n;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if C_EMIT_AT.get(mid * 2) <= off { lo = mid; } else { hi = mid; }
+    }
+    C_EMIT_AT.get(lo * 2 + 1)
+}
+
+// Where place o's name is: its header's path, its line (from 1), its
+// name; an empty path when it has none.
+fn c_place(o: i64) -> ([u8], i64, [u8]) {
+    let (file, line, text, _) = ctok_place(C_ORIGINS.get(o * 3));
+    if file < 0 {
+        return ("", 0, "");
+    }
+    (cfile_path(file), line, sym_text(text))
+}
+
+// `{"uri":..,"range":..}` of place o: its name on its line of its header.
+fn put_c_location(out: i64, o: i64) -> bool {
+    let (path, line, name) = c_place(o);
+    if path.len == 0 {
+        return false;
+    }
+    // its column: the name as a word on its line
+    let text = header_text(path);
+    let ls = text_line(text, line);
+    var col = 0;
+    var len = 0;
+    if ls >= 0 {
+        let le = text_line_end(text, ls);
+        var i = ls;
+        while i + name.len <= le {
+            let before = i == ls || !is_ident_byte(text[i - 1]);
+            let after = i + name.len == le || !is_ident_byte(text[i + name.len]);
+            if before && after && text[i..i + name.len] == name {
+                col = i - ls;
+                len = name.len;
+                break;
+            }
+            i += 1;
+        }
+    }
+    buf_str(out, c"{\"uri\":\"");
+    put_uri(out, buf_slice(header_path(path)));
+    buf_fmt(out,
+        f"\",\"range\":{{\"start\":{{\"line\":{line - 1},\"character\":{col}}},\"end\":{{\"line\":{line - 1},\"character\":{col + len}}}}}}}");
+    true
+}
+
+// The C files the program is built with, as far as the worker knows (the
+// buffers of their paths, into out): vole.cSources (C_SOURCES), and the
+// C file beside each header the program imports by a relative path
+// (`import "./ring.h"`: ./ring.c, when there is one).
+fn c_source_files(out: inout IntVec) {
+    for i in 0..C_SOURCES.count {
+        out.push(C_SOURCES.get(i));
+    }
+    var i = 0;
+    while i + 1 < C_IMPORT_PATHS.count {
+        let k = C_IMPORT_PATHS.get(i);
+        let p = sym_text(C_IMPORT_PATHS.get(i + 1));
+        i += 2;
+        let t = token_starting(C_IMPORT_POS.get(k));
+        if t < 0 {
+            continue;
+        }
+        let s = tok_text(t);
+        if s.len < 4 || s[1] != '.' || p.len < 2 || p[p.len - 2..p.len] != ".h" {
+            continue;
+        }
+        let c = buf_new();
+        buf_bytes(c, p[0..p.len - 1]);
+        buf_byte(c, 'c');
+        if std::fs::metadata(buf_slice(c)).is_ok() {
+            out.push(c);
+        }
+    }
+}
+
+// Where C function `name` has its body in the C text `text`: the
+// offset of its name, or -1. (A scan, not C's preprocessor: `NAME (...)
+// {` at the file's level, outside comments, strings and directives.)
+fn c_body_at(text: [u8], name: [u8]) -> i64 {
+    var i = 0;
+    var depth = 0;
+    var bol = true;
+    let n = text.len;
+    while i < n {
+        let c = text[i];
+        if c == '\n' {
+            bol = true;
+            i += 1;
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            i += 1;
+        } else if bol && c == '#' {
+            // a directive, with its continued lines
+            while i < n && text[i] != '\n' {
+                if text[i] == '\\' && i + 1 < n && text[i + 1] == '\n' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if c == '/' && i + 1 < n && text[i + 1] == '/' {
+            while i < n && text[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && i + 1 < n && text[i + 1] == '*' {
+            i += 2;
+            while i + 1 < n && !(text[i] == '*' && text[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '"' || c == '\'' {
+            i += 1;
+            while i < n && text[i] != c && text[i] != '\n' {
+                if text[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            bol = false;
+        } else if c == '{' {
+            depth += 1;
+            i += 1;
+            bol = false;
+        } else if c == '}' {
+            depth -= 1;
+            i += 1;
+            bol = false;
+        } else if is_ident_byte(c) && !(c >= '0' && c <= '9') {
+            var j = i;
+            while j < n && is_ident_byte(text[j]) {
+                j += 1;
+            }
+            if depth == 0 && text[i..j] == name {
+                var k = j;
+                while k < n
+                    && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n' || text[k] == '\r') {
+                    k += 1;
+                }
+                if k < n && text[k] == '(' {
+                    var parens = 0;
+                    while k < n {
+                        if text[k] == '(' {
+                            parens += 1;
+                        } else if text[k] == ')' {
+                            parens -= 1;
+                            if parens == 0 {
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    k += 1;
+                    while k < n
+                        && (text[k] == ' ' || text[k] == '\t' || text[k] == '\n' || text[k] == '\r') {
+                        k += 1;
+                    }
+                    if k < n && text[k] == '{' {
+                        return i;
+                    }
+                }
+            }
+            i = j;
+            bol = false;
+        } else {
+            i += 1;
+            bol = false;
+        }
+    }
+    -1
+}
+
+// `,{"uri":..,"range":..}` of each body of C function `name` in the C
+// files the program is built with, onto out; how many.
+fn put_c_bodies(out: i64, name: [u8]) -> i64 {
+    var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    c_source_files(&files);
+    var found = 0;
+    for f in 0..files.count {
+        let path = buf_slice(files.get(f));
+        let text = header_text(path);
+        let at = c_body_at(text, name);
+        if at < 0 {
+            continue;
+        }
+        var line = 0;
+        var ls = 0;
+        for p in 0..at {
+            if text[p] == '\n' {
+                line += 1;
+                ls = p + 1;
+            }
+        }
+        buf_str(out, c",{\"uri\":\"");
+        put_uri(out, buf_slice(header_path(path)));
+        buf_fmt(out,
+            f"\",\"range\":{{\"start\":{{\"line\":{line},\"character\":{at - ls}}},\"end\":{{\"line\":{line},\"character\":{at - ls + name.len}}}}}}}");
+        found += 1;
+    }
+    found
+}
+
+// The `import` whose header's string starts at start: the header's path,
+// else empty.
+fn import_header_at(start: i64) -> [u8] {
+    let t = token_starting(start);
+    if t <= 0 || tok_kind(t) != Tok::Str || tok_kind(t - 1) != Tok::Import {
+        return "";
+    }
+    for k in 0..C_IMPORT_POS.count {
+        if C_IMPORT_POS.get(k) == start {
+            var i = 0;
+            while i + 1 < C_IMPORT_PATHS.count {
+                if C_IMPORT_PATHS.get(i) == k {
+                    return sym_text(C_IMPORT_PATHS.get(i + 1));
+                }
+                i += 2;
+            }
+        }
+    }
+    ""
+}
+
+// The C declaration of place o, as its header writes it (at most
+// C_LINES_MAX lines; a macro with its continued lines), then where it is.
+fn put_c_decl(md: i64, o: i64) {
+    let (path, name_line, _) = c_place(o);
+    if path.len == 0 {
+        return;
+    }
+    var first = C_ORIGINS.get(o * 3 + 1);
+    var last = C_ORIGINS.get(o * 3 + 2);
+    if first <= 0 {
+        first = name_line;
+        last = first;
+    }
+    let text = header_text(path);
+    var at = text_line(text, first);
+    if at < 0 {
+        return;
+    }
+    buf_str(md, c"```c\n");
+    var line = first;
+    var shown = 0;
+    loop {
+        let e = text_line_end(text, at);
+        var t = e;
+        while t > at && (text[t - 1] == ' ' || text[t - 1] == '\t' || text[t - 1] == '\r') {
+            t -= 1;
+        }
+        if shown == C_LINES_MAX {
+            buf_str(md, c"...\n");
+            break;
+        }
+        buf_bytes(md, text[at..t]);
+        buf_byte(md, '\n');
+        shown += 1;
+        let continued = t > at && text[t - 1] == '\\';
+        if line >= last && !continued || e >= text.len {
+            break;
+        }
+        line += 1;
+        at = e + 1;
+    }
+    buf_str(md, c"```\n");
+    var k = path.len;
+    while k > 0 && path[k - 1] != '/' {
+        k -= 1;
+    }
+    buf_str(md, c"declared in `");
+    buf_bytes(md, path[k..path.len]);
+    buf_fmt(md, f":{name_line}` (C)\n");
+}
+
+// (0.25.2) A definition at a C import: the string of `import "h.h" as c;`
+// at start (the header it reads), or the declaration imported from C
+// whose name is at name_pos (-1: none; is_fn: a function): where its
+// header has it, a function's bodies in the program's C files first.
+// False when start is neither.
+fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool) -> bool {
+    let header = if start >= 0 { import_header_at(start) } else { "" };
+    if header.len > 0 {
+        buf_str(out, c"{\"uri\":\"");
+        put_uri(out, buf_slice(header_path(header)));
+        buf_str(out, c"\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}");
+        return true;
+    }
+    let o = if name_pos >= 0 { c_origin_at(name_pos) } else { -1 };
+    let loc = buf_new();
+    if o < 0 || !put_c_location(loc, o) {
+        return false;
+    }
+    let (_, _, name) = c_place(o);
+    let bodies = buf_new();
+    let n = if is_fn { put_c_bodies(bodies, name) } else { 0 };
+    if n == 0 {
+        buf_bytes(out, buf_slice(loc));
+    } else {
+        buf_byte(out, '[');
+        buf_bytes(out, buf_slice(bodies)[1..buf_slice(bodies).len]);
+        buf_byte(out, ',');
+        buf_bytes(out, buf_slice(loc));
+        buf_byte(out, ']');
+    }
+    true
+}
+
 fn put_definition(out: i64, pos: i64) {
     unsafe {
         let start = token_start(pos);
         let d = def_named_at(start);
+        // (0.25.2) at a C import: the header, the declaration in it
+        let name_pos = if d >= 0 { DEFS[d].name_pos } else { -1 };
+        if put_c_definition(out, start, name_pos, d >= 0 && DEFS[d].kind == K_FN) {
+            return;
+        }
         if d >= 0 {
             if located(DEFS[d].name_pos) {
                 put_location(out, DEFS[d].name_pos);
@@ -1632,10 +2082,20 @@ pub fn hover_def(md: i64, d: i64, inst: i64) {
             }
         }
         buf_str(md, c"```\n");
-        if why >= 0 && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
+        // (0.25.2) imported from C: the declaration in its header (its
+        // effects have no reasons in the program)
+        let o = c_origin_at(DEFS[d].name_pos);
+        if o >= 0 {
+            put_c_decl(md, o);
+        }
+        if why >= 0 && o < 0
+            && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
             put_why_lines(md, why);
         }
-        put_doc(md, d);
+        if o < 0 {
+            // (an import's comment is volec's, not the header's)
+            put_doc(md, d);
+        }
         buf_str(md, c"\n`");
         buf_bytes(md, SYMS[DEFS[d].fqn].text);
         buf_str(md, c"` (");
@@ -1836,6 +2296,20 @@ fn hover_at(md: i64, pos: i64, start: i64) -> bool {
         }
         if is_keyword(kind) {
             return false;
+        }
+        let header = import_header_at(start);
+        if header.len > 0 {
+            // (0.25.2) the string of `import "h.h" as c;`: the header
+            let name = text[1..text.len - 1];
+            let relative = name.len > 1 && name[0] == '.' && (name[1] == '/' || name[1] == '.');
+            buf_str(md, c"```c\n#include ");
+            buf_byte(md, if relative { '"' } else { '<' });
+            buf_bytes(md, name);
+            buf_byte(md, if relative { '"' } else { '>' });
+            buf_str(md, c"\n```\n`");
+            buf_bytes(md, buf_slice(header_path(header)));
+            buf_str(md, c"` (the header this import reads)\n");
+            return true;
         }
         let d = def_named_at(start);
         if d >= 0 {

@@ -1,6 +1,7 @@
 // The extension's manifest (npm run test:package): vole is the default
 // formatter of .vl files, they are formatted on save, indented by four
-// spaces; the language, the grammar and the client's entry point exist.
+// spaces; the language, the grammar and the client's entry point exist;
+// (0.25.2) the C settings are given to the server.
 // Plain node, no dependencies.
 
 "use strict";
@@ -26,6 +27,16 @@ for (const g of pkg.contributes.grammars) {
   assert.ok(fs.existsSync(path.join(root, g.path)), `grammar ${g.path}`);
 }
 assert.ok(fs.existsSync(path.join(root, "src", "extension.ts")), "the client");
+// (0.25.2) the project's C settings, arrays of paths
+const props = pkg.contributes.configuration.properties;
+for (const key of ["vole.includePaths", "vole.cSources"]) {
+  assert.ok(props[key], key);
+  assert.strictEqual(props[key].type, "array", `${key} is an array`);
+  assert.deepStrictEqual(props[key].default, [], `${key} is empty by default`);
+}
+const client = fs.readFileSync(path.join(root, "src", "extension.ts"), "utf8");
+assert.match(client, /initializationOptions: projectSettings\(config\)/, "the settings at the start");
+assert.match(client, /configurationSection: "vole"/, "and when they change");
 assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
 
 console.log(`ok: package.json (${id} ${pkg.version})`);
