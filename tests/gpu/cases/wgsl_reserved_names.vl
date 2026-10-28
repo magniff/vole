@@ -1,0 +1,182 @@
+// Every name MSL keeps for itself (std::gpu::wgsl::msl's RESERVED and
+// type families: macros, typedefs like `quad` and `float4`, keywords) that
+// the WGSL front end accepts is a usable identifier: four shaders use each
+// as a function, a parameter and a local, a struct and its member, a
+// private global, and a compute entry point; Metal compiles them, they
+// compute what the interpreter would, and every entry point is found by
+// its WGSL name. Names that escaping could map together (`quad`,
+// `quad_`, `_quad`, `u_quad_`) are there too.
+// EXPECT: names ok
+// EXPECT: functions ok
+// EXPECT: structs ok
+// EXPECT: globals ok
+// EXPECT: entries ok
+// NO-LEAKS: a long shader; leaks is run by the other wgsl cases
+
+use std::gpu;
+use std::gpu::{BufferUsage, wgsl};
+use std::gpu::wgsl::msl;
+
+const EXTRA: [[u8]; 8] = ["quad_", "_quad", "u_quad_", "_quad_", "uu_quad_", "float4_", "x_1", "q"];
+
+// Whether the front end takes n as a function, struct, member and local.
+fn accepted(n: [u8], gpa: Gpa) -> bool {
+    var src = Buf::new_in(gpa);
+    src.push_fmt(
+        f"struct {n} {{ {n}: f32 }}\nfn f(x: f32) -> f32 {{ let {n} = x; return {n}; }}\n");
+    src.push_fmt(f"fn g(x: {n}) -> f32 {{ return x.{n}; }}\n");
+    var code = Buf::new_in(gpa);
+    var refl = wgsl::new_reflection(gpa);
+    var err = wgsl::new_error(gpa);
+    if !wgsl::translate(src.as_slice(), wgsl::options(wgsl::TARGET_CHECK), &code, &refl, &err, gpa) {
+        return false;
+    }
+    var src2 = Buf::new_in(gpa);
+    src2.push_fmt(
+        f"var<private> {n}: f32;\n@compute @workgroup_size(1) fn {n}2() {{ {n} = 1.0; }}\n");
+    src2.push_fmt(f"fn h({n}: f32) -> f32 {{ return {n}; }}\n");
+    wgsl::translate(src2.as_slice(), wgsl::options(wgsl::TARGET_CHECK), &code, &refl, &err, gpa)
+}
+
+const HEAD: [u8] = "@group(0) @binding(0) var<storage, read_write> xs: array<f32>;\n";
+
+// A shader's result, xs[0], after one dispatch of its entry `run`.
+fn run(dev: gpu::Device, queue: inout gpu::Queue, src: [u8], gpa: Gpa) -> f32 {
+    let shader = match dev.shader_wgsl(src) {
+        Ok(s) => s,
+        Err(e) => {
+            let m = format_in(f"{e}", gpa);
+            println(f"shader: {m.as_slice()[0..std::min(m.len(), 400)]}");
+            return -1.0;
+        }
+    };
+    let pipe = dev.compute_pipeline(shader, "run").unwrap();
+    var buf = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
+    var enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch(1);
+    });
+    queue.submit(enc.finish());
+    gpu::f32s(buf.map_read(dev))[0]
+}
+
+fn report(what: [u8], got: f32, want: i64) {
+    if got == want as f32 {
+        println(f"{what} ok");
+    } else {
+        println(f"{what}: {got}, want {want}");
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    // the names: every reserved one the front end takes, and EXTRA
+    var names: Vec<Buf> = Vec::new_in(gpa);
+    var nb = Buf::new_in(gpa);
+    var rejected = 0;
+    for i in 0..msl::reserved_count() {
+        msl::reserved_name(i, &nb);
+        if !msl::is_reserved(nb.as_slice()) || nb.as_slice()[nb.len() - 1] == '_' {
+            println(f"table: {nb.as_slice()}");
+        }
+        // (the families' bare bases are C++ keywords too: once)
+        var seen = false;
+        for k in 0..names.len() {
+            if names[k].as_slice() == nb.as_slice() {
+                seen = true;
+            }
+        }
+        if seen {
+            continue;
+        }
+        if accepted(nb.as_slice(), gpa) {
+            names.push(Buf::from_in(nb.as_slice(), gpa));
+        } else {
+            rejected += 1;
+        }
+    }
+    for e in EXTRA {
+        names.push(Buf::from_in(e, gpa));
+    }
+    // most are WGSL identifiers (the front end rejects its own keywords)
+    if names.len() > 1500 && rejected < 100 {
+        println("names ok");
+    } else {
+        println(f"names: {names.len()} taken, {rejected} rejected");
+    }
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter().unwrap().device().unwrap();
+    let count = names.len();
+
+    // functions, parameters, locals: each fn adds 1
+    var f = Buf::from_in(HEAD, gpa);
+    for i in 0..count {
+        let n = names[i].as_slice();
+        f.push_fmt(f"fn {n}(x: f32) -> f32 {{ return x + 1.0; }}\n");
+        f.push_fmt(
+            f"fn h{i}({n}: f32) -> f32 {{ var r = {n}; {{ let {n} = r * 1.0; r = {n}; }} return r; }}\n");
+    }
+    f.push_str("@compute @workgroup_size(1) fn run() {\n    var acc = 0.0;\n");
+    for i in 0..count {
+        f.push_fmt(f"    acc = h{i}({names[i].as_slice()}(acc));\n");
+    }
+    f.push_str("    xs[0] = acc;\n}\n");
+    report("functions", run(dev, &queue, f.as_slice(), gpa), count);
+
+    // structs and their members, a local of each struct's name after it
+    var s = Buf::from_in(HEAD, gpa);
+    for i in 0..count {
+        let n = names[i].as_slice();
+        s.push_fmt(f"struct {n} {{ {n}: f32, v: vec3<f32> }}\n");
+        // (a function each: Metal compiles one long body far slower)
+        s.push_fmt(
+            f"fn u{i}() -> f32 {{ var s: {n}; s.{n} = 1.0; let {n} = s.{n} + s.v.x; var t = s; t.v = vec3<f32>({n}); return t.v.y; }}\n");
+    }
+    s.push_str("@compute @workgroup_size(1) fn run() {\n    var acc = 0.0;\n");
+    for i in 0..count {
+        s.push_fmt(f"    acc = acc + u{i}();\n");
+    }
+    s.push_str("    xs[0] = acc;\n}\n");
+    report("structs", run(dev, &queue, s.as_slice(), gpa), count);
+
+    // private globals
+    var g = Buf::from_in(HEAD, gpa);
+    for i in 0..count {
+        g.push_fmt(f"var<private> {names[i].as_slice()}: f32 = 1.0;\n");
+    }
+    g.push_str("@compute @workgroup_size(1) fn run() {\n    var acc = 0.0;\n");
+    for i in 0..count {
+        g.push_fmt(f"    acc = acc + {names[i].as_slice()};\n");
+    }
+    g.push_str("    xs[0] = acc;\n}\n");
+    report("globals", run(dev, &queue, g.as_slice(), gpa), count);
+
+    // entry points, found by their WGSL names
+    var e = Buf::from_in(HEAD, gpa);
+    for i in 0..count {
+        e.push_fmt(
+            f"@compute @workgroup_size(1) fn {names[i].as_slice()}() {{ xs[0] = {i}.0; }}\n");
+    }
+    match dev.shader_wgsl(e.as_slice()) {
+        Ok(shader) => {
+            var missing = 0;
+            for i in 0..count {
+                match dev.compute_pipeline(shader, names[i].as_slice()) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        missing += 1;
+                    }
+                }
+            }
+            if missing == 0 { println("entries ok"); }
+            else { println(f"entries: {missing} missing"); }
+        }
+        Err(err) => {
+            let m = format_in(f"{err}", gpa);
+            println(f"entries: {m.as_slice()[0..std::min(m.len(), 400)]}");
+        }
+    }
+    0
+}
