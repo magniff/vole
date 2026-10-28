@@ -1,0 +1,274 @@
+// The WGSL of the renderer, compiled at run time by std::gpu::wgsl.
+// Each pipeline's module is COMMON (the uniform and the object and light
+// records) followed by the kernel's own bindings and entry points.
+//
+// The frame: update (lights and objects move), cull (one workgroup per
+// 16 x 16 tile lists the lights that may touch it), geometry into three
+// G-buffers (albedo, normal, world position + view depth), lighting (each
+// pixel loops over its tile's lights), then the view pass: tone mapping,
+// or one G-buffer as the picture.
+//
+// Keep the constants in step with scene.vl: TILE, MAXL and the layouts.
+
+// Clip space of the camera in scene.vl: a right-handed view down -z.
+// proj = (P00, P11, A, B): clip = (P00 x, P11 y, A z + B, -z).
+pub const COMMON: [u8] = "struct G {\n\
+    vmat: mat4x4<f32>,\n\
+    proj: vec4<f32>,\n\
+    screen: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+}\n\
+struct Light {\n\
+    base: vec4<f32>,\n\
+    motion: vec4<f32>,\n\
+    color: vec4<f32>,\n\
+    pos: vec4<f32>,\n\
+}\n\
+struct Obj {\n\
+    home: vec4<f32>,\n\
+    scale: vec4<f32>,\n\
+    color: vec4<f32>,\n\
+    pos: vec4<f32>,\n\
+}\n\
+const TILE: u32 = 16u;\n\
+const MAXL: u32 = 256u;\n\
+const NEAR: f32 = 0.5;\n\
+const INTENS: f32 = 1.3;\n";
+
+// update: the lights orbit, the objects bob (misc = time, lights, mode, objects).
+pub const UPDATE: [u8] = "@group(0) @binding(0) var<uniform> g: G;\n\
+@group(0) @binding(1) var<storage, read_write> lights: array<Light>;\n\
+@group(0) @binding(2) var<storage, read_write> objs: array<Obj>;\n\
+@compute @workgroup_size(64)\n\
+fn update(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    let t = g.misc.x;\n\
+    if (i < u32(g.misc.y)) {\n\
+        let l = lights[i];\n\
+        let a = t * l.motion.x + l.motion.y;\n\
+        lights[i].pos = vec4<f32>(l.base.x + l.base.w * cos(a),\n\
+            l.motion.z + 0.35 * sin(2.0 * a),\n\
+            l.base.z + l.base.w * sin(a), l.color.w);\n\
+    }\n\
+    if (i < u32(g.misc.w)) {\n\
+        let o = objs[i];\n\
+        objs[i].pos = vec4<f32>(o.home.x,\n\
+            o.home.y + o.home.w * (0.5 + 0.5 * sin(2.0 * t + f32(i))),\n\
+            o.home.z, 0.0);\n\
+    }\n\
+}\n";
+
+// gen: the unit cube (36 vertices, side 1) then a UV sphere (radius 0.5,
+// 12 rings, 16 segments: 1152 vertices) into one vertex buffer of
+// position and normal, six f32s a vertex.
+pub const GEN: [u8] = "@group(0) @binding(0) var<storage, read_write> verts: array<f32>;\n\
+const PI: f32 = 3.14159265;\n\
+fn put(v: u32, p: vec3<f32>, n: vec3<f32>) {\n\
+    let b = v * 6u;\n\
+    verts[b] = p.x;\n\
+    verts[b + 1u] = p.y;\n\
+    verts[b + 2u] = p.z;\n\
+    verts[b + 3u] = n.x;\n\
+    verts[b + 4u] = n.y;\n\
+    verts[b + 5u] = n.z;\n\
+}\n\
+@compute @workgroup_size(64)\n\
+fn gen(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let v = id.x;\n\
+    if (v < 36u) {\n\
+        let f = v / 6u;\n\
+        let k = v % 6u;\n\
+        let a = f / 2u;\n\
+        let sg = select(1.0, -1.0, (f % 2u) == 1u);\n\
+        let b = (a + 1u) % 3u;\n\
+        let c = (a + 2u) % 3u;\n\
+        var uv = vec2<f32>(-1.0, -1.0);\n\
+        if (k == 1u || k == 4u) { uv = vec2<f32>(1.0, -1.0); }\n\
+        if (k == 2u || k == 3u) { uv = vec2<f32>(-1.0, 1.0); }\n\
+        if (k == 5u) { uv = vec2<f32>(1.0, 1.0); }\n\
+        let ma = vec3<f32>(f32(a == 0u), f32(a == 1u), f32(a == 2u));\n\
+        let mb = vec3<f32>(f32(b == 0u), f32(b == 1u), f32(b == 2u));\n\
+        let mc = vec3<f32>(f32(c == 0u), f32(c == 1u), f32(c == 2u));\n\
+        put(v, 0.5 * (sg * ma + uv.x * mb + uv.y * mc), sg * ma);\n\
+    }\n\
+    if (v >= 36u) {\n\
+        let s = v - 36u;\n\
+        if (s < 1152u) {\n\
+            let q = s / 6u;\n\
+            let k = s % 6u;\n\
+            var r = q / 16u;\n\
+            var seg = q % 16u;\n\
+            if (k == 1u || k == 4u) { r = r + 1u; }\n\
+            if (k == 2u || k == 3u) { seg = seg + 1u; }\n\
+            if (k == 5u) { r = r + 1u; seg = seg + 1u; }\n\
+            let th = PI * f32(r) / 12.0;\n\
+            let ph = 2.0 * PI * f32(seg) / 16.0;\n\
+            let n = vec3<f32>(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));\n\
+            put(v, 0.5 * n, n);\n\
+        }\n\
+    }\n\
+}\n";
+
+// cull: one workgroup per tile (16 x 16 threads). Each thread tests the
+// lights i = local, local + 256, ... against the tile's rectangle on the
+// screen (a sphere's projected box, conservative; a light that may touch
+// the near plane is kept). A hit appends i to the tile's list.
+pub const CULL: [u8] = "@group(0) @binding(0) var<uniform> g: G;\n\
+@group(0) @binding(1) var<storage, read> lights: array<Light>;\n\
+@group(0) @binding(2) var<storage, read_write> tile_count: array<atomic<u32>>;\n\
+@group(0) @binding(3) var<storage, read_write> tile_list: array<u32>;\n\
+@compute @workgroup_size(16, 16)\n\
+fn cull(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {\n\
+    let tiles_x = u32(g.screen.z);\n\
+    let t = wg.y * tiles_x + wg.x;\n\
+    let tw = 2.0 * f32(TILE) / g.screen.x;\n\
+    let th = 2.0 * f32(TILE) / g.screen.y;\n\
+    let cx = -1.0 + (f32(wg.x) + 0.5) * tw;\n\
+    let cy = 1.0 - (f32(wg.y) + 0.5) * th;\n\
+    if (li == 0u) {\n\
+        atomicStore(&tile_count[t], 0u);\n\
+    }\n\
+    storageBarrier();\n\
+    workgroupBarrier();\n\
+    let nl = u32(g.misc.y);\n\
+    for (var i = li; i < nl; i = i + 256u) {\n\
+        let l = lights[i];\n\
+        let v = g.vmat * vec4<f32>(l.pos.xyz, 1.0);\n\
+        let depth = -v.z;\n\
+        let r = l.pos.w;\n\
+        var hit = true;\n\
+        if (depth - r > NEAR) {\n\
+            // the sphere's view-space box, projected: a superset of the\n\
+            // sphere's silhouette (a sphere's projected centre is not its\n\
+            // projection's centre off-axis, so a disc would miss)\n\
+            var lo = vec2<f32>(1.0e30);\n\
+            var hi = vec2<f32>(-1.0e30);\n\
+            for (var c = 0u; c < 8u; c = c + 1u) {\n\
+                let sx = select(-r, r, (c & 1u) != 0u);\n\
+                let sy = select(-r, r, (c & 2u) != 0u);\n\
+                let sz = select(-r, r, (c & 4u) != 0u);\n\
+                let p = v.xyz + vec3<f32>(sx, sy, sz);\n\
+                let ndc = vec2<f32>(g.proj.x * p.x, g.proj.y * p.y) / -p.z;\n\
+                lo = min(lo, ndc);\n\
+                hi = max(hi, ndc);\n\
+            }\n\
+            hit = hi.x >= cx - 0.5 * tw && lo.x <= cx + 0.5 * tw\n\
+                && hi.y >= cy - 0.5 * th && lo.y <= cy + 0.5 * th;\n\
+        }\n\
+        if (hit) {\n\
+            let slot = atomicAdd(&tile_count[t], 1u);\n\
+            if (slot < MAXL) {\n\
+                tile_list[t * MAXL + slot] = i;\n\
+            }\n\
+        }\n\
+    }\n\
+}\n";
+
+// geometry: the instanced cube and sphere, one vertex buffer per mesh.
+// The three fragment entries write one G-buffer each (one color target a pass).
+pub const GEO: [u8] = "@group(0) @binding(0) var<uniform> g: G;\n\
+@group(0) @binding(1) var<storage, read> objs: array<Obj>;\n\
+struct GV {\n\
+    @builtin(position) clip: vec4<f32>,\n\
+    @location(0) wpos: vec3<f32>,\n\
+    @location(1) wn: vec3<f32>,\n\
+    @location(2) col: vec3<f32>,\n\
+    @location(3) vdepth: f32,\n\
+}\n\
+@vertex\n\
+fn geo_vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>,\n\
+          @builtin(instance_index) inst: u32) -> GV {\n\
+    let o = objs[inst];\n\
+    let wp = o.pos.xyz + p * o.scale.xyz;\n\
+    let v = g.vmat * vec4<f32>(wp, 1.0);\n\
+    var out: GV;\n\
+    out.clip = vec4<f32>(g.proj.x * v.x, g.proj.y * v.y, g.proj.z * v.z + g.proj.w, -v.z);\n\
+    out.wpos = wp;\n\
+    out.wn = normalize(n / o.scale.xyz);\n\
+    out.col = o.color.rgb;\n\
+    out.vdepth = -v.z;\n\
+    return out;\n\
+}\n\
+@fragment\n\
+fn geo_albedo(i: GV) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(i.col, 1.0);\n\
+}\n\
+@fragment\n\
+fn geo_normal(i: GV) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(normalize(i.wn), 1.0);\n\
+}\n\
+@fragment\n\
+fn geo_pos(i: GV) -> @location(0) vec4<f32> {\n\
+    return vec4<f32>(i.wpos, i.vdepth);\n\
+}\n";
+
+// The full-screen triangle, shared by the lighting and the view pass.
+pub const FULLSCREEN: [u8] = "@vertex\n\
+fn fs_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return vec4<f32>(p, 0.0, 1.0);\n\
+}\n";
+
+// lighting: shade each pixel with the lights in its tile. A pixel whose
+// view depth is the clear value (1e9) is sky.
+pub const LIGHT: [u8] = "@group(0) @binding(0) var<uniform> g: G;\n\
+@group(0) @binding(1) var<storage, read> lights: array<Light>;\n\
+@group(0) @binding(2) var<storage, read> tile_count: array<u32>;\n\
+@group(0) @binding(3) var<storage, read> tile_list: array<u32>;\n\
+@group(0) @binding(4) var albedo_t: texture_2d<f32>;\n\
+@group(0) @binding(5) var normal_t: texture_2d<f32>;\n\
+@group(0) @binding(6) var pos_t: texture_2d<f32>;\n\
+@fragment\n\
+fn light_fs(@builtin(position) fp: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let px = vec2<i32>(i32(fp.x), i32(fp.y));\n\
+    let tiles_x = u32(g.screen.z);\n\
+    let t = (u32(fp.y) / TILE) * tiles_x + u32(fp.x) / TILE;\n\
+    let gp = textureLoad(pos_t, px, 0);\n\
+    if (gp.w > 1.0e8) {\n\
+        return vec4<f32>(0.03, 0.04, 0.06, 1.0);\n\
+    }\n\
+    let alb = textureLoad(albedo_t, px, 0).rgb;\n\
+    let n = normalize(textureLoad(normal_t, px, 0).xyz);\n\
+    var acc = 0.03 * alb;\n\
+    let cnt = min(tile_count[t], MAXL);\n\
+    for (var k = 0u; k < cnt; k = k + 1u) {\n\
+        let l = lights[tile_list[t * MAXL + k]];\n\
+        let to = l.pos.xyz - gp.xyz;\n\
+        let d = length(to);\n\
+        let r = l.pos.w;\n\
+        if (d < r) {\n\
+            let att = 1.0 - d / r;\n\
+            acc = acc + alb * l.color.rgb * (max(dot(n, to / d), 0.0) * att * att * INTENS);\n\
+        }\n\
+    }\n\
+    return vec4<f32>(acc, 1.0);\n\
+}\n";
+
+// view: mode 0 is the tone-mapped frame (ACES fit, gamma 2.2); 1 albedo,
+// 2 normal, 3 view depth (near = white) as the picture.
+pub const VIEW: [u8] = "@group(0) @binding(0) var<uniform> g: G;\n\
+@group(0) @binding(1) var hdr_t: texture_2d<f32>;\n\
+@group(0) @binding(2) var albedo_t: texture_2d<f32>;\n\
+@group(0) @binding(3) var normal_t: texture_2d<f32>;\n\
+@group(0) @binding(4) var pos_t: texture_2d<f32>;\n\
+@fragment\n\
+fn view_fs(@builtin(position) fp: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let px = vec2<i32>(i32(fp.x), i32(fp.y));\n\
+    let mode = i32(g.misc.z);\n\
+    if (mode == 1) {\n\
+        return vec4<f32>(textureLoad(albedo_t, px, 0).rgb, 1.0);\n\
+    }\n\
+    if (mode == 2) {\n\
+        return vec4<f32>(textureLoad(normal_t, px, 0).xyz * 0.5 + 0.5, 1.0);\n\
+    }\n\
+    if (mode == 3) {\n\
+        let d = textureLoad(pos_t, px, 0).w;\n\
+        return vec4<f32>(vec3<f32>(clamp(1.0 - (d - 2.0) / 30.0, 0.0, 1.0)), 1.0);\n\
+    }\n\
+    let x = textureLoad(hdr_t, px, 0).rgb;\n\
+    let m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14),\n\
+        vec3<f32>(0.0), vec3<f32>(1.0));\n\
+    return vec4<f32>(pow(m, vec3<f32>(1.0 / 2.2)), 1.0);\n\
+}\n";

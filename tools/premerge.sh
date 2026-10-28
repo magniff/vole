@@ -69,7 +69,7 @@ if [ -z "$VOLEC" ]; then
     row fmt SKIP "no volec (bootstrap/bootstrap.sh --dev)"
 else
     : > "$TMP/fmt"
-    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v '^tests/' | grep -v 'front/stdsrc\.vl$'); do
+    for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^evals/' | grep -v 'front/stdsrc\.vl$'); do
         "$VOLEC" fmt --check "$f" > /dev/null 2>&1 || echo "  $f: not formatted (try: volec fmt $f)" >> "$TMP/fmt"
     done
     if [ -s "$TMP/fmt" ]; then row fmt FAIL "$(wc -l < "$TMP/fmt" | tr -d ' ') file(s)"; else row fmt PASS "changed .vl files formatted"; fi

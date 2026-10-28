@@ -1,0 +1,47 @@
+# deferred: eval record (vole 0.25.2)
+
+One of ten GPU demos built by AI agents in the first round of the vole eval loop (see [../SUMMARY.md](../SUMMARY.md)).
+
+| | |
+|---|---|
+| model | Claude Haiku 5.5 (`claude-haiku-5-5`) |
+| reasoning effort | medium |
+| agent | Claude Code subagent, type `general-purpose`, run in the background by the orchestrator (Claude Opus 5.5) |
+| harness | Claude Code with the repository's hooks (check after every edit with automatic `fix --suggested`, query-first, turn-end) |
+| compiler | vole 0.25.2 (`target/volec`, tag `v0.25.2`, commit 5562a818) |
+| started | 2026-10-28 18:36 CET |
+| duration | 15.2 min (910 s) |
+| tokens | 211,610 (as reported by the harness) |
+| tool calls | 75 |
+| shared machine | up to 5 agents at once; GPU programs run through [`../tools/gpu-run`](../tools/gpu-run) (one at a time) |
+
+## Files
+
+- [ANALYSIS.md](ANALYSIS.md): the agent's own report (tools used, what went well and badly, suggestions), asked to be brutally honest. Where the harness refused the agent's write, the orchestrator saved it verbatim from the agent's final message (the file says so).
+- [REVIEW.md](REVIEW.md): the review of its code and claims.
+- [PROGRAM.md](PROGRAM.md): the agent's README for its program (how to build and run it, controls, what it verified).
+- The program: `main.vl` and its modules; build with `volec main.vl -o deferred`.
+
+## The prompt
+
+The agent got this prompt, verbatim, and read the shared brief [../BRIEF.md](../BRIEF.md) as it says. The brief's "Harness notes" section was appended at 18:35 (after physarum and ocean had finished; agents started later saw it).
+
+```
+You are one of several agents in an evaluation of the vole programming language and its tools.
+
+Your project NAME is `deferred`. Your folder is /Users/magniff/workspace/tachyon/evals/tasks/0.25.2/deferred/ (it exists; work only there).
+
+First read /Users/magniff/workspace/tachyon/evals/tasks/0.25.2/BRIEF.md: it says how to learn vole, which tools to use, the rules, how to share the machine (the GPU lock), and what to deliver (the program, tests, README.md, and last ANALYSIS.md). Follow it; in it, NAME means `deferred`.
+
+Your task:
+
+A deferred renderer. A scene of simple meshes (generated: cubes, spheres, a floor), a G-buffer pass into several render targets (albedo, normal, depth), then a lighting pass with at least 256 moving coloured point lights (light culling in a compute pass: tiles or clusters), then tone mapping. Keys toggle the G-buffer views. Headless writes each G-buffer view and the final frame, and prints the frame time.
+```
+
+## Tool use, from the transcript
+
+Counted from the agent's transcript (tool calls deduplicated; `volec` subcommands parsed from every shell command; "hook blocks" are commands refused by tools/agent-hooks):
+
+| project | tool calls | Bash | Edit | Write | Read | volec calls (by subcommand) | hook blocks | failed tool calls |
+|---|---|---|---|---|---|---|---|---|
+| deferred | 74 | 39 | 25 | 0 | 10 | query items 25, query show 18, query grep 8, check 7, build 7, guide 6, test 6, fix 4 | 4 (query-first 3, edit-tool 1) | 6 |

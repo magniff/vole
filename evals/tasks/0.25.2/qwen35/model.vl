@@ -1,0 +1,390 @@
+// Qwen3.5-0.8B on the GPU: the weights as storage buffers (bf16, read in the
+// kernels; the small tensors widened to f32 on load), and per token one
+// compute pass of prebuilt dispatches (one bind group each, built once).
+// The token's embedding row is widened on the CPU and written to x; the
+// position goes to meta[0] (the kernels read it there).
+//
+// The text model: 24 layers, pattern 3 Gated DeltaNet + 1 full attention.
+
+use std::gpu;
+use std::gpu::{BindGroup, Buffer, BufferUsage, ComputePipeline, Device, Queue};
+
+use weights::{Tensors, widen};
+
+pub const HID: i64 = 1024;     // hidden size
+pub const FF: i64 = 3584;      // MLP width
+pub const VOCAB: i64 = 248320; // vocabulary (the rows of the tied embedding)
+pub const LAYERS: i64 = 24;
+pub const MAXCTX: i64 = 2048;  // the most positions a KV cache holds
+const HEAD_CHUNK: i64 = 32768; // LM head rows per buffer (under the binding limit)
+
+// The pipelines, by index in Model.pipes (in the order the shader lists them).
+const PMV: i64 = 0;
+const PNORM: i64 = 1;
+const PROPE: i64 = 2;
+const PATTN: i64 = 3;
+const PCONV: i64 = 4;
+const PDELTA: i64 = 5;
+const PADD: i64 = 6;
+const PSWIGLU: i64 = 7;
+
+// One dispatch: a pipeline (by index), its bind group, and the workgroups.
+pub struct Op {
+    pi: i64,
+    group: BindGroup,
+    x: i64,
+    y: i64,
+}
+
+pub struct Model {
+    pub dev: Device,
+    pub queue: Queue,
+    gpa: Gpa,
+    pipes: Vec<ComputePipeline>,
+    st: Tensors,
+    embed: i64,            // the record of embed_tokens
+    ops: Vec<Op>,          // the 24 layers and the final norm
+    heads: Vec<Op>,        // the LM head chunks (only for the last position)
+    x: Buffer,             // the residual stream, 1024 f32
+    meta: Buffer,          // u32: [position]
+    logits: Buffer,        // VOCAB f32
+    states: Vec<Buffer>,   // the conv and delta-rule states of the linear layers
+}
+
+fn ubuf(dev: Device, v: [u32; 4]) -> Buffer {
+    dev.buffer_init(gpu::bytes_of_u32(v[..]), BufferUsage::UNIFORM | BufferUsage::COPY_DST)
+}
+
+fn sbuf(dev: Device, bytes: [u8]) -> Buffer {
+    dev.buffer_init(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST)
+}
+
+fn zeros(dev: Device, n: i64) -> Buffer {
+    dev.buffer(n * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST)
+}
+
+// A small tensor as f32 storage: bf16 widened, f32 as it is.
+fn small_f32(dev: Device, st: inout Tensors, r: i64, gpa: Gpa) -> Buffer {
+    if st.is_bf16(r) {
+        var w: Vec<u8> = Vec::new_in(gpa);
+        widen(st.bytes(r), &w);
+        sbuf(dev, w.as_slice())
+    } else {
+        sbuf(dev, st.bytes(r))
+    }
+}
+
+// A matrix, as it is stored (bf16).
+fn matrix(dev: Device, st: inout Tensors, name: [u8]) -> Buffer {
+    let r = st.find(name);
+    sbuf(dev, st.bytes(r))
+}
+
+// "model.language_model.layers.L.rest"
+fn layer_name(l: i64, rest: [u8], gpa: Gpa) -> Vec<u8> {
+    var v: Vec<u8> = Vec::new_in(gpa);
+    push_str(&v, "model.language_model.layers.");
+    push_str(&v, format_in(f"{l}", gpa).as_slice());
+    push_str(&v, ".");
+    push_str(&v, rest);
+    v
+}
+
+fn mv_op(dev: Device, pipes: [ComputePipeline], w: Buffer, x: Buffer, y: Buffer,
+         rows: i64, cols: i64, yoff: i64) -> Op {
+    let u = ubuf(dev, [rows as u32, cols as u32, yoff as u32, 0]);
+    let g = dev.bind_group(pipes[PMV].bind_layout(0),
+        [gpu::bind(0, u), gpu::bind(1, w), gpu::bind(2, x), gpu::bind(3, y)][..]);
+    let gx = if rows < 256 { rows } else { 256 };
+    Op { pi: PMV, group: g, x: gx, y: (rows + 255) / 256 }
+}
+
+// RMSNorm (1 + w) of `heads` vectors of dim, read at h * stride, written at ooff + h * dim.
+fn norm_op(dev: Device, pipes: [ComputePipeline], src: Buffer, w: Buffer, dst: Buffer,
+           dim: i64, stride: i64, ooff: i64, heads: i64) -> Op {
+    let u = ubuf(dev, [dim as u32, stride as u32, 1, ooff as u32]);
+    let g = dev.bind_group(pipes[PNORM].bind_layout(0),
+        [gpu::bind(0, u), gpu::bind(1, src), gpu::bind(2, w), gpu::bind(3, dst)][..]);
+    Op { pi: PNORM, group: g, x: heads, y: 1 }
+}
+
+fn add_op(dev: Device, pipes: [ComputePipeline], src: Buffer, dst: Buffer) -> Op {
+    let u = ubuf(dev, [HID as u32, 0, 0, 0]);
+    let g = dev.bind_group(pipes[PADD].bind_layout(0), [gpu::bind(0, u), gpu::bind(1, src), gpu::bind(2, dst)][..]);
+    Op { pi: PADD, group: g, x: 16, y: 1 }
+}
+
+fn rope_op(dev: Device, pipes: [ComputePipeline], meta: Buffer, qkn: Buffer, qr: Buffer,
+           kc: Buffer, vc: Buffer, vr: Buffer) -> Op {
+    let g = dev.bind_group(pipes[PROPE].bind_layout(0),
+        [gpu::bind(0, meta), gpu::bind(1, qkn), gpu::bind(2, qr), gpu::bind(3, kc),
+         gpu::bind(4, vc), gpu::bind(5, vr)][..]);
+    Op { pi: PROPE, group: g, x: 11, y: 1 }
+}
+
+fn attn_op(dev: Device, pipes: [ComputePipeline], meta: Buffer, qr: Buffer, kc: Buffer,
+           vc: Buffer, qg: Buffer, ao: Buffer) -> Op {
+    let g = dev.bind_group(pipes[PATTN].bind_layout(0),
+        [gpu::bind(0, meta), gpu::bind(1, qr), gpu::bind(2, kc), gpu::bind(3, vc),
+         gpu::bind(4, qg), gpu::bind(5, ao)][..]);
+    Op { pi: PATTN, group: g, x: 8, y: 1 }
+}
+
+fn conv_op(dev: Device, pipes: [ComputePipeline], qkv: Buffer, cw: Buffer, cst: Buffer, out: Buffer) -> Op {
+    let g = dev.bind_group(pipes[PCONV].bind_layout(0),
+        [gpu::bind(0, qkv), gpu::bind(1, cw), gpu::bind(2, cst), gpu::bind(3, out)][..]);
+    Op { pi: PCONV, group: g, x: 96, y: 1 }
+}
+
+fn delta_op(dev: Device, pipes: [ComputePipeline], cq: Buffer, bb: Buffer, aa: Buffer, zz: Buffer,
+            alog: Buffer, dtb: Buffer, nw: Buffer, s: Buffer, yd: Buffer) -> Op {
+    let g = dev.bind_group(pipes[PDELTA].bind_layout(0),
+        [gpu::bind(0, cq), gpu::bind(1, bb), gpu::bind(2, aa), gpu::bind(3, zz),
+         gpu::bind(4, alog), gpu::bind(5, dtb), gpu::bind(6, nw), gpu::bind(7, s),
+         gpu::bind(8, yd)][..]);
+    Op { pi: PDELTA, group: g, x: 16, y: 1 }
+}
+
+fn swiglu_op(dev: Device, pipes: [ComputePipeline], gt: Buffer, up: Buffer, act: Buffer) -> Op {
+    let g = dev.bind_group(pipes[PSWIGLU].bind_layout(0), [gpu::bind(0, gt), gpu::bind(1, up), gpu::bind(2, act)][..]);
+    Op { pi: PSWIGLU, group: g, x: 56, y: 1 }
+}
+
+// One kernel: its own WGSL module (bindings are per module), its entry point.
+fn make_pipe(dev: Device, src: [u8], entry: [u8]) -> ComputePipeline {
+    let shader = match dev.shader_wgsl(src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"qwen35: shader {entry}: {e}");
+            panic("the kernels do not compile");
+        }
+    };
+    match dev.compute_pipeline(shader, entry) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln(f"qwen35: pipeline {entry}: {e}");
+            panic("the kernels do not compile");
+        }
+    }
+}
+
+// The index of the largest logit (greedy decoding).
+pub fn argmax(xs: [f32]) -> i64 {
+    var best: i64 = 0;
+    for i in 1..xs.len() {
+        if xs[i] > xs[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+fn push_str(v: inout Vec<u8>, s: [u8]) {
+    for k in 0..s.len() {
+        v.push(s[k]);
+    }
+}
+
+impl Model {
+    // The model from its folder: the weights, the pipelines, the dispatches.
+    pub fn load(dir: [u8], gpa: Gpa) -> Option<Model> {
+        var path: Vec<u8> = Vec::new_in(gpa);
+        push_str(&path, dir);
+        push_str(&path, "/model.safetensors-00001-of-00001.safetensors");
+        var st = match weights::read(path.as_slice(), gpa) {
+            Some(s) => s,
+            None => return None,
+        };
+        let inst = gpu::Instance::new_in(gpa);
+        let adapter = match inst.adapter() {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+        let (dev, queue) = match adapter.device() {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+        var pipes: Vec<ComputePipeline> = Vec::new_in(gpa);
+        pipes.push(make_pipe(dev, shaders::WGSL_MV, "mv"));
+        pipes.push(make_pipe(dev, shaders::WGSL_NORM, "norm"));
+        pipes.push(make_pipe(dev, shaders::WGSL_ROPE, "rope"));
+        pipes.push(make_pipe(dev, shaders::WGSL_ATTN, "attn"));
+        pipes.push(make_pipe(dev, shaders::WGSL_CONV, "conv"));
+        pipes.push(make_pipe(dev, shaders::WGSL_DELTA, "delta"));
+        pipes.push(make_pipe(dev, shaders::WGSL_ADD, "addv"));
+        pipes.push(make_pipe(dev, shaders::WGSL_SWIGLU, "swiglu"));
+
+        let embed = st.find("model.language_model.embed_tokens.weight");
+        let x = zeros(dev, HID);
+        let meta = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let logits = dev.buffer(VOCAB * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        var ops: Vec<Op> = Vec::new_in(gpa);
+        var heads: Vec<Op> = Vec::new_in(gpa);
+        var states: Vec<Buffer> = Vec::new_in(gpa);
+        // Shared scratch.
+        let xn = zeros(dev, HID);
+        let qg = zeros(dev, 4096);
+        let kr = zeros(dev, 512);
+        let vr = zeros(dev, 512);
+        let qkn = zeros(dev, 2560);
+        let qr = zeros(dev, 2048);
+        let ao = zeros(dev, 2048);
+        let ob = zeros(dev, HID);
+        let qkv = zeros(dev, 6144);
+        let cq = zeros(dev, 6144);
+        let zz = zeros(dev, 2048);
+        let bb = zeros(dev, 16);
+        let aa = zeros(dev, 16);
+        let yd = zeros(dev, 2048);
+        let gt = zeros(dev, FF);
+        let up = zeros(dev, FF);
+        let act = zeros(dev, FF);
+        let dn = zeros(dev, HID);
+        let xf = zeros(dev, HID);
+        let pp = pipes.as_slice();
+
+        for l in 0..LAYERS {
+            let full = (l + 1) % 4 == 0;
+            let r1 = st.find(layer_name(l, "input_layernorm.weight", gpa).as_slice());
+            let ln1 = small_f32(dev, &st, r1, gpa);
+            let r2 = st.find(layer_name(l, "post_attention_layernorm.weight", gpa).as_slice());
+            let ln2 = small_f32(dev, &st, r2, gpa);
+            let gate = matrix(dev, &st, layer_name(l, "mlp.gate_proj.weight", gpa).as_slice());
+            let up_w = matrix(dev, &st, layer_name(l, "mlp.up_proj.weight", gpa).as_slice());
+            let down = matrix(dev, &st, layer_name(l, "mlp.down_proj.weight", gpa).as_slice());
+            if full {
+                let qp = matrix(dev, &st, layer_name(l, "self_attn.q_proj.weight", gpa).as_slice());
+                let kp = matrix(dev, &st, layer_name(l, "self_attn.k_proj.weight", gpa).as_slice());
+                let vp = matrix(dev, &st, layer_name(l, "self_attn.v_proj.weight", gpa).as_slice());
+                let op = matrix(dev, &st, layer_name(l, "self_attn.o_proj.weight", gpa).as_slice());
+                let rq = st.find(layer_name(l, "self_attn.q_norm.weight", gpa).as_slice());
+                let qn = small_f32(dev, &st, rq, gpa);
+                let rk = st.find(layer_name(l, "self_attn.k_norm.weight", gpa).as_slice());
+                let kn = small_f32(dev, &st, rk, gpa);
+                let kc = zeros(dev, MAXCTX * 512);
+                let vc = zeros(dev, MAXCTX * 512);
+                ops.push(norm_op(dev, pp, x, ln1, xn, HID, HID, 0, 1));
+                ops.push(mv_op(dev, pp, qp, xn, qg, 4096, HID, 0));
+                ops.push(mv_op(dev, pp, kp, xn, kr, 512, HID, 0));
+                ops.push(mv_op(dev, pp, vp, xn, vr, 512, HID, 0));
+                ops.push(norm_op(dev, pp, qg, qn, qkn, 256, 512, 0, 8));
+                ops.push(norm_op(dev, pp, kr, kn, qkn, 256, 256, 2048, 2));
+                ops.push(rope_op(dev, pp, meta, qkn, qr, kc, vc, vr));
+                ops.push(attn_op(dev, pp, meta, qr, kc, vc, qg, ao));
+                ops.push(mv_op(dev, pp, op, ao, ob, HID, 2048, 0));
+            } else {
+                let qkvw = matrix(dev, &st, layer_name(l, "linear_attn.in_proj_qkv.weight", gpa).as_slice());
+                let zw = matrix(dev, &st, layer_name(l, "linear_attn.in_proj_z.weight", gpa).as_slice());
+                let bw = matrix(dev, &st, layer_name(l, "linear_attn.in_proj_b.weight", gpa).as_slice());
+                let aw = matrix(dev, &st, layer_name(l, "linear_attn.in_proj_a.weight", gpa).as_slice());
+                let ow = matrix(dev, &st, layer_name(l, "linear_attn.out_proj.weight", gpa).as_slice());
+                let rc = st.find(layer_name(l, "linear_attn.conv1d.weight", gpa).as_slice());
+                let cw = small_f32(dev, &st, rc, gpa);
+                let ra = st.find(layer_name(l, "linear_attn.A_log", gpa).as_slice());
+                let alog = small_f32(dev, &st, ra, gpa);
+                let rd = st.find(layer_name(l, "linear_attn.dt_bias", gpa).as_slice());
+                let dtb = small_f32(dev, &st, rd, gpa);
+                let rn = st.find(layer_name(l, "linear_attn.norm.weight", gpa).as_slice());
+                let nw = small_f32(dev, &st, rn, gpa);
+                let cst = zeros(dev, 6144 * 3);
+                let s = zeros(dev, 16 * 16384);
+                states.push(cst);
+                states.push(s);
+                let cst = states[states.len() - 2];
+                let s = states[states.len() - 1];
+                ops.push(norm_op(dev, pp, x, ln1, xn, HID, HID, 0, 1));
+                ops.push(mv_op(dev, pp, qkvw, xn, qkv, 6144, HID, 0));
+                ops.push(mv_op(dev, pp, zw, xn, zz, 2048, HID, 0));
+                ops.push(mv_op(dev, pp, bw, xn, bb, 16, HID, 0));
+                ops.push(mv_op(dev, pp, aw, xn, aa, 16, HID, 0));
+                ops.push(conv_op(dev, pp, qkv, cw, cst, cq));
+                ops.push(delta_op(dev, pp, cq, bb, aa, zz, alog, dtb, nw, s, yd));
+                ops.push(mv_op(dev, pp, ow, yd, ob, HID, 2048, 0));
+            }
+            ops.push(add_op(dev, pp, ob, x));
+            ops.push(norm_op(dev, pp, x, ln2, xn, HID, HID, 0, 1));
+            ops.push(mv_op(dev, pp, gate, xn, gt, FF, HID, 0));
+            ops.push(mv_op(dev, pp, up_w, xn, up, FF, HID, 0));
+            ops.push(swiglu_op(dev, pp, gt, up, act));
+            ops.push(mv_op(dev, pp, down, act, dn, HID, FF, 0));
+            ops.push(add_op(dev, pp, dn, x));
+        }
+        // The final norm, and the LM head: the tied embedding in chunks.
+        let rf = st.find("model.language_model.norm.weight");
+        let fnorm = small_f32(dev, &st, rf, gpa);
+        ops.push(norm_op(dev, pp, x, fnorm, xf, HID, HID, 0, 1));
+        var row: i64 = 0;
+        while row < VOCAB {
+            var rows = VOCAB - row;
+            if rows > HEAD_CHUNK {
+                rows = HEAD_CHUNK;
+            }
+            let eb = st.bytes(embed);
+            let chunk = sbuf(dev, eb[row * HID * 2..(row + rows) * HID * 2]);
+            heads.push(mv_op(dev, pp, chunk, xf, logits, rows, HID, row));
+            row += rows;
+        }
+        Some(Model {
+            dev: dev,
+            queue: queue,
+            gpa: gpa,
+            pipes: pipes,
+            st: st,
+            embed: embed,
+            ops: ops,
+            heads: heads,
+            x: x,
+            meta: meta,
+            logits: logits,
+            states: states,
+        })
+    }
+
+    // Forgets the earlier tokens: the states go back to zero (the KV cache
+    // needs no clearing: attention reads only the positions written since).
+    pub fn reset(inout self) {
+        for k in 0..self.states.len() {
+            let n = self.states[k].size;
+            var zero: Vec<u8> = Vec::new_in(self.gpa);
+            for _ in 0..n {
+                zero.push(0);
+            }
+            self.queue.write_buffer(self.states[k], 0, zero.as_slice());
+        }
+    }
+
+    // One token at position pos: its embedding in, the logits out (when
+    // want_logits). The KV cache and the states hold the earlier tokens.
+    pub fn step(inout self, tok: i64, pos: i64, want_logits: bool) {
+        var row: Vec<u8> = Vec::new_in(self.gpa);
+        let eb = self.st.bytes(self.embed);
+        widen(eb[tok * HID * 2..(tok + 1) * HID * 2], &row);
+        self.queue.write_buffer(self.x, 0, row.as_slice());
+        let m: [u32; 4] = [pos as u32, 0, 0, 0];
+        self.queue.write_buffer(self.meta, 0, gpu::bytes_of_u32(m[..]));
+        var enc = self.dev.encoder();
+        let ops = &self.ops;
+        let heads = &self.heads;
+        let pipes = self.pipes.as_slice();
+        enc.compute_pass(|pass| {
+            for k in 0..ops.len() {
+                pass.set_pipeline(pipes[ops[k].pi]);
+                pass.set_bind_group(0, ops[k].group);
+                pass.dispatch(ops[k].x, ops[k].y, 1);
+            }
+            if want_logits {
+                for k in 0..heads.len() {
+                    pass.set_pipeline(pipes[heads[k].pi]);
+                    pass.set_bind_group(0, heads[k].group);
+                    pass.dispatch(heads[k].x, heads[k].y, 1);
+                }
+            }
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The logits of the last step with logits (waits for the GPU).
+    pub fn read_logits(inout self) -> [f32] {
+        gpu::f32s(self.logits.map_read(self.dev))
+    }
+}

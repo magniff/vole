@@ -1,0 +1,319 @@
+// --check: the model against reference/reference.json (computed by
+// transformers on the CPU in float32). For each prompt: the token ids of its
+// text, then the model run on the reference's greedy continuation (teacher
+// forcing: the same tokens as the reference), comparing at each step the
+// top-10 logits with the reference's, and the argmax with its greedy token.
+//
+// The JSON is scanned for the few keys used (no general parser): the keys
+// are looked up in order, which the file writes in a fixed order.
+
+use std::time::monotonic_now;
+
+use model::Model;
+use tokenizer::Tokenizer;
+
+// Moves c past the next occurrence of "key" and the colon after it.
+fn seek(s: [u8], c: inout i64, key: [u8], gpa: Gpa) -> bool {
+    var pat: Vec<u8> = Vec::new_in(gpa);
+    pat.push(34);
+    for k in 0..key.len() {
+        pat.push(key[k]);
+    }
+    pat.push(34);
+    let n = s.len();
+    var i = c;
+    while i + pat.len() <= n {
+        var hit = true;
+        for k in 0..pat.len() {
+            if s[i + k] != pat[k] {
+                hit = false;
+                break;
+            }
+        }
+        if hit {
+            var j = i + pat.len();
+            while j < n && s[j] != 58 {
+                j += 1;
+            }
+            c = j + 1;
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn skip_space(s: [u8], c: inout i64) {
+    while c < s.len() && (s[c] == 32 || s[c] == 10 || s[c] == 13 || s[c] == 9) {
+        c += 1;
+    }
+}
+
+// The JSON string at c, its escapes decoded to UTF-8.
+fn read_string(s: [u8], c: inout i64, gpa: Gpa) -> Vec<u8> {
+    skip_space(s, &c);
+    var out: Vec<u8> = Vec::new_in(gpa);
+    c += 1;
+    while c < s.len() && s[c] != 34 {
+        if s[c] == 92 {
+            let e = s[c + 1];
+            c += 2;
+            if e == 117 {
+                var cp: i64 = 0;
+                for k in 0..4 {
+                    cp = cp * 16 + hex(s[c + k] as i64);
+                }
+                c += 4;
+                tokenizer::push_utf8(cp, &out);
+            } else if e == 110 {
+                out.push(10);
+            } else if e == 116 {
+                out.push(9);
+            } else if e == 114 {
+                out.push(13);
+            } else {
+                out.push(e);
+            }
+        } else {
+            out.push(s[c]);
+            c += 1;
+        }
+    }
+    c += 1;
+    out
+}
+
+fn hex(c: i64) -> i64 {
+    if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+// An array of integers at c (the '[' comes first).
+fn read_ints(s: [u8], c: inout i64, gpa: Gpa) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new_in(gpa);
+    while c < s.len() && s[c] != 91 {
+        c += 1;
+    }
+    c += 1;
+    loop {
+        skip_space(s, &c);
+        if c >= s.len() || s[c] == 93 {
+            break;
+        }
+        if s[c] == 44 {
+            c += 1;
+            continue;
+        }
+        var neg = false;
+        if s[c] == 45 {
+            neg = true;
+            c += 1;
+        }
+        var v: i64 = 0;
+        while c < s.len() && s[c] >= 48 && s[c] <= 57 {
+            v = v * 10 + (s[c] - 48) as i64;
+            c += 1;
+        }
+        out.push(if neg { -v } else { v });
+    }
+    c += 1;
+    out
+}
+
+// An array of decimal numbers at c (the '[' comes first).
+fn read_floats(s: [u8], c: inout i64, gpa: Gpa) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new_in(gpa);
+    while c < s.len() && s[c] != 91 {
+        c += 1;
+    }
+    c += 1;
+    loop {
+        skip_space(s, &c);
+        if c >= s.len() || s[c] == 93 {
+            break;
+        }
+        if s[c] == 44 {
+            c += 1;
+            continue;
+        }
+        var neg = false;
+        if s[c] == 45 {
+            neg = true;
+            c += 1;
+        }
+        var v: f64 = 0.0;
+        while c < s.len() && s[c] >= 48 && s[c] <= 57 {
+            v = v * 10.0 + (s[c] - 48) as f64;
+            c += 1;
+        }
+        if c < s.len() && s[c] == 46 {
+            c += 1;
+            var scale: f64 = 0.1;
+            while c < s.len() && s[c] >= 48 && s[c] <= 57 {
+                v = v + (s[c] - 48) as f64 * scale;
+                scale = scale * 0.1;
+                c += 1;
+            }
+        }
+        out.push(if neg { -v } else { v });
+    }
+    c += 1;
+    out
+}
+
+fn argmax_of(xs: [f32]) -> i64 {
+    var best: i64 = 0;
+    for i in 1..xs.len() {
+        if xs[i] > xs[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+fn fabs(x: f64) -> f64 {
+    if x < 0.0 { -x } else { x }
+}
+
+pub fn run(model: inout Model, tk: Tokenizer, path: [u8], gpa: Gpa) -> i32 {
+    let s = match std::fs::read_in(path, gpa) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln("check: cannot read reference/reference.json");
+            return 1;
+        }
+    };
+    var c: i64 = 0;
+    var all_ok = true;
+    var worst: f64 = 0.0;
+    let t0 = monotonic_now();
+    var steps_run: i64 = 0;
+    for p in 0..3 {
+        if !seek(s.as_slice(), &c, "text", gpa) {
+            eprintln("check: no prompt");
+            return 1;
+        }
+        let text = read_string(s.as_slice(), &c, gpa);
+        var ids_ref: Vec<i64> = Vec::new_in(gpa);
+        if seek(s.as_slice(), &c, "ids", gpa) {
+            ids_ref = read_ints(s.as_slice(), &c, gpa);
+        }
+        let ids = tk.encode(text.as_slice(), gpa);
+        var ids_ok = ids.len() == ids_ref.len();
+        if ids_ok {
+            for k in 0..ids.len() {
+                if ids[k] != ids_ref[k] {
+                    ids_ok = false;
+                }
+            }
+        }
+        // The reference steps: top-10 ids and logits, after each greedy token.
+        var step_ids: Vec<Vec<i64>> = Vec::new_in(gpa);
+        var step_logits: Vec<Vec<f64>> = Vec::new_in(gpa);
+        var nsteps: i64 = 0;
+        loop {
+            if !seek(s.as_slice(), &c, "top_ids", gpa) {
+                break;
+            }
+            let ti = read_ints(s.as_slice(), &c, gpa);
+            if !seek(s.as_slice(), &c, "top_logits", gpa) {
+                break;
+            }
+            let tl = read_floats(s.as_slice(), &c, gpa);
+            step_ids.push(ti);
+            step_logits.push(tl);
+            nsteps += 1;
+            if nsteps == 24 {
+                break;
+            }
+        }
+        var greedy: Vec<i64> = Vec::new_in(gpa);
+        if seek(s.as_slice(), &c, "greedy_ids", gpa) {
+            greedy = read_ints(s.as_slice(), &c, gpa);
+        }
+        // Teacher forcing: the prompt, then the reference's greedy tokens.
+        model.reset();
+        var pos: i64 = 0;
+        var matches: i64 = 0;
+        var pdiff: f64 = 0.0;
+        var mine: Vec<i64> = Vec::new_in(gpa);
+        for k in 0..ids.len() {
+            model.step(ids[k], pos, k == ids.len() - 1);
+            pos += 1;
+        }
+        for k in 0..nsteps {
+            let logits = model.read_logits();
+            steps_run += 1;
+            let top = argmax_of(logits);
+            mine.push(top);
+            if top == greedy[k] {
+                matches += 1;
+            }
+            let ti = step_ids[k].as_slice();
+            let tl = step_logits[k].as_slice();
+            for j in 0..10 {
+                let d = fabs(logits[ti[j]] as f64 - tl[j]);
+                if d > pdiff {
+                    pdiff = d;
+                }
+            }
+            model.step(greedy[k], pos, true);
+            pos += 1;
+        }
+        if pdiff > worst {
+            worst = pdiff;
+        }
+        let greedy_ok = matches == nsteps && nsteps > 0;
+        if !ids_ok || !greedy_ok {
+            all_ok = false;
+        }
+        let idword = if ids_ok { "match" } else { "DIFFER" };
+        println(f"prompt {p}: {ids.len()} tokens, ids {idword}; greedy {matches}/{nsteps} steps match the reference; top-10 logits: largest difference {pdiff:.4}");
+        let rt = tk.decode(greedy.as_slice(), gpa);
+        let mt = tk.decode(mine.as_slice(), gpa);
+        print("  reference text: ");
+        print(rt.as_slice());
+        println("");
+        print("  model text:     ");
+        print(mt.as_slice());
+        println("");
+    }
+    // The tokenizer on its own: the ids of reference strings, and decoding back.
+    var tok_ok = true;
+    var tok_n: i64 = 0;
+    if seek(s.as_slice(), &c, "tokenizer_only", gpa) {
+        for _ in 0..3 {
+            if !seek(s.as_slice(), &c, "text", gpa) {
+                break;
+            }
+            let text = read_string(s.as_slice(), &c, gpa);
+            if !seek(s.as_slice(), &c, "ids", gpa) {
+                break;
+            }
+            let ids_ref = read_ints(s.as_slice(), &c, gpa);
+            let ids = tk.encode(text.as_slice(), gpa);
+            var same = ids.len() == ids_ref.len();
+            if same {
+                for k in 0..ids.len() {
+                    if ids[k] != ids_ref[k] {
+                        same = false;
+                    }
+                }
+            }
+            let back = tk.decode(ids.as_slice(), gpa);
+            let round = back.as_slice() == text.as_slice();
+            if !same || !round {
+                tok_ok = false;
+            }
+            tok_n += 1;
+        }
+    }
+    println(f"tokenizer: {tok_n} reference strings, ids and decoding {if tok_ok { "match" } else { "DIFFER" }}");
+    if !tok_ok {
+        all_ok = false;
+    }
+    let secs = monotonic_now().saturating_sub(t0).as_secs_f64();
+    let verdict = if all_ok { "PASS" } else { "FAIL" };
+    println(f"check: {verdict}; largest top-10 logit difference over all prompts {worst:.4}");
+    println(f"check: {steps_run} teacher-forced steps in {secs:.2} s (one token at a time)");
+    if all_ok { 0 } else { 1 }
+}

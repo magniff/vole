@@ -1,0 +1,147 @@
+// Choosing the next token from the logits: greedy (temperature 0), or
+// temperature and top-p (nucleus) sampling with a xorshift generator.
+// exp is written out here (range reduction and a Taylor series): the
+// sampler needs it on x <= 0 only, where it is accurate to about 1e-15.
+
+// e^x for x <= 0.
+fn exp_neg(x: f64) -> f64 {
+    if x < -700.0 {
+        return 0.0;
+    }
+    let ln2: f64 = 0.6931471805599453;
+    var k: i64 = 0;
+    var r = x;
+    while r < -0.5 * ln2 {
+        r += ln2;
+        k -= 1;
+    }
+    // r is in [-ln2/2, 0] now; e^x = e^r / 2^(-k)
+    var term: f64 = 1.0;
+    var sum: f64 = 1.0;
+    for n in 1..20 {
+        term = term * r / (n as f64);
+        sum += term;
+    }
+    var v = sum;
+    while k < 0 {
+        v = v * 0.5;
+        k += 1;
+    }
+    v
+}
+
+struct Cand {
+    id: i64,
+    p: f64,
+}
+
+// The next token id from logits. temp <= 0 is greedy. rng is the state of
+// the generator (any nonzero start).
+pub fn next_token(logits: [f32], temp: f64, top_p: f64, rng: inout u64, gpa: Gpa) -> i64 {
+    let n = logits.len();
+    if temp <= 0.0 {
+        return argmax_f32(logits);
+    }
+    var m: f64 = logits[0] as f64;
+    for i in 1..n {
+        if logits[i] as f64 > m {
+            m = logits[i] as f64;
+        }
+    }
+    // A logit more than 14 temperatures below the largest has a share under
+    // 1e-6 (e^-14): it is not a candidate, so its exp is not taken.
+    let floor = m - 14.0 * temp;
+    var total: f64 = 0.0;
+    var probs: Vec<f64> = Vec::new_in(gpa);
+    for i in 0..n {
+        var p: f64 = 0.0;
+        if logits[i] as f64 >= floor {
+            p = exp_neg((logits[i] as f64 - m) / temp);
+        }
+        probs.push(p);
+        total += p;
+    }
+    // The candidates with a visible share, most likely first.
+    var cands: Vec<Cand> = Vec::new_in(gpa);
+    for i in 0..n {
+        let p = probs[i] / total;
+        if p >= 0.000001 {
+            cands.push(Cand { id: i as i64, p: p });
+        }
+    }
+    cands.sort_by(|a, b| if a.p > b.p { -1 } else if a.p < b.p { 1 } else { 0 });
+    // The nucleus: the fewest candidates whose share reaches top_p.
+    var keep: i64 = 0;
+    var mass: f64 = 0.0;
+    while keep < cands.len() {
+        mass += cands[keep].p;
+        keep += 1;
+        if mass >= top_p {
+            break;
+        }
+    }
+    // A draw in [0, mass) from the xorshift state.
+    var x = rng;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    rng = x;
+    let u = ((x >> 11) as f64) / 9007199254740992.0;
+    let target = u * mass;
+    var acc: f64 = 0.0;
+    for k in 0..keep {
+        acc += cands[k].p;
+        if target < acc {
+            return cands[k].id;
+        }
+    }
+    cands[keep - 1].id
+}
+
+fn argmax_f32(xs: [f32]) -> i64 {
+    var best: i64 = 0;
+    for i in 1..xs.len() {
+        if xs[i] > xs[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+// A decimal number ("0.7"); other characters are skipped.
+pub fn parse_f64(s: [u8]) -> f64 {
+    var v: f64 = 0.0;
+    var scale: f64 = 0.0;
+    for k in 0..s.len() {
+        let c = s[k];
+        if c == 46 {
+            scale = 0.1;
+        } else if c >= 48 && c <= 57 {
+            let d = (c - 48) as f64;
+            if scale == 0.0 {
+                v = v * 10.0 + d;
+            } else {
+                v = v + d * scale;
+                scale = scale * 0.1;
+            }
+        }
+    }
+    v
+}
+
+#[test]
+fn exp_neg_is_accurate() {
+    let e = exp_neg(-1.0);
+    assert_eq(e > 0.36787944 && e < 0.36787945, true);
+    let z = exp_neg(0.0);
+    assert_eq(z == 1.0, true);
+    assert_eq(exp_neg(-800.0) == 0.0, true);
+}
+
+#[test]
+fn parse_f64_reads_decimals() {
+    let v = parse_f64("0.75");
+    assert_eq(v > 0.7499999 && v < 0.7500001, true);
+    let w = parse_f64("12");
+    assert_eq(w == 12.0, true);
+}
