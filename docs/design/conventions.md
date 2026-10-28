@@ -1569,7 +1569,15 @@ gate with the rehearsal (§9.3 step 7).
   to the statement's end.
 - **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
   element, a dereference, or a field reached through one. `var x =
-  part` stays `own.move_out`.
+  part` stays `own.move_out`. (0.25.2) In std too: std was exempt
+  until 0.25.2, and there the line was a copy of the part's bits that
+  the scope dropped while its owner still held it (std::gpu::wgsl freed
+  parts of its module on every translation). A move out of a part is
+  `own.move_out` in std as well, except in std's root, std::iter and
+  std::collections (front/modules `std_moves_bits`), whose containers
+  and iterators move elements by their bits by hand; a bitwise move
+  there is written as a read through a raw pointer (`let at: *T =
+  &v[i]; let x = unsafe { *at };`). tests/std/moves.sh checks it.
 - **Markers.** `conv.marker` (an inout argument without `&`) and
   `conv.marker_extra` (`&` where a let or sink parameter is wanted) are
   reported in 0.20 files only. Mixed files keep 0.19's messages, so
