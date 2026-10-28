@@ -39,6 +39,22 @@ errors left (the 0.18 eval: the line was offered 43 times and run once):
     fixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?
     volec check main.vl: 0 errors (1 fixed)
 
+(0.25.2.1) Only the mechanical classes, whose fix changes no meaning:
+a call's `&` marker (conv.marker, conv.marker_extra) and Rust's
+spellings (conv.rust), as `fix --suggested --codes ... --diff`; and an
+unused import that was unused at the last check too (`fix --only unused
+--in FILE`; not one just written). Each change is shown:
+
+    changed marks.vl:11: bump(&mut ui); -> bump(&ui);
+
+The other exact fixes (a did-you-mean, a conversion, a `use`, a path:
+the 0.25.2 eval's wrong fixes were all of these) are shown, not made,
+with the compiler's refusals (`fix --suggested --dry-run`):
+
+    suggested, not applied (check each: ...; volec fix --suggested main.vl makes the changes, not the refused):
+      glyphs.vl:3: use mathx::sqr; -> use mathx::sqrt;
+      refused: main.vl:27:5: not applied: `read_back`: ... the call would call itself
+
 VOLE_HOOK_FIX=0: the hook names the fix and applies nothing, as
 before. Not at a turn's end (turn-end.py).
 
@@ -278,39 +294,138 @@ def exact_errors(errors):
     return [d for d in errors if any(SUGGESTED.search(t) for t in d.get("try") or [])]
 
 
-def apply_exact(compiler, root, cwd):
-    """(0.18.1) `volec fix --suggested ROOT` (--json): the errors'
-    exact fixes, one checked edit. [(file, what it fixed there)], or None
-    when it changed nothing (refused, or nothing to fix)."""
-    r = run_typed(compiler, cwd, ["fix", "--suggested", "--json"] + root_args(root, cwd))
+# (0.25.2.1) The exact fixes the hook makes itself: the mechanical
+# classes, whose fix changes no meaning (a call's `&` marker, Rust's
+# spellings respelled). Every other exact fix (a did-you-mean, a
+# conversion, a `use` or a path) is shown, not made: the 0.25.2 eval's
+# wrong ones (a cast of a cast, `std::abs` of an f64, a `use` of a
+# function where a bool goes, a call made recursive) were all of these.
+MECHANICAL = ("conv.marker", "conv.marker_extra", "conv.rust")
+UNUSED = "use.unused"
+
+
+def mechanical(d):
+    return (d.get("code") or "") in MECHANICAL
+
+
+def fix_output(compiler, cwd, args):
+    """`volec fix ARGS --json`: (the `fixed` summaries [(file, what)], the
+    diff's lines, the refusals' messages), or None when it could not run."""
+    r = run_typed(compiler, cwd, ["fix"] + args + ["--json"])
     if r is None:
         return None
-    changed = []
+    changed, diff, refused = [], [], []
     for line in (r.stdout + r.stderr).splitlines():
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        f = d.get("fields") if isinstance(d, dict) and d.get("kind") == "output" else None
-        if f and str(f[0]).startswith("fixed"):
-            changed.append((str(f[1]) if len(f) > 1 else "", str(f[0])))
-    return changed or None
+        if not isinstance(d, dict):
+            continue
+        f = d.get("fields") if d.get("kind") == "output" else None
+        if f and str(f[0]).startswith("fixed") and len(f) > 1:
+            changed.append((str(f[1]), str(f[0])))
+        elif f and len(f) == 1:
+            diff.append(str(f[0]))
+        elif d.get("kind") == "diagnostic" and d.get("code") == "fix.refused":
+            refused.append(str(d.get("message") or ""))
+    return changed, diff, refused
 
 
-def fixed_report(fixed, changed, root_shown):
-    """(0.18.1) What the hook's `fix --suggested` did: a head, then each
-    fixed error with its fix (its help), at the position it had."""
+def diff_changes(diff):
+    """A unified diff's changes, one line each: `FILE:LINE: OLD -> NEW`
+    (the old line and the line it became), `FILE:LINE: + NEW` (added),
+    `FILE:LINE: - OLD` (removed); LINE is the old text's."""
+    out, path, ln, minus, plus = [], "", 0, [], []
+
+    def flush():
+        for i in range(max(len(minus), len(plus))):
+            o = minus[i] if i < len(minus) else None
+            n = plus[i] if i < len(plus) else None
+            at = f"{path}:{ln + min(i, max(len(minus) - 1, 0))}: "
+            if o is not None and n is not None:
+                out.append(f"{at}{o.strip()} -> {n.strip()}")
+            elif o is not None:
+                out.append(f"{at}- {o.strip()}")
+            elif n.strip():
+                out.append(f"{at}+ {n.strip()}")
+        minus.clear()
+        plus.clear()
+    for line in diff:
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+            path = path[2:] if path.startswith("b/") else path
+        elif line.startswith("--- "):
+            flush()
+        elif line.startswith("@@"):
+            flush()
+            m = re.match(r"@@ -(\d+)", line)
+            ln = int(m.group(1)) if m else 0
+            ln = max(ln, 1)
+        elif line.startswith("-"):
+            minus.append(line[1:])
+        elif line.startswith("+"):
+            plus.append(line[1:])
+    flush()
+    return out
+
+
+def apply_exact(compiler, root, cwd, unused_in=(), suggested=True):
+    """(0.18.1; 0.25.2.1) The mechanical exact fixes, made: `volec fix
+    --suggested --codes MECHANICAL --diff ROOT`, and `fix --only unused
+    --in FILE` for each file of unused_in (the first when suggested;
+    one checked edit each,
+    journaled: `volec undo` takes it back). ([(file, what it fixed)],
+    [each change, `FILE:LINE: OLD -> NEW`]), or None when nothing changed."""
+    changed, lines = [], []
+    runs = [["--suggested", "--codes", ",".join(MECHANICAL), "--diff"]] if suggested else []
+    runs += [["--only", "unused", "--in", f, "--diff"] for f in unused_in]
+    for args in runs:
+        got = fix_output(compiler, cwd, args + root_args(root, cwd))
+        if got is None or not got[0]:
+            continue
+        changed += got[0]
+        lines += diff_changes(got[1])
+    return (changed, lines) if changed else None
+
+
+def shown_exact(compiler, root, cwd):
+    """(0.25.2.1) The other exact fixes, not made: `volec fix --suggested
+    --dry-run ROOT`'s changes and refusals (lines), or []."""
+    got = fix_output(compiler, cwd, ["--suggested", "--dry-run"] + root_args(root, cwd))
+    if got is None:
+        return []
+    return diff_changes(got[1]) + [f"refused: {m}" for m in got[2]]
+
+
+def fixed_report(fixed, changed, root_shown, lines=()):
+    """(0.18.1) What the hook's fix did: a head, each change it made
+    (`FILE:LINE: OLD -> NEW`, 0.25.2.1), then each fixed error."""
     where = " " + root_shown if root_shown else ""
     files = ", ".join(sorted({f for f, _ in changed if f})) or "the files"
-    lines = [f"volec fix --suggested{where}, run by the hook (volec undo takes it back; positions as "
-             f"before it; {files} changed: read {'it' if ',' not in files else 'them'} again before an Edit):"]
+    head = [f"volec fix{where}, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
+            f"unused at two checks; volec undo takes it back; positions as before it; {files} changed: read "
+            f"{'it' if ',' not in files else 'them'} again before an Edit):"]
+    out = head + [f"changed {x}" for x in lines]
     for d in fixed:
         pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
         fix = " | ".join(d.get("help") or []) or "its exact fix"
-        lines.append(f"fixed {pos}{d.get('message', '')} | {fix}")
-    if not fixed:
-        lines.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
-    return "\n".join(lines)
+        out.append(f"fixed {pos}{d.get('message', '')} | {fix}")
+    if not fixed and not lines:
+        out.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
+    return "\n".join(out)
+
+
+def shown_report(lines, root_shown, compiler, cwd):
+    """(0.25.2.1) The exact fixes the hook did not make: each change, for
+    the agent to judge (and make with `volec fix --suggested ROOT`)."""
+    where = " " + root_shown if root_shown else ""
+    name = volec_shown(compiler, cwd)
+    more = [f"  ({len(lines) - MAX_SHOWN} more: {name} fix --suggested{where} --dry-run)"] \
+        if len(lines) > MAX_SHOWN else []
+    return "\n".join([f"suggested, not applied (check each: a name, a conversion or an import can change "
+                      f"what the code means; {name} fix --suggested{where} makes the changes, not the refused):"]
+                     + [f"  {x}" for x in lines[:MAX_SHOWN]] + more)
 
 
 def typed_name(compiler, cwd):
@@ -660,36 +775,54 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     key_root = root or default_root(cwd)
     shown = root_shown(root, cwd, run_dir)
     errors = [d for d in diags if d.get("severity") == "error"]
-    # (0.18.1) the errors' exact fixes, applied: fix --suggested, then check again
-    fixed_text, hook_fixed = "", None
-    exact = exact_errors(errors) if not at_turn_end and os.environ.get("VOLE_HOOK_FIX", "1") != "0" else []
-    if exact and expects_errors(cwd, key_root, edited):
-        exact = []
-    if exact:
-        changed = apply_exact(compiler, root, run_dir)
-        again = run_check(compiler, root, run_dir) if changed else None
+    # (0.18.1) the errors' exact fixes, applied: fix --suggested, then
+    # check again; (0.25.2.1) only the mechanical ones, and the unused
+    # imports that were unused at the last check too (not one the agent
+    # has just written); the other exact fixes shown, not made
+    fixed_text, hook_fixed, shown_text = "", None, ""
+    key = key_root or ("check@" + cwd)
+    prev = (st.get("roots") or {}).get(key) or {}
+    allowed = not at_turn_end and os.environ.get("VOLE_HOOK_FIX", "1") != "0" \
+        and not expects_errors(cwd, key_root, edited)
+    exact = exact_errors(errors) if allowed else []
+    mech = [d for d in exact if mechanical(d)]
+    unused = [d for d in diags if d.get("code") == UNUSED]
+    unused_keys = [error_key(d) for d in unused]
+    stale = []
+    if allowed and not errors:
+        for f in sorted({d.get("file") or "" for d in unused}):
+            mine = [error_key(d) for d in unused if d.get("file") == f]
+            if f and all(k in (prev.get("unused") or []) for k in mine):
+                stale.append(f)
+    if mech or stale:
+        done = apply_exact(compiler, root, run_dir, stale, bool(mech))
+        again = run_check(compiler, root, run_dir) if done else None
         if again is not None:
+            diags = again
             errors = [d for d in again if d.get("severity") == "error"]
+            unused_keys = [error_key(d) for d in again if d.get("code") == UNUSED]
             left = {}
             for d in errors:
                 left[error_key(d)] = left.get(error_key(d), 0) + 1
             fixed = []
-            for d in exact:
+            for d in mech:
                 if left.get(error_key(d), 0) > 0:
                     left[error_key(d)] -= 1
                 else:
                     fixed.append(d)
             hook_fixed = len(fixed)
-            fixed_text = fixed_report(fixed, changed, shown)
+            fixed_text = fixed_report(fixed, done[0], shown, done[1])
+    if allowed and any(not mechanical(d) for d in exact_errors(errors)):
+        lines = shown_exact(compiler, root, run_dir)
+        if lines:
+            shown_text = shown_report(lines, shown, compiler, run_dir)
     roots = st.setdefault("roots", {})
-    key = key_root or ("check@" + cwd)
-    prev = roots.get(key) or {}
     keys = [error_key(d) for d in errors]
     text = report(errors, shown, edited) if at_turn_end else delta_report(errors, prev.get("errors"), shown, edited)
     if fixed_text and not text:
         text = f"volec check{' ' + shown if shown else ''}: 0 errors"
-    texts = [t for t in (fixed_text, text) if t]
-    entry = {"errors": keys, "time": time.time(), "root": key_root}
+    texts = [t for t in (fixed_text, text, shown_text) if t]
+    entry = {"errors": keys, "time": time.time(), "root": key_root, "unused": unused_keys}
     fp = hs.fingerprint(key_root)[0] if key_root else ""
     entry["fp"] = fp
     # hint: the same mistake made twice, or an error that names a guide topic

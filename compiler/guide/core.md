@@ -71,7 +71,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     let z = 0;
-    println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; no methods on numbers; x / 0 == 0
+    println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; x / 0 == 0
     unsafe { c::puts(c"from C"); }     // C calls need unsafe; c"..": a NUL-terminated *u8
     if z != 0 { panic("z"); }          // exit 101; unreachable()
     0
@@ -182,6 +182,9 @@ them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
 are checked at run time, a failure one line `FILE:L:C: message` (`guide
 testing`, `guide contracts`).
 
+Float math (0.25.2.1): Rust's methods on f32 and f64, no `use`
+(`x.sqrt()`, `x.sin()`, `y.atan2(x)`, `x.powi(2)`, `a.max(b)`) and
+constants (`f64::consts::PI`, `f64::EPSILON`), in vole: `volec guide math`.
 SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
 `__crc32cd`) checked against the CPU: `volec guide arch`; `query arch WORDS`.
 GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.

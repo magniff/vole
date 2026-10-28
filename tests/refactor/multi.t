@@ -159,6 +159,7 @@ shapes.vl:23:21: error[type error] undefined variable 'k'  [edited: crate::shape
 error edit.breaks: 1 new error; nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --rename-param k f
+note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(r: Rect, f: i64)' --no-check
 [exit 1]
 $ edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, r: Rect)'

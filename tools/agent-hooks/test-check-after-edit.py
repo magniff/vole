@@ -304,66 +304,124 @@ try:
 
     # (0.18.1) The exact fixes, applied: errors whose try: names `fix
     # --suggested` make the hook run it (a fake: `fix` writes fixed.out's
-    # lines and a mark; check then prints after.out), check again, and say
-    # what it fixed (each error with its help) before what is left.
+    # lines and a mark; `fix --dry-run` writes dry.out's; check then
+    # prints after.out), check again, and say what it fixed before what
+    # is left. (0.25.2.1) Only the mechanical classes (conv.marker,
+    # conv.rust), each change shown `FILE:LINE: OLD -> NEW`; the other
+    # exact fixes (a did-you-mean, a `use`) are shown, not made.
     fdir3 = os.path.join(tmp, "fake3")
     os.makedirs(fdir3)
     fake3 = os.path.join(fdir3, "volec")
-    write(fake3, "#!/bin/sh\nd='%s'\nif [ \"$1\" = fix ]; then echo \"$@\" >>\"$d/fix.calls\"; cat \"$d/fixed.out\"; "
+    write(fake3, "#!/bin/sh\nd='%s'\nif [ \"$1\" = fix ]; then echo \"$@\" >>\"$d/fix.calls\"; "
+                 "case \" $* \" in *' --dry-run '*) cat \"$d/dry.out\"; exit 0;; esac; cat \"$d/fixed.out\"; "
                  "[ -s \"$d/fixed.out\" ] && : >\"$d/mark\"; exit 0; fi\n"
                  "if [ -f \"$d/mark\" ]; then cat \"$d/after.out\" >&2; [ -s \"$d/after.out\" ] && exit 1; exit 0; fi\n"
                  "cat \"$d/check.out\" >&2\n[ -s \"$d/check.out\" ] && exit 1\nexit 0\n" % fdir3)
     os.chmod(fake3, 0o755)
     sug = "volec fix --suggested main.vl"
-    typo = dict(diag("main.vl", 2, "undefined variable 'prinln'", help=["did you mean 'println'?"]), **{"try": [sug]})
-    nouse = dict(diag("main.vl", 3, "undefined variable 'is_digit'", help=["add `use std::is_digit;`"]), **{"try": [sug]})
-    other = diag("main.vl", 4, "expected '[u8]', got 'i64'")
+    marker = dict(diag("main.vl", 2, "'ui' is lent inout here (the callee may change it): mark it '&ui'",
+                       code="conv.marker"), **{"try": [sug]})
+    spell = dict(diag("main.vl", 3, "'let mut' is Rust's spelling; a mutable binding is 'var x'", code="conv.rust"),
+                 **{"try": [sug]})
+    typo = dict(diag("main.vl", 4, "undefined variable 'prinln'", help=["did you mean 'println'?"]), **{"try": [sug]})
+    other = diag("main.vl", 5, "expected '[u8]', got 'i64'")
 
-    def fake3_says(check, fixed, after):
+    def out_lines(*fields):
+        return [list(f) for f in fields]
+
+    def fake3_says(check, fixed, after, dry=()):
         for f in ("mark", "fix.calls"):
             if os.path.exists(os.path.join(fdir3, f)):
                 os.remove(os.path.join(fdir3, f))
         write(os.path.join(fdir3, "check.out"), "".join(json.dumps(d) + "\n" for d in check))
         write(os.path.join(fdir3, "fixed.out"), "".join(json.dumps({"kind": "output", "fields": f}) + "\n" for f in fixed))
         write(os.path.join(fdir3, "after.out"), "".join(json.dumps(d) + "\n" for d in after))
+        write(os.path.join(fdir3, "dry.out"), "".join(json.dumps(d if isinstance(d, dict) else
+                                                                 {"kind": "output", "fields": d}) + "\n" for d in dry))
 
     def fix_calls():
         p = os.path.join(fdir3, "fix.calls")
-        return open(p).read().split("\n")[0] if os.path.exists(p) else ""
-    head = ("volec fix --suggested main.vl, run by the hook (volec undo takes it back; positions as before it; "
-            "main.vl changed: read it again before an Edit):")
-    fake3_says([typo, nouse, other], [["fixed 1 missing import, 1 suggested fix", "main.vl", "+3 -1 lines"]],
-               [dict(other, line=6)])
+        return open(p).read().strip().split("\n") if os.path.exists(p) else []
+    head = ("volec fix main.vl, run by the hook (only mechanical fixes: a call's `&`, Rust's spellings, an import "
+            "unused at two checks; volec undo takes it back; positions as before it; main.vl changed: read it "
+            "again before an Edit):")
+    shown = ("suggested, not applied (check each: a name, a conversion or an import can change what the code "
+             "means; " + fake3 + " fix --suggested main.vl makes the changes, not the refused):")
+    diff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -2,2 +2,2 @@"], ["-    bump(ui);"], ["-    let mut u = 0;"],
+            ["+    bump(&ui);"], ["+    var u = 0;"]]
+    fake3_says([marker, spell, typo, other], [["fixed 2 suggested fixes", "main.vl", "+2 -2 lines"]] + diff,
+               [dict(typo, line=4), dict(other, line=6)],
+               [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -4 +4 @@"], ["-    prinln(\"x\");"], ["+    println(\"x\");"]])
     got = ctx_of(run(ev, fake3)[1])
-    case("hook fix: applied, then what is left", (fix_calls(), got),
-         ("fix --suggested --json main.vl",
-          head + "\nfixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?"
-          "\nfixed main.vl:3:5: undefined variable 'is_digit' | add `use std::is_digit;`"
-          "\nvolec check main.vl: 1 error\nmain.vl:6:5: error[type error] expected '[u8]', got 'i64'"))
-    fake3_says([typo], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
+    case("hook fix: the mechanical ones applied, each change shown; the others shown, not made",
+         (fix_calls(), got),
+         (["fix --suggested --codes conv.marker,conv.marker_extra,conv.rust --diff main.vl --json",
+           "fix --suggested --dry-run main.vl --json"],
+          head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
+          "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
+          "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
+          "\nvolec check main.vl: 2 errors\ntry: volec fix --suggested main.vl   (1 of the errors: their exact "
+          "fixes, one checked edit)\nmain.vl:4:5: error[type error] undefined variable 'prinln' | help: did you "
+          "mean 'println'?\nmain.vl:6:5: error[type error] expected '[u8]', got 'i64'\n"
+          + shown + "\n  main.vl:4: prinln(\"x\"); -> println(\"x\");"))
+    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]] + diff[:4] + [diff[5]], [])
     case("hook fix: all fixed, clean", ctx_of(run(ev, fake3)[1]),
-         head + "\nfixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?\nvolec check main.vl: 0 errors")
+         head + "\nchanged main.vl:2: bump(ui); -> bump(&ui);"
+         "\nfixed main.vl:2:5: 'ui' is lent inout here (the callee may change it): mark it '&ui' | its exact fix"
+         "\nvolec check main.vl: 0 errors")
+    # (0.25.2.1) a did-you-mean is not made (the gpu2521 agent's
+    # `readback` made `read_back`, the function the call was in); the
+    # compiler's refusal is shown with the rest
+    refusal = {"kind": "diagnostic", "severity": "note", "code": "fix.refused", "file": None, "line": None,
+               "col": None, "message": "main.vl:4:5: not applied: `read_back`: the name it puts there is the "
+               "function the call is in: the call would call itself", "help": [], "notes": [], "try": []}
+    rec = dict(typo, message="undefined variable 'readback'", help=["did you mean 'read_back'?"])
+    fake3_says([rec], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [], [refusal])
+    got = ctx_of(run(ev, fake3)[1])
+    case("hook fix: a did-you-mean not made, its refusal shown", (fix_calls(), got.split("\n")[-2:]),
+         (["fix --suggested --dry-run main.vl --json"],
+          [shown, "  refused: main.vl:4:5: not applied: `read_back`: the name it puts there is the function the "
+                  "call is in: the call would call itself"]))
     fake3_says([other], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     case("hook fix: not without an exact fix", (ctx_of(run(ev, fake3)[1]), fix_calls()),
-         ("volec check main.vl: 1 error\nmain.vl:4:5: error[type error] expected '[u8]', got 'i64'", ""))
-    fake3_says([typo], [], [])
+         ("volec check main.vl: 1 error\nmain.vl:5:5: error[type error] expected '[u8]', got 'i64'", []))
+    fake3_says([marker], [], [])
     case("hook fix: refused or nothing done, named as before", ctx_of(run(ev, fake3)[1]),
          "volec check main.vl: 1 error\ntry: volec fix --suggested main.vl   (the error: their exact fixes, "
-         "one checked edit)\nmain.vl:2:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?")
-    fake3_says([typo], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
+         "one checked edit)\nmain.vl:2:5: error[conv.marker] 'ui' is lent inout here (the callee may change it): "
+         "mark it '&ui'")
+    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     os.environ["VOLE_HOOK_FIX"] = "0"
     got = ctx_of(run(ev, fake3)[1])
     del os.environ["VOLE_HOOK_FIX"]
     case("hook fix: VOLE_HOOK_FIX=0 applies nothing", (fix_calls(), got.split("\n")[1]),
-         ("", "try: volec fix --suggested main.vl   (the error: their exact fixes, one checked edit)"))
+         ([], "try: volec fix --suggested main.vl   (the error: their exact fixes, one checked edit)"))
     # (0.19) A test case meant to fail (`// ERROR:` lines) is left as it
     # is: its fixes are named, not applied.
     write(os.path.join(prog, "main.vl"), "// ERROR: undefined variable 'prinln'\nfn main() {}\n")
-    fake3_says([typo], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
+    fake3_says([marker], [["fixed 1 suggested fix", "main.vl", "+1 -1 lines"]], [])
     got = ctx_of(run(ev, fake3)[1])
     write(os.path.join(prog, "main.vl"), "mod util;\nfn main() {}\n")
     case("hook fix: not in an ERROR test case", (fix_calls(), got.split("\n")[1]),
-         ("", "try: volec fix --suggested main.vl   (the error: their exact fixes, one checked edit)"))
+         ([], "try: volec fix --suggested main.vl   (the error: their exact fixes, one checked edit)"))
+    # (0.25.2.1) An unused import is removed only when it was unused at
+    # the last check too (not one the agent has just written).
+    unused = diag("main.vl", 1, "unused import 'I64_MAX': nothing in this file names it", sev="warning",
+                  code="use.unused")
+    ustate = tempfile.mkdtemp(dir=tmp)
+    uev = dict(ev, session_id="unused")
+    fake3_says([unused], [["fixed 1 unused import", "main.vl", "+0 -1 lines"], ["--- a/main.vl"], ["+++ b/main.vl"],
+                          ["@@ -1 +0,0 @@"], ["-use std::I64_MAX;"]], [])
+    first = (run(uev, fake3, ustate)[1], fix_calls())
+    case("hook fix: an import just unused is kept", first, ("", []))
+    got = ctx_of(run(uev, fake3, ustate)[1])
+    case("hook fix: an import unused at two checks is removed", (fix_calls(), got),
+         (["fix --only unused --in main.vl --diff main.vl --json"],
+          head + "\nchanged main.vl:1: - use std::I64_MAX;\nvolec check main.vl: 0 errors"))
+    case("diff changes: replaced, added, removed",
+         hook.diff_changes(["--- a/x.vl", "+++ b/x.vl", "@@ -3,2 +3,3 @@", "-a", "-b", "+A", "+B", "+C",
+                            "@@ -9 +10,0 @@", "-z"]),
+         ["x.vl:3: a -> A", "x.vl:4: b -> B", "x.vl:4: + C", "x.vl:9: - z"])
     with open(log) as fh:
         recs = [json.loads(x) for x in fh if x.strip()]
     case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:2], [2, 1])
@@ -436,7 +494,9 @@ try:
 
     # The real compiler, when it has --json (0.15): a clean program is
     # silent, an error is reported; and the latency on a cache hit.
-    real = os.path.join(REPO, "target", "volec")
+    # (0.25.2.1) The compiler under test when tests/run.sh says which
+    # (VOLE_TEST_COMPILER): target/volec may be an older build then.
+    real = os.environ.get("VOLE_TEST_COMPILER") or os.path.join(REPO, "target", "volec")
     probe = subprocess.run([real, "check", "--json", "/nonexistent.vl"], capture_output=True, text=True) \
         if os.access(real, os.X_OK) else None
     if probe is not None and "unknown option" not in probe.stderr:
@@ -448,15 +508,18 @@ try:
         st, out = run(ev2, real)
         case("real: the error", json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else "",
              "volec check main.vl: 1 error\nmain.vl:2:18: error[type error] undefined variable 'q'")
-        # (0.18.1) the hook applies the exact fix: the file is changed
-        write(os.path.join(prog, "main.vl"), "fn main() {\n    prinln(\"x\");\n    let y = 1 + \"a\";\n}\n")
+        # (0.18.1) the hook applies the exact fix: the file is changed;
+        # (0.25.2.1) a mechanical one only: a did-you-mean is shown
+        write(os.path.join(prog, "main.vl"), "fn main() {\n    prinln(\"x\");\n    let mut y = 1 + \"a\";\n}\n")
         got = ctx_of(run(ev2, real)[1])
         with open(os.path.join(prog, "main.vl")) as fh:
             now = fh.read()
-        case("real: the hook's exact fix", (got.split("\n")[1:], "println(\"x\")" in now),
-             (["fixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?",
-               "volec check main.vl: 1 error",
-               "main.vl:3:13: error[type error] expected '[u8]', got 'i64'"], True))
+        lines = got.split("\n")
+        case("real: the hook's exact fix", ([x for x in lines if x.startswith(("changed", "fixed", "  main"))],
+                                            "var y" in now, "println(\"x\")" in now),
+             (["changed main.vl:3: let mut y = 1 + \"a\"; -> var y = 1 + \"a\";",
+               "fixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix",
+               "  main.vl:2: prinln(\"x\"); -> println(\"x\");"], True, False))
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):

@@ -5,7 +5,7 @@
 $ check --json
 $ query def add --json
 crate::add	main.vl:3:4	fn	fn add(a: i64, b: i64) -> i64	effects: none
-std::ops::Add::add	<std>:4787:20	trait-method	fn add(self, other: Self) -> Self
+std::ops::Add::add	<std>:4788:20	trait-method	fn add(self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.vl
@@ -16,7 +16,8 @@ $ query show nosuch --json
 ## An edit's new errors, its refusal, its summary.
 $ edit patch add --old 'a + b' --new 'a + q' --json
 {"kind":"diagnostic","severity":"error","code":"type error","file":"main.vl","line":4,"col":9,"message":"undefined variable 'q'  [edited: crate::add]","help":[],"notes":[],"try":[]}
-{"kind":"diagnostic","severity":"error","code":"edit.breaks","file":null,"line":null,"col":null,"message":"1 new error; nothing written","help":[],"notes":[],"try":["volec edit patch add --old 'a + b' --new 'a + q' --no-check"]}
+{"kind":"diagnostic","severity":"error","code":"edit.breaks","file":null,"line":null,"col":null,"message":"1 new error; nothing written","help":[],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"note","code":"edit.together","file":null,"line":null,"col":null,"message":"several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check","help":[],"notes":[],"try":["volec edit patch add --old 'a + b' --new 'a + q' --no-check"]}
 [exit 1]
 $ edit patch add --old 'a + b' --new 'b + a' --json
 {"kind":"output","fields":["patched crate::add","main.vl","+1 -1 lines"]}

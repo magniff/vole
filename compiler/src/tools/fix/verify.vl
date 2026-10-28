@@ -1,0 +1,606 @@
+// (0.25.2.1) `fix --suggested` makes only the fixes that are safe. The
+// 0.25.2 GPU eval: in 4 runs of 10 a fix the hook applied was wrong (a
+// float's `x.abs()` became `std::abs(x as i64)`, which truncates, and the
+// program's own checks then passed falsely; a cast chain became a double
+// cast; a `use` of std's internals for a local not yet written; an import
+// a second time). So:
+//
+// - before the edit (refusal_of), a conversion is made only when it keeps
+//   the value: never float to int, f64 to f32, to a narrower or other-
+//   signed int, nor of an expression that is a cast already (the cast, or
+//   the type of the place it goes to, is what to change);
+// - after it (verify_fixes), the edited program is checked: a fix whose
+//   own lines have an error the program had not, or whose error's place
+//   has a new one (the fix changed what is there to another type, an
+//   import brought something else than the name meant), is taken out and
+//   the rest checked again; each fix taken out is a `note fix.refused`
+//   with the error it made. A round of fix on the edited program checks
+//   its own fixes so too, so a later round never builds on a wrong fix.
+//
+// The imports a fix adds are not made twice (fix/mod.vl's
+// missing_use_edits): not for a name a `use` of the module imports
+// already, nor for one a fix of a `use` line spells.
+
+use crate::base::{
+    BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NODE_IMPLICIT, NodeKind};
+use crate::front::modules::{file_of_pos, within_std};
+use crate::front::types::{FNS, FN_COUNT, buf_type, fn_param, is_numeric};
+use crate::tools::edit::{drop_replaces, replace_at, replace_count};
+use crate::tools::edit::apply::{check_edited, prepare_edit, undo_copies, write_round_copies};
+use crate::tools::edit::breaks::{changed_index, hunks};
+use crate::tools::edit::diff::file_by_path;
+use crate::tools::proc::same_bytes;
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::positions::{line_of, line_start};
+use crate::tools::query::refs::file_text;
+
+// The replacements of the edit a fix made: the replacement's index, the
+// index in fix's counts it adds to, the number of fixes it is (0: one
+// more place of the same), the position of its error (-1: none), in fours.
+static var FIX_EDITS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The fix just added as replacement `edit` (edit_replace) is `n` fixes of
+// kind `cat` (fix's counts), for the error at `pos`.
+pub fn note_fix(edit: i64, cat: i64, n: i64, pos: i64) {
+    FIX_EDITS.push(edit);
+    FIX_EDITS.push(cat);
+    FIX_EDITS.push(n);
+    FIX_EDITS.push(pos);
+}
+
+// The index of the last replacement made (after an edit_replace that
+// returned true).
+pub fn last_replace() -> i64 {
+    replace_count() - 1
+}
+
+// ---- Before: conversions that keep the value ----
+
+// Whether a did-you-mean replacing the called name SRC[start..end) by t
+// names the innermost function holding it (`readback(x)` respelled
+// `read_back(x)` inside `fn read_back`): it type-checks and recurses.
+fn renames_to_self(start: i64, end: i64, t: [u8]) -> bool {
+    // UNSAFE: SRC (the sources' text), NODES (front/ast) and FILES are the compiler's raw tables.
+    // SAFETY: start < end are a fix's positions in SRC; q stops at its file's end; n < NODE_COUNT; p moves within [the fn's start, start).
+    unsafe {
+        if t.len == 0 || end <= start {
+            return false;
+        }
+        for i in 0..t.len {
+            let c = t[i];
+            if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')) {
+                return false;
+            }
+        }
+        var q = end;
+        let fe = crate::base::FILES[file_of_pos(start)].end;
+        while q < fe && (SRC[q] == ' ' || SRC[q] == '\t') {
+            q += 1;
+        }
+        if q >= fe || SRC[q] != '(' {
+            return false;
+        }
+        var best = 0;
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Fn && NODES[n].start <= start && start < NODES[n].end
+                && (best == 0 || NODES[n].start >= NODES[best].start) {
+                best = n;
+            }
+        }
+        if best == 0 {
+            return false;
+        }
+        // (its name: the word after `fn `)
+        var p = NODES[best].start;
+        while p + 3 < start && !(SRC[p] == 'f' && SRC[p + 1] == 'n' && SRC[p + 2] == ' ') {
+            p += 1;
+        }
+        p += 3;
+        while SRC[p] == ' ' {
+            p += 1;
+        }
+        let s = p;
+        while p < start && SRC[p] != '(' && SRC[p] != '<' && SRC[p] != ' ' {
+            p += 1;
+        }
+        same_bytes(SRC[s..p], t)
+    }
+}
+
+// (0.25.2.1) Why a method call respelled as std's function (SRC[start..
+// end), `x.abs()`, by text t, `std::abs(x)`) changes the value's type, or
+// "": the function takes a number of another type than the receiver's,
+// which converts to it (ocean's `(a - b).abs()` of i32s: an i64 after it).
+fn type_change(start: i64, end: i64, t: [u8]) -> [u8] {
+    var p = if t.len > 5 && same_bytes(t[0..5], "std::") { 5 } else { 0 };
+    let s = p;
+    while p < t.len && t[p] != '(' {
+        p += 1;
+    }
+    if p >= t.len || p == s {
+        return "";
+    }
+    let name = t[s..p];
+    // UNSAFE: NODES (front/ast), FNS and SYMS (front/types, base) are the
+    // compiler's raw tables.
+    // SAFETY: i < NODE_COUNT, f < FN_COUNT; recv is a node of the call
+    // found (its receiver); display is an interned symbol.
+    unsafe {
+        var rt = 0;
+        for i in 1..NODE_COUNT {
+            if NODES[i].kind == NodeKind::MethodCall && NODES[i].start == start
+                && NODES[i].end == end
+                && NODES[i].a > 0 {
+                rt = NODES[NODES[i].a].ty;
+            }
+        }
+        if rt <= 0 || !is_numeric(rt) {
+            return "";
+        }
+        for f in 0..FN_COUNT {
+            if FNS[f].tmpl != 0 || FNS[f].self_ty != 0 || FNS[f].param_count < 1
+                || !within_std(FNS[f].module) {
+                continue;
+            }
+            let d = SYMS[FNS[f].display].text;
+            let named = same_bytes(d, name)
+                || (d.len > name.len + 2 && same_bytes(d[d.len - name.len..d.len], name)
+                    && d[d.len - name.len - 1] == ':');
+            let pt = fn_param(f, 0);
+            if named && is_numeric(pt) && pt != rt {
+                let b = buf_new();
+                buf_str(b, c"std's `");
+                buf_bytes(b, name);
+                buf_str(b, c"` takes ");
+                buf_type(b, pt);
+                buf_str(b, c" and the value is ");
+                buf_type(b, rt);
+                buf_str(b, c": what it gives has another type");
+                return buf_slice(b);
+            }
+        }
+        ""
+    }
+}
+
+// Why the fix replacing SRC[start..end) by buffer `text` is not to be made,
+// or "" when nothing is against it: a conversion (`X as T`, `(X) as T` of
+// the text X there) that loses the value, or of a cast; a did-you-mean
+// that makes a call call the function it is in; std's function for a
+// method that takes another type than the value's (type_change).
+pub fn refusal_of(start: i64, end: i64, text: i64) -> [u8] {
+    // UNSAFE: SRC and NODES are the compiler's raw tables (the sources' text, the parser's nodes).
+    // SAFETY: start..end is an error's span in SRC (record_error checks it); i < NODE_COUNT.
+    unsafe {
+        let t = buf_slice(text);
+        let x = SRC[start..end];
+        if renames_to_self(start, end, t) {
+            return "the name it puts there is the function the call is in: the call would call itself";
+        }
+        let changed = type_change(start, end, t);
+        if changed.len > 0 {
+            return changed;
+        }
+        var k = -1;
+        if t.len > x.len + 4 && same_bytes(t[0..x.len], x)
+            && same_bytes(t[x.len..x.len + 4], " as ") {
+            k = x.len + 4;
+        } else if t.len > x.len + 6 && t[0] == '(' && same_bytes(t[1..x.len + 1], x)
+            && same_bytes(t[x.len + 1..x.len + 6], ") as ") {
+            k = x.len + 6;
+        }
+        if k < 0 {
+            return "";
+        }
+        let to = t[k..t.len];
+        var n = 0;
+        var cast = false;
+        for i in 1..NODE_COUNT {
+            if NODES[i].start != start || NODES[i].end != end {
+                continue;
+            }
+            if NODES[i].kind == NodeKind::Cast && (NODES[i].p & NODE_IMPLICIT) == 0 {
+                cast = true;
+            }
+            if n == 0 && (NODES[i].p & NODE_IMPLICIT) == 0 && NODES[i].ty > 0 {
+                n = i;
+            }
+        }
+        if cast {
+            return "it converts what a cast gives: the cast's type, or the type of the place it goes to, is what to change";
+        }
+        if n == 0 {
+            return "";
+        }
+        let b = buf_new();
+        buf_type(b, NODES[n].ty);
+        let from = buf_slice(b);
+        lossy(from, to)
+    }
+}
+
+// Why converting a `from` to a `to` (type names) loses the value, or "".
+fn lossy(from: [u8], to: [u8]) -> [u8] {
+    let fb = float_bits(from);
+    let tb = float_bits(to);
+    let fi = int_bits(from);
+    let ti = int_bits(to);
+    if fb > 0 && ti > 0 {
+        return "a float to an integer drops the fraction and wraps out of range";
+    }
+    if fb == 64 && tb == 32 {
+        return "f64 to f32 rounds";
+    }
+    if fi > 0 && ti > 0 {
+        let fs = from[0] == 'i';
+        let ts = to[0] == 'i';
+        if (fs == ts && ti < fi) || (fs && !ts) || (!fs && ts && ti <= fi) {
+            return "the integer type it goes to does not hold every value: it wraps";
+        }
+    }
+    if fi > 16 && tb == 32 {
+        return "an integer this wide to f32 rounds past 2^24";
+    }
+    ""
+}
+
+fn float_bits(t: [u8]) -> i64 {
+    if t == "f32" { 32 } else if t == "f64" { 64 } else { 0 }
+}
+
+fn int_bits(t: [u8]) -> i64 {
+    if t == "i8" || t == "u8" {
+        8
+    } else if t == "i16" || t == "u16" {
+        16
+    } else if t == "i32" || t == "u32" {
+        32
+    } else if t == "i64" || t == "u64" || t == "isize" || t == "usize" {
+        64
+    } else {
+        0
+    }
+}
+
+// `note fix.refused: PLACE: not applied: `TEXT`: WHY`, PLACE the fix's
+// error (else where it is).
+pub fn note_refused(pos: i64, text: [u8], why: [u8]) {
+    let d = diag(c"note", c"fix.refused");
+    put_place(d, pos);
+    buf_str(d, c": not applied: `");
+    put_trimmed(d, text);
+    buf_str(d, c"`: ");
+    buf_bytes(d, why);
+    buf_byte(d, '\n');
+}
+
+fn put_place(out: i64, pos: i64) {
+    buf_bytes(out, file_text(file_of_pos(pos)));
+    buf_byte(out, ':');
+    buf_int(out, line_of(pos));
+    buf_byte(out, ':');
+    buf_int(out, pos - line_start(pos) + 1);
+}
+
+// Text without its leading and trailing blank lines and spaces, its other
+// newlines as ` `.
+fn put_trimmed(out: i64, t: [u8]) {
+    var a = 0;
+    var b = t.len;
+    while a < b && (t[a] == ' ' || t[a] == '\n' || t[a] == '\t') {
+        a += 1;
+    }
+    while b > a && (t[b - 1] == ' ' || t[b - 1] == '\n' || t[b - 1] == '\t') {
+        b -= 1;
+    }
+    for i in a..b {
+        buf_byte(out, if t[i] == '\n' { ' ' } else { t[i] });
+    }
+}
+
+// ---- After: the edited program checked ----
+
+// Checks the edited program (its copies written: prepare_edit, or
+// write_round_copies in a round) and takes out each fix it finds wrong
+// (see the head), writing the copies again; at most 4 times. counts:
+// fix's, less the fixes taken out. Whether a replacement is left.
+pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
+    // UNSAFE: FIX_EDITS and LINES are static vars (this module's, positions'); replace_at reads the edit's.
+    // SAFETY: the indices are below their vectors' counts; the line table is made from SRC before any use.
+    unsafe {
+        // (the line table: a program the lexer stopped in has none yet)
+        if crate::tools::query::positions::LINES.count == 0 {
+            crate::tools::query::positions::init_positions();
+        }
+        for _ in 0..4 {
+            var added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if !check_edited(root, &added) || added.count == 0 {
+                return true;
+            }
+            var bad = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var why = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..added.count {
+                let line = buf_slice(added.data[i]);
+                var l = 0;
+                var c = 0;
+                let f = place_in(line, &l, &c);
+                if f >= 0 {
+                    blame(f, l, c, added.data[i], &bad, &why);
+                }
+            }
+            if bad.count == 0 {
+                return true;
+            }
+            sort_pairs(&bad, &why);
+            for k in 0..bad.count {
+                let e = bad.data[k];
+                let (s, _, text) = replace_at(e);
+                var pos = s;
+                var j = 0;
+                while j < FIX_EDITS.count {
+                    if FIX_EDITS.data[j] == e {
+                        if FIX_EDITS.data[j + 3] >= 0 && pos == s {
+                            pos = FIX_EDITS.data[j + 3];
+                        }
+                        counts[FIX_EDITS.data[j + 1]] -= FIX_EDITS.data[j + 2];
+                    }
+                    j += 4;
+                }
+                let w = buf_new();
+                buf_str(w, c"the edited program has a new error with it: ");
+                // (the error's place, code and message: not its help)
+                let y = buf_slice(why.data[k]);
+                var cut = 0;
+                while cut < y.len && !(cut + 3 <= y.len && same_bytes(y[cut..cut + 3], " | ")) {
+                    cut += 1;
+                }
+                buf_bytes(w, y[0..cut]);
+                note_refused(pos, buf_slice(text), buf_slice(w));
+            }
+            renumber(bad);
+            undo_copies();
+            drop_replaces(bad);
+            if replace_count() == 0 {
+                return false;
+            }
+            if round {
+                if !write_round_copies() {
+                    return false;
+                }
+            } else if prepare_edit() >= 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The file, line and column of a short diagnostic line (`PATH:L:C: error[`).
+fn place_in(line: [u8], l: inout i64, c: inout i64) -> i64 {
+    var at = -1;
+    var i = 0;
+    while i + 8 <= line.len {
+        if line[i] == ':' && line[i + 1] == ' ' && same_bytes(line[i + 2..i + 8], "error[") {
+            at = i;
+            break;
+        }
+        i += 1;
+    }
+    if at < 0 {
+        return -1;
+    }
+    // PATH:L:C: the two numbers before `at`
+    var c2 = at - 1;
+    while c2 > 0 && line[c2] != ':' {
+        c2 -= 1;
+    }
+    var c1 = c2 - 1;
+    while c1 > 0 && line[c1] != ':' {
+        c1 -= 1;
+    }
+    if c1 <= 0 {
+        return -1;
+    }
+    l = digits(line[c1 + 1..c2]);
+    c = digits(line[c2 + 1..at]);
+    if l <= 0 || c <= 0 {
+        return -1;
+    }
+    file_by_path(line[0..c1])
+}
+
+fn digits(s: [u8]) -> i64 {
+    var n = 0;
+    for i in 0..s.len {
+        if s[i] < '0' || s[i] > '9' {
+            return -1;
+        }
+        n = n * 10 + (s[i] - '0') as i64;
+    }
+    n
+}
+
+// The replacements to blame for a new error at line l, column c of file f
+// (the edited text's) into bad (once each), the error's line in why: one
+// whose text holds that place (its own code has the error; a text of
+// several lines, or one the formatter laid out again: any line of its
+// hunk), and a fix whose error was at that place before (what it put
+// there, or what its import brought, is not what the place takes).
+// Another new error on a line a fix wrote (a second error of the line
+// the checker reaches now) blames nothing: a later round fixes it.
+fn blame(f: i64, l: i64, c: i64, line: i64, bad: inout IntVec, why: inout IntVec) {
+    // UNSAFE: BUFS (the buffers) and FIX_EDITS are static vars, IntVec data raw pointers.
+    // SAFETY: e < replace_count(); FIX_EDITS is read in fours below its count; h's hunks in fours below h.count.
+    unsafe {
+        let ci = changed_index(f);
+        var h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if ci >= 0 {
+            hunks(ci, &h);
+        }
+        for e in 0..replace_count() {
+            let (s, en, text) = replace_at(e);
+            if file_of_pos(s) != f {
+                continue;
+            }
+            var hit = false;
+            let t = buf_slice(text);
+            var nl = false;
+            for i in 0..t.len {
+                if t[i] == '\n' {
+                    nl = true;
+                }
+            }
+            var c0 = 0;
+            let l0 = new_place(h, f, s, e, &c0);
+            if !nl && l0 > 0 {
+                hit = l == l0 && c >= c0 && (c < c0 + t.len || c == c0);
+            } else {
+                // (the hunk holding the replacement's old lines)
+                let l1 = line_of(s);
+                let l2 = if en > s { line_of(en - 1) } else { l1 };
+                var k = 0;
+                while k < h.count {
+                    let a = h.data[k];
+                    let b = h.data[k + 1];
+                    let hc = h.data[k + 2];
+                    let hd = h.data[k + 3];
+                    let holds = if b > 0 { l1 <= a + b - 1 && l2 >= a }
+                        else { l1 == a || l1 == a + 1 };
+                    if holds && l >= hc && l < hc + hd {
+                        hit = true;
+                    }
+                    k += 4;
+                }
+            }
+            var j = 0;
+            while !hit && j < FIX_EDITS.count {
+                let p = FIX_EDITS.data[j + 3];
+                if FIX_EDITS.data[j] == e && p >= 0 && file_of_pos(p) == f {
+                    var pc = 0;
+                    let pl = new_place(h, f, p, -1, &pc);
+                    hit = pl > 0 && pl == l && pc == c;
+                }
+                j += 4;
+            }
+            if hit {
+                var seen = false;
+                for x in 0..bad.count {
+                    if bad.data[x] == e {
+                        seen = true;
+                    }
+                }
+                if !seen {
+                    bad.push(e);
+                    why.push(line);
+                }
+            }
+        }
+    }
+}
+
+// Where position pos of file f (hunks h of its diff) is in the edited
+// text: its line (0 when the formatter laid its lines out again: a hunk
+// whose old and new lines differ in number), its column in *col, moved by
+// the replacements before it on its line (not `self`, the replacement
+// that starts there).
+fn new_place(h: IntVec, f: i64, pos: i64, self_: i64, col: inout i64) -> i64 {
+    // UNSAFE: BUFS is a static var (the buffers); h's data a raw pointer.
+    // SAFETY: k + 3 < h.count (hunks in fours); e < replace_count(), text a buffer replace_at gave.
+    unsafe {
+        let l = line_of(pos);
+        var nl = -1;
+        var delta = 0;
+        var k = 0;
+        while k < h.count {
+            let a = h.data[k];
+            let b = h.data[k + 1];
+            let hc = h.data[k + 2];
+            let hd = h.data[k + 3];
+            if b > 0 && l >= a && l < a + b {
+                if b != hd {
+                    return 0;
+                }
+                nl = hc + (l - a);
+                break;
+            }
+            if (b > 0 && l < a) || (b == 0 && l <= a) {
+                break;
+            }
+            delta += hd - b;
+            k += 4;
+        }
+        if nl < 0 {
+            nl = l + delta;
+        }
+        var c = pos - line_start(pos) + 1;
+        for e in 0..replace_count() {
+            if e == self_ {
+                continue;
+            }
+            let (s, en, text) = replace_at(e);
+            if file_of_pos(s) != f || line_of(s) != l || s > pos || (s == pos && en > s)
+                || en > pos {
+                continue;
+            }
+            c += BUFS[text].len - (en - s);
+        }
+        col = c;
+        nl
+    }
+}
+
+// bad in increasing order, why along with it.
+fn sort_pairs(bad: inout IntVec, why: inout IntVec) {
+    // UNSAFE: bad and why are IntVecs, their data raw pointers.
+    // SAFETY: i, j < bad.count == why.count (blame pushes them together).
+    unsafe {
+        for i in 1..bad.count {
+            var j = i;
+            while j > 0 && bad.data[j] < bad.data[j - 1] {
+                let t = bad.data[j];
+                bad.data[j] = bad.data[j - 1];
+                bad.data[j - 1] = t;
+                let w = why.data[j];
+                why.data[j] = why.data[j - 1];
+                why.data[j - 1] = w;
+                j -= 1;
+            }
+        }
+    }
+}
+
+// FIX_EDITS after the replacements `gone` (sorted) are taken out: theirs
+// dropped, the others' indices moved down.
+fn renumber(gone: IntVec) {
+    // UNSAFE: FIX_EDITS is a static var, its data a raw pointer.
+    // SAFETY: j < FIX_EDITS.count; gone is read below its count.
+    unsafe {
+        var k = 0;
+        var j = 0;
+        while j < FIX_EDITS.count {
+            let e = FIX_EDITS.data[j];
+            var out = false;
+            var below = 0;
+            for g in 0..gone.count {
+                if gone.data[g] == e {
+                    out = true;
+                }
+                if gone.data[g] < e {
+                    below += 1;
+                }
+            }
+            if !out {
+                FIX_EDITS.data[k] = e - below;
+                FIX_EDITS.data[k + 1] = FIX_EDITS.data[j + 1];
+                FIX_EDITS.data[k + 2] = FIX_EDITS.data[j + 2];
+                FIX_EDITS.data[k + 3] = FIX_EDITS.data[j + 3];
+                k += 4;
+            }
+            j += 4;
+        }
+        FIX_EDITS.count = k;
+    }
+}

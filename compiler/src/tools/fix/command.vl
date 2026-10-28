@@ -19,13 +19,14 @@ use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{
     SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_STATIC, SYM_STRUCT, item_node_of,
 };
-use crate::tools::edit::{TARGET, TARGET_NAME, edit_count};
+use crate::tools::edit::{NO_CHECK, TARGET, TARGET_NAME, edit_count};
 use crate::tools::edit::apply::{
-    CHECK_STRICT, LEFT_OK, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit,
-    set_command, write_round,
+    CHECK_STRICT, LEFT_OK, SHOW_DIFF, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args,
+    prepare_edit, print_round_files, set_command, write_round_copies,
 };
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
-use crate::tools::fix::{missing_use_edits, pub_edits, suggested_edits, unused_import_edits};
+use crate::tools::fix::{CODES, missing_use_edits, pub_edits, suggested_edits, unused_import_edits};
+use crate::tools::fix::verify::verify_fixes;
 use crate::tools::fixconv::{
     CC_DEREF, CC_INOUT_LOCAL, CC_MARKER, CC_PARAM_INOUT, CC_PARAM_LET, CC_PARAM_SINK, CC_RECEIVER,
     CC_SINK_CLOSURE, CC_STATIC, CC_TYPE, CC_UNMARKED, CC_VAR, CONV_COUNTS, CONV_LIST_LEFT,
@@ -77,6 +78,9 @@ const F_ALL: i64 = 15;
 static var CHOSEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Whether a name was left for fix.ambiguous (the exit status is 1).
 static var AMBIGUOUS: bool = false;
+
+// (0.25.2.1) `--codes`'s value as given, for the rounds' command lines.
+static var CODES_ARG: *u8 = 0 as *u8;
 
 // `--use PATH::NAME` into CHOSEN. False when it has no `::`.
 fn take_use(v: [u8]) -> bool {
@@ -323,6 +327,9 @@ pub fn fix_leaf(gpa: Gpa) -> Leaf {
     table.push(flag("fix-imports", "(0.8's spelling of --only imports)"));
     table.push(flag("fix-unsafe", "(0.9's spelling of --only unsafe)"));
     table.push(option("at", "FILE:LINE", "--suggested: one line's errors"));
+    table.push(option("codes", "CODE,...",
+        "--suggested: only the fixes of errors with these codes"));
+    table.push(flag("diff", "the diff of what is written, after the summary"));
     table.push(option("in", "FILE|MODULE", "only there"));
     table.push(option("use", "PATH::NAME", "the module to import NAME from"));
     table.push(option("only", "KINDS", "imports,unused,pub,unsafe,suggested,..."));
@@ -391,6 +398,19 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
             FIX_AT_FILE = buf_cstr(f);
             FIX_AT_LINE = line_no;
             continue;
+        } else if opt_is && ev.name == "codes" {
+            // (0.25.2.1: the check hook makes the mechanical fixes alone)
+            let b = buf_new();
+            buf_byte(b, ',');
+            buf_str(b, a);
+            buf_byte(b, ',');
+            CODES = b;
+            CODES_ARG = a;
+            suggested = true;
+            continue;
+        } else if flag_is && ev.name == "diff" {
+            SHOW_DIFF = true;
+            continue;
         } else if flag_is && ev.name == "list-left" {
             CONV_LIST_LEFT = true;
             continue;
@@ -456,7 +476,8 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
             }
             continue;
         } else if ev.kind == EV_MISSING && (ev.name == "at" || ev.name == "in"
-            || ev.name == "use" || ev.name == "only" || ev.name == "overlay") {
+            || ev.name == "use" || ev.name == "only" || ev.name == "overlay"
+            || ev.name == "codes") {
             ev.kind = EV_UNKNOWN;
         } else if take_edit_event(&ev, &root) {
             continue;
@@ -482,6 +503,11 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
     unsafe {
         if suggested {
             only = if only_arg == 0 as *u8 { F_SUGGESTS } else { only | F_SUGGESTS };
+        }
+        if CODES >= 0 {
+            // (0.25.2.1: --codes: those errors' exact fixes alone, no
+            // import, no pub)
+            only = F_SUGGESTED;
         }
         // (0.20) The migrations read 0.19's spelling: the program is read
         // mixed (front/conv), whatever the default
@@ -567,6 +593,14 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
             if edit_count() == 0 {
                 return 0;
             }
+            // (0.25.2.1: the round's fixes checked on its copies first,
+            // fix/verify.vl)
+            if !write_round_copies() {
+                return 1;
+            }
+            if (only & F_SUGGESTED) != 0 && !NO_CHECK && !verify_fixes(root, &counts, true) {
+                return 0;
+            }
             let out = buf_new();
             buf_str(out, c"count");
             for k in 0..11 {
@@ -575,7 +609,8 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
             }
             buf_byte(out, '\n');
             buf_write_fd(out, STDOUT);
-            return write_round();
+            print_round_files();
+            return 0;
         }
         if edit_count() == 0 {
             if AMBIGUOUS || ALLOC016_LEFT > 0 {
@@ -590,6 +625,13 @@ fn run_fix_inner(c: Call, alias: i64) -> i64 {
         let status = prepare_edit();
         if status >= 0 {
             return status;
+        }
+        // (0.25.2.1) The fixes checked on the edited program: a wrong one
+        // is taken out (fix/verify.vl)
+        if (only & F_SUGGESTED) != 0 && !NO_CHECK && !verify_fixes(root, &counts, false) {
+            let d = diag(c"note", c"fix.none");
+            buf_str(d, c"nothing to fix: every fix was refused (above)\n");
+            return 1;
         }
         // More rounds, on the edited program: a fix may let the checker
         // see more (the next unknown name of a statement). (--values: its
@@ -686,6 +728,10 @@ fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: inout 
         }
         if suggested {
             args.push(c"--suggested" as i64);
+        }
+        if CODES_ARG != 0 as *u8 {
+            args.push(c"--codes" as i64);
+            args.push(CODES_ARG as i64);
         }
         if at != 0 as *u8 {
             args.push(c"--at" as i64);

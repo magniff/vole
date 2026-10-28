@@ -31,11 +31,9 @@ $ fix --suggested --dry-run
 +
 +use text::wrap;
 +
-@@ -22,2 +26,2 @@
+@@ -22 +26 @@
 -    let t = totl(&v);
--    let small: u8 = t;
 +    let t = total(v);
-+    let small: u8 = t as u8;
 @@ -25 +29 @@
 -    if n {
 +    if n != 0 {
@@ -82,15 +80,14 @@ $ fix --suggested --in text.vl --dry-run
 -    let c: char = 'x';
 +    let c: u8 = 'x';
 $ fix --suggested --show
-fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+15 -11 lines
+fixed 2 missing imports, 1 pub, 12 suggested fixes	2 files	+14 -10 lines
 // main.vl:1-4
 1	use std::I64_MIN;
 2	
 3	use text::wrap;
 4	
-// main.vl:26-27
+// main.vl:26
 26	    let t = total(v);
-27	    let small: u8 = t as u8;
 // main.vl:29
 29	    if n != 0 {
 // main.vl:33
@@ -107,13 +104,15 @@ fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+15 -11 lines
 5	    crate::lib::shapes::area(r)
 // text.vl:9
 9	    let c: u8 = 'x';
+main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8 | try: volec fix --suggested main.vl
 main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
-note fix.left: 1 error left (above)
+note fix.left: 2 errors left (above)
 $ check
+main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8 | try: volec fix --suggested main.vl
 main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 [exit 1]
 $ undo
-undid fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+15 -11 lines
+undid fixed 2 missing imports, 1 pub, 12 suggested fixes	2 files	+14 -10 lines
 ## A Rust label: the program does not lex; the fix respells each line.
 $ fix --suggested labels.vl --show
 fixed 3 suggested fixes	labels.vl	+3 -3 lines
@@ -124,9 +123,8 @@ fixed 3 suggested fixes	labels.vl	+3 -3 lines
 7	                break :outer;
 ## A fix that makes an error on its own line refuses the edit.
 $ fix --suggested refuse.vl
-refuse.vl:5:18: error[type error] expected 'i64', got '[u8]'  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written
-try: volec fix --suggested refuse.vl --no-check
+note fix.refused: refuse.vl:5:18: not applied: `length`: the edited program has a new error with it: refuse.vl:5:18: error[type error] expected 'i64', got '[u8]'
+note fix.none: nothing to fix: every fix was refused (above)
 [exit 1]
 ## --at is for --suggested.
 $ fix --at main.vl:24

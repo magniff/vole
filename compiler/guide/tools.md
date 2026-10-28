@@ -22,7 +22,14 @@ small queries.
    the error's position; `volec edit patch` changes a few lines of it.
 3. `volec fix --suggested` when errors have `try: volec fix
    --suggested main.vl` (0.18): their exact fixes, one checked edit,
-   then the errors left; `volec fix` for unsafe blocks.
+   then the errors left; `volec fix` for unsafe blocks. A fix that
+   would change what the code means (a lossy conversion, a cast of a
+   cast, a did-you-mean naming the function the call is in, one with
+   which the program has a new error) is not made: `note fix.refused`
+   says why, and the error is yours to fix. The check hook makes only
+   the mechanical ones itself (a call's `&`, Rust's spellings, an
+   unused import), each shown as `changed FILE:LINE: OLD -> NEW`; the
+   others it shows as `suggested, not applied`: read each first.
 4. Build and run: `volec main.vl -o prog && ./prog` (a build that
    works ends with `ok: built prog`).
 
@@ -76,9 +83,10 @@ bodies.
 | a module's items, with signatures | `volec query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `volec query show MODULE::use` (`::header`) |
 | lines of any file | `volec query text FILE:A-B` |
+| a word in code, comments or strings (a shader's WGSL); in every program under a directory | `volec query grep WORD` (`--strings`, `--in FILE`); `query grep WORD --in examples/gpu` |
 | what nothing uses | `volec query unused` |
 | sizes, dependencies | `volec query stats`, `query deps MODULE` |
-| std's API, a std item | `volec query items std`, `query show std::read_line` (any program) |
+| std's API, a std item | `volec query items std`, `query show std::read_line` (any program; a re-exported name too: `query show std::gpu::Color`) |
 | what a snippet does | `volec try 'let v = [3, 1]; v[..].len()'` prints `i64 = 2` |
 | the guide on some words | `volec guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
 | items like one, to copy for a new one; recipes for adding an X (0.17) | `volec query similar NAME`; `query examples KIND`; `volec guide how` |
@@ -118,13 +126,16 @@ an edit then `check`.
 | imports, unused, pub, unsafe | `volec fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
 | 0.19's spelling to 0.20's (`&T` to `T`, `&mut T` to `inout T`, `let mut` to `var`, receivers, `&mut v` to `&v`, `*r` to `r`) | `volec fix --only conventions` (`--dry-run`) |
 | `*T` and by-value parameters of 0.16 code to accesses, with every call (0.17) | `volec fix --values` (`--dry-run`) |
-| the errors' exact fixes (their `try: volec fix --suggested`) | `volec fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
+| the errors' exact fixes (their `try: volec fix --suggested`) | `volec fix --suggested` (`--dry-run`, `--at FILE:LINE`, `--codes CODE,...`, `--diff`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
 that adds an error writes nothing and prints the errors, each tagged
 `[edited: PATH]` or `[in PATH]` (an item the edit did not change: change
 it in the same `edit apply`, or run the refactoring the `try:` line
 names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
+A change of several steps is one call, checked once at its end: `edit
+patch NAME --old A --new B --old C --new D` (`--in OTHER` before the
+pairs of another item), or `edit apply FILE`.
 
 ## Testing
 

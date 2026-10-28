@@ -933,7 +933,9 @@ esac
 case $(want hooks) in
     y)
         if command -v python3 >/dev/null 2>&1; then
-            for t in "$ROOT"/tools/agent-hooks/test-*.py; do python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
+            # (0.25.2.1) the compiler under test, not target/volec, for the
+            # cases that run a real one
+            for t in "$ROOT"/tools/agent-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
         else
             : >"$WORK/hooks.out"
         fi ;;

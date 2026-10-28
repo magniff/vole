@@ -60,8 +60,69 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.0 | `v0.25.0` | 0.24.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | compile speed (the resolve scans, a line index, the lexer, data as bytes, the assembler, `ld` run directly, an in-house Mach-O linker by default on aarch64-macos: the -O0 self-compile and `check` near half the instructions, a hello world linked 4 times faster) and a semantics audit (five red-team audits, about 1,600 probes kept as tests, a value-semantics fuzzer as the gate's `fuzz-sem`; about 30 families of soundness bugs of released versions fixed: views, exclusivity, drops, threads, the optimizer); the Vole Book (book/, every example checked); std::cli across the examples; `#[link]` and `-framework`; every name resolved in the language server; the chain rebuilt from the seed and checked against recorded hashes (`chain-fresh`, `chain-diverse`) |
 | 0.25.1 | `v0.25.1` | 0.25.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | one standard style, applied to the whole tree: `volec fmt` groups imports (`std`, `crate`, the rest) and writes trailing commas in lists whose closing bracket starts a line; docs/style.md, `guide fmt` |
 | 0.25.2 | `v0.25.2` | 0.25.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | soundness fixes found by real programs (the -O2 vector loop unrolled by 3, an assignment's let-argument temporaries, std's move exemption narrowed); volec's command line on std::cli; `use.unused`; program roots for the tools; the language server for single files and C headers; WGSL's MSL reserved names; four test tiers, `tools/premerge.sh`, a commit hook, a Linux smoke row and a gate that cannot hang |
+| 0.25.2.1 | `v0.25.2.1` | 0.25.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the first GPU eval: `f(make()?)?`'s empty argument fixed; float math in std, in vole; std::gpu multiple render targets and depth-only passes; frames for an occluded window; twelve diagnostics; `fix --suggested` and the hooks made safe |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.2.1
+
+The first round of the GPU eval (evals/tasks/0.25.2: ten agents each
+wrote a GPU program in vole from scratch) and what it asked for. The same
+ten tasks run again on this release.
+
+- **Soundness**: an argument that may return early, in a call whose
+  result is `?`'d (`f(make()?)?`, `f(match ..)?`, `count(mk(7), 8)?`),
+  reached the callee empty or leaked, at every level, since 0.24.0. The
+  block a `?` becomes is now visited for statement temporaries, an arm's
+  binding passed to a `let` parameter is held to the call, and an arm
+  that returns produces no value (front/own/drops.vl). 4,340 generated
+  cases (tools/sinksweep/argsweep.py; 1,577 wrong on 0.25.2) are tests;
+  `fuzz-sem --try-args` is in the gate.
+- **Float math in std, in vole** (no libm): `Float`'s methods on `f32`
+  and `f64` with no `use` (`abs`, `floor` .. `fract`, `min`/`max`/
+  `clamp`, `sqrt`, `cbrt`, `hypot`, the trigonometry and its inverses,
+  `exp`, `exp2`, `ln`, `log2`, `log10`, `log`, `powf`, `powi`, ..), the
+  same as functions in `std::math`, and `f64::consts::PI` and
+  `f64::EPSILON` .. `NAN` (f32 alike). Within 1 ulp of macOS's libm for
+  most (`tan` 3, `powi` 8; tests/run/math_vs_libm). A float method reads
+  std by itself. fluid2d, openhtop and galaga use it; `guide math`.
+- **std::gpu**: a pass has up to 8 color attachments
+  (`PassDesc::color(..).with_color(..)`), checked against the pipeline's
+  targets at `set_pipeline` (`gpu.format`); depth-only passes
+  (`PassDesc::depth_only`, `RenderDesc::depth_only`);
+  `Buffer::map_read_copy_in` for bytes that outlive the mapping.
+  `gpu.layout` lists the layout's bindings and the one that does not fit,
+  `gpu.usage` names the buffer and the flag it lacks, and two variables
+  at one binding say to give each kernel its own module.
+- **std::window**: a window the display cannot show (asleep, occluded)
+  still gets frames, from a 10 Hz timer, and says so after 3 s; `guide
+  window`.
+- **Diagnostics**: a value with no `.clone()` (`Device`) gets `sink`,
+  one owner or an index instead; `Gpa` in a test points to `#[test] fn
+  t(gpa: Gpa)`; a module and an item of one name are named, with the
+  `use` to write; an unknown variant gets a did-you-mean or the list;
+  `parse_i64` and the like point to `parse_int`; `..f` (struct update)
+  says what to write; an array literal where a slice goes takes its
+  element type (`let xs: [u32] = [1, 2, 3]`); nearest names only when
+  related; the `const` and f-string helps show the form to write; a
+  failing `assert` shows a float operand.
+- **Tools**: `fix --suggested` refuses a fix that changes a value's type,
+  a cast of a cast, an import nothing needs, a second import, and a
+  rename to the enclosing function (`note fix.refused`, with the reason;
+  tests/refactor/fixsafe.t). The check hook applies only mechanical fixes
+  (call marks, Rust's spellings, unused imports), shows each change
+  (`changed FILE:LINE: old -> new`) and lists the rest as suggested, not
+  applied. The query-first hook lets a program's own small files be read
+  and says "NOTHING on this line ran" when it blocks a compound line.
+  `query grep` finds text inside strings (WGSL); `query show
+  std::gpu::Color` follows re-exports; `edit patch` takes several
+  `--old`/`--new` pairs, checked together (`note edit.together`).
+- **The guide**: six gpu sections (multiple render targets, depth-only
+  passes, one module per kernel, atomics, a compute simulation, timing
+  GPU work), `guide math`, and in `guide testing` "a check must be able
+  to fail", with `gpa: Gpa` near the top.
+- **Tests**: a case for examples/voltty/app; the hooks cases run the
+  compiler under test.
 
 ### What's new in 0.25.2
 

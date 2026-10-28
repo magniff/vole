@@ -200,7 +200,12 @@ The three kinds of 0.17 (§2.1 there) decide what each convention costs:
   { E::A(_) => .. }`), `let _ = make()` (at once, as `make();`), and a
   value an argument moves into a callee while a later argument may leave
   the statement (`two(mk(1), g()?)`: dropped if `?` returns, the callee's
-  if the call is made). A view of a temporary used after the temporary
+  if the call is made; 0.25.2.1: a local moved there too, `two(t, g()?)`).
+  (0.25.2.1) The same holds inside a `?`'s operand (`count(make()?, 8)?`),
+  and for a branch's value lent to a let parameter that the branch itself
+  binds (`count(match make() { Ok(s) => s, Err(e) => return Err(e) }, 8)`,
+  an `if let`, a block's local, the `?` in an `if`): it is moved into a
+  temporary of the statement, not lent and dropped with its arm. A view of a temporary used after the temporary
   is dropped is `own.escape`, naming the temporary; in a loop each
   iteration's temporary is its own.
 

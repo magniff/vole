@@ -91,6 +91,12 @@ BEGIN {
     # (0.24) std::cli: read only by a program that names `cli`
     CLOSED["cli"] = 1
     GATES["std::cli"] = "cli"
+    # (0.25.2.1) std::math: lazy, behind the math gate; a program naming a
+    # Float method (`x.sqrt()`, no item of it) names the gate and the trait
+    # (front/modules/stdsections.vl: know_float_math)
+    n = split("std::math|Math: the Float trait (0.25.2.1)|Math: functions (0.25.2.1)|Math: constants (0.25.2.1)|Math: bits, rounding, min and max (0.25.2.1)|Math: roots (0.25.2.1)|Math: trigonometric kernels (0.25.2.1)|Math: argument reduction (0.25.2.1)|Math: sin, cos, tan (0.25.2.1)|Math: inverse trigonometric functions (0.25.2.1)|Math: exp and log (0.25.2.1)|Math: pow (0.25.2.1)", lz, "|")
+    for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
+    GATES["std::math"] = "math"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)

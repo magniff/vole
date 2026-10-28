@@ -59,18 +59,24 @@ checkout's when the worktree has none), so it always works (your own
 builds replace `target/volec`, and a broken one breaks `query`).
 
 **Hooks.** `tools/agent-hooks/query-first.py` blocks shell commands that
-read or rewrite `.vl` source (grep, sed, `sed -i`, Python writing
-compiler/src) and suggests the query or `edit patch`; a `.vl` under
-`tests/`, or a whole file under 300 lines, is read freely. When the tool
+read or rewrite the compiler's `.vl` source (compiler/src, compiler/std:
+grep, sed, `sed -i`, Python writing it) and suggests the query or `edit
+patch`; a program's `.vl` (examples, tests, your own) is read and
+rewritten freely, and so is a whole file under 300 lines. A blocked line
+ran nothing: the block names the command and gives the whole line again. When the tool
 is not enough, rerun with a trailing reason, which is recorded: `#
 no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 ...` for an edit). `check-after-edit.py` runs `volec check` after
 every Write/Edit of a `.vl` file and every writing `volec` command:
 what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
-`check` after an edit. Errors with an exact fix (`try: volec fix
---suggested`) it fixes itself and says so, each with its fix (`volec
-undo` takes it back; `VOLE_HOOK_FIX=0`: off). `check` and a build
+`check` after an edit. It makes only the mechanical exact fixes itself
+(a call's `&` marker, Rust's spellings, an import unused at two checks)
+and shows each change, `changed FILE:LINE: OLD -> NEW` (`volec undo`
+takes it back; `VOLE_HOOK_FIX=0`: off); the other exact fixes (a
+did-you-mean, a conversion, a `use`) it shows under `suggested, not
+applied`, with the ones `fix` refuses and why: check each before
+running `volec fix --suggested`. `check` and a build
 print `ok: ...` when there is no error. `turn-end.py` checks once more when you stop and
 blocks the stop once if errors are left. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside

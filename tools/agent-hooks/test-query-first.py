@@ -109,13 +109,15 @@ def blocked(command):
 st, err = blocked("sed -n '120,180p' compiler/src/gvn.vl")
 case("read sed -n", (st, "query show compiler/src/gvn.vl:120" in err), (True, True))
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.vl")[0], True)
-st, err = blocked("sed -n '120,180p' examples/loops.vl")
-case("read sed -n example program", "try: volec query text examples/loops.vl:120-180\n" in err, True)
-st, err = blocked("head -40 bench/calc.vl")
-case("read head program", "try: volec query text bench/calc.vl:1-40\n" in err, True)
-st, err = blocked("cat examples/main.vl")
-case("read cat", "volec query show examples/main.vl" in err, True)
-case("read a program outside tests", blocked("cat /home/u/proj/src/main.vl")[0], True)
+# (0.25.2.1) A program's files outside compiler/src and compiler/std (an
+# example, a program an agent writes) are read freely, as the Read tool
+# reads them.
+case("read sed -n example program", blocked("sed -n '120,180p' examples/loops.vl")[0], False)
+case("read head program", blocked("head -40 bench/calc.vl")[0], False)
+case("read cat example", blocked("cat examples/main.vl")[0], False)
+case("read a program outside tests", blocked("cat /home/u/proj/src/main.vl")[0], False)
+st, err, recs = bash("grep -n atomic ../../examples/gpu/fluid2d/main.vl ../../examples/gpu/fluid2d/sim.vl")
+case("grep of an example's large files: read-program", (st, [r["kind"] for r in recs]), (0, ["read-program"]))
 
 # (0.14) Test data under tests/ (cases, fixtures, eval tasks): read freely, logged.
 st, err, recs = bash("sed -n '120,180p' tests/run/loops.vl")
@@ -156,10 +158,18 @@ case("read escape", blocked("sed -n '1,9p' compiler/src/gvn.vl  # no-query: the 
 # Rewriting compiler source in place: blocked, with `edit patch`.
 st, err = blocked("sed -i '' '1615s/a < b/a <= b/' compiler/src/range.vl")
 case("sed -i line", (st, err.splitlines()[0] if err else ""),
-     (True, "blocked hook.edit-tool: sed -i rewriting compiler source (compiler/src/range.vl)"))
+     (True, "blocked hook.edit-tool: nothing ran: sed -i rewrites the compiler's source (compiler/src/range.vl)"))
 case("sed -i line suggestion",
-     "try: volec edit patch compiler/src/range.vl:1615 --old 'a < b' --new 'a <= b' |" in err, True)
-case("sed -i two lines", len(err.splitlines()), 2)
+     "try: volec edit patch compiler/src/range.vl:1615 --old 'a < b' --new 'a <= b'\n" in err, True)
+case("sed -i: the allowance, the override", err.splitlines()[2:],
+     ["allowed: sed -i, perl -pi and Python writes of any file outside compiler/src and compiler/std "
+      "(a program you write: as you like)", "override: append '# no-tool: <why the tools are not enough>'"])
+st, err = blocked("cat > /tmp/w/a.txt <<'EOF'\nx\nEOF\nsed -i '' 's/a/b/' compiler/src/range.vl; ls")
+case("sed -i on a compound line: nothing ran, which part", err.splitlines()[0],
+     "blocked hook.edit-tool: NOTHING on this line ran (3 commands): command 2 (`sed -i '' 's/a/b/' "
+     "compiler/src/range.vl`) (sed -i) rewrites the compiler's source (compiler/src/range.vl)")
+case("sed -i on a compound line: rerun the others", "then run the line's other commands again: they did not run"
+     in err, True)
 st, err = blocked("sed -i 's/x.*y/z/g' compiler/src/a.vl compiler/src/b.vl")
 case("sed -i regex", (st, "edit patch compiler/src/a.vl:LINE --old 'TEXT' --new 'TEXT'" in err), (True, True))
 case("sed -Ei", blocked("sed -Ei.bak 's/a/b/' compiler/std/vec.vl")[0], True)
@@ -189,24 +199,15 @@ case("sed -i -e with a line", "try: volec edit patch compiler/src/a.vl:12 --old 
 st, err = blocked("sed -i '' -e '12s/x - 1/x + 1/' compiler/src/a.vl")
 case("sed -i -e plain", "try: volec edit patch compiler/src/a.vl:12 --old 'x - 1' --new 'x + 1'" in err, True)
 case("sed -i test fixture", blocked("sed -i 's/a/b/' tests/run/loops.vl")[0], False)
-# (0.25.2) Any program's source is rewritten through the tools, as it is
-# read through them: an example's file (feedbacks/nes.md #7), with the
-# root its edit needs from where the command runs.
-st, err = blocked("cd ../.. && sed -i '' 's/let mut/var/' examples/nes/check.vl")
-case("sed -i example program", (st, err.splitlines()[0] if err else ""),
-     (True, "blocked hook.edit-tool: sed -i rewriting program source (examples/nes/check.vl)"))
-case("sed -i example program suggestion",
-     "try: volec edit patch examples/nes/check.vl --old 'let mut' --new var --all --root examples/nes/main.vl" in err,
-     True)
+# (0.25.2.1) A program's source outside compiler/src and compiler/std is
+# the agent's to rewrite as it likes (0.25.2 blocked an example's file).
+case("sed -i example program", blocked("cd ../.. && sed -i '' 's/let mut/var/' examples/nes/check.vl")[0], False)
 case("python writes an example", blocked(
-    "cd ../.. && python3 - <<'EOF'\np = 'examples/nes/check.vl'\nopen(p, 'w').write('x')\nEOF")[0], True)
+    "cd ../.. && python3 - <<'EOF'\np = 'examples/nes/check.vl'\nopen(p, 'w').write('x')\nEOF")[0], False)
+case("python writes the compiler from another directory", blocked(
+    "cd ../.. && python3 - <<'EOF'\np = 'compiler/src/main.vl'\nopen(p, 'w').write('x')\nEOF")[0], True)
 case("sed -i a scratch program", blocked("sed -i 's/a/b/' /tmp/w/probe.vl")[0], False)
-# (0.25.2) A read of another program's file: its queries say --root.
-st, err = blocked("cd ../.. && grep -n 'let ' examples/nes/check.vl")
-case("read example program, items with root",
-     "try: volec query items crate::check --root examples/nes/main.vl" in err, True)
-case("read example program, grep with root",
-     "volec query grep 'let ' --root examples/nes/main.vl" in err, True)
+case("read example program", blocked("cd ../.. && grep -n 'let ' examples/nes/check.vl")[0], False)
 case("sed -i docs", blocked("sed -i '' 's/a/b/' docs/refactor.md AGENTS.md")[0], False)
 case("sed -i scratch copy", blocked("sed -i 's/a/b/' target/scratch/compiler/src/x.vl")[0], False)
 case("sed -i tmp copy", blocked("sed -i 's/a/b/' /tmp/w/compiler/src/x.vl")[0], False)
@@ -286,6 +287,56 @@ case("python -c after an echo", blocked(
     "echo hi; python3 -c \"open('compiler/src/a.vl', 'w').write('x')\"")[0], True)
 case("read with 2>&1", blocked("grep -n fn compiler/src/a.vl 2>&1")[0], True)
 
+# (0.25.2.1) The 0.25.2 eval (evals/tasks/0.25.2/*/ANALYSIS.md): lines the
+# hook blocked then, verbatim but for the checkout's path; reads of the
+# agents' own programs and of the examples now run, the compiler's own
+# source is still read and rewritten through the tools, and a blocked
+# compound line says that none of it ran.
+EVAL = "/Users/magniff/workspace/tachyon"
+E = "%s/evals/tasks/0.25.2" % TREE
+EVAL_ALLOWED = [
+    ("ocean", "cd %s/ocean && sed -n '123,126p;136,139p;149,152p;427p' main.vl" % E),
+    ("terrain", "cd %s && head -28 examples/gpu/fluid2d/main.vl; sed -n 1,20p examples/gpu/fluid2d/ui.vl | head -5" % TREE),
+    ("cloth", "cd %s/cloth && grep -n \"\" geom.vl | sed -n '250,290p'" % E),
+    ("deferred", "cd %s/deferred && grep -n \"fn geo_desc\" -A 10 render.vl | head -14; grep -n \"geo_desc(dev\" render.vl" % E),
+    ("qwen35", "cd %s/qwen35 && grep -n \"app.wait()\" window.vl; grep -n \"let ev = match\" window.vl" % E),
+    ("sph", "cd %s/examples/gpu/fluid2d && ls -la && wc -l *.vl && cat main.vl | head -400" % TREE),
+    ("ocean sed -i", "cd %s/ocean && sed -i '' 's/^const AMP: f64 = 0.0005;/const AMP: f64 = 0.0000005;/' main.vl"
+     " && grep -n \"^const AMP\" main.vl" % E),
+    ("sdftext python", "cd %s/sdftext && python3 - <<'EOF'\np='main.vl'\ns=open(p).read()\n"
+     "s=s.replace('a', 'b')\nopen(p,'w').write(s)\nEOF" % E),
+]
+for who, line in EVAL_ALLOWED:
+    case("eval 0.25.2, %s: now runs" % who, blocked(line)[0], False)
+EVAL_BLOCKED = [
+    ("sed -i", "cd %s && sed -i '' 's/a < b/a <= b/' compiler/src/front/check/mod.vl" % TREE),
+    ("python", "cd %s && python3 - <<'EOF'\np = 'compiler/src/front/check/mod.vl'\ns = open(p).read()\n"
+               "open(p, 'w').write(s.replace('a', 'b'))\nEOF" % TREE),
+    ("perl -pi", "cd %s && perl -pi -e 's/foo/bar/' compiler/std/gpu/types.vl" % TREE),
+]
+for what, line in EVAL_BLOCKED:
+    st, err = blocked(line)
+    case("compiler source, %s: still blocked" % what, (st, err.split(":")[0], "nothing" in err.splitlines()[0].lower(),
+                                                     err.splitlines()[-2] if err else ""),
+         (True, "blocked hook.edit-tool", True, hook.ALLOWED_WRITES))
+# (qwen35's and cloth's lines, compound: one part of the compiler's source)
+st, err = blocked("cd %s && sed -n 395,415p compiler/std/gpu/types.vl; ls examples/gpu/fluid2d/; "
+                  "wc -l examples/gpu/fluid2d/*.vl; cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/" % TREE)
+case("compound, eval qwen35: nothing ran, which part", (st, err.splitlines()[0]),
+     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`sed -n 395,415p "
+            "compiler/std/gpu/types.vl`) reads the compiler's .vl source"))
+case("compound, eval qwen35: the whole line, the read as its query",
+     [l for l in err.splitlines() if l.startswith("try the whole line: ")][0].endswith(
+         "query text compiler/std/gpu/types.vl:395-415; ls examples/gpu/fluid2d/; wc -l examples/gpu/fluid2d/*.vl; "
+         "cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/"), True)
+st, err = blocked("cd %s && grep -rn \"sqrt\" compiler/std --include=*.vl | head -8; grep -rn \"sqrt\" "
+                  "examples/gpu/fluid2d/*.vl | head -5; grep -rn \"sqrt\" docs/*.md book/*.md 2>/dev/null | head -5" % TREE)
+case("compound, eval cloth: nothing ran, the std part", (st, err.splitlines()[0]),
+     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`grep -rn \"sqrt\" "
+            "compiler/std --include=*.vl`) reads the compiler's .vl source"))
+case("compound, eval cloth: rerun the others", "then run the line's other commands again: they did not run"
+     in err or "try the whole line: " in err, True)
+
 # 0.12: the checkout and its shared git directory, without git; who logs.
 import tempfile
 with tempfile.TemporaryDirectory() as tmp:
@@ -345,24 +396,40 @@ with tempfile.TemporaryDirectory() as tmp:
         return run({"hook_event_name": phase, "tool_name": "Bash", "cwd": cwd, "session_id": "qf-test",
                     "tool_input": {"command": command}, "tool_response": {"stdout": stdout, "stderr": ""}})
     st, err, recs = at(repo, "ls; cat compiler/src/front/big.vl; echo done")
-    case("per command: the reading one named", (st, err.splitlines()[0]),
-         (2, "blocked hook.query-first: `cat compiler/src/front/big.vl` (command 2 of 3 on the line; "
-             "the others are not blocked) reads .vl source"))
+    case("per command: nothing ran, the reading one named", (st, err.splitlines()[0]),
+         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands): command 2 "
+             "(`cat compiler/src/front/big.vl`) reads the compiler's .vl source"))
+    case("per command: the whole line to run instead", "try the whole line: ls; volec query items "
+         "crate::front::big; echo done" in err.splitlines(), True)
+    case("per command: the allowance", err.splitlines()[-2], hook.ALLOWED_READS)
     case("large file: its length and module", err.splitlines()[1].startswith(
         "compiler/src/front/big.vl is 400 lines (a file under 300 is read whole freely): "
         "`volec query items crate::front::big` lists its items"), True)
     case("blocked: the try lines logged", recs[-1].get("try"),
          ["volec query show compiler/src/front/big.vl (a whole small file) | volec query text "
-          "compiler/src/front/big.vl:A-B", "volec query items crate::front::big"])
+          "compiler/src/front/big.vl:A-B", "volec query items crate::front::big",
+          "ls; volec query items crate::front::big; echo done"])
+    st, err, recs = at(repo, "sed -n '10,20p' compiler/src/front/big.vl")
+    case("one command: the exact query first", (st, err.splitlines()[:2]),
+         (2, ["blocked hook.query-first: nothing ran: `sed -n '10,20p' compiler/src/front/big.vl` reads the "
+              "compiler's .vl source",
+              "compiler/src/front/big.vl is 400 lines (a file under 300 is read whole freely): `volec query items "
+              "crate::front::big` lists its items, `volec query show NAME` one of them, `volec query show "
+              "compiler/src/front/big.vl:LINE` the item at a line"]))
+    case("one command: try the query", err.splitlines()[2], "try: volec query text compiler/src/front/big.vl:10-20")
     st, err, recs = at(repo, "cat compiler/src/small.vl")
     case("small file: read whole", (st, [r["kind"] for r in recs]), (0, ["read-small"]))
     case("small file: sed -n", at(repo, "sed -n '1,5p' compiler/src/small.vl")[0], 0)
-    case("small file: grep is still a search", at(repo, "grep -n g compiler/src/small.vl")[0], 2)
+    case("small file: grep too (0.25.2.1)", at(repo, "grep -n g compiler/src/small.vl")[0], 0)
+    case("large file: grep blocked", at(repo, "grep -n g compiler/src/front/big.vl")[0], 2)
+    case("a directory of the compiler: grep -r blocked", at(repo, "grep -rn g compiler/src")[0], 2)
     case("a query on the line does not excuse a read",
          at(repo, "volec query show f; cat compiler/src/front/big.vl")[0], 2)
     case("a query and ls: not blocked", at(repo, "volec query items crate | head; ls compiler/src")[0], 0)
-    case("program: main.vl is source", at(prog, "cat main.vl")[0], 2)
-    case("program: a declared module is source", at(prog, "head -350 util.vl")[0], 2)
+    st, err, recs = at(prog, "cat main.vl")
+    case("program: main.vl of a program read freely (0.25.2.1)", (st, [r["kind"] for r in recs]),
+         (0, ["read-program"]))
+    case("program: a declared module too", at(prog, "head -350 util.vl")[0], 0)
     st, err, recs = at(prog, "head -6 scratch/diff.vl")
     case("program: a scratch .vl is not", (st, [r["kind"] for r in recs]), (0, ["read-scratch"]))
     case("program: a probe next to main.vl is not", at(prog, "cat probe.vl")[0], 0)
@@ -458,13 +525,12 @@ with tempfile.TemporaryDirectory() as tmp:
          [("rewritten", cmd)])
     case("rewrite tail -n", rewritten(repo, "tail -n 50 compiler/src/front/big.vl")[2],
          "target/tools/volec query text compiler/src/front/big.vl:351-400")
-    case("rewrite head -N, a program on PATH's volec", rewritten(prog, "head -350 util.vl")[2],
-         "volec query text util.vl:1-350")
+    case("a program's file is no source: runs as typed", rewritten(prog, "head -350 util.vl")[:3:2], (0, None))
     st, o, cmd, _ = rewritten(repo, "cat compiler/src/front/big.vl")
     case("rewrite cat of a large file: its outline", cmd, "target/tools/volec query items crate::front::big")
     case("rewrite cat: the note says how to read more", "is 400 lines; this is its outline: `query show NAME`"
          in o["additionalContext"], True)
-    case("rewrite cat in a program", rewritten(prog, "cat -n util.vl")[2], "volec query items crate::util")
+    case("rewrite cat in a program: runs as typed", rewritten(prog, "cat -n util.vl")[2], None)
     case("rewrite grep of a name", rewritten(repo, "grep -n f12 compiler/src/front/big.vl")[2],
          "target/tools/volec query refs f12 --in compiler/src/front/big.vl 2>/dev/null || "
          "target/tools/volec query grep f12 --in compiler/src/front/big.vl")
@@ -643,18 +709,18 @@ with tempfile.TemporaryDirectory() as tmp:
                 "grep -rn -e f12 compiler/src || echo none", "diff <(sed -n 1,5p %s) x" % B):
         case("in doubt, blocked: " + amb, rewritten(repo, amb, "doubt")[0], 2)
     st, err, recs = at(repo, "sed -n 1,5p %s; grep -n 'f1.*' %s; ls" % (B, B))
-    case("blocked: the translated parts named", (st, err.splitlines()[0], err.splitlines()[-2]),
-         (2, "blocked hook.query-first: `grep -n 'f1.*' compiler/src/front/big.vl` (command 2 of 3 on the line; "
-             "the others are not blocked) reads .vl source",
+    case("blocked: the translated parts named", (st, err.splitlines()[0], err.splitlines()[-4]),
+         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands): command 2 "
+             "(`grep -n 'f1.*' compiler/src/front/big.vl`) reads the compiler's .vl source",
           "the line's other reads of .vl source run as their queries on a retry: `sed -n 1,5p %s` as "
           "`%s query text %s:1-5`" % (B, T, B)))
     case("blocked: logged with what translated", recs[-1].get("translated"), ["%s query text %s:1-5" % (T, B)])
     st, err, recs = at(repo, "grep -n 'f1.*' %s; grep -c f2 %s" % (B, B))
     case("blocked: each blocked read of the line gets its try", err.splitlines()[0:1] + [
         l for l in err.splitlines() if l.startswith("also blocked")],
-         ["blocked hook.query-first: `grep -n 'f1.*' compiler/src/front/big.vl` (command 1 of 2 on the line) "
-          "reads .vl source",
-          "also blocked: `grep -c f2 compiler/src/front/big.vl` (command 2 of 2 on the line); try: "
+         ["blocked hook.query-first: NOTHING on this line ran (2 commands): command 1 "
+          "(`grep -n 'f1.*' compiler/src/front/big.vl`) reads the compiler's .vl source",
+          "also blocked: command 2 (`grep -c f2 compiler/src/front/big.vl`); try: "
           "volec query refs f2 | volec query grep f2"])
     del os.environ["VOLE_QUERY_MODE"]
     os.environ["PATH"] = old_path

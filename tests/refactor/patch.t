@@ -65,6 +65,7 @@ try: volec query show sum_to
 $ edit patch clamp --old 'return lo;' --new 'return true;'
 calc.vl:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::calc::clamp]
 error edit.breaks: 1 new error; nothing written
+note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
 $ edit patch sum_to --old 'var' --new 'let' --old 'var total' --new 'let total'

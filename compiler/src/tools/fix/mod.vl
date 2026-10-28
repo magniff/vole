@@ -30,13 +30,15 @@
 // nothing to do.
 
 pub mod command;
+pub mod verify;
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, SYMS, SYM_COUNT, buf_byte, buf_bytes, buf_new, buf_slice,
     buf_str, intern, sym_text,
 };
 use crate::base::diag::{
-    SUGGESTED, buf_tool_command, err_pos, fix_at_ok, name_failed, report_error_tries,
+    SUGGESTED, SUGGESTED_KIND, buf_tool_command, err_pos, fix_at_ok, name_failed,
+    report_error_tries,
 };
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
@@ -49,6 +51,7 @@ use crate::tools::edit::edit_replace;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::edit::items::{after_line, indent_of, node_head};
 use crate::tools::fix::command::choose_path;
+use crate::tools::fix::verify::{last_replace, note_fix, note_refused, refusal_of};
 use crate::tools::query::c_slice;
 use crate::tools::query::defs::{DEFS, DEF_COUNT, MOD_DEF};
 use crate::tools::query::diagnostics::sym_less;
@@ -76,14 +79,23 @@ pub fn note_missing_use(m: i64, path: i64, name: i64) {
         if unsafe {
             MISSING.data[i] == m && MISSING.data[i + 1] == path && MISSING.data[i + 2] == name
         } {
+            MISSING_AT.push(i / 3);
+            MISSING_AT.push(err_pos());
             return;
         }
         i += 3;
     }
+    MISSING_AT.push(MISSING.count / 3);
+    MISSING_AT.push(err_pos());
     MISSING.push(m);
     MISSING.push(path);
     MISSING.push(name);
 }
+
+// (0.25.2.1) Where each name of MISSING is used unknown: MISSING's entry
+// (its index / 3), the error's position, in pairs (verify_fixes: a new
+// error there after the import blames it).
+static var MISSING_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Binding b (B_PRIVATE) was used where it is private.
 pub fn note_private(b: i64) {
@@ -213,19 +225,73 @@ fn missing_use_edits() -> i64 {
             done.push(m);
             done.push(p);
             var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var entries = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             var j = 0;
             while j < MISSING.count {
-                if MISSING.data[j] == m && MISSING.data[j + 1] == p {
+                // (0.25.2.1: not a name a `use` of m imports already, nor
+                // one a fix of a `use` line of m spells: imported twice)
+                if MISSING.data[j] == m && MISSING.data[j + 1] == p
+                    && !imported_in(m, MISSING.data[j + 2]) {
                     names.push(MISSING.data[j + 2]);
+                    entries.push(j / 3);
                 }
                 j += 3;
+            }
+            if names.count == 0 {
+                continue;
             }
             sort_syms(&names);
             if add_import(m, p, names) {
                 fixes += names.count;
+                let e = last_replace();
+                for x in 0..entries.count {
+                    var at = 0;
+                    var first = x == 0;
+                    while at + 1 < MISSING_AT.count {
+                        if MISSING_AT.data[at] == entries.data[x] {
+                            note_fix(e, 0, if first { names.count } else { 0 },
+                                MISSING_AT.data[at + 1]);
+                            first = false;
+                        }
+                        at += 2;
+                    }
+                }
             }
         }
         fixes
+    }
+}
+
+// (0.25.2.1) Whether a `use` of module m imports `name` already (it may
+// not resolve: a wrong path), or a fix of one of its `use` lines writes
+// it (a did-you-mean of the imported name): an import of it would be a
+// second one.
+fn imported_in(m: i64, name: i64) -> bool {
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast); SUGGESTED a static var (base/diag).
+    // SAFETY: u is a Use node module_uses found and it a child of it (0 <= n < NODE_COUNT); SUGGESTED is read in fours below its count.
+    unsafe {
+        var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        module_uses(m, &uses);
+        for k in 0..uses.count {
+            let u = uses.data[k];
+            for i in 0..NODES[u].count {
+                let it = child(u, i);
+                if (if NODES[it].b != 0 { NODES[it].b } else { NODES[it].a }) == name {
+                    return true;
+                }
+            }
+            var s = 0;
+            while s + 3 < SUGGESTED.count {
+                let at = SUGGESTED.data[s + 1];
+                if at >= NODES[u].start && at < NODES[u].end
+                    && crate::tools::proc::same_bytes(buf_slice(SUGGESTED.data[s + 3]),
+                        SYMS[name].text) {
+                    return true;
+                }
+                s += 4;
+            }
+        }
+        false
     }
 }
 
@@ -632,6 +698,7 @@ fn pub_edits() -> i64 {
             let text = buf_new();
             buf_str(text, c"pub ");
             if edit_replace(NODES[node].start, NODES[node].start, text) {
+                note_fix(last_replace(), 3, 1, -1);
                 fixes += 1;
             }
         }
@@ -681,23 +748,68 @@ pub fn report_unused_imports() {
 
 // The edits of the errors' exact fixes (base::diag's SUGGESTED: a name
 // a did-you-mean offers alone, a conversion, a path from the crate's
-// root, a Rust spelling respelled...); their number.
+// root, a Rust spelling respelled...); their number. (0.25.2.1) Only
+// those of errors with a code in CODES when it is set (`--codes`); a
+// conversion that loses the value is not made (verify::refusal_of, a
+// `note fix.refused`); each fix made is noted for verify_fixes.
 pub fn suggested_edits() -> i64 {
     unsafe {
         var fixes = 0;
         var i = 0;
+        var k = 0;
         while i + 3 < SUGGESTED.count {
+            let pos = SUGGESTED.data[i];
             let start = SUGGESTED.data[i + 1];
             let end = SUGGESTED.data[i + 2];
             let text = SUGGESTED.data[i + 3];
+            let kind = if k < SUGGESTED_KIND.count { SUGGESTED_KIND.data[k] } else { -1 };
             i += 4;
-            if !user_pos(start) || (OPT_IN != 0 as *u8 && !ref_in(start)) {
+            k += 1;
+            if !user_pos(start) || (OPT_IN != 0 as *u8 && !ref_in(start)) || !code_taken(kind) {
+                continue;
+            }
+            let why = refusal_of(start, end, text);
+            if why.len > 0 {
+                note_refused(pos, buf_slice(text), why);
                 continue;
             }
             if edit_replace(start, end, text) {
+                note_fix(last_replace(), 10, 1, pos);
                 fixes += 1;
             }
         }
         fixes
+    }
+}
+
+// (0.25.2.1) `fix --suggested --codes C,...`: the error codes whose fixes
+// are made (a buffer of `,C,` pieces; -1: every code).
+pub static var CODES: i64 = -1;
+
+// Whether the fixes of errors of code `kind` (a symbol) are made.
+fn code_taken(kind: i64) -> bool {
+    // UNSAFE: CODES is a static var (the --codes option); SYMS the symbol table, a raw pointer.
+    // SAFETY: kind is an interned symbol (0 <= kind < SYM_COUNT; -1 returns before), CODES a buffer when >= 0.
+    unsafe {
+        if CODES < 0 {
+            return true;
+        }
+        if kind < 0 {
+            return false;
+        }
+        let want = buf_new();
+        buf_byte(want, ',');
+        buf_bytes(want, SYMS[kind].text);
+        buf_byte(want, ',');
+        let all = buf_slice(CODES);
+        let w = buf_slice(want);
+        var p = 0;
+        while p + w.len <= all.len {
+            if crate::tools::proc::same_bytes(all[p..p + w.len], w) {
+                return true;
+            }
+            p += 1;
+        }
+        false
     }
 }

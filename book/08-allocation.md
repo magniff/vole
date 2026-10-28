@@ -186,6 +186,7 @@ fn main(gpa: Gpa) {
 ```err
 error[type error]: undefined variable 'gpa'
  --> main.vl: line 2, column 39
+  = help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down
 ```
 
 `gpa` is just a parameter name, and `split_path` has no parameter by

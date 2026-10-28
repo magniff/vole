@@ -78,6 +78,16 @@ refs` of one name); a read it cannot translate blocks the line, the
 message naming every blocked read with its `try:` and the reads that will
 run as queries on the retry, so one retry clears the line. A file that is
 not there is left as typed (nothing is read).
+(0.25.2.1, after the 0.25.2 GPU eval, where every agent lost 4-10
+turns to blocks of reads of its own small new program) Only the
+compiler's own source is guarded: a shell read of any .vl outside
+compiler/src and compiler/std (an agent's program, an example) runs, so
+does any read (grep and awk too) of whole files under 300 lines, and a
+sed -i, perl -pi or Python write of any file outside them; still blocked:
+reads of the compiler's large files or directories, and every rewrite of
+its source. A block says first that NOTHING on the line ran, which
+command was blocked, the line with each blocked read as its query when
+that is not in doubt (`try the whole line:`), and what is allowed.
 Development tooling only: not part of the build.
 """
 import json
@@ -279,18 +289,19 @@ def segments(command):
     return [seg.strip() for seg in out if seg.strip()]
 
 
-SMALL_READERS = {"cat", "head", "tail", "sed", "nl", "less", "more"}
 SMALL_LINES = 300
 
 
-def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None):
+def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, programs=None):
     """(program, words, segment, [(operand, full path or None)]) of each
-    simple command reading .vl source. (0.17) Each command is judged on
-    its own, in the directory its `cd`s lead to, with `$VAR`s assigned on
-    the line expanded; a command that reads only test data is added to
-    `fixtures`, one that reads only files outside any program's module tree
-    (a probe, a scratch copy) to `scratch`, one that reads whole small
-    files (cat, head, sed -n ... of files under SMALL_LINES lines) to
+    simple command reading the compiler's .vl source. (0.17) Each command
+    is judged on its own, in the directory its `cd`s lead to, with `$VAR`s
+    assigned on the line expanded; a command that reads only test data is
+    added to `fixtures`, one that reads only files outside any program's
+    module tree (a probe, a scratch copy) to `scratch`, (0.25.2.1) one
+    that reads a program's files outside compiler/src and compiler/std
+    (an agent's own program, an example) to `programs`, one that reads
+    whole small files (any reader, of files under SMALL_LINES lines) to
     `small`; none of those is blocked."""
     found = []
     cwd = cwd or os.getcwd()
@@ -318,6 +329,13 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None):
         if not files:
             continue
         kinds = [file_kind(f, cwd, tc.expand(a, assigns)) for a, f in files]
+        # (0.25.2.1) Only the compiler's own source is read through the
+        # tools: a program's .vl outside compiler/src and compiler/std (the
+        # one an agent writes, an example) is read freely, as the Read tool
+        # reads it (the 0.25.2 eval: 4-10 turns an agent lost to blocks of
+        # reads of its own small files).
+        kinds = [k if k != "source" or compiler_file(f, a) else "program"
+                 for k, (a, f) in zip(kinds, files)]
         if all(k == "fixture" for k in kinds):
             if fixtures is not None:
                 fixtures.append((prog, args))
@@ -326,8 +344,13 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None):
             if scratch is not None:
                 scratch.append((prog, args))
             continue
-        if prog in SMALL_READERS and all(k != "source" or (f and lines_of(f) < SMALL_LINES)
-                                         for k, (_, f) in zip(kinds, files)):
+        if all(k in ("fixture", "scratch", "program") for k in kinds):
+            if programs is not None:
+                programs.append((prog, args))
+            continue
+        # (0.25.2.1: any reader, grep and awk too, of whole files under
+        # SMALL_LINES lines)
+        if all(k != "source" or (f and lines_of(f) < SMALL_LINES) for k, (_, f) in zip(kinds, files)):
             if small is not None:
                 small.append((prog, args))
             continue
@@ -360,6 +383,18 @@ def file_kind(full, cwd, typed=None):
     if SCRATCH.search(shown) or not is_program_source(full):
         return "scratch"
     return "source"
+
+
+COMPILER_DIR = re.compile(r"(^|/)compiler/(src|std)(/|$)")
+
+
+def compiler_file(full, typed=""):
+    """(0.25.2.1) Whether a path read is the compiler's own source: under
+    compiler/src or compiler/std (a file, a directory, a glob); a path not
+    known (a variable of an earlier call) by how it was typed."""
+    if full is None:
+        return bool(COMPILER_DIR.search(typed or ""))
+    return bool(COMPILER_DIR.search(full))
 
 
 def is_program_source(full):
@@ -544,11 +579,11 @@ def in_place_operands(prog, args):
 
 
 def program_source_paths(paths, cwd, base=""):
-    """(0.25.2) The paths that are program source, as reads judge it: the
-    compiler's (compiler/src, compiler/std), and any other .vl of a
-    program (examples/, bench/, a main.vl or a file a `mod` line declares:
-    file_kind's `source`); a test fixture, a scratch copy, a file that is
-    not there is not."""
+    """The paths that are the compiler's source, as reads judge it
+    (compiler/src, compiler/std, as typed or after the line's `cd`s); a
+    test fixture, a scratch copy, a file that is not there is not.
+    (0.25.2 counted any program's .vl; 0.25.2.1: only the compiler's, as
+    for reads: an agent rewrites its own program as it likes.)"""
     out = []
     for a in paths:
         if compiler_paths(a):
@@ -557,7 +592,7 @@ def program_source_paths(paths, cwd, base=""):
         if not a.endswith(".vl"):
             continue
         full = os.path.normpath(os.path.join(cwd or os.getcwd(), base, a))
-        if os.path.isfile(full) and file_kind(full, cwd, a) == "source":
+        if os.path.isfile(full) and file_kind(full, cwd, a) == "source" and compiler_file(full):
             out.append(a)
     return out
 
@@ -788,7 +823,7 @@ def with_root(t, root):
     return " | ".join(out)
 
 
-def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=()):
+def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=(), whole=None):
     """(the message for a blocked read, its `try:` commands): which command
     of the line reads source (when the line has several, the others are
     not the problem), how long the file is when it is too long to read
@@ -796,19 +831,15 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
     blocked reads (`others`) each get a `try:` too, so that one retry
     clears them all; in rewrite mode the reads it could run as queries
     (`translated`: (part, query, clause)) are named: once the blocked
-    ones are changed, the line runs with those as their queries."""
-    parts = [s for s in tc.segments(command) if s.strip() and not s.strip().startswith("#")]
+    ones are changed, the line runs with those as their queries.
+    (0.25.2.1) The message says first that nothing on the line ran;
+    `whole`: the line with every blocked read as its query, when each has
+    one not in doubt (rewrite_parts), to run as it is; the allowance."""
+    parts = command_parts(command)
 
     def where(sg):
-        what = "`%s`" % (sg if len(sg) <= 120 else sg[:117] + "...")
-        if len(parts) > 1:
-            what += " (command %d of %d on the line" % (
-                next((i + 1 for i, p in enumerate(parts) if p.strip() == sg.strip()), 1), len(parts))
-        return what
-    what = where(seg)
-    if len(parts) > 1:
-        what += "; the others are not blocked)" if not others else ")"
-    lines = ["blocked hook.query-first: %s reads .vl source" % what]
+        return part_named(parts, sg)
+    lines = ["blocked hook.query-first: %s: %s reads the compiler's .vl source" % (nothing_ran(parts), where(seg))]
     # (0.25.2) A file of another program than cwd's: every query says
     # `--root`, so that each try: line works where the agent stands.
     full0 = files[0][1] if files and files[0][1] else None
@@ -833,13 +864,53 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
     for o in others:
         t = with_root(suggestion(o[0], o[1]), root)
         tries.append(t)
-        lines.append("also blocked: %s); try: %s" % (where(o[2]), t))
+        lines.append("also blocked: %s; try: %s" % (where(o[2]), t))
     if translated:
         lines.append("the line's other reads of .vl source run as their queries on a retry: " +
                      "; ".join("`%s` as `%s`" % (p if len(p) <= 80 else p[:77] + "...", q)
                                for p, q, _ in translated))
+    if whole and len(parts) > 1:
+        # (0.25.2.1) The line with each blocked read as its query, to run as it is.
+        lines.append("try the whole line: %s" % whole)
+        tries.append(whole)
+    elif whole:
+        k = next(i for i, x in enumerate(lines) if x.startswith("try: "))
+        lines.insert(k, "try: %s" % whole)
+        tries.insert(0, whole)
+    elif len(parts) > 1:
+        lines.append("then run the line's other commands again: they did not run")
+    lines.append(ALLOWED_READS)
     lines.append("override: append '# no-query: <why query is not enough>'")
     return "\n".join(lines) + "\n", tries
+
+
+# (0.25.2.1) What the hook lets through, said in each block message.
+ALLOWED_READS = ("allowed: shell reads (cat, head, tail, sed -n, grep) of any .vl outside compiler/src "
+                 "and compiler/std, and of any file under %d lines; the Read tool reads any file" % SMALL_LINES)
+ALLOWED_WRITES = ("allowed: sed -i, perl -pi and Python writes of any file outside compiler/src and "
+                  "compiler/std (a program you write: as you like)")
+
+
+def command_parts(command):
+    """The simple commands of a line, comments left out."""
+    return [s for s in tc.segments(command) if s.strip() and not s.strip().startswith("#")]
+
+
+def nothing_ran(parts):
+    """(0.25.2.1) The head of a block message: a blocked call runs none of
+    its line (an agent took `the others are not blocked` for `the others
+    ran`, and its `cat > a && cat > b` chain made nothing)."""
+    return "NOTHING on this line ran (%d commands)" % len(parts) if len(parts) > 1 else "nothing ran"
+
+
+def part_named(parts, sg):
+    """A command of the line as a block message names it: `command K
+    (`TEXT`)`, or `TEXT` on a line of one command."""
+    what = "`%s`" % (sg if len(sg) <= 120 else sg[:117] + "...")
+    if len(parts) > 1:
+        k = next((i + 1 for i, p in enumerate(parts) if p.strip() == sg.strip()), 1)
+        what = "command %d (%s)" % (k, what)
+    return what
 
 
 # (0.17, E6) Rewrite instead of block: VOLE_QUERY_MODE=rewrite runs a
@@ -1638,15 +1709,22 @@ def main():
                 return 0
             log(gd, {"kind": "edit-blocked", "program": prog,
                      "files": files[:5], "command": command[:300]})
-            what = "compiler" if compiler_paths(files[0]) else "program"
-            sys.stderr.write("blocked hook.edit-tool: %s rewriting %s source (%s)\n"
-                             "try: %s | override: append '# no-tool: <why the tools are not enough>'\n"
-                             % (prog, what, files[0], edit_suggestion(prog, files, script, cwd, base)))
+            parts = command_parts(command)
+            seg = next((p for p in parts if re.search(r"\bsed\b|\bperl\b", p) and files[0] in p), None) \
+                if prog != "python" else None
+            what = ("%s (%s)" % (part_named(parts, seg), prog)) if seg and len(parts) > 1 else prog
+            sys.stderr.write("blocked hook.edit-tool: %s: %s rewrites the compiler's source (%s)\n"
+                             "try: %s\n%s%s\noverride: append '# no-tool: <why the tools are not enough>'\n"
+                             % (nothing_ran(parts), what, files[0],
+                                edit_suggestion(prog, files, script, cwd, base),
+                                "then run the line's other commands again: they did not run\n"
+                                if len(parts) > 1 else "", ALLOWED_WRITES))
             return 2
-        fixtures, small, scratch = [], [], []
-        reads = source_reads(command, cwd, fixtures, small, scratch)
+        fixtures, small, scratch, programs = [], [], [], []
+        reads = source_reads(command, cwd, fixtures, small, scratch, programs)
         if not reads:
-            for kind, got in (("read-small", small), ("read-scratch", scratch), ("read-fixture", fixtures)):
+            for kind, got in (("read-small", small), ("read-program", programs), ("read-scratch", scratch),
+                              ("read-fixture", fixtures)):
                 if got:
                     log(gd, {"kind": kind, "program": got[0][0], "command": command[:300]})
                     break
@@ -1659,8 +1737,16 @@ def main():
         if not query_ready(gd, cwd):
             log(gd, {"kind": "read-unenforced", "command": command[:300]})
             return 0
-        new, parts, failed = (rewrite_parts(event, command, cwd, reads) if query_mode() == "rewrite"
-                              else (None, [], list(reads)))
+        whole = None
+        if query_mode() == "rewrite":
+            new, parts, failed = rewrite_parts(event, command, cwd, reads)
+        else:
+            new, parts, failed = None, [], list(reads)
+            # (0.25.2.1) the line as rewrite mode would run it: offered whole
+            try:
+                whole = rewrite_parts(event, command, cwd, reads)[0]
+            except Exception:
+                whole = None
         if new:
             # (the first rewrite of a session says what the mode does)
             st = hs.load(event, "query")
@@ -1685,7 +1771,7 @@ def main():
             log(gd, {"kind": "read-missing", "program": reads[0][0], "command": command[:300]})
             return 0
         prog, args, seg, files = failed[0]
-        message, tries = blocked_message(command, prog, args, seg, files, cwd, failed[1:], parts)
+        message, tries = blocked_message(command, prog, args, seg, files, cwd, failed[1:], parts, whole)
         log(gd, {"kind": "blocked", "program": prog, "command": command[:300],
                  "segment": seg[:200], "try": tries, "reads": len(reads),
                  "translated": [to[:200] for _, to, _ in parts]})
