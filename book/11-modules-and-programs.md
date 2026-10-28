@@ -709,7 +709,6 @@ fn main(gpa: Gpa) {
 ```err
 error[type error]: no method 'output_in' on type '()'
  --> main.vl: line 4, column 15
-  = help: no method of that name; the nearest: 'fmt_debug'
 ```
 
 The message is about the symptom: `.arg("hi")` returned `()`, the empty
