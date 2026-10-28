@@ -167,6 +167,116 @@ help query
 --help
 -h
 bogus-command
+lint --max-lines 5
+lint --max-lines 5 main.vl
+lint --max-lines 5 main.vl extra
+lint --root main.vl --max-lines 99999
+lint -x
+lint --root
+lint --max-lines --root
+explain --list
+explain own.escape
+explain own
+explain expected an item
+explain --list x
+explain -x
+explain own.escap
+explain foo --bar
+same-output --corpus
+same-output -j
+same-output -j 2 a b
+same-output --bogus
+same-output nosuch
+same-output -x
+undo --force
+undo nosuch.vl
+assemble --target
+assemble --target bogus x.s -o y.o
+assemble x.s
+assemble -o
+query checks
+query checks main -O 1 --root
+query checks --bogus
+batch --stop --root
+batch nosuch.txt
+batch a b
+batch --root main.vl nosuch
+try '1 + 2'
+try --keep
+try --file
+try --file nosuch
+try -
+try --x
+try -1
+reduce --until
+reduce --fails
+reduce --input
+reduce --differs
+reduce main.vl --timeout x
+reduce main.vl --max-runs 0
+reduce a b
+reduce -x
+reduce main.vl
+reduce nosuch.vl --until true
+fuzz --time
+fuzz --time x
+fuzz a b
+fuzz -x
+fuzz -
+fuzz nosuch nosuch.vl
+probe --max
+probe main.vl:1 --max x
+probe x
+probe -x
+probe --count
+probe --count x
+probe -O
+probe -O3
+probe --root
+test --cases
+test --cases 0
+test --seed
+test --fuzz
+test --gen
+test -O 3
+test -O
+test -O3
+test --budget 0
+test --timeout 0
+test a.vl b.vl
+test -x
+test nosuch.vl
+test --dir
+guide --list
+guide --budget
+guide --budget x
+guide --find own escape --budget 100
+guide --whole core
+guide core nosuchsection
+guide core#nosuch
+guide -h
+guide --x
+guide nosuch --list
+guide how add-std-fn
+guide --find
+query conflicts
+query conflicts --show --root
+query conflicts --bogus
+query arch --feature
+query arch --arch bogus
+query arch --budget x
+query arch --bogus
+query arch add --budget 50
+rewrite --text a
+rewrite --text --files
+rewrite --text --bogus a b
+rewrite --text --regex --case a b
+rewrite --text a b --dry-run --files '*.vl'
+refactor extension
+refactor extension .vl .vl
+refactor extension --bogus
+refactor extension -j
+refactor extension .vl .tl --dry-run main.vl
 """.strip().split("\n")
 
 
