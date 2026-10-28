@@ -1,0 +1,386 @@
+// The lattice-Boltzmann state on the GPU: the populations (two buffers,
+// ping-pong), the solids, the macroscopic fields, the dye, a probe ring,
+// and one compute pipeline per kernel with its bind groups. A step is
+// collide, stream, macroscopic fields and dye, recorded into one encoder;
+// nothing is read back except where the headless checks ask for it.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use shaders::{COLLIDE, DYE, FUNCS, HEAD, INIT, MACRO, PROBE, RENDER, STREAM, STROKE};
+
+// The probe ring's length (the kernel's `& 65535`).
+pub const RING: i64 = 65536;
+
+// A brush stroke: the segment (x0, y0)-(x1, y1) in cells, its radius in
+// cells, and the mode: 0 none, 1 solid, 2 erase.
+pub struct Stroke {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub radius: f32,
+    pub mode: i64,
+}
+
+impl Stroke {
+    pub fn none() -> Stroke {
+        Stroke { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, radius: 0.0, mode: 0 }
+    }
+}
+
+// What a step, a stroke, a reset or a frame uses (the shaders' `U`).
+pub struct Params {
+    // the relaxation rate, the inflow speed, the dye's kept fraction a step
+    pub omega: f32,
+    pub inflow: f32,
+    pub dye_keep: f32,
+    // a closed box (every edge a wall, a perturbation to start) or the channel
+    pub closed: bool,
+    // 0 speed, 1 vorticity, 2 dye
+    pub view: i64,
+    // the probe: the cell it reads and the ring slot it writes
+    pub probe: i64,
+    pub slot: i64,
+    // reset only: rebuild the solids (walls, and the cylinder if on)
+    pub init_solid: bool,
+    pub cyl_on: bool,
+    pub cyl_x: f32,
+    pub cyl_y: f32,
+    pub cyl_r: f32,
+    pub stroke: Stroke,
+}
+
+impl Params {
+    pub fn new() -> Params {
+        Params {
+            omega: 1.7857, inflow: 0.1, dye_keep: 0.998, closed: false, view: 0, probe: 0,
+            slot: 0, init_solid: false, cyl_on: false, cyl_x: 0.0, cyl_y: 0.0, cyl_r: 0.0,
+            stroke: Stroke::none(),
+        }
+    }
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // cells across and down
+    pub w: i64,
+    pub h: i64,
+    // which population buffer holds the current state (the dye follows it)
+    pub parity: i64,
+    ubuf: gpu::Buffer,
+    f0: gpu::Buffer,
+    f1: gpu::Buffer,
+    solid: gpu::Buffer,
+    mac: gpu::Buffer,
+    dye0: gpu::Buffer,
+    dye1: gpu::Buffer,
+    series: gpu::Buffer,
+    k_init: gpu::ComputePipeline,
+    k_stroke: gpu::ComputePipeline,
+    k_collide: gpu::ComputePipeline,
+    k_stream: gpu::ComputePipeline,
+    k_macro: gpu::ComputePipeline,
+    k_dye: gpu::ComputePipeline,
+    k_probe: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    g_init: gpu::BindGroup,
+    g_stroke: gpu::BindGroup,
+    g_collide0: gpu::BindGroup,
+    g_collide1: gpu::BindGroup,
+    g_stream01: gpu::BindGroup,
+    g_stream10: gpu::BindGroup,
+    g_macro0: gpu::BindGroup,
+    g_macro1: gpu::BindGroup,
+    g_dye01: gpu::BindGroup,
+    g_dye10: gpu::BindGroup,
+    g_probe: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+}
+
+// The parts of a shader, joined.
+fn join(parts: [[u8]], gpa: Gpa) -> Buf {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    src
+}
+
+// A compute pipeline from the shader made of `parts`.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    let src = join(parts, gpa);
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// One kernel over w x h threads (workgroups of 8 x 8).
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, nx: i64, ny: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch((nx + 7) / 8, (ny + 7) / 8);
+}
+
+// The uniform as 24 words (the shaders' `U`, in order).
+#[pure]
+fn pack(p: Params, w: i64, h: i64) -> [u32; 24] {
+    var words: [u32; 24] = [0; 24];
+    words[0] = w as u32;
+    words[1] = h as u32;
+    words[2] = if p.closed { 1 } else { 0 };
+    words[3] = p.view as u32;
+    words[4] = f32_to_bits(p.omega);
+    words[5] = f32_to_bits(p.inflow);
+    words[6] = f32_to_bits(p.dye_keep);
+    words[7] = p.slot as u32;
+    words[8] = p.probe as u32;
+    words[9] = if p.init_solid { 1 } else { 0 };
+    words[10] = if p.cyl_on { 1 } else { 0 };
+    words[11] = f32_to_bits(p.cyl_x);
+    words[12] = f32_to_bits(p.cyl_y);
+    words[13] = f32_to_bits(p.cyl_r);
+    words[14] = f32_to_bits(p.stroke.x0);
+    words[15] = f32_to_bits(p.stroke.y0);
+    words[16] = f32_to_bits(p.stroke.x1);
+    words[17] = f32_to_bits(p.stroke.y1);
+    words[18] = f32_to_bits(p.stroke.radius);
+    words[19] = p.stroke.mode as u32;
+    words
+}
+
+impl Sim {
+    // A w x h grid, on the system's GPU, drawing into targets of `format`.
+    pub fn new_in(w: i64, h: i64, format: Format, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = w * h;
+        let ubuf = dev.buffer(96, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let f0 = storage(dev, cells * 9 * 4);
+        let f1 = storage(dev, cells * 9 * 4);
+        let solid = storage(dev, cells * 4);
+        let mac = storage(dev, cells * 16);
+        let dye0 = storage(dev, cells * 16);
+        let dye1 = storage(dev, cells * 16);
+        let series = storage(dev, RING * 4);
+
+        let k_init = kernel(dev, [HEAD, FUNCS, INIT][..], gpa)?;
+        let k_stroke = kernel(dev, [HEAD, FUNCS, STROKE][..], gpa)?;
+        let k_collide = kernel(dev, [HEAD, FUNCS, COLLIDE][..], gpa)?;
+        let k_stream = kernel(dev, [HEAD, FUNCS, STREAM][..], gpa)?;
+        let k_macro = kernel(dev, [HEAD, FUNCS, MACRO][..], gpa)?;
+        let k_dye = kernel(dev, [HEAD, FUNCS, DYE][..], gpa)?;
+        let k_probe = kernel(dev, [HEAD, FUNCS, PROBE][..], gpa)?;
+        let rsrc = join([HEAD, RENDER][..], gpa);
+        let rshader = dev.shader_wgsl(rsrc.as_slice())?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs", format))?;
+
+        let b = gpu::bind;
+        let g_init = dev.bind_group(k_init.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, f1), b(3, solid), b(4, dye0), b(5, dye1)][..]);
+        let g_stroke = dev.bind_group(k_stroke.bind_layout(0),
+            [b(0, ubuf), b(1, solid), b(2, f0), b(3, f1)][..]);
+        let g_collide0 = dev.bind_group(k_collide.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, solid)][..]);
+        let g_collide1 = dev.bind_group(k_collide.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, solid)][..]);
+        let g_stream01 = dev.bind_group(k_stream.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, f1), b(3, solid)][..]);
+        let g_stream10 = dev.bind_group(k_stream.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, f0), b(3, solid)][..]);
+        let g_macro0 = dev.bind_group(k_macro.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, solid), b(3, mac)][..]);
+        let g_macro1 = dev.bind_group(k_macro.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, solid), b(3, mac)][..]);
+        let g_dye01 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, solid), b(3, dye0), b(4, dye1)][..]);
+        let g_dye10 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, solid), b(3, dye1), b(4, dye0)][..]);
+        let g_probe = dev.bind_group(k_probe.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, series)][..]);
+        let g_render0 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, solid), b(3, dye0)][..]);
+        let g_render1 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, mac), b(2, solid), b(3, dye1)][..]);
+        Ok(Sim {
+            dev: dev, queue: queue, w: w, h: h, parity: 0, ubuf: ubuf, f0: f0, f1: f1,
+            solid: solid, mac: mac, dye0: dye0, dye1: dye1, series: series,
+            k_init: k_init, k_stroke: k_stroke, k_collide: k_collide, k_stream: k_stream,
+            k_macro: k_macro, k_dye: k_dye, k_probe: k_probe, render: render,
+            g_init: g_init, g_stroke: g_stroke, g_collide0: g_collide0, g_collide1: g_collide1,
+            g_stream01: g_stream01, g_stream10: g_stream10, g_macro0: g_macro0,
+            g_macro1: g_macro1, g_dye01: g_dye01, g_dye10: g_dye10, g_probe: g_probe,
+            g_render0: g_render0, g_render1: g_render1,
+        })
+    }
+
+    // The uniform for the next submission (queue order: a submission in
+    // flight keeps the value it was recorded with).
+    pub fn set_params(inout self, p: Params) {
+        let words = pack(p, self.w, self.h);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // Rebuilds the state: at rest at the inflow speed (or the closed box's
+    // perturbation), the dye cleared, the solids rebuilt when p.init_solid.
+    pub fn reset(inout self, p: Params) {
+        self.set_params(p);
+        var enc = self.dev.encoder();
+        let w = self.w;
+        let h = self.h;
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_init, self.g_init, w, h);
+            run(&pass, self.k_macro, self.g_macro0, w, h);
+        });
+        self.queue.submit(enc.finish());
+        self.parity = 0;
+    }
+
+    // A brush stroke, recorded into `enc` (the uniform's stroke fields).
+    pub fn stroke(inout self, enc: inout gpu::Encoder) {
+        let w = self.w;
+        let h = self.h;
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_stroke, self.g_stroke, w, h);
+        });
+    }
+
+    // One step, recorded into `enc`: collide the current populations, stream
+    // them into the other buffer, take the fields and advect the dye.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let w = self.w;
+        let h = self.h;
+        let p = self.parity;
+        enc.compute_pass(|pass| {
+            if p == 0 {
+                run(&pass, self.k_collide, self.g_collide0, w, h);
+                run(&pass, self.k_stream, self.g_stream01, w, h);
+                run(&pass, self.k_macro, self.g_macro1, w, h);
+                run(&pass, self.k_dye, self.g_dye01, w, h);
+            } else {
+                run(&pass, self.k_collide, self.g_collide1, w, h);
+                run(&pass, self.k_stream, self.g_stream10, w, h);
+                run(&pass, self.k_macro, self.g_macro0, w, h);
+                run(&pass, self.k_dye, self.g_dye10, w, h);
+            }
+        });
+        self.parity = 1 - p;
+    }
+
+    // The probe's sample of the fields' transverse velocity into the ring at
+    // the uniform's slot, recorded into `enc`.
+    pub fn probe(inout self, enc: inout gpu::Encoder) {
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.k_probe);
+            pass.set_bind_group(0, self.g_probe);
+            pass.dispatch(1);
+        });
+    }
+
+    // The picture of the current state into `target`.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let p = self.parity;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.render);
+            if p == 0 {
+                pass.set_bind_group(0, self.g_render0);
+            } else {
+                pass.set_bind_group(0, self.g_render1);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // The picture as a binary PPM of w x h pixels (waits for the GPU).
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+
+    // The sum of every population (waits for the GPU): the mass the
+    // closed box must keep.
+    pub fn mass(inout self) -> f64 {
+        let _ = self.queue.wait_idle();
+        let f = if self.parity == 0 {
+            gpu::f32s(self.f0.map_read(self.dev))
+        } else {
+            gpu::f32s(self.f1.map_read(self.dev))
+        };
+        var s = 0.0;
+        for x in f {
+            s += x as f64;
+        }
+        s
+    }
+
+    // The largest speed over the fluid cells, and whether every value is a
+    // finite number (waits for the GPU).
+    pub fn speed_check(inout self) -> (f64, bool) {
+        let _ = self.queue.wait_idle();
+        let m = gpu::f32s(self.mac.map_read(self.dev));
+        var top = 0.0;
+        var finite = true;
+        for c in 0..(self.w * self.h) {
+            let rho = m[c * 4] as f64;
+            let ux = m[c * 4 + 1] as f64;
+            let uy = m[c * 4 + 2] as f64;
+            if !(rho == rho) || !(ux == ux) || !(uy == uy) {
+                finite = false;
+            } else if rho > 0.0 {
+                let s = sqrt(ux * ux + uy * uy);
+                if s > top {
+                    top = s;
+                }
+            }
+        }
+        (top, finite)
+    }
+
+    // The probe ring's first `n` samples, copied out (waits for the GPU).
+    pub fn ring_in(inout self, n: i64, gpa: Gpa) -> Vec<f32> {
+        let _ = self.queue.wait_idle();
+        let all = gpu::f32s(self.series.map_read(self.dev));
+        var v: Vec<f32> = Vec::new_in(gpa);
+        for i in 0..n {
+            v.push(all[i]);
+        }
+        v
+    }
+}
+
+
+// Newton's square root (std has none without C; the start is a power of two
+// and 64 steps are exact to f64's precision for these sums).
+fn sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    var r = if x > 1.0 { x / 2.0 } else { 1.0 };
+    for _ in 0..64 {
+        r = 0.5 * (r + x / r);
+    }
+    r
+}

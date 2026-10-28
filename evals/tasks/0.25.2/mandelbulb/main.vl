@@ -1,0 +1,300 @@
+// mandelbulb: a Mandelbulb and a Mandelbox, raymarched in one WGSL fragment
+// shader (march.wgsl) on std::gpu: distance estimation, soft shadows, ambient
+// occlusion, a fly-through camera with the mouse and keys, a live power knob.
+//
+//   mandelbulb                          the window (P: fly-through on/off)
+//   mandelbulb --headless               three fixed views: timings and brightness
+//   mandelbulb --headless --check       the same, with verdicts (exit 1 on a failure)
+//   mandelbulb --headless --view 1 --shot shot.ppm
+//
+// scene.vl: the camera, the knobs, the keys and the fly-through (CPU side);
+// render.vl: the pipeline and the pictures; ppm.vl: PPM files and statistics.
+
+mod ppm;
+mod render;
+mod scene;
+mod shader;
+
+use std::{env, fs, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use ppm::{ppm_of_bgra, stats_of_bgra};
+use render::{Renderer, stride_of};
+use scene::{Scene, key_held, mouse, new_keys, on_key, step_scene, uniforms, view_scene};
+
+// What the command line asked for.
+pub struct Opts {
+    pub fractal: i64,
+    pub power: f64,
+    pub scale: f64,
+    pub shadows: bool,
+    pub ao: bool,
+    pub width: i64,
+    pub height: i64,
+    pub frames: i64,
+    pub view: i64,
+    pub shot: [u8],
+    pub check: bool,
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn fractal_name(f: i64) -> [u8] {
+    if f == 0 { "Mandelbulb" } else { "Mandelbox" }
+}
+
+fn same_bytes(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The fixed views, timed and measured; --check gives the verdicts.
+fn headless(o: Opts, gpa: Gpa) -> Result<i32, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var r = Renderer::new(dev, queue, Format::Bgra8Unorm)?;
+    let stride = stride_of(o.width);
+    var first = o.view;
+    var last = o.view;
+    if o.check {
+        first = 0;
+        last = 2;
+    }
+    var code: i32 = 0;
+    var v = first;
+    while v <= last {
+        var sc = view_scene(v, o.fractal, o.power, o.scale);
+        sc.shadows = o.shadows;
+        sc.ao = o.ao;
+        let u = uniforms(sc, o.width, o.height);
+        let px = r.snapshot(u, o.width, o.height, gpa);
+        let st = stats_of_bgra(px.as_slice(), o.width, o.height, stride);
+        let ms = r.bench(u, o.width, o.height, o.frames);
+        println(f"view {v} ({fractal_name(o.fractal)}, {o.width}x{o.height}): {ms:.2} ms a frame over {o.frames} frames, mean luma {st.mean:.3}, spread {st.spread:.3}");
+        if o.check {
+            let ok = st.mean > 0.03 && st.mean < 0.97 && st.spread > 0.04;
+            println(f"  picture is neither black nor flat: {if ok { "ok" } else { "FAILED" }}");
+            if !ok {
+                code = 1;
+            }
+        }
+        if o.shot.len() > 0 && v == o.view {
+            let img = ppm_of_bgra(px.as_slice(), o.width, o.height, stride, gpa);
+            if fs::write(o.shot, img.as_slice()).is_err() {
+                eprintln(f"mandelbulb: cannot write {o.shot}");
+                code = 1;
+            }
+        }
+        v += 1;
+    }
+    // the same view twice is the same bytes: nothing reads stale memory
+    let u0 = uniforms(view_scene(0, o.fractal, o.power, o.scale), o.width, o.height);
+    let a = r.snapshot(u0, o.width, o.height, gpa);
+    let b = r.snapshot(u0, o.width, o.height, gpa);
+    let same = same_bytes(a.as_slice(), b.as_slice());
+    if o.check {
+        println(f"repeatable: two renders of view 0 are {if same { "identical" } else { "DIFFERENT" }}");
+        if !same {
+            code = 1;
+        }
+    }
+    Ok(code)
+}
+
+// The window: the fly-through (or the keys), a frame a request.
+fn windowed(o: Opts, gpa: Gpa) -> Result<i32, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("mandelbulb: no window server (try --headless)");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("mandelbulb", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("mandelbulb: no window");
+            return Ok(1);
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var r = Renderer::new(dev, queue, Format::Bgra8Unorm)?;
+    var surf = inst.surface(r.dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    let sz = win.size();
+    surf.configure(r.dev, sz.w, sz.h);
+    var sc: Scene = view_scene(0, o.fractal, o.power, o.scale);
+    sc.shadows = o.shadows;
+    sc.ao = o.ao;
+    sc.auto = true;
+    var keys = new_keys();
+    let start = monotonic_now();
+    var prev = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    var fps = 0.0;
+    var fps_frames = 0;
+    var fps_since = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 {
+                    dt = 1.0 / 60.0;
+                }
+                if dt < 1.0 / 240.0 {
+                    dt = 1.0 / 240.0;
+                }
+                prev = now;
+                step_scene(&sc, &keys, dt);
+                match surf.frame() {
+                    Ok(f) => {
+                        r.draw(f.texture.view(), uniforms(sc, surf.width, surf.height));
+                        f.present(&r.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames == 1 {
+                    first = now;
+                }
+                fps_frames += 1;
+                if now - fps_since >= 0.5 {
+                    fps = fps_frames as f64 / (now - fps_since);
+                    fps_frames = 0;
+                    fps_since = now;
+                    let title = if sc.fractal == 0 {
+                        format_in(f"Mandelbulb  power {sc.power:.2}  {fps:.0} fps  P fly-through", gpa)
+                    } else {
+                        format_in(f"Mandelbox  scale {sc.scale:.2}  {fps:.0} fps  P fly-through", gpa)
+                    };
+                    win.set_title(title.as_slice());
+                }
+                if o.frames > 0 && frames >= o.frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(f"{surf.width} x {surf.height} pixels: {frames} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    if o.shot.len() > 0 {
+                        let px = r.snapshot(uniforms(sc, surf.width, surf.height), surf.width, surf.height, gpa);
+                        let img = ppm_of_bgra(px.as_slice(), surf.width, surf.height, stride_of(surf.width), gpa);
+                        if fs::write(o.shot, img.as_slice()).is_err() {
+                            eprintln(f"mandelbulb: cannot write {o.shot}");
+                        }
+                    }
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                key_held(&keys, k.code, k.pressed);
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Named(Named::Escape) => break,
+                        _ => {
+                            let _ = on_key(&sc, k.key);
+                        }
+                    }
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                let left = match m.button {
+                    Button::Left => true,
+                    _ => false,
+                };
+                mouse(&keys, m.action, left, m.x, m.y);
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(r.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    Ok(0)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("mandelbulb", gpa)
+        .about("A Mandelbulb and a Mandelbox, raymarched on the GPU: a window to fly through, or the headless renders")
+        .arg(Arg::flag("headless").help("no window: the fixed views, timed, with their brightness"))
+        .arg(Arg::flag("check").help("headless: all three views, with verdicts"))
+        .arg(Arg::option("view").value_name("N").default("0").help("headless: the view (0 to 2) for --shot"))
+        .arg(Arg::option("width").value_name("W").default("320").help("headless: the picture's width"))
+        .arg(Arg::option("height").value_name("H").default("180").help("headless: the picture's height"))
+        .arg(Arg::option("frames").value_name("N").default("20")
+            .help("headless: frames timed per view; window: quit after N frames and print the mean"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: the view as a PPM image; window: with --frames, the last frame"))
+        .arg(Arg::option("fractal").value_name("NAME").default("bulb").help("bulb or box"))
+        .arg(Arg::option("power").value_name("X").default("8").help("the Mandelbulb's power, 2 to 12"))
+        .arg(Arg::option("scale").value_name("X").default("2.3").help("the Mandelbox's scale, -3 to 4"))
+        .arg(Arg::flag("no-shadows").help("no soft shadows"))
+        .arg(Arg::flag("no-ao").help("no ambient occlusion"));
+    let m = cli.parse_or_exit(env::args());
+    let fractal = if m.get("fractal").unwrap_or("bulb") == "box" { 1 } else { 0 };
+    if m.get("fractal").unwrap_or("bulb") != "box" && m.get("fractal").unwrap_or("bulb") != "bulb" {
+        eprintln("mandelbulb: --fractal is bulb or box");
+        return 2;
+    }
+    let power = match std::num::parse_f64(m.get("power").unwrap_or("8")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("mandelbulb: --power takes a number");
+            return 2;
+        }
+    };
+    let scale = match std::num::parse_f64(m.get("scale").unwrap_or("2.3")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("mandelbulb: --scale takes a number");
+            return 2;
+        }
+    };
+    let view = parse_int(m.get("view").unwrap_or("0")).unwrap_or(-1);
+    let width = parse_int(m.get("width").unwrap_or("320")).unwrap_or(0);
+    let height = parse_int(m.get("height").unwrap_or("180")).unwrap_or(0);
+    let frames = parse_int(m.get("frames").unwrap_or("20")).unwrap_or(0);
+    if view < 0 || view > 2 || width < 16 || height < 16 || frames < 1 {
+        eprintln("mandelbulb: --view 0..2, --width and --height 16 or more, --frames 1 or more");
+        return 2;
+    }
+    let o = Opts {
+        fractal: fractal,
+        power: clamp_power(power),
+        scale: scale,
+        shadows: !m.flag("no-shadows"),
+        ao: !m.flag("no-ao"),
+        width: width,
+        height: height,
+        frames: frames,
+        view: view,
+        shot: m.get("shot").unwrap_or(""),
+        check: m.flag("check"),
+    };
+    let res = if m.flag("headless") { headless(o, gpa) } else { windowed(o, gpa) };
+    match res {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln(f"mandelbulb: {e}");
+            1
+        }
+    }
+}
+
+fn clamp_power(p: f64) -> f64 {
+    if p < 2.0 { 2.0 } else if p > 12.0 { 12.0 } else { p }
+}

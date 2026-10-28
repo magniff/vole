@@ -1,0 +1,252 @@
+// The GPU side of sph: the buffers, the kernels, one step (a counting sort
+// of the particles by cell, then the density, the forces and the
+// integration) and the picture. Every kernel is one compute shader built
+// from shaders.vl's parts; all of them share one bind group layout.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Format, PassDesc, TextureUsage};
+
+use cpu::{DT, GRAV, GX, GY, H, HH, HW, INV_H, MASS, N, RHO0, STIFF, VISC};
+use shaders::{BUFS, DRAW, DRAW_BUFS, K_BIN, K_CLEAR, K_DENSITY, K_FORCE, K_INTEGRATE, K_SCAN, K_SCATTER, PARAMS};
+
+// What changes between frames: the box's tilt, the stir and the view.
+pub struct Frame {
+    pub cs: f32,
+    pub sn: f32,
+    pub stirx: f32,
+    pub stiry: f32,
+    pub stirvx: f32,
+    pub stirvy: f32,
+    pub stirr: f32,
+    pub stiramt: f32,
+    pub vmax: f32,
+    pub psize: f32,
+    pub ext_x: f32,
+    pub ext_y: f32,
+}
+
+impl Frame {
+    // The box level, no stir, the view for a window of `aspect` width/height.
+    pub fn rest(aspect: f32) -> Frame {
+        Frame {
+            cs: 1.0, sn: 0.0, stirx: 0.0, stiry: 0.0, stirvx: 0.0, stirvy: 0.0,
+            stirr: 0.0, stiramt: 0.0, vmax: 4.0, psize: 0.0030,
+            ext_x: 0.86 * aspect, ext_y: 0.86,
+        }
+    }
+}
+
+pub struct Sim {
+    pub inst: gpu::Instance,
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    ubuf: gpu::Buffer,
+    pub pos: gpu::Buffer,
+    pub vel: gpu::Buffer,
+    pub acc: gpu::Buffer,
+    pub rho: gpu::Buffer,
+    pub cell: gpu::Buffer,
+    pub counts: gpu::Buffer,
+    pub starts: gpu::Buffer,
+    cursor: gpu::Buffer,
+    pub order: gpu::Buffer,
+    k_clear: gpu::ComputePipeline,
+    k_bin: gpu::ComputePipeline,
+    k_scan: gpu::ComputePipeline,
+    k_scatter: gpu::ComputePipeline,
+    k_density: gpu::ComputePipeline,
+    k_force: gpu::ComputePipeline,
+    k_integrate: gpu::ComputePipeline,
+    g_clear: gpu::BindGroup,
+    g_bin: gpu::BindGroup,
+    g_scan: gpu::BindGroup,
+    g_scatter: gpu::BindGroup,
+    g_density: gpu::BindGroup,
+    g_force: gpu::BindGroup,
+    g_integrate: gpu::BindGroup,
+    dpipe: gpu::RenderPipeline,
+    gdraw: gpu::BindGroup,
+    // the starting positions and zeros, for reset
+    init: Vec<f32>,
+    zeros: Vec<u8>,
+}
+
+// One compute shader: the parameters, the buffers, then a kernel.
+fn kernel(dev: gpu::Device, kernel_src: [u8], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    src.push_str(PARAMS);
+    src.push_str(BUFS);
+    src.push_str(kernel_src);
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// One dispatch of `groups` workgroups.
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, groups: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch(groups);
+}
+
+// The particles' workgroups (256 threads each).
+fn groups_of(items: i64) -> i64 {
+    (items + 255) / 256
+}
+
+impl Sim {
+    // N particles on the lattice at rest, the kernels built, the draw
+    // pipeline for `format` (the window's or the picture's).
+    pub fn new_in(gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let init = cpu::lattice(gpa);
+        let cells = GX * GY;
+        let ubuf = dev.buffer(128, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let pos = storage(dev, N * 8);
+        let vel = storage(dev, N * 8);
+        let acc = storage(dev, N * 8);
+        let rho = storage(dev, N * 4);
+        let cell = storage(dev, N * 4);
+        let counts = storage(dev, cells * 4);
+        let starts = storage(dev, cells * 4);
+        let cursor = storage(dev, cells * 4);
+        let order = storage(dev, N * 4);
+        var zeros: Vec<u8> = Vec::new_in(gpa);
+        for _ in 0..N * 8 {
+            zeros.push(0);
+        }
+        queue.write_buffer(pos, 0, gpu::bytes_of_f32(init.as_slice()));
+        queue.write_buffer(vel, 0, zeros.as_slice());
+
+        let k_clear = kernel(dev, K_CLEAR, gpa)?;
+        let k_bin = kernel(dev, K_BIN, gpa)?;
+        let k_scan = kernel(dev, K_SCAN, gpa)?;
+        let k_scatter = kernel(dev, K_SCATTER, gpa)?;
+        let k_density = kernel(dev, K_DENSITY, gpa)?;
+        let k_force = kernel(dev, K_FORCE, gpa)?;
+        let k_integrate = kernel(dev, K_INTEGRATE, gpa)?;
+
+        var dsrc = Buf::new_in(gpa);
+        dsrc.push_str(PARAMS);
+        dsrc.push_str(DRAW_BUFS);
+        dsrc.push_str(DRAW);
+        let dshader = dev.shader_wgsl(dsrc.as_slice())?;
+        let draw = dev.render_pipeline(gpu::RenderDesc::new(dshader, "vs", "fs", Format::Bgra8Unorm))?;
+
+        let b = gpu::bind;
+        // a kernel's layout has only the bindings its code uses
+        let g_clear = dev.bind_group(k_clear.bind_layout(0), [b(0, ubuf), b(6, counts)][..]);
+        let g_bin = dev.bind_group(k_bin.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(5, cell), b(6, counts)][..]);
+        let g_scan = dev.bind_group(k_scan.bind_layout(0),
+            [b(0, ubuf), b(6, counts), b(7, starts), b(8, cursor)][..]);
+        let g_scatter = dev.bind_group(k_scatter.bind_layout(0),
+            [b(0, ubuf), b(5, cell), b(8, cursor), b(9, order)][..]);
+        let g_density = dev.bind_group(k_density.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(4, rho), b(5, cell), b(6, counts), b(7, starts), b(9, order)][..]);
+        let g_force = dev.bind_group(k_force.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(2, vel), b(3, acc), b(4, rho), b(5, cell), b(6, counts),
+             b(7, starts), b(9, order)][..]);
+        let g_integrate = dev.bind_group(k_integrate.bind_layout(0),
+            [b(0, ubuf), b(1, pos), b(2, vel), b(3, acc)][..]);
+        let gdraw = dev.bind_group(draw.bind_layout(0), [b(0, ubuf), b(1, pos), b(2, vel)][..]);
+
+        Ok(Sim {
+            inst: inst, dev: dev, queue: queue, ubuf: ubuf, pos: pos, vel: vel, acc: acc,
+            rho: rho, cell: cell, counts: counts, starts: starts, cursor: cursor, order: order,
+            k_clear: k_clear, k_bin: k_bin, k_scan: k_scan, k_scatter: k_scatter,
+            k_density: k_density, k_force: k_force, k_integrate: k_integrate,
+            g_clear: g_clear, g_bin: g_bin, g_scan: g_scan, g_scatter: g_scatter,
+            g_density: g_density, g_force: g_force, g_integrate: g_integrate,
+            dpipe: draw, gdraw: gdraw, init: init, zeros: zeros,
+        })
+    }
+
+    // The frame's values into the uniform buffer: the constants of the
+    // sim and these. Written before the next submission.
+    pub fn set_frame(inout self, f: Frame) {
+        let w = constants_with(f);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(w[..]));
+    }
+
+    // Everything back at rest on the lattice.
+    pub fn reset(inout self) {
+        self.queue.write_buffer(self.pos, 0, gpu::bytes_of_f32(self.init.as_slice()));
+        self.queue.write_buffer(self.vel, 0, self.zeros.as_slice());
+    }
+
+    // The counting sort by cell: counts, the exclusive prefix sum into
+    // starts, then each particle into its slot of order.
+    pub fn sort(inout self, enc: inout gpu::Encoder) {
+        let gp = groups_of(N);
+        let gc = groups_of(GX * GY);
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_clear, self.g_clear, gc);
+            run(&pass, self.k_bin, self.g_bin, gp);
+            run(&pass, self.k_scan, self.g_scan, 1);
+            run(&pass, self.k_scatter, self.g_scatter, gp);
+        });
+    }
+
+    // One step: the sort, the density, the forces, the integration.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let gp = groups_of(N);
+        enc.compute_pass(|pass| {
+            run(&pass, self.k_clear, self.g_clear, groups_of(GX * GY));
+            run(&pass, self.k_bin, self.g_bin, gp);
+            run(&pass, self.k_scan, self.g_scan, 1);
+            run(&pass, self.k_scatter, self.g_scatter, gp);
+            run(&pass, self.k_density, self.g_density, gp);
+            run(&pass, self.k_force, self.g_force, gp);
+            run(&pass, self.k_integrate, self.g_integrate, gp);
+        });
+    }
+
+    // The particles, drawn into `target` (cleared to the background).
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let n = N;
+        enc.render_pass(PassDesc::color(target, Color::rgba(0.05, 0.06, 0.08, 1.0)), |pass| {
+            pass.set_pipeline(self.dpipe);
+            pass.set_bind_group(0, self.gdraw);
+            pass.draw(0..6, 0..(n + 4));
+        });
+    }
+
+    // The picture as a binary PPM (P6) of w x h pixels (w * 4 a multiple
+    // of 256), read back from the GPU.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Vec<u8> {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        var out = self.dev.buffer(w * 4 * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, w * 4);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var ppm: Vec<u8> = Vec::new_in(gpa);
+        let head = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for c in head.as_slice() {
+            ppm.push(c);
+        }
+        var k: i64 = 0;
+        while k < w * h {
+            ppm.push(px[4 * k + 2]);
+            ppm.push(px[4 * k + 1]);
+            ppm.push(px[4 * k]);
+            k += 1;
+        }
+        ppm
+    }
+}
+
+// The uniform's words: the sim's constants with the frame's values (the
+// box's tilt, the stir, the view). The order is shaders.vl's Params.
+fn constants_with(f: Frame) -> [f32; 32] {
+    [N as f32, GX as f32, GY as f32, -1.0, INV_H, H, H * H, MASS, RHO0, STIFF, VISC, 0.0, GRAV,
+     DT, f.cs, f.sn, HW, HH, f.stirx, f.stiry, f.stirvx, f.stirvy, f.stirr, f.stiramt,
+     f.vmax, f.psize, f.ext_x, f.ext_y, 0.0, 0.0, 0.0, 0.0]
+}

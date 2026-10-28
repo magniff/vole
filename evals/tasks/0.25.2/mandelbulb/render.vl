@@ -1,0 +1,83 @@
+// The GPU side: the march pipeline, its uniform buffer, and the pictures it
+// makes (into a window's frame, or a texture read back).
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use shader::MARCH;
+
+// The bytes a readback row takes: a multiple of 256.
+pub fn stride_of(w: i64) -> i64 {
+    (w * 4 + 255) / 256 * 256
+}
+
+pub struct Renderer {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pipe: gpu::RenderPipeline,
+    ubuf: gpu::Buffer,
+    group: gpu::BindGroup,
+}
+
+impl Renderer {
+    pub fn new(dev: sink gpu::Device, queue: sink gpu::Queue, format: Format) -> Result<Renderer, gpu::Error> {
+        let shader = dev.shader_wgsl(MARCH)?;
+        let pipe = dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs", format))?;
+        let ubuf = dev.buffer(96, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+        Ok(Renderer { dev: dev, queue: queue, pipe: pipe, ubuf: ubuf, group: group })
+    }
+
+    // Records one frame of the uniforms u into enc's target.
+    fn record(inout self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let pipe = self.pipe;
+        let group = self.group;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, group);
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // Draws one frame into target and submits it (the GPU runs it later).
+    pub fn draw(inout self, target: gpu::TextureView, u: [f32; 24]) {
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+        var enc = self.dev.encoder();
+        self.record(&enc, target);
+        self.queue.submit(enc.finish());
+    }
+
+    // The picture of u at w x h as BGRA rows, stride_of(w) bytes apart
+    // (waits for the GPU).
+    pub fn snapshot(inout self, u: [f32; 24], w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = stride_of(w);
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+        var enc = self.dev.encoder();
+        self.record(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = Buf::new_in(gpa);
+        for i in 0..px.len() {
+            b.push(px[i]);
+        }
+        b
+    }
+
+    // The mean milliseconds a frame of u takes at w x h over `frames` frames
+    // (one warm-up first; the GPU is waited for at the end).
+    pub fn bench(inout self, u: [f32; 24], w: i64, h: i64, frames: i64) -> f64 {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm, usage: TextureUsage::RENDER_ATTACHMENT);
+        self.draw(tex.view(), u);
+        let _ = self.queue.wait_idle();
+        let t0 = std::time::monotonic_now();
+        for _ in 0..frames {
+            self.draw(tex.view(), u);
+        }
+        let _ = self.queue.wait_idle();
+        let dt = std::time::monotonic_now().saturating_sub(t0);
+        dt.as_secs_f64() * 1000.0 / frames as f64
+    }
+}

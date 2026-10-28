@@ -1,0 +1,645 @@
+// Byte-level BPE of Qwen3.5: vocab.json and merges.txt of the model folder,
+// the pre-tokenizer of tokenizer.json (its regex, written out by hand over
+// code points), and the added (special) tokens. Encode and decode.
+//
+// Approximation: \p{L} and \p{N} are decided by ranges, not Unicode tables
+// (ASCII exact; the common scripts and punctuation blocks right).
+
+const VOCAB: i64 = 248044; // the ids of vocab.json; the added tokens follow
+const SLOTS: i64 = 524288;       // hash slots, a power of two, more than 2 x VOCAB
+const MASK: i64 = 524287;
+
+// The added tokens of tokenizer.json (their ids are fixed by the model).
+const SPECIALS: i64 = 26;
+
+fn special_text(i: i64) -> [u8] {
+    match i {
+        0 => "<|endoftext|>",
+        1 => "<|im_start|>",
+        2 => "<|im_end|>",
+        3 => "<|object_ref_start|>",
+        4 => "<|object_ref_end|>",
+        5 => "<|box_start|>",
+        6 => "<|box_end|>",
+        7 => "<|quad_start|>",
+        8 => "<|quad_end|>",
+        9 => "<|vision_start|>",
+        10 => "<|vision_end|>",
+        11 => "<|vision_pad|>",
+        12 => "<|image_pad|>",
+        13 => "<|video_pad|>",
+        14 => "<tool_call>",
+        15 => "</tool_call>",
+        16 => "<|fim_prefix|>",
+        17 => "<|fim_middle|>",
+        18 => "<|fim_suffix|>",
+        19 => "<|fim_pad|>",
+        20 => "<|repo_name|>",
+        21 => "<|file_sep|>",
+        22 => "<tool_response>",
+        23 => "</tool_response>",
+        24 => "<think>",
+        _ => "</think>",
+    }
+}
+
+pub const ENDOFTEXT: i64 = 248044;
+pub const IM_START: i64 = 248045;
+pub const IM_END: i64 = 248046;
+pub const THINK_START: i64 = 248068;
+pub const THINK_END: i64 = 248069;
+
+fn push_bytes(out: inout Vec<u8>, s: [u8]) {
+    for k in 0..s.len() {
+        out.push(s[k]);
+    }
+}
+
+// The UTF-8 bytes of one code point.
+pub fn push_utf8(cp: i64, out: inout Vec<u8>) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+// The code points of UTF-8 text (invalid bytes are taken as they are).
+fn utf8_cps(s: [u8], out: inout Vec<i64>) {
+    var i: i64 = 0;
+    let n = s.len();
+    while i < n {
+        let b = s[i] as i64;
+        if b < 0x80 {
+            out.push(b);
+            i += 1;
+        } else if b < 0xE0 && i + 1 < n {
+            out.push(((b & 0x1F) << 6) | (s[i + 1] as i64 & 0x3F));
+            i += 2;
+        } else if b < 0xF0 && i + 2 < n {
+            out.push(((b & 0x0F) << 12) | ((s[i + 1] as i64 & 0x3F) << 6) | (s[i + 2] as i64 & 0x3F));
+            i += 3;
+        } else if i + 3 < n {
+            out.push(((b & 0x07) << 18) | ((s[i + 1] as i64 & 0x3F) << 12)
+                | ((s[i + 2] as i64 & 0x3F) << 6) | (s[i + 3] as i64 & 0x3F));
+            i += 4;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+}
+
+fn hash_bytes(s: [u8]) -> i64 {
+    var h: i64 = 1469598103934665603;
+    for i in 0..s.len() {
+        h = (h ^ (s[i] as i64)) * 1099511628211;
+    }
+    (h ^ (h >> 29)) & MASK
+}
+
+fn hash_pair(a: i64, b: i64) -> i64 {
+    let h = (a * 1000003 + b) * 2654435761;
+    (h ^ (h >> 31)) & MASK
+}
+
+// The GPT-2 byte-to-character table: printable bytes map to themselves,
+// the rest to 256 and up. Returns the code point of each byte.
+fn byte_char(b: i64) -> i64 {
+    if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255) {
+        return b;
+    }
+    var n: i64 = 0;
+    for x in 0..b {
+        if !((x >= 33 && x <= 126) || (x >= 161 && x <= 172) || (x >= 174 && x <= 255)) {
+            n += 1;
+        }
+    }
+    256 + n
+}
+
+fn is_space(c: i64) -> bool {
+    c == 32 || (c >= 9 && c <= 13) || c == 0x85 || c == 0xA0 || c == 0x1680
+        || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029
+        || c == 0x202F || c == 0x205F || c == 0x3000
+}
+
+fn is_digit(c: i64) -> bool {
+    c >= 48 && c <= 57
+}
+
+// \p{L} or \p{M}, by ranges.
+fn is_letter(c: i64) -> bool {
+    if c < 0x80 {
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    }
+    if is_space(c) || c == 0xD7 || c == 0xF7 {
+        return false;
+    }
+    if c < 0x100 {
+        return c == 0xAA || c == 0xB5 || c == 0xBA || c >= 0xC0;
+    }
+    if (c >= 0x2000 && c <= 0x2BFF) || (c >= 0x3000 && c <= 0x303F)
+        || (c >= 0xFF00 && c <= 0xFF0F) || (c >= 0x1F000 && c <= 0x1FAFF) {
+        return false;
+    }
+    true
+}
+
+// [^\s\p{L}\p{M}\p{N}]
+fn is_other(c: i64) -> bool {
+    !is_space(c) && !is_letter(c) && !is_digit(c)
+}
+
+fn lower(c: i64) -> i64 {
+    if c >= 65 && c <= 90 { c + 32 } else { c }
+}
+
+// The pre-tokenizer's alternatives, tried in order at i; each gives the end
+// (exclusive, at most n) of the match, or -1.
+fn alt_contraction(c: [i64], n: i64, i: i64) -> i64 {
+    if c[i] != 39 {
+        return -1;
+    }
+    if i + 1 < n {
+        let x = lower(c[i + 1]);
+        if x == 115 || x == 116 || x == 109 || x == 100 {
+            return i + 2;
+        }
+    }
+    if i + 2 < n {
+        let x = lower(c[i + 1]);
+        let y = lower(c[i + 2]);
+        if (x == 114 && y == 101) || (x == 118 && y == 101) || (x == 108 && y == 108) {
+            return i + 3;
+        }
+    }
+    -1
+}
+
+// [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+fn alt_word(c: [i64], n: i64, i: i64) -> i64 {
+    var j = i;
+    if !is_letter(c[i]) {
+        if c[i] == 10 || c[i] == 13 || is_digit(c[i]) {
+            return -1;
+        }
+        if i + 1 >= n || !is_letter(c[i + 1]) {
+            return -1;
+        }
+        j = i + 1;
+    }
+    while j < n && is_letter(c[j]) {
+        j += 1;
+    }
+    j
+}
+
+// ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`
+fn alt_other(c: [i64], n: i64, i: i64) -> i64 {
+    var j = i;
+    if c[i] == 32 {
+        if i + 1 >= n || !is_other(c[i + 1]) {
+            return -1;
+        }
+        j = i + 1;
+    } else if !is_other(c[i]) {
+        return -1;
+    }
+    while j < n && is_other(c[j]) {
+        j += 1;
+    }
+    while j < n && (c[j] == 10 || c[j] == 13) {
+        j += 1;
+    }
+    j
+}
+
+// \s*[\r\n]+ : the whitespace run, up to its last newline.
+fn alt_newlines(c: [i64], n: i64, i: i64) -> i64 {
+    if !is_space(c[i]) {
+        return -1;
+    }
+    var e = i;
+    while e < n && is_space(c[e]) {
+        e += 1;
+    }
+    var k = e - 1;
+    while k >= i && c[k] != 10 && c[k] != 13 {
+        k -= 1;
+    }
+    if k < i { -1 } else { k + 1 }
+}
+
+// \s+(?!\S): a run that does not end before a non-space (it leaves one space).
+fn alt_space_run(c: [i64], n: i64, i: i64) -> i64 {
+    if !is_space(c[i]) {
+        return -1;
+    }
+    var e = i;
+    while e < n && is_space(c[e]) {
+        e += 1;
+    }
+    if e == n {
+        return e;
+    }
+    if e - i >= 2 { e - 1 } else { -1 }
+}
+
+// The end of the pre-token starting at i (never -1: the last alternative is \s+).
+fn next_end(c: [i64], n: i64, i: i64) -> i64 {
+    var e = alt_contraction(c, n, i);
+    if e >= 0 { return e; }
+    e = alt_word(c, n, i);
+    if e >= 0 { return e; }
+    if is_digit(c[i]) { return i + 1; }
+    e = alt_other(c, n, i);
+    if e >= 0 { return e; }
+    e = alt_newlines(c, n, i);
+    if e >= 0 { return e; }
+    e = alt_space_run(c, n, i);
+    if e >= 0 { return e; }
+    var j = i;
+    while j < n && is_space(c[j]) {
+        j += 1;
+    }
+    if j == i { i + 1 } else { j }
+}
+
+pub struct Tokenizer {
+    arena: Vec<u8>,      // the token strings, back to back
+    start: Vec<i64>,     // per id: where its string starts in arena
+    len: Vec<i64>,       // per id: its length
+    vslots: Vec<i64>,    // hash of a token string -> id, -1 empty
+    mslots: Vec<i64>,    // hash of a merge (a, b) -> its rank, -1 empty
+    m_a: Vec<i64>,       // per rank: the left token
+    m_b: Vec<i64>,       // per rank: the right token
+    m_out: Vec<i64>,     // per rank: the merged token
+    byte_id: Vec<i64>,   // per byte: the id of its byte-level character
+    char_byte: Vec<i64>, // per code point below 512: the byte it stands for, -1
+}
+
+impl Tokenizer {
+    fn token_eq(self, id: i64, s: [u8]) -> bool {
+        let st = self.start[id];
+        let n = self.len[id];
+        if n != s.len() {
+            return false;
+        }
+        for k in 0..n {
+            if self.arena[st + k] != s[k] {
+                return false;
+            }
+        }
+        true
+    }
+
+    // The id of a token string, -1 if the vocabulary has none.
+    fn find(self, s: [u8]) -> i64 {
+        var i = hash_bytes(s);
+        loop {
+            let id = self.vslots[i];
+            if id < 0 {
+                return -1;
+            }
+            if self.token_eq(id, s) {
+                return id;
+            }
+            i = (i + 1) & MASK;
+        }
+    }
+
+    fn insert_token(inout self, s: [u8], id: i64) {
+        var i = hash_bytes(s);
+        while self.vslots[i] >= 0 {
+            i = (i + 1) & MASK;
+        }
+        self.vslots[i] = id;
+    }
+
+    // The rank of the merge (a, b), -1 if there is none.
+    fn rank(self, a: i64, b: i64) -> i64 {
+        var i = hash_pair(a, b);
+        loop {
+            let r = self.mslots[i];
+            if r < 0 {
+                return -1;
+            }
+            if self.m_a[r] == a && self.m_b[r] == b {
+                return r;
+            }
+            i = (i + 1) & MASK;
+        }
+    }
+
+    // Byte-level BPE of one pre-token's bytes, appended to out.
+    fn bpe(self, bytes: [u8], out: inout Vec<i64>, gpa: Gpa) {
+        var sym: Vec<i64> = Vec::new_in(gpa);
+        for k in 0..bytes.len() {
+            sym.push(self.byte_id[bytes[k] as i64]);
+        }
+        loop {
+            var best: i64 = -1;
+            var best_rank: i64 = -1;
+            for k in 0..sym.len() - 1 {
+                let r = self.rank(sym[k], sym[k + 1]);
+                if r >= 0 && (best < 0 || r < best_rank) {
+                    best = k as i64;
+                    best_rank = r;
+                }
+            }
+            if best < 0 {
+                break;
+            }
+            let a = self.m_a[best_rank];
+            let b = self.m_b[best_rank];
+            var merged: Vec<i64> = Vec::new_in(gpa);
+            var k: i64 = 0;
+            let n = sym.len();
+            while k < n {
+                if k + 1 < n && sym[k] == a && sym[k + 1] == b {
+                    merged.push(self.m_out[best_rank]);
+                    k += 2;
+                } else {
+                    merged.push(sym[k]);
+                    k += 1;
+                }
+            }
+            sym = merged;
+        }
+        for k in 0..sym.len() {
+            out.push(sym[k]);
+        }
+    }
+
+    // Pre-tokenize code points [s, e) and BPE each piece into out.
+    fn encode_plain(self, c: [i64], s: i64, e: i64, out: inout Vec<i64>, gpa: Gpa) {
+        var i = s;
+        var bytes: Vec<u8> = Vec::new_in(gpa);
+        while i < e {
+            let j = next_end(c, e, i);
+            bytes.clear();
+            for k in i..j {
+                push_utf8(c[k], &bytes);
+            }
+            self.bpe(bytes.as_slice(), &out, gpa);
+            i = j;
+        }
+    }
+
+    // The ids of text. Added tokens are matched first, as in the tokenizer.
+    pub fn encode(self, text: [u8], gpa: Gpa) -> Vec<i64> {
+        var c: Vec<i64> = Vec::new_in(gpa);
+        utf8_cps(text, &c);
+        var out: Vec<i64> = Vec::new_in(gpa);
+        var seg: i64 = 0;
+        var i: i64 = 0;
+        let n = c.len();
+        while i < n {
+            var hit: i64 = -1;
+            if c[i] == 60 {
+                for sp in 0..SPECIALS {
+                    if hit < 0 && self.is_special_at(c.as_slice(), n, i, sp) {
+                        hit = sp;
+                    }
+                }
+            }
+            if hit >= 0 {
+                self.encode_plain(c.as_slice(), seg, i, &out, gpa);
+                out.push(VOCAB + hit);
+                i += special_text(hit).len() as i64;
+                seg = i;
+            } else {
+                i += 1;
+            }
+        }
+        self.encode_plain(c.as_slice(), seg, n, &out, gpa);
+        out
+    }
+
+    fn is_special_at(self, c: [i64], n: i64, i: i64, sp: i64) -> bool {
+        let s = special_text(sp);
+        if i + s.len() > n {
+            return false;
+        }
+        for k in 0..s.len() {
+            if c[i + k] != s[k] as i64 {
+                return false;
+            }
+        }
+        true
+    }
+
+    // The text of ids (byte-level characters back to bytes).
+    pub fn decode(self, ids: [i64], gpa: Gpa) -> Vec<u8> {
+        var out: Vec<u8> = Vec::new_in(gpa);
+        for k in 0..ids.len() {
+            let id = ids[k];
+            if id >= VOCAB {
+                let s = special_text(id - VOCAB);
+                for x in 0..s.len() {
+                    out.push(s[x]);
+                }
+                continue;
+            }
+            var cps: Vec<i64> = Vec::new_in(gpa);
+            let st = self.start[id];
+            utf8_cps(self.arena.as_slice()[st..st + self.len[id]], &cps);
+            for x in 0..cps.len() {
+                out.push(self.char_byte[cps[x]] as u8);
+            }
+        }
+        out
+    }
+}
+
+// Loads the vocabulary and merges from the model folder.
+pub fn load(dir: [u8], gpa: Gpa) -> Option<Tokenizer> {
+    var vpath: Vec<u8> = Vec::new_in(gpa);
+    push_bytes(&vpath, dir);
+    push_bytes(&vpath, "/vocab.json");
+    let txt = match std::fs::read_in(vpath.as_slice(), gpa) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    var mpath: Vec<u8> = Vec::new_in(gpa);
+    push_bytes(&mpath, dir);
+    push_bytes(&mpath, "/merges.txt");
+    let mtxt = match std::fs::read_in(mpath.as_slice(), gpa) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+
+    var tk = Tokenizer {
+        arena: Vec::new_in(gpa),
+        start: Vec::new_in(gpa),
+        len: Vec::new_in(gpa),
+        vslots: Vec::new_in(gpa),
+        mslots: Vec::new_in(gpa),
+        m_a: Vec::new_in(gpa),
+        m_b: Vec::new_in(gpa),
+        m_out: Vec::new_in(gpa),
+        byte_id: Vec::new_in(gpa),
+        char_byte: Vec::new_in(gpa),
+    };
+    for _ in 0..VOCAB {
+        tk.start.push(0);
+        tk.len.push(0);
+    }
+    for _ in 0..SLOTS {
+        tk.vslots.push(-1);
+        tk.mslots.push(-1);
+    }
+    for _ in 0..512 {
+        tk.char_byte.push(-1);
+    }
+    for b in 0..256 {
+        tk.char_byte[byte_char(b)] = b;
+    }
+    // "key": id pairs of vocab.json, keys with JSON escapes decoded.
+    var key: Vec<u8> = Vec::new_in(gpa);
+    var i: i64 = 0;
+    let n = txt.len();
+    while i < n {
+        if txt[i] != 34 {
+            i += 1;
+            continue;
+        }
+        key.clear();
+        i += 1;
+        while i < n && txt[i] != 34 {
+            if txt[i] == 92 {
+                let e = txt[i + 1];
+                i += 2;
+                if e == 117 {
+                    var cp: i64 = 0;
+                    for k in 0..4 {
+                        cp = cp * 16 + hex_digit(txt[i + k] as i64);
+                    }
+                    i += 4;
+                    push_utf8(cp, &key);
+                } else if e == 110 {
+                    key.push(10);
+                } else if e == 116 {
+                    key.push(9);
+                } else if e == 114 {
+                    key.push(13);
+                } else {
+                    key.push(e);
+                }
+            } else {
+                key.push(txt[i]);
+                i += 1;
+            }
+        }
+        i += 1;
+        while i < n && (txt[i] < 48 || txt[i] > 57) {
+            i += 1;
+        }
+        var id: i64 = 0;
+        while i < n && txt[i] >= 48 && txt[i] <= 57 {
+            id = id * 10 + (txt[i] - 48) as i64;
+            i += 1;
+        }
+        tk.start[id] = tk.arena.len();
+        tk.len[id] = key.len();
+        for k in 0..key.len() {
+            tk.arena.push(key[k]);
+        }
+        tk.insert_token(key.as_slice(), id);
+    }
+    for b in 0..256 {
+        var one: Vec<u8> = Vec::new_in(gpa);
+        push_utf8(byte_char(b), &one);
+        tk.byte_id.push(tk.find(one.as_slice()));
+    }
+    // merges.txt: "a b" per line, in rank order.
+    var rank: i64 = 0;
+    var line: i64 = 0;
+    let m = mtxt.len();
+    while line < m {
+        var e = line;
+        while e < m && mtxt[e] != 10 {
+            e += 1;
+        }
+        var sp = line;
+        while sp < e && mtxt[sp] != 32 {
+            sp += 1;
+        }
+        var stop = e;
+        if stop > line && mtxt[stop - 1] == 13 {
+            stop -= 1;
+        }
+        if sp < stop {
+            var ab: Vec<u8> = Vec::new_in(gpa);
+            let a = mtxt[line..sp];
+            let b = mtxt[sp + 1..stop];
+            let ia = tk.find(a);
+            let ib = tk.find(b);
+            push_bytes(&ab, a);
+            push_bytes(&ab, b);
+            let io = tk.find(ab.as_slice());
+            tk.m_a.push(ia);
+            tk.m_b.push(ib);
+            tk.m_out.push(io);
+            var h = hash_pair(ia, ib);
+            while tk.mslots[h] >= 0 {
+                h = (h + 1) & MASK;
+            }
+            tk.mslots[h] = rank;
+            rank += 1;
+        }
+        line = e + 1;
+    }
+    Some(tk)
+}
+
+fn hex_digit(c: i64) -> i64 {
+    if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 }
+}
+
+#[test]
+fn byte_chars_follow_gpt2() {
+    assert_eq(byte_char(32), 288);      // a space is U+0120, the 'G with dot'
+    assert_eq(byte_char(65), 65);       // 'A' stands for itself
+    assert_eq(byte_char(10), 266);      // a newline is U+010A
+}
+
+#[test]
+fn pretokenizer_splits_like_the_qwen_regex(gpa: Gpa) {
+    var c: Vec<i64> = Vec::new_in(gpa);
+    utf8_cps("Hello, world!\n  x".as_bytes(), &c);
+    let n = c.len();
+    var ends: Vec<i64> = Vec::new_in(gpa);
+    var i: i64 = 0;
+    while i < n {
+        let j = next_end(c.as_slice(), n, i);
+        ends.push(j);
+        i = j;
+    }
+    // "Hello" "," " world" "!\n" " " " x"
+    let want: [i64; 6] = [5, 6, 12, 14, 15, 17];
+    assert_eq(ends.len(), 6);
+    for k in 0..6 {
+        assert_eq(ends[k], want[k]);
+    }
+}
+
+#[test]
+fn contractions_and_digits_split_alone(gpa: Gpa) {
+    var c: Vec<i64> = Vec::new_in(gpa);
+    utf8_cps("don't 123".as_bytes(), &c);
+    let n = c.len();
+    assert_eq(next_end(c.as_slice(), n, 3), 5);   // "'t"
+    assert_eq(next_end(c.as_slice(), n, 6), 7);   // "1"
+}

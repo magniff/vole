@@ -1,0 +1,278 @@
+// shaders.vl: the WGSL. Each module has its own bindings, so the
+// structs they share are written out in each.
+//
+// Par (uniform, 96 bytes): g.xyz gravity, g.w substep dt; wind.xyz wind
+// acceleration; sphere.xyz centre, .w radius; grab.xyz the dragged point,
+// .w its particle index (-1: none); dims: n, rest length h, stretch and
+// bend stiffness; misc: floor height, damping per substep, time, wind on.
+//
+// The particle arrays hold vec4s: xyz position and w the inverse mass
+// (0 for a pinned or dragged particle). prev holds the position of the
+// last substep in xyz and the constant inverse mass in w.
+
+// Integration: gravity, wind, damping; the dragged particle follows the
+// mouse; the sphere and floor are applied in the solver's projection.
+pub const INTEGRATE: [u8] = "struct Par {\n\
+    g: vec4<f32>,\n\
+    wind: vec4<f32>,\n\
+    sphere: vec4<f32>,\n\
+    grab: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: Par;\n\
+    @group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> prev: array<vec4<f32>>;\n\
+    fn collide(x: vec3<f32>) -> vec3<f32> {\n\
+    var y = x;\n\
+    let r = u.sphere.w + 0.004;\n\
+    let d = y - u.sphere.xyz;\n\
+    let l = length(d);\n\
+    if (l < r && l > 0.0) {\n\
+    y = u.sphere.xyz + d * (r / l);\n\
+    }\n\
+    y = vec3<f32>(y.x, max(y.y, u.misc.x + 0.004), y.z);\n\
+    return y;\n\
+    }\n\
+    @compute @workgroup_size(64) fn integrate(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let n = u32(u.dims.x);\n\
+    let id = gid.x;\n\
+    if (id >= n * n) { return; }\n\
+    let old = pos[id];\n\
+    let before = prev[id];\n\
+    let base = before.w;\n\
+    if (f32(id) == u.grab.w) {\n\
+    let t = collide(u.grab.xyz);\n\
+    pos[id] = vec4<f32>(t, 0.0);\n\
+    prev[id] = vec4<f32>(t, base);\n\
+    return;\n\
+    }\n\
+    if (base == 0.0) { return; }\n\
+    let dt = u.g.w;\n\
+    let vel = (old.xyz - before.xyz) * u.misc.y;\n\
+    let gust = 0.6 + 0.4 * sin(u.misc.z * 1.3 + old.x * 4.0 + old.y * 3.0);\n\
+    let acc = u.g.xyz + u.wind.xyz * (u.misc.w * gust);\n\
+    let nx = old.xyz + vel + acc * (dt * dt);\n\
+    prev[id] = vec4<f32>(old.xyz, base);\n\
+    pos[id] = vec4<f32>(nx, base);\n\
+    }\n";
+
+// One Jacobi iteration of the distance constraints. Each particle reads
+// its 8 neighbours (4 stretch at rest length h, 4 bend at 2h) from src,
+// sums its share of each constraint's correction (weighted by inverse
+// mass), averages over the constraints it has, projects the sphere and
+// the floor, and writes dst. Gather only, so no two threads write the
+// same particle and the order does not matter.
+pub const JACOBI: [u8] = "struct Par {\n\
+    g: vec4<f32>,\n\
+    wind: vec4<f32>,\n\
+    sphere: vec4<f32>,\n\
+    grab: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: Par;\n\
+    @group(0) @binding(1) var<storage, read> src: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> dst: array<vec4<f32>>;\n\
+    fn collide(x: vec3<f32>) -> vec3<f32> {\n\
+    var y = x;\n\
+    let r = u.sphere.w + 0.004;\n\
+    let d = y - u.sphere.xyz;\n\
+    let l = length(d);\n\
+    if (l < r && l > 0.0) {\n\
+    y = u.sphere.xyz + d * (r / l);\n\
+    }\n\
+    y = vec3<f32>(y.x, max(y.y, u.misc.x + 0.004), y.z);\n\
+    return y;\n\
+    }\n\
+    fn offset(k: i32) -> vec2<i32> {\n\
+    var d = vec2<i32>(1, 0);\n\
+    if (k == 1) { d = vec2<i32>(-1, 0); }\n\
+    if (k == 2) { d = vec2<i32>(0, 1); }\n\
+    if (k == 3) { d = vec2<i32>(0, -1); }\n\
+    if (k == 4) { d = vec2<i32>(2, 0); }\n\
+    if (k == 5) { d = vec2<i32>(-2, 0); }\n\
+    if (k == 6) { d = vec2<i32>(0, 2); }\n\
+    if (k == 7) { d = vec2<i32>(0, -2); }\n\
+    return d;\n\
+    }\n\
+    @compute @workgroup_size(64) fn jacobi(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let n = i32(u.dims.x);\n\
+    let id = i32(gid.x);\n\
+    if (id >= n * n) { return; }\n\
+    let p = src[id];\n\
+    if (p.w == 0.0) {\n\
+    dst[id] = p;\n\
+    return;\n\
+    }\n\
+    let i = id % n;\n\
+    let j = id / n;\n\
+    var delta = vec3<f32>(0.0, 0.0, 0.0);\n\
+    var count = 0.0;\n\
+    for (var k: i32 = 0; k < 8; k = k + 1) {\n\
+    let o = offset(k);\n\
+    let a = i + o.x;\n\
+    let b = j + o.y;\n\
+    let valid = a >= 0 && a < n && b >= 0 && b < n;\n\
+    let qi = clamp(b, 0, n - 1) * n + clamp(a, 0, n - 1);\n\
+    let q = src[qi];\n\
+    let d = p.xyz - q.xyz;\n\
+    let l = length(d);\n\
+    let ws = p.w + q.w;\n\
+    let rest = select(u.dims.y, 2.0 * u.dims.y, k >= 4);\n\
+    let stiff = select(u.dims.z, u.dims.w, k >= 4);\n\
+    let ok = valid && l > 0.000001 && ws > 0.0;\n\
+    if (ok) {\n\
+    delta = delta - (p.w / ws) * (l - rest) * (d / l) * stiff;\n\
+    count = count + 1.0;\n\
+    }\n\
+    }\n\
+    var x = p.xyz;\n\
+    if (count > 0.0) { x = x + delta / count; }\n\
+    dst[id] = vec4<f32>(collide(x), p.w);\n\
+    }\n";
+
+// Vertex normals from the particles' neighbours (central differences,
+// one-sided at the edges); up for a flat sheet.
+pub const NORMALS: [u8] = "struct Par {\n\
+    g: vec4<f32>,\n\
+    wind: vec4<f32>,\n\
+    sphere: vec4<f32>,\n\
+    grab: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: Par;\n\
+    @group(0) @binding(1) var<storage, read> pos: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> nrm: array<vec4<f32>>;\n\
+    @compute @workgroup_size(64) fn normals(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let n = i32(u.dims.x);\n\
+    let id = i32(gid.x);\n\
+    if (id >= n * n) { return; }\n\
+    let i = id % n;\n\
+    let j = id / n;\n\
+    let il = max(i - 1, 0);\n\
+    let ir = min(i + 1, n - 1);\n\
+    let jd = max(j - 1, 0);\n\
+    let ju = min(j + 1, n - 1);\n\
+    let dx = pos[j * n + ir].xyz - pos[j * n + il].xyz;\n\
+    let dz = pos[ju * n + i].xyz - pos[jd * n + i].xyz;\n\
+    let c = cross(dz, dx);\n\
+    let l = length(c);\n\
+    var nn = vec3<f32>(0.0, 1.0, 0.0);\n\
+    if (l > 0.000001) { nn = c / l; }\n\
+    nrm[id] = vec4<f32>(nn, 0.0);\n\
+    }\n";
+
+// The cloth: each grid cell is two triangles drawn from vertex_index
+// (six vertices a cell), positions and normals read from the buffers.
+// Lit from one light, two-sided: a back face is flipped and darkened.
+pub const CLOTH: [u8] = "struct Cam {\n\
+    vp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    light: vec4<f32>,\n\
+    sph: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> cam: Cam;\n\
+    @group(0) @binding(1) var<storage, read> pos: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> nrm: array<vec4<f32>>;\n\
+    struct VOut {\n\
+    @builtin(position) clip: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) nor: vec3<f32>,\n\
+    }\n\
+    @vertex fn cloth_vs(@builtin(vertex_index) vid: u32) -> VOut {\n\
+    let n = u32(cam.eye.w);\n\
+    let cell = vid / 6u;\n\
+    let k = vid % 6u;\n\
+    let cx = cell % (n - 1u);\n\
+    let cy = cell / (n - 1u);\n\
+    var dx = 0u;\n\
+    var dy = 0u;\n\
+    if (k == 1u || k == 3u || k == 4u) { dx = 1u; }\n\
+    if (k == 2u || k == 4u || k == 5u) { dy = 1u; }\n\
+    let idx = (cy + dy) * n + cx + dx;\n\
+    let p = pos[idx].xyz;\n\
+    return VOut(cam.vp * vec4<f32>(p, 1.0), p, nrm[idx].xyz);\n\
+    }\n\
+    fn shade(world: vec3<f32>, nor: vec3<f32>, base: vec3<f32>) -> vec4<f32> {\n\
+    let v = normalize(cam.eye.xyz - world);\n\
+    var nn = normalize(nor);\n\
+    var back = false;\n\
+    if (dot(nn, v) < 0.0) {\n\
+    nn = -nn;\n\
+    back = true;\n\
+    }\n\
+    let l = normalize(cam.light.xyz);\n\
+    let h = normalize(l + v);\n\
+    let diff = max(dot(nn, l), 0.0);\n\
+    let spec = pow(max(dot(nn, h), 0.0), 48.0) * 0.35;\n\
+    var col = base * (0.22 + 0.78 * diff) + vec3<f32>(spec, spec, spec);\n\
+    if (back) { col = col * vec3<f32>(0.55, 0.5, 0.45); }\n\
+    col = pow(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.4545, 0.4545, 0.4545));\n\
+    return vec4<f32>(col, 1.0);\n\
+    }\n\
+    @fragment fn cloth_fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    return shade(v.world, v.nor, vec3<f32>(0.80, 0.30, 0.22));\n\
+    }\n";
+
+// The sphere (a 32 x 48 latitude-longitude mesh, 9216 vertices) and the
+// floor (a quad, 6 vertices, checkered in the fragment shader), from
+// vertex_index alone.
+pub const SOLID: [u8] = "struct Cam {\n\
+    vp: mat4x4<f32>,\n\
+    eye: vec4<f32>,\n\
+    light: vec4<f32>,\n\
+    sph: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> cam: Cam;\n\
+    struct VOut {\n\
+    @builtin(position) clip: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) nor: vec3<f32>,\n\
+    @location(2) kind: f32,\n\
+    }\n\
+    @vertex fn solid_vs(@builtin(vertex_index) vid: u32) -> VOut {\n\
+    if (vid < 9216u) {\n\
+    let quad = vid / 6u;\n\
+    let k = vid % 6u;\n\
+    var da = 0u;\n\
+    var db = 0u;\n\
+    if (k == 1u || k == 3u || k == 4u) { da = 1u; }\n\
+    if (k == 2u || k == 4u || k == 5u) { db = 1u; }\n\
+    let s = quad / 48u + da;\n\
+    let t = quad % 48u + db;\n\
+    let th = 3.14159265 * f32(s) / 32.0;\n\
+    let ph = 6.2831853 * f32(t) / 48.0;\n\
+    let d = vec3<f32>(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));\n\
+    let p = cam.sph.xyz + d * cam.sph.w;\n\
+    return VOut(cam.vp * vec4<f32>(p, 1.0), p, d, 0.0);\n\
+    }\n\
+    let k = vid - 9216u;\n\
+    var dx = 0u;\n\
+    var dy = 0u;\n\
+    if (k == 1u || k == 3u || k == 4u) { dx = 1u; }\n\
+    if (k == 2u || k == 4u || k == 5u) { dy = 1u; }\n\
+    let p = vec3<f32>(-4.0 + 8.0 * f32(dx), 0.0, -4.0 + 8.0 * f32(dy));\n\
+    return VOut(cam.vp * vec4<f32>(p, 1.0), p, vec3<f32>(0.0, 1.0, 0.0), 1.0);\n\
+    }\n\
+    fn shade(world: vec3<f32>, nor: vec3<f32>, base: vec3<f32>) -> vec4<f32> {\n\
+    let v = normalize(cam.eye.xyz - world);\n\
+    let nn = normalize(nor);\n\
+    let l = normalize(cam.light.xyz);\n\
+    let h = normalize(l + v);\n\
+    let diff = max(dot(nn, l), 0.0);\n\
+    let spec = pow(max(dot(nn, h), 0.0), 48.0) * 0.35;\n\
+    var col = base * (0.22 + 0.78 * diff) + vec3<f32>(spec, spec, spec);\n\
+    col = pow(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.4545, 0.4545, 0.4545));\n\
+    return vec4<f32>(col, 1.0);\n\
+    }\n\
+    @fragment fn solid_fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    var base = vec3<f32>(0.78, 0.80, 0.86);\n\
+    if (v.kind > 0.5) {\n\
+    let c = (i32(floor(v.world.x)) + i32(floor(v.world.z))) & 1;\n\
+    base = vec3<f32>(0.22, 0.26, 0.34);\n\
+    if (c == 1) { base = vec3<f32>(0.80, 0.80, 0.74); }\n\
+    }\n\
+    return shade(v.world, v.nor, base);\n\
+    }\n";

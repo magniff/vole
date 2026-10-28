@@ -1,0 +1,454 @@
+// The chat window: std::window for the keys and the frames, std::gpu for the
+// picture. The text is a grid of character codes that a full-screen shader
+// draws from the font (font.vl). Type, Return sends; the reply streams in one
+// token per frame, with the speeds of the prefill and of the decode shown.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use crate::sample::next_token;
+
+use font::GLYPHS;
+use model::{MAXCTX, Model};
+use template::{push_bytes, user_turn};
+use tokenizer::Tokenizer;
+
+const MAXCELLS: i64 = 65536;   // the grid's cells (a window of 300 x 200 characters)
+const RESERVE: i64 = 1024;     // room left in the context for a reply
+
+const SHADER: [u8] = "struct U { cols: f32, rows: f32, cw: f32, ch: f32, k: f32, w: f32, h: f32, pad: f32 }\n\
+@group(0) @binding(0) var<uniform> u: U;\n\
+@group(0) @binding(1) var<storage, read> grid: array<u32>;\n\
+@group(0) @binding(2) var<storage, read> glyphs: array<u32>;\n\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return vec4<f32>(p, 0.0, 1.0);\n\
+}\n\
+@fragment fn fs(@builtin(position) fp: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let bg = vec4<f32>(0.07, 0.08, 0.10, 1.0);\n\
+    let fg = vec4<f32>(0.86, 0.90, 0.95, 1.0);\n\
+    let col = u32(fp.x / u.cw);\n\
+    let row = u32(fp.y / u.ch);\n\
+    if (f32(col) >= u.cols || f32(row) >= u.rows) { return bg; }\n\
+    let c = grid[row * u32(u.cols) + col];\n\
+    let gx = u32((fp.x - f32(col) * u.cw) / u.k);\n\
+    let gy = u32((fp.y - f32(row) * u.ch) / u.k);\n\
+    if (c < 32u || c > 126u || gx >= 5u || gy >= 7u) { return bg; }\n\
+    let g = (c - 32u) * 2u;\n\
+    var bits: u32 = glyphs[g + 1u] & 0x7fu;\n\
+    if (gx < 4u) { bits = (glyphs[g] >> (gx * 8u)) & 0x7fu; }\n\
+    if (((bits >> gy) & 1u) == 1u) { return fg; }\n\
+    return bg;\n\
+}\n";
+
+pub struct Chat {
+    model: Model,
+    tk: Tokenizer,
+    gpa: Gpa,
+    transcript: Vec<u8>,
+    input: Vec<u8>,
+    pos: i64,        // the next position of the model
+    pending: i64,    // the next token of the reply, once the prompt is in
+    active: bool,    // a reply is streaming
+    started: f64,    // when the reply began, seconds
+    count: i64,      // the reply's tokens so far
+    prefill_tps: f64,
+    decode_tps: f64, // of the last reply, then of the current one
+    temp: f64,       // 0 is greedy
+    top_p: f64,
+    rng: u64,
+}
+
+fn now_secs() -> f64 {
+    monotonic_now().as_secs_f64()
+}
+
+// A byte of text as a character of the grid (ASCII; anything else is '?').
+fn cell_code(b: u8) -> u32 {
+    if b == 9 {
+        32
+    } else if b >= 32 && b < 127 {
+        b as u32
+    } else {
+        63
+    }
+}
+
+impl Chat {
+    pub fn new(model: sink Model, tk: sink Tokenizer, temp: f64, top_p: f64, seed: u64, gpa: Gpa) -> Chat {
+        var transcript: Vec<u8> = Vec::new_in(gpa);
+        push_bytes(&transcript, "Type a message and press Return. The model is Qwen3.5-0.8B, on the GPU.\n\n");
+        Chat {
+            model: model,
+            tk: tk,
+            gpa: gpa,
+            transcript: transcript,
+            input: Vec::new_in(gpa),
+            pos: 0,
+            pending: 0,
+            active: false,
+            started: 0.0,
+            count: 0,
+            prefill_tps: 0.0,
+            decode_tps: 0.0,
+            temp: temp,
+            top_p: top_p,
+            rng: seed,
+        }
+    }
+
+    pub fn type_bytes(inout self, s: [u8]) {
+        if self.active {
+            return;
+        }
+        for k in 0..s.len() {
+            if s[k] >= 32 && s[k] != 127 {
+                self.input.push(s[k]);
+            }
+        }
+    }
+
+    // Removes the last character (a whole UTF-8 sequence).
+    pub fn backspace(inout self) {
+        if self.input.len() == 0 {
+            return;
+        }
+        self.input.pop();
+        while self.input.len() > 0 && (self.input[self.input.len() - 1] & 0xC0) == 0x80 {
+            self.input.pop();
+        }
+    }
+
+    // The next token of the reply, from the logits of the last step.
+    fn sample(inout self) -> i64 {
+        let logits = self.model.read_logits();
+        next_token(logits, self.temp, self.top_p, &self.rng, self.gpa)
+    }
+
+    // Sends the typed line: its turn is prefilled, then the reply streams.
+    pub fn send(inout self) {
+        if self.active || self.input.len() == 0 {
+            return;
+        }
+        let text = user_turn(self.input.as_slice(), self.gpa);
+        let ids = self.tk.encode(text.as_slice(), self.gpa);
+        if self.pos + ids.len() + RESERVE > MAXCTX {
+            self.model.reset();
+            self.pos = 0;
+            push_bytes(&self.transcript, "[the context is full: starting again]\n");
+        }
+        if ids.len() + RESERVE > MAXCTX {
+            push_bytes(&self.transcript, "[that message is too long]\n\n");
+            self.input.clear();
+            return;
+        }
+        push_bytes(&self.transcript, "you: ");
+        push_bytes(&self.transcript, self.input.as_slice());
+        push_bytes(&self.transcript, "\nqwen: ");
+        self.input.clear();
+        let t0 = now_secs();
+        for k in 0..ids.len() {
+            self.model.step(ids[k], self.pos, k == ids.len() - 1);
+            self.pos += 1;
+        }
+        self.pending = self.sample();
+        let t1 = now_secs();
+        self.prefill_tps = ids.len() as f64 / (t1 - t0);
+        self.active = true;
+        self.count = 0;
+        self.started = t1;
+    }
+
+    // One token of the reply, if one is streaming (one per frame).
+    pub fn tick(inout self) {
+        if !self.active {
+            return;
+        }
+        let id = self.pending;
+        if id == tokenizer::IM_END || id == tokenizer::ENDOFTEXT || self.pos >= MAXCTX - 1 {
+            self.active = false;
+            let secs = now_secs() - self.started;
+            if secs > 0.0 {
+                self.decode_tps = self.count as f64 / secs;
+            }
+            push_bytes(&self.transcript, "\n\n");
+            return;
+        }
+        let piece = self.tk.decode([id], self.gpa);
+        push_bytes(&self.transcript, piece.as_slice());
+        self.count += 1;
+        self.model.step(id, self.pos, true);
+        self.pos += 1;
+        self.pending = self.sample();
+        let secs = now_secs() - self.started;
+        if secs > 0.0 {
+            self.decode_tps = self.count as f64 / secs;
+        }
+    }
+
+    // The grid of cols x rows cells: the transcript's last lines, the input
+    // line, the status line.
+    pub fn grid(self, cols: i64, rows: i64) -> Vec<u32> {
+        var g: Vec<u32> = Vec::new_in(self.gpa);
+        for _ in 0..MAXCELLS {
+            g.push(0);
+        }
+        var lines: Vec<Vec<u32>> = Vec::new_in(self.gpa);
+        var cur: Vec<u32> = Vec::new_in(self.gpa);
+        for k in 0..self.transcript.len() {
+            let b = self.transcript[k];
+            if b == 10 {
+                lines.push(cur);
+                cur = Vec::new_in(self.gpa);
+            } else {
+                if cur.len() >= cols {
+                    lines.push(cur);
+                    cur = Vec::new_in(self.gpa);
+                }
+                cur.push(cell_code(b));
+            }
+        }
+        lines.push(cur);
+        let visible = rows - 2;
+        var first = lines.len() - visible;
+        if first < 0 {
+            first = 0;
+        }
+        var r: i64 = 0;
+        var li = first;
+        while li < lines.len() && r < visible {
+            let line = lines[li].as_slice();
+            for c in 0..line.len() {
+                g[r * cols + c] = line[c];
+            }
+            li += 1;
+            r += 1;
+        }
+        // The input line, with a cursor.
+        var inl: Vec<u8> = Vec::new_in(self.gpa);
+        push_bytes(&inl, "> ");
+        push_bytes(&inl, self.input.as_slice());
+        if !self.active {
+            push_bytes(&inl, "_");
+        }
+        let irow = rows - 2;
+        for c in 0..inl.len() {
+            if c < cols {
+                g[irow * cols + c] = cell_code(inl[c]);
+            }
+        }
+        // The status line.
+        let status = format_in(f"prefill {self.prefill_tps:.1} tok/s, decode {self.decode_tps:.1} tok/s, context {self.pos}/{MAXCTX}  Esc quits", self.gpa);
+        let st = status.as_slice();
+        for c in 0..st.len() {
+            if c < cols {
+                g[(rows - 1) * cols + c] = cell_code(st[c]);
+            }
+        }
+        g
+    }
+}
+
+// The chat window until it is closed. frames > 0 quits after that many
+// frames; say is sent as a first message (both for tests).
+pub fn run(model: sink Model, tk: sink Tokenizer, frames: i64, say: [u8], temp: f64, top_p: f64,
+           seed: u64, gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("qwen35: no display: use --headless");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("qwen35 chat", 960, 640)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("qwen35: cannot open a window");
+            return 1;
+        }
+    };
+    var chat = Chat::new(model, tk, temp, top_p, seed, gpa);
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(chat.model.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln("qwen35: no surface");
+            return 1;
+        }
+    };
+    let px0 = win.size();
+    surf.configure(chat.model.dev, px0.w, px0.h);
+    let shader = match chat.model.dev.shader_wgsl(SHADER) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln("qwen35: the window shader does not compile");
+            return 1;
+        }
+    };
+    let draw = chat.model.dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm)).unwrap();
+    let ubuf = chat.model.dev.buffer(32, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let gbuf = chat.model.dev.buffer(MAXCELLS * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+    let fbuf = chat.model.dev.buffer_init(gpu::bytes_of_u32(GLYPHS[..]), BufferUsage::STORAGE);
+    let group = chat.model.dev.bind_group(draw.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, gbuf), gpu::bind(2, fbuf)][..]);
+
+    if say.len() > 0 {
+        chat.type_bytes(say);
+        chat.send();
+    }
+    win.request_frame();
+    var shown: i64 = 0;
+    loop {
+        // A test run (frames > 0) does not block for ever: when no event comes
+        // (a window hidden behind others gets no frames), it asks for one again.
+        let ev = if frames > 0 {
+            match app.wait_timeout(250) {
+                Some(e) => e,
+                None => {
+                    win.request_frame();
+                    continue;
+                }
+            }
+        } else {
+            match app.wait() {
+                Ok(e) => e,
+                Err(_) => break,
+            }
+        };
+        match ev {
+            Event::Frame(_) => {
+                chat.tick();
+                let px = win.size();
+                let k: f32 = if px.scale > 1.5 { 3.0 } else { 2.0 };
+                let cw = 6.0 * k;
+                let ch = 8.0 * k;
+                var cols = (px.w as f32 / cw) as i64;
+                var rows = (px.h as f32 / ch) as i64;
+                if cols * rows > MAXCELLS {
+                    rows = MAXCELLS / cols;
+                }
+                let uni: [f32; 8] = [cols as f32, rows as f32, cw, ch, k, px.w as f32, px.h as f32, 0.0];
+                chat.model.queue.write_buffer(ubuf, 0, gpu::bytes_of_f32(uni[..]));
+                let cells = chat.grid(cols, rows);
+                chat.model.queue.write_buffer(gbuf, 0, gpu::bytes_of_u32(cells.as_slice()));
+                match surf.frame() {
+                    Ok(frame) => {
+                        let target = frame.texture.view();
+                        var enc = chat.model.dev.encoder();
+                        enc.render_pass(PassDesc::color(target), |pass| {
+                            pass.set_pipeline(draw);
+                            pass.set_bind_group(0, group);
+                            pass.draw(0..3, 0..1);
+                        });
+                        chat.model.queue.submit(enc.finish());
+                        frame.present(&chat.model.queue);
+                    }
+                    Err(_) => {}
+                }
+                shown += 1;
+                if frames > 0 {
+                    eprintln(f"frame {shown}: {chat.count} tokens, pos {chat.pos}");
+                }
+                if frames > 0 && shown >= frames {
+                    break;
+                }
+                if chat.active || frames > 0 {
+                    win.request_frame();
+                }
+            }
+            Event::Text(t) => {
+                chat.type_bytes(t.bytes[0..t.len as i64]);
+                win.request_frame();
+            }
+            Event::Key(k) => {
+                if k.pressed {
+                    match k.key {
+                        Logical::Named(Named::Enter) => {
+                            chat.send();
+                            win.request_frame();
+                        }
+                        Logical::Named(Named::Backspace) => {
+                            chat.backspace();
+                            win.request_frame();
+                        }
+                        Logical::Named(Named::Escape) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Event::Resize(_, s) => {
+                surf.configure(chat.model.dev,s.w, s.h);
+                win.request_frame();
+            }
+            Event::Close(_) | Event::Quit => break,
+            _ => {}
+        }
+    }
+    0
+}
+
+// The chat's picture as a PPM file (headless: the same shader, rendered into
+// a texture and read back): the message is sent, its reply run to the end.
+pub fn shot(model: sink Model, tk: sink Tokenizer, say: [u8], path: [u8], temp: f64, top_p: f64,
+            seed: u64, gpa: Gpa) -> i32 {
+    var chat = Chat::new(model, tk, temp, top_p, seed, gpa);
+    if say.len() > 0 {
+        chat.type_bytes(say);
+        chat.send();
+    }
+    while chat.active {
+        chat.tick();
+    }
+    let w: i64 = 960;
+    let h: i64 = 640;
+    let cols: i64 = 80;
+    let rows: i64 = 40;
+    let shader = match chat.model.dev.shader_wgsl(SHADER) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let draw = chat.model.dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm)).unwrap();
+    let ubuf = chat.model.dev.buffer(32, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+    let gbuf = chat.model.dev.buffer(MAXCELLS * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+    let fbuf = chat.model.dev.buffer_init(gpu::bytes_of_u32(GLYPHS[..]), BufferUsage::STORAGE);
+    let group = chat.model.dev.bind_group(draw.bind_layout(0),
+        [gpu::bind(0, ubuf), gpu::bind(1, gbuf), gpu::bind(2, fbuf)][..]);
+    let uni: [f32; 8] = [cols as f32, rows as f32, 12.0, 16.0, 2.0, w as f32, h as f32, 0.0];
+    chat.model.queue.write_buffer(ubuf, 0, gpu::bytes_of_f32(uni[..]));
+    let cells = chat.grid(cols, rows);
+    chat.model.queue.write_buffer(gbuf, 0, gpu::bytes_of_u32(cells.as_slice()));
+    let tex = chat.model.dev.texture(w, h, Format::Bgra8Unorm, usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    var out = chat.model.dev.buffer(w * 4 * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = chat.model.dev.encoder();
+    enc.render_pass(PassDesc::color(tex.view()), |pass| {
+        pass.set_pipeline(draw);
+        pass.set_bind_group(0, group);
+        pass.draw(0..3, 0..1);
+    });
+    enc.copy_texture_to_buffer(tex, out, w * 4);
+    chat.model.queue.submit(enc.finish());
+    let px = out.map_read(chat.model.dev);
+    var ppm: Vec<u8> = Vec::new_in(gpa);
+    let hdr = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    push_bytes(&ppm, hdr.as_slice());
+    for i in 0..w * h {
+        ppm.push(px[i * 4 + 2]);
+        ppm.push(px[i * 4 + 1]);
+        ppm.push(px[i * 4]);
+    }
+    match std::fs::write(path, ppm.as_slice()) {
+        Ok(_) => {
+            println(f"wrote the picture ({w} x {h}) of {chat.count} reply tokens");
+            0
+        }
+        Err(_) => {
+            eprintln("qwen35: cannot write the picture");
+            1
+        }
+    }
+}
