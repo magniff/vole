@@ -750,7 +750,9 @@ proc_table() {
 # The free slots of the pool (the bytes in its FIFO), or "?".
 free_slots() {
     case "$(uname -s)" in Darwin) fionread=1074030207 ;; Linux) fionread=21531 ;; *) echo "?"; return ;; esac
-    perl -e 'open(my $f, "+<", $ARGV[0]) or exit 1; my $n = pack("L", 0);
+    # (opened for reading only, without waiting: on macOS a FIFO opened
+    # for reading and writing says 0)
+    perl -e 'use Fcntl; sysopen(my $f, $ARGV[0], O_RDONLY | O_NONBLOCK) or exit 1; my $n = pack("L", 0);
         ioctl($f, $ARGV[1], $n) or exit 1; print unpack("L", $n), "\n"' "$RUN/jobs" "$fionread" 2>/dev/null || echo "?"
 }
 

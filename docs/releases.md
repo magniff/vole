@@ -2046,7 +2046,9 @@ inner loop); nor does the gate inside a container.
 (0.25.2) No silent hang: a release gate waited 2.5 hours on two runners
 blocked reading the slot FIFO, every slot lost with jobs killed before
 they gave theirs back. Every runner's job now gives its slot back
-however it ends (a trap on EXIT, and on HUP, INT and TERM), and the gate
+however it ends (a trap on EXIT, and on HUP, INT and TERM; semfuzz
+counts the slots it holds and writes them back when killed or at exit),
+and the gate
 checks its steps (every 15 s; not the containers' rows, whose work is in
 the VM — the gate inside a container checks its own): a step none of
 whose processes used the CPU, started or ended for `$VOLE_GATE_STALL`
