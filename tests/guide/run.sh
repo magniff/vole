@@ -229,7 +229,8 @@ check_block() {
     [ -f "$d/stdin" ] || : >"$d/stdin"
     ( cd "$d" && exec ./prog <stdin >run.out 2>&1 ) &
     pid=$!
-    (sleep 20 && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    # (0.25.2: extended while the machine is loaded)
+    sh "$ROOT/tests/watchdog.sh" 20 "$pid" >/dev/null 2>&1 &
     watchdog=$!
     wait "$pid"
     rc=$?

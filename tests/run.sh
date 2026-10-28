@@ -133,8 +133,10 @@
 # directives (0.9's unsafe warnings are errors from 0.10; there are no
 # warnings at the moment).
 # Stdout is compared after removing trailing whitespace. Each program may
-# run for 20 seconds ($VOLE_TEST_TIMEOUT: another limit, for a loaded
-# machine). $VOLE_TEST_FLAGS (0.16): more compiler options for every
+# run for 20 seconds ($VOLE_TEST_TIMEOUT: another limit), extended while
+# the machine is loaded (0.25.2, tests/watchdog.sh: by the limit again, up
+# to 8 times, while the load average is above the CPUs); a program killed
+# at its limit fails with "timed out: killed after N s ...". $VOLE_TEST_FLAGS (0.16): more compiler options for every
 # case but those with NO-EXTRA-FLAGS (the gate's examples-checkalloc
 # step: --check-alloc).
 
@@ -386,14 +388,29 @@ run_program() {
         exec ./prog $(sed "s|@ROOT@|$ROOT|g" args) <stdin >stdout 2>stderr
     ) &
     pid=$!
-    # (0.22: a case's TIMEOUT directive multiplies the limit)
+    # (0.22: a case's TIMEOUT directive multiplies the limit; 0.25.2: the
+    # limit is extended while the machine is loaded, tests/watchdog.sh,
+    # and a program killed by it is a failure that says so: $dir/timedout)
     limit=$((TIMEOUT * $(cat "$dir/timeout" 2>/dev/null || echo 1)))
-    (sleep "$limit" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    rm -f "$dir/timedout"
+    sh "$ROOT/tests/watchdog.sh" "$limit" "$pid" "$dir/timedout" >/dev/null 2>&1 &
     watchdog=$!
-    wait "$pid"
+    wait "$pid" 2>/dev/null
     RC=$?
     kill "$watchdog" 2>/dev/null
     wait "$watchdog" 2>/dev/null
+}
+
+# After run_program: when the watchdog killed the program, the reason
+# (and what it printed) in $1/why; returns 1 then.
+timed_out() {
+    [ -s "$1/timedout" ] || return 1
+    {
+        echo "timed out: $(cat "$1/timedout")"
+        echo "--- stdout so far"; cat "$1/stdout" 2>/dev/null; echo
+        echo "--- stderr so far"; cat "$1/stderr" 2>/dev/null
+    } >"$1/why"
+    return 0
 }
 
 # Runs one case; prints nothing, returns 0 on success, and leaves the
@@ -513,6 +530,7 @@ check_case() {
     fi
     [ "$(cat "$dir/build")" = 1 ] && return 0
     run_program "$dir"
+    timed_out "$dir" && return 1
     expected_exit=$(cat "$dir/exit")
     trimmed "$dir/stdout" >"$dir/actual"
     trimmed "$dir/expect" >"$dir/wanted"
@@ -544,6 +562,7 @@ check_case() {
         RUN_ENV=VOLE_ARCH_DISABLE=all
         run_program "$dir"
         RUN_ENV=
+        timed_out "$dir" && return 1
         trimmed "$dir/stdout" >"$dir/actual"
         if ! stdout_matches "$dir" || [ "$RC" -ne "$expected_exit" ]; then
             {
@@ -605,6 +624,7 @@ profile_case() {
         return 1
     fi
     run_program "$2"
+    timed_out "$2" && return 1
     trimmed "$2/stdout" >"$2/actual"
     trimmed "$2/expect" >"$2/wanted"
     if [ "$RC" -ne "$(cat "$2/exit")" ] || ! stdout_matches "$2"; then
