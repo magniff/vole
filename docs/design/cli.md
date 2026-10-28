@@ -77,7 +77,7 @@ positional's `value_name` is its name in the usage and errors.
 `m.indices_of(name)`, clap's: the index among the arguments (the
 program's name is 0) of each value, or of each time a flag was given; a
 default has none. volec's own command line (compiler/src/cli/, on
-v0.24.0's std::cli) needs the order of different options' values (`-l`,
+0.25.1's std::cli, whose API is 0.24's) needs the order of different options' values (`-l`,
 `-L` and objects are linked in the order given; `edit patch`'s pairs
 after `--in NAME` are NAME's); until 0.26 builds it, it finds a value's
 place by the argv element the value views.
@@ -131,6 +131,20 @@ compiler/src/cli/, can drop them once a release has them):
   (or '-b')`.
 - The commands' table of a help was already one aligned line each, name
   then about; hidden ones are left out.
+
+volec's own command line is on std::cli in 0.25.2, every command: a
+build's options are one Command (compiler/src/cli/build.vl), `query`'s
+another (cli/query.vl), and each other command lists its options in a
+table read as events in argv's order (cli/events.vl: the flags, values,
+words and errors, so that a command keeps its old messages, try: lines
+and exit statuses; tools/cli-compat.py compares two volecs on the
+transcripts, the docs' command lines and some 300 bad inputs). The
+compiler is built by the previous release, so it uses 0.25.1's API;
+the layer's rewrites (`--overlay PATH COPY`, `--stats[=F]`, dash words,
+the words after probe's `--`) become 0.25.2's `num_values`,
+`default_missing`, `allow_hyphen_values` and `last` when 0.26 builds
+it. Two changes for the better: `--name=value` is taken wherever `--name
+value` is, and `--` ends the options of every command.
 
 Matches now keeps one vector of pairs (slot, argument index) while
 parsing and the indices by slot after it, in place of 0.25's three: a
