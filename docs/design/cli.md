@@ -9,6 +9,10 @@ The guide is `volec guide cli`; the code is compiler/std/cli.vl.
 Command::new_in(name, gpa)  .about(s) .version(s) .width(n) .arg(Arg) .subcommand(Command)
 Arg::flag(name) | Arg::option(name) | Arg::positional(name)
     .short('x') .long(s) .help(s) .value_name(s) .default(s) .required() .multiple()
+    .choices(s)                                       (0.25) "fast|slow"
+    .global() .alias(s) .hide() .num_values(n) .default_missing(s)
+    .allow_hyphen_values() .last() .conflicts_with(name)          (0.25.2)
+Command::new_in(..) .alias(s) .hide() .subcommand_required()      (0.25.2)
 cmd.parse(args) -> Result<Matches, CliError>         args: any Iterator<Item = str>, argv[0] first
 cmd.parse_in(args, a) -> Result<Matches<A>, CliError>
 cmd.parse_or_exit(args) -> Matches                    an error: cmd.exit(e)
@@ -79,21 +83,65 @@ after `--in NAME` are NAME's); until 0.26 builds it, it finds a value's
 place by the argv element the value views.
 
 What volec's layer makes up for (compiler/src/cli/mod.vl), candidates
-for later: a single-dash long option (`-framework`), an option whose
-value is optional (`--stats`, `--stats=functions`), an option with two
-values (`--overlay PATH COPY`), values and positionals starting with
-`-` (clap's `allow_hyphen_values`: `query grep '-> bool'`), and parsing
-on after an error (the tools report the NAMEs given with the error).
+for later: a single-dash long option (`-framework`) and parsing on after
+an error (the tools report the NAMEs given with the error); 0.25.2 has
+the rest (an optional value, two values, values starting with `-`).
 
-Still to do (the examples' migration, cli-ex, found these too):
-mutually exclusive arguments (`conflicts_with`; sha256sum's -b and -t,
-the last winning, is `indices_of`), a required subcommand, aliases, env
-defaults, `--no-flag`, the terminal's width.
+Still to do (the examples' migration, cli-ex, found these too): env
+defaults, `--no-flag`, the terminal's width (0.25.2 did the rest).
+
+## 0.25.2
+
+Clap's names for what volec's own command line needed (its layer,
+compiler/src/cli/, can drop them once a release has them):
+
+- `Arg::global()`: a flag or option of a command that its subcommands
+  accept at any depth, before or after their names (`prog --root D sub`,
+  `prog sub --root D`). It has one slot, on its command's level; Matches
+  of every level below find it there (`find_at`: the level's own
+  arguments first, then the global ones above). Its default and its
+  being required are settled at the end of the line, an error about the
+  last command; a subcommand's help lists it.
+- `Arg::alias(s)`, `Command::alias(s)`: other names, any number (each
+  call one, or several as `"a|b"`; up to 4 calls: an Arg stays a plain
+  value with no allocation). The did-you-mean measures them and suggests
+  the own name; `m.subcommand()` gives a command's own name.
+- `Arg::hide()`, `Command::hide()`: accepted, not in the help, the usage
+  or the did-you-mean (deprecated spellings).
+- `Arg::num_values(n)`: `--overlay PATH COPY`, n values each time
+  (`--overlay=PATH COPY` too), `values` in order; fewer at the end is
+  MissingValue. `.value_name("PATH COPY")` names each in the help.
+- `Arg::default_missing(s)`: an optional value, `--stats` gives s and
+  only the `=` form gives one (`--stats=functions`, `-s=x`; `-sq` is
+  `-s` then `-q`). The help writes `--stats[=<STATS>]`.
+- `Arg::allow_hyphen_values()`: a positional so marked takes a word
+  starting with `-` that is no option of the command (its own, the
+  global ones above, `-h`, `--help`): `grep '-> bool'`. An option takes
+  its next word anyway (decision 6).
+- `Arg::last()`: a positional of the words after `--` only: `probe
+  FILE:LINE EXPR... -- ARGS...`. Other positionals skip it; usage `[--
+  args]...`.
+- `Command::subcommand_required()`: no subcommand is MissingSubcommand,
+  exit code 2; `render_in` names the visible subcommands, `try: prog
+  <add|rm>` (one: `prog add`; long lists: `prog --help`), and the usage
+  writes `<command>`.
+- `Arg::conflicts_with(name)` (`"a|b"`: several): both given, either
+  way round, is ArgumentConflict, exit code 2, both as written, the
+  later first: `error: '-t' cannot be used with '-b'`, `try: drop '-t'
+  (or '-b')`.
+- The commands' table of a help was already one aligned line each, name
+  then about; hidden ones are left out.
+
+Matches now keeps one vector of pairs (slot, argument index) while
+parsing and the indices by slot after it, in place of 0.25's three: a
+program under --check-alloc numbers its blocks as with 0.25.1's std::cli
+(examples/allocators/check-alloc).
 
 ## Not in 0.24
 
-Value enums (`possible_values`), `env` defaults, argument groups and
-conflicts, a required subcommand, `--no-flag` negation, aliases, the
+Value enums (`possible_values`; 0.25: `choices`), `env` defaults,
+argument groups and conflicts (0.25.2: `conflicts_with`), a required
+subcommand (0.25.2), `--no-flag` negation, aliases (0.25.2), the
 terminal's width (`.width(n)` sets it), and typed errors from `get_as`
 that say why the value did not parse (the error names the argument and
 the value).
