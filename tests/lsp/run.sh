@@ -279,7 +279,8 @@ fi
 
 # (0.25.2) A system header (stdlib.h, where it is depends on the machine):
 # go to definition on `c::malloc` lands on a line of a header declaring
-# it, and a hover shows that C declaration.
+# it, and a hover shows that C declaration (glibc's is written
+# `malloc (size_t __size)`, macOS's `malloc(size_t __size)`).
 sdir="$WORK/syshdr"
 mkdir -p "$sdir"
 sdir=$(cd "$sdir" && pwd -P)
@@ -305,7 +306,7 @@ if [ "$rc" != 0 ] || [ -z "$loc" ]; then
     why="no definition in a header: $(grep '"id":2' "$WORK/sys.answers" | cut -c1-200)"
 elif ! sed -n "$((line + 1))p" "$hdr" | grep -q malloc; then
     why="$hdr:$((line + 1)) does not declare malloc"
-elif ! grep '"id":3' "$WORK/sys.answers" | grep -q '```c\\n.*malloc(.*declared in `'; then
+elif ! grep '"id":3' "$WORK/sys.answers" | grep -q '```c\\n.*malloc *(.*declared in `'; then
     why="the hover has no C declaration: $(grep '"id":3' "$WORK/sys.answers" | cut -c1-300)"
 elif ! grep -q '"id":4,"result":{"uri":"file://[^"]*/stdlib.h"' "$WORK/sys.answers"; then
     why="the import's string does not open stdlib.h: $(grep '"id":4' "$WORK/sys.answers" | cut -c1-200)"

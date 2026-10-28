@@ -1181,6 +1181,9 @@ case example_build in
             *) eb_host="" ;;
         esac
         if [ "$TARGET" = "$eb_host" ]; then
+            # (0.25.2) Off macOS, the examples on std::gpu, std::window or
+            # std::objc (Metal, Cocoa, libobjc) are skipped, with why: the
+            # ones naming them, or whose case says `// REQUIRES: metal`.
             for m in "$ROOT"/examples/*/main.vl "$ROOT"/examples/*/*/main.vl; do
                 [ -f "$m" ] || continue
                 ex=${m%/main.vl}
@@ -1191,6 +1194,17 @@ case example_build in
                 esac
                 # (a folder of a program's modules, not an example)
                 [ -f "${m%/main.vl}/../main.vl" ] && case "$ex" in */*) continue ;; esac
+                case "$TARGET" in
+                    *-macos) ;;
+                    *)
+                        if grep -rqE --include='*.vl' 'std::(gpu|window|objc)' "${m%/main.vl}" \
+                                || grep -lxF "// SOURCE: examples/$ex/main.vl" "$ROOT"/tests/examples/*.test 2>/dev/null \
+                                    | xargs grep -qx '// REQUIRES: metal' 2>/dev/null; then
+                            skipped example_build "example_build $ex: std::gpu and std::window need macOS (Metal, Cocoa)"
+                            count=$((count + 1))
+                            continue
+                        fi ;;
+                esac
                 if "$COMPILER" "$m" -o "$WORK/example_build.bin" >"$WORK/example_build.out" 2>&1; then
                     echo "example_build pass" >>"$TALLY"
                 else

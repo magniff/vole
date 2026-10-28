@@ -147,7 +147,9 @@ FAIL big: stdout differs at line 3 (10 lines expected, 9 printed)
 
 `volec test big small` runs the cases whose names contain a word;
 `--full` every failure in full; `--input FILE` (`-`: stdin) one run,
-its output and exit status; `--timeout S` per case (10). Output is
+its output and exit status; `--timeout S` per case (10; one stopped
+by it having run under half of S, waiting on a loaded machine, runs
+again, twice at most). Output is
 compared with `\r\n` as `\n` and trailing whitespace at the end left
 out. In the vole tree, `volec test FILTER` rebuilds
 `target/volec` when the source is newer and runs `tests/run.sh
