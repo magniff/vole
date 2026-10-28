@@ -1918,6 +1918,23 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
    its tag, then HEAD.
 6. Now (and not before) the compiler's source may use the new feature.
 
+### Who tests what (0.25.2)
+
+Every run of the whole suite costs every agent sharing the machine, so
+each level of testing runs once, by the one it names (AGENTS.md, "The
+inner loop"):
+
+1. an agent while working: `bootstrap/bootstrap.sh --dev --no-suite`
+   (the build and its fixpoint, no suite), then the cases it touches
+   (`tests/run.sh FILTER...`);
+2. an agent before reporting: `tools/premerge.sh` and
+   `tests/affected.sh` (the paths changed since the branch's base,
+   looked up in `tests/affected.map`, run at -O0 and -O2; `--linux` in
+   the aarch64-linux container when the change is platform-relevant);
+3. the integrator, once per merge batch: the whole `tests/run.sh` and
+   `bootstrap/gate.sh --quick`;
+4. a release: `bootstrap/gate.sh --release`.
+
 ### The gate
 
 `bootstrap/gate.sh` runs the whole gate in one command, as parallel as
@@ -2112,7 +2129,7 @@ Nothing else is trusted: no binary built before, no cache.
 | check | what it shows | where |
 |---|---|---|
 | the fixpoint | each compiler, built by its builder and then by itself, emits the same bytes | every bootstrap step |
-| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache | `gate.sh --only chain-fresh`, part of `--release` |
+| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST --history none`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache; (0.25.2) no suite runs when they agree (the bytes are those whose suite passed at the release), and the last release's runs when one differs (chain-fresh fails then anyway) | `gate.sh --only chain-fresh`, part of `--release` |
 | `chain-diverse` | HEAD's compiler by three paths: the normal chain (-O2); a path with no optimizer before the last step (the previous release at -O0, then HEAD at -O0, which builds HEAD at -O2); and the chain at -j1. The paths must end in the same bytes, and the -O2-built and -O0-built compilers must give the same output on the whole corpus (`same-output`) | `gate.sh --only chain-diverse`, part of `--release` |
 | `valgrind` | the compiler's own -O2 self-compile (at -j4) and the opt_, own_ and contract_ cases plus examples, under memcheck: no invalid read or write, no use of an uninitialised value | aarch64-linux container, `--release` |
 | `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
@@ -2196,6 +2213,9 @@ $ target/volec compiler/src/main.vl -o volec.s   # the compiler (its root file),
 $ cc -arch arm64 -o volec volec.s -lm
 $ tests/run.sh -c ./volec                            # the test suite, for the host
 $ tests/run.sh -c ./volec prog_                      # only cases named *prog_*
+$ tests/run.sh -c ./volec prog_ =lsp -f more.txt     # (0.25.2) the union: *prog_*, the lsp suite, a file's filters
+$ tests/run.sh -l opt_loop                           # (0.25.2) what a filter selects, run nothing
+$ tests/affected.sh --list                           # (0.25.2) the tests the branch's changes touch (tests/affected.map)
 $ tests/run.sh -c ./volec -t x86_64-macos            # x86-64, under Rosetta
 $ tests/run.sh -c ./volec -O 0                       # at another optimization level
 $ tests/fuzz/run.sh -c ./volec -n 500                # random programs, -O0 vs -O1 vs -O2
@@ -2307,6 +2327,9 @@ a lock whose holder is gone, or older than
 --clean            empty the cache first
 --out PATH         also copy the final compiler to PATH
 --history MODE     fast (the default): every release's fixpoint, the last
-                   one's suite; full: every release's suite too
+                   one's suite; full: every release's suite too; none
+                   (0.25.2): no release's suite
 --no-head-tests    build HEAD and check its fixpoint, not its suite
+--no-suite         (0.25.2) the agent's build: --no-head-tests and
+                   --history none; target/tools/volec is not replaced
 ```

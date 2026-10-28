@@ -2,7 +2,7 @@
 # The checks a branch passes before it is merged into an integration
 # branch (AGENTS.md, "Before a merge"): run in the branch's worktree.
 #
-# usage: tools/premerge.sh [BASE]     (default: the release-* branch it forked from, else main)
+# usage: tools/premerge.sh [BASE]     (default: the release-* branch it forked from, the nearest merge-base; else main)
 #
 #   base     the branch contains BASE's tip (else: merge BASE first)
 #   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
@@ -12,8 +12,9 @@
 #   layout   every tests/examples case names a SOURCE that exists
 #
 # One line per check (PASS, FAIL or SKIP and why), the details after;
-# exits 1 if one failed. It is not the test suite or the gate: those are
-# the branch's own (`tests/run.sh`, `bootstrap/gate.sh --quick`).
+# exits 1 if one failed. It is not the tests: with it, an agent runs
+# tests/affected.sh (AGENTS.md, tier 2); the whole suite and the gate are
+# the integrator's, once per merge batch (tier 3).
 set -u
 LC_ALL=C
 export LC_ALL
@@ -21,10 +22,15 @@ cd "$(git rev-parse --show-toplevel)" || exit 2
 
 BASE=${1:-}
 if [ -z "$BASE" ]; then
+    # (0.25.2: the one whose merge-base with HEAD is nearest, not the last
+    # by name, release-0.9 sorting after release-0.25.2; one that moved
+    # on since is still the base, and the check below says to merge it)
+    current=$(git rev-parse --abbrev-ref HEAD)
     BASE=$(git for-each-ref --format='%(refname:short)' 'refs/heads/release-*' | while read -r b; do
-        git merge-base --is-ancestor "$b" HEAD 2>/dev/null || continue
-        echo "$b"
-    done | tail -1)
+        [ "$b" = "$current" ] && continue
+        mb=$(git merge-base "$b" HEAD 2>/dev/null) || continue
+        echo "$(git rev-list --count "$mb..HEAD") $b"
+    done | sort -n -k1,1 | head -1 | cut -d' ' -f2)
     [ -n "$BASE" ] || BASE=main
 fi
 VOLEC=
