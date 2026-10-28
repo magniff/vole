@@ -1,0 +1,466 @@
+// Which program a command means (0.25.2; docs/query.md "ROOT"). Every
+// command that reads a program (query, edit, refactor, fix, probe, test,
+// check) finds its root here:
+//
+//   - a ROOT given (`--root R`, a last argument ending in .vl) that is a
+//     directory stands for its main.vl, and a file that is a module of a
+//     program (a `mod NAME;` of a main.vl above it says so) for that
+//     program's main.vl;
+//   - with no ROOT, a FILE or FILE:LINE argument of a program other than
+//     the default one (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl) names
+//     that program (its main.vl, or the file itself when it is a program
+//     of its own), and the `try:` lines then say `--root` (ROOT_INFERRED);
+//   - a NAME no definition of the default program answers to is looked
+//     for in the other programs under the current directory (`git grep`
+//     for its definition): `try:` lines with `--root`, and for a question
+//     of `query` that one program answers, the answer from there
+//     (run_query runs the command again, other_root).
+//
+// The command line is the one run_command was given (note_command), so a
+// command's own option parsing needs no change.
+
+use crate::base::{STDERR, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, buf_str, buf_write_fd};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::proc::{buf_cstr, read_file_if, run_capture};
+use crate::tools::query::{c_slice, find_root};
+use crate::tools::query::defs::last_segment;
+use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, diag, diags, put_cword, put_word, try_end};
+use crate::tools::query::names::is_name_char;
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+    fn realpath(path: *u8, resolved: *u8) -> *u8;
+    fn execvp(file: *u8, argv: **u8) -> i32;
+}
+
+// The command line of the command being run (run_command's argc, argv).
+static var CMD_ARGC: i64 = 0;
+static var CMD_ARGV: **u8 = 0 as **u8;
+// Whether ROOT_GIVEN was found here, not given: `try:` lines then say
+// `--root ROOT` (put_root).
+pub static var ROOT_INFERRED: bool = false;
+// The one other program that defines the NAME asked about (a C string; 0:
+// none, or several), for run_query to answer from.
+static var OTHER_ROOT: *u8 = 0 as *u8;
+
+pub fn note_command(argc: i64, argv: **u8) {
+    CMD_ARGC = argc;
+    CMD_ARGV = argv;
+}
+
+// Word k of the command line (0 <= k < CMD_ARGC).
+fn word(k: i64) -> *u8 {
+    // UNSAFE: the command line is C's argv, an array of C strings
+    // SAFETY: run_command's argv holds argc strings and k < CMD_ARGC
+    unsafe { CMD_ARGV[k] }
+}
+
+fn cstr_of(s: [u8]) -> *u8 {
+    let b = buf_new();
+    buf_bytes(b, s);
+    buf_cstr(b)
+}
+
+// The directory part of p, with its `/` ("" for none).
+fn dir_of(p: [u8]) -> [u8] {
+    var i = p.len;
+    while i > 0 && p[i - 1] != '/' {
+        i -= 1;
+    }
+    p[0..i]
+}
+
+// The name of p's last part, less `.vl`.
+fn stem_of(p: [u8]) -> [u8] {
+    let d = dir_of(p).len;
+    var e = p.len;
+    if e - d > 3 && p[e - 3..e] == ".vl" {
+        e -= 3;
+    }
+    p[d..e]
+}
+
+// Whether the text of file `path` declares module `name` (`mod name;`,
+// `pub mod name;`, as written, not in a comment's text).
+fn declares(path: [u8], name: [u8]) -> bool {
+    let b = buf_new();
+    if !read_file_if(cstr_of(path), b) {
+        return false;
+    }
+    let t = buf_slice(b);
+    var i = 0;
+    while i + 4 + name.len <= t.len {
+        if t[i..i + 4] == "mod " && (i == 0 || t[i - 1] == ' ' || t[i - 1] == '\n') {
+            var j = i + 4;
+            while j < t.len && t[j] == ' ' {
+                j += 1;
+            }
+            if j + name.len <= t.len && t[j..j + name.len] == name {
+                var k = j + name.len;
+                while k < t.len && t[k] == ' ' {
+                    k += 1;
+                }
+                if k < t.len && (t[k] == ';' || t[k] == '{') {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The main.vl of the program file `file` is a module of (walking up the
+// `mod` declarations: `a/b.vl` is declared by `a.vl`, `a/mod.vl` or
+// `a/main.vl`); `file` itself when it is a main.vl; 0 when no main.vl
+// declares it.
+pub fn program_of(file: [u8]) -> *u8 {
+    var cur = cstr_of(file);
+    for _ in 0..12 {
+        let p = c_slice(cur);
+        let stem = stem_of(p);
+        if stem == "main" {
+            return cur;
+        }
+        // (the module's name, and the directory its parent is in)
+        var name = stem;
+        var dir = dir_of(p);
+        if stem == "mod" {
+            if dir.len < 2 {
+                return 0 as *u8;
+            }
+            let up = dir[0..dir.len - 1];
+            name = stem_of(up);
+            dir = dir_of(up);
+        }
+        let parent = buf_new();
+        var found = false;
+        for c in 0..3 {
+            buf_clear(parent);
+            if c == 2 {
+                // (`a.vl` for the files of `a/`)
+                if dir.len < 2 {
+                    break;
+                }
+                buf_bytes(parent, dir[0..dir.len - 1]);
+                buf_str(parent, c".vl");
+            } else {
+                buf_bytes(parent, dir);
+                buf_str(parent, if c == 0 { c"main.vl" } else { c"mod.vl" });
+            }
+            let pp = buf_slice(parent);
+            if file_exists(buf_cstr(parent)) && declares(pp, name) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return 0 as *u8;
+        }
+        cur = cstr_of(buf_slice(parent));
+    }
+    0 as *u8
+}
+
+// Whether file p is a module of a program (not its root): `items FILE`
+// lists that module.
+pub fn is_module_file(p: *u8) -> bool {
+    let r = program_of(c_slice(p));
+    r != 0 as *u8 && stem_of(c_slice(p)) != "main"
+}
+
+// The file of argument a: `FILE`, `FILE:LINE`, `FILE:LINE:COL`,
+// `FILE:A-B`, when it is a source file that exists ("" otherwise).
+fn file_of_arg(a: [u8]) -> [u8] {
+    var end = a.len;
+    for _ in 0..2 {
+        var k = end;
+        while k > 0 && ((a[k - 1] >= '0' && a[k - 1] <= '9') || a[k - 1] == '-') {
+            k -= 1;
+        }
+        if k > 0 && k < end && a[k - 1] == ':' {
+            end = k - 1;
+        }
+    }
+    let f = a[0..end];
+    if f.len < 4 || f[f.len - 3..f.len] != ".vl" || !file_exists(cstr_of(f)) {
+        return a[0..0];
+    }
+    f
+}
+
+// Whether paths a and b name the same file.
+fn same_file(a: *u8, b: *u8) -> bool {
+    // UNSAFE: realpath is C's
+    // SAFETY: a and b are C strings; a null buffer makes realpath allocate
+    // the result, read only while it lives (never freed)
+    let ra = unsafe { realpath(a, 0 as *u8) };
+    // UNSAFE: as above
+    // SAFETY: as above
+    let rb = unsafe { realpath(b, 0 as *u8) };
+    if ra == 0 as *u8 || rb == 0 as *u8 {
+        return c_slice(a) == c_slice(b);
+    }
+    c_slice(ra) == c_slice(rb)
+}
+
+// Whether std's files hold path p (std is a program's always: stdedit).
+fn in_std(p: [u8]) -> bool {
+    var i = 0;
+    while i + 13 <= p.len {
+        if p[i..i + 13] == "compiler/std/" {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// A ROOT as given, as a program's root file: DIR is DIR/main.vl, a module
+// file its program's main.vl.
+pub fn root_named(given: *u8) -> *u8 {
+    let g = c_slice(given);
+    if g.len < 3 || g[g.len - 3..g.len] != ".vl" {
+        let m = buf_new();
+        buf_bytes(m, g);
+        if g.len > 0 && g[g.len - 1] != '/' {
+            buf_byte(m, '/');
+        }
+        buf_str(m, c"main.vl");
+        if file_exists(buf_cstr(m)) {
+            return buf_cstr(m);
+        }
+        return given;
+    }
+    if !file_exists(given) {
+        return given;
+    }
+    let r = program_of(g);
+    if r == 0 as *u8 { given } else { r }
+}
+
+// With no ROOT given: the program a FILE argument of the command line
+// names, when it is not the default program (ROOT_GIVEN is set to it, for
+// the `try:` lines); 0 otherwise.
+pub fn root_of_args() -> *u8 {
+    for k in 2..CMD_ARGC {
+        let a = c_slice(word(k));
+        if a == "--" {
+            break;
+        }
+        if a.len == 0 || a[0] == '-' {
+            continue;
+        }
+        let f = file_of_arg(a);
+        if f.len == 0 || in_std(f) {
+            continue;
+        }
+        var r = program_of(f);
+        if r == 0 as *u8 {
+            // (a program of its own)
+            r = cstr_of(f);
+        }
+        let default = find_root(0 as *u8);
+        if default != 0 as *u8 && same_file(r, default) {
+            return 0 as *u8;
+        }
+        ROOT_GIVEN = r;
+        ROOT_INFERRED = true;
+        return r;
+    }
+    0 as *u8
+}
+
+// The root of the command's program: ROOT given (root_named), else one a
+// FILE argument names (root_of_args), else the default (find_root); 0
+// when there is none.
+pub fn program_root(given: *u8) -> *u8 {
+    if given != 0 as *u8 {
+        return root_named(given);
+    }
+    let r = root_of_args();
+    if r != 0 as *u8 {
+        return r;
+    }
+    find_root(0 as *u8)
+}
+
+// ---- A NAME of another program ----
+
+// Whether the root is the default one, chosen by nobody: no ROOT, no
+// VOLE_ROOT (a question asked of another program goes to it).
+fn default_root_used() -> bool {
+    if ROOT_GIVEN != 0 as *u8 || ROOT_INFERRED {
+        return false;
+    }
+    // UNSAFE: getenv is C's
+    // SAFETY: a C string's name; the result is read before any setenv
+    let env = unsafe { getenv(c"VOLE_ROOT") };
+    env == 0 as *u8 || c_slice(env).len == 0
+}
+
+// The .vl files under the current directory with a match of extended
+// regular expression `pattern` as a whole word: a buffer of lines, sorted
+// (the same order everywhere). `git grep` (tracked and untracked files,
+// less what git ignores), else, out of a checkout or in a directory git
+// ignores (a release's tree extracted under target/), `grep -r` less the
+// build's and the tools' directories; never of the home directory or /.
+fn files_matching(pattern: *u8) -> [u8] {
+    let args = crate::base::alloc_array::<*u8>(5);
+    // UNSAFE: the command line of sh, an array of C strings
+    // SAFETY: args has 5 elements, 0 to 4 written, the last null
+    unsafe {
+        args[0] = c"sh";
+        args[1] = c"-c";
+        args[2] = c"{ if git rev-parse --git-dir >/dev/null 2>&1 && ! git check-ignore -q . 2>/dev/null; then git grep -l -w -E --untracked -e \"$0\" -- '*.vl'; elif [ \"$PWD\" != \"$HOME\" ] && [ \"$PWD\" != / ]; then grep -rlwE --include='*.vl' --exclude-dir=.git --exclude-dir=target --exclude-dir=.claude --exclude-dir=.volec --exclude-dir=node_modules -e \"$0\" -- .; fi; } 2>/dev/null | LC_ALL=C sort";
+        args[3] = pattern;
+        args[4] = 0 as *u8;
+    }
+    let listing = buf_new();
+    if run_capture(args, listing) != 0 {
+        return buf_slice(listing)[0..0];
+    }
+    buf_slice(listing)
+}
+
+// The roots of the programs under the current directory, other than
+// `default`, with a file that defines `name` (`fn name`, `struct name`,
+// `mod name`, ...): a buffer of lines, examples' first, tests' last.
+fn roots_defining(name: [u8], default: *u8) -> [u8] {
+    let pattern = buf_new();
+    buf_str(pattern, c"(fn|struct|enum|trait|const|type|mod|union|var|static)[[:space:]]+");
+    buf_bytes(pattern, name);
+    let t = files_matching(buf_cstr(pattern));
+    let roots = buf_new();
+    for pass in 0..2 {
+        var i = 0;
+        while i < t.len {
+            var e = i;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            var f = t[i..e];
+            i = e + 1;
+            if f.len > 2 && f[0..2] == "./" {
+                f = f[2..f.len];
+            }
+            let tests = f.len > 6 && f[0..6] == "tests/";
+            if (pass == 0) == tests || f.len < 4 || f[f.len - 3..f.len] != ".vl"
+                || (f.len > 9 && f[0..9] == "compiler/") || (f.len > 5 && f[0..5] == "seed/") {
+                continue;
+            }
+            var r = program_of(f);
+            if r == 0 as *u8 {
+                r = cstr_of(f);
+            }
+            if default != 0 as *u8 && same_file(r, default) {
+                continue;
+            }
+            // (once each)
+            let line = buf_new();
+            buf_byte(line, '\n');
+            buf_str(line, r);
+            buf_byte(line, '\n');
+            let seen = buf_new();
+            buf_byte(seen, '\n');
+            buf_bytes(seen, buf_slice(roots));
+            if !has_text(buf_slice(seen), buf_slice(line)) {
+                buf_str(roots, r);
+                buf_byte(roots, '\n');
+            }
+        }
+    }
+    buf_slice(roots)
+}
+
+fn has_text(t: [u8], part: [u8]) -> bool {
+    var i = 0;
+    while i + part.len <= t.len {
+        if t[i..i + part.len] == part {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// The command as it was run, with `--root ROOT`: a `try:` line.
+fn try_with_root(root: [u8]) {
+    let out = diags();
+    buf_str(out, c"try:");
+    put_cword(out, PROG);
+    for k in 1..CMD_ARGC {
+        put_word(out, c_slice(word(k)));
+    }
+    buf_str(out, c" --root");
+    put_word(out, root);
+    try_end(out);
+}
+
+// After a diagnostic that NAME is not in the default program: the other
+// programs that define it, a `try:` line each (at most 3); true when
+// there is one. `ask_again`: a question one program answers is asked of
+// it (other_root).
+pub fn try_other_roots(name: [u8], ask_again: bool) -> bool {
+    let want = last_segment(name);
+    if want.len == 0 || !default_root_used() {
+        return false;
+    }
+    for i in 0..want.len {
+        if !is_name_char(want[i]) {
+            return false;
+        }
+    }
+    let default = find_root(0 as *u8);
+    let roots = roots_defining(want, default);
+    var shown = 0;
+    var i = 0;
+    while i < roots.len && shown < 3 {
+        var e = i;
+        while e < roots.len && roots[e] != '\n' {
+            e += 1;
+        }
+        try_with_root(roots[i..e]);
+        if shown == 0 && ask_again && e + 1 >= roots.len {
+            OTHER_ROOT = cstr_of(roots[i..e]);
+        }
+        shown += 1;
+        i = e + 1;
+    }
+    shown > 0
+}
+
+// (run_query) A question no definition of the default program answers
+// and one other program's does: asked again of it, with a note saying so
+// in place of the diagnostics (never returns when it can run).
+pub fn other_root() {
+    if OTHER_ROOT == 0 as *u8 {
+        return;
+    }
+    let default = find_root(0 as *u8);
+    let out = diags();
+    buf_clear(out);
+    let d = diag(c"note", c"query.other-root");
+    buf_str(d, c"not in ");
+    buf_str(d, if default == 0 as *u8 { c"this directory's program" } else { default });
+    buf_str(d, c"; answered from ");
+    buf_str(d, OTHER_ROOT);
+    buf_str(d, c" (--root ");
+    buf_str(d, OTHER_ROOT);
+    buf_str(d, c")\n");
+    buf_write_fd(out, STDERR);
+    buf_clear(out);
+    let argv = crate::base::alloc_array::<*u8>(CMD_ARGC + 3);
+    // UNSAFE: the new command line, an array of C strings for execvp
+    // SAFETY: argv has CMD_ARGC + 3 elements: the command's words, then
+    // `--root`, the root and a null
+    unsafe {
+        for k in 0..CMD_ARGC {
+            argv[k] = word(k);
+        }
+        argv[CMD_ARGC] = c"--root";
+        argv[CMD_ARGC + 1] = OTHER_ROOT;
+        argv[CMD_ARGC + 2] = 0 as *u8;
+        execvp(argv[0], argv);
+    }
+}

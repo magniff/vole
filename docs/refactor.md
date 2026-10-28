@@ -13,7 +13,7 @@ Sessions with these tools on small programs, each step's command and
 its output, tested by `tests/walkthrough/run.sh`: [examples/tools](../examples/tools/README.md).
 
 ```
-volec edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
+volec edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose] [--nth N|--all]
 volec edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
 volec edit patch TARGET --pairs FILE [--loose]   (0.13)
 volec edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
@@ -37,7 +37,8 @@ volec query impact NAME
 ```
 
 The editing commands (edit, fix) also take `--dry-run`, `--no-check`, `--show`,
-`--exact`, `--root ROOT` and `--target T`, and (0.19) `-C
+`--exact`, `--root ROOT` (0.25.2: or `--root DIR`, its main.vl; with no
+ROOT a FILE argument of another program names it) and `--target T`, and (0.19) `-C
 target-cpu=CPU` and `-C target-feature=+x,-y`: an edit is checked with
 the build's features it is given, so one that removes a
 `detect("crc")` guard is refused on a `generic` build
@@ -181,7 +182,10 @@ try: volec edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
   `--all` every one; they hold for every pair of the command. Past the
   last: `error patch.nth: OLD 1 occurs 3 times in crate::calc::clamp;
   --nth 4 is past the last`. `edit insert --in` takes `--nth N` for its
-  ANCHOR (not `--all`).
+  ANCHOR (not `--all`). TARGET may be a whole file, so one checked edit
+  replaces every match in it: `volec edit patch examples/nes/check.vl
+  --old 'let mut' --new 'var' --all` (0.25.2: from anywhere; the file
+  names its program, see "Program roots" in [query.md](query.md)).
 
   Pairs of several lines, and pairs given as blocks, are not put on the
   command line (agent harnesses refuse `$'...'` quoting): they are
