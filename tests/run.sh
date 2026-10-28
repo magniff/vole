@@ -1301,17 +1301,18 @@ esac
 # transcript; category "walkthrough".
 case $(want walkthrough) in
     y)
-        while read -r status _; do
+        while read -r status rest; do
             case "$status" in
                 pass) echo "walkthrough pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "walkthrough fail" >>"$TALLY"; count=$((count + 1)) ;;
+                skip) skipped walkthrough "walkthrough $rest"; count=$((count + 1)) ;;
             esac
         done <"$WORK/walkthrough.out"
-        if ! grep -q '^pass' "$WORK/walkthrough.out"; then
+        if ! grep -qE '^(pass|skip)' "$WORK/walkthrough.out"; then
             echo "walkthrough fail" >>"$TALLY"
             count=$((count + 1))
         fi
-        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
+        awk '/^FAIL/ { p = 1 } /^(pass|skip)/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
         ;;
 esac
 
