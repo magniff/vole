@@ -2603,3 +2603,23 @@ threads 8116, incremental 172 series, objcheck 5152 (macOS) and 5124
 `--assign-calls`, every fuzz and ABI row on both systems. compile-cost
 against v0.25.1: a hello world 1.00x, std 1.01x, check of the compiler
 1.07x (std::cli in volec's own command line, unused-import tracking).
+
+### 0.25.2.1
+
+The release gate (`gate.sh --release --no-x86`, 48:13 wall). Every row
+passed but one, the gate's own: linux-aarch64/objcheck, 12 of 5184
+compilations (tests/run/link_libm, examples/c-math, examples/floats at
+-O0 and -O2) not linked, `cc: error: unrecognized command-line option
+'-framework'`. 0.25.2's objcheck fix (after its gate) gave a `// LINK:`
+case std's `#[link]` frameworks on every target; they are Apple
+frameworks and libobjc, and off macOS their modules are not compiled, so
+objcheck adds them for macOS targets only. Rerun alone in the container
+(`aarch64-linux-check.sh --worktree --compiler ... --only objcheck`):
+5184 of 5184; macOS's objcheck unchanged. The fix does not touch the
+compiler. The suite 4124 at each level (85 XFAIL, 1 SKIP without
+spirv-val), aarch64-linux 3599 at -O0 and -O2, threads 8197, incremental
+172 series, objcheck 5216 (macOS), compiler-memcheck 615, valgrind 307
+clean, fuzz-sem with `--try-args` (300 ok), examples-checkalloc 176,
+every fuzz and ABI row on both systems, chain-fresh 29 releases.
+compile-cost against v0.25.2: a hello world 1.01x, std 1.01x, check of
+the compiler 1.00x.

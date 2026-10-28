@@ -178,8 +178,11 @@ check() { # <file> <level> <dir> [-g]
     flags=$(echo " $flags" | sed 's/ -[lL] *[^ -][^ ]*//g')
     # (0.25.2: a case with `// LINK:` is linked by volec from its
     # #[link] attributes, which an object does not carry: both links get
-    # every framework and library that std and the program's directory name.)
-    if [ "$(cat "$WORK/directives/$(echo "$f" | tr / _)/link" 2>/dev/null)" = 1 ]; then
+    # every framework and library that std and the program's directory name.
+    # 0.25.2.1: on macOS only; std's are Apple frameworks and libobjc, and
+    # off macOS the modules that name them are not compiled.)
+    if [ "$(cat "$WORK/directives/$(echo "$f" | tr / _)/link" 2>/dev/null)" = 1 ] &&
+        case "$TARGET" in *-macos) true ;; *) false ;; esac; then
         libs="$libs $(grep -rhoE '#\[link\([^]]*\)\]' "$ROOT/compiler/std" "$(dirname "$f")" --include='*.vl' |
             grep -oE '(framework|lib) = "[^"]*"' |
             sed 's/^framework = "\(.*\)"$/-framework \1/; s/^lib = "\(.*\)"$/-l\1/' | sort -u | tr '\n' ' ')"
