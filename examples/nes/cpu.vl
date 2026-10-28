@@ -1,0 +1,710 @@
+// cpu.vl: the 2A03's 6502 core — all 151 documented opcodes, the
+// undocumented ones games actually use (LAX, SAX, DCP, ISC, SLO, RLA,
+// SRE, RRA, ANC, ALR, ARR, AXS, the store-and-high-byte variants and
+// the NOP families), NMI, IRQ and BRK, and the page-cross and branch
+// cycle penalties. Memory is reached only through bus.vl, so the same
+// core runs against RAM, the PPU's registers, the controllers and the
+// cartridge's banked ROM.
+//
+// Decimal mode is a flag this chip does not implement: ADC and SBC are
+// binary whatever D says, which is what the NES's Ricoh 2A03 does.
+//
+// The core is instruction-at-a-time: the PPU catches up by the cycle
+// count the step returns, so a flag the PPU raises is seen at the next
+// instruction boundary. That is enough for vblank waits, sprite-0
+// splits and MMC3 scanline IRQs; it is not cycle-exact inside an
+// instruction, and the README says where that shows.
+
+use bus::{Bus, bus_irq_level, bus_nmi_ack, bus_nmi_pending, bus_read, bus_write};
+
+const C_FLAG: u8 = 0x01;
+const Z_FLAG: u8 = 0x02;
+const I_FLAG: u8 = 0x04;
+const B_FLAG: u8 = 0x10;
+const U_FLAG: u8 = 0x20;
+const V_FLAG: u8 = 0x40;
+const N_FLAG: u8 = 0x80;
+
+pub struct Cpu {
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub pc: u16,
+    pub p: u8,
+    pub jammed: bool,
+    pub opcode: u8,
+    pub stall: i64,
+    pub total: i64,
+    // The I flag as the interrupt poll at the end of the previous
+    // instruction saw it. CLI, SEI and PLP change I after that poll, so
+    // the change only takes effect for the instruction after them: the
+    // 6502 samples the IRQ line during the second-to-last cycle, before
+    // the flag write lands.
+    poll_i: bool,
+}
+
+pub fn cpu_new() -> Cpu {
+    Cpu {
+        a: 0,
+        x: 0,
+        y: 0,
+        sp: 0xfd,
+        pc: 0,
+        p: U_FLAG | I_FLAG,
+        jammed: false,
+        opcode: 0,
+        stall: 0,
+        total: 0,
+        poll_i: true,
+    }
+}
+
+pub fn cpu_reset(cpu: inout Cpu, bus: inout Bus) {
+    cpu.a = 0;
+    cpu.x = 0;
+    cpu.y = 0;
+    cpu.sp = 0xfd;
+    cpu.p = U_FLAG | I_FLAG;
+    cpu.jammed = false;
+    cpu.stall = 0;
+    cpu.poll_i = true;
+    cpu.pc = (bus_read(&bus, 0xfffc) as u16) | ((bus_read(&bus, 0xfffd) as u16) << 8);
+}
+
+fn c_set(cpu: Cpu) -> bool {
+    (cpu.p & C_FLAG) != 0
+}
+
+fn set_flag(cpu: inout Cpu, f: u8, on: bool) {
+    if on {
+        cpu.p = cpu.p | f;
+    } else {
+        cpu.p = cpu.p & ~f;
+    }
+}
+
+fn set_zn(cpu: inout Cpu, v: u8) {
+    set_flag(&cpu, Z_FLAG, v == 0);
+    set_flag(&cpu, N_FLAG, (v & 0x80) != 0);
+}
+
+fn fetch(cpu: inout Cpu, bus: inout Bus) -> u8 {
+    let v = bus_read(&bus, cpu.pc as i64);
+    cpu.pc = cpu.pc + 1;
+    v
+}
+
+fn fetch16(cpu: inout Cpu, bus: inout Bus) -> u16 {
+    let lo = fetch(&cpu, &bus) as u16;
+    let hi = fetch(&cpu, &bus) as u16;
+    lo | (hi << 8)
+}
+
+fn push(cpu: inout Cpu, bus: inout Bus, v: u8) {
+    bus_write(&bus, 0x100 + cpu.sp as i64, v);
+    cpu.sp = cpu.sp - 1;
+}
+
+fn pull(cpu: inout Cpu, bus: inout Bus) -> u8 {
+    cpu.sp = cpu.sp + 1;
+    bus_read(&bus, 0x100 + cpu.sp as i64)
+}
+
+fn read16(bus: inout Bus, addr: i64) -> u16 {
+    let lo = bus_read(&bus, addr) as u16;
+    let hi = bus_read(&bus, addr + 1) as u16;
+    lo | (hi << 8)
+}
+
+// --- effective addresses ----------------------------------------------
+
+fn am_zp(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    fetch(&cpu, &bus) as i64
+}
+
+fn am_zpx(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    (fetch(&cpu, &bus) as i64 + cpu.x as i64) & 0xff
+}
+
+fn am_zpy(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    (fetch(&cpu, &bus) as i64 + cpu.y as i64) & 0xff
+}
+
+fn am_abs(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    fetch16(&cpu, &bus) as i64
+}
+
+// The address and whether the index carried into the high byte (one
+// more cycle).
+fn am_abx(cpu: inout Cpu, bus: inout Bus) -> (i64, bool) {
+    let base = fetch16(&cpu, &bus);
+    let addr = base + cpu.x as u16;
+    (addr as i64, (base & 0xff00) != (addr & 0xff00))
+}
+
+fn am_aby(cpu: inout Cpu, bus: inout Bus) -> (i64, bool) {
+    let base = fetch16(&cpu, &bus);
+    let addr = base + cpu.y as u16;
+    (addr as i64, (base & 0xff00) != (addr & 0xff00))
+}
+
+fn am_izx(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    let zp = (fetch(&cpu, &bus) as i64 + cpu.x as i64) & 0xff;
+    let lo = bus_read(&bus, zp) as i64;
+    let hi = bus_read(&bus, (zp + 1) & 0xff) as i64;
+    lo | (hi << 8)
+}
+
+fn am_izy(cpu: inout Cpu, bus: inout Bus) -> (i64, bool) {
+    let zp = fetch(&cpu, &bus) as i64;
+    let lo = bus_read(&bus, zp) as i64;
+    let hi = bus_read(&bus, (zp + 1) & 0xff) as i64;
+    let base = lo | (hi << 8);
+    let addr = base + cpu.y as i64;
+    (addr, (base & 0xff00) != (addr & 0xff00))
+}
+
+// --- operations -------------------------------------------------------
+
+fn op_adc(cpu: inout Cpu, v: u8) {
+    let a = cpu.a as i64;
+    let b = v as i64;
+    let c = if c_set(cpu) { 1 } else { 0 };
+    let sum = a + b + c;
+    let r = (sum & 0xff) as u8;
+    set_flag(&cpu, C_FLAG, sum > 0xff);
+    set_flag(&cpu, V_FLAG, ((a ^ b ^ 0x80) & (a ^ sum) & 0x80) != 0);
+    cpu.a = r;
+    set_zn(&cpu, r);
+}
+
+fn op_sbc(cpu: inout Cpu, v: u8) {
+    let a = cpu.a as i64;
+    let b = v as i64;
+    let c = if c_set(cpu) { 1 } else { 0 };
+    let diff = a - b - (1 - c);
+    let r = (diff & 0xff) as u8;
+    set_flag(&cpu, C_FLAG, diff >= 0);
+    set_flag(&cpu, V_FLAG, ((a ^ b) & (a ^ diff) & 0x80) != 0);
+    cpu.a = r;
+    set_zn(&cpu, r);
+}
+
+fn op_cmp(cpu: inout Cpu, reg: u8, v: u8) {
+    let r = reg as i64 - v as i64;
+    set_flag(&cpu, C_FLAG, r >= 0);
+    set_zn(&cpu, (r & 0xff) as u8);
+}
+
+fn op_bit(cpu: inout Cpu, v: u8) {
+    set_flag(&cpu, Z_FLAG, (cpu.a & v) == 0);
+    set_flag(&cpu, N_FLAG, (v & 0x80) != 0);
+    set_flag(&cpu, V_FLAG, (v & 0x40) != 0);
+}
+
+fn op_asl(cpu: inout Cpu, v: u8) -> u8 {
+    set_flag(&cpu, C_FLAG, (v & 0x80) != 0);
+    let r = v << 1;
+    set_zn(&cpu, r);
+    r
+}
+
+fn op_lsr(cpu: inout Cpu, v: u8) -> u8 {
+    set_flag(&cpu, C_FLAG, (v & 1) != 0);
+    let r = v >> 1;
+    set_zn(&cpu, r);
+    r
+}
+
+fn op_rol(cpu: inout Cpu, v: u8) -> u8 {
+    let c = if c_set(cpu) { 1 } else { 0 };
+    set_flag(&cpu, C_FLAG, (v & 0x80) != 0);
+    let r = ((v << 1) as i64 | c) as u8;
+    set_zn(&cpu, r);
+    r
+}
+
+fn op_ror(cpu: inout Cpu, v: u8) -> u8 {
+    let c: u8 = if c_set(cpu) { 0x80 } else { 0 };
+    set_flag(&cpu, C_FLAG, (v & 1) != 0);
+    let r = (v >> 1) | c;
+    set_zn(&cpu, r);
+    r
+}
+
+fn rmw(cpu: inout Cpu, bus: inout Bus, addr: i64, kind: i64) {
+    let v = bus_read(&bus, addr);
+    // The 6502 writes the old value back before the new one; a mapper
+    // that counts writes (MMC1's serial port) sees the difference.
+    bus_write(&bus, addr, v);
+    var r = v;
+    if kind == 0 {
+        r = op_asl(&cpu, v);
+    } else if kind == 1 {
+        r = op_lsr(&cpu, v);
+    } else if kind == 2 {
+        r = op_rol(&cpu, v);
+    } else if kind == 3 {
+        r = op_ror(&cpu, v);
+    } else if kind == 4 {
+        r = v + 1;
+        set_zn(&cpu, r);
+    } else {
+        r = v - 1;
+        set_zn(&cpu, r);
+    }
+    bus_write(&bus, addr, r);
+}
+
+fn branch(cpu: inout Cpu, bus: inout Bus, cond: bool) -> i64 {
+    let off = fetch(&cpu, &bus) as i8;
+    if !cond {
+        return 2;
+    }
+    let old = cpu.pc;
+    let target = (old as i64 + off as i64) as u16;
+    cpu.pc = target;
+    if (old & 0xff00) != (target & 0xff00) { 4 } else { 3 }
+}
+
+fn interrupt(cpu: inout Cpu, bus: inout Bus, vector: i64, brk: bool) {
+    let pc = cpu.pc;
+    push(&cpu, &bus, (pc >> 8) as u8);
+    push(&cpu, &bus, (pc & 0xff) as u8);
+    var p = cpu.p | U_FLAG;
+    if brk { p = p | B_FLAG; }
+    push(&cpu, &bus, p);
+    set_flag(&cpu, I_FLAG, true);
+    cpu.poll_i = true;
+    cpu.pc = read16(&bus, vector);
+}
+
+fn jam(cpu: inout Cpu) {
+    cpu.jammed = true;
+}
+
+// One instruction (or the interrupt it starts with); the cycles it took.
+pub fn step(cpu: inout Cpu, bus: inout Bus) -> i64 {
+    if cpu.stall > 0 {
+        let n = cpu.stall;
+        cpu.stall = 0;
+        return n;
+    }
+    if cpu.jammed {
+        return 2;
+    }
+    if bus.ppu.nmi_delay > 0 {
+        // An NMI enabled mid-vblank waits one instruction, as the CPU
+        // has already latched its interrupt input for this one.
+        bus.ppu.nmi_delay -= 1;
+    } else if bus_nmi_pending(bus) && bus.ppu.nmi_age >= 3 {
+        if bus.log_writes && bus.log_budget > 0 {
+            eprintln(f"NMI pc={cpu.pc:04x} sl={bus.ppu.scanline} dot={bus.ppu.dot}");
+            bus.log_budget -= 1;
+        }
+        bus_nmi_ack(&bus);
+        interrupt(&cpu, &bus, 0xfffa, false);
+        cpu.total += 7;
+        return 7;
+    }
+    if bus_irq_level(bus) && !cpu.poll_i {
+        interrupt(&cpu, &bus, 0xfffe, false);
+        cpu.total += 7;
+        return 7;
+    }
+    let op = fetch(&cpu, &bus);
+    bus.opcode = op;
+    cpu.opcode = op;
+    let i_before = (cpu.p & I_FLAG) != 0;
+    let cyc = exec(&cpu, &bus, op);
+    cpu.poll_i = if op == 0x58 || op == 0x78 || op == 0x28 {
+        i_before
+    } else {
+        (cpu.p & I_FLAG) != 0
+    };
+    cpu.total += cyc;
+    cyc
+}
+
+fn exec(cpu: inout Cpu, bus: inout Bus, op: u8) -> i64 {
+    // ZP, ZPX, ABS-style operands are read inside each arm; the arms
+    // keep the documented cycle counts (page-cross adds one).
+    match op as i64 {
+        0x00 => { // BRK
+            cpu.pc = cpu.pc + 1;
+            interrupt(&cpu, &bus, 0xfffe, true);
+            7
+        }
+        0x01 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 6 }
+        0x05 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 3 }
+        0x09 => { let v = fetch(&cpu, &bus); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 2 }
+        0x0d => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 4 }
+        0x11 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); if p { 6 } else { 5 } }
+        0x15 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 4 }
+        0x19 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+        0x1d => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+
+        0x21 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 6 }
+        0x25 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 3 }
+        0x29 => { let v = fetch(&cpu, &bus); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 2 }
+        0x2d => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 4 }
+        0x31 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); if p { 6 } else { 5 } }
+        0x35 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 4 }
+        0x39 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+        0x3d => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+
+        0x41 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 6 }
+        0x45 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 3 }
+        0x49 => { let v = fetch(&cpu, &bus); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 2 }
+        0x4d => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 4 }
+        0x51 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); if p { 6 } else { 5 } }
+        0x55 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 4 }
+        0x59 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+        0x5d => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+
+        0x61 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); 6 }
+        0x65 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); 3 }
+        0x69 => { let v = fetch(&cpu, &bus); op_adc(&cpu, v); 2 }
+        0x6d => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); 4 }
+        0x71 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); if p { 6 } else { 5 } }
+        0x75 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); 4 }
+        0x79 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); if p { 5 } else { 4 } }
+        0x7d => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); op_adc(&cpu, v); if p { 5 } else { 4 } }
+
+        0xc1 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 6 }
+        0xc5 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 3 }
+        0xc9 => { let v = fetch(&cpu, &bus); op_cmp(&cpu, cpu.a, v); 2 }
+        0xcd => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 4 }
+        0xd1 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); if p { 6 } else { 5 } }
+        0xd5 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 4 }
+        0xd9 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); if p { 5 } else { 4 } }
+        0xdd => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); if p { 5 } else { 4 } }
+
+        0xe1 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); 6 }
+        0xe5 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); 3 }
+        0xe9 | 0xeb => { let v = fetch(&cpu, &bus); op_sbc(&cpu, v); 2 }
+        0xed => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); 4 }
+        0xf1 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); if p { 6 } else { 5 } }
+        0xf5 => { let a = am_zpx(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); 4 }
+        0xf9 => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); if p { 5 } else { 4 } }
+        0xfd => { let (a, p) = am_abx(&cpu, &bus); let v = bus_read(&bus, a); op_sbc(&cpu, v); if p { 5 } else { 4 } }
+
+        0x81 => { let a = am_izx(&cpu, &bus); bus_write(&bus, a, cpu.a); 6 }
+        0x85 => { let a = am_zp(&cpu, &bus); bus_write(&bus, a, cpu.a); 3 }
+        0x8d => { let a = am_abs(&cpu, &bus); bus_write(&bus, a, cpu.a); 4 }
+        0x91 => { let (a, _) = am_izy(&cpu, &bus); bus_write(&bus, a, cpu.a); 6 }
+        0x95 => { let a = am_zpx(&cpu, &bus); bus_write(&bus, a, cpu.a); 4 }
+        0x99 => { let (a, _) = am_aby(&cpu, &bus); bus_write(&bus, a, cpu.a); 5 }
+        0x9d => { let (a, _) = am_abx(&cpu, &bus); bus_write(&bus, a, cpu.a); 5 }
+
+        0x84 => { let a = am_zp(&cpu, &bus); bus_write(&bus, a, cpu.y); 3 }
+        0x8c => { let a = am_abs(&cpu, &bus); bus_write(&bus, a, cpu.y); 4 }
+        0x94 => { let a = am_zpx(&cpu, &bus); bus_write(&bus, a, cpu.y); 4 }
+        0x86 => { let a = am_zp(&cpu, &bus); bus_write(&bus, a, cpu.x); 3 }
+        0x8e => { let a = am_abs(&cpu, &bus); bus_write(&bus, a, cpu.x); 4 }
+        0x96 => { let a = am_zpy(&cpu, &bus); bus_write(&bus, a, cpu.x); 4 }
+
+        0xa1 => { let a = am_izx(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); 6 }
+        0xa5 => { let a = am_zp(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); 3 }
+        0xa9 => { cpu.a = fetch(&cpu, &bus); set_zn(&cpu, cpu.a); 2 }
+        0xad => { let a = am_abs(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); 4 }
+        0xb1 => { let (a, p) = am_izy(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); if p { 6 } else { 5 } }
+        0xb5 => { let a = am_zpx(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); 4 }
+        0xb9 => { let (a, p) = am_aby(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+        0xbd => { let (a, p) = am_abx(&cpu, &bus); cpu.a = bus_read(&bus, a); set_zn(&cpu, cpu.a); if p { 5 } else { 4 } }
+
+        0xa2 => { cpu.x = fetch(&cpu, &bus); set_zn(&cpu, cpu.x); 2 }
+        0xa6 => { let a = am_zp(&cpu, &bus); cpu.x = bus_read(&bus, a); set_zn(&cpu, cpu.x); 3 }
+        0xae => { let a = am_abs(&cpu, &bus); cpu.x = bus_read(&bus, a); set_zn(&cpu, cpu.x); 4 }
+        0xb6 => { let a = am_zpy(&cpu, &bus); cpu.x = bus_read(&bus, a); set_zn(&cpu, cpu.x); 4 }
+        0xbe => { let (a, p) = am_aby(&cpu, &bus); cpu.x = bus_read(&bus, a); set_zn(&cpu, cpu.x); if p { 5 } else { 4 } }
+
+        0xa0 => { cpu.y = fetch(&cpu, &bus); set_zn(&cpu, cpu.y); 2 }
+        0xa4 => { let a = am_zp(&cpu, &bus); cpu.y = bus_read(&bus, a); set_zn(&cpu, cpu.y); 3 }
+        0xac => { let a = am_abs(&cpu, &bus); cpu.y = bus_read(&bus, a); set_zn(&cpu, cpu.y); 4 }
+        0xb4 => { let a = am_zpx(&cpu, &bus); cpu.y = bus_read(&bus, a); set_zn(&cpu, cpu.y); 4 }
+        0xbc => { let (a, p) = am_abx(&cpu, &bus); cpu.y = bus_read(&bus, a); set_zn(&cpu, cpu.y); if p { 5 } else { 4 } }
+
+        0xc0 => { let v = fetch(&cpu, &bus); op_cmp(&cpu, cpu.y, v); 2 }
+        0xc4 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.y, v); 3 }
+        0xcc => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.y, v); 4 }
+        0xe0 => { let v = fetch(&cpu, &bus); op_cmp(&cpu, cpu.x, v); 2 }
+        0xe4 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.x, v); 3 }
+        0xec => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.x, v); 4 }
+
+        0x24 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); op_bit(&cpu, v); 3 }
+        0x2c => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); op_bit(&cpu, v); 4 }
+
+        0x06 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 0); 5 }
+        0x0e => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 0); 6 }
+        0x16 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 0); 6 }
+        0x1e => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 0); 7 }
+        0x0a => { cpu.a = op_asl(&cpu, cpu.a); 2 }
+        0x26 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 2); 5 }
+        0x2e => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 2); 6 }
+        0x36 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 2); 6 }
+        0x3e => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 2); 7 }
+        0x2a => { cpu.a = op_rol(&cpu, cpu.a); 2 }
+        0x46 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 1); 5 }
+        0x4e => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 1); 6 }
+        0x56 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 1); 6 }
+        0x5e => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 1); 7 }
+        0x4a => { cpu.a = op_lsr(&cpu, cpu.a); 2 }
+        0x66 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 3); 5 }
+        0x6e => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 3); 6 }
+        0x76 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 3); 6 }
+        0x7e => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 3); 7 }
+        0x6a => { cpu.a = op_ror(&cpu, cpu.a); 2 }
+
+        0xc6 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 5); 5 }
+        0xce => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 5); 6 }
+        0xd6 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 5); 6 }
+        0xde => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 5); 7 }
+        0xe6 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 4); 5 }
+        0xee => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 4); 6 }
+        0xf6 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 4); 6 }
+        0xfe => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 4); 7 }
+
+        0x08 => { push(&cpu, &bus, cpu.p | B_FLAG | U_FLAG); 3 }
+        0x28 => { let v = pull(&cpu, &bus); cpu.p = (v & ~B_FLAG) | U_FLAG; 4 }
+        0x48 => { push(&cpu, &bus, cpu.a); 3 }
+        0x68 => { cpu.a = pull(&cpu, &bus); set_zn(&cpu, cpu.a); 4 }
+
+        0x18 => { set_flag(&cpu, C_FLAG, false); 2 }
+        0x38 => { set_flag(&cpu, C_FLAG, true); 2 }
+        0x58 => { set_flag(&cpu, I_FLAG, false); 2 }
+        0x78 => { set_flag(&cpu, I_FLAG, true); 2 }
+        0xb8 => { set_flag(&cpu, V_FLAG, false); 2 }
+        0xd8 => { set_flag(&cpu, 0x08, false); 2 }
+        0xf8 => { set_flag(&cpu, 0x08, true); 2 }
+
+        0xaa => { cpu.x = cpu.a; set_zn(&cpu, cpu.x); 2 }
+        0x8a => { cpu.a = cpu.x; set_zn(&cpu, cpu.a); 2 }
+        0xa8 => { cpu.y = cpu.a; set_zn(&cpu, cpu.y); 2 }
+        0x98 => { cpu.a = cpu.y; set_zn(&cpu, cpu.a); 2 }
+        0xba => { cpu.x = cpu.sp; set_zn(&cpu, cpu.x); 2 }
+        0x9a => { cpu.sp = cpu.x; 2 }
+        0xe8 => { cpu.x = cpu.x + 1; set_zn(&cpu, cpu.x); 2 }
+        0xca => { cpu.x = cpu.x - 1; set_zn(&cpu, cpu.x); 2 }
+        0xc8 => { cpu.y = cpu.y + 1; set_zn(&cpu, cpu.y); 2 }
+        0x88 => { cpu.y = cpu.y - 1; set_zn(&cpu, cpu.y); 2 }
+        0xea => 2,
+
+        0x10 => branch(&cpu, &bus, (cpu.p & N_FLAG) == 0),
+        0x30 => branch(&cpu, &bus, (cpu.p & N_FLAG) != 0),
+        0x50 => branch(&cpu, &bus, (cpu.p & V_FLAG) == 0),
+        0x70 => branch(&cpu, &bus, (cpu.p & V_FLAG) != 0),
+        0x90 => branch(&cpu, &bus, (cpu.p & C_FLAG) == 0),
+        0xb0 => branch(&cpu, &bus, (cpu.p & C_FLAG) != 0),
+        0xd0 => branch(&cpu, &bus, (cpu.p & Z_FLAG) == 0),
+        0xf0 => branch(&cpu, &bus, (cpu.p & Z_FLAG) != 0),
+
+        0x20 => {
+            let lo = fetch(&cpu, &bus) as u16;
+            let hi = fetch(&cpu, &bus) as u16;
+            let target = lo | (hi << 8);
+            let ret = cpu.pc - 1;
+            push(&cpu, &bus, (ret >> 8) as u8);
+            push(&cpu, &bus, (ret & 0xff) as u8);
+            cpu.pc = target;
+            6
+        }
+        0x4c => { cpu.pc = fetch16(&cpu, &bus); 3 }
+        0x6c => {
+            let ptr = fetch16(&cpu, &bus);
+            let lo = bus_read(&bus, ptr as i64) as u16;
+            let hi_addr = (ptr & 0xff00) | ((ptr + 1) & 0x00ff);
+            let hi = bus_read(&bus, hi_addr as i64) as u16;
+            cpu.pc = lo | (hi << 8);
+            5
+        }
+        0x60 => {
+            let lo = pull(&cpu, &bus) as u16;
+            let hi = pull(&cpu, &bus) as u16;
+            cpu.pc = (lo | (hi << 8)) + 1;
+            6
+        }
+        0x40 => {
+            let p = pull(&cpu, &bus);
+            cpu.p = (p & ~B_FLAG) | U_FLAG;
+            let lo = pull(&cpu, &bus) as u16;
+            let hi = pull(&cpu, &bus) as u16;
+            cpu.pc = lo | (hi << 8);
+            6
+        }
+
+        // --- undocumented: NOP families -----------------------------
+        0x1a | 0x3a | 0x5a | 0x7a | 0xda | 0xfa => 2,
+        0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 => { fetch(&cpu, &bus); 2 }
+        0x04 | 0x44 | 0x64 => { am_zp(&cpu, &bus); 3 }
+        0x14 | 0x34 | 0x54 | 0x74 | 0xd4 | 0xf4 => { am_zpx(&cpu, &bus); 4 }
+        0x0c => { am_abs(&cpu, &bus); 4 }
+        0x1c | 0x3c | 0x5c | 0x7c | 0xdc | 0xfc => {
+            let (_, p) = am_abx(&cpu, &bus);
+            if p { 5 } else { 4 }
+        }
+
+        // --- undocumented: LAX / SAX --------------------------------
+        0xa7 => { let a = am_zp(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); 3 }
+        0xb7 => { let a = am_zpy(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); 4 }
+        0xaf => { let a = am_abs(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); 4 }
+        0xbf => { let (a, p) = am_aby(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); if p { 5 } else { 4 } }
+        0xa3 => { let a = am_izx(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); 6 }
+        0xb3 => { let (a, p) = am_izy(&cpu, &bus); let v = bus_read(&bus, a); cpu.a = v; cpu.x = v; set_zn(&cpu, v); if p { 6 } else { 5 } }
+        0xab => { let v = fetch(&cpu, &bus); cpu.a = v; cpu.x = v; set_zn(&cpu, v); 2 }
+        0x87 => { let a = am_zp(&cpu, &bus); bus_write(&bus, a, cpu.a & cpu.x); 3 }
+        0x97 => { let a = am_zpy(&cpu, &bus); bus_write(&bus, a, cpu.a & cpu.x); 4 }
+        0x8f => { let a = am_abs(&cpu, &bus); bus_write(&bus, a, cpu.a & cpu.x); 4 }
+        0x83 => { let a = am_izx(&cpu, &bus); bus_write(&bus, a, cpu.a & cpu.x); 6 }
+
+        // --- undocumented: DCP (DEC then CMP) -----------------------
+        0xc7 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 5 }
+        0xd7 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 6 }
+        0xcf => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 6 }
+        0xdf => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 7 }
+        0xdb => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 7 }
+        0xc3 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 8 }
+        0xd3 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 5); let v = bus_read(&bus, a); op_cmp(&cpu, cpu.a, v); 8 }
+
+        // --- undocumented: ISC (INC then SBC) -----------------------
+        0xe7 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 5 }
+        0xf7 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 6 }
+        0xef => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 6 }
+        0xff => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 7 }
+        0xfb => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 7 }
+        0xe3 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 8 }
+        0xf3 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 4); let v = bus_read(&bus, a); op_sbc(&cpu, v); 8 }
+
+        // --- undocumented: SLO (ASL then ORA) -----------------------
+        0x07 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 5 }
+        0x17 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 6 }
+        0x0f => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 6 }
+        0x1f => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 7 }
+        0x1b => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 7 }
+        0x03 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 8 }
+        0x13 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 0); let v = bus_read(&bus, a); cpu.a = cpu.a | v; set_zn(&cpu, cpu.a); 8 }
+
+        // --- undocumented: RLA (ROL then AND) -----------------------
+        0x27 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 5 }
+        0x37 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 6 }
+        0x2f => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 6 }
+        0x3f => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 7 }
+        0x3b => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 7 }
+        0x23 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 8 }
+        0x33 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 2); let v = bus_read(&bus, a); cpu.a = cpu.a & v; set_zn(&cpu, cpu.a); 8 }
+
+        // --- undocumented: SRE (LSR then EOR) -----------------------
+        0x47 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 5 }
+        0x57 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 6 }
+        0x4f => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 6 }
+        0x5f => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 7 }
+        0x5b => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 7 }
+        0x43 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 8 }
+        0x53 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 1); let v = bus_read(&bus, a); cpu.a = cpu.a ^ v; set_zn(&cpu, cpu.a); 8 }
+
+        // --- undocumented: RRA (ROR then ADC) -----------------------
+        0x67 => { let a = am_zp(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 5 }
+        0x77 => { let a = am_zpx(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 6 }
+        0x6f => { let a = am_abs(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 6 }
+        0x7f => { let (a, _) = am_abx(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 7 }
+        0x7b => { let (a, _) = am_aby(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 7 }
+        0x63 => { let a = am_izx(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 8 }
+        0x73 => { let (a, _) = am_izy(&cpu, &bus); rmw(&cpu, &bus, a, 3); let v = bus_read(&bus, a); op_adc(&cpu, v); 8 }
+
+        // --- undocumented: immediate ALU ----------------------------
+        0x0b | 0x2b => { // ANC
+            let v = fetch(&cpu, &bus);
+            cpu.a = cpu.a & v;
+            set_zn(&cpu, cpu.a);
+            set_flag(&cpu, C_FLAG, (cpu.a & 0x80) != 0);
+            2
+        }
+        0x4b => { // ALR
+            let v = fetch(&cpu, &bus);
+            cpu.a = op_lsr(&cpu, cpu.a & v);
+            2
+        }
+        0x6b => { // ARR
+            let v = fetch(&cpu, &bus);
+            let t = cpu.a & v;
+            let c: u8 = if c_set(cpu) { 0x80 } else { 0 };
+            cpu.a = (t >> 1) | c;
+            set_zn(&cpu, cpu.a);
+            set_flag(&cpu, C_FLAG, (cpu.a & 0x40) != 0);
+            set_flag(&cpu, V_FLAG, (((cpu.a >> 6) ^ (cpu.a >> 5)) & 1) != 0);
+            2
+        }
+        0x8b => { // XAA: unstable, this is the common behaviour
+            let v = fetch(&cpu, &bus);
+            cpu.a = (cpu.a | 0xee) & cpu.x & v;
+            set_zn(&cpu, cpu.a);
+            2
+        }
+        0xcb => { // AXS
+            let v = fetch(&cpu, &bus) as i64;
+            let t = (cpu.a as i64) & (cpu.x as i64);
+            let r = t - v;
+            set_flag(&cpu, C_FLAG, r >= 0);
+            cpu.x = (r & 0xff) as u8;
+            set_zn(&cpu, cpu.x);
+            2
+        }
+
+        // --- undocumented: unstable stores --------------------------
+        0x9c => { // SHY
+            let (a, _) = am_abx(&cpu, &bus);
+            let hi = ((a >> 8) + 1) as u8;
+            bus_write(&bus, a, cpu.y & hi);
+            5
+        }
+        0x9e => { // SHX
+            let (a, _) = am_aby(&cpu, &bus);
+            let hi = ((a >> 8) + 1) as u8;
+            bus_write(&bus, a, cpu.x & hi);
+            5
+        }
+        0x9b => { // TAS
+            let (a, _) = am_aby(&cpu, &bus);
+            cpu.sp = cpu.a & cpu.x;
+            let hi = ((a >> 8) + 1) as u8;
+            bus_write(&bus, a, cpu.sp & hi);
+            5
+        }
+        0xbb => { // LAS
+            let (a, p) = am_aby(&cpu, &bus);
+            let v = bus_read(&bus, a) & cpu.sp;
+            cpu.a = v;
+            cpu.x = v;
+            cpu.sp = v;
+            set_zn(&cpu, v);
+            if p { 5 } else { 4 }
+        }
+        0x9f => { // AHX
+            let (a, _) = am_aby(&cpu, &bus);
+            let hi = ((a >> 8) + 1) as u8;
+            bus_write(&bus, a, cpu.a & cpu.x & hi);
+            5
+        }
+        0x93 => { // AHX (indirect)
+            let (a, _) = am_izy(&cpu, &bus);
+            let hi = ((a >> 8) + 1) as u8;
+            bus_write(&bus, a, cpu.a & cpu.x & hi);
+            6
+        }
+
+        // --- undocumented: JAM (the chip stops) ---------------------
+        0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72
+            | 0x92 | 0xb2 | 0xd2 | 0xf2 => {
+            jam(&cpu);
+            2
+        }
+
+        _ => {
+            // Unreachable: every 6502 opcode is above. A cartridge that
+            // manages it stops rather than running wild.
+            jam(&cpu);
+            2
+        }
+    }
+}

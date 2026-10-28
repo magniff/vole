@@ -1,0 +1,183 @@
+// apu.vl: the APU's register surface, its frame sequencer and the four
+// length counters. There is no sound yet: std has no audio device, so
+// the channels are not synthesised and the mixer is silent. What is here
+// is what a game can observe besides the missing sound — $4017's frame
+// counter, its four- or five-step mode, the frame IRQ (a handful of games,
+// mostly old arcade ports, wait on it), and the length counters, which
+// $4015 reports and several test ROMs use as a stopwatch. The DMC and its
+// IRQ are not modelled.
+
+// The frame sequencer's step times in CPU cycles. Step 6 wraps, and the
+// half-frame steps (1 and 4) clock the length counters. The 4-step
+// sequence raises its IRQ at step 3.
+const STEPS_4: [i64; 6] = [7457, 14913, 22371, 29828, 29829, 29830];
+const STEPS_5: [i64; 6] = [7457, 14913, 22371, 29829, 37281, 37282];
+
+const LENGTH_TABLE: [i64; 32] = [10, 254, 20, 2, 40, 4, 80, 6,
+    160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
+    192, 24, 72, 26, 16, 28, 32, 30];
+
+const LEN_BIT: [u8; 4] = [1, 2, 4, 8];
+
+pub struct Apu {
+    reg: [u8; 0x18],
+    // Cycles since the current step began, the step itself, and the
+    // number of whole sequences completed (the frame count a debugger
+    // can watch).
+    cycles: i64,
+    step: i64,
+    mode5: bool,
+    inhibit: bool,
+    frame_irq: bool,
+    frame_count: i64,
+    // Pulse 1, pulse 2, triangle, noise.
+    length: [i64; 4],
+    enabled: [bool; 4],
+    halt: [bool; 4],
+}
+
+pub fn apu_new() -> Apu {
+    Apu {
+        reg: [0; 0x18],
+        cycles: 0,
+        step: 0,
+        mode5: false,
+        inhibit: false,
+        frame_irq: false,
+        frame_count: 0,
+        length: [0; 4],
+        enabled: [false; 4],
+        halt: [false; 4],
+    }
+}
+
+fn step_time(mode5: bool, step: i64) -> i64 {
+    if mode5 { STEPS_5[step] } else { STEPS_4[step] }
+}
+
+impl Apu {
+    pub fn write(inout self, addr: i64, v: u8) {
+        if addr >= 0x4000 && addr <= 0x4013 {
+            self.reg[(addr - 0x4000) as i64] = v;
+            if addr == 0x4000 || addr == 0x4004 || addr == 0x400c {
+                let ch = if addr == 0x4000 { 0 } else if addr == 0x4004 { 1 } else { 3 };
+                self.halt[ch] = (v & 0x20) != 0;
+            } else if addr == 0x4008 {
+                // The triangle's halt bit is the linear counter's
+                // control flag, bit 7 rather than bit 5.
+                self.halt[2] = (v & 0x80) != 0;
+            }
+            if addr == 0x4003 || addr == 0x4007 || addr == 0x400b || addr == 0x400f {
+                let ch = (addr - 0x4003) / 4;
+                if self.enabled[ch] {
+                    self.length[ch] = LENGTH_TABLE[((v >> 3) & 0x1f) as i64];
+                }
+            }
+            return;
+        }
+        if addr == 0x4015 {
+            self.reg[0x15] = v;
+            for i in 0..4 {
+                let on = (v & LEN_BIT[i]) != 0;
+                if !on {
+                    // Clearing a channel's enable bit also empties its
+                    // length counter; setting it just allows the
+                    // counter to be loaded again.
+                    self.length[i] = 0;
+                }
+                self.enabled[i] = on;
+            }
+            self.frame_irq = false;
+            return;
+        }
+        if addr == 0x4017 {
+            self.mode5 = (v & 0x80) != 0;
+            self.inhibit = (v & 0x40) != 0;
+            self.cycles = 0;
+            self.step = 0;
+            if self.inhibit {
+                self.frame_irq = false;
+            }
+            if self.mode5 {
+                // Setting the mode bit clocks the half-frame units at
+                // once, which is how a game syncs the APU to vblank.
+                self.clock_half();
+            }
+            return;
+        }
+    }
+
+    pub fn read_status(inout self, addr: i64) -> u8 {
+        if addr == 0x4015 {
+            var s: u8 = 0;
+            for i in 0..4 {
+                if self.length[i] > 0 {
+                    s = s | LEN_BIT[i];
+                }
+            }
+            if self.frame_irq {
+                s = s | 0x40;
+            }
+            // Reading $4015 acknowledges the frame IRQ.
+            self.frame_irq = false;
+            return s;
+        }
+        0
+    }
+
+    // Half-frame clock: the length counters count down unless halted.
+    fn clock_half(inout self) {
+        for i in 0..4 {
+            if self.enabled[i] && !self.halt[i] && self.length[i] > 0 {
+                self.length[i] -= 1;
+            }
+        }
+    }
+
+    pub fn tick(inout self, cycles: i64) {
+        self.cycles += cycles;
+        loop {
+            if self.cycles < step_time(self.mode5, self.step) {
+                break;
+            }
+            if !self.mode5 && self.step == 3 && !self.inhibit {
+                self.frame_irq = true;
+            }
+            if self.step == 1 || self.step == 4 {
+                self.clock_half();
+            }
+            self.step += 1;
+            if self.step == 6 {
+                self.cycles -= step_time(self.mode5, 5);
+                self.step = 0;
+                self.frame_count += 1;
+            }
+        }
+    }
+
+    pub fn irq(self) -> bool {
+        self.frame_irq
+    }
+
+    pub fn ack_irq(inout self) {
+        self.frame_irq = false;
+    }
+
+    pub fn reset(inout self) {
+        for i in 0..0x18 {
+            self.reg[i] = 0;
+        }
+        for i in 0..4 {
+            self.length[i] = 0;
+            self.enabled[i] = false;
+            self.halt[i] = false;
+        }
+        // A reset acts as if $4017 had been written with $00.
+        self.cycles = 0;
+        self.step = 0;
+        self.mode5 = false;
+        self.inhibit = false;
+        self.frame_irq = false;
+        self.frame_count = 0;
+    }
+}

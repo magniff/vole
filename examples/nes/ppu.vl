@@ -1,0 +1,681 @@
+// ppu.vl: the 2C03 (NES PPU) — 256×240 of picture out of two pattern
+// tables, two nametables, 32 palette bytes and 64 sprites, at the
+// dot/scanline level: vblank and NMI at scanline 241, the pre-render
+// line's flag clear and scroll copy, sprite-0 hit and sprite overflow,
+// 8×16 sprites, left-column clipping, the odd-frame short line, and
+// per-scanline rendering so split screens (MMC3 IRQs, mid-frame
+// $2005/$2006 writes) land on the right line.
+//
+// It is a scanline renderer: the whole line is drawn at dot 0 from the
+// scroll registers, and the loopy `v` register is reloaded from `t`
+// there, because the per-tile increments the real chip makes while
+// drawing are not observable by a program that does not read $2006
+// mid-line. Background and sprite fetches are direct table lookups, not
+// a dot-by-dot fetch pattern, so sprite-0 hit timing inside a line, the
+// sprite overflow bug and the grey-dot column are not emulated; the
+// README says so.
+//
+// $2007's buffered read, palette mirroring, the write latch, the
+// increment by 1 or 32 and OAM access all behave as the chip's do.
+
+use cart::Cart;
+use rom::{MIRROR_FOUR, MIRROR_HORIZONTAL, MIRROR_SINGLE_HIGH, MIRROR_SINGLE_LOW,
+    MIRROR_VERTICAL};
+
+pub const W: i64 = 256;
+pub const H: i64 = 240;
+pub const PIXELS: i64 = W * H;
+
+const CTRL_NMI: u8 = 0x80;
+const CTRL_SPRITE_16: u8 = 0x20;
+const CTRL_BG_TABLE: u8 = 0x10;
+const CTRL_SPRITE_TABLE: u8 = 0x08;
+const MASK_GREY: u8 = 0x01;
+const MASK_BG_LEFT: u8 = 0x02;
+const MASK_SPRITE_LEFT: u8 = 0x04;
+const MASK_BG: u8 = 0x08;
+const MASK_SPRITES: u8 = 0x10;
+const STATUS_VBLANK: u8 = 0x80;
+const STATUS_SPRITE0: u8 = 0x40;
+const STATUS_OVERFLOW: u8 = 0x20;
+
+pub struct Ppu {
+    ctrl: u8,
+    mask: u8,
+    status: u8,
+    oam_addr: u8,
+    pub v: u16,
+    pub t: u16,
+    fine_x: u8,
+    w: bool,
+    read_buf: u8,
+    vram: Vec<u8>,
+    pub palette: [u8; 32],
+    pub oam: [u8; 256],
+    pub dot: i64,
+    pub scanline: i64,
+    pub frame: i64,
+    pub frame_ready: bool,
+    pub nmi_pending: bool,
+    pub nmi_enabled_last: bool,
+    pub odd: bool,
+    pub frames_done: i64,
+    pub chr_writes: i64,
+    // Set by a $2002 read on the dot the VBL flag is about to be set:
+    // the flag is not raised this frame (and no NMI with it).
+    vbl_suppress: bool,
+    // The mask as it stood one dot ago: the rendering-on decision for
+    // the short pre-render line reads the latch, not the write that
+    // landed on dot 339, so a $2001 write there comes too late.
+    mask_prev: u8,
+    // Dots left in the cycle after the flag is raised, during which a
+    // $2002 read still suppresses the NMI (but reads the flag set).
+    pub nmi_squelch: i64,
+    // Instructions to wait before serving an NMI that was raised by
+    // enabling $2000 while the VBL flag was already set.
+    pub nmi_delay: i64,
+    // PPU dots since the NMI was raised: the CPU only takes it at a
+    // boundary at least three dots later, as it samples the line
+    // before an instruction's last cycle.
+    pub nmi_age: i64,
+    // MMC3's A12 input: the address bit the PPU drives, and how many
+    // dots it has been low (an edge after only a short low pulse is
+    // ignored by the chip's filter).
+    a12: bool,
+    a12_low: i64,
+    // The 256×240 picture, one BGRA word per pixel, so an access on the
+    // bus can advance the PPU its three dots without every caller
+    // threading the buffer through.
+    pub fb: Vec<u32>,
+}
+
+pub fn ppu_new(gpa: Gpa) -> Ppu {
+    var vram: Vec<u8> = Vec::new_in(gpa);
+    for _ in 0..4096 {
+        vram.push(0);
+    }
+    var fb: Vec<u32> = Vec::new_in(gpa);
+    for _ in 0..PIXELS {
+        fb.push(0xff1c1c1c);
+    }
+    Ppu {
+        ctrl: 0,
+        mask: 0,
+        status: 0,
+        oam_addr: 0,
+        v: 0,
+        t: 0,
+        fine_x: 0,
+        w: false,
+        read_buf: 0,
+        vram: vram,
+        palette: [0; 32],
+        oam: [0; 256],
+        dot: 0,
+        scanline: 261,
+        frame: 0,
+        frame_ready: false,
+        nmi_pending: false,
+        nmi_enabled_last: false,
+        odd: false,
+        frames_done: 0,
+        chr_writes: 0,
+        vbl_suppress: false,
+        mask_prev: 0,
+        nmi_squelch: 0,
+        nmi_delay: 0,
+        nmi_age: 0,
+        a12: false,
+        a12_low: 0,
+        fb: fb,
+    }
+}
+
+fn ppu_off(addr: i64, mirroring: i64) -> i64 {
+    let off = addr - 0x2000;
+    let table = off / 0x400;
+    let rest = off % 0x400;
+    var phys = table;
+    if mirroring == MIRROR_HORIZONTAL {
+        phys = if table >= 2 { 1 } else { 0 };
+    } else if mirroring == MIRROR_VERTICAL {
+        phys = table & 1;
+    } else if mirroring == MIRROR_SINGLE_LOW {
+        phys = 0;
+    } else if mirroring == MIRROR_SINGLE_HIGH {
+        phys = 1;
+    } else if mirroring == MIRROR_FOUR {
+        phys = table & 3;
+    }
+    phys * 0x400 + rest
+}
+
+fn addr_read(ppu: Ppu, cart: Cart, addr: i64) -> u8 {
+    let a = addr & 0x3fff;
+    if a < 0x2000 {
+        return cart.ppu_read(a);
+    }
+    if a < 0x3f00 {
+        return ppu.vram[ppu_off(a, cart.mirroring())];
+    }
+    ppu.palette[pal_idx(a)]
+}
+
+fn pal_idx(addr: i64) -> i64 {
+    var i = (addr - 0x3f00) & 0x1f;
+    if (i & 0x13) == 0x10 {
+        i = i & 0x0f;
+    }
+    i
+}
+
+fn addr_write(ppu: inout Ppu, cart: inout Cart, addr: i64, v: u8) {
+    let a = addr & 0x3fff;
+    if a < 0x2000 {
+        ppu.chr_writes += 1;
+        cart.ppu_write(a, v);
+        return;
+    }
+    if a < 0x3f00 {
+        let i = ppu_off(a, cart.mirroring());
+        ppu.vram[i] = v;
+        return;
+    }
+    ppu.palette[pal_idx(a)] = v & 0x3f;
+}
+
+// A palette index to a pixel: the 2C02's colours, then greyscale and
+// the three emphasis bits (which darken the other channels).
+fn colour(idx: u8) -> u32 {
+    let i = (idx & 0x3f) as i64;
+    let c = PALETTE[i];
+    let r = (c >> 16) & 0xff;
+    let g = (c >> 8) & 0xff;
+    let b = c & 0xff;
+    r | (g << 8) | (b << 16) | (0xff << 24)
+}
+
+fn shade(px: u32, mask: u8) -> u32 {
+    let e = mask & 0xe0;
+    if e == 0 {
+        return px;
+    }
+    var r = (px & 0xff) as i64;
+    var g = ((px >> 8) & 0xff) as i64;
+    var b = ((px >> 16) & 0xff) as i64;
+    if (e & 0x20) != 0 {
+        r = r * 3 / 4;
+    }
+    if (e & 0x40) != 0 {
+        g = g * 3 / 4;
+    }
+    if (e & 0x80) != 0 {
+        b = b * 3 / 4;
+    }
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | (0xff << 24)
+}
+
+fn pixel_colour(ppu: Ppu, idx: u8) -> u32 {
+    var i = idx;
+    if (ppu.mask & MASK_GREY) != 0 {
+        i = i & 0x30;
+    }
+    if i != 0 {
+        i = ppu.palette[(i & 0x1f) as i64] & 0x3f;
+    } else {
+        i = ppu.palette[0] & 0x3f;
+    }
+    shade(colour(i), ppu.mask)
+}
+
+// --- the frame, one dot at a time -------------------------------------
+
+// The PPU's dot counter runs two dots ahead of the point where the CPU
+// samples the bus (a bus access ticks three dots and reads on the last
+// one), so the fetch windows below are offset by that much. The MMC3
+// test ROMs pin the phase to the dot, so this is measured, not chosen.
+const A12_PHASE: i64 = 2;
+
+// The A12 line the PPU drives at this dot. While the picture is being
+// fetched, that is the pattern-table bit of the current fetch: two
+// idle fetches, then the low and high pattern bytes, so a pattern
+// table at $1000 raises A12 for the four dots of the pattern reads in
+// each 8-dot tile, in each sprite's slot, and in the two-tile
+// pre-fetch at the end of the line. At every other time the bus holds
+// what the CPU last put in v ($2006/$2007).
+fn a12_dot(ppu: Ppu) -> bool {
+    let rendering = (ppu.mask & (MASK_BG | MASK_SPRITES)) != 0;
+    if rendering && (ppu.scanline < 240 || ppu.scanline == 261) {
+        let d = ppu.dot - A12_PHASE;
+        if d >= 1 && d <= 256 {
+            return ((d - 1) % 8) >= 4 && (ppu.ctrl & CTRL_BG_TABLE) != 0;
+        }
+        if d >= 257 && d <= 320 {
+            return ((d - 257) % 8) >= 4 && (ppu.ctrl & CTRL_SPRITE_TABLE) != 0;
+        }
+        if d >= 321 && d <= 336 {
+            return ((d - 321) % 8) >= 4 && (ppu.ctrl & CTRL_BG_TABLE) != 0;
+        }
+        return false;
+    }
+    (ppu.v & 0x1000) != 0
+}
+
+// MMC3 accepts a rising edge of A12 only after it has been low for
+// three CPU cycles (nine PPU dots). The comparator samples one dot
+// later than that, so ten dots is what the chip's filter amounts to:
+// the nine-dot gap between the two pre-fetch tiles' pattern reads and
+// the next line's first tile is rejected, which is what leaves one
+// clock per line at the pre-fetch. A longer low (the sprite fetches of
+// a $0000 sprite table, or vblank) is accepted, so a sprite-$1000 game
+// clocks at dot 263 and a background-$1000 game at dot 327.
+fn a12_track(ppu: inout Ppu, cart: inout Cart, high: bool) {
+    if high {
+        if !ppu.a12 && ppu.a12_low > 9 {
+            cart.clock_a12();
+        }
+        ppu.a12_low = 0;
+    } else {
+        ppu.a12_low += 1;
+    }
+    ppu.a12 = high;
+}
+
+pub fn ppu_run(ppu: inout Ppu, cart: inout Cart, dots: i64) {
+    var n = dots;
+    while n > 0 {
+        ppu_dot(&ppu, &cart);
+        n -= 1;
+    }
+}
+
+fn ppu_dot(ppu: inout Ppu, cart: inout Cart) {
+    let line = ppu.scanline;
+    let dot = ppu.dot;
+    let rendering = (ppu.mask & (MASK_BG | MASK_SPRITES)) != 0;
+    let high = a12_dot(ppu);
+    a12_track(&ppu, &cart, high);
+    if line < 240 && dot == 0 {
+        // With rendering off, v holds what the CPU set and the picture
+        // is the backdrop; the reload from t is a rendering-time copy.
+        if rendering {
+            ppu.v = ppu.t;
+        }
+        render_line(&ppu, cart, line);
+    }
+    if line == 241 && dot == 1 {
+        if ppu.vbl_suppress {
+            // A $2002 read landed on this dot: the flag is never set,
+            // and the NMI that would have come with it is lost too.
+            ppu.vbl_suppress = false;
+        } else {
+            ppu.status = ppu.status | STATUS_VBLANK;
+            if (ppu.ctrl & CTRL_NMI) != 0 {
+                ppu.nmi_pending = true;
+                ppu.nmi_delay = 0;
+                ppu.nmi_age = 0;
+            }
+            ppu.nmi_squelch = 3;
+        }
+    }
+    if line == 261 && dot == 1 {
+        ppu.status = ppu.status & ~(STATUS_VBLANK | STATUS_SPRITE0 | STATUS_OVERFLOW);
+        ppu.vbl_suppress = false;
+    }
+    if rendering && line == 261 && dot >= 280 && dot <= 304 {
+        // vertical bits: coarse Y, fine Y, nametable select
+        ppu.v = (ppu.t & 0x7be0) | (ppu.v & 0x041f);
+    }
+    if rendering && dot == 257 {
+        // horizontal bits: coarse X, fine X, nametable X
+        ppu.v = (ppu.t & 0x041f) | (ppu.v & 0x7be0);
+    }
+    if line == 261 && dot == 339 && (ppu.mask_prev & (MASK_BG | MASK_SPRITES)) != 0 && ppu.odd {
+        // The short pre-render line of an odd frame: the chip jumps
+        // from (339,261) straight to (0,0), so dot 340 is never
+        // reached. Rendering is sampled on dot 339, not 340, so a
+        // $2001 write on dot 340 comes too late to skip the tick.
+        ppu.dot = 0;
+        ppu.scanline = 0;
+        ppu.frame += 1;
+        ppu.frames_done += 1;
+        ppu.odd = !ppu.odd;
+        ppu.frame_ready = true;
+        return;
+    }
+    if ppu.nmi_squelch > 0 {
+        ppu.nmi_squelch -= 1;
+    }
+    ppu.nmi_age += 1;
+    ppu.mask_prev = ppu.mask;
+    ppu.dot += 1;
+    if ppu.dot > 340 {
+        ppu.dot = 0;
+        ppu.scanline += 1;
+        if ppu.scanline > 261 {
+            ppu.scanline = 0;
+            ppu.frame += 1;
+            ppu.frames_done += 1;
+            ppu.odd = !ppu.odd;
+            ppu.frame_ready = true;
+        }
+    }
+}
+
+fn render_line(ppu: inout Ppu, cart: Cart, line: i64) {
+    let backdrop = pixel_colour(ppu, 0);
+    for x in 0..W {
+        ppu.fb[line * W + x] = backdrop;
+    }
+    if (ppu.mask & (MASK_BG | MASK_SPRITES)) == 0 {
+        return;
+    }
+    var bg: [u8; 256] = [0; 256];
+    if (ppu.mask & MASK_BG) != 0 {
+        render_bg(ppu, cart, &bg, line);
+    }
+    var px: [u8; 256] = [0; 256];
+    for x in 0..W {
+        px[x] = bg[x];
+    }
+    if (ppu.mask & MASK_SPRITES) != 0 {
+        render_sprites(&ppu, cart, &px, bg, line);
+    }
+    for x in 0..W {
+        let c = pixel_colour(ppu, px[x]);
+        ppu.fb[line * W + x] = c;
+    }
+}
+
+// The eight pattern bytes a tile contributes, as two bit planes.
+fn tile_bits(cart: Cart, table: i64, tile: u8, row: i64) -> (u8, u8) {
+    let addr = table + (tile as i64) * 16 + row;
+    (cart.ppu_read(addr), cart.ppu_read(addr + 8))
+}
+
+fn render_bg(ppu: Ppu, cart: Cart, bg: inout [u8; 256], line: i64) {
+    let base_nt = ((ppu.v >> 10) & 3) as i64;
+    let coarse_y = ((ppu.v >> 5) & 31) as i64;
+    let coarse_x = (ppu.v & 31) as i64;
+    let fine_y = ((ppu.v >> 12) & 7) as i64;
+    let fine_x = ppu.fine_x as i64;
+    let table = if (ppu.ctrl & CTRL_BG_TABLE) != 0 { 0x1000 } else { 0 };
+    let clip = (ppu.mask & MASK_BG_LEFT) == 0;
+    for x in 0..W {
+        if clip && x < 8 {
+            bg[x] = 0;
+            continue;
+        }
+        let sx = x + fine_x;
+        var col = coarse_x + (sx >> 3);
+        var ntx = 0;
+        while col >= 32 {
+            col -= 32;
+            ntx += 1;
+        }
+        var row = coarse_y + ((fine_y + line) >> 3);
+        var nty = 0;
+        while row >= 30 {
+            row -= 30;
+            nty += 1;
+        }
+        let nt = base_nt ^ (ntx & 1) ^ ((nty & 1) << 1);
+        let nt_addr = 0x2000 + nt * 0x400;
+        let tile = addr_read(ppu, cart, nt_addr + row * 32 + col);
+        let attr = addr_read(ppu, cart, nt_addr + 0x3c0 + (row / 4) * 8 + (col / 4));
+        let shift = ((row & 2) << 1) | (col & 2);
+        let pal = ((attr >> shift) & 3) as i64;
+        let (lo, hi) = tile_bits(cart, table, tile, (fine_y + line) & 7);
+        let bit = 7 - (sx & 7);
+        let ci = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+        if ci != 0 {
+            bg[x] = (pal * 4 + ci as i64) as u8;
+        } else {
+            bg[x] = 0;
+        }
+    }
+}
+
+fn render_sprites(ppu: inout Ppu, cart: Cart, px: inout [u8; 256],
+    bg: [u8; 256], line: i64) {
+    let tall = (ppu.ctrl & CTRL_SPRITE_16) != 0;
+    let height = if tall { 16 } else { 8 };
+    let clip = (ppu.mask & MASK_SPRITE_LEFT) == 0;
+    var on: [i64; 8] = [0; 8];
+    var count = 0;
+    for i in 0..64 {
+        let y = ppu.oam[i * 4] as i64;
+        let row = line - (y + 1);
+        if row >= 0 && row < height {
+            if count < 8 {
+                on[count] = i;
+            }
+            count += 1;
+        }
+    }
+    if count > 8 {
+        ppu.status = ppu.status | STATUS_OVERFLOW;
+        count = 8;
+    }
+    // Which pixels a sprite has already painted: the lowest OAM index
+    // wins where two sprites overlap.
+    var painted: [u8; 256] = [0; 256];
+    for k in 0..count {
+        let i = on[k];
+        let y = ppu.oam[i * 4] as i64;
+        var row = line - (y + 1);
+        let tile = ppu.oam[i * 4 + 1];
+        let attr = ppu.oam[i * 4 + 2];
+        let sx = ppu.oam[i * 4 + 3] as i64;
+        if (attr & 0x80) != 0 {
+            row = height - 1 - row;
+        }
+        var table = if (ppu.ctrl & CTRL_SPRITE_TABLE) != 0 { 0x1000 } else { 0 };
+        var t = tile;
+        if tall {
+            table = if (tile & 1) != 0 { 0x1000 } else { 0 };
+            t = tile & 0xfe;
+            if row >= 8 {
+                t = t + 1;
+                row = row - 8;
+            }
+        }
+        let (lo, hi) = tile_bits(cart, table, t, row);
+        let pal = 0x10 + (attr & 3) as i64 * 4;
+        let behind = (attr & 0x20) != 0;
+        for j in 0..8 {
+            var cx = sx + j;
+            if (attr & 0x40) != 0 {
+                cx = sx + 7 - j;
+            }
+            if cx < 0 || cx >= W {
+                continue;
+            }
+            if clip && cx < 8 {
+                continue;
+            }
+            let xi = cx;
+            let bit = 7 - (j & 7);
+            let ci = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+            if ci == 0 {
+                continue;
+            }
+            if i == 0 && bg[xi] != 0 && xi != 255 && (ppu.mask & MASK_BG) != 0 {
+                ppu.status = ppu.status | STATUS_SPRITE0;
+            }
+            if painted[xi] != 0 {
+                continue;
+            }
+            if behind && bg[xi] != 0 {
+                continue;
+            }
+            px[xi] = (pal + ci as i64) as u8;
+            painted[xi] = 1;
+        }
+    }
+}
+
+// --- the CPU's side: $2000-$2007 --------------------------------------
+
+pub fn ppu_read_reg(ppu: inout Ppu, cart: inout Cart, reg: i64) -> u8 {
+    if reg == 2 {
+        let s = ppu.status;
+        // A read on the dot the VBL flag is about to be raised makes the
+        // flag never appear (and silences the NMI); a read in the same
+        // cycle just after it still reads the flag but suppresses NMI.
+        if ppu.scanline == 241 && ppu.dot == 1 && (ppu.status & STATUS_VBLANK) == 0 {
+            ppu.vbl_suppress = true;
+        }
+        if ppu.nmi_squelch > 0 {
+            ppu.nmi_pending = false;
+        }
+        ppu.status = ppu.status & ~STATUS_VBLANK;
+        ppu.w = false;
+        return s;
+    }
+    if reg == 4 {
+        return ppu.oam[ppu.oam_addr as i64];
+    }
+    if reg == 7 {
+        let addr = (ppu.v & 0x3fff) as i64;
+        let inc = if (ppu.ctrl & 4) != 0 { 32 } else { 1 };
+        if addr >= 0x3f00 {
+            let data = ppu.palette[pal_idx(addr)];
+            ppu.read_buf = addr_read(ppu, cart, addr - 0x1000);
+            ppu.v = ppu.v + inc as u16;
+            return data;
+        }
+        let data = ppu.read_buf;
+        ppu.read_buf = addr_read(ppu, cart, addr);
+        ppu.v = ppu.v + inc as u16;
+        return data;
+    }
+    0
+}
+
+pub fn ppu_write_reg(ppu: inout Ppu, cart: inout Cart, reg: i64, val: u8) {
+    if reg == 0 {
+        let was = ppu.ctrl & CTRL_NMI;
+        ppu.ctrl = val;
+        ppu.t = (ppu.t & 0xf3ff) | (((val & 3) as u16) << 10);
+        if was != 0 && (val & CTRL_NMI) == 0 && ppu.nmi_age < 3 {
+            // Turning NMI off in the three dots after the flag was
+            // raised takes the line back down before the CPU latches it.
+            ppu.nmi_pending = false;
+        }
+        if was == 0 && (val & CTRL_NMI) != 0 && (ppu.status & STATUS_VBLANK) != 0
+            && !(ppu.scanline == 261 && ppu.dot == 1) {
+            // Enabling NMI while the flag is already up: the console
+            // serves it after the instruction that follows this write.
+            // A write on the dot the flag clears sees the clear instead.
+            ppu.nmi_pending = true;
+            ppu.nmi_delay = 1;
+            ppu.nmi_age = 0;
+        }
+        return;
+    }
+    if reg == 1 {
+        ppu.mask = val;
+        return;
+    }
+    if reg == 3 {
+        ppu.oam_addr = val;
+        return;
+    }
+    if reg == 4 {
+        ppu.oam[ppu.oam_addr as i64] = val;
+        ppu.oam_addr = ppu.oam_addr + 1;
+        return;
+    }
+    if reg == 5 {
+        if !ppu.w {
+            ppu.fine_x = val & 7;
+            ppu.t = (ppu.t & 0x7fe0) | ((val as u16) >> 3);
+            ppu.w = true;
+        } else {
+            ppu.t = (ppu.t & 0x0c1f) | (((val & 7) as u16) << 12) | (((val as u16) & 0xf8) << 2);
+            ppu.w = false;
+        }
+        return;
+    }
+    if reg == 6 {
+        if !ppu.w {
+            ppu.t = (ppu.t & 0x00ff) | (((val & 0x3f) as u16) << 8);
+            ppu.w = true;
+        } else {
+            ppu.t = (ppu.t & 0xff00) | (val as u16);
+            ppu.v = ppu.t;
+            ppu.w = false;
+        }
+        return;
+    }
+    if reg == 7 {
+        addr_write(&ppu, &cart, (ppu.v & 0x3fff) as i64, val);
+        let inc = if (ppu.ctrl & 4) != 0 { 32 } else { 1 };
+        ppu.v = ppu.v + inc as u16;
+        return;
+    }
+}
+
+pub fn ppu_oam_dma(ppu: inout Ppu, bytes: [u8]) {
+    for i in 0..256 {
+        ppu.oam[(ppu.oam_addr as i64 + i) & 0xff] = bytes[i];
+    }
+}
+
+// A raw look at the first nametable, for `--state`.
+impl Ppu {
+    pub fn nametable_byte(self, i: i64) -> u8 {
+        self.vram[i]
+    }
+}
+
+pub fn ppu_take_nmi(ppu: inout Ppu) -> bool {
+    if ppu.nmi_pending {
+        ppu.nmi_pending = false;
+        true
+    } else {
+        false
+    }
+}
+
+// A reset (not power-on): registers off, the frame starts at the
+// pre-render line, VRAM/OAM/palette keep what they held.
+pub fn ppu_reset(ppu: inout Ppu) {
+    ppu.ctrl = 0;
+    ppu.mask = 0;
+    ppu.status = 0;
+    ppu.oam_addr = 0;
+    ppu.v = 0;
+    ppu.t = 0;
+    ppu.fine_x = 0;
+    ppu.w = false;
+    ppu.read_buf = 0;
+    ppu.dot = 0;
+    ppu.scanline = 261;
+    ppu.frame_ready = false;
+    ppu.nmi_pending = false;
+    ppu.odd = false;
+    ppu.vbl_suppress = false;
+    ppu.mask_prev = 0;
+    ppu.nmi_squelch = 0;
+    ppu.nmi_delay = 0;
+    ppu.nmi_age = 0;
+    ppu.a12 = false;
+    ppu.a12_low = 0;
+}
+
+
+// The 2C02's palette, the RGB approximations the NESdev wiki records.
+const PALETTE: [u32; 64] = [
+    0x7c7c7c, 0x0000fc, 0x0000bc, 0x4428bc, 0x940084, 0xa80020, 0xa81000, 0x881400,
+    0x503000, 0x007800, 0x006800, 0x005800, 0x004058, 0x000000, 0x000000, 0x000000,
+    0xbcbcbc, 0x0078f8, 0x0058f8, 0x6844fc, 0xd800cc, 0xe40058, 0xf83800, 0xe45c10,
+    0xac7c00, 0x00b800, 0x00a800, 0x00a844, 0x008888, 0x000000, 0x000000, 0x000000,
+    0xf8f8f8, 0x3cbcfc, 0x6888fc, 0x9878f8, 0xf878f8, 0xf85898, 0xf87858, 0xfca044,
+    0xf8b800, 0xb8f818, 0x58d854, 0x58f898, 0x00e8d8, 0x787878, 0x000000, 0x000000,
+    0xfcfcfc, 0xa4e4fc, 0xb8b8f8, 0xd8b8f8, 0xf8b8f8, 0xf8a4c0, 0xf0d0b0, 0xfce0a8,
+    0xf8d878, 0xd8f878, 0xb8f8b8, 0xb8f8d8, 0x00fcfc, 0xf8d8f8, 0x000000, 0x000000,
+];
+
+
