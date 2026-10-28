@@ -986,7 +986,11 @@ while read -r name file; do
     mkdir -p "$dir"
     read_directives "$file" "$dir"
     read -r _ <&3
-    ( run_case "$file" "$dir"; echo >&3 ) &
+    # (0.25.2) The job gives its slot back however it ends (a trap: its
+    # end, an exit in it, a signal), as every runner's jobs do: a slot
+    # lost with a killed job left a release gate waiting for 2.5 hours.
+    # (A job killed with -9 still loses it; the gate reports the stall.)
+    ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; run_case "$file" "$dir" ) &
 done <"$CASES"
 wait
 exec 3>&-

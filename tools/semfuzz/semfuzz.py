@@ -39,10 +39,13 @@ Exit status: 0 when every program behaved as expected.
 """
 
 import argparse
+import atexit
 import concurrent.futures
 import os
 import random
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -3369,23 +3372,57 @@ class Slots:
     def __init__(self, jobs):
         self.fd = None
         js = os.environ.get('VOLE_JOBSERVER')
+        self.held = 0
+        self.dying = False
+        self.lock = threading.Lock()
         if jobs is None and js and os.path.exists(js):
             self.fd = os.open(js, os.O_RDWR)
             self.n = os.cpu_count() or 4
+            # (0.25.2) the slots held go back however this ends: killed
+            # (TERM, HUP, INT) or at exit; a slot lost with a killed
+            # runner once left a gate waiting for hours. A slot is taken
+            # and counted under the lock, without blocking (a thread
+            # blocked reading would take a slot given back as it dies).
+            os.set_blocking(self.fd, False)
+            atexit.register(self.give_back)
+            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(sig, self.killed)
         else:
             self.n = jobs or os.cpu_count() or 4
         self.sem = threading.Semaphore(self.n)
 
+    def give_back(self):
+        with self.lock:
+            n, self.held, self.dying = self.held, 0, True
+            if n and self.fd is not None:
+                os.write(self.fd, b'\n' * n)
+
+    def killed(self, signum, frame):
+        self.give_back()
+        os._exit(128 + signum)
+
     def __enter__(self):
         if self.fd is not None:
-            while os.read(self.fd, 1) != b'\n':
-                pass
+            while True:
+                with self.lock:
+                    if not self.dying:
+                        try:
+                            got = os.read(self.fd, 1) == b'\n'
+                        except BlockingIOError:
+                            got = False
+                        if got:
+                            self.held += 1
+                            return
+                select.select([self.fd], [], [], 0.5)
         else:
             self.sem.acquire()
 
     def __exit__(self, *a):
         if self.fd is not None:
-            os.write(self.fd, b'\n')
+            with self.lock:
+                if self.held > 0:
+                    self.held -= 1
+                    os.write(self.fd, b'\n')
         else:
             self.sem.release()
 

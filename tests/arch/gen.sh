@@ -162,7 +162,7 @@ for p in $programs; do
             [ "$t" = - ] && t=""
             n=$((n + 1))
             read -r _ <&3
-            ( build "$p" "$o" "$t" >"$OUT/result.$n"; echo >&3 ) &
+            ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; build "$p" "$o" "$t" >"$OUT/result.$n" ) &
         done
     done
 done

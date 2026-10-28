@@ -160,7 +160,7 @@ n=0
 run() { # <file> <level> <env> <threads>
     n=$((n + 1))
     read -r _ <&3
-    ( check "$1" "$2" "$3" "$4" "$n" >"$WORK/$n.result"; echo >&3 ) &
+    ( trap 'echo >&3' EXIT; trap 'exit 1' HUP INT TERM; check "$1" "$2" "$3" "$4" "$n" >"$WORK/$n.result" ) &
 }
 while read -r f; do
     for o in 0 1 2; do

@@ -25,6 +25,14 @@
 #                  the chain
 #   --all-levels   run the test suite at -O0, -O1 and -O2 (else at the
 #                  default level)
+#   --levels=L,L   run the test suite at these levels (bootstrap/gate.sh:
+#                  0,2; 0.25.2: -O1 is left to macOS, the optimizer being
+#                  the same for every target)
+#   --smoke        (0.25.2) only the smoke-* checks of bootstrap/gate.sh
+#                  (its --quick's linux-smoke row): the runner's own
+#                  checks, the language server, the examples' builds,
+#                  every case at -O2, the walkthroughs and the book; a
+#                  few minutes
 #   --fuzz=N       also run N random programs in each mode of the
 #                  generator (tests/fuzz/run.sh)
 #   --abi=N        also run N C interoperability programs (tests/abi/run.sh),
@@ -54,6 +62,8 @@ IMAGE=vole-check:linux-aarch64
 PLATFORM=linux/arm64
 WORKTREE=0
 ALL_LEVELS=0
+LEVELS=""
+SMOKE=0
 FUZZ=0
 ABI=0
 OBJCHECK=0
@@ -89,6 +99,8 @@ for arg in "$@"; do
         --worktree) WORKTREE=1; rest="$rest --worktree" ;;
         --dev) WORKTREE=1; rest="$rest --dev" ;;
         --all-levels) ALL_LEVELS=1 ;;
+        --levels=*) LEVELS=${arg#--levels=} ;;
+        --smoke) SMOKE=1 ;;
         --fuzz=*) FUZZ=${arg#--fuzz=} ;;
         --abi=*) ABI=${arg#--abi=} ;;
         --objcheck) OBJCHECK=1 ;;
@@ -103,12 +115,14 @@ for arg in "$@"; do
         --compiler) want=compiler ;;
         --compiler=*) COMPILER=${arg#--compiler=} ;;
         --rebuild-image) REBUILD_IMAGE=1 ;;
-        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
 eval "set -- $rest"
 case "$CPUS" in ''|*[!0-9]*|0) die "--cpus needs a number" ;; esac
+case "$LEVELS" in *[!0-2,]*) die "--levels takes levels 0, 1 and 2, comma-separated" ;; esac
+[ "$SMOKE" = 0 ] || ONLY='smoke-*'
 
 command -v docker >/dev/null 2>&1 || die "docker not found"
 command -v git >/dev/null 2>&1 || die "git not found"
@@ -139,7 +153,7 @@ ensure_image "$IMAGE" "$PLATFORM" "$ROOT/bootstrap/ci/linux-aarch64.Dockerfile"
 
 echo "==> on aarch64-linux, in the container ($CPUS CPUs)" >&2
 tar -C "$SNAP" -c -f - src volec.o | docker run --rm -i --name "$CONTAINER" --cpus "$CPUS" --platform "$PLATFORM" \
-    -e CPUS="$CPUS" -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e OBJCHECK="$OBJCHECK" \
+    -e CPUS="$CPUS" -e ALL_LEVELS="$ALL_LEVELS" -e LEVELS="$LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e OBJCHECK="$OBJCHECK" \
     -e DEBUGGER="$DEBUGGER" -e VALGRIND="$VALGRIND" -e ONLY="$ONLY" \
     -e SLICE="$SLICE" -e SLICE_LEVELS="$SLICE_LEVELS" "$IMAGE" sh -c '
     set -eu
@@ -195,6 +209,7 @@ tar -C "$SNAP" -c -f - src volec.o | docker run --rm -i --name "$CONTAINER" --cp
     # The checks, at once.
     steps=suite-O2
     [ "$ALL_LEVELS" = 1 ] && steps="suite-O*"
+    [ -z "$LEVELS" ] || steps=$(echo "$LEVELS" | tr "," "\n" | sed "s/^/suite-O/" | paste -s -d, -)
     # (no seed here: it has no aarch64-linux backend)
     [ "$FUZZ" != 0 ] && steps="$steps,fuzz-plain,fuzz-loops,fuzz-generics,fuzz-pressure,fuzz-calls,fuzz-lang06,fuzz-vector,fuzz-div,fuzz-range,fuzz-arch"
     [ "$ABI" != 0 ] && steps="$steps,abi-*,layout"

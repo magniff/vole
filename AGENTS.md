@@ -102,8 +102,12 @@ never the whole suite or a gate unless its task says so**:
    same plan in the aarch64-linux container too (colima must run).
 3. **Per merge batch (integrator):** after merging the batch into the
    integration branch, one `tests/run.sh` and one `bootstrap/gate.sh
-   --quick` (the chain, the suite at -O2, a short fuzz in every mode),
-   and `bootstrap/bootstrap.sh --dev` there, which installs a tested
+   --quick` (the chain, the suite at -O2, a short fuzz in every mode,
+   and the `linux-smoke` row: the compiler cross-built for
+   aarch64-linux and, in the container, the runner's checks, the LSP,
+   the examples' builds, every case, the walkthroughs and the book;
+   `SKIP`, not pass, when colima is not running: `colima start`), and
+   `bootstrap/bootstrap.sh --dev` there, which installs a tested
    `target/tools/volec`.
 4. **A release:** one `bootstrap/gate.sh --release`, then `gate.sh
    --only bench` on an idle machine ([docs/releases.md](docs/releases.md),
@@ -143,8 +147,11 @@ alone (`tests/run.sh =NAME`) before calling it load or inherited.
   answered item by item with the command or count that shows it (e.g.
   "argv uses in compiler/src: 0, `volec query refs arg_at --count`").
 - **Mind the machine:** at most five agents build and test the compiler
-  at once, and one gate runs at a time; under heavy load, timing results
-  are not evidence (the runner SKIPs time budgets with the load).
+  at once, and one gate runs at a time: `gate.sh` takes a lock for all
+  worktrees and a second gate waits, saying whose gate runs (`--no-wait`
+  fails instead; `bootstrap.sh --dev` and `tests/run.sh` take none).
+  Under heavy load, timing results are not evidence (the runner SKIPs
+  time budgets with the load).
 
 ## Conventions
 
