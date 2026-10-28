@@ -59,8 +59,78 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
 | 0.25.0 | `v0.25.0` | 0.24.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | compile speed (the resolve scans, a line index, the lexer, data as bytes, the assembler, `ld` run directly, an in-house Mach-O linker by default on aarch64-macos: the -O0 self-compile and `check` near half the instructions, a hello world linked 4 times faster) and a semantics audit (five red-team audits, about 1,600 probes kept as tests, a value-semantics fuzzer as the gate's `fuzz-sem`; about 30 families of soundness bugs of released versions fixed: views, exclusivity, drops, threads, the optimizer); the Vole Book (book/, every example checked); std::cli across the examples; `#[link]` and `-framework`; every name resolved in the language server; the chain rebuilt from the seed and checked against recorded hashes (`chain-fresh`, `chain-diverse`) |
 | 0.25.1 | `v0.25.1` | 0.25.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | one standard style, applied to the whole tree: `volec fmt` groups imports (`std`, `crate`, the rest) and writes trailing commas in lists whose closing bracket starts a line; docs/style.md, `guide fmt` |
+| 0.25.2 | `v0.25.2` | 0.25.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | soundness fixes found by real programs (the -O2 vector loop unrolled by 3, an assignment's let-argument temporaries, std's move exemption narrowed); volec's command line on std::cli; `use.unused`; program roots for the tools; the language server for single files and C headers; WGSL's MSL reserved names; four test tiers, `tools/premerge.sh`, a commit hook, a Linux smoke row and a gate that cannot hang |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.2
+
+Bugs that real programs found (the showcase examples and agents' large
+ports; the fuzzers had not), the tools agents asked for, and a faster,
+steadier way to test.
+
+- **Soundness** (each also in 0.25.1):
+  - `-O2`'s vector loop could be unrolled by 3, but the trip mask
+    `trips & -(U*VF)` needs a power of two: a loop of 14 iterations ran
+    past its end. It unrolls by 4, 2 or 1 now; 1,173 generated loops
+    (tools/loopsweep) are tests.
+  - `t = t.add(size(leaf_of(gpa)))`: an owned assignment whose right side
+    lends a temporary to a `let` argument read a function's address
+    instead of the value, at every level (or gave a false error). The
+    checked right side's temporaries are no longer hoisted twice, and
+    they drop after the old value (conventions.md, 2.2). 233 of 330
+    generated sink/inout cases (tools/sinksweep) printed wrong values
+    before; `fuzz-sem --assign-calls` finds it on 0.25.1.
+  - std's exemption from the move checks is gone except for std's root,
+    `std::iter` and `std::collections`; the survey found no double free
+    left (tests/std/moves.sh). `std::gpu::wgsl`'s
+    `let f = m.functions[h]` double frees fixed.
+  - `requires`/`ensures` arguments resolve in the caller's module.
+- **volec's command line is std::cli**: `fn main(gpa)` reads
+  `std::env::args_os()`, one command tree (cli/tree.vl); the same
+  behaviour on 1,334 command lines; a non-UTF-8 argument is exit 1.
+  std::cli gained `global`, `alias`, `hide`, `num_values`,
+  `default_missing`, `allow_hyphen_values`, `last`, `conflicts_with`,
+  `subcommand_required` and the errors `MissingSubcommand` and
+  `ArgumentConflict`.
+- **Diagnostics**: unused imports are a warning, `use.unused` (an error
+  under `--deny-warnings`; 79 removed from the tree); a mismatch names
+  the literal default at its `let`; `str::from_utf8(b)?` is suggested
+  only where it type-checks; `fix --suggested` reads edited std.
+- **Tools**: query and edit work on any program, not only the compiler's
+  (`--root DIR`, or a FILE argument's own program; `note
+  query.other-root`); `edit patch` matches at other indentation
+  (`patch.loose`); `fmt --changed`, `--since REV`; probe and reduce keep
+  their scratch copies out of the source tree; `agent-feedback --list`,
+  `--find`.
+- **The language server**: a file outside any program is its own root;
+  info diagnostics say why a file is not checked; `-I DIR`,
+  `vole.includePaths` and `vole.cSources`; go-to-definition on header
+  strings and `c::`/`py::` names, hovers with the C prototype.
+- **WGSL**: the 498 MSL reserved names a shader could not use are
+  renamed; device-limit asserts are `Error::Shader` and
+  `Error::Pipeline`; `wgsl.target` errors point at the WGSL; `guide gpu`.
+- **Examples**: examples/gpu/fluid2d (Stable Fluids, in a window and
+  headless), examples/nes (an NES emulator), galaxy, pathtrace and voxel
+  under examples/gpu.
+- **Testing in tiers** (AGENTS.md, "The inner loop"):
+  `bootstrap.sh --dev --no-suite` (build and fixpoint in seconds,
+  `target/tools/volec` kept), `tests/affected.sh` (the tests a branch's
+  paths name in tests/affected.map, `--list`, `--linux`), `tests/run.sh`
+  with several filters, `=NAME`, `-f FILE`, `-l`; `tools/premerge.sh` and
+  the commit hook tools/git-hooks/pre-commit (unsafe justified, fmt,
+  checks, stdsrc, example sources). The runner: `// EXPECT-PPM`, EXPECT
+  holes, SKIP with a reason off macOS for window and GPU programs, load-aware
+  time budgets and watchdog; `volec test` reruns a case that timed out
+  while starved of CPU.
+- **The gate**: a `linux-smoke` row in `--quick`; one gate at a time
+  across worktrees; the job slots come back when a job is killed, and a
+  row that stalls fails instead of hanging; the Linux release row runs
+  -O0 and -O2 (-O1 stays on macOS), its long jobs first; chain-fresh
+  skips the last release's suite when every rebuilt compiler is the
+  recorded bytes.
+- **Breaking**: an unused `use` is a warning (an error with
+  `--deny-warnings`). A non-UTF-8 argument to volec is an error.
 
 ### What's new in 0.25.1
 
