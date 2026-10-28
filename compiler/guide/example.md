@@ -10,7 +10,7 @@ kind needs only what it shows: copy its patterns.
 each command it rejects and the report it is asked for. It has three
 files next to each other: `volec main.vl -o prog` builds them all.
 
-```tach main.vl
+```vole main.vl
 // stock: a ledger of items. Reads commands from stdin, one a line; prints
 // the report it is asked for, and a line for each command it rejects.
 mod command;
@@ -54,7 +54,7 @@ fn cut_comment(s: [u8]) -> [u8] {
 }
 ```
 
-```tach command.vl
+```vole command.vl
 // A line of input as a Command, or the Error that rejects it.
 
 // pub on a struct makes its fields visible with it. Clone: Vec::clone
@@ -125,7 +125,7 @@ fn number(w: [u8]) -> Result<i64, Error> {
 }
 ```
 
-```tach store.vl
+```vole store.vl
 // The items in stock, in the order they were first added.
 
 use command::{Command, Error, Item};

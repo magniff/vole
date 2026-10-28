@@ -5,7 +5,7 @@ function may have a default body. `impl Trait for Type` defines them for
 any type (`i64`, `[u8]`, `Vec<T>`, a struct). Its functions become the
 type's methods. Dispatch is static: a trait is not a type.
 
-```tach
+```vole
 use std::hash_u64;
 
 trait Shape {
@@ -104,7 +104,7 @@ A trait declares `type Name;`, each impl defines it, and `T::Name` (or
 `Self::Name`) is that type. A bound can fix it: `I: Iterator<Item =
 i64>`. Slices get impls too: `impl<T> [T] { ... }`, `impl<T> Tr for [T]`.
 
-```tach
+```vole
 use std::print_int;
 
 struct Countdown { n: i64 }

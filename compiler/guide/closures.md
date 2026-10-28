@@ -7,7 +7,7 @@ or keep it in a `let`. Calls are direct (no allocation, no pointer to a
 function), and a closure passed to a generic function is usually
 inlined.
 
-```tach
+```vole
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
     f(x)
 }
@@ -73,7 +73,7 @@ read, not changed. Use `x` after the closure's last call, pass the
 value to the closure as a parameter instead of capturing it, or capture
 a snapshot with `sink`.
 
-```tach
+```vole
 fn main(gpa: Gpa) {
     var v: Vec<i64> = Vec::new_in(gpa);
     var add = |x: i64| v.push(x);
@@ -113,7 +113,7 @@ parameter): that is `own.move_out`; use `x.clone()` inside. A `sink`
 skips that one. Called again after such a move, it stops the program
 (exit 101), since no closure is `FnOnce` yet.
 
-```tach
+```vole
 fn call<F: FnMut() -> i64>(f: sink F) -> i64 { f() }
 
 fn main(gpa: Gpa) -> i32 {
@@ -130,7 +130,7 @@ fn main(gpa: Gpa) -> i32 {
 1 1 1
 ```
 
-```tach
+```vole
 fn call<F: FnMut() -> i64>(f: sink F) -> i64 {
     f()
 }
@@ -173,7 +173,7 @@ hold one (outside generic parameters).
 - In a struct, a closure is a generic field: `struct Button<F> { on: F }`,
   called as `(b.on)(3)`.
 
-```tach
+```vole
 struct Counter<F> { step: F, n: i64 }
 
 fn run(f: fn(i64) -> i64) -> i64 {

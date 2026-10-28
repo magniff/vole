@@ -120,7 +120,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
   `std::take(&x)`, `std::replace(&x, v)`, `std::swap(&a, &b)`;
   `v.iter_ref()` yields let accesses of the elements.
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
     var counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
     let words = ["a", "b", "a", "c", "a"];
@@ -175,7 +175,7 @@ return are views of the text: keep the `Buf` until done with them. The
 next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
     var line = Buf::new_in(gpa);
     read_line(&line).unwrap();            // the header: "n m"

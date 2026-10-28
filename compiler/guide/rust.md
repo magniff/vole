@@ -24,7 +24,7 @@ more often than to something else, and each error names the fix.
 | `std::fs::read_to_string(p)?`, `File::open(p)?`, `BufReader::new(f)` | `fs::read_to_string_in(p, gpa)?`; `File::open(p)?` and `BufReader::new(f)` as Rust's (no allocation); `r.lines_in(gpa)`, `r.read_line(&mut s)?` (`guide io`) |
 | `std::env::args()`, `Command::new(p).arg(a).output()` | `env::args()` (views, `.collect_in(gpa)`); `let mut c = Command::new(p); c.arg(a); c.output_in(gpa)?` (`arg` changes `c`: no chaining) |
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
     var b = Buf::new_in(gpa);                  // freed at the end of main
     b.push_str("sum=");
@@ -84,7 +84,7 @@ whole program). Pass a container to a function that changes it as
 `&v` to an `inout` parameter, to one that reads it as `v`; return a new
 one by value (the caller owns it):
 
-```tach
+```vole
 fn fill(v: inout Vec<i64>, n: i64) {     // v.push changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
@@ -127,7 +127,7 @@ address.
 | `std::process::exit(n)` | `return n;` from `main`, or C's `exit` in `unsafe` |
 | `fn main() -> Result<(), E>` | the same (0.15): `Err(e)` prints `Error: ` and `e`'s Debug, exit 1 |
 
-```tach
+```vole
 enum Error { Empty, TooBig(i64) }
 
 fn check(n: i64) -> Result<i64, Error> {
@@ -179,7 +179,7 @@ Its parameters have conventions (`fn(inout Sum, i64)`); a
 function with `*T` parameters is a value like any other (an `unsafe fn`
 as a value is unsafe):
 
-```tach
+```vole
 struct Sum { total: i64 }
 
 fn add(s: inout Sum, x: i64) { s.total += x; }
@@ -220,7 +220,7 @@ fn main() -> i32 {
 | `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
 | `!x` (bitwise not) | `~x` |
 | `f.sqrt()`, `f.sin()`, `f.powi(n)`, `f64::consts::PI`, `f64::EPSILON` | the same (0.25.2.1, `guide math`), in vole: no C, no `unsafe` |
-| `x.pow(n)`, `x.abs()` on integers | write it (`std::abs(x)` for an i64) |
+| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they wrap, as `*` does |
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |

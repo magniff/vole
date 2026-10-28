@@ -40,7 +40,7 @@ in `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the compil
    `split_whitespace_in`.
 3. A test: `tests/run/std_NAME.vl` with `// EXPECT:` lines (edge
    cases: empty, too long, at the ends); see `add-test`.
-4. The guide: a sentence and a `tach` example with its `out` block in
+4. The guide: a sentence and a `vole` example with its `out` block in
    `compiler/guide/std.md` (the API listing at its end is generated);
    `compiler/guide/embed.sh`.
 5. `bootstrap/bootstrap.sh --dev --no-suite` (the compiler with the new
@@ -166,7 +166,7 @@ table of `compiler/src/tools/README.md`. Test: a transcript (`add-test`).
 To add a paragraph or an example in the guide.
 
 The guide is `compiler/guide/TOPIC.md` (the topics and their order:
-`compiler/guide/topics.txt`). An example is a `tach` block, then an
+`compiler/guide/topics.txt`). An example is a `vole` block, then an
 `out` block with what it prints (an `in` block before it: its stdin; an
 `err` block: it must fail to compile); each is compiled and run.
 `tests/guide/run.sh -f compiler/guide/TOPIC.md` checks one topic as you

@@ -11,7 +11,7 @@
 // - Passes are closure-scoped: `enc.compute_pass(|pass| { ... })`.
 // - Misuse is a contract failure (`requires`, exit 101 with the rule's
 //   code: gpu.usage, gpu.align, gpu.range, gpu.layout, gpu.pipeline,
-//   gpu.format, gpu.limits, gpu.state, gpu.unsupported); what can fail
+//   gpu.format, gpu.limits, gpu.state, gpu.unsupported, gpu.unwritten); what can fail
 //   however correct the program is (no adapter, a shader the driver
 //   rejects, a lost device) is a Result.
 // - Backends are behind std::gpu::hal: `Api` (compute, memory, copies)
@@ -122,7 +122,7 @@ impl Instance {
             var raw: Vec<backend::Adapter, ScopedArena> = Vec::new_in(a);
             N::adapters(&raw);
             for r in raw.iter() {
-                out.push(Adapter { raw: backend::Adapter { dev: r.dev.clone() }, gpa: gpa });
+                out.push(adapter_new(backend::Adapter { dev: r.dev.clone() }, gpa));
             }
         });
         out
@@ -143,12 +143,12 @@ impl Instance {
                 f
             });
             match found {
-                Some(a) => return Ok(Adapter { raw: a, gpa: self.gpa }),
+                Some(a) => return Ok(adapter_new(a, self.gpa)),
                 None => {}
             }
         }
         match N::default_adapter() {
-            Some(a) => Ok(Adapter { raw: a, gpa: self.gpa }),
+            Some(a) => Ok(adapter_new(a, self.gpa)),
             None => Err(Error::NoAdapter),
         }
     }
@@ -171,21 +171,45 @@ impl Instance {
 pub struct Adapter {
     pub raw: backend::Adapter,
     pub gpa: Gpa,
+    // the largest buffer it makes (N::adapter_max_buffer_size), for
+    // device()'s contract
+    max_buffer_size: i64,
+}
+
+fn adapter_new(raw: sink backend::Adapter, gpa: Gpa) -> Adapter {
+    let max = N::adapter_max_buffer_size(raw);
+    Adapter { raw: raw, gpa: gpa, max_buffer_size: max }
 }
 
 impl Adapter {
+    /// The most this adapter takes (wgpu's `adapter.limits()`): Limits::default()
+    /// with the largest buffer it makes (on Apple silicon several GiB, with
+    /// the memory). `adapter.device(adapter.limits())` asks for all of it.
+    pub fn limits(self) -> Limits {
+        var l = Limits::default();
+        l.max_buffer_size = self.max_buffer_size;
+        l
+    }
+
     /// The adapter's name ("Apple M5").
     pub fn name_in<A: Allocator>(self, out: inout Buf<A>) {
         N::adapter_name(self.raw, &out);
     }
 
-    /// The device and its queue.
+    /// The device and its queue, with `limits` (Limits::default(): those
+    /// every adapter takes, a buffer at most 1 GiB; wgpu's model). More, up
+    /// to adapter.limits(): `var lim = Limits::default(); lim.max_buffer_size
+    /// = 4 << 30; adapter.device(lim)`.
     pub fn device(self, limits: Limits = Limits::default()) -> Result<(Device, Queue),
-        Error> {
+        Error>
+        requires limits.max_buffer_size <= self.max_buffer_size
+        else f"gpu.limits: device(lim) asks for buffers of up to {limits.max_buffer_size} bytes (lim.max_buffer_size) and this adapter makes them up to {self.max_buffer_size} (adapter.limits().max_buffer_size)"
+        {
         match N::open(self.raw) {
             Some((d, q)) => {
                 let caps = N::caps(d);
-                Ok((Device { raw: d, gpa: self.gpa, limits: limits, caps: caps }, Queue { raw: q }))
+                Ok((Device { raw: d, gpa: self.gpa, limits: limits, caps: caps },
+                    Queue { raw: q, written: [0; 256], nwritten: 0, lost: false }))
             }
             None => Err(Error::DeviceCreation),
         }
@@ -201,6 +225,15 @@ pub struct Device {
 
 pub struct Queue {
     pub raw: backend::Queue,
+    // the ids (buffer_id) of the uniform buffers written so far, by
+    // write_buffer or by submitted commands (Unwritten's fills), for
+    // submit's gpu.unwritten: the first `nwritten`, no allocation (the
+    // queue's path allocates nothing)
+    written: [u64; 256],
+    nwritten: i64,
+    // more were written than these hold: gpu.unwritten checks no more (it
+    // would report a written one)
+    lost: bool,
 }
 
 /// A layout key: the bindings' kinds and slots, so that a bind group made
@@ -320,11 +353,14 @@ impl Device {
     /// A buffer of size bytes, zeroed.
     pub fn buffer(self, size: i64, usage: u32) -> Buffer
         requires size >= 0 && size <= self.limits.max_buffer_size
-        else "gpu.limits: a buffer's size is 0..limits.max_buffer_size"
+        else f"gpu.limits: a buffer of {size} bytes; this device makes them up to {self.limits.max_buffer_size} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {size}; adapter.device(lim)`"
         requires usage != 0 else "gpu.usage: a buffer needs a usage"
     {
         match N::create_buffer(self.raw, size, "") {
-            Some(b) => Buffer { raw: b, size: size, usage: usage, mapped: false },
+            Some(b) => Buffer {
+                raw: b, size: size, usage: usage, mapped: false,
+                written: false,
+            },
             None => out_of_memory("buffer"),
         }
     }
@@ -332,11 +368,14 @@ impl Device {
     /// A buffer holding a copy of bytes.
     pub fn buffer_init(self, bytes: [u8], usage: u32) -> Buffer
         requires bytes.len() <= self.limits.max_buffer_size
-        else "gpu.limits: a buffer's size is 0..limits.max_buffer_size"
+        else f"gpu.limits: a buffer of {bytes.len()} bytes; this device makes them up to {self.limits.max_buffer_size} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {bytes.len()}; adapter.device(lim)`"
         requires usage != 0 else "gpu.usage: a buffer needs a usage"
     {
         match N::create_buffer(self.raw, bytes.len(), bytes) {
-            Some(b) => Buffer { raw: b, size: bytes.len(), usage: usage, mapped: false },
+            Some(b) => Buffer {
+                raw: b, size: bytes.len(), usage: usage, mapped: false,
+                written: true,
+            },
             None => out_of_memory("buffer"),
         }
     }
@@ -349,7 +388,7 @@ impl Device {
         else "gpu.unsupported: this device has no textures (dev.caps().textures)"
         requires width >= 1 && height >= 1 && width <= self.limits.max_texture_dimension_2d
         && height <= self.limits.max_texture_dimension_2d
-        else "gpu.limits: a texture's sides are 1..limits.max_texture_dimension_2d"
+        else f"gpu.limits: a texture of {width} x {height}; its sides are 1 to {self.limits.max_texture_dimension_2d} (dev.limits().max_texture_dimension_2d)"
         requires layers >= 1 && layers <= self.limits.max_texture_array_layers && mips >= 1
         else "gpu.limits: layers and mips"
         requires usage != 0 else "gpu.usage: a texture needs a usage"
@@ -410,8 +449,11 @@ impl Device {
                 bindings.extend_from_slice(src.reflection.bindings.as_slice());
                 var inputs: Vec<VertexInput> = Vec::new_in(self.gpa);
                 inputs.extend_from_slice(src.reflection.inputs.as_slice());
+                var uses: Vec<[i64; 2]> = Vec::new_in(self.gpa);
+                uses.extend_from_slice(src.reflection.uses.as_slice());
                 Ok(Shader {
                     raw: s, entries: entries, bindings: bindings, inputs: inputs, sizes: sizes,
+                    uses: uses,
                 })
             }
             None => Err(Error::Shader(err)),
@@ -501,7 +543,8 @@ impl Device {
                     raw: p, layouts: Layouts::new(), workgroup: wg,
                     sizes: StageSizes::of(shader, e.sizes_slot),
                 };
-                out.layouts.merge_stage(shader.bindings.as_slice(), ShaderStage::COMPUTE);
+                out.layouts.merge_stage(shader, shader.entry_index(entry, ShaderStage::COMPUTE),
+                    ShaderStage::COMPUTE);
                 Ok(out)
             }
             None => Err(Error::Pipeline(err)),
@@ -513,10 +556,10 @@ impl Device {
         requires self.caps.render
         else "gpu.unsupported: this device does not render (dev.caps().render)"
         requires desc.state.buffer_count <= self.limits.max_vertex_buffers
-        else "gpu.limits: vertex buffers"
+        else f"gpu.limits: {desc.state.buffer_count} vertex buffers; the device takes at most {self.limits.max_vertex_buffers} (dev.limits().max_vertex_buffers)"
         requires desc.state.target_count >= 0
         && desc.state.target_count <= self.limits.max_color_attachments
-        else "gpu.limits: color targets"
+        else f"gpu.limits: {desc.state.target_count} color targets; the device takes 0 to {self.limits.max_color_attachments} (dev.limits().max_color_attachments)"
         requires desc.state.target_count > 0 || desc.state.depth.is_some()
         else "gpu.format: a pipeline with no color target draws only depth: give it a depth state (desc.depth(), or RenderDesc::depth_only)"
         {
@@ -590,9 +633,11 @@ impl Device {
                     fs_sizes: if desc.has_fs { StageSizes::of(desc.fragment, fs.sizes_slot) }
                         else { StageSizes::none() }
                 };
-                out.layouts.merge_stage(desc.vertex.bindings.as_slice(), ShaderStage::VERTEX);
+                out.layouts.merge_stage(desc.vertex,
+                    desc.vertex.entry_index(desc.vs, ShaderStage::VERTEX), ShaderStage::VERTEX);
                 if desc.has_fs {
-                    out.layouts.merge_stage(desc.fragment.bindings.as_slice(),
+                    out.layouts.merge_stage(desc.fragment,
+                        desc.fragment.entry_index(desc.fs, ShaderStage::FRAGMENT),
                         ShaderStage::FRAGMENT);
                 }
                 Ok(out)
@@ -603,21 +648,20 @@ impl Device {
 
     /// A bind group for `layout` (from `pipe.bind_layout(i)`): one entry per
     /// binding of the layout, in any order. A layout holds the bindings of
-    /// group i that the pipeline's shader module uses: those its entry
-    /// points of the pipeline's stages use, all of them together (a
-    /// binding declared and never used is not in it; one a second entry
-    /// point of the module uses is).
+    /// group i that the pipeline's own entry points use, through their
+    /// calls (WebGPU's `layout: "auto"`): one only another entry point of
+    /// the module uses is not in it, nor one declared and never used.
     pub fn bind_group(self, layout: BindLayout, entries: [BindEntry]) -> BindGroup
         requires layout_fit(layout, entries) < 0 || layout.count != 0
-        else f"gpu.layout: the layout of group {layout.group} has no bindings: no entry point of the pipeline's shader module uses one of group {layout.group}, and the bind group has {entries.len()} entries: bind nothing for this group, or use the bindings in the shader"
+        else f"gpu.layout: the layout of group {layout.group} has no bindings: the pipeline's own entry points use no binding of group {layout.group}, and the bind group has {entries.len()} entries: bind nothing for this group, or use the bindings in the shader"
         requires layout_fit(layout, entries) < 0 || layout.count != 1
-        else f"gpu.layout: the layout has 1 binding, {layout_at(layout, 0)}, and binding {layout_fit(layout, entries)} of the bind group does not fit it: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        else f"gpu.layout: the layout has 1 binding, {layout_at(layout, 0)}, and binding {layout_fit(layout, entries)} of the bind group does not fit it: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each"
         requires layout_fit(layout, entries) < 0 || layout.count != 2
-        else f"gpu.layout: the layout has 2 bindings, {layout_at(layout, 0)} and {layout_at(layout, 1)}, and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        else f"gpu.layout: the layout has 2 bindings, {layout_at(layout, 0)} and {layout_at(layout, 1)}, and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each"
         requires layout_fit(layout, entries) < 0 || layout.count != 3
-        else f"gpu.layout: the layout has 3 bindings, {layout_at(layout, 0)}, {layout_at(layout, 1)} and {layout_at(layout, 2)}, and the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        else f"gpu.layout: the layout has 3 bindings, {layout_at(layout, 0)}, {layout_at(layout, 1)} and {layout_at(layout, 2)}, and the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each"
         requires layout_fit(layout, entries) < 0
-        else f"gpu.layout: the layout has {layout.count} bindings, the first {layout_at(layout, 0)} (all: pipe.bind_layout(g).entries[i].binding), and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's shader module uses, those of all its entry points in the pipeline's stages (one declared and never used is not in it): give one entry for each, or give each kernel its own module"
+        else f"gpu.layout: the layout has {layout.count} bindings, the first {layout_at(layout, 0)} (all: pipe.bind_layout(g).entries[i].binding), and binding {layout_fit(layout, entries)} of the bind group does not fit them: a layout is the bindings the pipeline's own entry points use, through their calls (one only another entry point of the module uses is not in it, nor one declared and never used): give one entry for each"
         requires bind_fault(layout, entries, self.limits, BF_KIND) < 0
         else f"gpu.layout: the resource at binding {bind_fault(layout, entries, self.limits, BF_KIND)} is not of the shader's kind there: gpu::bind (a buffer) for var<uniform> and var<storage>, gpu::bind_texture for a texture, gpu::bind_sampler for a sampler"
         requires bind_fault(layout, entries, self.limits, BF_UNIFORM) < 0
@@ -637,6 +681,7 @@ impl Device {
         {
         var g = N::bind_group_new(self.raw);
         var bytes = GroupBytes::new();
+        var unwritten = Unwritten::new();
         for k in 0..layout.count {
             let b = layout.entries[k];
             for e in entries {
@@ -645,6 +690,15 @@ impl Device {
                     Resource::Buffer(buf, offset, size) => {
                         let n = if size < 0 { buf.size - offset } else { size };
                         N::bind_group_buffer(&g, b, buf.raw, offset, n);
+                        if buf.usage & BufferUsage::UNIFORM != 0 {
+                            if b.ty == BindingType::Uniform && !buf.written
+                                && buf.usage & BufferUsage::MAP_WRITE == 0 {
+                                // (one mapped for writing may be written after this)
+                                unwritten.read(buffer_id(buf), layout.group, b.binding, buf.size);
+                            } else if b.ty == BindingType::Storage {
+                                unwritten.wrote(buffer_id(buf));
+                            }
+                        }
                         // (at most 16 bindings in a layout, each given once)
                         bytes.binding[bytes.count] = b.binding;
                         bytes.bytes[bytes.count] = n;
@@ -655,12 +709,15 @@ impl Device {
                 }
             }
         }
-        BindGroup { raw: g, key: layout.key, bytes: bytes }
+        BindGroup { raw: g, key: layout.key, bytes: bytes, unwritten: unwritten }
     }
 
     /// A command encoder.
     pub fn encoder(self) -> Encoder {
-        Encoder { raw: N::begin(self.raw), limits: self.limits, caps: self.caps }
+        Encoder {
+            raw: N::begin(self.raw), limits: self.limits, caps: self.caps,
+            unwritten: Unwritten::new(),
+        }
     }
 
     /// Waits until the GPU has finished everything submitted.
@@ -671,10 +728,34 @@ impl Device {
 
 impl Queue {
     /// Submits recorded commands; they run after everything submitted
-    /// before.
-    pub fn submit(inout self, cmds: sink Commands) {
+    /// before. A uniform buffer they read must have been written first
+    /// (gpu.unwritten): by write_buffer, by commands submitted before or
+    /// these, or made with its bytes (buffer_init).
+    pub fn submit(inout self, cmds: sink Commands)
+        requires self.lost || unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 0) < 0
+        else f"gpu.unwritten: binding {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 2)} of group {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 1)} (a uniform buffer of {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 3)} bytes) was never written: write it (queue.write_buffer) before submitting the first dispatch or draw that reads it (dev.buffer's zeros are not a value; dev.buffer_init makes a buffer with its bytes)"
+        {
         var c = cmds;
+        if c.unwritten.lost {
+            self.lost = true;
+        }
+        for i in 0..c.unwritten.fills {
+            self.wrote(c.unwritten.fill[i]);
+        }
         N::submit(&self.raw, &c.raw);
+    }
+
+    // A uniform buffer has been written (its id, once).
+    fn wrote(inout self, id: u64) {
+        for i in 0..self.nwritten {
+            if self.written[i] == id { return; }
+        }
+        if self.nwritten < 256 {
+            self.written[self.nwritten] = id;
+            self.nwritten += 1;
+        } else {
+            self.lost = true;
+        }
     }
 
     /// Writes bytes into buf at offset, before the commands submitted next
@@ -688,6 +769,9 @@ impl Queue {
         else "gpu.range: write_buffer reaches past the buffer"
         requires !buf.mapped else "gpu.state: the buffer is mapped: unmap it first"
     {
+        if buf.usage & BufferUsage::UNIFORM != 0 && !buf.written {
+            self.wrote(buffer_id(buf));
+        }
         N::write_buffer(&self.raw, buf.raw, offset, bytes);
     }
 
@@ -723,6 +807,9 @@ pub struct Buffer {
     pub size: i64,
     pub usage: u32,
     pub mapped: bool,
+    /// Made with its bytes (buffer_init) or mapped for writing: gpu.unwritten
+    /// never reports it.
+    pub written: bool,
 }
 
 impl Buffer {
@@ -770,6 +857,7 @@ impl Buffer {
         {
         N::device_wait_idle(dev.raw);
         self.mapped = true;
+        self.written = true;
         N::map_write(dev.raw, &self.raw)
     }
 
@@ -852,6 +940,9 @@ pub struct Shader {
     pub bindings: Vec<Binding>,
     pub inputs: Vec<VertexInput>,
     pub sizes: Vec<GroupBinding>,
+    /// (entry, binding) index pairs: the bindings each entry point uses
+    /// (Reflection::uses; empty: each uses all its stage's).
+    pub uses: Vec<[i64; 2]>,
 }
 
 impl Shader {
@@ -868,6 +959,30 @@ impl Shader {
             }
         }
         None
+    }
+
+    /// The index of the entry point of that name and stage in `entries`;
+    /// -1: none.
+    pub fn entry_index(self, name: [u8], stage: u32) -> i64 {
+        for i in 0..self.entries.len() {
+            if self.entries[i].name.as_slice() == name && self.entries[i].stage == stage {
+                return i;
+            }
+        }
+        -1
+    }
+
+    /// Whether entry point `entry` uses binding `binding` (indices into
+    /// `entries` and `bindings`); with no `uses` (a reflection written by
+    /// hand), every binding its stage has a slot for.
+    pub fn entry_uses(self, entry: i64, binding: i64) -> bool {
+        if self.uses.len() == 0 {
+            return true;
+        }
+        for u in self.uses.iter() {
+            if u[0] == entry && u[1] == binding { return true; }
+        }
+        false
     }
 }
 
@@ -902,11 +1017,14 @@ impl Layouts {
         out
     }
 
-    /// Adds the bindings a stage uses; a binding seen from two stages is
-    /// one entry with both slots.
-    fn merge_stage(inout self, bindings: [Binding], stage: u32) {
-        for b in bindings {
-            if b.visibility() & stage == 0 { continue; }
+    /// Adds the bindings the entry point `entry` of `shader` (of stage
+    /// `stage`) uses: a pipeline's layout is its own entry points'
+    /// bindings, not those of the module's other entry points. A binding
+    /// seen from two stages is one entry with both slots.
+    fn merge_stage(inout self, shader: Shader, entry: i64, stage: u32) {
+        for bi in 0..shader.bindings.len() {
+            let b = shader.bindings[bi];
+            if b.visibility() & stage == 0 || !shader.entry_uses(entry, bi) { continue; }
             assert(b.group >= 0 && b.group < MAX_BIND_GROUPS, "gpu.limits: bind groups 0..3");
             let gi = b.group;
             var merged = false;
@@ -977,6 +1095,102 @@ pub struct BindGroup {
     pub raw: backend::BindGroup,
     pub key: u64,
     bytes: GroupBytes,
+    unwritten: Unwritten,
+}
+
+// Uniform buffers read before written (0.25.2.2; in the bind groups' section):
+
+// A buffer's id in gpu.unwritten's records: its Metal object's address
+// (a freed buffer's may come back: a write to the old one then counts for
+// the new, a miss, never a false error).
+fn buffer_id(b: Buffer) -> u64 {
+    b.raw.raw.ptr as u64
+}
+
+// What a bind group, a pass, an encoder and its commands record for
+// queue.submit's gpu.unwritten: the uniform buffers they read that may
+// be unwritten (made by dev.buffer: its id, the group and binding it is
+// read at, its size), and the uniform buffers they write (`fill`: a copy
+// into one, one bound as read_write storage). Kept small and plain: 16
+// reads, the rest not checked (a miss, never a false error); 16 writes,
+// the rest `lost` (then the queue checks no more).
+#[derive(Clone)]
+struct Unwritten {
+    count: i64,
+    id: [u64; 16],
+    group: [i64; 16],
+    binding: [i64; 16],
+    size: [i64; 16],
+    fills: i64,
+    fill: [u64; 16],
+    lost: bool,
+}
+
+impl Unwritten {
+    fn new() -> Unwritten {
+        Unwritten {
+            count: 0, id: [0; 16], group: [0; 16], binding: [0; 16], size: [0; 16], fills: 0,
+            fill: [0; 16], lost: false,
+        }
+    }
+
+    fn read(inout self, id: u64, group: i64, binding: i64, size: i64) {
+        for i in 0..self.count {
+            if self.id[i] == id { return; }
+        }
+        if self.count < 16 {
+            let n = self.count;
+            self.id[n] = id;
+            self.group[n] = group;
+            self.binding[n] = binding;
+            self.size[n] = size;
+            self.count = n + 1;
+        }
+    }
+
+    fn wrote(inout self, id: u64) {
+        for i in 0..self.fills {
+            if self.fill[i] == id { return; }
+        }
+        if self.fills < 16 {
+            self.fill[self.fills] = id;
+            self.fills += 1;
+        } else {
+            self.lost = true;
+        }
+    }
+
+    // Adds what `o` records (a bind group set at `group`, or a pass's).
+    fn add(inout self, o: Unwritten, group: i64) {
+        for i in 0..o.count {
+            self.read(o.id[i], if group >= 0 { group } else { o.group[i] }, o.binding[i],
+                o.size[i]);
+        }
+        for i in 0..o.fills {
+            self.wrote(o.fill[i]);
+        }
+        if o.lost { self.lost = true; }
+    }
+}
+
+// The first uniform buffer `u` reads that neither `written` nor u's own
+// writes hold: what = 0 its index, 1 its group, 2 its binding, 3 its size;
+// -1 when there is none.
+fn unwritten_fault(written: [u64], u: Unwritten, what: i64) -> i64 {
+    for i in 0..u.count {
+        var seen = false;
+        for w in written {
+            if w == u.id[i] { seen = true; }
+        }
+        for k in 0..u.fills {
+            if u.fill[k] == u.id[i] { seen = true; }
+        }
+        if !seen {
+            return if what == 0 { i } else if what == 1 { u.group[i] }
+                else if what == 2 { u.binding[i] } else { u.size[i] };
+        }
+    }
+    -1
 }
 
 // ---- GPU: the sizes buffer (0.22) ----
@@ -1165,11 +1379,13 @@ pub struct Encoder {
     pub raw: backend::CommandBuffer,
     pub limits: Limits,
     pub caps: Caps,
+    unwritten: Unwritten,
 }
 
 /// Recorded commands, for `queue.submit` (dropped unsubmitted: discarded).
 pub struct Commands {
     pub raw: backend::CommandBuffer,
+    unwritten: Unwritten,
 }
 
 /// The bind group keys a pass has bound, against a pipeline's layouts.
@@ -1218,6 +1434,7 @@ pub struct ComputePass {
     // the sizes buffer: the pipeline's, and the bound groups' bytes
     sizes: StageSizes,
     groups: [GroupBytes; 4],
+    unwritten: Unwritten,
 }
 
 impl ComputePass {
@@ -1230,13 +1447,18 @@ impl ComputePass {
     pub fn set_bind_group(inout self, i: i64, g: BindGroup) {
         self.binds.set_group(i, g.key);
         self.groups[i] = g.bytes;
+        if g.unwritten.count > 0 || g.unwritten.fills > 0 {
+            self.unwritten.add(g.unwritten, i);
+        }
         N::compute_set_bind_group(&self.raw, g.raw);
     }
 
     /// x * y * z workgroups of the pipeline's workgroup size.
     pub fn dispatch(inout self, x: i64, y: i64 = 1, z: i64 = 1)
-        requires x >= 0 && y >= 0 && z >= 0 && x <= self.max_groups && y <= self.max_groups
-        && z <= self.max_groups else "gpu.limits: workgroups per dimension"
+        requires x >= 0 && y >= 0 && z >= 0
+        else f"gpu.range: dispatch({x}, {y}, {z}): a count of workgroups is 0 or more"
+        requires x <= self.max_groups && y <= self.max_groups && z <= self.max_groups
+        else f"gpu.limits: a dispatch of {largest(x, y, z)} workgroups in one dimension; at most {self.max_groups} (dev.limits().max_compute_workgroups_per_dimension, the device's own, which device(lim) cannot raise): give the kernel a larger @workgroup_size, or spread the work over y and z (dispatch(x, y, z), the index from global_invocation_id.y and .z)"
         {
         self.binds.ready();
         if x == 0 || y == 0 || z == 0 { return; }
@@ -1247,6 +1469,12 @@ impl ComputePass {
         }
         N::dispatch(&self.raw, x, y, z);
     }
+}
+
+// The largest of a dispatch's counts (gpu.limits' message: a contract's
+// message holds three values at most).
+fn largest(x: i64, y: i64, z: i64) -> i64 {
+    if x >= y && x >= z { x } else if y >= z { y } else { z }
 }
 
 /// A color attachment of a render pass.
@@ -1399,6 +1627,7 @@ pub struct RenderPass {
     vs_sizes: StageSizes,
     fs_sizes: StageSizes,
     groups: [GroupBytes; 4],
+    unwritten: Unwritten,
 }
 
 // The first color target of a pipeline whose format differs from the
@@ -1452,6 +1681,9 @@ impl RenderPass {
     pub fn set_bind_group(inout self, i: i64, g: BindGroup) {
         self.binds.set_group(i, g.key);
         self.groups[i] = g.bytes;
+        if g.unwritten.count > 0 || g.unwritten.fills > 0 {
+            self.unwritten.add(g.unwritten, i);
+        }
         N::render_set_bind_group(&self.raw, g.raw);
     }
 
@@ -1569,9 +1801,11 @@ impl Encoder {
             raw: N::begin_compute(&self.raw), binds: Bindings::new(),
             max_groups: self.limits.max_compute_workgroups_per_dimension,
             sizes: StageSizes::none(), groups: [GroupBytes::new(); 4],
+            unwritten: Unwritten::new(),
         };
         f(&pass);
         N::end_compute(&pass.raw);
+        self.unwritten.add(pass.unwritten, -1);
     }
 
     /// Runs f with a render pass into desc's attachments; the pass ends
@@ -1634,9 +1868,11 @@ impl Encoder {
             vs_sizes: StageSizes::none(),
             fs_sizes: StageSizes::none(),
             groups: [GroupBytes::new(); 4],
+            unwritten: Unwritten::new(),
         };
         f(&pass);
         N::end_render(&pass.raw);
+        self.unwritten.add(pass.unwritten, -1);
     }
 
     /// Copies size bytes between buffers.
@@ -1653,6 +1889,7 @@ impl Encoder {
         requires !src.mapped && !dst.mapped else "gpu.state: the buffer is mapped: unmap it first"
     {
         if size == 0 { return; }
+        if dst.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(dst)); }
         N::copy_buffer(&self.raw, src.raw, src_offset, dst.raw, dst_offset, size);
     }
 
@@ -1679,6 +1916,7 @@ impl Encoder {
         assert(offset >= 0
             && offset + bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
             "gpu.range: the copy reaches past the buffer");
+        if buf.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(buf)); }
         N::copy_texture_to_buffer(&self.raw, tex.raw, layer, x, y, ww, hh, buf.raw, offset,
             bytes_per_row);
     }
@@ -1712,7 +1950,7 @@ impl Encoder {
 
     /// The recorded commands, for `queue.submit`.
     pub fn finish(sink self) -> Commands {
-        Commands { raw: self.raw }
+        Commands { raw: self.raw, unwritten: self.unwritten }
     }
 }
 

@@ -43,7 +43,7 @@ checks what it points to.
   checked; `p[i]` on a raw pointer is pointer arithmetic, unchecked and
   unsafe.
 
-```tach
+```vole
 extern "C" {
     fn malloc(n: u64) -> *u8;
     fn free(p: *u8);

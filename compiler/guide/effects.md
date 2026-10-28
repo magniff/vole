@@ -39,7 +39,7 @@ instances' (`query effects` lists each).
 A declaration is an upper bound the compiler checks against the
 inferred set; callers still see the inferred one, which may be smaller.
 
-```tach
+```vole
 #[pure]                                   // no alloc, io or global
 fn mid(a: i64, b: i64) -> i64 { a + (b - a) / 2 }
 
