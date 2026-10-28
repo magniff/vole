@@ -2,16 +2,17 @@
 ## program means (tests/refactor/fixsafe/; each case is a wrong fix from
 ## the 0.25.2 eval, evals/tasks/0.25.2/*/ANALYSIS.md). Refused, each
 ## with a `note fix.refused` saying why: a fix with which the edited
-## program has a new error (ocean's `std::abs((a - b))` of an f64,
-## deferred's `use` of a function where a bool goes), a cast of a cast
+## program has a new error (deferred's `use` of a function where a bool
+## goes), std's function for a method that takes another type (ocean's
+## `std::abs((a - b))` of i32s), a cast of a cast
 ## (cloth: the annotation is the fix), a conversion that loses the value
 ## (`t as u8`), a did-you-mean naming the function the call is in (it
 ## would recurse). Not added: a second import of a name a use line's fix
 ## already imports (sdftext).
 $ check
-main.vl:10:13: error[type error] no method 'abs' on type 'f64' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
-main.vl:21:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
-main.vl:32:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
+main.vl:11:13: error[type error] no method 'abs' on type 'i32' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
+main.vl:22:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
+main.vl:33:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
 glyphs.vl:3:12: error[type error] unresolved import 'mathx::sqr' | help: did you mean 'sqrt'? | try: volec fix --suggested main.vl
 glyphs.vl:6:5: error[type error] undefined variable 'sqrt' | help: add `use crate::mathx::sqrt;` | try: volec fix --suggested main.vl
 casts.vl:7:16: error[type error] expected 'f64', got 'f32' | help: only widening is implicit: convert explicitly | try: (m[k] as f32) as f64 | try: volec fix --suggested main.vl
@@ -42,11 +43,11 @@ $ fix --suggested --dry-run
 @@ -15 +15 @@
 -    let mut u = Ui { n: 0 };
 +    var u = Ui { n: 0 };
-note fix.refused: main.vl:32:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
+note fix.refused: main.vl:11:13: not applied: `std::abs((a - b))`: std's `abs` takes i64 and the value is i32: what it gives has another type
+note fix.refused: main.vl:33:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
 note fix.refused: casts.vl:7:16: not applied: `(m[k] as f32) as f64`: it converts what a cast gives: the cast's type, or the type of the place it goes to, is what to change
 note fix.refused: casts.vl:13:17: not applied: `t as u8`: the integer type it goes to does not hold every value: it wraps
-note fix.refused: main.vl:21:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:23:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
-note fix.refused: main.vl:10:13: not applied: `std::abs((a - b))`: the edited program has a new error with it: main.vl:12:23: error[type error] expected 'i64', got 'f64'
+note fix.refused: main.vl:22:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:24:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
 ## --codes: only the errors with these codes, the classes the check hook
 ## makes itself; --diff: the diff of what was written.
 $ fix --suggested --codes conv.marker,conv.rust --diff
@@ -61,9 +62,9 @@ fixed 3 suggested fixes	marks.vl	+3 -3 lines
 @@ -15 +15 @@
 -    let mut u = Ui { n: 0 };
 +    var u = Ui { n: 0 };
-main.vl:10:13: error[type error] no method 'abs' on type 'f64' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
-main.vl:21:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
-main.vl:32:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
+main.vl:11:13: error[type error] no method 'abs' on type 'i32' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
+main.vl:22:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
+main.vl:33:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
 glyphs.vl:3:12: error[type error] unresolved import 'mathx::sqr' | help: did you mean 'sqrt'? | try: volec fix --suggested main.vl
 glyphs.vl:6:5: error[type error] undefined variable 'sqrt' | help: add `use crate::mathx::sqrt;` | try: volec fix --suggested main.vl
 casts.vl:7:16: error[type error] expected 'f64', got 'f32' | help: only widening is implicit: convert explicitly | try: (m[k] as f32) as f64 | try: volec fix --suggested main.vl
@@ -92,15 +93,15 @@ pub fn start() -> i64 {
 ## The rest: the use line and the annotation are made, the others refused.
 $ fix --suggested
 fixed 2 suggested fixes	2 files	+2 -2 lines
-main.vl:10:13: error[type error] no method 'abs' on type 'f64' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
-main.vl:21:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
-main.vl:32:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
+main.vl:11:13: error[type error] no method 'abs' on type 'i32' | help: 'abs' is no method: std's function `abs` takes the value as its first argument | try: std::abs((a - b)) | try: volec fix --suggested main.vl
+main.vl:22:8: error[type error] undefined variable 'check' | help: add `use std::gpu::wgsl::uniformity::check;` | try: volec fix --suggested main.vl
+main.vl:33:5: error[type error] undefined variable 'readback' | help: did you mean 'read_back'? | try: volec fix --suggested main.vl
 casts.vl:13:17: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8 | try: volec fix --suggested main.vl
-note fix.refused: main.vl:32:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
+note fix.refused: main.vl:11:13: not applied: `std::abs((a - b))`: std's `abs` takes i64 and the value is i32: what it gives has another type
+note fix.refused: main.vl:33:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
 note fix.refused: casts.vl:7:16: not applied: `(m[k] as f32) as f64`: it converts what a cast gives: the cast's type, or the type of the place it goes to, is what to change
 note fix.refused: casts.vl:13:17: not applied: `t as u8`: the integer type it goes to does not hold every value: it wraps
-note fix.refused: main.vl:21:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:23:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
-note fix.refused: main.vl:10:13: not applied: `std::abs((a - b))`: the edited program has a new error with it: main.vl:12:23: error[type error] expected 'i64', got 'f64'
+note fix.refused: main.vl:22:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:24:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
 note fix.left: 4 errors left (above)
 % cat glyphs.vl
 // sdftext: the use line's name is misspelled; its fix imports sqrt, so

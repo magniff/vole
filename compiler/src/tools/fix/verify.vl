@@ -21,10 +21,12 @@
 // missing_use_edits): not for a name a `use` of the module imports
 // already, nor for one a fix of a `use` line spells.
 
-use crate::base::{BUFS, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
+use crate::base::{
+    BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+};
 use crate::front::ast::{NODES, NODE_COUNT, NODE_IMPLICIT, NodeKind};
-use crate::front::modules::file_of_pos;
-use crate::front::types::buf_type;
+use crate::front::modules::{file_of_pos, within_std};
+use crate::front::types::{FNS, FN_COUNT, buf_type, fn_param, is_numeric};
 use crate::tools::edit::{drop_replaces, replace_at, replace_count};
 use crate::tools::edit::apply::{check_edited, prepare_edit, undo_copies, write_round_copies};
 use crate::tools::edit::breaks::{changed_index, hunks};
@@ -108,10 +110,67 @@ fn renames_to_self(start: i64, end: i64, t: [u8]) -> bool {
     }
 }
 
+// (0.25.2.1) Why a method call respelled as std's function (SRC[start..
+// end), `x.abs()`, by text t, `std::abs(x)`) changes the value's type, or
+// "": the function takes a number of another type than the receiver's,
+// which converts to it (ocean's `(a - b).abs()` of i32s: an i64 after it).
+fn type_change(start: i64, end: i64, t: [u8]) -> [u8] {
+    var p = if t.len > 5 && same_bytes(t[0..5], "std::") { 5 } else { 0 };
+    let s = p;
+    while p < t.len && t[p] != '(' {
+        p += 1;
+    }
+    if p >= t.len || p == s {
+        return "";
+    }
+    let name = t[s..p];
+    // UNSAFE: NODES (front/ast), FNS and SYMS (front/types, base) are the
+    // compiler's raw tables.
+    // SAFETY: i < NODE_COUNT, f < FN_COUNT; recv is a node of the call
+    // found (its receiver); display is an interned symbol.
+    unsafe {
+        var rt = 0;
+        for i in 1..NODE_COUNT {
+            if NODES[i].kind == NodeKind::MethodCall && NODES[i].start == start
+                && NODES[i].end == end
+                && NODES[i].a > 0 {
+                rt = NODES[NODES[i].a].ty;
+            }
+        }
+        if rt <= 0 || !is_numeric(rt) {
+            return "";
+        }
+        for f in 0..FN_COUNT {
+            if FNS[f].tmpl != 0 || FNS[f].self_ty != 0 || FNS[f].param_count < 1
+                || !within_std(FNS[f].module) {
+                continue;
+            }
+            let d = SYMS[FNS[f].display].text;
+            let named = same_bytes(d, name)
+                || (d.len > name.len + 2 && same_bytes(d[d.len - name.len..d.len], name)
+                    && d[d.len - name.len - 1] == ':');
+            let pt = fn_param(f, 0);
+            if named && is_numeric(pt) && pt != rt {
+                let b = buf_new();
+                buf_str(b, c"std's `");
+                buf_bytes(b, name);
+                buf_str(b, c"` takes ");
+                buf_type(b, pt);
+                buf_str(b, c" and the value is ");
+                buf_type(b, rt);
+                buf_str(b, c": what it gives has another type");
+                return buf_slice(b);
+            }
+        }
+        ""
+    }
+}
+
 // Why the fix replacing SRC[start..end) by buffer `text` is not to be made,
 // or "" when nothing is against it: a conversion (`X as T`, `(X) as T` of
 // the text X there) that loses the value, or of a cast; a did-you-mean
-// that makes a call call the function it is in.
+// that makes a call call the function it is in; std's function for a
+// method that takes another type than the value's (type_change).
 pub fn refusal_of(start: i64, end: i64, text: i64) -> [u8] {
     // UNSAFE: SRC and NODES are the compiler's raw tables (the sources' text, the parser's nodes).
     // SAFETY: start..end is an error's span in SRC (record_error checks it); i < NODE_COUNT.
@@ -120,6 +179,10 @@ pub fn refusal_of(start: i64, end: i64, text: i64) -> [u8] {
         let x = SRC[start..end];
         if renames_to_self(start, end, t) {
             return "the name it puts there is the function the call is in: the call would call itself";
+        }
+        let changed = type_change(start, end, t);
+        if changed.len > 0 {
+            return changed;
         }
         var k = -1;
         if t.len > x.len + 4 && same_bytes(t[0..x.len], x)
