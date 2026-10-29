@@ -232,6 +232,16 @@ want=$(printf '%s\n' "$want" | sort | tr '\n' ',')
 printf '# a comment\n=readme_sync\n\n=example_helloworld  \n' >"$WORK/filters"
 got=$(sh "$ROOT/tests/run.sh" -l -f "$WORK/filters" | tr '\n' ',')
 [ "$got" = "case example_helloworld,suite readme_sync," ] && ok filters_file || bad filters_file "got '$got'"
+# (0.25.5) -n NAME: one name, as '=NAME', in a form zsh leaves alone.
+got=$(sh "$ROOT/tests/run.sh" -l -n readme_sync -n example_helloworld | sort | tr '\n' ',')
+[ "$got" = "case example_helloworld,suite readme_sync," ] && ok filters_dash_n || bad filters_dash_n "got '$got'"
+# (0.25.5) the failing cases' try: line names them with -n (a compiler
+# that fails every case)
+printf '#!/bin/sh\necho "error: no" >&2\nexit 1\n' >"$WORK/failing-volec"
+chmod +x "$WORK/failing-volec"
+got=$(sh "$ROOT/tests/run.sh" -c "$WORK/failing-volec" -j 2 -n abi_c_structs -n abi_callee_alignment 2>&1 | tail -1)
+[ "$got" = "try: tests/run.sh -n abi_c_structs -n abi_callee_alignment   (the failing cases alone)" ] \
+    && ok filters_try_dash_n || bad filters_try_dash_n "got '$got'"
 # tests/affected.map: every set, cmd and prefix it names exists.
 problems=$(awk '
     { sub(/#.*/, "") }

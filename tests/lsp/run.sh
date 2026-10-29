@@ -23,7 +23,15 @@
 # scratch directory is written @DIR@ in the answers, the compiler's path
 # `volec`. (0.25) std's files are written under the scratch directory
 # ($XDG_CACHE_HOME is @DIR@/.cache): `@DIR@/.cache/vole/std-@STD@/std.vl`,
-# the compiler's version and std's hash as @STD@ (in a message too).
+# the compiler's version and std's hash as @STD@ (in a message too);
+# in a request, `"line":@LINE:std.vl:TEXT@` is the line (from 0) of
+# std.vl where TEXT first is (-1 when it is not there).
+# (0.25.5) std's positions are compared normalized (tests/stdpos.awk,
+# with std's file names: `at std.vl:L:C`, a range in std's files), so
+# that a std change breaks no session that is not about std; a session
+# with a line `## exact-std` compares them exactly; -u keeps a line that
+# differs only in them (tests/stdkeep.sh); VOLE_STD_SHIFT=1 moves the
+# session's numbers first, as tests/stdpos/run.sh does.
 #
 # Then the compiler's own source is opened and asked for a file's symbols
 # and a definition: the answers must be plausible (it changes too often
@@ -90,6 +98,17 @@ session_input() {
                 ;;
             *) msg=$(printf '%s' "$line" | sed "s|@DIR@|$2|g; s|@STD@|$STD_NAME|g") ;;
         esac
+        # (0.25.5) @LINE:FILE:TEXT@ in a request: the line (from 0) of
+        # std's FILE where TEXT first is, so that a question about a
+        # place in std's files asks about the same place after a std
+        # change (TEXT: no @, no backslash)
+        while :; do
+            ph=$(printf '%s' "$msg" | sed -n 's/.*@LINE:\([^@]*\)@.*/\1/p')
+            [ -n "$ph" ] || break
+            n=$(grep -nF -- "${ph#*:}" "$2/.cache/vole/std-$STD_NAME/${ph%%:*}" 2>/dev/null | head -1 | cut -d: -f1)
+            msg=$(printf '%s' "$msg" | awk -v ph="@LINE:$ph@" -v n="$(( ${n:-0} - 1 ))" '
+                { i = index($0, ph); print substr($0, 1, i - 1) n substr($0, i + length(ph)) }')
+        done
         k=$((k + 1))
         frame "$msg" >"$WORK/msg.$k"
         id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p')
@@ -161,6 +180,9 @@ transcript() {
         END { while (k < n) print "< " a[k++] }' "$1"
 }
 
+STDPOS="$ROOT/tests/stdpos.awk"
+# (0.25.5) std's files, relative to compiler/std (stdpos.awk's stdfiles)
+STD_FILES=$(cd "$ROOT/compiler/std" 2>/dev/null && find . -name '*.vl' | sed 's|^\./||' | sort | tr '\n' ' ')
 for case in "$HERE"/*.lsp; do
     [ -e "$case" ] || continue
     name=$(basename "$case" .lsp)
@@ -205,18 +227,43 @@ for case in "$HERE"/*.lsp; do
         mv "$WORK/answers.q" "$WORK/answers"
     fi
     transcript "$case" >"$WORK/got"
+    # (0.25.5) std's positions (a hover's `at std.vl:303:37`, the range of a
+    # location in std's files) compared normalized, as the query runner's
+    # (tests/stdpos.awk), unless the session has a line `## exact-std`:
+    # std's files are those of compiler/std the program has none of
+    files=$(printf '%s\n' $STD_FILES | while read -r f; do [ -e "$dir/$f" ] || printf '%s ' "$f"; done)
+    exact=0
+    grep -q '^## exact-std' "$case" && exact=1
     if [ "$UPDATE" = 1 ]; then
-        cp "$WORK/got" "$case"
+        if [ "$exact" = 1 ]; then
+            cp "$WORK/got" "$case"
+        else
+            # (a line that differs only in std's numbers kept as it was)
+            sh "$ROOT/tests/stdkeep.sh" "$case" "$WORK/got" "$files" >"$WORK/kept"
+            cp "$WORK/kept" "$case"
+        fi
+    fi
+    if [ "${VOLE_STD_SHIFT:-0}" = 1 ]; then
+        awk -v mode=shift -v stdfiles="$files" -f "$STDPOS" "$case" >"$WORK/want.s"
+    else
+        cp "$case" "$WORK/want.s"
+    fi
+    if [ "$exact" = 1 ]; then
+        cp "$WORK/want.s" "$WORK/want.n"
+        cp "$WORK/got" "$WORK/got.n"
+    else
+        awk -v stdfiles="$files" -f "$STDPOS" "$WORK/want.s" >"$WORK/want.n"
+        awk -v stdfiles="$files" -f "$STDPOS" "$WORK/got" >"$WORK/got.n"
     fi
     if [ "$rc" != 0 ]; then
         echo "FAIL $name"
         echo "    exit $rc"
         sed 's/^/    /' "$WORK/err"
         STATUS=1
-    elif diff "$case" "$WORK/got" >"$WORK/diff"; then
+    elif diff "$WORK/want.n" "$WORK/got.n" >"$WORK/diff"; then
         echo "pass $name"
     else
-        echo "FAIL $name"
+        echo "FAIL $name (< expected, > got; std's numbers as L:C)"
         sed 's/^/    /' "$WORK/diff" | head -40
         STATUS=1
     fi

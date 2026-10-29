@@ -1,17 +1,15 @@
 ## View summaries (0.17 T3; tests/query/views017/): declared ones with
 ## the type filter, std's generic results (parametric: by their type),
 ## stores, a module's functions with --why, and `views:` in def and show.
-$ views first_word pick text_of intern count
+## (0.25.5) The program's items and std's by their paths, not every item
+## of a name: a std item of the same name does not change the transcript.
+$ views crate::first_word crate::pick crate::text_of crate::intern crate::count std::gpu::wgsl::ir::Module::intern std::string::Chars::count
 crate::first_word	views(s) declared
 crate::pick	views(toks, counts) declared
 crate::text_of	views(*toks) declared
-std::window::script::text_of	views()
 crate::intern	views() stores(word) declared
-std::gpu::wgsl::ir::Module::intern	views() inferred
-std::gpu::wgsl::msl::W::intern	views() inferred
 crate::count	views()
-<std::objc::Ref as NSArrayMethods>::count	views()
-std::gpu::timing::QuerySet::count	views()
+std::gpu::wgsl::ir::Module::intern	views() inferred
 <std::string::Chars as Iterator>::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
@@ -142,18 +140,12 @@ crate::text_of	views(*toks) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
 crate::intern	views() stores(word) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
-$ def pick intern count
+$ def crate::pick crate::intern crate::count std::iter::Iterator::count std::string::Chars::count
 crate::pick	views017/main.vl:17:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks, counts) declared
 crate::intern	views017/main.vl:28:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
-std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:531:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
-std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:368:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
 crate::count	views017/main.vl:32:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64
-std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
-<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
-std::gpu::timing::QuerySet::count	../../compiler/std/gpu/timing.vl:37:12	method	pub fn count(self) -> i64	effects: none
 <std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
-std::cli::Matches::count	../../compiler/std/cli.vl:1417:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: volec query items

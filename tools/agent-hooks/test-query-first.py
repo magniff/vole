@@ -132,6 +132,28 @@ case("range: cat piped into grep blocked", blocked("cd %s && cat %s | grep -n fn
 case("range: two files blocked", blocked("cd %s && head -n 20 %s compiler/std/gpu/types.vl" % (TREE, BIG))[0], True)
 case("range: grep of one large file blocked", blocked("cd %s && grep -n 'fn frame' %s" % (TREE, BIG))[0], True)
 case("range: sed -i still blocked", blocked("cd %s && sed -i '' '1,10s/a/b/' %s" % (TREE, BIG))[0], True)
+# (0.25.5) Several ranges of one file (fb254 #6): each at most 200 lines,
+# all of them at most 400.
+case("ranges: sed -n 'A,Bp;C,Dp' runs, logged",
+     (blocked("cd %s && sed -n '741,760p;840,890p' %s" % (TREE, BIG))[0], [r["kind"] for r in LOGGED][-1:]),
+     (False, ["read-range"]))
+case("ranges: -e A,Bp -e C,Dp and a line run", blocked("cd %s && sed -n -e '1,20p' -e '30,40p;99p' %s" % (TREE, BIG))[0],
+     False)
+case("ranges: one of over 200 lines blocked", blocked("cd %s && sed -n '1,20p;30,240p' %s" % (TREE, BIG))[0], True)
+case("ranges: over 400 lines in all blocked",
+     blocked("cd %s && sed -n '1,150p;200,350p;400,550p' %s" % (TREE, BIG))[0], True)
+case("ranges: another command among them blocked", blocked("cd %s && sed -n '1,20p;s/a/b/p' %s" % (TREE, BIG))[0], True)
+# (0.25.5) Files of other kinds under compiler/std (stdunsafe254 #8): not
+# vole source; a directory, or .vl files, still are.
+case("std, not .vl: grep of tables/*.objc runs",
+     blocked("cd %s && grep -rn MTLDevice compiler/std/objc/tables/*.objc" % TREE)[0], False)
+case("std, not .vl: grep of index.awk runs", blocked("cd %s && grep -n LAZY compiler/std/index.awk" % TREE)[0], False)
+case("std, not .vl: grep -r --include of .objc runs",
+     blocked("cd %s && grep -rn MTLDevice compiler/std --include='*.objc'" % TREE)[0], False)
+case("std, not .vl: grep -r of the directory still blocked",
+     blocked("cd %s && grep -rn MTLDevice compiler/std" % TREE)[0], True)
+case("std, not .vl: --include of .vl still blocked",
+     blocked("cd %s && grep -rn MTLDevice compiler/std --include='*.vl'" % TREE)[0], True)
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.vl")[0], True)
 # (0.25.2.1) A program's files outside compiler/src and compiler/std (an
 # example, a program an agent writes) are read freely, as the Read tool
@@ -190,7 +212,7 @@ case("sed -i: the allowance, the override", err.splitlines()[2:],
       "(a program you write: as you like)", "override: append '# no-tool: <why the tools are not enough>'"])
 st, err = blocked("cat > /tmp/w/a.txt <<'EOF'\nx\nEOF\nsed -i '' 's/a/b/' compiler/src/range.vl; ls")
 case("sed -i on a compound line: nothing ran, which part", err.splitlines()[0],
-     "blocked hook.edit-tool: NOTHING on this line ran (3 commands): command 2 (`sed -i '' 's/a/b/' "
+     "blocked hook.edit-tool: NOTHING on this line ran (3 commands; commands 1 and 3 would have run alone): command 2 (`sed -i '' 's/a/b/' "
      "compiler/src/range.vl`) (sed -i) rewrites the compiler's source (compiler/src/range.vl)")
 # (0.25.2.2) the line less the blocked command, to run as it is
 case("sed -i on a compound line: the rest, to run as it is", err.splitlines()[2:6],
@@ -348,7 +370,7 @@ for what, line in EVAL_BLOCKED:
 st, err = blocked("cd %s && sed -n 95,415p compiler/std/gpu/types.vl; ls examples/gpu/fluid2d/; "
                   "wc -l examples/gpu/fluid2d/*.vl; cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/" % TREE)
 case("compound, eval qwen35: nothing ran, which part", (st, err.splitlines()[0]),
-     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`sed -n 95,415p "
+     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands; commands 1, 3, 4, 5, 6 and 7 would have run alone): command 2 (`sed -n 95,415p "
             "compiler/std/gpu/types.vl`) reads the compiler's .vl source"))
 case("compound, eval qwen35: the whole line, the read as its query",
      [l for l in err.splitlines() if l.startswith("try the whole line: ")][0].endswith(
@@ -376,7 +398,7 @@ case("line_without: two blocked", hook.line_without("a; grep x b.vl; c; head -40
 st, err = blocked("cd %s && grep -rn \"sqrt\" compiler/std --include=*.vl | head -8; grep -rn \"sqrt\" "
                   "examples/gpu/fluid2d/*.vl | head -5; grep -rn \"sqrt\" docs/*.md book/*.md 2>/dev/null | head -5" % TREE)
 case("compound, eval cloth: nothing ran, the std part", (st, err.splitlines()[0]),
-     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`grep -rn \"sqrt\" "
+     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands; commands 1, 3, 4, 5, 6 and 7 would have run alone): command 2 (`grep -rn \"sqrt\" "
             "compiler/std --include=*.vl`) reads the compiler's .vl source"))
 case("compound, eval cloth: rerun the others", "then run the line's other commands again: they did not run"
      in err or "try the whole line: " in err, True)
@@ -441,7 +463,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     "tool_input": {"command": command}, "tool_response": {"stdout": stdout, "stderr": ""}})
     st, err, recs = at(repo, "ls; cat compiler/src/front/big.vl; echo done")
     case("per command: nothing ran, the reading one named", (st, err.splitlines()[0]),
-         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands): command 2 "
+         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands; commands 1 and 3 would have run alone): command 2 "
              "(`cat compiler/src/front/big.vl`) reads the compiler's .vl source"))
     case("per command: the whole line to run instead", "try the whole line: ls; volec query items "
          "crate::front::big; echo done" in err.splitlines(), True)
@@ -760,7 +782,7 @@ with tempfile.TemporaryDirectory() as tmp:
         case("in doubt, blocked: " + amb, rewritten(repo, amb, "doubt")[0], 2)
     st, err, recs = at(repo, "sed -n 1,5p %s; grep -n 'f1.*' %s; ls" % (B, B))
     case("blocked: the translated parts named", (st, err.splitlines()[0], err.splitlines()[-4]),
-         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands): command 2 "
+         (2, "blocked hook.query-first: NOTHING on this line ran (3 commands; commands 1 and 3 would have run alone): command 2 "
              "(`grep -n 'f1.*' compiler/src/front/big.vl`) reads the compiler's .vl source",
           "the line's other reads of .vl source run as their queries on a retry: `sed -n 1,5p %s` as "
           "`%s query text %s:1-5`" % (B, T, B)))
@@ -774,6 +796,68 @@ with tempfile.TemporaryDirectory() as tmp:
           "volec query refs f2 | volec query grep f2"])
     del os.environ["VOLE_QUERY_MODE"]
     os.environ["PATH"] = old_path
+
+# (0.25.5) A file the branch added (untracked, staged, or committed on a
+# branch no release-* nor main has) is the agent's own: read and rewritten
+# with any tool (run254 #1, opt254 #5); a tracked one is still guarded. A
+# Python script that reads the compiler's source and writes elsewhere is
+# not a rewrite (opt254 #5); one whose target comes from compiler source,
+# or from outside the script, still is.
+import subprocess
+with tempfile.TemporaryDirectory() as tmp:
+    g = os.path.join(os.path.realpath(tmp), "g")
+    os.makedirs(os.path.join(g, "compiler", "src"))
+    big = "".join("fn f%d() {}\n" % i for i in range(400))
+    for name in ("old.vl", "mine.vl", "staged.vl", "committed.vl"):
+        with open(os.path.join(g, "compiler", "src", name), "w") as fh:
+            fh.write(big)
+    q = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+             GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null")
+
+    def git(*a):
+        subprocess.run(["git", "-C", g] + list(a), capture_output=True, env=q, check=True)
+    git("init", "-q", "-b", "main")
+    git("add", "compiler/src/old.vl")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "work")
+    git("add", "compiler/src/committed.vl")
+    git("commit", "-qm", "mine")
+    git("add", "compiler/src/staged.vl")
+
+    def gb(command):
+        hook._ADDED.clear()
+        st, err, _ = run({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": g, "tool_input": {"command": command}})
+        return st == 2
+    for name, want in (("old", True), ("mine", False), ("staged", False), ("committed", False)):
+        case("own file: grep of %s.vl %s" % (name, "blocked" if want else "runs"),
+             gb("grep -n f12 compiler/src/%s.vl" % name), want)
+        case("own file: sed -i of %s.vl %s" % (name, "blocked" if want else "runs"),
+             gb("sed -i '' 's/f1/g1/' compiler/src/%s.vl" % name), want)
+    case("own file: python write of mine.vl runs",
+         gb("python3 - <<'EOF'\np = 'compiler/src/mine.vl'\nopen(p, 'w').write('x')\nEOF"), False)
+    case("own file: python write of old.vl blocked",
+         gb("python3 - <<'EOF'\np = 'compiler/src/old.vl'\nopen(p, 'w').write('x')\nEOF"), True)
+    git("checkout", "-q", "main")
+    case("own file: on main, a commit of another branch is not its own", gb("grep -n f12 compiler/src/committed.vl"),
+         True)
+    git("checkout", "-q", "work")
+
+    def py(body):
+        return gb("python3 - <<'EOF'\n%s\nEOF" % body)
+    case("python: reads source, writes a scratch file through join: runs",
+         py("import os\nsrc = open('compiler/src/old.vl').read()\nout = os.path.join('/private/tmp/x', 'facts.txt')\n"
+            "open(out, 'w').write(src)"), False)
+    case("python: reads source, writes a file named by f-string from a literal: runs",
+         py("d = '/private/tmp/x'\ns = open('compiler/src/old.vl').read()\nwith open(f'{d}/a.txt', 'w') as fh:\n    fh.write(s)"),
+         False)
+    case("python: writes a path joined from compiler/src: blocked",
+         py("import os\nroot = 'compiler/src'\np = os.path.join(root, 'old.vl')\nopen(p, 'w').write('x')"), True)
+    case("python: writes each of a list of compiler files: blocked",
+         py("for p in ['compiler/src/old.vl']:\n    s = open(p).read()\n    open(p, 'w').write(s)"), True)
+    case("python: writes a glob of compiler source: blocked",
+         py("import glob\nfor p in glob.glob('compiler/src/*.vl'):\n    open(p, 'w').write('x')"), True)
+    case("python: a target from argv, naming compiler source: blocked",
+         gb("python3 -c \"import sys; open(sys.argv[1], 'w').write('x')\" compiler/src/old.vl"), True)
 shutil.rmtree(STATE, ignore_errors=True)
 
 print("total", "ok" if FAILED == 0 else f"{FAILED} failed")

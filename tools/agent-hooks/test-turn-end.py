@@ -224,6 +224,28 @@ try:
           "target/tools/volec"])
     case("and the next edit is silent (clean)", hook("check-after-edit.py", edit, VOLE_CHECK_COMPILER=stale_fake)[1],
          "")
+
+    # (0.25.5) A compiler that reads no tree's system file, whose built-in
+    # one is not the tree's (a std item just added there): its errors would
+    # be false, so they are not reported; one line says so, once.
+    sc = os.path.join(tmp, "sc")
+    os.makedirs(os.path.join(sc, ".git"))
+    write(os.path.join(sc, "compiler", "std", "std.vl"), "mod sys;\n")
+    write(os.path.join(sc, "compiler", "std", "embed.sh"), "")
+    sysf = os.path.join(sc, "compiler", "std", "sys", "linux.vl" if sys.platform.startswith("linux") else "macos.vl")
+    write(sysf, "pub fn sys_c_strerror_r() -> i32 { 0 }\n")
+    write(os.path.join(sc, "ex", "main.vl"), "fn main() {\n    std::sys_c_strerror_r();\n}\n")
+    old_std = os.path.join(sc, "target", "tools", "volec")
+    write(old_std, "#!/bin/sh\necho '%s' >&2\nexit 1\n# pub fn sys_c_other() -> i32 { 0 }\n" % json.dumps(
+        dict(err, message="no 'sys_c_strerror_r' in module 'std'")))
+    os.chmod(old_std, 0o755)
+    sstop = dict(stop, session_id="stalestd", cwd=os.path.join(sc, "ex"))
+    out = hook("turn-end.py", sstop, VOLE_CHECK_COMPILER=old_std)[1]
+    got = (reason(out) or "").split("\n")
+    case("a compiler with another std built in: one line, not its false errors",
+         (got[0], got[1].split(":")[0], got[-1], "no 'sys_c_strerror_r'" in (reason(out) or "")),
+         ("turn-end: main.vl not checked", "note hook.stale-std", "try: bootstrap/bootstrap.sh --dev --no-suite",
+          False))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

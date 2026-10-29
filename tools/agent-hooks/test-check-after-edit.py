@@ -532,6 +532,86 @@ try:
     if saved_cc is not None:
         os.environ["VOLE_CHECK_COMPILER"] = saved_cc
 
+    # (0.25.5) The tree's std: $VOLE_STD_TREE names the checkout's
+    # compiler/std for every compiler run; a compiler that cannot read the
+    # tree's system file (no $VOLE_STD_TREE in it: before 0.25.5) and has
+    # another one built in is said once (hook.stale-std) and replaced by
+    # target/volec when that one is current, else not run.
+    srepo = os.path.join(tmp, "stdrepo")
+    os.makedirs(os.path.join(srepo, ".git"))
+    sysf = os.path.join(srepo, "compiler", "std", hook.SYS_FILE)
+    sys_text = "".join(f"pub const SYS_{k}: i64 = {k}; // \"quoted\" \\ text\n" for k in range(200))
+    write(sysf, sys_text)
+    write(os.path.join(srepo, "compiler", "std", "std.vl"), "mod sys;\n")
+    write(os.path.join(srepo, "compiler", "std", "embed.sh"), "")
+    chunks = hook.sys_chunks(sys_text.encode())
+    case("stale-std: chunks of at most 2000 escaped bytes, whole lines",
+         (len(chunks) > 1, b"".join(chunks) == sys_text.encode(), all(c.endswith(b"\n") for c in chunks)),
+         (True, True, True))
+    case("stale-std: std_tree", (hook.std_tree(os.path.join(srepo, "x")), hook.std_tree(prog)),
+         (os.path.join(srepo, "compiler", "std"), None))
+    case("stale-std: VOLE_STD_TREE for a run in the checkout",
+         ((hook.std_env(srepo) or {}).get("VOLE_STD_TREE"), hook.std_env(prog)),
+         (os.path.join(srepo, "compiler", "std"), None))
+    sdir = os.path.join(srepo, "compiler", "std")
+    built = os.path.join(srepo, "target", "tools", "volec")
+    write(built, "#!/bin/sh\nexit 0\n")
+    with open(built, "ab") as fh:
+        fh.write(b"\0".join(chunks) + b"\0")
+    os.chmod(built, 0o755)
+    case("stale-std: its system file built in: same", hook.std_state(built, sdir, {}), "same")
+    write(sysf, sys_text + "pub fn sys_c_new() -> i64 { 1 }\n")
+    case("stale-std: another one built in: stale", hook.std_state(built, sdir, {}), "stale")
+    reader = os.path.join(srepo, "reader-volec")
+    write(reader, "#!/bin/sh\n# VOLE_STD_TREE\nexit 0\n")
+    os.chmod(reader, 0o755)
+    case("stale-std: a compiler that reads the tree's", hook.std_state(reader, sdir, {}), "reads")
+    sst = {}
+    use, line = hook.current_std(built, srepo, sst)
+    case("stale-std: no current build: not checked, said",
+         (use, line.split(": ")[0], "not checked" in line, line.split("\n")[1]),
+         (None, "note hook.stale-std", True, "try: bootstrap/bootstrap.sh --dev --no-suite"))
+    case("stale-std: said once a session", hook.current_std(built, srepo, sst), (None, ""))
+    shutil.copy(reader, os.path.join(srepo, "target", "volec"))
+    use, line = hook.current_std(built, srepo, {})
+    case("stale-std: target/volec reads the tree's: checked with it",
+         (use, "checked with target/volec instead" in line), (os.path.join(srepo, "target", "volec"), True))
+    case("stale-std: a reader is used as it is", hook.current_std(reader, srepo, {}), (reader, ""))
+    write(os.path.join(srepo, "ex", "main.vl"), "fn main() {}\n")
+    sev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": srepo, "session_id": "stalestd",
+           "tool_input": {"file_path": os.path.join(srepo, "ex", "main.vl")}}
+    os.remove(os.path.join(srepo, "target", "volec"))
+    case("stale-std: end to end, one line", ctx_of(run(sev, built)[1]).split("\n")[0].split(": ")[0],
+         "note hook.stale-std")
+
+    # (0.25.5) A change to the guide's source: the hook runs
+    # compiler/guide/embed.sh, which makes the compiler's copy, and names
+    # what it rewrote; VOLE_HOOK_FIX=0: it says to run it.
+    grepo = os.path.join(tmp, "guiderepo")
+    os.makedirs(os.path.join(grepo, ".git"))
+    write(os.path.join(grepo, "compiler", "guide", "how.md"), "# how\n")
+    write(os.path.join(grepo, "compiler", "src", "guide", "text", "t_how.vl"), "old\n")
+    write(os.path.join(grepo, "compiler", "guide", "embed.sh"),
+          "cd \"$(dirname \"$0\")/../..\"\ncat compiler/guide/how.md > compiler/src/guide/text/t_how.vl\n")
+    how = os.path.join(grepo, "compiler", "guide", "how.md")
+    gev = {"tool_name": "Edit", "cwd": grepo, "tool_input": {"file_path": how}}
+    case("guide: an Edit of a topic", hook.guide_paths(gev), [how])
+    case("guide: sed -i of one", hook.guide_paths({"tool_name": "Bash", "cwd": grepo, "tool_input": {
+        "command": "sed -i '' 's/a/b/' compiler/guide/how.md"}}), [how])
+    case("guide: a read is not a change", hook.guide_paths({"tool_name": "Bash", "cwd": grepo, "tool_input": {
+        "command": "cat compiler/guide/how.md > /dev/null"}}), [])
+    case("guide: another .md is not", hook.guide_paths(dict(gev, tool_input={"file_path": os.path.join(grepo, "docs", "a.md")})),
+         [])
+    case("guide: embed.sh run, its rewrite named", hook.guide_embed(gev),
+         "ran compiler/guide/embed.sh, by the hook after the guide's change: rewrote compiler/src/guide/text/t_how.vl "
+         "(`volec guide` prints that copy once rebuilt; tests/run.sh guide compiles its examples)")
+    case("guide: current already", "the compiler's copy was current" in hook.guide_embed(gev), True)
+    os.environ["VOLE_HOOK_FIX"] = "0"
+    case("guide: VOLE_HOOK_FIX=0, said only", hook.guide_embed(gev),
+         "note hook.guide-embed: compiler/guide/how.md changed; the compiler's copy of the guide is made from it\n"
+         "try: sh compiler/guide/embed.sh")
+    del os.environ["VOLE_HOOK_FIX"]
+
     # Tests: run after a clean check when tests/ has cases, the new
     # failures shown, not again within the debounce.
     write(os.path.join(prog, "tests", "a.in"), "1\n")
@@ -655,6 +735,27 @@ try:
              "\nchanged main.vl:3: let y = z+1; -> let y = z + 1;")
         bash_dry = dict(bash, tool_input={"command": "volec fmt --dry-run main.vl"})
         case("real: fmt --dry-run, nothing said", run(bash_dry, real)[1], "")
+        # (0.25.5) An item just added to the tree's std, its system file
+        # too, is no error (0.25.4's false `std::sys_c_strerror_r`), the
+        # program checked from another directory.
+        if hook.STD_MARK in hook.binary_bytes(real) and os.path.isdir(os.path.join(REPO, "compiler", "std")):
+            nrepo = os.path.join(tmp, "newstd")
+            os.makedirs(os.path.join(nrepo, ".git"))
+            shutil.copytree(os.path.join(REPO, "compiler", "std"), os.path.join(nrepo, "compiler", "std"))
+            with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
+                fh.write("pub fn zz_hook_probe() -> i64 { 7 }\n")
+            with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
+                fh.write("pub fn zz_hook_probe2() -> i64 { 8 }\n")
+            write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
+                  "fn main() {\n    let x = std::zz_hook_probe() + std::str::zz_hook_probe2();\n    println(f\"{x}\");\n}\n")
+            nev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": os.path.join(nrepo, "ex", "a", "deep", "er"),
+                   "tool_input": {"file_path": os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl")}}
+            case("real: a std item added in the tree, its system file too", run(nev, real), (0, ""))
+            with open(os.path.join(nrepo, "compiler", "std", hook.SYS_FILE), "a") as fh:
+                fh.write("pub fn zz_bad() -> i64 { true }\n")
+            got = ctx_of(run(nev, real)[1])
+            case("real: an error in the tree's system file, at its line",
+                 f"compiler/std/{hook.SYS_FILE}:" in got and "expected 'i64', got 'bool'" in got, True)
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):

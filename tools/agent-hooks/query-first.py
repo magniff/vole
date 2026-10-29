@@ -93,6 +93,15 @@ query, the line without it, as typed (`try the line without it:`; a
 PreToolUse hook cannot run the rest), so the retry is one copy; and a
 bounded line range of any .vl runs (`sed -n 'A,Bp'`, `head`/`tail -n
 N`, `cat -n F | sed -n ...`: at most RANGE_LINES lines, `read-range`).
+(0.25.5, the 0.25.4 feedback digest, section 1) Fewer blocks: several
+ranges of one file (`sed -n 'A,Bp;C,Dp'`, each at most RANGE_LINES, all
+at most twice it); a `.vl` file the branch added (untracked, staged, or
+added by a commit no release-* branch nor main has: branch_added), read
+or rewritten with any tool; files of other kinds under compiler/src and
+compiler/std (`tables/*.objc`, a grep `--include` of them); a Python
+script whose writes go elsewhere, its targets followed through the
+script's assignments (written_from). A blocked line names the commands
+that would have run alone.
 Development tooling only: not part of the build.
 """
 import json
@@ -368,6 +377,13 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, pro
         if prog == "cat" and (">" in seg):
             continue  # writing a file
         files = []
+        # (0.25.5) grep -r restricted to files of other kinds (`--include
+        # '*.objc'`) reads no .vl
+        includes = [a.split("=", 1)[1] if "=" in a else "" for a in args if a.startswith("--include")]
+        includes += [args[k + 1] for k, a in enumerate(args[:-1]) if a == "--include"]
+        if prog in ("grep", "rg", "egrep", "fgrep") and includes and all(
+                g and re.search(r"\.\w+$", g) and not g.endswith(".vl") for g in includes if g):
+            continue
         for a in file_args(prog, args):
             e = tc.expand(a, assigns)
             if not reads_source(a, here):
@@ -383,6 +399,9 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, pro
         # reads of its own small files).
         kinds = [k if k != "source" or compiler_file(f, a) else "program"
                  for k, (a, f) in zip(kinds, files)]
+        # (0.25.5) and a file its branch added (untracked, or new since the
+        # branch's base): the agent wrote it
+        kinds = [k if k != "source" or not branch_added(f) else "program" for k, (a, f) in zip(kinds, files)]
         if all(k == "fixture" for k in kinds):
             if fixtures is not None:
                 fixtures.append((prog, args))
@@ -427,9 +446,44 @@ def bounded_range(prog, ops, full):
         return False
     try:
         rng = text_range(prog, ops, full)
+        # (0.25.5) several ranges, `sed -n 'A,Bp;C,Dp'` or `-e 'A,Bp' -e
+        # 'C,Dp'`: each within the limit, all of them within twice it
+        # (fb254 #6: two ranges of under 200 lines of a 1,633-line file)
+        rngs = [rng] if rng else sed_ranges(prog, ops, full)
     except (OSError, ValueError):
         return False
-    return bool(rng) and 0 <= rng[1] - rng[0] < RANGE_LINES
+    return bool(rngs) and all(0 <= b - a < RANGE_LINES for a, b in rngs) and \
+        sum(b - a + 1 for a, b in rngs) <= 2 * RANGE_LINES
+
+
+def sed_ranges(prog, ops, full):
+    """(0.25.5) The ranges [(A, B)] a `sed -n` of several print commands
+    prints (`'A,Bp;C,Dp;Ep'`, or each with its `-e`); None for any other
+    script."""
+    if prog != "sed" or "-n" not in ops:
+        return None
+    scripts, k, rest = [], 0, [a for a in ops if a != "-n"]
+    while k < len(rest):
+        if rest[k] in ("-e", "--expression") and k + 1 < len(rest):
+            scripts.append(rest[k + 1])
+            k += 2
+        elif rest[k].startswith("-"):
+            return None
+        else:
+            scripts.append(rest[k])
+            k += 1
+    out = []
+    for sc in scripts:
+        for cmd in sc.replace("\n", ";").split(";"):
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+            m = re.match(r"^(\d+)(?:,(\d+|\$))?p$", cmd)
+            if not m:
+                return None
+            b = m.group(2) or m.group(1)
+            out.append((int(m.group(1)), lines_of_all(full) if b == "$" else int(b)))
+    return out or None
 
 
 def piped_range(command, located, idx, full):
@@ -455,6 +509,49 @@ class Read(tuple):
         t = tuple.__new__(cls, (prog, args, seg, files))
         t.idx = idx
         return t
+
+
+_ADDED = {}
+
+
+def added_paths(top):
+    """(0.25.5) The files (relative to checkout top) its branch added:
+    untracked and not ignored, added to the index, or added by a commit of
+    the branch that no release-* branch nor main has; computed once a call,
+    only for a command that would be blocked (two git commands)."""
+    if top in _ADDED:
+        return _ADDED[top]
+    out = set()
+    for args in (["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                 ["log", "--diff-filter=A", "--name-only", "--format=", "HEAD", "--not",
+                  "--glob=refs/heads/release-*", "refs/heads/main", "--"]):
+        try:
+            r = subprocess.run(["git", "-C", top] + args, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode != 0:
+            continue
+        if args[0] == "status":
+            for e in r.stdout.split("\0"):
+                if len(e) > 3 and (e[:2] == "??" or e[0] == "A"):
+                    out.add(e[3:])
+        else:
+            out |= {x.strip() for x in r.stdout.splitlines() if x.strip()}
+    _ADDED[top] = out
+    return out
+
+
+def branch_added(full):
+    """(0.25.5) Whether file full is one its checkout's branch added
+    (added_paths): the agent wrote it, so it reads and rewrites it with any
+    tool (run254 #1, opt254 #5: a file of the session's own, blocked)."""
+    if not full or not os.path.isfile(full):
+        return False
+    top = checkout_of(os.path.dirname(full))[0]
+    if not top or not os.path.exists(os.path.join(top, ".git")):
+        return False
+    rel = os.path.relpath(os.path.realpath(full), os.path.realpath(top))
+    return not rel.startswith("..") and rel in added_paths(top)
 
 
 def file_kind(full, cwd, typed=None):
@@ -623,8 +720,13 @@ def reads_source(path, cwd=None):
     the path reads inside its vole tree, is_scratch)."""
     if is_scratch(path, cwd):
         return False
-    return path.endswith(".vl") or bool(SOURCE_DIRS.match(path)) or (
-        ("compiler/src" in path or "compiler/std" in path) and not path.endswith((".sh", ".md", ".toml", ".py", ".awk")))
+    # (0.25.5) a file of another kind under compiler/src or compiler/std
+    # (`tables/*.objc`, index.awk, a README: stdunsafe254 #8) is not vole
+    # source, as typed (a glob too): only a .vl, a directory, a glob of .vl
+    base = os.path.basename(path.rstrip("/"))
+    if re.search(r"\.\w+$", base) and not base.endswith(".vl"):
+        return False
+    return path.endswith(".vl") or bool(SOURCE_DIRS.match(path)) or ("compiler/src" in path or "compiler/std" in path)
 
 
 def compiler_paths(text):
@@ -689,14 +791,12 @@ def program_source_paths(paths, cwd, base=""):
     for reads: an agent rewrites its own program as it likes.)"""
     out = []
     for a in paths:
-        if compiler_paths(a):
-            out.append(a)
-            continue
-        if not a.endswith(".vl"):
-            continue
         full = os.path.normpath(os.path.join(cwd or os.getcwd(), base, a))
-        if os.path.isfile(full) and file_kind(full, cwd, a) == "source" and compiler_file(full):
-            out.append(a)
+        if compiler_paths(a) or a.endswith(".vl") and os.path.isfile(full) \
+                and file_kind(full, cwd, a) == "source" and compiler_file(full):
+            # (0.25.5) not a file its branch added: the agent's own, any tool
+            if not branch_added(full):
+                out.append(a)
     return out
 
 
@@ -736,7 +836,8 @@ def source_rewrites(command, cwd=None):
     if script and re.search(r"\.write\(|write_text\(|write_bytes\(", script):
         targets = python_targets(script)
         if targets is None:
-            files = compiler_paths(script)
+            files = [f for f in compiler_paths(script)
+                     if not branch_added(os.path.normpath(os.path.join(cwd or os.getcwd(), base, f)))]
         else:
             files = program_source_paths(targets, cwd, base)
         if files and not (scratch_cwd and not any(f.startswith("/") for f in files)):
@@ -776,23 +877,81 @@ def python_targets(command):
         m = re.search(r"\b%s\s*=\s*(?:[\w.]*Path\(\s*)?(?:r|b|f)?(['\"])(.+?)\1" % re.escape(name), command)
         return m.group(2) if m else None
 
-    for m in re.finditer(r"\bopen\(\s*([^,()]+?)\s*,\s*(?:mode\s*=\s*)?(?:r|b)?(['\"])([^'\"]*)\2", command):
+    def unresolved(expr):
+        """(0.25.5) A write target that is no literal: what the script makes
+        it from (written_from); its compiler paths are the targets, and
+        one made from nothing that names compiler source writes none (a
+        script that reads the compiler's source and writes a scratch file,
+        opt254 #5); unknown when it may come from outside the script."""
+        nonlocal unknown
+        got = written_from(expr, command)
+        if got is None:
+            unknown = True
+        else:
+            targets.extend(got)
+
+    for m in re.finditer(r"\bopen\(\s*([^,()]+?(?:\([^()]*\))?[^,()]*?)\s*,\s*(?:mode\s*=\s*)?(?:r|b)?(['\"])([^'\"]*)\2",
+                         command):
         if not re.search(r"[wax+]", m.group(3)):
             continue
         arg = m.group(1).strip()
-        lit = re.match(r"^(?:r|b|f)?(['\"])(.*)\1$", arg)
+        lit = re.match(r"^(?:r|b|f)?(['\"])([^'\"]*)\1$", arg)
         path = lit.group(2) if lit else (literal_of(arg) if re.match(r"^\w+$", arg) else None)
         if path is None:
-            unknown = True
+            unresolved(arg)
         else:
             targets.append(path)
     for m in re.finditer(r"(?:\b[\w.]*Path\(\s*(?:r|b|f)?(['\"])(.+?)\1\s*\)|\b(\w+))\.write_(?:text|bytes)\(", command):
         path = m.group(2) if m.group(2) else literal_of(m.group(3))
         if path is None:
-            unknown = True
+            unresolved(m.group(3) or "")
         else:
             targets.append(path)
     return None if unknown else targets
+
+
+# (0.25.5) What a script's value may come from outside it.
+OUTSIDE = re.compile(r"\bargv\b|\benviron\b|\bgetenv\b|\binput\(|\bstdin\b|\blistdir\b|\bwalk\(|\bglob\b|\biterdir\b|"
+                     r"\brglob\b|\bscandir\b")
+COMPILER_WORD = re.compile(r"(?:[\w.~-]+/)*compiler/(?:src|std)\b(?!/[\w./*-]*\.vl)(?:/[\w-]+)*")
+PY_NAMES = re.compile(r"(?<![\w.'\"])([A-Za-z_]\w*)\b(?!\s*\()")
+
+
+def written_from(expr, script, depth=0):
+    """(0.25.5) The compiler paths a Python expression (a write's target)
+    is made from, following the names it uses to their assignments in
+    script (`p = ...`, `for p in ...`, at most 4 deep): [] when none of
+    them names compiler source and nothing comes from outside the script;
+    None when it may (sys.argv, the environment, a directory listing, a
+    name with no assignment in script that is not a module's)."""
+    if depth > 4:
+        return None
+    named = compiler_paths(expr)
+    if not named:
+        # (a directory of the compiler's source, `'compiler/src'`: its files)
+        named = [m.group(0) + "/*.vl" for m in COMPILER_WORD.finditer(expr)]
+    if OUTSIDE.search(expr):
+        return None if not named else named
+    out = list(named)
+    # (the names outside string literals, and inside an f-string's braces)
+    bare = re.sub(r"(['\"])((?:\\.|(?!\1).)*)\1", lambda m: " ".join(re.findall(r"\{([^{}]*)\}", m.group(2))), expr)
+    for name in dict.fromkeys(PY_NAMES.findall(bare)):
+        if name in ("os", "sys", "path", "pathlib", "Path", "str", "f", "r", "b", "True", "False", "None",
+                    "join", "dirname", "basename", "abspath", "normpath", "with_suffix", "parent", "name"):
+            continue
+        origins = re.findall(r"^\s*%s\s*(?::[^=]*)?=(?!=)\s*(.+)$" % re.escape(name), script, re.M)
+        origins += re.findall(r"\bfor\s+(?:\w+\s*,\s*)*%s(?:\s*,\s*\w+)*\s+in\s+(.+?):\s*$" % re.escape(name), script, re.M)
+        origins += re.findall(r"\bas\s+%s\s*:" % re.escape(name), script) and [""] or []
+        if not origins:
+            if re.search(r"^\s*(?:import|from)\s.*\b%s\b" % re.escape(name), script, re.M):
+                continue
+            return None
+        for o in origins:
+            got = written_from(o, script, depth + 1)
+            if got is None:
+                return None
+            out += got
+    return out
 
 
 def edit_suggestion(prog, files, script, cwd=None, base=""):
@@ -943,7 +1102,8 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
 
     def where(sg):
         return part_named(parts, sg)
-    lines = ["blocked hook.query-first: %s: %s reads the compiler's .vl source" % (nothing_ran(parts), where(seg))]
+    lines = ["blocked hook.query-first: %s: %s reads the compiler's .vl source"
+             % (nothing_ran(parts, [seg] + [o[2] for o in others]), where(seg))]
     # (0.25.2) A file of another program than cwd's: every query says
     # `--root`, so that each try: line works where the agent stands.
     full0 = files[0][1] if files and files[0][1] else None
@@ -1073,11 +1233,21 @@ def command_parts(command):
     return [s for s in tc.segments(command) if s.strip() and not s.strip().startswith("#")]
 
 
-def nothing_ran(parts):
+def nothing_ran(parts, blocked=()):
     """(0.25.2.1) The head of a block message: a blocked call runs none of
     its line (an agent took `the others are not blocked` for `the others
-    ran`, and its `cat > a && cat > b` chain made nothing)."""
-    return "NOTHING on this line ran (%d commands)" % len(parts) if len(parts) > 1 else "nothing ran"
+    ran`, and its `cat > a && cat > b` chain made nothing). (0.25.5) With
+    the blocked commands' texts, which of the others would have run alone
+    (fb254 #6): `1, 2 and 4 would have run alone`."""
+    if len(parts) <= 1:
+        return "nothing ran"
+    bad = {x.strip() for x in blocked}
+    ok = [str(k + 1) for k, p in enumerate(parts) if p.strip() not in bad]
+    if not bad or not ok or len(ok) == len(parts):
+        return "NOTHING on this line ran (%d commands)" % len(parts)
+    names = ok[0] if len(ok) == 1 else ", ".join(ok[:-1]) + " and " + ok[-1]
+    return "NOTHING on this line ran (%d commands; %s %s would have run alone)" % (
+        len(parts), "command" if len(ok) == 1 else "commands", names)
 
 
 def part_named(parts, sg):
@@ -1899,7 +2069,9 @@ def main():
                 rest = line_without(command, (), bad) if bad else None
             sys.stderr.write("blocked hook.edit-tool: %s: %s rewrites the compiler's source (%s)\n"
                              "try: %s\n%s%s\noverride: append '# no-tool: <why the tools are not enough>'\n"
-                             % (nothing_ran(parts), what, files[0],
+                             % (nothing_ran(parts, [seg] if seg else [p for p in tc.segments(command)
+                                                                     if re.match(r"^(\S*/)?python[\d.]*\b", p.strip())]),
+                                what, files[0],
                                 edit_suggestion(prog, files, script, cwd, base),
                                 ("try the line without it (the rest did not run either): %s\n" % rest) if rest
                                 else "then run the line's other commands again: they did not run\n"

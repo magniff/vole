@@ -1412,6 +1412,24 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   target/bootstrap/HOST/v0.25.3-HASH/volec target/tools/volec` (the
   release's build in the bootstrap cache; else `bootstrap/bootstrap.sh
   --dev`).
+- (0.25.5) The tree's std. `volec check` reads std from the checkout's
+  compiler/std when its files differ from the std built into the
+  compiler (0.17), now the target's system file too (sys/macos.vl,
+  sys/linux.vl: 0.25.4's false `std::sys_c_strerror_r` errors), and the
+  hooks name the tree, `$VOLE_STD_TREE` (the checkout's compiler/std),
+  wherever check runs. A compiler before 0.25.5 reads no system file:
+  when the tree's is not the one built into it (its text, as embed.sh
+  writes it into the compiler, is looked for in the binary), the hooks
+  say so once, `note hook.stale-std: compiler/std/sys/macos.vl is not
+  the one built into target/tools/volec ...` and `try:
+  bootstrap/bootstrap.sh --dev --no-suite`, and check with target/volec
+  when that one is current, else not at all, instead of reporting false
+  errors.
+- (0.25.5) After a change to the guide's source (compiler/guide/*.md,
+  topics.txt: a Write or Edit, a `sed -i`, a redirection), the check
+  hook runs compiler/guide/embed.sh (half a second; it writes only the
+  generated compiler/src/guide/text/) and says which files it rewrote;
+  with VOLE_HOOK_FIX=0 it says to run it (`note hook.guide-embed`).
 - **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
   read of `.vl` source, judging each command of a line on its own (in
   the directory its `cd`s lead to, `$VAR`s assigned on the line
@@ -1431,9 +1449,21 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   not in doubt, `try the line without it: ...`, the rest of the line as
   typed (here-documents kept), to run as it is. A bounded line range of
   any `.vl` runs: `sed -n 'A,Bp'`, `head`/`tail -n N`, `cat -n F | sed
-  -n ...`, at most 200 lines (`read-range`); a grep of a large file, a
-  read of several, and every write of the compiler's source are still
-  blocked. The blocked record logs the `try:` commands it gave. After a
+  -n ...`, at most 200 lines (`read-range`); (0.25.5) and several
+  ranges of one file, `sed -n 'A,Bp;C,Dp'` (or `-e` each), each at most
+  200 lines and 400 in all. (0.25.5) A `.vl` file the branch added
+  (untracked, staged, or added by a commit no release-* branch nor main
+  has) is the agent's own: read and rewritten with any tool; a file of
+  another kind under compiler/src or compiler/std (`tables/*.objc`,
+  index.awk; a `grep -r --include '*.objc'`) is not vole source; a
+  Python script is a rewrite only when a file it opens for writing is
+  compiler source, its target followed through the script's assignments
+  (`out = os.path.join(scratch, 'x')` is not; a target from `sys.argv`,
+  the environment or a directory listing, with compiler source named,
+  still is); and a blocked line says which of its commands would have
+  run alone (`NOTHING on this line ran (5 commands; commands 1, 2, 3 and
+  5 would have run alone)`). A grep of a large file, a read of several,
+  and every write of the compiler's source are still blocked. The blocked record logs the `try:` commands it gave. After a
   call: a `# no-query:` reason asking for line numbers for the Edit tool
   is answered with `edit insert --after NAME` and `query def NAME`; the
   hints of tools/agent-hooks/hints.txt (`repeat-query` after the third

@@ -162,8 +162,12 @@ run_one() {
         awk -f "$ROOT/tests/stdpos.awk" "$meta/got" >"$meta/got.n"
     fi
     if [ "$UPDATE" -eq 1 ] && ! cmp -s "$meta/want.n" "$meta/got.n"; then
-        # each console block's lines become the ones it got
-        awk -v got="$meta/got" '
+        # each console block's lines become the ones it got (0.25.5: a line
+        # that differs only in std's numbers kept, tests/stdkeep.sh)
+        cp "$meta/got" "$meta/got.kept"
+        grep -q '^<!-- exact-std -->' "$readme" \
+            || sh "$ROOT/tests/stdkeep.sh" "$meta/want" "$meta/got" >"$meta/got.kept"
+        awk -v got="$meta/got.kept" '
             /^```console[ \t]*$/ && !in_block {
                 print; in_block = 1
                 while ((getline line < got) > 0 && line != "```") print line

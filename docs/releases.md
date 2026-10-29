@@ -72,6 +72,48 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.5
+
+- The check and turn-end hooks check with the tree's std: `volec check`
+  reads the target's system file (compiler/std/sys/macos.vl,
+  sys/linux.vl) from the tree as it reads std's other files when they
+  differ from the built-in std, and `$VOLE_STD_TREE` names the tree to
+  read wherever check runs (the hooks set it). A compiler before 0.25.5
+  whose built-in system file is not the tree's gets one line,
+  `note hook.stale-std`, instead of false `unresolved import` errors.
+- The check hook runs compiler/guide/embed.sh after a change to the
+  guide's source and names the files it rewrote.
+- query-first.py lets through a `.vl` file the branch added (any tool),
+  several small `sed -n` ranges of one file, reads of compiler/std's
+  other files (`*.objc`, index.awk), and a Python script that only reads
+  compiler source; a blocked line says which commands would have run
+  alone.
+- `tests/run.sh -n NAME`: one case, as `'=NAME'`, which zsh expands when
+  unquoted; the runner ends a failed run with `try: tests/run.sh -n
+  NAME ...` for the failing cases.
+- Transcripts a std change does not rewrite: std's list of modules (as
+  `query items` prints it) compares as one line; the LSP sessions compare
+  std's positions normalized; every runner's `-u` keeps the std numbers
+  of a line that did not change otherwise (tests/stdkeep.sh);
+  views017 asks for its items by path. `tests/stdpos/run.sh --real`
+  adds a function at the top of a std file and a std module, rebuilds,
+  and runs the query, refactor, walkthrough and LSP suites.
+- tests/refactor's `%` lines run the compiler under test as `volec`;
+  `tests/affected.sh --linux` prints the container's failures with their
+  differences; `tests/affected.sh` runs the compile-cost row (against the
+  last release built here, about 3 s) when compiler/std, the front end
+  or the optimizer change.
+- `volec test`'s default time limit is `$VOLE_TEST_CASE_TIMEOUT` when
+  set (10 s otherwise); the book's sessions give it nine times that on a
+  loaded machine, as the watchdog does (the 0.25.4 gate's Linux rows).
+- tests/fmt's `compiles` names a program changed during the run instead
+  of `differ`.
+- `guide how add-std-module` (index.awk's LAZY and GATES, closed gates,
+  header comments, why a build fails where `check` passes, the
+  transcripts), an alias fact's adversarial test and its mutant in
+  `add-pass`, the code prefixes and the 15-line help limit in
+  `add-diagnostic`.
+
 ### What's new in 0.25.4
 
 `volec run`, the pathtrace laboratory's feedback (feedbacks/pathtrace-ui.md),

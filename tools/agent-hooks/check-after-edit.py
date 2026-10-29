@@ -139,6 +139,16 @@ it is the one on PATH, else its path from the event's directory), so the
   same error is made twice or an error's help names the guide
   (VOLE_HINTS=0: never).
 
+(0.25.5, the 0.25.4 feedback digest, section 1)
+- The tree's std: every compiler run gets $VOLE_STD_TREE, the
+  checkout's compiler/std, which `check` reads when it differs from the
+  built-in std (its system file too, from 0.25.5); a compiler before
+  that whose built-in system file is not the tree's: `note
+  hook.stale-std` once, and target/volec checks when current, else
+  nothing (current_std).
+- A change to compiler/guide/*.md: compiler/guide/embed.sh run, the
+  files it rewrote named (guide_embed; VOLE_HOOK_FIX=0: said only).
+
 VOLE_CHECK_HOOK=0 turns it off; VOLE_HOOK_FIX=0 leaves the exact
 fixes to the agent. Development tooling only.
 """
@@ -373,13 +383,146 @@ def current_compiler(compiler, where, st=None):
     return use, line
 
 
+# (0.25.5) The tree's std. `volec check` reads std from the tree's files
+# (compiler/std) when they differ from the std built into it, so that a std
+# item just added is not a false `no 'X' in module 'std'`. It finds them
+# from the directory it runs in, at most three levels up; the hook names
+# them: $VOLE_STD_TREE, the checkout's compiler/std. A compiler before
+# 0.25.5 reads neither $VOLE_STD_TREE nor the tree's system file
+# (sys/macos.vl, sys/linux.vl: 0.25.4's false `std::sys_c_strerror_r`
+# errors): when that file is not the one built into it, the hook says so
+# in one line (hook.stale-std) and checks with target/volec when that one
+# is current, else not at all, instead of reporting false errors.
+STD_MARK = b"VOLE_STD_TREE"
+SYS_FILE = "sys/linux.vl" if sys.platform.startswith("linux") else "sys/macos.vl"
+
+
+def std_tree(where):
+    """(0.25.5) The checkout's compiler/std holding where (std.vl and
+    embed.sh there), or None."""
+    top = checkout_root(where) if where else None
+    d = os.path.join(top, "compiler", "std") if top else None
+    if d and os.path.exists(os.path.join(d, "std.vl")) and os.path.exists(os.path.join(d, "embed.sh")):
+        return d
+    return None
+
+
+def std_env(cwd):
+    """(0.25.5) The environment for a compiler run in cwd: $VOLE_STD_TREE
+    set to cwd's checkout's std (unless set already); None: the hook's
+    own."""
+    d = std_tree(cwd)
+    if not d or os.environ.get("VOLE_STD_TREE"):
+        return None
+    env = dict(os.environ)
+    env["VOLE_STD_TREE"] = d
+    return env
+
+
+_BINARIES = {}
+
+
+def binary_bytes(compiler):
+    """compiler's bytes (cached for the call), or b"" when unreadable."""
+    p = os.path.realpath(compiler)
+    if p not in _BINARIES:
+        try:
+            with open(p, "rb") as fh:
+                _BINARIES[p] = fh.read()
+        except OSError:
+            _BINARIES[p] = b""
+    return _BINARIES[p]
+
+
+def sys_chunks(text):
+    """(0.25.5) text as compiler/std/embed.sh's `lines` writes it into the
+    compiler: string literals of whole lines, a new one past 2000 bytes of
+    escaped text; each one's bytes, as the binary holds them."""
+    out, acc, n = [], [], 0
+    lines = text.split(b"\n")
+    if text.endswith(b"\n"):
+        lines = lines[:-1]
+    for line in lines:
+        esc = line.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
+        if n > 0 and n + len(esc) > 2000:
+            out.append(b"".join(acc))
+            acc, n = [], 0
+        acc.append(line + b"\n")
+        n += len(esc) + 2
+    if n > 0:
+        out.append(b"".join(acc))
+    return out
+
+
+def std_state(compiler, d, st=None):
+    """(0.25.5) How compiler stands to the tree's std in d: "reads" (it
+    reads the tree's files, the system file too), "same" (an older one
+    whose built-in system file is the tree's), "stale" (an older one whose
+    is not: its check of a program naming what changed there reports false
+    errors). Cached in st by the binary's path, size and time."""
+    try:
+        s = os.stat(compiler)
+        key = f"{os.path.realpath(compiler)}:{s.st_size}:{s.st_mtime_ns}"
+    except OSError:
+        return "same"
+    caps = st.setdefault("std_reads", {}) if st is not None else {}
+    data = None
+    if key not in caps:
+        data = binary_bytes(compiler)
+        caps[key] = STD_MARK in data
+    if caps[key]:
+        return "reads"
+    try:
+        with open(os.path.join(d, SYS_FILE), "rb") as fh:
+            text = fh.read()
+    except OSError:
+        return "same"
+    # (the answer for this binary and this text of the file, kept)
+    import zlib
+    skey = f"{key}:{zlib.crc32(text):x}:{len(text)}"
+    seen = st.setdefault("std_sys", {}) if st is not None else {}
+    if skey not in seen:
+        data = data if data is not None else binary_bytes(compiler)
+        seen[skey] = "same" if all(c + b"\0" in data for c in sys_chunks(text)) else "stale"
+    return seen[skey]
+
+
+def current_std(compiler, where, st=None):
+    """(0.25.5) The compiler to check with given the tree's std, and the one
+    line to say (once a session for the same binary): compiler itself unless
+    its std is stale (std_state); then target/volec when that one reads the
+    tree's std or has its system file built in; else None (no check)."""
+    d = std_tree(where)
+    if not compiler or not d or std_state(compiler, d, st) != "stale":
+        return compiler, ""
+    top = os.path.dirname(os.path.dirname(d))
+    build = os.path.join(top, "target", "volec")
+    use = None
+    if os.path.realpath(compiler) != os.path.realpath(build) and os.access(build, os.X_OK) \
+            and std_state(build, d, st) != "stale":
+        use = build
+    shown = os.path.relpath(compiler, top) if compiler.startswith(top + os.sep) else compiler
+    how = ("checked with target/volec instead" if use else
+           "not checked: an error naming what changed there would be false")
+    line = (f"note hook.stale-std: compiler/std/{SYS_FILE} is not the one built into {shown}, which reads "
+            f"no tree's system file (before 0.25.5); {how}\ntry: bootstrap/bootstrap.sh --dev --no-suite")
+    key = f"std:{compiler}:{SYS_FILE}"
+    if st is not None:
+        if key in (st.get("stale_noted") or []):
+            line = ""
+        else:
+            st.setdefault("stale_noted", []).append(key)
+    return use, line
+
+
 def run_typed(compiler, cwd, args):
     """compiler with args, run in cwd under the name the agent types (its
-    try: lines say so); None when it could not run."""
+    try: lines say so), with the tree's std named (std_env); None when it
+    could not run."""
     import subprocess  # (here: the hook's no-op path stays cheaper)
     try:
         return subprocess.run([typed_name(compiler, cwd)] + args, executable=compiler, cwd=cwd,
-                              capture_output=True, text=True, timeout=TIMEOUT)
+                              capture_output=True, text=True, timeout=TIMEOUT, env=std_env(cwd))
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -890,6 +1033,82 @@ def fmt_report(event):
     return ""
 
 
+GUIDE_MD = re.compile(r"(?:^|/)compiler/guide/[\w.-]+\.md$|(?:^|/)compiler/guide/topics\.txt$")
+MD_REDIRECT = re.compile(r"(?:^|[\s;])(?:\d?>>?|&>>?)\s*([^\s;|&<>]+)")
+
+
+def guide_paths(event):
+    """(0.25.5) The guide's sources (compiler/guide/*.md, topics.txt) the
+    call wrote: a Write, Edit or MultiEdit; a Bash call's redirection, tee,
+    cp, mv, sed -i or perl -i of one."""
+    tool = event.get("tool_name", "")
+    inp = event.get("tool_input") or {}
+    cwd = os.path.abspath(event.get("cwd") or os.getcwd())
+    if tool in ("Write", "Edit", "MultiEdit"):
+        p = os.path.abspath(os.path.join(cwd, inp.get("file_path") or ""))
+        return [p] if GUIDE_MD.search(p) else []
+    if tool != "Bash":
+        return []
+    found = []
+    for seg, words, here, assigns in tc.located(inp.get("command", ""), cwd):
+        cands = [m.group(1) for m in MD_REDIRECT.finditer(tc.HEREDOC.sub("<<HEREDOC\n", seg))]
+        if words and words[0] in ("tee", "cp", "mv") and len(words) > 1:
+            cands.append(words[-1])
+        if words and in_place(words):
+            cands += words[1:]
+        for w in cands:
+            w = tc.expand(w.strip("'\""), assigns)
+            p = os.path.normpath(os.path.join(here, w)) if w else ""
+            if p and GUIDE_MD.search(p) and p not in found:
+                found.append(p)
+    return found
+
+
+def guide_embed(event):
+    """(0.25.5) After a change to the guide's source: the compiler's copy of
+    it (compiler/src/guide/text/, which `volec guide` prints) is made by
+    compiler/guide/embed.sh, and a build from a stale copy prints the old
+    guide (run254 #3). The hook runs it (half a second; it writes only
+    those generated files, as the commit would need anyway) and says so in
+    one line, with the files it rewrote; VOLE_HOOK_FIX=0: says to run it."""
+    import subprocess
+    paths = guide_paths(event)
+    if not paths:
+        return ""
+    top = os.path.dirname(os.path.dirname(os.path.dirname(paths[0])))
+    script = os.path.join(top, "compiler", "guide", "embed.sh")
+    out = os.path.join(top, "compiler", "src", "guide", "text")
+    if not os.path.exists(script) or not os.path.isdir(out):
+        return ""
+    if os.environ.get("VOLE_HOOK_FIX", "1") == "0":
+        return (f"note hook.guide-embed: {os.path.relpath(paths[0], top)} changed; the compiler's copy of the guide "
+                f"is made from it\ntry: sh compiler/guide/embed.sh")
+
+    def snapshot():
+        got = {}
+        for n in sorted(os.listdir(out)):
+            try:
+                with open(os.path.join(out, n), "rb") as fh:
+                    got[n] = fh.read()
+            except OSError:
+                pass
+        return got
+    before = snapshot()
+    try:
+        r = subprocess.run(["sh", script], cwd=top, capture_output=True, text=True, timeout=TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return "note hook.guide-embed: compiler/guide/embed.sh did not run\ntry: sh compiler/guide/embed.sh"
+    if r.returncode != 0:
+        first = (r.stderr.strip().splitlines() or ["(no message)"])[0]
+        return f"note hook.guide-embed: compiler/guide/embed.sh failed: {first}\ntry: sh compiler/guide/embed.sh"
+    after = snapshot()
+    changed = sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
+    what = ("rewrote " + ", ".join(f"compiler/src/guide/text/{n}" for n in changed)) if changed \
+        else "the compiler's copy was current"
+    return (f"ran compiler/guide/embed.sh, by the hook after the guide's change: {what} (`volec guide` prints "
+            f"that copy once rebuilt; tests/run.sh guide compiles its examples)")
+
+
 def default_root(cwd):
     """The root `check` takes in cwd when none is given: the tree's
     compiler, else main.vl."""
@@ -958,7 +1177,7 @@ def run_tests(compiler, root, cwd):
     t0 = time.time()
     try:
         r = subprocess.run([compiler, "test", root, "--full", "--timeout", str(CASE_TIMEOUT)], cwd=cwd,
-                           capture_output=True, text=True, timeout=TEST_TIMEOUT)
+                           capture_output=True, text=True, timeout=TEST_TIMEOUT, env=std_env(cwd))
     except subprocess.TimeoutExpired:
         return {"slow": True, "ms": int((time.time() - t0) * 1000)}
     except OSError:
@@ -1297,6 +1516,8 @@ def main():
         return 0
     # (0.25.3) an agent's own `volec fmt`: what it rewrote
     fmt_text = fmt_report(event)
+    # (0.25.5) a change to the guide's source: its copy in the compiler made
+    fmt_text = "\n".join(t for t in (fmt_text, guide_embed(event)) if t)
     found = trigger(event)
     if not found:
         return say(fmt_text)
@@ -1311,6 +1532,13 @@ def main():
     st = hs.load(event)
     # (0.25.4) a tools binary older than the tree's source: said once
     compiler, stale = current_compiler(compiler, cwd if not edited else os.path.dirname(os.path.abspath(edited)), st)
+    if not compiler:
+        hs.save(event, st)
+        return say("\n".join(t for t in (fmt_text, stale) if t))
+    # (0.25.5) a compiler whose built-in std is not the tree's, and which
+    # cannot read the tree's: said once, checked with target/volec or not
+    compiler, stale_std = current_std(compiler, root or cwd, st)
+    stale = "\n".join(t for t in (stale, stale_std) if t)
     if not compiler:
         hs.save(event, st)
         return say("\n".join(t for t in (fmt_text, stale) if t))
