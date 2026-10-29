@@ -475,7 +475,9 @@ fn node_locals(f: i64) -> Effects {
 }
 
 // (0.21) Whether f is one of std::fmt's print lock functions
-// (print_acquire, print_release and their _held parts).
+// (print_acquire, print_release and their _held parts; 0.25.5: fmt_guard
+// and fmt_unguard, which a Fmt::to_fd takes and gives the lock by, and
+// print_threads_started, which takes it for a print a spawn is inside).
 fn is_print_lock(f: i64) -> bool {
     unsafe {
         if !within_std(FNS[f].module) {
@@ -484,6 +486,9 @@ fn is_print_lock(f: i64) -> bool {
         let text = SYMS[FNS[f].name].text;
         text == "std.fmt.print_acquire" || text == "std.fmt.print_release"
             || text == "std.fmt.print_acquire_held" || text == "std.fmt.print_release_held"
+            || text == "std.fmt.fmt_guard" || text == "std.fmt.fmt_guard_held"
+            || text == "std.fmt.fmt_unguard" || text == "std.fmt.fmt_unguard_held"
+            || text == "std.fmt.print_threads_started"
     }
 }
 
@@ -588,10 +593,8 @@ fn call_edge(n: i64, to: i64, kind: i64, add: i64) {
 }
 
 fn walk_list(n: i64) {
-    unsafe {
-        for i in 0..NODES[n].count {
-            walk(child(n, i));
-        }
+    for i in 0..NODES[n].count {
+        walk(child(n, i));
     }
 }
 
@@ -599,131 +602,127 @@ fn walk_list(n: i64) {
 // passed over here, without a call (the walk's hottest path).
 #[inline]
 fn walk(n: i64) {
-    unsafe {
-        if n == 0 {
-            return;
-        }
-        let kind = NODES[n].kind;
-        if kind == NodeKind::Ident && NODES[n].res == Res::Local || kind == NodeKind::Int
-            || kind == NodeKind::CStr || kind == NodeKind::Str || kind == NodeKind::Bool
-            || kind == NodeKind::Char {
-            return;
-        }
-        walk_node(n);
+    if n == 0 {
+        return;
     }
+    let kind = NODES[n].kind;
+    if kind == NodeKind::Ident && NODES[n].res == Res::Local || kind == NodeKind::Int
+        || kind == NodeKind::CStr || kind == NodeKind::Str || kind == NodeKind::Bool
+        || kind == NodeKind::Char {
+        return;
+    }
+    walk_node(n);
 }
 
 fn walk_node(n: i64) {
-    unsafe {
-        match NODES[n].kind {
-            NodeKind::Ident => walk_ident(n),
-            NodeKind::Assign => {
-                // (0.25: its target is changed, static_access)
-                STATIC_WRITE += 1;
-                walk(NODES[n].b);
-                STATIC_WRITE -= 1;
-                walk(NODES[n].c);
-            }
-            NodeKind::Binary | NodeKind::While => {
-                if NODES[n].kind == NodeKind::While && (NODES[n].p & NODE_IN_BOUNDS) == 0 {
-                    local(n, EFF_DIVERGE, 0);
-                }
-                walk(NODES[n].b);
-                walk(NODES[n].c);
-            }
-            NodeKind::Unary => {
-                if (NODES[n].p & NODE_RAW) != 0 {
-                    local(n, EFF_UNSAFE, 0);
-                }
-                // (0.25) `&place` exclusive or raw, a receiver too: the
-                // place may change (static_access)
-                let t = NODES[n].ty;
-                let lends = NODES[n].op == Tok::Amp && ((NODES[n].p & NODE_REF_MUT) != 0
-                    || t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != REF_SHARED);
-                if lends {
-                    STATIC_WRITE += 1;
-                }
-                walk(NODES[n].b);
-                if lends {
-                    STATIC_WRITE -= 1;
-                }
-            }
-            NodeKind::Cast => {
-                let operand = NODES[n].a;
-                walk(operand);
-                let from = NODES[operand].ty;
-                if from > 0 && TYPES[from].kind == TyKind::Prim
-                    && TYPES[NODES[n].ty].kind == TyKind::Ptr
-                    && !(NODES[operand].kind == NodeKind::Int && NODES[operand].a == 0) {
-                    local(n, EFF_UNSAFE, 0);
-                }
-            }
-            NodeKind::Call => walk_call(n),
-            NodeKind::MethodCall => {
-                walk(NODES[n].a);
-                walk_list(n);
-            }
-            NodeKind::Index => walk_index(n),
-            NodeKind::FieldAccess => {
-                if (NODES[n].p & NODE_RAW) != 0 || reads_union(n) {
-                    local(n, EFF_UNSAFE, 0);
-                }
-                walk(NODES[n].a);
-            }
-            NodeKind::TupleField | NodeKind::ExprStmt | NodeKind::Return | NodeKind::Defer => {
-                walk(NODES[n].a);
-            }
-            NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
-                walk_list(n);
-            }
-            NodeKind::FieldInit | NodeKind::Break | NodeKind::NamedArg => walk(NODES[n].b),
-            NodeKind::Repeat | NodeKind::Range => {
-                walk(NODES[n].a);
-                walk(NODES[n].b);
-            }
-            NodeKind::Block => {
-                // (its statements' expressions directly: fewer calls)
-                for i in 0..NODES[n].count {
-                    let s = child(n, i);
-                    let k = NODES[s].kind;
-                    walk(if k == NodeKind::ExprStmt { NODES[s].a } else if k == NodeKind::Let {
-                        NODES[s].c
-                    } else { s });
-                }
-                walk(NODES[n].a);
-            }
-            NodeKind::Let => walk(NODES[n].c),
-            NodeKind::If => {
-                walk(NODES[n].a);
-                walk(NODES[n].b);
-                walk(NODES[n].c);
-            }
-            NodeKind::Loop => {
-                if (NODES[n].p & NODE_IN_BOUNDS) == 0 {
-                    local(n, EFF_DIVERGE, 0);
-                }
-                walk(NODES[n].b);
-            }
-            NodeKind::For => walk_for(n),
-            NodeKind::Match => {
-                walk(NODES[n].a);
-                for i in 0..NODES[n].count {
-                    let arm = child(n, i);
-                    walk(NODES[arm].b);
-                    walk(NODES[arm].c);
-                }
-            }
-            NodeKind::EnumPanic => {
-                local(n, EFF_PANIC, 0);
-                walk(NODES[n].a);
-            }
-            NodeKind::VecOp => walk_vecop(n),
-            // (0.14: its env, or its function as a value; the body is the
-            // closure's function, walked as one)
-            NodeKind::Interp if NODES[n].x > 0 => walk_direct(n),
-            NodeKind::Closure | NodeKind::Try | NodeKind::Interp => walk(NODES[n].y),
-            _ => {}
+    match NODES[n].kind {
+        NodeKind::Ident => walk_ident(n),
+        NodeKind::Assign => {
+            // (0.25: its target is changed, static_access)
+            STATIC_WRITE += 1;
+            walk(NODES[n].b);
+            STATIC_WRITE -= 1;
+            walk(NODES[n].c);
         }
+        NodeKind::Binary | NodeKind::While => {
+            if NODES[n].kind == NodeKind::While && (NODES[n].p & NODE_IN_BOUNDS) == 0 {
+                local(n, EFF_DIVERGE, 0);
+            }
+            walk(NODES[n].b);
+            walk(NODES[n].c);
+        }
+        NodeKind::Unary => {
+            if (NODES[n].p & NODE_RAW) != 0 {
+                local(n, EFF_UNSAFE, 0);
+            }
+            // (0.25) `&place` exclusive or raw, a receiver too: the
+            // place may change (static_access)
+            let t = NODES[n].ty;
+            let lends = NODES[n].op == Tok::Amp && ((NODES[n].p & NODE_REF_MUT) != 0
+                || t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != REF_SHARED);
+            if lends {
+                STATIC_WRITE += 1;
+            }
+            walk(NODES[n].b);
+            if lends {
+                STATIC_WRITE -= 1;
+            }
+        }
+        NodeKind::Cast => {
+            let operand = NODES[n].a;
+            walk(operand);
+            let from = NODES[operand].ty;
+            if from > 0 && TYPES[from].kind == TyKind::Prim
+                && TYPES[NODES[n].ty].kind == TyKind::Ptr
+                && !(NODES[operand].kind == NodeKind::Int && NODES[operand].a == 0) {
+                local(n, EFF_UNSAFE, 0);
+            }
+        }
+        NodeKind::Call => walk_call(n),
+        NodeKind::MethodCall => {
+            walk(NODES[n].a);
+            walk_list(n);
+        }
+        NodeKind::Index => walk_index(n),
+        NodeKind::FieldAccess => {
+            if (NODES[n].p & NODE_RAW) != 0 || reads_union(n) {
+                local(n, EFF_UNSAFE, 0);
+            }
+            walk(NODES[n].a);
+        }
+        NodeKind::TupleField | NodeKind::ExprStmt | NodeKind::Return | NodeKind::Defer => {
+            walk(NODES[n].a);
+        }
+        NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
+            walk_list(n);
+        }
+        NodeKind::FieldInit | NodeKind::Break | NodeKind::NamedArg => walk(NODES[n].b),
+        NodeKind::Repeat | NodeKind::Range => {
+            walk(NODES[n].a);
+            walk(NODES[n].b);
+        }
+        NodeKind::Block => {
+            // (its statements' expressions directly: fewer calls)
+            for i in 0..NODES[n].count {
+                let s = child(n, i);
+                let k = NODES[s].kind;
+                walk(if k == NodeKind::ExprStmt { NODES[s].a } else if k == NodeKind::Let {
+                    NODES[s].c
+                } else { s });
+            }
+            walk(NODES[n].a);
+        }
+        NodeKind::Let => walk(NODES[n].c),
+        NodeKind::If => {
+            walk(NODES[n].a);
+            walk(NODES[n].b);
+            walk(NODES[n].c);
+        }
+        NodeKind::Loop => {
+            if (NODES[n].p & NODE_IN_BOUNDS) == 0 {
+                local(n, EFF_DIVERGE, 0);
+            }
+            walk(NODES[n].b);
+        }
+        NodeKind::For => walk_for(n),
+        NodeKind::Match => {
+            walk(NODES[n].a);
+            for i in 0..NODES[n].count {
+                let arm = child(n, i);
+                walk(NODES[arm].b);
+                walk(NODES[arm].c);
+            }
+        }
+        NodeKind::EnumPanic => {
+            local(n, EFF_PANIC, 0);
+            walk(NODES[n].a);
+        }
+        NodeKind::VecOp => walk_vecop(n),
+        // (0.14: its env, or its function as a value; the body is the
+        // closure's function, walked as one)
+        NodeKind::Interp if NODES[n].x > 0 => walk_direct(n),
+        NodeKind::Closure | NodeKind::Try | NodeKind::Interp => walk(NODES[n].y),
+        _ => {}
     }
 }
 
@@ -733,16 +732,14 @@ fn walk_node(n: i64) {
 // holes and allocator, then the writes, which a search finds as the call
 // (step_text: `'println(f"..")' calls 'std::println'`).
 fn walk_direct(n: i64) {
-    unsafe {
-        let block = NODES[n].y;
-        for i in 0..NODES[block].count {
-            walk(NODES[child(block, i)].c);
-        }
-        let found = FOUND_NODE;
-        walk(NODES[block].a);
-        if SEARCH && found == 0 && FOUND_NODE != 0 {
-            FOUND_NODE = n;
-        }
+    let block = NODES[n].y;
+    for i in 0..NODES[block].count {
+        walk(NODES[child(block, i)].c);
+    }
+    let found = FOUND_NODE;
+    walk(NODES[block].a);
+    if SEARCH && found == 0 && FOUND_NODE != 0 {
+        FOUND_NODE = n;
     }
 }
 
@@ -865,55 +862,53 @@ pub fn proven_true(n: i64) -> bool {
 
 // The value of condition n as written: 1 true, 0 false, -1 not known.
 fn const_bool(n: i64, depth: i64) -> i64 {
-    unsafe {
-        if n <= 0 || depth > 16 {
-            return -1;
-        }
-        let kind = NODES[n].kind;
-        if kind == NodeKind::Bool {
-            return if NODES[n].a != 0 { 1 } else { 0 };
-        }
-        if kind == NodeKind::Unary && NODES[n].op == Tok::Bang {
-            let v = const_bool(NODES[n].b, depth + 1);
-            return if v < 0 { -1 } else { 1 - v };
-        }
-        if kind != NodeKind::Binary {
-            return -1;
-        }
-        let op = NODES[n].op;
-        let l = NODES[n].b;
-        let r = NODES[n].c;
-        if op == Tok::AmpAmp || op == Tok::PipePipe {
-            let a = const_bool(l, depth + 1);
-            let b = const_bool(r, depth + 1);
-            if op == Tok::AmpAmp {
-                return if a == 0 || b == 0 { 0 } else if a == 1 && b == 1 { 1 } else { -1 };
-            }
-            return if a == 1 || b == 1 { 1 } else if a == 0 && b == 0 { 0 } else { -1 };
-        }
-        if NODES[l].kind != NodeKind::Int || NODES[r].kind != NodeKind::Int {
-            return -1;
-        }
-        let x = NODES[l].a;
-        let y = NODES[r].a;
-        var t = false;
-        if op == Tok::EqEq {
-            t = x == y;
-        } else if op == Tok::BangEq {
-            t = x != y;
-        } else if op == Tok::Lt {
-            t = x < y;
-        } else if op == Tok::LtEq {
-            t = x <= y;
-        } else if op == Tok::Gt {
-            t = x > y;
-        } else if op == Tok::GtEq {
-            t = x >= y;
-        } else {
-            return -1;
-        }
-        if t { 1 } else { 0 }
+    if n <= 0 || depth > 16 {
+        return -1;
     }
+    let kind = NODES[n].kind;
+    if kind == NodeKind::Bool {
+        return if NODES[n].a != 0 { 1 } else { 0 };
+    }
+    if kind == NodeKind::Unary && NODES[n].op == Tok::Bang {
+        let v = const_bool(NODES[n].b, depth + 1);
+        return if v < 0 { -1 } else { 1 - v };
+    }
+    if kind != NodeKind::Binary {
+        return -1;
+    }
+    let op = NODES[n].op;
+    let l = NODES[n].b;
+    let r = NODES[n].c;
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
+        let a = const_bool(l, depth + 1);
+        let b = const_bool(r, depth + 1);
+        if op == Tok::AmpAmp {
+            return if a == 0 || b == 0 { 0 } else if a == 1 && b == 1 { 1 } else { -1 };
+        }
+        return if a == 1 || b == 1 { 1 } else if a == 0 && b == 0 { 0 } else { -1 };
+    }
+    if NODES[l].kind != NodeKind::Int || NODES[r].kind != NodeKind::Int {
+        return -1;
+    }
+    let x = NODES[l].a;
+    let y = NODES[r].a;
+    var t = false;
+    if op == Tok::EqEq {
+        t = x == y;
+    } else if op == Tok::BangEq {
+        t = x != y;
+    } else if op == Tok::Lt {
+        t = x < y;
+    } else if op == Tok::LtEq {
+        t = x <= y;
+    } else if op == Tok::Gt {
+        t = x > y;
+    } else if op == Tok::GtEq {
+        t = x >= y;
+    } else {
+        return -1;
+    }
+    if t { 1 } else { 0 }
 }
 
 // Whether direct call n of f (its callee_info `info`) passes a raw pointer
@@ -974,36 +969,34 @@ fn callee_info(f: i64) -> i64 {
 }
 
 fn walk_index(n: i64) {
-    unsafe {
-        let base = NODES[n].a;
-        let index = NODES[n].b;
-        walk(base);
-        let bt = NODES[base].ty;
-        let raw = bt > 0 && TYPES[bt].kind == TyKind::Ptr;
-        if NODES[index].kind == NodeKind::Range {
-            walk(NODES[index].a);
-            walk(NODES[index].b);
-            if raw {
-                local(n, EFF_UNSAFE, 0);
-            } else if NODES[index].a == 0 && NODES[index].b == 0 {
-                // (`s[..]`: the whole)
-                NODES[n].p |= NODE_IN_BOUNDS;
-            } else if (NODES[n].p & NODE_IN_BOUNDS) == 0 {
-                local(n, EFF_PANIC, 0);
-            }
-            return;
-        }
-        walk(index);
+    let base = NODES[n].a;
+    let index = NODES[n].b;
+    walk(base);
+    let bt = NODES[base].ty;
+    let raw = bt > 0 && TYPES[bt].kind == TyKind::Ptr;
+    if NODES[index].kind == NodeKind::Range {
+        walk(NODES[index].a);
+        walk(NODES[index].b);
         if raw {
             local(n, EFF_UNSAFE, 0);
-            return;
-        }
-        if (NODES[n].p & NODE_IN_BOUNDS) != 0 || in_bounds(base, bt, index) {
+        } else if NODES[index].a == 0 && NODES[index].b == 0 {
+            // (`s[..]`: the whole)
             NODES[n].p |= NODE_IN_BOUNDS;
-            return;
+        } else if (NODES[n].p & NODE_IN_BOUNDS) == 0 {
+            local(n, EFF_PANIC, 0);
         }
-        local(n, EFF_PANIC, 0);
+        return;
     }
+    walk(index);
+    if raw {
+        local(n, EFF_UNSAFE, 0);
+        return;
+    }
+    if (NODES[n].p & NODE_IN_BOUNDS) != 0 || in_bounds(base, bt, index) {
+        NODES[n].p |= NODE_IN_BOUNDS;
+        return;
+    }
+    local(n, EFF_PANIC, 0);
 }
 
 // Whether `base[index]` (base of type bt, a slice or an array) is in
@@ -1082,20 +1075,18 @@ fn walk_for(n: i64) {
 }
 
 fn walk_vecop(n: i64) {
-    unsafe {
-        let kind = NODES[n].x;
-        if kind == VK_LOAD || kind == VK_STORE {
+    let kind = NODES[n].x;
+    if kind == VK_LOAD || kind == VK_STORE {
+        local(n, EFF_PANIC, 0);
+    } else if kind == VK_LANE || kind == VK_WITH {
+        let lane = child(n, 0);
+        if !(NODES[lane].kind == NodeKind::Int && NODES[lane].a >= 0
+            && NODES[lane].a < vec_lanes(NODES[n].y)) {
             local(n, EFF_PANIC, 0);
-        } else if kind == VK_LANE || kind == VK_WITH {
-            let lane = child(n, 0);
-            if !(NODES[lane].kind == NodeKind::Int && NODES[lane].a >= 0
-                && NODES[lane].a < vec_lanes(NODES[n].y)) {
-                local(n, EFF_PANIC, 0);
-            }
         }
-        walk(NODES[n].a);
-        walk_list(n);
     }
+    walk(NODES[n].a);
+    walk_list(n);
 }
 
 // ---- Components ----

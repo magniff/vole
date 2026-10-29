@@ -370,7 +370,16 @@ check_unit() {
             for s in "$d"/src/*; do [ -f "$s" ] && cp "$s" "$d/sess/"; done
         fi
         console_script "$c" "$c.sh"
-        (cd "$d/sess" && PATH="$WORK/bin:$PATH" with_timeout 120 sh "$c.sh" </dev/null >"$c.got" 2>&1)
+        # (0.25.5) `volec test`'s own time limit (10 s a test; a property's
+        # shrinking takes most of it) gets the load scaling the watchdog's
+        # has: on a loaded machine (tests/load.sh), (1 + VOLE_WATCHDOG_EXTEND)
+        # times it (the 0.25.4 gate's Linux rows: chapter 13's session)
+        case_limit=10
+        if sh "$ROOT/tests/load.sh" >/dev/null 2>&1; then
+            case_limit=$((10 * (1 + ${VOLE_WATCHDOG_EXTEND:-8})))
+        fi
+        (cd "$d/sess" && VOLE_TEST_CASE_TIMEOUT=$case_limit && export VOLE_TEST_CASE_TIMEOUT \
+            && PATH="$WORK/bin:$PATH" with_timeout 120 sh "$c.sh" </dev/null >"$c.got" 2>&1)
         trimmed "$c.got" >"$c.got.t"
         trimmed "$c" >"$c.want"
         # (0.25.3) std's positions and counts compared normalized

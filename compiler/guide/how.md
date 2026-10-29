@@ -7,6 +7,7 @@ one; `volec query examples KIND` prints the items to start from, and
 nearest). In the vole repository (commands from its root):
 
 - `add-std-fn`: a std function or method
+- `add-std-module`: a std module (a file of compiler/std)
 - `add-peephole`: an instruction-combining or e-graph rule
 - `add-pass`: an optimization pass
 - `add-diagnostic`: a compiler error, or a tool diagnostic with a code
@@ -49,6 +50,46 @@ in `collections/hash_map.vl`); `compiler/std/embed.sh` builds it into the compil
 
 `volec undo` takes a std edit back (and embeds again).
 
+## add-std-module
+
+To add a std module (a file of `compiler/std`).
+
+1. The file, `compiler/std/NAME.vl` (or `NAME/mod.vl`; a child of
+   `std::a` in `a/`), and its `mod NAME;` (or `pub mod NAME;`) line in
+   the parent's file: embed.sh finds the modules by those lines.
+2. Its sections: a banner `// ---- Title (0.X) ----` starts one. The
+   file's header comment and `use` lines are in its first section,
+   which every program reads: keep the header short, or put the long
+   part below the first banner. Its items before the first banner are
+   the section `std::NAME`. A section not in `compiler/std/index.awk`'s
+   LAZY is core: every program reads it. List each new section's title
+   (and `std::NAME`) in LAZY; `compiler/std/embed.sh --core` prints the
+   core sections and why each is core.
+3. A module that only programs naming it reach (std::gpu, std::window,
+   std::cli) is behind a gate: `GATES["std::a::NAME"] = "a"` in
+   index.awk, its sections then load only for a program that names the
+   gate word. A closed gate (`CLOSED`: gpu, window) is used by no other
+   module of std, so two closed gates cannot name each other: what both
+   need goes into a lazy module without a gate (std::capture).
+4. Check with a build, not only `volec check`: check reads std's edited
+   files whole (every section), a build reads std through the index. A
+   new section left core, or not behind its module's gate, can name a
+   gated module's type that the build does not load: `check` is clean
+   and `bootstrap/bootstrap.sh --dev --no-suite` fails in build1 with
+   `<std>:N:C: error[type error] unknown type 'KeyCode'`. So after the
+   index, `bootstrap/bootstrap.sh --dev --no-suite`, then
+   `target/volec PROG.vl -o x` of a program that uses the module.
+5. Tests and docs as for `add-std-fn`. `volec guide std`'s index has a
+   size limit (`tests/run.sh guide`: guide-std-index); a module with its
+   own topic leaves the index (compiler/src/guide/stdapi.vl:
+   `unindexed_section`).
+6. The transcripts: `tests/run.sh query refactor walkthrough lsp stdpos`.
+   They compare std's positions, counts and list of modules normalized
+   (tests/stdpos.awk), so only one about std itself (`## exact-std`) or
+   one whose output names the new items fails; rewrite it with its
+   runner's `-u` (`tests/query/run.sh -u NAME`), which keeps the std
+   numbers of a line that did not change otherwise, and read the diff.
+
 ## add-peephole
 
 To add an instruction-combining or e-graph rule.
@@ -88,6 +129,15 @@ To add an optimization pass.
 3. Test: `tests/run/opt_NAME.vl` with `// CHECK:` lines (see
    `add-peephole`); `tests/run.sh opt_`; `tests/fuzz/run.sh` (random
    programs at every level); `--time-passes` for its compile time.
+   An alias fact (two accesses that never overlap) also needs a case
+   that breaks if the fact is wrong: a write through another base (a
+   pointer kept in a static, another Vec's buffer) between the two
+   accesses, with no call between them (a call, or a write through the
+   same base, is handled before the fact is asked, so such a case passes
+   with a wrong fact too); `// FLAGS: --check-alloc` makes a stale read
+   fault. Show that it can fail: make the fact always say "apart",
+   `bootstrap/bootstrap.sh --dev --no-suite`, copy target/volec aside,
+   `volec undo`, and run `tests/run.sh -c MUTANT -n NAME`: it must fail.
 4. Docs: the module table of `compiler/src/middle/README.md`,
    `docs/optimizer.md`. Before reporting: `tests/affected.sh` (and
    `bench/run.sh`: no program may get slower).
@@ -113,7 +163,14 @@ in one `edit apply`; the Diagnostics table of `docs/query.md` or
 `docs/refactor.md`. `tests/refactor/run.sh` fails on a code without an
 entry (a new tool's prefix, `run.`, goes into its list of prefixes,
 the `grep -rhoE` above `self_explain`, or its entries read as `not a
-code`). Test: a transcript (`tests/query/NAME.q`, `tests/refactor/NAME.t`).
+code`). The prefixes are the
+`c"(query|edit|...|run)\.` list of that `grep -rhoE` in
+`tests/refactor/run.sh`. Test: a transcript (`tests/query/NAME.q`,
+`tests/refactor/NAME.t`).
+
+A `volec --help` row or a `volec CMD --help` text: 15 lines at most
+each (`tests/run.sh guide`, its `help-CMD` checks); `volec --help` has
+15 now, so a new row merges with another.
 
 ## add-test
 
@@ -129,7 +186,8 @@ To add a test case.
   `CHECK:` / `CHECK-NOT:` (the IR), `FLAGS:`; the header of
   `tests/run.sh` lists them all. Cases compile with `--deny-warnings`.
 - Run it: `tests/run.sh NAME` (cases whose name holds NAME), with
-  `-O 0` and `-O 1` too.
+  `-O 0` and `-O 1` too; one case alone: `tests/run.sh -n NAME` (or
+  `'=NAME'`, quoted: zsh expands a bare `=NAME`, and nothing runs).
 - A tool: a transcript, `$ ARGS` lines and their output:
   `tests/query/NAME.q` (on `tests/query/NAME/main.vl`),
   `tests/refactor/NAME.t` (in a copy of `tests/refactor/NAME/`; `%`

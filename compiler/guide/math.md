@@ -49,6 +49,7 @@ f64, `2.0f32.sqrt()` an f32; `let a: f32 = 0.5; a.sqrt()` too.
 | `exp`, `exp2`, `ln`, `log2`, `log10`, `log(b)` | e^x, 2^x, the logarithms (`ln(0)` is -inf, below 0 NaN) |
 | `powf(y)`, `powi(n: i32)` | x^y as C's pow; x^n by repeated squaring (faster, a few ulp) |
 | `recip`, `to_radians`, `to_degrees` | 1/x; the angle conversions |
+| `next_up`, `next_down` | (0.25.5) the neighbouring number above, below (by the bits: `0.0.next_up()` is the least subnormal, `f64::MAX.next_up()` inf) |
 | `is_nan`, `is_finite`, `is_infinite`, `is_sign_positive`, `is_sign_negative` | tests |
 
 The results are within 1 ulp of the exact value, or 2 (sqrt, the

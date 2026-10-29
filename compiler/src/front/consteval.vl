@@ -3,7 +3,7 @@
 // wrapped to their type (sign-extended when signed), floats as the bits of
 // an f64 (rounded to f32 first for f32), bools as 0 or 1.
 
-use crate::base::{BUFS, IntVec, buf_reserve, memset};
+use crate::base::{BUFS, IntVec, buf_reserve, memcpy, memset};
 use crate::base::diag::{err_begin, err_end, err_help, err_str};
 use crate::front::ast::{BLOCK_UNSAFE, NODES, NodeKind, VK_NEW, VK_SPLAT, child};
 use crate::front::check::{
@@ -71,10 +71,8 @@ fn not_constant(n: i64) -> ! {
 // (0.25) Whether n is `unsafe { e }`, a block of only a tail: its value is
 // e's (a pointer made from an integer in a static's initializer).
 fn unsafe_tail(n: i64) -> bool {
-    unsafe {
-        NODES[n].kind == NodeKind::Block && (NODES[n].p & BLOCK_UNSAFE) != 0
-            && NODES[n].count == 0 && NODES[n].a != 0
-    }
+    NODES[n].kind == NodeKind::Block && (NODES[n].p & BLOCK_UNSAFE) != 0
+        && NODES[n].count == 0 && NODES[n].a != 0
 }
 
 // Type checks `n` against `ty` with no locals in scope.
@@ -189,45 +187,41 @@ pub fn const_eval(n: i64) -> i64 {
 }
 
 fn const_unary(n: i64, ty: i64) -> i64 {
-    unsafe {
-        let value = const_eval(NODES[n].b);
-        match NODES[n].op {
-            Minus => if is_float(ty) {
-                float_const(0.0 - f64_of_bits(value), ty)
-            } else {
-                wrap_int(0 - value, ty)
-            },
-            Bang => 1 - value,
-            Tilde => wrap_int(~value, ty),
-            _ => not_constant(n),
-        }
+    let value = const_eval(NODES[n].b);
+    match NODES[n].op {
+        Minus => if is_float(ty) {
+            float_const(-f64_of_bits(value), ty)
+        } else {
+            wrap_int(0 - value, ty)
+        },
+        Bang => 1 - value,
+        Tilde => wrap_int(~value, ty),
+        _ => not_constant(n),
     }
 }
 
 fn const_binary(n: i64, ty: i64) -> i64 {
-    unsafe {
-        let op = NODES[n].op;
-        let lhs = NODES[n].b;
-        let operand_ty = NODES[lhs].ty;
-        let a = const_eval(lhs);
-        if op == AmpAmp && a == 0 {
-            return 0;
-        }
-        if op == PipePipe && a == 1 {
-            return 1;
-        }
-        let b = const_eval(NODES[n].c);
-        if operand_ty == TY_BOOL {
-            if op == AmpAmp || op == PipePipe { return b; }
-            if op == EqEq { return (a == b) as i64; }
-            if op == BangEq { return (a != b) as i64; }
-            type_error(n, c"invalid operator on bools");
-        }
-        if is_float(operand_ty) {
-            return const_float_binary(n, op, f64_of_bits(a), f64_of_bits(b), ty);
-        }
-        const_int_binary(n, op, a, b, operand_ty, ty)
+    let op = NODES[n].op;
+    let lhs = NODES[n].b;
+    let operand_ty = NODES[lhs].ty;
+    let a = const_eval(lhs);
+    if op == AmpAmp && a == 0 {
+        return 0;
     }
+    if op == PipePipe && a == 1 {
+        return 1;
+    }
+    let b = const_eval(NODES[n].c);
+    if operand_ty == TY_BOOL {
+        if op == AmpAmp || op == PipePipe { return b; }
+        if op == EqEq { return (a == b) as i64; }
+        if op == BangEq { return (a != b) as i64; }
+        type_error(n, c"invalid operator on bools");
+    }
+    if is_float(operand_ty) {
+        return const_float_binary(n, op, f64_of_bits(a), f64_of_bits(b), ty);
+    }
+    const_int_binary(n, op, a, b, operand_ty, ty)
 }
 
 fn const_float_binary(n: i64, op: Tok, a: f64, b: f64, ty: i64) -> i64 {
@@ -365,6 +359,16 @@ pub fn float_to_int(value: f64, to: i64) -> i64 {
 // bytes (a `[u8]` literal's pointer, or a `c"..."`).
 pub static var CONST_RELOCS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// Whether every byte is zero.
+pub fn all_zero(bytes: [u8]) -> bool {
+    for i in 0..bytes.len() {
+        if bytes[i] != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn const_emit(n: i64, ty: i64, out: i64) {
     unsafe {
         CONST_RELOCS.count = 0;
@@ -423,6 +427,32 @@ fn const_write(n: i64, ty: i64, out: i64, at: i64) {
             NodeKind::Tuple => {
                 for i in 0..NODES[n].count {
                     const_write(child(n, i), type_elem(ty, i), out, at + tuple_offset(ty, i));
+                }
+            }
+            NodeKind::Repeat if TYPES[ty].b > 0 => {
+                // (0.25.5) one element evaluated, then its bytes copied: each
+                // is the same constant (a [0; 65536] took 65536 evaluations,
+                // most of a small program's build); zeros are there already.
+                // An element with an address in it is written each time, for
+                // its relocations.
+                let elem = TYPES[ty].a;
+                let elem_size = type_size(elem);
+                let relocs = CONST_RELOCS.count;
+                const_write(NODES[n].a, elem, out, at);
+                if CONST_RELOCS.count != relocs {
+                    for i in 1..TYPES[ty].b {
+                        const_write(NODES[n].a, elem, out, at + i * elem_size);
+                    }
+                } else if !all_zero(BUFS[out].data[at..at + elem_size]) {
+                    // (the elements written so far, copied after them)
+                    let count = TYPES[ty].b;
+                    var done = 1;
+                    while done < count {
+                        let k = if done < count - done { done } else { count - done };
+                        memcpy(&BUFS[out].data[at + done * elem_size], &BUFS[out].data[at],
+                            (k * elem_size) as u64);
+                        done += k;
+                    }
                 }
             }
             NodeKind::Array | NodeKind::Repeat => {
@@ -593,26 +623,24 @@ fn const_arg(n: i64) -> i64 {
 // Whether constant expression n calls a function (its check waits for
 // the functions' bodies: check_static_calls).
 pub fn has_const_call(n: i64) -> bool {
-    unsafe {
-        let kind = NODES[n].kind;
-        if kind == NodeKind::Call {
-            return true;
-        }
-        if kind == NodeKind::StructLit {
-            for i in 0..NODES[n].count {
-                if has_const_call(NODES[child(n, i)].b) {
-                    return true;
-                }
-            }
-        } else if kind == NodeKind::Tuple || kind == NodeKind::Array {
-            for i in 0..NODES[n].count {
-                if has_const_call(child(n, i)) {
-                    return true;
-                }
-            }
-        } else if kind == NodeKind::Repeat {
-            return has_const_call(NODES[n].a);
-        }
-        false
+    let kind = NODES[n].kind;
+    if kind == NodeKind::Call {
+        return true;
     }
+    if kind == NodeKind::StructLit {
+        for i in 0..NODES[n].count {
+            if has_const_call(NODES[child(n, i)].b) {
+                return true;
+            }
+        }
+    } else if kind == NodeKind::Tuple || kind == NodeKind::Array {
+        for i in 0..NODES[n].count {
+            if has_const_call(child(n, i)) {
+                return true;
+            }
+        }
+    } else if kind == NodeKind::Repeat {
+        return has_const_call(NODES[n].a);
+    }
+    false
 }

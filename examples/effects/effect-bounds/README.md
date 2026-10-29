@@ -73,7 +73,7 @@ $ volec edit patch main --old '|v| v + bonus' --new '|v| {
 >         v + bonus
 >     }'
 main.vl:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:17:5: the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only
 try: volec edit patch main --old '|v| v + bonus' --new '|v| {
         println(f"{v}");
         v + bonus
@@ -94,7 +94,7 @@ the library) widen the bound.
 ```console
 $ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name[0] == 'a'"
 main.vl:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.vl:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:18:13: the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.vl:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only
 try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name[0] == 'a'' --no-check
 [exit 1]
 ```

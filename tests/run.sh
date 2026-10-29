@@ -13,7 +13,8 @@
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
-# (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
+# (the link without cc, 0.25) and tests/perf/run.sh (--time-passes=instructions
+# and --vec-stats=FN, 0.25.5) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
 # and tests/runner/run.sh (the runner's own pieces, 0.25.2) and
 # tests/embed/run.sh (text blocks in a CRLF file, the caches and embedded
 # files, 0.25.3) and tests/stdpos/run.sh (std's positions in the
@@ -21,7 +22,7 @@
 # --sample (the tools' answers from their cache the same as without it,
 # 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [FILTER...]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [-n NAME] [FILTER...]
 #
 #   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
@@ -44,9 +45,12 @@
 #   -f FILE       (0.25.2) more FILTERs, one per line (# comments)
 #   -l            (0.25.2) list what the FILTERs select, `case NAME` and
 #                 `suite NAME` (`leveled`: it takes -O), and run nothing
+#   -n NAME       (0.25.5) only NAME, as '=NAME' (repeatable): zsh expands
+#                 an unquoted =NAME to a path, and then nothing runs
 #   FILTER...     run only the cases (and the suites and checks below)
-#                 whose name contains a FILTER; =NAME: only NAME (0.25.2:
-#                 several of them, and -f, select the union)
+#                 whose name contains a FILTER; '=NAME': only NAME (0.25.2:
+#                 several of them, and -f, select the union; quote it in
+#                 zsh, or use -n NAME)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -179,7 +183,7 @@ FILTERS=""
 LIST=0
 
 usage() {
-    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,/^# Environment:/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -201,10 +205,17 @@ while [ $# -gt 0 ]; do
 "
             shift 2 ;;
         -l) LIST=1; shift ;;
+        # (0.25.5) -n NAME: only NAME, as =NAME, in a form zsh does not
+        # expand (its `=word` is a path: `=NAME` unquoted runs nothing)
+        -n)
+            [ $# -ge 2 ] || usage
+            FILTERS="$FILTERS=$2
+"
+            shift 2 ;;
         -h|--help) usage ;;
         -*)
             # (0.25.2: one line, not the whole usage)
-            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l; tests/run.sh -h for more)" >&2
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l -n NAME; tests/run.sh -h for more)" >&2
             exit 2 ;;
         *) break ;;
     esac
@@ -258,7 +269,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -953,6 +964,11 @@ esac
 case $(want link) in
     y) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
 esac
+# (0.25.5) The build's measuring options (tests/perf/run.sh:
+# --time-passes=instructions, --vec-stats=FN): category "perf".
+case $(want perf) in
+    y) "$ROOT/tests/perf/run.sh" -c "$COMPILER" >"$WORK/perf.out" 2>&1 & ;;
+esac
 # (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
 # (skipped elsewhere); category "gpu".
 case $(want gpu) in
@@ -1044,6 +1060,7 @@ while read -r name file; do
     elif [ "$status" = fail ]; then
         echo "$category fail" >>"$TALLY"
         { echo "FAIL $name:"; sed 's/^/    /' "$dir/why"; echo; } >>"$FAILURES"
+        echo "$name" >>"$WORK/failed-cases"
     else
         echo "$category $status" >>"$TALLY"
     fi
@@ -1175,6 +1192,24 @@ case $(want link) in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/link.out" >>"$FAILURES"
+        ;;
+esac
+
+# The measuring options (0.25.5): tests/perf/run.sh (run above); category
+# "perf".
+case $(want perf) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "perf pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "perf fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/perf.out"
+        if ! grep -q '^pass' "$WORK/perf.out"; then
+            echo "perf fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/perf.out" >>"$FAILURES"
         ;;
 esac
 
@@ -1623,6 +1658,12 @@ awk '
             printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
+# (0.25.5) The failing cases alone, in the form zsh leaves as it is
+# (`=NAME` is its path expansion; '=NAME' quoted works too).
+if [ -s "$WORK/failed-cases" ]; then
+    n=$(wc -l <"$WORK/failed-cases" | tr -d ' ')
+    echo "try: tests/run.sh $(head -5 "$WORK/failed-cases" | sed 's/^/-n /' | tr '\n' ' ' | sed 's/ $//')   (the failing case$( [ "$n" -gt 1 ] && echo s) alone$( [ "$n" -gt 5 ] && echo ", the first 5 of $n"))"
+fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1
 fi

@@ -13,7 +13,11 @@ pointers, with Rust's names as aliases (`AtomicI64`, `AtomicU32`,
 `AtomicBool`, `AtomicPtr<T>`...) and Rust's methods: `load`, `store`,
 `swap`, `compare_exchange` (`Ok(old)` or `Err(found)`), `fetch_add`,
 `fetch_sub`, `fetch_and`, `fetch_or`, `fetch_xor`, `fetch_nand`,
-`fetch_max`, `fetch_min`, `into_inner`, and `fence(order)`. The orderings
+`fetch_max`, `fetch_min`, `into_inner`, and `fence(order)`. (0.25.5) The
+bound `T: AtomicValue` checks T (`Atomic<f64>` or of a struct: "the trait
+'AtomicValue' is not implemented for 'f64'"); the arithmetic is the
+integers' (`AtomicInteger`), `fetch_and`/`or`/`xor` also bool's
+(`AtomicBitwise`); no program can implement these traits. The orderings
 are C++'s (`Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`,
 `SeqCst`); one an operation cannot have (a load with `Release`) is made
 `SeqCst`. An atomic is move-only. A static one needs no `var` (and so has

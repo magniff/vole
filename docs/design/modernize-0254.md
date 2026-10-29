@@ -251,6 +251,9 @@ to remove; its risk; what it can run in parallel with.
   comes first is the optimizer (§2, step 2, branch opt254): each
   `NODES[i]` gets a header reload and a bounds check. NODES waits for
   opt254, then runs alone with its compile-cost row.
+- 0.25.5 (tables255, §7): NODES, SRC, TYPES, SYMS, DEFS and FILES done,
+  one commit each; FNS and TOKS left, for the compile-cost limit (`check`
+  at most 1.03x 0.25.4's): FNS adds about 0.2%, TOKS 2.4%.
 
 **Step 5. IntVec's uses moved to the API Vec shares, module by module.**
 - Idiom, scope: the 2,823 IntVec references, in branches by directory
@@ -482,4 +485,87 @@ What the tool could not do: a justified unneeded block stays (`fix
 --only unneeded-unsafe` keeps blocks with `// UNSAFE:` comments; CFILES's
 cfile_path was taken away by hand), and the comments that name X_COUNT
 or X_CAP are left as they are.
+
+## 7. Step 4 in 0.25.5: the hot tables
+
+Branch tables255, on release-0.25.5 with opt254's Vec facts. Each table
+its own commit, proven the same way: `bootstrap.sh --dev --no-suite`
+(fixpoint ok), `volec same-output` against the compiler built before it
+(32,928 to 32,940 compilations, no difference but the compiler's own
+path in `try:` lines until edit255 made same-output compare them as
+equal: `identical` from SYMS on), and the compile-cost row.
+
+| table | how | rewrites | files | blocks freed (unneeded + justified) | sites after | unjustified after |
+|---|---|---|---:|---:|---:|---:|
+| (before) | | | | | 4,489 | 4,365 |
+| NODES | refactor table | 1 push, 107 len()s, 1 reserve() | 38 | 506 + 14 | 3,969 | 3,859 |
+| SRC | by hand: a `[u8]` view of SRC_BUF (texts and the 0 after) | 3 assignments; the lexer's loops, diag's memchr and the cache's hash read SRC.ptr | 6 | 116 + 12 | 3,841 | 3,743 |
+| TYPES | refactor table | 1 push, 7 len()s | 3 | 123 + 6 | 3,712 | 3,620 |
+| SYMS | refactor table, after 9 index calls hoisted | 2 pushes, 18 len()s | 7 | 73 + 3 | 3,643 | 3,547 |
+| DEFS (tools::query::defs) | refactor table, grow_defs inlined | 2 pushes, 90 len()s | 30 | 67 + 2 | 3,574 | 3,480 |
+| FILES | refactor table, one alias removed | 3 pushes, 128 len()s | 52 | 52 + 13 | 3,509 | 3,428 |
+
+(The sites between rows also move by the merges and the prep commit:
+SYMS's row starts at 3,719 after edit255's merge and template_text.)
+
+**What NODES found.** The first build with NODES a Vec stopped at
+`index out of bounds: index 1256772, length 1256772` in
+front/own/drops.vl: `NODES[n] = NODES[t_node(..)]`. `v[i]` takes `v`'s
+slice (as_slice: its ptr and len) before it evaluates i, so when i's
+call pushes, the element is read through the old header: a new element
+is refused by the check, an old one is read from the buffer the push
+freed. The raw table had the same stale pointer, unchecked. refactor
+table now refuses such an index (a call in it reaching a write of X or
+X_COUNT, through the resolved calls to a fixpoint): 2 in NODES, 9 in
+SYMS (`SYMS[intern_c(..)]`, `SYMS[template_name(..)]`,
+`SYMS[mod_fqn(..)]`), each hoisted into a `let`. The same order makes
+`v[grow(&v)]` on a local Vec a use after free in safe code
+(`--check-alloc`: `use after free`); that is a language question for
+0.26 (evaluate the index first, or have the exclusivity check refuse
+it), not changed here.
+
+**What the checks found later.** A bounds failure in intern, once, in
+arch-gen at -O2 (`index 7578, length 7578`): the emission threads
+interned an intrinsic template's placeholder names, a push to SYMS racing
+with the other threads' reads (raw, a read through a pointer the growth
+may free). The templates now look the names up (find_sym). Checked
+tables turn such latent stale reads into failures that name their line.
+
+**The cost.** `check` of compiler/src, instructions against 0.25.4 (the
+fewest of 9; the count moves by about 1% from run to run, more at a
+load above 30):
+
+| after | check | note |
+|---|---:|---|
+| the branch's base | 1.00x | |
+| NODES | 1.04x | the header loads and bounds checks of every NODES[i] |
+| + codegen | 1.02x to 1.03x | a slice from 0 stores its end as its length (no `len - 0`: the fold kept it, an i64 minus 0 typed u64); ldp pairs a Vec's ptr (u64) and len (i64) |
+| SRC | 1.03x | the lexer's loops keep SRC.ptr |
+| TYPES | 1.03x (1.030) | the limit |
+| SYMS, DEFS, FILES | 1.03x | each the same as the compiler before it, measured in pairs |
+| the branch, merged with release-0.25.5 (edit255, std255, codegen255) | 1.03x | 4,704.0 M against 4,581.7 M (compile_cost.sh -r 9); interleaved, the fewest of 9: 4,764 M against 4,617 M (1.032), release-0.25.5's own compiler 4,619 M (1.00x); hello 1.08x and std 1.02x, release-0.25.5's own 1.05x and 1.01x |
+
+Trials not committed: FNS +0.2%, TOKS +2.4% (the parser reads tokens
+in its inner loop) on the compiler with TYPES.
+
+The -O2 self-compile (`volec --no-cache -j1 -O2 compiler/src/main.vl
+-c`, each compiler on its own source): 46.2 G instructions before NODES,
+58.0 G with it, 59.4 G with TYPES, 60.3 G with FILES; after the merges 61.5 G, where release-0.25.5's compiler on its own source takes 47.2 G (+30%). The compilers'
+speed does not change (the compiler before and after NODES on one
+source: 46.24 G and 46.27 G; 58.0 G and 58.0 G): what grows is the
+work of compiling the source's checked indexing, 8,600 NODES reads each
+an inlined as_slice, a compare and a failure block with its call
+(`--time-passes`: inlining +33%, loop passes +21%, register allocation
++18%; IR after optimization 328 to 395 MB). Lowering `v[i]` of a Vec
+without the as_slice call, and one failure block per function, would
+take most of it back; neither is small.
+
+**The tool.** `refactor table` gained the refusal of a growing index
+and the rollback `let m = X_COUNT; ... X_COUNT = m;` as `X.truncate(m)`
+(TOKS's fmt rollback); `fix --only unneeded-justified` takes the
+unneeded blocks whose comments justified the raw indexing, with those
+comments (50 such blocks over the six tables). Dry runs are fast:
+TYPES 9 s, FNS 23 s (edit255's single imports round), NODES 26 s.
+Left as known gaps: comments naming X_COUNT or X_CAP (feedbacks/table254.md
+#6).
 

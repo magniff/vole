@@ -22,7 +22,10 @@ end); `r.lines_in(gpa)` yields each line as a String;
 `str`s (`.collect_in(gpa)`), `env::get_in(name, gpa)` a
 `Result<String, VarError>` (Rust's `env::var`). `Command::new(p)`, then `c.arg(a)` (it
 changes `c`: `var c = ..`, no chaining), `c.output_in(gpa)?`
-(`status`, `stdout`, `stderr`), `c.status()?`. A Rust `use std::io::{self,
+(`status`, `stdout`, `stderr`), `c.status()?`; (0.25.5) any number of
+arguments, `c.env_remove(name)`, and `c.foreground(true)`: while it
+waits, this process ignores ^C (SIGINT) and ^\, which end the child (as a
+shell runs a command). A Rust `use std::io::{self,
 Write}` is two lines here: `use std::io;` and `use std::io::Write;`.
 
 ```vole

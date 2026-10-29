@@ -799,7 +799,9 @@ or passed to any other call keeps its allocation on the heap. One slot
 serves an allocation in a loop: the pointer of one iteration cannot reach
 the next (it would need a phi).
 
-**Compile time.** `--time-passes` prints the CPU time of each phase.
+**Compile time.** `--time-passes` prints the CPU time of each phase;
+(0.25.5) `--time-passes=instructions` the instructions each retires,
+which a loaded machine hardly changes (the recipe: "0.25.5" below).
 Compiling the compiler itself to assembly at -O2 (Apple M-series, best
 of 7, user + system): 0.5.0 takes 0.63 s, 0.6 (built by itself) 0.50 s;
 at -O0, 0.06 s and 0.03 s. Of 0.6's -O2 time, the interprocedural layer
@@ -1734,7 +1736,8 @@ compiler/src/main.vl`) at each level, three runs, shares of
 RSS from `/usr/bin/time -l`; `--time-passes` with `clock()` replaced by
 instructions retired (a C file defining `clock` from
 `proc_pid_rusage`, linked into a build of the compiler: `volec
-compiler/src/main.vl iclock.c -o icount`) for each phase's
+compiler/src/main.vl iclock.c -o icount`; since 0.25.5
+`--time-passes=instructions` does it without a build) for each phase's
 instructions, which a loaded machine does not blur. `same-output`
 against the compiler before each change proved every change but two
 (see below) left the output of 6984 compilations as it was.
@@ -1894,7 +1897,7 @@ b.push_fmt(f"..")    =>  { let __r = &b; let __f0 = ..; { let mut __out = std::_
                             loop { WRITES; if std::__buf_fmt_end(__r, &__out) { break; } } } }
 format_in(f"..", a)  =>  { let __f0 = ..; let __a = a; { let mut __b = std::Buf::new_in(__a);
                             let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
-                            loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+                            loop { WRITES; if std::__fmt_in_end(&__b, &__out) { break; } }
                             __b } }
 ```
 
@@ -2747,3 +2750,115 @@ loop), `opt_vecfacts_push_reload`, `opt_vecfacts_raw_alias`,
 Vec, another Vec's buffer holding the header, a let parameter the
 function itself pushes to through a raw pointer, a closure in the loop
 that pushes; all with `--check-alloc`, at -O0, -O1 and -O2).
+
+## 0.25.5: measuring the compiler, bss, statics no code names
+
+**Measuring a compile** (the recipe):
+
+```
+/usr/bin/time -l target/volec --no-cache -j1 -c compiler/src/main.vl -o /dev/null
+target/volec --no-cache -j1 --time-passes=instructions -c compiler/src/main.vl -o /dev/null
+```
+
+`--no-cache`: the code cache would replay the functions of an earlier
+build. `-j1`: no thread, one counter for the whole compile
+(`--time-passes` runs on one thread anyway). `/usr/bin/time -l`'s
+"instructions retired" is the count to compare; time varies with the
+machine's load, instructions by about 0.5%. Compare two compilers
+**linked the same way**: both by `volec ... -o X`, or both `-c` and
+linked by `cc` (or `--linker=system`): see the next paragraph.
+`--time-passes=instructions` reads the system's counter: macOS's
+`proc_pid_rusage` (`ri_instructions`, through the `proc_info` system
+call), Linux's `perf_event_open` (user-space instructions of the
+thread; refused where `/proc/sys/kernel/perf_event_paranoid` is above
+2 or a container's seccomp forbids it: `error[time.instructions]`).
+It prints `N.N M  phase` per phase and `N M  total (instructions
+retired)`; tests/perf/run.sh checks it (on macOS, at most what
+`/usr/bin/time -l` counts for the process and at least half of it).
+
+**The 7x of a `-o`-linked compiler** (opt254 #8). The -O2
+self-compile, `--no-cache -j1 -c compiler/src/main.vl`, by a compiler
+built from 0.25.4's tree in two ways:
+
+| linked by | instructions | user time |
+|---|---|---|
+| `volec compiler/src/main.vl -o A` (the internal linker) | 470.4G | 36.6 s |
+| `volec -c` and `cc` | 46.2G | 3.5 s |
+| `volec --linker=system -o C` | 46.1G | 3.5 s |
+
+The objects are the same (the internal linker is given the same `.o`);
+not the -O level (both -O2 by default). `sample` on the slow one:
+`libsystem_malloc`'s `tiny_free_reattach_region`, `tiny_free_detach_region`
+and `tiny_free_scan_madvise_free` most of the samples. The cause: the
+internal linker wrote LC_BUILD_VERSION `minos 12.0, sdk 12.0`, and
+macOS's malloc keeps its older free path (madvise of freed tiny regions)
+for a program built against an SDK before 13; `ld` writes the SDK it
+links with. Shown on the slow binary alone, rewritten by `vtool
+-set-build-version macos MINOS SDK -replace`: minimum 12.0 with SDK
+27.0, 46G; minimum 26.0 with SDK 12.0, 497G: only the SDK field
+matters, and SDK 13.0 is already fast (-O1: SDK 12.0 29.6G, 13.0
+17.8G). The linker now writes SDK 26.0 (a constant: the
+host's version would need a macOS-only call in the compiler), minimum OS
+12.0 as before; the `-o`-linked compiler's self-compile is 46.2G, its
+object the one `cc` links. tests/link/run.sh `internal-sdk` checks the
+field (`otool -l`).
+
+**Zero statics in bss.** A static whose bytes are all zero and which can
+be written (a `static var`, or a static holding a cell) is emitted as
+zero-fill: `.section __DATA,__bss,zerofill` on Mach-O, `.section
+.bss,"aw",@nobits` on ELF (gen0's `bss_section`, chosen by `gen_data`). The
+in-process assembler takes both (section SEC_BSS: `.space`, `.p2align`
+and `.globl` only, anything else `data in a zero-fill section`; no
+mapping symbols), the object writers write a section with no bytes
+(Mach-O `S_ZEROFILL`, ELF `SHT_NOBITS`), and the internal Mach-O linker
+gives `__DATA` a memory size past its file size, its chained fixups
+naming the file's pages only (the vm size's pages made the kernel map
+`__LINKEDIT`'s bytes into bss: the first build of the compiler so linked
+crashed). A zero static that cannot be written stays read-only data.
+The constant evaluator writes `[x; N]` by evaluating x once and copying
+it (doubling), nothing for zeros: `[0; 65536]` cost 39M instructions.
+
+| | before | after |
+|---|---|---|
+| hello world, -O2 object | 9,864 B | 5,552 B |
+| hello world, -O0 object | 20,760 B | 16,448 B |
+| hello with a `[u8; 65536]` static, object | 78,496 B | 8,896 B |
+| the same, instructions to build | 145.4M | 104.5M |
+| a 16 MiB static: check, data phases | 179 ms, 191 ms | 2.3 ms, 11.8 ms |
+
+**Statics no code names.** gen0 writes a static only when a function
+it emits names it: `statics_named_by_ir` scans the live functions' IR
+(`GAddr`) before the tasks (at -O1 every function, as they are all
+emitted), -O0 marks each as its address is taken; the emission stops
+with an internal error if an unnamed one is ever asked for. A hello
+world wrote 12 statics, 4 of them unread (std::io's stdin buffer,
+position and length, std::hash's fold seeds); now 8. A program using
+much of std: 43 to 15 (20,014 bytes to 15,180). The self-compile 46.38G
+to 46.31G, its object 10,488,368 bytes to 10,352,824.
+
+The gate's `compile-cost` row (instructions to build, against 0.25.4):
+hello 78.3M 0.96x, std 1,038.9M 1.00x, check 4,223.0M 0.99x.
+
+**`--vec-stats=FN`**: a line on stderr for each loop of FN (a whole
+name, the name before an instance's `<` or `$`, or its last part) at
+-O2: `vectorized, L lanes, the body U times an iteration`, or `not
+vectorized: ` and the first reason: from legality (a call, a store or
+load not consecutive, a gather `a[idx[i]]`, a branch that is not a
+bounds check, an unknown trip count, a float carried between iterations,
+operand widths, an operation with no vector form) or the cost model; the
+instruction is named in parentheses when there is one. Its build runs on
+one thread and keeps the IR's positions for the loops' lines; the
+decisions are the same as without it. tests/perf/run.sh `vec-stats`.
+
+**Not done: a bounds check after `i < v.len()`** (stdunsafe254 #15).
+`if (i as u64) < (a.len as u64) { a[i] }` on a slice, and `if 0 <= i &&
+i < a.len { a[i] }`, already drop the check (0.25.4 too), and so does
+`Vec::get`. What keeps one: indexing a Vec after the test, `if 0 <= i &&
+i < v.len() { v[i] }`: the index goes through `as_slice()`, whose length
+is `len - 0` with the u64 type from an i64 `len`; instcombine replaces
+`x - 0` by x only when the types are the same (`replace_same_type`), so
+the range pass compares against another value. The fix (the slice's
+length when its start is 0, or x - 0 across the signedness of one
+width) changes every program's IR and needs the adversarial tests the
+item asks for (a length changed between the test and the access, a
+mutant): left for later.

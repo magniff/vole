@@ -2719,3 +2719,27 @@ fuzz-sem 300 ok, cachediff 1335 lines (387 from the cache), unsafe-audit
 4365 and 0 unjustified (0.25.3: 5316 and 1194), every fuzz and ABI row on
 both systems, chain-fresh 32 releases. compile-cost against v0.25.3: a
 hello world 0.99x, std 1.02x, check of the compiler 0.98x.
+
+### 0.25.5
+
+The release gate (`gate.sh --release --no-x86`, 83:28 wall), on the
+release commit: every row passed, on macOS and in the container (the
+book's property-test limit now relaxed under load). The suite 4454 at
+-O0 (2 SKIPPED: no spirv-val, and a terminal-render time budget under a
+load of 113), 4455 at -O1 and -O2 (70 XFAIL), aarch64-linux 3783 at -O0
+and -O2, threads 8410, incremental 172 series, objcheck 5436 (macOS) and
+5404 (aarch64-linux), compiler-memcheck 695, valgrind 347 clean,
+examples-checkalloc 180, fuzz-sem 300 ok, cachediff 1354 lines (398 from
+the cache), unsafe-audit 3425 and 0 unjustified (0.25.4: 4365 and 0),
+every fuzz and ABI row on both systems, chain-diverse, chain-fresh 33
+releases. compile-cost against v0.25.4: a hello world 1.12x (print's
+lock code in println), std 1.02x, check of the compiler 1.03x (the six
+tables as Vec). The compiler's own -O2 self-compile is not gated: 46G to
+61.5G instructions with the tables (feedbacks/DIGEST-0.25.5.md §2.1).
+
+0.25.5 is the last release before 0.26, which is a rethink and cleanup of the
+core semantics with the user: a small, checkable core language with the
+rest elaborated onto it. Its inputs: the inventory of 136 rules and 33
+contradictions, the literature on mutable value semantics, safety and
+concurrency, and a first draft of the core (in the working notes,
+.claude/briefs/research-026/).

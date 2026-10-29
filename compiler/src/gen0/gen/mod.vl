@@ -55,24 +55,24 @@ use crate::front::ast::NodeKind::{CStr, Defer, Fn, Let, PatBind, PatVariant, Pat
 use crate::front::cheader::{EMIT_HEADER, emit_c_header};
 use crate::front::check::{LOCALS, check_program};
 use crate::front::cimport::{IMPORTED_START, drop_shadowed_imports};
-use crate::front::consteval::{CONST_RELOCS, const_emit};
+use crate::front::consteval::{CONST_RELOCS, all_zero, const_emit};
 use crate::front::lexer::STR_COUNT;
 use crate::front::parser::parse_program;
 use crate::front::types::{
-    FNS, STATICS, STATIC_COUNT, TY_F32, TY_NEVER, TY_U32, TY_U64, TY_UNIT, align_to, fn_param,
-    init_declarations, init_types, is_compound, is_float, is_void, tuple_offset, type_align,
-    type_elem, type_size, variant_field, variant_field_offset,
+    FNS, STATICS, STATIC_COUNT, SYM_STATIC, TY_F32, TY_NEVER, TY_U32, TY_U64, TY_UNIT, align_to,
+    fn_param, init_declarations, init_types, is_compound, is_float, is_void, tuple_offset,
+    type_align, type_elem, type_size, variant_field, variant_field_offset,
 };
 use crate::gen0::target::{
-    DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, data_align, data_bytes,
-    data_label, data_section, data_string, emit_add_imm, emit_call, emit_copy, emit_epilogue,
-    emit_file_header, emit_file_trailer, emit_frame_addr, emit_frame_reserve, emit_function_start,
-    emit_label, emit_load, emit_load_imm, emit_load_param, emit_load_reg, emit_move_to_second,
-    emit_peek, emit_runtime, emit_store, first_int_arg, function_prefix, global_prefix, ins,
-    local_prefix, new_label, pop_d, pop_x, push_x0, static_prefix,
+    DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, bss_section, data_align,
+    data_bytes, data_label, data_section, data_string, emit_add_imm, emit_call, emit_copy,
+    emit_epilogue, emit_file_header, emit_file_trailer, emit_frame_addr, emit_frame_reserve,
+    emit_function_start, emit_label, emit_load, emit_load_imm, emit_load_param, emit_load_reg,
+    emit_move_to_second, emit_peek, emit_runtime, emit_store, first_int_arg, function_prefix,
+    global_prefix, ins, local_prefix, new_label, pop_d, pop_x, push_x0, static_prefix,
 };
 use crate::middle::inline::FN_LIVE;
-use crate::middle::ir::{IRFUNC_COUNT, ir_enter, ir_tables_bytes};
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_enter, ir_tables_bytes};
 use crate::middle::ir::print::print_ir_func;
 use crate::middle::lower::lower_program;
 use crate::middle::opt::{OPT_LEVEL, PER_FUNCTION, optimize_program};
@@ -82,6 +82,7 @@ use expr::gen_expr;
 
 // Used by lower.vl.
 use crate::back::codecache::cc_end;
+use crate::base::comp::Comp;
 use crate::base::diag::{ERR_KIND, flush_warnings};
 use crate::base::target::X86;
 use crate::base::term::{build_checked, build_compiling};
@@ -166,6 +167,64 @@ pub fn fn_is_global(f: i64) -> bool {
 
 pub fn static_symbol_prefix(s: i64) -> *u8 {
     if unsafe { STATICS[s].linkage != 0 } { global_prefix() } else { static_prefix() }
+}
+
+// (0.25.5) The statics the program's code names: gen_data leaves out a
+// static nothing names (std's statics come with their section of std, its
+// functions only with what the program calls). -O0's code generator marks
+// each it addresses (emit_static_addr); at -O1 and -O2 the live functions'
+// IR is read before the emission (statics_named_by_ir), and the emission
+// checks that it names no other (back::emit::operands::materialize).
+static var STATIC_NAMED: Vec<bool, Comp> = Vec::new_in(Comp {});
+
+pub fn static_named(s: i64) {
+    while STATIC_NAMED.len() as i64 <= s {
+        STATIC_NAMED.push(false);
+    }
+    STATIC_NAMED[s] = true;
+}
+
+pub fn is_static_named(s: i64) -> bool {
+    s < STATIC_NAMED.len() as i64 && STATIC_NAMED[s]
+}
+
+// -O1, -O2, before the emission: the statics the live functions' IR
+// addresses (GADDR; at -O2 optimized, at -O1 every function's as
+// lowered, which -O1's optimizer only takes from), and std::arch::detect's word, which
+// instruction selection addresses later (back::isel::arch).
+pub fn statics_named_by_ir(cx: sink *FnCtx) {
+    // UNSAFE: the IR's tables (IRFUNCS, a function's blocks and
+    // instructions in cx) and SYM_STATIC are the compiler's raw arrays.
+    // SAFETY: fi < IRFUNC_COUNT; ir_enter makes cx's tables fi's, which
+    // hold its blocks and their instruction lists (first, next: 0 ends);
+    // a GADDR's imm is a static's symbol (materialize reads SYM_STATIC so),
+    // and so is ARCH_WORD_SYM when not 0.
+    unsafe {
+        for fi in 0..IRFUNC_COUNT {
+            // (-O1 optimizes each function as it emits it: every one
+            // lowered, as its inlining may take any)
+            if FN_LIVE[fi] == 0 && !PER_FUNCTION {
+                continue;
+            }
+            ir_enter(cx, fi);
+            for b in IRFUNCS[fi].blocks.items() {
+                if cx.blocks[b].removed != 0 {
+                    continue;
+                }
+                var v = cx.blocks[b].first;
+                while v != 0 {
+                    if cx.insts[v].op == Op::GAddr {
+                        static_named(SYM_STATIC[cx.insts[v].imm] - 1);
+                    }
+                    v = cx.insts[v].next;
+                }
+            }
+        }
+        let word = crate::back::isel::arch::ARCH_WORD_SYM;
+        if word > 0 && SYM_STATIC[word] > 0 {
+            static_named(SYM_STATIC[word] - 1);
+        }
+    }
 }
 
 // ---- The program ----
@@ -269,6 +328,8 @@ pub fn compile_program(cx: sink *FnCtx, output: *u8) {
         asm_stream_begin();
         if OPT_LEVEL > 0 {
             timer_add(T_CODEGEN, t);
+            // (0.25.5: the statics the code names; gen_data writes those)
+            statics_named_by_ir(cx);
             // (0.17: each function selected, allocated and emitted, then
             // freed; at -O1 optimized there too)
             emit_ir_functions(cx);
@@ -345,6 +406,11 @@ fn gen_data() {
                 // Defined in C.
                 continue;
             }
+            // (0.25.5) one no code names (C can name it only when exported:
+            // linkage 2)
+            if STATICS[s].linkage == 0 && !is_static_named(s) {
+                continue;
+            }
             buf_clear(scratch);
             let init = NODES[item].c;
             if NODES[init].kind == CStr {
@@ -364,7 +430,13 @@ fn gen_data() {
             // load time)
             let relocs = CONST_RELOCS.count > 0;
             // (0.21: an atomic or a lock changes through a shared reference)
-            data_section(STATICS[s].mutable || relocs || is_interior_type(ty));
+            let writable = STATICS[s].mutable || relocs || is_interior_type(ty);
+            // (0.25.5: all zero, it takes no room in the object)
+            if writable && !relocs && BUFS[scratch].len > 0 && all_zero(buf_slice(scratch)) {
+                bss_section();
+            } else {
+                data_section(writable);
+            }
             data_align(type_align(ty));
             if STATICS[s].linkage == 2 {
                 buf_fmt(DATA, f".globl {cstr(global_prefix())}{SYMS[NODES[item].a].text}\n");
@@ -582,39 +654,37 @@ fn gen_return_value(cx: sink *FnCtx, ret: i64) {
 // ---- Statements ----
 
 fn gen_block(cx: sink *FnCtx, block: i64) {
-    unsafe {
-        let mark = DEFERS.count;
-        // (-g) After the block, the code is the enclosing statement's again.
-        let outer = STMT_POS;
-        for stmt in kids(block) {
-            if DEBUG_INFO {
-                stmt_loc(cx, NODES[stmt].start);
-            }
-            if NODES[stmt].kind == Let {
-                gen_expr(cx, NODES[stmt].c);
-                bind(cx, NODES[stmt].a);
-            } else if NODES[stmt].kind == Defer {
-                DEFERS.push(stmt);
-            } else {
-                gen_expr(cx, NODES[stmt].a);
-            }
+    let mark = DEFERS.count;
+    // (-g) After the block, the code is the enclosing statement's again.
+    let outer = STMT_POS;
+    for stmt in kids(block) {
+        if DEBUG_INFO {
+            stmt_loc(cx, NODES[stmt].start);
         }
-        let tail = NODES[block].a;
-        if tail != 0 {
-            if DEBUG_INFO {
-                stmt_loc(cx, NODES[tail].start);
-            }
-            gen_expr(cx, tail);
+        if NODES[stmt].kind == Let {
+            gen_expr(cx, NODES[stmt].c);
+            bind(cx, NODES[stmt].a);
+        } else if NODES[stmt].kind == Defer {
+            DEFERS.push(stmt);
+        } else {
+            gen_expr(cx, NODES[stmt].a);
         }
-        if DEFERS.count > mark {
-            gen_defers(cx, mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
-            DEFERS.count = mark;
-        }
-        if DEBUG_INFO && outer >= 0 {
-            stmt_loc(cx, outer);
-        }
-        STMT_POS = outer;
     }
+    let tail = NODES[block].a;
+    if tail != 0 {
+        if DEBUG_INFO {
+            stmt_loc(cx, NODES[tail].start);
+        }
+        gen_expr(cx, tail);
+    }
+    if DEFERS.count > mark {
+        gen_defers(cx, mark, if tail != 0 { NODES[tail].ty } else { TY_UNIT });
+        DEFERS.count = mark;
+    }
+    if DEBUG_INFO && outer >= 0 {
+        stmt_loc(cx, outer);
+    }
+    STMT_POS = outer;
 }
 
 // Runs the deferred statements registered above DEFERS depth `depth`, last

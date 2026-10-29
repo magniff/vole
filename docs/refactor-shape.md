@@ -143,6 +143,7 @@ resolved, in every module:
 | `X_COUNT` read | `X.len()` (a path keeps its prefix: `crate::m::X.len()`) |
 | `X_COUNT = 0` | `X.clear()` |
 | `X_COUNT -= k` | `X.truncate(X.len() - k)` |
+| `let m = X_COUNT; ... X_COUNT = m` (0.25.5: a rollback; m a `let` of the function set to the count, its one binding there, assigned nowhere) | `let m = X.len(); ... X.truncate(m)` |
 | `X[i]`, `X[i].f`, `X[i] = v`, `X[a..b]` | as they are |
 
 X_COUNT's and X_CAP's statics go, with their names in `use` lines (and
@@ -167,13 +168,21 @@ why`, then with more than three a count by reason (`refactor.table-why`):
 - between a store and its increment: a `return`, `?`, a `break` or
   `continue` out of the span, or a call that reaches code naming X_COUNT
   (through every call the checker resolved; a call it cannot follow is
-  refused too): the count would change at another time than before.
+  refused too): the count would change at another time than before;
+- (0.25.5) a call in the index of `X[i]` that may grow X (one reaching a
+  write of X or X_COUNT, through every call the checker resolved; one it
+  cannot follow too): `X[t_node(..)]` reads X's buffer and length before
+  it calls, so the element would be read through the header X had before
+  the call (a new element is refused by the bounds check, an old one read
+  from a buffer since freed). Take the index into a `let` first.
 
 Change those by hand (an index instead of a pointer; the increment moved
 next to the store), then run it again. Afterwards indexing X is safe:
 `note refactor.table-unsafe` gives the `try:` line, `fix --only
 unneeded-unsafe`, that takes away the unsafe blocks only the table's
-indexing needed. `--dry-run` prints the diff, or the refusals.
+indexing needed; `fix --only unneeded-justified` (0.25.5) also takes the
+ones whose `// UNSAFE:` and `// SAFETY:` comments named the table, with
+those comments. `--dry-run` prints the diff, or the refusals.
 
 ## refactor variant
 
@@ -466,8 +475,11 @@ as typed after `volec` (words as sh splits them: `'...'`, `"..."`;
 in one invocation, each on the program the ones before left, and checked
 once, at the end: all or nothing. Each command runs in a copy of the
 process (fork) that reads the copies the commands before it wrote
-(`FILE.vole-edit~`, as --overlay) and writes its own, unchecked
-(edit.vl's STEP_REPORT), printing its summary line. A command that
+(`FILE.vole-edit~`, 0.25.5: `FILE.vole-edit-TAG~`; as --overlay) and writes its own, unchecked
+(edit.vl's STEP_REPORT), printing its summary line; (0.25.5) `rewrite
+--text` too, on the program's files only (the steps' copies read in
+place of them; no `--move-paths`, no `--check`: the script checks), so
+a type's spelling changed as text is a step like the others. A command that
 fails ends the script: `error refactor.script: FILE:LINE: the command
 failed (exit N): ...; nothing written`. After the last, the copies are
 one edit: checked, written, journaled (one `undo` takes the whole script
@@ -495,7 +507,7 @@ pub fn half_area(p: Point) -> i64 {
 EOF
 ```
 
-The text goes to a file next to the root (`ROOT.vole-stdin~`) while
+The text goes to a file next to the root (`ROOT.vole-stdin~`; 0.25.5: `ROOT.vole-stdin-TAG~`, as the copies) while
 the command runs. A `<<WORD` without its line `WORD`: `error
 refactor.script: FILE:LINE: no line 'WORD' ends the text of <<WORD`.
 `--pairs FILE` works in a script as on the command line.

@@ -142,7 +142,12 @@ for file in "$HERE"/*.q; do
         grep -v '^##' "$file" >"$WORK/$name.want"
         if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
             # (0.16: a failing transcript only, its `##` comments kept
-            # above the `$` line they were above)
+            # above the `$` line they were above; 0.25.5: a line that
+            # differs only in std's numbers kept as it was, tests/stdkeep.sh)
+            if ! grep -q '^## exact-std' "$file"; then
+                sh "$ROOT/tests/stdkeep.sh" "$WORK/$name.want" "$WORK/$name.got" >"$WORK/$name.kept"
+                cp "$WORK/$name.kept" "$WORK/$name.got"
+            fi
             awk 'NR == FNR {
                     if ($0 ~ /^##/) { pend = pend $0 "\n" }
                     else if ($0 ~ /^\$ /) { c[++n] = pend; pend = "" }
@@ -189,7 +194,7 @@ unset VOLE_ROOT
 TAB=$(printf '\t')
 out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.vl 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*${TAB}effects: [a-z(), ]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*${TAB}effects: [A-Za-z(), ]*\$" \
     && printf '%s\n' "$out" | grep -q '^pub fn run_gvn(' && ok=1
 check self_show "$ok" "$out"
 out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.vl 2>&1)

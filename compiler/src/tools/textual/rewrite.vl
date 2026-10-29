@@ -13,17 +13,20 @@
 // left: matches in excluded files and lines, and in a source's other
 // places.
 
-use crate::base::{IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq};
+use crate::base::{
+    FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
+};
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_opt, option, table};
-use crate::tools::edit::{DRY_RUN, gone_path};
-use crate::tools::edit::apply::{copy_path, error_lines};
+use crate::tools::edit::{DRY_RUN, TARGET, gone_path};
+use crate::tools::edit::apply::{STEP_REPORT, cannot_write, copy_path, error_lines, not_generated};
 use crate::tools::edit::diff::diff_texts;
 use crate::tools::proc::{
     buf_cstr, read_file_if, remove_file, run_capture, same_bytes, write_file_if,
 };
 use crate::tools::query::c_slice;
+use crate::tools::query::command_line::load_program;
 use crate::tools::query::diagnostics::{
-    PROG, diag, diags, put_cword, put_word, try_end, write_diags,
+    PROG, diag, diags, program_errors, put_cword, put_word, try_end, write_diags,
 };
 use crate::tools::query::grep::{G_CODE, G_COMMENT, G_STRING};
 use crate::tools::textual::{
@@ -236,6 +239,41 @@ pub fn check_roots(roots: IntVec, added: inout IntVec) -> bool {
     }
 }
 
+// (0.25.5) A step of `refactor --script` (script.vl): the rewritten texts
+// written as the files' copies, unchecked, and listed in the step's report
+// (`file PATH`); then the lines and the totals. The exit status.
+fn step_write(out: i64) -> i64 {
+    for k in 0..W_PATH.count {
+        if !not_generated(c_slice(w_path(k)), buf_slice(W_BEFORE.get(k))) {
+            return 1;
+        }
+    }
+    let report = buf_new();
+    for k in 0..W_PATH.count {
+        let p = w_path(k);
+        if !write_file_if(copy_path(p), buf_slice(W_AFTER.get(k))) {
+            cannot_write(p);
+            return 1;
+        }
+        buf_str(report, c"file\t");
+        buf_str(report, p);
+        buf_byte(report, '\n');
+    }
+    if !write_file_if(STEP_REPORT, buf_slice(report)) {
+        cannot_write(STEP_REPORT);
+        return 1;
+    }
+    flush(out);
+    0
+}
+
+// The path of rewritten file k (W_PATH keeps C strings as integers).
+fn w_path(k: i64) -> *u8 {
+    // UNSAFE: W_PATH keeps C strings as integers; one made a pointer again is a cast.
+    // SAFETY: each entry is a path the rewrite made (FILES' or buf_cstr's), never freed; k < W_PATH.count.
+    unsafe { W_PATH.get(k) as *u8 }
+}
+
 pub fn run_text_rewrite(c: Call) -> i64 {
     let status = run_inner(c);
     write_diags();
@@ -260,6 +298,10 @@ pub fn text_rewrite_leaf(gpa: Gpa) -> Leaf {
     opts.push(option("check", "ROOT", "check ROOT's program after"));
     opts.push(option("exclude", "PATH", "not PATH (a file or directory)"));
     opts.push(option("exclude-from", "FILE", "not the paths listed in FILE"));
+    opts.push(flag("force", "a generated file too"));
+    // (0.25.5: a step of refactor --script, which gives them)
+    opts.push(option("root", "ROOT", "a script's step: the program's files"));
+    opts.push(option("target", "T", "a script's step: its target"));
     Leaf::new(opts, "words")
 }
 
@@ -271,6 +313,7 @@ fn run_inner(c: Call) -> i64 {
     var move_paths = false;
     var no_sources = false;
     var show_diff = false;
+    var step_root = 0 as *u8;
     for ev in c.evs.iter() {
         let a = ev.value;
         if is_flag(ev, "text") {
@@ -306,6 +349,11 @@ fn run_inner(c: Call) -> i64 {
             if !read_exclusions(a) {
                 return 2;
             }
+        } else if is_flag(ev, "force") {
+            crate::tools::edit::FORCE = true;
+        } else if is_opt(ev, "root") {
+            step_root = a;
+        } else if is_opt(ev, "target") {
         } else if ev.kind != EV_WORD || ev.text.starts_with("--") {
             let d = diag(c"error", c"rewrite.usage");
             buf_str(d, c"unknown option '");
@@ -333,7 +381,31 @@ fn run_inner(c: Call) -> i64 {
             return usage(c"OLD is no regular expression (^ $ . * + ? [a-z] \\d \\w)");
         }
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !tracked_files(&files) {
+        // (0.25.5, feedbacks/mod254.md #3) A step of `refactor --script`:
+        // the program's files, as the steps before left them (their copies,
+        // read in place of the files), rewritten as copies too, checked
+        // with the others at the script's end
+        let step = STEP_REPORT != 0 as *u8;
+        var file_index = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if step_root != 0 as *u8 && !step {
+            return usage(
+                c"--root is for a step of refactor --script; --text rewrites the files git tracks");
+        }
+        if step && (move_paths || roots.count > 0) {
+            return usage(c"in a refactor --script, --text rewrites the program's files: no --move-paths, no --check (the script checks)");
+        }
+        if step {
+            if step_root == 0 as *u8 || !load_program(step_root, TARGET) {
+                program_errors(c"error", step_root, true);
+                return 1;
+            }
+            for g in 0..FILES.len() {
+                if FILES[g].path[0] != '<' {
+                    files.push(FILES[g].path as i64);
+                    file_index.push(g);
+                }
+            }
+        } else if !tracked_files(&files) {
             let d = diag(c"error", c"rewrite.no-git");
             buf_str(d, c"--text edits the files git tracks: this is no git checkout\n");
             return 2;
@@ -367,8 +439,12 @@ fn run_inner(c: Call) -> i64 {
                 continue;
             }
             let text = buf_new();
+            if step {
+                let g = file_index.data[f];
+                buf_bytes(text, SRC[FILES[g].start..FILES[g].end]);
+            }
             // (0.24: a link is its target's text: never written through)
-            if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
+            else if crate::tools::proc::link_target(path) >= 0 || !read_file_if(path, text)
                 || !is_text(buf_slice(text)) {
                 continue;
             }
@@ -481,6 +557,9 @@ fn run_inner(c: Call) -> i64 {
         if total == 0 && M_FROM.count == 0 {
             flush(out);
             return 0;
+        }
+        if step {
+            return step_write(out);
         }
         // The check, then the edit.
         if roots.count > 0 {
