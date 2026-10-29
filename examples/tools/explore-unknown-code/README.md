@@ -42,7 +42,7 @@ generated header:
 ```console
 $ volec query items
 crate	main.vl	6
-std	<std>	605
+std	<std>	607
 crate::graph	graph.vl	10
 crate::heap	heap.vl	6
 crate::network	network.vl	2
@@ -65,7 +65,7 @@ std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
 std::fmt	<std>	95
-std::num	<std>	132
+std::num	<std>	140
 std::num::tables	<std>	4
 std::math	<std>	260
 std::convert	<std>	2
@@ -86,13 +86,15 @@ std::sync::mpsc	<std>	24
 std::thread	<std>	43
 std::objc	<std>	50
 std::objc::foundation	<std>	67
-std::gpu	<std>	176
+std::gpu	<std>	180
+std::gpu::capture	<std>	5
 std::gpu::hal	<std>	9
-std::gpu::hal::metal	<std>	115
+std::gpu::hal::metal	<std>	118
 std::gpu::hal::metal::bindings	<std>	776
 std::gpu::shader	<std>	26
+std::gpu::timing	<std>	15
 std::gpu::types	<std>	51
-std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::BufferUsage	<std>	10
 std::gpu::types::TextureUsage	<std>	5
 std::gpu::types::ShaderStage	<std>	3
 std::gpu::wgsl	<std>	30
@@ -116,10 +118,12 @@ std::path	<std>	34
 std::fs	<std>	59
 std::env	<std>	21
 std::process	<std>	36
-std::window	<std>	48
-std::window::cocoa	<std>	130
+std::window	<std>	52
+std::window::cocoa	<std>	131
 std::window::keys	<std>	27
 std::window::objc	<std>	88
+std::window::script	<std>	37
+std::capture	<std>	6
 std::cli	<std>	110
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
@@ -186,11 +190,11 @@ crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: Heap) -> bool
 crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout Heap) -> Option<Entry>
 crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
 crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap, e: Entry)
-std::Vec::filled_in	<std>:1517:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
-std::Option::unwrap	<std>:130:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::as_mut_slice	<std>:395:12	method	pub fn as_mut_slice(inout self) -> inout [T]
-<std::Vec as Drop>::drop	<std>:435:8	method	fn drop(inout self)
-std::Vec::as_slice	<std>:389:12	method	pub fn as_slice(self) -> [T]
+std::Vec::filled_in	<std>:1518:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Option::unwrap	<std>:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
+<std::Vec as Drop>::drop	<std>:436:8	method	fn drop(inout self)
+std::Vec::as_slice	<std>:390:12	method	pub fn as_slice(self) -> [T]
 // types (9)
 crate::route::Route	route.vl:17:12	struct	pub struct Route { pub legs: Vec<Leg>, pub total: i64, }
 note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1
