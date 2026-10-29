@@ -466,8 +466,11 @@ as typed after `volec` (words as sh splits them: `'...'`, `"..."`;
 in one invocation, each on the program the ones before left, and checked
 once, at the end: all or nothing. Each command runs in a copy of the
 process (fork) that reads the copies the commands before it wrote
-(`FILE.vole-edit~`, as --overlay) and writes its own, unchecked
-(edit.vl's STEP_REPORT), printing its summary line. A command that
+(`FILE.vole-edit~`, 0.25.5: `FILE.vole-edit-TAG~`; as --overlay) and writes its own, unchecked
+(edit.vl's STEP_REPORT), printing its summary line; (0.25.5) `rewrite
+--text` too, on the program's files only (the steps' copies read in
+place of them; no `--move-paths`, no `--check`: the script checks), so
+a type's spelling changed as text is a step like the others. A command that
 fails ends the script: `error refactor.script: FILE:LINE: the command
 failed (exit N): ...; nothing written`. After the last, the copies are
 one edit: checked, written, journaled (one `undo` takes the whole script
@@ -495,7 +498,7 @@ pub fn half_area(p: Point) -> i64 {
 EOF
 ```
 
-The text goes to a file next to the root (`ROOT.vole-stdin~`) while
+The text goes to a file next to the root (`ROOT.vole-stdin~`; 0.25.5: `ROOT.vole-stdin-TAG~`, as the copies) while
 the command runs. A `<<WORD` without its line `WORD`: `error
 refactor.script: FILE:LINE: no line 'WORD' ends the text of <<WORD`.
 `--pairs FILE` works in a script as on the command line.

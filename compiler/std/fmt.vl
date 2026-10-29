@@ -24,29 +24,48 @@ extern "C" {
 // (std::thread::spawn sets FMT_THREADED), each print holds a lock while it
 // fills std's buffer and writes it, so lines do not mix and the buffer is
 // never shared. A print inside a print (a Display that prints) on the
-// thread holding it takes nothing more.
+// thread holding it takes nothing more. (0.25.5) A Fmt to a file
+// descriptor a program makes itself (Fmt::to_fd) takes the lock at its
+// first write and keeps it to its flush (fmt_guard): 0.25.4 let it use the
+// buffer without the lock, a data race with any other thread's print.
 static var FMT_THREADED: AtomicU32 = AtomicU32 { v: 0 };
 static var FMT_LOCK: RawLock = RawLock { state: AtomicU32 { v: 0 } };
 static var FMT_OWNER: AtomicU64 = AtomicU64 { v: 0 };
-// The holder's prints in progress (prints inside prints).
+// The holder's holds: its prints in progress (prints inside prints), and
+// (FMT_LAZY) one for the writes of a Fmt::to_fd until its flush. (0.25.5)
+// Before any thread runs: the prints in progress.
 static var FMT_DEPTH: i64 = 0;
+static var FMT_LAZY: bool = false;
 
 // Called before the first thread starts.
 pub fn print_threads_started() {
+    // (0.25.5) A thread started inside a print (a Display that starts one):
+    // that print holds the lock from here on.
+    if FMT_THREADED.load(Ordering::Relaxed) == 0 && FMT_DEPTH > 0 {
+        FMT_LOCK.lock();
+        FMT_OWNER.store(fmt_thread_self(), Ordering::Relaxed);
+    }
     FMT_THREADED.store(1, Ordering::Release);
+}
+
+#[inline]
+fn fmt_thread_self() -> u64 {
+    // UNSAFE: C. SAFETY: pthread_self takes nothing.
+    unsafe { fmt_c_thread_self() }
 }
 
 #[inline]
 fn print_acquire() {
     if FMT_THREADED.load(Ordering::Relaxed) != 0 {
         print_acquire_held();
+    } else {
+        FMT_DEPTH += 1;
     }
 }
 
 #[inline(never)]
 fn print_acquire_held() {
-    // UNSAFE: C. SAFETY: pthread_self takes nothing.
-    let me = unsafe { fmt_c_thread_self() };
+    let me = fmt_thread_self();
     if FMT_OWNER.load(Ordering::Relaxed) != me {
         FMT_LOCK.lock();
         FMT_OWNER.store(me, Ordering::Relaxed);
@@ -58,21 +77,66 @@ fn print_acquire_held() {
 fn print_release() {
     if FMT_THREADED.load(Ordering::Relaxed) != 0 {
         print_release_held();
+    } else {
+        FMT_DEPTH -= 1;
     }
 }
 
 #[inline(never)]
 fn print_release_held() {
-    // UNSAFE: C. SAFETY: pthread_self takes nothing.
-    let me = unsafe { fmt_c_thread_self() };
-    if FMT_OWNER.load(Ordering::Relaxed) != me {
+    if FMT_OWNER.load(Ordering::Relaxed) != fmt_thread_self() {
         return;
     }
+    fmt_let_go();
+}
+
+// One hold of the holder given back; the lock with the last.
+fn fmt_let_go() {
     FMT_DEPTH -= 1;
     if FMT_DEPTH == 0 {
         FMT_OWNER.store(0, Ordering::Relaxed);
         FMT_LOCK.unlock();
     }
+}
+
+// (0.25.5) Before a Fmt to a file descriptor touches std's buffer (its
+// statics): once threads run, this thread holds the lock, taken here when
+// it did not (a Fmt::to_fd's writes; a print's holds it already) and kept
+// until a flush gives it back (fmt_unguard). Every function that reads or
+// writes FMT_OUT, FMT_LEN, FMT_FD or FMT_DONE calls it first.
+#[inline]
+fn fmt_guard() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        fmt_guard_held();
+    }
+}
+
+#[inline(never)]
+fn fmt_guard_held() {
+    let me = fmt_thread_self();
+    if FMT_OWNER.load(Ordering::Relaxed) != me {
+        FMT_LOCK.lock();
+        FMT_OWNER.store(me, Ordering::Relaxed);
+        FMT_DEPTH += 1;
+        FMT_LAZY = true;
+    }
+}
+
+// After a flush: the hold fmt_guard took, if any, given back.
+#[inline]
+fn fmt_unguard() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        fmt_unguard_held();
+    }
+}
+
+#[inline(never)]
+fn fmt_unguard_held() {
+    if FMT_OWNER.load(Ordering::Relaxed) != fmt_thread_self() || !FMT_LAZY {
+        return;
+    }
+    FMT_LAZY = false;
+    fmt_let_go();
 }
 
 // What `print(f"...")` and its kin compile to (front/check/interp.vl):
@@ -161,7 +225,7 @@ pub fn format_in<T: Display, A: Allocator>(x: T, a: sink A) -> Buf<A> {
     // text did not fit, to b's room)
     loop {
         x.fmt(&f);
-        if __fmt_in_end(&b, &f, &tmp) {
+        if __fmt_in_end(&b, &f) {
             return b;
         }
     }
@@ -174,7 +238,7 @@ pub fn format_in<T: Display, A: Allocator>(x: T, a: sink A) -> Buf<A> {
 //
 //   { let __f0 = e0; ...; let __a = a; let mut __b = std::Buf::new_in(__a);
 //     let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&mut __t);
-//     loop { WRITES; if std::__fmt_in_end(&mut __b, &mut __out, &__t) { break; } }
+//     loop { WRITES; if std::__fmt_in_end(&mut __b, &mut __out) { break; } }
 //     __b }
 //
 // and `b.push_fmt(f"..")` is `{ let __r = &b; let __f0 = e0; ...; let mut
@@ -190,20 +254,19 @@ pub fn __fmt_tmp(tmp: inout [u8; 256]) -> Fmt {
     f
 }
 
-// The end of a pass of format_in: the text written to tmp, when it fits,
-// copied to b, of its length (true); else b reserves the length and f
-// writes into b's room (false); after that pass, as __buf_fmt_end.
-// (0.20: tmp is format_in's buffer itself, compared by its address: a raw
-// pointer, as a let parameter would copy it)
-pub fn __fmt_in_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt, tmp: *[u8; 256]) -> bool {
-    // UNSAFE: deref of tmp. SAFETY: the compiler passes &__t, its [u8; 256].
-    if f.out.ptr != unsafe { (*tmp)[..].ptr } {
+// The end of a pass of format_in: the text written to its buffer on the
+// stack (f's room, from __fmt_tmp), when it fits, copied to b, of its
+// length (true); else b reserves the length and f writes into b's room
+// (false); after that pass, as __buf_fmt_end. (0.25.5: safe, two
+// arguments: f's room is b's when it starts at b's bytes, else it is the
+// buffer, which f views; 0.20 to 0.25.4 took the buffer as a raw pointer.)
+pub fn __fmt_in_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt) -> bool {
+    if f.out.ptr == b.bytes.ptr {
         return fmt_end_vec(&b.bytes, &f);
     }
     if f.need == 0 {
         b.bytes.reserve(f.len);
-        // UNSAFE: deref of tmp. SAFETY: as above; f.len <= 256 when need is 0.
-        b.bytes.extend_from_slice(unsafe { (*tmp)[0..f.len] });
+        b.bytes.extend_from_slice(f.out[0..f.len]);
         return true;
     }
     b.bytes.reserve(f.need);
@@ -280,6 +343,7 @@ pub fn __fmt_into_len<T: Display>(out: inout [u8], x: T) -> i64 {
 // stdout() writes after it).
 pub fn __flush_print() {
     fmt_flush();
+    fmt_unguard();
 }
 
 // `{x}` in an f-string, and what print writes.
@@ -314,6 +378,7 @@ static var FMT_DONE: i64 = 0;
 // Writes the buffer out.
 #[inline(never)]
 fn fmt_flush() {
+    fmt_guard();
     var i = 0;
     // (each round writes a byte at least)
     for _ in 0..FMT_LEN {
@@ -342,10 +407,13 @@ fn fmt_room(f: inout Fmt, n: i64) -> [u8] {
         // UNSAFE: f's room by pointer. SAFETY: at + n <= f.out.len (checked).
         return unsafe { f.out.ptr[at..at + n] };
     }
-    if f.fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
-        let at = FMT_LEN;
-        FMT_LEN = at + n;
-        return FMT_OUT[at..at + n];
+    if f.fd >= 0 {
+        fmt_guard();
+        if f.fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
+            let at = FMT_LEN;
+            FMT_LEN = at + n;
+            return FMT_OUT[at..at + n];
+        }
     }
     ""
 }
@@ -361,6 +429,7 @@ fn fmt_make_room(f: inout Fmt, n: i64) -> [u8] {
 
 #[inline(never)]
 fn fmt_fd_room(fd: i32, n: i64) -> [u8] {
+    fmt_guard();
     if fd != FMT_FD || FMT_LEN + n > FMT_CAP {
         fmt_flush();
         FMT_FD = fd;
@@ -394,6 +463,7 @@ fn fmt_str(f: inout Fmt, s: [u8]) {
 
 #[inline(never)]
 fn fmt_str_fd(fd: i32, s: [u8]) {
+    fmt_guard();
     let n = s.len;
     var out: [u8] = "";
     if fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
@@ -508,6 +578,11 @@ impl Fmt {
             self.len = at + 1;
             return;
         }
+        if self.fd < 0 {
+            fmt_byte(&self, b);
+            return;
+        }
+        fmt_guard();
         if self.fd == FMT_FD && FMT_LEN < FMT_CAP {
             let out: *u8 = &FMT_OUT[0];
             // UNSAFE: the static by pointer. SAFETY: FMT_LEN < FMT_CAP (checked).
@@ -525,6 +600,7 @@ impl Fmt {
     pub fn flush(inout self) {
         if self.fd >= 0 {
             fmt_flush();
+            fmt_unguard();
         }
     }
 
@@ -552,7 +628,11 @@ impl Fmt {
 
     // The position written to.
     fn pos(inout self) -> i64 {
-        if self.fd >= 0 { FMT_DONE + FMT_LEN } else { self.len }
+        if self.fd < 0 {
+            return self.len;
+        }
+        fmt_guard();
+        FMT_DONE + FMT_LEN
     }
 
     // Starts a hole with a spec (width w, precision p, -1: none; FMT_*
@@ -566,9 +646,12 @@ impl Fmt {
         };
         self.flags = flags;
         if w > 0 || p >= 0 {
-            if self.fd >= 0 && (self.fd != FMT_FD || FMT_CAP - FMT_LEN < w) {
-                fmt_flush();
-                FMT_FD = self.fd;
+            if self.fd >= 0 {
+                fmt_guard();
+                if self.fd != FMT_FD || FMT_CAP - FMT_LEN < w {
+                    fmt_flush();
+                    FMT_FD = self.fd;
+                }
             }
             self.width = w;
             self.prec = p;
@@ -695,7 +778,16 @@ fn fmt_pad(f: inout Fmt) {
     let start = f.mark;
     var end = f.pos();
     let number = (flags & FMT_NUM) != 0;
-    let reach = if f.fd >= 0 { start >= FMT_DONE && f.fd == FMT_FD } else { true };
+    // (0.25.5: the hole's text still in the buffer, and the room spec made
+    // for the width still there: always, but for a Fmt::to_fd flushed inside
+    // its hole, after which other threads may have written)
+    let reach = if f.fd >= 0 {
+        fmt_guard();
+        start >= FMT_DONE && f.fd == FMT_FD && end <= FMT_DONE + FMT_LEN
+            && FMT_LEN + (f.width - (end - start)) <= FMT_CAP
+    } else {
+        true
+    };
     // (a precision cuts text)
     if f.prec >= 0 && !number && end - start > f.prec && reach {
         end = start + f.prec;

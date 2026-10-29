@@ -1,19 +1,21 @@
 // std::process (0.20, docs/design/collections-text-io.md §2.6.3, task
 // B6): running programs, with Rust's names, through posix_spawnp
-// (std::sys). A Command keeps its program and up to 32 arguments as
-// views, inline, and builds argv on the stack when it runs (each argument
-// and the program's name up to 4 KB in all: InvalidInput beyond), so
-// `Command::new(p)` allocates nothing; `output_in(gpa)` puts what the
-// child writes in Vecs on gpa. `c.arg(x)` changes c in place (Rust's
-// `&mut Command`): `let mut c = Command::new("ls"); c.arg("-l");
-// let out = c.output_in(gpa)?;`.
+// (std::sys). A Command keeps its program and its first 32 arguments as
+// views, inline, and builds argv on the stack when it runs, so
+// `Command::new(p)` allocates nothing; (0.25.5) more arguments, more than
+// 4 KB of them, and `env_remove`'s names are kept in Vecs on C's
+// allocator (Gpa), which the Command frees when it is dropped.
+// `output_in(gpa)` puts what the child writes in Vecs on gpa. `c.arg(x)`
+// changes c in place (Rust's `&mut Command`): `let mut c =
+// Command::new("ls"); c.arg("-l"); let out = c.output_in(gpa)?;`.
 
-use std::{Allocator, Display, Fmt, Option, Vec};
+use std::{Allocator, Display, Fmt, Gpa, Option, Vec};
 use std::io::error::{ErrorKind, Result, __io_error, __os_error};
 use std::sys::{
-    SYS_EINTR, SYS_O_RDWR, SYS_POLLIN, SysPollFd, SysSpawnActions, sys_close, sys_exit_code,
-    sys_exit_signal, sys_kill, sys_open, sys_pipe, sys_poll, sys_read, sys_spawn, sys_spawn_actions,
-    sys_waitpid,
+    SYS_EINTR, SYS_O_RDWR, SYS_POLLIN, SYS_SIGINT, SYS_SIGQUIT, SysPollFd, SysSpawnActions,
+    SysSpawnAttr, sys_close, sys_env_at, sys_env_count, sys_exit_code, sys_exit_signal, sys_kill,
+    sys_open, sys_pipe, sys_poll, sys_read, sys_signal_ignore, sys_signal_restore,
+    sys_spawn_actions, sys_spawn_attr, sys_spawn_sigdefault, sys_waitpid,
 };
 
 // ---- Processes (0.20) ----
@@ -32,14 +34,21 @@ impl Stdio {
     pub fn piped() -> Stdio { Stdio::Piped }
 }
 
-// A program to run, its arguments and its streams.
+// A program to run, its arguments, its environment and its streams.
+// (0.25.5: owned, as it holds Vecs; a Command moves, as Rust's does not
+// copy.)
 pub struct Command {
     prog: [u8],
     args: [[u8]; 32],
     count: i64,
+    // (the arguments after the first 32)
+    more: Vec<[u8], Gpa>,
+    // (env_remove's names)
+    removed: Vec<[u8], Gpa>,
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
+    foreground: bool,
 }
 
 // How a child ended: its exit code, or the signal that ended it.
@@ -152,17 +161,37 @@ struct Argv { text: [u8; 4096], ptrs: [*u8; 34] }
 impl Command {
     // Runs prog: a path, or a name looked up in PATH.
     pub fn new(prog: [u8]) -> Command {
-        Command { prog: prog, args: [""; 32], count: 0, stdin: Stdio::Inherit,
-            stdout: Stdio::Inherit, stderr: Stdio::Inherit }
+        Command {
+            prog: prog, args: [""; 32], count: 0, more: Vec::new_in(Gpa {}),
+            removed: Vec::new_in(Gpa {}), stdin: Stdio::Inherit, stdout: Stdio::Inherit,
+            stderr: Stdio::Inherit, foreground: false,
+        }
     }
 
-    // Adds an argument (up to 32).
+    // Adds an argument (0.25.5: any number of them).
     pub fn arg(inout self, a: [u8]) {
-        if self.count >= MAX_ARGS {
-            std::panic_str("Command::arg: more than 32 arguments");
+        if self.count < MAX_ARGS {
+            self.args[self.count] = a;
+            self.count += 1;
+        } else {
+            self.more.push(a);
         }
-        self.args[self.count] = a;
-        self.count += 1;
+    }
+
+    // (0.25.5) The child's environment is this process's without the
+    // variable `name` (Rust's env_remove); each call removes one more.
+    pub fn env_remove(inout self, name: [u8]) {
+        self.removed.push(name);
+    }
+
+    // (0.25.5) Runs it as a shell runs a command in the foreground: while
+    // status() or output_in() waits for it, this process ignores SIGINT
+    // and SIGQUIT (^C and ^\ at a terminal, which reach both), and the
+    // child starts with their default actions, so ^C ends the child and
+    // this process sees how it ended (`volec run`). Not for spawn(): its
+    // caller decides when to wait.
+    pub fn foreground(inout self, on: bool) {
+        self.foreground = on;
     }
 
     // Adds each of list.
@@ -184,27 +213,82 @@ impl Command {
         self.stderr = s;
     }
 
-    // argv for C, in out: InvalidInput when it does not fit or holds a NUL.
-    fn build_argv(self, out: inout Argv) -> Result<()> {
+    // argv's length: the program's name and the arguments.
+    fn argc(self) -> i64 {
+        1 + self.count + self.more.len()
+    }
+
+    // argv's k-th string (0: the program's name).
+    fn arg_at(self, k: i64) -> [u8] {
+        if k == 0 {
+            self.prog
+        } else if k <= MAX_ARGS {
+            self.args[k - 1]
+        } else {
+            self.more[k - 1 - MAX_ARGS]
+        }
+    }
+
+    // The bytes argv's strings take, their NULs included.
+    fn argv_bytes(self) -> i64 {
+        var n = 0;
+        for k in 0..self.argc() {
+            n += self.arg_at(k).len + 1;
+        }
+        n
+    }
+
+    // argv for C, its strings in text and its pointers in ptrs (both of
+    // the room argc and argv_bytes ask): InvalidInput when one holds a NUL.
+    fn build_argv(self, text: inout [u8], ptrs: inout [*u8]) -> Result<()> {
         var at = 0;
-        for k in 0..self.count + 1 {
-            let s = if k == 0 { self.prog } else { self.args[k - 1] };
-            if at + s.len + 1 > ARG_TEXT {
-                return Err(__io_error(ErrorKind::InvalidInput, "arguments over 4096 bytes"));
-            }
+        let n = self.argc();
+        for k in 0..n {
+            let s = self.arg_at(k);
             for i in 0..s.len {
                 if s[i] == 0 {
                     return Err(__io_error(ErrorKind::InvalidInput, "an argument holds a NUL"));
                 }
-                out.text[at + i] = s[i];
+                text[at + i] = s[i];
             }
-            out.text[at + s.len] = 0;
-            // (text is out's: it lives as long as ptrs does)
-            out.ptrs[k] = &out.text[at] as *u8;
+            text[at + s.len] = 0;
             at += s.len + 1;
         }
-        out.ptrs[self.count + 1] = 0 as *u8;
+        // (the pointers once text is written: text is the caller's, and
+        // lives as long as ptrs does)
+        at = 0;
+        for k in 0..n {
+            ptrs[k] = text[at..at + 1].ptr;
+            at += self.arg_at(k).len + 1;
+        }
+        ptrs[n] = 0 as *u8;
         Ok(())
+    }
+
+    // The child's environment for C when env_remove named a variable:
+    // this process's variables but those, as pointers to their C strings,
+    // ending with a null one; empty (this process's environment) when it
+    // named none.
+    fn envp(self) -> Vec<*u8, Gpa> {
+        var out: Vec<*u8, Gpa> = Vec::new_in(Gpa {});
+        if self.removed.len() == 0 {
+            return out;
+        }
+        for i in 0..sys_env_count() {
+            let e = sys_env_at(i);
+            var keep = true;
+            for name in self.removed.as_slice() {
+                if e.len > name.len && e[name.len] == '=' && e[0..name.len] == name {
+                    keep = false;
+                }
+            }
+            if keep {
+                // (environ's string: NUL-ended, sys_env_at's view starts it)
+                out.push(e.ptr);
+            }
+        }
+        out.push(0 as *u8);
+        out
     }
 
     // Starts it with the streams as set (piped ones are not supported
@@ -223,6 +307,18 @@ impl Command {
 
     // Runs it, waits for it: how it ended.
     pub fn status(self) -> Result<ExitStatus> {
+        if self.foreground {
+            let int_was = sys_signal_ignore(SYS_SIGINT);
+            let quit_was = sys_signal_ignore(SYS_SIGQUIT);
+            let r = self.status_now();
+            sys_signal_restore(int_was);
+            sys_signal_restore(quit_was);
+            return r;
+        }
+        self.status_now()
+    }
+
+    fn status_now(self) -> Result<ExitStatus> {
         var c = self.spawn()?;
         c.wait()
     }
@@ -230,6 +326,18 @@ impl Command {
     // Runs it with stdout and stderr piped to this process (stdin
     // inherited), and waits: how it ended and what it wrote, in Vecs on a.
     pub fn output_in<A: Allocator>(self, a: sink A) -> Result<Output<A>> {
+        if self.foreground {
+            let int_was = sys_signal_ignore(SYS_SIGINT);
+            let quit_was = sys_signal_ignore(SYS_SIGQUIT);
+            let r = self.output_now(a);
+            sys_signal_restore(int_was);
+            sys_signal_restore(quit_was);
+            return r;
+        }
+        self.output_now(a)
+    }
+
+    fn output_now<A: Allocator>(self, a: sink A) -> Result<Output<A>> {
         let (out_r, out_w) = os(sys_pipe())?;
         let (err_r, err_w) = match sys_pipe() {
             Ok(p) => p,
@@ -291,14 +399,33 @@ impl Command {
         } else if self.stderr == Stdio::Null {
             os(acts.dup2(nfd, 2))?;
         }
-        var argv = Argv { text: [0; 4096], ptrs: [0 as *u8; 34] };
-        self.build_argv(&argv)?;
-        let envp: [*u8; 0] = [];
-        // (argv's strings are NUL-ended and its pointers end with null:
-        // build_argv; prog is ptrs[0])
-        // UNSAFE: sys_spawn reads C strings. SAFETY: build_argv made argv's
-        // strings NUL-ended, its pointers null-ended; envp is empty; acts is live.
-        let r = unsafe { sys_spawn(argv.ptrs[0], argv.ptrs[..self.count + 2], envp[..], &acts) };
+        // (the child's default SIGINT and SIGQUIT, which a foreground
+        // Command's waiter ignores)
+        var attr: SysSpawnAttr = os(sys_spawn_sigdefault([SYS_SIGINT, SYS_SIGQUIT][..]))?;
+        let envp = self.envp();
+        let n = self.argc();
+        let bytes = self.argv_bytes();
+        if n < MAX_ARGS + 2 && bytes <= ARG_TEXT {
+            var argv = Argv { text: [0; 4096], ptrs: [0 as *u8; 34] };
+            self.build_argv(&argv.text[..], &argv.ptrs[..])?;
+            // UNSAFE: sys_spawn reads C strings. SAFETY: build_argv made
+            // argv's strings NUL-ended and its pointers null-ended (prog is
+            // ptrs[0]); envp is empty or environ's strings, null-ended
+            // (envp); acts and attr are live.
+            let r = unsafe {
+                sys_spawn_attr(argv.ptrs[0], argv.ptrs[..n + 1], envp.as_slice(), &acts, &attr)
+            };
+            return os(r);
+        }
+        // (0.25.5: more than 32 arguments or 4 KB of them: on the heap)
+        var text: Vec<u8, Gpa> = Vec::filled_in(bytes, 0u8, Gpa {});
+        var ptrs: Vec<*u8, Gpa> = Vec::with_capacity_in(n + 1, Gpa {});
+        for _ in 0..n + 1 {
+            ptrs.push(0 as *u8);
+        }
+        self.build_argv(text.as_mut_slice(), ptrs.as_mut_slice())?;
+        // UNSAFE: as above. SAFETY: as above; text and ptrs live to the call's end.
+        let r = unsafe { sys_spawn_attr(ptrs[0], ptrs.as_slice(), envp.as_slice(), &acts, &attr) };
         os(r)
     }
 }

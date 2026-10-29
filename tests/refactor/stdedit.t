@@ -20,7 +20,7 @@ $ edit insert --after std::trim --dry-run < $T/inputs/strip_prefix.vl
 ## a wrong type): the check says so, nothing is written.
 $ edit insert --after std::trim < $T/inputs/strip_prefix_none.vl
 compiler/std/flat/io.vl:24:21: error[type error] expected '[u8]', got 'i64'  [edited]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: compiler/std/flat/io.vl:24:21: expected '[u8]', got 'i64'
 try: volec edit insert --after std::trim --no-check
 [exit 1]
 ## Written, then embed.sh makes the compiler's std from the files.
@@ -41,7 +41,7 @@ compiler/src/front/stdsrc.vl:0
 ## A generic method is checked too (with i64 for T).
 $ edit patch Option::unwrap_or --old 'Option::None => other,' --new 'Option::None => true,'
 compiler/std/std.vl:13:29: error[type error] expected 'i64', got 'bool' | note: in instantiation of 'Option<i64>::unwrap_or' at compiler/std/std.vl:10:9  [edited: std::Option::unwrap_or]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: compiler/std/std.vl:13:29: expected 'i64', got 'bool'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch Option::unwrap_or --old 'Option::None => other,' --new 'Option::None => true,' --no-check
 [exit 1]
@@ -74,3 +74,16 @@ $ fix --suggested --dry-run
 -    a
 +    a as f64
 note check.std-files: std's files differ from this compiler's std: checked with compiler/std (bootstrap/bootstrap.sh --dev builds them in)
+## (0.25.5) `@@ FILE` in a pairs file naming one of std's files: the edit
+## runs in std's files, as for a FILE argument, with the program's file.
+$ edit patch --pairs $T/inputs/stdedit_files.pairs --dry-run
+--- a/main.vl
++++ b/main.vl
+@@ -9 +9 @@
+-    if n != 1 {
++    if n != 1 { // one byte left
+--- a/compiler/std/flat/io.vl
++++ b/compiler/std/flat/io.vl
+@@ -12 +12 @@
+-    while a < b && is_space(s[a]) {
++    while a < b && is_space(s[a]) { // the front

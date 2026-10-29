@@ -80,7 +80,7 @@ $ volec edit apply <<'EOF'
 >     }
 > EOF
 main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:9 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:23:5: 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:9 is a static's (global)
 try: volec edit apply --no-check
 [exit 1]
 ```
@@ -98,7 +98,7 @@ A debugging print in `eq`:
 $ volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
 >         if self.text.len() != other.text.len() {'
 main.vl:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.vl:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:30:5: 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.vl:31:9 calls 'std::fmt::println'
 try: volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
         if self.text.len() != other.text.len() {' --no-check
 [exit 1]
