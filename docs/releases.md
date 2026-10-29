@@ -180,6 +180,30 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (pathtrace, voxel), their output unchanged; voltty's shader is
   `include_str("cells.wgsl")`, and `render/embed.sh`, which made it a
   constant, is gone. The guide's GPU programs use text blocks.
+- **`volec test` shows what tests print** (the round 3 eval's sdftext
+  failed asserts on purpose to see values): a failing test's own stdout
+  and stderr are under its failure (`  stdout: x = 3`), and the
+  failure's reason is the runtime's report, no longer a line the test
+  printed to stderr; `--show-output` (`--nocapture` too) prints every
+  test's under its name (`OUTPUT NAME`; per level when -O0 and -O2
+  printed different things). A run with every test passing and no flag
+  prints what it printed before.
+- **`query show TYPE` lists the type's methods** after its source, one
+  signature line each from every `impl` (a trait impl's marked `//
+  impl Display for Error`, a contract cut to `requires ...`), at most 50
+  (`--all`: every one).
+- **`query items` filters**: `--find WORD` (the items with WORD at the
+  start of a word of their name, any case when WORD is lowercase),
+  `--kind fn,method,struct,enum,trait,const,...` and `--names` (a line
+  an item: its kind and full path). `query items std --find clamp`
+  finds `f64::clamp`, `i64::clamp` and the rest; `--find PI` the
+  language's own constants too (`f64::consts::PI`); `guide math`
+  starts with it.
+- **The check hook names every rewrite**: each change of its fixes is
+  a `changed FILE:LINE: OLD -> NEW` line, repeats included (past 10,
+  their summary line); an agent's own `volec fmt` gets the lines it
+  changed (from `volec query diff`, at most 5). The hook itself formats
+  nothing.
 
 ### What's new in 0.25.2.2
 

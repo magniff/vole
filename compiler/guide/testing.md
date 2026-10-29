@@ -176,6 +176,10 @@ FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   bug, not yours (`volec reduce --differs` shrinks it).
 - `--seed H` replays a property's failure, `--accept` takes snapshots,
   case outputs and saved fuzz inputs, `-O N` runs one level.
+- What a failing test printed is under its failure (`  stdout: x = 3`,
+  `  stderr: ...`); `--show-output` (Rust's `--nocapture` too) prints
+  every test's under its name (`OUTPUT NAME`), so a value is seen with
+  `println`, not by failing an assert on purpose.
 
 ## #[fuzz] and volec fuzz
 

@@ -7,14 +7,16 @@ use crate::base::{
     buf_slice, buf_str, buf_write_fd, intern_c,
 };
 use crate::front::ast::{NODES, NodeKind};
+use crate::front::check::widen::{FLOAT_CONSTS, FLOAT_LIMITS};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{MODULES, file_of_pos, module_count, within_std};
+use crate::tools::query::c_slice;
 use crate::tools::query::cache::{C_BLOCK, C_HDR_FROM, C_HDR_TO, C_SIG_END, RESTORED};
 use crate::tools::query::defs::{
     DEFS, DEF_COUNT, K_CONST, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STATIC, K_STRUCT,
     K_TRAIT, K_TRAIT_FN, bytes_eq, ends_with, find_in, kind_name, mod_fqn_text,
 };
-use crate::tools::query::diagnostics::{diag, try_query};
+use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end, try_query};
 use crate::tools::query::effects::put_def_effects;
 use crate::tools::query::features::{put_def_features, put_intrinsic_notes};
 use crate::tools::query::names::{canonical_name, path_matches};
@@ -22,7 +24,7 @@ use crate::tools::query::positions::{
     collapse, is_space, line_end, line_of, line_start, put_lines, put_loc, put_path,
     sort_by_position, token_at,
 };
-use crate::tools::query::refs::{OPT_ALL, file_text};
+use crate::tools::query::refs::{OPT_ALL, OPT_KIND, file_text, kind_listed};
 use crate::tools::query::sections::{B_START, OPT_BANNERS, banners_of_module, put_banner_line};
 use crate::tools::query::stdq::{is_std_module, put_std_use};
 use crate::tools::query::values::put_def_views;
@@ -174,9 +176,109 @@ pub fn query_show(matches: IntVec, name: [u8]) -> i64 {
             put_std_use(out, d);
             buf_bytes(out, SRC[first..last]);
             buf_byte(out, '\n');
+            // (0.25.3) a struct's or enum's methods
+            put_type_methods(out, d);
         }
         buf_write_fd(out, STDOUT);
         0
+    }
+}
+
+// (0.25.3) More methods than this: `show TYPE` lists these (--all: every
+// one) and says how to see the rest.
+const SHOW_METHODS: i64 = 50;
+
+// (0.25.3) After a struct's or enum's source in `show`: its methods, one
+// signature line each from every impl block (std's: its API), by
+// position; a contract cut to its keyword (`query items TYPE` has it
+// whole), a trait impl's function marked with its `impl ... for ...`. The
+// round 3 eval's agents fell back to `query items`, whose answer was 170
+// lines, to find a type's methods.
+fn put_type_methods(out: i64, t: i64) {
+    // UNSAFE: DEFS is the query tables' raw array (defs.vl), read as the
+    // rest of show.vl reads it (the tables become Vecs in the 0.25.4 audit)
+    // SAFETY: t is a definition (resolve_name's) and d runs below DEF_COUNT:
+    // both index DEFS's DEF_COUNT entries, filled by load_program or
+    // cache_restore before any answer
+    unsafe {
+        let k0 = DEFS[t].kind;
+        if k0 != K_STRUCT && k0 != K_ENUM {
+            return;
+        }
+        let std = is_std_module(DEFS[t].module);
+        var methods = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner >= 0
+                && DEFS[d].owner == DEFS[t].fqn && !(std && !OPT_ALL && !DEFS[d].public
+                    && k == K_METHOD) {
+                methods.push(d);
+            }
+        }
+        if methods.count == 0 {
+            return;
+        }
+        sort_by_position(methods);
+        let name = SYMS[DEFS[t].fqn].text;
+        buf_str(out, c"// ");
+        buf_int(out, methods.count);
+        buf_str(out, if methods.count == 1 { c" method" } else { c" methods" });
+        buf_str(out, c" (with their lines and whole contracts: query items ");
+        buf_bytes(out, name);
+        buf_str(out, c")\n");
+        let shown = if OPT_ALL || methods.count <= SHOW_METHODS { methods.count }
+            else { SHOW_METHODS };
+        for i in 0..shown {
+            let d = methods.data[i];
+            put_short_signature(out, d);
+            if DEFS[d].kind == K_IMPL_METHOD {
+                buf_str(out, c"  // ");
+                var to = 0;
+                let from = impl_header_span(d, &to);
+                collapse(out, from, to);
+            }
+            buf_byte(out, '\n');
+        }
+        if shown < methods.count {
+            let n = diag(c"note", c"query.truncated");
+            buf_bytes(n, name);
+            buf_str(n, c" has ");
+            buf_int(n, methods.count);
+            buf_str(n, c" methods; showing the first ");
+            buf_int(n, shown);
+            buf_byte(n, '\n');
+            let tr = try_begin(c"show", name, true);
+            put_word(tr, c_slice(c"--all"));
+            try_end(tr);
+            try_query(c"items", name);
+        }
+    }
+}
+
+// (0.25.3) Definition d's signature on one line, a contract cut to its
+// keyword (`requires ...`): `show TYPE`'s method lines.
+fn put_short_signature(out: i64, d: i64) {
+    let mark = buf_slice(out).len;
+    put_signature(out, d);
+    let text = buf_slice(out);
+    var cut = -1;
+    for kw in [c" requires ", c" ensures "] {
+        let at = find_in(text, kw, mark);
+        if at >= 0 && (cut < 0 || at < cut) {
+            cut = at;
+        }
+    }
+    if cut >= 0 {
+        let word = if find_in(text, c" requires ", mark) == cut { c" requires ..." }
+            else { c" ensures ..." };
+        // UNSAFE: BUFS is base's raw table of buffers; cutting one is
+        // setting its len, as put_signature does for a long value
+        // SAFETY: out is a live buffer (buf_new's) and cut lies within its
+        // text (find_in found it there), so the new len is in bounds
+        unsafe {
+            BUFS[out].len = cut;
+        }
+        buf_str(out, word);
     }
 }
 
@@ -304,6 +406,163 @@ fn put_impl_header(out: i64, d: i64) {
     buf_byte(out, '\n');
 }
 
+// (0.25.3) `query items` filters, after the round 3 eval (its 170-line
+// answers): --find WORD, the items whose name holds WORD (in any case when
+// WORD has no capital: `--find clamp`; `--find PI` as written); --kind
+// KIND,... (fn, method, struct, enum, trait, trait-method, const, static,
+// type, mod); and --names, a line an item: its kind and full name.
+// Filtered, a module or impl block is named only above an item that
+// passes. ITEMS_SHOWN: how many items the last answer listed.
+pub static var OPT_FIND: *u8 = 0 as *u8;
+pub static var OPT_NAMES: bool = false;
+pub static var ITEMS_SHOWN: i64 = 0;
+
+pub fn items_filtered() -> bool {
+    OPT_FIND != 0 as *u8 || OPT_KIND != 0 as *u8
+}
+
+// The kinds --kind takes for `items`, as kind_name spells them.
+const ITEM_KINDS: [[u8]; 10] = ["fn", "method", "struct", "enum", "trait", "trait-method", "const",
+    "static", "type", "mod"];
+
+// The first word of --kind's list that is no kind of item, or "".
+pub fn bad_item_kind() -> [u8] {
+    if OPT_KIND == 0 as *u8 {
+        return "";
+    }
+    let list = c_slice(OPT_KIND);
+    var i = 0;
+    while i < list.len {
+        var j = i;
+        while j < list.len && list[j] != ',' {
+            j += 1;
+        }
+        let word = list[i..j];
+        var known = false;
+        for k in ITEM_KINDS {
+            if k == word {
+                known = true;
+            }
+        }
+        if !known {
+            return word;
+        }
+        i = j + 1;
+    }
+    ""
+}
+
+// Whether name holds --find's word at the start of one of its words (its
+// own start, after a `_`, or a capital after a small letter: `clamp` finds
+// clamp, set_lod_min_clamp and ClampToEdge; PI finds PI and FRAC_PI_2, not
+// EPIPE), in any case when the word has no capital letter (smart case).
+pub fn name_found(name: [u8]) -> bool {
+    if OPT_FIND == 0 as *u8 {
+        return true;
+    }
+    let w = c_slice(OPT_FIND);
+    var any_case = true;
+    for x in 0..w.len {
+        if w[x] >= 'A' && w[x] <= 'Z' {
+            any_case = false;
+        }
+    }
+    var i = 0;
+    while i + w.len <= name.len {
+        let p = if i > 0 { name[i - 1] } else { '_' };
+        let small = (p >= 'a' && p <= 'z') || (p >= '0' && p <= '9');
+        let big = p >= 'A' && p <= 'Z';
+        let capital = name[i] >= 'A' && name[i] <= 'Z';
+        let starts_word = !(small || big) || (small && capital) || (w.len > 0 && w[0] == '_');
+        var same = starts_word;
+        var x = 0;
+        while same && x < w.len {
+            var c = name[i + x];
+            if any_case && c >= 'A' && c <= 'Z' {
+                c = c + 32;
+            }
+            same = c == w[x];
+            x += 1;
+        }
+        if same {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// Whether an item of kind k named name passes --kind and --find.
+fn item_wanted(k: i64, name: [u8]) -> bool {
+    (OPT_KIND == 0 as *u8 || kind_listed(kind_name(k), OPT_KIND)) && name_found(name)
+}
+
+// (0.25.3) With --find (and a --kind that takes `const`), the constants
+// the language gives the primitive types (front/check/widen.vl's tables:
+// `f64::consts::PI`, `f32::EPSILON`, `i64::MAX`) whose names hold the
+// word, under their own header: a line a name (`-`: in no file), or with
+// --names a line each; how many.
+pub fn put_builtin_consts(out: i64) -> i64 {
+    if OPT_FIND == 0 as *u8 || !(OPT_KIND == 0 as *u8 || kind_listed(c"const", OPT_KIND)) {
+        return 0;
+    }
+    let lines = buf_new();
+    var n = 0;
+    for (k, _, _) in FLOAT_CONSTS {
+        if name_found(k) {
+            put_builtin(lines, true, "f64::consts::", k);
+            put_builtin(lines, false, "f32::consts::", k);
+            put_builtin_end(lines);
+            n += 2;
+        }
+    }
+    for (k, _, _) in FLOAT_LIMITS {
+        if name_found(k) {
+            put_builtin(lines, true, "f64::", k);
+            put_builtin(lines, false, "f32::", k);
+            put_builtin_end(lines);
+            n += 2;
+        }
+    }
+    for k in ["MAX", "MIN"] {
+        if name_found(k) {
+            var first = true;
+            for t in ["i8::", "i16::", "i32::", "i64::", "u8::", "u16::", "u32::", "u64::"] {
+                put_builtin(lines, first, t, k);
+                first = false;
+                n += 1;
+            }
+            put_builtin_end(lines);
+        }
+    }
+    if n > 0 {
+        buf_bytes(out, "# the primitive types' constants\t<built in>\n");
+        buf_bytes(out, buf_slice(lines));
+    }
+    n
+}
+
+// Built-in constant prefix+name: the first of its line (`-` for the line
+// number, it is in no file) or after a comma; with --names its own line.
+fn put_builtin(out: i64, first: bool, prefix: [u8], name: [u8]) {
+    if OPT_NAMES {
+        buf_bytes(out, "const\t");
+    } else {
+        buf_bytes(out, if first { "-\tconst\t" } else { ", " });
+    }
+    buf_bytes(out, prefix);
+    buf_bytes(out, name);
+    if OPT_NAMES {
+        buf_byte(out, '\n');
+    }
+}
+
+fn put_builtin_end(out: i64) {
+    if !OPT_NAMES {
+        buf_byte(out, '\n');
+    }
+}
+
 pub fn query_items(modules: IntVec) {
     unsafe {
         let out = buf_new();
@@ -312,21 +571,30 @@ pub fn query_items(modules: IntVec) {
             all.push(d);
         }
         sort_by_position(all);
+        // (0.25.3) --find, --kind: the items that pass, a module named
+        // above its first; --names: a line an item
+        let filtered = items_filtered();
+        ITEMS_SHOWN = 0;
         for i in 0..modules.count {
             let m = modules.data[i];
-            buf_str(out, c"# ");
-            buf_bytes(out, mod_fqn_text(m));
+            let header = buf_new();
+            buf_str(header, c"# ");
+            buf_bytes(header, mod_fqn_text(m));
             let f = module_file(m);
             if f >= 0 {
-                buf_byte(out, '\t');
-                put_path(out, f);
+                buf_byte(header, '\t');
+                put_path(header, f);
             }
-            buf_byte(out, '\n');
+            buf_byte(header, '\n');
+            var named = !filtered;
+            if named {
+                buf_bytes(out, buf_slice(header));
+            }
             var impl_of = -1;
             let std = within_std(m);
             // (--comments: the banners and comments before each item)
             var banners = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            if OPT_BANNERS {
+            if OPT_BANNERS && !filtered {
                 banners_of_module(m, &banners);
             }
             var bk = 0;
@@ -338,6 +606,21 @@ pub fn query_items(modules: IntVec) {
                 let k = DEFS[d].kind;
                 if std && !OPT_ALL && !DEFS[d].public && k != K_IMPL_METHOD {
                     // (0.15: std's API; --all: its private items too)
+                    continue;
+                }
+                if filtered && !item_wanted(k, SYMS[DEFS[d].name].text) {
+                    continue;
+                }
+                if !named {
+                    buf_bytes(out, buf_slice(header));
+                    named = true;
+                }
+                ITEMS_SHOWN += 1;
+                if OPT_NAMES {
+                    buf_str(out, kind_name(k));
+                    buf_byte(out, '\t');
+                    buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                    buf_byte(out, '\n');
                     continue;
                 }
                 var at = text_start(d);
@@ -370,7 +653,9 @@ pub fn query_items(modules: IntVec) {
                 bk += 1;
             }
             // (0.25.2.1) the names it re-exports
-            crate::tools::query::reexported::put_reexports(out, m);
+            if !filtered {
+                crate::tools::query::reexported::put_reexports(out, m);
+            }
         }
         buf_write_fd(out, STDOUT);
     }
@@ -378,7 +663,8 @@ pub fn query_items(modules: IntVec) {
 
 // (0.17) `query items TYPE`: a struct's, enum's or trait's own line, then
 // the functions of its impl blocks (std's: its API), by position; the
-// definitions of the types named are in `types`.
+// definitions of the types named are in `types`. (0.25.3) --find, --kind
+// and --names as for a module.
 pub fn query_type_items(types: IntVec) {
     unsafe {
         let out = buf_new();
@@ -387,6 +673,7 @@ pub fn query_type_items(types: IntVec) {
             all.push(d);
         }
         sort_by_position(all);
+        let filtered = items_filtered();
         for i in 0..types.count {
             let t = types.data[i];
             buf_str(out, c"# ");
@@ -394,12 +681,14 @@ pub fn query_type_items(types: IntVec) {
             buf_byte(out, '\t');
             put_loc(out, DEFS[t].name_pos);
             buf_byte(out, '\n');
-            buf_int(out, line_of(DEFS[t].name_pos));
-            buf_byte(out, '\t');
-            buf_str(out, kind_name(DEFS[t].kind));
-            buf_byte(out, '\t');
-            put_signature(out, t);
-            buf_byte(out, '\n');
+            if !OPT_NAMES && !filtered {
+                buf_int(out, line_of(DEFS[t].name_pos));
+                buf_byte(out, '\t');
+                buf_str(out, kind_name(DEFS[t].kind));
+                buf_byte(out, '\t');
+                put_signature(out, t);
+                buf_byte(out, '\n');
+            }
             let std = is_std_module(DEFS[t].module);
             var impl_of = -1;
             for j in 0..all.count {
@@ -408,6 +697,17 @@ pub fn query_type_items(types: IntVec) {
                 let mine = ((k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner >= 0
                     && DEFS[d].owner == DEFS[t].fqn) || (k == K_TRAIT_FN && DEFS[d].parent == t);
                 if !mine || (std && !OPT_ALL && !DEFS[d].public && k == K_METHOD) {
+                    continue;
+                }
+                if filtered && !item_wanted(k, SYMS[DEFS[d].name].text) {
+                    continue;
+                }
+                ITEMS_SHOWN += 1;
+                if OPT_NAMES {
+                    buf_str(out, kind_name(k));
+                    buf_byte(out, '\t');
+                    buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                    buf_byte(out, '\n');
                     continue;
                 }
                 if k == K_METHOD || k == K_IMPL_METHOD {

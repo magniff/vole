@@ -396,12 +396,30 @@ try:
         [["-    f(&mut %s);" % v] for v in "abc"] + [["+    f(&%s);" % v] for v in "abc"]
     fake3_says(rust + [spell], [["fixed 4 suggested fixes", "main.vl", "+4 -4 lines"]] + rdiff +
                [["@@ -3 +3 @@"], ["-    let mut u = 0;"], ["+    var u = 0;"]], [])
-    case("hook fix: repeats in one line, each file once", ctx_of(run(ev, fake3)[1]),
-         head + "\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
+    # (0.25.3) each change still a `changed` line: what the file now has
+    case("hook fix: repeats in one line, each change shown, each file once", ctx_of(run(ev, fake3)[1]),
+         head + "\nchanged main.vl:10: f(&mut a); -> f(&a);\nchanged main.vl:11: f(&mut b); -> f(&b);"
+         "\nchanged main.vl:12: f(&mut c); -> f(&c);\nchanged main.vl:3: let mut u = 0; -> var u = 0;"
          "\nfixed main.vl:3:5: 'let mut' is Rust's spelling; a mutable binding is 'var x' | its exact fix"
          "\nfixed 3 '&mut x' to '&x' (conv.rust) in main.vl: lines 10, 11, 12"
          "\nthe hook rewrote main.vl: the 4 changes above, nothing else (read it again before an Edit)"
          "\nvolec check main.vl: 0 errors")
+    # (0.25.3) past MAX_SHOWN changes, the repeats' lines are left to
+    # their summary line, and said so
+    many = [dict(diag("main.vl", 20 + k, "'&mut v%d' is Rust's spelling; an inout argument (the callee may change "
+                      "it) is marked '&x'" % k, code="conv.rust"),
+                 **{"try": ["volec edit patch main.vl:%d --old '&mut v%d' --new '&v%d'" % (20 + k, k, k), sug]})
+            for k in range(12)]
+    mdiff = [["--- a/main.vl"], ["+++ b/main.vl"], ["@@ -20,12 +20,12 @@"]] + \
+        [["-    f(&mut v%d);" % k] for k in range(12)] + [["+    f(&v%d);" % k] for k in range(12)]
+    fake3_says(many, [["fixed 12 suggested fixes", "main.vl", "+12 -12 lines"]] + mdiff, [])
+    got = ctx_of(run(ev, fake3)[1]).split("\n")
+    case("hook fix: many repeats, the first changes shown, the rest summed",
+         ([x for x in got if x.startswith("changed")][-2:], got[-3:-1]),
+         (["changed main.vl:29: f(&mut v9); -> f(&v9);",
+           "changed: 2 more, on the lines the `fixed N ...` lines below name"],
+          ["fixed 12 '&mut x' to '&x' (conv.rust) in main.vl: lines 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31",
+           "the hook rewrote main.vl: the 12 changes above, nothing else (read it again before an Edit)"]))
     case("fix pattern: a lent argument", hook.fix_pattern(dict(marker, **{"try": [
         "volec edit patch main.vl:2 --old '(ui' --new '(&ui'"]})), ("x", "&x"))
     case("fix pattern: a spelling", hook.fix_pattern(dict(spell, **{"try": [
@@ -571,6 +589,31 @@ try:
         del os.environ["VOLE_HOOK_FMT"]
         subprocess.run([real, "fmt", "main.vl"], cwd=prog, capture_output=True)
         case("real: formatted, silent", run(ev2, real, fst)[1], "")
+        # (0.25.3) The hook's rewrites are its fixes' changes, each named:
+        # the file differs from what was written by those lines alone (an
+        # unformatted line stays as it was; the hook formats nothing).
+        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(f\"{y}\");\n}\n"
+        write(os.path.join(prog, "main.vl"), before)
+        got = ctx_of(run(ev2, real, tempfile.mkdtemp(dir=tmp))[1])
+        with open(os.path.join(prog, "main.vl")) as fh:
+            now = fh.read()
+        differ = [f"main.vl:{k + 1}: {a.strip()} -> {b.strip()}"
+                  for k, (a, b) in enumerate(zip(before.split("\n"), now.split("\n"))) if a != b]
+        case("real: the hook's rewrites, each a changed line, nothing else",
+             ([x[len("changed "):] for x in got.split("\n") if x.startswith("changed ")], differ),
+             (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], ["main.vl:3: let mut y = z + 1; -> var y = z + 1;"]))
+        # (0.25.3) An agent's own `volec fmt`: its summary counts lines, the
+        # hook names them (from the journal, `volec query diff`); no check.
+        write(os.path.join(prog, "main.vl"), "fn main() {\n    let   z  =  3;\n    let y = z+1;\n    println(f\"{y}\");\n}\n")
+        r = subprocess.run([real, "fmt", "main.vl"], cwd=prog, capture_output=True, text=True)
+        bash = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": prog,
+                "tool_input": {"command": "volec fmt main.vl"}, "tool_response": {"stdout": r.stdout}}
+        case("real: an agent's fmt, its changes named", ctx_of(run(bash, real)[1]),
+             f"{real} fmt rewrote main.vl (+2 -2 lines): layout only (volec undo takes it back; read the file "
+             "again before an Edit):\nchanged main.vl:2: let   z  =  3; -> let z = 3;"
+             "\nchanged main.vl:3: let y = z+1; -> let y = z + 1;")
+        bash_dry = dict(bash, tool_input={"command": "volec fmt --dry-run main.vl"})
+        case("real: fmt --dry-run, nothing said", run(bash_dry, real)[1], "")
         write(os.path.join(prog, "main.vl"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):

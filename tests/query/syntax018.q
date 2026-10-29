@@ -98,6 +98,8 @@ fn push(s: inout Stack, x: i64)
 // crate::Stack	syntax018/main.vl:10-11
 struct Stack { items: [i64; 8], len: i64, max: i64 }
 invariant self.len <= self.max else "a stack holds at most max items"
+// 1 method (with their lines and whole contracts: query items crate::Stack)
+fn size2(self) -> i64 ensures ...  // impl Sized2 for Stack
 // crate::Percent	syntax018/main.vl:17-17
 type Percent = distinct i64 invariant 0 <= self && self <= 100;
 $ def NodeId any_id tests::two
