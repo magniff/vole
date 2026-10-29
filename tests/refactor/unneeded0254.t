@@ -2,7 +2,7 @@
 ## the unsafe blocks `query unsafe` calls `none (unneeded)` taken away, the
 ## code in them kept and in its scope; those it cannot open safely left
 ## and counted. The program prints what it printed.
-% volec main.vl -o a >/dev/null 2>&1 && ./a
+% "$COMPILER" main.vl -o a >/dev/null 2>&1 && ./a
 33 21
 $ query unsafe main.vl
 main.vl:5	extern	crate::extern	ffi	missing both	1 C function
@@ -67,7 +67,7 @@ $ fix --only unneeded-unsafe
 fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -3 lines
 $ fix --only unneeded-unsafe
 note fix.none: nothing to fix
-% volec main.vl -o b >/dev/null 2>&1 && ./b
+% "$COMPILER" main.vl -o b >/dev/null 2>&1 && ./b
 33 21
 $ query unsafe main.vl
 main.vl:5	extern	crate::extern	ffi	missing both	1 C function
