@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Generates tests/run/own_arg_temp_sweep_{let,sink,inout,view}{,_req}.vl
+# Generates tests/run/own_arg_temp_sweep_{let,sink,inout,view}{,_req}.vl and _closure.vl
 # (0.25.2.1; 0.25.2.2: _req, the callees have a requires clause, whose
 # call is a block binding the arguments first,
 # `dev.compute_pipeline(dev.shader_wgsl(SRC)?, "e")?`; view, the argument
@@ -19,6 +19,11 @@
 # with loc taken sink leaked loc when g failed (front/own/drops.vl
 # visit_temps, lend_branches, moved_local). Each case prints its result (computed
 # here); --check-alloc finds no leak, double free or use after free.
+# (0.25.3: own_arg_temp_sweep_closure, the callee a closure taking the
+# value by value: a local `|s: sink Sh, w: i64|`, one given to a generic
+# fn's FnMut(sink X, i64) bound that reads it or passes it on by sink, and
+# Option::map's; a closure's by-value parameter was never dropped, a leak
+# in every one of its cases.)
 #
 #   python3 tools/sinksweep/argsweep.py tests/run         (writes the tests)
 #   python3 tools/sinksweep/argsweep.py --one DIR         (one program per
@@ -188,14 +193,23 @@ fn f_cs_inout_r(acc: inout Sh, s: String, w: i64) -> Result<i64, i64> requires w
 }
 """
 
+# (0.25.3) own_arg_temp_sweep_closure's: a closure's by-value parameters,
+# through a generic bound
+CLOSURE_PRELUDE = """
+fn via<X, F: FnMut(sink X, i64) -> Result<i64, i64>>(f: sink F, s: sink X, w: i64)
+    -> Result<i64, i64> {
+    f(s, w)
+}
+"""
+
 # The value types: (key, its functions' suffix, model of a made value)
 # A value is modelled as its digest: Sh [n, n+1] is 200 + n + 1; a String
 # of n x's is n; grow adds an element (one more, the last plus one) or a "y".
 TYPES = {
-    "sh": dict(desc="Desc", desc_of="desc_of", make="make", opt="opt", mk="mk", grow="grow", grow_k="grow_k", c="c",
+    "sh": dict(ty="Sh", dig_fn="dig", desc="Desc", desc_of="desc_of", make="make", opt="opt", mk="mk", grow="grow", grow_k="grow_k", c="c",
                val=lambda n: (2, n + 1), dig=lambda v: v[0] * 100 + v[1],
                grown=lambda v: (v[0] + 1, v[1] + 1)),
-    "str": dict(desc="DescS", desc_of="descs_of", make="makes", opt="opts", mk="mks", grow="grows", grow_k="grows_k", c="cs",
+    "str": dict(ty="String", dig_fn="digs", desc="DescS", desc_of="descs_of", make="makes", opt="opts", mk="mks", grow="grows", grow_k="grows_k", c="cs",
                 val=lambda n: n, dig=lambda v: v, grown=lambda v: v + 1),
 }
 
@@ -253,6 +267,13 @@ CALLEES = {
              ("ff", "f_{c}_view{r}({desc_of}({a}, 0), {w})"),
              ("fl", "f_{c}_view{r}({desc} {{ s: {a}, n: 0 }}, {w})"),
              ("ul", "Dev::{c}_view{r}(dev, {desc} {{ s: {a}, n: 0 }}, {w})")],
+    # (0.25.3: a closure taking the value by value: a local one (c, its
+    # `cl` declared first), through via's FnMut(sink X, i64) bound reading
+    # it (g) or passing it on to a sink fn (gk), Option::map's (o))
+    "closure": [("c", "cl({a}, {w})"),
+                ("g", "via(|s, w| Ok({dig_fn}(s) + w), {a}, {w})"),
+                ("gk", "via(|s, w| f_{c}_sink(s, w), {a}, {w})"),
+                ("o", "Some({a}).map(|s| {dig_fn}(s) + {w}).ok_or(-9)")],
     "inout": [("m", "dev.{c}_inout{r}(&acc, {a}, {w})"), ("f", "f_{c}_inout{r}(&acc, {a}, {w})"),
               ("u", "Dev::{c}_inout{r}(dev, &acc, {a}, {w})")],
 }
@@ -301,14 +322,14 @@ def cases(conv, req=False):
             for wi, w in enumerate(WS):
                 for cn, ctext in CALLEES[conv]:
                     # (every second argument by the method; the others with 8)
-                    if wi > 0 and cn not in ("m", "mf", "ml"):
+                    if wi > 0 and cn not in ("m", "mf", "ml", "c"):
                         continue
                     # (a let field is no let parameter: a new value there has
                     # no place, `error: expected 'let Sh', got 'Sh'`)
                     if conv == "view" and cn.endswith("l") and an in LIT_REJECTS:
                         continue
                     call = ctext.format(c=t["c"], a=a, w=w[1], r=r, desc=t["desc"],
-                                        desc_of=t["desc_of"])
+                                        desc_of=t["desc_of"], dig_fn=t["dig_fn"])
                     for on, otext in OUTER:
                         # (an error leaves the case from the argument
                         # itself: `scr`'s arm, -100 + e, is never taken)
@@ -318,16 +339,19 @@ def cases(conv, req=False):
                             pre += f"let loc = dev.{t['mk']}(7);\n"
                         if conv == "inout":
                             pre += "var acc = dev.mk(1);\n"
+                        if cn == "c":
+                            pre += (f"let cl = |s: sink {t['ty']}, w: i64| -> Result<i64, i64> {{\n"
+                                    f"    Ok({t['dig_fn']}(s) + w)\n}};\n")
                         body = pre + otext.format(C=call)
                         out.append((f"{ty}_{an}_{w[0]}_{cn}_{on}", body, exp))
     return out
 
 
-def program(cs, header):
+def program(cs, header, extra=""):
     lines = [header, "// FLAGS: --check-alloc"]
     for name, _, exp in cs:
         lines.append(f"// EXPECT: {name} {exp}")
-    src = "\n".join(lines) + "\n\n" + PRELUDE
+    src = "\n".join(lines) + "\n\n" + PRELUDE + extra
     calls = []
     for name, body, _ in cs:
         ind = "\n".join("    " + l for l in body.split("\n"))
@@ -351,6 +375,7 @@ HEAD = ("// Generated by tools/sinksweep/argsweep.py (0.25.2.1): an owned argume
         "// calls) given to a parameter taken {what}, the call's result `?`'d,\n"
         "// let, returned, a tail or matched.")
 WHAT = {"let": "`let`", "sink": "`sink`", "inout": "`let` after an `inout` one",
+        "closure": "by value by a closure (0.25.3)",
         "view": "`let` in a view (a struct with a let field)"}
 
 if __name__ == "__main__":
@@ -360,17 +385,19 @@ if __name__ == "__main__":
         d = sys.argv[2]
         os.makedirs(d, exist_ok=True)
         with open(f"{d}/expected.txt", "w") as ef:
-            for conv in ("let", "sink", "inout", "view"):
-                for req in (False, True):
+            for conv in ("let", "sink", "inout", "view", "closure"):
+                for req in ((False,) if conv == "closure" else (False, True)):
                     for c in cases(conv, req):
                         name = f"{conv}{'_req' if req else ''}_{c[0]}"
                         with open(f"{d}/{name}.vl", "w") as f:
-                            f.write(program([(name, c[1], c[2])], HEAD.format(what=WHAT[conv])))
+                            f.write(program([(name, c[1], c[2])], HEAD.format(what=WHAT[conv]),
+                                            CLOSURE_PRELUDE if conv == "closure" else ""))
                         ef.write(f"{name} {c[2]}\n")
     else:
-        for conv in ("let", "sink", "inout", "view"):
-            for req in (False, True):
+        for conv in ("let", "sink", "inout", "view", "closure"):
+            for req in ((False,) if conv == "closure" else (False, True)):
                 what = WHAT[conv] + (", by a function with a requires" if req else "")
                 with open(f"{sys.argv[1]}/own_arg_temp_sweep_{conv}{'_req' if req else ''}.vl",
                           "w") as f:
-                    f.write(program(cases(conv, req), HEAD.format(what=what)))
+                    f.write(program(cases(conv, req), HEAD.format(what=what),
+                                    CLOSURE_PRELUDE if conv == "closure" else ""))
