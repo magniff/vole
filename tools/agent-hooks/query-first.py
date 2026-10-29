@@ -146,24 +146,51 @@ SUMMARY = re.compile(r"^(undid|patched|replaced|inserted|deleted|fixed|renamed|m
                      r"added|removed|changed|made|split|script)\b.*\t", re.M)
 
 
+def is_vole_tree(d):
+    """(0.25.3) Whether directory d is the root of a vole tree: it holds
+    compiler/src/main.vl and tools/agent-hooks."""
+    return os.path.isfile(os.path.join(d, "compiler", "src", "main.vl")) and \
+        os.path.isdir(os.path.join(d, "tools", "agent-hooks"))
+
+
+def vole_tree(path):
+    """(0.25.3) The vole tree holding path (a file or directory, there or
+    not): the nearest directory up from it that is one, else None."""
+    d = os.path.abspath(path)
+    while True:
+        if is_vole_tree(d):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
 def checkout_of(cwd):
     """(checkout root, shared git directory) of the checkout holding cwd,
     found without running git (a harness guard may refuse git inside a
     worktree): up from cwd to a `.git`; a worktree's `.git` is a file
-    naming its git directory, whose `commondir` names the shared one."""
+    naming its git directory, whose `commondir` names the shared one.
+    (0.25.3) The root is the vole tree met on the way, when one is met
+    before the `.git` (a release's tree extracted under the main
+    checkout's target/bootstrap, a copy of the tree under /tmp): paths are
+    judged inside it, not inside the checkout that happens to hold it."""
     d = os.path.abspath(cwd or os.getcwd())
+    tree = None
     while True:
+        if tree is None and is_vole_tree(d):
+            tree = d
         g = os.path.join(d, ".git")
         if os.path.isdir(g):
-            return d, g
+            return tree or d, g
         if os.path.isfile(g):
             try:
                 with open(g) as fh:
                     text = fh.read().strip()
             except OSError:
-                return d, None
+                return tree or d, None
             if not text.startswith("gitdir:"):
-                return d, None
+                return tree or d, None
             gd = text[len("gitdir:"):].strip()
             if not os.path.isabs(gd):
                 gd = os.path.normpath(os.path.join(d, gd))
@@ -172,13 +199,27 @@ def checkout_of(cwd):
                     common = fh.read().strip()
                 if not os.path.isabs(common):
                     common = os.path.normpath(os.path.join(gd, common))
-                return d, common
+                return tree or d, common
             except OSError:
-                return d, gd
+                return tree or d, gd
         parent = os.path.dirname(d)
         if parent == d:
-            return None, None
+            return tree, None
         d = parent
+
+
+def is_scratch(path, cwd=None, base=""):
+    """(0.25.3) Whether path (as typed, after `cd base`, from cwd) is a
+    scratch one: target/, tmp/, /tmp, /var/folders, judged by the path
+    inside the vole tree or checkout holding it (checkout_of), so that a
+    tree that itself lies under a target/ or /tmp (a release's tree in
+    the bootstrap cache, a copy) is not all scratch; a path outside any,
+    as typed."""
+    full = os.path.normpath(os.path.join(cwd or os.getcwd(), base, path))
+    top = checkout_of(full if os.path.isdir(full) else os.path.dirname(full))[0]
+    if top and (full + "/").startswith(top.rstrip("/") + "/"):
+        return bool(SCRATCH.search(os.path.relpath(full, top) + "/"))
+    return bool(SCRATCH.search(path.rstrip("/") + "/"))
 
 
 def git_dir(cwd):
@@ -329,7 +370,7 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, pro
         files = []
         for a in file_args(prog, args):
             e = tc.expand(a, assigns)
-            if not reads_source(a):
+            if not reads_source(a, here):
                 continue
             files.append((a, os.path.normpath(os.path.join(here, e)) if e is not None else None))
         if not files:
@@ -576,10 +617,11 @@ def file_args(prog, args):
     return operands
 
 
-def reads_source(path):
+def reads_source(path, cwd=None):
     """A .vl file, or a directory of them that grep -r would read; not a
-    scratch file (target/, /tmp: a generated program, a copy)."""
-    if SCRATCH.search(path):
+    scratch file (target/, /tmp: a generated program, a copy; 0.25.3: as
+    the path reads inside its vole tree, is_scratch)."""
+    if is_scratch(path, cwd):
         return False
     return path.endswith(".vl") or bool(SOURCE_DIRS.match(path)) or (
         ("compiler/src" in path or "compiler/std" in path) and not path.endswith((".sh", ".md", ".toml", ".py", ".awk")))
@@ -587,8 +629,21 @@ def reads_source(path):
 
 def compiler_paths(text):
     """The compiler source files (.vl under compiler/src or compiler/std)
-    named in text; scratch copies (target/, /tmp) left out."""
-    return [m for m in COMPILER_TACH.findall(text) if not SCRATCH.search(m)]
+    named in text; scratch copies (target/, /tmp) left out. (0.25.3) An
+    absolute path whose compiler/ is a vole tree's (a release's tree under
+    target/bootstrap, a copy under /tmp) is that tree's source, wherever
+    the tree lies."""
+    out = []
+    for mo in COMPILER_TACH.finditer(text):
+        m = mo.group(1)
+        if SCRATCH.search(m):
+            absolute = mo.start(1) > 0 and text[mo.start(1) - 1] == "/"
+            k = re.search(r"(^|/)compiler/(?:src|std)/", m)
+            tree = ("/" + m[:k.start() + len(k.group(1))]).rstrip("/") if absolute and k else None
+            if not (tree and is_vole_tree(tree)):
+                continue
+        out.append(m)
+    return out
 
 
 def in_place(prog, args):
@@ -667,7 +722,8 @@ def source_rewrites(command, cwd=None):
         args = words[1:]
         if prog == "cd" and args:
             # (relative paths after `cd target/x` are a scratch copy's)
-            scratch_cwd = bool(SCRATCH.search(args[0].rstrip("/") + "/"))
+            # (0.25.3: as the directory reads inside its vole tree)
+            scratch_cwd = is_scratch(args[0], cwd, base)
             base = os.path.join(base, args[0])
             continue
         if prog in ("sed", "perl") and in_place(prog, args):
@@ -773,7 +829,7 @@ def tool_target(command):
     scratch copy."""
     roots = re.findall(r"--root[= ]\s*(\S+)", command) + re.findall(r"\s(\S+\.vl)(?=\s|$|;|&|\|)", command)
     dirs = re.findall(r"\bcd\s+(\S+)", command)
-    return all(compiler_paths(r) for r in roots) and not any(SCRATCH.search(d + "/") for d in dirs)
+    return all(compiler_paths(r) for r in roots) and not any(is_scratch(d) for d in dirs)
 
 
 GREP_ANY = "volec query grep TEXT [--comments|--strings|--code] | volec query items MODULE --comments"
