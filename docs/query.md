@@ -147,6 +147,7 @@ tools` the ones a program needs.
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/volec check` |
+| build a program and run it: DIR/main.vl (DIR: `.`), rebuilt only when it changed, kept in volec's cache (0.25.4) | `target/volec run [DIR] [OPTIONS] [-- ARGS]` (a build's options; off a terminal only the program's output, its exit status volec's; `run --help`) |
 | build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/volec fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
@@ -1035,6 +1036,10 @@ when it was given, names quoted for the shell when they need it).
 | `query.other-root` | note | (the answer's) | (0.25.2) the NAME is not in the default program; one other program under the current directory defines it, and the answer is that program's | the command with its `--root` |
 | `query.bad-root` | error | 2 | ROOT cannot be read | the command without it, when a default root exists |
 | `query.usage` | error | 2 | no command, an unknown command or option, a missing NAME or option value, an extra argument | the command corrected (the nearest command, the option dropped, `--limit 60`), or `items` |
+| `run.no-main` | error | 2 | (0.25.4) `volec run DIR`: DIR has no main.vl, or is no folder | `volec run DIR/SUB` for a subfolder with a main.vl (three at most); the plain build and run of its one .vl file |
+| `run.file` | error | 2 | (0.25.4) `volec run FILE`: a file where run takes a folder | `volec run FOLDER -- ARGS` when the file's folder has a main.vl; else a .vl file's plain build and run |
+| `run.args` | error | 2 | (0.25.4) `volec run DIR WORD`: a second folder, or the program's argument without `--` | `volec run DIR -- WORD` |
+| `run.option` | error | 2 | (0.25.4) `volec run` with an option that makes no program to run here (`-c`, `-S`, `--emit-ir`, `--target` of another machine) | |
 
 ```
 error query.no-match: no definition 'run_gnv'

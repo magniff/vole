@@ -1,0 +1,597 @@
+// `volec run [DIR] [OPTIONS] [-- ARGS...]` (0.25.4): the program whose root
+// is DIR/main.vl (DIR: the current directory when none is given) built as
+// a plain build builds it, with a build's options (-O, -l, -L, C files and
+// objects, -framework, --check-alloc...; --target the host's only), then
+// run: stdin, stdout and stderr its own, the words after `--` its
+// arguments, its exit status volec's (128 + N when signal N ended it, as a
+// shell says).
+//
+// The program is kept in volec's cache, never in DIR: CACHE/run/NAME-KEY/
+// NAME, CACHE the tools' cache (./target/volec-cache, $VOLE_CACHE) or else
+// $TMPDIR/volec-cache, which the code cache then uses too (incremental
+// rebuilds); NAME the folder's name; KEY the root's absolute path and the
+// options, hashed. It is built again only when a .vl file under DIR or a
+// file of the link is newer, or another compiler runs: `volec test`'s
+// up_to_date and install (tools/testrun/program.vl). `-o FILE` keeps a copy
+// at FILE too.
+//
+// On a terminal the build's lines (`Compiling`, `Finished NAME in 0.4s`;
+// `Finished` alone when nothing changed), then `Running NAME` (base::term);
+// elsewhere (a pipe, an agent, a test) only the program's own output. With
+// $VOLE_CACHE_TRACE (a file) a line `run fresh` or `run build`.
+
+use std::{Gpa, arena_scope};
+use std::fs::{exists, metadata, read_dir};
+use std::string::str;
+
+use crate::host_target;
+use crate::back::codecache::hash::{hash_bytes, mix};
+use crate::back::objfile::output::is_link_input;
+use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, cstr, die2};
+use crate::base::diag::{DIAG_PROG, NESTED, OK_LINE};
+use crate::base::target::target_of_name;
+use crate::base::term::{SHOWN_AS, run_status};
+use crate::cli::c_of;
+use crate::cli::build::build_command;
+use crate::cli::line::Line;
+use crate::tools::proc::{
+    absolute_path, buf_cstr, exec_words, keep_mode, make_dirs, remove_file, run_foreground,
+};
+use crate::tools::query::cache::{cache_dir_or, ident};
+use crate::tools::query::diagnostics::{diag, put_word, write_diags};
+use crate::tools::testrun::program::{install, up_to_date};
+
+// What run's options say, words 2.. of its line before `--` (0: not given).
+struct RunLine {
+    // whether a build reads them (else the build's own error is given)
+    parsed: bool,
+    // the words that are neither options, their values nor files of the
+    // link: the folder, a second one, a .vl file
+    dir: *u8,
+    second: *u8,
+    dirs: i64,
+    // (the folder's word in line)
+    dir_at: i64,
+    vl: *u8,
+    vl_at: i64,
+    // (the words of all those but the .vl files)
+    extra: IntVec,
+    // `-o FILE`'s FILE, `--target T`'s T, an option that makes no program
+    out: *u8,
+    target: *u8,
+    refused: *u8,
+}
+
+// The options that make something else than a program to run.
+fn refused_flags() -> [str; 11] {
+    ["object", "emit-asm", "emit-ir", "emit-mir", "emit-header", "emit-imports", "tokens",
+        "version", "check-rules", "test-build", "coverage"]
+}
+
+// Words 2..end of line read as a build reads its options.
+fn read_run(line: Line, end: i64, gpa: Gpa) -> RunLine {
+    let cmd = build_command(gpa);
+    arena_scope(gpa, |a| {
+        var args: Vec<str, std::ScopedArena> = Vec::new_in(a);
+        args.push("volec");
+        for k in 2..end {
+            let w = line.word(k);
+            args.push(if w == "-framework" { "--framework" } else { w });
+        }
+        var r = RunLine {
+            parsed: false, dir: 0 as *u8, second: 0 as *u8, dirs: 0, dir_at: -1, vl: 0 as *u8,
+            vl_at: -1,
+            extra: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            out: 0 as *u8, target: 0 as *u8, refused: 0 as *u8,
+        };
+        match cmd.parse_in(args.iter(), a) {
+            Ok(m) => {
+                r.parsed = true;
+                let places = m.indices_of("input");
+                let inputs = m.values("input");
+                for j in 0..inputs.len() {
+                    let p = inputs[j];
+                    let c = c_of(p);
+                    if is_link_input(c) {
+                        continue;
+                    }
+                    if p.ends_with(".vl") {
+                        if r.vl == 0 as *u8 {
+                            r.vl = c;
+                            r.vl_at = places[j] + 1;
+                        }
+                        continue;
+                    }
+                    r.extra.push(places[j] + 1);
+                    if r.dirs == 0 {
+                        r.dir = c;
+                        r.dir_at = places[j] + 1;
+                    } else if r.dirs == 1 {
+                        r.second = c;
+                    }
+                    r.dirs += 1;
+                }
+                match m.get("out") {
+                    Option::Some(v) => r.out = c_of(v),
+                    Option::None => {}
+                }
+                match m.get("target") {
+                    Option::Some(v) => r.target = c_of(v),
+                    Option::None => {}
+                }
+                for f in refused_flags() {
+                    let at = m.indices_of(f);
+                    if r.refused == 0 as *u8 && at.len() > 0 {
+                        r.refused = c_of(line.word(at[0] + 1));
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        r
+    })
+}
+
+// Whether word k of line (before `--`) is left out of the build run
+// makes: the folder's (word dir_at) or `-o FILE`'s (its -o is the cache's).
+fn left_out(line: Line, k: i64, dir_at: i64) -> bool {
+    if k == dir_at {
+        return true;
+    }
+    let w = line.word(k);
+    w == "-o" || (w.starts_with("-o") && w.len() > 2) || (k > 2 && line.word(k - 1) == "-o")
+}
+
+// `try: volec`, as it was run.
+fn put_try(out: i64) {
+    buf_str(out, c"try: ");
+    buf_str(out, if DIAG_PROG == 0 as *u8 { c"volec" } else { DIAG_PROG });
+}
+
+// ` run DIR` (DIR "": none), run's options from line (words 2..end but
+// skip_at), then ` -- ` and the words that read as the program's
+// arguments (`extra`, the other words that are no option; those after
+// `--`).
+fn put_run(out: i64, line: Line, end: i64, skip_at: i64, extra: IntVec, dir: [u8]) {
+    put_word(out, "run");
+    if dir.len > 0 {
+        put_word(out, dir);
+    }
+    for k in 2..end {
+        if k != skip_at && !has(extra, k) {
+            put_word(out, line.word(k).as_bytes());
+        }
+    }
+    var dashes = false;
+    for j in 0..extra.count {
+        let k = extra.get(j);
+        if k != skip_at {
+            if !dashes {
+                put_word(out, "--");
+                dashes = true;
+            }
+            put_word(out, line.word(k).as_bytes());
+        }
+    }
+    for k in end + 1..line.len() {
+        if !dashes {
+            put_word(out, "--");
+            dashes = true;
+        }
+        put_word(out, line.word(k).as_bytes());
+    }
+}
+
+// Whether v holds x.
+fn has(v: IntVec, x: i64) -> bool {
+    for j in 0..v.count {
+        if v.get(j) == x {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether s ends with suffix.
+fn ends(s: [u8], suffix: [u8]) -> bool {
+    s.len >= suffix.len && s[s.len - suffix.len..s.len] == suffix
+}
+
+// The program's name a file makes: its name without folder and `.vl`.
+fn stem(path: [u8]) -> [u8] {
+    var from = path.len;
+    while from > 0 && path[from - 1] != '/' {
+        from -= 1;
+    }
+    let to = if ends(path, ".vl") { path.len - 3 } else { path.len };
+    if to > from { path[from..to] } else { "main" }
+}
+
+// `try: volec FILE -o STEM && ./STEM ARGS`: a file's plain build, run.
+fn put_try_file(out: i64, line: Line, end: i64, file: [u8], given: *u8) {
+    put_try(out);
+    put_word(out, file);
+    for k in 2..end {
+        let w = line.word(k).as_bytes();
+        if w != file && w != "run" && (given == 0 as *u8 || w != cstr(given)) {
+            put_word(out, w);
+        }
+    }
+    let s = stem(file);
+    put_word(out, "-o");
+    put_word(out, s);
+    buf_str(out, c" && ./");
+    buf_bytes(out, s);
+    for k in end + 1..line.len() {
+        put_word(out, line.word(k).as_bytes());
+    }
+    buf_byte(out, '\n');
+}
+
+// `DIR/NAME` (DIR "." left out).
+fn join(dir: [u8], name: [u8]) -> [u8] {
+    let b = buf_new();
+    if dir != "." {
+        buf_bytes(b, dir);
+        if dir.len > 0 && dir[dir.len - 1] != '/' {
+            buf_byte(b, '/');
+        }
+    }
+    buf_bytes(b, name);
+    buf_slice(b)
+}
+
+// a then b.
+fn concat(a: [u8], b: [u8]) -> [u8] {
+    let out = buf_new();
+    buf_bytes(out, a);
+    buf_bytes(out, b);
+    buf_slice(out)
+}
+
+// The folder of a path (`.` for none).
+fn folder_of(path: [u8]) -> [u8] {
+    var i = path.len;
+    while i > 0 && path[i - 1] != '/' {
+        i -= 1;
+    }
+    if i == 0 { "." } else if i == 1 { "/" } else { path[0..i - 1] }
+}
+
+// The sorted names of dir's entries: its folders holding a main.vl
+// (`subs`) and its .vl files.
+fn entries(dir: [u8], subs: inout Vec<[u8]>, files: inout Vec<[u8]>) {
+    match read_dir(dir) {
+        Ok(rd) => {
+            var it = rd;
+            loop {
+                match it.next() {
+                    Option::Some(Ok(e)) => {
+                        let b = buf_new();
+                        buf_bytes(b, e.file_name().as_bytes());
+                        let name = buf_slice(b);
+                        if name.len == 0 || name[0] == '.' {
+                            continue;
+                        }
+                        if e.is_dir() && exists(join(join(dir, name), "main.vl")) {
+                            subs.push(name);
+                        } else if ends(name, ".vl") {
+                            files.push(name);
+                        }
+                    }
+                    Option::Some(Err(_)) => {}
+                    Option::None => break,
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    subs.sort();
+    files.sort();
+}
+
+// run.no-main: dir (as given, `.`) is no folder, or one without main.vl.
+fn no_main(line: Line, end: i64, r: RunLine, dir: [u8], folder: bool, gpa: Gpa) -> i64 {
+    let given = r.dir;
+    let out = diag(c"error", c"run.no-main");
+    buf_byte(out, '\'');
+    buf_bytes(out, dir);
+    buf_str(out, if folder { c"' has no main.vl\n" } else { c"' is no folder\n" });
+    buf_str(out, c"help: `volec run DIR` builds and runs the program whose root is DIR/main.vl (DIR: the current directory when none is given)\n");
+    if !folder {
+        let file = buf_new();
+        buf_bytes(file, dir);
+        buf_bytes(file, ".vl");
+        if exists(buf_slice(file)) {
+            put_try_file(out, line, end, buf_slice(file), given);
+        }
+        write_diags();
+        return 2;
+    }
+    var subs: Vec<[u8]> = Vec::new_in(gpa);
+    var files: Vec<[u8]> = Vec::new_in(gpa);
+    entries(dir, &subs, &files);
+    for k in 0..subs.len() {
+        if k < 3 {
+            put_try(out);
+            put_run(out, line, end, r.dir_at, r.extra, join(dir, subs[k]));
+            buf_byte(out, '\n');
+        }
+    }
+    if subs.len() == 0 && files.len() == 1 {
+        put_try_file(out, line, end, join(dir, files[0]), given);
+    } else if subs.len() == 0 && files.len() > 1 {
+        let n = buf_new();
+        buf_str(n, c"note: it holds ");
+        crate::base::buf_int(n, files.len());
+        buf_str(n, c" .vl files and no main.vl: build the root itself, `volec ROOT.vl -o prog`\n");
+        buf_bytes(out, buf_slice(n));
+    }
+    write_diags();
+    2
+}
+
+// run.file: a file given where run takes a folder.
+fn file_given(line: Line, end: i64, r: RunLine, at: i64) -> i64 {
+    let file = c_of(line.word(at));
+    let f = cstr(file);
+    let out = diag(c"error", c"run.file");
+    buf_byte(out, '\'');
+    buf_bytes(out, f);
+    buf_str(out, c"' is a file: run takes the folder that holds main.vl\n");
+    let dir = folder_of(f);
+    if exists(join(dir, "main.vl")) {
+        put_try(out);
+        put_run(out, line, end, at, r.extra, if dir == "." { "" } else { dir });
+        buf_byte(out, '\n');
+    } else if ends(f, ".vl") {
+        put_try_file(out, line, end, f, 0 as *u8);
+    }
+    write_diags();
+    2
+}
+
+// run.args: a second folder, a program's argument without `--` before it.
+fn second_dir(line: Line, end: i64, word: *u8) -> i64 {
+    let out = diag(c"error", c"run.args");
+    buf_byte(out, '\'');
+    buf_str(out, word);
+    buf_str(out, c"' is a second folder, or the program's argument: run builds one program; its arguments go after --\n");
+    put_try(out);
+    put_word(out, "run");
+    for k in 2..end {
+        let w = line.word(k).as_bytes();
+        if w != cstr(word) {
+            put_word(out, w);
+        }
+    }
+    put_word(out, "--");
+    put_word(out, cstr(word));
+    for k in end + 1..line.len() {
+        put_word(out, line.word(k).as_bytes());
+    }
+    buf_byte(out, '\n');
+    write_diags();
+    2
+}
+
+// run.option: an option that makes no program to run (`-c`, `-S`,
+// `--emit-ir`, a target that is not the host's...).
+fn refused(what: *u8, why: *u8) -> i64 {
+    let out = diag(c"error", c"run.option");
+    buf_str(out, what);
+    buf_str(out, why);
+    buf_str(out, c"\nhelp: run builds a program for this machine and runs it; other outputs are a build's: `volec DIR/main.vl OPTIONS -o OUT`\n");
+    write_diags();
+    2
+}
+
+// $TMPDIR/volec-cache (/tmp without $TMPDIR).
+fn tmp_cache(gpa: Gpa) -> *u8 {
+    let b = buf_new();
+    match std::env::get_in("TMPDIR", gpa) {
+        Ok(t) => buf_bytes(b, t.as_bytes()),
+        Err(_) => {}
+    }
+    if buf_slice(b).len == 0 {
+        buf_bytes(b, "/tmp");
+    }
+    let s = buf_slice(b);
+    if s[s.len - 1] != '/' {
+        buf_byte(b, '/');
+    }
+    buf_bytes(b, "volec-cache");
+    buf_cstr(b)
+}
+
+// A line `word` in $VOLE_CACHE_TRACE's file, when it is set.
+fn trace(word: [u8], gpa: Gpa) {
+    match std::env::get_in("VOLE_CACHE_TRACE", gpa) {
+        Ok(p) => {
+            let b = buf_new();
+            buf_bytes(b, word);
+            buf_byte(b, '\n');
+            let _ = std::fs::append(p.as_bytes(), buf_slice(b));
+        }
+        Err(_) => {}
+    }
+}
+
+// h as 16 hex digits.
+fn put_hex(b: i64, h: u64) {
+    for i in 0..16 {
+        let d = ((h >> ((15 - i) * 4) as u64) & 15) as u8;
+        buf_byte(b, if d < 10 { '0' + d } else { 'a' + d - 10 });
+    }
+}
+
+// Whether a file of the link among words 2..end (a C file, an object, an
+// archive) is newer than the program at bin.
+fn link_newer(line: Line, end: i64, bin: [u8], dir_at: i64) -> bool {
+    let built = match metadata(bin) {
+        Ok(m) => m.modified().as_nanos(),
+        Err(_) => return true,
+    };
+    for k in 2..end {
+        let w = line.word(k).as_bytes();
+        if !left_out(line, k, dir_at) && is_link_input(c_of(line.word(k))) {
+            match metadata(w) {
+                Ok(m) => {
+                    if m.modified().as_nanos() > built {
+                        return true;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    false
+}
+
+// `volec run ...`: the program's exit status; 1 when it does not build, 2
+// for run's own errors.
+pub fn run(line: Line, gpa: Gpa) -> i64 {
+    var end = line.len();
+    for k in 2..line.len() {
+        if line.word(k) == "--" {
+            end = k;
+            break;
+        }
+    }
+    let r = read_run(line, end, gpa);
+    if !r.parsed {
+        // (the build's own error, exit 1: its options as a build reads them)
+        var words: Vec<str> = Vec::new_in(gpa);
+        for k in 0..end {
+            if k != 1 {
+                words.push(line.word(k));
+            }
+        }
+        crate::cli::build::read_build(Line { words: words.as_slice() }, gpa);
+        return 1;
+    }
+    if r.refused != 0 as *u8 {
+        return refused(r.refused, c" makes no program to run");
+    }
+    if r.target != 0 as *u8 {
+        let t = target_of_name(r.target);
+        if t != 0 && t != host_target() {
+            let w = buf_new();
+            buf_str(w, c"--target ");
+            buf_str(w, r.target);
+            return refused(buf_cstr(w),
+                c": run runs the program here; a build makes it for another machine");
+        }
+    }
+    if r.vl != 0 as *u8 {
+        return file_given(line, end, r, r.vl_at);
+    }
+    if r.dirs > 1 {
+        return second_dir(line, end, r.second);
+    }
+    let dir: [u8] = if r.dir == 0 as *u8 { "." } else { cstr(r.dir) };
+    match metadata(dir) {
+        Ok(m) => {
+            if !m.is_dir() {
+                return file_given(line, end, r, r.dir_at);
+            }
+        }
+        Err(_) => return no_main(line, end, r, dir, false, gpa),
+    }
+    let root = join(dir, "main.vl");
+    if !exists(root) {
+        return no_main(line, end, r, dir, true, gpa);
+    }
+    // Where the program is kept: CACHE/run/NAME-KEY/NAME.
+    let b = buf_new();
+    buf_bytes(b, root);
+    let root_abs = cstr(absolute_path(buf_cstr(b)));
+    let folder = folder_of(root_abs);
+    let name = if folder == "/" { "main" } else { stem(folder) };
+    var h = hash_bytes(root_abs.ptr, root_abs.len);
+    for k in 2..end {
+        if !left_out(line, k, r.dir_at) {
+            let w = line.word(k).as_bytes();
+            h = mix(h, hash_bytes(w.ptr, w.len));
+        }
+    }
+    let base = cache_dir_or(tmp_cache(gpa));
+    make_dirs(base);
+    let d = buf_new();
+    buf_str(d, absolute_path(base));
+    buf_bytes(d, "/run/");
+    buf_bytes(d, name);
+    buf_byte(d, '-');
+    put_hex(d, h);
+    let bin_dir = buf_slice(d);
+    make_dirs(buf_cstr(d));
+    let bin = buf_cstr_of(join(bin_dir, name));
+    // (NAME.build, NAME.key next to it, as `volec test`'s)
+    let built = buf_cstr_of(join(bin_dir, concat(name, ".build")));
+    let key_path = buf_cstr_of(join(bin_dir, concat(name, ".key")));
+    // (the key: the compiler, whose bytes tools::query::cache::ident hashes)
+    if crate::tools::query::diagnostics::PROG == 0 as *u8 {
+        crate::tools::query::diagnostics::PROG = line.c(0);
+    }
+    let kb = buf_new();
+    put_hex(kb, ident() as u64);
+    buf_byte(kb, '\n');
+    let key = buf_slice(kb);
+    let fresh = up_to_date(bin, key_path, key, buf_cstr_of(folder))
+        && !link_newer(line, end, cstr(bin), r.dir_at);
+    if fresh {
+        trace("run fresh", gpa);
+    } else {
+        trace("run build", gpa);
+        // (the build's lines name the program, not its path in the cache;
+        // off a terminal they say nothing: no `ok: built`)
+        SHOWN_AS = buf_cstr_of(name);
+        OK_LINE = false;
+        var words: Vec<str> = Vec::new_in(gpa);
+        words.push(line.word(0));
+        words.push(str::from_utf8(root).unwrap_or("main.vl"));
+        for k in 2..end {
+            if !left_out(line, k, r.dir_at) {
+                words.push(line.word(k));
+            }
+        }
+        words.push("-o");
+        words.push(str::from_utf8(cstr(built)).unwrap_or(""));
+        let status = crate::build(Line { words: words.as_slice() }, gpa);
+        if status != 0 {
+            return status;
+        }
+        install(built, bin, key_path, key);
+        remove_file(built);
+    }
+    if r.out != 0 as *u8 {
+        match std::fs::copy(cstr(bin), cstr(r.out)) {
+            Ok(_) => keep_mode(bin, r.out),
+            Err(_) => die2(c"cannot write ", r.out),
+        }
+    }
+    run_status(fresh, name);
+    // (the program's environment is volec's as it was given: VOLEC_NESTED,
+    // which marks the volec processes this one starts, only when it was set)
+    if !NESTED {
+        // UNSAFE: std::env::remove_var is unsafe: the environment is not
+        // guarded against other threads.
+        // SAFETY: no other thread runs here: the build's code generation
+        // and assembler threads were joined in compile_program
+        // (middle::threads::pool_stop, asm_thread_finish), and run starts none.
+        unsafe { std::env::remove_var("VOLEC_NESTED"); }
+    }
+    var argv = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    argv.push(bin as i64);
+    for k in end + 1..line.len() {
+        argv.push(c_of(line.word(k)) as i64);
+    }
+    run_foreground(exec_words(argv))
+}
+
+// bytes as a C string (a copy).
+fn buf_cstr_of(bytes: [u8]) -> *u8 {
+    let b = buf_new();
+    buf_bytes(b, bytes);
+    buf_cstr(b)
+}
