@@ -1,0 +1,1524 @@
+// `volec query unsafe [FILE...|std] [--no-std] [--json] [--summary]
+// [--unjustified]` and `volec check`'s `unsafe.unjustified` (0.25.3):
+// every unsafe site of a program, what it does and whether it says why.
+//
+// A site is an `unsafe { }` block, an `unsafe fn` or an `extern` block
+// (vole has no `unsafe impl`). The sites are found in each file's tokens
+// (scan_tokens: a cached program has none of the lexer's), so code
+// the checker never reaches (a generic never instantiated) is listed too.
+// What a site does is what the checker counted while it read the program
+// (front/check/unsafety.vl, AUDIT_OPS): each unsafe operation inside it,
+// the innermost site holding it. A site's class is its operations' first
+// in this order:
+//
+//   ffi             a C function called (not one of the allocator's)
+//   alloc           malloc, free, realloc, a Gpa's raw functions
+//   intrinsic       std::arch, a compiler builtin
+//   transmute/cast  an integer made a pointer, an `unsafe fn` as a value,
+//                   a `cast`/`transmute`
+//   raw-pointer     a raw pointer dereferenced, indexed, sliced; an `unsafe
+//                   fn` that takes one called
+//   static-mut      the same through a pointer held in a static (the
+//                   compiler's tables: `NODES[n]`, `TABLE.data[i]`)
+//   other           a union's field read, another `unsafe fn` called, or
+//                   nothing (an `unsafe fn` whose contract is the caller's)
+//
+// An extern block is ffi.
+//
+// A site is justified when the comments right above it hold `UNSAFE:`
+// (why it cannot be safe) and `SAFETY:` (why it is sound): the comment
+// lines directly above the statement or item the site starts (no blank
+// line between), the comments inside that statement before the site, and
+// a comment ending the site's line. `volec check` warns about each site of
+// the program (not std's) without both (an error with --deny-warnings),
+// and tools/unsafe-diff-check.py, the commit hook's, asks this command.
+
+use std::str::memchr;
+
+use crate::arch::virtual::ARCH_MODULE;
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_write_fd,
+};
+use crate::base::diag::{buf_tool_command, report_error_tries};
+use crate::base::json::{DIAG_JSON, buf_json_str};
+use crate::front::check::unsafety::{
+    AUDIT_CHECKED, AUDIT_OPS, U_C_CALL, U_DEREF, U_FIELD, U_FN_VALUE, U_INDEX, U_INT_PTR, U_METHOD,
+    U_SLICE, U_UNION, U_UNSAFE_CALL,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{file_of_pos, is_within, module_at, within_std};
+use crate::front::stdtree::std_file_line;
+use crate::front::types::{FNS, TLISTS, TYPES, TyKind};
+use crate::tools::query::c_slice;
+use crate::tools::query::defs::{DEFS, mod_fqn_text};
+use crate::tools::query::positions::enclosing;
+use crate::tools::query::refs::OPT_ALL;
+
+// The options (cli/query.vl).
+pub static var OPT_SUMMARY: bool = false;
+pub static var OPT_NO_STD: bool = false;
+pub static var OPT_UNJUSTIFIED: bool = false;
+
+// The kinds of site.
+const S_BLOCK: i64 = 0;
+const S_FN: i64 = 1;
+const S_EXTERN: i64 = 2;
+
+// The justification comments found (bits).
+const J_UNSAFE: i64 = 1;
+const J_SAFETY: i64 = 2;
+const J_BOTH: i64 = 3;
+
+// The classes, in the order a site takes the first of its operations'.
+const C_FFI: i64 = 0;
+const C_ALLOC: i64 = 1;
+const C_INTRINSIC: i64 = 2;
+const C_CAST: i64 = 3;
+const C_RAW: i64 = 4;
+const C_STATIC: i64 = 5;
+const C_OTHER: i64 = 6;
+const N_CLASSES: i64 = 7;
+
+fn class_name(c: i64) -> [u8] {
+    if c == C_FFI { "ffi" } else if c == C_ALLOC { "alloc" }
+    else if c == C_INTRINSIC { "intrinsic" } else if c == C_CAST { "transmute/cast" }
+    else if c == C_RAW { "raw-pointer" } else if c == C_STATIC { "static-mut" } else { "other" }
+}
+
+fn kind_name(k: i64) -> [u8] {
+    if k == S_BLOCK { "block" } else if k == S_FN { "unsafe fn" } else { "extern" }
+}
+
+// The sites found, in order of position (a file's, files in their order).
+static var S_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// the end of the site (its block's, its body's)
+static var S_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var S_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// its file (FILES) and, as printed, its path (a C string) and line
+static var S_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var S_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var S_LINE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// J_* bits
+static var S_JUST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// where the checker marks the site checked (AUDIT_CHECKED): an unsafe
+// block's `unsafe`, an `unsafe fn`'s body (-1: none)
+static var S_CHECK_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// an extern block's functions
+static var S_EXTERNS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// ---- The tables of the front end ----
+//
+// The front end's tables (SRC, FILES, TOKS, SYMS, FNS, TYPES, DEFS) are
+// raw pointers until the compiler moves them to std's Vec (0.25.4): each
+// read of them is one of these functions.
+
+fn file_bytes(f: i64) -> [u8] {
+    // UNSAFE: SRC and FILES are the front end's tables, raw pointers.
+    // SAFETY: 0 <= f < FILE_COUNT (every caller's loop), and the file's
+    // start..end lies within SRC, which holds every file read and is not
+    // freed while the program is read.
+    unsafe { SRC[FILES[f].start..FILES[f].end] }
+}
+
+fn file_start(f: i64) -> i64 {
+    // UNSAFE: FILES is the front end's table, a raw pointer.
+    // SAFETY: 0 <= f < FILE_COUNT (every caller's loop or a site's file).
+    unsafe { FILES[f].start }
+}
+
+fn file_path(f: i64) -> *u8 {
+    // UNSAFE: FILES is the front end's table, a raw pointer.
+    // SAFETY: 0 <= f < FILE_COUNT (every caller's loop or a site's file).
+    unsafe {
+        var p = FILES[f].path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        p
+    }
+}
+
+fn file_module(f: i64) -> i64 {
+    // UNSAFE: FILES is the front end's table, a raw pointer.
+    // SAFETY: 0 <= f < FILE_COUNT (every caller's loop).
+    unsafe { FILES[f].module }
+}
+
+// The name of function f as messages write it.
+fn fn_name(f: i64) -> [u8] {
+    // UNSAFE: FNS and SYMS are the checker's tables, raw pointers.
+    // SAFETY: f is a function the checker recorded a call of (AUDIT_OPS),
+    // and its display a symbol it interned.
+    unsafe { SYMS[FNS[f].display].text }
+}
+
+fn fn_module(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table, a raw pointer.
+    // SAFETY: f is a function the checker recorded a call of (AUDIT_OPS).
+    unsafe { FNS[f].module }
+}
+
+// Whether function f takes a raw pointer (`*T`, not `&T`).
+fn takes_raw_pointer(f: i64) -> bool {
+    // UNSAFE: FNS, TLISTS' data and TYPES are the checker's tables, raw
+    // pointers.
+    // SAFETY: f is a function the checker recorded a call of; its params
+    // are param_count types of TLISTS, each a type of TYPES.
+    unsafe {
+        for i in 0..FNS[f].param_count {
+            let t = TLISTS.get(FNS[f].params + i);
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The path of definition d.
+fn def_path(d: i64) -> [u8] {
+    // UNSAFE: DEFS and SYMS are the queries' tables, raw pointers.
+    // SAFETY: d is a definition enclosing() found, its fqn a symbol.
+    unsafe { SYMS[DEFS[d].fqn].text }
+}
+
+// Argument k of the command line (a C string kept as a number).
+fn arg_text(args: IntVec, k: i64) -> [u8] {
+    // UNSAFE: the arguments are C strings from argv, kept in an IntVec as
+    // numbers (the queries' argument list).
+    // SAFETY: each is a NUL-terminated string of argv (or its copy), alive
+    // for the whole run.
+    unsafe { c_slice(args.get(k) as *u8) }
+}
+
+// ---- Sites ----
+
+// The tokens of a file as the sites need them (scan_tokens): the words
+// `unsafe`, `fn` and `extern`, a string right after `extern`, the
+// brackets, `;` and the comments. Other words, numbers, characters,
+// strings and operators are not kept.
+const K_COMMENT: i64 = 0;
+const K_UNSAFE: i64 = 1;
+const K_FN: i64 = 2;
+const K_EXTERN: i64 = 3;
+const K_STR: i64 = 4;
+const K_LBRACE: i64 = 5;
+const K_RBRACE: i64 = 6;
+const K_LPAREN: i64 = 7;
+const K_RPAREN: i64 = 8;
+const K_LBRACKET: i64 = 9;
+const K_RBRACKET: i64 = 10;
+const K_SEMI: i64 = 11;
+
+// The tokens of text (a file's), three numbers each (kind, start, end),
+// into toks. Not the lexer (a cached program has no tokens, and lexing
+// the compiler again cost `check` a tenth of its time): a scan that knows
+// comments (nested `/* */` too), strings (an f-string's holes, which hold
+// strings of their own), characters and labels.
+fn scan_tokens(text: [u8], from: i64, to: i64, toks: inout IntVec) {
+    let n = text.len;
+    var i = from;
+    // (the last token was `extern`: a string is kept)
+    var after_extern = false;
+    while i < to {
+        let c = text[i];
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+            i += 1;
+            continue;
+        }
+        var kind = -1;
+        var j = i + 1;
+        if c == '/' && i + 1 < n && (text[i + 1] == '/' || text[i + 1] == '*') {
+            j = comment_end(text, i);
+            kind = K_COMMENT;
+        } else if c == '"' {
+            // (an f-string: its prefix is the word before)
+            let f = i > 0 && text[i - 1] == 'f';
+            j = string_end(text, i + 1, f);
+            if after_extern {
+                kind = K_STR;
+            }
+        } else if c == '\'' {
+            // a character ('a', '\n', '\'') or a label ('outer)
+            if i + 1 < n && text[i + 1] == '\\' {
+                j = i + 3;
+                while j < n && text[j] != '\'' {
+                    j += 1;
+                }
+                j += 1;
+            } else if i + 2 < n && text[i + 2] == '\'' {
+                j = i + 3;
+            }
+        } else if c == '{' {
+            kind = K_LBRACE;
+        } else if c == '}' {
+            kind = K_RBRACE;
+        } else if c == '(' {
+            kind = K_LPAREN;
+        } else if c == ')' {
+            kind = K_RPAREN;
+        } else if c == '[' {
+            kind = K_LBRACKET;
+        } else if c == ']' {
+            kind = K_RBRACKET;
+        } else if c == ';' {
+            kind = K_SEMI;
+        } else if is_word_byte(c) {
+            // a word: a name, a keyword, a number
+            while j < n && is_word_byte(text[j]) {
+                j += 1;
+            }
+            // (the keywords' first bytes, then the words)
+            if (c == 'u' || c == 'f' || c == 'e') && j - i <= 6 {
+                let w = text[i..j];
+                kind = if w == "unsafe" { K_UNSAFE } else if w == "fn" { K_FN }
+                    else if w == "extern" { K_EXTERN } else { -1 };
+            }
+        }
+        // (else an operator's byte: not kept)
+        if j > n {
+            j = n;
+        }
+        if kind != K_COMMENT {
+            after_extern = kind == K_EXTERN;
+        }
+        if kind >= 0 {
+            toks.push(kind);
+            toks.push(i);
+            toks.push(j);
+        }
+        i = j;
+    }
+}
+
+fn is_word_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// The end of the comment starting at i (`//` to the line's end, `/*` to
+// its `*/`, nested).
+fn comment_end(text: [u8], i: i64) -> i64 {
+    let n = text.len;
+    if text[i + 1] == '/' {
+        var j = i;
+        while j < n && text[j] != '\n' {
+            j += 1;
+        }
+        return j;
+    }
+    var depth = 0;
+    var j = i;
+    while j + 1 < n {
+        if text[j] == '/' && text[j + 1] == '*' {
+            depth += 1;
+            j += 2;
+        } else if text[j] == '*' && text[j + 1] == '/' {
+            depth -= 1;
+            j += 2;
+            if depth == 0 {
+                return j;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    n
+}
+
+// The end of the string whose text starts at i (after its `"`): after its
+// closing quote. In an f-string's holes (`{x}`, not `{{`) a quote starts
+// a string of the hole's own.
+fn string_end(text: [u8], i: i64, f: bool) -> i64 {
+    let n = text.len;
+    var j = i;
+    var hole = 0;
+    while j < n {
+        let c = text[j];
+        if c == '\\' {
+            j += 2;
+            continue;
+        }
+        if hole > 0 {
+            if c == '"' {
+                j = string_end(text, j + 1, false);
+                continue;
+            }
+            if c == '{' {
+                hole += 1;
+            } else if c == '}' {
+                hole -= 1;
+            }
+            j += 1;
+            continue;
+        }
+        if c == '"' {
+            return j + 1;
+        }
+        if f && c == '{' {
+            if j + 1 < n && text[j + 1] == '{' {
+                j += 2;
+                continue;
+            }
+            hole = 1;
+        }
+        j += 1;
+    }
+    n
+}
+
+fn tk(toks: IntVec, i: i64) -> i64 {
+    toks.get(3 * i)
+}
+
+fn tstart(toks: IntVec, i: i64) -> i64 {
+    toks.get(3 * i + 1)
+}
+
+fn tend(toks: IntVec, i: i64) -> i64 {
+    toks.get(3 * i + 2)
+}
+
+// The J_* bits of text (comments).
+fn marks(text: [u8]) -> i64 {
+    var bits = 0;
+    var i = 0;
+    while i + 7 <= text.len {
+        if text[i] == 'U' && i + 7 <= text.len && text[i..i + 7] == "UNSAFE:" {
+            bits |= J_UNSAFE;
+        } else if text[i] == 'S' && text[i..i + 7] == "SAFETY:" {
+            bits |= J_SAFETY;
+        }
+        i += 1;
+    }
+    bits
+}
+
+// The comments right above the site at token i (see the head of the
+// file): its J_* bits.
+fn justification(text: [u8], toks: IntVec, i: i64) -> i64 {
+    // The first token of the statement or item: back over what the site
+    // is inside of on its line, up to a `;`, `{` or `}` outside brackets.
+    let j = statement_first(toks, i);
+    // the statement's first byte: past blanks and comments
+    let gap_from = if j >= 0 { tend(toks, j) } else { 0 };
+    var first = gap_from;
+    while first < text.len {
+        let c = text[first];
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+            first += 1;
+        } else if c == '/' && first + 1 < text.len
+            && (text[first + 1] == '/' || text[first + 1] == '*') {
+            first = comment_end(text, first);
+        } else {
+            break;
+        }
+    }
+    var bits = 0;
+    // The comment lines directly above the first byte: the whole lines of
+    // the gap before it, from the last up, to a blank line.
+    let gap = text[gap_from..first];
+    var e = gap.len;
+    // (the first token's own line: what is before it on it)
+    while e > 0 && gap[e - 1] != '\n' {
+        e -= 1;
+    }
+    while e > 0 {
+        // the line ending at e - 1
+        var b = e - 1;
+        while b > 0 && gap[b - 1] != '\n' {
+            b -= 1;
+        }
+        if b == 0 && j >= 0 {
+            // (the rest of the line of the token before: not above)
+            break;
+        }
+        let line = gap[b..e - 1];
+        var blank = true;
+        for c in line {
+            if c != ' ' && c != '\t' && c != '\r' {
+                blank = false;
+            }
+        }
+        if blank {
+            break;
+        }
+        bits |= marks(line);
+        e = b;
+    }
+    // The comments inside the statement, before the site.
+    for m in j + 1..i {
+        if tk(toks, m) == K_COMMENT && tstart(toks, m) >= first {
+            bits |= marks(text[tstart(toks, m)..tend(toks, m)]);
+        }
+    }
+    // A comment ending the site's line.
+    var eol = tstart(toks, i);
+    while eol < text.len && text[eol] != '\n' {
+        eol += 1;
+    }
+    var m = i + 1;
+    let n = toks.count / 3;
+    while m < n && tstart(toks, m) < eol {
+        if tk(toks, m) == K_COMMENT {
+            let to = if tend(toks, m) < eol { tend(toks, m) } else { eol };
+            bits |= marks(text[tstart(toks, m)..to]);
+        }
+        m += 1;
+    }
+    bits
+}
+
+// The line (from 1) of offset at in text.
+fn line_at(text: [u8], at: i64, from: i64, line: i64) -> i64 {
+    var n = line;
+    for x in from..at {
+        if text[x] == '\n' {
+            n += 1;
+        }
+    }
+    n
+}
+
+// The sites of file f, appended to the S_* tables.
+fn find_sites(f: i64) {
+    let text = file_bytes(f);
+    var toks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    scan_tokens(text, 0, text.len, &toks);
+    let n = toks.count / 3;
+    // each `{`'s `}` (-1: unmatched)
+    var close = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for i in 0..n {
+        close.push(-1);
+        let k = tk(toks, i);
+        if k == K_LBRACE {
+            stack.push(i);
+        } else if k == K_RBRACE && stack.count > 0 {
+            close.set(stack.pop(), i);
+        }
+    }
+    let start = file_start(f);
+    var line = 1;
+    var line_from = 0;
+    for i in 0..n {
+        let k = tk(toks, i);
+        var kind = -1;
+        var body = -1;
+        if k == K_UNSAFE && i + 1 < n && tk(toks, i + 1) == K_LBRACE {
+            kind = S_BLOCK;
+            body = i + 1;
+        } else if k == K_UNSAFE && i + 1 < n && tk(toks, i + 1) == K_FN {
+            kind = S_FN;
+            // its body: the first `{` outside parentheses (none: a trait's
+            // declaration, up to its `;`)
+            var m = i + 2;
+            var depth = 0;
+            while m < n && body < 0 {
+                let km = tk(toks, m);
+                if km == K_LPAREN {
+                    depth += 1;
+                } else if km == K_RPAREN {
+                    depth -= 1;
+                } else if depth == 0 && km == K_LBRACE {
+                    body = m;
+                } else if depth == 0 && km == K_SEMI {
+                    break;
+                }
+                m += 1;
+            }
+            if body < 0 {
+                body = -(m + 2);
+            }
+        } else if k == K_EXTERN && i + 1 < n {
+            var m = i + 1;
+            if tk(toks, m) == K_STR {
+                m += 1;
+            }
+            if m < n && tk(toks, m) == K_LBRACE {
+                kind = S_EXTERN;
+                body = m;
+            }
+        }
+        if kind < 0 {
+            continue;
+        }
+        line = line_at(text, tstart(toks, i), line_from, line);
+        line_from = tstart(toks, i);
+        var end = tend(toks, i);
+        var check_at = -1;
+        if body >= 0 {
+            let c = close.get(body);
+            end = if c >= 0 { tend(toks, c) } else { text.len };
+            check_at = if kind == S_FN { start + tstart(toks, body) }
+                else { start + tstart(toks, i) };
+        } else {
+            // (an `unsafe fn` without a body: to its `;`)
+            let last = -body - 2;
+            end = if last < n { tend(toks, last) } else { text.len };
+        }
+        S_POS.push(start + tstart(toks, i));
+        S_END.push(start + end);
+        S_KIND.push(kind);
+        S_FILE.push(f);
+        // (std's built-in text: the path and line of std's file)
+        var path = file_path(f);
+        var at_line = line;
+        var std_line = 0;
+        if std_file_line(f, start + tstart(toks, i), &path, &std_line) {
+            at_line = std_line;
+        }
+        let pb = buf_new();
+        buf_bytes(pb, c_slice(path));
+        S_PATH.push(pb);
+        S_LINE.push(at_line);
+        S_JUST.push(justification(text, toks, i));
+        S_CHECK_AT.push(check_at);
+        // an extern block's functions: its `fn`s at its own level
+        var fns = 0;
+        if kind == S_EXTERN {
+            let c = close.get(body);
+            var d = 0;
+            for m in body + 1..(if c >= 0 { c } else { n }) {
+                let km = tk(toks, m);
+                if km == K_LBRACE {
+                    d += 1;
+                } else if km == K_RBRACE {
+                    d -= 1;
+                } else if d == 0 && km == K_FN {
+                    fns += 1;
+                }
+            }
+        }
+        S_EXTERNS.push(fns);
+    }
+}
+
+// Whether file f is std's (its built-in text, or its files with
+// --std-tree), and whether it is a vole file at all (not a C header's).
+fn is_std_file(f: i64) -> bool {
+    let p = c_slice(file_path(f));
+    p == "<std>" || within_std(file_module(f))
+}
+
+fn is_vole_file(f: i64) -> bool {
+    let p = c_slice(file_path(f));
+    p == "<std>" || (p.len > 3 && p[p.len - 3..p.len] == ".vl")
+}
+
+// The sites of every file of the program (`std`: std's too).
+fn find_all_sites(std: bool) {
+    for f in 0..FILE_COUNT {
+        if is_vole_file(f) && (std || !is_std_file(f)) {
+            find_sites(f);
+        }
+    }
+}
+
+// ---- unsafe.unjustified (volec check) ----
+
+// (check's sites, kept cheap: scanning every byte of the compiler cost
+// its `check` 8% more instructions) A file's sites from the words
+// `unsafe` and `extern` alone, found with std's memchr, each read in the
+// lines around it: a line is read alone, as a string spans lines only
+// where they end in `\` (line_start goes back to its first). A
+// file with a `/*` (a comment that may span lines) is scanned whole.
+fn light_sites(f: i64) {
+    let text = file_bytes(f);
+    if has_byte_pair(text, '/', '*') {
+        find_sites(f);
+        return;
+    }
+    var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    find_word(text, 'u', 0, "unsafe", &words);
+    let unsafe_words = words.count;
+    find_word(text, 'x', 1, "extern", &words);
+    // (in order of position: the two runs merged)
+    var a = 0;
+    var b = unsafe_words;
+    while a < unsafe_words || b < words.count {
+        if b >= words.count || (a < unsafe_words && words.get(a) < words.get(b)) {
+            light_site(f, text, words.get(a));
+            a += 1;
+        } else {
+            light_site(f, text, words.get(b));
+            b += 1;
+        }
+    }
+}
+
+// Whether text holds byte x followed by byte y.
+fn has_byte_pair(text: [u8], x: u8, y: u8) -> bool {
+    var from = 0;
+    while from < text.len {
+        match memchr(y, text[from..]) {
+            Option::Some(k) => {
+                let p = from + k;
+                if p > 0 && text[p - 1] == x {
+                    return true;
+                }
+                from = p + 1;
+            },
+            Option::None => {
+                return false;
+            },
+        }
+    }
+    false
+}
+
+// The positions of `word` as a whole word in text, into out: found by its
+// byte b, at index at in it.
+fn find_word(text: [u8], b: u8, at: i64, word: [u8], out: inout IntVec) {
+    var from = 0;
+    while from < text.len {
+        match memchr(b, text[from..]) {
+            Option::Some(k) => {
+                let p = from + k - at;
+                from += k + 1;
+                if p >= 0 && p + word.len <= text.len && text[p..p + word.len] == word
+                    && (p == 0 || !is_word_byte(text[p - 1]))
+                    && (p + word.len == text.len || !is_word_byte(text[p + word.len])) {
+                    out.push(p);
+                }
+            },
+            Option::None => {
+                return;
+            },
+        }
+    }
+}
+
+// The start of the line of p; of the first line of its string when the
+// lines before end in a `\` (a string continued).
+fn line_start(text: [u8], p: i64) -> i64 {
+    var s = p;
+    while s > 0 && text[s - 1] != '\n' {
+        s -= 1;
+    }
+    if s >= 2 && text[s - 2] == '\\' {
+        return line_start(text, s - 1);
+    }
+    s
+}
+
+fn line_end(text: [u8], p: i64) -> i64 {
+    var e = p;
+    while e < text.len && text[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+// The site at the word at p (file f's text), if it is one: read from the
+// line before it on (more lines while the statement starts above them) to
+// the end of its line (of the next while what follows the word is there).
+fn light_site(f: i64, text: [u8], p: i64) {
+    var from = line_start(text, p);
+    if from > 0 {
+        from = line_start(text, from - 1);
+    }
+    var to = line_end(text, p);
+    var extended = false;
+    var more = 1;
+    loop {
+        var toks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        scan_tokens(text, from, to, &toks);
+        var i = -1;
+        for k in 0..toks.count / 3 {
+            if tstart(toks, k) == p {
+                i = k;
+            }
+        }
+        if i < 0 {
+            // (in a string or a comment)
+            return;
+        }
+        let kind = site_kind(toks, i);
+        if kind < 0 && !extended && to < text.len && i + 2 >= toks.count / 3 {
+            extended = true;
+            // (`unsafe` or `extern "C"` ending its line: the next one)
+            to = line_end(text, to + 1);
+            continue;
+        }
+        if kind < 0 {
+            return;
+        }
+        if from > 0 && statement_first(toks, i) < 0 {
+            // (the statement starts above: more lines)
+            for _ in 0..more {
+                if from > 0 {
+                    from = line_start(text, from - 1);
+                }
+            }
+            more *= 2;
+            continue;
+        }
+        S_POS.push(file_start(f) + p);
+        S_END.push(file_start(f) + p);
+        S_KIND.push(kind);
+        S_FILE.push(f);
+        S_PATH.push(0);
+        S_LINE.push(0);
+        S_JUST.push(justification(text, toks, i));
+        S_CHECK_AT.push(-1);
+        S_EXTERNS.push(0);
+        return;
+    }
+}
+
+// The kind of site the token i starts (-1: none): `unsafe {`, `unsafe fn`,
+// `extern "C" {` (or `extern {`).
+fn site_kind(toks: IntVec, i: i64) -> i64 {
+    let n = toks.count / 3;
+    let k = tk(toks, i);
+    if k == K_UNSAFE && i + 1 < n {
+        let next = tk(toks, i + 1);
+        return if next == K_LBRACE { S_BLOCK } else if next == K_FN { S_FN } else { -1 };
+    }
+    if k == K_EXTERN && i + 1 < n {
+        var m = i + 1;
+        if tk(toks, m) == K_STR {
+            m += 1;
+        }
+        if m < n && tk(toks, m) == K_LBRACE {
+            return S_EXTERN;
+        }
+    }
+    -1
+}
+
+// The token before the statement or item token i is in (a `;`, `{` or `}`
+// outside brackets), or -1 when there is none before it.
+fn statement_first(toks: IntVec, i: i64) -> i64 {
+    var j = i - 1;
+    var depth = 0;
+    while j >= 0 {
+        let k = tk(toks, j);
+        if k == K_RPAREN || k == K_RBRACKET {
+            depth += 1;
+        } else if k == K_LPAREN || k == K_LBRACKET {
+            if depth > 0 {
+                depth -= 1;
+            }
+        } else if depth == 0 && (k == K_SEMI || k == K_LBRACE || k == K_RBRACE) {
+            return j;
+        }
+        j -= 1;
+    }
+    -1
+}
+
+// The sites of the program's files (not std's), for check. `lexed`: the
+// front end has just read the program, and the lexer's tokens say where
+// the words `unsafe` and `extern` are (else the files are searched).
+fn light_all_sites(lexed: bool) {
+    if !lexed {
+        for f in 0..FILE_COUNT {
+            if is_vole_file(f) && !is_std_file(f) {
+                light_sites(f);
+            }
+        }
+        return;
+    }
+    var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    lexed_words(&words);
+    var last = -1;
+    var whole = false;
+    for k in 0..words.count {
+        let pos = words.get(k);
+        let f = file_of_pos(pos);
+        if f != last {
+            last = f;
+            whole = has_byte_pair(file_bytes(f), '/', '*');
+            if whole {
+                find_sites(f);
+            }
+        }
+        if !whole {
+            light_site(f, file_bytes(f), pos - file_start(f));
+        }
+    }
+}
+
+// The positions of the lexer's `unsafe` and `extern` tokens in the
+// program's files (not std's), in order, into out.
+fn lexed_words(out: inout IntVec) {
+    for k in 0..TOK_COUNT {
+        // UNSAFE: TOKS is the lexer's table, a raw pointer.
+        // SAFETY: 0 <= k < TOK_COUNT: a token the lexer wrote, kept while
+        // the program is read.
+        let pos = unsafe {
+            if TOKS[k].kind == Tok::Unsafe || TOKS[k].kind == Tok::Extern { TOKS[k].start }
+            else { -1 }
+        };
+        if pos >= 0 {
+            let f = file_of_pos(pos);
+            if is_vole_file(f) && !is_std_file(f) {
+                out.push(pos);
+            }
+        }
+    }
+    // (the files were lexed in turn, std's sections between them: nearly
+    // in order)
+    sort_values(&out);
+}
+
+// The sites reported one by one; past them, one warning says how many.
+const SHOWN_UNJUSTIFIED: i64 = 5;
+
+// `volec check`: a warning for each site of the program (not std's)
+// without both comments; past SHOWN_UNJUSTIFIED of them, one warning that
+// counts them, at the first (a program of legacy unsafe, the compiler's,
+// says so in one line). `lexed`: see light_all_sites.
+pub fn report_unjustified(lexed: bool) {
+    light_all_sites(lexed);
+    var count = 0;
+    var first = -1;
+    for s in 0..S_POS.count {
+        if S_JUST.get(s) != J_BOTH {
+            if first < 0 {
+                first = s;
+            }
+            count += 1;
+        }
+    }
+    if count > SHOWN_UNJUSTIFIED {
+        let msg = buf_new();
+        buf_int(msg, count);
+        buf_bytes(msg,
+            " unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here)");
+        buf_byte(msg, 0);
+        let tries = buf_new();
+        buf_tool_command(tries, "query unsafe --no-std --unjustified --root", true);
+        report_error_tries(S_POS.get(first), 7102, c"unsafe.unjustified", buf_slice(msg).ptr,
+            c"each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them",
+            buf_slice(tries), true);
+        return;
+    }
+    for s in 0..S_POS.count {
+        let bits = S_JUST.get(s);
+        if bits == J_BOTH {
+            continue;
+        }
+        let msg = buf_new();
+        buf_bytes(msg, if S_KIND.get(s) == S_BLOCK { "unsafe block" }
+            else if S_KIND.get(s) == S_FN { "`unsafe fn`" } else { "extern block" });
+        buf_bytes(msg, if bits == J_UNSAFE { " without a `// SAFETY:` comment" }
+            else if bits == J_SAFETY { " without a `// UNSAFE:` comment" }
+            else { " without `// UNSAFE:` and `// SAFETY:` comments" });
+        buf_byte(msg, 0);
+        let tries = buf_new();
+        let args = buf_new();
+        buf_bytes(args, "query unsafe ");
+        buf_bytes(args, c_slice(file_path(S_FILE.get(s))));
+        buf_tool_command(tries, buf_slice(args), false);
+        report_error_tries(S_POS.get(s), 7101, c"unsafe.unjustified", buf_slice(msg).ptr,
+            c"say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does",
+            buf_slice(tries), true);
+    }
+}
+
+// ---- volec query unsafe ----
+
+// The operations recorded (AUDIT_OPS), one per position and kind: their
+// index in AUDIT_OPS (a multiple of 4), in order of position.
+fn distinct_ops(out: inout IntVec) {
+    var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var q = 0;
+    while q + 3 < AUDIT_OPS.count {
+        all.push(q);
+        q += 4;
+    }
+    sort_ops(&all, true);
+    for k in 0..all.count {
+        let a = all.get(k);
+        if out.count > 0 {
+            let b = out.get(out.count - 1);
+            if AUDIT_OPS.get(a) == AUDIT_OPS.get(b)
+                && AUDIT_OPS.get(a + 1) == AUDIT_OPS.get(b + 1) {
+                continue;
+            }
+        }
+        out.push(a);
+    }
+}
+
+// Sorts v: op indices by (position, kind) when `ops`, else numbers; a
+// merge sort.
+fn sort_ops(v: inout IntVec, ops: bool) {
+    let n = v.count;
+    var tmp = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in 0..n {
+        tmp.push(v.get(k));
+    }
+    var width = 1;
+    while width < n {
+        var lo = 0;
+        while lo < n {
+            let mid = if lo + width < n { lo + width } else { n };
+            let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+            var a = lo;
+            var b = mid;
+            var k = lo;
+            while k < hi {
+                if a < mid && (b >= hi || !(if ops { op_before(v.get(b), v.get(a)) }
+                    else { v.get(b) < v.get(a) })) {
+                    tmp.set(k, v.get(a));
+                    a += 1;
+                } else {
+                    tmp.set(k, v.get(b));
+                    b += 1;
+                }
+                k += 1;
+            }
+            lo = hi;
+        }
+        for k in 0..n {
+            v.set(k, tmp.get(k));
+        }
+        width *= 2;
+    }
+}
+
+fn op_before(a: i64, b: i64) -> bool {
+    let pa = AUDIT_OPS.get(a);
+    let pb = AUDIT_OPS.get(b);
+    pa < pb || (pa == pb && AUDIT_OPS.get(a + 1) < AUDIT_OPS.get(b + 1))
+}
+
+// The last segment of a function's name, without type arguments.
+fn last_name(name: [u8]) -> [u8] {
+    var from = 0;
+    var to = name.len;
+    var depth = 0;
+    for x in 0..name.len {
+        let c = name[x];
+        if c == '<' {
+            if depth == 0 && x >= from {
+                to = x;
+            }
+            depth += 1;
+        } else if c == '>' {
+            depth -= 1;
+        } else if depth == 0 && c == ':' && x + 1 < name.len && name[x + 1] == ':' {
+            from = x + 2;
+            to = name.len;
+        }
+    }
+    if to < from { name[from..name.len] } else { name[from..to] }
+}
+
+fn contains(s: [u8], part: [u8]) -> bool {
+    var i = 0;
+    while i + part.len <= s.len {
+        if s[i..i + part.len] == part {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_alloc_name(s: [u8]) -> bool {
+    contains(s, "alloc") || contains(s, "free") || contains(s, "resize") || contains(s, "memalign")
+        || s == "mmap" || s == "munmap"
+}
+
+fn is_cast_name(s: [u8]) -> bool {
+    s == "cast" || s == "transmute" || s == "bitcast"
+}
+
+fn is_intrinsic(f: i64, s: [u8]) -> bool {
+    (ARCH_MODULE >= 0 && is_within(fn_module(f), ARCH_MODULE))
+        || (s.len > 10 && s[0..10] == "__builtin_")
+}
+
+// The class of operation q (an index in AUDIT_OPS).
+fn op_class(q: i64) -> i64 {
+    let kind = AUDIT_OPS.get(q + 1);
+    let f = AUDIT_OPS.get(q + 2);
+    let held = AUDIT_OPS.get(q + 3) != 0;
+    if kind == U_C_CALL {
+        if f < 0 {
+            return C_FFI;
+        }
+        let s = last_name(fn_name(f));
+        return if is_alloc_name(s) { C_ALLOC } else if is_intrinsic(f, s) { C_INTRINSIC }
+            else { C_FFI };
+    }
+    if kind == U_UNSAFE_CALL {
+        let s = last_name(fn_name(f));
+        return if is_alloc_name(s) { C_ALLOC } else if is_intrinsic(f, s) { C_INTRINSIC }
+            else if is_cast_name(s) { C_CAST } else if takes_raw_pointer(f) { C_RAW }
+            else { C_OTHER };
+    }
+    if kind == U_INT_PTR || kind == U_FN_VALUE {
+        return C_CAST;
+    }
+    if kind == U_UNION {
+        return C_OTHER;
+    }
+    if held { C_STATIC } else { C_RAW }
+}
+
+// Operation q as listed: `index`, `static-index`, `c-call(malloc)`...
+fn put_op(out: i64, q: i64) {
+    let kind = AUDIT_OPS.get(q + 1);
+    let f = AUDIT_OPS.get(q + 2);
+    if kind == U_C_CALL || kind == U_UNSAFE_CALL {
+        buf_bytes(out, if kind == U_C_CALL { "c-call(" } else { "unsafe-call(" });
+        buf_bytes(out, if f >= 0 { fn_name(f) } else { "fn pointer" });
+        buf_byte(out, ')');
+        return;
+    }
+    if AUDIT_OPS.get(q + 3) != 0 {
+        buf_bytes(out, "static-");
+    }
+    buf_bytes(out, if kind == U_DEREF { "deref" } else if kind == U_FIELD { "field" }
+        else if kind == U_METHOD { "method" } else if kind == U_INDEX { "index" }
+        else if kind == U_SLICE { "slice" } else if kind == U_INT_PTR { "int-to-ptr" }
+        else if kind == U_UNION { "union-field" } else if kind == U_FN_VALUE { "fn-value" }
+        else { "other" });
+}
+
+// Whether two operations are listed the same.
+fn same_op(a: i64, b: i64) -> bool {
+    AUDIT_OPS.get(a + 1) == AUDIT_OPS.get(b + 1) && AUDIT_OPS.get(a + 2) == AUDIT_OPS.get(b + 2)
+        && AUDIT_OPS.get(a + 3) == AUDIT_OPS.get(b + 3)
+}
+
+// What the answer is about: the sites wanted, their operations.
+struct Audit {
+    // the sites wanted (S_* indices)
+    sites: IntVec,
+    // per site (by S_* index): its first operation in `ops`, and the end
+    first: IntVec,
+    last: IntVec,
+    // the operations, grouped by site
+    ops: IntVec,
+    // per site: its class, whether checked
+    class: IntVec,
+    checked: IntVec,
+}
+
+// Whether the site s is one the arguments want: every one when there is
+// none; else the sites of a FILE (or under a DIR) named, std's for `std`.
+fn wanted(s: i64, args: IntVec) -> bool {
+    if OPT_UNJUSTIFIED && S_JUST.get(s) == J_BOTH {
+        return false;
+    }
+    if args.count == 0 {
+        return true;
+    }
+    let path = buf_slice(S_PATH.get(s));
+    for k in 0..args.count {
+        var a = arg_text(args, k);
+        while a.len > 2 && a[0] == '.' && a[1] == '/' {
+            a = a[2..a.len];
+        }
+        while a.len > 1 && a[a.len - 1] == '/' {
+            a = a[0..a.len - 1];
+        }
+        if a == "std" && is_std_file(S_FILE.get(s)) {
+            return true;
+        }
+        if path == a || (path.len > a.len && path[0..a.len] == a && path[a.len] == '/') {
+            return true;
+        }
+    }
+    false
+}
+
+fn audit(args: IntVec) -> Audit {
+    var a = Audit {
+        sites: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        first: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        last: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        ops: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        class: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        checked: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+    };
+    var std = !OPT_NO_STD;
+    for k in 0..args.count {
+        if arg_text(args, k) == "std" {
+            std = true;
+        }
+    }
+    find_all_sites(std);
+    let n = S_POS.count;
+    // each operation's site: the innermost holding it
+    var ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    distinct_ops(&ops);
+    var site_of = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var counts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for _ in 0..n {
+        counts.push(0);
+    }
+    for k in 0..ops.count {
+        let pos = AUDIT_OPS.get(ops.get(k));
+        // the last site starting at or before pos, then back to one
+        // holding it
+        var lo = 0;
+        var hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if S_POS.get(mid) <= pos { lo = mid + 1; } else { hi = mid; }
+        }
+        var s = lo - 1;
+        var steps = 0;
+        while s >= 0 && S_END.get(s) <= pos && steps < 256 {
+            s -= 1;
+            steps += 1;
+        }
+        if s >= 0 && S_END.get(s) <= pos {
+            s = -1;
+        }
+        site_of.push(s);
+        if s >= 0 {
+            counts.set(s, counts.get(s) + 1);
+        }
+    }
+    var at = 0;
+    for s in 0..n {
+        a.first.push(at);
+        a.last.push(at);
+        at += counts.get(s);
+    }
+    for _ in 0..at {
+        a.ops.push(0);
+    }
+    for k in 0..ops.count {
+        let s = site_of.get(k);
+        if s >= 0 {
+            a.ops.set(a.last.get(s), ops.get(k));
+            a.last.set(s, a.last.get(s) + 1);
+        }
+    }
+    // checked: the positions the checker marked
+    var marked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for p in (&AUDIT_CHECKED).items() {
+        marked.push(p);
+    }
+    sort_values(&marked);
+    for s in 0..n {
+        var c = C_OTHER;
+        if S_KIND.get(s) == S_EXTERN {
+            c = C_FFI;
+        }
+        for k in a.first.get(s)..a.last.get(s) {
+            let oc = op_class(a.ops.get(k));
+            if oc < c {
+                c = oc;
+            }
+        }
+        a.class.push(c);
+        let p = S_CHECK_AT.get(s);
+        a.checked.push(if S_KIND.get(s) == S_EXTERN || (p >= 0 && has_value(marked, p)) { 1 }
+            else { 0 });
+        if wanted(s, args) {
+            a.sites.push(s);
+        }
+    }
+    a
+}
+
+fn sort_values(v: inout IntVec) {
+    sort_ops(&v, false);
+}
+
+fn has_value(v: IntVec, x: i64) -> bool {
+    var lo = 0;
+    var hi = v.count;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if v.get(mid) < x { lo = mid + 1; } else { hi = mid; }
+    }
+    lo < v.count && v.get(lo) == x
+}
+
+// The item a site is in: the function (an `unsafe fn`: itself), else the
+// module (an extern block: `MODULE::extern`).
+fn put_item(out: i64, s: i64) {
+    let kind = S_KIND.get(s);
+    let at = if kind == S_FN && S_CHECK_AT.get(s) >= 0 { S_CHECK_AT.get(s) } else { S_POS.get(s) };
+    if kind != S_EXTERN {
+        let d = enclosing(at);
+        if d >= 0 {
+            buf_bytes(out, def_path(d));
+            return;
+        }
+    }
+    buf_bytes(out, mod_fqn_text(module_at(at)));
+    if kind == S_EXTERN {
+        buf_bytes(out, "::extern");
+    }
+}
+
+// Whether site s is an unsafe block the checker read with nothing unsafe
+// inside.
+fn is_unneeded(a: Audit, s: i64) -> bool {
+    S_KIND.get(s) == S_BLOCK && a.checked.get(s) != 0 && a.first.get(s) == a.last.get(s)
+}
+
+fn just_text(bits: i64) -> [u8] {
+    if bits == J_BOTH { "justified" } else if bits == J_UNSAFE { "missing SAFETY:" }
+    else if bits == J_SAFETY { "missing UNSAFE:" } else { "missing both" }
+}
+
+// The operations of site s, as listed: each with ` xN` past one.
+fn put_ops(out: i64, a: Audit, s: i64) {
+    if S_KIND.get(s) == S_EXTERN {
+        buf_int(out, S_EXTERNS.get(s));
+        buf_bytes(out, if S_EXTERNS.get(s) == 1 { " C function" } else { " C functions" });
+        return;
+    }
+    let from = a.first.get(s);
+    let to = a.last.get(s);
+    if from == to {
+        buf_bytes(out, if is_unneeded(a, s) { "none (unneeded)" }
+            else if a.checked.get(s) != 0 { "none" } else { "not checked" });
+        return;
+    }
+    var done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var listed = 0;
+    for k in from..to {
+        let q = a.ops.get(k);
+        var seen = false;
+        for d in (&done).items() {
+            if same_op(d, q) {
+                seen = true;
+            }
+        }
+        if seen {
+            continue;
+        }
+        done.push(q);
+        var times = 0;
+        for k2 in k..to {
+            if same_op(a.ops.get(k2), q) {
+                times += 1;
+            }
+        }
+        if listed > 0 {
+            buf_bytes(out, ", ");
+        }
+        put_op(out, q);
+        if times > 1 {
+            buf_bytes(out, " x");
+            buf_int(out, times);
+        }
+        listed += 1;
+    }
+}
+
+fn put_line(out: i64, a: Audit, s: i64) {
+    buf_bytes(out, buf_slice(S_PATH.get(s)));
+    buf_byte(out, ':');
+    buf_int(out, S_LINE.get(s));
+    buf_byte(out, '\t');
+    buf_bytes(out, kind_name(S_KIND.get(s)));
+    buf_byte(out, '\t');
+    put_item(out, s);
+    buf_byte(out, '\t');
+    buf_bytes(out, class_name(a.class.get(s)));
+    buf_byte(out, '\t');
+    buf_bytes(out, just_text(S_JUST.get(s)));
+    buf_byte(out, '\t');
+    put_ops(out, a, s);
+    buf_byte(out, '\n');
+}
+
+fn put_json(out: i64, a: Audit, s: i64) {
+    let bits = S_JUST.get(s);
+    buf_bytes(out, "{\"file\":");
+    buf_json_str(out, buf_slice(S_PATH.get(s)));
+    buf_bytes(out, ",\"line\":");
+    buf_int(out, S_LINE.get(s));
+    buf_bytes(out, ",\"kind\":");
+    buf_json_str(out, kind_name(S_KIND.get(s)));
+    let item = buf_new();
+    put_item(item, s);
+    buf_bytes(out, ",\"item\":");
+    buf_json_str(out, buf_slice(item));
+    buf_bytes(out, ",\"class\":");
+    buf_json_str(out, class_name(a.class.get(s)));
+    buf_bytes(out, ",\"unsafe_comment\":");
+    buf_bytes(out, if (bits & J_UNSAFE) != 0 { "true" } else { "false" });
+    buf_bytes(out, ",\"safety_comment\":");
+    buf_bytes(out, if (bits & J_SAFETY) != 0 { "true" } else { "false" });
+    buf_bytes(out, ",\"justified\":");
+    buf_bytes(out, if bits == J_BOTH { "true" } else { "false" });
+    buf_bytes(out, ",\"checked\":");
+    buf_bytes(out, if a.checked.get(s) != 0 { "true" } else { "false" });
+    let ops = buf_new();
+    put_ops(ops, a, s);
+    buf_bytes(out, ",\"ops\":");
+    buf_json_str(out, buf_slice(ops));
+    buf_bytes(out, "}\n");
+}
+
+// The top-level module of site s: `crate::front`, `std::collections`.
+fn top_module(s: i64) -> [u8] {
+    let path = mod_fqn_text(module_at(S_POS.get(s)));
+    var seps = 0;
+    for x in 0..path.len {
+        if path[x] == ':' && x + 1 < path.len && path[x + 1] == ':' {
+            seps += 1;
+            if seps == 2 {
+                return path[0..x];
+            }
+        }
+    }
+    path
+}
+
+// Counts by key: keys (C strings or symbol texts kept as buffers) with
+// their sites and unjustified sites.
+struct Tally {
+    keys: IntVec,
+    sites: IntVec,
+    bad: IntVec,
+}
+
+fn tally_new() -> Tally {
+    Tally {
+        keys: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        sites: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        bad: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+    }
+}
+
+fn tally_add(t: inout Tally, key: [u8], bad: bool) {
+    for k in 0..t.keys.count {
+        if buf_slice(t.keys.get(k)) == key {
+            t.sites.set(k, t.sites.get(k) + 1);
+            if bad {
+                t.bad.set(k, t.bad.get(k) + 1);
+            }
+            return;
+        }
+    }
+    let b = buf_new();
+    buf_bytes(b, key);
+    t.keys.push(b);
+    t.sites.push(1);
+    t.bad.push(if bad { 1 } else { 0 });
+}
+
+// The rows of t, most sites first (at most `limit`; -1: all).
+fn put_tally(out: i64, t: Tally, limit: i64) {
+    var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for k in 0..t.keys.count {
+        order.push(k);
+    }
+    for i in 1..order.count {
+        let x = order.get(i);
+        var j = i;
+        while j > 0 && (t.sites.get(order.get(j - 1)) < t.sites.get(x)
+            || (t.sites.get(order.get(j - 1)) == t.sites.get(x)
+                && buf_slice(t.keys.get(order.get(j - 1))) > buf_slice(t.keys.get(x)))) {
+            order.set(j, order.get(j - 1));
+            j -= 1;
+        }
+        order.set(j, x);
+    }
+    let n = if limit >= 0 && limit < order.count { limit } else { order.count };
+    for i in 0..n {
+        let k = order.get(i);
+        buf_bytes(out, buf_slice(t.keys.get(k)));
+        buf_byte(out, '\t');
+        buf_int(out, t.sites.get(k));
+        buf_byte(out, '\t');
+        buf_int(out, t.bad.get(k));
+        buf_byte(out, '\n');
+    }
+    if n < order.count {
+        buf_bytes(out, "(");
+        buf_int(out, order.count - n);
+        buf_bytes(out, " more; --all lists every one)\n");
+    }
+}
+
+// `sites: N (B blocks, F unsafe fns, E extern blocks); unjustified: U;
+// unneeded: K` (K: unsafe blocks with nothing unsafe inside)
+fn put_total(out: i64, a: Audit) {
+    var by_kind = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for _ in 0..3 {
+        by_kind.push(0);
+    }
+    var bad = 0;
+    var unneeded = 0;
+    for i in 0..a.sites.count {
+        let s = a.sites.get(i);
+        by_kind.set(S_KIND.get(s), by_kind.get(S_KIND.get(s)) + 1);
+        if S_JUST.get(s) != J_BOTH {
+            bad += 1;
+        }
+        if is_unneeded(a, s) {
+            unneeded += 1;
+        }
+    }
+    buf_bytes(out, "sites: ");
+    buf_int(out, a.sites.count);
+    buf_bytes(out, " (");
+    buf_int(out, by_kind.get(S_BLOCK));
+    buf_bytes(out, " blocks, ");
+    buf_int(out, by_kind.get(S_FN));
+    buf_bytes(out, " unsafe fns, ");
+    buf_int(out, by_kind.get(S_EXTERN));
+    buf_bytes(out, " extern blocks); unjustified: ");
+    buf_int(out, bad);
+    buf_bytes(out, "; unneeded: ");
+    buf_int(out, unneeded);
+    buf_byte(out, '\n');
+}
+
+fn put_summary(out: i64, a: Audit) {
+    put_total(out, a);
+    var classes = tally_new();
+    var modules = tally_new();
+    var files = tally_new();
+    var states = tally_new();
+    for i in 0..a.sites.count {
+        let s = a.sites.get(i);
+        let bad = S_JUST.get(s) != J_BOTH;
+        tally_add(&classes, class_name(a.class.get(s)), bad);
+        tally_add(&modules, top_module(s), bad);
+        tally_add(&files, buf_slice(S_PATH.get(s)), bad);
+        tally_add(&states, just_text(S_JUST.get(s)), bad);
+    }
+    buf_bytes(out, "\nclass\tsites\tunjustified\n");
+    put_tally(out, classes, -1);
+    buf_bytes(out, "\nmodule\tsites\tunjustified\n");
+    put_tally(out, modules, -1);
+    buf_bytes(out, "\nfile\tsites\tunjustified\n");
+    put_tally(out, files, if OPT_ALL { -1 } else { 20 });
+    buf_bytes(out, "\njustification\tsites\tunjustified\n");
+    put_tally(out, states, -1);
+}
+
+// `volec query unsafe [FILE...|std]`: the program's unsafe sites (read by
+// run_query_inner with AUDIT_UNSAFE set).
+pub fn query_unsafe(args: IntVec) -> i64 {
+    let a = audit(args);
+    let out = buf_new();
+    if OPT_SUMMARY {
+        put_summary(out, a);
+    } else if DIAG_JSON {
+        // (all of it: a tool reads it)
+        OPT_ALL = true;
+        for i in 0..a.sites.count {
+            let s = a.sites.get(i);
+            put_json(out, a, s);
+        }
+    } else {
+        for i in 0..a.sites.count {
+            let s = a.sites.get(i);
+            put_line(out, a, s);
+        }
+        put_total(out, a);
+    }
+    buf_write_fd(out, STDOUT);
+    0
+}

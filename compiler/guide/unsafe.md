@@ -102,6 +102,18 @@ defined:
 
 - `volec fix --only unsafe` puts each unsafe operation outside unsafe
   code into an `unsafe { }` block (the statement around it).
+- Each unsafe site says why, in the comments right above it (the
+  statement's or item's, no blank line between): `// UNSAFE:` why it
+  cannot be safe, `// SAFETY:` why it is sound. `volec check` warns
+  about a site without both (`unsafe.unjustified`; an error with
+  `--deny-warnings`). (0.25.3)
+- `volec query unsafe [FILE...|std]` (0.25.3) lists every unsafe block,
+  `unsafe fn` and extern block: `FILE:LINE`, kind, item, class (`ffi`,
+  `alloc`, `intrinsic`, `transmute/cast`, `raw-pointer`, `static-mut`:
+  through a pointer held in a static, `other`), its comments, and the
+  operations inside that need unsafe; `none (unneeded)`: a block with
+  nothing unsafe inside, to remove. `--unjustified`, `--summary`
+  (counts by class, module, file), `--json`, `--no-std`.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access

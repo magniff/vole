@@ -929,13 +929,14 @@ case $(want gpu) in
         "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT >"$WORK/gpu.out" 2>&1 & ;;
 esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
-# skipped without python3): category "hooks".
+# skipped without python3): category "hooks"; (0.25.3) and the commit
+# hook's (tools/git-hooks/test-*.py).
 case $(want hooks) in
     y)
         if command -v python3 >/dev/null 2>&1; then
             # (0.25.2.1) the compiler under test, not target/volec, for the
             # cases that run a real one
-            for t in "$ROOT"/tools/agent-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
+            for t in "$ROOT"/tools/agent-hooks/test-*.py "$ROOT"/tools/git-hooks/test-*.py; do VOLE_TEST_COMPILER="$COMPILER" python3 -I "$t"; done >"$WORK/hooks.out" 2>&1 &
         else
             : >"$WORK/hooks.out"
         fi ;;

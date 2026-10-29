@@ -46,7 +46,10 @@ $ query diff
 -    k * abs(a) as i64
 +    unsafe { k * abs(a) as i64 }
 $ check
-ok: 0 errors in main.vl
+main.vl:4:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+main.vl:10:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+main.vl:21:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+ok: 0 errors, 3 warnings in main.vl
 $ edit patch one --show < $T/inputs/show_add.patch
 patched crate::one	main.vl	+2 -1 lines
 // main.vl:21-22
