@@ -86,6 +86,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   checker keeps such a declared cast (a `[u8]` viewed as `[f32]`)
   past its type filter, which had dropped it: `f32s(r.map_read(dev))`
   viewed nothing, so `r` could be unmapped, or a Vec grown, under it.
+  Inference carries the cast on: a function of the program's own that
+  returns it (through locals, calls, structs, other such functions) is
+  inferred to view its parameter, with no `#[views]`.
 
 ### What's new in 0.25.2.2
 
