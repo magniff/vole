@@ -127,6 +127,10 @@ error[link.no-input] cannot read 'nothere.o', an input of the link | help: the o
 % VOLE_CC=vole-tty253-no-cc "$COMPILER" main.vl -o prog
 error[link.no-linker] cannot run 'vole-tty253-no-cc', the C compiler that links the program | help: $VOLE_CC names it: set it to a C compiler, or unset it
 [exit 1]
+## Any other failure: the linker's lines under one error.
+% VOLE_CC=./fakecc "$COMPILER" main.vl -o prog
+error[link.failed] the link failed (./fakecc exited with status 3) | help: the linker's text follows (--verbose: its command too) | linker: fakecc: the weather is wrong for linking | linker: fakecc: try again tomorrow
+[exit 1]
 ## --verbose adds the link's command and the linker's whole text.
 % "$COMPILER" --verbose undef.vl -o undef 2>&1 | grep -c '^note: the link: '
 1

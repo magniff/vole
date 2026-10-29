@@ -19,6 +19,7 @@
 #               link (macOS: the executable loads them; Linux leaves a
 #               framework out), a hello world links nothing more, and an
 #               unknown key is an error
+#   no-framework (macOS) a framework the SDK lacks: link.no-framework
 # and, on aarch64 macOS, the compiler's own linker (--linker=internal,
 # back::objfile::link_macho):
 #   internal    the executable runs, its signature verifies, and the same
@@ -197,6 +198,19 @@ elif build badkey.vl -o prog || ! grep -q "unknown key 'library' in #\[link\]" b
     fail declared "an unknown key: $(cat build.out)"
 else
     pass declared
+fi
+
+# no-framework: (0.25.3, macOS) a framework the SDK lacks is
+# link.no-framework, not ld's text
+if [ "$(uname -s)" = Darwin ]; then
+    if build hello.vl -framework VoleNoSuchFramework -o prog; then
+        fail no-framework "linked with a framework that is not there"
+    elif ! grep -q "^error\[link.no-framework\] framework 'VoleNoSuchFramework' not found | help: -framework VoleNoSuchFramework on the command line names it" build.out \
+        || grep -q -e '^ld: ' -e 'clang: error' build.out; then
+        fail no-framework "not one link.no-framework error: $(cat build.out)"
+    else
+        pass no-framework
+    fi
 fi
 
 if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
