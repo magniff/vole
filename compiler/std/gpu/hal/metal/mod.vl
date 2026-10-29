@@ -21,7 +21,7 @@
 
 pub mod bindings;
 
-use std::gpu::hal::{Api, Caps, RawSurface, Render};
+use std::gpu::hal::{Api, Caps, MAPPED_READ, MAPPED_WRITE, RawSurface, Render};
 use std::gpu::shader::{Binding, EntryPoint, ShaderKind, ShaderSource};
 use std::gpu::types::{
     AddressMode, BlendFactor, BlendOp, Color, Compare, Cull, Filter, Format, FrontFace, IndexFormat,
@@ -74,10 +74,32 @@ pub struct Queue {
     pub last: Id<MTLCommandBuffer>,
 }
 
+/// A buffer: its MTLBuffer, the contents pointer and the size asked for.
+/// The MTLBuffer holds STATE_BYTES more, past the buffer's own bytes: its
+/// map state (0.25.3, `map_state`), which every handle of it sees.
 pub struct Buffer {
     pub raw: Id<MTLBuffer>,
     pub ptr: *u8,
     pub size: i64,
+}
+
+// (0.25.3) The bytes create_buffer adds past a buffer's own for its map
+// state (one byte used): the state is the native buffer's, so a handle
+// kept by recorded commands (buffer_handle) sees a map_read made after
+// the commands were recorded.
+const STATE_BYTES: i64 = 4;
+
+// Where a buffer of `size` bytes keeps its map state: past its bytes (a
+// buffer is at least 4 bytes, create_buffer's n).
+fn state_offset(size: i64) -> i64 {
+    if size < 4 { 4 } else { size }
+}
+
+fn set_map_state(b: inout Buffer, state: i64) {
+    let at = state_offset(b.size);
+    // UNSAFE: the state is in the MTLBuffer's own shared memory, which only its contents pointer reaches (Metal has no field to keep it in, and a table beside the buffers would outlive the ones dropped while mapped)
+    // SAFETY: create_buffer made the MTLBuffer state_offset(size) + STATE_BYTES bytes long, b.ptr is its contents and b.raw keeps it alive, so b.ptr[at] is in it; one byte, no alignment; the GPU never writes there (std::gpu's contracts keep copies and bindings below size)
+    unsafe { b.ptr[at] = state as u8; }
 }
 
 pub struct Texture {
@@ -484,7 +506,8 @@ impl Api for Metal {
     }
 
     fn adapter_max_buffer_size(a: Adapter) -> i64 {
-        let n = a.dev.r().max_buffer_length();
+        // (less the bytes of the map state, create_buffer's STATE_BYTES)
+        let n = a.dev.r().max_buffer_length() - STATE_BYTES as u64;
         if n > 9223372036854775807u64 { 9223372036854775807 } else { n as i64 }
     }
 
@@ -522,7 +545,8 @@ impl Api for Metal {
     }
 
     fn create_buffer(d: Device, size: i64, init: [u8]) -> Option<Buffer> {
-        let n = if size < 4 { 4 } else { size };
+        // the buffer's bytes, then its map state (STATE_BYTES)
+        let n = state_offset(size) + STATE_BYTES;
         match d.dev
             .r()
             .new_buffer_with_length_options(n as u64, bindings::MTLResourceStorageModeShared) {
@@ -533,25 +557,41 @@ impl Api for Metal {
                     // init.len() <= size is the caller's contract
                     unsafe { memcpy(p, init.ptr, init.len() as u64); }
                 }
-                Some(Buffer { raw: b, ptr: p, size: size })
+                var out = Buffer { raw: b, ptr: p, size: size };
+                set_map_state(&out, 0);
+                Some(out)
             }
             None => None,
         }
     }
 
+    fn buffer_handle(b: Buffer) -> Buffer {
+        Buffer { raw: b.raw.clone(), ptr: b.ptr, size: b.size }
+    }
+
+    fn map_state(b: Buffer) -> i64 {
+        // UNSAFE: the state is in the MTLBuffer's own memory (set_map_state's reason)
+        // SAFETY: as set_map_state: b.ptr[state_offset(size)] is inside the MTLBuffer that b.raw keeps alive, a byte the GPU never writes
+        unsafe { b.ptr[state_offset(b.size)] as i64 }
+    }
+
     #[views(b)]
     fn map_read(d: Device, b: inout Buffer) -> [u8] {
+        set_map_state(&b, MAPPED_READ);
         // shared memory: contents is valid for size bytes while b lives
         unsafe { b.ptr[0..b.size] }
     }
 
     #[views(b)]
     fn map_write(d: Device, b: inout Buffer) -> inout [u8] {
+        set_map_state(&b, MAPPED_WRITE);
         // as map_read
         unsafe { &b.ptr[0..b.size] }
     }
 
-    fn unmap(d: Device, b: inout Buffer) {}
+    fn unmap(d: Device, b: inout Buffer) {
+        set_map_state(&b, 0);
+    }
 
     fn create_texture(d: Device, desc: TextureDesc) -> Option<Texture> {
         let td = MTLTextureDescriptor::new();
