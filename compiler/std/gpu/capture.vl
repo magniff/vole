@@ -1,0 +1,110 @@
+// std::gpu::capture (0.25.4): the next frame presented, written to a
+// file. A test of a windowed program asks for it (std::window's scripted
+// event loop, its `shot FILE` command), and so can a program that wants a
+// screenshot of itself: `gpu::capture_next_frame("shot.ppm")`, then the
+// next `frame.present(&queue)` of any surface also writes that frame, with
+// everything submitted before it, as a binary PPM (P6, RGB). The request
+// itself is std::capture's (std::window makes it).
+
+use std::fs;
+use std::gpu::{Format, Queue, Texture};
+use std::gpu::hal::metal as backend;
+
+type N = backend::Metal;
+
+/// What a frame needs to be captured: its surface's device.
+pub struct Capture {
+    pub dev: backend::Device,
+    pub gpa: Gpa,
+}
+
+// Writes tex (a frame's texture, after the work submitted to queue) to
+// the file asked for, and forgets the request. Stderr says why when it
+// cannot.
+pub fn write(cap: Capture, queue: inout Queue, tex: Texture) {
+    var path: Buf = Buf::new_in(cap.gpa);
+    if !std::capture::take_capture(&path) {
+        return;
+    }
+    let w = tex.desc.width;
+    let h = tex.desc.height;
+    let format = tex.desc.format;
+    let half = format == Format::Rgba16Float;
+    if !half && format != Format::Bgra8Unorm && format != Format::Bgra8UnormSrgb {
+        eprintln(
+            f"gpu.capture: a frame of this format is not captured; {path.as_slice()} is not written | help: configure the surface with Format::Bgra8Unorm");
+        return;
+    }
+    let texel = format.size();
+    let stride = (w * texel + 255) / 256 * 256;
+    var buf = match N::create_buffer(cap.dev, stride * h, "") {
+        Some(b) => b,
+        None => {
+            eprintln(
+                f"gpu.capture: no memory for a {w} x {h} frame; {path.as_slice()} is not written");
+            return;
+        }
+    };
+    var cb = N::begin(cap.dev);
+    N::copy_texture_to_buffer(&cb, tex.raw, 0, 0, 0, w, h, buf, 0, stride);
+    N::submit(&queue.raw, &cb);
+    if !N::queue_wait_idle(&queue.raw) {
+        eprintln(
+            f"gpu.capture: the frame's work failed on the GPU; {path.as_slice()} is not written");
+        return;
+    }
+    let px = N::map_read(cap.dev, &buf);
+    var ppm: Buf = Buf::with_capacity_in(w * h * 3 + 32, cap.gpa);
+    ppm.push_fmt(f"P6\n{w} {h}\n255\n");
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * stride + x * texel;
+            if half {
+                ppm.push(unorm8(half_bits(px[p], px[p + 1])));
+                ppm.push(unorm8(half_bits(px[p + 2], px[p + 3])));
+                ppm.push(unorm8(half_bits(px[p + 4], px[p + 5])));
+            } else {
+                ppm.push(px[p + 2]);
+                ppm.push(px[p + 1]);
+                ppm.push(px[p]);
+            }
+        }
+    }
+    N::unmap(cap.dev, &buf);
+    match fs::write(path.as_slice(), ppm.as_slice()) {
+        Ok(_) => {}
+        Err(e) => eprintln(f"gpu.capture: {path.as_slice()} could not be written: {e}"),
+    }
+}
+
+// A little-endian binary16, as an f64.
+fn half_bits(lo: u8, hi: u8) -> f64 {
+    let bits = (hi as u32) << 8 | lo as u32;
+    let sign = if (bits & 0x8000) != 0 { -1.0 } else { 1.0 };
+    let e = ((bits >> 10) & 0x1F) as i64;
+    let m = (bits & 0x3FF) as f64;
+    if e == 0 {
+        return sign * m / 1024.0 / 16384.0;
+    }
+    if e == 31 {
+        return sign * 65504.0;
+    }
+    var v = 1.0 + m / 1024.0;
+    var k = e - 15;
+    while k > 0 {
+        v = v * 2.0;
+        k -= 1;
+    }
+    while k < 0 {
+        v = v / 2.0;
+        k += 1;
+    }
+    sign * v
+}
+
+// 0..1 to 0..255, clamped and rounded.
+fn unorm8(v: f64) -> u8 {
+    if v <= 0.0 { return 0; }
+    if v >= 1.0 { return 255; }
+    (v * 255.0 + 0.5) as u8
+}

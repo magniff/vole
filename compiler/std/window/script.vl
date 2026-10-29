@@ -1,0 +1,648 @@
+// std::window::script (0.25.4): the scripted event loop, for testing a
+// windowed program without a display. When the environment has
+// VOLE_WINDOW_SCRIPT, `App::new_in` opens no window server: the events
+// come from the script, in order, each Frame as soon as the program asks
+// for it, and a window's `raw_surface()` is null, which std::gpu takes
+// for `RawSurface::Headless` (frames offscreen, at the scripted size).
+// The program runs its own event loop, unchanged.
+//
+// The script is VOLE_WINDOW_SCRIPT's value, or the file it names after
+// an `@`; commands are separated by newlines or `;`, `#` starts a
+// comment. Coordinates are physical pixels from the content's top-left.
+//
+//   size 640x480 [2]           the window's size (and scale; default: the
+//                              WindowDesc's, scale 1), before any event
+//   frames N                   up to N Event::Frame, one for each
+//                              request_frame (none asked for: none sent)
+//   key K | keydown K | keyup K
+//                              a key: a character (`a`, `+`, `A` is
+//                              shift+a) or a name (space enter tab
+//                              backspace escape delete insert home end
+//                              pageup pagedown left right up down f1..f20),
+//                              after modifiers (shift+ ctrl+ alt+ cmd+);
+//                              `key` is a press and a release, and a
+//                              printable press is followed by its Text
+//   move X Y                   the pointer moves
+//   press [B] X Y | release [B] X Y | click [B] X Y
+//                              B is left (the default), right or middle;
+//                              a trailing shift, ctrl, alt or cmd holds it
+//   scroll DY [DX]             a wheel, in lines (positive: up)
+//   resize WxH                 Event::Resize to that size
+//   focus on|off               Event::Focus
+//   shot FILE.ppm              the next frame presented (std::gpu) is also
+//                              written to FILE, a PPM
+//   close | quit               Event::Close, Event::Quit
+//
+// When the script ends the program gets Close for each open window, then
+// Quit; a program that still waits for an event after that is stopped
+// (exit 1) with a line saying so.
+
+use std::window::{Button, Event, Key, Mouse, MouseAction, Scroll, Size, Text, WindowId};
+use std::window::keys::{ALT_L, CTRL_L, KeyCode, Logical, Mods, Named, SHIFT_L, SUPER_L};
+
+// What a Window reaches without its App (plain values; the main thread's).
+static var ON: bool = false;
+static var WIDTH: i64 = 0;
+static var HEIGHT: i64 = 0;
+static var SCALE: f64 = 1.0;
+// Bit n: window n asked for a frame (ids 1..63).
+static var REQUESTS: u64 = 0;
+// Bit n: window n was closed.
+static var CLOSED: u64 = 0;
+static var FULLSCREEN: bool = false;
+static var FOCUSED: bool = true;
+
+/// True when this process runs a scripted event loop (VOLE_WINDOW_SCRIPT).
+pub fn active() -> bool {
+    ON
+}
+
+pub fn request_frame(id: WindowId) {
+    if id.n >= 0 && id.n < 64 {
+        REQUESTS = REQUESTS | (1u64 << id.n as u64);
+    }
+}
+
+/// The window was closed (or dropped): no event names it again.
+pub fn closed(id: WindowId) {
+    if id.n >= 0 && id.n < 64 {
+        CLOSED = CLOSED | (1u64 << id.n as u64);
+        REQUESTS = REQUESTS & ~(1u64 << id.n as u64);
+    }
+}
+
+fn open(n: i64) -> bool {
+    n >= 0 && n < 64 && (CLOSED & (1u64 << n as u64)) == 0
+}
+
+pub fn size() -> Size {
+    Size { w: WIDTH, h: HEIGHT, scale: SCALE }
+}
+
+pub fn set_fullscreen(on: bool) {
+    FULLSCREEN = on;
+}
+
+pub fn is_fullscreen() -> bool {
+    FULLSCREEN
+}
+
+pub fn focused() -> bool {
+    FOCUSED
+}
+
+enum Step {
+    Size(i64, i64, f64),
+    Frames(i64),
+    Key(KeyCode, Logical, Mods, bool, u32),
+    Mouse(MouseAction, Button, f64, f64, Mods),
+    Scroll(f64, f64),
+    Resize(i64, i64),
+    Focus(bool),
+    Shot(Buf),
+    Close,
+    Quit,
+}
+
+/// The scripted backend: the parsed script and where it is.
+pub struct Script {
+    steps: Vec<Step>,
+    at: i64,
+    q: Vec<Event>,
+    head: i64,
+    frames: i64,
+    wins: Vec<i64>,
+    // 0: the script runs; 1: Close sent; 2: Quit sent
+    ended: i64,
+    sized: bool,
+}
+
+impl Script {
+    /// The script of VOLE_WINDOW_SCRIPT, if the variable is set; a script
+    /// that does not parse stops the program (exit 2) with its line.
+    pub fn from_env(gpa: Gpa) -> Option<Script> {
+        let raw = match std::env::var_os_in("VOLE_WINDOW_SCRIPT", gpa) {
+            Some(v) => v,
+            None => return None,
+        };
+        var text: Vec<u8> = Vec::new_in(gpa);
+        if raw.len() > 0 && raw[0] == '@' {
+            match std::fs::read_in(raw.as_slice()[1..raw.len()], gpa) {
+                Ok(bytes) => text.extend_from_slice(bytes.as_slice()),
+                Err(_) => {
+                    let name = raw.as_slice()[1..raw.len()];
+                    fail(0, f"cannot read the script file '{name}'",
+                        "VOLE_WINDOW_SCRIPT=@FILE names a file, relative to the program's directory");
+                }
+            }
+        } else {
+            text.extend_from_slice(raw.as_slice());
+        }
+        let s = match str::from_utf8(text.as_slice()) {
+            Ok(s) => s,
+            Err(_) => fail(0, "the script is not UTF-8", "write it in UTF-8"),
+        };
+        var steps: Vec<Step> = Vec::new_in(gpa);
+        var line: i64 = 0;
+        for l in s.lines() {
+            line += 1;
+            let code = match l.split_once('#') {
+                Some((before, _)) => before,
+                None => l,
+            };
+            for cmd in code.split(';') {
+                let c = cmd.trim();
+                if c.len() > 0 {
+                    steps.push(parse(c, line, gpa));
+                }
+            }
+        }
+        ON = true;
+        WIDTH = 0;
+        HEIGHT = 0;
+        SCALE = 1.0;
+        REQUESTS = 0;
+        CLOSED = 0;
+        Some(Script {
+            steps: steps, at: 0, q: Vec::new_in(gpa), head: 0, frames: 0,
+            wins: Vec::new_in(gpa), ended: 0, sized: false,
+        })
+    }
+
+    /// A window: its size is the script's `size`, or desc's at scale 1.
+    pub fn open(inout self, w: i64, h: i64, id: WindowId) {
+        if !self.sized {
+            // a leading `size` sets it before the first window
+            if self.at < self.steps.len() {
+                match self.steps[self.at] {
+                    Step::Size(sw, sh, sc) => {
+                        WIDTH = sw;
+                        HEIGHT = sh;
+                        SCALE = sc;
+                        self.at += 1;
+                    }
+                    _ => {
+                        WIDTH = w;
+                        HEIGHT = h;
+                        SCALE = 1.0;
+                    }
+                }
+            } else {
+                WIDTH = w;
+                HEIGHT = h;
+                SCALE = 1.0;
+            }
+            self.sized = true;
+        }
+        self.wins.push(id.n);
+        self.q.push(Event::Resize(id, size()));
+    }
+
+    // The window events go to: the last one opened and not closed.
+    fn win(self) -> WindowId {
+        var i = self.wins.len() - 1;
+        while i >= 0 {
+            if open(self.wins[i]) {
+                return WindowId { n: self.wins[i] };
+            }
+            i -= 1;
+        }
+        WindowId { n: 0 }
+    }
+
+    // A frame for a window that asked for one, if any did.
+    fn frame(inout self) -> Option<Event> {
+        for i in 0..self.wins.len() {
+            let n = self.wins[i];
+            if open(n) && n >= 0 && n < 64 && (REQUESTS & (1u64 << n as u64)) != 0 {
+                REQUESTS = REQUESTS & ~(1u64 << n as u64);
+                return Some(Event::Frame(WindowId { n: n }));
+            }
+        }
+        None
+    }
+
+    /// The next event: the queued ones, then the script's; `ms` is
+    /// ignored (nothing waits on a clock).
+    pub fn next_event(inout self, ms: i64) -> Option<Event> {
+        if self.head < self.q.len() {
+            let e = self.q[self.head];
+            self.head += 1;
+            if self.head == self.q.len() {
+                self.q.clear();
+                self.head = 0;
+            }
+            return Some(e);
+        }
+        loop {
+            if self.frames > 0 {
+                match self.frame() {
+                    Some(e) => {
+                        self.frames -= 1;
+                        return Some(e);
+                    }
+                    // nothing asked for a frame: the program is idle
+                    None => self.frames = 0,
+                }
+            }
+            if self.at >= self.steps.len() {
+                return self.end();
+            }
+            let i = self.at;
+            self.at += 1;
+            let w = self.win();
+            match self.steps[i] {
+                Step::Size(_, _, _) => fail(0, "'size' comes first, before any other command",
+                    "move it to the start of the script"),
+                Step::Frames(n) => self.frames = n,
+                Step::Key(code, key, mods, pressed, ch) => {
+                    let text = pressed && ch != 0 && !mods.ctrl() && !mods.sup();
+                    if text {
+                        self.q.push(Event::Text(text_of(w, ch)));
+                    }
+                    return Some(Event::Key(Key {
+                        win: w, code: code, key: key, mods: mods, pressed: pressed,
+                        repeat: false, ime: false, text_follows: text,
+                    }));
+                }
+                Step::Mouse(action, button, x, y, m) => {
+                    var mods = m;
+                    if (mods.bits & CLICK) != 0 {
+                        mods = Mods { bits: mods.bits & ~CLICK };
+                        self.q.push(Event::Mouse(Mouse {
+                            win: w, action: MouseAction::Release, button: button, x: x, y: y,
+                            mods: mods, clicks: 0,
+                        }));
+                    }
+                    let clicks = match action {
+                        MouseAction::Press => 1,
+                        _ => 0,
+                    };
+                    return Some(Event::Mouse(Mouse {
+                        win: w, action: action, button: button, x: x, y: y, mods: mods,
+                        clicks: clicks,
+                    }));
+                }
+                Step::Scroll(dy, dx) => {
+                    return Some(Event::Scroll(Scroll {
+                        win: w, dx: dx, dy: dy, precise: false, mods: Mods::none(),
+                    }));
+                }
+                Step::Resize(rw, rh) => {
+                    WIDTH = rw;
+                    HEIGHT = rh;
+                    return Some(Event::Resize(w, size()));
+                }
+                Step::Focus(on) => {
+                    FOCUSED = on;
+                    return Some(Event::Focus(w, on));
+                }
+                Step::Shot(path) => {
+                    std::capture::capture_next_frame(path.as_slice());
+                }
+                Step::Close => return Some(Event::Close(w)),
+                Step::Quit => return Some(Event::Quit),
+            }
+        }
+    }
+
+    // The script is over: Close for each open window, Quit, then stop.
+    fn end(inout self) -> Option<Event> {
+        if std::capture::capture_pending() {
+            eprintln("window.script: the script ended with a 'shot' no frame was presented after: put 'frames 1' after it | help: a shot is the next frame presented (Frame::present)");
+            std::capture::capture_cancel();
+        }
+        if self.ended == 0 {
+            self.ended = 1;
+            for i in 0..self.wins.len() {
+                if open(self.wins[i]) {
+                    self.q.push(Event::Close(WindowId { n: self.wins[i] }));
+                }
+            }
+            self.q.push(Event::Quit);
+            return self.next_event(0);
+        }
+        eprintln("window.script: the script has ended and the program waits for another event (it was sent Close and Quit) | help: end the event loop on Event::Close or Event::Quit, or end the script with the key that quits");
+        std::process::exit(1)
+    }
+}
+
+fn text_of(w: WindowId, ch: u32) -> Text {
+    var t = Text { win: w, len: 0, bytes: [0u8; 30] };
+    var n: i64 = 0;
+    if ch < 0x80 {
+        t.bytes[0] = ch as u8;
+        n = 1;
+    } else if ch < 0x800 {
+        t.bytes[0] = (0xC0 | (ch >> 6)) as u8;
+        t.bytes[1] = (0x80 | (ch & 0x3F)) as u8;
+        n = 2;
+    } else if ch < 0x10000 {
+        t.bytes[0] = (0xE0 | (ch >> 12)) as u8;
+        t.bytes[1] = (0x80 | ((ch >> 6) & 0x3F)) as u8;
+        t.bytes[2] = (0x80 | (ch & 0x3F)) as u8;
+        n = 3;
+    } else {
+        t.bytes[0] = (0xF0 | (ch >> 18)) as u8;
+        t.bytes[1] = (0x80 | ((ch >> 12) & 0x3F)) as u8;
+        t.bytes[2] = (0x80 | ((ch >> 6) & 0x3F)) as u8;
+        t.bytes[3] = (0x80 | (ch & 0x3F)) as u8;
+        n = 4;
+    }
+    t.len = n as u8;
+    t
+}
+
+// Stops the program over the script: line 0 is the script as a whole.
+fn fail<T: Display>(line: i64, what: T, help: [u8]) -> ! {
+    if line > 0 {
+        eprintln(f"window.script: VOLE_WINDOW_SCRIPT line {line}: {what} | help: {help}");
+    } else {
+        eprintln(f"window.script: VOLE_WINDOW_SCRIPT: {what} | help: {help}");
+    }
+    std::process::exit(2)
+}
+
+fn num(s: str, line: i64, what: [u8]) -> f64 {
+    match s.parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => fail(line, f"'{s}' is not a number ({what})", "write a number: 120, 64.5"),
+    }
+}
+
+fn whole(s: str, line: i64, what: [u8]) -> i64 {
+    match s.parse::<i64>() {
+        Ok(v) => v,
+        Err(_) => fail(line, f"'{s}' is not a whole number ({what})", "write a whole number: 3"),
+    }
+}
+
+fn dims(s: str, line: i64) -> (i64, i64) {
+    match s.split_once('x') {
+        Some((a, b)) => {
+            let w = whole(a, line, "a width");
+            let h = whole(b, line, "a height");
+            if w < 1 || h < 1 {
+                fail(line, f"'{s}' is not a size", "write WxH, at least 1x1: 640x480");
+            }
+            (w, h)
+        }
+        None => fail(line, f"'{s}' is not a size", "write WxH: 640x480"),
+    }
+}
+
+fn mod_bit(s: str) -> u32 {
+    if s == "shift" { return SHIFT_L; }
+    if s == "ctrl" { return CTRL_L; }
+    if s == "alt" || s == "option" { return ALT_L; }
+    if s == "cmd" || s == "super" { return SUPER_L; }
+    0
+}
+
+fn button_of(s: str) -> Option<Button> {
+    if s == "left" { return Some(Button::Left); }
+    if s == "right" { return Some(Button::Right); }
+    if s == "middle" { return Some(Button::Middle); }
+    None
+}
+
+fn parse(c: str, line: i64, gpa: Gpa) -> Step {
+    var words: Vec<str> = Vec::new_in(gpa);
+    for w in c.split_whitespace() {
+        words.push(w);
+    }
+    let op = words[0];
+    let n = words.len();
+    if op == "size" {
+        if n < 2
+            || n > 3 { fail(line, "'size' takes WxH and an optional scale", "size 640x480 2"); }
+        let (w, h) = dims(words[1], line);
+        let scale = if n == 3 { num(words[2], line, "a scale") } else { 1.0 };
+        if scale <= 0.0 { fail(line, "the scale is positive", "size 640x480 2"); }
+        return Step::Size(w, h, scale);
+    }
+    if op == "frames" {
+        if n != 2 { fail(line, "'frames' takes a count", "frames 3"); }
+        return Step::Frames(whole(words[1], line, "a count of frames"));
+    }
+    if op == "key" || op == "keydown" || op == "keyup" {
+        if n != 2 { fail(line, f"'{op}' takes one key", "key space, key shift+r, keydown left"); }
+        let step = key_step(words[1], op != "keyup", line);
+        return step;
+    }
+    if op == "move" || op == "press" || op == "release" || op == "click" {
+        var i: i64 = 1;
+        var button = Button::Left;
+        if n > 1 {
+            match button_of(words[1]) {
+                Some(b) => {
+                    button = b;
+                    i = 2;
+                }
+                None => {}
+            }
+        }
+        if op == "move" { button = Button::None; }
+        if n < i + 2 { fail(line, f"'{op}' takes X Y", "press left 120 80"); }
+        let x = num(words[i], line, "X");
+        let y = num(words[i + 1], line, "Y");
+        var bits: u32 = 0;
+        for k in i + 2..n {
+            let b = mod_bit(words[k]);
+            if b == 0 {
+                fail(line, f"'{words[k]}' is not a modifier", "shift, ctrl, alt or cmd");
+            }
+            bits = bits | b;
+        }
+        let mods = Mods { bits: bits };
+        if op == "move" { return Step::Mouse(MouseAction::Move, button, x, y, mods); }
+        if op == "press" { return Step::Mouse(MouseAction::Press, button, x, y, mods); }
+        if op == "release" { return Step::Mouse(MouseAction::Release, button, x, y, mods); }
+        // click: a press now, its release right after (the caller queues it)
+        return Step::Mouse(MouseAction::Press, button, x, y, Mods { bits: bits | CLICK });
+    }
+    if op == "scroll" {
+        if n < 2 || n > 3 { fail(line, "'scroll' takes DY and an optional DX", "scroll 3"); }
+        let dy = num(words[1], line, "DY");
+        let dx = if n == 3 { num(words[2], line, "DX") } else { 0.0 };
+        return Step::Scroll(dy, dx);
+    }
+    if op == "resize" {
+        if n != 2 { fail(line, "'resize' takes WxH", "resize 800x600"); }
+        let (w, h) = dims(words[1], line);
+        return Step::Resize(w, h);
+    }
+    if op == "focus" {
+        if n != 2 || (words[1] != "on" && words[1] != "off") {
+            fail(line, "'focus' takes on or off", "focus off");
+        }
+        return Step::Focus(words[1] == "on");
+    }
+    if op == "shot" {
+        if n != 2 { fail(line, "'shot' takes a file", "shot frame.ppm"); }
+        return Step::Shot(Buf::from_in(words[1], gpa));
+    }
+    if op == "close" && n == 1 { return Step::Close; }
+    if op == "quit" && n == 1 { return Step::Quit; }
+    fail(line, f"unknown command '{c}'",
+        "the commands: size, frames, key, keydown, keyup, move, press, release, click, scroll, resize, focus, shot, close, quit")
+}
+
+// A bit no modifier uses: marks a `click`'s press (its release follows).
+const CLICK: u32 = 1u32 << 30;
+
+fn key_step(spec: str, pressed: bool, line: i64) -> Step {
+    var bits: u32 = 0;
+    var rest = spec;
+    loop {
+        match rest.split_once('+') {
+            Some((m, after)) => {
+                // `+` alone, or a trailing `+` (ctrl++), is the key itself
+                if m.len() == 0 || after.len() == 0 { break; }
+                let b = mod_bit(m);
+                if b == 0 {
+                    fail(line, f"'{m}' is not a modifier",
+                        "shift+, ctrl+, alt+ or cmd+ before the key");
+                }
+                bits = bits | b;
+                rest = after;
+            }
+            None => break,
+        }
+    }
+    if rest.len() > 1 && rest.ends_with("+") && mod_bit(rest[0..rest.len() - 1]) != 0 {
+        bits = bits | mod_bit(rest[0..rest.len() - 1]);
+        rest = "+";
+    }
+    match named(rest) {
+        Some((code, key, ch)) => Step::Key(code, key, Mods { bits: bits }, pressed, ch),
+        None => {
+            var it = rest.chars();
+            let c = match it.next() {
+                Some(c) => c,
+                None => fail(line, "a key is missing", "key a"),
+            };
+            if it.next().is_some() {
+                fail(line, f"unknown key '{rest}'",
+                    "a character, or space enter tab backspace escape delete insert home end pageup pagedown left right up down f1..f20");
+            }
+            if c >= 'A' as u32 && c <= 'Z' as u32 {
+                bits = bits | SHIFT_L;
+            }
+            Step::Key(char_code(c), Logical::Char(c), Mods { bits: bits }, pressed, c)
+        }
+    }
+}
+
+fn named(s: str) -> Option<(KeyCode, Logical, u32)> {
+    if s == "space" { return Some((KeyCode::Space, Logical::Char(' ' as u32), ' ' as u32)); }
+    if s == "enter"
+        || s == "return" { return Some((KeyCode::Enter, Logical::Named(Named::Enter), 0)); }
+    if s == "tab" { return Some((KeyCode::Tab, Logical::Named(Named::Tab), 0)); }
+    if s == "backspace" { return Some((KeyCode::Backspace, Logical::Named(Named::Backspace), 0)); }
+    if s == "escape"
+        || s == "esc" { return Some((KeyCode::Escape, Logical::Named(Named::Escape), 0)); }
+    if s == "delete" { return Some((KeyCode::Delete, Logical::Named(Named::Delete), 0)); }
+    if s == "insert" { return Some((KeyCode::Insert, Logical::Named(Named::Insert), 0)); }
+    if s == "home" { return Some((KeyCode::Home, Logical::Named(Named::Home), 0)); }
+    if s == "end" { return Some((KeyCode::End, Logical::Named(Named::End), 0)); }
+    if s == "pageup" { return Some((KeyCode::PageUp, Logical::Named(Named::PageUp), 0)); }
+    if s == "pagedown" { return Some((KeyCode::PageDown, Logical::Named(Named::PageDown), 0)); }
+    if s == "left" { return Some((KeyCode::ArrowLeft, Logical::Named(Named::ArrowLeft), 0)); }
+    if s == "right" { return Some((KeyCode::ArrowRight, Logical::Named(Named::ArrowRight), 0)); }
+    if s == "up" { return Some((KeyCode::ArrowUp, Logical::Named(Named::ArrowUp), 0)); }
+    if s == "down" { return Some((KeyCode::ArrowDown, Logical::Named(Named::ArrowDown), 0)); }
+    if s.len() >= 2 && s.len() <= 3 && s.starts_with("f") {
+        match s[1..s.len()].parse::<i64>() {
+            Ok(n) => {
+                if n >= 1 && n <= 20 {
+                    return Some((f_code(n), Logical::F(n), 0));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+fn f_code(n: i64) -> KeyCode {
+    match n {
+        1 => KeyCode::F1,
+        2 => KeyCode::F2,
+        3 => KeyCode::F3,
+        4 => KeyCode::F4,
+        5 => KeyCode::F5,
+        6 => KeyCode::F6,
+        7 => KeyCode::F7,
+        8 => KeyCode::F8,
+        9 => KeyCode::F9,
+        10 => KeyCode::F10,
+        11 => KeyCode::F11,
+        12 => KeyCode::F12,
+        13 => KeyCode::F13,
+        14 => KeyCode::F14,
+        15 => KeyCode::F15,
+        16 => KeyCode::F16,
+        17 => KeyCode::F17,
+        18 => KeyCode::F18,
+        19 => KeyCode::F19,
+        _ => KeyCode::F20,
+    }
+}
+
+// The physical key of a character on a US (ANSI) keyboard.
+fn char_code(c: u32) -> KeyCode {
+    let l = if c >= 'A' as u32 && c <= 'Z' as u32 { c + 32 } else { c };
+    // each key's character, then its shifted one
+    match l {
+        0x61 => KeyCode::KeyA,
+        0x62 => KeyCode::KeyB,
+        0x63 => KeyCode::KeyC,
+        0x64 => KeyCode::KeyD,
+        0x65 => KeyCode::KeyE,
+        0x66 => KeyCode::KeyF,
+        0x67 => KeyCode::KeyG,
+        0x68 => KeyCode::KeyH,
+        0x69 => KeyCode::KeyI,
+        0x6A => KeyCode::KeyJ,
+        0x6B => KeyCode::KeyK,
+        0x6C => KeyCode::KeyL,
+        0x6D => KeyCode::KeyM,
+        0x6E => KeyCode::KeyN,
+        0x6F => KeyCode::KeyO,
+        0x70 => KeyCode::KeyP,
+        0x71 => KeyCode::KeyQ,
+        0x72 => KeyCode::KeyR,
+        0x73 => KeyCode::KeyS,
+        0x74 => KeyCode::KeyT,
+        0x75 => KeyCode::KeyU,
+        0x76 => KeyCode::KeyV,
+        0x77 => KeyCode::KeyW,
+        0x78 => KeyCode::KeyX,
+        0x79 => KeyCode::KeyY,
+        0x7A => KeyCode::KeyZ,
+        0x30 | 0x29 => KeyCode::Digit0,
+        0x31 | 0x21 => KeyCode::Digit1,
+        0x32 | 0x40 => KeyCode::Digit2,
+        0x33 | 0x23 => KeyCode::Digit3,
+        0x34 | 0x24 => KeyCode::Digit4,
+        0x35 | 0x25 => KeyCode::Digit5,
+        0x36 | 0x5E => KeyCode::Digit6,
+        0x37 | 0x26 => KeyCode::Digit7,
+        0x38 | 0x2A => KeyCode::Digit8,
+        0x39 | 0x28 => KeyCode::Digit9,
+        0x2D | 0x5F => KeyCode::Minus,
+        0x3D | 0x2B => KeyCode::Equal,
+        0x5B | 0x7B => KeyCode::BracketLeft,
+        0x5D | 0x7D => KeyCode::BracketRight,
+        0x5C | 0x7C => KeyCode::Backslash,
+        0x3B | 0x3A => KeyCode::Semicolon,
+        0x27 | 0x22 => KeyCode::Quote,
+        0x60 | 0x7E => KeyCode::Backquote,
+        0x2C | 0x3C => KeyCode::Comma,
+        0x2E | 0x3E => KeyCode::Period,
+        0x2F | 0x3F => KeyCode::Slash,
+        0x20 => KeyCode::Space,
+        _ => KeyCode::Unidentified,
+    }
+}
