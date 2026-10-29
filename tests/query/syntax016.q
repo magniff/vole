@@ -43,9 +43,9 @@ std::sync::mpsc	<std>	24
 std::thread	<std>	43
 std::objc	<std>	50
 std::objc::foundation	<std>	67
-std::gpu	<std>	173
-std::gpu::hal	<std>	7
-std::gpu::hal::metal	<std>	110
+std::gpu	<std>	176
+std::gpu::hal	<std>	9
+std::gpu::hal::metal	<std>	115
 std::gpu::hal::metal::bindings	<std>	776
 std::gpu::shader	<std>	26
 std::gpu::types	<std>	51
