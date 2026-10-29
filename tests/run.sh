@@ -659,9 +659,12 @@ check_case() {
 # (0.25.2) A link that failed for the symbols of Apple's frameworks
 # (std::window, std::gpu: Metal, Cocoa, the Objective-C runtime): one line
 # naming the directives that link them, instead of the linker's list.
-# Fails (prints nothing) for any other link error.
+# Fails (prints nothing) for any other link error. (0.25.3: the
+# linker's list, or volec's link.undefined, which names the symbol
+# without macOS's `_`.)
 framework_hint() {
-    sym=$(awk '/^Undefined symbols/ { u = 1; next } u && /^  "/ { s = $1; gsub(/[",]/, "", s); print s; exit }' "$1")
+    sym=$(awk '/^Undefined symbols/ { u = 1; next } u && /^  "/ { s = $1; gsub(/[",]/, "", s); print s; exit }
+        index($0, "error[link.undefined] undefined symbol ") { split($0, p, sprintf("%c", 39)); print "_" p[2]; exit }' "$1")
     case "$sym" in
         _objc_*|_OBJC_*|_CF*|_NS*|_MTL*|_CA*|_CG*|_kCF*|_IOSurface*|_dispatch_*) ;;
         *) return 1 ;;

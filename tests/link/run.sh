@@ -13,19 +13,20 @@
 #   fallback    a template whose linker fails: the link goes through cc,
 #               and the template is dropped
 #   off         $VOLE_LINK_CACHE=off: no template kept, the link works
-#   errors      a link that fails says so as cc does, once
+#   errors      a link that fails says so in one error (0.25.3: link.undefined)
 #   linker      $VOLE_LINKER=cc is --linker=cc; an unknown one is an error
 #   declared    an extern block's #[link(...)] and -framework reach the
 #               link (macOS: the executable loads them; Linux leaves a
 #               framework out), a hello world links nothing more, and an
 #               unknown key is an error
+#   no-framework (macOS) a framework the SDK lacks: link.no-framework
 # and, on aarch64 macOS, the compiler's own linker (--linker=internal,
 # back::objfile::link_macho):
 #   internal    the executable runs, its signature verifies, and the same
 #               input gives the same bytes
 #   default     it is the default
 #   internal-ld a program it does not take (an import libSystem lacks) is
-#               linked by ld, which says why it fails
+#               linked by ld, whose failure is link.undefined
 #   libsystem   libSystem has every name of link_macho's LIBSYSTEM
 
 set -u
@@ -146,13 +147,14 @@ else
     fail off "with VOLE_LINK_CACHE=off: $(cat build.out)"
 fi
 
-# errors: the undefined symbol, named once, then the compiler's line
+# errors: (0.25.3) one vole error, link.undefined at the extern
+# declaration, naming the symbol; none of the linker's text
 if build missing.vl -o prog; then
     fail errors "linked a program with an undefined symbol"
-elif [ "$(grep -c 'vole_link_test_missing' build.out)" -lt 1 ] \
-    || ! grep -q 'error: linking failed' build.out \
-    || [ "$(grep -c 'linking failed' build.out)" != 1 ]; then
-    fail errors "not cc's message: $(cat build.out)"
+elif [ "$(wc -l <build.out | tr -d ' ')" != 1 ] \
+    || ! grep -q "^missing.vl:2:5: error\[link.undefined\] undefined symbol 'vole_link_test_missing' | help: " build.out \
+    || grep -q -e 'Undefined symbols' -e 'undefined reference' -e 'linker command failed' build.out; then
+    fail errors "not one link.undefined error: $(cat build.out)"
 else
     pass errors
 fi
@@ -198,6 +200,19 @@ else
     pass declared
 fi
 
+# no-framework: (0.25.3, macOS) a framework the SDK lacks is
+# link.no-framework, not ld's text
+if [ "$(uname -s)" = Darwin ]; then
+    if build hello.vl -framework VoleNoSuchFramework -o prog; then
+        fail no-framework "linked with a framework that is not there"
+    elif ! grep -q "^error\[link.no-framework\] framework 'VoleNoSuchFramework' not found | help: -framework VoleNoSuchFramework on the command line names it" build.out \
+        || grep -q -e '^ld: ' -e 'clang: error' build.out; then
+        fail no-framework "not one link.no-framework error: $(cat build.out)"
+    else
+        pass no-framework
+    fi
+fi
+
 if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
     # internal
     if build --linker=internal hello.vl -o prog && [ "$(./prog)" = hello ] \
@@ -219,8 +234,8 @@ if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
     # internal-ld
     if build --linker=internal missing.vl -o prog; then
         fail internal-ld "linked a program with an undefined symbol"
-    elif ! grep -q 'vole_link_test_missing' build.out || ! grep -q 'error: linking failed' build.out; then
-        fail internal-ld "not ld's message: $(cat build.out)"
+    elif ! grep -q "error\[link.undefined\] undefined symbol 'vole_link_test_missing'" build.out; then
+        fail internal-ld "not ld's undefined symbol: $(cat build.out)"
     else
         pass internal-ld
     fi
