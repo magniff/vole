@@ -200,10 +200,17 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 
 ## 5. It builds
 
+No errors; the two warnings are the C call's unsafe, which says nowhere
+why it cannot be safe and why it is sound (`volec explain
+unsafe.unjustified`): `fix` wraps the call, the justification is the
+author's (`// UNSAFE:` and `// SAFETY:` right above).
+
 ```console
 $ volec check && echo no errors
 no errors
-ok: 0 errors in main.vl
+grades.vl:3:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
+grades.vl:39:17: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe grades.vl
+ok: 0 errors, 2 warnings in main.vl
 $ volec main.vl -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours
 Brook   75 C  swing 21
