@@ -2663,8 +2663,12 @@ object is unknown):
    `wrappers`, `vec_wrapper`). Not through other structs, sealed ones
    either: a let method of a Mutex (sealed since 0.25.4) writes the
    value inside through a raw pointer, and so may any struct's own
-   unsafe code (the case `opt_vecfacts_let_raw`'s `locked`). A new
-   wrapper of a Vec in std joins the list in `init_vec_facts`. Only for a parameter the function never writes through nor
+   unsafe code. (Not reachable through today's Mutex: every read of its
+   data locks it through the parameter, and `param_written` counts the
+   compare-exchange, so `opt_vecfacts_let_raw`'s `locked` compiles the
+   same with either rule; the list keeps the fact from resting on what
+   std's sealed structs happen to do.) A new wrapper of a Vec in std
+   joins the list in `init_vec_facts`. Only for a parameter the function never writes through nor
    passes on (`param_written`: `&v as *Vec<T>` is accepted in unsafe
    code, and the function may push through it), and under the own
    pass's error mode (`noalias_active`). Calls were covered already
