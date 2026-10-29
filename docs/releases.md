@@ -80,7 +80,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   the compiler for the sites a change adds (tools/unsafe-diff-check.py,
   its 12-line heuristic left for what the compiler cannot read); the
   baseline, docs/unsafe-baseline.md (compiler/src 5,316 unjustified of
-  5,380 sites, 938 blocks unneeded; std 1,194 of 1,202), and the gate's
+  5,380 sites, 938 blocks unneeded; std 1,194 of 1,204), and the gate's
   `unsafe-audit` row, which fails when either count rises.
 
 - **Soundness**: a mapped read view of a GPU buffer no longer changes
