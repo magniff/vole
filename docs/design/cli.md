@@ -151,7 +151,7 @@ that is not UTF-8 is an error (it was read as an empty word).
 
 The compiler is built by the previous release, so it uses 0.25.1's API.
 What that lacks is made up in cli/line.vl and cli/tree.vl, to go when
-0.25.2 builds the compiler (0.25.3):
+0.25.2 builds the compiler (0.25.3, below: what went and what stays):
 
 - a value's place in the line, by the word it views (`Line::at`): the
   order of different options' values (`indices_of`);
@@ -182,6 +182,80 @@ Matches now keeps one vector of pairs (slot, argument index) while
 parsing and the indices by slot after it, in place of 0.25's three: a
 program under --check-alloc numbers its blocks as with 0.25.1's std::cli
 (examples/allocators/check-alloc).
+
+## 0.25.3
+
+0.25.2.2 builds the compiler, so compiler/src/cli/ is on 0.25.2's
+std::cli and the list above is done (line.vl 608 lines to 425; tree.vl
+305 to 320, its comments the reasons for what stays). std::cli reads the
+line's words as they are, so an argument's index is its word's (`parse`
+maps the commands it names in place of words 1 and 2):
+
+- a value's place in the line: `Matches::indices_of`, through that map
+  (the events' order, `edit patch`'s pairs after `--in`; a build's `-l`,
+  `-L` and objects; the word a bad `-O3` or `--linker=ld` is shown as);
+- `WordIter` is gone: a command's words are a positional with
+  `allow_hyphen_values` (`query grep '-> bool'`); `--overlay PATH COPY`,
+  refactor's `--rename A B`, `--type X T` and rewrite's `--subst P R`
+  are `num_values(2)` (an Opt made by `pair`: each value an event of the
+  option's name, in order; `--2nd`, `--overlay-copy` are gone); probe's
+  words after `--` are a `last` positional (`--args` is gone); a build's
+  `--stats` and `--print-checks` are `default_missing("all")` and
+  `default_missing("")`;
+- the options the editing commands share (edit_opts) are `edit`'s,
+  `global()`; refactor's are each subcommand's still (`refactor
+  extension` has other ones).
+
+Where std::cli's rule differs from what the layer did, volec keeps
+std::cli's, and tools/cli-compat.py (with 23 more lines for these
+cases) finds no other difference on its 1,435 command lines:
+
+- a word with one `-` whose first letter is one of the command's short
+  options is that option (`-O3` is `-O 3`, `-Iinc` `-I inc`, `-j2` `-j
+  2`, `-in` `-i -n`), as getopt and clap read it: `probe -O3` and `test
+  -O3` say `-O takes 0, 1 or 2, not '3'` (they said `unknown option
+  '-O3'`; `probe -O 3` was taken and failed in the build), `query checks
+  -O 0` is -O0 as `-O0` was (it was -O2);
+- `allow_hyphen_values` takes an unknown `--name` too: the events make
+  it an unknown option, as std::cli's error was, before the line's `--`;
+- `-h` in a batch's line is std::cli's help, an unknown option to the
+  command (it was a word; main sends `-h` to the help first);
+- `--rename=A B` is `--rename A B`, as `--name=value` is anywhere.
+
+What std::cli has no rule for, and volec keeps (each a candidate for
+std::cli, in "Still to do" below, but the last two):
+
+- parsing on after an error (clap's `ignore_errors`): the tools report a
+  bad option with the NAMEs given; the error's word is found by the text
+  it views (`Line::at`), as a CliError has no index (an `e.index()`
+  would do);
+- a single-dash long option: a build's `-framework NAME` is given to
+  std::cli as `--framework` (one word for one, the indices hold);
+- a word naming a subcommand after a parent's positional (`query bogus
+  refs`, a build's `main.vl test`): std::cli takes it as the
+  subcommand; volec reads the parent's word 2 that names none as its
+  hidden `(other)` and a build's line with the root alone (clap's
+  `args_conflicts_with_subcommands`);
+- an option allowed only with another one: `edit insert --in` reads
+  patch's options, `rewrite --text` the textual rewrite's, chosen from
+  the line (clap's `requires`; `conflicts_with` says the opposite);
+- `--json`, `--values=`, `--syntax=` and `--color=` are taken out of the
+  line in main, and `--help` sent to tools/help.vl: they act before any
+  command reads its line (the help, a batch's lines, the code cache's
+  key) and keep their own messages; `global()` on the root would accept
+  them but not act first;
+- `refactor --script FILE` is `refactor script`, 0.8's `--fix-imports`
+  and 0.9's `--fix-unsafe` are `fix` (an option spelling a command).
+
+Still to do in std::cli (0.25's list and these; none in 0.25.3, whose
+compiler cannot use them before 0.25.4): env defaults, `--no-flag`, the
+terminal's width; `CliError`'s argument index and a parse that goes on
+after an error (`ignore_errors`, the errors with the Matches); a long
+option of one dash (`Arg::long` with one `-`: `-framework`, cc's and
+ld's spellings); a subcommand's name read as one only before the
+parent's first positional (`args_conflicts_with_subcommands`); an
+argument that needs another (`requires`). The last two items above are
+volec's own history and stay in volec.
 
 ## Not in 0.24
 
