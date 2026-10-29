@@ -524,6 +524,13 @@ SYMS (`SYMS[intern_c(..)]`, `SYMS[template_name(..)]`,
 0.26 (evaluate the index first, or have the exclusivity check refuse
 it), not changed here.
 
+**What the checks found later.** A bounds failure in intern, once, in
+arch-gen at -O2 (`index 7578, length 7578`): the emission threads
+interned an intrinsic template's placeholder names, a push to SYMS racing
+with the other threads' reads (raw, a read through a pointer the growth
+may free). The templates now look the names up (find_sym). Checked
+tables turn such latent stale reads into failures that name their line.
+
 **The cost.** `check` of compiler/src, instructions against 0.25.4 (the
 fewest of 9; the count moves by about 1% from run to run, more at a
 load above 30):
