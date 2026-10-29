@@ -35,9 +35,12 @@ mod legality;
 mod outer;
 pub mod unroll;
 
-use crate::base::{IntVec, free};
+use crate::back::dwarf::file_and_line;
+use crate::base::{
+    IntVec, STDERR, SYMS, buf_byte, buf_fmt, buf_new, buf_write_fd, cstr, free, strlen,
+};
 use crate::base::target::X86;
-use crate::front::types::{TY_I64, TY_U64, is_float, type_size};
+use crate::front::types::{FNS, TY_I64, TY_U64, is_float, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
 use crate::middle::gvn::find_escaping_slots;
@@ -62,12 +65,107 @@ use crate::middle::vectorize::build::{
 };
 use crate::middle::vectorize::checks::{build_groups, check_tests, overlap_pairs, overlap_tests};
 use crate::middle::vectorize::legality::{
-    NONAFFINE, analyze, class_of, coef, lane_type, reduction_of_next,
+    NONAFFINE, analyze, class_of, coef, lane_type, reduction_of_next, why,
 };
 use crate::middle::vectorize::outer::vectorize_outer;
 
 // --no-vectorize turns it off (to compare).
 pub static var VECTORIZE: bool = true;
+
+// (0.25.5) --vec-stats=FN: the function whose loops are reported, one line
+// each (vectorized, or the first reason it was not); 0: none. Its builds
+// run on one thread (middle::parallel::serial_only) and keep the IR's
+// positions, for the loops' lines.
+pub static var VEC_STATS_FN: *u8 = 0 as *u8;
+
+// Whether function f (a FNS index) is FN: its whole name (`Vec::push`), a
+// prefix of it before `<` or `$` (an instance), or its last part (`push`).
+pub fn vec_stats_wanted(f: i64) -> bool {
+    // UNSAFE: VEC_STATS_FN is a C string (from the command line), read by
+    // its bytes; FNS and SYMS are the compiler's raw tables.
+    // SAFETY: want is NUL-terminated and only its strlen bytes are read; f
+    // is a FNS index and its display a SYMS index, both checked.
+    unsafe {
+        let want = VEC_STATS_FN;
+        if want == 0 as *u8 {
+            return false;
+        }
+        let name = SYMS[FNS[f].display].text;
+        let n = strlen(want) as i64;
+        var start = 0;
+        for i in 0..name.len {
+            if i + 1 < name.len && name[i] == ':' && name[i + 1] == ':' {
+                start = i + 2;
+            }
+            if name[i] == '<' || name[i] == '$' {
+                break;
+            }
+        }
+        for s in [0, start] {
+            if s + n <= name.len && (0..n).all(|i| name[s + i] == want[i])
+                && (s + n == name.len || name[s + n] == '<' || name[s + n] == '$') {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The source line of loop l (its first instruction with a position), or
+// 0.
+fn loop_line(cx: sink *FnCtx, l: i64) -> i64 {
+    // UNSAFE: cx is the pass's raw *FnCtx.
+    // SAFETY: cx points at the function's live context for the whole pass;
+    // the blocks and instructions read are its own (checked indexes), and
+    // inst_loc is read below its count.
+    unsafe {
+        for i in 0..loop_size(cx, l) {
+            var v = cx.blocks[loop_block(cx, l, i)].first;
+            while v != 0 {
+                if v < cx.inst_loc.count && cx.inst_loc.data[v] > 0 {
+                    return file_and_line(cx.inst_loc.data[v] - 1) & 0xffffffff;
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        0
+    }
+}
+
+// One line of --vec-stats=FN on stderr: loop l of function fi, vectorized
+// (reason 0: VF lanes, the body `unroll` times) or not and why.
+fn vec_report(cx: sink *FnCtx, fi: i64, l: i64, reason: *u8, inst: i64) {
+    vec_report_at(cx, fi, loop_line(cx, l), loop_header(cx, l), reason, inst);
+}
+
+// The same, for the loop at line `line` (0: unknown) whose header is block
+// `header`.
+fn vec_report_at(cx: sink *FnCtx, fi: i64, line: i64, header: i64, reason: *u8, inst: i64) {
+    // UNSAFE: the compiler's raw tables (SYMS, FNS, IRFUNCS) and the
+    // reason, a C string.
+    // SAFETY: fi is an IRFUNCS index and the others follow from it (checked
+    // indexes); reason is a constant NUL-terminated string.
+    unsafe {
+        let out = buf_new();
+        buf_fmt(out, f"vec-stats: {SYMS[FNS[IRFUNCS[fi].f].display].text}");
+        if line > 0 {
+            buf_fmt(out, f", loop at line {line}");
+        } else {
+            buf_fmt(out, f", loop at block {header}");
+        }
+        if reason == 0 as *u8 {
+            buf_fmt(out,
+                f": vectorized, {cx.v_vf} lanes, the body {cx.v_unroll} times an iteration\n");
+        } else {
+            buf_fmt(out, f": not vectorized: {cstr(reason)}");
+            if inst > 0 {
+                buf_fmt(out, f" ({cstr(cx.insts[inst].op.name())})");
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDERR);
+    }
+}
 
 const VEC_MAX_INSTS: i64 = 160;
 const VEC_MAX_CHECKS: i64 = 8;
@@ -306,8 +404,9 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
         }
         let unroll = vector_unroll(cx, l, 0);
         if unroll == 0 {
-            return false;
+            return why(cx, c"the cost model: the vector loop would not be cheaper");
         }
+        cx.v_unroll = unroll;
         // (0.11: a loop of a few constant trips whose checks kept
         // transform_loops from unrolling it whole, until the ranges removed
         // them, is better unrolled whole when that is cheaper: then each
@@ -315,7 +414,7 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
         // pack, and no test of the trip count or overlap is made)
         if whole > 0 && vector_unroll(cx, l, whole) == 0 {
             cx.unroll_whole = true;
-            return false;
+            return why(cx, c"unrolled whole instead: a few constant trips, cheaper so");
         }
         ir_enter(cx, fi);
         let h = loop_header(cx, l);
@@ -520,9 +619,9 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
     }
 }
 
-// Whether loop l is no candidate at a glance: a call, a copy, no memory
-// access, or too big (before the costlier analysis).
-fn quick_reject(cx: sink *FnCtx, l: i64) -> bool {
+// Why loop l is no candidate at a glance (0: it may be): a call, a copy,
+// no memory access, or too big (before the costlier analysis).
+fn quick_reject(cx: sink *FnCtx, l: i64) -> *u8 {
     unsafe {
         var n = 0;
         var memory = false;
@@ -531,9 +630,17 @@ fn quick_reject(cx: sink *FnCtx, l: i64) -> bool {
             while v != 0 {
                 let op = cx.insts[v].op;
                 // (0.21: an atomic or a fence keeps the loop scalar)
-                if op.is_call() || op == Op::Copy || op.is_vector() || op == Op::Atomic
-                    || op == Op::Fence {
-                    return true;
+                if op.is_call() {
+                    return c"a call in the loop";
+                }
+                if op == Op::Copy {
+                    return c"a copy of memory (an aggregate's) in the loop";
+                }
+                if op.is_vector() {
+                    return c"vector operations already";
+                }
+                if op == Op::Atomic || op == Op::Fence {
+                    return c"an atomic operation or a fence in the loop";
                 }
                 if op == Load || op == Store {
                     memory = true;
@@ -542,24 +649,49 @@ fn quick_reject(cx: sink *FnCtx, l: i64) -> bool {
                 v = cx.insts[v].next;
             }
         }
-        !memory || n > VEC_MAX_INSTS
+        if !memory {
+            return c"no load or store";
+        }
+        if n > VEC_MAX_INSTS { c"too big: more than 160 instructions" } else { 0 as *u8 }
     }
 }
 
 // Vectorizes the innermost loops of fi that can be; returns whether any
-// was.
+// was. (0.25.5) With --vec-stats=FN and fi FN, a line for each loop.
 pub fn vectorize_loops(cx: sink *FnCtx, fi: i64) -> bool {
     unsafe {
         cx.unroll_whole = false;
         if !VECTORIZE {
             return false;
         }
+        let report = VEC_STATS_FN != 0 as *u8 && vec_stats_wanted(IRFUNCS[fi].f);
         canonicalize_loops(cx, fi);
         var headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var outer = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for l in 0..loop_count(cx) {
-            if loop_header(cx, l) == IRFUNCS[fi].entry || cx.blocks[loop_header(cx, l)].novec != 0
-                || is_cold_block(cx, loop_header(cx, l)) || quick_reject(cx, l) {
+            if loop_header(cx, l) == IRFUNCS[fi].entry {
+                if report {
+                    vec_report(cx, fi, l, c"its header is the function's entry", 0);
+                }
+                continue;
+            }
+            if cx.blocks[loop_header(cx, l)].novec != 0 {
+                if report {
+                    vec_report(cx, fi, l, c"a vector loop's scalar rest", 0);
+                }
+                continue;
+            }
+            if is_cold_block(cx, loop_header(cx, l)) {
+                if report {
+                    vec_report(cx, fi, l, c"cold (on a path to a panic or marked #[cold])", 0);
+                }
+                continue;
+            }
+            let quick = quick_reject(cx, l);
+            if quick != 0 as *u8 {
+                if report {
+                    vec_report(cx, fi, l, quick, 0);
+                }
                 continue;
             }
             if is_innermost(cx, l) {
@@ -578,6 +710,9 @@ pub fn vectorize_loops(cx: sink *FnCtx, fi: i64) -> bool {
             if children == 1 && is_innermost(cx, child) {
                 outer.push(loop_header(cx, l));
                 outer.push(loop_header(cx, child));
+            } else if report {
+                vec_report(cx, fi, l, c"not innermost, and not an outer loop of one innermost loop",
+                    0);
             }
         }
         var changed = false;
@@ -595,10 +730,20 @@ pub fn vectorize_loops(cx: sink *FnCtx, fi: i64) -> bool {
             if form_lcssa(cx, fi, l) {
                 resolve_all(cx, fi);
             }
+            let line = if report { loop_line(cx, l) } else { 0 };
             if vectorize_outer(cx, fi, l, l2) {
+                if report {
+                    let out = buf_new();
+                    buf_fmt(out,
+                        f"vec-stats: {SYMS[FNS[IRFUNCS[fi].f].display].text}, loop at line {line}: vectorized as an outer loop (its inner loop's iterations in lanes)\n");
+                    buf_write_fd(out, STDERR);
+                }
                 changed = true;
                 resolve_all(cx, fi);
                 verify_func(cx, fi, c"vectorization (outer loop)");
+            } else if report {
+                vec_report(cx, fi, l,
+                    c"not innermost, and the outer vectorizer did not take it (outer.vl)", 0);
             }
         }
         free(outer.data as *u8);
@@ -615,6 +760,9 @@ pub fn vectorize_loops(cx: sink *FnCtx, fi: i64) -> bool {
             }
             let l = innermost_loop(cx, headers.data[i]);
             if l < 0 || loop_header(cx, l) != headers.data[i] || !is_canonical(cx, l) {
+                if report && l >= 0 {
+                    vec_report(cx, fi, l, c"not in canonical form", 0);
+                }
                 continue;
             }
             if form_lcssa(cx, fi, l) {
@@ -632,12 +780,21 @@ pub fn vectorize_loops(cx: sink *FnCtx, fi: i64) -> bool {
             if hoist_invariant_loads(cx, l) {
                 changed = true;
             }
+            // (the line before the change, which renumbers the loops)
+            let line = if report { loop_line(cx, l) } else { 0 };
             if vectorize_loop(cx, fi, l) {
+                if report {
+                    vec_report_at(cx, fi, line, headers.data[i], 0 as *u8, 0);
+                }
                 changed = true;
                 stale = true;
                 escapes_stale = true;
                 resolve_all(cx, fi);
                 verify_func(cx, fi, c"vectorization");
+            } else if report {
+                vec_report(cx, fi, l,
+                    if cx.v_why == 0 as *u8 { c"(no reason recorded)" } else { cx.v_why },
+                    cx.v_why_inst);
             }
         }
         free(headers.data as *u8);
