@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, fb8d9efe. The gate's unsafe-audit row
+on Darwin arm64, 8f222dd7. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -15,7 +15,7 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 inside (statics are safe), removable as they are.
 
 baseline compiler/src unjustified: 4366
-baseline std unjustified: 1194
+baseline std unjustified: 0
 
 ## compiler/src
 
@@ -73,62 +73,60 @@ justified	112	0
 ## std
 
 ```
-sites: 1204 (977 blocks, 192 unsafe fns, 35 extern blocks); unjustified: 1194; unneeded: 13
+sites: 893 (671 blocks, 188 unsafe fns, 34 extern blocks); unjustified: 0; unneeded: 3
 
 class	sites	unjustified
-ffi	718	715
-raw-pointer	346	341
-other	90	89
-alloc	39	39
-static-mut	6	5
-transmute/cast	5	5
+ffi	456	0
+raw-pointer	317	0
+other	72	0
+alloc	39	0
+transmute/cast	5	0
+static-mut	4	0
 
 module	sites	unjustified
-std::gpu	473	471
-std	194	194
-std::collections	135	135
-std::window	77	70
-std::sys	74	74
-std::objc	63	63
-std::sync	54	54
-std::slice	53	53
-std::fmt	22	22
-std::thread	18	18
-std::io	10	10
-std::hash	8	8
-std::iter	8	7
-std::num	5	5
-std::env	3	3
-std::process	3	3
-std::random	2	2
-std::str	1	1
-std::string	1	1
+std::gpu	267	0
+std	123	0
+std::collections	118	0
+std::window	74	0
+std::sys	73	0
+std::slice	53	0
+std::sync	52	0
+std::objc	51	0
+std::fmt	22	0
+std::thread	18	0
+std::hash	8	0
+std::io	7	0
+std::str	7	0
+std::iter	6	0
+std::num	5	0
+std::env	3	0
+std::process	3	0
+std::random	2	0
+std::string	1	0
 
 file	sites	unjustified
-compiler/std/gpu/hal/metal/bindings.vl	396	396
-compiler/std/sys.vl	74	74
-compiler/std/window/cocoa.vl	64	57
-compiler/std/collections/raw_table.vl	53	53
-compiler/std/collections/btree_node.vl	52	52
-compiler/std/flat/test.vl	45	45
-compiler/std/flat/alloc.vl	43	43
-compiler/std/objc/foundation.vl	36	36
-compiler/std/gpu/wgsl/interp.vl	34	34
-compiler/std/sync/atomic.vl	29	29
-compiler/std/flat/fuzz.vl	28	28
-compiler/std/gpu/hal/metal/mod.vl	28	26
-compiler/std/objc/mod.vl	27	27
-compiler/std/fmt.vl	22	22
-compiler/std/std.vl	22	22
-compiler/std/slice.vl	21	21
-compiler/std/flat/arch.vl	20	20
-compiler/std/thread.vl	18	18
-compiler/std/collections/btree_map.vl	17	17
-compiler/std/slice/stable.vl	16	16
-(29 more; --all lists every one)
+compiler/std/gpu/hal/metal/bindings.vl	226	0
+compiler/std/sys.vl	73	0
+compiler/std/window/cocoa.vl	61	0
+compiler/std/collections/raw_table.vl	52	0
+compiler/std/flat/alloc.vl	41	0
+compiler/std/collections/btree_node.vl	38	0
+compiler/std/objc/mod.vl	29	0
+compiler/std/gpu/hal/metal/mod.vl	28	0
+compiler/std/sync/atomic.vl	25	0
+compiler/std/fmt.vl	22	0
+compiler/std/objc/foundation.vl	22	0
+compiler/std/std.vl	22	0
+compiler/std/slice.vl	21	0
+compiler/std/thread.vl	18	0
+compiler/std/collections/btree_map.vl	17	0
+compiler/std/slice/stable.vl	16	0
+compiler/std/flat/arch.vl	15	0
+compiler/std/sync/mod.vl	15	0
+compiler/std/flat/collections.vl	13	0
+compiler/std/window/objc.vl	13	0
+(26 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	1140	1140
-missing UNSAFE:	54	54
-justified	10	0
+justified	893	0
 ```

@@ -152,6 +152,36 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
   rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
   An existing file still gets the one-line note only.
+- **A windowed program's own event loop runs without a display**: with
+  `VOLE_WINDOW_SCRIPT` set, `App::new_in` opens no window server and
+  the events come from the script (std::window::script): keys (with
+  their Text), mouse moves, presses, releases and clicks, scrolls,
+  resizes, focus, Close and Quit, and each Frame as soon as the program
+  asks for it, never from the 10 Hz timer a hidden window gets. The
+  window's `raw_surface()` is null, which std::gpu takes for a headless
+  surface, so the program needs no code for it; `shot FILE` writes the
+  next frame presented as a PPM (`gpu::capture_next_frame`, which a
+  program can call too). The GPU evals' agents could not test input or
+  frame times; now `tests/examples/gpu-life-script.test` paints and
+  steps examples/gpu/life and `pathtrace-script.test` clicks a button of
+  pathtrace's panel, each against a golden region
+  (`guide window#testing-input-without-a-display`). The test runner
+  gets `// ENV: NAME=VALUE`.
+- **GPU timestamps**, on WebGPU's timestamp-query: `dev.query_set(n)`,
+  `enc.compute_pass_timed(set, begin, end, |pass| ..)` and
+  `render_pass_timed`, `enc.resolve_query_set(set, first, count, buf,
+  offset)` into a `BufferUsage::QUERY_RESOLVE` buffer, and
+  `queue.timestamp_period()` (ns a tick). On Metal a timed pass is a
+  command buffer of its own and its timestamps are the command buffer's
+  `GPUStartTime` and `GPUEndTime` (already bound; counter sampling would
+  have needed a dozen new Objective-C classes and methods for the same
+  per-pass resolution on Apple GPUs, which sample at stage boundaries
+  only); a submission with timed passes returns once they have
+  finished. `dev.caps().timestamps` says whether a device has them
+  (`gpu.unsupported` otherwise, never a wrong number).
+  `tests/gpu/cases/timestamp_query.vl` checks that a kernel looping 8
+  times longer measures longer (the ratio of medians), and
+  `guide gpu#timing-gpu-work` uses them.
 - (mod254) `volec fix --only unneeded-unsafe`: the unsafe blocks with
   nothing unsafe inside (`volec query unsafe`'s `none (unneeded)`) taken
   away, the code in them kept in its scope (a block on lines of its own
@@ -200,6 +230,38 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/refactor/run254.t).
 - The words after `--` reach a command as they are: `--json`,
   `--values=...` and `--help` there were volec's own before.
+- **std's unsafe, every site justified** (stdunsafe254): `volec query
+  unsafe std --summary` went from 1204 sites (1194 without `// UNSAFE:`
+  and `// SAFETY:` above them, 13 unneeded) to 893 sites, 0 unjustified,
+  3 reported unneeded (generic methods the query cannot see instantiated;
+  they are needed). docs/unsafe-baseline.md's std line is 0, so the gate
+  fails on any new unjustified site in std. Per class: ffi 718 to 456,
+  raw-pointer 346 to 317, other 90 to 72, alloc 39, static-mut 6
+  to 4, transmute 5. `[T]::get`'s unchecked read stays (1.9x faster than
+  `s[i]` in a 400M-read loop at -O2).
+- **Soundness fixes in std**: `RecvIter` holds its own reference to the
+  channel and has `Drop` (iterating after both ends were dropped read
+  freed memory); `SysDir` and `SysSpawnActions` have `Drop` (a dropped
+  one leaked its handle); `strerror` and `ptsname` became `strerror_r`
+  and `ptsname_r` (both raced between threads); `NsWindow::close` clears
+  its view, layer and display link, so a closed window's methods do
+  nothing instead of using a released object; stdin's buffer checks its
+  `malloc` for null (a static array instead made every program's object
+  64 KiB larger, and a hello world's build 1.46x dearer).
+- **Breaking, std's signatures**: `sys_poll(fds: inout [SysPollFd], ...)`
+  (it writes `revents`; it took the slice by `let`); `__io_error(kind,
+  msg: [u8])` and `io::Error` keeps a message index, not a C string;
+  `#[sealed]` on `SysDir`, `SysSpawnActions`, `Mutex`, `MutexGuard`,
+  `Sender`, `Receiver`, `RecvIter`, `JoinHandle`, `Scope` and
+  `ScopedJoinHandle`, whose fields hold raw pointers a struct literal
+  could forge; `atomic_fence` and `atomic_compiler_fence` are safe; the
+  private `utf8_word` is `unsafe fn`.
+- **std::objc**: `selector(name: [u8])` and `class_named(name: [u8])`,
+  safe, for the selectors and classes the bindings name; the generated
+  bindings (tools/objcgen) carry their `UNSAFE:`/`SAFETY:` comments.
+- **std's core sections**: `Mutex`, `Once` and `Condvar` moved to a lazy
+  section of their own ("Mutex, Once and Condvar (0.21)"), so a program
+  that prints does not read them; core is 157436 bytes of 163840.
 
 ### What's new in 0.25.3
 

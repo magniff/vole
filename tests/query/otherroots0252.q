@@ -24,6 +24,6 @@ note query.other-root: not in this directory's program; answered from xroots0252
 $ show std::window::Surface::frame
 error query.no-match: no definition 'std::window::Surface::frame'
 try: volec query show std::gpu::Surface::frame
+try: volec query show std::window::script::Script::frame
 try: volec query show std::gpu::Frame
-try: volec query show std::gpu::hal::metal::Frame
 [exit 1]

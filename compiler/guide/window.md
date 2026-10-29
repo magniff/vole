@@ -67,7 +67,10 @@ fn main(gpa: Gpa) -> i32 {
   they link (`#[link(framework = "AppKit")]`, `guide c-interop`), so
   `volec main.vl -o app` links AppKit, QuartzCore and libobjc.
 - **Tests**: `tests/window/run.sh`; the checks that need a display skip
-  without one (`VOLE_NO_DISPLAY_TESTS=1` too).
+  without one (`VOLE_NO_DISPLAY_TESTS=1` too). (0.25.4) A program's own
+  event loop runs without a display, its input and frames from a script:
+  `VOLE_WINDOW_SCRIPT='frames 2; key space; click 40 30; shot a.ppm;
+  frames 1' ./prog` (`window#testing-input-without-a-display`).
 
 ## Mouse and surface size
 
@@ -255,3 +258,101 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 ```out
 rgb 255 128 0, wrote shot.ppm: true
 ```
+
+## Testing input without a display
+
+(0.25.4) A program's own event loop runs with no display when
+`VOLE_WINDOW_SCRIPT` is set: `App::new_in` opens no window server and
+the events come from the script, in order. Each `Frame` comes as soon as
+the program asks for one (`request_frame`), never from a timer, so a
+test of keys, the mouse or a frame count takes milliseconds. The
+window's `raw_surface()` is null, which std::gpu takes for
+`RawSurface::Headless`: the frames are offscreen, at the script's size.
+The program needs no code for it; `shot FILE` writes the next frame it
+presents as a PPM to compare (`tests/ppmdiff.sh`, a case's
+`EXPECT-PPM`).
+
+```vole
+use std::gpu;
+use std::gpu::{Color, PassDesc, RawSurface};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::Logical;
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => return Ok(()), // no display, no script
+    };
+    var win = match app.window(WindowDesc::new("paint", 400, 300)) {
+        Ok(w) => w,
+        Err(_) => return Ok(()),
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    var red = false;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Resize(_, s)) => surf.configure(dev, s.w, s.h),
+            Ok(Event::Frame(_)) => {
+                let frame = surf.frame()?;
+                let c = if red { Color::rgba(1.0, 0.0, 0.0, 1.0) } else { Color::black() };
+                var enc = dev.encoder();
+                enc.render_pass(PassDesc::color(frame.texture.view(), clear: c), |_| {});
+                queue.submit(enc.finish());
+                frame.present(&queue);
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                if m.button == Button::Left && m.action == MouseAction::Press {
+                    red = !red;
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && k.key == Logical::Char('q' as u32) {
+                    break;
+                }
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+```sh
+VOLE_WINDOW_SCRIPT='size 64x32; frames 2; click left 10 10; shot red.ppm; frames 1; key q' ./paint
+VOLE_WINDOW_SCRIPT=@input.script ./paint      # the script in a file
+```
+
+The commands, separated by `;` or newlines (`#` a comment); coordinates
+are physical pixels from the content's top-left:
+
+| command | events |
+|---|---|
+| `size 640x480 [S]` | first: the window's size and scale (default: the WindowDesc's, scale 1) |
+| `frames N` | up to N `Frame`s, one for each `request_frame` (none asked for: none sent, the program is idle) |
+| `key K`, `keydown K`, `keyup K` | a press and a release, or one; K is a character (`a`, `+`, `A` is shift+a) or a name (`space enter tab backspace escape delete insert home end pageup pagedown left right up down f1`..`f20`), after `shift+ ctrl+ alt+ cmd+`; a printable press is followed by its `Text` |
+| `move X Y` | the pointer moves |
+| `press [B] X Y`, `release [B] X Y`, `click [B] X Y` | B: `left` (default), `right`, `middle`; then `shift`, `ctrl`, `alt` or `cmd` held |
+| `scroll DY [DX]` | a wheel, in lines (positive: up) |
+| `resize WxH`, `focus on`/`off` | `Resize`, `Focus` |
+| `shot FILE.ppm` | the next frame presented (`frame.present`) is also written to FILE (`gpu::capture_next_frame`) |
+| `close`, `quit` | `Close`, `Quit` |
+
+- When the script ends, each open window gets `Close`, then `Quit`; a
+  program still waiting after that stops (exit 1) with a line saying so.
+  A command that does not parse stops it (exit 2) with its line:
+  `window.script: VOLE_WINDOW_SCRIPT line 1: unknown command ...`.
+- A UI that reads the mouse in its frame (immediate mode) needs a frame
+  between a press and its release: `press 470 345; frames 1; release 470
+  345`. `click` sends both before the next frame.
+- Time does not pass: a program that moves things by the clock between
+  frames moves them by the few microseconds a frame takes. Pause it
+  (life's space) or step it (life's `n`) from the script.
+- In a test case: `// ENV: VOLE_WINDOW_SCRIPT=...` and `// EXPECT-PPM:
+  shot.ppm tests/golden/NAME.ppm region X,Y,W,H` (`tests/examples/
+  gpu-life-script.test` paints and steps examples/gpu/life;
+  `pathtrace-script.test` clicks a button of pathtrace's panel).
