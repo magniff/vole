@@ -101,6 +101,13 @@ into the line before. The limit is only in tests/guide/run.sh.
 `sed -n 1068,1300p table.vl` was blocked (233 lines); the Read tool
 or two ranges did it. Fine, one turn.
 
+### 9. Inherited failures in the last plan
+After merging release-0.25.5 (std255, codegen255) the plan failed `resolve`
+(lsp: std's fmt.vl positions 101 -> 165) and `self_explain` (`not a
+code:time.instructions`); release-0.25.5's own compiler fails both too
+(`tests/run.sh -c REL '=lsp' '=refactor'`). Not mine; reported. 20
+minutes to tell.
+
 ## Never used
 
 - `rewrite`, `refactor --script`: the tables needed refactor table or a
@@ -116,7 +123,7 @@ or two ranges did it. Fine, one turn.
    Vec is a use after free in safe code.
 2. [build] Lower a Vec's `v[i]` without the as_slice call, and share a
    function's bounds-failure blocks: the -O2 self-compile grew 28%
-   (46.2 G to 60.3 G) with six tables.
+   (46.2 G to 60.3 G) with six tables; 61.5 G against release-0.25.5's 47.2 G after the merges.
 3. [test] compile-cost: a count stable under load (the fewest of more
    runs, or user-mode instructions only), and the noise printed with the
    ratio.

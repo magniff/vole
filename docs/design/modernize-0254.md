@@ -543,13 +543,14 @@ load above 30):
 | SRC | 1.03x | the lexer's loops keep SRC.ptr |
 | TYPES | 1.03x (1.030) | the limit |
 | SYMS, DEFS, FILES | 1.03x | each the same as the compiler before it, measured in pairs |
+| the branch, merged with release-0.25.5 (edit255, std255, codegen255) | 1.03x | 4,704.0 M against 4,581.7 M (compile_cost.sh -r 9); interleaved, the fewest of 9: 4,764 M against 4,617 M (1.032), release-0.25.5's own compiler 4,619 M (1.00x); hello 1.08x and std 1.02x, release-0.25.5's own 1.05x and 1.01x |
 
 Trials not committed: FNS +0.2%, TOKS +2.4% (the parser reads tokens
 in its inner loop) on the compiler with TYPES.
 
 The -O2 self-compile (`volec --no-cache -j1 -O2 compiler/src/main.vl
 -c`, each compiler on its own source): 46.2 G instructions before NODES,
-58.0 G with it, 59.4 G with TYPES, 60.3 G with FILES. The compilers'
+58.0 G with it, 59.4 G with TYPES, 60.3 G with FILES; after the merges 61.5 G, where release-0.25.5's compiler on its own source takes 47.2 G (+30%). The compilers'
 speed does not change (the compiler before and after NODES on one
 source: 46.24 G and 46.27 G; 58.0 G and 58.0 G): what grows is the
 work of compiling the source's checked indexing, 8,600 NODES reads each
