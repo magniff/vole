@@ -5,6 +5,7 @@
 4 10 36 40
 2 8 23
 100 297 411
+5 100
 3 7
 ## Each rewrite: the grow goes, the store and its increment are a push
 ## (reads between them one less), reads are len(), `= 0` clear, `-= k`
@@ -119,15 +120,19 @@ note edit.imports: added the imports the new text needs (fix --only imports)
 ## A grow in `if TOK_COUNT >= TOK_CAP { ... }`: the `if` goes with it;
 ## `TOKS = reserve(TOKS, &TOK_CAP, n)` (room for n in all) is a Vec's
 ## reserve of what is missing.
+## (0.25.5) `TOK_COUNT = mark`, mark a `let` set to the count before and
+## assigned nowhere (a rollback), is `TOKS.truncate(mark)`.
 $ refactor table TOKS --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -13 +13 @@
 -use crate::tokens::{TOK_COUNT, add_tok, reserve_toks};
 +use crate::tokens::{TOKS, add_tok, reserve_toks};
-@@ -32 +32 @@
+@@ -32,2 +32,2 @@
 -    println(f"{TOK_COUNT} {crate::tokens::tok(99)} {crate::report::report()}");
+-    println(f"{crate::tokens::try_toks(5)} {TOK_COUNT}");
 +    println(f"{TOKS.len()} {crate::tokens::tok(99)} {crate::report::report()}");
++    println(f"{crate::tokens::try_toks(5)} {TOKS.len()}");
 --- a/tokens.vl
 +++ b/tokens.vl
 @@ -2 +1,0 @@
@@ -151,6 +156,14 @@ $ refactor table TOKS --dry-run
 +        TOKS.push(t * 3);
 @@ -20 +15,0 @@
 -    TOK_COUNT += 1;
+@@ -30 +25 @@
+-    let mark = TOK_COUNT;
++    let mark = TOKS.len();
+@@ -34,2 +29,2 @@
+-    let added = TOK_COUNT - mark;
+-    TOK_COUNT = mark;
++    let added = TOKS.len() - mark;
++    TOKS.truncate(mark);
 note edit.imports: added the imports the new text needs (fix --only imports)
 ## Refused, each use listed: a pointer into the table, the table passed
 ## and assigned, the capacity read, the count written, a call between the
@@ -206,7 +219,7 @@ note edit.imports: added the imports the new text needs (fix --only imports)
 note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
 try: volec fix --only unneeded-unsafe
 $ refactor table TOKS
-made crate::tokens::TOKS a Vec<i64, Comp>: 1 push, 1 len(), 1 reserve()	2 files	+7 -12 lines
+made crate::tokens::TOKS a Vec<i64, Comp>: 1 push, 4 len()s, 1 truncate(), 1 reserve()	2 files	+11 -16 lines
 note edit.imports: added the imports the new text needs (fix --only imports)
 note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
 try: volec fix --only unneeded-unsafe
@@ -216,6 +229,7 @@ fixed 10 unneeded unsafe blocks	4 files	+16 -24 lines
 4 10 36 40
 2 8 23
 100 297 411
+5 100
 3 7
 $ check
 base/mod.vl:4:5: warning[unsafe.unjustified] 12 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root main.vl

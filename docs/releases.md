@@ -80,6 +80,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   are read, so the element would be read through X's old header. Two such
   reads of NODES in front/own/drops.vl (`NODES[t_node(..)]`) take the
   index into a `let` first.
+- (tables255) `volec refactor table X` takes a rollback, `let m =
+  X_COUNT; ... X_COUNT = m;` (m a `let` assigned nowhere), as
+  `X.truncate(m)`.
 - (tables255) `volec fix --only unneeded-justified`: `unneeded-unsafe`'s
   blocks, and the unneeded ones whose `// UNSAFE:`/`// SAFETY:` comments
   justified them (a table's accessors), with those comments.

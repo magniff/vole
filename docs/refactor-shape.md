@@ -143,6 +143,7 @@ resolved, in every module:
 | `X_COUNT` read | `X.len()` (a path keeps its prefix: `crate::m::X.len()`) |
 | `X_COUNT = 0` | `X.clear()` |
 | `X_COUNT -= k` | `X.truncate(X.len() - k)` |
+| `let m = X_COUNT; ... X_COUNT = m` (0.25.5: a rollback; m a `let` of the function set to the count, its one binding there, assigned nowhere) | `let m = X.len(); ... X.truncate(m)` |
 | `X[i]`, `X[i].f`, `X[i] = v`, `X[a..b]` | as they are |
 
 X_COUNT's and X_CAP's statics go, with their names in `use` lines (and
