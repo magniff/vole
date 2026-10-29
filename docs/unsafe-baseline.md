@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, 8f222dd7. The gate's unsafe-audit row
+on Darwin arm64, 75150604. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,17 +14,17 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 4366
+baseline compiler/src unjustified: 4365
 baseline std unjustified: 0
 
 ## compiler/src
 
 ```
-sites: 4478 (4427 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 4366; unneeded: 0
+sites: 4489 (4438 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 4365; unneeded: 0
 
 class	sites	unjustified
-static-mut	2486	2411
-raw-pointer	1429	1410
+static-mut	2489	2411
+raw-pointer	1437	1409
 ffi	304	293
 alloc	134	134
 transmute/cast	116	110
@@ -33,7 +33,7 @@ other	9	8
 module	sites	unjustified
 crate::front	1685	1641
 crate::tools	1224	1169
-crate::middle	728	728
+crate::middle	739	727
 crate::back	579	576
 crate::base	109	101
 crate::gen0	87	87
@@ -63,11 +63,11 @@ compiler/src/front/own/moves.vl	36	30
 compiler/src/front/own/walk.vl	34	34
 compiler/src/back/objfile/mod.vl	33	33
 compiler/src/front/conv.vl	33	32
-(329 more; --all lists every one)
+(330 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	4366	4366
-justified	112	0
+missing both	4365	4365
+justified	124	0
 ```
 
 ## std

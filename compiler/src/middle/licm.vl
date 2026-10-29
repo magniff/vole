@@ -32,7 +32,9 @@ use crate::middle::ir::{
 };
 use crate::middle::ir::atomic::is_barrier;
 use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
+use crate::middle::loops::{invariant_in, loop_preheader, loop_size};
 use crate::middle::opt::{dominates, resolve_all};
+use crate::middle::vecfacts::in_param_vec_header;
 
 fn find_loops(cx: sink *FnCtx, fi: i64) {
     unsafe {
@@ -120,13 +122,18 @@ fn preheader(cx: sink *FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
     }
 }
 
-// Whether something in the loop (blocks marked `stamp`) may write
-// [base + offset, + size): a store, a copy, or a call (unless the base is
-// a private slot).
-fn loop_may_write(cx: sink *FnCtx, start: i64, count: i64, base: i64, offset: i64, size: i64) -> bool {
+// Whether something in the `count` blocks at `blocks` (a loop's) may
+// write [base + offset, + size): a store, a copy, or a call (unless the
+// base is a private slot).
+fn blocks_may_write(cx: sink *FnCtx, blocks: *i64, count: i64, base: i64, offset: i64, size: i64)
+    -> bool {
+    // UNSAFE: the IR's tables through the raw *FnCtx, and `blocks`, a raw
+    // pointer to a loop's block list.
+    // SAFETY: read only; `blocks` has `count` entries (the caller's loop),
+    // every other index an instruction or block id of this function.
     unsafe {
-        for i in start..start + count {
-            var v = cx.blocks[cx.loop_body.data[i]].first;
+        for i in 0..count {
+            var v = cx.blocks[blocks[i]].first;
             while v != 0 {
                 let op = cx.insts[v].op;
                 if op == Op::Store || is_copy(cx, v) {
@@ -150,6 +157,65 @@ fn loop_may_write(cx: sink *FnCtx, start: i64, count: i64, base: i64, offset: i6
     }
 }
 
+// (0.25.4) The loads of loop l (of loops.vl's forest, canonical: it has a
+// preheader) that LICM would hoist and that may run anywhere (inside
+// their object on every path: a static's, a slot's, a reference
+// parameter's field), moved to the preheader before the vectorizer
+// analyzes the loop: a Vec's `ptr` read in every iteration keeps an
+// element's address from being affine in the induction variable alone,
+// and LICM runs after the loop passes. The slots' escapes must be
+// current (find_escaping_slots). Returns whether one moved.
+pub fn hoist_invariant_loads(cx: sink *FnCtx, l: i64) -> bool {
+    // UNSAFE: the IR's tables through the raw *FnCtx, and `blocks`, a raw
+    // pointer into the loop forest's block list.
+    // SAFETY: every index is an instruction or block id of this function;
+    // `blocks` has loop_size(l) entries and does not move (the loop
+    // forest is not rebuilt here: only instructions move).
+    unsafe {
+        let pre = loop_preheader(cx, l);
+        if pre == 0 {
+            return false;
+        }
+        let blocks = &cx.lp_blocks.data[cx.lp_start.data[l]];
+        let count = loop_size(cx, l);
+        var moved = false;
+        for i in 0..count {
+            var v = cx.blocks[blocks[i]].first;
+            while v != 0 {
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Op::Load {
+                    ir_resolve_operands(cx, v);
+                    let a = cx.insts[v].a;
+                    let size = type_size(cx.insts[v].ty);
+                    var offset = cx.insts[v].imm;
+                    let base = address_base(cx, a, &offset);
+                    // (a static's or a slot's address in the loop goes too)
+                    let at_address = !invariant_in(cx, l, a) && is_address_op(cx.insts[a].op);
+                    if (at_address || invariant_in(cx, l, a)) && !op_guarded(cx, v)
+                        && (root_of(cx, base) != 0 || in_param_vec_header(cx, base, offset, size))
+                        && in_object_bounds(cx, a, cx.insts[v].imm, size)
+                        && !blocks_may_write(cx, blocks, count, base, offset, size) {
+                        if at_address {
+                            ir_unlink(cx, a);
+                            ir_append(cx, pre, a);
+                        }
+                        ir_unlink(cx, v);
+                        ir_append(cx, pre, v);
+                        moved = true;
+                    }
+                }
+                v = next;
+            }
+        }
+        moved
+    }
+}
+
+// (0.25.4) Whether op makes a memory object's address (no operands).
+fn is_address_op(op: Op) -> bool {
+    op == Op::GAddr || op == Op::Slot || op == Op::SAddr
+}
+
 fn defined_outside(cx: sink *FnCtx, v: i64, stamp: i64) -> bool {
     unsafe { v == 0 || cx.blocks[cx.insts[v].block].mark != stamp }
 }
@@ -166,12 +232,19 @@ fn is_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
             return false;
         }
         if op == Op::Load {
-            if !defined_outside(cx, cx.insts[v].a, stamp) {
+            // (0.25.4: at a static's, a slot's or a string's address made
+            // in the loop too, which hoist_loop then moves with it: a
+            // static Vec's ptr and len, middle::vecfacts)
+            let a = cx.insts[v].a;
+            if !defined_outside(cx, a, stamp) && !is_address_op(cx.insts[a].op) {
                 return false;
             }
             var offset = cx.insts[v].imm;
             let base = address_base(cx, cx.insts[v].a, &offset);
-            if root_of(cx, base) == 0 {
+            let size = type_size(cx.insts[v].ty);
+            // (0.25.4: or a Vec's header in a reference parameter's
+            // referent: middle::vecfacts)
+            if root_of(cx, base) == 0 && !in_param_vec_header(cx, base, offset, size) {
                 return false;
             }
             // (0.25) Run in the preheader, it runs where the loop may not
@@ -179,12 +252,11 @@ fn is_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
             // static's field, not an element at a variable index, valid
             // only under its bounds check), or one that runs in the first
             // iteration anyway.
-            let size = type_size(cx.insts[v].ty);
             if !in_object_bounds(cx, cx.insts[v].a, cx.insts[v].imm, size)
                 && !runs_first(cx, v, stamp, start, count) {
                 return false;
             }
-            return !loop_may_write(cx, start, count, base, offset, size);
+            return !blocks_may_write(cx, &cx.loop_body.data[start], count, base, offset, size);
         }
         if op.is_call() {
             return call_invariant(cx, v, stamp, start, count);
@@ -413,6 +485,12 @@ fn hoist_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
                     let next = cx.insts[v].next;
                     ir_resolve_operands(cx, v);
                     if is_invariant(cx, v, stamp, start, count) {
+                        // (a load's address made in the loop: is_invariant)
+                        let a = cx.insts[v].a;
+                        if cx.insts[v].op == Op::Load && !defined_outside(cx, a, stamp) {
+                            ir_unlink(cx, a);
+                            ir_append(cx, pre, a);
+                        }
                         ir_unlink(cx, v);
                         ir_append(cx, pre, v);
                         moved = true;
