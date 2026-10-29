@@ -194,7 +194,7 @@ unset VOLE_ROOT
 TAB=$(printf '\t')
 out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.vl 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*${TAB}effects: [a-z(), ]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*${TAB}effects: [A-Za-z(), ]*\$" \
     && printf '%s\n' "$out" | grep -q '^pub fn run_gvn(' && ok=1
 check self_show "$ok" "$out"
 out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.vl 2>&1)

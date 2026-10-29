@@ -15,12 +15,14 @@
 //   X_COUNT (read)                      X.len()
 //   X_COUNT = 0                         X.clear()
 //   X_COUNT -= k                        X.truncate(X.len() - k)
+//   let m = X_COUNT; ... X_COUNT = m    let m = X.len(); ... X.truncate(m) (0.25.5)
 //   X[i], X[i].f, X[i] = v, X[a..b]     as they are
 //
 // and X_COUNT's and X_CAP's statics and their imports go. A use it cannot
 // place (`&X[i]`, a raw pointer into the table; X passed or assigned;
 // X_CAP read; any other write of X_COUNT; a call between a store and its
-// increment that reads X_COUNT) is listed, and nothing is changed.
+// increment that reads X_COUNT; 0.25.5: a call in an index of X that may
+// grow X) is listed, and nothing is changed.
 
 use crate::base::{SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
 use crate::base::comp::Comp;
@@ -36,7 +38,7 @@ use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
 use crate::tools::edit::items::after_line;
 use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
 use crate::tools::query::defs::{
-    DEFS, DEF_COUNT, Def, K_FN, K_IMPL_METHOD, K_METHOD, K_STATIC, K_TRAIT_FN, bytes_eq,
+    DEFS, Def, K_FN, K_IMPL_METHOD, K_METHOD, K_STATIC, K_TRAIT_FN, bytes_eq,
 };
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
@@ -58,37 +60,27 @@ use crate::tools::rewrite::parsed::{
 // loaded program gave (a node, token, definition or position of it).
 
 fn src_text(a: i64, b: i64) -> [u8] {
-    // UNSAFE: SRC is the compiler's raw source table (a *u8 static).
-    // SAFETY: a and b are positions of the loaded program's nodes and
-    // tokens, 0 <= a <= b <= SRC_LEN; the text lives until the run ends.
-    unsafe { SRC[a..b] }
+    SRC[a..b]
 }
 
 fn src_byte(p: i64) -> u8 {
-    // UNSAFE: SRC is the compiler's raw source table (a *u8 static).
-    // SAFETY: p is at most a file's end, and SRC has a 0 after the last
-    // file (base::load_sources), so SRC[p] is in the table.
-    unsafe { SRC[p] }
+    SRC[p]
 }
 
 fn def_of(d: i64) -> Def {
-    // UNSAFE: DEFS is query's raw table of definitions (a *Def static).
-    // SAFETY: d comes from resolve_name or a loop below DEF_COUNT.
-    unsafe { DEFS[d] }
+    DEFS[d]
 }
 
 fn def_count() -> i64 {
-    DEF_COUNT
+    DEFS.len()
 }
 
 fn checked(n: i64) -> Node {
-    // UNSAFE: NODES is the checked program's raw node table.
-    // SAFETY: n is below NODE_COUNT (a loop's bound or a node's child).
-    unsafe { NODES[n] }
+    NODES[n]
 }
 
 fn node_count() -> i64 {
-    crate::front::ast::NODE_COUNT
+    crate::front::ast::NODES.len()
 }
 
 fn fn_node(f: i64) -> i64 {
@@ -382,6 +374,13 @@ static var FN_KEYS: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var FN_ENDS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 // fn start + 1 -> 1: it reads X_COUNT (directly or by a call)
 static var READS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// (0.25.5) fn start + 1 -> 1: it writes X or X_COUNT (directly or by a
+// call). `X[f(..)]` takes X's buffer and length before it calls f: when f
+// grows X, the element is read through the header X had before the call (a
+// buffer since freed, a length since passed). The raw table read the same
+// stale pointer; as a Vec, a new element is refused by the bounds check
+// and an old one is read from freed memory.
+static var GROWS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // The functions' spans, sorted by start (keys: start * 2^20 + def).
 fn collect_fns() {
@@ -418,17 +417,11 @@ fn fn_at(pos: i64) -> i64 {
     if pos < FN_ENDS.get(start + 1) - 1 { start } else { -1 }
 }
 
-// READS: the functions naming X_COUNT, then their callers, to a fixpoint.
-fn reading_fns(count_refs: Vec<i64, Comp>) {
-    for p in count_refs.iter() {
-        let f = fn_at(p);
-        if f >= 0 {
-            READS.put(f + 1, 1);
-        }
-    }
-    // (caller start, callee start) of each resolved call
-    var callers: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var callees: Vec<i64, Comp> = Vec::new_in(Comp {});
+// (caller start, callee start) of each call the checker resolved
+static var CALLERS: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var CALLEES: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+fn call_edges() {
     for n in 1..node_count() {
         let nd = checked(n);
         if nd.kind != NodeKind::Call || nd.x <= 0 {
@@ -437,20 +430,81 @@ fn reading_fns(count_refs: Vec<i64, Comp>) {
         let from = fn_at(nd.start);
         let to = fn_at(checked(fn_node(nd.x - 1)).start);
         if from >= 0 && to >= 0 && from != to {
-            callers.push(from);
-            callees.push(to);
+            CALLERS.push(from);
+            CALLEES.push(to);
+        }
+    }
+}
+
+// READS: the functions naming X_COUNT, then their callers, to a fixpoint.
+fn reading_fns(count_refs: Vec<i64, Comp>) {
+    for p in count_refs.iter() {
+        let f = fn_at(p);
+        if f >= 0 {
+            READS.put(f + 1, 1);
         }
     }
     var changed = true;
     while changed {
         changed = false;
-        for i in 0..callers.len() {
-            if READS.get(callees[i] + 1) != 0 && READS.get(callers[i] + 1) == 0 {
-                READS.put(callers[i] + 1, 1);
+        for i in 0..CALLERS.len() {
+            if READS.get(CALLEES[i] + 1) != 0 && READS.get(CALLERS[i] + 1) == 0 {
+                READS.put(CALLERS[i] + 1, 1);
                 changed = true;
             }
         }
     }
+}
+
+// (0.25.5) GROWS: the functions writing X itself (`X = grow(..)`, `X =
+// reserve(..)`) or X_COUNT (`+= 1`, `= 0`, `-= k`), at write positions
+// (parsed: the left of an assignment), then their callers, to a fixpoint.
+fn growing_fns(writes: Vec<i64, Comp>) {
+    for p in writes.iter() {
+        let f = fn_at(p);
+        if f >= 0 {
+            GROWS.put(f + 1, 1);
+        }
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..CALLERS.len() {
+            if GROWS.get(CALLEES[i] + 1) != 0 && GROWS.get(CALLERS[i] + 1) == 0 {
+                GROWS.put(CALLERS[i] + 1, 1);
+                changed = true;
+            }
+        }
+    }
+}
+
+// (0.25.5) Whether parsed name expression e (of X or X_COUNT) is written:
+// the left of an assignment.
+fn written(e: i64) -> bool {
+    let par = parent(e);
+    par > 0 && pk(par) == NodeKind::Assign && pb(par) == e
+}
+
+// (0.25.5) A call in SRC[a..b) that may grow X: one to a function of GROWS,
+// or one the checker did not resolve. Its start, or -1; PROB_A, PROB_B: the
+// call.
+fn growing_call(a: i64, b: i64) -> i64 {
+    for n in 1..node_count() {
+        let nd = checked(n);
+        if nd.kind != NodeKind::Call || nd.start < a || nd.start >= b {
+            continue;
+        }
+        let grows = if nd.x <= 0 { true } else {
+            let to = fn_at(checked(fn_node(nd.x - 1)).start);
+            to >= 0 && GROWS.get(to + 1) != 0
+        };
+        if grows {
+            PROB_A = nd.start;
+            PROB_B = nd.end;
+            return nd.start;
+        }
+    }
+    -1
 }
 
 // Whether a `break` or `continue` at parsed node n leaves SRC[a..):
@@ -823,6 +877,13 @@ fn place_x(e: i64) {
             if ix > 0 { ix } else { e });
         return;
     }
+    // (0.25.5) a call in the index that may grow X (GROWS)
+    if growing_call(pstart(pb(ix)), pend(pb(ix))) >= 0 {
+        refuse(pstart(ix),
+            c"a call in X[i]'s index that may grow X (X's buffer and length are read before it): take the index into a `let` first",
+            ix);
+        return;
+    }
     // (the place an element starts: up through fields and indices)
     var place = ix;
     var up = parent(place);
@@ -838,8 +899,43 @@ fn place_x(e: i64) {
     }
 }
 
+// (0.25.5) Whether the local `name` is a mark of X_COUNT for the assignment
+// `X_COUNT = name` (parsed node asg): its one binding in asg's function is
+// `let name = X_COUNT;` before it, and nothing assigns it. The rollback
+// (`let first = TOK_COUNT; ... TOK_COUNT = first;`) is then a truncate:
+// the count only grows from the mark, by pushes, until it is set back.
+fn is_mark(asg: i64, name: i64) -> bool {
+    let f = fn_at(pstart(asg));
+    if f < 0 {
+        return false;
+    }
+    let end = FN_ENDS.get(f + 1) - 1;
+    var found = false;
+    for n in 1..PROGRAM_END {
+        let s = pstart(n);
+        if s < f || s >= end {
+            continue;
+        }
+        let k = pk(n);
+        if k == NodeKind::Let && pk(pa(n)) == NodeKind::PatBind && pa(pa(n)) == name {
+            if s >= pstart(asg) || !is_name(pc(n), C_SYM) || found {
+                return false;
+            }
+            found = true;
+        } else if k == NodeKind::PatBind && pa(n) == name && parent(n) > 0
+            && pk(parent(n)) != NodeKind::Let {
+            // (bound by a pattern elsewhere: a match arm, a for)
+            return false;
+        } else if k == NodeKind::Assign && pk(pb(n)) == NodeKind::Ident && pa(pb(n)) == name {
+            return false;
+        }
+    }
+    found
+}
+
 // X_COUNT at name expression e: a read is `X.len()` (one more or less in
-// a sequence's span), `= 0` clear, `-= k` truncate; other writes refused.
+// a sequence's span), `= 0` clear, `-= k` truncate, `= mark` (a local
+// set to X_COUNT before, is_mark) truncate(mark); other writes refused.
 fn place_count(e: i64) {
     let par = parent(e);
     if par > 0 && pk(par) == NodeKind::Assign && pb(par) == e {
@@ -862,6 +958,17 @@ fn place_count(e: i64) {
             buf_str(t, if paren { c".len() - (" } else { c".len() - " });
             edit(pstart(par), pstart(v), buf_slice(t));
             edit(pend(v), pend(v), if paren { "))".as_bytes() } else { ")".as_bytes() });
+            N_TRUNC += 1;
+            return;
+        }
+        if op == Tok::Eq && pk(v) == NodeKind::Ident && is_mark(par, pa(v)) {
+            // (0.25.5) a rollback to a mark read before: a truncate
+            let t = buf_new();
+            put_x(t, e);
+            buf_str(t, c".truncate(");
+            buf_bytes(t, src_text(pstart(v), pend(v)));
+            buf_byte(t, ')');
+            edit(pstart(par), pend(par), buf_slice(t));
             N_TRUNC += 1;
             return;
         }
@@ -1318,7 +1425,22 @@ fn table_inner(c: Call) -> i64 {
             count_reads.push(cpos[i]);
         }
     }
+    call_edges();
     reading_fns(count_reads);
+    var writes: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for p in xpos.iter() {
+        let id = ident_at(p, X_SYM);
+        if id > 0 && written(expr_of(id)) {
+            writes.push(p);
+        }
+    }
+    for p in cpos.iter() {
+        let id = ident_at(p, C_SYM);
+        if id > 0 && written(expr_of(id)) {
+            writes.push(p);
+        }
+    }
+    growing_fns(writes);
 
     // 1. The grows and the stores after them; 2. the stores without one.
     for i in 0..xpos.len() {

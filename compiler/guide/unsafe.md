@@ -124,7 +124,8 @@ defined:
 - `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
   (unneeded)` blocks away and keeps their code in its scope; a block it
   cannot open so (one that declares and is not last) is left and
-  counted.
+  counted. `--only unneeded-justified` (0.25.5) takes the justified ones
+  too, with their `// UNSAFE:` and `// SAFETY:` comments.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access
