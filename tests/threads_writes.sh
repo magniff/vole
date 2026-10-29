@@ -162,7 +162,11 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
-READ='gen0::gen::STATIC_NAMED	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
+READ='base::timer::TIME_INSTRUCTIONS	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
+base::timer::PERF_FD	off: the same; opened by counters_open on the main thread before the tasks, read-only after
+base::timer::COUNTERS_OFF	off: the same (counters_open)
+middle::vectorize::VEC_STATS_FN	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
+gen0::gen::STATIC_NAMED	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
 middle::vecfacts::VEC_TMPL	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
 middle::vecfacts::WRAPS	key: the same (std'"'"'s Vec wrappers)
 back::mc_arm64::atomic::A64_LSE_FLAG	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks

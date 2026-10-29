@@ -1,14 +1,128 @@
 // --time-passes (0.6): the CPU time of each phase of a compilation, on
 // stderr. clock() is CPU time in microseconds (CLOCKS_PER_SEC is a million
 // on macOS and glibc alike). Timing changes nothing the compiler emits.
+// (0.25.5) --time-passes=instructions: the instructions retired instead,
+// which a loaded machine hardly changes, from the system's own counter:
+// macOS's proc_info (proc_pid_rusage's ri_instructions), Linux's
+// perf_event_open (user space; where perf_event_paranoid or a container
+// refuses it, the build stops with time.instructions).
 
 use crate::base::{STDERR, buf_fmt, buf_new, buf_write_fd, cstr};
+use crate::base::target::{T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_MACOS};
 
 extern "C" {
     fn clock() -> u64;
 }
 
 pub static var TIME_PASSES: bool = false;
+
+// (0.25.5) --time-passes=instructions: the phases' counts are
+// instructions retired, not microseconds.
+pub static var TIME_INSTRUCTIONS: bool = false;
+
+// Linux's perf_event_open counter (-1: not opened, -2: refused); set by
+// counters_open before the tasks, read-only after.
+static var PERF_FD: i64 = -1;
+// $VOLE_COUNTERS: 0 not read yet (counters_open), 1 off, 2 on.
+static var COUNTERS_OFF: i64 = 0;
+
+// UNSAFE: the system's counters are reached through C: syscall (on macOS
+// and Linux alike, unlike proc_pid_rusage), read and getpid.
+// SAFETY: instructions_retired passes each a buffer of the size it says.
+extern "C" {
+    #[link_name = "syscall"]
+    fn timer_syscall(number: i64, ...) -> i64;
+    #[link_name = "read"]
+    fn timer_read(fd: i32, buf: *u8, n: u64) -> i64;
+    #[link_name = "getpid"]
+    fn timer_getpid() -> i32;
+}
+
+// Opens the system's counter, on the main thread before any task: false
+// when the system will not count (instructions_retired then says -1).
+pub fn counters_open() -> bool {
+    // ($VOLE_COUNTERS=off: the counter refuses, as a container's
+    // perf_event_open does; for the tests)
+    // UNSAFE: getenv, a C function, and its C string.
+    // SAFETY: the name is a constant C string; the value is read up to its
+    // NUL on the main thread, while nothing changes the environment.
+    let off = unsafe {
+        let v = crate::base::getenv(c"VOLE_COUNTERS");
+        v != 0 as *u8 && crate::base::streq(v, c"off")
+    };
+    COUNTERS_OFF = if off { 1 } else { 2 };
+    let host = crate::host_target();
+    if !off && host != T_AARCH64_MACOS && host != T_X86_64_MACOS {
+        // perf_event_attr: type PERF_TYPE_HARDWARE (0), size 128, config
+        // PERF_COUNT_HW_INSTRUCTIONS (1), flags exclude_kernel (bit 5) and
+        // exclude_hv (bit 6); this thread (a build that counts runs its
+        // tasks on it: serial_only), any CPU, no group.
+        var attr: [u64; 16] = [0; 16];
+        attr[0] = 128 << 32;
+        attr[1] = 1;
+        attr[5] = 1 << 5 | 1 << 6;
+        let number = if host == T_AARCH64_LINUX { 241 } else { 298 };
+        // UNSAFE: a system call (syscall, a C function), with a struct's
+        // address.
+        // SAFETY: attr is the 128 bytes the call is told it has; the kernel
+        // only reads it.
+        let fd = unsafe { timer_syscall(number, &attr as *u8, 0, -1, -1, 0) };
+        PERF_FD = if fd < 0 { -2 } else { fd };
+    }
+    instructions_retired() >= 0
+}
+
+// The instructions this process has retired, or -1 when the system will
+// not say (or counters_open has not run).
+pub fn instructions_retired() -> i64 {
+    if COUNTERS_OFF != 2 {
+        return -1;
+    }
+    let host = crate::host_target();
+    if host == T_AARCH64_MACOS || host == T_X86_64_MACOS {
+        // proc_info(PROC_INFO_CALL_PIDRUSAGE = 9, pid, RUSAGE_INFO_V4 = 4,
+        // 0, buffer, its size): a struct rusage_info_v4 (296 bytes), its
+        // ri_instructions at 248.
+        var info: [u8; 296] = [0; 296];
+        // UNSAFE: a system call (syscall, a C function), with a buffer's
+        // address.
+        // SAFETY: info has the 296 bytes the call is told it has, and the
+        // kernel writes at most that many.
+        let r = unsafe { timer_syscall(336, 9, timer_getpid() as i64, 4, 0, &info as *u8, 296) };
+        if r != 0 {
+            return -1;
+        }
+        return le64(info[248..256]);
+    }
+    if PERF_FD < 0 {
+        return -1;
+    }
+    var count: [u8; 8] = [0; 8];
+    // UNSAFE: read, a C function, into a buffer by its address.
+    // SAFETY: count has the 8 bytes read is told it may write.
+    let n = unsafe { timer_read(PERF_FD as i32, &count as *u8, 8) };
+    if n != 8 { -1 } else { le64(count[..]) }
+}
+
+// A little-endian 64-bit number.
+fn le64(b: [u8]) -> i64 {
+    var v = 0;
+    for i in 0..8 {
+        v = v | (b[i] as i64) << (8 * i);
+    }
+    v
+}
+
+// The counter --time-passes reads: CPU time, or instructions retired.
+fn now() -> i64 {
+    if TIME_INSTRUCTIONS {
+        instructions_retired()
+    } else {
+        // UNSAFE: clock, a C function.
+        // SAFETY: it takes nothing and returns a number.
+        unsafe { clock() as i64 }
+    }
+}
 
 pub const T_PARSE: i64 = 0;
 pub const T_CHECK: i64 = 1;
@@ -75,25 +189,23 @@ fn phase_name(k: i64) -> *u8 {
 
 // The time now (0 when not timing).
 pub fn timer_now() -> i64 {
-    if TIME_PASSES { unsafe { clock() as i64 } } else { 0 }
+    if TIME_PASSES { now() } else { 0 }
 }
 
 // The time since `start` taken out of phase `outer` (which runs it) and
 // added to phase k.
 pub fn timer_sub(outer: i64, k: i64, start: i64) {
     if TIME_PASSES {
-        unsafe {
-            let spent = clock() as i64 - start;
-            T_TOTALS[k] += spent;
-            T_TOTALS[outer] -= spent;
-        }
+        let spent = now() - start;
+        T_TOTALS[k] += spent;
+        T_TOTALS[outer] -= spent;
     }
 }
 
 // Adds the time since `start` to phase k.
 pub fn timer_add(k: i64, start: i64) {
     if TIME_PASSES {
-        unsafe { T_TOTALS[k] += clock() as i64 - start; }
+        T_TOTALS[k] += now() - start;
     }
 }
 
@@ -103,6 +215,9 @@ pub fn timer_report() {
     }
     let out = buf_new();
     let total = T_TOTALS[0..T_COUNT].iter().sum();
+    // (microseconds printed as milliseconds; instructions as millions)
+    let unit = if TIME_INSTRUCTIONS { 1000000 } else { 1000 };
+    let name = if TIME_INSTRUCTIONS { "M" } else { "ms" };
     for i in 0..T_COUNT {
         // (in order: reading, parsing, checking, effects, own, the
         // tools' index, cache and answer, then the middle and back ends)
@@ -111,11 +226,14 @@ pub fn timer_report() {
         if T_TOTALS[k] == 0 {
             continue;
         }
-        buf_fmt(out, f"{T_TOTALS[k] / 1000}.");
-        let frac = (T_TOTALS[k] % 1000) / 100;
-        buf_fmt(out, f"{frac} ms  {cstr(phase_name(k))}\n");
+        let frac = (T_TOTALS[k] % unit) / (unit / 10);
+        buf_fmt(out, f"{T_TOTALS[k] / unit}.{frac} {name}  {cstr(phase_name(k))}\n");
     }
-    buf_fmt(out, f"{total / 1000} ms  total\n");
+    if TIME_INSTRUCTIONS {
+        buf_fmt(out, f"{total / unit} M  total (instructions retired)\n");
+    } else {
+        buf_fmt(out, f"{total / unit} ms  total\n");
+    }
     if T_IR_BYTES[0] > 0 {
         buf_fmt(out,
             f"{T_IR_BYTES[0] / 1000000} MB  IR lowered, {T_IR_BYTES[1] / 1000000} MB optimized\n");
