@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 //     let h = thread::spawn(move || work(input));
 //     let r = h.join();
 
+// UNSAFE: C's allocator and POSIX threads, which take raw pointers.
+// SAFETY: the prototypes are stdlib.h's, pthread.h's, sched.h's and
+// unistd.h's (pthread_t as u64, as on macOS and Linux).
 extern "C" {
     #[link_name = "malloc"]
     fn thread_c_malloc(n: u64) -> *u8;
@@ -62,6 +65,9 @@ struct Packet<F, R> { f: F, out: *Out<R> }
 // The thread's first frame (C's convention, the address pthread_create
 // takes).
 extern "C" fn thread_start(arg: *u8) -> *u8 {
+    // UNSAFE: the start record through its raw pointer.
+    // SAFETY: arg is the Start spawn wrote, given to this thread only; it is
+    // read and freed once, before run.
     unsafe {
         let s = arg as *Start;
         let run = (*s).run;
@@ -74,6 +80,10 @@ extern "C" fn thread_start(arg: *u8) -> *u8 {
 
 // The thread's work: the closure called, its result published.
 fn thread_run<F: FnMut() -> R, R>(data: *u8) {
+    // UNSAFE: the packet and the result's place through raw pointers.
+    // SAFETY: data is the Packet spawn wrote for this thread only, moved out
+    // and freed once; out is live while refs > 0, and this thread holds one
+    // ref until its fetch_sub (AcqRel: the handle's side comes before).
     unsafe {
         let q = data as *Packet<F, R>;
         var p = *q;
@@ -92,11 +102,16 @@ fn thread_run<F: FnMut() -> R, R>(data: *u8) {
 
 // A running thread, joined by `join` or left to run (detached) when the
 // handle is dropped.
+#[sealed]
 pub struct JoinHandle<R> { t: u64, out: *Out<R> }
 
 impl<R> JoinHandle<R> {
     // Waits for the thread to finish; its closure's result.
     pub fn join(sink self) -> R {
+        // UNSAFE: pthread_join and the result's place through its raw pointer.
+        // SAFETY: the handle holds a ref, so out is live; after the join the
+        // thread is done with it, so it is moved out and freed once (out nulled:
+        // the handle's drop then does nothing).
         unsafe {
             var h = self;
             thread_c_join(h.t, 0 as *u64);
@@ -111,6 +126,9 @@ impl<R> JoinHandle<R> {
 
 impl<R> Drop for JoinHandle<R> {
     fn drop(inout self) {
+        // UNSAFE: pthread_detach and the result's place through its raw pointer.
+        // SAFETY: out is live (the handle's ref, not given up by a join); the last
+        // of the thread and the handle (refs) frees it, once.
         unsafe {
             if self.out == 0 as *Out<R> {
                 return;
@@ -132,6 +150,11 @@ const THREAD_STACK: u64 = 8388608;
 
 // Starts a thread running f; its handle.
 pub fn spawn<F: FnMut() -> R, R>(f: sink F) -> JoinHandle<R> {
+    // UNSAFE: C memory for the thread's records, and pthread_create.
+    // SAFETY: each malloc is checked non-null and has the record's size
+    // (malloc's alignment, 16, is enough for records of words, a closure and
+    // an Option); raw writes drop nothing; attr is 128 bytes, more than a
+    // pthread_attr_t; the Start and Packet go to the new thread only.
     unsafe {
         std::fmt::print_threads_started();
         let out = thread_c_malloc(size_of(Out<R>) as u64) as *Out<R>;
@@ -162,6 +185,7 @@ pub fn spawn<F: FnMut() -> R, R>(f: sink F) -> JoinHandle<R> {
 }
 
 // The threads a `scope` started, joined when it ends: a list.
+#[sealed]
 pub struct Scope { first: *ScopeJoin }
 
 // A thread of a scope: its handle's join, erased, and the next one.
@@ -169,11 +193,15 @@ struct ScopeJoin { join: fn(*u8), handle: *u8, next: *ScopeJoin }
 
 // A thread started in a scope: `join` gives its result; a thread not
 // joined by hand is joined when the scope ends.
+#[sealed]
 pub struct ScopedJoinHandle<R> { slot: *ScopeHandle<R> }
 
 struct ScopeHandle<R> { h: Option<JoinHandle<R>>, done: bool }
 
 fn scope_join<R>(p: *u8) {
+    // UNSAFE: the scope's slot through its raw pointer.
+    // SAFETY: p is the ScopeHandle Scope::spawn made, live until this frees it
+    // (once: scope calls each node's join once).
     unsafe {
         let s = p as *ScopeHandle<R>;
         if !(*s).done {
@@ -194,6 +222,10 @@ fn scope_join<R>(p: *u8) {
 impl<R> ScopedJoinHandle<R> {
     // Waits for the thread; its result.
     pub fn join(sink self) -> R {
+        // UNSAFE: the scope's slot through its raw pointer.
+        // SAFETY: the slot is live until the scope ends, and the handle cannot
+        // outlive the scope (sync.scope_escape); a second join finds None and
+        // panics.
         unsafe {
             let s = self.slot;
             (*s).done = true;
@@ -207,6 +239,9 @@ impl<R> ScopedJoinHandle<R> {
 impl Scope {
     // Starts a thread running f, joined at the latest when the scope ends.
     pub fn spawn<F: FnMut() -> R, R>(inout self, f: sink F) -> ScopedJoinHandle<R> {
+        // UNSAFE: C memory for the slot and the scope's node.
+        // SAFETY: both checked non-null, with their records' sizes; raw writes
+        // drop nothing; the node is linked into this scope only.
         unsafe {
             let slot = thread_c_malloc(size_of(ScopeHandle<R>) as u64) as *ScopeHandle<R>;
             if slot == 0 as *ScopeHandle<R> {
@@ -227,6 +262,9 @@ impl Scope {
 // Runs f with a scope; every thread started in it is joined before scope
 // returns f's result.
 pub fn scope<F: FnMut(inout Scope) -> R, R>(f: sink F) -> R {
+    // UNSAFE: walks the scope's list through raw pointers.
+    // SAFETY: every node is one Scope::spawn made for s, live until freed here,
+    // once; its join frees its slot.
     unsafe {
         var s = Scope { first: 0 as *ScopeJoin };
         var g = f;
@@ -244,11 +282,13 @@ pub fn scope<F: FnMut(inout Scope) -> R, R>(f: sink F) -> R {
 
 // Lets another thread run.
 pub fn yield_now() {
+    // UNSAFE: C. SAFETY: sched_yield takes nothing.
     unsafe { thread_c_yield(); }
 }
 
 // How many threads can run at once (the CPUs online), at least 1.
 pub fn available_parallelism() -> i64 {
+    // UNSAFE: C. SAFETY: sysconf takes an int.
     let n = unsafe { thread_c_sysconf(std::SYS_SC_NPROCESSORS_ONLN) };
     if n < 1 { 1 } else { n }
 }
@@ -264,6 +304,8 @@ pub fn available_parallelism() -> i64 {
 // allocated from C at its first access and freed when the thread ends. A
 // thread-local's drop does not run.
 
+// UNSAFE: POSIX thread-specific data and memcpy, with raw pointers.
+// SAFETY: the prototypes are pthread.h's and string.h's.
 extern "C" {
     #[link_name = "pthread_key_create"]
     #[effects(sync)]
@@ -289,11 +331,16 @@ static var TLS_LOCK: std::sync::RawLock = std::sync::RawLock {
 };
 
 extern "C" fn tls_free(p: *u8) {
+    // UNSAFE: C's free. SAFETY: p is a thread's copy tls_first allocated, freed
+    // once, by the key's destructor when the thread ends.
     unsafe { thread_c_free(p); }
 }
 
 // This thread's copy of the thread-local whose initial value (size bytes)
 // is at template.
+// UNSAFE: returns a raw pointer to this thread's copy.
+// SAFETY: (the caller's: the compiler's) template is a thread-local's
+// initial value of size bytes, live for the program.
 pub unsafe fn __tls_addr(template: *u8, size: i64) -> *u8 {
     let key = tls_key(template);
     let p = tls_c_get(key);
@@ -303,6 +350,9 @@ pub unsafe fn __tls_addr(template: *u8, size: i64) -> *u8 {
     tls_first(key, template, size)
 }
 
+// UNSAFE: C memory and a copy from a raw pointer.
+// SAFETY: (the caller's) template has size bytes; p is checked non-null,
+// with room for them.
 #[inline(never)]
 unsafe fn tls_first(key: u64, template: *u8, size: i64) -> *u8 {
     let n = if size > 0 { size } else { 1 };
@@ -315,6 +365,9 @@ unsafe fn tls_first(key: u64, template: *u8, size: i64) -> *u8 {
     p
 }
 
+// UNSAFE: atomic loads of the key table's statics through raw pointers.
+// SAFETY: i stays in 0..TLS_SLOTS (a hash's top 10 bits, then mod); the
+// table is written only under TLS_LOCK, a key before its address (release).
 unsafe fn tls_key(template: *u8) -> u64 {
     let a = template as u64;
     var i = ((a >> 4) * 0x9e3779b97f4a7c15 >> 54) as i64;
@@ -330,6 +383,8 @@ unsafe fn tls_key(template: *u8) -> u64 {
     }
 }
 
+// UNSAFE: the key table through raw pointers, and pthread_key_create.
+// SAFETY: under TLS_LOCK; i stays in 0..TLS_SLOTS; key is a local.
 #[inline(never)]
 unsafe fn tls_new_key(a: u64) -> u64 {
     TLS_LOCK.lock();

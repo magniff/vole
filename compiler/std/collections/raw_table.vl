@@ -105,6 +105,9 @@ fn raw_buckets_for(cap: i64) -> i64 {
 
 // Sets n control bytes at ctrl to EMPTY; the caller guarantees that they
 // are writable.
+// UNSAFE: writes control bytes through a raw pointer, a group at a time.
+// SAFETY: the caller's: ctrl[0..n] is writable (a table's buckets + GROUP control bytes); the
+// group stores end at n / GROUP * GROUP <= n, the byte loop below n.
 unsafe fn raw_fill_empty(ctrl: *u8, n: i64) {
     for g in 0..n / GROUP {
         group_store(ctrl, g * GROUP, 0xffffffffffffffffu64);
@@ -173,6 +176,11 @@ impl<T, A: Allocator> RawTable<T, A> {
     // Allocates `buckets` empty buckets for an empty table.
     fn alloc_buckets(inout self, buckets: i64) {
         let (size, align, ctrl_at) = RawTable::<T, A>::raw_layout(buckets);
+        // UNSAFE: the table's one allocation is split by raw pointers into buckets and control
+        // bytes.
+        // SAFETY: alloc returns size = ctrl_at + buckets + GROUP bytes (or stops the program),
+        // aligned for T and for u64 loads; ctrl_at >= buckets * size_of(T), so the control
+        // bytes follow the buckets inside it, all set EMPTY before use.
         unsafe {
             let p = self.alloc.alloc(size, align);
             self.data = p as *T;
@@ -190,6 +198,9 @@ impl<T, A: Allocator> RawTable<T, A> {
         if i < 0 || i > self.bucket_mask || self.bucket_mask == 0 {
             return false;
         }
+        // UNSAFE: reads a control byte through the raw pointer.
+        // SAFETY: the table is allocated and 0 <= i <= bucket_mask (checked above), below its
+        // buckets + GROUP control bytes.
         unsafe { self.ctrl[i] & 0x80 == 0 }
     }
 
@@ -197,6 +208,8 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[inline]
     fn check_full(self, i: i64) {
         if !self.is_full(i) {
+            // UNSAFE: std::panic takes a C string.
+            // SAFETY: a NUL-terminated c"" literal (std::panic for --trace's frames).
             unsafe { panic(c"RawTable: the bucket is not full") }
         }
     }
@@ -214,6 +227,10 @@ impl<T, A: Allocator> RawTable<T, A> {
         var stride = 0;
         // (triangular steps visit every group: the loop ends by then)
         for _ in 0..(mask >> 3) + 1 {
+            // UNSAFE: an unaligned 8-byte load of control bytes through the raw pointer (the
+            // Swiss table's probe, HashMap's hot path).
+            // SAFETY: mask != 0, so the table is allocated; pos <= mask, and the GROUP bytes from
+            // pos are below buckets + GROUP, all control bytes.
             let g = unsafe { group_load(self.ctrl, pos) };
             var m = match_tag(g, tag);
             for _ in 0..GROUP {
@@ -221,6 +238,9 @@ impl<T, A: Allocator> RawTable<T, A> {
                     break;
                 }
                 let i = (pos + bitmask_lowest(m)) & mask;
+                // UNSAFE: a view of bucket i's element through the raw pointer.
+                // SAFETY: i <= mask is a bucket; its control byte matched a tag, a FULL byte, so
+                // the element is initialized; eq borrows it for the call only.
                 if unsafe { eq(*(&self.data[i])) } {
                     return i;
                 }
@@ -251,6 +271,8 @@ impl<T, A: Allocator> RawTable<T, A> {
         var stride = 0;
         var slot = -1;
         for _ in 0..(mask >> 3) + 1 {
+            // UNSAFE: an unaligned 8-byte load of control bytes (as find's).
+            // SAFETY: mask != 0 (allocated) and pos <= mask: the bytes are control bytes.
             let g = unsafe { group_load(self.ctrl, pos) };
             var m = match_tag(g, tag);
             for _ in 0..GROUP {
@@ -258,6 +280,8 @@ impl<T, A: Allocator> RawTable<T, A> {
                     break;
                 }
                 let i = (pos + bitmask_lowest(m)) & mask;
+                // UNSAFE: a view of bucket i's element (as find's).
+                // SAFETY: i <= mask, a FULL bucket (a tag matched): initialized, borrowed for eq.
                 if unsafe { eq(*(&self.data[i])) } {
                     return i;
                 }
@@ -285,14 +309,23 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[inline]
     pub fn insert_in_slot(inout self, hash: u64, slot: i64, x: sink T) -> i64 {
         if slot < 0 || slot > self.bucket_mask || self.bucket_mask == 0 {
+            // UNSAFE: std::panic takes a C string.
+            // SAFETY: a NUL-terminated c"" literal.
             unsafe { panic(c"RawTable::insert_in_slot: no such bucket") }
         }
+        // UNSAFE: reads a control byte through the raw pointer.
+        // SAFETY: the table is allocated and 0 <= slot <= bucket_mask (checked above).
         let old = unsafe { self.ctrl[slot] };
         // (a FULL bucket, or an EMPTY one with no growth left, is no slot)
         if old & 0x80 == 0 || (old == CTRL_EMPTY && self.growth_left == 0) {
+            // UNSAFE: std::panic takes a C string.
+            // SAFETY: a NUL-terminated c"" literal.
             unsafe { panic(c"RawTable::insert_in_slot: not a free slot") }
         }
         self.record_insert(slot, old, hash);
+        // UNSAFE: x moves into the bucket through the raw pointer.
+        // SAFETY: slot is a bucket (checked) that was EMPTY or DELETED (checked), so nothing
+        // there is overwritten without its drop; its control byte now says FULL.
         unsafe {
             self.data[slot] = x;
         }
@@ -304,12 +337,18 @@ impl<T, A: Allocator> RawTable<T, A> {
     // for those the table moves when it grows.
     pub fn insert<H: FnMut(let T) -> u64>(inout self, hash: u64, x: sink T, hasher: H) -> i64 {
         var i = if self.bucket_mask == 0 { -1 } else { self.find_insert_slot(hash) };
+        // UNSAFE: reads a control byte through the raw pointer.
+        // SAFETY: only when i >= 0 (||), a bucket find_insert_slot gave of the allocated table.
         if i < 0 || (self.growth_left == 0 && unsafe { self.ctrl[i] } == CTRL_EMPTY) {
             self.reserve_rehash(1, hasher);
             i = self.find_insert_slot(hash);
         }
+        // UNSAFE: reads a control byte through the raw pointer.
+        // SAFETY: i is find_insert_slot's bucket of the (now allocated) table.
         let old = unsafe { self.ctrl[i] };
         self.record_insert(i, old, hash);
+        // UNSAFE: x moves into the bucket through the raw pointer.
+        // SAFETY: i was EMPTY or DELETED (find_insert_slot's), so nothing live is overwritten.
         unsafe {
             self.data[i] = x;
         }
@@ -331,6 +370,8 @@ impl<T, A: Allocator> RawTable<T, A> {
         var pos = hash as i64 & mask;
         var stride = 0;
         for _ in 0..(mask >> 3) + 1 {
+            // UNSAFE: an unaligned 8-byte load of control bytes (as find's).
+            // SAFETY: the callers call it on an allocated table; pos <= mask: control bytes.
             let e = match_empty_or_deleted(unsafe { group_load(self.ctrl, pos) });
             if e != 0 {
                 return self.fix_insert_slot((pos + bitmask_lowest(e)) & mask);
@@ -338,6 +379,8 @@ impl<T, A: Allocator> RawTable<T, A> {
             stride += GROUP;
             pos = (pos + stride) & mask;
         }
+        // UNSAFE: std::panic takes a C string.
+        // SAFETY: a NUL-terminated c"" literal.
         unsafe { panic(c"RawTable: no free bucket") }
     }
 
@@ -347,7 +390,12 @@ impl<T, A: Allocator> RawTable<T, A> {
     // from bucket 0.
     #[inline]
     fn fix_insert_slot(self, i: i64) -> i64 {
+        // UNSAFE: a control byte, then a group, read through the raw pointer.
+        // SAFETY: i is a bucket of the allocated table (the callers' probe); the group at 0 is
+        // the first GROUP of its buckets + GROUP control bytes.
         if unsafe { self.ctrl[i] } & 0x80 == 0 {
+            // UNSAFE: as above.
+            // SAFETY: as above: bytes 0..GROUP are control bytes.
             return bitmask_lowest(match_empty_or_deleted(unsafe { group_load(self.ctrl, 0) }));
         }
         i
@@ -357,6 +405,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[inline]
     fn set_ctrl(inout self, i: i64, c: u8) {
         let mirror = ((i - GROUP) & self.bucket_mask) + GROUP;
+        // UNSAFE: writes two control bytes through the raw pointer.
+        // SAFETY: i is a bucket (<= mask) of the allocated table, and mirror <= mask + GROUP,
+        // below buckets + GROUP: both are control bytes.
         unsafe {
             self.ctrl[i] = c;
             self.ctrl[mirror] = c;
@@ -368,6 +419,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[views(self)]
     pub fn get(self, i: i64) -> let T {
         self.check_full(i);
+        // UNSAFE: a view of bucket i's element through the raw pointer.
+        // SAFETY: check_full stopped the program unless i is a FULL bucket: initialized;
+        // #[views(self)] keeps the view from outliving the table or a change of it.
         unsafe { *(&self.data[i]) }
     }
 
@@ -377,11 +431,17 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[views(self)]
     pub fn get_mut(inout self, i: i64) -> inout T {
         self.check_full(i);
+        // UNSAFE: a writable view of bucket i's element through the raw pointer.
+        // SAFETY: i is FULL (checked): initialized; self is inout, so the view is the only
+        // access while it lives (#[views(self)]).
         unsafe { &*(&self.data[i]) }
     }
 
     // A raw pointer to bucket i's element, unchecked: the caller
     // guarantees that i is FULL (a result of find).
+    // UNSAFE: no check that i is a bucket, the point of the function (callers that know it).
+    // SAFETY: the caller's: i is a FULL bucket of this table (find's result, the table unchanged
+    // since); the pointer is valid until the table changes.
     #[inline]
     pub unsafe fn bucket_unchecked(self, i: i64) -> *T {
         &self.data[i]
@@ -392,6 +452,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[inline]
     pub fn bucket(self, i: i64) -> *T {
         self.check_full(i);
+        // UNSAFE: the address of bucket i, through the raw pointer.
+        // SAFETY: i is a FULL bucket (checked), inside the buckets; reading through the result is
+        // the caller's unsafe.
         unsafe { &self.data[i] }
     }
 
@@ -407,6 +470,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[inline]
     pub fn write(inout self, i: i64, x: sink T) {
         self.check_full(i);
+        // UNSAFE: the old element dropped and x moved in, through the raw pointer.
+        // SAFETY: i is FULL (checked): its element is initialized, dropped once, then replaced
+        // bit for bit by x (a raw write drops nothing); the control byte stays FULL.
         unsafe {
             if needs_drop::<T>() {
                 drop(self.data[i]);
@@ -423,7 +489,12 @@ impl<T, A: Allocator> RawTable<T, A> {
         self.check_full(i);
         let mask = self.bucket_mask;
         let before = (i - GROUP) & mask;
+        // UNSAFE: unaligned 8-byte loads of control bytes.
+        // SAFETY: i is FULL (checked), so the table is allocated; before and i are <= mask,
+        // their groups within the buckets + GROUP control bytes.
         let empty_before = match_empty(unsafe { group_load(self.ctrl, before) });
+        // UNSAFE: as above.
+        // SAFETY: as above.
         let empty_after = match_empty(unsafe { group_load(self.ctrl, i) });
         if bitmask_leading(empty_before) + bitmask_trailing(empty_after) >= GROUP {
             self.set_ctrl(i, CTRL_DELETED);
@@ -432,6 +503,9 @@ impl<T, A: Allocator> RawTable<T, A> {
             self.set_ctrl(i, CTRL_EMPTY);
         }
         self.items -= 1;
+        // UNSAFE: the element moves out of bucket i through the raw pointer.
+        // SAFETY: i was FULL (checked), so the element is initialized; its control byte is EMPTY
+        // or DELETED now, so the table will not drop or read it again.
         unsafe { self.data[i] }
     }
 
@@ -476,6 +550,9 @@ impl<T, A: Allocator> RawTable<T, A> {
         if old_mask != 0 {
             for g in 0..(old_mask >> 3) + 1 {
                 let pos = g * GROUP;
+                // UNSAFE: an 8-byte load of the old table's control bytes.
+                // SAFETY: the old table was allocated (old_mask != 0, its block not yet freed);
+                // pos = g * GROUP < old buckets, so pos..pos + GROUP are its control bytes.
                 var m = match_full(unsafe { group_load(old_ctrl, pos) });
                 for _ in 0..GROUP {
                     if m == 0 {
@@ -483,15 +560,24 @@ impl<T, A: Allocator> RawTable<T, A> {
                     }
                     let i = pos + bitmask_lowest(m);
                     m = bitmask_remove_lowest(m);
+                    // UNSAFE: a view of the old bucket i's element.
+                    // SAFETY: i < old buckets and FULL (match_full): initialized, still in place.
                     let hash = unsafe { hasher(*(&old_data[i])) };
                     let j = self.find_insert_slot(hash);
                     self.set_ctrl(j, ctrl_tag(hash));
+                    // UNSAFE: the element moves bit for bit into the new table.
+                    // SAFETY: j is an EMPTY bucket of the new allocation (find_insert_slot), old
+                    // bucket i is FULL; the old block is freed below without drops, so the
+                    // element lives in exactly one place.
                     unsafe {
                         self.data[j] = old_data[i];
                     }
                 }
             }
             let (size, align, _) = RawTable::<T, A>::raw_layout(old_mask + 1);
+            // UNSAFE: Allocator::free of the old raw block.
+            // SAFETY: old_data is the block alloc_buckets got for old_mask + 1 buckets, with this
+            // size and alignment (raw_layout), its elements moved out; freed once.
             unsafe {
                 self.alloc.free(old_data as *u8, size, align);
             }
@@ -509,6 +595,9 @@ impl<T, A: Allocator> RawTable<T, A> {
         let buckets = self.bucket_mask + 1;
         for g in 0..(buckets + GROUP - 1) / GROUP {
             let i = g * GROUP;
+            // UNSAFE: an 8-byte load and store of control bytes.
+            // SAFETY: i < buckets + GROUP - 1 rounded to groups: i + GROUP <= buckets + GROUP, the
+            // control bytes (rehash runs on an allocated table).
             unsafe {
                 group_store(self.ctrl, i,
                     convert_special_to_empty_and_full_to_deleted(group_load(self.ctrl, i)));
@@ -517,21 +606,30 @@ impl<T, A: Allocator> RawTable<T, A> {
         // (the copy past the end)
         if buckets < GROUP {
             for k in 0..buckets {
+                // UNSAFE: a control byte copied through the raw pointer.
+                // SAFETY: k < buckets < GROUP, so GROUP + k < buckets + GROUP: control bytes.
                 unsafe {
                     self.ctrl[GROUP + k] = self.ctrl[k];
                 }
             }
         } else {
+            // UNSAFE: an 8-byte load and store of control bytes.
+            // SAFETY: bytes 0..GROUP and buckets..buckets + GROUP are both control bytes.
             unsafe {
                 group_store(self.ctrl, buckets, group_load(self.ctrl, 0));
             }
         }
         for i in 0..buckets {
+            // UNSAFE: reads a control byte through the raw pointer.
+            // SAFETY: i < buckets.
             if unsafe { self.ctrl[i] } != CTRL_DELETED {
                 continue;
             }
             // (each round places one element for good: buckets rounds at most)
             for _ in 0..buckets {
+                // UNSAFE: a view of bucket i's element.
+                // SAFETY: i < buckets is marked DELETED by the conversion above, which marks
+                // exactly the buckets that were FULL: its element is initialized.
                 let hash = unsafe { hasher(*(&self.data[i])) };
                 let j = self.find_insert_slot(hash);
                 // (in the same group as its probe's start: it stays)
@@ -541,16 +639,24 @@ impl<T, A: Allocator> RawTable<T, A> {
                     self.set_ctrl(i, ctrl_tag(hash));
                     break;
                 }
+                // UNSAFE: reads a control byte through the raw pointer.
+                // SAFETY: j is find_insert_slot's bucket, < buckets.
                 let prev = unsafe { self.ctrl[j] };
                 self.set_ctrl(j, ctrl_tag(hash));
                 if prev == CTRL_EMPTY {
                     self.set_ctrl(i, CTRL_EMPTY);
+                    // UNSAFE: the element moves bit for bit from bucket i to bucket j.
+                    // SAFETY: j was EMPTY (nothing to overwrite) and i is marked EMPTY now, so
+                    // the element is in exactly one bucket, j, now FULL.
                     unsafe {
                         self.data[j] = self.data[i];
                     }
                     break;
                 }
                 // (j held an element still to move: swap, go on with it)
+                // UNSAFE: two elements swapped bit for bit through the raw pointer.
+                // SAFETY: j was DELETED (an element still to move) and i holds one: both are
+                // initialized buckets < buckets; the swap keeps each in exactly one place.
                 unsafe {
                     let x = self.data[j];
                     self.data[j] = self.data[i];
@@ -566,6 +672,8 @@ impl<T, A: Allocator> RawTable<T, A> {
         if needs_drop::<T>() && self.items > 0 {
             for g in 0..(self.bucket_mask >> 3) + 1 {
                 let pos = g * GROUP;
+                // UNSAFE: an 8-byte load of control bytes.
+                // SAFETY: items > 0, so the table is allocated; pos < buckets.
                 var m = match_full(unsafe { group_load(self.ctrl, pos) });
                 for _ in 0..GROUP {
                     if m == 0 {
@@ -573,6 +681,9 @@ impl<T, A: Allocator> RawTable<T, A> {
                     }
                     let i = pos + bitmask_lowest(m);
                     m = bitmask_remove_lowest(m);
+                    // UNSAFE: the element of bucket i read out to be dropped.
+                    // SAFETY: i < buckets is FULL (match_full): initialized; the callers mark
+                    // every bucket EMPTY or free the block next, so it is dropped once.
                     unsafe {
                         drop(self.data[i]);
                     }
@@ -587,6 +698,8 @@ impl<T, A: Allocator> RawTable<T, A> {
             return;
         }
         self.drop_elements();
+        // UNSAFE: raw_fill_empty writes the control bytes through the raw pointer.
+        // SAFETY: the table is allocated (bucket_mask != 0) with buckets + GROUP control bytes.
         unsafe {
             raw_fill_empty(self.ctrl, self.bucket_mask + 1 + GROUP);
         }
@@ -600,8 +713,14 @@ impl<T, A: Allocator> RawTable<T, A> {
         if self.bucket_mask == 0 {
             return RawIter { ctrl: "", pos: 0, bits: 0 };
         }
+        // UNSAFE: a slice of the control bytes, through the raw pointer.
+        // SAFETY: the table is allocated: buckets + GROUP control bytes, initialized;
+        // #[views(self)] keeps the iterator from outliving the table or a change of it.
         let ctrl = unsafe { self.ctrl[0..self.bucket_mask + 1 + GROUP] };
-        RawIter { ctrl: ctrl, pos: 0, bits: match_full(unsafe { group_load(ctrl.ptr, 0) }) }
+        // UNSAFE: an 8-byte load from the slice's pointer.
+        // SAFETY: ctrl has buckets + GROUP >= 12 bytes, so bytes 0..GROUP are in it.
+        let bits = match_full(unsafe { group_load(ctrl.ptr, 0) });
+        RawIter { ctrl: ctrl, pos: 0, bits: bits }
     }
 
     // Drops the elements and gives the memory back; the table is empty,
@@ -610,6 +729,10 @@ impl<T, A: Allocator> RawTable<T, A> {
         self.drop_elements();
         if self.bucket_mask != 0 {
             let (size, align, _) = RawTable::<T, A>::raw_layout(self.bucket_mask + 1);
+            // UNSAFE: Allocator::free of the table's raw block.
+            // SAFETY: data is the block alloc_buckets got with this size and alignment
+            // (raw_layout); the elements were dropped above; the fields are cleared below, so
+            // it is freed once.
             unsafe {
                 self.alloc.free(self.data as *u8, size, align);
             }
@@ -627,6 +750,8 @@ impl<T, A: Allocator> RawTable<T, A> {
         var stats = ProbeStats { total: 0, max: 0 };
         let mask = self.bucket_mask;
         for i in self.iter() {
+            // UNSAFE: a view of bucket i's element.
+            // SAFETY: iter gives FULL buckets only: initialized, borrowed for the call.
             let hash = unsafe { hasher(*(&self.data[i])) };
             var pos = hash as i64 & mask;
             var stride = 0;
@@ -660,9 +785,13 @@ impl<T, A: Allocator> RawTable<T, A> {
         var full = 0;
         var deleted = 0;
         for i in 0..buckets {
+            // UNSAFE: reads a control byte through the raw pointer.
+            // SAFETY: the table is allocated (checked above) and i < buckets.
             let c = unsafe { self.ctrl[i] };
             if c & 0x80 == 0 {
                 full += 1;
+                // UNSAFE: a view of bucket i's element.
+                // SAFETY: its control byte is FULL (c & 0x80 == 0): initialized.
                 let hash = unsafe { hasher(*(&self.data[i])) };
                 if ctrl_tag(hash) != c {
                     return "a control byte is not its element's tag";
@@ -680,13 +809,16 @@ impl<T, A: Allocator> RawTable<T, A> {
             }
         }
         for k in 0..GROUP {
-            let mirror = if buckets < GROUP {
-                if k < buckets { unsafe { self.ctrl[k] } } else { CTRL_EMPTY }
-            } else {
-                unsafe { self.ctrl[k] }
-            };
+            // UNSAFE: reads control bytes through the raw pointer.
+            // SAFETY: k < GROUP <= buckets + GROUP, a control byte of the allocated table.
+            let first = unsafe { self.ctrl[k] };
+            let mirror = if buckets < GROUP { if k < buckets { first } else { CTRL_EMPTY } }
+                else { first };
             let at = if buckets < GROUP { if k < buckets { GROUP + k } else { k } }
                 else { buckets + k };
+            // UNSAFE: as above.
+            // SAFETY: at < buckets + GROUP in each case (GROUP + k with k < buckets, k, or
+            // buckets + k with k < GROUP).
             if unsafe { self.ctrl[at] } != mirror {
                 return "the control bytes past the end are not a copy";
             }
@@ -728,6 +860,8 @@ impl RawIter {
             if self.pos + GROUP >= self.ctrl.len {
                 return -1;
             }
+            // UNSAFE: an 8-byte load from the control bytes' slice pointer.
+            // SAFETY: pos + GROUP < ctrl.len (checked above), so the 8 bytes are in the slice.
             self.bits = match_full(unsafe { group_load(self.ctrl.ptr, self.pos) });
         }
         -1

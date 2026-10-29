@@ -33,6 +33,10 @@ struct Chan<T> {
     refs: AtomicU32,
 }
 
+// UNSAFE: C's allocator, which deals in raw pointers.
+// SAFETY: malloc's and free's prototypes (stdlib.h); the shared state is
+// allocated once (channel_in) and freed once, by the last end let go
+// (chan_release).
 extern "C" {
     #[link_name = "malloc"]
     fn chan_c_malloc(n: u64) -> *u8;
@@ -41,9 +45,11 @@ extern "C" {
 }
 
 // The sending end; clone it for more senders.
+#[sealed]
 pub struct Sender<T> { c: *Chan<T> }
 
 // The receiving end.
+#[sealed]
 pub struct Receiver<T> { c: *Chan<T> }
 
 // send's error: the receiver is gone; the value comes back.
@@ -86,6 +92,11 @@ impl Display for RecvError {
 
 // A channel; its two ends. The queue grows from gpa.
 pub fn channel_in<T>(gpa: Gpa) -> (Sender<T>, Receiver<T>) {
+    // UNSAFE: the shared state is C memory, written through a raw pointer.
+    // SAFETY: malloc's result is checked non-null and has room for a
+    // Chan<T> (malloc's alignment, 16, is at least Chan's, 8: it holds words and Vecs, not a T); `*c = ...`
+    // writes it without dropping what was there (raw writes never drop);
+    // refs is 2, one for each end returned.
     unsafe {
         let c = chan_c_malloc(size_of(Chan<T>) as u64) as *Chan<T>;
         if c == 0 as *Chan<T> {
@@ -101,6 +112,11 @@ pub fn channel_in<T>(gpa: Gpa) -> (Sender<T>, Receiver<T>) {
 }
 
 // One end let go: the last one drops what is left and frees the channel.
+// UNSAFE: reads and frees the shared state through its raw pointer.
+// SAFETY: (the caller's obligation) c is the live channel of an end that
+// holds one of its refs and gives it up here, once; the last one (refs
+// reaching 0, AcqRel: every other end's accesses come before) moves the
+// state out, frees the memory and drops the state.
 unsafe fn chan_release<T>(c: *Chan<T>) {
     if (*c).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
         let gone = *c;
@@ -112,6 +128,10 @@ unsafe fn chan_release<T>(c: *Chan<T>) {
 impl<T> Sender<T> {
     // Sends x; Err(x back) when the receiver is gone.
     pub fn send(self, x: sink T) -> Result<(), SendError<T>> {
+        // UNSAFE: the shared state through the Sender's raw pointer.
+        // SAFETY: a Sender holds one of the channel's refs, so c is live;
+        // the queue is touched only under its lock; the futex wakes on the
+        // live seq word.
         unsafe {
             let c = self.c;
             (*c).lock.lock();
@@ -130,6 +150,9 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(self) -> Sender<T> {
+        // UNSAFE: the shared state through the Sender's raw pointer.
+        // SAFETY: self holds a ref, so c is live; the new Sender gets its
+        // own ref (and counts as a sender) before it exists.
         unsafe {
             (*self.c).senders.fetch_add(1, Ordering::Relaxed);
             (*self.c).refs.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +163,9 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(inout self) {
+        // UNSAFE: the shared state through the Sender's raw pointer.
+        // SAFETY: this Sender's ref keeps c live until chan_release, its
+        // last use, gives the ref up (once: a Sender is dropped once).
         unsafe {
             let c = self.c;
             if (*c).senders.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -158,6 +184,10 @@ impl<T> Receiver<T> {
     // The next value, waiting for one; Err when every sender is gone and
     // nothing is left.
     pub fn recv(self) -> Result<T, RecvError> {
+        // UNSAFE: the shared state through the Receiver's raw pointer.
+        // SAFETY: a Receiver holds one of the channel's refs, so c is live;
+        // chan_pop runs under the lock; the futex waits on the live seq
+        // word.
         unsafe {
             let c = self.c;
             loop {
@@ -182,6 +212,8 @@ impl<T> Receiver<T> {
 
     // The next value if there is one now.
     pub fn try_recv(self) -> Option<T> {
+        // UNSAFE: as recv.
+        // SAFETY: as recv: c is live, chan_pop runs under the lock.
         unsafe {
             let c = self.c;
             (*c).lock.lock();
@@ -192,12 +224,21 @@ impl<T> Receiver<T> {
     }
 
     // The values, until every sender is gone: `for x in rx.iter()`.
+    // (0.25.4) The iterator holds a ref of its own: it may outlive the
+    // Receiver.
     pub fn iter(self) -> RecvIter<T> {
+        // UNSAFE: the shared state through the Receiver's raw pointer.
+        // SAFETY: self holds a ref, so c is live; the iterator gets its own
+        // ref before it exists, given up by its Drop.
+        unsafe { (*self.c).refs.fetch_add(1, Ordering::Relaxed); }
         RecvIter { c: self.c }
     }
 }
 
 // The next value of the queue (the lock held).
+// UNSAFE: the queue through the channel's raw pointer.
+// SAFETY: (the caller's obligation) c is live and the caller holds its
+// lock, so no other thread touches the queue.
 unsafe fn chan_pop<T>(c: *Chan<T>) -> Option<T> {
     if (*c).outbox.is_empty() {
         loop {
@@ -212,6 +253,9 @@ unsafe fn chan_pop<T>(c: *Chan<T>) -> Option<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(inout self) {
+        // UNSAFE: the shared state through the Receiver's raw pointer.
+        // SAFETY: this Receiver's ref keeps c live until chan_release gives
+        // it up (once).
         unsafe {
             let c = self.c;
             (*c).lock.lock();
@@ -222,8 +266,19 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-// Receiver::iter's iterator: recv until it fails.
+// Receiver::iter's iterator: recv until it fails. It holds one of the
+// channel's refs (0.25.4), so it moves and is never copied.
+#[sealed]
 pub struct RecvIter<T> { c: *Chan<T> }
+
+impl<T> Drop for RecvIter<T> {
+    fn drop(inout self) {
+        // UNSAFE: gives the iterator's ref up through its raw pointer.
+        // SAFETY: the ref iter took keeps c live until here; an iterator is
+        // dropped once.
+        unsafe { chan_release(self.c); }
+    }
+}
 
 impl<T> Iterator for RecvIter<T> {
     type Item = T;
