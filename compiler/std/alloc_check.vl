@@ -3,14 +3,20 @@
 impl Gpa {
     // The blocks allocated and not freed: -1, unknown, unless --check-alloc.
     pub fn live_blocks(self) -> i64 {
-        CHECK_LIVE
+        CHECK_LOCK.lock();
+        let n = CHECK_LIVE;
+        CHECK_LOCK.unlock();
+        n
     }
 
     // Whether no block is left allocated (with --check-alloc, which lists
     // them); always true without.
     pub fn check_leaks(self) -> bool {
+        CHECK_LOCK.lock();
         unsafe { check_alloc_list_leaks() }
-        CHECK_LIVE == 0
+        let none = CHECK_LIVE == 0;
+        CHECK_LOCK.unlock();
+        none
     }
 }
 
@@ -19,6 +25,13 @@ impl Gpa {
 // property's case, or a fuzz run, leaks them (test_case, fuzz_exec);
 // their count.
 fn check_alloc_leaks_since(mark: i64) -> i64 {
+    CHECK_LOCK.lock();
+    let live = check_leaks_since(mark);
+    CHECK_LOCK.unlock();
+    live
+}
+
+fn check_leaks_since(mark: i64) -> i64 {
     var live = 0;
     var bytes = 0;
     unsafe {
@@ -98,6 +111,16 @@ extern "C" {
 // The site of the program's call being run that may allocate (`main.vl:
 // 14:9`, a C string), stored by the compiled program before the call.
 static var CHECK_ALLOC_SITE: *u8 = 0 as *u8;
+
+// (0.25.5) Threads: each entry of the checking allocator (the functions
+// below that std and the program call) holds this lock, so its tables are
+// never changed by two threads at once (0.25.4 corrupted them: double and
+// invalid frees reported where there were none). The fault handler takes
+// nothing (it stops the program). CHECK_ALLOC_SITE is stored by the program
+// without it: under threads a block may name another thread's call.
+static CHECK_LOCK: std::sync::RawLock = std::sync::RawLock {
+    state: std::sync::atomic::AtomicU32 { v: 0 },
+};
 
 // A block: its pages [start, start + span), its size, its allocator (0:
 // Gpa, else an arena's state), its state, and where it was allocated and
@@ -510,7 +533,7 @@ unsafe fn check_owned(p: *u8, size: i64, owner: u64, freeing: bool) -> i64 {
 // null (p untouched).
 unsafe fn check_move(owner: u64, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
     if old_size == 0 {
-        return check_alloc_block(owner, new_size, align);
+        return if new_size == 0 { align as *u8 } else { check_new_block(owner, new_size) };
     }
     let b = check_owned(p, old_size, owner, false);
     if new_size == 0 {
@@ -533,23 +556,33 @@ fn check_alloc_block(owner: u64, size: i64, align: i64) -> *u8 {
     if size == 0 {
         return unsafe { align as *u8 };
     }
-    unsafe { check_new_block(owner, size) }
+    CHECK_LOCK.lock();
+    let p = unsafe { check_new_block(owner, size) };
+    CHECK_LOCK.unlock();
+    p
 }
 
 // (Arenas) p, a block of owner of old_size bytes, moved to new_size bytes.
 unsafe fn check_alloc_moved(owner: u64, p: *u8, old_size: i64, new_size: i64, align: i64)
     -> *u8 {
-    check_move(owner, p, old_size, new_size, align)
+    CHECK_LOCK.lock();
+    let q = check_move(owner, p, old_size, new_size, align);
+    CHECK_LOCK.unlock();
+    q
 }
 
 // (Arenas) The blocks allocated so far: a mark for check_alloc_release.
 fn check_alloc_mark() -> i64 {
-    CHECK_COUNT
+    CHECK_LOCK.lock();
+    let n = CHECK_COUNT;
+    CHECK_LOCK.unlock();
+    n
 }
 
 // (Arenas: a reset, a scope's end) Every block of owner allocated after
 // mark is given back: a later access faults.
 fn check_alloc_release(owner: u64, mark: i64) {
+    CHECK_LOCK.lock();
     unsafe {
         for b in mark..CHECK_COUNT {
             if CHECK_BLOCKS[b].owner == owner && CHECK_BLOCKS[b].state == CHECK_LIVE_BLOCK {
@@ -557,6 +590,7 @@ fn check_alloc_release(owner: u64, mark: i64) {
             }
         }
     }
+    CHECK_LOCK.unlock();
 }
 
 // (Arenas) The site of the call being run, and that site set again: a
@@ -574,6 +608,13 @@ fn check_alloc_set_site(site: *u8) {
 // (Arenas) Whether p starts the last live block of owner: the block an
 // arena grows, or gives back, in place.
 fn check_alloc_is_last(owner: u64, p: *u8) -> bool {
+    CHECK_LOCK.lock();
+    let last = check_is_last(owner, p);
+    CHECK_LOCK.unlock();
+    last
+}
+
+fn check_is_last(owner: u64, p: *u8) -> bool {
     unsafe {
         for k in 0..CHECK_COUNT {
             let b = CHECK_COUNT - 1 - k;
@@ -589,13 +630,16 @@ fn check_alloc_is_last(owner: u64, p: *u8) -> bool {
 // false when p is no memory of the checking allocator, true when it is in
 // bounds of a live block; else the program stops.
 pub unsafe fn check_alloc_access(p: u64, size: u64, site: *u8) -> bool {
+    CHECK_LOCK.lock();
     let b = check_find(p);
     if b == -1 {
+        CHECK_LOCK.unlock();
         return false;
     }
     var m = check_msg();
     if b >= 0 && CHECK_BLOCKS[b].state == CHECK_LIVE_BLOCK {
         if p + size <= CHECK_BLOCKS[b].start + CHECK_BLOCKS[b].size as u64 {
+            CHECK_LOCK.unlock();
             return true;
         }
         m.text("unsafe access out of bounds: ");
@@ -686,11 +730,13 @@ unsafe fn check_alloc_list_leaks() {
 // At exit: the leaks, unless check_leaks listed them and nothing changed
 // since.
 extern "C" fn check_alloc_at_exit() {
+    CHECK_LOCK.lock();
     unsafe {
         if CHECK_LISTED != CHECK_CHANGES {
             check_alloc_list_leaks();
         }
     }
+    CHECK_LOCK.unlock();
 }
 
 impl Allocator for Gpa {
@@ -699,13 +745,16 @@ impl Allocator for Gpa {
     }
 
     unsafe fn try_resize(self: *Gpa, p: *u8, old_size: i64, new_size: i64, align: i64) -> *u8 {
-        check_move(0, p, old_size, new_size, align)
+        check_alloc_moved(0, p, old_size, new_size, align)
     }
 
     unsafe fn free(self: *Gpa, p: *u8, size: i64, align: i64) {
+        CHECK_LOCK.lock();
         if size == 0 && check_find(p as u64) == -1 {
+            CHECK_LOCK.unlock();
             return;
         }
         check_drop_block(check_owned(p, size, 0, true), CHECK_FREED);
+        CHECK_LOCK.unlock();
     }
 }
