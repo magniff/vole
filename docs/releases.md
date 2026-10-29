@@ -194,6 +194,15 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   bugs254 (docs/unsafe-baseline.md), every compilation of the corpus
   byte-identical (`volec same-output`). The plan for the rest of
   compiler/src's modernization: docs/design/modernize-0254.md.
+- (table254) **`volec refactor table X`** (modernize-0254.md step 3):
+  a raw table, `static var X: *T` with its X_COUNT and X_CAP grown by
+  `grow`, becomes `static var X: Vec<T, Comp>` with every use: the grow
+  goes, a store and its increment are `X.push(v)`, X_COUNT is `X.len()`,
+  `= 0` `X.clear()`, `-= k` `X.truncate(..)`, the statics and their
+  imports go. A use it cannot place (`&X[i]`, X passed or freed, X_CAP
+  read, X_COUNT written, a call between a store and its increment that
+  reads the count) is listed and nothing is changed
+  (`refactor.table-use`; docs/refactor-shape.md, "refactor table").
 - **`volec run [DIR] [OPTIONS] [-- ARGS...]`** builds the program whose
   root is DIR/main.vl (DIR: the current directory when none is given)
   and runs it: stdin, stdout and stderr its own, the words after `--`

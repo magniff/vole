@@ -125,6 +125,7 @@ an edit then `check`.
 | rename a local or parameter | `volec refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--convention v inout`: the calls pass `&v`, `--convention v let` or `sink`: `v`) |
 | a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
+| a raw table (`*T`, X_COUNT, X_CAP) to a Vec, with every use | `volec refactor table X --dry-run` (refused, nothing changed, when a use cannot be placed: each listed); then `volec fix --only unneeded-unsafe` |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `volec refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` |

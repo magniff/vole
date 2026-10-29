@@ -136,6 +136,7 @@ tools` the ones a program needs.
 | add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
 | add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
 | add a variant (an arm in each match that needs one), remove, rename one | `target/volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
+| a raw table (`static var X: *T`, X_COUNT, X_CAP, grown by `grow`) to a `Vec<T, Comp>`, every use (0.25.4) | `target/volec refactor table X --dry-run` (`--count N`, `--cap C`, `--alloc PATH`; refused, nothing changed, each use it cannot place listed: `&X[i]`, X passed, X_CAP read, X_COUNT written; then `fix --only unneeded-unsafe`) |
 | move lines of a function into a new one, parameters and result computed | `target/volec refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/volec refactor inline FN` (`--at FILE:LINE`: one call) |
 | replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |

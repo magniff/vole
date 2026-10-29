@@ -237,6 +237,20 @@ to remove; its risk; what it can run in parallel with.
   unsafe blocks around its uses go). One table a branch, merged before
   the next; small tables private to one module can go in module branches
   (step 7).
+- NODES, by `refactor table NODES --dry-run` (table254, §6): its first
+  run refused 3 uses, all in one statement, `NODES = reserve(NODES,
+  &NODE_CAP, n)` in front::ast::reserve_nodes (0.25's room ahead for the
+  parser: the table passed, NODE_CAP read). The tool now writes it
+  `NODES.reserve(n - NODES.len())` (Vec's reserve takes the extra room,
+  none when that is not above 0), and the dry run is clean: no use
+  refused, 38 files, 108 reads `NODES.len()`, new_node's store and
+  increment one `NODES.push(..)` (its `let n = NODE_COUNT;` before the
+  store becomes `let n = NODES.len();`), NODE_COUNT and NODE_CAP with
+  their imports gone, and the edited compiler checks. No pointer into
+  NODES was found (`&NODES[i]`), so nothing waits on the source. What
+  comes first is the optimizer (§2, step 2, branch opt254): each
+  `NODES[i]` gets a header reload and a bounds check. NODES waits for
+  opt254, then runs alone with its compile-cost row.
 
 **Step 5. IntVec's uses moved to the API Vec shares, module by module.**
 - Idiom, scope: the 2,823 IntVec references, in branches by directory
@@ -405,3 +419,67 @@ reads, so `--no-check` until the last; `refactor --script` refuses a
 `rewrite --text` line), a Vec local needs its type written, and in a
 module that also reads tables, an IntVec step alone frees little: tables
 first.
+
+## 6. Step 3, done; the first tables
+
+**The tool** (table254): `volec refactor table X [--count X_COUNT]
+[--cap X_CAP] [--alloc PATH]` in tools/refactor_shape/table.vl
+(docs/refactor-shape.md, "refactor table"; tests/refactor/table254.t).
+Beyond the brief's rewrites it places the forms the compiler's tables
+use: a grow inside `if X_COUNT >= X_CAP { }`, the increment after the
+unsafe block holding the store, a store at a local set to the count
+(`let n = X_COUNT;`, `n = X_COUNT;`), the increment before the store
+(reads between them `X.len() + 1`), `X = reserve(X, &X_CAP, n)`, a count
+or table named by a path, X_CAP kept in a submodule. A call between a
+store and its increment is checked against every function whose code
+names X_COUNT, and their callers to a fixpoint (the calls the checker
+resolved; one it cannot follow is refused).
+
+**Over the tree** (`--dry-run` of the 241 `static var X: *T` but NODES
+and FNS, on 48ebd405, before the reserve form): 29 convert cleanly (the
+edited compiler checks), 17 are refused, 195 have no `X_COUNT` (fixed
+arrays from alloc_array, hash tables, C strings, or counts named
+otherwise: `--count`). The refusals, by table:
+
+| table | uses refused | why |
+|---|---:|---|
+| base::BUFS | 16 | `&BUFS[b].data[..]`: pointers into the table (buf_* internals) |
+| middle::ir::IRFUNCS | 6 | `&IRFUNCS[f].blocks`, `.slots`: IntVec fields passed by pointer |
+| front::tests::FOUND, testrun::program::JOBS, codecache::hash::STR_H | 5, 5, 4 | grown by hand: the capacity read, the table reassigned |
+| tools::query::defs::DEFS | 5 | grown through grow_defs (the table passed), DEF_CAP read |
+| front::lexer::STRS | 4 | `elem_at(STRS, i)`: the table passed |
+| front::lexer::TOKS | 3 | `TOK_COUNT = first` (fmt/pieces.vl rolls the tokens back), `&TOKS[i]` |
+| front::types::FIELDS | 2 | `&FIELDS[..]`: pointers into the table |
+| FN_EFFECTS, SYM_KEYWORD, features::NEEDS, query::cache::C_REFS | 2 each | allocated whole (`alloc_array`, another table's block) and their count set |
+| arch::INTRS, cimport::CFIELDS | 1 each | `&X[i]` |
+| base::FILES | 1 | `let files = crate::base::FILES;` (unsafecheck.vl) |
+| cpp::MACROS | 1 | a call between its store and its increment reaches code naming MACRO_COUNT |
+
+The clean 29: ASYMS, RELOCS, FRAGS, FIXUPS (back::objfile), MEMOS
+(assemble), SYMS (base), LOCALS (check), GMETHODS (collect), CFUNCS,
+CTYPES, CVARS, CENUMS, CENUMERATORS, CTYPEDEFS, CRECS (cimport), CTOKS,
+HS, CFILES (cpp), CLOSURES, MODULES, IMPLS, TRAITS, METHODS, TYPES,
+ENUMS, STRUCTS, CONSTS, STATICS, VARIANTS (types), and NODES with the
+reserve form.
+
+**The first tables**, each its own commit, cold (C imports only), small:
+
+| table | files | refs (X, X_COUNT, X_CAP) | rewrites | unsafe sites freed | same-output |
+|---|---:|---|---|---:|---|
+| front::cpp::HS | 1 | 11, 5, 2 | 1 push, 1 len() | 4 | 32,844 compilations, 7,425 differ only in the compiler's path in try: lines, 0 after |
+| front::cpp::input::CFILES | 1 | 23, 8, 3 | 2 pushes (increment first), 3 len()s | 2 (1 by hand: a justified block the fix keeps) | the same |
+| front::cimport::CENUMERATORS | 4 | 13, 10, 3 | 1 push, 4 len()s | 1 | the same |
+| front::cimport::CVARS | 3 | 20, 8, 3 | 1 push, 2 len()s | 1 | the same |
+| front::cimport::CFUNCS | 3 | 17, 8, 3 | 1 push, 2 len()s | 1 | the same |
+
+`query unsafe --summary --no-std`: sites 4,487 -> 4,478, unjustified
+4,374 -> 4,366 (the tool's own 6 blocks are justified;
+docs/unsafe-baseline.md made again). Few blocks go per table: the other
+blocks around these tables' uses also index CTOKS, CTYPES and CRECS
+(tables first, as the pilot found).
+
+What the tool could not do: a justified unneeded block stays (`fix
+--only unneeded-unsafe` keeps blocks with `// UNSAFE:` comments; CFILES's
+cfile_path was taken away by hand), and the comments that name X_COUNT
+or X_CAP are left as they are.
+
