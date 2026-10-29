@@ -40,7 +40,7 @@ $ edit patch main::extern --old 'puts' --new 'fputs' --dry-run
 -    fn puts(s: *u8) -> i32;
 +    fn fputs(s: *u8) -> i32;
 main.vl:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'? | try: volec fix --suggested main.vl  [in crate::main]
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:23:9: undefined variable 'puts'
 [exit 1]
 $ edit patch calc::extern --old 'a' --new 'b'
 error patch.no-region: no extern block in crate::calc; edit replace adds one
@@ -166,7 +166,7 @@ undid rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
 calc.vl:29:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::calc::empties]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'Buf'
 note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'

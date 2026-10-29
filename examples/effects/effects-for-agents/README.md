@@ -94,7 +94,7 @@ markup.vl:75:25: error[type error] expected 'inout Buf', got 'inout Buf<Arena>' 
 markup.vl:90:28: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
 markup.vl:100:23: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
 markup.vl:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
-warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: markup.vl:11:25: expected 'Gpa', got 'Arena'
 ```
 
 The errors are the rest of the plan: the return types (`Vec<[u8]>`
@@ -223,7 +223,7 @@ guards the whole module. A debugging print three calls down, in `slug`:
 $ volec edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
 >     var dash = false;'
 markup.vl:68:5: error[effect] 'markup::render' is #[effects(alloc(Arena), panic)], but it does io: 'headings(ls.as_slice(), arena)' at markup.vl:71:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena), panic)] | try: volec query effects markup::render --why io  [in crate::markup::render]
-error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written; the error: markup.vl:68:5: 'markup::render' is #[effects(alloc(Arena), panic)], but it does io: 'headings(ls.as_slice(), arena)' at markup.vl:71:14 calls 'markup::headings'
 note edit.together: change crate::markup::render in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::markup::render
 try: volec edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");

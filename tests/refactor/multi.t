@@ -112,7 +112,7 @@ try: volec query show NAME
 ## fits a changed shape; the items to change in the same edit.
 $ edit patch scale --old 'k: i64' --new 'k: i64, m: i64'
 main.vl:15:13: error[type error] function 'shapes::scale' expects 3 arguments, got 2 | help: its signature: `fn scale(r: Rect, k: i64, m: i64) -> Rect` (shapes.vl:22) | try: scale(Rect { w: 2, h: 3 }, k, VALUE)  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:15:13: function 'shapes::scale' expects 3 arguments, got 2
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: volec refactor signature crate::shapes::scale --add 'm: i64 = VALUE'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -124,7 +124,7 @@ main.vl:15:32: error[type error] unknown field 'h' in struct 'Rect'  [in crate::
 shapes.vl:15:11: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::area]
 shapes.vl:19:15: error[type error] struct 'Rect' has no field 'h'  [in crate::shapes::kind]
 shapes.vl:23:24: error[type error] unknown field 'h' in struct 'Rect'  [in crate::shapes::scale]
-error edit.breaks: 4 new errors (4 in crate::main, crate::shapes::area, crate::shapes::kind and 1 more, which the edit does not change); nothing written
+error edit.breaks: 4 new errors (4 in crate::main, crate::shapes::area, crate::shapes::kind and 1 more, which the edit does not change); nothing written; the first: main.vl:15:32: unknown field 'h' in struct 'Rect'
 note edit.refactor: the uses of crate::shapes::Rect no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor field crate::shapes::Rect --rename h height
 note edit.together: change crate::main, crate::shapes::area, crate::shapes::kind and 1 more in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -133,7 +133,7 @@ try: volec edit patch Rect --old 'h: i64,' --new 'height: i64,' --no-check
 [exit 1]
 $ edit patch Kind < $T/inputs/multi_tall.pairs
 main.vl:7:5: error[type error] non-exhaustive match: 'Kind::Tall' is not covered | help: add an arm for it (try:), or a wildcard arm '_ =>' | try: Kind::Tall => VALUE,  [in crate::describe]
-error edit.breaks: 1 new error (1 in crate::describe, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::describe, which the edit does not change); nothing written; the error: main.vl:7:5: non-exhaustive match: 'Kind::Tall' is not covered
 note edit.refactor: the uses of crate::shapes::Kind no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: volec refactor variant crate::shapes::Kind --add Tall --arm 'EXPR'
 note edit.together: change crate::describe in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -142,21 +142,21 @@ try: volec edit patch Kind --no-check
 [exit 1]
 $ edit replace area < $T/inputs/multi_renamed.vl
 main.vl:4:26: error[type error] unresolved import 'shapes::area'
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:4:26: unresolved import 'shapes::area'
 note edit.refactor: the uses of crate::shapes::area no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor rename crate::shapes::area surface
 try: volec edit replace area --no-check
 [exit 1]
 $ edit patch area < $T/inputs/multi_area_bool.pairs
 main.vl:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: describe(kind(r)) != 0 | try: volec fix --suggested main.vl  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:16:18: expected 'bool', got 'i64'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::main
 try: volec edit patch area --no-check
 [exit 1]
 $ edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(r: Rect, f: i64)'
 shapes.vl:23:21: error[type error] undefined variable 'k'  [edited: crate::shapes::scale]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: shapes.vl:23:21: undefined variable 'k'
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --rename-param k f
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
@@ -164,7 +164,7 @@ try: volec edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(r: Rect,
 [exit 1]
 $ edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, r: Rect)'
 main.vl:15:19: error[type error] expected 'i64', got 'Rect'  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:15:19: expected 'i64', got 'Rect'
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --reorder k,r
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -173,7 +173,7 @@ try: volec edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, 
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32'
 main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | note: main.vl:14:5: 'k' is 'i64' from its literals (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, `let k: i32 = ...` | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:15:40: expected 'i32', got 'i64'
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --type k i32 --default '$k as i32'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -182,7 +182,7 @@ try: volec edit patch scale --old 'k: i64' --new 'k: i32' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32' --old 'r.w * k, h: r.h * k' --new 'r.w * k as i64, h: r.h * k as i64'
 main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | note: main.vl:14:5: 'k' is 'i64' from its literals (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, `let k: i32 = ...` | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:15:40: expected 'i32', got 'i64'
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --type k i32 --default '$k as i32'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks

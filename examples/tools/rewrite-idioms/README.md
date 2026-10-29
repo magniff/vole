@@ -117,7 +117,7 @@ the hole has two types at the sites, and each gets a command:
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
 report.vl:69:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: report.vl:69:8: no method 'is_empty' on type 'Buf'
 note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'
