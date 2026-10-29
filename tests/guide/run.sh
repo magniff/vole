@@ -562,7 +562,7 @@ else
 fi
 
 # --help on every command (0.15): the command's rows, no error.
-for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce; do
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce run; do
     # shellcheck disable=SC2086
     if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
         && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then

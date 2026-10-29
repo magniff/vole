@@ -71,6 +71,36 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.4
+
+- **`volec run [DIR] [OPTIONS] [-- ARGS...]`** builds the program whose
+  root is DIR/main.vl (DIR: the current directory when none is given)
+  and runs it: stdin, stdout and stderr its own, the words after `--`
+  its arguments as they are (`--help` and `--json` too), its exit
+  status volec's (128 + N when signal N ended it, as a shell says).
+  OPTIONS are a plain build's (`-O0`, `-l`, `-L`, C files and objects,
+  `-framework`, `--check-alloc`...; `--target` only the host's), and a
+  build error is the plain build's (status 1, nothing run). The program
+  is kept in volec's cache, never in DIR: CACHE/run/NAME-KEY/NAME, CACHE
+  the tools' cache (./target/volec-cache, `$VOLE_CACHE`) or else
+  `$TMPDIR/volec-cache`, which the code cache then uses too; KEY hashes
+  the root's absolute path and the options. It is built again only when a
+  .vl file under DIR or a file of the link changed, or another compiler
+  runs (`volec test`'s check, now shared: tools/testrun/program.vl);
+  `-o FILE` keeps a copy at FILE too. On a terminal: the build's lines,
+  naming the program (`Finished NAME in 0.4s`; `Finished` alone when
+  nothing changed), then `Running NAME`; elsewhere only the program's
+  output. Its errors: `run.no-main` (a folder without main.vl: `try:
+  volec run DIR/SUB` for a subfolder that has one, or the plain build of
+  its one .vl file), `run.file` (a file for its folder), `run.args` (a
+  second folder: the program's arguments go after `--`), `run.option`
+  (`-c`, `-S`, `--emit-ir`, another target...); `volec explain run.no-main`.
+  `$VOLE_CACHE_TRACE` gets `run fresh` or `run build`. `volec run` was
+  `cli.not-a-command` in 0.25.3; `volec exec` now reads as `run`
+  (tests/refactor/run254.t).
+- The words after `--` reach a command as they are: `--json`,
+  `--values=...` and `--help` there were volec's own before.
+
 ### What's new in 0.25.3
 
 The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten

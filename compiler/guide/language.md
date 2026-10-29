@@ -17,6 +17,7 @@ topic with std's API in its place.
 ## Build and run
 
 ```sh
+volec run [DIR] [-- ARGS]            # DIR/main.vl built (when changed), then run
 volec hello.vl -o hello && ./hello   # executable (cc links it)
 volec hello.vl -o hello.o            # object; `-o x.s`: assembly
 volec check hello.vl                 # errors only, one per line
