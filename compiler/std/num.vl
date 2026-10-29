@@ -886,6 +886,189 @@ pub fn write_f32(v: f32, mode: FloatFmt, out: inout [u8]) -> i64 {
     num_float_text(&out, negative, d2, k2, mode)
 }
 
+// The most decimals fmt_f64 writes; more are taken as this many.
+pub const FIXED_DECIMALS_MAX: i64 = 20;
+
+// v with `decimals` digits after the point (0 to FIXED_DECIMALS_MAX;
+// fewer are 0, more are the most) at the end of out, out[start..32]: the
+// start. No allocation; the text is `{v:.N}`'s (println, format_in) byte
+// for byte: v's exact value rounded to the nearest, a tie (exactly half,
+// as 2.5 to 0 decimals or 0.125 to 2) to the even digit, as C's %.*f
+// and Rust's `{:.N}`; a '-' whenever v is negative or -0.0 (`-0.00`);
+// `NaN`, `inf`, `-inf` as `{v}`. A text longer than 32 bytes (from 1e31
+// at 0 decimals, 1e10 at 20) is `{v:e}`'s instead (`1.5e40`). An f32 x
+// is fmt_f64(x as f64, ..), as `{x:.N}` is.
+pub fn fmt_f64(v: f64, decimals: i64, out: inout [u8; 32]) -> i64 {
+    let bits = f64_to_bits(v);
+    let negative = (bits >> 63) != 0;
+    let f = bits & 0xfffffffffffff;
+    let be = ((bits >> 52) & 0x7ff) as i64;
+    if be == 0x7ff {
+        let t = if f != 0 { "NaN" } else if negative { "-inf" } else { "inf" };
+        for j in 0..t.len {
+            out[32 - t.len + j] = t[j];
+        }
+        return 32 - t.len;
+    }
+    let d = if decimals < 0 { 0 } else if decimals > FIXED_DECIMALS_MAX { FIXED_DECIMALS_MAX }
+        else { decimals };
+    // |v| = m * 2^e
+    let m = if be == 0 { f } else { f | 0x10000000000000 };
+    let e = if be == 0 { -1074 } else { be - 1075 };
+    // q (128 bits, qh:ql) then `tail` zeros: |v| * 10^d, rounded
+    var qh: u64 = 0;
+    var ql: u64 = 0;
+    var tail = 0;
+    if e >= 0 {
+        if e > 74 {
+            return num_fixed_exp(v, &out);
+        }
+        // m * 2^e < 2^127: the integer, then d zeros
+        if e >= 64 {
+            qh = m << (e - 64);
+        } else if e > 0 {
+            qh = m >> (64 - e);
+            ql = m << e;
+        } else {
+            ql = m;
+        }
+        tail = d;
+    } else {
+        // m * 10^d < 2^53 * 10^20 < 2^120, shifted right by s with the
+        // bits shifted out rounded: half up, a tie to even
+        ql = m;
+        var left = d;
+        while left > 0 {
+            let k = if left > 9 { 9 } else { left };
+            let (h, l) = num_u128_mul_small(qh, ql, num_pow10(k));
+            qh = h;
+            ql = l;
+            left -= k;
+        }
+        let s = -e;
+        if s >= 128 {
+            qh = 0;
+            ql = 0;
+        } else {
+            let half = num_u128_bit(qh, ql, s - 1);
+            let sticky = num_u128_low_bits(qh, ql, s - 1);
+            if s >= 64 {
+                ql = qh >> (s - 64);
+                qh = 0;
+            } else {
+                ql = (ql >> s) | (qh << (64 - s));
+                qh = qh >> s;
+            }
+            if half && (sticky || (ql & 1) != 0) {
+                ql += 1;
+                if ql == 0 {
+                    qh += 1;
+                }
+            }
+        }
+    }
+    // q's digits, the last at digits[39]
+    var digits: [u8; 40] = [0; 40];
+    var nq = 0;
+    while qh != 0 {
+        let (h, l, r) = num_u128_div_small(qh, ql, 1000000000);
+        var c = r;
+        for _ in 0..9 {
+            digits[39 - nq] = '0' + (c % 10) as u8;
+            c /= 10;
+            nq += 1;
+        }
+        qh = h;
+        ql = l;
+    }
+    while ql != 0 || nq == 0 {
+        digits[39 - nq] = '0' + (ql % 10) as u8;
+        ql /= 10;
+        nq += 1;
+    }
+    let n = if nq + tail > d + 1 { nq + tail } else { d + 1 };
+    let sign = if negative { 1 } else { 0 };
+    let point = if d > 0 { 1 } else { 0 };
+    if sign + n + point > 32 {
+        return num_fixed_exp(v, &out);
+    }
+    // the digits from the last, the point after d of them
+    var at = 32;
+    for k in 0..n {
+        if k == d && d > 0 {
+            at -= 1;
+            out[at] = '.';
+        }
+        at -= 1;
+        out[at] = if k < tail || k - tail >= nq { '0' } else { digits[39 - (k - tail)] };
+    }
+    if negative {
+        at -= 1;
+        out[at] = '-';
+    }
+    at
+}
+
+// fmt_f64's text when the fixed one is longer than out: `{v:e}`'s (at
+// most 24 bytes), at the end of out: its start.
+fn num_fixed_exp(v: f64, out: inout [u8; 32]) -> i64 {
+    var tmp: [u8; 32] = [0; 32];
+    let n = write_f64(v, FloatFmt::LowerExp, &tmp[..]);
+    for j in 0..n {
+        out[32 - n + j] = tmp[j];
+    }
+    32 - n
+}
+
+// 10^k, k from 0 to 19.
+fn num_pow10(k: i64) -> u64 {
+    var p: u64 = 1;
+    for _ in 0..k {
+        p *= 10;
+    }
+    p
+}
+
+// (h:l) * k, when it fits in 128 bits.
+#[inline]
+fn num_u128_mul_small(h: u64, l: u64, k: u64) -> (u64, u64) {
+    let (ph, pl) = wide_mul(l, k);
+    (h * k + ph, pl)
+}
+
+// (h:l) / k and (h:l) % k, k from 1 to 2^32.
+fn num_u128_div_small(h: u64, l: u64, k: u64) -> (u64, u64, u64) {
+    let qh = h / k;
+    var r = h - qh * k;
+    let a = (r << 32) | (l >> 32);
+    let qa = a / k;
+    r = a - qa * k;
+    let b = (r << 32) | (l & 0xffffffff);
+    let qb = b / k;
+    r = b - qb * k;
+    (qh, (qa << 32) | qb, r)
+}
+
+// Bit i (0 to 127) of (h:l).
+#[inline]
+fn num_u128_bit(h: u64, l: u64, i: i64) -> bool {
+    if i >= 64 { ((h >> (i - 64)) & 1) != 0 } else { ((l >> i) & 1) != 0 }
+}
+
+// Whether any of the bits below bit i (0 to 127) of (h:l) is set.
+fn num_u128_low_bits(h: u64, l: u64, i: i64) -> bool {
+    if i == 0 {
+        return false;
+    }
+    if i < 64 {
+        return (l << (64 - i)) != 0;
+    }
+    if l != 0 {
+        return true;
+    }
+    i > 64 && (h << (128 - i)) != 0
+}
+
 // ---- Numbers: float parsing (0.20) ----
 
 // Why parse_f64 failed (Rust's ParseFloatError): the text is empty, or it

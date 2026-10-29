@@ -94,6 +94,7 @@ without a Fmt:
 | `parse_i64_radix(s, 16) -> Result<i64, ParseIntError>`, `parse_u64_radix` | Rust's `from_str_radix` (radix 2 to 36) |
 | `write_f64(v, FloatFmt::Debug, &out) -> i64`, `write_f32` | the text into `out` (an `inout [u8]`) (`FLOAT_TEXT_MAX` bytes always fit): its length |
 | `fmt_u64(v, &out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
+| `fmt_f64(v, decimals, &out) -> i64` (0.25.4) | `{v:.N}`'s text at the end of a `[u8; 32]`, no allocation: where it starts (`guide text#numbers-as-text-without-an-allocator`) |
 | `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
 
 ```vole

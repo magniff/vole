@@ -71,6 +71,18 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.4
+
+- **`std::num::fmt_f64(v, decimals, &out) -> i64`**: a float with a
+  fixed number of decimals (0 to `FIXED_DECIMALS_MAX`, 20) at the end
+  of a `[u8; 32]`, no allocation, `fmt_i64`'s shape: `{v:.N}`'s text
+  byte for byte (the exact value rounded to the nearest, a tie to the
+  even digit, `-0.00`, `NaN`, `inf`; `{v:e}`'s when longer than 32
+  bytes), checked against `format_in` on 149,331 generated cases
+  (tests/run/std_num_fmt_f64.vl); `guide text#numbers-as-text-without-an-allocator`.
+  examples/gpu/pathtrace uses it instead of its own `format_fixed`, and
+  its camera's five C math calls are `f64` methods (no `unsafe` left).
+
 ### What's new in 0.25.3
 
 The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten
