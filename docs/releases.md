@@ -91,6 +91,14 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   with an f-string's holes, specs and `{{ }}`, quotes as text
   (`guide syntax#lexical`); 0.25.3 said "newline in string literal".
   The language server's completion reads text blocks as one literal.
+- The gate no longer stops a step that waits for a slot while the other
+  steps' jobs use them all: 0.25.2.2's and 0.25.3's container rows
+  stopped a fuzz row so ("0 of 8 slots free (slots lost with killed
+  jobs?)") while the other 18 rows ran on the same slots to the end; no
+  slot was lost. A still step is stopped when a slot is free, or when no
+  step moved for `$VOLE_GATE_STALL` s; its processes and what they wait
+  on go to its log, and they get 10 s after TERM to give their slots
+  back. Two self-test rows (`gate.sh --self-test`) pin it.
 
 ### What's new in 0.25.3
 
