@@ -1,0 +1,834 @@
+// An immediate-mode UI in the style of Dear ImGui and egui: the program
+// describes the panel every frame, widgets answer with a click or a new
+// value, and the UI's own state is only what a widget needs between two
+// frames (the active drag, the open dropdown, the panel's position).
+//
+// The draw list is a list of textured quads in physical pixels. Solid
+// shapes sample the white texel of the font atlas; characters sample
+// their glyph. ui_render.vl turns the list into one vertex buffer and one
+// blended render pass over the path-traced image.
+
+use std::num::fmt_i64;
+
+use font::{GLYPH_H, GLYPH_W, WHITE_U, WHITE_V, glyph_uv};
+
+// ---------------------------------------------------------------- theme
+
+pub const BG: [f32; 4] = [0.030, 0.036, 0.050, 0.965];
+pub const HEADER: [f32; 4] = [0.050, 0.060, 0.081, 1.0];
+pub const BORDER: [f32; 4] = [0.19, 0.23, 0.30, 1.0];
+pub const TEXT: [f32; 4] = [0.88, 0.91, 0.95, 1.0];
+pub const DIM: [f32; 4] = [0.52, 0.58, 0.67, 1.0];
+pub const FAINT: [f32; 4] = [0.34, 0.39, 0.47, 1.0];
+pub const ACCENT: [f32; 4] = [0.36, 0.78, 1.0, 1.0];
+pub const ACCENT_DIM: [f32; 4] = [0.12, 0.36, 0.52, 1.0];
+pub const WARM: [f32; 4] = [1.0, 0.64, 0.31, 1.0];
+pub const GOOD: [f32; 4] = [0.40, 0.88, 0.58, 1.0];
+pub const WARN: [f32; 4] = [1.0, 0.78, 0.30, 1.0];
+pub const BUTTON: [f32; 4] = [0.085, 0.10, 0.135, 1.0];
+pub const BUTTON_HOVER: [f32; 4] = [0.13, 0.16, 0.21, 1.0];
+pub const BUTTON_DOWN: [f32; 4] = [0.09, 0.27, 0.38, 1.0];
+pub const BUTTON_EDGE: [f32; 4] = [0.12, 0.15, 0.19, 1.0];
+pub const ACCENT_HOVER: [f32; 4] = [0.20, 0.52, 0.70, 1.0];
+pub const ACCENT_FILL: [f32; 4] = [0.10, 0.30, 0.42, 1.0];
+pub const ACCENT_EDGE: [f32; 4] = [0.18, 0.48, 0.64, 1.0];
+pub const TRACK: [f32; 4] = [0.07, 0.085, 0.115, 1.0];
+pub const SHADOW: [f32; 4] = [0.0, 0.0, 0.0, 0.35];
+
+pub const PANEL_ID: i64 = -7;
+
+// ---------------------------------------------------------------- input
+
+pub struct Input {
+    /// Pointer in physical pixels from the content's top-left.
+    pub x: f64,
+    pub y: f64,
+    pub down: bool,
+    /// The left button went down (or up) since the previous frame.
+    pub press: bool,
+    pub release: bool,
+    pub wheel: f64,
+    /// The surface's physical size and the display's scale.
+    pub w: f64,
+    pub h: f64,
+    pub scale: f64,
+}
+
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
+    Rect { x: x, y: y, w: w, h: h }
+}
+
+fn inside(r: Rect, x: f64, y: f64) -> bool {
+    x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
+}
+
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+// ---------------------------------------------------------------- state
+
+pub struct Ui {
+    pub inp: Input,
+    /// Physical pixels per UI point: 1.0 at scale 1, 2.0 on a Retina display.
+    pub u: f64,
+    /// Physical pixels per font pixel: whole, so the glyphs stay crisp.
+    pub font: f64,
+    pub verts: Vec<f32>,
+    clip: Rect,
+    pub active: i64,
+    consumed: bool,
+    /// Where the pointer is: over the panel or its open dropdown.
+    pub over: bool,
+    pub panel_x: f64,
+    pub panel_y: f64,
+    pub panel_w: f64,
+    pub panel_h: f64,
+    drag_dx: f64,
+    drag_dy: f64,
+    /// The one open accordion section, and whether the whole panel is hidden.
+    pub section: i64,
+    pub hidden: bool,
+    // the dropdown
+    pub popup_open: bool,
+    pub popup_id: i64,
+    popup_x: f64,
+    popup_y: f64,
+    popup_w: f64,
+    popup_row: f64,
+    popup_count: i64,
+    popup_sel: i64,
+    popup_items: [[u8]; 16],
+    popup_result: i64,
+    /// What the last widget asked the renderer to do.
+    pub reset: bool,
+    pub redraw: bool,
+}
+
+impl Ui {
+    pub fn new_in(gpa: Gpa) -> Ui {
+        Ui {
+            inp: Input {
+                x: 0.0, y: 0.0, down: false, press: false, release: false, wheel: 0.0,
+                w: 1.0, h: 1.0, scale: 1.0,
+            },
+            u: 1.0, font: 2.0,
+            verts: Vec::with_capacity_in(32768, gpa),
+            clip: rect(0.0, 0.0, 100000.0, 100000.0),
+            active: 0, consumed: false, over: false,
+            panel_x: -10000.0, panel_y: 20.0, panel_w: 300.0, panel_h: 400.0,
+            drag_dx: 0.0, drag_dy: 0.0,
+            section: 0, hidden: false,
+            popup_open: false, popup_id: 0, popup_x: 0.0, popup_y: 0.0, popup_w: 0.0,
+            popup_row: 24.0, popup_count: 0, popup_sel: 0,
+            popup_items: [""; 16], popup_result: -1,
+            reset: false, redraw: false,
+        }
+    }
+
+    pub fn begin(inout self, input: Input) {
+        self.inp = input;
+        self.u = if input.scale > 1.0 { input.scale } else { 1.0 };
+        self.font = (self.u * 1.5 + 0.5) as i64 as f64;
+        if self.font < 2.0 { self.font = 2.0; }
+        self.verts.clear();
+        self.consumed = false;
+        self.reset = false;
+        self.redraw = false;
+        self.popup_result = -1;
+        self.clip = rect(0.0, 0.0, input.w, input.h);
+        if self.panel_x < -1000.0 {
+            self.panel_x = input.w - self.panel_w * self.u - 20.0 * self.u;
+            if self.panel_x < 20.0 * self.u { self.panel_x = 20.0 * self.u; }
+        }
+        self.panel_x = if self.panel_x < 0.0 { 0.0 }
+            else if self.panel_x
+            > input.w - self.panel_w * self.u { input.w - self.panel_w * self.u }
+            else { self.panel_x };
+        if self.panel_y < 0.0 { self.panel_y = 0.0; }
+        if self.panel_y > input.h - 80.0 * self.u { self.panel_y = input.h - 80.0 * self.u; }
+        self.over = !self.hidden && inside(
+            rect(self.panel_x, self.panel_y, self.panel_w * self.u, self.panel_h),
+            input.x, input.y,
+        );
+        // The dropdown consumes the click that chooses (or dismisses) it
+        // before any widget under it sees the frame.
+        if self.popup_open {
+            let box = rect(self.popup_x, self.popup_y, self.popup_w,
+                self.popup_row * self.popup_count as f64);
+            let over = inside(box, input.x, input.y);
+            if over { self.over = true; }
+            if input.press {
+                if over {
+                    let k = ((input.y - self.popup_y) / self.popup_row) as i64;
+                    if k >= 0 && k < self.popup_count { self.popup_result = k; }
+                }
+                self.popup_open = false;
+                self.consumed = true;
+            }
+        }
+    }
+
+    /// Draw the deferred dropdown, then forget what no widget claimed.
+    pub fn end(inout self) {
+        self.draw_popup();
+        if !self.popup_open { self.popup_result = -1; }
+    }
+
+    pub fn mark_reset(inout self) {
+        self.reset = true;
+    }
+
+    pub fn mark_redraw(inout self) {
+        self.redraw = true;
+    }
+
+    pub fn hit(self, x: f64, y: f64, w: f64, h: f64) -> bool {
+        if self.popup_open { return false; }
+        let r = self.clip;
+        inside(r, self.inp.x, self.inp.y)
+            && self.inp.x >= x && self.inp.x < x + w
+            && self.inp.y >= y && self.inp.y < y + h
+    }
+
+    /// Whether the pointer at (x, y) is on the panel (or its open
+    /// dropdown, or the SHOW UI tab when hidden). Input handlers use this
+    /// directly, so the first click on the panel never starts a camera
+    /// drag, even though `over` is a frame behind.
+    pub fn covers(self, x: f64, y: f64) -> bool {
+        if self.hidden {
+            let bw = 88.0 * self.u;
+            let bh = 24.0 * self.u;
+            let bx = self.inp.w - bw - 12.0 * self.u;
+            let by = 12.0 * self.u;
+            return x >= bx && x < bx + bw && y >= by && y < by + bh;
+        }
+        if x >= self.panel_x && x < self.panel_x + self.panel_w * self.u
+            && y >= self.panel_y && y < self.panel_y + self.panel_h {
+            return true;
+        }
+        if self.popup_open {
+            let h = self.popup_row * self.popup_count as f64;
+            return inside(rect(self.popup_x, self.popup_y, self.popup_w, h), x, y);
+        }
+        false
+    }
+
+    pub fn set_clip(inout self, r: Rect) {
+        self.clip = r;
+    }
+
+    /// A press that starts a widget here, consumed before the panel's drag
+    /// sees it. For headers and tabs, whose content height must be known
+    /// before anything is drawn.
+    pub fn click_here(inout self, x: f64, y: f64, w: f64, h: f64) -> bool {
+        if self.hit(x, y, w, h) && self.inp.press {
+            self.consumed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Move the panel by its title bar. `dead_x`/`dead_w` is the hide
+    /// button, which must not also start a drag.
+    pub fn drag_panel(inout self, x: f64, y: f64, w: f64, h: f64,
+        dead_x: f64, dead_w: f64) -> bool {
+        let hovered = self.hit(x, y, w, h)
+            && !(self.inp.x >= dead_x && self.inp.x < dead_x + dead_w);
+        if hovered && self.inp.press {
+            self.active = PANEL_ID;
+            self.drag_dx = self.inp.x - x;
+            self.drag_dy = self.inp.y - y;
+            self.consumed = true;
+        }
+        if self.active == PANEL_ID {
+            if self.inp.down {
+                self.panel_x = self.inp.x - self.drag_dx;
+                self.panel_y = self.inp.y - self.drag_dy;
+                if self.panel_x < 0.0 { self.panel_x = 0.0; }
+                if self.panel_y < 0.0 { self.panel_y = 0.0; }
+                if self.panel_x > self.inp.w - w { self.panel_x = self.inp.w - w; }
+                if self.panel_y > self.inp.h - 40.0 * self.u {
+                    self.panel_y = self.inp.h - 40.0 * self.u;
+                }
+                return true;
+            }
+            if self.inp.release { self.active = 0; }
+        }
+        false
+    }
+
+    /// A scene card: a title, a line under it, and a colour stripe.
+    pub fn card(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, title: [u8],
+        sub: [u8], accent: [f32; 4], on: bool) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let u = self.u;
+        let f = self.font;
+        let hh = GLYPH_H as f64 * f;
+        self.rect(x, y, w, h,
+            if on { ACCENT_DIM } else if hovered { BUTTON_HOVER } else { BUTTON });
+        self.outline(x, y, w, h, u,
+            if on { ACCENT } else if hovered { BORDER } else { BUTTON_EDGE });
+        self.rect(x, y, 3.0 * u, h, accent);
+        self.text(x + 12.0 * u, y + 7.0 * u, title, if on || hovered { TEXT } else { DIM });
+        self.text(x + 12.0 * u, y + 7.0 * u + hh + 2.0 * u, sub, DIM);
+        clicked
+    }
+
+    /// A colour swatch; `on` draws the selection ring.
+    pub fn swatch(inout self, id: i64, x: f64, y: f64, w: f64, h: f64,
+        color: [f32; 3], on: bool) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let u = self.u;
+        self.rect(x, y, w, h, [color[0], color[1], color[2], 1.0]);
+        self.outline(x, y, w, h, u, if on { [1.0, 1.0, 1.0, 1.0] }
+            else if hovered { ACCENT } else { BUTTON_EDGE });
+        if on {
+            let t = 2.0 * u;
+            self.rect(x + t, y + t, w - 2.0 * t, t, [0.0, 0.0, 0.0, 0.6]);
+            self.rect(x + t, y + h - 2.0 * t, w - 2.0 * t, t, [0.0, 0.0, 0.0, 0.6]);
+        }
+        clicked
+    }
+
+    pub fn full_clip(inout self) {
+        self.clip = rect(0.0, 0.0, self.inp.w, self.inp.h);
+    }
+
+    pub fn px(inout self, n: f64) -> f64 {
+        n * self.u
+    }
+
+    // ------------------------------------------------------------ shapes
+
+    /// A quad from (x0, y0) to (x1, y1), clipped to the current clip rectangle.
+    pub fn quad(inout self, x0: f64, y0: f64, x1: f64, y1: f64,
+        u0: f64, v0: f64, u1: f64, v1: f64, c: [f32; 4]) {
+        let cp = self.clip;
+        let ax = fmax(x0, cp.x);
+        let ay = fmax(y0, cp.y);
+        let bx = fmin(x1, cp.x + cp.w);
+        let by = fmin(y1, cp.y + cp.h);
+        if ax >= bx || ay >= by { return; }
+        let w = x1 - x0;
+        let h = y1 - y0;
+        let ta = (ax - x0) / w;
+        let tb = (bx - x0) / w;
+        let tc = (ay - y0) / h;
+        let td = (by - y0) / h;
+        let ua = u0 + (u1 - u0) * ta;
+        let ub = u0 + (u1 - u0) * tb;
+        let va = v0 + (v1 - v0) * tc;
+        let vb = v0 + (v1 - v0) * td;
+        let nx = 2.0 / self.inp.w;
+        let ny = 2.0 / self.inp.h;
+        let l = ax * nx - 1.0;
+        let r = bx * nx - 1.0;
+        let t = 1.0 - ay * ny;
+        let b = 1.0 - by * ny;
+        self.vertex(l, t, ua, va, c);
+        self.vertex(r, t, ub, va, c);
+        self.vertex(r, b, ub, vb, c);
+        self.vertex(l, t, ua, va, c);
+        self.vertex(r, b, ub, vb, c);
+        self.vertex(l, b, ua, vb, c);
+    }
+
+    fn vertex(inout self, x: f64, y: f64, u: f64, v: f64, c: [f32; 4]) {
+        self.verts.push(x as f32);
+        self.verts.push(y as f32);
+        self.verts.push(c[0]);
+        self.verts.push(c[1]);
+        self.verts.push(c[2]);
+        self.verts.push(c[3]);
+        self.verts.push(u as f32);
+        self.verts.push(v as f32);
+    }
+
+    pub fn rect(inout self, x: f64, y: f64, w: f64, h: f64, c: [f32; 4]) {
+        self.quad(x, y, x + w, y + h, WHITE_U, WHITE_V, WHITE_U, WHITE_V, c);
+    }
+
+    pub fn outline(inout self, x: f64, y: f64, w: f64, h: f64, t: f64, c: [f32; 4]) {
+        self.rect(x, y, w, t, c);
+        self.rect(x, y + h - t, w, t, c);
+        self.rect(x, y + t, t, h - 2.0 * t, c);
+        self.rect(x + w - t, y + t, t, h - 2.0 * t, c);
+    }
+
+    // ------------------------------------------------------------ text
+
+    pub fn text_width(self, s: [u8]) -> f64 {
+        if s.len() == 0 { return 0.0; }
+        (s.len() as f64 * 6.0 - 1.0) * self.font
+    }
+
+    pub fn text(inout self, x: f64, y: f64, s: [u8], c: [f32; 4]) -> f64 {
+        let f = self.font;
+        let gx = GLYPH_W as f64 * f;
+        let gy = GLYPH_H as f64 * f;
+        var cx = x;
+        for ch in s {
+            if ch != 32 && ch >= 32 && ch <= 126 {
+                let g = glyph_uv(ch);
+                self.quad(cx, y, cx + gx, y + gy, g.u0, g.v0, g.u1, g.v1, c);
+            }
+            cx += 6.0 * f;
+        }
+        cx - f - x
+    }
+
+    pub fn text_center(inout self, x: f64, y: f64, w: f64, s: [u8], c: [f32; 4]) {
+        let tw = self.text_width(s);
+        self.text(x + (w - tw) * 0.5, y, s, c);
+    }
+
+    pub fn text_right(inout self, x: f64, y: f64, right: f64, s: [u8], c: [f32; 4]) {
+        let tw = self.text_width(s);
+        self.text(right - tw, y, s, c);
+    }
+
+    /// Number `v` with `dec` decimals (0 to 6) at (x, y); the width drawn.
+    pub fn number(inout self, x: f64, y: f64, v: f64, dec: i64, c: [f32; 4]) -> f64 {
+        var buf: [u8; 32] = [32; 32];
+        let n = format_fixed(v, dec, &buf);
+        self.text(x, y, buf[0..n], c)
+    }
+
+    // ------------------------------------------------------------ buttons
+
+    pub fn button(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8]) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let down = self.active == id && self.inp.down;
+        let bg = if down { BUTTON_DOWN } else if hovered { BUTTON_HOVER } else { BUTTON };
+        let fg = if down || hovered { TEXT } else { DIM };
+        let u = self.u;
+        let f = self.font;
+        self.rect(x, y, w, h, bg);
+        self.outline(x, y, w, h, u, if hovered { BORDER } else { BUTTON_EDGE });
+        self.text_center(x, y + (h - GLYPH_H as f64 * f) * 0.5, w, label, fg);
+        clicked
+    }
+
+    /// A button with the accent fill: the primary action of a section.
+    pub fn primary(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8]) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let down = self.active == id && self.inp.down;
+        let bg = if down { ACCENT_DIM } else if hovered { ACCENT_HOVER } else { ACCENT_FILL };
+        let u = self.u;
+        let f = self.font;
+        self.rect(x, y, w, h, bg);
+        self.outline(x, y, w, h, u, if hovered { ACCENT } else { ACCENT_EDGE });
+        self.text_center(x, y + (h - GLYPH_H as f64 * f) * 0.5, w, label, TEXT);
+        clicked
+    }
+
+    /// A chip: a compact choice with an on/off look.
+    pub fn chip(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8],
+        on: bool) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let bg = if on { ACCENT_DIM } else if hovered { BUTTON_HOVER } else { BUTTON };
+        let fg = if on { ACCENT } else if hovered { TEXT } else { DIM };
+        let u = self.u;
+        let f = self.font;
+        self.rect(x, y, w, h, bg);
+        self.outline(x, y, w, h, u,
+            if on { ACCENT } else if hovered { BORDER } else { BUTTON_EDGE });
+        self.text_center(x, y + (h - GLYPH_H as f64 * f) * 0.5, w, label, fg);
+        clicked
+    }
+
+    /// A labelled on/off switch. Returns whether the row was clicked.
+    pub fn toggle(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8],
+        on: bool) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var clicked = false;
+        if self.active == id && self.inp.release {
+            if hovered { clicked = true; }
+            self.active = 0;
+        }
+        let u = self.u;
+        let f = self.font;
+        let tw = 32.0 * u;
+        let th = 15.0 * u;
+        let tx = x + w - tw;
+        let ty = y + (h - th) * 0.5;
+        self.text(x, y + (h - GLYPH_H as f64 * f) * 0.5, label, if hovered { TEXT } else { DIM });
+        self.rect(tx, ty, tw, th, if on { ACCENT_DIM } else { TRACK });
+        self.outline(tx, ty, tw, th, u, if on { ACCENT } else { BORDER });
+        let kn = th - 4.0 * u;
+        let kx = if on { tx + tw - kn - 2.0 * u } else { tx + 2.0 * u };
+        self.rect(kx, ty + 2.0 * u, kn, kn, if on { ACCENT } else { DIM });
+        clicked
+    }
+
+    // ------------------------------------------------------------ slider
+
+    /// A labelled slider. Returns whether the value changed this frame.
+    /// Drag anywhere on the track (no need to grab the knob); clicking moves
+    /// the knob there, which is what an immediate-mode UI should do.
+    pub fn slider(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8],
+        value: inout f64, lo: f64, hi: f64, dec: i64, unit: [u8]) -> bool {
+        let hit = self.hit(x, y, w, h);
+        if hit && self.inp.press {
+            self.active = id;
+            self.consumed = true;
+        }
+        var changed = false;
+        if self.active == id && self.inp.down {
+            let u = self.u;
+            let tx = x + 2.0 * u;
+            let tw = w - 4.0 * u;
+            var t = 0.0;
+            if tw > 0.0 {
+                let q = (self.inp.x - tx) / tw;
+                t = if q < 0.0 { 0.0 } else if q > 1.0 { 1.0 } else { q };
+            }
+            let v = lo + t * (hi - lo);
+            if v != value {
+                value = v;
+                changed = true;
+            }
+        }
+        if self.active == id && self.inp.release {
+            self.active = 0;
+        }
+        let u = self.u;
+        let f = self.font;
+        let ty = y + h - 7.0 * u;
+        let tx = x + 2.0 * u;
+        let tw = w - 4.0 * u;
+        var t = if hi > lo { (value - lo) / (hi - lo) } else { 0.0 };
+        if t < 0.0 { t = 0.0; }
+        if t > 1.0 { t = 1.0; }
+        self.text(x, y + 2.0 * u, label, if hit || self.active == id { TEXT } else { DIM });
+        var buf: [u8; 32] = [32; 32];
+        let n = format_fixed(value, dec, &buf);
+        let vw = self.text_width(buf[0..n]) + self.text_width(unit);
+        self.text_right(x, y + 2.0 * u, x + w - vw - 6.0 * u, buf[0..n],
+            if self.active == id { ACCENT } else { TEXT });
+        // the unit after the value, right-aligned
+        self.text_right(x, y + 2.0 * u, x + w, unit, FAINT);
+        self.rect(tx, ty, tw, 4.0 * u, TRACK);
+        self.rect(tx, ty, tw * t, 4.0 * u, if self.active == id { ACCENT } else { ACCENT_DIM });
+        let kw = 7.0 * u;
+        let kh = 12.0 * u;
+        self.rect(tx + tw * t - kw * 0.5, ty + 2.0 * u - kh * 0.5, kw, kh,
+            if hit || self.active == id { [0.95, 0.97, 1.0, 1.0] }
+            else { [0.72, 0.78, 0.86, 1.0] });
+        changed
+    }
+
+    // ------------------------------------------------------------ combo
+
+    /// A dropdown. `selected` changes when an item is chosen; the popup is
+    /// drawn after everything else, so it floats above the panel.
+    pub fn combo(inout self, id: i64, x: f64, y: f64, w: f64, h: f64, label: [u8],
+        items: [[u8]; 16], count: i64, selected: inout i64) -> bool {
+        let hovered = self.hit(x, y, w, h);
+        if hovered && self.inp.press {
+            self.popup_open = true;
+            self.popup_id = id;
+            self.popup_x = x;
+            self.popup_w = w;
+            self.popup_row = 22.0 * self.u;
+            self.popup_count = count;
+            self.popup_sel = selected;
+            self.popup_items = items;
+            let below = y + h + 2.0 * self.u;
+            let ph = self.popup_row * count as f64;
+            self.popup_y = if below + ph > self.inp.h - 8.0 * self.u { y - ph - 2.0 * self.u }
+                else { below };
+            if self.popup_y < 8.0 * self.u { self.popup_y = 8.0 * self.u; }
+            self.consumed = true;
+        }
+        var changed = false;
+        if self.popup_result >= 0 && self.popup_id == id {
+            if self.popup_result != selected {
+                selected = self.popup_result;
+                changed = true;
+            }
+            self.popup_result = -1;
+        }
+        let u = self.u;
+        let f = self.font;
+        let hh = GLYPH_H as f64 * f;
+        let open = self.popup_open && self.popup_id == id;
+        self.rect(x, y, w, h,
+            if open { BUTTON_DOWN } else if hovered { BUTTON_HOVER } else { BUTTON });
+        self.outline(x, y, w, h, u,
+            if open { ACCENT } else if hovered { BORDER } else { BUTTON_EDGE });
+        self.text(x + 8.0 * u, y + (h - hh) * 0.5, label, DIM);
+        let name = items[selected];
+        self.text_right(x, y + (h - hh) * 0.5, x + w - 22.0 * u, name, TEXT);
+        // the chevron: two short bars, open points up
+        let cx = x + w - 13.0 * u;
+        let cy = y + h * 0.5;
+        let t = 2.0 * u;
+        if open {
+            self.rect(cx, cy - 2.0 * u, 11.0 * u, t, ACCENT);
+            self.rect(cx + 2.0 * u, cy - 4.0 * u, 7.0 * u, t, ACCENT);
+        } else {
+            self.rect(cx, cy, 11.0 * u, t, DIM);
+            self.rect(cx + 2.0 * u, cy + 2.0 * u, 7.0 * u, t, DIM);
+        }
+        changed
+    }
+
+    fn draw_popup(inout self) {
+        if !self.popup_open { return; }
+        self.full_clip();
+        let u = self.u;
+        let f = self.font;
+        let hh = GLYPH_H as f64 * f;
+        let x = self.popup_x;
+        let y = self.popup_y;
+        let w = self.popup_w;
+        let row = self.popup_row;
+        let h = row * self.popup_count as f64;
+        self.rect(x + 3.0 * u, y + 3.0 * u, w, h, SHADOW);
+        self.rect(x, y, w, h, [0.045, 0.053, 0.070, 1.0]);
+        self.outline(x, y, w, h, u, ACCENT);
+        for i in 0..self.popup_count {
+            let ry = y + row * i as f64;
+            let hovered = inside(rect(x, ry, w, row), self.inp.x, self.inp.y);
+            if hovered { self.rect(x + u, ry, w - 2.0 * u, row, BUTTON_HOVER); }
+            if i == self.popup_sel {
+                self.rect(x + u, ry, 2.0 * u, row, ACCENT);
+            }
+            let label = self.popup_items[i];
+            self.text(x + 10.0 * u, ry + (row - hh) * 0.5, label,
+                if i == self.popup_sel { ACCENT } else { TEXT });
+            if i == self.popup_sel {
+                self.text_right(x, ry + (row - hh) * 0.5, x + w - 8.0 * u, "*", GOOD);
+            }
+        }
+        self.set_clip(rect(0.0, 0.0, self.inp.w, self.inp.h));
+    }
+}
+
+// ---------------------------------------------------------------- numbers
+
+/// `v` with `dec` decimals into `out`, returning the length. Safe digits
+/// only: the UI prints measurements, never arbitrary text.
+pub fn format_fixed(v: f64, dec: i64, out: inout [u8; 32]) -> i64 {
+    var d = dec;
+    if d < 0 { d = 0; }
+    if d > 6 { d = 6; }
+    var scale = 1;
+    for _ in 0..d { scale *= 10; }
+    let negative = v < 0.0;
+    let a = if negative { -v } else { v };
+    var n = (a * scale as f64 + 0.5) as i64;
+    var digits: [u8; 20] = [0; 20];
+    let start = fmt_i64(n / scale, &digits);
+    var len = 0;
+    if negative && n > 0 {
+        out[len] = '-';
+        len += 1;
+    }
+    for i in start..20 {
+        out[len] = digits[i];
+        len += 1;
+    }
+    if d > 0 {
+        out[len] = '.';
+        len += 1;
+        var frac = n % scale;
+        var div = scale / 10;
+        for _ in 0..d {
+            out[len] = '0' + (frac / div) as u8;
+            frac = frac % div;
+            if div > 1 { div = div / 10; }
+            len += 1;
+        }
+    }
+    len
+}
+
+// ---------------------------------------------------------------- tests
+
+#[test]
+fn fixed_format_keeps_the_sign_and_the_decimals(gpa: Gpa) {
+    var b: [u8; 32] = [32; 32];
+    assert_eq(format_fixed(1.25, 2, &b), 4);
+    assert_eq(b[0..4], "1.25");
+    assert_eq(format_fixed(-0.5, 1, &b), 4);
+    assert_eq(b[0..4], "-0.5");
+    assert_eq(format_fixed(12.0, 0, &b), 2);
+    assert_eq(b[0..2], "12");
+}
+
+#[test]
+fn a_slider_drag_sets_the_value_from_the_pointer(gpa: Gpa) {
+    var ui = Ui::new_in(gpa);
+    var value = 0.0;
+    let id = 11;
+    // press at the middle of the track
+    ui.begin(Input {
+        x: 52.0, y: 14.0, down: true, press: true, release: false, wheel: 0.0,
+        w: 400.0, h: 300.0, scale: 1.0,
+    });
+    ui.set_clip(rect(0.0, 0.0, 400.0, 300.0));
+    assert_eq(ui.slider(id, 4.0, 4.0, 96.0, 20.0, "v", &value, 0.0, 10.0, 1, ""), true);
+    // the track is 4..100: the pointer at 52 is halfway
+    assert_eq(value > 4.7 && value < 5.3, true);
+    ui.end();
+    // drag to the right end, then release
+    ui.begin(Input {
+        x: 100.0, y: 14.0, down: true, press: false, release: false, wheel: 0.0,
+        w: 400.0, h: 300.0, scale: 1.0,
+    });
+    assert_eq(ui.slider(id, 4.0, 4.0, 96.0, 20.0, "v", &value, 0.0, 10.0, 1, ""), true);
+    assert_eq(value > 9.9, true);
+    ui.end();
+    ui.begin(Input {
+        x: 100.0, y: 14.0, down: false, press: false, release: true, wheel: 0.0,
+        w: 400.0, h: 300.0, scale: 1.0,
+    });
+    ui.slider(id, 4.0, 4.0, 96.0, 20.0, "v", &value, 0.0, 10.0, 1, "");
+    ui.end();
+    assert_eq(ui.active, 0);
+}
+
+#[test]
+fn a_click_needs_press_then_release_on_the_same_widget(gpa: Gpa) {
+    var ui = Ui::new_in(gpa);
+    let id = 3;
+    ui.begin(Input {
+        x: 10.0, y: 10.0, down: true, press: true, release: false, wheel: 0.0,
+        w: 300.0, h: 200.0, scale: 1.0,
+    });
+    ui.set_clip(rect(0.0, 0.0, 300.0, 200.0));
+    assert_eq(ui.button(id, 4.0, 4.0, 60.0, 20.0, "ok"), false);
+    ui.end();
+    ui.begin(Input {
+        x: 10.0, y: 10.0, down: false, press: false, release: true, wheel: 0.0,
+        w: 300.0, h: 200.0, scale: 1.0,
+    });
+    assert_eq(ui.button(id, 4.0, 4.0, 60.0, 20.0, "ok"), true);
+    ui.end();
+    // moved away before releasing: no click
+    ui.begin(Input {
+        x: 10.0, y: 10.0, down: true, press: true, release: false, wheel: 0.0,
+        w: 300.0, h: 200.0, scale: 1.0,
+    });
+    ui.button(id, 4.0, 4.0, 60.0, 20.0, "ok");
+    ui.end();
+    ui.begin(Input {
+        x: 200.0, y: 150.0, down: false, press: false, release: true, wheel: 0.0,
+        w: 300.0, h: 200.0, scale: 1.0,
+    });
+    assert_eq(ui.button(id, 4.0, 4.0, 60.0, 20.0, "ok"), false);
+    ui.end();
+}
+
+#[test]
+fn the_panel_claims_its_own_rectangle(gpa: Gpa) {
+    var ui = Ui::new_in(gpa);
+    ui.begin(Input {
+        x: 10.0, y: 10.0, down: false, press: false, release: false, wheel: 0.0,
+        w: 400.0, h: 300.0, scale: 1.0,
+    });
+    ui.panel_x = 100.0;
+    ui.panel_y = 20.0;
+    ui.panel_w = 120.0;
+    ui.panel_h = 200.0;
+    assert_eq(ui.covers(110.0, 30.0), true);
+    assert_eq(ui.covers(99.0, 30.0), false);
+    assert_eq(ui.covers(110.0, 220.0), false);
+    ui.hidden = true;
+    // only the SHOW UI tab is live while the panel is hidden
+    assert_eq(ui.covers(400.0 - 88.0 - 12.0 + 4.0, 20.0), true);
+    assert_eq(ui.covers(110.0, 30.0), false);
+}
+
+#[test]
+fn a_combo_chooses_on_the_next_frame(gpa: Gpa) {
+    var ui = Ui::new_in(gpa);
+    let id = 9;
+    let items: [[u8]; 16] = ["beauty", "normals", "albedo", "depth", "traversal",
+        "materials", "bounces", "variance", "ray path", "", "", "", "", "", "", ""];
+    var selected = 0;
+    ui.begin(Input {
+        x: 10.0, y: 10.0, down: true, press: true, release: false, wheel: 0.0,
+        w: 400.0, h: 400.0, scale: 1.0,
+    });
+    ui.set_clip(rect(0.0, 0.0, 400.0, 400.0));
+    assert_eq(ui.combo(id, 4.0, 4.0, 120.0, 22.0, "view", items, 9, &selected), false);
+    assert_eq(ui.popup_id, id);
+    ui.end();
+    // the popup starts just below the box (22 + 2): its third row is selected
+    ui.begin(Input {
+        x: 20.0, y: 30.0 + 22.0 * 2.0 + 10.0, down: true, press: true, release: false,
+        wheel: 0.0, w: 400.0, h: 400.0, scale: 1.0,
+    });
+    ui.set_clip(rect(0.0, 0.0, 400.0, 400.0));
+    assert_eq(ui.combo(id, 4.0, 4.0, 120.0, 22.0, "view", items, 9, &selected), true);
+    assert_eq(selected, 2);
+    ui.end();
+}
+
+// Test-only accessors, so the UI's own state stays private.
+impl Ui {
+}

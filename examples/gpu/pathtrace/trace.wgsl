@@ -14,6 +14,8 @@ struct Params {
     light_color: vec4<f32>,
     light_size: vec4<f32>,
     materials: array<Material, 4>,
+    // fog.rgb is the medium's single-scattering albedo; fog.w the scene.
+    fog: vec4<f32>,
 }
 struct Hit {
     t: f32,
@@ -111,7 +113,7 @@ fn area_light(ro: vec3<f32>, rd: vec3<f32>, best: Hit) -> Hit {
     intersection_tests += 1u;
     var h = best;
     if abs(rd.y) > 0.000001 {
-        let t = (5.0 - ro.y) / rd.y;
+        let t = (u.light_pos.y - ro.y) / rd.y;
         let p = ro + rd * t;
         if t > 0.0001 && t < h.t && abs(p.x - u.light_pos.x) <= u.light_size.x * 0.5
         && abs(p.z - u.light_pos.z) <= u.light_size.y * 0.5 {
@@ -142,8 +144,31 @@ fn shadow_plane(ro: vec3<f32>, rd: vec3<f32>, normal: vec3<f32>, d: f32,
     let t = (d - dot(ro, normal)) / denominator;
     return t > 0.0001 && t < max_t;
 }
+fn scene_id() -> u32 {
+    return u32(u.fog.w + 0.5);
+}
 fn visible(ro: vec3<f32>, rd: vec3<f32>, distance: f32) -> bool {
     let max_t = distance - 0.001;
+    let scene_number = scene_id();
+    if scene_number == 1u {
+        if shadow_plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, max_t) { return false; }
+        if shadow_plane(ro, rd, vec3<f32>(1.0, 0.0, 0.0), -3.0, max_t) { return false; }
+        if shadow_plane(ro, rd, vec3<f32>(-1.0, 0.0, 0.0), -3.0, max_t) { return false; }
+        if shadow_plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -8.0, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(-1.35, 0.0, -1.4), 0.85, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(1.35, 0.0, -1.4), 0.85, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(0.0, 0.1, -3.4), 1.0, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(1.6, 0.0, -5.6), 0.95, max_t) { return false; }
+        return true;
+    }
+    if scene_number == 2u {
+        if shadow_plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(-3.0, 0.2, -1.0), 1.0, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(0.0, 0.9, -2.5), 0.9, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(3.0, 0.3, -0.5), 1.1, max_t) { return false; }
+        if shadow_sphere(ro, rd, vec3<f32>(0.8, -0.45, 2.0), 0.55, max_t) { return false; }
+        return true;
+    }
     if u.flags.y > 0.5 {
         if shadow_plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -2.2, max_t) { return false; }
         if shadow_plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -1.2, max_t) { return false; }
@@ -195,6 +220,26 @@ fn hit_material(h: Hit) -> Material {
 }
 fn scene(ro: vec3<f32>, rd: vec3<f32>) -> Hit {
     var h = miss();
+    let scene_number = scene_id();
+    if scene_number == 1u {
+        h = plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, 4u, h);
+        h = plane(ro, rd, vec3<f32>(1.0, 0.0, 0.0), -3.0, 5u, h);
+        h = plane(ro, rd, vec3<f32>(-1.0, 0.0, 0.0), -3.0, 6u, h);
+        h = plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -8.0, 7u, h);
+        h = sphere(ro, rd, vec3<f32>(-1.35, 0.0, -1.4), 0.85, 0u, h);
+        h = sphere(ro, rd, vec3<f32>(1.35, 0.0, -1.4), 0.85, 1u, h);
+        h = sphere(ro, rd, vec3<f32>(0.0, 0.1, -3.4), 1.0, 2u, h);
+        h = sphere(ro, rd, vec3<f32>(1.6, 0.0, -5.6), 0.95, 3u, h);
+        return area_light(ro, rd, h);
+    }
+    if scene_number == 2u {
+        h = plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -1.0, 4u, h);
+        h = sphere(ro, rd, vec3<f32>(-3.0, 0.2, -1.0), 1.0, 0u, h);
+        h = sphere(ro, rd, vec3<f32>(0.0, 0.9, -2.5), 0.9, 1u, h);
+        h = sphere(ro, rd, vec3<f32>(3.0, 0.3, -0.5), 1.1, 2u, h);
+        h = sphere(ro, rd, vec3<f32>(0.8, -0.45, 2.0), 0.55, 3u, h);
+        return area_light(ro, rd, h);
+    }
     if u.flags.y > 0.5 {
         h = plane(ro, rd, vec3<f32>(0.0, 1.0, 0.0), -2.2, 20u, h);
         h = plane(ro, rd, vec3<f32>(0.0, 0.0, 1.0), -1.2, 21u, h);
@@ -294,8 +339,9 @@ fn sample_phase(direction: vec3<f32>) -> vec3<f32> {
 fn direct_medium(p: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     let light = sample_light(p);
     if !visible(p, light.wi, light.distance) { return vec3<f32>(0.0); }
-    return u.light_color.xyz * (u.light_pos.w * phase(dot(direction, light.wi)) / light.pdf)
-    * transmittance(light.distance);
+    return u.fog.xyz * u.light_color.xyz
+        * (u.light_pos.w * phase(dot(direction, light.wi)) / light.pdf)
+        * transmittance(light.distance);
 }
 fn sample_ggx(n: vec3<f32>, roughness: f32) -> vec3<f32> {
     let alpha = max(0.0001, roughness * roughness);
@@ -331,7 +377,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, index: u32, sample: u32) -> vec3<f32> {
             radiance += throughput * direct_medium(p, direction);
             if u.flags.z < 0.5 { break; }
             direction = sample_phase(direction);
-            throughput *= vec3<f32>(0.94, 0.96, 0.99);
+            throughput *= u.fog.xyz;
             origin = p + direction * 0.001;
             specular = false;
             record_point(p, 4.0);

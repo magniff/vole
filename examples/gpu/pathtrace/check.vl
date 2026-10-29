@@ -6,8 +6,11 @@ use std::{fs, gpu};
 use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
 use std::time::monotonic_now;
 
-use render::{Renderer, renderer_new};
+use render::{MAX_SAMPLES, Renderer, renderer_new};
 use state::{Lab, lab_default};
+use ui::{Input, Ui};
+use ui_panel::{Status, panel};
+use ui_render::{UiRenderer, ui_renderer_new};
 
 fn capture(renderer: inout Renderer, dev: gpu::Device, queue: inout gpu::Queue,
     surf: inout gpu::Surface, width: i64, height: i64, lab: Lab,
@@ -15,6 +18,34 @@ fn capture(renderer: inout Renderer, dev: gpu::Device, queue: inout gpu::Queue,
     let frame = surf.frame()?;
     let target = frame.texture.view();
     renderer.draw(dev, &queue, target, lab);
+    let stride = (width * 4 + 255) / 256 * 256;
+    var readback = dev.buffer(stride * height, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(enc.finish());
+    frame.present(&queue);
+    let pixels = readback.map_read(dev);
+    var image: Vec<u8> = Vec::new_in(gpa);
+    for y in 0..height {
+        let row = y * stride;
+        for x in 0..width * 4 {
+            image.push(pixels[row + x]);
+        }
+    }
+    Ok(image)
+}
+
+/// The last frame again, this time with the immediate-mode panel's draw
+/// list blended over it: what `--ui` writes is exactly what the window
+/// shows, through the same UI pipeline.
+fn capture_ui(renderer: inout Renderer, ui_renderer: inout UiRenderer,
+    dev: gpu::Device, queue: inout gpu::Queue, surf: inout gpu::Surface,
+    width: i64, height: i64, lab: Lab, verts: [f32],
+    gpa: Gpa) -> Result<Vec<u8>, gpu::Error> {
+    let frame = surf.frame()?;
+    let target = frame.texture.view();
+    renderer.redraw(dev, &queue, target, lab);
+    ui_renderer.draw(dev, &queue, target, verts);
     let stride = (width * 4 + 255) / 256 * 256;
     var readback = dev.buffer(stride * height, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     var enc = dev.encoder();
@@ -130,10 +161,12 @@ pub fn benchmark_lab(samples: i64, width: i64, height: i64, lab: Lab, gpa: Gpa) 
 }
 
 pub fn run(samples: i64, width: i64, height: i64, out: [u8], gpa: Gpa) -> i32 {
-    run_lab(samples, width, height, out, lab_default(), gpa)
+    run_lab(samples, width, height, out, lab_default(), false, 1.0, 0, gpa)
 }
 
-pub fn run_lab(samples: i64, width: i64, height: i64, out: [u8], lab: Lab, gpa: Gpa) -> i32 {
+pub fn run_lab(samples: i64, width: i64, height: i64, out: [u8], lab: Lab,
+    with_ui: bool, ui_scale: f64, ui_section: i64, gpa: Gpa) -> i32 {
+    var lab = lab;
     println(f"pathtrace {width}x{height}, {samples} samples");
     let inst = gpu::Instance::new_in(gpa);
     let opened = match inst.adapter() {
@@ -207,6 +240,42 @@ pub fn run_lab(samples: i64, width: i64, height: i64, out: [u8], lab: Lab, gpa: 
         println("progress ok");
     } else {
         println(f"progress FAIL (pixel detail {first_detail:.2} -> {final_detail:.2})");
+    }
+
+    if with_ui {
+        var ui = Ui::new_in(gpa);
+        ui.section = ui_section;
+        ui.begin(Input {
+            x: -100.0, y: -100.0, down: false, press: false, release: false,
+            wheel: 0.0, w: width as f64, h: height as f64, scale: ui_scale,
+        });
+        let actions = panel(&ui, &lab, Status {
+            samples: renderer.samples,
+            max_samples: MAX_SAMPLES,
+            fps: 0.0,
+            ms: 0.0,
+            width: width,
+            height: height,
+            paused: false,
+        });
+        ui.end();
+        let _ = actions;
+        var ui_renderer = match ui_renderer_new(dev, &queue, gpa) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln(f"pathtrace: UI renderer: {e}");
+                return 1;
+            }
+        };
+        final_image = match capture_ui(&renderer, &ui_renderer, dev, &queue, &surf,
+            width, height, lab, ui.verts.as_slice(), gpa) {
+            Ok(image) => image,
+            Err(e) => {
+                eprintln(f"pathtrace: UI capture: {e}");
+                return 1;
+            }
+        };
+        println("ui ok");
     }
 
     if out.len() > 0 {

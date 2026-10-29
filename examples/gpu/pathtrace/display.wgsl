@@ -14,6 +14,8 @@ struct Params {
     light_color: vec4<f32>,
     light_size: vec4<f32>,
     materials: array<Material, 4>,
+    // the scene and the fog's scattering albedo (used by the tracer)
+    fog: vec4<f32>,
 }
 struct Surface {
     normal: vec4<f32>,
@@ -112,28 +114,6 @@ fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
         let selected = u.light_size.zw * u.dims.xy;
         if abs(pixel.x - selected.x) < 0.8 || abs(pixel.y - selected.y) < 0.8 {
             if length(pixel - selected) < 8.0 { color = vec3<f32>(1.0); }
-        }
-    }
-    if mode != 8u && pixel.x < 218.0 && pixel.y < 52.0 {
-        color = mix(color, vec3<f32>(0.015, 0.02, 0.03), 0.82);
-        if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 10.0 && pixel.y < 15.0 {
-            color = vec3<f32>(0.12, 0.16, 0.22);
-            if pixel.x < 10.0 + 194.0 * min(1.0, count / 512.0) {
-                color = vec3<f32>(0.25, 0.75, 1.0);
-            }
-        }
-        let selected_material = u.materials[u32(u.flags.w + 0.5)];
-        if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 23.0 && pixel.y < 28.0 {
-            color = selected_material.albedo.xyz;
-            if pixel.x > 10.0 + 194.0 * selected_material.albedo.w {
-                color = vec3<f32>(0.08, 0.09, 0.11);
-            }
-        }
-        if pixel.x >= 10.0 && pixel.x < 204.0 && pixel.y >= 35.0 && pixel.y < 40.0 {
-            color = vec3<f32>(0.65, 0.72, 0.82);
-            if pixel.x > 10.0 + 194.0 * selected_material.params.x {
-                color = vec3<f32>(0.08, 0.09, 0.11);
-            }
         }
     }
     return vec4<f32>(color, 1.0);
