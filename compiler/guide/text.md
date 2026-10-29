@@ -50,3 +50,56 @@ fn main(gpa: Gpa) -> i32 {
 ADA LOVELACE al 211 true
 ["a", "b", "", "c"] 4
 ```
+
+## String constants
+
+String constants come in three forms:
+
+| form | what it is |
+|---|---|
+| `const X: [u8] = "...";` | bytes; a text block (`"""`, `guide syntax#lexical`), `include_str("f.wgsl")` and `include_bytes("f.bin")` too |
+| `static X: str = "...";` | text: a `str` is a static's (`const X: str` is an error whose fix is this) |
+| `static X: [str; N] = ["a", "b"];` | an array of them (`const` too): `X[i]` is one, `X[..]` the slice; `[str]`, without the length, is refused |
+
+What turns one form into another:
+
+| you have | you want | write |
+|---|---|---|
+| a `str` (a literal, a static) | `[u8]` | nothing: a `str` goes where a `[u8]` does; `s.as_bytes()` says so |
+| `[u8]` | `str` | `str::from_utf8(b)?`: checked, a `Result` |
+| `Vec<T>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
+| an f-string | its text | `format_in(f"..", gpa)`, a `Buf` (`.as_slice()` views it); `to_string_in(f"..", gpa)`, a `String` |
+| a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `Buf` or `String` |
+
+`print`, `println` and `eprintln` take any `T: Display`: an f-string,
+a number, a `str`, a `[u8]`, with no allocator. `panic(msg)` and
+`assert`'s message take a `[u8]` (a `str` too), not an f-string:
+`panic(format_in(f"bad {x}", gpa).as_slice())`; with no `gpa` at hand,
+`eprintln(f"bad {x}")` and `std::process::exit(1)`.
+
+```vole
+const SHADER: [u8] = """
+    @compute @workgroup_size(1)
+    fn main() {}
+    """;
+static NAME: str = "vole";
+static DAYS: [str; 3] = ["mon", "tue", "wed"];
+
+fn main(gpa: Gpa) {
+    let bytes: [u8] = NAME; // a str goes where [u8] does
+    let text: str = str::from_utf8(SHADER).unwrap(); // bytes to str: checked
+    var v: Vec<u8> = Vec::new_in(gpa);
+    v.extend_from_slice(NAME.as_bytes());
+    v.extend_from_slice(DAYS[1]);
+    let msg = format_in(f"{NAME}: {DAYS.len()} days, {v.len()} bytes", gpa); // a Buf
+    println(msg.as_slice());
+    println(f"{bytes.len} {text.lines().count()} {DAYS[..].len()}");
+    if v.len() != 7 {
+        panic(msg.as_slice()); // [u8], not an f-string
+    }
+}
+```
+```out
+vole: 3 days, 7 bytes
+4 2 3
+```
