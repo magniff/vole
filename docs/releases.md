@@ -72,6 +72,18 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.5
+
+- (tables255) `volec refactor table X` refuses `X[f(..)]` where f may
+  grow X (a call reaching a write of X or X_COUNT, through every call the
+  checker resolved): the index is evaluated after X's buffer and length
+  are read, so the element would be read through X's old header. Two such
+  reads of NODES in front/own/drops.vl (`NODES[t_node(..)]`) take the
+  index into a `let` first.
+- (tables255) `volec fix --only unneeded-justified`: `unneeded-unsafe`'s
+  blocks, and the unneeded ones whose `// UNSAFE:`/`// SAFETY:` comments
+  justified them (a table's accessors), with those comments.
+
 ### What's new in 0.25.4
 
 `volec run`, the pathtrace laboratory's feedback (feedbacks/pathtrace-ui.md),

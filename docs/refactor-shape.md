@@ -167,13 +167,21 @@ why`, then with more than three a count by reason (`refactor.table-why`):
 - between a store and its increment: a `return`, `?`, a `break` or
   `continue` out of the span, or a call that reaches code naming X_COUNT
   (through every call the checker resolved; a call it cannot follow is
-  refused too): the count would change at another time than before.
+  refused too): the count would change at another time than before;
+- (0.25.5) a call in the index of `X[i]` that may grow X (one reaching a
+  write of X or X_COUNT, through every call the checker resolved; one it
+  cannot follow too): `X[t_node(..)]` reads X's buffer and length before
+  it calls, so the element would be read through the header X had before
+  the call (a new element is refused by the bounds check, an old one read
+  from a buffer since freed). Take the index into a `let` first.
 
 Change those by hand (an index instead of a pointer; the increment moved
 next to the store), then run it again. Afterwards indexing X is safe:
 `note refactor.table-unsafe` gives the `try:` line, `fix --only
 unneeded-unsafe`, that takes away the unsafe blocks only the table's
-indexing needed. `--dry-run` prints the diff, or the refusals.
+indexing needed; `fix --only unneeded-justified` (0.25.5) also takes the
+ones whose `// UNSAFE:` and `// SAFETY:` comments named the table, with
+those comments. `--dry-run` prints the diff, or the refusals.
 
 ## refactor variant
 
