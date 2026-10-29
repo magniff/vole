@@ -191,6 +191,18 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/refactor/run254.t).
 - The words after `--` reach a command as they are: `--json`,
   `--values=...` and `--help` there were volec's own before.
+- (opt254) **A Vec's header out of its loops** (-O2;
+  docs/optimizer.md, "0.25.4: Vec facts"; middle/vecfacts.vl): a let
+  parameter's Vec does not change during the call, and a store to a
+  Vec's element does not reach that Vec's ptr, len or cap, so GVN, LICM
+  and the vectorizer (which now moves a loop's invariant loads out
+  first) keep them from before the loop. `for i in 0..v.len() { s +=
+  v[i] }` over a let parameter is vectorized again (55 to 36 ms on
+  bench/vecloop, IntVec's 35), `v[i] = v[i] + 1` over an inout Vec
+  loses its bounds check and is vectorized (26 to 9 ms), and a static
+  Vec's ptr and len are read once before a loop that indexes it. What
+  unsafe code must keep for it is in `guide unsafe`: nothing lent let
+  changes during the call, through a raw pointer either.
 
 ### What's new in 0.25.3
 

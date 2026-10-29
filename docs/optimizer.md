@@ -2642,3 +2642,91 @@ address is taken could assume too); entry facts for a function its
 callers inline (the phase order above: the facts after its loop passes);
 a non-negative length (the window); facts at the instance level of a
 callee whose clause calls more than `len()`.
+
+## 0.25.4: Vec facts
+
+docs/design/modernize-0254.md §2 measured std's `Vec<i64>` against the
+compiler's IntVec before the compiler's tables and IntVecs become
+`Vec<T, Comp>`: a loop over a Vec reached through a parameter or a
+static was 20 to 40% slower, because the Vec's `ptr` and `len` were
+read again, and checked, at every element, and the reload kept the
+vectorizer away. Two facts for the alias analysis remove that
+(middle/vecfacts.vl, asked by gvn.vl's `may_alias` when a side's memory
+object is unknown):
+
+1. **A let parameter's Vec header does not change during the call.** A
+   let parameter of an owned type is a `&T` to the optimizer, lent
+   read-only for the call; no store reaches the ptr, len and cap of a
+   std Vec in its referent, reached through std's sealed structs (a
+   String's or a Buf's bytes; `vec_header_in` with `sealed`). Not
+   through other structs: a let method of a Mutex writes the value
+   inside through a raw pointer, and so may any struct's own unsafe
+   code; std's sealed structs never write their fields from a let
+   method. Only for a parameter the function never writes through nor
+   passes on (`param_written`: `&v as *Vec<T>` is accepted in unsafe
+   code, and the function may push through it), and under the own
+   pass's error mode (`noalias_active`). Calls were covered already
+   (0.17's `param_frozen`); this adds the stores.
+2. **A Vec's buffer does not hold its own header.** An access at an
+   address made by additions from the `ptr` loaded from a Vec's header
+   (`buffer_load`), with no memory object of its own (`root_of` 0), is
+   not at that same header's ptr, len or cap: the buffer is a block the
+   Vec owns, and a Vec is never inside what it owns. The header is
+   where a type says it is: a reference parameter's referent, a static
+   of this program, a frame slot (`memory_type`), through struct fields
+   and array elements at constant offsets. Another Vec's buffer may hold
+   this header (`Vec<Vec<T>>`), so the fact is about the same header
+   only (`same_object`).
+
+What unsafe code must keep for them is in `guide unsafe`: it changes
+nothing lent let while the call runs, through a raw pointer either, and
+it makes no pointer into a Vec's header from that Vec's buffer pointer.
+
+With the facts, three passes move the header out of loops:
+
+- **GVN** forwards a load of `len` (or `ptr`) made before a loop into
+  the loop: the loop's stores to elements no longer kill it
+  (`inherit_into`'s block kills). `for i in 0..v.len() { v[i] = .. }`
+  then compares i with the length read once, and the range analysis
+  removes the check.
+- **The vectorizer** first moves the loop's invariant loads to its
+  preheader (licm.vl's `hoist_invariant_loads`, the loads LICM would
+  move, that may run anywhere: a static's, a slot's, a Vec header in a
+  reference parameter's referent, `in_param_vec_header`), since LICM
+  runs after the loop passes: an access whose address depends on a load
+  in the loop (`loads_in`) is not vectorized, and a Vec's `ptr` read in
+  every iteration was such a load.
+- **LICM** hoists a load from a Vec header in a reference parameter's
+  referent (before, only a load with a slot or a static as its object
+  was a candidate), and a load at the address of a static, a slot or a
+  string made in the loop, the address moving with it (`is_address_op`;
+  before, such a load was never invariant), so a static Vec's header
+  leaves a loop whose bound is not its length. Only with a load: hoisting
+  every such address out of every loop (they are constants) made the
+  -O2 self-compile 5% dearer, for longer live ranges and nothing faster.
+
+**Measured** (bench/vecloop/run.sh: vec.vl, std's Vec; raw.vl, the
+same program on an IntVec and a raw static table; aarch64-macos, -O2,
+CPU time of each kernel alone (`vec K`), the best of 5 runs at a load
+average of 12 on 12 cores, so a few milliseconds are noise; the
+assembly is the evidence, `run.sh -s DIR` keeps it):
+
+| kernel | Vec before | Vec after | raw | the code after |
+|---|---:|---:|---:|---|
+| 1 push 4M, 15 rounds | 105 | 88 | 112-121 | the same: the push |
+| 2 `for i in 0..v.len() { s += v[i] }`, v a let parameter | 55 | 36 | 35-45 | `ldp q, q` 4 vectors of 2 lanes an iteration, as raw's (before: `ldr x1, [x0]` at each element, unrolled by 4, not vectorized) |
+| 3 `for x in v.iter()` | 43 | 33 | 33-39 | the same (vectorized before too) |
+| 4 `v[i] = v[i] + 1`, v inout | 26 | 9 | 17-18 | vectorized, no check (before: len and ptr read and compared at each element); raw's IntVec reloads `data` per element and stays scalar |
+| 5 data-dependent index, `k = (v[k] * 7 + k) & 65535` | 14 | 8 | 8-9 | one compare and branch an access (the check stays: the index is data); ptr and len read once (before: twice an access) |
+| 6 push 1M 48-byte nodes to a static Vec, 10 rounds | 24 | 24 | 25 | the same |
+| 7 walk 10M links through a static Vec | 111 | 103 | 103-111 | ptr and len read once, before the loop (before: the static's address and both loads in the loop) |
+| 8 `X[i].end = X[i].start + X[i].kind`, X a static Vec | 13 | 11 | 13 | unrolled by 4, no check (before: the header read and compared at each element) |
+
+Tests: `opt_vecfacts_header` (the IR: the let sum vectorized, the inout
+and static loops without a check, a static Vec's header before the
+loop), `opt_vecfacts_push_reload`, `opt_vecfacts_raw_alias`,
+`opt_vecfacts_other_vec`, `opt_vecfacts_let_raw`, `opt_vecfacts_closure`
+(what must still be read again: a push in the loop, a raw pointer to the
+Vec, another Vec's buffer holding the header, a let parameter the
+function itself pushes to through a raw pointer, a closure in the loop
+that pushes; all with `--check-alloc`, at -O0, -O1 and -O2).

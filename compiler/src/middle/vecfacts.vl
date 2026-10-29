@@ -1,0 +1,324 @@
+// (0.25.4) What the optimizer knows of std's Vec (docs/design/
+// modernize-0254.md §2, step 2): two facts for the alias analysis
+// (gvn.vl's may_alias), with which GVN forwards a Vec's ptr and len
+// across the stores of a loop, LICM hoists them, and the vectorizer
+// (vectorize/mod.vl, hoist_invariant_loads) sees an element's address
+// affine in the induction variable. docs/optimizer.md, "0.25.4: Vec facts".
+//
+// 1. A let parameter's Vec header does not change during the call. The
+//    referent of a let parameter (`v: Vec<T>`, a `&T` to the optimizer) is
+//    lent read-only for the call (the law of exclusivity): no store
+//    reaches the ptr, len and cap of a std Vec in it, reached from the
+//    parameter through std's sealed structs (a String's or a Buf's bytes).
+//    Not through other structs: a let method of a Mutex writes the value
+//    inside through a raw pointer (std::sync), and so may any struct's
+//    own unsafe code; std's sealed structs never do. Only when the
+//    function never writes through the parameter itself or passes it on
+//    (param_written: `&v as *Vec<T>` is accepted in unsafe code) and the
+//    own pass ran in error mode (noalias_active). Calls were covered
+//    already (gvn.vl, param_frozen); this adds the stores.
+// 2. A Vec's buffer does not hold its own header. An access at an
+//    address made from the `ptr` loaded from a Vec's header, plus offsets
+//    (an element's), is not at that header's ptr, len or cap: the buffer
+//    is a block the Vec owns, and a Vec is never inside what it owns. The
+//    header must be at a place whose type says where the Vec is: a
+//    reference parameter's referent, a static of this program, a frame
+//    slot. Another Vec's buffer may hold this header (a Vec<Vec<T>>), so
+//    the fact is about the same header only.
+//
+// What unsafe code must keep for these (guide unsafe): it changes no Vec
+// lent let while the call runs, through a raw pointer either; it makes no
+// address of a Vec's header from its buffer's pointer.
+use crate::base::intern_c;
+use crate::front::ast::STRUCT_SEALED;
+use crate::front::modules::within_std;
+use crate::front::types::{
+    FIELDS, STATICS, STRUCTS, STRUCT_COUNT, SYM_STATIC, TYPES, TY_U64, TyKind, fn_param, type_size,
+};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::is_const;
+use crate::middle::gvn::{
+    PC_NONE, PC_SHARED, address_base, noalias_active, param_class, param_written, root_of,
+};
+use crate::middle::ir::IRFUNCS;
+use crate::middle::ir::Op::{Add, GAddr, Load, Param, Slot};
+
+// The std Vec template's index in STRUCTS + 1 (an instance's `tmpl`), 0
+// when there is none (no std, or before init_vec_facts): the facts off.
+static var VEC_TMPL: i64 = 0;
+
+// Finds std's Vec (before the tasks run: middle::parallel, prepare_tasks).
+pub fn init_vec_facts() {
+    VEC_TMPL = 0;
+    let name = intern_c(c"Vec");
+    // UNSAFE: STRUCTS, the checker's raw table of structs.
+    // SAFETY: read only, s below STRUCT_COUNT; on the main thread, before
+    // the optimizer's threads start.
+    unsafe {
+        for s in 0..STRUCT_COUNT {
+            if STRUCTS[s].generic != 0 && STRUCTS[s].tmpl == 0 && STRUCTS[s].name == name
+                && within_std(STRUCTS[s].module) {
+                VEC_TMPL = s + 1;
+                return;
+            }
+        }
+    }
+}
+
+// Whether struct s (an instance) is one of std's sealed structs.
+fn sealed_std(s: i64) -> bool {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        let t = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
+        (STRUCTS[t].repr & STRUCT_SEALED) != 0 && within_std(STRUCTS[t].module)
+    }
+}
+
+// Where [offset, + size) of a value of type t lies in the header (ptr,
+// len, cap) of a std Vec inside it, through struct fields and array
+// elements (`sealed`: through std's sealed structs only): the header's
+// offset in t + 1, or 0.
+fn vec_header_in(t0: i64, offset: i64, size: i64, sealed: bool) -> i64 {
+    var t = t0;
+    var off = offset;
+    var at = 0;
+    // UNSAFE: the checker's raw tables of types, structs and fields.
+    // SAFETY: read only; t is a type id, s a struct id and f a field index
+    // of s, all made by the checker; the tables do not change while the
+    // optimizer runs.
+    unsafe {
+        for _ in 0..8 {
+            if t <= 0 || off < 0 || size <= 0 {
+                return 0;
+            }
+            let kind = TYPES[t].kind;
+            if kind == TyKind::Struct {
+                let s = TYPES[t].a;
+                if VEC_TMPL != 0 && STRUCTS[s].tmpl == VEC_TMPL {
+                    // (ptr, len, cap: the first three fields)
+                    let end = FIELDS[STRUCTS[s].fields + 2].offset + 8;
+                    return if off + size <= end { at + 1 } else { 0 };
+                }
+                if sealed && !sealed_std(s) {
+                    return 0;
+                }
+                var next = 0;
+                for i in 0..STRUCTS[s].field_count {
+                    let f = STRUCTS[s].fields + i;
+                    let fo = FIELDS[f].offset;
+                    if off >= fo && off + size <= fo + type_size(FIELDS[f].ty) {
+                        next = FIELDS[f].ty;
+                        at += fo;
+                        off -= fo;
+                        break;
+                    }
+                }
+                t = next;
+            } else if kind == TyKind::Array && !sealed {
+                let elem = TYPES[t].a;
+                let es = type_size(elem);
+                if es <= 0 {
+                    return 0;
+                }
+                let k = off / es;
+                at += k * es;
+                off -= k * es;
+                t = elem;
+            } else {
+                return 0;
+            }
+        }
+        0
+    }
+}
+
+// The type of the memory object at `base` (an address with no offset of
+// its own): a reference parameter's referent, a static's of this
+// program, a frame slot's; 0 when not known.
+fn memory_type(cx: sink *FnCtx, base: i64) -> i64 {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        let op = cx.insts[base].op;
+        if op == Param {
+            let k = cx.insts[base].imm;
+            if k < 0 || cx.insts[base].ty != TY_U64 || cx.insts[base].imm2 != 0
+                || param_class(cx, k) == PC_NONE {
+                return 0;
+            }
+            let t = fn_param(IRFUNCS[cx.irf].f, k);
+            return if TYPES[t].kind == TyKind::Ptr { TYPES[t].a } else { 0 };
+        }
+        if op == GAddr {
+            let st = SYM_STATIC[cx.insts[base].imm] - 1;
+            if st < 0 || STATICS[st].linkage == 1 {
+                return 0;
+            }
+            return STATICS[st].ty;
+        }
+        if op == Slot {
+            let s = cx.insts[base].imm;
+            let t = cx.slots[s].ty;
+            if t <= 0 || type_size(t) > cx.slots[s].size {
+                return 0;
+            }
+            return t;
+        }
+        0
+    }
+}
+
+// Whether [base + off, + size) is a let parameter's Vec header that
+// nothing writes during the call (fact 1): a let parameter (`&T`) the
+// function never writes through nor passes on, under the own pass's
+// error mode, the range in a std Vec's header reached through std's
+// sealed structs. (The cheap tests first: may_alias asks often.)
+fn frozen_header(cx: sink *FnCtx, base: i64, off: i64, size: i64) -> bool {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        let k = cx.insts[base].imm;
+        if k < 0 || cx.insts[base].ty != TY_U64 || cx.insts[base].imm2 != 0
+            || param_class(cx, k) != PC_SHARED || !noalias_active() {
+            return false;
+        }
+        let t = fn_param(IRFUNCS[cx.irf].f, k);
+        TYPES[t].kind == TyKind::Ptr && vec_header_in(TYPES[t].a, off, size, true) != 0
+            && !param_written(cx, k + 1)
+    }
+}
+
+// (0.25.4) The size of a reference parameter's referent when `base` is
+// one (a `&T` or `&mut T`, not a slice's pointer), else -1: such a
+// parameter points to a live T for the whole call, so an access inside it
+// may run anywhere in the function (LICM's preheader).
+pub fn ref_param_size(cx: sink *FnCtx, base: i64) -> i64 {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        if cx.insts[base].op != Param {
+            return -1;
+        }
+        let t = memory_type(cx, base);
+        if t <= 0 { -1 } else { type_size(t) }
+    }
+}
+
+// Whether [base + off, + size) is in the header of a std Vec in the
+// referent of reference parameter `base`: what LICM hoists of a
+// parameter's memory (only a Vec's header: other memory a let parameter
+// reaches may change under it, a Mutex's value).
+pub fn in_param_vec_header(cx: sink *FnCtx, base: i64, off: i64, size: i64) -> bool {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        if VEC_TMPL == 0 || cx.insts[base].op != Param {
+            return false;
+        }
+        let t = memory_type(cx, base);
+        t > 0 && vec_header_in(t, off, size, false) != 0
+    }
+}
+
+// The load of a pointer that address `v` is made from through additions
+// (one side of each the pointer, the other an offset), or 0.
+fn buffer_load(cx: sink *FnCtx, v: i64) -> i64 {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        var x = v;
+        for _ in 0..16 {
+            let op = cx.insts[x].op;
+            if op == Load {
+                return if cx.insts[x].ty == TY_U64 { x } else { 0 };
+            }
+            if op != Add || cx.insts[x].ty != TY_U64 {
+                return 0;
+            }
+            if is_const(cx, cx.insts[x].b) {
+                x = cx.insts[x].a;
+                continue;
+            }
+            let la = buffer_load(cx, cx.insts[x].a);
+            let lb = buffer_load(cx, cx.insts[x].b);
+            if (la == 0) == (lb == 0) {
+                return 0;
+            }
+            return if la != 0 { la } else { lb };
+        }
+        0
+    }
+}
+
+// Whether bases a and b are the same memory object's start.
+fn same_object(cx: sink *FnCtx, a: i64, b: i64) -> bool {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        if a == b {
+            return true;
+        }
+        let op = cx.insts[a].op;
+        op == cx.insts[b].op && (op == GAddr || op == Slot || op == Param)
+            && cx.insts[a].imm == cx.insts[b].imm && cx.insts[a].imm2 == cx.insts[b].imm2
+    }
+}
+
+// Whether [base + off, + size) is apart from an access at base `other`
+// by the facts above (may_alias asks when a root is unknown): a let
+// parameter's Vec header, which nothing writes (fact 1), or a Vec header
+// that `other`, in its own buffer, cannot reach (fact 2).
+pub fn vec_apart(cx: sink *FnCtx, base: i64, off: i64, size: i64, other: i64) -> bool {
+    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
+    // statics) and the IR's, reached through the raw *FnCtx.
+    // SAFETY: read only; every index is a type, struct, static or value id
+    // the checker or the IR made, in its table; the tables do not change
+    // while the optimizer runs (prepare_tasks laid every type out).
+    unsafe {
+        if VEC_TMPL == 0 {
+            return false;
+        }
+        let op = cx.insts[base].op;
+        if op != Param && op != GAddr && op != Slot {
+            return false;
+        }
+        if op == Param && frozen_header(cx, base, off, size) {
+            return true;
+        }
+        // Fact 2: `other` made from a pointer loaded from this same
+        // object, at the start of the Vec header holding the range.
+        let l = buffer_load(cx, other);
+        if l == 0 {
+            return false;
+        }
+        var o = cx.insts[l].imm;
+        let hb = address_base(cx, cx.insts[l].a, &o);
+        if !same_object(cx, hb, base) || root_of(cx, other) != 0 {
+            return false;
+        }
+        let t = memory_type(cx, base);
+        t > 0 && vec_header_in(t, off, size, false) == o + 1
+    }
+}
