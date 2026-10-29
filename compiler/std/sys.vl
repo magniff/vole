@@ -949,10 +949,34 @@ extern "C" {
     #[link_name = "getpid"]
     #[effects(io)]
     fn sys_c_getpid() -> i32;
+    // (0.25.5) Spawn attributes and signal dispositions (std::process's
+    // Command::foreground).
+    #[link_name = "posix_spawnattr_init"]
+    #[effects(io)]
+    fn sys_c_attr_init(a: *u8) -> i32;
+    #[link_name = "posix_spawnattr_destroy"]
+    #[effects(io)]
+    fn sys_c_attr_destroy(a: *u8) -> i32;
+    #[link_name = "posix_spawnattr_setflags"]
+    #[effects(io)]
+    fn sys_c_attr_setflags(a: *u8, flags: i16) -> i32;
+    #[link_name = "posix_spawnattr_setsigdefault"]
+    #[effects(io)]
+    fn sys_c_attr_setsigdefault(a: *u8, set: *u8) -> i32;
+    #[link_name = "sigemptyset"]
+    #[effects(io)]
+    fn sys_c_sigemptyset(set: *u8) -> i32;
+    #[link_name = "sigaddset"]
+    #[effects(io)]
+    fn sys_c_sigaddset(set: *u8, sig: i32) -> i32;
+    #[link_name = "signal"]
+    #[effects(io)]
+    fn sys_c_signal(sig: i32, handler: *u8) -> *u8;
 }
 
 pub const SYS_SIGHUP: i32 = 1;
 pub const SYS_SIGINT: i32 = 2;
+pub const SYS_SIGQUIT: i32 = 3;
 pub const SYS_SIGKILL: i32 = 9;
 pub const SYS_SIGTERM: i32 = 15;
 const SYS_WNOHANG: i32 = 1;
@@ -1035,6 +1059,15 @@ impl SysSpawnActions {
 // and envp's nulls are NUL-ended strings, and actions is null or points to
 // a SysSpawnActions; the nulls that end argv and envp are checked here.
 pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32> {
+    sys_spawn_attr(prog, argv, envp, actions, 0 as *SysSpawnAttr)
+}
+
+// (0.25.5) sys_spawn with spawn attributes (null: none).
+// UNSAFE: as sys_spawn.
+// SAFETY: (the caller's obligation) as sys_spawn's, and attr is null or
+// points to a SysSpawnAttr.
+pub unsafe fn sys_spawn_attr(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions,
+    attr: *SysSpawnAttr) -> Result<i32, i32> {
     if argv.len == 0 || argv[argv.len - 1] != 0 as *u8 {
         return Err(SYS_EINVAL);
     }
@@ -1047,12 +1080,97 @@ pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnA
     } else {
         &actions.words as *u8
     };
+    let at = if attr == 0 as *SysSpawnAttr || !attr.live { 0 as *u8 } else { &attr.words as *u8 };
     var pid = 0i32;
-    let r = sys_c_posix_spawnp(&pid, prog, acts, 0 as *u8, argv.ptr, env);
+    let r = sys_c_posix_spawnp(&pid, prog, acts, at, argv.ptr, env);
     if r != 0 {
         return Err(r);
     }
     Ok(pid)
+}
+
+// (0.25.5) posix_spawnattr_t, opaque: room for either system's (8 bytes on
+// macOS, 336 on Linux). Dropping it frees it, so it moves and is never
+// copied, as SysSpawnActions.
+#[sealed]
+pub struct SysSpawnAttr {
+    words: [u64; 48],
+    live: bool,
+}
+
+impl Drop for SysSpawnAttr {
+    fn drop(inout self) {
+        if self.live {
+            // UNSAFE: C destroys the attributes through a raw pointer.
+            // SAFETY: live (checked): initialized by sys_spawn_sigdefault,
+            // destroyed once, live cleared right after.
+            unsafe { sys_c_attr_destroy(&self.words as *u8); }
+            self.live = false;
+        }
+    }
+}
+
+// POSIX_SPAWN_SETSIGDEF, the same on macOS and Linux.
+const SYS_SPAWN_SETSIGDEF: i16 = 4;
+
+// (0.25.5) Spawn attributes under which the child starts with the default
+// action of each of sigs, whatever this process's are (a signal it
+// ignores, the child does not).
+pub fn sys_spawn_sigdefault(sigs: [i32]) -> Result<SysSpawnAttr, i32> {
+    var a = SysSpawnAttr { words: [0u64; 48], live: false };
+    // sigset_t: 4 bytes on macOS, 128 on Linux
+    var set: [u64; 16] = [0u64; 16];
+    // UNSAFE: C initializes the attributes and the signal set through raw
+    // pointers. SAFETY: a.words (384 bytes) and set (128) are larger than
+    // either system's posix_spawnattr_t and sigset_t, 8-aligned; the
+    // attributes hold no pointer into themselves, so moving them is fine.
+    unsafe {
+        let r = sys_c_attr_init(&a.words as *u8);
+        if r != 0 {
+            return Err(r);
+        }
+        a.live = true;
+        sys_c_sigemptyset(&set as *u8);
+        for sig in sigs {
+            sys_c_sigaddset(&set as *u8, sig);
+        }
+        let r2 = sys_c_attr_setsigdefault(&a.words as *u8, &set as *u8);
+        if r2 != 0 {
+            return Err(r2);
+        }
+        let r3 = sys_c_attr_setflags(&a.words as *u8, SYS_SPAWN_SETSIGDEF);
+        if r3 != 0 {
+            return Err(r3);
+        }
+    }
+    Ok(a)
+}
+
+// (0.25.5) A signal's disposition before sys_signal_ignore changed it: only
+// sys_signal_ignore makes one, so sys_signal_restore sets back what C gave.
+#[sealed]
+pub struct SysSignalWas { sig: i32, handler: *u8 }
+
+// This process ignores sig (SIG_IGN) from now on: what it did before.
+pub fn sys_signal_ignore(sig: i32) -> SysSignalWas {
+    // UNSAFE: C's signal, with a handler as a raw pointer.
+    // SAFETY: SIG_IGN (1 on macOS and Linux) is a disposition, not code; sig
+    // is an int (an invalid one gives SIG_ERR, restored as nothing below).
+    let was = unsafe { sys_c_signal(sig, 1 as *u8) };
+    SysSignalWas { sig: sig, handler: was }
+}
+
+// The disposition sys_signal_ignore replaced, set back.
+pub fn sys_signal_restore(was: SysSignalWas) {
+    // (SIG_ERR, -1: signal failed, nothing was changed)
+    if was.handler as i64 == -1 {
+        return;
+    }
+    // UNSAFE: C's signal, with a handler as a raw pointer.
+    // SAFETY: was.handler is what signal returned for was.sig (SysSignalWas
+    // is sealed: only sys_signal_ignore makes one): SIG_DFL, SIG_IGN, or a
+    // handler of this process, still loaded.
+    unsafe { sys_c_signal(was.sig, was.handler); }
 }
 
 // Waits for the child pid (-1: any child) to end, or with nohang only

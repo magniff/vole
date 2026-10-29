@@ -96,6 +96,41 @@ The edit tools (edit255, feedbacks/DIGEST-0.25.4.md §2):
   compiler's, and prints `try: volec fix --only unneeded-unsafe` when
   blocks are unneeded; `refactor --script` runs `rewrite --text` steps.
 
+std (std255):
+
+- **Breaking:** `Atomic<T>` is bounded: `T: AtomicValue`, which only the
+  integers, `bool` and raw pointers implement (the compiler's, as `Ord`
+  for pointers; std seals the trait: its function returns a type private
+  to std::sync::atomic, so no program can add a type). The arithmetic
+  (`fetch_add`, `fetch_sub`, `fetch_nand`, `fetch_max`, `fetch_min`) takes
+  `T: AtomicInteger` (the integers), `fetch_and`/`or`/`xor`
+  `T: AtomicBitwise` (and bool). 0.25.4 compiled `Atomic` of a struct,
+  whose load faulted at -O2, and `Atomic<f64>`, whose `fetch_add` added
+  the bits as an integer; both are now "the trait 'AtomicValue' is not
+  implemented for 'f64'", at the call that makes one.
+- std's statics under threads: a `Fmt::to_fd` of a program's own takes
+  print's lock at its first write and keeps it to its flush (0.25.4 used
+  print's buffer without it, a data race with any other thread's print
+  that mixed lines and could write past the buffer); the checking
+  allocator (`--check-alloc`) holds a lock in each entry (0.25.4 reported
+  double and invalid frees, or crashed, when threads allocated); the CPU
+  feature word of `std::arch::detect` is an atomic. stdin's buffer and
+  Linux's argument statics stay plain: a thread that reaches them is
+  refused (`sync.global`).
+- A `#[thread_local]` builds without `use std::thread` (0.25.4: "undefined
+  variable 'thread_c_malloc'" in std).
+- `std::__fmt_in_end` (what `format_in(f"..")` compiles to) takes two
+  arguments, safely; `std::test_args` (a test binary's arguments) reads
+  `env::args_os()`, safely, and the test main takes no argc and argv.
+- `[T]::starts_with(p)` and `ends_with(p)` (Rust's; bytes included);
+  `f64::next_up`, `next_down` and f32's.
+- `std::process::Command`: any number of arguments (0.25.4 panicked past
+  32, and refused more than 4 KB of them), `env_remove(name)`, and
+  `foreground(true)`: while `status()` or `output_in` waits, this process
+  ignores SIGINT and SIGQUIT and the child starts with their default
+  actions (as a shell runs a command: ^C ends the child, whose end this
+  process reports). Breaking: a Command owns Vecs, so it moves.
+
 ### What's new in 0.25.4
 
 `volec run`, the pathtrace laboratory's feedback (feedbacks/pathtrace-ui.md),

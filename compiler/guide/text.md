@@ -23,7 +23,9 @@ as u32`). What allocates takes an allocator, Rust's name with `_in`:
 forms are errors naming them. Bytes become a `str` checked:
 `str::from_utf8(b)?`, `String::from_utf8(v)?` (a `Vec<u8>`),
 `String::from_buf(b)?`, `String::from_utf8_lossy_in(b, gpa)`; back:
-`s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`.
+`s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`. (0.25.5) Bytes (any
+slice whose elements have `==`) have `starts_with(p)` and `ends_with(p)`
+too: `name.ends_with(".vl")` of a `[u8]`.
 
 ```vole
 fn initials(name: str, gpa: Gpa) -> String {
