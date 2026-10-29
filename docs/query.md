@@ -1127,15 +1127,24 @@ nodes, which are not cached: they read the program in full and leave the
 cache as it is. The answers are the same code, on the same tables,
 byte for byte: tests/query/run.sh and tests/refactor/run.sh run every
 transcript without the cache and with it (a query twice: the second
-must come from the cache when the first made it).
+must come from the cache when the first made it); (0.25.3)
+tests/cachediff/run.sh runs every command line of the query and
+refactoring transcripts and of the walkthroughs three times on the same
+state of its program, without the cache, with a fresh one and from it
+(an edit's from the cache `check` made of the program it reads), and
+compares the outputs, exit statuses and the files the command left (a
+sample in the suite, all of it in the gate's `cachediff` step).
 
 - Where: `target/volec-cache/q-KEY.bin` and `q-KEY.refs` (every
   reference, read by refs and callers only), KEY a hash of the root as
-  given, the current directory and the target. `$VOLE_CACHE` names
+  given, the current directory, the target and (0.25.3) the compiler as
+  it was run (`volec`, `target/volec`: the name the errors' `try:`
+  lines print, which the cache keeps). `$VOLE_CACHE` names
   another directory, or `off`; without it there is a cache only when the
   current directory has a `target` directory.
 - When it holds: for the compiler that wrote it (a hash of its
-  executable), when every file of the program has the text it had (each
+  executable; 0.25.3: also when it is run from `$PATH`, as `volec`,
+  which had no cache before), when every file of the program has the text it had (each
   is read again and hashed: an edit by any means is seen), and when the
   module files that were looked for and not found (`a.vl` before
   `a/mod.vl`) still do not exist. Else the program is read in full and

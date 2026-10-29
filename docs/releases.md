@@ -303,6 +303,21 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   not read, and is made again), the answers from it are the same as
   without it, and the table is not read where it was not made
   (tests/query/stdcache0253.q).
+- **The tools' cache, checked**: tests/cachediff/run.sh runs every
+  command line of the query and refactoring transcripts and of the
+  walkthroughs (1,293 lines, 130 transcripts) without the cache, with
+  a fresh one and from it, on the same state of the program, and
+  compares the output,
+  the exit status and the files left (a sample in the suite, category
+  `cachediff`; all of it in the gate's `cachediff` step, --quick too).
+  What it found: `volec` run from `$PATH` never had a cache (the
+  compiler hashes its own file, and found none by a name without a
+  `/`); and a cache made by the compiler under one name (`target/volec
+  check`) was read under another (`volec edit ...`), with its errors'
+  `try:` lines naming the first: `check` printed them, and an edit
+  compared them with its own check's, took them for new errors and
+  refused itself (`edit.breaks`). The cache's key now has the name the
+  compiler was run by (tests/refactor/cachename0253.t).
 
 - **A closure drops its by-value parameter** (a leak since 0.19, F20):
   one given to an `FnMut(sink T)` bound (`map`, `for_each`, `fold`,
