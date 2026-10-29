@@ -251,6 +251,17 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `as_slice`, `as_bytes`, `format_in` and `extend_from_slice` turn
   into what; what `panic` and `println` take. compiler/guide/embed.sh
   writes a topic of more than 990 lines as several functions.
+- **The tools' cache, fixed**: `query show` (and `context`) of one of
+  std's items no longer crashes when it answers from the cache (SIGSEGV
+  every time, in 0.25.2.2 too: `query show parse_primary` in the
+  compiler, whose std has a `Front::parse_primary`). Its `// use` line
+  asks what `std::NAME` names, which the front end answers from its
+  scopes and its table of items' nodes; a program from the cache has
+  neither, and the answer read that table through a null pointer. The
+  cache now keeps those answers (its format 9: a cache of 0.25.2.2 is
+  not read, and is made again), the answers from it are the same as
+  without it, and the table is not read where it was not made
+  (tests/query/stdcache0253.q).
 
 ### What's new in 0.25.2.2
 
