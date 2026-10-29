@@ -68,9 +68,24 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.2.1 | `v0.25.2.1` | 0.25.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the first GPU eval: `f(make()?)?`'s empty argument fixed; float math in std, in vole; std::gpu multiple render targets and depth-only passes; frames for an occluded window; twelve diagnostics; `fix --suggested` and the hooks made safe |
 | 0.25.2.2 | `v0.25.2.2` | 0.25.2.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the second GPU eval: a `requires` call's `?` arguments kept to the call; std::gpu layouts per entry point, `gpu.unwritten`, more storage formats, limits named; integer methods; ten diagnostics; `query show` across programs; the hooks quieter and clearer |
 
+| 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.25.3
+
+The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten
+tasks on 0.25.2.2; no turns lost to the two bugs 0.25.2.2 fixed, where
+round 2 lost about 30; the last round of the loop, as run-to-run noise
+now exceeds a release's effect), what it found, and the roadmap's 0.25.3.
+
+**Breaking:** std::gpu takes WebGPU's usage rule for mappable buffers
+(`MAP_READ` only with `COPY_DST`, `MAP_WRITE` only with `COPY_SRC`), so
+a buffer a kernel writes is read back through a copy into a
+`MAP_READ | COPY_DST` buffer, and a mapped buffer stays mapped until
+`unmap(dev)` (the soundness item below; `guide gpu#skeleton`). The
+round 1–3 eval programs under evals/tasks/0.25.2* that read back
+through a `STORAGE | MAP_READ` buffer stop at `gpu.usage` on 0.25.3;
+they are records of their release.
 
 - **The unsafe audit**: `volec query unsafe [FILE...|std]` lists every
   unsafe block, `unsafe fn` and extern block of a program (std's too;
@@ -292,6 +307,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `as_slice`, `as_bytes`, `format_in` and `extend_from_slice` turn
   into what; what `panic` and `println` take. compiler/guide/embed.sh
   writes a topic of more than 990 lines as several functions.
+- **The chain and a tag's own suite**: a release's tree cannot change,
+  so a case of its own that cannot pass where the chain runs it is
+  listed in its releases.toml entry (`known_failures`, CATEGORY:COUNT)
+  with why; its suite passes only when it fails exactly so, and the
+  summary says it. 0.25.2.2 has one: a hooks case whose hook takes the
+  cache's `target/` path for a scratch copy (fixed in 0.25.3's hook).
 - **The tools' cache, fixed**: `query show` (and `context`) of one of
   std's items no longer crashes when it answers from the cache (SIGSEGV
   every time, in 0.25.2.2 too: `query show parse_primary` in the
