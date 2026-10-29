@@ -310,13 +310,14 @@ exist:
 ```console
 $ volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}'
 report.vl:29:42: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: report.vl:29:42: undefined variable 'share'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}' --no-check
 ```
 
 The error says what would go wrong, tagged `[edited: ...]` to show it
-comes from our change, and `edit.breaks` says nothing was written. When
+comes from our change, and `edit.breaks` says nothing was written and
+repeats the error on its own line, the one to read first. When
 the error is one a second edit would fix (here, adding `share` above),
 the `edit.together` note says how to make both in one call: several
 `--old`/`--new` pairs, checked together at the end. The `try:` line
@@ -477,7 +478,7 @@ mark chapter 4 explained:
 $ volec edit patch run --old '(&counts' --new '(counts' --no-check
 main.vl:14:27: error[conv.marker] 'counts' is lent inout here (the callee may change it): mark it '&counts' | help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let' | try: volec edit patch main.vl:14 --old '(counts' --new '(&counts' | try: volec fix --suggested main.vl  [edited: crate::run]
 patched crate::run	main.vl	+1 -1 lines
-warning edit.breaks: 1 new error; written anyway (--no-check)
+warning edit.breaks: 1 new error; written anyway (--no-check); the error: main.vl:14:27: 'counts' is lent inout here (the callee may change it): mark it '&counts'
 try: volec check
 $ volec check
 main.vl:14:27: error[conv.marker] 'counts' is lent inout here (the callee may change it): mark it '&counts' | help: an inout parameter takes '&place'; when the callee never changes it, take it let: 'volec refactor signature F --convention x let' | try: volec edit patch main.vl:14 --old '(counts' --new '(&counts' | try: volec fix --suggested main.vl

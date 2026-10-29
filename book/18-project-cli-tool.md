@@ -755,7 +755,7 @@ patch`:
 ```console
 $ volec edit patch count::count --old 'var lines = 0;' --new 'println("counting"); var lines = 0;'
 count.vl:22:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: count.vl:22:5: 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println'
 try: volec edit patch count::count --old 'var lines = 0;' --new 'println("counting"); var lines = 0;' --no-check
 ```
 

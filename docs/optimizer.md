@@ -1894,7 +1894,7 @@ b.push_fmt(f"..")    =>  { let __r = &b; let __f0 = ..; { let mut __out = std::_
                             loop { WRITES; if std::__buf_fmt_end(__r, &__out) { break; } } } }
 format_in(f"..", a)  =>  { let __f0 = ..; let __a = a; { let mut __b = std::Buf::new_in(__a);
                             let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
-                            loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+                            loop { WRITES; if std::__fmt_in_end(&__b, &__out) { break; } }
                             __b } }
 ```
 
