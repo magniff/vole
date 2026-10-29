@@ -237,6 +237,22 @@ to remove; its risk; what it can run in parallel with.
   unsafe blocks around its uses go). One table a branch, merged before
   the next; small tables private to one module can go in module branches
   (step 7).
+- NODES, by `refactor table NODES --dry-run` (table254, on 02a9efcf):
+  its first run refused 3 uses, all one statement, `NODES =
+  reserve(NODES, &NODE_CAP, n)` in front::ast::reserve_nodes (0.25's
+  room-ahead for the parser: the table passed, NODE_CAP read). The tool
+  now writes it `NODES.reserve(n - NODES.len())` (Vec's reserve takes
+  the extra room; none when it is not above 0), and the dry run is clean:
+  no use refused, 38 files, 108 reads become `NODES.len()`, the one
+  store-and-increment in new_node `NODES.push(...)`, NODE_COUNT and
+  NODE_CAP and their imports gone, and the edited compiler checks. What
+  to fix first is not in the source but in the optimizer (§2, step 2,
+  branch opt254): every `NODES[i]` gets a header reload and a bounds
+  check, so NODES waits for opt254 and is measured by the compile-cost
+  row then. Two things to check when it runs: new_node's caller keep
+  `let n = NODES.len()` before the push (the tool's form), and the
+  stress-grow row's raw `&NODES[i]` (none left: the tool found no
+  pointer into NODES).
 
 **Step 5. IntVec's uses moved to the API Vec shares, module by module.**
 - Idiom, scope: the 2,823 IntVec references, in branches by directory

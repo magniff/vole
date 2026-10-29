@@ -20,6 +20,7 @@ volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... 
 volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 volec refactor extract-function FN --lines A-B --to NEW          (0.13)
 volec refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
+volec refactor table X [--count X_COUNT] [--cap X_CAP] [--alloc PATH] (0.25.4)
 volec refactor --script FILE
 ```
 
@@ -116,6 +117,63 @@ accesses.
 
 A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
 `warning refactor.layout` (C code sharing it must change too).
+
+## refactor table (0.25.4)
+
+A table kept the way compiler/src kept them before vole had generics, a
+raw pointer, a count and a capacity grown by `base::grow`,
+
+```
+static var X: *T = 0 as *T;
+static var X_COUNT: i64 = 0;
+static var X_CAP: i64 = 0;
+```
+
+becomes `static var X: Vec<T, Comp> = Vec::new_in(Comp {});`
+(docs/design/modernize-0254.md, step 3), with every use the checker
+resolved, in every module:
+
+| before | after |
+|---|---|
+| `X = grow(X, X_COUNT, &X_CAP);` (or in `if X_COUNT >= X_CAP { ... }`) | gone |
+| `X[X_COUNT] = v; ... X_COUNT += 1;` (the increment after the unsafe block the store is in, too) | `X.push(v); ...`; a read of X_COUNT between them is `X.len() - 1` (`X_COUNT + 1`: `X.len()`) |
+| `let n = X_COUNT; ... X[n] = v;` (`n = X_COUNT;` too) | `let n = X.len(); ... X.push(v);` |
+| `let n = X_COUNT; ... X_COUNT += 1; ... X[n] = v;` | `X.push(v)`; a read between the increment and the store's end is `X.len() + 1` |
+| `X = reserve(X, &X_CAP, n);` | `X.reserve(n - X.len());` |
+| `X_COUNT` read | `X.len()` (a path keeps its prefix: `crate::m::X.len()`) |
+| `X_COUNT = 0` | `X.clear()` |
+| `X_COUNT -= k` | `X.truncate(X.len() - k)` |
+| `X[i]`, `X[i].f`, `X[i] = v`, `X[a..b]` | as they are |
+
+X_COUNT's and X_CAP's statics go, with their names in `use` lines (and
+`grow`'s, `reserve`'s where no call of them is left); the table's import
+is added where a file read only its count. X_COUNT's default is X without
+its trailing S, then X, with `_COUNT` (NODES: NODE_COUNT; HS: HS_COUNT),
+X_CAP's the same with `_CAP`: a static of X's module, or the one of that
+name below it; `--count` and `--cap` name others. `--alloc` names the
+allocator type (default `Comp`, crate::base::comp's).
+
+A use it cannot place refuses the whole refactor, nothing written
+(`refactor.table-use`): each one on a line, `FILE:LINE:COL: `CODE`:
+why`, then with more than three a count by reason (`refactor.table-why`):
+
+- `&X[i]` (`&X[i].f`): a raw pointer into the table, which a push may
+  move (the stress-grow gate row finds such pointers kept past a grow);
+- X itself: passed, assigned, cast, compared, freed (`elem_at(X, i)`,
+  `free(X as *u8)`, `let p = X;`);
+- X_CAP read anywhere but in the grow or its guard;
+- X_COUNT written otherwise (`X_COUNT = n`, `+= 1` with no store next to
+  it, `&X_COUNT`);
+- between a store and its increment: a `return`, `?`, a `break` or
+  `continue` out of the span, or a call that reaches code naming X_COUNT
+  (through every call the checker resolved; a call it cannot follow is
+  refused too): the count would change at another time than before.
+
+Change those by hand (an index instead of a pointer; the increment moved
+next to the store), then run it again. Afterwards indexing X is safe:
+`note refactor.table-unsafe` gives the `try:` line, `fix --only
+unneeded-unsafe`, that takes away the unsafe blocks only the table's
+indexing needed. `--dry-run` prints the diff, or the refusals.
 
 ## refactor variant
 

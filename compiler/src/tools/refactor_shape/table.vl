@@ -1,0 +1,1454 @@
+// `refactor table X [--count X_COUNT] [--cap X_CAP] [--alloc PATH]`
+// (0.25.4, docs/design/modernize-0254.md step 3): a table kept as a raw
+// pointer, a count and a capacity,
+//
+//   static var X: *T = 0 as *T;  static var X_COUNT: i64 = 0;  static var X_CAP: i64 = 0;
+//
+// grown by base::grow, becomes `static var X: Vec<T, Comp> =
+// Vec::new_in(Comp {});`. Every use the checker resolved is placed:
+//
+//   X = grow(X, X_COUNT, &X_CAP);       gone (a Vec grows itself)
+//   X[X_COUNT] = v; ... X_COUNT += 1;   X.push(v); ...  (a `let n = X_COUNT;`
+//                                       between the grow and the store stays;
+//                                       a read of X_COUNT between the store and
+//                                       the increment is `X.len() - 1`)
+//   X_COUNT (read)                      X.len()
+//   X_COUNT = 0                         X.clear()
+//   X_COUNT -= k                        X.truncate(X.len() - k)
+//   X[i], X[i].f, X[i] = v, X[a..b]     as they are
+//
+// and X_COUNT's and X_CAP's statics and their imports go. A use it cannot
+// place (`&X[i]`, a raw pointer into the table; X passed or assigned;
+// X_CAP read; any other write of X_COUNT; a call between a store and its
+// increment that reads X_COUNT) is listed, and nothing is changed.
+
+use crate::base::{SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::comp::Comp;
+use crate::cli::line::Call;
+use crate::front::ast::{BLOCK_UNSAFE, NODES, Node, NodeKind};
+use crate::front::lexer::Tok;
+use crate::front::modules::file_of_pos;
+use crate::front::parser::exprs::infix_left_bp;
+use crate::front::types::FNS;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::{DRY_RUN, edit_replace};
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
+use crate::tools::edit::items::after_line;
+use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, Def, K_FN, K_IMPL_METHOD, K_METHOD, K_STATIC, K_TRAIT_FN, bytes_eq,
+};
+use crate::tools::query::diagnostics::{
+    PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
+};
+use crate::tools::query::positions::{line_start, put_loc};
+use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS};
+use crate::tools::refactor_move::imports::{emit_use_edits, remove_use_names};
+use crate::tools::refactor_shape::{
+    PROGRAM_END, SUB, load_and_find, opt, put_count, refs_of, shape_options, starts_line, sym_text,
+    take_args, text_buf, usage_error,
+};
+use crate::tools::rewrite::parsed::{
+    binding_level, expr_slots, pa, pb, pc, pchild, pcount, pd, pend, pflags, pk, pop, pstart,
+};
+
+// ---- What is read ----
+//
+// Each accessor reads one of the compiler's raw tables at an index the
+// loaded program gave (a node, token, definition or position of it).
+
+fn src_text(a: i64, b: i64) -> [u8] {
+    // UNSAFE: SRC is the compiler's raw source table (a *u8 static).
+    // SAFETY: a and b are positions of the loaded program's nodes and
+    // tokens, 0 <= a <= b <= SRC_LEN; the text lives until the run ends.
+    unsafe { SRC[a..b] }
+}
+
+fn src_byte(p: i64) -> u8 {
+    // UNSAFE: SRC is the compiler's raw source table (a *u8 static).
+    // SAFETY: p is at most a file's end, and SRC has a 0 after the last
+    // file (base::load_sources), so SRC[p] is in the table.
+    unsafe { SRC[p] }
+}
+
+fn def_of(d: i64) -> Def {
+    // UNSAFE: DEFS is query's raw table of definitions (a *Def static).
+    // SAFETY: d comes from resolve_name or a loop below DEF_COUNT.
+    unsafe { DEFS[d] }
+}
+
+fn def_count() -> i64 {
+    DEF_COUNT
+}
+
+fn checked(n: i64) -> Node {
+    // UNSAFE: NODES is the checked program's raw node table.
+    // SAFETY: n is below NODE_COUNT (a loop's bound or a node's child).
+    unsafe { NODES[n] }
+}
+
+fn node_count() -> i64 {
+    crate::front::ast::NODE_COUNT
+}
+
+fn fn_node(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's raw table of functions.
+    // SAFETY: f is a Call node's resolution (x - 1), an index of FNS.
+    unsafe { FNS[f].node }
+}
+
+// ---- The table being changed ----
+
+// X's, X_COUNT's and X_CAP's names (symbols) and definitions (-1: none).
+static var X_SYM: i64 = 0;
+static var C_SYM: i64 = 0;
+static var K_SYM: i64 = 0;
+static var X_DEF: i64 = -1;
+static var C_DEF: i64 = -1;
+static var K_DEF: i64 = -1;
+// The table's name as the new text says it.
+static var X_TEXT: [u8] = "";
+
+// The parent of each parsed node of the program (0: none).
+static var PARENT: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The parsed Ident node at each position (pos + 1 -> node + 1).
+static var IDENT_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The references placed by a sequence (pos + 1 -> 1).
+static var DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The uses refused: their positions, why (a C string), the node shown.
+static var RF_POS: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var RF_WHY: Vec<*u8, Comp> = Vec::new_in(Comp {});
+static var RF_A: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var RF_B: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The span of the last problem region_problem found (PROB_B 0: none).
+static var PROB_A: i64 = 0;
+static var PROB_B: i64 = 0;
+// What was done, for the summary.
+static var N_PUSH: i64 = 0;
+static var N_LEN: i64 = 0;
+static var N_CLEAR: i64 = 0;
+static var N_TRUNC: i64 = 0;
+static var N_RESERVE: i64 = 0;
+static var EDIT_FAILED: bool = false;
+
+// A use refused: where, why (a C string; X, X_COUNT and X_CAP are
+// the table's names), the code shown (node; 0: none).
+fn refuse(pos: i64, why: *u8, node: i64) {
+    if node > 0 {
+        refuse_span(pos, why, pstart(node), pend(node));
+    } else {
+        refuse_span(pos, why, 0, 0);
+    }
+}
+
+// A use refused, the code shown SRC[a..b) (none when b <= a); a
+// problem region_problem found shows its own code.
+fn refuse_span(pos: i64, why: *u8, a: i64, b: i64) {
+    RF_POS.push(if PROB_B > PROB_A { PROB_A } else { pos });
+    RF_WHY.push(why);
+    RF_A.push(if PROB_B > PROB_A { PROB_A } else { a });
+    RF_B.push(if PROB_B > PROB_A { PROB_B } else { b });
+    PROB_A = 0;
+    PROB_B = 0;
+}
+
+fn edit(a: i64, b: i64, text: [u8]) {
+    if !edit_replace(a, b, text_buf(text)) {
+        EDIT_FAILED = true;
+    }
+}
+
+fn parent(n: i64) -> i64 {
+    if n <= 0 || n >= PARENT.len() { 0 } else { PARENT[n] }
+}
+
+// The parents of the program's parsed nodes, from the expressions inside
+// each (rewrite's expr_slots: statements, blocks, operands, arguments).
+fn build_parents() {
+    PARENT.clear();
+    for _ in 0..PROGRAM_END + 1 {
+        PARENT.push(0);
+    }
+    var kids = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var levels = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for n in 1..PROGRAM_END {
+        kids.count = 0;
+        levels.count = 0;
+        expr_slots(n, &kids, &levels);
+        for i in 0..kids.count {
+            let c = kids.get(i);
+            if c > 0 && c < PROGRAM_END {
+                PARENT[c] = n;
+            }
+        }
+        // (a function's body; a path's segments)
+        if pk(n) == NodeKind::Fn && pc(n) > 0 && pc(n) < PROGRAM_END {
+            PARENT[pc(n)] = n;
+        }
+        if pk(n) == NodeKind::Path {
+            for i in 0..pcount(n) {
+                let c = pchild(n, i);
+                if c > 0 && c < PROGRAM_END {
+                    PARENT[c] = n;
+                }
+            }
+        }
+        if pk(n) == NodeKind::Ident {
+            IDENT_AT.put(pstart(n) + 1, n + 1);
+        }
+    }
+}
+
+// The parsed Ident naming `sym` at pos, or -1.
+fn ident_at(pos: i64, sym: i64) -> i64 {
+    let n = IDENT_AT.get(pos + 1) - 1;
+    if n > 0 && pa(n) == sym { n } else { -1 }
+}
+
+// The name node n ends with: n (an Ident), a path's last segment
+// (`crate::m::X`), or -1.
+fn last_seg(n: i64) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    if pk(n) == NodeKind::Ident {
+        return n;
+    }
+    if pk(n) == NodeKind::Path && pcount(n) > 0 && pk(pchild(n, pcount(n) - 1)) == NodeKind::Ident {
+        return pchild(n, pcount(n) - 1);
+    }
+    -1
+}
+
+// Whether parsed node n names sym (an Ident, or a path ending in it).
+fn is_name(n: i64, sym: i64) -> bool {
+    let s = last_seg(n);
+    s > 0 && pa(s) == sym
+}
+
+// The expression the name at Ident id is: id, or the path it ends.
+fn expr_of(id: i64) -> i64 {
+    let p = parent(id);
+    if p > 0 && pk(p) == NodeKind::Path && last_seg(p) == id { p } else { id }
+}
+
+// The position of the name expression e names X_COUNT or X by.
+fn name_pos(e: i64) -> i64 {
+    pstart(last_seg(e))
+}
+
+// Into t: X as name expression e writes it (`crate::m::X` for a path).
+fn put_x(t: i64, e: i64) {
+    buf_bytes(t, src_text(pstart(e), name_pos(e)));
+    buf_bytes(t, X_TEXT);
+}
+
+fn is_int(n: i64, v: i64) -> bool {
+    n > 0 && pk(n) == NodeKind::Int && pa(n) == v
+}
+
+// `X = grow(X, X_COUNT, &X_CAP)` (Assign node a).
+fn is_grow(a: i64) -> bool {
+    if pk(a) != NodeKind::Assign || pop(a) != Tok::Eq || !is_name(pb(a), X_SYM) {
+        return false;
+    }
+    let call = pc(a);
+    if pk(call) != NodeKind::Call || !is_name(pa(call), intern("grow".as_bytes()))
+        || pcount(call) != 3 {
+        return false;
+    }
+    let cap = pchild(call, 2);
+    is_name(pchild(call, 0), X_SYM) && is_name(pchild(call, 1), C_SYM)
+        && pk(cap) == NodeKind::Unary && pop(cap) == Tok::Amp && is_name(pb(cap), K_SYM)
+}
+
+// The statement node e is the expression of (an ExprStmt with its `;`),
+// and its block and index there; false when it is none.
+fn stmt_of(e: i64, stmt: inout i64, block: inout i64, index: inout i64) -> bool {
+    let s = parent(e);
+    if s <= 0 || pk(s) != NodeKind::ExprStmt || pa(s) != e {
+        return false;
+    }
+    let b = parent(s);
+    if b <= 0 || pk(b) != NodeKind::Block {
+        return false;
+    }
+    for i in 0..pcount(b) {
+        if pchild(b, i) == s {
+            stmt = s;
+            block = b;
+            index = i;
+            return true;
+        }
+    }
+    false
+}
+
+// The assignment statement s is (`a = b;`, `a += b;`), or 0.
+fn assign_of(s: i64) -> i64 {
+    if pk(s) != NodeKind::ExprStmt || pk(pa(s)) != NodeKind::Assign {
+        return 0;
+    }
+    pa(s)
+}
+
+// `X_COUNT += 1;` (statement s).
+fn is_increment(s: i64) -> bool {
+    let a = assign_of(s);
+    a > 0 && pop(a) == Tok::PlusEq && is_name(pb(a), C_SYM) && is_int(pc(a), 1)
+}
+
+// A local statement s sets to X_COUNT (`let n = X_COUNT;`, `n =
+// X_COUNT;`): its name, or -1.
+fn count_local(s: i64) -> i64 {
+    if pk(s) == NodeKind::Let && pk(pa(s)) == NodeKind::PatBind && is_name(pc(s), C_SYM) {
+        return pa(pa(s));
+    }
+    let a = assign_of(s);
+    if a > 0 && pop(a) == Tok::Eq && pk(pb(a)) == NodeKind::Ident && is_name(pc(a), C_SYM) {
+        return pa(pb(a));
+    }
+    -1
+}
+
+// Whether statement s is the store `X[I] = v;`, I X_COUNT (when
+// `count_ok`) or one of the locals.
+fn is_store(s: i64, locals: Vec<i64, Comp>, count_ok: bool) -> bool {
+    let a = assign_of(s);
+    if a <= 0 || pop(a) != Tok::Eq || pk(pb(a)) != NodeKind::Index || !is_name(pa(pb(a)), X_SYM) {
+        return false;
+    }
+    let ix = pb(pb(a));
+    if count_ok && is_name(ix, C_SYM) {
+        return true;
+    }
+    for l in locals.iter() {
+        if pk(ix) == NodeKind::Ident && pa(ix) == l {
+            return true;
+        }
+    }
+    false
+}
+
+// The increment after statement k of block b: in b, or after the `unsafe`
+// block b is a statement of; -1.
+fn increment_after(b: i64, k: i64) -> i64 {
+    for i in k + 1..pcount(b) {
+        if is_increment(pchild(b, i)) {
+            return pchild(b, i);
+        }
+    }
+    if (pflags(b) & BLOCK_UNSAFE) == 0 {
+        return -1;
+    }
+    var stmt = 0;
+    var outer = 0;
+    var index = 0;
+    if !stmt_of(b, &stmt, &outer, &index) {
+        return -1;
+    }
+    for i in index + 1..pcount(outer) {
+        if is_increment(pchild(outer, i)) {
+            return pchild(outer, i);
+        }
+    }
+    -1
+}
+
+// The deletion of statement s: its lines when it has them to itself.
+fn delete_stmt(s: i64) {
+    let a = pstart(s);
+    let e = pend(s);
+    var p = e;
+    while src_byte(p) == ' ' || src_byte(p) == '\t' {
+        p += 1;
+    }
+    let alone = starts_line(a) && (src_byte(p) == '\n' || src_byte(p) == 0);
+    if alone {
+        edit(line_start(a), after_line(e), "".as_bytes());
+    } else {
+        edit(a, p, "".as_bytes());
+    }
+}
+
+// ---- The functions that read X_COUNT ----
+//
+// A call between a store and its increment saw the old count; with
+// push, the new length. The functions whose code names X_COUNT (and
+// those that call them, through every call the checker resolved) are
+// the ones where that differs.
+
+static var FN_KEYS: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var FN_ENDS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// fn start + 1 -> 1: it reads X_COUNT (directly or by a call)
+static var READS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The functions' spans, sorted by start (keys: start * 2^20 + def).
+fn collect_fns() {
+    FN_KEYS.clear();
+    for d in 0..def_count() {
+        let df = def_of(d);
+        if df.kind == K_FN || df.kind == K_METHOD || df.kind == K_IMPL_METHOD
+            || df.kind == K_TRAIT_FN {
+            FN_KEYS.push(df.start * 1048576 + d);
+            if FN_ENDS.get(df.start + 1) < df.end + 1 {
+                FN_ENDS.put(df.start + 1, df.end + 1);
+            }
+        }
+    }
+    FN_KEYS.sort();
+}
+
+// The start of the function whose text holds pos, or -1.
+fn fn_at(pos: i64) -> i64 {
+    var lo = 0;
+    var hi = FN_KEYS.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if FN_KEYS[mid] / 1048576 <= pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return -1;
+    }
+    let start = FN_KEYS[lo - 1] / 1048576;
+    if pos < FN_ENDS.get(start + 1) - 1 { start } else { -1 }
+}
+
+// READS: the functions naming X_COUNT, then their callers, to a fixpoint.
+fn reading_fns(count_refs: Vec<i64, Comp>) {
+    for p in count_refs.iter() {
+        let f = fn_at(p);
+        if f >= 0 {
+            READS.put(f + 1, 1);
+        }
+    }
+    // (caller start, callee start) of each resolved call
+    var callers: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var callees: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for n in 1..node_count() {
+        let nd = checked(n);
+        if nd.kind != NodeKind::Call || nd.x <= 0 {
+            continue;
+        }
+        let from = fn_at(nd.start);
+        let to = fn_at(checked(fn_node(nd.x - 1)).start);
+        if from >= 0 && to >= 0 && from != to {
+            callers.push(from);
+            callees.push(to);
+        }
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..callers.len() {
+            if READS.get(callees[i] + 1) != 0 && READS.get(callers[i] + 1) == 0 {
+                READS.put(callers[i] + 1, 1);
+                changed = true;
+            }
+        }
+    }
+}
+
+// Whether a `break` or `continue` at parsed node n leaves SRC[a..):
+// unlabelled, its loop starts there.
+fn leaves(n: i64, a: i64) -> bool {
+    if pa(n) != 0 {
+        return true;
+    }
+    var p = parent(n);
+    while p > 0 {
+        let k = pk(p);
+        if k == NodeKind::Loop || k == NodeKind::While || k == NodeKind::For {
+            return pstart(p) < a;
+        }
+        if k == NodeKind::Closure || k == NodeKind::Fn {
+            return true;
+        }
+        p = parent(p);
+    }
+    true
+}
+
+// What in SRC[a..b) makes the push differ from the store and the
+// increment it replaces: leaving the span (`return`, `?`, a `break` or
+// `continue` out of it; when `exits`), a call that reaches code naming
+// X_COUNT (it sees the count changed at a different time). The reason, or
+// 0; at: where.
+fn region_problem(a: i64, b: i64, exits: bool, at: inout i64) -> *u8 {
+    if exits {
+        for n in 1..PROGRAM_END {
+            let s = pstart(n);
+            if s < a || s >= b {
+                continue;
+            }
+            let k = pk(n);
+            if k == NodeKind::Return || k == NodeKind::Try
+                || ((k == NodeKind::Break || k == NodeKind::Continue) && leaves(n, a)) {
+                at = s;
+                PROB_A = s;
+                PROB_B = pend(n);
+                return c"a return, ? or break between the store and `X_COUNT += 1` (the push and the count would part)";
+            }
+        }
+    }
+    for n in 1..node_count() {
+        let nd = checked(n);
+        if nd.kind != NodeKind::Call || nd.start < a || nd.start >= b {
+            continue;
+        }
+        if nd.x <= 0 {
+            at = nd.start;
+            PROB_A = nd.start;
+            PROB_B = nd.end;
+            return c"a call the tool cannot follow between the store and `X_COUNT += 1` (if it reads X_COUNT it sees another value)";
+        }
+        let to = fn_at(checked(fn_node(nd.x - 1)).start);
+        if to >= 0 && READS.get(to + 1) != 0 {
+            at = nd.start;
+            PROB_A = nd.start;
+            PROB_B = nd.end;
+            return c"a call between the store and `X_COUNT += 1` reaches code naming X_COUNT (it would see the count changed): move the `+= 1` next to the store first";
+        }
+    }
+    0 as *u8
+}
+
+// ---- The sequences ----
+//
+// A grow, the store `X[I] = v;` and the increment `X_COUNT += 1;`, in one
+// block (the increment may follow the unsafe block the store is in): I is
+// X_COUNT, or a local set to it before (`let n = X_COUNT;`, `n =
+// X_COUNT;`). The increment may come before the store, I then a local;
+// between them a read of X_COUNT is `X.len() + 1`; between the store and
+// a later increment, `X.len() - 1`.
+
+// The spans and what a read of X_COUNT there adds (-1, +1).
+static var RG_START: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var RG_END: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var RG_ADD: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+fn region_add(pos: i64) -> i64 {
+    for i in 0..RG_START.len() {
+        if pos >= RG_START[i] && pos < RG_END[i] {
+            return RG_ADD[i];
+        }
+    }
+    0
+}
+
+// The sequence of block b from statement k (the grow when `grow`, else
+// the store) on: its edits, true; false with why and at.
+fn take_seq(b: i64, k: i64, grow: bool, why: inout *u8, at: inout i64) -> bool {
+    var locals: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var local_end = -1;
+    for i in 0..k {
+        let l = count_local(pchild(b, i));
+        if l >= 0 {
+            locals.push(l);
+            local_end = pend(pchild(b, i));
+        }
+    }
+    var inc = -1;
+    var store = -1;
+    var j = if grow { k + 1 } else { k };
+    while j < pcount(b) {
+        let s = pchild(b, j);
+        if is_store(s, locals, inc < 0) {
+            store = s;
+            break;
+        }
+        if inc < 0 && grow && is_increment(s) {
+            inc = s;
+        } else if inc < 0 {
+            let l = count_local(s);
+            if l >= 0 {
+                locals.push(l);
+                local_end = pend(s);
+            }
+        }
+        j += 1;
+    }
+    if store < 0 {
+        why = if inc >= 0 {
+            c"a grow and `X_COUNT += 1` with no store `X[n] = v;` after them (n set to X_COUNT before the increment)"
+        } else {
+            c"a grow not followed by `X[X_COUNT] = v;` in its block (or `let n = X_COUNT;` and `X[n] = v;`)"
+        };
+        return false;
+    }
+    // (the store's names are this sequence's, placed or refused)
+    let target = pb(pa(store));
+    DONE.put(name_pos(pa(target)) + 1, 1);
+    if is_name(pb(target), C_SYM) {
+        DONE.put(name_pos(pb(target)) + 1, 1);
+    }
+    var add = -1;
+    var ra = 0;
+    var rb = 0;
+    if inc >= 0 {
+        // (the increment first: up to the end of the store, whose value
+        // read the raised count)
+        ra = pend(inc);
+        rb = pend(store);
+        add = 1;
+    } else {
+        inc = increment_after(b, j);
+        if inc < 0 {
+            why = c"a store at X_COUNT with no `X_COUNT += 1;` after it (in its block, or after the unsafe block it is in)";
+            at = pstart(store);
+            return false;
+        }
+        ra = pend(store);
+        rb = pstart(inc);
+    }
+    DONE.put(name_pos(pb(pa(inc))) + 1, 1);
+    let problem = region_problem(ra, rb, true, &at);
+    if problem != 0 as *u8 {
+        why = problem;
+        return false;
+    }
+    // (a local's value is the count until the store: nothing between may
+    // push or read the table's count)
+    if local_end >= 0 {
+        let p = region_problem(local_end, pstart(store), false, &at);
+        if p != 0 as *u8 {
+            why = p;
+            return false;
+        }
+    }
+    // (a local index: set only to X_COUNT in the block before the store)
+    let ix = pb(pb(pa(store)));
+    if pk(ix) == NodeKind::Ident && !is_name(ix, C_SYM) {
+        for n in 1..PROGRAM_END {
+            if pk(n) == NodeKind::Assign && pstart(n) >= pstart(b) && pstart(n) < pstart(store)
+                && is_name(pb(n), pa(ix)) && !(pop(n) == Tok::Eq && is_name(pc(n), C_SYM)) {
+                at = pstart(n);
+                why = c"the store's index is changed between its `= X_COUNT` and the store";
+                return false;
+            }
+        }
+    }
+    // X[I] = v  ->  X.push(v)
+    let a = pa(store);
+    let value = pc(a);
+    let open = buf_new();
+    put_x(open, pa(target));
+    buf_str(open, c".push(");
+    edit(pstart(a), pstart(value), buf_slice(open));
+    edit(pend(value), pend(value), ")".as_bytes());
+    delete_stmt(inc);
+    RG_START.push(ra);
+    RG_END.push(rb);
+    RG_ADD.push(add);
+    N_PUSH += 1;
+    true
+}
+
+// The grow calls deleted (their callee's position + 1 -> 1).
+static var GROWS_GONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The imports of base::grow (base::reserve) in the files where no call of
+// it is left.
+fn drop_grow_imports(path: [u8]) {
+    if GROWS_GONE.count == 0 {
+        return;
+    }
+    let sym = intern(path);
+    var g = -1;
+    for d in 0..def_count() {
+        if def_of(d).fqn == sym {
+            g = d;
+        }
+    }
+    if g < 0 {
+        return;
+    }
+    var targets = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    targets.push(g);
+    refs_of(targets);
+    // (file + 1 -> 1: a call of grow is left there)
+    var used = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for r in 0..R_POS.count {
+        let p = R_POS.get(r);
+        if R_DEF.get(r) == g && (R_FLAGS.get(r) & (QF_DEF | QF_USE)) == 0
+            && GROWS_GONE.get(p + 1) == 0 {
+            used.put(file_of_pos(p) + 1, 1);
+        }
+    }
+    var gone_in = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for r in 0..R_POS.count {
+        let p = R_POS.get(r);
+        if R_DEF.get(r) == g && (R_FLAGS.get(r) & QF_USE) != 0 && used.get(file_of_pos(p) + 1) == 0
+            && gone_in.get(p + 1) == 0 {
+            gone_in.put(p + 1, 1);
+            drop_use(p);
+        }
+    }
+}
+
+// The grow guard around a grow (Assign a): `if X_COUNT >= X_CAP { X =
+// grow(..); }`, the If node, or 0.
+fn guard_of(a: i64) -> i64 {
+    var stmt = 0;
+    var b = 0;
+    var k = 0;
+    if !stmt_of(a, &stmt, &b, &k) || pcount(b) != 1 || pa(b) != 0 {
+        return 0;
+    }
+    let f = parent(b);
+    if f <= 0 || pk(f) != NodeKind::If || pb(f) != b || pc(f) != 0 {
+        return 0;
+    }
+    let cond = pa(f);
+    if pk(cond) == NodeKind::Binary && pop(cond) == Tok::GtEq && is_name(pb(cond), C_SYM)
+        && is_name(pc(cond), K_SYM) {
+        return f;
+    }
+    0
+}
+
+// The grow whose target is X at name expression e, with the store after
+// it.
+fn take_grow(e: i64) {
+    let a = parent(e);
+    if a <= 0 || !is_grow(a) || pb(a) != e {
+        return;
+    }
+    let call = pc(a);
+    // (its names are this grow's, refused or not)
+    DONE.put(name_pos(e) + 1, 1);
+    DONE.put(name_pos(pchild(call, 0)) + 1, 1);
+    DONE.put(name_pos(pchild(call, 1)) + 1, 1);
+    DONE.put(name_pos(pb(pchild(call, 2))) + 1, 1);
+    let guard = guard_of(a);
+    if guard > 0 {
+        DONE.put(name_pos(pb(pa(guard))) + 1, 1);
+        DONE.put(name_pos(pc(pa(guard))) + 1, 1);
+    }
+    var stmt = 0;
+    var b = 0;
+    var k = 0;
+    if !stmt_of(if guard > 0 { guard } else { a }, &stmt, &b, &k) {
+        refuse(pstart(a), c"a grow that is not a statement of its own", a);
+        return;
+    }
+    var why = 0 as *u8;
+    var at = pstart(a);
+    if !take_seq(b, k, true, &why, &at) {
+        refuse(at, why, a);
+        return;
+    }
+    delete_stmt(stmt);
+    GROWS_GONE.put(pstart(pa(call)) + 1, 1);
+}
+
+// `X = reserve(X, &X_CAP, n)` (base::reserve: room for n in all) at
+// name expression e: `X.reserve(n - X.len())` (Vec's: room for so many
+// more; none when that is not above 0).
+fn take_reserve(e: i64) {
+    let a = parent(e);
+    if a <= 0 || pk(a) != NodeKind::Assign || pop(a) != Tok::Eq || pb(a) != e {
+        return;
+    }
+    let call = pc(a);
+    if pk(call) != NodeKind::Call || !is_name(pa(call), intern("reserve".as_bytes()))
+        || pcount(call) != 3 {
+        return;
+    }
+    let cap = pchild(call, 1);
+    let n = pchild(call, 2);
+    if !is_name(pchild(call, 0), X_SYM) || pk(cap) != NodeKind::Unary || pop(cap) != Tok::Amp
+        || !is_name(pb(cap), K_SYM) {
+        return;
+    }
+    DONE.put(name_pos(e) + 1, 1);
+    DONE.put(name_pos(pchild(call, 0)) + 1, 1);
+    DONE.put(name_pos(pb(cap)) + 1, 1);
+    let t = buf_new();
+    put_x(t, e);
+    buf_str(t, c".reserve(");
+    edit(pstart(a), pstart(n), buf_slice(t));
+    let rest = buf_new();
+    buf_str(rest, c" - ");
+    put_x(rest, e);
+    buf_str(rest, c".len())");
+    if binding_level(n) < infix_left_bp(Tok::Minus) / 2 {
+        edit(pstart(n), pstart(n), "(".as_bytes());
+        edit(pend(n), pend(n), ")".as_bytes());
+    }
+    edit(pend(n), pend(a), buf_slice(rest));
+    GROWS_GONE.put(pstart(pa(call)) + 1, 1);
+    N_RESERVE += 1;
+}
+
+// A store `X[X_COUNT] = v` with no grow before it (a table allocated
+// once): a push too, when its increment follows.
+fn take_store(e: i64) {
+    let ix = parent(e);
+    if ix <= 0 || pk(ix) != NodeKind::Index || pa(ix) != e || !is_name(pb(ix), C_SYM) {
+        return;
+    }
+    let a = parent(ix);
+    if a <= 0 || pk(a) != NodeKind::Assign || pop(a) != Tok::Eq || pb(a) != ix {
+        return;
+    }
+    var stmt = 0;
+    var b = 0;
+    var k = 0;
+    if !stmt_of(a, &stmt, &b, &k) {
+        return;
+    }
+    var why = 0 as *u8;
+    var at = pstart(a);
+    if !take_seq(b, k, false, &why, &at) {
+        refuse(at, why, a);
+        DONE.put(name_pos(e) + 1, 1);
+        DONE.put(name_pos(pb(ix)) + 1, 1);
+    }
+}
+
+// ---- Each other use ----
+
+// X at name expression e: an index (`X[i]`, `X[i].f`, `X[i] = v`, a
+// slice) stays; a pointer into it or X itself is refused.
+fn place_x(e: i64) {
+    let ix = parent(e);
+    if ix <= 0 || pk(ix) != NodeKind::Index || pa(ix) != e {
+        refuse(name_pos(e),
+            c"the table itself used (passed, assigned, compared, freed): a Vec is not its pointer",
+            if ix > 0 { ix } else { e });
+        return;
+    }
+    // (the place an element starts: up through fields and indices)
+    var place = ix;
+    var up = parent(place);
+    while up > 0 && (pk(up) == NodeKind::FieldAccess || pk(up) == NodeKind::TupleField
+        || pk(up) == NodeKind::Index) && pa(up) == place {
+        place = up;
+        up = parent(place);
+    }
+    if up > 0 && pk(up) == NodeKind::Unary && pop(up) == Tok::Amp && pb(up) == place {
+        refuse(pstart(up),
+            c"a pointer into the table (`&X[i]`): kept past a push it dangles; take the index, or the element by value",
+            up);
+    }
+}
+
+// X_COUNT at name expression e: a read is `X.len()` (one more or less in
+// a sequence's span), `= 0` clear, `-= k` truncate; other writes refused.
+fn place_count(e: i64) {
+    let par = parent(e);
+    if par > 0 && pk(par) == NodeKind::Assign && pb(par) == e {
+        let op = pop(par);
+        let v = pc(par);
+        if op == Tok::Eq && is_int(v, 0) {
+            let t = buf_new();
+            put_x(t, e);
+            buf_str(t, c".clear()");
+            edit(pstart(par), pend(par), buf_slice(t));
+            N_CLEAR += 1;
+            return;
+        }
+        if op == Tok::MinusEq {
+            let paren = binding_level(v) <= infix_left_bp(Tok::Minus) / 2;
+            let t = buf_new();
+            put_x(t, e);
+            buf_str(t, c".truncate(");
+            put_x(t, e);
+            buf_str(t, if paren { c".len() - (" } else { c".len() - " });
+            edit(pstart(par), pstart(v), buf_slice(t));
+            edit(pend(v), pend(v), if paren { "))".as_bytes() } else { ")".as_bytes() });
+            N_TRUNC += 1;
+            return;
+        }
+        refuse(name_pos(e), if op == Tok::PlusEq && is_int(v, 1) {
+            c"`X_COUNT += 1` with no store at X_COUNT next to it (a push needs the element)"
+        } else {
+            c"X_COUNT written (a Vec's length changes by push, clear and truncate only)"
+        }, par);
+        return;
+    }
+    if par > 0 && pk(par) == NodeKind::Unary && pop(par) == Tok::Amp {
+        refuse(pstart(par), c"&X_COUNT: the count's address (a Vec's length has none)", par);
+        return;
+    }
+    N_LEN += 1;
+    let t = buf_new();
+    put_x(t, e);
+    buf_str(t, c".len()");
+    let add = region_add(name_pos(e));
+    if add == 0 {
+        edit(pstart(e), pend(e), buf_slice(t));
+        return;
+    }
+    // (`X_COUNT + 1` after the push, `X_COUNT - 1` after the increment:
+    // the length)
+    let undo = if add < 0 { Tok::Plus } else { Tok::Minus };
+    if par > 0 && pk(par) == NodeKind::Binary && pop(par) == undo && pb(par) == e
+        && is_int(pc(par), 1) {
+        edit(pstart(par), pend(par), buf_slice(t));
+        return;
+    }
+    buf_str(t, if add < 0 { c" - 1" } else { c" + 1" });
+    var need = 0;
+    if par > 0 {
+        var kids = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var levels = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        expr_slots(par, &kids, &levels);
+        for i in 0..kids.count {
+            if kids.get(i) == e {
+                need = levels.get(i);
+            }
+        }
+    }
+    if need > infix_left_bp(Tok::Minus) / 2 {
+        let p = buf_new();
+        buf_byte(p, '(');
+        buf_bytes(p, buf_slice(t));
+        buf_byte(p, ')');
+        edit(pstart(e), pend(e), buf_slice(p));
+    } else {
+        edit(pstart(e), pend(e), buf_slice(t));
+    }
+}
+
+// The `use` naming a static at pos: its name dropped from its list.
+fn drop_use(pos: i64) -> bool {
+    for u in 1..PROGRAM_END {
+        let nd = checked(u);
+        if nd.kind != NodeKind::Use || pos < nd.start || pos >= nd.end {
+            continue;
+        }
+        for k in 0..nd.count {
+            let id = crate::front::ast::child(u, k);
+            let c = checked(id);
+            if pos >= c.start && pos < c.end {
+                remove_use_names(u, id);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// The static item d (X_COUNT, X_CAP) deleted, with its lines.
+fn delete_static(d: i64) {
+    let df = def_of(d);
+    var e = df.end;
+    while src_byte(e) == ' ' || src_byte(e) == '\t' {
+        e += 1;
+    }
+    if src_byte(e) == ';' {
+        e += 1;
+    }
+    edit(line_start(df.start), after_line(e - 1), "".as_bytes());
+}
+
+// The references to X, X_COUNT and X_CAP (deduplicated: a generic
+// function's instances share their positions), each with its flags, in
+// the lists of its definition.
+fn refs_all(xpos: inout Vec<i64, Comp>, xflags: inout Vec<i64, Comp>, cpos: inout Vec<i64, Comp>,
+    cflags: inout Vec<i64, Comp>, kpos: inout Vec<i64, Comp>, kflags: inout Vec<i64, Comp>) {
+    var targets = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    targets.push(X_DEF);
+    targets.push(C_DEF);
+    if K_DEF >= 0 {
+        targets.push(K_DEF);
+    }
+    refs_of(targets);
+    var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for r in 0..R_POS.count {
+        let p = R_POS.get(r);
+        let d = R_DEF.get(r);
+        let key = p * 4 + if d == X_DEF { 1 } else if d == C_DEF { 2 } else { 3 };
+        if seen.get(key) != 0 {
+            continue;
+        }
+        seen.put(key, 1);
+        if d == X_DEF {
+            xpos.push(p);
+            xflags.push(R_FLAGS.get(r));
+        } else if d == C_DEF {
+            cpos.push(p);
+            cflags.push(R_FLAGS.get(r));
+        } else if d == K_DEF {
+            kpos.push(p);
+            kflags.push(R_FLAGS.get(r));
+        }
+    }
+}
+
+// The static named `name` in X's module (or the path given); else the
+// one static of that name in the modules below X's (a table's capacity
+// kept in the submodule that grows it); or -1.
+fn sibling(name: [u8]) -> i64 {
+    let fqn = sym_text(def_of(X_DEF).fqn);
+    var e = fqn.len;
+    while e > 0 && fqn[e - 1] != ':' {
+        e -= 1;
+    }
+    let want = buf_new();
+    if !has_path(name) {
+        buf_bytes(want, fqn[0..e]);
+    }
+    buf_bytes(want, name);
+    let sym = intern(buf_slice(want));
+    for d in 0..def_count() {
+        let df = def_of(d);
+        if df.kind == K_STATIC && df.fqn == sym {
+            return d;
+        }
+    }
+    if has_path(name) {
+        return -1;
+    }
+    let short = intern(name);
+    var found = -1;
+    for d in 0..def_count() {
+        let df = def_of(d);
+        let path = sym_text(df.fqn);
+        if df.kind == K_STATIC && df.name == short && path.len > e
+            && bytes_eq(path[0..e], fqn[0..e]) {
+            if found >= 0 {
+                return -1;
+            }
+            found = d;
+        }
+    }
+    found
+}
+
+fn has_path(s: [u8]) -> bool {
+    for i in 1..s.len {
+        if s[i] == ':' && s[i - 1] == ':' {
+            return true;
+        }
+    }
+    false
+}
+
+// X's name without a trailing S (NODES: NODE), then with: X_COUNT's
+// default is the first that names a static.
+fn default_sibling(suffix: [u8]) -> i64 {
+    let x = sym_text(X_SYM);
+    if x.len > 1 && x[x.len - 1] == 'S' {
+        let b = buf_new();
+        buf_bytes(b, x[0..x.len - 1]);
+        buf_bytes(b, suffix);
+        let d = sibling(buf_slice(b));
+        if d >= 0 {
+            return d;
+        }
+    }
+    let b = buf_new();
+    buf_bytes(b, x);
+    buf_bytes(b, suffix);
+    sibling(buf_slice(b))
+}
+
+fn last_segment(s: [u8]) -> [u8] {
+    var i = s.len;
+    while i > 0 && s[i - 1] != ':' {
+        i -= 1;
+    }
+    s[i..s.len]
+}
+
+// Whether static node s is `static var NAME: i64 = 0`.
+fn zero_i64(s: i64) -> bool {
+    let t = pb(s);
+    pd(s) != 0 && pk(t) == NodeKind::TyName && bytes_eq(sym_text(pa(t)), "i64".as_bytes())
+        && is_int(pc(s), 0)
+}
+
+fn shape_error(d: i64, what: *u8) -> i64 {
+    let e = diag(c"error", c"refactor.table-shape");
+    buf_bytes(e, sym_text(def_of(d).fqn));
+    buf_str(e, c" is not ");
+    buf_str(e, what);
+    buf_byte(e, '\n');
+    let out = diags();
+    buf_str(out, c"try:");
+    put_cword(out, PROG);
+    buf_str(out, c" query show");
+    put_word(out, sym_text(def_of(d).fqn));
+    put_root(out);
+    try_end(out);
+    1
+}
+
+// The refusals, one line each, sorted by position.
+fn report_refusals() -> i64 {
+    var order: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..RF_POS.len() {
+        order.push(RF_POS[i] * 65536 + i);
+    }
+    order.sort();
+    let e = diag(c"error", c"refactor.table-use");
+    buf_bytes(e, sym_text(def_of(X_DEF).fqn));
+    buf_str(e, c": ");
+    put_count(e, RF_POS.len(), c"use", c"uses");
+    buf_str(e, c" refactor table cannot place; nothing changed\n");
+    let out = diags();
+    var shown = 0;
+    for key in order.iter() {
+        let i = key % 65536;
+        shown += 1;
+        if shown > 200 {
+            buf_str(out, c"... and ");
+            buf_int_of(out, RF_POS.len() - 200);
+            buf_str(out, c" more\n");
+            break;
+        }
+        put_loc(out, RF_POS[i]);
+        buf_str(out, c": ");
+        if RF_B[i] > RF_A[i] {
+            put_snippet(out, RF_A[i], RF_B[i]);
+            buf_str(out, c": ");
+        }
+        put_reason(out, RF_WHY[i]);
+        buf_byte(out, '\n');
+    }
+    // (by reason, when there are several)
+    if RF_POS.len() > 3 {
+        var whys: Vec<*u8, Comp> = Vec::new_in(Comp {});
+        var counts: Vec<i64, Comp> = Vec::new_in(Comp {});
+        for w in RF_WHY.iter() {
+            var found = false;
+            for k in 0..whys.len() {
+                if whys[k] == w {
+                    counts[k] += 1;
+                    found = true;
+                }
+            }
+            if !found {
+                whys.push(w);
+                counts.push(1);
+            }
+        }
+        for k in 0..whys.len() {
+            diag(c"note", c"refactor.table-why");
+            buf_int_of(out, counts[k]);
+            buf_str(out, c": ");
+            put_reason(out, whys[k]);
+            buf_byte(out, '\n');
+        }
+    }
+    buf_str(out, c"help: change these by hand (or with rewrite), then run refactor table again\n");
+    buf_str(out, c"try:");
+    put_cword(out, PROG);
+    buf_str(out, c" query refs");
+    put_word(out, sym_text(def_of(X_DEF).fqn));
+    put_root(out);
+    try_end(out);
+    1
+}
+
+fn buf_int_of(out: i64, n: i64) {
+    crate::base::buf_int(out, n);
+}
+
+fn word_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// A reason, its words X, X_COUNT and X_CAP the table's names.
+fn put_reason(out: i64, why: *u8) {
+    let s = c_slice(why);
+    var i = 0;
+    while i < s.len {
+        let start_ok = i == 0 || !word_byte(s[i - 1]);
+        var w = 0;
+        if start_ok && s[i] == 'X' {
+            var e = i + 1;
+            while e < s.len && word_byte(s[e]) {
+                e += 1;
+            }
+            let word = s[i..e];
+            if bytes_eq(word, "X".as_bytes()) {
+                buf_bytes(out, sym_text(X_SYM));
+                w = 1;
+            } else if bytes_eq(word, "X_COUNT".as_bytes()) {
+                buf_bytes(out, sym_text(C_SYM));
+                w = 7;
+            } else if bytes_eq(word, "X_CAP".as_bytes()) && K_SYM >= 0 {
+                buf_bytes(out, sym_text(K_SYM));
+                w = 5;
+            }
+        }
+        if w == 0 {
+            buf_byte(out, s[i]);
+            w = 1;
+        }
+        i += w;
+    }
+}
+
+// SRC[a..b) on one line, at most 60 bytes.
+fn put_snippet(out: i64, a: i64, b: i64) {
+    let s = src_text(a, b);
+    buf_byte(out, '`');
+    var col = 0;
+    var space = false;
+    for c in s.iter() {
+        if col >= 60 {
+            buf_str(out, c"...");
+            break;
+        }
+        if c == '\n' || c == ' ' || c == '\t' {
+            space = true;
+            continue;
+        }
+        if space && col > 0 {
+            buf_byte(out, ' ');
+            col += 1;
+        }
+        space = false;
+        buf_byte(out, c);
+        col += 1;
+    }
+    buf_byte(out, '`');
+}
+
+// ---- refactor table ----
+
+pub fn run_table(c: Call) -> i64 {
+    let status = table_inner(c);
+    write_diags();
+    status
+}
+
+fn table_inner(c: Call) -> i64 {
+    set_command(c.line);
+    PROG = c.prog();
+    TOOL = c"refactor";
+    SUB = c"table";
+    var root = 0 as *u8;
+    var words = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var opts = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let example = c"NODES --dry-run";
+    if !take_args(c, shape_options("table"), &root, &words, &opts) {
+        return 2;
+    }
+    if words.count != 1 {
+        return usage_error(if words.count == 0 { c"a TABLE (a static var X: *T) is needed" }
+            else { c"one TABLE at a time" }, example);
+    }
+    // UNSAFE: take_args keeps the words as C strings cast to i64 (an IntVec).
+    // SAFETY: words.get(0) is such a pointer, to an argument of the command
+    // line, which lives until the run ends.
+    let name = c_slice(unsafe { words.get(0) as *u8 });
+    ROOT_GIVEN = root;
+    root = root_or_diag(root, SUB, name, true);
+    if root == 0 as *u8 {
+        return 2;
+    }
+    var status = 0;
+    X_DEF = load_and_find(root, name, 1 << K_STATIC, c"static", &status);
+    if X_DEF < 0 {
+        return status;
+    }
+    let xd = def_of(X_DEF);
+    X_SYM = xd.name;
+    X_TEXT = sym_text(X_SYM);
+    let s = xd.node;
+    if pk(s) != NodeKind::Static || pd(s) == 0 || pk(pb(s)) != NodeKind::TyPtr
+        || checked(s).y != 0 {
+        return shape_error(X_DEF, c"a `static var X: *T` of the program (a table's pointer)");
+    }
+    let count_opt = opt(opts, c"--count", false);
+    let cap_opt = opt(opts, c"--cap", false);
+    C_DEF = if count_opt != 0 as *u8 { sibling(c_slice(count_opt)) }
+        else { default_sibling("_COUNT".as_bytes()) };
+    K_DEF = if cap_opt != 0 as *u8 { sibling(c_slice(cap_opt)) }
+        else { default_sibling("_CAP".as_bytes()) };
+    if C_DEF < 0 {
+        let e = diag(c"error", c"refactor.table-count");
+        buf_bytes(e, sym_text(xd.fqn));
+        buf_str(e, c" has no count static (");
+        buf_str(e, if count_opt != 0 as *u8 { count_opt } else { c"X_COUNT or XS_COUNT" });
+        buf_str(e, c" not found in its module)\n");
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" refactor table");
+        put_word(out, sym_text(xd.fqn));
+        buf_str(out, c" --count NAME --dry-run");
+        put_root(out);
+        try_end(out);
+        return 1;
+    }
+    if cap_opt != 0 as *u8 && K_DEF < 0 {
+        let e = diag(c"error", c"refactor.table-count");
+        buf_str(e, c"no static ");
+        buf_str(e, cap_opt);
+        buf_str(e, c" in the module of ");
+        buf_bytes(e, sym_text(xd.fqn));
+        buf_byte(e, '\n');
+        return 1;
+    }
+    if !zero_i64(def_of(C_DEF).node) {
+        return shape_error(C_DEF, c"a `static var X_COUNT: i64 = 0` (the table's count)");
+    }
+    if K_DEF >= 0 && !zero_i64(def_of(K_DEF).node) {
+        return shape_error(K_DEF, c"a `static var X_CAP: i64 = 0` (the table's capacity)");
+    }
+    C_SYM = def_of(C_DEF).name;
+    K_SYM = if K_DEF >= 0 { def_of(K_DEF).name } else { -1 };
+    let alloc_opt = opt(opts, c"--alloc", false);
+    let alloc = last_segment(if alloc_opt != 0 as *u8 { c_slice(alloc_opt) }
+        else { "Comp".as_bytes() });
+
+    build_parents();
+    collect_fns();
+    var xpos: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var xflags: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var cpos: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var cflags: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var kpos: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var kflags: Vec<i64, Comp> = Vec::new_in(Comp {});
+    refs_all(&xpos, &xflags, &cpos, &cflags, &kpos, &kflags);
+    var count_reads: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for i in 0..cpos.len() {
+        if (cflags[i] & (QF_DEF | QF_USE)) == 0 {
+            count_reads.push(cpos[i]);
+        }
+    }
+    reading_fns(count_reads);
+
+    // 1. The grows and the stores after them; 2. the stores without one.
+    for i in 0..xpos.len() {
+        if (xflags[i] & (QF_DEF | QF_USE)) == 0 {
+            let id = ident_at(xpos[i], X_SYM);
+            if id > 0 {
+                take_grow(expr_of(id));
+                take_reserve(expr_of(id));
+            }
+        }
+    }
+    for i in 0..xpos.len() {
+        if (xflags[i] & (QF_DEF | QF_USE)) == 0 && DONE.get(xpos[i] + 1) == 0 {
+            let id = ident_at(xpos[i], X_SYM);
+            if id > 0 {
+                take_store(expr_of(id));
+            }
+        }
+    }
+    // 3. Every other use.
+    for i in 0..xpos.len() {
+        let p = xpos[i];
+        if (xflags[i] & (QF_DEF | QF_USE)) != 0 || DONE.get(p + 1) != 0 {
+            continue;
+        }
+        let id = ident_at(p, X_SYM);
+        if id < 0 {
+            refuse(p, c"X named by a path the tool cannot read (not a plain name)", 0);
+            continue;
+        }
+        place_x(expr_of(id));
+    }
+    for i in 0..cpos.len() {
+        let p = cpos[i];
+        if (cflags[i] & QF_DEF) != 0 || DONE.get(p + 1) != 0 {
+            continue;
+        }
+        if (cflags[i] & QF_USE) != 0 {
+            if !drop_use(p) {
+                refuse(p, c"a use of X_COUNT the tool cannot remove", 0);
+            }
+            continue;
+        }
+        let id = ident_at(p, C_SYM);
+        if id < 0 {
+            refuse(p, c"X_COUNT named by a path the tool cannot read (not a plain name)", 0);
+            continue;
+        }
+        place_count(expr_of(id));
+    }
+    for i in 0..kpos.len() {
+        let p = kpos[i];
+        if (kflags[i] & QF_DEF) != 0 || DONE.get(p + 1) != 0 {
+            continue;
+        }
+        if (kflags[i] & QF_USE) != 0 {
+            if !drop_use(p) {
+                refuse(p, c"a use of X_CAP the tool cannot remove", 0);
+            }
+            continue;
+        }
+        let id = ident_at(p, K_SYM);
+        refuse(p, c"X_CAP read outside the grow (a Vec's capacity is its own)",
+            if id > 0 { parent(expr_of(id)) } else { 0 });
+    }
+    if RF_POS.len() > 0 {
+        return report_refusals();
+    }
+
+    // The statics: X a Vec; X_COUNT and X_CAP gone.
+    let ty = pb(s);
+    let tt = buf_new();
+    buf_str(tt, c"Vec<");
+    buf_bytes(tt, src_text(pstart(pa(ty)), pend(pa(ty))));
+    buf_str(tt, c", ");
+    buf_bytes(tt, alloc);
+    buf_byte(tt, '>');
+    edit(pstart(ty), pend(ty), buf_slice(tt));
+    let vt = buf_new();
+    buf_str(vt, c"Vec::new_in(");
+    buf_bytes(vt, alloc);
+    buf_str(vt, c" {})");
+    edit(pstart(pc(s)), pend(pc(s)), buf_slice(vt));
+    delete_static(C_DEF);
+    if K_DEF >= 0 {
+        delete_static(K_DEF);
+    }
+    drop_grow_imports("crate::base::grow".as_bytes());
+    drop_grow_imports("crate::base::reserve".as_bytes());
+    emit_use_edits();
+    if EDIT_FAILED {
+        let d = diag(c"error", c"refactor.internal");
+        buf_str(d, c"the edits overlap (a case refactor table does not handle); nothing written\n");
+        return 1;
+    }
+    let what = buf_new();
+    buf_str(what, c"made ");
+    buf_bytes(what, sym_text(xd.fqn));
+    buf_str(what, c" a Vec<");
+    buf_bytes(what, src_text(pstart(pa(ty)), pend(pa(ty))));
+    buf_str(what, c", ");
+    buf_bytes(what, alloc);
+    buf_str(what, c">: ");
+    put_count(what, N_PUSH, c"push", c"pushes");
+    buf_str(what, c", ");
+    put_count(what, N_LEN, c"len()", c"len()s");
+    if N_CLEAR > 0 {
+        buf_str(what, c", ");
+        put_count(what, N_CLEAR, c"clear()", c"clear()s");
+    }
+    if N_TRUNC > 0 {
+        buf_str(what, c", ");
+        put_count(what, N_TRUNC, c"truncate()", c"truncate()s");
+    }
+    if N_RESERVE > 0 {
+        buf_str(what, c", ");
+        put_count(what, N_RESERVE, c"reserve()", c"reserve()s");
+    }
+    ADD_IMPORTS = true;
+    let status = apply_edit(buf_slice(what), root);
+    if status == 0 && !DRY_RUN {
+        // The unsafe blocks only the table's raw indexing needed.
+        let out = diags();
+        let d = diag(c"note", c"refactor.table-unsafe");
+        buf_str(d, c"the unsafe blocks around its indexing may be unneeded now\n");
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" fix --only unneeded-unsafe");
+        put_root(out);
+        try_end(out);
+    }
+    status
+}
