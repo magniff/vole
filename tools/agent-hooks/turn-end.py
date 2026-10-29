@@ -269,6 +269,14 @@ def main():
         compiler = cae.compiler_for(cwd)
         if not compiler:
             continue
+        # (0.25.4) a tools binary older than the tree's source would report
+        # the new release's syntax as errors: target/volec when current,
+        # else no check; said once a session (the check hook's state)
+        compiler, stale = cae.current_compiler(compiler, cwd, st)
+        if not compiler:
+            if stale:
+                reports.append(f"turn-end: {os.path.basename(root)} not checked\n{stale}")
+            continue
         t0 = time.time()
         got = cae.verify(event, st, compiler, root, cwd, None, at_turn_end=True)
         if got is None:
@@ -289,7 +297,8 @@ def main():
             shown = os.path.relpath(root, os.path.abspath(event.get("cwd") or os.getcwd()))
             if shown.startswith(".."):
                 shown = root
-            reports.append(f"turn-end: unchecked changes in {shown}: {', '.join(what)}\n{text}".rstrip())
+            reports.append(f"turn-end: unchecked changes in {shown}: {', '.join(what)}\n"
+                           f"{stale + chr(10) if stale else ''}{text}".rstrip())
     tops = []
     for r in candidates(event, st) + [os.path.abspath(event.get("cwd") or os.getcwd())]:
         top = cae.checkout_root(r)

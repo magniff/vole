@@ -73,6 +73,46 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.25.4
 
+- `const X: str = "...";` is allowed: text, a constant, each use the
+  literal, as a `[u8]` constant's is (`guide text#string-constants`).
+  0.25.3 refused it because, allowed, it crashed: the checker inlined a
+  string constant's literal only when its type was `[u8]`, so a `str`
+  one was read as an integer constant, a null slice.
+- A closure's `let` parameter takes a value with no place (`f(make())`),
+  lent as a temporary of the statement and dropped at its end, as a
+  function's does; 0.25.3 said "this value has no place".
+- A closure whose parameter is taken another way than its `Fn` bound
+  gives it (`|r: sink R|` for `F: FnMut(R)`, `|r: R|` for
+  `FnMut(sink R)`, a let one for an `inout` one) is refused as not
+  satisfying the bound, naming both ways, with the fix (`fix
+  --suggested`) that writes the bound's; 0.25.3 gave a type mismatch
+  whose help was wrong ("this value has no place", `*R`, `&i64`).
+- `f"""` is an f-string text block: a text block's lines and dedent
+  with an f-string's holes, specs and `{{ }}`, quotes as text
+  (`guide syntax#lexical`); 0.25.3 said "newline in string literal".
+  The language server's completion reads text blocks as one literal.
+- The gate no longer stops a step that waits for a slot while the other
+  steps' jobs use them all: 0.25.2.2's and 0.25.3's container rows
+  stopped a fuzz row so ("0 of 8 slots free (slots lost with killed
+  jobs?)") while the other 18 rows ran on the same slots to the end; no
+  slot was lost. A still step is stopped when a slot is free, or when no
+  step moved for `$VOLE_GATE_STALL` s; its processes and what they wait
+  on go to its log, and they get 10 s after TERM to give their slots
+  back. Two self-test rows (`gate.sh --self-test`) pin it.
+- The check and turn-end hooks notice a tools binary older than the
+  tree's source (`volec --version` below compiler/src/main.vl's
+  `version()`): right after 0.25.3 the stop hook reported 16 errors that
+  were 0.25.3's text blocks read by 0.25.2.2. They check with a current
+  target/volec instead, or not at all, and say so in one line
+  (`hook.stale-volec`) with the `try:` that installs the release's build.
+- An error whose fix `fix --suggested` refuses before making it (a
+  conversion that loses the value, a cast of a cast, a call made to call
+  itself, std's function for another type) no longer prints `try: volec
+  fix --suggested`; the refusal's `note fix.refused` still says why.
+- A `requires` or `ensures` message's f-string hole that is not an
+  integer, or a fourth hole, is `contract.message`, which says what
+  shows such a value (0.25.3: "expected 'i64', got 'str'", and a fourth
+  hole was left out of the message silently). The holes stay integers.
 - **`std::num::fmt_f64(v, decimals, &out) -> i64`**: a float with a
   fixed number of decimals (0 to `FIXED_DECIMALS_MAX`, 20) at the end
   of a `[u8; 32]`, no allocation, `fmt_i64`'s shape: `{v:.N}`'s text

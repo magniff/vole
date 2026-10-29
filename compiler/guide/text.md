@@ -53,12 +53,13 @@ ADA LOVELACE al 211 true
 
 ## String constants
 
-String constants come in three forms:
+String constants come in four forms:
 
 | form | what it is |
 |---|---|
+| `const X: str = "...";` | text, a value: each use is the literal (0.25.4); a text block too |
 | `const X: [u8] = "...";` | bytes; a text block (`"""`, `guide syntax#lexical`), `include_str("f.wgsl")` and `include_bytes("f.bin")` too |
-| `static X: str = "...";` | text: a `str` is a static's (`const X: str` is an error whose fix is this) |
+| `static X: str = "...";` | text in a place, one address for every use, as any static |
 | `static X: [str; N] = ["a", "b"];` | an array of them (`const` too): `X[i]` is one, `X[..]` the slice; `[str]`, without the length, is refused |
 
 What turns one form into another:
@@ -82,7 +83,7 @@ const SHADER: [u8] = """
     @compute @workgroup_size(1)
     fn main() {}
     """;
-static NAME: str = "vole";
+const NAME: str = "vole";
 static DAYS: [str; 3] = ["mon", "tue", "wed"];
 
 fn main(gpa: Gpa) {

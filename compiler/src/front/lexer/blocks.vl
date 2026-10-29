@@ -14,6 +14,9 @@
 // end of a line joins it to the next. `r"""` opens a raw block: no
 // escapes at all; `r#"""` .. `"""#` (any number of `#`s) one whose text
 // may hold a line starting with `"""`. The token is a Str, as "...".
+// (0.25.4) `f"""` is an f-string text block: the same lines and dedent,
+// and an f-string's holes (lexer/strings: lex_fstring; open_ftext_block,
+// ftext_line here).
 
 use crate::base::{SRC, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice};
 use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_jump};
@@ -94,13 +97,35 @@ fn closes_at(src: [u8], p: i64, hashes: i64) -> bool {
     true
 }
 
-// The text block starting at `start` (its `"""`, or the `r` of a raw one
-// with `hashes` `#`s): the value in LEX_SCRATCH, a Str token.
-pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
+// The closing line of a block whose text starts at `body`: the first line
+// whose first non-blank bytes close it (`"""` and `hashes` `#`s): its
+// start and where its delimiter is (its indentation between); (-1, -1)
+// when there is none.
+fn closing_line(src: [u8], body: i64, hashes: i64) -> (i64, i64) {
+    let end = src.len;
+    var line = body;
+    while line < end {
+        var q = line;
+        while q < end && (src[q] == ' ' || src[q] == '\t') {
+            q += 1;
+        }
+        if closes_at(src, q, hashes) {
+            return (line, q);
+        }
+        while q < end && src[q] != '\n' {
+            q += 1;
+        }
+        line = q + 1;
+    }
+    (-1, -1)
+}
+
+// The opening line of a block whose `"""` ends at p: blanks only, then
+// the line break; where its text starts (the next line).
+fn opening_line(start: i64, p0: i64, hashes: i64) -> i64 {
     let src = src();
     let end = src.len;
-    var p = start + 3 + if raw { 1 + hashes } else { 0 };
-    // The rest of the opening line: blanks only.
+    var p = p0;
     while p < end && (src[p] == ' ' || src[p] == '\t') {
         p += 1;
     }
@@ -116,32 +141,47 @@ pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
             "end the line after '\"\"\"'; a string of one line is \"...\"", -1, "",
             fatal: true);
     }
-    let body = p + 1;
-    // The closing line: the first whose first non-blank bytes close.
-    var line = body;
-    var close = -1;
-    var indent_end = -1;
-    while line < end {
-        var q = line;
-        while q < end && (src[q] == ' ' || src[q] == '\t') {
-            q += 1;
-        }
-        if closes_at(src, q, hashes) {
-            close = line;
-            indent_end = q;
-            break;
-        }
-        while q < end && src[q] != '\n' {
-            q += 1;
-        }
-        line = q + 1;
+    p + 1
+}
+
+// Where the text of a block's line [line, text_end) starts: past the
+// closing line's `indent`; a blank line's past it, if anything; a line
+// indented less is lex.text-block-indent (once a block: `reported`), its
+// text from its first non-blank byte.
+fn line_from(src: [u8], line: i64, text_end: i64, indent: [u8], reported: inout bool) -> i64 {
+    var first = line;
+    while first < text_end && (src[first] == ' ' || src[first] == '\t') {
+        first += 1;
     }
+    let indented = text_end - line >= indent.len && src[line..line + indent.len] == indent;
+    if first == text_end {
+        // a blank line: what is past the indentation, if anything
+        return if text_end - line <= indent.len || !indented { text_end }
+            else { line + indent.len };
+    }
+    if !indented {
+        if !reported {
+            short_line(line, first, indent);
+            reported = true;
+        }
+        return first;
+    }
+    line + indent.len
+}
+
+// The text block starting at `start` (its `"""`, or the `r` of a raw one
+// with `hashes` `#`s): the value in LEX_SCRATCH, a Str token.
+pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
+    let src = src();
+    // The rest of the opening line: blanks only.
+    let body = opening_line(start, start + 3 + if raw { 1 + hashes } else { 0 }, hashes);
+    let (close, indent_end) = closing_line(src, body, hashes);
     if close < 0 {
         unterminated(start, hashes);
     }
     let indent = src[close..indent_end];
     buf_clear(LEX_SCRATCH);
-    line = body;
+    var line = body;
     var reported = false;
     while line < close {
         // [line, text_end) the line's text, '\n' at line_end
@@ -153,23 +193,7 @@ pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
         if text_end > line && src[text_end - 1] == '\r' {
             text_end -= 1;
         }
-        var first = line;
-        while first < text_end && (src[first] == ' ' || src[first] == '\t') {
-            first += 1;
-        }
-        var from = line + indent.len;
-        if first == text_end {
-            // a blank line: what is past the indentation, if anything
-            if text_end - line <= indent.len || !(src[line..line + indent.len] == indent) {
-                from = text_end;
-            }
-        } else if text_end - line < indent.len || !(src[line..line + indent.len] == indent) {
-            if !reported {
-                short_line(line, first, indent);
-                reported = true;
-            }
-            from = first;
-        }
+        let from = line_from(src, line, text_end, indent, &reported);
         var joined = false;
         if raw {
             buf_bytes(LEX_SCRATCH, src[from..text_end]);
@@ -204,6 +228,66 @@ pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
     LEX_POS = indent_end + 3 + hashes;
     let id = add_string(buf_slice(LEX_SCRATCH));
     push_token(Str, start, id as u64, 0);
+}
+
+// (0.25.4) An f-string text block being lexed, `f"""` (lex_fstring): its
+// closing line's start and its delimiter's position (the indentation
+// between them), -1 when none is open; whether a short line was reported.
+static var FB_CLOSE: i64 = -1;
+static var FB_QUOTE: i64 = -1;
+static var FB_REPORTED: bool = false;
+
+// (0.25.4) Whether an f-string text block opens at `start` (its `f`).
+pub fn at_ftext_block(start: i64) -> bool {
+    quotes_at(src(), start + 1)
+}
+
+// Whether an f-string text block is being lexed.
+pub fn in_ftext_block() -> bool {
+    FB_CLOSE >= 0
+}
+
+// No f-string text block open (lex_range: one an error left open, as a
+// fatal error in a hole does, is not the next text's).
+pub fn ftext_reset() {
+    FB_CLOSE = -1;
+}
+
+// (0.25.4) Opens the f-string text block at `start`, its `f"""`: the
+// opening line checked, the closing line found; LEX_POS at the text of
+// its first line. True when it is already closed (no line of text).
+pub fn open_ftext_block(start: i64) -> bool {
+    let body = opening_line(start, start + 4, 0);
+    let (close, quote) = closing_line(src(), body, 0);
+    if close < 0 {
+        unterminated(start, 0);
+    }
+    FB_CLOSE = close;
+    FB_QUOTE = quote;
+    FB_REPORTED = false;
+    ftext_line(body)
+}
+
+// (0.25.4) In an open f-string text block, the next line starts at
+// `line`: LEX_POS at its text, past the closing line's indentation, and
+// false; or, at the closing line, LEX_POS past the delimiter, the block
+// closed, and true.
+pub fn ftext_line(line: i64) -> bool {
+    let src = src();
+    if line >= FB_CLOSE {
+        LEX_POS = FB_QUOTE + 3;
+        FB_CLOSE = -1;
+        return true;
+    }
+    var text_end = line;
+    while src[text_end] != '\n' {
+        text_end += 1;
+    }
+    if text_end > line && src[text_end - 1] == '\r' {
+        text_end -= 1;
+    }
+    LEX_POS = line_from(src, line, text_end, src[FB_CLOSE..FB_QUOTE], &FB_REPORTED);
+    false
 }
 
 // An unterminated text block at `start`: the closing line it needs.

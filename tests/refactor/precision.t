@@ -138,7 +138,7 @@ $ refactor signature scale --type k i16 --default '$k as i16' --dry-run
 -pub fn scale(v: i64, k: i32) -> i64 {
 +pub fn scale(v: i64, k: i16) -> i64 {
 $ refactor signature scale --type k i16
-main.vl:11:36: error[type error] expected 'i16', got 'i32' | help: only widening is implicit: convert explicitly | try: n as i16 | try: volec fix --suggested main.vl  [in crate::main]
+main.vl:11:36: error[type error] expected 'i16', got 'i32' | help: only widening is implicit: convert explicitly | try: n as i16  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::calc::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::calc::scale --type k i16 --default '$k as i16'

@@ -30,7 +30,9 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   before the closing line are not in the value; escapes work as in
   `"..."`, a `\` at a line's end joins it to the next. `r"""` is a raw
   block: no escapes, a `\` is a backslash; text with a line starting
-  with `"""` goes in `r#"""` .. `"""#`. A text block is a string
+  with `"""` goes in `r#"""` .. `"""#`. `f"""` (0.25.4) is an f-string
+  text block: the same lines and dedent, with holes (`{x}`, `{x:>4}`,
+  `{{` for a brace) and quotes as text. A text block is a string
   literal: a `[u8]` or a `str`, in a `const` too. `volec fmt` leaves its
   lines as they are.
 - `include_str("shader.wgsl")` is the file's text as a string literal,
@@ -50,6 +52,11 @@ const PATTERN: [u8] = r"""
 fn main() -> i32 {
     println(USAGE);
     println(f"{PATTERN} {PATTERN.len}");
+    let n = 2;
+    println(f"""
+        "{n}" lines
+          {n * 2:>3}
+        """);
     0
 }
 ```
@@ -57,6 +64,8 @@ fn main() -> i32 {
 usage: tool [-v] FILE
   -v  verbose
 ^\d+\.\d+$ 10
+"2" lines
+    4
 ```
 
 ## Items

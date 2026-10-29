@@ -210,7 +210,7 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-geom.vl:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32 | try: volec fix --suggested main.vl  [in crate::geom::Point::scale]
+geom.vl:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::geom::Point::scale]
 error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor field crate::geom::Point --type x i32
