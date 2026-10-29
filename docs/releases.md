@@ -65,6 +65,43 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.3
+
+- **Diagnostics from the third GPU eval** (evals/tasks/0.25.2.2: eleven
+  messages that cost agents turns):
+  - `fn bump(inout x: i64)` is `conv.mode_order`: the mode goes after the
+    colon, `x: inout i64` (the exact fix; `let x: T` is `x: T`), and the
+    function is checked as if so written; it was "'inout' is a keyword:
+    rename it";
+  - an unknown name std has in several modules (`Matches`: std::cli's and
+    std::string's) gets the one whose module the file names, else each;
+    it was std::string's, the module loaded first;
+  - `gpu::Instance` after `use std::gpu::{Surface};` (or `fs::read_in`
+    with no `use`): `use std::gpu;` brings the module's name (the fix adds
+    it); `fs` was "vole's std has no such module";
+  - `const X: str = "..."`: a `str` is a static's (the fix), bytes a
+    constant's; it was "constants must be ... string literals";
+  - `v == s` of a `Vec<u8>` and a `[u8]`: `v.as_slice() == s`, the exact
+    fix; `Duration - Duration`: the type's methods for it
+    (`b.saturating_sub(a)`, the fix);
+  - `{s}` of a slice says why it has no Display; `{s:?}` of a slice whose
+    elements have Debug **now works** (`[1, 2, 3]`, `Fmt::debug_slice`);
+  - own.moved and own.move_out of a move-only value name the statement
+    that moved it: a struct literal or a tuple (`let (a, b) = (self.a,
+    self.b)`), and a std function that keeps it (`'Vec::push' keeps it`,
+    not "take it let"); a std::gpu handle's help points at
+    `volec guide gpu#handles`;
+  - a value whose type came from its literals (`let dt = 1.0 / 60.0;`
+    used as an f32): a note at the `let`, `note: FILE:L:C: 'dt' is 'f64'
+    from its literals: annotate it, `let dt: f32 = ...``, beside the
+    edit and the fix there (errors may now have `note:` lines about
+    another place).
+- **std::cli**: `m.get(name)`, `get_as` and `values` of a flag fail
+  (`cli.kind`, at the caller's line: "read a flag with m.flag(NAME)");
+  `m.get("headless").is_some()` on a flag was always false (one agent
+  lost a 120 s GPU run to it). `m.flag(name)` of an option stays what it
+  was: whether it was given.
+
 ### What's new in 0.25.2.2
 
 The second round of the GPU eval (evals/tasks/0.25.2.1: the same ten
