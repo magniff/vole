@@ -70,9 +70,25 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 | 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
+| 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.25.5
+
+The last release before 0.26's rethink of the core semantics: no language
+change (the user, 10-29), only the compiler's tables, the tools, the
+harness, std's soundness and code generation. Six of compiler/src's hot
+tables are `Vec<T, Comp>` (NODES, SRC, TYPES, SYMS, DEFS, FILES):
+compiler/src's unsafe went from 4,489 sites (4,365 unjustified) to 3,519
+(3,425); `check` costs 1.03x 0.25.4's, the compiler's own -O2
+self-compile 30% more instructions (about 8,600 bounds-checked Vec
+indexes, each inlined with its failure block: the next measured step).
+A compiler linked by `volec -o` had run about 10 times slower than one
+linked by `cc` (an old SDK version in its header; fixed). Breaking:
+`Atomic<T>` takes integers, bool and raw pointers only, and
+`std::process::Command` moves. Found and left for 0.26: `v[i]` reads `v`
+before it evaluates `i`, so `v[grow(&v)]` reads freed memory in safe code
+(semantics-inventory seam 32).
 
 The edit tools (edit255, feedbacks/DIGEST-0.25.4.md §2):
 
@@ -133,6 +149,10 @@ std (std255):
 
 Code generation and measuring (codegen255):
 
+- A constant `-0.0` keeps its sign: the constant evaluator negated a
+  float as `0.0 - x` (+0.0), in a `static`, `static var`, `const`,
+  `[-0.0; N]` and a struct's field, and in a C header's float macro
+  (tests/run/float_neg_zero_const.vl).
 - A compiler linked by `volec ... -o X` (the internal Mach-O linker, the
   default on aarch64-macos) ran its -O2 self-compile in about 10 times
   the instructions of the same objects linked by `cc` (470G against 46G,
@@ -170,22 +190,33 @@ Code generation and measuring (codegen255):
 
 compiler/src's tables (tables255, docs/design/modernize-0254.md step 4):
 
-- (tables255) `volec refactor table X` refuses `X[f(..)]` where f may
+- Compiler/src's tables: NODES (8,608 references), SRC (by hand, a `[u8]`
+  view), TYPES, SYMS, DEFS and FILES are `Vec<T, Comp>`, each with the
+  fixpoint and `volec same-output` against the compiler before it (no
+  difference but the compiler's own path); FNS and TOKS stay raw (each
+  would take `check` past 1.03x). A codegen change keeps checked Vec
+  indexing cheap: no `len - 0` for a slice from 0, a Vec's pointer and
+  length loaded as one pair (tests/run/opt_vec_index.vl).
+- A data race in the code generator: emission threads interned an
+  intrinsic template's placeholder names into SYMS while others read it
+  (`index out of bounds` once in arch-gen at -O2); the names are interned
+  on the main thread, templates look them up.
+- `volec refactor table X` refuses `X[f(..)]` where f may
   grow X (a call reaching a write of X or X_COUNT, through every call the
   checker resolved): the index is evaluated after X's buffer and length
   are read, so the element would be read through X's old header. Two such
   reads of NODES in front/own/drops.vl (`NODES[t_node(..)]`) take the
   index into a `let` first.
-- (tables255) `volec refactor table X` takes a rollback, `let m =
+- `volec refactor table X` takes a rollback, `let m =
   X_COUNT; ... X_COUNT = m;` (m a `let` assigned nowhere), as
   `X.truncate(m)`.
-- (tables255) The AArch64 and x86-64 emission of an intrinsic's
+- The AArch64 and x86-64 emission of an intrinsic's
   template found its placeholders' names by interning them, on the code
   generator's threads: a push to the symbol table racing with the other
   threads' reads (with SYMS a Vec, seen once as `index out of bounds:
   index 7578, length 7578` in arch-gen at -O2). They are now looked up
   (find_sym), the six slot names interned when the table is read.
-- (tables255) `volec fix --only unneeded-justified`: `unneeded-unsafe`'s
+- `volec fix --only unneeded-justified`: `unneeded-unsafe`'s
   blocks, and the unneeded ones whose `// UNSAFE:`/`// SAFETY:` comments
   justified them (a table's accessors), with those comments.
 
