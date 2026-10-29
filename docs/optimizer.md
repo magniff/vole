@@ -2722,6 +2722,17 @@ assembly is the evidence, `run.sh -s DIR` keeps it):
 | 7 walk 10M links through a static Vec | 111 | 103 | 103-111 | ptr and len read once, before the loop (before: the static's address and both loads in the loop) |
 | 8 `X[i].end = X[i].start + X[i].kind`, X a static Vec | 13 | 11 | 13 | unrolled by 4, no check (before: the header read and compared at each element) |
 
+**Compile cost** (instructions retired, `/usr/bin/time -l`, `--no-cache
+-j1 -c compiler/src/main.vl`): the -O2 self-compile 50.9G before, 51.8G
+after (+1.8%), by a compiler built by itself in both cases; the same
+compiler built by the old optimizer also takes 51.8G, so the code of the
+compiler is not slower: the rise is the optimizer's more work (by phase,
+`--time-passes` counting instructions: loop passes +0.6G, inlining and
+its simplification +0.2G, LICM +0.1G, register allocation +0.1G; the
+check phase 72M less). The facts' own analysis is 0.2G of it. The gate's
+`compile-cost` row: hello 1.00x, std 1.00x, check 0.99x. Five more
+vector loops in the compiler (40 to 45); its object 0.14% larger.
+
 Tests: `opt_vecfacts_header` (the IR: the let sum vectorized, the inout
 and static loops without a check, a static Vec's header before the
 loop), `opt_vecfacts_push_reload`, `opt_vecfacts_raw_alias`,
