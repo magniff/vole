@@ -208,7 +208,7 @@ maps the commands it names in place of words 1 and 2):
 
 Where std::cli's rule differs from what the layer did, volec keeps
 std::cli's, and tools/cli-compat.py (with 23 more lines for these
-cases) finds no other difference on its 1,435 command lines:
+cases) finds no other difference on its 1,438 command lines:
 
 - a word with one `-` whose first letter is one of the command's short
   options is that option (`-O3` is `-O 3`, `-Iinc` `-I inc`, `-j2` `-j

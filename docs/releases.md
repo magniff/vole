@@ -286,7 +286,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `last`, a build's `--stats` and `--print-checks` `default_missing`,
   and the editing commands' shared options `edit`'s `global` ones.
   Messages, `try:` lines and exit statuses are as before
-  (tools/cli-compat.py: 0 differences on 1,435 command lines but `-O3`
+  (tools/cli-compat.py: 0 differences on 1,438 command lines but `-O3`
   of `probe` and `test`), with the rules of every other option: `-O3` is
   `-O 3` (`-O takes 0, 1 or 2, not '3'`; probe took it and failed
   later), `-Iinc`, `-j2` are `-I inc`, `-j 2`, a cluster `-in` of
