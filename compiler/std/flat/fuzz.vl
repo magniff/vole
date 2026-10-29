@@ -22,12 +22,6 @@ pub fn coverage_reset() {
     }
 }
 
-extern "C" {
-    #[link_name = "time"]
-    #[effects(io)]
-    fn fuzz_time(t: *i64) -> i64;
-}
-
 // An input's bytes: all of them when the choices are an input's
 // (fuzzing, a saved input), else a generated text of bytes.
 pub fn gen_bytes(g: inout Gen) -> Vec<u8> {
@@ -47,47 +41,43 @@ pub fn gen_bytes(g: inout Gen) -> Vec<u8> {
 // A run of one input in a child process: its status, the choices it used,
 // and (when it returned) its coverage, into `cov`.
 fn fuzz_exec<F: Fn(inout Gen)>(f: F, gpa: Gpa, input: Vec<u64>, cov: [u8]) -> CaseRun {
-    var fds = [0 as i32, 0 as i32];
-    var cfds = [0 as i32, 0 as i32];
-    if unsafe { pipe(&fds[0]) } != 0 || unsafe { pipe(&cfds[0]) } != 0 {
-        eprintln("vole-test: cannot make a pipe");
-        unsafe { exit(2) };
-    }
-    let pid = unsafe { fork() };
+    let (rd, wr) = test_pipe();
+    let (crd, cwr) = test_pipe();
+    let pid = test_fork();
     if pid == 0 {
-        unsafe { close(fds[0]) };
-        unsafe { close(cfds[0]) };
-        let null = unsafe { open(c"/dev/null", 1) };
-        unsafe { dup2(null, 1) };
-        unsafe { dup2(null, 2) };
+        let _ = std::sys::sys_close(rd);
+        let _ = std::sys::sys_close(crd);
+        test_quiet();
         test_running();
         coverage_reset();
         let s = input.as_slice();
         var g = Gen {
-            choices: s.ptr, count: s.len, at: 0, size: 64, gpa: gpa, depth: 0, showing: false,
-            report: fds[1], raw: true,
+            choices: s, count: s.len, at: 0, size: 64, gpa: gpa, depth: 0, showing: false,
+            report: wr, raw: true,
         };
         // (0.18 with 0.17's drops: the case's values are dropped by now, so
         // a block it allocated and left is a leak; --check-alloc)
         let mark = check_alloc_mark();
         f(&g);
         if check_alloc_leaks_since(mark) > 0 {
-            unsafe { test_exit_now(101) };
+            test_quit(101);
         }
-        unsafe { write(cfds[1], &COVERAGE_MAP[0], 65536) };
-        unsafe { test_exit_now(0) };
+        let _ = std::sys::sys_write(cwr, COVERAGE_MAP[0..65536]);
+        test_quit(0);
     }
-    unsafe { close(fds[1]) };
-    unsafe { close(cfds[1]) };
-    var used: i64 = -1;
-    let n = unsafe { read(fds[0], &used as *u8, 8) };
-    unsafe { close(fds[0]) };
+    let _ = std::sys::sys_close(wr);
+    let _ = std::sys::sys_close(cwr);
+    let used = test_read_i64(rd);
+    let _ = std::sys::sys_close(rd);
     var got = 0;
     for i in 0..65536 {
         cov[i] = 0;
     }
     loop {
-        let k = unsafe { read(cfds[0], &cov[got], (65536 - got) as u64) };
+        let k = match std::sys::sys_read(crd, &cov[got..65536]) {
+            Ok(k) => k,
+            Err(_) => 0,
+        };
         if k <= 0 {
             break;
         }
@@ -96,12 +86,8 @@ fn fuzz_exec<F: Fn(inout Gen)>(f: F, gpa: Gpa, input: Vec<u64>, cov: [u8]) -> Ca
             break;
         }
     }
-    unsafe { close(cfds[0]) };
-    var status = 0 as i32;
-    unsafe { waitpid(pid, &status, 0) };
-    let st = status as i64;
-    let code = if (st & 127) == 0 { ((st >> 8) & 255) as i32 } else { 128 + (st & 127) as i32 };
-    CaseRun { status: code, used: if n == 8 && used >= 0 { used } else { input.len() } }
+    let _ = std::sys::sys_close(crd);
+    CaseRun { status: test_wait(pid), used: if used >= 0 { used } else { input.len() } }
 }
 
 // AFL's buckets of a count: 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128-255.
@@ -216,8 +202,8 @@ fn fuzz_hash(v: Vec<u64>) -> u64 {
 // Input v saved as DIR/PREFIXHASH (bytes): its path.
 fn fuzz_save(gpa: Gpa, v: Vec<u64>, prefix: [u8]) -> Buf {
     var path = Buf::new_in(gpa);
-    if TEST_FUZZ_DIR != 0 as *u8 {
-        unsafe { path.push_cstr(TEST_FUZZ_DIR) };
+    if TEST_FUZZ_DIR_SET {
+        path.push_str(TEST_FUZZ_DIR);
         path.push('/');
     }
     path.push_str(prefix);
@@ -230,16 +216,12 @@ fn fuzz_save(gpa: Gpa, v: Vec<u64>, prefix: [u8]) -> Buf {
     for i in 0..v.len() {
         bytes.push(v.get(i) as u8);
     }
-    var c = Buf::new_in(gpa);
-    c.push_str(path.as_slice());
-    c.push(0);
-    unsafe { test_write_file(c.as_slice().ptr, bytes.as_slice()) };
-    c.free();
+    test_write_file(path.as_slice(), bytes.as_slice());
     bytes.free();
     path
 }
 
-unsafe fn fuzz_load(gpa: Gpa, path: *u8, into: *Vec<u64>) -> bool {
+fn fuzz_load(gpa: Gpa, path: [u8], into: inout Vec<u64>) -> bool {
     var b = Buf::new_in(gpa);
     let ok = test_read_file(path, &b);
     into.clear();
@@ -271,13 +253,12 @@ pub fn run_fuzz_target<F: Fn(inout Gen)>(gpa: Gpa, name: [u8], f: F) {
     if TEST_FUZZ_TIME <= 0 {
         TEST_RAW = true;
         for k in 0..TEST_REPLAYS {
-            if !unsafe { fuzz_load(gpa, TEST_REPLAY[k], &input) } {
+            if !fuzz_load(gpa, TEST_REPLAY[k], &input) {
                 continue;
             }
             let r = test_case(f, gpa, input, 64, true);
             if test_fails(r) {
-                let p = unsafe { test_arg(TEST_REPLAY[k]) };
-                println(f"vole-test: property input {p}");
+                println(f"vole-test: property input {TEST_REPLAY[k]}");
                 test_case(f, gpa, input, 64, false);
                 test_exit(1);
             }
@@ -295,7 +276,7 @@ pub fn run_fuzz_target<F: Fn(inout Gen)>(gpa: Gpa, name: [u8], f: F) {
     corpus.push(empty);
     for k in 0..TEST_REPLAYS {
         var v: Vec<u64> = Vec::new_in(gpa);
-        if unsafe { fuzz_load(gpa, TEST_REPLAY[k], &v) } {
+        if fuzz_load(gpa, TEST_REPLAY[k], &v) {
             corpus.push(v);
         }
     }
@@ -310,10 +291,10 @@ pub fn run_fuzz_target<F: Fn(inout Gen)>(gpa: Gpa, name: [u8], f: F) {
         fuzz_new_coverage(cov[..], seen[..]);
     }
     var state = test_seed_of(name);
-    let start = unsafe { fuzz_time(0 as *i64) };
+    let start = fuzz_seconds();
     var kept = 0;
     var child: Vec<u64> = Vec::new_in(gpa);
-    while unsafe { fuzz_time(0 as *i64) } - start < TEST_FUZZ_TIME {
+    while fuzz_seconds() - start < TEST_FUZZ_TIME {
         var parent = corpus.get((test_next(&state) % corpus.len() as u64) as i64);
         var other = corpus.get((test_next(&state) % corpus.len() as u64) as i64);
         child.clear();
@@ -345,4 +326,9 @@ pub fn run_fuzz_target<F: Fn(inout Gen)>(gpa: Gpa, name: [u8], f: F) {
     }
     println(f"vole-test: fuzz {runs} runs, {kept} inputs kept, {corpus.len()} in the corpus");
     test_exit(0)
+}
+
+// The wall clock's seconds (C's time(NULL)).
+fn fuzz_seconds() -> i64 {
+    std::sys::sys_clock_gettime(std::sys::SYS_CLOCK_REALTIME).0
 }

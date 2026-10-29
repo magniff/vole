@@ -221,6 +221,38 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/refactor/run254.t).
 - The words after `--` reach a command as they are: `--json`,
   `--values=...` and `--help` there were volec's own before.
+- **std's unsafe, every site justified** (stdunsafe254): `volec query
+  unsafe std --summary` went from 1204 sites (1194 without `// UNSAFE:`
+  and `// SAFETY:` above them, 13 unneeded) to 893 sites, 0 unjustified,
+  3 reported unneeded (generic methods the query cannot see instantiated;
+  they are needed). docs/unsafe-baseline.md's std line is 0, so the gate
+  fails on any new unjustified site in std. Per class: ffi 718 to 456,
+  raw-pointer 346 to 317, other 90 to 72, alloc 39, static-mut 6
+  to 4, transmute 5. `[T]::get`'s unchecked read stays (1.9x faster than
+  `s[i]` in a 400M-read loop at -O2).
+- **Soundness fixes in std**: `RecvIter` holds its own reference to the
+  channel and has `Drop` (iterating after both ends were dropped read
+  freed memory); `SysDir` and `SysSpawnActions` have `Drop` (a dropped
+  one leaked its handle); `strerror` and `ptsname` became `strerror_r`
+  and `ptsname_r` (both raced between threads); `NsWindow::close` clears
+  its view, layer and display link, so a closed window's methods do
+  nothing instead of using a released object; stdin's buffer checks its
+  `malloc` for null (a static array instead made every program's object
+  64 KiB larger, and a hello world's build 1.46x dearer).
+- **Breaking, std's signatures**: `sys_poll(fds: inout [SysPollFd], ...)`
+  (it writes `revents`; it took the slice by `let`); `__io_error(kind,
+  msg: [u8])` and `io::Error` keeps a message index, not a C string;
+  `#[sealed]` on `SysDir`, `SysSpawnActions`, `Mutex`, `MutexGuard`,
+  `Sender`, `Receiver`, `RecvIter`, `JoinHandle`, `Scope` and
+  `ScopedJoinHandle`, whose fields hold raw pointers a struct literal
+  could forge; `atomic_fence` and `atomic_compiler_fence` are safe; the
+  private `utf8_word` is `unsafe fn`.
+- **std::objc**: `selector(name: [u8])` and `class_named(name: [u8])`,
+  safe, for the selectors and classes the bindings name; the generated
+  bindings (tools/objcgen) carry their `UNSAFE:`/`SAFETY:` comments.
+- **std's core sections**: `Mutex`, `Once` and `Condvar` moved to a lazy
+  section of their own ("Mutex, Once and Condvar (0.21)"), so a program
+  that prints does not read them; core is 157436 bytes of 163840.
 
 ### What's new in 0.25.3
 

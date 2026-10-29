@@ -5,12 +5,12 @@
 ## and in compiler/std/std.vl (def, in the repository): the two forms
 ## agree. Only a change to std.vl's first 130 lines moves them.
 $ def Option::unwrap
-std::Option::unwrap	../../compiler/std/std.vl:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Option::unwrap	../../compiler/std/std.vl:135:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 $ grep 'pub fn unwrap(sink self) -> T' --in std
 # <std>
-131:5	code	std	pub fn unwrap(sink self) -> T
-162:5	code	std	pub fn unwrap(sink self) -> T
+135:5	code	std	pub fn unwrap(sink self) -> T
+167:5	code	std	pub fn unwrap(sink self) -> T
 $ effects pick --why panic
 crate::pick	panic
   'o.unwrap()' at stdpos0253/main.vl:2:5 calls 'Option::unwrap$pre'
-  'self.is_some()' at <std>:132:18 is a requires check, which may fail
+  'self.is_some()' at <std>:136:18 is a requires check, which may fail
