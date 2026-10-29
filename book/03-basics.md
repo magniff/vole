@@ -168,13 +168,14 @@ error[type error]: expected 'i32', got 'i64'
  --> main.vl: line 4, column 22
   = help: only widening is implicit: convert explicitly
   = try: y as i32
-  = try: volec fix --suggested main.vl
 ```
 
 `x + y` is an `i64` (the `i32` widened), and putting an `i64` into an
 `i32` could lose its high bits, so the compiler wants you to say so. The
-first `try:` line is the code to write in place of `y`: `let z: i32 = x
-+ y as i32;`. The second is a command that makes that edit for you.
+`try:` line is the code to write in place of `y`: `let z: i32 = x + y
+as i32;`. `volec fix --suggested`, which makes most fixes for you, leaves
+this one to you, because the conversion may lose the value: whether it
+can is yours to judge.
 
 `as` also converts between integers and floats. Converting a float to
 an integer drops the fraction:

@@ -104,11 +104,11 @@ fixed 2 missing imports, 1 pub, 12 suggested fixes	2 files	+14 -10 lines
 5	    crate::lib::shapes::area(r)
 // text.vl:9
 9	    let c: u8 = 'x';
-main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8 | try: volec fix --suggested main.vl
+main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8
 main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 note fix.left: 2 errors left (above)
 $ check
-main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8 | try: volec fix --suggested main.vl
+main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8
 main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 [exit 1]
 $ undo

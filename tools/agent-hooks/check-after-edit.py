@@ -84,6 +84,16 @@ few ms; VOLE_HOOK_FMT=0: off):
 
     main.vl is not formatted: volec fmt main.vl (or --dry-run first: ...)
 
+(0.25.4, after the pathtrace UI feedback) A NEW `.vl` file outside
+compiler/src and compiler/std that the agent has just written (a Write
+whose result is a `create`) is formatted by the hook, `volec fmt FILE`
+before the check, and its changes named as the hook's other rewrites
+are (an existing file still gets the note only):
+
+    volec fmt ui.vl, run by the hook on the new file (layout only; volec undo takes it back):
+    changed ui.vl:3: let   z  =  3; -> let z = 3;
+    the hook rewrote ui.vl: the change above, nothing else (read it again before an Edit)
+
 and the compiler is run under the name the agent can type (`volec` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
@@ -100,6 +110,12 @@ it is the one on PATH, else its path from the event's directory), so the
   target/tools/volec (bootstrap/bootstrap.sh --dev, a passing build),
   then target/volec; then `volec` on PATH (the eval's bin/). For a
   Bash call, the binary it ran when that is a path.
+- (0.25.4) A compiler older than the checkout's source (its `volec
+  --version` below compiler/src/main.vl's `version()`, as the tools
+  binary is right after a release) would report the new release's syntax
+  as errors: then target/volec when it is current, else no check; said
+  once, in one line, with the `try:` that installs a current one
+  (stale_compiler).
 - How: `volec check --json ROOT` in the event's directory (one JSON
   object per diagnostic, docs/query.md); a compiler without --json is run
   without it, its short lines parsed.
@@ -257,6 +273,104 @@ def compiler_for(where, ran=None, root=None):
             if os.access(p, os.X_OK):
                 return p
     return which("volec")
+
+
+VERSION_FN = re.compile(r'pub fn version\(\)\s*->\s*\*u8\s*\{\s*c"([0-9]+(?:\.[0-9]+)+)"')
+VERSION_OUT = re.compile(r"\b([0-9]+(?:\.[0-9]+)+)\b")
+
+
+def tree_version(top):
+    """(0.25.4) The release checkout top's compiler source is: its
+    compiler/src/main.vl's `version()`; None outside a vole checkout."""
+    try:
+        with open(os.path.join(top, "compiler", "src", "main.vl"), errors="replace") as fh:
+            m = VERSION_FN.search(fh.read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def compiler_version(compiler):
+    """(0.25.4) The release compiler says it is (`--version`), or None."""
+    import subprocess
+    try:
+        r = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = VERSION_OUT.search(r.stdout) if r.returncode == 0 else None
+    return m.group(1) if m else None
+
+
+def version_key(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def stale_compiler(compiler, where):
+    """(0.25.4) (the compiler's version, the tree's, the checkout) when
+    compiler is older than the release the checkout's compiler source is
+    (right after a release, the tools binary of the release before it);
+    else None."""
+    top = checkout_root(where)
+    if not top or not compiler:
+        return None
+    tv = tree_version(top)
+    cv = compiler_version(compiler) if tv else None
+    if tv and cv and version_key(cv) < version_key(tv):
+        return cv, tv, top
+    return None
+
+
+def install_try(top, version):
+    """(0.25.4) The command that installs a current tools binary: the
+    bootstrap cache's build of release `version` (this checkout's, then the
+    main checkout's), copied over target/tools/volec; else bootstrap.sh
+    --dev, which builds the chain and installs a tested one."""
+    import glob
+    caches = [os.path.join(top, "target", "bootstrap")]
+    try:
+        with open(os.path.join(top, ".git")) as fh:
+            gd = fh.read().strip()
+        if gd.startswith("gitdir:"):
+            main = gd.split(":", 1)[1].strip()
+            main = main.split(os.sep + ".git" + os.sep)[0]
+            caches.append(os.path.join(main, "target", "bootstrap"))
+    except OSError:
+        pass
+    for c in caches:
+        for p in sorted(glob.glob(os.path.join(c, "*", f"v{version}-*", "volec"))):
+            if os.access(p, os.X_OK):
+                shown = os.path.relpath(p, top) if p.startswith(top + os.sep) else p
+                return f"rm -f target/tools/volec && cp {shown} target/tools/volec"
+    return "bootstrap/bootstrap.sh --dev"
+
+
+def current_compiler(compiler, where, st=None):
+    """(0.25.4) The compiler to check with, and the one line to say: the
+    compiler itself when it is not older than the tree's source; else
+    target/volec when that is current; else None. The line is said once a
+    session for the same versions (st, hookstate's), else ""."""
+    old = stale_compiler(compiler, where)
+    if not old:
+        return compiler, ""
+    cv, tv, top = old
+    shown = os.path.relpath(compiler, top) if compiler.startswith(top + os.sep) else compiler
+    build = os.path.join(top, "target", "volec")
+    use = None
+    if os.path.abspath(compiler) != build and os.access(build, os.X_OK):
+        bv = compiler_version(build)
+        if bv and version_key(bv) >= version_key(tv):
+            use = build
+    how = ("checked with target/volec instead" if use else
+           "not checked: its errors would be the newer release's syntax")
+    line = (f"note hook.stale-volec: {shown} is {cv}, older than this tree's {tv} "
+            f"(compiler/src/main.vl's version()); {how}\ntry: {install_try(top, tv)}")
+    key = f"{compiler}:{cv}:{tv}"
+    if st is not None:
+        if key in (st.get("stale_noted") or []):
+            line = ""
+        else:
+            st.setdefault("stale_noted", []).append(key)
+    return use, line
 
 
 def run_typed(compiler, cwd, args):
@@ -1093,6 +1207,48 @@ def fmt_note(compiler, cwd, edited, st):
             f"nothing, and says this once a file)")
 
 
+def new_file_written(event, edited):
+    """(0.25.4) Whether the call is a Write that created edited (Claude
+    Code's Write result says `"type": "create"`; `update` overwrote a
+    file), a .vl file outside a compiler/src or compiler/std (the
+    compiler's own source is formatted by its author and the commit hook)."""
+    if event.get("tool_name") != "Write" or not edited or not edited.endswith(".vl"):
+        return False
+    resp = event.get("tool_response")
+    if not isinstance(resp, dict) or resp.get("type") != "create":
+        return False
+    parts = os.path.abspath(edited).split(os.sep)
+    return not any(parts[i] == "compiler" and parts[i + 1] in ("src", "std") for i in range(len(parts) - 1))
+
+
+def fmt_new_file(event, compiler, cwd, edited):
+    """(0.25.4) A new file the agent has just written (new_file_written),
+    formatted: `volec fmt FILE` (journaled: `volec undo` takes it back),
+    its changes from the journal (`volec query diff`) as `changed
+    FILE:LINE: OLD -> NEW` lines, at most FMT_SHOWN, then `the hook
+    rewrote FILE` as for the hook's fixes; "" when the file was formatted
+    already, does not parse (the check says why) or VOLE_HOOK_FMT=0."""
+    if os.environ.get("VOLE_HOOK_FMT", "1") == "0" or not new_file_written(event, edited) \
+            or not os.path.exists(edited):
+        return ""
+    full = os.path.abspath(edited)
+    arg = os.path.relpath(full, cwd) if full.startswith(cwd + os.sep) else full
+    r = run_typed(compiler, cwd, ["fmt", arg])
+    if r is None or r.returncode != 0 or not FORMATTED.search(r.stdout or ""):
+        return ""
+    d = run_typed(compiler, cwd, ["query", "diff"])
+    changes = diff_changes(d.stdout.splitlines()) if d is not None and d.returncode == 0 else []
+    name = volec_shown(compiler, cwd)
+    lines = [f"{name} fmt {arg}, run by the hook on the new file (layout only; volec undo takes it back):"]
+    lines += [f"changed {x}" for x in changes[:FMT_SHOWN]]
+    if len(changes) > FMT_SHOWN:
+        lines.append(f"({len(changes) - FMT_SHOWN} more: {name} query diff)")
+    n = len(changes)
+    count = f"the {n} changes above" if n > 1 else "the change above" if n else "its layout"
+    lines.append(f"the hook rewrote {arg}: {count}, nothing else (read it again before an Edit)")
+    return "\n".join(lines)
+
+
 def volec_shown(compiler, cwd):
     """The compiler as the agent would type it."""
     if not compiler:
@@ -1153,13 +1309,22 @@ def main():
     if not compiler:
         return say(fmt_text)
     st = hs.load(event)
+    # (0.25.4) a tools binary older than the tree's source: said once
+    compiler, stale = current_compiler(compiler, cwd if not edited else os.path.dirname(os.path.abspath(edited)), st)
+    if not compiler:
+        hs.save(event, st)
+        return say("\n".join(t for t in (fmt_text, stale) if t))
+    # (0.25.4) a new file: formatted first, so the check's positions are
+    # the formatted file's
+    new_text = fmt_new_file(event, compiler, cwd, edited)
     got = verify(event, st, compiler, root, cwd, edited)
     if got is None:
-        return say(fmt_text)
+        hs.save(event, st)
+        return say("\n".join(t for t in (fmt_text, new_text, stale) if t))
     text, rec = got
     hs.save(event, st)
     record(event, cwd, rec)
-    return say("\n".join(t for t in (fmt_text, text) if t))
+    return say("\n".join(t for t in (fmt_text, new_text, stale, text) if t))
 
 
 def say(text):
