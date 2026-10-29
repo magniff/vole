@@ -6,8 +6,8 @@
 use std::Option;
 
 use crate::base::{
-    BUFS, IntVec, SRC, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, free, intern,
-    sym_text,
+    BUFS, IntVec, SRC, SYMS, SYM_COUNT, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free,
+    intern, sym_text,
 };
 use crate::base::diag::{
     ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_fix, err_fix_word,
@@ -382,6 +382,14 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             return;
         }
         var path = import_path_for(name, value);
+        if path == 0 && IMPORT_PATHS != 0 {
+            // (0.25.3) several modules have it, none named in the file: each
+            err_help(c"'");
+            err_help_sym(name);
+            err_help(c"' is in several modules: add ");
+            buf_bytes(ERR_HELP, buf_slice(IMPORT_PATHS));
+            return;
+        }
         if path == 0 && STD_MODULE < 0 && std_has(name, value) {
             path = buf_new();
             buf_str(path, c"std");
@@ -909,8 +917,18 @@ fn lower(c: u8) -> u8 {
 
 // The path of the module (`crate::a::b`, `std`) whose public item `name`
 // is a value (or a type) the current module could import: a buffer, or 0.
+// The program's module first (`fix --only imports` chooses among several
+// by nearness). (0.25.3, eval 0.25.2.2: `Matches`, std::cli's and
+// std::string's) Else, when several of std's modules have one (from std's
+// whole source: a module the program does not name is not loaded), the
+// one whose path the file already names (`use std::cli::{Arg, ..}`); else
+// none, and IMPORT_PATHS lists them all.
 pub fn import_path_for(name: i64, value: bool) -> i64 {
     unsafe {
+        IMPORT_PATHS = 0;
+        let paths = buf_new();
+        var in_std = false;
+        var std_first = 0;
         for m in 0..module_count() {
             if m == CUR_MOD || m == C_MODULE {
                 continue;
@@ -931,11 +949,183 @@ pub fn import_path_for(name: i64, value: bool) -> i64 {
                 buf_str(out, c"std");
                 return out;
             }
+            if within_std(m) {
+                if !in_std {
+                    put_module_path(out, m);
+                    std_first = out;
+                }
+                in_std = true;
+                continue;
+            }
             put_module_path(out, m);
             return out;
         }
-        0
+        if in_std {
+            std_item_paths(paths, name, value);
+        }
+        let all = buf_slice(paths);
+        let f = crate::front::modules::file_of_pos(err_pos());
+        let file = if f >= 0 { SRC[crate::base::FILES[f].start..crate::base::FILES[f].end] }
+            else { SRC[0..0] };
+        var count = 0;
+        var named_count = 0;
+        var first = all[0..0];
+        var named = all[0..0];
+        let list = buf_new();
+        var a = 0;
+        while a < all.len {
+            var e = a;
+            while e < all.len && all[e] != '\n' {
+                e += 1;
+            }
+            let p = all[a..e];
+            a = e + 1;
+            if count == 0 {
+                first = p;
+            } else {
+                buf_str(list, c" or ");
+            }
+            count += 1;
+            buf_str(list, c"`use ");
+            buf_bytes(list, p);
+            buf_str(list, c"::");
+            buf_bytes(list, SYMS[name].text);
+            buf_str(list, c";`");
+            let mentioned = buf_new();
+            buf_bytes(mentioned, p);
+            buf_str(mentioned, c"::");
+            if mentions(file, buf_slice(mentioned)) {
+                named = p;
+                named_count += 1;
+            }
+        }
+        let one = if count == 1 { first } else if named_count == 1 { named } else { all[0..0] };
+        if one.len > 0 {
+            let out = buf_new();
+            buf_bytes(out, one);
+            return out;
+        }
+        if count > 1 {
+            IMPORT_PATHS = list;
+            return 0;
+        }
+        // (std's source not read as the scan reads it: the module found)
+        std_first
     }
+}
+
+// (0.25.3) The `use` lines of the modules import_path_for found when it
+// could not choose one (a buffer), else 0.
+pub static var IMPORT_PATHS: i64 = 0;
+
+// Path p as a line of paths (a buffer), unless it has it.
+fn add_path(paths: i64, p: [u8]) {
+    let have = buf_new();
+    buf_str(have, c"\n");
+    buf_bytes(have, buf_slice(paths));
+    let line = buf_new();
+    buf_str(line, c"\n");
+    buf_bytes(line, p);
+    buf_str(line, c"\n");
+    if !mentions(buf_slice(have), buf_slice(line)) {
+        buf_bytes(paths, p);
+        buf_str(paths, c"\n");
+    }
+}
+
+// (0.25.3) The paths of std's modules (`std::cli`) that define a public
+// value (or type) `name` at their top level, from std's whole source and
+// its files' list (`flat/` and std.vl: `std`), added to paths.
+fn std_item_paths(paths: i64, name: i64, value: bool) {
+    let src = buf_new();
+    std_source(src);
+    let files = buf_new();
+    crate::front::stdsrc::std_files(files);
+    let text = buf_slice(src);
+    let list = buf_slice(files);
+    let word = sym_text(name);
+    var start = 0;
+    while start < text.len {
+        var end = start;
+        while end < text.len && text[end] != '\n' {
+            end += 1;
+        }
+        let line = text[start..end];
+        let at = start;
+        start = end + 1;
+        if line.len < 5 || line[0..4] != "pub " {
+            continue;
+        }
+        var rest = line[4..line.len];
+        if rest.len > 7 && rest[0..7] == "unsafe " {
+            rest = rest[7..rest.len];
+        }
+        var kind_len = 0;
+        let kinds: [[u8]] = if value { ["fn ", "const ", "static "] }
+            else { ["struct ", "enum ", "type ", "trait ", "union "] };
+        for k in kinds {
+            if rest.len > k.len && rest[0..k.len] == k {
+                kind_len = k.len;
+            }
+        }
+        if kind_len == 0 {
+            continue;
+        }
+        rest = rest[kind_len..rest.len];
+        if rest.len < word.len || rest[0..word.len] != word
+            || rest.len > word.len && crate::front::lexer::is_ident_byte(rest[word.len]) {
+            continue;
+        }
+        // (the file at `at`: the last whose offset is not past it)
+        var file = list[0..0];
+        var a = 0;
+        while a < list.len {
+            var e = a;
+            while e < list.len && list[e] != '\n' {
+                e += 1;
+            }
+            var s = a;
+            var off = 0;
+            while s < e && list[s] != ' ' {
+                off = off * 10 + (list[s] - '0') as i64;
+                s += 1;
+            }
+            if off > at || s >= e {
+                break;
+            }
+            file = list[s + 1..e];
+            a = e + 1;
+        }
+        let path = buf_new();
+        buf_str(path, c"std");
+        if file.len > 3 && file != "std.vl" && !(file.len > 5 && file[0..5] == "flat/") {
+            var f = file[0..file.len - 3];
+            if f.len > 4 && f[f.len - 4..f.len] == "/mod" {
+                f = f[0..f.len - 4];
+            }
+            buf_str(path, c"::");
+            for c in f {
+                if c == '/' {
+                    buf_str(path, c"::");
+                } else {
+                    buf_byte(path, c);
+                }
+            }
+        }
+        add_path(paths, buf_slice(path));
+    }
+}
+
+// Whether text t has part in it.
+fn mentions(t: [u8], part: [u8]) -> bool {
+    var i = 0;
+    while i + part.len <= t.len {
+        if t[i..i + part.len] == part {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn put_module_path(out: i64, m: i64) {

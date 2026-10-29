@@ -295,8 +295,13 @@ fn check_moved(p: i64, n: i64) {
             own_str(if definite { c" is used here after it moved" }
                 else { c" is used here after it may have moved" });
         }
+        // (0.25.3) the literal that took it: `App { dev: d, .. }`, `(a, b)`
+        let lit = if by > 0 && !made_closure(by) { literal_of(by) } else { 0 };
         if by > 0 && made_closure(by) {
             own_str(c" into the sink closure");
+        } else if lit > 0 {
+            own_str(c" into ");
+            own_bytes(literal_words(lit));
         } else if by > 0 {
             moved_into(by);
         }
@@ -313,7 +318,23 @@ fn check_moved(p: i64, n: i64) {
         let moved_ty = if by > 0 && !closure { NODES[by].ty }
             else if q == p || q < 0 { NODES[n].ty } else { -1 };
         let copy = moved_ty >= 0 && can_clone(moved_ty);
-        if closure {
+        // (0.25.3) a std function that keeps it (`Vec::push(sink x)`): its
+        // parameter is not the program's to change
+        let std_callee = if by > 0 && !closure && lit == 0 { std_sink_callee(by) } else { "" };
+        if lit > 0 {
+            own_help(if copy {
+                c"a literal moves the values it is given: use it before the literal, give the literal a copy ('.clone()'), or reach it through its new owner (the literal's field)"
+            } else {
+                c"a literal moves the values it is given: use it before the literal, or reach it through its new owner (the literal's field); a function that only reads it takes it let ('x: T')"
+            });
+        } else if std_callee.len > 0 {
+            own_help_bytes(std_callee);
+            own_help(if copy {
+                c" keeps it: use it before the call, give the call a copy ('.clone()'), or reach it where it is kept ('v[i]', 'v.last()')"
+            } else {
+                c" keeps it: use it before the call, or reach it where it is kept ('v[i]', 'v.last()')"
+            });
+        } else if closure {
             own_help(if copy {
                 c"the sink closure takes what it captures: use it before the closure, give the closure a copy ('let c = x.clone();' before it, 'c' in it), or capture it as a view: a closure without 'sink' that does not outlive it"
             } else {
@@ -332,6 +353,7 @@ fn check_moved(p: i64, n: i64) {
                 c"use it before the move, or let the callee read it: a let parameter ('x: T'), not 'sink'"
             });
         }
+        gpu_handle_help(moved_ty);
         // (0.25: not a pattern's binding, walk::bind_parts: `.clone()` there
         // does not parse)
         if by > 0 && copy && !closure && NODES[by].kind != NodeKind::PatBind {
@@ -465,6 +487,145 @@ fn moved_into(by: i64) {
         own_str(c"sink ");
         own_bytes(SYMS[NODES[p].a].text);
         own_str(c")'");
+    }
+}
+
+// (0.25.3) The name of the std function whose sink parameter took the
+// value moved at node `by` (`'Vec::push'`), else "".
+fn std_sink_callee(by: i64) -> [u8] {
+    let v = MOVE_CALL.get(by + 1);
+    if v <= 0 {
+        return "";
+    }
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast).
+    // SAFETY: v / 256 is the call node eval_call noted for the argument, a
+    // node made; the table lives while the program is checked.
+    let f = unsafe { NODES[v / 256].x } - 1;
+    if f < 0 {
+        return "";
+    }
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is the function the call resolved to (its node's x - 1,
+    // below FN_COUNT), and an instance's tmpl - 1 its template's index.
+    let info = unsafe { if FNS[f].tmpl > 0 { FNS[FNS[f].tmpl - 1] } else { FNS[f] } };
+    if !within_std(info.module) {
+        return "";
+    }
+    let name = crate::base::sym_text(info.display);
+    var cut = 0;
+    while cut < name.len && name[cut] != '<' {
+        cut += 1;
+    }
+    let b = buf_new();
+    buf_bytes(b, "'");
+    buf_bytes(b, name[0..cut]);
+    buf_bytes(b, "'");
+    buf_slice(b)
+}
+
+// (0.25.3, eval 0.25.2.2: six agents on std::gpu's handles) The literals
+// owned values move into: element node + 1 -> the literal (a struct, a
+// tuple, an array, a variant) + 1 (walk.vl: eval), so that own.moved and
+// own.move_out name the literal that took the value.
+pub static var MOVE_LIT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn note_literal(lit: i64) {
+    for i in 0..lit_node(lit).count {
+        let c = child(lit, i);
+        let cn = lit_node(c);
+        let v = if cn.kind == NodeKind::FieldInit || cn.kind == NodeKind::NamedArg { cn.b }
+            else { c };
+        if v > 0 {
+            MOVE_LIT.put(v + 1, lit + 1);
+        }
+    }
+}
+
+// Node n of a literal or of what it holds.
+fn lit_node(n: i64) -> crate::front::ast::Node {
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast).
+    // SAFETY: n is a literal the walk reaches, or one of its elements (its
+    // children, a field's value), nodes made (0 < n < NODE_COUNT); the
+    // table lives while the program is checked.
+    unsafe { NODES[n] }
+}
+
+// The literal node n moved into (0: none).
+fn literal_of(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    let v = MOVE_LIT.get(n + 1);
+    if v > 0 { v - 1 } else { 0 }
+}
+
+// What literal `lit` is called in a message: `the struct literal 'App {
+// .. }'`, `a tuple`, `an array`, `'E::V(..)'`.
+fn literal_words(lit: i64) -> [u8] {
+    let ln = lit_node(lit);
+    let k = ln.kind;
+    if k == NodeKind::Tuple {
+        return "a tuple";
+    }
+    if k == NodeKind::Array {
+        return "an array";
+    }
+    // UNSAFE: SRC is the buffer of every file read, a raw pointer.
+    // SAFETY: the literal's start..end is inside its file's text, which SRC
+    // holds whole.
+    let text = unsafe { SRC[ln.start..ln.end] };
+    var e = 0;
+    while e < text.len && text[e] != '{' && text[e] != '(' {
+        e += 1;
+    }
+    var h = e;
+    while h > 0 && (text[h - 1] == ' ' || text[h - 1] == '\n') {
+        h -= 1;
+    }
+    let b = buf_new();
+    if k == NodeKind::StructLit {
+        buf_bytes(b, "the struct literal '");
+    } else {
+        buf_bytes(b, "'");
+    }
+    buf_bytes(b, text[0..h]);
+    if e < text.len && text[e] == '(' {
+        buf_bytes(b, "(..)'");
+    } else {
+        buf_bytes(b, " { .. }'");
+    }
+    buf_slice(b)
+}
+
+// (0.25.3) Whether type t is one of std::gpu's (a Device, a Buffer, a
+// BindGroup: handles that move, which the guide's gpu#handles explains).
+fn gpu_handle(t: i64) -> bool {
+    if t <= 0 {
+        return false;
+    }
+    // UNSAFE: TYPES is the table of types, a raw pointer (front/types).
+    // SAFETY: t is a checked node's type, a type made (0 < t < the number
+    // of types); the table lives while the program is checked.
+    let info = unsafe { TYPES[t] };
+    if info.kind != TyKind::Struct {
+        return false;
+    }
+    // UNSAFE: STRUCTS is the table of structs, a raw pointer (front/types).
+    // SAFETY: a struct type's a is its struct's index, below the number of
+    // structs.
+    let m = unsafe { STRUCTS[info.a].module };
+    let std_m = crate::front::modules::STD_MODULE;
+    if std_m < 0 || m < 0 {
+        return false;
+    }
+    let g = crate::front::modules::child_module(std_m, crate::base::intern_c(c"gpu"));
+    g >= 0 && crate::front::modules::is_within(m, g)
+}
+
+// The help's pointer to the guide for a std::gpu handle of type t.
+fn gpu_handle_help(t: i64) {
+    if gpu_handle(t) {
+        own_help(c"; std::gpu's handles move and are kept by one owner: `volec guide gpu#handles`");
     }
 }
 
@@ -614,9 +775,10 @@ fn move_out(p: i64, n: i64, how: i64) {
             // nothing can be left in its place, and taking it would empty
             // the field the next step reads
             let f = file_of(NODES[n].start);
+            let lit = literal_of(n);
             no_default_help(SRC[NODES[n].start..NODES[n].end],
                 SRC[FILES[f].start..NODES[n].start], SRC[NODES[n].end..FILES[f].end],
-                buf_slice(tn));
+                buf_slice(tn), if lit > 0 { literal_words(lit) } else { "" });
         } else {
             if cl {
                 own_help(if !strict {
@@ -641,6 +803,7 @@ fn move_out(p: i64, n: i64, how: i64) {
             }
             if cl { try_wrap(n, c"", c".clone()"); }
         }
+        gpu_handle_help(NODES[n].ty);
         own_end();
     }
 }
@@ -650,9 +813,14 @@ fn move_out(p: i64, n: i64, how: i64) {
 // and `after` it, its file's text): read it in place, and where an `if` or
 // `match` picks one of two fields (`let g = if k == 0 { self.g0 } else {
 // self.g1 };`), use each field inside its branch.
-fn no_default_help(s: [u8], before: [u8], after: [u8], tn: [u8]) {
+fn no_default_help(s: [u8], before: [u8], after: [u8], tn: [u8], lit: [u8]) {
     let b = buf_new();
-    if chosen_by_branch(before, after) {
+    if lit.len > 0 {
+        // (0.25.3, eval 0.25.2.2: `App { dev: self.dev }`, `let (a, b) =
+        // (self.a, self.b);`) a literal moves what it is given
+        buf_fmt(b,
+            f"{lit} moves '{s}' out of its owner, and '{tn}' has no Default to leave in its place (no 'std::take') and no '.clone()': read it in place where it is needed, passing '{s}' itself to a let parameter (`f({s})`), or make the literal where the value is owned (a 'sink' parameter, a local)");
+    } else if chosen_by_branch(before, after) {
         buf_fmt(b,
             f"an `if` or `match` that picks '{s}' moves it out, and '{tn}' has no Default to leave in its place (no 'std::take') and no '.clone()': use the field inside each branch, where a let parameter reads it in place (`if c {{ f({s}) }} else {{ f(...) }}`), or pass '{s}' itself where it is needed");
     } else {
