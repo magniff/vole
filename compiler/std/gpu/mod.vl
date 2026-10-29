@@ -23,11 +23,14 @@
 //   the device's ShaderKind (MSL on Metal): a ShaderSource, the code and
 //   its reflection.
 
+mod capture;
 pub mod hal;
 pub mod shader;
+mod timing;
 pub mod types;
 pub mod wgsl;
 
+pub use std::capture::{capture_cancel, capture_next_frame, capture_pending};
 use std::iter::Range;
 
 use hal::metal as backend;
@@ -36,6 +39,7 @@ pub use shader::{
     Binding, BindingType, EntryPoint, GroupBinding, Reflection, ShaderKind, ShaderSource,
     VertexInput,
 };
+pub use timing::{MAX_QUERIES, QuerySet};
 use types::{MAX_BIND_GROUPS, MAX_COLOR_TARGETS, MAX_VERTEX_BUFFERS};
 pub use types::{
     AddressMode, Blend, BlendComponent, BlendFactor, BlendOp, BufferUsage, Color, ColorTarget,
@@ -162,6 +166,7 @@ impl Instance {
         match N::create_surface(dev.raw, raw) {
             Some(s) => Ok(Surface {
                 raw: s, configured: false, width: 0, height: 0, format: Format::Bgra8Unorm,
+                dev: dev.raw.clone(), gpa: self.gpa,
             }),
             None => Err(Error::SurfaceLost),
         }
@@ -737,6 +742,8 @@ impl Device {
         Encoder {
             raw: N::begin(self.raw), limits: self.limits, caps: self.caps,
             unwritten: Unwritten::new(), maps: Vec::new_in(self.gpa),
+            dev: self.raw.clone(), segs: Vec::new_in(self.gpa), stamps: Vec::new_in(self.gpa),
+            resolve_next: false,
         }
     }
 
@@ -768,7 +775,12 @@ impl Queue {
         for i in 0..c.unwritten.fills {
             self.wrote(c.unwritten.fill[i]);
         }
-        N::submit(&self.raw, &c.raw);
+        if c.segs.len() > 0 || c.resolve_next {
+            // (0.25.4) timed passes or resolves (timing.vl)
+            timing::submit_segments(&self.raw, &c);
+        } else {
+            N::submit(&self.raw, &c.raw);
+        }
     }
 
     // A uniform buffer has been written (its id, once).
@@ -1425,6 +1437,13 @@ pub struct Encoder {
     // way the GPU reaches one, map_usage_fault), a handle of each, for
     // submit's gpu.state; on the device's allocator, from the first
     maps: Vec<backend::Buffer>,
+    // (0.25.4) timing (timing.vl): the device, for a new command buffer;
+    // the command buffers ended before a timed pass, by it and before a
+    // resolve; the timestamps written; the current one resolves
+    dev: backend::Device,
+    segs: Vec<timing::Seg>,
+    stamps: Vec<timing::Stamp>,
+    resolve_next: bool,
 }
 
 /// Recorded commands, for `queue.submit` (dropped unsubmitted: discarded).
@@ -1432,6 +1451,10 @@ pub struct Commands {
     pub raw: backend::CommandBuffer,
     unwritten: Unwritten,
     maps: Vec<backend::Buffer>,
+    // (0.25.4) the encoder's split command buffers and timestamps
+    segs: Vec<timing::Seg>,
+    stamps: Vec<timing::Stamp>,
+    resolve_next: bool,
 }
 
 // (0.25.3) The first buffer of `maps` (the mappable buffers recorded
@@ -2017,7 +2040,10 @@ impl Encoder {
 
     /// The recorded commands, for `queue.submit`.
     pub fn finish(sink self) -> Commands {
-        Commands { raw: self.raw, unwritten: self.unwritten, maps: self.maps }
+        Commands {
+            raw: self.raw, unwritten: self.unwritten, maps: self.maps, segs: self.segs,
+            stamps: self.stamps, resolve_next: self.resolve_next,
+        }
     }
 
     // (0.25.3) A buffer a copy uses: when it is mappable, a handle of it
@@ -2041,6 +2067,9 @@ pub struct Surface {
     pub width: i64,
     pub height: i64,
     pub format: Format,
+    // (0.25.4) the device it was made for, for capture_next_frame
+    dev: backend::Device,
+    gpa: Gpa,
 }
 
 /// A frame of a surface: its texture is the render target; `present`
@@ -2048,6 +2077,8 @@ pub struct Surface {
 pub struct Frame {
     pub raw: backend::Frame,
     pub texture: Texture,
+    // (0.25.4) a capture asked for (capture_next_frame) when it was taken
+    cap: Option<capture::Capture>,
 }
 
 impl Surface {
@@ -2077,7 +2108,12 @@ impl Surface {
                     width: self.width, height: self.height, layers: 1, mips: 1, format: self.format,
                     usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
                 };
-                Ok(Frame { raw: f, texture: Texture { raw: t, desc: desc } })
+                let cap = if std::capture::capture_pending() {
+                    Some(capture::Capture { dev: self.dev.clone(), gpa: self.gpa })
+                } else {
+                    None
+                };
+                Ok(Frame { raw: f, texture: Texture { raw: t, desc: desc }, cap: cap })
             }
             None => Err(Error::SurfaceLost),
         }
@@ -2085,9 +2121,18 @@ impl Surface {
 }
 
 impl Frame {
-    /// Shows the frame after the work submitted to queue so far.
+    /// Shows the frame after the work submitted to queue so far. (0.25.4)
+    /// After capture_next_frame, the frame is also written to its file.
     pub fn present(sink self, queue: inout Queue) {
         let f = self;
+        match f.cap {
+            Some(cap) => {
+                if std::capture::capture_pending() {
+                    capture::write(cap, &queue, f.texture);
+                }
+            }
+            None => {}
+        }
         N::present(&queue.raw, f.raw);
     }
 }
