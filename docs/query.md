@@ -1386,7 +1386,11 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   formatter runs). Those shell edits of a `.vl` now trigger the check
   too. A file the call left unformatted gets `main.vl is not formatted:
   volec fmt main.vl` once, until it is formatted (`fmt --check`, a few
-  ms; VOLE_HOOK_FMT=0: off); the hook formats nothing.
+  ms; VOLE_HOOK_FMT=0: off); the hook formats nothing but (0.25.4) a
+  NEW `.vl` file the agent has just written (a Write whose result is a
+  `create`) outside compiler/src and compiler/std: `volec fmt FILE`
+  before the check, its changes named as `changed FILE:LINE: OLD -> NEW`
+  and `the hook rewrote FILE: ...` (journaled: `volec undo`).
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,

@@ -108,7 +108,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
   (`guide window`).
 - The handles (`dev`, `cells`, `step`, ...) move: keep them in one
   owner, `gpu#handles`. Headless (tests, a server):
-  `RawSurface::Headless` gives frames without a window.
+  `RawSurface::Headless` gives frames without a window; reading them
+  back to check a windowed program's pixels: `window#checking-the-pixels-headless`.
 
 @PAGE-END@ More, a section at a time (`volec guide gpu#NAME`; `volec guide gpu#` lists them): `handles` (which objects move; keeping them in a struct, a Vec, a closure), `lifecycle` (the objects; mapping and readback), `compute`, `ordering` (dispatches in a pass), `bind-groups`, `one-module-per-kernel`, `uniform-and-storage-layout`, `workgroups`, `buffer-sizes`, `atomics`, `ping-pong`, `per-step-parameters`, `timing-gpu-work`, `what-the-translation-rejects`, `contracts` (the gpu.* stops). Rendering: `volec guide gpu-render`; the window and the mouse: `volec guide window`. All of it: `volec guide gpu --whole`.
 
@@ -1117,4 +1118,4 @@ is (no adapter, a shader the driver rejects) is a `gpu::Error`.
 Surfaces (`inst.surface(dev, RawSurface::MetalLayer(layer))`,
 `surf.configure(..)`, `surf.frame()?`, `frame.present(&queue)`) are
 what std::window draws into; `RawSurface::Headless` gives frames without
-a window.
+a window (to check a window's pixels: `window#checking-the-pixels-headless`).

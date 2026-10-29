@@ -1,4 +1,4 @@
-# Windows: std::window (0.23; guide updated 0.25.3)
+# Windows: std::window (0.23; guide updated 0.25.4)
 
 `std::window` opens windows and reads their input, winit's objects with
 events pulled rather than pushed. 0.23.0 runs on macOS (Cocoa); Wayland
@@ -50,9 +50,12 @@ fn main(gpa: Gpa) -> i32 {
   `surf.height` are the drawable's pixels too; a snapshot of the window
   (a copy of its frame, a canvas, a PPM) is `surf.width` x
   `surf.height`, never the WindowDesc's numbers (those give its top-left
-  quarter at scale 2). Divide by `scale` only for logical points (UI
-  sizes meant to look the same on every display). The mouse maps with
-  the surface's size now (`window#mouse-and-surface-size`).
+  quarter at scale 2). The scale is the window's, not the surface's:
+  `Surface` has none (its fields are `raw`, `configured`, `width`,
+  `height`, `format`); keep the last `Size`'s `scale` (`win.size()`,
+  then each `Resize`'s) beside the surface, and divide by it only for
+  logical points (UI sizes meant to look the same on every display). The
+  mouse maps with the surface's size now (`window#mouse-and-surface-size`).
 - **Frames when the window is not shown** (0.25.2.1) come from a
   10 Hz timer: their times are not the program's
   (`window#when-the-window-is-not-shown`).
@@ -99,10 +102,14 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var surf = inst.surface(dev, RawSurface::MetalLayer(win.raw_surface()))?;
     let px = win.size(); // the size now: stale after a Resize
     surf.configure(dev, px.w, px.h);
+    var scale = px.scale; // the window's; a Surface has no scale
     var down = false;
     loop {
         match app.wait() {
-            Ok(Event::Resize(_, s)) => surf.configure(dev, s.w, s.h), // surf.width, .height follow
+            Ok(Event::Resize(_, s)) => {
+                surf.configure(dev, s.w, s.h); // surf.width, .height follow
+                scale = s.scale;
+            }
             Ok(Event::Mouse(m)) => {
                 if m.button == Button::Left && m.action != MouseAction::Move {
                     down = m.action == MouseAction::Press;
@@ -113,7 +120,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
                     let cy = (m.y / surf.height as f64 * GRID) as i64;
                     let nx = 2.0 * m.x / surf.width as f64 - 1.0;
                     let ny = 1.0 - 2.0 * m.y / surf.height as f64;
-                    println(f"cell {cx} {cy}, shader {nx:.2} {ny:.2}");
+                    let pt = m.x / scale; // logical points, for UI sizes
+                    println(f"cell {cx} {cy}, shader {nx:.2} {ny:.2}, x {pt:.0} pt");
                 }
             }
             Ok(Event::Close(_)) | Ok(Event::Quit) => break,
@@ -187,4 +195,63 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 ```
 ```out
 200 frames timed: true
+```
+
+## Checking the pixels headless
+
+A windowed program's pixels can be checked without a window: give it a
+`--headless` mode that draws its final frame with the same code into a
+`RawSurface::Headless` surface (frames, no window), copies the frame's
+texture into a `MAP_READ | COPY_DST` buffer (rows 256-byte aligned),
+optionally draws the overlay first (`gpu-render#drawing-over-the-image-you-just-made`),
+and then compares pixels or writes a PPM to look at (`sips -s format png
+shot.ppm --out shot.png` on macOS makes an image a viewer opens). The
+worked example is examples/gpu/pathtrace: `--headless --ui --size
+1280x720 --out panel.ppm` draws the panel over the final frame through
+the window's own UI pipeline (`--ui-scale 2` for a Retina layout), and
+its case in tests/examples checks it.
+
+```vole
+use std::{fs, gpu};
+use std::gpu::{BufferUsage, Color, Format, PassDesc, RawSurface, TextureView};
+
+// The frame's drawing, shared with the window's Event::Frame: here a
+// clear; in a program its scene passes, then the overlay.
+fn draw(dev: gpu::Device, queue: inout gpu::Queue, view: TextureView) {
+    var enc = dev.encoder();
+    enc.render_pass(PassDesc::color(view, clear: Color::rgba(1.0, 0.5, 0.0, 1.0)), |_| {});
+    queue.submit(enc.finish());
+}
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let (w, h) = (64, 32);
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    var surf = inst.surface(dev, RawSurface::Headless)?; // frames, no window
+    surf.configure(dev, w, h, format: Format::Bgra8Unorm, vsync: false);
+    let frame = surf.frame()?;
+    draw(dev, &queue, frame.texture.view());
+    let stride = (w * 4 + 255) / 256 * 256; // rows 256-byte aligned
+    var readback = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(frame.texture, readback, stride);
+    queue.submit(enc.finish());
+    frame.present(&queue);
+    let px = readback.map_read(dev); // B, G, R, A a pixel
+    var ppm = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * stride + x * 4;
+            ppm.push(px[p + 2]);
+            ppm.push(px[p + 1]);
+            ppm.push(px[p]);
+        }
+    }
+    let ok = fs::write("shot.ppm", ppm.as_slice()).is_ok(); // open it, or compare
+    println(f"rgb {px[2]} {px[1]} {px[0]}, wrote shot.ppm: {ok}");
+    Ok(())
+}
+```
+```out
+rgb 255 128 0, wrote shot.ppm: true
 ```
