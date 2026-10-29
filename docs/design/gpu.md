@@ -179,7 +179,17 @@ COPY_SRC)`.
   on each `set*`.
 - **Mapped ranges are views** (0.17 §2.4). `map_read` is
   `#[views(self)]`: the slice points into the buffer, and the buffer is
-  borrowed while it lives.
+  borrowed while it lives. (0.25.3) The borrow alone left a hole: a copy
+  takes its destination as a `let` parameter, a read of the buffer, so
+  a copy into a buffer whose view was alive was accepted and the GPU
+  changed the view. As in wgpu, `map_read` now leaves the buffer mapped
+  until `unmap` (which takes it `inout`, so not while a view lives), in
+  a state byte kept in the native buffer past its bytes, which the
+  handles recorded commands keep see: a copy into a mapped buffer is
+  `gpu.state` when recorded, or at `queue.submit` when recorded before
+  the map. WebGPU's usage rule (`MAP_READ` with `COPY_DST` alone,
+  `MAP_WRITE` with `COPY_SRC` alone) keeps every GPU use of a mappable
+  buffer a copy, so the copies are all the encoder records.
 - **Passes are closure-scoped views.** A view type may not implement
   `Drop` (0.17 §2.2), so "end the pass when it goes out of scope" cannot
   be a destructor. `enc.render_pass(&desc, |pass| ...)` begins the pass,
@@ -1097,8 +1107,9 @@ compiler's other outputs in 0.22.x.
     cannot outlive the `Id` it came from; autoreleased results view the
     receiver they came from.
   - `map_read(&mut self, &dev) -> [u8]` and `map_write(..) -> &mut [u8]`
-    are views of the buffer; `unmap(&dev)` ends a map_write (a no-op on
-    Metal's shared memory, a copy on a discrete-memory backend).
+    are views of the buffer; `unmap(&dev)` ends a mapping (on Metal's
+    shared memory it clears the map state, 0.25.3; a copy on a
+    discrete-memory backend).
   - Surfaces: `inst.surface(&dev, RawSurface::MetalLayer(p))` for
     std::window's layer, `RawSurface::Headless` for an unattached layer
     (tested: frames taken, drawn, read back, presented).
