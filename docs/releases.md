@@ -225,6 +225,32 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   their summary line); an agent's own `volec fmt` gets the lines it
   changed (from `volec query diff`, at most 5). The hook itself formats
   nothing.
+- **The guide's gaps from the round 3 GPU eval** (eight that cost
+  agents turns), each with a compiled example: `guide gpu` opens with
+  a skeleton (the window loop, a compute pass, a render pass, a
+  readback through a `MAP_READ | COPY_DST` buffer) and a list of its
+  sections, the rest a section at a time (`guide gpu#NAME`) or
+  `--whole`. `gpu#handles`, where own.moved and own.move_out point:
+  which std::gpu objects move and which copy, keeping them in a struct
+  made by a `sink` constructor, a `Vec` or an array, using them in a
+  pass's closure, one of two by a flag. `gpu#ordering`: the dispatches
+  of one pass run in order, each seeing the writes of the ones before
+  (Metal's serial compute encoder; no barrier), with the cost of a
+  pass and a submit. `gpu#ping-pong`: two buffers, two bind groups, the
+  parity, every step in one pass, the state in the buffer written
+  last. `gpu#per-step-parameters`: why one uniform cannot vary across
+  the steps of one submit, and three ways with their costs (a submit a
+  step; a uniform range a step; a storage buffer of parameters indexed
+  by a step the GPU counts). `window#mouse-and-surface-size`: map the
+  mouse with `surf.width` and `.height`, which `configure` at each
+  `Resize` sets, never a size taken at the start.
+  `window#when-the-window-is-not-shown`: the 10 Hz timer's frames, and
+  timing headless instead (submit N, `wait_idle`, divide: throughput,
+  not latency). `text#string-constants`: `const X: [u8]`, `static X:
+  str`, `static X: [str; N]`, text blocks and `include_str`; what
+  `as_slice`, `as_bytes`, `format_in` and `extend_from_slice` turn
+  into what; what `panic` and `println` take. compiler/guide/embed.sh
+  writes a topic of more than 990 lines as several functions.
 
 ### What's new in 0.25.2.2
 
