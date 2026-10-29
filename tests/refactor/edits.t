@@ -66,7 +66,7 @@ $ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.vl
 +        self.y + self.x
 geom.vl:20:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
 geom.vl:20:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
-warning edit.breaks: 2 new errors (dry run)
+warning edit.breaks: 2 new errors (dry run); the first: geom.vl:20:9: access to a field through a raw pointer is unsafe: `self` is a `*T` parameter
 [exit 1]
 ## The text as `query show` prints it: its header line is dropped.
 $ edit replace geom::scale --dry-run < $T/inputs/scale_shown.vl
@@ -95,7 +95,7 @@ $ edit insert --before Point::sum --dry-run < $T/inputs/diag.vl
 +
 geom.vl:19:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
 geom.vl:19:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
-warning edit.breaks: 2 new errors (dry run)
+warning edit.breaks: 2 new errors (dry run); the first: geom.vl:19:9: access to a field through a raw pointer is unsafe: `self` is a `*T` parameter
 [exit 1]
 ## Deleting: an item with one blank line; a variant of a one-line enum;
 ## a field (the struct literals need it: refused).
@@ -117,7 +117,7 @@ main.vl:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate:
 geom.vl:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
 geom.vl:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
 geom.vl:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
-error edit.breaks: 5 new errors (5 in crate::main, crate::geom::area, crate::geom::scale and 1 more, which the edit does not change); nothing written
+error edit.breaks: 5 new errors (5 in crate::main, crate::geom::area, crate::geom::scale and 1 more, which the edit does not change); nothing written; the first: main.vl:13:27: unknown field 'y' in struct 'Point'
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec query refs crate::geom::Point.y
 note edit.together: change crate::main, crate::geom::area, crate::geom::scale and 1 more in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -127,7 +127,7 @@ try: volec edit delete Point.y --no-check
 ## An edit that adds an error writes nothing (--dry-run says so too).
 $ edit replace geom::area < $T/inputs/area_bool.vl
 main.vl:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
-error edit.breaks: 1 new error (1 in crate::total, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::total, which the edit does not change); nothing written; the error: main.vl:9:5: expected 'i64', got 'bool'
 note edit.together: change crate::total in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::total
 try: volec edit replace geom::area --no-check
@@ -143,7 +143,7 @@ $ edit replace geom::area --dry-run < $T/inputs/area_bool.vl
 +pub fn area(p: Point) -> bool {
 +    p.x > p.y
 main.vl:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
-warning edit.breaks: 1 new error (1 in crate::total, which the edit does not change) (dry run)
+warning edit.breaks: 1 new error (1 in crate::total, which the edit does not change) (dry run); the error: main.vl:9:5: expected 'i64', got 'bool'
 [exit 1]
 ## NAME must name one definition; replace needs its text on stdin.
 $ edit delete area
@@ -177,7 +177,7 @@ error undo.empty: no edit to undo
 $ edit delete shapes::area --no-check
 main.vl:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
 deleted crate::shapes::area	shapes.vl	+0 -4 lines
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check); the error: main.vl:15:27: no 'area' in module 'shapes'
 try: volec check
 $ check
 main.vl:15:27: error[type error] no 'area' in module 'shapes'

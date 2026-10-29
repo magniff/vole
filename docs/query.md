@@ -599,7 +599,9 @@ crate::total→alloc(Gpa) panic
 ## unsafe (0.25.3)
 
 `unsafe [FILE...|DIR|std]` lists every unsafe site of the program, std's
-too (`--no-std`: the program's only): each `unsafe { }` block, `unsafe
+too (`--no-std`: the program's only; 0.25.5: in the vole repository, std
+as its files have it when they differ from the compiler's, with `note
+check.std-files`, as `check` reads it): each `unsafe { }` block, `unsafe
 fn` and `extern` block (vole has no `unsafe impl`), one line each:
 
 ```
@@ -619,7 +621,9 @@ sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
   before them when the pointer is held in a static, as the compiler's
   tables are), `int-to-ptr`, `c-call(F)`, `unsafe-call(F)`,
   `union-field`, `fn-value`. `none (unneeded)`: a block the checker read
-  with nothing unsafe inside (remove it); `not checked`: code the checker
+  with nothing unsafe inside (remove it: 0.25.5, when there are any, the
+  total line is followed by `try: volec fix --only unneeded-unsafe`);
+  `not checked`: code the checker
   did not reach (a generic function never instantiated); an extern block
   says how many C functions it declares.
 - CLASS: its operations' first in this order: `ffi` (C called, not the

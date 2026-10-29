@@ -65,7 +65,7 @@ debugging print in `clamp`:
 $ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
 >     if x < lo {'
 main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
-error edit.breaks: 1 new error (1 in crate::score, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::score, which the edit does not change); nothing written; the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
 note edit.together: change crate::score in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::score
 try: volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
@@ -85,7 +85,7 @@ $ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}"
 >     if x < lo {' --no-check
 main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
 patched crate::clamp	main.vl	+1 -0 lines
-warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check); the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
 try: volec check
 $ volec query effects score --why io | head -5
 crate::score	io global panic
@@ -113,7 +113,7 @@ allocated (here, an array on the stack). `outliers` would not:
 $ volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 > fn outliers'
 main.vl:89:1: error[effect] 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64> | help: allocate in the caller and pass the memory in, or remove #[no_alloc] | try: volec query effects outliers --why alloc(Gpa)  [edited: crate::outliers]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:89:1: 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64>
 try: volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 fn outliers' --no-check
 [exit 1]
@@ -132,7 +132,7 @@ index instead:
 ```console
 $ volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];'
 main.vl:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:16 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: volec query effects peak --why panic  [edited: crate::peak]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: main.vl:74:1: 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:16 is a checked index
 try: volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];' --no-check
 [exit 1]
 ```

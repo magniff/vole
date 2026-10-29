@@ -34,7 +34,7 @@ $ edit delete f --dry-run --no-check
 -}
 -
 main.vl:6:6: error[type error] undefined variable 'f'  [in crate::main]
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:6:6: undefined variable 'f'
 [exit 1]
 ## A comment after the item on its line is the item's.
 $ edit delete K --dry-run
@@ -44,5 +44,5 @@ $ edit delete K --dry-run
 -const K: i64 = 3; // trailing
 -
 main.vl:10:8: error[type error] undefined variable 'K'  [in crate::main]
-warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run); the error: main.vl:10:8: undefined variable 'K'
 [exit 1]

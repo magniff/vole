@@ -81,7 +81,7 @@ $ volec edit insert --before adler32 <<'EOF'
 inserted before crate::adler::adler32	adler.vl	+3 -0 lines
 $ volec rewrite '65521' 'MOD_ADLER'
 adler.vl:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: adler.vl:4:1: constant 'MOD_ADLER' is defined in terms of itself
 try: volec rewrite 65521 MOD_ADLER --no-check
 [exit 1]
 $ volec rewrite '$e % 65521' '$e % MOD_ADLER' --show

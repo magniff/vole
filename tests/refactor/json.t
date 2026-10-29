@@ -17,7 +17,7 @@ $ query show nosuch --json
 ## An edit's new errors, its refusal, its summary.
 $ edit patch add --old 'a + b' --new 'a + q' --json
 {"kind":"diagnostic","severity":"error","code":"type error","file":"main.vl","line":4,"col":9,"message":"undefined variable 'q'  [edited: crate::add]","help":[],"notes":[],"try":[]}
-{"kind":"diagnostic","severity":"error","code":"edit.breaks","file":null,"line":null,"col":null,"message":"1 new error; nothing written","help":[],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"edit.breaks","file":null,"line":null,"col":null,"message":"1 new error; nothing written; the error: main.vl:4:9: undefined variable 'q'","help":[],"notes":[],"try":[]}
 {"kind":"diagnostic","severity":"note","code":"edit.together","file":null,"line":null,"col":null,"message":"several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check","help":[],"notes":[],"try":["volec edit patch add --old 'a + b' --new 'a + q' --no-check"]}
 [exit 1]
 $ edit patch add --old 'a + b' --new 'b + a' --json

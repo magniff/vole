@@ -106,7 +106,7 @@ $ refactor signature area --type p '*Point' --dry-run
 main.vl:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: volec fix --suggested main.vl  [in crate::main]
 geom.vl:18:5: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
 geom.vl:18:11: error[unsafe] access to a field through a raw pointer is unsafe: `p` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `p` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::area]
-warning edit.breaks: 3 new errors (2 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 3 new errors (2 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: geom.vl:18:5: access to a field through a raw pointer is unsafe: `p` is a `*T` parameter
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
 ## parameter, a parameter still used, a name taken.
@@ -154,7 +154,7 @@ try: volec query def Point
 $ refactor signature area --type p i32
 main.vl:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
 geom.vl:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
-error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written; the first in the edited text: geom.vl:18:5: cannot access field 'x' on type 'i32'
 note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: volec refactor signature crate::geom::area --type p i32 --default EXPR
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -211,7 +211,7 @@ $ refactor field Point --rename y height --dry-run
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
 geom.vl:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::geom::Point::scale]
-error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written; the error: geom.vl:47:27: expected 'i32', got 'i64'
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor field crate::geom::Point --type x i32
 note edit.together: change crate::geom::Point::scale in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -256,7 +256,7 @@ $ refactor field Label --add 'size: i64 = 4' --dry-run
 $ refactor variant Kind --add 'Ring(i64, i64)' --arm 'oops'
 kinds.vl:16:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::weight]
 kinds.vl:39:29: error[type error] undefined variable 'oops'  [edited: crate::kinds::sides]
-error edit.breaks: 2 new errors; nothing written
+error edit.breaks: 2 new errors; nothing written; the first: kinds.vl:16:29: undefined variable 'oops'
 try: volec refactor variant Kind --add 'Ring(i64, i64)' --arm oops --no-check
 [exit 1]
 ## A match without `_` gets an arm (on a line of its own when the arms
@@ -412,7 +412,7 @@ renamed parameter x to n of crate::geom::twice	geom.vl	+2 -2 lines
 changed parameter p to i32 in crate::geom::area	geom.vl	+1 -1 lines
 main.vl:16:18: error[type error] expected 'i32', got 'Point'  [in crate::main]
 geom.vl:18:5: error[type error] cannot access field 'x' on type 'i32'  [edited: crate::geom::area]
-error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 2 new errors (1 in the edited text, 1 in crate::main, which the edit does not change); nothing written; the first in the edited text: geom.vl:18:5: cannot access field 'x' on type 'i32'
 note edit.refactor: the uses of crate::geom::area no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
 try: volec refactor signature crate::geom::area --type p i32 --default EXPR
 try: volec refactor signature crate::geom::twice --rename-param x n
