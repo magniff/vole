@@ -1392,6 +1392,16 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   `check` (and the tests) once; errors or failures block the stop once,
   with `turn-end: unchecked changes in main.vl: 2 errors` and the
   errors as the reason. Never twice for the same sources.
+- (0.25.4) Both hooks first compare the compiler with the checkout's
+  source: when its `--version` is older than compiler/src/main.vl's
+  `version()` (the tools binary right after a release), its errors would
+  be the new release's syntax, so target/volec checks instead when it is
+  current, and otherwise nothing is checked; one line says so, once a
+  session: `note hook.stale-volec: target/tools/volec is 0.25.2.2, older
+  than this tree's 0.25.3 ...` and `try: rm -f target/tools/volec && cp
+  target/bootstrap/HOST/v0.25.3-HASH/volec target/tools/volec` (the
+  release's build in the bootstrap cache; else `bootstrap/bootstrap.sh
+  --dev`).
 - **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
   read of `.vl` source, judging each command of a line on its own (in
   the directory its `cd`s lead to, `$VAR`s assigned on the line

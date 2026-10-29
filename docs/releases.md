@@ -99,6 +99,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   step moved for `$VOLE_GATE_STALL` s; its processes and what they wait
   on go to its log, and they get 10 s after TERM to give their slots
   back. Two self-test rows (`gate.sh --self-test`) pin it.
+- The check and turn-end hooks notice a tools binary older than the
+  tree's source (`volec --version` below compiler/src/main.vl's
+  `version()`): right after 0.25.3 the stop hook reported 16 errors that
+  were 0.25.3's text blocks read by 0.25.2.2. They check with a current
+  target/volec instead, or not at all, and say so in one line
+  (`hook.stale-volec`) with the `try:` that installs the release's build.
 
 ### What's new in 0.25.3
 
