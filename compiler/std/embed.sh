@@ -112,11 +112,11 @@ fi
 lines() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' |
         LC_ALL=C awk '{
-            if (n > 0 && n + length($0) > 2000) { print "        buf_str(out, c\"" acc "\");"; acc = ""; n = 0 }
+            if (n > 0 && n + length($0) > 2000) { print "    buf_str(out, c\"" acc "\");"; acc = ""; n = 0 }
             acc = acc $0 "\\n"
             n += length($0) + 2
         }
-        END { if (n > 0) print "        buf_str(out, c\"" acc "\");" }'
+        END { if (n > 0) print "    buf_str(out, c\"" acc "\");" }'
 }
 # The index of std's text on stdin (index.awk), as lines of code.
 index() {
@@ -132,38 +132,30 @@ index() {
     echo "use crate::front::stdalloc::std_alloc_tail;"
     echo ""
     echo "pub fn std_source(out: i64) {"
-    echo "    unsafe {"
     lines <"$text"
-    echo "    }"
     echo "    std_alloc_tail(out);"
     echo "}"
     echo ""
     echo "// Gpa's implementation (0.16), the end of std's source unless"
     echo "// --check-alloc (front/stdalloc.vl)."
     echo "pub fn std_gpa_source(out: i64) {"
-    echo "    unsafe {"
     lines <compiler/std/gpa.vl
-    echo "    }"
     echo "}"
     echo ""
     echo "// The checking Gpa (0.16), the end of std's source with --check-alloc"
     echo "// (front/stdalloc.vl)."
     echo "pub fn std_check_gpa_source(out: i64) {"
-    echo "    unsafe {"
     lines <compiler/std/alloc_check.vl
-    echo "    }"
     echo "}"
     echo ""
     echo "// (0.20) The end of std's text, after std::CHECK_ALLOC: the target's"
     echo "// system, sys/linux.vl or sys/macos.vl (front/stdalloc.vl), the"
     echo "// same length, std_sys_len bytes, so that one index holds for both."
     echo "pub fn std_sys_source(out: i64, linux: bool) {"
-    echo "    unsafe {"
-    echo "        if linux {"
+    echo "    if linux {"
     lines <compiler/std/sys/linux.vl | sed 's/^/    /'
-    echo "        } else {"
+    echo "    } else {"
     lines <compiler/std/sys/macos.vl | sed 's/^/    /'
-    echo "        }"
     echo "    }"
     echo "}"
     echo ""
@@ -175,32 +167,26 @@ index() {
     echo "// each defines and needs, so that a program's loader lexes only the"
     echo "// sections it can reach (front/modules: load_std_sections)."
     echo "pub fn std_index(out: i64) {"
-    echo "    unsafe {"
     # (0.16: over std_source's whole text, std_alloc_tail's included: Gpa's
     # implementation and CHECK_ALLOC as without --check-alloc)
     { cat "$text"; cat compiler/std/gpa.vl
         echo "pub const CHECK_ALLOC: bool = false;"; cat compiler/std/sys/macos.vl; } | index
-    echo "    }"
     echo "}"
     echo ""
     echo "// (0.16) The index with --check-alloc: std's source ends with the"
     echo "// checking Gpa (alloc_check.vl), CHECK_ALLOC and CHECK_ALLOC_OS (one"
     echo "// digit, so that the index holds for every target)."
     echo "pub fn std_check_index(out: i64) {"
-    echo "    unsafe {"
     { cat "$text"; cat compiler/std/alloc_check.vl
         echo "pub const CHECK_ALLOC: bool = true;"
         echo "const CHECK_ALLOC_OS: i64 = 0;"; cat compiler/std/sys/macos.vl; } | index
-    echo "    }"
     echo "}"
     echo ""
     echo "// (0.20) std's files in std_source's text: a line \`START PATH\` for each"
     echo "// (PATH under compiler/std), in the text's order, then a line with the"
     echo "// end of the last module's text (std_alloc_tail's follows; front/stdtree)."
     echo "pub fn std_files(out: i64) {"
-    echo "    unsafe {"
     lines <"$map"
-    echo "    }"
     echo "}"
 } >"$tmp"
 if [ "${1:-}" = "-c" ]; then

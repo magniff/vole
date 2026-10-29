@@ -21,7 +21,7 @@ import re
 import shlex
 
 SUBCOMMANDS = {"query", "edit", "refactor", "rewrite", "check", "fix", "undo", "fmt",
-               "explain", "guide", "lint", "same-output", "test", "try", "batch"}
+               "explain", "guide", "lint", "same-output", "test", "try", "batch", "run"}
 # Commands that run another command named by their arguments.
 WRAPPERS = {"time", "env", "nice", "command", "exec", "timeout", "gtimeout", "then", "do",
             "else", "if", "while", "until", "!"}
