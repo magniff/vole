@@ -36,7 +36,8 @@
 #   - (0.25.5) with -v stdfiles="std.vl flat/alloc.vl ..." (std's files,
 #     relative to compiler/std: the LSP runner), a position in one of
 #     them as the LSP writes it: `at std.vl:303:37` in a hover, and the
-#     range after a `.../std-@STD@/FILE.vl` uri.
+#     range after a `.../std-@STD@/FILE.vl` uri, and the answer's own
+#     range (a hover's) to a request about a place in one of them.
 # A program's own positions are left as they are. `$ ` and `% ` lines
 # (the commands) are never changed.
 #
@@ -114,7 +115,13 @@ BEGIN { if (mode == "") mode = "norm"; changed = 0 }
         }
     }
     line = file_std(inline_std(line))
-    if (stdfiles != "") line = lsp_std(line)
+    if (stdfiles != "") {
+        # (a request about a place in std's files: its answer's own range,
+        # a hover's, is in that file too)
+        if (line ~ /^> /) stdreq = (line ~ /"textDocument":\{"uri":"[^"]*\/std-@STD@\//)
+        line = lsp_std(line)
+        if (stdreq && line ~ /^< /) line = lsp_own(line)
+    }
     emit(line)
 }
 
@@ -147,6 +154,19 @@ function lsp_std(s,    out, pre, m, k, rest, n, i, names) {
         k = index(m, "\"range\"")
         rest = substr(m, k)
         out = out pre substr(m, 1, k - 1) lsp_range(rest)
+    }
+    return out s
+}
+
+# The ranges of s without a uri before them (`},"range":{...}`: a hover's).
+function lsp_own(s,    out, at, len) {
+    out = ""
+    while (match(s, /\},"range":\{"start":\{"line":[0-9]+,"character":[0-9]+\},"end":\{"line":[0-9]+,"character":[0-9]+\}/)) {
+        # (lsp_range matches too: RSTART and RLENGTH kept first)
+        at = RSTART
+        len = RLENGTH
+        out = out substr(s, 1, at + 1) lsp_range(substr(s, at + 2, len - 2))
+        s = substr(s, at + len)
     }
     return out s
 }

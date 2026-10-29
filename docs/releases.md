@@ -93,7 +93,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   NAME ...` for the failing cases.
 - Transcripts a std change does not rewrite: std's list of modules (as
   `query items` prints it) compares as one line; the LSP sessions compare
-  std's positions normalized; every runner's `-u` keeps the std numbers
+  std's positions normalized, and a request about a place in std's
+  files names its line by its text (`"line":@LINE:std.vl:TEXT@`);
+  every runner's `-u` keeps the std numbers
   of a line that did not change otherwise (tests/stdkeep.sh);
   views017 asks for its items by path. `tests/stdpos/run.sh --real`
   adds a function at the top of a std file and a std module, rebuilds,

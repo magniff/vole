@@ -80,7 +80,20 @@ rows I could normalize in stdpos.awk; name searches I could not (no
 queries to paths. The Vec instantiation rows still list std's own
 (`Vec<JobBuffer, ScopedArena>::get`). About 3 turns reading transcripts.
 
-### 5. Python's `hash()` is not stable across processes
+### 5. The LSP session asks about a place in std.vl by its number
+
+`tests/stdpos/run.sh --real` (the dummy std change) failed once on
+resolve.lsp: its hover and definition requests name `std.vl` line 284,
+which a new module line moves, and the hover's answer (a range with no
+uri before it) was not normalized. Fixed with `@LINE:std.vl:TEXT@` in the
+request (the runner finds the line) and the answer's own range normalized
+after a request about std's files. A loop in the new awk function (it
+called a function that runs `match` and then used RSTART) hung the
+check once. Two rounds of --real, about 10 minutes each under a load of
+35. Would save it: the dummy std change in the brief's first steps, not
+the last.
+
+### 6. Python's `hash()` is not stable across processes
 
 My first cache key for the hook's system-file comparison used `hash(text)`,
 which PYTHONHASHSEED randomizes per process: the cache never hit. Caught
