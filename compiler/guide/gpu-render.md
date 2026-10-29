@@ -57,16 +57,18 @@ texture of one mip level, or code outside uniform control flow); an
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, SamplerDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const QUAD: [u8] = "struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
-    @group(0) @binding(0) var t: texture_2d<f32>;\n\
-    @group(0) @binding(1) var s: sampler;\n\
-    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
-    return VOut(vec4<f32>(pos, 0.0, 1.0), uv);\n\
-    }\n\
-    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
-    let r = textureSampleLevel(t, s, v.uv, 0.0).r;\n\
-    return vec4<f32>(r, r, r, 1.0);\n\
-    }";
+const QUAD: [u8] = r"""
+    struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+    @group(0) @binding(0) var t: texture_2d<f32>;
+    @group(0) @binding(1) var s: sampler;
+    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {
+        return VOut(vec4<f32>(pos, 0.0, 1.0), uv);
+    }
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {
+        let r = textureSampleLevel(t, s, v.uv, 0.0).r;
+        return vec4<f32>(r, r, r, 1.0);
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
@@ -126,20 +128,22 @@ same order (`RenderDesc::new`'s format is target 0, then
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
 
-const GBUFFER: [u8] = "struct G {\n\
-    @location(0) albedo: vec4<f32>,\n\
-    @location(1) normal: vec4<f32>,\n\
-    @location(2) depth: f32,\n\
-    }\n\
-    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
-    var p = vec2<f32>(-1.0, -1.0);\n\
-    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
-    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
-    return vec4<f32>(p, 0.25, 1.0);\n\
-    }\n\
-    @fragment fn fs(@builtin(position) pos: vec4<f32>) -> G {\n\
-    return G(vec4<f32>(1.0, 0.5, 0.0, 1.0), vec4<f32>(0.0, 0.0, 1.0, 1.0), pos.z);\n\
-    }";
+const GBUFFER: [u8] = r"""
+    struct G {
+        @location(0) albedo: vec4<f32>,
+        @location(1) normal: vec4<f32>,
+        @location(2) depth: f32,
+    }
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+        var p = vec2<f32>(-1.0, -1.0);
+        if (i == 1u) { p = vec2<f32>(3.0, -1.0); }
+        if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }
+        return vec4<f32>(p, 0.25, 1.0);
+    }
+    @fragment fn fs(@builtin(position) pos: vec4<f32>) -> G {
+        return G(vec4<f32>(1.0, 0.5, 0.0, 1.0), vec4<f32>(0.0, 0.0, 1.0, 1.0), pos.z);
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
@@ -198,9 +202,11 @@ with a comparison sampler); it needs `TEXTURE_BINDING` for that.
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const SHADOW: [u8] = "@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {\n\
-    return vec4<f32>(p, 1.0);\n\
-    }";
+const SHADOW: [u8] = r"""
+    @vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
+        return vec4<f32>(p, 1.0);
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);

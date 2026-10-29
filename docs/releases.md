@@ -152,6 +152,34 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   file` with `try: volec main.vl -o x` (`cli.not-a-command`); `run` gives
   `volec main.vl -o main && ./main`, a near-miss of a command (`chek`)
   that command.
+- **Text blocks**: `"""` ending its line opens a string literal of
+  several lines, a line holding only blanks and `"""` closes it, and the
+  closing line's indentation is removed from every line (a line
+  indented less is `lex.text-block-indent`, whose fix `volec fix
+  --suggested` makes). Escapes work as in `"..."`, a `\` at a line's end
+  joins it to the next; `r"""` is a raw block, without escapes (WGSL,
+  regular expressions), and `r#"""` .. `"""#` holds a line starting
+  with `"""`. A text block is a string literal (`[u8]`, `str`, in a
+  `const` or `static`); `volec fmt` keeps its lines; a CRLF file's line
+  breaks are `\n` in the value. New codes: `lex.text-block-open`,
+  `lex.text-block-indent`, `lex.text-block-unterminated` (`volec
+  explain`). docs/grammar.md, "Text blocks"; `guide syntax`.
+- **`include_str("shader.wgsl")` and `include_bytes("font.bin")`**: a
+  file's contents as a string literal, read at compile time, the path
+  relative to the file holding the call (Rust's `include_str!(..)` is
+  the same call). include_str's file must be UTF-8 (`embed.utf8`, fixed
+  to include_bytes by `fix --suggested`); include_bytes' value is a
+  `[u8]` whatever its bytes. A missing file is `embed.missing` (naming
+  the path it tried), a path that is not a literal `embed.path`. The
+  embedded files are inputs of the build: the tools' cache holds only
+  while each has the bytes it had, and the code cache rebuilds what a
+  change changes (tests/embed/run.sh, the `embed-checks` suite). The
+  language server's go to definition on the call opens the file.
+- **The examples**: examples/gpu's shaders are raw text blocks (fluid2d,
+  galaga, galaxy, life) or `.wgsl` files read by `include_str`
+  (pathtrace, voxel), their output unchanged; voltty's shader is
+  `include_str("cells.wgsl")`, and `render/embed.sh`, which made it a
+  constant, is gone. The guide's GPU programs use text blocks.
 
 ### What's new in 0.25.2.2
 

@@ -14,7 +14,9 @@
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
 # (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
-# and tests/runner/run.sh (the runner's own pieces, 0.25.2). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# and tests/runner/run.sh (the runner's own pieces, 0.25.2) and
+# tests/embed/run.sh (text blocks in a CRLF file, the caches and embedded
+# files, 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [FILTER...]
 #
@@ -250,7 +252,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -909,6 +911,11 @@ esac
 case $(want std-moves) in
     y) sh "$ROOT/tests/std/moves.sh" -c "$COMPILER" >"$WORK/std-moves.out" 2>&1 & ;;
 esac
+# (0.25.3) Text blocks in a CRLF file and the caches seeing an embedded
+# file change (tests/embed/run.sh): category "embed-checks".
+case $(want embed-checks) in
+    y) sh "$ROOT/tests/embed/run.sh" -c "$COMPILER" >"$WORK/embed-checks.out" 2>&1 & ;;
+esac
 # (0.25.2) The runner's own pieces (tests/runner/run.sh: the EXPECT holes,
 # the golden-image comparison, the directives): category "runner".
 case $(want runner) in
@@ -1070,6 +1077,25 @@ case $(want runner) in
             { echo "FAIL runner: tests/runner/run.sh reported nothing:"; sed 's/^/    /' "$WORK/runner.out" | head -20; echo; } >>"$FAILURES"
         fi
         grep '^FAIL' "$WORK/runner.out" >>"$FAILURES"
+        ;;
+esac
+
+# Text blocks and embedded files (0.25.3, run above); category
+# "embed-checks".
+case $(want embed-checks) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "embed-checks pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "embed-checks fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/embed-checks.out"
+        if ! grep -q '^pass' "$WORK/embed-checks.out"; then
+            echo "embed-checks fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL embed-checks: tests/embed/run.sh reported nothing:"; sed 's/^/    /' "$WORK/embed-checks.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/embed-checks.out" >>"$FAILURES"
         ;;
 esac
 

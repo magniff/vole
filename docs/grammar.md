@@ -34,6 +34,46 @@ escape       = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\'"
              | "\u{" hex { hex } "}" ;                 (* UTF-8 encoded; ASCII only in char_lit *)
 ```
 
+**Text blocks** *(0.25.3)*: string literals of several lines.
+
+```ebnf
+text_block   = '"""' blanks "\n" { line } indent '"""' ;
+raw_block    = "r" hashes '"""' blanks "\n" { line } indent '"""' hashes ;
+hashes       = { "#" } ;                               (* as many after the closing """ as after the r *)
+blanks       = { " " | "\t" } ;
+line         = { any - "\n" } "\n" ;                   (* not a closing line: indent '"""' [hashes] *)
+indent       = blanks ;                                (* the closing line's indentation *)
+include      = ( "include_str" | "include_bytes" ) [ "!" ] "(" string_lit [ "," ] ")" ;
+```
+
+- `"""` opens a text block when only blanks follow it on its line; the
+  first line whose first non-blank bytes are the closing delimiter
+  (`"""`, then the raw block's `#`s) closes it, and tokens may follow
+  the delimiter on that line (`""";`).
+- The closing line's indentation is removed from every line; a line
+  that does not begin with it, byte for byte, is the error
+  `lex.text-block-indent` (its fix indents the line), but for a line of
+  blanks only, which may be shorter (it is then empty). The line break
+  after the opening line and the one before the closing line are not
+  in the value; every other line break is `\n`, a CRLF file's too.
+- In a text block the escapes are `escape`'s, and a `\` at the end of
+  a line joins it to the next (no line break; the next line's
+  indentation is removed as any line's). `\"""` writes three quotes. A
+  raw block (`r"""`) has no escapes: every byte stands for itself; a
+  line starting with `"""` goes in a block with `#`s (`r#"""` ..
+  `"""#`).
+- A text block is a `string_lit` token: a `[u8]`, or a `str` where one
+  goes, in a `const` or `static` too. `volec fmt` keeps its text, the
+  closing delimiter's indentation included (it is part of the value).
+- `include_str("p")` and `include_bytes("p")` (an expression, the names
+  built in) are the contents of file `p`, relative to the directory of
+  the file holding the call, read when the program is compiled:
+  include_str's a string literal (UTF-8, else `embed.utf8`),
+  include_bytes' a `[u8]` literal. A file that cannot be read is
+  `embed.missing`, a path that is not a string literal `embed.path`.
+  The files are inputs of the build: the tools' cache and the code
+  cache see them change.
+
 `_` may separate digits (`1_000_000`, `255_u8`). After `.`, digits are a
 tuple index, so `t.0.1` is `(t.0).1`. A literal must not be followed
 directly by other letters (`3e` and `1foo` are errors).

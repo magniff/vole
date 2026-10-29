@@ -127,8 +127,9 @@ there are deliberately no fabricated BVH counters.
   `Renderer::redraw`, which does not add or invalidate a sample. Camera,
   material, light, GI, fog and resize changes reset it.
 
-All host-side application and state logic is Vole. WGSL is embedded in
-`shaders.vl` because that is the current `std::gpu::shader_wgsl` workflow. Live
+All host-side application and state logic is Vole. The WGSL is in
+`trace.wgsl` and `display.wgsl`, embedded at compile time by `include_str` in
+`shaders.vl` and compiled at run time by `std::gpu::shader_wgsl`. Live
 editing is not included: the API can compile WGSL at runtime, but a shader text
 editor is outside this example's core renderer.
 
@@ -179,7 +180,9 @@ command above for local numbers.
 | [main.vl](main.vl) | CLI, native window, controls, pause/reset policy and dashboard |
 | [state.vl](state.vl) | Vole material/light/camera state, bounded controls and unit tests |
 | [render.vl](render.vl) | `std::gpu` resources, uniform packing, dispatch and presentation |
-| [shaders.vl](shaders.vl) | WGSL integrator, media, G-buffer, accumulation and display |
+| [shaders.vl](shaders.vl) | the two shaders, `include_str` of the `.wgsl` files |
+| [trace.wgsl](trace.wgsl) | WGSL integrator, media, G-buffer and accumulation |
+| [display.wgsl](display.wgsl) | WGSL tone mapping and display |
 | [check.vl](check.vl) | headless readback checks, PPM output and steady-state benchmark |
 
 On macOS the current backend is Metal. No additional frameworks, assets or link

@@ -47,13 +47,6 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-voltty-render.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
-# render/cells.vl is render/cells.wgsl's text (render/embed.sh)
-if "$ROOT/examples/voltty/render/embed.sh" --check; then
-    echo "pass voltty_render_cells_embedded"
-else
-    echo "FAIL voltty_render_cells_embedded: run examples/voltty/render/embed.sh"
-fi
-
 if ! (cd "$ROOT" && "$COMPILER" -O2 tests/voltty-render/main.vl -o "$WORK/prog") \
         >"$WORK/build.out" 2>&1; then
     echo "FAIL voltty_render_build:"
