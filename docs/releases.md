@@ -317,6 +317,23 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   twice). Fuzzed: semfuzz's `--closure-params` (in the gate's
   `fuzz-sem`) and the argument sweep's `own_arg_temp_sweep_closure`
   (1,680 cases); 12 XFAILs (the leaks, `|d: sink D|`) now pass.
+- **volec's command line on 0.25.2's std::cli**: the compiler is built by
+  0.25.2.2, so the workarounds of compiler/src/cli/ for 0.25.1's std::cli
+  are gone (line.vl 608 lines to 425): the line's words go to std::cli
+  as they are, the order of different options' values is
+  `Matches::indices_of`, a word starting with `-` that is no option is a
+  word by `allow_hyphen_values`, `--overlay PATH COPY`, `--rename A B`,
+  `--subst P R` take `num_values(2)`, probe's words after `--` are
+  `last`, a build's `--stats` and `--print-checks` `default_missing`,
+  and the editing commands' shared options `edit`'s `global` ones.
+  Messages, `try:` lines and exit statuses are as before
+  (tools/cli-compat.py: 0 differences on 1,438 command lines but `-O3`
+  of `probe` and `test`), with the rules of every other option: `-O3` is
+  `-O 3` (`-O takes 0, 1 or 2, not '3'`; probe took it and failed
+  later), `-Iinc`, `-j2` are `-I inc`, `-j 2`, a cluster `-in` of
+  `query grep` is `-i -n`, and `--rename=A B` is `--rename A B`.
+  docs/design/cli.md, "0.25.3", lists what std::cli still has no rule
+  for and volec keeps.
 
 ### What's new in 0.25.2.2
 
