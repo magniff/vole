@@ -103,7 +103,8 @@ never the whole suite or a gate unless its task says so**:
    stays the last build whose suite passed). After an edit: the check
    hook's errors (or `target/volec check`), then only the cases the
    change concerns: `tests/run.sh FILTER...` (names containing a
-   FILTER; `=NAME` one name; `-f FILE` a list; `-l` lists them), or
+   FILTER; `-n NAME` or `'=NAME'` one name, quoted: zsh expands a bare
+   `=NAME` and nothing runs; `-f FILE` a list; `-l` lists them), or
    `tests/affected.sh -O 2` for what the branch touches so far.
 2. **Before reporting (agent):** `tools/premerge.sh` (prints `premerge:
    ok`) and `tests/affected.sh`: the tests `tests/affected.map` names for
@@ -126,7 +127,8 @@ never the whole suite or a gate unless its task says so**:
    "The gate").
 
 A test that fails in the plan is yours until shown otherwise: rerun it
-alone (`tests/run.sh =NAME`) before calling it load or inherited.
+alone (`tests/run.sh -n NAME`, or `'=NAME'` quoted) before calling it
+load or inherited.
 
 ## Before you commit, before a merge
 

@@ -273,6 +273,11 @@ def main():
         # the new release's syntax as errors: target/volec when current,
         # else no check; said once a session (the check hook's state)
         compiler, stale = cae.current_compiler(compiler, cwd, st)
+        # (0.25.5) and one whose built-in std is not the tree's, which it
+        # cannot read (check-after-edit.py: current_std)
+        if compiler:
+            compiler, stale_std = cae.current_std(compiler, root, st)
+            stale = "\n".join(t for t in (stale, stale_std) if t)
         if not compiler:
             if stale:
                 reports.append(f"turn-end: {os.path.basename(root)} not checked\n{stale}")

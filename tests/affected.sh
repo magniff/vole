@@ -149,10 +149,37 @@ awk -v changed="$WORK/changed" '
         }
     }' "$MAP" >"$WORK/rules"
 
-# The command of a `cmd NAME ...` line, with @C the compiler.
+# (0.25.5) The newest release built in a bootstrap cache (this tree's,
+# the main checkout's), not HEAD's own: what the gate's compile-cost row
+# compares with; empty when none is built.
+previous_release() {
+    head=$(git rev-parse HEAD 2>/dev/null | cut -c1-12)
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    caches="$ROOT/target/bootstrap"
+    [ -z "$common" ] || caches="$caches $(dirname "$common")/target/bootstrap"
+    found=""
+    for tag in $(sh bootstrap/release-tags.sh 2>/dev/null); do
+        for b in $caches; do
+            for p in "$b"/*/"$tag"-*/volec; do
+                [ -x "$p" ] || continue
+                case "$p" in *-"$head"/volec) continue ;; esac
+                found=$p
+            done
+        done
+    done
+    echo "$found"
+}
+PREVIOUS=""
+
+# The command of a `cmd NAME ...` line, with @C the compiler and (0.25.5)
+# @P the previous release (previous_release).
 map_cmd() {
+    if [ -z "$PREVIOUS" ] && grep -q "^cmd $1 .*@P" "$MAP"; then
+        PREVIOUS=$(previous_release)
+        PREVIOUS=${PREVIOUS:-none}
+    fi
     awk -v n="$1" '$1 == "cmd" && $2 == n { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }' "$MAP" \
-        | sed "s|@C|$COMPILER|g"
+        | sed "s|@C|$COMPILER|g; s|@P|$PREVIOUS|g"
 }
 
 # A case's filter from its file: tests/run/X.vl is =X, tests/run/D/... is
@@ -341,8 +368,16 @@ while read -r c; do
     echo "==> $c" >&2
     t0=$(date +%s)
     # shellcheck disable=SC2086
-    if sh $c >"$WORK/cmd.out" 2>&1; then
+    sh $c >"$WORK/cmd.out" 2>&1
+    rc=$?
+    if [ $rc = 0 ]; then
+        # (0.25.5: the compile-cost row's lines, its ratios)
+        case "$c" in *compile_cost.sh*) cat "$WORK/cmd.out" ;; esac
         result PASS "$c" $(( $(date +%s) - t0 ))
+    elif [ $rc = 77 ]; then
+        # (0.25.5: a command that cannot run here, said why: compile-cost
+        # without a release built, or /usr/bin/time -l)
+        result SKIP "$c: $(tail -1 "$WORK/cmd.out")" $(( $(date +%s) - t0 ))
     else
         tail -20 "$WORK/cmd.out"
         result FAIL "$c" $(( $(date +%s) - t0 ))
@@ -355,7 +390,12 @@ if [ $LINUX = 1 ] && [ -s "$WORK/plan" ]; then
         --slice "$(tr '\n' ' ' <"$WORK/plan")" --slice-levels "$LEVELS" >"$WORK/linux.log" 2>&1; then
         result PASS "aarch64-linux: $(grep -c '^gate-row.*pass' "$WORK/linux.log") rows" $(( $(date +%s) - t0 ))
     else
-        grep -E '^(FAIL|XPASS) |^gate-row|^--- ' "$WORK/linux.log" || tail -40 "$WORK/linux.log"
+        # (0.25.5) each failure with its difference (its indented lines, at
+        # most 30 of each, 300 in all), not only its name (mod254 #13)
+        awk '/^(FAIL|XPASS) / { p = 1; k = 0; print; next }
+            p && (/^[ \t]/ || /^$/) { if (++k <= 30 && ++n <= 300) print; else if (k == 31) print "    (more lines cut)"; next }
+            { p = 0 }
+            /^gate-row|^--- / { print }' "$WORK/linux.log" | grep . || tail -40 "$WORK/linux.log"
         result FAIL "aarch64-linux: $(grep -c '^FAIL ' "$WORK/linux.log") failed" $(( $(date +%s) - t0 ))
     fi
 fi

@@ -17,7 +17,8 @@
 #   $ ARGS    runs `volec ARGS` there (ARGS are evaluated by the shell:
 #             `< $T/inputs/x.vl` gives stdin from tests/refactor/inputs)
 #   % CMD     runs shell command CMD there (`cat geom.vl`, to see what
-#             an edit wrote)
+#             an edit wrote; 0.25.5: a bare `volec` in it is the
+#             compiler under test, first in PATH)
 # the lines after it, up to the next `$` or `%` line, are its output:
 # stdout, then stderr, then `[exit N]` when N is not 0. The compiler's
 # path is written `volec`, the copy's `WORK`, the shell's own errors'
@@ -71,6 +72,12 @@ unset VOLE_ROOT
 mkdir -p "$WORK/tmp"
 TMPDIR="$WORK/tmp"
 export TMPDIR
+# (0.25.5) a bare `volec` in a `%` line is the compiler under test, first
+# in PATH, not whatever is installed (mod254 #13)
+mkdir -p "$WORK/bin"
+ln -s "$COMPILER" "$WORK/bin/volec"
+PATH="$WORK/bin:$PATH"
+export PATH
 
 # The transcript of test file $1, run in a copy of its program, on stdout;
 # (0.13) with $2 `off`, without the tools' cache, with `cache`, with a
@@ -105,7 +112,7 @@ transcript() {
                 *) eval "$args" >"$WORK/out" 2>"$WORK/err" </dev/null ;;
             esac
             rc=$?
-            cat "$WORK/out" "$WORK/err" | sed -e "s|$COMPILER|volec|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g" \
+            cat "$WORK/out" "$WORK/err" | sed -e "s|$WORK/bin/volec|volec|g" -e "s|$COMPILER|volec|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g" \
                 -e "s|^$0: |tests/refactor/run.sh: |"
             [ $rc -eq 0 ] || echo "[exit $rc]"
         )
@@ -145,7 +152,12 @@ for file in "$HERE"/*.t; do
     transcript "$file" $mode >"$WORK/$name.got"
     grep -v '^##' "$file" >"$WORK/$name.want"
     if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
-        # (each comment stays before the command it was before)
+        # (each comment stays before the command it was before; 0.25.5: a
+        # line that differs only in std's numbers kept, tests/stdkeep.sh)
+        if ! grep -q '^## exact-std' "$file"; then
+            sh "$ROOT/tests/stdkeep.sh" "$WORK/$name.want" "$WORK/$name.got" >"$WORK/$name.kept"
+            cp "$WORK/$name.kept" "$WORK/$name.got"
+        fi
         awk 'NR == FNR {
                 if ($0 ~ /^##/) { pending = pending $0 "\n" }
                 else if ($0 ~ /^[$%] /) { before[++n] = pending; pending = "" }

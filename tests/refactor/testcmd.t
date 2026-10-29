@@ -14,6 +14,17 @@ FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a tim
   trace: main.vl:12 main
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
+## (0.25.5) $VOLE_TEST_CASE_TIMEOUT: the time limit's default (a runner's
+## on a loaded machine); --timeout overrides it
+% VOLE_TEST_CASE_TIMEOUT=1 volec test hang
+test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
+FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
+  trace: main.vl:12 main
+(outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
+[exit 1]
+% VOLE_TEST_CASE_TIMEOUT=30 volec test hang --timeout 1 | head -2
+test main.vl: 0 passed, 1 failed (1 case; -O0 and -O2 agree)
+FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
 ## filters: cases whose name contains one of them
 $ test ok exit
 test main.vl: 2 passed (2 cases; -O0 and -O2 agree)

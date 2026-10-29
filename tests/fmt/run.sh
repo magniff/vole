@@ -19,7 +19,9 @@
 #   compiles    every program of the corpus (tests/run, examples, bench,
 #               compiler/src) compiled at -O2 from the tree and from the
 #               copy: the same assembly, exit status and messages (their
-#               positions and the compiler's path aside)
+#               positions and the compiler's path aside); (0.25.5) a
+#               program a file of which changed after the copy was made
+#               is said so (`changed during the run: rerun`), not `differ`
 #   same-output the compiler built from the copy's compiler/src: the same
 #               object as the one built from the tree's, and `same-output`
 #               against it: identical
@@ -72,6 +74,9 @@ check tree "$([ $rc = 0 ] && echo 1)" "$(cat "$WORK/check.out")"
 # roundtrip
 COPY="$WORK/copy"
 mkdir -p "$COPY"
+# (0.25.5: a file changed after this is changed during the run: compiles
+# says so, not `differ`)
+: >"$WORK/copied"
 cp -R compiler tests examples bench "$COPY/"
 find compiler/src compiler/std tests examples bench -name .volec -prune -o -name '*.vl' -print \
     | grep -v '^tests/query/' | grep -v '^tests/refactor/' | sort >"$WORK/files"
@@ -106,6 +111,18 @@ $(cat "$WORK/fmt.out")"
 programs=$(ls tests/run/*.vl tests/run/*/main.vl examples/*/main.vl examples/*/*/main.vl bench/*.vl 2>/dev/null | grep -v '^examples/tools/')
 mkdir -p "$WORK/c"
 printf '%s\n' $programs compiler/src/main.vl | awk -v w="$WORK/c" '{ print NR " " $0 }' >"$WORK/list"
+# (0.25.5) The first of program $1's files (its directory's, for a
+# program of several; compiler/src and compiler/std for the compiler)
+# changed after the copy was made, or nothing.
+changed_since_copy() {
+    case "$1" in
+        compiler/src/main.vl) where="compiler/src compiler/std" ;;
+        tests/run/*/main.vl|examples/*/main.vl|examples/*/*/main.vl) where=$(dirname "$1") ;;
+        *) where=$1 ;;
+    esac
+    # shellcheck disable=SC2086
+    (cd "$ROOT" && find $where -name '*.vl' -newer "$WORK/copied" 2>/dev/null | head -1)
+}
 compile_one() { # <n> <program>
     d="$WORK/c/$1"
     mkdir -p "$d"
@@ -134,6 +151,11 @@ compile_one() { # <n> <program>
     if cmp -s "$d/a.rc" "$d/b.rc" && cmp -s "$d/a.msg" "$d/b.msg" \
         && { [ ! -f "$d/a.s" ] || [ "$(cat "$d/a.rc")" != 0 ] || cmp -s "$d/a.s" "$d/b.s"; }; then
         echo same >"$d/result"
+    elif ch=$(changed_since_copy "$2") && [ -n "$ch" ]; then
+        # (0.25.5) a file of the program changed after the copy was made
+        # (an agent's edit while the suite ran): the two compiles read
+        # different text, which says nothing of fmt (opt254 #6)
+        echo "changed $2 $ch" >"$d/result"
     else
         echo "$2" >"$d/result"
     fi
@@ -147,9 +169,10 @@ while read -r k p; do
 done <"$WORK/list"
 wait
 total=$(wc -l <"$WORK/list" | tr -d ' ')
-bad=$(cat "$WORK"/c/*/result | grep -v '^same$')
-check compiles "$([ -z "$bad" ] && [ "$(cat "$WORK"/c/*/result | wc -l | tr -d ' ')" = "$total" ] && echo 1)" \
-    "$total programs; differ: $bad"
+bad=$(cat "$WORK"/c/*/result | grep -v '^same$' | grep -v '^changed ')
+changed=$(cat "$WORK"/c/*/result | awk '$1 == "changed" { printf "%s%s (%s)", sep, $2, $3; sep = ", " }')
+check compiles "$([ -z "$bad" ] && [ -z "$changed" ] && [ "$(cat "$WORK"/c/*/result | wc -l | tr -d ' ')" = "$total" ] && echo 1)" \
+    "$total programs; differ: ${bad:-none}$([ -n "$changed" ] && printf '; changed during the run, not compared (rerun): %s' "$changed")"
 
 # same-output
 ok=0

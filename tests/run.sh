@@ -22,7 +22,7 @@
 # --sample (the tools' answers from their cache the same as without it,
 # 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [FILTER...]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [-n NAME] [FILTER...]
 #
 #   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
@@ -45,9 +45,12 @@
 #   -f FILE       (0.25.2) more FILTERs, one per line (# comments)
 #   -l            (0.25.2) list what the FILTERs select, `case NAME` and
 #                 `suite NAME` (`leveled`: it takes -O), and run nothing
+#   -n NAME       (0.25.5) only NAME, as '=NAME' (repeatable): zsh expands
+#                 an unquoted =NAME to a path, and then nothing runs
 #   FILTER...     run only the cases (and the suites and checks below)
-#                 whose name contains a FILTER; =NAME: only NAME (0.25.2:
-#                 several of them, and -f, select the union)
+#                 whose name contains a FILTER; '=NAME': only NAME (0.25.2:
+#                 several of them, and -f, select the union; quote it in
+#                 zsh, or use -n NAME)
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
 # VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
@@ -180,7 +183,7 @@ FILTERS=""
 LIST=0
 
 usage() {
-    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,/^# Environment:/p' "$0" | sed '$d; s/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -202,10 +205,17 @@ while [ $# -gt 0 ]; do
 "
             shift 2 ;;
         -l) LIST=1; shift ;;
+        # (0.25.5) -n NAME: only NAME, as =NAME, in a form zsh does not
+        # expand (its `=word` is a path: `=NAME` unquoted runs nothing)
+        -n)
+            [ $# -ge 2 ] || usage
+            FILTERS="$FILTERS=$2
+"
+            shift 2 ;;
         -h|--help) usage ;;
         -*)
             # (0.25.2: one line, not the whole usage)
-            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l; tests/run.sh -h for more)" >&2
+            echo "tests/run.sh: unknown option '$1' (options: -c COMPILER -t TARGET -O LEVEL or -O0 -j JOBS -a -k LINKER -d FORMAT -f FILE -l -n NAME; tests/run.sh -h for more)" >&2
             exit 2 ;;
         *) break ;;
     esac
@@ -1050,6 +1060,7 @@ while read -r name file; do
     elif [ "$status" = fail ]; then
         echo "$category fail" >>"$TALLY"
         { echo "FAIL $name:"; sed 's/^/    /' "$dir/why"; echo; } >>"$FAILURES"
+        echo "$name" >>"$WORK/failed-cases"
     else
         echo "$category $status" >>"$TALLY"
     fi
@@ -1647,6 +1658,12 @@ awk '
             printf "  (%d skipped, not passed: the SKIP lines above say why)\n", total["skip"]
     }
 ' "$TALLY"
+# (0.25.5) The failing cases alone, in the form zsh leaves as it is
+# (`=NAME` is its path expansion; '=NAME' quoted works too).
+if [ -s "$WORK/failed-cases" ]; then
+    n=$(wc -l <"$WORK/failed-cases" | tr -d ' ')
+    echo "try: tests/run.sh $(head -5 "$WORK/failed-cases" | sed 's/^/-n /' | tr '\n' ' ' | sed 's/ $//')   (the failing case$( [ "$n" -gt 1 ] && echo s) alone$( [ "$n" -gt 5 ] && echo ", the first 5 of $n"))"
+fi
 if grep -q ' fail$' "$TALLY"; then
     exit 1
 fi

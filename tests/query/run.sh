@@ -142,7 +142,12 @@ for file in "$HERE"/*.q; do
         grep -v '^##' "$file" >"$WORK/$name.want"
         if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
             # (0.16: a failing transcript only, its `##` comments kept
-            # above the `$` line they were above)
+            # above the `$` line they were above; 0.25.5: a line that
+            # differs only in std's numbers kept as it was, tests/stdkeep.sh)
+            if ! grep -q '^## exact-std' "$file"; then
+                sh "$ROOT/tests/stdkeep.sh" "$WORK/$name.want" "$WORK/$name.got" >"$WORK/$name.kept"
+                cp "$WORK/$name.kept" "$WORK/$name.got"
+            fi
             awk 'NR == FNR {
                     if ($0 ~ /^##/) { pend = pend $0 "\n" }
                     else if ($0 ~ /^\$ /) { c[++n] = pend; pend = "" }
