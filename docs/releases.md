@@ -71,6 +71,14 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.4
+
+- `const X: str = "...";` is allowed: text, a constant, each use the
+  literal, as a `[u8]` constant's is (`guide text#string-constants`).
+  0.25.3 refused it because, allowed, it crashed: the checker inlined a
+  string constant's literal only when its type was `[u8]`, so a `str`
+  one was read as an integer constant, a null slice.
+
 ### What's new in 0.25.3
 
 The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten
