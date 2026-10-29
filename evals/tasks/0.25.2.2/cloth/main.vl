@@ -1,0 +1,414 @@
+// cloth: position-based dynamics of a cloth on the GPU (std::gpu, WGSL
+// compute kernels), drawn lit and two-sided into a window (std::window).
+//
+//   cloth [--size N] [--iters N]                  the window: drag to pull
+//   cloth --headless [--steps N] [--shot FILE]    no window: the checks
+//
+// shaders.vl holds the WGSL, sim.vl the GPU side, cloth.vl the CPU side
+// (vectors, the camera's ray, the pick, the checks' numbers).
+
+mod cloth;
+mod shaders;
+mod sim;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface, Surface};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use cloth::{
+    Camera, V3, camera, constraint_error, drag_target, energy, not_finite, pick, pos_at, ray, v3,
+};
+use sim::{Frame, Sim};
+
+// The camera: a little to the side, looking at the cloth's middle.
+fn view_camera(w: i64, h: i64) -> Camera {
+    camera(v3(0.35, 0.25, 4.3), v3(0.0, -0.25, 0.0), 2.2, w as f32 / h as f32)
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+// The headless run: `steps` frames of 1/60 s, a number every 60 frames and
+// the verdicts. The cloth starts 8% stretched; its constraint error must
+// fall, its energy must not grow after it has landed, and nothing may be NaN.
+fn headless(n: i64, steps: i64, iters: i64, gravity: f32, sphere: bool, damping: f32, grab_on: bool,
+    shot: [u8], gpa: Gpa) -> i32 {
+    let w = 640;
+    let h = 360;
+    var s = match Sim::new_in(n, iters, w, h, 1.08, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    s.sphere_on = sphere;
+    s.damping = damping;
+    let cam = view_camera(w, h);
+    let dt: f32 = 1.0 / 60.0;
+    let sp = s.spacing;
+    println(
+        f"cloth: {n} x {n} particles, {s.iters} constraint sweeps x {s.substeps} substeps a frame, rest {sp:.4}");
+    var rms0 = 0.0;
+    var rms_end = 0.0;
+    var e_settled = 0.0;
+    var e_max_later = 0.0;
+    var ke_peak = 0.0;
+    var bad = 0;
+    var checks = 0;
+    // the grab: the middle particle is dragged from where it hangs to GRAB
+    // over frames 60 to 240, and must be there at 240
+    let gi = 32 * n + 32;
+    let target = v3(0.6, 0.2, 0.4);
+    var p0 = v3(0.0, 0.0, 0.0);
+    var grab_err = -1.0;
+    var t_start = monotonic_now();
+    for fr in 0..steps + 1 {
+        if fr % 60 == 0 || fr == steps {
+            let (xs, vs) = s.read(gpa);
+            let (rms, worst) = constraint_error(xs.as_slice(), n, sp);
+            let (ke, pe) = energy(xs.as_slice(), vs.as_slice(), n, gravity, s.floor);
+            let total = ke + pe;
+            let nan = not_finite(xs.as_slice()) + not_finite(vs.as_slice());
+            bad += nan;
+            checks += 1;
+            if fr == 0 {
+                rms0 = rms;
+            }
+            rms_end = rms;
+            if ke > ke_peak {
+                ke_peak = ke;
+            }
+            // from frame 120 (two seconds, the cloth has landed) on
+            if fr == 120 {
+                e_settled = total;
+            }
+            if fr == 60 {
+                p0 = pos_at(xs.as_slice(), gi);
+            }
+            if fr == 240 && grab_on {
+                grab_err = pos_at(xs.as_slice(), gi).sub(target).length() as f64;
+            }
+            if fr >= 120 && total > e_max_later {
+                e_max_later = total;
+            }
+            println(
+                f"frame {fr:4}: constraint error rms {rms:.4}, largest {worst:.4}; energy kinetic {ke:.3}, potential {pe:.3}, total {total:.3}; not finite {nan}");
+        }
+        if fr == steps {
+            break;
+        }
+        var grab = -1;
+        var grab_at = v3(0.0, 0.0, 0.0);
+        if grab_on && fr >= 60 && fr <= 240 {
+            grab = gi;
+            grab_at = p0.add(target.sub(p0).scale((fr - 60) as f32 / 180.0));
+        }
+        s.set_frame(Frame {
+            dt: dt, time: fr as f32 * dt, gravity: gravity, wind: 0.0, wind_dir: v3(1.0, 0.0, 0.0),
+            grab: grab, grab_at: grab_at, cam: cam,
+        }, w, h);
+        var enc = s.dev.encoder();
+        s.step(&enc);
+        s.queue.submit(enc.finish());
+        if fr == 0 {
+            // the first frame's time alone includes the pipelines' warm-up
+            let _ = s.queue.wait_idle();
+            t_start = monotonic_now();
+        }
+    }
+    let _ = s.queue.wait_idle();
+    let ms_total = secs(monotonic_now().saturating_sub(t_start)) * 1000.0;
+    let error_falls = rms_end < 0.5 * rms0;
+    // with the grab on, the hand does work on the cloth: no energy verdict
+    let energy_bounded = grab_on || e_max_later <= 1.02 * e_settled;
+    println(
+        f"constraint error (rms): {rms0:.4} at the start, {rms_end:.4} at the end: {verdict(error_falls)}");
+    if grab_on {
+        println(
+            f"energy: kinetic peaks at {ke_peak:.1} on impact; not judged with the grab (the hand does work)");
+    } else {
+        println(
+            f"energy: kinetic peaks at {ke_peak:.1} on impact; total {e_settled:.1} at frame 120, at most {e_max_later:.1} after: {verdict(energy_bounded)}");
+    }
+    println(f"NaN and infinities over {checks} reads: {bad} ({verdict(bad == 0)})");
+    println(
+        f"{steps - 1} frames after the first, {ms_total / (steps - 1) as f64:.3} ms a frame on the GPU (all submitted, then waited for)");
+    if grab_on {
+        println(
+            f"grab: particle {gi} dragged to ({target.x}, {target.y}, {target.z}), {grab_err:.4} away at frame 240: {verdict(grab_err < 0.02)}");
+        if grab_err >= 0.02 {
+            bad += 1;
+        }
+    }
+    if shot.len() > 0 {
+        s.set_frame(Frame {
+            dt: dt, time: 0.0, gravity: 9.8, wind: 0.0, wind_dir: v3(1.0, 0.0, 0.0),
+            grab: -1, grab_at: v3(0.0, 0.0, 0.0), cam: cam,
+        }, w, h);
+        let img = s.snapshot_in(w, h, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"cloth: cannot write {shot}");
+            return 1;
+        }
+        println(f"shot: {w} x {h} written to {shot}");
+    }
+    if error_falls && energy_bounded && bad == 0 { 0 } else { 1 }
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The mouse and the keys, between frames.
+struct Input {
+    // the left button is down (the grab follows the mouse)
+    down: bool,
+    // the mouse, in physical pixels
+    x: f64,
+    y: f64,
+    // the particle held (-1: none), its place when it was taken, and the
+    // place it is held at now
+    grab: i64,
+    grab_p0: V3,
+    grab_at: V3,
+    paused: bool,
+    wind: bool,
+    sphere: bool,
+    reset: bool,
+    quit: bool,
+}
+
+// One frame: the uniform, a step (unless paused) and the picture, in one
+// submission, then presented.
+fn frame(s: inout Sim, surf: inout Surface, f: Frame, step: bool) {
+    s.set_frame(f, surf.width, surf.height);
+    match surf.frame() {
+        Ok(fr) => {
+            var enc = s.dev.encoder();
+            if step {
+                s.step(&enc);
+            }
+            s.draw(&enc, fr.texture.view(), s.depth_view());
+            s.queue.submit(enc.finish());
+            fr.present(&s.queue);
+        }
+        Err(_) => {}
+    }
+}
+
+fn windowed(n: i64, iters: i64, max_frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("cloth: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("cloth", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("cloth: no window");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    var s = match Sim::new_in(n, iters, sz.w, sz.h, 1.08, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"cloth: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input {
+        down: false, x: 0.0, y: 0.0, grab: -1, grab_p0: v3(0.0, 0.0, 0.0),
+        grab_at: v3(0.0, 0.0, 0.0), paused: false, wind: false, sphere: true, reset: false,
+        quit: false,
+    };
+    let start = monotonic_now();
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    var now = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                now = secs(monotonic_now().saturating_sub(start));
+                // the step follows the display's clock, within limits that
+                // keep it stable after a stall
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 { dt = 1.0 / 60.0; }
+                if dt < 1.0 / 240.0 { dt = 1.0 / 240.0; }
+                prev = now;
+                if inp.reset {
+                    s.reset();
+                    inp.reset = false;
+                }
+                let step = !inp.paused;
+                if step { clock += dt; }
+                let w = sz.w;
+                let h = sz.h;
+                if inp.grab >= 0 {
+                    inp.grab_at = drag_target(view_camera(w, h), inp.grab_p0,
+                        ray(view_camera(w, h), inp.x, inp.y, w as f64, h as f64));
+                }
+                s.sphere_on = inp.sphere;
+                let f = Frame {
+                    dt: dt as f32, time: clock as f32, gravity: 9.8,
+                    wind: if inp.wind { 2.0 } else { 0.0 }, wind_dir: v3(1.0, 0.0, -0.3),
+                    grab: inp.grab, grab_at: inp.grab_at, cam: view_camera(w, h),
+                };
+                frame(&s, &surf, f, step);
+                frames += 1;
+                if frames == 1 { first = now; }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"{n} x {n} cloth, {s.iters} sweeps, {frames} frames, {mean:.2} ms a frame");
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(surf.width, surf.height, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"cloth: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        if m.button == Button::Left {
+                            let w = sz.w;
+                            let h = sz.h;
+                            let c = view_camera(w, h);
+                            let dir = ray(c, m.x, m.y, w as f64, h as f64);
+                            // the particles as the GPU has them now
+                            let (xs, _) = s.read(gpa);
+                            let (i, t) = pick(xs.as_slice(), n, c.eye, dir, 0.12);
+                            if i >= 0 {
+                                inp.grab = i;
+                                inp.grab_p0 = pos_at(xs.as_slice(), i);
+                                inp.grab_at = inp.grab_p0;
+                                inp.down = true;
+                                let _ = t;
+                            }
+                        }
+                    }
+                    MouseAction::Release => {
+                        if m.button == Button::Left {
+                            inp.grab = -1;
+                            inp.down = false;
+                        }
+                    }
+                    MouseAction::Move => {}
+                }
+                inp.x = m.x;
+                inp.y = m.y;
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                inp.paused = !inp.paused;
+                            } else if c == 'r' as u32 {
+                                inp.reset = true;
+                            } else if c == 'w' as u32 {
+                                inp.wind = !inp.wind;
+                            } else if c == 's' as u32 {
+                                inp.sphere = !inp.sphere;
+                            } else if c == 'q' as u32 {
+                                inp.quit = true;
+                            }
+                        }
+                        Logical::Named(Named::Escape) => inp.quit = true,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(s.dev, z.w, z.h);
+                s.resize(z.w, z.h);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("cloth", gpa)
+        .about("Position-based dynamics of a cloth on the GPU: a window to pull, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: run --steps frames, then the checks"))
+        .arg(Arg::option("steps").value_name("N").default("600")
+            .help("headless: the frames (1/60 s each)"))
+        .arg(Arg::option("size").value_name("N").default("64")
+            .help("the cloth is N x N particles (8 to 128)"))
+        .arg(Arg::option("iters").value_name("N").default("16")
+            .help("constraint sweeps a substep (each solves the 12 colours once)"))
+        .arg(Arg::option("gravity").value_name("G").default("9.8")
+            .help("headless: gravity, m/s^2 along -y"))
+        .arg(Arg::option("damping").value_name("D").default("0.99")
+            .help("headless: what is kept of a velocity each substep"))
+        .arg(Arg::flag("no-sphere").help("headless: take the sphere out"))
+        .arg(Arg::flag("grab").help("headless: drag the middle particle, and check it follows"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the last picture as a PPM image (headless: the final state)"));
+    let m = cli.parse_or_exit(env::args());
+    let n = match parse_int(m.get("size").unwrap_or("64")) {
+        Ok(x) => x,
+        Err(_) => 0,
+    };
+    let iters = match parse_int(m.get("iters").unwrap_or("16")) {
+        Ok(x) => x,
+        Err(_) => 16,
+    };
+    let steps = match parse_int(m.get("steps").unwrap_or("600")) {
+        Ok(x) => x,
+        Err(_) => 600,
+    };
+    let frames = match parse_int(m.get("frames").unwrap_or("0")) {
+        Ok(x) => x,
+        Err(_) => 0,
+    };
+    if n < 8 || n > 128 || iters < 0 || steps < 1 {
+        eprintln("cloth: --size 8..128, --iters 0 or more, --steps 1 or more");
+        return 2;
+    }
+    if m.flag("headless") {
+        let g = match std::num::parse_f64(m.get("gravity").unwrap_or("9.8")) {
+            Ok(x) => x as f32,
+            Err(_) => 9.8,
+        };
+        let d = match std::num::parse_f64(m.get("damping").unwrap_or("0.99")) {
+            Ok(x) => x as f32,
+            Err(_) => 0.99,
+        };
+        return headless(n, steps, iters, g, !m.flag("no-sphere"), d, m.flag("grab"),
+            m.get("shot").unwrap_or(""), gpa);
+    }
+    windowed(n, iters, frames, m.get("shot").unwrap_or(""), gpa)
+}

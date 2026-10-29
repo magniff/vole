@@ -1,0 +1,247 @@
+// deferred: a deferred renderer on std::gpu, in a window (std::window).
+// A scene of cubes, spheres and a checkered floor is drawn into a G-buffer
+// (albedo, normal, linear depth); a compute pass culls 256 or more moving
+// coloured point lights into 16 x 16 tiles; the lighting pass adds each
+// pixel's lights; tone mapping shows the frame.
+//
+//   deferred [--lights N] [--frames N]         the window (N lights, default 512)
+//   deferred --headless [--frames N]           no window: time N frames
+//       [--size WxH] [--shot FILE.ppm] [--views PREFIX]
+//
+// Keys: 0 the frame; 1 albedo, 2 normal, 3 depth, 4 lights per tile (press
+// again for the frame); space pauses the lights; q quits.
+// --views PREFIX writes PREFIX-final, -albedo, -normal, -depth and -lights
+// as PPM images, and --shot FILE.ppm the final frame.
+
+mod math;
+mod render;
+mod scene;
+mod shaders;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::Logical;
+
+use render::Renderer;
+
+// The scene's clock steps this much a frame (the window's frames are 60 a second).
+const DT: f32 = 1.0 / 60.0;
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn parse_size(s: str) -> (i64, i64) {
+    let (ws, hs) = match s.split_once("x") {
+        Some(pair) => pair,
+        None => ("960", "600"),
+    };
+    (ws.parse::<i64>().unwrap_or(960), hs.parse::<i64>().unwrap_or(600))
+}
+
+fn mode_name(m: i64) -> [u8] {
+    if m == 1 {
+        "albedo"
+    } else if m == 2 {
+        "normal"
+    } else if m == 3 {
+        "depth"
+    } else if m == 4 {
+        "lights"
+    } else {
+        "final"
+    }
+}
+
+// The frame at time t in view mode m, as a PPM image (P6, RGB). Its pixels
+// are read back from the GPU, so this waits for the frame.
+fn frame_ppm(r: inout Renderer, t: f32, mode: i64, gpa: Gpa) -> Result<Buf, gpu::Error> {
+    let w = r.t.w;
+    let h = r.t.h;
+    let tex = r.dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let stride = (w * 4 + 255) / 256 * 256;
+    var out = r.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    r.render_to(tex.view(), t, mode);
+    var enc = r.dev.encoder();
+    enc.copy_texture_to_buffer(tex, out, stride);
+    r.queue.submit(enc.finish());
+    let px = out.map_read(r.dev);
+    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            b.push(px[i + 2]);
+            b.push(px[i + 1]);
+            b.push(px[i]);
+        }
+    }
+    Ok(b)
+}
+
+fn headless(w: i64, h: i64, nlights: i64, frames: i64, shot: [u8], views: [u8], gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var r = Renderer::new_in(dev, queue, w, h, nlights, gpa)?;
+    let out = r.dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let ov = out.view();
+    for _ in 0..8 {
+        r.render_to(ov, 0.0, 0);
+    }
+    r.queue.wait_idle()?;
+    let t0 = monotonic_now();
+    for i in 0..frames {
+        r.render_to(ov, (i as f32) * DT, 0);
+    }
+    r.queue.wait_idle()?;
+    let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / (frames as f64);
+    println(
+        f"deferred: {nlights} lights, {w} x {h} pixels, {r.t.tiles_x} x {r.t.tiles_y} tiles: {frames} frames, {ms:.3} ms a frame");
+
+    if shot.len() > 0 {
+        let img = frame_ppm(&r, 2.0, 0, gpa)?;
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"deferred: cannot write {shot}");
+        }
+    }
+    if views.len() > 0 {
+        for m in 0..5 {
+            let img = frame_ppm(&r, 2.0, m, gpa)?;
+            let path = format_in(f"{views}-{mode_name(m)}.ppm", gpa);
+            if std::fs::write(path.as_slice(), img.as_slice()).is_err() {
+                eprintln(f"deferred: cannot write {path}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn windowed(nlights: i64, frames: i64, gpa: Gpa) -> Result<(), gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("deferred: no window server (try --headless)");
+            return Ok(());
+        }
+    };
+    var win = match app.window(WindowDesc::new("deferred", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("deferred: no window");
+            return Ok(());
+        }
+    };
+    let sz = win.size();
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var r = Renderer::new_in(dev, queue, sz.w, sz.h, nlights, gpa)?;
+    var surf = inst.surface(r.dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    surf.configure(r.dev, sz.w, sz.h);
+
+    var mode: i64 = 0;
+    var paused = false;
+    var quit = false;
+    var clock: f32 = 0.0;
+    var drawn: i64 = 0;
+    var first = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if !paused {
+                    clock = clock + DT;
+                }
+                match surf.frame() {
+                    Ok(frame) => {
+                        r.render_to(frame.texture.view(), clock, mode);
+                        frame.present(&r.queue);
+                    }
+                    Err(_) => {}
+                }
+                if drawn == 0 {
+                    first = monotonic_now();
+                }
+                drawn += 1;
+                if (frames > 0 && drawn >= frames) || quit {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'q' as u32 {
+                                quit = true;
+                            } else if c >= '0' as u32 && c <= '4' as u32 {
+                                let m = (c - '0' as u32) as i64;
+                                mode = if mode == m { 0 } else { m };
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(r.dev, z.w, z.h);
+                r.resize(z.w, z.h);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    if drawn > 1 {
+        let mean = secs(monotonic_now().saturating_sub(first)) * 1000.0 / ((drawn - 1) as f64);
+        println(f"deferred: {drawn} frames, {mean:.2} ms a frame ({nlights} lights)");
+    }
+    Ok(())
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("deferred", gpa)
+        .about("a deferred renderer: G-buffer, tile-culled point lights, tone mapping")
+        .arg(Arg::flag("headless").help("no window: time the frames and write the views"))
+        .arg(Arg::option("lights").value_name("N").default("512")
+            .help("moving point lights, 256 to 4096"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("frames to run (headless: default 120; window: default until closed)"))
+        .arg(Arg::option("size").value_name("WxH").default("960x600")
+            .help("headless: the frame's size in pixels"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: write the final frame"))
+        .arg(Arg::option("views").value_name("PREFIX")
+            .help("headless: write PREFIX-final/-albedo/-normal/-depth/-lights.ppm"));
+    let m = cli.parse_or_exit(env::args());
+    let nlights = m.get_as::<i64>("lights").unwrap_or(512);
+    if nlights < 256 || nlights > 4096 {
+        eprintln("deferred: --lights takes 256 to 4096");
+        return 2;
+    }
+    let frames = m.get_as::<i64>("frames").unwrap_or(0);
+    let (w, h) = parse_size(m.get("size").unwrap_or("960x600"));
+    if w < 16 || h < 16 {
+        eprintln("deferred: --size wants at least 16x16");
+        return 2;
+    }
+    let shot = m.get("shot").unwrap_or("");
+    let views = m.get("views").unwrap_or("");
+    let res = if m.flag("headless") {
+        headless(w, h, nlights, if frames > 0 { frames } else { 120 }, shot, views, gpa)
+    } else {
+        windowed(nlights, frames, gpa)
+    };
+    match res {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln(f"deferred: {e}");
+            1
+        }
+    }
+}

@@ -1,0 +1,217 @@
+// The chat screen: a grid of characters, one cell per glyph of the 5 x 7
+// font, drawn by one full-screen render pass that reads the cells (a
+// character code and flags per cell) from a storage buffer. The transcript
+// is wrapped to the grid on the CPU; the newest lines stay at the bottom,
+// above the input line and the status line.
+
+use std::gpu;
+use std::gpu::{Buffer, BufferUsage, BindGroup, Color, Device, Format, Load, PassDesc, Queue, RenderPipeline, TextureView};
+use font::GLYPHS;
+
+// The largest grid: columns and rows of cells.
+pub const MAXCOLS: i64 = 320;
+pub const MAXROWS: i64 = 160;
+
+// Cell flags: 1 user text (a line starting "> "), 2 inverse (the cursor),
+// 4 dim (the status line).
+const SHADER: [u8] = "@group(0) @binding(0) var<storage, read> cells: array<u32>;\n\
+@group(0) @binding(1) var<storage, read> glyphs: array<u32>;\n\
+@group(0) @binding(2) var<storage, read> prm: array<u32>;\n\
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return vec4<f32>(p, 0.0, 1.0);\n\
+}\n\
+@fragment fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let cols = prm[0];\n\
+    let rows = prm[1];\n\
+    let k = prm[2];\n\
+    let cw = 6u * k;\n\
+    let ch = 8u * k;\n\
+    let x = u32(fc.x);\n\
+    let y = u32(fc.y);\n\
+    var color = vec3<f32>(0.07, 0.08, 0.10);\n\
+    let cx = x / cw;\n\
+    let cy = y / ch;\n\
+    if (cx < cols && cy < rows) {\n\
+        let cell = cells[cy * cols + cx];\n\
+        let code = cell & 0xffu;\n\
+        let flags = cell >> 8u;\n\
+        let lx = (x % cw) / k;\n\
+        let ly = (y % ch) / k;\n\
+        var on = false;\n\
+        if (lx < 5u && ly < 7u) {\n\
+            let g = clamp(code, 32u, 126u) - 32u;\n\
+            var bits: u32 = 0u;\n\
+            if (lx < 4u) { bits = (glyphs[g * 2u] >> (lx * 8u)) & 0xffu; }\n\
+            else { bits = glyphs[g * 2u + 1u] & 0xffu; }\n\
+            on = ((bits >> ly) & 1u) == 1u;\n\
+        }\n\
+        var fg = vec3<f32>(0.86, 0.87, 0.90);\n\
+        if ((flags & 1u) != 0u) { fg = vec3<f32>(0.55, 0.85, 1.0); }\n\
+        if ((flags & 4u) != 0u) { fg = vec3<f32>(0.50, 0.52, 0.56); }\n\
+        var lit = on;\n\
+        if ((flags & 2u) != 0u) { lit = !on; }\n\
+        if (lit) { color = fg; }\n\
+    }\n\
+    return vec4<f32>(color, 1.0);\n\
+}\n";
+
+pub struct Screen {
+    pipe: RenderPipeline,
+    group: BindGroup,
+    cells: Buffer,
+    prm: Buffer,
+    // the grid of the last layout
+    pub cols: i64,
+    pub rows: i64,
+    // the glyph scale in pixels (a cell is 6k x 8k pixels)
+    pub k: i64,
+    grid: Vec<u32>,
+    gpa: Gpa,
+}
+
+impl Screen {
+    // The pipeline for frames of format Bgra8Unorm.
+    pub fn new(dev: Device, gpa: Gpa) -> Result<Screen, gpu::Error> {
+        let shader = dev.shader_wgsl(SHADER)?;
+        let pipe = dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm))?;
+        let glyphs = dev.buffer_init(gpu::bytes_of_u32(GLYPHS[..]), BufferUsage::STORAGE);
+        let cells = dev.buffer(MAXCOLS * MAXROWS * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let prm = dev.buffer(32, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let group = dev.bind_group(pipe.bind_layout(0),
+            [gpu::bind(0, cells), gpu::bind(1, glyphs), gpu::bind(2, prm)][..]);
+        let grid: Vec<u32> = Vec::filled_in(MAXCOLS * MAXROWS, 0, gpa);
+        Ok(Screen { pipe: pipe, group: group, cells: cells, prm: prm, cols: 0, rows: 0, k: 2,
+            grid: grid, gpa: gpa })
+    }
+
+    // The grid for a surface of w x h pixels (the glyph scale k, and the
+    // cells that fit).
+    pub fn fit(inout self, w: i64, h: i64, scale: f64) {
+        self.k = if scale >= 1.5 { 3 } else { 2 };
+        self.cols = w / (6 * self.k);
+        self.rows = h / (8 * self.k);
+        if self.cols > MAXCOLS { self.cols = MAXCOLS; }
+        if self.rows > MAXROWS { self.rows = MAXROWS; }
+        if self.cols < 8 { self.cols = 8; }
+        if self.rows < 6 { self.rows = 6; }
+    }
+
+    // Fills the grid: the transcript (its lines wrapped; the newest at the
+    // bottom), a separator, the input line with a cursor and the status.
+    pub fn layout(inout self, log: [u8], input: [u8], status: [u8]) {
+        let cols = self.cols;
+        let rows = self.rows;
+        for i in 0..(cols * rows) { self.grid[i] = 0; }
+        // the visual rows of the transcript: [start, end, flag] triples
+        var vis: Vec<i64> = Vec::new_in(self.gpa);
+        var p: i64 = 0;
+        while p <= log.len() {
+            var e = p;
+            while e < log.len() && log[e] != 10 { e += 1; }
+            let user: i64 = if e - p >= 2 && log[p] == '>' && log[p + 1] == ' ' { 1 } else { 0 };
+            var row_start = p;
+            var n: i64 = 0;
+            var a = p;
+            while a < e {
+                if n == cols {
+                    vis.push(row_start);
+                    vis.push(a);
+                    vis.push(user);
+                    row_start = a;
+                    n = 0;
+                }
+                var b = a + 1;
+                while b < e && log[b] & 0xC0 == 0x80 { b += 1; }
+                n += 1;
+                a = b;
+            }
+            vis.push(row_start);
+            vis.push(e);
+            vis.push(user);
+            p = e + 1;
+        }
+        // the newest rows that fit above the three bottom rows
+        let avail = rows - 3;
+        let total = vis.len() / 3;
+        var first = total - avail;
+        if first < 0 { first = 0; }
+        var r: i64 = 0;
+        for t in first..total {
+            put_span(&self.grid, cols, r, 0, log, vis[3 * t], vis[3 * t + 1], vis[3 * t + 2]);
+            r += 1;
+        }
+        // the separator
+        for c in 0..cols { self.grid[(rows - 3) * cols + c] = '-' as u32; }
+        // the input: its tail, with a cursor (an inverse blank)
+        let at = rows - 2;
+        var room = cols - 3;
+        var q = input.len();
+        var chars: i64 = 0;
+        while q > 0 && chars < room {
+            q -= 1;
+            if input[q] & 0xC0 != 0x80 { chars += 1; }
+        }
+        let tail = q;
+        self.grid[at * cols] = '>' as u32;
+        self.grid[at * cols + 1] = ' ' as u32;
+        var c: i64 = 2;
+        var s = tail;
+        while s < input.len() {
+            var b = s + 1;
+            while b < input.len() && input[b] & 0xC0 == 0x80 { b += 1; }
+            self.grid[at * cols + c] = code_of(input[s]) | (1u32 << 8);
+            c += 1;
+            s = b;
+        }
+        self.grid[at * cols + c] = ' ' as u32 | (2u32 << 8) | (1u32 << 8);
+        // the status line, dim
+        let sr = rows - 1;
+        var k: i64 = 0;
+        while k < status.len() && k < cols {
+            self.grid[sr * cols + k] = code_of(status[k]) | (4u32 << 8);
+            k += 1;
+        }
+    }
+
+    // Draws the grid into target (a frame or a texture of w x h pixels).
+    pub fn draw(inout self, dev: Device, queue: inout Queue, target: TextureView, w: i64, h: i64) {
+        let cols = self.cols;
+        let rows = self.rows;
+        queue.write_buffer(self.cells, 0, gpu::bytes_of_u32(self.grid[0..(cols * rows)]));
+        let prm: [u32; 8] = [cols as u32, rows as u32, self.k as u32, w as u32, h as u32, 0, 0, 0];
+        queue.write_buffer(self.prm, 0, gpu::bytes_of_u32(prm[..]));
+        var enc = dev.encoder();
+        enc.render_pass(PassDesc::color(target, Color::rgba(0.0, 0.0, 0.0, 1.0), Load::Clear), |pass| {
+            pass.set_pipeline(self.pipe);
+            pass.set_bind_group(0, self.group);
+            pass.draw(0..3, 0..1);
+        });
+        queue.submit(enc.finish());
+    }
+}
+
+// The glyph code of a byte: printable ASCII as itself, others as '?'.
+fn code_of(b: u8) -> u32 {
+    if b >= 32 && b < 127 { b as u32 } else { '?' as u32 }
+}
+
+// Writes the bytes of one visual row (a logical line's piece) at row r.
+fn put_span(grid: inout Vec<u32>, cols: i64, r: i64, c0: i64, log: [u8], a: i64, e: i64, flag: i64) {
+    var c = c0;
+    var p = a;
+    while p < e && c < cols {
+        let b = log[p];
+        if b & 0xC0 != 0x80 {
+            var code = code_of(b);
+            if b == 9 { code = ' ' as u32; }
+            var fl: u32 = 0;
+            if flag == 1 { fl = 1; }
+            grid[r * cols + c] = code | (fl << 8);
+            c += 1;
+        }
+        p += 1;
+    }
+}

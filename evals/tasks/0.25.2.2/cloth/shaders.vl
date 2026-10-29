@@ -1,0 +1,231 @@
+// The WGSL of cloth, compiled at run time by std::gpu::wgsl. Each kernel
+// is its own module: COMMON (the uniform, the camera and the shading),
+// then the kernel's bindings and entry point (sim.vl puts them together).
+//
+// Positions are vec4s: xyz, and w = the inverse mass (0: pinned). The
+// distance constraints are solved Gauss-Seidel by colour (see CLASS), in
+// place, so the constraints of all particles of one colour run in parallel
+// with no races.
+
+pub const COMMON: [u8] = "struct Prm {\n\
+    sim: vec4<f32>,\n\
+    wind: vec4<f32>,\n\
+    sphere: vec4<f32>,\n\
+    grab: vec4<f32>,\n\
+    grid: vec4<f32>,\n\
+    eye: vec4<f32>,\n\
+    right: vec4<f32>,\n\
+    up: vec4<f32>,\n\
+    fwd: vec4<f32>,\n\
+    proj: vec4<f32>,\n\
+    light: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> prm: Prm;\n\
+    struct VOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) nrm: vec3<f32>,\n\
+    }\n\
+    fn project(p: vec3<f32>) -> vec4<f32> {\n\
+    let d = p - prm.eye.xyz;\n\
+    let xv = dot(d, prm.right.xyz);\n\
+    let yv = dot(d, prm.up.xyz);\n\
+    let zv = dot(d, prm.fwd.xyz);\n\
+    let near = prm.proj.z;\n\
+    let far = prm.proj.w;\n\
+    let a = far / (far - near);\n\
+    let b = -near * far / (far - near);\n\
+    return vec4<f32>(xv * prm.proj.x / prm.proj.y, yv * prm.proj.x, zv * a + b, zv);\n\
+    }\n\
+    fn shade(n0: vec3<f32>, world: vec3<f32>, front: vec3<f32>, back: vec3<f32>) -> vec4<f32> {\n\
+    let to = normalize(prm.eye.xyz - world);\n\
+    var n = normalize(n0);\n\
+    var base = front;\n\
+    if (dot(n, to) < 0.0) {\n\
+    n = -n;\n\
+    base = back;\n\
+    }\n\
+    let l = normalize(prm.light.xyz);\n\
+    let diff = max(dot(n, l), 0.0);\n\
+    let h = normalize(l + to);\n\
+    let spec = pow(max(dot(n, h), 0.0), 40.0) * 0.3;\n\
+    let k = prm.light.w + (1.0 - prm.light.w) * diff;\n\
+    return vec4<f32>(base * k + vec3<f32>(spec), 1.0);\n\
+    }\n";
+
+// predict: gravity, wind and damping on the velocities, then the
+// positions the solver starts from. A held particle follows the mouse.
+pub const PREDICT: [u8] = "@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> V: array<vec4<f32>>;\n\
+    @group(0) @binding(3) var<storage, read_write> P: array<vec4<f32>>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(prm.grid.x);\n\
+    let i = id.x;\n\
+    if (i >= n * n) { return; }\n\
+    let x = X[i];\n\
+    let h = prm.sim.x;\n\
+    let gust = prm.wind.w * (0.6 + 0.4 * sin(prm.grid.w * 1.7 + f32(i % 97u) * 0.37));\n\
+    let a = vec3<f32>(0.0, prm.sim.y, 0.0) + prm.wind.xyz * gust;\n\
+    var v = (V[i].xyz + a * h) * prm.sim.w;\n\
+    var p = x.xyz + v * h;\n\
+    if (x.w == 0.0) {\n\
+    p = x.xyz;\n\
+    v = vec3<f32>(0.0);\n\
+    }\n\
+    if (f32(i) == prm.grab.w) {\n\
+    p = prm.grab.xyz;\n\
+    v = (p - x.xyz) / h;\n\
+    }\n\
+    V[i] = vec4<f32>(v, 0.0);\n\
+    P[i] = vec4<f32>(p, x.w);\n\
+    }\n";
+
+// class: one colour of distance constraints, projected in place (the full
+// PBD correction, split by the two masses). The colours are chosen so that
+// no particle is in two constraints of one colour: a horizontal stretch
+// (k = 1) is coloured by its column mod 2, a horizontal bend (k = 2) by its
+// column mod 4, and the same for the rows. Within one dispatch each particle
+// is touched by at most one thread, so there are no races. cls = (k, axis
+// (0: along x, 1: along y), modulus m, residue r) as floats.
+pub const CLASS: [u8] = "@group(0) @binding(1) var<uniform> cls: vec4<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> P: array<vec4<f32>>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = i32(prm.grid.x);\n\
+    let i = i32(id.x);\n\
+    if (i >= n * n) { return; }\n\
+    let k = i32(cls.x);\n\
+    let vert = i32(cls.y) == 1;\n\
+    let m = i32(cls.z);\n\
+    let r = i32(cls.w);\n\
+    let ix = i % n;\n\
+    let iy = i / n;\n\
+    let along = select(ix, iy, vert);\n\
+    let jx = ix + select(k, 0, vert);\n\
+    let jy = iy + select(0, k, vert);\n\
+    if (jx >= n || jy >= n || along % m != r) { return; }\n\
+    let j = jy * n + jx;\n\
+    let a = P[u32(i)];\n\
+    let b = P[u32(j)];\n\
+    let wsum = a.w + b.w;\n\
+    if (wsum <= 0.0) { return; }\n\
+    let d = b.xyz - a.xyz;\n\
+    let len = length(d);\n\
+    let c = len - prm.grid.y * f32(k);\n\
+    let dir = d / max(len, 1e-9);\n\
+    P[u32(i)] = vec4<f32>(a.xyz + (a.w / wsum) * c * dir, a.w);\n\
+    P[u32(j)] = vec4<f32>(b.xyz - (b.w / wsum) * c * dir, b.w);\n\
+    }\n";
+
+// collide: the sphere and the floor push the particles out, then the mouse's
+// grab holds its particle where the mouse is. In place, one thread each.
+pub const COLLIDE: [u8] = "@group(0) @binding(1) var<storage, read_write> P: array<vec4<f32>>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(prm.grid.x);\n\
+    let i = id.x;\n\
+    if (i >= n * n) { return; }\n\
+    var p = P[i];\n\
+    if (p.w > 0.0) {\n\
+    let sc = prm.sphere.xyz;\n\
+    let sr = prm.sphere.w;\n\
+    let ds = p.xyz - sc;\n\
+    let ls = length(ds);\n\
+    if (sr > 0.0 && ls < sr) {\n\
+    p = vec4<f32>(sc + ds / max(ls, 1e-6) * sr, p.w);\n\
+    }\n\
+    p.y = max(p.y, prm.grid.z);\n\
+    }\n\
+    if (f32(i) == prm.grab.w) {\n\
+    p = vec4<f32>(prm.grab.xyz, p.w);\n\
+    }\n\
+    P[i] = p;\n\
+    }\n";
+
+// update: the velocities from the solved positions, then the positions.
+pub const UPDATE: [u8] = "@group(0) @binding(1) var<storage, read> P: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> X: array<vec4<f32>>;\n\
+    @group(0) @binding(3) var<storage, read_write> V: array<vec4<f32>>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = u32(prm.grid.x);\n\
+    let i = id.x;\n\
+    if (i >= n * n) { return; }\n\
+    let p = P[i];\n\
+    let x = X[i];\n\
+    V[i] = vec4<f32>((p.xyz - x.xyz) / prm.sim.x, 0.0);\n\
+    X[i] = vec4<f32>(p.xyz, x.w);\n\
+    }\n";
+
+// normals: the grid's tangents (central differences) and their cross
+// product, one normal a particle, on the GPU after each step.
+pub const NORMALS: [u8] = "@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> NRM: array<vec4<f32>>;\n\
+    fn at(ix: i32, iy: i32) -> vec3<f32> {\n\
+    let n = i32(prm.grid.x);\n\
+    let cx = clamp(ix, 0, n - 1);\n\
+    let cy = clamp(iy, 0, n - 1);\n\
+    return X[u32(cy * n + cx)].xyz;\n\
+    }\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = i32(prm.grid.x);\n\
+    let i = i32(id.x);\n\
+    if (i >= n * n) { return; }\n\
+    let ix = i % n;\n\
+    let iy = i / n;\n\
+    let a = at(ix + 1, iy) - at(ix - 1, iy);\n\
+    let b = at(ix, iy + 1) - at(ix, iy - 1);\n\
+    var nr = cross(b, a);\n\
+    if (length(nr) < 1e-12) { nr = vec3<f32>(0.0, 0.0, 1.0); }\n\
+    NRM[u32(i)] = vec4<f32>(normalize(nr), 0.0);\n\
+    }\n";
+
+// The cloth's picture: two triangles per grid square, positions and
+// normals read from the buffers the kernels wrote.
+pub const CLOTH_RENDER: [u8] = "@group(0) @binding(1) var<storage, read> X: array<vec4<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> NRM: array<vec4<f32>>;\n\
+    @vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    let n = u32(prm.grid.x);\n\
+    let quad = vi / 6u;\n\
+    let c = vi % 6u;\n\
+    let qx = quad % (n - 1u);\n\
+    let qy = quad / (n - 1u);\n\
+    let ox = select(0u, 1u, c == 1u || c == 4u || c == 5u);\n\
+    let oy = select(0u, 1u, c == 2u || c == 3u || c == 5u);\n\
+    let idx = (qy + oy) * n + qx + ox;\n\
+    let p = X[idx].xyz;\n\
+    return VOut(project(p), p, NRM[idx].xyz);\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    return shade(v.nrm, v.world, vec3<f32>(0.93, 0.56, 0.24), vec3<f32>(0.25, 0.56, 0.92));\n\
+    }\n";
+
+// The sphere: a latitude-longitude mesh made in the vertex shader.
+pub const SPHERE_RENDER: [u8] = "@vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    let quad = vi / 6u;\n\
+    let c = vi % 6u;\n\
+    let ilon = quad % 48u;\n\
+    let ilat = quad / 48u;\n\
+    let ox = select(0u, 1u, c == 1u || c == 4u || c == 5u);\n\
+    let oy = select(0u, 1u, c == 2u || c == 3u || c == 5u);\n\
+    let u = f32(ilon + ox) / 48.0 * 6.2831853;\n\
+    let v = f32(ilat + oy) / 32.0 * 3.1415927;\n\
+    let dir = vec3<f32>(sin(v) * cos(u), cos(v), sin(v) * sin(u));\n\
+    let p = prm.sphere.xyz + dir * prm.sphere.w * 0.97;\n\
+    return VOut(project(p), p, dir);\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    return shade(v.nrm, v.world, vec3<f32>(0.78, 0.82, 0.9), vec3<f32>(0.78, 0.82, 0.9));\n\
+    }\n";
+
+// The floor: a checked square under the cloth.
+pub const FLOOR_RENDER: [u8] = "@vertex fn vs(@builtin(vertex_index) vi: u32) -> VOut {\n\
+    let c = vi % 6u;\n\
+    let ox = select(0.0, 1.0, c == 1u || c == 4u || c == 5u);\n\
+    let oz = select(0.0, 1.0, c == 2u || c == 3u || c == 5u);\n\
+    let p = vec3<f32>(-8.0 + 16.0 * ox, prm.grid.z - 0.01, -8.0 + 16.0 * oz);\n\
+    return VOut(project(p), p, vec3<f32>(0.0, 1.0, 0.0));\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    let k = (i32(floor(v.world.x)) + i32(floor(v.world.z))) & 1;\n\
+    var c = vec3<f32>(0.34, 0.36, 0.4);\n\
+    if (k == 1) { c = vec3<f32>(0.46, 0.48, 0.52); }\n\
+    return shade(v.nrm, v.world, c, c);\n\
+    }\n";

@@ -1,0 +1,192 @@
+// The WGSL of the four passes. Each pass is its own module: COMMON (the
+// structs, the tile constants and the fullscreen vertex stage) plus the
+// pass's own bindings and entry points.
+//
+// View space: the camera looks down -z, a point's depth is -z (stored
+// in the depth target, 0 where nothing was drawn), and a pixel's view
+// ray is (ndc.x * tanxy.x, ndc.y * tanxy.y, -1).
+
+pub const COMMON: [u8] = "struct Cam {\n\
+    view: mat4x4<f32>,\n\
+    proj: mat4x4<f32>,\n\
+    tanxy: vec4<f32>,\n\
+    screen: vec4<f32>,\n\
+    mode: vec4<f32>,\n\
+}\n\
+struct Light {\n\
+    p: vec4<f32>,\n\
+    c: vec4<f32>,\n\
+}\n\
+const TILE: u32 = 16u;\n\
+const STRIDE: u32 = 128u;\n\
+const MAXL: u32 = 127u;\n\
+@vertex fn fullscreen(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return vec4<f32>(p, 0.0, 1.0);\n\
+}\n";
+
+// Pass 1: the G-buffer. Albedo, view-space normal and linear depth, and
+// a depth buffer for the visibility test.
+pub const GBUF: [u8] = "struct VIn {\n\
+    @location(0) pos: vec3<f32>,\n\
+    @location(1) nrm: vec3<f32>,\n\
+    @location(2) col: vec3<f32>,\n\
+}\n\
+struct VOut {\n\
+    @builtin(position) clip: vec4<f32>,\n\
+    @location(0) vn: vec3<f32>,\n\
+    @location(1) col: vec3<f32>,\n\
+    @location(2) vd: f32,\n\
+}\n\
+struct GOut {\n\
+    @location(0) albedo: vec4<f32>,\n\
+    @location(1) normal: vec4<f32>,\n\
+    @location(2) depth: f32,\n\
+}\n\
+@group(0) @binding(0) var<uniform> cam: Cam;\n\
+@vertex fn gvs(v: VIn) -> VOut {\n\
+    let vp = cam.view * vec4<f32>(v.pos, 1.0);\n\
+    return VOut(cam.proj * vp, (cam.view * vec4<f32>(v.nrm, 0.0)).xyz, v.col, -vp.z);\n\
+}\n\
+@fragment fn gfs(i: VOut) -> GOut {\n\
+    return GOut(vec4<f32>(i.col, 1.0), vec4<f32>(normalize(i.vn), 0.0), i.vd);\n\
+}\n";
+
+// Pass 2: light culling, one workgroup per 16 x 16 tile. The tile's depth
+// range comes from its pixels (an atomic min and max), its four side planes
+// from the tile's corner rays; each light is tested against both and the
+// survivors are appended to the tile's list in shared memory, then written
+// as slot 0 = count, slots 1.. = light indices (STRIDE u32s a tile).
+pub const CULL: [u8] = "@group(0) @binding(0) var<uniform> cam: Cam;\n\
+@group(0) @binding(1) var<storage, read> lights: array<Light>;\n\
+@group(0) @binding(2) var depth: texture_2d<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> tiles: array<u32>;\n\
+var<workgroup> wmin: atomic<u32>;\n\
+var<workgroup> wmax: atomic<u32>;\n\
+var<workgroup> wcount: atomic<u32>;\n\
+var<workgroup> wlist: array<u32, 127>;\n\
+fn inward(n: vec3<f32>, c: vec3<f32>) -> vec3<f32> {\n\
+    let u = normalize(n);\n\
+    if (dot(u, c) < 0.0) { return -u; }\n\
+    return u;\n\
+}\n\
+@compute @workgroup_size(16, 16)\n\
+fn cull(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32, @builtin(workgroup_id) wg: vec3<u32>) {\n\
+    if (li == 0u) {\n\
+        atomicStore(&wmin, 0x7f800000u);\n\
+        atomicStore(&wmax, 0u);\n\
+        atomicStore(&wcount, 0u);\n\
+    }\n\
+    workgroupBarrier();\n\
+    let w = u32(cam.screen.x);\n\
+    let h = u32(cam.screen.y);\n\
+    if (gid.x < w && gid.y < h) {\n\
+        let d = max(textureLoad(depth, vec2<i32>(gid.xy), 0).r, 0.0);\n\
+        atomicMin(&wmin, bitcast<u32>(d));\n\
+        atomicMax(&wmax, bitcast<u32>(d));\n\
+    }\n\
+    workgroupBarrier();\n\
+    let dmin = bitcast<f32>(atomicLoad(&wmin));\n\
+    let dmax = bitcast<f32>(atomicLoad(&wmax));\n\
+    let x0 = f32(wg.x * TILE) / cam.screen.x * 2.0 - 1.0;\n\
+    let x1 = f32((wg.x + 1u) * TILE) / cam.screen.x * 2.0 - 1.0;\n\
+    let y0 = 1.0 - f32(wg.y * TILE) / cam.screen.y * 2.0;\n\
+    let y1 = 1.0 - f32((wg.y + 1u) * TILE) / cam.screen.y * 2.0;\n\
+    let tx = cam.tanxy.x;\n\
+    let ty = cam.tanxy.y;\n\
+    let tl = vec3<f32>(x0 * tx, y0 * ty, -1.0);\n\
+    let tr = vec3<f32>(x1 * tx, y0 * ty, -1.0);\n\
+    let bl = vec3<f32>(x0 * tx, y1 * ty, -1.0);\n\
+    let br = vec3<f32>(x1 * tx, y1 * ty, -1.0);\n\
+    let c = tl + tr + bl + br;\n\
+    let nl = inward(cross(bl, tl), c);\n\
+    let nr = inward(cross(tr, br), c);\n\
+    let nt = inward(cross(tl, tr), c);\n\
+    let nb = inward(cross(br, bl), c);\n\
+    let n = u32(cam.mode.y);\n\
+    var i = li;\n\
+    loop {\n\
+        if (i >= n) { break; }\n\
+        let L = lights[i];\n\
+        let v = (cam.view * vec4<f32>(L.p.xyz, 1.0)).xyz;\n\
+        let r = L.p.w;\n\
+        let dz = -v.z;\n\
+        var vis = dz + r >= dmin && dz - r <= dmax;\n\
+        vis = vis && dot(v, nl) >= -r && dot(v, nr) >= -r && dot(v, nt) >= -r && dot(v, nb) >= -r;\n\
+        if (vis) {\n\
+            let s = atomicAdd(&wcount, 1u);\n\
+            if (s < MAXL) { wlist[s] = i; }\n\
+        }\n\
+        i = i + 256u;\n\
+    }\n\
+    workgroupBarrier();\n\
+    let cnt = min(atomicLoad(&wcount), MAXL);\n\
+    let base = (wg.y * u32(cam.screen.z) + wg.x) * STRIDE;\n\
+    if (li == 0u) { tiles[base] = cnt; }\n\
+    var j = li;\n\
+    loop {\n\
+        if (j >= cnt) { break; }\n\
+        tiles[base + 1u + j] = wlist[j];\n\
+        j = j + 256u;\n\
+    }\n\
+}\n";
+
+// Pass 3: lighting. Each pixel rebuilds its view position from its depth
+// and walks the lights its tile kept; the result is linear HDR colour.
+pub const LIGHT: [u8] = "@group(0) @binding(0) var<uniform> cam: Cam;\n\
+@group(0) @binding(1) var<storage, read> lights: array<Light>;\n\
+@group(0) @binding(2) var albedo: texture_2d<f32>;\n\
+@group(0) @binding(3) var normal: texture_2d<f32>;\n\
+@group(0) @binding(4) var depth: texture_2d<f32>;\n\
+@group(0) @binding(5) var<storage, read> tiles: array<u32>;\n\
+@fragment fn lfs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let px = vec2<i32>(p.xy);\n\
+    let d = textureLoad(depth, px, 0).r;\n\
+    if (d <= 0.0) { return vec4<f32>(0.02, 0.025, 0.04, 1.0); }\n\
+    let alb = textureLoad(albedo, px, 0).rgb;\n\
+    let nrm = normalize(textureLoad(normal, px, 0).xyz);\n\
+    let ndc = vec2<f32>(p.x / cam.screen.x * 2.0 - 1.0, 1.0 - p.y / cam.screen.y * 2.0);\n\
+    let pos = vec3<f32>(ndc.x * cam.tanxy.x * d, ndc.y * cam.tanxy.y * d, -d);\n\
+    let tile = vec2<u32>(u32(p.x), u32(p.y)) / vec2<u32>(TILE, TILE);\n\
+    let base = (tile.y * u32(cam.screen.z) + tile.x) * STRIDE;\n\
+    let cnt = tiles[base];\n\
+    var acc = vec3<f32>(0.0);\n\
+    for (var k = 0u; k < cnt; k = k + 1u) {\n\
+        let L = lights[tiles[base + 1u + k]];\n\
+        let to = (cam.view * vec4<f32>(L.p.xyz, 1.0)).xyz - pos;\n\
+        let dist = length(to);\n\
+        let r = L.p.w;\n\
+        if (dist < r) {\n\
+            let f = 1.0 - dist / r;\n\
+            acc = acc + L.c.rgb * L.c.w * max(dot(nrm, to / dist), 0.0) * f * f;\n\
+        }\n\
+    }\n\
+    return vec4<f32>(alb * (acc + vec3<f32>(0.04)), 1.0);\n\
+}\n";
+
+// Pass 4: tone mapping to the frame, or a G-buffer view when cam.mode.x
+// is 1 (albedo), 2 (normal), 3 (depth) or 4 (lights kept per tile).
+pub const TONE: [u8] = "@group(0) @binding(0) var<uniform> cam: Cam;\n\
+@group(0) @binding(1) var hdr: texture_2d<f32>;\n\
+@group(0) @binding(2) var albedo: texture_2d<f32>;\n\
+@group(0) @binding(3) var normal: texture_2d<f32>;\n\
+@group(0) @binding(4) var depth: texture_2d<f32>;\n\
+@group(0) @binding(5) var<storage, read> tiles: array<u32>;\n\
+@fragment fn tfs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n\
+    let px = vec2<i32>(p.xy);\n\
+    let mode = i32(cam.mode.x);\n\
+    if (mode == 1) { return vec4<f32>(textureLoad(albedo, px, 0).rgb, 1.0); }\n\
+    if (mode == 2) { return vec4<f32>(textureLoad(normal, px, 0).xyz * 0.5 + vec3<f32>(0.5), 1.0); }\n\
+    if (mode == 3) { return vec4<f32>(vec3<f32>(clamp(textureLoad(depth, px, 0).r / 40.0, 0.0, 1.0)), 1.0); }\n\
+    let tile = vec2<u32>(u32(p.x), u32(p.y)) / vec2<u32>(TILE, TILE);\n\
+    let base = (tile.y * u32(cam.screen.z) + tile.x) * STRIDE;\n\
+    if (mode == 4) {\n\
+        let t = clamp(f32(tiles[base]) / 24.0, 0.0, 1.0);\n\
+        return vec4<f32>(t, 1.0 - abs(2.0 * t - 1.0), 1.0 - t, 1.0);\n\
+    }\n\
+    let c = textureLoad(hdr, px, 0).rgb;\n\
+    let m = c / (c + vec3<f32>(1.0));\n\
+    return vec4<f32>(pow(m, vec3<f32>(1.0 / 2.2)), 1.0);\n\
+}\n";

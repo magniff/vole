@@ -1,0 +1,320 @@
+// The GPU side of windtunnel: the populations and the dye (two buffers
+// each, swapped every step: `cur` is the one that holds the latest state),
+// the solid mask, the probe's series, the three compute kernels (LBM, DYE,
+// PROBE) and the picture. A frame is `set_params`, then `record` steps and
+// `draw` into one encoder; nothing is read back and nothing allocated
+// while the window runs.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use flow::{CX, CY, feq};
+use shaders::{COMMON, DYE, LBM, PROBE, RENDER};
+
+// What a step and a picture use (the shaders' `Params`).
+pub struct Config {
+    // the relaxation rate 1/tau and the inflow speed, in lattice units
+    pub omega: f32,
+    pub inflow: f32,
+    // the obstacle's diameter in cells (the vorticity's scale)
+    pub diam: f32,
+    // all four walls (the mass check) instead of an inlet and an outlet
+    pub closed: bool,
+    // 0 speed, 1 vorticity, 2 dye
+    pub view: i64,
+    // the dye's kept fraction each step
+    pub dye_keep: f32,
+    // the probe's cell, or -1 for none
+    pub probe: i64,
+}
+
+// The numbers of the populations: total mass over the fluid cells, the
+// largest speed, and whether every number is finite.
+pub struct Stats {
+    pub mass: f64,
+    pub max_speed: f64,
+    pub finite: bool,
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub w: i64,
+    pub h: i64,
+    // which population buffer holds the latest state
+    pub cur: i64,
+    // the probe's series length (samples, one a step)
+    pub probe_len: i64,
+    ubuf: gpu::Buffer,
+    f0: gpu::Buffer,
+    f1: gpu::Buffer,
+    d0: gpu::Buffer,
+    d1: gpu::Buffer,
+    solid: gpu::Buffer,
+    probe: gpu::Buffer,
+    k_lbm: gpu::ComputePipeline,
+    k_dye: gpu::ComputePipeline,
+    k_probe: gpu::ComputePipeline,
+    render: gpu::RenderPipeline,
+    // g_<kernel><cur>: the bind groups for the state in f<cur> / d<cur>
+    g_lbm0: gpu::BindGroup,
+    g_lbm1: gpu::BindGroup,
+    g_dye0: gpu::BindGroup,
+    g_dye1: gpu::BindGroup,
+    g_probe0: gpu::BindGroup,
+    g_probe1: gpu::BindGroup,
+    g_render0: gpu::BindGroup,
+    g_render1: gpu::BindGroup,
+    // zeros for the dye, as long as the dye buffers
+    zeros: Vec<u8>,
+}
+
+// A compute pipeline from the shader made of `parts`.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+fn storage(dev: gpu::Device, bytes: i64) -> gpu::Buffer {
+    dev.buffer(bytes, BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ)
+}
+
+// Dispatches a kernel over nx x ny threads (workgroups of 8 x 8; the probe
+// is one thread, so it dispatches once).
+fn run(pass: inout gpu::ComputePass, k: gpu::ComputePipeline, g: gpu::BindGroup, nx: i64, ny: i64) {
+    pass.set_pipeline(k);
+    pass.set_bind_group(0, g);
+    pass.dispatch((nx + 7) / 8, (ny + 7) / 8);
+}
+
+// The equilibrium at rest-plus-inflow, with a tiny deterministic wiggle
+// in y so the symmetric flow can leave its symmetry and shed.
+fn equilibrium(w: i64, h: i64, inflow: f32, closed: bool, gpa: Gpa) -> Vec<f32> {
+    var v: Vec<f32> = Vec::new_in(gpa);
+    let ux = if closed { 0.0 } else { inflow as f64 };
+    for i in 0..w * h {
+        let uy = ((i * 2654435761) % 1000) as f64 * 2e-6 - 1e-3;
+        for k in 0..9 {
+            v.push(feq(k, 1.0, ux, uy) as f32);
+        }
+    }
+    v
+}
+
+// The uniform as 12 words: four u32s, then f32s and u32s in the order of
+// the shaders' Params.
+#[pure]
+fn pack(c: Config, w: i64, h: i64, step: i64) -> [u32; 12] {
+    var words: [u32; 12] = [0; 12];
+    words[0] = w as u32;
+    words[1] = h as u32;
+    words[2] = c.view as u32;
+    words[3] = if c.closed { 1 } else { 0 };
+    words[4] = f32_to_bits(c.omega);
+    words[5] = f32_to_bits(c.inflow);
+    words[6] = f32_to_bits(c.diam);
+    words[7] = step as u32;
+    words[8] = if c.probe < 0 { 0 } else { (c.probe) as u32 };
+    words[9] = if c.probe < 0 { 0 } else { 1 };
+    words[10] = f32_to_bits(c.dye_keep);
+    words[11] = 0;
+    words
+}
+
+impl Sim {
+    // A w x h grid on the system's GPU. `probe_len` samples of the probe
+    // series (0 or 1 when there is no probe). The populations are not set:
+    // call `reset` before the first step.
+    pub fn new_in(w: i64, h: i64, probe_len: i64, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let cells = w * h;
+        let ubuf = dev.buffer(48, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let f0 = storage(dev, cells * 9 * 4);
+        let f1 = storage(dev, cells * 9 * 4);
+        let d0 = storage(dev, cells * 4);
+        let d1 = storage(dev, cells * 4);
+        let solid = storage(dev, cells * 4);
+        let probe = storage(dev, if probe_len < 1 { 4 } else { probe_len * 4 });
+
+        let k_lbm = kernel(dev, [COMMON, LBM][..], gpa)?;
+        let k_dye = kernel(dev, [COMMON, DYE][..], gpa)?;
+        let k_probe = kernel(dev, [COMMON, PROBE][..], gpa)?;
+        var rsrc = Buf::new_in(gpa);
+        for p in [COMMON, RENDER] {
+            rsrc.push_str(p);
+        }
+        let rshader = dev.shader_wgsl(rsrc.as_slice())?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(rshader, "vs", "fs",
+            Format::Bgra8Unorm))?;
+
+        let b = gpu::bind;
+        let g_lbm0 = dev.bind_group(k_lbm.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, f1), b(3, solid)][..]);
+        let g_lbm1 = dev.bind_group(k_lbm.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, f0), b(3, solid)][..]);
+        let g_dye0 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, d0), b(3, d1), b(4, solid)][..]);
+        let g_dye1 = dev.bind_group(k_dye.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, d1), b(3, d0), b(4, solid)][..]);
+        let g_probe0 = dev.bind_group(k_probe.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, probe)][..]);
+        let g_probe1 = dev.bind_group(k_probe.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, probe)][..]);
+        let g_render0 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, f0), b(2, d0), b(3, solid)][..]);
+        let g_render1 = dev.bind_group(render.bind_layout(0),
+            [b(0, ubuf), b(1, f1), b(2, d1), b(3, solid)][..]);
+
+        Ok(Sim {
+            dev: dev, queue: queue, w: w, h: h, cur: 0, probe_len: probe_len,
+            ubuf: ubuf, f0: f0, f1: f1, d0: d0, d1: d1, solid: solid, probe: probe,
+            k_lbm: k_lbm, k_dye: k_dye, k_probe: k_probe, render: render,
+            g_lbm0: g_lbm0, g_lbm1: g_lbm1, g_dye0: g_dye0, g_dye1: g_dye1,
+            g_probe0: g_probe0, g_probe1: g_probe1, g_render0: g_render0, g_render1: g_render1,
+            zeros: Vec::filled_in(cells * 4, 0u8, gpa),
+        })
+    }
+
+    // The populations back to the inflow's equilibrium and the dye to
+    // none (the solid mask is not touched).
+    pub fn reset(inout self, c: Config, gpa: Gpa) {
+        let init = equilibrium(self.w, self.h, c.inflow, c.closed, gpa);
+        let bytes = gpu::bytes_of_f32(init.as_slice());
+        self.queue.write_buffer(self.f0, 0, bytes);
+        self.queue.write_buffer(self.f1, 0, bytes);
+        let z = self.zeros.as_slice();
+        self.queue.write_buffer(self.d0, 0, z);
+        self.queue.write_buffer(self.d1, 0, z);
+        self.cur = 0;
+    }
+
+    // The obstacles: one u32 a cell, 1 solid, 0 fluid.
+    pub fn set_solid(inout self, mask: [u32]) {
+        self.queue.write_buffer(self.solid, 0, gpu::bytes_of_u32(mask));
+    }
+
+    // The parameters of the next steps and picture; `step` is the index of
+    // the step a probe sample belongs to.
+    pub fn set_params(inout self, c: Config, step: i64) {
+        let words = pack(c, self.w, self.h, step);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // `n` steps recorded into `enc`, each one: collide and stream the
+    // populations, advect the dye by the new velocity, sample the probe.
+    pub fn record(inout self, enc: inout gpu::Encoder, n: i64) {
+        let c0 = self.cur;
+        let w = self.w;
+        let h = self.h;
+        enc.compute_pass(|pass| {
+            for i in 0..n {
+                if (c0 + i) % 2 == 0 {
+                    run(&pass, self.k_lbm, self.g_lbm0, w, h);
+                    run(&pass, self.k_dye, self.g_dye0, w, h);
+                    run(&pass, self.k_probe, self.g_probe0, 1, 1);
+                } else {
+                    run(&pass, self.k_lbm, self.g_lbm1, w, h);
+                    run(&pass, self.k_dye, self.g_dye1, w, h);
+                    run(&pass, self.k_probe, self.g_probe1, 1, 1);
+                }
+            }
+        });
+        self.cur = (c0 + n) % 2;
+    }
+
+    // The picture of the latest state into `target`.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        if self.cur == 0 {
+            enc.render_pass(PassDesc::color(target), |pass| {
+                pass.set_pipeline(self.render);
+                pass.set_bind_group(0, self.g_render0);
+                pass.draw(0..3, 0..1);
+            });
+        } else {
+            enc.render_pass(PassDesc::color(target), |pass| {
+                pass.set_pipeline(self.render);
+                pass.set_bind_group(0, self.g_render1);
+                pass.draw(0..3, 0..1);
+            });
+        }
+    }
+
+    // The mass, the largest speed and finiteness over the fluid cells of
+    // the latest state (reads the populations back once).
+    pub fn stats(inout self, solid: [u32]) -> Stats {
+        let _ = self.queue.wait_idle();
+        let f = if self.cur == 0 {
+            gpu::f32s(self.f0.map_read(self.dev))
+        } else {
+            gpu::f32s(self.f1.map_read(self.dev))
+        };
+        var mass = 0.0;
+        var vmax = 0.0;
+        var finite = true;
+        for c in 0..(self.w * self.h) {
+            if solid[c] != 0 {
+                continue;
+            }
+            var rho = 0.0;
+            var mx = 0.0;
+            var my = 0.0;
+            for k in 0..9 {
+                let v = f[9 * c + k] as f64;
+                rho += v;
+                mx += CX[k] as f64 * v;
+                my += CY[k] as f64 * v;
+            }
+            if rho - rho != 0.0 || mx - mx != 0.0 || my - my != 0.0 {
+                finite = false;
+            }
+            mass += rho;
+            let s = (mx * mx + my * my).sqrt() / rho;
+            if s > vmax {
+                vmax = s;
+            }
+        }
+        Stats { mass: mass, max_speed: vmax, finite: finite }
+    }
+
+    // The first n samples of the probe's series, one y velocity a step
+    // (waits for the GPU).
+    pub fn probe_series(inout self, n: i64, gpa: Gpa) -> Vec<f32> {
+        let _ = self.queue.wait_idle();
+        let all = gpu::f32s(self.probe.map_read(self.dev));
+        var out: Vec<f32> = Vec::new_in(gpa);
+        for i in 0..n {
+            out.push(all[i]);
+        }
+        out
+    }
+
+    // The picture of the latest state, w x h pixels, as a binary PPM
+    // (waits for the GPU): the window's screenshot.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

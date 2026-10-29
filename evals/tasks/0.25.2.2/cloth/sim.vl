@@ -1,0 +1,361 @@
+// The simulation and its picture, all on the GPU. The buffers are made once
+// (`Sim::new_in`); a frame is `set_frame` (the uniform: gravity, wind, the
+// sphere, the grab, the camera), then `step` (substeps of predict, solve
+// sweeps of the colour classes and collide, update; then the normals) and
+// `draw`, recorded into one encoder. Nothing is read back in the frame loop; `read` is for the checks
+// and for a mouse press (the pick).
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Format, PassDesc, RenderDesc, TextureUsage};
+
+use cloth::{Camera, V3, v3};
+use shaders::{
+    CLASS, CLOTH_RENDER, COLLIDE, COMMON, FLOOR_RENDER, NORMALS, PREDICT, SPHERE_RENDER, UPDATE,
+};
+
+// The sphere's mesh (sphere_render in shaders.vl): 48 x 32 quads.
+const SPHERE_VERTICES: i64 = 48 * 32 * 6;
+
+// What changes from frame to frame.
+pub struct Frame {
+    // seconds this frame
+    pub dt: f32,
+    // seconds since the start (the wind's gusts)
+    pub time: f32,
+    // the gravity's strength, along -y
+    pub gravity: f32,
+    // the wind's strength (0: none) along `wind`
+    pub wind: f32,
+    pub wind_dir: V3,
+    // the particle held by the mouse (-1: none) and where it is held
+    pub grab: i64,
+    pub grab_at: V3,
+    pub cam: Camera,
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // the cloth is n x n particles
+    pub n: i64,
+    // constraint sweeps a substep (each sweep solves the 12 colours once)
+    pub iters: i64,
+    pub substeps: i64,
+    // the rest length between neighbours, the floor's height, the damping
+    // (what is kept of a velocity per substep)
+    pub spacing: f32,
+    pub floor: f32,
+    pub damping: f32,
+    // the sphere: centre and radius; off when `sphere_on` is false
+    pub sph_c: V3,
+    pub sph_r: f32,
+    pub sphere_on: bool,
+    // the start of the cloth (positions, velocities at rest)
+    init: Vec<f32>,
+    zeros: Vec<f32>,
+    ubuf: gpu::Buffer,
+    xb: gpu::Buffer,
+    vb: gpu::Buffer,
+    pa: gpu::Buffer,
+    cbufs: Vec<gpu::Buffer>,
+    nb: gpu::Buffer,
+    stage_x: gpu::Buffer,
+    stage_v: gpu::Buffer,
+    depth: gpu::Texture,
+    k_predict: gpu::ComputePipeline,
+    k_class: gpu::ComputePipeline,
+    k_collide: gpu::ComputePipeline,
+    k_update: gpu::ComputePipeline,
+    k_normals: gpu::ComputePipeline,
+    g_predict: gpu::BindGroup,
+    g_classes: Vec<gpu::BindGroup>,
+    g_collide: gpu::BindGroup,
+    g_update: gpu::BindGroup,
+    g_normals: gpu::BindGroup,
+    cloth_pipe: gpu::RenderPipeline,
+    sphere_pipe: gpu::RenderPipeline,
+    floor_pipe: gpu::RenderPipeline,
+    g_cloth: gpu::BindGroup,
+    g_sphere: gpu::BindGroup,
+    g_floor: gpu::BindGroup,
+}
+
+// A module of `parts` (the shared prefix and one kernel or picture), its
+// entry point `main`.
+fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+// A picture: a module of `parts` with the vertex entry `vs` and fragment
+// `fs`, drawn into Bgra8Unorm with a depth test.
+fn picture(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::RenderPipeline, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    var desc = RenderDesc::new(shader, "vs", "fs", Format::Bgra8Unorm);
+    desc.depth(Format::Depth32Float);
+    dev.render_pipeline(desc)
+}
+
+// One kernel over `groups` workgroups, in a compute pass of its own.
+fn dispatch1(enc: inout gpu::Encoder, p: gpu::ComputePipeline, g: gpu::BindGroup, groups: i64) {
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, g);
+        pass.dispatch(groups);
+    });
+}
+
+// The colour c of the distance constraints, as (k, axis, modulus, residue):
+// 0-1 stretch along x, 2-3 stretch along y, 4-7 bend along x, 8-11 bend
+// along y (see CLASS in shaders.vl).
+fn class_of(c: i64) -> (i64, i64, i64, i64) {
+    if c < 2 {
+        (1, 0, 2, c)
+    } else if c < 4 {
+        (1, 1, 2, c - 2)
+    } else if c < 8 {
+        (2, 0, 4, c - 4)
+    } else {
+        (2, 1, 4, c - 8)
+    }
+}
+
+// The uniform's floats, in the order of shaders.vl's `Prm`.
+fn pack(s: Sim, f: Frame, w: i64, h: i64) -> [f32; 44] {
+    var u: [f32; 44] = [0.0; 44];
+    let sub = f.dt / s.substeps as f32;
+    let wd = f.wind_dir.norm();
+    let light = v3(0.45, 1.0, 0.7).norm();
+    let c = f.cam;
+    u[0] = sub;
+    u[1] = -f.gravity;
+    u[2] = 0.0;
+    u[3] = s.damping;
+    u[4] = wd.x;
+    u[5] = wd.y;
+    u[6] = wd.z;
+    u[7] = f.wind;
+    u[8] = s.sph_c.x;
+    u[9] = s.sph_c.y;
+    u[10] = s.sph_c.z;
+    u[11] = if s.sphere_on { s.sph_r } else { 0.0 };
+    u[12] = f.grab_at.x;
+    u[13] = f.grab_at.y;
+    u[14] = f.grab_at.z;
+    u[15] = f.grab as f32;
+    u[16] = s.n as f32;
+    u[17] = s.spacing;
+    u[18] = s.floor;
+    u[19] = f.time;
+    u[20] = c.eye.x;
+    u[21] = c.eye.y;
+    u[22] = c.eye.z;
+    u[24] = c.right.x;
+    u[25] = c.right.y;
+    u[26] = c.right.z;
+    u[28] = c.up.x;
+    u[29] = c.up.y;
+    u[30] = c.up.z;
+    u[32] = c.fwd.x;
+    u[33] = c.fwd.y;
+    u[34] = c.fwd.z;
+    u[36] = c.focal;
+    u[37] = w as f32 / h as f32;
+    u[38] = c.near;
+    u[39] = c.far;
+    u[40] = light.x;
+    u[41] = light.y;
+    u[42] = light.z;
+    u[43] = 0.22;
+    u
+}
+
+impl Sim {
+    // The cloth of n x n particles, spaced 2.4 / (n - 1) apart at rest (a
+    // 2.4-wide sheet), starting `stretch` times longer; pictures of `w` x `h`.
+    pub fn new_in(n: i64, iters: i64, w: i64, h: i64, stretch: f32, gpa: Gpa) -> Result<Sim,
+        gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let spacing = 2.4 / (n - 1) as f32;
+        let init = cloth::initial(n, spacing, stretch, 1.4, 0.25, gpa);
+        var zeros: Vec<f32> = Vec::new_in(gpa);
+        for _ in 0..n * n * 4 {
+            zeros.push(0.0);
+        }
+        let bytes = n * n * 16;
+        let storage = BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC;
+        let xb = dev.buffer_init(gpu::bytes_of_f32(init.as_slice()), storage);
+        let vb = dev.buffer_init(gpu::bytes_of_f32(zeros.as_slice()), storage);
+        let pa = dev.buffer(bytes, BufferUsage::STORAGE);
+        let nb = dev.buffer(bytes, BufferUsage::STORAGE);
+        let ubuf = dev.buffer(176, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let stage_x = dev.buffer(bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        let stage_v = dev.buffer(bytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        let depth = dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+
+        let k_predict = kernel(dev, [COMMON, PREDICT][..], gpa)?;
+        let k_class = kernel(dev, [COMMON, CLASS][..], gpa)?;
+        let k_collide = kernel(dev, [COMMON, COLLIDE][..], gpa)?;
+        let k_update = kernel(dev, [COMMON, UPDATE][..], gpa)?;
+        let k_normals = kernel(dev, [COMMON, NORMALS][..], gpa)?;
+        let cloth_p = picture(dev, [COMMON, CLOTH_RENDER][..], gpa)?;
+        let sphere_p = picture(dev, [COMMON, SPHERE_RENDER][..], gpa)?;
+        let floor_p = picture(dev, [COMMON, FLOOR_RENDER][..], gpa)?;
+
+        let g_predict = dev.bind_group(k_predict.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, xb), gpu::bind(2, vb), gpu::bind(3, pa)][..]);
+        var cbufs: Vec<gpu::Buffer> = Vec::new_in(gpa);
+        var g_classes: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+        for c in 0..12 {
+            let (k, axis, m, r) = class_of(c);
+            var cv: [f32; 4] = [k as f32, axis as f32, m as f32, r as f32];
+            cbufs.push(dev.buffer_init(gpu::bytes_of_f32(cv[..]), BufferUsage::UNIFORM));
+            g_classes.push(dev.bind_group(k_class.bind_layout(0),
+                [gpu::bind(0, ubuf), gpu::bind(1, cbufs[c]), gpu::bind(2, pa)][..]));
+        }
+        let g_collide = dev.bind_group(k_collide.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, pa)][..]);
+        let g_update = dev.bind_group(k_update.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, pa), gpu::bind(2, xb), gpu::bind(3, vb)][..]);
+        let g_normals = dev.bind_group(k_normals.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, xb), gpu::bind(2, nb)][..]);
+        let g_cloth = dev.bind_group(cloth_p.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, xb), gpu::bind(2, nb)][..]);
+        let g_sphere = dev.bind_group(sphere_p.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+        let g_floor = dev.bind_group(floor_p.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+
+        Ok(Sim {
+            dev: dev, queue: queue, n: n, iters: iters, substeps: 4, spacing: spacing,
+            floor: -1.2, damping: 0.99, sph_c: v3(0.0, -0.35, 0.0), sph_r: 0.45,
+            sphere_on: true, init: init, zeros: zeros, ubuf: ubuf, xb: xb, vb: vb, pa: pa,
+            cbufs: cbufs, nb: nb, stage_x: stage_x, stage_v: stage_v, depth: depth,
+            k_predict: k_predict, k_class: k_class, k_collide: k_collide, k_update: k_update,
+            k_normals: k_normals, g_predict: g_predict, g_classes: g_classes,
+            g_collide: g_collide, g_update: g_update,
+            g_normals: g_normals, cloth_pipe: cloth_p, sphere_pipe: sphere_p, floor_pipe: floor_p,
+            g_cloth: g_cloth, g_sphere: g_sphere, g_floor: g_floor,
+        })
+    }
+
+    // The cloth back at its start, at rest.
+    pub fn reset(inout self) {
+        self.queue.write_buffer(self.xb, 0, gpu::bytes_of_f32(self.init.as_slice()));
+        self.queue.write_buffer(self.vb, 0, gpu::bytes_of_f32(self.zeros.as_slice()));
+    }
+
+    pub fn depth_view(self) -> gpu::TextureView {
+        self.depth.view()
+    }
+
+    // The depth buffer for pictures of w x h (on a resize).
+    pub fn resize(inout self, w: i64, h: i64) {
+        self.depth = self.dev.texture(w, h, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT);
+    }
+
+    // The frame's uniform: written before the frame's commands are submitted.
+    pub fn set_frame(inout self, f: Frame, w: i64, h: i64) {
+        var u = pack(self, f, w, h);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+    }
+
+    // The substeps and the normals. Each dispatch is its own compute pass, so
+    // that each colour sees the one before it. A sweep solves the 12 colours
+    // of the distance constraints, then the collisions.
+    pub fn step(self, enc: inout gpu::Encoder) {
+        let groups = (self.n * self.n + 63) / 64;
+        for _ in 0..self.substeps {
+            dispatch1(&enc, self.k_predict, self.g_predict, groups);
+            for _ in 0..self.iters {
+                for c in 0..12 {
+                    dispatch1(&enc, self.k_class, self.g_classes[c], groups);
+                }
+                dispatch1(&enc, self.k_collide, self.g_collide, groups);
+            }
+            dispatch1(&enc, self.k_update, self.g_update, groups);
+        }
+        dispatch1(&enc, self.k_normals, self.g_normals, groups);
+    }
+
+    // The scene into a colour view and its depth view: the floor, the
+    // sphere (when on), the cloth.
+    pub fn draw(self, enc: inout gpu::Encoder, view: gpu::TextureView, dv: gpu::TextureView) {
+        let fl = self.floor_pipe;
+        let fg = self.g_floor;
+        let sp = self.sphere_pipe;
+        let sg = self.g_sphere;
+        let on = self.sphere_on;
+        let cl = self.cloth_pipe;
+        let cg = self.g_cloth;
+        let cloth_count = 6 * (self.n - 1) * (self.n - 1);
+        enc.render_pass(PassDesc::color(view, Color::rgba(0.07, 0.08, 0.1, 1.0)).with_depth(dv),
+            |pass| {
+                pass.set_pipeline(fl);
+                pass.set_bind_group(0, fg);
+                pass.draw(0..6, 0..1);
+                if on {
+                    pass.set_pipeline(sp);
+                    pass.set_bind_group(0, sg);
+                    pass.draw(0..SPHERE_VERTICES, 0..1);
+                }
+                pass.set_pipeline(cl);
+                pass.set_bind_group(0, cg);
+                pass.draw(0..cloth_count, 0..1);
+            });
+    }
+
+    // The positions and velocities as the GPU has them (waits for the GPU).
+    // Each is n * n xyzw f32s: w of a position is its inverse mass.
+    pub fn read(inout self, gpa: Gpa) -> (Vec<f32>, Vec<f32>) {
+        var enc = self.dev.encoder();
+        let bytes = self.n * self.n * 16;
+        enc.copy_buffer(self.xb, 0, self.stage_x, 0, bytes);
+        enc.copy_buffer(self.vb, 0, self.stage_v, 0, bytes);
+        self.queue.submit(enc.finish());
+        var xs: Vec<f32> = Vec::new_in(gpa);
+        let px = gpu::f32s(self.stage_x.map_read(self.dev));
+        for i in 0..px.len() {
+            xs.push(px[i]);
+        }
+        var vs: Vec<f32> = Vec::new_in(gpa);
+        let pv = gpu::f32s(self.stage_v.map_read(self.dev));
+        for i in 0..pv.len() {
+            vs.push(pv[i]);
+        }
+        (xs, vs)
+    }
+
+    // The frame's picture as a PPM (P6) of w x h, from the current state.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let depth = self.dev.texture(w, h, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view(), depth.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}

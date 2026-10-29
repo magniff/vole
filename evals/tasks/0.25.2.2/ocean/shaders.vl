@@ -1,0 +1,169 @@
+// The WGSL of the ocean. Three modules: the spectrum's time evolution
+// (one kernel per texel), one radix-2 Stockham FFT stage (run 2 log2 N
+// times per inverse 2D transform, ping-ponging between two buffers),
+// and the picture (a sky pass and the displaced water mesh).
+//
+// Complex numbers are vec2<f32> (x real, y imaginary). A field buffer
+// holds the five spectra one after the other, each N x N texels (row z,
+// column x at index z * N + x): 0 height, 1 choppy Dx, 2 choppy Dz,
+// 3 the slope dh/dx, 4 the slope dh/dz.
+
+pub const SPECTRUM: [u8] = "struct S { n: u32, length: f32, time: f32, pad: f32 }\n\
+@group(0) @binding(0) var<uniform> s: S;\n\
+@group(0) @binding(1) var<storage, read> h0: array<vec2<f32>>;\n\
+@group(0) @binding(2) var<storage, read_write> buf: array<vec2<f32>>;\n\
+const PI: f32 = 3.14159265358979;\n\
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {\n\
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n\
+}\n\
+fn wave_number(i: u32, n: u32, length: f32) -> f32 {\n\
+    var m = i32(i);\n\
+    if (i >= n / 2u) { m = m - i32(n); }\n\
+    return 2.0 * PI * f32(m) / length;\n\
+}\n\
+@compute @workgroup_size(8, 8) fn spectrum(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let n = s.n;\n\
+    if (id.x >= n || id.y >= n) { return; }\n\
+    let idx = id.y * n + id.x;\n\
+    let kx = wave_number(id.x, n, s.length);\n\
+    let kz = wave_number(id.y, n, s.length);\n\
+    let k = length(vec2<f32>(kx, kz));\n\
+    let nidx = ((n - id.y) % n) * n + (n - id.x) % n;\n\
+    let ph = sqrt(9.81 * k) * s.time;\n\
+    let e = vec2<f32>(cos(ph), sin(ph));\n\
+    let hm = vec2<f32>(h0[nidx].x, -h0[nidx].y);\n\
+    let h = cmul(h0[idx], e) + cmul(hm, vec2<f32>(e.x, -e.y));\n\
+    let inv = select(0.0, 1.0 / k, k > 0.0);\n\
+    let minus_i = vec2<f32>(h.y, -h.x);\n\
+    let plus_i = vec2<f32>(-h.y, h.x);\n\
+    let st = n * n;\n\
+    buf[idx] = h;\n\
+    buf[st + idx] = minus_i * (kx * inv);\n\
+    buf[2u * st + idx] = minus_i * (kz * inv);\n\
+    buf[3u * st + idx] = plus_i * kx;\n\
+    buf[4u * st + idx] = plus_i * kz;\n\
+}\n";
+
+// One stage of the Stockham autosort FFT (decimation in time), over
+// `count` fields at once (the z of the dispatch). A line is a row (the
+// x transform) or a column (the z transform): element e of line y is at
+// y * line_step + e * stride. Stage s takes spans ns = 2^s: butterfly i
+// reads i and i + n/2, writes 2 * ns * (i / ns) + i % ns and that + ns.
+// sign +1 is the inverse transform (unnormalised).
+pub const FFT_STAGE: [u8] = "struct F { n: u32, ns: u32, stride: u32, line_step: u32, sign: f32, count: u32, pad0: u32, pad1: u32 }\n\
+@group(0) @binding(0) var<uniform> f: F;\n\
+@group(0) @binding(1) var<storage, read> src: array<vec2<f32>>;\n\
+@group(0) @binding(2) var<storage, read_write> dst: array<vec2<f32>>;\n\
+const PI: f32 = 3.14159265358979;\n\
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {\n\
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n\
+}\n\
+@compute @workgroup_size(8, 8, 1) fn stage(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let half = f.n / 2u;\n\
+    if (id.x >= half || id.y >= f.n || id.z >= f.count) { return; }\n\
+    let base = id.z * f.n * f.n + id.y * f.line_step;\n\
+    let j = id.x % f.ns;\n\
+    let ang = f.sign * 2.0 * PI * f32(j) / f32(2u * f.ns);\n\
+    let w = vec2<f32>(cos(ang), sin(ang));\n\
+    let x0 = src[base + id.x * f.stride];\n\
+    let x1 = cmul(w, src[base + (id.x + half) * f.stride]);\n\
+    let o = (id.x / f.ns) * 2u * f.ns + j;\n\
+    dst[base + o * f.stride] = x0 + x1;\n\
+    dst[base + (o + f.ns) * f.stride] = x0 - x1;\n\
+}\n";
+
+// The picture. `cam` holds the eye, the camera's basis, the sun's
+// direction, the lens (tan of half the field of view, aspect, near, far)
+// and the grid (N, the cell size, the choppiness, the time).
+pub const RENDER: [u8] = "struct Cam {\n\
+    eye: vec4<f32>,\n\
+    fwd: vec4<f32>,\n\
+    right: vec4<f32>,\n\
+    up: vec4<f32>,\n\
+    sun: vec4<f32>,\n\
+    lens: vec4<f32>,\n\
+    grid: vec4<f32>,\n\
+}\n\
+@group(0) @binding(0) var<uniform> cam: Cam;\n\
+@group(0) @binding(1) var<storage, read> field: array<vec2<f32>>;\n\
+struct Vout {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) world: vec3<f32>,\n\
+    @location(1) normal: vec3<f32>,\n\
+    @location(2) foam: f32,\n\
+}\n\
+struct SkyOut {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) ndc: vec2<f32>,\n\
+}\n\
+fn sky(d: vec3<f32>) -> vec3<f32> {\n\
+    let t = pow(clamp(d.y, 0.0, 1.0), 0.45);\n\
+    let c = mix(vec3<f32>(0.80, 0.87, 0.95), vec3<f32>(0.18, 0.40, 0.80), t);\n\
+    let s = max(dot(d, cam.sun.xyz), 0.0);\n\
+    return c + vec3<f32>(1.0, 0.92, 0.75) * (pow(s, 4000.0) * 60.0 + pow(s, 12.0) * 0.18);\n\
+}\n\
+fn at(f: i32, x: i32, z: i32) -> f32 {\n\
+    let n = i32(cam.grid.x);\n\
+    let xc = clamp(x, 0, n - 1);\n\
+    let zc = clamp(z, 0, n - 1);\n\
+    return field[u32(f * n * n + zc * n + xc)].x;\n\
+}\n\
+@vertex fn vs(@builtin(vertex_index) v: u32) -> Vout {\n\
+    let quads = u32(cam.grid.x) - 1u;\n\
+    let q = v / 6u;\n\
+    let c = v % 6u;\n\
+    let gx = i32(q % quads) + select(0i, 1i, c == 1u || c == 4u || c == 5u);\n\
+    let gz = i32(q / quads) + select(0i, 1i, c == 2u || c == 3u || c == 5u);\n\
+    let n = cam.grid.x;\n\
+    let dx = cam.grid.y;\n\
+    let lam = cam.grid.z;\n\
+    let h = at(0, gx, gz);\n\
+    let dxx = at(1, gx, gz);\n\
+    let dzz = at(2, gx, gz);\n\
+    let sx = at(3, gx, gz);\n\
+    let sz = at(4, gx, gz);\n\
+    let dxdx = (at(1, gx + 1, gz) - at(1, gx - 1, gz)) / (2.0 * dx);\n\
+    let dxdz = (at(1, gx, gz + 1) - at(1, gx, gz - 1)) / (2.0 * dx);\n\
+    let dzdx = (at(2, gx + 1, gz) - at(2, gx - 1, gz)) / (2.0 * dx);\n\
+    let dzdz = (at(2, gx, gz + 1) - at(2, gx, gz - 1)) / (2.0 * dx);\n\
+    let jac = (1.0 - lam * dxdx) * (1.0 - lam * dzdz) - lam * lam * dxdz * dzdx;\n\
+    let foam = clamp((1.0 - jac) * 2.5 - 0.3, 0.0, 1.0);\n\
+    let hn = n * 0.5;\n\
+    let pos = vec3<f32>((f32(gx) - hn) * dx - lam * dxx, h, (f32(gz) - hn) * dx - lam * dzz);\n\
+    let nrm = normalize(vec3<f32>(-sx, 1.0, -sz));\n\
+    let d = pos - cam.eye.xyz;\n\
+    let xc = dot(d, cam.right.xyz);\n\
+    let yc = dot(d, cam.up.xyz);\n\
+    let zc = dot(d, cam.fwd.xyz);\n\
+    let th = cam.lens.x;\n\
+    let asp = cam.lens.y;\n\
+    let nr = cam.lens.z;\n\
+    let fa = cam.lens.w;\n\
+    let clip = vec4<f32>(xc / (th * asp), yc / th, zc * fa / (fa - nr) - fa * nr / (fa - nr), zc);\n\
+    return Vout(clip, pos, nrm, foam);\n\
+}\n\
+@fragment fn fs(v: Vout) -> @location(0) vec4<f32> {\n\
+    let n = normalize(v.normal);\n\
+    let view = normalize(cam.eye.xyz - v.world);\n\
+    let cosv = clamp(dot(n, view), 0.0, 1.0);\n\
+    let fres = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);\n\
+    let r = reflect(-view, n);\n\
+    var c = mix(vec3<f32>(0.01, 0.06, 0.08), sky(r), fres);\n\
+    let hv = normalize(view + cam.sun.xyz);\n\
+    c = c + vec3<f32>(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 500.0) * 3.0;\n\
+    c = mix(c, vec3<f32>(0.90, 0.93, 0.95), v.foam * 0.8);\n\
+    let dist = length(cam.eye.xyz - v.world);\n\
+    c = mix(c, vec3<f32>(0.80, 0.87, 0.95), 1.0 - exp(-dist * 0.006));\n\
+    return vec4<f32>(c, 1.0);\n\
+}\n\
+@vertex fn sky_vs(@builtin(vertex_index) i: u32) -> SkyOut {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return SkyOut(vec4<f32>(p, 1.0, 1.0), p);\n\
+}\n\
+@fragment fn sky_fs(v: SkyOut) -> @location(0) vec4<f32> {\n\
+    let th = cam.lens.x;\n\
+    let d = normalize(cam.fwd.xyz + cam.right.xyz * (v.ndc.x * th * cam.lens.y) + cam.up.xyz * (v.ndc.y * th));\n\
+    return vec4<f32>(sky(d), 1.0);\n\
+}\n";

@@ -1,0 +1,291 @@
+// terrain: a procedural fly-over. The heights are fractal noise computed
+// on the GPU; the terrain is a grid of 16 x 16 chunks, each drawn at a
+// level of detail (1, 2, 4 or 8 grid cells a quad) by its distance to the
+// eye, with skirts against cracks; the sun casts a shadow map from a
+// depth-only pass; fog; materials by height and slope (sand, grass, rock,
+// snow); the sea at height 0.
+//
+//   terrain                              the window: a fly-over (space pauses, q quits)
+//   terrain --headless                   no window: the numbers and the checks
+//   terrain --headless --shot F.ppm --camera N   camera N (0, 1, 2) as a PPM image
+//   terrain --frames N                   the window for N frames, then the mean frame time
+//
+// scene.vl is the GPU side, terrain.vl the level of detail, mat.vl the
+// matrices, shaders.vl the WGSL.
+
+mod mat;
+mod terrain;
+mod shaders;
+mod scene;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::time::monotonic_now;
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical};
+
+use mat::V3;
+use scene::{Scene, SHADOW};
+use terrain::{SEA, histogram, triangles, full_triangles, lod_steps};
+
+// the headless picture's size (the stride is padded to 256 bytes)
+const W: i64 = 960;
+const H: i64 = 540;
+
+// The fixed cameras: an eye and a target.
+fn camera(i: i64) -> (V3, V3) {
+    if i == 1 {
+        (V3::new(-120.0, 30.0, -470.0), V3::new(150.0, 0.0, 100.0))
+    } else if i == 2 {
+        (V3::new(260.0, 200.0, 260.0), V3::new(-100.0, -20.0, -50.0))
+    } else {
+        (V3::new(-380.0, 110.0, -380.0), V3::new(0.0, 10.0, 0.0))
+    }
+}
+
+// The fly-over at time t seconds: a low pass along x that weaves in z.
+fn fly(t: f32) -> (V3, V3) {
+    let eye = V3::new(-500.0 + 45.0 * t, 110.0 + 12.0 * (0.25 * t).sin(), 220.0 * (0.06 * t).sin());
+    let dir = V3::new(1.0, -0.22, 0.35 * (0.06 * t).cos()).norm();
+    (eye, eye.add(dir.scale(300.0)))
+}
+
+fn view_proj(eye: V3, target: V3, aspect: f32) -> [f32; 16] {
+    mat::mul(mat::perspective(1.0, aspect, 1.0, 3000.0), mat::look_at(eye, target, V3::new(0.0, 1.0, 0.0)))
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// Writes the BGRA picture (rows `stride` bytes apart) as a binary PPM.
+fn write_ppm(px: [u8], w: i64, h: i64, stride: i64, path: [u8], gpa: Gpa) -> bool {
+    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            b.push(px[i + 2]);
+            b.push(px[i + 1]);
+            b.push(px[i]);
+        }
+    }
+    std::fs::write(path, b.as_slice()).is_ok()
+}
+
+// The headless run: the heights' range, the level of detail of each
+// fixed camera, the shadow map's coverage, and optionally one picture.
+// Returns the number of failed checks.
+fn headless(seed: i64, cam: i64, shot: [u8], gpa: Gpa) -> Result<i64, gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var s = Scene::new_in(dev, queue, seed)?;
+    var failed: i64 = 0;
+
+    // the heights
+    let hs = s.read_heights();
+    var lo: f32 = 1.0e9;
+    var hi: f32 = -1.0e9;
+    var sum: f64 = 0.0;
+    var under: i64 = 0;
+    var nan: i64 = 0;
+    for i in 0..hs.len() {
+        let h = hs[i];
+        if h != h {
+            nan += 1;
+            continue;
+        }
+        lo = lo.min(h);
+        hi = hi.max(h);
+        sum += h as f64;
+        if h < SEA {
+            under += 1;
+        }
+    }
+    let count = (hs.len() - nan) as f64;
+    let frac = under as f64 / count;
+    println(f"heights: {hs.len()} samples, min {lo:.1}, max {hi:.1}, mean {sum / count:.1}, under sea level {frac * 100.0:.1}%");
+    let relief = hi - lo > 60.0 && lo < SEA && hi > SEA;
+    let sea_ok = frac > 0.05 && frac < 0.6;
+    println(f"  check range: land and sea both, relief over 60: {verdict(relief)}");
+    println(f"  check sea: between 5% and 60% of the samples under it: {verdict(sea_ok)}");
+    println(f"  check finite: {nan} NaN samples: {verdict(nan == 0)}");
+    if !relief { failed += 1; }
+    if !sea_ok { failed += 1; }
+    if nan != 0 { failed += 1; }
+
+    // the level of detail, per fixed camera
+    let full = full_triangles();
+    for i in 0..3 {
+        let (eye, _) = camera(i);
+        let steps = lod_steps(eye);
+        let h = histogram(steps);
+        let t = triangles(steps);
+        println(f"camera {i}: chunks at step 1/2/4/8: {h[0]}/{h[1]}/{h[2]}/{h[3]}, {t} triangles of {full} at full detail ({t * 100 / full}%)");
+        if t >= full {
+            failed += 1;
+        }
+    }
+    let fly_steps = lod_steps(fly(0.0).0);
+    println(f"fly-over at t=0: triangles {triangles(fly_steps)}");
+
+    // the shadow map: how much of it the terrain covers
+    s.update(view_proj(camera(cam).0, camera(cam).1, W as f32 / H as f32), camera(cam).0, 0.0);
+    var enc = s.dev.encoder();
+    s.shadow_pass(&enc);
+    let sbytes = SHADOW * SHADOW * 4;
+    var sbuf = s.dev.buffer(sbytes, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    enc.copy_texture_to_buffer(s.shadow, sbuf, SHADOW * 4);
+    s.queue.submit(enc.finish());
+    let depth = gpu_f32s_count_below(sbuf.map_read(s.dev), 1.0);
+    let covered = depth as f64 / (SHADOW * SHADOW) as f64;
+    let shadow_ok = covered > 0.02 && covered < 0.9;
+    println(f"shadow map {SHADOW} x {SHADOW}: the terrain covers {covered * 100.0:.1}% of it: check {verdict(shadow_ok)}");
+    if !shadow_ok { failed += 1; }
+
+    // one picture
+    if shot.len() > 0 {
+        let (eye, target) = camera(cam);
+        s.update(view_proj(eye, target, W as f32 / H as f32), eye, 0.0);
+        let color = s.dev.texture(W, H, Format::Bgra8Unorm, usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let dtex = s.dev.texture(W, H, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+        let stride = (W * 4 + 255) / 256 * 256;
+        var out = s.dev.buffer(stride * H, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var fenc = s.dev.encoder();
+        s.frame(&fenc, color.view(), dtex.view());
+        fenc.copy_texture_to_buffer(color, out, stride);
+        s.queue.submit(fenc.finish());
+        let px = out.map_read(s.dev);
+        if write_ppm(px, W, H, stride, shot, gpa) {
+            println(f"wrote {shot}: camera {cam}, {W} x {H}");
+        } else {
+            eprintln(f"terrain: cannot write {shot}");
+            failed += 1;
+        }
+    }
+    Ok(failed)
+}
+
+// How many of the f32 depths are below `limit`.
+fn gpu_f32s_count_below(bytes: [u8], limit: f32) -> i64 {
+    let d = gpu::f32s(bytes);
+    var n: i64 = 0;
+    for i in 0..d.len() {
+        if d[i] < limit {
+            n += 1;
+        }
+    }
+    n
+}
+
+// The window: the fly-over, `frames` frames if asked, then the mean.
+fn windowed(seed: i64, frames: i64, gpa: Gpa) -> Result<i64, gpu::Error> {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("terrain: no window server (try --headless)");
+            return Ok(1);
+        }
+    };
+    var win = match app.window(WindowDesc::new("terrain", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("terrain: no window");
+            return Ok(1);
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, queue) = inst.adapter()?.device()?;
+    var s = Scene::new_in(dev, queue, seed)?;
+    var surf = inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface()))?;
+    var sz = win.size();
+    surf.configure(s.dev, sz.w, sz.h);
+    var depth = s.dev.texture(sz.w, sz.h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+    var t: f32 = 0.0;
+    var paused = false;
+    var n: i64 = 0;
+    var first: f64 = 0.0;
+    var start = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if !paused {
+                    t += 1.0 / 60.0;
+                }
+                let (eye, target) = fly(t);
+                s.update(view_proj(eye, target, sz.w as f32 / sz.h as f32), eye, t);
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = s.dev.encoder();
+                        s.frame(&enc, f.texture.view(), depth.view());
+                        s.queue.submit(enc.finish());
+                        f.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                n += 1;
+                if n == 1 {
+                    start = monotonic_now();
+                }
+                if frames > 0 && n >= frames + 1 {
+                    let ms = (monotonic_now().saturating_sub(start)).as_secs_f64() * 1000.0 / frames as f64;
+                    println(f"{frames} frames, {ms:.2} ms a frame");
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, sz2)) => {
+                sz = sz2;
+                surf.configure(s.dev, sz.w, sz.h);
+                depth = s.dev.texture(sz.w, sz.h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime {
+                    match k.key {
+                        Logical::Char(c) => {
+                            if c == ' ' as u32 {
+                                paused = !paused;
+                            } else if c == 'q' as u32 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Close(_)) | Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    let _ = first;
+    Ok(0)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("terrain", gpa)
+        .arg(Arg::flag("headless").help("no window: the heights, the level of detail and the checks"))
+        .arg(Arg::option("shot").value_name("FILE.ppm").help("headless: the camera as a PPM image"))
+        .arg(Arg::option("camera").value_name("N").default("0").help("the fixed camera for --shot: 0, 1 or 2"))
+        .arg(Arg::option("seed").value_name("N").default("1").help("the noise's seed"))
+        .arg(Arg::option("frames").value_name("N").default("0").help("window: quit after N frames and print the mean"));
+    let m = cli.parse_or_exit(env::args());
+    let seed = parse_int(m.get("seed").unwrap_or("1")).unwrap_or(1);
+    let cam = parse_int(m.get("camera").unwrap_or("0")).unwrap_or(0);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    let shot = m.get("shot").unwrap_or("");
+    let result = if m.flag("headless") {
+        headless(seed, cam, shot, gpa)
+    } else {
+        windowed(seed, frames, gpa)
+    };
+    match result {
+        Ok(0) => 0,
+        Ok(_) => 1,
+        Err(e) => {
+            eprintln(f"terrain: {e}");
+            1
+        }
+    }
+}

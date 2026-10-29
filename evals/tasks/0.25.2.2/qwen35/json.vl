@@ -1,0 +1,211 @@
+// A small JSON reader: enough for config.json, the safetensors header and
+// reference.json. Numbers are f64; strings are their bytes (escapes decoded).
+
+pub enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(Vec<u8>),
+    Arr(Vec<Json>),
+    Obj(Vec<Member>),
+}
+
+pub struct Member {
+    key: Vec<u8>,
+    val: Json,
+}
+
+fn skip_ws(s: [u8], i: inout i64) {
+    while i < s.len() && (s[i] == 32 || s[i] == 10 || s[i] == 13 || s[i] == 9) {
+        i += 1;
+    }
+}
+
+fn hex_val(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { return (c - '0') as i64; }
+    if c >= 'a' && c <= 'f' { return (c - 'a') as i64 + 10; }
+    if c >= 'A' && c <= 'F' { return (c - 'A') as i64 + 10; }
+    0
+}
+
+// Appends the UTF-8 bytes of a code point.
+pub fn push_utf8(out: inout Vec<u8>, cp: i64) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+fn read_hex4(s: [u8], i: inout i64) -> i64 {
+    var v: i64 = 0;
+    for _ in 0..4 {
+        v = v * 16 + hex_val(s[i]);
+        i += 1;
+    }
+    v
+}
+
+// Reads a string at s[i] == '"'.
+fn read_str(s: [u8], i: inout i64, out: inout Vec<u8>) {
+    i += 1;
+    while s[i] != '"' {
+        if s[i] == '\\' {
+            i += 1;
+            let c = s[i];
+            i += 1;
+            if c == 'n' { out.push(10); }
+            else if c == 't' { out.push(9); }
+            else if c == 'r' { out.push(13); }
+            else if c == 'b' { out.push(8); }
+            else if c == 'f' { out.push(12); }
+            else if c == 'u' {
+                var cp = read_hex4(s, &i);
+                // a surrogate pair: 🚀
+                if cp >= 0xD800 && cp < 0xDC00 && s[i] == '\\' && s[i + 1] == 'u' {
+                    i += 2;
+                    let lo = read_hex4(s, &i);
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+                push_utf8(&out, cp);
+            }
+            else { out.push(c); }
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    i += 1;
+}
+
+fn read_num(s: [u8], i: inout i64) -> f64 {
+    var neg = false;
+    if s[i] == '-' { neg = true; i += 1; }
+    var mant: f64 = 0.0;
+    while i < s.len() && s[i] >= '0' && s[i] <= '9' {
+        mant = mant * 10.0 + (s[i] - '0') as f64;
+        i += 1;
+    }
+    if i < s.len() && s[i] == '.' {
+        i += 1;
+        var scale: f64 = 0.1;
+        while i < s.len() && s[i] >= '0' && s[i] <= '9' {
+            mant += (s[i] - '0') as f64 * scale;
+            scale *= 0.1;
+            i += 1;
+        }
+    }
+    if i < s.len() && (s[i] == 'e' || s[i] == 'E') {
+        i += 1;
+        var eneg = false;
+        if s[i] == '-' { eneg = true; i += 1; }
+        else if s[i] == '+' { i += 1; }
+        var e: i64 = 0;
+        while i < s.len() && s[i] >= '0' && s[i] <= '9' {
+            e = e * 10 + (s[i] - '0') as i64;
+            i += 1;
+        }
+        var k: i64 = 0;
+        while k < e {
+            if eneg { mant = mant / 10.0; } else { mant = mant * 10.0; }
+            k += 1;
+        }
+    }
+    if neg { -mant } else { mant }
+}
+
+fn read_value(s: [u8], i: inout i64, gpa: Gpa) -> Json {
+    skip_ws(s, &i);
+    let c = s[i];
+    if c == '{' {
+        i += 1;
+        var ms: Vec<Member> = Vec::new_in(gpa);
+        skip_ws(s, &i);
+        if s[i] == '}' { i += 1; return Json::Obj(ms); }
+        while true {
+            skip_ws(s, &i);
+            var key: Vec<u8> = Vec::new_in(gpa);
+            read_str(s, &i, &key);
+            skip_ws(s, &i);
+            i += 1; // ':'
+            let v = read_value(s, &i, gpa);
+            ms.push(Member { key: key, val: v });
+            skip_ws(s, &i);
+            if s[i] == ',' { i += 1; } else { i += 1; break; }
+        }
+        return Json::Obj(ms);
+    }
+    if c == '[' {
+        i += 1;
+        var xs: Vec<Json> = Vec::new_in(gpa);
+        skip_ws(s, &i);
+        if s[i] == ']' { i += 1; return Json::Arr(xs); }
+        while true {
+            let v = read_value(s, &i, gpa);
+            xs.push(v);
+            skip_ws(s, &i);
+            if s[i] == ',' { i += 1; } else { i += 1; break; }
+        }
+        return Json::Arr(xs);
+    }
+    if c == '"' {
+        var out: Vec<u8> = Vec::new_in(gpa);
+        read_str(s, &i, &out);
+        return Json::Str(out);
+    }
+    if c == 't' { i += 4; return Json::Bool(true); }
+    if c == 'f' { i += 5; return Json::Bool(false); }
+    if c == 'n' { i += 4; return Json::Null; }
+    Json::Num(read_num(s, &i))
+}
+
+pub fn parse(s: [u8], gpa: Gpa) -> Json {
+    var i: i64 = 0;
+    read_value(s, &i, gpa)
+}
+
+// The index of the member with this key in an object's members, or -1.
+pub fn member_index(ms: [Member], key: [u8]) -> i64 {
+    var k: i64 = 0;
+    while k < ms.len() {
+        if ms[k].key.as_slice() == key {
+            return k;
+        }
+        k += 1;
+    }
+    -1
+}
+
+#[test]
+fn parses_nested_values(gpa: Gpa) {
+    let j = parse("{\"a\": [1, -2.5e1, true, null], \"b\": \"x\\u00e9\\n\"}".as_bytes(), gpa);
+    match j {
+        Json::Obj(ms) => {
+            assert_eq(ms.len(), 2);
+            let a = member_index(ms, "a".as_bytes());
+            assert_eq(a, 0);
+            match ms[a].val {
+                Json::Arr(xs) => {
+                    assert_eq(xs.len(), 4);
+                    match xs[1] {
+                        Json::Num(n) => assert(n == -25.0),
+                        _ => assert(false),
+                    }
+                }
+                _ => assert(false),
+            }
+            assert_eq(member_index(ms, "zz".as_bytes()), -1);
+        }
+        _ => assert(false),
+    }
+}

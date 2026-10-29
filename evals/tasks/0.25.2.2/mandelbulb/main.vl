@@ -1,0 +1,501 @@
+// mandelbulb: a Mandelbulb and a Mandelbox, raymarched on the GPU (one
+// std::gpu render pass per frame, WGSL in shader.vl), in a window
+// (std::window) with a smooth fly camera, or headless (fixed views to PPM,
+// with timings).
+//
+//   mandelbulb                          the window (see the README's keys)
+//   mandelbulb --headless               the four fixed views: timings and checks
+//   mandelbulb --headless --view 1 --shot v1.ppm    one view as a PPM image
+//
+// camera.vl holds the pose, the easing camera, the views and the uniform
+// block; shader.vl the WGSL.
+
+mod camera;
+mod shader;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command, Matches};
+use std::gpu::{BufferUsage, Format, PassDesc, RawSurface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use camera::{Camera, Look, Pose};
+
+// The GPU side: a device, its queue, the uniform block and the one
+// pipeline that draws the picture (into a window's frame or a texture).
+struct Tracer {
+    dev: gpu::Device,
+    queue: gpu::Queue,
+    ubuf: gpu::Buffer,
+    pipe: gpu::RenderPipeline,
+    group: gpu::BindGroup,
+    blit: gpu::RenderPipeline,
+    sampler: gpu::Sampler,
+}
+
+// The window's scene texture (rendered at a fraction of the frame) and the
+// bind group that lets the blit read it.
+struct Screen {
+    tex: gpu::Texture,
+    group: gpu::BindGroup,
+    w: i64,
+    h: i64,
+}
+
+fn screen_of(t: Tracer, w: i64, h: i64) -> Screen {
+    let tex = t.dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING);
+    let group = t.dev.bind_group(t.blit.bind_layout(0),
+        [gpu::bind_texture(0, tex.view()), gpu::bind_sampler(1, t.sampler)][..]);
+    Screen { tex: tex, group: group, w: w, h: h }
+}
+
+impl Tracer {
+    fn new_in(gpa: Gpa) -> Result<Tracer, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let ubuf = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let shader = dev.shader_wgsl(shader::SHADER)?;
+        let pipe = dev.render_pipeline(gpu::RenderDesc::new(shader, "vs", "fs",
+            Format::Bgra8Unorm))?;
+        let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+        let bshader = dev.shader_wgsl(shader::BLIT)?;
+        let blit = dev.render_pipeline(gpu::RenderDesc::new(bshader, "vs", "fs",
+            Format::Bgra8Unorm))?;
+        let sampler = dev.sampler(gpu::SamplerDesc::linear());
+        Ok(Tracer { dev: dev, queue: queue, ubuf: ubuf, pipe: pipe, group: group, blit: blit,
+            sampler: sampler })
+    }
+
+    // The uniforms of the next frame, written in queue order.
+    fn set(inout self, words: [f32; 28]) {
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(words[..]));
+    }
+
+    // One full-screen pass into `target`.
+    fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.pipe);
+            pass.set_bind_group(0, self.group);
+            pass.draw(0..3, 0..1);
+        });
+    }
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+// The mean time of `frames` frames into a w x h texture, waiting for the
+// GPU at the end (the submissions are back to back, as in a window).
+fn bench(t: inout Tracer, words: [f32; 28], w: i64, h: i64, frames: i64) -> f64 {
+    let tex = t.dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    // a warm-up frame first: the pipeline's first use is not timed
+    t.set(words);
+    var warm = t.dev.encoder();
+    t.draw(&warm, tex.view());
+    t.queue.submit(warm.finish());
+    let _ = t.queue.wait_idle();
+    let t0 = monotonic_now();
+    for _ in 0..frames {
+        t.set(words);
+        var enc = t.dev.encoder();
+        t.draw(&enc, tex.view());
+        t.queue.submit(enc.finish());
+    }
+    let _ = t.queue.wait_idle();
+    secs(monotonic_now().saturating_sub(t0)) * 1000.0 / frames as f64
+}
+
+// One frame into a texture, read back as a binary PPM (P6) and its
+// statistics: the mean and the spread of the luminance (0 to 255), and the
+// number of distinct colours (quantised to 16 levels a channel).
+struct Shot {
+    ppm: Buf,
+    mean: f64,
+    spread: f64,
+    colours: i64,
+}
+
+fn snapshot(t: inout Tracer, words: [f32; 28], w: i64, h: i64, gpa: Gpa) -> Shot {
+    t.set(words);
+    let tex = t.dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let stride = (w * 4 + 255) / 256 * 256;
+    var out = t.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = t.dev.encoder();
+    t.draw(&enc, tex.view());
+    enc.copy_texture_to_buffer(tex, out, stride);
+    t.queue.submit(enc.finish());
+    let px = out.map_read(t.dev);
+    var ppm = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    var sum = 0.0;
+    var sum2 = 0.0;
+    var seen: Vec<bool> = Vec::filled_in(4096, false, gpa);
+    var colours = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            let r = px[i + 2];
+            let g = px[i + 1];
+            let b = px[i];
+            ppm.push(r);
+            ppm.push(g);
+            ppm.push(b);
+            let l = (r as f64 + g as f64 + b as f64) / 3.0;
+            sum += l;
+            sum2 += l * l;
+            let q = (r as i64 / 16) * 256 + (g as i64 / 16) * 16 + (b as i64 / 16);
+            if !seen[q] {
+                seen[q] = true;
+                colours += 1;
+            }
+        }
+    }
+    let n = (w * h) as f64;
+    let mean = sum / n;
+    let var_ = (sum2 / n - mean * mean).max(0.0);
+    Shot { ppm: ppm, mean: mean, spread: var_.sqrt(), colours: colours }
+}
+
+fn kind_name(k: i64) -> [u8] {
+    if k == 0 { "Mandelbulb" } else { "Mandelbox" }
+}
+
+// The headless run: fixed views (all four, or --view N), a timing of each
+// over --frames frames, one picture of each (--shot) and its statistics.
+fn headless(m: inout Matches, gpa: Gpa) -> i32 {
+    let w = parse_int(m.get("width").unwrap_or("640")).unwrap_or(640);
+    let h = parse_int(m.get("height").unwrap_or("360")).unwrap_or(360);
+    let frames = parse_int(m.get("frames").unwrap_or("20")).unwrap_or(20);
+    let power = std::num::parse_f64(m.get("power").unwrap_or("8")).unwrap_or(8.0);
+    var t = match Tracer::new_in(gpa) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln(f"mandelbulb: {e}");
+            return 1;
+        }
+    };
+    let shot_path = m.get("shot").unwrap_or("");
+    var first = 0;
+    var last = 3;
+    if m.get("view").is_some() {
+        first = parse_int(m.get("view").unwrap_or("0")).unwrap_or(0);
+        last = first;
+    }
+    if first < 0 || last > 3 {
+        eprintln("mandelbulb: --view 0 to 3");
+        return 2;
+    }
+    if shot_path.len() > 0 && first != last {
+        eprintln("mandelbulb: --shot writes one view: give --view K with it");
+        return 2;
+    }
+    var ok = true;
+    for k in first..last + 1 {
+        let kind = camera::view_kind(k);
+        let look = Look {
+            kind: kind, power: power, bscale: -2.0, iters: if kind == 0 { 10 } else { 12 },
+            shadows: !m.flag("no-shadows"), ao: !m.flag("no-ao"),
+        };
+        let pose = camera::view(k);
+        let words = camera::pack(pose, look, 0.0, w, h);
+        let ms = bench(&t, words, w, h, frames);
+        let shot = snapshot(&t, words, w, h, gpa);
+        println(
+            f"view {k} {camera::view_name(k)} ({kind_name(kind)}, power {power:.2} if bulb): {w} x {h}, {ms:.2} ms a frame over {frames} frames");
+        println(
+            f"  check: luminance mean {shot.mean:.1}, spread {shot.spread:.1}, {shot.colours} colours");
+        if shot.spread < 4.0 || shot.colours < 8 {
+            println("  FAILED: the picture is flat (the march hit nothing, or everything)");
+            ok = false;
+        }
+        if shot_path.len() > 0 {
+            if std::fs::write(shot_path, shot.ppm.as_slice()).is_err() {
+                eprintln(f"mandelbulb: cannot write {shot_path}");
+                return 1;
+            }
+            println(f"  wrote {shot_path}");
+        }
+    }
+    if ok { 0 } else { 1 }
+}
+
+// Keys and the mouse, between frames.
+struct Input {
+    // a movement key held: w a s d (forward, left, back, right), q e (down, up)
+    w: bool,
+    a: bool,
+    s: bool,
+    d: bool,
+    q: bool,
+    e: bool,
+    shift: bool,
+    // dragging with the left button
+    drag: bool,
+    x: f64,
+    y: f64,
+    // the animation: the fly-through runs by itself; the time clock stops
+    auto: bool,
+    paused: bool,
+    quit: bool,
+}
+
+// The movement keys, held or released (lower case; letters only).
+fn hold(inp: inout Input, c: u32, on: bool) {
+    let l = if c >= 'A' as u32 && c <= 'Z' as u32 { c + 32 } else { c };
+    if l == 'w' as u32 {
+        inp.w = on;
+    } else if l == 'a' as u32 {
+        inp.a = on;
+    } else if l == 's' as u32 {
+        inp.s = on;
+    } else if l == 'd' as u32 {
+        inp.d = on;
+    } else if l == 'q' as u32 {
+        inp.q = on;
+    } else if l == 'e' as u32 {
+        inp.e = on;
+    }
+}
+
+// A key pressed: the toggles and the power.
+fn press(inp: inout Input, look: inout Look, cam: inout Camera, key: Logical) {
+    match key {
+        Logical::Char(c) => {
+            let l = if c >= 'A' as u32 && c <= 'Z' as u32 { c + 32 } else { c };
+            if l == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if l == '1' as u32 {
+                look.kind = 0;
+            } else if l == '2' as u32 {
+                look.kind = 1;
+            } else if l == 'o' as u32 {
+                inp.auto = !inp.auto;
+            } else if l == 'x' as u32 {
+                look.shadows = !look.shadows;
+            } else if l == 'g' as u32 {
+                look.ao = !look.ao;
+            } else if l == 'r' as u32 {
+                cam.goal = camera::view(0);
+            } else if l == '+' as u32 || l == '=' as u32 {
+                look.iters = if look.iters < 40 { look.iters + 1 } else { 40 };
+            } else if l == '-' as u32 {
+                look.iters = if look.iters > 4 { look.iters - 1 } else { 4 };
+            }
+            hold(&inp, c, true);
+        }
+        Logical::Named(Named::ArrowUp) => change(&look, 1.0),
+        Logical::Named(Named::ArrowDown) => change(&look, -1.0),
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+}
+
+// The power of the Mandelbulb, or the scale of the Mandelbox.
+fn change(look: inout Look, d: f64) {
+    if look.kind == 0 {
+        look.power = (look.power + 0.25 * d).clamp(2.0, 16.0);
+    } else {
+        look.bscale = (look.bscale - 0.05 * d).clamp(-3.0, -1.0);
+    }
+}
+
+fn windowed(look: inout Look, start: Pose, max_frames: i64, scale: i64, gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("mandelbulb: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("mandelbulb", 960, 600)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("mandelbulb: no window");
+            return 1;
+        }
+    };
+    var t = match Tracer::new_in(gpa) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln(f"mandelbulb: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(t.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"mandelbulb: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(t.dev, sz.w, sz.h);
+    var screen = screen_of(t, sz.w / scale, sz.h / scale);
+    var cam = Camera::new(start);
+    var inp = Input {
+        w: false, a: false, s: false, d: false, q: false, e: false, shift: false,
+        drag: false, x: 0.0, y: 0.0, auto: false, paused: false, quit: false,
+    };
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    var now = 0.0;
+    let begin = monotonic_now();
+    var shown = -1.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                now = secs(monotonic_now().saturating_sub(begin));
+                var dt = now - prev;
+                if frames == 0 || dt > 0.1 { dt = 1.0 / 60.0; }
+                prev = now;
+                if !inp.paused { clock += dt; }
+                let speed = if inp.shift { 3.0 } else { 1.0 };
+                let fwd = (if inp.w { 1.0 } else { 0.0 }) - (if inp.s { 1.0 } else { 0.0 });
+                let side = (if inp.d { 1.0 } else { 0.0 }) - (if inp.a { 1.0 } else { 0.0 });
+                let lift = (if inp.e { 1.0 } else { 0.0 }) - (if inp.q { 1.0 } else { 0.0 });
+                if inp.auto {
+                    // the fly-through: a slow orbit at the fractal's scale
+                    cam.goal.yaw = cam.goal.yaw + 0.12 * dt;
+                    cam.goal.pitch = 0.25 * (clock * 0.3).sin();
+                    cam.fly(0.0, 0.0, 0.0, dt);
+                    cam.goal.x = 2.6 * (clock * 0.11).sin();
+                    cam.goal.z = -2.6 * (clock * 0.11).cos();
+                    cam.goal.y = 0.4 * (clock * 0.17).sin();
+                }
+                cam.fly(fwd * speed, side * speed, lift * speed, dt);
+                cam.ease(dt);
+                let words = camera::pack(cam.at, look, clock, screen.w, screen.h);
+                t.set(words);
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = t.dev.encoder();
+                        t.draw(&enc, screen.tex.view());
+                        enc.render_pass(PassDesc::color(f.texture.view()), |pass| {
+                            pass.set_pipeline(t.blit);
+                            pass.set_bind_group(0, screen.group);
+                            pass.draw(0..3, 0..1);
+                        });
+                        t.queue.submit(enc.finish());
+                        f.present(&t.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames == 1 { first = now; }
+                if now - shown > 0.5 {
+                    shown = now;
+                    let kind = kind_name(look.kind);
+                    win.set_title(
+                        format_in(
+                            f"mandelbulb: {kind}, power {look.power:.2}, box scale {look.bscale:.2}, {look.iters} steps, shadows {look.shadows}, ao {look.ao}", gpa).as_slice());
+                }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"{surf.width} x {surf.height} pixels: {frames} frames, {mean:.2} ms a frame");
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed {
+                    if !k.repeat {
+                        press(&inp, &look, &cam, k.key);
+                    } else {
+                        match k.key {
+                            Logical::Named(Named::ArrowUp) => change(&look, 1.0),
+                            Logical::Named(Named::ArrowDown) => change(&look, -1.0),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    match k.key {
+                        Logical::Char(c) => hold(&inp, c, false),
+                        _ => {}
+                    }
+                }
+                inp.shift = k.mods.shift();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        if m.button == Button::Left {
+                            inp.drag = true;
+                            inp.x = m.x;
+                            inp.y = m.y;
+                        }
+                    }
+                    MouseAction::Release => {
+                        if m.button == Button::Left { inp.drag = false; }
+                    }
+                    MouseAction::Move => {
+                        if inp.drag {
+                            cam.look(m.x - inp.x, m.y - inp.y);
+                        }
+                        inp.x = m.x;
+                        inp.y = m.y;
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(t.dev, z.w, z.h);
+                screen = screen_of(t, z.w / scale, z.h / scale);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = t.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("mandelbulb", gpa)
+        .about(
+            "a Mandelbulb and a Mandelbox, raymarched on the GPU: a window, or the headless views")
+        .arg(Arg::flag("headless").help("no window: the fixed views, timed, as PPM with --shot"))
+        .arg(Arg::option("view").value_name("K")
+            .help("headless: one view (0 to 3; default all four); window: the start pose"))
+        .arg(Arg::option("kind").value_name("NAME").default("bulb")
+            .help("window: bulb or box to start with"))
+        .arg(Arg::option("power").value_name("P").default("8")
+            .help("the Mandelbulb's power (2 to 16)"))
+        .arg(Arg::option("width").value_name("N").default("640").help("headless: pixels across"))
+        .arg(Arg::option("height").value_name("N").default("360").help("headless: pixels down"))
+        .arg(Arg::option("frames").value_name("N").default("20")
+            .help(
+                "headless: frames timed per view; window: quit after N frames and print the mean"))
+        .arg(Arg::option("shot").value_name("FILE.ppm").help("headless: write the view as a PPM"))
+        .arg(Arg::flag("no-shadows").help("headless: no soft shadows"))
+        .arg(Arg::flag("no-ao").help("headless: no ambient occlusion"))
+        .arg(Arg::option("scale").value_name("N").default("2")
+            .help("window: render the picture at 1/N of the frame's pixels, then stretch it"));
+    var m = cli.parse_or_exit(env::args());
+    let power = std::num::parse_f64(m.get("power").unwrap_or("8")).unwrap_or(8.0);
+    if m.flag("headless") {
+        return headless(&m, gpa);
+    }
+    let k = parse_int(m.get("view").unwrap_or("0")).unwrap_or(0);
+    var look = Look {
+        kind: if m.get("kind").unwrap_or("bulb") == "box" { 1 } else { 0 },
+        power: power, bscale: -2.0, iters: 10, shadows: true, ao: true,
+    };
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    let scale = parse_int(m.get("scale").unwrap_or("2")).unwrap_or(2);
+    if scale < 1 || scale > 8 {
+        eprintln("mandelbulb: --scale 1 to 8");
+        return 2;
+    }
+    windowed(&look, camera::view(k), frames, scale, gpa)
+}

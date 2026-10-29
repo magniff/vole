@@ -1,0 +1,228 @@
+// The WGSL of windtunnel: a D2Q9 lattice Boltzmann flow with BGK
+// collision, the dye it carries, a probe and the picture, compiled at run
+// time by std::gpu::wgsl. Each kernel is its own module: COMMON (the
+// parameters, the lattice and the equilibrium) plus its bindings and
+// entry point (sim.vl puts them together).
+//
+// Layout: cell i = y * w + x, y down, x right. Population k of cell i is
+// f[9 * i + k], with the directions of CX, CY below (0 rest, 1 +x, 2 +y,
+// 3 -x, 4 -y, 5 +x+y, 6 -x+y, 7 -x-y, 8 +x-y); OPP is the reverse one.
+// Lattice units: a step is one time unit, speeds are cells per step.
+// Walls at the top and bottom always; the left and right are an inlet
+// (equilibrium at the inflow speed) and an outlet (zero gradient) when
+// `closed` is 0, walls too when it is 1.
+
+pub const COMMON: [u8] = "struct Params {\n\
+    w: u32, h: u32, view: u32, closed: u32,\n\
+    omega: f32, inflow: f32, diam: f32, step: u32,\n\
+    probe: u32, probe_on: u32, dye_keep: f32, pad: f32,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> prm: Params;\n\
+    const CX: array<i32, 9> = array<i32, 9>(0, 1, 0, -1, 0, 1, -1, -1, 1);\n\
+    const CY: array<i32, 9> = array<i32, 9>(0, 0, 1, 0, -1, 1, 1, -1, -1);\n\
+    const OPP: array<u32, 9> = array<u32, 9>(0u, 3u, 4u, 1u, 2u, 7u, 8u, 5u, 6u);\n\
+    const WT: array<f32, 9> = array<f32, 9>(0.4444444, 0.1111111, 0.1111111, 0.1111111, 0.1111111, 0.0277778, 0.0277778, 0.0277778, 0.0277778);\n\
+    fn feq(k: u32, rho: f32, ux: f32, uy: f32) -> f32 {\n\
+    let cu = 3.0 * (f32(CX[k]) * ux + f32(CY[k]) * uy);\n\
+    return WT[k] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * (ux * ux + uy * uy));\n\
+    }\n";
+
+// Pull streaming and a regularized BGK collision in one kernel (the
+// non-equilibrium stress is kept, the rest of it dropped: stable at higher Re): each population comes
+// from the neighbour it streams from (fin, the state after the last step),
+// a solid neighbour or a wall bounces the cell's own opposite population
+// back, the inlet supplies equilibrium, the outlet copies the cell. Then
+// the moments are collided towards equilibrium into fout.
+pub const LBM: [u8] = "@group(0) @binding(1) var<storage, read> fin: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> fout: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read> solid: array<u32>;\n\
+    @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= prm.w || id.y >= prm.h) { return; }\n\
+    let w = i32(prm.w);\n\
+    let h = i32(prm.h);\n\
+    let x = i32(id.x);\n\
+    let y = i32(id.y);\n\
+    let cell = id.y * prm.w + id.x;\n\
+    if (solid[cell] != 0u) {\n\
+    let u = select(0.0, prm.inflow, prm.closed == 0u);\n\
+    for (var k = 0u; k < 9u; k++) { fout[9u * cell + k] = feq(k, 1.0, u, 0.0); }\n\
+    return;\n\
+    }\n\
+    var g: array<f32, 9>;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let sx = x - CX[k];\n\
+    let sy = y - CY[k];\n\
+    var v = fin[9u * cell + OPP[k]];\n\
+    if (sy >= 0 && sy < h) {\n\
+    if (sx >= 0 && sx < w) {\n\
+    let src = u32(sy) * prm.w + u32(sx);\n\
+    if (solid[src] == 0u) { v = fin[9u * src + k]; }\n\
+    } else if (prm.closed == 0u) {\n\
+    if (sx < 0) { v = feq(k, 1.0, prm.inflow, 0.0); } else { v = fin[9u * (cell - 1u) + k]; }\n\
+    }\n\
+    }\n\
+    g[k] = v;\n\
+    }\n\
+    var rho = 0.0;\n\
+    var mx = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    rho += g[k];\n\
+    mx += f32(CX[k]) * g[k];\n\
+    my += f32(CY[k]) * g[k];\n\
+    }\n\
+    let ux = mx / rho;\n\
+    let uy = my / rho;\n\
+    var pxx = 0.0;\n\
+    var pxy = 0.0;\n\
+    var pyy = 0.0;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let d = g[k] - feq(k, rho, ux, uy);\n\
+    let cx = f32(CX[k]);\n\
+    let cy = f32(CY[k]);\n\
+    pxx += cx * cx * d;\n\
+    pxy += cx * cy * d;\n\
+    pyy += cy * cy * d;\n\
+    }\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let cx = f32(CX[k]);\n\
+    let cy = f32(CY[k]);\n\
+    let neq = WT[k] * 4.5 * ((cx * cx - 0.3333333) * pxx + 2.0 * cx * cy * pxy + (cy * cy - 0.3333333) * pyy);\n\
+    fout[9u * cell + k] = feq(k, rho, ux, uy) + (1.0 - prm.omega) * neq;\n\
+    }\n\
+    }\n";
+
+// The dye: semi-Lagrangian advection by the velocity of the new state
+// (fnew), a bilinear sample of dyein, a decay, and dye bands at the inlet.
+pub const DYE: [u8] = "@group(0) @binding(1) var<storage, read> fnew: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> dyein: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read_write> dyeout: array<f32>;\n\
+    @group(0) @binding(4) var<storage, read> solid: array<u32>;\n\
+    fn cubic(t: f32) -> vec4<f32> {\n\
+    let t2 = t * t;\n\
+    let t3 = t2 * t;\n\
+    return vec4<f32>(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);\n\
+    }\n\
+    fn at(x: i32, y: i32) -> f32 {\n\
+    let cx = clamp(x, 0, i32(prm.w) - 1);\n\
+    let cy = clamp(y, 0, i32(prm.h) - 1);\n\
+    return dyein[u32(cy) * prm.w + u32(cx)];\n\
+    }\n\
+    @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= prm.w || id.y >= prm.h) { return; }\n\
+    let cell = id.y * prm.w + id.x;\n\
+    if (solid[cell] != 0u) { dyeout[cell] = 0.0; return; }\n\
+    var rho = 0.0;\n\
+    var mx = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let f = fnew[9u * cell + k];\n\
+    rho += f;\n\
+    mx += f32(CX[k]) * f;\n\
+    my += f32(CY[k]) * f;\n\
+    }\n\
+    let p = vec2<f32>(f32(id.x), f32(id.y)) - vec2<f32>(mx, my) / rho;\n\
+    let x0 = floor(p.x);\n\
+    let y0 = floor(p.y);\n\
+    let fx = p.x - x0;\n\
+    let fy = p.y - y0;\n\
+    let ix = i32(x0);\n\
+    let iy = i32(y0);\n\
+    let wx = cubic(fx);\n\
+    let wy = cubic(fy);\n\
+    var v = 0.0;\n\
+    for (var j = 0; j < 4; j++) {\n\
+    var row = 0.0;\n\
+    for (var i = 0; i < 4; i++) {\n\
+    row += wx[i] * at(ix - 1 + i, iy - 1 + j);\n\
+    }\n\
+    v += wy[j] * row;\n\
+    }\n\
+    var d = clamp(v, 0.0, 1.0) * prm.dye_keep;\n\
+    if (id.x < 2u && prm.closed == 0u) {\n\
+    d = select(0.0, 1.0, (id.y / 12u) % 2u == 0u);\n\
+    }\n\
+    dyeout[cell] = d;\n\
+    }\n";
+
+// The y velocity at the probe cell after the step, one sample a step.
+pub const PROBE: [u8] = "@group(0) @binding(1) var<storage, read> fnew: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read_write> probe: array<f32>;\n\
+    @compute @workgroup_size(1) fn main() {\n\
+    if (prm.probe_on == 0u || prm.step >= arrayLength(&probe)) { return; }\n\
+    var rho = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let f = fnew[9u * prm.probe + k];\n\
+    rho += f;\n\
+    my += f32(CY[k]) * f;\n\
+    }\n\
+    probe[prm.step] = my / rho;\n\
+    }\n";
+
+// The picture: a triangle over the window, one grid cell per pixel
+// block (nearest). View 0: speed (colour map, in inflow units), 1:
+// vorticity (blue clockwise, red anticlockwise), 2: dye. Solid cells grey.
+pub const RENDER: [u8] = "@group(0) @binding(1) var<storage, read> fr: array<f32>;\n\
+    @group(0) @binding(2) var<storage, read> dr: array<f32>;\n\
+    @group(0) @binding(3) var<storage, read> solid: array<u32>;\n\
+    struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
+    }\n\
+    fn macro_at(x: i32, y: i32) -> vec3<f32> {\n\
+    let cx = clamp(x, 0, i32(prm.w) - 1);\n\
+    let cy = clamp(y, 0, i32(prm.h) - 1);\n\
+    let cell = u32(cy) * prm.w + u32(cx);\n\
+    var rho = 0.0;\n\
+    var mx = 0.0;\n\
+    var my = 0.0;\n\
+    for (var k = 0u; k < 9u; k++) {\n\
+    let f = fr[9u * cell + k];\n\
+    rho += f;\n\
+    mx += f32(CX[k]) * f;\n\
+    my += f32(CY[k]) * f;\n\
+    }\n\
+    return vec3<f32>(rho, mx / rho, my / rho);\n\
+    }\n\
+    fn cmap(t0: f32) -> vec3<f32> {\n\
+    let t = clamp(t0, 0.0, 1.0);\n\
+    let c0 = vec3<f32>(0.10, 0.05, 0.35);\n\
+    let c1 = vec3<f32>(0.10, 0.45, 0.75);\n\
+    let c2 = vec3<f32>(0.20, 0.75, 0.60);\n\
+    let c3 = vec3<f32>(0.97, 0.88, 0.25);\n\
+    if (t < 0.333) { return mix(c0, c1, t * 3.0); }\n\
+    if (t < 0.666) { return mix(c1, c2, (t - 0.333) * 3.0); }\n\
+    return mix(c2, c3, (t - 0.666) * 3.0);\n\
+    }\n\
+    fn div_color(n: f32) -> vec3<f32> {\n\
+    let mid = vec3<f32>(0.08, 0.09, 0.12);\n\
+    let neg = vec3<f32>(0.15, 0.45, 1.00);\n\
+    let pos = vec3<f32>(1.00, 0.35, 0.15);\n\
+    if (n < 0.0) { return mix(mid, neg, -n); }\n\
+    return mix(mid, pos, n);\n\
+    }\n\
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let x = min(u32(v.uv.x * f32(prm.w)), prm.w - 1u);\n\
+    let y = min(u32(v.uv.y * f32(prm.h)), prm.h - 1u);\n\
+    let cell = y * prm.w + x;\n\
+    let xi = i32(x);\n\
+    let yi = i32(y);\n\
+    if (solid[cell] != 0u) { return vec4<f32>(0.42, 0.42, 0.46, 1.0); }\n\
+    var c = vec3<f32>(0.0);\n\
+    if (prm.view == 0u) {\n\
+    let m = macro_at(xi, yi);\n\
+    c = cmap(length(m.yz) / (1.5 * prm.inflow));\n\
+    } else if (prm.view == 1u) {\n\
+    let dvdx = (macro_at(xi + 1, yi).z - macro_at(xi - 1, yi).z) * 0.5;\n\
+    let dudy = (macro_at(xi, yi + 1).y - macro_at(xi, yi - 1).y) * 0.5;\n\
+    c = div_color(clamp((dvdx - dudy) * prm.diam / prm.inflow * 0.5, -1.0, 1.0));\n\
+    } else {\n\
+    let d = sqrt(clamp(dr[cell], 0.0, 1.0));\n\
+    c = mix(vec3<f32>(0.04, 0.06, 0.10), vec3<f32>(1.0, 0.78, 0.30), d);\n\
+    }\n\
+    return vec4<f32>(c, 1.0);\n\
+    }\n";

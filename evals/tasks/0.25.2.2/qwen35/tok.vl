@@ -1,0 +1,397 @@
+// The byte-level BPE tokenizer of Qwen3.5 (vocab.json and merges.txt in the
+// model folder). Encoding: split the text into pre-tokens with the same
+// rules as the model's regex (over code points, with the Unicode classes
+// approximated: see class_of), map each byte to its printable character,
+// merge by rank. Decoding: the reverse. The special tokens the chat format
+// uses are recognised in the text.
+
+use json::{Json, push_utf8};
+
+static SPECIALS: [str; 5] = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>"];
+static SPECIAL_IDS: [i64; 5] = [248044, 248045, 248046, 248068, 248069];
+
+pub struct Tok {
+    // FNV-1a hash of a token's mapped text -> its id (collisions: none in
+    // this vocabulary; the table is checked against vocab.json at load).
+    ids: HashMap<i64, i64>,
+    // hash of (left id, right id) -> the merge's rank
+    ranks: HashMap<i64, i64>,
+    // rank -> the id of the merged token, and the ids it merges
+    merged: Vec<i64>,
+    lefts: Vec<i64>,
+    rights: Vec<i64>,
+    // byte -> the id of its one-character token
+    byte_id: Vec<i64>,
+    // id -> the bytes the token stands for
+    raw: Vec<Vec<u8>>,
+}
+
+fn fnv(s: [u8]) -> i64 {
+    var h: u64 = 14695981039346656037;
+    for b in s {
+        h = (h ^ b as u64) * 1099511628211;
+    }
+    h as i64
+}
+
+// The printable character GPT-2's byte-level BPE gives each byte.
+fn byte_char(b: i64) -> i64 {
+    if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255) {
+        return b;
+    }
+    // the others, in order, from 256 up
+    var n: i64 = 0;
+    var k: i64 = 0;
+    while k < b {
+        if !((k >= 33 && k <= 126) || (k >= 161 && k <= 172) || (k >= 174 && k <= 255)) {
+            n += 1;
+        }
+        k += 1;
+    }
+    256 + n
+}
+
+// The code point of the character at s[i] (UTF-8), advancing i.
+pub fn utf8_next(s: [u8], i: inout i64) -> i64 {
+    let b = s[i] as i64;
+    if b < 0x80 { i += 1; return b; }
+    if b < 0xE0 {
+        let cp = ((b & 0x1F) << 6) | (s[i + 1] as i64 & 0x3F);
+        i += 2;
+        return cp;
+    }
+    if b < 0xF0 {
+        let cp = ((b & 0x0F) << 12) | ((s[i + 1] as i64 & 0x3F) << 6) | (s[i + 2] as i64 & 0x3F);
+        i += 3;
+        return cp;
+    }
+    let cp = ((b & 0x07) << 18) | ((s[i + 1] as i64 & 0x3F) << 12)
+        | ((s[i + 2] as i64 & 0x3F) << 6) | (s[i + 3] as i64 & 0x3F);
+    i += 4;
+    cp
+}
+
+// 0 letter or mark, 1 number, 2 space (not a newline), 3 newline, 4 other.
+// The regex's \p{L}, \p{M}, \p{N} and \s, approximated by code point
+// ranges: exact for ASCII and Latin, Greek, Cyrillic, CJK, kana, Hangul
+// and emoji, approximate elsewhere.
+fn class_of(cp: i64) -> i64 {
+    if cp < 0x80 {
+        if (cp >= 97 && cp <= 122) || (cp >= 65 && cp <= 90) { return 0; }
+        if cp >= 48 && cp <= 57 { return 1; }
+        if cp == 10 || cp == 13 { return 3; }
+        if cp == 32 || cp == 9 || cp == 11 || cp == 12 { return 2; }
+        return 4;
+    }
+    if cp < 0xC0 {
+        if cp == 0x85 || cp == 0xA0 { return 2; }
+        if cp == 0xB2 || cp == 0xB3 || cp == 0xB9 || (cp >= 0xBC && cp <= 0xBE) { return 1; }
+        if cp == 0xAA || cp == 0xB5 || cp == 0xBA { return 0; }
+        return 4;
+    }
+    if cp < 0x2000 {
+        if cp == 0xD7 || cp == 0xF7 { return 4; }
+        return 0;
+    }
+    if cp <= 0x200A || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000 {
+        return 2;
+    }
+    if cp >= 0x2000 && cp <= 0x2BFF { return 4; }
+    if cp >= 0x2C00 && cp <= 0x2DFF { return 0; }
+    if cp >= 0x2E00 && cp <= 0x2E7F { return 4; }
+    if cp >= 0x3000 && cp <= 0x303F {
+        if cp == 0x3005 || cp == 0x3006 || cp == 0x3007 { return 0; }
+        return 4;
+    }
+    if cp >= 0xD800 && cp <= 0xF8FF { return 4; }
+    if cp >= 0xFF01 && cp <= 0xFF0F { return 4; }
+    if cp >= 0xFF10 && cp <= 0xFF19 { return 1; }
+    if cp >= 0x1F000 && cp <= 0x1FAFF { return 4; }
+    if cp >= 0x2070 && cp <= 0x209F { return 4; }
+    0
+}
+
+// The pre-tokens of s: byte ranges [start, end), flat (start, end, ...).
+fn pre_tokens(s: [u8], gpa: Gpa) -> Vec<i64> {
+    var cps: Vec<i64> = Vec::new_in(gpa);
+    var starts: Vec<i64> = Vec::new_in(gpa);
+    var i: i64 = 0;
+    while i < s.len() {
+        starts.push(i);
+        cps.push(utf8_next(s, &i));
+    }
+    starts.push(s.len());
+    let n = cps.len();
+    var cls: Vec<i64> = Vec::new_in(gpa);
+    for k in 0..n { cls.push(class_of(cps[k])); }
+    var out: Vec<i64> = Vec::new_in(gpa);
+    var p: i64 = 0;
+    while p < n {
+        var q: i64 = -1;
+        let c = cls[p];
+        // 's 't 're 've 'm 'll 'd (case-insensitive)
+        if cps[p] == 39 && p + 1 < n {
+            let l1 = lower(cps[p + 1]);
+            if l1 == 115 || l1 == 116 || l1 == 109 || l1 == 100 {
+                q = p + 2;
+            } else if p + 2 < n {
+                let l2 = lower(cps[p + 2]);
+                if (l1 == 114 && l2 == 101) || (l1 == 118 && l2 == 101) || (l1 == 108 && l2 == 108) {
+                    q = p + 3;
+                }
+            }
+        }
+        // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+        if q < 0 && c == 0 {
+            q = p;
+            while q < n && cls[q] == 0 { q += 1; }
+        } else if q < 0 && (c == 2 || c == 4) && p + 1 < n && cls[p + 1] == 0 {
+            q = p + 1;
+            while q < n && cls[q] == 0 { q += 1; }
+        }
+        // \p{N}
+        if q < 0 && c == 1 {
+            q = p + 1;
+        }
+        // ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`
+        if q < 0 && (c == 4 || (c == 2 && cps[p] == 32 && p + 1 < n && cls[p + 1] == 4)) {
+            q = p;
+            if c == 2 { q += 1; }
+            while q < n && cls[q] == 4 { q += 1; }
+            while q < n && cls[q] == 3 { q += 1; }
+        }
+        // \s*[\r\n]+ : whitespace up to its last newline
+        if q < 0 && (c == 2 || c == 3) {
+            var r = p;
+            var last: i64 = -1;
+            while r < n && (cls[r] == 2 || cls[r] == 3) {
+                if cls[r] == 3 { last = r; }
+                r += 1;
+            }
+            if last >= 0 { q = last + 1; }
+        }
+        // \s+(?!\S), then \s+
+        if q < 0 && (c == 2 || c == 3) {
+            var r = p;
+            while r < n && (cls[r] == 2 || cls[r] == 3) { r += 1; }
+            if r == n || r - p == 1 {
+                q = r;
+            } else {
+                q = r - 1;
+            }
+        }
+        if q < 0 { q = p + 1; }
+        out.push(starts[p]);
+        out.push(starts[q]);
+        p = q;
+    }
+    out
+}
+
+fn lower(cp: i64) -> i64 {
+    if cp >= 65 && cp <= 90 { cp + 32 } else { cp }
+}
+
+impl Tok {
+    // Loads the tokenizer from the model folder.
+    pub fn load(dir: str, gpa: Gpa) -> Result<Tok, std::io::Error> {
+        var vpath: Buf = Buf::new_in(gpa);
+        vpath.push_str(dir.as_bytes());
+        vpath.push_str("/vocab.json");
+        let vbytes = std::fs::read_in(vpath.as_slice(), gpa)?;
+        var mpath: Buf = Buf::new_in(gpa);
+        mpath.push_str(dir.as_bytes());
+        mpath.push_str("/merges.txt");
+        let mbytes = std::fs::read_in(mpath.as_slice(), gpa)?;
+
+        // vocab.json: token text -> id; and each id's raw bytes
+        let inv = byte_inverse(gpa);
+        var ids: HashMap<i64, i64> = HashMap::new_in(gpa);
+        var raw: Vec<Vec<u8>> = Vec::new_in(gpa);
+        for _ in 0..VOCAB { raw.push(Vec::new_in(gpa)); }
+        match json::parse(vbytes.as_slice(), gpa) {
+            Json::Obj(ms) => {
+                for m in ms {
+                    match m.val {
+                        Json::Num(x) => {
+                            let id = x as i64;
+                            ids.insert(fnv(m.key.as_slice()), id);
+                            var r: Vec<u8> = Vec::new_in(gpa);
+                            let k = m.key.as_slice();
+                            var i: i64 = 0;
+                            while i < k.len() {
+                                let cp = utf8_next(k, &i);
+                                r.push(inv[cp]);
+                            }
+                            raw.set(id, r);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        // the special tokens are not in vocab.json
+        for k in 0..SPECIALS.len() {
+            var r: Vec<u8> = Vec::new_in(gpa);
+            r.extend_from_slice(SPECIALS[k].as_bytes());
+            raw.set(SPECIAL_IDS[k], r);
+        }
+
+        var byte_id: Vec<i64> = Vec::new_in(gpa);
+        for b in 0..256 {
+            var cb: Vec<u8> = Vec::new_in(gpa);
+            push_utf8(&cb, byte_char(b));
+            byte_id.push(ids.get(fnv(cb.as_slice())).unwrap_or(0));
+        }
+
+        // merges.txt: "left right" per line, the first line a comment
+        var merged: Vec<i64> = Vec::new_in(gpa);
+        var lefts: Vec<i64> = Vec::new_in(gpa);
+        var rights: Vec<i64> = Vec::new_in(gpa);
+        var ranks: HashMap<i64, i64> = HashMap::new_in(gpa);
+        for line in split_in(mbytes.as_slice(), 10, gpa) {
+            if line.len() == 0 || line[0] == '#' { continue; }
+            let parts = split_in(line, ' ', gpa);
+            if parts.len() != 2 { continue; }
+            let a = ids.get(fnv(parts[0])).unwrap_or(-1);
+            let b = ids.get(fnv(parts[1])).unwrap_or(-1);
+            var both: Buf = Buf::new_in(gpa);
+            both.push_str(parts[0]);
+            both.push_str(parts[1]);
+            let r = ids.get(fnv(both.as_slice())).unwrap_or(-1);
+            if a < 0 || b < 0 || r < 0 { continue; }
+            ranks.insert(pair_key(a, b), merged.len());
+            merged.push(r);
+            lefts.push(a);
+            rights.push(b);
+        }
+        Ok(Tok { ids: ids, ranks: ranks, merged: merged, lefts: lefts, rights: rights,
+            byte_id: byte_id, raw: raw })
+    }
+
+    // The token ids of text: special tokens recognised, the rest BPE.
+    pub fn encode(self, text: [u8], gpa: Gpa) -> Vec<i64> {
+        var out: Vec<i64> = Vec::new_in(gpa);
+        var seg: i64 = 0;
+        var i: i64 = 0;
+        while i < text.len() {
+            var hit: i64 = -1;
+            if text[i] == '<' {
+                for k in 0..SPECIALS.len() {
+                    if hit < 0 && matches_at(text, i, SPECIALS[k].as_bytes()) {
+                        hit = k;
+                    }
+                }
+            }
+            if hit >= 0 {
+                self.encode_plain(text[seg..i], gpa, &out);
+                out.push(SPECIAL_IDS[hit]);
+                i += SPECIALS[hit].len();
+                seg = i;
+            } else {
+                i += 1;
+            }
+        }
+        self.encode_plain(text[seg..text.len()], gpa, &out);
+        out
+    }
+
+    fn encode_plain(self, s: [u8], gpa: Gpa, out: inout Vec<i64>) {
+        let cuts = pre_tokens(s, gpa);
+        var k: i64 = 0;
+        while k < cuts.len() {
+            self.bpe(s[cuts[k]..cuts[k + 1]], gpa, &out);
+            k += 2;
+        }
+    }
+
+    // Merges the bytes of one pre-token, lowest rank first.
+    fn bpe(self, word: [u8], gpa: Gpa, out: inout Vec<i64>) {
+        var sym: Vec<i64> = Vec::new_in(gpa);
+        for b in word { sym.push(self.byte_id[b as i64]); }
+        while sym.len() > 1 {
+            var best: i64 = -1;
+            for k in 0..(sym.len() - 1) {
+                let r = self.ranks.get(pair_key(sym[k], sym[k + 1])).unwrap_or(-1);
+                if r >= 0 && (best < 0 || r < best) {
+                    best = r;
+                }
+            }
+            if best < 0 { break; }
+            let a = self.lefts[best];
+            let b = self.rights[best];
+            var next: Vec<i64> = Vec::new_in(gpa);
+            var k: i64 = 0;
+            while k < sym.len() {
+                if k + 1 < sym.len() && sym[k] == a && sym[k + 1] == b {
+                    next.push(self.merged[best]);
+                    k += 2;
+                } else {
+                    next.push(sym[k]);
+                    k += 1;
+                }
+            }
+            sym = next;
+        }
+        for x in sym { out.push(x); }
+    }
+
+    // The bytes of a sequence of ids.
+    pub fn decode(self, ids: [i64], gpa: Gpa) -> Vec<u8> {
+        var out: Vec<u8> = Vec::new_in(gpa);
+        for id in ids {
+            if id >= 0 && id < self.raw.len() {
+                out.extend_from_slice(self.raw[id].as_slice());
+            }
+        }
+        out
+    }
+
+    pub fn id_of(self, text: [u8]) -> i64 {
+        self.ids.get(fnv(text)).unwrap_or(-1)
+    }
+}
+
+// The inverse of byte_char: a character's code point -> its byte.
+fn byte_inverse(gpa: Gpa) -> Vec<u8> {
+    var inv: Vec<u8> = Vec::filled_in(512, 0, gpa);
+    for b in 0..256 {
+        inv[byte_char(b)] = b as u8;
+    }
+    inv
+}
+
+fn matches_at(text: [u8], i: i64, pat: [u8]) -> bool {
+    if i + pat.len() > text.len() { return false; }
+    for k in 0..pat.len() {
+        if text[i + k] != pat[k] { return false; }
+    }
+    true
+}
+
+fn pair_key(a: i64, b: i64) -> i64 {
+    a * 262144 + b
+}
+
+const VOCAB: i64 = 248320;
+
+#[test]
+fn byte_chars_follow_gpt2(gpa: Gpa) {
+    assert_eq(byte_char(65), 65);
+    assert_eq(byte_char(0), 256);
+    assert_eq(byte_char(32), 288);
+    assert_eq(byte_inverse(gpa)[288], 32);
+}
+
+#[test]
+fn pre_tokens_split_like_the_model(gpa: Gpa) {
+    // "don't stop" -> "don", "'t", " stop"; "a  b" -> "a", " ", " b"
+    let s = "don't stop".as_bytes();
+    let cuts = pre_tokens(s, gpa);
+    assert_eq(cuts.len(), 6);
+    assert_eq(cuts[2], 3);
+    assert_eq(cuts[3], 5);
+    assert_eq(cuts[4], 5);
+    assert_eq(cuts[5], 10);
+}

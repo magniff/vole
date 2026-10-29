@@ -1,0 +1,443 @@
+// ocean: Tessendorf's FFT ocean on the GPU (std::gpu, WGSL compute and
+// render), drawn into a window (std::window) with a camera you move.
+//
+//   ocean [--n N] [--frames K] [--shot FILE.ppm]     the window
+//   ocean --headless [--n N] [--steps S] [--shot FILE.ppm]
+//
+// ocean.vl holds the spectrum, the FFT and the picture; shaders.vl the
+// WGSL. The headless mode checks the GPU against the CPU: the inverse FFT
+// against a direct DFT on a 16 x 16 grid, the height and slope fields at
+// sample texels against the direct sums over all modes, and the height's
+// mean square against Parseval's sum over the spectrum.
+
+mod ocean;
+mod shaders;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use ocean::{Camera, FIELDS, Fft, Ocean, PI, Rng, coeffs_at, direct, spectral_energy, wave_number};
+
+// The patch's side in metres, the wind (m/s) and the waves' standard
+// deviation (m): the sea's height is about 4 sig from trough to crest.
+const LENGTH: f64 = 256.0;
+const WIND: f64 = 10.0;
+const SIG: f64 = 0.45;
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The inverse 2D DFT of a 16 x 16 grid by the definition, for the check:
+// y(m, p) = sum over (q, r) of x(q, r) e^{2 pi i (r m + q p) / n}.
+fn dft_inverse(x: [f32], n: i64, gpa: Gpa) -> Vec<f64> {
+    var y: Vec<f64> = Vec::filled_in(2 * n * n, 0.0, gpa);
+    for p in 0..n {
+        for m in 0..n {
+            var sr = 0.0;
+            var si = 0.0;
+            for q in 0..n {
+                for r in 0..n {
+                    let ph = 2.0 * PI * ((r * m + q * p) % n) as f64 / n as f64;
+                    let (c, s) = (ph.cos(), ph.sin());
+                    let xr = x[2 * (q * n + r)] as f64;
+                    let xi = x[2 * (q * n + r) + 1] as f64;
+                    sr += xr * c - xi * s;
+                    si += xr * s + xi * c;
+                }
+            }
+            y[2 * (p * n + m)] = sr;
+            y[2 * (p * n + m) + 1] = si;
+        }
+    }
+    y
+}
+
+// The GPU's inverse FFT of a random 16 x 16 grid against the DFT: the
+// largest difference of any value.
+fn fft_check(o: inout Ocean, gpa: Gpa) -> Result<f64, gpu::Error> {
+    let n = 16;
+    var f = Fft::new_in(o.dev, n, 5, gpa)?;
+    var rng = Rng::new(7);
+    var x: Vec<f32> = Vec::filled_in(10 * n * n, 0.0, gpa);
+    for i in 0..10 * n * n {
+        if i < 2 * n * n { x[i] = (2.0 * rng.uniform() - 1.0) as f32; }
+    }
+    o.queue.write_buffer(f.a, 0, gpu::bytes_of_f32(x.as_slice()));
+    var enc = o.dev.encoder();
+    enc.compute_pass(|pass| {
+        f.transform(&pass);
+    });
+    o.queue.submit(enc.finish());
+    let got = gpu::f32s(f.a.map_read(o.dev));
+    var worst = 0.0;
+    for fld in 0..5 {
+        let want = dft_inverse(x[fld * 2 * n * n..(fld + 1) * 2 * n * n], n, gpa);
+        for i in 0..2 * n * n {
+            let e = (got[fld * 2 * n * n + i] as f64 - want[i]).abs();
+            if e > worst {
+                worst = e;
+            }
+        }
+    }
+    Ok(worst)
+}
+
+// The real part of texel i of field f in the transformed buffer (the
+// buffer holds re, im pairs, field f's texels from f * n * n).
+fn field_at(got: [f32], f: i64, i: i64, n: i64) -> f64 {
+    got[2 * (f * n * n + i)] as f64
+}
+
+// The headless run: the checks, the frame time and (with --shot) a picture.
+fn headless(n: i64, steps: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var o = match Ocean::new_in(n, LENGTH, WIND, SIG, Format::Bgra8Unorm, gpa) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    let fft_err = match fft_check(&o, gpa) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    let fft_ok = fft_err < 1e-3;
+    println(
+        f"inverse FFT of 5 fields, 16 x 16 grid against the CPU DFT: max error {fft_err:.2e} ({verdict(fft_ok)})");
+
+    // the fields at time t, against the CPU's sums over all the modes
+    let t = 3.7;
+    o.evolve(t);
+    let coef = coeffs_at(o.h0.as_slice(), n, LENGTH, t, gpa);
+    let got = gpu::f32s(o.fft.a.map_read(o.dev));
+    let cells = n * n;
+    var sum = 0.0;
+    var sq = 0.0;
+    for i in 0..cells {
+        let v = field_at(got, 0, i, n);
+        sum += v;
+        sq += v * v;
+    }
+    let mean = sum / cells as f64;
+    let ms = sq / cells as f64;
+    let energy = spectral_energy(coef.as_slice());
+    let parseval = (ms - energy).abs() / energy;
+    let std = (ms - mean * mean).sqrt();
+    let std_ok = (std - SIG).abs() / SIG < 0.25;
+    let parseval_ok = parseval < 1e-3;
+    println(
+        f"height field {n} x {n} at t = {t} s: mean {mean:.2e} m, std {std:.4} m (target {SIG} m, {verdict(std_ok)})");
+    println(
+        f"Parseval: mean square {ms:.6} m2 against the spectrum's sum {energy:.6} m2 (relative {parseval:.2e}, {verdict(parseval_ok)})");
+
+    var worst_h = 0.0;
+    var worst_s = 0.0;
+    // sample texels, as fractions of the grid: (x, z) in 1/256ths
+    let samples: [i64] = [0, 0, 37, 101, 128, 3, 200, 250];
+    for i in 0..4 {
+        let x = samples[2 * i] * n / 256;
+        let z = samples[2 * i + 1] * n / 256;
+        let hg = field_at(got, 0, z * n + x, n);
+        let hc = direct(coef.as_slice(), n, LENGTH, x, z, 0);
+        let sg = field_at(got, 3, z * n + x, n);
+        let sc = direct(coef.as_slice(), n, LENGTH, x, z, 3);
+        if (hg - hc).abs() > worst_h { worst_h = (hg - hc).abs(); }
+        if (sg - sc).abs() > worst_s { worst_s = (sg - sc).abs(); }
+    }
+    let pointwise_ok = worst_h < 1e-3 && worst_s < 1e-3;
+    println(
+        f"4 sample texels against the direct sums: height error {worst_h:.2e} m, slope error {worst_s:.2e} m/m ({verdict(pointwise_ok)})");
+
+    // the frame time: the spectrum and its inverse FFT, every frame
+    let t0 = monotonic_now();
+    for i in 0..steps {
+        o.set_time(t + i as f64 / 60.0);
+        var enc = o.dev.encoder();
+        o.step(&enc);
+        o.queue.submit(enc.finish());
+    }
+    let _ = o.queue.wait_idle();
+    let ms_frame = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / steps as f64;
+    println(
+        f"frame: spectrum and inverse FFT of {FIELDS} fields, {n} x {n}: {ms_frame:.3} ms a frame ({steps} frames)");
+
+    if shot.len() > 0 {
+        o.set_time(t);
+        o.set_camera(Camera::start(), 960, 540, t);
+        let img = o.snapshot_in(960, 540, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"ocean: cannot write {shot}");
+            return 1;
+        }
+        println(f"wrote {shot} (960 x 540)");
+    }
+    if fft_ok && std_ok && parseval_ok && pointwise_ok { 0 } else { 1 }
+}
+
+// What a held key does: the camera's keys (WASD, arrows, Q/E), pause, quit.
+struct Keys {
+    fwd: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    turn_l: bool,
+    turn_r: bool,
+    look_up: bool,
+    look_down: bool,
+    pause: bool,
+    reset: bool,
+    quit: bool,
+}
+
+fn on_key(k: inout Keys, key: Logical, down: bool) {
+    match key {
+        Logical::Char(c) => {
+            if c == 'w' as u32 { k.fwd = down; }
+            if c == 's' as u32 { k.back = down; }
+            if c == 'a' as u32 { k.left = down; }
+            if c == 'd' as u32 { k.right = down; }
+            if c == 'e' as u32 { k.up = down; }
+            if c == 'q' as u32 { k.down = down; }
+            if c == 'r' as u32 && down { k.reset = true; }
+            if c == 'p' as u32 && down { k.pause = !k.pause; }
+        }
+        Logical::Named(Named::ArrowLeft) => k.turn_l = down,
+        Logical::Named(Named::ArrowRight) => k.turn_r = down,
+        Logical::Named(Named::ArrowUp) => k.look_up = down,
+        Logical::Named(Named::ArrowDown) => k.look_down = down,
+        Logical::Named(Named::Escape) => {
+            if down { k.quit = true; }
+        }
+        _ => {}
+    }
+}
+
+// The window: the camera moves with the keys, the sea runs on the clock.
+fn windowed(n: i64, max_frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("ocean: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("ocean", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("ocean: no window");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    var o = match Ocean::new_in(n, LENGTH, WIND, SIG, Format::Bgra8Unorm, gpa) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(o.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"ocean: {e}");
+            return 1;
+        }
+    };
+    surf.configure(o.dev, sz.w, sz.h);
+    var depth = o.dev.texture(surf.width, surf.height, Format::Depth32Float,
+        usage: TextureUsage::RENDER_ATTACHMENT);
+    var cam = Camera::start();
+    var keys = Keys {
+        fwd: false, back: false, left: false, right: false, up: false, down: false,
+        turn_l: false, turn_r: false, look_up: false, look_down: false, pause: false,
+        reset: false, quit: false,
+    };
+    let start = monotonic_now();
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames = 0;
+    var first = 0.0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var dt = now - prev;
+                if frames == 0 || dt > 1.0 / 30.0 { dt = 1.0 / 60.0; }
+                prev = now;
+                if keys.reset {
+                    cam = Camera::start();
+                    keys.reset = false;
+                }
+                let speed = 12.0 * dt;
+                let f = (if keys.fwd { speed } else { 0.0 }) - (if keys.back { speed }
+                    else { 0.0 });
+                let s = (if keys.right { speed } else { 0.0 }) - (if keys.left { speed }
+                    else { 0.0 });
+                let u = (if keys.up { speed } else { 0.0 }) - (if keys.down { speed } else { 0.0 });
+                cam.move_by(f, s, u);
+                cam.yaw += (if keys.turn_r { 1.0 } else { 0.0 }) * dt - (if keys.turn_l { 1.0 }
+                    else { 0.0 }) * dt;
+                cam.pitch += (if keys.look_up { 0.6 } else { 0.0 }) * dt - (
+                    if keys.look_down { 0.6 } else { 0.0 }) * dt;
+                if cam.pitch > 1.5 { cam.pitch = 1.5; }
+                if cam.pitch < -1.5 { cam.pitch = -1.5; }
+                if !keys.pause { clock += dt; }
+                o.set_time(clock);
+                o.set_camera(cam, surf.width, surf.height, clock);
+                match surf.frame() {
+                    Ok(fr) => {
+                        var enc = o.dev.encoder();
+                        if !keys.pause {
+                            o.step(&enc);
+                        }
+                        o.draw(&enc, fr.texture.view(), depth.view());
+                        o.queue.submit(enc.finish());
+                        fr.present(&o.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames == 1 { first = now; }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"{n} x {n} grid, {surf.width} x {surf.height} pixels: {frames} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    if shot.len() > 0 {
+                        let img = o.snapshot_in(surf.width, surf.height, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"ocean: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if keys.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if !k.repeat {
+                    on_key(&keys, k.key, k.pressed);
+                } else if k.pressed {
+                    on_key(&keys, k.key, true);
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(o.dev, z.w, z.h);
+                depth = o.dev.texture(surf.width, surf.height, Format::Depth32Float,
+                    usage: TextureUsage::RENDER_ATTACHMENT);
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if keys.quit { break; }
+    }
+    let _ = o.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("ocean", gpa)
+        .about(
+            "Tessendorf's FFT ocean on the GPU: a window to move through, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: run the checks, print the numbers"))
+        .arg(Arg::option("n").value_name("N").default("256")
+            .help("the grid's side (a power of two, 16 to 1024)"))
+        .arg(Arg::option("steps").default("60").help("headless: frames timed"))
+        .arg(Arg::option("frames").value_name("K").default("0")
+            .help("window: quit after K frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the picture as a PPM (headless: the start camera; window: with --frames, the last frame)"));
+    let m = cli.parse_or_exit(env::args());
+    let n = match parse_int(m.get("n").unwrap_or("256")) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln("ocean: --n takes a number");
+            return 2;
+        }
+    };
+    if n < 16 || n > 1024 || (n & (n - 1)) != 0 {
+        eprintln("ocean: --n is a power of two from 16 to 1024");
+        return 2;
+    }
+    let shot = m.get("shot").unwrap_or("");
+    if m.flag("headless") {
+        let steps = parse_int(m.get("steps").unwrap_or("60")).unwrap_or(60);
+        return headless(n, steps, shot, gpa);
+    }
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    windowed(n, frames, shot, gpa)
+}
+
+#[test]
+fn rng_is_in_the_unit_interval() {
+    var r = Rng::new(42);
+    for _ in 0..10000 {
+        let u = r.uniform();
+        assert(u > 0.0 && u <= 1.0);
+    }
+}
+
+#[test]
+fn wave_numbers_are_symmetric() {
+    let n = 16;
+    assert_eq(wave_number(0, n, LENGTH), 0.0);
+    assert_eq(wave_number(1, n, LENGTH) + wave_number(15, n, LENGTH), 0.0);
+    assert_eq(wave_number(n - 1, n, LENGTH), -wave_number(1, n, LENGTH));
+}
+
+#[test]
+fn spectrum_has_the_asked_variance(gpa: Gpa) {
+    // sum 2 P(k) over the modes is sig^2 by construction
+    let n = 32;
+    let w = ocean::weights(n, LENGTH, WIND, 0.8, 0.6, SIG, gpa);
+    var total = 0.0;
+    for i in 0..n * n {
+        total += 2.0 * w[i];
+    }
+    assert((total - SIG * SIG).abs() < 1e-9);
+}
+
+#[test]
+fn spectrum_at_t_is_hermitian(gpa: Gpa) {
+    // H(-k) = conj H(k): the transform is real
+    let n = 16;
+    let h0 = ocean::initial(n, LENGTH, WIND, 0.8, 0.6, SIG, 99, gpa);
+    let c = coeffs_at(h0.as_slice(), n, LENGTH, 2.5, gpa);
+    for z in 0..n {
+        for x in 0..n {
+            let i = z * n + x;
+            let j = ((n - z) % n) * n + (n - x) % n;
+            assert((c[2 * i] - c[2 * j]).abs() < 1e-12);
+            assert((c[2 * i + 1] + c[2 * j + 1]).abs() < 1e-12);
+        }
+    }
+}
+
+#[test]
+fn camera_basis_is_orthonormal() {
+    var c = Camera::start();
+    c.pitch = 0.4;
+    c.yaw = 2.0;
+    let w = c.words(640, 360, 64, LENGTH, 1.0, 0.0);
+    // forward, right, up at offsets 4, 8, 12 (vec4 each)
+    let dot_fr = w[4] * w[8] + w[5] * w[9] + w[6] * w[10];
+    let dot_fu = w[4] * w[12] + w[5] * w[13] + w[6] * w[14];
+    let len_r = w[8] * w[8] + w[9] * w[9] + w[10] * w[10];
+    assert(dot_fr.abs() < 1e-5 && dot_fu.abs() < 1e-5 && (len_r - 1.0).abs() < 1e-5);
+}

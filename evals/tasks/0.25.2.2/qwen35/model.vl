@@ -1,0 +1,295 @@
+// The Qwen3.5-0.8B forward pass on the GPU: the bf16 weights uploaded from
+// the safetensors bytes, the kernels of wgsl.vl compiled once, and one
+// compute pass of dispatches per token: the 24 layers, then the head (the
+// final norm and the tied LM head, run only when the logits are wanted).
+// The KV caches and the recurrent states live on the GPU.
+
+use std::gpu;
+use std::gpu::{Buffer, BufferUsage, BindEntry, BindGroup, BindLayout, ComputePipeline, Device, Queue};
+use st::SafeTensors;
+use wgsl::{src_matvec, src_norm, src_embed, src_conv, src_delta, src_rope, src_kvstore, src_attn, src_silu_mul};
+
+// The most positions the KV cache holds (prompt plus reply).
+pub const MAXCTX: i64 = 2048;
+pub const VOCAB: i64 = 248320;
+const HID: i64 = 1024;
+const INTER: i64 = 3584;
+
+// The pipelines, by index (one module per kernel shape).
+const P_MV_QKV: i64 = 0;     // 6144 x 1024, write
+const P_MV_Z: i64 = 1;       // 2048 x 1024, write
+const P_MV_BA: i64 = 2;      // 16 x 1024, write (b and a)
+const P_MV_OUT: i64 = 3;     // 1024 x 2048, add (out_proj, o_proj)
+const P_MV_Q: i64 = 4;       // 4096 x 1024, write
+const P_MV_KV: i64 = 5;      // 512 x 1024, write
+const P_MV_UP: i64 = 6;      // 3584 x 1024, write (gate, up)
+const P_MV_DOWN: i64 = 7;    // 1024 x 3584, add
+const P_MV_LM: i64 = 8;      // 248320 x 1024, write
+const P_NORM_H: i64 = 9;     // 1024 values
+const P_NORM_Q: i64 = 10;    // 256 per head, stride 512 (the query in qfull)
+const P_NORM_K: i64 = 11;    // 256 per head, stride 256
+const P_EMBED: i64 = 12;
+const P_CONV: i64 = 13;
+const P_DELTA: i64 = 14;
+const P_ROPE: i64 = 15;
+const P_KVSTORE: i64 = 16;
+const P_ATTN: i64 = 17;
+const P_SILU: i64 = 18;
+
+// One dispatch: a pipeline, its bind group, and the workgroups in x and y.
+pub struct Op {
+    pipe: i64,
+    group: i64,
+    nx: i64,
+    ny: i64,
+}
+
+// The pipelines, bind groups and dispatches of the model, built once.
+struct Builder {
+    lay: Vec<BindLayout>,
+    pipes: Vec<ComputePipeline>,
+    groups: Vec<BindGroup>,
+    ops: Vec<Op>,
+}
+
+impl Builder {
+    fn op(inout self, dev: Device, pipe: i64, entries: [BindEntry], nx: i64, ny: i64) {
+        let g = dev.bind_group(self.lay[pipe], entries);
+        self.groups.push(g);
+        self.ops.push(Op { pipe: pipe, group: self.groups.len() - 1, nx: nx, ny: ny });
+    }
+
+    // y = W x (or y += W x) with W rows x cols; a row per workgroup.
+    fn mv(inout self, dev: Device, pipe: i64, rows: i64, w: Buffer, x: Buffer, y: Buffer) {
+        let dx = if rows < 65535 { rows } else { 65535 };
+        let dy = (rows + dx - 1) / dx;
+        self.op(dev, pipe, [gpu::bind(0, w), gpu::bind(1, x), gpu::bind(2, y)][..], dx, dy);
+    }
+
+    // The zero-centred RMSNorm of `vecs` vectors: out = norm(x) * (1 + w).
+    fn norm(inout self, dev: Device, pipe: i64, x: Buffer, w: Buffer, out: Buffer, vecs: i64) {
+        self.op(dev, pipe, [gpu::bind(0, x), gpu::bind(1, w), gpu::bind(2, out)][..], vecs, 1);
+    }
+}
+
+// The name of layer l's tensor with this suffix.
+fn lname(gpa: Gpa, l: i64, suffix: str) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("model.language_model.layers.");
+    b.push_int(l);
+    b.push_str(".");
+    b.push_str(suffix.as_bytes());
+    b
+}
+
+// The index of a tensor, which the model needs.
+fn need(st: SafeTensors, name: [u8], gpa: Gpa) -> i64 {
+    let i = st.find(name);
+    if i < 0 {
+        panic(format_in(f"missing tensor {name}", gpa).as_slice());
+    }
+    i
+}
+
+fn wbuf(dev: Device, st: SafeTensors, i: i64) -> Buffer {
+    dev.buffer_init(st.bytes_of(i), BufferUsage::STORAGE)
+}
+
+// A zeroed buffer of n bytes (the initial state of a cache or a recurrence).
+fn zeros(dev: Device, n: i64, gpa: Gpa) -> Buffer {
+    let z: Vec<u8> = Vec::filled_in(n, 0, gpa);
+    dev.buffer_init(z.as_slice(), BufferUsage::STORAGE | BufferUsage::COPY_DST)
+}
+
+// A scratch buffer of n f32s (each is written before it is read).
+fn scratch(dev: Device, n: i64) -> Buffer {
+    dev.buffer(n * 4, BufferUsage::STORAGE)
+}
+
+fn pipe_of(dev: Device, src: Buf) -> Result<ComputePipeline, gpu::Error> {
+    let shader = dev.shader_wgsl(src.as_slice())?;
+    dev.compute_pipeline(shader, "main")
+}
+
+pub struct Model {
+    pub inst: gpu::Instance,
+    pub dev: Device,
+    pub queue: Queue,
+    pipes: Vec<ComputePipeline>,
+    groups: Vec<BindGroup>,
+    ops: Vec<Op>,
+    // the ops from here on are the head (run for the logits only)
+    head_at: i64,
+    // the per-token parameters: [pos, pos + 1, token id, 0], u32s
+    pb: Buffer,
+    // the logits of the last token that wanted them (f32 x VOCAB)
+    pub logits: Buffer,
+    // the recurrent states (the conv and delta states of each linear layer)
+    recur: Vec<Buffer>,
+    // the position of the next token
+    pub pos: i64,
+}
+
+impl Model {
+    // Compiles the kernels and uploads the weights of the text model in st.
+    pub fn new(st: SafeTensors, gpa: Gpa) -> Result<Model, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+
+        var pipes: Vec<ComputePipeline> = Vec::new_in(gpa);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 6144, 1024, false, 6144))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 2048, 1024, false, 2048))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 16, 1024, false, 16))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 1024, 2048, true, 1024))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 4096, 1024, false, 4096))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 512, 1024, false, 512))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 3584, 1024, false, 3584))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, 1024, 3584, true, 1024))?);
+        pipes.push(pipe_of(dev, src_matvec(gpa, VOCAB, 1024, false, 65535))?);
+        pipes.push(pipe_of(dev, src_norm(gpa, 1024, 1024))?);
+        pipes.push(pipe_of(dev, src_norm(gpa, 256, 512))?);
+        pipes.push(pipe_of(dev, src_norm(gpa, 256, 256))?);
+        pipes.push(pipe_of(dev, src_embed(gpa))?);
+        pipes.push(pipe_of(dev, src_conv(gpa))?);
+        pipes.push(pipe_of(dev, src_delta(gpa))?);
+        pipes.push(pipe_of(dev, src_rope(gpa, 8))?);
+        pipes.push(pipe_of(dev, src_kvstore(gpa))?);
+        pipes.push(pipe_of(dev, src_attn(gpa, MAXCTX))?);
+        pipes.push(pipe_of(dev, src_silu_mul(gpa))?);
+        var lay: Vec<BindLayout> = Vec::new_in(gpa);
+        for p in 0..pipes.len() {
+            lay.push(pipes[p].bind_layout(0));
+        }
+        var recur: Vec<Buffer> = Vec::new_in(gpa);
+        var b = Builder { lay: lay, pipes: pipes, groups: Vec::new_in(gpa),
+            ops: Vec::new_in(gpa) };
+
+        // the scratch activations
+        let x = scratch(dev, HID);
+        let xn = scratch(dev, HID);
+        let qkv_raw = scratch(dev, 6144);
+        let conv_out = scratch(dev, 6144);
+        let zb = scratch(dev, 2048);
+        let braw = scratch(dev, 16);
+        let araw = scratch(dev, 16);
+        let core = scratch(dev, 2048);
+        let qfull = scratch(dev, 4096);
+        let kraw = scratch(dev, 512);
+        let vraw = scratch(dev, 512);
+        let qnorm = scratch(dev, 2048);
+        let knorm = scratch(dev, 512);
+        let attn_out = scratch(dev, 2048);
+        let gbuf = scratch(dev, INTER);
+        let ubuf = scratch(dev, INTER);
+        let act = scratch(dev, INTER);
+        let logits = dev.buffer(VOCAB * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let pb = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+
+        // the tied embedding table: the first op reads it, the LM head too
+        let emb = wbuf(dev, st, need(st, "model.language_model.embed_tokens.weight", gpa));
+        b.op(dev, P_EMBED, [gpu::bind(0, emb), gpu::bind(1, pb), gpu::bind(2, x)][..], 4, 1);
+
+        for l in 0..24 {
+            let is_full = (l + 1) % 4 == 0;
+            let nrm_in = wbuf(dev, st, need(st, lname(gpa, l, "input_layernorm.weight").as_slice(), gpa));
+            let nrm_post = wbuf(dev, st, need(st, lname(gpa, l, "post_attention_layernorm.weight").as_slice(), gpa));
+            let w_gate = wbuf(dev, st, need(st, lname(gpa, l, "mlp.gate_proj.weight").as_slice(), gpa));
+            let w_up = wbuf(dev, st, need(st, lname(gpa, l, "mlp.up_proj.weight").as_slice(), gpa));
+            let w_down = wbuf(dev, st, need(st, lname(gpa, l, "mlp.down_proj.weight").as_slice(), gpa));
+            b.norm(dev, P_NORM_H, x, nrm_in, xn, 1);
+            if is_full {
+                let wq = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.q_proj.weight").as_slice(), gpa));
+                let wk = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.k_proj.weight").as_slice(), gpa));
+                let wv = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.v_proj.weight").as_slice(), gpa));
+                let wo = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.o_proj.weight").as_slice(), gpa));
+                let qn_w = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.q_norm.weight").as_slice(), gpa));
+                let kn_w = wbuf(dev, st, need(st, lname(gpa, l, "self_attn.k_norm.weight").as_slice(), gpa));
+                let kc = zeros(dev, MAXCTX * 512 * 4, gpa);
+                let vc = zeros(dev, MAXCTX * 512 * 4, gpa);
+                b.mv(dev, P_MV_Q, 4096, wq, xn, qfull);
+                b.mv(dev, P_MV_KV, 512, wk, xn, kraw);
+                b.mv(dev, P_MV_KV, 512, wv, xn, vraw);
+                b.norm(dev, P_NORM_Q, qfull, qn_w, qnorm, 8);
+                b.norm(dev, P_NORM_K, kraw, kn_w, knorm, 2);
+                b.op(dev, P_ROPE, [gpu::bind(0, qnorm), gpu::bind(1, pb)][..], 8, 1);
+                b.op(dev, P_ROPE, [gpu::bind(0, knorm), gpu::bind(1, pb)][..], 2, 1);
+                b.op(dev, P_KVSTORE, [gpu::bind(0, knorm), gpu::bind(1, vraw), gpu::bind(2, pb),
+                    gpu::bind(3, kc), gpu::bind(4, vc)][..], 2, 1);
+                b.op(dev, P_ATTN, [gpu::bind(0, qnorm), gpu::bind(1, qfull), gpu::bind(2, kc),
+                    gpu::bind(3, vc), gpu::bind(4, pb), gpu::bind(5, attn_out)][..], 8, 1);
+                b.mv(dev, P_MV_OUT, 1024, wo, attn_out, x);
+            } else {
+                let w_qkv = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.in_proj_qkv.weight").as_slice(), gpa));
+                let w_z = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.in_proj_z.weight").as_slice(), gpa));
+                let w_b = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.in_proj_b.weight").as_slice(), gpa));
+                let w_a = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.in_proj_a.weight").as_slice(), gpa));
+                let w_out = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.out_proj.weight").as_slice(), gpa));
+                let conv_w = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.conv1d.weight").as_slice(), gpa));
+                let alog = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.A_log").as_slice(), gpa));
+                let dtb = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.dt_bias").as_slice(), gpa));
+                let norm_w = wbuf(dev, st, need(st, lname(gpa, l, "linear_attn.norm.weight").as_slice(), gpa));
+                let cstate = zeros(dev, 6144 * 3 * 4, gpa);
+                let sstate = zeros(dev, 16 * 128 * 128 * 4, gpa);
+                b.mv(dev, P_MV_QKV, 6144, w_qkv, xn, qkv_raw);
+                b.mv(dev, P_MV_Z, 2048, w_z, xn, zb);
+                b.mv(dev, P_MV_BA, 16, w_b, xn, braw);
+                b.mv(dev, P_MV_BA, 16, w_a, xn, araw);
+                b.op(dev, P_CONV, [gpu::bind(0, conv_w), gpu::bind(1, qkv_raw), gpu::bind(2, cstate),
+                    gpu::bind(3, conv_out)][..], 24, 1);
+                b.op(dev, P_DELTA, [gpu::bind(0, conv_out), gpu::bind(1, braw), gpu::bind(2, araw),
+                    gpu::bind(3, alog), gpu::bind(4, dtb), gpu::bind(5, zb), gpu::bind(6, norm_w),
+                    gpu::bind(7, sstate), gpu::bind(8, core)][..], 16, 1);
+                b.mv(dev, P_MV_OUT, 1024, w_out, core, x);
+                recur.push(cstate);
+                recur.push(sstate);
+            }
+            // the MLP: x += down(silu(gate(n)) * up(n)), n = norm(x)
+            b.norm(dev, P_NORM_H, x, nrm_post, xn, 1);
+            b.mv(dev, P_MV_UP, 3584, w_gate, xn, gbuf);
+            b.mv(dev, P_MV_UP, 3584, w_up, xn, ubuf);
+            b.op(dev, P_SILU, [gpu::bind(0, gbuf), gpu::bind(1, ubuf), gpu::bind(2, act)][..], 14, 1);
+            b.mv(dev, P_MV_DOWN, 1024, w_down, act, x);
+        }
+
+        let head_at = b.ops.len();
+        let nf = wbuf(dev, st, need(st, "model.language_model.norm.weight", gpa));
+        b.norm(dev, P_NORM_H, x, nf, xn, 1);
+        b.mv(dev, P_MV_LM, VOCAB, emb, xn, logits);
+        Ok(Model { inst: inst, dev: dev, queue: queue, pipes: b.pipes, groups: b.groups, ops: b.ops,
+            head_at: head_at, pb: pb, logits: logits, recur: recur, pos: 0 })
+    }
+
+    // Waits until the GPU has run every token fed so far.
+    pub fn sync(inout self) {
+        self.dev.wait_idle();
+    }
+
+    // Starts a new sequence: the recurrent states back to zero, position 0.
+    pub fn reset(inout self, gpa: Gpa) {
+        let zero: Vec<u8> = Vec::filled_in(16 * 128 * 128 * 4, 0, gpa);
+        for k in 0..self.recur.len() {
+            self.queue.write_buffer(self.recur[k], 0, zero[0..self.recur[k].size]);
+        }
+        self.pos = 0;
+    }
+
+    // Runs one token at the next position: its layers, and the head (the
+    // logits in self.logits) when want_logits. Waits for the GPU when the
+    // logits are wanted.
+    pub fn step(inout self, token: i64, want_logits: bool) {
+        let p: [u32; 4] = [self.pos as u32, (self.pos + 1) as u32, token as u32, 0];
+        self.queue.write_buffer(self.pb, 0, gpu::bytes_of_u32(p[..]));
+        var enc = self.dev.encoder();
+        let n = if want_logits { self.ops.len() } else { self.head_at };
+        enc.compute_pass(|pass| {
+            for k in 0..n {
+                let op = self.ops[k];
+                pass.set_pipeline(self.pipes[op.pipe]);
+                pass.set_bind_group(0, self.groups[op.group]);
+                pass.dispatch(op.nx, op.ny);
+            }
+        });
+        self.queue.submit(enc.finish());
+        self.pos += 1;
+    }
+}

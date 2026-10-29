@@ -1,0 +1,179 @@
+// --check: the model against reference.json (transformers' float32 CPU run
+// of the same weights). It compares the tokenizer on the reference's texts,
+// the chat template, and for each prompt the top-10 logits at every greedy
+// step, fed the reference's own greedy tokens (teacher forcing: one miss
+// does not hide the rest).
+
+use json::{Json, Member, member_index};
+use model::Model;
+use tok::Tok;
+use run::{feed, logits_of, argmax, topk, chat_text};
+
+// The integers of a JSON array (numbers only).
+fn ints_of(xs: [Json], gpa: Gpa) -> Vec<i64> {
+    var out: Vec<i64> = Vec::new_in(gpa);
+    for k in 0..xs.len() {
+        match xs[k] {
+            Json::Num(n) => out.push(n as i64),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn floats_of(xs: [Json], gpa: Gpa) -> Vec<f64> {
+    var out: Vec<f64> = Vec::new_in(gpa);
+    for k in 0..xs.len() {
+        match xs[k] {
+            Json::Num(n) => out.push(n),
+            _ => {}
+        }
+    }
+    out
+}
+
+// The ints of the array member key of an object (empty when missing).
+fn member_ints(fs: [Member], key: str, gpa: Gpa) -> Vec<i64> {
+    let i = member_index(fs, key.as_bytes());
+    if i < 0 { return Vec::new_in(gpa); }
+    match fs[i].val {
+        Json::Arr(xs) => ints_of(xs.as_slice(), gpa),
+        _ => Vec::new_in(gpa),
+    }
+}
+
+// The text of the string member key of an object (empty when missing).
+fn member_text(fs: [Member], key: str, gpa: Gpa) -> Vec<u8> {
+    let i = member_index(fs, key.as_bytes());
+    if i < 0 { return Vec::new_in(gpa); }
+    match fs[i].val {
+        Json::Str(s) => {
+            var out: Vec<u8> = Vec::new_in(gpa);
+            out.extend_from_slice(s.as_slice());
+            out
+        }
+        _ => Vec::new_in(gpa),
+    }
+}
+
+fn same(a: [i64], b: [i64]) -> bool {
+    if a.len() != b.len() { return false; }
+    for k in 0..a.len() {
+        if a[k] != b[k] { return false; }
+    }
+    true
+}
+
+// Runs the checks; returns the number of failed ones (0: all agree).
+pub fn check(m: inout Model, tk: Tok, reference: [u8], gpa: Gpa) -> i32 {
+    var fails: i32 = 0;
+    let root = json::parse(reference, gpa);
+    let ms = match root {
+        Json::Obj(ms) => ms,
+        _ => panic("reference.json is not an object"),
+    };
+
+    // the tokenizer on the reference's texts
+    let ti = member_index(ms, "tokenizer_only".as_bytes());
+    match ms[ti].val {
+        Json::Arr(items) => {
+            for k in 0..items.len() {
+                match items[k] {
+                    Json::Obj(fs) => {
+                        let text = member_text(fs, "text", gpa);
+                        let want = member_ints(fs, "ids", gpa);
+                        let got = tk.encode(text.as_slice(), gpa);
+                        let back = tk.decode(got.as_slice(), gpa);
+                        let ok = same(got.as_slice(), want.as_slice()) && back.as_slice() == text.as_slice();
+                        if !ok { fails += 1; }
+                        println(f"tokenizer {ok}: {want.len()} ids");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // the chat template: the text it renders and its ids
+    let pi = member_index(ms, "prompts".as_bytes());
+    match ms[pi].val {
+        Json::Arr(prompts) => {
+            for p in 0..prompts.len() {
+                match prompts[p] {
+                    Json::Obj(pf) => {
+                        let name = member_text(pf, "name", gpa);
+                        let text = member_text(pf, "text", gpa);
+                        let ids = member_ints(pf, "ids", gpa);
+                        let greedy = member_ints(pf, "greedy_ids", gpa);
+                        let enc = tk.encode(text.as_slice(), gpa);
+                        if !same(enc.as_slice(), ids.as_slice()) {
+                            fails += 1;
+                            println(f"prompt {name.as_slice()}: the ids differ");
+                        }
+                        if name.as_slice() == "chat".as_bytes() {
+                            let t = chat_text("Write a haiku about a GPU.".as_bytes(), gpa);
+                            let tid = tk.encode(t.as_slice(), gpa);
+                            let same_text = t.as_slice() == text.as_slice();
+                            if !same_text || !same(tid.as_slice(), ids.as_slice()) {
+                                fails += 1;
+                                println("chat template: differs");
+                            } else {
+                                println("chat template: the text and ids match");
+                            }
+                        }
+                        // the logits along the greedy continuation
+                        m.reset(gpa);
+                        feed(&m, ids.as_slice());
+                        let si = member_index(pf, "steps".as_bytes());
+                        let steps: [Json] = match pf[si].val {
+                            Json::Arr(xs) => xs.as_slice(),
+                            _ => panic("no steps"),
+                        };
+                        var top1: i64 = 0;
+                        var set_ok: i64 = 0;
+                        var maxd: f64 = 0.0;
+                        var first_bad: i64 = -1;
+                        for k in 0..steps.len() {
+                            let lg = logits_of(&m);
+                            var rid: Vec<i64> = Vec::new_in(gpa);
+                            var rl: Vec<f64> = Vec::new_in(gpa);
+                            match steps[k] {
+                                Json::Obj(sf) => {
+                                    rid = member_ints(sf, "top_ids", gpa);
+                                    let li = member_index(sf, "top_logits".as_bytes());
+                                    match sf[li].val {
+                                        Json::Arr(xs) => rl = floats_of(xs.as_slice(), gpa),
+                                        _ => {}
+                                    }
+                                }
+                                _ => {}
+                            }
+                            for t in 0..rid.len() {
+                                let d = (lg[rid[t]] as f64 - rl[t]).abs();
+                                if d > maxd { maxd = d; }
+                            }
+                            let mine = topk(lg, 10, gpa);
+                            if same(mine.as_slice(), rid.as_slice()) { set_ok += 1; }
+                            let want = if k < greedy.len() { greedy[k] } else { -1 };
+                            if argmax(lg) == want {
+                                top1 += 1;
+                            } else if first_bad < 0 {
+                                first_bad = k;
+                            }
+                            if k + 1 < greedy.len() {
+                                m.step(greedy[k], true);
+                            }
+                        }
+                        let ok = top1 == steps.len() && set_ok == steps.len();
+                        if !ok { fails += 1; }
+                        println(f"prompt {name.as_slice()} {ok}: greedy {top1}/{steps.len()} top10 {set_ok}/{steps.len()} max |logit diff| {maxd:.4} first miss {first_bad}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    fails
+}

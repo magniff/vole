@@ -1,0 +1,176 @@
+// Generation on top of the model: the prompt (the chat template or raw
+// text), feeding tokens, and sampling the next one from the logits (greedy,
+// or temperature with top-p over the 256 likeliest tokens).
+
+use std::gpu;
+use model::Model;
+
+// The chat template for one user message, with the empty thinking block
+// the model's template opens (as Qwen3.5 renders it with thinking off).
+pub fn chat_text(user: [u8], gpa: Gpa) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new_in(gpa);
+    out.extend_from_slice("<|im_start|>user\n".as_bytes());
+    out.extend_from_slice(user);
+    out.extend_from_slice("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".as_bytes());
+    out
+}
+
+// The sampling settings: temperature 0 is greedy.
+pub struct Sampler {
+    pub temp: f64,
+    pub top_p: f64,
+    pub seed: u64,
+}
+
+// A xorshift generator: the random draws of the sampling.
+pub struct Rng {
+    s: u64,
+}
+
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        Rng { s: if seed == 0 { 88172645463325252 } else { seed } }
+    }
+
+    // A number in [0, 1).
+    pub fn unit(inout self) -> f64 {
+        self.s = self.s ^ (self.s << 13);
+        self.s = self.s ^ (self.s >> 7);
+        self.s = self.s ^ (self.s << 17);
+        ((self.s >> 11) as f64) / 9007199254740992.0
+    }
+}
+
+// The next token from the logits lg (a view of VOCAB floats).
+pub fn pick(lg: [f32], cfg: Sampler, rng: inout Rng, gpa: Gpa) -> i64 {
+    if cfg.temp <= 0.0 {
+        return argmax(lg);
+    }
+    // the 256 likeliest, in decreasing order
+    let k = 256;
+    var ids: Vec<i64> = Vec::filled_in(k, -1, gpa);
+    var vals: Vec<f64> = Vec::filled_in(k, -1.0e30, gpa);
+    var n: i64 = 0;
+    for i in 0..lg.len() {
+        let v = lg[i] as f64;
+        if n < k || v > vals[k - 1] {
+            var j = if n < k { n } else { k - 1 };
+            while j > 0 && vals[j - 1] < v {
+                vals[j] = vals[j - 1];
+                ids[j] = ids[j - 1];
+                j -= 1;
+            }
+            vals[j] = v;
+            ids[j] = i;
+            if n < k { n += 1; }
+        }
+    }
+    let top = vals[0];
+    var total: f64 = 0.0;
+    var w: Vec<f64> = Vec::filled_in(n, 0.0, gpa);
+    for j in 0..n {
+        w[j] = ((vals[j] - top) / cfg.temp).exp();
+        total += w[j];
+    }
+    // the nucleus: the fewest likeliest tokens with mass top_p
+    var cut: i64 = 0;
+    var mass: f64 = 0.0;
+    while cut < n && (mass < cfg.top_p * total || cut == 0) {
+        mass += w[cut];
+        cut += 1;
+    }
+    let r = rng.unit() * mass;
+    var acc: f64 = 0.0;
+    for j in 0..cut {
+        acc += w[j];
+        if r < acc {
+            return ids[j];
+        }
+    }
+    ids[cut - 1]
+}
+
+// The index of the largest logit.
+pub fn argmax(lg: [f32]) -> i64 {
+    var best: i64 = 0;
+    for i in 1..lg.len() {
+        if lg[i] > lg[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+// The ids of the k largest logits, in decreasing order.
+pub fn topk(lg: [f32], k: i64, gpa: Gpa) -> Vec<i64> {
+    var ids: Vec<i64> = Vec::filled_in(k, -1, gpa);
+    var n: i64 = 0;
+    for i in 0..lg.len() {
+        let v = lg[i];
+        if n < k || v > lg[ids[k - 1]] {
+            var j = if n < k { n } else { k - 1 };
+            while j > 0 && lg[ids[j - 1]] < v {
+                ids[j] = ids[j - 1];
+                j -= 1;
+            }
+            ids[j] = i;
+            if n < k { n += 1; }
+        }
+    }
+    ids
+}
+
+// The count of leading bytes of b that end on a whole UTF-8 character (the
+// rest waits for the next token).
+pub fn whole_utf8(b: [u8]) -> i64 {
+    var end = b.len();
+    // back over at most 3 continuation bytes to a lead byte
+    var back: i64 = 0;
+    while back < 4 && end > 0 && b[end - 1] & 0xC0 == 0x80 {
+        end -= 1;
+        back += 1;
+    }
+    if end == 0 { return b.len(); }
+    let lead = b[end - 1];
+    var need: i64 = 1;
+    if lead >= 0xF0 { need = 4; } else if lead >= 0xE0 { need = 3; } else if lead >= 0xC0 { need = 2; }
+    if end - 1 + need <= b.len() { b.len() } else { end - 1 }
+}
+
+// Feeds the tokens; the last one's logits are left in the model.
+pub fn feed(m: inout Model, ids: [i64]) {
+    for k in 0..ids.len() {
+        m.step(ids[k], k + 1 == ids.len());
+    }
+    m.sync();
+}
+
+// The logits of the last step (read back from the GPU).
+pub fn logits_of(m: inout Model) -> [f32] {
+    gpu::f32s(m.logits.map_read(m.dev))
+}
+
+#[test]
+fn chat_turn_has_the_template(gpa: Gpa) {
+    let t = chat_text("hi".as_bytes(), gpa);
+    assert(t.as_slice() == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".as_bytes());
+}
+
+#[test]
+fn whole_utf8_waits_for_a_split_character() {
+    // "é" is 0xC3 0xA9; with only the lead byte, the lead waits
+    assert_eq(whole_utf8("ab\u{e9}".as_bytes()), 4);
+    let a: [u8; 2] = [97, 0xC3];
+    let b: [u8; 3] = [97, 0xE2, 0x80];
+    assert_eq(whole_utf8(a[..]), 1);
+    assert_eq(whole_utf8(b[..]), 1);
+}
+
+#[test]
+fn argmax_and_topk_agree(gpa: Gpa) {
+    let v: [f32; 5] = [0.5, 3.0, -1.0, 3.0, 2.0];
+    assert_eq(argmax(v[..]), 1);
+    let k = topk(v[..], 3, gpa);
+    assert_eq(k[0], 1);
+    assert_eq(k[2], 4);
+}

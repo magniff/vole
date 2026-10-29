@@ -1,0 +1,339 @@
+// physarum: slime-mould agents on the GPU (std::gpu, WGSL compute), drawn
+// into a window (std::window). Each agent senses the trail ahead and to
+// both sides, turns toward the strongest, moves and deposits; the trail
+// diffuses and decays every step, and is drawn through a colour ramp.
+//
+//   physarum [--agents N] [--width W]                 the window
+//   physarum --headless [--steps N] [--every K] [--shot FILE.ppm]
+//
+// shaders.vl holds the WGSL, sim.vl the GPU side. The headless run checks
+// the numbers: the agents stay inside the trail, and the trail's total
+// follows total' = keep * (total + deposits) at every check (its
+// diffusion moves mass without losing it), so it levels off at
+// keep * deposits / (1 - keep).
+
+mod shaders;
+mod sim;
+
+use std::{env, fs};
+use std::cli::{Arg, Command};
+use std::gpu;
+use std::gpu::{RawSurface, Surface};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use sim::{Params, Sim, deposit_units};
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn clampf(x: f32, lo: f32, hi: f32) -> f32 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+// The trail's total after a step: what is kept of it and this step's
+// deposits.
+pub fn step_total(total: f64, deposits: f64, keep: f64) -> f64 {
+    (total + deposits) * keep
+}
+
+// The steps, the checks every `every` steps and the numbers at the end;
+// a shot of the trail, if asked for.
+fn headless(w: i64, n: i64, steps: i64, every: i64, shot: [u8], gpa: Gpa) -> i32 {
+    let h = w * 9 / 16;
+    var s = match Sim::new_in(w, h, n, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    var p = Params::new();
+    println(
+        f"physarum: {n} agents, a {w} x {h} trail, {steps} steps; deposit {p.deposit}, keep {p.keep}, diffuse {p.diffuse}, sensors {p.sensor_angle} rad at {p.sensor_dist} cells, turn {p.turn}");
+    s.reset(p);
+    let deposits = n as f64 * deposit_units(p.deposit);
+    let keep = p.keep as f64;
+    var pred = 0.0;
+    var worst = 0.0;
+    var last = 0.0;
+    let t0 = monotonic_now();
+    for i in 0..steps {
+        s.set_params(p);
+        var enc = s.dev.encoder();
+        s.step(&enc);
+        s.queue.submit(enc.finish());
+        pred = step_total(pred, deposits, keep);
+        if (i + 1) % every == 0 {
+            let got = s.trail_total();
+            let err = if pred > 0.0 { (got - pred).abs() / pred } else { got.abs() };
+            if err > worst { worst = err; }
+            println(f"step {i + 1}: trail {got:.1}, predicted {pred:.1} (off by {err:.2e})");
+            pred = got;
+            last = got;
+        }
+    }
+    let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0 / steps as f64;
+    let steady = keep * deposits / (1.0 - keep);
+    let (bad, mx, my) = s.agents_outside();
+    println(
+        f"agents: {bad} of {n} outside the trail or not finite (largest x {mx:.2}, y {my:.2}; the trail is {w} x {h})");
+    println(
+        f"trail: {last:.1} after {steps} steps, steady state {steady:.1} ({((last - steady).abs() / steady * 100.0):.4}% off)");
+    println(f"time: {ms:.3} ms a step (with {steps / every} checks read back)");
+    let inside = bad == 0;
+    let mass = worst < 1e-3;
+    println(f"agents stay inside: {if inside { "ok" } else { "FAILED" }}");
+    println(f"trail follows keep * (total + deposits): {if mass { "ok" } else { "FAILED" }}");
+    if shot.len() > 0 {
+        let img = s.snapshot_in(gpa);
+        if fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"physarum: cannot write {shot}");
+            return 1;
+        }
+        println(f"shot: {shot}");
+    }
+    if inside && mass { 0 } else { 1 }
+}
+
+// The mouse and the keys, between frames.
+struct Input {
+    left: bool,
+    right: bool,
+    // the pointer, in window pixels
+    x: f64,
+    y: f64,
+    paused: bool,
+    reset: bool,
+    quit: bool,
+}
+
+fn show(p: Params) {
+    println(
+        f"sensors {p.sensor_angle:.2} rad at {p.sensor_dist:.1} cells, turn {p.turn:.2}, keep {p.keep:.3}, diffuse {p.diffuse:.2}");
+}
+
+// What a key does: 1/2 the sensors' angle, 3/4 their distance, 5/6 the
+// turn, 7/8 the keep (7 decays faster), 9/0 the diffusion.
+fn on_key(inp: inout Input, p: inout Params, key: Logical) {
+    match key {
+        Logical::Char(c) => {
+            if c == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if c == 'r' as u32 {
+                inp.reset = true;
+            } else if c == 'q' as u32 {
+                inp.quit = true;
+            } else if c == '1' as u32 {
+                p.sensor_angle = clampf(p.sensor_angle - 0.05, 0.05, 2.5);
+            } else if c == '2' as u32 {
+                p.sensor_angle = clampf(p.sensor_angle + 0.05, 0.05, 2.5);
+            } else if c == '3' as u32 {
+                p.sensor_dist = clampf(p.sensor_dist - 1.0, 2.0, 40.0);
+            } else if c == '4' as u32 {
+                p.sensor_dist = clampf(p.sensor_dist + 1.0, 2.0, 40.0);
+            } else if c == '5' as u32 {
+                p.turn = clampf(p.turn - 0.02, 0.0, 1.0);
+            } else if c == '6' as u32 {
+                p.turn = clampf(p.turn + 0.02, 0.0, 1.0);
+            } else if c == '7' as u32 {
+                p.keep = clampf(p.keep - 0.005, 0.8, 0.999);
+            } else if c == '8' as u32 {
+                p.keep = clampf(p.keep + 0.005, 0.8, 0.999);
+            } else if c == '9' as u32 {
+                p.diffuse = clampf(p.diffuse - 0.05, 0.0, 1.0);
+            } else if c == '0' as u32 {
+                p.diffuse = clampf(p.diffuse + 0.05, 0.0, 1.0);
+            } else {
+                return;
+            }
+            show(p);
+        }
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+}
+
+// One frame: the settings, a step (unless paused) and the picture, in one
+// submission, then presented.
+fn frame(s: inout Sim, surf: inout Surface, p: Params, step: bool) {
+    s.set_params(p);
+    match surf.frame() {
+        Ok(f) => {
+            var enc = s.dev.encoder();
+            if step {
+                s.step(&enc);
+            }
+            s.draw(&enc, f.texture.view());
+            s.queue.submit(enc.finish());
+            f.present(&s.queue);
+        }
+        Err(_) => {}
+    }
+}
+
+fn windowed(w: i64, n: i64, max_frames: i64, gpa: Gpa) -> i32 {
+    let h = w * 9 / 16;
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("physarum: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("physarum", w, h)) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("physarum: no window");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    var s = match Sim::new_in(w, h, n, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"physarum: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input { left: false, right: false, x: 0.0, y: 0.0, paused: false, reset: false,
+        quit: false };
+    var p = Params::new();
+    show(p);
+    s.reset(p);
+    let start = monotonic_now();
+    var first = 0.0;
+    var frames = 0;
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if inp.reset {
+                    s.reset(p);
+                    inp.reset = false;
+                }
+                // the mouse: left adds food, right repels, in trail cells
+                p.mouse_x = (inp.x * w as f64 / sz.w as f64) as f32;
+                p.mouse_y = (inp.y * h as f64 / sz.h as f64) as f32;
+                p.mouse_mode = if inp.left { 1.0 } else if inp.right { -1.0 } else { 0.0 };
+                frame(&s, &surf, p, !inp.paused);
+                frames += 1;
+                let now = secs(monotonic_now().saturating_sub(start));
+                if frames == 1 { first = now; }
+                if max_frames > 0 && frames >= max_frames {
+                    let mean = (now - first) * 1000.0 / (frames - 1) as f64;
+                    println(
+                        f"physarum: {n} agents, {w} x {h} trail: {frames} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => match m.button {
+                        Button::Left => inp.left = true,
+                        Button::Right => inp.right = true,
+                        _ => {}
+                    },
+                    MouseAction::Release => match m.button {
+                        Button::Left => inp.left = false,
+                        Button::Right => inp.right = false,
+                        _ => {}
+                    },
+                    MouseAction::Move => {}
+                }
+                inp.x = m.x;
+                inp.y = m.y;
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    on_key(&inp, &p, k.key);
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("physarum", gpa)
+        .about("Physarum: agents that sense, turn and leave a trail, on the GPU")
+        .arg(Arg::flag("headless").help("no window: run the steps, print the checks, write --shot"))
+        .arg(Arg::option("agents").value_name("N").default("1048576")
+            .help("the agents (a multiple of 64)"))
+        .arg(Arg::option("width").value_name("W").default("960")
+            .help("the trail's width in cells (its height is 9/16 of it)"))
+        .arg(Arg::option("steps").value_name("N").default("600")
+            .help("headless: the steps"))
+        .arg(Arg::option("every").value_name("K").default("100")
+            .help("headless: a check every K steps"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: the trail after the steps, as a PPM image"));
+    let m = cli.parse_or_exit(env::args());
+    let n = parse_int(m.get("agents").unwrap_or("1048576")).unwrap_or(0);
+    let w = parse_int(m.get("width").unwrap_or("960")).unwrap_or(0);
+    let steps = parse_int(m.get("steps").unwrap_or("600")).unwrap_or(0);
+    let every = parse_int(m.get("every").unwrap_or("100")).unwrap_or(0);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    if n < 64 || n > 4000000 || n % 64 != 0 {
+        eprintln("physarum: --agents 64..4000000, a multiple of 64");
+        return 2;
+    }
+    if w < 64 || w > 4096 {
+        eprintln("physarum: --width 64..4096");
+        return 2;
+    }
+    if steps < 1 || every < 1 {
+        eprintln("physarum: --steps and --every 1 or more");
+        return 2;
+    }
+    if m.flag("headless") {
+        return headless(w, n, steps, every, m.get("shot").unwrap_or(""), gpa);
+    }
+    windowed(w, n, frames, gpa)
+}
+
+#[test]
+fn the_total_levels_off_at_keep_times_deposits_over_decay() {
+    var t = 0.0;
+    for _ in 0..400 {
+        t = step_total(t, 100.0, 0.9);
+    }
+    let steady = 0.9 * 100.0 / 0.1;
+    if (t - steady).abs() > 1e-6 {
+        panic("the total did not level off where the formula says");
+    }
+}
+
+#[test]
+fn a_step_keeps_what_it_says() {
+    assert_eq(step_total(0.0, 10.0, 0.5), 5.0);
+    assert_eq(step_total(4.0, 10.0, 0.5), 7.0);
+}
+
+#[test]
+fn clamp_stays_in_its_range() {
+    assert_eq(clampf(-1.0, 0.0, 2.0), 0.0);
+    assert_eq(clampf(3.0, 0.0, 2.0), 2.0);
+    assert_eq(clampf(1.5, 0.0, 2.0), 1.5);
+}

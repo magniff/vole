@@ -1,0 +1,238 @@
+// The deferred renderer: the GPU objects, the four passes and their bind
+// groups. Pipelines and the scene's buffers live as long as the renderer;
+// the targets (sized to the frame, and the tile lists) are rebuilt by
+// resize.
+//
+//   1. G-buffer: the scene's triangles into albedo, normal, depth (and a
+//      depth buffer for the visibility test).
+//   2. Light culling (compute): one workgroup per 16 x 16 tile keeps the
+//      lights that can touch the tile.
+//   3. Lighting: each pixel adds the lights its tile kept, into an HDR target.
+//   4. Tone mapping to the frame, or to a G-buffer view (the keys).
+
+use std::gpu;
+use std::gpu::{
+    BufferUsage, Compare, Format, IndexFormat, PassDesc, TextureUsage, VertexFormat, VertexLayout,
+};
+
+use math::{look_at, perspective};
+use scene::{LIGHT_FLOATS, build_scene, lights_into};
+use shaders::{COMMON, CULL, GBUF, LIGHT, TONE};
+
+pub const TILE: i64 = 16;
+// a tile's slots: the count, then up to 127 light indices
+pub const STRIDE: i64 = 128;
+// the camera uniform: view, proj (16 each), tanxy, screen, mode (4 each)
+pub const CAM_FLOATS: i64 = 44;
+
+// The targets that depend on the frame's size, and the bind groups over them.
+pub struct Targets {
+    pub w: i64,
+    pub h: i64,
+    pub tiles_x: i64,
+    pub tiles_y: i64,
+    albedo: gpu::Texture,
+    normal: gpu::Texture,
+    gdepth: gpu::Texture,
+    ddepth: gpu::Texture,
+    hdr: gpu::Texture,
+    tiles: gpu::Buffer,
+    gbg: gpu::BindGroup,
+    cbg: gpu::BindGroup,
+    lbg: gpu::BindGroup,
+    tbg: gpu::BindGroup,
+}
+
+pub struct Renderer {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub nlights: i64,
+    pub t: Targets,
+    cam: gpu::Buffer,
+    lights: gpu::Buffer,
+    vb: gpu::Buffer,
+    ib: gpu::Buffer,
+    nindex: i64,
+    gpipe: gpu::RenderPipeline,
+    cull: gpu::ComputePipeline,
+    lpipe: gpu::RenderPipeline,
+    tpipe: gpu::RenderPipeline,
+    camdata: Vec<f32>,
+    lightdata: Vec<f32>,
+}
+
+// A shader module: the shared prefix, then the pass's own source.
+fn shader(dev: gpu::Device, body: [u8], gpa: Gpa) -> Result<gpu::Shader, gpu::Error> {
+    var src = Buf::new_in(gpa);
+    src.push_str(COMMON);
+    src.push_str(body);
+    dev.shader_wgsl(src.as_slice())
+}
+
+fn make_targets(dev: gpu::Device, cam: gpu::Buffer, lights: gpu::Buffer, gpipe: gpu::RenderPipeline,
+    cull: gpu::ComputePipeline, lpipe: gpu::RenderPipeline, tpipe: gpu::RenderPipeline,
+    w: i64, h: i64) -> Targets {
+    let tx = (w + TILE - 1) / TILE;
+    let ty = (h + TILE - 1) / TILE;
+    let rt = TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING;
+    let albedo = dev.texture(w, h, Format::Rgba8Unorm, usage: rt);
+    let normal = dev.texture(w, h, Format::Rgba16Float, usage: rt);
+    let gdepth = dev.texture(w, h, Format::R32Float, usage: rt);
+    let ddepth = dev.texture(w, h, Format::Depth32Float, usage: TextureUsage::RENDER_ATTACHMENT);
+    let hdr = dev.texture(w, h, Format::Rgba16Float, usage: rt);
+    let tiles = dev.buffer(tx * ty * STRIDE * 4, BufferUsage::STORAGE);
+    let gbg = dev.bind_group(gpipe.bind_layout(0), [gpu::bind(0, cam)][..]);
+    let cbg = dev.bind_group(cull.bind_layout(0), [gpu::bind(0, cam), gpu::bind(1, lights),
+        gpu::bind_texture(2, gdepth.view()), gpu::bind(3, tiles)][..]);
+    let lbg = dev.bind_group(lpipe.bind_layout(0), [gpu::bind(0, cam), gpu::bind(1, lights),
+        gpu::bind_texture(2, albedo.view()), gpu::bind_texture(3, normal.view()),
+        gpu::bind_texture(4, gdepth.view()), gpu::bind(5, tiles)][..]);
+    let tbg = dev.bind_group(tpipe.bind_layout(0),
+        [gpu::bind(0, cam), gpu::bind_texture(1, hdr.view()),
+            gpu::bind_texture(2, albedo.view()), gpu::bind_texture(3, normal.view()),
+            gpu::bind_texture(4, gdepth.view()), gpu::bind(5, tiles)][..]);
+    Targets {
+        w: w, h: h, tiles_x: tx, tiles_y: ty,
+        albedo: albedo, normal: normal, gdepth: gdepth, ddepth: ddepth, hdr: hdr,
+        tiles: tiles, gbg: gbg, cbg: cbg, lbg: lbg, tbg: tbg,
+    }
+}
+
+impl Renderer {
+    pub fn new_in(dev: sink gpu::Device, queue: sink gpu::Queue, w: i64, h: i64, nlights: i64,
+        gpa: Gpa) -> Result<Renderer, gpu::Error> {
+        let mesh = build_scene(gpa);
+        let vb = dev.buffer_init(gpu::bytes_of_f32(mesh.verts.as_slice()), BufferUsage::VERTEX);
+        let ib = dev.buffer_init(gpu::bytes_of_u32(mesh.index.as_slice()), BufferUsage::INDEX);
+        let nindex = mesh.index.len();
+        let cam = dev.buffer(CAM_FLOATS * 4, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let lights = dev.buffer(nlights * LIGHT_FLOATS * 4,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST);
+
+        var gdesc = gpu::RenderDesc::new(shader(dev, GBUF, gpa)?, "gvs", "gfs", Format::Rgba8Unorm);
+        gdesc.target(Format::Rgba16Float);
+        gdesc.target(Format::R32Float);
+        gdesc.depth(Format::Depth32Float, Compare::Less, true);
+        var vl = VertexLayout::new(36);
+        vl.attribute(0, VertexFormat::Float32x3, 0);
+        vl.attribute(1, VertexFormat::Float32x3, 12);
+        vl.attribute(2, VertexFormat::Float32x3, 24);
+        gdesc.vertex_buffer(vl);
+        let gpipe = dev.render_pipeline(gdesc)?;
+        let cull = dev.compute_pipeline(shader(dev, CULL, gpa)?, "cull")?;
+        let lpipe = dev.render_pipeline(gpu::RenderDesc::new(shader(dev, LIGHT, gpa)?,
+            "fullscreen", "lfs", Format::Rgba16Float))?;
+        let tpipe = dev.render_pipeline(gpu::RenderDesc::new(shader(dev, TONE, gpa)?,
+            "fullscreen", "tfs", Format::Bgra8Unorm))?;
+
+        let t = make_targets(dev, cam, lights, gpipe, cull, lpipe, tpipe, w, h);
+        var camdata: Vec<f32> = Vec::new_in(gpa);
+        for _ in 0..CAM_FLOATS {
+            camdata.push(0.0);
+        }
+        var lightdata: Vec<f32> = Vec::new_in(gpa);
+        for _ in 0..nlights * LIGHT_FLOATS {
+            lightdata.push(0.0);
+        }
+        Ok(Renderer {
+            dev: dev, queue: queue, nlights: nlights, t: t,
+            cam: cam, lights: lights, vb: vb, ib: ib, nindex: nindex,
+            gpipe: gpipe, cull: cull, lpipe: lpipe, tpipe: tpipe,
+            camdata: camdata, lightdata: lightdata,
+        })
+    }
+
+    // New targets for a frame of w x h pixels.
+    pub fn resize(inout self, w: i64, h: i64) {
+        self.t = make_targets(self.dev, self.cam, self.lights, self.gpipe, self.cull,
+            self.lpipe, self.tpipe, w, h);
+    }
+
+    // The camera (a slow orbit of the scene) and the lights at time t, and
+    // the view that the tone pass shows (mode: 0 frame, 1 albedo, 2 normal,
+    // 3 depth, 4 lights per tile). Written to the GPU for this frame.
+    pub fn update(inout self, t: f32, mode: i64) {
+        let aspect = (self.t.w as f32) / (self.t.h as f32);
+        let a = 0.35 + 0.08 * t;
+        let eye: [f32; 3] = [30.0 * a.sin(), 13.0, 30.0 * a.cos()];
+        let view = look_at(eye, [0.0, 1.5, 0.0], [0.0, 1.0, 0.0]);
+        let fovy: f32 = 0.9;
+        let proj = perspective(fovy, aspect, 0.5, 200.0);
+        let tany = (fovy * 0.5).tan();
+        for k in 0..16 {
+            self.camdata[k] = view[k];
+            self.camdata[16 + k] = proj[k];
+        }
+        self.camdata[32] = tany * aspect;
+        self.camdata[33] = tany;
+        self.camdata[34] = 0.0;
+        self.camdata[35] = 0.0;
+        self.camdata[36] = self.t.w as f32;
+        self.camdata[37] = self.t.h as f32;
+        self.camdata[38] = self.t.tiles_x as f32;
+        self.camdata[39] = self.t.tiles_y as f32;
+        self.camdata[40] = mode as f32;
+        self.camdata[41] = self.nlights as f32;
+        self.camdata[42] = 0.0;
+        self.camdata[43] = 0.0;
+        lights_into(self.nlights, t, &self.lightdata);
+        self.queue.write_buffer(self.cam, 0, gpu::bytes_of_f32(self.camdata.as_slice()));
+        self.queue.write_buffer(self.lights, 0, gpu::bytes_of_f32(self.lightdata.as_slice()));
+    }
+
+    // The four passes into enc; the frame is drawn into out.
+    pub fn draw(inout self, enc: inout gpu::Encoder, out: gpu::TextureView) {
+        let gpipe = self.gpipe;
+        let cull = self.cull;
+        let lpipe = self.lpipe;
+        let tpipe = self.tpipe;
+        let vb = self.vb;
+        let ib = self.ib;
+        let nindex = self.nindex;
+        let gbg = self.t.gbg;
+        let cbg = self.t.cbg;
+        let lbg = self.t.lbg;
+        let tbg = self.t.tbg;
+        let tx = self.t.tiles_x;
+        let ty = self.t.tiles_y;
+        let albedo = self.t.albedo.view();
+        let normal = self.t.normal.view();
+        let gdepth = self.t.gdepth.view();
+        let ddepth = self.t.ddepth.view();
+        let hdr = self.t.hdr.view();
+
+        enc.render_pass(PassDesc::color(albedo)
+            .with_color(normal)
+            .with_color(gdepth)
+            .with_depth(ddepth), |pass| {
+            pass.set_pipeline(gpipe);
+            pass.set_bind_group(0, gbg);
+            pass.set_vertex_buffer(0, vb);
+            pass.set_index_buffer(ib, IndexFormat::Uint32);
+            pass.draw_indexed(0..nindex, 0, 0..1);
+        });
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(cull);
+            pass.set_bind_group(0, cbg);
+            pass.dispatch(tx, ty);
+        });
+        enc.render_pass(PassDesc::color(hdr), |pass| {
+            pass.set_pipeline(lpipe);
+            pass.set_bind_group(0, lbg);
+            pass.draw(0..3, 0..1);
+        });
+        enc.render_pass(PassDesc::color(out), |pass| {
+            pass.set_pipeline(tpipe);
+            pass.set_bind_group(0, tbg);
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // One whole frame at time t, with the view mode, into out.
+    pub fn render_to(inout self, out: gpu::TextureView, t: f32, mode: i64) {
+        self.update(t, mode);
+        var enc = self.dev.encoder();
+        self.draw(&enc, out);
+        self.queue.submit(enc.finish());
+    }
+}

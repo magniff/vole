@@ -1,0 +1,436 @@
+// windtunnel: a 2D wind tunnel by the lattice Boltzmann method (D2Q9,
+// BGK collision), on the GPU. The flow comes in from the left at a
+// Reynolds number you choose, round the obstacles you draw and erase with
+// the mouse; keys switch the view (speed, vorticity, dye).
+//
+//   windtunnel [--re N] [--view NAME]          the window
+//   windtunnel --headless [--steps N] [--check] [--shot FILE.ppm]
+//
+// flow.vl is the CPU side (constants, masks, the Strouhal number), shaders.vl
+// the WGSL, sim.vl the GPU side. The headless mode checks two things: the
+// mass of a closed box stays put, and the flow past the cylinder sheds
+// vortices at the Strouhal number of its Reynolds number.
+
+mod flow;
+mod shaders;
+mod sim;
+
+use std::{env, fs, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::RawSurface;
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use flow::{disk, empty_mask, omega_for, strouhal};
+use sim::{Config, Sim};
+
+// The grid (cells across and down), the cylinder and the inflow, in
+// lattice units: one step is one time unit, speeds are cells a step.
+const W: i64 = 640;
+const H: i64 = 320;
+const DIAM: f64 = 40.0;
+const INFLOW: f64 = 0.08;
+const CX0: f64 = 160.0;
+const CY0: f64 = 160.0;
+const RE0: f64 = 100.0;
+// the first picture's view and the probe: half a diameter below the
+// wake's centre line, two diameters behind the cylinder
+const VIEWS: [[u8]; 3] = ["speed", "vorticity", "dye"];
+
+// What the flow is set to: the relaxation rate for `re`, and the picture.
+fn config(re: f64, view: i64, closed: bool, probe: i64) -> Config {
+    Config {
+        omega: omega_for(re, INFLOW, DIAM) as f32,
+        inflow: INFLOW as f32,
+        diam: DIAM as f32,
+        closed: closed,
+        view: view,
+        dye_keep: 0.999,
+        probe: probe,
+    }
+}
+
+// The probe's cell: two diameters behind the cylinder, half a diameter off
+// the centre line.
+fn probe_cell() -> i64 {
+    let px = (CX0 + 2.0 * DIAM) as i64;
+    let py = (CY0 + 0.5 * DIAM) as i64;
+    py * W + px
+}
+
+// The default obstacle: the cylinder, and nothing else.
+fn cylinder(gpa: Gpa) -> Vec<u32> {
+    var m = empty_mask(W, H, gpa);
+    disk(&m, W, H, CX0, CY0, DIAM / 2.0, 1u32);
+    m
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The checks, printed; exits 0 when all of them pass.
+fn headless(re: f64, steps: i64, view: i64, check: bool, shot: [u8], series_file: [u8], gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(W, H, steps, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"windtunnel: {e}");
+            return 1;
+        }
+    };
+    let mask = cylinder(gpa);
+    s.set_solid(mask.as_slice());
+
+    // the open tunnel: the cylinder's wake, sampled by the probe each step
+    let cfg = config(re, view, false, probe_cell());
+    s.reset(cfg, gpa);
+    for t in 0..steps {
+        s.set_params(cfg, t);
+        var enc = s.dev.encoder();
+        s.record(&enc, 1);
+        s.queue.submit(enc.finish());
+    }
+    let st = s.stats(mask.as_slice());
+    let series = s.probe_series(steps, gpa);
+    if series_file.len() > 0 {
+        var text = Buf::new_in(gpa);
+        for v in series.iter() {
+            text.push_str(format_in(f"{v:.7e}\n", gpa).as_slice());
+        }
+        let _ = fs::write(series_file, text.as_slice());
+    }
+    let shed = strouhal(series.as_slice(), DIAM, INFLOW);
+    var lo = 1000.0;
+    var hi = -1000.0;
+    for i in (steps / 2)..steps {
+        let v = series[i] as f64;
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+    }
+    let amp = hi - lo;
+    if shot.len() > 0 {
+        let img = s.snapshot_in(W * 2, H * 2, gpa);
+        if fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"windtunnel: cannot write {shot}");
+            return 1;
+        }
+    }
+    let shed_ok = shed > 0.14 && shed < 0.20 && amp > 0.005;
+    let stable = st.finite && st.max_speed < 0.3;
+
+    // the closed box: the same cylinder, four walls, the mass must stay
+    s.reset(config(re, view, true, -1), gpa);
+    let m0 = s.stats(mask.as_slice()).mass;
+    let closed_steps = 1000;
+    for t in 0..closed_steps {
+        s.set_params(config(re, view, true, -1), t);
+        var enc = s.dev.encoder();
+        s.record(&enc, 1);
+        s.queue.submit(enc.finish());
+    }
+    let m1 = s.stats(mask.as_slice()).mass;
+    let drift = ((m1 - m0) / m0).abs();
+    let conserved = drift < 1e-4;
+
+    if check {
+        println(
+            f"mass over {closed_steps} steps in a closed box: relative drift under 1e-4: {verdict(conserved)}");
+        println(
+            f"vortex shedding at Re {re:.0}: Strouhal number in 0.14..0.20: {verdict(shed_ok)}");
+        println(f"stable over {steps} steps: finite, speed under 0.3: {verdict(stable)}");
+    } else {
+        println(
+            f"grid:      {W} x {H} cells, cylinder {DIAM:.0} cells across, Re {re:.0}, omega {cfg.omega:.4}");
+        println(
+            f"mass:      {m0:.6} at the start, {m1:.6} after {closed_steps} closed steps (relative drift {drift:.2e}): {verdict(conserved)}");
+        println(
+            f"shedding:  Strouhal number {shed:.4} over {steps} steps (probe amplitude {amp:.4} in the second half); the known value at Re 100 is about 0.165: {verdict(shed_ok)}");
+        println(
+            f"stability: max speed {st.max_speed:.4} (lattice limit 0.577), finite: {st.finite}: {verdict(stable)}");
+    }
+    if conserved && shed_ok && stable { 0 } else { 1 }
+}
+
+// The mouse, the keys and the settings, between frames.
+struct Input {
+    left: bool,
+    right: bool,
+    x: f64,
+    y: f64,
+    px: f64,
+    py: f64,
+    paused: bool,
+    view: i64,
+    re: f64,
+    // the brush's radius, in cells
+    radius: f64,
+    // the obstacles changed: upload the mask
+    mask_dirty: bool,
+    // the title shows something else now
+    title_dirty: bool,
+    reset: bool,
+    clear: bool,
+    quit: bool,
+}
+
+// What a key does.
+fn on_key(inp: inout Input, key: Logical) {
+    match key {
+        Logical::Char(c) => {
+            if c == ' ' as u32 {
+                inp.paused = !inp.paused;
+            } else if c == 'r' as u32 {
+                inp.reset = true;
+            } else if c == 'c' as u32 {
+                inp.clear = true;
+            } else if c == 'v' as u32 {
+                inp.view = (inp.view + 1) % 3;
+            } else if c == '1' as u32 {
+                inp.view = 0;
+            } else if c == '2' as u32 {
+                inp.view = 1;
+            } else if c == '3' as u32 {
+                inp.view = 2;
+            } else if c == '+' as u32 || c == '=' as u32 {
+                inp.re = (inp.re * 1.1).clamp(20.0, 250.0);
+            } else if c == '-' as u32 {
+                inp.re = (inp.re / 1.1).clamp(20.0, 250.0);
+            } else if c == ']' as u32 {
+                inp.radius = (inp.radius + 1.0).clamp(2.0, 16.0);
+            } else if c == '[' as u32 {
+                inp.radius = (inp.radius - 1.0).clamp(2.0, 16.0);
+            } else if c == 'q' as u32 {
+                inp.quit = true;
+            }
+        }
+        Logical::Named(Named::Escape) => inp.quit = true,
+        _ => {}
+    }
+    inp.title_dirty = true;
+}
+
+// Paints a disk of `value` along the stroke from (x0, y0) to (x1, y1), in
+// cells, so a fast mouse leaves no gaps.
+fn paint(mask: inout Vec<u32>, x0: f64, y0: f64, x1: f64, y1: f64, r: f64, value: u32) {
+    let d = ((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)).sqrt();
+    var n = (d / (r * 0.5)).ceil() as i64;
+    if n < 1 {
+        n = 1;
+    }
+    if n > 200 {
+        n = 200;
+    }
+    for i in 0..=n {
+        let t = i as f64 / n as f64;
+        disk(&mask, W, H, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, value);
+    }
+}
+
+fn windowed(re: f64, view: i64, steps_per_frame: i64, max_frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("windtunnel: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("windtunnel", 1200, 600)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("windtunnel: no window");
+            return 1;
+        }
+    };
+    var s = match Sim::new_in(W, H, 1, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"windtunnel: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"windtunnel: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input {
+        left: false, right: false, x: 0.0, y: 0.0, px: 0.0, py: 0.0, paused: false, view: view,
+        re: re, radius: 5.0, mask_dirty: true, title_dirty: true, reset: false, clear: false,
+        quit: false,
+    };
+    var mask = cylinder(gpa);
+    s.reset(config(inp.re, inp.view, false, -1), gpa);
+    s.set_solid(mask.as_slice());
+    win.request_frame();
+    var frames = 0;
+    var first = 0.0;
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                if inp.reset {
+                    s.reset(config(inp.re, inp.view, false, -1), gpa);
+                    mask = cylinder(gpa);
+                    inp.reset = false;
+                    inp.mask_dirty = true;
+                }
+                if inp.clear {
+                    mask = empty_mask(W, H, gpa);
+                    inp.clear = false;
+                    inp.mask_dirty = true;
+                }
+                if inp.mask_dirty {
+                    s.set_solid(mask.as_slice());
+                    inp.mask_dirty = false;
+                }
+                if inp.title_dirty {
+                    let name = VIEWS[inp.view as usize];
+                    let t = format_in(
+                        f"windtunnel: Re {inp.re:.0}, {name}{if inp.paused { ", paused" } else { "" }}", gpa);
+                    win.set_title(t.as_slice());
+                    inp.title_dirty = false;
+                }
+                s.set_params(config(inp.re, inp.view, false, -1), 0);
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = s.dev.encoder();
+                        if !inp.paused {
+                            s.record(&enc, steps_per_frame);
+                        }
+                        s.draw(&enc, f.texture.view());
+                        s.queue.submit(enc.finish());
+                        f.present(&s.queue);
+                    }
+                    Err(_) => {}
+                }
+                frames += 1;
+                if frames == 1 {
+                    first = 1.0;
+                }
+                if max_frames > 0 && frames >= max_frames {
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(sz.w, sz.h, gpa);
+                        if fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"windtunnel: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit {
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                match m.action {
+                    MouseAction::Press => {
+                        match m.button {
+                            Button::Left => inp.left = true,
+                            Button::Right => inp.right = true,
+                            _ => {}
+                        }
+                        inp.px = m.x;
+                        inp.py = m.y;
+                    }
+                    MouseAction::Release => {
+                        match m.button {
+                            Button::Left => inp.left = false,
+                            Button::Right => inp.right = false,
+                            _ => {}
+                        }
+                    }
+                    MouseAction::Move => {}
+                }
+                inp.x = m.x;
+                inp.y = m.y;
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    on_key(&inp, k.key);
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.left || inp.right {
+            let kx = W as f64 / sz.w as f64;
+            let ky = H as f64 / sz.h as f64;
+            paint(&mask, inp.px * kx, inp.py * ky, inp.x * kx, inp.y * ky, inp.radius,
+                if inp.left { 1u32 } else { 0u32 });
+            inp.mask_dirty = true;
+        }
+        inp.px = inp.x;
+        inp.py = inp.y;
+        if inp.quit {
+            break;
+        }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("windtunnel", gpa)
+        .about("A 2D lattice Boltzmann wind tunnel on the GPU, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: run the checks and print the numbers"))
+        .arg(Arg::flag("check").help("headless: print only the verdicts"))
+        .arg(Arg::option("steps").value_name("N").default("40000")
+            .help("headless: steps of the open tunnel"))
+        .arg(Arg::option("re").value_name("X").default("100")
+            .help("the Reynolds number, 20 to 250"))
+        .arg(Arg::option("view").value_name("NAME").default("speed")
+            .help("the first view: speed, vorticity or dye"))
+        .arg(Arg::option("speed").value_name("N").default("8")
+            .help("window: steps a frame"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames"))
+        .arg(Arg::option("series").value_name("FILE")
+            .help("headless: the probe's series, one value a line"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("the picture as a PPM (headless: after the run; window: with --frames)"));
+    let m = cli.parse_or_exit(env::args());
+    let re = match std::num::parse_f64(m.get("re").unwrap_or("100")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("windtunnel: --re takes a number");
+            return 2;
+        }
+    };
+    if re < 20.0 || re > 250.0 {
+        eprintln("windtunnel: --re 20 to 250 (the relaxation rate goes to its limit above it)");
+        return 2;
+    }
+    let name = m.get("view").unwrap_or("speed");
+    var view = -1;
+    for i in 0..3 {
+        if VIEWS[i] == name {
+            view = i as i64;
+        }
+    }
+    if view < 0 {
+        eprintln(f"windtunnel: no view named {name} (speed, vorticity, dye)");
+        return 2;
+    }
+    let shot = m.get("shot").unwrap_or("");
+    if m.flag("headless") {
+        let steps = parse_int(m.get("steps").unwrap_or("40000")).unwrap_or(40000);
+        if steps < 3000 {
+            eprintln("windtunnel: --steps 3000 or more");
+            return 2;
+        }
+        return headless(re, steps, view, m.flag("check"), shot, m.get("series").unwrap_or(""), gpa);
+    }
+    let speed = parse_int(m.get("speed").unwrap_or("8")).unwrap_or(8);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    windowed(re, view, speed, frames, shot, gpa)
+}

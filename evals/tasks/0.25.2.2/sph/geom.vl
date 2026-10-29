@@ -1,0 +1,222 @@
+// The pure parts, with no GPU: the constants of the fluid, the start
+// layout, the uniform's packing (the layout of shaders.vl's `U`), the
+// view's transform (the box is tilted and drawn centred), and the CPU
+// references the headless checks compare the GPU with. `volec test` runs
+// the #[test]s here.
+
+// The lattice's spacing and the box's size: the box is 1 x 1.
+pub const SPACING: f32 = 0.002;
+// The smoothing length: 2.5 spacings (about 20 neighbours).
+pub const H: f32 = 0.005;
+// The particle's mass: rho0 * spacing^2, over the lattice's density sum
+// (0.9884 at h = 2.5 spacings: so the start block is at rest density).
+pub const MASS: f32 = 0.0040464;
+// The rest density, and the stiffness k = c^2 with c = 20 (the sound speed
+// in box units a second): the pressure is k * (rho - rho0).
+pub const RHO0: f32 = 1000.0;
+pub const STIFF: f32 = 400.0;
+pub const GRAVITY: f32 = 9.8;
+// The walls' bounce (the speed kept).
+pub const RESTITUTION: f32 = 0.3;
+// The block of particles starts at this lower-left corner.
+pub const BLOCK_START: f32 = 0.0333;
+pub const PI: f32 = 3.14159265;
+
+// The knobs the window and the headless run set each frame.
+pub struct Knobs {
+    // seconds a substep
+    pub dt: f32,
+    // the kinematic viscosity (box units squared a second)
+    pub visc: f32,
+    // the box's tilt, radians (counter-clockwise), and the gravity's size
+    pub tilt: f32,
+    pub gravity: f32,
+    // the stir: on, the mouse's position and velocity in box units, the
+    // radius and the strength (the push a second per unit of mouse speed)
+    pub stir_on: bool,
+    pub mx: f32,
+    pub my: f32,
+    pub mvx: f32,
+    pub mvy: f32,
+    pub stir_radius: f32,
+    pub stir_strength: f32,
+    // the picture: the target's height over its width, the zoom (box units
+    // to clip), a particle's half size (box units) and the speed that is red
+    pub aspect: f32,
+    pub zoom: f32,
+    pub quad: f32,
+    pub vref: f32,
+}
+
+impl Knobs {
+    pub fn new() -> Knobs {
+        Knobs {
+            dt: 5.0e-5, visc: 0.02, tilt: 0.0, gravity: GRAVITY, stir_on: false, mx: 0.5,
+            my: 0.5, mvx: 0.0, mvy: 0.0, stir_radius: 0.08, stir_strength: 25.0, aspect: 1.0,
+            zoom: 1.84, quad: 0.0028, vref: 1.5,
+        }
+    }
+}
+
+// The grid's cells across (and down): the box's width over the smoothing
+// length, rounded down, plus one, so that x = 1 has a cell of its own.
+pub fn grid_side() -> i64 {
+    (1.0 / H).floor() as i64 + 1
+}
+
+// The uniform: 32 floats, four vec4s per field group, in the order of
+// shaders.vl's `struct U`. Gravity is in the box's frame: the box turns by
+// `tilt`, so the world's down is (-sin, -cos) of it here.
+pub fn pack(k: Knobs, n: i64, gx: i64, gy: i64) -> [f32; 32] {
+    var w: [f32; 32] = [0.0; 32];
+    let cells = gx * gy;
+    let grid = [n as f32, gx as f32, gy as f32, cells as f32];
+    let sph = [H, MASS, RHO0, STIFF];
+    let gxg = -k.gravity * k.tilt.sin();
+    let gyg = -k.gravity * k.tilt.cos();
+    let flow = [k.dt, k.visc, gxg, gyg];
+    let dims = [1.0, 1.0, H, RESTITUTION];
+    let mouse = [k.mx, k.my, k.mvx, k.mvy];
+    let stir = [k.stir_radius, k.stir_strength, if k.stir_on { 1.0 } else { 0.0 }, 0.0];
+    let draw = [k.tilt.cos(), k.tilt.sin(), k.aspect, k.zoom];
+    let misc = [k.quad, k.vref, 0.0, 0.0];
+    let groups = [grid, sph, flow, dims, mouse, stir, draw, misc];
+    for g in 0..8 {
+        for c in 0..4 {
+            w[g * 4 + c] = groups[g][c];
+        }
+    }
+    w
+}
+
+// The lattice of the block: side x side particles, row by row, at the
+// spacing, as x, y pairs.
+pub fn lattice(side: i64, gpa: Gpa) -> Vec<f32> {
+    var v: Vec<f32> = Vec::new_in(gpa);
+    for j in 0..side {
+        for i in 0..side {
+            v.push(BLOCK_START + SPACING * (i as f32 + 0.5));
+            v.push(BLOCK_START + SPACING * (j as f32 + 0.5));
+        }
+    }
+    v
+}
+
+// The cell of a point, as shaders.vl's cell_xy computes it.
+pub fn cell_of(x: f32, y: f32, gx: i64, gy: i64) -> i64 {
+    let cx = clamp_i((x / H).floor() as i64, 0, gx - 1);
+    let cy = clamp_i((y / H).floor() as i64, 0, gy - 1);
+    cy * gx + cx
+}
+
+fn clamp_i(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+// The exclusive prefix sum: out[i] = the sum of xs[0..i], out[len] the total.
+pub fn exclusive_scan(xs: [u32], gpa: Gpa) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new_in(gpa);
+    var run: u32 = 0;
+    for x in xs {
+        out.push(run);
+        run += x;
+    }
+    out.push(run);
+    out
+}
+
+// The poly6 kernel of the density, 2D, normalised to one over the disk.
+pub fn poly6(r: f32, h: f32) -> f32 {
+    let q = h * h - r * r;
+    if q <= 0.0 {
+        0.0
+    } else {
+        let h2 = h * h;
+        4.0 / (PI * h2 * h2 * h2 * h2) * q * q * q
+    }
+}
+
+// The box's point b (box units, 0..1) to the window's pixel (y down) and
+// back: the box is centred, turned by the tilt and drawn at `zoom`, its
+// x scaled by the aspect so that it is square on screen.
+pub fn screen_to_box(px: f32, py: f32, w: f32, h: f32, zoom: f32, tilt: f32) -> (f32, f32) {
+    let cx = 2.0 * px / w - 1.0;
+    let cy = 1.0 - 2.0 * py / h;
+    let rx = cx / (zoom * h / w);
+    let ry = cy / zoom;
+    let c = tilt.cos();
+    let s = tilt.sin();
+    (rx * c + ry * s + 0.5, -rx * s + ry * c + 0.5)
+}
+
+// The inverse of screen_to_box: the pixel of a box point.
+pub fn box_to_screen(bx: f32, by: f32, w: f32, h: f32, zoom: f32, tilt: f32) -> (f32, f32) {
+    let x = bx - 0.5;
+    let y = by - 0.5;
+    let c = tilt.cos();
+    let s = tilt.sin();
+    let rx = x * c - y * s;
+    let ry = x * s + y * c;
+    let cx = rx * zoom * h / w;
+    let cy = ry * zoom;
+    ((cx + 1.0) * w / 2.0, (1.0 - cy) * h / 2.0)
+}
+
+#[test]
+fn poly6_is_normalised() {
+    // a midpoint sum over the square around the disk
+    let n = 400;
+    let d = 2.0 * H / n as f32;
+    var sum: f32 = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let x = -H + (i as f32 + 0.5) * d;
+            let y = -H + (j as f32 + 0.5) * d;
+            sum += poly6((x * x + y * y).sqrt(), H) * d * d;
+        }
+    }
+    assert((sum - 1.0).abs() < 0.005);
+}
+
+#[test]
+fn exclusive_scan_is_the_prefix_sums(gpa: Gpa) {
+    let s = exclusive_scan([3u32, 0u32, 2u32, 5u32][..], gpa);
+    assert_eq(s.len(), 5);
+    assert_eq(s[0], 0u32);
+    assert_eq(s[2], 3u32);
+    assert_eq(s[4], 10u32);
+}
+
+#[test]
+fn gravity_turns_with_the_box() {
+    let k = Knobs::new();
+    let w = pack(k, 1, 1, 1);
+    assert((w[10] - 0.0).abs() < 1e-6);
+    assert((w[11] + GRAVITY).abs() < 1e-5);
+    var t = Knobs::new();
+    t.tilt = PI / 2.0;
+    let q = pack(t, 1, 1, 1);
+    assert((q[10] + GRAVITY).abs() < 1e-4);
+    assert(q[11].abs() < 1e-4);
+}
+
+#[test]
+fn screen_and_box_round_trip() {
+    let w: f32 = 1280.0;
+    let h: f32 = 720.0;
+    for i in 0..4 {
+        let b = 0.2 + 0.2 * i as f32;
+        let (px, py) = box_to_screen(b, 1.0 - b, w, h, 1.84, 0.4);
+        let (bx, by) = screen_to_box(px, py, w, h, 1.84, 0.4);
+        assert((bx - b).abs() < 1e-4);
+        assert((by - (1.0 - b)).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn cells_cover_the_box() {
+    let gx = grid_side();
+    assert_eq(cell_of(0.0, 0.0, gx, gx), 0);
+    assert_eq(cell_of(1.0, 1.0, gx, gx), gx * gx - 1);
+    assert_eq(cell_of(-0.1, 0.5, gx, gx) % gx, 0);
+}

@@ -1,0 +1,338 @@
+// sdftext: text from a glyph atlas of signed distance fields, built at
+// startup from a stroke font (font.vl) on the CPU, drawn on the GPU
+// (std::gpu) as glyph quads that the shader thresholds, and a small
+// immediate-mode UI (ui.vl) with a button, a slider, a text field and
+// a scrolling list, driven by the mouse and the keyboard (std::window).
+//
+//   sdftext                         the window (960 x 640 points)
+//   sdftext --frames N              quit after N frames, print the frame time
+//   sdftext --headless [--shot F]   no window: the checks, then the page as a PPM
+//
+// font.vl: the strokes. atlas.vl: the distance fields. canvas.vl: the
+// vertices. gpu.vl: the pipeline. ui.vl: the widgets and the page.
+
+mod font;
+mod atlas;
+mod canvas;
+mod shaders;
+mod render;
+mod ui;
+
+use std::env;
+use std::gpu as gpulib;
+use std::cli::{Arg, Command};
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use render::Renderer;
+use ui::{Ev, Ui};
+
+// The device and its queue, from the instance's first adapter.
+fn open(inst: gpulib::Instance) -> Result<(gpulib::Device, gpulib::Queue), gpulib::Error> {
+    inst.adapter()?.device()
+}
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+// The page as a PPM, scale x size pixels: the frame drawn into a texture
+// and copied out (waits for the GPU).
+fn snapshot(dev: gpulib::Device, r: inout Renderer, queue: inout gpulib::Queue, ui: Ui, gpa: Gpa) -> Buf {
+    let w = ui.cv.pw as i64;
+    let h = ui.cv.ph as i64;
+    let tex = dev.texture(w, h, Format::Bgra8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let stride = (w * 4 + 255) / 256 * 256;
+    var out = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    let _ = r.record(&queue, &enc, ui.cv, tex.view());
+    enc.copy_texture_to_buffer(tex, out, stride);
+    queue.submit(enc.finish());
+    let px = out.map_read(dev);
+    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            b.push(px[i + 2]);
+            b.push(px[i + 1]);
+            b.push(px[i]);
+        }
+    }
+    b
+}
+
+// The check of the atlas, on its bytes: for every glyph, the middle of
+// its first stroke must be inside the outline (above 0.5), and the
+// cell's corner far outside (below 0.5).
+fn check_atlas(img: [u8], gpa: Gpa) -> bool {
+    var inside_ok = 0;
+    var outside_ok = 0;
+    for g in 0..font::GLYPHS.len() {
+        let segs = font::segments(g as i64, gpa);
+        let s = segs[0];
+        let mx = (s.ax + s.bx) / 2.0;
+        let my = (s.ay + s.by) / 2.0;
+        let cx = (g as i64 % atlas::COLS) * atlas::CELL;
+        let cy = (g as i64 / atlas::COLS) * atlas::CELL;
+        let tx = ((mx - atlas::ORIGIN_X) / atlas::SPAN * atlas::CELL as f32) as i64;
+        let ty = ((my - atlas::ORIGIN_Y) / atlas::SPAN * atlas::CELL as f32) as i64;
+        let v = img[(cy + ty) * atlas::W + cx + tx] as i64;
+        if v > 128 {
+            inside_ok += 1;
+        }
+        let c = img[cy * atlas::W + cx] as i64;
+        if c < 128 {
+            outside_ok += 1;
+        }
+    }
+    let n = font::GLYPHS.len() as i64;
+    println(f"atlas: {n} glyphs, {atlas::W} x {atlas::H} texels, {atlas::CELL} texel cells");
+    println(f"  stroke middles inside the outline (value > 0.5): {inside_ok} of {n}");
+    println(f"  cell corners outside (value < 0.5): {outside_ok} of {n}");
+    inside_ok == n && outside_ok == n
+}
+
+// The scripted input of the headless check: each step is fed, then the
+// page is drawn once. Returns the frame's list of events.
+fn script(ui: inout Ui, scale: f32) {
+    let s = scale;
+    // ADD twice
+    ui.feed(Ev::Move(670.0, 140.0)); ui.feed(Ev::Down); ui.feed(Ev::Up);
+    ui.page(); ui.end();
+    ui.feed(Ev::Move(680.0, 135.0)); ui.feed(Ev::Down); ui.feed(Ev::Up);
+    ui.page(); ui.end();
+    // the slider: drag from 42 to 75
+    ui.feed(Ev::Move(640.0 + 0.42 * 280.0, 240.0)); ui.feed(Ev::Down);
+    ui.page(); ui.end();
+    ui.feed(Ev::Move(640.0 + 0.75 * 280.0, 240.0));
+    ui.page(); ui.end();
+    ui.feed(Ev::Up);
+    ui.page(); ui.end();
+    // the field: focus, type HELLO, one backspace, type O
+    ui.feed(Ev::Move(700.0, 330.0)); ui.feed(Ev::Down); ui.feed(Ev::Up);
+    ui.page(); ui.end();
+    let hello = "HELLO";
+    for i in 0..hello.len() {
+        ui.feed(Ev::Char(hello[i]));
+    }
+    ui.page(); ui.end();
+    ui.feed(Ev::Back);
+    ui.page(); ui.end();
+    ui.feed(Ev::Char('O'));
+    ui.page(); ui.end();
+    // the list: wheel down six rows, select the first visible one
+    ui.feed(Ev::Move(760.0, 460.0)); ui.feed(Ev::Wheel(6.0));
+    ui.page(); ui.end();
+    ui.feed(Ev::Down); ui.feed(Ev::Up);
+    ui.page(); ui.end();
+}
+
+fn headless(scale: f32, shot: [u8], gpa: Gpa) -> i32 {
+    let inst = gpulib::Instance::new_in(gpa);
+    let (dev, var queue) = match open(inst) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            return 1;
+        }
+    };
+    let t0 = monotonic_now();
+    var r = match Renderer::new_in(dev, &queue, gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            return 1;
+        }
+    };
+    let ms = secs(monotonic_now().saturating_sub(t0)) * 1000.0;
+    println(f"atlas built and uploaded in {ms:.1} ms (CPU) ");
+    let img = atlas::build(gpa);
+    let atlas_ok = check_atlas(img.as_slice(), gpa);
+    var ui = Ui::new_in(ui::PAGE_W * scale, ui::PAGE_H * scale, scale, gpa);
+    script(&ui, scale);
+    let widgets_ok = ui.clicks == 2 && ui.text.len() == 5 && ui.sel == 8 && ui.top == 6;
+    let text = f"{ui.text.len()}";
+    println(
+        f"widgets: clicks {ui.clicks}, value {ui.value:.2}, text \"{ui.text.as_slice()}\" ({text} bytes), list top {ui.top}, selected {ui.sel}");
+    println(
+        f"  ADD x2 counted: {ui.clicks == 2}; text field: {ui.text.len() == 5}; list selection {ui.sel == 8}");
+    ui.page();
+    let pixels = (ui.cv.pw as i64) * (ui.cv.ph as i64);
+    println(
+        f"page: {ui.cv.v.len() as i64 / 9} vertices, {ui.cv.pw as i64} x {ui.cv.ph as i64} pixels at scale {scale}");
+    let ppm = snapshot(dev, &r, &queue, ui, gpa);
+    // the frame's colours: the paper colour is everywhere but the page
+    let bg = 0x17u8;
+    var lit = 0;
+    var partial = 0;
+    var i = 0;
+    let body = ppm.len() - pixels * 3;
+    while i < pixels * 3 {
+        let v = ppm[body + i] as i64;
+        if v > 40 {
+            lit += 1;
+        }
+        if v > 40 && v < 200 {
+            partial += 1;
+        }
+        i += 1;
+    }
+    println(
+        f"frame: about {lit / 3} lit pixels (a channel over 40), about {partial / 3} of them at an edge (a channel from 40 to 200)");
+    if shot.len() > 0 {
+        if std::fs::write(shot, ppm.as_slice()).is_err() {
+            eprintln(f"sdftext: cannot write {shot}");
+            return 1;
+        }
+        println(f"wrote {shot}");
+    }
+    if atlas_ok && widgets_ok { 0 } else { 1 }
+}
+
+fn windowed(frames: i64, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sdftext: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("sdftext", 960, 640)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("sdftext: no window");
+            return 1;
+        }
+    };
+    let inst = gpulib::Instance::new_in(gpa);
+    let (dev, var queue) = match open(inst) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    var surf = match inst.surface(dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            return 1;
+        }
+    };
+    surf.configure(dev, sz.w, sz.h);
+    var r = match Renderer::new_in(dev, &queue, gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"sdftext: {e}");
+            return 1;
+        }
+    };
+    var ui = Ui::new_in(sz.w as f32, sz.h as f32, sz.scale as f32, gpa);
+    var n = 0;
+    var first = 0.0;
+    var start_t = 0.0;
+    var last = 0.0;
+    let start = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                ui.page();
+                match surf.frame() {
+                    Ok(f) => {
+                        var enc = dev.encoder();
+                        let _ = r.record(&queue, &enc, ui.cv, f.texture.view());
+                        queue.submit(enc.finish());
+                        f.present(&queue);
+                    }
+                    Err(_) => {}
+                }
+                ui.end();
+                n += 1;
+                last = secs(monotonic_now().saturating_sub(start));
+                if n == 1 { first = last; }
+                if frames > 0 && n >= frames {
+                    let mean = (last - first) * 1000.0 / (n - 1) as f64;
+                    println(
+                        f"{n} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps), {ui.cv.pw as i64} x {ui.cv.ph as i64} pixels");
+                    if shot.len() > 0 {
+                        let img = snapshot(dev, &r, &queue, ui, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"sdftext: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                let sc = ui.cv.sc as f64;
+                ui.feed(Ev::Move((m.x / sc) as f32, (m.y / sc) as f32));
+                if m.button == Button::Left {
+                    match m.action {
+                        MouseAction::Press => ui.feed(Ev::Down),
+                        MouseAction::Release => ui.feed(Ev::Up),
+                        MouseAction::Move => {}
+                    }
+                }
+            }
+            Ok(Event::Scroll(s)) => {
+                let lines = if s.precise { s.dy / ui.cv.sc as f64 / 24.0 } else { s.dy };
+                ui.feed(Ev::Wheel(-lines as f32));
+            }
+            Ok(Event::Text(t)) => {
+                for i in 0..t.len as i64 {
+                    let b = t.bytes[i];
+                    if b >= 32 && b < 127 {
+                        ui.feed(Ev::Char(b));
+                    }
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.repeat {
+                    match k.key {
+                        Logical::Named(Named::Backspace) => ui.feed(Ev::Back),
+                        Logical::Named(Named::Escape) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Resize(_, s)) => {
+                surf.configure(dev, s.w, s.h);
+                ui.cv.pw = s.w as f32;
+                ui.cv.ph = s.h as f32;
+                ui.cv.sc = s.scale as f32;
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    let _ = queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("sdftext", gpa)
+        .about("SDF text from a glyph atlas, and a small immediate-mode UI")
+        .arg(Arg::flag("headless").help("no window: the atlas checks, the scripted UI, a PPM"))
+        .arg(Arg::option("shot")
+            .value_name("FILE.ppm")
+            .help("headless, or window with --frames: the page as a PPM"))
+        .arg(Arg::option("scale").value_name("N").default("1")
+            .help("headless: pixels per point (the page is 960 x 640 points)"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"));
+    let m = cli.parse_or_exit(env::args());
+    let shot = m.get("shot").unwrap_or("");
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    if m.flag("headless") {
+        let scale = std::num::parse_f64(m.get("scale").unwrap_or("1")).unwrap_or(1.0) as f32;
+        return headless(scale, shot, gpa);
+    }
+    windowed(frames, shot, gpa)
+}

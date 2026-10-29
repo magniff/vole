@@ -1,0 +1,320 @@
+// physarum's GPU side: the agents and the two trail grids, the kernels
+// as compute pipelines, the picture as a render pipeline. A frame is
+// set_params, then step and draw into one encoder; nothing is read back
+// except by the checks.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
+use shaders::{AGENTS, COMMON, DIFFUSE, INIT, RENDER};
+
+// The user's settings and the mouse, as the shaders' U.
+pub struct Params {
+    // the sensors: their angle either side of the heading, and their distance
+    pub sensor_angle: f32,
+    pub sensor_dist: f32,
+    // radians an agent turns a step
+    pub turn: f32,
+    // cells an agent moves a step
+    pub speed: f32,
+    // what is kept of the trail each step (1 - decay)
+    pub keep: f32,
+    // how much of the 3x3 mean replaces each cell (0: none, 1: all)
+    pub diffuse: f32,
+    // what an agent deposits on its cell in a step
+    pub deposit: f32,
+    // the mouse, in cells; mode 1: food, -1: repel, 0: off
+    pub mouse_x: f32,
+    pub mouse_y: f32,
+    pub mouse_mode: f32,
+    pub mouse_r: f32,
+    // the food a cell gets a step under the mouse
+    pub food: f32,
+    // the display's gain
+    pub gain: f32,
+}
+
+impl Params {
+    pub fn new() -> Params {
+        Params {
+            sensor_angle: 0.6, sensor_dist: 9.0, turn: 0.25, speed: 1.0, keep: 0.92,
+            diffuse: 0.5, deposit: 0.2, mouse_x: 0.0, mouse_y: 0.0, mouse_mode: 0.0,
+            mouse_r: 24.0, food: 0.5, gain: 0.04,
+        }
+    }
+}
+
+// The shaders' U: a, b, c, d, e (four f32s each).
+fn pack(p: Params, w: i64, h: i64, n: i64, frame: i64) -> [f32; 20] {
+    var u: [f32; 20] = [0.0; 20];
+    u[0] = w as f32;
+    u[1] = h as f32;
+    u[2] = n as f32;
+    u[3] = frame as f32;
+    u[4] = p.sensor_angle;
+    u[5] = p.sensor_dist;
+    u[6] = p.turn;
+    u[7] = p.speed;
+    u[8] = p.keep;
+    u[9] = p.diffuse;
+    u[10] = p.deposit;
+    u[12] = p.mouse_x;
+    u[13] = p.mouse_y;
+    u[14] = p.mouse_mode;
+    u[15] = p.mouse_r;
+    u[16] = p.food;
+    u[17] = p.gain;
+    u
+}
+
+// The deposit an agent makes in a step, as the shader rounds it (SCALE
+// units to a unit): the checks predict the trail's total with it.
+pub fn deposit_units(deposit: f32) -> f64 {
+    (deposit * 256.0) as i64 as f64 / 256.0
+}
+
+// The sum of a grid.
+fn total(xs: [f32]) -> f64 {
+    var s = 0.0;
+    for x in xs {
+        s += x as f64;
+    }
+    s
+}
+
+fn text(parts: [[u8]], gpa: Gpa) -> Buf {
+    var src = Buf::new_in(gpa);
+    for p in parts {
+        src.push_str(p);
+    }
+    src
+}
+
+pub struct Sim {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    // the trail is w x h cells, with n agents
+    pub w: i64,
+    pub h: i64,
+    pub n: i64,
+    // steps taken since the reset
+    pub frame: i64,
+    // 0: trail_a holds the latest trail, 1: trail_b does
+    pub cur: i64,
+    ubuf: gpu::Buffer,
+    agents: gpu::Buffer,
+    trail_a: gpu::Buffer,
+    trail_b: gpu::Buffer,
+    dep: gpu::Buffer,
+    k_agents: gpu::ComputePipeline,
+    k_diffuse: gpu::ComputePipeline,
+    k_init: gpu::ComputePipeline,
+    k_clear: gpu::ComputePipeline,
+    g_init: gpu::BindGroup,
+    g_clear_a: gpu::BindGroup,
+    g_clear_b: gpu::BindGroup,
+    g_agents_a: gpu::BindGroup,
+    g_agents_b: gpu::BindGroup,
+    g_diffuse_ab: gpu::BindGroup,
+    g_diffuse_ba: gpu::BindGroup,
+    render: gpu::RenderPipeline,
+    g_render_a: gpu::BindGroup,
+    g_render_b: gpu::BindGroup,
+}
+
+impl Sim {
+    // A w x h trail with n agents, on the system's GPU, drawing into
+    // Bgra8Unorm. Call reset before the first step.
+    pub fn new_in(w: i64, h: i64, n: i64, gpa: Gpa) -> Result<Sim, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, var queue) = inst.adapter()?.device()?;
+        let cells = w * h;
+        let ubuf = dev.buffer(80, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let agents = dev.buffer(n * 16, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let trail_a = dev.buffer(cells * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let trail_b = dev.buffer(cells * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let dep = dev.buffer(cells * 4, BufferUsage::STORAGE);
+
+        let agents_sh = dev.shader_wgsl(text([COMMON, AGENTS][..], gpa).as_slice())?;
+        let diffuse_sh = dev.shader_wgsl(text([COMMON, DIFFUSE][..], gpa).as_slice())?;
+        let init_sh = dev.shader_wgsl(text([COMMON, INIT][..], gpa).as_slice())?;
+        let clear_sh = dev.shader_wgsl(text([COMMON, INIT][..], gpa).as_slice())?;
+        let render_sh = dev.shader_wgsl(text([COMMON, RENDER][..], gpa).as_slice())?;
+        let k_agents = dev.compute_pipeline(agents_sh, "move_agents")?;
+        let k_diffuse = dev.compute_pipeline(diffuse_sh, "diffuse")?;
+        let k_init = dev.compute_pipeline(init_sh, "init")?;
+        let k_clear = dev.compute_pipeline(clear_sh, "clear")?;
+        let render = dev.render_pipeline(gpu::RenderDesc::new(render_sh, "vs", "fs",
+            Format::Bgra8Unorm))?;
+
+        let g_init = dev.bind_group(k_init.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(2, agents)][..]);
+        let g_clear_a = dev.bind_group(k_clear.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_a), gpu::bind(3, dep)][..]);
+        let g_clear_b = dev.bind_group(k_clear.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_b), gpu::bind(3, dep)][..]);
+        let g_agents_a = dev.bind_group(k_agents.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_a), gpu::bind(2, agents), gpu::bind(3, dep)][..]);
+        let g_agents_b = dev.bind_group(k_agents.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_b), gpu::bind(2, agents), gpu::bind(3, dep)][..]);
+        let g_diffuse_ab = dev.bind_group(k_diffuse.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_a), gpu::bind(2, trail_b), gpu::bind(3, dep)][..]);
+        let g_diffuse_ba = dev.bind_group(k_diffuse.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_b), gpu::bind(2, trail_a), gpu::bind(3, dep)][..]);
+        let g_render_a = dev.bind_group(render.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_a)][..]);
+        let g_render_b = dev.bind_group(render.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, trail_b)][..]);
+
+        Ok(Sim {
+            dev: dev, queue: queue, w: w, h: h, n: n, frame: 0, cur: 0, ubuf: ubuf,
+            agents: agents, trail_a: trail_a, trail_b: trail_b, dep: dep,
+            k_agents: k_agents, k_diffuse: k_diffuse, k_init: k_init, k_clear: k_clear,
+            g_init: g_init, g_clear_a: g_clear_a, g_clear_b: g_clear_b,
+            g_agents_a: g_agents_a, g_agents_b: g_agents_b,
+            g_diffuse_ab: g_diffuse_ab, g_diffuse_ba: g_diffuse_ba,
+            render: render, g_render_a: g_render_a, g_render_b: g_render_b,
+        })
+    }
+
+    // The settings for the next step (written before its submission).
+    pub fn set_params(inout self, p: Params) {
+        let u = pack(p, self.w, self.h, self.n, self.frame);
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+    }
+
+    // The agents at random, the trail and the deposits empty.
+    pub fn reset(inout self, p: Params) {
+        self.frame = 0;
+        self.cur = 0;
+        self.set_params(p);
+        var enc = self.dev.encoder();
+        let cells = self.w * self.h;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.k_init);
+            pass.set_bind_group(0, self.g_init);
+            pass.dispatch((self.n + 63) / 64);
+            pass.set_pipeline(self.k_clear);
+            pass.set_bind_group(0, self.g_clear_a);
+            pass.dispatch((cells + 63) / 64);
+            pass.set_bind_group(0, self.g_clear_b);
+            pass.dispatch((cells + 63) / 64);
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // One step, recorded into enc: every agent senses, turns, moves and
+    // deposits; then the trail diffuses and decays into the other grid.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let a = self.cur == 0;
+        let n = self.n;
+        let w = self.w;
+        let h = self.h;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(self.k_agents);
+            if a {
+                pass.set_bind_group(0, self.g_agents_a);
+            } else {
+                pass.set_bind_group(0, self.g_agents_b);
+            }
+            pass.dispatch(n / 64);
+            pass.set_pipeline(self.k_diffuse);
+            if a {
+                pass.set_bind_group(0, self.g_diffuse_ab);
+            } else {
+                pass.set_bind_group(0, self.g_diffuse_ba);
+            }
+            pass.dispatch((w + 7) / 8, (h + 7) / 8);
+        });
+        self.cur = 1 - self.cur;
+        self.frame += 1;
+    }
+
+    // The trail as it is now, drawn into target.
+    pub fn draw(self, enc: inout gpu::Encoder, target: gpu::TextureView) {
+        let a = self.cur == 0;
+        enc.render_pass(PassDesc::color(target), |pass| {
+            pass.set_pipeline(self.render);
+            if a {
+                pass.set_bind_group(0, self.g_render_a);
+            } else {
+                pass.set_bind_group(0, self.g_render_b);
+            }
+            pass.draw(0..3, 0..1);
+        });
+    }
+
+    // The sum of the trail now (waits for the GPU).
+    pub fn trail_total(inout self) -> f64 {
+        if self.cur == 0 {
+            total(gpu::f32s(self.trail_a.map_read(self.dev)))
+        } else {
+            total(gpu::f32s(self.trail_b.map_read(self.dev)))
+        }
+    }
+
+    // The agents that are not finite or outside the trail, [0, w] x [0, h]
+    // (waits for the GPU), and the largest x and y seen.
+    pub fn agents_outside(inout self) -> (i64, f64, f64) {
+        let xs = gpu::f32s(self.agents.map_read(self.dev));
+        let w = self.w as f32;
+        let h = self.h as f32;
+        var bad = 0;
+        var mx = 0.0;
+        var my = 0.0;
+        for i in 0..self.n {
+            let x = xs[4 * i];
+            let y = xs[4 * i + 1];
+            if !(x >= 0.0 && x <= w && y >= 0.0 && y <= h) {
+                bad += 1;
+            }
+            if x as f64 > mx { mx = x as f64; }
+            if y as f64 > my { my = y as f64; }
+        }
+        (bad, mx, my)
+    }
+
+    // The picture of the current trail, w x h pixels, as a binary PPM.
+    pub fn snapshot_in(inout self, gpa: Gpa) -> Buf {
+        let w = self.w;
+        let h = self.h;
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}
+
+#[test]
+fn pack_puts_each_setting_in_its_word() {
+    var p = Params::new();
+    p.keep = 0.5;
+    p.mouse_mode = -1.0;
+    let u = pack(p, 960, 540, 64, 7);
+    assert_eq(u[0], 960.0);
+    assert_eq(u[2], 64.0);
+    assert_eq(u[3], 7.0);
+    assert_eq(u[8], 0.5);
+    assert_eq(u[14], -1.0);
+    assert_eq(u[19], 0.0);
+}
+
+#[test]
+fn deposit_is_rounded_to_the_shaders_units() {
+    assert_eq(deposit_units(0.2), 51.0 / 256.0);
+    assert_eq(deposit_units(1.0), 1.0);
+}

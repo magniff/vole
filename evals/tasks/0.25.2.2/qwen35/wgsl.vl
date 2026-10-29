@@ -1,0 +1,280 @@
+// The WGSL compute kernels of the forward pass, one module per kernel
+// (shapes are constants of the text, so the generators take the sizes).
+// Weights are bf16 (two per u32 word, read with bf16_at) or f32 words
+// (read with bitcast); activations are f32.
+
+// y = W x (write) or y += W x (add) for W rows x cols, bf16. One workgroup
+// of 64 threads per row; rows are spread over dx columns of workgroups.
+pub fn src_matvec(gpa: Gpa, rows: i64, cols: i64, add: bool, dx: i64) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> w: array<u32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> x: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> y: array<f32>;\n");
+    b.push_str("var<workgroup> red: array<f32, 64>;\n");
+    b.push_str("fn bf(e: u32) -> f32 {\n");
+    b.push_str("    let word = w[e >> 1u];\n");
+    b.push_str("    let bits = (word >> ((e & 1u) * 16u)) & 0xffffu;\n");
+    b.push_str("    return bitcast<f32>(bits << 16u);\n}\n");
+    b.push_str("@compute @workgroup_size(64) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    b.push_str("    let row = wid.y * ");
+    b.push_int(dx);
+    b.push_str("u + wid.x;\n    if (row >= ");
+    b.push_int(rows);
+    b.push_str("u) { return; }\n    let base = row * ");
+    b.push_int(cols);
+    b.push_str("u;\n    var acc: f32 = 0.0;\n");
+    b.push_str("    for (var c: u32 = lid.x; c < ");
+    b.push_int(cols);
+    b.push_str("u; c += 64u) { acc = acc + bf(base + c) * x[c]; }\n");
+    b.push_str("    red[lid.x] = acc;\n    workgroupBarrier();\n");
+    b.push_str("    for (var s: u32 = 32u; s > 0u; s = s >> 1u) {\n");
+    b.push_str("        if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }\n");
+    b.push_str("        workgroupBarrier();\n    }\n");
+    b.push_str("    if (lid.x == 0u) {\n");
+    if add {
+        b.push_str("        y[row] = y[row] + red[0];\n");
+    } else {
+        b.push_str("        y[row] = red[0];\n");
+    }
+    b.push_str("    }\n}\n");
+    b
+}
+
+// out[v*dim + j] = normalise(x[v*stride + j]) * (1 + w[j]) (zero-centred
+// RMSNorm, Qwen3.5's), for each of the vectors v of the dispatch.
+pub fn src_norm(gpa: Gpa, dim: i64, stride: i64) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> x: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> w: array<u32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> out: array<f32>;\n");
+    b.push_str("var<workgroup> red: array<f32, 256>;\n");
+    b.push_str("fn bf(e: u32) -> f32 {\n    let word = w[e >> 1u];\n    let bits = (word >> ((e & 1u) * 16u)) & 0xffffu;\n    return bitcast<f32>(bits << 16u);\n}\n");
+    b.push_str(REDUCE_256);
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    b.push_str("    let base = wid.x * ");
+    b.push_int(stride);
+    b.push_str("u;\n    var ss: f32 = 0.0;\n");
+    b.push_str("    for (var j: u32 = lid.x; j < ");
+    b.push_int(dim);
+    b.push_str("u; j += 256u) { let v = x[base + j]; ss = ss + v * v; }\n");
+    b.push_str("    let total = reduce_sum256(lid.x, ss);\n");
+    b.push_str("    let inv = inverseSqrt(total / ");
+    b.push_int(dim);
+    b.push_str(".0 + 1e-6);\n");
+    b.push_str("    for (var j: u32 = lid.x; j < ");
+    b.push_int(dim);
+    b.push_str("u; j += 256u) { out[wid.x * ");
+    b.push_int(dim);
+    b.push_str("u + j] = x[base + j] * inv * (1.0 + bf(j)); }\n}\n");
+    b
+}
+
+const REDUCE_256: [u8] = "fn reduce_sum256(j: u32, v: f32) -> f32 {\n\
+    red[j] = v;\n\
+    workgroupBarrier();\n\
+    for (var s: u32 = 128u; s > 0u; s = s >> 1u) {\n\
+        if (j < s) { red[j] = red[j] + red[j + s]; }\n\
+        workgroupBarrier();\n\
+    }\n\
+    let r = red[0];\n\
+    workgroupBarrier();\n\
+    return r;\n\
+}\n";
+
+// The token's embedding row: x = embed[pb[2]] (bf16).
+pub fn src_embed(gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> emb: array<u32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> pb: array<u32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> x: array<f32>;\n");
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n");
+    b.push_str("    let j = id.x;\n    if (j >= 1024u) { return; }\n");
+    b.push_str("    let e = pb[2] * 1024u + j;\n");
+    b.push_str("    let word = emb[e >> 1u];\n");
+    b.push_str("    let bits = (word >> ((e & 1u) * 16u)) & 0xffffu;\n");
+    b.push_str("    x[j] = bitcast<f32>(bits << 16u);\n}\n");
+    b
+}
+
+// The causal depthwise conv1d (kernel 4) of one token, with its state of the
+// last 3 inputs per channel, then SiLU. Channels: 6144.
+pub fn src_conv(gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> w: array<u32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> xin: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> st: array<f32>;\n");
+    b.push_str("@group(0) @binding(3) var<storage, read_write> out: array<f32>;\n");
+    b.push_str("fn bf(e: u32) -> f32 {\n    let word = w[e >> 1u];\n    let bits = (word >> ((e & 1u) * 16u)) & 0xffffu;\n    return bitcast<f32>(bits << 16u);\n}\n");
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n");
+    b.push_str("    let c = id.x;\n    if (c >= 6144u) { return; }\n");
+    b.push_str("    let s0 = st[c * 3u];\n    let s1 = st[c * 3u + 1u];\n    let s2 = st[c * 3u + 2u];\n");
+    b.push_str("    let xv = xin[c];\n");
+    b.push_str("    let acc = bf(c * 4u) * s0 + bf(c * 4u + 1u) * s1 + bf(c * 4u + 2u) * s2 + bf(c * 4u + 3u) * xv;\n");
+    b.push_str("    st[c * 3u] = s1;\n    st[c * 3u + 1u] = s2;\n    st[c * 3u + 2u] = xv;\n");
+    b.push_str("    out[c] = acc / (1.0 + exp(-acc));\n}\n");
+    b
+}
+
+const REDUCE_128: [u8] = "fn reduce_sum128(j: u32, v: f32) -> f32 {\n\
+    red[j] = v;\n\
+    workgroupBarrier();\n\
+    for (var s: u32 = 64u; s > 0u; s = s >> 1u) {\n\
+        if (j < s) { red[j] = red[j] + red[j + s]; }\n\
+        workgroupBarrier();\n\
+    }\n\
+    let r = red[0];\n\
+    workgroupBarrier();\n\
+    return r;\n\
+}\n";
+
+// The gated delta rule of one token, one workgroup per value head (16),
+// one thread per value column j of the 128 x 128 state S[h] (rows i, columns
+// j, stored at h*16384 + i*128 + j). Inputs: the conv output (q, k, v),
+// b and a (the gate projections, 16 each), A_log and dt_bias (bf16 / f32
+// words), the output gate z and the norm's weight (f32). The output is
+// core = RMSNormGated(o) * silu(z): per head, the normalised o times the
+// norm's weight times silu(z).
+pub fn src_delta(gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> conv: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> braw: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read> araw: array<f32>;\n");
+    b.push_str("@group(0) @binding(3) var<storage, read> alog: array<u32>;\n");
+    b.push_str("@group(0) @binding(4) var<storage, read> dtb: array<u32>;\n");
+    b.push_str("@group(0) @binding(5) var<storage, read> z: array<f32>;\n");
+    b.push_str("@group(0) @binding(6) var<storage, read> normw: array<u32>;\n");
+    b.push_str("@group(0) @binding(7) var<storage, read_write> s: array<f32>;\n");
+    b.push_str("@group(0) @binding(8) var<storage, read_write> core: array<f32>;\n");
+    b.push_str("var<workgroup> red: array<f32, 128>;\n");
+    b.push_str("var<workgroup> qs: array<f32, 128>;\n");
+    b.push_str("var<workgroup> ks: array<f32, 128>;\n");
+    b.push_str(REDUCE_128);
+    b.push_str("fn dtb_at(h: u32) -> f32 {\n    let word = dtb[h >> 1u];\n    let bits = (word >> ((h & 1u) * 16u)) & 0xffffu;\n    return bitcast<f32>(bits << 16u);\n}\n");
+    b.push_str("@compute @workgroup_size(128) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    b.push_str("    let h = wid.x;\n    let j = lid.x;\n");
+    b.push_str("    let q0 = conv[h * 128u + j];\n    let k0 = conv[2048u + h * 128u + j];\n    let v = conv[4096u + h * 128u + j];\n");
+    b.push_str("    let qn = reduce_sum128(j, q0 * q0);\n    let kn = reduce_sum128(j, k0 * k0);\n");
+    b.push_str("    qs[j] = q0 * inverseSqrt(qn + 1e-6) * 0.08838834764831845;\n");
+    b.push_str("    ks[j] = k0 * inverseSqrt(kn + 1e-6);\n");
+    b.push_str("    workgroupBarrier();\n");
+    b.push_str("    let beta = 1.0 / (1.0 + exp(-braw[h]));\n");
+    b.push_str("    let ar = araw[h] + dtb_at(h);\n");
+    b.push_str("    var sp = ar;\n    if (ar < 20.0) { sp = log(1.0 + exp(ar)); }\n");
+    b.push_str("    let decay = exp(-exp(bitcast<f32>(alog[h])) * sp);\n");
+    b.push_str("    let base = h * 16384u + j;\n");
+    b.push_str("    var kv: f32 = 0.0;\n");
+    b.push_str("    for (var i: u32 = 0u; i < 128u; i = i + 1u) {\n");
+    b.push_str("        let sv = s[base + i * 128u] * decay;\n        s[base + i * 128u] = sv;\n        kv = kv + sv * ks[i];\n    }\n");
+    b.push_str("    let delta = (v - kv) * beta;\n");
+    b.push_str("    var o: f32 = 0.0;\n");
+    b.push_str("    for (var i: u32 = 0u; i < 128u; i = i + 1u) {\n");
+    b.push_str("        let sv = s[base + i * 128u] + ks[i] * delta;\n        s[base + i * 128u] = sv;\n        o = o + sv * qs[i];\n    }\n");
+    b.push_str("    let ms = reduce_sum128(j, o * o);\n");
+    b.push_str("    let zv = z[h * 128u + j];\n");
+    b.push_str("    core[h * 128u + j] = o * inverseSqrt(ms / 128.0 + 1e-6) * bitcast<f32>(normw[j]) * (zv / (1.0 + exp(-zv)));\n}\n");
+    b
+}
+
+// Partial RoPE (theta 1e7, the first 64 of each head's 256 dims, pairs
+// (i, i + 32)) on n heads of 256 at position pb[0]. 32 threads per head.
+pub fn src_rope(gpa: Gpa, heads: i64) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read_write> v: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> pb: array<u32>;\n");
+    b.push_str("@compute @workgroup_size(32) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    b.push_str("    let i = lid.x;\n    let base = wid.x * 256u;\n");
+    b.push_str("    let pos = f32(pb[0]);\n");
+    b.push_str("    let freq = exp(-(f32(2u * i) / 64.0) * 16.11809565095832);\n");
+    b.push_str("    let ang = pos * freq;\n    let c = cos(ang);\n    let sn = sin(ang);\n");
+    b.push_str("    let x1 = v[base + i];\n    let x2 = v[base + i + 32u];\n");
+    b.push_str("    v[base + i] = x1 * c - x2 * sn;\n    v[base + i + 32u] = x2 * c + x1 * sn;\n}\n");
+    b
+}
+
+// Copies this token's k (normalised, roped) and v into the cache at pb[0].
+pub fn src_kvstore(gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> kn: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> vn: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read> pb: array<u32>;\n");
+    b.push_str("@group(0) @binding(3) var<storage, read_write> kc: array<f32>;\n");
+    b.push_str("@group(0) @binding(4) var<storage, read_write> vc: array<f32>;\n");
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n");
+    b.push_str("    let i = id.x;\n    if (i >= 512u) { return; }\n");
+    b.push_str("    let at = pb[0] * 512u + i;\n    kc[at] = kn[i];\n    vc[at] = vn[i];\n}\n");
+    b
+}
+
+// Causal attention with GQA for one token: one workgroup per query head
+// (8), 256 threads (one per head dim). Scores over the T = pb[1] cached
+// positions, softmax, the values, then times sigmoid(gate). The query is
+// qn (normalised, roped; 256 per head); the gate is in qfull (head h's
+// gate at h*512 + 256 + d). The cache is 512 floats per position.
+pub fn src_attn(gpa: Gpa, maxctx: i64) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> qn: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> qfull: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read> kc: array<f32>;\n");
+    b.push_str("@group(0) @binding(3) var<storage, read> vc: array<f32>;\n");
+    b.push_str("@group(0) @binding(4) var<storage, read> pb: array<u32>;\n");
+    b.push_str("@group(0) @binding(5) var<storage, read_write> out: array<f32>;\n");
+    b.push_str("var<workgroup> sc: array<f32, ");
+    b.push_int(maxctx);
+    b.push_str(">;\nvar<workgroup> red: array<f32, 256>;\n");
+    b.push_str(REDUCE_MAX256);
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n");
+    b.push_str("    let h = wid.x;\n    let t = lid.x;\n    let kvh = h / 4u;\n    let n = pb[1];\n");
+    b.push_str("    var p: u32 = t;\n");
+    b.push_str("    while (p < n) {\n        var dot: f32 = 0.0;\n");
+    b.push_str("        for (var d: u32 = 0u; d < 256u; d = d + 1u) {\n");
+    b.push_str("            dot = dot + qn[h * 256u + d] * kc[p * 512u + kvh * 256u + d];\n        }\n");
+    b.push_str("        sc[p] = dot * 0.0625;\n        p = p + 256u;\n    }\n");
+    b.push_str("    workgroupBarrier();\n");
+    b.push_str("    var m: f32 = -3.0e38;\n    p = t;\n");
+    b.push_str("    while (p < n) { m = max(m, sc[p]); p = p + 256u; }\n");
+    b.push_str("    let mx = reduce_max256(t, m);\n");
+    b.push_str("    var sum: f32 = 0.0;\n    p = t;\n");
+    b.push_str("    while (p < n) { let e = exp(sc[p] - mx); sc[p] = e; sum = sum + e; p = p + 256u; }\n");
+    b.push_str("    let tot = reduce_sum_a(t, sum);\n");
+    b.push_str("    workgroupBarrier();\n");
+    b.push_str("    var acc: f32 = 0.0;\n");
+    b.push_str("    for (var q: u32 = 0u; q < n; q = q + 1u) { acc = acc + sc[q] * vc[q * 512u + kvh * 256u + t]; }\n");
+    b.push_str("    let gate = qfull[h * 512u + 256u + t];\n");
+    b.push_str("    out[h * 256u + t] = (acc / tot) * (1.0 / (1.0 + exp(-gate)));\n}\n");
+    b
+}
+
+const REDUCE_MAX256: [u8] = "fn reduce_max256(j: u32, v: f32) -> f32 {\n\
+    red[j] = v;\n\
+    workgroupBarrier();\n\
+    for (var s: u32 = 128u; s > 0u; s = s >> 1u) {\n\
+        if (j < s) { red[j] = max(red[j], red[j + s]); }\n\
+        workgroupBarrier();\n\
+    }\n\
+    let r = red[0];\n\
+    workgroupBarrier();\n\
+    return r;\n\
+}\n\
+fn reduce_sum_a(j: u32, v: f32) -> f32 {\n\
+    red[j] = v;\n\
+    workgroupBarrier();\n\
+    for (var s: u32 = 128u; s > 0u; s = s >> 1u) {\n\
+        if (j < s) { red[j] = red[j] + red[j + s]; }\n\
+        workgroupBarrier();\n\
+    }\n\
+    let r = red[0];\n\
+    workgroupBarrier();\n\
+    return r;\n\
+}\n";
+
+// out[i] = silu(g[i]) * u[i], n = 3584.
+pub fn src_silu_mul(gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("@group(0) @binding(0) var<storage, read> g: array<f32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> u: array<f32>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> out: array<f32>;\n");
+    b.push_str("@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n");
+    b.push_str("    let i = id.x;\n    if (i >= 3584u) { return; }\n");
+    b.push_str("    let gv = g[i];\n    out[i] = (gv / (1.0 + exp(-gv))) * u[i];\n}\n");
+    b
+}

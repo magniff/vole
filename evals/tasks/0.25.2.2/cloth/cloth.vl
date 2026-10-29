@@ -1,0 +1,237 @@
+// The CPU side of the cloth: vectors, the camera and the mouse's ray, the
+// grab's pick, the initial state, and the numbers the headless check reads
+// back from the GPU (constraint error, energy, NaNs). Positions are flat
+// f32 arrays of xyzw (w: inverse mass), as the GPU keeps them.
+
+pub struct V3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+pub fn v3(x: f32, y: f32, z: f32) -> V3 {
+    V3 { x: x, y: y, z: z }
+}
+
+impl V3 {
+    pub fn add(self, o: V3) -> V3 {
+        v3(self.x + o.x, self.y + o.y, self.z + o.z)
+    }
+
+    pub fn sub(self, o: V3) -> V3 {
+        v3(self.x - o.x, self.y - o.y, self.z - o.z)
+    }
+
+    pub fn scale(self, k: f32) -> V3 {
+        v3(self.x * k, self.y * k, self.z * k)
+    }
+
+    pub fn dot(self, o: V3) -> f32 {
+        self.x * o.x + self.y * o.y + self.z * o.z
+    }
+
+    pub fn cross(self, o: V3) -> V3 {
+        v3(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
+    }
+
+    pub fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    pub fn norm(self) -> V3 {
+        let l = self.length();
+        if l > 0.0 { self.scale(1.0 / l) } else { self }
+    }
+}
+
+// A pinhole camera; `focal` is 1 / tan(fov / 2). The projection (sim.vl's
+// uniform, shaders.vl's `project`) maps a point to x = right, y = up.
+pub struct Camera {
+    pub eye: V3,
+    pub fwd: V3,
+    pub right: V3,
+    pub up: V3,
+    pub focal: f32,
+    pub aspect: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+pub fn camera(eye: V3, target: V3, focal: f32, aspect: f32) -> Camera {
+    let fwd = target.sub(eye).norm();
+    let right = fwd.cross(v3(0.0, 1.0, 0.0)).norm();
+    let up = right.cross(fwd);
+    Camera { eye: eye, fwd: fwd, right: right, up: up, focal: focal, aspect: aspect,
+        near: 0.05, far: 60.0 }
+}
+
+// The direction of the ray through pixel (px, py) of a w x h picture
+// (pixels from the top left).
+pub fn ray(c: Camera, px: f64, py: f64, w: f64, h: f64) -> V3 {
+    let nx = (px / w * 2.0 - 1.0) as f32;
+    let ny = (1.0 - py / h * 2.0) as f32;
+    c.fwd.add(c.right.scale(nx * c.aspect / c.focal)).add(c.up.scale(ny / c.focal)).norm()
+}
+
+pub fn pos_at(pos: [f32], i: i64) -> V3 {
+    v3(pos[4 * i], pos[4 * i + 1], pos[4 * i + 2])
+}
+
+// The movable particle nearest the ray (within `reach`), as its index and
+// its distance along the ray; -1 when none is near.
+pub fn pick(pos: [f32], n: i64, eye: V3, dir: V3, reach: f32) -> (i64, f32) {
+    var best = -1;
+    var best_d = reach;
+    var best_t: f32 = 0.0;
+    for i in 0..n * n {
+        if pos[4 * i + 3] == 0.0 {
+            continue;
+        }
+        let rel = pos_at(pos, i).sub(eye);
+        let t = rel.dot(dir);
+        if t <= 0.0 {
+            continue;
+        }
+        let d = rel.sub(dir.scale(t)).length();
+        if d < best_d {
+            best_d = d;
+            best = i;
+            best_t = t;
+        }
+    }
+    (best, best_t)
+}
+
+// Where the grabbed particle goes while the mouse is at ray `dir`: the
+// point on that ray in the plane, across the view, through `p0`.
+pub fn drag_target(c: Camera, p0: V3, dir: V3) -> V3 {
+    let denom = dir.dot(c.fwd);
+    if denom <= 1e-6 {
+        return p0;
+    }
+    let t = p0.sub(c.eye).dot(c.fwd) / denom;
+    c.eye.add(dir.scale(t))
+}
+
+// The start: an n x n grid in the x-y plane, `top` the height of the top
+// row, `spacing` the rest length between neighbours. The rows are `stretch`
+// times further apart than at rest (1.0: at rest), so the sheet starts that
+// much too long down the grid; across it the pinned top corners keep their
+// rest distance. The sheet bulges towards the viewer (z) by `bulge` at its
+// middle, so that it meets a sphere in front of it and wraps it: a sheet
+// exactly through the sphere's centre would be pushed sideways only, and
+// tear across the hole. The two top corners are pinned.
+pub fn initial(n: i64, spacing: f32, stretch: f32, top: f32, bulge: f32, gpa: Gpa) -> Vec<f32> {
+    var out: Vec<f32> = Vec::new_in(gpa);
+    let half = (n - 1) as f32 * spacing * 0.5;
+    for iy in 0..n {
+        for ix in 0..n {
+            let pinned = iy == 0 && (ix == 0 || ix == n - 1);
+            let x = ix as f32 * spacing - half;
+            out.push(x);
+            out.push(top - iy as f32 * spacing * stretch);
+            out.push(bulge * (-(x * x) / 0.36).exp());
+            out.push(if pinned { 0.0 } else { 1.0 });
+        }
+    }
+    out
+}
+
+// The constraint error: over every stretch (1 apart) and bend (2 apart)
+// pair, |length - rest| / rest, as its root mean square and its largest.
+pub fn constraint_error(pos: [f32], n: i64, spacing: f32) -> (f64, f64) {
+    var sum = 0.0;
+    var worst = 0.0;
+    var count = 0;
+    for iy in 0..n {
+        for ix in 0..n {
+            let i = iy * n + ix;
+            for k in 1..3 {
+                for axis in 0..2 {
+                    let jx = if axis == 0 { ix + k } else { ix };
+                    let jy = if axis == 1 { iy + k } else { iy };
+                    if jx >= n || jy >= n {
+                        continue;
+                    }
+                    let j = jy * n + jx;
+                    let rest = spacing * k as f32;
+                    let len = pos_at(pos, i).sub(pos_at(pos, j)).length();
+                    let e = ((len - rest) / rest).abs() as f64;
+                    sum = sum + e * e;
+                    if e > worst {
+                        worst = e;
+                    }
+                    count += 1;
+                }
+            }
+        }
+    }
+    let rms = if count > 0 { (sum / count as f64).sqrt() } else { 0.0 };
+    (rms, worst)
+}
+
+// Kinetic and potential energy (unit mass per movable particle, gravity
+// `g` along -y from the floor `floor`), in that order.
+pub fn energy(pos: [f32], vel: [f32], n: i64, g: f32, floor: f32) -> (f64, f64) {
+    var ke = 0.0;
+    var pe = 0.0;
+    for i in 0..n * n {
+        if pos[4 * i + 3] == 0.0 {
+            continue;
+        }
+        let v = v3(vel[4 * i], vel[4 * i + 1], vel[4 * i + 2]);
+        ke = ke + 0.5 * v.dot(v) as f64;
+        pe = pe + (g * (pos[4 * i + 1] - floor)) as f64;
+    }
+    (ke, pe)
+}
+
+// How many of the numbers are not finite (NaN or an infinity).
+pub fn not_finite(xs: [f32]) -> i64 {
+    var bad = 0;
+    for x in xs {
+        if x - x != 0.0 {
+            bad += 1;
+        }
+    }
+    bad
+}
+
+#[test]
+fn ray_through_the_centre_is_forward() {
+    let c = camera(v3(0.0, 0.0, 4.0), v3(0.0, 0.0, 0.0), 2.0, 16.0 / 9.0);
+    let d = ray(c, 400.0, 300.0, 800.0, 600.0);
+    assert(d.sub(c.fwd).length() < 1e-5);
+}
+
+#[test]
+fn a_flat_grid_has_no_constraint_error(gpa: Gpa) {
+    let flat = initial(8, 0.1, 1.0, 0.0, 0.0, gpa);
+    let (rms, worst) = constraint_error(flat[..], 8, 0.1);
+    assert(rms < 1e-6 && worst < 1e-6);
+}
+
+#[test]
+fn a_stretched_grid_has_its_stretch_as_error(gpa: Gpa) {
+    let s = initial(8, 0.1, 1.1, 0.0, 0.0, gpa);
+    let (_, worst) = constraint_error(s[..], 8, 0.1);
+    assert(worst > 0.09 && worst < 0.11);
+}
+
+#[test]
+fn pick_takes_the_particle_on_the_ray(gpa: Gpa) {
+    // a 4 x 4 flat grid: particle (ix, iy) at x = ix - 1.5, y = -iy
+    let flat = initial(4, 1.0, 1.0, 0.0, 0.0, gpa);
+    // the ray down -z at x = -0.5, y = -1 hits (1, 1), index 5
+    let (i, t) = pick(flat[..], 4, v3(-0.5, -1.0, 5.0), v3(0.0, 0.0, -1.0), 0.2);
+    assert(i == 5);
+    assert(t > 0.0);
+}
+
+#[test]
+fn not_finite_counts_nan_and_inf() {
+    let zero: f32 = 0.0;
+    let nan = zero / zero;
+    let inf = 1.0 / zero;
+    assert(not_finite([1.0, nan, inf, 2.0][..]) == 2);
+}

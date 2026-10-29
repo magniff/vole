@@ -1,0 +1,184 @@
+// The GPU side of the terrain: the height noise (one compute kernel, run
+// once), the sun's depth pass (a shadow map), and the frame: the chunks
+// at their level of detail, then the sea. shaders.vl holds the WGSL.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Compare, Format, PassDesc, TextureUsage};
+
+use mat::V3;
+use shaders::{NOISE, SCENE};
+use terrain::{AMP, CELL, NCHUNKS, SEA, SKIRT, SAMPLES, chunk_verts, lod_steps};
+
+pub const SHADOW: i64 = 2048;
+// the sun's box in world units, and its distance (the far plane)
+const SUN_HALF: f32 = 730.0;
+
+// the uniform block: 48 f32s (see SCENE's U)
+const UNIFORM_FLOATS: i64 = 48;
+
+pub const FOG_COLOR: [f32; 3] = [0.62, 0.71, 0.80];
+pub const FOG_DENSITY: f32 = 0.0009;
+
+pub struct Scene {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub heights: gpu::Buffer,
+    pub shadow: gpu::Texture,
+    pub sun: V3,
+    pub sun_vp: [f32; 16],
+    pub steps: [u32; 256],
+    noise: gpu::ComputePipeline,
+    noise_group: gpu::BindGroup,
+    ubuf: gpu::Buffer,
+    stepbuf: gpu::Buffer,
+    shadow_pipe: gpu::RenderPipeline,
+    shadow_group: gpu::BindGroup,
+    scene_pipe: gpu::RenderPipeline,
+    scene_group: gpu::BindGroup,
+    water_pipe: gpu::RenderPipeline,
+    water_group: gpu::BindGroup,
+}
+
+impl Scene {
+    // Makes the pipelines and buffers, and runs the noise once.
+    pub fn new_in(dev: sink gpu::Device, queue: sink gpu::Queue, seed: i64) -> Result<Scene, gpu::Error> {
+        let np: [f32; 4] = [SAMPLES as f32, seed as f32, CELL, AMP];
+        let npbuf = dev.buffer_init(gpu::bytes_of_f32(np[..]), BufferUsage::UNIFORM);
+        let heights = dev.buffer(SAMPLES * SAMPLES * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+        let nshader = dev.shader_wgsl(NOISE)?;
+        let noise = dev.compute_pipeline(nshader, "main")?;
+        let noise_group = dev.bind_group(noise.bind_layout(0), [gpu::bind(0, npbuf), gpu::bind(1, heights)][..]);
+
+        let ubuf = dev.buffer(UNIFORM_FLOATS * 4, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let stepbuf = dev.buffer(256 * 4, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let shadow = dev.texture(SHADOW, SHADOW, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_SRC);
+
+        let sshader = dev.shader_wgsl(SCENE)?;
+        let shadow_pipe = dev.render_pipeline(gpu::RenderDesc::depth_only(sshader, "vs_shadow"))?;
+        let shadow_group = dev.bind_group(shadow_pipe.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, heights), gpu::bind(2, stepbuf)][..]);
+
+        var sd = gpu::RenderDesc::new(sshader, "vs", "fs", Format::Bgra8Unorm);
+        sd.depth(Format::Depth32Float, Compare::Less, true);
+        let scene_pipe = dev.render_pipeline(sd)?;
+        let scene_group = dev.bind_group(scene_pipe.bind_layout(0),
+            [gpu::bind(0, ubuf), gpu::bind(1, heights), gpu::bind(2, stepbuf),
+             gpu::bind_texture(3, shadow.view())][..]);
+
+        var wd = gpu::RenderDesc::new(sshader, "vw", "fw", Format::Bgra8Unorm);
+        wd.depth(Format::Depth32Float, Compare::Less, true);
+        let water_pipe = dev.render_pipeline(wd)?;
+        let water_group = dev.bind_group(water_pipe.bind_layout(0), [gpu::bind(0, ubuf)][..]);
+
+        // the sun: looks at the middle of the terrain from 1000 units off
+        let sun = V3::new(0.45, 0.62, 0.38).norm();
+        let sun_view = mat::look_at(sun.scale(1000.0), V3::new(0.0, 0.0, 0.0), V3::new(0.0, 1.0, 0.0));
+        let sun_proj = mat::ortho(-SUN_HALF, SUN_HALF, -SUN_HALF, SUN_HALF, 1.0, 2000.0);
+        let sun_vp = mat::mul(sun_proj, sun_view);
+
+        var s = Scene {
+            dev: dev,
+            queue: queue,
+            heights: heights,
+            shadow: shadow,
+            sun: sun,
+            sun_vp: sun_vp,
+            steps: [1; 256],
+            noise: noise,
+            noise_group: noise_group,
+            ubuf: ubuf,
+            stepbuf: stepbuf,
+            shadow_pipe: shadow_pipe,
+            shadow_group: shadow_group,
+            scene_pipe: scene_pipe,
+            scene_group: scene_group,
+            water_pipe: water_pipe,
+            water_group: water_group,
+        };
+        s.run_noise();
+        Ok(s)
+    }
+
+    // The heights: one compute pass over the grid, waited for by the
+    // first readback or frame.
+    fn run_noise(inout self) {
+        var enc = self.dev.encoder();
+        let k = self.noise;
+        let g = self.noise_group;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(k);
+            pass.set_bind_group(0, g);
+            pass.dispatch(65, 65); // 8 x 8 workgroups cover the 513 x 513 samples
+        });
+        self.queue.submit(enc.finish());
+    }
+
+    // The uniform block for a camera (its view and projection in one
+    // matrix), its eye, the time, and the level of detail for the eye.
+    pub fn update(inout self, view_proj: [f32; 16], eye: V3, time: f32) {
+        var u: [f32; 48] = [0.0; 48];
+        for i in 0..16 {
+            u[i] = view_proj[i];
+            u[16 + i] = self.sun_vp[i];
+        }
+        u[32] = eye.x;
+        u[33] = eye.y;
+        u[34] = eye.z;
+        u[36] = self.sun.x;
+        u[37] = self.sun.y;
+        u[38] = self.sun.z;
+        u[40] = FOG_COLOR[0];
+        u[41] = FOG_COLOR[1];
+        u[42] = FOG_COLOR[2];
+        u[43] = FOG_DENSITY;
+        u[44] = CELL;
+        u[45] = SKIRT;
+        u[46] = SEA;
+        u[47] = time;
+        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_f32(u[..]));
+        self.steps = lod_steps(eye);
+        self.queue.write_buffer(self.stepbuf, 0, gpu::bytes_of_u32(self.steps[..]));
+    }
+
+    // The sun's depth pass: every chunk, at the step it has.
+    pub fn shadow_pass(inout self, enc: inout gpu::Encoder) {
+        let p = self.shadow_pipe;
+        let g = self.shadow_group;
+        let steps = self.steps;
+        enc.render_pass(PassDesc::depth_only(self.shadow.view()), |pass| {
+            pass.set_pipeline(p);
+            pass.set_bind_group(0, g);
+            for c in 0..NCHUNKS {
+                pass.draw(0..chunk_verts(steps[c as usize] as i64), c..c + 1);
+            }
+        });
+    }
+
+    // One frame into a colour view and a depth view of its size: the
+    // shadow map, the terrain, then the sea.
+    pub fn frame(inout self, enc: inout gpu::Encoder, color: gpu::TextureView, depth: gpu::TextureView) {
+        self.shadow_pass(&enc);
+        let p = self.scene_pipe;
+        let g = self.scene_group;
+        let w = self.water_pipe;
+        let wg = self.water_group;
+        let steps = self.steps;
+        enc.render_pass(PassDesc::color(color, Color::rgba(0.55, 0.70, 0.88, 1.0))
+                .with_depth(depth, 1.0, false), |pass| {
+            pass.set_pipeline(p);
+            pass.set_bind_group(0, g);
+            for c in 0..NCHUNKS {
+                pass.draw(0..chunk_verts(steps[c as usize] as i64), c..c + 1);
+            }
+            pass.set_pipeline(w);
+            pass.set_bind_group(0, wg);
+            pass.draw(0..6, 0..1);
+        });
+    }
+
+    // The heights as read back: they wait for the noise.
+    pub fn read_heights(inout self) -> [f32] {
+        gpu::f32s(self.heights.map_read(self.dev))
+    }
+}

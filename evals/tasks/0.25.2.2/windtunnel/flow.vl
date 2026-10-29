@@ -1,0 +1,135 @@
+// The CPU side of windtunnel: the lattice's constants and equilibrium, the
+// relaxation rate from the Reynolds number, the obstacle masks (a disk, a
+// brush) and the shedding frequency of a probe's series. Nothing here
+// touches the GPU; the tests are #[test] functions at the bottom.
+
+// D2Q9: the directions and their weights (see shaders.vl for the layout).
+pub const CX: [i64; 9] = [0, 1, 0, -1, 0, 1, -1, -1, 1];
+pub const CY: [i64; 9] = [0, 0, 1, 0, -1, 1, 1, -1, -1];
+pub const WT: [f64; 9] = [
+    4.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,
+];
+
+// The equilibrium population k of density rho and velocity (ux, uy).
+#[pure]
+pub fn feq(k: i64, rho: f64, ux: f64, uy: f64) -> f64 {
+    let cu = 3.0 * (CX[k] as f64 * ux + CY[k] as f64 * uy);
+    WT[k] * rho * (1.0 + cu + 0.5 * cu * cu - 1.5 * (ux * ux + uy * uy))
+}
+
+// The relaxation rate omega = 1/tau for a Reynolds number re = U D / nu:
+// nu = U D / re in lattice units, tau = 3 nu + 1/2.
+#[pure]
+pub fn omega_for(re: f64, inflow: f64, diam: f64) -> f64 {
+    let nu = inflow * diam / re;
+    1.0 / (3.0 * nu + 0.5)
+}
+
+// The Strouhal number f D / U of a probe's series (one sample a step, in
+// lattice units): the mean is removed, the first half skipped (the
+// start-up transient lasts about 15000 steps at Re 100), and the period is the mean spacing of the upward crossings of
+// zero, interpolated. -1 when there are fewer than three crossings.
+pub fn strouhal(series: [f32], diam: f64, inflow: f64) -> f64 {
+    let n = series.len();
+    let from = n / 2;
+    var mean = 0.0;
+    for i in from..n {
+        mean += series[i] as f64;
+    }
+    mean = mean / (n - from) as f64;
+    var first = 0.0;
+    var last = 0.0;
+    var count = 0;
+    for i in (from + 1)..n {
+        let a = series[i - 1] as f64 - mean;
+        let b = series[i] as f64 - mean;
+        if a < 0.0 && b >= 0.0 {
+            let t = i as f64 - 1.0 + (-a) / (b - a);
+            if count == 0 {
+                first = t;
+            }
+            last = t;
+            count += 1;
+        }
+    }
+    if count < 3 {
+        return -1.0;
+    }
+    let period = (last - first) / (count - 1) as f64;
+    diam / inflow / period
+}
+
+// A w x h mask of zeros (fluid), as long as the grid.
+pub fn empty_mask(w: i64, h: i64, gpa: Gpa) -> Vec<u32> {
+    Vec::filled_in(w * h, 0u32, gpa)
+}
+
+// Sets every cell whose centre is within r of (cx, cy) to `value`.
+pub fn disk(mask: inout Vec<u32>, w: i64, h: i64, cx: f64, cy: f64, r: f64, value: u32) {
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f64 + 0.5 - cx;
+            let dy = y as f64 + 0.5 - cy;
+            if dx * dx + dy * dy <= r * r {
+                mask[y * w + x] = value;
+            }
+        }
+    }
+}
+
+// The number of cells set in a mask.
+pub fn solid_count(mask: [u32]) -> i64 {
+    var n = 0;
+    for m in mask {
+        if m != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn equilibrium_has_its_moments() {
+    let ux = 0.08;
+    let uy = -0.01;
+    var rho = 0.0;
+    var mx = 0.0;
+    var my = 0.0;
+    for k in 0..9 {
+        let f = feq(k, 1.0, ux, uy);
+        rho += f;
+        mx += CX[k] as f64 * f;
+        my += CY[k] as f64 * f;
+    }
+    assert_eq((rho * 1e9).round(), 1e9);
+    assert_eq(((mx - ux) * 1e9).round(), 0.0);
+    assert_eq(((my - uy) * 1e9).round(), 0.0);
+}
+
+#[test]
+fn omega_matches_the_viscosity() {
+    // re = U D / nu: at re 100, U 0.08, D 25, nu = 0.02 and tau = 0.56
+    let w = omega_for(100.0, 0.08, 25.0);
+    assert_eq(((1.0 / w - 0.56) * 1e9).round(), 0.0);
+}
+
+#[test]
+fn strouhal_of_a_sine(gpa: Gpa) {
+    // a sine of period 50 steps, D = 2, U = 0.5: St = (1/50) * 2 / 0.5
+    var xs: Vec<f32> = Vec::new_in(gpa);
+    for i in 0..600 {
+        xs.push((i as f64 * 2.0 * std::math::PI / 50.0).sin() as f32);
+    }
+    let st = strouhal(xs.as_slice(), 2.0, 0.5);
+    assert_eq(((st - 0.08) * 1e4).round(), 0.0);
+}
+
+#[test]
+fn disk_has_its_area(gpa: Gpa) {
+    var m = empty_mask(120, 120, gpa);
+    disk(&m, 120, 120, 60.0, 60.0, 20.0, 1u32);
+    let area = solid_count(m.as_slice()) as f64;
+    let want = 3.14159265 * 400.0;
+    assert_eq(((area - want) / want).abs() < 0.01, true);
+}

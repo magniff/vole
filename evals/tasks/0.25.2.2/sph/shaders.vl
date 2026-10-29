@@ -1,0 +1,273 @@
+// The WGSL of the SPH step: one module per kernel (each its own bindings),
+// the shared prefix (the uniform, the cell of a point) first. The kernels:
+// clear the cell counts, count the particles per cell, scan the counts
+// (one workgroup), scatter the particles into their cells (a counting
+// sort), the density, the pressure and viscosity forces, and the
+// integration (gravity, the mouse's stir, the walls). The picture is a
+// quad per particle, coloured by its speed.
+
+// The uniform, 32 floats (see geom.vl's pack).
+pub const PRE: [u8] = "struct U {\n\
+    grid: vec4<f32>,\n\
+    sph: vec4<f32>,\n\
+    flow: vec4<f32>,\n\
+    dims: vec4<f32>,\n\
+    mouse: vec4<f32>,\n\
+    stir: vec4<f32>,\n\
+    draw: vec4<f32>,\n\
+    misc: vec4<f32>,\n\
+    }\n\
+    @group(0) @binding(0) var<uniform> u: U;\n\
+    const PI: f32 = 3.14159265;\n\
+    fn cell_xy(p: vec2<f32>) -> vec2<u32> {\n\
+    let gx = u32(u.grid.y);\n\
+    let gy = u32(u.grid.z);\n\
+    let cx = min(u32(max(p.x / u.sph.x, 0.0)), gx - 1u);\n\
+    let cy = min(u32(max(p.y / u.sph.x, 0.0)), gy - 1u);\n\
+    return vec2<u32>(cx, cy);\n\
+    }\n";
+
+// Cell counts cleared (one per cell).
+pub const CLEAR: [u8] = "@group(0) @binding(1) var<storage, read_write> counts: array<atomic<u32>>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.w) { return; }\n\
+    atomicStore(&counts[i], 0u);\n\
+    }\n";
+
+// Each particle's cell, and one count into it.
+pub const COUNT: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> cellid: array<u32>;\n\
+    @group(0) @binding(3) var<storage, read_write> counts: array<atomic<u32>>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.x) { return; }\n\
+    let c = cell_xy(pos[i]);\n\
+    let id = c.y * u32(u.grid.y) + c.x;\n\
+    cellid[i] = id;\n\
+    atomicAdd(&counts[id], 1u);\n\
+    }\n";
+
+// The exclusive prefix sum of the counts, one workgroup of 256: each lane
+// sums its chunk, the 256 chunk sums are scanned in shared memory
+// (Hillis-Steele), and each lane writes its chunk's starts. starts[cells]
+// is the total; cursor starts as a copy of starts (the scatter's).
+pub const SCAN: [u8] = "@group(0) @binding(1) var<storage, read> counts: array<u32>;\n\
+    @group(0) @binding(2) var<storage, read_write> starts: array<u32>;\n\
+    @group(0) @binding(3) var<storage, read_write> cursor: array<u32>;\n\
+    var<workgroup> sums: array<u32, 256>;\n\
+    @compute @workgroup_size(256)\n\
+    fn main(@builtin(local_invocation_index) t: u32) {\n\
+    let n = u32(u.grid.w);\n\
+    let chunk = (n + 255u) / 256u;\n\
+    let lo = min(t * chunk, n);\n\
+    let hi = min(lo + chunk, n);\n\
+    var s = 0u;\n\
+    for (var i = lo; i < hi; i += 1u) { s += counts[i]; }\n\
+    sums[t] = s;\n\
+    workgroupBarrier();\n\
+    for (var d = 1u; d < 256u; d = d * 2u) {\n\
+    var add = 0u;\n\
+    if t >= d { add = sums[t - d]; }\n\
+    workgroupBarrier();\n\
+    sums[t] = sums[t] + add;\n\
+    workgroupBarrier();\n\
+    }\n\
+    var run = 0u;\n\
+    if t > 0u { run = sums[t - 1u]; }\n\
+    for (var i = lo; i < hi; i += 1u) {\n\
+    starts[i] = run;\n\
+    cursor[i] = run;\n\
+    run += counts[i];\n\
+    }\n\
+    if t == 255u { starts[n] = sums[255]; }\n\
+    }\n";
+
+// The counting sort's scatter: each particle takes the next slot of its cell.
+pub const SCATTER: [u8] = "@group(0) @binding(1) var<storage, read> cellid: array<u32>;\n\
+    @group(0) @binding(2) var<storage, read_write> cursor: array<atomic<u32>>;\n\
+    @group(0) @binding(3) var<storage, read_write> sorted: array<u32>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.x) { return; }\n\
+    let slot = atomicAdd(&cursor[cellid[i]], 1u);\n\
+    sorted[slot] = i;\n\
+    }\n";
+
+// The density: the poly6 kernel summed over the 3 x 3 cells around.
+pub const DENSITY: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> starts: array<u32>;\n\
+    @group(0) @binding(3) var<storage, read> sorted: array<u32>;\n\
+    @group(0) @binding(4) var<storage, read> cellid: array<u32>;\n\
+    @group(0) @binding(5) var<storage, read_write> dens: array<f32>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.x) { return; }\n\
+    let h = u.sph.x;\n\
+    let h2 = h * h;\n\
+    let h8 = h2 * h2 * h2 * h2;\n\
+    let gx = i32(u.grid.y);\n\
+    let gy = i32(u.grid.z);\n\
+    let cid = i32(cellid[i]);\n\
+    let cx = cid % gx;\n\
+    let cy = cid / gx;\n\
+    let p = pos[i];\n\
+    var rho = 0.0;\n\
+    for (var dy = -1; dy <= 1; dy += 1) {\n\
+    for (var dx = -1; dx <= 1; dx += 1) {\n\
+    let x = cx + dx;\n\
+    let y = cy + dy;\n\
+    if x < 0 || y < 0 || x >= gx || y >= gy { continue; }\n\
+    let c2 = u32(y * gx + x);\n\
+    for (var s = starts[c2]; s < starts[c2 + 1u]; s += 1u) {\n\
+    let d = p - pos[sorted[s]];\n\
+    let r2 = dot(d, d);\n\
+    if r2 < h2 {\n\
+    let q = h2 - r2;\n\
+    rho += q * q * q;\n\
+    }\n\
+    }\n\
+    }\n\
+    }\n\
+    dens[i] = rho * 4.0 / (PI * h8) * u.sph.y;\n\
+    }\n";
+
+// The forces per second squared: the pressure (spiky gradient, symmetric
+// in the pair) divided by the density, and the viscosity (the kernel
+// 40/(pi h^5) (h - r), positive over the support, whose sum approximates
+// laplacian(v); the poly6 Laplacian is negative at the short range of a
+// lattice and made the viscosity anti-diffusive).
+pub const FORCE: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> dens: array<f32>;\n\
+    @group(0) @binding(4) var<storage, read> starts: array<u32>;\n\
+    @group(0) @binding(5) var<storage, read> sorted: array<u32>;\n\
+    @group(0) @binding(6) var<storage, read> cellid: array<u32>;\n\
+    @group(0) @binding(7) var<storage, read_write> acc: array<vec2<f32>>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.x) { return; }\n\
+    let h = u.sph.x;\n\
+    let h2 = h * h;\n\
+    let m = u.sph.y;\n\
+    let rho0 = u.sph.z;\n\
+    let stiff = u.sph.w;\n\
+    let visc = u.flow.y;\n\
+    let spiky = 30.0 / (PI * h2 * h2 * h);\n\
+    let lapv = 40.0 / (PI * h2 * h2 * h);\n\
+    let pi_ = pos[i];\n\
+    let vi = vel[i];\n\
+    let rhoi = dens[i];\n\
+    let pri = max(stiff * (rhoi - rho0), 0.0);\n\
+    let gx = i32(u.grid.y);\n\
+    let gy = i32(u.grid.z);\n\
+    let cid = i32(cellid[i]);\n\
+    let cx = cid % gx;\n\
+    let cy = cid / gx;\n\
+    var ap = vec2<f32>(0.0, 0.0);\n\
+    var av = vec2<f32>(0.0, 0.0);\n\
+    for (var dy = -1; dy <= 1; dy += 1) {\n\
+    for (var dx = -1; dx <= 1; dx += 1) {\n\
+    let x = cx + dx;\n\
+    let y = cy + dy;\n\
+    if x < 0 || y < 0 || x >= gx || y >= gy { continue; }\n\
+    let c2 = u32(y * gx + x);\n\
+    for (var s = starts[c2]; s < starts[c2 + 1u]; s += 1u) {\n\
+    let j = sorted[s];\n\
+    if j == i { continue; }\n\
+    let d = pi_ - pos[j];\n\
+    let r2 = dot(d, d);\n\
+    if r2 >= h2 || r2 < 1.0e-14 { continue; }\n\
+    let r = sqrt(r2);\n\
+    let rhoj = dens[j];\n\
+    let prj = max(stiff * (rhoj - rho0), 0.0);\n\
+    let q = h - r;\n\
+    let pk = m * (pri + prj) / (2.0 * rhoj) * spiky * q * q / r;\n\
+    ap += pk * d;\n\
+    let lw = lapv * (h - r);\n\
+    av += (m / rhoj) * lw * (vel[j] - vi);\n\
+    }\n\
+    }\n\
+    }\n\
+    acc[i] = ap / rhoi + visc * av;\n\
+    }\n";
+
+// Integration: gravity (in the box's frame: it tilts with the box), the
+// mouse's stir (a push along the mouse's velocity, fading to the radius),
+// the walls (a bounce that keeps the particle in, and the deepest
+// penetration, as a max of float bits, for the check).
+pub const INTEGRATE: [u8] = "@group(0) @binding(1) var<storage, read_write> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read_write> vel: array<vec2<f32>>;\n\
+    @group(0) @binding(3) var<storage, read> acc: array<vec2<f32>>;\n\
+    @group(0) @binding(4) var<storage, read_write> penmax: array<atomic<u32>>;\n\
+    @compute @workgroup_size(64)\n\
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
+    let i = gid.x;\n\
+    if i >= u32(u.grid.x) { return; }\n\
+    let dt = u.flow.x;\n\
+    var a = acc[i] + vec2<f32>(u.flow.z, u.flow.w);\n\
+    var p = pos[i];\n\
+    if u.stir.z > 0.5 {\n\
+    let rr = length(p - u.mouse.xy);\n\
+    let rad = u.stir.x;\n\
+    if rr < rad {\n\
+    let f = 1.0 - rr / rad;\n\
+    a += u.stir.y * f * f * u.mouse.zw;\n\
+    }\n\
+    }\n\
+    var v = vel[i] + a * dt;\n\
+    p = p + v * dt;\n\
+    let rest = u.dims.w;\n\
+    var pen = 0.0;\n\
+    if p.x < 0.0 { pen = max(pen, -p.x); p.x = 0.0; v.x = -v.x * rest; }\n\
+    if p.x > u.dims.x { pen = max(pen, p.x - u.dims.x); p.x = u.dims.x; v.x = -v.x * rest; }\n\
+    if p.y < 0.0 { pen = max(pen, -p.y); p.y = 0.0; v.y = -v.y * rest; }\n\
+    if p.y > u.dims.y { pen = max(pen, p.y - u.dims.y); p.y = u.dims.y; v.y = -v.y * rest; }\n\
+    if pen > 0.0 { atomicMax(&penmax[0], bitcast<u32>(pen)); }\n\
+    pos[i] = p;\n\
+    vel[i] = v;\n\
+    }\n";
+
+// The picture: a quad per particle (six vertices, instanced), coloured by
+// the speed on a blue-cyan-yellow-red ramp; the fragment rounds the quad.
+pub const RENDER: [u8] = "@group(0) @binding(1) var<storage, read> pos: array<vec2<f32>>;\n\
+    @group(0) @binding(2) var<storage, read> vel: array<vec2<f32>>;\n\
+    struct V {\n\
+    @builtin(position) clip: vec4<f32>,\n\
+    @location(0) color: vec3<f32>,\n\
+    @location(1) uv: vec2<f32>,\n\
+    }\n\
+    fn ramp(t: f32) -> vec3<f32> {\n\
+    let c0 = vec3<f32>(0.12, 0.30, 0.90);\n\
+    let c1 = vec3<f32>(0.10, 0.85, 0.85);\n\
+    let c2 = vec3<f32>(0.98, 0.92, 0.25);\n\
+    let c3 = vec3<f32>(0.95, 0.20, 0.12);\n\
+    if t < 0.333 { return mix(c0, c1, t * 3.0); }\n\
+    if t < 0.666 { return mix(c1, c2, (t - 0.333) * 3.0); }\n\
+    return mix(c2, c3, (t - 0.666) * 3.0);\n\
+    }\n\
+    @vertex\n\
+    fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> V {\n\
+    let cx = select(0.0, 1.0, vi == 1u || vi == 4u || vi == 5u);\n\
+    let cy = select(0.0, 1.0, vi == 2u || vi == 3u || vi == 5u);\n\
+    let uv = vec2<f32>(cx, cy) * 2.0 - 1.0;\n\
+    let b = pos[ii] - vec2<f32>(0.5, 0.5);\n\
+    let c = u.draw.x;\n\
+    let s = u.draw.y;\n\
+    let r = vec2<f32>(b.x * c - b.y * s, b.x * s + b.y * c);\n\
+    let q = u.misc.x;\n\
+    let k = vec2<f32>(u.draw.z * u.draw.w, u.draw.w);\n\
+    let o = (r + uv * q) * k;\n\
+    let t = clamp(length(vel[ii]) / u.misc.y, 0.0, 1.0);\n\
+    return V(vec4<f32>(o, 0.0, 1.0), ramp(t), uv);\n\
+    }\n\
+    @fragment\n\
+    fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    if dot(v.uv, v.uv) > 1.0 { discard; }\n\
+    return vec4<f32>(v.color, 1.0);\n\
+    }\n";

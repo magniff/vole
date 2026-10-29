@@ -1,0 +1,144 @@
+// The window: the chat on screen (ui.vl draws it, chat.vl makes it). Each
+// token of a reply is one frame: a Frame event generates a token and asks
+// for the next frame, so the window stays responsive between tokens. Also
+// shot(): the same screen rendered offscreen to a PPM file, for checking.
+
+use std::window::{App, Event, WindowDesc};
+use std::window::keys::KeyCode;
+use std::gpu;
+use std::gpu::{BufferUsage, Format, RawSurface, TextureUsage};
+use model::Model;
+use tok::Tok;
+use chat::Chat;
+use ui::Screen;
+
+pub fn window(net: inout Model, tk: Tok, chat: inout Chat, frames: i64, first: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("no display: use --headless");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("Qwen3.5-0.8B on the GPU, in vole", 960, 640)) {
+        Ok(w) => w,
+        Err(_) => return 1,
+    };
+    var surf = match net.inst.surface(net.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    var screen = match Screen::new(net.dev, gpa) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let sz = win.size();
+    surf.configure(net.dev, sz.w, sz.h);
+    screen.fit(sz.w, sz.h, sz.scale);
+    chat.set_status();
+    if first.len() > 0 {
+        chat.submit(&net, tk, first, false);
+    }
+    win.request_frame();
+    var drawn: i64 = 0;
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                chat.gen_one(&net, tk);
+                screen.layout(chat.log.as_slice(), chat.input.as_slice(), chat.status.as_slice());
+                let now = win.size();
+                match surf.frame() {
+                    Ok(frame) => {
+                        let target = frame.texture.view();
+                        screen.draw(net.dev, &net.queue, target, now.w, now.h);
+                        frame.present(&net.queue);
+                    }
+                    Err(_) => {}
+                }
+                drawn += 1;
+                if frames > 0 && drawn >= frames { break; }
+                if chat.generating || (frames > 0 && drawn < frames) { win.request_frame(); }
+            }
+            Ok(Event::Text(t)) => {
+                // control characters (Return, Tab) are keys, not text
+                if !chat.generating && t.len > 0 && t.bytes[0] >= 32 && t.bytes[0] != 127 {
+                    chat.input.push_str(t.bytes[0..t.len as i64]);
+                    win.request_frame();
+                }
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed {
+                    match k.code {
+                        KeyCode::Enter => {
+                            if !chat.generating && chat.input.len() > 0 {
+                                var text: Vec<u8> = Vec::new_in(gpa);
+                                text.extend_from_slice(chat.input.as_slice());
+                                chat.input = Buf::new_in(gpa);
+                                chat.submit(&net, tk, text.as_slice(), false);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if !chat.generating {
+                                chat.input = drop_char(chat.input.as_slice(), gpa);
+                            }
+                        }
+                        KeyCode::Escape => break,
+                        _ => {}
+                    }
+                    win.request_frame();
+                }
+            }
+            Ok(Event::Resize(_, s)) => {
+                surf.configure(net.dev, s.w, s.h);
+                screen.fit(s.w, s.h, s.scale);
+                win.request_frame();
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    0
+}
+
+// The text without its last character (a UTF-8 character).
+fn drop_char(s: [u8], gpa: Gpa) -> Buf {
+    var end = s.len();
+    if end > 0 {
+        end -= 1;
+        while end > 0 && s[end] & 0xC0 == 0x80 { end -= 1; }
+    }
+    var out = Buf::new_in(gpa);
+    out.push_str(s[0..end]);
+    out
+}
+
+// The chat's screen rendered offscreen (1280 x 720) and written to path as
+// a binary PPM.
+pub fn shot(net: inout Model, tk: Tok, chat: inout Chat, path: [u8], gpa: Gpa) -> i32 {
+    let w: i64 = 1280;
+    let h: i64 = 720;
+    var screen = Screen::new(net.dev, gpa).unwrap();
+    screen.fit(w, h, 1.0);
+    screen.layout(chat.log.as_slice(), chat.input.as_slice(), chat.status.as_slice());
+    let tex = net.dev.texture(w, h, Format::Bgra8Unorm,
+        TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    screen.draw(net.dev, &net.queue, tex.view(), w, h);
+    var out = net.dev.buffer(w * h * 4, BufferUsage::COPY_DST | BufferUsage::MAP_READ);
+    var enc = net.dev.encoder();
+    enc.copy_texture_to_buffer(tex, out, w * 4);
+    net.queue.submit(enc.finish());
+    let px = out.map_read(net.dev);
+    var ppm: Vec<u8> = Vec::new_in(gpa);
+    ppm.extend_from_slice(format_in(f"P6\n{w} {h}\n255\n", gpa).as_slice());
+    var i: i64 = 0;
+    while i + 3 < px.len() {
+        ppm.push(px[i + 2]);
+        ppm.push(px[i + 1]);
+        ppm.push(px[i]);
+        i += 4;
+    }
+    std::fs::write(path, ppm.as_slice()).unwrap();
+    0
+}

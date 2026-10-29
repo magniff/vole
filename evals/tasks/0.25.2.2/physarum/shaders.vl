@@ -1,0 +1,176 @@
+// physarum's WGSL. Each kernel is a module: COMMON (the uniform U and the
+// hash) plus its own bindings. The trail is two f32 grids that swap roles
+// every step; the agents deposit into `dep`, a grid of atomic u32s in
+// fixed point (SCALE units to a unit), which the diffusion pass reads and
+// clears.
+
+pub const COMMON: [u8] = "struct U {\n\
+    a: vec4<f32>,\n\
+    b: vec4<f32>,\n\
+    c: vec4<f32>,\n\
+    d: vec4<f32>,\n\
+    e: vec4<f32>,\n\
+}\n\
+@group(0) @binding(0) var<uniform> u: U;\n\
+const SCALE: f32 = 256.0;\n\
+fn hash32(x: u32) -> u32 {\n\
+    var v = x;\n\
+    v = v ^ (v >> 16u);\n\
+    v = v * 0x7feb352du;\n\
+    v = v ^ (v >> 15u);\n\
+    v = v * 0x846ca68bu;\n\
+    v = v ^ (v >> 16u);\n\
+    return v;\n\
+}\n\
+fn rnd(seed: u32) -> f32 {\n\
+    return f32(hash32(seed)) / 4294967296.0;\n\
+}\n";
+
+// a: w, h, agents, frame. b: sensor angle, sensor distance, turn, speed.
+// c: keep, diffuse, deposit. d: mouse x, mouse y, mouse mode (1 food,
+// -1 repel, 0 off), mouse radius. e: food, display gain.
+//
+// Each agent senses the trail at its left, centre and right sensors,
+// turns toward the strongest (the Jones rule), moves one step, bounces
+// off the walls, and adds its deposit to `dep`.
+pub const AGENTS: [u8] = "@group(0) @binding(1) var<storage, read> trail: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> agents: array<vec4<f32>>;\n\
+@group(0) @binding(3) var<storage, read_write> dep: array<atomic<u32>>;\n\
+fn sense(x: f32, y: f32) -> f32 {\n\
+    let cx = u32(clamp(x, 0.0, u.a.x - 1.0));\n\
+    let cy = u32(clamp(y, 0.0, u.a.y - 1.0));\n\
+    return trail[cy * u32(u.a.x) + cx];\n\
+}\n\
+@compute @workgroup_size(64)\n\
+fn move_agents(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(u.a.z)) { return; }\n\
+    let s = agents[i];\n\
+    var pos = s.xy;\n\
+    var ang = s.z;\n\
+    let base = hash32(hash32(i) + u32(u.a.w) * 747796405u);\n\
+    let sa = u.b.x;\n\
+    let sd = u.b.y;\n\
+    let turn = u.b.z;\n\
+    let speed = u.b.w;\n\
+    let fl = vec2<f32>(cos(ang - sa), sin(ang - sa)) * sd;\n\
+    let fc = vec2<f32>(cos(ang), sin(ang)) * sd;\n\
+    let fr = vec2<f32>(cos(ang + sa), sin(ang + sa)) * sd;\n\
+    let vl = sense(pos.x + fl.x, pos.y + fl.y);\n\
+    let vc = sense(pos.x + fc.x, pos.y + fc.y);\n\
+    let vr = sense(pos.x + fr.x, pos.y + fr.y);\n\
+    if (vc > vl && vc > vr) {\n\
+        // the middle is strongest: keep straight\n\
+    } else if (vc < vl && vc < vr) {\n\
+        if (rnd(base + 1u) < 0.5) { ang = ang + turn; } else { ang = ang - turn; }\n\
+    } else if (vl > vr) {\n\
+        ang = ang - turn;\n\
+    } else if (vr > vl) {\n\
+        ang = ang + turn;\n\
+    }\n\
+    ang = ang + (rnd(base + 2u) - 0.5) * 0.1 * turn;\n\
+    if (u.d.z < 0.0) {\n\
+        let away = pos - u.d.xy;\n\
+        if (length(away) < u.d.w) {\n\
+            let dir0 = vec2<f32>(cos(ang), sin(ang));\n\
+            let dir1 = normalize(mix(dir0, normalize(away + vec2<f32>(0.0001, 0.0)), 0.5));\n\
+            ang = atan2(dir1.y, dir1.x);\n\
+        }\n\
+    }\n\
+    var dir = vec2<f32>(cos(ang), sin(ang));\n\
+    pos = pos + dir * speed;\n\
+    if (pos.x < 0.0) { pos.x = -pos.x; dir.x = -dir.x; }\n\
+    if (pos.x >= u.a.x) { pos.x = 2.0 * u.a.x - pos.x; dir.x = -dir.x; }\n\
+    if (pos.y < 0.0) { pos.y = -pos.y; dir.y = -dir.y; }\n\
+    if (pos.y >= u.a.y) { pos.y = 2.0 * u.a.y - pos.y; dir.y = -dir.y; }\n\
+    ang = atan2(dir.y, dir.x);\n\
+    let cx = u32(clamp(pos.x, 0.0, u.a.x - 1.0));\n\
+    let cy = u32(clamp(pos.y, 0.0, u.a.y - 1.0));\n\
+    atomicAdd(&dep[cy * u32(u.a.x) + cx], u32(u.c.z * SCALE));\n\
+    agents[i] = vec4<f32>(pos, ang, 0.0);\n\
+}\n";
+
+// The trail's diffusion and decay, one thread a cell: the old trail's
+// clamped 3x3 mean (mass-preserving) mixed in by `diffuse`, plus this
+// step's deposits, the mouse's food, then times `keep`. Reads trail_in
+// and writes trail_out, so no cell races with its neighbours.
+pub const DIFFUSE: [u8] = "@group(0) @binding(1) var<storage, read> trail_in: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> trail_out: array<f32>;\n\
+@group(0) @binding(3) var<storage, read_write> dep: array<atomic<u32>>;\n\
+@compute @workgroup_size(8, 8)\n\
+fn diffuse(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let w = u32(u.a.x);\n\
+    let h = u32(u.a.y);\n\
+    if (id.x >= w || id.y >= h) { return; }\n\
+    let i = id.y * w + id.x;\n\
+    let add = f32(atomicLoad(&dep[i])) / SCALE;\n\
+    atomicStore(&dep[i], 0u);\n\
+    var sum = 0.0;\n\
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {\n\
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {\n\
+            let x = clamp(i32(id.x) + dx, 0, i32(w) - 1);\n\
+            let y = clamp(i32(id.y) + dy, 0, i32(h) - 1);\n\
+            sum = sum + trail_in[u32(y) * w + u32(x)];\n\
+        }\n\
+    }\n\
+    var v = mix(trail_in[i], sum / 9.0, u.c.y) + add;\n\
+    let p = vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5);\n\
+    let dd = distance(p, u.d.xy);\n\
+    if (u.d.z > 0.0 && dd < u.d.w) {\n\
+        v = v + u.e.x * (1.0 - dd / u.d.w);\n\
+    }\n\
+    trail_out[i] = v * u.c.x;\n\
+}\n";
+
+// The start: `init` scatters the agents at random, `clear` empties a
+// trail and the deposits. Two modules of this text (one per entry point).
+pub const INIT: [u8] = "@group(0) @binding(1) var<storage, read_write> trail: array<f32>;\n\
+@group(0) @binding(2) var<storage, read_write> agents: array<vec4<f32>>;\n\
+@group(0) @binding(3) var<storage, read_write> dep: array<atomic<u32>>;\n\
+@compute @workgroup_size(64)\n\
+fn init(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    let i = id.x;\n\
+    if (i >= u32(u.a.z)) { return; }\n\
+    let base = hash32(hash32(i) + 12345u);\n\
+    let x = rnd(base + 1u) * u.a.x;\n\
+    let y = rnd(base + 2u) * u.a.y;\n\
+    let ang = rnd(base + 3u) * 6.2831853;\n\
+    agents[i] = vec4<f32>(x, y, ang, 0.0);\n\
+}\n\
+@compute @workgroup_size(64)\n\
+fn clear(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if (id.x >= u32(u.a.x * u.a.y)) { return; }\n\
+    trail[id.x] = 0.0;\n\
+    atomicStore(&dep[id.x], 0u);\n\
+}\n";
+
+// The picture: a full-screen triangle, the trail through a colour ramp
+// (1 - exp(-t * gain): a trail of any size reads on the same scale).
+pub const RENDER: [u8] = "@group(0) @binding(1) var<storage, read> trail: array<f32>;\n\
+struct V {\n\
+    @builtin(position) pos: vec4<f32>,\n\
+    @location(0) uv: vec2<f32>,\n\
+}\n\
+@vertex\n\
+fn vs(@builtin(vertex_index) i: u32) -> V {\n\
+    var p = vec2<f32>(-1.0, -1.0);\n\
+    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
+    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
+    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
+}\n\
+fn ramp(t: f32) -> vec3<f32> {\n\
+    let a = vec3<f32>(0.01, 0.01, 0.04);\n\
+    let b = vec3<f32>(0.10, 0.30, 0.70);\n\
+    let c = vec3<f32>(0.95, 0.60, 0.20);\n\
+    let d = vec3<f32>(1.00, 0.97, 0.88);\n\
+    if (t < 0.33) { return mix(a, b, t / 0.33); }\n\
+    if (t < 0.66) { return mix(b, c, (t - 0.33) / 0.33); }\n\
+    return mix(c, d, clamp((t - 0.66) / 0.34, 0.0, 1.0));\n\
+}\n\
+@fragment\n\
+fn fs(v: V) -> @location(0) vec4<f32> {\n\
+    let w = u32(u.a.x);\n\
+    let c = vec2<u32>(clamp(v.uv * u.a.xy, vec2<f32>(0.0), u.a.xy - 1.0));\n\
+    let t = trail[c.y * w + c.x];\n\
+    return vec4<f32>(ramp(1.0 - exp(-t * u.e.y)), 1.0);\n\
+}\n";

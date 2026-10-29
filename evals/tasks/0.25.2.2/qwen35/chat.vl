@@ -1,0 +1,117 @@
+// The chat: the transcript (what the screen shows), one user turn at a time
+// and the reply streamed a token per call. The model keeps the conversation
+// in its caches, so a new turn feeds only its own tokens.
+
+use std::time::monotonic_now;
+use model::{Model, MAXCTX};
+use tok::Tok;
+use run::{feed, logits_of, pick, Sampler, Rng, chat_text, whole_utf8};
+
+const EOS_TEXT: i64 = 248044;
+const EOS_CHAT: i64 = 248046;
+
+pub struct Chat {
+    // "> text" lines for the user, the replies as they come
+    pub log: Buf,
+    // the line being typed
+    pub input: Buf,
+    // the status line: the last speeds, or what is running
+    pub status: Buf,
+    pub generating: bool,
+    pub made: i64,
+    pub prefill_tps: f64,
+    pub cfg: Sampler,
+    pub rng: Rng,
+    // the most tokens one reply may have
+    pub max_new: i64,
+    // the bytes of a reply's last character not yet whole
+    pending: Vec<u8>,
+    t_reply: f64,
+    gpa: Gpa,
+}
+
+impl Chat {
+    pub fn new(cfg: Sampler, gpa: Gpa) -> Chat {
+        let seed = cfg.seed;
+        Chat { log: Buf::new_in(gpa), input: Buf::new_in(gpa), status: Buf::new_in(gpa),
+            generating: false, made: 0, prefill_tps: 0.0, cfg: cfg, rng: Rng::new(seed), max_new: 1024,
+            pending: Vec::new_in(gpa), t_reply: 0.0, gpa: gpa }
+    }
+
+    // Starts a reply to the text: the turn is fed (prefill), then tokens
+    // come from gen_one until the reply ends.
+    pub fn submit(inout self, net: inout Model, tk: Tok, text: [u8], raw: bool) {
+        self.log.push_str("> ");
+        self.log.push_str(text);
+        self.log.push_str("\n");
+        var ids: Vec<i64> = Vec::new_in(self.gpa);
+        if raw {
+            ids = tk.encode(text, self.gpa);
+        } else {
+            let turn = chat_text(text, self.gpa);
+            ids = tk.encode(turn.as_slice(), self.gpa);
+        }
+        if net.pos + ids.len() + 64 > MAXCTX {
+            net.reset(self.gpa);
+            self.log.push_str("(the context is full: a new conversation)\n");
+        }
+        let t0 = monotonic_now();
+        feed(&net, ids.as_slice());
+        let dt = monotonic_now().saturating_sub(t0).as_secs_f64();
+        self.prefill_tps = if dt > 0.0 { ids.len() as f64 / dt } else { 0.0 };
+        self.made = 0;
+        self.pending = Vec::new_in(self.gpa);
+        self.generating = true;
+        self.t_reply = monotonic_now().as_secs_f64();
+        self.set_status();
+    }
+
+    // The next token of the reply: appended to the log (its whole characters),
+    // or the reply's end, which closes the turn in the cache.
+    pub fn gen_one(inout self, net: inout Model, tk: Tok) {
+        if !self.generating { return; }
+        let t = {
+            let lg = logits_of(&net);
+            pick(lg, self.cfg, &self.rng, self.gpa)
+        };
+        if t == EOS_TEXT || t == EOS_CHAT || self.made >= self.max_new || net.pos + 2 >= MAXCTX {
+            if t == EOS_TEXT || t == EOS_CHAT {
+                net.step(t, false);
+            }
+            let nl = tk.encode("\n", self.gpa);
+            for k in 0..nl.len() {
+                net.step(nl[k], false);
+            }
+            net.sync();
+            self.log.push_str("\n");
+            self.generating = false;
+            self.set_status();
+            return;
+        }
+        self.made += 1;
+        let bytes = tk.decode([t], self.gpa);
+        self.pending.extend_from_slice(bytes.as_slice());
+        let k = whole_utf8(self.pending.as_slice());
+        self.log.push_str(self.pending[0..k]);
+        var rest: Vec<u8> = Vec::new_in(self.gpa);
+        rest.extend_from_slice(self.pending[k..self.pending.len()]);
+        self.pending = rest;
+        net.step(t, true);
+        self.set_status();
+    }
+
+    // The status line: the speeds so far, or that the reply runs.
+    pub fn set_status(inout self) {
+        self.status = Buf::new_in(self.gpa);
+        let el = monotonic_now().as_secs_f64() - self.t_reply;
+        if self.generating {
+            let tps = if el > 0.0 { self.made as f64 / el } else { 0.0 };
+            self.status.push_str(format_in(f"generating: {self.made} tokens, {tps:.1} tok/s, prefill {self.prefill_tps:.0} tok/s (Esc quits)", self.gpa).as_slice());
+        } else if self.made > 0 {
+            let tps = if el > 0.0 { self.made as f64 / el } else { 0.0 };
+            self.status.push_str(format_in(f"{self.made} tokens, {tps:.1} tok/s, prefill {self.prefill_tps:.0} tok/s. Type a message and press Return.", self.gpa).as_slice());
+        } else {
+            self.status.push_str("Type a message and press Return. Esc quits.");
+        }
+    }
+}

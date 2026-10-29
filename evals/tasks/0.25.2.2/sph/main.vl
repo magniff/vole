@@ -1,0 +1,451 @@
+// sph: a 2D smoothed-particle hydrodynamics fluid of 100,000+ particles,
+// all on the GPU (std::gpu, WGSL kernels): a grid of cells built by a
+// counting sort (clear, count, prefix sum, scatter) each substep, then the
+// density, the pressure and viscosity forces, and the integration. The
+// particles are drawn in a window (std::window), coloured by speed.
+//
+//   sph                       the window: arrows tilt the box, drag (left
+//                             button) to stir, space pauses, r resets, q quits
+//   sph --headless            no window: the checks, then the numbers
+//   sph --headless --shot F   also writes the last frame as a PPM
+//   sph --frames N            the window for N frames, then its frame time
+//
+// geom.vl: the constants, the layout, the uniform's packing and the CPU
+// references; shaders.vl: the WGSL; sim.vl: the buffers and the passes.
+
+mod geom;
+mod shaders;
+mod sim;
+
+use std::{env, gpu};
+use std::cli::{Arg, Command};
+use std::gpu::{Format, RawSurface};
+use std::num::{f32_from_bits, f32_to_bits};
+use std::time::{Duration, monotonic_now};
+use std::window::{App, Button, Event, MouseAction, WindowDesc};
+use std::window::keys::{Logical, Named};
+
+use geom::{cell_of, exclusive_scan, screen_to_box, Knobs, H};
+use sim::Sim;
+
+// The window's zoom (box units to clip) and the particles' half size.
+const ZOOM: f32 = 1.84;
+const QUAD: f32 = 0.0028;
+
+fn secs(d: Duration) -> f64 {
+    d.as_secs_f64()
+}
+
+fn verdict(ok: bool) -> [u8] {
+    if ok { "ok" } else { "FAILED" }
+}
+
+// The grid, checked against the CPU on the current positions: the cell
+// counts and the cells of the particles against a histogram, the starts
+// against the exclusive prefix sum of the counts (exact), and the sorted
+// order (each particle once, cells in order, each in its cell's slots).
+// Returns the number of mismatches it found.
+fn check_grid(s: inout Sim, gpa: Gpa) -> i64 {
+    var enc = s.dev.encoder();
+    s.build_grid(&enc);
+    s.queue.submit(enc.finish());
+    let _ = s.queue.wait_idle();
+    let n = s.n;
+    let cells = s.cells;
+    let gx = s.gx;
+    let gy = s.gy;
+    let pos = gpu::f32s(s.pos.map_read(s.dev));
+    let counts = gpu::u32s(s.counts.map_read(s.dev));
+    let starts = gpu::u32s(s.starts.map_read(s.dev));
+    let cellid = gpu::u32s(s.cellid.map_read(s.dev));
+    let sorted = gpu::u32s(s.sorted.map_read(s.dev));
+    var bad_counts = 0;
+    var bad_cells = 0;
+    var hist: Vec<u32> = Vec::filled_in(cells, 0u32, gpa);
+    for i in 0..n {
+        let c = cell_of(pos[2 * i], pos[2 * i + 1], gx, gy);
+        if cellid[i] as i64 != c {
+            bad_cells += 1;
+        }
+        hist[c] += 1;
+    }
+    for c in 0..cells {
+        if counts[c] != hist[c] {
+            bad_counts += 1;
+        }
+    }
+    let want = exclusive_scan(counts[0..cells], gpa);
+    var bad_starts = 0;
+    for c in 0..cells + 1 {
+        if starts[c] != want[c] {
+            bad_starts += 1;
+        }
+    }
+    var bad_sort = 0;
+    var seen: Vec<u8> = Vec::filled_in(n, 0u8, gpa);
+    var last: u32 = 0;
+    for k in 0..n {
+        let i = sorted[k] as i64;
+        if i < 0 || i >= n {
+            bad_sort += 1;
+            continue;
+        }
+        seen[i] += 1;
+        let c = cellid[i];
+        if c < last {
+            bad_sort += 1;
+        }
+        last = c;
+        if (k as u32) < starts[c as i64] || (k as u32) >= starts[c as i64 + 1] {
+            bad_sort += 1;
+        }
+    }
+    for i in 0..n {
+        if seen[i] != 1 {
+            bad_sort += 1;
+        }
+    }
+    println(f"  cell counts and cells of the particles, against a CPU histogram: {verdict(bad_counts == 0 && bad_cells == 0)} ({bad_counts} counts, {bad_cells} cells differ)");
+    println(f"  prefix sum of {cells} counts, against the CPU's exact scan: {verdict(bad_starts == 0)} ({bad_starts} of {cells + 1} differ)");
+    println(f"  counting sort: each particle once, in cell order, in its cell's slots: {verdict(bad_sort == 0)} ({bad_sort} problems)");
+    bad_counts + bad_cells + bad_starts + bad_sort
+}
+
+// The mean density over the particles, and the share of the particles at
+// 90% of rest density or more (the bulk, not the free surface).
+fn density_stats(s: inout Sim) -> (f64, f64) {
+    let d = gpu::f32s(s.dens.map_read(s.dev));
+    var sum = 0.0;
+    var bulk = 0;
+    for i in 0..d.len() {
+        sum += d[i] as f64;
+        if d[i] >= 0.9 * geom::RHO0 {
+            bulk += 1;
+        }
+    }
+    (sum / d.len() as f64, bulk as f64 / d.len() as f64)
+}
+
+// The height of the centre of the particles, and the top speed.
+fn motion(s: inout Sim) -> (f64, f64) {
+    let pos = gpu::f32s(s.pos.map_read(s.dev));
+    var cy = 0.0;
+    for i in 0..s.n {
+        cy += pos[2 * i + 1] as f64;
+    }
+    let vel = gpu::f32s(s.vel.map_read(s.dev));
+    var vmax = 0.0;
+    for i in 0..s.n {
+        let v = (vel[2 * i] as f64).hypot(vel[2 * i + 1] as f64);
+        if v > vmax {
+            vmax = v;
+        }
+    }
+    (cy / s.n as f64, vmax)
+}
+
+// The headless run: the checks on the start block, then `steps` substeps
+// (a submission each 10), the density every 500, the escape and the
+// picture. Exit 0 when all the checks pass.
+fn headless(side: i64, steps: i64, tilt: f32, dt: f32, visc: f32, shot: [u8], gpa: Gpa) -> i32 {
+    var s = match Sim::new_in(side, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    var k = Knobs::new();
+    k.tilt = tilt;
+    k.dt = dt;
+    k.visc = visc;
+    s.set_knobs(k);
+    println(f"sph: {s.n} particles ({side} x {side}), grid {s.gx} x {s.gy} cells, h = {H}");
+    println("checks on the start block:");
+    let grid_bad = check_grid(&s, gpa);
+
+    let chunk = 10;
+    let every = 500;
+    var checks: Vec<f64> = Vec::new_in(gpa);
+    // the stepping's time: from one checkpoint's wait to the next, the
+    // checks themselves left out
+    var t_run = 0.0;
+    var done = 0;
+    var seg = monotonic_now();
+    let wall0 = monotonic_now();
+    while done < steps {
+        var enc = s.dev.encoder();
+        s.step(&enc, chunk);
+        s.queue.submit(enc.finish());
+        done += chunk;
+        if done % every == 0 {
+            let _ = s.queue.wait_idle();
+            t_run += secs(monotonic_now().saturating_sub(seg));
+            let (m, bulk) = density_stats(&s);
+            checks.push(m);
+            let (cy, vmax) = motion(&s);
+            println(f"  substep {done:6} (t = {done as f64 * k.dt as f64:.4} s): mean density {m:.2} ({m / geom::RHO0 as f64 * 100.0:.2}% of rest), bulk {bulk * 100.0:.1}%, centre height {cy:.4}, top speed {vmax:.3}");
+            seg = monotonic_now();
+        }
+    }
+    let _ = s.queue.wait_idle();
+    t_run += secs(monotonic_now().saturating_sub(seg));
+    let wall = secs(monotonic_now().saturating_sub(wall0));
+    println(f"  wall {wall * 1000.0 / done as f64:.3} ms a substep including the checks");
+    let ms = t_run * 1000.0 / done as f64;
+
+    // the particles: finite, inside the box, and the deepest penetration
+    // of a wall (as float bits, the largest is the bound: one smoothing length)
+    let pos = gpu::f32s(s.pos.map_read(s.dev));
+    var outside = 0;
+    for v in pos {
+        if !(v >= -0.01 && v <= 1.01) {
+            outside += 1;
+        }
+    }
+    let pen_bits = gpu::u32s(s.penmax.map_read(s.dev))[0];
+    let escaped = pen_bits >= f32_to_bits(H);
+    let fine = outside == 0 && !escaped;
+
+    // settling: the last two checks agree within 1%, and the mean sits at
+    // the rest density within 5%
+    var settled = false;
+    if checks.len() >= 2 {
+        let a = checks[checks.len() - 2];
+        let b = checks[checks.len() - 1];
+        let rel = (b - a).abs() / geom::RHO0 as f64;
+        let near = (b - geom::RHO0 as f64).abs() / geom::RHO0 as f64;
+        settled = rel < 0.01 && near < 0.05;
+    }
+
+    println(f"  {done} substeps, {ms:.3} ms a substep (submitted and waited for, checks left out)");
+    println(f"  particles: all inside the box and finite: {verdict(outside == 0)}; deepest wall penetration {f32_bits_to_f(pen_bits):.5} (smoothing length {H}): {verdict(!escaped)}");
+    println(f"  mean density settles: last two checks within 1%, mean within 5% of rest: {verdict(settled)}");
+    if shot.len() > 0 {
+        let img = s.snapshot_in(720, 720, gpa);
+        if std::fs::write(shot, img.as_slice()).is_err() {
+            eprintln(f"sph: cannot write {shot}");
+            return 1;
+        }
+        println(f"  picture: {shot} (720 x 720)");
+    }
+    let sort_ok = grid_bad == 0;
+    println(f"overall: grid {verdict(sort_ok)}, fluid {verdict(fine && settled)}");
+    if sort_ok && fine && settled { 0 } else { 1 }
+}
+
+// The float of some bits (for the report; the check compares the bits).
+fn f32_bits_to_f(b: u32) -> f32 {
+    f32_from_bits(b)
+}
+
+// Mouse and keys, between frames.
+struct Input {
+    left: bool,
+    tilt_left: bool,
+    tilt_right: bool,
+    x: f64,
+    y: f64,
+    tilt: f32,
+    paused: bool,
+    reset: bool,
+    quit: bool,
+}
+
+fn windowed(side: i64, frames: i64, tilt: f32, shot: [u8], gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("sph: no window server (try --headless)");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("sph", 1280, 720)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("sph: no window");
+            return 1;
+        }
+    };
+    var s = match Sim::new_in(side, gpa) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    let inst = gpu::Instance::new_in(gpa);
+    let sz = win.size();
+    var surf = match inst.surface(s.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln(f"sph: {e}");
+            return 1;
+        }
+    };
+    surf.configure(s.dev, sz.w, sz.h);
+    var inp = Input {
+        left: false, tilt_left: false, tilt_right: false, x: 0.0, y: 0.0, tilt: tilt,
+        paused: false, reset: false, quit: false,
+    };
+    var k = Knobs::new();
+    k.quad = QUAD;
+    k.zoom = ZOOM;
+    var prev = 0.0;
+    var clock = 0.0;
+    var frames_done = 0;
+    var first = 0.0;
+    var pbx: f32 = 0.5;
+    var pby: f32 = 0.5;
+    let start = monotonic_now();
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                let now = secs(monotonic_now().saturating_sub(start));
+                var dt = now - prev;
+                if frames_done == 0 || dt > 1.0 / 30.0 { dt = 1.0 / 60.0; }
+                if dt < 1.0 / 240.0 { dt = 1.0 / 240.0; }
+                prev = now;
+                if inp.reset {
+                    s.reset();
+                    inp.reset = false;
+                }
+                if inp.tilt_left { inp.tilt -= 1.2 * dt as f32; }
+                if inp.tilt_right { inp.tilt += 1.2 * dt as f32; }
+                if inp.tilt < -1.5 { inp.tilt = -1.5; }
+                if inp.tilt > 1.5 { inp.tilt = 1.5; }
+                let (bx, by) = screen_to_box(inp.x as f32, inp.y as f32, sz.w as f32,
+                    sz.h as f32, ZOOM, inp.tilt);
+                var mvx = (bx - pbx) / dt as f32;
+                var mvy = (by - pby) / dt as f32;
+                let sp = (mvx * mvx + mvy * mvy).sqrt();
+                if sp > 3.0 {
+                    mvx = mvx * 3.0 / sp;
+                    mvy = mvy * 3.0 / sp;
+                }
+                pbx = bx;
+                pby = by;
+                k.tilt = inp.tilt;
+                k.stir_on = inp.left && !inp.paused;
+                k.mx = bx;
+                k.my = by;
+                k.mvx = mvx;
+                k.mvy = mvy;
+                k.aspect = sz.h as f32 / sz.w as f32;
+                s.set_knobs(k);
+                if !inp.paused { clock += dt; }
+                var enc = s.dev.encoder();
+                if !inp.paused { s.step(&enc, 20); }
+                match surf.frame() {
+                    Ok(f) => {
+                        s.draw(&enc, f.texture.view());
+                        s.queue.submit(enc.finish());
+                        f.present(&s.queue);
+                    }
+                    Err(_) => {
+                        s.queue.submit(enc.finish());
+                    }
+                }
+                frames_done += 1;
+                if frames_done == 1 { first = now; }
+                if frames > 0 && frames_done >= frames {
+                    let mean = (now - first) * 1000.0 / (frames_done - 1) as f64;
+                    println(f"sph: {s.n} particles, {frames_done} frames, {mean:.2} ms a frame ({1000.0 / mean:.1} fps)");
+                    if shot.len() > 0 {
+                        let img = s.snapshot_in(sz.w, sz.h, gpa);
+                        if std::fs::write(shot, img.as_slice()).is_err() {
+                            eprintln(f"sph: cannot write {shot}");
+                        }
+                    }
+                    break;
+                }
+                if inp.quit { break; }
+                win.request_frame();
+            }
+            Ok(Event::Mouse(m)) => {
+                inp.x = m.x;
+                inp.y = m.y;
+                match m.action {
+                    MouseAction::Press => {
+                        if m.button == Button::Left { inp.left = true; }
+                    }
+                    MouseAction::Release => {
+                        if m.button == Button::Left { inp.left = false; }
+                    }
+                    MouseAction::Move => {}
+                }
+            }
+            Ok(Event::Key(kev)) => {
+                match kev.key {
+                    Logical::Named(Named::ArrowLeft) => inp.tilt_left = kev.pressed,
+                    Logical::Named(Named::ArrowRight) => inp.tilt_right = kev.pressed,
+                    Logical::Named(Named::Escape) => inp.quit = kev.pressed,
+                    Logical::Char(c) => {
+                        if kev.pressed && !kev.repeat {
+                            if c == ' ' as u32 { inp.paused = !inp.paused; }
+                            if c == 'r' as u32 { inp.reset = true; }
+                            if c == 'q' as u32 { inp.quit = true; }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Resize(_, z)) => surf.configure(s.dev, z.w, z.h),
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        if inp.quit { break; }
+    }
+    let _ = s.queue.wait_idle();
+    0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("sph", gpa)
+        .about("2D SPH fluid on the GPU: a window to tilt and stir, or the headless checks")
+        .arg(Arg::flag("headless").help("no window: the checks and the numbers"))
+        .arg(Arg::option("side").value_name("N").default("320")
+            .help("the start block is N x N particles (320: 102,400)"))
+        .arg(Arg::option("steps").value_name("N").default("6000")
+            .help("headless: substeps (each 5e-5 s of the fluid)"))
+        .arg(Arg::option("dt").value_name("SECONDS").default("0.00005")
+            .help("headless: the substep"))
+        .arg(Arg::option("visc").value_name("NU").default("0.02")
+            .help("the kinematic viscosity"))
+        .arg(Arg::option("tilt").value_name("DEG").default("0")
+            .help("the box's tilt, degrees counter-clockwise"))
+        .arg(Arg::option("frames").value_name("N").default("0")
+            .help("window: quit after N frames and print the mean frame time"))
+        .arg(Arg::option("shot").value_name("FILE.ppm")
+            .help("headless: the picture as PPM; window: with --frames, the last frame"));
+    let m = cli.parse_or_exit(env::args());
+    let side = parse_int(m.get("side").unwrap_or("320")).unwrap_or(0);
+    let steps = parse_int(m.get("steps").unwrap_or("6000")).unwrap_or(0);
+    let frames = parse_int(m.get("frames").unwrap_or("0")).unwrap_or(0);
+    let deg = match std::num::parse_f64(m.get("tilt").unwrap_or("0")) {
+        Ok(x) => x,
+        Err(_) => {
+            eprintln("sph: --tilt takes a number of degrees");
+            return 2;
+        }
+    };
+    let tilt = (deg * 3.14159265 / 180.0) as f32;
+    let dt = match std::num::parse_f64(m.get("dt").unwrap_or("0.00005")) {
+        Ok(x) => x as f32,
+        Err(_) => 0.00005,
+    };
+    let visc = match std::num::parse_f64(m.get("visc").unwrap_or("0.02")) {
+        Ok(x) => x as f32,
+        Err(_) => 0.02,
+    };
+    if side < 8 || side > 1000 || steps < 10 {
+        eprintln("sph: --side 8..1000, --steps 10 or more");
+        return 2;
+    }
+    if m.flag("headless") {
+        return headless(side, steps, tilt, dt, visc, m.get("shot").unwrap_or(""), gpa);
+    }
+    windowed(side, frames, tilt, m.get("shot").unwrap_or(""), gpa)
+}

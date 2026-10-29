@@ -1,0 +1,171 @@
+// The WGSL of the terrain. The constants N, NC and CHUNK repeat
+// terrain.vl's SAMPLES, NC and CHUNK: change both together.
+//
+// NOISE: fractal value noise, seven octaves, written into the height
+// buffer (one f32 a sample, row by row).
+// SCENE: the chunks (vs, and vs_shadow for the sun's depth pass, built
+// from the step of each chunk), the lit and fogged terrain (fs), and the
+// sea (vw, fw). Vertices are not stored: a vertex is a grid sample, its
+// height read from the buffer and its normal from the neighbours.
+
+pub const NOISE: [u8] = "struct NP { n: f32, seed: f32, cell: f32, amp: f32, }\n\
+@group(0) @binding(0) var<uniform> np: NP;\n\
+@group(0) @binding(1) var<storage, read_write> heights: array<f32>;\n\
+fn hash(p: vec2<u32>, s: u32) -> f32 {\n\
+var h = s ^ (p.x * 0x27d4eb2du) ^ (p.y * 0x165667b1u);\n\
+h = h ^ (h >> 15u);\n\
+h = h * 0x2c1b3c6du;\n\
+h = h ^ (h >> 12u);\n\
+h = h * 0x297a2d39u;\n\
+h = h ^ (h >> 15u);\n\
+return f32(h) / 4294967295.0;\n\
+}\n\
+fn vnoise(p: vec2<f32>, s: u32) -> f32 {\n\
+let i = vec2<u32>(floor(p));\n\
+let f = fract(p);\n\
+let w = f * f * (3.0 - 2.0 * f);\n\
+let a = hash(i, s);\n\
+let b = hash(i + vec2<u32>(1u, 0u), s);\n\
+let c = hash(i + vec2<u32>(0u, 1u), s);\n\
+let d = hash(i + vec2<u32>(1u, 1u), s);\n\
+return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);\n\
+}\n\
+fn fbm(p0: vec2<f32>, s: u32) -> f32 {\n\
+var p = p0;\n\
+var amp = 0.5;\n\
+var sum = 0.0;\n\
+var norm = 0.0;\n\
+for (var o = 0u; o < 7u; o = o + 1u) {\n\
+sum = sum + amp * vnoise(p, s + o * 101u);\n\
+norm = norm + amp;\n\
+amp = amp * 0.5;\n\
+p = p * 2.03 + vec2<f32>(17.1, 9.2);\n\
+}\n\
+return sum / norm;\n\
+}\n\
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+let n = u32(np.n);\n\
+if (id.x >= n || id.y >= n) { return; }\n\
+let p = vec2<f32>(f32(id.x), f32(id.y)) * (4.0 / (np.n - 1.0));\n\
+let base = fbm(p, u32(np.seed));\n\
+heights[id.y * n + id.x] = np.amp * (pow(base, 1.6) - 0.32);\n\
+}";
+
+pub const SCENE: [u8] = "struct U {\n\
+view_proj: mat4x4<f32>,\n\
+sun_vp: mat4x4<f32>,\n\
+eye: vec4<f32>,\n\
+sun: vec4<f32>,\n\
+fog: vec4<f32>,\n\
+params: vec4<f32>,\n\
+}\n\
+@group(0) @binding(0) var<uniform> u: U;\n\
+@group(0) @binding(1) var<storage, read> heights: array<f32>;\n\
+@group(0) @binding(2) var<storage, read> steps: array<u32>;\n\
+@group(0) @binding(3) var shadow: texture_depth_2d;\n\
+const N: u32 = 513u;\n\
+const NC: u32 = 16u;\n\
+const CHUNK: u32 = 32u;\n\
+fn height_at(gx: u32, gy: u32) -> f32 {\n\
+return heights[min(gy, N - 1u) * N + min(gx, N - 1u)];\n\
+}\n\
+fn world_at(g: u32) -> f32 {\n\
+return (f32(g) - f32(N - 1u) * 0.5) * u.params.x;\n\
+}\n\
+fn corner(vi: u32, chunk: u32) -> vec3<u32> {\n\
+let s = steps[chunk];\n\
+let n = CHUNK / s;\n\
+let x0 = (chunk % NC) * CHUNK;\n\
+let y0 = (chunk / NC) * CHUNK;\n\
+let q = vi / 6u;\n\
+let c = vi % 6u;\n\
+let bx = select(0u, 1u, c == 1u || c == 3u || c == 4u);\n\
+let dy = select(0u, 1u, c == 2u || c == 4u || c == 5u);\n\
+if (q < n * n) {\n\
+return vec3<u32>(x0 + (q % n + bx) * s, y0 + (q / n + dy) * s, 0u);\n\
+}\n\
+let k = q - n * n;\n\
+let along = (k % n + bx) * s;\n\
+let e = k / n;\n\
+if (e == 0u) { return vec3<u32>(x0 + along, y0, dy); }\n\
+if (e == 1u) { return vec3<u32>(x0 + along, y0 + CHUNK, dy); }\n\
+if (e == 2u) { return vec3<u32>(x0, y0 + along, dy); }\n\
+return vec3<u32>(x0 + CHUNK, y0 + along, dy);\n\
+}\n\
+fn ground(g: vec3<u32>) -> vec3<f32> {\n\
+let drop = select(0.0, u.params.y, g.z == 1u);\n\
+return vec3<f32>(world_at(g.x), height_at(g.x, g.y) - drop, world_at(g.y));\n\
+}\n\
+fn normal_at(gx: u32, gy: u32) -> vec3<f32> {\n\
+let xl = max(gx, 1u) - 1u;\n\
+let xr = min(gx + 1u, N - 1u);\n\
+let yd = max(gy, 1u) - 1u;\n\
+let yu = min(gy + 1u, N - 1u);\n\
+let dx = (height_at(xr, gy) - height_at(xl, gy)) / (f32(xr - xl) * u.params.x);\n\
+let dz = (height_at(gx, yu) - height_at(gx, yd)) / (f32(yu - yd) * u.params.x);\n\
+return normalize(vec3<f32>(-dx, 1.0, -dz));\n\
+}\n\
+struct VOut {\n\
+@builtin(position) pos: vec4<f32>,\n\
+@location(0) world: vec3<f32>,\n\
+@location(1) normal: vec3<f32>,\n\
+}\n\
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) chunk: u32) -> VOut {\n\
+let g = corner(vi, chunk);\n\
+let p = ground(g);\n\
+return VOut(u.view_proj * vec4<f32>(p, 1.0), p, normal_at(g.x, g.y));\n\
+}\n\
+@vertex fn vs_shadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) chunk: u32) -> @builtin(position) vec4<f32> {\n\
+return u.sun_vp * vec4<f32>(ground(corner(vi, chunk)), 1.0);\n\
+}\n\
+fn shadow_at(p: vec3<f32>, n: vec3<f32>) -> f32 {\n\
+let q = u.sun_vp * vec4<f32>(p + n * 1.5, 1.0);\n\
+let ndc = q.xyz / q.w;\n\
+if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z > 1.0) { return 1.0; }\n\
+let dims = vec2<i32>(textureDimensions(shadow));\n\
+let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);\n\
+let c = vec2<i32>(uv * vec2<f32>(dims));\n\
+var lit = 0.0;\n\
+for (var j = -1; j <= 1; j = j + 1) {\n\
+for (var i = -1; i <= 1; i = i + 1) {\n\
+let t = clamp(c + vec2<i32>(i, j), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));\n\
+if (ndc.z - 0.002 <= textureLoad(shadow, t, 0)) { lit = lit + 1.0; }\n\
+}\n\
+}\n\
+return lit / 9.0;\n\
+}\n\
+fn fog(col: vec3<f32>, world: vec3<f32>) -> vec3<f32> {\n\
+let f = 1.0 - exp(-u.fog.w * distance(world, u.eye.xyz));\n\
+return mix(col, u.fog.rgb, clamp(f, 0.0, 1.0));\n\
+}\n\
+@fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+let n = normalize(v.normal);\n\
+let slope = 1.0 - n.y;\n\
+let h = v.world.y;\n\
+var albedo = mix(vec3<f32>(0.20, 0.36, 0.11), vec3<f32>(0.40, 0.36, 0.31), smoothstep(0.08, 0.26, slope));\n\
+albedo = mix(albedo, vec3<f32>(0.78, 0.72, 0.52), 1.0 - smoothstep(2.0, 6.0, h));\n\
+albedo = mix(albedo, vec3<f32>(0.94, 0.95, 0.98), smoothstep(55.0, 80.0, h) * smoothstep(0.5, 0.75, n.y));\n\
+let ndl = max(dot(n, u.sun.xyz), 0.0);\n\
+let lit = shadow_at(v.world, n) * ndl;\n\
+let sky = vec3<f32>(0.42, 0.58, 0.82) * 0.30;\n\
+return vec4<f32>(fog(albedo * (sky + vec3<f32>(1.0, 0.94, 0.82) * lit), v.world), 1.0);\n\
+}\n\
+@vertex fn vw(@builtin(vertex_index) vi: u32) -> VOut {\n\
+let c = vi % 6u;\n\
+let bx = select(0.0, 1.0, c == 1u || c == 3u || c == 4u);\n\
+let bz = select(0.0, 1.0, c == 2u || c == 4u || c == 5u);\n\
+let p = vec3<f32>(mix(-2000.0, 2000.0, bx), u.params.z, mix(-2000.0, 2000.0, bz));\n\
+return VOut(u.view_proj * vec4<f32>(p, 1.0), p, vec3<f32>(0.0, 1.0, 0.0));\n\
+}\n\
+@fragment fn fw(v: VOut) -> @location(0) vec4<f32> {\n\
+let t = u.params.w;\n\
+let wx = 0.03 * sin(v.world.x * 0.05 + t * 1.3) + 0.02 * sin(v.world.z * 0.09 - t * 0.9);\n\
+let wz = 0.03 * cos(v.world.z * 0.04 + t * 1.1) + 0.02 * sin(v.world.x * 0.07 + t * 0.7);\n\
+let n = normalize(vec3<f32>(wx, 1.0, wz));\n\
+let view = normalize(u.eye.xyz - v.world);\n\
+let fres = pow(1.0 - max(dot(view, n), 0.0), 5.0);\n\
+var col = mix(vec3<f32>(0.03, 0.16, 0.22), vec3<f32>(0.55, 0.70, 0.88), 0.08 + 0.7 * fres);\n\
+let half_v = normalize(u.sun.xyz + view);\n\
+col = col + vec3<f32>(1.0, 0.95, 0.8) * pow(max(dot(n, half_v), 0.0), 180.0);\n\
+return vec4<f32>(fog(col, v.world), 1.0);\n\
+}";

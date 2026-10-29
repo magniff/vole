@@ -1,0 +1,419 @@
+// The ocean: a Phillips spectrum made once on the CPU, its time evolution
+// and the inverse FFT on the GPU every frame (Tessendorf's method), and
+// the picture of the displaced water. The CPU side of the numbers (the
+// spectrum, the direct sums the GPU is checked against) is here too.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Color, Compare, Format, Load, PassDesc, RenderDesc, TextureUsage};
+use std::num::f32_to_bits;
+
+use shaders::{FFT_STAGE, RENDER, SPECTRUM};
+
+pub const PI: f64 = 3.141592653589793;
+pub const GRAV: f64 = 9.81;
+
+// The fields the FFT transforms together, in the order the render reads them.
+pub const FIELDS: i64 = 5;
+
+// A small generator (LCG, Box-Muller): the same numbers every run.
+pub struct Rng {
+    pub s: u32,
+}
+
+impl Rng {
+    pub fn new(seed: u32) -> Rng {
+        Rng { s: seed }
+    }
+
+    // A uniform number in (0, 1].
+    pub fn uniform(inout self) -> f64 {
+        self.s = self.s * 1664525 + 1013904223;
+        (((self.s >> 8) + 1) as f64) / 16777216.0
+    }
+
+    // Two independent standard normal numbers.
+    pub fn normal(inout self) -> (f64, f64) {
+        let u1 = self.uniform();
+        let u2 = self.uniform();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let a = 2.0 * PI * u2;
+        (r * a.cos(), r * a.sin())
+    }
+}
+
+// The wave number of index i of an n-point grid over `length` metres:
+// 2 pi m / length with m = i, or i - n for the upper half.
+pub fn wave_number(i: i64, n: i64, length: f64) -> f64 {
+    let m = if i >= n / 2 { i - n } else { i };
+    2.0 * PI * m as f64 / length
+}
+
+// The Phillips spectrum's weight of wave vector (kx, kz) for a wind of
+// `wind` m/s along the unit vector (wx, wz):
+// P(k) = exp(-1 / (k L)^2) / k^4 * (k_hat . w)^2, with L = V^2 / g.
+pub fn phillips(kx: f64, kz: f64, wind: f64, wx: f64, wz: f64) -> f64 {
+    let k2 = kx * kx + kz * kz;
+    if k2 == 0.0 {
+        return 0.0;
+    }
+    let k = k2.sqrt();
+    let lw = wind * wind / GRAV;
+    let c = (kx * wx + kz * wz) / k;
+    (-1.0 / ((k * lw) * (k * lw))).exp() / (k2 * k2) * c * c
+}
+
+// The spectrum's weights P(k) (texel z * n + x), scaled so that the modes'
+// variance, sum 2 P(k) = sig^2, is the height field's mean square: the
+// waves' height is then sig (the standard deviation) by construction.
+pub fn weights(n: i64, length: f64, wind: f64, wx: f64, wz: f64, sig: f64, gpa: Gpa) -> Vec<f64> {
+    var w: Vec<f64> = Vec::filled_in(n * n, 0.0, gpa);
+    var sum = 0.0;
+    for z in 0..n {
+        for x in 0..n {
+            let p = phillips(wave_number(x, n, length), wave_number(z, n, length), wind, wx, wz);
+            w[z * n + x] = p;
+            sum += p;
+        }
+    }
+    let scale = if sum > 0.0 { sig * sig / (2.0 * sum) } else { 0.0 };
+    for i in 0..n * n {
+        w[i] = w[i] * scale;
+    }
+    w
+}
+
+// h0(k) = sqrt(P(k) / 2) (a + i b) with a, b standard normal: the
+// random amplitudes of the spectrum at time zero, as interleaved (re, im).
+pub fn initial(n: i64, length: f64, wind: f64, wx: f64, wz: f64, sig: f64, seed: u32,
+    gpa: Gpa) -> Vec<f32> {
+    let w = weights(n, length, wind, wx, wz, sig, gpa);
+    var rng = Rng::new(seed);
+    var h: Vec<f32> = Vec::filled_in(2 * n * n, 0.0, gpa);
+    for i in 0..n * n {
+        let (a, b) = rng.normal();
+        let s = (w[i] / 2.0).sqrt();
+        h[2 * i] = (s * a) as f32;
+        h[2 * i + 1] = (s * b) as f32;
+    }
+    h
+}
+
+// The spectrum H(k, t) of the time evolution, as the spectrum kernel
+// computes it on the GPU (interleaved re, im, texel z * n + x):
+// H = h0(k) e^{i w t} + conj(h0(-k)) e^{-i w t}, w = sqrt(g k).
+pub fn coeffs_at(h0: [f32], n: i64, length: f64, t: f64, gpa: Gpa) -> Vec<f64> {
+    var out: Vec<f64> = Vec::filled_in(2 * n * n, 0.0, gpa);
+    for z in 0..n {
+        for x in 0..n {
+            let i = z * n + x;
+            let nidx = ((n - z) % n) * n + (n - x) % n;
+            let kx = wave_number(x, n, length);
+            let kz = wave_number(z, n, length);
+            let k = (kx * kx + kz * kz).sqrt();
+            let ph = (GRAV * k).sqrt() * t;
+            let c = ph.cos();
+            let s = ph.sin();
+            let ar = h0[2 * i] as f64;
+            let ai = h0[2 * i + 1] as f64;
+            let br = h0[2 * nidx] as f64;
+            let bi = -(h0[2 * nidx + 1] as f64);
+            out[2 * i] = ar * c - ai * s + br * c + bi * s;
+            out[2 * i + 1] = ar * s + ai * c + bi * c - br * s;
+        }
+    }
+    out
+}
+
+// The height (deriv 0) or its slope dh/dx (deriv 3) at texel (x, z) by the
+// direct sum over all modes of the coefficients `coef` (from coeffs_at):
+// the reference the GPU's inverse FFT is checked against.
+pub fn direct(coef: [f64], n: i64, length: f64, x: i64, z: i64, deriv: i64) -> f64 {
+    var sum = 0.0;
+    for q in 0..n {
+        for p in 0..n {
+            let i = q * n + p;
+            let phase = 2.0 * PI * ((p * x + q * z) % n) as f64 / n as f64;
+            let (c, s) = (phase.cos(), phase.sin());
+            // H e^{i phase}
+            let hr = coef[2 * i];
+            let hi = coef[2 * i + 1];
+            var zr = hr * c - hi * s;
+            var zi = hr * s + hi * c;
+            if deriv == 3 {
+                // multiply by i kx: (zr + i zi) i kx = -zi kx + i zr kx
+                let kx = wave_number(p, n, length);
+                let t = zr;
+                zr = -zi * kx;
+                zi = t * kx;
+            }
+            sum += zr;
+        }
+    }
+    sum
+}
+
+// The mean square of the height field: sum over modes of |H|^2 (Parseval).
+pub fn spectral_energy(coef: [f64]) -> f64 {
+    var e = 0.0;
+    for i in 0..coef.len() / 2 {
+        e += coef[2 * i] * coef[2 * i] + coef[2 * i + 1] * coef[2 * i + 1];
+    }
+    e
+}
+
+// The camera: a position and a view (yaw, pitch, radians; yaw pi looks
+// down -z, the start).
+pub struct Camera {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f64,
+    pub pitch: f64,
+}
+
+impl Camera {
+    pub fn start() -> Camera {
+        Camera { x: 0.0, y: 4.0, z: 30.0, yaw: PI, pitch: -0.12 }
+    }
+
+    pub fn forward(self) -> (f64, f64, f64) {
+        let cp = self.pitch.cos();
+        (self.yaw.sin() * cp, self.pitch.sin(), self.yaw.cos() * cp)
+    }
+
+    // The uniform's 28 floats: eye, forward, right, up, sun, lens, grid.
+    pub fn words(self, w: i64, h: i64, n: i64, length: f64, lambda: f64, time: f64) -> [f32; 28] {
+        let (fx, fy, fz) = self.forward();
+        let hl = (fx * fx + fz * fz).sqrt();
+        let (rx, rz) = if hl > 0.0 { (-fz / hl, fx / hl) } else { (1.0, 0.0) };
+        // up = right x forward
+        let ux = -rz * fy;
+        let uy = rz * fx - rx * fz;
+        let uz = rx * fy;
+        let sl = (0.45 * 0.45 + 0.30 * 0.30 + 0.84 * 0.84).sqrt();
+        let th = (PI / 6.0).tan();
+        let aspect = w as f64 / h as f64;
+        var out: [f32; 28] = [0.0; 28];
+        let vals: [f64; 28] = [
+            self.x, self.y, self.z, 0.0, fx, fy, fz, 0.0, rx, 0.0, rz, 0.0, ux, uy, uz, 0.0,
+            0.45 / sl, 0.30 / sl, -0.84 / sl, 0.0, th, aspect, 0.5, 2000.0,
+            n as f64, length / n as f64, lambda, time,
+        ];
+        for i in 0..28 {
+            out[i] = vals[i] as f32;
+        }
+        out
+    }
+
+    // Move by (f, s, u) metres along the view's forward, right and up
+    // (forward is horizontal: the walk), and turn by (dy, dp) radians.
+    pub fn move_by(inout self, f: f64, s: f64, u: f64) {
+        let (fx, _, fz) = self.forward();
+        let hl = (fx * fx + fz * fz).sqrt();
+        if hl > 0.0 {
+            self.x += fx / hl * f + (-fz / hl) * s;
+            self.z += fz / hl * f + (fx / hl) * s;
+        }
+        self.y += u;
+    }
+}
+
+// The GPU side: the spectrum's buffers and pipelines, the FFT, the lens.
+pub struct Ocean {
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pub n: i64,
+    pub length: f64,
+    pub lambda: f64,
+    // the spectrum at time zero, as the CPU made it
+    pub h0: Vec<f32>,
+    pub fft: Fft,
+    spec_u: gpu::Buffer,
+    h0_buf: gpu::Buffer,
+    cam: gpu::Buffer,
+    k_spec: gpu::ComputePipeline,
+    g_spec: gpu::BindGroup,
+    sky: gpu::RenderPipeline,
+    water: gpu::RenderPipeline,
+    g_sky: gpu::BindGroup,
+    g_water: gpu::BindGroup,
+}
+
+// The inverse 2D FFT of `count` fields of n x n complex texels: 2 log2 n
+// Stockham stages (rows, then columns), ping-ponging between a and b. The
+// input and the output are in a (2 log2 n stages: an even count).
+pub struct Fft {
+    pub n: i64,
+    pub count: i64,
+    pub a: gpu::Buffer,
+    pub b: gpu::Buffer,
+    pipe: gpu::ComputePipeline,
+    ubufs: Vec<gpu::Buffer>,
+    groups: Vec<gpu::BindGroup>,
+    stages: i64,
+    half_groups: i64,
+}
+
+impl Fft {
+    // n a power of two.
+    pub fn new_in(dev: gpu::Device, n: i64, count: i64, gpa: Gpa) -> Result<Fft, gpu::Error> {
+        var log2 = 0;
+        while (1 << log2) < n {
+            log2 += 1;
+        }
+        let bytes = count * n * n * 8;
+        let a = dev.buffer(bytes,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ);
+        let b = dev.buffer(bytes,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::MAP_READ);
+        let shader = dev.shader_wgsl(FFT_STAGE)?;
+        let pipe = dev.compute_pipeline(shader, "stage")?;
+        var ubufs: Vec<gpu::Buffer> = Vec::new_in(gpa);
+        var groups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+        let stages = 2 * log2;
+        let sign = f32_to_bits(1.0);
+        for pass in 0..2 {
+            for s in 0..log2 {
+                // rows: lines are rows, stride 1; columns: lines are columns
+                let (line_step, stride) = if pass == 0 { (n, 1) } else { (1, n) };
+                let words: [u32; 8] = [n as u32, (1 << s) as u32, stride as u32,
+                    line_step as u32, sign, count as u32, 0, 0];
+                let u = dev.buffer_init(gpu::bytes_of_u32(words[..]), BufferUsage::UNIFORM);
+                let g0 = dev.bind_group(pipe.bind_layout(0),
+                    [gpu::bind(0, u), gpu::bind(1, a), gpu::bind(2, b)][..]);
+                let g1 = dev.bind_group(pipe.bind_layout(0),
+                    [gpu::bind(0, u), gpu::bind(1, b), gpu::bind(2, a)][..]);
+                ubufs.push(u);
+                groups.push(g0);
+                groups.push(g1);
+            }
+        }
+        Ok(Fft {
+            n: n, count: count, a: a, b: b, pipe: pipe, ubufs: ubufs, groups: groups,
+            stages: stages, half_groups: (n / 2 + 7) / 8,
+        })
+    }
+
+    // The transform, recorded into the pass: input in a, output in a.
+    pub fn transform(self, pass: inout gpu::ComputePass) {
+        for t in 0..self.stages {
+            pass.set_pipeline(self.pipe);
+            // stage t reads a when t is even (group 2t), b when odd (2t + 1)
+            pass.set_bind_group(0, self.groups[2 * t + t % 2]);
+            pass.dispatch(self.half_groups, (self.n + 7) / 8, self.count);
+        }
+    }
+}
+
+impl Ocean {
+    // An n x n grid over `length` metres, a wind of `wind` m/s and waves of
+    // standard deviation `sig` metres; drawn into targets of `format`.
+    pub fn new_in(n: i64, length: f64, wind: f64, sig: f64, format: Format, gpa: Gpa) ->
+        Result<Ocean, gpu::Error> {
+        let inst = gpu::Instance::new_in(gpa);
+        let (dev, queue) = inst.adapter()?.device()?;
+        let h0 = initial(n, length, wind, 0.8, 0.6, sig, 1234567, gpa);
+        let fft = Fft::new_in(dev, n, FIELDS, gpa)?;
+        let h0_buf = dev.buffer_init(gpu::bytes_of_f32(h0.as_slice()), BufferUsage::STORAGE);
+        let spec_u = dev.buffer(16, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let cam = dev.buffer(112, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let k_spec = dev.compute_pipeline(dev.shader_wgsl(SPECTRUM)?, "spectrum")?;
+        let g_spec = dev.bind_group(k_spec.bind_layout(0),
+            [gpu::bind(0, spec_u), gpu::bind(1, h0_buf), gpu::bind(2, fft.a)][..]);
+        let shader = dev.shader_wgsl(RENDER)?;
+        let sky = dev.render_pipeline(RenderDesc::new(shader, "sky_vs", "sky_fs", format))?;
+        var wdesc = RenderDesc::new(shader, "vs", "fs", format);
+        wdesc.depth(Format::Depth32Float, Compare::Less, true);
+        let water = dev.render_pipeline(wdesc)?;
+        let g_sky = dev.bind_group(sky.bind_layout(0), [gpu::bind(0, cam)][..]);
+        let g_water = dev.bind_group(water.bind_layout(0),
+            [gpu::bind(0, cam), gpu::bind(1, fft.a)][..]);
+        Ok(Ocean {
+            dev: dev, queue: queue, n: n, length: length, lambda: 1.0, h0: h0, fft: fft,
+            spec_u: spec_u, h0_buf: h0_buf, cam: cam, k_spec: k_spec, g_spec: g_spec,
+            sky: sky, water: water, g_sky: g_sky, g_water: g_water,
+        })
+    }
+
+    // The time of the next step (written in queue order).
+    pub fn set_time(inout self, t: f64) {
+        let words: [u32; 4] = [self.n as u32, f32_to_bits(self.length as f32),
+            f32_to_bits(t as f32), 0];
+        self.queue.write_buffer(self.spec_u, 0, gpu::bytes_of_u32(words[..]));
+    }
+
+    // The camera for the next frame, on a w x h target.
+    pub fn set_camera(inout self, c: Camera, w: i64, h: i64, t: f64) {
+        let words = c.words(w, h, self.n, self.length, self.lambda, t);
+        self.queue.write_buffer(self.cam, 0, gpu::bytes_of_f32(words[..]));
+    }
+
+    // The spectrum at the set time, and its inverse FFT, recorded into enc:
+    // the five fields are in fft.a afterwards.
+    pub fn step(inout self, enc: inout gpu::Encoder) {
+        let n = self.n;
+        let k = self.k_spec;
+        let g = self.g_spec;
+        enc.compute_pass(|pass| {
+            pass.set_pipeline(k);
+            pass.set_bind_group(0, g);
+            pass.dispatch((n + 7) / 8, (n + 7) / 8);
+            self.fft.transform(&pass);
+        });
+    }
+
+    // Evolve to time t and wait for the GPU (headless use).
+    pub fn evolve(inout self, t: f64) {
+        self.set_time(t);
+        var enc = self.dev.encoder();
+        self.step(&enc);
+        self.queue.submit(enc.finish());
+        let _ = self.queue.wait_idle();
+    }
+
+    // The picture into the color target and the depth target (both the
+    // size of the set camera's target): the sky, then the water mesh.
+    pub fn draw(self, enc: inout gpu::Encoder, color: gpu::TextureView, depth: gpu::TextureView) {
+        let sky = self.sky;
+        let gs = self.g_sky;
+        enc.render_pass(PassDesc::color(color), |pass| {
+            pass.set_pipeline(sky);
+            pass.set_bind_group(0, gs);
+            pass.draw(0..3, 0..1);
+        });
+        let water = self.water;
+        let gw = self.g_water;
+        let quads = (self.n - 1) * (self.n - 1);
+        enc.render_pass(PassDesc::color(color, Color::black(), Load::Keep).with_depth(depth),
+            |pass| {
+                pass.set_pipeline(water);
+                pass.set_bind_group(0, gw);
+                pass.draw(0..6 * quads, 0..1);
+            });
+    }
+
+    // The picture of the current state as a binary PPM of w x h pixels.
+    pub fn snapshot_in(inout self, w: i64, h: i64, gpa: Gpa) -> Buf {
+        let tex = self.dev.texture(w, h, Format::Bgra8Unorm,
+            usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+        let depth = self.dev.texture(w, h, Format::Depth32Float,
+            usage: TextureUsage::RENDER_ATTACHMENT);
+        let stride = (w * 4 + 255) / 256 * 256;
+        var out = self.dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+        var enc = self.dev.encoder();
+        self.draw(&enc, tex.view(), depth.view());
+        enc.copy_texture_to_buffer(tex, out, stride);
+        self.queue.submit(enc.finish());
+        let px = out.map_read(self.dev);
+        var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * stride + x * 4;
+                b.push(px[i + 2]);
+                b.push(px[i + 1]);
+                b.push(px[i]);
+            }
+        }
+        b
+    }
+}
