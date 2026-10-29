@@ -375,6 +375,12 @@ the change: 32,760 compilations, 7,401 of them differing only in the
 compiler's own path in `try:` lines (each compared again with OLD's path
 replaced: 0 differ).
 
+The other checks: `tools/premerge.sh`: `premerge: ok`;
+`tests/affected.sh`: plan 2584 of 2765 cases, -O0 3511 passed and 70
+xfail, -O2 1138 passed and 38 xfail, abi and fuzz pass; `bootstrap/gate.sh
+--only compile-cost`: hello 80.2 M 0.98x, std 1020.3 M 1.00x, check
+4057.7 M 1.00x against 0.25.3.
+
 **The pilot** (a different shape: one idiom, one module, the migration's
 mechanics): tools/fixunsafe.vl's IntVecs (a static, five locals, four
 parameters) as `Vec<i64, Comp>`, by
