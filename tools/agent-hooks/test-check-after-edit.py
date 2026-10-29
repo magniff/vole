@@ -53,6 +53,21 @@ def diag(file, line, msg, sev="error", code="type error", help=()):
             "message": msg, "help": list(help), "notes": [], "try": []}
 
 
+# (0.25.4) Which Writes make a new file the hook formats: a `create` of a
+# .vl outside compiler/src and compiler/std.
+def wrote(path, kind="create", tool="Write"):
+    return {"tool_name": tool, "tool_response": {"type": kind, "filePath": path}}
+
+
+case("new file: a create", hook.new_file_written(wrote("/w/ex/ui.vl"), "/w/ex/ui.vl"), True)
+case("new file: an update is not", hook.new_file_written(wrote("/w/ex/ui.vl", "update"), "/w/ex/ui.vl"), False)
+case("new file: an Edit is not", hook.new_file_written(wrote("/w/ex/ui.vl", tool="Edit"), "/w/ex/ui.vl"), False)
+case("new file: compiler/src is not",
+     hook.new_file_written(wrote("/w/compiler/src/x.vl"), "/w/compiler/src/x.vl"), False)
+case("new file: compiler/std is not",
+     hook.new_file_written(wrote("/w/compiler/std/x.vl"), "/w/compiler/std/x.vl"), False)
+case("new file: not a .vl", hook.new_file_written(wrote("/w/ex/a.wgsl"), "/w/ex/a.wgsl"), False)
+
 # The recogniser: volec by name, copy, variable.
 case("calls: plain", [c[0] for c in tc.calls("volec query show f; volec main.vl -o p")],
      ["query", "build"])
@@ -589,6 +604,32 @@ try:
         del os.environ["VOLE_HOOK_FMT"]
         subprocess.run([real, "fmt", "main.vl"], cwd=prog, capture_output=True)
         case("real: formatted, silent", run(ev2, real, fst)[1], "")
+        # (0.25.4) A new file the agent wrote (a Write whose result is a
+        # `create`) is formatted by the hook, its changes named; an
+        # existing one (`update`) gets the note only, as before.
+        newer = "fn main() {\n    let   z  =  3;\n    println(f\"{z}\");\n}\n"
+        write(os.path.join(prog, "main.vl"), newer)
+        wev = {"hook_event_name": "PostToolUse", "tool_name": "Write", "cwd": prog,
+               "tool_input": {"file_path": os.path.join(prog, "main.vl"), "content": newer},
+               "tool_response": {"type": "create", "filePath": os.path.join(prog, "main.vl")}}
+        got = ctx_of(run(wev, real)[1])
+        with open(os.path.join(prog, "main.vl")) as fh:
+            now = fh.read()
+        case("real: a new file, formatted and named", (got, "let z = 3;" in now),
+             (f"{real} fmt main.vl, run by the hook on the new file (layout only; volec undo takes it back):\n"
+              "changed main.vl:2: let   z  =  3; -> let z = 3;\n"
+              "the hook rewrote main.vl: the change above, nothing else (read it again before an Edit)", True))
+        write(os.path.join(prog, "main.vl"), newer)
+        uev = dict(wev, tool_response={"type": "update", "filePath": os.path.join(prog, "main.vl")})
+        got = ctx_of(run(uev, real)[1])
+        with open(os.path.join(prog, "main.vl")) as fh:
+            now = fh.read()
+        case("real: an overwritten file, the note only", (got.startswith("main.vl is not formatted: "), now == newer),
+             (True, True))
+        os.environ["VOLE_HOOK_FMT"] = "0"
+        case("real: a new file, VOLE_HOOK_FMT=0: as it was", (run(wev, real)[1], open(os.path.join(prog, "main.vl")).read()),
+             ("", newer))
+        del os.environ["VOLE_HOOK_FMT"]
         # (0.25.3) The hook's rewrites are its fixes' changes, each named:
         # the file differs from what was written by those lines alone (an
         # unformatted line stays as it was; the hook formats nothing).

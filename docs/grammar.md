@@ -1330,6 +1330,12 @@ type no expected type gives takes the type of what stands beside it:
 - an array literal: the type of its first element that is not such a
   literal (`[0, 1, b[2]]` is a `[u8; 3]`).
 
+(0.25.4) An array literal of such literals (nested too, `[[0.5, 1.0],
+[0.0, 0.0]]`) is one in each of these places, where the other side is
+an array: `if down { ACCENT } else { [0.2, 0.5, 0.7, 1.0] }` with
+`ACCENT: [f32; 4]` is a `[f32; 4]`, so is a match arm beside it and an
+element of `[[0.1, 0.2, 0.3, 1.0], ACCENT]`.
+
 Where nothing gives a type the rules are as before: `i64` (`f64`). The
 literal must fit (`if c { 300 } else { b[0] }` is an error). Binary
 operators, ranges, arguments and annotated `let`s already gave their
