@@ -81,6 +81,8 @@ bodies.
 | each local's kind, moves and views there (0.17) | `volec query own main.vl:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `volec query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | a module's items, with signatures | `volec query items MODULE`; every module: `query items` |
+| only some of them, briefly (0.25.3) | `query items std --find clamp` (a word of the name: `f64::clamp`, `i64::clamp`), `--kind fn,method`; `--names`: kinds and paths only |
+| a type, then its methods | `volec query show TYPE` (each method's signature; `query items TYPE`: contracts whole) |
 | a module's `use` lines, header comment | `volec query show MODULE::use` (`::header`) |
 | lines of any file | `volec query text FILE:A-B` |
 | a word in code, comments or strings (a shader's WGSL); in every program under a directory | `volec query grep WORD` (`--strings`, `--in FILE`); `query grep WORD --in examples/gpu` |

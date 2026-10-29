@@ -8,6 +8,8 @@ pub struct Color {
     pub r: f64,
     pub g: f64,
 }
+// 1 method (with their lines and whole contracts: query items crate::paint::types::Color)
+pub fn grey(v: f64) -> Color
 note query.reexport: paint::Color is crate::paint::types::Color, which crate::paint re-exports (`pub use`)
 $ show paint::Color::grey
 // crate::paint::types::Color::grey	reexport0252/paint/types.vl:8-10	effects: none

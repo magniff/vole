@@ -1,5 +1,10 @@
 # Float math (0.25.2.1), and integers' (0.25.2.2)
 
+Before writing a numeric helper, try `volec query items std --find
+NAME`: `--find clamp` lists `f64::clamp`, `i64::clamp` and the rest,
+`--find PI` the constants (`f64::consts::PI`); `--names` gives a line
+each.
+
 f32 and f64 have Rust's methods: `x.sqrt()`, `x.sin()`, `y.atan2(x)`,
 `x.powi(2)`, `a.max(b)`, with no `use` (they are std::math's trait
 `Float`, found as any trait's methods are). They are vole, not C: no

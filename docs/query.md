@@ -25,7 +25,7 @@ volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the in
 volec query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
-volec query items [MODULE|TYPE...] [--root ROOT] [--comments]
+volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
 volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
@@ -116,7 +116,8 @@ tools` the ones a program needs.
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
-| what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE` |
+| what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
+| only some items; a line each (0.25.3) | `target/volec query items std --find clamp` (WORD at a word's start of the name; any case when lowercase), `--kind fn,method`; `--names` |
 | the item at a compiler error's position | `target/volec query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/volec query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/volec edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
@@ -144,7 +145,7 @@ tools` the ones a program needs.
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/volec check` |
-| build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
+| build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/volec fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/volec fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |

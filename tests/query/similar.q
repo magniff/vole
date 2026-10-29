@@ -37,6 +37,9 @@ $ similar Square::perimeter Square
 pub struct Circle {
     pub r: i64,
 }
+// 2 methods (with their lines and whole contracts: query items crate::shapes::Circle)
+pub fn diameter(self) -> i64
+pub fn double_diameter(self) -> i64
 $ similar nothing_like_it
 error query.no-match: no definition 'nothing_like_it'
 try: volec query items
