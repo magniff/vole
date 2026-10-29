@@ -2657,12 +2657,14 @@ object is unknown):
 1. **A let parameter's Vec header does not change during the call.** A
    let parameter of an owned type is a `&T` to the optimizer, lent
    read-only for the call; no store reaches the ptr, len and cap of a
-   std Vec in its referent, reached through std's sealed structs (a
-   String's or a Buf's bytes; `vec_header_in` with `sealed`). Not
-   through other structs: a let method of a Mutex writes the value
-   inside through a raw pointer, and so may any struct's own unsafe
-   code; std's sealed structs never write their fields from a let
-   method. Only for a parameter the function never writes through nor
+   std Vec in its referent, reached through std's wrappers of a Vec
+   (`String`, `Buf`, `PathBuf`, `BinaryHeap`, `MinHeap`: sealed, their
+   fields changed by inout methods only; `vec_header_in` with
+   `wrappers`, `vec_wrapper`). Not through other structs, sealed ones
+   either: a let method of a Mutex (sealed since 0.25.4) writes the
+   value inside through a raw pointer, and so may any struct's own
+   unsafe code (the case `opt_vecfacts_let_raw`'s `locked`). A new
+   wrapper of a Vec in std joins the list in `init_vec_facts`. Only for a parameter the function never writes through nor
    passes on (`param_written`: `&v as *Vec<T>` is accepted in unsafe
    code, and the function may push through it), and under the own
    pass's error mode (`noalias_active`). Calls were covered already

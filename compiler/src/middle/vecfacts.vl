@@ -9,10 +9,11 @@
 //    referent of a let parameter (`v: Vec<T>`, a `&T` to the optimizer) is
 //    lent read-only for the call (the law of exclusivity): no store
 //    reaches the ptr, len and cap of a std Vec in it, reached from the
-//    parameter through std's sealed structs (a String's or a Buf's bytes).
-//    Not through other structs: a let method of a Mutex writes the value
-//    inside through a raw pointer (std::sync), and so may any struct's
-//    own unsafe code; std's sealed structs never do. Only when the
+//    parameter through std's wrappers of a Vec (String, Buf, PathBuf,
+//    BinaryHeap, MinHeap: sealed, changed by inout methods only). Not
+//    through other structs, sealed ones either: a let method of a Mutex
+//    writes the value inside through a raw pointer (std::sync), and so may
+//    any struct's own unsafe code. Only when the
 //    function never writes through the parameter itself or passes it on
 //    (param_written: `&v as *Vec<T>` is accepted in unsafe code) and the
 //    own pass ran in error mode (noalias_active). Calls were covered
@@ -30,7 +31,6 @@
 // lent let while the call runs, through a raw pointer either; it makes no
 // address of a Vec's header from its buffer's pointer.
 use crate::base::intern_c;
-use crate::front::ast::STRUCT_SEALED;
 use crate::front::modules::within_std;
 use crate::front::types::{
     FIELDS, STATICS, STRUCTS, STRUCT_COUNT, SYM_STATIC, TYPES, TY_U64, TyKind, fn_param, type_size,
@@ -47,42 +47,63 @@ use crate::middle::ir::Op::{Add, GAddr, Load, Param, Slot};
 // when there is none (no std, or before init_vec_facts): the facts off.
 static var VEC_TMPL: i64 = 0;
 
-// Finds std's Vec (before the tasks run: middle::parallel, prepare_tasks).
+// The templates (index + 1) of std's wrappers of a Vec: vec_wrapper.
+static var WRAPS: [i64; 5] = [0; 5];
+
+// Finds std's Vec and its wrappers (before the tasks run:
+// middle::parallel, prepare_tasks).
 pub fn init_vec_facts() {
     VEC_TMPL = 0;
-    let name = intern_c(c"Vec");
-    // UNSAFE: STRUCTS, the checker's raw table of structs.
-    // SAFETY: read only, s below STRUCT_COUNT; on the main thread, before
-    // the optimizer's threads start.
+    let vec = intern_c(c"Vec");
+    let names = [
+        intern_c(c"String"), intern_c(c"Buf"), intern_c(c"PathBuf"), intern_c(c"BinaryHeap"),
+        intern_c(c"MinHeap"),
+    ];
+    // UNSAFE: STRUCTS, the checker's raw table of structs, and WRAPS, a
+    // static the optimizer's threads only read.
+    // SAFETY: s below STRUCT_COUNT, k below WRAPS' length; on the main
+    // thread, before the optimizer's threads start.
     unsafe {
+        for k in 0..5 {
+            WRAPS[k] = 0;
+        }
         for s in 0..STRUCT_COUNT {
-            if STRUCTS[s].generic != 0 && STRUCTS[s].tmpl == 0 && STRUCTS[s].name == name
-                && within_std(STRUCTS[s].module) {
+            if STRUCTS[s].tmpl != 0 || !within_std(STRUCTS[s].module) {
+                continue;
+            }
+            if STRUCTS[s].name == vec && STRUCTS[s].generic != 0 {
                 VEC_TMPL = s + 1;
-                return;
+            }
+            for k in 0..5 {
+                if STRUCTS[s].name == names[k] {
+                    WRAPS[k] = s + 1;
+                }
             }
         }
     }
 }
 
-// Whether struct s (an instance) is one of std's sealed structs.
-fn sealed_std(s: i64) -> bool {
-    // UNSAFE: the checker's tables (STRUCTS, FIELDS, TYPES, STATICS: raw
-    // statics) and the IR's, reached through the raw *FnCtx.
-    // SAFETY: read only; every index is a type, struct, static or value id
-    // the checker or the IR made, in its table; the tables do not change
-    // while the optimizer runs (prepare_tasks laid every type out).
+// Whether struct s (an instance) is one of std's wrappers of a Vec
+// (String, Buf, PathBuf, BinaryHeap, MinHeap): sealed, every change
+// through an inout method. Not every sealed std struct: a Mutex (sealed
+// in 0.25.4) changes its value from a let method, through a raw pointer.
+fn vec_wrapper(s: i64) -> bool {
+    // UNSAFE: STRUCTS, the checker's raw table of structs, and WRAPS.
+    // SAFETY: read only; s is a struct id the checker made; neither table
+    // changes while the optimizer runs.
     unsafe {
-        let t = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
-        (STRUCTS[t].repr & STRUCT_SEALED) != 0 && within_std(STRUCTS[t].module)
+        // (an instance's template; a struct with no parameters is its own)
+        let t = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl } else { s + 1 };
+        WRAPS[0] != 0
+            && (t == WRAPS[0] || t == WRAPS[1] || t == WRAPS[2] || t == WRAPS[3] || t == WRAPS[4])
     }
 }
 
 // Where [offset, + size) of a value of type t lies in the header (ptr,
 // len, cap) of a std Vec inside it, through struct fields and array
-// elements (`sealed`: through std's sealed structs only): the header's
+// elements (`wrappers`: through std's wrappers of a Vec only): the header's
 // offset in t + 1, or 0.
-fn vec_header_in(t0: i64, offset: i64, size: i64, sealed: bool) -> i64 {
+fn vec_header_in(t0: i64, offset: i64, size: i64, wrappers: bool) -> i64 {
     var t = t0;
     var off = offset;
     var at = 0;
@@ -103,7 +124,7 @@ fn vec_header_in(t0: i64, offset: i64, size: i64, sealed: bool) -> i64 {
                     let end = FIELDS[STRUCTS[s].fields + 2].offset + 8;
                     return if off + size <= end { at + 1 } else { 0 };
                 }
-                if sealed && !sealed_std(s) {
+                if wrappers && !vec_wrapper(s) {
                     return 0;
                 }
                 var next = 0;
@@ -118,7 +139,7 @@ fn vec_header_in(t0: i64, offset: i64, size: i64, sealed: bool) -> i64 {
                     }
                 }
                 t = next;
-            } else if kind == TyKind::Array && !sealed {
+            } else if kind == TyKind::Array && !wrappers {
                 let elem = TYPES[t].a;
                 let es = type_size(elem);
                 if es <= 0 {
