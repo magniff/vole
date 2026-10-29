@@ -80,6 +80,7 @@ bodies.
 | who calls a function; what it calls | `volec query callers NAME`; `query callees FN` (`--transitive`) |
 | each local's kind, moves and views there (0.17) | `volec query own main.vl:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `volec query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
+| every unsafe site: what it does, its class, its `UNSAFE:`/`SAFETY:` comments (0.25.3) | `volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
 | a module's items, with signatures | `volec query items MODULE`; every module: `query items` |
 | only some of them, briefly (0.25.3) | `query items std --find clamp` (a word of the name: `f64::clamp`, `i64::clamp`), `--kind fn,method`; `--names`: kinds and paths only |
 | a type, then its methods | `volec query show TYPE` (each method's signature; `query items TYPE`: contracts whole) |

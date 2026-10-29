@@ -64,6 +64,9 @@
 # voltty-fuzz (tests/voltty/run.sh -s 60: the terminal's core against
 # alacritty_terminal, 60 s of the differential fuzzer, 0.23; skipped
 # without cargo);
+# unsafe-audit (tests/unsafe_audit.sh, 0.25.3: the unsafe sites of
+# compiler/src and std without // UNSAFE: and // SAFETY:, `volec query
+# unsafe`, no more than docs/unsafe-baseline.md counts; --quick too);
 # compile-cost (tests/compile_cost.sh: the instructions of a hello world,
 # a std-heavy program and `check` of compiler/src against the previous
 # release's, 0.21.1: fails above 1.5x, 1.5x and 1.15x);
@@ -228,7 +231,7 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed fuzz-sem"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost unsafe-audit"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
 # rebuild compilers rather than test one
 RELEASE_STEPS="chain-diverse chain-fresh"
@@ -245,7 +248,7 @@ OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
-        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost"
+        STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost unsafe-audit"
         [ $LINUX -eq 1 ] && STEPS="$SMOKE_STEPS $STEPS" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
@@ -596,6 +599,8 @@ run_step() {
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
         threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
+        # (0.25.3) the unsafe sites without justification, against the baseline
+        unsafe-audit) sh "$ROOT/tests/unsafe_audit.sh" -c "$C" ;;
         voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
@@ -938,8 +943,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*|smoke-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed%s\n", $2, $3, $4, ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*|unsafe-audit)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh|unsafe-audit):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         # (no rows: it failed before the container's steps, e.g. docker)
