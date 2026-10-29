@@ -94,6 +94,13 @@ defined:
 - it makes no second live alias of a place under an inout access (the
   optimizer relies on an `inout` parameter being the only way to its
   memory);
+- (0.25.4) it changes nothing lent let while the call runs, through a
+  raw pointer either: the optimizer keeps a let parameter's Vec header
+  (its pointer, length and capacity) from before a loop, so a push to
+  the caller's Vec through a pointer kept in a static may go unseen;
+- it makes no pointer into a Vec's header from the Vec's own buffer
+  pointer, nor puts a Vec inside its own buffer (the optimizer takes a
+  store to an element as never reaching that Vec's header);
 - a type whose safe methods manage memory through raw pointers (a
   growable buffer of its own) implements `Drop`: that makes it owned and
   move-only, so a copy cannot outlive a reallocation.
