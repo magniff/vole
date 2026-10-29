@@ -19,7 +19,12 @@ seed (Rust)  ──builds──▶  0.1.0  ──builds──▶  next release  
   of `v0.1.0` also holds the seed, so that one tag has everything.
 - **Each release is built by the previous one**, and checked: it must reach
   the fixpoint (compiled by itself, it emits exactly what its first build
-  emits) and pass its own test suite.
+  emits) and pass its own test suite. (0.25.3) A tag cannot change, so a
+  case of its own that cannot pass where the chain runs it is listed in its
+  release's `known_failures` (releases.toml), with why; the suite then
+  passes only when it fails exactly so, and the chain's summary says it
+  (0.25.2.2: one hooks case, which takes the cache's `target/` path for a
+  scratch copy).
 
 `bootstrap/releases.toml` lists the seed's tag and the releases in order,
 with the tag, where the compiler's source is, what builds it, how its
