@@ -81,6 +81,10 @@ against 849, hook blocks 5 against 53) and what it found.
   since 0.24; tools/sinksweep/argsweep.py adds `requires` callees and
   arguments through a call or a struct literal: 13,440 cases (3,619 of
   the new ones wrong on 0.25.2.1).
+- **`volec fix` crashed** (a bus error, now and then) on a name std
+  re-exports (`use std::I64_MIN`): it read the entry before its table
+  for an item std's root has no key for. tests/refactor/fixstdpath.t
+  runs it under guard malloc, where 0.25.2.1 crashes every time.
 - **std::gpu**:
   - a pipeline's layout is the bindings its own entry points use, through
     the functions they call (WebGPU's `layout: "auto"`); it was every
@@ -114,6 +118,10 @@ against 849, hook blocks 5 against 53) and what it found.
   rewrote, checks `sed -i`/`perl -pi`/Python writes of a `.vl`, and notes
   an unformatted file; a blocked compound line comes with the line
   without its blocked part; reads of up to 200 lines of any `.vl` run.
+  A trait impl's method is named by its type's path in `query` and
+  hovers (`<crate::more::Meters as From>::from`). `bootstrap.sh`
+  replaces `target/volec` by a rename: a copy over a binary a test still
+  ran made macOS kill every later run of it (`Killed: 9`).
 - **The guide**: `guide gpu-render` (the render sections, with a textured
   quad), buffer sizes and limits, one compute pass for many dispatches,
   atomics need read_write, the reserved names, uniforms before their

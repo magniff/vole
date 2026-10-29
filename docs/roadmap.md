@@ -2623,3 +2623,25 @@ clean, fuzz-sem with `--try-args` (300 ok), examples-checkalloc 176,
 every fuzz and ABI row on both systems, chain-fresh 29 releases.
 compile-cost against v0.25.2: a hello world 1.01x, std 1.01x, check of
 the compiler 1.00x.
+
+### 0.25.2.2
+
+The release gate (`gate.sh --release --no-x86`, 54:29 wall), on the
+merge of the `fix` crash's fix. A first gate, on the commit before it,
+was stopped: its suite rows failed two cases, `suggested` (the crash
+itself, `volec fix` reading `SYM_FN[-1]` for a name std re-exports, a
+bus error when nothing was mapped before the table; under guard malloc
+0.25.2.1 crashes every time, tests/refactor/fixstdpath.t runs it so) and
+lsp/resolve (not a flake, as recorded before: query now names a trait
+impl's method by its type's path, `<crate::more::Meters as From>::from`,
+and the transcript was updated). On the merge every row passed but one:
+linux-aarch64/fuzz-loops stalled (no process of it ran, started or ended
+for 600 s with no slot free) and gave no verdict. Rerun alone in the
+container (`aarch64-linux-check.sh --worktree --dev --compiler ... --only
+fuzz-loops --fuzz=300`): 300 programs, 0 failing. The suite 4191 at -O0
+and -O2, 4190 at -O1 (85 XFAIL; 1 SKIP without spirv-val), aarch64-linux
+3627 at -O0 and -O2, threads 8248, incremental 172 series, objcheck 5252
+(macOS) and 5220 (aarch64-linux), compiler-memcheck 643, valgrind 321
+clean, examples-checkalloc 176, fuzz-sem 300 ok, every other fuzz and
+ABI row on both systems, chain-fresh 30 releases. compile-cost against
+v0.25.2.1: a hello world 0.99x, std 1.01x, check of the compiler 1.01x.
