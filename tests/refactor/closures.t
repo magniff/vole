@@ -31,7 +31,7 @@ $ rewrite 'apply($f, $x)' '$f($x)' --dry-run
 -    }, 2);
 +    })(2);
 main.vl:21:16: error[type error] cannot infer the type of closure parameter 'y' | help: write its type: '|y: i64| ...'  [edited: crate::main]
-warning edit.breaks: 1 new error (dry run)
+warning edit.breaks: 1 new error (dry run); the error: main.vl:21:16: cannot infer the type of closure parameter 'y'
 [exit 1]
 $ rewrite 'apply(|y| $b, $x)' 'apply(|y| $b + 0, $x)' --dry-run
 --- a/main.vl

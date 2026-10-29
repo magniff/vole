@@ -22,7 +22,7 @@ $ refactor signature bump --type k 'inout i64' --dry-run
 -    bump(&a, 2);
 +    bump(&a, &2);
 main.vl:16:14: error[conv.place] '&' lends a place for the callee to change; '2' is a temporary, whose change would be lost | help: name it first, then lend it: 'var t = VALUE;' and '&t'  [edited: crate::main]
-warning edit.breaks: 1 new error (dry run)
+warning edit.breaks: 1 new error (dry run); the error: main.vl:16:14: '&' lends a place for the callee to change; '2' is a temporary, whose change would be lost
 [exit 1]
 $ refactor signature eat --convention v lent
 error refactor.usage: --convention takes a parameter and let, inout or sink
