@@ -9,6 +9,7 @@ FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
   + line 2: b
   + line 3: c
 FAIL crash: exit 3 (expected 0)
+  stdout: line 1: a
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
   trace: main.vl:12 main
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)

@@ -5,8 +5,10 @@ $ test --timeout 1
 test main.vl: 1 passed, 2 failed (3 cases; -O0 and -O2 agree)
 FAIL crash: exit 101 (expected 0): stats.vl:44:13: index out of bounds: index 0, length 0
   trace: stats.vl:44 stats::best < main.vl:25 main
+  stdout: a best 7
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
   trace: stats.vl:56 stats::bar < main.vl:28 main
+  stdout: a best 3
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 ## A program built with --trace (at -O1 at least); without it, a failure's
