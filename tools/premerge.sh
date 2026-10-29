@@ -48,6 +48,13 @@ row() { printf '  %-7s %-5s %s\n' "$1" "$2" "$3"; [ "$2" = FAIL ] && FAILED=1; }
 CHANGED=$(git diff --name-only "$BASE"...HEAD; git diff --name-only HEAD)
 CHANGED=$(printf '%s\n' "$CHANGED" | sort -u | while read -r f; do [ -n "$f" ] && [ -e "$f" ] && echo "$f"; done)
 
+# (0.25.3) A branch that changes the compiler checks and formats its
+# programs with its own build, target/volec: they may use what it adds
+# (a new literal, a new std item) that the last tested build does not read.
+if [ -x target/volec ] && printf '%s\n' "$CHANGED" | grep -q '^compiler/src/\|^compiler/std/'; then
+    VOLEC=$PWD/target/volec
+fi
+
 echo "premerge: $(git rev-parse --abbrev-ref HEAD) against $BASE"
 
 # base
