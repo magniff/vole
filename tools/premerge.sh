@@ -10,7 +10,9 @@
 #   check    every program the change touches checks with no error and no warning
 #            (but unsafe.unjustified: legacy sites are the baseline's, and new
 #            ones the unsafe row's)
-#   std      compiler/src/front/stdsrc.vl is what compiler/std/embed.sh makes of std
+#   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
+#            makes of the committed std (0.25.3: made by the commit hook and the
+#            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
 #   layout   every tests/examples case names a SOURCE that exists
 #
 # One line per check (PASS, FAIL or SKIP and why), the details after;
@@ -109,21 +111,22 @@ else
     if [ -s "$TMP/check" ]; then row check FAIL "errors or warnings in the touched programs"; else row check PASS "$n program(s) check clean"; fi
 fi
 
-# std: the embedded std is up to date
-if printf '%s\n' "$CHANGED" | grep -q '^compiler/std/'; then
-    if ! git diff --quiet HEAD -- compiler/src/front/stdsrc.vl; then
-        row std SKIP "stdsrc.vl has uncommitted changes"
+# std: the embedded std is up to date, as committed (0.25.3: made from
+# HEAD's compiler/std in a copy, so the work tree is left as it is)
+setup=""
+[ -n "$(git config merge.stdsrc.driver)" ] || setup="; the stdsrc merge driver is not set up: tools/git-hooks/setup.sh"
+if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc\.vl$'; then
+    mkdir -p "$TMP/std/compiler/src/front"
+    git archive HEAD compiler/std | tar -xf - -C "$TMP/std"
+    if ! sh "$TMP/std/compiler/std/embed.sh" > "$TMP/std.out" 2>&1; then
+        row std FAIL "compiler/std/embed.sh failed: $(head -1 "$TMP/std.out")"
+    elif git show HEAD:compiler/src/front/stdsrc.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc.vl"; then
+        row std PASS "the committed stdsrc.vl matches compiler/std$setup"
     else
-        sh compiler/std/embed.sh > /dev/null 2>&1
-        if git diff --quiet -- compiler/src/front/stdsrc.vl; then
-            row std PASS "stdsrc.vl matches compiler/std"
-        else
-            git checkout -q -- compiler/src/front/stdsrc.vl
-            row std FAIL "stdsrc.vl is stale: run compiler/std/embed.sh and commit it"
-        fi
+        row std FAIL "the committed stdsrc.vl is stale: compiler/std/embed.sh, then commit it$setup"
     fi
 else
-    row std SKIP "compiler/std unchanged"
+    row std SKIP "compiler/std unchanged$setup"
 fi
 
 # layout: tests/examples cases name sources that exist

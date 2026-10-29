@@ -578,10 +578,12 @@ run_step() {
         # 0.25.2: as many again with --assign-calls (owned
         # assignments whose right side is a call, lending temporaries);
         # 0.25.2.1: and with --try-args (arguments that may return, `?`
-        # or a match's arm, in calls whose result is `?`'d)
+        # or a match's arm, in calls whose result is `?`'d); 0.25.3: and
+        # with --closure-params (closures taking a T by value)
         fuzz-sem) python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" \
             && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --assign-calls \
-            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args ;;
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --try-args \
+            && python3 "$ROOT/tools/semfuzz/semfuzz.py" -c "$C" -n "$SFZ" -f 1 -k "$k" --closure-params ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

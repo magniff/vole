@@ -16,8 +16,10 @@
 # (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
 # and tests/runner/run.sh (the runner's own pieces, 0.25.2) and
 # tests/embed/run.sh (text blocks in a CRLF file, the caches and embedded
-# files, 0.25.3) and tests/cachediff/run.sh --sample (the tools' answers
-# from their cache the same as without it, 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# files, 0.25.3) and tests/stdpos/run.sh (std's positions in the
+# transcripts, compared normalized, 0.25.3) and tests/cachediff/run.sh
+# --sample (the tools' answers from their cache the same as without it,
+# 0.25.3). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [-f FILE] [-l] [FILTER...]
 #
@@ -253,7 +255,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -917,6 +919,11 @@ esac
 case $(want embed-checks) in
     y) sh "$ROOT/tests/embed/run.sh" -c "$COMPILER" >"$WORK/embed-checks.out" 2>&1 & ;;
 esac
+# (0.25.3) std's positions in the transcripts, compared normalized: a std
+# change moves none of them (tests/stdpos/run.sh): category "stdpos".
+case $(want stdpos) in
+    y) sh "$ROOT/tests/stdpos/run.sh" -c "$COMPILER" >"$WORK/stdpos.out" 2>&1 & ;;
+esac
 # (0.25.3) The tools' answers from their cache the same as without it, on
 # a sample of the transcripts (tests/cachediff/run.sh --sample; all of
 # them: the gate's cachediff step): category "cachediff".
@@ -1104,6 +1111,25 @@ case $(want embed-checks) in
             { echo "FAIL embed-checks: tests/embed/run.sh reported nothing:"; sed 's/^/    /' "$WORK/embed-checks.out" | head -20; echo; } >>"$FAILURES"
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/embed-checks.out" >>"$FAILURES"
+        ;;
+esac
+
+# std's positions in the transcripts (0.25.3, run above); category
+# "stdpos".
+case $(want stdpos) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "stdpos pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "stdpos fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/stdpos.out"
+        if ! grep -q '^pass' "$WORK/stdpos.out"; then
+            echo "stdpos fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL stdpos: tests/stdpos/run.sh reported nothing:"; sed 's/^/    /' "$WORK/stdpos.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/stdpos.out" >>"$FAILURES"
         ;;
 esac
 

@@ -1,5 +1,7 @@
 ## Editing std by name in the vole repository (0.17): this copy is
 ## one (compiler/std/ with its embed.sh), with a small std.
+## exact-std: its std is the fixture's own small one, and its point is
+## positions in std's files (an edit by FILE:LINE, the errors' lines).
 % mkdir -p compiler/src/front && cp $T/../../compiler/std/embed.sh $T/../../compiler/std/index.awk compiler/std/
 ## A std item is edited in its file, with the edited std checked.
 $ edit insert --after std::trim --dry-run < $T/inputs/strip_prefix.vl

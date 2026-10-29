@@ -625,6 +625,19 @@ if [ $STOPPED -eq 0 ]; then
         head_tree="$head_dir/tree"
         extract "$head_commit" "$head_tree"
     fi
+    # (0.25.3) std's embedded text, compiler/src/front/stdsrc.vl, is a
+    # product of the build: made from compiler/std before HEAD's compile
+    # (a release's tree is built with the file its tag holds). In the work
+    # tree a stale one is replaced, and said: commit it (the commit hook
+    # and the merge driver keep it current, tools/git-hooks/setup.sh).
+    if [ -f "$head_tree/compiler/std/embed.sh" ] && ! sh "$head_tree/compiler/std/embed.sh" -c >/dev/null 2>&1; then
+        sh "$head_tree/compiler/std/embed.sh" || die "compiler/std/embed.sh failed in $head_tree"
+        if [ $WORKTREE -eq 1 ]; then
+            note "compiler/src/front/stdsrc.vl was stale: made again from compiler/std (commit it)"
+        else
+            note "HEAD's compiler/src/front/stdsrc.vl is stale: built with it made again from compiler/std"
+        fi
+    fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
         "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS" "$HEAD_BIN" "$HEAD_EXT"
     if [ $NO_SUITE -eq 1 ]; then

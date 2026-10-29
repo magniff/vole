@@ -298,6 +298,28 @@ refactor --script
 main.vl --fix-unsafe --dry-run
 edit insert report --in report --after x
 edit insert report --after
+check --overlay a
+check --overlay a b c
+fix --overlay a
+refactor signature report --rename-param items
+refactor field Item.name --rename
+rewrite --subst a
+rewrite --subst a b c d
+query grep -x
+query grep '-> i64'
+query refs report --bogus=3
+query refs report -- --x
+query refs report --in -x
+edit patch report --old a --new b --bogus
+edit --dry-run patch report
+probe main.vl:2 x -- -y --z
+main.vl --stats=bogus
+main.vl -framework
+main.vl --overlay main.vl
+-lnosuchlibb main.vl -L /nonexistent -lnosuchliba -o p --verbose
+main.vl -lnosuchlibb -L/nonexist -lnosuchliba -o p --verbose
+query items -C target-cpu=native
+batch --bogus x
 """.strip().split("\n")
 
 
@@ -359,8 +381,10 @@ def run(binary, prog, lines, timeout):
                 code = p.returncode
             except subprocess.TimeoutExpired:
                 o, e, code = "", "", "timeout"
+            # (the copy's path, and as probe names its directory: `/` as `-`)
             norm = lambda s: s.replace(binary, "VOLEC").replace(work, "WORK").replace(
-                os.path.realpath(work), "WORK")
+                os.path.realpath(work), "WORK").replace(
+                os.path.realpath(work).lstrip("/").replace("/", "-"), "WORK")
             res.append((norm(o), norm(e), code))
         return res
     finally:

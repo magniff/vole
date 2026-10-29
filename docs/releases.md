@@ -225,6 +225,47 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   their summary line); an agent's own `volec fmt` gets the lines it
   changed (from `volec query diff`, at most 5). The hook itself formats
   nothing.
+- **A std change no longer breaks unrelated transcripts**: the query,
+  refactor, walkthrough and book runners compare std's positions
+  normalized (tests/stdpos.awk): `<std>:LINE:COL` and
+  `compiler/std/FILE.vl:LINE:COL` as `L:C`, the rows under a `# <std>`
+  header, a std module's item count (`std::gpu<TAB><std><TAB>N`) and a
+  std item's `refs --count`. A program's own positions compare exactly,
+  and so does a transcript with a line `## exact-std` (a README's or
+  chapter's `<!-- exact-std -->`): tests/query/stdpos0253.q (std.vl's
+  lines as `<std>` and as the file, which must agree) and
+  tests/refactor/stdedit.t (its own small std, edited by FILE:LINE).
+  `-u` rewrites only a failing transcript, with the real numbers. The
+  query and refactor runners take NAMEs, as the walkthrough runner does.
+  tests/stdpos/run.sh (category `stdpos`) moves std's numbers in every
+  transcript that has them and runs them: all pass but the exact-std
+  ones, which must fail; `--real` adds a line to std.vl and std::gpu in
+  a copy, rebuilds, and runs the three suites whole.
+- **compiler/src/front/stdsrc.vl stays tracked, and is made, not
+  merged**: a git merge driver (tools/git-hooks/merge-stdsrc, named by
+  .gitattributes) makes it from the merged compiler/std (git merge-tree
+  of the two commits, then that std's embed.sh), so two branches that
+  both change std merge without a conflict on it; when compiler/std
+  itself conflicts, or in a rebase or cherry-pick, it reports a conflict
+  that says to run compiler/std/embed.sh. The commit hook makes it from
+  the staged std and stages it (it refused a std change without it);
+  `bootstrap.sh` makes it from compiler/std before HEAD's compile (a
+  stale one in the work tree is replaced, and said), and premerge's
+  `std` row checks the committed one, from HEAD's std, and says when the
+  driver is not set up. Set up once per clone: `tools/git-hooks/setup.sh`
+  (core.hooksPath and merge.stdsrc). Untracked was not chosen: every
+  release tag's tree must build as `git archive` gives it (the chain),
+  and the tools read the compiler's source, stdsrc.vl included, in a
+  fresh worktree before any build (query, check, the hooks, premerge).
+- **The agent hooks in a tree inside another checkout**: query-first
+  judges a path inside the vole tree that holds it (the nearest directory
+  with compiler/src/main.vl and tools/agent-hooks), before the git root,
+  and scratch (target/, tmp/) by the path inside that tree, not by any
+  target/ or tmp/ of the absolute path: a release's tree extracted under
+  target/bootstrap (the chain runs its suite there) or a copy under /tmp
+  is the compiler's source, and `sed -i` on it is blocked as in the
+  checkout. tools/agent-hooks/test-nested-tree.py runs the hooks' cases
+  in a copy under target/ and one under /private/tmp.
 - **The guide's gaps from the round 3 GPU eval** (eight that cost
   agents turns), each with a compiled example: `guide gpu` opens with
   a skeleton (the window loop, a compute pass, a render pass, a
@@ -277,6 +318,37 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   compared them with its own check's, took them for new errors and
   refused itself (`edit.breaks`). The cache's key now has the name the
   compiler was run by (tests/refactor/cachename0253.t).
+
+- **A closure drops its by-value parameter** (a leak since 0.19, F20):
+  one given to an `FnMut(sink T)` bound (`map`, `for_each`, `fold`,
+  `Option::map`, `map_err`, `and_then`, `unwrap_or_else`, a program's
+  own) owns its argument and drops it at the end of its body unless the
+  body moves it out (returns it, pushes it, passes it on to a `sink`
+  parameter; on one path, by a drop flag); `|_|` drops it too. A closure
+  may say so itself, `|d: sink D|` (was `conv.sink_type`). A let
+  parameter still borrows, and a borrowing iterator's items (`w.iter()`,
+  a HashMap's) stay the container's: `own.iter_item_copy` is kept
+  (lifting it, `w.iter().collect_in(gpa)` still frees each element
+  twice). Fuzzed: semfuzz's `--closure-params` (in the gate's
+  `fuzz-sem`) and the argument sweep's `own_arg_temp_sweep_closure`
+  (1,680 cases); 12 XFAILs (the leaks, `|d: sink D|`) now pass.
+- **volec's command line on 0.25.2's std::cli**: the compiler is built by
+  0.25.2.2, so the workarounds of compiler/src/cli/ for 0.25.1's std::cli
+  are gone (line.vl 608 lines to 425): the line's words go to std::cli
+  as they are, the order of different options' values is
+  `Matches::indices_of`, a word starting with `-` that is no option is a
+  word by `allow_hyphen_values`, `--overlay PATH COPY`, `--rename A B`,
+  `--subst P R` take `num_values(2)`, probe's words after `--` are
+  `last`, a build's `--stats` and `--print-checks` `default_missing`,
+  and the editing commands' shared options `edit`'s `global` ones.
+  Messages, `try:` lines and exit statuses are as before
+  (tools/cli-compat.py: 0 differences on 1,438 command lines but `-O3`
+  of `probe` and `test`), with the rules of every other option: `-O3` is
+  `-O 3` (`-O takes 0, 1 or 2, not '3'`; probe took it and failed
+  later), `-Iinc`, `-j2` are `-I inc`, `-j 2`, a cluster `-in` of
+  `query grep` is `-i -n`, and `--rename=A B` is `--rename A B`.
+  docs/design/cli.md, "0.25.3", lists what std::cli still has no rule
+  for and volec keeps.
 
 ### What's new in 0.25.2.2
 
