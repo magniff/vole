@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, 75150604. The gate's unsafe-audit row
+on Darwin arm64, d0451626. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,60 +14,60 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 4365
+baseline compiler/src unjustified: 3428
 baseline std unjustified: 0
 
 ## compiler/src
 
 ```
-sites: 4489 (4438 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 4365; unneeded: 0
+sites: 3509 (3458 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 3428; unneeded: 0
 
 class	sites	unjustified
-static-mut	2489	2411
-raw-pointer	1437	1409
+static-mut	1482	1449
+raw-pointer	1462	1434
 ffi	304	293
 alloc	134	134
-transmute/cast	116	110
+transmute/cast	118	110
 other	9	8
 
 module	sites	unjustified
-crate::front	1685	1641
-crate::tools	1224	1169
-crate::middle	739	727
-crate::back	579	576
-crate::base	109	101
-crate::gen0	87	87
+crate::front	1072	1055
+crate::tools	924	882
+crate::middle	711	699
+crate::back	572	570
+crate::base	98	92
+crate::gen0	67	67
 crate::arch	51	51
-crate::guide	10	10
+crate::guide	9	9
 crate	3	3
 crate::cli	2	0
 
 file	sites	unjustified
-compiler/src/front/own/drops.vl	78	77
-compiler/src/tools/lsp/complete.vl	61	61
-compiler/src/tools/lsp/answer.vl	59	57
 compiler/src/back/codecache/mod.vl	57	57
-compiler/src/base/mod.vl	55	53
-compiler/src/tools/fixconv.vl	50	50
-compiler/src/front/own/views.vl	45	45
-compiler/src/front/types.vl	44	43
+compiler/src/base/mod.vl	51	49
+compiler/src/tools/lsp/answer.vl	45	43
+compiler/src/front/own/drops.vl	44	43
 compiler/src/middle/gvn.vl	44	44
 compiler/src/middle/inline.vl	41	41
+compiler/src/front/own/views.vl	39	39
 compiler/src/middle/parallel.vl	39	39
 compiler/src/middle/loops.vl	38	38
-compiler/src/base/diag.vl	37	35
+compiler/src/tools/lsp/complete.vl	38	38
 compiler/src/front/own/state.vl	37	37
-compiler/src/tools/fixvalues.vl	37	37
-compiler/src/front/check/synth_mode.vl	36	32
-compiler/src/front/own/moves.vl	36	30
-compiler/src/front/own/walk.vl	34	34
 compiler/src/back/objfile/mod.vl	33	33
-compiler/src/front/conv.vl	33	32
-(330 more; --all lists every one)
+compiler/src/base/diag.vl	32	30
+compiler/src/middle/ir/mod.vl	32	32
+compiler/src/back/regalloc/intervals.vl	30	30
+compiler/src/back/regalloc/scan.vl	29	29
+compiler/src/gen0/target.vl	28	28
+compiler/src/back/objfile/output.vl	27	26
+compiler/src/front/types.vl	27	26
+compiler/src/front/effects/infer.vl	26	26
+(324 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	4365	4365
-justified	124	0
+missing both	3428	3428
+justified	81	0
 ```
 
 ## std
@@ -129,4 +129,5 @@ compiler/std/window/objc.vl	13	0
 
 justification	sites	unjustified
 justified	893	0
+try: /Users/magniff/workspace/tachyon/.claude/worktrees/tables255/target/volec fix --only unneeded-unsafe
 ```
