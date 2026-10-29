@@ -1,4 +1,4 @@
-# Windows: std::window (0.23)
+# Windows: std::window (0.23; guide updated 0.25.2.2)
 
 `std::window` opens windows and reads their input, winit's objects with
 events pulled rather than pushed. 0.23.0 runs on macOS (Cocoa); Wayland
@@ -40,6 +40,18 @@ fn main(gpa: Gpa) -> i32 {
   `win.request_frame()`, `size()`, `raw_surface()` (the CAMetalLayer),
   `set_title`, `set_cursor`, `hide_cursor_while_typing`,
   `set_ime_area(x, y, w, h)`, `set_fullscreen`, `focused`, `close`.
+- **HiDPI units** (0.25.2.2): only `WindowDesc::new(title, w, h)` is in
+  logical points. Everything a program reads back is in physical pixels:
+  `win.size()` (a `Size { w, h, scale }`), `Resize`'s size, `Mouse.x`
+  and `.y`, `Scroll`'s precise deltas. On a Retina display (`scale`
+  2.0) `WindowDesc::new("demo", 800, 600)` gives `win.size()` 1600 x
+  1200. Configure the surface with that size (`surf.configure(dev,
+  s.w, s.h, ..)`, again at each `Resize`), so `surf.width` and
+  `surf.height` are the drawable's pixels too; a snapshot of the window
+  (a copy of its frame, a canvas, a PPM) is `surf.width` x
+  `surf.height`, never the WindowDesc's numbers (those give its top-left
+  quarter at scale 2). Divide by `scale` only for logical points (UI
+  sizes meant to look the same on every display).
 - **Frames when the window is not shown** (0.25.2.1): the display gives
   no frames while it is asleep (the screen locked, the person away), or
   while the window is covered, hidden, minimized or on another Space. A

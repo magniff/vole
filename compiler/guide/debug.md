@@ -52,7 +52,7 @@ instructions per call and per loop iteration: the compiler runs about
 25% slower when built with it, and its binary is larger. Without
 `--trace`, a failure is one line, its position and message:
 
-```tach
+```vole
 fn main() -> i32 {
     let v = [1, 2, 3];
     let i = v.len() as i64;

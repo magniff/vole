@@ -19,7 +19,7 @@ are C++'s (`Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`,
 `SeqCst`. An atomic is move-only. A static one needs no `var` (and so has
 no `global`): `static HITS: AtomicI64 = AtomicI64 { v: 0 };`.
 
-```tach
+```vole
 use std::sync::atomic::{AtomicI64, Ordering};
 
 fn main() {
@@ -57,7 +57,7 @@ scoped thread's handle leaves `thread::scope` (`sync.scope_escape`): join
 inside and return the results. No thread may reach a `static var` (`sync.global`; `query
 effects FILE:LINE --why global` shows the chain); printing is fine.
 
-```tach
+```vole
 use std::thread;
 
 fn sum(s: [i64]) -> i64 {
@@ -109,7 +109,7 @@ carries, a Mutex holds and `with`'s closure returns is no view
 views is gone; send an owned copy (`s.to_vec_in(gpa)`,
 `s.to_string_in(gpa)`).
 
-```tach
+```vole
 use std::thread;
 use std::sync::{Mutex, mpsc};
 
@@ -144,7 +144,7 @@ The locks wait on a futex (Linux) or `__ulock` (macOS).
 made from `INIT` when the thread first uses it. Using one is safe; its
 effect is `tls`, not `global`. A thread-local's drop does not run.
 
-```tach
+```vole
 use std::thread;
 
 #[thread_local]

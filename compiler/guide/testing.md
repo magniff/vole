@@ -11,7 +11,7 @@ and checks that the test frees what it allocates).
 
 ## #[test]
 
-```tach
+```vole
 fn gap(v: [i64]) -> i64 {
     var best = 0;
     for i in 1..v.len() {
@@ -83,7 +83,7 @@ reporting it as verified misleads. Before trusting a check:
   settles in a few steps "grows" for any run. Ask: what wrong program
   passes this?
 
-```tach
+```vole
 // The update clamps x into 0..1.
 fn step(x: f64, v: f64, dt: f64) -> f64 {
     let y = x + v * dt;
@@ -113,7 +113,7 @@ fn main() -> i32 {
 A property's parameters are generated: 100 cases (`--cases N`), sizes
 growing, a failure shrunk to a small input and printed with its seed.
 
-```tach
+```vole
 fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
@@ -179,7 +179,7 @@ FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
 
 ## #[fuzz] and volec fuzz
 
-```tach
+```vole
 fn parse(data: [u8]) -> i64 {
     if data.len() >= 2 && data[0] == 'O' && data[1] == 'K' {
         return 1;

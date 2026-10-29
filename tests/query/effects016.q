@@ -13,6 +13,7 @@ crate::mystery	io
 crate::ext_pure	none
 $ effects add bump address at part whole color sum same spin forever fact even odd
 crate::add	none
+std::gpu::Unwritten::add	panic
 crate::bump	global
 crate::address	global
 crate::at	panic

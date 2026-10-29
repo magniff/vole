@@ -88,6 +88,11 @@ reads of the compiler's large files or directories, and every rewrite of
 its source. A block says first that NOTHING on the line ran, which
 command was blocked, the line with each blocked read as its query when
 that is not in doubt (`try the whole line:`), and what is allowed.
+(0.25.2.2, after the 0.25.2.1 GPU eval) When a blocked read has no such
+query, the line without it, as typed (`try the line without it:`; a
+PreToolUse hook cannot run the rest), so the retry is one copy; and a
+bounded line range of any .vl runs (`sed -n 'A,Bp'`, `head`/`tail -n
+N`, `cat -n F | sed -n ...`: at most RANGE_LINES lines, `read-range`).
 Development tooling only: not part of the build.
 """
 import json
@@ -292,7 +297,7 @@ def segments(command):
 SMALL_LINES = 300
 
 
-def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, programs=None):
+def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, programs=None, ranges=None):
     """(program, words, segment, [(operand, full path or None)]) of each
     simple command reading the compiler's .vl source. (0.17) Each command
     is judged on its own, in the directory its `cd`s lead to, with `$VAR`s
@@ -305,7 +310,8 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, pro
     `small`; none of those is blocked."""
     found = []
     cwd = cwd or os.getcwd()
-    for idx, (seg, words, here, assigns) in enumerate(tc.located(command, cwd)):
+    located = tc.located(command, cwd)
+    for idx, (seg, words, here, assigns) in enumerate(located):
         if not seg.strip() or seg.strip()[:1] == "#":
             continue
         while words and "=" in words[0] and not words[0].startswith("-"):
@@ -354,8 +360,50 @@ def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None, pro
             if small is not None:
                 small.append((prog, args))
             continue
+        # (0.25.2.2) a bounded line range of one file: `sed -n 'A,Bp'`,
+        # `head`/`tail -n N`, at most RANGE_LINES lines (`cat FILE | head
+        # -n N` too); the 0.25.2.1 eval's sph wanted 40 lines of a 480-line
+        # std file and lost a turn to the block
+        # (rewrite mode runs such a read as its query, as before)
+        if len(files) == 1 and files[0][1] and query_mode() != "rewrite" and (
+                bounded_range(prog, [a for a in args if a != files[0][0]], files[0][1]) or
+                (prog == "cat" and piped_range(command, located, idx, files[0][1]))):
+            if ranges is not None:
+                ranges.append((prog, args))
+            continue
         found.append(Read(prog, args, seg, [x for k, x in zip(kinds, files) if k == "source"], idx))
     return found
+
+
+RANGE_LINES = 200
+
+
+def bounded_range(prog, ops, full):
+    """(0.25.2.2) Whether `prog ops FILE` prints at most RANGE_LINES lines
+    of file full: `sed -n 'A,Bp'`, `head [-n] N`, `tail [-n] N` (`tail -n
+    +K` when the file has at most RANGE_LINES lines from K on)."""
+    if prog not in ("sed", "head", "tail"):
+        return False
+    try:
+        rng = text_range(prog, ops, full)
+    except (OSError, ValueError):
+        return False
+    return bool(rng) and 0 <= rng[1] - rng[0] < RANGE_LINES
+
+
+def piped_range(command, located, idx, full):
+    """(0.25.2.2) Whether command idx of located (a `cat FILE`, `cat -n
+    FILE`) is piped into a bounded `sed -n 'A,Bp'` or `head -n N`."""
+    if idx + 1 >= len(located):
+        return False
+    nxt = located[idx + 1][1]
+    if not nxt or nxt[0] not in ("sed", "head") or [a for a in nxt[1:] if not a.startswith("-") and a.endswith(".vl")]:
+        return False
+    seg = located[idx][0].strip()
+    k = command.find(seg)
+    if k < 0 or not re.match(r"^\s*\|(?!\|)", command[k + len(seg):]):
+        return False
+    return bounded_range(nxt[0], nxt[1:], full)
 
 
 class Read(tuple):
@@ -823,7 +871,7 @@ def with_root(t, root):
     return " | ".join(out)
 
 
-def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=(), whole=None):
+def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=(), whole=None, blocked_idx=()):
     """(the message for a blocked read, its `try:` commands): which command
     of the line reads source (when the line has several, the others are
     not the problem), how long the file is when it is too long to read
@@ -878,7 +926,14 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
         lines.insert(k, "try: %s" % whole)
         tries.insert(0, whole)
     elif len(parts) > 1:
-        lines.append("then run the line's other commands again: they did not run")
+        # (0.25.2.2) the rest of the line, to run as it is
+        rest = line_without(command, blocked_idx, [seg] + [o[2] for o in others])
+        if rest:
+            lines.append("try the line without %s (the rest did not run either): %s"
+                         % ("it" if not others else "them", rest))
+            tries.append(rest)
+        else:
+            lines.append("then run the line's other commands again: they did not run")
     lines.append(ALLOWED_READS)
     lines.append("override: append '# no-query: <why query is not enough>'")
     return "\n".join(lines) + "\n", tries
@@ -886,9 +941,75 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
 
 # (0.25.2.1) What the hook lets through, said in each block message.
 ALLOWED_READS = ("allowed: shell reads (cat, head, tail, sed -n, grep) of any .vl outside compiler/src "
-                 "and compiler/std, and of any file under %d lines; the Read tool reads any file" % SMALL_LINES)
+                 "and compiler/std, and of any file under %d lines; of any .vl, a range of at most %d lines "
+                 "(sed -n 'A,Bp', head or tail -n N); the Read tool reads any file" % (SMALL_LINES, RANGE_LINES))
 ALLOWED_WRITES = ("allowed: sed -i, perl -pi and Python writes of any file outside compiler/src and "
                   "compiler/std (a program you write: as you like)")
+
+
+def line_without(command, blocked_idx=(), blocked_text=()):
+    """(0.25.2.2) The line as typed less its blocked commands, to run as it
+    is (a PreToolUse hook cannot let the rest run; the 0.25.2.1 eval's
+    qwen35 retyped a python edit and a grep by hand): each pipeline that
+    holds a blocked command (`blocked_idx`: indexes into tc.segments,
+    `blocked_text`: their texts) left out with the separator before it,
+    here-documents kept; None when nothing is left to run but `cd`s and
+    assignments, or the blocked command is inside `$(...)`, backquotes or
+    parentheses."""
+    marks, body, last = [], [], 0
+    for m in HEREDOC.finditer(command):
+        body.append(command[last:m.start()])
+        marks.append((sum(len(x) for x in body), m.group(0)))
+        body.append("<<HEREDOC\n")
+        last = m.end()
+    body.append(command[last:])
+    body = "".join(body)
+    spans = tc._spans(body)
+    if not spans:
+        return None
+    texts = [body[a:b].strip() for a, b in spans]
+    blocked = set(blocked_idx) | {k for k, t in enumerate(texts) if t in {x.strip() for x in blocked_text}}
+    if not blocked:
+        return None
+    seps = [body[spans[k][1]:spans[k + 1][0]] for k in range(len(spans) - 1)]
+    pipes, cur = [], [0]
+    for k, sep in enumerate(seps):
+        if re.search(r"[()`]|\$\(", sep):
+            if k in blocked or k + 1 in blocked:
+                return None
+        if sep.strip() == "|":
+            cur.append(k + 1)
+        else:
+            pipes.append(cur)
+            cur = [k + 1]
+    pipes.append(cur)
+    out, kept, out_heredoc = "", [], False
+    for p in pipes:
+        if any(k in blocked for k in p):
+            continue
+        a, b = spans[p[0]][0], spans[p[-1]][1]
+        piece = body[a:b]
+        for pos, orig in reversed(marks):
+            if a <= pos < b:
+                piece = piece[:pos - a] + orig.rstrip("\n") + piece[pos - a + len("<<HEREDOC"):]
+        if out:
+            sep = seps[p[0] - 1].strip()
+            # (after a here-document's terminator only a new line: the
+            # line's `&&` was before its body)
+            if out_heredoc or "\n" in seps[p[0] - 1] and sep in ("", ";"):
+                out += "\n"
+            elif sep in (";", "&"):
+                out += sep + " "
+            else:
+                out += " " + sep + " "
+        out += piece
+        # (a here-document ends the command it is given to: its text up to
+        # the end of the line went with it)
+        out_heredoc = any(spans[p[-1]][0] <= pos < b for pos, _ in marks)
+        kept.extend(p)
+    if not any(not re.match(r"^(cd|pushd|export|local)\b|^[A-Za-z_]\w*=", texts[k]) for k in kept):
+        return None
+    return out
 
 
 def command_parts(command):
@@ -1713,18 +1834,26 @@ def main():
             seg = next((p for p in parts if re.search(r"\bsed\b|\bperl\b", p) and files[0] in p), None) \
                 if prog != "python" else None
             what = ("%s (%s)" % (part_named(parts, seg), prog)) if seg and len(parts) > 1 else prog
+            # (0.25.2.2) the rest of the line, to run as it is: a python
+            # edit is its here-document's command, a sed's its segment
+            rest = None
+            if len(parts) > 1:
+                bad = [seg] if seg else [p for p in tc.segments(command)
+                                         if re.match(r"^(\S*/)?python[\d.]*\b", p.strip())]
+                rest = line_without(command, (), bad) if bad else None
             sys.stderr.write("blocked hook.edit-tool: %s: %s rewrites the compiler's source (%s)\n"
                              "try: %s\n%s%s\noverride: append '# no-tool: <why the tools are not enough>'\n"
                              % (nothing_ran(parts), what, files[0],
                                 edit_suggestion(prog, files, script, cwd, base),
-                                "then run the line's other commands again: they did not run\n"
+                                ("try the line without it (the rest did not run either): %s\n" % rest) if rest
+                                else "then run the line's other commands again: they did not run\n"
                                 if len(parts) > 1 else "", ALLOWED_WRITES))
             return 2
-        fixtures, small, scratch, programs = [], [], [], []
-        reads = source_reads(command, cwd, fixtures, small, scratch, programs)
+        fixtures, small, scratch, programs, ranges = [], [], [], [], []
+        reads = source_reads(command, cwd, fixtures, small, scratch, programs, ranges)
         if not reads:
-            for kind, got in (("read-small", small), ("read-program", programs), ("read-scratch", scratch),
-                              ("read-fixture", fixtures)):
+            for kind, got in (("read-small", small), ("read-range", ranges), ("read-program", programs),
+                              ("read-scratch", scratch), ("read-fixture", fixtures)):
                 if got:
                     log(gd, {"kind": kind, "program": got[0][0], "command": command[:300]})
                     break
@@ -1771,7 +1900,8 @@ def main():
             log(gd, {"kind": "read-missing", "program": reads[0][0], "command": command[:300]})
             return 0
         prog, args, seg, files = failed[0]
-        message, tries = blocked_message(command, prog, args, seg, files, cwd, failed[1:], parts, whole)
+        message, tries = blocked_message(command, prog, args, seg, files, cwd, failed[1:], parts, whole,
+                                         [getattr(r, "idx", -1) for r in failed])
         log(gd, {"kind": "blocked", "program": prog, "command": command[:300],
                  "segment": seg[:200], "try": tries, "reads": len(reads),
                  "translated": [to[:200] for _, to, _ in parts]})

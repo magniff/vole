@@ -36,7 +36,7 @@ segment, when the module has no name of its own for it, is a child of its
 parent module, else of the root; when both exist and differ, the error's
 `try:` lines are the two `crate::` paths.
 
-```tach
+```vole
 mod util {
     pub fn double(x: i64) -> i64 { x * 2 }
     pub fn half(x: i64) -> i64 { x / 2 }

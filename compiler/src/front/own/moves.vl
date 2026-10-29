@@ -14,7 +14,8 @@
 // (drops.vl: drop_state).
 
 use crate::base::{
-    FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_int, buf_new, buf_slice,
+    buf_str,
 };
 use crate::base::diag::buf_tool_command;
 use crate::front::ast::{FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child};
@@ -548,6 +549,23 @@ fn move_out(p: i64, n: i64, how: i64) {
             buf_type(tn, NODES[n].ty);
         }
         let strict = crate::front::conv::strict_at(NODES[n].start);
+        // (0.25.2.2) whether the type has a Default for 'std::take' to leave
+        // in its place: a plain value, std's Default (read only when the
+        // program mentions it, so a type nothing makes Default has none),
+        // an Option (None)
+        let ty = NODES[n].ty;
+        var dflt = false;
+        if ty > 0 && !crate::front::check::has_error_type(ty) {
+            let tr = crate::front::traits::std_trait(c"Default");
+            dflt = crate::front::derive::intrinsic::is_plain(ty)
+                || (tr >= 0 && crate::front::traits::implements(tr, ty));
+            if !dflt && TYPES[ty].kind == TyKind::Enum
+                && crate::front::types::ENUMS[TYPES[ty].a].tmpl != 0 {
+                let tmpl = crate::front::types::ENUMS[TYPES[ty].a].tmpl;
+                dflt = within_std(crate::front::types::ENUMS[tmpl - 1].module)
+                    && SYMS[crate::front::generics::template_name(-tmpl)].text == "Option";
+            }
+        }
         if how == MO_INDEX {
             if cl {
                 own_help(if !strict {
@@ -590,6 +608,15 @@ fn move_out(p: i64, n: i64, how: i64) {
                 own_help(c"it is a let access, read-only: take the parameter 'sink' to own it and store it ('sink self', 'x: sink T'), move it into its one owner and reach it through that owner, or keep an index to it");
                 no_clone_help(buf_slice(tn));
             }
+        } else if !cl && !owned_base_type(NODES[n].ty) && !dflt {
+            // (0.25.2.2, eval 0.25.2.1: windtunnel, physarum) a handle with
+            // neither Default nor Clone (std::gpu's BindGroup, Buffer):
+            // nothing can be left in its place, and taking it would empty
+            // the field the next step reads
+            let f = file_of(NODES[n].start);
+            no_default_help(SRC[NODES[n].start..NODES[n].end],
+                SRC[FILES[f].start..NODES[n].start], SRC[NODES[n].end..FILES[f].end],
+                buf_slice(tn));
         } else {
             if cl {
                 own_help(if !strict {
@@ -608,7 +635,7 @@ fn move_out(p: i64, n: i64, how: i64) {
             if owned_base_type(NODES[n].ty) {
                 // (a container keeps its allocator: T4's `take`)
                 try_wrap(n, c"", c".take()");
-            } else {
+            } else if dflt {
                 try_wrap(n,
                     c"std::take(&", c")");
             }
@@ -616,6 +643,69 @@ fn move_out(p: i64, n: i64, how: i64) {
         }
         own_end();
     }
+}
+
+// (0.25.2.2) The help of a move out of a reference of a value with neither
+// Default nor Clone (a std::gpu handle), the value's text `s` (`before`
+// and `after` it, its file's text): read it in place, and where an `if` or
+// `match` picks one of two fields (`let g = if k == 0 { self.g0 } else {
+// self.g1 };`), use each field inside its branch.
+fn no_default_help(s: [u8], before: [u8], after: [u8], tn: [u8]) {
+    let b = buf_new();
+    if chosen_by_branch(before, after) {
+        buf_fmt(b,
+            f"an `if` or `match` that picks '{s}' moves it out, and '{tn}' has no Default to leave in its place (no 'std::take') and no '.clone()': use the field inside each branch, where a let parameter reads it in place (`if c {{ f({s}) }} else {{ f(...) }}`), or pass '{s}' itself where it is needed");
+    } else {
+        buf_fmt(b,
+            f"'{tn}' has no Default to leave in its place (no 'std::take') and no '.clone()': read it in place, passing '{s}' itself to a let parameter (`f({s})`), or take the parameter 'sink' to own it");
+    }
+    own_help_bytes(buf_slice(b));
+}
+
+// Whether a value is one a branch gives, from the text `before` and
+// `after` it: a match arm's (`=> self.g0,`), or the last thing in a block
+// (`{ self.g0 }`) that is an `if`'s, an `else`'s or an arm's (its line has
+// `if`, `else` or `=>`), not a function's body.
+fn chosen_by_branch(before: [u8], after: [u8]) -> bool {
+    var i = before.len;
+    while i > 0 && (before[i - 1] == ' ' || before[i - 1] == '\n' || before[i - 1] == '\t') {
+        i -= 1;
+    }
+    var j = 0;
+    while j < after.len && (after[j] == ' ' || after[j] == '\n' || after[j] == '\t') {
+        j += 1;
+    }
+    if i < 2 || j >= after.len {
+        return false;
+    }
+    if before[i - 1] == '>' && before[i - 2] == '=' {
+        return after[j] == ',' || after[j] == '}';
+    }
+    if before[i - 1] != '{' || after[j] != '}' {
+        return false;
+    }
+    // (the text before the `{` on its line)
+    var ls = i - 1;
+    while ls > 0 && before[ls - 1] != '\n' {
+        ls -= 1;
+    }
+    let line = buf_new();
+    buf_byte(line, ' ');
+    buf_bytes(line, before[ls..i - 1]);
+    let t = buf_slice(line);
+    !has_text(t, " fn ") && (has_text(t, " if ") || has_text(t, "else") || has_text(t, "=>"))
+}
+
+// Whether text t has `part` in it.
+fn has_text(t: [u8], part: [u8]) -> bool {
+    var k = 0;
+    while k + part.len <= t.len {
+        if t[k..k + part.len] == part {
+            return true;
+        }
+        k += 1;
+    }
+    false
 }
 
 // The help's note that a type (its name) has no `.clone()`, which

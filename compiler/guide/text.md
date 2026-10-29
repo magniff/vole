@@ -25,7 +25,7 @@ forms are errors naming them. Bytes become a `str` checked:
 `String::from_buf(b)?`, `String::from_utf8_lossy_in(b, gpa)`; back:
 `s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`.
 
-```tach
+```vole
 fn initials(name: str, gpa: Gpa) -> String {
     var out = String::new_in(gpa);
     for w in name.split_whitespace() {

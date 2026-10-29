@@ -9,7 +9,7 @@ so a function's signature says whether it allocates.
 
 ## Gpa, from main
 
-```tach
+```vole
 fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
     var v: Vec<i64> = Vec::with_capacity_in(n, gpa);
     for i in 0..n { v.push(i * i); }
@@ -48,7 +48,7 @@ in Rust's allocator API (`Vec::with_capacity_in(cap, alloc)`), except
 before a closure that is given it: `arena_scope(gpa, |a| ..)`.
 The 0.15 forms are errors that name the `_in` form:
 
-```tach
+```vole
 let v: Vec<i64> = Vec::new();
 ```
 ```err
@@ -71,7 +71,7 @@ bytes). Code generic over the allocator names it, and changes the
 container through an `inout` parameter (called with `&v`); code that
 only reads takes a slice:
 
-```tach
+```vole
 fn fill<A: Allocator>(v: inout Vec<i64, A>, n: i64) {
     for i in 0..n { v.push(i); }
 }
@@ -109,7 +109,7 @@ container on it, lives, `mem` is not read, written or dropped another
 way (`own.conflict`), and it cannot outlive `mem`. Two containers alive
 together need a buffer each.
 
-```tach
+```vole
 use std::FixedBuf;
 
 fn main() {
@@ -124,7 +124,7 @@ fn main() {
 15
 ```
 
-```tach
+```vole
 fn longest(words: [[u8]], gpa: Gpa) -> i64 {
     arena_scope(gpa, |a| {
         var lens: Vec<i64, ScopedArena> = Vec::new_in(a);

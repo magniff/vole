@@ -74,10 +74,10 @@ Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
 Vec<Adapter>::push	views()
 Vec<ShaderEntry>::push	views()
+Vec<[i64; 2]>::push	views()
 Vec<EntryPoint>::push	views() stores(x) declared
 Vec<Binding>::push	views()
 Vec<VertexInput>::push	views()
-Vec<[i64; 2]>::push	views()
 Vec<Type, ScopedArena>::push	views() stores(x) declared
 Vec<Expr, ScopedArena>::push	views() stores(x) declared
 Vec<[u8], ScopedArena>::push	views() stores(x) declared
@@ -134,7 +134,7 @@ crate::intern	views() stores(word) declared
 $ def pick intern count
 crate::pick	views017/main.vl:16:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks) declared
 crate::intern	views017/main.vl:27:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
-std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:528:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
+std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:531:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
 std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:368:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
 crate::count	views017/main.vl:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64

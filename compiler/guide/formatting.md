@@ -33,7 +33,7 @@ those three bytes (a literal holding `{name}` of a local passed to
   Through a function of your own taking `T: Display`, each f-string is
   a new copy of that function (and of what it calls).
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
     let name = "vole";
     let n = 42;
@@ -53,7 +53,7 @@ vole has 42 and 2.5
 to stderr: 42-43
 ```
 
-```tach
+```vole
 fn next(c: inout i64) -> i64 {
     c += 1;
     c
@@ -96,7 +96,7 @@ without a Fmt:
 | `fmt_u64(v, &out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
 | `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
 
-```tach
+```vole
 use std::num::{FloatFmt, parse_f64, parse_i64_radix, write_f64};
 
 fn main() -> i32 {
@@ -132,7 +132,7 @@ escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `Some(5)`, `{1: 2}`). A slice `[T]` has no Debug (it would clash with
 `[u8]`'s): `std::debug_list(f, s)` writes one from a Debug impl.
 
-```tach
+```vole
 #[derive(Debug, Clone)]
 struct Point { x: i64, y: i64 }
 
@@ -188,7 +188,7 @@ derived trait and a hand-written impl of it clash: remove one.
 tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
 `HashMap`, `Option`, `Result` and the primitives.
 
-```tach
+```vole
 #[derive(Eq, Ord, Hash, Debug)]
 struct Key { group: i64, id: i64 }
 

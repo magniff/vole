@@ -22,7 +22,7 @@ volec hello.vl -o hello.o            # object; `-o x.s`: assembly
 volec check hello.vl                 # errors only, one per line
 ```
 
-```tach
+```vole
 fn main() -> i32 {
     println("hello");
     0
@@ -56,7 +56,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
 | `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
 | `!x` on integers | `~x`; `!` is for `bool` only |
-| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers none |
+| `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers `abs`, `signum`, `min`, `max`, `clamp`, `pow` (0.25.2.2) |
 | overflow panics, `/ 0` panics | integers wrap; `x / 0 == 0`, `x % 0 == x`; no panic |
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |
@@ -75,7 +75,7 @@ full list).
 
 ## Values and types
 
-```tach
+```vole
 let a = 42;               // i64: an integer literal is i64 unless the context says
 let b: u8 = 255;          // i8 i16 i32 i64 u8 u16 u32 u64 isize usize
 let c = 3u32;             // suffixes; 1_000, 0xff, 0b1010
@@ -99,7 +99,7 @@ checked (a message, exit 101): `guide types`.
 
 ## Functions and control flow
 
-```tach
+```vole
 fn classify(n: i64) -> [u8] {
     if n < 0 { "negative" } else if n == 0 { "zero" } else { "positive" }
 }
@@ -140,7 +140,7 @@ The last expression of a block, without `;`, is its value; `if`, `match`,
 
 ## Parameters: let, inout, sink
 
-```tach
+```vole
 struct Account { balance: i64, log: Vec<i64> }
 
 fn transfer(from: inout Account, to: inout Account, amount: i64) -> bool {
@@ -184,7 +184,7 @@ fn main(gpa: Gpa) {
 
 ## Structs, enums, match, methods
 
-```tach
+```vole
 struct Point { x: i64, y: i64 }
 
 enum Shape { Circle(Point, i64), Rect { min: Point, max: Point }, Empty }
@@ -240,7 +240,7 @@ by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 
 ## Generics and traits
 
-```tach
+```vole
 trait Area {
     fn area(self) -> i64;
     fn twice(self) -> i64 { 2 * self.area() }          // a default method
@@ -289,7 +289,7 @@ re-exports. A missing import's error says which `use` line to add, and
 
 ## Slices, arrays, text
 
-```tach
+```vole
 fn sum(xs: [i64]) -> i64 {
     var t = 0;
     for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
@@ -323,7 +323,7 @@ array, a `Vec` or memory. A `[T]` is read-only; `inout [T]`
 
 ## std: Vec, HashMap, Buf; allocation
 
-```tach
+```vole
 fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
     (0..n).map(|i| i * 2).collect_in(gpa)
 }
@@ -394,7 +394,7 @@ A priority queue is a `BinaryHeap` (the largest first) or a `MinHeap`
 prelude (`guide std#heaps-priority-queues`). Dijkstra's shortest paths
 with a MinHeap of (distance, node) pairs:
 
-```tach
+```vole
 // Dijkstra: the shortest distances from node 0.
 fn main(gpa: Gpa) -> i32 {
     let n = 5;
@@ -436,7 +436,7 @@ std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
 
-```tach
+```vole
 import "string.h" as c;
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
@@ -463,7 +463,7 @@ fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
 
 ## unsafe and C
 
-```tach
+```vole
 import "stdio.h" as c;                   // a C header, its names under c::
 
 extern "C" {                              // or declare C functions yourself

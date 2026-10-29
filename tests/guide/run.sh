@@ -14,22 +14,23 @@
 # The code blocks of every topic (`volec guide NAME`), by the fence's
 # language:
 #
-#   ```tach   vole code, compiled with --deny-warnings: a program when
+#   ```vole   vole code (```tach too, its name before 0.24), compiled
+#             with --deny-warnings: a program when
 #             it has a line starting `fn main(`; else items, when every
 #             line at column 0 starts an item (fn, struct, impl, use...),
 #             compiled with an empty main; else statements, compiled as
 #             main's body (leading `use` and `import` lines above it;
 #             0.16: main is `fn main(gpa: Gpa)`, its allocator `gpa`)
-#   ```tach NAME.vl
+#   ```vole NAME.vl
 #             (0.17) a file of a program of several modules: the blocks
 #             named so, in a row (prose between them, no other block),
 #             are written next to each other and main.vl is compiled;
 #             an in and out block after the last one are the program's
-#   ```in     right after a tach block: the program's stdin (else empty)
-#   ```out    after a tach block (and its in block): it is run, and its stdout and
+#   ```in     right after a vole block: the program's stdin (else empty)
+#   ```out    after a vole block (and its in block): it is run, and its stdout and
 #             stderr together are this text (trailing blanks aside);
 #             `out (exit N)` expects exit code N, else 0
-#   ```err    right after a tach block: compiling it fails (exit code 1)
+#   ```err    right after a vole block: compiling it fails (exit code 1)
 #             with each line of this text in its diagnostics (short form)
 #   other     (sh, text, rust) not checked
 #
@@ -67,7 +68,7 @@ STATUS=0
 RESULTS="$WORK/results"
 : >"$RESULTS"
 
-# Splits the guide text $1 (topic $2) into one directory per tach block
+# Splits the guide text $1 (topic $2) into one directory per vole block
 # under $WORK/blocks: prog.vl (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
@@ -92,9 +93,9 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
-                if (lang ~ /^tach [a-z_][a-z0-9_]*\.vl$/) {
+                if (lang ~ /^(tach|vole) [a-z_][a-z0-9_]*\.vl$/) {
                     # (0.17) a file of a program of several: the blocks
-                    # `tach NAME.vl` in a row are one program, built from
+                    # `vole NAME.vl` in a row are one program, built from
                     # main.vl; an in or out block after them is its
                     if (proj == "") {
                         n++
@@ -115,7 +116,7 @@ split_blocks() {
                 } else {
                     proj = ""
                 }
-                if (lang == "tach") {
+                if (lang == "tach" || lang == "vole") {
                     n++
                     name = topic ":" start
                     d = dir "/" topic "-" sprintf("%05d", start)

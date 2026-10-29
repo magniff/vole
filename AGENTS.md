@@ -62,8 +62,10 @@ builds replace `target/volec`, and a broken one breaks `query`).
 read or rewrite the compiler's `.vl` source (compiler/src, compiler/std:
 grep, sed, `sed -i`, Python writing it) and suggests the query or `edit
 patch`; a program's `.vl` (examples, tests, your own) is read and
-rewritten freely, and so is a whole file under 300 lines. A blocked line
-ran nothing: the block names the command and gives the whole line again. When the tool
+rewritten freely, and so is a whole file under 300 lines or a range of
+at most 200 lines of any (`sed -n 'A,Bp'`, `head -n N`). A blocked line
+ran nothing: the block names the command and gives the whole line again
+(with the read as its query, or without it). When the tool
 is not enough, rerun with a trailing reason, which is recorded: `#
 no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 ...` for an edit). `check-after-edit.py` runs `volec check` after
@@ -72,8 +74,10 @@ what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
 `check` after an edit. It makes only the mechanical exact fixes itself
 (a call's `&` marker, Rust's spellings, an import unused at two checks)
-and shows each change, `changed FILE:LINE: OLD -> NEW` (`volec undo`
-takes it back; `VOLE_HOOK_FIX=0`: off); the other exact fixes (a
+and shows each change, `changed FILE:LINE: OLD -> NEW` (repeats in one
+line), then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
+takes it back; `VOLE_HOOK_FIX=0`: off); it says once when a file you
+changed is not formatted (`volec fmt FILE`); the other exact fixes (a
 did-you-mean, a conversion, a `use`) it shows under `suggested, not
 applied`, with the ones `fix` refuses and why: check each before
 running `volec fix --suggested`. `check` and a build

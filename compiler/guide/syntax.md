@@ -25,7 +25,7 @@ The whole grammar is docs/grammar.md; this is what a program uses.
 
 ## Items
 
-```tach
+```vole
 use std::Buf;                       // imports first, by convention
 import "stdio.h" as c;              // a C header
 
@@ -75,7 +75,7 @@ takes it; an owned argument moves). Receivers: `self`, `inout self`,
 
 ## Statements and blocks
 
-```tach
+```vole
 let x = 1;                          // immutable
 var y: i64 = 2;                     // mutable, with a type
 let (a, var b) = (3, 4);            // patterns that always match; `var` per name
@@ -137,7 +137,7 @@ too).
 
 ## Control flow
 
-```tach
+```vole
 fn main(gpa: Gpa) -> i32 {
     let n = 7;
     let parity = if n % 2 == 0 { "even" } else { "odd" };

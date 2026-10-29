@@ -7,6 +7,7 @@ usage: python3 -I tools/agent-hooks/test-query-first.py
 import importlib.util
 import io
 import json
+import re
 import os
 import shutil
 import sys
@@ -106,8 +107,31 @@ def blocked(command):
 
 
 # Reading source: blocked with the query; other files are not.
-st, err = blocked("sed -n '120,180p' compiler/src/gvn.vl")
+st, err = blocked("sed -n '120,380p' compiler/src/gvn.vl")
 case("read sed -n", (st, "query show compiler/src/gvn.vl:120" in err), (True, True))
+# (0.25.2.2) A bounded line range of any .vl (at most 200 lines: sed -n
+# 'A,Bp', head or tail -n N, `cat -n F | sed -n ...`) runs (the 0.25.2.1
+# eval's sph lost a turn to a block of 40 lines of a 480-line std file);
+# a longer one, a grep, a read of several files, and every write are
+# still blocked.
+BIG = "compiler/std/gpu/mod.vl"
+case("range: sed -n of 40 lines of a large std file runs, logged",
+     (blocked("cd %s && sed -n 712,751p %s" % (TREE, BIG))[0], [r["kind"] for r in LOGGED][-1:]),
+     (False, ["read-range"]))
+case("range: sed -n of 200 lines runs", blocked("cd %s && sed -n '1,200p' %s" % (TREE, BIG))[0], False)
+case("range: sed -n of 201 lines blocked", blocked("cd %s && sed -n '1,201p' %s" % (TREE, BIG))[0], True)
+case("range: sed -n to $ of a large file blocked", blocked("cd %s && sed -n '100,$p' %s" % (TREE, BIG))[0], True)
+case("range: head -n 150 runs", blocked("cd %s && head -n 150 %s" % (TREE, BIG))[0], False)
+case("range: head -80 runs", blocked("cd %s && head -80 %s" % (TREE, BIG))[0], False)
+case("range: tail -n 120 runs", blocked("cd %s && tail -n 120 %s" % (TREE, BIG))[0], False)
+case("range: head -n 250 blocked", blocked("cd %s && head -n 250 %s" % (TREE, BIG))[0], True)
+case("range: tail -n +10 of a large file blocked", blocked("cd %s && tail -n +10 %s" % (TREE, BIG))[0], True)
+case("range: cat -n piped into sed -n 40 lines runs",
+     blocked("cd %s && cat -n %s | sed -n '100,140p'" % (TREE, BIG))[0], False)
+case("range: cat piped into grep blocked", blocked("cd %s && cat %s | grep -n fn" % (TREE, BIG))[0], True)
+case("range: two files blocked", blocked("cd %s && head -n 20 %s compiler/std/gpu/types.vl" % (TREE, BIG))[0], True)
+case("range: grep of one large file blocked", blocked("cd %s && grep -n 'fn frame' %s" % (TREE, BIG))[0], True)
+case("range: sed -i still blocked", blocked("cd %s && sed -i '' '1,10s/a/b/' %s" % (TREE, BIG))[0], True)
 case("read grep", blocked("grep -n 'fn run_gvn' compiler/src/gvn.vl")[0], True)
 # (0.25.2.1) A program's files outside compiler/src and compiler/std (an
 # example, a program an agent writes) are read freely, as the Read tool
@@ -168,8 +192,9 @@ st, err = blocked("cat > /tmp/w/a.txt <<'EOF'\nx\nEOF\nsed -i '' 's/a/b/' compil
 case("sed -i on a compound line: nothing ran, which part", err.splitlines()[0],
      "blocked hook.edit-tool: NOTHING on this line ran (3 commands): command 2 (`sed -i '' 's/a/b/' "
      "compiler/src/range.vl`) (sed -i) rewrites the compiler's source (compiler/src/range.vl)")
-case("sed -i on a compound line: rerun the others", "then run the line's other commands again: they did not run"
-     in err, True)
+# (0.25.2.2) the line less the blocked command, to run as it is
+case("sed -i on a compound line: the rest, to run as it is", err.splitlines()[2:6],
+     ["try the line without it (the rest did not run either): cat > /tmp/w/a.txt <<'EOF'", "x", "EOF", "ls"])
 st, err = blocked("sed -i 's/x.*y/z/g' compiler/src/a.vl compiler/src/b.vl")
 case("sed -i regex", (st, "edit patch compiler/src/a.vl:LINE --old 'TEXT' --new 'TEXT'" in err), (True, True))
 case("sed -Ei", blocked("sed -Ei.bak 's/a/b/' compiler/std/vec.vl")[0], True)
@@ -320,15 +345,34 @@ for what, line in EVAL_BLOCKED:
                                                      err.splitlines()[-2] if err else ""),
          (True, "blocked hook.edit-tool", True, hook.ALLOWED_WRITES))
 # (qwen35's and cloth's lines, compound: one part of the compiler's source)
-st, err = blocked("cd %s && sed -n 395,415p compiler/std/gpu/types.vl; ls examples/gpu/fluid2d/; "
+st, err = blocked("cd %s && sed -n 95,415p compiler/std/gpu/types.vl; ls examples/gpu/fluid2d/; "
                   "wc -l examples/gpu/fluid2d/*.vl; cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/" % TREE)
 case("compound, eval qwen35: nothing ran, which part", (st, err.splitlines()[0]),
-     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`sed -n 395,415p "
+     (True, "blocked hook.query-first: NOTHING on this line ran (7 commands): command 2 (`sed -n 95,415p "
             "compiler/std/gpu/types.vl`) reads the compiler's .vl source"))
 case("compound, eval qwen35: the whole line, the read as its query",
      [l for l in err.splitlines() if l.startswith("try the whole line: ")][0].endswith(
-         "query text compiler/std/gpu/types.vl:395-415; ls examples/gpu/fluid2d/; wc -l examples/gpu/fluid2d/*.vl; "
+         "query text compiler/std/gpu/types.vl:95-415; ls examples/gpu/fluid2d/; wc -l examples/gpu/fluid2d/*.vl; "
          "cat tools/agent-feedback | head -20; ls evals/tasks/0.25.2/tools/"), True)
+# (0.25.2.2) The 0.25.2.1 eval's qwen35, round 2: a python edit of its own
+# program and a grep over compiler/std on one line; the grep has no query
+# not in doubt, so the message gives the line without it, to run as it is.
+line = ("cd %s && python3 - <<'EOF'\np = '/tmp/q/main.vl'\ns = open(p).read()\nopen(p, 'w').write(s)\nEOF\n"
+        "grep -n \"monotonic_now\\|pub fn\" compiler/std/time*.vl 2>/dev/null; ls" % TREE)
+st, err = blocked(line)
+rest = [l for l in err.splitlines(True) if l.startswith("try the line without it")]
+k = err.find("try the line without it (the rest did not run either): ")
+case("compound, eval qwen35 round 2: the line without the grep, to run as it is",
+     (st, err[k:].split("\nallowed:")[0] if k >= 0 else err),
+     (True, "try the line without it (the rest did not run either): cd %s && python3 - <<'EOF'\np = "
+            "'/tmp/q/main.vl'\ns = open(p).read()\nopen(p, 'w').write(s)\nEOF\nls" % TREE))
+case("line_without: a pipeline goes whole, the separator before it",
+     hook.line_without("a && grep x big.vl | head -3 && c", (), ["grep x big.vl"]), "a && c")
+case("line_without: nothing left but a cd", hook.line_without("cd /x && grep x big.vl", (), ["grep x big.vl"]), None)
+case("line_without: inside $(...), no", hook.line_without("x=$(grep y big.vl); echo $x", (), ["grep y big.vl"]),
+     None)
+case("line_without: two blocked", hook.line_without("a; grep x b.vl; c; head -400 d.vl; e", (),
+                                                    ["grep x b.vl", "head -400 d.vl"]), "a; c; e")
 st, err = blocked("cd %s && grep -rn \"sqrt\" compiler/std --include=*.vl | head -8; grep -rn \"sqrt\" "
                   "examples/gpu/fluid2d/*.vl | head -5; grep -rn \"sqrt\" docs/*.md book/*.md 2>/dev/null | head -5" % TREE)
 case("compound, eval cloth: nothing ran, the std part", (st, err.splitlines()[0]),
@@ -409,14 +453,16 @@ with tempfile.TemporaryDirectory() as tmp:
          ["volec query show compiler/src/front/big.vl (a whole small file) | volec query text "
           "compiler/src/front/big.vl:A-B", "volec query items crate::front::big",
           "ls; volec query items crate::front::big; echo done"])
-    st, err, recs = at(repo, "sed -n '10,20p' compiler/src/front/big.vl")
+    st, err, recs = at(repo, "sed -n '10,250p' compiler/src/front/big.vl")
     case("one command: the exact query first", (st, err.splitlines()[:2]),
-         (2, ["blocked hook.query-first: nothing ran: `sed -n '10,20p' compiler/src/front/big.vl` reads the "
+         (2, ["blocked hook.query-first: nothing ran: `sed -n '10,250p' compiler/src/front/big.vl` reads the "
               "compiler's .vl source",
               "compiler/src/front/big.vl is 400 lines (a file under 300 is read whole freely): `volec query items "
               "crate::front::big` lists its items, `volec query show NAME` one of them, `volec query show "
               "compiler/src/front/big.vl:LINE` the item at a line"]))
-    case("one command: try the query", err.splitlines()[2], "try: volec query text compiler/src/front/big.vl:10-20")
+    case("one command: try the query", err.splitlines()[2], "try: volec query text compiler/src/front/big.vl:10-250")
+    case("one command: a range of 11 lines runs (0.25.2.2)",
+         at(repo, "sed -n '10,20p' compiler/src/front/big.vl")[0], 0)
     st, err, recs = at(repo, "cat compiler/src/small.vl")
     case("small file: read whole", (st, [r["kind"] for r in recs]), (0, ["read-small"]))
     case("small file: sed -n", at(repo, "sed -n '1,5p' compiler/src/small.vl")[0], 0)
@@ -505,7 +551,7 @@ with tempfile.TemporaryDirectory() as tmp:
             return st, None, None, recs
         o = json.loads(OUT[0])["hookSpecificOutput"]
         return st, o, o["updatedInput"]["command"], recs
-    st, err = blocked("sed -n '120,180p' compiler/src/gvn.vl")
+    st, err = blocked("sed -n '120,380p' compiler/src/gvn.vl")
     case("block mode is the default", st, True)
     os.environ["VOLE_QUERY_MODE"] = "rewrite"
     st, o, cmd, recs = rewritten(repo, "sed -n '120,180p' compiler/src/front/big.vl")
@@ -599,7 +645,11 @@ with tempfile.TemporaryDirectory() as tmp:
         "sed -n 95,122p compiler/std/io.vl; sed -n 70,110p compiler/guide/std.md; ls tests/run | head -5; head -20 tests/run.sh",
     ]
     os.environ["VOLE_QUERY_MODE"] = "block"
-    case("iteration 3: all 26 lines blocked in block mode", [blk for blk in ITER3 if at(repo, blk)[0] != 2], [])
+    # (0.25.2.2) but the 5 whose every read of the compiler's source is a
+    # range of at most 200 lines (sed -n, head)
+    ran = [blk for blk in ITER3 if at(repo, blk)[0] != 2]
+    case("iteration 3: all 26 lines blocked in block mode but the 5 of line ranges",
+         (len(ran), all(re.search(r"sed -n \d+,\d+p compiler/(std|src)/", blk) for blk in ran)), (5, True))
     os.environ["VOLE_QUERY_MODE"] = "rewrite"
     got = {}
     for k, line in enumerate(ITER3):
