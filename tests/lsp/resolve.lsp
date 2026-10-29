@@ -207,7 +207,7 @@
 > {"jsonrpc":"2.0","id":94,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/more.vl"},"position":{"line":45,"character":22}}}
 < {"jsonrpc":"2.0","id":94,"result":{"uri":"file://@DIR@/more.vl","range":{"start":{"line":11,"character":7},"end":{"line":11,"character":11}}}}
 > {"jsonrpc":"2.0","id":95,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/more.vl"},"position":{"line":45,"character":22}}}
-< {"jsonrpc":"2.0","id":95,"result":{"contents":{"kind":"markdown","value":"```vole\nfn from(f: Feet) -> Meters\neffects: none (inferred)\nfeatures: none\n```\n\n`<Meters as From>::from` (method)\n"},"range":{"start":{"line":45,"character":22},"end":{"line":45,"character":26}}}}
+< {"jsonrpc":"2.0","id":95,"result":{"contents":{"kind":"markdown","value":"```vole\nfn from(f: Feet) -> Meters\neffects: none (inferred)\nfeatures: none\n```\n\n`<crate::more::Meters as From>::from` (method)\n"},"range":{"start":{"line":45,"character":22},"end":{"line":45,"character":26}}}}
 > {"jsonrpc":"2.0","id":96,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/more.vl"},"position":{"line":15,"character":4}}}
 < {"jsonrpc":"2.0","id":96,"result":{"uri":"file://@DIR@/more.vl","range":{"start":{"line":14,"character":9},"end":{"line":14,"character":12}}}}
 > {"jsonrpc":"2.0","id":97,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/more.vl"},"position":{"line":15,"character":4}}}

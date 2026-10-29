@@ -626,7 +626,11 @@ if [ $STOPPED -eq 0 ]; then
     note "head     $head_desc, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
     FINAL="$head_dir/$HEAD_BIN"
     mkdir -p "$ROOT/target"
-    cp "$FINAL" "$ROOT/target/$HEAD_BIN"
+    # (0.25.2.2) replaced by rename too: a copy over the file a test still
+    # runs rewrites that file in place, and macOS then kills every new run
+    # of it (Killed: 9, its pages no longer match the signature it cached)
+    cp "$FINAL" "$ROOT/target/$HEAD_BIN.new"
+    mv -f "$ROOT/target/$HEAD_BIN.new" "$ROOT/target/$HEAD_BIN"
     # (0.15) The tools binary: a compiler that passed its fixpoint and its
     # test suite, for querying and editing while target/volec is under
     # test (an agent's own builds replace that one); replaced by rename, so
