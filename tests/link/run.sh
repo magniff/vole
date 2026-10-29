@@ -25,9 +25,14 @@
 #   internal    the executable runs, its signature verifies, and the same
 #               input gives the same bytes
 #   default     it is the default
-#   internal-sdk its LC_BUILD_VERSION names the running macOS as the SDK
+#   internal-sdk its LC_BUILD_VERSION names SDK 26.0, as ld writes one
 #               (0.25.5: with SDK 12.0, libmalloc's old free path made the
 #               compiler linked so 10x slower)
+#   internal-bss (0.25.5) __data over two pages, pointers on its last
+#               page, and a __bss of 100000 bytes: the zerofill pages read
+#               zero, and the chains name the file's pages only, as ld's do
+#               (dyld_info; naming a zerofill page maps __LINKEDIT's bytes
+#               there: the compiler linked so crashed at its start)
 #   internal-ld a program it does not take (an import libSystem lacks) is
 #               linked by ld, whose failure is link.undefined
 #   libsystem   libSystem has every name of link_macho's LIBSYSTEM
@@ -78,6 +83,20 @@ fail() {
 cat >hello.vl <<'EOF'
 fn main() {
     println("hello");
+}
+EOF
+cat >bss.vl <<'EOF'
+static var DATA: [u8; 20000] = [1; 20000];
+static var NAMES: [str; 4] = ["a", "b", "c", "d"];
+static var ZEROS: [u8; 100000] = [0; 100000];
+
+fn main() {
+    var sum = 0;
+    for i in 0..100000 {
+        sum += ZEROS[i] as i64;
+    }
+    ZEROS[99999] = 2;
+    println(f"{sum} {NAMES[3]} {DATA[19999]} {ZEROS[99999]}");
 }
 EOF
 cat >missing.vl <<'EOF'
@@ -234,13 +253,22 @@ if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
         fail default "without --linker, not the internal linker's bytes: $(cat build.out)"
     fi
 
-    # internal-sdk: the SDK is the running macOS's (major.minor)
+    # internal-sdk: SDK 26.0 (12.0 before 0.25.5: libmalloc's old path)
     sdk=$(otool -l prog.internal | awk '/cmd LC_BUILD_VERSION/ { b = 1 } b && $1 == "sdk" { print $2; exit }')
-    host=$(sw_vers -productVersion)
-    if [ "${sdk%.*}" = "${host%.*}" ] || [ "$sdk" = "$host" ] || [ "${sdk%.*}" = "$host" ]; then
+    if [ "$sdk" = 26.0 ]; then
         pass internal-sdk
     else
-        fail internal-sdk "LC_BUILD_VERSION's sdk is $sdk, the running macOS $host"
+        fail internal-sdk "LC_BUILD_VERSION's sdk is $sdk, not 26.0"
+    fi
+
+    # internal-bss
+    pages() { dyld_info -fixup_chains "$1" 2>/dev/null | awk '/pages:/ { print $2 }' | tr '\n' ' '; }
+    if build --linker=internal bss.vl -o prog && [ "$(./prog)" = "0 d 1 2" ] \
+        && otool -l prog | grep -q 'sectname __bss' && codesign -v prog 2>/dev/null \
+        && build --linker=system bss.vl -o prog.ld && [ "$(pages prog)" = "$(pages prog.ld)" ]; then
+        pass internal-bss
+    else
+        fail internal-bss "--linker=internal: $(cat build.out); it printed: $(./prog 2>&1 | head -c 200); chain pages: $(pages prog), ld's: $(pages prog.ld)"
     fi
 
     # internal-ld
