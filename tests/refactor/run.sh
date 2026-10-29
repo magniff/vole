@@ -332,6 +332,8 @@ check module_path_without_crate "$ok" "$out"
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
+    # (0.25.5: a code written whole into a C string, `c"error[time.instructions]: ...`)
+    grep -rhoE --exclude-dir=.volec 'c"(error|warning)\[[a-z-]+\.[a-z0-9_-]+\]' compiler/src | sed -e 's/^c"[a-z]*\[\(.*\)\]$/c"\1"/'
     # (0.15: guide's codes, written into its own messages)
     grep -rhoE --exclude-dir=.volec '"(error|note) guide\.[a-z-]+' compiler/src | sed -e 's/^"[a-z]* \(.*\)$/c"\1"/'
 } | sed -e 's/.*c"\([^"]*\)"$/\1/' | grep -v '^embed\.sh$' | sort -u >"$WORK/codes"
