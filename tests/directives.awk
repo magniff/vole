@@ -1,5 +1,5 @@
 # The directives of a test case (listed at the top of tests/run.sh), one
-# file per directive in directory `dir`: args, stdin, expect, exit, errors,
+# file per directive in directory `dir`: args, stdin, env, expect, exit, errors,
 # xfail, flags, ... Shared by tests/run.sh and tests/objcheck.sh:
 #   awk -v dir=DIR -v target=TARGET -f tests/directives.awk CASE
 {
@@ -16,6 +16,7 @@
     if (substr(value, 1, 1) == " ") value = substr(value, 2)
     if (key == "ARGS") args = value
     else if (key == "STDIN") stdin = stdin (nstdin++ ? "\n" : "") value
+    else if (key == "ENV") envs = envs value "\n"
     else if (key == "EXPECT") expect = expect (nexpect++ ? "\n" : "") value
     else if (key == "EXPECT-PPM") ppms = ppms value "\n"
     else if (key == "EXIT") exitcode = value + 0
@@ -51,6 +52,7 @@
 END {
     printf "%s", args > (dir "/args")
     printf "%s", stdin > (dir "/stdin")
+    printf "%s", envs > (dir "/env")
     printf "%s", expect > (dir "/expect")
     printf "%s", ppms > (dir "/ppms")
     printf "%d", exitcode > (dir "/exit")

@@ -69,7 +69,223 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.2.2 | `v0.25.2.2` | 0.25.2.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the second GPU eval: a `requires` call's `?` arguments kept to the call; std::gpu layouts per entry point, `gpu.unwritten`, more storage formats, limits named; integer methods; ten diagnostics; `query show` across programs; the hooks quieter and clearer |
 
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
+| 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.4
+
+`volec run`, the pathtrace laboratory's feedback (feedbacks/pathtrace-ui.md),
+the bugs carried from 0.25.3, std's unsafe justified to the last site, and
+the start of compiler/src's modernization (docs/design/modernize-0254.md:
+its plan, its first three steps and the first tables). Language changes to
+review: `const X: str` is allowed; an array of unsuffixed literals takes
+the other side's type; `f"""` text blocks; a closure's `|x: sink T|` and
+its Fn bound must agree. Breaking: std's `sys_poll` and `__io_error`
+signatures, and `#[sealed]` on std's thread and sync handles (below).
+compiler/src's unsafe: 5,380 sites (5,316 unjustified) in 0.25.3, 4,489
+(4,365) now; std's: 1,204 (1,194), 893 (0).
+
+- `const X: str = "...";` is allowed: text, a constant, each use the
+  literal, as a `[u8]` constant's is (`guide text#string-constants`).
+  0.25.3 refused it because, allowed, it crashed: the checker inlined a
+  string constant's literal only when its type was `[u8]`, so a `str`
+  one was read as an integer constant, a null slice.
+- A closure's `let` parameter takes a value with no place (`f(make())`),
+  lent as a temporary of the statement and dropped at its end, as a
+  function's does; 0.25.3 said "this value has no place".
+- A closure whose parameter is taken another way than its `Fn` bound
+  gives it (`|r: sink R|` for `F: FnMut(R)`, `|r: R|` for
+  `FnMut(sink R)`, a let one for an `inout` one) is refused as not
+  satisfying the bound, naming both ways, with the fix (`fix
+  --suggested`) that writes the bound's; 0.25.3 gave a type mismatch
+  whose help was wrong ("this value has no place", `*R`, `&i64`).
+- `f"""` is an f-string text block: a text block's lines and dedent
+  with an f-string's holes, specs and `{{ }}`, quotes as text
+  (`guide syntax#lexical`); 0.25.3 said "newline in string literal".
+  The language server's completion reads text blocks as one literal.
+- The gate no longer stops a step that waits for a slot while the other
+  steps' jobs use them all: 0.25.2.2's and 0.25.3's container rows
+  stopped a fuzz row so ("0 of 8 slots free (slots lost with killed
+  jobs?)") while the other 18 rows ran on the same slots to the end; no
+  slot was lost. A still step is stopped when a slot is free, or when no
+  step moved for `$VOLE_GATE_STALL` s; its processes and what they wait
+  on go to its log, and they get 10 s after TERM to give their slots
+  back. Two self-test rows (`gate.sh --self-test`) pin it.
+- The check and turn-end hooks notice a tools binary older than the
+  tree's source (`volec --version` below compiler/src/main.vl's
+  `version()`): right after 0.25.3 the stop hook reported 16 errors that
+  were 0.25.3's text blocks read by 0.25.2.2. They check with a current
+  target/volec instead, or not at all, and say so in one line
+  (`hook.stale-volec`) with the `try:` that installs the release's build.
+- An error whose fix `fix --suggested` refuses before making it (a
+  conversion that loses the value, a cast of a cast, a call made to call
+  itself, std's function for another type) no longer prints `try: volec
+  fix --suggested`; the refusal's `note fix.refused` still says why.
+- A `requires` or `ensures` message's f-string hole that is not an
+  integer, or a fourth hole, is `contract.message`, which says what
+  shows such a value (0.25.3: "expected 'i64', got 'str'", and a fourth
+  hole was left out of the message silently). The holes stay integers.
+- **`std::num::fmt_f64(v, decimals, &out) -> i64`**: a float with a
+  fixed number of decimals (0 to `FIXED_DECIMALS_MAX`, 20) at the end
+  of a `[u8; 32]`, no allocation, `fmt_i64`'s shape: `{v:.N}`'s text
+  byte for byte (the exact value rounded to the nearest, a tie to the
+  even digit, `-0.00`, `NaN`, `inf`; `{v:e}`'s when longer than 32
+  bytes), checked against `format_in` on 149,331 generated cases
+  (tests/run/std_num_fmt_f64.vl); `guide text#numbers-as-text-without-an-allocator`.
+  examples/gpu/pathtrace uses it instead of its own `format_fixed`, and
+  its camera's five C math calls are `f64` methods (no `unsafe` left).
+- **`guide gpu-render#drawing-over-the-image-you-just-made`**: an
+  overlay pass (`PassDesc::color(view, load: Load::Keep)`,
+  `Blend::alpha()`, a vertex layout of position, colour and uv, an
+  `R8Unorm` atlas with a white texel, text measured and drawn), compiled
+  and its pixels read back by `tests/run.sh guide`; from pathtrace's UI.
+- **`guide window#checking-the-pixels-headless`**: a windowed program's
+  frame drawn into `RawSurface::Headless`, read back and written as a
+  PPM (pathtrace's `--headless --ui` the worked example), pointed to
+  from `guide gpu`'s `RawSurface::Headless`.
+- `guide window`: the scale is the window's (`Size`, `Resize`), not the
+  surface's; `Surface` has no `scale`, and the mouse example keeps it.
+- `guide testing`: a `#[test]` sees its module's private functions and
+  methods and every field (fields are as visible as their struct), with
+  a two-file example; tests/guide/run.sh now runs `volec test` on a
+  guide program with `#[test]`s, so their bodies are checked and run (a
+  build leaves them out).
+- **An array of unsuffixed literals takes the other side's type**, as a
+  literal does: `if down { ACCENT } else { [0.20, 0.52, 0.70, 1.0] }`
+  with `ACCENT: [f32; 4]` is a `[f32; 4]` (an `else if` chain too), and
+  so is a match arm (before or after the typed one) and an element of
+  `[[0.1, 0.2, 0.3, 1.0], ACCENT]`; 0.25.3 said `if/else branches have
+  different types: '[f32; 4]' vs '[f64; 4]'`. A branch that is a local
+  made of literals (`let base = [0.2, ...];`) gets the note at its `let`
+  with the annotation and its `edit patch`, as a mismatch does.
+- **The check hook formats a new file**: a `.vl` file the agent has just
+  created with Write, outside compiler/src and compiler/std, goes
+  through `volec fmt` before the check, and the hook names the changes
+  as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
+  rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
+  An existing file still gets the one-line note only.
+- **A windowed program's own event loop runs without a display**: with
+  `VOLE_WINDOW_SCRIPT` set, `App::new_in` opens no window server and
+  the events come from the script (std::window::script): keys (with
+  their Text), mouse moves, presses, releases and clicks, scrolls,
+  resizes, focus, Close and Quit, and each Frame as soon as the program
+  asks for it, never from the 10 Hz timer a hidden window gets. The
+  window's `raw_surface()` is null, which std::gpu takes for a headless
+  surface, so the program needs no code for it; `shot FILE` writes the
+  next frame presented as a PPM (`gpu::capture_next_frame`, which a
+  program can call too). The GPU evals' agents could not test input or
+  frame times; now `tests/examples/gpu-life-script.test` paints and
+  steps examples/gpu/life and `pathtrace-script.test` clicks a button of
+  pathtrace's panel, each against a golden region
+  (`guide window#testing-input-without-a-display`). The test runner
+  gets `// ENV: NAME=VALUE`.
+- **GPU timestamps**, on WebGPU's timestamp-query: `dev.query_set(n)`,
+  `enc.compute_pass_timed(set, begin, end, |pass| ..)` and
+  `render_pass_timed`, `enc.resolve_query_set(set, first, count, buf,
+  offset)` into a `BufferUsage::QUERY_RESOLVE` buffer, and
+  `queue.timestamp_period()` (ns a tick). On Metal a timed pass is a
+  command buffer of its own and its timestamps are the command buffer's
+  `GPUStartTime` and `GPUEndTime` (already bound; counter sampling would
+  have needed a dozen new Objective-C classes and methods for the same
+  per-pass resolution on Apple GPUs, which sample at stage boundaries
+  only); a submission with timed passes returns once they have
+  finished. `dev.caps().timestamps` says whether a device has them
+  (`gpu.unsupported` otherwise, never a wrong number).
+  `tests/gpu/cases/timestamp_query.vl` checks that a kernel looping 8
+  times longer measures longer (the ratio of medians), and
+  `guide gpu#timing-gpu-work` uses them.
+- `volec fix --only unneeded-unsafe`: the unsafe blocks with
+  nothing unsafe inside (`volec query unsafe`'s `none (unneeded)`) taken
+  away, the code in them kept in its scope (a block on lines of its own
+  becomes its lines, one level less indented; a block on one line its
+  code, parenthesized where operators around could bind otherwise); a
+  block that declares and is not last, one with a string over several
+  lines, one whose comments say `UNSAFE:`/`SAFETY:` are left and counted.
+  Run over compiler/src: 938 blocks gone, the unjustified sites 5,315 to
+  4,377, before the merge of
+  bugs254 (docs/unsafe-baseline.md), every compilation of the corpus
+  byte-identical (`volec same-output`). The plan for the rest of
+  compiler/src's modernization: docs/design/modernize-0254.md.
+- **`volec refactor table X`** (modernize-0254.md step 3):
+  a raw table, `static var X: *T` with its X_COUNT and X_CAP grown by
+  `grow`, becomes `static var X: Vec<T, Comp>` with every use: the grow
+  goes, a store and its increment are `X.push(v)`, X_COUNT is `X.len()`,
+  `= 0` `X.clear()`, `-= k` `X.truncate(..)`, the statics and their
+  imports go. A use it cannot place (`&X[i]`, X passed or freed, X_CAP
+  read, X_COUNT written, a call between a store and its increment that
+  reads the count) is listed and nothing is changed
+  (`refactor.table-use`; docs/refactor-shape.md, "refactor table").
+- **`volec run [DIR] [OPTIONS] [-- ARGS...]`** builds the program whose
+  root is DIR/main.vl (DIR: the current directory when none is given)
+  and runs it: stdin, stdout and stderr its own, the words after `--`
+  its arguments as they are (`--help` and `--json` too), its exit
+  status volec's (128 + N when signal N ended it, as a shell says).
+  OPTIONS are a plain build's (`-O0`, `-l`, `-L`, C files and objects,
+  `-framework`, `--check-alloc`...; `--target` only the host's), and a
+  build error is the plain build's (status 1, nothing run). The program
+  is kept in volec's cache, never in DIR: CACHE/run/NAME-KEY/NAME, CACHE
+  the tools' cache (./target/volec-cache, `$VOLE_CACHE`) or else
+  `$TMPDIR/volec-cache`, which the code cache then uses too; KEY hashes
+  the root's absolute path and the options. It is built again only when a
+  .vl file under DIR or a file of the link changed, or another compiler
+  runs (`volec test`'s check, now shared: tools/testrun/program.vl);
+  `-o FILE` keeps a copy at FILE too. On a terminal: the build's lines,
+  naming the program (`Finished NAME in 0.4s`; `Finished` alone when
+  nothing changed), then `Running NAME`; elsewhere only the program's
+  output. Its errors: `run.no-main` (a folder without main.vl: `try:
+  volec run DIR/SUB` for a subfolder that has one, or the plain build of
+  its one .vl file), `run.file` (a file for its folder), `run.args` (a
+  second folder: the program's arguments go after `--`), `run.option`
+  (`-c`, `-S`, `--emit-ir`, another target...); `volec explain run.no-main`.
+  `$VOLE_CACHE_TRACE` gets `run fresh` or `run build`. `volec run` was
+  `cli.not-a-command` in 0.25.3; `volec exec` now reads as `run`
+  (tests/refactor/run254.t).
+- The words after `--` reach a command as they are: `--json`,
+  `--values=...` and `--help` there were volec's own before.
+- **std's unsafe, every site justified**: `volec query
+  unsafe std --summary` went from 1204 sites (1194 without `// UNSAFE:`
+  and `// SAFETY:` above them, 13 unneeded) to 893 sites, 0 unjustified,
+  3 reported unneeded (generic methods the query cannot see instantiated;
+  they are needed). docs/unsafe-baseline.md's std line is 0, so the gate
+  fails on any new unjustified site in std. Per class: ffi 718 to 456,
+  raw-pointer 346 to 317, other 90 to 72, alloc 39, static-mut 6
+  to 4, transmute 5. `[T]::get`'s unchecked read stays (1.9x faster than
+  `s[i]` in a 400M-read loop at -O2).
+- **Soundness fixes in std**: `RecvIter` holds its own reference to the
+  channel and has `Drop` (iterating after both ends were dropped read
+  freed memory); `SysDir` and `SysSpawnActions` have `Drop` (a dropped
+  one leaked its handle); `strerror` and `ptsname` became `strerror_r`
+  and `ptsname_r` (both raced between threads); `NsWindow::close` clears
+  its view, layer and display link, so a closed window's methods do
+  nothing instead of using a released object; stdin's buffer checks its
+  `malloc` for null (a static array instead made every program's object
+  64 KiB larger, and a hello world's build 1.46x dearer).
+- **Breaking, std's signatures**: `sys_poll(fds: inout [SysPollFd], ...)`
+  (it writes `revents`; it took the slice by `let`); `__io_error(kind,
+  msg: [u8])` and `io::Error` keeps a message index, not a C string;
+  `#[sealed]` on `SysDir`, `SysSpawnActions`, `Mutex`, `MutexGuard`,
+  `Sender`, `Receiver`, `RecvIter`, `JoinHandle`, `Scope` and
+  `ScopedJoinHandle`, whose fields hold raw pointers a struct literal
+  could forge; `atomic_fence` and `atomic_compiler_fence` are safe; the
+  private `utf8_word` is `unsafe fn`.
+- **std::objc**: `selector(name: [u8])` and `class_named(name: [u8])`,
+  safe, for the selectors and classes the bindings name; the generated
+  bindings (tools/objcgen) carry their `UNSAFE:`/`SAFETY:` comments.
+- **std's core sections**: `Mutex`, `Once` and `Condvar` moved to a lazy
+  section of their own ("Mutex, Once and Condvar (0.21)"), so a program
+  that prints does not read them; core is 157436 bytes of 163840.
+- **A Vec's header out of its loops** (-O2;
+  docs/optimizer.md, "0.25.4: Vec facts"; middle/vecfacts.vl): a let
+  parameter's Vec does not change during the call, and a store to a
+  Vec's element does not reach that Vec's ptr, len or cap, so GVN, LICM
+  and the vectorizer (which now moves a loop's invariant loads out
+  first) keep them from before the loop. `for i in 0..v.len() { s +=
+  v[i] }` over a let parameter is vectorized again (55 to 36 ms on
+  bench/vecloop, IntVec's 35), `v[i] = v[i] + 1` over an inout Vec
+  loses its bounds check and is vectorized (26 to 9 ms), and a static
+  Vec's ptr and len are read once before a loop that indexes it. What
+  unsafe code must keep for it is in `guide unsafe`: nothing lent let
+  changes during the call, through a raw pointer either.
 
 ### What's new in 0.25.3
 

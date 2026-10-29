@@ -47,7 +47,9 @@ main.vl:22:16: pop on an empty stack: self.items.len() = 0
 - A failure reads `requires failed: 'COND' of 'f' (FILE:L:C): x = 4, ...`
   (the integer operands' values; a float's in millionths, `d = 707106e-6`,
   0.25.2.1). `else "text"` (or an f-string,
-  evaluated only on failure) replaces all before the values.
+  evaluated only on failure) replaces all before the values. The
+  f-string's holes are integers, three at most (`contract.message`): a
+  float or text shows as an operand of the condition instead.
 - `debug requires` / `debug ensures` are checked only by `volec test`
   (and `--debug-contracts`): for conditions that cost more than the
   function (`debug requires is_sorted(v)`).

@@ -154,7 +154,7 @@ def call_kind(tool, what):
     if calls:
         sub = calls[0][0]
         if sub in ("query", "edit", "refactor", "fix", "check", "test", "probe", "guide", "fmt", "undo", "rewrite",
-                   "explain", "reduce", "batch"):
+                   "explain", "reduce", "batch", "run"):
             return "volec " + sub
         return "volec build"
     first = re.split(r"[\s;|&]+", w, maxsplit=1)[0] if w else ""

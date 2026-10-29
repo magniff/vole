@@ -30,8 +30,11 @@ small queries.
    the mechanical ones itself (a call's `&`, Rust's spellings, an
    unused import), each shown as `changed FILE:LINE: OLD -> NEW`; the
    others it shows as `suggested, not applied`: read each first.
-4. Build and run: `volec main.vl -o prog && ./prog` (a build that
-   works ends with `ok: built prog`).
+4. Build and run: `volec run` (0.25.4: `volec run DIR -- ARGS`;
+   DIR/main.vl, here ./main.vl, built into volec's cache when it
+   changed, then run; off a terminal only the program's output, its
+   exit status volec's). For the executable itself, `volec main.vl -o
+   prog` (a build that works ends with `ok: built prog`).
 
 ## The program
 
@@ -91,6 +94,7 @@ bodies.
 | sizes, dependencies | `volec query stats`, `query deps MODULE` |
 | std's API, a std item | `volec query items std`, `query show std::read_line` (any program; a re-exported name too: `query show std::gpu::Color`) |
 | what a snippet does | `volec try 'let v = [3, 1]; v[..].len()'` prints `i64 = 2` |
+| build a program and run it (0.25.4) | `volec run [DIR] [OPTIONS] [-- ARGS]` (DIR/main.vl; rebuilt only when it changed; the binary in volec's cache, never in DIR) |
 | the guide on some words | `volec guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
 | items like one, to copy for a new one; recipes for adding an X (0.17) | `volec query similar NAME`; `query examples KIND`; `volec guide how` |
 
@@ -121,6 +125,7 @@ an edit then `check`.
 | rename a local or parameter | `volec refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
 | a parameter, with every call | `volec refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--convention v inout`: the calls pass `&v`, `--convention v let` or `sink`: `v`) |
 | a field, with every literal | `volec refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
+| a raw table (`*T`, X_COUNT, X_CAP) to a Vec, with every use | `volec refactor table X --dry-run` (refused, nothing changed, when a use cannot be placed: each listed); then `volec fix --only unneeded-unsafe` |
 | a variant, with every match | `volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `volec refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `volec rewrite 'old($a)' 'new($a)' --dry-run` |

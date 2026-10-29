@@ -1,4 +1,4 @@
-# GPU: std::gpu (0.22; guide updated 0.25.3)
+# GPU: std::gpu (0.22; guide updated 0.25.4)
 
 `std::gpu` is compute and rendering on the GPU, on wgpu's model: an
 `Instance`, an `Adapter`, a `Device` and its `Queue`; `Buffer`s,
@@ -108,7 +108,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
   (`guide window`).
 - The handles (`dev`, `cells`, `step`, ...) move: keep them in one
   owner, `gpu#handles`. Headless (tests, a server):
-  `RawSurface::Headless` gives frames without a window.
+  `RawSurface::Headless` gives frames without a window; reading them
+  back to check a windowed program's pixels: `window#checking-the-pixels-headless`.
 
 @PAGE-END@ More, a section at a time (`volec guide gpu#NAME`; `volec guide gpu#` lists them): `handles` (which objects move; keeping them in a struct, a Vec, a closure), `lifecycle` (the objects; mapping and readback), `compute`, `ordering` (dispatches in a pass), `bind-groups`, `one-module-per-kernel`, `uniform-and-storage-layout`, `workgroups`, `buffer-sizes`, `atomics`, `ping-pong`, `per-step-parameters`, `timing-gpu-work`, `what-the-translation-rejects`, `contracts` (the gpu.* stops). Rendering: `volec guide gpu-render`; the window and the mouse: `volec guide window`. All of it: `volec guide gpu --whole`.
 
@@ -1020,8 +1021,75 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 
 ## Timing GPU work
 
-std::gpu has no timestamp queries (no GPU-side clock): time the work on
-the CPU, around the submission and a wait for it to finish:
+(0.25.4) GPU timestamps, on WebGPU's timestamp-query, give the GPU's
+own time for a pass, which the load of other processes on the CPU does
+not change: a `QuerySet` (`dev.query_set(n)`), passes that write two of
+its timestamps when their work begins and ends
+(`enc.compute_pass_timed(set, begin, end, |pass| ...)`,
+`enc.render_pass_timed(desc, set, begin, end, |pass| ...)`; -1: not
+that one), `enc.resolve_query_set(set, first, count, buf, offset)` into
+a buffer made with `BufferUsage::QUERY_RESOLVE` (copy it into a
+`MAP_READ` one to read; the offset a multiple of 256), a `u64` a
+timestamp, and `queue.timestamp_period()`, the ns of a tick:
+
+```vole
+use std::gpu;
+use std::gpu::BufferUsage;
+
+const STEP: [u8] = """
+    @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        for (var i = 0u; i < 256u; i = i + 1u) {
+            xs[id.x] = xs[id.x] * 3u + 1u;
+        }
+    }
+    """;
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP)?, "main")?;
+    let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, xs)][..]);
+    let set = dev.query_set(2);
+    let resolved = dev.buffer(256, BufferUsage::QUERY_RESOLVE | BufferUsage::COPY_SRC);
+    var out = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.compute_pass_timed(set, 0, 1, |pass| { // 0: its beginning, 1: its end
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch(1024);
+    });
+    enc.resolve_query_set(set, 0, 2, resolved, 0);
+    enc.copy_buffer(resolved, 0, out, 0, 16);
+    queue.submit(enc.finish()); // returns when the timed pass has finished
+    let t = gpu::u32s(out.map_read(dev)); // two u64s, little-endian
+    let begin = t[0] as u64 | (t[1] as u64) << 32;
+    let end = t[2] as u64 | (t[3] as u64) << 32;
+    let ns = (end - begin) as f64 * queue.timestamp_period();
+    println(f"the pass took GPU time: {ns > 0.0}"); // a report prints f"{ns / 1.0e6:.3} ms"
+    Ok(())
+}
+```
+```out
+the pass took GPU time: true
+```
+
+- On Metal a timed pass is a command buffer of its own, and its
+  timestamps are the command buffer's `GPUStartTime` and `GPUEndTime`,
+  in ns (the period is 1). Metal gives them when the work has
+  completed: a submission with a timed pass returns once that work has
+  finished, so time a loop's passes, not its throughput, this way. Off
+  Metal a device has no timestamps (`dev.caps().timestamps` false;
+  `query_set` stops with `gpu.unsupported`), never a wrong number.
+- Passes that share no buffer may run at once on the GPU: two timed
+  passes' intervals can overlap, and each still measures its own work.
+- Compare times as ratios (this kernel against that one, before and
+  after a change), the median of several runs after a warm-up: the GPU
+  is shared with the display and other programs.
+
+Wall time, on the CPU around the submission and a wait for it, is what
+a frame costs the program; timestamps are what the GPU spends:
 
 ```vole
 use std::gpu;
@@ -1042,8 +1110,9 @@ fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
 ```
 
 - What it measures is wall time: encoding on the CPU, submission, the
-  GPU's work and the wait's wake-up. For the GPU's share, make the work
-  large (many steps in one submission) so the fixed cost (tens of
+  GPU's work and the wait's wake-up, and other processes' load swings it
+  (tenfold). For the GPU's share use timestamps, or make the work large
+  (many steps in one submission) so the fixed cost (tens of
   microseconds) is small beside it, and say so when reporting.
 - Run it a few times first (the first submission compiles and warms
   caches), then take the median of several runs, not one.
@@ -1052,7 +1121,8 @@ fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
   once, divide by N (`guide window#when-the-window-is-not-shown`).
 - A frame loop's time is the time between frames: with vsync it is the
   display's rate, not the GPU's, and while the window is not shown a
-  10 Hz timer's; time with `vsync: false` or headless.
+  10 Hz timer's; time with `vsync: false`, headless, or a scripted event
+  loop (`guide window#testing-input-without-a-display`).
 - `map_read` and `dev.wait_idle()` wait too: a readback inside the timed
   region adds its copy.
 
@@ -1117,4 +1187,4 @@ is (no adapter, a shader the driver rejects) is a `gpu::Error`.
 Surfaces (`inst.surface(dev, RawSurface::MetalLayer(layer))`,
 `surf.configure(..)`, `surf.frame()?`, `frame.present(&queue)`) are
 what std::window draws into; `RawSurface::Headless` gives frames without
-a window.
+a window (to check a window's pixels: `window#checking-the-pixels-headless`).

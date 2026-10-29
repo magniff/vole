@@ -5,11 +5,13 @@ $ views first_word pick text_of intern count
 crate::first_word	views(s) declared
 crate::pick	views(toks, counts) declared
 crate::text_of	views(*toks) declared
+std::window::script::text_of	views()
 crate::intern	views() stores(word) declared
 std::gpu::wgsl::ir::Module::intern	views() inferred
 std::gpu::wgsl::msl::W::intern	views() inferred
 crate::count	views()
 <std::objc::Ref as NSArrayMethods>::count	views()
+std::gpu::timing::QuerySet::count	views()
 <std::string::Chars as Iterator>::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
@@ -30,6 +32,8 @@ Vec<EntryInfo>::as_slice	views(self) declared
 Vec<BindingInfo>::as_slice	views(self) declared
 Vec<InputInfo>::as_slice	views(self) declared
 Vec<i64>::as_slice	views(self) declared
+Vec<Seg>::as_slice	views(self) declared
+Vec<Stamp>::as_slice	views(self) declared
 Vec<Type, ScopedArena>::as_slice	views(self) declared
 Vec<StructMember, ScopedArena>::as_slice	views(self) declared
 Vec<i64, ScopedArena>::as_slice	views(self) declared
@@ -62,8 +66,10 @@ Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<Req>::as_slice	views(self) declared
 Vec<State>::as_slice	views(self) declared
-Vec<Buffer>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
+Vec<Step>::as_slice	views(self) declared
+Vec<str>::as_slice	views(self) declared
+Vec<Buffer>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
 Vec<JobBuffer, ScopedArena>::as_slice	views(self) declared
@@ -80,6 +86,8 @@ Vec<[i64; 2]>::push	views()
 Vec<EntryPoint>::push	views() stores(x) declared
 Vec<Binding>::push	views()
 Vec<VertexInput>::push	views()
+Vec<Seg>::push	views()
+Vec<Stamp>::push	views()
 Vec<Type, ScopedArena>::push	views() stores(x) declared
 Vec<Expr, ScopedArena>::push	views() stores(x) declared
 Vec<[u8], ScopedArena>::push	views() stores(x) declared
@@ -119,9 +127,10 @@ Vec<Event>::push	views()
 Vec<State>::push	views()
 Vec<Watch>::push	views()
 Vec<Req>::push	views()
+Vec<Step>::push	views()
+Vec<str>::push	views() stores(x) declared
 Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<(i64, u32)>::push	views()
-Vec<str>::push	views() stores(x) declared
 Vec<Path>::push	views() stores(x) declared
 Vec<Result<DirEntry, Error>>::push	views()
 $ views crate --why
@@ -142,6 +151,7 @@ crate::count	views017/main.vl:32:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: n
 std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64
 std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
 <std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
+std::gpu::timing::QuerySet::count	../../compiler/std/gpu/timing.vl:37:12	method	pub fn count(self) -> i64	effects: none
 <std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
 std::cli::Matches::count	../../compiler/std/cli.vl:1417:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here

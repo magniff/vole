@@ -23,11 +23,14 @@
 //   the device's ShaderKind (MSL on Metal): a ShaderSource, the code and
 //   its reflection.
 
+mod capture;
 pub mod hal;
 pub mod shader;
+mod timing;
 pub mod types;
 pub mod wgsl;
 
+pub use std::capture::{capture_cancel, capture_next_frame, capture_pending};
 use std::iter::Range;
 
 use hal::metal as backend;
@@ -36,6 +39,7 @@ pub use shader::{
     Binding, BindingType, EntryPoint, GroupBinding, Reflection, ShaderKind, ShaderSource,
     VertexInput,
 };
+pub use timing::{MAX_QUERIES, QuerySet};
 use types::{MAX_BIND_GROUPS, MAX_COLOR_TARGETS, MAX_VERTEX_BUFFERS};
 pub use types::{
     AddressMode, Blend, BlendComponent, BlendFactor, BlendOp, BufferUsage, Color, ColorTarget,
@@ -43,10 +47,6 @@ pub use types::{
     Power, SamplerDesc, ShaderStage, StepMode, TextureDesc, TextureUsage, Topology, VertexAttribute,
     VertexFormat, VertexLayout,
 };
-
-extern "C" {
-    fn exit(status: i32) -> !;
-}
 
 /// The backend of this build (Metal on macOS).
 pub type Native = backend::Metal;
@@ -97,8 +97,7 @@ impl Debug for Error {
 /// of Gpa does.
 fn out_of_memory(what: [u8]) -> ! {
     eprintln(f"gpu: out of device memory ({what})");
-    // exit is the C library's
-    unsafe { exit(101) }
+    std::process::exit(101)
 }
 
 // ---- GPU: instance, adapters, devices (0.22) ----
@@ -162,6 +161,7 @@ impl Instance {
         match N::create_surface(dev.raw, raw) {
             Some(s) => Ok(Surface {
                 raw: s, configured: false, width: 0, height: 0, format: Format::Bgra8Unorm,
+                dev: dev.raw.clone(), gpa: self.gpa,
             }),
             None => Err(Error::SurfaceLost),
         }
@@ -737,6 +737,8 @@ impl Device {
         Encoder {
             raw: N::begin(self.raw), limits: self.limits, caps: self.caps,
             unwritten: Unwritten::new(), maps: Vec::new_in(self.gpa),
+            dev: self.raw.clone(), segs: Vec::new_in(self.gpa), stamps: Vec::new_in(self.gpa),
+            resolve_next: false,
         }
     }
 
@@ -768,7 +770,12 @@ impl Queue {
         for i in 0..c.unwritten.fills {
             self.wrote(c.unwritten.fill[i]);
         }
-        N::submit(&self.raw, &c.raw);
+        if c.segs.len() > 0 || c.resolve_next {
+            // (0.25.4) timed passes or resolves (timing.vl)
+            timing::submit_segments(&self.raw, &c);
+        } else {
+            N::submit(&self.raw, &c.raw);
+        }
     }
 
     // A uniform buffer has been written (its id, once).
@@ -1425,6 +1432,13 @@ pub struct Encoder {
     // way the GPU reaches one, map_usage_fault), a handle of each, for
     // submit's gpu.state; on the device's allocator, from the first
     maps: Vec<backend::Buffer>,
+    // (0.25.4) timing (timing.vl): the device, for a new command buffer;
+    // the command buffers ended before a timed pass, by it and before a
+    // resolve; the timestamps written; the current one resolves
+    dev: backend::Device,
+    segs: Vec<timing::Seg>,
+    stamps: Vec<timing::Stamp>,
+    resolve_next: bool,
 }
 
 /// Recorded commands, for `queue.submit` (dropped unsubmitted: discarded).
@@ -1432,6 +1446,10 @@ pub struct Commands {
     pub raw: backend::CommandBuffer,
     unwritten: Unwritten,
     maps: Vec<backend::Buffer>,
+    // (0.25.4) the encoder's split command buffers and timestamps
+    segs: Vec<timing::Seg>,
+    stamps: Vec<timing::Stamp>,
+    resolve_next: bool,
 }
 
 // (0.25.3) The first buffer of `maps` (the mappable buffers recorded
@@ -2017,7 +2035,10 @@ impl Encoder {
 
     /// The recorded commands, for `queue.submit`.
     pub fn finish(sink self) -> Commands {
-        Commands { raw: self.raw, unwritten: self.unwritten, maps: self.maps }
+        Commands {
+            raw: self.raw, unwritten: self.unwritten, maps: self.maps, segs: self.segs,
+            stamps: self.stamps, resolve_next: self.resolve_next,
+        }
     }
 
     // (0.25.3) A buffer a copy uses: when it is mappable, a handle of it
@@ -2041,6 +2062,9 @@ pub struct Surface {
     pub width: i64,
     pub height: i64,
     pub format: Format,
+    // (0.25.4) the device it was made for, for capture_next_frame
+    dev: backend::Device,
+    gpa: Gpa,
 }
 
 /// A frame of a surface: its texture is the render target; `present`
@@ -2048,6 +2072,8 @@ pub struct Surface {
 pub struct Frame {
     pub raw: backend::Frame,
     pub texture: Texture,
+    // (0.25.4) a capture asked for (capture_next_frame) when it was taken
+    cap: Option<capture::Capture>,
 }
 
 impl Surface {
@@ -2077,7 +2103,12 @@ impl Surface {
                     width: self.width, height: self.height, layers: 1, mips: 1, format: self.format,
                     usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC,
                 };
-                Ok(Frame { raw: f, texture: Texture { raw: t, desc: desc } })
+                let cap = if std::capture::capture_pending() {
+                    Some(capture::Capture { dev: self.dev.clone(), gpa: self.gpa })
+                } else {
+                    None
+                };
+                Ok(Frame { raw: f, texture: Texture { raw: t, desc: desc }, cap: cap })
             }
             None => Err(Error::SurfaceLost),
         }
@@ -2085,9 +2116,18 @@ impl Surface {
 }
 
 impl Frame {
-    /// Shows the frame after the work submitted to queue so far.
+    /// Shows the frame after the work submitted to queue so far. (0.25.4)
+    /// After capture_next_frame, the frame is also written to its file.
     pub fn present(sink self, queue: inout Queue) {
         let f = self;
+        match f.cap {
+            Some(cap) => {
+                if std::capture::capture_pending() {
+                    capture::write(cap, &queue, f.texture);
+                }
+            }
+            None => {}
+        }
         N::present(&queue.raw, f.raw);
     }
 }
@@ -2097,21 +2137,27 @@ impl Frame {
 /// The bytes of a slice of f32s (a view of the same memory).
 #[views(s)]
 pub fn bytes_of_f32(s: [f32]) -> [u8] {
-    // s.len() f32s are s.len() * 4 readable bytes; u8 has no alignment
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() f32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; #[views(s)] keeps the result from outliving s.
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
 }
 
 /// The bytes of a slice of u32s (a view of the same memory).
 #[views(s)]
 pub fn bytes_of_u32(s: [u32]) -> [u8] {
-    // as bytes_of_f32
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() u32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; #[views(s)] keeps the result from outliving s.
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
 }
 
 /// The bytes of a slice of i32s (a view of the same memory).
 #[views(s)]
 pub fn bytes_of_i32(s: [i32]) -> [u8] {
-    // as bytes_of_f32
+    // UNSAFE: a view of one element type as another is a raw-pointer slice; std has no safe cast.
+    // SAFETY: s.len() i32s are s.len() * 4 readable bytes at s.ptr, u8 needs no alignment and any
+    // byte is a u8; #[views(s)] keeps the result from outliving s.
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
 }
 
@@ -2122,7 +2168,9 @@ pub fn f32s(b: [u8]) -> [f32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
     {
-    // aligned, and every bit pattern is an f32
+    // UNSAFE: a view of bytes as f32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 f32s lie within b; every bit pattern is an f32; #[views(b)] bounds its life.
     unsafe { (b.ptr as *f32)[0..b.len() / 4] }
 }
 
@@ -2132,7 +2180,9 @@ pub fn u32s(b: [u8]) -> [u32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
     {
-    // aligned, and every bit pattern is a u32
+    // UNSAFE: a view of bytes as u32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 u32s lie within b; every bit pattern is a u32; #[views(b)] bounds its life.
     unsafe { (b.ptr as *u32)[0..b.len() / 4] }
 }
 
@@ -2142,7 +2192,9 @@ pub fn i32s(b: [u8]) -> [i32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: i32s needs 4-aligned bytes, a multiple of 4"
     {
-    // aligned, and every bit pattern is an i32
+    // UNSAFE: a view of bytes as i32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // b.len() / 4 i32s lie within b; every bit pattern is an i32; #[views(b)] bounds its life.
     unsafe { (b.ptr as *i32)[0..b.len() / 4] }
 }
 
@@ -2152,7 +2204,10 @@ pub fn u32s_mut(b: inout [u8]) -> inout [u32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
     {
-    // aligned, and every bit pattern is a u32
+    // UNSAFE: a writable view of bytes as u32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // u32s lie within b; every bit pattern is a u32; b is inout, so this view is the only
+    // access to those bytes while it lives (#[views(b)]).
     unsafe { &(b.ptr as *u32)[0..b.len() / 4] }
 }
 
@@ -2162,6 +2217,9 @@ pub fn f32s_mut(b: inout [u8]) -> inout [f32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
     {
-    // aligned, and every bit pattern is an f32
+    // UNSAFE: a writable view of bytes as f32s is a raw-pointer slice; std has no safe cast.
+    // SAFETY: the contract checked that b.ptr is 4-aligned and b.len() a multiple of 4, so the
+    // f32s lie within b; every bit pattern is an f32; b is inout, so this view is the only
+    // access to those bytes while it lives (#[views(b)]).
     unsafe { &(b.ptr as *f32)[0..b.len() / 4] }
 }

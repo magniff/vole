@@ -94,6 +94,13 @@ defined:
 - it makes no second live alias of a place under an inout access (the
   optimizer relies on an `inout` parameter being the only way to its
   memory);
+- (0.25.4) it changes nothing lent let while the call runs, through a
+  raw pointer either: the optimizer keeps a let parameter's Vec header
+  (its pointer, length and capacity) from before a loop, so a push to
+  the caller's Vec through a pointer kept in a static may go unseen;
+- it makes no pointer into a Vec's header from the Vec's own buffer
+  pointer, nor puts a Vec inside its own buffer (the optimizer takes a
+  store to an element as never reaching that Vec's header);
 - a type whose safe methods manage memory through raw pointers (a
   growable buffer of its own) implements `Drop`: that makes it owned and
   move-only, so a copy cannot outlive a reallocation.
@@ -114,6 +121,10 @@ defined:
   operations inside that need unsafe; `none (unneeded)`: a block with
   nothing unsafe inside, to remove. `--unjustified`, `--summary`
   (counts by class, module, file), `--json`, `--no-std`.
+- `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
+  (unneeded)` blocks away and keeps their code in its scope; a block it
+  cannot open so (one that declares and is not last) is left and
+  counted.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access

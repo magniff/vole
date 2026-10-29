@@ -1467,6 +1467,23 @@ temporary, the gate's stalled container rows; an offscreen event loop
 and GPU timestamps if they fit. Same output, the fixpoint, and no
 compile-cost regression.
 
+0.25.4 did `volec run`, the pathtrace feedback, the carried bugs, std's
+unsafe (0 unjustified), a scripted event loop and GPU timestamps, and the
+modernization's first three steps (docs/design/modernize-0254.md: the
+938 unneeded blocks, std Vec facts in the optimizer, `refactor table`
+and five tables). Next, 0.25.5: the hot tables (NODES, then SRC, TYPES,
+FNS, SYMS, TOKS, DEFS, FILES, compile-cost on each), and the cheap fixes
+of feedbacks/DIGEST-0.25.4.md: the hooks (std from the tree, the reads
+they block), dependent edits in one checked call, `'=NAME'` under zsh,
+transcripts that pin std's shape (the LSP runner's std positions), the
+add-a-std-module docs, compile-cost in tests/affected.sh for std, zero
+statics as bss, `Atomic<T>` bounded to integers, bool and pointers,
+std's print and stdin statics made thread-safe, the book's property-test
+time limit under load. Then 0.25.6, after a design doc the user
+approves: private fields as in Rust, one std cell type as the only
+interior mutability (`#[sealed]` retired), and the thread-sharing marker
+(Rust's Send and Sync, or one Swift-style marker: undecided).
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
@@ -2682,3 +2699,23 @@ unsafe-audit 5315 and 1194 unjustified (baselines 5316 and 1194), every
 other fuzz and ABI row on both systems, chain-fresh 31 releases.
 compile-cost against v0.25.2.2: a hello world 1.01x, std 1.01x, check
 of the compiler 1.05x (the unsafe audit's warning, text blocks).
+
+### 0.25.4
+
+The release gate (`gate.sh --release --no-x86`, 68:41 wall), on the
+release commit. Every row on macOS passed; in the container, every row
+but the suite's: suite-O0 and suite-O2 failed 5 cases each, run with
+valgrind, objcheck and the fuzz rows on the same 8 CPUs. The one shown is
+book chapter 13's session, whose property test shrank past the runner's
+fixed 10 s limit (SIGALRM; the book expects 226 steps); the limit is not
+relaxed under load as the runner's other time budgets are (0.25.5). Rerun
+alone in the container (`aarch64-linux-check.sh --worktree --dev
+--compiler ... --only suite-O0`, and `--levels=2 --only suite-O2`): 3754
+passed, 0 failed at each level. The suite 4375 at -O0 and -O1, 4376 at
+-O2 (70 XFAIL), aarch64-linux 3754 at -O0 and -O2, threads 8368,
+incremental 172 series, objcheck 5396 (macOS) and 5364 (aarch64-linux),
+compiler-memcheck 691, valgrind 345 clean, examples-checkalloc 180,
+fuzz-sem 300 ok, cachediff 1335 lines (387 from the cache), unsafe-audit
+4365 and 0 unjustified (0.25.3: 5316 and 1194), every fuzz and ABI row on
+both systems, chain-fresh 32 releases. compile-cost against v0.25.3: a
+hello world 0.99x, std 1.02x, check of the compiler 0.98x.

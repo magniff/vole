@@ -58,8 +58,8 @@ try:
     log = os.path.join(tmp, "hook.jsonl")
 
     def hook(script, event, **env):
-        e = dict(os.environ, VOLE_CHECK_COMPILER=fake, VOLE_HOOK_STATE=state, VOLE_CHECK_HOOK_LOG=log,
-                 **env)
+        e = dict(os.environ, VOLE_CHECK_COMPILER=fake, VOLE_HOOK_STATE=state, VOLE_CHECK_HOOK_LOG=log)
+        e.update(env)
         t0 = time.time()
         r = subprocess.run([sys.executable, "-I", os.path.join(HERE, script)], input=json.dumps(event),
                            capture_output=True, text=True, env=e)
@@ -184,6 +184,46 @@ try:
     out = hook("turn-end.py", ex_stop)[1]
     case("examples: committed in this session, still seen", (reason(out) or "").split("\n")[0],
          "turn-end: changed examples (examples/moved): 3 problems the suite would report")
+
+    # (0.25.4) A tools binary older than the tree's source (right after a
+    # release): its errors are the new syntax's, so they are not reported;
+    # one line says so, with the install's try:, once a session.
+    vc = os.path.join(tmp, "vc")
+    os.makedirs(os.path.join(vc, ".git"))
+    write(os.path.join(vc, "compiler", "src", "main.vl"),
+          'fn main() {}\n\npub fn version() -> *u8 {\n    c"0.25.3"\n}\n')
+    cache = os.path.join(vc, "target", "bootstrap", "aarch64-macos", "v0.25.3-98ff0933d605", "volec")
+    stale_fake = os.path.join(vc, "target", "tools", "volec")
+    for path, ver, out in ((stale_fake, "0.25.2.2", json.dumps(err)), (cache, "0.25.3", "")):
+        write(path, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'volec %s (host: x)'; exit 0; fi\n"
+                    "echo '%s' >&2\n[ -n '%s' ] && exit 1\nexit 0\n" % (ver, out, out))
+        os.chmod(path, 0o755)
+    vstop = dict(stop, session_id="stale", cwd=vc)
+    out = hook("turn-end.py", vstop, VOLE_CHECK_COMPILER=stale_fake)[1]
+    case("a stale tools binary: one line, not its errors", (reason(out) or "").split("\n"),
+         ["turn-end: main.vl not checked",
+          "note hook.stale-volec: target/tools/volec is 0.25.2.2, older than this tree's 0.25.3 "
+          "(compiler/src/main.vl's version()); not checked: its errors would be the newer release's syntax",
+          "try: rm -f target/tools/volec && cp target/bootstrap/aarch64-macos/v0.25.3-98ff0933d605/volec "
+          "target/tools/volec"])
+    write(os.path.join(vc, "compiler", "src", "main.vl"),
+          'fn main() {}\n\npub fn version() -> *u8 {\n    c"0.25.3"\n}\n\n')
+    case("a stale tools binary: said once a session",
+         hook("turn-end.py", vstop, VOLE_CHECK_COMPILER=stale_fake)[1], "")
+    shutil.copy(cache, os.path.join(vc, "target", "volec"))
+    write(os.path.join(vc, "compiler", "src", "main.vl"),
+          'fn main() {}\n\npub fn version() -> *u8 {\n    c"0.25.3"\n}\n\n\n')
+    edit = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "session_id": "stale2", "cwd": vc,
+            "tool_input": {"file_path": os.path.join(vc, "compiler", "src", "main.vl")}}
+    st, out, _ = hook("check-after-edit.py", edit, VOLE_CHECK_COMPILER=stale_fake)
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+    case("after an edit: a current target/volec checks instead, said once", ctx.split("\n"),
+         ["note hook.stale-volec: target/tools/volec is 0.25.2.2, older than this tree's 0.25.3 "
+          "(compiler/src/main.vl's version()); checked with target/volec instead",
+          "try: rm -f target/tools/volec && cp target/bootstrap/aarch64-macos/v0.25.3-98ff0933d605/volec "
+          "target/tools/volec"])
+    case("and the next edit is silent (clean)", hook("check-after-edit.py", edit, VOLE_CHECK_COMPILER=stale_fake)[1],
+         "")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

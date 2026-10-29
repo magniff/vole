@@ -223,6 +223,14 @@ check_block() {
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
+    # (0.25.4) A program's #[test]s are left out of its build: `volec
+    # test` runs them, at -O0 and -O2, and they must pass.
+    if grep -q '^#\[test\]' "$d"/*.vl; then
+        if ! (cd "$d" && "$COMPILER" test main.vl) >"$d/test.out" 2>&1; then
+            { echo "FAIL $name: its #[test]s fail (volec test main.vl)"; sed 's/^/    /' "$d/test.out"; } >"$d/result"
+            return
+        fi
+    fi
     if [ ! -f "$d/out" ]; then
         echo "pass $name" >"$d/result"
         return
@@ -562,7 +570,7 @@ else
 fi
 
 # --help on every command (0.15): the command's rows, no error.
-for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce; do
+for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo explain try "query context" rewrite lint same-output test probe reduce run; do
     # shellcheck disable=SC2086
     if "$COMPILER" $c --help >"$WORK/help.out" 2>&1 && [ -s "$WORK/help.out" ] \
         && [ "$(wc -l <"$WORK/help.out")" -le 15 ] && ! grep -q '^error' "$WORK/help.out"; then

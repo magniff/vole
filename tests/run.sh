@@ -58,6 +58,9 @@
 #   // ARGS: a b c       command-line arguments (whitespace separated; 0.20:
 #                        @ROOT@ stands for the root of the tree)
 #   // STDIN: text       stdin, one directive per line, joined with '\n'
+#   // ENV: NAME=VALUE   (0.25.4) a variable of the program's environment,
+#                        one directive each; @ROOT@ in VALUE is the root
+#                        (`// ENV: VOLE_WINDOW_SCRIPT=frames 2; key q`)
 #   // EXPECT: text      expected stdout, one directive per line; (0.25.2)
 #                        holes for what changes from run to run: {num} a
 #                        number (12, -3, 0.25, 1.5e-3), {int} an integer,
@@ -461,6 +464,12 @@ run_program() {
     dir=$1
     (
         cd "$dir" || exit 1
+        # (0.25.4: the case's ENV directives)
+        if [ -s env ]; then
+            while IFS= read -r kv; do
+                [ -n "$kv" ] && export "$(printf '%s' "$kv" | sed "s|@ROOT@|$ROOT|g")"
+            done <env
+        fi
         # (0.19: RUN_ENV, a variable for the run: VOLE_ARCH_DISABLE)
         if [ -n "${RUN_ENV:-}" ]; then
             # shellcheck disable=SC2046

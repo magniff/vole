@@ -136,6 +136,7 @@ tools` the ones a program needs.
 | add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
 | add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
 | add a variant (an arm in each match that needs one), remove, rename one | `target/volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
+| a raw table (`static var X: *T`, X_COUNT, X_CAP, grown by `grow`) to a `Vec<T, Comp>`, every use (0.25.4) | `target/volec refactor table X --dry-run` (`--count N`, `--cap C`, `--alloc PATH`; refused, nothing changed, each use it cannot place listed: `&X[i]`, X passed, X_CAP read, X_COUNT written; then `fix --only unneeded-unsafe`) |
 | move lines of a function into a new one, parameters and result computed | `target/volec refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/volec refactor inline FN` (`--at FILE:LINE`: one call) |
 | replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
@@ -147,6 +148,7 @@ tools` the ones a program needs.
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/volec check` |
+| build a program and run it: DIR/main.vl (DIR: `.`), rebuilt only when it changed, kept in volec's cache (0.25.4) | `target/volec run [DIR] [OPTIONS] [-- ARGS]` (a build's options; off a terminal only the program's output, its exit status volec's; `run --help`) |
 | build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/volec fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
@@ -1035,6 +1037,10 @@ when it was given, names quoted for the shell when they need it).
 | `query.other-root` | note | (the answer's) | (0.25.2) the NAME is not in the default program; one other program under the current directory defines it, and the answer is that program's | the command with its `--root` |
 | `query.bad-root` | error | 2 | ROOT cannot be read | the command without it, when a default root exists |
 | `query.usage` | error | 2 | no command, an unknown command or option, a missing NAME or option value, an extra argument | the command corrected (the nearest command, the option dropped, `--limit 60`), or `items` |
+| `run.no-main` | error | 2 | (0.25.4) `volec run DIR`: DIR has no main.vl, or is no folder | `volec run DIR/SUB` for a subfolder with a main.vl (three at most); the plain build and run of its one .vl file |
+| `run.file` | error | 2 | (0.25.4) `volec run FILE`: a file where run takes a folder | `volec run FOLDER -- ARGS` when the file's folder has a main.vl; else a .vl file's plain build and run |
+| `run.args` | error | 2 | (0.25.4) `volec run DIR WORD`: a second folder, or the program's argument without `--` | `volec run DIR -- WORD` |
+| `run.option` | error | 2 | (0.25.4) `volec run` with an option that makes no program to run here (`-c`, `-S`, `--emit-ir`, `--target` of another machine) | |
 
 ```
 error query.no-match: no definition 'run_gnv'
@@ -1386,12 +1392,26 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   formatter runs). Those shell edits of a `.vl` now trigger the check
   too. A file the call left unformatted gets `main.vl is not formatted:
   volec fmt main.vl` once, until it is formatted (`fmt --check`, a few
-  ms; VOLE_HOOK_FMT=0: off); the hook formats nothing.
+  ms; VOLE_HOOK_FMT=0: off); the hook formats nothing but (0.25.4) a
+  NEW `.vl` file the agent has just written (a Write whose result is a
+  `create`) outside compiler/src and compiler/std: `volec fmt FILE`
+  before the check, its changes named as `changed FILE:LINE: OLD -> NEW`
+  and `the hook rewrote FILE: ...` (journaled: `volec undo`).
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,
   with `turn-end: unchecked changes in main.vl: 2 errors` and the
   errors as the reason. Never twice for the same sources.
+- (0.25.4) Both hooks first compare the compiler with the checkout's
+  source: when its `--version` is older than compiler/src/main.vl's
+  `version()` (the tools binary right after a release), its errors would
+  be the new release's syntax, so target/volec checks instead when it is
+  current, and otherwise nothing is checked; one line says so, once a
+  session: `note hook.stale-volec: target/tools/volec is 0.25.2.2, older
+  than this tree's 0.25.3 ...` and `try: rm -f target/tools/volec && cp
+  target/bootstrap/HOST/v0.25.3-HASH/volec target/tools/volec` (the
+  release's build in the bootstrap cache; else `bootstrap/bootstrap.sh
+  --dev`).
 - **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
   read of `.vl` source, judging each command of a line on its own (in
   the directory its `cd`s lead to, `$VAR`s assigned on the line
