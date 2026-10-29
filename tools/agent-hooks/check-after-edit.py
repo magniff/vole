@@ -67,6 +67,16 @@ edits, 27 of 30, and the hook's fixes, 3):
     fixed 20 '&mut x' to '&x' (conv.rust) in main.vl: lines 3, 7, ...
     the hook rewrote main.vl: the 20 changes above, nothing else (read it again before an Edit)
 
+(0.25.3, after the round 3 eval: five agents met `changed on disk` after
+the hook's fixes) Each change is still its `changed FILE:LINE: OLD -> NEW`
+line, the repeats' too (past 10, the rest are left to their `fixed N`
+line). The hook runs no formatter; an agent's own `volec fmt` (whose
+summary counts lines) gets the lines it changed, from the journal (`volec
+query diff`), at most 5:
+
+    volec fmt rewrote main.vl (+2 -2 lines): layout only (volec undo takes it back; ...):
+    changed main.vl:2: let   z  =  3; -> let z = 3;
+
 Those shell edits trigger the check too (sed -i, perl -pi, a Python
 script that opens a .vl it names for writing). A file the call left
 unformatted gets one line, once until it is formatted (`fmt --check`, a
@@ -478,22 +488,30 @@ def fixed_report(fixed, changed, root_shown, lines=()):
         groups.setdefault(key, []).append(d)
     summed = [g for g in groups.values() if len(g) >= 2]
     summed_ids = {id(d) for g in summed for d in g}
-    # (a change line is left out when every fixed error on its line is in
-    # a summary line)
+    # (0.25.3) every change is a `changed FILE:LINE: OLD -> NEW` line (the
+    # round 3 eval: five agents met the harness's `changed on disk` notice
+    # after the hook's fixes, one agent's later string replacement missed
+    # its old text); past MAX_SHOWN, a change on a line of a summary line
+    # is left to that summary
     on_line = {}
     for d in fixed:
         on_line.setdefault((os.path.normpath(d.get("file") or ""), d.get("line")), []).append(id(d))
     kept = []
     per_file = {}
+    left = 0
     for x in lines:
         m = re.match(r"^(.+?):(\d+): ", x)
         f, ln = (m.group(1), int(m.group(2))) if m else ("", 0)
         ids = next((v for (ff, ll), v in on_line.items() if ll == ln and same_file(ff, f)), [])
-        if not (ids and all(i in summed_ids for i in ids)):
+        if len(lines) <= MAX_SHOWN or not (ids and all(i in summed_ids for i in ids)) or len(kept) < MAX_SHOWN:
             kept.append(x)
-        if not ids and f:
+        else:
+            left += 1
+        if f:
             per_file[f] = per_file.get(f, 0) + 1
     out = head + [f"changed {x}" for x in kept]
+    if left:
+        out.append(f"changed: {left} more, on the lines the `fixed N ...` lines below name")
     for d in fixed:
         if id(d) in summed_ids:
             continue
@@ -505,11 +523,11 @@ def fixed_report(fixed, changed, root_shown, lines=()):
         lns = sorted({d.get("line") for d in g if d.get("line")})
         out.append(f"fixed {len(g)} '{old}' to '{new}' ({g[0].get('code', '')}) in {g[0].get('file') or 'the files'}: "
                    f"line{'s' if len(lns) != 1 else ''} {', '.join(map(str, lns))}")
+    # (a file with no change line: its fixed errors are its changes)
     for d in fixed:
         f = d.get("file") or ""
-        if f:
-            key = next((k for k in per_file if same_file(k, f)), f)
-            per_file[key] = per_file.get(key, 0) + 1
+        if f and not any(same_file(k, f) for k in per_file):
+            per_file[f] = sum(1 for e in fixed if same_file(e.get("file") or "", f))
     if not fixed and not lines:
         out.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
     files = sorted(set(per_file) | {f for f, _ in changed if f and not any(same_file(f, k) for k in per_file)})
@@ -718,6 +736,44 @@ def trigger(event):
                 if root:
                     return (path, root, None, here)
     return None
+
+
+# (0.25.3) `volec fmt FILE`'s summary line: `formatted<TAB>FILE<TAB>+3 -2 lines`.
+FORMATTED = re.compile(r"^formatted\t(\S+)\t(.*)$", re.M)
+FMT_SHOWN = 5
+
+
+def fmt_report(event):
+    """(0.25.3) What an agent's own `volec fmt` rewrote (a Bash call): its
+    summary says how many lines, not which, and the harness's `changed on
+    disk` notice follows it. The changes from the journal (`volec query
+    diff`, the last edit's diff), each `changed FILE:LINE: OLD -> NEW`, at
+    most FMT_SHOWN; "" when the call formatted nothing. fmt changes only
+    layout: no check after it."""
+    if event.get("tool_name") != "Bash":
+        return ""
+    inp = event.get("tool_input") or {}
+    resp = event.get("tool_response") or {}
+    out = (resp.get("stdout") or "") if isinstance(resp, dict) else str(resp)
+    done = FORMATTED.findall(out)
+    if not done:
+        return ""
+    cwd = os.path.abspath(event.get("cwd") or os.getcwd())
+    for sub, words, path, _, here in tc.calls_at(inp.get("command", ""), cwd):
+        if sub != "fmt" or any(w in ("--check", "--dry-run") for w in words):
+            continue
+        compiler = compiler_for(here, path or None)
+        r = run_typed(compiler, here, ["query", "diff"]) if compiler else None
+        changes = diff_changes(r.stdout.splitlines()) if r is not None and r.returncode == 0 else []
+        name = volec_shown(compiler, here)
+        files = ", ".join(f"{f} ({n})" for f, n in done)
+        head = (f"{name} fmt rewrote {files}: layout only (volec undo takes it back; read the file again "
+                f"before an Edit)" + (":" if changes else ""))
+        lines = [head] + [f"changed {x}" for x in changes[:FMT_SHOWN]]
+        if len(changes) > FMT_SHOWN:
+            lines.append(f"({len(changes) - FMT_SHOWN} more: {name} query diff)")
+        return "\n".join(lines)
+    return ""
 
 
 def default_root(cwd):
@@ -1083,9 +1139,11 @@ def main():
         record(event, os.path.abspath(event.get("cwd") or os.getcwd()), call_end(event))
     if os.environ.get("VOLE_CHECK_HOOK") == "0":
         return 0
+    # (0.25.3) an agent's own `volec fmt`: what it rewrote
+    fmt_text = fmt_report(event)
     found = trigger(event)
     if not found:
-        return 0
+        return say(fmt_text)
     edited, root, ran, cwd = found
     if root and not os.path.isabs(root):
         root = os.path.normpath(os.path.join(cwd, root))
@@ -1093,14 +1151,19 @@ def main():
         ran = os.path.join(cwd, ran)
     compiler = compiler_for(cwd if not edited else os.path.dirname(os.path.abspath(edited)), ran, root)
     if not compiler:
-        return 0
+        return say(fmt_text)
     st = hs.load(event)
     got = verify(event, st, compiler, root, cwd, edited)
     if got is None:
-        return 0
+        return say(fmt_text)
     text, rec = got
     hs.save(event, st)
     record(event, cwd, rec)
+    return say("\n".join(t for t in (fmt_text, text) if t))
+
+
+def say(text):
+    """The agent's context: text, when there is any."""
     if text:
         json.dump({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}},
                   sys.stdout)
