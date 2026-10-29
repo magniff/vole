@@ -305,7 +305,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/query/stdcache0253.q).
 - **The tools' cache, checked**: tests/cachediff/run.sh runs every
   command line of the query and refactoring transcripts and of the
-  walkthroughs (1,293 lines, 130 transcripts) without the cache, with
+  walkthroughs (1,297 lines, 132 transcripts) without the cache, with
   a fresh one and from it, on the same state of the program, and
   compares the output,
   the exit status and the files left (a sample in the suite, category
