@@ -334,6 +334,18 @@ fn bind_fault(l: BindLayout, entries: [BindEntry], lim: Limits, rule: i64) -> i6
     -1
 }
 
+// (0.25.3) WebGPU's rule for mappable buffers: MAP_READ goes with COPY_DST
+// alone, MAP_WRITE with COPY_SRC alone, so the GPU reaches a mappable
+// buffer only by copies (which the encoder records for submit's
+// gpu.state). 1: MAP_READ with more, 2: MAP_WRITE with more, 0: fine.
+fn map_usage_fault(usage: u32) -> i64 {
+    let read = BufferUsage::MAP_READ | BufferUsage::COPY_DST;
+    let write = BufferUsage::MAP_WRITE | BufferUsage::COPY_SRC;
+    if usage & BufferUsage::MAP_READ != 0 && usage | read != read { 1 }
+    else if usage & BufferUsage::MAP_WRITE != 0 && usage | write != write { 2 }
+    else { 0 }
+}
+
 impl Device {
     pub fn limits(self) -> Limits {
         self.limits
@@ -355,7 +367,11 @@ impl Device {
         requires size >= 0 && size <= self.limits.max_buffer_size
         else f"gpu.limits: a buffer of {size} bytes; this device makes them up to {self.limits.max_buffer_size} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {size}; adapter.device(lim)`"
         requires usage != 0 else "gpu.usage: a buffer needs a usage"
-    {
+        requires map_usage_fault(usage) != 1
+        else f"gpu.usage: a buffer made with BufferUsage::MAP_READ has COPY_DST besides and nothing more (WebGPU's rule: what the GPU writes otherwise could change a mapped view); this one's usage is {usage}: make the buffer the GPU writes with COPY_SRC (not MAP_READ), copy it into one of MAP_READ | COPY_DST (enc.copy_buffer) and map that"
+        requires map_usage_fault(usage) != 2
+        else f"gpu.usage: a buffer made with BufferUsage::MAP_WRITE has COPY_SRC besides and nothing more (WebGPU's rule: the GPU could read it while the CPU writes); this one's usage is {usage}: write the buffer the GPU uses with queue.write_buffer, or write one of MAP_WRITE | COPY_SRC and copy it (enc.copy_buffer)"
+        {
         match N::create_buffer(self.raw, size, "") {
             Some(b) => Buffer {
                 raw: b, size: size, usage: usage, mapped: false,
@@ -370,7 +386,11 @@ impl Device {
         requires bytes.len() <= self.limits.max_buffer_size
         else f"gpu.limits: a buffer of {bytes.len()} bytes; this device makes them up to {self.limits.max_buffer_size} (dev.limits().max_buffer_size; Limits::default() has 1 GiB): ask for more when opening it, up to the adapter's largest (adapter.limits().max_buffer_size): `var lim = Limits::default(); lim.max_buffer_size = {bytes.len()}; adapter.device(lim)`"
         requires usage != 0 else "gpu.usage: a buffer needs a usage"
-    {
+        requires map_usage_fault(usage) != 1
+        else f"gpu.usage: a buffer made with BufferUsage::MAP_READ has COPY_DST besides and nothing more (WebGPU's rule: what the GPU writes otherwise could change a mapped view); this one's usage is {usage}: make the buffer the GPU writes with COPY_SRC (not MAP_READ), copy it into one of MAP_READ | COPY_DST (enc.copy_buffer) and map that"
+        requires map_usage_fault(usage) != 2
+        else f"gpu.usage: a buffer made with BufferUsage::MAP_WRITE has COPY_SRC besides and nothing more (WebGPU's rule: the GPU could read it while the CPU writes); this one's usage is {usage}: write the buffer the GPU uses with queue.write_buffer, or write one of MAP_WRITE | COPY_SRC and copy it (enc.copy_buffer)"
+        {
         match N::create_buffer(self.raw, bytes.len(), bytes) {
             Some(b) => Buffer {
                 raw: b, size: bytes.len(), usage: usage, mapped: false,
@@ -716,7 +736,7 @@ impl Device {
     pub fn encoder(self) -> Encoder {
         Encoder {
             raw: N::begin(self.raw), limits: self.limits, caps: self.caps,
-            unwritten: Unwritten::new(),
+            unwritten: Unwritten::new(), maps: Vec::new_in(self.gpa),
         }
     }
 
@@ -730,10 +750,16 @@ impl Queue {
     /// Submits recorded commands; they run after everything submitted
     /// before. A uniform buffer they read must have been written first
     /// (gpu.unwritten): by write_buffer, by commands submitted before or
-    /// these, or made with its bytes (buffer_init).
+    /// these, or made with its bytes (buffer_init). A buffer they copy
+    /// into or from is not mapped (gpu.state): one mapped after the copy
+    /// was recorded is unmapped first.
     pub fn submit(inout self, cmds: sink Commands)
         requires self.lost || unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 0) < 0
         else f"gpu.unwritten: binding {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 2)} of group {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 1)} (a uniform buffer of {unwritten_fault(self.written[0..self.nwritten], cmds.unwritten, 3)} bytes) was never written: write it (queue.write_buffer) before submitting the first dispatch or draw that reads it (dev.buffer's zeros are not a value; dev.buffer_init makes a buffer with its bytes)"
+        requires map_fault(cmds.maps.as_slice(), hal::MAPPED_READ, 0) < 0
+        else f"gpu.state: these commands copy into a buffer of {map_fault(cmds.maps.as_slice(), hal::MAPPED_READ, 1)} bytes that was mapped (map_read) after the copy was recorded: the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)"
+        requires map_fault(cmds.maps.as_slice(), hal::MAPPED_WRITE, 0) < 0
+        else f"gpu.state: these commands copy from a buffer of {map_fault(cmds.maps.as_slice(), hal::MAPPED_WRITE, 1)} bytes that was mapped for writing (map_write) after the copy was recorded: unmap it (buf.unmap(dev)) before submitting, which sends what was written"
         {
         var c = cmds;
         if c.unwritten.lost {
@@ -767,8 +793,9 @@ impl Queue {
         else "gpu.align: write_buffer's offset and size are multiples of 4"
         requires offset >= 0 && offset + bytes.len() <= buf.size
         else "gpu.range: write_buffer reaches past the buffer"
-        requires !buf.mapped else "gpu.state: the buffer is mapped: unmap it first"
-    {
+        requires !buf.mapped
+        else f"gpu.state: write_buffer's buffer ({buf.size} bytes) is mapped (map_read): the write would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)"
+        {
         if buf.usage & BufferUsage::UNIFORM != 0 && !buf.written {
             self.wrote(buffer_id(buf));
         }
@@ -806,6 +833,8 @@ pub struct Buffer {
     pub raw: backend::Buffer,
     pub size: i64,
     pub usage: u32,
+    /// Mapped by map_read or map_write, until unmap (the native buffer
+    /// holds the same, for the commands recorded before: Queue::submit).
     pub mapped: bool,
     /// Made with its bytes (buffer_init) or mapped for writing: gpu.unwritten
     /// never reports it.
@@ -823,21 +852,27 @@ impl Buffer {
 
     /// The buffer's bytes once the GPU has finished every submitted
     /// command (it waits): a view of the buffer, which cannot be used
-    /// while the view is. The view lives no longer than the buffer: a
-    /// function may return it when the buffer is its caller's (an inout
-    /// or let parameter), not when the buffer is its own local; then
-    /// return a copy, `map_read_copy_in(dev, gpa)`.
+    /// while the view is. The buffer stays mapped until `unmap(dev)`:
+    /// until then nothing writes it (a copy into it is gpu.state, when it
+    /// is recorded or, recorded before map_read, when it is submitted), so
+    /// the view never changes; unmap takes the buffer as `inout`, so not
+    /// while a view of it lives. The view lives no longer than the
+    /// buffer: a function may return it when the buffer is its caller's
+    /// (an inout or let parameter), not when the buffer is its own local;
+    /// then return a copy, `map_read_copy_in(dev, gpa)`.
     pub fn map_read(inout self, dev: Device) -> [u8]
         requires self.usage & BufferUsage::MAP_READ != 0
         else f"gpu.usage: map_read's buffer ({self.size} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made"
         {
         N::device_wait_idle(dev.raw);
+        self.mapped = true;
         N::map_read(dev.raw, &self.raw)
     }
 
     /// The buffer's bytes, as map_read, copied into a new Vec on
     /// allocator a: they outlive the buffer (return them from the function
-    /// that made it). `gpu::f32s(v.as_slice())` views them as f32s.
+    /// that made it). It maps, copies and unmaps: the buffer is not mapped
+    /// afterwards. `gpu::f32s(v.as_slice())` views them as f32s.
     pub fn map_read_copy_in<A: Allocator>(inout self, dev: Device, a: sink A) -> Vec<u8, A>
         requires self.usage & BufferUsage::MAP_READ != 0
         else f"gpu.usage: map_read_copy_in's buffer ({self.size} bytes) was made without BufferUsage::MAP_READ: add it where the buffer is made"
@@ -845,6 +880,8 @@ impl Buffer {
         N::device_wait_idle(dev.raw);
         var out: Vec<u8, A> = Vec::with_capacity_in(self.size, a);
         out.extend_from_slice(N::map_read(dev.raw, &self.raw));
+        N::unmap(dev.raw, &self.raw);
+        self.mapped = false;
         out
     }
 
@@ -861,7 +898,11 @@ impl Buffer {
         N::map_write(dev.raw, &self.raw)
     }
 
-    /// Ends a map_write: what was written reaches the GPU.
+    /// Ends a mapping: after a map_write what was written reaches the GPU;
+    /// after a map_read the buffer can be written again (copies into it,
+    /// write_buffer). Its `inout` self is refused while a view of the
+    /// buffer lives (own.*): the view is done first. Unmapping a buffer
+    /// that is not mapped does nothing.
     pub fn unmap(inout self, dev: Device) {
         N::unmap(dev.raw, &self.raw);
         self.mapped = false;
@@ -1380,12 +1421,29 @@ pub struct Encoder {
     pub limits: Limits,
     pub caps: Caps,
     unwritten: Unwritten,
+    // (0.25.3) the mappable buffers the commands use (copies: the only
+    // way the GPU reaches one, map_usage_fault), a handle of each, for
+    // submit's gpu.state; on the device's allocator, from the first
+    maps: Vec<backend::Buffer>,
 }
 
 /// Recorded commands, for `queue.submit` (dropped unsubmitted: discarded).
 pub struct Commands {
     pub raw: backend::CommandBuffer,
     unwritten: Unwritten,
+    maps: Vec<backend::Buffer>,
+}
+
+// (0.25.3) The first buffer of `maps` (the mappable buffers recorded
+// commands use) whose map state is `state` (hal::MAPPED_READ,
+// MAPPED_WRITE) now: what = 0 its index, 1 its size; -1 when none is.
+fn map_fault(maps: [backend::Buffer], state: i64, what: i64) -> i64 {
+    for i in 0..maps.len() {
+        if N::map_state(maps[i]) == state {
+            return if what == 0 { i } else { maps[i].size };
+        }
+    }
+    -1
 }
 
 /// The bind group keys a pass has bound, against a pipeline's layouts.
@@ -1886,9 +1944,14 @@ impl Encoder {
         else "gpu.align: copy offsets and sizes are multiples of 4"
         requires src_offset >= 0 && dst_offset >= 0 && size >= 0 && src_offset + size <= src.size
         && dst_offset + size <= dst.size else "gpu.range: the copy reaches past a buffer"
-        requires !src.mapped && !dst.mapped else "gpu.state: the buffer is mapped: unmap it first"
-    {
+        requires !dst.mapped
+        else f"gpu.state: copy_buffer's destination, its third argument (a buffer of {dst.size} bytes), is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)"
+        requires !src.mapped
+        else f"gpu.state: copy_buffer's source, its first argument (a buffer of {src.size} bytes), is mapped for writing (map_write): unmap it first (buf.unmap(dev)), which sends what was written"
+        {
         if size == 0 { return; }
+        self.uses(src);
+        self.uses(dst);
         if dst.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(dst)); }
         N::copy_buffer(&self.raw, src.raw, src_offset, dst.raw, dst_offset, size);
     }
@@ -1905,8 +1968,9 @@ impl Encoder {
         requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
         else "gpu.align: bytes_per_row is a multiple of 256"
         requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
-        requires !buf.mapped else "gpu.state: the buffer is mapped: unmap it first"
-    {
+        requires !buf.mapped
+        else f"gpu.state: copy_texture_to_buffer's buffer ({buf.size} bytes) is mapped (map_read): the copy would change its view. Unmap it (buf.unmap(dev)) when its view is done, or read a copy (map_read_copy_in)"
+        {
         let ww = if w < 0 { tex.desc.width - x } else { w };
         let hh = if h < 0 { tex.desc.height - y } else { h };
         assert(x >= 0 && y >= 0 && ww >= 1 && hh >= 1 && x + ww <= tex.desc.width
@@ -1916,6 +1980,7 @@ impl Encoder {
         assert(offset >= 0
             && offset + bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
             "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
         if buf.usage & BufferUsage::UNIFORM != 0 { self.unwritten.wrote(buffer_id(buf)); }
         N::copy_texture_to_buffer(&self.raw, tex.raw, layer, x, y, ww, hh, buf.raw, offset,
             bytes_per_row);
@@ -1933,8 +1998,9 @@ impl Encoder {
         requires bytes_per_row % 256 == 0 && offset % tex.desc.format.size() == 0
         else "gpu.align: bytes_per_row is a multiple of 256"
         requires layer >= 0 && layer < tex.desc.layers else "gpu.range: no such layer"
-        requires !buf.mapped else "gpu.state: the buffer is mapped: unmap it first"
-    {
+        requires !buf.mapped
+        else f"gpu.state: copy_buffer_to_texture's buffer ({buf.size} bytes) is mapped for writing (map_write): unmap it first (buf.unmap(dev)), which sends what was written"
+        {
         let ww = if w < 0 { tex.desc.width - x } else { w };
         let hh = if h < 0 { tex.desc.height - y } else { h };
         assert(x >= 0 && y >= 0 && ww >= 1 && hh >= 1 && x + ww <= tex.desc.width
@@ -1944,13 +2010,25 @@ impl Encoder {
         assert(offset >= 0
             && offset + bytes_per_row * (hh - 1) + ww * tex.desc.format.size() <= buf.size,
             "gpu.range: the copy reaches past the buffer");
+        self.uses(buf);
         N::copy_buffer_to_texture(&self.raw, buf.raw, offset, bytes_per_row, tex.raw, layer,
             x, y, ww, hh);
     }
 
     /// The recorded commands, for `queue.submit`.
     pub fn finish(sink self) -> Commands {
-        Commands { raw: self.raw, unwritten: self.unwritten }
+        Commands { raw: self.raw, unwritten: self.unwritten, maps: self.maps }
+    }
+
+    // (0.25.3) A buffer a copy uses: when it is mappable, a handle of it
+    // for submit's gpu.state (once a buffer).
+    fn uses(inout self, buf: Buffer) {
+        if buf.usage & (BufferUsage::MAP_READ | BufferUsage::MAP_WRITE) == 0 { return; }
+        let id = buffer_id(buf);
+        for m in self.maps.iter() {
+            if m.raw.ptr as u64 == id { return; }
+        }
+        self.maps.push(N::buffer_handle(buf.raw));
     }
 }
 
@@ -2017,18 +2095,21 @@ impl Frame {
 // ---- GPU: bytes (0.22) ----
 
 /// The bytes of a slice of f32s (a view of the same memory).
+#[views(s)]
 pub fn bytes_of_f32(s: [f32]) -> [u8] {
     // s.len() f32s are s.len() * 4 readable bytes; u8 has no alignment
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
 }
 
 /// The bytes of a slice of u32s (a view of the same memory).
+#[views(s)]
 pub fn bytes_of_u32(s: [u32]) -> [u8] {
     // as bytes_of_f32
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
 }
 
 /// The bytes of a slice of i32s (a view of the same memory).
+#[views(s)]
 pub fn bytes_of_i32(s: [i32]) -> [u8] {
     // as bytes_of_f32
     unsafe { (s.ptr as *u8)[0..s.len() * 4] }
@@ -2036,6 +2117,7 @@ pub fn bytes_of_i32(s: [i32]) -> [u8] {
 
 /// Bytes as f32s (a view): the length a multiple of 4 and the memory
 /// 4-aligned, as mapped buffers are.
+#[views(b)]
 pub fn f32s(b: [u8]) -> [f32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
@@ -2045,6 +2127,7 @@ pub fn f32s(b: [u8]) -> [f32]
 }
 
 /// Bytes as u32s (a view), as f32s.
+#[views(b)]
 pub fn u32s(b: [u8]) -> [u32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
@@ -2054,6 +2137,7 @@ pub fn u32s(b: [u8]) -> [u32]
 }
 
 /// Bytes as i32s (a view), as f32s.
+#[views(b)]
 pub fn i32s(b: [u8]) -> [i32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: i32s needs 4-aligned bytes, a multiple of 4"
@@ -2063,6 +2147,7 @@ pub fn i32s(b: [u8]) -> [i32]
 }
 
 /// The same bytes, writable, as u32s (a view of mapped memory).
+#[views(b)]
 pub fn u32s_mut(b: inout [u8]) -> inout [u32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: u32s needs 4-aligned bytes, a multiple of 4"
@@ -2072,6 +2157,7 @@ pub fn u32s_mut(b: inout [u8]) -> inout [u32]
 }
 
 /// The same bytes, writable, as f32s.
+#[views(b)]
 pub fn f32s_mut(b: inout [u8]) -> inout [f32]
     requires b.len() % 4 == 0 && (b.ptr as u64) % 4 == 0
     else "gpu.align: f32s needs 4-aligned bytes, a multiple of 4"
