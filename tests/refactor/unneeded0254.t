@@ -77,3 +77,24 @@ main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
 main.vl:39	block	crate::three	other	justified	none (unneeded)
 sites: 4 (3 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 2
 try: volec fix --only unneeded-unsafe
+## (0.25.5) `--only unneeded-justified`: the justified one too, with the
+## comments above it (they say why a block no longer needed was).
+$ fix --only unneeded-justified --diff
+fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -5 lines
+--- a/main.vl
++++ b/main.vl
+@@ -37,5 +37 @@
+-    // UNSAFE: kept: its comments say why, a reader's to judge.
+-    // SAFETY: nothing to it.
+-    unsafe {
+-        COUNT += 1;
+-    }
++    COUNT += 1;
+% "$COMPILER" main.vl -o c >/dev/null 2>&1 && ./c
+33 21
+$ query unsafe main.vl
+main.vl:5	extern	crate::extern	ffi	missing both	1 C function
+main.vl:27	block	crate::two	other	missing both	none (unneeded)
+main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
+sites: 3 (2 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 1
+try: volec fix --only unneeded-unsafe
