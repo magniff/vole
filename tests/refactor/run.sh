@@ -255,10 +255,10 @@ check module_path_without_crate "$ok" "$out"
 # explain (0.13): every code the compiler's source can print has an
 # entry: the tools' codes (`c"query.no-match"`; 0.17: the own pass's,
 # `c"own.moved"`), the kinds of the
-# compiler's errors (ERR_KIND) and warnings and keyed errors (their
+# compiler's errors (ERR_KIND; 0.25.3: main.missing) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

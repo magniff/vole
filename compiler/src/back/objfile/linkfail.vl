@@ -1,0 +1,554 @@
+// A program with no fn main, and a link that failed (0.25.3): one vole
+// error each, naming what failed, instead of the linker's or the C
+// driver's text first.
+//
+// main.missing (require_main): an executable of a program without fn main
+// is an error after the checks, before any code is made; with an object,
+// an archive, a library or a C file on the command line (which may define
+// main), the link says so, and its `main` is that error too.
+//
+// A failed link (link_failed) is read from what the C driver printed
+// (output.vl's LINK_LOG): the shapes of ld64 and ld-prime (macOS), GNU
+// ld and lld (Linux), and the driver's:
+//
+//   link.undefined     symbols no input defines: `Undefined symbols for
+//                      architecture A:` then `"_f", referenced from:`,
+//                      "undefined reference to `f'", `undefined symbol: f`;
+//                      at the extern declaration of the first (by name),
+//                      with the #[link] of its block
+//   link.no-library    `library 'x' not found`, `library not found for
+//                      -lx`, `cannot find -lx`, `unable to find library -lx`
+//   link.no-framework  `framework 'X' not found`, `framework not found X`
+//   link.duplicate     `duplicate symbol '_f' in:`, "multiple definition
+//                      of `f'", `duplicate symbol: f`
+//   link.c-file        a C file of the command line that does not compile
+//                      (`x.c:3:5: error: ...`): its errors under the error
+//   link.no-linker     the C driver cannot be run (the shell's 127)
+//   link.failed        anything else: the linker's lines under the error
+//
+// and, before the link, link.no-input: an input of the command line (an
+// object, an archive, a library, a C file) that is not there. `--verbose`
+// prints the link's command and the linker's whole text after the error.
+
+use std::fs::exists;
+use std::process::exit;
+
+use crate::back::objfile::{OUTPUT_MODE, OUT_EXECUTABLE};
+use crate::back::objfile::output::{
+    LINK_CMD, LINK_LOG, lib_given, link_decl_first, link_decl_framework, link_decl_name,
+    link_decl_of, link_input, link_input_count,
+};
+use crate::base::{
+    FILE_COUNT, IntVec, STDERR, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str,
+    buf_write_fd, cstr, sym_name,
+};
+use crate::base::diag::{
+    ERR_KIND, buf_position, buf_tool_command, err_begin, err_end, err_fmt, err_help, err_try_fmt,
+    err_try_tool, print_diagnostic, put_try_lines,
+};
+use crate::base::target::ELF;
+use crate::base::term::{build_failed, file_info};
+use crate::front::ast::{NODES, NODE_COUNT, Node, NodeKind};
+use crate::front::cheader::EMIT_HEADER;
+use crate::front::types::{FNS, FN_COUNT, FnInfo};
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR, MAIN_SYM};
+use crate::gen0::target::LINK_NAMES;
+
+// `--verbose`: the link's command and the linker's whole text after its
+// error.
+pub static var LINK_VERBOSE: bool = false;
+
+// The most lines of the linker's (or the C compiler's) text under an
+// error.
+const MAX_LINES: i64 = 20;
+
+// ---- main.missing ----
+
+// The program's root file (the first that is not std's or a C header's),
+// or -1.
+fn root_file() -> i64 {
+    for f in 0..FILE_COUNT {
+        if cstr(file_info(f).path)[0] != '<' {
+            return f;
+        }
+    }
+    -1
+}
+
+// File f's path as positions print it (without `./`).
+fn root_path(f: i64) -> [u8] {
+    let s = cstr(file_info(f).path);
+    if s.len > 2 && s[0] == '.' && s[1] == '/' { s[2..s.len] } else { s }
+}
+
+// FILE without its directory and .vl.
+fn stem(path: [u8]) -> [u8] {
+    var from = path.len;
+    while from > 0 && path[from - 1] != '/' {
+        from -= 1;
+    }
+    let to = if path.len >= 3 && path[path.len - 3..path.len] == ".vl" { path.len - 3 } else {
+        path.len
+    };
+    if to > from { path[from..to] } else { "main" }
+}
+
+// main.missing's help.
+fn main_help() -> *u8 {
+    c"a program starts at its fn main, and this one has none; an object (-c) needs none"
+}
+
+// main.missing's help and its two try: lines (fn main added to the root;
+// the root built as an object) into a diagnostic's text.
+fn main_tail(t: i64, root: [u8]) {
+    buf_fmt(t, f"  = help: {cstr(main_help())}\n");
+    buf_fmt(t, f"  = try: printf '\\nfn main() -> i32 {{\\n    0\\n}}\\n' >> {root}\n");
+    buf_str(t, c"  = try: ");
+    let args = buf_new();
+    buf_fmt(args, f"-c -o {stem(root)}.o");
+    buf_tool_command(t, buf_slice(args), true);
+    buf_byte(t, '\n');
+}
+
+// Function f of the checker (0 <= f < FN_COUNT).
+fn fn_info(f: i64) -> FnInfo {
+    if f < 0 || f >= FN_COUNT {
+        panic("linkfail::fn_info: no such function");
+    }
+    // UNSAFE: FNS is the checker's C-style array of functions
+    // (front::types), a raw pointer indexed unchecked.
+    // SAFETY: 0 <= f < FN_COUNT (checked above): the entries the checker
+    // made, each filled before it is counted; the entry is copied out.
+    unsafe { FNS[f] }
+}
+
+// Node n of the AST (0 <= n < NODE_COUNT).
+fn node(n: i64) -> Node {
+    if n < 0 || n >= NODE_COUNT {
+        panic("linkfail::node: no such node");
+    }
+    // UNSAFE: NODES is the parser's C-style array of nodes (front::ast), a
+    // raw pointer indexed unchecked.
+    // SAFETY: 0 <= n < NODE_COUNT (checked above): nodes the parser made,
+    // kept for the whole compilation; the node is copied out.
+    unsafe { NODES[n] }
+}
+
+// After the checks of a build that makes an executable: an error when the
+// program has no fn main and nothing else of the link may define it.
+pub fn require_main() {
+    if OUTPUT_MODE != OUT_EXECUTABLE || EMIT_HEADER || EMIT_IR || EMIT_MIR {
+        return;
+    }
+    if link_input_count() > 0 {
+        return;
+    }
+    for f in 0..FN_COUNT {
+        let info = fn_info(f);
+        if info.name == MAIN_SYM && !info.is_extern {
+            return;
+        }
+    }
+    let f = root_file();
+    if f < 0 {
+        return;
+    }
+    let root = root_path(f);
+    ERR_KIND = c"main.missing";
+    err_begin(file_info(f).start);
+    err_fmt(f"'{root}' has no fn main");
+    err_help(main_help());
+    err_try_fmt(f"printf '\\nfn main() -> i32 {{\\n    0\\n}}\\n' >> {root}");
+    let args = buf_new();
+    buf_fmt(args, f"-c -o {stem(root)}.o");
+    err_try_tool(buf_slice(args), true);
+    err_end();
+}
+
+// ---- A failed link ----
+
+// The byte that ends the line at i of text (its '\n', or text's end).
+fn line_end(text: [u8], i: i64) -> i64 {
+    var e = i;
+    while e < text.len && text[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+// The error, then (--verbose) the link and its text, then the build's
+// `Failed`; exit 1. `text` is the human form, at pos (-1: none).
+fn fail(pos: i64, text: i64) -> ! {
+    print_diagnostic(pos, buf_slice(text));
+    if LINK_VERBOSE && LINK_CMD != 0 as *u8 {
+        let out = buf_new();
+        buf_fmt(out, f"note: the link: {cstr(LINK_CMD)}\n");
+        if LINK_LOG >= 0 {
+            let log = buf_slice(LINK_LOG);
+            var i = 0;
+            while i < log.len {
+                let e = line_end(log, i);
+                buf_str(out, c"    ");
+                buf_bytes(out, log[i..e]);
+                buf_byte(out, '\n');
+                i = e + 1;
+            }
+        }
+        buf_write_fd(out, STDERR);
+    }
+    build_failed();
+    exit(1)
+}
+
+// A diagnostic's text: `error[kind]: message`, its position when pos >=
+// 0, its help.
+fn head(kind: *u8, message: [u8], pos: i64, help: [u8]) -> i64 {
+    let t = buf_new();
+    buf_fmt(t, f"error[{cstr(kind)}]: {message}\n");
+    if pos >= 0 {
+        buf_str(t, c" --> ");
+        buf_position(t, pos);
+        buf_byte(t, '\n');
+    }
+    if help.len > 0 {
+        buf_fmt(t, f"  = help: {help}\n");
+    }
+    t
+}
+
+// Where in s pattern starts, from `from`, or -1.
+fn find(s: [u8], pattern: [u8], from: i64) -> i64 {
+    var i = from;
+    while i + pattern.len <= s.len {
+        if s[i..i + pattern.len] == pattern {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// The text after `pattern` in l up to byte `stop` (or l's end); "" when l
+// has no pattern.
+fn after(l: [u8], pattern: [u8], stop: u8) -> [u8] {
+    let at = find(l, pattern, 0);
+    if at < 0 {
+        return "";
+    }
+    let from = at + pattern.len;
+    var e = from;
+    while e < l.len && l[e] != stop {
+        e += 1;
+    }
+    l[from..e]
+}
+
+// A symbol as C names it: macOS's linker spells it with a `_` first.
+fn c_name(s: [u8]) -> [u8] {
+    if !ELF && s.len > 1 && s[0] == '_' { s[1..s.len] } else { s }
+}
+
+// Adds name to v (buffers), once.
+fn add_name(v: inout IntVec, name: [u8]) {
+    if name.len == 0 {
+        return;
+    }
+    for i in 0..v.count {
+        if buf_slice(v.get(i)) == name {
+            return;
+        }
+    }
+    let b = buf_new();
+    buf_bytes(b, name);
+    v.push(b);
+}
+
+// Whether a sorts before b, byte by byte.
+fn less(a: [u8], b: [u8]) -> bool {
+    var i = 0;
+    while i < a.len && i < b.len {
+        if a[i] != b[i] {
+            return a[i] < b[i];
+        }
+        i += 1;
+    }
+    a.len < b.len
+}
+
+// v's names sorted (the linkers list them in orders of their own).
+fn sort_names(v: inout IntVec) {
+    for i in 1..v.count {
+        var j = i;
+        while j > 0 && less(buf_slice(v.get(j)), buf_slice(v.get(j - 1))) {
+            let t = v.get(j);
+            v.set(j, v.get(j - 1));
+            v.set(j - 1, t);
+            j -= 1;
+        }
+    }
+}
+
+fn name_at(v: IntVec, i: i64) -> [u8] {
+    buf_slice(v.get(i))
+}
+
+// Where the program declares C symbol sym (an extern fn or static), or -1.
+fn declared_at(sym: [u8]) -> i64 {
+    for n in 0..NODE_COUNT {
+        let x = node(n);
+        if x.kind == NodeKind::ExternFn || (x.kind == NodeKind::Static && x.y == 1) {
+            let link = LINK_NAMES.get(x.a + 1);
+            if cstr(sym_name(if link > 0 { link - 1 } else { x.a })) == sym {
+                return x.start;
+            }
+        }
+    }
+    -1
+}
+
+// The C driver the link ran: the first word of its command (cc, or
+// $VOLE_CC).
+fn driver() -> [u8] {
+    if LINK_CMD == 0 as *u8 {
+        return "cc";
+    }
+    let cmd = cstr(LINK_CMD);
+    var e = 0;
+    while e < cmd.len && cmd[e] != ' ' {
+        e += 1;
+    }
+    cmd[0..e]
+}
+
+// Whether line l is a C compiler's error at a C file (`x.c:3:5: error:`).
+fn c_error_line(l: [u8]) -> bool {
+    let colon = find(l, ".c:", 0);
+    colon > 0 && (find(l, ": error:", colon) > 0 || find(l, ": fatal error:", colon) > 0)
+}
+
+// Whether line l is the driver's or the linker's own (not a C file's).
+fn tool_line(l: [u8]) -> bool {
+    find(l, "clang: ", 0) == 0 || find(l, "cc: ", 0) == 0 || find(l, "gcc: ", 0) == 0
+        || find(l, "collect2: ", 0) == 0 || find(l, "ld: ", 0) == 0
+        || find(l, "/usr/bin/ld", 0) == 0 || find(l, " generated.", 0) > 0
+}
+
+// `  = LABEL: LINE` for each line of text (at most MAX_LINES).
+fn put_lines(t: i64, label: *u8, lines: IntVec) {
+    let n = if lines.count < MAX_LINES { lines.count } else { MAX_LINES };
+    for i in 0..n {
+        buf_fmt(t, f"  = {cstr(label)}: {name_at(lines, i)}\n");
+    }
+    if lines.count > n {
+        buf_fmt(t, f"  = {cstr(label)}: ... {lines.count - n} more lines (--verbose)\n");
+    }
+}
+
+// Before the link: each input of the command line is there.
+pub fn check_link_inputs() {
+    for k in 0..link_input_count() {
+        let p = cstr(link_input(k));
+        if !exists(p) {
+            let m = buf_new();
+            buf_fmt(m, f"cannot read '{p}', an input of the link");
+            fail(-1, head(c"link.no-input", buf_slice(m), -1,
+                "the objects (.o), archives (.a), shared libraries (.so, .dylib) and C files (.c) of the command line go to the link: check the path"));
+        }
+    }
+}
+
+// The names the linker's text gives, line by line.
+struct Found {
+    undefined: IntVec,
+    libs: IntVec,
+    frameworks: IntVec,
+    dups: IntVec,
+    c_lines: IntVec,
+    all: IntVec,
+    c_file: [u8],
+}
+
+fn empty() -> IntVec {
+    IntVec { data: 0 as *i64, count: 0, cap: 0 }
+}
+
+// What the linker's text `log` names.
+fn read_log(log: [u8]) -> Found {
+    var x = Found {
+        undefined: empty(), libs: empty(), frameworks: empty(), dups: empty(), c_lines: empty(),
+        all: empty(), c_file: "",
+    };
+    var in_undefined = false;
+    var i = 0;
+    while i < log.len {
+        let e = line_end(log, i);
+        let l = log[i..e];
+        i = e + 1;
+        if l.len == 0 {
+            continue;
+        }
+        let b = buf_new();
+        buf_bytes(b, l);
+        x.all.push(b);
+        if c_error_line(l) {
+            if x.c_file.len == 0 {
+                x.c_file = l[0..find(l, ".c:", 0) + 2];
+            }
+            x.c_lines.push(b);
+            continue;
+        }
+        if x.c_file.len > 0 && !tool_line(l) {
+            x.c_lines.push(b);
+            continue;
+        }
+        if find(l, "Undefined symbols for architecture", 0) == 0 {
+            in_undefined = true;
+            continue;
+        }
+        if in_undefined {
+            if l.len > 3 && l[0] == ' ' && l[1] == ' ' && l[2] == '"' {
+                add_name(&x.undefined, c_name(after(l, "\"", '"')));
+                continue;
+            }
+            if l[0] == ' ' {
+                continue;
+            }
+            in_undefined = false;
+        }
+        add_name(&x.undefined, after(l, "undefined reference to `", '\''));
+        add_name(&x.undefined, after(l, "undefined symbol: ", 0));
+        if find(l, "' not found", 0) > 0 {
+            add_name(&x.libs, after(l, "library '", '\''));
+            add_name(&x.frameworks, after(l, "framework '", '\''));
+        }
+        add_name(&x.libs, after(l, "library not found for -l", 0));
+        add_name(&x.libs, after(l, "cannot find -l", ':'));
+        add_name(&x.libs, after(l, "unable to find library -l", 0));
+        add_name(&x.frameworks, after(l, "framework not found ", 0));
+        add_name(&x.dups, c_name(after(l, "duplicate symbol '", '\'')));
+        add_name(&x.dups, after(l, "multiple definition of `", '\''));
+        add_name(&x.dups, after(l, "duplicate symbol: ", 0));
+    }
+    sort_names(&x.undefined);
+    x
+}
+
+// A library or framework not found.
+fn no_library(x: Found) -> ! {
+    let framework = x.libs.count == 0;
+    let name = if framework { name_at(x.frameworks, 0) } else { name_at(x.libs, 0) };
+    let d = link_decl_of(if framework { 'F' } else { 'l' }, name);
+    let first = if d >= 0 { link_decl_first(d) } else { 0 as *u8 };
+    let pos = if first != 0 as *u8 { declared_at(cstr(first)) } else { -1 };
+    let m = buf_new();
+    buf_fmt(m, f"{if framework { "framework" } else { "library" }} '{name}' not found");
+    let h = buf_new();
+    if !framework && lib_given(name) {
+        buf_fmt(h, f"-l {name} on the command line names it");
+    } else if d >= 0 {
+        buf_str(h, c"the #[link] of the extern block names it");
+    } else {
+        buf_fmt(h, f"-framework {name} on the command line names it");
+    }
+    if framework {
+        buf_str(h, c"; the linker looked in the SDK's frameworks and found none: check the name");
+    } else {
+        buf_str(h, c"; the linker looked in its directories and the -L ones and found none: install it, or give the directory that has it with -L DIR");
+    }
+    fail(pos, head(if framework { c"link.no-framework" } else { c"link.no-library" },
+        buf_slice(m), pos, buf_slice(h)))
+}
+
+// Symbols nothing of the link defines (`main` among them: main.missing).
+fn undefined(x: Found, path: *u8) -> ! {
+    for k in 0..x.undefined.count {
+        if name_at(x.undefined, k) == "main" {
+            let f = root_file();
+            let root = if f >= 0 { root_path(f) } else { cstr(path) };
+            let m = buf_new();
+            buf_fmt(m, f"'{root}' has no fn main");
+            let t = head(c"main.missing", buf_slice(m), -1, "");
+            main_tail(t, root);
+            fail(-1, t);
+        }
+    }
+    let first = name_at(x.undefined, 0);
+    let pos = declared_at(first);
+    let m = buf_new();
+    buf_fmt(m, f"undefined symbol '{first}'");
+    let more = x.undefined.count - 1;
+    if more > 0 {
+        buf_fmt(m, f", and {more} more:");
+        for k in 1..x.undefined.count {
+            if k > 3 {
+                buf_str(m, c" ...");
+                break;
+            }
+            buf_fmt(m, f" '{name_at(x.undefined, k)}'");
+        }
+    }
+    let h = buf_new();
+    let d = link_decl_of(0, first);
+    if d >= 0 {
+        let what = if link_decl_framework(d) { "framework" } else { "library" };
+        buf_fmt(h,
+            f"'{first}' is declared in an extern block whose #[link] names the {what} '{cstr(link_decl_name(d))}', which does not define it: check the name and the {what}'s version");
+    } else if pos >= 0 {
+        buf_fmt(h, f"'{first}' is declared in an extern block, and nothing the link is given defines it: name its library, #[link(lib = \"NAME\")] on the block or -l NAME on the command line");
+    } else {
+        buf_fmt(h,
+            f"a C file, an object or a library of the command line uses '{first}', and nothing the link is given defines it");
+    }
+    buf_str(h, c" (--verbose: the linker's text)");
+    fail(pos, head(c"link.undefined", buf_slice(m), pos, buf_slice(h)))
+}
+
+// The link of `path` failed with status: its error (exit 1).
+pub fn link_failed(status: i64, path: *u8) -> ! {
+    let x = read_log(if LINK_LOG >= 0 { buf_slice(LINK_LOG) } else { "" });
+    let cc = driver();
+    if x.c_file.len > 0 {
+        let m = buf_new();
+        buf_fmt(m, f"the C file '{x.c_file}' does not compile");
+        let t = head(c"link.c-file", buf_slice(m), -1,
+            "the C files of the command line are compiled for the link; the C compiler's errors follow");
+        put_lines(t, c"cc", x.c_lines);
+        fail(-1, t);
+    }
+    if status == 127 {
+        let m = buf_new();
+        buf_fmt(m, f"cannot run '{cc}', the C compiler that links the program");
+        let named = cc != "cc";
+        let t = head(c"link.no-linker", buf_slice(m), -1,
+            if named { "$VOLE_CC names it: set it to a C compiler, or unset it" } else {
+                "the link runs the system's C compiler: install one (the command line tools on macOS, gcc or clang on Linux)"
+            });
+        if !named && !ELF {
+            put_try_lines(t, "xcode-select --install");
+        }
+        fail(-1, t);
+    }
+    if x.libs.count > 0 || x.frameworks.count > 0 {
+        no_library(x);
+    }
+    if x.undefined.count > 0 {
+        undefined(x, path);
+    }
+    if x.dups.count > 0 {
+        let name = name_at(x.dups, 0);
+        let m = buf_new();
+        buf_fmt(m, f"symbol '{name}' is defined more than once");
+        fail(-1, head(c"link.duplicate", buf_slice(m), -1,
+            if name == "main" {
+                "the program's fn main and a C file, an object or a library of the command line both define main: keep one (--verbose: the linker's text)"
+            } else {
+                "two inputs of the link define it (the program's object, a C file, an object or a library of the command line): rename one, or leave one out (--verbose: the linker's text)"
+            }));
+    }
+    let m = buf_new();
+    buf_fmt(m, f"the link failed ({cc} exited with status {status})");
+    let t = head(c"link.failed", buf_slice(m), -1,
+        "the linker's text follows (--verbose: its command too)");
+    put_lines(t, c"linker", x.all);
+    fail(-1, t)
+}

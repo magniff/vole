@@ -1,0 +1,494 @@
+// The terminal (0.25.3): what a build and `check` show a person at a
+// terminal, and only there. Colour (`--color=auto|always|never`, and
+// NO_COLOR, which only `--color=always` overrides); the phases as they
+// go (`Checking main.vl ... ok`, `Compiling`, `Linking`) and a
+// `Finished` or `Failed` summary; each diagnostic with its source line
+// and a caret under its position (rich_diagnostic).
+//
+// Off a terminal (an agent, a hook, a pipe, a test) RICH is false and the
+// output is what it was, byte for byte; so is it with `--color=never`, and
+// in a volec another one runs (VOLEC_NESTED). `--color=always` gives the
+// terminal's form anywhere: its tests (tests/refactor/tty253.t) use it.
+
+use crate::base::{
+    FILES, FILE_COUNT, SRC, SRC_LEN, STDERR, SourceFile, buf_byte, buf_bytes, buf_fmt, buf_new,
+    buf_slice, buf_str, buf_write_fd, cstr,
+};
+use crate::base::diag::{NESTED, buf_position, errors_in, file_line_col, put_short_positions};
+use crate::base::json::DIAG_JSON;
+use crate::tools::lsp::now_us;
+
+// UNSAFE: whether stderr is a terminal is C's question (POSIX isatty); std
+// has no function that asks it.
+// SAFETY: isatty reads nothing but its int argument; any fd is valid (one
+// that is not open gives 0, with errno set).
+extern "C" {
+    fn isatty(fd: i32) -> i32;
+}
+
+pub const COLOR_AUTO: i64 = 0;
+pub const COLOR_ALWAYS: i64 = 1;
+pub const COLOR_NEVER: i64 = 2;
+
+// Whether stderr gets the terminal's form: the phases, the source lines
+// under the diagnostics, the summary.
+pub static var RICH: bool = false;
+// Whether it is coloured (ANSI SGR escapes).
+pub static var COLOR: bool = false;
+// When the compiler started (microseconds), for the summary's time.
+static var STARTED_US: i64 = 0;
+// A build's phases are shown (term_build): what it makes, its
+// `Compiling` line; BUILDING is false again once its summary is out.
+static var BUILDING: bool = false;
+static var BUILD_OUT: *u8 = 0 as *u8;
+static var BUILD_COMPILING: i64 = -1;
+
+// The width of a status line's verb, right-aligned (`    Checking`).
+const VERB_WIDTH: i64 = 12;
+// The files a summary lists by name, the ones with errors aside.
+const FILES_LISTED: i64 = 10;
+
+// `--color=WHEN`, word w of the command line: its mode, -1 when w is no
+// --color option, -2 when WHEN is none of auto, always and never.
+pub fn color_mode_of(w: [u8]) -> i64 {
+    if w == "--color=auto" {
+        return COLOR_AUTO;
+    }
+    if w == "--color=always" {
+        return COLOR_ALWAYS;
+    }
+    if w == "--color=never" {
+        return COLOR_NEVER;
+    }
+    if w.len >= 8 && w[0..8] == "--color=" { -2 } else { -1 }
+}
+
+// Whether stderr is a terminal.
+pub fn stderr_is_terminal() -> bool {
+    // UNSAFE: a C call (isatty: no std function asks it).
+    // SAFETY: STDERR is a plain int; isatty reads nothing else.
+    unsafe { isatty(STDERR) != 0 }
+}
+
+// Decides the form of stderr, once, at the start (main), after --json and
+// --color are read; `no_color`: NO_COLOR is set, and not empty.
+pub fn term_setup(mode: i64, no_color: bool) {
+    STARTED_US = now_us();
+    if DIAG_JSON || mode == COLOR_NEVER || (NESTED && mode != COLOR_ALWAYS) {
+        return;
+    }
+    RICH = mode == COLOR_ALWAYS || stderr_is_terminal();
+    COLOR = RICH && (mode == COLOR_ALWAYS || !no_color);
+}
+
+// Starts style sgr (an SGR code: "1;31" is bold red), when coloured.
+fn style(out: i64, sgr: *u8) {
+    if COLOR {
+        buf_byte(out, 27);
+        buf_byte(out, '[');
+        buf_str(out, sgr);
+        buf_byte(out, 'm');
+    }
+}
+
+// Ends a style.
+fn plain(out: i64) {
+    if COLOR {
+        buf_byte(out, 27);
+        buf_str(out, c"[0m");
+    }
+}
+
+// `text` in style sgr, when coloured.
+pub fn paint(out: i64, sgr: *u8, text: [u8]) {
+    style(out, sgr);
+    buf_bytes(out, text);
+    plain(out);
+}
+
+// ---- Diagnostics ----
+
+// The byte that ends the line at i of text (its '\n', or text's end).
+fn line_end(text: [u8], i: i64) -> i64 {
+    var e = i;
+    while e < text.len && text[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+// Whether s starts with prefix.
+fn starts(s: [u8], prefix: [u8]) -> bool {
+    s.len >= prefix.len && s[0..prefix.len] == prefix
+}
+
+// A byte of a name (the caret spans a name's bytes).
+fn name_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+fn digits(n: i64) -> i64 {
+    var d = 1;
+    var x = n;
+    while x >= 10 {
+        x = x / 10;
+        d += 1;
+    }
+    d
+}
+
+fn spaces(out: i64, n: i64) {
+    for _ in 0..n {
+        buf_byte(out, ' ');
+    }
+}
+
+// Source file f of the program (0 <= f < FILE_COUNT).
+pub fn file_info(f: i64) -> SourceFile {
+    if f < 0 || f >= FILE_COUNT {
+        panic("base::term::file_info: no such file");
+    }
+    // UNSAFE: FILES is base's C-style array of the source files, older than
+    // std's Vec: a raw pointer, indexed unchecked.
+    // SAFETY: 0 <= f < FILE_COUNT (checked above), and load_sources,
+    // add_source and restore_sources fill each entry before they count it;
+    // the entry is copied out.
+    unsafe { FILES[f] }
+}
+
+// The program's source text: every file, as base::SRC holds it.
+fn source() -> [u8] {
+    if FILE_COUNT == 0 {
+        return "";
+    }
+    // UNSAFE: SRC is base's raw buffer of the sources (a C-style pointer).
+    // SAFETY: once a file is read SRC holds SRC_LEN bytes (and a NUL); the
+    // slice is used at once, before a file is added (which moves SRC).
+    unsafe { SRC[0..SRC_LEN] }
+}
+
+// The file of position pos (an index in FILES).
+fn file_of(pos: i64) -> i64 {
+    var f = 0;
+    while f + 1 < FILE_COUNT && pos >= file_info(f + 1).start {
+        f += 1;
+    }
+    f
+}
+
+// The head `error[kind]: message`: the severity and kind in its colour,
+// the message bold.
+fn put_head(out: i64, head: [u8], tone: *u8) {
+    var k = 0;
+    while k + 1 < head.len && !(head[k] == ':' && head[k + 1] == ' ') {
+        k += 1;
+    }
+    if k + 1 >= head.len || head[0] == ' ' {
+        buf_bytes(out, head);
+        return;
+    }
+    paint(out, tone, head[0..k]);
+    paint(out, c"1", head[k..head.len]);
+}
+
+// The source line of pos under its position, with a caret under what is
+// at pos (a name, a string, else one character); `pad`: the gutter's
+// width.
+fn put_snippet(out: i64, pos: i64, line: i64, pad: i64, tone: *u8) {
+    let src = source();
+    let file = file_info(file_of(pos));
+    let last = if file.end < src.len { file.end } else { src.len };
+    if pos > last {
+        return;
+    }
+    var ls = pos;
+    while ls > file.start && src[ls - 1] != '\n' {
+        ls -= 1;
+    }
+    var le = pos;
+    while le < last && src[le] != '\n' {
+        le += 1;
+    }
+    spaces(out, pad + 1);
+    paint(out, c"1;34", "|");
+    buf_byte(out, '\n');
+    style(out, c"1;34");
+    buf_fmt(out, f"{line} |");
+    plain(out);
+    if le > ls {
+        buf_byte(out, ' ');
+    }
+    for i in ls..le {
+        if src[i] == '\t' {
+            spaces(out, 4);
+        } else {
+            buf_byte(out, src[i]);
+        }
+    }
+    buf_byte(out, '\n');
+    spaces(out, pad + 1);
+    paint(out, c"1;34", "|");
+    buf_byte(out, ' ');
+    // the caret's column: a tab is 4, a UTF-8 character one
+    for i in ls..pos {
+        if src[i] == '\t' {
+            spaces(out, 4);
+        } else if (src[i] & 192) != 128 {
+            buf_byte(out, ' ');
+        }
+    }
+    var n = 1;
+    if pos < le && name_byte(src[pos]) {
+        var e = pos;
+        while e < le && name_byte(src[e]) {
+            e += 1;
+        }
+        n = e - pos;
+    } else if pos < le && src[pos] == '"' {
+        var e = pos + 1;
+        while e < le && src[e] != '"' {
+            e += if src[e] == '\\' { 2 } else { 1 };
+        }
+        n = if e < le { e + 1 - pos } else { 1 };
+    }
+    style(out, tone);
+    for _ in 0..n {
+        buf_byte(out, '^');
+    }
+    plain(out);
+    buf_byte(out, '\n');
+}
+
+// Diagnostic `text`, in the human form (`error[kind]: message`, ` -->
+// FILE: line L, column C`, `  = help: ...`, `  = try: ...`, notes), at
+// pos (-1: none), in the terminal's form: the head coloured, the position
+// as FILE:L:C, the source line with a caret under pos (when the position
+// is pos's: a C header's is not), then the `= help:` and `= try:` lines
+// marked.
+pub fn rich_diagnostic(out: i64, pos: i64, text: [u8]) {
+    let head_end = line_end(text, 0);
+    let head = text[0..head_end];
+    let tone = if starts(head, "warning") { c"1;33" } else { c"1;31" };
+    put_head(out, head, tone);
+    buf_byte(out, '\n');
+    var i = head_end + 1;
+    var pad = 1;
+    if i < text.len && starts(text[i..text.len], " --> ") {
+        let e = line_end(text, i);
+        let at = text[i + 5..e];
+        var line = 0;
+        if pos >= 0 && pos <= SRC_LEN && FILE_COUNT > 0 {
+            let b = buf_new();
+            buf_position(b, pos);
+            if buf_slice(b) == at {
+                var col = 1;
+                line = file_line_col(file_of(pos), pos, &col);
+                pad = digits(line);
+            }
+        }
+        spaces(out, pad);
+        paint(out, c"1;34", "-->");
+        buf_byte(out, ' ');
+        put_short_positions(out, at);
+        buf_byte(out, '\n');
+        if line > 0 {
+            put_snippet(out, pos, line, pad, tone);
+        }
+        i = e + 1;
+    }
+    while i < text.len {
+        let e = line_end(text, i);
+        let l = text[i..e];
+        if starts(l, "  = ") {
+            // `  = help: X`, `  = try: X`, `  = note: X`
+            var k = 4;
+            while k < l.len && l[k] != ':' {
+                k += 1;
+            }
+            spaces(out, pad + 1);
+            buf_str(out, c"= ");
+            let word = l[4..k];
+            if word == "try" {
+                paint(out, c"1;32", "try:");
+                let rest = if k + 1 < l.len { l[k + 1..l.len] } else { "" };
+                paint(out, c"1", rest);
+            } else {
+                paint(out, c"1", word);
+                buf_bytes(out, l[k..l.len]);
+            }
+        } else {
+            buf_bytes(out, l);
+        }
+        buf_byte(out, '\n');
+        i = e + 1;
+    }
+}
+
+// ---- Progress and summary ----
+
+// A status line on stderr, now: the verb right-aligned in its colour,
+// then `what`.
+fn status(verb: [u8], tone: *u8, what: [u8]) {
+    let out = buf_new();
+    spaces(out, VERB_WIDTH - verb.len);
+    paint(out, tone, verb);
+    buf_byte(out, ' ');
+    buf_bytes(out, what);
+    buf_byte(out, '\n');
+    buf_write_fd(out, STDERR);
+}
+
+// A path as positions print it (without `./`).
+fn shown_path(p: *u8) -> [u8] {
+    let s = cstr(p);
+    if s.len > 2 && s[0] == '.' && s[1] == '/' { s[2..s.len] } else { s }
+}
+
+// `N error(s)`.
+fn put_errors(out: i64, n: i64) {
+    buf_fmt(out, f"{n} error{if n == 1 { "" } else { "s" }}");
+}
+
+// `Checking FILE ... ok` (or `... N errors`) for each of the program's
+// own files (not std's, not C headers'): the first FILES_LISTED, and every
+// one with errors; then one line for the rest.
+fn checked_files() {
+    var listed = 0;
+    var rest = 0;
+    for f in 0..FILE_COUNT {
+        let file = file_info(f);
+        let path = shown_path(file.path);
+        if path.len == 0 || path[0] == '<' {
+            continue;
+        }
+        let to = if f + 1 < FILE_COUNT { file_info(f + 1).start } else { SRC_LEN + 1 };
+        let n = errors_in(file.start, to);
+        if listed >= FILES_LISTED && n == 0 {
+            rest += 1;
+            continue;
+        }
+        listed += 1;
+        let w = buf_new();
+        buf_bytes(w, path);
+        buf_str(w, c" ... ");
+        if n == 0 {
+            paint(w, c"32", "ok");
+        } else {
+            let e = buf_new();
+            put_errors(e, n);
+            paint(w, c"31", buf_slice(e));
+        }
+        status("Checking", c"1;32", buf_slice(w));
+    }
+    if rest > 0 {
+        let w = buf_new();
+        buf_fmt(w, f"{rest} more file{if rest == 1 { "" } else { "s" }} ... ");
+        paint(w, c"32", "ok");
+        status("Checking", c"1;32", buf_slice(w));
+    }
+}
+
+// ` in 0.42s`
+fn put_time(out: i64) {
+    let us = now_us() - STARTED_US;
+    let cs = (us + 5000) / 10000;
+    buf_fmt(out, f" in {cs / 100}.{if cs % 100 < 10 { "0" } else { "" }}{cs % 100}s");
+}
+
+// `, N warning(s)`, when there were some.
+fn put_warnings(out: i64, warnings: i64) {
+    if warnings > 0 {
+        buf_fmt(out, f", {warnings} warning{if warnings == 1 { "" } else { "s" }}");
+    }
+}
+
+// A build starts (main): it makes `out`; `compiling` (a buffer) is its
+// Compiling line. Its phases are shown on a terminal.
+pub fn term_build(out: *u8, compiling: i64) {
+    BUILDING = RICH;
+    BUILD_OUT = out;
+    BUILD_COMPILING = compiling;
+}
+
+// The build's front end found no error (gen0::gen::compile_program).
+pub fn build_checked() {
+    if BUILDING {
+        checked_files();
+    }
+}
+
+// The build's code generation starts.
+pub fn build_compiling() {
+    if BUILDING && BUILD_COMPILING >= 0 {
+        status("Compiling", c"1;32", buf_slice(BUILD_COMPILING));
+    }
+}
+
+// The build's link starts.
+pub fn build_linking(path: *u8) {
+    if BUILDING {
+        status("Linking", c"1;32", shown_path(path));
+    }
+}
+
+// The build is done (main): `Finished OUT in 0.42s`.
+pub fn build_finished(warnings: i64) {
+    if !BUILDING {
+        return;
+    }
+    BUILDING = false;
+    let w = buf_new();
+    buf_bytes(w, shown_path(BUILD_OUT));
+    put_time(w);
+    put_warnings(w, warnings);
+    status("Finished", c"1;32", buf_slice(w));
+}
+
+// The build's front end failed (diag::exit_if_errors, after the errors):
+// each file's count, then `Failed OUT: N errors`.
+pub fn build_failed_errors(errors: i64) {
+    if !BUILDING {
+        return;
+    }
+    BUILDING = false;
+    checked_files();
+    let w = buf_new();
+    buf_bytes(w, shown_path(BUILD_OUT));
+    buf_str(w, c": ");
+    put_errors(w, errors);
+    put_time(w);
+    status("Failed", c"1;31", buf_slice(w));
+}
+
+// The build failed after its front end (die, a link that failed):
+// `Failed OUT`.
+pub fn build_failed() {
+    if !BUILDING {
+        return;
+    }
+    BUILDING = false;
+    let w = buf_new();
+    buf_bytes(w, shown_path(BUILD_OUT));
+    put_time(w);
+    status("Failed", c"1;31", buf_slice(w));
+}
+
+// `check`'s summary on a terminal: each file's count, then `Finished
+// ROOT: 0 errors` or `Failed ROOT: N errors`.
+pub fn check_summary(root: *u8, errors: i64, warnings: i64) {
+    if !RICH {
+        return;
+    }
+    checked_files();
+    let w = buf_new();
+    buf_bytes(w, shown_path(root));
+    buf_str(w, c": ");
+    put_errors(w, errors);
+    put_warnings(w, warnings);
+    put_time(w);
+    if errors > 0 {
+        status("Failed", c"1;31", buf_slice(w));
+    } else {
+        status("Finished", c"1;32", buf_slice(w));
+    }
+}

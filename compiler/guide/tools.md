@@ -195,6 +195,15 @@ try: volec edit patch main --old 'print_int(total)' --new 'print_int(total + 1)'
 
 Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
+On a terminal (0.25.3) a build and `check` show their phases
+(`Checking main.vl ... ok`, `Compiling`, `Linking`), each error as rustc
+does (`FILE:LINE:COL`, the source line, a caret, the `try:` marked) and a
+`Finished` or `Failed` line, in colour: `--color=auto|always|never`,
+`NO_COLOR`. Off a terminal the output is the one-line form above. A link
+that fails is one error too (`link.undefined`, `link.no-library`,
+`main.missing`...; `volec explain link`), `--verbose` adds the linker's
+own text; `volec build main.vl` says to write `volec main.vl -o main`.
+
 ## In an editor
 
 `volec lsp` (0.24) is a language server over stdin and stdout: the

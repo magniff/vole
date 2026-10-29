@@ -65,6 +65,38 @@ binary is invoked, where its test runner is and which hosts it supports.
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.3
+
+- **The compiler at a terminal** (base/term.vl): a build shows its
+  phases (`Checking main.vl ... ok` for each of the program's files, or
+  `... 2 errors`; `Compiling main.vl (-O2, aarch64-macos)`; `Linking
+  prog`) and ends with `Finished prog in 0.42s` or `Failed prog: 2
+  errors`; each diagnostic is rustc's shape, coloured: the position as
+  `FILE:LINE:COL`, the source line, a caret under what is at the
+  position, the `help:` and a highlighted `try:`. `check` gives the same
+  per-file lines and summary. `--color=auto|always|never` (auto: when
+  stderr is a terminal) and `NO_COLOR` (no colour; `--color=always`
+  overrides it). Off a terminal (an agent, a hook, a pipe, the tests)
+  and with `--color=never` the output is 0.25.2's, byte for byte.
+- **`main.missing`**: building an executable of a program with no `fn
+  main` is a compiler error after the checks, with `try:` lines that add
+  `fn main() -> i32 { 0 }` or build an object (`-c`), instead of the
+  linker's `Undefined symbols: "_main"`.
+- **A failed link is one vole error**, never the linker's text first
+  (back/objfile/linkfail.vl reads ld64's, ld-prime's, GNU ld's and lld's):
+  `link.undefined` (at the extern declaration of the symbol, naming its
+  block's `#[link]`), `link.no-library`, `link.no-framework`,
+  `link.duplicate`, `link.c-file` (a C file of the command line that does
+  not compile: its errors under the error), `link.no-linker`,
+  `link.no-input` (checked before the link) and `link.failed` (anything
+  else, the linker's lines under it). `--verbose` prints the link's
+  command and the linker's whole text. tests/refactor/tty253.t has a case
+  for each that can be made on macOS and Linux alike.
+- **`volec build main.vl -o x`** says `'build' is not a volec command or a
+  file` with `try: volec main.vl -o x` (`cli.not-a-command`); `run` gives
+  `volec main.vl -o main && ./main`, a near-miss of a command (`chek`)
+  that command.
+
 ### What's new in 0.25.2.2
 
 The second round of the GPU eval (evals/tasks/0.25.2.1: the same ten
