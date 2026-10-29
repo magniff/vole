@@ -25,7 +25,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	94
+std::fmt	<std>	95
 std::num	<std>	132
 std::num::tables	<std>	4
 std::math	<std>	260
@@ -81,7 +81,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	130
 std::window::keys	<std>	27
 std::window::objc	<std>	88
-std::cli	<std>	109
+std::cli	<std>	110
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

@@ -143,7 +143,7 @@ std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count
 std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
 <std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
 <std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
-std::cli::Matches::count	../../compiler/std/cli.vl:1409:12	method	pub fn count(self, name: str) -> i64
+std::cli::Matches::count	../../compiler/std/cli.vl:1417:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: volec query items
