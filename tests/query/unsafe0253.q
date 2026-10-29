@@ -19,6 +19,7 @@ unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	index
 unsafe0253/raw.vl:13	unsafe fn	crate::raw::first	raw-pointer	missing both	deref
 unsafe0253/raw.vl:19	block	crate::raw::peek	raw-pointer	missing both	deref
 sites: 13 (10 blocks, 2 unsafe fns, 1 extern blocks); unjustified: 7; unneeded: 1
+try: volec fix --only unneeded-unsafe
 ## A FILE's sites; the unjustified ones.
 $ unsafe unsafe0253/raw.vl
 unsafe0253/raw.vl:5	unsafe fn	crate::raw::sum	raw-pointer	justified	index
@@ -34,6 +35,7 @@ unsafe0253/main.vl:48	block	crate::main	alloc	missing both	c-call(free)
 unsafe0253/raw.vl:13	unsafe fn	crate::raw::first	raw-pointer	missing both	deref
 unsafe0253/raw.vl:19	block	crate::raw::peek	raw-pointer	missing both	deref
 sites: 7 (6 blocks, 1 unsafe fns, 0 extern blocks); unjustified: 7; unneeded: 1
+try: volec fix --only unneeded-unsafe
 ## The counts.
 $ unsafe --no-std --summary
 sites: 13 (10 blocks, 2 unsafe fns, 1 extern blocks); unjustified: 7; unneeded: 1
@@ -58,6 +60,7 @@ justification	sites	unjustified
 justified	6	0
 missing both	5	5
 missing UNSAFE:	2	2
+try: volec fix --only unneeded-unsafe
 ## One object a site.
 $ unsafe unsafe0253/raw.vl --json
 {"file":"unsafe0253/raw.vl","line":5,"kind":"unsafe fn","item":"crate::raw::sum","class":"raw-pointer","unsafe_comment":true,"safety_comment":true,"justified":true,"checked":true,"ops":"index"}
