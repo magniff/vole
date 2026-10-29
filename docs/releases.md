@@ -221,6 +221,20 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   changed (from `volec query diff`, at most 5). The hook itself formats
   nothing.
 
+- **A closure drops its by-value parameter** (a leak since 0.19, F20):
+  one given to an `FnMut(sink T)` bound (`map`, `for_each`, `fold`,
+  `Option::map`, `map_err`, `and_then`, `unwrap_or_else`, a program's
+  own) owns its argument and drops it at the end of its body unless the
+  body moves it out (returns it, pushes it, passes it on to a `sink`
+  parameter; on one path, by a drop flag); `|_|` drops it too. A closure
+  may say so itself, `|d: sink D|` (was `conv.sink_type`). A let
+  parameter still borrows, and a borrowing iterator's items (`w.iter()`,
+  a HashMap's) stay the container's: `own.iter_item_copy` is kept
+  (lifting it, `w.iter().collect_in(gpa)` still frees each element
+  twice). Fuzzed: semfuzz's `--closure-params` (in the gate's
+  `fuzz-sem`) and the argument sweep's `own_arg_temp_sweep_closure`
+  (1,680 cases); 12 XFAILs (the leaks, `|d: sink D|`) now pass.
+
 ### What's new in 0.25.2.2
 
 The second round of the GPU eval (evals/tasks/0.25.2.1: the same ten
