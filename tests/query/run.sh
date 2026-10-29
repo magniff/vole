@@ -1,10 +1,13 @@
 #!/bin/sh
 # The tests of `volec query` (0.11). POSIX sh and awk only.
 #
-# usage: tests/query/run.sh [-c COMPILER] [-u]
+# usage: tests/query/run.sh [-c COMPILER] [-u] [NAME...]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
-#   -u            rewrite the .q files with the output they get now
+#   -u            rewrite the .q files that fail with the output they get
+#                 now (the real numbers, std's too)
+#   NAME          only these transcripts (NAME.q), and not the checks of
+#                 the compiler's own source below
 #
 # Each tests/query/NAME.q is a transcript: a line `$ ARGS` runs
 # `volec query ARGS` in tests/query (ARGS are split as the shell
@@ -14,7 +17,10 @@
 # (the compiler's path in `try:` lines written `volec`), then `[exit N]`
 # when N is not 0. Lines starting with `##` are comments (`#` starts
 # the file headers of refs).
-# A test passes when the transcript it makes is the file, comments aside.
+# A test passes when the transcript it makes is the file, comments aside,
+# std's positions and counts compared normalized (0.25.3, tests/stdpos.awk:
+# `<std>:L:C`), so that a std change breaks no transcript that is not
+# about std; one with a line `## exact-std` compares them exactly.
 #
 # Then the compiler's own source, compiler/src/main.vl, is asked a few
 # questions whose answers must be plausible (it changes too often for a
@@ -31,11 +37,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
 UPDATE=0
+ONLY=
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
         -u) UPDATE=1; shift ;;
-        *) echo "usage: tests/query/run.sh [-c COMPILER] [-u]" >&2; exit 2 ;;
+        -*) echo "usage: tests/query/run.sh [-c COMPILER] [-u] [NAME...]" >&2; exit 2 ;;
+        *) ONLY="$ONLY $1"; shift ;;
     esac
 done
 case "$COMPILER" in
@@ -100,13 +108,39 @@ transcript() {
 }
 
 : >"$WORK/hits"
+STDPOS="$ROOT/tests/stdpos.awk"
+# Whether transcript file $1's text $2 matches what it got, $3 (0.25.3):
+# std's numbers normalized unless $1 says `## exact-std`; with
+# VOLE_STD_SHIFT=1 (tests/stdpos/run.sh) $2's std numbers are moved first,
+# as a std change would move them. Leaves the texts compared in $3.w, $3.g.
+same_transcript() {
+    if [ "${VOLE_STD_SHIFT:-0}" = 1 ]; then
+        awk -v mode=shift -f "$STDPOS" "$2" >"$3.s"
+    else
+        cp "$2" "$3.s"
+    fi
+    if grep -q '^## exact-std' "$1"; then
+        cp "$3.s" "$3.w"
+        cp "$3" "$3.g"
+    else
+        awk -f "$STDPOS" "$3.s" >"$3.w"
+        awk -f "$STDPOS" "$3" >"$3.g"
+    fi
+    cmp -s "$3.w" "$3.g"
+}
+# (VOLE_STD_SHIFT=1: once, without the cache; the shift is the check)
+MODES="off cache"
+[ "${VOLE_STD_SHIFT:-0}" = 1 ] && MODES=off
 for file in "$HERE"/*.q; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .q)
-    for mode in off cache; do
+    if [ -n "$ONLY" ]; then
+        case " $ONLY " in *" $name "*) ;; *) continue ;; esac
+    fi
+    for mode in $MODES; do
         transcript "$file" $mode >"$WORK/$name.got"
         grep -v '^##' "$file" >"$WORK/$name.want"
-        if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
+        if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
             # (0.16: a failing transcript only, its `##` comments kept
             # above the `$` line they were above)
             awk 'NR == FNR {
@@ -120,15 +154,17 @@ for file in "$HERE"/*.q; do
             cp "$WORK/$name.new" "$file"
             grep -v '^##' "$file" >"$WORK/$name.want"
         fi
-        if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
+        if same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
             echo "pass $name ($mode)"
         else
-            echo "FAIL $name ($mode): the transcript differs (< expected, > got):"
-            diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40
+            echo "FAIL $name ($mode): the transcript differs (< expected, > got; std's numbers as L:C, N):"
+            diff "$WORK/$name.got.w" "$WORK/$name.got.g" | sed 's/^/    /' | head -40
             STATUS=1
         fi
     done
 done
+# (NAME given: those transcripts only)
+[ -z "$ONLY" ] || exit $STATUS
 # (the cache was made and used: by some lines of every program)
 hits=$(grep -c hit "$WORK/hits")
 if [ "$hits" -ge 10 ]; then

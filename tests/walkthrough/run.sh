@@ -26,7 +26,10 @@
 #                 `[exit N]` when N is not 0
 #
 # The other blocks (```tach, ```diff, ...) and the prose are not run. An
-# example passes when every console block is what its commands print now.
+# example passes when every console block is what its commands print now,
+# std's positions and counts compared normalized (0.25.3, tests/stdpos.awk:
+# `<std>:L:C`), unless the README has a line `<!-- exact-std -->`; `-u`
+# rewrites only a README that fails, with the real numbers.
 # HOME and git's configuration are the runner's own (git's defaults: a
 # conflict looks the same on every machine).
 #
@@ -143,7 +146,22 @@ run_one() {
         echo '```' >>"$meta/got"
         last=$((last + 1))
     done
-    if [ "$UPDATE" -eq 1 ]; then
+    # (0.25.3) std's numbers normalized, unless the README asks
+    # `<!-- exact-std -->`; VOLE_STD_SHIFT=1 (tests/stdpos/run.sh) moves
+    # the README's first, as a std change would
+    if [ "${VOLE_STD_SHIFT:-0}" = 1 ]; then
+        awk -v mode=shift -f "$ROOT/tests/stdpos.awk" "$meta/want" >"$meta/want.s"
+    else
+        cp "$meta/want" "$meta/want.s"
+    fi
+    if grep -q '^<!-- exact-std -->' "$readme"; then
+        cp "$meta/want.s" "$meta/want.n"
+        cp "$meta/got" "$meta/got.n"
+    else
+        awk -f "$ROOT/tests/stdpos.awk" "$meta/want.s" >"$meta/want.n"
+        awk -f "$ROOT/tests/stdpos.awk" "$meta/got" >"$meta/got.n"
+    fi
+    if [ "$UPDATE" -eq 1 ] && ! cmp -s "$meta/want.n" "$meta/got.n"; then
         # each console block's lines become the ones it got
         awk -v got="$meta/got" '
             /^```console[ \t]*$/ && !in_block {
@@ -155,13 +173,13 @@ run_one() {
             in_block { next }
             { print }
         ' "$readme" >"$meta/new" && cp "$meta/new" "$readme"
-        cp "$meta/got" "$meta/want"
+        cp "$meta/got.n" "$meta/want.n"
     fi
-    if cmp -s "$meta/want" "$meta/got"; then
+    if cmp -s "$meta/want.n" "$meta/got.n"; then
         echo "pass $name"
     else
-        echo "FAIL $name: the session differs (< README, > got):"
-        diff "$meta/want" "$meta/got" | sed 's/^/    /' | head -40
+        echo "FAIL $name: the session differs (< README, > got; std's numbers as L:C, N):"
+        diff "$meta/want.n" "$meta/got.n" | sed 's/^/    /' | head -40
     fi >"$meta/result"
 }
 
