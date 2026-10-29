@@ -681,7 +681,165 @@ fn push_signature(tb: Table, out: inout Buf, m: Method, recv: [u8], recv_kind: i
     }
 }
 
-fn push_body(tb: Table, g: inout Gen, out: inout Buf, m: Method, receiver: [u8], gpa: Gpa) {
+// A comment of words, wrapped at 96 columns, each line `indent// `.
+fn push_comment(out: inout Buf, indent: [u8], text: [u8]) {
+    var col = 0;
+    var i = 0;
+    while i < text.len {
+        var j = i;
+        while j < text.len && text[j] != ' ' { j += 1; }
+        let word = text[i..j];
+        if col > 0 && col + 1 + word.len > 96 {
+            out.push('\n');
+            col = 0;
+        }
+        if col == 0 {
+            out.push_str(indent);
+            out.push_str("//");
+            col = indent.len + 2;
+        }
+        out.push(' ');
+        out.push_str(word);
+        col += 1 + word.len;
+        i = j + 1;
+    }
+    if col > 0 { out.push('\n'); }
+}
+
+// A zero of a type, for the result of a message to nil.
+fn push_zero(tb: Table, t: Ty, out: inout Buf) {
+    if t.kind == K_STRUCT {
+        match tb.find_struct(t.name) {
+            Some(s) => {
+                out.push_str(s.name);
+                out.push_str(" { ");
+                for i in 0..s.fields.len() {
+                    let f = s.fields.get(i);
+                    if i > 0 { out.push_str(", "); }
+                    push_ident(&out, f.name);
+                    out.push_str(": ");
+                    push_zero(tb, f.ty, &out);
+                }
+                out.push_str(" }");
+            }
+            None => out.push('0'),
+        }
+    } else if t.kind == K_SCALAR {
+        if t.code == 'f' || t.code == 'd' { out.push_str("0.0"); }
+        else if t.code == 'B' { out.push_str("false"); }
+        else { out.push('0'); }
+    } else {
+        out.push_str("0 as *u8");
+    }
+}
+
+// The pointer parameters of m, `a`, `b and c`.
+fn ptr_params(m: Method, out: inout Buf) {
+    var n = 0;
+    for p in m.params {
+        if p.ty.kind == K_PTR { n += 1; }
+    }
+    var k = 0;
+    for p in m.params {
+        if p.ty.kind != K_PTR { continue; }
+        if k > 0 { out.push_str(if k == n - 1 { " and " } else { ", " }); }
+        out.push('`');
+        push_ident(&out, p.name);
+        out.push('`');
+        k += 1;
+    }
+}
+
+// The comments above an `unsafe fn` wrapper (a method with a pointer
+// parameter): why it cannot be safe, and the caller's obligation.
+fn push_unsafe_fn_doc(out: inout Buf, indent: [u8], m: Method, gpa: Gpa) {
+    var t = Buf::new_in(gpa);
+    let sign = if m.class_method { "+" } else { "-" };
+    t.push_str(f"UNSAFE: {sign}{m.selector} takes the raw pointer ");
+    ptr_params(m, &t);
+    t.push_str(", whose extent and lifetime no type states.");
+    push_comment(&out, indent, t.as_slice());
+    t.clear();
+    t.push_str("SAFETY: the caller's:");
+    var first = true;
+    for p in m.params {
+        if p.ty.kind != K_PTR { continue; }
+        t.push_str(if first { " " } else { "; " });
+        first = false;
+        if p.name == "error" {
+            t.push_str("`error` is null or the address of a writable *u8 slot, where");
+            t.push_str(f" {sign}{m.selector} stores an autoreleased NSError or nil (NSError **)");
+        } else {
+            t.push('`');
+            push_ident(&t, p.name);
+            t.push_str(f"` points to memory valid for what {sign}{m.selector} reads or writes");
+            t.push_str(" through it, for as long as the object uses it");
+        }
+    }
+    t.push('.');
+    push_comment(&out, indent, t.as_slice());
+    t.free();
+}
+
+// The comments above a wrapper's message send: why it is unsafe (a C call
+// the compiler cannot check) and why it is sound (the prototype checked
+// against the runtime, the receiver, the arguments, the result's owner).
+// recv_kind: 1 an instance method of `ty` (declared by `decl`), 0 a class
+// method, 2 the init family.
+fn push_send_doc(tb: Table, out: inout Buf, m: Method, shape: [u8], recv: [u8], recv_kind: i64,
+    ty: [u8], decl: [u8], gpa: Gpa) {
+    let sign = if m.class_method { "+" } else { "-" };
+    var t = Buf::new_in(gpa);
+    t.push_str(f"UNSAFE: {sign}{m.selector} is sent by objc_msgSend, a C call whose types the");
+    t.push_str(" compiler cannot see.");
+    push_comment(&out, "        ", t.as_slice());
+    t.clear();
+    t.push_str(f"SAFETY: {shape} is its C prototype, checked against the runtime's type encoding");
+    t.push_str(" (objcgen --check)");
+    if recv_kind == 1 {
+        t.push_str(f"; self.ptr is nil or a live {ty} (Ref's invariant)");
+        if ty != decl { t.push_str(f", which has {decl}'s methods"); }
+        if m.ret.kind != K_STRUCT { t.push_str(", and a message to nil returns zero"); }
+    } else if recv_kind == 0 {
+        t.push_str(f"; {recv} is the class {decl}, or nil before its framework is opened, and a");
+        t.push_str(" message to nil returns zero");
+    } else {
+        t.push_str(f"; `this` is a +1 {decl} (or nil) that {recv} hands to the init family, which");
+        t.push_str(" consumes it");
+    }
+    var objs = false;
+    for p in m.params {
+        if p.ty.kind == K_OBJ { objs = true; }
+    }
+    if objs {
+        t.push_str("; the object arguments are live objects (or nil) of their declared types,");
+        t.push_str(" borrowed for the call");
+    }
+    let r = m.ret;
+    if r.kind == K_OBJ {
+        if r.own {
+            t.push_str("; the result is +1, and the Id returned owns and releases it");
+        } else if recv_kind == 1 {
+            t.push_str("; the +0 result is a Ref tied to self.keep, so it cannot outlive the");
+            t.push_str(" receiver that holds it");
+        } else {
+            t.push_str("; the +0 result is kept by the process (a class) or the current");
+            t.push_str(" autorelease pool (from_global's rule)");
+        }
+    } else if r.kind == K_STRUCT {
+        t.push_str("; a nil receiver is answered with zeroes first, as a message to nil does not");
+        t.push_str(" write a struct result returned in memory");
+    } else if r.kind == K_PTR {
+        t.push_str("; the pointer result is returned raw: reading through it is the caller's");
+        t.push_str(" unsafe");
+    }
+    t.push('.');
+    push_comment(&out, "        ", t.as_slice());
+    t.free();
+}
+
+fn push_body(tb: Table, g: inout Gen, out: inout Buf, m: Method, receiver: [u8], recv_kind: i64,
+    ty: [u8], decl: [u8], gpa: Gpa) {
     let shape = need_shape(tb, &g, m, gpa);
     let si = sel_index(&g, m.selector);
     var call = Buf::new_in(gpa);
@@ -707,7 +865,17 @@ fn push_body(tb: Table, g: inout Gen, out: inout Buf, m: Method, receiver: [u8],
     call.push(')');
     let c = call.as_slice();
     let in_unsafe = is_unsafe(m);
-    out.push_str(" {\n        // the prototype is checked against the runtime's encoding (objcgen --check)\n        ");
+    out.push_str(" {\n");
+    if m.ret.kind == K_STRUCT {
+        // a message to nil leaves a struct result in memory unwritten
+        out.push_fmt(f"        if {receiver}.is_null() {{\n            return ");
+        push_zero(tb, m.ret, &out);
+        out.push_str(";\n        }\n");
+    }
+    if !in_unsafe {
+        push_send_doc(tb, &out, m, shape.as_slice(), receiver, recv_kind, ty, decl, gpa);
+    }
+    out.push_str("        ");
     if !in_unsafe { out.push_str("unsafe { "); }
     let r = m.ret;
     if r.kind == K_OBJ {
@@ -791,7 +959,9 @@ fn gen_items(tb: Table, g: inout Gen, b: inout Buf, gpa: Gpa) {
             b.push_fmt(f"pub trait {d.name}Methods {{\n");
             for m in d.methods {
                 if m.class_method || is_init(m.selector) { continue; }
-                b.push_fmt(f"    // {m.selector}\n    ");
+                b.push_fmt(f"    // {m.selector}\n");
+                if is_unsafe(m) { push_unsafe_fn_doc(&b, "    ", m, gpa); }
+                b.push_str("    ");
                 if is_unsafe(m) { b.push_str("unsafe "); }
                 b.push_str("fn ");
                 push_signature(tb, &b, m, "Self", 3, gpa);
@@ -805,11 +975,12 @@ fn gen_items(tb: Table, g: inout Gen, b: inout Buf, gpa: Gpa) {
                 b.push_fmt(f"impl {d.name}Methods for Ref<{h}> {{\n");
                 for m in d.methods {
                     if m.class_method || is_init(m.selector) { continue; }
+                    if is_unsafe(m) { push_unsafe_fn_doc(&b, "    ", m, gpa); }
                     b.push_str("    ");
                     if is_unsafe(m) { b.push_str("unsafe "); }
                     b.push_str("fn ");
                     push_signature(tb, &b, m, h, 1, gpa);
-                    push_body(tb, &g, &b, m, "self.ptr", gpa);
+                    push_body(tb, &g, &b, m, "self.ptr", 1, h, d.name, gpa);
                 }
                 b.push_str("}\n\n");
             }
@@ -825,19 +996,23 @@ fn gen_items(tb: Table, g: inout Gen, b: inout Buf, gpa: Gpa) {
             for m in d.methods {
                 if m.class_method {
                     let ci = class_index(&g, d.name);
-                    b.push_fmt(f"    // +{m.selector}\n    pub ");
+                    b.push_fmt(f"    // +{m.selector}\n");
+                    if is_unsafe(m) { push_unsafe_fn_doc(&b, "    ", m, gpa); }
+                    b.push_str("    pub ");
                     if is_unsafe(m) { b.push_str("unsafe "); }
                     b.push_str("fn ");
                     push_signature(tb, &b, m, d.name, 0, gpa);
                     let recv = format_in(f"class_{ci}()", gpa);
-                    push_body(tb, &g, &b, m, recv.as_slice(), gpa);
+                    push_body(tb, &g, &b, m, recv.as_slice(), 0, d.name, d.name, gpa);
                 } else if is_init(m.selector) {
                     b.push_fmt(
-                        f"    // -{m.selector}: consumes `this` (the init family), returns +1\n    pub ");
+                        f"    // -{m.selector}: consumes `this` (the init family), returns +1\n");
+                    if is_unsafe(m) { push_unsafe_fn_doc(&b, "    ", m, gpa); }
+                    b.push_str("    pub ");
                     if is_unsafe(m) { b.push_str("unsafe "); }
                     b.push_str("fn ");
                     push_signature(tb, &b, m, d.name, 2, gpa);
-                    push_body(tb, &g, &b, m, "this.into_raw()", gpa);
+                    push_body(tb, &g, &b, m, "this.into_raw()", 2, d.name, d.name, gpa);
                 }
             }
             b.push_str("}\n\n");
@@ -848,25 +1023,33 @@ fn gen_items(tb: Table, g: inout Gen, b: inout Buf, gpa: Gpa) {
 fn finish(tb: Table, g: inout Gen, body: [u8]) {
     g.out.push_fmt(f"// Generated by tools/objcgen from {tb.file}: do not edit.\n");
     g.out.push_str("// Every prototype below is checked against the Objective-C runtime's\n// type encoding by `objcgen --check`, and every constant and struct\n// against the SDK's headers by `objcgen --c-check` (tests/gpu/run.sh).\n\n");
-    g.out.push_fmt(f"use {tb.objc}::{{Id, Object, Ref, opt_ptr}};\n");
+    g.out.push_fmt(f"use {tb.objc}::{{Id, Object, Ref, class_named, opt_ptr, selector}};\n");
     for u in tb.uses {
         g.out.push_str(u);
         if u[u.len - 1] != ';' { g.out.push(';'); }
         g.out.push('\n');
     }
-    g.out.push_str("\nextern \"C\" {\n    fn sel_registerName(name: *u8) -> *u8;\n    fn objc_getClass(name: *u8) -> *u8;\n");
+    g.out.push_str(
+        "\n// UNSAFE: objc_msgSend has no prototype of its own: it is declared once per ABI shape\n");
+    g.out.push_str("// of the methods sent through it, and C cannot check a call.\n");
+    g.out.push_str(
+        "// SAFETY: each shape is the C prototype of the methods that use it, checked against the\n");
+    g.out.push_str(
+        "// runtime's type encodings (objcgen --check) and the structs against the SDK's headers\n");
+    g.out.push_str("// (objcgen --c-check); only the wrappers below call them.\n");
+    g.out.push_str("extern \"C\" {\n");
     g.out.push_str(g.shape_lines.as_slice());
     g.out.push_str("}\n\n");
     g.out.push_str("// The selectors and classes, looked up on first use.\n");
     for i in 0..g.sels.len() {
         let s = g.sels.get(i);
         g.out.push_fmt(
-            f"static var SEL_{i}: *u8 = 0 as *u8;\n\nfn sel_{i}() -> *u8 {{\n    if SEL_{i}.is_null() {{\n        SEL_{i} = unsafe {{ sel_registerName(c\"{s}\") }};\n    }}\n    SEL_{i}\n}}\n\n");
+            f"static var SEL_{i}: *u8 = 0 as *u8;\n\nfn sel_{i}() -> *u8 {{\n    if SEL_{i}.is_null() {{\n        SEL_{i} = selector(\"{s}\");\n    }}\n    SEL_{i}\n}}\n\n");
     }
     for i in 0..g.classes.len() {
         let s = g.classes.get(i);
         g.out.push_fmt(
-            f"static var CLASS_{i}: *u8 = 0 as *u8;\n\nfn class_{i}() -> *u8 {{\n    if CLASS_{i}.is_null() {{\n        CLASS_{i} = unsafe {{ objc_getClass(c\"{s}\") }};\n    }}\n    CLASS_{i}\n}}\n\n");
+            f"static var CLASS_{i}: *u8 = 0 as *u8;\n\nfn class_{i}() -> *u8 {{\n    if CLASS_{i}.is_null() {{\n        CLASS_{i} = class_named(\"{s}\");\n    }}\n    CLASS_{i}\n}}\n\n");
     }
     g.out.push_str(body);
 }
