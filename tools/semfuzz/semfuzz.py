@@ -39,6 +39,11 @@ usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                 parameter or moved to a sink one, in a call whose own
                 result is `?`'d or not (`chk(tchk(t, 3)?, 5)?`), and a
                 later argument that returns after an owned one is moved
+  --closure-params  (0.25.3) closures that take a T by value: `|t: sink
+                T|` called with a moved local (read, returned, moved on to
+                a sink fn on one path), one given to an FnMut(sink T)
+                bound, and Option::map's; each parameter is dropped at the
+                end of the closure's body unless moved out (a leak before)
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -1670,7 +1675,13 @@ class CloBlock(S_):
     'let'  { let f = || obs(x) + k; println(f"oN {f()} {f()}"); }
     'var'  { var f = || { x.v += k; x.v }; println(f"oN {f()} {f()}"); }
     'sink' { let f = sink || x.v + k; println(f"oN {f()}"); }   x moves in
-    'twice' twice(|a: i64| { x.v += a * k; });"""
+    'twice' twice(|a: i64| { x.v += a * k; });
+    (0.25.3, --closure-params: x moves in, as the closure's argument)
+    'param' { let f = |t: sink T| obs(t) + k; println(f"oN {f(x)}"); }
+    'pass'  { let f = |t: sink T| t; let y = f(x); println(f"oN {obs(y)}"); }
+    'cond'  { let f = |t: sink T| if t.v > k { eat(t) } else { obs(t) + k }; .. }
+    'bound' { let r = feed(|t| obs(t) + k, x); println(f"oN {r}"); }
+    'map'   { let r = Some(x).map(|t| t.v + k).unwrap_or(0); println(f"oN {r}"); }"""
     def __init__(self, kind, p, k, n, fname):
         self.kind = kind
         self.p = p
@@ -1687,6 +1698,16 @@ class CloBlock(S_):
             out.append('%s{ var %s = || { %s.v += %d; %s.v }; println(f"o%d {%s()} {%s()}"); }' % (ind, f, x, self.k, x, self.n, f, f))
         elif self.kind == 'sink':
             out.append('%s{ let %s = sink || %s.v + %d; println(f"o%d {%s()}"); }' % (ind, f, x, self.k, self.n, f))
+        elif self.kind == 'param':
+            out.append('%s{ let %s = |t: sink T| obs(t) + %d; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.n, f, x))
+        elif self.kind == 'pass':
+            out.append('%s{ let %s = |t: sink T| t; let %s_y = %s(%s); println(f"o%d {obs(%s_y)}"); }' % (ind, f, f, f, x, self.n, f))
+        elif self.kind == 'cond':
+            out.append('%s{ let %s = |t: sink T| if t.v > %d { eat(t) } else { obs(t) + %d }; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.k, self.n, f, x))
+        elif self.kind == 'bound':
+            out.append('%s{ let %s = feed(|t| obs(t) + %d, %s); println(f"o%d {%s}"); }' % (ind, f, self.k, x, self.n, f))
+        elif self.kind == 'map':
+            out.append('%s{ let %s = Some(%s).map(|t| t.v + %d).unwrap_or(0); println(f"o%d {%s}"); }' % (ind, f, x, self.k, self.n, f))
         else:
             out.append('%stwice(|a: i64| { %s.v += a * %d; });' % (ind, x, self.k))
 
@@ -1704,6 +1725,17 @@ class CloBlock(S_):
             pl.set(MOVED)
             it.line('o%d %d' % (self.n, wrap(t.v + self.k)))
             it.drop(t)
+        elif self.kind == 'pass':
+            # (returned: the block's y, dropped at its end)
+            pl.set(MOVED)
+            it.line('o%d %d' % (self.n, t.v))
+            it.drop(t)
+        elif self.kind in ('param', 'cond', 'bound', 'map'):
+            # (dropped at the end of the closure's body, or by eat)
+            pl.set(MOVED)
+            v = t.v if self.kind == 'cond' and t.v > self.k else wrap(t.v + self.k)
+            it.drop(t)
+            it.line('o%d %d' % (self.n, v))
         else:
             t.v = wrap(t.v + self.k)
             t.v = wrap(t.v + 2 * self.k)
@@ -1887,6 +1919,7 @@ fn seat(s: sink String) -> i64 { s.len() }
 fn apply<F: Fn(i64) -> i64>(f: F, a: i64) -> i64 { f(a) }
 fn twice<F: FnMut(i64)>(f: sink F) { f(1); f(2); }
 fn callf<F: Fn() -> i64>(f: sink F) -> i64 { f() }
+fn feed<F: FnMut(sink T) -> i64>(f: sink F, t: sink T) -> i64 { f(t) }
 '''
 
 MAIN = '''fn main(gpa: Gpa) -> i32 {
@@ -1940,11 +1973,13 @@ class Ctx:
 
 
 class Gen:
-    def __init__(self, seed, known=False, size=24, assign_calls=False, try_args=False):
+    def __init__(self, seed, known=False, size=24, assign_calls=False, try_args=False,
+                 closure_params=False):
         self.r = random.Random(seed)
         self.known = known
         self.assign_calls = assign_calls
         self.try_args = try_args
+        self.closure_params = closure_params
         self.in_assign = False
         self.size = size
         self.nid = 0
@@ -2491,7 +2526,7 @@ class Gen:
             (5 if depth < 5 else 0, self.st_if),
             (3 if depth < 4 and c.loop < 2 else 0, self.st_loop),
             (2 if depth < 5 else 0, self.st_block),
-            (3, self.st_closure),
+            (10 if self.closure_params else 3, self.st_closure),
             (3, self.st_match),
             (2, self.st_option),
             (3, self.st_struct),
@@ -2960,6 +2995,12 @@ class Gen:
         return Do(Call('drop', [Arg('sink', m)]))
 
     def st_closure(self, c):
+        if self.closure_params and self.chance(0.6):
+            # (0.25.3) a closure taking a T by value
+            m = self.take_var(c, 'T', set())
+            if m is not None:
+                kind = self.r.choice(['param', 'pass', 'cond', 'bound', 'map'])
+                return CloBlock(kind, m.p, self.small(), self.obsn(), self.name('f'))
         r = self.r.random()
         if r < 0.3:
             ps = [q for q in self.t_places(c) if self.whole(self.var_of(c, q.root()))]
@@ -3519,13 +3560,14 @@ def main():
     ap.add_argument('--size', type=int, default=24)
     ap.add_argument('--assign-calls', action='store_true')
     ap.add_argument('--try-args', action='store_true')
+    ap.add_argument('--closure-params', action='store_true')
     ap.add_argument('-h', '--help', action='store_true')
     a = ap.parse_args()
     if a.help:
         print(__doc__)
         return 0
     if a.print is not None:
-        prog = Gen(a.print, a.known, a.size, a.assign_calls, a.try_args).program()
+        prog = Gen(a.print, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
         print(prog.code())
         try:
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(prog.expect()).splitlines()))
@@ -3538,7 +3580,7 @@ def main():
         return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
-        prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args).program()
+        prog = Gen(a.shrink, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
         kind, detail = check_program(volec, prog, work, 'p')
         print('// %s: %s' % (kind, detail))
         if kind not in ('ok', 'invalid'):
@@ -3553,7 +3595,7 @@ def main():
     lock = threading.Lock()
 
     def one(seed):
-        prog = Gen(seed, a.known, a.size, a.assign_calls, a.try_args).program()
+        prog = Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program()
         d = os.path.join(work, 's%d' % seed)
         os.makedirs(d, exist_ok=True)
         with slots:
@@ -3570,7 +3612,7 @@ def main():
                 pass
             if kind != 'invalid' and not a.no_shrink:
                 with slots:
-                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args).program(), kind, d)
+                    small = shrink(volec, Gen(seed, a.known, a.size, a.assign_calls, a.try_args, a.closure_params).program(), kind, d)
                 with open(base + '.min.vl', 'w') as f:
                     f.write(small.code())
                 with open(base + '.min.expect', 'w') as f:
