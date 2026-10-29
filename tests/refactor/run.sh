@@ -66,6 +66,11 @@ STATUS=0
 T=$HERE
 export T
 unset VOLE_ROOT
+# (0.25.4) $TMPDIR in the work directory, removed with it: what the tools
+# keep there (`volec run`'s programs without a cache, try's slots) goes too
+mkdir -p "$WORK/tmp"
+TMPDIR="$WORK/tmp"
+export TMPDIR
 
 # The transcript of test file $1, run in a copy of its program, on stdout;
 # (0.13) with $2 `off`, without the tools' cache, with `cache`, with a
@@ -300,7 +305,7 @@ check module_path_without_crate "$ok" "$out"
 # embed.*, text blocks and include_str; `embed.sh`, a script's name, is
 # not one.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

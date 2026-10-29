@@ -111,7 +111,9 @@ means, fix, example }` in `crate::tools::explain::tools_table::TOOLS_TABLE`
 (or `refactor_table`), `TOOLS_COUNT` and the array's length one more,
 in one `edit apply`; the Diagnostics table of `docs/query.md` or
 `docs/refactor.md`. `tests/refactor/run.sh` fails on a code without an
-entry. Test: a transcript (`tests/query/NAME.q`, `tests/refactor/NAME.t`).
+entry (a new tool's prefix, `run.`, goes into its list of prefixes,
+the `grep -rhoE` above `self_explain`, or its entries read as `not a
+code`). Test: a transcript (`tests/query/NAME.q`, `tests/refactor/NAME.t`).
 
 ## add-test
 

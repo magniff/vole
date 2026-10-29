@@ -147,9 +147,10 @@ $ compile
 error cli.not-a-command: 'compile' is not a volec command or a file: a build names its files, with no command word
 try: volec main.vl -o main
 [exit 2]
+## (0.25.4: run is a command, run.file: tests/refactor/run254.t)
 $ run main.vl -O0 one two
-error cli.not-a-command: 'run' is not a volec command or a file: volec builds the program, and the shell runs it
-try: volec main.vl -O0 -o main && ./main one two
+error run.file: 'main.vl' is a file: run takes the folder that holds main.vl
+try: volec run -O0 -- one two
 [exit 2]
 $ chek main.vl
 error cli.not-a-command: 'chek' is not a volec command or a file; did you mean 'check'?

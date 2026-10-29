@@ -164,6 +164,33 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   bugs254 (docs/unsafe-baseline.md), every compilation of the corpus
   byte-identical (`volec same-output`). The plan for the rest of
   compiler/src's modernization: docs/design/modernize-0254.md.
+- **`volec run [DIR] [OPTIONS] [-- ARGS...]`** builds the program whose
+  root is DIR/main.vl (DIR: the current directory when none is given)
+  and runs it: stdin, stdout and stderr its own, the words after `--`
+  its arguments as they are (`--help` and `--json` too), its exit
+  status volec's (128 + N when signal N ended it, as a shell says).
+  OPTIONS are a plain build's (`-O0`, `-l`, `-L`, C files and objects,
+  `-framework`, `--check-alloc`...; `--target` only the host's), and a
+  build error is the plain build's (status 1, nothing run). The program
+  is kept in volec's cache, never in DIR: CACHE/run/NAME-KEY/NAME, CACHE
+  the tools' cache (./target/volec-cache, `$VOLE_CACHE`) or else
+  `$TMPDIR/volec-cache`, which the code cache then uses too; KEY hashes
+  the root's absolute path and the options. It is built again only when a
+  .vl file under DIR or a file of the link changed, or another compiler
+  runs (`volec test`'s check, now shared: tools/testrun/program.vl);
+  `-o FILE` keeps a copy at FILE too. On a terminal: the build's lines,
+  naming the program (`Finished NAME in 0.4s`; `Finished` alone when
+  nothing changed), then `Running NAME`; elsewhere only the program's
+  output. Its errors: `run.no-main` (a folder without main.vl: `try:
+  volec run DIR/SUB` for a subfolder that has one, or the plain build of
+  its one .vl file), `run.file` (a file for its folder), `run.args` (a
+  second folder: the program's arguments go after `--`), `run.option`
+  (`-c`, `-S`, `--emit-ir`, another target...); `volec explain run.no-main`.
+  `$VOLE_CACHE_TRACE` gets `run fresh` or `run build`. `volec run` was
+  `cli.not-a-command` in 0.25.3; `volec exec` now reads as `run`
+  (tests/refactor/run254.t).
+- The words after `--` reach a command as they are: `--json`,
+  `--values=...` and `--help` there were volec's own before.
 
 ### What's new in 0.25.3
 

@@ -13,7 +13,8 @@ demand (the end). From Rust: `volec guide rust` has the mapping.
 ## Build and run
 
 ```sh
-volec main.vl -o prog && ./prog < in.txt   # `mod x;` loads x.vl
+volec run < in.txt                         # ./main.vl built (when changed), run
+volec main.vl -o prog                      # the executable; `mod x;` loads x.vl
 volec check main.vl                        # every error, one line each
 volec try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
 ```
