@@ -38,7 +38,7 @@ use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
 use crate::tools::edit::cli::{ambiguous, edit_opts, source_only, take_edit_event};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
-use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted, std_rerun};
+use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted, std_file_rerun, std_rerun};
 use crate::tools::proc::{buf_cstr, read_file_if, read_stdin};
 use crate::tools::query::{c_slice, def_at_line, file_line, file_named, resolve_name, root_or_diag};
 use crate::tools::query::cache::cache_restore;
@@ -260,9 +260,6 @@ pub fn run_patch(c: Call) -> i64 {
         if OLDS.count != NEWS.count {
             return usage(c"each --old needs its --new");
         }
-        if PAIRS_FILE != 0 as *u8 && OLDS.count > 0 {
-            return usage(c"the pairs come from --old/--new or from --pairs FILE, not both");
-        }
         if insert && anchor == 0 as *u8 {
             return usage(c"insert --in needs --after ANCHOR or --before ANCHOR");
         }
@@ -280,6 +277,9 @@ pub fn run_patch(c: Call) -> i64 {
                 return 2;
             }
             FROM_STDIN = true;
+            // (0.25.5: after the --old/--new pairs, if any; its blocks
+            // before an `@@` line are the command line's TARGET's)
+            CUR_TARGET = -1;
             if !read_pairs(buf_slice(input)) {
                 return 2;
             }
@@ -312,11 +312,19 @@ pub fn run_patch(c: Call) -> i64 {
             return 2;
         }
         for k in 0..OLDS.count {
-            if BUFS[OLDS.data[k]].len == 0 || (LOOSE && trimmed(buf_slice(OLDS.data[k])).len == 0) {
+            // (0.25.5: an empty OLD inserts NEW above its target's line, a
+            // FILE:LINE; insert_above)
+            let above = BUFS[OLDS.data[k]].len == 0 && !insert && BUFS[NEWS.data[k]].len > 0
+                && line_target(c_slice(TARGETS.data[PAIR_TARGET.data[k]] as *u8));
+            if !above && (BUFS[OLDS.data[k]].len == 0
+                || (LOOSE && trimmed(buf_slice(OLDS.data[k])).len == 0)) {
                 let d = diag(c"error", c"edit.usage");
                 buf_str(d, c"OLD ");
                 buf_int(d, k + 1);
-                buf_str(d, c" is empty\n");
+                buf_str(d,
+                    c" is empty; an empty OLD inserts NEW above the line of a FILE:LINE target\n");
+                let out = try_begin(c"patch FILE:LINE --old '' --new TEXT", c_slice(c""), false);
+                try_end(out);
                 return 2;
             }
         }
@@ -344,6 +352,7 @@ pub fn run_patch(c: Call) -> i64 {
             // OLD is found in the text as it was before the edit.
             buf_str(summary, c"patched ");
             var done = 0;
+            var named = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for t in 0..TARGETS.count {
                 var any = false;
                 for k in 0..OLDS.count {
@@ -363,11 +372,22 @@ pub fn run_patch(c: Call) -> i64 {
                         return 1;
                     }
                 }
-                if done > 0 {
-                    buf_str(summary, c", ");
+                // (0.25.5: each item once, though several FILE:LINE targets
+                // name it)
+                var seen = false;
+                for x in 0..named.count {
+                    if bytes_eq(buf_slice(named.get(x)), buf_slice(SCOPE_NAME)) {
+                        seen = true;
+                    }
                 }
-                buf_bytes(summary, buf_slice(SCOPE_NAME));
-                done += 1;
+                if !seen {
+                    if done > 0 {
+                        buf_str(summary, c", ");
+                    }
+                    buf_bytes(summary, buf_slice(SCOPE_NAME));
+                    named.push(SCOPE_NAME);
+                    done += 1;
+                }
             }
         }
         // (0.14: the imports the new text needs, when it has new errors)
@@ -438,6 +458,7 @@ fn is_marker(line: [u8], marker: *u8) -> bool {
 // The pairs of stdin: `<<<<<<< OLD`, its lines, `=======`, NEW's lines,
 // `>>>>>>> NEW`; blank lines between blocks. False after the diagnostic.
 fn read_pairs(input: [u8]) -> bool {
+    let before = OLDS.count;
     var state = 0;
     var text = -1;
     var lines = 0;
@@ -494,7 +515,7 @@ fn read_pairs(input: [u8]) -> bool {
     if state != 0 {
         return format_error(n, c"a block without its end");
     }
-    if OLDS.count == 0 {
+    if OLDS.count == before {
         return format_error(n, c"no block");
     }
     true
@@ -565,6 +586,11 @@ fn find_scope() -> bool {
                     return true;
                 }
             }
+            // (0.25.5: one of std's files, named by `@@ FILE` in --pairs:
+            // the command runs again in std's files, as for a FILE argument)
+            if std_file_rerun(name) {
+                return false;
+            }
             let d = diag(c"error", c"query.no-match");
             buf_str(d, c"no file '");
             buf_bytes(d, name);
@@ -617,6 +643,15 @@ fn find_scope() -> bool {
         }
         SCOPE_START = line_start(text_start(d));
         SCOPE_END = after_line(item_tail(d) - 1);
+        // (0.25.5, feedbacks/headless254.md #4) A module of no file of its
+        // own, `pub mod m { ... }`: its text to its closing brace (its
+        // definition ends at the brace that opens it)
+        if DEFS[d].kind == K_MOD {
+            let close = closing_brace(DEFS[d].end);
+            if close > SCOPE_END {
+                SCOPE_END = after_line(close - 1);
+            }
+        }
         true
     }
 }
@@ -791,6 +826,9 @@ fn spaces_only(from: i64, to: i64) -> bool {
 fn patch_pair(k: i64) -> bool {
     unsafe {
         let old = buf_slice(OLDS.data[k]);
+        if old.len == 0 {
+            return insert_above(k);
+        }
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         find_all(old, &starts, &ends);
@@ -834,18 +872,188 @@ fn patch_pair(k: i64) -> bool {
                     e = after_line(e);
                 }
             }
-            if !edit_replace(s, e, text) {
-                let d = diag(c"error", c"patch.overlap");
-                buf_str(d, c"OLD ");
-                buf_int(d, k + 1);
-                buf_str(d, c" (line ");
-                buf_int(d, line_of(s));
-                buf_str(d, c") overlaps an OLD before it; make them one pair\n");
+            if !replaced(k, s, e, text) {
                 return false;
             }
         }
         LOOSE = was_loose;
         true
+    }
+}
+
+// (0.25.5) The replacements made so far: their ranges in SRC and their
+// pairs, to name the one a later pair overlaps.
+static var R_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_PAIR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// SRC[s..e) replaced by buffer text for pair k: false after `patch.overlap`,
+// naming both pairs, when it overlaps the range of an earlier one (ranges
+// that only touch, one ending where the next begins, do not overlap).
+fn replaced(k: i64, s: i64, e: i64, text: i64) -> bool {
+    if edit_replace(s, e, text) {
+        R_START.push(s);
+        R_END.push(e);
+        R_PAIR.push(k);
+        return true;
+    }
+    var other = -1;
+    for i in 0..R_START.count {
+        let a = R_START.get(i);
+        let b = R_END.get(i);
+        if (s < b && a < e) || (s == e && a < s && s < b) || (a == b && s < a && a < e) {
+            other = i;
+            break;
+        }
+    }
+    let d = diag(c"error", c"patch.overlap");
+    buf_str(d, c"OLD ");
+    buf_int(d, k + 1);
+    put_lines(d, s, e);
+    if other >= 0 && R_PAIR.get(other) != k {
+        buf_str(d, c" overlaps OLD ");
+        buf_int(d, R_PAIR.get(other) + 1);
+        put_lines(d, R_START.get(other), R_END.get(other));
+        buf_str(d, c"; make them one pair (OLDs that only touch are fine)\n");
+    } else if other >= 0 {
+        buf_str(d, c" overlaps another match of itself");
+        put_lines(d, R_START.get(other), R_END.get(other));
+        buf_str(d, c"; give more of the text around it, or --nth N\n");
+    } else {
+        buf_str(d, c" overlaps an edit before it; make them one pair\n");
+    }
+    false
+}
+
+// ` (line A)` or ` (lines A-B)` of SRC[s..e).
+fn put_lines(d: i64, s: i64, e: i64) {
+    let a = line_of(s);
+    let b = if e > s { line_of(e - 1) } else { a };
+    buf_str(d, if b > a { c" (lines " } else { c" (line " });
+    buf_int(d, a);
+    if b > a {
+        buf_byte(d, '-');
+        buf_int(d, b);
+    }
+    buf_byte(d, ')');
+}
+
+// (0.25.5) After the `{` at or after p (in its file), the end of the `}`
+// that closes it, skipping comments, strings and characters; -1 when there
+// is none.
+fn closing_brace(p: i64) -> i64 {
+    let f = file_of_pos(p);
+    // UNSAFE: FILES is the front end's table of the files read and SRC their text, raw pointers.
+    // SAFETY: f is file_of_pos's file of p, 0 <= f < FILE_COUNT, and its text is SRC[start..end), inside SRC.
+    let (base, t) = unsafe { (FILES[f].start, SRC[FILES[f].start..FILES[f].end]) };
+    var q = p - base;
+    // (an inline module's definition may end on its `{` or before it)
+    if q > 0 && t[q - 1] == '{' {
+        q -= 1;
+    }
+    while q < t.len && t[q] != '{' {
+        if t[q] == ';' || t[q] == '}' {
+            return -1;
+        }
+        q += 1;
+    }
+    var depth = 0;
+    while q < t.len {
+        let c = t[q];
+        if c == '/' && q + 1 < t.len && t[q + 1] == '/' {
+            while q < t.len && t[q] != '\n' {
+                q += 1;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            q += 1;
+            while q < t.len && t[q] != c && t[q] != '\n' {
+                if t[q] == '\\' {
+                    q += 1;
+                }
+                q += 1;
+            }
+        } else if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return base + q + 1;
+            }
+        }
+        q += 1;
+    }
+    -1
+}
+
+// Whether a target is FILE:LINE (FILE:LINE:COL).
+fn line_target(name: [u8]) -> bool {
+    var line = 0;
+    file_line(name, &line) > 0 && line > 0
+}
+
+// (0.25.5) Pair k, with an empty OLD: NEW's lines inserted above the line
+// of its target, a FILE:LINE (the line as the file was before the edit),
+// indented like that line; several at one line keep their order. False
+// after the diagnostic.
+fn insert_above(k: i64) -> bool {
+    let name = target();
+    var line = 0;
+    let n = file_line(name, &line);
+    let f = if n > 0 { file_named(name[0..n]) } else { -1 };
+    var start = 0;
+    var end = 0;
+    if f >= 0 {
+        // UNSAFE: FILES is the front end's table of the files read, a raw pointer.
+        // SAFETY: f is file_named's index of a file of the program, 0 <= f < FILE_COUNT.
+        unsafe {
+            start = FILES[f].start;
+            end = FILES[f].end;
+        }
+    }
+    let idx = if f >= 0 && line > 0 { line_index(start) + line - 1 } else { -1 };
+    if idx < 0 || idx >= LINES.count || LINES.get(idx) >= end {
+        let d = diag(c"error", c"edit.usage");
+        buf_str(d, c"OLD ");
+        buf_int(d, k + 1);
+        buf_str(d, c" is empty, and ");
+        buf_bytes(d, name);
+        buf_str(d, c" is no line of a file of the program: an empty OLD inserts NEW above the line of a FILE:LINE target\n");
+        try_end(try_begin(c"query text", name, false));
+        return false;
+    }
+    let pos = LINES.get(idx);
+    let out = buf_new();
+    indented_block(out, indent_of(pos), buf_slice(NEWS.get(k)));
+    replaced(k, pos, pos, out)
+}
+
+// The lines of input into out, each ended, the least indented ones with
+// `indent`, the others keeping their indentation relative to them; blank
+// lines left blank.
+fn indented_block(out: i64, indent: [u8], input: [u8]) {
+    let t = trimmed_lines(input);
+    var first = 0;
+    var least = 0;
+    indents(t, &first, &least);
+    var i = 0;
+    while i < t.len {
+        var e2 = i;
+        while e2 < t.len && t[e2] != '\n' {
+            e2 += 1;
+        }
+        var a = i;
+        while a < e2 && is_blank(t[a]) {
+            a += 1;
+        }
+        if a < e2 {
+            buf_bytes(out, indent);
+            let keep = i + least;
+            buf_bytes(out, t[if keep < a { keep } else { a } ..e2]);
+        }
+        buf_byte(out, '\n');
+        i = e2 + 1;
     }
 }
 
@@ -946,33 +1154,12 @@ fn insert_at(anchor: [u8], after: bool, input: [u8]) -> bool {
                 buf_str(indent, c"    ");
             }
         }
-        let t = trimmed_lines(input);
-        var first = 0;
-        var least = 0;
-        indents(t, &first, &least);
         let out = buf_new();
         let pos = if after { after_line(at) } else { line_start(at) };
         if pos > FILES[file_of_pos(at)].start && SRC[pos - 1] != '\n' {
             buf_byte(out, '\n');
         }
-        var i = 0;
-        while i < t.len {
-            var e2 = i;
-            while e2 < t.len && t[e2] != '\n' {
-                e2 += 1;
-            }
-            var a = i;
-            while a < e2 && is_blank(t[a]) {
-                a += 1;
-            }
-            if a < e2 {
-                buf_bytes(out, buf_slice(indent));
-                let keep = i + least;
-                buf_bytes(out, t[if keep < a { keep } else { a } ..e2]);
-            }
-            buf_byte(out, '\n');
-            i = e2 + 1;
-        }
+        indented_block(out, buf_slice(indent), input);
         edit_replace(pos, pos, out);
         true
     }

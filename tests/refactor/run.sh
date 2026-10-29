@@ -264,6 +264,17 @@ out=$(PATH="$WORK:$PATH" "$COMPILER" same-output old-volec --corpus tests/refact
 ok=0
 printf '%s\n' "$out" | grep -q "^identical${TAB}" && ok=1
 check same_output_in_path "$ok" "$out"
+# (0.25.5) A compilation whose error has a `try:` line naming the compiler
+# (`try: OLD fix --suggested ...`): the two compilers' own paths are taken
+# as equal, so a copy of the compiler is identical.
+mkdir -p "$WORK/sotry"
+printf 'fn count() -> i32 {\n    3\n}\n\nfn main() -> i32 {\n    coutn() - 3\n}\n' >"$WORK/sotry/try.vl"
+out=$("$COMPILER" same-output "$WORK/old-volec" --corpus "$WORK/sotry" --work "$WORK/so-try" 2>&1)
+ok=0
+printf '%s\n' "$out" | grep -q "^identical${TAB}" \
+    && "$WORK/old-volec" "$WORK/sotry/try.vl" -o "$WORK/sotry/out.s" --diagnostics=human 2>&1 \
+        | grep -q "try: $WORK/old-volec fix --suggested" && ok=1
+check same_output_own_paths "$ok" "$out"
 cat >"$WORK/differs.sh" <<EOS
 #!/bin/sh
 # volec, but its assembly for md5/main.vl at -O1 has one more line

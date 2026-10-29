@@ -117,7 +117,7 @@ main.vl:25:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: cr
 main.vl:26:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::more]
 main.vl:31:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
 main.vl:32:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.vl:20:5  [edited: crate::grow_twice]
-error edit.breaks: 5 new errors; nothing written
+error edit.breaks: 5 new errors; nothing written; the first: main.vl:10:10: expected 'inout IntVec', got 'i64'
 try: volec rewrite 'grow($v, $n)' 'grow($n, $v)' --no-check
 [exit 1]
 % git status --short
