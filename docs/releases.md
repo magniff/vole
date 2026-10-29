@@ -98,6 +98,14 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   a two-file example; tests/guide/run.sh now runs `volec test` on a
   guide program with `#[test]`s, so their bodies are checked and run (a
   build leaves them out).
+- **An array of unsuffixed literals takes the other side's type**, as a
+  literal does: `if down { ACCENT } else { [0.20, 0.52, 0.70, 1.0] }`
+  with `ACCENT: [f32; 4]` is a `[f32; 4]` (an `else if` chain too), and
+  so is a match arm (before or after the typed one) and an element of
+  `[[0.1, 0.2, 0.3, 1.0], ACCENT]`; 0.25.3 said `if/else branches have
+  different types: '[f32; 4]' vs '[f64; 4]'`. A branch that is a local
+  made of literals (`let base = [0.2, ...];`) gets the note at its `let`
+  with the annotation and its `edit patch`, as a mismatch does.
 
 ### What's new in 0.25.3
 

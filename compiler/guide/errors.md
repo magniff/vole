@@ -214,7 +214,12 @@ error[type error] integer literal 300 does not fit in type 'u8'
 ```
 An unsuffixed literal takes the type the code around it gives: `if ok {
 line[i] } else { 0 }` is a `u8`, from the other branch; so are match arms
-and array elements beside a `u8`. Alone, a literal is `i64` (`f64`).
+and array elements beside a `u8`, and (0.25.4) an array of literals
+beside an array (`if down { ACCENT } else { [0.2, 0.5, 0.7, 1.0] }` is
+a `[f32; 4]` when `ACCENT` is). Alone, a literal is `i64` (`f64`), and a
+`let` of literals keeps that type: `let base = [0.2, 0.5, 0.7, 1.0];`
+beside a `[f32; 4]` is an error whose note names the `let` and its
+annotation, `let base: [f32; 4] = ...`.
 
 ```vole
 const ORIGIN: (i64, i64) = (0, 0);
