@@ -142,6 +142,12 @@ compiler/src's tables (tables255, docs/design/modernize-0254.md step 4):
 - (tables255) `volec refactor table X` takes a rollback, `let m =
   X_COUNT; ... X_COUNT = m;` (m a `let` assigned nowhere), as
   `X.truncate(m)`.
+- (tables255) The AArch64 and x86-64 emission of an intrinsic's
+  template found its placeholders' names by interning them, on the code
+  generator's threads: a push to the symbol table racing with the other
+  threads' reads (with SYMS a Vec, seen once as `index out of bounds:
+  index 7578, length 7578` in arch-gen at -O2). They are now looked up
+  (find_sym), the six slot names interned when the table is read.
 - (tables255) `volec fix --only unneeded-justified`: `unneeded-unsafe`'s
   blocks, and the unneeded ones whose `// UNSAFE:`/`// SAFETY:` comments
   justified them (a table's accessors), with those comments.
