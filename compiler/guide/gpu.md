@@ -1,4 +1,4 @@
-# GPU: std::gpu (0.22; guide updated 0.25.2.2)
+# GPU: std::gpu (0.22; guide updated 0.25.3)
 
 `std::gpu` is compute and rendering on the GPU, on wgpu's model: an
 `Instance`, an `Adapter`, a `Device` and its `Queue`; `Buffer`s,
@@ -140,14 +140,33 @@ end of its scope, and dropping a resource the GPU still uses is safe
 | `BindGroup` | `dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..])` | `pass.set_bind_group(0, g)` |
 | `Encoder`, `Commands` | `dev.encoder()`, `enc.finish()` | `enc.compute_pass(\|pass\| ..)`, `enc.render_pass(desc, \|pass\| ..)`, copies |
 
+A mappable buffer is reached by copies only (WebGPU's rule, `gpu.usage`
+at `dev.buffer`, 0.25.3): `MAP_READ` goes with `COPY_DST` alone,
+`MAP_WRITE` with `COPY_SRC` alone. A kernel's output is a `STORAGE |
+COPY_SRC` buffer, copied (`enc.copy_buffer`) into a `MAP_READ |
+COPY_DST` one that is mapped (the compute examples below).
+
 A mapped buffer is a view (`guide views`): `let b = buf.map_read(dev);`
-waits for the GPU and views the buffer, which cannot be used while `b`
-is. The view lives no longer than the buffer: a function may return
+waits for the GPU and views the buffer's bytes (`gpu::f32s(b)`,
+`u32s`, `i32s`: the same bytes as numbers, still a view of `buf`). The
+buffer stays **mapped until `buf.unmap(dev)`**, and nothing writes a
+mapped buffer, so a view never changes under the program: a copy into
+it (or `queue.write_buffer`) stops with `gpu.state`, when it is
+recorded, or at `queue.submit` when it was recorded before the
+`map_read`. `unmap` takes the buffer `inout`, so it is refused
+(`own.conflict`) while a view of it is still used: read what you need,
+`unmap`, then copy into it again (the atomics example below). Mapping
+again while mapped is fine. `buf.map_read_copy_in(dev, gpa)` maps,
+copies the bytes into a `Vec<u8>` (`gpu::f32s(v.as_slice())`) and
+unmaps: the buffer can be written again at once, and the copy outlives
+it. A view lives no longer than the buffer: a function may return
 `buf.map_read(dev)` when `buf` is its caller's (an `inout` parameter),
-not when the buffer is a local of its own (`own.escape`). Then return
-a copy, `buf.map_read_copy_in(dev, gpa)` (a `Vec<u8>`; view it with
-`gpu::f32s(v.as_slice())`), or take the numbers you need while the view
-lives. Shaders come from the shader compiler as a `ShaderSource`: the code
+not when the buffer is a local of its own (`own.escape`); then return
+`map_read_copy_in`'s copy. A function of your own that returns
+`gpu::f32s(buf.map_read(dev))` of an `inout` parameter views `buf`
+too (inferred, `volec query views NAME`).
+
+Shaders come from the shader compiler as a `ShaderSource`: the code
 for the device's `caps().shader_kind` (MSL on Metal) and its
 `Reflection` (entry points, bindings and their native slots).
 `dev.shader_wgsl(text)` does it all: `std::gpu::wgsl` translates the
@@ -173,8 +192,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let pipe = dev.compute_pipeline(shader, "main")?;
     var xs: Vec<u32> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
-    var buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
-        BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    var out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST); // the readback
     let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
     var enc = dev.encoder();
     enc.compute_pass(|pass| {
@@ -182,8 +202,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_bind_group(0, group);
         pass.dispatch(1); // one workgroup of 64
     });
+    enc.copy_buffer(buf, 0, out, 0, 64 * 4);
     queue.submit(enc.finish());
-    let squares = gpu::u32s(buf.map_read(dev));
+    let squares = gpu::u32s(out.map_read(dev));
     println(f"{squares[3]} {squares[63]}");
     Ok(())
 }
@@ -212,8 +233,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let pipe = dev.compute_pipeline(shader, "main")?;
     var xs: Vec<u32> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
-    var buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
-        BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    var out = dev.buffer(64 * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
     var enc = dev.encoder();
     enc.compute_pass(|pass| {
@@ -221,8 +243,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_bind_group(0, group);
         pass.dispatch(1);
     });
+    enc.copy_buffer(buf, 0, out, 0, 64 * 4);
     queue.submit(enc.finish());
-    let squares = gpu::u32s(buf.map_read(dev));
+    let squares = gpu::u32s(out.map_read(dev));
     println(f"{squares[3]} {squares[63]}");
     Ok(())
 }
@@ -258,8 +281,10 @@ defaults are wgpu's.
 - **Buffer usages** (`BufferUsage::`, or them together): `MAP_READ`,
   `MAP_WRITE`, `COPY_SRC`, `COPY_DST` (`queue.write_buffer`), `INDEX`,
   `VERTEX`, `UNIFORM`, `STORAGE`, `INDIRECT`. A storage buffer is
-  `STORAGE` (`| MAP_READ` to read it back, `| COPY_DST` to write it from
-  the CPU). They are `u32` bit flags (`const`s of `BufferUsage`, not an
+  `STORAGE` (`| COPY_SRC` to copy it into a `MAP_READ | COPY_DST`
+  buffer and read it back, `| COPY_DST` to write it from the CPU).
+  `MAP_READ` takes `COPY_DST` alone and `MAP_WRITE` `COPY_SRC` alone
+  (`gpu.usage`). They are `u32` bit flags (`const`s of `BufferUsage`, not an
   enum): a usage is a `u32`, `let u: u32 = BufferUsage::UNIFORM |
   BufferUsage::COPY_DST;`, and `buf.usage & BufferUsage::STORAGE != 0`
   tests one. `TextureUsage::` is the same.
@@ -435,8 +460,9 @@ main.vl:52:5: gpu.unwritten: binding 0 of group 0 (a uniform buffer of 256 bytes
 ```
 
 For the other bindings, a readback after the first step shows what a
-kernel saw (a storage buffer, `MAP_READ`, written from the uniform's
-fields), and `dev.buffer_init` gives a buffer its bytes when it is made.
+kernel saw (a storage buffer written from the uniform's fields, copied
+into a `MAP_READ` one), and `dev.buffer_init` gives a buffer its bytes
+when it is made.
 
 In a `var<uniform>`, an array's stride and a nested struct's offset are
 also multiples of 16 (`wgsl.layout`): use `vec4` elements, or move the
@@ -463,7 +489,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     // the struct as WGSL lays it out: 48 bytes, 12 f32s
     let u: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 7.0, 8.0, 9.0, 10.0];
     let ubuf = dev.buffer_init(gpu::bytes_of_f32(u[..]), BufferUsage::UNIFORM);
-    var out = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let out = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    var rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, ubuf), gpu::bind(1, out)][..]);
     var enc = dev.encoder();
     enc.compute_pass(|pass| {
@@ -471,8 +498,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_bind_group(0, group);
         pass.dispatch(1);
     });
+    enc.copy_buffer(out, 0, rb, 0, 16);
     queue.submit(enc.finish());
-    let r = gpu::f32s(out.map_read(dev));
+    let r = gpu::f32s(rb.map_read(dev));
     println(f"{r[0]} {r[1]} {r[2]} {r[3]}");
     Ok(())
 }
@@ -574,7 +602,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var xs: Vec<u32> = Vec::new_in(gpa);
     for i in 0..256 { xs.push(i as u32); }
     let xb = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
-    var bins = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let bins = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    var rb = dev.buffer(16, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
     // each module's layout has the bindings it uses: two, and one
     let dgroup = dev.bind_group(deposit.bind_layout(0), [gpu::bind(0, bins), gpu::bind(1, xb)][..]);
     let cgroup = dev.bind_group(clear.bind_layout(0), [gpu::bind(0, bins)][..]);
@@ -586,9 +615,11 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.dispatch(4); // 256 items deposit
         pass.dispatch(4); // and again: 128 a bin
     });
+    enc.copy_buffer(bins, 0, rb, 0, 16);
     queue.submit(enc.finish());
-    let twice = gpu::u32s(bins.map_read(dev));
+    let twice = gpu::u32s(rb.map_read(dev));
     println(f"{twice[0]} {twice[1]} {twice[2]} {twice[3]}");
+    rb.unmap(dev); // twice is done: rb can be copied into again
     var enc2 = dev.encoder();
     enc2.compute_pass(|pass| {
         pass.set_pipeline(clear);
@@ -598,8 +629,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_bind_group(0, dgroup);
         pass.dispatch(4);
     });
+    enc2.copy_buffer(bins, 0, rb, 0, 16);
     queue.submit(enc2.finish());
-    let once = gpu::u32s(bins.map_read(dev));
+    let once = gpu::u32s(rb.map_read(dev));
     println(f"{once[0]} {once[1]} {once[2]} {once[3]}");
     Ok(())
 }
@@ -682,8 +714,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let pipe = dev.compute_pipeline(shader, "main")?;
     var start: Vec<u32> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
-    let usage = BufferUsage::STORAGE | BufferUsage::MAP_READ;
-    var a = dev.buffer_init(gpu::bytes_of_u32(start.as_slice()), usage);
+    let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
+    let a = dev.buffer_init(gpu::bytes_of_u32(start.as_slice()), usage);
     let b = dev.buffer(N * 4, usage);
     let ubuf = dev.buffer(dev.align_uniform(16), BufferUsage::UNIFORM | BufferUsage::COPY_DST);
     let layout = pipe.bind_layout(0);
@@ -700,9 +732,13 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         });
         queue.submit(enc.finish());
     }
-    // STEPS is even: the state is back in a
+    // STEPS is even: the state is back in a, read through a copy
+    var rb = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_buffer(a, 0, rb, 0, N * 4);
+    queue.submit(enc.finish());
     let want = reference(start.as_slice(), gpa);
-    let got = gpu::u32s(a.map_read(dev));
+    let got = gpu::u32s(rb.map_read(dev));
     var differ = 0;
     for i in 0..N {
         if got[i] != want[i] { differ += 1; }
@@ -804,7 +840,7 @@ is (no adapter, a shader the driver rejects) is a `gpu::Error`.
 | `gpu.format` | a format that does not fit: target, view, storage, shader kind | the pipeline's target format |
 | `gpu.limits` | a size or count above `dev.limits()` (what a shader asks, its workgroup size or bindings, is an `Err` instead); the message names the limit as `dev.limits().NAME` | smaller, or a larger `max_buffer_size` at `adapter.device(lim)` |
 | `gpu.unwritten` | a submit reads a uniform buffer nothing wrote (0.25.2.2) | `queue.write_buffer` before the submit, or `dev.buffer_init` |
-| `gpu.state` | a buffer used while mapped for writing | `buf.unmap(dev)` first |
+| `gpu.state` | a buffer written while mapped for reading (a copy into it or `write_buffer`: at the copy, or at `queue.submit` when recorded before `map_read`), or used while mapped for writing | `buf.unmap(dev)` when its view is done, or `map_read_copy_in` |
 | `gpu.unsupported` | a capability the device lacks | check `dev.caps()` |
 
 Surfaces (`inst.surface(dev, RawSurface::MetalLayer(layer))`,

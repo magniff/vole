@@ -83,6 +83,29 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   5,380 sites, 938 blocks unneeded; std 1,194 of 1,202), and the gate's
   `unsafe-audit` row, which fails when either count rises.
 
+- **Soundness**: a mapped read view of a GPU buffer no longer changes
+  under the program (the round 3 GPU eval's ocean: `let v =
+  gpu::f32s(r.map_read(dev))`, then a copy into `r`, and `v` read 1,
+  then 2, racing the GPU without a wait). As in wgpu, `map_read` leaves
+  the buffer mapped until `buf.unmap(dev)`, in state kept with the
+  native buffer: a copy into a mapped buffer (or `write_buffer`) stops
+  with `gpu.state` where it is recorded, and `queue.submit` stops when
+  the copy was recorded before the `map_read`; `unmap` takes the buffer
+  `inout`, so the checker refuses it while a view is used, and
+  `map_read_copy_in` maps, copies and unmaps. `dev.buffer` and
+  `buffer_init` take WebGPU's rule (`gpu.usage`): `MAP_READ` with
+  `COPY_DST` alone, `MAP_WRITE` with `COPY_SRC` alone, so the GPU
+  reaches a mappable buffer only by copies (a kernel's output is read
+  through a copy into a `MAP_READ | COPY_DST` buffer; the guide, tests
+  and examples moved). `gpu::f32s`, `u32s`, `i32s`, their `_mut` forms
+  and `bytes_of_*` are `#[views(..)]` of their argument, and the
+  checker keeps such a declared cast (a `[u8]` viewed as `[f32]`)
+  past its type filter, which had dropped it: `f32s(r.map_read(dev))`
+  viewed nothing, so `r` could be unmapped, or a Vec grown, under it.
+  Inference carries the cast on: a function of the program's own that
+  returns it (through locals, calls, structs, other such functions) is
+  inferred to view its parameter, with no `#[views]`.
+
 ### What's new in 0.25.2.2
 
 The second round of the GPU eval (evals/tasks/0.25.2.1: the same ten
