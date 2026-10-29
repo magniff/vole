@@ -106,6 +106,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   different types: '[f32; 4]' vs '[f64; 4]'`. A branch that is a local
   made of literals (`let base = [0.2, ...];`) gets the note at its `let`
   with the annotation and its `edit patch`, as a mismatch does.
+- **The check hook formats a new file**: a `.vl` file the agent has just
+  created with Write, outside compiler/src and compiler/std, goes
+  through `volec fmt` before the check, and the hook names the changes
+  as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
+  rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
+  An existing file still gets the one-line note only.
 
 ### What's new in 0.25.3
 
