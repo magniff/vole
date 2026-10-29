@@ -71,6 +71,20 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.25.4
+
+- (mod254) `volec fix --only unneeded-unsafe`: the unsafe blocks with
+  nothing unsafe inside (`volec query unsafe`'s `none (unneeded)`) taken
+  away, the code in them kept in its scope (a block on lines of its own
+  becomes its lines, one level less indented; a block on one line its
+  code, parenthesized where operators around could bind otherwise); a
+  block that declares and is not last, one with a string over several
+  lines, one whose comments say `UNSAFE:`/`SAFETY:` are left and counted.
+  Run over compiler/src: 938 blocks gone, the unjustified sites 5,315 to
+  4,377 (docs/unsafe-baseline.md), every compilation of the corpus
+  byte-identical (`volec same-output`). The plan for the rest of
+  compiler/src's modernization: docs/design/modernize-0254.md.
+
 ### What's new in 0.25.3
 
 The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten

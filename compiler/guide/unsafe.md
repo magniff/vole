@@ -114,6 +114,10 @@ defined:
   operations inside that need unsafe; `none (unneeded)`: a block with
   nothing unsafe inside, to remove. `--unjustified`, `--summary`
   (counts by class, module, file), `--json`, `--no-std`.
+- `volec fix --only unneeded-unsafe` (0.25.4) takes the `none
+  (unneeded)` blocks away and keeps their code in its scope; a block it
+  cannot open so (one that declares and is not last) is left and
+  counted.
 - `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access
