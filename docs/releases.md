@@ -152,6 +152,36 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
   rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
   An existing file still gets the one-line note only.
+- **A windowed program's own event loop runs without a display**: with
+  `VOLE_WINDOW_SCRIPT` set, `App::new_in` opens no window server and
+  the events come from the script (std::window::script): keys (with
+  their Text), mouse moves, presses, releases and clicks, scrolls,
+  resizes, focus, Close and Quit, and each Frame as soon as the program
+  asks for it, never from the 10 Hz timer a hidden window gets. The
+  window's `raw_surface()` is null, which std::gpu takes for a headless
+  surface, so the program needs no code for it; `shot FILE` writes the
+  next frame presented as a PPM (`gpu::capture_next_frame`, which a
+  program can call too). The GPU evals' agents could not test input or
+  frame times; now `tests/examples/gpu-life-script.test` paints and
+  steps examples/gpu/life and `pathtrace-script.test` clicks a button of
+  pathtrace's panel, each against a golden region
+  (`guide window#testing-input-without-a-display`). The test runner
+  gets `// ENV: NAME=VALUE`.
+- **GPU timestamps**, on WebGPU's timestamp-query: `dev.query_set(n)`,
+  `enc.compute_pass_timed(set, begin, end, |pass| ..)` and
+  `render_pass_timed`, `enc.resolve_query_set(set, first, count, buf,
+  offset)` into a `BufferUsage::QUERY_RESOLVE` buffer, and
+  `queue.timestamp_period()` (ns a tick). On Metal a timed pass is a
+  command buffer of its own and its timestamps are the command buffer's
+  `GPUStartTime` and `GPUEndTime` (already bound; counter sampling would
+  have needed a dozen new Objective-C classes and methods for the same
+  per-pass resolution on Apple GPUs, which sample at stage boundaries
+  only); a submission with timed passes returns once they have
+  finished. `dev.caps().timestamps` says whether a device has them
+  (`gpu.unsupported` otherwise, never a wrong number).
+  `tests/gpu/cases/timestamp_query.vl` checks that a kernel looping 8
+  times longer measures longer (the ratio of medians), and
+  `guide gpu#timing-gpu-work` uses them.
 
 ### What's new in 0.25.3
 

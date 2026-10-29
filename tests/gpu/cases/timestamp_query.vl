@@ -1,0 +1,133 @@
+// (0.25.4) GPU timestamps: a query set, timed compute passes (each writes
+// its beginning and its end), resolve_query_set into a QUERY_RESOLVE
+// buffer, copied out and read. A kernel looping 8 times longer measures
+// longer: the median of five runs of each, compared as a ratio (the
+// machine's load changes the times, not much their ratio). A resolve in a
+// later encoder reads the same values; the period is 1 ns. (The two
+// passes share no buffer, so the GPU may run them at once: their order
+// is not checked.)
+// EXPECT: period 1 ns
+// EXPECT: every pass: begin < end
+// EXPECT: the long kernel takes longer: ok
+// EXPECT: a later resolve reads the same: ok
+
+use std::gpu;
+use std::gpu::{BufferUsage, ComputePipeline, Device, QuerySet, Queue};
+
+const GROUPS: i64 = 1024; // of 64 threads
+
+fn kernel(iters: i64, gpa: Gpa) -> Buf {
+    var src = Buf::new_in(gpa);
+    src.push_str(KERNEL_HEAD);
+    src.push_fmt(f"    for (var i = 0u; i < {iters}u; i = i + 1u) {{\n");
+    src.push_str(KERNEL_TAIL);
+    src
+}
+
+const KERNEL_HEAD: [u8] = """
+    @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        var x = xs[id.x] + id.x;
+    """;
+
+const KERNEL_TAIL: [u8] = """
+            x = x ^ (x << 13u);
+            x = x ^ (x >> 17u);
+            x = x ^ (x << 5u);
+        }
+        xs[id.x] = x;
+    }
+    """;
+
+// Runs the short and the long kernel in one encoder, each a timed pass
+// (timestamps 0, 1 and 2, 3), and reads the four timestamps back.
+fn run(dev: Device, queue: inout Queue, set: QuerySet, short: ComputePipeline,
+    long: ComputePipeline, group: gpu::BindGroup, long_group: gpu::BindGroup,
+    resolved: gpu::Buffer, out: inout gpu::Buffer) -> [u64; 4] {
+    var enc = dev.encoder();
+    enc.compute_pass_timed(set, 0, 1, |pass| {
+        pass.set_pipeline(short);
+        pass.set_bind_group(0, group);
+        pass.dispatch(GROUPS);
+    });
+    enc.compute_pass_timed(set, 2, 3, |pass| {
+        pass.set_pipeline(long);
+        pass.set_bind_group(0, long_group);
+        pass.dispatch(GROUPS);
+    });
+    enc.resolve_query_set(set, 0, 4, resolved, 0);
+    enc.copy_buffer(resolved, 0, out, 0, 32);
+    queue.submit(enc.finish());
+    read(dev, &out)
+}
+
+fn read(dev: Device, out: inout gpu::Buffer) -> [u64; 4] {
+    let b = out.map_read(dev);
+    var t: [u64; 4] = [0u64; 4];
+    for k in 0..4 {
+        for j in 0..8 {
+            t[k] = t[k] | (b[k * 8 + j] as u64) << (8 * j) as u64;
+        }
+    }
+    out.unmap(dev);
+    t
+}
+
+fn median(xs: [u64]) -> u64 {
+    var v = [0u64; 5];
+    for i in 0..5 {
+        v[i] = xs[i];
+    }
+    v.sort();
+    v[2]
+}
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    println(f"period {queue.timestamp_period()} ns");
+    let short = dev.compute_pipeline(dev.shader_wgsl(kernel(500, gpa).as_slice())?, "main")?;
+    let long = dev.compute_pipeline(dev.shader_wgsl(kernel(4000, gpa).as_slice())?, "main")?;
+    let xs = dev.buffer(GROUPS * 64 * 4, BufferUsage::STORAGE);
+    let ys = dev.buffer(GROUPS * 64 * 4, BufferUsage::STORAGE);
+    let group = dev.bind_group(short.bind_layout(0), [gpu::bind(0, xs)][..]);
+    let long_group = dev.bind_group(long.bind_layout(0), [gpu::bind(0, ys)][..]);
+    let set = dev.query_set(4);
+    let resolved = dev.buffer(256, BufferUsage::QUERY_RESOLVE | BufferUsage::COPY_SRC);
+    var out = dev.buffer(32, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+
+    // a warm-up: the first submission sets the pipelines up
+    run(dev, &queue, set, short, long, group, long_group, resolved, &out);
+    var shorts = [0u64; 5];
+    var longs = [0u64; 5];
+    var ordered = true;
+    var last = [0u64; 4];
+    for r in 0..5 {
+        let t = run(dev, &queue, set, short, long, group, long_group, resolved, &out);
+        ordered = ordered && t[0] > 0 && t[0] < t[1] && t[2] > 0 && t[2] < t[3];
+        shorts[r] = t[1] - t[0];
+        longs[r] = t[3] - t[2];
+        last = t;
+    }
+    println(if ordered { "every pass: begin < end" }
+        else { "a pass's timestamps are out of order" });
+    let s = median(shorts[..]);
+    let l = median(longs[..]);
+    if l > 3 * s {
+        println("the long kernel takes longer: ok");
+    } else {
+        println(f"the long kernel takes longer: no (short {s} ns, long {l} ns)");
+    }
+
+    // the set keeps the last values: a resolve in another encoder reads them
+    var enc = dev.encoder();
+    enc.resolve_query_set(set, 0, 4, resolved, 0);
+    enc.copy_buffer(resolved, 0, out, 0, 32);
+    queue.submit(enc.finish());
+    let again = read(dev, &out);
+    let same = again[0] == last[0] && again[1] == last[1] && again[2] == last[2]
+        && again[3] == last[3];
+    println(if same { "a later resolve reads the same: ok" }
+        else { "a later resolve reads other values" });
+    Ok(())
+}

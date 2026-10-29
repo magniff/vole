@@ -34,13 +34,13 @@ BEGIN {
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.22) std::objc and std::gpu: every section lazy, behind the gates
     # below, so that a program that uses neither reads none of them.
-    n = split("std::objc|Objective-C objects (0.22)|Autorelease pools, selectors, classes, frameworks (0.22)|Strings and exceptions (0.22)|std::objc::foundation|std::gpu|GPU: errors (0.22)|GPU: the sizes buffer (0.22)|GPU: instance, adapters, devices (0.22)|GPU: buffers, textures, samplers, shaders (0.22)|GPU: bind layouts and groups (0.22)|GPU: pipelines (0.22)|GPU: encoders and passes (0.22)|GPU: surfaces and frames (0.22)|GPU: bytes (0.22)|std::gpu::capture|std::gpu::types|GPU types: flags, formats, descriptors (0.22)|std::gpu::shader|GPU shaders: sources and reflection (0.22)|GPU shaders: from std::gpu::wgsl (0.22)|std::gpu::hal|The GPU backend interface (0.22)|std::gpu::hal::metal|GPU on Metal: devices, memory, resources (0.22)|GPU on Metal: conversions (0.22)|GPU on Metal: recording helpers (0.22)|GPU on Metal: hal::Api (0.22)|GPU on Metal: hal::Render (0.22)|std::gpu::hal::metal::bindings", lz, "|")
+    n = split("std::objc|Objective-C objects (0.22)|Autorelease pools, selectors, classes, frameworks (0.22)|Strings and exceptions (0.22)|std::objc::foundation|std::gpu|GPU: errors (0.22)|GPU: the sizes buffer (0.22)|GPU: instance, adapters, devices (0.22)|GPU: buffers, textures, samplers, shaders (0.22)|GPU: bind layouts and groups (0.22)|GPU: pipelines (0.22)|GPU: encoders and passes (0.22)|GPU: surfaces and frames (0.22)|GPU: bytes (0.22)|std::gpu::capture|GPU: capturing a frame (0.25.4)|std::gpu::timing|GPU: timestamps (0.25.4)|std::gpu::types|GPU types: flags, formats, descriptors (0.22)|std::gpu::shader|GPU shaders: sources and reflection (0.22)|GPU shaders: from std::gpu::wgsl (0.22)|std::gpu::hal|The GPU backend interface (0.22)|std::gpu::hal::metal|GPU on Metal: devices, memory, resources (0.22)|GPU on Metal: conversions (0.22)|GPU on Metal: recording helpers (0.22)|GPU on Metal: hal::Api (0.22)|GPU on Metal: hal::Render (0.22)|std::gpu::hal::metal::bindings", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.23) std::window: every section lazy, behind the window gate, so
     # that a program that does not name it reads none of it (its Cocoa
     # callbacks would otherwise be in every program: the effects of every
     # C call include what a callback may do)
-    n = split("std::window|Windows and input (0.23)|std::window::script|std::window::keys|Keys (0.23)|std::window::objc|The Objective-C layer (0.23)|std::window::cocoa|The Cocoa backend (0.23)|the view's methods (IMPs) (0.23)|NSTextInputClient (0.23)|the window delegate (0.23)|watched file descriptors (0.23)|classes (0.23)", lz, "|")
+    n = split("std::window|Windows and input (0.23)|std::window::script|Windows: the scripted event loop (0.25.4)|std::window::keys|Keys (0.23)|std::window::objc|The Objective-C layer (0.23)|std::window::cocoa|The Cocoa backend (0.23)|the view's methods (IMPs) (0.23)|NSTextInputClient (0.23)|the window delegate (0.23)|watched file descriptors (0.23)|classes (0.23)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.24) std::cli: every section lazy, behind the cli gate: a program
     # that does not name `cli` reads none of it
@@ -79,6 +79,7 @@ BEGIN {
     GATES["std::objc::foundation"] = "objc"
     GATES["std::gpu::types"] = "gpu"
     GATES["std::gpu::capture"] = "gpu"
+    GATES["std::gpu::timing"] = "gpu"
     GATES["std::gpu::shader"] = "gpu"
     GATES["std::gpu::hal"] = "gpu"
     GATES["std::gpu::hal::metal"] = "gpu"
@@ -102,6 +103,7 @@ BEGIN {
     # (0.25.4) std::capture: lazy, no gate: std::window (its scripted loop)
     # and std::gpu both reach it, and neither can reach the other
     LAZY["std::capture"] = 1
+    LAZY["Frame capture (0.25.4)"] = 1
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
