@@ -78,6 +78,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   0.25.3 refused it because, allowed, it crashed: the checker inlined a
   string constant's literal only when its type was `[u8]`, so a `str`
   one was read as an integer constant, a null slice.
+- A closure's `let` parameter takes a value with no place (`f(make())`),
+  lent as a temporary of the statement and dropped at its end, as a
+  function's does; 0.25.3 said "this value has no place".
 
 ### What's new in 0.25.3
 
