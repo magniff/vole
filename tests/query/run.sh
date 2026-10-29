@@ -266,8 +266,11 @@ check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
 rc=$?
 ok=0
-# (0.18.1: a clean check says so in one line)
-[ $rc -eq 0 ] && [ "$out" = "ok: 0 errors in compiler/src/main.vl" ] && ok=1
+# (0.18.1: a clean check says so in one line; 0.25.3: but for one
+# unsafe.unjustified warning, the compiler's legacy unsafe, which
+# docs/unsafe-baseline.md counts)
+clean=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]' | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
+[ $rc -eq 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && ok=1
 check std_tree_checks "$ok" "$out"
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do

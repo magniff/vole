@@ -205,8 +205,12 @@ check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
 # check: the compiler's source has no errors, quickly.
 "$COMPILER" check compiler/src/main.vl >"$WORK/check.out" 2>&1
-# (0.18.1: a clean check says so in one line)
-check self_check "$([ $? = 0 ] && [ "$(cat "$WORK/check.out")" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
+rc=$?
+# (0.18.1: a clean check says so in one line; 0.25.3: but for one
+# unsafe.unjustified warning, the compiler's legacy unsafe, which
+# docs/unsafe-baseline.md counts)
+clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
+check self_check "$([ $rc = 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and
 # against a wrapper that changes one compilation (different).
 cp "$COMPILER" "$WORK/old-volec"
@@ -260,7 +264,7 @@ check module_path_without_crate "$ok" "$out"
 # embed.*, text blocks and include_str; `embed.sh`, a script's name, is
 # not one.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

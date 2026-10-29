@@ -67,6 +67,22 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.25.3
 
+- **The unsafe audit**: `volec query unsafe [FILE...|std]` lists every
+  unsafe block, `unsafe fn` and extern block of a program (std's too;
+  `--no-std`): its item, the operations inside it that need unsafe as
+  the checker counts them, a class (`ffi`, `alloc`, `intrinsic`,
+  `transmute/cast`, `raw-pointer`, `static-mut`, `other`), whether the
+  comments right above it say `UNSAFE:` and `SAFETY:`, and blocks with
+  nothing unsafe inside (`none (unneeded)`); `--unjustified`,
+  `--summary`, `--json`. `volec check` warns about a site without both
+  comments (`unsafe.unjustified`, the first five and a count; `check
+  --deny-warnings` makes it an error); the commit hook and premerge ask
+  the compiler for the sites a change adds (tools/unsafe-diff-check.py,
+  its 12-line heuristic left for what the compiler cannot read); the
+  baseline, docs/unsafe-baseline.md (compiler/src 5,316 unjustified of
+  5,380 sites, 938 blocks unneeded; std 1,194 of 1,204), and the gate's
+  `unsafe-audit` row, which fails when either count rises.
+
 - **Soundness**: a mapped read view of a GPU buffer no longer changes
   under the program (the round 3 GPU eval's ocean: `let v =
   gpu::f32s(r.map_read(dev))`, then a copy into `r`, and `v` read 1,

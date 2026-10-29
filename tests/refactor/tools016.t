@@ -16,7 +16,8 @@ try: volec fix --only imports --use crate::back::obj::is_blank
 $ fix --only imports --use crate::back::obj::is_blank
 fixed 2 missing imports	2 files	+4 -0 lines
 $ check
-ok: 0 errors in main.vl
+loops.vl:6:13: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe loops.vl
+ok: 0 errors, 1 warning in main.vl
 ## edit patch: OLD occurs several times: the error names --nth and --all;
 ## --nth N patches the Nth, --all every one; --nth past the last.
 $ edit patch clamp --old 'r = ' --new 'r = 0 + '
@@ -163,7 +164,8 @@ pub fn total() -> i64 {
     t + v_two * other
 }
 $ check
-ok: 0 errors in main.vl
+loops.vl:6:13: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe loops.vl
+ok: 0 errors, 1 warning in main.vl
 $ rewrite 'clamp($a, $b, $c)' 'clamp($a, $b, $d)'
 error rewrite.unbound: the replacement's $d is not in the pattern, and the replacement binds no name with it (`for $x in`, `let $x =`)
 [exit 2]

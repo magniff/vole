@@ -73,7 +73,9 @@ error fix.bad-in: no file, module or item 'nowhere' in the program
 $ fix
 fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 $ check
-ok: 0 errors in main.vl
+main.vl:10:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+main.vl:17:13: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+ok: 0 errors, 2 warnings in main.vl
 ## Nothing left to fix.
 $ fix
 note fix.none: nothing to fix

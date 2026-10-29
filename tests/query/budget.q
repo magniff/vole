@@ -208,6 +208,7 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
        volec query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
        volec query examples [KIND...]   (items to start from for an "add an X" change; volec guide how)
+       volec query unsafe [FILE...|DIR|std] [--no-std] [--summary] [--unjustified] [--json]   (every unsafe block, unsafe fn and extern block: what it does, its class, its UNSAFE:/SAFETY: comments)
 NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)
 --budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)
 ROOT: --root ROOT|DIR, a last argument ending in .vl, $VOLE_ROOT, ./main.vl, ./compiler/src/main.vl; a FILE[:LINE] argument names its own program
