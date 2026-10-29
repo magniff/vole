@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, 43a1d4ef. The gate's unsafe-audit row
+on Darwin arm64, ae68b63e. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,60 +14,60 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 5316
+baseline compiler/src unjustified: 4375
 baseline std unjustified: 1194
 
 ## compiler/src
 
 ```
-sites: 5380 (5330 blocks, 10 unsafe fns, 40 extern blocks); unjustified: 5316; unneeded: 938
+sites: 4468 (4417 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 4375; unneeded: 0
 
 class	sites	unjustified
-static-mut	2459	2420
-raw-pointer	1428	1411
-other	946	946
-ffi	300	296
+static-mut	2480	2419
+raw-pointer	1429	1410
+ffi	302	294
 alloc	134	134
-transmute/cast	113	109
+transmute/cast	115	110
+other	8	8
 
 module	sites	unjustified
-crate::front	1905	1887
-crate::tools	1539	1497
-crate::back	757	757
-crate::middle	754	754
-crate::gen0	211	211
-crate::base	124	121
-crate::arch	70	70
-crate::guide	15	15
-crate	4	4
+crate::front	1684	1649
+crate::tools	1216	1170
+crate::middle	728	728
+crate::back	579	576
+crate::base	109	101
+crate::gen0	87	87
+crate::arch	51	51
+crate::guide	10	10
+crate	3	3
 crate::cli	1	0
 
 file	sites	unjustified
-compiler/src/front/own/drops.vl	85	85
-compiler/src/tools/lsp/complete.vl	81	81
-compiler/src/back/codecache/mod.vl	65	65
-compiler/src/gen0/x86_64.vl	65	65
-compiler/src/tools/lsp/answer.vl	65	64
-compiler/src/gen0/arm64.vl	58	58
+compiler/src/front/own/drops.vl	78	77
+compiler/src/tools/lsp/complete.vl	61	61
+compiler/src/tools/lsp/answer.vl	59	57
+compiler/src/back/codecache/mod.vl	57	57
 compiler/src/base/mod.vl	55	53
-compiler/src/tools/fixconv.vl	54	54
-compiler/src/front/own/views.vl	52	52
-compiler/src/front/own/state.vl	49	49
-compiler/src/base/diag.vl	47	46
-compiler/src/front/types.vl	47	47
-compiler/src/front/own/walk.vl	46	46
-compiler/src/middle/gvn.vl	46	46
-compiler/src/middle/parallel.vl	44	44
-compiler/src/tools/fixvalues.vl	43	43
-compiler/src/middle/inline.vl	42	42
-compiler/src/front/own/infer.vl	39	39
-compiler/src/front/effects/infer.vl	38	38
+compiler/src/tools/fixconv.vl	50	50
+compiler/src/front/own/views.vl	45	45
+compiler/src/front/types.vl	44	43
+compiler/src/middle/gvn.vl	44	44
+compiler/src/middle/inline.vl	41	41
+compiler/src/middle/parallel.vl	39	39
 compiler/src/middle/loops.vl	38	38
-(336 more; --all lists every one)
+compiler/src/base/diag.vl	37	35
+compiler/src/front/own/state.vl	37	37
+compiler/src/tools/fixvalues.vl	37	37
+compiler/src/front/own/moves.vl	36	30
+compiler/src/front/check/synth_mode.vl	35	32
+compiler/src/front/own/walk.vl	34	34
+compiler/src/back/objfile/mod.vl	33	33
+compiler/src/front/effects/infer.vl	33	33
+(327 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	5316	5316
-justified	64	0
+missing both	4375	4375
+justified	93	0
 ```
 
 ## std
