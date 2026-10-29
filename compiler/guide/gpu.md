@@ -25,31 +25,35 @@ use std::window::{App, Event, WindowDesc};
 
 const N: i64 = 256; // the field is N x N f32s
 
-const STEP: [u8] = "struct U { time: f32, n: f32, pad0: f32, pad1: f32 }\n\
-    @group(0) @binding(0) var<uniform> u: U;\n\
-    @group(0) @binding(1) var<storage, read_write> field: array<f32>;\n\
-    @compute @workgroup_size(8, 8) fn step(@builtin(global_invocation_id) id: vec3<u32>) {\n\
-    let n = u32(u.n);\n\
-    if (id.x >= n || id.y >= n) { return; }\n\
-    let p = vec2<f32>(f32(id.x), f32(id.y)) / u.n;\n\
-    field[id.y * n + id.x] = 0.5 + 0.5 * sin(12.0 * (p.x + p.y) + u.time);\n\
-    }\n";
+const STEP: [u8] = r"""
+    struct U { time: f32, n: f32, pad0: f32, pad1: f32 }
+    @group(0) @binding(0) var<uniform> u: U;
+    @group(0) @binding(1) var<storage, read_write> field: array<f32>;
+    @compute @workgroup_size(8, 8) fn step(@builtin(global_invocation_id) id: vec3<u32>) {
+        let n = u32(u.n);
+        if (id.x >= n || id.y >= n) { return; }
+        let p = vec2<f32>(f32(id.x), f32(id.y)) / u.n;
+        field[id.y * n + id.x] = 0.5 + 0.5 * sin(12.0 * (p.x + p.y) + u.time);
+    }
+    """;
 
-const DRAW: [u8] = "struct U { time: f32, n: f32, pad0: f32, pad1: f32 }\n\
-    @group(0) @binding(0) var<uniform> u: U;\n\
-    @group(0) @binding(1) var<storage, read> field: array<f32>;\n\
-    struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
-    @vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n\
-    var p = vec2<f32>(-1.0, -1.0);\n\
-    if (i == 1u) { p = vec2<f32>(3.0, -1.0); }\n\
-    if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }\n\
-    return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));\n\
-    }\n\
-    @fragment fn fs(v: V) -> @location(0) vec4<f32> {\n\
-    let c = vec2<u32>(clamp(v.uv * u.n, vec2<f32>(0.0), vec2<f32>(u.n - 1.0)));\n\
-    let h = field[c.y * u32(u.n) + c.x];\n\
-    return vec4<f32>(h, 0.4 * h, 1.0 - h, 1.0);\n\
-    }\n";
+const DRAW: [u8] = r"""
+    struct U { time: f32, n: f32, pad0: f32, pad1: f32 }
+    @group(0) @binding(0) var<uniform> u: U;
+    @group(0) @binding(1) var<storage, read> field: array<f32>;
+    struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+        var p = vec2<f32>(-1.0, -1.0);
+        if (i == 1u) { p = vec2<f32>(3.0, -1.0); }
+        if (i == 2u) { p = vec2<f32>(-1.0, 3.0); }
+        return V(vec4<f32>(p, 0.0, 1.0), vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5));
+    }
+    @fragment fn fs(v: V) -> @location(0) vec4<f32> {
+        let c = vec2<u32>(clamp(v.uv * u.n, vec2<f32>(0.0), vec2<f32>(u.n - 1.0)));
+        let h = field[c.y * u32(u.n) + c.x];
+        return vec4<f32>(h, 0.4 * h, 1.0 - h, 1.0);
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var app = match App::new_in(gpa) {
@@ -200,10 +204,12 @@ bound there.
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const SQUARE: [u8] = "@group(0) @binding(0) var<storage, read_write> xs: array<u32>;\n\
-    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
-    xs[id.x] = xs[id.x] * xs[id.x];\n\
-    }";
+const SQUARE: [u8] = r"""
+    @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        xs[id.x] = xs[id.x] * xs[id.x];
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
@@ -362,10 +368,12 @@ or a vertex buffer of `StepMode::Instance`).
 use std::gpu;
 use std::gpu::{BufferUsage, Format, IndexFormat, PassDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const QUAD: [u8] = "@vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {\n\
-    return vec4<f32>(p, 0.0, 1.0);\n\
-    }\n\
-    @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
+const QUAD: [u8] = r"""
+    @vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {
+        return vec4<f32>(p, 0.0, 1.0);
+    }
+    @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
@@ -448,12 +456,14 @@ use std::gpu;
 use std::gpu::BufferUsage;
 
 // a: offset 0 (vec3 aligns to 16), b: 12 (in a's padding), c: 16, d: 32
-const SHADER: [u8] = "struct U { a: vec3<f32>, b: f32, c: vec2<f32>, d: vec4<f32> }\n\
-    @group(0) @binding(0) var<uniform> u: U;\n\
-    @group(0) @binding(1) var<storage, read_write> out: array<f32>;\n\
-    @compute @workgroup_size(1) fn main() {\n\
-    out[0] = u.a.z; out[1] = u.b; out[2] = u.c.y; out[3] = u.d.w;\n\
-    }";
+const SHADER: [u8] = r"""
+    struct U { a: vec3<f32>, b: f32, c: vec2<f32>, d: vec4<f32> }
+    @group(0) @binding(0) var<uniform> u: U;
+    @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(1) fn main() {
+        out[0] = u.a.z; out[1] = u.b; out[2] = u.c.y; out[3] = u.d.w;
+    }
+    """;
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
@@ -547,15 +557,19 @@ use std::gpu::BufferUsage;
 
 const BINS: [u8] = "@group(0) @binding(0) var<storage, read_write> bins: array<atomic<u32>>;\n";
 
-const DEPOSIT: [u8] = "@group(0) @binding(1) var<storage, read> xs: array<u32>;\n\
-    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
-    if (id.x >= 256u) { return; }\n\
-    atomicAdd(&bins[xs[id.x] % 4u], 1u);\n\
-    }\n";
+const DEPOSIT: [u8] = r"""
+    @group(0) @binding(1) var<storage, read> xs: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        if (id.x >= 256u) { return; }
+        atomicAdd(&bins[xs[id.x] % 4u], 1u);
+    }
+    """;
 
-const CLEAR: [u8] = "@compute @workgroup_size(4) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
-    atomicStore(&bins[id.x], 0u);\n\
-    }\n";
+const CLEAR: [u8] = r"""
+    @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        atomicStore(&bins[id.x], 0u);
+    }
+    """;
 
 fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
     var src = Buf::new_in(gpa);
@@ -645,17 +659,19 @@ const N: i64 = 64;
 const STEPS: i64 = 10;
 
 // next[i] = (cur[i - 1] + cur[i + 1] + step) % 251, on a ring of N
-const STEP: [u8] = "struct U { step: u32, n: u32, pad0: u32, pad1: u32 }\n\
-    @group(0) @binding(0) var<uniform> u: U;\n\
-    @group(0) @binding(1) var<storage, read> cur: array<u32>;\n\
-    @group(0) @binding(2) var<storage, read_write> next: array<u32>;\n\
-    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
-    let i = id.x;\n\
-    if (i >= u.n) { return; }\n\
-    let l = cur[(i + u.n - 1u) % u.n];\n\
-    let r = cur[(i + 1u) % u.n];\n\
-    next[i] = (l + r + u.step) % 251u;\n\
-    }\n";
+const STEP: [u8] = r"""
+    struct U { step: u32, n: u32, pad0: u32, pad1: u32 }
+    @group(0) @binding(0) var<uniform> u: U;
+    @group(0) @binding(1) var<storage, read> cur: array<u32>;
+    @group(0) @binding(2) var<storage, read_write> next: array<u32>;
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        let i = id.x;
+        if (i >= u.n) { return; }
+        let l = cur[(i + u.n - 1u) % u.n];
+        let r = cur[(i + 1u) % u.n];
+        next[i] = (l + r + u.step) % 251u;
+    }
+    """;
 
 // The same steps on the CPU: the reference the GPU's state is checked
 // against.
