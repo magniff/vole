@@ -162,10 +162,9 @@ unmaps: the buffer can be written again at once, and the copy outlives
 it. A view lives no longer than the buffer: a function may return
 `buf.map_read(dev)` when `buf` is its caller's (an `inout` parameter),
 not when the buffer is a local of its own (`own.escape`); then return
-`map_read_copy_in`'s copy. (A function of your own that returns
-`gpu::f32s(buf.map_read(dev))` of an `inout` parameter declares
-`#[views(buf)]`: the checker does not see that numbers can view a
-buffer's bytes through it.)
+`map_read_copy_in`'s copy. A function of your own that returns
+`gpu::f32s(buf.map_read(dev))` of an `inout` parameter views `buf`
+too (inferred, `volec query views NAME`).
 
 Shaders come from the shader compiler as a `ShaderSource`: the code
 for the device's `caps().shader_kind` (MSL on Metal) and its
