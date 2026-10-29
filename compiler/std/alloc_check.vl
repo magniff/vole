@@ -3,19 +3,19 @@
 impl Gpa {
     // The blocks allocated and not freed: -1, unknown, unless --check-alloc.
     pub fn live_blocks(self) -> i64 {
-        CHECK_LOCK.lock();
+        let took = check_lock();
         let n = CHECK_LIVE;
-        CHECK_LOCK.unlock();
+        check_unlock(took);
         n
     }
 
     // Whether no block is left allocated (with --check-alloc, which lists
     // them); always true without.
     pub fn check_leaks(self) -> bool {
-        CHECK_LOCK.lock();
+        let took = check_lock();
         unsafe { check_alloc_list_leaks() }
         let none = CHECK_LIVE == 0;
-        CHECK_LOCK.unlock();
+        check_unlock(took);
         none
     }
 }
@@ -25,9 +25,9 @@ impl Gpa {
 // property's case, or a fuzz run, leaks them (test_case, fuzz_exec);
 // their count.
 fn check_alloc_leaks_since(mark: i64) -> i64 {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let live = check_leaks_since(mark);
-    CHECK_LOCK.unlock();
+    check_unlock(took);
     live
 }
 
@@ -121,6 +121,37 @@ static var CHECK_ALLOC_SITE: *u8 = 0 as *u8;
 static CHECK_LOCK: std::sync::RawLock = std::sync::RawLock {
     state: std::sync::atomic::AtomicU32 { v: 0 },
 };
+// The thread holding CHECK_LOCK (0: none): --check-unsafe checks the
+// allocator's own raw accesses too, through check_alloc_access, inside an
+// entry that holds the lock, so the lock is taken again by no one.
+static CHECK_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64 { v: 0 };
+
+// UNSAFE: C. SAFETY: pthread.h's prototype (pthread_t as u64).
+extern "C" {
+    #[link_name = "pthread_self"]
+    #[effects()]
+    fn check_thread_self() -> u64;
+}
+
+// Takes CHECK_LOCK unless this thread holds it: whether it did.
+fn check_lock() -> bool {
+    // UNSAFE: C. SAFETY: pthread_self takes nothing.
+    let me = unsafe { check_thread_self() };
+    if CHECK_OWNER.load(std::sync::atomic::Ordering::Relaxed) == me {
+        return false;
+    }
+    CHECK_LOCK.lock();
+    CHECK_OWNER.store(me, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+// Lets CHECK_LOCK go when check_lock took it.
+fn check_unlock(took: bool) {
+    if took {
+        CHECK_OWNER.store(0, std::sync::atomic::Ordering::Relaxed);
+        CHECK_LOCK.unlock();
+    }
+}
 
 // A block: its pages [start, start + span), its size, its allocator (0:
 // Gpa, else an arena's state), its state, and where it was allocated and
@@ -556,33 +587,33 @@ fn check_alloc_block(owner: u64, size: i64, align: i64) -> *u8 {
     if size == 0 {
         return unsafe { align as *u8 };
     }
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let p = unsafe { check_new_block(owner, size) };
-    CHECK_LOCK.unlock();
+    check_unlock(took);
     p
 }
 
 // (Arenas) p, a block of owner of old_size bytes, moved to new_size bytes.
 unsafe fn check_alloc_moved(owner: u64, p: *u8, old_size: i64, new_size: i64, align: i64)
     -> *u8 {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let q = check_move(owner, p, old_size, new_size, align);
-    CHECK_LOCK.unlock();
+    check_unlock(took);
     q
 }
 
 // (Arenas) The blocks allocated so far: a mark for check_alloc_release.
 fn check_alloc_mark() -> i64 {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let n = CHECK_COUNT;
-    CHECK_LOCK.unlock();
+    check_unlock(took);
     n
 }
 
 // (Arenas: a reset, a scope's end) Every block of owner allocated after
 // mark is given back: a later access faults.
 fn check_alloc_release(owner: u64, mark: i64) {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     unsafe {
         for b in mark..CHECK_COUNT {
             if CHECK_BLOCKS[b].owner == owner && CHECK_BLOCKS[b].state == CHECK_LIVE_BLOCK {
@@ -590,7 +621,7 @@ fn check_alloc_release(owner: u64, mark: i64) {
             }
         }
     }
-    CHECK_LOCK.unlock();
+    check_unlock(took);
 }
 
 // (Arenas) The site of the call being run, and that site set again: a
@@ -608,9 +639,9 @@ fn check_alloc_set_site(site: *u8) {
 // (Arenas) Whether p starts the last live block of owner: the block an
 // arena grows, or gives back, in place.
 fn check_alloc_is_last(owner: u64, p: *u8) -> bool {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let last = check_is_last(owner, p);
-    CHECK_LOCK.unlock();
+    check_unlock(took);
     last
 }
 
@@ -630,16 +661,16 @@ fn check_is_last(owner: u64, p: *u8) -> bool {
 // false when p is no memory of the checking allocator, true when it is in
 // bounds of a live block; else the program stops.
 pub unsafe fn check_alloc_access(p: u64, size: u64, site: *u8) -> bool {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     let b = check_find(p);
     if b == -1 {
-        CHECK_LOCK.unlock();
+        check_unlock(took);
         return false;
     }
     var m = check_msg();
     if b >= 0 && CHECK_BLOCKS[b].state == CHECK_LIVE_BLOCK {
         if p + size <= CHECK_BLOCKS[b].start + CHECK_BLOCKS[b].size as u64 {
-            CHECK_LOCK.unlock();
+            check_unlock(took);
             return true;
         }
         m.text("unsafe access out of bounds: ");
@@ -730,13 +761,13 @@ unsafe fn check_alloc_list_leaks() {
 // At exit: the leaks, unless check_leaks listed them and nothing changed
 // since.
 extern "C" fn check_alloc_at_exit() {
-    CHECK_LOCK.lock();
+    let took = check_lock();
     unsafe {
         if CHECK_LISTED != CHECK_CHANGES {
             check_alloc_list_leaks();
         }
     }
-    CHECK_LOCK.unlock();
+    check_unlock(took);
 }
 
 impl Allocator for Gpa {
@@ -749,12 +780,12 @@ impl Allocator for Gpa {
     }
 
     unsafe fn free(self: *Gpa, p: *u8, size: i64, align: i64) {
-        CHECK_LOCK.lock();
+        let took = check_lock();
         if size == 0 && check_find(p as u64) == -1 {
-            CHECK_LOCK.unlock();
+            check_unlock(took);
             return;
         }
         check_drop_block(check_owned(p, size, 0, true), CHECK_FREED);
-        CHECK_LOCK.unlock();
+        check_unlock(took);
     }
 }
