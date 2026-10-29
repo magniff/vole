@@ -29,7 +29,7 @@ The times are from an Apple M-series machine, measured with vole
 Each example is one file:
 
 ```sh
-volec examples/algorithms/NAME/main.vl -o NAME && ./NAME
+volec run examples/algorithms/NAME
 cc -O2 examples/algorithms/NAME/reference.c -o NAME-c && ./NAME-c   # the C version, where there is one
 ```
 

@@ -248,7 +248,7 @@ INSIDE_SMOKE_STEPS="smoke-runner smoke-lsp smoke-examples smoke-cases smoke-walk
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind $INSIDE_SMOKE_STEPS"
 # (the self-test's steps, only for it)
-[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow"
+[ -z "${VOLE_GATE_SELFTEST:-}" ] || OTHER_STEPS="$OTHER_STEPS selftest-sleep selftest-leak selftest-slow selftest-hog selftest-wait selftest-hang"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
     quick)
@@ -386,6 +386,28 @@ self_test() {
         st_row "a lost slot is reported" "pass (in $(( $(date +%s) - s0 )) s)"
     else
         st_row "a lost slot is reported" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/leak.out" | tr '\n' ' ')"
+    fi
+    # (0.25.4) A step waiting for the one slot while another's job holds
+    # it, busy, is waiting, not stalled (0.25.3's container gate stopped a
+    # fuzz row so, "0 of 8 slots free (slots lost ...?)", none lost).
+    VOLE_GATE_STALL=4 g -j 1 --only selftest-hog,selftest-wait >"$st/wait.out" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ] && grep -q 'selftest-wait .*pass' "$st/wait.out"; then
+        st_row "a step waiting is not stopped" pass
+    else
+        st_row "a step waiting is not stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/wait.out" | tr '\n' ' ')"
+    fi
+    # A job that holds its slot and does nothing: its step is stopped (its
+    # processes in its log), the job gives the slot back, and the step
+    # waiting for it then runs and passes.
+    VOLE_GATE_STALL=4 g -j 1 --only selftest-hang,selftest-wait >"$st/hang.out" 2>&1
+    rc=$?
+    hl=$(sed -n 's/.*(log: \(.*selftest-hang.log\)).*/\1/p' "$st/hang.out" | head -1)
+    if [ $rc -ne 0 ] && grep -q 'selftest-hang .*FAIL .*stalled' "$st/hang.out" \
+        && grep -q 'selftest-wait .*pass' "$st/hang.out" && [ -n "$hl" ] && grep -q 'its processes' "$hl"; then
+        st_row "a hung job's step is stopped" pass
+    else
+        st_row "a hung job's step is stopped" "FAIL (exit $rc): $(grep -E 'selftest|stalled' "$st/hang.out" | tr '\n' ' ')"
     fi
     if [ $st_failed -eq 0 ]; then echo "gate: self-test: ok"; else echo "gate: self-test: FAIL (outputs in $st)"; trap - EXIT; fi
     exit $st_failed
@@ -702,6 +724,30 @@ run_step() {
             e=$(( $(date +%s) + 7 ))
             while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e6) i++ }'; done
             echo "selftest: busy, done" ;;
+        # (0.25.4) a runner's rows, as tests/run.sh's jobs take and give back
+        # their slots: one job busy for 8 s on its slot; one job that waits
+        # for a slot (after 3 s of its own), then ends; one job that holds
+        # its slot and does nothing (a hang: only a sleep)
+        selftest-hog|selftest-wait|selftest-hang)
+            exec 3<>"$VOLE_JOBSERVER"
+            if [ "$1" = selftest-wait ]; then
+                sleep 2
+                e=$(( $(date +%s) + 1 ))
+                while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e5) i++ }'; done
+            fi
+            read -r _ <&3
+            (
+                trap 'echo >&3' EXIT
+                trap 'exit 1' HUP INT TERM
+                case "$1" in
+                    selftest-hog)
+                        e=$(( $(date +%s) + 8 ))
+                        while [ "$(date +%s)" -lt $e ]; do awk 'BEGIN { while (i < 2e6) i++ }'; done ;;
+                    selftest-hang) sleep 60 ;;
+                esac
+            ) &
+            wait
+            echo "selftest: $1, done" ;;
         bench)
             previous=$(find_previous)
             seed=$(find_seed)
@@ -741,11 +787,24 @@ start() { # <step>
 # free. (Not the containers' rows: their work is in the VM, and the gate
 # inside a container checks its own steps. `sleep` does not count: a
 # step that only sleeps is waiting.)
+#
+# (0.25.4) A step that waits for a slot while the other steps' jobs hold
+# them all is waiting, not stalled: 0.25.2.2's and 0.25.3's release gates
+# stopped a fuzz row in the container so ("0 of 8 slots free (slots lost
+# with killed jobs?)") while the other 18 rows, on the same 8 slots, ran
+# to the end and passed: no slot was lost. So a still step is stopped
+# when a slot is free (it is not waiting for one: its own hang), or when
+# no step at all moved (ran, started, ended, or finished) for that long
+# (the slots are lost), the step still the longest first, one at a time;
+# its processes and what they wait on go to its log, and they get 10 s
+# from TERM to give their slots back before KILL.
 STALL=${VOLE_GATE_STALL:-600}
 case "$STALL" in ''|*[!0-9]*|0) STALL=600 ;; esac
 STALL_EVERY=15
 [ "$STALL" -ge 60 ] || STALL_EVERY=1
 STALL_NEXT=0
+# (0.25.4) When a step last moved: a signature of its changed, or it ended.
+LAST_MOVE=$(date +%s)
 
 # The processes: pid, parent, CPU time, command (ps; in a container
 # without ps, /proc).
@@ -787,9 +846,49 @@ kill_tree() { # <pid>
     [ -n "$kt" ] || return 0
     # shellcheck disable=SC2086
     kill -TERM $kt 2>/dev/null
-    sleep 2
+    # (0.25.4) up to 10 s for them to end: a job's trap gives its slot back
+    # once its command has ended, which KILL would lose
+    kw=0
+    while [ $kw -lt 10 ]; do
+        alive=""
+        for p in $kt; do
+            kill -0 "$p" 2>/dev/null && alive="$alive $p"
+        done
+        [ -n "$alive" ] || return 0
+        sleep 1
+        kw=$((kw + 1))
+    done
     # shellcheck disable=SC2086
-    kill -KILL $kt 2>/dev/null
+    kill -KILL $alive 2>/dev/null
+}
+
+# (0.25.4) The processes below pid $1, one a line: pid, parent, state,
+# what it waits on (the kernel's wchan), command; what a stopped step's
+# log shows of it.
+proc_states() { # <pid>
+    if command -v ps >/dev/null 2>&1; then
+        ps -A -o pid= -o ppid= -o stat= -o wchan= -o comm= 2>/dev/null
+    elif [ -d /proc/self ]; then
+        for f in /proc/[0-9]*/stat; do
+            d=${f%/stat}
+            w=$(cat "$d/wchan" 2>/dev/null)
+            awk -v w="${w:--}" '{
+                l = $0; i = index(l, "("); j = 0
+                for (k = length(l); k > i; k--) if (substr(l, k, 1) == ")") { j = k; break }
+                if (j == 0) next
+                split(substr(l, j + 2), f, " ")
+                print $1, f[2], f[1], w, substr(l, i + 1, j - i - 1)
+            }' "$f" 2>/dev/null
+        done
+    fi | awk -v root="$1" '
+        { parent[$1] = $2; line[$1] = $0 }
+        END {
+            for (p in parent) {
+                q = p
+                while ((q in parent) && q != root && q > 1) q = parent[q]
+                if (q == root) print line[p]
+            }
+        }' | sort -n
 }
 
 check_stalls() {
@@ -816,21 +915,51 @@ check_stalls() {
             }
             for (i = 1; i <= n; i++) { split(r[i], kv, "="); print kv[1], (kv[1] in sig ? sig[kv[1]] : "") }
         }' >"$RUN/stall.sigs"
+    still=""
+    oldest=""
     while read -r s sig; do
         if [ ! -f "$RUN/$s.sig" ] || [ "$(cat "$RUN/$s.sig")" != "$sig" ]; then
             printf '%s\n' "$sig" >"$RUN/$s.sig"
             echo "$t" >"$RUN/$s.sigt"
+            LAST_MOVE=$t
             continue
         fi
-        [ $(( t - $(cat "$RUN/$s.sigt") )) -ge "$STALL" ] || continue
-        free=$(free_slots)
-        why="stalled: no process of it ran, started or ended for $STALL s, with $free of $JOBS slots free$([ "$free" = 0 ] && echo ' (slots lost with killed jobs?)'); stopped"
-        [ $INSIDE -eq 1 ] || echo "  $s: $why" >&2
-        kill_tree "$(cat "$RUN/$s.pid")"
-        echo "--- $s: $why" >>"$RUN/$s.log"
-        echo "$why" >"$RUN/$s.stalled"
-        echo "1 $(( t - $(cat "$RUN/$s.start") ))" >"$RUN/$s.status"
+        since=$(cat "$RUN/$s.sigt")
+        [ $(( t - since )) -ge "$STALL" ] || continue
+        still="$still $s"
+        [ -n "$oldest" ] && [ "$since" -ge "$oldest_since" ] || { oldest=$s; oldest_since=$since; }
     done <"$RUN/stall.sigs"
+    [ -n "$still" ] || return 0
+    free=$(free_slots)
+    case "$free" in ''|*[!0-9]*) free_n=0 ;; *) free_n=$free ;; esac
+    if [ "$free_n" -gt 0 ]; then
+        # (a slot is free: the still steps do not wait for one)
+        for s in $still; do
+            stop_step "$s" "stalled: no process of it ran, started or ended for $STALL s, with $free of $JOBS slots free; stopped"
+        done
+    elif [ $(( t - LAST_MOVE )) -ge "$STALL" ]; then
+        # (no slot free and nothing moved: the slots are lost, or held by
+        # the still steps' jobs; the one still the longest first)
+        stop_step "$oldest" "stalled: no process of it or of any other step ran, started or ended for $STALL s, with 0 of $JOBS slots free (lost with a job killed by -9, or held by its jobs); stopped"
+        LAST_MOVE=$t
+    fi
+}
+
+# (0.25.4) Stops step $1, failed, for reason $2: what its processes wait
+# on to its log, then TERM (and KILL) to them.
+stop_step() { # <step> <why>
+    [ $INSIDE -eq 1 ] || echo "  $1: $2" >&2
+    # (what they wait on, read before they are stopped; written after, as
+    # their own last words go to the log too)
+    proc_states "$(cat "$RUN/$1.pid")" >"$RUN/$1.procs" 2>&1
+    kill_tree "$(cat "$RUN/$1.pid")"
+    {
+        echo "--- $1: $2"
+        echo "--- its processes (pid, parent, state, waiting in, command):"
+        cat "$RUN/$1.procs"
+    } >>"$RUN/$1.log" 2>&1
+    echo "$2" >"$RUN/$1.stalled"
+    echo "1 $(( $(now) - $(cat "$RUN/$1.start") ))" >"$RUN/$1.status"
 }
 
 mmss() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
@@ -857,6 +986,7 @@ poll() {
         if [ -f "$RUN/$s.status" ]; then
             read -r _ secs <"$RUN/$s.status"
             REPORTED="$REPORTED $s"
+            LAST_MOVE=$(now)
             [ $INSIDE -eq 1 ] || printf '  %-16s %-5s %6s   (at %s)\n' "$s" "$(result_of "$s")" "$(mmss "$secs")" "$(mmss $(( $(now) - GATE_START )))"
         else
             RUNNING=$((RUNNING + 1))

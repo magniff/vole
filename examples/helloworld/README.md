@@ -8,12 +8,14 @@ From this folder (with `volec` on your `PATH`, or `../../target/volec`
 after `bootstrap/bootstrap.sh`):
 
 ```sh
-volec main.vl -o helloworld && ./helloworld
+volec run                                   # build main.vl (when it changed), run it
+volec main.vl -o helloworld && ./helloworld # the executable itself, here
 ```
 
 `volec` compiles the program and links it with the system's C compiler
-(`cc`, or `$VOLE_CC`). `-o helloworld.o` makes an object instead, and
-`-o helloworld.s` assembly.
+(`cc`, or `$VOLE_CC`); `volec run` keeps the executable in volec's cache
+(`volec run examples/helloworld` from the tree's root). `-o
+helloworld.o` makes an object instead, and `-o helloworld.s` assembly.
 
 ## Expected output
 

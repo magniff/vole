@@ -53,12 +53,13 @@ ADA LOVELACE al 211 true
 
 ## String constants
 
-String constants come in three forms:
+String constants come in four forms:
 
 | form | what it is |
 |---|---|
+| `const X: str = "...";` | text, a value: each use is the literal (0.25.4); a text block too |
 | `const X: [u8] = "...";` | bytes; a text block (`"""`, `guide syntax#lexical`), `include_str("f.wgsl")` and `include_bytes("f.bin")` too |
-| `static X: str = "...";` | text: a `str` is a static's (`const X: str` is an error whose fix is this) |
+| `static X: str = "...";` | text in a place, one address for every use, as any static |
 | `static X: [str; N] = ["a", "b"];` | an array of them (`const` too): `X[i]` is one, `X[..]` the slice; `[str]`, without the length, is refused |
 
 What turns one form into another:
@@ -82,7 +83,7 @@ const SHADER: [u8] = """
     @compute @workgroup_size(1)
     fn main() {}
     """;
-static NAME: str = "vole";
+const NAME: str = "vole";
 static DAYS: [str; 3] = ["mon", "tue", "wed"];
 
 fn main(gpa: Gpa) {
@@ -102,4 +103,37 @@ fn main(gpa: Gpa) {
 ```out
 vole: 3 days, 7 bytes
 4 2 3
+```
+
+## Numbers as text without an allocator
+
+`format_in(f"{v:.2}", gpa)` allocates a `Buf`; a loop that writes a
+number every frame (a UI's label) writes it into a stack array instead.
+`std::num::fmt_f64(v, decimals, &out)` (0.25.4) writes `{v:.N}`'s text
+byte for byte at the end of a `[u8; 32]` and returns where it starts:
+the exact value rounded to the nearest, a tie to the even digit (`2.5`
+to 0 decimals is `2`, as C's `%.0f` and Rust's `{:.0}`), `-0.00`,
+`NaN`, `inf`; `decimals` from 0 to `FIXED_DECIMALS_MAX` (20); a text
+longer than 32 bytes is `{v:e}`'s. An `f32` is `fmt_f64(x as f64, ..)`.
+`fmt_i64(v, &out)` and `fmt_u64` do the same for integers into a
+`[u8; 20]` (`guide formatting#numbers`).
+
+```vole
+use std::num::{fmt_f64, fmt_i64};
+
+fn main() {
+    var out: [u8; 32] = [0; 32];
+    let at = fmt_f64(3.14159, 2, &out);
+    println(out[at..32]);
+    let at2 = fmt_f64(-0.5, 0, &out);
+    println(out[at2..32]);
+    var digits: [u8; 20] = [0; 20];
+    let i = fmt_i64(-42, &digits);
+    println(digits[i..20]);
+}
+```
+```out
+3.14
+-0
+-42
 ```
