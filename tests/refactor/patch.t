@@ -64,7 +64,7 @@ try: volec query show sum_to
 [exit 1]
 $ edit patch clamp --old 'return lo;' --new 'return true;'
 calc.vl:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::calc::clamp]
-error edit.breaks: 1 new error; nothing written
+error edit.breaks: 1 new error; nothing written; the error: calc.vl:6:16: expected 'i64', got 'bool'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
 try: volec edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
@@ -173,7 +173,7 @@ $ edit delete calc.vl:4 --dry-run
 -}
 -
 main.vl:4:12: error[type error] unresolved import 'calc::clamp'
-warning edit.breaks: 1 new error (dry run)
+warning edit.breaks: 1 new error (dry run); the error: main.vl:4:12: unresolved import 'calc::clamp'
 [exit 1]
 $ edit patch calc.vl:13 --old 'v' --new 'w'
 error patch.no-match: OLD 1 is not in calc.vl:13; no line is near it
@@ -262,7 +262,7 @@ $ edit replace crate::use --dry-run < $T/inputs/use_alias.vl
 -use calc::{clamp, sum_to};
 main.vl:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: volec fix --suggested main.vl  [in crate::main]
 main.vl:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;` | try: volec fix --suggested main.vl  [in crate::main]
-warning edit.breaks: 2 new errors (2 in crate::main, which the edit does not change) (dry run)
+warning edit.breaks: 2 new errors (2 in crate::main, which the edit does not change) (dry run); the first: main.vl:7:13: undefined variable 'clamp'
 [exit 1]
 $ edit delete crate::header
 deleted crate::header	main.vl	+0 -1 lines

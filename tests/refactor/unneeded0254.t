@@ -20,6 +20,7 @@ main.vl:47	block	crate::three	other	missing both	none (unneeded)
 main.vl:48	block	crate::three	other	missing both	none (unneeded)
 main.vl:57	block	crate::main	other	missing both	none (unneeded)
 sites: 14 (13 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 13; unneeded: 12
+try: volec fix --only unneeded-unsafe
 $ fix --only unneeded-unsafe --diff
 fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	main.vl	+12 -20 lines
 --- a/main.vl
@@ -75,3 +76,4 @@ main.vl:27	block	crate::two	other	missing both	none (unneeded)
 main.vl:32	block	crate::two	ffi	missing both	c-call(strlen)
 main.vl:39	block	crate::three	other	justified	none (unneeded)
 sites: 4 (3 blocks, 0 unsafe fns, 1 extern blocks); unjustified: 3; unneeded: 2
+try: volec fix --only unneeded-unsafe

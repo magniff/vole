@@ -110,7 +110,7 @@ try: volec query def crate::geom::scale
 $ refactor rename geom::area p
 main.vl:11:19: error[type error] cannot call non-function type 'Point'  [edited: crate::main]
 shapes.vl:7:29: error[type error] cannot call non-function type 'Point'  [edited: crate::shapes::perimeter]
-error edit.breaks: 2 new errors; nothing written
+error edit.breaks: 2 new errors; nothing written; the first: main.vl:11:19: cannot call non-function type 'Point'
 try: volec refactor rename geom::area p --no-check
 [exit 1]
 % git status --short

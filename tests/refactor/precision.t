@@ -77,7 +77,7 @@ $ edit wrap sum_to --in '' --lines 17-21 --dry-run
 $ edit wrap sum_to --in '' --lines 16
 calc.vl:21:9: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
 calc.vl:24:5: error[type error] undefined variable 'total'  [edited: crate::calc::sum_to]
-error edit.breaks: 2 new errors; nothing written
+error edit.breaks: 2 new errors; nothing written; the first: calc.vl:21:9: undefined variable 'total'
 try: volec edit wrap sum_to --in '' --lines 16 --no-check
 [exit 1]
 $ edit wrap sum_to --in loop --lines 30-31
@@ -139,7 +139,7 @@ $ refactor signature scale --type k i16 --default '$k as i16' --dry-run
 +pub fn scale(v: i64, k: i16) -> i64 {
 $ refactor signature scale --type k i16
 main.vl:11:36: error[type error] expected 'i16', got 'i32' | help: only widening is implicit: convert explicitly | try: n as i16  [in crate::main]
-error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
+error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written; the error: main.vl:11:36: expected 'i16', got 'i32'
 note edit.refactor: the uses of crate::calc::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::calc::scale --type k i16 --default '$k as i16'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
@@ -154,7 +154,7 @@ try: volec refactor signature NAME --type x T --default EXPR
 $ edit patch lib/inner.vl --old 'use crate::calc::clamp;' --new '' --no-check
 lib/inner.vl:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: volec fix --suggested main.vl  [in crate::lib::inner::double]
 patched crate::lib::inner	lib/inner.vl	+0 -1 lines
-warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check)
+warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check); the error: lib/inner.vl:4:5: undefined variable 'clamp'
 try: volec check
 $ fix --in crate::lib --dry-run
 --- a/lib/inner.vl
