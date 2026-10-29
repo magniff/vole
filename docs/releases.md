@@ -93,6 +93,11 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   from `guide gpu`'s `RawSurface::Headless`.
 - `guide window`: the scale is the window's (`Size`, `Resize`), not the
   surface's; `Surface` has no `scale`, and the mouse example keeps it.
+- `guide testing`: a `#[test]` sees its module's private functions and
+  methods and every field (fields are as visible as their struct), with
+  a two-file example; tests/guide/run.sh now runs `volec test` on a
+  guide program with `#[test]`s, so their bodies are checked and run (a
+  build leaves them out).
 
 ### What's new in 0.25.3
 

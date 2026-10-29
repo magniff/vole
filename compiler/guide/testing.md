@@ -59,6 +59,63 @@ fn main() -> i32 {
 - `assert_snapshot(x)` compares `{x:?}` with
   `tests/snapshots/MODULE__TEST__N.snap`; the first run writes it, a
   change fails with the first differing line, `--accept` rewrites it.
+- A `#[test]` sees what its module sees: written in the
+  module it tests, it calls that module's private functions and
+  methods, and reads any field (a field is as visible as its struct:
+  `guide modules#visibility`), so a test of a widget's state needs no
+  `pub` and no accessor. From another module a private function is an
+  error (`'clamp01' is private`).
+
+```vole widget.vl
+// A slider: `drag` and `clamp01` are private to this module.
+pub struct Slider { active: bool, value: f64 }
+
+pub fn slider_new() -> Slider {
+    Slider { active: false, value: 0.0 }
+}
+
+impl Slider {
+    pub fn press(inout self, x: f64) {
+        self.active = true;
+        self.drag(x);
+    }
+
+    pub fn value(self) -> f64 { self.value }
+
+    fn drag(inout self, x: f64) {
+        if self.active {
+            self.value = clamp01(x);
+        }
+    }
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x }
+}
+
+#[test]
+fn a_press_starts_a_drag() {
+    var s = slider_new();
+    s.press(0.25);
+    assert(s.active); // the state behind the widget
+    s.drag(2.0); // a private method
+    assert(s.value == clamp01(2.0)); // a private function
+}
+```
+```vole main.vl
+mod widget;
+
+use widget::slider_new;
+
+fn main() {
+    var s = slider_new();
+    s.press(0.5);
+    println(s.value());
+}
+```
+```out
+0.5
+```
 
 ## A check must be able to fail
 
