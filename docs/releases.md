@@ -87,6 +87,10 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   satisfying the bound, naming both ways, with the fix (`fix
   --suggested`) that writes the bound's; 0.25.3 gave a type mismatch
   whose help was wrong ("this value has no place", `*R`, `&i64`).
+- `f"""` is an f-string text block: a text block's lines and dedent
+  with an f-string's holes, specs and `{{ }}`, quotes as text
+  (`guide syntax#lexical`); 0.25.3 said "newline in string literal".
+  The language server's completion reads text blocks as one literal.
 
 ### What's new in 0.25.3
 
