@@ -13,7 +13,8 @@
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
 # tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
 # (the book's examples and sessions, 0.25) and tests/link/run.sh
-# (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
+# (the link without cc, 0.25) and tests/perf/run.sh (--time-passes=instructions
+# and --vec-stats=FN, 0.25.5) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS)
 # and tests/runner/run.sh (the runner's own pieces, 0.25.2) and
 # tests/embed/run.sh (text blocks in a CRLF file, the caches and embedded
 # files, 0.25.3) and tests/stdpos/run.sh (std's positions in the
@@ -258,7 +259,7 @@ want() {
 # NAME)` is below (tests/runner/run.sh checks the two agree): what -l
 # lists. LEVELED: the ones that take -O (the others are the same at
 # every level).
-SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync"
+SUITES="query refactor guide book fmt walkthrough wgsl voltty own-try std-own std-moves runner embed-checks stdpos cachediff lsp link gpu hooks arch-gen arch-enc voltty_render window example_layout example_build readme_sync perf"
 LEVELED="gpu arch-gen"
 if [ "$LIST" = 1 ]; then
     all_cases | select_names | awk '{ print "case " $1 }'
@@ -953,6 +954,11 @@ esac
 case $(want link) in
     y) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
 esac
+# (0.25.5) The build's measuring options (tests/perf/run.sh:
+# --time-passes=instructions, --vec-stats=FN): category "perf".
+case $(want perf) in
+    y) "$ROOT/tests/perf/run.sh" -c "$COMPILER" >"$WORK/perf.out" 2>&1 & ;;
+esac
 # (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
 # (skipped elsewhere); category "gpu".
 case $(want gpu) in
@@ -1175,6 +1181,24 @@ case $(want link) in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/link.out" >>"$FAILURES"
+        ;;
+esac
+
+# The measuring options (0.25.5): tests/perf/run.sh (run above); category
+# "perf".
+case $(want perf) in
+    y)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "perf pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "perf fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/perf.out"
+        if ! grep -q '^pass' "$WORK/perf.out"; then
+            echo "perf fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/perf.out" >>"$FAILURES"
         ;;
 esac
 

@@ -162,7 +162,14 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
-READ='back::mc_arm64::atomic::A64_LSE_FLAG	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
+READ='base::timer::TIME_INSTRUCTIONS	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
+base::timer::PERF_FD	off: the same; opened by counters_open on the main thread before the tasks, read-only after
+base::timer::COUNTERS_OFF	off: the same (counters_open)
+middle::vectorize::VEC_STATS_FN	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
+gen0::gen::STATIC_NAMED	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
+middle::vecfacts::VEC_TMPL	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
+middle::vecfacts::WRAPS	key: the same (std'"'"'s Vec wrappers)
+back::mc_arm64::atomic::A64_LSE_FLAG	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
 arch::ARCH_USED	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
 back::isel::arch::ARCH_WORD_SYM	IR: set before the tasks (arch_after_lowering); a function reaches instruction selection with a CPUFEAT, which ir_hash covers, only in a program whose main fills std::ARCH_FEATURES, and the symbol is the same in every build
 front::conv::LEGACY_ROOT	key: set by the front end from the root file'"'"'s first line before the tasks, read-only after; a task reads it only for a diagnostic'"'"'s words, 0.19 or 0.20, which the code cache does not keep
@@ -364,11 +371,13 @@ mkdir -p "$WORK"
 } | sort -u >"$WORK/reached"
 [ -s "$WORK/reached" ] || { echo "threads-writes: query callees found nothing"; exit 1; }
 # Every static, as a query path.
-grep -rn --exclude-dir=.volec '^ *\(pub \)\{0,1\}static mut [A-Za-z_0-9]* *:' compiler/src | awk -F: '{
+# (0.25.5: `static var`, as statics are spelled now; `static mut` matched
+# nothing, and the checks passed on no static at all)
+grep -rn --exclude-dir=.volec '^ *\(pub \)\{0,1\}static \(mut\|var\) [A-Za-z_0-9]* *:' compiler/src | awk -F: '{
     file = $1; sub(/^compiler\/src\//, "", file); sub(/\.vl$/, "", file); sub(/\/mod$/, "", file)
     gsub(/\//, "::", file)
     line = $0; sub(/^[^:]*:[^:]*:/, "", line)
-    sub(/^ *(pub )?static mut /, "", line); sub(/ *:.*/, "", line)
+    sub(/^ *(pub )?static (mut|var) /, "", line); sub(/ *:.*/, "", line)
     print (file == "main" ? "crate" : "crate::" file) "::" line
 }' >"$WORK/statics"
 sed 's/^/query refs /; s/$/ --all/' "$WORK/statics" | "$COMPILER" batch >"$WORK/refs" 2>&1
