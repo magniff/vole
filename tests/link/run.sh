@@ -25,6 +25,9 @@
 #   internal    the executable runs, its signature verifies, and the same
 #               input gives the same bytes
 #   default     it is the default
+#   internal-sdk its LC_BUILD_VERSION names the running macOS as the SDK
+#               (0.25.5: with SDK 12.0, libmalloc's old free path made the
+#               compiler linked so 10x slower)
 #   internal-ld a program it does not take (an import libSystem lacks) is
 #               linked by ld, whose failure is link.undefined
 #   libsystem   libSystem has every name of link_macho's LIBSYSTEM
@@ -229,6 +232,15 @@ if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
         pass default
     else
         fail default "without --linker, not the internal linker's bytes: $(cat build.out)"
+    fi
+
+    # internal-sdk: the SDK is the running macOS's (major.minor)
+    sdk=$(otool -l prog.internal | awk '/cmd LC_BUILD_VERSION/ { b = 1 } b && $1 == "sdk" { print $2; exit }')
+    host=$(sw_vers -productVersion)
+    if [ "${sdk%.*}" = "${host%.*}" ] || [ "$sdk" = "$host" ] || [ "${sdk%.*}" = "$host" ]; then
+        pass internal-sdk
+    else
+        fail internal-sdk "LC_BUILD_VERSION's sdk is $sdk, the running macOS $host"
     fi
 
     # internal-ld
