@@ -19,7 +19,12 @@ seed (Rust)  ──builds──▶  0.1.0  ──builds──▶  next release  
   of `v0.1.0` also holds the seed, so that one tag has everything.
 - **Each release is built by the previous one**, and checked: it must reach
   the fixpoint (compiled by itself, it emits exactly what its first build
-  emits) and pass its own test suite.
+  emits) and pass its own test suite. (0.25.3) A tag cannot change, so a
+  case of its own that cannot pass where the chain runs it is listed in its
+  release's `known_failures` (releases.toml), with why; the suite then
+  passes only when it fails exactly so, and the chain's summary says it
+  (0.25.2.2: one hooks case, which takes the cache's `target/` path for a
+  scratch copy).
 
 `bootstrap/releases.toml` lists the seed's tag and the releases in order,
 with the tag, where the compiler's source is, what builds it, how its
@@ -220,6 +225,57 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   their summary line); an agent's own `volec fmt` gets the lines it
   changed (from `volec query diff`, at most 5). The hook itself formats
   nothing.
+- **The guide's gaps from the round 3 GPU eval** (eight that cost
+  agents turns), each with a compiled example: `guide gpu` opens with
+  a skeleton (the window loop, a compute pass, a render pass, a
+  readback through a `MAP_READ | COPY_DST` buffer) and a list of its
+  sections, the rest a section at a time (`guide gpu#NAME`) or
+  `--whole`. `gpu#handles`, where own.moved and own.move_out point:
+  which std::gpu objects move and which copy, keeping them in a struct
+  made by a `sink` constructor, a `Vec` or an array, using them in a
+  pass's closure, one of two by a flag. `gpu#ordering`: the dispatches
+  of one pass run in order, each seeing the writes of the ones before
+  (Metal's serial compute encoder; no barrier), with the cost of a
+  pass and a submit. `gpu#ping-pong`: two buffers, two bind groups, the
+  parity, every step in one pass, the state in the buffer written
+  last. `gpu#per-step-parameters`: why one uniform cannot vary across
+  the steps of one submit, and three ways with their costs (a submit a
+  step; a uniform range a step; a storage buffer of parameters indexed
+  by a step the GPU counts). `window#mouse-and-surface-size`: map the
+  mouse with `surf.width` and `.height`, which `configure` at each
+  `Resize` sets, never a size taken at the start.
+  `window#when-the-window-is-not-shown`: the 10 Hz timer's frames, and
+  timing headless instead (submit N, `wait_idle`, divide: throughput,
+  not latency). `text#string-constants`: `const X: [u8]`, `static X:
+  str`, `static X: [str; N]`, text blocks and `include_str`; what
+  `as_slice`, `as_bytes`, `format_in` and `extend_from_slice` turn
+  into what; what `panic` and `println` take. compiler/guide/embed.sh
+  writes a topic of more than 990 lines as several functions.
+- **The tools' cache, fixed**: `query show` (and `context`) of one of
+  std's items no longer crashes when it answers from the cache (SIGSEGV
+  every time, in 0.25.2.2 too: `query show parse_primary` in the
+  compiler, whose std has a `Front::parse_primary`). Its `// use` line
+  asks what `std::NAME` names, which the front end answers from its
+  scopes and its table of items' nodes; a program from the cache has
+  neither, and the answer read that table through a null pointer. The
+  cache now keeps those answers (its format 9: a cache of 0.25.2.2 is
+  not read, and is made again), the answers from it are the same as
+  without it, and the table is not read where it was not made
+  (tests/query/stdcache0253.q).
+
+- **A closure drops its by-value parameter** (a leak since 0.19, F20):
+  one given to an `FnMut(sink T)` bound (`map`, `for_each`, `fold`,
+  `Option::map`, `map_err`, `and_then`, `unwrap_or_else`, a program's
+  own) owns its argument and drops it at the end of its body unless the
+  body moves it out (returns it, pushes it, passes it on to a `sink`
+  parameter; on one path, by a drop flag); `|_|` drops it too. A closure
+  may say so itself, `|d: sink D|` (was `conv.sink_type`). A let
+  parameter still borrows, and a borrowing iterator's items (`w.iter()`,
+  a HashMap's) stay the container's: `own.iter_item_copy` is kept
+  (lifting it, `w.iter().collect_in(gpa)` still frees each element
+  twice). Fuzzed: semfuzz's `--closure-params` (in the gate's
+  `fuzz-sem`) and the argument sweep's `own_arg_temp_sweep_closure`
+  (1,680 cases); 12 XFAILs (the leaks, `|d: sink D|`) now pass.
 - **volec's command line on 0.25.2's std::cli**: the compiler is built by
   0.25.2.2, so the workarounds of compiler/src/cli/ for 0.25.1's std::cli
   are gone (line.vl 608 lines to 425): the line's words go to std::cli
