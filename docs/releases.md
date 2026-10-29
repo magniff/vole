@@ -131,6 +131,43 @@ std (std255):
   actions (as a shell runs a command: ^C ends the child, whose end this
   process reports). Breaking: a Command owns Vecs, so it moves.
 
+Code generation and measuring (codegen255):
+
+- A compiler linked by `volec ... -o X` (the internal Mach-O linker, the
+  default on aarch64-macos) ran its -O2 self-compile in about 10 times
+  the instructions of the same objects linked by `cc` (470G against 46G,
+  measured on 0.25.4). Not the -O level: the linker wrote the SDK version
+  12.0 in LC_BUILD_VERSION, and macOS's malloc keeps its older, slower
+  free path for a program built against an SDK before 13. The linker now
+  writes SDK 26.0 (the minimum OS stays 12.0); `tests/link/run.sh`'s
+  `internal-sdk` pins it. Programs that allocate much, linked by volec,
+  are faster the same way (docs/optimizer.md, "0.25.5").
+- A static whose initializer is all zero bytes and that can be written
+  (a `static var`, or one holding a cell) goes in bss: `__DATA,__bss`
+  (zerofill) on Mach-O, `.bss` (NOBITS) on ELF, in both the system
+  assembler's spelling and the in-process object writer and linker. A
+  hello world's -O2 object 9,864 bytes to 5,552; one with a
+  `[u8; 65536]` static 78,496 to 8,896 bytes and 145M to 105M
+  instructions to build. A constant `[x; N]` is evaluated once and
+  copied (a `[0; 65536]` cost 39M instructions). The internal linker's
+  chained fixups name the file's pages only (a bss page past them made
+  the kernel map other bytes into it). Test `static_bss`.
+- Statics no emitted function names are not written: a hello world 12
+  statics to 8 (std's stdin buffer and position, hash seeds), a
+  std-heavy program 43 to 15. Test `static_unnamed`.
+- `--time-passes=instructions` counts each phase in instructions retired,
+  from the system's counter (macOS: `proc_pid_rusage`'s
+  `ri_instructions`; Linux: `perf_event_open`, user space), without the
+  `clock()` replacement build docs/optimizer.md described; where Linux
+  refuses the counter it stops with `time.instructions` (`volec explain
+  time.instructions`). tests/perf (suite `perf`).
+- `--vec-stats=FN`: a line for each loop of FN at -O2, vectorized (lanes,
+  unroll) or the first reason it was not (a call, a gather, a branch, an
+  unknown trip count, a float carried between iterations, the cost
+  model, ...).
+- tests/threads_writes.sh had stopped checking anything when `static
+  mut` became `static var`; it checks the 197 statics tasks touch again.
+
 The hooks, the test harness and the guide (loop255, feedbacks/DIGEST-0.25.4.md §1 and §3):
 
 - The check and turn-end hooks check with the tree's std: `volec check`

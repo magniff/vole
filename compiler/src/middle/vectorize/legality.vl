@@ -152,8 +152,33 @@ pub fn is_unreachable_exit(cx: sink *FnCtx, l: i64, b: i64) -> bool {
     unsafe { !loop_contains(cx, l, b) && cx.blocks[b].term == Term::Unreach }
 }
 
+// (0.25.5) --vec-stats=FN: says why the loop is not vectorized (the first
+// reason found), and returns false.
+pub fn why(cx: sink *FnCtx, reason: *u8) -> bool {
+    // UNSAFE: cx is the pass's raw *FnCtx (every pass takes it so).
+    // SAFETY: cx points at the function's live context for the whole pass,
+    // and nothing else holds it while the pass writes these two fields.
+    unsafe {
+        cx.v_why = reason;
+        cx.v_why_inst = 0;
+    }
+    false
+}
+
+// The same, at instruction v.
+fn why_at(cx: sink *FnCtx, reason: *u8, v: i64) -> bool {
+    // UNSAFE: cx is the pass's raw *FnCtx (every pass takes it so).
+    // SAFETY: cx points at the function's live context for the whole pass,
+    // and nothing else holds it while the pass writes these two fields.
+    unsafe {
+        cx.v_why = reason;
+        cx.v_why_inst = v;
+    }
+    false
+}
+
 // Classifies the instructions of loop l; false when it cannot be
-// vectorized.
+// vectorized (0.25.5: the reason in cx.v_why, for --vec-stats=FN).
 pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
     unsafe {
         cx.vstamp += 1;
@@ -165,20 +190,28 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
         cx.v_checks.count = 0;
         cx.v_access.count = 0;
         cx.v_reds.count = 0;
+        cx.v_why = 0 as *u8;
+        cx.v_why_inst = 0;
         let h = loop_header(cx, l);
         let latch = loop_latch(cx, l);
-        if cx.blocks[h].novec != 0 || is_cold_block(cx, h) || latch == 0
-            || loop_preheader(cx, l) == 0
-            || cx.blocks[latch].term != Term::Branch {
-            return false;
+        if cx.blocks[h].novec != 0 {
+            return why(cx, c"a vector loop's scalar rest");
+        }
+        if is_cold_block(cx, h) {
+            return why(cx, c"cold (on a path to a panic or marked #[cold])");
+        }
+        if latch == 0 || loop_preheader(cx, l) == 0 || cx.blocks[latch].term != Term::Branch {
+            return why(cx, c"not in canonical form: no preheader, or no one latch that branches");
         }
         var iv = 0;
         var step = 0;
         var n = 0;
         var ne = false;
-        if !counted_loop(cx, l, &iv, &step, &n, &ne) || step != 1
-            || int_bits(cx.insts[iv].ty) != 64 {
-            return false;
+        if !counted_loop(cx, l, &iv, &step, &n, &ne) {
+            return why(cx, c"an unknown trip count: not a loop over a counter to a bound");
+        }
+        if step != 1 || int_bits(cx.insts[iv].ty) != 64 {
+            return why(cx, c"its counter steps by other than 1, or is not 64 bits wide");
         }
         cx.v_iv = iv;
         cx.v_n = n;
@@ -204,26 +237,27 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
                     next = s1;
                 }
                 if next == 0 || cx.blocks[next].preds.count != 1 || !record_check(cx, l, b, next) {
-                    return false;
+                    return why(cx,
+                        c"a branch in its body that is no bounds check (an if, a break)");
                 }
                 b = next;
             } else {
-                return false;
+                return why(cx, c"a branch in its body that is no bounds check (an if, a break)");
             }
             count += 1;
             if count > 32 {
-                return false;
+                return why(cx, c"more than 32 blocks in its body");
             }
         }
         if cx.v_chain.count != loop_size(cx, l) {
-            return false;
+            return why(cx, c"a branch in its body that is no bounds check (an if, a break)");
         }
         // The exit at the latch.
         let s0 = cx.blocks[latch].s0;
         let s1 = cx.blocks[latch].s1;
         let e = if s0 == h { s1 } else { s0 };
         if loop_contains(cx, l, e) || cx.blocks[e].preds.count != 1 {
-            return false;
+            return why(cx, c"its exit is reached from elsewhere too");
         }
         exit = e;
         let latch_cond = ir_val(cx, cx.blocks[latch].cond);
@@ -232,10 +266,17 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
         while phi != 0 && cx.insts[phi].op == Phi {
             if phi != iv {
                 let next = ir_val(cx, ir_arg(cx, phi, pred_index(cx, h, latch)));
-                if !is_integer(cx.insts[phi].ty) || class_of(cx, next) != 0
+                if !is_integer(cx.insts[phi].ty) {
+                    return why_at(cx,
+                        c"a float carried from one iteration to the next (a float sum: lanes would add in another order)",
+                        phi);
+                }
+                if class_of(cx, next) != 0
                     || cx.insts[next].block == 0
                     || !loop_contains(cx, l, cx.insts[next].block) {
-                    return false;
+                    return why_at(cx,
+                        c"a value carried from one iteration to the next that is no integer reduction",
+                        phi);
                 }
                 let op = cx.insts[next].op;
                 // (0.15) A minimum or maximum: k ? z : r (or k ? r : z), k an
@@ -243,7 +284,9 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
                 // are).
                 if op == Op::Sel {
                     if !is_minmax(cx, phi, next) || !use_elem(cx, cx.insts[phi].ty) {
-                        return false;
+                        return why_at(cx,
+                            c"a value carried from one iteration to the next that is no minimum or maximum it can vectorize",
+                            next);
                     }
                     set_class(cx, phi, VC_VECTOR);
                     cx.v_reds.push(phi);
@@ -253,16 +296,21 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
                     continue;
                 }
                 if op != Add && op != Sub && op != Mul && op != And && op != Or && op != Xor {
-                    return false;
+                    return why_at(cx,
+                        c"a value carried from one iteration to the next that is no sum, product, and, or, xor, minimum or maximum",
+                        next);
                 }
                 let a = ir_val(cx, cx.insts[next].a);
                 let bb = ir_val(cx, cx.insts[next].b);
                 if !(a == phi || (bb == phi && op != Sub)) || a == bb
                     || cx.insts[next].ty != cx.insts[phi].ty {
-                    return false;
+                    return why_at(cx,
+                        c"a value carried from one iteration to the next that is no sum, product, and, or, xor, minimum or maximum",
+                        next);
                 }
                 if !use_elem(cx, cx.insts[phi].ty) {
-                    return false;
+                    return why_at(cx,
+                        c"a reduction of a type of another width than the loop's elements", phi);
                 }
                 set_class(cx, phi, VC_VECTOR);
                 cx.v_reds.push(phi);
@@ -280,9 +328,12 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
             while v != 0 {
                 total += 1;
                 if total > VEC_MAX_INSTS {
-                    return false;
+                    return why(cx, c"too big: more than 160 instructions");
                 }
                 if !classify(cx, l, v, latch_cond) {
+                    if cx.v_why == 0 as *u8 {
+                        why_at(cx, c"an operation it has no vector form for", v);
+                    }
                     return false;
                 }
                 v = cx.insts[v].next;
@@ -290,12 +341,12 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
         }
         cx.v_size = total;
         if cx.v_elem == 0 {
-            return false;
+            return why(cx, c"no load or store of consecutive elements");
         }
         cx.v_vf = 16 / type_size(cx.v_elem);
         cx.v_vt = vector_type(lane_type(cx.v_elem), cx.v_vf);
         if cx.v_vt == 0 {
-            return false;
+            return why(cx, c"no vector type for its elements");
         }
         // The reductions' phis are used by their next values alone, and the
         // loop's values used after it are reductions' (LCSSA: the exit's
@@ -307,7 +358,7 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
             let also = if cx.insts[next].op == Op::Sel { ir_val(cx, cx.insts[next].a) }
                 else { next };
             if !uses_only(cx, l, p, next, also) {
-                return false;
+                return why_at(cx, c"a reduction's running value used inside the loop", p);
             }
         }
         var x = cx.blocks[e].first;
@@ -318,7 +369,9 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
             if !invariant_in(cx, l, w) && reduction_of_next(cx, w) < 0
                 && (class_of(cx, w) != VC_UNIFORM || coef(cx, l, w) == NONAFFINE
                     || loads_in(cx, l, w)) {
-                return false;
+                return why_at(cx,
+                    c"a value used after the loop that is no reduction and no step of the counter",
+                    w);
             }
             x = cx.insts[x].next;
         }
@@ -328,16 +381,18 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
         for k in 0..cx.v_checks.count / 3 {
             if coef(cx, l, cx.v_checks.data[3 * k + 1]) != 1
                 || loads_in(cx, l, cx.v_checks.data[3 * k + 1]) {
-                return false;
+                return why(cx,
+                    c"a bounds check on an index that is not the counter plus a constant, or depends on a load in the loop");
             }
         }
         for k in 0..cx.v_access.count / 3 {
             if loads_in(cx, l, cx.v_access.data[3 * k + 1]) {
-                return false;
+                return why_at(cx, c"an access address that depends on a load in the loop",
+                    cx.v_access.data[3 * k]);
             }
         }
         if overlap_pairs(cx) > VEC_MAX_OVERLAPS {
-            return false;
+            return why(cx, c"too many pairs of accesses to test for overlap (more than 16)");
         }
         true
     }
@@ -490,8 +545,13 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
                 set_class(cx, v, VC_UNIFORM);
                 return true;
             }
-            if c != type_size(ty) || !use_elem(cx, ty) {
-                return false;
+            if c != type_size(ty) {
+                return why_at(cx,
+                    c"a load whose address does not step by its size each iteration (a stride, or an index loaded or computed)",
+                    v);
+            }
+            if !use_elem(cx, ty) {
+                return why_at(cx, c"elements of two widths (one vector type per loop)", v);
             }
             cx.v_access.push(v);
             cx.v_access.push(addr);
@@ -502,9 +562,16 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
         if op == Store {
             let ty = cx.insts[v].imm2;
             let addr = ir_val(cx, cx.insts[v].a);
-            if coef(cx, l, addr) != type_size(ty) || !use_elem(cx, ty)
-                || !vector_operand_ok(cx, l, cx.insts[v].b) {
-                return false;
+            if coef(cx, l, addr) != type_size(ty) {
+                return why_at(cx,
+                    c"a store whose address does not step by its size each iteration (a stride, or an index loaded or computed)",
+                    v);
+            }
+            if !use_elem(cx, ty) {
+                return why_at(cx, c"elements of two widths (one vector type per loop)", v);
+            }
+            if !vector_operand_ok(cx, l, cx.insts[v].b) {
+                return why_at(cx, c"a stored value it cannot compute in vector lanes", v);
             }
             cx.v_has_store = true;
             cx.v_access.push(v);
@@ -546,6 +613,12 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
             let ty = cx.insts[v].ty;
             let ok_op = op == Add || op == Sub || op == Mul || op == And || op == Or || op == Xor
                 || op == Neg || (op == Div && is_float(ty));
+            if op == Op::Shl {
+                // (an index scaled to an address: a[idx[i]])
+                return why_at(cx,
+                    c"an address computed from a value loaded in the loop (a gather, a[idx[i]])",
+                    v);
+            }
             if !ok_op || (is_float(ty) && (op == And || op == Or || op == Xor))
                 || !use_elem(cx, ty) {
                 return false;
@@ -563,12 +636,13 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
         if op.is_pure() || op == Const {
             if op == Op::Cmp || cx.insts[v].ty == TY_BOOL {
                 // (A comparison that is no check: control flow, or a value.)
-                return false;
+                return why_at(cx, c"a comparison that is no bounds check and selects nothing", v);
             }
             set_class(cx, v, VC_UNIFORM);
             return true;
         }
-        false
+        // (0.25.5: a call, an atomic, a division of integers...)
+        why_at(cx, c"an operation it has no vector form for", v)
     }
 }
 
