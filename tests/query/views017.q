@@ -62,6 +62,8 @@ Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
 Vec<SourceLine>::as_slice	views(self) declared
+Vec<[u8]>::as_slice	views(self) declared
+Vec<*u8>::as_slice	views(self) declared
 Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<Req>::as_slice	views(self) declared
@@ -123,6 +125,7 @@ Vec<InputInfo>::push	views()
 Vec<i64>::push	views()
 Vec<BindingInfo>::push	views()
 Vec<u32>::push	views()
+Vec<*u8>::push	views()
 Vec<Event>::push	views()
 Vec<State>::push	views()
 Vec<Watch>::push	views()
@@ -149,10 +152,10 @@ std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:531:12	meth
 std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:368:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
 crate::count	views017/main.vl:32:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64
-std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
-<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
+std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:388:8	trait-method	fn count(self) -> u64
+<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:394:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
 std::gpu::timing::QuerySet::count	../../compiler/std/gpu/timing.vl:37:12	method	pub fn count(self) -> i64	effects: none
-<std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
+<std::string::Chars as Iterator>::count	../../compiler/std/string.vl:756:8	method	fn count(sink self) -> i64	effects: panic diverge
 std::cli::Matches::count	../../compiler/std/cli.vl:1417:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
