@@ -69,9 +69,21 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.2.2 | `v0.25.2.2` | 0.25.2.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the second GPU eval: a `requires` call's `?` arguments kept to the call; std::gpu layouts per entry point, `gpu.unwritten`, more storage formats, limits named; integer methods; ten diagnostics; `query show` across programs; the hooks quieter and clearer |
 
 | 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
+| 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.25.4
+
+`volec run`, the pathtrace laboratory's feedback (feedbacks/pathtrace-ui.md),
+the bugs carried from 0.25.3, std's unsafe justified to the last site, and
+the start of compiler/src's modernization (docs/design/modernize-0254.md:
+its plan, its first three steps and the first tables). Language changes to
+review: `const X: str` is allowed; an array of unsuffixed literals takes
+the other side's type; `f"""` text blocks; a closure's `|x: sink T|` and
+its Fn bound must agree. Breaking: std's `sys_poll` and `__io_error`
+signatures, and `#[sealed]` on std's thread and sync handles (below).
+compiler/src's unsafe: 5,380 sites (5,316 unjustified) in 0.25.3, 4,489
+(4,365) now; std's: 1,204 (1,194), 893 (0).
 
 - `const X: str = "...";` is allowed: text, a constant, each use the
   literal, as a `[u8]` constant's is (`guide text#string-constants`).
@@ -182,7 +194,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `tests/gpu/cases/timestamp_query.vl` checks that a kernel looping 8
   times longer measures longer (the ratio of medians), and
   `guide gpu#timing-gpu-work` uses them.
-- (mod254) `volec fix --only unneeded-unsafe`: the unsafe blocks with
+- `volec fix --only unneeded-unsafe`: the unsafe blocks with
   nothing unsafe inside (`volec query unsafe`'s `none (unneeded)`) taken
   away, the code in them kept in its scope (a block on lines of its own
   becomes its lines, one level less indented; a block on one line its
@@ -194,7 +206,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   bugs254 (docs/unsafe-baseline.md), every compilation of the corpus
   byte-identical (`volec same-output`). The plan for the rest of
   compiler/src's modernization: docs/design/modernize-0254.md.
-- (table254) **`volec refactor table X`** (modernize-0254.md step 3):
+- **`volec refactor table X`** (modernize-0254.md step 3):
   a raw table, `static var X: *T` with its X_COUNT and X_CAP grown by
   `grow`, becomes `static var X: Vec<T, Comp>` with every use: the grow
   goes, a store and its increment are `X.push(v)`, X_COUNT is `X.len()`,
@@ -230,7 +242,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/refactor/run254.t).
 - The words after `--` reach a command as they are: `--json`,
   `--values=...` and `--help` there were volec's own before.
-- **std's unsafe, every site justified** (stdunsafe254): `volec query
+- **std's unsafe, every site justified**: `volec query
   unsafe std --summary` went from 1204 sites (1194 without `// UNSAFE:`
   and `// SAFETY:` above them, 13 unneeded) to 893 sites, 0 unjustified,
   3 reported unneeded (generic methods the query cannot see instantiated;
@@ -262,7 +274,7 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 - **std's core sections**: `Mutex`, `Once` and `Condvar` moved to a lazy
   section of their own ("Mutex, Once and Condvar (0.21)"), so a program
   that prints does not read them; core is 157436 bytes of 163840.
-- (opt254) **A Vec's header out of its loops** (-O2;
+- **A Vec's header out of its loops** (-O2;
   docs/optimizer.md, "0.25.4: Vec facts"; middle/vecfacts.vl): a let
   parameter's Vec does not change during the call, and a store to a
   Vec's element does not reach that Vec's ptr, len or cap, so GVN, LICM
