@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, ac3ec0d7. The gate's unsafe-audit row
+on Darwin arm64, 3d363629. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,119 +14,121 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 5315
-baseline std unjustified: 0
+baseline compiler/src unjustified: 4374
+baseline std unjustified: 1194
 
 ## compiler/src
 
 ```
-sites: 5421 (5370 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 5315; unneeded: 938
+sites: 4481 (4430 blocks, 10 unsafe fns, 41 extern blocks); unjustified: 4374; unneeded: 0
 
 class	sites	unjustified
-static-mut	2490	2420
-raw-pointer	1431	1412
-other	947	946
+static-mut	2490	2419
+raw-pointer	1429	1410
 ffi	304	293
 alloc	134	134
 transmute/cast	115	110
+other	9	8
 
 module	sites	unjustified
-crate::front	1930	1886
-crate::tools	1546	1497
-crate::back	760	757
-crate::middle	754	754
-crate::gen0	211	211
-crate::base	129	121
-crate::arch	70	70
-crate::guide	15	15
-crate	4	4
+crate::front	1694	1649
+crate::tools	1218	1169
+crate::middle	728	728
+crate::back	579	576
+crate::base	109	101
+crate::gen0	87	87
+crate::arch	51	51
+crate::guide	10	10
+crate	3	3
 crate::cli	2	0
 
 file	sites	unjustified
-compiler/src/front/own/drops.vl	86	85
-compiler/src/tools/lsp/complete.vl	81	81
-compiler/src/tools/lsp/answer.vl	66	64
-compiler/src/back/codecache/mod.vl	65	65
-compiler/src/gen0/x86_64.vl	65	65
-compiler/src/gen0/arm64.vl	58	58
+compiler/src/front/own/drops.vl	78	77
+compiler/src/tools/lsp/complete.vl	61	61
+compiler/src/tools/lsp/answer.vl	59	57
+compiler/src/back/codecache/mod.vl	57	57
 compiler/src/base/mod.vl	55	53
-compiler/src/tools/fixconv.vl	54	54
-compiler/src/front/own/views.vl	52	52
-compiler/src/front/own/state.vl	49	49
-compiler/src/base/diag.vl	48	46
-compiler/src/front/types.vl	47	46
-compiler/src/front/own/walk.vl	46	46
-compiler/src/middle/gvn.vl	46	46
-compiler/src/middle/parallel.vl	44	44
-compiler/src/tools/fixvalues.vl	43	43
-compiler/src/middle/inline.vl	42	42
-compiler/src/front/own/infer.vl	39	39
-compiler/src/front/own/moves.vl	39	33
-compiler/src/front/effects/infer.vl	38	38
-(341 more; --all lists every one)
+compiler/src/tools/fixconv.vl	50	50
+compiler/src/front/own/views.vl	45	45
+compiler/src/front/types.vl	44	43
+compiler/src/middle/gvn.vl	44	44
+compiler/src/middle/inline.vl	41	41
+compiler/src/middle/parallel.vl	39	39
+compiler/src/middle/loops.vl	38	38
+compiler/src/base/diag.vl	37	35
+compiler/src/front/own/state.vl	37	37
+compiler/src/tools/fixvalues.vl	37	37
+compiler/src/front/check/synth_mode.vl	36	32
+compiler/src/front/own/moves.vl	36	30
+compiler/src/front/own/walk.vl	34	34
+compiler/src/back/objfile/mod.vl	33	33
+compiler/src/front/conv.vl	33	32
+(328 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	5315	5315
-justified	106	0
+missing both	4374	4374
+justified	107	0
 ```
 
 ## std
 
 ```
-sites: 891 (669 blocks, 188 unsafe fns, 34 extern blocks); unjustified: 0; unneeded: 3
+sites: 1204 (977 blocks, 192 unsafe fns, 35 extern blocks); unjustified: 1194; unneeded: 13
 
 class	sites	unjustified
-ffi	456	0
-raw-pointer	317	0
-other	72	0
-alloc	38	0
-transmute/cast	5	0
-static-mut	3	0
+ffi	718	715
+raw-pointer	346	341
+other	90	89
+alloc	39	39
+static-mut	6	5
+transmute/cast	5	5
 
 module	sites	unjustified
-std::gpu	267	0
-std	123	0
-std::collections	118	0
-std::window	74	0
-std::sys	73	0
-std::slice	53	0
-std::sync	52	0
-std::objc	51	0
-std::fmt	22	0
-std::thread	18	0
-std::hash	8	0
-std::str	7	0
-std::iter	6	0
-std::io	5	0
-std::num	5	0
-std::env	3	0
-std::process	3	0
-std::random	2	0
-std::string	1	0
+std::gpu	473	471
+std	194	194
+std::collections	135	135
+std::window	77	70
+std::sys	74	74
+std::objc	63	63
+std::sync	54	54
+std::slice	53	53
+std::fmt	22	22
+std::thread	18	18
+std::io	10	10
+std::hash	8	8
+std::iter	8	7
+std::num	5	5
+std::env	3	3
+std::process	3	3
+std::random	2	2
+std::str	1	1
+std::string	1	1
 
 file	sites	unjustified
-compiler/std/gpu/hal/metal/bindings.vl	226	0
-compiler/std/sys.vl	73	0
-compiler/std/window/cocoa.vl	61	0
-compiler/std/collections/raw_table.vl	52	0
-compiler/std/flat/alloc.vl	41	0
-compiler/std/collections/btree_node.vl	38	0
-compiler/std/objc/mod.vl	29	0
-compiler/std/gpu/hal/metal/mod.vl	28	0
-compiler/std/sync/atomic.vl	25	0
-compiler/std/fmt.vl	22	0
-compiler/std/objc/foundation.vl	22	0
-compiler/std/std.vl	22	0
-compiler/std/slice.vl	21	0
-compiler/std/thread.vl	18	0
-compiler/std/collections/btree_map.vl	17	0
-compiler/std/slice/stable.vl	16	0
-compiler/std/flat/arch.vl	15	0
-compiler/std/sync/mod.vl	15	0
-compiler/std/flat/collections.vl	13	0
-compiler/std/window/objc.vl	13	0
-(26 more; --all lists every one)
+compiler/std/gpu/hal/metal/bindings.vl	396	396
+compiler/std/sys.vl	74	74
+compiler/std/window/cocoa.vl	64	57
+compiler/std/collections/raw_table.vl	53	53
+compiler/std/collections/btree_node.vl	52	52
+compiler/std/flat/test.vl	45	45
+compiler/std/flat/alloc.vl	43	43
+compiler/std/objc/foundation.vl	36	36
+compiler/std/gpu/wgsl/interp.vl	34	34
+compiler/std/sync/atomic.vl	29	29
+compiler/std/flat/fuzz.vl	28	28
+compiler/std/gpu/hal/metal/mod.vl	28	26
+compiler/std/objc/mod.vl	27	27
+compiler/std/fmt.vl	22	22
+compiler/std/std.vl	22	22
+compiler/std/slice.vl	21	21
+compiler/std/flat/arch.vl	20	20
+compiler/std/thread.vl	18	18
+compiler/std/collections/btree_map.vl	17	17
+compiler/std/slice/stable.vl	16	16
+(29 more; --all lists every one)
 
 justification	sites	unjustified
-justified	891	0
+missing both	1140	1140
+missing UNSAFE:	54	54
+justified	10	0
 ```

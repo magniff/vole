@@ -152,6 +152,18 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
   rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
   An existing file still gets the one-line note only.
+- (mod254) `volec fix --only unneeded-unsafe`: the unsafe blocks with
+  nothing unsafe inside (`volec query unsafe`'s `none (unneeded)`) taken
+  away, the code in them kept in its scope (a block on lines of its own
+  becomes its lines, one level less indented; a block on one line its
+  code, parenthesized where operators around could bind otherwise); a
+  block that declares and is not last, one with a string over several
+  lines, one whose comments say `UNSAFE:`/`SAFETY:` are left and counted.
+  Run over compiler/src: 938 blocks gone, the unjustified sites 5,315 to
+  4,377, before the merge of
+  bugs254 (docs/unsafe-baseline.md), every compilation of the corpus
+  byte-identical (`volec same-output`). The plan for the rest of
+  compiler/src's modernization: docs/design/modernize-0254.md.
 - **`volec run [DIR] [OPTIONS] [-- ARGS...]`** builds the program whose
   root is DIR/main.vl (DIR: the current directory when none is given)
   and runs it: stdin, stdout and stderr its own, the words after `--`
