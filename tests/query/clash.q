@@ -391,6 +391,7 @@ $ items sys
 17787	fn	pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32>
 17826	const	pub const SYS_SIGHUP: i32 = 1
 17827	const	pub const SYS_SIGINT: i32 = 2
+18303	const	pub const SYS_SIGQUIT: i32 = 3
 17828	const	pub const SYS_SIGKILL: i32 = 9
 17829	const	pub const SYS_SIGTERM: i32 = 15
 17835	struct	pub struct SysSpawnActions
@@ -402,6 +403,14 @@ $ items sys
 17875	method	pub fn close(inout self, fd: i32) -> Result<(), i32>
 17885	method	pub fn free(inout self)
 17908	fn	pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32>
+18393	fn	pub unsafe fn sys_spawn_attr(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions, attr: *SysSpawnAttr) -> Result<i32, i32>
+18420	struct	pub struct SysSpawnAttr
+18425	impl	impl Drop for SysSpawnAttr
+18426	method	fn drop(inout self)
+18443	fn	pub fn sys_spawn_sigdefault(sigs: [i32]) -> Result<SysSpawnAttr, i32>
+18476	struct	pub struct SysSignalWas
+18479	fn	pub fn sys_signal_ignore(sig: i32) -> SysSignalWas
+18488	fn	pub fn sys_signal_restore(was: SysSignalWas)
 17932	fn	pub fn sys_waitpid(pid: i32, nohang: bool) -> Result<(i32, i32), i32>
 17944	fn	pub fn sys_exit_code(status: i32) -> Option<i32>
 17949	fn	pub fn sys_exit_signal(status: i32) -> Option<i32>

@@ -60,6 +60,8 @@ Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
 Vec<SourceLine>::as_slice	views(self) declared
+Vec<[u8]>::as_slice	views(self) declared
+Vec<*u8>::as_slice	views(self) declared
 Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<Req>::as_slice	views(self) declared
@@ -121,6 +123,7 @@ Vec<InputInfo>::push	views()
 Vec<i64>::push	views()
 Vec<BindingInfo>::push	views()
 Vec<u32>::push	views()
+Vec<*u8>::push	views()
 Vec<Event>::push	views()
 Vec<State>::push	views()
 Vec<Watch>::push	views()
