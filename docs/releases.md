@@ -81,6 +81,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 - A closure's `let` parameter takes a value with no place (`f(make())`),
   lent as a temporary of the statement and dropped at its end, as a
   function's does; 0.25.3 said "this value has no place".
+- A closure whose parameter is taken another way than its `Fn` bound
+  gives it (`|r: sink R|` for `F: FnMut(R)`, `|r: R|` for
+  `FnMut(sink R)`, a let one for an `inout` one) is refused as not
+  satisfying the bound, naming both ways, with the fix (`fix
+  --suggested`) that writes the bound's; 0.25.3 gave a type mismatch
+  whose help was wrong ("this value has no place", `*R`, `&i64`).
 
 ### What's new in 0.25.3
 
