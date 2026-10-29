@@ -135,6 +135,8 @@ run_runners() {
             fi
         elif grep -q "^pass $name\\( \\|\$\\)" "$out" && ! grep -q "^FAIL $name\\( \\|:\\)" "$out"; then
             echo "pass $4_$name"
+        elif grep -q "^skip $name:" "$out"; then
+            echo "pass $4_$name (skipped by its runner here)"
         else
             echo "FAIL $4_$name: std's numbers moved, and the $kind transcript failed:"
             awk -v n="$name" '$2 == n || $2 == n ":" { p = ($1 == "FAIL") } p' "$out" | head -20 | sed 's/^/    /'
