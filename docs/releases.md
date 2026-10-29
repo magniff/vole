@@ -82,6 +82,17 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   (tests/run/std_num_fmt_f64.vl); `guide text#numbers-as-text-without-an-allocator`.
   examples/gpu/pathtrace uses it instead of its own `format_fixed`, and
   its camera's five C math calls are `f64` methods (no `unsafe` left).
+- **`guide gpu-render#drawing-over-the-image-you-just-made`**: an
+  overlay pass (`PassDesc::color(view, load: Load::Keep)`,
+  `Blend::alpha()`, a vertex layout of position, colour and uv, an
+  `R8Unorm` atlas with a white texel, text measured and drawn), compiled
+  and its pixels read back by `tests/run.sh guide`; from pathtrace's UI.
+- **`guide window#checking-the-pixels-headless`**: a windowed program's
+  frame drawn into `RawSurface::Headless`, read back and written as a
+  PPM (pathtrace's `--headless --ui` the worked example), pointed to
+  from `guide gpu`'s `RawSurface::Headless`.
+- `guide window`: the scale is the window's (`Size`, `Resize`), not the
+  surface's; `Surface` has no `scale`, and the mouse example keeps it.
 
 ### What's new in 0.25.3
 
