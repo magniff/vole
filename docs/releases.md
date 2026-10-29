@@ -193,12 +193,12 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   `--values=...` and `--help` there were volec's own before.
 - **std's unsafe, every site justified** (stdunsafe254): `volec query
   unsafe std --summary` went from 1204 sites (1194 without `// UNSAFE:`
-  and `// SAFETY:` above them, 13 unneeded) to 891 sites, 0 unjustified,
+  and `// SAFETY:` above them, 13 unneeded) to 893 sites, 0 unjustified,
   3 reported unneeded (generic methods the query cannot see instantiated;
   they are needed). docs/unsafe-baseline.md's std line is 0, so the gate
   fails on any new unjustified site in std. Per class: ffi 718 to 456,
-  raw-pointer 346 to 317, other 90 to 72, alloc 39 to 38, static-mut 6
-  to 3, transmute 5. `[T]::get`'s unchecked read stays (1.9x faster than
+  raw-pointer 346 to 317, other 90 to 72, alloc 39, static-mut 6
+  to 4, transmute 5. `[T]::get`'s unchecked read stays (1.9x faster than
   `s[i]` in a 400M-read loop at -O2).
 - **Soundness fixes in std**: `RecvIter` holds its own reference to the
   channel and has `Drop` (iterating after both ends were dropped read
@@ -206,8 +206,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   one leaked its handle); `strerror` and `ptsname` became `strerror_r`
   and `ptsname_r` (both raced between threads); `NsWindow::close` clears
   its view, layer and display link, so a closed window's methods do
-  nothing instead of using a released object; `STDIN`'s buffer is a
-  static array, no longer a `malloc` behind a raw pointer.
+  nothing instead of using a released object; stdin's buffer checks its
+  `malloc` for null (a static array instead made every program's object
+  64 KiB larger, and a hello world's build 1.46x dearer).
 - **Breaking, std's signatures**: `sys_poll(fds: inout [SysPollFd], ...)`
   (it writes `revents`; it took the slice by `let`); `__io_error(kind,
   msg: [u8])` and `io::Error` keeps a message index, not a C string;

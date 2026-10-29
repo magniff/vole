@@ -4,7 +4,7 @@
 and extern block in compiler/std (objc and its generated bindings, gpu,
 the core module, collections, window, sys and its tails, sync, slice,
 fmt, thread, io, hash, iter, str, env, random, string, num), the
-soundness bugs found on the way, and std's core size budget. 891 sites
+soundness bugs found on the way, and std's core size budget. 893 sites
 left, 0 unjustified (from 1204 and 1194).
 
 ## Verdict
@@ -107,7 +107,19 @@ whole batch. Would save: the hook passes non-.vl files under
 compiler/std; `edit insert-above FILE:LINE TEXT...` for many lines in
 one checked edit.
 
-### 7. Smaller
+### 7. A zeroed static array is data in every object
+
+`static var STDIN_BUF: [u8; 65536] = [0; 65536]` (to drop a malloc) is
+emitted as `.space 65536` in `__DATA,__data` of every program, hello
+world included (its object 9840 -> 75384 bytes), and made compile-cost's
+hello row 1.46x (116.9 M instructions against 80.3 M). Found by the
+orchestrator from the gate line, then `--time-passes` ("data and output"
+0.2 -> 0.9 ms, check 0.7 -> 1.3 ms) and `-S`; the buffer is a checked
+malloc again. About 4 turns. Would save: zero-initialized statics in
+`__bss`/zerofill, statics no program reaches left out, and compile-cost
+printed by `tests/affected.sh` when std changes.
+
+### 8. Smaller
 
 - `query context` "used by" repeated one line about 50 times (recorded).
 - `tests/query/run.sh -u` rewrote std line numbers wholesale (a 354-line
@@ -155,3 +167,8 @@ one checked edit.
     expected files.
 15. [build] the optimizer: drop a bounds check dominated by an explicit
     `< len` test.
+16. [build] zero-initialized statics as zerofill (bss), and statics no
+    program reaches not emitted: a `[u8; 65536]` static cost every
+    program 64 KiB of object and 46% of a hello world's build.
+17. [test] tests/affected.sh runs the compile-cost row when compiler/std
+    changes (std reaches every program).

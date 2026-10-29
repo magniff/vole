@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, a0ef0602. The gate's unsafe-audit row
+on Darwin arm64, 003b5556. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -73,15 +73,15 @@ justified	107	0
 ## std
 
 ```
-sites: 891 (669 blocks, 188 unsafe fns, 34 extern blocks); unjustified: 0; unneeded: 3
+sites: 893 (671 blocks, 188 unsafe fns, 34 extern blocks); unjustified: 0; unneeded: 3
 
 class	sites	unjustified
 ffi	456	0
 raw-pointer	317	0
 other	72	0
-alloc	38	0
+alloc	39	0
 transmute/cast	5	0
-static-mut	3	0
+static-mut	4	0
 
 module	sites	unjustified
 std::gpu	267	0
@@ -95,9 +95,9 @@ std::objc	51	0
 std::fmt	22	0
 std::thread	18	0
 std::hash	8	0
+std::io	7	0
 std::str	7	0
 std::iter	6	0
-std::io	5	0
 std::num	5	0
 std::env	3	0
 std::process	3	0
@@ -128,5 +128,5 @@ compiler/std/window/objc.vl	13	0
 (26 more; --all lists every one)
 
 justification	sites	unjustified
-justified	891	0
+justified	893	0
 ```
