@@ -76,8 +76,10 @@ to that call's result; nothing added means no change, so do not run
 (a call's `&` marker, Rust's spellings, an import unused at two checks)
 and shows each change, `changed FILE:LINE: OLD -> NEW` (repeats in one
 line), then `the hook rewrote FILE: ...`, all it wrote (`volec undo`
-takes it back; `VOLE_HOOK_FIX=0`: off); it says once when a file you
-changed is not formatted (`volec fmt FILE`); the other exact fixes (a
+takes it back; `VOLE_HOOK_FIX=0`: off); a new `.vl` file you Write
+outside compiler/src and compiler/std it formats (`volec fmt`) and names
+the same way; it says once when another file you changed is not
+formatted (`volec fmt FILE`); the other exact fixes (a
 did-you-mean, a conversion, a `use`) it shows under `suggested, not
 applied`, with the ones `fix` refuses and why: check each before
 running `volec fix --suggested`. `check` and a build

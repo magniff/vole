@@ -84,6 +84,16 @@ few ms; VOLE_HOOK_FMT=0: off):
 
     main.vl is not formatted: volec fmt main.vl (or --dry-run first: ...)
 
+(0.25.4, after the pathtrace UI feedback) A NEW `.vl` file outside
+compiler/src and compiler/std that the agent has just written (a Write
+whose result is a `create`) is formatted by the hook, `volec fmt FILE`
+before the check, and its changes named as the hook's other rewrites
+are (an existing file still gets the note only):
+
+    volec fmt ui.vl, run by the hook on the new file (layout only; volec undo takes it back):
+    changed ui.vl:3: let   z  =  3; -> let z = 3;
+    the hook rewrote ui.vl: the change above, nothing else (read it again before an Edit)
+
 and the compiler is run under the name the agent can type (`volec` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
@@ -1197,6 +1207,48 @@ def fmt_note(compiler, cwd, edited, st):
             f"nothing, and says this once a file)")
 
 
+def new_file_written(event, edited):
+    """(0.25.4) Whether the call is a Write that created edited (Claude
+    Code's Write result says `"type": "create"`; `update` overwrote a
+    file), a .vl file outside a compiler/src or compiler/std (the
+    compiler's own source is formatted by its author and the commit hook)."""
+    if event.get("tool_name") != "Write" or not edited or not edited.endswith(".vl"):
+        return False
+    resp = event.get("tool_response")
+    if not isinstance(resp, dict) or resp.get("type") != "create":
+        return False
+    parts = os.path.abspath(edited).split(os.sep)
+    return not any(parts[i] == "compiler" and parts[i + 1] in ("src", "std") for i in range(len(parts) - 1))
+
+
+def fmt_new_file(event, compiler, cwd, edited):
+    """(0.25.4) A new file the agent has just written (new_file_written),
+    formatted: `volec fmt FILE` (journaled: `volec undo` takes it back),
+    its changes from the journal (`volec query diff`) as `changed
+    FILE:LINE: OLD -> NEW` lines, at most FMT_SHOWN, then `the hook
+    rewrote FILE` as for the hook's fixes; "" when the file was formatted
+    already, does not parse (the check says why) or VOLE_HOOK_FMT=0."""
+    if os.environ.get("VOLE_HOOK_FMT", "1") == "0" or not new_file_written(event, edited) \
+            or not os.path.exists(edited):
+        return ""
+    full = os.path.abspath(edited)
+    arg = os.path.relpath(full, cwd) if full.startswith(cwd + os.sep) else full
+    r = run_typed(compiler, cwd, ["fmt", arg])
+    if r is None or r.returncode != 0 or not FORMATTED.search(r.stdout or ""):
+        return ""
+    d = run_typed(compiler, cwd, ["query", "diff"])
+    changes = diff_changes(d.stdout.splitlines()) if d is not None and d.returncode == 0 else []
+    name = volec_shown(compiler, cwd)
+    lines = [f"{name} fmt {arg}, run by the hook on the new file (layout only; volec undo takes it back):"]
+    lines += [f"changed {x}" for x in changes[:FMT_SHOWN]]
+    if len(changes) > FMT_SHOWN:
+        lines.append(f"({len(changes) - FMT_SHOWN} more: {name} query diff)")
+    n = len(changes)
+    count = f"the {n} changes above" if n > 1 else "the change above" if n else "its layout"
+    lines.append(f"the hook rewrote {arg}: {count}, nothing else (read it again before an Edit)")
+    return "\n".join(lines)
+
+
 def volec_shown(compiler, cwd):
     """The compiler as the agent would type it."""
     if not compiler:
@@ -1262,14 +1314,17 @@ def main():
     if not compiler:
         hs.save(event, st)
         return say("\n".join(t for t in (fmt_text, stale) if t))
+    # (0.25.4) a new file: formatted first, so the check's positions are
+    # the formatted file's
+    new_text = fmt_new_file(event, compiler, cwd, edited)
     got = verify(event, st, compiler, root, cwd, edited)
     if got is None:
         hs.save(event, st)
-        return say("\n".join(t for t in (fmt_text, stale) if t))
+        return say("\n".join(t for t in (fmt_text, new_text, stale) if t))
     text, rec = got
     hs.save(event, st)
     record(event, cwd, rec)
-    return say("\n".join(t for t in (fmt_text, stale, text) if t))
+    return say("\n".join(t for t in (fmt_text, new_text, stale, text) if t))
 
 
 def say(text):

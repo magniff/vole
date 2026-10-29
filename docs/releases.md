@@ -113,6 +113,45 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   integer, or a fourth hole, is `contract.message`, which says what
   shows such a value (0.25.3: "expected 'i64', got 'str'", and a fourth
   hole was left out of the message silently). The holes stay integers.
+- **`std::num::fmt_f64(v, decimals, &out) -> i64`**: a float with a
+  fixed number of decimals (0 to `FIXED_DECIMALS_MAX`, 20) at the end
+  of a `[u8; 32]`, no allocation, `fmt_i64`'s shape: `{v:.N}`'s text
+  byte for byte (the exact value rounded to the nearest, a tie to the
+  even digit, `-0.00`, `NaN`, `inf`; `{v:e}`'s when longer than 32
+  bytes), checked against `format_in` on 149,331 generated cases
+  (tests/run/std_num_fmt_f64.vl); `guide text#numbers-as-text-without-an-allocator`.
+  examples/gpu/pathtrace uses it instead of its own `format_fixed`, and
+  its camera's five C math calls are `f64` methods (no `unsafe` left).
+- **`guide gpu-render#drawing-over-the-image-you-just-made`**: an
+  overlay pass (`PassDesc::color(view, load: Load::Keep)`,
+  `Blend::alpha()`, a vertex layout of position, colour and uv, an
+  `R8Unorm` atlas with a white texel, text measured and drawn), compiled
+  and its pixels read back by `tests/run.sh guide`; from pathtrace's UI.
+- **`guide window#checking-the-pixels-headless`**: a windowed program's
+  frame drawn into `RawSurface::Headless`, read back and written as a
+  PPM (pathtrace's `--headless --ui` the worked example), pointed to
+  from `guide gpu`'s `RawSurface::Headless`.
+- `guide window`: the scale is the window's (`Size`, `Resize`), not the
+  surface's; `Surface` has no `scale`, and the mouse example keeps it.
+- `guide testing`: a `#[test]` sees its module's private functions and
+  methods and every field (fields are as visible as their struct), with
+  a two-file example; tests/guide/run.sh now runs `volec test` on a
+  guide program with `#[test]`s, so their bodies are checked and run (a
+  build leaves them out).
+- **An array of unsuffixed literals takes the other side's type**, as a
+  literal does: `if down { ACCENT } else { [0.20, 0.52, 0.70, 1.0] }`
+  with `ACCENT: [f32; 4]` is a `[f32; 4]` (an `else if` chain too), and
+  so is a match arm (before or after the typed one) and an element of
+  `[[0.1, 0.2, 0.3, 1.0], ACCENT]`; 0.25.3 said `if/else branches have
+  different types: '[f32; 4]' vs '[f64; 4]'`. A branch that is a local
+  made of literals (`let base = [0.2, ...];`) gets the note at its `let`
+  with the annotation and its `edit patch`, as a mismatch does.
+- **The check hook formats a new file**: a `.vl` file the agent has just
+  created with Write, outside compiler/src and compiler/std, goes
+  through `volec fmt` before the check, and the hook names the changes
+  as its other rewrites (`changed FILE:LINE: OLD -> NEW`, `the hook
+  rewrote FILE: ...`; `volec undo` takes it back; VOLE_HOOK_FMT=0: off).
+  An existing file still gets the one-line note only.
 
 ### What's new in 0.25.3
 

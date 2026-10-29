@@ -1,4 +1,4 @@
-# GPU rendering: std::gpu (0.22; guide updated 0.25.2.2)
+# GPU rendering: std::gpu (0.22; guide updated 0.25.4)
 
 Drawing with std::gpu (`guide gpu` for the objects, compute, bind groups,
 usages and formats, limits and contracts): a render pipeline
@@ -114,6 +114,176 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 ```out
 0 64 128 255
 ```
+
+## Drawing over the image you just made
+
+An overlay (a panel, a label, a cursor) is one more render pass into the
+same target after the scene's passes and before `frame.present`: a
+pass that keeps what is there instead of clearing it,
+`PassDesc::color(view, load: Load::Keep)`, and a pipeline that blends
+over it, `desc.blend(Blend::alpha())` (source over destination, straight
+alpha; `Blend::premultiplied()` for premultiplied colours). Everything
+is a textured quad from one vertex buffer of position, colour and uv
+(`VertexLayout::new(32)`: `Float32x2`, `Float32x4`, `Float32x2`), and
+one `R8Unorm` atlas (`queue.write_texture`) holds the glyphs and a white
+texel: a solid quad samples the white texel, a character its glyph, and
+the fragment shader writes the colour with alpha times the coverage. A
+string's width is its glyph count times the advance, less the last gap,
+so text is measured before it is placed (centred, right-aligned). A
+window's frame is `Bgra8Unorm`: the pipeline's format is the frame's.
+
+```vole
+use std::gpu;
+use std::gpu::{
+    Blend, BufferUsage, Color, Format, Load, PassDesc, SamplerDesc, TextureUsage, VertexFormat,
+    VertexLayout,
+};
+
+const UI: [u8] = r"""
+    struct VIn {
+        @location(0) pos: vec2<f32>, @location(1) color: vec4<f32>, @location(2) uv: vec2<f32>,
+    }
+    struct VOut {
+        @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32>, @location(1) uv: vec2<f32>,
+    }
+    @group(0) @binding(0) var atlas: texture_2d<f32>;
+    @group(0) @binding(1) var samp: sampler;
+    @vertex fn vs(v: VIn) -> VOut {
+        return VOut(vec4<f32>(v.pos, 0.0, 1.0), v.color, v.uv);
+    }
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {
+        let coverage = textureSampleLevel(atlas, samp, v.uv, 0.0).r; // ink, or the white texel
+        return vec4<f32>(v.color.rgb, v.color.a * coverage);
+    }
+    """;
+
+// The atlas (R8Unorm, 12 x 5 texels, '#' is 255): the white texel at
+// (0, 0) for solid quads, then 'H' and 'I', 3 x 5 each, at x 4 and 8.
+static ART: [str; 5] = [
+    "#   # # ### ",
+    "    # #  #  ",
+    "    ###  #  ",
+    "    # #  #  ",
+    "    # # ### ",
+];
+const AW: f64 = 12.0;
+const AH: f64 = 5.0;
+const W: i64 = 16; // the target, in pixels
+const H: i64 = 8;
+
+// Pixels (x0, y0)-(x1, y1) showing atlas texels (u0, v0)-(u1, v1) (in
+// 0..1) in colour c: two triangles of x, y, r, g, b, a, u, v.
+fn quad(vs: inout Vec<f32>, x0: f64, y0: f64, x1: f64, y1: f64, uv: [f64; 4], c: [f32; 4]) {
+    let (l, r) = (2.0 * x0 / W as f64 - 1.0, 2.0 * x1 / W as f64 - 1.0);
+    let (t, b) = (1.0 - 2.0 * y0 / H as f64, 1.0 - 2.0 * y1 / H as f64);
+    let corners = [
+        [l, t, uv[0], uv[1]], [r, t, uv[2], uv[1]], [l, b, uv[0], uv[3]],
+        [l, b, uv[0], uv[3]], [r, t, uv[2], uv[1]], [r, b, uv[2], uv[3]],
+    ];
+    for k in 0..6 {
+        let p = corners[k];
+        vs.extend_from_slice([p[0] as f32, p[1] as f32, c[0], c[1], c[2], c[3], p[2] as f32,
+            p[3] as f32][..]);
+    }
+}
+
+// The width of s in pixels: 4 a glyph (3 of ink, 1 of space), less the last space.
+fn text_width(s: [u8]) -> f64 {
+    if s.len == 0 { 0.0 } else { (s.len * 4 - 1) as f64 }
+}
+
+// One quad a glyph from (x, y), the top left; its cell from the byte.
+fn text(vs: inout Vec<f32>, x: f64, y: f64, s: [u8], c: [f32; 4]) {
+    var cx = x;
+    for ch in s {
+        let u = if ch == 'H' { 4.0 } else { 8.0 }; // a real font: a table of cells
+        quad(&vs, cx, y, cx + 3.0, y + 5.0, [u / AW, 0.0, (u + 3.0) / AW, 1.0], c);
+        cx += 4.0;
+    }
+}
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    let target = dev.texture(W, H, Format::Rgba8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let view = target.view();
+    // the image you just made: here a pass that clears it to blue
+    var enc = dev.encoder();
+    enc.render_pass(PassDesc::color(view, clear: Color::rgba(0.0, 0.0, 1.0, 1.0)), |_| {});
+    queue.submit(enc.finish());
+
+    // the overlay: a blended pipeline of position, colour and uv
+    let shader = dev.shader_wgsl(UI)?;
+    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm); // a frame: Bgra8Unorm
+    var layout = VertexLayout::new(32); // 8 f32s a vertex
+    layout.attribute(0, VertexFormat::Float32x2, 0); // x, y
+    layout.attribute(1, VertexFormat::Float32x4, 8); // r, g, b, a
+    layout.attribute(2, VertexFormat::Float32x2, 24); // u, v
+    desc.vertex_buffer(layout);
+    desc.blend(Blend::alpha()); // source over what is there
+    let pipe = dev.render_pipeline(desc)?;
+    var texels: Vec<u8> = Vec::new_in(gpa);
+    for r in 0..5 {
+        for ch in ART[r].as_bytes() {
+            texels.push(if ch == '#' { 255 } else { 0 });
+        }
+    }
+    let atlas = dev.texture(12, 5, Format::R8Unorm); // TEXTURE_BINDING | COPY_DST
+    queue.write_texture(atlas, texels.as_slice(), 12); // rows of 12 bytes
+    let sampler = dev.sampler(SamplerDesc::nearest());
+    let group = dev.bind_group(pipe.bind_layout(0),
+        [gpu::bind_texture(0, atlas.view()), gpu::bind_sampler(1, sampler)][..]);
+
+    // the draw list: a half-dark box, then "HI" measured and centred in it
+    var verts: Vec<f32> = Vec::new_in(gpa);
+    let white = [0.5 / AW, 0.5 / AH, 0.5 / AW, 0.5 / AH];
+    quad(&verts, 1.0, 1.0, 10.0, 8.0, white, [0.0, 0.0, 0.0, 0.5]);
+    let label = "HI";
+    text(&verts, 1.0 + (9.0 - text_width(label)) / 2.0, 2.0, label, [1.0, 1.0, 0.0, 1.0]);
+    let vb = dev.buffer_init(gpu::bytes_of_f32(verts.as_slice()), BufferUsage::VERTEX);
+    let count = verts.len() / 8;
+    var out = dev.buffer(256 * H, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc2 = dev.encoder();
+    enc2.render_pass(PassDesc::color(view, load: Load::Keep), |pass| { // kept, not cleared
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.set_vertex_buffer(0, vb);
+        pass.draw(0..count, 0..1);
+    });
+    enc2.copy_texture_to_buffer(target, out, 256);
+    queue.submit(enc2.finish());
+    let px = out.map_read(dev);
+    // a pixel a character: '#' the text, 'o' the box, '.' the image
+    for y in 0..H {
+        var line: [u8; 16] = [0; 16];
+        for x in 0..W {
+            let p = y * 256 + x * 4;
+            line[x] = if px[p] > 200 { '#' } else if px[p + 2] > 200 { '.' } else { 'o' };
+        }
+        println(line[..]);
+    }
+    println(f"box {px[256 + 4 + 2]}, image {px[256 + 14 * 4 + 2]}"); // blue, half and whole
+    Ok(())
+}
+```
+```out
+................
+.ooooooooo......
+.o#o#o###o......
+.o#o#oo#oo......
+.o###oo#oo......
+.o#o#oo#oo......
+.o#o#o###o......
+.ooooooooo......
+box 128, image 255
+```
+
+A whole one: examples/gpu/pathtrace (`ui_render.vl`: the pipeline and
+the pass; `font.vl`: a 5 x 7 font of 95 glyphs baked into a 128 x 128
+atlas; `ui.wgsl`; `ui.vl`'s `quad`, `text`, `text_width`, with
+clipping). Its `--headless --ui` draws the panel over the final frame
+and writes a PPM (`guide window#checking-the-pixels-headless`).
 
 ## Multiple render targets
 
