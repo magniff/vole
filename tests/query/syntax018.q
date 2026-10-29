@@ -22,7 +22,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	94
+std::fmt	<std>	95
 std::num	<std>	132
 std::num::tables	<std>	4
 std::math	<std>	260
@@ -44,9 +44,9 @@ std::sync::mpsc	<std>	24
 std::thread	<std>	43
 std::objc	<std>	50
 std::objc::foundation	<std>	67
-std::gpu	<std>	173
-std::gpu::hal	<std>	7
-std::gpu::hal::metal	<std>	110
+std::gpu	<std>	176
+std::gpu::hal	<std>	9
+std::gpu::hal::metal	<std>	115
 std::gpu::hal::metal::bindings	<std>	776
 std::gpu::shader	<std>	26
 std::gpu::types	<std>	51
@@ -78,7 +78,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	130
 std::window::keys	<std>	27
 std::window::objc	<std>	88
-std::cli	<std>	109
+std::cli	<std>	110
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -98,6 +98,8 @@ fn push(s: inout Stack, x: i64)
 // crate::Stack	syntax018/main.vl:10-11
 struct Stack { items: [i64; 8], len: i64, max: i64 }
 invariant self.len <= self.max else "a stack holds at most max items"
+// 1 method (with their lines and whole contracts: query items crate::Stack)
+fn size2(self) -> i64 ensures ...  // impl Sized2 for Stack
 // crate::Percent	syntax018/main.vl:17-17
 type Percent = distinct i64 invariant 0 <= self && self <= 100;
 $ def NodeId any_id tests::two

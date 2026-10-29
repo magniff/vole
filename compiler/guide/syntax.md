@@ -22,6 +22,42 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   `f"x = {x:>4}"` is an f-string (0.15, `guide formatting`). A
   backslash at the end of a line inside a string continues it, leaving
   out the line break and the next line's indentation.
+- Text blocks (0.25.3), for text of several lines (WGSL, SQL, a usage
+  message): `"""` ending its line opens one, a line holding only
+  blanks and `"""` closes it, and the closing line's indentation is
+  removed from every line (a line indented less is
+  `lex.text-block-indent`). The line breaks after the opening `"""` and
+  before the closing line are not in the value; escapes work as in
+  `"..."`, a `\` at a line's end joins it to the next. `r"""` is a raw
+  block: no escapes, a `\` is a backslash; text with a line starting
+  with `"""` goes in `r#"""` .. `"""#`. A text block is a string
+  literal: a `[u8]` or a `str`, in a `const` too. `volec fmt` leaves its
+  lines as they are.
+- `include_str("shader.wgsl")` is the file's text as a string literal,
+  read when the program is compiled (the path relative to the file
+  holding the call; UTF-8, else `embed.utf8`); `include_bytes("f.bin")`
+  its bytes, a `[u8]`. Rust's `include_str!(..)` is the same call.
+
+```vole
+const USAGE: [u8] = """
+    usage: tool [-v] FILE
+      -v  verbose
+    """;
+const PATTERN: [u8] = r"""
+    ^\d+\.\d+$
+    """;
+
+fn main() -> i32 {
+    println(USAGE);
+    println(f"{PATTERN} {PATTERN.len}");
+    0
+}
+```
+```out
+usage: tool [-v] FILE
+  -v  verbose
+^\d+\.\d+$ 10
+```
 
 ## Items
 

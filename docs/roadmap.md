@@ -1452,6 +1452,21 @@ parameter leak (F20), values017, the rest of fix25j's diagnostics and of
 views, the 26 OVERSTRICT cases, a thread-safe `--check-alloc` in a -j8
 compiler.
 
+0.25.1–0.25.3 followed (their gates are recorded under "Benchmarks"). Next,
+0.25.4: compiler/src without the pre-generics idioms (`base::IntVec`
+as `Vec<i64>`, index handles into global buffers, `*u8` strings where
+`str` or `String` fit, `static var` globals, hand-written growable
+arrays), and the unsafe they carry removed with `volec query unsafe`
+(docs/unsafe-baseline.md: 5,316 unjustified sites of 5,380 in
+compiler/src, 938 unneeded; std 1,194 of 1,204), each remaining site
+justified; a move/drop verifier on the lowered IR, one meaning per
+construct (std's remaining move exemption, the per-file syntax modes),
+ownership-shaped fuzzing and a drop-poisoning run of the suite; the
+`const X: str` run-time crash, a closure's `let` parameter given a
+temporary, the gate's stalled container rows; an offscreen event loop
+and GPU timestamps if they fit. Same output, the fixpoint, and no
+compile-cost regression.
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
@@ -2645,3 +2660,25 @@ and -O2, 4190 at -O1 (85 XFAIL; 1 SKIP without spirv-val), aarch64-linux
 clean, examples-checkalloc 176, fuzz-sem 300 ok, every other fuzz and
 ABI row on both systems, chain-fresh 30 releases. compile-cost against
 v0.25.2.1: a hello world 0.99x, std 1.01x, check of the compiler 1.01x.
+
+### 0.25.3
+
+The release gate (`gate.sh --release --no-x86`, 65:02 wall), on the
+release commit. Every row passed but one: linux-aarch64/fuzz-vector
+stalled (no process of it ran, started or ended for 600 s, with 0 of 8
+slots free) and gave no verdict, as fuzz-loops did in 0.25.2.2's gate,
+so the gate's slot accounting in the container is suspect (0.25.4).
+Rerun alone in the container (`aarch64-linux-check.sh --worktree --dev
+--compiler ... --only fuzz-vector --fuzz=300`): 300 programs, 0 failing.
+The chain ran 0.25.2.2's own suite with its one known failure
+(releases.toml `known_failures`, a hooks case that took the cache's
+`target/` path for a scratch copy). The suite 4328 at each level (73
+XFAIL, 12 fewer with the closure fix; 1 SKIP without spirv-val),
+aarch64-linux 3725 at -O0 and -O2, threads 8326, incremental 172 series,
+objcheck 5348 (macOS) and 5316 (aarch64-linux), compiler-memcheck 667,
+valgrind 333 clean, examples-checkalloc 176, fuzz-sem 300 ok (with
+`--closure-params`), cachediff 1297 lines (386 from the cache),
+unsafe-audit 5315 and 1194 unjustified (baselines 5316 and 1194), every
+other fuzz and ABI row on both systems, chain-fresh 31 releases.
+compile-cost against v0.25.2.2: a hello world 1.01x, std 1.01x, check
+of the compiler 1.05x (the unsafe audit's warning, text blocks).

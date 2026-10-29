@@ -18,9 +18,9 @@ use crate::tools::proc::{buf_cstr, read_file_if, rename_file, write_file_if};
 use crate::tools::query::c_slice;
 use crate::tools::query::diagnostics::{PROG, diag, put_cword, try_begin, try_end};
 use crate::tools::testrun::{
-    BUDGET, FILTERS, OPT, TIMEOUT, build_key_for, case_file, contains, expected_exit, join,
-    line_count, line_end, list_cases, normal, put_cut, put_difference, put_failures, put_lines,
-    put_lines_count, selected, shown_path, starts, traced,
+    BUDGET, FILTERS, OPT, SHOW_OUTPUT, TIMEOUT, build_key_for, case_file, contains, expected_exit,
+    join, line_count, line_end, list_cases, normal, output_lines, put_cut, put_difference,
+    put_failures, put_lines, put_lines_count, selected, shown_path, starts, traced,
 };
 
 extern "C" {
@@ -207,6 +207,104 @@ fn program_lines(s: [u8]) -> [u8] {
         i = e + 1;
     }
     normal(buf_slice(b))
+}
+
+// (0.25.3) Where the runtime's report of a failure starts in the stderr of
+// a test that failed: the line before its trace (the notes between them
+// left out), else its first `check-alloc:` line, else (last: true) its last
+// line, else its end. The lines before it are the program's own.
+fn failure_start(err: [u8], last: bool) -> i64 {
+    var prev = -1;
+    var final = err.len;
+    var alloc = -1;
+    var i = 0;
+    while i < err.len {
+        let e = line_end(err, i);
+        let line = err[i..e];
+        if starts(line, "trace, ") {
+            return if prev >= 0 { prev } else { i };
+        }
+        if alloc < 0 && starts(line, "check-alloc: ") {
+            alloc = i;
+        }
+        if line.len > 0 && !starts(line, "note: ") {
+            prev = i;
+            if alloc < 0 && last {
+                final = i;
+            }
+        }
+        i = e + 1;
+    }
+    if alloc >= 0 { alloc } else { final }
+}
+
+// (0.25.3) The program's own stdout of a job (a test's: not the runtime's
+// `vole-test:` lines) and its own stderr (a failed test's: before the
+// runtime's report, failure_start).
+fn own_stdout(kind: i64, job: Job) -> [u8] {
+    let got = file_text(job.out);
+    if kind == CASE { normal(got) } else { program_lines(got) }
+}
+
+fn own_stderr(kind: i64, job: Job) -> [u8] {
+    let err = normal(file_text(job.err));
+    if job.status == 0 || job.status == -1 {
+        return err;
+    }
+    normal(err[0..failure_start(err, kind != CASE)])
+}
+
+// (0.25.3) Lines of output s, each after label (`  stdout: `), at most
+// output_lines() of them, then how many more and the file they are in.
+fn put_output(block: i64, label: [u8], s: [u8], path: *u8) {
+    let n = line_count(s);
+    let max = output_lines();
+    put_lines(block, s, 0, max, label);
+    if n > max {
+        buf_bytes(block, label);
+        buf_byte(block, '(');
+        buf_int(block, n - max);
+        buf_bytes(block, " more: ");
+        buf_str(block, shown_path(path));
+        buf_bytes(block, ")\n");
+    }
+}
+
+// (0.25.3) --show-output: `OUTPUT NAME` and the stdout and stderr of an
+// item at its first level (job a), and at the other (job b, when
+// two_levels) when it printed something else there, each block then named
+// with its level.
+fn put_shown_output(out: i64, kind: i64, name: [u8], a: Job, b: Job, two_levels: bool, la: *u8,
+    lb: *u8) {
+    let o = own_stdout(kind, a);
+    let e = own_stderr(kind, a);
+    let differs = two_levels && (own_stdout(kind, b) != o || own_stderr(kind, b) != e);
+    put_output_block(out, kind, name, if differs { la } else { 0 as *u8 }, a, o, e);
+    if differs {
+        put_output_block(out, kind, name, lb, b, own_stdout(kind, b), own_stderr(kind, b));
+    }
+}
+
+fn put_output_block(out: i64, kind: i64, name: [u8], level: *u8, job: Job, o: [u8], e: [u8]) {
+    buf_bytes(out, "OUTPUT ");
+    buf_bytes(out, name);
+    if level != 0 as *u8 {
+        buf_bytes(out, " (");
+        buf_str(out, level);
+        buf_byte(out, ')');
+    }
+    if o.len == 0 && e.len == 0 {
+        // (a property's cases run with their output thrown away; the
+        // failing case, replayed, prints under its failure)
+        buf_bytes(out, if kind == CASE || kind == TEST { ": none\n" }
+            else {
+                ": none (its generated cases run quiet; a failing one prints under its failure)\n"
+            });
+        return;
+    }
+    buf_byte(out, '\n');
+    put_output(out, "  stdout: ", o, job.out);
+    put_output(out, "  stderr: ", e, job.err);
 }
 
 // The rest of the `vole-test: WORD ` line of s, or "".
@@ -579,12 +677,14 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
         var diffs = 0;
         var new_snaps = 0;
         var counts = [0, 0, 0, 0, 0];
+        var passed_first = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..n {
             counts[kinds.data[k]] += 1;
             let main_job = first_job + k;
             let block = buf_new();
             let ok = judge(block, kinds.data[k], buf_slice(names.data[k]), main_job, tests, shown,
                 root);
+            passed_first.push(if ok { 1 } else { 0 });
             // the snapshots made new (at the first level)
             let got = file_text(JOBS[main_job].out);
             var s = 0;
@@ -658,6 +758,21 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
         }
         if blocks.count > 0 {
             put_failures(out, blocks, failed);
+        }
+        // (0.25.3) --show-output: what each item printed (a failed one's
+        // is under its failure)
+        if SHOW_OUTPUT {
+            let two = lv.count > 1;
+            for k in 0..n {
+                if passed_first.data[k] != 0 {
+                    let other = if two { first_job + n + k } else { first_job + k };
+                    put_shown_output(out, kinds.data[k], buf_slice(names.data[k]),
+                        JOBS[first_job + k], JOBS[other], two, lv.data[0] as *u8,
+                        if two { lv.data[1] as *u8 } else { 0 as *u8 });
+                }
+            }
+        }
+        if blocks.count > 0 {
             buf_bytes(out, "(outputs: ");
             buf_str(out, shown_path(level_dir(work, lv.data[0] as *u8)));
             buf_bytes(out, "/case-NAME.got, .err; test-NAME.got, .err)\n");
@@ -712,11 +827,14 @@ fn put_trace(block: i64, err: [u8]) {
 }
 
 // Whether item k passed at its first level (job j); else why, into block.
+// (0.25.3) Under a failure, what the item printed (its own lines; the
+// runtime's report of the failure is the reason): stdout, then stderr.
 fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root: *u8) -> bool {
     unsafe {
-        let status = JOBS[j].status;
-        let got = file_text(JOBS[j].out);
-        let err = normal(file_text(JOBS[j].err));
+        let job = JOBS[j];
+        let status = job.status;
+        let got = file_text(job.out);
+        let err = normal(file_text(job.err));
         if kind == CASE {
             let want_b = buf_new();
             let has_want = read_file_if(case_file(tests, name, ".out"), want_b);
@@ -746,6 +864,9 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
             buf_bytes(block, name);
             buf_bytes(block, ": ");
             if status == -1 || status != want_exit {
+                // (a crash's report: from the line before its trace)
+                let cut = if status == -1 { err.len } else { failure_start(err, false) };
+                let report = if cut < err.len { err[cut..err.len] } else { err };
                 if status == -1 {
                     buf_bytes(block, "no exit after ");
                     buf_int(block, TIMEOUT);
@@ -757,12 +878,16 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                     buf_int(block, want_exit);
                     buf_bytes(block, ")");
                 }
-                if err.len > 0 {
+                if report.len > 0 {
                     buf_bytes(block, ": ");
-                    buf_bytes(block, first_line(err));
+                    buf_bytes(block, first_line(report));
                 }
                 buf_byte(block, '\n');
-                put_trace(block, err);
+                put_trace(block, report);
+                put_output(block, "  stdout: ", g, job.out);
+                if cut < err.len {
+                    put_output(block, "  stderr: ", normal(err[0..cut]), job.err);
+                }
             } else if !has_want {
                 buf_bytes(block, "no ");
                 buf_str(block, shown);
@@ -772,14 +897,20 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                 put_lines_count(block, line_count(g));
                 buf_bytes(block, " (--accept writes it)\n");
                 put_lines(block, g, 0, 4, "  + ");
+                put_output(block, "  stderr: ", err, job.err);
             } else {
                 put_difference(block, want, g);
+                put_output(block, "  stderr: ", err, job.err);
             }
             return false;
         }
         if status == 0 {
             return true;
         }
+        // (0.25.3) the runtime's report, after what the test printed
+        let cut = if status == -1 { err.len } else { failure_start(err, true) };
+        let report = err[cut..err.len];
+        let tries = buf_new();
         buf_bytes(block, "FAIL ");
         buf_bytes(block, name);
         let prop = runtime_line(got, "property", 0);
@@ -797,16 +928,16 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
             buf_bytes(block, "no exit after ");
             buf_int(block, TIMEOUT);
             buf_bytes(block, " s (--timeout S)\n");
-        } else if err.len == 0 {
+        } else if report.len == 0 {
             buf_bytes(block, "exit ");
             buf_int(block, status);
             buf_byte(block, '\n');
-        } else if starts(err, "check-alloc: ") {
+        } else if starts(report, "check-alloc: ") {
             // a leak: the count, then where the first block was allocated
-            buf_bytes(block, first_line(err));
-            let second = line_end(err, 0) + 1;
-            if second < err.len {
-                let line = err[second..line_end(err, second)];
+            buf_bytes(block, first_line(report));
+            let second = line_end(report, 0) + 1;
+            if second < report.len {
+                let line = report[second..line_end(report, second)];
                 var a = 0;
                 while a < line.len && line[a] == ' ' {
                     a += 1;
@@ -816,18 +947,16 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
             }
             buf_byte(block, '\n');
         } else {
-            put_cut(block, "", first_line(err));
-            put_trace(block, err);
-            if starts(err, "snapshot differs: ") {
-                let t = buf_new();
-                buf_bytes(t, "  try: ");
-                buf_str(t, PROG);
-                buf_bytes(t, " test ");
-                buf_bytes(t, name);
-                buf_bytes(t, " --accept ");
-                buf_str(t, root);
-                buf_byte(t, '\n');
-                buf_bytes(block, buf_slice(t));
+            put_cut(block, "", first_line(report));
+            put_trace(block, report);
+            if starts(report, "snapshot differs: ") {
+                buf_bytes(tries, "  try: ");
+                buf_str(tries, PROG);
+                buf_bytes(tries, " test ");
+                buf_bytes(tries, name);
+                buf_bytes(tries, " --accept ");
+                buf_str(tries, root);
+                buf_byte(tries, '\n');
             }
         }
         var k = 0;
@@ -838,19 +967,20 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
         if kind != TEST && prop.len > 0 {
             let seed_at = find(prop, ", seed ");
             if seed_at >= 0 {
-                let t = buf_new();
-                buf_bytes(t, "  try: ");
-                buf_str(t, PROG);
-                buf_bytes(t, " test ");
-                buf_bytes(t, name);
-                buf_bytes(t, " --seed 0x");
-                buf_bytes(t, prop[seed_at + 7..prop.len]);
-                buf_byte(t, ' ');
-                buf_str(t, root);
-                buf_byte(t, '\n');
-                buf_bytes(block, buf_slice(t));
+                buf_bytes(tries, "  try: ");
+                buf_str(tries, PROG);
+                buf_bytes(tries, " test ");
+                buf_bytes(tries, name);
+                buf_bytes(tries, " --seed 0x");
+                buf_bytes(tries, prop[seed_at + 7..prop.len]);
+                buf_byte(tries, ' ');
+                buf_str(tries, root);
+                buf_byte(tries, '\n');
             }
         }
+        put_output(block, "  stdout: ", program_lines(got), job.out);
+        put_output(block, "  stderr: ", normal(err[0..cut]), job.err);
+        buf_bytes(block, buf_slice(tries));
         false
     }
 }

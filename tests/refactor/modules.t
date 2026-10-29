@@ -2,7 +2,8 @@
 ## new-module, move-module, split; each atomic, journaled for undo, with
 ## --dry-run.
 $ check
-ok: 0 errors in main.vl
+util.vl:7:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe util.vl
+ok: 0 errors, 1 warning in main.vl
 $ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"

@@ -8,7 +8,11 @@
 #   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
 #   fmt      every changed .vl outside tests/ is in the standard style
 #   check    every program the change touches checks with no error and no warning
-#   std      compiler/src/front/stdsrc.vl is what compiler/std/embed.sh makes of std
+#            (but unsafe.unjustified: legacy sites are the baseline's, and new
+#            ones the unsafe row's)
+#   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
+#            makes of the committed std (0.25.3: made by the commit hook and the
+#            merge driver, tools/git-hooks/setup.sh; said when they are not set up)
 #   layout   every tests/examples case names a SOURCE that exists
 #
 # One line per check (PASS, FAIL or SKIP and why), the details after;
@@ -47,6 +51,13 @@ row() { printf '  %-7s %-5s %s\n' "$1" "$2" "$3"; [ "$2" = FAIL ] && FAILED=1; }
 
 CHANGED=$(git diff --name-only "$BASE"...HEAD; git diff --name-only HEAD)
 CHANGED=$(printf '%s\n' "$CHANGED" | sort -u | while read -r f; do [ -n "$f" ] && [ -e "$f" ] && echo "$f"; done)
+
+# (0.25.3) A branch that changes the compiler checks and formats its
+# programs with its own build, target/volec: they may use what it adds
+# (a new literal, a new std item) that the last tested build does not read.
+if [ -x target/volec ] && printf '%s\n' "$CHANGED" | grep -q '^compiler/src/\|^compiler/std/'; then
+    VOLEC=$PWD/target/volec
+fi
 
 echo "premerge: $(git rev-parse --abbrev-ref HEAD) against $BASE"
 
@@ -91,6 +102,8 @@ else
     : > "$TMP/check"
     while read -r r; do
         out=$( (cd "$(dirname "$r")" && "$VOLEC" check main.vl) 2>&1 )
+        # (0.25.3: not unsafe.unjustified, the unsafe row's and the baseline's)
+        out=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]')
         printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' > /dev/null && \
             printf '  %s:\n%s\n' "$r" "$(printf '%s\n' "$out" | grep -E '(error|warning)\[|^error ' | head -5 | sed 's/^/    /')" >> "$TMP/check"
     done < "$TMP/roots"
@@ -98,21 +111,22 @@ else
     if [ -s "$TMP/check" ]; then row check FAIL "errors or warnings in the touched programs"; else row check PASS "$n program(s) check clean"; fi
 fi
 
-# std: the embedded std is up to date
-if printf '%s\n' "$CHANGED" | grep -q '^compiler/std/'; then
-    if ! git diff --quiet HEAD -- compiler/src/front/stdsrc.vl; then
-        row std SKIP "stdsrc.vl has uncommitted changes"
+# std: the embedded std is up to date, as committed (0.25.3: made from
+# HEAD's compiler/std in a copy, so the work tree is left as it is)
+setup=""
+[ -n "$(git config merge.stdsrc.driver)" ] || setup="; the stdsrc merge driver is not set up: tools/git-hooks/setup.sh"
+if printf '%s\n' "$CHANGED" | grep -q -e '^compiler/std/' -e '^compiler/src/front/stdsrc\.vl$'; then
+    mkdir -p "$TMP/std/compiler/src/front"
+    git archive HEAD compiler/std | tar -xf - -C "$TMP/std"
+    if ! sh "$TMP/std/compiler/std/embed.sh" > "$TMP/std.out" 2>&1; then
+        row std FAIL "compiler/std/embed.sh failed: $(head -1 "$TMP/std.out")"
+    elif git show HEAD:compiler/src/front/stdsrc.vl | cmp -s - "$TMP/std/compiler/src/front/stdsrc.vl"; then
+        row std PASS "the committed stdsrc.vl matches compiler/std$setup"
     else
-        sh compiler/std/embed.sh > /dev/null 2>&1
-        if git diff --quiet -- compiler/src/front/stdsrc.vl; then
-            row std PASS "stdsrc.vl matches compiler/std"
-        else
-            git checkout -q -- compiler/src/front/stdsrc.vl
-            row std FAIL "stdsrc.vl is stale: run compiler/std/embed.sh and commit it"
-        fi
+        row std FAIL "the committed stdsrc.vl is stale: compiler/std/embed.sh, then commit it$setup"
     fi
 else
-    row std SKIP "compiler/std unchanged"
+    row std SKIP "compiler/std unchanged$setup"
 fi
 
 # layout: tests/examples cases name sources that exist

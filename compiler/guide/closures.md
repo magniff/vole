@@ -43,6 +43,11 @@ fn main() -> i32 {
 - Parameters are patterns: `|(a, b): (i64, i64)| a * b`, `|var x|`,
   `|_|`; not `|a | b|` (no or-pattern at the top). They are let unless
   annotated: `|s: inout Sum, x: i64| s.total += x`.
+- `|d: sink D|` takes its argument (the call moves it), as does a
+  closure given to an `FnMut(sink T)` bound (`map`, `for_each`,
+  `fold`, `Option::map`): the closure owns it and drops it at the end
+  of its body, unless the body moves it out (returns it, pushes it,
+  passes it to a `sink` parameter). Before 0.25.3 it leaked.
 - A parameter's type is the annotation, else the one the context
   expects (an `F: Fn(i64) -> bool` bound, an `fn(i64) -> bool`
   parameter). Without either it is an error: `cannot infer the type of

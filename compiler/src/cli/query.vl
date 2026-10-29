@@ -3,7 +3,7 @@
 // NAMEs and ROOT, and the last bad option, go back to run_query_inner,
 // which reports it as before (`error query.usage: unknown option '--cnt'`,
 // `--in needs a FILE or MODULE`, with the try: line of the NAMEs given). A
-// word with one '-' but `-i` and `-C` is a NAME (`query grep '-> bool'`);
+// word with one '-' that is no option is a NAME (`query grep '-> bool'`);
 // a valued option's value may not start with '-'.
 
 use std::Vec;
@@ -11,8 +11,7 @@ use std::string::str;
 
 use crate::base::IntVec;
 use crate::base::timer::TIME_PASSES;
-use crate::cli::c_of;
-use crate::cli::line::{Call, EV_MISSING, Leaf, Opt, flag, option, short_option};
+use crate::cli::line::{Call, EV_MISSING, EV_WORD, Leaf, Opt, flag, is_opt, option, short_option};
 use crate::front::stdtree::STD_TREE;
 use crate::tools::query::{OPT_MAX_LINES, OPT_OVER, parse_count};
 use crate::tools::query::budget::OPT_BUDGET;
@@ -22,6 +21,8 @@ use crate::tools::query::effects::{OPT_HAS, OPT_WHY};
 use crate::tools::query::grep::{G_CODE, G_COMMENT, G_STRING, OPT_NOCASE, OPT_WHERE, OPT_WORD};
 use crate::tools::query::refs::{OPT_ALL, OPT_COUNT, OPT_IN, OPT_KIND, OPT_LIMIT};
 use crate::tools::query::sections::OPT_BANNERS;
+use crate::tools::query::show::{OPT_FIND, OPT_NAMES};
+use crate::tools::query::unsafe_audit::{OPT_NO_STD, OPT_SUMMARY, OPT_UNJUSTIFIED};
 use crate::tools::query::values::OPT_VIEWS_WHY;
 use crate::tools::query_text::WITH_COMMENTS;
 
@@ -42,7 +43,11 @@ pub fn query_leaf(views: bool, gpa: Gpa) -> Leaf {
     var o: Vec<Opt> = Vec::new_in(gpa);
     o.push(option("root", "ROOT", "the program's root file"));
     o.push(option("in", "FILE|MODULE|ITEM", "only the uses there"));
-    o.push(option("kind", "KIND,...", "read, write, call, init, type, use, mod, pat, def"));
+    o.push(option("kind", "KIND,...",
+        "read, write, call, init, type, use, mod, pat, def; items: fn, method, struct, const, ..."));
+    // (0.25.3) items' filters (show.vl)
+    o.push(option("find", "WORD", "items: those whose name holds WORD (any case if lowercase)"));
+    o.push(flag("names", "items: a line each, its kind and full name"));
     o.push(option("limit", "N", "at most N lines"));
     o.push(option("budget", "TOKENS", "the answer cut to about N tokens"));
     o.push(option("over", "N", "stats: the items over N lines"));
@@ -57,6 +62,9 @@ pub fn query_leaf(views: bool, gpa: Gpa) -> Leaf {
     o.push(option("std-tree", "DIR", "std from its files in DIR"));
     o.push(short_option("C", "OPTION", "features: the build's -C"));
     o.push(flag("count", "how many, per file"));
+    o.push(flag("summary", "unsafe: the counts by class, module, file"));
+    o.push(flag("no-std", "unsafe: the program's sites, not std's"));
+    o.push(flag("unjustified", "unsafe: the sites without UNSAFE:/SAFETY: comments"));
     o.push(flag("transitive", "callees: what they call too"));
     o.push(flag("exact", "the NAME as written, not its end"));
     o.push(flag("all", "everything, no limit or budget"));
@@ -69,7 +77,7 @@ pub fn query_leaf(views: bool, gpa: Gpa) -> Leaf {
     var i = flag("ignore-case", "grep: any case");
     i.short = 'i';
     o.push(i);
-    Leaf::new(o, "name", " -i -C ")
+    Leaf::new(o, "name")
 }
 
 // The last bad option so far: (its word's index, its text, whether it lacks
@@ -92,13 +100,14 @@ fn note(w: inout Worst, at: i64, text: *u8, value: bool) {
 // does not start with '-' (else noted as bad).
 fn value_of(c: Call, name: str, spelled: *u8, w: inout Worst) -> *u8 {
     var out = 0 as *u8;
-    for v in c.m.values(name) {
-        let real = c.line.given(v);
-        let k = c.line.at(real);
-        if real.len() == 0 || real.as_bytes()[0] == '-' {
-            note(&w, k - 1, spelled, true);
+    for ev in c.evs.iter() {
+        if !is_opt(ev, name) {
+            continue;
+        }
+        if ev.text.len() == 0 || ev.text.as_bytes()[0] == '-' {
+            note(&w, ev.at - 1, spelled, true);
         } else {
-            out = c_of(real);
+            out = ev.value;
         }
     }
     out
@@ -107,13 +116,14 @@ fn value_of(c: Call, name: str, spelled: *u8, w: inout Worst) -> *u8 {
 // A count option's value (-1: not given, or bad and noted).
 fn count_of(c: Call, name: str, spelled: *u8, w: inout Worst) -> i64 {
     var n = -1;
-    for v in c.m.values(name) {
-        let real = c.line.given(v);
-        let k = c.line.at(real);
-        let x = if real.len() == 0 || real.as_bytes()[0] == '-' { -1 }
-            else { parse_count(c_of(real)) };
+    for ev in c.evs.iter() {
+        if !is_opt(ev, name) {
+            continue;
+        }
+        let x = if ev.text.len() == 0 || ev.text.as_bytes()[0] == '-' { -1 }
+            else { parse_count(ev.value) };
         if x < 0 {
-            note(&w, k - 1, spelled, true);
+            note(&w, ev.at - 1, spelled, true);
         } else {
             n = x;
         }
@@ -131,6 +141,10 @@ fn apply(c: Call, views: bool) -> QueryArgs {
     OPT_TRANSITIVE = OPT_TRANSITIVE || c.m.flag("transitive");
     OPT_EXACT = OPT_EXACT || c.m.flag("exact");
     OPT_ALL = OPT_ALL || c.m.flag("all");
+    // (0.25.3: query unsafe, tools/query/unsafe_audit.vl)
+    OPT_SUMMARY = OPT_SUMMARY || c.m.flag("summary");
+    OPT_NO_STD = OPT_NO_STD || c.m.flag("no-std");
+    OPT_UNJUSTIFIED = OPT_UNJUSTIFIED || c.m.flag("unjustified");
     TIME_PASSES = TIME_PASSES || c.m.flag("time-passes");
     WITH_COMMENTS = WITH_COMMENTS || c.m.flag("with-comments");
     if c.m.flag("comments") {
@@ -151,14 +165,21 @@ fn apply(c: Call, views: bool) -> QueryArgs {
         OPT_VIEWS_WHY = OPT_VIEWS_WHY || c.m.flag("why");
     }
     // (0.19: -C, the build's features, for `query features`)
-    for v in c.m.values("C") {
-        crate::arch::features::arch_option(c_of(c.line.given(v)));
+    for ev in c.evs.iter() {
+        if is_opt(ev, "C") {
+            crate::arch::features::arch_option(ev.value);
+        }
     }
     let given_in = value_of(c, "in", c"--in", &w);
     if given_in != 0 as *u8 {
         OPT_IN = given_in;
     }
     let root = value_of(c, "root", c"--root", &w);
+    OPT_NAMES = OPT_NAMES || c.m.flag("names");
+    let find = value_of(c, "find", c"--find", &w);
+    if find != 0 as *u8 {
+        OPT_FIND = find;
+    }
     let kind = value_of(c, "kind", c"--kind", &w);
     if kind != 0 as *u8 {
         OPT_KIND = kind;
@@ -199,8 +220,10 @@ fn apply(c: Call, views: bool) -> QueryArgs {
         OPT_MAX_LINES = lines;
     }
     var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for v in c.m.values("name") {
-        args.push(c_of(c.line.given(v)) as i64);
+    for ev in c.evs.iter() {
+        if ev.kind == EV_WORD {
+            args.push(ev.value as i64);
+        }
     }
     QueryArgs { args: args, root: root, bad: w.text, bad_value: w.value }
 }

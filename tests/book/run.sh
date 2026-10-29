@@ -373,6 +373,12 @@ check_unit() {
         (cd "$d/sess" && PATH="$WORK/bin:$PATH" with_timeout 120 sh "$c.sh" </dev/null >"$c.got" 2>&1)
         trimmed "$c.got" >"$c.got.t"
         trimmed "$c" >"$c.want"
+        # (0.25.3) std's positions and counts compared normalized
+        # (tests/stdpos.awk), unless the chapter has `<!-- exact-std -->`
+        if ! grep -q '^<!-- exact-std -->' "$ROOT/book/${cname%%:*}.md" 2>/dev/null; then
+            awk -f "$ROOT/tests/stdpos.awk" "$c.got.t" >"$c.got.n" && mv "$c.got.n" "$c.got.t"
+            awk -f "$ROOT/tests/stdpos.awk" "$c.want" >"$c.want.n" && mv "$c.want.n" "$c.want"
+        fi
         if transcript_matches "$c.want" "$c.got.t"; then
             echo "pass $cname" >>"$d/result"
         else

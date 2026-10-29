@@ -6,7 +6,7 @@ $ check --json
 $ query def add --json
 crate::add	main.vl:3:4	fn	fn add(a: i64, b: i64) -> i64	effects: none
 std::ops::Add::add	<std>:4788:20	trait-method	fn add(self, other: Self) -> Self
-std::gpu::Unwritten::add	<std>:24596:8	method	fn add(inout self, o: Unwritten, group: i64)	effects: panic
+std::gpu::Unwritten::add	<std>:24643:8	method	fn add(inout self, o: Unwritten, group: i64)	effects: panic
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.vl

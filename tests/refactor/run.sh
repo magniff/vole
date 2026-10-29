@@ -3,10 +3,13 @@
 # fix, lint, same-output and the planning queries (query stats, deps,
 # unused, impact). POSIX sh and awk only.
 #
-# usage: tests/refactor/run.sh [-c COMPILER] [-u]
+# usage: tests/refactor/run.sh [-c COMPILER] [-u] [NAME...]
 #
 #   -c COMPILER   the volec binary (default: target/volec)
-#   -u            rewrite the .t files with the output they get now
+#   -u            rewrite the .t files that fail with the output they get
+#                 now (the real numbers, std's too)
+#   NAME          only these transcripts (NAME.t), and not the checks of
+#                 the compiler's own source below
 #
 # Each tests/refactor/NAME.t is a transcript run in a fresh copy of the
 # program tests/refactor/NAME/ (a git repository of its own, so that
@@ -20,7 +23,9 @@
 # path is written `volec`, the copy's `WORK`, the shell's own errors'
 # prefix `tests/refactor/run.sh:` however the runner was called. Lines starting with `##`
 # are comments. A test passes when the transcript it makes is the file,
-# comments aside; one with a `## XFAIL: reason` line is expected to differ
+# comments aside, std's positions compared normalized (0.25.3,
+# tests/stdpos.awk: `<std>:L:C`; a transcript with a line `## exact-std`
+# compares them exactly); one with a `## XFAIL: reason` line is expected to differ
 # (counted xfail), and fails when it does not.
 #
 # Then the compiler's own source is asked for its stats, deps, unused
@@ -38,11 +43,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 COMPILER="$ROOT/target/volec"
 UPDATE=0
+ONLY=
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
         -u) UPDATE=1; shift ;;
-        *) echo "usage: tests/refactor/run.sh [-c COMPILER] [-u]" >&2; exit 2 ;;
+        -*) echo "usage: tests/refactor/run.sh [-c COMPILER] [-u] [NAME...]" >&2; exit 2 ;;
+        *) ONLY="$ONLY $1"; shift ;;
     esac
 done
 case "$COMPILER" in
@@ -100,12 +107,39 @@ transcript() {
     done
 }
 
+STDPOS="$ROOT/tests/stdpos.awk"
+# Whether transcript file $1's text $2 matches what it got, $3 (0.25.3):
+# std's numbers normalized unless $1 says `## exact-std`; with
+# VOLE_STD_SHIFT=1 (tests/stdpos/run.sh) $2's std numbers are moved first,
+# as a std change would move them. Leaves the texts compared in $3.w, $3.g.
+same_transcript() {
+    if [ "${VOLE_STD_SHIFT:-0}" = 1 ]; then
+        awk -v mode=shift -f "$STDPOS" "$2" >"$3.s"
+    else
+        cp "$2" "$3.s"
+    fi
+    if grep -q '^## exact-std' "$1"; then
+        cp "$3.s" "$3.w"
+        cp "$3" "$3.g"
+    else
+        awk -f "$STDPOS" "$3.s" >"$3.w"
+        awk -f "$STDPOS" "$3" >"$3.g"
+    fi
+    cmp -s "$3.w" "$3.g"
+}
+# (VOLE_STD_SHIFT=1: once, without the cache; the shift is the check)
+MODES="off cache"
+[ "${VOLE_STD_SHIFT:-0}" = 1 ] && MODES=off
 for file in "$HERE"/*.t; do
     [ -f "$file" ] || continue
     name=$(basename "$file" .t)
-    for mode in off cache; do
+    if [ -n "$ONLY" ]; then
+        case " $ONLY " in *" $name "*) ;; *) continue ;; esac
+    fi
+    for mode in $MODES; do
     transcript "$file" $mode >"$WORK/$name.got"
-    if [ $UPDATE -eq 1 ] && [ $mode = off ]; then
+    grep -v '^##' "$file" >"$WORK/$name.want"
+    if [ $UPDATE -eq 1 ] && [ $mode = off ] && ! same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
         # (each comment stays before the command it was before)
         awk 'NR == FNR {
                 if ($0 ~ /^##/) { pending = pending $0 "\n" }
@@ -121,7 +155,7 @@ for file in "$HERE"/*.t; do
     # (0.25) `## XFAIL: reason` in a transcript: known to differ, for that
     # reason; one that passes says so (remove the line)
     xfail=$(sed -n 's/^## XFAIL: //p' "$file" | head -1)
-    if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
+    if same_transcript "$file" "$WORK/$name.want" "$WORK/$name.got"; then
         if [ -n "$xfail" ]; then
             echo "FAIL $name ($mode): passes but is marked XFAIL ($xfail); remove the line"
             STATUS=1
@@ -131,13 +165,15 @@ for file in "$HERE"/*.t; do
     elif [ -n "$xfail" ]; then
         echo "xfail $name ($mode): $xfail"
     else
-        echo "FAIL $name ($mode): the transcript differs (< expected, > got):"
-        diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40
+        echo "FAIL $name ($mode): the transcript differs (< expected, > got; std's numbers as L:C, N):"
+        diff "$WORK/$name.got.w" "$WORK/$name.got.g" | sed 's/^/    /' | head -40
         STATUS=1
     fi
     done
 done
 unset VOLE_CACHE
+# (NAME given: those transcripts only)
+[ -z "$ONLY" ] || exit $STATUS
 
 # The compiler's own source.
 check() { # <name> <condition> <output>
@@ -205,8 +241,12 @@ check self_lint "$ok" "$(printf '%s\n' "$out" | head -4)"
 check self_lint_ok "$([ $? = 0 ] && echo 1)" "lint --max-lines 100000 failed"
 # check: the compiler's source has no errors, quickly.
 "$COMPILER" check compiler/src/main.vl >"$WORK/check.out" 2>&1
-# (0.18.1: a clean check says so in one line)
-check self_check "$([ $? = 0 ] && [ "$(cat "$WORK/check.out")" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
+rc=$?
+# (0.18.1: a clean check says so in one line; 0.25.3: but for one
+# unsafe.unjustified warning, the compiler's legacy unsafe, which
+# docs/unsafe-baseline.md counts)
+clean=$(grep -v 'warning\[unsafe\.unjustified\]' "$WORK/check.out" | sed 's/^ok: 0 errors, 1 warning in /ok: 0 errors in /')
+check self_check "$([ $rc = 0 ] && [ "$clean" = "ok: 0 errors in compiler/src/main.vl" ] && echo 1)" "$(cat "$WORK/check.out")"
 # same-output: the compiler against a copy of itself (identical), and
 # against a wrapper that changes one compilation (different).
 cp "$COMPILER" "$WORK/old-volec"
@@ -255,16 +295,18 @@ check module_path_without_crate "$ok" "$out"
 # explain (0.13): every code the compiler's source can print has an
 # entry: the tools' codes (`c"query.no-match"`; 0.17: the own pass's,
 # `c"own.moved"`), the kinds of the
-# compiler's errors (ERR_KIND) and warnings and keyed errors (their
-# third argument); and every entry is such a code.
+# compiler's errors (ERR_KIND; 0.25.3: main.missing) and warnings and keyed errors (their
+# third argument); and every entry is such a code. (0.25.3: lex.* and
+# embed.*, text blocks and include_str; `embed.sh`, a script's name, is
+# not one.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
     # (0.15: guide's codes, written into its own messages)
     grep -rhoE --exclude-dir=.volec '"(error|note) guide\.[a-z-]+' compiler/src | sed -e 's/^"[a-z]* \(.*\)$/c"\1"/'
-} | sed -e 's/.*c"\([^"]*\)"$/\1/' | sort -u >"$WORK/codes"
+} | sed -e 's/.*c"\([^"]*\)"$/\1/' | grep -v '^embed\.sh$' | sort -u >"$WORK/codes"
 "$COMPILER" explain --list | sort >"$WORK/explained"
 missing=$(comm -23 "$WORK/codes" "$WORK/explained")
 extra=$(comm -13 "$WORK/codes" "$WORK/explained")

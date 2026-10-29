@@ -1,0 +1,244 @@
+// Text blocks (0.25.3): string literals of several lines.
+//
+//     let s = """
+//         line one
+//           line two
+//         """;
+//
+// `"""` ending its line opens one; a line whose first non-blank bytes are
+// `"""` closes it. The closing line's indentation is removed from every
+// line (a line indented less is lex.text-block-indent; a blank line may
+// be shorter); the line break after the opening `"""` and the one before
+// the closing line are not part of the value, and every line break in it
+// is '\n' (a CRLF file's too). Escapes work as in "...", and a `\` at the
+// end of a line joins it to the next. `r"""` opens a raw block: no
+// escapes at all; `r#"""` .. `"""#` (any number of `#`s) one whose text
+// may hold a line starting with `"""`. The token is a Str, as "...".
+
+use crate::base::{SRC, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_new, buf_slice};
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_jump};
+use crate::front::lexer::{LEX_END, LEX_POS, LEX_SCRATCH, push_token};
+use crate::front::lexer::Tok::Str;
+use crate::front::lexer::strings::{add_string, lex_escape};
+
+// The number of `#`s of a raw text block at LEX_POS (`r"""`: 0,
+// `r##"""`: 2), or -1 when there is none there.
+pub fn raw_block_hashes() -> i64 {
+    let src = src();
+    var p = LEX_POS + 1;
+    while p < src.len && src[p] == '#' {
+        p += 1;
+    }
+    if quotes_at(src, p) {
+        return p - LEX_POS - 1;
+    }
+    -1
+}
+
+// The text being lexed, SRC up to LEX_END.
+fn src() -> [u8] {
+    // UNSAFE: SRC is the buffer of every source text read, a raw pointer
+    // (base::load_sources; fmt points it at the text it formats).
+    // SAFETY: LEX_END is the end of the text lex_range was given, within
+    // the buffer, which is never freed while tokens are made.
+    unsafe { SRC[0..LEX_END] }
+}
+
+// Whether src[p..] starts with `"""`.
+fn quotes_at(src: [u8], p: i64) -> bool {
+    p >= 0 && p + 2 < src.len && src[p] == '"' && src[p + 1] == '"' && src[p + 2] == '"'
+}
+
+// Whether a plain text block starts at LEX_POS: `"""`.
+pub fn at_text_block() -> bool {
+    quotes_at(src(), LEX_POS)
+}
+
+// A coded error of the lexer at `pos`: the message, the help (when not
+// empty), its fix (SRC[pos..fix_end) replaced by `fix`, when fix_end >=
+// pos: `volec fix --suggested`); fatal when `fatal`, else the lexing goes
+// on.
+fn block_error(code: *u8, pos: i64, message: [u8], help: [u8], fix_end: i64, fix: [u8],
+    fatal: bool) {
+    let saved = ERR_KIND;
+    ERR_KIND = code;
+    err_begin(pos);
+    err_fmt(message);
+    if help.len > 0 {
+        let h = buf_new();
+        buf_bytes(h, help);
+        buf_byte(h, 0);
+        err_help(buf_slice(h).ptr);
+    }
+    if fix_end >= pos {
+        err_fix(pos, fix_end, fix);
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+    if fatal {
+        err_jump();
+    }
+}
+
+// Whether SRC[p..) is the closing delimiter of a block with `hashes`
+// `#`s: `"""` and the `#`s.
+fn closes_at(src: [u8], p: i64, hashes: i64) -> bool {
+    if !quotes_at(src, p) {
+        return false;
+    }
+    for k in 0..hashes {
+        if p + 3 + k >= src.len || src[p + 3 + k] != '#' {
+            return false;
+        }
+    }
+    true
+}
+
+// The text block starting at `start` (its `"""`, or the `r` of a raw one
+// with `hashes` `#`s): the value in LEX_SCRATCH, a Str token.
+pub fn lex_text_block(start: i64, raw: bool, hashes: i64) {
+    let src = src();
+    let end = src.len;
+    var p = start + 3 + if raw { 1 + hashes } else { 0 };
+    // The rest of the opening line: blanks only.
+    while p < end && (src[p] == ' ' || src[p] == '\t') {
+        p += 1;
+    }
+    if p < end && src[p] == '\r' && p + 1 < end && src[p + 1] == '\n' {
+        p += 1;
+    }
+    if p >= end || src[p] != '\n' {
+        if p >= end {
+            unterminated(start, hashes);
+        }
+        block_error(c"lex.text-block-open", p,
+            "a text block's text starts on the line after its opening '\"\"\"'",
+            "end the line after '\"\"\"'; a string of one line is \"...\"", -1, "",
+            fatal: true);
+    }
+    let body = p + 1;
+    // The closing line: the first whose first non-blank bytes close.
+    var line = body;
+    var close = -1;
+    var indent_end = -1;
+    while line < end {
+        var q = line;
+        while q < end && (src[q] == ' ' || src[q] == '\t') {
+            q += 1;
+        }
+        if closes_at(src, q, hashes) {
+            close = line;
+            indent_end = q;
+            break;
+        }
+        while q < end && src[q] != '\n' {
+            q += 1;
+        }
+        line = q + 1;
+    }
+    if close < 0 {
+        unterminated(start, hashes);
+    }
+    let indent = src[close..indent_end];
+    buf_clear(LEX_SCRATCH);
+    line = body;
+    var reported = false;
+    while line < close {
+        // [line, text_end) the line's text, '\n' at line_end
+        var line_end = line;
+        while src[line_end] != '\n' {
+            line_end += 1;
+        }
+        var text_end = line_end;
+        if text_end > line && src[text_end - 1] == '\r' {
+            text_end -= 1;
+        }
+        var first = line;
+        while first < text_end && (src[first] == ' ' || src[first] == '\t') {
+            first += 1;
+        }
+        var from = line + indent.len;
+        if first == text_end {
+            // a blank line: what is past the indentation, if anything
+            if text_end - line <= indent.len || !(src[line..line + indent.len] == indent) {
+                from = text_end;
+            }
+        } else if text_end - line < indent.len || !(src[line..line + indent.len] == indent) {
+            if !reported {
+                short_line(line, first, indent);
+                reported = true;
+            }
+            from = first;
+        }
+        var joined = false;
+        if raw {
+            buf_bytes(LEX_SCRATCH, src[from..text_end]);
+        } else {
+            var i = from;
+            while i < text_end {
+                let c = src[i];
+                if c != '\\' {
+                    var j = i + 1;
+                    while j < text_end && src[j] != '\\' {
+                        j += 1;
+                    }
+                    buf_bytes(LEX_SCRATCH, src[i..j]);
+                    i = j;
+                    continue;
+                }
+                if i + 1 == text_end {
+                    joined = true;
+                    break;
+                }
+                // (an escape stops at the line's end: its digits are not '\n')
+                LEX_POS = i + 1;
+                lex_escape(LEX_SCRATCH, in_char: false);
+                i = LEX_POS;
+            }
+        }
+        line = line_end + 1;
+        if line < close && !joined {
+            buf_byte(LEX_SCRATCH, '\n');
+        }
+    }
+    LEX_POS = indent_end + 3 + hashes;
+    let id = add_string(buf_slice(LEX_SCRATCH));
+    push_token(Str, start, id as u64, 0);
+}
+
+// An unterminated text block at `start`: the closing line it needs.
+fn unterminated(start: i64, hashes: i64) -> ! {
+    let m = buf_new();
+    buf_bytes(m, "unterminated text block: no line starts with '\"\"\"");
+    for _ in 0..hashes {
+        buf_byte(m, '#');
+    }
+    buf_bytes(m, "' to close it");
+    block_error(c"lex.text-block-unterminated", start, buf_slice(m),
+        "a line holding only optional blanks and the closing delimiter ends a text block; its indentation is removed from every line",
+        -1, "", fatal: true);
+    err_jump()
+}
+
+// A content line (from `line`, its text at `first`) indented less than the
+// closing delimiter's `indent`.
+fn short_line(line: i64, first: i64, indent: [u8]) {
+    let m = buf_new();
+    let n = first - line;
+    buf_fmt(m,
+        f"a text block's line is indented {n} byte{if n == 1 { "" } else { "s" }}; its closing '\"\"\"' is indented {indent.len}");
+    let tabs = indent_has_tab(src()[line..first]) != indent_has_tab(indent);
+    block_error(c"lex.text-block-indent", line, buf_slice(m),
+        if tabs { "the indentation mixes tabs and spaces: the closing line's indentation must begin every line, byte for byte" }
+        else { "the closing line's indentation is removed from every line: indent the line at least as much, or move the closing '\"\"\"' left" },
+        first, indent, fatal: false);
+}
+
+fn indent_has_tab(s: [u8]) -> bool {
+    for c in s {
+        if c == '\t' {
+            return true;
+        }
+    }
+    false
+}

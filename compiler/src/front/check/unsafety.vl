@@ -21,13 +21,13 @@
 // a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
 // (fixunsafe.vl).
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice, cstr, intern_c};
+use crate::base::{IntVec, SRC, buf_fmt, buf_new, buf_slice, cstr, intern_c};
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help_fmt, err_str, err_try_fmt,
     err_try_tool, error_keyed, report_error_once,
 };
 use crate::front::ambient::check_ambient_call;
-use crate::front::ast::{FN_UNSAFE, NODES, NODE_REF, NodeKind, child};
+use crate::front::ast::{FN_UNSAFE, NODES, NODE_REF, Node, NodeKind, child};
 use crate::front::ast::NodeKind::{
     Call, Cast, FieldAccess, Ident, MethodCall, TupleField, TyName, TyPtr, TySlice, Unary,
 };
@@ -66,14 +66,64 @@ pub const U_INT_PTR: i64 = 6;
 
 pub const U_C_CALL: i64 = 7;
 
-const U_UNSAFE_CALL: i64 = 8;
+pub const U_UNSAFE_CALL: i64 = 8;
 
 pub const U_UNION: i64 = 9;
 
 pub const U_FN_VALUE: i64 = 11;
 
+// (0.25.3) `volec query unsafe` (tools/query/unsafe_audit.vl): the unsafe
+// operations met inside unsafe code, recorded while the program is
+// checked, four numbers each: the position, the kind (U_*), the function
+// called (FNS; -1: none) and 1 when the pointer is held in a static
+// (`NODES[n]`, `TABLE.data[i]`: a global table), else 0.
+pub static var AUDIT_UNSAFE: bool = false;
+pub static var AUDIT_OPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The function check_call_safety is checking a call of (-1: none).
+static var AUDIT_CALLEE: i64 = -1;
+
+// Unsafe code at position pos (an unsafe block, the body of an `unsafe fn`)
+// was checked: a site without operations has none (not an instance never
+// made).
+pub fn audit_checked(pos: i64) {
+    if AUDIT_UNSAFE {
+        AUDIT_CHECKED.push(pos);
+    }
+}
+
+pub static var AUDIT_CHECKED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn audit_op(n: i64, key: i64, base: i64, callee: i64) {
+    AUDIT_OPS.push(audit_node(n).start);
+    AUDIT_OPS.push(key);
+    AUDIT_OPS.push(callee);
+    AUDIT_OPS.push(if base > 0 && held_in_static(base) { 1 } else { 0 });
+}
+
+// Node n (a copy), for the audit.
+fn audit_node(n: i64) -> Node {
+    // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast).
+    // SAFETY: n is a node the checker is checking or one of its operands
+    // (0 < n < NODE_COUNT), and the table lives while the program is checked.
+    unsafe { NODES[n] }
+}
+
+// Whether pointer expression e is a static, or a field of one
+// (`NODES`, `TABLE.data`).
+fn held_in_static(e: i64) -> bool {
+    var x = audit_node(e);
+    while x.kind == FieldAccess || x.kind == TupleField {
+        x = audit_node(x.a);
+    }
+    x.kind == Ident && x.res == Res::Static
+}
+
 // Operation n, of kind `key`, needs unsafe code.
 pub fn unsafe_op(n: i64, key: i64, message: *u8) {
+    if AUDIT_UNSAFE && UNSAFE_DEPTH > 0 {
+        let base = if key == U_INDEX || key == U_SLICE { audit_node(n).a } else { 0 };
+        audit_op(n, key, base, AUDIT_CALLEE);
+    }
     // (0.25: a pointer made from an integer needs unsafe code in the
     // initializer of a constant or a static too; the fix wraps the cast,
     // which consteval reads through)
@@ -111,6 +161,9 @@ fn raw_param(e: i64) -> bool {
 // `&mut T` when written through, which `fix --values` writes with every
 // call.
 pub fn unsafe_through(n: i64, base: i64, key: i64, message: *u8) {
+    if AUDIT_UNSAFE && UNSAFE_DEPTH > 0 {
+        audit_op(n, key, base, -1);
+    }
     if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
         return;
     }
@@ -141,6 +194,9 @@ pub fn unsafe_through(n: i64, base: i64, key: i64, message: *u8) {
 // `fix --only unsafe` wraps it (its meaning is the same in `unsafe`). For a
 // local `let p = &v;` the try: indexes v itself.
 pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: bool) {
+    if AUDIT_UNSAFE && UNSAFE_DEPTH > 0 {
+        audit_op(n, if slicing { U_SLICE } else { U_INDEX }, base, -1);
+    }
     if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
         return;
     }
@@ -221,6 +277,9 @@ pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: b
 // `fix --suggested` makes it), or the read. Through a raw pointer `*p` is
 // unsafe too: unsafe_op's error, its help naming `*p`.
 pub fn unsafe_index_zero(n: i64, base: i64, pointee: i64) {
+    if AUDIT_UNSAFE && UNSAFE_DEPTH > 0 {
+        audit_op(n, U_INDEX, base, -1);
+    }
     if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
         return;
     }
@@ -426,12 +485,12 @@ pub fn check_call_safety(n: i64, f: i64, first: i64) {
     unsafe {
         // (0.16: std's functions of an ambient allocator)
         check_ambient_call(n, f);
+        AUDIT_CALLEE = f;
         if FNS[f].is_extern {
             unsafe_op(n, U_C_CALL, c"calling a C function is unsafe");
-            return;
-        }
-        if (FNS[f].attrs & FN_UNSAFE) != 0 {
+        } else if (FNS[f].attrs & FN_UNSAFE) != 0 {
             unsafe_op(n, U_UNSAFE_CALL, c"calling an `unsafe fn` is unsafe");
         }
+        AUDIT_CALLEE = -1;
     }
 }

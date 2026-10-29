@@ -19,7 +19,12 @@ seed (Rust)  ──builds──▶  0.1.0  ──builds──▶  next release  
   of `v0.1.0` also holds the seed, so that one tag has everything.
 - **Each release is built by the previous one**, and checked: it must reach
   the fixpoint (compiled by itself, it emits exactly what its first build
-  emits) and pass its own test suite.
+  emits) and pass its own test suite. (0.25.3) A tag cannot change, so a
+  case of its own that cannot pass where the chain runs it is listed in its
+  release's `known_failures` (releases.toml), with why; the suite then
+  passes only when it fails exactly so, and the chain's summary says it
+  (0.25.2.2: one hooks case, which takes the cache's `target/` path for a
+  scratch copy).
 
 `bootstrap/releases.toml` lists the seed's tag and the releases in order,
 with the tag, where the compiler's source is, what builds it, how its
@@ -63,7 +68,308 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.2.1 | `v0.25.2.1` | 0.25.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the first GPU eval: `f(make()?)?`'s empty argument fixed; float math in std, in vole; std::gpu multiple render targets and depth-only passes; frames for an occluded window; twelve diagnostics; `fix --suggested` and the hooks made safe |
 | 0.25.2.2 | `v0.25.2.2` | 0.25.2.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the second GPU eval: a `requires` call's `?` arguments kept to the call; std::gpu layouts per entry point, `gpu.unwritten`, more storage formats, limits named; integer methods; ten diagnostics; `query show` across programs; the hooks quieter and clearer |
 
+| 0.25.3 | `v0.25.3` | 0.25.2.2 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | from the third GPU eval and the roadmap: mapped GPU views that cannot change (breaking: WebGPU's usage rule); a closure drops its by-value parameter; text blocks and `include_str`; the compiler at a terminal; `volec query unsafe` and its baseline; eleven diagnostics; the tools' cache checked; transcripts a std change cannot break; volec's command line on std::cli; the guide's GPU gaps |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.3
+
+The third round of the GPU eval (evals/tasks/0.25.2.2: the same ten
+tasks on 0.25.2.2; no turns lost to the two bugs 0.25.2.2 fixed, where
+round 2 lost about 30; the last round of the loop, as run-to-run noise
+now exceeds a release's effect), what it found, and the roadmap's 0.25.3.
+
+**Breaking:** std::gpu takes WebGPU's usage rule for mappable buffers
+(`MAP_READ` only with `COPY_DST`, `MAP_WRITE` only with `COPY_SRC`), so
+a buffer a kernel writes is read back through a copy into a
+`MAP_READ | COPY_DST` buffer, and a mapped buffer stays mapped until
+`unmap(dev)` (the soundness item below; `guide gpu#skeleton`). The
+round 1–3 eval programs under evals/tasks/0.25.2* that read back
+through a `STORAGE | MAP_READ` buffer stop at `gpu.usage` on 0.25.3;
+they are records of their release.
+
+- **The unsafe audit**: `volec query unsafe [FILE...|std]` lists every
+  unsafe block, `unsafe fn` and extern block of a program (std's too;
+  `--no-std`): its item, the operations inside it that need unsafe as
+  the checker counts them, a class (`ffi`, `alloc`, `intrinsic`,
+  `transmute/cast`, `raw-pointer`, `static-mut`, `other`), whether the
+  comments right above it say `UNSAFE:` and `SAFETY:`, and blocks with
+  nothing unsafe inside (`none (unneeded)`); `--unjustified`,
+  `--summary`, `--json`. `volec check` warns about a site without both
+  comments (`unsafe.unjustified`, the first five and a count; `check
+  --deny-warnings` makes it an error); the commit hook and premerge ask
+  the compiler for the sites a change adds (tools/unsafe-diff-check.py,
+  its 12-line heuristic left for what the compiler cannot read); the
+  baseline, docs/unsafe-baseline.md (compiler/src 5,316 unjustified of
+  5,380 sites, 938 blocks unneeded; std 1,194 of 1,204), and the gate's
+  `unsafe-audit` row, which fails when either count rises.
+
+- **Soundness**: a mapped read view of a GPU buffer no longer changes
+  under the program (the round 3 GPU eval's ocean: `let v =
+  gpu::f32s(r.map_read(dev))`, then a copy into `r`, and `v` read 1,
+  then 2, racing the GPU without a wait). As in wgpu, `map_read` leaves
+  the buffer mapped until `buf.unmap(dev)`, in state kept with the
+  native buffer: a copy into a mapped buffer (or `write_buffer`) stops
+  with `gpu.state` where it is recorded, and `queue.submit` stops when
+  the copy was recorded before the `map_read`; `unmap` takes the buffer
+  `inout`, so the checker refuses it while a view is used, and
+  `map_read_copy_in` maps, copies and unmaps. `dev.buffer` and
+  `buffer_init` take WebGPU's rule (`gpu.usage`): `MAP_READ` with
+  `COPY_DST` alone, `MAP_WRITE` with `COPY_SRC` alone, so the GPU
+  reaches a mappable buffer only by copies (a kernel's output is read
+  through a copy into a `MAP_READ | COPY_DST` buffer; the guide, tests
+  and examples moved). `gpu::f32s`, `u32s`, `i32s`, their `_mut` forms
+  and `bytes_of_*` are `#[views(..)]` of their argument, and the
+  checker keeps such a declared cast (a `[u8]` viewed as `[f32]`)
+  past its type filter, which had dropped it: `f32s(r.map_read(dev))`
+  viewed nothing, so `r` could be unmapped, or a Vec grown, under it.
+  Inference carries the cast on: a function of the program's own that
+  returns it (through locals, calls, structs, other such functions) is
+  inferred to view its parameter, with no `#[views]`.
+- **Diagnostics from the third GPU eval** (evals/tasks/0.25.2.2: eleven
+  messages that cost agents turns):
+  - `fn bump(inout x: i64)` is `conv.mode_order`: the mode goes after the
+    colon, `x: inout i64` (the exact fix; `let x: T` is `x: T`), and the
+    function is checked as if so written; it was "'inout' is a keyword:
+    rename it";
+  - an unknown name std has in several modules (`Matches`: std::cli's and
+    std::string's) gets the one whose module the file names, else each;
+    it was std::string's, the module loaded first;
+  - `gpu::Instance` after `use std::gpu::{Surface};` (or `fs::read_in`
+    with no `use`): `use std::gpu;` brings the module's name (the fix adds
+    it); `fs` was "vole's std has no such module";
+  - `const X: str = "..."`: a `str` is a static's (the fix), bytes a
+    constant's; it was "constants must be ... string literals";
+  - `v == s` of a `Vec<u8>` and a `[u8]`: `v.as_slice() == s`, the exact
+    fix; `Duration - Duration`: the type's methods for it
+    (`b.saturating_sub(a)`, the fix);
+  - `{s}` of a slice says why it has no Display; `{s:?}` of a slice whose
+    elements have Debug **now works** (`[1, 2, 3]`, `Fmt::debug_slice`);
+  - own.moved and own.move_out of a move-only value name the statement
+    that moved it: a struct literal or a tuple (`let (a, b) = (self.a,
+    self.b)`), and a std function that keeps it (`'Vec::push' keeps it`,
+    not "take it let"); a std::gpu handle's help points at
+    `volec guide gpu#handles`;
+  - a value whose type came from its literals (`let dt = 1.0 / 60.0;`
+    used as an f32): a note at the `let`, `note: FILE:L:C: 'dt' is 'f64'
+    from its literals: annotate it, `let dt: f32 = ...``, beside the
+    edit and the fix there (errors may now have `note:` lines about
+    another place).
+- **std::cli**: `m.get(name)`, `get_as` and `values` of a flag fail
+  (`cli.kind`, at the caller's line: "read a flag with m.flag(NAME)");
+  `m.get("headless").is_some()` on a flag was always false (one agent
+  lost a 120 s GPU run to it). `m.flag(name)` of an option stays what it
+  was: whether it was given.
+- **The compiler at a terminal** (base/term.vl): a build shows its
+  phases (`Checking main.vl ... ok` for each of the program's files, or
+  `... 2 errors`; `Compiling main.vl (-O2, aarch64-macos)`; `Linking
+  prog`) and ends with `Finished prog in 0.42s` or `Failed prog: 2
+  errors`; each diagnostic is rustc's shape, coloured: the position as
+  `FILE:LINE:COL`, the source line, a caret under what is at the
+  position, the `help:` and a highlighted `try:`. `check` gives the same
+  per-file lines and summary. `--color=auto|always|never` (auto: when
+  stderr is a terminal) and `NO_COLOR` (no colour; `--color=always`
+  overrides it). Off a terminal (an agent, a hook, a pipe, the tests)
+  and with `--color=never` the output is 0.25.2's, byte for byte.
+- **`main.missing`**: building an executable of a program with no `fn
+  main` is a compiler error after the checks, with `try:` lines that add
+  `fn main() -> i32 { 0 }` or build an object (`-c`), instead of the
+  linker's `Undefined symbols: "_main"`.
+- **A failed link is one vole error**, never the linker's text first
+  (back/objfile/linkfail.vl reads ld64's, ld-prime's, GNU ld's and lld's):
+  `link.undefined` (at the extern declaration of the symbol, naming its
+  block's `#[link]`), `link.no-library`, `link.no-framework`,
+  `link.duplicate`, `link.c-file` (a C file of the command line that does
+  not compile: its errors under the error), `link.no-linker`,
+  `link.no-input` (checked before the link) and `link.failed` (anything
+  else, the linker's lines under it). `--verbose` prints the link's
+  command and the linker's whole text. tests/refactor/tty253.t has a case
+  for each that can be made on macOS and Linux alike.
+- **`volec build main.vl -o x`** says `'build' is not a volec command or a
+  file` with `try: volec main.vl -o x` (`cli.not-a-command`); `run` gives
+  `volec main.vl -o main && ./main`, a near-miss of a command (`chek`)
+  that command.
+- **Text blocks**: `"""` ending its line opens a string literal of
+  several lines, a line holding only blanks and `"""` closes it, and the
+  closing line's indentation is removed from every line (a line
+  indented less is `lex.text-block-indent`, whose fix `volec fix
+  --suggested` makes). Escapes work as in `"..."`, a `\` at a line's end
+  joins it to the next; `r"""` is a raw block, without escapes (WGSL,
+  regular expressions), and `r#"""` .. `"""#` holds a line starting
+  with `"""`. A text block is a string literal (`[u8]`, `str`, in a
+  `const` or `static`); `volec fmt` keeps its lines; a CRLF file's line
+  breaks are `\n` in the value. New codes: `lex.text-block-open`,
+  `lex.text-block-indent`, `lex.text-block-unterminated` (`volec
+  explain`). docs/grammar.md, "Text blocks"; `guide syntax`.
+- **`include_str("shader.wgsl")` and `include_bytes("font.bin")`**: a
+  file's contents as a string literal, read at compile time, the path
+  relative to the file holding the call (Rust's `include_str!(..)` is
+  the same call). include_str's file must be UTF-8 (`embed.utf8`, fixed
+  to include_bytes by `fix --suggested`); include_bytes' value is a
+  `[u8]` whatever its bytes. A missing file is `embed.missing` (naming
+  the path it tried), a path that is not a literal `embed.path`. The
+  embedded files are inputs of the build: the tools' cache holds only
+  while each has the bytes it had, and the code cache rebuilds what a
+  change changes (tests/embed/run.sh, the `embed-checks` suite). The
+  language server's go to definition on the call opens the file.
+- **The examples**: examples/gpu's shaders are raw text blocks (fluid2d,
+  galaga, galaxy, life) or `.wgsl` files read by `include_str`
+  (pathtrace, voxel), their output unchanged; voltty's shader is
+  `include_str("cells.wgsl")`, and `render/embed.sh`, which made it a
+  constant, is gone. The guide's GPU programs use text blocks.
+- **`volec test` shows what tests print** (the round 3 eval's sdftext
+  failed asserts on purpose to see values): a failing test's own stdout
+  and stderr are under its failure (`  stdout: x = 3`), and the
+  failure's reason is the runtime's report, no longer a line the test
+  printed to stderr; `--show-output` (`--nocapture` too) prints every
+  test's under its name (`OUTPUT NAME`; per level when -O0 and -O2
+  printed different things). A run with every test passing and no flag
+  prints what it printed before.
+- **`query show TYPE` lists the type's methods** after its source, one
+  signature line each from every `impl` (a trait impl's marked `//
+  impl Display for Error`, a contract cut to `requires ...`), at most 50
+  (`--all`: every one).
+- **`query items` filters**: `--find WORD` (the items with WORD at the
+  start of a word of their name, any case when WORD is lowercase),
+  `--kind fn,method,struct,enum,trait,const,...` and `--names` (a line
+  an item: its kind and full path). `query items std --find clamp`
+  finds `f64::clamp`, `i64::clamp` and the rest; `--find PI` the
+  language's own constants too (`f64::consts::PI`); `guide math`
+  starts with it.
+- **The check hook names every rewrite**: each change of its fixes is
+  a `changed FILE:LINE: OLD -> NEW` line, repeats included (past 10,
+  their summary line); an agent's own `volec fmt` gets the lines it
+  changed (from `volec query diff`, at most 5). The hook itself formats
+  nothing.
+- **A std change no longer breaks unrelated transcripts**: the query,
+  refactor, walkthrough and book runners compare std's positions
+  normalized (tests/stdpos.awk): `<std>:LINE:COL` and
+  `compiler/std/FILE.vl:LINE:COL` as `L:C`, the rows under a `# <std>`
+  header, a std module's item count (`std::gpu<TAB><std><TAB>N`) and a
+  std item's `refs --count`. A program's own positions compare exactly,
+  and so does a transcript with a line `## exact-std` (a README's or
+  chapter's `<!-- exact-std -->`): tests/query/stdpos0253.q (std.vl's
+  lines as `<std>` and as the file, which must agree) and
+  tests/refactor/stdedit.t (its own small std, edited by FILE:LINE).
+  `-u` rewrites only a failing transcript, with the real numbers. The
+  query and refactor runners take NAMEs, as the walkthrough runner does.
+  tests/stdpos/run.sh (category `stdpos`) moves std's numbers in every
+  transcript that has them and runs them: all pass but the exact-std
+  ones, which must fail; `--real` adds a line to std.vl and std::gpu in
+  a copy, rebuilds, and runs the three suites whole.
+- **compiler/src/front/stdsrc.vl stays tracked, and is made, not
+  merged**: a git merge driver (tools/git-hooks/merge-stdsrc, named by
+  .gitattributes) makes it from the merged compiler/std (git merge-tree
+  of the two commits, then that std's embed.sh), so two branches that
+  both change std merge without a conflict on it; when compiler/std
+  itself conflicts, or in a rebase or cherry-pick, it reports a conflict
+  that says to run compiler/std/embed.sh. The commit hook makes it from
+  the staged std and stages it (it refused a std change without it);
+  `bootstrap.sh` makes it from compiler/std before HEAD's compile (a
+  stale one in the work tree is replaced, and said), and premerge's
+  `std` row checks the committed one, from HEAD's std, and says when the
+  driver is not set up. Set up once per clone: `tools/git-hooks/setup.sh`
+  (core.hooksPath and merge.stdsrc). Untracked was not chosen: every
+  release tag's tree must build as `git archive` gives it (the chain),
+  and the tools read the compiler's source, stdsrc.vl included, in a
+  fresh worktree before any build (query, check, the hooks, premerge).
+- **The agent hooks in a tree inside another checkout**: query-first
+  judges a path inside the vole tree that holds it (the nearest directory
+  with compiler/src/main.vl and tools/agent-hooks), before the git root,
+  and scratch (target/, tmp/) by the path inside that tree, not by any
+  target/ or tmp/ of the absolute path: a release's tree extracted under
+  target/bootstrap (the chain runs its suite there) or a copy under /tmp
+  is the compiler's source, and `sed -i` on it is blocked as in the
+  checkout. tools/agent-hooks/test-nested-tree.py runs the hooks' cases
+  in a copy under target/ and one under /private/tmp.
+- **The guide's gaps from the round 3 GPU eval** (eight that cost
+  agents turns), each with a compiled example: `guide gpu` opens with
+  a skeleton (the window loop, a compute pass, a render pass, a
+  readback through a `MAP_READ | COPY_DST` buffer) and a list of its
+  sections, the rest a section at a time (`guide gpu#NAME`) or
+  `--whole`. `gpu#handles`, where own.moved and own.move_out point:
+  which std::gpu objects move and which copy, keeping them in a struct
+  made by a `sink` constructor, a `Vec` or an array, using them in a
+  pass's closure, one of two by a flag. `gpu#ordering`: the dispatches
+  of one pass run in order, each seeing the writes of the ones before
+  (Metal's serial compute encoder; no barrier), with the cost of a
+  pass and a submit. `gpu#ping-pong`: two buffers, two bind groups, the
+  parity, every step in one pass, the state in the buffer written
+  last. `gpu#per-step-parameters`: why one uniform cannot vary across
+  the steps of one submit, and three ways with their costs (a submit a
+  step; a uniform range a step; a storage buffer of parameters indexed
+  by a step the GPU counts). `window#mouse-and-surface-size`: map the
+  mouse with `surf.width` and `.height`, which `configure` at each
+  `Resize` sets, never a size taken at the start.
+  `window#when-the-window-is-not-shown`: the 10 Hz timer's frames, and
+  timing headless instead (submit N, `wait_idle`, divide: throughput,
+  not latency). `text#string-constants`: `const X: [u8]`, `static X:
+  str`, `static X: [str; N]`, text blocks and `include_str`; what
+  `as_slice`, `as_bytes`, `format_in` and `extend_from_slice` turn
+  into what; what `panic` and `println` take. compiler/guide/embed.sh
+  writes a topic of more than 990 lines as several functions.
+- **The chain and a tag's own suite**: a release's tree cannot change,
+  so a case of its own that cannot pass where the chain runs it is
+  listed in its releases.toml entry (`known_failures`, CATEGORY:COUNT)
+  with why; its suite passes only when it fails exactly so, and the
+  summary says it. 0.25.2.2 has one: a hooks case whose hook takes the
+  cache's `target/` path for a scratch copy (fixed in 0.25.3's hook).
+- **The tools' cache, fixed**: `query show` (and `context`) of one of
+  std's items no longer crashes when it answers from the cache (SIGSEGV
+  every time, in 0.25.2.2 too: `query show parse_primary` in the
+  compiler, whose std has a `Front::parse_primary`). Its `// use` line
+  asks what `std::NAME` names, which the front end answers from its
+  scopes and its table of items' nodes; a program from the cache has
+  neither, and the answer read that table through a null pointer. The
+  cache now keeps those answers (its format 9: a cache of 0.25.2.2 is
+  not read, and is made again), the answers from it are the same as
+  without it, and the table is not read where it was not made
+  (tests/query/stdcache0253.q).
+- **The tools' cache, checked**: tests/cachediff/run.sh runs every
+  command line of the query and refactoring transcripts and of the
+  walkthroughs (1,297 lines, 132 transcripts) without the cache, with
+  a fresh one and from it, on the same state of the program, and
+  compares the output,
+  the exit status and the files left (a sample in the suite, category
+  `cachediff`; all of it in the gate's `cachediff` step, --quick too).
+  What it found: `volec` run from `$PATH` never had a cache (the
+  compiler hashes its own file, and found none by a name without a
+  `/`); and a cache made by the compiler under one name (`target/volec
+  check`) was read under another (`volec edit ...`), with its errors'
+  `try:` lines naming the first: `check` printed them, and an edit
+  compared them with its own check's, took them for new errors and
+  refused itself (`edit.breaks`). The cache's key now has the name the
+  compiler was run by (tests/refactor/cachename0253.t).
+
+- **A closure drops its by-value parameter** (a leak since 0.19, F20):
+  one given to an `FnMut(sink T)` bound (`map`, `for_each`, `fold`,
+  `Option::map`, `map_err`, `and_then`, `unwrap_or_else`, a program's
+  own) owns its argument and drops it at the end of its body unless the
+  body moves it out (returns it, pushes it, passes it on to a `sink`
+  parameter; on one path, by a drop flag); `|_|` drops it too. A closure
+  may say so itself, `|d: sink D|` (was `conv.sink_type`). A let
+  parameter still borrows, and a borrowing iterator's items (`w.iter()`,
+  a HashMap's) stay the container's: `own.iter_item_copy` is kept
+  (lifting it, `w.iter().collect_in(gpa)` still frees each element
+  twice). Fuzzed: semfuzz's `--closure-params` (in the gate's
+  `fuzz-sem`) and the argument sweep's `own_arg_temp_sweep_closure`
+  (1,680 cases); 12 XFAILs (the leaks, `|d: sink D|`) now pass.
+- **volec's command line on 0.25.2's std::cli**: the compiler is built by
+  0.25.2.2, so the workarounds of compiler/src/cli/ for 0.25.1's std::cli
+  are gone (line.vl 608 lines to 425): the line's words go to std::cli
+  as they are, the order of different options' values is
+  `Matches::indices_of`, a word starting with `-` that is no option is a
+  word by `allow_hyphen_values`, `--overlay PATH COPY`, `--rename A B`,
+  `--subst P R` take `num_values(2)`, probe's words after `--` are
+  `last`, a build's `--stats` and `--print-checks` `default_missing`,
+  and the editing commands' shared options `edit`'s `global` ones.
+  Messages, `try:` lines and exit statuses are as before
+  (tools/cli-compat.py: 0 differences on 1,438 command lines but `-O3`
+  of `probe` and `test`), with the rules of every other option: `-O3` is
+  `-O 3` (`-O takes 0, 1 or 2, not '3'`; probe took it and failed
+  later), `-Iinc`, `-j2` are `-I inc`, `-j 2`, a cluster `-in` of
+  `query grep` is `-i -n`, and `--rename=A B` is `--rename A B`.
+  docs/design/cli.md, "0.25.3", lists what std::cli still has no rule
+  for and volec keeps.
 
 ### What's new in 0.25.2.2
 

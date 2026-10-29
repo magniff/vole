@@ -129,8 +129,10 @@ methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
 return. Display is in std for the numbers, `[u8]` and the
 error enums; Debug for those (a `[u8]` quoted and
 escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
-`Some(5)`, `{1: 2}`). A slice `[T]` has no Debug (it would clash with
-`[u8]`'s): `std::debug_list(f, s)` writes one from a Debug impl.
+`Some(5)`, `{1: 2}`). `{s:?}` of a slice `[T]` whose T has Debug
+writes it as a Vec's, `[1, 2]` (0.25.3); the slice has no Debug impl of
+its own (it would clash with `[u8]`'s), so a Debug impl writes one with
+`std::debug_list(f, s)`.
 
 ```vole
 #[derive(Debug, Clone)]

@@ -5,8 +5,9 @@
 // parses nor checks it.
 //
 // The cache of a program is target/volec-cache/q-KEY.bin (and
-// q-KEY.refs), KEY a hash of the root as given, the current directory
-// and the target; $VOLE_CACHE names another directory, or `off`.
+// q-KEY.refs), KEY a hash of the root as given, the current directory,
+// the target and the compiler as it was run (0.25.3: the name the errors'
+// `try:` lines print); $VOLE_CACHE names another directory, or `off`.
 // Without $VOLE_CACHE and a ./target directory there is none.
 //
 // It holds for the compiler that wrote it (a hash of its executable) and
@@ -26,14 +27,16 @@ use crate::base::{
     buf_reserve, buf_slice, buf_str, fclose, fopen, fwrite, memcpy, memset, restore_sources,
     restore_sym, strlen, sym_hash,
 };
-use crate::base::diag::{diag_records, diag_restore};
+use crate::base::diag::{DIAG_PROG, diag_records, diag_restore};
 use crate::base::timer::{TIME_PASSES, T_CACHE, timer_add, timer_now};
 use crate::front::cimport::IMPORTED_START;
+use crate::front::embed::{embed_count, embed_path_at, read_embedded};
 use crate::front::lexer::init_lexer;
 use crate::front::modules::{
     C_MODULE, INLINE_MODS, MODULES, MODULE_PROBES, STD_MODULE, add_module, init_modules,
     module_count,
 };
+use crate::front::modules::lookup::{restore_std_keys, std_item_keys};
 use crate::front::own::diag::OWN_MODE;
 use crate::tools::edit::items::{item_head, item_tail, keyword_head};
 use crate::tools::proc::{
@@ -68,8 +71,9 @@ extern "C" {
 
 // "tachyonq", and the version of the format.
 const MAGIC: i64 = 8174034211981648244;
-// (6, 0.17: the kinds and view summaries; 7, 0.19: the features)
-const VERSION: i64 = 7;
+// (6, 0.17: the kinds and view summaries; 7, 0.19: the features; 9,
+// 0.25.3: std_item_key's answers)
+const VERSION: i64 = 9;
 
 // The program came from the cache: the answers take what the nodes and
 // tokens would give from the C_* tables (per definition).
@@ -213,6 +217,17 @@ fn hash_region(p: *u8, n: i64) -> u64 {
     }
 }
 
+// (0.25.3) The hash of embedded file `path`'s bytes (include_str,
+// include_bytes; a NUL after the path), -1 when it cannot be read.
+fn embedded_hash(path: [u8]) -> i64 {
+    let b = buf_new();
+    if !read_embedded(path, b) {
+        return -1;
+    }
+    let text = buf_slice(b);
+    (hash_region(text.ptr, text.len) >> 1) as i64
+}
+
 // The hash of buffer b's words from word `from` on (a cache file's body:
 // a file that is not as written is not read).
 fn body_hash(b: i64, from: i64) -> i64 {
@@ -239,8 +254,14 @@ pub fn ident() -> i64 {
             slash = slash || PROG[i] == '/';
             i += 1;
         }
+        // (0.25.3: `volec` run from $PATH, without a `/`, is the file the
+        // shell found; it had no cache before)
+        var exe = PROG;
+        if !slash && PROG != 0 as *u8 {
+            exe = crate::tools::proc::find_in_path(PROG[0..i]);
+        }
         let b = buf_new();
-        if slash && read_file_if(PROG, b) {
+        if exe != 0 as *u8 && read_file_if(exe, b) {
             IDENT = (hash_region(BUFS[b].data, BUFS[b].len) >> 1) as i64;
             if IDENT == 0 {
                 IDENT = 1;
@@ -293,6 +314,11 @@ fn cache_file(root: *u8, target: i64, ext: *u8) -> *u8 {
         put(k, target);
         // (0.17: the own pass's mode decides the errors: --values)
         put(k, OWN_MODE);
+        // (0.25.3: and the compiler as it was run, which the errors' `try:`
+        // lines kept in the cache name: `target/volec check`, then `volec
+        // edit ...` from $PATH, read them as other errors, new ones, and
+        // refused the edit; `volec check` printed `try: target/volec ...`)
+        put_cstr(k, if DIAG_PROG == 0 as *u8 { c"volec" } else { DIAG_PROG });
         let h = hash_region(BUFS[k].data, BUFS[k].len);
         let out = buf_new();
         buf_str(out, cache_dir());
@@ -461,6 +487,13 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
                 return false;
             }
         }
+        let n_embeds = get_count(2);
+        for _ in 0..n_embeds {
+            let path = get_str();
+            if RD_BAD || get() != embedded_hash(path) {
+                return false;
+            }
+        }
         var words = 0 as *i64;
         var n_refs = 0;
         if refs {
@@ -583,6 +616,21 @@ fn restore_tables() {
             warnings.push(get());
         }
         diag_restore(&errors, &warnings, error_count);
+        // (0.25.3) std_item_key's answers, symbols both (a pair naming no item
+        // is none)
+        var std_keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let n_std = get_count(2);
+        for _ in 0..n_std {
+            let s = get();
+            let k = get();
+            if s < 0 || s >= n_syms || k >= n_syms {
+                RD_BAD = true;
+            } else if k >= 0 {
+                std_keys.push(s);
+                std_keys.push(k);
+            }
+        }
+        restore_std_keys(std_keys);
     }
 }
 
@@ -733,6 +781,13 @@ fn save(root: *u8, target: i64) {
         for k in 0..MODULE_PROBES.count {
             put_cstr(b, MODULE_PROBES.data[k] as *u8);
         }
+        // (0.25.3) the embedded files, each with the hash of its bytes
+        put(b, embed_count());
+        for k in 0..embed_count() {
+            let path = embed_path_at(k);
+            put_str(b, path);
+            put(b, embedded_hash(path));
+        }
         save_tables(b);
         // (the number of words, in the header)
         let header = BUFS[b].data as *i64;
@@ -746,8 +801,9 @@ fn save(root: *u8, target: i64) {
 
 fn save_tables(b: i64) {
     unsafe {
-        put(b, SYM_COUNT);
-        for s in 0..SYM_COUNT {
+        let n_syms = SYM_COUNT;
+        put(b, n_syms);
+        for s in 0..n_syms {
             put(b, sym_hash(s) as i64);
             put_str(b, SYMS[s].text);
         }
@@ -852,6 +908,18 @@ fn save_tables(b: i64) {
             put_str(b, buf_slice(warnings.data[w + 1]));
             put(b, warnings.data[w + 2]);
             w += 3;
+        }
+        // (0.25.3) What `std::NAME` names, for each symbol (std_item_key:
+        // the restored program has no scopes to ask). Last: what asking
+        // does to the tables is not in what was written above.
+        var std_keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        std_item_keys(n_syms, &std_keys);
+        put(b, std_keys.count / 2);
+        var p = 0;
+        while p + 1 < std_keys.count {
+            put(b, std_keys.get(p));
+            put(b, if std_keys.get(p + 1) < n_syms { std_keys.get(p + 1) } else { -1 });
+            p += 2;
         }
     }
 }

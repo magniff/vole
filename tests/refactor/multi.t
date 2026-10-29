@@ -172,7 +172,7 @@ try: volec query show crate::main
 try: volec edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, r: Rect)' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32'
-main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly; 'k' is 'i64' from its literals at main.vl:14:5 (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, 'k: i32' | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
+main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | note: main.vl:14:5: 'k' is 'i64' from its literals (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, `let k: i32 = ...` | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --type k i32 --default '$k as i32'
@@ -181,7 +181,7 @@ try: volec query show crate::main
 try: volec edit patch scale --old 'k: i64' --new 'k: i32' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32' --old 'r.w * k, h: r.h * k' --new 'r.w * k as i64, h: r.h * k as i64'
-main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly; 'k' is 'i64' from its literals at main.vl:14:5 (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, 'k: i32' | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
+main.vl:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | note: main.vl:14:5: 'k' is 'i64' from its literals (a float literal is f64, an integer one i64, where nothing gives their type): annotate it, `let k: i32 = ...` | try: k as i32 | try: volec edit patch main.vl:14 --old 'let k =' --new 'let k: i32 =' main.vl | try: volec fix --suggested main.vl  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: volec refactor signature crate::shapes::scale --type k i32 --default '$k as i32'

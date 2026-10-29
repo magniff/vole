@@ -245,7 +245,7 @@ awk '
         if (section == "seed")
             print "seed|" v["tag"] "|" v["dir"]
         if (section == "release")
-            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"] "|" v["bin"] "|" v["ext"]
+            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"] "|" v["bin"] "|" v["ext"] "|" v["known_failures"]
         if (section == "head")
             print "head|" v["compiler"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"] "|" v["bin"] "|" v["ext"]
         split("", v)
@@ -288,7 +288,7 @@ check_host() { # <what> <comma-separated hosts>
 }
 
 prev_version=""
-while IFS='|' read -r _ version _ _ _ _ _ hosts _ _ _; do
+while IFS='|' read -r _ version _ _ _ _ _ hosts _ _ _ _; do
     [ -z "$prev_version" ] || version_lt "$prev_version" "$version" \
         || die "$MANIFEST: release $version comes after $prev_version but is not newer (versions compare by number: 0.9.0 < 0.10.0)"
     prev_version=$version
@@ -440,10 +440,10 @@ compile_with() { # <cli> <bin> <src> <root> <out> <ext>
 # fixpoint and, if <run_tests> is 1, runs the tree's test suite; leaves
 # <dir>/<bin> (the compiler's name, from releases.toml) and sets
 # TEST_TOTAL.
-build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir> <run_tests> <bin> <ext>
+build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir> <run_tests> <bin> <ext> [<known_failures>]
     bc_name=$1 bc_tree=$2 bc_src="$2/$3" bc_root=$4 bc_cli=$5 bc_tests=$6
     bc_builder_cli=$7 bc_builder_bin=$8 bc_builder_name=$9 bc_dir=${10} bc_run_tests=${11}
-    bc_bin=${12} bc_ext=${13}
+    bc_bin=${12} bc_ext=${13} bc_known=${14:-}
     mkdir -p "$bc_dir"
     step "$bc_name: building with $bc_builder_name"
     compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1" "$bc_ext"
@@ -455,18 +455,27 @@ build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli
     cp "$bc_dir/build2" "$bc_dir/$bc_bin"
     TEST_TOTAL="not run"
     [ "$bc_run_tests" = 1 ] || return 0
-    run_suite "$bc_name" "$bc_tree" "$bc_tests" "$bc_dir" "$bc_bin"
+    run_suite "$bc_name" "$bc_tree" "$bc_tests" "$bc_dir" "$bc_bin" "$bc_known"
 }
 
 # Runs the test suite of the tree <tree> with <dir>/<bin>; sets
 # TEST_TOTAL.
-run_suite() { # <name> <tree> <tests> <dir> <bin>
+# (0.25.3) A released tree's suite may fail only as its release's
+# known_failures (releases.toml) say: each category's fail count exactly.
+run_suite() { # <name> <tree> <tests> <dir> <bin> [<known_failures>]
     step "$1: running its test suite ($3)"
+    rs_known=""
     if ! (cd "$2" && "./$3" -c "$4/$5" -t "$HOST") >"$4/tests.log" 2>&1; then
-        tail -40 "$4/tests.log" >&2
-        die "$1: test suite failed (log: $4/tests.log)"
+        rs_fails=$(awk 'f && $1 != "total" && $4 ~ /^[0-9]+$/ && $4 > 0 { s = s (s == "" ? "" : ",") $1 ":" $4 }
+                        $1 == "category" { f = 1 } END { print s }' "$4/tests.log")
+        if [ -z "${6:-}" ] || [ "$rs_fails" != "$6" ]; then
+            tail -40 "$4/tests.log" >&2
+            die "$1: test suite failed (log: $4/tests.log)${6:+; known failures $6, these $rs_fails}"
+        fi
+        rs_known=", $rs_fails known failures (releases.toml)"
+        step "$1: only its known failures failed ($rs_fails)"
     fi
-    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$4/tests.log")
+    TEST_TOTAL=$(awk '$1 == "total" { print $2 " passed, " $3 " xfail" ($5 > 0 ? ", " $5 " SKIPPED" : "") }' "$4/tests.log")$rs_known
     # (0.25.2) skipped is not passed: the reasons, where they are seen
     grep '^SKIP ' "$4/tests.log" | sed "s/^/  $1: /" || true
 }
@@ -534,7 +543,7 @@ PREV_CLI=seed
 PREV_NAME=seed
 STOPPED=0
 
-while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; do
+while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext known; do
     [ "$built_by" = "$PREV_NAME" ] \
         || die "release $version is built by '$built_by', but the previous step is '$PREV_NAME'"
     commit=$(tag_commit "$tag")
@@ -570,7 +579,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
             step "$version: $tag ($short), built by another run (cached)"
             TEST_TOTAL="not run (--history $HISTORY)"
         elif [ -f "$dir/fixpoint" ] && [ -x "$dir/$bin" ] && [ -d "$dir/tree" ]; then
-            run_suite "$version" "$dir/tree" "$tests" "$dir" "$bin" </dev/null
+            run_suite "$version" "$dir/tree" "$tests" "$dir" "$bin" "$known" </dev/null
             echo "$TEST_TOTAL" >"$dir/ok.new"
             mv "$dir/ok.new" "$dir/ok"
         else
@@ -578,7 +587,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; 
             rm -rf "$dir.building"
             extract "$commit" "$dir.building/tree"
             build_and_check "$version" "$dir.building/tree" "$compiler" "$root" "$cli" "$tests" \
-                "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir.building" "$run_tests" "$bin" "$ext" </dev/null
+                "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir.building" "$run_tests" "$bin" "$ext" "$known" </dev/null
             : >"$dir.building/fixpoint"
             if [ $run_tests -eq 1 ]; then
                 echo "$TEST_TOTAL" >"$dir.building/ok"
@@ -615,6 +624,19 @@ if [ $STOPPED -eq 0 ]; then
         head_desc="HEAD $(echo "$head_commit" | cut -c1-12)"
         head_tree="$head_dir/tree"
         extract "$head_commit" "$head_tree"
+    fi
+    # (0.25.3) std's embedded text, compiler/src/front/stdsrc.vl, is a
+    # product of the build: made from compiler/std before HEAD's compile
+    # (a release's tree is built with the file its tag holds). In the work
+    # tree a stale one is replaced, and said: commit it (the commit hook
+    # and the merge driver keep it current, tools/git-hooks/setup.sh).
+    if [ -f "$head_tree/compiler/std/embed.sh" ] && ! sh "$head_tree/compiler/std/embed.sh" -c >/dev/null 2>&1; then
+        sh "$head_tree/compiler/std/embed.sh" || die "compiler/std/embed.sh failed in $head_tree"
+        if [ $WORKTREE -eq 1 ]; then
+            note "compiler/src/front/stdsrc.vl was stale: made again from compiler/std (commit it)"
+        else
+            note "HEAD's compiler/src/front/stdsrc.vl is stale: built with it made again from compiler/std"
+        fi
     fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
         "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS" "$HEAD_BIN" "$HEAD_EXT"

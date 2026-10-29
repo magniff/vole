@@ -1,7 +1,9 @@
 ## The tools' fixes of 0.17 (tests/refactor/tools017/).
 $ check
+main.vl:14:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+main.vl:22:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 calc.vl:4:17: warning[use.unused] unused import 'area': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 1 warning in main.vl
+ok: 0 errors, 3 warnings in main.vl
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines

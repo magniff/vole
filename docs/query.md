@@ -22,10 +22,11 @@ volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [-
 volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
+volec query unsafe [FILE...|DIR|std] [--no-std] [--unjustified] [--summary] [--json]   (0.25.3) every unsafe site
 volec query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
 volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
-volec query items [MODULE|TYPE...] [--root ROOT] [--comments]
+volec query items [MODULE|TYPE...] [--root ROOT] [--comments] [--find WORD] [--kind KIND,...] [--names]
 volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
@@ -114,9 +115,11 @@ tools` the ones a program needs.
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | each local's kind, moves and views at a position (0.17) | `target/volec query own FILE:LINE:COL` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
+| every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/volec query def NAME` |
-| what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE` |
+| what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE`; `query show TYPE` (its source, then a line a method) |
+| only some items; a line each (0.25.3) | `target/volec query items std --find clamp` (WORD at a word's start of the name; any case when lowercase), `--kind fn,method`; `--names` |
 | the item at a compiler error's position | `target/volec query show FILE:LINE` (`--with-comments`: its section comment too) |
 | a module's `use` lines, header comment, extern blocks | `target/volec query show MODULE::use` (`::header`, `::extern`) |
 | change a module's `use` lines or header comment | `target/volec edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
@@ -144,7 +147,7 @@ tools` the ones a program needs.
 | several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
 | several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
 | the errors, one per line (front end only) | `target/volec check` |
-| build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
+| build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`; what tests print: under a failure, every test's with `--show-output`) |
 | a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
 | missing/unused imports, `pub`, `unsafe` blocks | `target/volec fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
 | imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/volec fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
@@ -590,6 +593,63 @@ $ volec query effects total --why alloc
 crate::total→alloc(Gpa) panic
   ...the chain...
 ```
+
+## unsafe (0.25.3)
+
+`unsafe [FILE...|DIR|std]` lists every unsafe site of the program, std's
+too (`--no-std`: the program's only): each `unsafe { }` block, `unsafe
+fn` and `extern` block (vole has no `unsafe impl`), one line each:
+
+```
+FILE:LINE \t KIND \t ITEM \t CLASS \t JUSTIFICATION \t OPERATIONS
+compiler/std/gpa.vl:24	block	<std::Gpa as Allocator>::try_alloc	alloc	missing both	c-call(std::malloc)
+main.vl:22	block	crate::main	raw-pointer	missing both	index x3, static-index
+main.vl:29	block	crate::main	raw-pointer	justified	unsafe-call(total)
+sites: 7 (5 blocks, 1 unsafe fns, 1 extern blocks); unjustified: 4; unneeded: 0
+```
+
+- KIND: `block`, `unsafe fn`, `extern`. ITEM: the function it is in
+  (an `unsafe fn`: itself), else the module (`MODULE::extern`).
+- OPERATIONS: what inside it needs unsafe code, as the checker counted
+  it while it read the program (front/check/unsafety.vl), each in the
+  innermost site holding it, with ` xN` for N of them: `deref`,
+  `field`, `method`, `index`, `slice` (through a raw pointer; `static-`
+  before them when the pointer is held in a static, as the compiler's
+  tables are), `int-to-ptr`, `c-call(F)`, `unsafe-call(F)`,
+  `union-field`, `fn-value`. `none (unneeded)`: a block the checker read
+  with nothing unsafe inside (remove it); `not checked`: code the checker
+  did not reach (a generic function never instantiated); an extern block
+  says how many C functions it declares.
+- CLASS: its operations' first in this order: `ffi` (C called, not the
+  allocator), `alloc` (malloc, free, realloc, a Gpa's raw functions),
+  `intrinsic` (std::arch, a builtin), `transmute/cast` (an integer made
+  a pointer, an `unsafe fn` as a value, a `cast`/`transmute`),
+  `raw-pointer`, `static-mut` (through a pointer in a static), `other`
+  (a union's field, another `unsafe fn`, nothing). An extern block is
+  `ffi`.
+- JUSTIFICATION: `justified` when the comments right above it hold
+  `UNSAFE:` and `SAFETY:` (AGENTS.md: why it cannot be safe, why it is
+  sound), else `missing UNSAFE:`, `missing SAFETY:` or `missing both`.
+  Right above: the comment lines directly over the statement or item
+  the site starts (no blank line between; a `let x = unsafe { .. }`'s
+  are the `let`'s), comments inside that statement before the site, and
+  a comment ending the site's line. `volec check` uses the same rule
+  (`unsafe.unjustified`, a warning; an error with `--deny-warnings`),
+  and so does the commit hook (tools/unsafe-diff-check.py), for the
+  lines a commit adds.
+- FILE (or a DIR, or `std`) keeps the sites there; `--unjustified` the
+  sites without both comments; `--summary` prints the counts instead:
+  the total line, then by class, by top-level module, by file (the 20
+  with the most sites; `--all`: every one) and by justification, each
+  `KEY \t SITES \t UNJUSTIFIED`; `--json` one object a site (`file`,
+  `line`, `kind`, `item`, `class`, `unsafe_comment`, `safety_comment`,
+  `justified`, `checked`, `ops`).
+
+The sites are found in the files' text (not the parser's tree, so code
+the checker never reaches is listed too); the operations need the
+program checked, so `unsafe` reads it in full (no cache).
+docs/unsafe-baseline.md is the compiler's and std's summary, which the
+gate's `unsafe-audit` row holds them to (tests/unsafe_audit.sh).
 
 ## features (0.19)
 
@@ -1067,15 +1127,24 @@ nodes, which are not cached: they read the program in full and leave the
 cache as it is. The answers are the same code, on the same tables,
 byte for byte: tests/query/run.sh and tests/refactor/run.sh run every
 transcript without the cache and with it (a query twice: the second
-must come from the cache when the first made it).
+must come from the cache when the first made it); (0.25.3)
+tests/cachediff/run.sh runs every command line of the query and
+refactoring transcripts and of the walkthroughs three times on the same
+state of its program, without the cache, with a fresh one and from it
+(an edit's from the cache `check` made of the program it reads), and
+compares the outputs, exit statuses and the files the command left (a
+sample in the suite, all of it in the gate's `cachediff` step).
 
 - Where: `target/volec-cache/q-KEY.bin` and `q-KEY.refs` (every
   reference, read by refs and callers only), KEY a hash of the root as
-  given, the current directory and the target. `$VOLE_CACHE` names
+  given, the current directory, the target and (0.25.3) the compiler as
+  it was run (`volec`, `target/volec`: the name the errors' `try:`
+  lines print, which the cache keeps). `$VOLE_CACHE` names
   another directory, or `off`; without it there is a cache only when the
   current directory has a `target` directory.
 - When it holds: for the compiler that wrote it (a hash of its
-  executable), when every file of the program has the text it had (each
+  executable; 0.25.3: also when it is run from `$PATH`, as `volec`,
+  which had no cache before), when every file of the program has the text it had (each
   is read again and hashed: an edit by any means is seen), and when the
   module files that were looked for and not found (`a.vl` before
   `a/mod.vl`) still do not exist. Else the program is read in full and

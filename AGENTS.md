@@ -132,13 +132,18 @@ alone (`tests/run.sh =NAME`) before calling it load or inherited.
   not from a main nobody has checked; if your base fails tests, say which
   ones and fix or report them before your own work, so that your results
   are not mixed with inherited failures.
-- **The commit hook** (`git config core.hooksPath tools/git-hooks`, once
-  per clone) refuses a commit that adds `unsafe` without its `UNSAFE:`/
-  `SAFETY:` comments, stages an unformatted `.vl`, changes `compiler/std`
-  without the regenerated `compiler/src/front/stdsrc.vl`, or adds an
-  example case whose SOURCE does not exist. It runs for every committer,
-  under any agent harness (Claude Code's hooks do not run under opencode
-  or other tools; git's do).
+- **The commit hook** (`tools/git-hooks/setup.sh`, once per clone:
+  core.hooksPath and the stdsrc merge driver) refuses a commit that adds
+  `unsafe` without its `UNSAFE:`/`SAFETY:` comments, stages an
+  unformatted `.vl`, or adds an example case whose SOURCE does not
+  exist; a commit that changes `compiler/std` gets the
+  `compiler/src/front/stdsrc.vl` made from it, staged by the hook, and a
+  merge makes it from the merged std (no conflict on it). It runs for
+  every committer, under any agent harness (Claude Code's hooks do not
+  run under opencode or other tools; git's do).
+- **Transcripts** (tests/query, tests/refactor, the walkthroughs)
+  compare std's positions as `<std>:L:C`: a std change does not touch
+  them; `## exact-std` in one that is about std's positions.
 - **A change to an example** also needs its `tests/examples/*.test` case
   (`// REQUIRES: metal` and `// LINK:` for std::gpu/std::window) and
   `tests/run.sh example example_build`; moving an example moves its case.
