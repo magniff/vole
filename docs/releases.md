@@ -105,6 +105,14 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   were 0.25.3's text blocks read by 0.25.2.2. They check with a current
   target/volec instead, or not at all, and say so in one line
   (`hook.stale-volec`) with the `try:` that installs the release's build.
+- An error whose fix `fix --suggested` refuses before making it (a
+  conversion that loses the value, a cast of a cast, a call made to call
+  itself, std's function for another type) no longer prints `try: volec
+  fix --suggested`; the refusal's `note fix.refused` still says why.
+- A `requires` or `ensures` message's f-string hole that is not an
+  integer, or a fourth hole, is `contract.message`, which says what
+  shows such a value (0.25.3: "expected 'i64', got 'str'", and a fourth
+  hole was left out of the message silently). The holes stay integers.
 
 ### What's new in 0.25.3
 
