@@ -2085,206 +2085,204 @@ fn chain_place(tp: i64, t: i64, chain: IntVec, level: i64, at: i64) -> i64 {
 // visited as they were checked (but an operator's, operator_temps);
 // closures' bodies are their own; a `while`'s condition is its own unit.
 fn visit_temps(e: i64) {
-    unsafe {
-        if e == 0 {
+    if e == 0 {
+        return;
+    }
+    let k = NODES[e].kind;
+    if k == NodeKind::Block && operator_temps(e) {
+        return;
+    }
+    if k == NodeKind::Block && crate::front::contracts::expand::requires_tail(e) > 0 {
+        // (0.25.2.2: a call of a function with a requires,
+        // contracts::desugar::requires_call `{ let ?aI = argI; ..;
+        // f$pre(SITE, ?a0, ..); f(?a0, ..) }`, checked by hand, not as a
+        // block: its arguments' temporaries are the statement's, as a
+        // call's. `dev.compute_pipeline(dev.shader_wgsl(SRC)?, "e")?`
+        // lent the shader dropped, a plain temporary leaked)
+        for i in 0..NODES[e].count {
+            let s = child(e, i);
+            if NODES[s].kind == NodeKind::Let {
+                visit_temps(NODES[s].c);
+            }
+        }
+        hold_args(e, true);
+        return;
+    }
+    if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
+        || k == NodeKind::Defer || k == NodeKind::Let {
+        return;
+    }
+    if k == NodeKind::While {
+        NODES[e].b = unit_value(NODES[e].b);
+        return;
+    }
+    if k == NodeKind::For {
+        visit_temps(NODES[e].c);
+        return;
+    }
+    if k == NodeKind::Unary {
+        // (`&make().v`: the field is borrowed, not moved)
+        TEMP_BORROW = NODES[e].op == Tok::Amp;
+        visit_temps(NODES[e].b);
+        TEMP_BORROW = false;
+        if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
+            // (`&value`: a receiver, a let argument; the block gives
+            // the address, as `&` did)
+            let ty = NODES[e].ty;
+            let b = temp_ptr(NODES[e].b);
+            NODES[e] = NODES[b];
+            NODES[e].ty = ty;
+        } else if NODES[e].op == Tok::Amp && lent_value(NODES[e].b) {
+            // (0.25: a value without glue lent the same way, `E { .. }.nm()`:
+            // a local of the statement, whose views are checked as a
+            // local's)
+            let ty = NODES[e].ty;
+            let b = temp_value(NODES[e].b);
+            NODES[e] = NODES[b];
+            NODES[e].ty = ty;
+        }
+        return;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        let borrowed = TEMP_BORROW;
+        let base = NODES[e].a;
+        TEMP_BORROW = borrowed && (NODES[base].kind == NodeKind::FieldAccess
+            || NODES[base].kind == NodeKind::TupleField);
+        // (0.25: a part moved out of a part, `make().a.b`: the chain is
+        // the outermost node's)
+        let moved_out = !borrowed && NODES[e].y != 1 && is_owned_type(NODES[e].ty);
+        if moved_out && part_move(e) {
+            TEMP_BORROW = false;
             return;
         }
-        let k = NODES[e].kind;
-        if k == NodeKind::Block && operator_temps(e) {
+        visit_temps(base);
+        TEMP_BORROW = false;
+        // (0.24: an owned field moved out, `let x = make().v;`, is not
+        // read through the temporary's address, which would drop it
+        // again with the temporary: part_move, or own.partial when
+        // a type on the way implements Drop)
+        if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
+            // (`make().id`: read through the address)
+            NODES[e].a = temp_ptr(NODES[e].a);
+            if k == NodeKind::FieldAccess {
+                NODES[e].y = 1;
+                NODES[e].p |= NODE_RAW;
+            } else {
+                // (`make().1`: a tuple part of the temporary, `(*&tv).1`)
+                NODES[e].a = deref_of(NODES[e].a);
+            }
+        }
+        return;
+    }
+    if k == NodeKind::Binary || k == NodeKind::Assign || k == NodeKind::Index
+        || k == NodeKind::Range || k == NodeKind::If {
+        if k == NodeKind::If {
+            visit_temps(NODES[e].a);
+            visit_temps(NODES[e].b);
+            visit_temps(NODES[e].c);
             return;
         }
-        if k == NodeKind::Block && crate::front::contracts::expand::requires_tail(e) > 0 {
-            // (0.25.2.2: a call of a function with a requires,
-            // contracts::desugar::requires_call `{ let ?aI = argI; ..;
-            // f$pre(SITE, ?a0, ..); f(?a0, ..) }`, checked by hand, not as a
-            // block: its arguments' temporaries are the statement's, as a
-            // call's. `dev.compute_pipeline(dev.shader_wgsl(SRC)?, "e")?`
-            // lent the shader dropped, a plain temporary leaked)
-            for i in 0..NODES[e].count {
-                let s = child(e, i);
+        if k == NodeKind::Index && !TEMP_BORROW && is_owned_type(NODES[e].ty) {
+            // (0.25: an element moved out of an array temporary,
+            // `make()[1]`; by a run-time index the others would leak)
+            if part_move(e) {
+                return;
+            }
+            let base = NODES[e].a;
+            if is_temp(base) && TYPES[NODES[base].ty].kind == TyKind::Array {
+                temp_element_error(e);
+            }
+        }
+        if k == NodeKind::Index || k == NodeKind::Range {
+            visit_temps(NODES[e].a);
+            visit_temps(NODES[e].b);
+            return;
+        }
+        visit_temps(NODES[e].b);
+        visit_temps(NODES[e].c);
+        return;
+    }
+    if k == NodeKind::Cast || k == NodeKind::Return || k == NodeKind::Repeat
+        || k == NodeKind::EnumPanic {
+        visit_temps(NODES[e].a);
+        return;
+    }
+    if k == NodeKind::Break || k == NodeKind::FieldInit || k == NodeKind::NamedArg {
+        visit_temps(NODES[e].b);
+        return;
+    }
+    if k == NodeKind::Try {
+        // (0.25.2.1: its desugaring, `{ let ?try = e; match ?try { .. } }`
+        // (check/try_op.vl), is checked by hand, not as a block: the
+        // temporaries of e are its statement's. `f(make()?, 8)?` lent
+        // the argument by its address, unkept: the match's `?v` was
+        // dropped under it, a leak without the inner `?`)
+        let y = NODES[e].y;
+        if y > 0 && NODES[y].kind == NodeKind::Block && NODES[y].count > 0
+            && NODES[child(y, 0)].kind == NodeKind::Let {
+            visit_temps(NODES[child(y, 0)].c);
+            return;
+        }
+        visit_temps(y);
+        return;
+    }
+    if k == NodeKind::Interp {
+        // (the holes, then what the f-string became)
+        for i in 0..NODES[e].count {
+            let h = child(e, i);
+            if NODES[h].kind == NodeKind::InterpHole {
+                visit_temps(NODES[h].a);
+            }
+        }
+        let y = NODES[e].y;
+        if y > 0 && NODES[y].kind == NodeKind::Block {
+            // (a call written in place, check/interp.vl direct_call:
+            // its holes are the values of its `let`s)
+            for i in 0..NODES[y].count {
+                let s = child(y, i);
                 if NODES[s].kind == NodeKind::Let {
                     visit_temps(NODES[s].c);
                 }
             }
-            hold_args(e, true);
-            return;
-        }
-        if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
-            || k == NodeKind::Defer || k == NodeKind::Let {
-            return;
-        }
-        if k == NodeKind::While {
-            NODES[e].b = unit_value(NODES[e].b);
-            return;
-        }
-        if k == NodeKind::For {
-            visit_temps(NODES[e].c);
-            return;
-        }
-        if k == NodeKind::Unary {
-            // (`&make().v`: the field is borrowed, not moved)
-            TEMP_BORROW = NODES[e].op == Tok::Amp;
-            visit_temps(NODES[e].b);
-            TEMP_BORROW = false;
-            if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
-                // (`&value`: a receiver, a let argument; the block gives
-                // the address, as `&` did)
-                let ty = NODES[e].ty;
-                let b = temp_ptr(NODES[e].b);
-                NODES[e] = NODES[b];
-                NODES[e].ty = ty;
-            } else if NODES[e].op == Tok::Amp && lent_value(NODES[e].b) {
-                // (0.25: a value without glue lent the same way, `E { .. }.nm()`:
-                // a local of the statement, whose views are checked as a
-                // local's)
-                let ty = NODES[e].ty;
-                let b = temp_value(NODES[e].b);
-                NODES[e] = NODES[b];
-                NODES[e].ty = ty;
-            }
-            return;
-        }
-        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
-            let borrowed = TEMP_BORROW;
-            let base = NODES[e].a;
-            TEMP_BORROW = borrowed && (NODES[base].kind == NodeKind::FieldAccess
-                || NODES[base].kind == NodeKind::TupleField);
-            // (0.25: a part moved out of a part, `make().a.b`: the chain is
-            // the outermost node's)
-            let moved_out = !borrowed && NODES[e].y != 1 && is_owned_type(NODES[e].ty);
-            if moved_out && part_move(e) {
-                TEMP_BORROW = false;
-                return;
-            }
-            visit_temps(base);
-            TEMP_BORROW = false;
-            // (0.24: an owned field moved out, `let x = make().v;`, is not
-            // read through the temporary's address, which would drop it
-            // again with the temporary: part_move, or own.partial when
-            // a type on the way implements Drop)
-            if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
-                // (`make().id`: read through the address)
-                NODES[e].a = temp_ptr(NODES[e].a);
-                if k == NodeKind::FieldAccess {
-                    NODES[e].y = 1;
-                    NODES[e].p |= NODE_RAW;
-                } else {
-                    // (`make().1`: a tuple part of the temporary, `(*&tv).1`)
-                    NODES[e].a = deref_of(NODES[e].a);
-                }
-            }
-            return;
-        }
-        if k == NodeKind::Binary || k == NodeKind::Assign || k == NodeKind::Index
-            || k == NodeKind::Range || k == NodeKind::If {
-            if k == NodeKind::If {
-                visit_temps(NODES[e].a);
-                visit_temps(NODES[e].b);
-                visit_temps(NODES[e].c);
-                return;
-            }
-            if k == NodeKind::Index && !TEMP_BORROW && is_owned_type(NODES[e].ty) {
-                // (0.25: an element moved out of an array temporary,
-                // `make()[1]`; by a run-time index the others would leak)
-                if part_move(e) {
-                    return;
-                }
-                let base = NODES[e].a;
-                if is_temp(base) && TYPES[NODES[base].ty].kind == TyKind::Array {
-                    temp_element_error(e);
-                }
-            }
-            if k == NodeKind::Index || k == NodeKind::Range {
-                visit_temps(NODES[e].a);
-                visit_temps(NODES[e].b);
-                return;
-            }
-            visit_temps(NODES[e].b);
-            visit_temps(NODES[e].c);
-            return;
-        }
-        if k == NodeKind::Cast || k == NodeKind::Return || k == NodeKind::Repeat
-            || k == NodeKind::EnumPanic {
-            visit_temps(NODES[e].a);
-            return;
-        }
-        if k == NodeKind::Break || k == NodeKind::FieldInit || k == NodeKind::NamedArg {
-            visit_temps(NODES[e].b);
-            return;
-        }
-        if k == NodeKind::Try {
-            // (0.25.2.1: its desugaring, `{ let ?try = e; match ?try { .. } }`
-            // (check/try_op.vl), is checked by hand, not as a block: the
-            // temporaries of e are its statement's. `f(make()?, 8)?` lent
-            // the argument by its address, unkept: the match's `?v` was
-            // dropped under it, a leak without the inner `?`)
-            let y = NODES[e].y;
-            if y > 0 && NODES[y].kind == NodeKind::Block && NODES[y].count > 0
-                && NODES[child(y, 0)].kind == NodeKind::Let {
-                visit_temps(NODES[child(y, 0)].c);
-                return;
-            }
+        } else {
             visit_temps(y);
-            return;
         }
-        if k == NodeKind::Interp {
-            // (the holes, then what the f-string became)
-            for i in 0..NODES[e].count {
-                let h = child(e, i);
-                if NODES[h].kind == NodeKind::InterpHole {
-                    visit_temps(NODES[h].a);
-                }
-            }
-            let y = NODES[e].y;
-            if y > 0 && NODES[y].kind == NodeKind::Block {
-                // (a call written in place, check/interp.vl direct_call:
-                // its holes are the values of its `let`s)
-                for i in 0..NODES[y].count {
-                    let s = child(y, i);
-                    if NODES[s].kind == NodeKind::Let {
-                        visit_temps(NODES[s].c);
-                    }
-                }
-            } else {
-                visit_temps(y);
-            }
-            return;
+        return;
+    }
+    if k == NodeKind::Match {
+        visit_temps(NODES[e].a);
+        for i in 0..NODES[e].count {
+            let arm = child(e, i);
+            visit_temps(NODES[arm].b);
+            visit_temps(NODES[arm].c);
         }
-        if k == NodeKind::Match {
+        // (0.25: an owned temporary matched with no binding that takes
+        // a part of it, `match make() { E::A(_) => .. }`: matched where
+        // it is kept, and dropped with the statement)
+        let s = NODES[e].a;
+        if is_temp(s) && !match_binds_owned(e) {
+            NODES[e].a = deref_of(temp_ptr(s));
+        }
+        return;
+    }
+    if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
+        if k == NodeKind::MethodCall || k == NodeKind::VecOp || NODES[e].x == 0 {
             visit_temps(NODES[e].a);
-            for i in 0..NODES[e].count {
-                let arm = child(e, i);
-                visit_temps(NODES[arm].b);
-                visit_temps(NODES[arm].c);
-            }
-            // (0.25: an owned temporary matched with no binding that takes
-            // a part of it, `match make() { E::A(_) => .. }`: matched where
-            // it is kept, and dropped with the statement)
-            let s = NODES[e].a;
-            if is_temp(s) && !match_binds_owned(e) {
-                NODES[e].a = deref_of(temp_ptr(s));
-            }
-            return;
         }
-        if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
-            if k == NodeKind::MethodCall || k == NodeKind::VecOp || NODES[e].x == 0 {
-                visit_temps(NODES[e].a);
-            }
-            for i in 0..NODES[e].count {
-                visit_temps(child(e, i));
-            }
-            hold_args(e, k == NodeKind::Call);
-            return;
+        for i in 0..NODES[e].count {
+            visit_temps(child(e, i));
         }
-        if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
-            || k == NodeKind::VariantLit {
-            for i in 0..NODES[e].count {
-                visit_temps(child(e, i));
-            }
-            if k == NodeKind::StructLit {
-                // (0.25.2.2: a let field given a branch's value, hold_args)
-                hold_args(e, false);
-            }
+        hold_args(e, k == NodeKind::Call);
+        return;
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
+        || k == NodeKind::VariantLit {
+        for i in 0..NODES[e].count {
+            visit_temps(child(e, i));
+        }
+        if k == NodeKind::StructLit {
+            // (0.25.2.2: a let field given a branch's value, hold_args)
+            hold_args(e, false);
         }
     }
 }
@@ -2292,28 +2290,24 @@ fn visit_temps(e: i64) {
 // `*b` of the block b temp_make made (of type `&T`): the temporary as a
 // place.
 fn deref_of(b: i64) -> i64 {
-    unsafe {
-        let n = t_node(NodeKind::Unary, b, TYPES[NODES[b].ty].a);
-        NODES[n].op = Tok::Star;
-        NODES[n].b = b;
-        n
-    }
+    let n = t_node(NodeKind::Unary, b, TYPES[NODES[b].ty].a);
+    NODES[n].op = Tok::Star;
+    NODES[n].b = b;
+    n
 }
 
 // (0.25) Whether `&v` lends value v as a temporary of no glue (`&E { .. }`,
 // a receiver; a let argument): v is no place, and has storage.
 fn lent_value(v: i64) -> bool {
-    unsafe {
-        let t = NODES[v].ty;
-        if t <= 0 || has_glue(t) || is_place(v) {
-            return false;
-        }
-        let k = NODES[v].kind;
-        (k == NodeKind::Call || k == NodeKind::StructLit || k == NodeKind::Tuple
-            || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat)
-            && (TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Tuple
-                || TYPES[t].kind == TyKind::Array || TYPES[t].kind == TyKind::Enum)
+    let t = NODES[v].ty;
+    if t <= 0 || has_glue(t) || is_place(v) {
+        return false;
     }
+    let k = NODES[v].kind;
+    (k == NodeKind::Call || k == NodeKind::StructLit || k == NodeKind::Tuple
+        || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat)
+        && (TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Tuple
+            || TYPES[t].kind == TyKind::Array || TYPES[t].kind == TyKind::Enum)
 }
 
 // (0.25) Value v (no glue) lent as a temporary: `{ var __own_tv = v;
@@ -2403,18 +2397,16 @@ fn part_move(e: i64) -> bool {
 // Whether n takes a part of its base where it is (a field, a tuple part,
 // an element of an array by a constant), not through a pointer.
 fn is_part_node(n: i64) -> bool {
-    unsafe {
-        let k = NODES[n].kind;
-        if k == NodeKind::FieldAccess {
-            return NODES[n].y != 1;
-        }
-        if k == NodeKind::TupleField {
-            return true;
-        }
-        let base = NODES[n].a;
-        k == NodeKind::Index && NODES[NODES[n].b].kind == NodeKind::Int && NODES[base].ty > 0
-            && TYPES[NODES[base].ty].kind == TyKind::Array
+    let k = NODES[n].kind;
+    if k == NodeKind::FieldAccess {
+        return NODES[n].y != 1;
     }
+    if k == NodeKind::TupleField {
+        return true;
+    }
+    let base = NODES[n].a;
+    k == NodeKind::Index && NODES[NODES[n].b].kind == NodeKind::Int && NODES[base].ty > 0
+        && TYPES[NODES[base].ty].kind == TyKind::Array
 }
 
 // (0.25) Call e (0.25.2.2: or a requires check's block, or a struct
