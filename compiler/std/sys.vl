@@ -1,7 +1,7 @@
 // std::sys: the OS layer, thin bindings of the C library (0.20).
 
 // (what differs between the targets: std's tail, sys/macos.vl or sys/linux.vl)
-use std::{Option, Result, panic_str, sys_errno_location};
+use std::{Option, Result, panic_str, sys_c_strerror_r, sys_errno_location};
 pub use std::{
     SYS_CLOCK_MONOTONIC, SYS_EAGAIN, SYS_ELOOP, SYS_ENAMETOOLONG, SYS_ENOSYS, SYS_ENOTEMPTY,
     SYS_ENOTSUP, SYS_ETIMEDOUT, SYS_O_APPEND, SYS_O_CLOEXEC, SYS_O_CREAT, SYS_O_DIRECTORY,
@@ -33,10 +33,10 @@ pub use std::{
 // sys_layout.vl); a slice made from a C string (`sys_cstr_view`) is valid
 // while that string is.
 
+// UNSAFE: C's strlen reads memory up to a NUL through a raw pointer.
+// SAFETY: its prototype is C's (string.h); sys_cstr_view, its one caller,
+// passes a non-null pointer its own caller promises is a NUL-ended string.
 extern "C" {
-    #[link_name = "strerror"]
-    #[effects(global)]
-    fn sys_c_strerror(e: i32) -> *u8;
     #[link_name = "strlen"]
     #[effects()]
     fn sys_c_strlen(s: *u8) -> u64;
@@ -85,13 +85,17 @@ pub enum SysErrorKind {
 
 // The errno of the last C call that failed (C's `errno`).
 pub fn sys_errno() -> i32 {
-    // (sys_errno_location points to this thread's errno: always valid)
+    // UNSAFE: errno is C's thread-local int, reached only through the C
+    // library's pointer to it.
+    // SAFETY: sys_errno_location (__error, __errno_location) returns this
+    // thread's errno, an aligned int valid for the thread's life.
     unsafe { *sys_errno_location() }
 }
 
 // Sets errno (to 0 before a call whose only failure report is errno).
 pub fn sys_set_errno(e: i32) {
-    // (as sys_errno)
+    // UNSAFE: as sys_errno.
+    // SAFETY: as sys_errno: this thread's errno, which only it writes.
     unsafe { *sys_errno_location() = e; }
 }
 
@@ -131,11 +135,19 @@ pub fn sys_errno_kind(e: i32) -> SysErrorKind {
 // C's message for errno e (`strerror`) copied into out, cut to its length:
 // the bytes written.
 pub fn sys_strerror_into(e: i32, out: inout [u8]) -> i64 {
-    // (strerror's result is a NUL-ended string, valid until the next call)
-    let msg = unsafe { sys_cstr_view(sys_c_strerror(e)) };
-    let n = if msg.len < out.len { msg.len } else { out.len };
-    for i in 0..n {
-        out[i] = msg[i];
+    // (0.25.4) strerror_r, not strerror: strerror may keep the message in
+    // one buffer for every thread.
+    var buf = [0u8; 256];
+    // UNSAFE: C's strerror_r writes the message through a raw pointer.
+    // SAFETY: buf is a local of 256 bytes and strerror_r is given 255, so
+    // the message and its NUL stay in buf and buf[255] stays 0 (a message
+    // cut short ends with a NUL too; an unknown errno gets C's "Unknown
+    // error" text).
+    let _ = unsafe { sys_c_strerror_r(e, &buf as *u8, 255) };
+    var n = 0;
+    while n < out.len && buf[n] != 0 {
+        out[n] = buf[n];
+        n += 1;
     }
     n
 }
@@ -143,6 +155,11 @@ pub fn sys_strerror_into(e: i32, out: inout [u8]) -> i64 {
 // The bytes of the NUL-ended C string at p, without the NUL; empty for a
 // null p. The caller promises that p is null or a NUL-ended string, valid
 // while the slice is used.
+// UNSAFE: makes a slice from a raw C pointer, whose extent only its NUL
+// tells.
+// SAFETY: (the caller's obligation, above) p is null, or a NUL-ended
+// string that outlives the slice; strlen stops at that NUL, so the slice
+// covers readable bytes only.
 pub unsafe fn sys_cstr_view(p: *u8) -> [u8] {
     if p == 0 as *u8 {
         return ""[0..0];
@@ -198,6 +215,11 @@ impl SysPath {
 
 // ---- Sys: files (0.20) ----
 
+// UNSAFE: the C library's file calls (POSIX), which take raw pointers.
+// SAFETY: each prototype is POSIX's (fcntl.h, unistd.h, sys/stat.h,
+// stdio.h's rename); open and fcntl are variadic in C and declared so; the
+// wrappers below pass pointers into buffers they own or borrow, with their
+// true lengths.
 extern "C" {
     #[link_name = "open"]
     #[effects(io)]
@@ -281,87 +303,117 @@ const SYS_FD_CLOEXEC: i32 = 1;
 // close-on-exec (SYS_O_CLOEXEC is added).
 pub fn sys_open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32> {
     let p = sys_cpath(path)?;
-    // (p holds a NUL-ended path; open's third argument is variadic, an int)
+    // UNSAFE: C's open takes the path as a raw pointer.
+    // SAFETY: p holds a NUL-ended path (sys_cpath), live past the call;
+    // open's third argument is variadic, an int.
     let r = unsafe { sys_c_open(&p.buf as *u8, flags | SYS_O_CLOEXEC, mode) };
     Ok(sys_check(r as i64)? as i32)
 }
 
 pub fn sys_close(fd: i32) -> Result<(), i32> {
+    // UNSAFE: a C library call (close).
+    // SAFETY: close takes an int and touches no memory of ours (a bad
+    // descriptor is EBADF).
     sys_check_unit(unsafe { sys_c_close(fd) })
 }
 
 // Reads up to buf.len bytes into buf: how many (0 at the end).
 pub fn sys_read(fd: i32, buf: inout [u8]) -> Result<i64, i32> {
-    // (C writes at most buf.len bytes at buf.ptr)
+    // UNSAFE: C's read writes through a raw pointer.
+    // SAFETY: buf is the caller's inout slice: read writes at most buf.len
+    // bytes at buf.ptr, all within it.
     sys_check(unsafe { sys_c_read(fd, buf.ptr, buf.len as u64) })
 }
 
 // Writes some of buf: how many bytes.
 pub fn sys_write(fd: i32, buf: [u8]) -> Result<i64, i32> {
-    // (C reads at most buf.len bytes at buf.ptr)
+    // UNSAFE: C's write reads through a raw pointer.
+    // SAFETY: buf is a borrowed slice: write reads at most buf.len bytes at
+    // buf.ptr, all within it.
     sys_check(unsafe { sys_c_write(fd, buf.ptr, buf.len as u64) })
 }
 
 // Reads into buf from offset off, not moving the file's position.
 pub fn sys_pread(fd: i32, buf: inout [u8], off: i64) -> Result<i64, i32> {
-    // (as sys_read)
+    // UNSAFE: as sys_read.
+    // SAFETY: as sys_read: at most buf.len bytes, within buf.
     sys_check(unsafe { sys_c_pread(fd, buf.ptr, buf.len as u64, off) })
 }
 
 // Writes buf at offset off, not moving the file's position.
 pub fn sys_pwrite(fd: i32, buf: [u8], off: i64) -> Result<i64, i32> {
-    // (as sys_write)
+    // UNSAFE: as sys_write.
+    // SAFETY: as sys_write: at most buf.len bytes, within buf.
     sys_check(unsafe { sys_c_pwrite(fd, buf.ptr, buf.len as u64, off) })
 }
 
 // Moves the position to off from SYS_SEEK_SET, _CUR or _END: the new one.
 pub fn sys_lseek(fd: i32, off: i64, whence: i32) -> Result<i64, i32> {
+    // UNSAFE: a C library call (lseek).
+    // SAFETY: lseek takes integers only and touches no memory of ours.
     sys_check(unsafe { sys_c_lseek(fd, off, whence) })
 }
 
 pub fn sys_ftruncate(fd: i32, len: i64) -> Result<(), i32> {
+    // UNSAFE: a C library call (ftruncate).
+    // SAFETY: ftruncate takes integers only and touches no memory of ours.
     sys_check_unit(unsafe { sys_c_ftruncate(fd, len) })
 }
 
 pub fn sys_fsync(fd: i32) -> Result<(), i32> {
+    // UNSAFE: a C library call (fsync).
+    // SAFETY: fsync takes an int and touches no memory of ours.
     sys_check_unit(unsafe { sys_c_fsync(fd) })
 }
 
 pub fn sys_mkdir(path: [u8], mode: i32) -> Result<(), i32> {
     let p = sys_cpath(path)?;
+    // UNSAFE: C's mkdir takes the path as a raw pointer.
+    // SAFETY: p holds a NUL-ended path (sys_cpath), live past the call.
     sys_check_unit(unsafe { sys_c_mkdir(&p.buf as *u8, mode as u32) })
 }
 
 pub fn sys_rmdir(path: [u8]) -> Result<(), i32> {
     let p = sys_cpath(path)?;
+    // UNSAFE: C's rmdir takes the path as a raw pointer.
+    // SAFETY: as sys_mkdir.
     sys_check_unit(unsafe { sys_c_rmdir(&p.buf as *u8) })
 }
 
 pub fn sys_unlink(path: [u8]) -> Result<(), i32> {
     let p = sys_cpath(path)?;
+    // UNSAFE: C's unlink takes the path as a raw pointer.
+    // SAFETY: as sys_mkdir.
     sys_check_unit(unsafe { sys_c_unlink(&p.buf as *u8) })
 }
 
 pub fn sys_rename(from: [u8], to: [u8]) -> Result<(), i32> {
     let a = sys_cpath(from)?;
     let b = sys_cpath(to)?;
+    // UNSAFE: C's rename takes the paths as raw pointers.
+    // SAFETY: a and b hold NUL-ended paths (sys_cpath), live past the call.
     sys_check_unit(unsafe { sys_c_rename(&a.buf as *u8, &b.buf as *u8) })
 }
 
 pub fn sys_dup(fd: i32) -> Result<i32, i32> {
+    // UNSAFE: a C library call (dup).
+    // SAFETY: dup takes an int and touches no memory of ours.
     Ok(sys_check(unsafe { sys_c_dup(fd) } as i64)? as i32)
 }
 
 // Makes `to` a copy of fd (closing what `to` was); `to` is not
 // close-on-exec.
 pub fn sys_dup2(fd: i32, to: i32) -> Result<i32, i32> {
+    // UNSAFE: a C library call (dup2).
+    // SAFETY: dup2 takes integers only and touches no memory of ours.
     Ok(sys_check(unsafe { sys_c_dup2(fd, to) } as i64)? as i32)
 }
 
 // A pipe: (read end, write end), both close-on-exec.
 pub fn sys_pipe() -> Result<(i32, i32), i32> {
     var fds: [i32; 2] = [0, 0];
-    // (pipe writes two ints)
+    // UNSAFE: C's pipe writes through a raw pointer.
+    // SAFETY: fds is a local [i32; 2]: pipe writes two ints there.
     sys_check_unit(unsafe { sys_c_pipe(&fds as *i32) })?;
     sys_set_cloexec(fds[0], true)?;
     sys_set_cloexec(fds[1], true)?;
@@ -370,9 +422,13 @@ pub fn sys_pipe() -> Result<(i32, i32), i32> {
 
 // Sets or clears O_NONBLOCK on fd.
 pub fn sys_set_nonblocking(fd: i32, on: bool) -> Result<(), i32> {
+    // UNSAFE: a C library call (fcntl, variadic).
+    // SAFETY: F_GETFL takes no third argument and touches no memory of ours.
     let fl = sys_check(unsafe { sys_c_fcntl(fd, SYS_F_GETFL) } as i64)? as i32;
     let want = if on { fl | SYS_O_NONBLOCK } else { fl & ~SYS_O_NONBLOCK };
     if want != fl {
+        // UNSAFE: a C library call (fcntl, variadic).
+        // SAFETY: F_SETFL takes an int and touches no memory of ours.
         sys_check_unit(unsafe { sys_c_fcntl(fd, SYS_F_SETFL, want) })?;
     }
     Ok(())
@@ -380,9 +436,13 @@ pub fn sys_set_nonblocking(fd: i32, on: bool) -> Result<(), i32> {
 
 // Sets or clears FD_CLOEXEC on fd.
 pub fn sys_set_cloexec(fd: i32, on: bool) -> Result<(), i32> {
+    // UNSAFE: a C library call (fcntl, variadic).
+    // SAFETY: F_GETFD takes no third argument and touches no memory of ours.
     let fl = sys_check(unsafe { sys_c_fcntl(fd, SYS_F_GETFD) } as i64)? as i32;
     let want = if on { fl | SYS_FD_CLOEXEC } else { fl & ~SYS_FD_CLOEXEC };
     if want != fl {
+        // UNSAFE: a C library call (fcntl, variadic).
+        // SAFETY: F_SETFD takes an int and touches no memory of ours.
         sys_check_unit(unsafe { sys_c_fcntl(fd, SYS_F_SETFD, want) })?;
     }
     Ok(())
@@ -390,6 +450,8 @@ pub fn sys_set_cloexec(fd: i32, on: bool) -> Result<(), i32> {
 
 // Whether fd is a terminal.
 pub fn sys_isatty(fd: i32) -> bool {
+    // UNSAFE: a C library call (isatty).
+    // SAFETY: isatty takes an int and touches no memory of ours.
     unsafe { sys_c_isatty(fd) == 1 }
 }
 
@@ -497,9 +559,13 @@ struct SysStatBuf {
 }
 
 // The FileStat in b, filled by a stat call of this system.
-fn sys_stat_decode(b: *SysStatBuf) -> FileStat {
+fn sys_stat_decode(b: SysStatBuf) -> FileStat {
     if TARGET_OS == 1 {
-        // (b holds a struct stat of Linux, 128 of its 160 bytes)
+        // UNSAFE: reads C's struct stat out of b's words, a reinterpretation.
+        // SAFETY: b holds the struct stat of Linux that stat wrote, 128 of
+        // its 160 bytes (the layout is checked against the headers by
+        // tests/run/sys_layout.vl); the words are 8-aligned, as StatLinux
+        // is; StatLinux is integers only, so any bits are a valid one.
         let s = unsafe { *(&b.words as *StatLinux) };
         FileStat {
             dev: s.st_dev,
@@ -520,7 +586,9 @@ fn sys_stat_decode(b: *SysStatBuf) -> FileStat {
             ctime_nsec: s.st_ctime_nsec,
         }
     } else {
-        // (b holds a struct stat of macOS, 144 of its 160 bytes)
+        // UNSAFE: as for Linux, above.
+        // SAFETY: as for Linux: macOS's struct stat, 144 of the 160 bytes,
+        // StatMacos integers only.
         let s = unsafe { *(&b.words as *StatMacos) };
         FileStat {
             dev: s.st_dev as u32 as u64,
@@ -545,31 +613,40 @@ fn sys_stat_decode(b: *SysStatBuf) -> FileStat {
 
 pub fn sys_fstat(fd: i32) -> Result<FileStat, i32> {
     var b = SysStatBuf { words: [0u64; 20] };
-    // (160 bytes: more than either system's struct stat)
+    // UNSAFE: C's fstat writes a struct stat through a raw pointer.
+    // SAFETY: b.words is a local of 160 bytes, more than either system's
+    // struct stat (144 on macOS, 128 on Linux), 8-aligned.
     sys_check_unit(unsafe { sys_c_fstat(fd, &b.words as *u8) })?;
-    Ok(sys_stat_decode(&b))
+    Ok(sys_stat_decode(b))
 }
 
 // The status of the file at path, following symbolic links.
 pub fn sys_stat(path: [u8]) -> Result<FileStat, i32> {
     let p = sys_cpath(path)?;
     var b = SysStatBuf { words: [0u64; 20] };
-    // (as sys_fstat)
+    // UNSAFE: C's stat takes the path and writes a struct stat, through
+    // raw pointers.
+    // SAFETY: p holds a NUL-ended path (sys_cpath); b as in sys_fstat.
     sys_check_unit(unsafe { sys_c_stat(&p.buf as *u8, &b.words as *u8) })?;
-    Ok(sys_stat_decode(&b))
+    Ok(sys_stat_decode(b))
 }
 
 // The status of the file at path, of a symbolic link itself.
 pub fn sys_lstat(path: [u8]) -> Result<FileStat, i32> {
     let p = sys_cpath(path)?;
     var b = SysStatBuf { words: [0u64; 20] };
-    // (as sys_fstat)
+    // UNSAFE: as sys_stat (lstat).
+    // SAFETY: as sys_stat.
     sys_check_unit(unsafe { sys_c_lstat(&p.buf as *u8, &b.words as *u8) })?;
-    Ok(sys_stat_decode(&b))
+    Ok(sys_stat_decode(b))
 }
 
 // ---- Sys: directories (0.20) ----
 
+// UNSAFE: the C library's directory calls, which take and return raw
+// pointers.
+// SAFETY: each prototype is POSIX's (dirent.h, unistd.h); a DIR * is kept
+// opaque in SysDir, and getcwd is given a slice's pointer and length.
 extern "C" {
     #[link_name = "opendir"]
     #[effects(io)]
@@ -609,9 +686,19 @@ pub struct DirentLinux {
     d_name: [u8; 256],
 }
 
-// An open directory (C's DIR *); sys_closedir frees it.
+// An open directory (C's DIR *); sys_closedir frees it, and (0.25.4) so
+// does dropping it: a SysDir moves, it is not copied (two copies could
+// close one DIR twice, or read one closed).
 pub struct SysDir {
     handle: *u8,
+}
+
+impl Drop for SysDir {
+    fn drop(inout self) {
+        if self.handle != 0 as *u8 {
+            let _ = sys_closedir(&self);
+        }
+    }
 }
 
 // An entry read by sys_readdir_into: its name's length (the name is in the
@@ -635,6 +722,8 @@ pub const SYS_DT_SOCK: u8 = 12;
 
 pub fn sys_opendir(path: [u8]) -> Result<SysDir, i32> {
     let p = sys_cpath(path)?;
+    // UNSAFE: C's opendir takes the path as a raw pointer.
+    // SAFETY: p holds a NUL-ended path (sys_cpath), live past the call.
     let d = unsafe { sys_c_opendir(&p.buf as *u8) };
     if d == 0 as *u8 {
         return Err(sys_errno());
@@ -650,7 +739,10 @@ pub fn sys_readdir_into(dir: inout SysDir, name: inout [u8; 256]) -> Result<Opti
         return Err(SYS_EBADF);
     }
     sys_set_errno(0);
-    // (handle is an open DIR * until sys_closedir clears it)
+    // UNSAFE: C's readdir on the raw DIR *.
+    // SAFETY: handle is the DIR * opendir returned, non-null (checked)
+    // until sys_closedir clears it; a SysDir is never copied (its Drop), so
+    // no other value closes it under this one.
     let e = unsafe { sys_c_readdir(dir.handle) };
     if e == 0 as *u8 {
         let err = sys_errno();
@@ -659,8 +751,12 @@ pub fn sys_readdir_into(dir: inout SysDir, name: inout [u8; 256]) -> Result<Opti
     var kind = 0u8;
     var ino = 0u64;
     var nm = ""[0..0];
-    // (readdir's entry is a struct dirent of this system, valid until the
-    // next readdir; d_name is NUL-ended within it)
+    // UNSAFE: reads the struct dirent readdir returned, through its raw
+    // pointer, and views its name.
+    // SAFETY: e is non-null (checked): a struct dirent of this system (the
+    // layouts checked by tests/run/sys_layout.vl), valid until the next
+    // readdir of this DIR; d_name is NUL-ended within it, and nm is copied
+    // into name before this returns.
     unsafe {
         if TARGET_OS == 1 {
             let d = e as *DirentLinux;
@@ -688,7 +784,9 @@ pub fn sys_closedir(dir: inout SysDir) -> Result<(), i32> {
     if dir.handle == 0 as *u8 {
         return Err(SYS_EBADF);
     }
-    // (an open DIR *, closed once)
+    // UNSAFE: C's closedir on the raw DIR *.
+    // SAFETY: the open DIR * (non-null, checked), closed once: handle is
+    // cleared right after.
     let r = unsafe { sys_c_closedir(dir.handle) };
     dir.handle = 0 as *u8;
     sys_check_unit(r)
@@ -697,7 +795,9 @@ pub fn sys_closedir(dir: inout SysDir) -> Result<(), i32> {
 // The working directory's path, into buf: its length (ERANGE when buf is
 // too short).
 pub fn sys_getcwd_into(buf: inout [u8]) -> Result<i64, i32> {
-    // (getcwd writes at most buf.len bytes, its NUL included)
+    // UNSAFE: C's getcwd writes through a raw pointer.
+    // SAFETY: buf is the caller's inout slice: getcwd writes at most buf.len
+    // bytes, its NUL included.
     let r = unsafe { sys_c_getcwd(buf.ptr, buf.len as u64) };
     if r == 0 as *u8 {
         return Err(sys_errno());
@@ -714,11 +814,17 @@ pub fn sys_getcwd_into(buf: inout [u8]) -> Result<i64, i32> {
 
 pub fn sys_chdir(path: [u8]) -> Result<(), i32> {
     let p = sys_cpath(path)?;
+    // UNSAFE: C's chdir takes the path as a raw pointer.
+    // SAFETY: p holds a NUL-ended path (sys_cpath), live past the call.
     sys_check_unit(unsafe { sys_c_chdir(&p.buf as *u8) })
 }
 
 // ---- Sys: the environment (0.20) ----
 
+// UNSAFE: C's environment: the environ array, and getenv, setenv and
+// unsetenv, which take raw pointers.
+// SAFETY: the prototypes are POSIX's (stdlib.h, unistd.h); environ is read
+// here, never written.
 extern "C" {
     static environ: **u8;
     #[link_name = "getenv"]
@@ -734,15 +840,18 @@ extern "C" {
 
 // C's `environ`: the NUL-ended strings NAME=VALUE, then a null pointer.
 pub fn sys_environ() -> **u8 {
-    unsafe { environ }
+    environ
 }
 
 // The number of the environment's variables.
 pub fn sys_env_count() -> i64 {
     let e = sys_environ();
     var n = 0;
-    // (environ ends with a null pointer; 2^31 bounds the walk)
     for i in 0..2147483647 {
+        // UNSAFE: indexes C's environ through its raw pointer.
+        // SAFETY: environ is an array of pointers ended by a null one; the
+        // walk stops at that null (2^31 bounds it), so each e[i] read is in
+        // the array.
         if unsafe { e[i] } == 0 as *u8 {
             break;
         }
@@ -757,7 +866,10 @@ pub fn sys_env_at(i: i64) -> [u8] {
     if i < 0 || i >= sys_env_count() {
         panic_str("sys_env_at: index out of bounds");
     }
-    // (i is within environ's entries, each a NUL-ended string)
+    // UNSAFE: indexes environ and views a C string, through raw pointers.
+    // SAFETY: 0 <= i < sys_env_count() (checked): environ[i] is a NUL-ended
+    // string, valid until the environment changes, which only the unsafe
+    // sys_setenv and sys_unsetenv do.
     unsafe { sys_cstr_view(sys_environ()[i]) }
 }
 
@@ -768,18 +880,28 @@ pub fn sys_getenv(name: [u8]) -> Option<[u8]> {
         Ok(p) => p,
         Err(_) => return None,
     };
-    // (getenv returns null or a NUL-ended string in the environment)
+    // UNSAFE: C's getenv takes the name and returns the value, as raw
+    // pointers.
+    // SAFETY: p holds a NUL-ended name (sys_cpath).
     let v = unsafe { sys_c_getenv(&p.buf as *u8) };
     if v == 0 as *u8 {
-        None
-    } else {
-        Some(unsafe { sys_cstr_view(v) })
+        return None;
     }
+    // UNSAFE: a view of the C string getenv returned.
+    // SAFETY: v is non-null (checked): a NUL-ended string in the
+    // environment, valid until it changes (only the unsafe sys_setenv and
+    // sys_unsetenv change it).
+    Some(unsafe { sys_cstr_view(v) })
 }
 
 // Sets the variable name to value. Unsafe as in Rust 2024: views of the
 // environment (sys_env_at, sys_getenv) may dangle afterwards, and other
 // threads may be reading it.
+// UNSAFE: changes C's environment, which other code reads through raw
+// pointers.
+// SAFETY: (the caller's obligation) no view of the environment
+// (sys_env_at, sys_getenv) is used after the call, and no other thread
+// reads or changes the environment during it.
 pub unsafe fn sys_setenv(name: [u8], value: [u8]) -> Result<(), i32> {
     let n = sys_cpath(name)?;
     let v = sys_cpath(value)?;
@@ -787,6 +909,8 @@ pub unsafe fn sys_setenv(name: [u8], value: [u8]) -> Result<(), i32> {
 }
 
 // Removes the variable name (unsafe as sys_setenv).
+// UNSAFE: as sys_setenv.
+// SAFETY: (the caller's obligation) as sys_setenv.
 pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32> {
     let n = sys_cpath(name)?;
     sys_check_unit(sys_c_unsetenv(&n.buf as *u8))
@@ -794,6 +918,11 @@ pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32> {
 
 // ---- Sys: processes (0.20) ----
 
+// UNSAFE: posix_spawn and the C library's process calls, which take raw
+// pointers.
+// SAFETY: the prototypes are POSIX's (spawn.h, sys/wait.h, signal.h,
+// unistd.h); the file actions live in SysSpawnActions' words, larger than
+// either system's posix_spawn_file_actions_t.
 extern "C" {
     #[link_name = "posix_spawnp"]
     #[effects(io)]
@@ -828,16 +957,26 @@ pub const SYS_SIGTERM: i32 = 15;
 const SYS_WNOHANG: i32 = 1;
 
 // posix_spawn_file_actions_t, opaque: room for either system's (8 bytes
-// on macOS, 80 on Linux).
+// on macOS, 80 on Linux). (0.25.4) Dropping it frees it, so it moves and
+// is never copied: two copies could destroy the actions twice.
 pub struct SysSpawnActions {
     words: [u64; 16],
     live: bool,
 }
 
+impl Drop for SysSpawnActions {
+    fn drop(inout self) {
+        self.free();
+    }
+}
+
 // Empty file actions; sys_spawn_actions_free frees them.
 pub fn sys_spawn_actions() -> Result<SysSpawnActions, i32> {
     var a = SysSpawnActions { words: [0u64; 16], live: false };
-    // (128 bytes, more than either system's posix_spawn_file_actions_t)
+    // UNSAFE: C initializes the file actions through a raw pointer.
+    // SAFETY: a.words is 128 bytes, more than either system's
+    // posix_spawn_file_actions_t (8 on macOS, 80 on Linux), 8-aligned; the
+    // actions hold no pointer into themselves, so moving them is fine.
     let r = unsafe { sys_c_actions_init(&a.words as *u8) };
     if r != 0 {
         return Err(r);
@@ -852,7 +991,9 @@ impl SysSpawnActions {
         if !self.live {
             return Err(SYS_EINVAL);
         }
-        // (live: initialized and not destroyed)
+        // UNSAFE: C adds to the file actions through a raw pointer.
+        // SAFETY: live: initialized by sys_spawn_actions and not destroyed
+        // (a SysSpawnActions is never copied, see its Drop).
         let r = unsafe { sys_c_actions_adddup2(&self.words as *u8, fd, to) };
         if r != 0 { Err(r) } else { Ok(()) }
     }
@@ -862,14 +1003,17 @@ impl SysSpawnActions {
         if !self.live {
             return Err(SYS_EINVAL);
         }
-        // (as dup2)
+        // UNSAFE: as dup2.
+        // SAFETY: as dup2.
         let r = unsafe { sys_c_actions_addclose(&self.words as *u8, fd) };
         if r != 0 { Err(r) } else { Ok(()) }
     }
 
     pub fn free(inout self) {
         if self.live {
-            // (as dup2)
+            // UNSAFE: C destroys the file actions through a raw pointer.
+            // SAFETY: live (checked): destroyed once, live cleared right
+            // after.
             unsafe { sys_c_actions_destroy(&self.words as *u8); }
             self.live = false;
         }
@@ -883,6 +1027,11 @@ impl SysSpawnActions {
 // not end with a null pointer.
 // Unsafe: prog and every pointer before argv's and envp's null must be
 // NUL-ended strings.
+// UNSAFE: posix_spawnp reads the program's name, arguments and environment
+// through raw pointers.
+// SAFETY: (the caller's obligation) prog and every pointer before argv's
+// and envp's nulls are NUL-ended strings, and actions is null or points to
+// a SysSpawnActions; the nulls that end argv and envp are checked here.
 pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32> {
     if argv.len == 0 || argv[argv.len - 1] != 0 as *u8 {
         return Err(SYS_EINVAL);
@@ -909,6 +1058,8 @@ pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnA
 // or (0, 0) when nohang and it is still running.
 pub fn sys_waitpid(pid: i32, nohang: bool) -> Result<(i32, i32), i32> {
     var status = 0i32;
+    // UNSAFE: C's waitpid writes the status through a raw pointer.
+    // SAFETY: status is a local i32.
     let r = unsafe { sys_c_waitpid(pid, &status, if nohang { SYS_WNOHANG } else { 0 }) };
     if r == -1 {
         return Err(sys_errno());
@@ -928,15 +1079,24 @@ pub fn sys_exit_signal(status: i32) -> Option<i32> {
 }
 
 pub fn sys_kill(pid: i32, sig: i32) -> Result<(), i32> {
+    // UNSAFE: a C library call (kill).
+    // SAFETY: kill takes integers only and touches no memory of ours.
     sys_check_unit(unsafe { sys_c_kill(pid, sig) })
 }
 
 pub fn sys_getpid() -> i32 {
+    // UNSAFE: a C library call (getpid).
+    // SAFETY: getpid takes nothing and touches no memory of ours.
     unsafe { sys_c_getpid() }
 }
 
 // ---- Sys: terminals (0.20) ----
 
+// UNSAFE: the C library's terminal and process calls, which take raw
+// pointers.
+// SAFETY: the prototypes are POSIX's (stdlib.h, sys/ioctl.h, termios.h,
+// unistd.h, poll.h); ioctl is variadic in C and declared so; a struct
+// termios is kept in SysTermios' words, larger than either system's.
 extern "C" {
     #[link_name = "posix_openpt"]
     #[effects(io)]
@@ -947,9 +1107,9 @@ extern "C" {
     #[link_name = "unlockpt"]
     #[effects(io)]
     fn sys_c_unlockpt(fd: i32) -> i32;
-    #[link_name = "ptsname"]
-    #[effects(io, global)]
-    fn sys_c_ptsname(fd: i32) -> *u8;
+    #[link_name = "ptsname_r"]
+    #[effects(io)]
+    fn sys_c_ptsname_r(fd: i32, buf: *u8, n: u64) -> i32;
     #[link_name = "ioctl"]
     #[effects(io)]
     fn sys_c_ioctl(fd: i32, req: u64, ...) -> i32;
@@ -1016,10 +1176,14 @@ pub const SYS_POLLNVAL: i16 = 32;
 // is the child's output); the terminal becomes the child's stdin, stdout
 // and stderr (sys_fork_exec_pty), and the caller closes its copy then.
 pub fn sys_openpty(size: SysWinsize) -> Result<(i32, i32), i32> {
+    // UNSAFE: a C library call (posix_openpt).
+    // SAFETY: posix_openpt takes an int and touches no memory of ours.
     let m = sys_check(unsafe { sys_c_posix_openpt(SYS_O_RDWR | SYS_O_NOCTTY) } as i64)? as i32;
     match sys_openpty_side(m, size) {
         Ok(s) => Ok((m, s)),
         Err(e) => {
+            // UNSAFE: a C library call (close).
+            // SAFETY: close takes an int: the controller opened above.
             unsafe { sys_c_close(m); }
             Err(e)
         }
@@ -1028,18 +1192,33 @@ pub fn sys_openpty(size: SysWinsize) -> Result<(i32, i32), i32> {
 
 fn sys_openpty_side(m: i32, size: SysWinsize) -> Result<i32, i32> {
     sys_set_cloexec(m, true)?;
+    // UNSAFE: a C library call (grantpt).
+    // SAFETY: grantpt takes an int and touches no memory of ours.
     sys_check_unit(unsafe { sys_c_grantpt(m) })?;
+    // UNSAFE: a C library call (unlockpt).
+    // SAFETY: unlockpt takes an int and touches no memory of ours.
     sys_check_unit(unsafe { sys_c_unlockpt(m) })?;
-    // (ptsname: the terminal's path, a NUL-ended string valid until the
-    // next call; copied at once)
-    let name = unsafe { sys_cstr_view(sys_c_ptsname(m)) };
-    if name.len == 0 {
+    // (0.25.4) ptsname_r, not ptsname: ptsname keeps the path in one
+    // buffer for every thread.
+    var nb = [0u8; 1024];
+    // UNSAFE: C's ptsname_r writes the terminal's path through a raw
+    // pointer.
+    // SAFETY: nb is a local of 1024 bytes and ptsname_r is given 1023, so
+    // the path and its NUL stay in nb and nb[1023] stays 0.
+    let r = unsafe { sys_c_ptsname_r(m, &nb as *u8, 1023) };
+    var n = 0;
+    while r == 0 && nb[n] != 0 {
+        n += 1;
+    }
+    if n == 0 {
         return Err(sys_errno());
     }
-    let s = sys_open(name, SYS_O_RDWR | SYS_O_NOCTTY, 0)?;
+    let s = sys_open(nb[0..n], SYS_O_RDWR | SYS_O_NOCTTY, 0)?;
     match sys_set_winsize(m, size) {
         Ok(()) => Ok(s),
         Err(e) => {
+            // UNSAFE: a C library call (close).
+            // SAFETY: close takes an int: the terminal opened above.
             unsafe { sys_c_close(s); }
             Err(e)
         }
@@ -1055,6 +1234,12 @@ fn sys_openpty_side(m: i32, size: SysWinsize) -> Result<i32, i32> {
 // with 127.
 // Unsafe: path and every pointer before argv's and envp's nulls must be
 // NUL-ended strings.
+// UNSAFE: fork and execve, given raw pointers to the program's path,
+// arguments and environment.
+// SAFETY: (the caller's obligation) path and every pointer before argv's
+// and envp's nulls are NUL-ended strings (the nulls are checked here);
+// between fork and execve the child calls only async-signal-safe
+// functions, on integers and those pointers, and allocates nothing.
 pub unsafe fn sys_fork_exec_pty(tty: i32, path: *u8, argv: [*u8], envp: [*u8]) -> Result<i32, i32> {
     if argv.len == 0 || argv[argv.len - 1] != 0 as *u8 {
         return Err(SYS_EINVAL);
@@ -1088,14 +1273,18 @@ pub unsafe fn sys_fork_exec_pty(tty: i32, path: *u8, argv: [*u8], envp: [*u8]) -
 // child gets SIGWINCH).
 pub fn sys_set_winsize(fd: i32, size: SysWinsize) -> Result<(), i32> {
     let ws = size;
-    // (ioctl reads one struct winsize)
+    // UNSAFE: C's ioctl (variadic) reads a struct winsize through a raw
+    // pointer.
+    // SAFETY: ws is a local SysWinsize, C's struct winsize (#[repr(C)]).
     sys_check_unit(unsafe { sys_c_ioctl(fd, SYS_TIOCSWINSZ, &ws as *u8) })
 }
 
 // The size of the terminal fd (TIOCGWINSZ).
 pub fn sys_get_winsize(fd: i32) -> Result<SysWinsize, i32> {
     var ws = SysWinsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    // (ioctl writes one struct winsize)
+    // UNSAFE: C's ioctl (variadic) writes a struct winsize through a raw
+    // pointer.
+    // SAFETY: ws is a local SysWinsize, C's struct winsize (#[repr(C)]).
     sys_check_unit(unsafe { sys_c_ioctl(fd, SYS_TIOCGWINSZ, &ws as *u8) })?;
     Ok(ws)
 }
@@ -1103,33 +1292,47 @@ pub fn sys_get_winsize(fd: i32) -> Result<SysWinsize, i32> {
 // The terminal fd's settings.
 pub fn sys_tcgetattr(fd: i32) -> Result<SysTermios, i32> {
     var t = SysTermios { words: [0u64; 16] };
-    // (128 bytes: more than either system's struct termios)
+    // UNSAFE: C's tcgetattr writes a struct termios through a raw pointer.
+    // SAFETY: t.words is a local of 128 bytes, more than either system's
+    // struct termios (72 on macOS, 60 on Linux), 8-aligned.
     sys_check_unit(unsafe { sys_c_tcgetattr(fd, &t.words as *u8) })?;
     Ok(t)
 }
 
 // Sets the terminal fd's settings, now (TCSANOW).
 pub fn sys_tcsetattr(fd: i32, t: SysTermios) -> Result<(), i32> {
-    // (as sys_tcgetattr)
+    // UNSAFE: C's tcsetattr reads a struct termios through a raw pointer.
+    // SAFETY: t.words, 128 bytes, holds the struct termios tcgetattr wrote
+    // (perhaps changed by sys_make_raw); tcsetattr only reads it.
     sys_check_unit(unsafe { sys_c_tcsetattr(fd, 0, &t.words as *u8) })
 }
 
 // Raw mode (cfmakeraw): no echo, no line editing, no signals from keys, no
 // output processing, 8-bit characters.
 pub fn sys_make_raw(t: inout SysTermios) {
-    // (as sys_tcgetattr)
+    // UNSAFE: C's cfmakeraw changes a struct termios through a raw pointer.
+    // SAFETY: t is the caller's inout SysTermios: its 128 bytes of words
+    // hold the struct termios, more than either system's.
     unsafe { sys_c_cfmakeraw(&t.words as *u8); }
 }
 
 // Waits until one of fds is ready or timeout_ms passes (-1: no limit):
-// how many have revents set.
-pub fn sys_poll(fds: [SysPollFd], timeout_ms: i32) -> Result<i64, i32> {
-    // (poll reads and writes fds.len structs at fds.ptr)
+// how many have revents set. (0.25.4) fds is inout: poll writes their
+// revents.
+pub fn sys_poll(fds: inout [SysPollFd], timeout_ms: i32) -> Result<i64, i32> {
+    // UNSAFE: C's poll reads and writes the pollfds through a raw pointer.
+    // SAFETY: fds is the caller's inout slice of SysPollFd (C's struct
+    // pollfd, #[repr(C)]): poll touches fds.len of them at fds.ptr.
     sys_check(unsafe { sys_c_poll(fds.ptr, fds.len as u64, timeout_ms) } as i64)
 }
 
 // ---- Sys: clocks and entropy (0.20) ----
 
+// UNSAFE: the C library's clock and entropy calls, which take raw
+// pointers.
+// SAFETY: the prototypes are POSIX's and the systems' (time.h; getentropy:
+// unistd.h on Linux, sys/random.h on macOS); a struct timespec is
+// SysTimespec, #[repr(C)].
 extern "C" {
     #[link_name = "clock_gettime"]
     #[effects(io)]
@@ -1156,8 +1359,10 @@ pub const SYS_CLOCK_REALTIME: i32 = 0;
 // nanoseconds).
 pub fn sys_clock_gettime(clock: i32) -> (i64, i64) {
     var ts = SysTimespec { tv_sec: 0, tv_nsec: 0 };
-    // (clock_gettime writes one struct timespec; it fails only for a clock
-    // the system does not have, which reads as 0)
+    // UNSAFE: C's clock_gettime writes a struct timespec through a raw
+    // pointer.
+    // SAFETY: ts is a local SysTimespec; it fails only for a clock the
+    // system does not have, which reads as 0.
     unsafe { sys_c_clock_gettime(clock, &ts); }
     (ts.tv_sec, ts.tv_nsec)
 }
@@ -1166,7 +1371,9 @@ pub fn sys_clock_gettime(clock: i32) -> (i64, i64) {
 // signal interrupts it, Err(EINTR) with the time left in *left.
 pub fn sys_nanosleep(secs: i64, nanos: i64, left: inout SysTimespec) -> Result<(), i32> {
     let req = SysTimespec { tv_sec: secs, tv_nsec: nanos };
-    // (nanosleep reads req and writes *left, a borrowed struct timespec)
+    // UNSAFE: C's nanosleep reads and writes struct timespecs through raw
+    // pointers.
+    // SAFETY: req is a local, left the caller's inout SysTimespec.
     sys_check_unit(unsafe { sys_c_nanosleep(&req, &left) })
 }
 
@@ -1175,7 +1382,9 @@ pub fn sys_getentropy(buf: inout [u8]) -> Result<(), i32> {
     var at = 0;
     for _ in 0..(buf.len + 255) / 256 {
         let n = if buf.len - at < 256 { buf.len - at } else { 256 };
-        // (n bytes from buf.ptr + at, within buf)
+        // UNSAFE: C's getentropy writes through a raw pointer.
+        // SAFETY: n <= 256 bytes at buf[at..at + n].ptr, a subslice of buf
+        // (bounds-checked).
         let r = unsafe { sys_c_getentropy(buf[at..at + n].ptr, n as u64) };
         if r != 0 {
             return Err(sys_errno());
