@@ -121,7 +121,14 @@ compiler change was six small edits; the rest was shell and Python.
 5. [test] `tests/stdpos/run.sh --real` in the gate's stdpos row (it
    takes minutes: a rebuild and four suites), so that a transcript that
    pins std's shape fails before a std change does.
-6. [hook] query-first: a read of a large compiler file by the Read tool
+6. [test] std's content, not its numbers, still pins four transcripts:
+   after merging std255, calls016 (a transitive callee count through
+   std), clash (`items sys` lists std::sys's items), views017 (std's own
+   instantiations) and resolve.lsp (std::thread::scope's inferred
+   effects) failed; -u changed 14 lines and kept every other std number.
+   A `--in crate`/`--no-std` for items, callees and views would let them
+   ask about the program only.
+7. [hook] query-first: a read of a large compiler file by the Read tool
    is free, a `sed -n` of 201 lines is not; say in the block that the
    Read tool reads it (it does: `the Read tool reads any file`), first,
    not last.
