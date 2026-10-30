@@ -13,8 +13,7 @@
 // tests/wgsl/cases/cells_vs.wgsl and cells_fs.wgsl run the two stages on
 // the interpreter.
 //
-// cells.vl holds this text as a constant (render/embed.sh writes it:
-// vole has no include_str yet).
+// cells.vl embeds this file: `embed wgsl CELLS_WGSL from "cells.wgsl";`.
 
 struct U {
     cols: u32, lines: u32, top: u32, cw: u32,
