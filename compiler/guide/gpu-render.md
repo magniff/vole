@@ -34,7 +34,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_texture_to_buffer(tex, out, 256); // rows 256 bytes apart
     queue.submit(enc.finish());
     let px = out.map_read(dev);
-    println(f"{px[0]} {px[1]} {px[2]} {px[3]}");
+    println("{} {} {} {}", px[0], px[1], px[2], px[3]);
     Ok(())
 }
 ```
@@ -107,7 +107,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     queue.submit(enc.finish());
     let px = out.map_read(dev);
     // the red byte of the four corners: each texel covers 2 x 2 pixels
-    println(f"{px[0]} {px[3 * 4]} {px[3 * 256]} {px[3 * 256 + 3 * 4]}");
+    println("{} {} {} {}", px[0], px[3 * 4], px[3 * 256], px[3 * 256 + 3 * 4]);
     Ok(())
 }
 ```
@@ -263,7 +263,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         }
         println(line[..]);
     }
-    println(f"box {px[256 + 4 + 2]}, image {px[256 + 14 * 4 + 2]}"); // blue, half and whole
+    println("box {}, image {}", px[256 + 4 + 2], px[256 + 14 * 4 + 2]); // blue, half and whole
     Ok(())
 }
 ```
@@ -345,7 +345,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let a = outs[0].map_read_copy_in(dev, gpa);
     let n = outs[1].map_read_copy_in(dev, gpa);
     let d = gpu::f32s(outs[2].map_read(dev));
-    println(f"albedo {a[0]} {a[1]} {a[2]}, normal {n[0]} {n[1]} {n[2]}, depth {d[0]}");
+    println("albedo {} {} {}, normal {} {} {}, depth {}", a[0], a[1], a[2], n[0], n[1], n[2], d[0]);
     Ok(())
 }
 ```
@@ -403,7 +403,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_texture_to_buffer(map, out, 256);
     queue.submit(enc.finish());
     let d = gpu::f32s(out.map_read(dev));
-    println(f"left {d[0]}, right {d[7]}"); // the right half keeps the clear value
+    println("left {}, right {}", d[0], d[7]); // the right half keeps the clear value
     Ok(())
 }
 ```

@@ -17,7 +17,7 @@ b.push_str(s: [u8])
 Buf::new_in(gpa) -> Buf          text you build (there is no String)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
-print(x), println(x)             any Display; "{x} {v:?} {}", v[i]: a format string
+print(x), println(x)             any Display; println("{x} {:?}", v)
 b.push_int(v: i64)
 v.set(i: i64, x: T)              checked, as v[i] = x
 Scanner::new(text: [u8]) -> Scanner
@@ -82,8 +82,8 @@ Anything else is used by path (`std::print_int(n)`) or imported by name
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no file reading (call C; iterators: `volec guide
 iterators`). A `Vec` (and a `Buf`) indexes as
-its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's format strings,
-`println("{x:>4} {}", v.len())` (`volec guide formatting`); errors are enums in a
+its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's,
+`println("{x:>4}")` (`volec guide formatting`); errors are enums in a
 `Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
