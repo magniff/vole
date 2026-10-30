@@ -614,8 +614,8 @@ builtins, and no item may have those names.)
 **Strings.** `c"..."` initializes a `const` or a `static` of type `*u8`:
 the address of the bytes (`const PROMPT: *u8 = c"> ";`).
 
-**Slices.** `s.len` is `i64` (it was `u64`): lengths and indices mix
-without casts. Indexing takes any integer type. `for x in s` iterates a
+**Slices.** `s.len` is `usize` (0.26.2; it was `i64`, and `u64` before
+that), as std's lengths are. Indexing takes any integer type. `for x in s` iterates a
 slice or an array by value (the sequence is evaluated once; `break`,
 `continue` and labels work as in other loops).
 
@@ -1692,7 +1692,7 @@ take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
 
 **`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
 an array (a variable, constant, static or a field of one) is its
-length, an `i64`. The field stays. The other way round, `a.len` on such
+length, an `i64` (still in 0.26.2, where the field is a `usize`). The field stays. The other way round, `a.len` on such
 an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
 (whose `len` field is private, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.

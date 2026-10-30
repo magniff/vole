@@ -119,7 +119,7 @@ skips that one. Called again after such a move, it stops the program
 (exit 101), since no closure is `FnOnce` yet.
 
 ```vole
-fn call<F: FnMut() -> i64>(f: sink F) -> i64 { f() }
+fn call<F: FnMut() -> usize>(f: sink F) -> usize { f() }
 
 fn main(gpa: Gpa) -> i32 {
     var v: Vec<i64> = Vec::new_in(gpa);

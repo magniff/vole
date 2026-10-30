@@ -13,7 +13,7 @@ drops0261/main.vl:22 in pick
   37:1  drop(_22) [kept]  x: D
   37:1  drop(_5) [kept]  all: Vec<D>
   37:1  drop(_4) [removed]  b: D
-  37:1  drop(_3) [flag _25]  a: D
+  37:1  drop(_3) [flag _26]  a: D
 $ drops main.vl:18 main.vl:12
 drops0261/main.vl:18 in keep
   19:1  drop(_2) [removed]  d: D

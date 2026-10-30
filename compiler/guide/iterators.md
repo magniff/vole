@@ -24,7 +24,7 @@ fn main(gpa: Gpa) -> i32 {
     print(" ");
     std::print_int(v.iter().map(|x| x * 10).max().unwrap());
     print(" ");
-    std::print_int((0..100).filter(|n| n % 7 == 0).count());
+    std::print_int((0..100).filter(|n| n % 7 == 0).count() as i64);
     println("");
     for (i, x) in v.iter().enumerate().take(2) {
         std::print_int(i * 100 + x);

@@ -135,7 +135,7 @@ fn main() -> i32 {
     print(" ");
     print_int(total(Countdown { n: 4 }));
     print(" ");
-    print_int(Countdown { n: 5 }.count());
+    print_int(Countdown { n: 5 }.count() as i64);
     print(" ");
     let c: [u8; 1] = ["xyz".second()];
     print(c[0..1]);

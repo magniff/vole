@@ -66,7 +66,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     var b = Buf::new_in(gpa);          // a text builder
     let o = odds(7, gpa);
     b.push_str("n=");
-    b.push_int(o.len());
+    b.push_int(o.len() as i64);
     println(b.as_slice());
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
@@ -87,8 +87,8 @@ n=3
 from C
 ```
 
-Also: lengths and indices are `i64` (`usize` is a type of its own, not
-`u64`); integers wrap; `a as i32`
+Also: lengths and indices are `usize` (0.26.2; a counter from a literal
+says `var i: usize = 0`); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
 to take what it captures), `impl Trait for T`, `T: Trait`,
 `#[derive(Eq, Debug)]`; no `dyn`, `where`, `Box`. A let or inout

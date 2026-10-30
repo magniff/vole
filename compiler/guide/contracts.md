@@ -12,10 +12,10 @@ struct Stack { items: Vec<i64> }
 
 impl Stack {
     fn top(self, i: i64) -> i64
-        requires 0 <= i && i < self.items.len() else f"no item {i}"
-        ensures result == self.items.get(i)
+        requires 0 <= i && i < self.items.len() as i64 else f"no item {i}"
+        ensures result == self.items.get(i as usize)
     {
-        self.items.get(i)
+        self.items.get(i as usize)
     }
 
     fn pop(inout self) -> i64

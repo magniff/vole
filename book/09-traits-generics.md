@@ -85,7 +85,7 @@ impl<T> Stack<T> {
         self.items.pop()
     }
 
-    fn len(self) -> i64 {
+    fn len(self) -> usize {
         self.items.len()
     }
 }

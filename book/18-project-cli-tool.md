@@ -62,7 +62,7 @@ mod report;
 use std::{env, fs, io};
 use std::cli::{Arg, Command, Matches};
 
-fn run(m: Matches, n: i64, gpa: Gpa) -> io::Result<()> {
+fn run(m: Matches, n: usize, gpa: Gpa) -> io::Result<()> {
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
@@ -79,7 +79,7 @@ fn main(gpa: Gpa) -> i32 {
         .arg(Arg::option("top").short('t').value_name("N").default("5").help("how many words"))
         .arg(Arg::positional("file").multiple().help("the files to read"));
     let m = cmd.parse_or_exit(env::args());
-    let n = match m.get_as::<i64>("top") {
+    let n = match m.get_as::<usize>("top") {
         Ok(n) => n,
         Err(e) => cmd.exit(e),
     };
@@ -110,7 +110,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -136,7 +136,7 @@ pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -259,9 +259,9 @@ complete program, one file at a time.
 // give back numbers, which makes them easy to test.
 
 pub struct Counts {
-    pub lines: i64,
-    pub words: i64,
-    pub bytes: i64,
+    pub lines: usize,
+    pub words: usize,
+    pub bytes: usize,
 }
 
 impl Counts {
@@ -276,7 +276,7 @@ impl Counts {
 // a newline, a word is a run of anything but spaces.
 #[no_io]
 pub fn count(text: str) -> Counts {
-    var lines = 0;
+    var lines: usize = 0;
     for b in text.as_bytes() {
         if b == '\n' {
             lines += 1;
@@ -309,7 +309,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // Chapter 7's: the word without the punctuation around it.
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -351,7 +351,7 @@ fn counts_add_up(bytes: Vec<u8>, gpa: Gpa) {
     for (_, k) in freq.iter() {
         total += k;
     }
-    assert_eq(total, count(text).words);
+    assert_eq(total, count(text).words as i64);
 }
 ```
 
@@ -400,7 +400,7 @@ pub fn print_counts(c: Counts, name: str, words_only: bool) {
 }
 
 // The n most common words, most common first; as common, alphabetically.
-pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -526,7 +526,7 @@ fn tally(text: str, fold: bool, totals: inout HashMap<String, i64>, gpa: Gpa) ->
     count::count(text)
 }
 
-fn run(m: Matches, top: i64, gpa: Gpa) -> Result<(), TallyError> {
+fn run(m: Matches, top: usize, gpa: Gpa) -> Result<(), TallyError> {
     let fold = m.flag("ignore-case");
     let words_only = m.flag("words");
     var totals: HashMap<String, i64> = HashMap::new_in(gpa);
@@ -568,7 +568,7 @@ fn main(gpa: Gpa) -> i32 {
         .arg(Arg::flag("ignore-case").short('i').help("fold case before counting"))
         .arg(Arg::positional("file").multiple().help("the files to read (none: stdin)"));
     let m = cmd.parse_or_exit(env::args());
-    let top = match m.get_as::<i64>("top") {
+    let top = match m.get_as::<usize>("top") {
         Ok(n) => n,
         Err(e) => cmd.exit(e),
     };
@@ -753,10 +753,10 @@ someone adds a debugging print to `count`, with chapter 17's `edit
 patch`:
 
 ```console
-$ volec edit patch count::count --old 'var lines = 0;' --new 'println("counting"); var lines = 0;'
+$ volec edit patch count::count --old 'var lines: usize = 0;' --new 'println("counting"); var lines: usize = 0;'
 count.vl:22:5: error[effect] 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[no_io] | try: volec query effects count::count --why io  [edited: crate::count::count]
 error edit.breaks: 1 new error; nothing written; the error: count.vl:22:5: 'count::count' is #[no_io], but it does io: 'println("counting")' at count.vl:23:5 calls 'std::fmt::println'
-try: volec edit patch count::count --old 'var lines = 0;' --new 'println("counting"); var lines = 0;' --no-check
+try: volec edit patch count::count --old 'var lines: usize = 0;' --new 'println("counting"); var lines: usize = 0;' --no-check
 ```
 
 The edit is refused, and the message says why and what to do: return

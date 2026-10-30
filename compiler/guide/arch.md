@@ -190,7 +190,7 @@ fn dot(a: [u8], b: [u8]) -> u32 {
     if has("dotprod") {
         var acc = vdupq_n_u32(0);
         var i = 0;
-        while i + 16 <= a.len {
+        while i + 16 <= a.len as i64 {
             acc = vdotq_u32(acc, vld1q_u8(a, i), vld1q_u8(b, i));
             i += 16;
         }
@@ -256,7 +256,7 @@ fn find(s: [u8], b: u8) -> i64 {
     var i = 0;
     if has("neon") {
         let needle = vdupq_n_u8(b);
-        while i + 16 <= s.len {
+        while i + 16 <= s.len as i64 {
             let eq = vceqq_u8(vld1q_u8(s, i), needle);
             if vmaxvq_u8(eq) != 0 {
                 let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
@@ -266,7 +266,7 @@ fn find(s: [u8], b: u8) -> i64 {
         }
     } else if has("sse2") {
         let needle = _mm_set1_epi8(b as i8);
-        while i + 16 <= s.len {
+        while i + 16 <= s.len as i64 {
             let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s, i), needle));
             if m != 0 {
                 return i + trailing_zeros(m as u64);
@@ -274,7 +274,7 @@ fn find(s: [u8], b: u8) -> i64 {
             i += 16;
         }
     }
-    while i < s.len {
+    while i < s.len as i64 {
         if s[i] == b {
             return i;
         }

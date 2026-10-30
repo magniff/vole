@@ -19,8 +19,8 @@ $ edit insert --after std::trim --dry-run < $T/inputs/strip_prefix.vl
 ## An error in std's new text (0.17: std sees the prelude, `None`; here
 ## a wrong type): the check says so, nothing is written.
 $ edit insert --after std::trim < $T/inputs/strip_prefix_none.vl
-compiler/std/flat/io.vl:24:21: error[type error] expected '[u8]', got 'i64'  [edited]
-error edit.breaks: 1 new error; nothing written; the error: compiler/std/flat/io.vl:24:21: expected '[u8]', got 'i64'
+compiler/std/flat/io.vl:24:21: error[type error] expected '[u8]', got 'usize'  [edited]
+error edit.breaks: 1 new error; nothing written; the error: compiler/std/flat/io.vl:24:21: expected '[u8]', got 'usize'
 try: volec edit insert --after std::trim --no-check
 [exit 1]
 ## Written, then embed.sh makes the compiler's std from the files.
