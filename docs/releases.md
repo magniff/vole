@@ -73,6 +73,14 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.26.0
+
+The first release of the move to Rust's surface
+([design/rust-surface-plan.md](design/rust-surface-plan.md)): the places
+IR at `check`, struct fields private unless `pub`, and shaders as
+`embed wgsl` blocks. Built and tested on aarch64-macos only; Linux is
+untested in this release.
+
 ### What's new in 0.25.5
 
 The last release before 0.26's rethink of the core semantics: no language
