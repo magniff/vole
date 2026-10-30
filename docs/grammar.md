@@ -1425,8 +1425,10 @@ tightly as a call: `parse(s)?.len` is `(parse(s)?).len`, `-x?` is
 
 `widens(A, B)` holds for integer types when `B` is wider with the same
 signedness (`i8 < i16 < i32 < i64`, `u8 < u16 < u32 < u64`), or `A` is
-unsigned and `B` signed and strictly wider (`u32` to `i64`); `isize` and
-`usize` are `i64` and `u64`. Nothing else widens: not int and float,
+unsigned and `B` signed and strictly wider (`u32` to `i64`). `usize` and
+`isize` (0.26.2) are 64-bit types of their own, unsigned and signed: `u32`
+widens to `usize`, `i32` and `u32` to `isize`, and `usize` and `u64`,
+`isize` and `i64`, convert by `as` or `TryFrom` (std). Nothing else widens: not int and float,
 not `bool`, not signed to unsigned, never narrower.
 
 - Wherever a value of type `A` meets an expected type `B` with
