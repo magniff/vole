@@ -76,7 +76,8 @@ static var MAP_GEN: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var GEN: i64 = 0;
 // The statics named so far: (symbol, IR local) pairs.
 static var STATICS_SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The scope stack: records of SW words (kind, first entry, loop node,
+// The scope stack: records of SW words (kind, first entry, its node
+// (where its drops run, places/print.vl drop_pos; a loop's: the loop),
 // break block, continue block, the loop's result local and projection).
 const SW: i64 = 8;
 const SC_BODY: i64 = 1;
@@ -100,6 +101,11 @@ static var PL_P: i64 = 0;
 static var RET_BLOCK: i64 = -1;
 static var UNIT_LOCAL: i64 = -1;
 static var CUR_F: i64 = -1;
+
+// The exit whose scopes' entries are being emitted (a `return`, `break`,
+// `continue`, a refused guard, the body's end): the node of their drops
+// (0: a scope's own end, its node's).
+static var EXIT_NODE: i64 = 0;
 // Whether drops are placed (--values=error, as the own pass's).
 static var DROPS: bool = false;
 // Whether the struct literal being lowered is a by-access closure's env
@@ -240,11 +246,11 @@ fn static_local(name: i64, node: i64) -> i64 {
 
 // ---- Scopes ----
 
-fn push_scope(kind: i64) -> i64 {
+fn push_scope(kind: i64, node: i64) -> i64 {
     let at = SCOPES.len() / SW;
     SCOPES.push(kind);
     SCOPES.push(ENTRIES.len() / 2);
-    SCOPES.push(0);
+    SCOPES.push(node);
     SCOPES.push(-1);
     SCOPES.push(-1);
     SCOPES.push(-1);
@@ -269,12 +275,14 @@ fn schedule(kind: i64, v: i64) {
 fn emit_scope(s: i64) {
     let first = SCOPES[s * SW + 1];
     let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] } else { ENTRIES.len() / 2 };
+    // (where its drops run: the exit taken, or the scope's own end)
+    let at = if EXIT_NODE > 0 { EXIT_NODE } else { SCOPES[s * SW + 2] };
     var e = end - 1;
     while e >= first {
         let kind = ENTRIES[2 * e];
         let v = ENTRIES[2 * e + 1];
         if kind == EN_DROP {
-            emit(SK_DROP, v, 0, DS_UNDECIDED, -1, P_LOCALS[v].src, 0, 0, 0);
+            emit(SK_DROP, v, 0, DS_UNDECIDED, -1, P_LOCALS[v].src, 0, 0, at);
         } else if kind == EN_DEAD {
             emit(SK_DEAD, v, 0, 0, 0, 0, 0, 0, 0);
         } else if kind == EN_DEFER {
@@ -286,12 +294,15 @@ fn emit_scope(s: i64) {
 
 // Leaves scopes down to `depth` (they stay on the stack: an edge out of
 // them, `break`, `return`).
-fn exit_to(depth: i64) {
+fn exit_to(depth: i64, node: i64) {
+    let saved = EXIT_NODE;
+    EXIT_NODE = node;
     var s = scope_depth() - 1;
     while s >= depth {
         emit_scope(s);
         s -= 1;
     }
+    EXIT_NODE = saved;
 }
 
 // The innermost scope ends: its entries emitted (when the code reaches its
@@ -323,7 +334,7 @@ fn run_defer(d: i64) {
     if e == 0 {
         return;
     }
-    let s = push_scope(SC_STMT);
+    let s = push_scope(SC_STMT, d);
     expr_into(e, -1, 0);
     pop_scope_at(s);
 }
@@ -1259,7 +1270,7 @@ fn lower_return(n: i64) {
     if !reachable() {
         return;
     }
-    exit_to(0);
+    exit_to(0, n);
     goto(RET_BLOCK);
 }
 
@@ -1281,7 +1292,7 @@ fn lower_break(n: i64) {
     if !reachable() {
         return;
     }
-    exit_to(s + 1);
+    exit_to(s + 1, n);
     goto(SCOPES[s * SW + 3]);
 }
 
@@ -1291,7 +1302,7 @@ fn lower_continue(n: i64) {
         unsupported(n);
         return;
     }
-    exit_to(s + 1);
+    exit_to(s + 1, n);
     if SCOPES[s * SW + 7] != 0 {
         goto_back(SCOPES[s * SW + 4]);
     } else {
@@ -1341,7 +1352,7 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     let exit = new_block();
     goto(head);
     enter_block(head);
-    let s = push_scope(SC_LOOP);
+    let s = push_scope(SC_LOOP, n);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = head;
@@ -1352,7 +1363,7 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     if NODES[n].kind == NodeKind::While {
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
-        let c = push_scope(SC_STMT);
+        let c = push_scope(SC_STMT, n);
         operand(NODES[n].b, false);
         let at = ops_mark();
         push_now();
@@ -1414,11 +1425,11 @@ fn lower_for(n: i64) {
     push_now();
     switch_bool(at2, exit, body, n);
     enter_block(body);
-    let s = push_scope(SC_LOOP);
+    let s = push_scope(SC_LOOP, n);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = next;
-    let arm = push_scope(SC_ARM);
+    let arm = push_scope(SC_ARM, n);
     let pat = NODES[n].b;
     if NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
         let l = user_local(NODES[pat].x, pat, false);
@@ -1483,13 +1494,13 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
         let arm = child(n, i);
         let pat = NODES[arm].a;
         let fail = new_block();
-        let s = push_scope(SC_ARM);
+        let s = push_scope(SC_ARM, arm);
         test_pattern(pat, sl, sp, st, fail);
         let guard = NODES[arm].b;
         if guard != 0 && reachable() {
             phase_begin(-1);
             bind_pattern(pat, sl, sp, st, true);
-            let g = push_scope(SC_STMT);
+            let g = push_scope(SC_STMT, guard);
             operand(guard, false);
             if reachable() {
                 let at = ops_mark();
@@ -1498,7 +1509,7 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
                 let refused = new_block();
                 switch_bool(at, refused, ok, arm);
                 enter_block(refused);
-                exit_to(s);
+                exit_to(s, arm);
                 goto(fail);
                 enter_block(ok);
             }
@@ -1768,7 +1779,7 @@ fn lower_block(b: i64, dl: i64, dp: i64) {
     // (a statement temporary's block, or a transparent desugaring: no scope
     // of its own)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
-    let s = if scoped { push_scope(SC_BLOCK) } else { -1 };
+    let s = if scoped { push_scope(SC_BLOCK, b) } else { -1 };
     for i in 0..NODES[b].count {
         if !reachable() {
             break;
@@ -1809,12 +1820,12 @@ fn lower_stmt(st: i64) {
         if e == 0 || own_flag_write(e) {
             return;
         }
-        let s = push_scope(SC_STMT);
+        let s = push_scope(SC_STMT, st);
         expr_into(e, -1, 0);
         pop_scope_at(s);
         return;
     }
-    let s = push_scope(SC_STMT);
+    let s = push_scope(SC_STMT, st);
     expr_into(st, -1, 0);
     pop_scope_at(s);
 }
@@ -1885,7 +1896,7 @@ fn lower_let(st: i64) {
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
     let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);
-    let s = if keep { -1 } else { push_scope(SC_STMT) };
+    let s = if keep { -1 } else { push_scope(SC_STMT, st) };
     if pk == NodeKind::PatWild {
         if init != 0 {
             expr_into(init, -1, 0);
@@ -1992,7 +2003,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     crate::places::ir::B_PARAMS = count;
     let entry = new_block();
     RET_BLOCK = new_block();
-    let body_scope = push_scope(SC_BODY);
+    let body_scope = push_scope(SC_BODY, NODES[item].c);
     // the parameters: _1.._n
     let keep = keep_params(f);
     for i in 0..count {
@@ -2018,7 +2029,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     let body = NODES[item].c;
     expr_into(body, 0, 0);
     if reachable() {
-        exit_to(body_scope);
+        exit_to(body_scope, body);
         goto(RET_BLOCK);
     }
     SCOPES.clear();
