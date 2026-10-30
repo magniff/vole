@@ -31,7 +31,7 @@ fn main(gpa: Gpa) -> i32 {
             continue;
         }
         if let Err(e) = run(&store, line, gpa) {    // &: run may change store
-            println(f"line {line_no}: {e}");    // Error has Display
+            println("line {line_no}: {e}");    // Error has Display
         }
     }
     0
@@ -82,11 +82,11 @@ pub enum Error {
 impl Display for Error {
     fn fmt(self, f: inout Fmt) {
         match self {
-            Error::Unknown(w) => f.write(f"unknown command {w}"),
-            Error::Arity(w, n) => f.write(f"{w} takes {n - 1} arguments"),
-            Error::BadNumber(w) => f.write(f"not a number: {w}"),
-            Error::NoItem(name) => f.write(f"no item {name}"),
-            Error::Short(name, have) => f.write(f"only {have} {name} left"),
+            Error::Unknown(w) => f.write("unknown command {w}"),
+            Error::Arity(w, n) => f.write("{w} takes {} arguments", n - 1),
+            Error::BadNumber(w) => f.write("not a number: {w}"),
+            Error::NoItem(name) => f.write("no item {name}"),
+            Error::Short(name, have) => f.write("only {have} {name} left"),
         }
     }
 }
@@ -179,7 +179,7 @@ impl Store {
         var out = Buf::new_in(gpa);             // Rust's String
         var total = 0;
         for it in order {
-            out.push_fmt(f"{it.name:<5}{it.count:>3} x {it.price:>2} = {value(it)}\n");
+            out.push_fmt("{:<5}{:>3} x {:>2} = {}\n", it.name, it.count, it.price, value(it));
             total += value(it);
         }
         out.push_str("total ");
@@ -237,7 +237,7 @@ total 129
 - `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
   derive: a struct of numbers and views, as `Item`, copies; one holding a
   `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by
-  hand, with `f.write(f"..")`: `fn fmt(self, f: inout Fmt)`.
+  hand, with `f.write("..", args)`: `fn fmt(self, f: inout Fmt)`.
 - Nothing allocates without an allocator. `main` gets `gpa` and passes
   it down. A function that allocates takes `gpa: Gpa`; one holding a
   `Vec` can use `v.allocator()`. Nothing is freed by hand: a value is
@@ -250,5 +250,5 @@ total 129
   value. Bindings: `let` (fixed), `var` (changes).
 - Comparators return an `i64` (negative: `a` first) and take their
   elements let: `sort_by(|a, b| ..)`, `cmp_of(a, b)`.
-- `Buf` is Rust's `String`: `push_str`, `push_int`, `push_fmt(f"..")`,
+- `Buf` is Rust's `String`: `push_str`, `push_int`, `push_fmt("..", args)`,
   `as_slice()`.

@@ -208,7 +208,7 @@ fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```
 
 ```err
-error[type error]: 'add_words' is private
+error[item.private]: 'add_words' is private
  --> main.vl: line 5, column 5
   = help: make it public: `pub fn add_words` at count.vl: line 1, column 1
   = try: volec fix --suggested main.vl

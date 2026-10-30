@@ -10,7 +10,7 @@ more often than to something else, and each error names the fix.
 | Rust | vole |
 |---|---|
 | `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
-| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt(f"..")`; `to_string_in(f"..", gpa)`; `std::Buf` for bytes, `format_in(f"..", gpa)` (a Buf) |
+| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `std::Buf` for bytes, `format_in("..", args, gpa)` (a Buf) |
 | `&[u8]` | `[u8]`: bytes; `str::from_utf8(b)?` makes a `str` of them (checked); `"abc"` is a `[u8]` where no `str` goes |
 | `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
@@ -241,13 +241,14 @@ fn main() -> i32 {
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
 | `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
-| `where T: Ord` | `<T: Ord>` |
-| `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children; fields too, 0.26); `pub(crate)` and `pub(super)` come in 0.26.2 |
+| `where T: Ord` | the same (0.26.2), on a parameter of the item; `where I::Item: Ord` comes with the rust edition |
+| `pub(crate)`, `pub(super)`, `pub(in path)` | the same (0.26.2), on items, fields, `use` and `mod`; nothing is private to the module and its children (fields too, 0.26) |
 | `fn` inside a `fn` | items only at module level |
-| `macro_rules!`, `println!`, `vec!` | none: `println(f"{x}")` (0.15) |
+| `macro_rules!`, `println!`, `vec!` | none: `println("{}", x)`, a format string (0.26.2) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
 | `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
-| `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
+| `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
+| `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |
 | `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |
 | `assert!`, `debug_assert!`, contracts crates | `assert(c)`, `assert_eq(a, b)`; `requires`/`ensures` clauses (0.18; guide contracts) |
 | `use a::b::*;` | `use a::b::{c, d};` |

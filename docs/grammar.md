@@ -80,12 +80,13 @@ directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue defer else enum extern false fn for
 if impl import in let loop match mod mut pub return static struct trait true
-type union unsafe use while move` (`import` and `use` since 0.4, `pub` and
+type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
 `mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14).
+since 0.14, `where` since 0.26.2). `defer` is a keyword with no statement
+since 0.26.2: `syntax.defer`, which names it.
 
-**Reserved** (an error if used): the keywords `where dyn` (and `move` until
-0.14, a keyword since), and the
+**Reserved** (an error if used): the keyword `dyn` (and `move` until
+0.14, `where` until 0.26.2, keywords since), and the
 token `@` (and `?` until 0.15, an operator since). `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
@@ -98,7 +99,7 @@ are two `*`.
 
 ```ebnf
 program      = { item } EOF ;
-item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may come before pub *)
+item         = [ vis ] [ attributes ] [ vis ]           (* (0.6) attributes may come before pub *)
                ( fn_decl | extern_item | struct_decl | union_decl | enum_decl
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
@@ -110,9 +111,12 @@ use_name     = ident [ "as" ident ] ;
 mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.vl, see "Modules" *)
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
+vis          = "pub" [ "(" ( "crate" | "super" | "self" | "in" path ) ")" ] ;   (* (0.26.2) see "Modules" *)
 
-fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
-                                                       (* unsafe: (0.9), see "Unsafe code" *)
+fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] [ where ] block ;
+                                                       (* unsafe: (0.9), see "Unsafe code"; where: (0.26.2) *)
+where        = "where" pred { "," pred } [ "," ] ;      (* (0.26.2) a type parameter's bounds, see below *)
+pred         = ident ":" bound { "+" bound } ;
 generics     = "<" tparam { "," tparam } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
 tparam       = ident [ ":" path { "+" path } ] ;       (* bounds: (0.9), see "Traits" *)
 params       = param { "," param } [ "," ] ;
@@ -132,20 +136,36 @@ attribute    = "repr" "(" repr { "," repr } ")"        (* (0.3) structs, unions,
              | "inline" [ "(" "never" ")" ] | "cold" ;  (* (0.6) functions *)
 repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
-struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "}" ;
+struct_decl  = "struct" ident [ generics ] [ where ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
-field        = [ "pub" ] ident ":" type ;              (* (0.26) private to the struct's module unless pub *)
-enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
+field        = [ vis ] ident ":" type ;                (* (0.26) private to the struct's module unless pub *)
+enum_decl    = "enum" ident [ generics ] [ where ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
-impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
+impl_block   = "impl" [ generics ] [ path "for" ] type [ where ] "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
                                                        (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
-trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
+trait_decl   = "trait" ident [ generics ] [ where ] "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] [ where ] ( ";" | block ) } "}" ;
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
 type_alias   = "type" ident [ generics ] "=" type ";" ;   (* generics: (0.6) *)
 ```
+
+**`where` and `impl Trait`** *(0.26.2)* are other ways to write type
+parameters and their bounds, as in Rust. `where P: B + C, Q: D` after a
+function's result type (before its contract clauses), after a struct's,
+enum's or trait's generics, or before an impl's `{`, adds the bounds to
+those written inline: `fn f<T>(x: T) where T: Display` is `fn f<T:
+Display>(x: T)`. A method's `where` may bound its impl's parameters too.
+The left side is a type parameter of the item; a bound on another type
+(`I::Item: Display`, `Vec<T>: Debug`) is `where.unsupported` until the
+rust edition (bound a parameter instead: `I: Iterator<Item = X>, X:
+Display`). A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
+after a mode: `f: inout impl FnMut(i64)`) is a hidden type parameter
+with those bounds, after the written ones: messages name it by its text,
+`impl Display`, and a turbofish gives only the written ones
+(`pick::<i64>(t, u)`). `impl Trait` anywhere else (a result, a field, a
+`let`) is `type.impl-position`.
 
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
@@ -192,7 +212,8 @@ type = path [ type_args ]                             (* i8 ... u64, isize, usiz
      | "[" type "]"                                   (* (0.3) a slice: a pointer and a length *)
      | [ "extern" '"C"' ] "fn" "(" [ type { "," type } [ "," ] ] ")" [ "->" type ]
                                                       (* not variadic; extern "C" fn (0.3) is another type *)
-     | "!" ;                                          (* never: e.g. `fn exit(c: i32) -> !` *)
+     | "!"                                            (* never: e.g. `fn exit(c: i32) -> !` *)
+     | "impl" bound { "+" bound } ;                   (* (0.26.2) a parameter's type only: see "Items" *)
 type_args = "<" type { "," type } [ "," ] ">" ;       (* (0.5); `>>` closes two lists *)
 ```
 
@@ -242,7 +263,7 @@ bound so may be read, not changed or moved). There is no `&pat` pattern.
 block       = "{" { stmt } [ expr ] "}" ;
 stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
-            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6) *)
+            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6; 0.26.2: error syntax.defer) *)
             | block_like [ ";" ]
             | expr ";" ;
 block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
@@ -730,9 +751,22 @@ the error's help is the declaration with `pub` and where it is, which
 `volec fix --only pub` writes; on a field with a method of its name
 (`v.len`), the call. (Until 0.26 a field was as visible as its struct,
 and `pub` on it changed nothing; `#[sealed]` asked for this rule.)
-`pub(crate)`, `pub(super)` and `pub(in path)`, for items and fields, come
-in 0.26.2; until then a field read from a sibling module is plain
-`pub`.
+
+**Restricted visibility** *(0.26.2)*, Rust's: `pub(crate)` is visible in
+the item's crate, `pub(super)` in its module's parent (and the modules
+inside it), `pub(in path)` in the module the path names, which must be
+the item's module or one around it (else `vis.path`, E0742; `pub(super)`
+at a crate's root is one too); `pub(self)` is private. They go on items,
+fields, `use` (a `pub(crate) use` re-exports inside the crate only) and
+`mod`. A program's crate is its root module; std's is std, so a std item
+marked `pub(crate)` is std's own, and in std an `in` path starts at
+`std::` or `super::`. Outside its restriction an item's use is
+`item.private` (E0603; a private item's too, from 0.26.2: it was a `type
+error`) and a field's `field.private`, both saying where it is visible
+(`visible only in crate 'std'`, `in module 'a::b'`); `volec fix --only
+pub` widens a restriction to `pub(crate)` (a program is one crate) and
+writes `pub` on a private item (0.26.2 writes no `pub(crate)` there:
+compiler/src may use the form from 0.26.3).
 
 Paths name items through modules: `geometry::shapes::area(s)`,
 `geometry::Rect { w: 1, h: 2 }`, `shapes::Shape::Rect(r)` (a variant),
@@ -816,7 +850,10 @@ change the value already taken from it. A deferred statement sees the
 bindings made before it; it may not `return`, nor `break`/`continue` out
 of itself (loops inside it are fine). Deferred statements do not run when
 the program ends by a failed check (exit 101), `exit`, or a `longjmp` past
-them.
+them. (0.26.2: removed, as Rust has none. `defer` is `error
+syntax.defer`; a guard, a value whose `Drop` does what the deferred
+statement did, is made where it stood and dropped on the same ways out,
+last first, the value leaving the block computed before.)
 
 **Function attributes.** `#[inline]`, `#[inline(never)]` and `#[cold]`
 (rarely called) before a function, also in impl blocks: hints for the
@@ -1294,8 +1331,8 @@ type; `e` is evaluated once, into a hidden `let`:
 
 Anything else is the error `'for' iterates over ranges, slices, arrays,
 iterators and types with an 'iter' method, got 'T'`. The pattern is
-irrefutable (a `let`'s); labels, `break`, `continue` and `defer` in the
-body behave as in any loop. Items are copies.
+irrefutable (a `let`'s); labels, `break`, `continue` and the drops of
+the body behave as in any loop. Items are copies.
 
 `a..b` and `a..=b` outside a `for` head, a slicing and a pattern are
 values: `std::Range { start: a, end: b }` and `std::RangeInclusive {
@@ -1417,7 +1454,7 @@ tightly as a call: `parse(s)?.len` is `(parse(s)?).len`, `-x?` is
   neither is an error, and so is `?` on an Option in a function returning
   a Result (`try: e.ok_or(VALUE)?`). Inside a closure `?` returns from the
   closure, whose result type must then be known (`|x| -> Option<i64>
-  {..}`, as for `return`). `defer` blocks run, as for `return`.
+  {..}`, as for `return`). The drops run, as for `return`.
 - `fn main() -> Result<(), E>` with `E: Debug`: on `Err(e)` the program
   prints `Error: ` and `e`'s Debug text on stderr and exits with 1.
 
@@ -1466,25 +1503,76 @@ with `U` the expected type, and `t: Into<U>` holds when `U: From<t>`.
 
 ### Formatting
 
-An f-string `f"..."` is an expression of an unnameable type (an
-`std::Interp` of a closure) implementing `std::Display`. Its text takes
-the escapes of a string literal; `{{` and `}}` are braces; `{expr}` is a
-hole, `{expr:spec}` one with a spec. The lexer reads it as pieces:
-`f"text{` (FHead), the hole's tokens, `:spec}text{` or `}text{` (FMid),
-..., `:spec}text"` (FTail); an f-string without holes is one FHead. A
-hole ends at its `}` at bracket depth 0 or at a `:` outside brackets
-that is not `::`, so an expression with a top-level `:` needs
-parentheses; string literals may appear in holes; f-strings do not
+(0.26.2) A **format literal** is a plain string literal (`"..."`, a text
+block, `r"..."`) that is the first argument of a format function: Rust's
+`format!` family without the `!`. The format functions are a closed table
+(front/check/format.vl), std's own:
+
+| format function | the format arguments |
+|---|---|
+| `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
+| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)` |
+| `panic`, the message of `assert` and `debug_assert` | after the literal |
+| the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
+| a contract's `else` | `requires c else "len {}", v.len()` |
+
+A function of the program is none: it takes `format_args("..", ..)`, a
+value of the unnameable `std::Interp` type that implements `Display`
+(Rust's `format_args!`). A first argument that is not a literal (a
+`const`, a variable) is a plain value, `println(s)` prints `s`, and an
+argument after it is `format.args`: a format string is a literal.
+
+The literal's grammar is Rust's std::fmt:
+
+    format   = { text | "{{" | "}}" | hole }
+    hole     = "{" [ arg ] [ ":" spec ] "}"
+    arg      = integer | identifier
+    spec     = [[fill] align] ["+" | "-"] ["#"] ["0"] [width] ["." precision] [type]
+    align    = "<" | "^" | ">"
+    width    = count
+    precision = count | "*"
+    count    = integer | integer "$" | identifier "$"
+    type     = "?" | "x?" | "X?" | "x" | "X" | "o" | "b" | "e" | "E" | "p" | "c"
+
+`{}` takes the next positional argument, `{N}` argument N, `{name}` a
+named argument (`name = expr`) or else a local, a parameter, a `const` or
+a `static` in scope (Rust 2021's captures). `N$`, `name$` and `.*` (two
+arguments: the precision, then the value) give a width or a precision
+as an integer value. An expression in a hole (`{p.a}`, `{x + 1}`) is
+`format.expr-hole`, whose fix moves it to an argument; a `{` or `}` of
+the text not doubled is `format.syntax`; a spec not of this grammar is
+`format.spec` (`{:#?}` is not in this release); an argument no hole
+takes, or a hole with no argument, is `format.args`.
+
+The meaning is rustc's, byte for byte: `{}` is `Display::fmt`, `{:?}`
+`Debug::fmt_debug`; `x X o b` take integers, `e E` integers and floats, as Rust's do; `+`
+signs a number, `#` writes `0x`, `0o`, `0b`; `0` pads a number with
+zeros after its sign and prefix; text is left-aligned and numbers
+right-aligned by default; the fill is any byte; `p` writes a pointer as
+`0x..`; vole's `c` writes a `u8` as its byte, until vole has `char`. The
+arguments are evaluated once each, left to right, before any is
+written. `panic("bad {x}")` (and assert's message) formats into 256
+bytes on the stack, a piece that does not fit left out, so that a
+`#[no_alloc]` function can panic with one.
+
+Until 0.26.1 a plain literal at a format position was printed as it is,
+braces and all; `volec fix --only fstring` doubles such a literal's
+braces, so that its output stays the same.
+
+**f-strings** (`f"..."`, until 0.28) stay accepted: an f-string is an
+expression of the same `std::Interp` type. Its text takes the escapes of
+a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
+any expression, `{expr:spec}` one with a spec (the same specs). The lexer
+reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
+or `}text{` (FMid), ..., `:spec}text"` (FTail); an f-string without holes
+is one FHead. A hole ends at its `}` at bracket depth 0 or at a `:`
+outside brackets that is not `::`, so an expression with a top-level `:`
+needs parentheses; string literals may appear in holes; f-strings do not
 nest; a hole may not be empty, and a lone `}` in the text is an error.
-
-The spec: `<` or `>` aligns (numbers right, text left by default), `0`
-pads with zeros, the digits are the width, `.N` the precision (floats:
-N decimals), and the last character picks Debug (`?`), hex (`x`, `X`),
-binary (`b`) or a byte (`c`, a `u8` written as the byte).
-
-The holes are evaluated where the f-string is, once each, left to
-right; the value holds copies of them. Its Display writes the text and
-each hole's `Display` (or `Debug`) in turn.
+The holes are evaluated where the f-string is, once each, left to right;
+the value holds copies of them. `volec fix --only fstring` rewrites an
+f-string as a format literal (at a format position) or as
+`format_args(..)` (anywhere else).
 
 ### Named arguments, defaults, shorthand
 
@@ -1630,8 +1718,8 @@ on by default: `--values=error` (the default since T7, which moved the
 tests, examples and evals over with `volec fix --values`).
 `--values=warn` and `--values=report` keep 0.16's semantics (no drops)
 and only warn or list; `--values=off` turns the pass off. They are
-opt-outs for 0.17 only. `defer v.free()` stays legal (`free` frees now
-and leaves the container empty) and is no longer needed.
+opt-outs for 0.17 only. `v.free()` stays legal (`free` frees now and
+leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,
@@ -1721,8 +1809,9 @@ checks, the tests and distinct types come with the tasks named there.
 
 ```ebnf
 fn_item    = signature { clause } ( block | ";" ) ;            (* fns, trait fns, impl fns *)
-clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ "else" expr ] ;
-type_inv   = [ "debug" ] "invariant" expr [ "else" expr ] [ ";" ] ;   (* after a struct's or enum's "}" *)
+clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ message ] ;
+type_inv   = [ "debug" ] "invariant" expr [ message ] [ ";" ] ;
+message    = "else" expr { "," arg } ;                        (* 0.26.2: a format literal's arguments *)   (* after a struct's or enum's "}" *)
 alias      = "type" ident [ generics ] "=" [ "distinct" ] type [ type_inv ] ";" ;
 attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
 ```
@@ -1733,7 +1822,10 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
   In an `ensures`, `result` is the returned value and `old(e)` is `e` at
   the function's entry (T1).
 - A clause's condition is an expression in which `{` ends it, as in an
-  `if`'s condition. The message after `else` is a string or an f-string.
+  `if`'s condition. The message after `else` is a string or an f-string;
+  (0.26.2) a plain literal is a format literal, its arguments after it:
+  `requires v.len() > 0 else "empty: {} items", v.len()` (at most three
+  holes, as an f-string's).
 - `#[cfg(test)]` marks the item after it (all of a module's items);
   `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
   compiles them as ordinary items (T2 leaves them out of builds that are

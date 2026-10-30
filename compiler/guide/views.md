@@ -84,7 +84,7 @@ fn main(gpa: Gpa) {
     p.toks.push(Tok { text: "x", kind: 1 });
     let a = p.name();
     let b = p.name();                 // a is still fine
-    println(f"{a} {b}");
+    println("{a} {b}");
 }
 ```
 ```out

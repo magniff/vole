@@ -86,15 +86,29 @@ static var FWD: Vec<i64, Comp> = Vec::new_in(Comp {});
 // The block emitted after the current one (-1: none), so that a jump to
 // it is left out.
 static var NEXT: i64 = -1;
-// The accumulator forwarding: a local written by one statement and read
-// only by the next one, first (a statement temporary: MENTIONS, its
-// mentions in the body, 2), is not stored: write_place leaves it in the
-// accumulator (FWD_TO: the local the statement being generated writes
-// so; ACC_HOLDS: the local the accumulator holds, until its read).
-// Likewise the result _0 written right before a return.
+// The emitted blocks in order (gen_blocks); the slots share_slots hands
+// out, by size and alignment, and the last mention of their last user.
+static var ORDER: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var POOL_SLOT: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var POOL_SIZE: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var POOL_ALIGN: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var POOL_LAST: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// Per local: its mentions in the body (count_mentions).
 static var MENTIONS: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var FWD_TO: i64 = -1;
-static var ACC_HOLDS: i64 = -1;
+// Per local: whether the accumulator carries it (find_acc_only): no slot,
+// written and read in the accumulator (write_place, gen_place_value).
+static var ACC_ONLY: Vec<bool, Comp> = Vec::new_in(Comp {});
+// Per emitted block: its predecessors, a list (P_HEAD, then P_NEXT) of
+// the blocks in P_FROM.
+static var P_HEAD: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var P_NEXT: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var P_FROM: Vec<i64, Comp> = Vec::new_in(Comp {});
+// Per block: whether it has nothing but a return (return_block), and the
+// local the accumulator holds at its start (-1: none known; every
+// predecessor's last statement wrote it, or each one's switch read it).
+static var RET_BLOCK: Vec<bool, Comp> = Vec::new_in(Comp {});
+static var START_HOLD: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // Function f (its Fn node: item) generated from its kept body: false
 // when it has none (or one take_body leaves to the AST walk), or is an
@@ -103,7 +117,7 @@ pub fn gen_places_function(cx: sink *FnCtx, item: i64, f: i64) -> bool {
     if atomic_intrinsic(f) >= 0 {
         return false;
     }
-    if !take_body(f) {
+    if !take_body(f, true) {
         return false;
     }
     gen_body(cx, item, f);
@@ -182,10 +196,11 @@ fn gen_body(cx: sink *FnCtx, item: i64, f: i64) {
                 SLOT[i + 1] = LOCALS[ast].offset;
             }
         }
-        count_mentions();
+        forward_blocks();
+        scan_locals();
         for l in 0..n {
             let ty = local_type(l);
-            if has_flag(l, LF_STATIC) || is_void(ty) || ty == TY_NEVER {
+            if has_flag(l, LF_STATIC) || is_void(ty) || ty == TY_NEVER || ACC_ONLY[l] {
                 continue;
             }
             if SLOT[l] < 0 && !shares_slot(l) && (MENTIONS[l] > 0 || P_LOCALS[l].src >= 0) {
@@ -213,15 +228,67 @@ fn gen_body(cx: sink *FnCtx, item: i64, f: i64) {
 // The blocks in reverse postorder, each its label, its statements and
 // its terminator.
 fn gen_blocks(cx: sink *FnCtx) {
-    let nb = block_count();
     LABEL.clear();
-    FWD.clear();
-    for b in 0..nb {
+    for _ in 0..block_count() {
         LABEL.push(0);
-        FWD.push(b);
     }
     for i in 0..RPO.len() as i64 {
         let b = RPO[i];
+        if FWD[b] == b {
+            LABEL[b] = new_label(cx);
+        }
+    }
+    // (the emitted blocks, in order: not a block only an inlined return
+    // reached)
+    let first = FWD[RPO[0]];
+    ORDER.clear();
+    for i in 0..RPO.len() as i64 {
+        let b = RPO[i];
+        if FWD[b] == b && (P_HEAD[b] >= 0 || b == first) {
+            ORDER.push(b);
+        }
+    }
+    if ORDER.len() as i64 == 0 || ORDER[0] != first {
+        emit_jump(cx, LABEL[first]);
+    }
+    for i in 0..ORDER.len() as i64 {
+        let b = ORDER[i];
+        NEXT = if i + 1 < ORDER.len() as i64 { ORDER[i + 1] } else { -1 };
+        if jumped_to(b, if i > 0 { ORDER[i - 1] } else { -1 }) {
+            emit_label(cx, LABEL[b]);
+        }
+        let start = block_start(b);
+        let len = block_len(b);
+        for j in 0..len {
+            gen_stmt(cx, start + j);
+        }
+        gen_term(cx, block_term(b));
+    }
+    NEXT = -1;
+}
+
+// Each block's forward (FWD: itself, or for an empty block that jumps on,
+// where it leads), whether it has nothing but a return (RET_BLOCK), each
+// emitted block's predecessors (a jump to a block with nothing but a
+// return is the return itself: no edge), and the local the accumulator
+// holds at each block's start (START_HOLD).
+fn forward_blocks() {
+    let nb = block_count();
+    FWD.clear();
+    P_HEAD.clear();
+    P_NEXT.clear();
+    P_FROM.clear();
+    RET_BLOCK.clear();
+    START_HOLD.clear();
+    for b in 0..nb {
+        FWD.push(b);
+        P_HEAD.push(-1);
+        RET_BLOCK.push(false);
+        START_HOLD.push(-1);
+    }
+    for i in 0..RPO.len() as i64 {
+        let b = RPO[i];
+        RET_BLOCK[b] = return_block(b);
         var t = b;
         var steps = 0;
         while steps < 64 && is_forward(t) {
@@ -234,47 +301,68 @@ fn gen_blocks(cx: sink *FnCtx) {
     }
     for i in 0..RPO.len() as i64 {
         let b = RPO[i];
-        if FWD[b] == b {
-            LABEL[b] = new_label(cx);
+        if FWD[b] != b {
+            continue;
         }
-    }
-    // (the emitted blocks, in order)
-    var order: Vec<i64, Comp> = Vec::new_in(Comp {});
-    for i in 0..RPO.len() as i64 {
-        if FWD[RPO[i]] == RPO[i] {
-            order.push(RPO[i]);
+        let t = P_STMTS[block_term(b)];
+        if t.kind == TK_GOTO && RET_BLOCK[t.a] {
+            continue;
         }
-    }
-    let first = FWD[RPO[0]];
-    if order.len() as i64 == 0 || order[0] != first {
-        emit_jump(cx, LABEL[first]);
-    }
-    for i in 0..order.len() as i64 {
-        let b = order[i];
-        NEXT = if i + 1 < order.len() as i64 { order[i + 1] } else { -1 };
-        emit_label(cx, LABEL[b]);
-        let start = block_start(b);
-        let len = block_len(b);
-        for j in 0..len {
-            let held = ACC_HOLDS;
-            FWD_TO = forward_from(b, start + j, start + len);
-            gen_stmt(cx, start + j);
-            FWD_TO = -1;
-            if held >= 0 && ACC_HOLDS == held && does_something(start + j) {
-                not_read();
+        let holds = end_hold(b);
+        for k in 0..crate::places::ir::succ_count(b) {
+            let to = FWD[crate::places::ir::succ(b, k)];
+            // (its first predecessor's, then -1 when another's differs)
+            if P_HEAD[to] < 0 {
+                START_HOLD[to] = holds;
+            } else if START_HOLD[to] != holds {
+                START_HOLD[to] = -1;
             }
-        }
-        gen_term(cx, block_term(b));
-        if ACC_HOLDS >= 0 {
-            not_read();
+            P_FROM.push(b);
+            P_NEXT.push(P_HEAD[to]);
+            P_HEAD[to] = P_FROM.len() as i64 - 1;
         }
     }
-    NEXT = -1;
+    START_HOLD[FWD[RPO[0]]] = -1;
 }
 
-// Each local's mentions in the reachable blocks: as a statement's place,
-// an operand, an index or a drop's flag.
-fn count_mentions() {
+// The local the accumulator holds at the end of block b (-1: none): its
+// switch's operand, or what its last statement before a jump wrote.
+fn end_hold(b: i64) -> i64 {
+    let t = P_STMTS[block_term(b)];
+    if t.kind == TK_SWITCH {
+        let k = op_kind(t.ops, 0);
+        if (k == OK_COPY || k == OK_MOVE) && op_b(t.ops, 0) == 0 {
+            return op_a(t.ops, 0);
+        }
+        return -1;
+    }
+    if t.kind != TK_GOTO {
+        return -1;
+    }
+    var j = block_term(b) - 1;
+    while j >= block_start(b) {
+        if does_something(j) {
+            let s = P_STMTS[j];
+            return if writes_held(s, s.a) { s.a } else { -1 };
+        }
+        j -= 1;
+    }
+    -1
+}
+
+// The one pass over the body's statements before it is generated:
+//
+// - each local's mentions (MENTIONS; M_FIRST, M_LAST, M_BLOCK, M_WRITTEN,
+//   M_ORDER for share_slots): as a statement's place, an operand, an
+//   index or a drop's flag;
+// - the locals the accumulator carries (ACC_ONLY): a scalar statement
+//   temporary (or the result _0, a compound one's address) whose every
+//   read is what its statement generates first and finds in the
+//   accumulator: written by the statement before it in its block, or,
+//   at a block's start, at the end of every predecessor (START_HOLD).
+//   Neither store nor load: the AST walk's value in the accumulator
+//   across `&&`, `||` and an `if`'s arms.
+fn scan_locals() {
     let n = local_count();
     MENTIONS.clear();
     M_FIRST.clear();
@@ -282,43 +370,82 @@ fn count_mentions() {
     M_BLOCK.clear();
     M_WRITTEN.clear();
     M_ORDER.clear();
-    for _ in 0..n {
+    ACC_ONLY.clear();
+    for l in 0..n {
         MENTIONS.push(0);
         M_FIRST.push(0);
         M_LAST.push(0);
         M_BLOCK.push(-1);
         M_WRITTEN.push(false);
+        let ty = local_type(l);
+        ACC_ONLY.push((l == 0 || l > crate::places::ir::B_PARAMS && P_LOCALS[l].src < 0
+            && !is_compound(ty)) && !has_flag(l, LF_STATIC) && !is_void(ty) && ty != TY_NEVER
+            && !has_flag(l, crate::places::ir::LF_BORROWED));
     }
+    let first = FWD[RPO[0]];
     for i in 0..RPO.len() as i64 {
         let b = RPO[i];
+        // (an emitted block: not one only an inlined return reached)
+        let emitted = FWD[b] == b && (P_HEAD[b] >= 0 || b == first);
         let start = block_start(b);
+        // (the local the accumulator holds before the statement)
+        var held = START_HOLD[b];
         for j in 0..block_len(b) + 1 {
             let at = start + j;
             let s = P_STMTS[at];
             let k = s.kind;
+            if k == crate::places::ir::SK_LIVE || k == crate::places::ir::SK_DEAD
+                || k == crate::places::ir::SK_NOP {
+                continue;
+            }
             // (the operands read first, then the place written)
             for o in 0..s.nops {
                 let ok = op_kind(s.ops, o);
-                if ok == OK_COPY || ok == OK_MOVE || ok == OK_PLACE {
-                    mention_place(op_a(s.ops, o), op_b(s.ops, o), at, b, ok == OK_PLACE);
+                if ok != OK_COPY && ok != OK_MOVE && ok != OK_PLACE {
+                    continue;
+                }
+                let l = op_a(s.ops, o);
+                let p = op_b(s.ops, o);
+                mention_place(l, p, at, b, ok == OK_PLACE);
+                if ACC_ONLY[l] && !(emitted && l == held && ok != OK_PLACE && p == 0
+                    && (o == 0 && reads_first(at, l) || o == 1 && reads_second(at, l))) {
+                    ACC_ONLY[l] = false;
                 }
             }
-            if k == SK_DROP && s.c == DS_FLAG {
-                mention(s.d, at, b, false);
+            // (the result, read by a return)
+            if emitted && held != 0 && ACC_ONLY[0]
+                && (k == TK_RETURN || k == TK_GOTO && RET_BLOCK[s.a]) {
+                ACC_ONLY[0] = false;
             }
+            var writes = false;
             if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC {
                 if s.b == 0 {
                     // (a whole write)
-                    let first = MENTIONS[s.a] == 0;
+                    let w = MENTIONS[s.a] == 0;
                     mention(s.a, at, b, false);
-                    if first {
+                    if w {
                         M_WRITTEN[s.a] = true;
+                    }
+                    if ACC_ONLY[s.a] {
+                        writes = leaves_in_acc(s);
+                        if emitted && !writes {
+                            ACC_ONLY[s.a] = false;
+                        }
                     }
                 } else {
                     mention_place(s.a, s.b, at, b, false);
+                    ACC_ONLY[s.a] = false;
                 }
             } else if k == SK_DROP || k == crate::places::ir::SK_MENTION {
                 mention_place(s.a, s.b, at, b, true);
+                ACC_ONLY[s.a] = false;
+                if k == SK_DROP && s.c == DS_FLAG {
+                    mention(s.d, at, b, false);
+                    ACC_ONLY[s.d] = false;
+                }
+            }
+            if k != crate::places::ir::SK_MENTION {
+                held = if writes { s.a } else { -1 };
             }
         }
     }
@@ -342,15 +469,42 @@ fn mention(l: i64, at: i64, b: i64, placed: bool) {
     }
 }
 
+// Place (l, p) mentioned (its index locals too, which are not carried).
 fn mention_place(l: i64, p: i64, at: i64, b: i64, placed: bool) {
-    mention(l, at, b, placed || p != 0 && !const_chain(p));
+    if p == 0 {
+        mention(l, at, b, placed);
+        return;
+    }
+    mention(l, at, b, placed || !const_chain(p));
     var q = p;
     while q > 0 {
         if proj_kind(q) == PJ_INDEX {
-            mention(proj_val(q), at, b, false);
+            let v = proj_val(q);
+            mention(v, at, b, false);
+            ACC_ONLY[v] = false;
         }
         q = proj_parent(q);
     }
+}
+
+// Whether statement s, writing its local whole, leaves the value in the
+// accumulator (its generation ends with write_place).
+fn leaves_in_acc(s: PStmt) -> bool {
+    if s.kind != SK_ASSIGN {
+        return s.kind == SK_CALL || s.c == IK_ARCH || s.c == IK_VECTOR;
+    }
+    let dt = place_ty(s.a, 0);
+    if s.c == RV_AGG {
+        return s.d == AK_VARIANT && !is_compound(dt);
+    }
+    !(s.c == RV_BINARY && is_vector(dt))
+}
+
+// Whether statement s writes local l whole and leaves it in the
+// accumulator.
+fn writes_held(s: PStmt, l: i64) -> bool {
+    (s.kind == SK_ASSIGN || s.kind == SK_CALL || s.kind == SK_INTRINSIC) && s.a == l && s.b == 0
+        && leaves_in_acc(s)
 }
 
 // Per local: its first and last mention (statement indices), its block
@@ -369,7 +523,7 @@ static var M_ORDER: Vec<i64, Comp> = Vec::new_in(Comp {});
 // address taken of it: a reference, a slice of it, a drop).
 fn shares_slot(l: i64) -> bool {
     l > crate::places::ir::B_PARAMS && P_LOCALS[l].src < 0 && M_BLOCK[l] >= 0 && M_WRITTEN[l]
-        && !has_flag(l, crate::places::ir::LF_BORROWED)
+        && !has_flag(l, crate::places::ir::LF_BORROWED) && !ACC_ONLY[l]
 }
 
 // The slots of the statement temporaries (shares_slot), each one's
@@ -377,24 +531,12 @@ fn shares_slot(l: i64) -> bool {
 // is last mentioned (a linear scan per block: a temporary is dead past
 // its block). Shared slots keep the frame small, its offsets in reach of
 // one instruction.
-pub static var DBG_R: [i64; 8] = [0; 8];
 
 fn share_slots() {
-    for l in 0..local_count() {
-        let ty = local_type(l);
-        if is_void(ty) || has_flag(l, LF_STATIC) || MENTIONS[l] == 0 { continue; }
-        var r = 0;
-        if l <= crate::places::ir::B_PARAMS { r = 1; }
-        else if P_LOCALS[l].src >= 0 { r = 2; }
-        else if M_BLOCK[l] < 0 { r = 3; }
-        else if !M_WRITTEN[l] { r = 4; }
-        else if has_flag(l, crate::places::ir::LF_BORROWED) { r = 5; }
-        DBG_R[r] += type_size(ty);
-    }
-    var p_slot: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var p_size: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var p_align: Vec<i64, Comp> = Vec::new_in(Comp {});
-    var p_last: Vec<i64, Comp> = Vec::new_in(Comp {});
+    POOL_SLOT.clear();
+    POOL_SIZE.clear();
+    POOL_ALIGN.clear();
+    POOL_LAST.clear();
     var block = -1;
     for i in 0..M_ORDER.len() as i64 {
         let l = M_ORDER[i];
@@ -407,29 +549,29 @@ fn share_slots() {
         }
         if M_BLOCK[l] != block {
             block = M_BLOCK[l];
-            for k in 0..p_last.len() as i64 {
-                p_last[k] = -1;
+            for k in 0..POOL_LAST.len() as i64 {
+                POOL_LAST[k] = -1;
             }
         }
         let size = if is_compound(ty) { crate::front::types::align_to(type_size(ty), 8) }
             else { type_size(ty) };
         let align = crate::front::types::type_align(ty);
         var found = -1;
-        for k in 0..p_slot.len() as i64 {
-            if p_size[k] == size && p_align[k] == align && p_last[k] < M_FIRST[l] {
+        for k in 0..POOL_SLOT.len() as i64 {
+            if POOL_SIZE[k] == size && POOL_ALIGN[k] == align && POOL_LAST[k] < M_FIRST[l] {
                 found = k;
                 break;
             }
         }
         if found >= 0 {
-            SLOT[l] = p_slot[found];
-            p_last[found] = M_LAST[l];
+            SLOT[l] = POOL_SLOT[found];
+            POOL_LAST[found] = M_LAST[l];
         } else {
             SLOT[l] = alloc_slot_for(ty);
-            p_slot.push(SLOT[l]);
-            p_size.push(size);
-            p_align.push(align);
-            p_last.push(M_LAST[l]);
+            POOL_SLOT.push(SLOT[l]);
+            POOL_SIZE.push(size);
+            POOL_ALIGN.push(align);
+            POOL_LAST.push(M_LAST[l]);
         }
     }
 }
@@ -441,51 +583,6 @@ fn does_something(at: i64) -> bool {
     k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP || k == SK_ASSERT
         || k == TK_GOTO || k == TK_SWITCH || k == TK_RETURN
         || k == crate::places::ir::TK_UNREACHABLE
-}
-
-// The local statement `at` (of block b, whose terminator is at `end`)
-// may leave in the accumulator for the next one (-1: none): a scalar
-// statement temporary the next statement reads first, or _0 before a
-// return.
-fn forward_from(b: i64, at: i64, end: i64) -> i64 {
-    let s = P_STMTS[at];
-    if s.b != 0 || s.kind != SK_ASSIGN && s.kind != SK_CALL && s.kind != SK_INTRINSIC {
-        return -1;
-    }
-    if s.kind == SK_INTRINSIC && s.c != IK_ARCH {
-        return -1;
-    }
-    let l = s.a;
-    if has_flag(l, LF_STATIC) || SLOT[l] < 0 {
-        return -1;
-    }
-    var next = at + 1;
-    while next < end && !does_something(next) {
-        next += 1;
-    }
-    if l == 0 {
-        // (the result, returned right after)
-        if next == end && returns(b) {
-            return 0;
-        }
-        return -1;
-    }
-    let ty = local_type(l);
-    if MENTIONS[l] != 2 || is_compound(ty) || P_LOCALS[l].src >= 0
-        || l <= crate::places::ir::B_PARAMS {
-        return -1;
-    }
-    if reads_first(next, l) || reads_second(next, l) { l } else { -1 }
-}
-
-// Whether block b's terminator returns: a return, or a jump to a block
-// that has nothing but one.
-fn returns(b: i64) -> bool {
-    let t = P_STMTS[block_term(b)];
-    if t.kind == TK_RETURN {
-        return true;
-    }
-    t.kind == TK_GOTO && return_block(t.a)
 }
 
 // Whether block b has nothing but a return.
@@ -503,7 +600,7 @@ fn return_block(b: i64) -> bool {
 fn reads_first(at: i64, l: i64) -> bool {
     let s = P_STMTS[at];
     let k = s.kind;
-    if k == TK_RETURN || k == TK_GOTO && return_block(s.a) {
+    if k == TK_RETURN || k == TK_GOTO && RET_BLOCK[s.a] {
         return l == 0;
     }
     if s.nops == 0 || op_b(s.ops, 0) != 0 || op_a(s.ops, 0) != l {
@@ -526,11 +623,62 @@ fn reads_first(at: i64, l: i64) -> bool {
         }
         return false;
     }
-    // (a call the builder made, of a function: its first argument first)
+    // (a call of a function: its first argument first)
     if k == SK_CALL && s.c >= 0 {
-        return !bound_call(s);
+        return !bound_call(s) || plain_call(s);
     }
     false
+}
+
+// R_SECOND = operand i at `ops` when that takes no stack and leaves the
+// accumulator: an integer constant, or an 8-byte integer (or pointer)
+// in the frame; false (nothing emitted) otherwise.
+fn gen_second(cx: sink *FnCtx, ops: i64, i: i64) -> bool {
+    let k = op_kind(ops, i);
+    if k == OK_INT || k == OK_CONST {
+        let t = erase_type(op_b(ops, i));
+        if is_float(t) {
+            return false;
+        }
+        let v = if k == OK_INT { wrap_int(op_a(ops, i), t) } else { const_value(op_a(ops, i)) };
+        emit_load_imm(cx, R_SECOND, v as u64);
+        return true;
+    }
+    if k != OK_COPY && k != OK_MOVE {
+        return false;
+    }
+    let l = op_a(ops, i);
+    let p = op_b(ops, i);
+    let ty = place_ty(l, p);
+    if p == 0 && ACC_ONLY[l] || !in_frame(l, p) || is_float(ty) || is_compound(ty)
+        || type_size(ty) != 8 {
+        return false;
+    }
+    emit_frame_addr(cx, R_SECOND, SLOT[l] - chain_offset(l, p));
+    emit_load_reg(cx, R_SECOND, R_SECOND);
+    true
+}
+
+// Whether operand i at `ops` is read into the accumulator without
+// R_SECOND (its frame slot, a constant), as an assert's index after its
+// length.
+fn simple_first(ops: i64, i: i64) -> bool {
+    let k = op_kind(ops, i);
+    if k == OK_INT || k == OK_CONST {
+        return !is_float(erase_type(op_b(ops, i)));
+    }
+    if k != OK_COPY && k != OK_MOVE {
+        return false;
+    }
+    let l = op_a(ops, i);
+    let ty = place_ty(l, op_b(ops, i));
+    !has_flag(l, LF_STATIC) && const_chain(op_b(ops, i)) && !is_float(ty) && !is_compound(ty)
+}
+
+// Whether operand i at `ops` is a local the accumulator carries.
+fn is_carried(ops: i64, i: i64) -> bool {
+    let k = op_kind(ops, i);
+    (k == OK_COPY || k == OK_MOVE) && op_b(ops, i) == 0 && ACC_ONLY[op_a(ops, i)]
 }
 
 // Whether operand i at `ops` is local l's whole value.
@@ -554,6 +702,12 @@ fn swapped(bo: i64) -> Tok {
 // local l, and its operator may swap them.
 fn reads_second(at: i64, l: i64) -> bool {
     let s = P_STMTS[at];
+    if s.kind == SK_ASSERT {
+        // (the length, the index then read without R_SECOND)
+        return s.nops == 2 && op_is_local(s.ops, 1, l) && !op_is_local(s.ops, 0, l)
+            && simple_first(s.ops, 0) && !(op_kind(s.ops, 0) != OK_INT
+                && op_kind(s.ops, 0) != OK_CONST && op_a(s.ops, 0) == l);
+    }
     if s.kind != SK_ASSIGN || s.c != RV_BINARY || s.nops != 2 || !op_is_local(s.ops, 1, l)
         || op_is_local(s.ops, 0, l) || is_vector(op_type(s.ops, 0)) {
         return false;
@@ -561,10 +715,22 @@ fn reads_second(at: i64, l: i64) -> bool {
     swapped(s.d) != Tok::Eof
 }
 
-// A value left in the accumulator was not read by the next statement:
-// the forwarding is wrong (forward_from, reads_first).
-fn not_read() {
-    crate::base::die(c"internal error: places: a forwarded value not read");
+// Whether a jump lands at block b, emitted after block `prev` (-1: first):
+// a predecessor other than prev, or prev's switch (its jumps name their
+// targets); the function's jump to its first block.
+fn jumped_to(b: i64, prev: i64) -> bool {
+    if prev < 0 && b != FWD[RPO[0]] || prev >= 0 && b == FWD[RPO[0]] {
+        return true;
+    }
+    var e = P_HEAD[b];
+    while e >= 0 {
+        let from = P_FROM[e];
+        if from != prev || P_STMTS[block_term(from)].kind != TK_GOTO {
+            return true;
+        }
+        e = P_NEXT[e];
+    }
+    false
 }
 
 // A jump to block b (forwarded), unless it is the next one emitted.
@@ -692,8 +858,7 @@ fn gen_place_addr(cx: sink *FnCtx, l: i64, p: i64) {
 
 // Accumulator = the value of place (l, p) (a compound one's address).
 fn gen_place_value(cx: sink *FnCtx, l: i64, p: i64) {
-    if p == 0 && l == ACC_HOLDS {
-        ACC_HOLDS = -1;
+    if p == 0 && ACC_ONLY[l] {
         return;
     }
     let ty = place_ty(l, p);
@@ -711,9 +876,7 @@ fn write_place(cx: sink *FnCtx, l: i64, p: i64) {
     if is_void(ty) || ty == TY_NEVER {
         return;
     }
-    if p == 0 && l == FWD_TO {
-        ACC_HOLDS = l;
-        FWD_TO = -1;
+    if p == 0 && ACC_ONLY[l] {
         return;
     }
     if in_frame(l, p) {
@@ -790,11 +953,20 @@ fn gen_stmt(cx: sink *FnCtx, at: i64) {
     } else {
         // AK_BOUNDS: the index, as unsigned, below the length (the
         // helper is given both, as expr.vl's gen_index_addr)
-        gen_op(cx, s.ops, 0);
-        push_x0(cx);
-        gen_op(cx, s.ops, 1);
-        emit_move_to_second(cx, TY_U64);
-        pop_x(cx, R_ACC);
+        if is_carried(s.ops, 1) {
+            // (the length in the accumulator; the index read without
+            // R_SECOND: simple_first)
+            emit_move_to_second(cx, TY_U64);
+            gen_op(cx, s.ops, 0);
+        } else {
+            gen_op(cx, s.ops, 0);
+            if !gen_second(cx, s.ops, 1) {
+                push_x0(cx);
+                gen_op(cx, s.ops, 1);
+                emit_move_to_second(cx, TY_U64);
+                pop_x(cx, R_ACC);
+            }
+        }
         let ok = new_label(cx);
         emit_compare_jump(cx, Cond::Lt, false, ok);
         emit_panic(cx, panic_kind(op_type(s.ops, 0), false), site_of(s.d, 0));
@@ -850,12 +1022,14 @@ fn gen_assign(cx: sink *FnCtx, s: PStmt) {
                 return;
             }
             // (the second operand first, the operator swapped, when the
-            // accumulator holds it: forward_from)
-            let swap = ACC_HOLDS >= 0 && op_is_local(s.ops, 1, ACC_HOLDS);
+            // accumulator holds it: find_acc_only)
+            let swap = is_carried(s.ops, 1);
             gen_op(cx, s.ops, if swap { 1 } else { 0 });
-            push_value(cx, ot);
-            gen_op(cx, s.ops, if swap { 0 } else { 1 });
-            pop_second_operand(cx, ot);
+            if is_float(ot) || !gen_second(cx, s.ops, if swap { 0 } else { 1 }) {
+                push_value(cx, ot);
+                gen_op(cx, s.ops, if swap { 0 } else { 1 });
+                pop_second_operand(cx, ot);
+            }
             gen_operator(cx, if swap { swapped(s.d) } else { token_of(s.d) }, ot, dt);
         } else if rv == RV_UNARY {
             if is_vector(dt) {
@@ -1092,6 +1266,8 @@ fn gen_call_stmt(cx: sink *FnCtx, s: PStmt) {
         let n = s.node;
         let f = s.c;
         let skip = if f < 0 { 1 } else { 0 };
+        // (a compound result made in its destination's slot: into_dest)
+        let into = into_dest(s);
         if bound_call(s) {
             if f < 0 {
                 bind(NODES[n].a, s.ops, 0);
@@ -1099,9 +1275,15 @@ fn gen_call_stmt(cx: sink *FnCtx, s: PStmt) {
             for i in 0..NODES[n].count {
                 bind(child(n, i), s.ops, i + skip);
             }
+            if into != 0 {
+                crate::gen0::gen::call::RESULT_INTO = into;
+            }
             gen_call(cx, n);
+            crate::gen0::gen::call::RESULT_INTO = 0;
             unbind();
-            write_place(cx, s.a, s.b);
+            if into == 0 {
+                write_place(cx, s.a, s.b);
+            }
             return;
         }
         var param_count = 0;
@@ -1142,9 +1324,41 @@ fn gen_call_stmt(cx: sink *FnCtx, s: PStmt) {
         if n > 0 && NODES[n].kind == NodeKind::Call {
             site_before_call(cx, n);
         }
+        crate::gen0::gen::call::RESULT_INTO = into;
         gen_call_sequence(cx, f, &arg_types as *i64, count, param_count, variadic, pushed, ret);
-        write_place(cx, s.a, s.b);
+        if into == 0 {
+            write_place(cx, s.a, s.b);
+        }
     }
+}
+
+// The frame slot call s makes its compound result in, its destination's
+// (0: a new one, then copied): a whole local in the frame that nothing
+// borrows (the callee cannot see it before it returns) and no operand of
+// the call names; a plain call (plain_call: its convention's, no
+// intrinsic's).
+fn into_dest(s: PStmt) -> i64 {
+    let l = s.a;
+    if s.b != 0 || s.c < 0 || SLOT[l] <= 0 || has_flag(l, LF_STATIC) || ACC_ONLY[l]
+        || has_flag(l, crate::places::ir::LF_BORROWED) || !is_compound(local_type(l))
+        || l <= crate::places::ir::B_PARAMS || bound_call(s) && !plain_call(s) {
+        return 0;
+    }
+    for i in 0..s.nops {
+        let k = op_kind(s.ops, i);
+        if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(s.ops, i) == l {
+            return 0;
+        }
+    }
+    SLOT[l]
+}
+
+// Whether call s, of function s.c through gen_call, is an ordinary one: no
+// contract check, no std::arch intrinsic (whose own forms neither read
+// their arguments first nor make a result by the call sequence).
+fn plain_call(s: PStmt) -> bool {
+    s.c >= 0 && s.c != crate::front::contracts::checks::CHECK_FN
+        && crate::arch::intrinsic_of_fn(s.c) < 0
 }
 
 // Whether call s is generated by gen_call of its node, its operands bound.
@@ -1209,7 +1423,7 @@ fn gen_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
 fn gen_term(cx: sink *FnCtx, at: i64) {
     let s = P_STMTS[at];
     let k = s.kind;
-    if k == TK_GOTO && !return_block(s.a) {
+    if k == TK_GOTO && !RET_BLOCK[s.a] {
         jump_to(cx, s.a);
     } else if k == TK_SWITCH {
         gen_switch(cx, s);

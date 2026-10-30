@@ -156,7 +156,7 @@ extern "C" {
 }
 
 fn main() {
-    println(f"{unsafe { ilogb(8.0) }}");
+    println("{}", unsafe { ilogb(8.0) });
 }
 ```
 ```out

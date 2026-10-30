@@ -92,7 +92,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_buffer(cells, 0, rb, 0, 64 * 4);
     queue.submit(enc.finish());
     let v = gpu::f32s(rb.map_read(dev));
-    println(f"{frames} frames, v[0] = {v[0]}");
+    println("{frames} frames, v[0] = {}", v[0]);
     Ok(())
 }
 ```
@@ -211,7 +211,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var g = Gpu::new(dev, queue, gpa)?; // dev and queue moved: g.dev from here
     g.add(0, 3);
     g.add(1, 5);
-    println(f"{g.first(0)} {g.first(1)}");
+    println("{} {}", g.first(0), g.first(1));
     Ok(())
 }
 ```
@@ -301,7 +301,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_buffer(buf, 0, out, 0, 64 * 4);
     queue.submit(enc.finish());
     let squares = gpu::u32s(out.map_read(dev));
-    println(f"{squares[3]} {squares[63]}");
+    println("{} {}", squares[3], squares[63]);
     Ok(())
 }
 ```
@@ -344,7 +344,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_buffer(buf, 0, out, 0, 64 * 4);
     queue.submit(enc.finish());
     let squares = gpu::u32s(out.map_read(dev));
-    println(f"{squares[3]} {squares[63]}");
+    println("{} {}", squares[3], squares[63]);
     Ok(())
 }
 ```
@@ -422,7 +422,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     for i in 0..256 {
         if got[i] != ((255 - i) * (255 - i)) as u32 { wrong += 1; }
     }
-    println(f"{got[0]} {got[255]}, {wrong} wrong");
+    println("{} {}, {wrong} wrong", got[0], got[255]);
     Ok(())
 }
 ```
@@ -543,7 +543,7 @@ embed wgsl SIM {
 }
 
 fn main() {
-    println(f"{SIM.step} {SIM.src.len() > 0}");
+    println("{} {}", SIM.step, SIM.src.len() > 0);
 }
 ```
 ```out
@@ -611,7 +611,7 @@ embed wgsl TWO with COMMON {
 
 fn main() {
     // one module each, the prefix in both: dev.shader_wgsl(ONE.src)?, ONE.main
-    println(f"{ONE.main} {TWO.main} {ONE.src.len() > TWO.src.len()}");
+    println("{} {} {}", ONE.main, TWO.main, ONE.src.len() > TWO.src.len());
 }
 ```
 ```out
@@ -670,7 +670,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_texture_to_buffer(tex, out, 256);
     queue.submit(enc.finish());
     let px = out.map_read(dev);
-    println(f"{px[0]} {px[1]} {px[2]} {px[256 * 7 + 4 * 7 + 1]}");
+    println("{} {} {} {}", px[0], px[1], px[2], px[256 * 7 + 4 * 7 + 1]);
     Ok(())
 }
 ```
@@ -762,7 +762,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_buffer(out, 0, rb, 0, 16);
     queue.submit(enc.finish());
     let r = gpu::f32s(rb.map_read(dev));
-    println(f"{r[0]} {r[1]} {r[2]} {r[3]}");
+    println("{} {} {} {}", r[0], r[1], r[2], r[3]);
     Ok(())
 }
 ```
@@ -801,7 +801,7 @@ embed wgsl SIM with Params, STEPS {
 }
 
 fn main() {
-    println(f"{size_of(Params)} {align_of(Params)}");
+    println("{} {}", size_of(Params), align_of(Params));
     println(SIM.src.len() > 0);
 }
 ```
@@ -848,7 +848,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var lim = Limits::default();
     lim.max_buffer_size = 2 << 30; // 2 GiB
     let (dev, var _queue) = adapter.device(lim)?;
-    println(f"{dev.limits().max_buffer_size >> 30} GiB, the adapter's {adapter.limits().max_buffer_size >= 2 << 30}");
+    println("{} GiB, the adapter's {}", dev.limits().max_buffer_size >> 30,
+        adapter.limits().max_buffer_size >= 2 << 30);
     let _small = dev.buffer(1 << 20, BufferUsage::STORAGE); // 1 MiB
     Ok(())
 }
@@ -910,7 +911,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     // each module's layout has the bindings it uses: two, and one
     let dgroup = dev.bind_group(deposit.bind_layout(0), [gpu::bind(0, bins), gpu::bind(1, xb)][..]);
     let cgroup = dev.bind_group(clear.bind_layout(0), [gpu::bind(0, bins)][..]);
-    println(f"layouts: {deposit.bind_layout(0).count} and {clear.bind_layout(0).count}");
+    println("layouts: {} and {}", deposit.bind_layout(0).count, clear.bind_layout(0).count);
     var enc = dev.encoder();
     enc.compute_pass(|pass| {
         pass.set_pipeline(deposit);
@@ -921,7 +922,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc.copy_buffer(bins, 0, rb, 0, 16);
     queue.submit(enc.finish());
     let twice = gpu::u32s(rb.map_read(dev));
-    println(f"{twice[0]} {twice[1]} {twice[2]} {twice[3]}");
+    println("{} {} {} {}", twice[0], twice[1], twice[2], twice[3]);
     rb.unmap(dev); // twice is done: rb can be copied into again
     var enc2 = dev.encoder();
     enc2.compute_pass(|pass| {
@@ -935,7 +936,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     enc2.copy_buffer(bins, 0, rb, 0, 16);
     queue.submit(enc2.finish());
     let once = gpu::u32s(rb.map_read(dev));
-    println(f"{once[0]} {once[1]} {once[2]} {once[3]}");
+    println("{} {} {} {}", once[0], once[1], once[2], once[3]);
     Ok(())
 }
 ```
@@ -1034,7 +1035,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     for i in 0..N {
         if got[i] != cur[i] { differ += 1; }
     }
-    println(f"{STEPS} steps in one pass, the state in bufs[{last}], {differ} of {N} differ from the CPU");
+    println(
+        "{STEPS} steps in one pass, the state in bufs[{last}], {differ} of {N} differ from the CPU");
     Ok(())
 }
 ```
@@ -1130,7 +1132,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     for i in 0..N {
         if got[i] != cur[i] { differ += 1; }
     }
-    println(f"{STEPS} steps, one submit, {differ} of {N} differ from the CPU");
+    println("{STEPS} steps, one submit, {differ} of {N} differ from the CPU");
     Ok(())
 }
 ```
@@ -1186,7 +1188,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let begin = t[0] as u64 | (t[1] as u64) << 32;
     let end = t[2] as u64 | (t[3] as u64) << 32;
     let ns = (end - begin) as f64 * queue.timestamp_period();
-    println(f"the pass took GPU time: {ns > 0.0}"); // a report prints f"{ns / 1.0e6:.3} ms"
+    println("the pass took GPU time: {}", ns > 0.0); // a report prints format_args("{:.3} ms", ns / 1.0e6)
     Ok(())
 }
 ```

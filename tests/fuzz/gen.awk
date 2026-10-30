@@ -24,8 +24,8 @@
 # to 10 parameters (beyond the argument registers) and 12 to 25 locals,
 # every one of them live until the end, and more statements (so more
 # calls, inside loops too).
-# lang06=1 (the 0.6 language) adds functions using defer on every way out
-# of their blocks (a log of what ran is printed at the end), if let and
+# lang06=1 (the 0.6 language) adds functions with guards (a Drop; 0.6 to
+# 0.26.1: defer) on every way out of their blocks (a log of what ran is printed at the end), if let and
 # while let over the prelude's Option, string slices, and structural ==
 # on structs, tuples, arrays and enums with fields.
 # calls=1 (for the vole calling convention of 0.5) adds functions of 3
@@ -189,20 +189,24 @@ function lang06_defs() {
     print ""
     print "fn dnote(d: u64) { DLOG = DLOG * 31 + d; }"
     print ""
+    print "struct DNote { d: u64 }"
+    print ""
+    print "impl Drop for DNote { fn drop(inout self) { dnote(self.d); } }"
+    print ""
     print "fn dfn(x: i64, n: i64) -> i64 {"
-    print "    defer dnote(1);"
+    print "    let _d1 = DNote { d: 1 };"
     print "    var acc = x;"
     print "    var i = 0;"
     print "    outer: while i < n {"
-    print "        defer dnote(2);"
+    print "        let _d2 = DNote { d: 2 };"
     print "        i += 1;"
     print "        if acc % 3 == 0 { acc += 1; continue; }"
     print "        for j in 0..2 {"
-    print "            defer { dnote(4); }"
+    print "            let _d4 = DNote { d: 4 };"
     print "            if acc > 1000 { break :outer; }"
     print "            if j == 1 && acc % 5 == 0 { continue :outer; }"
     print "        }"
-    print "        defer { dnote(3); }"
+    print "        let _d3 = DNote { d: 3 };"
     print "        acc = acc * 2 + i;"
     print "        if acc % 7 == 0 { return acc; }"
     print "    }"

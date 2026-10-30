@@ -13,7 +13,7 @@ main.vl:22:13: error[type error] undefined variable 'totl' | help: did you mean 
 main.vl:25:8: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: n != 0 | try: volec fix --suggested main.vl
 main.vl:29:13: error[type error] allocation is explicit: pass an allocator (try: format_in(x, gpa)) | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc016 main.vl | try: volec fix --suggested main.vl
 main.vl:30:15: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
-main.vl:31:13: error[type error] 'describe' is private | help: make it public: `pub fn describe` at text.vl:3:1 | try: volec fix --suggested main.vl
+main.vl:31:13: error[item.private] 'describe' is private | help: make it public: `pub fn describe` at text.vl:3:1 | try: volec fix --suggested main.vl
 main.vl:32:13: error[type error] function 'table::make' expects 2 arguments, got 1 | help: its signature: `fn make(width: i64, gpa: Gpa) -> Table` (table.vl:3) | try: table::make(3, gpa) | try: volec fix --suggested main.vl
 main.vl:34:5: error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'? | try: volec query items Buf main.vl | try: volec fix --suggested main.vl
 main.vl:37:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?

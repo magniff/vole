@@ -102,10 +102,11 @@ local; nothing else takes `&`.
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: vole has no macros | help: write `println(f"{1}")`
+error[parser error] 'println!' is a macro call: vole has no macros | help: write `println("{}", 1)`
 ```
-`println(f"{x}")` (0.15, `volec guide formatting`). The help names
-what replaces `vec!`, `format!`, `assert!` and the others.
+Since 0.26.2 the call without its `!` takes the same format string
+(`volec guide formatting`). The help names what replaces `vec!`,
+`format!`, `assert!` and the others.
 
 ```vole
 'outer: for i in 0..3 { break 'outer; }
@@ -166,12 +167,12 @@ error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Cl
 and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
 
 ```vole
-fn f<T>(x: sink T) -> T where T: Ord { x }
+fn f<I>(it: I) -> i64 where I: Iterator, I::Item: Ord { 0 }
 ```
 ```err
-error[parser error] expected '{', got 'where'
+error[where.unsupported] 'I::Item: Ord': a 'where' bound is on a type parameter of the item, and 'I::Item' is not one
 ```
-Bounds go in the list: `fn f<T: Ord>(x: T) -> T`.
+`where` (0.26.2) bounds the item's parameters: `I: Iterator<Item = X>, X: Ord`.
 
 ```vole
 fn main() -> i32 {
@@ -539,13 +540,13 @@ every field.
 
 ```vole
 struct P { x: i64 }
-fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
+fn main() -> i32 { let p = P { x: 1 }; println("{p}"); 0 }
 ```
 ```err
 'P' does not implement Display
 ```
 Implement it (`impl Display for P { fn fmt(self, f: inout std::Fmt) {
-f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
+f.write("P({})", self.x); } }`), or print with `{p:?}` and
 `#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
 fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 
@@ -657,7 +658,7 @@ mod m { fn hidden() -> i64 { 1 } }
 fn main() -> i32 { m::hidden() as i32 }
 ```
 ```err
-error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at
+error[item.private] 'hidden' is private | help: make it public: `pub fn hidden` at
 ```
 The help gives the declaration with `pub` and where it is (`volec fix
 --only pub` writes them all). Child modules see their parent's private items, not

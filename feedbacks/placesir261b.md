@@ -10,10 +10,14 @@
 - fold's `k ? false : false` fix (f1ceb3c4) and block forwarding back
   (7d80668b);
 - cost work (e0cb7243);
-- step 3, drops through A's shims (64af433d).
+- step 3, drops through A's shims (64af433d), contracts (1e177b31);
+- step 5, -O0 from the IR in gen0 (74ae5651), and its code size made the
+  AST walk's (35ee705c);
+- ir: predecessor lists start small (db652f8b); gen0's analyses in one
+  pass, a types-only scan, labels only where jumped to.
 
-Left: step 5 (the -O0 walk in gen0) and step 6 (places by default, the
-fixpoint with it).
+Left: step 6 (places by default). It is ready, but it waits on the -O0
+cost bar (the total at most 1.10x the AST walk's); see Verdict.
 
 ## Verdict
 
@@ -28,8 +32,32 @@ The places IR lowers to the middle IR in one walk.
   a sink closure's second move unchecked), sent to A as R5-R9, plus two
   IR-shape cases. Two of them are use-after-frees that `--places-diff`
   does not see, because it compares named locals only.
-- Cost is still over the bar: IR to SSA 1,838M against the AST walk's
-  1,428M (the bar is 1,343M), with no single hotspot.
+- -O0 from the IR also builds compiler/src to a compiler that compiles
+  it byte-identically, and its code is now the AST walk's size (3,159,628
+  instructions against 3,172,169; objects 18,010,224 against 18,040,272
+  bytes), from 22% more.
+- Cost, compiler/src at -j1 (instructions; the totals vary by about
+  ±70M between runs):
+  - -O2 total: 66,643M against 66,247M (1.006x). -O1 total: 23,796M
+    against 22,131M (1.075x).
+  - -O0 total, the gate's measure (/usr/bin/time -l, default -j, on
+    df931cf9): 10,892M against 9,587M (1.136x; -j1 1.130x). The bar,
+    1.10x, is about 300M away.
+  - `--time-passes` costs the places path about 1.2G more than the AST
+    walk's (a timer read per function and phase), so its -j1 table says
+    1.23x; use it for where, not how much. In it emission (mine) is
+    +737M over the AST walk's: the generator's own passes, not the code
+    it emits.
+  - Where (in-process counters, compiler/src at -j1: 10,982 functions,
+    157k blocks, 248k locals, 479k statements): gen_blocks 1,984M
+    against the AST walk's whole gen_function 1,867M; the analyses
+    before it about 450M (scan_locals ~250M, take_body ~100M,
+    forward_blocks ~80M, slots and share_slots ~40M), some 400 to 500
+    instructions per statement or block, spread over Vec reads and
+    pushes. Cutting the calls (op_kind inlined by hand) or the scans
+    (forward_blocks in one scan per block) moved nothing measurable;
+    the lever is not walking at all: A's keep records each local's
+    mentions (asked of A, with the RPO kept with the body).
 
 ## What worked
 
@@ -53,6 +81,14 @@ The places IR lowers to the middle IR in one walk.
 - `query unsafe --unjustified FILE` and `fix --only unneeded-unsafe`.
 
 ## What cost time, ranked
+
+0. The -O0 code size (step 5): finding the classes took an instruction
+   mix diff (each line's opcode with operands normalized, ast against
+   places), then the hottest small functions side by side. Four classes
+   made almost all of the 22%: values that the AST walk keeps in the
+   accumulator across `&&`/`||` and if-arms; compound call results copied
+   from their own slot; push/pop around a constant or frame operand; and
+   index checks reading their length through a temporary. About 3 hours.
 
 1. Cost. In-process instruction counters cost about 33k instructions a
    read (a syscall), which buried the small sections; sampling did
@@ -92,7 +128,12 @@ The places IR lowers to the middle IR in one walk.
    (about 8% of the lowering's samples). A body read in place, or copied
    in bulk, is the next saving. Then the per-statement walk: operand and
    bind, about 25%.
-7. [build] -O0 `--emit-ir`: a flagged drop's split block prints after
-   the rest (fmt_direct_ir's CHECK order).
+7. [build] -O0 cost of the places generator: its per-function passes
+   (about 360M for the analyses) are mostly static Vec accesses in tight
+   loops. A function-local table, or raw slices for P_STMTS and P_OPS,
+   would halve them.
 8. [tool:hooks] query-first: let a file the agent created this session
    be read with grep.
+9. [tool] `git checkout FILE` to undo temporary instrumentation threw
+   away an uncommitted rewrite once. Instrument a copy, or let `volec
+   undo` take back a batch of edits made by a script.

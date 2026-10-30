@@ -84,7 +84,7 @@ fn main(gpa: Gpa) {
     var add = |x: i64| v.push(x);
     add(1);
     add(2);
-    println(f"{v.len()}");             // add's last call is above
+    println("{}", v.len()); // add's last call is above
 }
 ```
 ```out
@@ -127,7 +127,7 @@ fn main(gpa: Gpa) -> i32 {
     let w = v.clone();
     let count = || w.len();            // an owned let: read through an access
     let keep = sink || v.len();        // v moves into the closure: dead here
-    println(f"{count()} {call(keep)} {w.len()}");
+    println("{} {} {}", count(), call(keep), w.len());
     0
 }
 ```
@@ -146,7 +146,7 @@ fn main() -> i32 {
     let bump = || { n += 10; n };      // n captured inout: changes n
     let b = call(bump);                // 11
     n += 100;                          // bump is done with n
-    println(f"{b} {call(snap)} {n}");
+    println("{b} {} {n}", call(snap));
     0
 }
 ```

@@ -16,7 +16,7 @@ Display as Rust's: `No such file or directory (os error 2)`), and
 `BufWriter::new(f)` keep an 8 KB buffer inline (no allocation):
 `r.read_line(&s)?` appends a line, its `'\n'` included (0 at the
 end); `r.lines_in(gpa)` yields each line as a String;
-`writeln(&w, f"..")?` (Rust's `writeln!`; `use std::io::writeln`).
+`writeln(&w, format_args("..", x))?` (Rust's `writeln!`; `use std::io::writeln`).
 `Path::new(p)`: `file_name()`, `extension()`, `parent()`,
 `components()`, `join_in(q, gpa)` (a PathBuf). `env::args()` yields
 `str`s (`.collect_in(gpa)`), `env::get_in(name, gpa)` a
@@ -40,7 +40,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
     {
         var w = BufWriter::new(File::create(path)?);
         for i in 1..4 {
-            writeln(&w, f"line {i}")?;
+            writeln(&w, format_args("line {i}"))?;
         }
     }
     var r = BufReader::new(File::open(path)?);
@@ -49,15 +49,15 @@ fn run(gpa: Gpa) -> io::Result<()> {
     while r.read_line(&line)? > 0 {
         total += 1;
     }
-    println(f"{total} {line.lines().count()} {fs::metadata(path)?.len()}");
+    println("{total} {} {}", line.lines().count(), fs::metadata(path)?.len());
     fs::remove_file(path)?;
     var c = Command::new("echo");
     c.arg("hi");
     let out = c.output_in(gpa)?;
-    println(f"{out.status.success()} {out.stdout.len()}");
+    println("{} {}", out.status.success(), out.stdout.len());
     match File::open(path) {
         Ok(_) => println("still there"),
-        Err(e) => println(f"{e.kind():?}"),
+        Err(e) => println("{:?}", e.kind()),
     }
     Ok(())
 }
@@ -66,7 +66,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(gpa) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln(f"{e}");
+            eprintln("{e}");
             1
         }
     }

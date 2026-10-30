@@ -124,7 +124,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
                     let nx = 2.0 * m.x / surf.width as f64 - 1.0;
                     let ny = 1.0 - 2.0 * m.y / surf.height as f64;
                     let pt = m.x / scale; // logical points, for UI sizes
-                    println(f"cell {cx} {cy}, shader {nx:.2} {ny:.2}, x {pt:.0} pt");
+                    println("cell {cx} {cy}, shader {nx:.2} {ny:.2}, x {pt:.0} pt");
                 }
             }
             Ok(Event::Close(_)) | Ok(Event::Quit) => break,
@@ -192,7 +192,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     }
     queue.wait_idle()?; // all n done
     let ms = std::time::monotonic_now().saturating_sub(t0).as_millis_f64() / n as f64;
-    println(f"{n} frames timed: {ms > 0.0}"); // a report prints f"{ms:.3} ms a frame"
+    println("{n} frames timed: {}", ms > 0.0); // a report prints format_args("{ms:.3} ms a frame")
     Ok(())
 }
 ```
@@ -241,7 +241,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     queue.submit(enc.finish());
     frame.present(&queue);
     let px = readback.map_read(dev); // B, G, R, A a pixel
-    var ppm = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    var ppm = format_in("P6\n{w} {h}\n255\n", gpa);
     for y in 0..h {
         for x in 0..w {
             let p = y * stride + x * 4;
@@ -251,7 +251,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         }
     }
     let ok = fs::write("shot.ppm", ppm.as_slice()).is_ok(); // open it, or compare
-    println(f"rgb {px[2]} {px[1]} {px[0]}, wrote shot.ppm: {ok}");
+    println("rgb {} {} {}, wrote shot.ppm: {ok}", px[2], px[1], px[0]);
     Ok(())
 }
 ```

@@ -77,6 +77,64 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
 
+`where`, `impl Trait`, visibility and format literals (text262; grammar.md, "Items", "Modules", "Formatting"):
+
+- `where P: B + C, Q: D` after a function's result type, a struct's,
+  enum's or trait's generics, or before an impl's `{`: the bounds join
+  the parameters' inline ones. A bound on a type that is not a parameter
+  of the item (`I::Item: Display`) is `where.unsupported`. `where` is a
+  keyword (it was reserved).
+- Argument-position `impl Trait`, `fn show(x: impl Display)` (also `impl
+  Fn(i64) -> i64`, `inout impl FnMut(i64)`): a hidden type parameter,
+  named `impl Display` in messages; a turbofish gives only the written
+  parameters. Anywhere else it is `type.impl-position`.
+- `volec fmt` lays `where` out as a signature's continuation.
+- `pub(crate)`, `pub(super)`, `pub(self)` and `pub(in path)` on items,
+  fields, `use` and `mod`, as Rust's; `pub(in path)` naming no module
+  around its item is `vis.path`. A private or restricted item used
+  outside is `item.private` (it was a `type error`); it and
+  `field.private` say where a restricted one is visible. `fix --only pub`
+  widens a restriction to `pub(crate)` (and still writes plain `pub` on a
+  private item: compiler/src may write `pub(crate)` from 0.26.3);
+  `query context` and hover show a field's restriction.
+- Format literals, Rust's `format!` without the `!`: a plain literal that
+  is the first argument of `print`, `println`, `eprint`, `eprintln`,
+  `format_args` (new: Rust's `format_args!`), `format_in` (the allocator
+  last), `push_fmt`, `Fmt::write`, `panic`, assert's message or a
+  contract's `else` is a format string: `println("{} {x:>4}", a.b)`,
+  positional and named (`name = e`) arguments, `{0}`, `{name}`, `N$`,
+  `.*`, and Rust's whole spec (fill, `^`, `+`, `#`, `o`, `e`, `p`), byte
+  for byte rustc's. The errors `format.syntax`, `format.spec`,
+  `format.args`, `format.expr-hole` (its fix moves the expression to an
+  argument). `panic("bad {x}")` formats on the stack, so `#[no_alloc]`
+  code may. **Breaking:** such a literal's braces are holes now
+  (`println("{")` is `format.syntax`, `warning[format]` is gone); `fix
+  --only fstring` doubles them. f-strings stay, with no warning, until
+  0.26.3. `{:#?}` is `format.spec` "not in this release".
+- The tools see a format string's holes as an f-string's: `query refs`,
+  `refactor rename` (a local, an item, a width's `name$`), `query type`
+  and hover; `volec fmt` keeps a literal's bytes.
+- `volec fix --only fstring`, the migration, run once on code written
+  before 0.26.2: an f-string at a format position loses its `f` (a name
+  hole stays, the other holes' expressions become its arguments, in
+  order), one anywhere else becomes `format_args(..)`, 0.17's
+  `b.push_str(f"..")` becomes `push_fmt`, and a plain literal at a
+  format position gets its braces doubled. It refuses nothing. The
+  guide's examples are migrated; compiler/src, std, the examples and the
+  tests are not yet (their migrated copies check clean).
+- Rust's print macros get the call without the `!` as their help
+  (`println!("{} {x:?}", a)`: write `println("{} {x:?}", a)`; `format!`
+  is `format_in(.., gpa)`, `write!(f, ..)` `f.write(..)`).
+- **Breaking:** `defer` is removed (Rust has none): `defer e;` and
+  `defer { .. }` are `syntax.defer` (`explain` shows the guard that
+  replaces it, a struct whose `Drop` does the work, alive to the end of
+  the scope; `defer` stays a keyword so the error can name it). The
+  examples close their descriptors and directories with guards (`Fd`,
+  `Dir`, openhtop's `Restore`). `fix --values` no longer deletes `defer
+  v.free()`.
+- `edit`, `fix`, `fmt` and `undo` write a file reached through a symlink
+  through it: the link stays a link.
+
 - `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Lengths and indices stay `i64` for now; indexing takes any integer type.
 - Float to integer `as` saturates for every target type, as Rust's: `300.7 as u8 == 255`, `70000.0 as u16 == 65535`, `-1.0 as u64 == 0` (they were 44, 4464 and `u64::MAX`); NaN is 0. The same in constants, the folder, both code generators and x86-64.
 
@@ -131,6 +189,27 @@ compiler/src/places/README.md):
   placeholders give until they go.
 - `volec query drops FILE:LINE`: a function's drops as the IR decides
   them, each with where it runs (query.md, "drops").
+
+The places IR, the code generators' half (placesir261b; §8 steps 1 to 5,
+compiler/src/middle/README.md, compiler/src/gen0/README.md):
+
+- `VOLE_LOWER=places`: both code generators read each function's kept
+  body. -O1 and -O2 lower it to the SSA IR (middle/lower/places.vl): a
+  scalar never borrowed is an SSA variable, blocks in reverse postorder,
+  the IR's drops as calls of their shims (a flagged one under its flag),
+  switches as one Switch, an assert's condition from the IR. -O0
+  generates from it (gen0/gen/places.vl): a statement temporary's slot
+  shared once it is dead, a value read first by the next statement (or
+  at a block's start, by every predecessor's end) kept in the
+  accumulator, a call's compound result made in its destination. Every
+  function of compiler/src and of tests/run comes from the IR but under
+  `--check-unsafe`; compilers built so compile compiler/src
+  byte-identically. The default is still the AST walk.
+- fold: a three-way select whose two constants were equal took the
+  wrong one (`k ? false : false` for `!k`); tests/run/opt_ifconv_three_way.vl.
+- ir: a block's predecessor list starts with room for 4, not 64, so
+  that ir_shrink leaves it alone: -O1's lower to SSA of compiler/src
+  1,489M to 1,352M instructions.
 
 Cells (cells261, plan §1 g; grammar.md, "Interior mutability"; `guide
 memory#cells`):

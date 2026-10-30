@@ -26,7 +26,7 @@ fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
     var b = Buf::new_in(gpa);
     b.push_int(total(v));
     let words: Vec<i64> = (1..4).map(|x| x * 10).collect_in(gpa);
-    println(f"{b.as_slice()} {words:?}");
+    println("{} {words:?}", b.as_slice());
     0
 }                                             // words, b, v dropped: freed
 ```
@@ -117,7 +117,7 @@ fn main() {
     var v: Vec<i64, FixedBuf> = Vec::new_in(FixedBuf::new(&mem[..]));
     v.push(7);
     v.push(8);
-    println(f"{v[0] + v[1]}");
+    println("{}", v[0] + v[1]);
 }
 ```
 ```out
