@@ -125,6 +125,27 @@ code generators' agent (0.26.1) sees what moved.
   An enum's arm with several values is reached through a block per
   value, a goto to the arm's: a code generator may see a switch with
   many targets wherever a match was.
+- 0.26.1 (R5): a statement temporary (`__own_tv`) drops at the end of
+  the scope of its prelude defer (TEMP_SCOPES, temp_scope, schedule_in),
+  not at the end of the hidden `let` that holds an operator's operand or
+  an f-string's hole; it has no storage markers (the own pass's lives in
+  the body's frame).
+- 0.26.1 (R6): an open drop's part flags are made when the drop is
+  decided (elab.vl open_flags), so the rewrite clears them at entry and
+  writes them at each init and move.
+- 0.26.1 (R7): a sink closure's move of a flagged capture first reads
+  the flag; moved already, `intrinsic panic` with the own pass's message.
+- 0.26.1 (R8): a call temporary is borrowed (not dropped) for a
+  parametric copy (`second<T>(p: *T) -> T { p[1] }`), as the own pass's
+  fresh (build.vl copied_call).
+- 0.26.1: `--places-diff` also checks where each drop runs and its flag
+  (diff.vl check_drops): a kept or flagged drop followed, on a path that
+  does not make the place again, by a read of it or of a borrowed copy or
+  a reference made from it (`'x' used after its drop`), and a flagged drop
+  reached with its flag unwritten or a flag never set true (`'x' under a
+  flag never set`). Before R5 and R6 it found 6,707 and 652 such lines
+  over tests/run (196 sources); after, one (an XFAIL case's `v = v`
+  through an inout).
 
 ## `--places-diff`: the differences left
 
