@@ -22,22 +22,24 @@
 
 use crate::base::{buf_new, buf_slice, buf_str, intern, intern_c};
 use crate::base::comp::Comp;
-use crate::front::generics::mangle_type;
+use crate::front::ast::{NODES, NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::generics::{INST_QUEUE, mangle_type};
 use crate::front::own::glue::{flag_field, has_glue};
 use crate::front::own::kinds::{has_drop_impl, owned_base_type};
 use crate::front::types::{
     FN_COUNT, REF_MUT, TYPES, TY_BOOL, TY_I64, TY_UNIT, TyKind, fn_param, ref_to, type_elem,
 };
 use crate::places::front::{
-    enum_tag_ty, enum_variant_count, enum_variants, fn_name_sym, fn_self_ty, fn_template,
+    enum_tag_ty, enum_variant_count, enum_variants, fn_name_sym, fn_node, fn_self_ty, fn_template,
     struct_field_name, variant_discr,
 };
 use crate::places::ir::{
-    BK_MUT, BO_ADD, BO_LT, DS_KEPT, LF_MUT, LF_PARAM, LF_RETURN, LF_TEMP, OK_COPY, OK_INT, OK_MOVE,
-    OK_PLACE, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_VARIANT, P_TARGETS, RV_BINARY, RV_DISCR, RV_REF,
-    RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, TK_GOTO, TK_RETURN, TK_SWITCH, body_begin, emit,
-    enter_block, new_block, new_local, ops_mark, proj, push_op, struct_field_count, struct_field_ty,
-    terminate, undistinct, variant_field_count, variant_part_type,
+    BK_MUT, BO_ADD, BO_LT, B_FN, DS_KEPT, LF_MUT, LF_PARAM, LF_RETURN, LF_TEMP, OK_COPY, OK_INT,
+    OK_MOVE, OK_PLACE, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_VARIANT, P_STMTS, P_TARGETS, RV_BINARY,
+    RV_DISCR, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, TK_GOTO, TK_RETURN, TK_SWITCH,
+    body_begin, emit, enter_block, full_place_type, new_block, new_local, ops_mark, proj, push_op,
+    struct_field_count, struct_field_ty, terminate, undistinct, variant_field_count,
+    variant_part_type,
 };
 
 // The shims made: their type (distinct types erased), and per type id + 1
@@ -48,6 +50,10 @@ static var SHIM_OF: Vec<i64, Comp> = Vec::new_in(Comp {});
 // functions FNS[0..DROP_SCANNED].
 static var DROP_OF: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var DROP_SCANNED: i64 = 0;
+
+// The `Drop::drop` instances made here (no glue of the own pass's asked
+// for them).
+pub static var DROP_MADE: i64 = 0;
 static var SYM_DROP: i64 = 0;
 
 // The shim of type t (made now when t has none): what `drop(P)` of a
@@ -63,6 +69,7 @@ pub fn shim_of(t: i64) -> i64 {
     SHIM_TY.push(u);
     let id = SHIM_TY.len() - 1;
     SHIM_OF[u] = id + 1;
+    SHIM_FN.push(-1);
     id
 }
 
@@ -298,17 +305,34 @@ fn variant_glue(v: i64) -> bool {
 // ---- Drop::drop's instance of a type ----
 
 // The function `t.drop()` calls (t has an `impl Drop`): its method, or
-// the instance of its generic impl's method for t (-1 when the checker
-// made none).
+// the instance of its generic impl's method for t. That instance is the
+// one the checker made for the own pass's glue, or, when there is none,
+// made and checked now (the checker's way: instantiate_call on a `drop()`
+// call of no arguments, then the instances it queued), so that a shim
+// never lacks one; -1 only when t has no `drop` method.
 fn drop_fn(t: i64) -> i64 {
     if SYM_DROP == 0 {
         SYM_DROP = intern_c(c"drop");
     }
     let f0 = crate::front::check::calls::method_of(t, SYM_DROP);
-    if f0 >= 0 && !crate::places::front::fn_generic(f0) {
+    if f0 < 0 || !crate::places::front::fn_generic(f0) {
         return f0;
     }
-    // (the instances made since the last scan: by their receiver's type)
+    scan_drop_instances();
+    if t < DROP_OF.len() && DROP_OF[t] > 0 {
+        return DROP_OF[t] - 1;
+    }
+    let f = make_drop_instance(f0, t);
+    while DROP_OF.len() <= t {
+        DROP_OF.push(0);
+    }
+    DROP_OF[t] = f + 1;
+    f
+}
+
+// The `Drop::drop` instances made since the last scan, by their
+// receiver's type (DROP_OF).
+fn scan_drop_instances() {
     while DROP_SCANNED < FN_COUNT {
         let f = DROP_SCANNED;
         DROP_SCANNED += 1;
@@ -327,7 +351,23 @@ fn drop_fn(t: i64) -> i64 {
             DROP_OF[st] = f + 1;
         }
     }
-    if t < DROP_OF.len() && DROP_OF[t] > 0 { DROP_OF[t] - 1 } else { -1 }
+}
+
+// The instance of template f0 (a generic impl's `drop`) for receiver type
+// t, made as synth_method makes a method's (a `drop()` call node at the
+// body's function, for the messages), and checked with what it queues.
+fn make_drop_instance(f0: i64, t: i64) -> i64 {
+    let at = if B_FN >= 0 { NODES[fn_node(B_FN)].start } else { 0 };
+    let n = new_node(NodeKind::MethodCall, at, at);
+    NODES[n].b = SYM_DROP;
+    let mark = list_begin();
+    list_end(n, mark);
+    let q = INST_QUEUE.count;
+    let f = crate::front::generics::instantiate::instantiate_call(f0, n, 1, t, 0);
+    crate::front::assoc::ensure_checked(f, n);
+    crate::front::check::check_queued_instances(q);
+    DROP_MADE += 1;
+    f
 }
 
 // The shim's name, for --emit-places: `drop_in_place::<T>`.
@@ -433,4 +473,96 @@ fn add_part(pt0: i64, mark: i64) {
             DF_TMP.push(f);
         }
     }
+}
+
+// ---- Shims as functions (at a build whose code generators read the IR) ----
+
+// Per shim: its function (FNS), or -1 before make_shim_functions.
+static var SHIM_FN: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// Per function (FNS): whether it is a shim's.
+static var IS_SHIM: Vec<bool, Comp> = Vec::new_in(Comp {});
+
+// Whether function f is a drop shim's (make_shim_functions).
+pub fn is_shim_fn(f: i64) -> bool {
+    f >= 0 && f < IS_SHIM.len() && IS_SHIM[f]
+}
+
+// The function of shim id (-1: not made).
+pub fn shim_fn(id: i64) -> i64 {
+    if id < SHIM_FN.len() { SHIM_FN[id] } else { -1 }
+}
+
+// The function `drop(P)` of a place of type t calls with `&mut P` (its
+// shim's), -1 when t has none (no glue, or no body kept that drops one).
+pub fn drop_shim_fn(t: i64) -> i64 {
+    let u = undistinct(t);
+    if u <= 0 || u >= SHIM_OF.len() || SHIM_OF[u] == 0 {
+        return -1;
+    }
+    shim_fn(SHIM_OF[u] - 1)
+}
+
+// run_places, every body kept: each shim asked for (and the shims their
+// drops ask for) made a function, its body built and kept like a
+// function's. A shim is then a function like any (FNS, a Fn node, a
+// parameter `_1: &mut T` with an AST local, its symbol shim_fn_symbol),
+// made before the code generators size their tables by FN_COUNT, but not
+// a program item: a code generator lowers them by shim_count and shim_fn.
+pub fn make_shim_functions() {
+    var id = 0;
+    while id < shim_count() {
+        build_shim(id);
+        for s in 0..P_STMTS.len() {
+            let st = P_STMTS[s];
+            if st.kind == SK_DROP && st.c == DS_KEPT {
+                shim_of(full_place_type(st.a, st.b));
+            }
+        }
+        let f = shim_function(id);
+        crate::places::ir::B_FN = f;
+        crate::places::ir::B_NODE = fn_node(f);
+        crate::places::keep::keep_body();
+        id += 1;
+    }
+}
+
+// Shim id's function: a Fn node (no body: the IR is the body) with its
+// parameter, an AST local for it, the FNS entry.
+fn shim_function(id: i64) -> i64 {
+    while SHIM_FN.len() <= id {
+        SHIM_FN.push(-1);
+    }
+    if SHIM_FN[id] >= 0 {
+        return SHIM_FN[id];
+    }
+    let t = SHIM_TY[id];
+    let pt = ref_to(t, REF_MUT);
+    let name = shim_fn_symbol(id);
+    let shown = buf_new();
+    buf_shim_name(shown, id);
+    let display = intern(buf_slice(shown));
+    let item = new_node(NodeKind::Fn, 0, 0);
+    NODES[item].a = name;
+    let p = new_node(NodeKind::Param, 0, 0);
+    let self_sym = intern_c(c"self");
+    NODES[p].a = self_sym;
+    NODES[p].ty = pt;
+    // (an AST local for the parameter, as a checked function's: the code
+    // generators bind it; not in any scope)
+    let l = crate::front::check::define_local(self_sym, pt, false, true);
+    crate::front::check::ENV.count -= 1;
+    NODES[p].x = l;
+    let mark = list_begin();
+    list_push(p);
+    list_end(item, mark);
+    crate::front::check::collect::add_fn(item, name, display);
+    let f = FN_COUNT - 1;
+    crate::places::front::fn_set_shim_signature(f, pt);
+    SHIM_FN[id] = f;
+    while IS_SHIM.len() <= f {
+        IS_SHIM.push(false);
+    }
+    IS_SHIM[f] = true;
+    f
 }
