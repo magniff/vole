@@ -1,0 +1,401 @@
+// `--verify-places` (0.26.0, docs/design/places-ir.md §7.3): the body
+// held is checked, and each problem printed on stderr as one line,
+// `places.verify: FN bbK[i]: WHAT`:
+//
+// - its form (§3.6): every block entered ends in one terminator, its
+//   statements are not terminators, the ranges do not overlap, every
+//   target is a block that was entered, and no block is left open;
+// - its places: each operand's local exists and its projections apply to
+//   the type they are taken of; an index is a local;
+// - the copy rule (§3.3), under --values=error: a `copy` of a place whose
+//   type needs drop only as the value of a BORROWED local or of a
+//   BORROWED local's place (a borrowed copy of a borrowed copy), and no
+//   `move` out of a BORROWED local;
+// - each `as V` dominated by a `switch` on the discriminant of the place
+//   it is taken of;
+// - no use of a local outside its storage: with a StorageLive anywhere in
+//   the body, a local is used only where it is live on every path.
+//
+// The count of problems is VERIFY_ERRORS; the driver (places/mod.vl)
+// stops with exit 1 when it is not 0.
+
+use crate::base::{STDERR, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::base::comp::Comp;
+use crate::front::own::drops::drops_on;
+use crate::front::own::glue::has_glue;
+use crate::places::cfg::{IDOM, RPO, RPO_INDEX, compute_idom, compute_preds, compute_rpo, in_graph};
+use crate::places::ir::{
+    B_FN, CUR_BLOCK, LF_BORROWED, LF_PARAM, LF_RETURN, LF_STATIC, OK_COPY, OK_MOVE, PJ_INDEX,
+    PJ_VARIANT, P_STMTS, RV_DISCR, RV_USE, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
+    SK_LIVE, SK_MENTION, TK_SWITCH, block_count, block_len, block_start, block_term,
+    full_place_type, has_flag, is_terminator, local_count, op_a, op_b, op_is_place, op_kind,
+    proj_kind, proj_parent, proj_val, succ, succ_count,
+};
+use crate::places::print::buf_fn_name;
+
+pub static var VERIFY_ERRORS: i64 = 0;
+
+// Per statement, its block (-1: in none yet), for the overlap check.
+static var OWNER: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The storage dataflow: per block, the words of the locals that may be
+// dead at its entry; the current state.
+static var DEAD_IN: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DEAD: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var TRACKED: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var WORDS: i64 = 0;
+// The block and the statement being checked (for the messages).
+static var AT_BLOCK: i64 = 0;
+static var AT_STMT: i64 = 0;
+// Whether the problems are being reported (the storage pass runs its
+// blocks more than once, and reports on its last round only).
+static var REPORT: bool = true;
+
+fn problem(what: [u8]) {
+    if !REPORT {
+        return;
+    }
+    VERIFY_ERRORS += 1;
+    let out = buf_new();
+    buf_str(out, c"places.verify: ");
+    buf_fn_name(out, B_FN);
+    buf_str(out, c" bb");
+    buf_int(out, AT_BLOCK);
+    buf_str(out, c"[");
+    buf_int(out, AT_STMT);
+    buf_str(out, c"]: ");
+    crate::base::buf_bytes(out, what);
+    buf_str(out, c"\n");
+    buf_write_fd(out, STDERR);
+}
+
+// Checks the body held.
+pub fn verify_body() {
+    REPORT = true;
+    AT_BLOCK = -1;
+    AT_STMT = -1;
+    if CUR_BLOCK >= 0 {
+        problem("a block is left open (no terminator)");
+    }
+    if !verify_form() {
+        return;
+    }
+    compute_preds();
+    compute_rpo();
+    compute_idom();
+    for b in 0..block_count() {
+        if !in_graph(b) {
+            continue;
+        }
+        AT_BLOCK = b;
+        let start = block_start(b);
+        for s in start..start + block_len(b) + 1 {
+            AT_STMT = s - start;
+            verify_stmt(s, b);
+        }
+    }
+    verify_storage();
+}
+
+// The form: ranges, terminators, targets. False when it is broken (the
+// rest would read past it).
+fn verify_form() -> bool {
+    let n = P_STMTS.len();
+    OWNER.clear();
+    for _ in 0..n {
+        OWNER.push(-1);
+    }
+    var ok = true;
+    for b in 0..block_count() {
+        let start = block_start(b);
+        if start < 0 {
+            continue;
+        }
+        AT_BLOCK = b;
+        AT_STMT = -1;
+        let end = start + block_len(b);
+        if end >= n {
+            problem("the block has no terminator");
+            ok = false;
+            continue;
+        }
+        for s in start..end + 1 {
+            AT_STMT = s - start;
+            if OWNER[s] >= 0 {
+                problem("the statement is in two blocks");
+                ok = false;
+            }
+            OWNER[s] = b;
+            let term = is_terminator(P_STMTS[s].kind);
+            if s < end && term {
+                problem("a terminator inside the block");
+                ok = false;
+            }
+            if s == end && !term {
+                problem("the block does not end in a terminator");
+                ok = false;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        for i in 0..succ_count(b) {
+            let t = succ(b, i);
+            if !in_graph(t) {
+                problem("a target block that was never entered");
+                ok = false;
+            }
+        }
+    }
+    if block_count() > 0 && !in_graph(0) {
+        AT_BLOCK = 0;
+        problem("bb0 was never entered");
+        ok = false;
+    }
+    ok
+}
+
+// Whether place (l, p) is well formed: its local exists, each step applies.
+fn check_place(l: i64, p: i64) -> bool {
+    if l < 0 || l >= local_count() {
+        problem("a place of a local that does not exist");
+        return false;
+    }
+    if full_place_type(l, p) <= 0 {
+        problem("a projection that does not apply to its type");
+        return false;
+    }
+    var q = p;
+    while q > 0 {
+        if proj_kind(q) == PJ_INDEX {
+            let i = proj_val(q);
+            if i < 0 || i >= local_count() {
+                problem("an index that is not a local");
+                return false;
+            }
+        }
+        q = proj_parent(q);
+    }
+    true
+}
+
+fn verify_stmt(s: i64, b: i64) {
+    let st = P_STMTS[s];
+    let k = st.kind;
+    if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP || k == SK_MENTION {
+        check_place(st.a, st.b);
+    }
+    for i in 0..st.nops {
+        let ok = op_kind(st.ops, i);
+        if !op_is_place(ok) {
+            continue;
+        }
+        let l = op_a(st.ops, i);
+        let p = op_b(st.ops, i);
+        if !check_place(l, p) {
+            continue;
+        }
+        if ok == OK_MOVE && has_flag(l, LF_BORROWED) {
+            problem("a move out of a borrowed local");
+        }
+        if ok == OK_COPY && drops_on() && has_glue(full_place_type(l, p)) {
+            // (the copy rule: only into a borrowed local or temporary, or
+            // of a borrowed local's place, itself a borrowed copy)
+            let into_borrowed = k == SK_ASSIGN && st.c == RV_USE && st.b == 0
+                && has_flag(st.a, LF_BORROWED);
+            if !into_borrowed && !has_flag(l, LF_BORROWED) {
+                problem("a copy of a value that needs drop, not into a borrowed local");
+            }
+        }
+        check_variants(l, p, b);
+    }
+}
+
+// Each `as V` step of place (l, p) is dominated by a switch on the
+// discriminant of the place it is taken of.
+fn check_variants(l: i64, p: i64, b: i64) {
+    var q = p;
+    while q > 0 {
+        if proj_kind(q) == PJ_VARIANT && !switch_dominates(l, proj_parent(q), b) {
+            problem("an 'as V' not dominated by a switch on its discriminant");
+        }
+        q = proj_parent(q);
+    }
+}
+
+// Whether a block that dominates b ends in a switch on `discriminant (l,
+// p)` (the switch's operand a local assigned it in that block).
+fn switch_dominates(l: i64, p: i64, b: i64) -> bool {
+    if RPO_INDEX[b] < 0 {
+        // (an unreachable block: nothing to dominate it)
+        return true;
+    }
+    var d = b;
+    while true {
+        if discr_switch(d, l, p) && (d != b) {
+            return true;
+        }
+        let up = IDOM[d];
+        if up < 0 || up == d {
+            return false;
+        }
+        d = up;
+    }
+    false
+}
+
+fn discr_switch(d: i64, l: i64, p: i64) -> bool {
+    let t = block_term(d);
+    if P_STMTS[t].kind != TK_SWITCH {
+        return false;
+    }
+    let ops = P_STMTS[t].ops;
+    let k = op_kind(ops, 0);
+    if k != OK_COPY && k != OK_MOVE || op_b(ops, 0) != 0 {
+        return false;
+    }
+    let dl = op_a(ops, 0);
+    let start = block_start(d);
+    var s = t - 1;
+    while s >= start {
+        let st = P_STMTS[s];
+        if st.kind == SK_ASSIGN && st.a == dl && st.b == 0 {
+            return st.c == RV_DISCR && op_a(st.ops, 0) == l && op_b(st.ops, 0) == p;
+        }
+        s -= 1;
+    }
+    false
+}
+
+// ---- Storage ----
+
+fn word_get(v: Vec<i64, Comp>, at: i64, l: i64) -> bool {
+    (v[at + l / 64] >> (l % 64) & 1) != 0
+}
+
+fn dead_set(l: i64, on: bool) {
+    let w = l / 64;
+    let bit = 1 << (l % 64);
+    if on {
+        DEAD[w] = DEAD[w] | bit;
+    } else {
+        DEAD[w] = DEAD[w] & ~bit;
+    }
+}
+
+fn use_local(l: i64) {
+    if l >= 0 && l < local_count() && word_get(TRACKED, 0, l) && word_get(DEAD, 0, l) {
+        problem("a use of a local outside its storage");
+    }
+}
+
+fn use_place(l: i64, p: i64) {
+    use_local(l);
+    var q = p;
+    while q > 0 {
+        if proj_kind(q) == PJ_INDEX {
+            use_local(proj_val(q));
+        }
+        q = proj_parent(q);
+    }
+}
+
+// One block's statements over DEAD (its state at the entry).
+fn storage_block(b: i64) {
+    let start = block_start(b);
+    for s in start..start + block_len(b) + 1 {
+        AT_STMT = s - start;
+        let st = P_STMTS[s];
+        let k = st.kind;
+        if k == SK_LIVE {
+            if st.a >= 0 && st.a < local_count() {
+                dead_set(st.a, false);
+            }
+            continue;
+        }
+        if k == SK_DEAD {
+            if st.a >= 0 && st.a < local_count() {
+                dead_set(st.a, true);
+            }
+            continue;
+        }
+        for i in 0..st.nops {
+            if op_is_place(op_kind(st.ops, i)) {
+                use_place(op_a(st.ops, i), op_b(st.ops, i));
+            }
+        }
+        if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP
+            || k == SK_MENTION {
+            use_place(st.a, st.b);
+        }
+    }
+}
+
+// Maybe-dead, forward, to a fixed point; then reported once.
+fn verify_storage() {
+    let n = local_count();
+    WORDS = n / 64 + 1;
+    TRACKED.clear();
+    for _ in 0..WORDS {
+        TRACKED.push(0);
+    }
+    var any = false;
+    for s in 0..P_STMTS.len() {
+        if P_STMTS[s].kind == SK_LIVE {
+            let l = P_STMTS[s].a;
+            if l >= 0 && l < n && !has_flag(l, LF_PARAM) && !has_flag(l, LF_RETURN)
+                && !has_flag(l, LF_STATIC) {
+                TRACKED[l / 64] = TRACKED[l / 64] | 1 << (l % 64);
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return;
+    }
+    let nb = block_count();
+    DEAD_IN.clear();
+    for b in 0..nb {
+        for w in 0..WORDS {
+            // (bb0: every tracked local dead; the others: nothing known yet)
+            DEAD_IN.push(if b == 0 { TRACKED[w] } else { 0 });
+        }
+    }
+    DEAD.clear();
+    for _ in 0..WORDS {
+        DEAD.push(0);
+    }
+    REPORT = false;
+    var changed = true;
+    var rounds = 0;
+    while changed && rounds < 64 {
+        changed = false;
+        rounds += 1;
+        for k in 0..RPO.len() {
+            let b = RPO[k];
+            for w in 0..WORDS {
+                DEAD[w] = DEAD_IN[b * WORDS + w];
+            }
+            storage_block(b);
+            for i in 0..succ_count(b) {
+                let t = succ(b, i);
+                for w in 0..WORDS {
+                    let old = DEAD_IN[t * WORDS + w];
+                    let new = old | DEAD[w];
+                    if new != old {
+                        DEAD_IN[t * WORDS + w] = new;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    REPORT = true;
+    for k in 0..RPO.len() {
+        let b = RPO[k];
+        AT_BLOCK = b;
+        for w in 0..WORDS {
+            DEAD[w] = DEAD_IN[b * WORDS + w];
+        }
+        storage_block(b);
+    }
+}

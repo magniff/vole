@@ -267,8 +267,10 @@ An operand is `copy P`, `move P` or a constant. A `copy` of a place whose
 type needs drop is valid only as the initializer of a `BORROWED` local or
 a `BORROWED` temporary: the source is an ordinary owned place, the
 destination is the borrowed copy (`x = copy (*_buf)[_i]`, a `for`
-element; `x = copy (_s as Some).0`, a match through a reference). A
-`BORROWED` local is never the source of a `move`. The verifier checks
+element; `x = copy (_s as Some).0`, a match through a reference), or
+when its root is itself a `BORROWED` local (a borrowed copy of a borrowed
+copy: a closure's borrowed item passed on, `g(acc, e.1)`). A `BORROWED`
+local is never the source of a `move`. The verifier checks
 both, under `--values=error` (§4): any other copy of a needs-drop place is
 the shape of S6, a bit copy of an owned iterator.
 
@@ -654,6 +656,31 @@ representation work below moves to 0.26.1.
 | -O1 build: IR to SSA in place of AST to SSA | ≤ 1,343M |
 | -O0 build: gen0 from the IR | ≤ 2,012M; -O0 total ≤ 1.05x of 8,896M |
 | RSS of `check` | ≤ 1.05x of 513 MB |
+
+**Measured in 0.26.0 (the fallback applied).** `tests/compile_cost.sh -r
+5` with `--places` added, against the same compiler without it (both
+checking the branch's compiler/src):
+
+| point | check | IR's share | hello | std |
+|---|---|---|---|---|
+| after 2a (95% of bodies built) | 5,188M vs 4,755M | +433M | 108.8M vs 85.7M | 1,077M vs 1,052M |
+| after 2c (every body) | 5,197M vs 4,769M | +428M (the builder) | 109.2M vs 86.6M | 1,077M vs 1,051M |
+| after 3a (elaboration, flags, the backstop's record) | 5,439M vs 4,886M | +554M | 109.4M vs 87.0M | 1,090M vs 1,060M |
+
+So the builder alone is about 430M (340M budgeted) and elaboration with
+the backstop about 125M (125M budgeted, 100M + 25M): the IR runs only
+under `--places` in 0.26.0, and the representation work below moves to
+0.26.1, before default-on. `--time-passes` at 3a: places (build) about 50
+ms, places (elaborate) about 5 ms. The profile of the builder is flat:
+staging operands (OPSTACK, then copied into P_OPS) and Vec pushes are
+about 20% of it. Writing operands straight into P_OPS where the order
+allows is the first change to make; estimated 15-20% of the builder.
+
+`hello` at 1.27x with `--places`: the bodies of every std function a
+hello world checks (fmt, Buf, the allocator), about 23M. 0.26.1 needs
+bodies only for the functions emitted or checked for the program (std's
+reached ones built on demand, as the code generators ask), not all of
+std's checked ones.
 
 **How it stays cheap.**
 

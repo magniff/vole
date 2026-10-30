@@ -1,0 +1,649 @@
+// The places IR (0.26.0, docs/design/places-ir.md §3): one Body per
+// checked function, a MIR-like form of it: typed locals, places with
+// interned projections, operands and rvalues, statements and terminators
+// in one array, blocks as ranges of it. This file is the contract: the
+// builder (build.vl), elaboration (elab.vl), the printer (print.vl), the
+// verifier (verify.vl) and, from 0.26.1, both code generators read the IR
+// through the names here, and nothing else. A change to it gets a line in
+// places/README.md's change log.
+//
+// One body is held at a time, in the P_* tables below, cleared and reused
+// for the next (no allocation per body once they have grown).
+//
+// Locals (§3.1): _0 the return place, _1.._n the parameters in order,
+// then the user locals, the temporaries and (made by elaboration) the drop
+// flags. A static the body names is a local too, flagged LF_STATIC: a
+// place root that is never dropped and never moved out of.
+//
+// Places (§3.2): a local and a projection list (0: none). A projection
+// list is interned per body as a chain (parent, kind, value), so a place
+// is two words and equal places are equal pairs.
+//
+//   PJ_FIELD k    field k of a struct, element k of a tuple, part k of a
+//                 slice (0 its pointer, 1 its length)
+//   PJ_DEREF      through a reference or a raw pointer
+//   PJ_INDEX l    an element of an array or a slice, or of the buffer a
+//                 raw pointer points to, indexed by local l (after its
+//                 bounds check, an `assert`, for an array or a slice)
+//   PJ_CONST k    the same with a constant index
+//   PJ_VARIANT v  the payload of enum variant v (VARIANTS), then PJ_FIELD
+//                 k for its field k; valid only where a `switch` on the
+//                 place's discriminant dominates it (the verifier checks)
+//   PJ_UNION k    field k of a union: no drop, no move path
+//
+// Operands (§3.3), three words each in P_OPS (kind, a, b):
+//
+//   OK_COPY l p   a copy of place (l, p)
+//   OK_MOVE l p   a move of place (l, p)
+//   OK_PLACE l p  the place itself, not read (a borrow's, a
+//                 discriminant's, a length's, a slicing's base)
+//   OK_INT v t    an integer, bool or char constant of type t
+//   OK_FLOAT b t  a float constant, its bits b, of type t
+//   OK_STR s t    a string literal (string id s), `[u8]`
+//   OK_CSTR s t   a C string literal, `*u8`
+//   OK_FN f t     function f (FNS) as a value
+//   OK_CONST c t  named constant c (CONSTS), of type t
+//   OK_UNIT       `()`
+//
+// Statements (§3.4) and terminators (§3.5) are PStmt records; a block is
+// a range of P_STMTS whose terminator is the slot after it. Their fields:
+//
+//   SK_ASSIGN     (a, b) = rvalue c: d, e its words, ops its operands
+//   SK_CALL       (a, b) = call: c the function (FNS), or -1 when ops[0]
+//                 is the callee value; ops the arguments after it
+//   SK_INTRINSIC  (a, b) = intrinsic c (IK_*): d the AST node; ops
+//   SK_DROP       drop (a, b): c its decision (DS_*), d its flag local (or
+//                 -1), e what --places-diff compares it with (the AST
+//                 local it drops, or -1)
+//   SK_ASSERT     ops[0] must be true, else exit 101: c the check (AK_*),
+//                 d the AST node (its site, its message)
+//   SK_LIVE l     StorageLive(a), SK_DEAD: StorageDead(a)
+//   SK_MENTION    a place read without a value (a, b)
+//   SK_NOP        a removed statement
+//   TK_GOTO       to block a; c = 1 on the back edge of an uncounted loop
+//   TK_SWITCH     on ops[0]: P_TARGETS[a .. a + 2b] (value, block) pairs,
+//                 otherwise block c
+//   TK_RETURN     _0 is the result
+//   TK_UNREACHABLE after a call that returns `!`, a panic, an exit
+//
+// Rvalues (§3.3), the c of an SK_ASSIGN:
+//
+//   RV_USE        ops[0]
+//   RV_REF        &ops[0] (an OK_PLACE): d the kind (BK_*), e the region
+//                 (0 until 0.27)
+//   RV_BINARY     ops[0] OP ops[1]: d the operator (BO_*), e the AST node
+//                 (0: one the builder made)
+//   RV_UNARY      OP ops[0]: d the operator (UO_*), e the AST node
+//   RV_CAST       ops[0] as type d
+//   RV_DISCR      the discriminant of place ops[0]
+//   RV_AGG        aggregate d (AK_*): e the struct (STRUCTS), variant
+//                 (VARIANTS) or closure type; ops its parts in declaration
+//                 order
+//   RV_REPEAT     [ops[0]; d]
+//   RV_LEN        the length of place ops[0], an array or a slice
+//   RV_SLICE      ops[0][ops[1]..ops[2]] (ops[0] an OK_PLACE of an array
+//                 or slice, or of a pointer, read; an absent bound
+//                 OK_UNIT), its bounds checked (exit 101): d the AST node
+//                 (inclusive or not, the site), e the region
+//
+// An SK_ASSERT of AK_BOUNDS has two operands, the index and the length:
+// it holds when the index, as unsigned, is below the length.
+//
+// Panics do not unwind (§3.10): calls and drops are statements, and
+// there are no cleanup edges. Unwinding, when it comes, makes SK_CALL and
+// SK_DROP terminators with a cleanup edge.
+
+use crate::base::comp::Comp;
+use crate::front::ast::REPR_UNION;
+use crate::front::types::{
+    ENUMS, STRUCTS, TYPES, TY_I64, TY_UNIT, TyKind, VARIANTS, struct_field, type_elem,
+    variant_field,
+};
+
+// Projection kinds.
+pub const PJ_FIELD: i64 = 1;
+pub const PJ_DEREF: i64 = 2;
+pub const PJ_INDEX: i64 = 3;
+pub const PJ_CONST: i64 = 4;
+pub const PJ_VARIANT: i64 = 5;
+pub const PJ_UNION: i64 = 6;
+
+// Local flags: MUT (a `var`: may be assigned again), BORROWED (a bit copy
+// of a value owned elsewhere, §3.11: never dropped, never moved out of),
+// TEMP (a temporary), PARAM (a parameter, _1.._n), RETURN (_0), FLAG (a
+// drop flag), STATIC (a static's place root), USER (a local of the
+// source). A local's src is its LOCALS index (a USER or PARAM local; a
+// temporary the own pass made a local of, too), a STATIC's name (its
+// symbol), else -1; node is the AST node it comes from (0: none).
+pub const LF_MUT: i64 = 1;
+pub const LF_BORROWED: i64 = 2;
+pub const LF_TEMP: i64 = 4;
+pub const LF_PARAM: i64 = 8;
+pub const LF_RETURN: i64 = 16;
+pub const LF_FLAG: i64 = 32;
+pub const LF_STATIC: i64 = 64;
+pub const LF_USER: i64 = 128;
+
+// Operand kinds.
+pub const OK_COPY: i64 = 1;
+pub const OK_MOVE: i64 = 2;
+pub const OK_PLACE: i64 = 3;
+pub const OK_INT: i64 = 4;
+pub const OK_FLOAT: i64 = 5;
+pub const OK_STR: i64 = 6;
+pub const OK_CSTR: i64 = 7;
+pub const OK_FN: i64 = 8;
+pub const OK_CONST: i64 = 9;
+pub const OK_UNIT: i64 = 10;
+
+// Statement kinds, then terminator kinds (TK_FALSE_EDGE is 0.27's, for
+// match guards: reserved).
+pub const SK_ASSIGN: i64 = 1;
+pub const SK_CALL: i64 = 2;
+pub const SK_INTRINSIC: i64 = 3;
+pub const SK_DROP: i64 = 4;
+pub const SK_ASSERT: i64 = 5;
+pub const SK_LIVE: i64 = 6;
+pub const SK_DEAD: i64 = 7;
+pub const SK_MENTION: i64 = 8;
+pub const SK_NOP: i64 = 9;
+pub const TK_GOTO: i64 = 16;
+pub const TK_SWITCH: i64 = 17;
+pub const TK_RETURN: i64 = 18;
+pub const TK_UNREACHABLE: i64 = 19;
+pub const TK_FALSE_EDGE: i64 = 20;
+
+// Rvalue kinds.
+pub const RV_USE: i64 = 1;
+pub const RV_REF: i64 = 2;
+pub const RV_BINARY: i64 = 3;
+pub const RV_UNARY: i64 = 4;
+pub const RV_CAST: i64 = 5;
+pub const RV_DISCR: i64 = 6;
+pub const RV_AGG: i64 = 7;
+pub const RV_REPEAT: i64 = 8;
+pub const RV_LEN: i64 = 9;
+pub const RV_SLICE: i64 = 10;
+
+// Binary operators (the operands' types say signed, unsigned or float;
+// a comparison gives a bool) and unary ones.
+pub const BO_ADD: i64 = 1;
+pub const BO_SUB: i64 = 2;
+pub const BO_MUL: i64 = 3;
+pub const BO_DIV: i64 = 4;
+pub const BO_REM: i64 = 5;
+pub const BO_AND: i64 = 6;
+pub const BO_OR: i64 = 7;
+pub const BO_XOR: i64 = 8;
+pub const BO_SHL: i64 = 9;
+pub const BO_SHR: i64 = 10;
+pub const BO_EQ: i64 = 11;
+pub const BO_NE: i64 = 12;
+pub const BO_LT: i64 = 13;
+pub const BO_LE: i64 = 14;
+pub const BO_GT: i64 = 15;
+pub const BO_GE: i64 = 16;
+pub const UO_NEG: i64 = 1;
+pub const UO_NOT: i64 = 2;
+pub const UO_BITNOT: i64 = 3;
+
+// The text of binary operator op.
+pub fn bo_text(op: i64) -> *u8 {
+    match op {
+        1 => c"+",
+        2 => c"-",
+        3 => c"*",
+        4 => c"/",
+        5 => c"%",
+        6 => c"&",
+        7 => c"|",
+        8 => c"^",
+        9 => c"<<",
+        10 => c">>",
+        11 => c"==",
+        12 => c"!=",
+        13 => c"<",
+        14 => c"<=",
+        15 => c">",
+        16 => c">=",
+        _ => c"?",
+    }
+}
+
+pub fn uo_text(op: i64) -> *u8 {
+    if op == UO_NEG { c"-" } else if op == UO_NOT { c"!" } else if op == UO_BITNOT { c"~" }
+    else { c"?" }
+}
+
+// Borrow kinds: shared, exclusive, two-phase exclusive (a reservation,
+// activated at its first use: a receiver), a raw address.
+pub const BK_SHARED: i64 = 1;
+pub const BK_MUT: i64 = 2;
+pub const BK_MUT2: i64 = 3;
+pub const BK_RAW: i64 = 4;
+
+// Aggregate kinds.
+pub const AK_TUPLE: i64 = 1;
+pub const AK_ARRAY: i64 = 2;
+pub const AK_STRUCT: i64 = 3;
+pub const AK_VARIANT: i64 = 4;
+pub const AK_CLOSURE: i64 = 5;
+
+// Intrinsics: a vector operation (the VecOp node), an atomic or
+// std::arch intrinsic call (the Call node), `needs_drop::<T>()`, a
+// contract check (std::contract_check's call), a panic of the checker's
+// (an EnumPanic: d its node).
+pub const IK_VECTOR: i64 = 1;
+pub const IK_ARCH: i64 = 2;
+pub const IK_NEEDS_DROP: i64 = 3;
+pub const IK_CONTRACT: i64 = 4;
+pub const IK_PANIC: i64 = 5;
+
+// Run-time checks: an index against the length, a slicing's bounds, a
+// value's variant (`as E`), a requires call's result.
+pub const AK_BOUNDS: i64 = 1;
+pub const AK_RANGE: i64 = 2;
+pub const AK_ENUM: i64 = 3;
+pub const AK_REQUIRES: i64 = 4;
+
+// A drop's decision: not decided yet (the builder's), kept, removed, run
+// under flag d, opened (each moved child's siblings dropped instead).
+pub const DS_UNDECIDED: i64 = 0;
+pub const DS_KEPT: i64 = 1;
+pub const DS_REMOVED: i64 = 2;
+pub const DS_FLAG: i64 = 3;
+pub const DS_OPEN: i64 = 4;
+
+pub struct PLocal { pub ty: i64, pub flags: i64, pub src: i64, pub node: i64 }
+pub struct PProj { pub parent: i64, pub kind: i64, pub val: i64, pub first: i64, pub next: i64 }
+
+pub struct PStmt {
+    pub kind: i64, pub a: i64, pub b: i64, pub c: i64, pub d: i64, pub e: i64, pub ops: i64,
+    pub nops: i64, pub node: i64,
+}
+
+pub struct PBlock { pub start: i64, pub len: i64 }
+
+// The body: its function (FNS), its Fn node, its parameters' count.
+pub static var B_FN: i64 = -1;
+pub static var B_NODE: i64 = 0;
+pub static var B_PARAMS: i64 = 0;
+pub static var P_LOCALS: Vec<PLocal, Comp> = Vec::new_in(Comp {});
+pub static var P_PROJS: Vec<PProj, Comp> = Vec::new_in(Comp {});
+pub static var P_STMTS: Vec<PStmt, Comp> = Vec::new_in(Comp {});
+pub static var P_BLOCKS: Vec<PBlock, Comp> = Vec::new_in(Comp {});
+pub static var P_OPS: Vec<i64, Comp> = Vec::new_in(Comp {});
+pub static var P_TARGETS: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The block statements are appended to (-1: none, after a terminator).
+pub static var CUR_BLOCK: i64 = -1;
+
+// A new body for function f (node item): the tables emptied, projection 0
+// (none) made.
+pub fn body_begin(f: i64, item: i64) {
+    B_FN = f;
+    B_NODE = item;
+    B_PARAMS = 0;
+    P_LOCALS.clear();
+    P_PROJS.clear();
+    P_STMTS.clear();
+    P_BLOCKS.clear();
+    P_OPS.clear();
+    P_TARGETS.clear();
+    P_PROJS.push(PProj { parent: -1, kind: 0, val: 0, first: 0, next: 0 });
+    CUR_BLOCK = -1;
+}
+
+// ---- Locals ----
+
+pub fn new_local(ty: i64, flags: i64, src: i64, node: i64) -> i64 {
+    P_LOCALS.push(PLocal { ty, flags, src, node });
+    P_LOCALS.len() - 1
+}
+
+pub fn local_count() -> i64 {
+    P_LOCALS.len()
+}
+
+pub fn local_ty(l: i64) -> i64 {
+    P_LOCALS[l].ty
+}
+
+pub fn local_flags(l: i64) -> i64 {
+    P_LOCALS[l].flags
+}
+
+pub fn has_flag(l: i64, flag: i64) -> bool {
+    (P_LOCALS[l].flags & flag) != 0
+}
+
+// ---- Projections ----
+
+// The projection list `parent` followed by (kind, val), interned: the same
+// list is the same number.
+pub fn proj(parent: i64, kind: i64, val: i64) -> i64 {
+    var c = P_PROJS[parent].first;
+    while c != 0 {
+        if P_PROJS[c].kind == kind && P_PROJS[c].val == val {
+            return c;
+        }
+        c = P_PROJS[c].next;
+    }
+    let id = P_PROJS.len();
+    P_PROJS.push(PProj { parent, kind, val, first: 0, next: P_PROJS[parent].first });
+    P_PROJS[parent].first = id;
+    id
+}
+
+pub fn proj_parent(p: i64) -> i64 {
+    P_PROJS[p].parent
+}
+
+pub fn proj_kind(p: i64) -> i64 {
+    P_PROJS[p].kind
+}
+
+pub fn proj_val(p: i64) -> i64 {
+    P_PROJS[p].val
+}
+
+// The number of steps of projection list p.
+pub fn proj_depth(p: i64) -> i64 {
+    var n = 0;
+    var q = p;
+    while q > 0 {
+        n += 1;
+        q = P_PROJS[q].parent;
+    }
+    n
+}
+
+// Whether list p has a `*` or an index step: such a place has no move path
+// (§3.8). (PJ_CONST is made for arrays only, a part of the array itself; a
+// constant index into a slice or a buffer is a PJ_INDEX of a temporary.)
+pub fn proj_indirect(p: i64) -> bool {
+    var q = p;
+    while q > 0 {
+        let k = P_PROJS[q].kind;
+        if k == PJ_DEREF || k == PJ_INDEX {
+            return true;
+        }
+        q = P_PROJS[q].parent;
+    }
+    false
+}
+
+// The type of a place: local l's type through projection list p (0 when a
+// step does not apply, which the verifier reports).
+pub fn place_type(l: i64, p: i64) -> i64 {
+    if p == 0 {
+        return P_LOCALS[l].ty;
+    }
+    let base = place_type(l, P_PROJS[p].parent);
+    step_type(base, P_PROJS[p].kind, P_PROJS[p].val)
+}
+
+// The type a projection step (kind, val) gives from a place of type t.
+pub fn step_type(t0: i64, kind: i64, val: i64) -> i64 {
+    // (a distinct type is its underlying one: `str` over `[u8]`, until the
+    // erasure)
+    var t = t0;
+    while t > 0 && TYPES[t].kind == TyKind::Distinct {
+        t = TYPES[t].a;
+    }
+    if t <= 0 {
+        return 0;
+    }
+    let tk = TYPES[t].kind;
+    if kind == PJ_DEREF {
+        return if tk == TyKind::Ptr { TYPES[t].a } else { 0 };
+    }
+    if kind == PJ_INDEX || kind == PJ_CONST {
+        return if tk == TyKind::Array || tk == TyKind::Slice || tk == TyKind::Ptr {
+            TYPES[t].a
+        } else {
+            0
+        };
+    }
+    if kind == PJ_VARIANT {
+        return if tk == TyKind::Enum { t } else { 0 };
+    }
+    if kind != PJ_FIELD && kind != PJ_UNION {
+        return 0;
+    }
+    if tk == TyKind::Struct {
+        let s = TYPES[t].a;
+        return if val >= 0 && val < struct_field_count(s) { struct_field_ty(s, val) } else { 0 };
+    }
+    if tk == TyKind::Tuple {
+        return if val >= 0 && val < TYPES[t].count { type_elem(t, val) } else { 0 };
+    }
+    if tk == TyKind::Slice {
+        return if val == 0 {
+            crate::front::types::ptr_to(TYPES[t].a)
+        } else if val == 1 {
+            TY_I64
+        } else {
+            0
+        };
+    }
+    0
+}
+
+// Type t, a distinct type's underlying one (`str` is `[u8]`, until the
+// erasure).
+pub fn undistinct(t: i64) -> i64 {
+    var u = t;
+    while u > 0 && TYPES[u].kind == TyKind::Distinct {
+        u = TYPES[u].a;
+    }
+    u
+}
+
+// ---- The checker's tables, read ----
+
+// The number of fields of struct s (STRUCTS).
+pub fn struct_field_count(s: i64) -> i64 {
+    // UNSAFE: STRUCTS is the checker's raw table of structs.
+    // SAFETY: s is a struct type's struct, below STRUCT_COUNT.
+    unsafe { STRUCTS[s].field_count }
+}
+
+// The type of field k of struct s.
+pub fn struct_field_ty(s: i64, k: i64) -> i64 {
+    // UNSAFE: struct_field gives a pointer into the checker's raw FIELDS.
+    // SAFETY: 0 <= k < s's field count (the callers check), so it points to
+    // one of s's fields.
+    unsafe { (*struct_field(s, k)).ty }
+}
+
+// The number of fields of variant v (VARIANTS).
+pub fn variant_field_count(v: i64) -> i64 {
+    // UNSAFE: VARIANTS is the checker's raw table of enum variants.
+    // SAFETY: v is a variant the checker resolved, below VARIANT_COUNT.
+    unsafe { VARIANTS[v].field_count }
+}
+
+// The type of field k of variant v's payload (PJ_VARIANT v, then PJ_FIELD
+// k): place_type gives the enum for the PJ_VARIANT step, and the field's
+// type is asked here.
+pub fn variant_part_type(v: i64, k: i64) -> i64 {
+    if k < 0 || k >= variant_field_count(v) {
+        return 0;
+    }
+    variant_field(v, k)
+}
+
+// The type of place (l, p), with variant payloads: a PJ_FIELD after a
+// PJ_VARIANT is the variant's field.
+pub fn full_place_type(l: i64, p: i64) -> i64 {
+    if p == 0 {
+        return P_LOCALS[l].ty;
+    }
+    let parent = P_PROJS[p].parent;
+    if P_PROJS[p].kind == PJ_FIELD && parent > 0 && P_PROJS[parent].kind == PJ_VARIANT {
+        return variant_part_type(P_PROJS[parent].val, P_PROJS[p].val);
+    }
+    step_type(full_place_type(l, parent), P_PROJS[p].kind, P_PROJS[p].val)
+}
+
+// Whether struct type t is a closure's env.
+pub fn struct_closure(t: i64) -> bool {
+    if t <= 0 || TYPES[t].kind != TyKind::Struct {
+        return false;
+    }
+    // UNSAFE: STRUCTS is the checker's raw table of structs.
+    // SAFETY: t is a struct type, so TYPES[t].a is below STRUCT_COUNT.
+    unsafe { STRUCTS[TYPES[t].a].closure != 0 }
+}
+
+// Whether struct type t is a union.
+pub fn is_union_type(t: i64) -> bool {
+    if t <= 0 || TYPES[t].kind != TyKind::Struct {
+        return false;
+    }
+    // UNSAFE: STRUCTS is the checker's raw table of structs.
+    // SAFETY: t is a struct type, so TYPES[t].a is below STRUCT_COUNT.
+    unsafe { (STRUCTS[TYPES[t].a].repr & REPR_UNION) != 0 }
+}
+
+// Whether enum type t keeps its payloads in memory (some variant has
+// fields).
+pub fn enum_has_fields(t: i64) -> bool {
+    if t <= 0 || TYPES[t].kind != TyKind::Enum {
+        return false;
+    }
+    // UNSAFE: ENUMS is the checker's raw table of enums.
+    // SAFETY: t is an enum type, so TYPES[t].a is below ENUM_COUNT.
+    unsafe { ENUMS[TYPES[t].a].has_fields }
+}
+
+// ---- Blocks and statements ----
+
+// A new block, not entered yet (its range starts when it is).
+pub fn new_block() -> i64 {
+    P_BLOCKS.push(PBlock { start: -1, len: 0 });
+    P_BLOCKS.len() - 1
+}
+
+pub fn block_count() -> i64 {
+    P_BLOCKS.len()
+}
+
+// Statements go to block b from now on; it must not have been entered.
+pub fn enter_block(b: i64) {
+    P_BLOCKS[b].start = P_STMTS.len();
+    P_BLOCKS[b].len = 0;
+    CUR_BLOCK = b;
+}
+
+pub fn block_start(b: i64) -> i64 {
+    P_BLOCKS[b].start
+}
+
+pub fn block_len(b: i64) -> i64 {
+    P_BLOCKS[b].len
+}
+
+// The location of block b's terminator.
+pub fn block_term(b: i64) -> i64 {
+    P_BLOCKS[b].start + P_BLOCKS[b].len
+}
+
+// Whether a block is open (statements go somewhere).
+pub fn reachable() -> bool {
+    CUR_BLOCK >= 0
+}
+
+// Appends a statement to the current block: its index (-1 when no block
+// is open: the code after a `return` or a `break`, never run).
+pub fn emit(kind: i64, a: i64, b: i64, c: i64, d: i64, e: i64, ops: i64, nops: i64,
+    node: i64) -> i64 {
+    if CUR_BLOCK < 0 {
+        return -1;
+    }
+    P_STMTS.push(PStmt { kind, a, b, c, d, e, ops, nops, node });
+    P_BLOCKS[CUR_BLOCK].len += 1;
+    P_STMTS.len() - 1
+}
+
+// Ends the current block with terminator `kind` (its fields as emit's);
+// no block is open after it.
+pub fn terminate(kind: i64, a: i64, b: i64, c: i64, ops: i64, nops: i64, node: i64) {
+    if CUR_BLOCK < 0 {
+        return;
+    }
+    P_STMTS.push(PStmt { kind, a, b, c, d: 0, e: 0, ops, nops, node });
+    CUR_BLOCK = -1;
+}
+
+// The operand triples of a statement start at the end of P_OPS: push them
+// with push_op, then emit with ops = the mark, nops = their count.
+pub fn ops_mark() -> i64 {
+    P_OPS.len()
+}
+
+pub fn push_op(kind: i64, a: i64, b: i64) {
+    P_OPS.push(kind);
+    P_OPS.push(a);
+    P_OPS.push(b);
+}
+
+pub fn op_kind(at: i64, i: i64) -> i64 {
+    P_OPS[at + 3 * i]
+}
+
+pub fn op_a(at: i64, i: i64) -> i64 {
+    P_OPS[at + 3 * i + 1]
+}
+
+pub fn op_b(at: i64, i: i64) -> i64 {
+    P_OPS[at + 3 * i + 2]
+}
+
+// Whether operand kind k is of a place.
+pub fn op_is_place(k: i64) -> bool {
+    k == OK_COPY || k == OK_MOVE || k == OK_PLACE
+}
+
+pub fn is_terminator(kind: i64) -> bool {
+    kind >= TK_GOTO
+}
+
+// The successors of block b's terminator: their count, then each.
+pub fn succ_count(b: i64) -> i64 {
+    let t = block_term(b);
+    let k = P_STMTS[t].kind;
+    if k == TK_GOTO {
+        return 1;
+    }
+    if k == TK_SWITCH {
+        return P_STMTS[t].b + 1;
+    }
+    0
+}
+
+pub fn succ(b: i64, i: i64) -> i64 {
+    let t = block_term(b);
+    let s = P_STMTS[t];
+    if s.kind == TK_GOTO {
+        return s.a;
+    }
+    if i < s.b { P_TARGETS[s.a + 2 * i + 1] } else { s.c }
+}
+
+// ---- Points (§3.6) ----
+
+// Location loc's start point, and its mid point: dense, so that a set of
+// points is a bitset (0.27's liveness and solve).
+pub fn point_start(loc: i64) -> i64 {
+    2 * loc
+}
+
+pub fn point_mid(loc: i64) -> i64 {
+    2 * loc + 1
+}
+
+// The unit type, for the result of a statement with no value.
+pub fn unit_ty() -> i64 {
+    TY_UNIT
+}

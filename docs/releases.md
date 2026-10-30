@@ -138,6 +138,22 @@ Private fields (privfields260, plan §1 k):
   0.26.2's `pub(crate)` may narrow them. `pub(crate)`, `pub(super)` and
   `pub(in path)` come in 0.26.2.
 
+The places IR (placesir260):
+
+- **The places IR, behind `--places`** (compiler/src/places,
+  [design/places-ir.md](design/places-ir.md)): every checked body as
+  typed locals, places with projections, temporaries, borrows and storage
+  markers, its drops elaborated per place (move paths, two dataflows,
+  flags, open drops). `--emit-places[=all]` prints it, `--verify-places`
+  checks it, `--places-diff` compares its drops with the own pass's (5
+  differences left over tests/run, each the IR's more precise, listed in
+  places/README.md), and a move-out backstop reports what the own pass
+  would let through (nothing over compiler/src and tests/run). New
+  directive `// PLACES:` in tests/run; `places_*` cases for the audit's
+  findings and families. Off by default: the builder costs about 430M
+  instructions at `check` of compiler/src, over its 340M budget (§6's
+  fallback rule); 0.26.1 makes it cheaper before turning it on.
+
 ### What's new in 0.25.5
 
 The last release before 0.26's rethink of the core semantics: no language

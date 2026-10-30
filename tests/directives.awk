@@ -31,6 +31,8 @@
     else if (key == "CHECK") checks = checks "+" value "\n"
     else if (key == "CHECK-NOT") checks = checks "-" value "\n"
     else if (key == "CHECK-OPT") checkopt = value
+    else if (key == "PLACES") places = places "+" value "\n"
+    else if (key == "PLACES-NOT") places = places "-" value "\n"
     else if (key == "ASM(" target ")") asms = asms "+" value "\n"
     else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
     else if (key == "FIXIMPORTS") fiximports = 1
@@ -66,6 +68,7 @@ END {
     printf "%d", build > (dir "/build")
     printf "%s", checks > (dir "/checks")
     printf "%s", asms > (dir "/asms")
+    printf "%s", places > (dir "/places")
     printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
     printf "%d", fiximports > (dir "/fiximports")
     printf "%s", fixed > (dir "/fixed")
