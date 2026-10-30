@@ -98,6 +98,31 @@ compiler/src/places/README.md):
 - `volec query drops FILE:LINE`: a function's drops as the IR decides
   them, each with where it runs (query.md, "drops").
 
+Cells (cells261, plan §1 g; grammar.md, "Interior mutability"; `guide
+memory#cells`):
+
+- `std::cell::UnsafeCell<T>` and `Cell<T>`, Rust's API: `new`, `get`
+  (T: Copy), `set`, `replace`, `take` (T: Default), `swap`, `update`,
+  `into_inner`, `as_ptr`; Clone, Default, Debug, Eq and Ord. A cell is
+  owned (move-only) with no drop of its own: `needs_drop::<Cell<i64>>()`
+  is false, and a `let` parameter of one is a reference to the caller's
+  cell, so `fn bump(c: Cell<i64>) { c.set(c.get() + 1); }` changes it.
+- `std::Freeze`, an auto trait: a type holding no UnsafeCell by value.
+  The optimizer keeps no fact through a shared reference to what is not
+  Freeze; an immutable static of it lives in writable data.
+- No bit copy of a cell: `for c in arr` over an array of cells iterates
+  the array in place; `v.get(i)` of a cell, and a closure given a
+  borrowing iterator's cells, are `own.interior_copy` (try: `v[i]`).
+- A cell is not Sync: an immutable `static` of one is `sync.static` (a
+  `static var` or a `#[thread_local] static var` may hold one); a cell
+  of a view is `cell.view_item`.
+- A contract condition or a `#[pure]` function may not read a cell or an
+  atomic (`contract.effect`, `effect`): the hidden effect `interior`,
+  `query effects F --why interior`.
+- std's Atomic and Mutex hold an UnsafeCell, and std::fmt's print state
+  is one immutable static behind one: printing is `io panic`, no longer
+  `global` (`query effects std::println`).
+
 ### What's new in 0.26.0
 
 The first release of the move to Rust's surface
