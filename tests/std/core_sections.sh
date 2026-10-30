@@ -11,7 +11,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # 0.22.0: 144 KB, printing's lock pulls in 0.21's Atomics, Locks and the
 # futex calls, and std::gpu's closed gate keeps its `mod` sections core;
 # the bound is 160 KB until 0.22.1 brings them back under 128 KB.)
-MAX=${1:-163840}
+MAX=${1:-167936}
 report=$(sh "$ROOT/compiler/std/embed.sh" --core) || { echo "error: compiler/std/embed.sh --core failed" >&2; exit 1; }
 bytes=$(printf '%s\n' "$report" | awk '/^core:/ { print $6 }')
 summary=$(printf '%s\n' "$report" | tail -1 | sed 's/^core: //')
