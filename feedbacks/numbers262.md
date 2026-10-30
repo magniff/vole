@@ -226,6 +226,17 @@ purecall_hoisted's 1.117e9). Wall time was measured under heavy load
 (other agents' builds): its geomean, 1.139 (user 1.055), is indicative
 only.
 
+Without $VOLE_PROTO_OVF the code is unchanged: `-O2 -S` of all 43 bench
+programs is byte-identical between the build before the vectorizer and
+unroller work, the build with the unroller restriction (dd9298aa) and the
+final one (7f9a699f). The restriction and its removal only touch loops
+that have overflow checks, so no bench program's default code moves.
+
+Decision 6, as revised by the integrator after this round: Rust's default
+(checks at -O0, wrapping at -O1 and up), `--overflow-checks=on|off` to
+override it, std built with the program's setting; the mitigations stay
+for `on` at -O2.
+
 What is left, by kind:
 
 - Inherent checks Rust has too: collatz (`3 * n + 1` on u64, `count +=
