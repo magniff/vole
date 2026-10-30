@@ -81,6 +81,34 @@ IR at `check`, struct fields private unless `pub`, and shaders as
 `embed wgsl` blocks. Built and tested on aarch64-macos only; Linux is
 untested in this release.
 
+Shaders as embedded blocks (embedwgsl260; grammar.md, "Embedded blocks";
+`guide gpu#shaders-as-embedded-blocks`):
+
+- `embed wgsl NAME { WGSL }` and `embed wgsl NAME from "x.wgsl";`, an
+  item: an immutable static whose fields are `src`, the text, and one
+  per entry point holding its name (`dev.shader_wgsl(K.src)?`,
+  `compute_pipeline(s, K.step)`). `embed`, `wgsl` and `from` stay
+  identifiers. The lexer hands the text to WGSL's rule (the `}` that
+  matches outside comments): `1u`, `@` attributes and nested comments
+  are no vole errors.
+- `volec check`, the LSP and every checked edit run the text through
+  std::gpu::wgsl's front end: its first error at its `.vl` position
+  (`error[wgsl.type]`), in the file form at the `from` string with the
+  file's `x.wgsl:L:C:`. `K.stpe` is `gpu.entry`, listing the block's
+  entry points, the nearest as `fix --suggested`'s fix.
+- `gpu.*` (11) and `wgsl.*` (21) are codes with `volec explain` entries;
+  wgslc's own table is gone. New codes: `gpu.entry`, `embed.language`,
+  `embed.unterminated`, `embed.name`.
+- The tools: fmt keeps a block's lines as they are; `query grep`
+  classifies its text by WGSL's rules; `query show K`, `edit patch K`,
+  `query refs K.step` (the WGSL `fn step`); the LSP's go to definition
+  (the `from` file, `K.step`), document symbols and diagnostics. VS
+  Code: a WGSL grammar, injected into blocks. The 6 `include_str` of
+  `.wgsl` files in examples are blocks' file form.
+- Cost: `compile_cost`'s `check` 1.00x the base; compiler/src itself
+  grows by the WGSL front it now checks (one compiler on both sources:
+  4,693M to 5,373M instructions, 308 to 332 ms).
+
 Private fields (privfields260, plan §1 k):
 
 - Breaking: a struct's fields are private to the module that declares

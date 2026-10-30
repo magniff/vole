@@ -519,6 +519,53 @@ main.vl:135:17: gpu.layout: the layout has 2 bindings, 0 and 3, and binding 1 of
 
 `pipe.bind_layout(g).entries[i].binding` (i below `.count`) lists them.
 
+## Shaders as embedded blocks
+
+(0.26.0) Write a shader as a block, `embed wgsl NAME { WGSL }`, or read
+it from a file beside the source, `embed wgsl NAME from "x.wgsl";`.
+`volec check` (the LSP, every checked edit) checks its WGSL and reports
+an error at its line in the `.vl` file. `NAME` is a static: `NAME.src`
+is the text, for `dev.shader_wgsl(NAME.src)?`, and each entry point is a
+field holding its name, for `dev.compute_pipeline(shader, NAME.step)`; a
+name the block has no entry point for is `gpu.entry`, listing the ones
+it has. `volec fmt` keeps the block's text as it is.
+
+```vole
+embed wgsl SIM {
+    @group(0) @binding(0) var<storage, read_write> cells: array<u32>;
+
+    @compute @workgroup_size(64)
+    fn step(@builtin(global_invocation_id) id: vec3<u32>) {
+        cells[id.x] = cells[id.x] + 1u;   // a } in a comment is fine
+    }
+}
+
+fn main() {
+    println(f"{SIM.step} {SIM.src.len() > 0}");
+}
+```
+```out
+step true
+```
+
+A WGSL error is the compiler's, at its position:
+
+```vole
+embed wgsl BAD {
+    @compute @workgroup_size(1)
+    fn main() {
+        let x = 1u + 2i;
+    }
+}
+
+fn main() {
+    println(BAD.main);
+}
+```
+```err
+error[wgsl.type] '+' cannot take u32 and i32
+```
+
 ## One module per kernel
 
 Give each compute kernel its own shader module: one `dev.shader_wgsl`
@@ -1130,7 +1177,7 @@ fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
 
 `dev.shader_wgsl` runs std::gpu::wgsl's front end, then Metal's compiler
 on the MSL it writes. Everything is an `Err(gpu::Error::Shader(m))` with
-the position in the WGSL, never a panic (`wgslc explain CODE`):
+the position in the WGSL, never a panic (`volec explain CODE`):
 
 - The front end takes the subset of docs/design/gpu.md (section 2.10) and
   rejects the rest at its line: `wgsl.unsupported` (f16, `override`,

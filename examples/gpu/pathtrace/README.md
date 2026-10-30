@@ -232,7 +232,7 @@ command above for local numbers.
 | [ui_render.vl](ui_render.vl) | the UI pipeline, atlas upload and blended pass |
 | [ui.wgsl](ui.wgsl) | WGSL for one textured, alpha-blended quad |
 | [font.vl](font.vl) | 5×7 bitmap font and its atlas |
-| [shaders.vl](shaders.vl) | the two path-tracing shaders, `include_str` of the `.wgsl` files |
+| [shaders.vl](shaders.vl) | the two path-tracing shaders, `embed wgsl K from` the `.wgsl` files |
 | [trace.wgsl](trace.wgsl) | WGSL integrator, scene geometry, media, G-buffer and accumulation |
 | [display.wgsl](display.wgsl) | WGSL tone mapping and display modes |
 | [check.vl](check.vl) | headless readback checks, PPM output (with `--ui`) and benchmark |
