@@ -61,7 +61,7 @@ its first line, without reading its body. The compiler sees it too:
 $ volec query effects crate lengths.vl
 crate::longest	none
 crate::lengths	alloc(Gpa) panic
-crate::main	alloc(Gpa) io global panic
+crate::main	alloc(Gpa) io panic
 ```
 
 This line of output for each function is its *effects*, the things
@@ -539,8 +539,8 @@ The compiler confirms that no `Gpa` is involved:
 ```console
 $ volec query effects crate requests.vl
 split_path<FixedBuf>	alloc(FixedBuf) panic diverge
-handle<FixedBuf>	alloc(FixedBuf) io global panic diverge
-crate::main	alloc(FixedBuf) io global panic diverge
+handle<FixedBuf>	alloc(FixedBuf) io panic diverge
+crate::main	alloc(FixedBuf) io panic diverge
 ```
 
 ### Handling running out

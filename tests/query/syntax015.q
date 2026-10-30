@@ -38,6 +38,7 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::cell	<std>	19
 std::sync	<std>	29
 std::sync::atomic	<std>	48
 std::sync::mpsc	<std>	24
@@ -89,7 +90,7 @@ std::arch::x86_64	<std::arch::x86_64>	6
 std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ show main
-// crate::main	syntax015/main.vl:25-31	effects: io global panic
+// crate::main	syntax015/main.vl:25-31	effects: io panic
 fn main() -> Option<i64> {
     let x = half(8)?;
     let y = area(x, h: 2);

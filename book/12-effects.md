@@ -20,7 +20,7 @@ changing its `inout` arguments. The compiler knows six of them:
 |---|---|---|
 | `alloc(Gpa)` | allocates memory, from a `Gpa` | `Vec::push`, `String::from_in`, anything `_in` |
 | `io` | reads or writes outside the program | printing, files, stdin |
-| `global` | uses a global variable | a `static var`, std's print buffer |
+| `global` | uses a global variable | a `static var`, std's stdin buffer |
 | `panic` | may stop the program | a checked index, `unwrap`, `assert` |
 | `diverge` | may never return | `loop`, `while`, recursion |
 | `unsafe` | does unsafe operations itself | chapter 15 |
@@ -119,7 +119,7 @@ Each line is a function and its effects. Let's read them.
   the program if `i` is out of range. (`bucket` keeps `i` in range, but
   the compiler doesn't follow the arithmetic that far.)
 - `main` does everything: it allocates (the `Vec`, the `String`), does
-  I/O (stdin and printing), uses a global (std keeps its print buffer
+  I/O (stdin and printing), uses a global (std keeps its stdin buffer
   in one), may panic (the `unwrap`s), and may not return.
 
 That last one is surprising: `main` has no loop that could run forever.

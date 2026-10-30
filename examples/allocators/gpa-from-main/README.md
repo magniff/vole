@@ -78,7 +78,7 @@ body and everything it calls (`volec guide effects`):
 
 ```console
 $ volec query effects crate
-crate::parse_orders	alloc(Gpa) io global panic diverge
+crate::parse_orders	alloc(Gpa) io panic diverge
 crate::total	none
 crate::by_customer	alloc(Gpa) panic
 count_items<Gpa>	alloc(Gpa) panic
@@ -88,9 +88,9 @@ crate::main	alloc(Gpa) io global panic diverge
 `total` is `none`: no allocation, no I/O, no statics, and not even a
 possible panic. `count_items` is generic, so its effects are its
 instances': here only `Gpa`. `parse_orders` does I/O (`eprintln` of a
-bad line, which writes through a static buffer: `global`) and may not
-terminate (`diverge`: std's `split_whitespace_in` loops with `while
-let`); `query effects parse_orders --why diverge` shows the chain.
+bad line) and may not terminate (`diverge`: std's
+`split_whitespace_in` loops with `while let`); `query effects
+parse_orders --why diverge` shows the chain.
 
 ## Forgetting the allocator
 

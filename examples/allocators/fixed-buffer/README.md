@@ -91,7 +91,7 @@ Only `Vec` has `try_` forms; a `Buf` or a `HashMap` on a
 
 ```console
 $ volec query effects crate
-<crate::CalcError as Display>::fmt	io global panic
+<crate::CalcError as Display>::fmt	io panic
 crate::push	alloc(FixedBuf)
 crate::skip	panic
 crate::pop2	panic
@@ -99,7 +99,7 @@ crate::eval	alloc(FixedBuf) panic
 crate::Input::byte	io panic unsafe
 crate::Input::line	alloc(FixedBuf) io panic diverge
 crate::short	panic
-crate::main	alloc(FixedBuf) io global panic diverge
+crate::main	alloc(FixedBuf) io panic diverge
 ```
 
 No function has `alloc(Gpa)`, nor `alloc(extern)` (C's `malloc`):
