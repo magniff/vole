@@ -77,6 +77,9 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
 
+- `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Lengths and indices stay `i64` for now; indexing takes any integer type.
+- Float to integer `as` saturates for every target type, as Rust's: `300.7 as u8 == 255`, `70000.0 as u16 == 65535`, `-1.0 as u64 == 0` (they were 44, 4464 and `u64::MAX`); NaN is 0. The same in constants, the folder, both code generators and x86-64.
+
 Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
 "Embedded blocks"; `guide gpu#one-module-per-kernel`,
 `gpu#shared-constants-and-structs`):
@@ -107,6 +110,27 @@ Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
+
+The places IR, agent A's half (placesir261a; design/places-ir.md §8,
+compiler/src/places/README.md):
+
+- Kept bodies: at a build whose code generators read the IR, each
+  elaborated body is kept and loaded back when its function is generated
+  (places/keep.vl); `check --keep-places --emit-places` prints them so.
+- Drop shims (places/shim.vl, §3.9): one body per type with drop glue,
+  `drop_in_place::<T>` (a `Drop` impl's call, then the fields', an
+  enum's switch, an array's loop, a sink closure's capture under its
+  flag), made on demand; `check --emit-places --emit-shims` prints them.
+- The builder's cost: operands written straight into the IR, storage
+  markers only for locals with drop glue outside `--emit-places` and
+  `--verify-places`; the IR's share of `check` of compiler/src from
+  544M to about 420M instructions.
+- Effects see the IR's drops: each function's kept and flagged drops
+  give its effect graph an edge to the `Drop::drop` functions their
+  shims call (front/effects/infer.vl), the edges the own pass's drop
+  placeholders give until they go.
+- `volec query drops FILE:LINE`: a function's drops as the IR decides
+  them, each with where it runs (query.md, "drops").
 
 ### What's new in 0.26.0
 

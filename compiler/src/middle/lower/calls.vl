@@ -7,15 +7,17 @@ use crate::arch::intrinsic_of_fn;
 use crate::back::abi::{
     AbiClass, conv_classify, conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::base::{IntVec, die, free, intern_c};
+use crate::base::{FILES, IntVec, die, free, intern_c};
+use crate::base::comp::Comp;
 use crate::base::target::X86;
 use crate::front::ast::{NODES, NODE_RAW, child};
 use crate::front::contracts::checks::{CHECK_FN, check_message, check_values, conjuncts};
+use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE};
 use crate::front::modules::{item_symbol, within_std};
 use crate::front::threadlocal::{symbol_is_thread_local, tls_addr_fn};
 use crate::front::types::{
-    FNS, STATICS, SYM_STATIC, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, int_bits,
-    is_compound, is_signed, is_void, scalar_type, type_elem, type_size,
+    FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param,
+    int_bits, is_compound, is_integer, is_signed, is_void, scalar_type, type_elem, type_size,
 };
 use crate::gen0::target::{PANIC_USED, message_kind, rt_panic_sym};
 use crate::middle::checkalloc::site_before_call;
@@ -266,8 +268,10 @@ pub fn emit_call_of(cx: sink *FnCtx, conv: CallConv, callee_value: i64, mark: i6
         let c = conv.c;
         var result_ptr = 0;
         if is_compound(ret) {
-            result_ptr = ir_slot_addr(cx, new_slot_for(cx, ret));
+            result_ptr = if RESULT_DEST != 0 { RESULT_DEST }
+                else { ir_slot_addr(cx, new_slot_for(cx, ret)) };
         }
+        RESULT_DEST = 0;
         let result_ty = if is_compound(ret) { 0 } else { ir_type(ret) };
         // (0.16: --check-alloc's allocation site, the arguments lowered)
         site_before_call(cx, n);
@@ -319,6 +323,87 @@ pub fn lower_check(cx: sink *FnCtx, ok: i64, kind: i64, a: i64, b: i64, c: i64, 
     ir_seal(cx, fail);
     CUR = fail;
     rt_panic_call(cx, kind, a, b, c, site, site_value);
+    ir_seal(cx, pass);
+    CUR = pass;
+}
+
+// (0.26.2, a prototype: $VOLE_PROTO_OVF=1) Whether the operators' overflow
+// checks are made (-1: not read yet).
+static var PROTO_OVF: i64 = -1;
+
+// (measuring only) $VOLE_PROTO_OVF_SKIP: the sites whose operations are
+// meant to wrap (what their source would write as `wrapping_*`), unchecked:
+// `LINE:COL` of the program's file or `<std>:LINE:COL`, separated by commas.
+static var PROTO_SKIP: Vec<u8, Comp> = Vec::new_in(Comp {});
+
+pub fn proto_ovf() -> bool {
+    if PROTO_OVF < 0 {
+        PROTO_OVF = if std::env::var_is_set("VOLE_PROTO_OVF") { 1 } else { 0 };
+        match std::env::var_os_in("VOLE_PROTO_OVF_SKIP", Comp {}) {
+            Option::Some(v) => {
+                PROTO_SKIP.extend_from_slice(v.as_slice());
+            }
+            Option::None => {}
+        }
+    }
+    PROTO_OVF == 1
+}
+
+fn proto_skipped(site: i64) -> bool {
+    let n = PROTO_SKIP.len();
+    if site <= 0 || n == 0 {
+        return false;
+    }
+    let in_std = within_std(FILES[SITE_FILE.get(site)].module);
+    var i = 0;
+    while i < n {
+        var j = i;
+        while j < n && PROTO_SKIP[j] != ',' {
+            j += 1;
+        }
+        var k = i;
+        var item_std = false;
+        if j - i > 6 && PROTO_SKIP[i] == '<' {
+            item_std = true;
+            k = i + 6;
+        }
+        var line = 0;
+        while k < j && PROTO_SKIP[k] != ':' {
+            line = line * 10 + (PROTO_SKIP[k] - '0') as i64;
+            k += 1;
+        }
+        k += 1;
+        var col = 0;
+        while k < j {
+            col = col * 10 + (PROTO_SKIP[k] - '0') as i64;
+            k += 1;
+        }
+        if item_std == in_std && line == SITE_LINE.get(site) && col == SITE_COL.get(site) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
+// (0.26.2, a prototype) The check that `a <op> b` (op Add, Sub, Mul, or Neg
+// with b 0) does not overflow integer type `ty` (a checker type): an OVF
+// and a branch to the panic when it holds. Made only with $VOLE_PROTO_OVF.
+pub fn lower_overflow_check(cx: sink *FnCtx, op: Op, ty: i64, a: i64, b: i64, site: i64) {
+    if !proto_ovf() || !is_integer(ty) {
+        return;
+    }
+    if op != Op::Add && op != Op::Sub && op != Op::Mul && op != Op::Neg || proto_skipped(site) {
+        return;
+    }
+    PANIC_USED = true;
+    let ovf = emit_ir(cx, Op::Ovf, TY_BOOL, a, b, (op as i64) | (ir_type(ty) << 8));
+    let pass = ir_new_block(cx);
+    let fail = ir_new_block(cx);
+    lower_branch(cx, ovf, fail, pass);
+    ir_seal(cx, fail);
+    CUR = fail;
+    rt_panic_call(cx, 0, 0, 0, 0, site, 0);
     ir_seal(cx, pass);
     CUR = pass;
 }
@@ -420,3 +505,8 @@ pub fn raw_check(cx: sink *FnCtx, n: i64, addr: i64, size: i64) {
         take_args(cx, call, mark);
     }
 }
+
+// (0.26.1) Where the next call's compound result is made (emit_call_of):
+// a place the places-IR lowering gives (its destination), or 0, a new
+// slot. Reset by the call.
+pub static var RESULT_DEST: i64 = 0;
