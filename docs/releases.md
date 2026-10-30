@@ -81,6 +81,14 @@ IR at `check`, struct fields private unless `pub`, and shaders as
 `embed wgsl` blocks. Built and tested on aarch64-macos only; Linux is
 untested in this release.
 
+- **The places IR, behind `--places`** (compiler/src/places,
+  [design/places-ir.md](design/places-ir.md)): every checked body as
+  typed locals, places with projections, temporaries, borrows and storage
+  markers. `--emit-places[=all]` prints it, `--verify-places` checks it
+  and names the bodies not built yet; `--time-passes` shows `places
+  (build)`. Off by default: the builder costs about 433M instructions at
+  `check` of compiler/src, over its 340M budget (§6's fallback rule).
+
 ### What's new in 0.25.5
 
 The last release before 0.26's rethink of the core semantics: no language
