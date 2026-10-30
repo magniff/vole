@@ -654,7 +654,7 @@ representation work below moves to 0.26.1.
 |---|---|
 | total at `check`, after step 7 | ≤ 0.26.0's, with the placeholders' 228M given back; the aim 5,000M (leaving 0.26.2's effects on the IR room: today's AST effects are 95M) |
 | -O1 build: IR to SSA in place of AST to SSA | ≤ 1,343M |
-| -O0 build: gen0 from the IR | ≤ 2,012M; -O0 total ≤ 1.05x of 8,896M |
+| -O0 build: gen0 from the IR | -O0 total ≤ 1.10x of the AST lowering's on the same source (the user, 2026-10-30: 1.05x is out of reach with every body built at a build; measured 1.26x at 35ee705c, code size at parity) |
 | RSS of `check` | ≤ 1.05x of 513 MB |
 
 **Measured in 0.26.0 (the fallback applied).** `tests/compile_cost.sh -r
