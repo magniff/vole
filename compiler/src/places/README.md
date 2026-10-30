@@ -17,7 +17,7 @@ From 0.26.1 both code generators read it.
 | `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
 | `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
 | `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` |
-| `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body packed in one allocation (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
+| `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body's six tables copied whole, each of its exact size (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
 | `shim.vl` | drop shims (0.26.1, R2, places-ir.md §3.9): `shim_of(t) -> id` made on demand, `shim_count()`, `build_shim(id)` (a body, `_1: &mut T`, B_FN -1 and B_SHIM id), `shim_fn_symbol(id)` (`$drop.G` and the type mangled) |
 | `front.vl` | what the IR reads of the checker's raw tables, one justified accessor each |
 | `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff`; `--keep-places` (keep the bodies, print them loaded back) and `--emit-shims` (with `--emit-places`: the shims the printed bodies' drops call, and theirs) |
@@ -152,6 +152,11 @@ code generators' agent (0.26.1) sees what moved.
   flag never set`). Before R5 and R6 it found 6,707 and 652 such lines
   over tests/run (196 sources); after, one (an XFAIL case's `v = v`
   through an inout).
+- 0.26.1 (the builder's cost at a build): keep.vl keeps a body's six
+  tables as typed copies (K_LOCALS .. K_TARGETS, extend_from_slice both
+  ways) instead of packing them field by field into words: a build of
+  compiler/src at -O0 under VOLE_LOWER=places, 10,157M instructions to
+  10,116M (-0.4%); its objects byte-identical at -O0 and -O2.
 
 ## `--places-diff`: the differences left
 
