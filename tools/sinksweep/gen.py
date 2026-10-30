@@ -23,7 +23,7 @@ PRELUDE = """\
 struct Leaf { opts: Vec<i64> }
 
 impl Leaf {
-    fn count(self) -> i64 { self.opts.len() }
+    fn count(self) -> i64 { self.opts.len() as i64 }
 }
 
 struct Tree { sizes: Vec<i64> }
@@ -35,7 +35,7 @@ impl Tree {
     fn sum(self) -> i64 {
         var s = 0;
         var i = 0;
-        while i < self.sizes.len() { s += self.sizes[i]; i += 1; }
+        while i < self.sizes.len() as i64 { s += self.sizes[i]; i += 1; }
         s
     }
     fn show(self) { println(f"{self.sum()} {self.sizes.len()}"); }
@@ -53,7 +53,7 @@ fn vec_of(gpa: Gpa, k: i64) -> Vec<i64> {
     v
 }
 fn leaf_of(gpa: Gpa, k: i64) -> Leaf { Leaf { opts: vec_of(gpa, k) } }
-fn size(leaf: Leaf) -> i64 { leaf.opts.len() }
+fn size(leaf: Leaf) -> i64 { leaf.opts.len() as i64 }
 fn grow(l: Leaf, gpa: Gpa) -> Leaf { var v = l.opts.clone(); v.push(9); Leaf { opts: v } }
 fn name_of(gpa: Gpa, k: i64) -> String {
     var s = String::new_in(gpa);
@@ -61,7 +61,7 @@ fn name_of(gpa: Gpa, k: i64) -> String {
     s
 }
 fn slen(s: String) -> i64 { s.len() as i64 }
-fn glen<T>(v: Vec<T>) -> i64 { v.len() }
+fn glen<T>(v: Vec<T>) -> i64 { v.len() as i64 }
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }
 fn tree_of(gpa: Gpa) -> Tree { Tree { sizes: vec_of(gpa, 1) } }
 """
