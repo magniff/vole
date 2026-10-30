@@ -183,6 +183,17 @@ code generators' agent (0.26.1) sees what moved.
   LF_SSA (keep.vl `mark_ssa`, run before `keep_body` at a build; the
   printer says `temp ssa`). Over compiler/src 98,251 of 149,332
   temporaries; the build's places phase +57M instructions.
+- 0.26.1 (the kept scan, for gen0): `mark_ssa` becomes `scan_kept`, one
+  walk over the body in reverse postorder before `keep_body`, kept with
+  it (K_SCAN) and put back by `load_body` (P_SCAN): the RPO
+  (`load_rpo` fills cfg's RPO and RPO_INDEX as compute_rpo would; it is
+  elaborate's when no block was added after, elab::RPO_CURRENT), each
+  local's mentions as gen0's scan_locals counts them (`scan_mentions`,
+  `scan_first`, `scan_last`, `scan_block`, `scan_written`,
+  `scan_order_count`, `scan_order`), its mentions as a list in walk
+  order (`scan_mention_head`, `_next`, `_at`, `_slot`: the operand's
+  number, -1 a whole write, -2 else), and LF_SSA, now over the RPO's
+  blocks only.
 
 ## `--places-diff`: the differences left
 
