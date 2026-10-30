@@ -84,10 +84,16 @@ untested in this release.
 - **The places IR, behind `--places`** (compiler/src/places,
   [design/places-ir.md](design/places-ir.md)): every checked body as
   typed locals, places with projections, temporaries, borrows and storage
-  markers. `--emit-places[=all]` prints it, `--verify-places` checks it
-  and names the bodies not built yet; `--time-passes` shows `places
-  (build)`. Off by default: the builder costs about 433M instructions at
-  `check` of compiler/src, over its 340M budget (§6's fallback rule).
+  markers, its drops elaborated per place (move paths, two dataflows,
+  flags, open drops). `--emit-places[=all]` prints it, `--verify-places`
+  checks it, `--places-diff` compares its drops with the own pass's (5
+  differences left over tests/run, each the IR's more precise, listed in
+  places/README.md), and a move-out backstop reports what the own pass
+  would let through (nothing over compiler/src and tests/run). New
+  directive `// PLACES:` in tests/run; `places_*` cases for the audit's
+  findings and families. Off by default: the builder costs about 430M
+  instructions at `check` of compiler/src, over its 340M budget (§6's
+  fallback rule); 0.26.1 makes it cheaper before turning it on.
 
 ### What's new in 0.25.5
 

@@ -31,10 +31,12 @@
 use crate::base::{SYMS, intern_c};
 use crate::base::comp::Comp;
 use crate::front::ast::{
-    BLOCK_TRANSPARENT, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
+    BLOCK_TRANSPARENT, CLOSURE_MOVE, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind,
+    child,
 };
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
+use crate::front::contracts::expand::is_pre_fn;
 use crate::front::lexer::Tok;
 use crate::front::own::byref::{ASSIGN_OLD, BYREF, MATCH_BYREF, NO_DROP, borrowed_call};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
@@ -103,6 +105,9 @@ static var UNIT_LOCAL: i64 = -1;
 static var CUR_F: i64 = -1;
 // Whether drops are placed (--values=error, as the own pass's).
 static var DROPS: bool = false;
+// Whether the struct literal being lowered is a by-access closure's env
+// (its values borrowed copies).
+static var AGG_BORROW: bool = false;
 // The symbols of the own pass's names the builder reads.
 static var SYM_TP: i64 = 0;
 static var SYM_TF: i64 = 0;
@@ -670,7 +675,14 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
             unsupported(e);
             return;
         }
+        // (a closure that is not `move` captures by access: its env's
+        // values are borrowed copies, the owner keeps them; an f-string's
+        // holes too)
+        let saved = AGG_BORROW;
+        AGG_BORROW = (NODES[e].c & CLOSURE_MOVE) == 0
+            && NODES[NODES[e].y].kind == NodeKind::StructLit;
         expr_into(NODES[e].y, dl, dp);
+        AGG_BORROW = saved;
         return;
     }
     if k == NodeKind::EnumPanic {
@@ -912,7 +924,20 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
             i = crate::front::ast::field_order(e, j);
             value = child(e, i);
         }
-        operand(value, true);
+        if AGG_BORROW {
+            // (only this literal's parts: not those of what they contain)
+            AGG_BORROW = false;
+            operand(value, true);
+            AGG_BORROW = true;
+            if OPK == OK_MOVE {
+                let t = new_temp(NODES[value].ty, value, true);
+                set_op(OK_COPY, OPA, OPB);
+                emit_use(t, 0, value);
+                set_op(OK_COPY, t, 0);
+            }
+        } else {
+            operand(value, true);
+        }
         if i >= 0 && i < n {
             OPSTACK[m + 3 * i] = OPK;
             OPSTACK[m + 3 * i + 1] = OPA;
@@ -1012,10 +1037,18 @@ fn lower_call(n: i64, dl: i64, dp: i64) {
     } else if f >= 0 && crate::arch::intrinsic_of_fn(f) >= 0 {
         ik = IK_ARCH;
     }
+    // (a requires clause's `$pre` companion reads its arguments in place:
+    // borrowed copies, the call's after it moves them)
+    let pre = f >= 0 && is_pre_fn(f);
     for i in 0..NODES[n].count {
         let arg = child(n, i);
         let mode = if f >= 0 { param_mode(f, i) } else { arg_mode_of(arg) };
-        lower_arg(i, arg, mode, c_callee);
+        lower_arg(i, arg, mode, c_callee || pre);
+        if pre && OPK == OK_COPY && !has_flag(OPA, LF_BORROWED) && has_glue(NODES[arg].ty) {
+            let t = new_temp(NODES[arg].ty, arg, true);
+            emit_use(t, 0, arg);
+            set_op(OK_COPY, t, 0);
+        }
         push_cur_op();
         if !reachable() {
             OPSTACK.truncate(m);
@@ -1127,13 +1160,17 @@ fn lower_assign(n: i64) {
 // read as `tmp = rhs; drop(p); p = move tmp` (§3.8). False when b is not
 // one.
 fn lower_own_assign(b: i64) -> bool {
-    if NODES[b].count < 2 || NODES[b].a != 0 {
+    // (the inner block is the outer's last statement, or its tail once
+    // checked; the assignment the inner's second statement, or its tail)
+    let tail = NODES[b].a;
+    let stmts = if tail != 0 { NODES[b].count } else { NODES[b].count - 1 };
+    if stmts < 1 {
         return false;
     }
     // (the right side's temporaries' preludes come first, drops.vl
     // temps_before: nothing for the IR)
     var j = 0;
-    while j < NODES[b].count - 1 && prelude_stmt(child(b, j)) {
+    while j < stmts - 1 && prelude_stmt(child(b, j)) {
         j += 1;
     }
     let first = child(b, j);
@@ -1144,20 +1181,39 @@ fn lower_own_assign(b: i64) -> bool {
     if npat == 0 || NODES[npat].kind != NodeKind::PatBind || NODES[npat].a != SYM_NEW {
         return false;
     }
-    let last = child(b, NODES[b].count - 1);
-    if NODES[last].kind != NodeKind::ExprStmt {
+    var inner = tail;
+    if inner == 0 {
+        let last = child(b, NODES[b].count - 1);
+        if NODES[last].kind != NodeKind::ExprStmt {
+            return false;
+        }
+        inner = NODES[last].a;
+    }
+    if inner == 0 || NODES[inner].kind != NodeKind::Block || NODES[inner].count < 1 {
         return false;
     }
-    let inner = NODES[last].a;
-    if inner == 0 || NODES[inner].kind != NodeKind::Block || NODES[inner].count != 2 {
-        return false;
-    }
+    // (`let =o = p;`, the own pass's implicit defer of `=o`, then `p =
+    // __own_new;`)
     let olet = child(inner, 0);
-    let ast = child(inner, 1);
-    if NODES[olet].kind != NodeKind::Let || NODES[ast].kind != NodeKind::ExprStmt {
+    var asg = NODES[inner].a;
+    var last_stmt = NODES[inner].count;
+    if asg == 0 {
+        let ast = child(inner, NODES[inner].count - 1);
+        if NODES[inner].count < 2 || NODES[ast].kind != NodeKind::ExprStmt {
+            return false;
+        }
+        asg = NODES[ast].a;
+        last_stmt -= 1;
+    }
+    for i in 1..last_stmt {
+        let d = child(inner, i);
+        if NODES[d].kind != NodeKind::Defer || (NODES[d].p & DEFER_IMPLICIT) == 0 {
+            return false;
+        }
+    }
+    if NODES[olet].kind != NodeKind::Let {
         return false;
     }
-    let asg = NODES[ast].a;
     let read = NODES[olet].c;
     if asg == 0 || NODES[asg].kind != NodeKind::Assign || read == 0
         || (NODES[read].p & ASSIGN_OLD) == 0 {
@@ -1172,7 +1228,7 @@ fn lower_own_assign(b: i64) -> bool {
     }
     expr_into(NODES[first].c, tmp, 0);
     // the hoisted indexes, in order
-    for i in j + 1..NODES[b].count - 1 {
+    for i in j + 1..stmts {
         lower_stmt(child(b, i));
     }
     if !reachable() {
@@ -1911,8 +1967,14 @@ fn let_borrows(pat: i64, init: i64) -> bool {
     if name == SYM_FOR_SEQ && init != 0 && is_place_expr(init) {
         return true;
     }
+    // (`let x = S;` of a static: it borrows, statics are never dropped)
+    if init != 0 && NODES[init].kind == NodeKind::Ident && NODES[init].res == Res::Static {
+        return true;
+    }
+    // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
+    // an operator's operand: a borrowed copy, as the own pass's let_drops)
     let text = SYMS[name].text;
-    text.len > 1 && text[0] == '=' && text[1] == '='
+    text.len > 0 && text[0] == '='
 }
 
 // ---- The body ----
@@ -1980,6 +2042,11 @@ pub fn build_body(f: i64, item: i64) -> bool {
 // borrowing iterator's item (a copy its container keeps), as the own
 // pass's param_drops.
 fn keep_params(f: i64) -> bool {
+    // (a `$pre` companion's parameters are its call's arguments, read in
+    // place: contracts::expand::is_pre_fn)
+    if is_pre_fn(f) {
+        return true;
+    }
     let t = crate::places::front::fn_template(f);
     if !crate::front::modules::within_std(crate::places::front::fn_module(t)) {
         return false;

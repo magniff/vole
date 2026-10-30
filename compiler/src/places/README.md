@@ -14,14 +14,18 @@ From 0.26.1 both code generators read it.
 | `cfg.vl` | predecessors, reverse postorder, immediate dominators of the body held |
 | `print.vl` | `--emit-places`: a body as text, what `// PLACES:` lines match |
 | `verify.vl` | `--verify-places`: the form, the places, the copy rule, `as V` dominance, storage |
-| `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build yet makes the body a fallback (`--verify-places` names it) |
+| `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
+| `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
+| `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` |
 | `front.vl` | what the IR reads of the checker's raw tables, one justified accessor each |
-| `mod.vl` | the driver (check_program calls `run_places`) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff` |
+| `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff` |
 
 In 0.26.0 the IR is built only under `--places` (or `--emit-places`,
-`--verify-places`, `--places-diff`): after step 2a its builder costs about
-433M instructions at `check` of compiler/src, over §6's 340M for all of
-step 2, so §6's fallback rule applies (the IR off by default).
+`--verify-places`, `--places-diff`; the tools' cache is not used with
+them): its builder costs about 430M instructions at `check` of
+compiler/src, over §6's 340M for all of step 2, so §6's fallback rule
+applies. `// PLACES:` lines in tests/run cases (`places_*`) match
+`check --emit-places --places-diff`'s output.
 
 One body is held at a time (`ir.vl`'s `P_*` tables), cleared and reused
 for the next.
@@ -53,3 +57,41 @@ code generators' agent (0.26.1) sees what moved.
 - 0.26.0 (step 2): RV_BINARY and RV_UNARY carry the operator (BO_*,
   UO_*) in d and the AST node in e; an AK_BOUNDS assert has two operands
   (index, length); RV_SLICE checks its bounds; struct_closure.
+- 0.26.0 (step 2): the copy rule also allows a copy whose root is a
+  BORROWED local (a borrowed copy passed on).
+- 0.26.0 (step 3): a DS_FLAG drop stays one statement, `drop(P) [flag
+  _f]` (d the flag, a LF_FLAG bool local): the code generators branch on
+  it. A DS_OPEN drop is followed by its parts' drops, each decided (an
+  enum's behind a switch on its discriminant, new blocks). A drop whose
+  place has no move path (through `*` or an index) is DS_KEPT as written.
+  A drop's e is the AST local it drops (-1 for an open drop's parts).
+  PJ_CONST of an owned array is a move path (`f()[1]` moved out).
+
+## `--places-diff`: the differences left
+
+Over compiler/src (142 locals compared) and every tests/run source
+(30,699 locals), after step 3a: none in compiler/src; 5 in tests/run,
+each where the IR is the more precise of the two (the own pass flags a
+drop the IR proves never runs):
+
+| case | local | own | IR | why |
+|---|---|---|---|---|
+| sem_own_match_arm_return `f` | `e` | under a flag | removed | `match e { E::A(d) => return .., E::N => {} }`: past the match `e` is `E::N`, which has nothing to drop |
+| sem_own_pat_arms_matrix `m_A_whole`, `m_B_whole`, `m_C_whole`, `m_N_whole` | `e` | under a flag | removed | every arm moves `e` or its owned payload: nothing is left at the end |
+
+Differences of form, not listed by `--places-diff` (diff.vl):
+
+- a flag beside parts apart: the own pass flags a whole enum whose
+  payload moved on some arms; the IR opens it and flags the payload;
+- a local the IR owns with no drop at all: no exit reaches it (every
+  path ends in a `!` call, `worker_exit`, `exit`); the own pass's
+  placeholder never runs either;
+- a statement temporary (`__own_tv`): the own pass drops it under its
+  run-time flag (`__own_tf`), with no placeholder to compare;
+- a requires call's argument `?aN`: the own pass drops the statement
+  temporary it holds, the IR the `?aN` it was moved into;
+- the IR's kept-at-some-exits, removed-at-others is the own pass's flag.
+
+The move-out backstop reports nothing over the same sources. As the own
+pass's move_out, it does not look at std's modules that move by bits
+(`std_moves_bits`), nor at a raw pointer's `p[i]`.

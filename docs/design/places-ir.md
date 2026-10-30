@@ -657,6 +657,31 @@ representation work below moves to 0.26.1.
 | -O0 build: gen0 from the IR | ≤ 2,012M; -O0 total ≤ 1.05x of 8,896M |
 | RSS of `check` | ≤ 1.05x of 513 MB |
 
+**Measured in 0.26.0 (the fallback applied).** `tests/compile_cost.sh -r
+5` with `--places` added, against the same compiler without it (both
+checking the branch's compiler/src):
+
+| point | check | IR's share | hello | std |
+|---|---|---|---|---|
+| after 2a (95% of bodies built) | 5,188M vs 4,755M | +433M | 108.8M vs 85.7M | 1,077M vs 1,052M |
+| after 2c (every body) | 5,197M vs 4,769M | +428M (the builder) | 109.2M vs 86.6M | 1,077M vs 1,051M |
+| after 3a (elaboration, flags, the backstop's record) | 5,439M vs 4,886M | +554M | 109.4M vs 87.0M | 1,090M vs 1,060M |
+
+So the builder alone is about 430M (340M budgeted) and elaboration with
+the backstop about 125M (125M budgeted, 100M + 25M): the IR runs only
+under `--places` in 0.26.0, and the representation work below moves to
+0.26.1, before default-on. `--time-passes` at 3a: places (build) about 50
+ms, places (elaborate) about 5 ms. The profile of the builder is flat:
+staging operands (OPSTACK, then copied into P_OPS) and Vec pushes are
+about 20% of it. Writing operands straight into P_OPS where the order
+allows is the first change to make; estimated 15-20% of the builder.
+
+`hello` at 1.27x with `--places`: the bodies of every std function a
+hello world checks (fmt, Buf, the allocator), about 23M. 0.26.1 needs
+bodies only for the functions emitted or checked for the program (std's
+reached ones built on demand, as the code generators ask), not all of
+std's checked ones.
+
 **How it stays cheap.**
 
 - One pass per function over the checked AST, in evaluation order, into
