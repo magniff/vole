@@ -371,12 +371,12 @@ run time and in constant folding, which agree):
   truncated (`1u8 << 9 == 0`, `1u8 << 33 == 2`); a negative amount is a
   large one (`1 << -1 == 1 << 63`). `>>` is arithmetic on signed types,
   logical on unsigned ones.
-- Float to integer conversion (`as`): NaN becomes 0; a signed target
-  saturates at its own bounds (`1e30 as i64 == i64::MAX`,
-  `3e9 as i32 == i32::MAX`); `u64` saturates at its maximum above it and
-  wraps below zero (`-5.0 as u64 == 2^64 - 5`, as through `i64`);
-  narrower unsigned targets take the low bits of the `i64` conversion
-  (`300.0 as u8 == 44`).
+- Float to integer conversion (`as`), as Rust's: the value truncated
+  toward zero, NaN becomes 0, and every target saturates at its own
+  bounds (`1e30 as i64 == i64::MAX`, `3e9 as i32 == i32::MAX`,
+  `300.7 as u8 == 255`, `-1.0 as u64 == 0`; before 0.26.2 an unsigned
+  target below `u64` took the low bits of the `i64` conversion and
+  `-5.0 as u64` was `2^64 - 5`).
 - Floating point is IEEE 754 double and single precision, without
   reassociation or contraction (no fast-math); comparisons with NaN are
   false, except `!=`, which is true.
