@@ -242,7 +242,7 @@ fn main() -> i32 {
 | `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
 | `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
 | `where T: Ord` | `<T: Ord>` |
-| `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |
+| `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children; fields too, 0.26); `pub(crate)` and `pub(super)` come in 0.26.2 |
 | `fn` inside a `fn` | items only at module level |
 | `macro_rules!`, `println!`, `vec!` | none: `println(f"{x}")` (0.15) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |

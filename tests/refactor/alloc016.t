@@ -18,7 +18,7 @@ $ fix --only alloc016 --dry-run
 @@ -47 +47 @@
 -    println(count(2));
 +    println(count(2, gpa));
-error fix.alloc016-manual: a write of field 'len' at main.vl:40:7: std's Vec is #[sealed] (0.16): its fields change only through its methods (push, clear, truncate, reserve, ...)
+error fix.alloc016-manual: a write of field 'len' at main.vl:40:7: std's Vec keeps its fields private (0.16): they change only through its methods (push, clear, truncate, reserve, ...)
 try: volec query show main.vl:40
 error fix.alloc016-manual: the default of parameter 'v' of crate::with allocates at main.vl:34:31, and a default has no allocator: take an Option and make the value in the body
 try: volec query show main.vl:34
@@ -28,5 +28,5 @@ error fix.alloc016-manual: crate::make needs an allocator (it allocates at main.
 try: volec query show main.vl:18
 [exit 1]
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe or unneeded-justified, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified or obsolete-attr, not 'nonsense'
 [exit 2]

@@ -328,7 +328,7 @@ check module_path_without_crate "$ok" "$out"
 # embed.*, text blocks and include_str; `embed.sh`, a script's name, is
 # not one.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run|field|attr)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

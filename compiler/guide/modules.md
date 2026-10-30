@@ -18,9 +18,34 @@ volec main.vl -o prog      # loads the modules main.vl names
 ## Visibility
 
 Every item is private to its module and the modules inside it unless
-`pub`. A struct's fields are as visible as the struct (no private
-fields). Methods are visible wherever their type is. A `pub mod` can be
-reached from outside its parent. `pub use a::b;` re-exports `b`.
+`pub`. So is a struct's field (0.26, Rust's rule): outside, reading,
+writing or borrowing a field not marked `pub` is `field.private`, and a
+literal needs every field visible (`field.literal-private`; a struct
+with a private field is made by its module's functions). On your own
+field the help is its declaration with `pub`, which `volec fix --only
+pub` writes. Methods are visible wherever their type is. A `pub mod` can
+be reached from outside its parent. `pub use a::b;` re-exports `b`.
+`pub(crate)` and `pub(super)` come in 0.26.2.
+
+```vole
+mod geo {
+    pub struct Rect { pub w: i64, h: i64 }
+    impl Rect {
+        pub fn new(w: i64, h: i64) -> Rect { Rect { w: w, h: h } }
+        pub fn area(self) -> i64 { self.w * self.h }
+    }
+}
+
+fn main() -> i32 {
+    let r = geo::Rect::new(3, 4);     // not `geo::Rect { w: 3, h: 4 }`: h is private
+    std::print_int(r.w + r.area());   // r.w is pub; r.h would be field.private
+    println("");
+    0
+}
+```
+```out
+15
+```
 
 ## Paths and use
 

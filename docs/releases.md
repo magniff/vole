@@ -81,6 +81,35 @@ IR at `check`, struct fields private unless `pub`, and shaders as
 `embed wgsl` blocks. Built and tested on aarch64-macos only; Linux is
 untested in this release.
 
+Private fields (privfields260, plan §1 k):
+
+- Breaking: a struct's fields are private to the module that declares
+  it (and the modules inside it) unless marked `pub`, Rust's rule.
+  Outside, a read, a write or a borrow of a private field is
+  `error[field.private]`, and a struct literal that names one is
+  `error[field.literal-private]`; a struct with no fields has its
+  literal anywhere, enum variants' fields stay public, and what the
+  compiler writes itself (main's `Gpa {}`, structural `==`, derives,
+  closures, f-strings) is let through. std's modules are modules like
+  any (0.20's exception, std as one module, is gone). On a program's own
+  field the help is its declaration with `pub`, and `volec fix --only
+  pub` (or `--suggested`) writes the `pub`s; `v.len` on a `Vec` still
+  reads as `v.len()`. `volec explain field.private`,
+  `field.literal-private`.
+- `#[sealed]` is that rule, so it changes nothing: `warning[attr.obsolete]`,
+  and `volec fix --only obsolete-attr` deletes it. std has none left;
+  `Gpa` holds a private zero-sized field (`_private: ()`: still size 0,
+  a `Vec` on it three words), so no program writes `Gpa {}`.
+- The migration, `pub` on the fields read across modules: 165 in
+  std::gpu::wgsl, 47 in the rest of std (std::sys's C structs,
+  `SendError.value`), 286 in compiler/src, 63 in the examples, 6 in
+  tests/. std's `Atomic { v: 0 }` and
+  `RawLock { .. }` statics are `AtomicU64::new(0)` and `RawLock::new()`
+  (constant calls), and so must a program's be (`static N: AtomicI64 =
+  AtomicI64::new(0)`). std::gpu::wgsl's `pub` fields are provisional:
+  0.26.2's `pub(crate)` may narrow them. `pub(crate)`, `pub(super)` and
+  `pub(in path)` come in 0.26.2.
+
 ### What's new in 0.25.5
 
 The last release before 0.26's rethink of the core semantics: no language
