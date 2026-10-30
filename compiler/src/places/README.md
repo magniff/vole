@@ -14,7 +14,7 @@ From 0.26.1 both code generators read it.
 | `cfg.vl` | predecessors, reverse postorder, immediate dominators of the body held |
 | `print.vl` | `--emit-places`: a body as text, what `// PLACES:` lines match |
 | `verify.vl` | `--verify-places`: the form, the places, the copy rule, `as V` dominance, storage |
-| `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
+| `build.vl` | the builder: a checked body to the IR, in evaluation order, its temporaries and assignment drops its own (0.26.2), reading the own pass's nodes as what they stand for; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
 | `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
 | `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` |
 | `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body's six tables copied whole, each of its exact size (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
@@ -183,6 +183,30 @@ code generators' agent (0.26.1) sees what moved.
   LF_SSA (keep.vl `mark_ssa`, run before `keep_body` at a build; the
   printer says `temp ssa`). Over compiler/src 98,251 of 149,332
   temporaries; the build's places phase +57M instructions.
+
+- 0.26.2 (step 7, the builder's own temporaries and assignment drops):
+  a temporary the builder makes for a value (`value_temp`: an operand, a
+  place for `&e`, a field or a receiver of a value, a scrutinee) drops at
+  the end of its statement's scope (`temp_home`, R5's rule: a statement,
+  or the block for a tail and a `let` that may view it; not an arm, a
+  guard, a loop, nor a checker's desugaring of an expression, a block
+  whose first `let`s bind its hidden `=` names), with no storage markers
+  when that is not the innermost scope; its drop and storage end are
+  registered once it holds its value, so the temporaries it was made of
+  drop after it. A temporary its branches make of a local declared in an
+  argument lent to a let parameter (drops.vl hold_args) drops with the
+  call's statement (`LENT_HOME`). An owned assignment in a statement's
+  place is `tmp = v; drop(p); p = move tmp` from the assignment as
+  written (`lower_assign_at`; drops.vl's hoist_indexes leaves the
+  original's indexes as written). The own pass's NODE_TEMP blocks are
+  read as the `&e` or `e` they stand for (`own_temp_block`) and its
+  assignment blocks as the assignment (byref.vl `own_assign_of`), which
+  decides whether it drops until step 7; `--places-diff` reports each
+  assignment where the builder's rule (`drops_old`) decides otherwise
+  (none over compiler/src and tests/run). The R5 tables (TEMP_SCOPES,
+  TV_SCOPE) are gone; the printed IR has `temp` locals where it had
+  `__own_tv` ones, and fewer removed drops (a temporary is not dropped on
+  an exit taken before it holds its value).
 
 ## `--places-diff`: the differences left
 

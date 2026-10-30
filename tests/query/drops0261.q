@@ -7,9 +7,9 @@ $ drops main.vl:22
 drops0261/main.vl:22 in pick
   31:13  drop(_12) [kept]  t: D
   34:5  drop(_12) [kept]  t: D
-  35:33  drop(_21) [removed]  a temporary (35:22): D
   35:33  drop(_20) [open]  a temporary (35:18): (D, D)
   35:33  drop(_20.1) [kept]  a temporary (35:18): D
+  35:33  drop(_21) [removed]  a temporary (35:22): D
   37:1  drop(_22) [kept]  x: D
   37:1  drop(_5) [kept]  all: Vec<D>
   37:1  drop(_4) [removed]  b: D

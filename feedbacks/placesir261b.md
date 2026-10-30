@@ -16,8 +16,12 @@
 - ir: predecessor lists start small (db652f8b); gen0's analyses in one
   pass, a types-only scan, labels only where jumped to.
 
-Left: step 6 (places by default). It is ready, but it waits on the -O0
-cost bar (the total at most 1.10x the AST walk's); see Verdict.
+- step 6, places by default at every level (fb114599), the bar for -O0
+  set at 1.15x (the gate's measure: 1.132x); two bugs the Book found on
+  the flipped build fixed (7a640e96: a unit argument evaluated twice,
+  check-alloc's drop sites).
+
+Left: step 8 (the AST lowerings deleted), in 0.26.2 with A2's step 7.
 
 ## Verdict
 
