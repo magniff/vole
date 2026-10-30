@@ -27,6 +27,7 @@ use crate::front::lexer::Tok::{
     Import, Int, LBrace, LBracket, LParen, Lt, Mod, Plus, Pub, RBrace, RBracket, RParen, Reserved,
     Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
 };
+use crate::front::modules::vis::{VIS_TOK, note_vis, restricted_at, restriction_end, self_only};
 use crate::front::parser::{
     BODY_FAILED, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
     expect_ident, prev_end, reserved_error, syntax_error, tok_kind,
@@ -43,7 +44,9 @@ use crate::front::parser::items::attrs::{
     INTRINSIC_PENDING, check_fn_attributes, parse_fn_attribute, parse_fn_attributes,
     take_effect_decls,
 };
-use crate::front::parser::items::params::parse_params;
+use crate::front::parser::items::params::{
+    WHERE_OUTER, begin_impl_params, end_impl_params, parse_params, parse_where,
+};
 use crate::front::parser::stmts::parse_block;
 use crate::front::parser::types::{is_int_type_name, parse_bound, parse_type};
 use crate::front::threadlocal::STATIC_THREAD_LOCAL;
@@ -53,7 +56,8 @@ use crate::tools::fix::note_obsolete_attr;
 // the program's list.
 pub fn parse_top_item() {
     unsafe {
-        let public = eat(Pub);
+        crate::front::modules::vis::VIS_TOK = -1;
+        let public = parse_vis();
         if at(Impl) {
             // The functions of an impl block are items of the program.
             parse_impl(false);
@@ -121,7 +125,37 @@ pub const ITEM_PUBLIC: i64 = 1;
 fn mark_public(item: i64, public: bool) {
     if public {
         NODES[item].p |= ITEM_PUBLIC;
+        // (0.26.2: `pub(crate)`, ..., read by parse_vis)
+        if VIS_TOK >= 0 {
+            note_vis(item, VIS_TOK);
+        }
     }
+}
+
+// (0.26.2) `pub`, `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`
+// at the cursor: whether the item is public (`pub(self)` is private); a
+// restriction is left in VIS_TOK for mark_public (-1: plain `pub`). With
+// no `pub` here, VIS_TOK is left as it was (`pub #[inline] fn`).
+pub fn parse_vis() -> bool {
+    if !at(Pub) {
+        return false;
+    }
+    let p = P;
+    advance();
+    if !restricted_at(p) {
+        VIS_TOK = -1;
+        return true;
+    }
+    let end = restriction_end(p);
+    while P < end && !at(Eof) {
+        advance();
+    }
+    if self_only(p) {
+        VIS_TOK = -1;
+        return false;
+    }
+    VIS_TOK = p;
+    true
 }
 
 fn parse_item() -> i64 {
@@ -159,6 +193,9 @@ fn parse_impl(public: bool) {
             error_at(NODES[self_type].start,
                 c"impl blocks are for named types (structs and enums)");
         }
+        parse_where(params, 0);
+        let saved_outer = WHERE_OUTER;
+        WHERE_OUTER = params;
         let fns = SCRATCH.count;
         expect(LBrace);
         while !at(RBrace) && !at(Eof) {
@@ -171,7 +208,8 @@ fn parse_impl(public: bool) {
             }
             let attrs_start = cur_start();
             let flags = parse_fn_attributes();
-            let item_public = eat(Pub) || public;
+            crate::front::modules::vis::VIS_TOK = -1;
+            let item_public = parse_vis() || public;
             if !at(Fn) && !(at(Unsafe) && tok_kind(1) == Fn) {
                 if flags != 0 {
                     error_at(attrs_start, c"#[inline] and #[cold] go before a function");
@@ -196,6 +234,7 @@ fn parse_impl(public: bool) {
             list_push(f);
         }
         expect(RBrace);
+        WHERE_OUTER = saved_outer;
         let assoc = take_assoc_types(fns, impl_start);
         if trait_name != 0 {
             let n = new_node(NodeKind::Impl, impl_start, prev_end());
@@ -278,6 +317,7 @@ fn parse_trait() -> i64 {
     NODES[n].a = expect_binding_name();
     // (0.15: `trait From<T>`)
     NODES[n].g = parse_generic_params(false);
+    parse_where(NODES[n].g, 0);
     expect(LBrace);
     let mark = list_begin();
     while !at(RBrace) && !at(Eof) {
@@ -309,10 +349,13 @@ fn parse_trait() -> i64 {
         NODES[f].a = expect_binding_name();
         NODES[f].g = parse_generic_params(false);
         expect(LParen);
+        let owner = begin_impl_params(f);
         parse_params(f, false);
+        end_impl_params(f, owner);
         no_param_defaults(f, c"a trait function");
         expect(RParen);
         NODES[f].b = parse_return_type();
+        parse_where(NODES[f].g, NODES[n].g);
         // (0.18: requires/ensures)
         parse_clauses(f);
         if !eat(Semi) {
@@ -419,6 +462,7 @@ fn parse_enum() -> i64 {
     let n = new_node(NodeKind::Enum, start, 0);
     NODES[n].a = expect_binding_name();
     NODES[n].g = parse_generic_params(true);
+    parse_where(NODES[n].g, 0);
     expect(LBrace);
     let mark = list_begin();
     while !at(RBrace) && !at(Eof) {
@@ -501,9 +545,14 @@ pub fn parse_function() -> i64 {
     NODES[n].a = expect_binding_name();
     NODES[n].g = parse_generic_params(false);
     expect(LParen);
+    let owner = begin_impl_params(n);
     parse_params(n, false);
+    end_impl_params(n, owner);
     expect(RParen);
     NODES[n].b = parse_return_type();
+    // (0.26.2) `where T: Display` (an impl's function: also the impl's
+    // parameters, WHERE_OUTER)
+    parse_where(NODES[n].g, WHERE_OUTER);
     // (0.18: requires/ensures, front/parser/clauses.vl)
     parse_clauses(n);
     // (0.19) A declaration of std::arch's (arch/virtual.vl): `;` for
@@ -767,12 +816,11 @@ fn parse_attributed_item(public: bool) -> i64 {
                 error_at(NODES[derives].start,
                     c"expected the traits to derive: '#[derive(Eq, Ord, Hash, Debug, Clone)]'");
             }
-            if !at(Struct) && !at(Enum)
-                && !(at(Pub) && (tok_kind(1) == Struct || tok_kind(1) == Enum)) {
-                error_at(NODES[derives].start, c"#[derive(...)] goes before a struct or an enum");
-            }
         }
-        let item_public = eat(Pub) || public;
+        let item_public = parse_vis() || public;
+        if derives != 0 && !at(Struct) && !at(Enum) {
+            error_at(NODES[derives].start, c"#[derive(...)] goes before a struct or an enum");
+        }
         if thread_local {
             if fn_flags != 0 || repr || derives != 0 || struct_flags != 0 {
                 error_at(at_start, c"#[thread_local] takes no other attribute");
@@ -885,13 +933,15 @@ fn parse_struct() -> i64 {
     }
     NODES[n].a = expect_binding_name();
     NODES[n].g = parse_generic_params(true);
+    parse_where(NODES[n].g, 0);
     expect(LBrace);
     let mark = list_begin();
     while !at(RBrace) && !at(Eof) {
         let field_start = cur_start();
         // `pub` (0.5) is allowed: a field is visible wherever its struct is
         // (0.16: of a #[sealed] struct, only the `pub` ones outside its module).
-        let public = eat(Pub);
+        crate::front::modules::vis::VIS_TOK = -1;
+        let public = parse_vis();
         let field = new_node(NodeKind::Field, field_start, 0);
         // (0.16: what a #[sealed] struct shows outside its module)
         mark_public(field, public);

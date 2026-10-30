@@ -58,7 +58,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     v.sort();                          // or sort(v.as_mut_slice())
     var p = P { x: 1 };
     p.bump();                          // a receiver needs no &; p must be var
-    println(f"{p.get()} {v:?} {total(v)}");   // f-strings; total(v) only reads
+    println("{} {v:?} {}", p.get(), total(v)); // f-strings; total(v) only reads
     var all: Vec<Vec<i64>> = Vec::new_in(gpa);
     keep(&all, v);                     // v moved into keep: dead from here
     let s = "hi";
@@ -72,7 +72,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     let z = 0;
-    println(f"{~0u8} {7 / z} {m.get("k").unwrap()}");   // ~x; x / 0 == 0
+    println("{} {} {}", ~0u8, 7 / z, m.get("k").unwrap()); // ~x; x / 0 == 0
     unsafe { c::puts(c"from C"); }     // C calls need unsafe; c"..": a NUL-terminated *u8
     if z != 0 { panic("z"); }          // exit 101; unreachable()
     0
@@ -91,7 +91,7 @@ Also: lengths and indices are `i64` (`usize` is a type of its own, not
 `u64`); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
 to take what it captures), `impl Trait for T`, `T: Trait`,
-`#[derive(Eq, Debug)]`; no `dyn`, `where`, `Box`. A let or inout
+`#[derive(Eq, Debug)]`, `where T: Ord` and `x: impl Display` (0.26.2); no `dyn`, `Box`. A let or inout
 parameter is used as the value itself: `n + 1`, `out = acc`, `p.x`
 (`*` is only for raw `*T` pointers, which need `unsafe`). `inout r =
 &st;` names an access to pass on: `f(&r)`, `g(&r)`. `match e` on a let
@@ -127,15 +127,15 @@ fn main(gpa: Gpa) -> i32 {
         seen.insert(name, qty);                // also contains(k), remove(k)
     }
     items.sort_by(|a, b| b.qty - a.qty);       // a, b: Item (let); < 0: a first
-    for (i, it) in items.iter().enumerate() { print(f"{i}:{it.name} "); }
+    for (i, it) in items.iter().enumerate() { print("{i}:{} ", it.name); }
     let line = trim(sc.next_line().unwrap());  // the rest of the line
     let total = split_in(line, ',', gpa).iter()
         .map(|w| parse_int(trim(w)).unwrap_or(0)).sum();
     match seen.get("pen") {                    // Option<i64>
-        Some(q) => println(f"pen={q} total={total}"),
+        Some(q) => println("pen={q} total={total}"),
         None => println("no pen"),
     }
-    let text = format_in(f"{items.len()} {seen.len()}", gpa);   // a Buf
+    let text = format_in("{} {}", items.len(), seen.len(), gpa); // a Buf
     println(text.as_slice());                  // text, seen, items, input: dropped at the end
     0
 }

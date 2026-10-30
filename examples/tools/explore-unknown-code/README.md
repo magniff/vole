@@ -267,17 +267,17 @@ guide answers from its own text:
 
 ```console
 $ volec guide --find 'spec width align' --budget 900 | head -11
-# formatting#f-strings
-- `{{` and `}}` are a brace; the text takes a string's escapes.
-- A hole holds any expression but a top-level `:` (parenthesize it);
-  string literals work in it (`{m.get("k"):?}`); f-strings do not nest.
-- The holes are evaluated where the f-string is written, once, left to
-  right; the value holds copies, so it can be stored and printed later.
-- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c|e|E]`:
-  `<` and `>` align (numbers go right by default, text left), `0` pads
-  with zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex,
-  `b` binary, `c` a `u8` as its byte (a `u8` is a number otherwise),
-  `e`/`E` a float with an exponent (0.20: `1.5e3`).
+# formatting#format-strings
+`{name:spec}`, `spec = [[fill]align][+][#][0][width][.precision][type]`:
+`<` `^` `>` align (numbers go right by default, text left) with any fill
+byte (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b` (and `0`
+pads after them), `0` pads a number with zeros after its sign, the width
+and the precision are digits, `N$`, `name$` (precision also `*`: the
+next argument), `.N` gives a float N decimals and cuts text to N; the
+type is `?` Debug (`x?`, `X?` with hex numbers), `x`/`X` hex, `o` octal,
+`b` binary, `e`/`E` an exponent (`1.5e3`), `p` a pointer as `0x..`, and
+vole's `c`, a `u8` as its byte (a `u8` is a number otherwise). `{:#?}`,
+Debug over several lines, is not in this release.
 ```
 
 And the fix's condition, tried on a snippet before it goes in (`try`

@@ -68,7 +68,6 @@ fn main() -> i32 {
     add(&st, 5);
     add(&st, 7);
     let p = unsafe { malloc(3 * 8) as *i64 };
-    defer { unsafe { free(p as *u8); } }
     unsafe {
         p[0] = 1;
         p[1] = 2;
@@ -77,6 +76,7 @@ fn main() -> i32 {
     let raw = unsafe { p[0..3] };     // a slice of raw memory: valid while p is
     std::print_int(st.sum + unsafe { total(p, 3) } + raw[2]);
     println("");
+    unsafe { free(p as *u8); }        // raw is not used after
     0
 }
 ```

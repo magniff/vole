@@ -156,7 +156,7 @@ let d = unsafe { c::opendir(cdir.as_slice().ptr) };
 if d == 0 as *c::DIR {
     return None;
 }
-defer unsafe { c::closedir(d); };
+let _dir = Dir { d };
 loop {
     let ent = unsafe { c::readdir(d) };
     if ent == 0 as *c::dirent {
@@ -168,7 +168,17 @@ loop {
 ```
 
 `DIR` is whatever the header says it is; the program only holds a
-pointer. `defer` closes the directory on every way out of the function.
+pointer. `Dir` is a guard: its `Drop` calls `closedir`, so the directory
+is closed on every way out of the function:
+
+```tach
+struct Dir { d: *c::DIR }
+
+impl Drop for Dir {
+    fn drop(inout self) { unsafe { c::closedir(self.d); } }
+}
+```
+
 `d_name` is a `char` array inside the struct: `&ent.d_name as *u8` is its
 address, a C string. `readdir` returns names in the file system's order,
 so the entries are sorted with a closure:
@@ -233,7 +243,7 @@ a read-only `c"..."` literal.
   `volec guide c-interop`
 - `unsafe fn` with a contract (a generic one, `zeroed<T>`), raw pointers, `&x as *u8`:
   `volec guide unsafe`
-- `defer` for C resources, `Buf` and its drop: `volec guide memory`
+- a guard with `Drop` for C resources, `Buf` and its drop: `volec guide memory`
 - `Option` at the boundary, `{x:?}` on an `Option<Buf>`:
   `volec guide conversions`, `volec guide formatting`
 - `sort_by`, `filter`, `map`, `sum` with closures:

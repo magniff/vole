@@ -1,0 +1,1139 @@
+// Format literals (0.26.2; docs/grammar.md, "Formatting"): a plain string
+// literal (a text block and `r"..."` too) is a Rust format string where it
+// is the first argument of one of std's format functions (the closed table
+// of format_kind): `println("{} {x:>4}", a.b)`, `format_in("{}", v, gpa)`.
+// format_call parses it before any argument is typed, so it knows the
+// holes and which arguments they take, and makes of the literal and its
+// arguments the Interp node an f-string makes (check/interp.vl lowers it):
+// its holes the arguments' expressions (or Ident nodes for the names in
+// the text, at their positions), so direct_call, the effects, the own pass
+// and both IRs see what they see of an f-string.
+//
+// The grammar is Rust's std::fmt: `{}`, `{0}`, `{name}`, each with an
+// optional `:spec`, `{{` and `}}` for braces;
+//
+//   spec = [[fill]align][sign]['#']['0'][width]['.' precision][type]
+//
+// align `<` `^` `>`, sign `+` (`-` is accepted and means nothing), width
+// and precision an integer, `N$` or `name$`, precision `*` too; type `?`,
+// `x?`, `X?`, `x`, `X`, `o`, `b`, `e`, `E`, `p`, and vole's `c` (a u8 as
+// its byte). Arguments are positional or named (`name = expr`), each
+// evaluated once, left to right; one never used, or one a hole asks and
+// the call lacks, is format.args. An expression in a hole is
+// format.expr-hole, whose fix moves it to an argument.
+//
+// When every argument is used once, as a value, in the order written (what
+// `fix --only fstring` writes), the holes are the arguments themselves:
+// the lowering is the f-string's. Otherwise each argument is first an
+// evaluated-only hole (HOLE_EVAL), in order, and the holes that use it
+// read its value (HOLE_ALIAS: the `=fK` of that hole).
+
+use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, intern};
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help};
+use crate::front::ast::{
+    FMT_BIN, FMT_CHAR, FMT_EXP, FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES, NodeKind,
+    child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::CUR_FN;
+use crate::front::lexer::{add_string, str_at};
+use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::types::{FNS, FN_COUNT};
+
+// Flags of a hole beyond the f-string's (std/fmt.vl's Fmt has the same
+// values): `^`, `+`, `#`, `o`; FMT_PTR (`p`) is the checker's: the hole is
+// written as an address, `0x..`.
+pub const FMT_CENTER: i64 = 1024;
+pub const FMT_PLUS: i64 = 2048;
+pub const FMT_ALT: i64 = 4096;
+pub const FMT_OCT: i64 = 8192;
+pub const FMT_PTR: i64 = 16384;
+
+// An InterpHole's b: HOLE_DEBUG (`?`), its fill byte (0: a space) at
+// HOLE_FILL, HOLE_EVAL (an argument only evaluated, not written), and
+// the hole it reads (+ 1) at HOLE_ALIAS.
+pub const HOLE_DEBUG: i64 = 1;
+const HOLE_FILL: i64 = 2;
+pub const HOLE_EVAL: i64 = 512;
+const HOLE_ALIAS: i64 = 1024;
+
+pub fn hole_debug(h: i64) -> bool {
+    (NODES[h].b & HOLE_DEBUG) != 0
+}
+
+pub fn hole_fill(h: i64) -> i64 {
+    (NODES[h].b / HOLE_FILL) & 255
+}
+
+pub fn hole_eval_only(h: i64) -> bool {
+    (NODES[h].b & HOLE_EVAL) != 0
+}
+
+// The hole (its index among the Interp's holes) hole h reads, -1: none.
+pub fn hole_alias(h: i64) -> i64 {
+    NODES[h].b / HOLE_ALIAS - 1
+}
+
+// The kinds of format function.
+const FK_PRINT: i64 = 1;
+const FK_FORMAT_IN: i64 = 2;
+const FK_PANIC: i64 = 3;
+const FK_ASSERT: i64 = 4;
+const FK_DEBUG_ASSERT: i64 = 5;
+const FK_METHOD: i64 = 6;
+
+// Which format function f is (its template; `method`: called as one): 0
+// for none. print, println, eprint, eprintln, format_args; format_in;
+// panic; assert, debug_assert; and the methods Buf::push_fmt,
+// String::push_fmt, Fmt::write.
+fn format_kind(f: i64, method: bool) -> i64 {
+    // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
+    // SAFETY: f >= 0 is the called function's index (the caller's), below FN_COUNT.
+    let info = unsafe { FNS[f] };
+    if STD_MODULE < 0 || !within_std(info.module) || info.node <= 0 {
+        return 0;
+    }
+    let name = SYMS[NODES[info.node].a].text;
+    if method {
+        let owner = NODES[info.node].d;
+        let ty = if owner > 0 { SYMS[owner].text } else { "" };
+        if name == "push_fmt" && (ty == "Buf" || ty == "String") || name == "write" && ty == "Fmt" {
+            return FK_METHOD;
+        }
+        return 0;
+    }
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln"
+        || name == "format_args" {
+        FK_PRINT
+    } else if name == "format_in" {
+        FK_FORMAT_IN
+    } else if name == "panic_str" {
+        FK_PANIC
+    } else if name == "assert" {
+        FK_ASSERT
+    } else if name == "debug_assert" {
+        FK_DEBUG_ASSERT
+    } else {
+        0
+    }
+}
+
+// Whether node n is a plain string literal (`"..."`, a text block,
+// `r"..."`): not an f-string, a C string, nor include_str's text.
+pub fn is_format_literal(n: i64) -> bool {
+    if NODES[n].kind != NodeKind::Str || NODES[n].b != 0 || NODES[n].end <= NODES[n].start {
+        return false;
+    }
+    let c = SRC[NODES[n].start];
+    c == '"' || c == 'r'
+}
+
+// (0.26.2) For `fix --only fstring` (tools/fix/fstring.vl), when
+// RECORD_SITES: the f-strings and the plain literals with braces the
+// checker saw, as pairs (position, kind): SITE_FORMAT, a format
+// function's format argument (a contract's `else` message too);
+// SITE_CHECKED, an f-string anywhere else.
+pub static var RECORD_SITES: bool = false;
+pub static var FORMAT_SITES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub const SITE_FORMAT: i64 = 1;
+pub const SITE_CHECKED: i64 = 2;
+
+// Node n (an f-string, `f"..."`, or a plain literal) recorded as a site
+// of `kind`: an f-string the parser made, a literal at a format position
+// that has a brace.
+pub fn note_site(n: i64, kind: i64) {
+    if !RECORD_SITES || n <= 0 {
+        return;
+    }
+    let k = NODES[n].kind;
+    let p = NODES[n].start;
+    if k == NodeKind::Interp && SRC[p] == 'f'
+        || k == NodeKind::Str && kind == SITE_FORMAT && is_format_literal(n) && has_brace(n) {
+        FORMAT_SITES.push(p);
+        FORMAT_SITES.push(kind);
+    }
+}
+
+// The std function `name` of std's root and its modules (a template), -1:
+// none.
+fn std_fn(name: [u8]) -> i64 {
+    for f in 0..FN_COUNT {
+        // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
+        // SAFETY: f < FN_COUNT, the table's length.
+        let info = unsafe { FNS[f] };
+        if info.tmpl == 0 && info.node > 0 && within_std(info.module)
+            && SYMS[NODES[info.node].a].text == name {
+            return f;
+        }
+    }
+    -1
+}
+
+static var PANIC_FMT: i64 = -2;
+static var ASSERT_FMT: i64 = -2;
+
+// Call n of function f (its named arguments not yet put in order;
+// `method`: a method call, its receiver apart): when f is a format
+// function and its format argument is a literal, the literal and its
+// arguments are made one Interp node, in its place (format_in's allocator
+// stays last). `panic` and `assert` with holes call std's __panic_fmt and
+// __assert_fmt, which format into 256 bytes on the stack (decision 5);
+// that function is returned, else f. A format argument that is not a
+// literal is a plain value (`println(s)`); arguments after it are
+// format.args.
+pub fn format_call(n: i64, f: i64, method: bool) -> i64 {
+    if f < 0 {
+        return f;
+    }
+    let k = format_kind(f, method);
+    if k == 0 {
+        return f;
+    }
+    let at = if k == FK_ASSERT || k == FK_DEBUG_ASSERT { 1 } else { 0 };
+    // (the positional arguments; vole's named ones, `at: ..`, are apart)
+    var count = 0;
+    while count < NODES[n].count && !vole_named(child(n, count)) {
+        count += 1;
+    }
+    if count <= at {
+        return f;
+    }
+    let lit = child(n, at);
+    let last = if k == FK_FORMAT_IN { count - 1 } else { count };
+    // (a plain literal with arguments after it is a format string already)
+    if last <= at + 1 || NODES[lit].kind != NodeKind::Str {
+        note_site(lit, SITE_FORMAT);
+    }
+    // (panic and assert: what follows a message that is no literal, or has
+    // no brace, is their own `at`)
+    let own_at = k >= FK_PANIC && k <= FK_DEBUG_ASSERT;
+    if !is_format_literal(lit) {
+        if !own_at && last > at + 1 && NODES[lit].kind != NodeKind::Interp {
+            args_error(NODES[child(n, at + 1)].start, "a format string is a literal: this argument has no hole to go to", "write the text where the format string goes, '\"{}\"', or format it first: 'format_args(\"{}\", x)'");
+            // (the arguments left out: no error of the call's arity)
+            let mark = list_begin();
+            for i in 0..at + 1 {
+                list_push(child(n, i));
+            }
+            for i in last..NODES[n].count {
+                list_push(child(n, i));
+            }
+            list_end(n, mark);
+        }
+        return f;
+    }
+    if own_at && !has_brace(lit) {
+        return f;
+    }
+    // (after an error, the literal alone: no error of the call's arity)
+    var made = make_format(lit, n, at + 1, last);
+    if made == 0 {
+        made = lit;
+    }
+    // The call's arguments: those before the literal, the Interp, the
+    // allocator, vole's named ones.
+    let mark = list_begin();
+    for i in 0..at {
+        list_push(child(n, i));
+    }
+    list_push(made);
+    for i in last..NODES[n].count {
+        list_push(child(n, i));
+    }
+    list_end(n, mark);
+    if NODES[made].kind != NodeKind::Interp {
+        return f;
+    }
+    if k == FK_PANIC || k == FK_ASSERT || k == FK_DEBUG_ASSERT {
+        return panic_call(n, f, k);
+    }
+    f
+}
+
+// Whether argument a is one of vole's named arguments, `at: x`.
+fn vole_named(a: i64) -> bool {
+    NODES[a].kind == NodeKind::NamedArg && NODES[a].c == 0
+}
+
+// panic or assert call n (k) whose message has holes: std::__panic_fmt
+// (message, at) or std::__assert_fmt(ok, message, at), `at` the call's
+// FILE:LINE:COL as panic_site gives panic's; debug_assert without
+// --debug-contracts loses its message (it is not evaluated: nothing is).
+fn panic_call(n: i64, f: i64, k: i64) -> i64 {
+    if k == FK_DEBUG_ASSERT && !crate::front::contracts::flags::DEBUG_CONTRACTS {
+        let mark = list_begin();
+        list_push(child(n, 0));
+        list_end(n, mark);
+        return f;
+    }
+    if PANIC_FMT == -2 {
+        PANIC_FMT = std_fn("__panic_fmt");
+        ASSERT_FMT = std_fn("__assert_fmt");
+    }
+    let target = if k == FK_PANIC { PANIC_FMT } else { ASSERT_FMT };
+    if target < 0 {
+        return f;
+    }
+    // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
+    // SAFETY: CUR_FN, when >= 0, is the function being checked, below FN_COUNT.
+    let in_std = CUR_FN >= 0 && within_std(unsafe { FNS[CUR_FN].module });
+    let bare = NODES[n].count == (if k == FK_PANIC { 1 } else { 2 });
+    if !in_std && !crate::front::contracts::flags::NO_POSITIONS && bare {
+        let b = buf_new();
+        crate::front::contracts::checks::put_position(b, NODES[n].start);
+        let s = new_node(NodeKind::Str, NODES[n].start, NODES[n].start);
+        NODES[s].a = add_string(buf_slice(b));
+        let mark = list_begin();
+        for i in 0..NODES[n].count {
+            list_push(child(n, i));
+        }
+        list_push(s);
+        list_end(n, mark);
+    }
+    target
+}
+
+// (0.26.2) A contract's message, `else "len {}", v.len()` (front/parser/
+// clauses.vl): literal lit and the argument nodes SCRATCH-free in `args`
+// (a node whose list they are, 0: none), made an Interp (or a Str); 0 when
+// the literal has an error (reported).
+pub fn format_message(lit: i64, args: i64) -> i64 {
+    if !is_format_literal(lit) {
+        return lit;
+    }
+    let made = make_format(lit, args, 0, if args == 0 { 0 } else { NODES[args].count });
+    if made == 0 { lit } else { made }
+}
+
+// ---- The literal ----
+
+// What a hole names: its value, its width, its precision.
+const R_NONE: i64 = 0;
+// the next positional argument (`{}`), argument N (`{N}`, `N$`), a name
+// (`{x}`, `x$`), `.*`
+const R_NEXT: i64 = 1;
+const R_INDEX: i64 = 2;
+const R_NAME: i64 = 3;
+const R_STAR: i64 = 4;
+// an integer constant (a width or a precision)
+const R_INT: i64 = 5;
+
+// A parsed hole: its value's reference, its spec, where it is.
+struct Hole {
+    kind: i64, value: i64, pos: i64, end: i64,
+    fill: i64, flags: i64, debug: bool,
+    wkind: i64, wvalue: i64, pkind: i64, pvalue: i64,
+    // (a width's or precision's `name$`: where the name is)
+    wpos: i64, wend: i64, ppos: i64, pend: i64,
+}
+
+// The texts and holes of a literal, in order: `texts[i]` (a string id, -1
+// for none) comes before hole i; one more text ends it.
+struct Parsed {
+    texts: IntVec, holes: Vec<Hole, crate::base::comp::Comp>, ok: bool, braces: bool,
+}
+
+// The literal lit of call n, its arguments n's children first..last: an
+// Interp node (a Str when it has no hole: the text, `{{` as `{`), 0 after
+// an error. n may be a node holding the arguments in its list (a
+// contract's message) or 0.
+fn make_format(lit: i64, n: i64, first: i64, last: i64) -> i64 {
+    let s = str_at(NODES[lit].a);
+    // (no brace at all: the literal as it is, the common case)
+    if !has_brace(lit) {
+        if last > first {
+            args_error(NODES[child(n, first)].start,
+                "this argument is never used: the format string has no hole",
+                "write a hole for it, '{}'");
+            return 0;
+        }
+        return lit;
+    }
+    let map = raw_map(lit);
+    var p = parse(lit, s, map);
+    if !p.ok {
+        return 0;
+    }
+    let made = build(lit, n, first, last, &p, map);
+    made
+}
+
+// Whether literal lit's text has a brace (else it is its own text).
+fn has_brace(lit: i64) -> bool {
+    let s = str_at(NODES[lit].a);
+    for i in 0..s.len {
+        if s[i] == '{' || s[i] == '}' {
+            return true;
+        }
+    }
+    false
+}
+
+// The raw position (in SRC) of each byte of literal lit's text, and of its
+// end: escapes read as the lexer reads them, a text block's indentation
+// skipped. Positions only (the tools' `{x}`), so a near one will do.
+fn raw_map(lit: i64) -> IntVec {
+    let s = str_at(NODES[lit].a);
+    var map = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let start = NODES[lit].start;
+    let end = NODES[lit].end;
+    var raw = false;
+    var i = start;
+    if SRC[i] == 'r' {
+        raw = true;
+        i += 1;
+        while i < end && SRC[i] == '#' {
+            i += 1;
+        }
+    }
+    // (past the opening quote, or a text block's `"""` and its line)
+    if i + 2 < end && SRC[i] == '"' && SRC[i + 1] == '"' && SRC[i + 2] == '"' {
+        i += 3;
+        while i < end && SRC[i] != '\n' {
+            i += 1;
+        }
+        i += 1;
+    } else {
+        i += 1;
+    }
+    var j = 0;
+    while j < s.len {
+        if i >= end {
+            map.push(end);
+            j += 1;
+            continue;
+        }
+        if !raw && SRC[i] == '\\' && i + 1 < end {
+            let e = SRC[i + 1];
+            map.push(i);
+            if e == '\n' {
+                // (a line continuation: no byte)
+                map.count -= 1;
+                i += 2;
+                while i < end && (SRC[i] == ' ' || SRC[i] == '\t' || SRC[i] == '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            if e == 'x' {
+                i += 4;
+            } else if e == 'u' {
+                var k = i + 2;
+                while k < end && SRC[k] != '}' {
+                    k += 1;
+                }
+                // (its UTF-8 bytes, all at the escape)
+                var cp = 0;
+                for q in i + 3..k {
+                    cp = cp * 16 + hex_digit(SRC[q]);
+                }
+                let len = if cp < 128 { 1 } else if cp < 2048 { 2 } else if cp < 65536 { 3 }
+                    else { 4 };
+                for _ in 1..len {
+                    map.push(i);
+                }
+                j += len - 1;
+                i = k + 1;
+            } else {
+                i += 2;
+            }
+            j += 1;
+            continue;
+        }
+        if SRC[i] != s[j] {
+            // (a text block's indentation, or a CRLF's CR)
+            i += 1;
+            continue;
+        }
+        map.push(i);
+        i += 1;
+        j += 1;
+    }
+    map.push(if i < end { i } else { end - 1 });
+    map
+}
+
+fn hex_digit(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { (c - '0') as i64 }
+    else if c >= 'a' && c <= 'f' { (c - 'a') as i64 + 10 }
+    else if c >= 'A' && c <= 'F' { (c - 'A') as i64 + 10 }
+    else { 0 }
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    is_ident_start(c) || c >= '0' && c <= '9'
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= '0' && c <= '9'
+}
+
+// The literal's text s parsed into texts and holes (errors reported:
+// format.syntax, format.spec, format.expr-hole).
+fn parse(lit: i64, s: [u8], map: IntVec) -> Parsed {
+    var p = Parsed {
+        texts: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        holes: Vec::new_in(crate::base::comp::Comp {}), ok: true, braces: false,
+    };
+    let text = buf_new();
+    var i = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '{' && i + 1 < s.len && s[i + 1] == '{' {
+            buf_byte(text, '{');
+            p.braces = true;
+            i += 2;
+            continue;
+        }
+        if c == '}' && i + 1 < s.len && s[i + 1] == '}' {
+            buf_byte(text, '}');
+            p.braces = true;
+            i += 2;
+            continue;
+        }
+        if c == '}' {
+            syntax_error(lit, map.get(i), "unmatched '}' in a format string",
+                "a '}' of the text is written '}}'");
+            p.ok = false;
+            return p;
+        }
+        if c != '{' {
+            buf_byte(text, c);
+            i += 1;
+            continue;
+        }
+        // A hole.
+        p.texts.push(text_id(text));
+        let open = i;
+        var close = i + 1;
+        while close < s.len && s[close] != '}' && s[close] != '{' {
+            close += 1;
+        }
+        if close >= s.len || s[close] == '{' {
+            // (an expression with braces or strings, or none closed)
+            let e = expr_end(s, i + 1);
+            if e < s.len && e > i + 1 {
+                expr_hole(lit, s, map, open, e);
+            } else {
+                syntax_error(lit, map.get(open),
+                    "a hole of the format string is not closed: expected '}'",
+                    "a '{' of the text is written '{{'");
+            }
+            p.ok = false;
+            return p;
+        }
+        var h = Hole {
+            kind: R_NEXT, value: 0, pos: map.get(open + 1), end: map.get(close),
+            fill: 0, flags: 0, debug: false, wkind: R_NONE, wvalue: 0, pkind: R_NONE, pvalue: -1,
+            wpos: 0, wend: 0, ppos: 0, pend: 0,
+        };
+        var k = i + 1;
+        if k < close && is_digit(s[k]) {
+            var v = 0;
+            while k < close && is_digit(s[k]) {
+                v = v * 10 + (s[k] - '0') as i64;
+                k += 1;
+            }
+            h.kind = R_INDEX;
+            h.value = v;
+        } else if k < close && is_ident_start(s[k]) {
+            let from = k;
+            while k < close && is_ident_byte(s[k]) {
+                k += 1;
+            }
+            h.kind = R_NAME;
+            h.value = intern(s[from..k]);
+            h.pos = map.get(from);
+            h.end = map.get(k);
+        }
+        let arg_end = k;
+        while k < close && s[k] == ' ' {
+            k += 1;
+        }
+        // (Rust's: `{ x }`, `{a b}` are no holes but text whose braces are
+        // not doubled)
+        if k < close && s[k] != ':' && k > arg_end
+            && (arg_end == i + 1 || is_ident_start(s[k]) || is_digit(s[k])) {
+            syntax_error(lit, map.get(open),
+                "a hole of the format string is not closed: expected '}'",
+                "a '{' of the text is written '{{'");
+            p.ok = false;
+            return p;
+        }
+        if k < close && s[k] != ':'
+            || k < close && s[k] == ':' && k + 1 < close && s[k + 1] == ':' {
+            // `{a.b}`, `{f(x)}`, `{a::b}`
+            expr_hole(lit, s, map, open, expr_end(s, i + 1));
+            p.ok = false;
+            return p;
+        }
+        if k < close && s[k] == ':' {
+            if !parse_spec(lit, s, map, k + 1, close, &h) {
+                p.ok = false;
+                return p;
+            }
+        }
+        p.holes.push(h);
+        i = close + 1;
+    }
+    p.texts.push(text_id(text));
+    p
+}
+
+// The text gathered so far, as a string id (-1 when empty), and cleared.
+fn text_id(b: i64) -> i64 {
+    let t = buf_slice(b);
+    let id = if t.len > 0 { add_string(t) } else { -1 };
+    crate::base::buf_clear(b);
+    id
+}
+
+// The end of an expression hole's text starting at s[k]: the `}` closing
+// it at depth 0 (brackets and strings skipped), or s.len.
+fn expr_end(s: [u8], k: i64) -> i64 {
+    var depth = 0;
+    var i = k;
+    while i < s.len {
+        let c = s[i];
+        if c == '"' {
+            i += 1;
+            while i < s.len && s[i] != '"' {
+                if s[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if c == '(' || c == '[' || c == '{' {
+            depth += 1;
+        } else if c == ')' || c == ']' {
+            depth -= 1;
+        } else if c == '}' {
+            if depth == 0 {
+                return i;
+            }
+            depth -= 1;
+        }
+        i += 1;
+    }
+    s.len
+}
+
+// The spec s[from..to] of hole h, into its fields; false after an error
+// (format.spec).
+fn parse_spec(lit: i64, s: [u8], map: IntVec, from: i64, to: i64, h: inout Hole) -> bool {
+    var i = from;
+    let spec = s[from..to];
+    // [[fill]align]
+    if i + 1 < to && (s[i + 1] == '<' || s[i + 1] == '^' || s[i + 1] == '>') {
+        if s[i] >= 128 {
+            spec_error(lit, map.get(i), spec, "a fill is one ASCII character in this release");
+            return false;
+        }
+        h.fill = s[i] as i64;
+        i += 1;
+    }
+    if i < to && (s[i] == '<' || s[i] == '^' || s[i] == '>') {
+        h.flags |= if s[i] == '<' { FMT_LEFT } else if s[i] == '>' { FMT_RIGHT }
+            else { FMT_CENTER };
+        i += 1;
+    }
+    if i < to && (s[i] == '+' || s[i] == '-') {
+        if s[i] == '+' {
+            h.flags |= FMT_PLUS;
+        }
+        i += 1;
+    }
+    if i < to && s[i] == '#' {
+        h.flags |= FMT_ALT;
+        i += 1;
+    }
+    if i < to && s[i] == '0' && !(i + 1 < to && s[i + 1] == '$') {
+        h.flags |= FMT_ZERO;
+        i += 1;
+    }
+    // width: N, N$, name$
+    let w = count(s, i, to);
+    if w.kind == R_INT || w.kind == R_INDEX || w.kind == R_NAME {
+        if w.kind == R_INT && w.value > 65535 {
+            spec_error(lit, map.get(i), spec, "a format width is at most 65535");
+            return false;
+        }
+        h.wkind = w.kind;
+        h.wvalue = w.value;
+        h.wpos = map.get(i);
+        h.wend = map.get(w.end - 1);
+        i = w.end;
+    }
+    if i < to && s[i] == '.' {
+        i += 1;
+        if i < to && s[i] == '*' {
+            h.pkind = R_STAR;
+            i += 1;
+        } else {
+            let pr = count(s, i, to);
+            if pr.kind == R_NONE {
+                spec_error(lit, map.get(i), spec,
+                    "expected the precision after '.': digits, 'N$', 'name$' or '*'");
+                return false;
+            }
+            if pr.kind == R_INT && pr.value > 65535 {
+                spec_error(lit, map.get(i), spec, "a format precision is at most 65535");
+                return false;
+            }
+            h.pkind = pr.kind;
+            h.pvalue = pr.value;
+            h.ppos = map.get(i);
+            h.pend = map.get(pr.end - 1);
+            i = pr.end;
+        }
+    }
+    // type
+    let rest = s[i..to];
+    if rest == "" {
+    } else if rest == "?" {
+        h.debug = true;
+    } else if rest == "x?" {
+        h.debug = true;
+        h.flags |= FMT_HEX;
+    } else if rest == "X?" {
+        h.debug = true;
+        h.flags |= FMT_HEX | FMT_UPPER;
+    } else if rest == "x" {
+        h.flags |= FMT_HEX;
+    } else if rest == "X" {
+        h.flags |= FMT_HEX | FMT_UPPER;
+    } else if rest == "o" {
+        h.flags |= FMT_OCT;
+    } else if rest == "b" {
+        h.flags |= FMT_BIN;
+    } else if rest == "e" {
+        h.flags |= FMT_EXP;
+    } else if rest == "E" {
+        h.flags |= FMT_EXP | FMT_UPPER;
+    } else if rest == "p" {
+        h.flags |= FMT_PTR;
+    } else if rest == "c" {
+        h.flags |= FMT_CHAR;
+    } else {
+        let b = buf_new();
+        if (h.flags & FMT_ALT) != 0 && rest == "?" {
+            buf_fmt(b, f"'{{:#?}}', Debug written over several lines, is not in this release");
+        } else {
+            buf_fmt(b, f"unknown format trait '{rest}'");
+        }
+        spec_error(lit, map.get(i), spec, buf_slice(b));
+        return false;
+    }
+    if (h.flags & FMT_ALT) != 0 && h.debug {
+        spec_error(lit, map.get(from), spec,
+            "'{:#?}', Debug written over several lines, is not in this release");
+        return false;
+    }
+    true
+}
+
+// A width or precision at s[i..to]: R_INT (`8`), R_INDEX (`1$`), R_NAME
+// (`w$`) or R_NONE, and where it ends.
+struct Count { kind: i64, value: i64, end: i64 }
+
+fn count(s: [u8], i: i64, to: i64) -> Count {
+    if i < to && is_digit(s[i]) {
+        var k = i;
+        var v = 0;
+        while k < to && is_digit(s[k]) {
+            v = v * 10 + (s[k] - '0') as i64;
+            k += 1;
+        }
+        if k < to && s[k] == '$' {
+            return Count { kind: R_INDEX, value: v, end: k + 1 };
+        }
+        return Count { kind: R_INT, value: v, end: k };
+    }
+    if i < to && is_ident_start(s[i]) {
+        var k = i;
+        while k < to && is_ident_byte(s[k]) {
+            k += 1;
+        }
+        if k < to && s[k] == '$' {
+            return Count { kind: R_NAME, value: intern(s[i..k]), end: k + 1 };
+        }
+    }
+    Count { kind: R_NONE, value: 0, end: i }
+}
+
+// ---- The Interp node ----
+
+// The arguments of a format call: n's children first..last, positional
+// (P) then named (`name = e`, N).
+struct Args { pos: IntVec, named: IntVec, uses: IntVec, value_uses: IntVec }
+
+fn build(lit: i64, n: i64, first: i64, last: i64, p: inout Parsed, map: IntVec) -> i64 {
+    var a = Args {
+        pos: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        named: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        uses: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        value_uses: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+    };
+    for i in first..last {
+        let arg = child(n, i);
+        if NODES[arg].kind == NodeKind::NamedArg {
+            a.named.push(arg);
+        } else {
+            a.pos.push(arg);
+        }
+        a.uses.push(0);
+        a.value_uses.push(0);
+    }
+    if p.holes.len() == 0 {
+        if last > first {
+            args_error(NODES[child(n, first)].start,
+                "this argument is never used: the format string has no hole",
+                "write a hole for it, '{}'");
+            return 0;
+        }
+        // (only `{{`, `}}`: the text)
+        let s = new_node(NodeKind::Str, NODES[lit].start, NODES[lit].end);
+        NODES[s].a = if p.texts.get(0) >= 0 { p.texts.get(0) } else { add_string("") };
+        return s;
+    }
+    // Each hole's value, width and precision: the argument it takes (an
+    // index into the arguments, positional then named), or -1 - sym for a
+    // name in scope.
+    let np = a.pos.count;
+    var next = 0;
+    var vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var widths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var precs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var order = -1;
+    var simple = true;
+    var missing = false;
+    for i in 0..p.holes.len() {
+        let h = p.holes[i];
+        var pr = -2;
+        if h.pkind == R_STAR {
+            pr = next;
+            next += 1;
+            missing = missing || pr >= np;
+        } else if h.pkind != R_NONE && h.pkind != R_INT {
+            pr = resolve_ref(h.pkind, h.pvalue, &a, &next);
+            missing = missing || h.pkind == R_INDEX && pr >= np;
+        }
+        var w = -2;
+        if h.wkind != R_NONE && h.wkind != R_INT {
+            w = resolve_ref(h.wkind, h.wvalue, &a, &next);
+            missing = missing || h.wkind == R_INDEX && w >= np;
+        }
+        let v = resolve_ref(h.kind, h.value, &a, &next);
+        missing = missing || (h.kind == R_NEXT || h.kind == R_INDEX) && v >= np;
+        if missing {
+            missing_error(lit, &p, np);
+            return 0;
+        }
+        for r in [w, pr] {
+            if r >= 0 {
+                a.uses.set(r, a.uses.get(r) + 1);
+                simple = false;
+            }
+        }
+        if v >= 0 {
+            a.uses.set(v, a.uses.get(v) + 1);
+            a.value_uses.set(v, a.value_uses.get(v) + 1);
+            if v <= order {
+                simple = false;
+            }
+            order = v;
+        }
+        vals.push(v);
+        widths.push(w);
+        precs.push(pr);
+    }
+    for i in 0..a.uses.count {
+        if a.uses.get(i) == 0 {
+            let arg = if i < np { a.pos.get(i) } else { a.named.get(i - np) };
+            args_error(NODES[arg].start,
+                if i < np { "this argument is never used: no hole of the format string takes it" }
+                else { "this named argument is never used: no hole of the format string names it" },
+                "write a hole for it, '{}', or remove it");
+            return 0;
+        }
+        if a.value_uses.get(i) != 1 {
+            simple = false;
+        }
+    }
+    // The Interp.
+    let interp = new_node(NodeKind::Interp, NODES[lit].start, NODES[lit].end);
+    let mark = list_begin();
+    let nargs = a.uses.count;
+    if !simple {
+        for i in 0..nargs {
+            let arg = if i < np { a.pos.get(i) } else { NODES[a.named.get(i - np)].b };
+            let h = new_node(NodeKind::InterpHole, NODES[arg].start, NODES[arg].end);
+            NODES[h].a = arg;
+            NODES[h].b = HOLE_EVAL;
+            NODES[h].c = -1;
+            NODES[h].d = -1;
+            list_push(h);
+        }
+    }
+    for i in 0..p.holes.len() {
+        let t = p.texts.get(i);
+        if t >= 0 {
+            list_push(text_node(t, lit));
+        }
+        let h = p.holes[i];
+        let hole = new_node(NodeKind::InterpHole, h.pos, h.end);
+        let v = vals.get(i);
+        NODES[hole].b = (if h.debug { HOLE_DEBUG } else { 0 }) + h.fill * HOLE_FILL;
+        if v < 0 {
+            // a name in scope, at its position in the text
+            NODES[hole].a = name_node(-v - 1, h.pos, h.end);
+        } else if simple {
+            NODES[hole].a = if v < np { a.pos.get(v) } else { NODES[a.named.get(v - np)].b };
+        } else {
+            NODES[hole].a = name_node(hidden_name(v), h.pos, h.end);
+            NODES[hole].b += (v + 1) * HOLE_ALIAS;
+        }
+        NODES[hole].c = if h.wkind == R_INT { h.wvalue } else { -1 };
+        NODES[hole].d = if h.pkind == R_INT { h.pvalue } else { -1 };
+        NODES[hole].p = h.flags;
+        let w = widths.get(i);
+        if w != -2 {
+            NODES[hole].g = if w < 0 { name_node(-w - 1, h.wpos, h.wend) }
+                else { name_node(hidden_name(w), h.pos, h.end) };
+        }
+        let pr = precs.get(i);
+        if pr != -2 {
+            NODES[hole].h = if pr < 0 { name_node(-pr - 1, h.ppos, h.pend) }
+                else { name_node(hidden_name(pr), h.pos, h.end) };
+        }
+        list_push(hole);
+    }
+    let t = p.texts.get(p.holes.len());
+    if t >= 0 {
+        list_push(text_node(t, lit));
+    }
+    list_end(interp, mark);
+    interp
+}
+
+// The argument (positional, then named) a reference takes, or -1 - sym for
+// a name in scope; -2 for none. `next` counts the `{}` holes.
+fn resolve_ref(kind: i64, value: i64, a: inout Args, next: inout i64) -> i64 {
+    if kind == R_NEXT {
+        let v = next;
+        next += 1;
+        return v;
+    }
+    if kind == R_INDEX {
+        return value;
+    }
+    if kind == R_NAME {
+        for i in 0..a.named.count {
+            if NODES[a.named.get(i)].a == value {
+                return a.pos.count + i;
+            }
+        }
+        return -1 - value;
+    }
+    -2
+}
+
+// `=fK`, the hidden local of hole K (check/interp.vl's hidden()).
+fn hidden_name(k: i64) -> i64 {
+    let b = buf_new();
+    buf_fmt(b, f"=f{k}");
+    intern(buf_slice(b))
+}
+
+fn name_node(sym: i64, start: i64, end: i64) -> i64 {
+    let id = new_node(NodeKind::Ident, start, end);
+    NODES[id].a = sym;
+    id
+}
+
+fn text_node(id: i64, lit: i64) -> i64 {
+    let s = new_node(NodeKind::Str, NODES[lit].start, NODES[lit].end);
+    NODES[s].a = id;
+    s
+}
+
+// ---- Errors ----
+
+// format.args: more holes take positional arguments than the call has.
+fn missing_error(lit: i64, p: inout Parsed, np: i64) {
+    var asked = 0;
+    var next = 0;
+    for i in 0..p.holes.len() {
+        let h = p.holes[i];
+        if h.pkind == R_STAR {
+            next += 1;
+        }
+        if h.kind == R_NEXT {
+            next += 1;
+        }
+        for (k, v) in [(h.kind, h.value), (h.wkind, h.wvalue), (h.pkind, h.pvalue)] {
+            if k == R_INDEX && v + 1 > asked {
+                asked = v + 1;
+            }
+        }
+    }
+    if next > asked {
+        asked = next;
+    }
+    let b = buf_new();
+    buf_fmt(b,
+        f"{asked} positional argument{if asked == 1 { "" } else { "s" }} in the format string, but the call has {np}");
+    args_error(NODES[lit].start, buf_slice(b),
+        "give each '{}' (and '{N}', 'N$', '.*') its argument after the format string");
+}
+
+fn args_error(pos: i64, message: [u8], help: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"format.args";
+    err_begin(pos);
+    err_fmt(message);
+    help_text(help);
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+fn help_text(help: [u8]) {
+    let h = buf_new();
+    buf_bytes(h, help);
+    buf_byte(h, 0);
+    err_help(buf_slice(h).ptr);
+}
+
+// format.syntax at pos; its fix doubles the literal's braces (its text as
+// it printed before 0.26.2).
+fn syntax_error(lit: i64, pos: i64, message: [u8], help: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"format.syntax";
+    err_begin(pos);
+    err_fmt(message);
+    help_text(help);
+    let raw = SRC[NODES[lit].start..NODES[lit].end];
+    let fixed = buf_new();
+    for i in 0..raw.len {
+        if raw[i] == '{' || raw[i] == '}' {
+            buf_byte(fixed, raw[i]);
+        }
+        buf_byte(fixed, raw[i]);
+    }
+    err_fix(NODES[lit].start, NODES[lit].end, buf_slice(fixed));
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+fn spec_error(lit: i64, pos: i64, spec: [u8], message: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"format.spec";
+    err_begin(pos);
+    err_fmt(f"invalid format spec ':{spec}': {message}");
+    help_text("a spec is [[fill]align][+][#][0][width][.precision][type]: align < ^ >, width and precision N, N$ or name$ (precision also *), type ? x? X? x X o b e E p c: '{x:>8.2}', '{v:?}', '{n:#010x}', '{s:*^9}'");
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// format.expr-hole: the hole s[open..close] (`{a.b}`) holds an expression;
+// its fix makes it `{}` (its spec kept) and the expression an argument,
+// when the call has no other positional argument.
+fn expr_hole(lit: i64, s: [u8], map: IntVec, open: i64, close: i64) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"format.expr-hole";
+    let inner = s[open + 1..close];
+    var colon = -1;
+    var depth = 0;
+    for k in 0..inner.len {
+        let c = inner[k];
+        if c == '(' || c == '[' {
+            depth += 1;
+        } else if c == ')' || c == ']' {
+            depth -= 1;
+        } else if c == ':' && depth == 0 && colon < 0
+            && !(k + 1 < inner.len && inner[k + 1] == ':') && !(k > 0 && inner[k - 1] == ':') {
+            colon = k;
+        }
+    }
+    let expr = if colon >= 0 { inner[0..colon] } else { inner };
+    err_begin(map.get(open + 1));
+    err_fmt(f"'{{{expr}}}': a hole of a format string holds a name, not an expression");
+    help_text("write '{}' and pass the expression after the format string, as Rust does: 'println(\"{} {x}\", a.b)'");
+    // The fix: every expression hole of the literal moved, in order.
+    let fixed = fixed_literal(lit, map);
+    if fixed.len > 0 {
+        err_fix(NODES[lit].start, NODES[lit].end, fixed);
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// Literal lit's source with each expression hole written `{}` (or `{:spec}`)
+// and the expressions after it, `"a {} {x}", e`: empty when the literal has
+// a `{}` or `{N}` of its own (its arguments would move).
+fn fixed_literal(lit: i64, map: IntVec) -> [u8] {
+    let s = str_at(NODES[lit].a);
+    let raw = SRC[NODES[lit].start..NODES[lit].end];
+    let base = NODES[lit].start;
+    let out = buf_new();
+    let exprs = buf_new();
+    var r = 0;
+    var i = 0;
+    while i < s.len {
+        if (s[i] == '{' || s[i] == '}') && i + 1 < s.len && s[i + 1] == s[i] {
+            i += 2;
+            continue;
+        }
+        if s[i] != '{' {
+            i += 1;
+            continue;
+        }
+        let close = expr_end(s, i + 1);
+        if close >= s.len {
+            return "";
+        }
+        let inner = s[i + 1..close];
+        var k = 0;
+        while k < inner.len && is_ident_byte(inner[k]) {
+            k += 1;
+        }
+        let name_only = k > 0 && is_ident_start(inner[0]) && (k == inner.len || inner[k] == ':'
+            && !(k + 1 < inner.len && inner[k + 1] == ':'));
+        if !name_only {
+            if inner.len == 0 || is_digit(inner[0]) || inner[0] == ':' {
+                return "";
+            }
+            // the expression's raw text, up to its spec
+            var colon = inner.len;
+            var depth = 0;
+            for q in 0..inner.len {
+                let c = inner[q];
+                if c == '(' || c == '[' {
+                    depth += 1;
+                } else if c == ')' || c == ']' {
+                    depth -= 1;
+                } else if c == ':' && depth == 0 && colon == inner.len
+                    && !(q + 1 < inner.len && inner[q + 1] == ':')
+                    && !(q > 0 && inner[q - 1] == ':') {
+                    colon = q;
+                }
+            }
+            let rs = map.get(i + 1) - base;
+            let re = map.get(i + 1 + colon) - base;
+            if rs < r || re < rs || re > raw.len {
+                return "";
+            }
+            buf_bytes(out, raw[r..rs]);
+            r = re;
+            buf_bytes(exprs, ", ");
+            buf_bytes(exprs, raw[rs..re]);
+        }
+        i = close + 1;
+    }
+    buf_bytes(out, raw[r..raw.len]);
+    buf_bytes(out, buf_slice(exprs));
+    buf_slice(out)
+}

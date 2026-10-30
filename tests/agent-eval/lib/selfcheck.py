@@ -47,7 +47,6 @@ TACH_PROBE = """use std::{Scanner, read_stdin_in};
 // The self-check's probe: the sum of the integers on stdin.
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();
-    defer input.free();
     let mut sc = Scanner::new(input.as_slice());
     let mut t = 0;
     while let Ok(n) = sc.next_int() {

@@ -104,6 +104,10 @@ BEGIN {
     # and std::gpu both reach it, and neither can reach the other
     LAZY["std::capture"] = 1
     LAZY["Frame capture (0.25.4)"] = 1
+    # (0.26.2) format_args and what panic and assert with holes compile to
+    # (front/check/format.vl: std_fn), read by a program that names them
+    LAZY["Format literals (0.26.2)"] = 1
+    TRIGGERS["Format literals (0.26.2)"] = "panic assert debug_assert"
     # (0.26.1) std::cell: lazy, no gate (std::sync and std::fmt reach
     # UnsafeCell; Cell, with its trait impls, only a program that names it)
     LAZY["std::cell"] = 1
