@@ -709,6 +709,28 @@ back), against the base 1.07x; `hello` 1.03x and `std` 1.00x against
 The profile left is flat (the statement and operand pushes, `operand`,
 `expr_into`, the scope stack, `proj`'s interning), each a few percent.
 
+**The builder's cost at check (0.26.1, later).** At a check no code
+generator reads the bodies, and a body without a drop that runs gives
+nothing the check uses (no drop, flag or drop edge; the backstop is a
+second check of the own pass). So a check builds only the bodies that
+may drop (front/own/fast.vl `glue_met`: the own pass gave the function
+a drop; with its drops off, any type with glue met in it); a build,
+`--verify-places`, `--places-diff` and `--emit-places` build all.
+`check` of compiler/src, fewest of 5 runs:
+
+| compiler | without `--places` | with | the IR's share |
+|---|---|---|---|
+| before (every body built) | 5,557.3M | 6,043.4M | 1.087x |
+| a body built when it may drop (by the own pass's drops) | 5,555.0M | 5,594.4M | 1.007x |
+| (by the types met alone, the rule left after step 7) | 5,598.0M | 5,863.8M | 1.047x |
+
+700 of 10,872 bodies are built. `--places-noglue-check` builds the
+others too and names any with a drop that runs: none over compiler/src
+and every tests/run source. The objects of a build under
+`VOLE_LOWER=places` (every body built) are byte-identical at -O0 and
+-O2. Step 7, which deletes the own pass's drops, needs a rule of its own
+to keep this (the types rule alone is 1.047x).
+
 **How it stays cheap.**
 
 - One pass per function over the checked AST, in evaluation order, into
