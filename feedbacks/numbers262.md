@@ -298,3 +298,7 @@ binary still treats usize as u64, so until it is refreshed it reports 24
    checked reduction.
 3. [check] A clear error for assigning a non-Copy value to a static in a
    match arm.
+4. [tests] tests/agent-eval is not migrated to usize lengths (0.26.2
+   step 5): affected.map runs it @none, and many tasks' solutions no
+   longer compile (`.len()` into an i64, an i64 into a usize parameter).
+   Migrate it with `fix --only usize` before the next eval run.
