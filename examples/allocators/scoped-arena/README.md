@@ -10,7 +10,7 @@ at once, when the request is answered:
 let used = arena_scope(gpa, |scratch| {
     var out = Buf::new_in(scratch);
     answer(&store, line, scratch, &out);
-    println(f"{line:<24} -> {out.as_slice()}");
+    println("{line:<24} -> {}", out.as_slice());
     scratch.used()
 });
 ```

@@ -135,7 +135,7 @@ On the vole side:
 extern "C" static var EVICTIONS: i64 = 0;
 
 extern "C" fn on_evict(value: i64) {
-    println(f"    (dropped {value})");
+    println("    (dropped {value})");
 }
 ```
 
@@ -213,7 +213,7 @@ the free.
 ```tach
 let word = "vole";
 let from_c = unsafe { c::fnv1a(word.ptr, word.len() as u64) };
-println(f"fnv1a(\"{word}\"): C {from_c:08x}, vole {fnv1a(word):08x}");
+println("fnv1a(\"{word}\"): C {from_c:08x}, vole {:08x}", fnv1a(word));
 ```
 
 A `[u8]` is a pointer and a length, which is exactly what a C function

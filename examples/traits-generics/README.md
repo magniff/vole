@@ -90,7 +90,8 @@ pub trait Shape {
     fn perimeter(self) -> f64;
     fn name(self) -> [u8] { "shape" }
     fn describe(self) {
-        println(f"{self.name():<8} area {self.area():>7.2}  perimeter {self.perimeter():>6.2}");
+        println("{:<8} area {:>7.2}  perimeter {:>6.2}", self.name(), self.area(),
+            self.perimeter());
     }
 }
 ```
@@ -163,7 +164,7 @@ impl Measured for Segment {
 
 fn show<T: Measured>(label: [u8], x: T) {
     let m: T::Output = x.measure();
-    println(f"{label:<10} {m}");
+    println("{label:<10} {m}");
 }
 ```
 

@@ -105,9 +105,9 @@ its NUL.
 and sent with one `write` loop:
 
 ```tach
-h.push_fmt(f"HTTP/1.0 {status}\r\nContent-Type: {content_type}");
+h.push_fmt("HTTP/1.0 {status}\r\nContent-Type: {content_type}");
 if let Some(n) = length {
-    h.push_fmt(f"\r\nContent-Length: {n}");
+    h.push_fmt("\r\nContent-Length: {n}");
 }
 ```
 

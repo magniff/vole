@@ -168,7 +168,7 @@ its comment states the contract the caller takes on.
 ### Printing
 
 ```tach
-println(f"  {i + 1:>2}. {name:<12} {country:<10} {city.population:>9} {d:>8.1}/km2");
+println("  {:>2}. {name:<12} {country:<10} {:>9} {d:>8.1}/km2", i + 1, city.population);
 ```
 
 f-strings with widths (`>` right, `<` left) and a precision for floats

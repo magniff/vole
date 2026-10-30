@@ -48,7 +48,7 @@ fn distance(self, other: Point) -> f64 {
 The result is printed with six decimals, as C's `printf("%f")` would:
 
 ```tach
-println(f"{a.distance(b):.6}");
+println("{:.6}", a.distance(b));
 ```
 
 Without a precision, an f-string prints the shortest text that reads back

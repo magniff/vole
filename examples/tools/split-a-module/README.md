@@ -159,7 +159,7 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index 51768eb..1e7b68d 100644
+index 9c9753d..f3e61fc 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -4,7 +4,10 @@ mod shop;

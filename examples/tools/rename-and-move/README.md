@@ -54,8 +54,8 @@ members.vl:6:    // the count of books held now
 members.vl:7:    pub count: i64,
 members.vl:24:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
 members.vl:35:    m.count < m.limit && m.owed == 0
-report.vl:10:        println(f"  {b.title:<28} {b.author:<18} count {b.count}/{b.owned}");
-report.vl:17:        println(f"  {m.name:<10} holds {m.count} of {m.limit}, owes {m.owed} cents");
+report.vl:10:        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
+report.vl:17:        println("  {:<10} holds {} of {}, owes {} cents", m.name, m.count, m.limit, m.owed);
 ```
 
 The compiler knows which ones are `Book`'s field, including the use
@@ -70,7 +70,7 @@ $ volec query refs Book.count
 42:26	write	catalog::take	cat.books[i].count -= 1;
 52:22	write	catalog::put_back	cat.books[i].count += 1;
 # report.vl
-10:59	read	report::shelf	println(f"  {b.title:<28} {b.author:<18} count {b.count}/{b.owned}");
+10:69	read	report::shelf	println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
 ```
 
 So the rename changes exactly those, and leaves `Member.count`, the
@@ -90,7 +90,7 @@ renamed crate::catalog::Book.count to copies	2 files	+6 -6 lines
 // catalog.vl:52
 52	        cat.books[i].copies += 1;
 // report.vl:10
-10	        println(f"  {b.title:<28} {b.author:<18} count {b.copies}/{b.owned}");
+10	        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.copies, b.owned);
 ```
 
 `--show` prints the lines the edit wrote, numbered, so nothing needs to

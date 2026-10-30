@@ -161,7 +161,7 @@ view is not checked. The `push` grows the Vec, which moves its memory
 ```tach
 let first = v.as_slice().ptr;
 v.push(41);
-println(f"first {unsafe { first[0] }}");
+println("first {}", unsafe { first[0] });
 ```
 
 The checking allocator gives every block pages of its own and never
@@ -187,7 +187,7 @@ counts;` copies the pointer, not the memory. Each copy is freed:
 ```tach
 let counts = pair_new(gpa, 3, 4);
 let shelf = counts;
-println(f"shelf: {unsafe { shelf.p[0] + shelf.p[1] }}");
+println("shelf: {}", unsafe { shelf.p[0] + shelf.p[1] });
 unsafe { gpa.free(counts.p as *u8, 16, 8) };
 unsafe { gpa.free(shelf.p as *u8, 16, 8) };
 ```
@@ -195,7 +195,7 @@ unsafe { gpa.free(shelf.p as *u8, 16, 8) };
 ```console
 $ ./shop-checked twice
 shelf: 7
-double free: block #9 (16 bytes), allocated at main.vl:52:13, freed at main.vl:68:14, freed again at main.vl:70:18
+double free: block #9 (16 bytes), allocated at main.vl:54:13, freed at main.vl:72:14, freed again at main.vl:74:18
 [exit 101]
 ```
 
