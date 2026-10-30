@@ -594,6 +594,25 @@ revisited in 0.28, when `--values` goes.
 | the effects' SCCs it reuses | kept | kept | from the IR's call graph | |
 | `noalias` facts for the optimizer | kept | | | from `&mut T` types |
 
+**Step 7's scope, decided 2026-10-30 (0.26.2): the drop half only.** It
+deletes the implicit defers (DEFER_IMPLICIT) and their placement at the
+checker's call sites, the statement temporaries' drop flags and pointers
+(`__own_tf`, `__own_tp`, their defers), the assignment desugaring,
+`finish_drops` and the walk's drop recording, and the tools' reads of them
+(fixvalues, refactor extract). It keeps `visit_temps` and the hidden `let`s
+of the statement temporaries (`__own_tv`) that the own walk's checks read:
+own.escape (an argument's local lent past its arm, hold_args), own.partial
+(an element moved out of a temporary array by a run-time index),
+own.move_out (a part moved out of a temporary, part_move) and own.moved.
+An experiment build with them off fails 26 of the 650 places/own/temp
+cases, 15 of them those checks' errors. They go with those checks to the
+borrow checker (NLL, 0.27). own.drop_view, reported today from the
+parameters' implicit defers (finish_drops), moves onto the IR's drops.
+The builder makes its own temporaries and assignment drops already
+(0.26.2, places/README.md), and drops the old value at every owned
+assignment, as Rust does (0.25's own pass leaked it at an arm's value or
+inside an expression).
+
 Nothing of the own pass goes in 0.26.0. About 3,300 lines go in 0.26.1
 (`drops.vl` but its predicates, `glue.vl` moved, the drop recording in
 the walk), and with them the AST lowerings of function bodies in
