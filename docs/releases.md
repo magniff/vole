@@ -165,6 +165,14 @@ Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
   and 12 kernels with a `#[repr(wgsl)] GpuParams`, and galaga, galaxy,
   life and nes; so are the guide's 20.
 
+The places IR, the AST lowerings' end (placesir262b; places-ir.md §8
+step 8):
+
+- `--check-unsafe` from the IR: a `*` of a raw pointer checks its
+  pointee, an element of one (`p[i]`) the element, a slice of one its
+  bytes, each at the statement's position (the 9 cases' reports are
+  unchanged). No function falls back to the AST lowering any more.
+
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.

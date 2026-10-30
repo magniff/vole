@@ -85,7 +85,6 @@ pub static var PL_LOWERED: i64 = 0;
 pub static var PL_NO_BODY: i64 = 0;
 pub static var PL_DROP: i64 = 0;
 pub static var PL_KIND: i64 = 0;
-pub static var PL_CHECKED: i64 = 0;
 static var KIND_COUNTS: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // Per local of the body held: its type (erased), its SSA variable (-1:
@@ -119,15 +118,11 @@ pub fn lower_places_function(cx: sink *FnCtx, item: i64, f: i64) -> bool {
 // Function f's kept body held for a code generator (this file, or gen0's
 // places.vl), its blocks ordered (RPO) and scanned (scan_body); counted
 // by the reason when it cannot be (none kept, a drop that does not run, a
-// statement kind not handled, --check-unsafe), and then not held. The
+// statement kind not handled), and then not held. The
 // caller frees a body held (free_body). `types_only`: the scan makes the
 // locals' and places' types only, not what the SSA lowering needs (where
 // each local is used, which are borrowed): gen0's.
 pub fn take_body(f: i64, types_only: bool) -> bool {
-    if CHECK_UNSAFE {
-        PL_CHECKED += 1;
-        return false;
-    }
     if !load_body(f) {
         PL_NO_BODY += 1;
         return false;
@@ -164,8 +159,6 @@ pub fn lower_stats() {
     buf_int(out, PL_NO_BODY);
     buf_str(out, c", drop ");
     buf_int(out, PL_DROP);
-    buf_str(out, c", check-unsafe ");
-    buf_int(out, PL_CHECKED);
     buf_str(out, c", kind ");
     buf_int(out, PL_KIND);
     for k in 0..KIND_COUNTS.len() as i64 {
@@ -475,7 +468,19 @@ fn done_edge(cx: sink *FnCtx, b: i64) {
 
 // ---- Places and operands ----
 
-// The address of place (l, p).
+// (0.26.2) --check-unsafe's position for a raw access: the statement's
+// (lower_stmt, lower_term).
+static var RAW_POS: i64 = 0;
+
+// Whether type t is a raw pointer (not a reference, 0.17).
+fn is_raw_pointer(t: i64) -> bool {
+    TYPES[t].kind == TyKind::Ptr && !crate::front::types::is_ref(t)
+}
+
+// The address of place (l, p). With --check-unsafe, an access through a
+// raw pointer is checked, at the statement's position: a `*` of one, the
+// whole pointee (as the AST lowering's lower_addr checks `*p`), and an
+// element of one (`p[i]`).
 fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     if p == 0 {
         if has_flag(l, LF_STATIC) {
@@ -487,7 +492,15 @@ fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     let k = proj_kind(p);
     let v = proj_val(p);
     if k == PJ_DEREF {
-        return place_value(cx, l, parent);
+        let pointer = place_value(cx, l, parent);
+        if CHECK_UNSAFE {
+            let pointer_ty = place_ty(l, parent);
+            if is_raw_pointer(pointer_ty) {
+                crate::middle::lower::calls::raw_check_at(cx, RAW_POS, pointer,
+                    ir_const(cx, type_size(TYPES[pointer_ty].a), TY_U64));
+            }
+        }
+        return pointer;
     }
     if k == PJ_VARIANT {
         return place_addr(cx, l, parent);
@@ -527,7 +540,13 @@ fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     if elem_size != 1 {
         scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64));
     }
-    ir_binary(cx, Op::Add, TY_U64, base, scaled)
+    let at = ir_binary(cx, Op::Add, TY_U64, base, scaled);
+    // (a raw pointer's element: checked, as lower_addr's `p[i]`)
+    if CHECK_UNSAFE && is_raw_pointer(pt) {
+        crate::middle::lower::calls::raw_check_at(cx, RAW_POS, at,
+            ir_const(cx, elem_size, TY_U64));
+    }
+    at
 }
 
 // The value of place (l, p): an SSA use, a load, or a compound value's
@@ -647,6 +666,9 @@ fn lower_stmt(cx: sink *FnCtx, at: i64) {
     if IR_LOCS && s.node > 0 {
         IR_LOC = NODES[s.node].start + 1;
         IR_EXPR_LOC = 0;
+    }
+    if s.node > 0 {
+        RAW_POS = NODES[s.node].start;
     }
     if is_dead_block(cx, CUR) {
         return;
@@ -1070,6 +1092,9 @@ fn lower_term(cx: sink *FnCtx, at: i64) {
     if IR_LOCS && s.node > 0 {
         IR_LOC = NODES[s.node].start + 1;
         IR_EXPR_LOC = 0;
+    }
+    if s.node > 0 {
+        RAW_POS = NODES[s.node].start;
     }
     if k == TK_GOTO {
         // (a jump to the return block, which has nothing else: the return

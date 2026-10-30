@@ -15,8 +15,8 @@ them): a frame slot per local (a statement temporary's shared with the
 later ones, one read by the next statement left in the accumulator),
 the blocks in reverse postorder, calls, intrinsics and vectors through
 the AST walk's functions with their operands bound (`gen_expr` of a
-bound node is its IR operand). The AST walk stays for the bodies not
-taken (under `--check-unsafe`) and an atomic intrinsic's.
+bound node is its IR operand). The AST walk stays for an atomic
+intrinsic's body.
 
 | module | |
 |---|---|
