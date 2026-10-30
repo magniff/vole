@@ -197,6 +197,7 @@ usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
        volec query type FILE:LINE[:COL]...
        volec query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)
+       volec query drops FILE:LINE...   (0.26.1: the function's drops as the places IR decides them, each with where it runs)
        volec query stats [MODULE|FILE] [--over N] [--all]
        volec query deps MODULE [--max-lines N]
        volec query unused [MODULE] [--all]

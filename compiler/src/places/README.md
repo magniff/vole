@@ -86,6 +86,45 @@ code generators' agent (0.26.1) sees what moved.
 - 0.26.1 (R2): drop shims, shim.vl (`shim_of`, `shim_count`,
   `shim_type`, `build_shim`, `shim_fn_symbol`); ir.vl's `B_SHIM` (the
   shim held, -1 for a function's body; B_FN is -1 for a shim).
+- 0.26.1 (step 6, front half): `drop_edge_count(f)`, `drop_edge(f, i)`
+  (mod.vl): the `Drop::drop` functions f's kept and flagged drops call
+  through their shims (shim.vl: `drop_fn_count(t)`, `drop_fn_at(t, i)`),
+  edges of the effect graph (front/effects/infer.vl: node_locals).
+- 0.26.1 (step 9): a drop's `node` is where it runs: the scope's node (a
+  block, a statement, a loop, an arm, the body) or the exit's (`return`,
+  `break`, `continue`); print.vl's `drop_pos` gives its position (a
+  block's `}`). `query drops FILE:LINE` (tools/query/drops.vl) lists them.
+- 0.26.1 (step 2, the builder's cost): an open block's `len` is set when
+  it is terminated (`close_block`), not by each `emit`; read a block's
+  range only once it has its terminator. Outside `--emit-places` and
+  `--verify-places`, StorageLive and StorageDead are made only for the
+  locals whose type has glue (the ones elaboration reads them for; about
+  half of all statements were the scalars' markers): a code generator
+  must not rely on a scalar local having them (`--places-lean` makes the
+  printed IR so too). Operands are written straight to `P_OPS` (no
+  staging), so `P_OPS` may hold words no statement points to; read
+  operands only through a statement's `ops` and `nops`.
+- 0.26.1 (shims as functions): with kept bodies and drops on, each shim
+  is a function of the `FNS` table after the program's (`shim_fn(id)`,
+  `drop_shim_fn(t)`, `is_shim_fn(f)`; `self: &mut T`, unit): not a
+  program item, so a code generator lowers them in a loop over
+  `shim_count()`, `lower_places_function(cx, fn_node(shim_fn(id)),
+  shim_fn(id))`. A generic `Drop::drop` a shim calls is instantiated at
+  check time when no instance exists yet (`make_drop_instance`, then
+  front/check's `check_queued_instances`), so every shim has its callee.
+- 0.26.1 (R3): a sink closure's body that moves a flagged capture out of
+  its env writes `(*_1).k_flag = const false` after the move
+  (build.vl `live_writes`), as the own pass does.
+- 0.26.1: a union literal's aggregate has a part per field of the union,
+  `const ()` for each field not written.
+- 0.26.1 (R4): a match whose arms are values (no guard; an integer, or
+  an enum without the null niche whose variants' fields only bind; a
+  wildcard or binding only last; 6 values, or 4 for an enum with
+  fields) is one `switch` with a target per value (build.vl
+  `switch_cases`, `lower_match_switch`, as middle/lower/matching.vl's).
+  An enum's arm with several values is reached through a block per
+  value, a goto to the arm's: a code generator may see a switch with
+  many targets wherever a match was.
 
 ## `--places-diff`: the differences left
 

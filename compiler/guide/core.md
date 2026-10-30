@@ -87,7 +87,8 @@ n=3
 from C
 ```
 
-Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
+Also: lengths and indices are `i64` (`usize` is a type of its own, not
+`u64`); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
 to take what it captures), `impl Trait for T`, `T: Trait`,
 `#[derive(Eq, Debug)]`, `where T: Ord` and `x: impl Display` (0.26.2); no `dyn`, `Box`. A let or inout

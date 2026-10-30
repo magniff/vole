@@ -25,6 +25,7 @@
 #               is said so (`changed during the run: rerun`), not `differ`
 #   embed_block (0.26.0) an embedded block's bytes, kept by fmt as they
 #               are, the vole around it formatted
+#   embed_with  (0.26.2) a block's `with` header kept on its one line
 #   same-output the compiler built from the copy's compiler/src: the same
 #               object as the one built from the tree's, and `same-output`
 #               against it: identical
@@ -84,6 +85,14 @@ printf 'embed wgsl K {\n  @compute   @workgroup_size(1)\n\tfn main() {  // }\n\n
 check embed_block "$(cmp -s "$WORK/embed/main.vl" "$WORK/embed/want" && echo 1)" \
     "$(cat "$WORK/embed/out"; diff "$WORK/embed/want" "$WORK/embed/main.vl")"
 
+# embed_with (0.26.2): a block with parts keeps its header, `with` list
+# and all, on one line as it is; the file form's is laid out as vole
+printf 'embed wgsl K with A,  b::B {\n  fn f() {}\n}\nembed  wgsl F with A from "x.wgsl"  ;\n' >"$WORK/embed/with.vl"
+"$COMPILER" fmt "$WORK/embed/with.vl" >"$WORK/embed/out" 2>&1
+printf 'embed wgsl K with A,  b::B {\n  fn f() {}\n}\nembed wgsl F with A from "x.wgsl";\n' >"$WORK/embed/want"
+check embed_with "$(cmp -s "$WORK/embed/with.vl" "$WORK/embed/want" && echo 1)" \
+    "$(cat "$WORK/embed/out"; diff "$WORK/embed/want" "$WORK/embed/with.vl")"
+
 # roundtrip
 COPY="$WORK/copy"
 mkdir -p "$COPY"
@@ -102,7 +111,7 @@ while IFS= read -r f; do
     # they are: fmt keeps them; d counts its braces outside `//` comments)
     awk 'function braces(l,  t) { t = l; sub(/\/\/.*/, "", t); return gsub(/\{/, "{", t) - gsub(/\}/, "}", t) }
         ine { print; d += braces($0); if (d <= 0) ine = 0; next }
-        /^[ \t]*(pub[ \t]+)?embed[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{/ && !inb && !cont {
+        /^[ \t]*(pub[ \t]+)?embed[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]+with[ \t]+[A-Za-z0-9_:, \t]+)?[ \t]*\{/ && !inb && !cont {
             print; d = braces($0); if (d > 0) ine = 1; next }
         inb { print; if (match($0, /^[ \t]*"""/) && substr($0, RSTART + RLENGTH, length(h)) == h) inb = 0; next }
         { if (!cont) sub(/^[ \t]+/, ""); print; cont = /\\$/

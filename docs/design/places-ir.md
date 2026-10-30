@@ -680,7 +680,34 @@ allows is the first change to make; estimated 15-20% of the builder.
 hello world checks (fmt, Buf, the allocator), about 23M. 0.26.1 needs
 bodies only for the functions emitted or checked for the program (std's
 reached ones built on demand, as the code generators ask), not all of
-std's checked ones.
+std's checked ones. *Corrected in 0.26.1:* the 23M was the measuring
+wrapper's, not the IR's: `--places` was added by a shell script around
+the compiler, and `/usr/bin/time` counts the shell's start (22.7M: the
+same wrapper without the flag gives 110.2M against 87.5M). The IR's
+own share of `hello` is 0.7M (49 bodies), so nothing is to be won there.
+
+**Measured in 0.26.1, step 2 (the builder's cost).** `check` of
+compiler/src (a copy, `VOLE_CACHE=off`, fewest of 3 to 5 runs), the same
+compiler with and without `--places`; the builder alone by a build that
+builds each body 200 times more (its cost: the difference / 200):
+
+| change | the IR's share | the builder |
+|---|---|---|
+| R1 and R2 (a230cedc) | +544M | 440M |
+| a block's length set at its terminator, not by each `emit` | | |
+| operands written straight to `P_OPS` (no OPSTACK staging) | +501M | 395M, then 375M |
+| `has_glue` memoized per type | | |
+| storage markers only for locals with glue (595,544 of 1,120,167 statements were markers) | +421M | 357M |
+
+With the IR on by default (an uncommitted build, the placeholders still
+there), `tests/compile_cost.sh -r 5`: `check` 5,982M against 0.25.5's
+5,535M (1.08x, inside the IR's 1.10x before the placeholders' 228M come
+back), against the base 1.07x; `hello` 1.03x and `std` 1.00x against
+0.25.5. RSS of `check`: 531 MB against 529 MB. Kept bodies at a build
+(R1, every body kept, none freed yet): -O0 737 MB against 661 MB, -O2
+1,323 MB against 1,246 MB (+77 MB; +117 MB before the lean markers).
+The profile left is flat (the statement and operand pushes, `operand`,
+`expr_into`, the scope stack, `proj`'s interning), each a few percent.
 
 **How it stays cheap.**
 
@@ -842,6 +869,24 @@ suite: both are in 0.26.0. Step 7 waits for steps 4 and 5: while one code
 generator reads the AST, own's drops are still the ones it runs. Step 6
 waits for step 3's cases to pass under `VOLE_LOWER=places` at both
 levels. Effects move onto the IR in 0.26.2, after steps 6 and 7.
+
+**State, agent A (placesir261a).** Done: R1 (kept bodies) and R2 (drop
+shims) for B; step 2's builder cost (§6, "Measured in 0.26.1"); step 6's
+front half without the switch: the drop edges into effects (each
+function's kept and flagged drops give an edge to the `Drop::drop`
+functions their shims call; with the placeholders skipped by the effect
+walk, `query effects` of compiler/src's 20,275 functions differs in 3,
+each more precise); step 9's `query drops`. `check_program`'s order is
+§4's already (the IR before the effects). Then, for B: shims as
+functions of `FNS` after the program's (`shim_fn(id)`, not program
+items: lowered in a loop over `shim_count()`), a generic `Drop::drop`
+instance made at check time when the glue made none (so step 7 needs
+nothing more for it), R3 (a moved capture's live flag cleared), union
+literals' parts, R4 (a match on values is one switch with many targets;
+`middle/lower/places.vl`'s `lower_switch` still makes a chain of
+compares of it, so `opt_switch` fails under `VOLE_LOWER=places` until it
+uses `ir_switch`). Waiting on B's steps 4 and 5: the default (step 6's
+switch: `PLACES_ON` true, `--no-places` the escape) and step 7.
 
 ## 9. The chain rule
 
