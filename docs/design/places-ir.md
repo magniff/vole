@@ -877,11 +877,16 @@ function's kept and flagged drops give an edge to the `Drop::drop`
 functions their shims call; with the placeholders skipped by the effect
 walk, `query effects` of compiler/src's 20,275 functions differs in 3,
 each more precise); step 9's `query drops`. `check_program`'s order is
-§4's already (the IR before the effects). Waiting on B's steps 4 and 5:
-the default (step 6's switch: `PLACES_ON` true, `--no-places` the
-escape) and step 7. Step 7 also has to make a shim's `Drop::drop`
-instance itself: today the checker makes it for the placeholders' glue,
-and a shim that finds none stops the compiler.
+§4's already (the IR before the effects). Then, for B: shims as
+functions of `FNS` after the program's (`shim_fn(id)`, not program
+items: lowered in a loop over `shim_count()`), a generic `Drop::drop`
+instance made at check time when the glue made none (so step 7 needs
+nothing more for it), R3 (a moved capture's live flag cleared), union
+literals' parts, R4 (a match on values is one switch with many targets;
+`middle/lower/places.vl`'s `lower_switch` still makes a chain of
+compares of it, so `opt_switch` fails under `VOLE_LOWER=places` until it
+uses `ir_switch`). Waiting on B's steps 4 and 5: the default (step 6's
+switch: `PLACES_ON` true, `--no-places` the escape) and step 7.
 
 ## 9. The chain rule
 
