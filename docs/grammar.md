@@ -82,7 +82,8 @@ directly by other letters (`3e` and `1foo` are errors).
 if impl import in let loop match mod mut pub return static struct trait true
 type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
 `mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14, `where` since 0.26.2).
+since 0.14, `where` since 0.26.2). `defer` is a keyword with no statement
+since 0.26.2: `syntax.defer`, which names it.
 
 **Reserved** (an error if used): the keyword `dyn` (and `move` until
 0.14, `where` until 0.26.2, keywords since), and the
@@ -262,7 +263,7 @@ bound so may be read, not changed or moved). There is no `&pat` pattern.
 block       = "{" { stmt } [ expr ] "}" ;
 stmt        = ";"                                      (* empty statement *)
             | "let" pattern [ ":" type ] "=" expr ";"
-            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6) *)
+            | "defer" ( block [ ";" ] | expr ";" )    (* (0.6; 0.26.2: error syntax.defer) *)
             | block_like [ ";" ]
             | expr ";" ;
 block_like  = block | "unsafe" block | if_expr | match_expr | loop_expr | while_expr | for_expr ;
@@ -849,7 +850,10 @@ change the value already taken from it. A deferred statement sees the
 bindings made before it; it may not `return`, nor `break`/`continue` out
 of itself (loops inside it are fine). Deferred statements do not run when
 the program ends by a failed check (exit 101), `exit`, or a `longjmp` past
-them.
+them. (0.26.2: removed, as Rust has none. `defer` is `error
+syntax.defer`; a guard, a value whose `Drop` does what the deferred
+statement did, is made where it stood and dropped on the same ways out,
+last first, the value leaving the block computed before.)
 
 **Function attributes.** `#[inline]`, `#[inline(never)]` and `#[cold]`
 (rarely called) before a function, also in impl blocks: hints for the
@@ -1327,8 +1331,8 @@ type; `e` is evaluated once, into a hidden `let`:
 
 Anything else is the error `'for' iterates over ranges, slices, arrays,
 iterators and types with an 'iter' method, got 'T'`. The pattern is
-irrefutable (a `let`'s); labels, `break`, `continue` and `defer` in the
-body behave as in any loop. Items are copies.
+irrefutable (a `let`'s); labels, `break`, `continue` and the drops of
+the body behave as in any loop. Items are copies.
 
 `a..b` and `a..=b` outside a `for` head, a slicing and a pattern are
 values: `std::Range { start: a, end: b }` and `std::RangeInclusive {
@@ -1450,7 +1454,7 @@ tightly as a call: `parse(s)?.len` is `(parse(s)?).len`, `-x?` is
   neither is an error, and so is `?` on an Option in a function returning
   a Result (`try: e.ok_or(VALUE)?`). Inside a closure `?` returns from the
   closure, whose result type must then be known (`|x| -> Option<i64>
-  {..}`, as for `return`). `defer` blocks run, as for `return`.
+  {..}`, as for `return`). The drops run, as for `return`.
 - `fn main() -> Result<(), E>` with `E: Debug`: on `Err(e)` the program
   prints `Error: ` and `e`'s Debug text on stderr and exits with 1.
 
@@ -1714,8 +1718,8 @@ on by default: `--values=error` (the default since T7, which moved the
 tests, examples and evals over with `volec fix --values`).
 `--values=warn` and `--values=report` keep 0.16's semantics (no drops)
 and only warn or list; `--values=off` turns the pass off. They are
-opt-outs for 0.17 only. `defer v.free()` stays legal (`free` frees now
-and leaves the container empty) and is no longer needed.
+opt-outs for 0.17 only. `v.free()` stays legal (`free` frees now and
+leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,

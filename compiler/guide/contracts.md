@@ -42,7 +42,7 @@ main.vl:22:19: pop on an empty stack: self.items.len() = 0
   names the caller's line, the one to change. Several clauses are
   checked in order.
 - `ensures COND` is checked at every return of the body, before its
-  drops and defers: a failure names the function. `result` is the value
+  drops: a failure names the function. `result` is the value
   returned; `old(e)` is e evaluated at entry.
 - A failure reads `requires failed: 'COND' of 'f' (FILE:L:C): x = 4, ...`
   (the integer operands' values; a float's in millionths, `d = 707106e-6`,

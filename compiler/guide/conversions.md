@@ -103,8 +103,8 @@ fn main() -> i32 {
 function. On a `Result<T, E>` it gives the `T`, or returns `Err`: the
 error as it is when `E` is the function's error type `F`, widened when
 `E` widens to `F`, else `F::from(err)` through an `impl From<E> for F`.
-Inside a closure it returns from the closure (give it `-> T`). `defer`s
-run, as for `return`.
+Inside a closure it returns from the closure (give it `-> T`). The
+drops run, as for `return`.
 
 ```vole
 use std::ParseIntError;

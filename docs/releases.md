@@ -120,9 +120,20 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
   order), one anywhere else becomes `format_args(..)`, 0.17's
   `b.push_str(f"..")` becomes `push_fmt`, and a plain literal at a
   format position gets its braces doubled. It refuses nothing. The
-  guide's examples are migrated (but gpu, gpu-render and window);
-  compiler/src, std, the examples and the tests are not yet (their
-  migrated copies check clean).
+  guide's examples are migrated; compiler/src, std, the examples and the
+  tests are not yet (their migrated copies check clean).
+- Rust's print macros get the call without the `!` as their help
+  (`println!("{} {x:?}", a)`: write `println("{} {x:?}", a)`; `format!`
+  is `format_in(.., gpa)`, `write!(f, ..)` `f.write(..)`).
+- **Breaking:** `defer` is removed (Rust has none): `defer e;` and
+  `defer { .. }` are `syntax.defer` (`explain` shows the guard that
+  replaces it, a struct whose `Drop` does the work, alive to the end of
+  the scope; `defer` stays a keyword so the error can name it). The
+  examples close their descriptors and directories with guards (`Fd`,
+  `Dir`, openhtop's `Restore`). `fix --values` no longer deletes `defer
+  v.free()`.
+- `edit`, `fix`, `fmt` and `undo` write a file reached through a symlink
+  through it: the link stays a link.
 
 - `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Lengths and indices stay `i64` for now; indexing takes any integer type.
 - Float to integer `as` saturates for every target type, as Rust's: `300.7 as u8 == 255`, `70000.0 as u16 == 65535`, `-1.0 as u64 == 0` (they were 44, 4464 and `u64::MAX`); NaN is 0. The same in constants, the folder, both code generators and x86-64.

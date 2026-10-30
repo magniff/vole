@@ -99,6 +99,11 @@ fn main(gpa: Gpa) {
   holds no view, also through a type argument (`G<[i64]>` of `impl<T>
   Drop for G<T>`): `own.drop_view`, since its drop could read what the
   view points to after that is gone. std's containers of views are fine.
+- A guard is a struct whose `Drop` releases what it holds (closes a
+  descriptor, restores the terminal), made where the resource is taken:
+  `let _closer = Closer { fd };` runs its drop on every exit of the
+  scope, after the locals made later (`let _ = ..` drops at once). It is
+  what `defer` did before 0.26.2 (now `syntax.defer`).
 - A `match`, `if let` or `let (a, _) = t` by value on a local moves
   only the parts it binds; the rest (`_`, `..`, a wildcard arm) stays
   in the local and is dropped with it, at its scope's end. `v[i] = x`
@@ -110,8 +115,7 @@ fn main(gpa: Gpa) {
   (`std::take(&x)` for a `Default` value), `std::replace`, or
   `.clone()`.
 - `v.free()` still works: it frees now and leaves `v` empty (its drop
-  then frees nothing). `defer v.free()`, the idiom before 0.17, is
-  legal and no longer needed.
+  then frees nothing).
 
 ## Accesses
 

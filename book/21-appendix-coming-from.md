@@ -176,7 +176,7 @@ choice about memory.
 | interfaces, satisfied implicitly | traits, implemented explicitly, resolved at compile time; enums for "one of several types" | 5, 9 |
 | generics | generics, specialized for each type (no boxing) | 9 |
 | slices that share an array | `[T]` views, which can't outlive or see changes to what they view | 4 |
-| `defer` | `defer` (`volec guide syntax`), and `Drop` for values that clean up after themselves | 4, 15 |
+| `defer` | a guard, a struct whose `Drop` cleans up, made where the defer was (`volec guide memory`); `defer` itself is removed in 0.26.2 | 4, 15 |
 | `go fmt`, `go vet` | `volec fmt`, and the compiler's own checks | 17 |
 | modules and packages | modules (`mod`, `use`, `pub`); no packages yet | 11 |
 | zero values | every variable is set when it's declared | 3 |

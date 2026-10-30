@@ -8,13 +8,14 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   `//` above an item is its comment.
 - Identifiers: ASCII letters, digits, `_`; `_` alone is the wildcard.
   `r#type` is the identifier `type` (C names that are keywords).
-- Keywords: `as break const continue defer else enum extern false fn for
-  if impl import in let loop match mod pub return static struct trait
-  true type union unsafe use var while`; `inout` and `sink` (0.20) are
-  words where a convention, a binding or a closure starts. Reserved
-  (errors): `where`, `dyn`, `@`; `mut` and `move` are Rust's spellings,
-  each a `conv.rust` error naming vole's (`var`, `sink ||`). `self`,
-  `Self`, `super`, `crate` are names.
+- Keywords: `as break const continue else enum extern false fn for if
+  impl import in let loop match mod pub return static struct trait true
+  type union unsafe use var while`; `inout` and `sink` (0.20) are words
+  where a convention, a binding or a closure starts, `where` (0.26.2)
+  where an item's bounds do. Reserved (errors): `defer` (`syntax.defer`,
+  removed in 0.26.2: a guard with `Drop` does it), `dyn`, `@`; `mut`
+  and `move` are Rust's spellings, each a `conv.rust` error naming
+  vole's (`var`, `sink ||`). `self`, `Self`, `super`, `crate` are names.
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,
@@ -128,7 +129,6 @@ let (a, var b) = (3, 4);            // patterns that always match; `var` per nam
 b += 0;
 inout r = &y;                       // an access to y: r is used as y itself
 r += x + a * b;                     // = += -= *= /= %= &= |= ^= <<= >>=
-defer println("last");              // runs when the block exits
 {
     let inner = y;                  // a block is an expression
     std::print_int(inner);
@@ -137,7 +137,6 @@ println("");
 ```
 ```out
 15
-last
 ```
 
 The binding forms: `let x = e` (immutable: takes `e` when this
