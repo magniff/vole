@@ -5,12 +5,11 @@
 
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
-use std::num::f32_to_bits;
 
 use font::GLYPHS;
 use shaders::{
-    ADVECT_DYE, ADVECT_VEL, BLOOM, BLUR_X, BLUR_Y, CONFINE, CURL, DIVERGENCE, JACOBI, MEAN, PROJECT,
-    RENDER,
+    ADVECT_DYE, ADVECT_VEL, BLOOM, BLUR_X, BLUR_Y, CONFINE, CURL, DIVERGENCE, GpuParams, GpuSplat,
+    JACOBI, MEAN, PROJECT, RENDER,
 };
 use ui::{COLS, ROWS};
 
@@ -191,40 +190,27 @@ fn rms(xs: [f32]) -> f64 {
     if xs.len() == 0 { 0.0 } else { (s / xs.len() as f64).sqrt() }
 }
 
-// The shaders' `Params` as 52 words: four u32s, twelve f32s, the two
-// splats (three vec4<f32> each), then the overlay's three vec4<f32>.
+// The shaders' parameters for p, on a w x h grid and an sw x sh target:
+// GpuParams (shaders.vl), the struct the shaders' COMMON declares.
 #[pure]
-fn pack(p: Params, w: i64, h: i64, sw: i64, sh: i64) -> [u32; 52] {
-    var words: [u32; 52] = [0; 52];
-    words[0] = w as u32;
-    words[1] = h as u32;
-    words[2] = p.n_splats as u32;
-    words[3] = p.view as u32;
-    let fs: [f32; 12] = [
-        p.dt, p.time, p.vorticity, p.dye_keep, p.vel_keep, p.emit, sw as f32, sh as f32, p.bloom,
-        p.shade, p.jet_speed, 0.0,
-    ];
-    for i in 0..12 {
-        words[4 + i] = f32_to_bits(fs[i]);
-    }
+fn gpu_params(p: Params, w: i64, h: i64, sw: i64, sh: i64) -> GpuParams {
+    var splats = [GpuSplat { seg: [0.0; 4], force: [0.0; 4], color: [0.0; 4] }; 2];
     for k in 0..2 {
         let s = p.splats[k];
-        let v: [f32; 12] = [
-            s.x0, s.y0, s.x1, s.y1, s.fx, s.fy, s.radius, 0.0, s.r, s.g, s.b, s.amount,
-        ];
-        for i in 0..12 {
-            words[16 + k * 12 + i] = f32_to_bits(v[i]);
-        }
+        splats[k] = GpuSplat {
+            seg: [s.x0, s.y0, s.x1, s.y1], force: [s.fx, s.fy, s.radius, 0.0],
+            color: [s.r, s.g, s.b, s.amount],
+        };
     }
     let (r, g, b) = p.brush;
-    let ui: [f32; 12] = [
-        p.ui_x, p.ui_y, p.ui_px, if p.ui_shown { 1.0 } else { 0.0 }, p.ui_cols as f32,
-        p.ui_rows as f32, COLS as f32, 0.0, r, g, b, 0.0,
-    ];
-    for i in 0..12 {
-        words[40 + i] = f32_to_bits(ui[i]);
+    GpuParams {
+        w: w as u32, h: h as u32, n_splats: p.n_splats as u32, view: p.view as u32, dt: p.dt,
+        time: p.time, vorticity: p.vorticity, dye_keep: p.dye_keep, vel_keep: p.vel_keep,
+        emit: p.emit, sw: sw as f32, sh: sh as f32, bloom: p.bloom, shade: p.shade,
+        jet_speed: p.jet_speed, r1: 0.0, splats,
+        ui: [p.ui_x, p.ui_y, p.ui_px, if p.ui_shown { 1.0 } else { 0.0 }],
+        ui2: [p.ui_cols as f32, p.ui_rows as f32, COLS as f32, 0.0], brush: [r, g, b, 0.0],
     }
-    words
 }
 
 impl Sim {
@@ -236,7 +222,7 @@ impl Sim {
         let cells = w * h;
         let gw = (w + 3) / 4;
         let gh = (h + 3) / 4;
-        let ubuf = dev.buffer(208, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let ubuf = dev.buffer(size_of(GpuParams), BufferUsage::UNIFORM | BufferUsage::COPY_DST);
         let u0 = storage(dev, (w + 1) * h * 4);
         let v0 = storage(dev, w * (h + 1) * 4);
         let u1 = storage(dev, (w + 1) * h * 4);
@@ -331,9 +317,16 @@ impl Sim {
     // The parameters of the next step and frame, for a target of sw x sh
     // pixels (written in queue order: a frame in flight keeps its own).
     pub fn set_params(inout self, p: Params, sw: i64, sh: i64) {
-        let words = pack(p, self.w, self.h, sw, sh);
+        let g = gpu_params(p, self.w, self.h, sw, sh);
         self.view = p.view;
-        self.queue.write_buffer(self.ubuf, 0, gpu::bytes_of_u32(words[..]));
+        // UNSAFE: the uniform's bytes are GpuParams' own, and std::gpu has no safe view of a
+        // struct as bytes (a struct may have padding, which is no value).
+        // SAFETY: GpuParams is #[repr(wgsl)] without padding (16 4-byte scalars, two GpuSplats of
+        // three [f32; 4], three [f32; 4]: 208 bytes, each field at the end of the one before), so
+        // size_of(GpuParams) initialized bytes are at &g, which lives across the call; write_buffer
+        // copies them.
+        let bytes = unsafe { (&g as *GpuParams as *u8)[0..size_of(GpuParams)] };
+        self.queue.write_buffer(self.ubuf, 0, bytes);
     }
 
     // One step of the simulation, recorded into `enc`: advect the

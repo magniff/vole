@@ -1,0 +1,351 @@
+// The WGSL the compiler writes for a block (0.26.2, plan §10.1 item 3):
+// the `const`s and `#[repr(wgsl)]` structs a `with` list names, so that
+// one definition serves host and shader. A const of i32, u32, f32 or bool
+// (or an array of them) with a literal value becomes `const W: u32 = 64u;`
+// (an f32 written as it reads back, `0.1f`); a `#[repr(wgsl)]` struct its
+// WGSL `struct`, its nested structs first, once each. Its layout is
+// WGSL's (front::types::compute_layout under REPR_WGSL): `[f32; 3]` is a
+// `vec3<f32>`, aligned to 16, so host and shader cannot disagree.
+//
+// A field WGSL cannot share (`bool`, `usize`, `i64`, a pointer, `Vec`, a
+// reference, a tuple, an enum) is gpu.repr, naming it, with the fix when
+// there is one (`u32` for a `bool`). Every `#[repr(wgsl)]` struct of the
+// program is checked so (check_repr_structs), named in a `with` or not.
+
+use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, sym_text};
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help};
+use crate::front::ast::{NODES, NodeKind, REPR_WGSL, child};
+use crate::front::check::PROGRAM;
+use crate::front::embed::parts::{item_named, path_module};
+use crate::front::modules::module_of;
+
+// The `#[repr(wgsl)]` structs whose fields WGSL cannot share all of
+// (gpu.repr said so): no WGSL is written for them.
+static var BAD_STRUCTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Every `#[repr(wgsl)]` struct's fields checked (gpu.repr).
+pub fn check_repr_structs() {
+    BAD_STRUCTS.count = 0;
+    for i in 0..NODES[PROGRAM].count {
+        let s = child(PROGRAM, i);
+        if NODES[s].kind != NodeKind::Struct || (NODES[s].c & REPR_WGSL) == 0 {
+            continue;
+        }
+        var ok = true;
+        var deps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let scratch = buf_new();
+        for k in 0..NODES[s].count {
+            let f = child(s, k);
+            if !wgsl_type(NODES[f].b, s, f, scratch, &deps, true) {
+                ok = false;
+            }
+        }
+        if NODES[s].count == 0 {
+            repr_error(s, s, -1, "has no fields: WGSL has no empty struct", "", "");
+            ok = false;
+        }
+        if !ok {
+            BAD_STRUCTS.push(s);
+        }
+    }
+}
+
+// Whether struct s is one gpu.repr refused.
+pub fn is_bad_struct(s: i64) -> bool {
+    for i in 0..BAD_STRUCTS.count {
+        if BAD_STRUCTS.get(i) == s {
+            return true;
+        }
+    }
+    false
+}
+
+// Item (a Const or a struct) into `out`, after the structs its fields
+// name, each once.
+pub fn add_made(item: i64, out: inout IntVec) {
+    for i in 0..out.count {
+        if out.get(i) == item {
+            return;
+        }
+    }
+    if NODES[item].kind == NodeKind::Struct {
+        var deps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let scratch = buf_new();
+        for k in 0..NODES[item].count {
+            let f = child(item, k);
+            wgsl_type(NODES[f].b, item, f, scratch, &deps, false);
+        }
+        for i in 0..deps.count {
+            add_made(deps.get(i), &out);
+        }
+    }
+    out.push(item);
+}
+
+// The WGSL of item (a Const or a `#[repr(wgsl)]` struct) into buffer b.
+pub fn write_made(item: i64, b: i64) {
+    var deps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    if NODES[item].kind == NodeKind::Struct {
+        buf_bytes(b, "struct ");
+        buf_bytes(b, sym_text(NODES[item].a));
+        buf_bytes(b, " {\n");
+        for k in 0..NODES[item].count {
+            let f = child(item, k);
+            buf_bytes(b, "    ");
+            buf_bytes(b, sym_text(NODES[f].a));
+            buf_bytes(b, ": ");
+            wgsl_type(NODES[f].b, item, f, b, &deps, false);
+            buf_bytes(b, ",\n");
+        }
+        buf_bytes(b, "}\n");
+        return;
+    }
+    buf_bytes(b, "const ");
+    buf_bytes(b, sym_text(NODES[item].a));
+    buf_bytes(b, ": ");
+    let t = NODES[item].b;
+    wgsl_type(t, item, -1, b, &deps, false);
+    buf_bytes(b, " = ");
+    write_value(NODES[item].c, t, b);
+    buf_bytes(b, ";\n");
+}
+
+// The scalar a type node names: 1 i32, 2 u32, 3 f32, 4 bool, 0 none.
+fn scalar_of(t: i64) -> i64 {
+    if NODES[t].kind != NodeKind::TyName || NODES[t].count > 0 || NODES[t].g != 0 {
+        return 0;
+    }
+    let name = sym_text(NODES[t].a);
+    if name == "i32" { 1 } else if name == "u32" { 2 } else if name == "f32" { 3 }
+    else if name == "bool" { 4 } else { 0 }
+}
+
+fn scalar_text(k: i64) -> [u8] {
+    if k == 1 { "i32" } else if k == 2 { "u32" } else if k == 3 { "f32" } else { "bool" }
+}
+
+// The literal length of array type node t, or -1.
+fn array_len(t: i64) -> i64 {
+    let n = NODES[t].b;
+    if n > 0 && NODES[n].kind == NodeKind::Int { NODES[n].a } else { -1 }
+}
+
+// The WGSL type of vole type node t into buffer b: field f of struct (or
+// const) `owner` (f -1: the const's own type). A nested `#[repr(wgsl)]`
+// struct goes into deps. False when WGSL cannot share it: gpu.repr when
+// `report`.
+fn wgsl_type(t: i64, owner: i64, f: i64, b: i64, deps: inout IntVec, report: bool) -> bool {
+    let k = NODES[t].kind;
+    let sc = scalar_of(t);
+    if sc == 4 && f >= 0 {
+        if report {
+            repr_error(owner, f, t, "is a bool, and WGSL's bool is not host-shareable",
+                "a bool's size is not WGSL's: write it as a u32 (0 or 1)", "u32");
+        }
+        return false;
+    }
+    if sc != 0 {
+        buf_bytes(b, scalar_text(sc));
+        return true;
+    }
+    if k == NodeKind::TyArray {
+        let n = array_len(t);
+        if n < 0 {
+            if report {
+                repr_error(owner, f, t, "is an array whose length is no integer literal",
+                    "write the length as a number: the WGSL is written before the program's consts are evaluated", "");
+            }
+            return false;
+        }
+        let e = NODES[t].a;
+        let es = scalar_of(e);
+        if es >= 1 && es <= 3 && n >= 2 && n <= 4 && f >= 0 {
+            // [f32; 3]: vec3<f32>
+            buf_bytes(b, "vec");
+            buf_int(b, n);
+            buf_byte(b, '<');
+            buf_bytes(b, scalar_text(es));
+            buf_byte(b, '>');
+            return true;
+        }
+        if NODES[e].kind == NodeKind::TyArray && scalar_of(NODES[e].a) != 0 && array_len(e) == 3 {
+            if report {
+                repr_error(owner, f, t,
+                    "is an array of 3-element arrays: WGSL's array<vec3<_>, N> has a stride of 16, the host's of 12",
+                    "make the element a 4-element array", "");
+            }
+            return false;
+        }
+        buf_bytes(b, "array<");
+        if !wgsl_type(e, owner, f, b, &deps, report) {
+            return false;
+        }
+        buf_bytes(b, ", ");
+        buf_int(b, n);
+        buf_byte(b, '>');
+        return true;
+    }
+    if k == NodeKind::TyName && NODES[t].g == 0 && f >= 0 {
+        let name = sym_text(NODES[t].a);
+        let fix = if name == "usize" || name == "u64" || name == "u8" || name == "u16" { "u32" }
+            else if name == "i64" || name == "isize" || name == "i8" || name == "i16" { "i32" }
+            else if name == "f64" { "f32" } else { "" };
+        if fix.len > 0 && NODES[t].count == 0 {
+            if report {
+                repr_error(owner, f, t, "is no WGSL scalar: WGSL shares i32, u32 and f32",
+                    "write it as the WGSL scalar it fits", fix);
+            }
+            return false;
+        }
+        let m = path_module(module_of(owner), t, false);
+        let s = if m >= 0 { item_named(m, NODES[t].a) } else { -1 };
+        if s >= 0 && NODES[s].kind == NodeKind::Struct && (NODES[s].c & REPR_WGSL) != 0 {
+            buf_bytes(b, sym_text(NODES[s].a));
+            deps.push(s);
+            return true;
+        }
+        if s >= 0 && NODES[s].kind == NodeKind::Struct {
+            if report {
+                repr_error(owner, f, t, "is a struct without #[repr(wgsl)]",
+                    "put #[repr(wgsl)] on it, so that its layout is WGSL's too", "");
+            }
+            return false;
+        }
+    }
+    if report {
+        repr_error(owner, f, t,
+            "is not host-shareable: a #[repr(wgsl)] struct holds i32, u32, f32, [T; 2|3|4] (vectors), arrays and #[repr(wgsl)] structs",
+            "no pointer, reference, Vec, slice, tuple, enum, bool or 64-bit number: they have no WGSL layout",
+            "");
+    }
+    false
+}
+
+// gpu.repr at field f of struct s (or the struct itself, f == s), its type
+// node t: `S.f (T) <what>`, the help, and the fix (t's text replaced) when
+// there is one.
+fn repr_error(s: i64, f: i64, t: i64, what: [u8], help: [u8], fix: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"gpu.repr";
+    let m = buf_new();
+    buf_bytes(m, sym_text(NODES[s].a));
+    if f != s && f >= 0 {
+        buf_byte(m, '.');
+        buf_bytes(m, sym_text(NODES[f].a));
+    }
+    if t >= 0 {
+        buf_bytes(m, " (");
+        buf_bytes(m, SRC[NODES[t].start..NODES[t].end]);
+        buf_byte(m, ')');
+    }
+    buf_byte(m, ' ');
+    buf_bytes(m, what);
+    err_begin(if f >= 0 { NODES[f].start } else { NODES[s].start });
+    err_fmt(buf_slice(m));
+    if help.len > 0 {
+        let h = buf_new();
+        buf_bytes(h, help);
+        buf_byte(h, 0);
+        err_help(buf_slice(h).ptr);
+    }
+    if fix.len > 0 && t >= 0 {
+        err_fix(NODES[t].start, NODES[t].end, fix);
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// ---- consts ----
+
+// Whether const c (named at `path`) can be written in WGSL: a scalar or
+// an array of them, a literal value; else embed.with.
+pub fn const_ok(c: i64, path: i64) -> bool {
+    let t = NODES[c].b;
+    var ok = scalar_of(t) != 0;
+    if NODES[t].kind == NodeKind::TyArray {
+        ok = scalar_of(NODES[t].a) != 0 && array_len(t) >= 0;
+    }
+    ok = ok && literal_ok(NODES[c].c, t);
+    if !ok {
+        let saved = ERR_KIND;
+        ERR_KIND = c"embed.with";
+        err_begin(NODES[path].start);
+        err_fmt(f"the const '{sym_text(NODES[c].a)}' cannot be written in WGSL: a shared const is an i32, u32, f32 or bool, or an array of them, with a literal value");
+        err_help(c"write its value as a literal (`pub const W: u32 = 64;`): the WGSL is written before the program's consts are evaluated");
+        err_end_soft();
+        ERR_KIND = saved;
+    }
+    ok
+}
+
+// Whether expression v is a literal of type node t: a number, `-` one, a
+// bool, or an array (`[a, b]`, `[a; n]`) of them for an array type.
+fn literal_ok(v: i64, t: i64) -> bool {
+    if v <= 0 {
+        return false;
+    }
+    let k = NODES[v].kind;
+    if NODES[t].kind == NodeKind::TyArray {
+        if k == NodeKind::Array {
+            for i in 0..NODES[v].count {
+                if !literal_ok(child(v, i), NODES[t].a) {
+                    return false;
+                }
+            }
+            return NODES[v].count == array_len(t);
+        }
+        return k == NodeKind::Repeat && literal_ok(NODES[v].a, NODES[t].a);
+    }
+    let sc = scalar_of(t);
+    if sc == 4 {
+        return k == NodeKind::Bool;
+    }
+    if k == NodeKind::Unary && NODES[v].op == crate::front::lexer::Tok::Minus {
+        return sc != 2 && literal_ok(NODES[v].b, t);
+    }
+    if k == NodeKind::Float {
+        // (an f32 WGSL can write: finite)
+        let x = std::num::f64_from_bits(NODES[v].a as u64) as f32;
+        return sc == 3 && x == x && x - x == 0.0;
+    }
+    k == NodeKind::Int
+}
+
+// Literal v (literal_ok's) of type node t, in WGSL, into buffer b.
+fn write_value(v: i64, t: i64, b: i64) {
+    let k = NODES[v].kind;
+    if NODES[t].kind == NodeKind::TyArray {
+        let e = NODES[t].a;
+        let n = array_len(t);
+        buf_bytes(b, "array<");
+        buf_bytes(b, scalar_text(scalar_of(e)));
+        buf_bytes(b, ", ");
+        buf_int(b, n);
+        buf_bytes(b, ">(");
+        for i in 0..n {
+            if i > 0 {
+                buf_bytes(b, ", ");
+            }
+            write_value(if k == NodeKind::Array { child(v, i) } else { NODES[v].a }, e, b);
+        }
+        buf_byte(b, ')');
+        return;
+    }
+    let sc = scalar_of(t);
+    if k == NodeKind::Bool {
+        buf_bytes(b, if NODES[v].a != 0 { "true" } else { "false" });
+    } else if k == NodeKind::Unary {
+        buf_byte(b, '-');
+        write_value(NODES[v].b, t, b);
+    } else if sc == 3 {
+        let x = if k == NodeKind::Float { std::num::f64_from_bits(NODES[v].a as u64) as f32 }
+            else { NODES[v].a as f32 };
+        let s = buf_new();
+        crate::base::buf_fmt(s, f"{x}");
+        buf_bytes(b, buf_slice(s));
+        buf_byte(b, 'f');
+    } else {
+        buf_int(b, NODES[v].a);
+        buf_byte(b, if sc == 1 { 'i' } else { 'u' });
+    }
+}

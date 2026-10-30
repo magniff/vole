@@ -15,8 +15,9 @@
 
 use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, intern_c, sym_text};
 use crate::base::diag::{ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fmt, err_help};
-use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::ast::{NODES, NodeKind, REPR_WGSL, child};
 use crate::front::check::PROGRAM;
+use crate::front::embed::made::{add_made, check_repr_structs, const_ok, is_bad_struct};
 use crate::front::modules::{MODULES, child_module, is_within, module_of};
 use crate::front::parser::items::ITEM_PUBLIC;
 
@@ -27,9 +28,11 @@ pub static var BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var WITH_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var WITH_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static var IS_PART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The `with` entries: the item named (a block's index in BLOCKS, or -1
-// after an error) and the path's node.
+// The `with` entries: the block named (its index in BLOCKS, or -1: none,
+// or after an error), the const or `#[repr(wgsl)]` struct named (its node;
+// 0: none) and the path's node.
 static var WITH_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var WITH_ITEM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var WITH_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 static var SYM_WGSL: i64 = 0;
@@ -45,6 +48,7 @@ pub fn resolve_parts() {
     WITH_COUNT.count = 0;
     IS_PART.count = 0;
     WITH_BLOCK.count = 0;
+    WITH_ITEM.count = 0;
     WITH_PATH.count = 0;
     if SYM_WGSL == 0 {
         SYM_WGSL = intern_c(c"wgsl");
@@ -53,13 +57,19 @@ pub fn resolve_parts() {
         SYM_SELF = intern_c(c"self");
     }
     var any_with = false;
+    var any_repr = false;
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
         if NODES[item].kind == NodeKind::Embed && NODES[item].b == SYM_WGSL {
             BLOCKS.push(item);
             IS_PART.push(0);
             any_with = any_with || NODES[item].count > 0;
+        } else if NODES[item].kind == NodeKind::Struct && (NODES[item].c & REPR_WGSL) != 0 {
+            any_repr = true;
         }
+    }
+    if any_repr {
+        check_repr_structs();
     }
     if !any_with {
         for b in 0..BLOCKS.count {
@@ -74,8 +84,11 @@ pub fn resolve_parts() {
         WITH_COUNT.push(NODES[e].count);
         for k in 0..NODES[e].count {
             let path = child(e, k);
-            let named = resolve_with(e, path);
+            let item = resolve_with(e, path);
+            let named = if item >= 0 && NODES[item].kind == NodeKind::Embed { block_of(item) }
+                else { -1 };
             WITH_BLOCK.push(named);
+            WITH_ITEM.push(if named < 0 && item >= 0 { item } else { 0 });
             WITH_PATH.push(path);
             if named >= 0 {
                 IS_PART.set(named, 1);
@@ -144,11 +157,61 @@ fn cycle_error(k: i64, p: i64, stack: IntVec) {
     ERR_KIND = saved;
 }
 
-// The block (its index in BLOCKS) that `path` (a TyName) names from block
-// e's module, or -1 after embed.with.
+// The item `path` (a TyName) names from block e's module: an Embed node,
+// a Const or a `#[repr(wgsl)]` Struct (made.vl writes their WGSL), or -1
+// after embed.with.
 fn resolve_with(e: i64, path: i64) -> i64 {
-    var m = module_of(e);
-    let from = m;
+    let from = module_of(e);
+    let m = path_module(from, path, true);
+    if m < 0 {
+        return -1;
+    }
+    let name = NODES[path].a;
+    let item = item_named(m, name);
+    if item < 0 {
+        with_error(path, NODES[path].start, f"no `embed wgsl` block, const or #[repr(wgsl)] struct '{sym_text(name)}' in this module", "`with` names an item by its path from this block's module (`with shaders::COMMON`); a `use` does not bring one in");
+        return -1;
+    }
+    let k = NODES[item].kind;
+    if k != NodeKind::Embed && k != NodeKind::Const && k != NodeKind::Struct {
+        with_error(path, NODES[path].start,
+            f"'{sym_text(name)}' is {item_kind_text(k)}, not an `embed wgsl` block, a const or a #[repr(wgsl)] struct",
+            "`with` names embedded blocks, whose text comes before this block's own, and the consts and #[repr(wgsl)] structs whose WGSL the compiler writes");
+        return -1;
+    }
+    if k == NodeKind::Struct && (NODES[item].c & REPR_WGSL) == 0 {
+        with_error(path, NODES[path].start,
+            f"the struct '{sym_text(name)}' is no #[repr(wgsl)] struct: its layout is not WGSL's",
+            "put #[repr(wgsl)] on it: its fields are then laid out as WGSL's, and the block gets its WGSL `struct`");
+        return -1;
+    }
+    if (NODES[item].p & ITEM_PUBLIC) == 0 && !is_within(from, m) {
+        with_error(path, NODES[path].start, f"'{sym_text(name)}' is private to its module",
+            "an item named from another module is `pub`");
+        return -1;
+    }
+    if k == NodeKind::Struct && !is_within(from, m) {
+        for i in 0..NODES[item].count {
+            let f = child(item, i);
+            if (NODES[f].p & ITEM_PUBLIC) == 0 {
+                with_error(path, NODES[path].start,
+                    f"the field '{sym_text(NODES[item].a)}.{sym_text(NODES[f].a)}' is private to its module",
+                    "the WGSL struct a block is given has every field: a struct named from another module has `pub` fields");
+                return -1;
+            }
+        }
+    }
+    if k == NodeKind::Const && !const_ok(item, path) {
+        return -1;
+    }
+    item
+}
+
+// The module `path`'s segments before its name lead to from module
+// `from` (`a::b::X`: a::b; `crate::`, `super::`, `self::`), or -1 (after
+// embed.with when `report`).
+pub fn path_module(from: i64, path: i64, report: bool) -> i64 {
+    var m = from;
     for k in 0..NODES[path].count {
         let seg = child(path, k);
         let s = NODES[seg].a;
@@ -160,41 +223,35 @@ fn resolve_with(e: i64, path: i64) -> i64 {
             m = child_module(m, s);
         }
         if m < 0 {
-            with_error(path, NODES[seg].start, f"no module '{sym_text(s)}' here",
-                "a `with` path starts at the block's module (`shaders::COMMON`), or at `crate::` or `super::`");
+            if report {
+                with_error(path, NODES[seg].start, f"no module '{sym_text(s)}' here",
+                    "a `with` path starts at the block's module (`shaders::COMMON`), or at `crate::` or `super::`");
+            }
             return -1;
         }
     }
-    let name = NODES[path].a;
+    m
+}
+
+// The item named `name` in module m: the first block, const or struct of
+// that name, else the first other item, else -1.
+pub fn item_named(m: i64, name: i64) -> i64 {
     var other = -1;
     for i in 0..NODES[PROGRAM].count {
         let item = child(PROGRAM, i);
         if NODES[item].a != name || !is_named_item(NODES[item].kind) || module_of(item) != m {
             continue;
         }
-        if NODES[item].kind == NodeKind::Embed {
-            if (NODES[item].p & ITEM_PUBLIC) == 0 && !is_within(from, m) {
-                with_error(path, NODES[path].start,
-                    f"the block '{sym_text(name)}' is private to its module",
-                    "a part named from another module is `pub embed wgsl ..`");
-                return -1;
-            }
-            for b in 0..BLOCKS.count {
-                if BLOCKS.get(b) == item {
-                    return b;
-                }
-            }
+        let k = NODES[item].kind;
+        if (k == NodeKind::Embed && NODES[item].b == SYM_WGSL) || k == NodeKind::Const
+            || k == NodeKind::Struct {
+            return item;
         }
-        other = item;
+        if other < 0 {
+            other = item;
+        }
     }
-    if other >= 0 {
-        with_error(path, NODES[path].start,
-            f"'{sym_text(name)}' is {item_kind_text(NODES[other].kind)}, not an `embed wgsl` block",
-            "`with` names embedded blocks, whose text comes before this block's own");
-    } else {
-        with_error(path, NODES[path].start, f"no `embed wgsl` block '{sym_text(name)}' in this module", "`with` names a block by its path from this block's module (`with shaders::COMMON`); a `use` does not bring one in");
-    }
-    -1
+    other
 }
 
 // Whether an item of this kind has a name `with` could mean.
@@ -269,6 +326,31 @@ fn add_in_order(b: i64, out: inout IntVec) {
         }
     }
     out.push(b);
+}
+
+// The consts and `#[repr(wgsl)]` structs block b's module names (through
+// any of its blocks' `with`), the structs' nested structs first, each
+// once, into out; `order` is its module_order. False when one is a
+// struct gpu.repr refused (the module is then not checked).
+pub fn module_items(order: IntVec, out: inout IntVec) -> bool {
+    out.count = 0;
+    var ok = true;
+    for i in 0..order.count {
+        let b = order.get(i);
+        let first = WITH_FIRST.get(b);
+        for k in first..first + WITH_COUNT.get(b) {
+            let item = WITH_ITEM.get(k);
+            if item > 0 {
+                add_made(item, &out);
+            }
+        }
+    }
+    for i in 0..out.count {
+        if is_bad_struct(out.get(i)) {
+            ok = false;
+        }
+    }
+    ok
 }
 
 // (embed.part_use) The blocks that include part b directly or through

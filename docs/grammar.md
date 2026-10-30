@@ -2173,3 +2173,26 @@ what K declares after it).
   fields, `volec fix --suggested` the first).
 - `with` is not a Rust keyword: like `embed` and `wgsl` it stays an
   identifier everywhere else. `volec fmt` keeps the header on its line.
+
+**Shared consts and structs** *(0.26.2)*. A `with` list may also name
+a `const` and a `#[repr(wgsl)]` struct; the compiler writes their WGSL
+before the module's blocks, so one definition serves host and shader:
+
+- a const of `i32`, `u32`, `f32` or `bool`, or an array of them, with a
+  literal value (`pub const W: u32 = 64;` is `const W: u32 = 64u;`; an
+  `f32` is written as it reads back, `0.1f`); another const is
+  `embed.with`;
+- `#[repr(wgsl)] struct` (alone: no `C`, `packed` or `align`) lays the
+  struct out as WGSL does: its fields in order, a `[T; 2]` of `i32`,
+  `u32` or `f32` a `vec2<T>` aligned to 8, a `[T; 3]` or `[T; 4]` a
+  `vec3`/`vec4` aligned to 16 (a vec3's size stays 12), a nested
+  `#[repr(wgsl)]` struct by its own layout, `[T; N]` an `array<T, N>`;
+  the size rounds up to the alignment, so `size_of(T)` is WGSL's
+  `SizeOf`. The block gets its WGSL `struct`, nested structs first, once
+  each. A `bool`, `usize`, 64-bit number, pointer, `Vec`, slice, tuple,
+  enum or array of 3-element arrays in one is `gpu.repr`, naming the
+  field (`fix --suggested` writes `u32` for a `bool`). Named from another
+  module, the struct and its fields are `pub`.
+- An error in the written WGSL is reported at the item's declaration,
+  "in the WGSL made for 'P'". Resolution is one way: a block exports only
+  its entry points.
