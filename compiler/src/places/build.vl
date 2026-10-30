@@ -548,12 +548,15 @@ fn deref_place(e: i64) {
         let tail = NODES[e].a;
         if tail != 0 && NODES[tail].kind == NodeKind::Unary && NODES[tail].op == Tok::Amp
             && is_place_expr(NODES[tail].b) {
+            let saved_tv = TV_SCOPE;
+            TV_SCOPE = temp_scope(e);
             for i in 0..NODES[e].count {
                 if !reachable() {
                     break;
                 }
                 lower_stmt(child(e, i));
             }
+            TV_SCOPE = saved_tv;
             if place_of(NODES[tail].b) {
                 return;
             }
@@ -1989,12 +1992,15 @@ fn lower_block(b: i64, dl: i64, dp: i64) {
     // of its own)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
     let s = if scoped { push_scope(SC_BLOCK, b) } else { -1 };
+    let saved_tv = TV_SCOPE;
+    TV_SCOPE = if (flags & NODE_TEMP) != 0 { temp_scope(b) } else { -1 };
     for i in 0..NODES[b].count {
         if !reachable() {
             break;
         }
         lower_stmt(child(b, i));
     }
+    TV_SCOPE = saved_tv;
     let tail = NODES[b].a;
     if tail != 0 && reachable() {
         expr_into(tail, dl, dp);
@@ -2014,7 +2020,13 @@ fn is_void_dest(dl: i64, dp: i64) -> bool {
 fn lower_stmt(st: i64) {
     let k = NODES[st].kind;
     if k == NodeKind::Defer {
-        if (NODES[st].p & DEFER_IMPLICIT) != 0 || temp_defer(st) {
+        if (NODES[st].p & DEFER_IMPLICIT) != 0 {
+            return;
+        }
+        if temp_defer(st) {
+            // (the temporary it drops drops at the end of this scope)
+            TEMP_SCOPES.push(temp_flag(st));
+            TEMP_SCOPES.push(scope_depth() - 1);
             return;
         }
         schedule(EN_DEFER, st);
@@ -2092,6 +2104,54 @@ fn temp_defer(d: i64) -> bool {
     NODES[c].kind == NodeKind::Ident && NODES[c].res == Res::Local && own_temp_local(NODES[c].y)
 }
 
+// (0.26.1, R5) Statement temporaries: each skipped prelude defer's
+// `__own_tf` and the scope it is in, (tf, scope) pairs. A temporary's
+// value drops at the end of that scope, as the defer ran (the end of its
+// statement, or of the block when a binding views it), not at the end of
+// the statement that makes it.
+static var TEMP_SCOPES: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The scope the temporary made by the statement temporary's block being
+// lowered drops in, -1 outside one.
+static var TV_SCOPE: i64 = -1;
+
+// The `__own_tf` local of a statement temporary's defer d (temp_defer).
+fn temp_flag(d: i64) -> i64 {
+    let s = child(NODES[d].a, 0);
+    NODES[NODES[NODES[s].a].a].y
+}
+
+// The scope where the temporary of statement temporary block b drops: the
+// scope of the defer its `__own_tf = true;` names, -1 when none is known.
+fn temp_scope(b: i64) -> i64 {
+    for i in 0..NODES[b].count {
+        let st = child(b, i);
+        if NODES[st].kind == NodeKind::ExprStmt && NODES[st].a != 0 && own_flag_write(NODES[st].a) {
+            let l = NODES[NODES[NODES[st].a].b].y;
+            if crate::places::front::ast_local_name(l) == SYM_TF {
+                var k = TEMP_SCOPES.len() - 2;
+                while k >= 0 {
+                    if TEMP_SCOPES[k] == l {
+                        let s = TEMP_SCOPES[k + 1];
+                        return if s < scope_depth() { s } else { -1 };
+                    }
+                    k -= 2;
+                }
+                return -1;
+            }
+        }
+    }
+    -1
+}
+
+// Schedules an entry at the end of scope s, below the scopes inside it.
+fn schedule_in(s: i64, kind: i64, v: i64) {
+    if s + 1 >= scope_depth() {
+        schedule(kind, v);
+    } else {
+        schedule_outer(s + 1, kind, v);
+    }
+}
+
 fn lower_let(st: i64) {
     let pat = NODES[st].a;
     let init = NODES[st].c;
@@ -2119,15 +2179,31 @@ fn lower_let(st: i64) {
         } else {
             let borrowed = let_borrows(pat, init);
             let ir = user_local(l, pat, borrowed);
+            // (a statement temporary's value: in the scope of its
+            // prelude, R5)
+            var into = -1;
+            if TV_SCOPE >= 0 && crate::places::front::ast_local_name(l) == SYM_TV {
+                into = TV_SCOPE;
+                TV_SCOPE = -1;
+            }
             // (its storage begins first; its drop is registered once it
-            // holds its value, in the block's scope)
-            live(ir);
-            schedule_outer(s, EN_DEAD, ir);
+            // holds its value, in the block's scope. A statement
+            // temporary made on some paths of the scope it drops in, an
+            // arm's, has no storage markers: its storage is the body's, as
+            // the own pass's `__own_tv`)
+            if into < 0 {
+                live(ir);
+                schedule_outer(s, EN_DEAD, ir);
+            }
             if init != 0 {
                 expr_into(init, ir, 0);
             }
             if !has_flag(ir, LF_BORROWED) && needs_drop(P_LOCALS[ir].ty) {
-                schedule_outer(s, EN_DROP, ir);
+                if into >= 0 {
+                    schedule_in(into, EN_DROP, ir);
+                } else {
+                    schedule_outer(s, EN_DROP, ir);
+                }
             }
         }
     } else {
@@ -2205,6 +2281,8 @@ pub fn build_body(f: i64, item: i64) -> bool {
     SCOPES.clear();
     ENTRIES.clear();
     STATICS_SEEN.clear();
+    TEMP_SCOPES.clear();
+    TV_SCOPE = -1;
     UNIT_LOCAL = -1;
     let ret = fn_ret(f);
     new_local(ret, LF_RETURN, -1, 0);
