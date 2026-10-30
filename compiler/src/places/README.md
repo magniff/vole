@@ -44,6 +44,12 @@ A shim's `Drop::drop` call is the instance the checker made for the own
 pass's glue (until step 7 deletes it; a shim that finds none stops the
 compiler with `places: a drop shim found no Drop::drop instance`).
 
+`--check-unsafe` stays on the AST path in 0.26.1: under it
+`middle/lower/places.vl` lowers no body from the IR and no shim (its
+checks name the AST's raw accesses; `places lowering: ... check-unsafe N`
+counts them, 586 functions over tests/run at -O2). Its move to the IR is
+step 8's, in 0.26.2, with the AST walk's removal.
+
 ## The contract
 
 `ir.vl`'s header comment is the reference: what each projection, operand,
