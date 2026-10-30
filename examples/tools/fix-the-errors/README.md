@@ -93,7 +93,7 @@ $ volec query show roster.vl:26
 pub fn with_scores(r: Roster, n: i64) -> i64 {
     let count = 0;
     for s in r.students.as_slice() {
-        if s.scores.len() >= n {
+        if s.scores.len() as i64 >= n {
             count += 1;
         }
     }
@@ -119,13 +119,13 @@ writes the field, `scores.len` (a slice has both, `.len` and `.len()`):
 
 ```console
 $ volec edit patch grades.vl:18 --old 'totl / scores.len()' --new 'total / scores.len()'
-error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len
+error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len as i64
 try: volec edit patch grades.vl:18 --old 'totl / scores.len' --new 'total / scores.len()'
 [exit 1]
 $ volec edit patch grades.vl:18 --old 'totl' --new 'total' --show
 patched crate::grades::average	grades.vl	+1 -1 lines
 // grades.vl:18
-18	    total / scores.len
+18	    total / scores.len as i64
 ```
 
 ## 4. A fix that spans items: `edit apply`

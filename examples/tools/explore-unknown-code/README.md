@@ -80,6 +80,7 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::cell	<std>	19
 std::sync	<std>	29
 std::sync::atomic	<std>	48
 std::sync::mpsc	<std>	24
@@ -153,8 +154,8 @@ $ volec query context quickest --budget 600
 // crate::route::quickest	route.vl:34-63	effects: alloc(Gpa) panic diverge
 pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     let n = size(g);
-    var best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
-    var how: Vec<Step> = Vec::filled_in(n, Step { from: -1, line: 0, minutes: 0 }, gpa);
+    var best: Vec<i64> = Vec::filled_in(n as usize, i64::MAX, gpa);
+    var how: Vec<Step> = Vec::filled_in(n as usize, Step { from: -1, line: 0, minutes: 0 }, gpa);
     var h = new_heap(gpa);
 
     best[from] = 0;
@@ -190,7 +191,7 @@ crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: Heap) -> bool
 crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout Heap) -> Option<Entry>
 crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
 crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap, e: Entry)
-std::Vec::filled_in	<std>:1518:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1613:12	method	pub fn filled_in(n: usize, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
 <std::Vec as Drop>::drop	<std>:436:8	method	fn drop(inout self)
