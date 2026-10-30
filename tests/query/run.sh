@@ -333,8 +333,9 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # and the symbols of the generated code (closures, instances; not the
 # runtime's, nor std's statics: 0.20.0 names `vole.static.std.X` for a
 # static of a std submodule, which `query def` does not take back yet, a
-# 0.20.1 item; aarch64-linux's argv statics showed it), each
-# given to `query def` (positions and modules to `show` and `items`).
+# 0.20.1 item; aarch64-linux's argv statics showed it; nor, 0.26.1, the
+# places IR's drop shims, `vole.$drop.T`: glue with no item of its own),
+# each given to `query def` (positions and modules to `show` and `items`).
 cd "$HERE" || exit 2
 roundtrip() { # <program dir> <seed names...>
     prog=$1
@@ -350,7 +351,7 @@ roundtrip() { # <program dir> <seed names...>
         "$COMPILER" query items 2>/dev/null | awk -F "$TAB" '{ print "items " $1; print "items " $2 }'
         "$COMPILER" check --diagnostics=short "$prog/main.vl" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
         "$COMPILER" "$prog/main.vl" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
-            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
+            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ && !/^_?vole\.\$drop\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
     } | sort -u >"$WORK/rt.names"
     : >"$WORK/rt.bad"
     n=0
