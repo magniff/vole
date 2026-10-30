@@ -14,11 +14,11 @@ use std::gpu::wgsl::uniformity;
 use std::gpu::wgsl::front::new_front;
 
 use crate::base::{
-    IntVec, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, intern, intern_c, sym_name,
+    IntVec, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, intern, intern_c, sym_name,
     sym_text,
 };
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_str, err_sym,
+    ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_str, err_sym,
 };
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::PROGRAM;
@@ -71,6 +71,12 @@ pub fn expand_embeds() {
     ENTRY_STAGE.count = 0;
     ENTRY_POS.count = 0;
     REPORTED.count = 0;
+    BIND_BLOCK.count = 0;
+    BIND_G.count = 0;
+    BIND_B.count = 0;
+    BIND_KIND.count = 0;
+    BIND_NAME.count = 0;
+    BIND_POS.count = 0;
     resolve_parts();
     if BLOCKS.count == 0 {
         return;
@@ -113,10 +119,14 @@ fn make_items(b: i64, made: inout IntVec) {
         module_order(b, &order);
         var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let shared_ok = module_items(order, &items);
+        let bfirst = BIND_BLOCK.count;
         if order.count == 1 && items.count == 0 {
             add_piece(0, e);
             scan_block(e, first);
-            check_block(e, str_at(NODES[e].c));
+            scan_bindings(e, b);
+            if !duplicate_bindings(b, bfirst) {
+                check_block(e, str_at(NODES[e].c));
+            }
         } else {
             let m = buf_new();
             // (0.26.2) the WGSL of the consts and structs it names, first
@@ -134,9 +144,10 @@ fn make_items(b: i64, made: inout IntVec) {
                 buf_bytes(m, str_at(NODES[p].c));
                 buf_byte(m, '\n');
                 scan_block(p, first);
+                scan_bindings(p, b);
             }
             src_id = add_string(buf_slice(m));
-            if shared_ok {
+            if shared_ok && !duplicate_bindings(b, bfirst) {
                 check_block(e, buf_slice(m));
             }
         }
@@ -307,6 +318,202 @@ fn scan_entries(text: [u8], at: i64, base: i64, first: i64) {
 
 fn ident_start(c: u8) -> bool {
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+// ---- (0.26.2) A module's bindings, from a scan of its text ----
+//
+// `@group(G) @binding(B) var<uniform> NAME: T` (either attribute first;
+// `var<storage, read>`, `var<storage, read_write>`, `var NAME:
+// texture_..`, `var NAME: sampler`), comments skipped: for gpu_lint.vl's
+// diagnostics and wgsl.binding across parts, never from std::gpu::wgsl's
+// reflection.
+
+pub const BK_UNIFORM: i64 = 1;
+pub const BK_STORAGE: i64 = 2;
+pub const BK_STORAGE_RW: i64 = 3;
+pub const BK_TEXTURE: i64 = 4;
+pub const BK_SAMPLER: i64 = 5;
+pub const BK_STORAGE_TEXTURE: i64 = 6;
+
+// The bindings of every module: its block (an index of BLOCK_NODE), group,
+// binding, kind (BK_), name (a symbol) and position in SRC.
+pub static var BIND_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_G: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The bindings of block e's text (at `at` in SRC; -1: none), into the
+// BIND_ lists for module b.
+fn scan_bindings(e: i64, b: i64) {
+    let text = str_at(NODES[e].c);
+    let at = if NODES[e].d >= 0 { NODES[e].d } else { NODES[e].g };
+    if at < 0 {
+        return;
+    }
+    var p = 0;
+    while p < text.len {
+        let c = text[p];
+        if c == '/' && p + 1 < text.len && (text[p + 1] == '/' || text[p + 1] == '*') {
+            p = comment_end(text, p);
+            continue;
+        }
+        if c != '@' {
+            p += 1;
+            continue;
+        }
+        // the attributes, then `var`
+        let start = p;
+        var group = -1;
+        var binding = -1;
+        var q = p;
+        while q < text.len && text[q] == '@' {
+            let (word, w_end) = word_at(text, q + 1);
+            q = skip_space(text, w_end);
+            var value = -1;
+            if q < text.len && text[q] == '(' {
+                let v0 = skip_space(text, q + 1);
+                var v = v0;
+                value = 0;
+                while v < text.len && text[v] >= '0' && text[v] <= '9' {
+                    value = value * 10 + (text[v] - '0') as i64;
+                    v += 1;
+                }
+                if v == v0 {
+                    value = -1;
+                }
+                while q < text.len && text[q] != ')' {
+                    q += 1;
+                }
+                q = skip_space(text, q + 1);
+            }
+            if word == "group" {
+                group = value;
+            } else if word == "binding" {
+                binding = value;
+            }
+        }
+        let (kw, kw_end) = word_at(text, q);
+        if group < 0 || binding < 0 || kw != "var" {
+            p = if q > start { q } else { start + 1 };
+            continue;
+        }
+        q = skip_space(text, kw_end);
+        var space: [u8] = "";
+        var access: [u8] = "";
+        if q < text.len && text[q] == '<' {
+            let (s, s_end) = word_at(text, skip_space(text, q + 1));
+            space = s;
+            q = skip_space(text, s_end);
+            if q < text.len && text[q] == ',' {
+                let (a, a_end) = word_at(text, skip_space(text, q + 1));
+                access = a;
+                q = a_end;
+            }
+            while q < text.len && text[q] != '>' {
+                q += 1;
+            }
+            q = skip_space(text, q + 1);
+        }
+        let (name, n_end) = word_at(text, q);
+        q = skip_space(text, n_end);
+        var ty: [u8] = "";
+        if q < text.len && text[q] == ':' {
+            let (t, _t_end) = word_at(text, skip_space(text, q + 1));
+            ty = t;
+        }
+        let kind = if space == "uniform" { BK_UNIFORM } else if space == "storage" {
+            if access == "read_write" { BK_STORAGE_RW } else { BK_STORAGE } }
+            else if ty == "sampler" || ty == "sampler_comparison" { BK_SAMPLER }
+            else if ty.len > 16 && ty[0..16] == "texture_storage_" { BK_STORAGE_TEXTURE }
+            else { BK_TEXTURE };
+        if name.len > 0 {
+            BIND_BLOCK.push(b);
+            BIND_G.push(group);
+            BIND_B.push(binding);
+            BIND_KIND.push(kind);
+            BIND_NAME.push(intern(name));
+            BIND_POS.push(at + start);
+        }
+        p = q;
+    }
+}
+
+// The identifier at text[p] (empty when none) and its end.
+fn word_at(text: [u8], p: i64) -> ([u8], i64) {
+    var q = p;
+    while q < text.len && (ident_start(text[q]) || (text[q] >= '0' && text[q] <= '9')) {
+        q += 1;
+    }
+    (text[p..q], q)
+}
+
+fn skip_space(text: [u8], p0: i64) -> i64 {
+    var p = p0;
+    while p < text.len
+        && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r') {
+        p += 1;
+    }
+    p
+}
+
+// (wgsl.binding across parts) Two bindings of module b at one group and
+// binding, from `first` of the BIND_ lists: reported at the second, naming
+// the first's block and line; true when there was one.
+fn duplicate_bindings(b: i64, first: i64) -> bool {
+    for j in first..BIND_BLOCK.count {
+        for i in first..j {
+            if BIND_G.get(i) == BIND_G.get(j) && BIND_B.get(i) == BIND_B.get(j) {
+                duplicate_error(b, i, j);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn duplicate_error(b: i64, i: i64, j: i64) {
+    // the block whose text holds the first
+    let holder = piece_node_at(BIND_POS.get(i));
+    let saved = ERR_KIND;
+    ERR_KIND = c"wgsl.binding";
+    err_begin(BIND_POS.get(j));
+    let m = buf_new();
+    buf_bytes(m, "@group(");
+    buf_int(m, BIND_G.get(j));
+    buf_bytes(m, ") @binding(");
+    buf_int(m, BIND_B.get(j));
+    buf_bytes(m, ") is already '");
+    buf_bytes(m, sym_text(BIND_NAME.get(i)));
+    buf_bytes(m, "' (");
+    if holder > 0 {
+        buf_bytes(m, sym_text(NODES[holder].a));
+        buf_bytes(m, ", ");
+    }
+    buf_file_line(m, BIND_POS.get(i));
+    buf_bytes(m, ")");
+    err_fmt(buf_slice(m));
+    let h = buf_new();
+    buf_bytes(h, "two resources of one module at one group and binding: give each its own, or put them in different modules; the module of '");
+    buf_bytes(h, sym_text(NODES[BLOCKS.get(b)].a));
+    buf_bytes(h, "' is the text of its parts (`with`) and its own");
+    buf_byte(h, 0);
+    err_help(buf_slice(h).ptr);
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The block whose piece of the module being made holds SRC position pos
+// (its Embed node), or 0.
+fn piece_node_at(pos: i64) -> i64 {
+    for k in 0..PIECE_SRC.count {
+        let at = PIECE_SRC.get(k);
+        if at >= 0 && pos >= at && pos < at + PIECE_LEN.get(k) {
+            return PIECE_NODE.get(k);
+        }
+    }
+    0
 }
 
 // Entry `sym` at pos (stage), unless it is no field's name (embed.name)
