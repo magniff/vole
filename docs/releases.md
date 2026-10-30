@@ -77,6 +77,33 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
 
+Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
+"Embedded blocks"; `guide gpu#one-module-per-kernel`,
+`gpu#shared-constants-and-structs`):
+
+- Parts: `embed wgsl K with A, shaders::B { .. }` makes K's module of
+  its parts' texts (each part's own parts first, each once), then its
+  own. A part is checked only inside the blocks that use it and has no
+  `src` or entry points of its own (`embed.part_use`); `embed.with` (a
+  name that is no block, const or struct), `embed.cycle`; a binding two
+  parts declare is `wgsl.binding`, naming both.
+- A block's `.wgsl` file is a file of the program: its errors are at
+  `x.wgsl:L:C`, published by the LSP to its own URI, and `query grep`
+  finds its lines; the code cache's version changes (10).
+- `#[repr(wgsl)]` structs have WGSL's layout (`[f32; 3]` a `vec3<f32>`,
+  16-aligned), and `with` names them and `const`s of literal values: the
+  compiler writes their WGSL into the module (`gpu.repr` for a field
+  WGSL cannot share).
+- Check-time GPU diagnostics in one function's `let`s
+  (front/embed/gpu_lint.vl): `gpu.entry` for an entry point named by a
+  string, `gpu.layout` for a bind group entry the shader's group has
+  not or of another kind, `gpu.usage` for a buffer of a constant usage
+  used without its flag (`try:` the edit), and the warning
+  `gpu.unwritten` for a uniform buffer nothing in the function writes.
+- The examples' shaders are blocks: fluid2d's 17 constants are 5 parts
+  and 12 kernels with a `#[repr(wgsl)] GpuParams`, and galaga, galaxy,
+  life and nes; so are the guide's 20.
+
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
