@@ -97,6 +97,20 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
   widens a restriction to `pub(crate)` (and still writes plain `pub` on a
   private item: compiler/src may write `pub(crate)` from 0.26.3);
   `query context` and hover show a field's restriction.
+- Format literals, Rust's `format!` without the `!`: a plain literal that
+  is the first argument of `print`, `println`, `eprint`, `eprintln`,
+  `format_args` (new: Rust's `format_args!`), `format_in` (the allocator
+  last), `push_fmt`, `Fmt::write`, `panic`, assert's message or a
+  contract's `else` is a format string: `println("{} {x:>4}", a.b)`,
+  positional and named (`name = e`) arguments, `{0}`, `{name}`, `N$`,
+  `.*`, and Rust's whole spec (fill, `^`, `+`, `#`, `o`, `e`, `p`), byte
+  for byte rustc's. The errors `format.syntax`, `format.spec`,
+  `format.args`, `format.expr-hole` (its fix moves the expression to an
+  argument). `panic("bad {x}")` formats on the stack, so `#[no_alloc]`
+  code may. **Breaking:** such a literal's braces are holes now
+  (`println("{")` is `format.syntax`, `warning[format]` is gone); `fix
+  --only fstring` doubles them. f-strings stay, with no warning, until
+  0.26.3. `{:#?}` is `format.spec` "not in this release".
 
 ### What's new in 0.26.1
 

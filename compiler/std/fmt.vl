@@ -1,6 +1,6 @@
 // std::fmt: printing, Display and Debug, and Fmt, the formatter (0.20: from flat/fmt.vl).
 
-use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, put_decimal, strlen, write};
+use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, panic_str, put_decimal, strlen, write};
 use std::num::{FloatFmt, write_f32, write_f64};
 use std::sync::RawLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -365,6 +365,12 @@ const FMT_BIN: i64 = 32;
 const FMT_CHAR: i64 = 64;
 const FMT_NUM: i64 = 128;
 const FMT_PAD: i64 = 256;
+// (0.26.2) `^` `+` `#` `o`; a fill byte from bit 16 (0: a space)
+const FMT_CENTER: i64 = 1024;
+const FMT_PLUS: i64 = 2048;
+const FMT_ALT: i64 = 4096;
+const FMT_OCT: i64 = 8192;
+const FMT_FILL_SHIFT: i64 = 16;
 
 // The buffer of stdout and stderr: FMT_LEN bytes for FMT_FD; FMT_DONE
 // bytes were written out before them (FMT_DONE + FMT_LEN: the position a
@@ -676,7 +682,7 @@ impl Fmt {
     #[inline(never)]
     pub fn int(inout self, v: i64) {
         if self.flags != 0 {
-            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR | FMT_OCT)) != 0 {
                 fmt_radix(&self, v as u64);
             } else {
                 let negative = v < 0;
@@ -693,7 +699,7 @@ impl Fmt {
     #[inline(never)]
     pub fn uint(inout self, v: u64) {
         if self.flags != 0 {
-            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR | FMT_OCT)) != 0 {
                 fmt_radix(&self, v);
             } else {
                 fmt_spec_decimal(&self, v, false);
@@ -709,6 +715,9 @@ impl Fmt {
 #[inline(never)]
 fn fmt_spec_decimal(f: inout Fmt, u: u64, negative: bool) {
     fmt_number_start(&f);
+    if (f.flags & FMT_PLUS) != 0 && !negative {
+        f.byte('+');
+    }
     fmt_decimal(&f, u, negative);
 }
 
@@ -729,7 +738,11 @@ fn fmt_radix(f: inout Fmt, v: u64) {
         return;
     }
     fmt_number_start(&f);
-    let shift: u64 = if (flags & FMT_HEX) != 0 { 4 } else { 1 };
+    let shift: u64 = if (flags & FMT_HEX) != 0 { 4 } else if (flags & FMT_OCT) != 0 { 3 }
+        else { 1 };
+    if (flags & FMT_ALT) != 0 {
+        f.str(if shift == 4 { "0x" } else if shift == 3 { "0o" } else { "0b" });
+    }
     let mask = (1u64 << shift) - 1;
     let digits = if (flags & FMT_UPPER) != 0 { "0123456789ABCDEF" } else { "0123456789abcdef" };
     var n = 1;
@@ -763,7 +776,7 @@ fn fmt_radix(f: inout Fmt, v: u64) {
 // A signed integer of `bits` bits: in hex or binary as its unsigned value
 // of that size (Rust's `{:x}` of -1i8 is ff).
 pub fn fmt_signed(f: inout Fmt, v: i64, bits: u64) {
-    if v < 0 && (f.flags & (FMT_HEX | FMT_BIN)) != 0 {
+    if v < 0 && (f.flags & (FMT_HEX | FMT_BIN | FMT_OCT)) != 0 {
         f.uint((v as u64) & ((1u64 << bits) - 1));
     } else {
         f.int(v);
@@ -796,22 +809,34 @@ fn fmt_pad(f: inout Fmt) {
             f.len = end;
         }
     }
-    let pad = f.width - (end - start);
-    if pad <= 0 {
+    let total = f.width - (end - start);
+    if total <= 0 {
         return;
     }
-    if (flags & FMT_LEFT) != 0 || (flags & FMT_RIGHT) == 0 && !number {
-        for i in 0..pad {
-            f.byte(' ');
+    // (0.26.2) Rust's: `0` pads a number after its sign and prefix; else
+    // `<` `^` `>`, a number right by default
+    let zeros = number && (flags & FMT_ZERO) != 0;
+    var fill = ((flags >> FMT_FILL_SHIFT) & 255) as u8;
+    if fill == 0 {
+        fill = ' ';
+    }
+    var pad = total;
+    if !zeros && (flags & FMT_CENTER) != 0 {
+        pad = total / 2;
+    } else if !zeros && ((flags & FMT_LEFT) != 0 || (flags & FMT_RIGHT) == 0 && !number) {
+        pad = 0;
+    }
+    if pad == 0 {
+        for i in 0..total {
+            f.byte(fill);
         }
         return;
     }
     if !reach {
         return;
     }
-    // Right-aligned: the text moves right by pad, after the sign when zeros
-    // fill.
-    let zeros = number && (flags & FMT_ZERO) != 0;
+    // Right-aligned (or centred): the text moves right by pad, after the
+    // sign when zeros fill.
     var text: *u8 = 0 as *u8;
     var base = 0;
     if f.fd >= 0 {
@@ -830,10 +855,15 @@ fn fmt_pad(f: inout Fmt) {
     }
     var at = start - base;
     // UNSAFE: raw moves. SAFETY: start..end and the pad bytes after it are the
-    // destination's (room taken above: spec's for the width, or checked).
+    // destination's (room taken above: spec's for the width, or checked); the
+    // prefix's two bytes are in it (checked).
     unsafe {
         if zeros && end > start && (text[at] == '-' || text[at] == '+') {
             at += 1;
+        }
+        if zeros && (flags & FMT_ALT) != 0 && (flags & (FMT_HEX | FMT_OCT | FMT_BIN)) != 0
+            && end - base - at >= 2 && text[at] == '0' {
+            at += 2;
         }
         let count = end - base - at;
         for k in 0..count {
@@ -841,8 +871,11 @@ fn fmt_pad(f: inout Fmt) {
             text[at + pad + i] = text[at + i];
         }
         for k in 0..pad {
-            text[at + k] = if zeros { '0' } else { ' ' };
+            text[at + k] = if zeros { '0' } else { fill };
         }
+    }
+    for i in pad..total {
+        f.byte(fill);
     }
 }
 
@@ -1022,6 +1055,11 @@ const FMT_EXP: i64 = 512;
 fn fmt_float(f: inout Fmt, v: f64, single: bool, debug: bool) {
     if f.flags != 0 {
         fmt_number_start(&f);
+        // (0.26.2: `{x:+}`: a sign on a number that has none, `+inf` too,
+        // not on NaN nor -0)
+        if (f.flags & FMT_PLUS) != 0 && (v > 0.0 || v == 0.0 && 1.0 / v > 0.0) {
+            f.byte('+');
+        }
     }
     if f.prec >= 0 && v == v && v - v == 0.0 {
         fmt_float_prec(&f, v);
@@ -1101,5 +1139,40 @@ fn fmt_fixed_long(f: inout Fmt, v: f64) {
     f.str(tmp[0..if n < 1424 { n } else { 1423 }]);
     for _ in prec..f.prec {
         f.byte('0');
+    }
+}
+
+// ---- Format literals (0.26.2) ----
+
+// (0.26.2) `format_args("{} {x}", a)`, Rust's `format_args!`: the
+// format literal and its arguments as one value that writes them (a
+// `std::Interp`, Display), for a function of the program that takes a `T:
+// Display` (the compiler makes the value: front/check/format.vl).
+#[inline]
+pub fn format_args<T: Display>(x: sink T) -> T {
+    x
+}
+
+// (0.26.2) What `panic("bad {x}")` (a message with holes) compiles to: the
+// message written into 256 bytes on the stack, cut there, so that a
+// #[no_alloc] function panics with one too (decision 5); `at` as
+// panic_str's. Not for programs to call.
+pub fn __panic_fmt<T: Display>(x: T, at: [u8] = "") -> ! {
+    var tmp: [u8; 256] = [0; 256];
+    var f = __fmt_tmp(&tmp);
+    x.fmt(&f);
+    // (a piece that did not fit is left out: what was written is the
+    // bytes before the zeros left)
+    var n = if f.need != 0 || f.len > 256 { 256 } else { f.len };
+    while f.need != 0 && n > 0 && tmp[n - 1] == 0 {
+        n -= 1;
+    }
+    panic_str(tmp[0..n], at)
+}
+
+// (0.26.2) `assert(c, "bad {x}")`: `c` must hold, else __panic_fmt.
+pub fn __assert_fmt<T: Display>(ok: bool, x: T, at: [u8] = "") {
+    if !ok {
+        __panic_fmt(x, at)
     }
 }

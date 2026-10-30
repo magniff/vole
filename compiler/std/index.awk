@@ -104,6 +104,10 @@ BEGIN {
     # and std::gpu both reach it, and neither can reach the other
     LAZY["std::capture"] = 1
     LAZY["Frame capture (0.25.4)"] = 1
+    # (0.26.2) format_args and what panic and assert with holes compile to
+    # (front/check/format.vl: std_fn), read by a program that names them
+    LAZY["Format literals (0.26.2)"] = 1
+    TRIGGERS["Format literals (0.26.2)"] = "panic assert debug_assert"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)

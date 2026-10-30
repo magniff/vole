@@ -1497,25 +1497,76 @@ with `U` the expected type, and `t: Into<U>` holds when `U: From<t>`.
 
 ### Formatting
 
-An f-string `f"..."` is an expression of an unnameable type (an
-`std::Interp` of a closure) implementing `std::Display`. Its text takes
-the escapes of a string literal; `{{` and `}}` are braces; `{expr}` is a
-hole, `{expr:spec}` one with a spec. The lexer reads it as pieces:
-`f"text{` (FHead), the hole's tokens, `:spec}text{` or `}text{` (FMid),
-..., `:spec}text"` (FTail); an f-string without holes is one FHead. A
-hole ends at its `}` at bracket depth 0 or at a `:` outside brackets
-that is not `::`, so an expression with a top-level `:` needs
-parentheses; string literals may appear in holes; f-strings do not
+(0.26.2) A **format literal** is a plain string literal (`"..."`, a text
+block, `r"..."`) that is the first argument of a format function: Rust's
+`format!` family without the `!`. The format functions are a closed table
+(front/check/format.vl), std's own:
+
+| format function | the format arguments |
+|---|---|
+| `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
+| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)` |
+| `panic`, the message of `assert` and `debug_assert` | after the literal |
+| the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
+| a contract's `else` | `requires c else "len {}", v.len()` |
+
+A function of the program is none: it takes `format_args("..", ..)`, a
+value of the unnameable `std::Interp` type that implements `Display`
+(Rust's `format_args!`). A first argument that is not a literal (a
+`const`, a variable) is a plain value, `println(s)` prints `s`, and an
+argument after it is `format.args`: a format string is a literal.
+
+The literal's grammar is Rust's std::fmt:
+
+    format   = { text | "{{" | "}}" | hole }
+    hole     = "{" [ arg ] [ ":" spec ] "}"
+    arg      = integer | identifier
+    spec     = [[fill] align] ["+" | "-"] ["#"] ["0"] [width] ["." precision] [type]
+    align    = "<" | "^" | ">"
+    width    = count
+    precision = count | "*"
+    count    = integer | integer "$" | identifier "$"
+    type     = "?" | "x?" | "X?" | "x" | "X" | "o" | "b" | "e" | "E" | "p" | "c"
+
+`{}` takes the next positional argument, `{N}` argument N, `{name}` a
+named argument (`name = expr`) or else a local, a parameter, a `const` or
+a `static` in scope (Rust 2021's captures). `N$`, `name$` and `.*` (two
+arguments: the precision, then the value) give a width or a precision
+as an integer value. An expression in a hole (`{p.a}`, `{x + 1}`) is
+`format.expr-hole`, whose fix moves it to an argument; a `{` or `}` of
+the text not doubled is `format.syntax`; a spec not of this grammar is
+`format.spec` (`{:#?}` is not in this release); an argument no hole
+takes, or a hole with no argument, is `format.args`.
+
+The meaning is rustc's, byte for byte: `{}` is `Display::fmt`, `{:?}`
+`Debug::fmt_debug`; `x X o b` take integers, `e E` integers and floats, as Rust's do; `+`
+signs a number, `#` writes `0x`, `0o`, `0b`; `0` pads a number with
+zeros after its sign and prefix; text is left-aligned and numbers
+right-aligned by default; the fill is any byte; `p` writes a pointer as
+`0x..`; vole's `c` writes a `u8` as its byte, until vole has `char`. The
+arguments are evaluated once each, left to right, before any is
+written. `panic("bad {x}")` (and assert's message) formats into 256
+bytes on the stack, a piece that does not fit left out, so that a
+`#[no_alloc]` function can panic with one.
+
+Until 0.26.1 a plain literal at a format position was printed as it is,
+braces and all; `volec fix --only fstring` doubles such a literal's
+braces, so that its output stays the same.
+
+**f-strings** (`f"..."`, until 0.28) stay accepted: an f-string is an
+expression of the same `std::Interp` type. Its text takes the escapes of
+a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
+any expression, `{expr:spec}` one with a spec (the same specs). The lexer
+reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
+or `}text{` (FMid), ..., `:spec}text"` (FTail); an f-string without holes
+is one FHead. A hole ends at its `}` at bracket depth 0 or at a `:`
+outside brackets that is not `::`, so an expression with a top-level `:`
+needs parentheses; string literals may appear in holes; f-strings do not
 nest; a hole may not be empty, and a lone `}` in the text is an error.
-
-The spec: `<` or `>` aligns (numbers right, text left by default), `0`
-pads with zeros, the digits are the width, `.N` the precision (floats:
-N decimals), and the last character picks Debug (`?`), hex (`x`, `X`),
-binary (`b`) or a byte (`c`, a `u8` written as the byte).
-
-The holes are evaluated where the f-string is, once each, left to
-right; the value holds copies of them. Its Display writes the text and
-each hole's `Display` (or `Debug`) in turn.
+The holes are evaluated where the f-string is, once each, left to right;
+the value holds copies of them. `volec fix --only fstring` rewrites an
+f-string as a format literal (at a format position) or as
+`format_args(..)` (anywhere else).
 
 ### Named arguments, defaults, shorthand
 
@@ -1752,8 +1803,9 @@ checks, the tests and distinct types come with the tasks named there.
 
 ```ebnf
 fn_item    = signature { clause } ( block | ";" ) ;            (* fns, trait fns, impl fns *)
-clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ "else" expr ] ;
-type_inv   = [ "debug" ] "invariant" expr [ "else" expr ] [ ";" ] ;   (* after a struct's or enum's "}" *)
+clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ message ] ;
+type_inv   = [ "debug" ] "invariant" expr [ message ] [ ";" ] ;
+message    = "else" expr { "," arg } ;                        (* 0.26.2: a format literal's arguments *)   (* after a struct's or enum's "}" *)
 alias      = "type" ident [ generics ] "=" [ "distinct" ] type [ type_inv ] ";" ;
 attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
 ```
@@ -1764,7 +1816,10 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
   In an `ensures`, `result` is the returned value and `old(e)` is `e` at
   the function's entry (T1).
 - A clause's condition is an expression in which `{` ends it, as in an
-  `if`'s condition. The message after `else` is a string or an f-string.
+  `if`'s condition. The message after `else` is a string or an f-string;
+  (0.26.2) a plain literal is a format literal, its arguments after it:
+  `requires v.len() > 0 else "empty: {} items", v.len()` (at most three
+  holes, as an f-string's).
 - `#[cfg(test)]` marks the item after it (all of a module's items);
   `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
   compiles them as ordinary items (T2 leaves them out of builds that are

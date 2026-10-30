@@ -56,20 +56,22 @@ A *warning* is a problem that doesn't stop the build. It has the same
 shapes, with `warning` instead of `error`:
 
 ```vole w.vl warn
+use std::HashMap;
+
 fn main() {
-    let x = 42;
-    println("x = {x}");
+    println("hello");
 }
 ```
 
 ```console
 $ volec w.vl -o w
-warning[format]: this string has '{x}' in it, as text: it is not an f-string
- --> w.vl: line 3, column 13
-  = help: an f-string writes the local's value: 'println(f"x = {x}")'
+warning[use.unused]: unused import 'HashMap': nothing in this file names it
+ --> w.vl: line 1, column 10
+  = help: remove it (`volec fix` removes every unused import)
+  = try: volec fix --only unused w.vl
 ok: built w
 $ ./w
-x = {x}
+hello
 ```
 
 ## Kinds and codes
@@ -87,7 +89,6 @@ C import
 unsafe
 effect
 profile
-format
 ```
 
 | kind | what it's about |
@@ -99,7 +100,7 @@ format
 | `C import` | an `import "header.h"` that can't be read (chapter 15) |
 | `unsafe` | an unsafe operation outside `unsafe` (chapter 15) |
 | `effect` | a broken effect promise (chapter 12) |
-| `profile`, `format` | warnings: a stale profile (`volec guide tools`), a string that looks like an f-string |
+| `profile` | a warning: a stale profile (`volec guide tools`) |
 | `use.unused` | a warning: an import nothing in its file names (`volec fix --only unused` removes it) |
 
 Newer checks have *codes* with a family prefix and a dot. The code is
