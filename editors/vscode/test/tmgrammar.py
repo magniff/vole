@@ -4,7 +4,9 @@ without node.
 
 It implements the subset of TextMate the grammar uses (match, begin/end,
 captures, beginCaptures, endCaptures, contentName, include of #rule,
-$self and the grammar's own scope) with Python's re, which agrees with
+$self and the grammar's own scope, and (0.26.0) of another grammar of
+syntaxes/ by its scope, `source.wgsl`, whose own #rule and $self
+includes stay its own) with Python's re, which agrees with
 Oniguruma on every construct the grammar uses (lookarounds, classes,
 \\b, $). It reads the same test files as vscode-tmgrammar-test and
 writes snapshots in vscode-tmgrammar-snap's format, so the files stay
@@ -43,6 +45,36 @@ class Grammar:
         self.root = {"patterns": g["patterns"]}
         self._re = {}
         self._flat = {}
+        # the other grammars beside it, by scope: an include of one goes
+        # there; its rules' includes are rewritten to its own names
+        self.roots = {self.scope: self.root}
+        here = os.path.dirname(os.path.abspath(path))
+        for f in sorted(os.listdir(here)):
+            other = os.path.join(here, f)
+            if not f.endswith(".tmLanguage.json") or os.path.samefile(other, path):
+                continue
+            with open(other) as fh:
+                o = json.load(fh)
+            sc = o["scopeName"]
+            for k, r in o.get("repository", {}).items():
+                self.repo[sc + "#" + k] = self._own(r, sc)
+            self.roots[sc] = {"patterns": [self._own(r, sc) for r in o["patterns"]]}
+
+    def _own(self, rule, scope):
+        """rule (another grammar's) with its includes made this one's names."""
+        if isinstance(rule, list):
+            return [self._own(r, scope) for r in rule]
+        if not isinstance(rule, dict):
+            return rule
+        out = {}
+        for k, v in rule.items():
+            if k == "include" and v.startswith("#"):
+                out[k] = "#" + scope + v
+            elif k == "include" and v in ("$self", "$base"):
+                out[k] = scope
+            else:
+                out[k] = self._own(v, scope)
+        return out
 
     def regex(self, src):
         r = self._re.get(src)
@@ -57,6 +89,8 @@ class Grammar:
             return rule
         if inc in ("$self", "$base", self.scope):
             return self.root
+        if inc in self.roots:
+            return self.roots[inc]
         if inc.startswith("#"):
             return self.repo[inc[1:]]
         raise ValueError("unsupported include " + inc)

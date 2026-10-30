@@ -2084,3 +2084,52 @@ of `struct { _0; _1; } V`), an integer-repr one a union of structs that
 start with the tag; `packed(N)` is `#pragma pack(N)`. Types of default
 layout appear only behind pointers, as incomplete structs. A name that is
 a C keyword is an error.
+
+## Embedded blocks
+
+*(0.26.0)* A block of another language inside vole source, checked by
+the compiler. WGSL is the one language.
+
+```ebnf
+embed_item   = [ "pub" ] "embed" lang name ( "{" embedded "}" | "from" string_lit ";" ) ;
+lang         = ident ;                                 (* "wgsl" *)
+embedded     = { any } ;                               (* to the "}" that matches, by the language's rule *)
+```
+
+- `embed`, the language and `from` are identifiers, not keywords:
+  three identifiers in a row start no other item, and `embed` and
+  `wgsl` stay names everywhere else (`std::gpu::wgsl`, `let wgsl`). An
+  item only, at module scope (in `mod m { .. }` and `#[cfg(test)]` too).
+- The lexer does not lex the text: after the `{` of `embed LANG NAME {`
+  (the three words and the `{` in one file), the text ends at the `}`
+  that matches it outside WGSL's comments, `//` to the line's end and
+  nested `/* */` (WGSL has no strings). A `}` in a comment does not
+  count. No matching `}` is `embed.unterminated`, at the `{`, naming
+  the innermost `{` left open; the rest of the file is not read. A
+  language other than `wgsl` is `embed.language` (its text is still
+  delimited by WGSL's rule).
+- `embed wgsl K from "x.wgsl";` takes the text from a file, relative to
+  the directory of the file holding the block, as `include_str` does:
+  `embed.missing`, `embed.path` and `embed.utf8` apply.
+- The block is an immutable `static K` of a struct type the compiler
+  makes, `embed wgsl K` in messages (source cannot name it in 0.26). Its
+  fields are `pub` and `[u8]`: `src`, the text, and one per entry point
+  (`@compute`, `@vertex` or `@fragment` then `fn NAME`, outside
+  comments) holding its name: `dev.shader_wgsl(K.src)?`,
+  `dev.compute_pipeline(shader, K.step)`. An entry point named `src` or
+  a vole keyword is `embed.name`; a field the block does not have is
+  `gpu.entry`, listing its entry points.
+- `volec check` (and the LSP, and every checked edit) runs the text
+  through std::gpu::wgsl's front end: its first error is reported at
+  its position in the `.vl` file, with its `wgsl.*` code; in the file
+  form at the `from` string, the file's `x.wgsl:L:C:` first.
+- `volec fmt` keeps a block's lines as they are, from its `{` to its
+  `}`. `query grep` classifies its text by WGSL's rules (comments, the
+  rest code); `query show K` and `edit patch K` take the item.
+
+*Coming in 0.26.2: shader parts.* `embed wgsl K with A, B { .. }` puts
+the text of the blocks `A` and `B`, then `K`'s own text, into one WGSL
+module (module-scope order is free in WGSL). A part is an `embed wgsl`
+block found by ordinary path resolution; it has no entry points, and
+parts form no cycle. `with` is not a Rust keyword: like `embed` and
+`wgsl` it stays an identifier everywhere else.

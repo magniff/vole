@@ -154,14 +154,15 @@ for f in "$HERE"/cases/*.wgsl; do
         echo "pass wgsl_$name"
     fi
 done
-# every wgsl.* code the compiler reports has an explanation
+# every wgsl.* code the compiler reports has an explanation (0.26.0:
+# `volec explain`'s, tools/explain/gpu_table.vl)
 why=""
 for code in $(cat "$ROOT"/compiler/std/gpu/wgsl/*.vl | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
-    "$W" explain "$code" >/dev/null 2>&1 || why="$why $code"
+    "$COMPILER" explain "$code" >/dev/null 2>&1 || why="$why $code"
 done
 if [ -n "$why" ]; then
     echo "FAIL wgsl_explain:"
-    echo "    no 'wgslc explain' for:$why"
+    echo "    no 'volec explain' for:$why"
     fail=1
 else
     echo "pass wgsl_explain"

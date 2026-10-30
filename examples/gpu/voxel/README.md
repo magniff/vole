@@ -142,7 +142,7 @@ offscreen FPS. Run the command for local results.
 | [main.vl](main.vl) | native window, event loop, free-fly and sculpt controls |
 | [camera.vl](camera.vl) | camera basis, movement and tests |
 | [world.vl](world.vl) | bounded streaming, GPU resources, edit history and procedural tests |
-| [shaders.vl](shaders.vl) | the two shaders, `include_str` of the `.wgsl` files |
+| [shaders.vl](shaders.vl) | the two shaders, `embed wgsl K from` the `.wgsl` files |
 | [world.wgsl](world.wgsl) | WGSL noise, caves, scan meshing, water and vegetation |
 | [render.wgsl](render.wgsl) | WGSL rendering |
 | [render.vl](render.vl) | camera uniforms, depth target, frustum filtering and native presentation |
