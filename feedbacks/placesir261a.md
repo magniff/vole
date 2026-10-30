@@ -50,7 +50,22 @@ fits its share (`check` 1.08x of 0.25.5 with the placeholders still in).
 
 ## Never used
 
-`probe`, `reduce`, `rewrite`, `refactor extract-function`, `undo`.
+`reduce`, `rewrite`, `refactor extract-function`, `undo`.
+
+## Second round (shims as functions, R3, R4)
+
+- `probe` on the compiler itself (`probe compiler/src/places/build.vl:L
+  t integer is_enum -- prog.vl --emit-places`) found in three runs why
+  an enum match stayed a chain (its arms match through the reference,
+  PAT_DEREF): the fastest tool of the round. An enum prints as
+  `<NodeKind>`; `kind as i64` works.
+- `edit patch` of two items in one shell line: the second patch's check
+  failed on the first's not yet existing static and printed the whole
+  command back with `--no-check`, with no error line saying why.
+- `tests/affected.sh` after the integrator merged the branch: the plan
+  is empty (`0 of 2867`), since the default base contains HEAD; against
+  the previous base a one-function change in front/check/mod.vl is
+  `@broad` (2,461 cases).
 
 ## Fix list, in order
 
@@ -60,4 +75,7 @@ fits its share (`check` 1.08x of 0.25.5 with the placeholders still in).
    `Vec<Vec<T>>`: say what is unsupported, `try:` `.set(i, v)`.
 3. [hook] query-first: allow `grep`/`wc` of files the session created.
 4. [doc] places/README: the shim's Drop::drop instance must be made by
-   the shim once the placeholders go (step 7).
+   the shim once the placeholders go (step 7). (Done in the second
+   round: made at check time.)
+5. [tool] edit patch: a failed check says which error, before the
+   `--no-check` retry line.
