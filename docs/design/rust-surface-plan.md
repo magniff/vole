@@ -51,6 +51,7 @@ lattice with no identity, walked over the AST.
 | 0.28 | Phase 3 (§7): compiler/src flipped; MVS, the own pass and the old std deleted; then invariant newtypes and `debug requires` on `unsafe fn` |
 | 0.29 | the cuts of §6 (const generics, `Rc`/`Arc`, `RefCell`, `may_dangle`, ...); GPU first class: translation ahead of time, interpreter tests, the eval gate |
 | 0.30 | `embed regex`; Vulkan and Linux when the Linux backend returns (§13) |
+| later | panics that unwind (decision 18) |
 
 ## 1. Phase 1, 0.26.x: every decision, under MVS
 
@@ -60,14 +61,14 @@ nothing else.
 
 | item | what | the number |
 |---|---|---|
-| a. the places IR | a MIR-like lowering: places, explicit temporaries, drops and drop flags; move and drop elaboration per place on it; effects inferred on it (drops become IR, so `#[no_alloc]` must see them there). Today the middle IR starts at -O1 (`middle/ir/mod.vl`); the places IR runs at `check` and -O0 too, so `check` gets a whole new lowering | the own audit's 19 findings and the two post-audit families (`793e4b8c`, `e1bbdd94`) as passing tests on the IR's drops; the own pass's drop code deleted; `check` of the compiler within 1.10x of 0.25.5's |
+| a. the places IR | a MIR-like lowering: places, explicit temporaries, drops and drop flags; move and drop elaboration per place on it; effects inferred on it (drops become IR, so `#[no_alloc]` must see them there). Today the middle IR starts at -O1 (`middle/ir/mod.vl`); the places IR runs at `check` and -O0 too, so `check` gets a whole new lowering | the own audit's 19 findings (already fixed on the own pass's drops) and the post-audit drop family (`793e4b8c` with `51075d9c`, `ea70255c`, `1d4215a4`) still passing on the IR's drops; the own pass's drop code deleted (0.26.1); `check` of the compiler within 1.10x of 0.25.5's. `e1bbdd94` is a view-summary family and stays the own pass's until 0.27 ([places-ir.md](places-ir.md) §11) |
 | k. private fields | fields private to their module unless `pub`, as in Rust (0.25.6's plan; grammar.md: "vole has no private fields yet") | needed by (g), by `Gpa`'s private constructor and by invariant newtypes (§9.3) |
 | b. arithmetic | Rust's, overflow checks always on; `wrapping_*`, `checked_*`, `Wrapping<T>`; float-to-int `as` saturating | bench at -O2 with checks on and off (time, instructions, vector loops); `--print-checks` counts removed by the range pass; the wrap-reliant sites in compiler/src (hashes, PRNGs) |
 | c. `usize` | lengths and indices `usize`, `isize` where signed | `as i64` in compiler/src: 1,188 in code (`query grep 'as i64' --code --count`) |
 | d. text | `Buf` → `String`, `[u8]` as text → `str` | `Buf`: 475 (`query grep Buf --word --count`) |
 | e. raw-pointer parameters | the legacy `*T` parameters (the proposal counts 3,903, from its prototype; recount with `query`) decided into `let`, `inout` or a real raw pointer | unjustified unsafe sites, from 3,425 (`query unsafe --summary`) |
 | f. globals | the 1,841 `static var` in compiler/src into context structs passed down `inout`; the context holds `Comp` and `Ast` as real arenas (§9.1) | `static var` count; compile cost. The largest MVS refactor attempted here (0.25.5 moved six tables): it changes most signatures and every view summary, so it runs last, alone, and stops at the first point release that fails the gate's compile-cost row |
-| g. a cell type | `UnsafeCell<T>` and `Cell<T>` in std (0.25.6's plan); `#[sealed]` retired, replaced by private fields | needed before arenas (`Allocator::allocate` takes `&self`) and before std's print statics move behind a `Sync` cell (§9.2) |
+| g. a cell type | `UnsafeCell<T>` and `Cell<T>` in std (0.25.6's plan); `#[sealed]` is retired by (k), so (g) only adds the cells | needed before arenas (`Allocator::allocate` takes `&self`) and before std's print statics move behind a `Sync` cell (§9.2) |
 | h. allocation as a capability (§2.0) | every `_in` takes its allocator last; `Ambient` and every constructor without `_in` removed; the `= Gpa` defaults removed from std's types; types holding an allocator made generic over it (rule 3); statics and thread-locals refused an allocator in their type (rule 1); `Allocator` an `unsafe trait` | 0 uses of `Ambient`; 0 `= Gpa` defaults; 0 structs with an allocator field not in their parameters |
 | i. format literals | f-strings become Rust's format grammar in plain functions: `println("{x} {y:?}")`, `format_in("{x}", a)` | 1,248 f-strings (814 in compiler/src, 434 in std) |
 | j. small syntax | `where` as sugar for inline bounds; argument-position `impl Trait` | |
@@ -76,7 +77,12 @@ nothing else.
 **The chain rule inside 0.26.** A release's compiler is built by the
 previous one, so an item that changes the language lands in two steps:
 the feature in point release k, and compiler/src's use of it in k+1.
-This applies to (b), (c), (d), (i) and (k). Arithmetic is
+This applies to (b), (c), (d) and (i). (k) is one step: `pub` on a field
+already compiles under 0.25.5, which ignores it, so compiler/src's `pub`s
+land in 0.26.0 before the rule turns on (stage 1 compiles compiler/src
+against 0.25.5's embedded std; the tree's std is first compiled by
+build1). The same holds for std APIs: one added in 0.26.k is used in
+compiler/src from 0.26.k+1. Arithmetic is
 order-sensitive: `wrapping_*` must exist in release k, and in k+1 the
 hash and PRNG sites are rewritten to it before the checks turn on.
 The first build of k+1, by k, then has no checks; its fixpoint build has
@@ -89,14 +95,23 @@ compiler, 1.5x for small programs). The places IR has its own budget,
 and effects on the IR compound, 0.26 as a whole is held to 1.25x of
 0.25.5, measured by its last point release.
 
-**The order, for at most three agents in parallel** (§13):
+**The order, at most three agents in each point release** (§13; agreed
+in the 0.26.0 review, 2026-10-30):
 
 | point release | in parallel |
 |---|---|
-| 0.26.0 | (a) the places IR; (k) private fields; `embed wgsl` with the `gpu.*`/`wgsl.*` codes (own files, no conflicts) |
-| 0.26.1 | effects on the places IR (after a); (g) the cell type (after k); the features of (b), (c), (d) and (i); (j). (e) starts as one agent's long branch |
-| 0.26.2 | (h) the capability rules (after g); compiler/src's migrations to (c), (d) and (i); (b)'s second step (the wrap sites, then the checks on) |
-| 0.26.3+ | (f) the statics, last and alone (after a, so the view summaries it disturbs are recomputed on the IR); (e) merges when done |
+| 0.26.0 | (a) the places IR, steps 1–3: built and elaborated at `check` by default, checked against the own pass by `--places-diff`, one agent ([places-ir.md](places-ir.md)); (k) private fields, which also retire `#[sealed]`; `embed wgsl` with the `gpu.*`/`wgsl.*` codes |
+| 0.26.1 | (a) steps 4–8: both code generators read the IR and the own pass's drop code goes (two agents); (g) the cell type (after k) |
+| 0.26.2 | effects on the places IR (after a); the features of (b), (c), (d) and (i), with (j) and `pub(crate)`/`pub(super)` (one agent, in sequence); embed's follow-ups: shader parts, the file form's own `FILES` entry, fluid2d, diagnostics 2–7's text forms, shared `const`s and `#[repr(wgsl)]` |
+| 0.26.3 | (h) the capability rules (after g and k); compiler/src's migrations to (c), (d), (i) and `pub(crate)`, and (b)'s second step (the wrap sites, then the checks on), as one agent; (e) starts as a long branch |
+| 0.26.4+ | (f) the statics, last and alone, because it changes most signatures; (e) merges when done |
+
+**The 0.26.0 budget.** `check` of compiler/src at most 1.13x 0.25.5's
+(the gate's row stops at 1.15x), shared out: the IR 1.10x, `embed
+wgsl` 1.025x, private fields noise. Agents measure with
+`tests/compile_cost.sh` against their branch's base and 0.25.5. The
+IR gives back the own pass's drop placeholders (228M instructions) only
+in 0.26.1.
 
 Each item has one owning agent and its own design brief before code, as
 the project does for every release; the integrator merges per batch
@@ -416,7 +431,9 @@ the declarations or reports them; containers on a non-freeing allocator
 parameters become `&T` (or `T` for Copy), `inout` becomes `&mut T`,
 `sink` becomes `T`, a view `[T]` becomes `&[T]`, `&x` at a call becomes
 `&mut x` or `&x` from the parameter's type, `var` becomes `let mut`.
-Two parts are not mechanical:
+`v.len` on a std container (a read, which 0.17's
+`len_reads_as_method` lets through) becomes `v.len()`. Two parts are
+not mechanical:
 
 - *regions on structs.* `query views` is level-aware but indexed by
   parameter, with no identity: it says which parameters a result views,
@@ -707,7 +724,7 @@ one transitivity step), run once on the places IR before inlining, the
 same at every `-O`. The 0.18.1 survey says what it discharges: 31 of
 211 std contract checks at call sites (15%), all "an index loop bounded
 by `len()`". Expect 15–25% of clauses to become statically decided. The
-procedure serves `#[no_panic]` and `contract.refuted`. It is not a
+procedure serves `#[no_panic]` and `contract.violated`. It is not a
 verifier, and Level 2 (`volec verify`) is not planned until the
 compiler carries its first hundred clauses.
 
@@ -784,7 +801,7 @@ evals/tasks/0.25.2*):
   seven WGSL structs have a vole struct of the same name next to them,
   none with `#[repr(C)]`.
 - **The `gpu.*` names are not codes yet.** They live in the `else
-  "gpu.usage: .."` text of 66 of std::gpu's 121 `requires` clauses;
+  "gpu.usage: .."` text of all 121 of std::gpu's `requires` clauses;
   `explain` knows none of them.
 
 ### 10.1 What "first class" means
@@ -796,7 +813,7 @@ evals/tasks/0.25.2*):
    .. }`, or read from a file with `embed wgsl CELLS from "x.wgsl";` for
    shaders shared with other tools. One checker serves both. The file
    form reuses `include_str`'s machinery (`front/embed.vl`): its path
-   rules and its `embed.missing`, `embed.path` and `embed.utf8` codes
+   rules and its `embed.missing`, `embed.path` (raised in `parse_include`, front/parser/exprs.vl) and `embed.utf8` codes
    apply unchanged, and `include_str` stays for plain text.
 3. **One struct definition for host and shader.** A block may name vole
    `const`s of `i32`, `u32`, `f32`, `bool` (and arrays of them) and
@@ -814,7 +831,7 @@ evals/tasks/0.25.2*):
    group count), `s.vs` and `s.fs` for render stages, and per
    `@group(N)` a bindings struct, `Bindings0<'a> { particles: &'a
    Buffer<Particle, Storage>, params: &'a Buffer<Params, Uniform> }`.
-   `dev.shader(&s)` does no run-time parse and cannot fail on the
+   `dev.shader(&s)` (0.27's typed form; today's path is `dev.shader_wgsl(src)`) does no run-time parse and cannot fail on the
    source; a missing entry point cannot be named; a bind group that
    does not match its layout is a type error.
 5. **Resources in Rust's surface.**
@@ -841,14 +858,14 @@ evals/tasks/0.25.2*):
    per-arity impls would be hand-written, so `Has<M>` is
    compiler-provided, like `Send`. No const generics needed.
 7. **Validation, sorted by where it can be decided.** Of std::gpu's 121
-   `requires` (66 of them carry a `gpu.*` code today):
+   `requires` (all of them carry a `gpu.*` name in their text today):
    - *gone, by types*: 55. `gpu.usage` 26 (typestate), `gpu.layout` 7
      (typed bindings), `gpu.align` 10 (element offsets on `Buffer<T, U>`
      and typed views), the mapped state and `configured` 9 (exclusive
      mapped views, `Surface<Configured>`), the shader kind 1 (translation
      ahead of time per backend), `u32` counts and typed binding sizes 2;
    - *compile errors when the arguments are constants* (Level 1,
-     `contract.refuted`): 12. Bind-group and vertex-buffer slot indices,
+     `contract.violated`): 12. Bind-group and vertex-buffer slot indices,
      builder counts against 8 (attributes, vertex buffers, colour
      targets, pass attachments), anisotropy 1..16, query-set size, the
      surface format. Builder counts need a straight-line builder chain;
@@ -883,7 +900,7 @@ The ten worth building first, each from a failure the eval agents hit:
 | 7 | `wgsl.binding` | `@group(0) @binding(0) is already 'cells' (line 3)`; help: one module per kernel, or distinct bindings | |
 | 8 | `borrow` on a mapped view | `'r' is mutably borrowed by the mapped view 'v' (main.vl:40) and copied into at main.vl:45`; help: the GPU writes under the view | end the view first, or `v.to_vec_in(a)` |
 | 9 | `gpu.repr` | `Particle.vel ([f32; 3]) is at offset 12 in a host struct, 16 in WGSL (vec3 aligns to 16)`: only for a struct declared outside a block's reach, since shared structs cannot disagree | `vel: [f32; 4]`, or `_pad: f32` after `pos` |
-| 10 | `contract.refuted` | `bind_layout(4): bind groups are 0..3 (std::gpu::MAX_BIND_GROUPS)` | `bind_layout(3)` |
+| 10 | `contract.violated` | `bind_layout(4): bind groups are 0..3 (std::gpu::MAX_BIND_GROUPS)` | `bind_layout(3)` |
 
 Plus three host-side diagnostics round 3 asked for: `use
 std::gpu::{Surface}` reported as "unknown module 'gpu'" should say `use
@@ -957,6 +974,16 @@ without new keywords. A block is an item that names its constant,
 `embed wgsl CELLS { .. }`, so the generated type has a name for `query`,
 the LSP and errors; the file form is `embed wgsl CELLS from "x.wgsl";`
 (decision 15).
+
+**Parts (0.26.2, proposed).** WGSL has no includes, and fluid2d and three
+of the eval programs build each kernel from shared text. A block may
+name other blocks whose text comes before its own, in one module:
+`embed wgsl STEP with COMMON, NOISE { .. }`. A part has no entry points,
+and parts may not form a cycle. `with` is a contextual word, like
+`embed` and `wgsl`, not Rust's `use`, so no Rust token gains a second
+meaning; `K(A, B)` was rejected because it reads as a call or a
+tuple-struct constructor. The clause is additive, so 0.26.0's blocks
+need no migration when it lands. Decided: decision 19.
 
 **Two kinds of block, not one feature.** `wgsl` is a compile-time
 artifact: a zero-sized constant with generated types and an embedded
@@ -1040,6 +1067,28 @@ which the user accepted as a whole.
     1.0.
 17. **`Device<AnyAlloc<'a>>`** is the application spelling of a GPU
     device: one instance of std::gpu, the allocator visible (§10.3).
+
+Taken after the 0.26.0 review (2026-10-30), the user accepting both:
+
+18. **A panic exits with 101, with no unwinding**, as today, for now.
+    The user wants unwinding later (Rust's default, with `catch_unwind`
+    and drops on panic); it is deferred to save time, not rejected, and
+    becomes its own item after the flip: unwind edges and cleanup blocks
+    in the places IR, landing pads in both code generators. The places IR has no unwind edges, and calls and
+    drops are statements ([places-ir.md](places-ir.md) §3.10). The
+    consequences:
+    - a panic in a spawned thread ends the process, and there is no
+      `catch_unwind`;
+    - `Drop` is not cleanup on panic: voltty's terminal restore stays
+      an atexit or signal handler;
+    - `assert`, a failed `requires` and `panic` share the one exit-101
+      path, with one `explain` entry;
+    - `--check-alloc` reports no leaks on exit 101;
+    - the rustc twin runs with `-C panic=abort` and compares exit codes
+      (101 against 134), and a test expecting a panic is compared by
+      its exit code only.
+19. **Shader parts are spelled `embed wgsl K with A, B { .. }`** (§11),
+    in 0.26.2.
 
 ## 13. How the work runs (the user's constraints, 2026-10-30)
 
