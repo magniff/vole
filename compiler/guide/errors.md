@@ -104,8 +104,9 @@ println!("{}", 1);
 ```err
 error[parser error] 'println!' is a macro call: vole has no macros | help: write `println(f"{1}")`
 ```
-`println(f"{x}")` (0.15, `volec guide formatting`). The help names
-what replaces `vec!`, `format!`, `assert!` and the others.
+`println(f"{x}")` (0.15), and since 0.26.2 the call without its `!`,
+`println("{}", 1)`, a format string (`volec guide formatting`). The
+help names what replaces `vec!`, `format!`, `assert!` and the others.
 
 ```vole
 'outer: for i in 0..3 { break 'outer; }
@@ -539,13 +540,13 @@ every field.
 
 ```vole
 struct P { x: i64 }
-fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
+fn main() -> i32 { let p = P { x: 1 }; println("{p}"); 0 }
 ```
 ```err
 'P' does not implement Display
 ```
 Implement it (`impl Display for P { fn fmt(self, f: inout std::Fmt) {
-f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
+f.write("P({})", self.x); } }`), or print with `{p:?}` and
 `#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
 fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 

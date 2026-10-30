@@ -145,7 +145,7 @@ fn main() {
     let x: f64 = 0.5;
     let d: Meters = 2.0;
     let e = d + x as Meters;           // `d + x` is distinct.mix
-    println(f"{b} {a < b} {e} {b as i64 + 1}");
+    println("{b} {} {e} {}", a < b, b as i64 + 1);
 }
 ```
 ```out
@@ -181,7 +181,7 @@ fn main() {
             cur = (*p.as_ptr()).next;
         }
     }
-    println(f"{total} {size_of(Option<NonNull<Node>>)}");
+    println("{total} {}", size_of(Option<NonNull<Node>>));
 }
 ```
 ```out

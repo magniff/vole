@@ -55,7 +55,7 @@ fn make(n: i64, gpa: Gpa) -> Vec<i64> {  // the caller owns the result
 fn main(gpa: Gpa) {
     let v = make(4, gpa);
     let w = v.clone();                   // a copy; `let w = v;` moves v
-    println(f"{total(v)} {total(w)} {w.len()}");
+    println("{} {} {}", total(v), total(w), w.len());
     var all: Vec<Vec<i64>> = Vec::new_in(gpa);
     keep(&all, w);                       // w is dead from here
     println(all.len());
@@ -150,10 +150,10 @@ behaviour. Take the view again after the change, or keep an index:
 var v: Vec<i64> = Vec::new_in(gpa);
 v.push(1);
 let s = v.as_slice();
-print(f"{s[0]} ");                        // used before the pushes
+    print("{} ", s[0]); // used before the pushes
 for i in 0..100 { v.push(i); }            // may move the elements
 let s2 = v.as_slice();                    // a fresh view
-println(f"{s2.len()}");
+    println("{}", s2.len());
 ```
 ```out
 1 101

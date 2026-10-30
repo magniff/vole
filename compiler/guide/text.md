@@ -7,7 +7,7 @@ string literal is one where a `str` goes, and a `str` goes where a `[u8]`
 does, for free. `String` owns its text, on an allocator:
 `String::new_in(gpa)`, `String::from_in("x", gpa)`, `s.push_str("..")`,
 `s.push(c)` (a code point, a `u32`: vole has no `char` yet),
-`s.push_fmt(f"{x}")`, `to_string_in(f"..", gpa)`. A String has its
+`s.push_fmt("{x}")`, `to_string_in(format_args("..", y), gpa)`. A String has its
 `str`'s methods (`s.trim()`), and `&s` goes where a `str` or `[u8]` does.
 The methods are Rust's, and what they return views the text: `len`,
 `chars()` (code points; `.rev()`), `char_indices()`, `bytes()`,
@@ -42,9 +42,9 @@ fn main(gpa: Gpa) -> i32 {
     let born = year.parse::<i64>().unwrap();
     let up = name.to_uppercase_in(gpa);
     let short = initials(name, gpa);
-    println(f"{up} {short} {2026 - born} {name.contains('l')}");
+    println("{up} {short} {} {}", 2026 - born, name.contains('l'));
     let parts: Vec<str> = "a,b,,c".split(',').collect_in(gpa);
-    println(f"{parts:?} {parts.len()}");
+    println("{parts:?} {}", parts.len());
     0
 }
 ```
@@ -71,14 +71,14 @@ What turns one form into another:
 | a `str` (a literal, a static) | `[u8]` | nothing: a `str` goes where a `[u8]` does; `s.as_bytes()` says so |
 | `[u8]` | `str` | `str::from_utf8(b)?`: checked, a `Result` |
 | `Vec<T>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
-| an f-string | its text | `format_in(f"..", gpa)`, a `Buf` (`.as_slice()` views it); `to_string_in(f"..", gpa)`, a `String` |
+| a format string | its text | `format_in("..", args, gpa)`, a `Buf` (`.as_slice()` views it); `to_string_in(format_args("..", args), gpa)`, a `String` |
 | a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `Buf` or `String` |
 
-`print`, `println` and `eprintln` take any `T: Display`: an f-string,
-a number, a `str`, a `[u8]`, with no allocator. `panic(msg)` and
-`assert`'s message take a `[u8]` (a `str` too), not an f-string:
-`panic(format_in(f"bad {x}", gpa).as_slice())`; with no `gpa` at hand,
-`eprintln(f"bad {x}")` and `std::process::exit(1)`.
+`print`, `println` and `eprintln` take any `T: Display`: a number, a
+`str`, a `[u8]`, `format_args(..)`, with no allocator; a literal first
+is a format string, its arguments after it. (0.26.2) `panic("bad {x}")`
+and `assert(c, "bad {}", x)` format their message too, on the stack, with
+no allocator; a message that is no literal is a `[u8]` (a `str` too).
 
 ```vole
 const SHADER: [u8] = """
@@ -94,11 +94,11 @@ fn main(gpa: Gpa) {
     var v: Vec<u8> = Vec::new_in(gpa);
     v.extend_from_slice(NAME.as_bytes());
     v.extend_from_slice(DAYS[1]);
-    let msg = format_in(f"{NAME}: {DAYS.len()} days, {v.len()} bytes", gpa); // a Buf
+    let msg = format_in("{NAME}: {} days, {} bytes", DAYS.len(), v.len(), gpa); // a Buf
     println(msg.as_slice());
-    println(f"{bytes.len} {text.lines().count()} {DAYS[..].len()}");
+    println("{} {} {}", bytes.len, text.lines().count(), DAYS[..].len());
     if v.len() != 7 {
-        panic(msg.as_slice()); // [u8], not an f-string
+        panic(msg.as_slice()); // a [u8]: no format string
     }
 }
 ```
@@ -109,7 +109,7 @@ vole: 3 days, 7 bytes
 
 ## Numbers as text without an allocator
 
-`format_in(f"{v:.2}", gpa)` allocates a `Buf`; a loop that writes a
+`format_in("{v:.2}", gpa)` allocates a `Buf`; a loop that writes a
 number every frame (a UI's label) writes it into a stack array instead.
 `std::num::fmt_f64(v, decimals, &out)` (0.25.4) writes `{v:.N}`'s text
 byte for byte at the end of a `[u8; 32]` and returns where it starts:

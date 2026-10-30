@@ -111,6 +111,18 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
   (`println("{")` is `format.syntax`, `warning[format]` is gone); `fix
   --only fstring` doubles them. f-strings stay, with no warning, until
   0.26.3. `{:#?}` is `format.spec` "not in this release".
+- The tools see a format string's holes as an f-string's: `query refs`,
+  `refactor rename` (a local, an item, a width's `name$`), `query type`
+  and hover; `volec fmt` keeps a literal's bytes.
+- `volec fix --only fstring`, the migration, run once on code written
+  before 0.26.2: an f-string at a format position loses its `f` (a name
+  hole stays, the other holes' expressions become its arguments, in
+  order), one anywhere else becomes `format_args(..)`, 0.17's
+  `b.push_str(f"..")` becomes `push_fmt`, and a plain literal at a
+  format position gets its braces doubled. It refuses nothing. The
+  guide's examples are migrated (but gpu, gpu-render and window);
+  compiler/src, std, the examples and the tests are not yet (their
+  migrated copies check clean).
 
 ### What's new in 0.26.1
 

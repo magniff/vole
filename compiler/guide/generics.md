@@ -91,7 +91,7 @@ fn main(gpa: Gpa) -> i32 {
 use std::Display;
 
 fn show<T>(label: T, x: impl Display) where T: Display {
-    println(f"{label}={x}");
+    println("{label}={x}");
 }
 
 fn apply(f: impl Fn(i64) -> i64, x: i64) -> i64 { f(x) }

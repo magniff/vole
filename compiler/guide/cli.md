@@ -43,10 +43,10 @@ fn main(gpa: Gpa) -> i32 {
         .subcommand(Command::new_in("push", gpa).arg(Arg::flag("force").short('f')));
     let m = cmd.parse("tool -vv -ofile a b".split(' ')).unwrap();
     let jobs = m.get_as::<i64>("jobs").unwrap();
-    println(f"{m.count("verbose")} {m.get("out").unwrap()} {jobs} {m.values("file").len()}");
+    println("{} {} {jobs} {}", m.count("verbose"), m.get("out").unwrap(), m.values("file").len());
     let p = cmd.parse("tool -j 4 push -f".split(' ')).unwrap();
     match p.subcommand() {
-        Some((name, sub)) => println(f"{name} {sub.flag("force")}"),
+        Some((name, sub)) => println("{name} {}", sub.flag("force")),
         None => println("none"),
     }
     match cmd.parse("tool --outt x".split(' ')) {
@@ -100,8 +100,9 @@ fn main(gpa: Gpa) -> i32 {
             .arg(Arg::positional("args").multiple().last()));
     let m = cmd.parse("vc --stats --overlay a b rm -R d -x -- -y".split(' ')).unwrap();
     let (name, sub) = m.subcommand().unwrap();
-    println(f"{name} {m.get("stats").unwrap()} {m.values("overlay").len()} {sub.get("root").unwrap()}");
-    println(f"{sub.values("expr")[0]} {sub.values("args")[0]}");
+    println("{name} {} {} {}", m.get("stats").unwrap(), m.values("overlay").len(),
+        sub.get("root").unwrap());
+    println("{} {}", sub.values("expr")[0], sub.values("args")[0]);
     let lines: [str; 2] = ["vc", "vc rm -b -t"];
     for line in lines {
         match cmd.parse(line.split(' ')) {

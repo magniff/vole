@@ -19,7 +19,8 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,
   `"\x41"`, `"\u{e9}"` (UTF-8 bytes); `c"..."` is NUL-terminated;
-  `f"x = {x:>4}"` is an f-string (0.15, `guide formatting`). A
+  `f"x = {x:>4}"` is an f-string (0.15; `guide formatting`: since
+  0.26.2 a format string, `println("x = {x:>4}")`, writes it). A
   backslash at the end of a line inside a string continues it, leaving
   out the line break and the next line's indentation.
 - Text blocks (0.25.3), for text of several lines (WGSL, SQL, a usage
@@ -51,12 +52,12 @@ const PATTERN: [u8] = r"""
 
 fn main() -> i32 {
     println(USAGE);
-    println(f"{PATTERN} {PATTERN.len}");
+    println("{PATTERN} {}", PATTERN.len);
     let n = 2;
-    println(f"""
+    println("""
         "{n}" lines
-          {n * 2:>3}
-        """);
+          {:>3}
+        """, n * 2);
     0
 }
 ```

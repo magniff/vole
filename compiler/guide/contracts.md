@@ -12,7 +12,7 @@ struct Stack { items: Vec<i64> }
 
 impl Stack {
     fn top(self, i: i64) -> i64
-        requires 0 <= i && i < self.items.len() else f"no item {i}"
+        requires 0 <= i && i < self.items.len() else "no item {i}"
         ensures result == self.items.get(i)
     {
         self.items.get(i)
@@ -28,14 +28,14 @@ impl Stack {
 fn main(gpa: Gpa) -> i32 {
     var s = Stack { items: Vec::new_in(gpa) };
     s.items.push(4);
-    println(f"{s.top(0)} {s.pop()}");
-    println(f"{s.pop()}");
+    println("{} {}", s.top(0), s.pop());
+    println("{}", s.pop());
     0
 }
 ```
 ```out (exit 101)
 4 4
-main.vl:22:16: pop on an empty stack: self.items.len() = 0
+main.vl:22:19: pop on an empty stack: self.items.len() = 0
 ```
 
 - `requires COND` is checked at the call, after the arguments: a failure

@@ -78,7 +78,7 @@ fn main() {
     let wrapped = vaddq_u8(a, b);      // 300 wraps to 44
     let floor = vqsubq_u8(b, a);       // saturates at 0
     let both = vextq_u8(wrapped, floor, 15);
-    println(f"{vgetq_lane_u8(wrapped, 0)} {vgetq_lane_u8(floor, 0)} {vgetq_lane_u8(both, 1)}");
+    println("{} {} {}", vgetq_lane_u8(wrapped, 0), vgetq_lane_u8(floor, 0), vgetq_lane_u8(both, 1));
 }
 ```
 ```out
@@ -140,7 +140,7 @@ fn crc32c(s: [u8]) -> u32 {
 }
 
 fn main() {
-    println(f"{crc32c("123456789"):x} {crc32c_portable("123456789"):x}");
+    println("{:x} {:x}", crc32c("123456789"), crc32c_portable("123456789"));
 }
 ```
 ```out
@@ -207,7 +207,7 @@ fn dot(a: [u8], b: [u8]) -> u32 {
 fn main() {
     let a: [u8; 32] = [3; 32];
     let b: [u8; 32] = [2; 32];
-    println(f"{dot(a[..], b[..])}");
+    println("{}", dot(a[..], b[..]));
 }
 ```
 ```out
@@ -285,7 +285,7 @@ fn find(s: [u8], b: u8) -> i64 {
 
 fn main() {
     let text = "the quick brown fox jumps over the lazy dog";
-    println(f"{find(text, 'z')} {find(text, 'q')} {find(text, '!')}");
+    println("{} {} {}", find(text, 'z'), find(text, 'q'), find(text, '!'));
 }
 ```
 ```out
@@ -372,7 +372,7 @@ fn main() {
     }
     compress(&state[..], block[..]);
     for k in 0..8 {
-        print(f"{state[k]:08x}");
+        print("{:08x}", state[k]);
     }
     println("");
 }

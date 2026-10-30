@@ -164,9 +164,9 @@ fn port(raw: i64) -> Result<i64, ConfigError> {
 
 fn main() -> Result<(), ConfigError> {
     let p = port(8080)?;
-    println(f"port {p}");
+    println("port {p}");
     let q = port(-1)?;
-    println(f"port {q}");
+    println("port {q}");
     Ok(())
 }
 ```

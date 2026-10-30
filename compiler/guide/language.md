@@ -47,7 +47,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `fn f(&self)`, `fn f(&mut self)`, `fn f(self)` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)` |
 | `let mut x`, `move \|\|` | `var x`, `sink \|\|`; `inout r = &x;` keeps an access, used as `x` itself (no `*r`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
-| `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
+| `println!("{}", x)`, `format!` | no macros: `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `volec query effects f` (0.16, `guide effects`) |
@@ -106,7 +106,7 @@ fn classify(n: i64) -> [u8] {
 }
 
 fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {   // defaults (0.15)
-    for _ in 0..times { print(f"hi {name}{sep}"); }
+    for _ in 0..times { print("hi {name}{sep}"); }
 }
 
 fn main() -> i32 {
@@ -166,7 +166,7 @@ fn main(gpa: Gpa) {
     report(b, &sum);
     var all: Vec<Account> = Vec::new_in(gpa);
     keep(&all, a);                        // a moves: dead from here
-    println(f"{sum} {all[0].log.len()} {b.balance}");
+    println("{sum} {} {}", all[0].log.len(), b.balance);
 }
 ```
 ```out
@@ -266,7 +266,7 @@ impl<T: Ord> Pair<T> {
 fn main() -> i32 {
     let squares = [Square { side: 2 }, Square { side: 3 }];
     let p = Pair::<i64> { a: 3, b: 9 };   // the turbofish: Pair::<i64>
-    println(f"{total(squares[..])} {squares[0].twice()} {p.max()}");   // a[..]: a slice
+    println("{} {} {}", total(squares[..]), squares[0].twice(), p.max()); // a[..]: a slice
     0
 }
 ```
@@ -422,7 +422,7 @@ fn main(gpa: Gpa) -> i32 {
             }
         }
     }
-    println(f"{dist[1]} {dist[2]} {dist[3]} {dist[4] == i64::MAX}");
+    println("{} {} {} {}", dist[1], dist[2], dist[3], dist[4] == i64::MAX);
     0
 }
 ```
@@ -503,7 +503,7 @@ and linking: `guide c-interop`.
 | `own.readonly: '&n' changes 'n', a let binding` (or `v.push(x)`) | `var n`; a parameter `x: inout T`; `inout self`; `static var` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
-| `'println!' is a macro call` | no macros: `println(f"{x}")` |
+| `'println!' is a macro call` | no macros: `println("{}", x)` |
 | `cannot assign to immutable variable 'x'` | `var x` |
 | `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
 | `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc016` |

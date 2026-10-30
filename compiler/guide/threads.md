@@ -30,7 +30,7 @@ fn main() {
     let n = AtomicI64::new(5);
     let old = n.fetch_add(3, Ordering::Relaxed);
     let r = n.compare_exchange(8, 10, Ordering::AcqRel, Ordering::Acquire);
-    println(f"{old} {r.is_ok()} {n.load(Ordering::SeqCst)}");
+    println("{old} {} {}", r.is_ok(), n.load(Ordering::SeqCst));
 }
 ```
 ```out
@@ -80,7 +80,7 @@ fn main(gpa: Gpa) {
         a.join() + b.join()
     });
     let h = thread::spawn(sink || v.len());
-    println(f"{total} {h.join()}");
+    println("{total} {}", h.join());
 }
 ```
 ```out
@@ -133,7 +133,7 @@ fn main(gpa: Gpa) {
         for x in rx.iter() { sum += x; }
         sum
     });
-    println(f"{total} {count.with(|n| n)}");
+    println("{total} {}", count.with(|n| n));
 }
 ```
 ```out
@@ -162,7 +162,7 @@ fn work() -> i64 {
 fn main() {
     let h = thread::spawn(sink || work());
     CALLS = 100;
-    println(f"{h.join()} {CALLS}");
+    println("{} {CALLS}", h.join());
 }
 ```
 ```out
