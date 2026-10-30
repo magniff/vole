@@ -1,0 +1,193 @@
+// `volec query drops FILE:LINE` (0.26.1, docs/design/places-ir.md §8 step
+// 9): the elaborated drops of the function at that line, as the places IR
+// decides them. The first line is the function; then a line per drop, in
+// the order of its body: where it runs (a block's `}`, the end of a
+// statement, a `return` or `break`), the drop and its decision (kept,
+// removed, under a flag, opened into its parts), and what it drops (the
+// local's name, or a temporary and where it was made) with its type.
+//
+// The program is checked with its bodies kept (places/keep.vl), so the
+// function's body is the one a code generator reads.
+
+use crate::base::{
+    STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+};
+use crate::base::comp::Comp;
+use crate::front::ast::NODES;
+use crate::front::types::{FN_COUNT, buf_type};
+use crate::places::front::{ast_local_name, fn_node};
+use crate::places::ir::{LF_FLAG, LF_TEMP, P_LOCALS, P_STMTS, SK_DROP, full_place_type, has_flag};
+use crate::places::keep::{has_kept, load_body};
+use crate::places::print::{buf_drop, buf_fn_name, buf_pos, drop_pos};
+use crate::tools::query::{parse_digits, trailing_number};
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::positions::{LINES, line_end, line_index};
+use crate::tools::query::refs::file_text;
+use crate::tools::query::typeat::file_named;
+
+// Called before the program is loaded: its bodies are kept.
+pub fn drops_wanted() {
+    crate::places::keep::KEEP_BODIES = true;
+}
+
+pub fn query_drops(arg: [u8]) -> i64 {
+    var line = -1;
+    var file = arg[0..0];
+    let a = trailing_number(arg);
+    if a > 0 && arg[a - 1] == ':' {
+        line = parse_digits(arg[a..arg.len()]);
+        file = arg[0..a - 1];
+        // (FILE:LINE:COL: the column is not needed)
+        let b = trailing_number(file);
+        if b > 0 && file[b - 1] == ':' {
+            line = parse_digits(file[b..file.len()]);
+            file = file[0..b - 1];
+        }
+    }
+    if line < 1 {
+        let d = diag(c"error", c"query.usage");
+        buf_str(d, c"drops needs a line, FILE:LINE (not '");
+        buf_bytes(d, arg);
+        buf_str(d, c"')\n");
+        return 2;
+    }
+    let g = file_named(file);
+    if g < 0 {
+        let d = diag(c"error", c"query.no-match");
+        buf_str(d, c"no file '");
+        buf_bytes(d, file);
+        buf_str(d, c"' in the program\n");
+        return 1;
+    }
+    let idx = line_index(crate::base::FILES[g].start) + line - 1;
+    if idx >= LINES.count || line_at(idx) >= crate::base::FILES[g].end {
+        let d = diag(c"error", c"query.no-match");
+        buf_bytes(d, file_text(g));
+        buf_str(d, c" has no line ");
+        buf_int(d, line);
+        buf_byte(d, '\n');
+        return 1;
+    }
+    let pos = line_at(idx);
+    let f = body_at(pos, line_end(pos));
+    if f < 0 {
+        let d = diag(c"error", c"query.no-match");
+        buf_bytes(d, arg);
+        buf_str(d, c" is in no function with a body in the places IR (a generic one never instantiated, C's, or one with errors)\n");
+        try_end(try_begin(c"show", arg, true));
+        return 1;
+    }
+    load_body(f);
+    let out = buf_new();
+    buf_bytes(out, file_text(g));
+    buf_byte(out, ':');
+    buf_int(out, line);
+    buf_str(out, c" in ");
+    buf_fn_name(out, f);
+    buf_byte(out, '\n');
+    // (by where they run, then in the body's order)
+    var order: Vec<i64, Comp> = Vec::new_in(Comp {});
+    for s in 0..P_STMTS.len() {
+        if P_STMTS[s].kind == SK_DROP {
+            order.push(s);
+        }
+    }
+    for i in 1..order.len() {
+        var j = i;
+        while j > 0 && at_of(order[j - 1]) > at_of(order[j]) {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let n = order.len();
+    for s in order.iter() {
+        let st = P_STMTS[s];
+        buf_str(out, c"  ");
+        if st.node > 0 {
+            buf_line_col(out, drop_pos(st.node));
+        } else {
+            buf_str(out, c"-");
+        }
+        buf_str(out, c"  ");
+        buf_drop(out, s);
+        buf_str(out, c"  ");
+        buf_what(out, st.a);
+        buf_str(out, c": ");
+        buf_type(out, full_place_type(st.a, st.b));
+        buf_byte(out, '\n');
+    }
+    if n == 0 {
+        buf_str(out, c"  (no drops: nothing it holds needs one)\n");
+    }
+    buf_write_fd(out, STDOUT);
+    0
+}
+
+// Where drop statement s runs (-1: unknown).
+fn at_of(s: i64) -> i64 {
+    let node = P_STMTS[s].node;
+    if node > 0 { drop_pos(node) } else { -1 }
+}
+
+// The start of line idx (LINES).
+fn line_at(idx: i64) -> i64 {
+    LINES.get(idx)
+}
+
+// The innermost function with a kept body whose text holds the line
+// [start, end): a closure inside its parent, the first instance of a
+// generic one; -1.
+fn body_at(start: i64, end: i64) -> i64 {
+    var best = -1;
+    var size = 0;
+    for f in 0..FN_COUNT {
+        if !has_kept(f) {
+            continue;
+        }
+        let item = fn_node(f);
+        let s = NODES[item].start;
+        let e = NODES[item].end;
+        if s < end && start < e && (best < 0 || e - s < size) {
+            best = f;
+            size = e - s;
+        }
+    }
+    best
+}
+
+// `LINE:COL` of pos (buf_pos without its file).
+fn buf_line_col(out: i64, pos: i64) {
+    let b = buf_new();
+    buf_pos(b, pos);
+    let text = buf_slice(b);
+    // (FILE:LINE:COL: from the second colon from the end)
+    var i = text.len();
+    var colons = 0;
+    while i > 0 {
+        i -= 1;
+        if text[i] == ':' {
+            colons += 1;
+            if colons == 2 {
+                buf_bytes(out, text[i + 1..text.len()]);
+                return;
+            }
+        }
+    }
+    buf_bytes(out, text);
+}
+
+// What local l is: its name, a temporary and where it was made, a flag.
+fn buf_what(out: i64, l: i64) {
+    let src = P_LOCALS[l].src;
+    if has_flag(l, LF_TEMP) || src < 0 {
+        buf_str(out, if has_flag(l, LF_FLAG) { c"a flag" } else { c"a temporary" });
+        let node = P_LOCALS[l].node;
+        if node > 0 {
+            buf_str(out, c" (");
+            buf_line_col(out, NODES[node].start);
+            buf_str(out, c")");
+        }
+        return;
+    }
+    buf_bytes(out, SYMS[ast_local_name(src)].text);
+}

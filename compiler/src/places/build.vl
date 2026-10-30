@@ -40,7 +40,6 @@ use crate::front::contracts::expand::is_pre_fn;
 use crate::front::lexer::Tok;
 use crate::front::own::byref::{ASSIGN_OLD, BYREF, MATCH_BYREF, NO_DROP, borrowed_call};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
-use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
 use crate::front::patterns::{binding_count, binds_ref, pattern_referent};
 use crate::front::types::{
@@ -49,7 +48,7 @@ use crate::front::types::{
 };
 use crate::places::front::{
     ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
-    variant_discr,
+    type_glue, variant_discr,
 };
 use crate::places::ir::{
     AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
@@ -57,7 +56,7 @@ use crate::places::ir::{
     BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR,
     LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY,
     OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF,
-    PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, P_LOCALS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR,
+    PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, P_LOCALS, P_OPS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR,
     RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD,
     SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE,
     UO_BITNOT, UO_NEG, UO_NOT, body_begin, emit, enter_block, has_flag, is_union_type, new_block,
@@ -77,7 +76,8 @@ static var MAP_GEN: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var GEN: i64 = 0;
 // The statics named so far: (symbol, IR local) pairs.
 static var STATICS_SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The scope stack: records of SW words (kind, first entry, loop node,
+// The scope stack: records of SW words (kind, first entry, its node
+// (where its drops run, places/print.vl drop_pos; a loop's: the loop),
 // break block, continue block, the loop's result local and projection).
 const SW: i64 = 8;
 const SC_BODY: i64 = 1;
@@ -91,8 +91,6 @@ const EN_DROP: i64 = 1;
 const EN_DEAD: i64 = 2;
 const EN_DEFER: i64 = 3;
 static var ENTRIES: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Operands being collected for a statement: triples.
-static var OPSTACK: Vec<i64, Comp> = Vec::new_in(Comp {});
 // The last operand made (operand) and the last place (as_place).
 static var OPK: i64 = 0;
 static var OPA: i64 = 0;
@@ -103,6 +101,11 @@ static var PL_P: i64 = 0;
 static var RET_BLOCK: i64 = -1;
 static var UNIT_LOCAL: i64 = -1;
 static var CUR_F: i64 = -1;
+
+// The exit whose scopes' entries are being emitted (a `return`, `break`,
+// `continue`, a refused guard, the body's end): the node of their drops
+// (0: a scope's own end, its node's).
+static var EXIT_NODE: i64 = 0;
 // Whether drops are placed (--values=error, as the own pass's).
 static var DROPS: bool = false;
 // Whether the struct literal being lowered is a by-access closure's env
@@ -119,6 +122,10 @@ static var SYM_FOR_SEQ: i64 = 0;
 // Counts, for --time-passes and the README.
 pub static var BUILT: i64 = 0;
 pub static var STMTS_MADE: i64 = 0;
+
+// Whether every local gets its storage markers (keeps_storage): set by the
+// driver for --emit-places and --verify-places.
+pub static var ALL_STORAGE: bool = true;
 
 fn syms() {
     if SYM_TP == 0 {
@@ -167,7 +174,7 @@ fn ast_borrowed(l: i64) -> bool {
 }
 
 fn needs_drop(t: i64) -> bool {
-    DROPS && t > 0 && t != TY_NEVER && has_glue(t)
+    DROPS && t > 0 && t != TY_NEVER && type_glue(t)
 }
 
 // A new IR local for AST local l (bound by a pattern or a `let`).
@@ -199,7 +206,19 @@ fn new_temp(ty: i64, node: i64, borrowed: bool) -> i64 {
 }
 
 fn live(l: i64) {
+    if !keeps_storage(l) {
+        return;
+    }
     emit(SK_LIVE, l, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// Whether local l gets its storage markers: every local when they are
+// printed or verified (ALL_STORAGE), else only one whose type has glue,
+// which elaboration reads them for (a StorageLive or StorageDead makes its
+// paths uninitialized). The code generators ignore them in 0.26.1, and
+// most locals are scalars: about half the statements.
+fn keeps_storage(l: i64) -> bool {
+    ALL_STORAGE || type_glue(P_LOCALS[l].ty)
 }
 
 // The local `()` values are discarded into.
@@ -227,11 +246,11 @@ fn static_local(name: i64, node: i64) -> i64 {
 
 // ---- Scopes ----
 
-fn push_scope(kind: i64) -> i64 {
+fn push_scope(kind: i64, node: i64) -> i64 {
     let at = SCOPES.len() / SW;
     SCOPES.push(kind);
     SCOPES.push(ENTRIES.len() / 2);
-    SCOPES.push(0);
+    SCOPES.push(node);
     SCOPES.push(-1);
     SCOPES.push(-1);
     SCOPES.push(-1);
@@ -245,6 +264,9 @@ fn scope_depth() -> i64 {
 }
 
 fn schedule(kind: i64, v: i64) {
+    if kind == EN_DEAD && !keeps_storage(v) {
+        return;
+    }
     ENTRIES.push(kind);
     ENTRIES.push(v);
 }
@@ -253,12 +275,14 @@ fn schedule(kind: i64, v: i64) {
 fn emit_scope(s: i64) {
     let first = SCOPES[s * SW + 1];
     let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] } else { ENTRIES.len() / 2 };
+    // (where its drops run: the exit taken, or the scope's own end)
+    let at = if EXIT_NODE > 0 { EXIT_NODE } else { SCOPES[s * SW + 2] };
     var e = end - 1;
     while e >= first {
         let kind = ENTRIES[2 * e];
         let v = ENTRIES[2 * e + 1];
         if kind == EN_DROP {
-            emit(SK_DROP, v, 0, DS_UNDECIDED, -1, P_LOCALS[v].src, 0, 0, 0);
+            emit(SK_DROP, v, 0, DS_UNDECIDED, -1, P_LOCALS[v].src, 0, 0, at);
         } else if kind == EN_DEAD {
             emit(SK_DEAD, v, 0, 0, 0, 0, 0, 0, 0);
         } else if kind == EN_DEFER {
@@ -270,12 +294,15 @@ fn emit_scope(s: i64) {
 
 // Leaves scopes down to `depth` (they stay on the stack: an edge out of
 // them, `break`, `return`).
-fn exit_to(depth: i64) {
+fn exit_to(depth: i64, node: i64) {
+    let saved = EXIT_NODE;
+    EXIT_NODE = node;
     var s = scope_depth() - 1;
     while s >= depth {
         emit_scope(s);
         s -= 1;
     }
+    EXIT_NODE = saved;
 }
 
 // The innermost scope ends: its entries emitted (when the code reaches its
@@ -307,7 +334,7 @@ fn run_defer(d: i64) {
     if e == 0 {
         return;
     }
-    let s = push_scope(SC_STMT);
+    let s = push_scope(SC_STMT, d);
     expr_into(e, -1, 0);
     pop_scope_at(s);
 }
@@ -326,34 +353,35 @@ fn set_op(k: i64, a: i64, b: i64) {
     OPB = b;
 }
 
-fn push_cur_op() {
-    OPSTACK.push(OPK);
-    OPSTACK.push(OPA);
-    OPSTACK.push(OPB);
+// The current operand written straight to P_OPS: a statement whose
+// operands are all known (nothing is emitted between its ops_mark and its
+// emit), so no staging.
+fn push_now() {
+    push_op(OPK, OPA, OPB);
 }
 
-// Moves the operands collected since `mark` (an OPSTACK length) into
-// P_OPS: their mark there, for emit.
-fn flush_ops(mark: i64) -> i64 {
-    let at = ops_mark();
-    var i = mark;
-    while i < OPSTACK.len() {
-        push_op(OPSTACK[i], OPSTACK[i + 1], OPSTACK[i + 2]);
-        i += 3;
+// The current operand added to a statement's operands being written
+// straight to P_OPS from `at` (n there so far), as each is made: when
+// making it emitted statements with operands of their own (after ours),
+// ours are moved to the end first. The new start of the operands.
+fn ops_add(at: i64, n: i64) -> i64 {
+    var start = at;
+    if P_OPS.len() != at + 3 * n {
+        start = P_OPS.len();
+        for j in 0..3 * n {
+            let w = P_OPS[at + j];
+            P_OPS.push(w);
+        }
     }
-    OPSTACK.truncate(mark);
-    at
-}
-
-fn op_count(mark: i64) -> i64 {
-    (OPSTACK.len() - mark) / 3
+    push_now();
+    start
 }
 
 // The operand that reads place (l, p) of type ty: a move of a value that
 // needs drop when `moving`, but out of a borrowed copy (a copy of a
 // borrowed copy is one too), else a copy.
 fn place_operand(l: i64, p: i64, ty: i64, moving: bool) {
-    if moving && ty > 0 && has_glue(ty) && !has_flag(l, LF_BORROWED) {
+    if moving && ty > 0 && type_glue(ty) && !has_flag(l, LF_BORROWED) {
         set_op(OK_MOVE, l, p);
     } else {
         set_op(OK_COPY, l, p);
@@ -561,26 +589,23 @@ fn index_place(e: i64) -> bool {
     if bt > 0 && (NODES[e].p & NODE_IN_BOUNDS) == 0 {
         let tk = TYPES[bt].kind;
         if tk == TyKind::Array {
-            let m = OPSTACK.len();
+            let at = ops_mark();
             set_op(OK_COPY, il, 0);
-            push_cur_op();
+            push_now();
             set_op(OK_INT, TYPES[bt].b, TY_I64);
-            push_cur_op();
-            let at = flush_ops(m);
+            push_now();
             emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at, 2, e);
         } else if tk == TyKind::Slice {
             let len = new_temp(TY_I64, e, false);
-            let m = OPSTACK.len();
+            let at = ops_mark();
             set_op(OK_PLACE, bl, bp);
-            push_cur_op();
-            let at = flush_ops(m);
+            push_now();
             emit(SK_ASSIGN, len, 0, RV_LEN, 0, 0, at, 1, e);
-            let m2 = OPSTACK.len();
+            let at2 = ops_mark();
             set_op(OK_COPY, il, 0);
-            push_cur_op();
+            push_now();
             set_op(OK_COPY, len, 0);
-            push_cur_op();
-            let at2 = flush_ops(m2);
+            push_now();
             emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at2, 2, e);
         }
     }
@@ -606,9 +631,8 @@ fn as_place(e: i64) {
 
 // (l, p) = use of the current operand.
 fn emit_use(l: i64, p: i64, node: i64) {
-    let m = OPSTACK.len();
-    push_cur_op();
-    let at = flush_ops(m);
+    let at = ops_mark();
+    push_now();
     emit(SK_ASSIGN, l, p, RV_USE, 0, 0, at, 1, node);
 }
 
@@ -687,9 +711,8 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
     }
     if k == NodeKind::EnumPanic {
         operand(NODES[e].a, false);
-        let m = OPSTACK.len();
-        push_cur_op();
-        let at = flush_ops(m);
+        let at = ops_mark();
+        push_now();
         emit(SK_INTRINSIC, unit_local(), 0, IK_PANIC, e, 0, at, 1, e);
         terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, e);
         return;
@@ -739,9 +762,8 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
         if !reachable() {
             return;
         }
-        let m = OPSTACK.len();
-        push_cur_op();
-        let at = flush_ops(m);
+        let at = ops_mark();
+        push_now();
         emit(SK_ASSIGN, dl, dp, RV_CAST, ty, 0, at, 1, e);
         return;
     }
@@ -752,9 +774,8 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
     }
     if k == NodeKind::Repeat {
         operand(NODES[e].a, true);
-        let m = OPSTACK.len();
-        push_cur_op();
-        let at = flush_ops(m);
+        let at = ops_mark();
+        push_now();
         emit(SK_ASSIGN, dl, dp, RV_REPEAT, TYPES[undistinct(ty)].b, 0, at, 1, e);
         return;
     }
@@ -801,18 +822,16 @@ fn lower_unary(e: i64, dl: i64, dp: i64) {
     if !reachable() {
         return;
     }
-    let m = OPSTACK.len();
-    push_cur_op();
-    let at = flush_ops(m);
+    let at = ops_mark();
+    push_now();
     let uo = if op == Tok::Minus { UO_NEG } else if op == Tok::Bang { UO_NOT } else { UO_BITNOT };
     emit(SK_ASSIGN, dl, dp, RV_UNARY, uo, e, at, 1, e);
 }
 
 fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64) {
-    let m = OPSTACK.len();
+    let at = ops_mark();
     set_op(OK_PLACE, l, p);
-    push_cur_op();
-    let at = flush_ops(m);
+    push_now();
     emit(SK_ASSIGN, dl, dp, RV_REF, kind, 0, at, 1, node);
 }
 
@@ -828,10 +847,9 @@ fn lower_binary(e: i64, dl: i64, dp: i64) {
         emit_use(t, 0, e);
         let rhs = new_block();
         let done = new_block();
-        let m = OPSTACK.len();
+        let at = ops_mark();
         set_op(OK_COPY, t, 0);
-        push_cur_op();
-        let at = flush_ops(m);
+        push_now();
         if op == Tok::AmpAmp {
             switch_bool(at, done, rhs, e);
         } else {
@@ -848,16 +866,19 @@ fn lower_binary(e: i64, dl: i64, dp: i64) {
         emit_use(dl, dp, e);
         return;
     }
-    let m = OPSTACK.len();
+    // (the left operand held while the right one is made: it may emit
+    // statements of its own, with their operands)
     operand(NODES[e].b, false);
-    push_cur_op();
+    let k1 = OPK;
+    let a1 = OPA;
+    let b1 = OPB;
     operand(NODES[e].c, false);
-    push_cur_op();
     if !reachable() {
-        OPSTACK.truncate(m);
         return;
     }
-    let at = flush_ops(m);
+    let at = ops_mark();
+    push_op(k1, a1, b1);
+    push_now();
     emit(SK_ASSIGN, dl, dp, RV_BINARY, bo_of(op), e, at, 2, e);
 }
 
@@ -907,12 +928,11 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
     let k = NODES[e].kind;
     let ty = NODES[e].ty;
     let n = NODES[e].count;
-    let m = OPSTACK.len();
-    // (room for the parts, filled by position)
+    // (room for the parts in P_OPS, filled by position: what their values
+    // emit goes after it)
+    let at = ops_mark();
     for _ in 0..n {
-        OPSTACK.push(OK_UNIT);
-        OPSTACK.push(0);
-        OPSTACK.push(TY_UNIT);
+        push_op(OK_UNIT, 0, TY_UNIT);
     }
     for j in 0..n {
         var i = j;
@@ -939,16 +959,14 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
             operand(value, true);
         }
         if i >= 0 && i < n {
-            OPSTACK[m + 3 * i] = OPK;
-            OPSTACK[m + 3 * i + 1] = OPA;
-            OPSTACK[m + 3 * i + 2] = OPB;
+            P_OPS[at + 3 * i] = OPK;
+            P_OPS[at + 3 * i + 1] = OPA;
+            P_OPS[at + 3 * i + 2] = OPB;
         }
     }
     if !reachable() {
-        OPSTACK.truncate(m);
         return;
     }
-    let at = flush_ops(m);
     var ak = AK_TUPLE;
     var info = 0;
     if k == NodeKind::Array {
@@ -968,46 +986,43 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
 fn lower_slicing(e: i64, dl: i64, dp: i64) {
     let base = NODES[e].a;
     let range = NODES[e].b;
-    let m = OPSTACK.len();
     as_place(base);
     set_op(OK_PLACE, PL_L, PL_P);
-    push_cur_op();
+    var at = ops_add(ops_mark(), 0);
     if NODES[range].a != 0 {
         operand(NODES[range].a, false);
     } else {
         set_op(OK_UNIT, 0, TY_UNIT);
     }
-    push_cur_op();
+    at = ops_add(at, 1);
     if NODES[range].b != 0 {
         operand(NODES[range].b, false);
     } else {
         set_op(OK_UNIT, 0, TY_UNIT);
     }
-    push_cur_op();
+    at = ops_add(at, 2);
     if !reachable() {
-        OPSTACK.truncate(m);
         return;
     }
-    let at = flush_ops(m);
     emit(SK_ASSIGN, dl, dp, RV_SLICE, e, 0, at, 3, e);
 }
 
 fn lower_vecop(e: i64, dl: i64, dp: i64) {
-    let m = OPSTACK.len();
+    var at = ops_mark();
+    var n = 0;
     if NODES[e].a != 0 {
         operand(NODES[e].a, false);
-        push_cur_op();
+        at = ops_add(at, n);
+        n += 1;
     }
     for i in 0..NODES[e].count {
         operand(child(e, i), false);
-        push_cur_op();
+        at = ops_add(at, n);
+        n += 1;
     }
     if !reachable() {
-        OPSTACK.truncate(m);
         return;
     }
-    let n = op_count(m);
-    let at = flush_ops(m);
     var l = dl;
     var p = dp;
     if l < 0 {
@@ -1025,10 +1040,12 @@ fn lower_vecop(e: i64, dl: i64, dp: i64) {
 fn lower_call(n: i64, dl: i64, dp: i64) {
     let f = NODES[n].x - 1;
     let ty = NODES[n].ty;
-    let m = OPSTACK.len();
+    var at = ops_mark();
+    var count = 0;
     if f < 0 {
         operand(NODES[n].a, false);
-        push_cur_op();
+        at = ops_add(at, count);
+        count += 1;
     }
     let c_callee = f >= 0 && fn_is_extern(f);
     var ik = -1;
@@ -1044,14 +1061,14 @@ fn lower_call(n: i64, dl: i64, dp: i64) {
         let arg = child(n, i);
         let mode = if f >= 0 { param_mode(f, i) } else { arg_mode_of(arg) };
         lower_arg(i, arg, mode, c_callee || pre);
-        if pre && OPK == OK_COPY && !has_flag(OPA, LF_BORROWED) && has_glue(NODES[arg].ty) {
+        if pre && OPK == OK_COPY && !has_flag(OPA, LF_BORROWED) && type_glue(NODES[arg].ty) {
             let t = new_temp(NODES[arg].ty, arg, true);
             emit_use(t, 0, arg);
             set_op(OK_COPY, t, 0);
         }
-        push_cur_op();
+        at = ops_add(at, count);
+        count += 1;
         if !reachable() {
-            OPSTACK.truncate(m);
             return;
         }
     }
@@ -1062,8 +1079,6 @@ fn lower_call(n: i64, dl: i64, dp: i64) {
             else { new_temp(ty, n, borrowed_call(n)) };
         p = 0;
     }
-    let count = op_count(m);
-    let at = flush_ops(m);
     if ik >= 0 {
         emit(SK_INTRINSIC, l, p, ik, n, 0, at, count, n);
     } else {
@@ -1138,20 +1153,18 @@ fn lower_assign(n: i64) {
         return;
     }
     // `p op= v`: p = p op v, the value first
-    let m = OPSTACK.len();
     operand(value, false);
     let vk = OPK;
     let va = OPA;
     let vb = OPB;
     if !reachable() || !place_of(target) {
-        OPSTACK.truncate(m);
         return;
     }
+    let at = ops_mark();
     set_op(OK_COPY, PL_L, PL_P);
-    push_cur_op();
+    push_now();
     set_op(vk, va, vb);
-    push_cur_op();
-    let at = flush_ops(m);
+    push_now();
     emit(SK_ASSIGN, PL_L, PL_P, RV_BINARY, bo_of(op), n, at, 2, n);
 }
 
@@ -1257,7 +1270,7 @@ fn lower_return(n: i64) {
     if !reachable() {
         return;
     }
-    exit_to(0);
+    exit_to(0, n);
     goto(RET_BLOCK);
 }
 
@@ -1279,7 +1292,7 @@ fn lower_break(n: i64) {
     if !reachable() {
         return;
     }
-    exit_to(s + 1);
+    exit_to(s + 1, n);
     goto(SCOPES[s * SW + 3]);
 }
 
@@ -1289,7 +1302,7 @@ fn lower_continue(n: i64) {
         unsupported(n);
         return;
     }
-    exit_to(s + 1);
+    exit_to(s + 1, n);
     if SCOPES[s * SW + 7] != 0 {
         goto_back(SCOPES[s * SW + 4]);
     } else {
@@ -1314,9 +1327,8 @@ fn lower_if(n: i64, dl: i64, dp: i64) {
     let has_else = NODES[n].c != 0;
     let else_b = if has_else { new_block() } else { -1 };
     let join = new_block();
-    let m = OPSTACK.len();
-    push_cur_op();
-    let at = flush_ops(m);
+    let at = ops_mark();
+    push_now();
     switch_bool(at, if has_else { else_b } else { join }, then_b, n);
     enter_block(then_b);
     expr_into(NODES[n].b, dl, dp);
@@ -1340,7 +1352,7 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     let exit = new_block();
     goto(head);
     enter_block(head);
-    let s = push_scope(SC_LOOP);
+    let s = push_scope(SC_LOOP, n);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = head;
@@ -1351,11 +1363,10 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     if NODES[n].kind == NodeKind::While {
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
-        let c = push_scope(SC_STMT);
+        let c = push_scope(SC_STMT, n);
         operand(NODES[n].b, false);
-        let m = OPSTACK.len();
-        push_cur_op();
-        let at = flush_ops(m);
+        let at = ops_mark();
+        push_now();
         let body = new_block();
         let out = new_block();
         // (the condition's temporaries end on both edges)
@@ -1403,24 +1414,22 @@ fn lower_for(n: i64) {
     goto(test);
     enter_block(test);
     let cmp = new_temp(TY_BOOL, n, false);
-    let m = OPSTACK.len();
+    let at = ops_mark();
     set_op(OK_COPY, counter, 0);
-    push_cur_op();
+    push_now();
     set_op(OK_COPY, end, 0);
-    push_cur_op();
-    let at = flush_ops(m);
+    push_now();
     emit(SK_ASSIGN, cmp, 0, RV_BINARY, if inclusive { BO_LE } else { BO_LT }, n, at, 2, n);
-    let m2 = OPSTACK.len();
+    let at2 = ops_mark();
     set_op(OK_COPY, cmp, 0);
-    push_cur_op();
-    let at2 = flush_ops(m2);
+    push_now();
     switch_bool(at2, exit, body, n);
     enter_block(body);
-    let s = push_scope(SC_LOOP);
+    let s = push_scope(SC_LOOP, n);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = next;
-    let arm = push_scope(SC_ARM);
+    let arm = push_scope(SC_ARM, n);
     let pat = NODES[n].b;
     if NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
         let l = user_local(NODES[pat].x, pat, false);
@@ -1441,27 +1450,24 @@ fn lower_for(n: i64) {
     if inclusive {
         // (the last round: counter == end)
         let last = new_temp(TY_BOOL, n, false);
-        let m3 = OPSTACK.len();
+        let at3 = ops_mark();
         set_op(OK_COPY, counter, 0);
-        push_cur_op();
+        push_now();
         set_op(OK_COPY, end, 0);
-        push_cur_op();
-        let at3 = flush_ops(m3);
+        push_now();
         emit(SK_ASSIGN, last, 0, RV_BINARY, BO_EQ, n, at3, 2, n);
-        let m4 = OPSTACK.len();
+        let at4 = ops_mark();
         set_op(OK_COPY, last, 0);
-        push_cur_op();
-        let at4 = flush_ops(m4);
+        push_now();
         let inc = new_block();
         switch_bool(at4, inc, exit, n);
         enter_block(inc);
     }
-    let m5 = OPSTACK.len();
+    let at5 = ops_mark();
     set_op(OK_COPY, counter, 0);
-    push_cur_op();
+    push_now();
     set_op(OK_INT, 1, rt);
-    push_cur_op();
-    let at5 = flush_ops(m5);
+    push_now();
     emit(SK_ASSIGN, counter, 0, RV_BINARY, BO_ADD, n, at5, 2, n);
     goto(test);
     enter_block(exit);
@@ -1488,23 +1494,22 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
         let arm = child(n, i);
         let pat = NODES[arm].a;
         let fail = new_block();
-        let s = push_scope(SC_ARM);
+        let s = push_scope(SC_ARM, arm);
         test_pattern(pat, sl, sp, st, fail);
         let guard = NODES[arm].b;
         if guard != 0 && reachable() {
             phase_begin(-1);
             bind_pattern(pat, sl, sp, st, true);
-            let g = push_scope(SC_STMT);
+            let g = push_scope(SC_STMT, guard);
             operand(guard, false);
             if reachable() {
-                let m = OPSTACK.len();
-                push_cur_op();
-                let at = flush_ops(m);
+                let at = ops_mark();
+                push_now();
                 let ok = new_block();
                 let refused = new_block();
                 switch_bool(at, refused, ok, arm);
                 enter_block(refused);
-                exit_to(s);
+                exit_to(s, arm);
                 goto(fail);
                 enter_block(ok);
             }
@@ -1593,17 +1598,15 @@ fn test_pattern(pat: i64, l: i64, p: i64, ty: i64, fail: i64) {
 // `_c = copy (l, p) OP const value; switch _c [false: fail]`.
 fn compare_const(l: i64, p: i64, ty: i64, op: i64, value: i64, fail: i64, node: i64) {
     let c = new_local(TY_BOOL, LF_TEMP, -1, node);
-    let m = OPSTACK.len();
+    let at = ops_mark();
     set_op(OK_COPY, l, p);
-    push_cur_op();
+    push_now();
     set_op(OK_INT, value, ty);
-    push_cur_op();
-    let at = flush_ops(m);
+    push_now();
     emit(SK_ASSIGN, c, 0, RV_BINARY, op, 0, at, 2, node);
-    let m2 = OPSTACK.len();
+    let at2 = ops_mark();
     set_op(OK_COPY, c, 0);
-    push_cur_op();
-    let at2 = flush_ops(m2);
+    push_now();
     let next = new_block();
     switch_bool(at2, fail, next, node);
     enter_block(next);
@@ -1613,15 +1616,13 @@ fn compare_const(l: i64, p: i64, ty: i64, op: i64, value: i64, fail: i64, node: 
 // what makes `(l, p) as v` valid in the blocks it dominates.
 fn switch_variant(l: i64, p: i64, ty: i64, v: i64, fail: i64, node: i64) {
     let d = new_local(enum_tag_ty(undistinct(ty)), LF_TEMP, -1, node);
-    let m = OPSTACK.len();
+    let at = ops_mark();
     set_op(OK_PLACE, l, p);
-    push_cur_op();
-    let at = flush_ops(m);
+    push_now();
     emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, at, 1, node);
-    let m2 = OPSTACK.len();
+    let at2 = ops_mark();
     set_op(OK_COPY, d, 0);
-    push_cur_op();
-    let at2 = flush_ops(m2);
+    push_now();
     let next = new_block();
     let ti = crate::places::ir::P_TARGETS.len();
     crate::places::ir::P_TARGETS.push(variant_discr(v));
@@ -1778,7 +1779,7 @@ fn lower_block(b: i64, dl: i64, dp: i64) {
     // (a statement temporary's block, or a transparent desugaring: no scope
     // of its own)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
-    let s = if scoped { push_scope(SC_BLOCK) } else { -1 };
+    let s = if scoped { push_scope(SC_BLOCK, b) } else { -1 };
     for i in 0..NODES[b].count {
         if !reachable() {
             break;
@@ -1819,12 +1820,12 @@ fn lower_stmt(st: i64) {
         if e == 0 || own_flag_write(e) {
             return;
         }
-        let s = push_scope(SC_STMT);
+        let s = push_scope(SC_STMT, st);
         expr_into(e, -1, 0);
         pop_scope_at(s);
         return;
     }
-    let s = push_scope(SC_STMT);
+    let s = push_scope(SC_STMT, st);
     expr_into(st, -1, 0);
     pop_scope_at(s);
 }
@@ -1895,7 +1896,7 @@ fn lower_let(st: i64) {
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
     let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);
-    let s = if keep { -1 } else { push_scope(SC_STMT) };
+    let s = if keep { -1 } else { push_scope(SC_STMT, st) };
     if pk == NodeKind::PatWild {
         if init != 0 {
             expr_into(init, -1, 0);
@@ -1931,6 +1932,9 @@ fn lower_let(st: i64) {
 // Registers an entry in the scope that encloses statement scope s (the
 // block's), or in the innermost one when s is -1.
 fn schedule_outer(s: i64, kind: i64, v: i64) {
+    if kind == EN_DEAD && !keeps_storage(v) {
+        return;
+    }
     if s < 0 {
         schedule(kind, v);
         return;
@@ -1991,7 +1995,6 @@ pub fn build_body(f: i64, item: i64) -> bool {
     body_begin(f, item);
     SCOPES.clear();
     ENTRIES.clear();
-    OPSTACK.clear();
     STATICS_SEEN.clear();
     UNIT_LOCAL = -1;
     let ret = fn_ret(f);
@@ -2000,7 +2003,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     crate::places::ir::B_PARAMS = count;
     let entry = new_block();
     RET_BLOCK = new_block();
-    let body_scope = push_scope(SC_BODY);
+    let body_scope = push_scope(SC_BODY, NODES[item].c);
     // the parameters: _1.._n
     let keep = keep_params(f);
     for i in 0..count {
@@ -2026,7 +2029,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     let body = NODES[item].c;
     expr_into(body, 0, 0);
     if reachable() {
-        exit_to(body_scope);
+        exit_to(body_scope, body);
         goto(RET_BLOCK);
     }
     SCOPES.clear();
