@@ -1,4 +1,4 @@
-# numbers262: the session (steps 1 and 2)
+# numbers262: the session (steps 1 to 3, and the mitigation round)
 
 ## Verdict
 
@@ -133,6 +133,115 @@ final design would:
 - the vectorizer has no checked reduction (an overflow flag OR-ed across
   the lanes and tested at the loop's exit);
 - the checks split blocks, which costs loop rotation (extra jumps).
+
+## The mitigation round (decision 6: "mitigate, then decide")
+
+One round, then the same thresholds (geomean <= 1.05, no program above
+1.20, at most 25% of vector loops lost, purecall passing). They are not
+met: the pre-approved fallback (checks at -O0, wrapping at -O1 and up, as
+Rust's default) applies unless the user decides otherwise.
+
+What was done (commits dd9298aa, 7f9a699f; all behind $VOLE_PROTO_OVF):
+
+1. Fused: an overflow check right after its own add or sub (32 or 64
+   bits) takes the operation's flags (adds/subs + b.vs/b.hs/b.lo); a
+   64-bit signed product's check reuses the product (smulh, mul, cmp asr
+   #63). One instruction less per check.
+2. Ranges: `x + c` / `x - c` by a fact `x < w` that leaves room for c, and
+   a signed index by the unsigned bounds-check fact `x <u w`, w >= 0. No
+   length bound (the IR does not know a load is a length).
+3. Vector loops and the runtime unroller take loops with checks: checks of
+   values exactly affine in the counter are tested at the first and last
+   iteration before the loop; checks on lanes accumulate sign-bit masks,
+   and a sum's own step check accumulates its addends' magnitudes
+   (|init| + n * (max|x| + 1) <= MAX after the loop, by one division);
+   when that fails, the scalar loop redoes the work from the start (loops
+   without stores only, so the result and the panic site are exactly the
+   scalar loop's). The unroller splits checked sums the same way.
+   Checked against -O1 on sums that overflow early, late, only in order,
+   only in lanes (a false alarm), and products that overflow first.
+
+`user` is VOLE_PROTO_OVF=user: no checks in std's code, as Rust ships its
+std built without them (Rust's twins measure only user code too).
+
+Instructions on/off per step (the `+ranges` column was measured with a
+restriction on the unroller since dropped; the final build, one run
+each: iterchain 2.70, iterloop 2.22, geomean 1.207 with 20 programs above
+1.20 (std_read_lines at 1.23 in that run), and 1.096 with 7 for `user`):
+
+```
+program               step1    fused     +vec  +ranges     user   vec off>on (+ranges, user)
+arena_trees           1.290    1.216    1.217    1.217    1.087   0>0, 0
+binarytrees           1.013    1.009    1.008    1.009    1.008   0>0, 0
+collatz               1.421    1.238    1.232    1.233    1.235   0>0, 0
+contracts             1.617    1.455    1.455    1.457    1.454   3>3, 3
+contracts_plain       1.609    1.455    1.458    1.456    1.456   3>3, 3
+fannkuch              1.267    1.177    1.171    1.178    1.175   0>0, 0
+fib                   0.987    0.904    0.904    0.681    0.680   0>0, 0
+fmtints               1.274    1.226    1.330    1.329    1.001   2>2, 2
+fmtloop               1.273    1.233    1.232    1.234    0.998   1>1, 1
+heap                  1.623    1.521    1.514    1.520    1.357   0>0, 0
+interp                1.403    1.338    1.339    1.338    1.339   0>0, 0
+iterchain             3.885    3.473    2.698    2.875    1.882   3>1, 3
+iterloop              3.672    3.272    2.215    2.388    2.389   3>2, 2
+json                  1.226    1.180    1.177    1.180    1.134   1>1, 1
+mandelbrot            0.999    0.999    0.998    1.000    0.999   0>0, 0
+matmul                1.000    1.000    1.000    1.000    1.000   1>1, 1
+nbody                 1.000    1.000    0.999    1.002    0.999   0>0, 0
+purecall              1.000    1.000    1.001    1.001    1.002   0>0, 0
+purecall_hoisted      1.000    1.000    1.000    0.998    1.000   0>0, 0
+sieve                 1.011    1.008    1.007    1.003    1.002   0>0, 0
+sort                  1.227    1.146    1.164    1.140    0.983   1>1, 1
+stencil               1.000    1.000    1.003    1.000    1.000   1>1, 1
+wordcount             1.157    1.140    1.140    1.138    1.100   2>2, 2
+std_btree_u64         1.059    1.040    1.040    1.039    1.027   0>0, 0
+std_chars             1.450    1.318    1.333    1.168    1.117   10>10, 10
+std_fmt_f64           1.358    1.337    1.335    1.336    1.001   8>8, 8
+std_fmt_f64_prec      1.009    1.008    1.016    1.015    1.001   8>8, 8
+std_fmt_int           1.360    1.317    1.318    1.318    1.034   0>0, 0
+std_graphemes         1.258    1.188    1.340    1.341    1.103   10>10, 10
+std_hash_churn        1.463    1.408    1.405    1.400    1.048   2>2, 2
+std_hash_str          1.410    1.371    1.203    1.184    1.151   2>2, 2
+std_hash_u64          1.359    1.286    1.357    1.366    1.005   2>2, 2
+std_parse_f64         1.341    1.314    1.214    1.213    1.107   4>4, 4
+std_parse_int         1.245    1.203    1.188    1.187    1.066   3>3, 3
+std_read_lines        1.009    0.940    1.030    1.049    0.973   9>9, 9
+std_rng               1.040    1.033    1.034    1.031    1.020   0>0, 0
+std_sort_stable       1.594    1.490    1.295    1.280    0.997   1>1, 1
+std_sort_unstable     1.323    1.217    1.218    1.216    1.000   1>1, 1
+std_spawn             1.002    1.003    0.995    1.002    1.003   0>0, 0
+std_str_ops           1.150    1.121    1.119    1.114    1.000   2>2, 2
+std_term_feed         1.233    1.209    1.208    1.197    0.984   10>10, 10
+std_utf8_validate     1.183    1.156    1.164    1.168    1.008   10>10, 10
+std_width             1.372    1.332    1.337    1.303    1.003   10>10, 10
+step1   : geomean 1.285, above 1.20: 26, vector loops 113->79 (30% lost), n=43
+fused   : geomean 1.232, above 1.20: 22, vector loops 113->79 (30% lost), n=43
++vec    : geomean 1.213, above 1.20: 22, vector loops 113->110 (3% lost), n=43
++ranges : geomean 1.204, above 1.20: 19, vector loops 113->110 (3% lost), n=43
+user    : geomean 1.091, above 1.20: 7, vector loops 113->112 (1% lost), n=43
+```
+
+purecall passes in every column (on: 1.130e9 instructions against
+purecall_hoisted's 1.117e9). Wall time was measured under heavy load
+(other agents' builds): its geomean, 1.139 (user 1.055), is indicative
+only.
+
+What is left, by kind:
+
+- Inherent checks Rust has too: collatz (`3 * n + 1` on u64, `count +=
+  1`), interp (a VM's stack pointer), heap's and contracts' index
+  arithmetic, a product's check in every iteration (iterloop's dot).
+- Checks inside an `if` in a loop (filter_map_sum, max_count's `c += 1`):
+  the if is no longer converted to a select, so neither the vectorizer
+  nor the unroller takes the loop. Hoisting the check out of the
+  conditional (branch on `cond & ovf`) is the next mitigation.
+- Cliffs from code size: a loop now vectorized or unrolled (Buf::push_str
+  copying) makes its caller too big to inline a closure
+  (std_graphemes 1.188 -> 1.341, fmtints 1.226 -> 1.329); the vector
+  loop's run-time test also costs more per entry for short strings.
+- In std (the default mode): fmt, hashing, parsing and sorting code
+  carries most of the remaining cost; with std unchecked (`user`) the
+  geomean is 1.091 and 7 programs pass 1.20.
 
 ## Step 3 (usize and isize)
 
