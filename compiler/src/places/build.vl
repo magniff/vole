@@ -36,15 +36,18 @@ use crate::front::ast::{
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
 use crate::front::lexer::Tok;
-use crate::front::own::byref::{ASSIGN_OLD, BYREF, NO_DROP, borrowed_call};
+use crate::front::own::byref::{ASSIGN_OLD, BYREF, MATCH_BYREF, NO_DROP, borrowed_call};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
+use crate::front::patterns::{binding_count, binds_ref, pattern_referent};
 use crate::front::types::{
     REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_void,
+    type_elem, variant_field,
 };
 use crate::places::front::{
-    ast_local_mutable, ast_local_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
+    ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
+    variant_discr,
 };
 use crate::places::ir::{
     AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
@@ -52,11 +55,11 @@ use crate::places::ir::{
     BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR,
     LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY,
     OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF,
-    PJ_FIELD, PJ_INDEX, PJ_UNION, P_LOCALS, RV_AGG, RV_BINARY, RV_CAST, RV_LEN, RV_REF, RV_REPEAT,
-    RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
-    SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT,
-    body_begin, emit, enter_block, has_flag, is_union_type, new_block, new_local, ops_mark, proj,
-    push_op, reachable, struct_closure, terminate, undistinct,
+    PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, P_LOCALS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR,
+    RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD,
+    SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE,
+    UO_BITNOT, UO_NEG, UO_NOT, body_begin, emit, enter_block, has_flag, is_union_type, new_block,
+    new_local, ops_mark, proj, push_op, reachable, struct_closure, terminate, undistinct,
 };
 
 // ---- State ----
@@ -632,7 +635,7 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
         return;
     }
     if k == NodeKind::Match {
-        unsupported(e);
+        lower_match(e, dl, dp);
         return;
     }
     if k == NodeKind::Call {
@@ -1401,6 +1404,303 @@ fn lower_for(n: i64) {
     enter_block(exit);
 }
 
+// ---- match and patterns ----
+
+// `match`: the scrutinee's place (a temporary of the statement when it is
+// a value), then each arm in order: its pattern tested (a branch to the
+// next arm on a mismatch), its guard evaluated with the bindings as
+// borrowed copies, then the bindings made (moved out, unless the own pass
+// made them borrow) and the body; no arm matching is unreachable.
+fn lower_match(n: i64, dl: i64, dp: i64) {
+    let scrut = NODES[n].a;
+    let st = NODES[scrut].ty;
+    scrutinee_place(scrut);
+    if !reachable() || st == TY_NEVER {
+        return;
+    }
+    let sl = PL_L;
+    let sp = PL_P;
+    let join = new_block();
+    for i in 0..NODES[n].count {
+        let arm = child(n, i);
+        let pat = NODES[arm].a;
+        let fail = new_block();
+        let s = push_scope(SC_ARM);
+        test_pattern(pat, sl, sp, st, fail);
+        let guard = NODES[arm].b;
+        if guard != 0 && reachable() {
+            phase_begin(-1);
+            bind_pattern(pat, sl, sp, st, true);
+            let g = push_scope(SC_STMT);
+            operand(guard, false);
+            if reachable() {
+                let m = OPSTACK.len();
+                push_cur_op();
+                let at = flush_ops(m);
+                let ok = new_block();
+                let refused = new_block();
+                switch_bool(at, refused, ok, arm);
+                enter_block(refused);
+                exit_to(s);
+                goto(fail);
+                enter_block(ok);
+            }
+            pop_scope_at(g);
+        }
+        if reachable() {
+            phase_begin(-1);
+            bind_pattern(pat, sl, sp, st, false);
+            expr_into(NODES[arm].c, dl, dp);
+        }
+        pop_scope_at(s);
+        if reachable() {
+            goto(join);
+        }
+        enter_block(fail);
+    }
+    terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, n);
+    enter_block(join);
+}
+
+// The place a scrutinee (or a pattern `let`'s initializer) is matched in
+// (PL_L, PL_P): a place expression's, else a temporary of the statement,
+// borrowed when the own pass made the match borrow (MATCH_BYREF, a copying
+// getter's result).
+fn scrutinee_place(e: i64) {
+    if is_place_expr(e) && place_of(e) {
+        return;
+    }
+    let borrowed = borrowed_call(e) || (NODES[e].p & MATCH_BYREF) != 0;
+    let t = new_temp(NODES[e].ty, e, borrowed);
+    expr_into(e, t, 0);
+    PL_L = t;
+    PL_P = 0;
+}
+
+// Branches to block `fail` unless place (l, p) of type ty matches pattern
+// pat: discriminant switches, comparisons; no binding made.
+fn test_pattern(pat: i64, l: i64, p: i64, ty: i64, fail: i64) {
+    if !reachable() || ty == TY_NEVER {
+        return;
+    }
+    var pp = p;
+    var t = ty;
+    let inner = pattern_referent(pat, t);
+    if inner != 0 {
+        pp = proj(pp, PJ_DEREF, 0);
+        t = inner;
+    }
+    let k = NODES[pat].kind;
+    if k == NodeKind::PatLit {
+        compare_const(l, pp, t, BO_EQ, NODES[pat].x, fail, pat);
+    } else if k == NodeKind::PatRange {
+        compare_const(l, pp, t, BO_GE, NODES[pat].x, fail, pat);
+        compare_const(l, pp, t, BO_LE, NODES[pat].y, fail, pat);
+    } else if k == NodeKind::PatOr {
+        let ok = new_block();
+        let last = NODES[pat].count - 1;
+        for i in 0..last {
+            let next = new_block();
+            test_pattern(child(pat, i), l, pp, t, next);
+            if reachable() {
+                goto(ok);
+            }
+            enter_block(next);
+        }
+        test_pattern(child(pat, last), l, pp, t, fail);
+        if reachable() {
+            goto(ok);
+        }
+        enter_block(ok);
+    } else if k == NodeKind::PatTuple {
+        let tt = undistinct(t);
+        for i in 0..NODES[pat].count {
+            test_pattern(child(pat, i), l, proj(pp, PJ_FIELD, i), type_elem(tt, i), fail);
+        }
+    } else if k == NodeKind::PatVariant {
+        let v = NODES[pat].x;
+        switch_variant(l, pp, t, v, fail, pat);
+        let vp = proj(pp, PJ_VARIANT, v);
+        for i in 0..NODES[pat].count {
+            test_pattern(child(pat, i), l, proj(vp, PJ_FIELD, i), variant_field(v, i), fail);
+        }
+    }
+}
+
+// `_c = copy (l, p) OP const value; switch _c [false: fail]`.
+fn compare_const(l: i64, p: i64, ty: i64, op: i64, value: i64, fail: i64, node: i64) {
+    let c = new_local(TY_BOOL, LF_TEMP, -1, node);
+    let m = OPSTACK.len();
+    set_op(OK_COPY, l, p);
+    push_cur_op();
+    set_op(OK_INT, value, ty);
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, c, 0, RV_BINARY, op, 0, at, 2, node);
+    let m2 = OPSTACK.len();
+    set_op(OK_COPY, c, 0);
+    push_cur_op();
+    let at2 = flush_ops(m2);
+    let next = new_block();
+    switch_bool(at2, fail, next, node);
+    enter_block(next);
+}
+
+// `_d = discriminant (l, p); switch _d [discr(v): next, otherwise: fail]`:
+// what makes `(l, p) as v` valid in the blocks it dominates.
+fn switch_variant(l: i64, p: i64, ty: i64, v: i64, fail: i64, node: i64) {
+    let d = new_local(enum_tag_ty(undistinct(ty)), LF_TEMP, -1, node);
+    let m = OPSTACK.len();
+    set_op(OK_PLACE, l, p);
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, at, 1, node);
+    let m2 = OPSTACK.len();
+    set_op(OK_COPY, d, 0);
+    push_cur_op();
+    let at2 = flush_ops(m2);
+    let next = new_block();
+    let ti = crate::places::ir::P_TARGETS.len();
+    crate::places::ir::P_TARGETS.push(variant_discr(v));
+    crate::places::ir::P_TARGETS.push(next);
+    terminate(TK_SWITCH, ti, 1, fail, at2, 1, node);
+    enter_block(next);
+}
+
+// The AST locals bound in this phase of an arm (a guard's borrowed copies,
+// then the body's bindings) and their IR locals: pairs. An or-pattern's
+// alternatives bind the same locals.
+static var PHASE: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The statement scope a pattern `let` binds out of (-1: none, the arm's).
+static var BIND_SCOPE: i64 = -1;
+
+fn phase_begin(s: i64) {
+    PHASE.clear();
+    BIND_SCOPE = s;
+}
+
+// Binds the variables of pattern pat, known to match place (l, p) of type
+// ty: each a move of its part (a copy when it borrows: `guard`, the own
+// pass's BYREF, a part of a borrowed copy), or a reference to it (PAT_REF).
+// An or-pattern's alternatives are tested again, in order, to bind the one
+// that matched.
+fn bind_pattern(pat: i64, l: i64, p: i64, ty: i64, guard: bool) {
+    if !reachable() || ty == TY_NEVER {
+        return;
+    }
+    var pp = p;
+    var t = ty;
+    let inner = pattern_referent(pat, t);
+    if inner != 0 {
+        pp = proj(pp, PJ_DEREF, 0);
+        t = inner;
+    }
+    let k = NODES[pat].kind;
+    if k == NodeKind::PatBind {
+        bind_one(pat, l, pp, t, guard);
+    } else if k == NodeKind::PatTuple {
+        let tt = undistinct(t);
+        for i in 0..NODES[pat].count {
+            bind_pattern(child(pat, i), l, proj(pp, PJ_FIELD, i), type_elem(tt, i), guard);
+        }
+    } else if k == NodeKind::PatVariant {
+        let v = NODES[pat].x;
+        let vp = proj(pp, PJ_VARIANT, v);
+        for i in 0..NODES[pat].count {
+            bind_pattern(child(pat, i), l, proj(vp, PJ_FIELD, i), variant_field(v, i), guard);
+        }
+    } else if k == NodeKind::PatOr && binding_count(pat) > 0 {
+        let ok = new_block();
+        let last = NODES[pat].count - 1;
+        for i in 0..last {
+            let next = new_block();
+            test_pattern(child(pat, i), l, pp, t, next);
+            bind_pattern(child(pat, i), l, pp, t, guard);
+            if reachable() {
+                goto(ok);
+            }
+            enter_block(next);
+        }
+        bind_pattern(child(pat, last), l, pp, t, guard);
+        if reachable() {
+            goto(ok);
+        }
+        enter_block(ok);
+    }
+}
+
+fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool) {
+    let al = NODES[pat].x;
+    if al < 0 {
+        return;
+    }
+    let by_ref = binds_ref(pat);
+    let borrowed = !by_ref && (guard || ast_borrowed(al) || has_flag(l, LF_BORROWED));
+    // (the IR local: the phase's when an earlier alternative made it)
+    var ir = -1;
+    var i = 0;
+    while i < PHASE.len() {
+        if PHASE[i] == al {
+            ir = PHASE[i + 1];
+            break;
+        }
+        i += 2;
+    }
+    let first = ir < 0;
+    if first {
+        ir = user_local(al, pat, borrowed);
+        PHASE.push(al);
+        PHASE.push(ir);
+    }
+    live(ir);
+    if first {
+        schedule_outer(BIND_SCOPE, EN_DEAD, ir);
+    }
+    if by_ref {
+        let rt = undistinct(ast_local_ty(al));
+        let kind = if rt > 0 && TYPES[rt].kind == TyKind::Ptr && TYPES[rt].b == REF_MUT { BK_MUT }
+            else { BK_SHARED };
+        emit_ref(ir, 0, l, p, kind, pat);
+    } else {
+        place_operand(l, p, ty, !borrowed);
+        emit_use(ir, 0, pat);
+    }
+    if first && !has_flag(ir, LF_BORROWED) && needs_drop(P_LOCALS[ir].ty) {
+        schedule_outer(BIND_SCOPE, EN_DROP, ir);
+    }
+}
+
+// `let PAT = init;` for a pattern other than a name: the initializer's
+// place, its pattern tested (an irrefutable one: a mismatch is
+// unreachable), then its parts bound, in the block's scope (s: the
+// statement's scope).
+fn lower_let_pattern(pat: i64, init: i64, s: i64) {
+    if init == 0 {
+        unsupported(pat);
+        return;
+    }
+    scrutinee_place(init);
+    if !reachable() {
+        return;
+    }
+    let l = PL_L;
+    let p = PL_P;
+    let ty = NODES[init].ty;
+    let targets = crate::places::ir::P_TARGETS.len();
+    let fail = new_block();
+    test_pattern(pat, l, p, ty, fail);
+    if crate::places::ir::P_TARGETS.len() != targets && reachable() {
+        let ok = new_block();
+        goto(ok);
+        enter_block(fail);
+        terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, pat);
+        enter_block(ok);
+    }
+    phase_begin(s);
+    bind_pattern(pat, l, p, ty, false);
+    BIND_SCOPE = -1;
+}
+
 // ---- Blocks and statements ----
 
 fn lower_block(b: i64, dl: i64, dp: i64) {
@@ -1558,7 +1858,7 @@ fn lower_let(st: i64) {
             }
         }
     } else {
-        unsupported(pat);
+        lower_let_pattern(pat, init, s);
     }
     if s >= 0 {
         pop_scope_at(s);
