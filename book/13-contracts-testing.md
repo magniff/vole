@@ -22,18 +22,18 @@ Save this as `ring.vl`:
 
 struct Ring {
     items: Vec<i64>,
-    start: i64,
-    len: i64,
+    start: usize,
+    len: usize,
 }
 
 impl Ring {
-    fn new(cap: i64, gpa: Gpa) -> Ring
+    fn new(cap: usize, gpa: Gpa) -> Ring
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
     }
 
-    fn cap(self) -> i64 {
+    fn cap(self) -> usize {
         self.items.len()
     }
 
@@ -109,12 +109,12 @@ Here `push` promises to add one item, and has a bug, a forgotten
 ```vole
 struct Ring {
     items: Vec<i64>,
-    start: i64,
-    len: i64,
+    start: usize,
+    len: usize,
 }
 
 impl Ring {
-    fn new(cap: i64, gpa: Gpa) -> Ring {
+    fn new(cap: usize, gpa: Gpa) -> Ring {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
     }
 
@@ -221,13 +221,13 @@ it implies. Save this as `checks.vl`:
 use std::env;
 
 #[inline(never)]
-fn at(v: Vec<i64>, i: i64) -> i64 {
+fn at(v: Vec<i64>, i: usize) -> i64 {
     v[i]
 }
 
 #[inline(never)]
-fn at_checked(v: Vec<i64>, i: i64) -> i64
-    requires 0 <= i && i < v.len()
+fn at_checked(v: Vec<i64>, i: usize) -> i64
+    requires i < v.len()
 {
     v[i]
 }
@@ -263,8 +263,8 @@ separate so we can see it.)
 
 Nothing is assumed: a fact comes only from a check that ran. And
 integers wrap around in vole, so a condition may not mean what it looks
-like. `i + 1 < v.len()` is true for an `i` near the largest `i64`,
-where `i + 1` wraps to a negative number, so it doesn't prove that
+like. `i + 1 < v.len()` is true for an `i` that is the largest `usize`,
+where `i + 1` wraps to 0, so it doesn't prove that
 `v[i + 1]` is in range, and that check stays. Write the condition about
 the index you use.
 
@@ -339,23 +339,23 @@ three tests. There's a bug in `wrap`. Can you see it?
 
 struct Ring {
     items: Vec<i64>,
-    start: i64,
-    len: i64,
+    start: usize,
+    len: usize,
 }
 
 // Slot i of a ring of cap slots: past the end, it wraps to the front.
-fn wrap(i: i64, cap: i64) -> i64 {
+fn wrap(i: usize, cap: usize) -> usize {
     if i > cap { i - cap } else { i }
 }
 
 impl Ring {
-    fn new(cap: i64, gpa: Gpa) -> Ring
+    fn new(cap: usize, gpa: Gpa) -> Ring
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
     }
 
-    fn cap(self) -> i64 {
+    fn cap(self) -> usize {
         self.items.len()
     }
 
@@ -382,8 +382,8 @@ impl Ring {
         x
     }
 
-    fn get(self, i: i64) -> i64
-        requires 0 <= i && i < self.len else f"no item {i} in a ring of {self.len}"
+    fn get(self, i: usize) -> i64
+        requires i < self.len else f"no item {i} in a ring of {self.len}"
     {
         self.items[wrap(self.start + i, self.cap())]
     }
@@ -412,7 +412,7 @@ fn wraps_around(gpa: Gpa) {
 #[property]
 fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
     for cap in 1..5 {
-        var r = Ring::new(cap, gpa);
+        var r = Ring::new(cap as usize, gpa);
         var next = 0;
         for x in xs {
             if r.is_full() {
@@ -497,7 +497,7 @@ Look at the property again:
 #[property]
 fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
     for cap in 1..5 {
-        var r = Ring::new(cap, gpa);
+        var r = Ring::new(cap as usize, gpa);
         var next = 0;
         for x in xs {
             if r.is_full() {

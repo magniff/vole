@@ -748,7 +748,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -887,7 +887,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;

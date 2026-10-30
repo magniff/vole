@@ -37,6 +37,6 @@ $ show Vec::push
 $ show HashMap::len
 // std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.vl:37-40
     #[inline]
-    pub fn len(self) -> i64 {
+    pub fn len(self) -> usize {
         self.table.len()
     }

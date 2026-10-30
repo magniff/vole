@@ -106,7 +106,7 @@ is designed so that ordinary code can't have undefined behaviour.
 | destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
 | a pointer and a length, passed separately | a slice, `[T]`, which carries its length | 7 |
 | `char *` strings | `str`, UTF-8 with a length; `c"..."` for C | 7, 15 |
-| `int`, `long`, `size_t` | `i32`, `i64`, `u64`; lengths and indices are `i64` | 3 |
+| `int`, `long`, `size_t` | `i32`, `i64`, `usize`; lengths and indices are `usize` | 3 |
 | `#include` and the preprocessor | `mod` and `use`; no macros | 11 |
 | exceptions (C++), error codes | `Result` and `?` | 6 |
 | templates (C++) | generics, compiled once per type as templates are; bounds are checked at each call | 9 |

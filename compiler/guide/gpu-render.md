@@ -249,7 +249,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, group);
         pass.set_vertex_buffer(0, vb);
-        pass.draw(0..count, 0..1);
+        pass.draw(0..count as i64, 0..1);
     });
     enc2.copy_texture_to_buffer(target, out, 256);
     queue.submit(enc2.finish());

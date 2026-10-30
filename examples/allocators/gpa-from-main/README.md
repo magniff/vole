@@ -169,7 +169,7 @@ one: `gpa` is a name like any other, and here it is not in scope.
 
 ```console
 $ cat > count.vl <<'EOF'
-> fn count(text: [u8]) -> i64 {
+> fn count(text: [u8]) -> usize {
 >     let words = std::split_whitespace_in(text, gpa);
 >     words.len()
 > }

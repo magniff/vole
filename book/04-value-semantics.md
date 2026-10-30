@@ -474,9 +474,9 @@ done reading by then, is fine:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add_copies(list: inout Vec<Song>, n: i64) {
+fn add_copies(list: inout Vec<Song>, n: usize) {
     for i in 0..n {
-        list.push(Song { title: "Encore", seconds: 60 + i });
+        list.push(Song { title: "Encore", seconds: 60 + i as i64 });
     }
 }
 
@@ -651,7 +651,7 @@ impl Playlist {
         Playlist { name: name, songs: Vec::new_in(gpa) }
     }
 
-    fn len(self) -> i64 {
+    fn len(self) -> usize {
         self.songs.len()
     }
 
