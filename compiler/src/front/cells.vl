@@ -15,8 +15,12 @@
 //   copy of a value that is not Freeze (std's copying getters), it is
 //   own.interior_copy (interior_copy, below).
 
-use crate::base::{SYMS, buf_bytes, buf_int, buf_str, intern_c};
-use crate::front::modules::within_std;
+use crate::base::{
+    FILES, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern_c,
+};
+use crate::base::diag::report_error_once;
+use crate::front::ast::NODES;
+use crate::front::modules::{file_of_pos, within_std};
 use crate::front::types::{
     ENUMS, STRUCTS, TYPES, TY_ERROR, TyKind, VARIANTS, buf_type, enum_variant, struct_field,
     type_elem, variant_field,
@@ -45,6 +49,20 @@ pub fn is_unsafe_cell_struct(s: i64) -> bool {
 // Whether type t is an UnsafeCell<T>.
 pub fn is_unsafe_cell(t: i64) -> bool {
     t > 0 && TYPES[t].kind == TyKind::Struct && is_unsafe_cell_struct(TYPES[t].a)
+}
+
+// Whether type t is std::cell::Cell<T>.
+fn is_std_cell(t: i64) -> bool {
+    // UNSAFE: STRUCTS is the checker's raw table of structs (*StructInfo).
+    // SAFETY: a struct type's TYPES[t].a is a struct id; tmpl - 1 its template's.
+    unsafe {
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s = TYPES[t].a;
+        let b = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
+        SYMS[STRUCTS[b].name].text == "Cell" && within_std(STRUCTS[b].module)
+    }
 }
 
 // Whether type t is Freeze: it holds no UnsafeCell by value.
@@ -184,4 +202,120 @@ pub fn buf_freeze_note(out: i64, t: i64) {
         buf_interior_path(out, t, 0);
     }
     buf_str(out, c")");
+}
+
+// ---- own.interior_copy ----
+
+// The key of own.interior_copy's errors, once per position
+// (base::diag::error_keyed).
+const KEY_INTERIOR_COPY: i64 = 3100;
+
+// Node n's source text.
+fn text_of(n: i64) -> [u8] {
+    SRC[NODES[n].start..NODES[n].end]
+}
+
+// The `edit patch FILE:LINE --old 'OLD' --new 'NEW'` arguments for an
+// error at pos, into out; nothing in std or for text a shell word cannot
+// hold.
+fn buf_patch(out: i64, pos: i64, old: [u8], new: [u8]) {
+    // UNSAFE: FILES is the loader's raw table of source files.
+    // SAFETY: f = file_of_pos(pos) is the file holding pos, below FILE_COUNT.
+    unsafe {
+        let f = file_of_pos(pos);
+        let path = FILES[f].path;
+        if path[0] == '<' || old.contains('\'') || new.contains('\'') || old.contains('\n')
+            || new.contains('\n') {
+            return;
+        }
+        var line = 1;
+        for i in FILES[f].start..pos {
+            if SRC[i] == '\n' {
+                line += 1;
+            }
+        }
+        buf_str(out, c"edit patch ");
+        buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_bytes(out, ":");
+        buf_int(out, line);
+        buf_bytes(out, " --old '");
+        buf_bytes(out, old);
+        buf_bytes(out, "' --new '");
+        buf_bytes(out, new);
+        buf_bytes(out, "'");
+    }
+}
+
+// own.interior_copy at expression e: a bit copy of an element its shared
+// receiver keeps (std's copying getters, `v.get(i)`, `v.last()`; a
+// borrowing iterator's items), of a type that is not Freeze. The copy is
+// another cell, so a write through it would be lost. In the program's
+// code only: std's own bodies use such copies to read.
+pub fn interior_copy(e: i64) {
+    // UNSAFE: FILES is the loader's raw table of source files.
+    // SAFETY: file_of_pos(pos) is the file holding the node's start.
+    unsafe {
+        let t = NODES[e].ty;
+        let pos = NODES[e].start;
+        if FILES[file_of_pos(pos)].path[0] == '<' {
+            return;
+        }
+        let msg = buf_new();
+        buf_str(msg, c"a copy of a '");
+        buf_type(msg, t);
+        let part = interior_part(t);
+        if part == t || is_std_cell(t) {
+            buf_str(msg, c"' is another cell: a write through it is lost");
+        } else {
+            // (`Atomic<i64>`: its UnsafeCell<i64> at .v)
+            buf_str(msg, c"' holds another cell (");
+            buf_type(msg, part);
+            buf_str(msg, c" at ");
+            buf_interior_path(msg, t, 0);
+            buf_str(msg, c"): a write through it is lost");
+        }
+        buf_byte(msg, 0);
+        let fix = buf_new();
+        let s = text_of(e);
+        if s.len > 7
+            && s[s.len - 1] == ')' {
+            // (`v.get(i)`, written so: the element's place is `v[i]`)
+            var k = 0;
+            while k + 5 <= s.len && s[k..k + 5] != ".get(" {
+                k += 1;
+            }
+            if k > 0 && k + 5 < s.len && !s[k + 5..s.len - 1].contains('(') {
+                let new = buf_new();
+                buf_bytes(new, s[0..k]);
+                buf_byte(new, '[');
+                buf_bytes(new, s[k + 5..s.len - 1]);
+                buf_byte(new, ']');
+                buf_patch(fix, pos, s, buf_slice(new));
+            }
+        }
+        report_error_once(pos, KEY_INTERIOR_COPY, c"own.interior_copy", buf_slice(msg).ptr,
+            c"reach the element where it is kept, a place: index it (`v[i].set(x)`), or loop over it (`for c in v.iter() { c.set(x); }`)",
+            buf_slice(fix));
+    }
+}
+
+// own.interior_copy at call n of `map`, `for_each`, `filter_map` or
+// `fold` on a borrowing iterator of type t whose items are not Freeze: its
+// closure would be given copies, other cells.
+pub fn interior_items(n: i64, t: i64) {
+    // UNSAFE: FILES is the loader's raw table of source files.
+    // SAFETY: file_of_pos(pos) is the file holding the node's start.
+    unsafe {
+        let pos = NODES[n].start;
+        if FILES[file_of_pos(pos)].path[0] == '<' {
+            return;
+        }
+        let msg = buf_new();
+        buf_str(msg, c"the items of '");
+        buf_type(msg, t);
+        buf_str(msg, c"' are copies, other cells: a write through one is lost");
+        buf_byte(msg, 0);
+        report_error_once(pos, KEY_INTERIOR_COPY, c"own.interior_copy", buf_slice(msg).ptr,
+            c"loop over the elements, places: `for c in v.iter() { c.set(x); }`", "");
+    }
 }
