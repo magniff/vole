@@ -147,8 +147,8 @@ $ def crate::pick crate::intern crate::count std::iter::Iterator::count std::str
 crate::pick	views017/main.vl:17:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks, counts) declared
 crate::intern	views017/main.vl:28:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
 crate::count	views017/main.vl:32:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
-std::iter::Iterator::count	../../compiler/std/iter.vl:82:8	trait-method	fn count(sink self) -> i64
-<std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(sink self) -> i64	effects: panic diverge
+std::iter::Iterator::count	../../compiler/std/iter.vl:83:8	trait-method	fn count(sink self) -> usize
+<std::string::Chars as Iterator>::count	../../compiler/std/string.vl:757:8	method	fn count(sink self) -> usize	effects: panic diverge
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: volec query items

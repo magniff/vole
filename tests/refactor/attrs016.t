@@ -23,7 +23,7 @@ fn middle(a: i64, b: i64, c: i64) -> i64 {
 fn main(gpa: Gpa) {
     var v: Vec<i64> = Vec::new_in(gpa);
     grow(&v);
-    println(middle(2, 10, 0) + v.len() * 2 + util::one());
+    println(middle(2, 10, 0) + (v.len() as i64) * 2 + util::one());
 }
 pub fn one() -> i64 {
     1

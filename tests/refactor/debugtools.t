@@ -68,7 +68,7 @@ run: exit 0; stdout 4 lines (target/scratch/probe/main.vl/out)
   | a best 7
   | ###
 $ probe main.vl:23 i --input tests/ok.in
-probe main.vl:23 (each time round `while i < keys.len() {`): 3 times
+probe main.vl:23 (each time round `while i < keys.len() as i64 {`): 3 times
   #1  i = 0
   #2  i = 1
   #3  i = 2

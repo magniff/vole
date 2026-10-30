@@ -187,7 +187,7 @@ fn main(gpa: Gpa) -> i32 {
         line.push(ch as u8);
     }
     print("read ");
-    std::print_int(line.len());
+    std::print_int(line.len() as i64);
     println(" bytes");
     0
 }

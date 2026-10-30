@@ -654,7 +654,7 @@ representation work below moves to 0.26.1.
 |---|---|
 | total at `check`, after step 7 | ≤ 0.26.0's, with the placeholders' 228M given back; the aim 5,000M (leaving 0.26.2's effects on the IR room: today's AST effects are 95M) |
 | -O1 build: IR to SSA in place of AST to SSA | the whole -O1 and -O2 build ≤ 1.10x of the AST lowering's on the same source (2026-10-30: 1,343M was the AST walk's cost then, and the walk has since got cheaper, 1,352M against places' 1,749M at db652f8b; lowering is under 1% of an -O2 build) |
-| -O0 build: gen0 from the IR | -O0 total ≤ 1.10x of the AST lowering's on the same source (the user, 2026-10-30: 1.05x is out of reach with every body built at a build; measured 1.26x at 35ee705c, code size at parity) |
+| -O0 build: gen0 from the IR | -O0 total ≤ 1.15x of the AST lowering's on the same source, the gate's measure at the default -j (the user, 2026-10-30, twice: 1.05x was out of reach with every body built at a build; then 1.10x, as the remaining cost is per-statement bookkeeping, not a trim: flipped at 1.137x, step 7 expected to bring it to about 1.11x of today's) |
 | RSS of `check` | ≤ 1.05x of 513 MB |
 
 **Measured in 0.26.0 (the fallback applied).** `tests/compile_cost.sh -r
@@ -730,6 +730,34 @@ and every tests/run source. The objects of a build under
 `VOLE_LOWER=places` (every body built) are byte-identical at -O0 and
 -O2. Step 7, which deletes the own pass's drops, needs a rule of its own
 to keep this (the types rule alone is 1.047x).
+
+**The builder's cost at a build (0.26.1, later).** The flip's bar is
+-O0 total within 1.10x of the AST lowering. A build of compiler/src
+(`-c -O0`, `VOLE_LOWER=places`, caches off, fewest of 3):
+
+| step | instructions | objects |
+|---|---|---|
+| before | 11,776.8M | |
+| the check's work skipped at a build (record_body unless a move is suspect or `--places-diff` runs; drop edges and shims only when a drop is kept; live_writes with no flag) | 11,663.8M | identical |
+| load_body takes the kept tables instead of copying them | 11,638.9M | identical |
+| `a && b`, `a \|\| b` made in their destination (no temporary copied at the end) | 11,382.9M (1.186x) | text 17.85M to 17.70M |
+| the AST lowering | 9,601.0M | text 15.22M |
+
+With gen0's accumulator across blocks (35ee705c) the code is at parity
+(text 15.19M against 15.23M), and the gap is the work. By phase, `-j1
+--time-passes=instructions` on 62828865 (millions):
+
+| phase | AST | places |
+|---|---|---|
+| check | 2,511 | 2,882 |
+| places (build) | | 822 (878 with LF_SSA) |
+| places (elaborate) | | 379 |
+| register allocation and emission | 2,237 | 3,045 |
+| data and output | 2,628 | 2,660 |
+| total | 10,351 | 12,774 (1.234x) |
+
+LF_SSA (places/README.md) flags 98,251 of 149,332 temporaries for gen0,
+which then need not scan the body for them.
 
 **How it stays cheap.**
 

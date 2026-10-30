@@ -71,12 +71,12 @@ $ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
 rewrote 3 sites in 2 files	2 files	+3 -6 lines
 // report.vl:4: 1 line removed after line 4
 // report.vl:32
-32	        let c = top[i];
+32	        let c = top[i as i64];
 // stats.vl:4: 2 lines removed after line 4
 // stats.vl:64
 64	        out.push(v[i]);
 // stats.vl:73
-73	        if v[i].n == 1 {
+73	        if v[i as i64].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
@@ -171,9 +171,9 @@ pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
     var at = 0;
     for i in 0..ls.len {
         let l = ls[i];
-        if l.len > best {
-            best = l.len;
-            at = i;
+        if l.len as i64 > best {
+            best = l.len as i64;
+            at = i as i64;
         }
     }
     (best, at)

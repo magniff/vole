@@ -12,8 +12,10 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # futex calls, and std::gpu's closed gate keeps its `mod` sections core;
 # the bound is 160 KB until 0.22.1 brings them back under 128 KB.
 # 0.26.1: 164 KB; std's print state moves behind an UnsafeCell, so
-# UnsafeCell and the state's accesses are core: 163.8 KB to 164.9 KB.)
-MAX=${1:-167936}
+# UnsafeCell and the state's accesses are core: 163.8 KB to 164.9 KB.
+# 0.26.2: 165 KB; lengths are usize, so usize's impls (the section usize
+# and isize, 1.2 KB) are core, with std's casts at its i64 sizes.)
+MAX=${1:-168960}
 report=$(sh "$ROOT/compiler/std/embed.sh" --core) || { echo "error: compiler/std/embed.sh --core failed" >&2; exit 1; }
 bytes=$(printf '%s\n' "$report" | awk '/^core:/ { print $6 }')
 summary=$(printf '%s\n' "$report" | tail -1 | sed 's/^core: //')

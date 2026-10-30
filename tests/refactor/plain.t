@@ -16,11 +16,11 @@ $ query diff
 +++ b/main.vl
 @@ -10,3 +10,3 @@
 -    var i = 0;
--    while i < points.len() {
--        let p = points.get(i);
+-    while i < points.len() as i64 {
+-        let p = points.get(i as usize);
 +    var j = 0;
-+    while j < points.len() {
-+        let p = points.get(j);
++    while j < points.len() as i64 {
++        let p = points.get(j as usize);
 @@ -14 +14 @@
 -        i = i + 1;
 +        j = j + 1;

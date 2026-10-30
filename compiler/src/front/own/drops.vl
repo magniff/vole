@@ -46,7 +46,7 @@ use crate::front::closures::{CLOSURES, CLOSURE_STACK};
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
 use crate::front::own::byref::{
-    BYREF, MATCH_BYREF, binds, borrowed_call, fresh, method_word, push_bindings,
+    BYREF, MATCH_BYREF, binds, borrowed_call, fresh, note_own_assign, push_bindings,
 };
 use crate::front::own::diag::{
     MODE_ERROR, OWN_DROP_VIEW, OWN_MODE, own_end, own_help, own_str, own_type,
@@ -69,6 +69,7 @@ use crate::middle::lower::ssa::HMap;
 // (check/iterate.vl; 0.25: its bindings are a match's, borrowed only from a
 // borrowing iterator). (0.26.0: ASSIGN_OLD and NO_DROP are byref.vl's,
 // which the places IR reads; named here too for the checker.)
+use crate::front::own::byref::{indexable_place, slice_receiver};
 pub use crate::front::own::byref::{ASSIGN_OLD, NO_DROP};
 pub const ARM_DROPS_DONE: i64 = 1 << 60;
 pub const PARAM_DROPS_DONE: i64 = 1 << 61;
@@ -778,56 +779,6 @@ fn copy_place(e: i64) -> i64 {
     0
 }
 
-// (0.25) The receiver of `v.as_mut_slice()` that the checker made of a
-// Vec's or a Buf's `v[i]` written (check/synth_mode.vl: synth_index), when
-// it is call e; else 0.
-fn slice_receiver(e: i64) -> i64 {
-    unsafe {
-        if NODES[e].kind == NodeKind::MethodCall {
-            let name = SYMS[NODES[e].b].text;
-            return if name == "as_mut_slice" { NODES[e].a } else { 0 };
-        }
-        if NODES[e].kind != NodeKind::Call || NODES[e].count != 1 {
-            return 0;
-        }
-        let f = NODES[e].x - 1;
-        if f < 0 || !within_std(FNS[f].module)
-            || method_word(SYMS[FNS[f].display].text) != "as_mut_slice" {
-            return 0;
-        }
-        var r = child(e, 0);
-        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
-            r = NODES[r].b;
-        }
-        r
-    }
-}
-
-// (0.25) Whether place e (an assignment's target) is one copy_place copies
-// once its indexes are names: names, fields, `*` and indexes, no call.
-fn indexable_place(e: i64) -> bool {
-    if e == 0 || (NODES[e].p & NODE_RAW) != 0 {
-        return false;
-    }
-    let k = NODES[e].kind;
-    if k == NodeKind::Ident {
-        return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
-    }
-    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
-        return indexable_place(NODES[e].a);
-    }
-    if k == NodeKind::Unary && NODES[e].op == Tok::Star {
-        return indexable_place(NODES[e].b);
-    }
-    if k == NodeKind::Index {
-        let i = NODES[e].b;
-        let r = slice_receiver(NODES[e].a);
-        return i != 0 && NODES[i].kind != NodeKind::Range
-            && indexable_place(if r != 0 { r } else { NODES[e].a });
-    }
-    false
-}
-
 // (0.25) The indexes of place e that are not a local's name or a literal,
 // each bound first, once (`let __own_iK = i;`, pushed on the list being
 // built), and read by its name in e: the old element's read and the write
@@ -866,8 +817,17 @@ fn hoist_indexes(e: i64, k: i64) -> i64 {
     NODES[id].a = sym;
     NODES[id].res = Res::Local;
     NODES[e].b = id;
+    // (0.26.2: undone once the copies are made, assign_drops: the places
+    // IR lowers the assignment as written)
+    HOIST_UNDO.push(e);
+    HOIST_UNDO.push(i);
     k2 + 1
 }
+
+// (0.26.2) The index nodes hoist_indexes rewrote, (node, index) pairs,
+// put back once the copies are made: the places IR lowers the assignment
+// as written (byref.vl own_assign_of).
+static var HOIST_UNDO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Assignment e (`p = rhs`, checked) to an owned place: its desugaring,
 // checked, or 0 (not owned, compound, or a place this does not handle:
@@ -898,6 +858,12 @@ fn assign_drops(e: i64) -> i64 {
         SCRATCH.count = hmark;
         let read = copy_place(target);
         let write = copy_place(target);
+        var u = 0;
+        while u < HOIST_UNDO.count {
+            NODES[HOIST_UNDO.data[u]].b = HOIST_UNDO.data[u + 1];
+            u += 2;
+        }
+        HOIST_UNDO.count = 0;
         if read == 0 || write == 0 {
             return 0;
         }
@@ -947,6 +913,7 @@ fn assign_drops(e: i64) -> i64 {
         if r >= 0 {
             D_OUTER.data[r] = outer;
         }
+        note_own_assign(outer, e, NODES[opat].x);
         outer
     }
 }
