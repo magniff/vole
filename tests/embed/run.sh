@@ -16,6 +16,9 @@
 #                       without the cache makes, the rest from the cache
 #   embed_wgsl_tokens   (0.26.0) an embedded block's text is one token,
 #                       `embedded`, between its braces (`volec --tokens`)
+#   lower_code_cache    (0.26.1) the code cache's key holds VOLE_LOWER: an
+#                       `ast` build's objects never serve a `places` build,
+#                       nor the reverse (here as embed_code_cache's sibling)
 #
 # usage: tests/embed/run.sh [-c COMPILER]
 #
@@ -141,5 +144,32 @@ printf 'embed wgsl K {\n    fn f() -> u32 { return 1u; } // }\n}\n' >"$d/main.vl
 out=$("$COMPILER" --tokens "$d/main.vl" 2>&1)
 want=$(printf '0 5 0 ident embed\n6 10 0 ident wgsl\n11 12 0 ident K\n13 14 0 {\n14 53 1 embedded\n53 54 0 }')
 check embed_wgsl_tokens "$([ "$(printf '%s\n' "$out" | head -6)" = "$want" ] && echo 1)" "$out"
+
+# lower_code_cache: VOLE_LOWER is in the code cache's key: a build under
+# one lowering never takes another's objects (no hit at the first build
+# under each), a second build under the same one does, and each object is
+# the one its lowering makes without the cache
+d="$WORK/lower"
+mkdir -p "$d"
+printf 'struct P {\n    x: i64,\n    y: i64,\n}\n\nfn sum(p: P) -> i64 {\n    p.x + p.y\n}\n\nfn main() -> i32 {\n    let p = P { x: 2, y: 3 };\n    println(sum(p));\n    0\n}\n' >"$d/main.vl"
+lower_build() { # <lowering> <out> <cache: on|no>; prints the run and the code hits
+    flag=--cache=on
+    [ "$3" = on ] || flag=--no-cache
+    : >"$d/trace"
+    out=$(cd "$d" && VOLE_OK=0 VOLE_LOWER=$1 VOLE_CODE_CACHE=on VOLE_CACHE="$d/cache" VOLE_CACHE_SYNC=1 \
+        VOLE_CACHE_TRACE="$d/trace" "$COMPILER" -O2 $flag main.vl -c -o "$2.o" && cc "$2.o" -o "$2" -lm && "$2" 2>&1)
+    echo "$out $(awk '$1 == "code" { h += $2 } END { print h + 0 }' "$d/trace")"
+}
+a1=$(lower_build ast "$d/a1" on)
+p1=$(lower_build places "$d/p1" on)
+p2=$(lower_build places "$d/p2" on)
+a2=$(lower_build ast "$d/a2" on)
+lower_build ast "$d/ac" no >/dev/null
+lower_build places "$d/pc" no >/dev/null
+ok=0
+set -- $a1 $p1 $p2 $a2
+[ "$1 $2 $3 $4" = "5 0 5 0" ] && [ "$5" = 5 ] && [ "$6" -gt 0 ] && [ "$7" = 5 ] && [ "$8" -gt 0 ] \
+    && cmp -s "$d/a2.o" "$d/ac.o" && cmp -s "$d/p2.o" "$d/pc.o" && ok=1
+check lower_code_cache "$ok" "run and code hits: ast $a1, places $p1, places again $p2, ast again $a2; objects: ast $(cmp "$d/a2.o" "$d/ac.o" 2>&1 || true), places $(cmp "$d/p2.o" "$d/pc.o" 2>&1 || true)"
 
 exit $STATUS
