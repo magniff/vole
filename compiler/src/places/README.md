@@ -117,6 +117,14 @@ code generators' agent (0.26.1) sees what moved.
   (build.vl `live_writes`), as the own pass does.
 - 0.26.1: a union literal's aggregate has a part per field of the union,
   `const ()` for each field not written.
+- 0.26.1 (R4): a match whose arms are values (no guard; an integer, or
+  an enum without the null niche whose variants' fields only bind; a
+  wildcard or binding only last; 6 values, or 4 for an enum with
+  fields) is one `switch` with a target per value (build.vl
+  `switch_cases`, `lower_match_switch`, as middle/lower/matching.vl's).
+  An enum's arm with several values is reached through a block per
+  value, a goto to the arm's: a code generator may see a switch with
+  many targets wherever a match was.
 
 ## `--places-diff`: the differences left
 
