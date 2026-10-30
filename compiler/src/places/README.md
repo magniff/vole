@@ -86,6 +86,14 @@ code generators' agent (0.26.1) sees what moved.
 - 0.26.1 (R2): drop shims, shim.vl (`shim_of`, `shim_count`,
   `shim_type`, `build_shim`, `shim_fn_symbol`); ir.vl's `B_SHIM` (the
   shim held, -1 for a function's body; B_FN is -1 for a shim).
+- 0.26.1 (step 6, front half): `drop_edge_count(f)`, `drop_edge(f, i)`
+  (mod.vl): the `Drop::drop` functions f's kept and flagged drops call
+  through their shims (shim.vl: `drop_fn_count(t)`, `drop_fn_at(t, i)`),
+  edges of the effect graph (front/effects/infer.vl: node_locals).
+- 0.26.1 (step 9): a drop's `node` is where it runs: the scope's node (a
+  block, a statement, a loop, an arm, the body) or the exit's (`return`,
+  `break`, `continue`); print.vl's `drop_pos` gives its position (a
+  block's `}`). `query drops FILE:LINE` (tools/query/drops.vl) lists them.
 - 0.26.1 (step 2, the builder's cost): an open block's `len` is set when
   it is terminated (`close_block`), not by each `emit`; read a block's
   range only once it has its terminator. Outside `--emit-places` and
