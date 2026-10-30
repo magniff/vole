@@ -267,8 +267,10 @@ An operand is `copy P`, `move P` or a constant. A `copy` of a place whose
 type needs drop is valid only as the initializer of a `BORROWED` local or
 a `BORROWED` temporary: the source is an ordinary owned place, the
 destination is the borrowed copy (`x = copy (*_buf)[_i]`, a `for`
-element; `x = copy (_s as Some).0`, a match through a reference). A
-`BORROWED` local is never the source of a `move`. The verifier checks
+element; `x = copy (_s as Some).0`, a match through a reference), or
+when its root is itself a `BORROWED` local (a borrowed copy of a borrowed
+copy: a closure's borrowed item passed on, `g(acc, e.1)`). A `BORROWED`
+local is never the source of a `move`. The verifier checks
 both, under `--values=error` (§4): any other copy of a needs-drop place is
 the shape of S6, a bit copy of an owned iterator.
 

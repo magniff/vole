@@ -1,0 +1,1686 @@
+// The builder (0.26.0, docs/design/places-ir.md §3, §4, §8 step 2): one
+// checked function body (its AST, with the checker's and the own pass's
+// nodes in it) into the IR of places/ir.vl, in evaluation order.
+//
+// Scopes (§3.7) are a stack: the body, each block, each statement (its
+// temporaries), each loop and arm. A scope's entries are "drop local l",
+// "storage of l ends" and "run defer d"; leaving a scope by any edge emits
+// the entries of every scope it leaves, innermost first, each in reverse
+// order of registration. Every needs-drop local and temporary gets a drop
+// there, whether it moved or not: elaboration decides each (elab.vl).
+//
+// The own pass's nodes are read through (§4):
+// - its implicit defers (DEFER_IMPLICIT) are skipped: the IR places its
+//   own drops;
+// - a statement temporary (drops.vl temp_make: a NODE_TEMP block, its
+//   `__own_tp` and `__own_tf` lets, their defer) is the temporary it
+//   stands for, `__own_tv`, dropped with its statement;
+// - the assignment desugaring `{ let __own_new = rhs; { let =o = p; p =
+//   __own_new; } }` is the one assignment `tmp = rhs; drop(p); p = move
+//   tmp` (§3.8);
+// - the checker's transparent blocks (BLOCK_TRANSPARENT: `?`'s and a
+//   requires call's) are no scope: their `let`s are temporaries of the
+//   statement;
+// - the bindings it borrows (byref.vl: BYREF, a `for` loop's sequence of
+//   a place, the `==` operands of an operator) are BORROWED locals,
+//   initialized by a copy.
+//
+// A construct the builder does not handle yet makes the body a fallback
+// (BUILD_FAILED, FAIL_NODE): no body, counted by the driver.
+
+use crate::base::{SYMS, intern_c};
+use crate::base::comp::Comp;
+use crate::front::ast::{
+    BLOCK_TRANSPARENT, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
+};
+use crate::front::check::Res;
+use crate::front::check::temps::NODE_TEMP;
+use crate::front::lexer::Tok;
+use crate::front::own::byref::{ASSIGN_OLD, BYREF, NO_DROP, borrowed_call};
+use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
+use crate::front::own::glue::has_glue;
+use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
+use crate::front::types::{
+    REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_void,
+};
+use crate::places::front::{
+    ast_local_mutable, ast_local_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
+};
+use crate::places::ir::{
+    AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
+    BK_SHARED, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GE, BO_GT, BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR,
+    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR,
+    LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY,
+    OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF,
+    PJ_FIELD, PJ_INDEX, PJ_UNION, P_LOCALS, RV_AGG, RV_BINARY, RV_CAST, RV_LEN, RV_REF, RV_REPEAT,
+    RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
+    SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT,
+    body_begin, emit, enter_block, has_flag, is_union_type, new_block, new_local, ops_mark, proj,
+    push_op, reachable, struct_closure, terminate, undistinct,
+};
+
+// ---- State ----
+
+// Set when the body uses a construct not built yet: the node.
+pub static var BUILD_FAILED: bool = false;
+pub static var FAIL_NODE: i64 = 0;
+
+// AST local -> IR place (local, projection), valid where MAP_GEN is GEN.
+static var MAP_L: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var MAP_P: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var MAP_GEN: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var GEN: i64 = 0;
+// The statics named so far: (symbol, IR local) pairs.
+static var STATICS_SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The scope stack: records of SW words (kind, first entry, loop node,
+// break block, continue block, the loop's result local and projection).
+const SW: i64 = 8;
+const SC_BODY: i64 = 1;
+const SC_BLOCK: i64 = 2;
+const SC_STMT: i64 = 3;
+const SC_LOOP: i64 = 4;
+const SC_ARM: i64 = 5;
+static var SCOPES: Vec<i64, Comp> = Vec::new_in(Comp {});
+// Their entries: (kind, value) pairs.
+const EN_DROP: i64 = 1;
+const EN_DEAD: i64 = 2;
+const EN_DEFER: i64 = 3;
+static var ENTRIES: Vec<i64, Comp> = Vec::new_in(Comp {});
+// Operands being collected for a statement: triples.
+static var OPSTACK: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The last operand made (operand) and the last place (as_place).
+static var OPK: i64 = 0;
+static var OPA: i64 = 0;
+static var OPB: i64 = 0;
+static var PL_L: i64 = 0;
+static var PL_P: i64 = 0;
+// The return block, the discard local (`()`, no storage), the function.
+static var RET_BLOCK: i64 = -1;
+static var UNIT_LOCAL: i64 = -1;
+static var CUR_F: i64 = -1;
+// Whether drops are placed (--values=error, as the own pass's).
+static var DROPS: bool = false;
+// The symbols of the own pass's names the builder reads.
+static var SYM_TP: i64 = 0;
+static var SYM_TF: i64 = 0;
+static var SYM_TV: i64 = 0;
+static var SYM_NEW: i64 = 0;
+static var SYM_OLD: i64 = 0;
+static var SYM_FOR_SEQ: i64 = 0;
+
+// Counts, for --time-passes and the README.
+pub static var BUILT: i64 = 0;
+pub static var STMTS_MADE: i64 = 0;
+
+fn syms() {
+    if SYM_TP == 0 {
+        SYM_TP = intern_c(c"__own_tp");
+        SYM_TF = intern_c(c"__own_tf");
+        SYM_TV = intern_c(c"__own_tv");
+        SYM_NEW = intern_c(c"__own_new");
+        SYM_OLD = intern_c(c"=o");
+        SYM_FOR_SEQ = intern_c(c"__for_seq");
+    }
+}
+
+fn unsupported(n: i64) {
+    if !BUILD_FAILED {
+        BUILD_FAILED = true;
+        FAIL_NODE = n;
+    }
+}
+
+// ---- Locals ----
+
+fn map_local(l: i64, ir: i64, p: i64) {
+    while MAP_GEN.len() <= l {
+        MAP_L.push(0);
+        MAP_P.push(0);
+        MAP_GEN.push(0);
+    }
+    MAP_L[l] = ir;
+    MAP_P[l] = p;
+    MAP_GEN[l] = GEN;
+}
+
+// The IR place of AST local l (PL_L, PL_P); false when it has none.
+fn mapped(l: i64) -> bool {
+    if l < 0 || l >= MAP_GEN.len() || MAP_GEN[l] != GEN {
+        return false;
+    }
+    PL_L = MAP_L[l];
+    PL_P = MAP_P[l];
+    true
+}
+
+// Whether AST local l is a borrowed copy (byref.vl's BYREF).
+fn ast_borrowed(l: i64) -> bool {
+    l >= 0 && BYREF.get(l + 1) != 0
+}
+
+fn needs_drop(t: i64) -> bool {
+    DROPS && t > 0 && t != TY_NEVER && has_glue(t)
+}
+
+// A new IR local for AST local l (bound by a pattern or a `let`).
+fn user_local(l: i64, node: i64, borrowed: bool) -> i64 {
+    let ty = ast_local_ty(l);
+    var flags = LF_USER;
+    if ast_local_mutable(l) {
+        flags |= LF_MUT;
+    }
+    if borrowed || ast_borrowed(l) {
+        flags |= LF_BORROWED;
+    }
+    let ir = new_local(ty, flags, l, node);
+    map_local(l, ir, 0);
+    ir
+}
+
+// A temporary of type ty: its storage begins now, and its storage end
+// (and drop, when its type needs one and it is not borrowed) are entries of
+// the innermost scope.
+fn new_temp(ty: i64, node: i64, borrowed: bool) -> i64 {
+    let l = new_local(ty, LF_TEMP | if borrowed { LF_BORROWED } else { 0 }, -1, node);
+    live(l);
+    schedule(EN_DEAD, l);
+    if !borrowed && needs_drop(ty) {
+        schedule(EN_DROP, l);
+    }
+    l
+}
+
+fn live(l: i64) {
+    emit(SK_LIVE, l, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// The local `()` values are discarded into.
+fn unit_local() -> i64 {
+    if UNIT_LOCAL < 0 {
+        UNIT_LOCAL = new_local(TY_UNIT, LF_TEMP, -1, 0);
+    }
+    UNIT_LOCAL
+}
+
+// The IR local of static `name` (a symbol).
+fn static_local(name: i64, node: i64) -> i64 {
+    var i = 0;
+    while i < STATICS_SEEN.len() {
+        if STATICS_SEEN[i] == name {
+            return STATICS_SEEN[i + 1];
+        }
+        i += 2;
+    }
+    let l = new_local(static_ty(name), LF_STATIC, name, node);
+    STATICS_SEEN.push(name);
+    STATICS_SEEN.push(l);
+    l
+}
+
+// ---- Scopes ----
+
+fn push_scope(kind: i64) -> i64 {
+    let at = SCOPES.len() / SW;
+    SCOPES.push(kind);
+    SCOPES.push(ENTRIES.len() / 2);
+    SCOPES.push(0);
+    SCOPES.push(-1);
+    SCOPES.push(-1);
+    SCOPES.push(-1);
+    SCOPES.push(0);
+    SCOPES.push(0);
+    at
+}
+
+fn scope_depth() -> i64 {
+    SCOPES.len() / SW
+}
+
+fn schedule(kind: i64, v: i64) {
+    ENTRIES.push(kind);
+    ENTRIES.push(v);
+}
+
+// The entries of scope s, emitted (innermost last registered first).
+fn emit_scope(s: i64) {
+    let first = SCOPES[s * SW + 1];
+    let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] } else { ENTRIES.len() / 2 };
+    var e = end - 1;
+    while e >= first {
+        let kind = ENTRIES[2 * e];
+        let v = ENTRIES[2 * e + 1];
+        if kind == EN_DROP {
+            emit(SK_DROP, v, 0, DS_UNDECIDED, -1, P_LOCALS[v].src, 0, 0, 0);
+        } else if kind == EN_DEAD {
+            emit(SK_DEAD, v, 0, 0, 0, 0, 0, 0, 0);
+        } else if kind == EN_DEFER {
+            run_defer(v);
+        }
+        e -= 1;
+    }
+}
+
+// Leaves scopes down to `depth` (they stay on the stack: an edge out of
+// them, `break`, `return`).
+fn exit_to(depth: i64) {
+    var s = scope_depth() - 1;
+    while s >= depth {
+        emit_scope(s);
+        s -= 1;
+    }
+}
+
+// The innermost scope ends: its entries emitted (when the code reaches its
+// end), then it is popped.
+fn pop_scope() {
+    let s = scope_depth() - 1;
+    if reachable() {
+        emit_scope(s);
+    }
+    ENTRIES.truncate(2 * SCOPES[s * SW + 1]);
+    SCOPES.truncate(s * SW);
+}
+
+// The loop scope of loop node lp, or -1.
+fn loop_scope(lp: i64) -> i64 {
+    var s = scope_depth() - 1;
+    while s >= 0 {
+        if SCOPES[s * SW] == SC_LOOP && SCOPES[s * SW + 2] == lp {
+            return s;
+        }
+        s -= 1;
+    }
+    -1
+}
+
+// A defer's deferred expression, run on an exit.
+fn run_defer(d: i64) {
+    let e = NODES[d].a;
+    if e == 0 {
+        return;
+    }
+    let s = push_scope(SC_STMT);
+    expr_into(e, -1, 0);
+    pop_scope_at(s);
+}
+
+fn pop_scope_at(s: i64) {
+    while scope_depth() > s {
+        pop_scope();
+    }
+}
+
+// ---- Operands ----
+
+fn set_op(k: i64, a: i64, b: i64) {
+    OPK = k;
+    OPA = a;
+    OPB = b;
+}
+
+fn push_cur_op() {
+    OPSTACK.push(OPK);
+    OPSTACK.push(OPA);
+    OPSTACK.push(OPB);
+}
+
+// Moves the operands collected since `mark` (an OPSTACK length) into
+// P_OPS: their mark there, for emit.
+fn flush_ops(mark: i64) -> i64 {
+    let at = ops_mark();
+    var i = mark;
+    while i < OPSTACK.len() {
+        push_op(OPSTACK[i], OPSTACK[i + 1], OPSTACK[i + 2]);
+        i += 3;
+    }
+    OPSTACK.truncate(mark);
+    at
+}
+
+fn op_count(mark: i64) -> i64 {
+    (OPSTACK.len() - mark) / 3
+}
+
+// The operand that reads place (l, p) of type ty: a move of a value that
+// needs drop when `moving`, but out of a borrowed copy (a copy of a
+// borrowed copy is one too), else a copy.
+fn place_operand(l: i64, p: i64, ty: i64, moving: bool) {
+    if moving && ty > 0 && has_glue(ty) && !has_flag(l, LF_BORROWED) {
+        set_op(OK_MOVE, l, p);
+    } else {
+        set_op(OK_COPY, l, p);
+    }
+}
+
+// An operand for the value of expression e (moved when `moving`).
+fn operand(e: i64, moving: bool) {
+    let k = NODES[e].kind;
+    let ty = NODES[e].ty;
+    if k == NodeKind::Int || k == NodeKind::Char {
+        set_op(OK_INT, crate::front::consteval::wrap_int(NODES[e].a, ty), ty);
+        return;
+    }
+    if k == NodeKind::Bool {
+        set_op(OK_INT, NODES[e].a, TY_BOOL);
+        return;
+    }
+    if k == NodeKind::Float {
+        set_op(OK_FLOAT, NODES[e].a, ty);
+        return;
+    }
+    if k == NodeKind::Unit {
+        set_op(OK_UNIT, 0, TY_UNIT);
+        return;
+    }
+    if k == NodeKind::Str {
+        set_op(OK_STR, NODES[e].a, ty);
+        return;
+    }
+    if k == NodeKind::CStr {
+        set_op(OK_CSTR, NODES[e].a, ty);
+        return;
+    }
+    if k == NodeKind::Ident && NODES[e].res == Res::Const {
+        set_op(OK_CONST, NODES[e].y, ty);
+        return;
+    }
+    if k == NodeKind::Ident && NODES[e].res == Res::Fn {
+        set_op(OK_FN, NODES[e].y, ty);
+        return;
+    }
+    if is_place_expr(e) {
+        if place_of(e) {
+            place_operand(PL_L, PL_P, ty, moving);
+            return;
+        }
+    }
+    if is_void(ty) || ty == TY_NEVER {
+        // (a `()` value, or none: made, then the unit constant)
+        expr_into(e, -1, 0);
+        set_op(OK_UNIT, 0, TY_UNIT);
+        return;
+    }
+    let t = new_temp(ty, e, false);
+    expr_into(e, t, 0);
+    place_operand(t, 0, ty, true);
+}
+
+// Whether operand makes e's value without a temporary: a constant, a
+// local, a static, a function, a place.
+fn is_operand_kind(e: i64) -> bool {
+    let k = NODES[e].kind;
+    if k == NodeKind::Int || k == NodeKind::Char || k == NodeKind::Bool
+        || k == NodeKind::Float || k == NodeKind::Unit || k == NodeKind::Str
+        || k == NodeKind::CStr {
+        return true;
+    }
+    if k == NodeKind::Ident {
+        let r = NODES[e].res;
+        return r == Res::Const || r == Res::Fn || r == Res::Local || r == Res::Static;
+    }
+    is_place_expr(e)
+}
+
+// ---- Places ----
+
+// Whether e is written as a place: a local, a static, a field or tuple
+// part of a place (or through a pointer), `*p`, an index.
+fn is_place_expr(e: i64) -> bool {
+    let k = NODES[e].kind;
+    if k == NodeKind::Ident {
+        return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+        return true;
+    }
+    if k == NodeKind::Unary {
+        return NODES[e].op == Tok::Star;
+    }
+    if k == NodeKind::Index {
+        return NODES[NODES[e].b].kind != NodeKind::Range;
+    }
+    false
+}
+
+// The place of place expression e (PL_L, PL_P): its base evaluated as it
+// must be (a value base into a temporary, a pointer read), the index
+// checked. False when e is not one (or its local is unknown).
+fn place_of(e: i64) -> bool {
+    let k = NODES[e].kind;
+    if k == NodeKind::Ident {
+        if NODES[e].res == Res::Static {
+            PL_L = static_local(NODES[e].a, e);
+            PL_P = 0;
+            return true;
+        }
+        if NODES[e].res != Res::Local {
+            return false;
+        }
+        if !mapped(NODES[e].y) {
+            unsupported(e);
+            PL_L = unit_local();
+            PL_P = 0;
+            return true;
+        }
+        return true;
+    }
+    if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+        // `*p`: p's value read (a place holding a pointer, or a temporary)
+        deref_place(NODES[e].b);
+        return true;
+    }
+    if k == NodeKind::FieldAccess {
+        let base = NODES[e].a;
+        let field = NODES[e].x;
+        if NODES[e].y == 1 {
+            // (through a pointer: `(*p).f`)
+            deref_place(base);
+            PL_P = proj(PL_P, PJ_FIELD, field);
+            return true;
+        }
+        as_place(base);
+        let bt = NODES[base].ty;
+        PL_P = proj(PL_P, if is_union_type(bt) { PJ_UNION } else { PJ_FIELD }, field);
+        return true;
+    }
+    if k == NodeKind::TupleField {
+        as_place(NODES[e].a);
+        PL_P = proj(PL_P, PJ_FIELD, NODES[e].b);
+        return true;
+    }
+    if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
+        return index_place(e);
+    }
+    false
+}
+
+// The place pointer expression e points to: `*e`, or, when e takes an
+// address, the place it takes (`*&x` is x; a statement temporary's block
+// gives `&__own_tv`, so `*{ .. }` is the temporary itself).
+fn deref_place(e: i64) {
+    let k = NODES[e].kind;
+    if k == NodeKind::Unary && NODES[e].op == Tok::Amp && is_place_expr(NODES[e].b)
+        && place_of(NODES[e].b) {
+        return;
+    }
+    if k == NodeKind::Block && (NODES[e].p & NODE_TEMP) != 0 {
+        let tail = NODES[e].a;
+        if tail != 0 && NODES[tail].kind == NodeKind::Unary && NODES[tail].op == Tok::Amp
+            && is_place_expr(NODES[tail].b) {
+            for i in 0..NODES[e].count {
+                if !reachable() {
+                    break;
+                }
+                lower_stmt(child(e, i));
+            }
+            if place_of(NODES[tail].b) {
+                return;
+            }
+        }
+    }
+    as_place(e);
+    PL_P = proj(PL_P, PJ_DEREF, 0);
+}
+
+// `base[i]`: the base's place first (a pointer's location, a slice's or an
+// array's), then the index into a local, then the check.
+fn index_place(e: i64) -> bool {
+    let base = NODES[e].a;
+    let idx = NODES[e].b;
+    let bt = undistinct(NODES[base].ty);
+    as_place(base);
+    let bl = PL_L;
+    let bp = PL_P;
+    let ik = NODES[idx].kind;
+    if bt > 0 && TYPES[bt].kind == TyKind::Array && ik == NodeKind::Int {
+        let v = NODES[idx].a;
+        if v >= 0 && v < TYPES[bt].b {
+            PL_L = bl;
+            PL_P = proj(bp, PJ_CONST, v);
+            return true;
+        }
+    }
+    // (the index in a local: one the program names, or a temporary)
+    var il = -1;
+    if ik == NodeKind::Ident && NODES[idx].res == Res::Local && mapped(NODES[idx].y) && PL_P == 0 {
+        il = PL_L;
+    } else {
+        operand(idx, false);
+        let it = NODES[idx].ty;
+        il = new_temp(it, idx, false);
+        emit_use(il, 0, idx);
+    }
+    if bt > 0 && (NODES[e].p & NODE_IN_BOUNDS) == 0 {
+        let tk = TYPES[bt].kind;
+        if tk == TyKind::Array {
+            let m = OPSTACK.len();
+            set_op(OK_COPY, il, 0);
+            push_cur_op();
+            set_op(OK_INT, TYPES[bt].b, TY_I64);
+            push_cur_op();
+            let at = flush_ops(m);
+            emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at, 2, e);
+        } else if tk == TyKind::Slice {
+            let len = new_temp(TY_I64, e, false);
+            let m = OPSTACK.len();
+            set_op(OK_PLACE, bl, bp);
+            push_cur_op();
+            let at = flush_ops(m);
+            emit(SK_ASSIGN, len, 0, RV_LEN, 0, 0, at, 1, e);
+            let m2 = OPSTACK.len();
+            set_op(OK_COPY, il, 0);
+            push_cur_op();
+            set_op(OK_COPY, len, 0);
+            push_cur_op();
+            let at2 = flush_ops(m2);
+            emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at2, 2, e);
+        }
+    }
+    PL_L = bl;
+    PL_P = proj(bp, PJ_INDEX, il);
+    true
+}
+
+// The place of e, whatever e is: a place expression's, or a temporary's
+// holding its value.
+fn as_place(e: i64) {
+    if is_place_expr(e) && place_of(e) {
+        return;
+    }
+    let ty = NODES[e].ty;
+    let t = new_temp(ty, e, borrowed_call(e));
+    expr_into(e, t, 0);
+    PL_L = t;
+    PL_P = 0;
+}
+
+// ---- Statements of assignment ----
+
+// (l, p) = use of the current operand.
+fn emit_use(l: i64, p: i64, node: i64) {
+    let m = OPSTACK.len();
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, l, p, RV_USE, 0, 0, at, 1, node);
+}
+
+// ---- Expressions ----
+
+// Evaluates e and writes its value to (dl, dp); dl = -1: the value is
+// discarded.
+fn expr_into(e: i64, dl: i64, dp: i64) {
+    if e == 0 {
+        return;
+    }
+    STMTS_MADE += 1;
+    let k = NODES[e].kind;
+    let ty = NODES[e].ty;
+    if k == NodeKind::Block {
+        lower_block(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::If {
+        lower_if(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::Loop || k == NodeKind::While {
+        lower_loop(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::For {
+        lower_for(e);
+        return;
+    }
+    if k == NodeKind::Match {
+        unsupported(e);
+        return;
+    }
+    if k == NodeKind::Call {
+        lower_call(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::Assign {
+        lower_assign(e);
+        return;
+    }
+    if k == NodeKind::Return {
+        lower_return(e);
+        return;
+    }
+    if k == NodeKind::Break {
+        lower_break(e);
+        return;
+    }
+    if k == NodeKind::Continue {
+        lower_continue(e);
+        return;
+    }
+    if k == NodeKind::Try || k == NodeKind::Interp {
+        expr_into(NODES[e].y, dl, dp);
+        return;
+    }
+    if k == NodeKind::Closure {
+        unsupported(e);
+        return;
+    }
+    if k == NodeKind::EnumPanic {
+        operand(NODES[e].a, false);
+        let m = OPSTACK.len();
+        push_cur_op();
+        let at = flush_ops(m);
+        emit(SK_INTRINSIC, unit_local(), 0, IK_PANIC, e, 0, at, 1, e);
+        terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, e);
+        return;
+    }
+    if k == NodeKind::VecOp {
+        lower_vecop(e, dl, dp);
+        return;
+    }
+    if dl < 0 {
+        // (a value discarded: a place is mentioned, a value made)
+        if is_place_expr(e) {
+            if place_of(e) {
+                emit(SK_MENTION, PL_L, PL_P, 0, 0, 0, 0, 0, e);
+            }
+            return;
+        }
+        if k == NodeKind::Unary || k == NodeKind::Binary || k == NodeKind::Cast {
+            // (its operands evaluated for what they do)
+            let t = new_temp(ty, e, false);
+            expr_into(e, t, 0);
+            return;
+        }
+        if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
+            || k == NodeKind::VariantLit || k == NodeKind::Repeat || k == NodeKind::Index {
+            let t = new_temp(ty, e, false);
+            expr_into(e, t, 0);
+            return;
+        }
+        if k == NodeKind::Int || k == NodeKind::Bool || k == NodeKind::Unit || k == NodeKind::Char
+            || k == NodeKind::Float || k == NodeKind::Str || k == NodeKind::CStr
+            || k == NodeKind::Ident {
+            return;
+        }
+        unsupported(e);
+        return;
+    }
+    if k == NodeKind::Unary {
+        lower_unary(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::Binary {
+        lower_binary(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::Cast {
+        operand(NODES[e].a, false);
+        if !reachable() {
+            return;
+        }
+        let m = OPSTACK.len();
+        push_cur_op();
+        let at = flush_ops(m);
+        emit(SK_ASSIGN, dl, dp, RV_CAST, ty, 0, at, 1, e);
+        return;
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
+        || k == NodeKind::VariantLit {
+        lower_aggregate(e, dl, dp);
+        return;
+    }
+    if k == NodeKind::Repeat {
+        operand(NODES[e].a, true);
+        let m = OPSTACK.len();
+        push_cur_op();
+        let at = flush_ops(m);
+        emit(SK_ASSIGN, dl, dp, RV_REPEAT, TYPES[undistinct(ty)].b, 0, at, 1, e);
+        return;
+    }
+    if k == NodeKind::Index && NODES[NODES[e].b].kind == NodeKind::Range {
+        lower_slicing(e, dl, dp);
+        return;
+    }
+    // A plain value: an operand, written.
+    if !is_operand_kind(e) {
+        unsupported(e);
+        return;
+    }
+    let moving = !has_flag(dl, LF_BORROWED);
+    operand(e, moving);
+    if !reachable() {
+        return;
+    }
+    emit_use(dl, dp, e);
+}
+
+fn lower_unary(e: i64, dl: i64, dp: i64) {
+    let op = NODES[e].op;
+    let ty = undistinct(NODES[e].ty);
+    if op == Tok::Amp {
+        let operand_e = NODES[e].b;
+        as_place(operand_e);
+        var kind = BK_SHARED;
+        if ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == 0 {
+            kind = BK_RAW;
+        } else if (NODES[e].p & NODE_REF_MUT) != 0
+            || ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == REF_MUT {
+            kind = BK_MUT;
+        }
+        emit_ref(dl, dp, PL_L, PL_P, kind, e);
+        return;
+    }
+    if op == Tok::Star {
+        let moving = !has_flag(dl, LF_BORROWED);
+        operand(e, moving);
+        emit_use(dl, dp, e);
+        return;
+    }
+    operand(NODES[e].b, false);
+    if !reachable() {
+        return;
+    }
+    let m = OPSTACK.len();
+    push_cur_op();
+    let at = flush_ops(m);
+    let uo = if op == Tok::Minus { UO_NEG } else if op == Tok::Bang { UO_NOT } else { UO_BITNOT };
+    emit(SK_ASSIGN, dl, dp, RV_UNARY, uo, e, at, 1, e);
+}
+
+fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64) {
+    let m = OPSTACK.len();
+    set_op(OK_PLACE, l, p);
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, dl, dp, RV_REF, kind, 0, at, 1, node);
+}
+
+fn lower_binary(e: i64, dl: i64, dp: i64) {
+    let op = NODES[e].op;
+    if op == Tok::AmpAmp || op == Tok::PipePipe {
+        // `a && b`: dest = a; if a (or !a) then dest = b
+        operand(NODES[e].b, false);
+        if !reachable() {
+            return;
+        }
+        let t = new_temp(TY_BOOL, e, false);
+        emit_use(t, 0, e);
+        let rhs = new_block();
+        let done = new_block();
+        let m = OPSTACK.len();
+        set_op(OK_COPY, t, 0);
+        push_cur_op();
+        let at = flush_ops(m);
+        if op == Tok::AmpAmp {
+            switch_bool(at, done, rhs, e);
+        } else {
+            switch_bool(at, rhs, done, e);
+        }
+        enter_block(rhs);
+        operand(NODES[e].c, false);
+        if reachable() {
+            emit_use(t, 0, e);
+            goto(done);
+        }
+        enter_block(done);
+        set_op(OK_COPY, t, 0);
+        emit_use(dl, dp, e);
+        return;
+    }
+    let m = OPSTACK.len();
+    operand(NODES[e].b, false);
+    push_cur_op();
+    operand(NODES[e].c, false);
+    push_cur_op();
+    if !reachable() {
+        OPSTACK.truncate(m);
+        return;
+    }
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, dl, dp, RV_BINARY, bo_of(op), e, at, 2, e);
+}
+
+// The IR's binary operator of token op (an operator or a compound
+// assignment's).
+fn bo_of(op: Tok) -> i64 {
+    match op {
+        Tok::Plus | Tok::PlusEq => BO_ADD,
+        Tok::Minus | Tok::MinusEq => BO_SUB,
+        Tok::Star | Tok::StarEq => BO_MUL,
+        Tok::Slash | Tok::SlashEq => BO_DIV,
+        Tok::Percent | Tok::PercentEq => BO_REM,
+        Tok::Amp | Tok::AmpEq => BO_AND,
+        Tok::Pipe | Tok::PipeEq => BO_OR,
+        Tok::Caret | Tok::CaretEq => BO_XOR,
+        Tok::Shl | Tok::ShlEq => BO_SHL,
+        Tok::Shr | Tok::ShrEq => BO_SHR,
+        Tok::EqEq => BO_EQ,
+        Tok::BangEq => BO_NE,
+        Tok::Lt => BO_LT,
+        Tok::LtEq => BO_LE,
+        Tok::Gt => BO_GT,
+        Tok::GtEq => BO_GE,
+        _ => 0,
+    }
+}
+
+// A switch on bool operand `at` (in P_OPS): false to `f`, true to `t`.
+fn switch_bool(at: i64, f: i64, t: i64, node: i64) {
+    let ti = crate::places::ir::P_TARGETS.len();
+    crate::places::ir::P_TARGETS.push(0);
+    crate::places::ir::P_TARGETS.push(f);
+    terminate(TK_SWITCH, ti, 1, t, at, 1, node);
+}
+
+fn goto(b: i64) {
+    terminate(TK_GOTO, b, 0, 0, 0, 0, 0);
+}
+
+fn goto_back(b: i64) {
+    terminate(TK_GOTO, b, 0, 1, 0, 0, 0);
+}
+
+// Struct, tuple, array and variant literals: the parts in the order they
+// are written, then the aggregate in declaration order.
+fn lower_aggregate(e: i64, dl: i64, dp: i64) {
+    let k = NODES[e].kind;
+    let ty = NODES[e].ty;
+    let n = NODES[e].count;
+    let m = OPSTACK.len();
+    // (room for the parts, filled by position)
+    for _ in 0..n {
+        OPSTACK.push(OK_UNIT);
+        OPSTACK.push(0);
+        OPSTACK.push(TY_UNIT);
+    }
+    for j in 0..n {
+        var i = j;
+        var value = child(e, j);
+        if k == NodeKind::StructLit {
+            i = NODES[value].x;
+            value = NODES[value].b;
+        } else if k == NodeKind::VariantLit {
+            i = crate::front::ast::field_order(e, j);
+            value = child(e, i);
+        }
+        operand(value, true);
+        if i >= 0 && i < n {
+            OPSTACK[m + 3 * i] = OPK;
+            OPSTACK[m + 3 * i + 1] = OPA;
+            OPSTACK[m + 3 * i + 2] = OPB;
+        }
+    }
+    if !reachable() {
+        OPSTACK.truncate(m);
+        return;
+    }
+    let at = flush_ops(m);
+    var ak = AK_TUPLE;
+    var info = 0;
+    if k == NodeKind::Array {
+        ak = AK_ARRAY;
+    } else if k == NodeKind::StructLit {
+        ak = if struct_closure(ty) { AK_CLOSURE } else { AK_STRUCT };
+        info = ty;
+    } else if k == NodeKind::VariantLit {
+        ak = AK_VARIANT;
+        info = NODES[e].a;
+    }
+    emit(SK_ASSIGN, dl, dp, RV_AGG, ak, info, at, n, e);
+}
+
+// `a[lo..hi]`: the base (a place, or a pointer's value), the bounds, then
+// the slice.
+fn lower_slicing(e: i64, dl: i64, dp: i64) {
+    let base = NODES[e].a;
+    let range = NODES[e].b;
+    let m = OPSTACK.len();
+    as_place(base);
+    set_op(OK_PLACE, PL_L, PL_P);
+    push_cur_op();
+    if NODES[range].a != 0 {
+        operand(NODES[range].a, false);
+    } else {
+        set_op(OK_UNIT, 0, TY_UNIT);
+    }
+    push_cur_op();
+    if NODES[range].b != 0 {
+        operand(NODES[range].b, false);
+    } else {
+        set_op(OK_UNIT, 0, TY_UNIT);
+    }
+    push_cur_op();
+    if !reachable() {
+        OPSTACK.truncate(m);
+        return;
+    }
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, dl, dp, RV_SLICE, e, 0, at, 3, e);
+}
+
+fn lower_vecop(e: i64, dl: i64, dp: i64) {
+    let m = OPSTACK.len();
+    if NODES[e].a != 0 {
+        operand(NODES[e].a, false);
+        push_cur_op();
+    }
+    for i in 0..NODES[e].count {
+        operand(child(e, i), false);
+        push_cur_op();
+    }
+    if !reachable() {
+        OPSTACK.truncate(m);
+        return;
+    }
+    let n = op_count(m);
+    let at = flush_ops(m);
+    var l = dl;
+    var p = dp;
+    if l < 0 {
+        l = if is_void(NODES[e].ty) { unit_local() } else { new_temp(NODES[e].ty, e, false) };
+        p = 0;
+    }
+    emit(SK_INTRINSIC, l, p, IK_VECTOR, e, 0, at, n, e);
+}
+
+// ---- Calls ----
+
+// Call n: the callee value (a function value), each argument left to
+// right (a `&place` a borrow of its parameter's kind: a receiver's
+// exclusive borrow two-phase), then the call; a `!` result ends the block.
+fn lower_call(n: i64, dl: i64, dp: i64) {
+    let f = NODES[n].x - 1;
+    let ty = NODES[n].ty;
+    let m = OPSTACK.len();
+    if f < 0 {
+        operand(NODES[n].a, false);
+        push_cur_op();
+    }
+    let c_callee = f >= 0 && fn_is_extern(f);
+    var ik = -1;
+    if f >= 0 && f == crate::front::contracts::checks::CHECK_FN {
+        ik = IK_CONTRACT;
+    } else if f >= 0 && crate::arch::intrinsic_of_fn(f) >= 0 {
+        ik = IK_ARCH;
+    }
+    for i in 0..NODES[n].count {
+        let arg = child(n, i);
+        let mode = if f >= 0 { param_mode(f, i) } else { arg_mode_of(arg) };
+        lower_arg(i, arg, mode, c_callee);
+        push_cur_op();
+        if !reachable() {
+            OPSTACK.truncate(m);
+            return;
+        }
+    }
+    var l = dl;
+    var p = dp;
+    if l < 0 {
+        l = if is_void(ty) || ty == TY_NEVER { unit_local() }
+            else { new_temp(ty, n, borrowed_call(n)) };
+        p = 0;
+    }
+    let count = op_count(m);
+    let at = flush_ops(m);
+    if ik >= 0 {
+        emit(SK_INTRINSIC, l, p, ik, n, 0, at, count, n);
+    } else {
+        emit(SK_CALL, l, p, f, 0, 0, at, count, n);
+    }
+    if ty == TY_NEVER {
+        terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, n);
+    }
+}
+
+// The mode of an argument of a call through a function value: by its type.
+fn arg_mode_of(arg: i64) -> i64 {
+    let t = undistinct(NODES[arg].ty);
+    if t > 0 && TYPES[t].kind == TyKind::Ptr {
+        return if TYPES[t].b == REF_SHARED { crate::front::own::kinds::P_SHARED }
+            else if TYPES[t].b == REF_MUT { P_MUT } else { P_RAW };
+    }
+    P_VALUE
+}
+
+// Argument i (node arg) of call n: its operand (OPK..).
+fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool) {
+    let k = NODES[arg].kind;
+    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+        let operand_e = NODES[arg].b;
+        let at_ty = undistinct(NODES[arg].ty);
+        as_place(operand_e);
+        let pl = PL_L;
+        let pp = PL_P;
+        var kind = BK_SHARED;
+        if c_callee || mode == P_RAW || at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr
+            && TYPES[at_ty].b == 0 {
+            kind = BK_RAW;
+        } else if mode == P_MUT || (NODES[arg].p & NODE_REF_MUT) != 0 {
+            let receiver = i == 0 && NODES[arg].start == NODES[operand_e].start;
+            kind = if receiver { BK_MUT2 } else { BK_MUT };
+        }
+        let t = new_temp(at_ty, arg, false);
+        emit_ref(t, 0, pl, pp, kind, arg);
+        set_op(OK_MOVE, t, 0);
+        return;
+    }
+    // (a value: moved into a by-value parameter; read where the callee
+    // only reads it: a raw or C parameter, a view)
+    let moving = mode == P_VALUE && !c_callee;
+    operand(arg, moving);
+}
+
+// ---- Assignment ----
+
+// `p = v` and `p op= v`: the value first, then the place, then the write
+// (the old value is not dropped: the own pass's desugaring is what drops,
+// lower_own_assign).
+fn lower_assign(n: i64) {
+    let op = NODES[n].op;
+    let target = NODES[n].b;
+    let value = NODES[n].c;
+    if op == Tok::Eq {
+        operand(value, true);
+        if !reachable() {
+            return;
+        }
+        let ok = OPK;
+        let oa = OPA;
+        let ob = OPB;
+        if !place_of(target) {
+            unsupported(target);
+            return;
+        }
+        set_op(ok, oa, ob);
+        emit_use(PL_L, PL_P, n);
+        return;
+    }
+    // `p op= v`: p = p op v, the value first
+    let m = OPSTACK.len();
+    operand(value, false);
+    let vk = OPK;
+    let va = OPA;
+    let vb = OPB;
+    if !reachable() || !place_of(target) {
+        OPSTACK.truncate(m);
+        return;
+    }
+    set_op(OK_COPY, PL_L, PL_P);
+    push_cur_op();
+    set_op(vk, va, vb);
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, PL_L, PL_P, RV_BINARY, bo_of(op), n, at, 2, n);
+}
+
+// The own pass's desugaring of an owned assignment, block b: `{ let
+// __own_new = rhs; [let __own_iK = i;] { let =o = p; p = __own_new; } }`,
+// read as `tmp = rhs; drop(p); p = move tmp` (§3.8). False when b is not
+// one.
+fn lower_own_assign(b: i64) -> bool {
+    if NODES[b].count < 2 || NODES[b].a != 0 {
+        return false;
+    }
+    // (the right side's temporaries' preludes come first, drops.vl
+    // temps_before: nothing for the IR)
+    var j = 0;
+    while j < NODES[b].count - 1 && prelude_stmt(child(b, j)) {
+        j += 1;
+    }
+    let first = child(b, j);
+    if NODES[first].kind != NodeKind::Let || (NODES[first].p & NO_DROP) == 0 {
+        return false;
+    }
+    let npat = NODES[first].a;
+    if npat == 0 || NODES[npat].kind != NodeKind::PatBind || NODES[npat].a != SYM_NEW {
+        return false;
+    }
+    let last = child(b, NODES[b].count - 1);
+    if NODES[last].kind != NodeKind::ExprStmt {
+        return false;
+    }
+    let inner = NODES[last].a;
+    if inner == 0 || NODES[inner].kind != NodeKind::Block || NODES[inner].count != 2 {
+        return false;
+    }
+    let olet = child(inner, 0);
+    let ast = child(inner, 1);
+    if NODES[olet].kind != NodeKind::Let || NODES[ast].kind != NodeKind::ExprStmt {
+        return false;
+    }
+    let asg = NODES[ast].a;
+    let read = NODES[olet].c;
+    if asg == 0 || NODES[asg].kind != NodeKind::Assign || read == 0
+        || (NODES[read].p & ASSIGN_OLD) == 0 {
+        return false;
+    }
+    // tmp = rhs
+    let nl = NODES[npat].x;
+    let vt = NODES[NODES[first].c].ty;
+    let tmp = new_temp(vt, first, false);
+    if nl >= 0 {
+        map_local(nl, tmp, 0);
+    }
+    expr_into(NODES[first].c, tmp, 0);
+    // the hoisted indexes, in order
+    for i in j + 1..NODES[b].count - 1 {
+        lower_stmt(child(b, i));
+    }
+    if !reachable() {
+        return true;
+    }
+    // drop(p); p = move tmp
+    let target = NODES[asg].b;
+    if !place_of(target) {
+        unsupported(target);
+        return true;
+    }
+    let ol = NODES[NODES[olet].a].x;
+    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, ol, 0, 0, asg);
+    set_op(OK_MOVE, tmp, 0);
+    emit_use(PL_L, PL_P, asg);
+    true
+}
+
+// ---- Control flow ----
+
+fn lower_return(n: i64) {
+    let v = NODES[n].a;
+    if v != 0 {
+        expr_into(v, 0, 0);
+    }
+    if !reachable() {
+        return;
+    }
+    exit_to(0);
+    goto(RET_BLOCK);
+}
+
+fn lower_break(n: i64) {
+    let s = loop_scope(NODES[n].x);
+    if s < 0 {
+        unsupported(n);
+        return;
+    }
+    let v = NODES[n].b;
+    if v != 0 {
+        let rl = SCOPES[s * SW + 5];
+        if rl >= 0 {
+            expr_into(v, rl, SCOPES[s * SW + 6]);
+        } else {
+            expr_into(v, -1, 0);
+        }
+    }
+    if !reachable() {
+        return;
+    }
+    exit_to(s + 1);
+    goto(SCOPES[s * SW + 3]);
+}
+
+fn lower_continue(n: i64) {
+    let s = loop_scope(NODES[n].x);
+    if s < 0 {
+        unsupported(n);
+        return;
+    }
+    exit_to(s + 1);
+    if SCOPES[s * SW + 7] != 0 {
+        goto_back(SCOPES[s * SW + 4]);
+    } else {
+        goto(SCOPES[s * SW + 4]);
+    }
+}
+
+fn lower_if(n: i64, dl: i64, dp: i64) {
+    let fixed = crate::front::features::static_condition(NODES[n].a);
+    if fixed >= 0 {
+        let live = if fixed == 1 { NODES[n].b } else { NODES[n].c };
+        if live != 0 {
+            expr_into(live, dl, dp);
+        }
+        return;
+    }
+    operand(NODES[n].a, false);
+    if !reachable() {
+        return;
+    }
+    let then_b = new_block();
+    let has_else = NODES[n].c != 0;
+    let else_b = if has_else { new_block() } else { -1 };
+    let join = new_block();
+    let m = OPSTACK.len();
+    push_cur_op();
+    let at = flush_ops(m);
+    switch_bool(at, if has_else { else_b } else { join }, then_b, n);
+    enter_block(then_b);
+    expr_into(NODES[n].b, dl, dp);
+    if reachable() {
+        goto(join);
+    }
+    if has_else {
+        enter_block(else_b);
+        expr_into(NODES[n].c, dl, dp);
+        if reachable() {
+            goto(join);
+        }
+    }
+    enter_block(join);
+}
+
+// `loop` and `while`: a header block; the body's scopes; `break` to the
+// exit, `continue` to the header (a back edge).
+fn lower_loop(n: i64, dl: i64, dp: i64) {
+    let head = new_block();
+    let exit = new_block();
+    goto(head);
+    enter_block(head);
+    let s = push_scope(SC_LOOP);
+    SCOPES[s * SW + 2] = n;
+    SCOPES[s * SW + 3] = exit;
+    SCOPES[s * SW + 4] = head;
+    SCOPES[s * SW + 5] = dl;
+    SCOPES[s * SW + 6] = dp;
+    // (`continue` takes the back edge of an uncounted loop)
+    SCOPES[s * SW + 7] = 1;
+    if NODES[n].kind == NodeKind::While {
+        // (the condition is a unit of its own: its temporaries drop when
+        // it is evaluated)
+        let c = push_scope(SC_STMT);
+        operand(NODES[n].b, false);
+        let m = OPSTACK.len();
+        push_cur_op();
+        let at = flush_ops(m);
+        let body = new_block();
+        let out = new_block();
+        // (the condition's temporaries end on both edges)
+        switch_bool(at, out, body, n);
+        enter_block(out);
+        emit_scope(c);
+        goto(exit);
+        enter_block(body);
+        pop_scope_at(c);
+        expr_into(NODES[n].c, -1, 0);
+    } else {
+        expr_into(NODES[n].b, -1, 0);
+    }
+    if reachable() {
+        goto_back(head);
+    }
+    pop_scope_at(s);
+    enter_block(exit);
+    if NODES[n].kind == NodeKind::While && dl >= 0 && dl != unit_local() {
+        // (a `while` is `()`)
+        set_op(OK_UNIT, 0, TY_UNIT);
+        emit_use(dl, dp, n);
+    }
+}
+
+// `for p in a..b` (the counted form the checker leaves): the bounds once,
+// the counter's copy bound each round; `continue` to the increment.
+fn lower_for(n: i64) {
+    let range = NODES[n].c;
+    let rt = NODES[range].ty;
+    let inclusive = NODES[range].c != 0;
+    operand(NODES[range].a, false);
+    let counter = new_temp(rt, n, false);
+    emit_use(counter, 0, n);
+    operand(NODES[range].b, false);
+    let end = new_temp(rt, n, false);
+    emit_use(end, 0, n);
+    if !reachable() {
+        return;
+    }
+    let test = new_block();
+    let body = new_block();
+    let next = new_block();
+    let exit = new_block();
+    goto(test);
+    enter_block(test);
+    let cmp = new_temp(TY_BOOL, n, false);
+    let m = OPSTACK.len();
+    set_op(OK_COPY, counter, 0);
+    push_cur_op();
+    set_op(OK_COPY, end, 0);
+    push_cur_op();
+    let at = flush_ops(m);
+    emit(SK_ASSIGN, cmp, 0, RV_BINARY, if inclusive { BO_LE } else { BO_LT }, n, at, 2, n);
+    let m2 = OPSTACK.len();
+    set_op(OK_COPY, cmp, 0);
+    push_cur_op();
+    let at2 = flush_ops(m2);
+    switch_bool(at2, exit, body, n);
+    enter_block(body);
+    let s = push_scope(SC_LOOP);
+    SCOPES[s * SW + 2] = n;
+    SCOPES[s * SW + 3] = exit;
+    SCOPES[s * SW + 4] = next;
+    let arm = push_scope(SC_ARM);
+    let pat = NODES[n].b;
+    if NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
+        let l = user_local(NODES[pat].x, pat, false);
+        live(l);
+        schedule(EN_DEAD, l);
+        set_op(OK_COPY, counter, 0);
+        emit_use(l, 0, pat);
+    } else if NODES[pat].kind != NodeKind::PatWild {
+        unsupported(pat);
+    }
+    expr_into(NODES[n].d, -1, 0);
+    pop_scope_at(arm);
+    if reachable() {
+        goto(next);
+    }
+    pop_scope_at(s);
+    enter_block(next);
+    if inclusive {
+        // (the last round: counter == end)
+        let last = new_temp(TY_BOOL, n, false);
+        let m3 = OPSTACK.len();
+        set_op(OK_COPY, counter, 0);
+        push_cur_op();
+        set_op(OK_COPY, end, 0);
+        push_cur_op();
+        let at3 = flush_ops(m3);
+        emit(SK_ASSIGN, last, 0, RV_BINARY, BO_EQ, n, at3, 2, n);
+        let m4 = OPSTACK.len();
+        set_op(OK_COPY, last, 0);
+        push_cur_op();
+        let at4 = flush_ops(m4);
+        let inc = new_block();
+        switch_bool(at4, inc, exit, n);
+        enter_block(inc);
+    }
+    let m5 = OPSTACK.len();
+    set_op(OK_COPY, counter, 0);
+    push_cur_op();
+    set_op(OK_INT, 1, rt);
+    push_cur_op();
+    let at5 = flush_ops(m5);
+    emit(SK_ASSIGN, counter, 0, RV_BINARY, BO_ADD, n, at5, 2, n);
+    goto(test);
+    enter_block(exit);
+}
+
+// ---- Blocks and statements ----
+
+fn lower_block(b: i64, dl: i64, dp: i64) {
+    if lower_own_assign(b) {
+        if dl >= 0 && dl != unit_local() {
+            set_op(OK_UNIT, 0, TY_UNIT);
+            emit_use(dl, dp, b);
+        }
+        return;
+    }
+    let flags = NODES[b].p;
+    // (a statement temporary's block, or a transparent desugaring: no scope
+    // of its own)
+    let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
+    let s = if scoped { push_scope(SC_BLOCK) } else { -1 };
+    for i in 0..NODES[b].count {
+        if !reachable() {
+            break;
+        }
+        lower_stmt(child(b, i));
+    }
+    let tail = NODES[b].a;
+    if tail != 0 && reachable() {
+        expr_into(tail, dl, dp);
+    } else if tail == 0 && dl >= 0 && reachable() && !is_void_dest(dl, dp) {
+        set_op(OK_UNIT, 0, TY_UNIT);
+        emit_use(dl, dp, b);
+    }
+    if scoped {
+        pop_scope_at(s);
+    }
+}
+
+fn is_void_dest(dl: i64, dp: i64) -> bool {
+    dl == unit_local() || dp == 0 && is_void(P_LOCALS[dl].ty)
+}
+
+fn lower_stmt(st: i64) {
+    let k = NODES[st].kind;
+    if k == NodeKind::Defer {
+        if (NODES[st].p & DEFER_IMPLICIT) != 0 || temp_defer(st) {
+            return;
+        }
+        schedule(EN_DEFER, st);
+        return;
+    }
+    if k == NodeKind::Let {
+        lower_let(st);
+        return;
+    }
+    if k == NodeKind::ExprStmt {
+        let e = NODES[st].a;
+        if e == 0 || own_flag_write(e) {
+            return;
+        }
+        let s = push_scope(SC_STMT);
+        expr_into(e, -1, 0);
+        pop_scope_at(s);
+        return;
+    }
+    let s = push_scope(SC_STMT);
+    expr_into(st, -1, 0);
+    pop_scope_at(s);
+}
+
+// Whether local l is one of the own pass's temporaries' bookkeeping
+// (`__own_tp`, `__own_tf`), which the IR has no use for.
+fn own_temp_local(l: i64) -> bool {
+    if l < 0 {
+        return false;
+    }
+    let name = crate::places::front::ast_local_name(l);
+    name == SYM_TP || name == SYM_TF
+}
+
+// Whether statement s is a statement temporary's prelude: its `__own_tp`
+// or `__own_tf` let, its defer.
+fn prelude_stmt(s: i64) -> bool {
+    let k = NODES[s].kind;
+    if k == NodeKind::Defer {
+        return (NODES[s].p & DEFER_IMPLICIT) == 0 && temp_defer(s);
+    }
+    if k != NodeKind::Let {
+        return false;
+    }
+    let pat = NODES[s].a;
+    pat != 0 && NODES[pat].kind == NodeKind::PatBind && own_temp_local(NODES[pat].x)
+}
+
+// Whether expression e writes one (`__own_tp = &__own_tv;`, `__own_tf =
+// true;`).
+fn own_flag_write(e: i64) -> bool {
+    if NODES[e].kind != NodeKind::Assign {
+        return false;
+    }
+    let t = NODES[e].b;
+    NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && own_temp_local(NODES[t].y)
+}
+
+// Whether defer d is a statement temporary's (`defer { if __own_tf { .. }
+// }`, drops.vl temp_make): the IR's drop of the temporary is its own.
+fn temp_defer(d: i64) -> bool {
+    let body = NODES[d].a;
+    if body == 0 || NODES[body].kind != NodeKind::Block || NODES[body].count != 1 {
+        return false;
+    }
+    let s = child(body, 0);
+    if NODES[s].kind != NodeKind::ExprStmt {
+        return false;
+    }
+    let f = NODES[s].a;
+    if f == 0 || NODES[f].kind != NodeKind::If {
+        return false;
+    }
+    let c = NODES[f].a;
+    NODES[c].kind == NodeKind::Ident && NODES[c].res == Res::Local && own_temp_local(NODES[c].y)
+}
+
+fn lower_let(st: i64) {
+    let pat = NODES[st].a;
+    let init = NODES[st].c;
+    if pat == 0 {
+        return;
+    }
+    let pk = NODES[pat].kind;
+    if pk == NodeKind::PatBind && own_temp_local(NODES[pat].x) {
+        return;
+    }
+    // (its temporaries: to the end of the statement, or of the block when
+    // it may keep a view of them)
+    let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);
+    let s = if keep { -1 } else { push_scope(SC_STMT) };
+    if pk == NodeKind::PatWild {
+        if init != 0 {
+            expr_into(init, -1, 0);
+        }
+    } else if pk == NodeKind::PatBind {
+        let l = NODES[pat].x;
+        if l < 0 {
+            if init != 0 {
+                expr_into(init, -1, 0);
+            }
+        } else {
+            let borrowed = let_borrows(pat, init);
+            let ir = user_local(l, pat, borrowed);
+            // (its storage begins first; its drop is registered once it
+            // holds its value, in the block's scope)
+            live(ir);
+            schedule_outer(s, EN_DEAD, ir);
+            if init != 0 {
+                expr_into(init, ir, 0);
+            }
+            if !has_flag(ir, LF_BORROWED) && needs_drop(P_LOCALS[ir].ty) {
+                schedule_outer(s, EN_DROP, ir);
+            }
+        }
+    } else {
+        unsupported(pat);
+    }
+    if s >= 0 {
+        pop_scope_at(s);
+    }
+}
+
+// Registers an entry in the scope that encloses statement scope s (the
+// block's), or in the innermost one when s is -1.
+fn schedule_outer(s: i64, kind: i64, v: i64) {
+    if s < 0 {
+        schedule(kind, v);
+        return;
+    }
+    // (the statement scope is innermost and holds only its temporaries:
+    // the entry goes before them, at the end of the enclosing scope)
+    let at = SCOPES[s * SW + 1];
+    ENTRIES.push(0);
+    ENTRIES.push(0);
+    var e = ENTRIES.len() / 2 - 1;
+    while e > at {
+        ENTRIES[2 * e] = ENTRIES[2 * e - 2];
+        ENTRIES[2 * e + 1] = ENTRIES[2 * e - 1];
+        e -= 1;
+    }
+    ENTRIES[2 * at] = kind;
+    ENTRIES[2 * at + 1] = v;
+    // (the statement scope's entries now start one later)
+    var t = s;
+    while t < scope_depth() {
+        SCOPES[t * SW + 1] += 1;
+        t += 1;
+    }
+}
+
+// Whether `let pat = init` binds a borrowed copy: byref.vl's BYREF, a
+// `for` loop's sequence when it is a place, an operator's `==` operand.
+fn let_borrows(pat: i64, init: i64) -> bool {
+    let l = NODES[pat].x;
+    if ast_borrowed(l) {
+        return true;
+    }
+    let name = NODES[pat].a;
+    if name == SYM_FOR_SEQ && init != 0 && is_place_expr(init) {
+        return true;
+    }
+    let text = SYMS[name].text;
+    text.len > 1 && text[0] == '=' && text[1] == '='
+}
+
+// ---- The body ----
+
+// Builds function f's body (Fn node item) into the IR tables; false when
+// a construct is not handled (a fallback).
+pub fn build_body(f: i64, item: i64) -> bool {
+    syms();
+    BUILD_FAILED = false;
+    FAIL_NODE = 0;
+    GEN += 1;
+    CUR_F = f;
+    DROPS = OWN_MODE == MODE_ERROR;
+    body_begin(f, item);
+    SCOPES.clear();
+    ENTRIES.clear();
+    OPSTACK.clear();
+    STATICS_SEEN.clear();
+    UNIT_LOCAL = -1;
+    let ret = fn_ret(f);
+    new_local(ret, LF_RETURN, -1, 0);
+    let count = NODES[item].count;
+    crate::places::ir::B_PARAMS = count;
+    let entry = new_block();
+    RET_BLOCK = new_block();
+    let body_scope = push_scope(SC_BODY);
+    // the parameters: _1.._n
+    let keep = keep_params(f);
+    for i in 0..count {
+        let p = child(item, i);
+        let l = NODES[p].x;
+        let ty = if i < fn_param_count(f) { fn_param(f, i) } else { 0 };
+        var flags = LF_PARAM;
+        if l >= 0 && ast_local_mutable(l) {
+            flags |= LF_MUT;
+        }
+        if l >= 0 && ast_borrowed(l) {
+            flags |= LF_BORROWED;
+        }
+        let ir = new_local(ty, flags, l, p);
+        if l >= 0 {
+            map_local(l, ir, 0);
+        }
+        if !keep && (flags & LF_BORROWED) == 0 && needs_drop(ty) {
+            schedule(EN_DROP, ir);
+        }
+    }
+    enter_block(entry);
+    let body = NODES[item].c;
+    expr_into(body, 0, 0);
+    if reachable() {
+        exit_to(body_scope);
+        goto(RET_BLOCK);
+    }
+    SCOPES.clear();
+    ENTRIES.clear();
+    enter_block(RET_BLOCK);
+    terminate(TK_RETURN, 0, 0, 0, 0, 0, 0);
+    BUILT += 1;
+    !BUILD_FAILED
+}
+
+// Whether function f keeps its by-value parameters undropped: std's
+// `forget` (whose point that is), and `iter::pass_over::<I>` of a
+// borrowing iterator's item (a copy its container keeps), as the own
+// pass's param_drops.
+fn keep_params(f: i64) -> bool {
+    let t = crate::places::front::fn_template(f);
+    if !crate::front::modules::within_std(crate::places::front::fn_module(t)) {
+        return false;
+    }
+    let name = crate::places::front::fn_name_sym(t);
+    if name == intern_c(c"forget") {
+        return true;
+    }
+    name == intern_c(c"pass_over")
+        && crate::front::own::byref::copies_owned_items(crate::places::front::fn_targ(f, 0), 0)
+}

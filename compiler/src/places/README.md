@@ -14,6 +14,14 @@ From 0.26.1 both code generators read it.
 | `cfg.vl` | predecessors, reverse postorder, immediate dominators of the body held |
 | `print.vl` | `--emit-places`: a body as text, what `// PLACES:` lines match |
 | `verify.vl` | `--verify-places`: the form, the places, the copy rule, `as V` dominance, storage |
+| `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build yet makes the body a fallback (`--verify-places` names it) |
+| `front.vl` | what the IR reads of the checker's raw tables, one justified accessor each |
+| `mod.vl` | the driver (check_program calls `run_places`) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff` |
+
+In 0.26.0 the IR is built only under `--places` (or `--emit-places`,
+`--verify-places`, `--places-diff`): after step 2a its builder costs about
+433M instructions at `check` of compiler/src, over §6's 340M for all of
+step 2, so §6's fallback rule applies (the IR off by default).
 
 One body is held at a time (`ir.vl`'s `P_*` tables), cleared and reused
 for the next.
@@ -42,3 +50,6 @@ Changes to `ir.vl` after its first commit, one line each, so that the
 code generators' agent (0.26.1) sees what moved.
 
 - 0.26.0: first version.
+- 0.26.0 (step 2): RV_BINARY and RV_UNARY carry the operator (BO_*,
+  UO_*) in d and the AST node in e; an AK_BOUNDS assert has two operands
+  (index, length); RV_SLICE checks its bounds; struct_closure.
