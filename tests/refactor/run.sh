@@ -339,7 +339,7 @@ $(cat "$WORK/embedren/main.vl")"
 # not one. 0.26.0: gpu.* and wgsl.*, and std's own: the shader compiler's
 # `"wgsl.X"` and `error wgsl.target`, std::gpu's `gpu.X:` texts.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run|gpu|wgsl)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run|gpu|wgsl|field|attr)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
     grep -rhoE 'gpu\.[a-z]+:' compiler/std/gpu | sed -e 's/^\(.*\):$/c"\1"/'

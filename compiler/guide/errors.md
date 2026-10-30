@@ -661,7 +661,18 @@ error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at
 ```
 The help gives the declaration with `pub` and where it is (`volec fix
 --only pub` writes them all). Child modules see their parent's private items, not
-the reverse.
+the reverse. A struct's fields too (0.26):
+
+```vole
+mod m {
+    pub struct P { pub x: i64, y: i64 }
+    pub fn p() -> P { P { x: 1, y: 2 } }
+}
+fn main() -> i32 { m::p().y as i32 }
+```
+```err
+error[field.private] field 'y' of 'P' is private to module 'm' | help: make it public: 'pub y: i64' at
+```
 
 ## unsafe
 

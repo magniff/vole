@@ -37,7 +37,7 @@ fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
 `Gpa` is a zero-sized value, copied freely: an allocator is passed as a
 let parameter (`gpa: Gpa`, no convention to write), and every container
 made from it shares it. Only `main` gets one (std's
-types are `#[sealed]`: no `Gpa {}` outside std). Each 0.15 form that
+types have private fields: no `Gpa {}` outside std). Each 0.15 form that
 allocated has an `_in` form taking the allocator last: `Vec::new_in(a)`,
 `with_capacity_in(n, a)`, `filled_in(n, x, a)`, `Buf::new_in(a)`,
 `HashMap::new_in(a)`, `it.collect_in(a)`, `format_in(x, a)`,
