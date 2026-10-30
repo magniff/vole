@@ -1,0 +1,294 @@
+// Borrowed copies (0.26.0, moved out of drops.vl for the places IR,
+// docs/design/places-ir.md §5): the predicates that say which bindings and
+// values are bit copies of a value owned elsewhere, never dropped and
+// never moved out of: std's copying getters (borrowed_call), a borrowing
+// iterator's items (copies_owned_items), a generic result made of what
+// its arguments keep (parametric_copy), the locals bound by reference
+// (BYREF) and the match scrutinees reached through one (MATCH_BYREF).
+// drops.vl places the drops with them; places/ reads them, and never
+// drops.vl.
+
+use crate::base::SYMS;
+use crate::front::ast::{NODES, NodeKind, SCRATCH, child, list_begin, list_push};
+use crate::front::check::Res;
+use crate::front::modules::within_std;
+use crate::front::own::glue::has_glue;
+use crate::front::own::kinds::is_owned_type;
+use crate::front::types::{FNS, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TyKind, fn_param};
+use crate::middle::lower::ssa::HMap;
+
+// Whether a value of type t is an iterator (or an adapter of one, to depth
+// 4) that copies a borrowed container's non-copyable elements.
+pub fn copies_owned_items(t: i64, depth: i64) -> bool {
+    // UNSAFE: STRUCTS and TLISTS' data are the checker's raw tables (*StructInfo, *i64).
+    // SAFETY: t > 0 is a struct type, so TYPES[t].a < STRUCT_COUNT; its targs are
+    // targ_count entries of TLISTS.
+    unsafe {
+        if t <= 0 || depth > 4 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s = TYPES[t].a;
+        if !within_std(STRUCTS[s].module) || STRUCTS[s].targ_count == 0 {
+            return false;
+        }
+        let a0 = TLISTS.data[STRUCTS[s].targs];
+        let a1 = if STRUCTS[s].targ_count > 1 { TLISTS.data[STRUCTS[s].targs + 1] } else { 0 };
+        // (0.25: a set's iter, HashSetIter and BTreeSetIter, too)
+        if crate::front::check::is_std_named(t, c"SliceIter")
+            || crate::front::check::is_std_named(t, c"Keys")
+            || crate::front::check::is_std_named(t, c"HashSetIter")
+            || crate::front::check::is_std_named(t, c"BTreeSetIter") {
+            return crate::front::own::glue::has_glue(a0);
+        }
+        if crate::front::check::is_std_named(t, c"Values") {
+            return crate::front::own::glue::has_glue(a1);
+        }
+        if crate::front::check::is_std_named(t, c"HashMapIter")
+            || crate::front::check::is_std_named(t, c"BTreeIter") {
+            return crate::front::own::glue::has_glue(a0) || crate::front::own::glue::has_glue(a1);
+        }
+        // (a map's items are its closure's results, made from borrowed ones)
+        if crate::front::check::is_std_named(t, c"Map")
+            || crate::front::check::is_std_named(t, c"FilterMap") {
+            return false;
+        }
+        for i in 0..STRUCTS[s].targ_count {
+            if copies_owned_items(TLISTS.data[STRUCTS[s].targs + i], depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub const MATCH_BYREF: i64 = 1 << 58;
+
+// Locals bound by reference (local + 1 -> the node they borrow + 1).
+pub static var BYREF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The bindings of pattern p (PatBind nodes) onto SCRATCH.
+pub fn push_bindings(p: i64) {
+    if p == 0 {
+        return;
+    }
+    let k = NODES[p].kind;
+    if k == NodeKind::PatBind {
+        list_push(p);
+        return;
+    }
+    if k == NodeKind::PatOr {
+        // (every alternative binds the same names)
+        if NODES[p].count > 0 {
+            push_bindings(child(p, 0));
+        }
+        return;
+    }
+    if k == NodeKind::PatTuple || k == NodeKind::PatVariant {
+        for i in 0..NODES[p].count {
+            push_bindings(child(p, i));
+        }
+    }
+}
+
+// The last word of a function's display name: `get` of `Vec<T>::get`.
+pub fn method_word(d: [u8]) -> [u8] {
+    var i = d.len;
+    while i > 0 && d[i - 1] != ':' && d[i - 1] != '.' {
+        i -= 1;
+    }
+    d[i..d.len]
+}
+
+// Whether call e gives a copy of an element its shared receiver keeps:
+// std's accessors (`v.get(i)`, `v.last()`, `m.get(k)`, `key_at`,
+// `value_at`; 0.18.1: a heap's `peek`) return a `T`, not a `&T`, until references are type
+// arguments (0.17.1), and through `unwrap`, `expect`, `unwrap_or`. The copy
+// is borrowed: a binding of it is not dropped, and moving it is
+// own.move_out (it would be dropped twice).
+pub fn borrowed_call(e: i64) -> bool {
+    // UNSAFE: FNS is the checker's raw table of functions (*FnInfo).
+    // SAFETY: f = NODES[e].x - 1 >= 0 is the call's resolved function, below FN_COUNT.
+    unsafe {
+        // (0.18: through a requires check's block to its call)
+        let wrapped = crate::front::contracts::expand::requires_tail(e);
+        if wrapped > 0 {
+            return borrowed_call(wrapped);
+        }
+        // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
+        if e > 0 && NODES[e].kind == NodeKind::Try {
+            return borrowed_call(NODES[e].a);
+        }
+        // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
+        if e > 0 && NODES[e].kind == NodeKind::Match && NODES[e].count == 2
+            && (NODES[child(e, 1)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
+            return borrowed_call(NODES[e].a);
+        }
+        if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
+            return false;
+        }
+        let f = NODES[e].x - 1;
+        if f < 0 || !within_std(FNS[f].module) || !has_glue(NODES[e].ty) {
+            return false;
+        }
+        let name = method_word(SYMS[FNS[f].display].text);
+        let p0 = fn_param(f, 0);
+        if p0 <= 0 {
+            return false;
+        }
+        if name == "get" || name == "last" || name == "first" || name == "key_at"
+            || name == "value_at" || name == "peek" || name == "first_key_value"
+            || name == "last_key_value" {
+            // (a shared receiver: `&self`, or a slice)
+            return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
+                || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
+        }
+        // (0.24: a borrowing iterator's items, copies of elements its
+        // container keeps, moves::copies_owned_items: in std's adapters,
+        // `count`, `filter`, an item looked at and passed over is not dropped)
+        if (name == "next" || name == "next_back" || name == "at" || name == "find"
+            || name == "last" || name == "nth" || name == "min" || name == "max")
+            && crate::front::own::byref::copies_owned_items(
+                if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0) {
+            return true;
+        }
+        if name == "unwrap" || name == "expect" || name == "unwrap_or" {
+            return borrowed_call(crate::front::contracts::desugar::requires_arg(child(e, 0)));
+        }
+        false
+    }
+}
+
+// Whether pattern p binds local l.
+pub fn binds(p: i64, l: i64) -> bool {
+    // UNSAFE: SCRATCH.data is IntVec's raw buffer, read by index.
+    // SAFETY: mark <= i < SCRATCH.count, the entries push_bindings pushed.
+    unsafe {
+        let mark = list_begin();
+        push_bindings(p);
+        var found = false;
+        for i in mark..SCRATCH.count {
+            if NODES[SCRATCH.data[i]].x == l {
+                found = true;
+            }
+        }
+        SCRATCH.count = mark;
+        found
+    }
+}
+
+// Whether value expression e (a branch's, an arm's: pat its pattern, or
+// 0) is new: made by e, or a local that dies with it.
+fn fresh_value(e: i64, pat: i64) -> bool {
+    if e == 0 {
+        return false;
+    }
+    let k = NODES[e].kind;
+    // (0.25.2.1: a `return`, `break` or `continue`, as `Err(e) =>
+    // return Err(e)`, makes no value: its type is not always never)
+    if NODES[e].ty == crate::front::types::TY_NEVER || k == NodeKind::Return
+        || k == NodeKind::Break || k == NodeKind::Continue {
+        return true;
+    }
+    if k == NodeKind::Block {
+        let t = NODES[e].a;
+        if t == 0 {
+            return false;
+        }
+        if fresh_value(t, pat) {
+            return true;
+        }
+        if NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && NODES[t].y >= 0 {
+            let l = NODES[t].y;
+            for i in 0..NODES[e].count {
+                let s = child(e, i);
+                if NODES[s].kind == NodeKind::Let && NODES[s].a != 0 && binds(NODES[s].a, l) {
+                    return BYREF.get(l + 1) == 0;
+                }
+            }
+        }
+        return false;
+    }
+    if k == NodeKind::Ident {
+        return pat != 0 && NODES[e].res == Res::Local && NODES[e].y >= 0
+            && binds(pat, NODES[e].y) && BYREF.get(NODES[e].y + 1) == 0;
+    }
+    fresh(e)
+}
+
+// Whether expression e makes a new owned value (not a place's, not a copy
+// a collection keeps: borrowed_call).
+pub fn fresh(e: i64) -> bool {
+    let k = NODES[e].kind;
+    if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e) {
+        return !borrowed_call(e) && !parametric_copy(e);
+    }
+    if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
+        || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat
+        || k == NodeKind::Try || k == NodeKind::Interp {
+        return true;
+    }
+    if k == NodeKind::Block {
+        return fresh_value(e, 0);
+    }
+    if k == NodeKind::If {
+        return NODES[e].c != 0 && fresh_value(NODES[e].b, 0) && fresh_value(NODES[e].c, 0);
+    }
+    if k == NodeKind::Match {
+        if NODES[e].count == 0 {
+            return false;
+        }
+        for i in 0..NODES[e].count {
+            let arm = child(e, i);
+            if !fresh_value(NODES[arm].c, NODES[arm].a) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Whether call e may give a copy of a value its arguments keep: a generic
+// result made of its type parameters (summary::ret_parametric) from a
+// callee that neither consumes nor changes an argument (`second<T>(p: *T)
+// -> T { p[1] }` reads one through a raw pointer; `unwrap(sink self)`,
+// std's `pop(inout self)` give one up; outside std a function that
+// changes an argument may still return a copy through a raw pointer).
+fn parametric_copy(e: i64) -> bool {
+    // UNSAFE: FNS and TLISTS' data are the checker's raw tables (*FnInfo, *i64).
+    // SAFETY: f >= 0 is the call's resolved function, below FN_COUNT; its targs are
+    // targ_count entries of TLISTS.
+    unsafe {
+        let f = NODES[e].x - 1;
+        if f < 0 || crate::front::own::summary::ret_parametric(f) == 0 {
+            return false;
+        }
+        // (0.25: `clone` makes a new value, `v.clone().len()`; a result
+        // whose type arguments have no glue holds no copy that matters,
+        // `String::from_in("x", gpa)`)
+        if method_word(SYMS[FNS[f].display].text) == "clone" {
+            return false;
+        }
+        var glue_arg = false;
+        for i in 0..FNS[f].targ_count {
+            if has_glue(TLISTS.data[FNS[f].targs + i]) {
+                glue_arg = true;
+            }
+        }
+        if !glue_arg {
+            return false;
+        }
+        for i in 0..FNS[f].param_count {
+            let m = crate::front::own::kinds::param_mode(f, i);
+            let t = fn_param(f, i);
+            // (an owned argument consumed, or one changed in place)
+            if m == crate::front::own::kinds::P_VALUE && is_owned_type(t)
+                || within_std(FNS[f].module) && m == crate::front::own::kinds::P_MUT && t > 0
+                && TYPES[t].b == REF_MUT
+                && is_owned_type(TYPES[t].a) {
+                return false;
+            }
+        }
+        true
+    }
+}
