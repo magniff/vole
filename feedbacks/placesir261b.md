@@ -48,6 +48,16 @@ The places IR lowers to the middle IR in one walk.
     1.23x; use it for where, not how much. In it emission (mine) is
     +737M over the AST walk's: the generator's own passes, not the code
     it emits.
+  - Where (in-process counters, compiler/src at -j1: 10,982 functions,
+    157k blocks, 248k locals, 479k statements): gen_blocks 1,984M
+    against the AST walk's whole gen_function 1,867M; the analyses
+    before it about 450M (scan_locals ~250M, take_body ~100M,
+    forward_blocks ~80M, slots and share_slots ~40M), some 400 to 500
+    instructions per statement or block, spread over Vec reads and
+    pushes. Cutting the calls (op_kind inlined by hand) or the scans
+    (forward_blocks in one scan per block) moved nothing measurable;
+    the lever is not walking at all: A's keep records each local's
+    mentions (asked of A, with the RPO kept with the body).
 
 ## What worked
 
