@@ -167,6 +167,16 @@ code generators' agent (0.26.1) sees what moved.
   bug: nothing checked the move and x dropped what S keeps (a double
   free); it is own.move_out now, as Rust's E0507 (front/own/walk.vl
   eval_place_value).
+- 0.26.1 (the builder's cost at check): at a check (no code generator
+  reads the IR; not --verify-places, --places-diff, --emit-places) a body
+  is built only when it may drop (front/own/fast.vl glue_met: the own
+  pass gave it a drop, drops::fn_has_drops; with its drops off, a type
+  with glue met in it): over compiler/src 700 bodies of 10,872, `check
+  --places` 6,043M instructions to 5,594M, 1.087x to 1.007x of the check
+  without the IR. `--places-noglue-check` builds the others too and
+  reports any with a drop that runs: none over compiler/src and every
+  tests/run source. The backstop sees only the bodies built. When step 7
+  deletes the own pass's drops, the type rule is what is left (1.047x).
 
 ## `--places-diff`: the differences left
 
