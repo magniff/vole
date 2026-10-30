@@ -104,6 +104,19 @@ code generators' agent (0.26.1) sees what moved.
   printed IR so too). Operands are written straight to `P_OPS` (no
   staging), so `P_OPS` may hold words no statement points to; read
   operands only through a statement's `ops` and `nops`.
+- 0.26.1 (shims as functions): with kept bodies and drops on, each shim
+  is a function of the `FNS` table after the program's (`shim_fn(id)`,
+  `drop_shim_fn(t)`, `is_shim_fn(f)`; `self: &mut T`, unit): not a
+  program item, so a code generator lowers them in a loop over
+  `shim_count()`, `lower_places_function(cx, fn_node(shim_fn(id)),
+  shim_fn(id))`. A generic `Drop::drop` a shim calls is instantiated at
+  check time when no instance exists yet (`make_drop_instance`, then
+  front/check's `check_queued_instances`), so every shim has its callee.
+- 0.26.1 (R3): a sink closure's body that moves a flagged capture out of
+  its env writes `(*_1).k_flag = const false` after the move
+  (build.vl `live_writes`), as the own pass does.
+- 0.26.1: a union literal's aggregate has a part per field of the union,
+  `const ()` for each field not written.
 
 ## `--places-diff`: the differences left
 
