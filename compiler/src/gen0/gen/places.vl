@@ -19,7 +19,7 @@
 
 use crate::back::abi::returns_through_pointer;
 use crate::back::dwarf::{DEBUG_INFO, dbg_function_begin, dbg_function_end};
-use crate::base::{buf_bytes, buf_clear, buf_slice};
+use crate::base::{IntVec, buf_bytes, buf_clear, buf_slice, free};
 use crate::base::comp::Comp;
 use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NodeKind, child};
 use crate::front::check::{LOCALS, LOCAL_COUNT};
@@ -29,8 +29,8 @@ use crate::front::distinct::{enum_niche, erase_type};
 use crate::front::lexer::Tok;
 use crate::front::types::{
     ENUMS, FNS, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, VARIANTS, field_offset, fn_param,
-    is_compound, is_float, is_slice, is_vector, is_void, tuple_offset, type_elem, type_size,
-    variant_field, variant_field_offset,
+    is_compound, is_float, is_signed, is_slice, is_vector, is_void, tuple_offset, type_elem,
+    type_size, variant_field, variant_field_offset,
 };
 use crate::gen0::gen::{
     CUR_FN, FRAME_SIZE, OVERALIGNED, RESULT_SLOT, RETURN_LABEL, STMT_POS, alloc_slot,
@@ -38,11 +38,11 @@ use crate::gen0::gen::{
     gen_return_value, load_from_x0, pop_second_operand, stmt_loc, store_reg_to_frame,
     store_to_frame,
 };
-use crate::gen0::gen::call::{gen_call, gen_call_sequence, gen_contract_check_of, gen_pass_arg};
+use crate::gen0::gen::call::{gen_call, gen_call_sequence, gen_pass_arg};
 use crate::gen0::gen::checkalloc::site_before_call;
 use crate::gen0::gen::expr::{
-    emit_static_addr, gen_cast, gen_fn_address, gen_operator, gen_repeat_fill, gen_slice_tail,
-    gen_string_id, gen_unop, panic_kind,
+    emit_static_addr, gen_cast, gen_expr, gen_fn_address, gen_operator, gen_repeat_fill,
+    gen_slice_tail, gen_string_id, gen_unop, panic_kind,
 };
 use crate::gen0::gen::vector::{
     gen_vecop, gen_vector_binary, gen_vector_negate, vector_assign_lanes, vector_value_to_slot,
@@ -52,7 +52,8 @@ use crate::gen0::target::{
     emit_copy, emit_epilogue, emit_frame_addr, emit_frame_reserve, emit_function_start,
     emit_index_addr, emit_int_binary, emit_jump, emit_jump_if_zero, emit_label, emit_load,
     emit_load_float, emit_load_imm, emit_load_reg, emit_move_to_second, emit_normalize, emit_panic,
-    emit_store, emit_string_addr, new_label, pop_d, pop_x, push_value, push_x0,
+    emit_panic_site_popped, emit_store, emit_string_addr, message_kind, new_label, pop_d, pop_x,
+    push_value, push_x0,
 };
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Cond;
@@ -1375,6 +1376,53 @@ fn bound_call(s: PStmt) -> bool {
         && NODES[n].count + skip == s.nops
 }
 
+// (0.26.2) A check's failing path, the places IR's (as middle/lower's
+// lower_contract_failure): ops[1] the site, ops[2..] the shown values
+// (widened to 64 bits), the helper called with the message, whose text
+// alone is the AST's; the block ends in `unreachable`.
+fn gen_contract_failure(cx: sink *FnCtx, s: PStmt) {
+    // UNSAFE: shown is a raw IntVec this function owns; NODES is the checker's
+    // raw table.
+    // SAFETY: check_values fills shown, whose data is freed once here; s.d is
+    // the check's call node, below NODE_COUNT.
+    unsafe {
+        let n = s.d;
+        let check = NODES[child(n, 2)].a;
+        var shown = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        crate::front::contracts::checks::check_values(n, s.e, &shown);
+        // (the site: a `$pre` function's SITE parameter, or the check's
+        // own, the AST's constant)
+        let site_kind = op_kind(s.ops, 1);
+        if site_kind == OK_COPY || site_kind == OK_MOVE {
+            gen_op(cx, s.ops, 1);
+            gen_cast(cx, op_type(s.ops, 1), TY_I64);
+        } else {
+            gen_expr(cx, child(n, 1));
+        }
+        push_x0(cx);
+        let count = s.nops - 2;
+        for i in 0..count {
+            let ty = op_type(s.ops, i + 2);
+            gen_op(cx, s.ops, i + 2);
+            gen_cast(cx, ty, if is_signed(ty) { TY_I64 } else { TY_U64 });
+            push_x0(cx);
+        }
+        if count > 2 {
+            pop_x(cx, R_ADDR);
+        }
+        if count > 1 {
+            pop_x(cx, R_SECOND);
+        }
+        if count > 0 {
+            pop_x(cx, R_ACC);
+        }
+        let kind = message_kind(crate::front::contracts::checks::check_message(check, s.e, shown,
+            CUR_FN));
+        emit_panic_site_popped(cx, kind);
+        free(shown.data as *u8);
+    }
+}
+
 fn gen_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
     // UNSAFE: NODES is the checker's raw table of nodes.
     // SAFETY: s.d is the intrinsic's node (the EnumPanic, the contract check's
@@ -1388,17 +1436,7 @@ fn gen_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
             return;
         }
         if s.c == IK_CONTRACT {
-            // An assert's condition (which may change state) is the IR's,
-            // evaluated once; a requires', ensures' or invariant's (pure) is
-            // generated again from the AST (its locals are the IR's slots).
-            let check = NODES[child(n, 2)].a;
-            if crate::front::contracts::checks::CHECK_KIND.get(check)
-                == crate::front::contracts::checks::CHK_ASSERT {
-                gen_op(cx, s.ops, 0);
-                gen_contract_check_of(cx, n);
-            } else {
-                gen_call(cx, n);
-            }
+            gen_contract_failure(cx, s);
             return;
         }
         if s.c == IK_VECTOR {
