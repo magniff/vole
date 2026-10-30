@@ -208,6 +208,15 @@ code generators' agent (0.26.1) sees what moved.
   `__own_tv` ones, and fewer removed drops (a temporary is not dropped on
   an exit taken before it holds its value).
 
+- 0.26.2 (contract conditions in the IR): a requires', ensures' or
+  invariant's check is built as a branch per conjunct of its condition
+  (`lower_contract`, the form entry facts read) and, on each failing path,
+  the values its report shows and `intrinsic contract_check(SITE,
+  VALUE..)` (IK_CONTRACT, e the conjunct), then unreachable: a code
+  generator lowers the failure from the operands and check_message, with
+  nothing of the condition left to lower from the AST. An assert's check
+  is as before (e 0, ops[0] its condition's value).
+
 ## `--places-diff`: the differences left
 
 Over compiler/src (142 locals compared) and every tests/run source
