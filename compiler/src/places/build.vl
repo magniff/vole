@@ -36,31 +36,36 @@ use crate::front::ast::{
 };
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
+use crate::front::consteval::wrap_int;
 use crate::front::contracts::expand::is_pre_fn;
+use crate::front::distinct::enum_niche;
 use crate::front::lexer::Tok;
 use crate::front::own::byref::{ASSIGN_OLD, BYREF, MATCH_BYREF, NO_DROP, borrowed_call};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
-use crate::front::patterns::{binding_count, binds_ref, pattern_referent};
+use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_referent};
+use crate::front::patterns::usefulness::int_key;
 use crate::front::types::{
-    REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_void,
-    type_elem, variant_field,
+    REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_compound,
+    is_integer, is_void, type_elem, variant_field,
 };
 use crate::places::front::{
     ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
-    type_glue, variant_discr,
+    struct_field_name, type_glue, variant_discr,
 };
 use crate::places::ir::{
     AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
     BK_SHARED, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GE, BO_GT, BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR,
-    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR,
-    LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY,
-    OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF,
-    PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, P_LOCALS, P_OPS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR,
-    RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD,
-    SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE,
-    UO_BITNOT, UO_NEG, UO_NOT, body_begin, emit, enter_block, has_flag, is_union_type, new_block,
-    new_local, ops_mark, proj, push_op, reachable, struct_closure, terminate, undistinct,
+    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, B_PARAMS, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC,
+    IK_VECTOR, LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST,
+    OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST,
+    PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_OPS, P_STMTS, RV_AGG,
+    RV_BINARY, RV_CAST, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT,
+    SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN,
+    TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT, block_count, block_len, block_start,
+    body_begin, emit, enter_block, has_flag, is_union_type, local_count, new_block, new_local, op_a,
+    op_b, op_kind, ops_mark, proj, proj_kind, proj_parent, proj_val, push_op, reachable,
+    struct_closure, terminate, undistinct,
 };
 
 // ---- State ----
@@ -929,9 +934,16 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
     let ty = NODES[e].ty;
     let n = NODES[e].count;
     // (room for the parts in P_OPS, filled by position: what their values
-    // emit goes after it)
+    // emit goes after it; a union literal names one of its fields, and has
+    // a part per field, `()` but the one written)
+    let ut = undistinct(ty);
+    let slots = if k == NodeKind::StructLit && is_union_type(ut) {
+        crate::places::ir::struct_field_count(TYPES[ut].a)
+    } else {
+        n
+    };
     let at = ops_mark();
-    for _ in 0..n {
+    for _ in 0..slots {
         push_op(OK_UNIT, 0, TY_UNIT);
     }
     for j in 0..n {
@@ -958,7 +970,7 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
         } else {
             operand(value, true);
         }
-        if i >= 0 && i < n {
+        if i >= 0 && i < slots {
             P_OPS[at + 3 * i] = OPK;
             P_OPS[at + 3 * i + 1] = OPA;
             P_OPS[at + 3 * i + 2] = OPB;
@@ -978,7 +990,7 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
         ak = AK_VARIANT;
         info = NODES[e].a;
     }
-    emit(SK_ASSIGN, dl, dp, RV_AGG, ak, info, at, n, e);
+    emit(SK_ASSIGN, dl, dp, RV_AGG, ak, info, at, slots, e);
 }
 
 // `a[lo..hi]`: the base (a place, or a pointer's value), the bounds, then
@@ -1489,6 +1501,10 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
     }
     let sl = PL_L;
     let sp = PL_P;
+    if switch_cases(n, st) {
+        lower_match_switch(n, st, sl, sp, dl, dp);
+        return;
+    }
     let join = new_block();
     for i in 0..NODES[n].count {
         let arm = child(n, i);
@@ -1527,6 +1543,199 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
         enter_block(fail);
     }
     terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, n);
+    enter_block(join);
+}
+
+// (0.26.1, R4) A match lowered as one switch: its (value, arm) pairs, each
+// value once (for the first arm that has it), and the arm that is the
+// default (a wildcard or a binding, the last arm), -1 when none is.
+static var SW_CASES: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var SW_DEFAULT: i64 = -1;
+// The referent type the arms match through (their patterns' PAT_DEREF),
+// 0 when they match the value itself.
+static var SW_INNER: i64 = 0;
+
+// Whether match n on a value of type st is one switch (R4, as
+// middle/lower/matching.vl's switch_cases): no guards; an integer
+// scrutinee matched against literals, ranges and their alternatives, or
+// an enum (not one with the null niche) matched by variant, whose fields
+// only bind; a wildcard or binding, if any, the last arm; at least 6
+// values, or 4 for an enum with fields. Fills SW_CASES and SW_DEFAULT.
+fn switch_cases(n: i64, st: i64) -> bool {
+    let count = NODES[n].count;
+    SW_INNER = -1;
+    for i in 0..count {
+        let p = NODES[child(n, i)].a;
+        let kind = NODES[p].kind;
+        if kind != NodeKind::PatWild && kind != NodeKind::PatBind {
+            let r = pattern_referent(p, st);
+            if SW_INNER >= 0 && r != SW_INNER {
+                return false;
+            }
+            SW_INNER = r;
+        }
+    }
+    let t = undistinct(if SW_INNER > 0 { SW_INNER } else { st });
+    if t <= 0 {
+        return false;
+    }
+    let integer = is_integer(t);
+    let is_enum = TYPES[t].kind == TyKind::Enum;
+    if !integer && !is_enum || is_enum && enum_niche(TYPES[t].a) {
+        return false;
+    }
+    SW_CASES.clear();
+    SW_DEFAULT = -1;
+    for i in 0..count {
+        let arm = child(n, i);
+        let p = NODES[arm].a;
+        if NODES[arm].b != 0 {
+            return false;
+        }
+        let kind = NODES[p].kind;
+        if kind == NodeKind::PatWild || kind == NodeKind::PatBind {
+            if i != count - 1 {
+                return false;
+            }
+            SW_DEFAULT = i;
+        } else if !add_switch_values(p, i, t, integer) {
+            return false;
+        }
+    }
+    let cases = SW_CASES.len() / 2;
+    cases >= 6 || is_enum && is_compound(t) && cases >= 4
+}
+
+// Adds the values pattern p matches (for arm `arm`, unless an earlier arm
+// has them) of the integer or enum type t; false when p is not a set of
+// values.
+fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool) -> bool {
+    let kind = NODES[p].kind;
+    if kind == NodeKind::PatLit && integer {
+        add_switch_value(NODES[p].x, arm);
+        return true;
+    }
+    if kind == NodeKind::PatRange && integer {
+        let count = int_key(NODES[p].y, t) - int_key(NODES[p].x, t) + 1;
+        if count < 1 || count > 256 || SW_CASES.len() + 2 * count > 2048 {
+            return false;
+        }
+        for k in 0..count {
+            add_switch_value(wrap_int(NODES[p].x + k, t), arm);
+        }
+        return true;
+    }
+    if kind == NodeKind::PatVariant && !integer {
+        for i in 0..NODES[p].count {
+            if !is_irrefutable(child(p, i)) {
+                return false;
+            }
+        }
+        add_switch_value(variant_discr(NODES[p].x), arm);
+        return true;
+    }
+    if kind == NodeKind::PatOr && binding_count(p) == 0 {
+        for i in 0..NODES[p].count {
+            if !add_switch_values(child(p, i), arm, t, integer) {
+                return false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn add_switch_value(value: i64, arm: i64) {
+    var i = 0;
+    while i < SW_CASES.len() {
+        if SW_CASES[i] == value {
+            return;
+        }
+        i += 2;
+    }
+    SW_CASES.push(value);
+    SW_CASES.push(arm);
+}
+
+// Match n, its scrutinee at (sl, sp) of type st, as one switch (R4; after
+// switch_cases said it is one): `switch copy P` for an integer, `_d =
+// discriminant P; switch copy _d` for an enum (P is `*(sl, sp)` when the
+// arms match through the reference, SW_INNER), a target per value; every
+// arm in a block of its own that binds and lowers the body. An enum's arm
+// with several values is reached through a block per value (a goto to
+// the arm's): elaboration learns the variant of P from the edge of a
+// target with one value.
+fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64) {
+    let inner = SW_INNER;
+    let t = undistinct(if inner > 0 { inner } else { st });
+    let pp = if inner > 0 { proj(sp, PJ_DEREF, 0) } else { sp };
+    let integer = is_integer(t);
+    var at = 0;
+    if integer {
+        at = ops_mark();
+        set_op(OK_COPY, sl, pp);
+        push_now();
+    } else {
+        let d = new_local(enum_tag_ty(t), LF_TEMP, -1, n);
+        let a0 = ops_mark();
+        set_op(OK_PLACE, sl, pp);
+        push_now();
+        emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, a0, 1, n);
+        at = ops_mark();
+        set_op(OK_COPY, d, 0);
+        push_now();
+    }
+    let join = new_block();
+    let count = NODES[n].count;
+    let first = new_block();
+    for _ in 1..count {
+        new_block();
+    }
+    var default = -1;
+    if SW_DEFAULT >= 0 {
+        default = first + SW_DEFAULT;
+    } else {
+        default = new_block();
+    }
+    let cases = SW_CASES.len() / 2;
+    let ti = crate::places::ir::P_TARGETS.len();
+    for c in 0..cases {
+        let arm = SW_CASES[2 * c + 1];
+        var many = false;
+        if !integer {
+            for o in 0..cases {
+                many = many || o != c && SW_CASES[2 * o + 1] == arm;
+            }
+        }
+        crate::places::ir::P_TARGETS.push(SW_CASES[2 * c]);
+        crate::places::ir::P_TARGETS.push(if many { new_block() } else { first + arm });
+    }
+    terminate(TK_SWITCH, ti, cases, default, at, 1, n);
+    for c in 0..cases {
+        let arm = SW_CASES[2 * c + 1];
+        let target = crate::places::ir::P_TARGETS[ti + 2 * c + 1];
+        if target != first + arm {
+            enter_block(target);
+            goto(first + arm);
+        }
+    }
+    let catch_all = SW_DEFAULT;
+    for i in 0..count {
+        let arm = child(n, i);
+        enter_block(first + i);
+        let s = push_scope(SC_ARM, arm);
+        phase_begin(-1);
+        bind_pattern(NODES[arm].a, sl, sp, st, false);
+        expr_into(NODES[arm].c, dl, dp);
+        pop_scope_at(s);
+        if reachable() {
+            goto(join);
+        }
+    }
+    if catch_all < 0 {
+        enter_block(default);
+        terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, n);
+    }
     enter_block(join);
 }
 
@@ -2036,6 +2245,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     ENTRIES.clear();
     enter_block(RET_BLOCK);
     terminate(TK_RETURN, 0, 0, 0, 0, 0, 0);
+    live_writes();
     BUILT += 1;
     !BUILD_FAILED
 }
@@ -2061,3 +2271,100 @@ fn keep_params(f: i64) -> bool {
     name == intern_c(c"pass_over")
         && crate::front::own::byref::copies_owned_items(crate::places::front::fn_targ(f, 0), 0)
 }
+
+// ---- A sink closure's captures moved (R3) ----
+
+static var OLD_STMTS: Vec<PStmt, Comp> = Vec::new_in(Comp {});
+
+// The flag field index of the capture statement st moves out of the env
+// of the closure body held (`move (*_1).k...`, k a capture with a
+// `__live_` flag), or -1.
+fn moved_capture_flag(st: PStmt) -> i64 {
+    for i in 0..st.nops {
+        if op_kind(st.ops, i) != OK_MOVE || op_a(st.ops, i) != 1 {
+            continue;
+        }
+        // (the steps from the root: `*`, then field k)
+        var second = 0;
+        var first = op_b(st.ops, i);
+        while first > 0 && proj_parent(first) > 0 {
+            second = first;
+            first = proj_parent(first);
+        }
+        if first <= 0 || proj_kind(first) != PJ_DEREF || second <= 0
+            || proj_kind(second) != PJ_FIELD {
+            continue;
+        }
+        let env = undistinct(P_LOCALS[1].ty);
+        let pt = if env > 0 && TYPES[env].kind == TyKind::Ptr { TYPES[env].a } else { 0 };
+        if pt <= 0 || !struct_closure(pt) {
+            continue;
+        }
+        let s = TYPES[pt].a;
+        let flag = crate::front::own::glue::flag_field(s, struct_field_name(s, proj_val(second)));
+        if flag == 0 {
+            continue;
+        }
+        for k in 0..crate::places::ir::struct_field_count(s) {
+            if struct_field_name(s, k) == flag {
+                return k;
+            }
+        }
+    }
+    -1
+}
+
+// A closure body that moves a capture of a sink closure out of its env:
+// `(*_1).__live_x = const false` after each such move, as the own pass
+// writes it, so that the env's shim drops only what it still holds.
+fn live_writes() {
+    if B_PARAMS < 1 || local_count() < 2 || !has_flag(1, LF_PARAM) {
+        return;
+    }
+    var any = false;
+    for s in 0..P_STMTS.len() {
+        if moved_capture_flag(P_STMTS[s]) >= 0 {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return;
+    }
+    OLD_STMTS.clear();
+    for s in 0..P_STMTS.len() {
+        OLD_STMTS.push(P_STMTS[s]);
+    }
+    let n = block_count();
+    // (the blocks' ranges before: entering a block resets its start)
+    let ranges = TMP_RANGES.len();
+    for b in 0..n {
+        TMP_RANGES.push(block_start(b));
+        TMP_RANGES.push(block_len(b));
+    }
+    P_STMTS.clear();
+    let root = proj(0, PJ_DEREF, 0);
+    for b in 0..n {
+        let start = TMP_RANGES[ranges + 2 * b];
+        if start < 0 {
+            continue;
+        }
+        let len = TMP_RANGES[ranges + 2 * b + 1];
+        enter_block(b);
+        for s in start..start + len {
+            let st = OLD_STMTS[s];
+            P_STMTS.push(st);
+            let k = moved_capture_flag(st);
+            if k >= 0 {
+                let at = ops_mark();
+                push_op(OK_INT, 0, TY_BOOL);
+                emit(SK_ASSIGN, 1, proj(root, PJ_FIELD, k), RV_USE, 0, 0, at, 1, st.node);
+            }
+        }
+        let term = OLD_STMTS[start + len];
+        terminate(term.kind, term.a, term.b, term.c, term.ops, term.nops, term.node);
+    }
+    TMP_RANGES.truncate(ranges);
+}
+
+static var TMP_RANGES: Vec<i64, Comp> = Vec::new_in(Comp {});
