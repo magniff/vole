@@ -1,0 +1,306 @@
+// Shader parts (0.26.2, decision 19): `embed wgsl K with A, b::B { .. }`.
+// The names in a `with` list are paths from the block's module (`A`,
+// `shaders::A`, `crate::gpu::A`, `super::A`; a `use` does not bring one
+// in): blocks, whose text comes before K's own in K's module, and (step 4)
+// `const`s and `#[repr(wgsl)]` structs, whose WGSL the compiler writes. A
+// block named in any `with` is a part: checked only inside the modules that
+// include it, its entry points the fields of each block that includes it,
+// its own `.src` and entry fields no values (embed.part_use, wgsl.vl). A
+// name that is none of these is embed.with; parts that include themselves,
+// embed.cycle.
+//
+// resolve_parts runs first in expand_embeds, before any block's struct is
+// made: BLOCKS lists the program's wgsl blocks, and module_order gives a
+// block's module, its parts depth-first, each once, then itself.
+
+use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, intern_c, sym_text};
+use crate::base::diag::{ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::PROGRAM;
+use crate::front::modules::{MODULES, child_module, is_within, module_of};
+use crate::front::parser::items::ITEM_PUBLIC;
+
+// The program's `embed wgsl` blocks (their Embed nodes), in order.
+pub static var BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// For each block: the first of its `with` entries (WITH_), their count,
+// and whether it is a part (1).
+static var WITH_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var WITH_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var IS_PART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The `with` entries: the item named (a block's index in BLOCKS, or -1
+// after an error) and the path's node.
+static var WITH_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var WITH_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static var SYM_WGSL: i64 = 0;
+static var SYM_CRATE: i64 = 0;
+static var SYM_SUPER: i64 = 0;
+static var SYM_SELF: i64 = 0;
+
+// The program's blocks into BLOCKS, their `with` lists resolved, the parts
+// marked, a cycle broken (embed.cycle).
+pub fn resolve_parts() {
+    BLOCKS.count = 0;
+    WITH_FIRST.count = 0;
+    WITH_COUNT.count = 0;
+    IS_PART.count = 0;
+    WITH_BLOCK.count = 0;
+    WITH_PATH.count = 0;
+    if SYM_WGSL == 0 {
+        SYM_WGSL = intern_c(c"wgsl");
+        SYM_CRATE = intern_c(c"crate");
+        SYM_SUPER = intern_c(c"super");
+        SYM_SELF = intern_c(c"self");
+    }
+    var any_with = false;
+    for i in 0..NODES[PROGRAM].count {
+        let item = child(PROGRAM, i);
+        if NODES[item].kind == NodeKind::Embed && NODES[item].b == SYM_WGSL {
+            BLOCKS.push(item);
+            IS_PART.push(0);
+            any_with = any_with || NODES[item].count > 0;
+        }
+    }
+    if !any_with {
+        for b in 0..BLOCKS.count {
+            WITH_FIRST.push(0);
+            WITH_COUNT.push(0);
+        }
+        return;
+    }
+    for b in 0..BLOCKS.count {
+        let e = BLOCKS.get(b);
+        WITH_FIRST.push(WITH_BLOCK.count);
+        WITH_COUNT.push(NODES[e].count);
+        for k in 0..NODES[e].count {
+            let path = child(e, k);
+            let named = resolve_with(e, path);
+            WITH_BLOCK.push(named);
+            WITH_PATH.push(path);
+            if named >= 0 {
+                IS_PART.set(named, 1);
+            }
+        }
+    }
+    // the cycles, each reported once and broken where it closes
+    var state = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for b in 0..BLOCKS.count {
+        state.push(0);
+    }
+    var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for b in 0..BLOCKS.count {
+        if state.get(b) == 0 {
+            find_cycles(b, &state, &stack);
+        }
+    }
+}
+
+// The depth-first walk from block b: state 1 while its parts are walked,
+// 2 after; a `with` entry that reaches a block in state 1 closes a cycle.
+fn find_cycles(b: i64, state: inout IntVec, stack: inout IntVec) {
+    state.set(b, 1);
+    stack.push(b);
+    let first = WITH_FIRST.get(b);
+    for k in first..first + WITH_COUNT.get(b) {
+        let p = WITH_BLOCK.get(k);
+        if p < 0 {
+            continue;
+        }
+        if state.get(p) == 1 {
+            cycle_error(k, p, stack);
+            WITH_BLOCK.set(k, -1);
+        } else if state.get(p) == 0 {
+            find_cycles(p, &state, &stack);
+        }
+    }
+    stack.count -= 1;
+    state.set(b, 2);
+}
+
+// embed.cycle at `with` entry k, which names block p, a block of the walk
+// (stack) that has not come back yet.
+fn cycle_error(k: i64, p: i64, stack: IntVec) {
+    let m = buf_new();
+    buf_bytes(m, "the parts of '");
+    buf_bytes(m, sym_text(NODES[BLOCKS.get(p)].a));
+    buf_bytes(m, "' include it again: ");
+    var from = 0;
+    for i in 0..stack.count {
+        if stack.get(i) == p {
+            from = i;
+        }
+    }
+    for i in from..stack.count {
+        buf_bytes(m, sym_text(NODES[BLOCKS.get(stack.get(i))].a));
+        buf_bytes(m, " with ");
+    }
+    buf_bytes(m, sym_text(NODES[BLOCKS.get(p)].a));
+    let saved = ERR_KIND;
+    ERR_KIND = c"embed.cycle";
+    err_begin(NODES[WITH_PATH.get(k)].start);
+    err_fmt(buf_slice(m));
+    err_help(c"a module's text is its parts' texts, then its own: a part cannot include the block that includes it; move what both need into a part of its own");
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The block (its index in BLOCKS) that `path` (a TyName) names from block
+// e's module, or -1 after embed.with.
+fn resolve_with(e: i64, path: i64) -> i64 {
+    var m = module_of(e);
+    let from = m;
+    for k in 0..NODES[path].count {
+        let seg = child(path, k);
+        let s = NODES[seg].a;
+        if s == SYM_CRATE {
+            m = 0;
+        } else if s == SYM_SUPER {
+            m = module_parent(m);
+        } else if s != SYM_SELF {
+            m = child_module(m, s);
+        }
+        if m < 0 {
+            with_error(path, NODES[seg].start, f"no module '{sym_text(s)}' here",
+                "a `with` path starts at the block's module (`shaders::COMMON`), or at `crate::` or `super::`");
+            return -1;
+        }
+    }
+    let name = NODES[path].a;
+    var other = -1;
+    for i in 0..NODES[PROGRAM].count {
+        let item = child(PROGRAM, i);
+        if NODES[item].a != name || !is_named_item(NODES[item].kind) || module_of(item) != m {
+            continue;
+        }
+        if NODES[item].kind == NodeKind::Embed {
+            if (NODES[item].p & ITEM_PUBLIC) == 0 && !is_within(from, m) {
+                with_error(path, NODES[path].start,
+                    f"the block '{sym_text(name)}' is private to its module",
+                    "a part named from another module is `pub embed wgsl ..`");
+                return -1;
+            }
+            for b in 0..BLOCKS.count {
+                if BLOCKS.get(b) == item {
+                    return b;
+                }
+            }
+        }
+        other = item;
+    }
+    if other >= 0 {
+        with_error(path, NODES[path].start,
+            f"'{sym_text(name)}' is {item_kind_text(NODES[other].kind)}, not an `embed wgsl` block",
+            "`with` names embedded blocks, whose text comes before this block's own");
+    } else {
+        with_error(path, NODES[path].start, f"no `embed wgsl` block '{sym_text(name)}' in this module", "`with` names a block by its path from this block's module (`with shaders::COMMON`); a `use` does not bring one in");
+    }
+    -1
+}
+
+// Whether an item of this kind has a name `with` could mean.
+fn is_named_item(k: NodeKind) -> bool {
+    k == NodeKind::Embed || k == NodeKind::Const || k == NodeKind::Struct || k == NodeKind::Static
+        || k == NodeKind::Fn || k == NodeKind::Enum || k == NodeKind::TypeAlias
+}
+
+fn item_kind_text(k: NodeKind) -> [u8] {
+    if k == NodeKind::Const { "a const" } else if k == NodeKind::Struct { "a struct" }
+    else if k == NodeKind::Static { "a static" } else if k == NodeKind::Fn { "a function" }
+    else if k == NodeKind::Enum { "an enum" } else { "a type" }
+}
+
+// embed.with at pos, of the `with` entry `path`.
+fn with_error<T: std::Display>(path: i64, pos: i64, message: sink T, help: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"embed.with";
+    err_begin(if pos >= 0 { pos } else { NODES[path].start });
+    err_fmt(message);
+    let h = buf_new();
+    buf_bytes(h, help);
+    crate::base::buf_byte(h, 0);
+    err_help(buf_slice(h).ptr);
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The parent of module m (-1: the root has none).
+fn module_parent(m: i64) -> i64 {
+    // UNSAFE: MODULES is the module table, a raw pointer the module loader
+    // grows (front::modules).
+    // SAFETY: m is a module of the program (module_of, child_module or a
+    // parent read here gave it, each < MODULE_COUNT), and the table is no
+    // longer grown once the modules are loaded, before expand_embeds.
+    unsafe { MODULES[m].parent }
+}
+
+// Block b's index in BLOCKS for Embed node e, or -1.
+pub fn block_of(e: i64) -> i64 {
+    for b in 0..BLOCKS.count {
+        if BLOCKS.get(b) == e {
+            return b;
+        }
+    }
+    -1
+}
+
+// Whether block b is a part (named in some `with`).
+pub fn is_part(b: i64) -> bool {
+    b >= 0 && b < IS_PART.count && IS_PART.get(b) != 0
+}
+
+// Block b's module: its parts depth-first, each once, then b, into out
+// (indexes of BLOCKS).
+pub fn module_order(b: i64, out: inout IntVec) {
+    out.count = 0;
+    add_in_order(b, &out);
+}
+
+fn add_in_order(b: i64, out: inout IntVec) {
+    for i in 0..out.count {
+        if out.get(i) == b {
+            return;
+        }
+    }
+    let first = WITH_FIRST.get(b);
+    for k in first..first + WITH_COUNT.get(b) {
+        let p = WITH_BLOCK.get(k);
+        if p >= 0 {
+            add_in_order(p, &out);
+        }
+    }
+    out.push(b);
+}
+
+// (embed.part_use) The blocks that include part b directly or through
+// other parts and are no parts themselves, into out; the position of the
+// first `with` entry that names b.
+pub fn users_of(b: i64, out: inout IntVec) -> i64 {
+    out.count = 0;
+    var at = -1;
+    var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for u in 0..BLOCKS.count {
+        let first = WITH_FIRST.get(u);
+        for k in first..first + WITH_COUNT.get(u) {
+            if WITH_BLOCK.get(k) == b && at < 0 {
+                at = NODES[WITH_PATH.get(k)].start;
+            }
+        }
+        if is_part(u) || u == b {
+            continue;
+        }
+        module_order(u, &order);
+        for i in 0..order.count {
+            if order.get(i) == b {
+                out.push(u);
+            }
+        }
+    }
+    at
+}
+
+// `FILE:LINE` of pos, a new buffer's text.
+pub fn file_line_text(pos: i64) -> [u8] {
+    let b = buf_new();
+    buf_file_line(b, pos);
+    buf_slice(b)
+}
