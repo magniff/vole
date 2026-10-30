@@ -19,7 +19,7 @@
 // exactly what the scalar iteration does, in order.
 
 use crate::base::{IntVec, free};
-use crate::front::types::{TY_I64, TY_U64, int_bits, is_integer};
+use crate::front::types::{TY_BOOL, TY_I64, TY_U64, int_bits, is_integer, is_signed};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::all_ones;
 use crate::middle::ir::{
@@ -38,8 +38,11 @@ use crate::middle::opt::resolve_all;
 use crate::middle::profile::{is_cold_block, is_hot_count};
 use crate::middle::scev::counted_loop;
 use crate::middle::vectorize::{VC_UNIFORM, expected_trips};
-use crate::middle::vectorize::build::{append, cmp, konst};
-use crate::middle::vectorize::checks::{check_tests, record_check};
+use crate::middle::vectorize::build::{append, cmp, konst, reduction_may_overflow};
+use crate::middle::vectorize::checks::{
+    OVK_KEEP, OVK_STEP, OVK_UNIFORM, check_tests, ovf_index, ovf_tests, ovf_uniform, record_check,
+    record_ovf,
+};
 use crate::middle::vectorize::legality::{coef, is_unreachable_exit, loads_in, set_class};
 
 const UNROLL_RT_SIZE: i64 = 64;
@@ -101,6 +104,7 @@ fn runtime_factor(cx: sink *FnCtx, l: i64) -> i64 {
         cx.v_ne = ne;
         cx.v_iv2 = 0;
         cx.v_checks.count = 0;
+        cx.v_ovfs.count = 0;
         cx.v_eval.count = 0;
         let s0 = cx.blocks[latch].s0;
         let s1 = cx.blocks[latch].s1;
@@ -136,7 +140,7 @@ fn runtime_factor(cx: sink *FnCtx, l: i64) -> i64 {
                     let next = if loop_contains(cx, l, a) { a } else { c };
                     let out = if next == a { c } else { a };
                     if !loop_contains(cx, l, next) || !is_unreachable_exit(cx, l, out)
-                        || !record_check(cx, l, b, next) {
+                        || !record_check(cx, l, b, next) && !record_ovf(cx, l, b, next) {
                         return 0;
                     }
                 }
@@ -151,10 +155,28 @@ fn runtime_factor(cx: sink *FnCtx, l: i64) -> i64 {
                 return 0;
             }
         }
+        // (0.26.2, a prototype) Overflow checks of values exactly affine in
+        // the counter go too (tested before the loop); the others stay in
+        // every copy.
+        var going = cx.v_checks.count / 3;
+        var kept = 0;
+        for k in 0..cx.v_ovfs.count / 3 {
+            if ovf_uniform(cx, l, cx.v_ovfs.data[3 * k]) {
+                cx.v_ovfs.data[3 * k + 1] = OVK_UNIFORM;
+                going += 1;
+            } else {
+                cx.v_ovfs.data[3 * k + 1] = OVK_KEEP;
+                kept += 1;
+            }
+        }
+        // (Copies that keep checks are big: only where a reduction splits.)
+        if kept > 0 && !has_split_reduction(cx, l) {
+            return 0;
+        }
         // It pays where checks go, or where the loop's own instructions (the
         // induction variable, its test and branch) are a good part of it.
         // (0.15) Or where reductions run on several accumulators.
-        if cx.v_checks.count == 0 && size > UNROLL_RT_TINY
+        if going == 0 && size > UNROLL_RT_TINY
             && (size > UNROLL_RT_REDUCTION || !has_split_reduction(cx, l)) {
             return 0;
         }
@@ -188,8 +210,10 @@ fn in_set(set: IntVec, v: i64) -> bool {
 // maximum, `k ? x : r` with k comparing x and r (an integer order). Only
 // nx may be used outside the loop (outs: the exit block's values). Returns
 // the operation (as i64; ADD for + and -), -1 for a minimum or maximum (its
-// select nx), or 0.
-fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec) -> i64 {
+// select nx), or 0. (0.26.2, a prototype) When `spec`, a sum whose steps
+// are each overflow-checked is one too: its steps and addends into `steps`.
+fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec, spec: bool,
+    steps: inout IntVec) -> i64 {
     unsafe {
         let ty = cx.insts[r].ty;
         if !is_integer(ty) || r == cx.v_iv || nx == r || cx.insts[nx].block == 0
@@ -215,6 +239,7 @@ fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec) -> i6
         }
         var ok = true;
         var grew = true;
+        var checks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         while ok && grew && !minmax {
             grew = false;
             for i in 0..loop_size(cx, l) {
@@ -222,6 +247,7 @@ fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec) -> i6
                 while w != 0 && ok {
                     if w != r && !in_set(set, w) && uses_set(cx, w, set) {
                         let op = cx.insts[w].op;
+                        var member = true;
                         if op == Phi {
                             ok = cx.insts[w].block != h;
                             for a in 0..cx.insts[w].nargs {
@@ -237,10 +263,17 @@ fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec) -> i6
                                 && (op != Sub || in_set(set, cx.insts[w].a))
                                 && (family == 0 || family == f);
                             family = f;
+                        } else if op == Op::Ovf && spec && ovf_index(cx, w) >= 0 {
+                            // (0.26.2) A step's overflow check (see
+                            // checked_steps): not one of the set.
+                            if !in_set(checks, w) {
+                                checks.push(w);
+                            }
+                            member = false;
                         } else {
                             ok = false;
                         }
-                        if ok {
+                        if ok && member {
                             set.push(w);
                             grew = true;
                         }
@@ -274,8 +307,107 @@ fn split_reduction(cx: sink *FnCtx, l: i64, r: i64, nx: i64, outs: IntVec) -> i6
                 ok = false;
             }
         }
+        // (0.26.2) Checked steps: split when spec, the loop redone from its
+        // start when the sums may overflow (unroll_runtime).
+        if ok && checks.count > 0 {
+            ok = !minmax && family == Add as i64 && checked_steps(cx, set, checks, ty, &steps);
+        }
+        free(checks.data as *u8);
         free(set.data as *u8);
         if !ok { 0 } else if minmax { -1 } else { family }
+    }
+}
+
+// (0.26.2, a prototype) Whether `checks`, overflow checks on values of
+// `set` (a reduction's, of type ty), check its steps: each the + or - of a
+// step of the set on its operands, every step checked, all of one sign when
+// unsigned. The steps and their addends, pairs, into `steps`.
+fn checked_steps(cx: sink *FnCtx, set: IntVec, checks: IntVec, ty: i64, steps: inout IntVec) -> bool {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in split_reduction.
+    // SAFETY: the set's values and the checks are instructions of the loop's
+    // function; i and j stay below their counts.
+    unsafe {
+        var count = 0;
+        var adds = 0;
+        for i in 0..set.count {
+            let w = set.data[i];
+            let op = cx.insts[w].op;
+            if op != Add && op != Sub {
+                continue;
+            }
+            count += 1;
+            if op == Add {
+                adds += 1;
+            }
+            let a = ir_val(cx, cx.insts[w].a);
+            let b = ir_val(cx, cx.insts[w].b);
+            var found = false;
+            for j in 0..checks.count {
+                let c = checks.data[j];
+                let imm = cx.insts[c].imm;
+                let ca = ir_val(cx, cx.insts[c].a);
+                let cb = ir_val(cx, cx.insts[c].b);
+                if (imm & 255) == op as i64 && (imm >> 8) == ty
+                    && (ca == a && cb == b || op == Add && ca == b && cb == a) {
+                    found = true;
+                }
+            }
+            if !found {
+                return false;
+            }
+            steps.push(w);
+            steps.push(if in_set(set, a) { b } else { a });
+        }
+        count == checks.count && (is_signed(ty) || adds == 0 || adds == count)
+    }
+}
+
+// (0.26.2, a prototype) Whether loop l may be redone from its start when a
+// check of its unrolled copies fails (see unroll_runtime): it stores
+// nothing, and its body is a chain, its only branches checks and its latch.
+fn speculable(cx: sink *FnCtx, l: i64) -> bool {
+    // UNSAFE: the function's IR is FnCtx's raw arrays (blocks, insts).
+    // SAFETY: the blocks are loop l's, their instructions the function's.
+    unsafe {
+        let latch = loop_latch(cx, l);
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                let op = cx.insts[v].op;
+                if op == Op::Store || op == Op::Copy || op == Op::Atomic || op == Op::Fence
+                    || op.is_call() {
+                    return false;
+                }
+                v = cx.insts[v].next;
+            }
+            if b != latch && cx.blocks[b].term == Term::Branch
+                && loop_contains(cx, l, cx.blocks[b].s0) && loop_contains(cx, l, cx.blocks[b].s1) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// (0.26.2) Marks the overflow check of step w (one of the same operation
+// and operands) in V_OVFS as OVK_STEP.
+fn mark_step_check(cx: sink *FnCtx, w: i64) {
+    // UNSAFE: FnCtx's raw arrays (insts, V_OVFS).
+    // SAFETY: k stays below V_OVFS' count; its checks and w are
+    // instructions of the function entered.
+    unsafe {
+        let a = ir_val(cx, cx.insts[w].a);
+        let b = ir_val(cx, cx.insts[w].b);
+        for k in 0..cx.v_ovfs.count / 3 {
+            let c = cx.v_ovfs.data[3 * k];
+            let ca = ir_val(cx, cx.insts[c].a);
+            let cb = ir_val(cx, cx.insts[c].b);
+            if (cx.insts[c].imm & 255) == cx.insts[w].op as i64
+                && (ca == a && cb == b || cx.insts[w].op == Add && ca == b && cb == a) {
+                cx.v_ovfs.data[3 * k + 1] = OVK_STEP;
+            }
+        }
     }
 }
 
@@ -338,14 +470,17 @@ fn has_split_reduction(cx: sink *FnCtx, l: i64) -> bool {
         let h = loop_header(cx, l);
         let li = pred_index(cx, h, loop_latch(cx, l));
         let outs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let spec = speculable(cx, l);
+        var steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var found = false;
         var x = cx.blocks[h].first;
-        while x != 0 && cx.insts[x].op == Phi {
-            if split_reduction(cx, l, x, ir_val(cx, ir_arg(cx, x, li)), outs) != 0 {
-                return true;
-            }
+        while x != 0 && cx.insts[x].op == Phi && !found {
+            found = split_reduction(cx, l, x, ir_val(cx, ir_arg(cx, x, li)), outs, spec, &steps)
+                != 0;
             x = cx.insts[x].next;
         }
-        false
+        free(steps.data as *u8);
+        found
     }
 }
 
@@ -386,12 +521,39 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
         var kinds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var onext = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ostart = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // (0.26.2, a prototype) Sums whose steps are overflow-checked, split
+        // when the loop can be redone (speculable): their (phi index, step,
+        // addend) triples. Each copy or's its addends' bounds; after the
+        // unrolled loop, R (the scalar loop from the start) unless they bound
+        // the sums inside their type; the copies' other checks go to R too.
+        let spec = speculable(cx, l);
+        var spec_steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..np {
             let nx = ir_val(cx, ir_arg(cx, phis.data[i], li));
             onext.push(nx);
             ostart.push(ir_val(cx, ir_arg(cx, phis.data[i], hp)));
-            kinds.push(split_reduction(cx, l, phis.data[i], nx, outs));
+            steps.count = 0;
+            kinds.push(split_reduction(cx, l, phis.data[i], nx, outs, spec, &steps));
+            if kinds.data[i] != 0 {
+                var s = 0;
+                while s < steps.count {
+                    mark_step_check(cx, steps.data[s]);
+                    spec_steps.push(i);
+                    spec_steps.push(steps.data[s]);
+                    spec_steps.push(steps.data[s + 1]);
+                    s += 2;
+                }
+            }
         }
+        free(steps.data as *u8);
+        let speculating = spec_steps.count > 0;
+        let nsteps = spec_steps.count / 3;
+        let restart = if speculating { ir_new_block(cx) } else { 0 };
+        if speculating {
+            cx.blocks[restart].sealed = 1;
+        }
+        var absv = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         // Per copy: its blocks (nb), header phis (np), next values (np), exit
         // values (ne), and the induction variable's next value.
         var blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -412,11 +574,48 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
                 outv.push(clone_map(cx, outs.data[i], stamp));
             }
             ivn.push(clone_map(cx, ir_val(cx, ir_arg(cx, cx.v_iv, li)), stamp));
+            // (0.26.2) A kept overflow check's copy branches to its exit too
+            // (with its values for the exit's phis), or to R, speculating.
+            for i in 0..nb {
+                let bo = region.data[i];
+                let o = ovf_index(cx, cx.blocks[bo].cond);
+                if speculating || o < 0 || cx.v_ovfs.data[3 * o + 1] != OVK_KEEP {
+                    continue;
+                }
+                let out = cx.blocks[bo].s0;
+                let pi = pred_index(cx, out, bo);
+                var exit_vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                var x = cx.blocks[out].first;
+                while x != 0 && cx.insts[x].op == Phi {
+                    exit_vals.push(clone_map(cx, ir_val(cx, ir_arg(cx, x, pi)), stamp));
+                    x = cx.insts[x].next;
+                }
+                add_pred_values(cx, out, cx.blocks[bo].aux, &exit_vals, 0);
+                free(exit_vals.data as *u8);
+            }
+            // (0.26.2) The copy's addends' bounds, x ^ (x >> bits - 1) (or x,
+            // unsigned), in its steps' blocks.
+            for s in 0..nsteps {
+                let w = clone_map(cx, spec_steps.data[3 * s + 1], stamp);
+                let x = clone_map(cx, spec_steps.data[3 * s + 2], stamp);
+                let ty = cx.insts[w].ty;
+                let wb = cx.insts[w].block;
+                if is_signed(ty) {
+                    let sign = append(cx, wb, Op::Shr, ty, x, konst(cx, wb, int_bits(ty) - 1, ty),
+                        0);
+                    absv.push(append(cx, wb, Op::Xor, ty, x, sign, 0));
+                } else {
+                    absv.push(x);
+                }
+            }
         }
         // The copies' checks go: each branch to an unreachable exit jumps on.
+        // (0.26.2) But for overflow checks of kind OVK_KEEP.
         for k in 0..u * nb {
             let b = blocks.data[k];
-            if cx.blocks[b].term == Term::Branch {
+            let o = ovf_index(cx, cx.blocks[region.data[k % nb]].cond);
+            if cx.blocks[b].term == Term::Branch
+                && (o < 0 || cx.v_ovfs.data[3 * o + 1] != OVK_KEEP) {
                 let a = cx.blocks[b].s0;
                 let c = cx.blocks[b].s1;
                 let out_a = is_unreachable_exit(cx, l, a) && !is_copy_block(blocks, a);
@@ -427,6 +626,10 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
                     cx.blocks[b].s0 = if out_a { c } else { a };
                     cx.blocks[b].s1 = 0;
                 }
+            } else if cx.blocks[b].term == Term::Branch && speculating {
+                // (a kept overflow check's copy, speculating: to R)
+                cx.blocks[b].s0 = restart;
+                cx.blocks[restart].preds.push(b);
             }
         }
         let hi = region_index(region, h);
@@ -464,6 +667,7 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
         var ok = cmp(cx, c, Cond::Ge, TY_U64, trips, konst(cx, c, u, TY_I64));
         let lastv = append(cx, c, Sub, TY_I64, n, konst(cx, c, 1, TY_I64), 0);
         ok = check_tests(cx, l, c, ok, start, lastv);
+        ok = ovf_tests(cx, l, c, ok, start, lastv);
         ir_terminate(cx, c, Term::Branch, ok, up, sp);
         // UP: the end of the unrolled iterations.
         let mask = konst(cx, up, 0 - u, TY_I64);
@@ -500,6 +704,36 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
             }
         }
         cx.blocks[h0].novec = 1;
+        // (0.26.2) Each copy's bounds of a sum's addends, or'ed: a phi of
+        // the first copy's header from 0, or'ed on in the last copy's latch.
+        var bnext = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..u {
+            for i in 0..np {
+                var acc = 0;
+                for s in 0..nsteps {
+                    if spec_steps.data[3 * s] != i {
+                        continue;
+                    }
+                    let ty = cx.insts[phis.data[i]].ty;
+                    if acc == 0 {
+                        vals.count = 0;
+                        vals.push(0);
+                        vals.push(0);
+                        vals.data[hp] = konst(cx, up, 0, ty);
+                        acc = new_phi_in(cx, h0, ty, &vals, 0, 2);
+                        bnext.push(acc);
+                    }
+                    acc = append(cx, last, Op::Or, ty, acc, absv.data[k * nsteps + s], 0);
+                }
+                if acc != 0 {
+                    ir_set_arg(cx, bnext.data[bnext.count - 1], li, acc);
+                    bnext.push(acc);
+                } else {
+                    bnext.push(0);
+                    bnext.push(0);
+                }
+            }
+        }
         // The last copy's latch.
         let more = cmp(cx, last, Cond::Ne, TY_I64, ivn.data[u - 1], uend);
         cx.blocks[last].term = Term::Branch;
@@ -507,9 +741,15 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
         cx.blocks[last].s0 = h0;
         cx.blocks[last].s1 = ux;
         cx.blocks[ux].preds.push(last);
-        // UX: done, or the rest in the scalar loop.
-        let done = cmp(cx, ux, Cond::Eq, TY_I64, uend, n);
-        ir_terminate(cx, ux, Term::Branch, done, e, sp);
+        // UX: done, or the rest in the scalar loop. (0.26.2) When
+        // speculating, UX2 is that, UX going to R when the sums may overflow.
+        var ux2 = ux;
+        if speculating {
+            ux2 = ir_new_block(cx);
+            cx.blocks[ux2].sealed = 1;
+        }
+        let done = cmp(cx, ux2, Cond::Eq, TY_I64, uend, n);
+        ir_terminate(cx, ux2, Term::Branch, done, e, sp);
         cx.blocks[e].preds.count -= 1;
         // (0.15) The reductions' accumulators combined.
         var comb = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -527,13 +767,43 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
             }
             vals.push(x);
         }
-        add_pred_values(cx, e, ux, &vals, 0);
+        if speculating {
+            var bad = 0;
+            let count = append(cx, ux, Sub, TY_I64, uend, start, 0);
+            for i in 0..np {
+                var nsum = 0;
+                var op = Add;
+                for s in 0..nsteps {
+                    if spec_steps.data[3 * s] == i {
+                        nsum += 1;
+                        op = cx.insts[spec_steps.data[3 * s + 1]].op;
+                    }
+                }
+                if nsum == 0 {
+                    continue;
+                }
+                let ty = cx.insts[phis.data[i]].ty;
+                var all = bnext.data[2 * i + 1];
+                for k in 1..u {
+                    all = append(cx, ux, Op::Or, ty, all, bnext.data[2 * (k * np + i) + 1], 0);
+                }
+                let this = reduction_may_overflow(cx, ux, (op as i64) | (ty << 8), ostart.data[i],
+                    all, count, nsum);
+                bad = if bad == 0 { this } else { append(cx, ux, Op::Or, TY_BOOL, bad, this, 0) };
+            }
+            ir_terminate(cx, ux, Term::Branch, bad, restart, ux2);
+            ir_terminate(cx, restart, Term::Jump, 0, sp, 0);
+        }
+        add_pred_values(cx, e, ux2, &vals, 0);
         // SP: the scalar loop's preheader, from C or UX.
         for i in 0..np {
             vals.count = 0;
             vals.push(ir_val(cx, ir_arg(cx, phis.data[i], hp)));
             vals.push(comb.data[i]);
-            let r = new_phi_in(cx, sp, cx.insts[phis.data[i]].ty, &vals, 0, 2);
+            // (R's: the start again)
+            vals.push(ir_val(cx, ir_arg(cx, phis.data[i], hp)));
+            let r = new_phi_in(cx, sp, cx.insts[phis.data[i]].ty, &vals, 0,
+                if speculating { 3 } else { 2 });
             ir_set_arg(cx, phis.data[i], hp, r);
         }
         ir_terminate(cx, sp, Term::Jump, 0, h, 0);
@@ -553,6 +823,9 @@ fn unroll_runtime(cx: sink *FnCtx, fi: i64, l: i64, u: i64) {
         free(onext.data as *u8);
         free(ostart.data as *u8);
         free(comb.data as *u8);
+        free(spec_steps.data as *u8);
+        free(absv.data as *u8);
+        free(bnext.data as *u8);
     }
 }
 
