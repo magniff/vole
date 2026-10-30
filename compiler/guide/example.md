@@ -57,10 +57,11 @@ fn cut_comment(s: [u8]) -> [u8] {
 ```vole command.vl
 // A line of input as a Command, or the Error that rejects it.
 
-// pub on a struct makes its fields visible with it. Clone: Vec::clone
-// needs it (the derives: Eq, Ord, Hash, Debug, Clone).
+// A field is private to its module unless `pub` (0.26): store.vl reads
+// these. Clone: Vec::clone needs it (the derives: Eq, Ord, Hash, Debug,
+// Clone).
 #[derive(Clone)]
-pub struct Item { name: [u8], count: i64, price: i64 }
+pub struct Item { pub name: [u8], pub count: i64, pub price: i64 }
 
 // Variants carry data, tuple-like or struct-like, as in Rust.
 pub enum Command {

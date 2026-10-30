@@ -214,8 +214,10 @@ an item.
 | `#[thread_local]` | `static var` | one copy per thread | 14 |
 | `#[link(...)]`, `#[link_name = "..."]` | `extern` block, function | which C library to link, and a function's C name | 15 |
 
-You'll also see `#[sealed]` in the standard library's source, which
-marks a trait only the standard library may implement.
+Until 0.26 you could see `#[sealed]` before a struct, which made its
+fields private to its module; every struct's fields are now, so the
+attribute only gets a warning (`volec fix --only obsolete-attr`
+deletes it).
 
 ## The prelude
 

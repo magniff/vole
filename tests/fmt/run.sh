@@ -12,7 +12,8 @@
 #               tests/refactor/, whose text is what they test)
 #   roundtrip   a copy of those directories with every line's
 #               indentation removed (but a string's continuation lines
-#               and, 0.25.3, a text block's),
+#               and, 0.25.3, a text block's; 0.26.0, an embedded
+#               block's, `embed wgsl K {` to its `}`),
 #               formatted: compiler/src and compiler/std come back byte
 #               for byte (the fixpoint), and so does every file of the
 #               rest that has no block comment
@@ -22,6 +23,8 @@
 #               positions and the compiler's path aside); (0.25.5) a
 #               program a file of which changed after the copy was made
 #               is said so (`changed during the run: rerun`), not `differ`
+#   embed_block (0.26.0) an embedded block's bytes, kept by fmt as they
+#               are, the vole around it formatted
 #   same-output the compiler built from the copy's compiler/src: the same
 #               object as the one built from the tree's, and `same-output`
 #               against it: identical
@@ -71,6 +74,16 @@ cd "$ROOT" || exit 2
 rc=$?
 check tree "$([ $rc = 0 ] && echo 1)" "$(cat "$WORK/check.out")"
 
+# embed_block (0.26.0): an embedded block's bytes are kept as they are
+# (its odd indentation, a `}` in a comment, blank lines), the vole around
+# it formatted
+mkdir -p "$WORK/embed"
+printf 'embed wgsl K {\n  @compute   @workgroup_size(1)\n\tfn main() {  // }\n\n      let x=1u;\n  }\n}\nfn  f( ) -> i32 { 1 }\n' >"$WORK/embed/main.vl"
+"$COMPILER" fmt "$WORK/embed/main.vl" >"$WORK/embed/out" 2>&1
+printf 'embed wgsl K {\n  @compute   @workgroup_size(1)\n\tfn main() {  // }\n\n      let x=1u;\n  }\n}\nfn f() -> i32 { 1 }\n' >"$WORK/embed/want"
+check embed_block "$(cmp -s "$WORK/embed/main.vl" "$WORK/embed/want" && echo 1)" \
+    "$(cat "$WORK/embed/out"; diff "$WORK/embed/want" "$WORK/embed/main.vl")"
+
 # roundtrip
 COPY="$WORK/copy"
 mkdir -p "$COPY"
@@ -85,7 +98,13 @@ while IFS= read -r f; do
     # (0.25.3: a text block's lines, its closing line included, as they
     # are: their indentation is part of the value)
     # (a raw block's closing """ has as many #s as its r, kept in h)
-    awk 'inb { print; if (match($0, /^[ \t]*"""/) && substr($0, RSTART + RLENGTH, length(h)) == h) inb = 0; next }
+    # (0.26.0: an embedded block's lines, `embed wgsl K {` to its `}`, as
+    # they are: fmt keeps them; d counts its braces outside `//` comments)
+    awk 'function braces(l,  t) { t = l; sub(/\/\/.*/, "", t); return gsub(/\{/, "{", t) - gsub(/\}/, "}", t) }
+        ine { print; d += braces($0); if (d <= 0) ine = 0; next }
+        /^[ \t]*(pub[ \t]+)?embed[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{/ && !inb && !cont {
+            print; d = braces($0); if (d > 0) ine = 1; next }
+        inb { print; if (match($0, /^[ \t]*"""/) && substr($0, RSTART + RLENGTH, length(h)) == h) inb = 0; next }
         { if (!cont) sub(/^[ \t]+/, ""); print; cont = /\\$/
           if ($0 ~ /(^|[^"])"""[ \t]*\r?$/) { inb = 1; h = ""; if (match($0, /#+"""[ \t]*\r?$/)) { h = substr($0, RSTART, RLENGTH); sub(/".*/, "", h) } } }' \
         "$f" >"$COPY/$f"

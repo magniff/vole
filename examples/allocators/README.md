@@ -10,7 +10,7 @@ freed all at once, or in a fixed buffer with no heap at all.
 
 | example | the program | what it shows |
 |---|---|---|
-| [gpa-from-main](gpa-from-main/) | order totals from stdin | `fn main(gpa: Gpa)`, passing it down, a container's own allocator, generic `A: Allocator`; the errors when you forget, `fix --only alloc016`, `refactor signature --fill-calls`; `#[sealed]` `Gpa` |
+| [gpa-from-main](gpa-from-main/) | order totals from stdin | `fn main(gpa: Gpa)`, passing it down, a container's own allocator, generic `A: Allocator`; the errors when you forget, `fix --only alloc016`, `refactor signature --fill-calls`; `Gpa`'s private field |
 | [arena-parser](arena-parser/) | an S-expression tokenizer and parser | a tree built in an arena (`arena_scope`, `Arena::scope`) and freed at once, timed against `Gpa`; arena-friendly allocation; what an allocator handle costs |
 | [scoped-arena](scoped-arena/) | a key-value store, a request per line | per-request scratch memory with `arena_scope`; what outlives a request; the compile errors when a value escapes its scope; the view that still can |
 | [fixed-buffer](fixed-buffer/) | a reverse-Polish calculator in 512 bytes | `fn main()` with no `Gpa`, `FixedBuf` over a stack array, `try_push` and `AllocError`, `#[effects(alloc(FixedBuf), panic)]` |

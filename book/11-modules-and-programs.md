@@ -223,9 +223,13 @@ Private is the default because most of a module is its own business.
 What's `pub` is what other modules may rely on; everything else you can
 change without reading the rest of the program.
 
-A struct's fields are as visible as the struct: a `pub struct` can be
-built and read field by field wherever it can be named. Methods are
-visible wherever their type is.
+A struct's fields are private the same way: a field not marked `pub`
+is seen only by the struct's module and the modules inside it. Another
+module reads `r.w` only when the field is `pub w: i64`, and builds the
+struct with a literal only when every field is `pub`; otherwise it
+calls a function of the struct's module (`Rect::new(3, 4)`), which keeps
+the fields meaning what they should. Methods are visible wherever their
+type is. (Until 0.26 every field was as visible as its struct.)
 
 ## Paths and use
 

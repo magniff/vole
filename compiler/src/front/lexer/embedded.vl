@@ -1,0 +1,199 @@
+// Embedded blocks (0.26.0): `embed wgsl NAME { WGSL }`. Vole's lexer
+// cannot lex another language's text (WGSL's `1u`, `2.0f`, its nested
+// comments), so when it adds the `{` of `embed LANG NAME {` it hands the
+// body to that language's rule for its end: a WGSL body ends at the `}`
+// that matches outside `//` and nested `/* */` comments (WGSL has no
+// string or character literals). The body is one Tok::Embedded token
+// (its bytes, no string id); lexing resumes at the closing `}`. The
+// parser (front::parser::items) makes the item, front::embed its meaning.
+
+use crate::base::{FILES, SRC, SRC_BUF, buf_bytes, buf_int, buf_new, buf_slice, intern_c};
+use crate::base::comp::Comp;
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fmt, err_help, err_jump};
+use crate::front::contracts::sites::file_of_pos;
+use crate::front::lexer::{LEX_END, LEX_FIRST, TOKS, TOK_COUNT, Tok, Token, add_token};
+
+// The symbol `embed` (0: not interned yet).
+static var SYM_EMBED: i64 = 0;
+
+// Whether the `{` just added (the last token) opens an embedded block: the
+// three tokens before it are `embed`, an identifier and an identifier, in
+// the same file (TOKS holds every file: a file ending in `embed wgsl` and
+// the next starting `K {` are not one block).
+pub fn at_embedded_open() -> bool {
+    let n = TOK_COUNT - 1;
+    if n - 3 < LEX_FIRST || tok(n - 3).kind != Tok::Ident || tok(n - 2).kind != Tok::Ident
+        || tok(n - 1).kind != Tok::Ident {
+        return false;
+    }
+    if SYM_EMBED == 0 {
+        SYM_EMBED = intern_c(c"embed");
+    }
+    tok(n - 3).value as i64 == SYM_EMBED
+        && (!program_text() || file_of_pos(tok(n - 3).start) == file_of_pos(tok(n).start))
+}
+
+// Token i of TOKS, for i in LEX_FIRST..TOK_COUNT.
+fn tok(i: i64) -> Token {
+    // UNSAFE: TOKS is the lexer's raw token array (a pointer, grown by add_token).
+    // SAFETY: the callers pass LEX_FIRST <= i < TOK_COUNT, tokens add_token wrote.
+    unsafe { TOKS[i] }
+}
+
+// Whether SRC is the program's files, FILES' text (fmt and rewrite lex a
+// text of their own, one file).
+fn program_text() -> bool {
+    FILES.len() > 0 && SRC.ptr == buf_slice(SRC_BUF).ptr
+}
+
+// The end of the text the block at `open` may take: its file's end, or
+// the lexed range's.
+fn text_end(open: i64) -> i64 {
+    if !program_text() {
+        return LEX_END;
+    }
+    let f = FILES[file_of_pos(open)].end;
+    if f < LEX_END { f } else { LEX_END }
+}
+
+// The body of the block whose `{` is at `open`, as one Tok::Embedded token
+// (open + 1 .. its `}`): the position of that `}`, where lexing resumes. No
+// matching `}` is embed.unterminated, fatal.
+pub fn lex_embedded(open: i64) -> i64 {
+    let end = text_end(open);
+    let close = embed_block_end(SRC[0..end], open);
+    if close < 0 {
+        unterminated(open, -close - 1);
+    }
+    add_token(Tok::Embedded, open + 1, close, 0, 0, true);
+    close
+}
+
+// The `}` matching the `{` at src[open], outside `//` comments and nested
+// `/* */` comments (WGSL's rules, std::gpu::wgsl::lex); -1 - the position
+// of the innermost `{` left open when there is none.
+pub fn embed_block_end(src: [u8], open: i64) -> i64 {
+    var depth = 0;
+    var p = open;
+    while p < src.len {
+        let c = src[p];
+        if c == '/' && p + 1 < src.len && (src[p + 1] == '/' || src[p + 1] == '*') {
+            p = comment_end(src, p);
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return p;
+            }
+        }
+        p += 1;
+    }
+    -1 - innermost_open(src, open)
+}
+
+// The innermost `{` left open at the end of src, from the `{` at `open`
+// (none closes it).
+fn innermost_open(src: [u8], open: i64) -> i64 {
+    var opens: Vec<i64, Comp> = Vec::new_in(Comp {});
+    var p = open;
+    while p < src.len {
+        let c = src[p];
+        if c == '/' && p + 1 < src.len && (src[p + 1] == '/' || src[p + 1] == '*') {
+            p = comment_end(src, p);
+            continue;
+        }
+        if c == '{' {
+            opens.push(p);
+        } else if c == '}' && opens.len() > 0 {
+            opens.pop();
+        }
+        p += 1;
+    }
+    if opens.len() == 0 { open } else { opens[opens.len() - 1] }
+}
+
+// The position after the comment at src[p0]: a `//` comment to its line's
+// end, a `/* */` one (they nest) past its `*/`, or the text's end when it
+// is not closed.
+pub fn comment_end(src: [u8], p0: i64) -> i64 {
+    var p = p0 + 2;
+    if src[p0 + 1] == '/' {
+        while p < src.len && src[p] != '\n' {
+            p += 1;
+        }
+        return p;
+    }
+    var depth = 1;
+    while p < src.len {
+        if src[p] == '/' && p + 1 < src.len && src[p + 1] == '*' {
+            depth += 1;
+            p += 2;
+        } else if src[p] == '*' && p + 1 < src.len && src[p + 1] == '/' {
+            depth -= 1;
+            p += 2;
+            if depth == 0 {
+                return p;
+            }
+        } else {
+            p += 1;
+        }
+    }
+    p
+}
+
+// (query grep) Whether byte `at` of an embedded block's text is in one
+// of its comments (WGSL's: `//` to the line's end, nested `/* */`).
+pub fn in_embedded_comment(text: [u8], at: i64) -> bool {
+    var p = 0;
+    while p < text.len && p <= at {
+        if text[p] == '/' && p + 1 < text.len && (text[p + 1] == '/' || text[p + 1] == '*') {
+            let e = comment_end(text, p);
+            if at < e {
+                return true;
+            }
+            p = e;
+            continue;
+        }
+        p += 1;
+    }
+    false
+}
+
+// embed.unterminated at the `{` at `open`; `inner` is the innermost `{`
+// left open (the block's own or one in its text).
+fn unterminated(open: i64, inner: i64) -> ! {
+    let saved = ERR_KIND;
+    ERR_KIND = c"embed.unterminated";
+    err_begin(open);
+    let m = buf_new();
+    buf_bytes(m, "unterminated embedded block: no '}' closes this '{'");
+    if inner != open {
+        buf_bytes(m, " (the '{' at line ");
+        buf_int(m, line_of(inner));
+        buf_bytes(m, " is the last left open)");
+    }
+    err_fmt(buf_slice(m));
+    err_help(
+        c"a block's text ends at the '}' that matches its '{', outside '//' and '/* */' comments");
+    err_end_soft();
+    ERR_KIND = saved;
+    err_jump()
+}
+
+// The 1-based line of position pos in its file.
+fn line_of(pos: i64) -> i64 {
+    var start = 0;
+    if program_text() {
+        start = FILES[file_of_pos(pos)].start;
+    }
+    var line = 1;
+    for i in start..pos {
+        if SRC[i] == '\n' {
+            line += 1;
+        }
+    }
+    line
+}

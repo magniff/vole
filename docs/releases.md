@@ -81,6 +81,65 @@ IR at `check`, struct fields private unless `pub`, and shaders as
 `embed wgsl` blocks. Built and tested on aarch64-macos only; Linux is
 untested in this release.
 
+Shaders as embedded blocks (embedwgsl260; grammar.md, "Embedded blocks";
+`guide gpu#shaders-as-embedded-blocks`):
+
+- `embed wgsl NAME { WGSL }` and `embed wgsl NAME from "x.wgsl";`, an
+  item: an immutable static whose fields are `src`, the text, and one
+  per entry point holding its name (`dev.shader_wgsl(K.src)?`,
+  `compute_pipeline(s, K.step)`). `embed`, `wgsl` and `from` stay
+  identifiers. The lexer hands the text to WGSL's rule (the `}` that
+  matches outside comments): `1u`, `@` attributes and nested comments
+  are no vole errors.
+- `volec check`, the LSP and every checked edit run the text through
+  std::gpu::wgsl's front end: its first error at its `.vl` position
+  (`error[wgsl.type]`), in the file form at the `from` string with the
+  file's `x.wgsl:L:C:`. `K.stpe` is `gpu.entry`, listing the block's
+  entry points, the nearest as `fix --suggested`'s fix.
+- `gpu.*` (11) and `wgsl.*` (21) are codes with `volec explain` entries;
+  wgslc's own table is gone. New codes: `gpu.entry`, `embed.language`,
+  `embed.unterminated`, `embed.name`.
+- The tools: fmt keeps a block's lines as they are; `query grep`
+  classifies its text by WGSL's rules; `query show K`, `edit patch K`,
+  `query refs K.step` (the WGSL `fn step`); the LSP's go to definition
+  (the `from` file, `K.step`), document symbols and diagnostics. VS
+  Code: a WGSL grammar, injected into blocks. The 6 `include_str` of
+  `.wgsl` files in examples are blocks' file form.
+- Cost: `compile_cost`'s `check` 1.00x the base; compiler/src itself
+  grows by the WGSL front it now checks (one compiler on both sources:
+  4,693M to 5,373M instructions, 308 to 332 ms).
+
+Private fields (privfields260, plan §1 k):
+
+- Breaking: a struct's fields are private to the module that declares
+  it (and the modules inside it) unless marked `pub`, Rust's rule.
+  Outside, a read, a write or a borrow of a private field is
+  `error[field.private]`, and a struct literal that names one is
+  `error[field.literal-private]`; a struct with no fields has its
+  literal anywhere, enum variants' fields stay public, and what the
+  compiler writes itself (main's `Gpa {}`, structural `==`, derives,
+  closures, f-strings) is let through. std's modules are modules like
+  any (0.20's exception, std as one module, is gone). On a program's own
+  field the help is its declaration with `pub`, and `volec fix --only
+  pub` (or `--suggested`) writes the `pub`s; `v.len` on a `Vec` still
+  reads as `v.len()`. `volec explain field.private`,
+  `field.literal-private`.
+- `#[sealed]` is that rule, so it changes nothing: `warning[attr.obsolete]`,
+  and `volec fix --only obsolete-attr` deletes it. std has none left;
+  `Gpa` holds a private zero-sized field (`_private: ()`: still size 0,
+  a `Vec` on it three words), so no program writes `Gpa {}`.
+- The migration, `pub` on the fields read across modules: 165 in
+  std::gpu::wgsl, 47 in the rest of std (std::sys's C structs,
+  `SendError.value`), 286 in compiler/src, 63 in the examples, 6 in
+  tests/. std's `Atomic { v: 0 }` and
+  `RawLock { .. }` statics are `AtomicU64::new(0)` and `RawLock::new()`
+  (constant calls), and so must a program's be (`static N: AtomicI64 =
+  AtomicI64::new(0)`). std::gpu::wgsl's `pub` fields are provisional:
+  0.26.2's `pub(crate)` may narrow them. `pub(crate)`, `pub(super)` and
+  `pub(in path)` come in 0.26.2.
+
+The places IR (placesir260):
+
 - **The places IR, behind `--places`** (compiler/src/places,
   [design/places-ir.md](design/places-ir.md)): every checked body as
   typed locals, places with projections, temporaries, borrows and storage

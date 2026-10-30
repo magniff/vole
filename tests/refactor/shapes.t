@@ -173,7 +173,8 @@ $ undo
 undid added parameter scale: i64 to crate::geom::area, 2 calls	2 files	+2 -2 lines
 % git status --short
 ## --- field ---
-$ refactor field Point --add 'z: i64 = 0' --dry-run
+## (0.26: a field main's literal names is `pub`, or the literal breaks)
+$ refactor field Point --add 'pub z: i64 = 0' --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -12 +12 @@
@@ -182,7 +183,7 @@ $ refactor field Point --add 'z: i64 = 0' --dry-run
 --- a/geom.vl
 +++ b/geom.vl
 @@ -6,0 +7 @@
-+    z: i64,
++    pub z: i64,
 @@ -13 +14 @@
 -    Point { x: 0, y: 0 }
 +    Point { x: 0, y: 0, z: 0 }

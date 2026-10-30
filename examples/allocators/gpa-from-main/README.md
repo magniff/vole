@@ -196,9 +196,9 @@ $ volec count.vl -o count && ./count
 ok: built count
 ```
 
-Nor can a `Gpa` be made, or kept in a static: `Gpa` is `#[sealed]`, so
-only std makes one (the one `main` gets), and no constant expression
-does.
+Nor can a `Gpa` be made, or kept in a static: `Gpa`'s one field is
+private to std, so only std makes one (the one `main` gets), and no
+constant expression does.
 
 ```console
 $ cat > forge.vl <<'EOF'
@@ -210,8 +210,8 @@ $ cat > forge.vl <<'EOF'
 > }
 > EOF
 $ volec check forge.vl
-forge.vl:1:42: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
-forge.vl:4:16: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:1:42: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:4:16: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 [exit 1]
 ```
 

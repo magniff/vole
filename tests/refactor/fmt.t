@@ -53,7 +53,7 @@ fn main() -> i32 {
     0
 }
 % cat util.vl
-pub struct Pair<T> { first: T, second: T }
+pub struct Pair<T> { pub first: T, pub second: T }
 pub enum Kind { Small, Large(i64) }
 
 pub fn twice(n: i64) -> i64 { n * 2 }
@@ -101,7 +101,7 @@ formatted	2 files	+18 -13 lines
 $ edit replace sum < $T/inputs/fmt_helper.vl
 replaced crate::util::sum	util.vl	+1 -0 lines
 % cat util.vl
-pub struct Pair<T> { first: T, second: T }
+pub struct Pair<T> { pub first: T, pub second: T }
 pub enum Kind { Small, Large(i64) }
 
 pub fn twice(n: i64) -> i64 { n * 2 }
