@@ -210,12 +210,15 @@ code generators' agent (0.26.1) sees what moved.
 
 - 0.26.2 (contract conditions in the IR): a requires', ensures' or
   invariant's check is built as a branch per conjunct of its condition
-  (`lower_contract`, the form entry facts read) and, on each failing path,
-  the values its report shows and `intrinsic contract_check(SITE,
-  VALUE..)` (IK_CONTRACT, e the conjunct), then unreachable: a code
-  generator lowers the failure from the operands and check_message, with
-  nothing of the condition left to lower from the AST. An assert's check
-  is as before (e 0, ops[0] its condition's value).
+  (`lower_contract`, the form entry facts read); an assert's (whose
+  condition may change state) as one branch on its condition, evaluated
+  once, and on its failing path a branch per conjunct but the last,
+  evaluated again to find the one that failed. Each conjunct's failing
+  path makes the values its report shows, then `intrinsic
+  contract_check(false, SITE, VALUE..)` (IK_CONTRACT, e the conjunct),
+  then unreachable: a code generator can lower the failure from the
+  operands and check_message, with nothing of the condition left to lower
+  from the AST.
 
 ## `--places-diff`: the differences left
 
