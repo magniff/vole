@@ -134,6 +134,17 @@ final design would:
   the lanes and tested at the loop's exit);
 - the checks split blocks, which costs loop rotation (extra jumps).
 
+## Step 3 (usize and isize)
+
+Done in commit a2b2574d. The point of risk was code generation: ir_type
+maps the two types to u64 and i64, and gen0 already decides by is_signed
+and int_bits, so 36 explicit TY_U64/TY_I64 comparisons needed only three
+fixes. The surprises were std's core budget (163840 bytes): the new impls
+went into a lazy section of their own, with a `3usize` literal counted as
+naming it. The `guide std` budget went to 22000 bytes. The hook's tools
+binary still treats usize as u64, so until it is refreshed it reports 24
+"conflicting impls" errors on the new std.
+
 ## What worked
 
 - `volec query context` and `edit patch` on unfamiliar back-end code.
