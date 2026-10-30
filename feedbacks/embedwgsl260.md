@@ -1,7 +1,7 @@
 # Feedback: embedwgsl260, `embed wgsl` blocks and gpu.*/wgsl.* codes
 
-2026-10-30, release 0.26.0; steps 1-3 of 7 merged on the branch (codes, syntax, the item), step 4
-(check-time WGSL) on the side branch embedwgsl260-check; stopped at step 4's cost bar.
+2026-10-30, release 0.26.0; all 7 steps. Stopped once at step 4's cost bar; the integrator ruled
+that the budget is compile_cost's two-compilers ratio (1.00x), the source growth reported apart.
 
 ## Verdict
 
@@ -12,6 +12,9 @@ instructions (1.145x of the base; the share is 1.025x, +117M). The brief's assum
 `reflect`'s reach into msl was wrong: the path never calls reflect, and `new_front` alone (the lexer
 and Front's types) is +380M. Level-1 `contract.violated` does not exist in the compiler (only its
 explain entry and a constant), so "make it carry gpu.X" had nothing to attach to.
+
+Afterwards: a fluid2d-shaped program (12 blocks, 935 WGSL lines) checks in 69.5M instructions
+against 54.3M with the same text as string constants.
 
 ## What worked
 
@@ -38,14 +41,16 @@ explain entry and a constant), so "make it carry gpu.X" had nothing to attach to
 
 ## Fix list, in order
 
-1. [tool:compile_cost] a mode that measures a source change: one compiler, the base's and the
+1. [tool:query] `name_position` looks for a definition's name in the next 24 tokens: a definition
+   whose name is no token (a block's field, at its WGSL `fn`) took a later use's position.
+2. [tool:compile_cost] a mode that measures a source change: one compiler, the base's and the
    head's compiler/src (`-s BASE_REV`), so a share of the budget can be read off directly.
-2. [diag] Level-1 `contract.violated` (a requires false for constant arguments) is still to be built;
+3. [diag] Level-1 `contract.violated` (a requires false for constant arguments) is still to be built;
    explain lists it as if it existed.
-3. [build] check-time WGSL needs a cheaper home: std::gpu::wgsl's front checked once (a separately
+4. [build] check-time WGSL needs a cheaper home: std::gpu::wgsl's front checked once (a separately
    compiled helper the compiler runs, or a cached check of std modules compiler/src does not
    change), else its 680M lands on every self-check.
-4. [tool:query] `query refs CONTRACT_VIOLATED` shows the definition only; a "nothing uses this"
+5. [tool:query] `query refs CONTRACT_VIOLATED` shows the definition only; a "nothing uses this"
    note would have answered faster.
-5. [test] tests/gpu uses `// NEEDS: metal`, tests/run `// REQUIRES: metal`; the brief named the
+6. [test] tests/gpu uses `// NEEDS: metal`, tests/run `// REQUIRES: metal`; the brief named the
    second for a tests/gpu case.
