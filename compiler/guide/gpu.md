@@ -23,19 +23,19 @@ use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, RawSurface, RenderDesc};
 use std::window::{App, Event, WindowDesc};
 
-const STEP: [u8] = """
+embed wgsl STEP {
     @group(0) @binding(0) var<storage, read_write> v: array<f32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         v[id.x] += 0.01;
     }
-    """;
-const DRAW: [u8] = """
+}
+embed wgsl DRAW {
     @group(0) @binding(0) var<storage, read> v: array<f32>;
     @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
         return vec4<f32>(select(-1.0, 3.0, i == 1u), select(-1.0, 3.0, i == 2u), 0.0, 1.0);
     }
     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(fract(v[0]), 0.3, 0.5, 1.0); }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     var app = match App::new_in(gpa) {
@@ -52,9 +52,9 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let px = win.size();
     surf.configure(dev, px.w, px.h); // Format::Bgra8Unorm, vsync
     let cells = dev.buffer(64 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
-    let step = dev.compute_pipeline(dev.shader_wgsl(STEP)?, "main")?;
-    let draw_shader = dev.shader_wgsl(DRAW)?;
-    let draw = dev.render_pipeline(RenderDesc::new(draw_shader, "vs", "fs", Format::Bgra8Unorm))?;
+    let step = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
+    let draw_shader = dev.shader_wgsl(DRAW.src)?;
+    let draw = dev.render_pipeline(RenderDesc::new(draw_shader, DRAW.vs, DRAW.fs, Format::Bgra8Unorm))?;
     let sgroup = dev.bind_group(step.bind_layout(0), [gpu::bind(0, cells)][..]);
     let dgroup = dev.bind_group(draw.bind_layout(0), [gpu::bind(0, cells)][..]);
     var frames = 0;
@@ -151,12 +151,12 @@ copy (`volec query own FILE:LINE:COL` says it of each local):
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const ADD: [u8] = """
+embed wgsl ADD {
     @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         xs[id.x] += 1u;
     }
-    """;
+}
 
 // The program's handles, with one owner.
 struct Gpu {
@@ -169,7 +169,7 @@ struct Gpu {
 
 impl Gpu {
     fn new(dev: sink gpu::Device, queue: sink gpu::Queue, gpa: Gpa) -> Result<Gpu, gpu::Error> {
-        let pipe = dev.compute_pipeline(dev.shader_wgsl(ADD)?, "main")?;
+        let pipe = dev.compute_pipeline(dev.shader_wgsl(ADD.src)?, ADD.main)?;
         var bufs: Vec<gpu::Buffer> = Vec::new_in(gpa);
         for _ in 0..2 {
             bufs.push(dev.buffer(64 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC));
@@ -317,18 +317,18 @@ bound there.
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const SQUARE: [u8] = r"""
+embed wgsl SQUARE {
     @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         xs[id.x] = xs[id.x] * xs[id.x];
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(SQUARE)?;
-    let pipe = dev.compute_pipeline(shader, "main")?;
+    let shader = dev.shader_wgsl(SQUARE.src)?;
+    let pipe = dev.compute_pipeline(shader, SQUARE.main)?;
     var xs: Vec<u32> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
     let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
@@ -380,27 +380,27 @@ What runs after what, as std's Metal backend runs it:
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const FILL: [u8] = """
+embed wgsl FILL {
     @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         xs[id.x] = id.x * id.x;
     }
-    """;
+}
 
 // reads what other workgroups of FILL wrote
-const REVERSE: [u8] = """
+embed wgsl REVERSE {
     @group(0) @binding(0) var<storage, read> xs: array<u32>;
     @group(0) @binding(1) var<storage, read_write> ys: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         ys[id.x] = xs[255u - id.x];
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let fill = dev.compute_pipeline(dev.shader_wgsl(FILL)?, "main")?;
-    let reverse = dev.compute_pipeline(dev.shader_wgsl(REVERSE)?, "main")?;
+    let fill = dev.compute_pipeline(dev.shader_wgsl(FILL.src)?, FILL.main)?;
+    let reverse = dev.compute_pipeline(dev.shader_wgsl(REVERSE.src)?, REVERSE.main)?;
     let xs = dev.buffer(256 * 4, BufferUsage::STORAGE);
     let ys = dev.buffer(256 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
     let fgroup = dev.bind_group(fill.bind_layout(0), [gpu::bind(0, xs)][..]);
@@ -524,7 +524,9 @@ main.vl:135:17: gpu.layout: the layout has 2 bindings, 0 and 3, and binding 1 of
 (0.26.0) Write a shader as a block, `embed wgsl NAME { WGSL }`, or read
 it from a file beside the source, `embed wgsl NAME from "x.wgsl";`.
 `volec check` (the LSP, every checked edit) checks its WGSL and reports
-an error at its line in the `.vl` file. `NAME` is a static: `NAME.src`
+an error at its line in the `.vl` file (0.26.2: in a block's `.wgsl`
+file, at `x.wgsl:L:C`, which the LSP and `query grep` know as a file of
+the program). `NAME` is a static: `NAME.src`
 is the text, for `dev.shader_wgsl(NAME.src)?`, and each entry point is a
 field holding its name, for `dev.compute_pipeline(shader, NAME.step)`; a
 name the block has no entry point for is `gpu.entry`, listing the ones
@@ -582,21 +584,44 @@ and the kernel. The reasons:
   bindings (the next example's clear binds one buffer, the deposit
   two).
 
-The helper the examples use: a compute pipeline from the module made of
-`parts` (a shared prefix and one kernel), its entry point `main`.
+(0.26.2) The shared prefix is a part: a block named in another's
+`with`, `embed wgsl K with COMMON { .. }`. K's module is the text of its
+parts, in the order named (a part's own parts first, each once), then
+its own; `K.src` is that text and K's fields are its entry points. A
+part is checked only inside the blocks that use it (its names may be
+theirs), and has no `src` or entry points of its own
+(`embed.part_use`). Two parts of one module at one binding are
+`wgsl.binding`, naming both.
 
 ```vole
-use std::gpu;
+embed wgsl COMMON {
+    @group(0) @binding(0) var<storage, read_write> cells: array<u32>;
+    fn bump(i: u32) { cells[i] = cells[i] + 1u; }
+}
 
-fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
-    var src = Buf::new_in(gpa);
-    for p in parts {
-        src.push_str(p);
-    }
-    let shader = dev.shader_wgsl(src.as_slice())?;
-    dev.compute_pipeline(shader, "main")
+embed wgsl ONE with COMMON {
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) { bump(id.x); }
+}
+
+embed wgsl TWO with COMMON {
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) { bump(id.x); bump(id.x); }
+}
+
+fn main() {
+    // one module each, the prefix in both: dev.shader_wgsl(ONE.src)?, ONE.main
+    println(f"{ONE.main} {TWO.main} {ONE.src.len() > TWO.src.len()}");
 }
 ```
+```out
+main main false
+```
+
+A `with` names a block by its path from the block's module (`A`,
+`shaders::A`, `crate::`, `super::`); also a `const` of a literal
+number or a `#[repr(wgsl)]` struct, which the compiler writes into the
+module as WGSL (`gpu#shared-constants-and-structs`).
 
 ## Index buffers, instancing, indirect draws
 
@@ -610,18 +635,18 @@ or a vertex buffer of `StepMode::Instance`).
 use std::gpu;
 use std::gpu::{BufferUsage, Format, IndexFormat, PassDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const QUAD: [u8] = r"""
+embed wgsl QUAD {
     @vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {
         return vec4<f32>(p, 0.0, 1.0);
     }
     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(QUAD)?;
-    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm);
+    let shader = dev.shader_wgsl(QUAD.src)?;
+    var desc = gpu::RenderDesc::new(shader, QUAD.vs, QUAD.fs, Format::Rgba8Unorm);
     var layout = VertexLayout::new(8); // a vec2<f32> per vertex
     layout.attribute(0, VertexFormat::Float32x2, 0); // @location(0) at offset 0
     desc.vertex_buffer(layout);
@@ -684,6 +709,15 @@ kernel read zeros: a guard on `u.n` wrote nothing, silently):
 main.vl:52:5: gpu.unwritten: binding 0 of group 0 (a uniform buffer of 256 bytes) was never written: write it (queue.write_buffer) before submitting the first dispatch or draw that reads it ...
 ```
 
+(0.26.2) `volec check` warns before the run (`gpu.unwritten`, a warning)
+when a buffer the function makes is bound at a uniform binding and
+nothing in that function writes it, passes it to a function or stores
+it. In the same function it also reports a bind group entry the
+shader's group does not have, or of another kind (`gpu.layout`), a
+buffer of a constant usage used without its flag (`gpu.usage`, its
+`try:` the edit), and an entry point named by a string the block has
+not (`gpu.entry`).
+
 For the other bindings, a readback after the first step shows what a
 kernel saw (a storage buffer written from the uniform's fields, copied
 into a `MAP_READ` one), and `dev.buffer_init` gives a buffer its bytes
@@ -699,20 +733,20 @@ use std::gpu;
 use std::gpu::BufferUsage;
 
 // a: offset 0 (vec3 aligns to 16), b: 12 (in a's padding), c: 16, d: 32
-const SHADER: [u8] = r"""
+embed wgsl SHADER {
     struct U { a: vec3<f32>, b: f32, c: vec2<f32>, d: vec4<f32> }
     @group(0) @binding(0) var<uniform> u: U;
     @group(0) @binding(1) var<storage, read_write> out: array<f32>;
     @compute @workgroup_size(1) fn main() {
         out[0] = u.a.z; out[1] = u.b; out[2] = u.c.y; out[3] = u.d.w;
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(SHADER)?;
-    let pipe = dev.compute_pipeline(shader, "main")?;
+    let shader = dev.shader_wgsl(SHADER.src)?;
+    let pipe = dev.compute_pipeline(shader, SHADER.main)?;
     // the struct as WGSL lays it out: 48 bytes, 12 f32s
     let u: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 7.0, 8.0, 9.0, 10.0];
     let ubuf = dev.buffer_init(gpu::bytes_of_f32(u[..]), BufferUsage::UNIFORM);
@@ -735,6 +769,51 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
 ```out
 3 4 6 10
 ```
+
+## Shared constants and structs
+
+(0.26.2) A struct with `#[repr(wgsl)]` has WGSL's layout (the table
+above: a `[f32; 3]` is a `vec3<f32>`, at 16 and 12 bytes long; a field
+after it fills its last 4), so its bytes are the uniform's. A block
+that names it in `with` gets its WGSL `struct`, written by the
+compiler (nested structs first, once each); a `const` of a literal
+number, bool or array in `with` becomes WGSL's `const`. One definition
+serves the host and the shader; a field WGSL cannot share (a `bool`, a
+`usize`, a pointer) is `gpu.repr`.
+
+```vole
+#[repr(wgsl)]
+struct Params {
+    origin: [f32; 3],
+    scale: f32,
+    size: [u32; 2],
+    pad: [u32; 2], // to its size, 32: no byte of padding
+}
+
+const STEPS: u32 = 4;
+
+embed wgsl SIM with Params, STEPS {
+    @group(0) @binding(0) var<uniform> p: Params;
+    @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(1) fn main() {
+        out[0] = p.origin.z * p.scale * f32(STEPS);
+    }
+}
+
+fn main() {
+    println(f"{size_of(Params)} {align_of(Params)}");
+    println(SIM.src.len() > 0);
+}
+```
+```out
+32 16
+true
+```
+
+The bytes for `queue.write_buffer` come from the struct's memory; std
+has no safe view of a struct's bytes yet, so it is an `unsafe` slice of
+`size_of(Params)` bytes from `&p`, sound when the struct has no padding
+(no uninitialized byte), as here (examples/gpu/fluid2d's `set_params`).
 
 ## Workgroups
 
@@ -800,36 +879,29 @@ before the next deposit; the CPU reads the buffer as plain `u32`s.
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const BINS: [u8] = "@group(0) @binding(0) var<storage, read_write> bins: array<atomic<u32>>;\n";
+embed wgsl BINS {
+    @group(0) @binding(0) var<storage, read_write> bins: array<atomic<u32>>;
+}
 
-const DEPOSIT: [u8] = r"""
+embed wgsl DEPOSIT with BINS {
     @group(0) @binding(1) var<storage, read> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (id.x >= 256u) { return; }
         atomicAdd(&bins[xs[id.x] % 4u], 1u);
     }
-    """;
+}
 
-const CLEAR: [u8] = r"""
+embed wgsl CLEAR with BINS {
     @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicStore(&bins[id.x], 0u);
     }
-    """;
-
-fn kernel(dev: gpu::Device, parts: [[u8]], gpa: Gpa) -> Result<gpu::ComputePipeline, gpu::Error> {
-    var src = Buf::new_in(gpa);
-    for p in parts {
-        src.push_str(p);
-    }
-    let shader = dev.shader_wgsl(src.as_slice())?;
-    dev.compute_pipeline(shader, "main")
 }
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let deposit = kernel(dev, [BINS, DEPOSIT][..], gpa)?;
-    let clear = kernel(dev, [BINS, CLEAR][..], gpa)?;
+    let deposit = dev.compute_pipeline(dev.shader_wgsl(DEPOSIT.src)?, DEPOSIT.main)?;
+    let clear = dev.compute_pipeline(dev.shader_wgsl(CLEAR.src)?, CLEAR.main)?;
     var xs: Vec<u32> = Vec::new_in(gpa);
     for i in 0..256 { xs.push(i as u32); }
     let xb = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
@@ -912,7 +984,7 @@ const N: i64 = 256;
 const STEPS: i64 = 25;
 
 // next[i] = (cur[i - 1] + cur[i] + cur[i + 1]) % 251, on a ring of N
-const BLUR: [u8] = """
+embed wgsl BLUR {
     @group(0) @binding(0) var<storage, read> cur: array<u32>;
     @group(0) @binding(1) var<storage, read_write> next: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -921,12 +993,12 @@ const BLUR: [u8] = """
         if (i >= n) { return; }
         next[i] = (cur[(i + n - 1u) % n] + cur[i] + cur[(i + 1u) % n]) % 251u;
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let pipe = dev.compute_pipeline(dev.shader_wgsl(BLUR)?, "main")?;
+    let pipe = dev.compute_pipeline(dev.shader_wgsl(BLUR.src)?, BLUR.main)?;
     var start: Vec<u32> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
     let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
@@ -993,7 +1065,7 @@ const N: i64 = 64;
 const STEPS: i64 = 10;
 
 // next[i] = (cur[i - 1] + cur[i + 1] + params[step]) % 251; ctl[0] is the step
-const STEP: [u8] = """
+embed wgsl STEP {
     @group(0) @binding(0) var<storage, read> ctl: array<u32>;
     @group(0) @binding(1) var<storage, read> params: array<u32>;
     @group(0) @binding(2) var<storage, read> cur: array<u32>;
@@ -1004,19 +1076,19 @@ const STEP: [u8] = """
         if (i >= n) { return; }
         next[i] = (cur[(i + n - 1u) % n] + cur[(i + 1u) % n] + params[ctl[0]]) % 251u;
     }
-    """;
+}
 
 // one invocation: the next step's number
-const TICK: [u8] = """
+embed wgsl TICK {
     @group(0) @binding(0) var<storage, read_write> ctl: array<u32>;
     @compute @workgroup_size(1) fn main() { ctl[0] += 1u; }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let step = dev.compute_pipeline(dev.shader_wgsl(STEP)?, "main")?;
-    let tick = dev.compute_pipeline(dev.shader_wgsl(TICK)?, "main")?;
+    let step = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
+    let tick = dev.compute_pipeline(dev.shader_wgsl(TICK.src)?, TICK.main)?;
     var start: Vec<u32> = Vec::new_in(gpa);
     var params: Vec<u32> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
@@ -1083,19 +1155,19 @@ timestamp, and `queue.timestamp_period()`, the ns of a tick:
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const STEP: [u8] = """
+embed wgsl STEP {
     @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var i = 0u; i < 256u; i = i + 1u) {
             xs[id.x] = xs[id.x] * 3u + 1u;
         }
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP)?, "main")?;
+    let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
     let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, xs)][..]);
     let set = dev.query_set(2);
