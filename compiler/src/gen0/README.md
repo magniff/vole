@@ -8,14 +8,15 @@ the front end with the other levels, so it is the oracle they are tested
 against.
 
 (0.26.1) The -O0 generator reads each function's places IR instead
-(the AST walk under `VOLE_LOWER=ast` or `--no-places`, until 0.26.x's
-step 8 removes it) (`gen/places.vl`, the same bodies as
+(0.26.2: only) (`gen/places.vl`, the same bodies as
 `middle/lower/places.vl` takes at -O1 and -O2, the drop shims with
 them): a frame slot per local (a statement temporary's shared with the
 later ones, one read by the next statement left in the accumulator),
 the blocks in reverse postorder, calls, intrinsics and vectors through
 the AST walk's functions with their operands bound (`gen_expr` of a
-bound node is its IR operand). The AST walk stays for an atomic
+bound node is its IR operand). What stays of the AST walk: those
+functions, the expressions of constant operands and of contract and
+assert conditions (until places-ir.md §8's step 8b), and an atomic
 intrinsic's body.
 
 | module | |
