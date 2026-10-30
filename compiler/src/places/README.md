@@ -17,8 +17,10 @@ From 0.26.1 both code generators read it.
 | `build.vl` | the builder: a checked body to the IR, in evaluation order, reading the own pass's nodes; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
 | `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
 | `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` |
+| `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body packed in one allocation (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
+| `shim.vl` | drop shims (0.26.1, R2, places-ir.md §3.9): `shim_of(t) -> id` made on demand, `shim_count()`, `build_shim(id)` (a body, `_1: &mut T`, B_FN -1 and B_SHIM id), `shim_fn_symbol(id)` (`$drop.G` and the type mangled) |
 | `front.vl` | what the IR reads of the checker's raw tables, one justified accessor each |
-| `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff` |
+| `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff`; `--keep-places` (keep the bodies, print them loaded back) and `--emit-shims` (with `--emit-places`: the shims the printed bodies' drops call, and theirs) |
 
 In 0.26.0 the IR is built only under `--places` (or `--emit-places`,
 `--verify-places`, `--places-diff`; the tools' cache is not used with
@@ -28,7 +30,19 @@ applies. `// PLACES:` lines in tests/run cases (`places_*`) match
 `check --emit-places --places-diff`'s output.
 
 One body is held at a time (`ir.vl`'s `P_*` tables), cleared and reused
-for the next.
+for the next. At a build whose code generators read the IR
+(`keep::KEEP_BODIES`, which B's `VOLE_LOWER=places` sets; `--keep-places`
+at check) each is kept after elaboration (keep.vl) and loaded back when
+its function is generated. A kept body is as elaboration left it: its
+types are the checker's, distinct ones not erased (`undistinct`).
+
+A drop that runs (DS_KEPT, DS_FLAG, and an open drop's parts, each
+decided) of a place of type T is a call of T's shim (`shim_of(T)`) with
+`&mut P`. A shim's own drops are DS_KEPT (through `*_1`: no move path),
+so lowering a shim asks for more shims: loop `while id < shim_count()`.
+A shim's `Drop::drop` call is the instance the checker made for the own
+pass's glue (until step 7 deletes it; a shim that finds none stops the
+compiler with `places: a drop shim found no Drop::drop instance`).
 
 ## The contract
 
@@ -66,6 +80,12 @@ code generators' agent (0.26.1) sees what moved.
   place has no move path (through `*` or an index) is DS_KEPT as written.
   A drop's e is the AST local it drops (-1 for an open drop's parts).
   PJ_CONST of an owned array is a move path (`f()[1]` moved out).
+- 0.26.1 (R1): kept bodies, keep.vl (`keep_body`, `load_body`,
+  `free_body`, `has_kept`); `load_body` restores B_FN, B_NODE, B_PARAMS
+  and every `P_*` table, no block open.
+- 0.26.1 (R2): drop shims, shim.vl (`shim_of`, `shim_count`,
+  `shim_type`, `build_shim`, `shim_fn_symbol`); ir.vl's `B_SHIM` (the
+  shim held, -1 for a function's body; B_FN is -1 for a shim).
 
 ## `--places-diff`: the differences left
 
