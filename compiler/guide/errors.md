@@ -102,11 +102,11 @@ local; nothing else takes `&`.
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: vole has no macros | help: write `println(f"{1}")`
+error[parser error] 'println!' is a macro call: vole has no macros | help: write `println("{}", 1)`
 ```
-`println(f"{x}")` (0.15), and since 0.26.2 the call without its `!`,
-`println("{}", 1)`, a format string (`volec guide formatting`). The
-help names what replaces `vec!`, `format!`, `assert!` and the others.
+Since 0.26.2 the call without its `!` takes the same format string
+(`volec guide formatting`). The help names what replaces `vec!`,
+`format!`, `assert!` and the others.
 
 ```vole
 'outer: for i in 0..3 { break 'outer; }
