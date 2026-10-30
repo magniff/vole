@@ -545,7 +545,7 @@ crate::main	alloc(Gpa) io global panic diverge
 ```
 
 That one line says `main` allocates memory from a `Gpa`, does
-input and output, uses some global state (`println` keeps its output
+input and output, uses some global state (`read_line` keeps its input
 buffer in one), may panic (all those `unwrap`s), and may never return
 (the `loop`). You never wrote any of that down: the compiler worked it
 out from the code. Chapter 12 shows how to use this, and how to make the compiler

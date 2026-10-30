@@ -8,10 +8,10 @@ crate::labs	none
 <crate::Square as Shape>::area	none
 apply<closure(i64) -> i64 at syntax016/main.vl:47:32>	none
 crate::grow	alloc(Gpa) panic
-crate::main	alloc(Gpa) io global panic unsafe
+crate::main	alloc(Gpa) io panic unsafe
 $ effects crate --has io syntax016/main.vl
 crate::out_write	io
-crate::main	alloc(Gpa) io global panic unsafe
+crate::main	alloc(Gpa) io panic unsafe
 $ effects grow --why alloc syntax016/main.vl
 crate::grow	alloc(Gpa) panic
   'v.push(1)' at syntax016/main.vl:39:5 grows a Vec<i64>

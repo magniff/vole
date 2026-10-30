@@ -9,7 +9,7 @@ std::io::read_line	../../compiler/std/io.vl:41:8	fn	pub fn read_line<A: Allocato
 std::io::buffered::BufReader::read_line	../../compiler/std/io/buffered.vl:152:12	method	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64>
 crate::twice	nostd/main.vl:4:4	fn	fn twice(x: i64) -> i64	effects: none
 $ show std::print_int
-// std::fmt::print_int	../../compiler/std/fmt.vl:108-118	effects: io global panic
+// std::fmt::print_int	../../compiler/std/fmt.vl:194-204	effects: io panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {
