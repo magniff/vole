@@ -9,8 +9,15 @@
 // type exists before the declarations are collected; the field `step` is
 // at the WGSL `fn step`, `src` at the `{`.
 
-use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, intern, intern_c, sym_text};
-use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_help, err_str, err_sym};
+use std::{Arena, Gpa};
+use std::gpu::wgsl::uniformity;
+use std::gpu::wgsl::front::new_front;
+
+use crate::base::{
+    IntVec, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, intern, intern_c, sym_name,
+    sym_text,
+};
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fmt, err_help, err_str, err_sym};
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::PROGRAM;
 use crate::front::lexer::{Tok, keyword_of_sym, str_at};
@@ -71,6 +78,7 @@ fn make_items(e: i64, made: inout IntVec) {
     let open = if block { NODES[e].d - 1 } else { NODES[e].h };
     let first = ENTRY_SYM.count;
     scan_entries(text, if block { base } else { -1 }, base);
+    check_block(e, text);
     let name = NODES[e].a;
     let at = NODES[e].y;
     let public = (NODES[e].p & ITEM_PUBLIC) != 0;
@@ -245,4 +253,106 @@ fn add_entry(sym: i64, stage: i64, pos: i64, first: i64) {
     ENTRY_SYM.push(sym);
     ENTRY_STAGE.push(stage);
     ENTRY_POS.push(pos);
+}
+
+// ---- The check: std::gpu::wgsl's front end, at check time ----
+//
+// Every block's text goes through std::gpu::wgsl's checking half, as
+// `translate` does before it writes anything: `new_front`, `module`, then
+// `uniformity::check`, on an arena given back when the block is done.
+// Never `translate`: it names the writers (msl, spirv, dump), which every
+// check of a program would then compile. The front stops at its first
+// error, so a block has at most one: reported at its position in the
+// block's text (the block form), or at the `from` string with the file's
+// `x.wgsl:L:C:` first (the file form).
+
+// The arena the checks allocate from (main's gpa: wgsl_init).
+static var WGSL_ARENA: Arena = Arena::none();
+// The first error of the block being checked: its code, position,
+// message and help (buffers).
+static var FAIL_CODE: i64 = -1;
+static var FAIL_POS: i64 = 0;
+static var FAIL_MSG: i64 = -1;
+static var FAIL_HELP: i64 = -1;
+
+// (main) The checks' arena, from gpa.
+pub fn wgsl_init(gpa: Gpa) {
+    WGSL_ARENA = Arena::new_in(gpa);
+}
+
+// Block e's text checked: its first error reported.
+fn check_block(e: i64, text: [u8]) {
+    if FAIL_CODE < 0 {
+        FAIL_CODE = buf_new();
+        FAIL_MSG = buf_new();
+        FAIL_HELP = buf_new();
+    }
+    let failed = WGSL_ARENA.scope(|a| -> bool {
+        var fr = new_front(text, a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(fr);
+        }
+        if fr.failed {
+            FAIL_POS = fr.err_pos;
+            buf_clear(FAIL_CODE);
+            buf_bytes(FAIL_CODE, fr.err_code);
+            buf_clear(FAIL_MSG);
+            buf_bytes(FAIL_MSG, fr.emsg.as_slice());
+            buf_clear(FAIL_HELP);
+            buf_bytes(FAIL_HELP, fr.ehelp.as_slice());
+        }
+        fr.failed
+    });
+    if failed {
+        report(e, text);
+    }
+}
+
+// The error FAIL_ holds, of block e (text its WGSL).
+fn report(e: i64, text: [u8]) {
+    let block = NODES[e].d >= 0;
+    let saved = ERR_KIND;
+    ERR_KIND = sym_name(intern(buf_slice(FAIL_CODE)));
+    let pos = if FAIL_POS < 0 { 0 } else if FAIL_POS > text.len { text.len } else { FAIL_POS };
+    let m = buf_new();
+    if block {
+        err_begin(NODES[e].d + pos);
+    } else {
+        // (the file's text is no file of the program in 0.26.0: its line
+        // and column first, at the `from` string)
+        err_begin(NODES[e].h);
+        let (line, col) = line_col(text, pos);
+        buf_bytes(m, str_at(NODES[e].x));
+        buf_byte(m, ':');
+        buf_int(m, line);
+        buf_byte(m, ':');
+        buf_int(m, col);
+        buf_bytes(m, ": ");
+    }
+    buf_bytes(m, buf_slice(FAIL_MSG));
+    err_fmt(buf_slice(m));
+    if buf_slice(FAIL_HELP).len > 0 {
+        let h = buf_new();
+        buf_bytes(h, buf_slice(FAIL_HELP));
+        buf_byte(h, 0);
+        err_help(buf_slice(h).ptr);
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The 1-based line and column of byte pos of text.
+fn line_col(text: [u8], pos: i64) -> (i64, i64) {
+    var line = 1;
+    var col = 1;
+    for i in 0..pos {
+        if text[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
