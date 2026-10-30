@@ -81,6 +81,27 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
 
+The places IR, agent A's half (placesir261a; design/places-ir.md §8,
+compiler/src/places/README.md):
+
+- Kept bodies: at a build whose code generators read the IR, each
+  elaborated body is kept and loaded back when its function is generated
+  (places/keep.vl); `check --keep-places --emit-places` prints them so.
+- Drop shims (places/shim.vl, §3.9): one body per type with drop glue,
+  `drop_in_place::<T>` (a `Drop` impl's call, then the fields', an
+  enum's switch, an array's loop, a sink closure's capture under its
+  flag), made on demand; `check --emit-places --emit-shims` prints them.
+- The builder's cost: operands written straight into the IR, storage
+  markers only for locals with drop glue outside `--emit-places` and
+  `--verify-places`; the IR's share of `check` of compiler/src from
+  544M to about 420M instructions.
+- Effects see the IR's drops: each function's kept and flagged drops
+  give its effect graph an edge to the `Drop::drop` functions their
+  shims call (front/effects/infer.vl), the edges the own pass's drop
+  placeholders give until they go.
+- `volec query drops FILE:LINE`: a function's drops as the IR decides
+  them, each with where it runs (query.md, "drops").
+
 ### What's new in 0.26.0
 
 The first release of the move to Rust's surface

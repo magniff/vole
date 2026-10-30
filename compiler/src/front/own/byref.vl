@@ -20,6 +20,12 @@ use crate::middle::lower::ssa::HMap;
 // Whether a value of type t is an iterator (or an adapter of one, to depth
 // 4) that copies a borrowed container's non-copyable elements.
 pub fn copies_owned_items(t: i64, depth: i64) -> bool {
+    copies_items(t, depth, false)
+}
+
+// copies_owned_items, or (interior) whether the items it copies are not
+// Freeze (0.26.1: each copy is another cell, own.interior_copy).
+pub fn copies_items(t: i64, depth: i64, interior: bool) -> bool {
     // UNSAFE: STRUCTS and TLISTS' data are the checker's raw tables (*StructInfo, *i64).
     // SAFETY: t > 0 is a struct type, so TYPES[t].a < STRUCT_COUNT; its targs are
     // targ_count entries of TLISTS.
@@ -38,14 +44,14 @@ pub fn copies_owned_items(t: i64, depth: i64) -> bool {
             || crate::front::check::is_std_named(t, c"Keys")
             || crate::front::check::is_std_named(t, c"HashSetIter")
             || crate::front::check::is_std_named(t, c"BTreeSetIter") {
-            return crate::front::own::glue::has_glue(a0);
+            return copied(a0, interior);
         }
         if crate::front::check::is_std_named(t, c"Values") {
-            return crate::front::own::glue::has_glue(a1);
+            return copied(a1, interior);
         }
         if crate::front::check::is_std_named(t, c"HashMapIter")
             || crate::front::check::is_std_named(t, c"BTreeIter") {
-            return crate::front::own::glue::has_glue(a0) || crate::front::own::glue::has_glue(a1);
+            return copied(a0, interior) || copied(a1, interior);
         }
         // (a map's items are its closure's results, made from borrowed ones)
         if crate::front::check::is_std_named(t, c"Map")
@@ -53,12 +59,18 @@ pub fn copies_owned_items(t: i64, depth: i64) -> bool {
             return false;
         }
         for i in 0..STRUCTS[s].targ_count {
-            if copies_owned_items(TLISTS.data[STRUCTS[s].targs + i], depth + 1) {
+            if copies_items(TLISTS.data[STRUCTS[s].targs + i], depth + 1, interior) {
                 return true;
             }
         }
         false
     }
+}
+
+// Whether an item of type t is a copy that matters: one with drop glue
+// (owned twice), or (interior) one that is not Freeze (another cell).
+fn copied(t: i64, interior: bool) -> bool {
+    if interior { !crate::front::cells::is_freeze(t) } else { has_glue(t) }
 }
 
 pub const MATCH_BYREF: i64 = 1 << 58;
@@ -104,30 +116,44 @@ pub fn method_word(d: [u8]) -> [u8] {
 // `value_at`; 0.18.1: a heap's `peek`) return a `T`, not a `&T`, until references are type
 // arguments (0.17.1), and through `unwrap`, `expect`, `unwrap_or`. The copy
 // is borrowed: a binding of it is not dropped, and moving it is
-// own.move_out (it would be dropped twice).
+// own.move_out (it would be dropped twice). (0.26.1) A copy of a value
+// that is not Freeze, with or without a drop, is another cell: a write
+// through it would be lost, own.interior_copy (front/cells.vl).
 pub fn borrowed_call(e: i64) -> bool {
+    let r = borrowed_copy(e, false);
+    if e > 0 && !crate::front::cells::is_freeze(NODES[e].ty) && (r || borrowed_copy(e, true)) {
+        crate::front::cells::interior_copy(e);
+    }
+    r
+}
+
+// borrowed_call's shapes; interior: of a value that is not Freeze, glue or
+// not, instead of one with glue.
+fn borrowed_copy(e: i64, interior: bool) -> bool {
     // UNSAFE: FNS is the checker's raw table of functions (*FnInfo).
     // SAFETY: f = NODES[e].x - 1 >= 0 is the call's resolved function, below FN_COUNT.
     unsafe {
         // (0.18: through a requires check's block to its call)
         let wrapped = crate::front::contracts::expand::requires_tail(e);
         if wrapped > 0 {
-            return borrowed_call(wrapped);
+            return borrowed_copy(wrapped, interior);
         }
         // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
         if e > 0 && NODES[e].kind == NodeKind::Try {
-            return borrowed_call(NODES[e].a);
+            return borrowed_copy(NODES[e].a, interior);
         }
         // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
         if e > 0 && NODES[e].kind == NodeKind::Match && NODES[e].count == 2
             && (NODES[child(e, 1)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
-            return borrowed_call(NODES[e].a);
+            return borrowed_copy(NODES[e].a, interior);
         }
         if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
             return false;
         }
         let f = NODES[e].x - 1;
-        if f < 0 || !within_std(FNS[f].module) || !has_glue(NODES[e].ty) {
+        if f < 0 || !within_std(FNS[f].module)
+            || (if interior { crate::front::cells::is_freeze(NODES[e].ty) }
+                else { !has_glue(NODES[e].ty) }) {
             return false;
         }
         let name = method_word(SYMS[FNS[f].display].text);
@@ -147,12 +173,13 @@ pub fn borrowed_call(e: i64) -> bool {
         // `count`, `filter`, an item looked at and passed over is not dropped)
         if (name == "next" || name == "next_back" || name == "at" || name == "find"
             || name == "last" || name == "nth" || name == "min" || name == "max")
-            && crate::front::own::byref::copies_owned_items(
-                if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0) {
+            && copies_items(if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0,
+                interior) {
             return true;
         }
         if name == "unwrap" || name == "expect" || name == "unwrap_or" {
-            return borrowed_call(crate::front::contracts::desugar::requires_arg(child(e, 0)));
+            return borrowed_copy(crate::front::contracts::desugar::requires_arg(child(e, 0)),
+                interior);
         }
         false
     }

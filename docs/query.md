@@ -31,6 +31,7 @@ volec query show MODULE::section TITLE                   (0.13)
 volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 volec query type FILE:LINE[:COL]...                      (0.13)
 volec query own FILE:LINE:COL...                         (0.17)
+volec query drops FILE:LINE...                           (0.26.1)
 volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 volec query deps MODULE [--max-lines N]                 (refactor.md)
 volec query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -114,6 +115,7 @@ tools` the ones a program needs.
 | a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/volec query type FILE:LINE:COL` |
 | each local's kind, moves and views at a position (0.17) | `target/volec query own FILE:LINE:COL` |
+| a function's drops, each decided (kept, removed, flagged, opened) and where it runs (0.26.1) | `target/volec query drops FILE:LINE` |
 | what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
 | every unsafe site: what it does, its class, whether it says why | `target/volec query unsafe [FILE...\|std]` (`--unjustified`, `--summary`, `--json`) |
 | the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
@@ -1003,6 +1005,35 @@ first  [i64]     view
 
 A `let`'s names are in scope after the `let`. A position in no function
 the checker saw: `error query.no-match`, `try:` the item at that line.
+
+## drops (0.26.1)
+
+`drops FILE:LINE` shows the drops of the function at that line as the
+places IR decides them (docs/design/places-ir.md §3.8; the body a code
+generator reads, places/keep.vl): the function, then a line per drop,
+by where it runs (a block's `}`, the end of a statement, a `return`,
+`break` or `continue`), with its decision (`kept`; `removed`, it never
+runs; `flag _N`, it runs when flag `_N` is set; `open`, its parts are
+dropped instead, on the lines after it) and what it drops, a local's
+name or a temporary and where it was made, and its type
+(tests/query/drops0261.q):
+
+```
+drops0261/main.vl:22 in pick
+  31:13  drop(_12) [kept]  t: D
+  34:5  drop(_12) [kept]  t: D
+  35:33  drop(_20) [open]  a temporary (35:18): (D, D)
+  35:33  drop(_20.1) [kept]  a temporary (35:18): D
+  37:1  drop(_4) [removed]  b: D
+  37:1  drop(_3) [flag _25]  a: D
+```
+
+The innermost function holds the line (a closure inside its parent;
+the first instance of a generic one). A line in no function with a body
+(a generic one never instantiated, C's, one with errors): `error
+query.no-match`, `try:` the item at that line. `check --emit-places`
+prints the whole IR; `--emit-shims` the drop shims a `[kept]` drop
+calls.
 
 ## Diagnostics
 
