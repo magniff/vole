@@ -1,0 +1,374 @@
+// Restricted visibility (0.26.2), Rust's `pub(crate)`, `pub(super)`,
+// `pub(self)` and `pub(in path)`, on items, fields, `use` re-exports and
+// modules. ITEM_PUBLIC (a module's `public`) keeps meaning "visible
+// outside its module"; a restricted one also has the token of its `pub`
+// here (VIS: node + 1 -> token + 1; MOD_VIS: module + 1 -> token + 1),
+// and vis_end says the module where its visibility ends: its crate's
+// root for `crate` (a program's crate is its root module, std's is std),
+// its module's parent for `super`, the path's module for `in`, which must
+// be its module or one around it (vis.path). `pub(self)` is private.
+
+use crate::base::{IntVec, SRC, SYMS, buf_fmt, buf_new, buf_slice, intern_c};
+use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, Token};
+use crate::front::modules::{MODULES, STD_MODULE, child_module, is_within, module_of, within_std};
+use crate::middle::lower::ssa::HMap;
+
+// The token of the restricted `pub` the parser read last (-1: plain
+// `pub`, or none); the parser's mark_public notes it on the item.
+pub static var VIS_TOK: i64 = -1;
+
+static var VIS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var MOD_VIS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// (token + 1 -> the module where it ends + 2, once resolved)
+static var VIS_END: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The restricted nodes and modules, in order, for check_vis_paths.
+static var VIS_NODES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var VIS_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn tok(i: i64) -> Token {
+    // UNSAFE: TOKS is the lexer's token array, a raw pointer (front/lexer).
+    // SAFETY: the callers ask for tokens of a `pub (..)` the parser or the
+    // module scan read, below TOK_COUNT (checked where it could run past).
+    unsafe { TOKS[i] }
+}
+
+fn parent_of(m: i64) -> i64 {
+    // UNSAFE: MODULES is the table of modules, a raw pointer (front/modules).
+    // SAFETY: m >= 0 is a module's index, below module_count().
+    unsafe { MODULES[m].parent }
+}
+
+fn tok_word(i: i64, word: [u8]) -> bool {
+    i < TOK_COUNT && tok(i).kind == Tok::Ident && SYMS[tok(i).value as i64].text == word
+}
+
+// Whether token p, a `pub`, is followed by a restriction: `(crate)`,
+// `(super)`, `(self)`, `(in path)`.
+pub fn restricted_at(p: i64) -> bool {
+    p + 2 < TOK_COUNT && tok(p + 1).kind == Tok::LParen
+        && (tok_word(p + 2, "crate") || tok_word(p + 2, "super") || tok_word(p + 2, "self")
+            || tok(p + 2).kind == Tok::In)
+}
+
+// Whether the restriction at `pub` token p is `pub(self)`: private.
+pub fn self_only(p: i64) -> bool {
+    tok_word(p + 2, "self")
+}
+
+// The token after the restriction's `)`.
+pub fn restriction_end(p: i64) -> i64 {
+    var i = p + 2;
+    while i < TOK_COUNT && tok(i).kind != Tok::RParen && tok(i).kind != Tok::Eof {
+        i += 1;
+    }
+    if i < TOK_COUNT && tok(i).kind == Tok::RParen { i + 1 } else { i }
+}
+
+// The parser read restricted `pub` p on node n (an item, a field, a use).
+pub fn note_vis(n: i64, p: i64) {
+    if VIS.get(n + 1) == 0 {
+        VIS_NODES.push(n);
+    }
+    VIS.put(n + 1, p + 1);
+}
+
+// The module scan at a `mod` at token i: whether the module is public
+// (`pub mod`, `pub(crate) mod`; `pub(self) mod` is not).
+pub fn module_public(i: i64) -> bool {
+    if i < 1 {
+        return false;
+    }
+    if tok(i - 1).kind == Tok::Pub {
+        return true;
+    }
+    let p = restriction_before(i);
+    p >= 0 && !self_only(p)
+}
+
+// The `pub` token of a restriction just before token i (`pub(crate)
+// mod`), -1 for none.
+fn restriction_before(i: i64) -> i64 {
+    if i < 1 || tok(i - 1).kind != Tok::RParen {
+        return -1;
+    }
+    var j = i - 1;
+    while j > 0 && tok(j).kind != Tok::LParen {
+        j -= 1;
+    }
+    if j < 1 || tok(j - 1).kind != Tok::Pub || !restricted_at(j - 1) { -1 } else { j - 1 }
+}
+
+// After it made module m for the `mod` at token i: its restriction, if
+// any, noted.
+pub fn note_module_vis(m: i64, i: i64) {
+    let p = restriction_before(i);
+    if p >= 0 && !self_only(p) {
+        MOD_VIS.put(m + 1, p + 1);
+        VIS_MODS.push(m);
+    }
+}
+
+// The crate of module m: std for std's modules, else the program's root.
+fn crate_root(m: i64) -> i64 {
+    if within_std(m) { STD_MODULE } else { 0 }
+}
+
+// The module where the visibility of restricted `pub` p, in module m,
+// ends (-1: p is not restricted). A bad `in` path ends it at the crate.
+fn vis_end(p: i64, m: i64) -> i64 {
+    let known = VIS_END.get(p + 1);
+    if known != 0 {
+        return known - 2;
+    }
+    let end = resolve(p, m, false);
+    VIS_END.put(p + 1, end + 2);
+    end
+}
+
+// What restricted `pub` p in module m names (report: vis.path errors).
+fn resolve(p: i64, m: i64, report: bool) -> i64 {
+    let root = crate_root(m);
+    if tok_word(p + 2, "crate") {
+        return root;
+    }
+    if tok_word(p + 2, "super") {
+        if m == root || parent_of(m) < 0 {
+            if report {
+                path_error(p, "'super' of a crate's root is outside the crate");
+            }
+            return root;
+        }
+        return parent_of(m);
+    }
+    // `in path`
+    var i = p + 3;
+    var cur = -1;
+    var first = true;
+    while i < TOK_COUNT && tok(i).kind == Tok::Ident {
+        let name = tok(i).value as i64;
+        if first && name == intern_c(c"crate") {
+            cur = root;
+        } else if first && name == intern_c(c"self") {
+            cur = m;
+        } else if first && name == intern_c(c"std") && STD_MODULE >= 0 {
+            cur = STD_MODULE;
+        } else if name == intern_c(c"super") && (first || cur >= 0) {
+            let from = if first { m } else { cur };
+            cur = if from >= 0 && from != root { parent_of(from) } else { -1 };
+        } else if first {
+            cur = child_module(m, name);
+        } else if cur >= 0 {
+            cur = child_module(cur, name);
+        }
+        first = false;
+        i += 1;
+        if i < TOK_COUNT && tok(i).kind == Tok::ColonColon {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if cur < 0 || !is_within(m, cur) {
+        if report {
+            path_error(p, if cur < 0 { "the path names no module" }
+                else { "the path names a module that is not around this item" });
+        }
+        return root;
+    }
+    cur
+}
+
+// error vis.path (E0742): `pub(in path)` names no ancestor of the item's
+// module.
+fn path_error(p: i64, why: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"vis.path";
+    let end = tok(restriction_end(p) - 1).end;
+    err_begin(tok(p).start);
+    err_fmt(f"'{SRC[tok(p).start..end]}': {why}");
+    err_help(c"'pub(in path)' names the item's module or one around it: 'pub(in crate::a)', 'pub(super)', 'pub(crate)'");
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The module where node n's visibility ends, -1 when it is not
+// restricted (plain `pub`, or private: ITEM_PUBLIC says which).
+pub fn vis_end_of(n: i64) -> i64 {
+    if VIS.count == 0 {
+        return -1;
+    }
+    let p = VIS.get(n + 1);
+    if p == 0 { -1 } else { vis_end(p - 1, module_of(n)) }
+}
+
+// The same for module c (declared in its parent).
+pub fn module_vis_end(c: i64) -> i64 {
+    if MOD_VIS.count == 0 {
+        return -1;
+    }
+    let p = MOD_VIS.get(c + 1);
+    if p == 0 { -1 } else { vis_end(p - 1, parent_of(c)) }
+}
+
+// Whether public node n is visible from code in module `from`.
+pub fn admits(n: i64, from: i64) -> bool {
+    let end = vis_end_of(n);
+    end < 0 || is_within(from, end)
+}
+
+// Whether public module c is visible from code in module `from`.
+pub fn module_admits(c: i64, from: i64) -> bool {
+    let end = module_vis_end(c);
+    end < 0 || is_within(from, end)
+}
+
+// The restricted `pub` token of node n, -1 for none.
+pub fn vis_token(n: i64) -> i64 {
+    if VIS.count == 0 {
+        return -1;
+    }
+    VIS.get(n + 1) - 1
+}
+
+// The text of node n's `pub (..)` (`pub(crate)`), empty for none.
+pub fn vis_text(n: i64) -> [u8] {
+    let p = vis_token(n);
+    if p < 0 {
+        return "";
+    }
+    SRC[tok(p).start..tok(restriction_end(p) - 1).end]
+}
+
+// Whether module m is a crate's root (the program's, or std).
+pub fn is_crate_root(m: i64) -> bool {
+    m == 0 || m == STD_MODULE
+}
+
+// After the modules are loaded and the program parsed: each `pub(in
+// path)` and `pub(super)` names a module around its item (vis.path).
+pub fn check_vis_paths() {
+    for i in 0..VIS_NODES.count {
+        let n = VIS_NODES.get(i);
+        let p = VIS.get(n + 1) - 1;
+        if !tok_word(p + 2, "crate") {
+            VIS_END.put(p + 1, resolve(p, module_of(n), true) + 2);
+        }
+    }
+    for i in 0..VIS_MODS.count {
+        let c = VIS_MODS.get(i);
+        let p = MOD_VIS.get(c + 1) - 1;
+        if !tok_word(p + 2, "crate") {
+            VIS_END.put(p + 1, resolve(p, parent_of(c), true) + 2);
+        }
+    }
+}
+
+// Where a restriction that ends at module `end` lets its item be seen,
+// for a message: `crate 'std'`, `this crate`, `module 'a::b'`.
+pub fn vis_where(end: i64) -> [u8] {
+    if end == STD_MODULE {
+        return "crate 'std'";
+    }
+    if end == 0 {
+        return "this crate";
+    }
+    let b = buf_new();
+    // UNSAFE: MODULES is the table of modules, a raw pointer (front/modules).
+    // SAFETY: end > 0 is a module's index (vis_end's), below module_count().
+    let key = unsafe { MODULES[end].key };
+    buf_fmt(b, f"module '{SYMS[key].text}'");
+    buf_slice(b)
+}
+
+// The bytes of node n's restriction, `pub(crate)` (its start, its end),
+// (-1, -1) for none.
+pub fn restriction_span(n: i64) -> (i64, i64) {
+    let p = vis_token(n);
+    if p < 0 {
+        return (-1, -1);
+    }
+    (tok(p).start, tok(restriction_end(p) - 1).end)
+}
+
+// The bytes of a `pub(self)` written at or just before position pos (an
+// item's start is after its `pub`, a field's at it), (-1, -1) for none:
+// `fix --only pub` makes it `pub`.
+pub fn self_span(pos: i64) -> (i64, i64) {
+    var s = pos;
+    if !(s + 3 <= SRC.len && SRC[s..s + 3] == "pub") {
+        // (back over blanks to a `)`)
+        var i = pos - 1;
+        while i > 0 && (SRC[i] == ' ' || SRC[i] == '\t' || SRC[i] == '\n') {
+            i -= 1;
+        }
+        if i <= 0 || SRC[i] != ')' {
+            return (-1, -1);
+        }
+        while i > 0 && SRC[i] != '(' {
+            i -= 1;
+        }
+        while i > 0 && (SRC[i - 1] == ' ' || SRC[i - 1] == '\t') {
+            i -= 1;
+        }
+        if i < 3 || SRC[i - 3..i] != "pub" {
+            return (-1, -1);
+        }
+        s = i - 3;
+    }
+    var e = s + 3;
+    while e < SRC.len && (SRC[e] == ' ' || SRC[e] == '\t') {
+        e += 1;
+    }
+    if e >= SRC.len || SRC[e] != '(' {
+        return (-1, -1);
+    }
+    var close = e;
+    while close < SRC.len && SRC[close] != ')' {
+        close += 1;
+    }
+    if close >= SRC.len {
+        return (-1, -1);
+    }
+    var w = e + 1;
+    while w < close && SRC[w] == ' ' {
+        w += 1;
+    }
+    var we = close;
+    while we > w && SRC[we - 1] == ' ' {
+        we -= 1;
+    }
+    if SRC[w..we] != "self" {
+        return (-1, -1);
+    }
+    (s, close + 1)
+}
+
+// The text of a restriction written at or just before position pos
+// (`pub(crate)`, `pub(in a::b)`), from the source alone (the tools'
+// cache has no tokens), empty for none: what `query context` and hover
+// show of a definition's visibility.
+pub fn written_restriction(pos: i64) -> [u8] {
+    var s = pos;
+    if !(s + 4 <= SRC.len && SRC[s..s + 4] == "pub(") {
+        var i = pos - 1;
+        while i > 0 && (SRC[i] == ' ' || SRC[i] == '\t' || SRC[i] == '\n') {
+            i -= 1;
+        }
+        if i <= 0 || SRC[i] != ')' {
+            return "";
+        }
+        while i > 0 && SRC[i] != '(' {
+            i -= 1;
+        }
+        if i < 3 || SRC[i - 3..i] != "pub" {
+            return "";
+        }
+        s = i - 3;
+    }
+    var e = s;
+    while e < SRC.len && SRC[e] != ')' && SRC[e] != '\n' {
+        e += 1;
+    }
+    if e < SRC.len && SRC[e] == ')' { SRC[s..e + 1] } else { "" }
+}

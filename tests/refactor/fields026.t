@@ -62,7 +62,7 @@ ok: 0 errors in main.vl
 $ explain field.private
 field.private: error
 (0.26.0) A field not marked `pub` is read, written or borrowed outside the module that declares its struct (and the modules inside it), Rust's E0616. A field marked `pub` is visible wherever its struct is; until 0.26 every field was.
-fix: Call the struct's method when it has one of that name (`.len()`; the try: line writes the `()`); in your own program, mark the field `pub` where it is declared (`volec fix --only pub`). Std's fields change only through its methods. (`pub(crate)` and `pub(super)` come in 0.26.2.)
+fix: Call the struct's method when it has one of that name (`.len()`; the try: line writes the `()`); in your own program, mark the field `pub` where it is declared (`volec fix --only pub`). Std's fields change only through its methods. (0.26.2: a field marked `pub(crate)`, `pub(super)` or `pub(in path)` is visible up to that module; the message says where, and `fix --only pub` widens it to `pub(crate)`.)
 example:
     error[field.private] field 'w' of 'Rect' is private to module 'geometry' | help: make it public: 'pub w: i64' at geometry.vl:1:19
 $ explain field.literal-private

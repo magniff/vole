@@ -98,7 +98,7 @@ are two `*`.
 
 ```ebnf
 program      = { item } EOF ;
-item         = [ "pub" ] [ attributes ] [ "pub" ]       (* (0.6) attributes may come before pub *)
+item         = [ vis ] [ attributes ] [ vis ]           (* (0.6) attributes may come before pub *)
                ( fn_decl | extern_item | struct_decl | union_decl | enum_decl
              | const_decl | static_decl | type_alias
              | import_item | use_item | mod_item )      (* pub, mod: (0.5); import, use: (0.4) *)
@@ -110,6 +110,7 @@ use_name     = ident [ "as" ident ] ;
 mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.vl, see "Modules" *)
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
+vis          = "pub" [ "(" ( "crate" | "super" | "self" | "in" path ) ")" ] ;   (* (0.26.2) see "Modules" *)
 
 fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] [ where ] block ;
                                                        (* unsafe: (0.9), see "Unsafe code"; where: (0.26.2) *)
@@ -136,7 +137,7 @@ repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | in
 
 struct_decl  = "struct" ident [ generics ] [ where ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
-field        = [ "pub" ] ident ":" type ;              (* (0.26) private to the struct's module unless pub *)
+field        = [ vis ] ident ":" type ;                (* (0.26) private to the struct's module unless pub *)
 enum_decl    = "enum" ident [ generics ] [ where ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
@@ -749,9 +750,22 @@ the error's help is the declaration with `pub` and where it is, which
 `volec fix --only pub` writes; on a field with a method of its name
 (`v.len`), the call. (Until 0.26 a field was as visible as its struct,
 and `pub` on it changed nothing; `#[sealed]` asked for this rule.)
-`pub(crate)`, `pub(super)` and `pub(in path)`, for items and fields, come
-in 0.26.2; until then a field read from a sibling module is plain
-`pub`.
+
+**Restricted visibility** *(0.26.2)*, Rust's: `pub(crate)` is visible in
+the item's crate, `pub(super)` in its module's parent (and the modules
+inside it), `pub(in path)` in the module the path names, which must be
+the item's module or one around it (else `vis.path`, E0742; `pub(super)`
+at a crate's root is one too); `pub(self)` is private. They go on items,
+fields, `use` (a `pub(crate) use` re-exports inside the crate only) and
+`mod`. A program's crate is its root module; std's is std, so a std item
+marked `pub(crate)` is std's own, and in std an `in` path starts at
+`std::` or `super::`. Outside its restriction an item's use is
+`item.private` (E0603; a private item's too, from 0.26.2: it was a `type
+error`) and a field's `field.private`, both saying where it is visible
+(`visible only in crate 'std'`, `in module 'a::b'`); `volec fix --only
+pub` widens a restriction to `pub(crate)` (a program is one crate) and
+writes `pub` on a private item (0.26.2 writes no `pub(crate)` there:
+compiler/src may use the form from 0.26.3).
 
 Paths name items through modules: `geometry::shapes::area(s)`,
 `geometry::Rect { w: 1, h: 2 }`, `shapes::Shape::Rect(r)` (a variant),

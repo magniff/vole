@@ -89,6 +89,14 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
   named `impl Display` in messages; a turbofish gives only the written
   parameters. Anywhere else it is `type.impl-position`.
 - `volec fmt` lays `where` out as a signature's continuation.
+- `pub(crate)`, `pub(super)`, `pub(self)` and `pub(in path)` on items,
+  fields, `use` and `mod`, as Rust's; `pub(in path)` naming no module
+  around its item is `vis.path`. A private or restricted item used
+  outside is `item.private` (it was a `type error`); it and
+  `field.private` say where a restricted one is visible. `fix --only pub`
+  widens a restriction to `pub(crate)` (and still writes plain `pub` on a
+  private item: compiler/src may write `pub(crate)` from 0.26.3);
+  `query context` and hover show a field's restriction.
 
 ### What's new in 0.26.1
 

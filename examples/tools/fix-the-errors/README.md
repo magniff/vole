@@ -21,7 +21,7 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ volec check
-main.vl:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
+main.vl:8:38: error[item.private] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
 main.vl:9:14: error[type error] unresolved import 'roster::add_score'
 main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)

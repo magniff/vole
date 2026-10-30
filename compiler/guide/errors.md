@@ -657,7 +657,7 @@ mod m { fn hidden() -> i64 { 1 } }
 fn main() -> i32 { m::hidden() as i32 }
 ```
 ```err
-error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at
+error[item.private] 'hidden' is private | help: make it public: `pub fn hidden` at
 ```
 The help gives the declaration with `pub` and where it is (`volec fix
 --only pub` writes them all). Child modules see their parent's private items, not
