@@ -151,7 +151,7 @@ impl Store {
                     self.items[i].price = item.price;
                 }
                 None => {
-                    self.index.insert(item.name, self.items.len());
+                    self.index.insert(item.name, self.items.len() as i64);
                     self.items.push(item);
                 }
             },

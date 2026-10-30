@@ -49,7 +49,7 @@ Here's our starting point. Save it as `lines.vl`:
 use std::{env, time};
 
 // n bytes of made-up text: letters, spaces, and a newline now and then.
-fn make_text(n: i64, gpa: Gpa) -> Vec<u8> {
+fn make_text(n: usize, gpa: Gpa) -> Vec<u8> {
     var v: Vec<u8> = Vec::with_capacity_in(n, gpa);
     var x: u64 = 0x9e3779b97f4a7c15;
     for _ in 0..n {
@@ -63,8 +63,8 @@ fn make_text(n: i64, gpa: Gpa) -> Vec<u8> {
 }
 
 // How many times b occurs in s, a byte at a time.
-fn count_loop(s: [u8], b: u8) -> i64 {
-    var n = 0;
+fn count_loop(s: [u8], b: u8) -> usize {
+    var n: usize = 0;
     for i in 0..s.len() {
         if s[i] == b {
             n += 1;
@@ -74,14 +74,14 @@ fn count_loop(s: [u8], b: u8) -> i64 {
 }
 
 // The same, as an iterator chain.
-fn count_iter(s: [u8], b: u8) -> i64 {
+fn count_iter(s: [u8], b: u8) -> usize {
     s.iter().filter(|c| c == b).count()
 }
 
 // Runs f on s five times; prints its result and the fastest time.
-fn time_it(name: str, f: fn([u8], u8) -> i64, s: [u8]) {
+fn time_it(name: str, f: fn([u8], u8) -> usize, s: [u8]) {
     var best = time::Duration::max_value();
-    var result = 0;
+    var result: usize = 0;
     for _ in 0..5 {
         let start = time::monotonic_now();
         result = f(s, '\n');
@@ -94,7 +94,7 @@ fn time_it(name: str, f: fn([u8], u8) -> i64, s: [u8]) {
 }
 
 fn main(gpa: Gpa) {
-    let size = 64 << 20; // 64 MiB
+    let size: usize = 64 << 20; // 64 MiB
     let text = make_text(size, gpa);
     let s = text.as_slice();
     if env::args().len() > 1 {
@@ -240,7 +240,7 @@ and it removes the check. Here's a function where it can't. Save it as `window.v
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8>, lo: i64, hi: i64, b: u8) -> i64 {
+fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64 {
     var n = 0;
     for i in lo..hi {
         if v[i] == b {
@@ -284,8 +284,8 @@ a window that's inside `v`. Chapter 13 showed how to say that, with a
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8>, lo: i64, hi: i64, b: u8) -> i64
-    requires 0 <= lo && lo <= hi && hi <= v.len()
+fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64
+    requires lo <= hi && hi <= v.len()
 {
     var n = 0;
     for i in lo..hi {
@@ -344,8 +344,8 @@ on all sixteen *lanes* at once:
 
 ```vole simd.vl
 // How many times b occurs in s, a byte at a time.
-fn count_loop(s: [u8], b: u8) -> i64 {
-    var n = 0;
+fn count_loop(s: [u8], b: u8) -> usize {
+    var n: usize = 0;
     for i in 0..s.len() {
         if s[i] == b {
             n += 1;
@@ -355,14 +355,14 @@ fn count_loop(s: [u8], b: u8) -> i64 {
 }
 
 // The same, 16 bytes at a time.
-fn count_simd(s: [u8], b: u8) -> i64 {
+fn count_simd(s: [u8], b: u8) -> usize {
     let needle = v16u8::splat(b);
     let one = v16u8::splat(1);
-    var n = 0;
+    var n: usize = 0;
     var i = 0;
     while i + 16 <= s.len() {
         let eq = v16u8::load(s, i) == needle; // 0xff where equal, else 0
-        n += (eq & one).sum() as i64;
+        n += (eq & one).sum() as usize;
         i += 16;
     }
     n + count_loop(s[i..s.len()], b)

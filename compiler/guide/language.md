@@ -62,7 +62,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |
 | no default or named arguments | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15): named ones last, in order |
-| `usize`, implicit `i32` -> `i64` | lengths and indices are `i64`; lossless widening (0.15), `a as i32` narrows |
+| `usize`, implicit `i32` -> `i64` | lengths and indices are `usize` (0.26.2); lossless widening (0.15), `a as i32` narrows |
 
 The prelude, in every module without `use`: `Option`, `Some`, `None`,
 `Result`, `Ok`, `Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`,
@@ -354,7 +354,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     var b = Buf::new_in(gpa);              // text builder
     let e = evens(4, gpa);
     b.push_str("n=");
-    b.push_int(m.len() + e.len());
+    b.push_int(m.len() as i64 + e.len() as i64);
     b.push('!');
     println(b.as_slice());
     0
@@ -407,7 +407,7 @@ fn main(gpa: Gpa) -> i32 {
     for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
         adj[u].push((v, w));
     }
-    var dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    var dist: Vec<i64> = Vec::filled_in(n as usize, i64::MAX, gpa);
     var heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);      // (distance, node)
     dist[0] = 0;
     heap.push((0, 0));

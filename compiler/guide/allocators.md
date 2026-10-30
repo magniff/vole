@@ -11,7 +11,7 @@ so a function's signature says whether it allocates.
 
 ```vole
 fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
-    var v: Vec<i64> = Vec::with_capacity_in(n, gpa);
+    var v: Vec<i64> = Vec::with_capacity_in(n as usize, gpa);
     for i in 0..n { v.push(i * i); }
     v
 }

@@ -92,7 +92,7 @@ pub fn add(a: i64, b: i64) -> i64 { a + b }
 fn first<T>(s: [T]) -> T { s[0] }
 fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(n: sink i64) -> i64 { n += 1; n }  // sink: the callee's own, mutable
-fn twice(v: inout Vec<i64>) { v.push(v.len()); }   // inout: called as twice(&v)
+fn twice(v: inout Vec<i64>) { v.push(v.len() as i64); }   // inout: called as twice(&v)
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
 fn hi(out: inout Buf) { out.push_str("hi"); }   // Buf: the `use` above
 

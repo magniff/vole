@@ -57,7 +57,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
         count::add_words(&counts, text, gpa);
     }
     let n = match env::get_in("WC_TOP", gpa) {
-        Ok(s) => s.parse::<i64>().unwrap_or(5),
+        Ok(s) => s.parse::<usize>().unwrap_or(5),
         Err(_) => 5,
     };
     let top = report::top(counts, n, report::Order::ByCount, gpa);
@@ -91,7 +91,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -123,7 +123,7 @@ pub enum Order {
     Alphabetical,
 }
 
-pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -176,7 +176,7 @@ it? `volec query context` answers all three at once:
 ```console
 $ volec query context report::top
 // crate::report::top	report.vl:9-20	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -234,7 +234,7 @@ of use and the function it's in:
 $ volec query refs Order
 # report.vl
 4:10	def	pub enum Order {
-9:57	type	report::top	pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
+9:59	type	report::top	pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
 15:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
 16:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
 # main.vl
@@ -366,8 +366,8 @@ value for the existing calls, and `--fill-calls` writes that value into
 each of them:
 
 ```console
-$ volec refactor signature count::count_words --add 'min_len: i64 = 1' --fill-calls
-added parameter min_len: i64 to crate::count::count_words, 1 call	2 files	+2 -2 lines
+$ volec refactor signature count::count_words --add 'min_len: usize = 1' --fill-calls
+added parameter min_len: usize to crate::count::count_words, 1 call	2 files	+2 -2 lines
 $ volec query callers count_words
 # main.vl
 14:16	call	run	count::count_words(&counts, text, gpa, 1);
@@ -399,7 +399,7 @@ patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
 // crate::count::count_words	count.vl:26-35	effects: alloc(Gpa) panic diverge
 // Adds the words of text to counts, lowercased.
-pub fn count_words(counts: inout HashMap<String, i64>, text: str, min_len: i64, gpa: Gpa) {
+pub fn count_words(counts: inout HashMap<String, i64>, text: str, min_len: usize, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.len() < min_len {
@@ -422,11 +422,11 @@ longer covers every case (chapter 5). `refactor variant` adds the
 variant and an arm to each match, with the expression you give:
 
 ```console
-$ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len() - a.0.len())'
+$ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(a.0.len()))'
 added variant Longest to crate::report::Order, an arm in 1 match	report.vl	+2 -0 lines
 $ volec query show report::top
 // crate::report::top	report.vl:10-22	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -434,7 +434,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<
     match order {
         Order::ByCount => pairs.sort_by(by_count),
         Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
-        Order::Longest => pairs.sort_by(|a, b| b.0.len() - a.0.len()),
+        Order::Longest => pairs.sort_by(|a, b| b.0.len().cmp(a.0.len())),
     }
     pairs.truncate(n);
     pairs

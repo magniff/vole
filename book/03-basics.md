@@ -104,9 +104,12 @@ $ volec try '7.0 / 2.0'
 f64 = 3.5
 ```
 
-Lengths and indexes are `i64` too. A list's `len()` is an `i64`, and
-you index with an `i64`. There's no separate unsigned type for sizes,
-so you never have to convert between "a count" and "a number".
+Lengths and indexes are `usize`. A list's `len()` is a `usize`, and
+you index with a `usize` (an `i64` works too). A literal is an `i64`
+unless something gives it a type, so a counter that walks a list says
+its type, `var i: usize = 0;`, and a `usize` and an `i64` don't mix in
+arithmetic: the error names the conversion to write, such as
+`v.len() as i64`.
 
 ### Literals
 
@@ -250,7 +253,7 @@ each integer type. Numbers have few methods, though: `x.abs()` and
 else { x }`), or a small function of your own.
 
 > **If you know Rust:** overflow never panics, in debug builds or
-> release ones; `x / 0` is 0; lengths are `i64`, not `usize`.
+> release ones; `x / 0` is 0; lengths are `usize`, as yours are.
 
 ## Other simple types
 
@@ -706,7 +709,7 @@ This chapter went through the basics:
 - `let` for values that don't change, `var` for ones that do, and
   shadowing with a second `let`;
 - the integer and float types, `i64` and `f64` as the defaults, and
-  `i64` for lengths and indexes;
+  `usize` for lengths and indexes;
 - literals with underscores, `0x`, `0b` and suffixes, widening, and `as`
   for every other conversion;
 - defined behaviour for every operation: wrapping, `x / 0 == 0`,

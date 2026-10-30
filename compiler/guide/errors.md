@@ -838,7 +838,7 @@ errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
 self`, `static var N`.
 
 ```vole
-fn keep(v: sink Vec<i64>) -> i64 { v.len() }
+fn keep(v: sink Vec<i64>) -> usize { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
 ```err

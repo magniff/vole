@@ -24,8 +24,8 @@ Here are two functions side by side. Save them as `lengths.vl`:
 
 ```vole lengths.vl
 // Reads the words it's given: allocates nothing.
-fn longest(words: [str]) -> i64 {
-    var best = 0;
+fn longest(words: [str]) -> usize {
+    var best: usize = 0;
     for w in words {
         if w.len() > best {
             best = w.len();
@@ -35,8 +35,8 @@ fn longest(words: [str]) -> i64 {
 }
 
 // Builds a new Vec: needs an allocator.
-fn lengths(words: [str], gpa: Gpa) -> Vec<i64> {
-    var out: Vec<i64> = Vec::new_in(gpa);
+fn lengths(words: [str], gpa: Gpa) -> Vec<usize> {
+    var out: Vec<usize> = Vec::new_in(gpa);
     for w in words {
         out.push(w.len());
     }
