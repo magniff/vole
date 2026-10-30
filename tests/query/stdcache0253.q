@@ -8,7 +8,7 @@
 ## line runs once without the cache and twice with it (run.sh): the same
 ## answers.
 $ show print_int
-// std::fmt::print_int	../../compiler/std/fmt.vl:111-121	effects: io global panic
+// std::fmt::print_int	../../compiler/std/fmt.vl:194-204	effects: io panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {

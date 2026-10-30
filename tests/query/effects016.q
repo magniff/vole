@@ -19,7 +19,7 @@ crate::address	global
 crate::at	panic
 crate::part	panic
 crate::whole	none
-std::window::script::whole	io global panic diverge
+std::window::script::whole	io panic diverge
 crate::color	panic
 std::gpu::PassDesc::color	none
 crate::sum	none
