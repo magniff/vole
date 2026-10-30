@@ -59,6 +59,13 @@ spec in every program's Fmt path breaks by itself.
    or after p, so a hole inside a literal is the token before it.
 7. The disk filled up halfway through (other worktrees).
 
+## The chain
+
+0.25.5, stage 1, cannot build a format literal: `println("{} {x}", x)` is
+type error "'println<[u8]>' expects 1 arguments, got 2", and
+`println("plain {x}")` prints `{x}` with a warning. compiler/src keeps its
+f-strings until the release after 0.26.2 builds it.
+
 ## Never used
 
 `refactor extract-function`, `inline`, `split`; `probe` and `reduce`
@@ -66,16 +73,16 @@ spec in every program's Fmt path breaks by itself.
 
 ## Fix list, in order
 
-1. [tool] `fix` and `edit` write through a symlink, not over it
-   (tools/edit's write).
+1. [tool] done (tools/proc's rename_file): `fix` and `edit` write through a
+   symlink, not over it; tests/refactor/symlink0262.
 2. [tool] `fix --only fstring` rule 4: record which literals 0.26.1
    would have printed as they are (e.g. only in files that still hold an
    f-string, or behind `--plain-braces`), so that a second run is a no-op.
-3. [compiler] macro_error's help for `println!(..)` writes an f-string;
-   in 0.26.3 it should drop the `!` (`println("{}", 1)`), `format!` to
-   `format_in(.., gpa)`, `write!(f, ..)` to `f.write(..)`.
-4. [lsp] hover on a name in a literal's hole answers the literal's range,
-   not the name's.
+3. [compiler] done: macro_error's help for `println!(..)` is the call
+   without its `!` (`println("{}", 1)`), `format!` `format_in(.., gpa)`,
+   `write!(f, ..)` `f.write(..)`.
+4. [lsp] done: hover on a name in a literal's hole answers the name's
+   range (tests/lsp/fmtlit).
 5. [compiler] an `unsafe { .. }` inside an f-string hole is not an unsafe
    site for unsafe.unjustified (examples/allocators/check-alloc: 3 more
    once migrated).
