@@ -162,6 +162,11 @@ code generators' agent (0.26.1) sees what moved.
   k) = mk::<R>()` owns s, as the own pass's let_drops. `--places-diff`
   compares a borrowed copy with glue too (`'s' own kept, places no
   drop`).
+  The one difference it added over tests/run, `let x = S;` of an owned
+  static in a function that makes no place for S, was the own pass's
+  bug: nothing checked the move and x dropped what S keeps (a double
+  free); it is own.move_out now, as Rust's E0507 (front/own/walk.vl
+  eval_place_value).
 
 ## `--places-diff`: the differences left
 
@@ -174,7 +179,6 @@ drop the IR proves never runs):
 |---|---|---|---|---|
 | sem_own_match_arm_return `f` | `e` | under a flag | removed | `match e { E::A(d) => return .., E::N => {} }`: past the match `e` is `E::N`, which has nothing to drop |
 | sem_own_pat_arms_matrix `m_A_whole`, `m_B_whole`, `m_C_whole`, `m_N_whole` | `e` | under a flag | removed | every arm moves `e` or its owned payload: nothing is left at the end |
-| sem_own_static_owned_move `main` | `x` | kept | no drop | `let x = S;` of an owned static: the IR borrows it (statics are never dropped), the own pass's let_drops drops x (compared since 0.26.1, R10: a borrowed copy is) |
 
 Differences of form, not listed by `--places-diff` (diff.vl):
 
