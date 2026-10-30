@@ -326,10 +326,13 @@ check module_path_without_crate "$ok" "$out"
 # compiler's errors (ERR_KIND; 0.25.3: main.missing) and warnings and keyed errors (their
 # third argument); and every entry is such a code. (0.25.3: lex.* and
 # embed.*, text blocks and include_str; `embed.sh`, a script's name, is
-# not one.)
+# not one. 0.26.0: gpu.* and wgsl.*, and std's own: the shader compiler's
+# `"wgsl.X"` and `error wgsl.target`, std::gpu's `gpu.X:` texts.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run|gpu|wgsl)\.[a-z0-9_-]+"' \
         compiler/src
+    grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
+    grep -rhoE 'gpu\.[a-z]+:' compiler/std/gpu | sed -e 's/^\(.*\):$/c"\1"/'
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
     # (0.15: guide's codes, written into its own messages)

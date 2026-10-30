@@ -1130,7 +1130,7 @@ fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
 
 `dev.shader_wgsl` runs std::gpu::wgsl's front end, then Metal's compiler
 on the MSL it writes. Everything is an `Err(gpu::Error::Shader(m))` with
-the position in the WGSL, never a panic (`wgslc explain CODE`):
+the position in the WGSL, never a panic (`volec explain CODE`):
 
 - The front end takes the subset of docs/design/gpu.md (section 2.10) and
   rejects the rest at its line: `wgsl.unsupported` (f16, `override`,
