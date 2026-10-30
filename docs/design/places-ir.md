@@ -654,7 +654,7 @@ representation work below moves to 0.26.1.
 |---|---|
 | total at `check`, after step 7 | ≤ 0.26.0's, with the placeholders' 228M given back; the aim 5,000M (leaving 0.26.2's effects on the IR room: today's AST effects are 95M) |
 | -O1 build: IR to SSA in place of AST to SSA | the whole -O1 and -O2 build ≤ 1.10x of the AST lowering's on the same source (2026-10-30: 1,343M was the AST walk's cost then, and the walk has since got cheaper, 1,352M against places' 1,749M at db652f8b; lowering is under 1% of an -O2 build) |
-| -O0 build: gen0 from the IR | -O0 total ≤ 1.10x of the AST lowering's on the same source (the user, 2026-10-30: 1.05x is out of reach with every body built at a build; measured 1.26x at 35ee705c, code size at parity) |
+| -O0 build: gen0 from the IR | -O0 total ≤ 1.15x of the AST lowering's on the same source, the gate's measure at the default -j (the user, 2026-10-30, twice: 1.05x was out of reach with every body built at a build; then 1.10x, as the remaining cost is per-statement bookkeeping, not a trim: flipped at 1.137x, step 7 expected to bring it to about 1.11x of today's) |
 | RSS of `check` | ≤ 1.05x of 513 MB |
 
 **Measured in 0.26.0 (the fallback applied).** `tests/compile_cost.sh -r
