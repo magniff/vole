@@ -1,0 +1,1225 @@
+// The check-time forms of GPU diagnostics 2, 3, 4 and 6 (0.26.2, plan
+// §10.2): what one function's text makes certain about std::gpu's calls,
+// after the checker, in a program that has an `embed wgsl` block.
+//
+// One rule: a value is followed only when a `let` (or a `var` never
+// assigned) binds it, its name bound once in the function, to
+//   - `dev.shader_wgsl(K.src)` (a shader of block K's module),
+//   - `dev.compute_pipeline(s, ..)` or `dev.render_pipeline(..)` of such a
+//     shader (a pipeline of K),
+//   - `p.bind_layout(G)` with G a literal (group G of K),
+//   - `dev.buffer(n, U)` or `dev.buffer_init(b, U)` with U a constant
+//     (`BufferUsage::A | BufferUsage::B`: its usage);
+// and a `dev.bind_group(l, [gpu::bind(B, b), ..][..])` is read only when
+// its entries are an array literal. Nothing that came from elsewhere (a
+// parameter, a field, a call of another function) is followed, so nothing
+// is reported that the text does not make certain. std::gpu's functions
+// are known by their resolved FNS entries.
+//
+//   gpu.entry   `compute_pipeline(s, "mian")`, `RenderDesc::new(s, "vs",
+//               "fs", ..)`: an entry name that is no entry point of the
+//               stage in K's module; the fix, K's field
+//   gpu.layout  an entry of a bind group for K's group G that K's module
+//               does not declare, or of another kind (a buffer for a
+//               texture, a uniform buffer for storage)
+//   gpu.usage   a buffer of constant usage used where it needs a flag its
+//               usage lacks; the try: the usage with the flag
+//   gpu.unwritten (a warning) a buffer bound at a uniform binding that no
+//               write_buffer, map_write or copy in the function writes,
+//               and that is never passed elsewhere or stored
+//
+// A module's bindings come from the scan of its text (wgsl.vl: BIND_),
+// never from std::gpu::wgsl's reflection (which reaches the writers).
+
+use crate::base::{
+    IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, intern, intern_c, sym_text,
+};
+use crate::base::diag::{
+    ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
+    report_warning,
+};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::PROGRAM;
+use crate::front::check::names::near_to;
+use crate::front::embed::wgsl::{
+    BIND_B, BIND_BLOCK, BIND_G, BIND_KIND, BIND_NAME, BIND_POS, BK_SAMPLER, BK_STORAGE,
+    BK_STORAGE_RW, BK_TEXTURE, BK_UNIFORM, BLOCK_FIRST, BLOCK_NODE, BLOCK_STRUCT, ENTRY_STAGE,
+    ENTRY_SYM, STAGE_COMPUTE, STAGE_FRAGMENT, STAGE_VERTEX,
+};
+use crate::front::lexer::{Tok, str_at};
+use crate::front::modules::{STD_MODULE, child_module, is_within};
+use crate::front::types::{FNS, STRUCTS, TYPES, TyKind};
+
+// The calls the lint knows (GF_), by their functions.
+const GF_NONE: i64 = 0;
+const GF_SHADER_WGSL: i64 = 1;
+const GF_COMPUTE_PIPELINE: i64 = 2;
+const GF_RENDER_PIPELINE: i64 = 3;
+const GF_RENDER_DESC: i64 = 4;
+const GF_DEPTH_ONLY: i64 = 5;
+const GF_BIND_LAYOUT: i64 = 6;
+const GF_BUFFER: i64 = 7;
+const GF_BUFFER_INIT: i64 = 8;
+const GF_BIND_GROUP: i64 = 9;
+const GF_BIND: i64 = 10;
+const GF_BIND_RANGE: i64 = 11;
+const GF_BIND_TEXTURE: i64 = 12;
+const GF_BIND_SAMPLER: i64 = 13;
+const GF_WRITE_BUFFER: i64 = 14;
+const GF_MAP_READ: i64 = 15;
+const GF_MAP_WRITE: i64 = 16;
+const GF_COPY_BUFFER: i64 = 17;
+const GF_SET_VERTEX: i64 = 18;
+const GF_SET_INDEX: i64 = 19;
+const GF_SIZE: i64 = 20;
+// A contract's check of another call (`f$pre`): its arguments are that
+// call's.
+const GF_PRE: i64 = 21;
+
+// BufferUsage's flags (std::gpu::types), by name.
+const U_MAP_READ: i64 = 1;
+const U_MAP_WRITE: i64 = 2;
+const U_COPY_SRC: i64 = 4;
+const U_COPY_DST: i64 = 8;
+const U_INDEX: i64 = 16;
+const U_VERTEX: i64 = 32;
+const U_UNIFORM: i64 = 64;
+const U_STORAGE: i64 = 128;
+
+// What a followed name holds (L_KIND).
+const LK_SHADER: i64 = 1;
+const LK_PIPELINE: i64 = 2;
+const LK_LAYOUT: i64 = 3;
+const LK_BUFFER: i64 = 4;
+const LK_DESC: i64 = 5;
+
+// The followed names of the function being linted: the name, what it
+// holds, its block (an index of BLOCK_NODE), the pipeline's entry point
+// (a symbol; 0: none), the layout's group, the buffer's usage (-1: not
+// constant) and its usage expression, the `let`'s position, whether it
+// is written, whether it escapes, and the bind entry that binds it at a
+// uniform binding (its node; 0: none) with that binding (a BIND_ index).
+static var L_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_ENTRY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_GROUP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_USAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_USAGE_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_WRITTEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_ESCAPED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_UNIFORM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var L_UNIFORM_BIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Each name's bindings and assignments in the function (pairs: name,
+// count), for the "bound once, never assigned" rule.
+static var BOUND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var ASSIGNED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The checker's temporaries in scope (the blocks being walked): a
+// contract's check binds a call's arguments to `?aN` lets in a block
+// around the call. Name and value, in pairs.
+static var TEMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static var GPU_MODULE: i64 = -1;
+static var SYM_SRC: i64 = 0;
+static var SYM_BUFFER_USAGE: i64 = 0;
+
+// (check_program, after the checker) Every function of the program's own
+// (not std's) linted, when the program has a block.
+pub fn gpu_lint() {
+    if BLOCK_NODE.count == 0 || STD_MODULE < 0 {
+        return;
+    }
+    GPU_MODULE = child_module(STD_MODULE, intern_c(c"gpu"));
+    if GPU_MODULE < 0 {
+        return;
+    }
+    SYM_SRC = intern_c(c"src");
+    SYM_BUFFER_USAGE = intern_c(c"BufferUsage");
+    for i in 0..NODES[PROGRAM].count {
+        let f = child(PROGRAM, i);
+        if NODES[f].kind == NodeKind::Fn && NODES[f].c > 0
+            && !is_within(crate::front::modules::module_of(f), STD_MODULE) {
+            lint_fn(f);
+        }
+    }
+}
+
+fn lint_fn(f: i64) {
+    L_NAME.count = 0;
+    L_KIND.count = 0;
+    L_BLOCK.count = 0;
+    L_ENTRY.count = 0;
+    L_GROUP.count = 0;
+    L_USAGE.count = 0;
+    L_USAGE_NODE.count = 0;
+    L_POS.count = 0;
+    L_WRITTEN.count = 0;
+    L_ESCAPED.count = 0;
+    L_UNIFORM.count = 0;
+    L_UNIFORM_BIND.count = 0;
+    BOUND.count = 0;
+    ASSIGNED.count = 0;
+    TEMPS.count = 0;
+    for k in 0..NODES[f].count {
+        count_name(&BOUND, NODES[child(f, k)].a);
+    }
+    // the names' bindings and assignments, then the followed lets in
+    // order (a let's value may name an earlier one), then the uses
+    walk(NODES[f].c, 0);
+    walk(NODES[f].c, 1);
+    walk(NODES[f].c, 2);
+    for l in 0..L_NAME.count {
+        if L_KIND.get(l) == LK_BUFFER && L_UNIFORM.get(l) != 0 && L_WRITTEN.get(l) == 0
+            && L_ESCAPED.get(l) == 0 && L_USAGE.get(l) >= 0 {
+            unwritten(l);
+        }
+    }
+}
+
+// ---- The walk: phase 0 counts, 1 follows the lets, 2 reads the uses ----
+
+fn walk(n: i64, phase: i64) {
+    if n <= 0 {
+        return;
+    }
+    let k = NODES[n].kind;
+    if k == NodeKind::Ident {
+        if phase == 2 {
+            use_of(n);
+        }
+        return;
+    }
+    if k == NodeKind::Let {
+        if is_temp_let(n) {
+            // (its value is read where the temporary is: strip, use_of)
+            if phase != 2 {
+                walk(NODES[n].c, phase);
+            }
+            return;
+        }
+        if phase == 0 {
+            count_pattern(NODES[n].a);
+        } else if phase == 1 {
+            let mark = TEMPS.count;
+            follow_let(n);
+            TEMPS.count = mark;
+        }
+        walk(NODES[n].c, phase);
+        return;
+    }
+    if k == NodeKind::Assign {
+        let t = NODES[n].b;
+        if phase == 0 && NODES[t].kind == NodeKind::Ident {
+            count_name(&ASSIGNED, NODES[t].a);
+        }
+        if phase == 2 && NODES[t].kind == NodeKind::Ident {
+            escape(NODES[t].a);
+        } else {
+            walk(t, phase);
+        }
+        walk(NODES[n].c, phase);
+        return;
+    }
+    if k == NodeKind::Call {
+        if phase == 2 && lint_call(n) {
+            return;
+        }
+        walk_list(n, phase);
+        return;
+    }
+    if k == NodeKind::Block {
+        let mark = TEMPS.count;
+        push_temps(n);
+        walk_list(n, phase);
+        walk(NODES[n].a, phase);
+        TEMPS.count = mark;
+        return;
+    }
+    if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::Interp
+        || k == NodeKind::VariantLit {
+        walk_list(n, phase);
+        return;
+    }
+    if k == NodeKind::StructLit {
+        for i in 0..NODES[n].count {
+            walk(NODES[child(n, i)].b, phase);
+        }
+        return;
+    }
+    if k == NodeKind::Match {
+        walk(NODES[n].a, phase);
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            if phase == 0 {
+                count_pattern(NODES[arm].a);
+            }
+            walk(NODES[arm].b, phase);
+            walk(NODES[arm].c, phase);
+        }
+        return;
+    }
+    if k == NodeKind::For {
+        if phase == 0 {
+            count_pattern(NODES[n].b);
+        }
+        walk(NODES[n].c, phase);
+        walk(NODES[n].d, phase);
+        return;
+    }
+    if k == NodeKind::Closure {
+        for i in 0..NODES[n].count {
+            if phase == 0 {
+                count_name(&BOUND, NODES[child(n, i)].a);
+            }
+        }
+        walk(NODES[n].a, phase);
+        return;
+    }
+    if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Cast
+        || k == NodeKind::Return || k == NodeKind::Try || k == NodeKind::ExprStmt
+        || k == NodeKind::Defer {
+        walk(NODES[n].a, phase);
+        return;
+    }
+    if k == NodeKind::Binary || k == NodeKind::If || k == NodeKind::While {
+        if k == NodeKind::If {
+            walk(NODES[n].a, phase);
+        }
+        walk(NODES[n].b, phase);
+        walk(NODES[n].c, phase);
+        return;
+    }
+    if k == NodeKind::Unary || k == NodeKind::Loop || k == NodeKind::Break {
+        walk(NODES[n].b, phase);
+        return;
+    }
+    if k == NodeKind::Index || k == NodeKind::Range || k == NodeKind::Repeat {
+        walk(NODES[n].a, phase);
+        walk(NODES[n].b, phase);
+        return;
+    }
+    if k == NodeKind::InterpHole {
+        walk(NODES[n].a, phase);
+    }
+}
+
+fn walk_list(n: i64, phase: i64) {
+    for i in 0..NODES[n].count {
+        walk(child(n, i), phase);
+    }
+}
+
+fn count_name(v: inout IntVec, name: i64) {
+    var i = 0;
+    while i < v.count {
+        if v.get(i) == name {
+            v.set(i + 1, v.get(i + 1) + 1);
+            return;
+        }
+        i += 2;
+    }
+    v.push(name);
+    v.push(1);
+}
+
+fn name_count(v: IntVec, name: i64) -> i64 {
+    var i = 0;
+    while i < v.count {
+        if v.get(i) == name {
+            return v.get(i + 1);
+        }
+        i += 2;
+    }
+    0
+}
+
+// The names a pattern binds, counted.
+fn count_pattern(p: i64) {
+    if p <= 0 {
+        return;
+    }
+    let k = NODES[p].kind;
+    if k == NodeKind::PatBind {
+        count_name(&BOUND, NODES[p].a);
+    } else if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+        for i in 0..NODES[p].count {
+            count_pattern(child(p, i));
+        }
+    }
+}
+
+// ---- Following the lets ----
+
+// The followed name `name`'s index, or -1.
+fn local(name: i64) -> i64 {
+    for l in 0..L_NAME.count {
+        if L_NAME.get(l) == name {
+            return l;
+        }
+    }
+    -1
+}
+
+// The value expression n stands for: under `?`, the synthetic `&`/`*` the
+// checker puts on a receiver, a block's tail (a contract's check is a
+// block around the call; its temporaries come into scope) and a
+// temporary's value.
+fn strip(n0: i64) -> i64 {
+    var n = n0;
+    loop {
+        let k = NODES[n].kind;
+        if k == NodeKind::Try {
+            n = NODES[n].a;
+        } else if k == NodeKind::Unary && (NODES[n].op == Tok::Amp || NODES[n].op == Tok::Star) {
+            n = NODES[n].b;
+        } else if k == NodeKind::Block && NODES[n].a > 0 {
+            push_temps(n);
+            n = NODES[n].a;
+        } else if k == NodeKind::Ident && temp_value(NODES[n].a) > 0
+            && temp_value(NODES[n].a) != n {
+            n = temp_value(NODES[n].a);
+        } else {
+            return n;
+        }
+    }
+}
+
+// Whether `let` n binds one of the checker's temporaries (`?a1`, the own
+// pass's `__own_tv`).
+fn is_temp_let(n: i64) -> bool {
+    let p = NODES[n].a;
+    if NODES[p].kind != NodeKind::PatBind {
+        return false;
+    }
+    let t = sym_text(NODES[p].a);
+    t.len > 1 && (t[0] == '?' || (t[0] == '_' && t[1] == '_'))
+}
+
+// Block n's temporaries into scope, and those of the blocks that are
+// their values (the own pass's `__own_tv` in a contract's argument).
+fn push_temps(n: i64) {
+    for i in 0..NODES[n].count {
+        let st = child(n, i);
+        if NODES[st].kind == NodeKind::Let && is_temp_let(st) {
+            TEMPS.push(NODES[NODES[st].a].a);
+            TEMPS.push(NODES[st].c);
+            var v = NODES[st].c;
+            while NODES[v].kind == NodeKind::Try {
+                v = NODES[v].a;
+            }
+            if NODES[v].kind == NodeKind::Block {
+                push_temps(v);
+            }
+        }
+    }
+}
+
+// The value of temporary `name` in scope (the innermost), or 0.
+fn temp_value(name: i64) -> i64 {
+    let i = temp_index(name);
+    if i >= 0 { TEMPS.get(i + 1) } else { 0 }
+}
+
+// The index in TEMPS of temporary `name` in scope (the innermost), or -1.
+fn temp_index(name: i64) -> i64 {
+    var i = TEMPS.count - 2;
+    while i >= 0 {
+        if TEMPS.get(i) == name {
+            return i;
+        }
+        i -= 2;
+    }
+    -1
+}
+
+// The followed name expression n (stripped) is, or -1.
+fn local_of(n: i64) -> i64 {
+    let s = strip(n);
+    if NODES[s].kind == NodeKind::Ident { local(NODES[s].a) } else { -1 }
+}
+
+// The `let` n: its name followed when its value is one the lint knows.
+fn follow_let(n: i64) {
+    let p = NODES[n].a;
+    if NODES[p].kind != NodeKind::PatBind {
+        return;
+    }
+    let name = NODES[p].a;
+    if name_count(BOUND, name) != 1 || name_count(ASSIGNED, name) != 0 {
+        return;
+    }
+    let v = strip(NODES[n].c);
+    if NODES[v].kind != NodeKind::Call {
+        return;
+    }
+    let g = gpu_fn(v);
+    var kind = 0;
+    var block = -1;
+    var entry = 0;
+    var group = -1;
+    var usage = -1;
+    var usage_node = 0;
+    if g == GF_SHADER_WGSL {
+        block = shader_block(v);
+        kind = LK_SHADER;
+    } else if g == GF_COMPUTE_PIPELINE && NODES[v].count >= 3 {
+        block = shader_of(child(v, 1));
+        entry = entry_sym(child(v, 2));
+        kind = LK_PIPELINE;
+    } else if g == GF_RENDER_PIPELINE && NODES[v].count >= 2 {
+        block = desc_block(child(v, 1));
+        kind = LK_PIPELINE;
+    } else if g == GF_RENDER_DESC || g == GF_DEPTH_ONLY {
+        block = shader_of(child(v, 0));
+        kind = LK_DESC;
+        if NODES[v].count >= 2 {
+            entry = entry_sym(child(v, 1));
+        }
+    } else if g == GF_BIND_LAYOUT && NODES[v].count >= 2 {
+        let pl = local_of(child(v, 0));
+        let gn = child(v, 1);
+        if pl >= 0 && L_KIND.get(pl) == LK_PIPELINE && NODES[gn].kind == NodeKind::Int {
+            block = L_BLOCK.get(pl);
+            entry = L_ENTRY.get(pl);
+            group = NODES[gn].a;
+            kind = LK_LAYOUT;
+        }
+    } else if (g == GF_BUFFER || g == GF_BUFFER_INIT) && NODES[v].count >= 3 {
+        usage_node = child(v, 2);
+        usage = usage_of(usage_node);
+        kind = LK_BUFFER;
+    }
+    if kind == 0 || (kind != LK_BUFFER && block < 0) {
+        return;
+    }
+    L_NAME.push(name);
+    L_KIND.push(kind);
+    L_BLOCK.push(block);
+    L_ENTRY.push(entry);
+    L_GROUP.push(group);
+    L_USAGE.push(usage);
+    L_USAGE_NODE.push(usage_node);
+    L_POS.push(NODES[p].start);
+    // (a buffer_init's bytes are its contents: written)
+    L_WRITTEN.push(if g == GF_BUFFER_INIT { 1 } else { 0 });
+    L_ESCAPED.push(0);
+    L_UNIFORM.push(0);
+    L_UNIFORM_BIND.push(-1);
+}
+
+// The block of `dev.shader_wgsl(K.src)` (call v), or -1.
+fn shader_block(v: i64) -> i64 {
+    if NODES[v].count < 2 {
+        return -1;
+    }
+    let a = strip(child(v, 1));
+    if NODES[a].kind != NodeKind::FieldAccess || NODES[a].b != SYM_SRC {
+        return -1;
+    }
+    block_of_type(NODES[NODES[a].a].ty)
+}
+
+// The block whose made struct type t is, or -1.
+fn block_of_type(t: i64) -> i64 {
+    if t <= 0 {
+        return -1;
+    }
+    let node = struct_node_of(t);
+    for b in 0..BLOCK_STRUCT.count {
+        if BLOCK_STRUCT.get(b) == node {
+            return b;
+        }
+    }
+    -1
+}
+
+// The block of shader expression n: a followed shader, or a
+// `dev.shader_wgsl(K.src)` in place; -1.
+fn shader_of(n: i64) -> i64 {
+    let l = local_of(n);
+    if l >= 0 {
+        return if L_KIND.get(l) == LK_SHADER { L_BLOCK.get(l) } else { -1 };
+    }
+    let s = strip(n);
+    if NODES[s].kind == NodeKind::Call && gpu_fn(s) == GF_SHADER_WGSL { shader_block(s) }
+    else { -1 }
+}
+
+// The block of a RenderDesc expression: a followed one, or
+// `RenderDesc::new(s, ..)` in place; -1.
+fn desc_block(n: i64) -> i64 {
+    let l = local_of(n);
+    if l >= 0 {
+        return if L_KIND.get(l) == LK_DESC { L_BLOCK.get(l) } else { -1 };
+    }
+    let s = strip(n);
+    let g = if NODES[s].kind == NodeKind::Call { gpu_fn(s) } else { GF_NONE };
+    if (g == GF_RENDER_DESC || g == GF_DEPTH_ONLY) && NODES[s].count >= 1 {
+        shader_of(child(s, 0))
+    } else {
+        -1
+    }
+}
+
+// The entry point an entry argument names: `K.main`'s field, or a string
+// literal's text (a symbol); 0 when neither.
+fn entry_sym(n: i64) -> i64 {
+    let s = strip(n);
+    if NODES[s].kind == NodeKind::FieldAccess {
+        return NODES[s].b;
+    }
+    if NODES[s].kind == NodeKind::Str {
+        return intern(str_at(NODES[s].a));
+    }
+    0
+}
+
+// The usage expression's value: BufferUsage's flags or'ed, or -1 when it
+// is not that constant.
+fn usage_of(n0: i64) -> i64 {
+    let n = strip(n0);
+    let k = NODES[n].kind;
+    if k == NodeKind::Binary && NODES[n].op == Tok::Pipe {
+        let a = usage_of(NODES[n].b);
+        let b = usage_of(NODES[n].c);
+        return if a < 0 || b < 0 { -1 } else { a | b };
+    }
+    if k == NodeKind::Int {
+        return NODES[n].a;
+    }
+    if k == NodeKind::Path && NODES[n].a == SYM_BUFFER_USAGE {
+        return flag_named(sym_text(NODES[n].b));
+    }
+    // (the checker's: `std::gpu::types::BufferUsage::COPY_DST`)
+    if k == NodeKind::Ident {
+        let t = sym_text(NODES[n].a);
+        let tail = "BufferUsage::";
+        var i = t.len;
+        while i > 0 && t[i - 1] != ':' {
+            i -= 1;
+        }
+        if i >= tail.len && t[i - tail.len..i] == tail {
+            return flag_named(t[i..t.len]);
+        }
+    }
+    -1
+}
+
+fn flag_named(name: [u8]) -> i64 {
+    if name == "MAP_READ" { U_MAP_READ } else if name == "MAP_WRITE" { U_MAP_WRITE }
+    else if name == "COPY_SRC" { U_COPY_SRC } else if name == "COPY_DST" { U_COPY_DST }
+    else if name == "INDEX" { U_INDEX } else if name == "VERTEX" { U_VERTEX }
+    else if name == "UNIFORM" { U_UNIFORM } else if name == "STORAGE" { U_STORAGE }
+    else if name == "INDIRECT" { 256 } else if name == "QUERY_RESOLVE" { 512 } else { -1 }
+}
+
+fn flag_text(bit: i64) -> [u8] {
+    if bit == U_MAP_READ { "MAP_READ" } else if bit == U_MAP_WRITE { "MAP_WRITE" }
+    else if bit == U_COPY_SRC { "COPY_SRC" } else if bit == U_COPY_DST { "COPY_DST" }
+    else if bit == U_INDEX { "INDEX" } else if bit == U_VERTEX { "VERTEX" }
+    else if bit == U_UNIFORM { "UNIFORM" } else if bit == U_STORAGE { "STORAGE" }
+    else if bit == 256 { "INDIRECT" } else { "QUERY_RESOLVE" }
+}
+
+// ---- std::gpu's functions ----
+
+// Which of std::gpu's functions call n is (GF_), by its resolved function.
+fn gpu_fn(n: i64) -> i64 {
+    let x = NODES[n].x;
+    if x <= 0 {
+        return GF_NONE;
+    }
+    let (module, fn_sym) = fn_facts(x);
+    if !is_within(module, GPU_MODULE) {
+        return GF_NONE;
+    }
+    let sym = sym_text(fn_sym);
+    // the last two segments of `std.gpu.Device.shader_wgsl`
+    var e = sym.len;
+    var i = e;
+    while i > 0 && sym[i - 1] != '.' && sym[i - 1] != ':' {
+        i -= 1;
+    }
+    let name = sym[i..e];
+    if name.len > 4 && name[name.len - 4..name.len] == "$pre" {
+        return GF_PRE;
+    }
+    var j = i;
+    while j > 0 && (sym[j - 1] == '.' || sym[j - 1] == ':') {
+        j -= 1;
+    }
+    var h = j;
+    while h > 0 && sym[h - 1] != '.' && sym[h - 1] != ':' {
+        h -= 1;
+    }
+    let owner = sym[h..j];
+    if owner == "Device" {
+        return if name == "shader_wgsl" { GF_SHADER_WGSL }
+            else if name == "compute_pipeline" { GF_COMPUTE_PIPELINE }
+            else if name == "render_pipeline" { GF_RENDER_PIPELINE }
+            else if name == "buffer" { GF_BUFFER } else if name == "buffer_init" { GF_BUFFER_INIT }
+            else if name == "bind_group" { GF_BIND_GROUP } else { GF_NONE };
+    }
+    if owner == "RenderDesc" {
+        return if name == "new" { GF_RENDER_DESC } else if name == "depth_only" { GF_DEPTH_ONLY }
+            else { GF_NONE };
+    }
+    if owner == "ComputePipeline" || owner == "RenderPipeline" {
+        return if name == "bind_layout" { GF_BIND_LAYOUT } else { GF_NONE };
+    }
+    if owner == "Queue" {
+        return if name == "write_buffer" { GF_WRITE_BUFFER } else { GF_NONE };
+    }
+    if owner == "Buffer" {
+        return if name == "map_read" || name == "map_read_copy_in" { GF_MAP_READ }
+            else if name == "map_write" { GF_MAP_WRITE } else if name == "size" { GF_SIZE }
+            else { GF_NONE };
+    }
+    if owner == "Encoder" {
+        return if name == "copy_buffer" { GF_COPY_BUFFER } else { GF_NONE };
+    }
+    if owner == "RenderPass" {
+        return if name == "set_vertex_buffer" { GF_SET_VERTEX }
+            else if name == "set_index_buffer" { GF_SET_INDEX } else { GF_NONE };
+    }
+    if name == "bind" { GF_BIND } else if name == "bind_range" { GF_BIND_RANGE }
+    else if name == "bind_texture" { GF_BIND_TEXTURE } else if name == "bind_sampler" {
+        GF_BIND_SAMPLER } else { GF_NONE }
+}
+
+// The module and symbol of the function a call's x names (x - 1; its
+// template, for an instance).
+fn fn_facts(x: i64) -> (i64, i64) {
+    // UNSAFE: FNS is the checker's function table, a raw pointer (front::types).
+    // SAFETY: x - 1 is a function the checker resolved a call to, so < FN_COUNT, and an
+    // instance's tmpl - 1 is its template, another; the table is not grown while the lint reads.
+    unsafe {
+        let f0 = x - 1;
+        let f = if FNS[f0].tmpl > 0 { FNS[f0].tmpl - 1 } else { f0 };
+        (FNS[f].module, FNS[f].name)
+    }
+}
+
+// The node of struct type t's struct, or -1 when t is no struct type.
+fn struct_node_of(t: i64) -> i64 {
+    // UNSAFE: TYPES and STRUCTS are the checker's tables, raw pointers (front::types).
+    // SAFETY: t is the type of a checked expression, so 0 < t < TYPE_COUNT, and a Struct
+    // type's `a` is an index of STRUCTS; neither grows while the lint reads.
+    unsafe { if TYPES[t].kind == TyKind::Struct { STRUCTS[TYPES[t].a].node } else { -1 } }
+}
+
+// ---- The uses ----
+
+// A use of a followed name the lint does not know: it escapes (a
+// temporary: what its value uses).
+fn use_of(n: i64) {
+    let i = temp_index(NODES[n].a);
+    if i >= 0 {
+        // (hidden while its value is walked: a temporary of a nested
+        // contract can be named as the one it reads, `let ?a1 = f(?a1)`)
+        TEMPS.set(i, 0);
+        walk(TEMPS.get(i + 1), 2);
+        TEMPS.set(i, NODES[n].a);
+        return;
+    }
+    // (a use the compiler made at the binding itself, its drop: no use)
+    let l = local(NODES[n].a);
+    if l >= 0 && NODES[n].start == L_POS.get(l) {
+        return;
+    }
+    escape(NODES[n].a);
+}
+
+fn escape(name: i64) {
+    let l = local(name);
+    if l >= 0 {
+        L_ESCAPED.set(l, 1);
+    }
+}
+
+// Call n, linted: true when its arguments were read here (the walk does
+// not go into them again).
+fn lint_call(n: i64) -> bool {
+    let g = gpu_fn(n);
+    if g == GF_NONE || g == GF_SHADER_WGSL || g == GF_BUFFER || g == GF_BUFFER_INIT
+        || g == GF_RENDER_PIPELINE {
+        return false;
+    }
+    if g == GF_COMPUTE_PIPELINE && NODES[n].count >= 3 {
+        let b = shader_of(child(n, 1));
+        entry_literal(b, child(n, 2), STAGE_COMPUTE);
+        return false;
+    }
+    if (g == GF_RENDER_DESC || g == GF_DEPTH_ONLY) && NODES[n].count >= 2 {
+        let b = shader_of(child(n, 0));
+        entry_literal(b, child(n, 1), STAGE_VERTEX);
+        if g == GF_RENDER_DESC && NODES[n].count >= 3 {
+            entry_literal(b, child(n, 2), STAGE_FRAGMENT);
+        }
+        return false;
+    }
+    if g == GF_BIND_GROUP && NODES[n].count >= 3 {
+        return bind_group(n);
+    }
+    // the buffer argument of a call that needs a flag, and writes
+    var buf = -1;
+    var need = 0;
+    var what: [u8] = "";
+    var writes = false;
+    if g == GF_WRITE_BUFFER && NODES[n].count >= 2 {
+        buf = 1;
+        need = U_COPY_DST;
+        what = "written by write_buffer";
+        writes = true;
+    } else if (g == GF_MAP_READ || g == GF_MAP_WRITE) && NODES[n].count >= 1 {
+        buf = 0;
+        need = if g == GF_MAP_READ { U_MAP_READ } else { U_MAP_WRITE };
+        what = if g == GF_MAP_READ { "mapped for reading" } else { "mapped for writing" };
+        writes = g == GF_MAP_WRITE;
+    } else if g == GF_SET_VERTEX && NODES[n].count >= 3 {
+        buf = 2;
+        need = U_VERTEX;
+        what = "set as a vertex buffer";
+    } else if g == GF_SET_INDEX && NODES[n].count >= 2 {
+        buf = 1;
+        need = U_INDEX;
+        what = "set as an index buffer";
+    } else if g == GF_SIZE || g == GF_PRE {
+        return true;
+    } else if g == GF_COPY_BUFFER && NODES[n].count >= 4 {
+        need_flag(child(n, 1), U_COPY_SRC, "copied from");
+        need_flag(child(n, 3), U_COPY_DST, "copied into");
+        let dst = local_of(child(n, 3));
+        if dst >= 0 {
+            L_WRITTEN.set(dst, 1);
+        }
+        walk(child(n, 0), 2);
+        for i in 4..NODES[n].count {
+            walk(child(n, i), 2);
+        }
+        return true;
+    }
+    if buf < 0 {
+        return false;
+    }
+    need_flag(child(n, buf), need, what);
+    let l = local_of(child(n, buf));
+    if l >= 0 && writes {
+        L_WRITTEN.set(l, 1);
+    }
+    for i in 0..NODES[n].count {
+        if i != buf {
+            walk(child(n, i), 2);
+        }
+    }
+    true
+}
+
+// Buffer expression a, used where it needs flag `need` (`what` it is
+// used as): gpu.usage when its usage is a constant without it.
+fn need_flag(a: i64, need: i64, what: [u8]) {
+    let l = local_of(a);
+    if l < 0 || L_KIND.get(l) != LK_BUFFER || L_USAGE.get(l) < 0 || (L_USAGE.get(l) & need) != 0 {
+        return;
+    }
+    usage_error(a, l, need, what, "");
+}
+
+// gpu.usage at a, of followed buffer l, which lacks flag `need`.
+fn usage_error(a: i64, l: i64, need: i64, what: [u8], extra: [u8]) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"gpu.usage";
+    err_begin(NODES[a].start);
+    let m = buf_new();
+    buf_bytes(m, "buffer '");
+    buf_bytes(m, sym_text(L_NAME.get(l)));
+    buf_bytes(m, "' (usage ");
+    usage_text(m, L_USAGE.get(l));
+    buf_bytes(m, ", created ");
+    buf_file_line(m, L_POS.get(l));
+    buf_bytes(m, ") ");
+    buf_bytes(m, what);
+    buf_bytes(m, extra);
+    buf_bytes(m, ", which needs ");
+    buf_bytes(m, flag_text(need));
+    err_fmt(buf_slice(m));
+    err_help(c"a buffer's usage is fixed when it is made (dev.buffer(size, usage)): every use needs its flag");
+    // the try: the usage with the flag
+    let u = L_USAGE_NODE.get(l);
+    let old = SRC[NODES[u].start..NODES[u].end];
+    if !has_newline(old) && !has_quote(old) {
+        let prefix = flag_prefix(u);
+        let t = buf_new();
+        buf_bytes(t, "edit patch ");
+        buf_file_line(t, NODES[u].start);
+        buf_bytes(t, " --old '");
+        buf_bytes(t, old);
+        buf_bytes(t, "' --new '");
+        buf_bytes(t, prefix);
+        buf_bytes(t, flag_text(need));
+        buf_bytes(t, " | ");
+        buf_bytes(t, old);
+        buf_byte(t, '\'');
+        err_try_tool(buf_slice(t), false);
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+fn has_newline(s: [u8]) -> bool {
+    for c in s {
+        if c == '\n' {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_quote(s: [u8]) -> bool {
+    for c in s {
+        if c == '\'' {
+            return true;
+        }
+    }
+    false
+}
+
+// The spelling of BufferUsage's path in usage expression u (`BufferUsage::`,
+// `gpu::BufferUsage::`): its first flag's text before the flag's name.
+fn flag_prefix(u0: i64) -> [u8] {
+    var u = strip(u0);
+    while NODES[u].kind == NodeKind::Binary {
+        u = strip(NODES[u].b);
+    }
+    if NODES[u].kind == NodeKind::Path || NODES[u].kind == NodeKind::Ident {
+        let t = SRC[NODES[u].start..NODES[u].end];
+        var i = t.len;
+        while i > 0 && t[i - 1] != ':' {
+            i -= 1;
+        }
+        if i > 0 {
+            return t[0..i];
+        }
+    }
+    "BufferUsage::"
+}
+
+// Usage bits as `A | B` into m.
+fn usage_text(m: i64, u: i64) {
+    var first = true;
+    var bit = 1;
+    while bit <= 512 {
+        if (u & bit) != 0 {
+            if !first {
+                buf_bytes(m, " | ");
+            }
+            buf_bytes(m, flag_text(bit));
+            first = false;
+        }
+        bit = bit << 1;
+    }
+    if first {
+        buf_byte(m, '0');
+    }
+}
+
+// ---- gpu.entry: an entry point named by a string literal ----
+
+// Entry argument a of a pipeline of block b's module, of `stage`: a string
+// literal that is no entry point of that stage is gpu.entry, fixed by the
+// block's field.
+fn entry_literal(b: i64, a0: i64, stage: i64) {
+    let a = strip(a0);
+    if b < 0 || NODES[a].kind != NodeKind::Str {
+        return;
+    }
+    let name = intern(str_at(NODES[a].a));
+    let first = BLOCK_FIRST.get(b);
+    let end = if b + 1 < BLOCK_FIRST.count { BLOCK_FIRST.get(b + 1) } else { ENTRY_SYM.count };
+    for k in first..end {
+        if ENTRY_SYM.get(k) == name && ENTRY_STAGE.get(k) == stage {
+            return;
+        }
+    }
+    let e = BLOCK_NODE.get(b);
+    let saved = ERR_KIND;
+    ERR_KIND = c"gpu.entry";
+    err_begin(NODES[a].start);
+    let m = buf_new();
+    buf_bytes(m, "the block '");
+    buf_bytes(m, sym_text(NODES[e].a));
+    buf_bytes(m, "' has no ");
+    buf_bytes(m, stage_attr(stage));
+    buf_bytes(m, " fn '");
+    buf_bytes(m, sym_text(name));
+    buf_bytes(m, "'");
+    if end == first {
+        buf_bytes(m, "; it has no entry points");
+    } else {
+        buf_bytes(m, "; its entry points: ");
+        for k in first..end {
+            if k > first {
+                buf_bytes(m, ", ");
+            }
+            buf_bytes(m, sym_text(ENTRY_SYM.get(k)));
+            buf_bytes(m, stage_name(ENTRY_STAGE.get(k)));
+        }
+    }
+    err_fmt(buf_slice(m));
+    var near = near_to(name);
+    var only = -1;
+    var count = 0;
+    for k in first..end {
+        if ENTRY_STAGE.get(k) == stage {
+            near.offer(ENTRY_SYM.get(k));
+            only = k;
+            count += 1;
+        }
+    }
+    let best = near.best;
+    let fix = if best > 0 { best } else if count == 1 { ENTRY_SYM.get(only) } else { 0 };
+    if fix > 0 {
+        let f = buf_new();
+        buf_bytes(f, sym_text(NODES[e].a));
+        buf_byte(f, '.');
+        buf_bytes(f, sym_text(fix));
+        err_fix(NODES[a].start, NODES[a].end, buf_slice(f));
+        let h = buf_new();
+        buf_bytes(h, "the block's field names its entry point: ");
+        buf_bytes(h, buf_slice(f));
+        buf_byte(h, 0);
+        err_help(buf_slice(h).ptr);
+    } else {
+        err_help(
+            c"name an entry point by the block's field (`K.main`): a field that is none is an error");
+    }
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+fn stage_attr(stage: i64) -> [u8] {
+    if stage == STAGE_COMPUTE { "@compute" } else if stage == STAGE_VERTEX { "@vertex" }
+    else { "@fragment" }
+}
+
+fn stage_name(stage: i64) -> [u8] {
+    if stage == STAGE_COMPUTE { " (compute)" } else if stage == STAGE_VERTEX { " (vertex)" }
+    else { " (fragment)" }
+}
+
+// ---- Bind groups: gpu.layout, gpu.usage, and what gpu.unwritten needs ----
+
+// `dev.bind_group(l, entries)` (call n): its entries read when l is a
+// followed layout (or `p.bind_layout(G)` in place) and they are an array
+// literal. True when its arguments were read here.
+fn bind_group(n: i64) -> bool {
+    let la = strip(child(n, 1));
+    var b = -1;
+    var group = -1;
+    var entry = 0;
+    let l = local_of(la);
+    if l >= 0 && L_KIND.get(l) == LK_LAYOUT {
+        b = L_BLOCK.get(l);
+        group = L_GROUP.get(l);
+        entry = L_ENTRY.get(l);
+    } else if NODES[la].kind == NodeKind::Call && gpu_fn(la) == GF_BIND_LAYOUT
+        && NODES[la].count >= 2 {
+        let pl = local_of(child(la, 0));
+        let gn = strip(child(la, 1));
+        if pl >= 0 && L_KIND.get(pl) == LK_PIPELINE && NODES[gn].kind == NodeKind::Int {
+            b = L_BLOCK.get(pl);
+            group = NODES[gn].a;
+            entry = L_ENTRY.get(pl);
+        }
+    }
+    var arr = strip(child(n, 2));
+    if NODES[arr].kind == NodeKind::Index && NODES[NODES[arr].b].kind == NodeKind::Range {
+        arr = strip(NODES[arr].a);
+    }
+    if b < 0 || NODES[arr].kind != NodeKind::Array {
+        return false;
+    }
+    walk(child(n, 0), 2);
+    walk(la, 2);
+    for i in 0..NODES[arr].count {
+        let en = strip(child(arr, i));
+        let g = if NODES[en].kind == NodeKind::Call { gpu_fn(en) } else { GF_NONE };
+        if g != GF_BIND && g != GF_BIND_RANGE && g != GF_BIND_TEXTURE && g != GF_BIND_SAMPLER
+            || NODES[en].count < 2 {
+            walk(en, 2);
+            continue;
+        }
+        bind_entry(b, group, entry, en, g);
+        for k in 2..NODES[en].count {
+            walk(child(en, k), 2);
+        }
+    }
+    true
+}
+
+// Entry en (a gpu::bind* call g) of a bind group for group `group` of
+// block b's module (its pipeline's entry point `entry`).
+fn bind_entry(b: i64, group: i64, entry: i64, en: i64, g: i64) {
+    let bn = strip(child(en, 0));
+    let res = child(en, 1);
+    let l = local_of(res);
+    if NODES[bn].kind != NodeKind::Int {
+        if l >= 0 {
+            L_ESCAPED.set(l, 1);
+        }
+        return;
+    }
+    let binding = NODES[bn].a;
+    var d = -1;
+    for i in 0..BIND_BLOCK.count {
+        if BIND_BLOCK.get(i) == b && BIND_G.get(i) == group && BIND_B.get(i) == binding {
+            d = i;
+        }
+    }
+    if d < 0 {
+        layout_error(b, group, entry, en, -1, "");
+        if l >= 0 {
+            L_ESCAPED.set(l, 1);
+        }
+        return;
+    }
+    let kind = BIND_KIND.get(d);
+    let is_buffer = g == GF_BIND || g == GF_BIND_RANGE;
+    let wants_buffer = kind == BK_UNIFORM || kind == BK_STORAGE || kind == BK_STORAGE_RW;
+    if is_buffer != wants_buffer || (g == GF_BIND_SAMPLER) != (kind == BK_SAMPLER) {
+        layout_error(b, group, entry, en, d,
+            if g == GF_BIND_TEXTURE { "a texture view" } else if g == GF_BIND_SAMPLER {
+                "a sampler" } else { "a buffer" });
+        if l >= 0 {
+            L_ESCAPED.set(l, 1);
+        }
+        return;
+    }
+    if l < 0 || L_KIND.get(l) != LK_BUFFER {
+        return;
+    }
+    let usage = L_USAGE.get(l);
+    // (a uniform binding of a buffer made for storage: gpu.layout, below,
+    // and not gpu.unwritten too)
+    if kind == BK_UNIFORM && (usage < 0 || (usage & U_UNIFORM) != 0 || (usage & U_STORAGE) == 0) {
+        L_UNIFORM.set(l, en);
+        L_UNIFORM_BIND.set(l, d);
+    }
+    if usage < 0 {
+        return;
+    }
+    let need = if kind == BK_UNIFORM { U_UNIFORM } else { U_STORAGE };
+    let other = if kind == BK_UNIFORM { U_STORAGE } else { U_UNIFORM };
+    if (usage & need) != 0 {
+        return;
+    }
+    if (usage & other) != 0 {
+        let t = buf_new();
+        buf_bytes(t, if other == U_STORAGE { "storage buffer '" } else { "uniform buffer '" });
+        buf_bytes(t, sym_text(L_NAME.get(l)));
+        buf_byte(t, '\'');
+        layout_error(b, group, entry, en, d, buf_slice(t));
+        return;
+    }
+    let w = buf_new();
+    buf_bytes(w, " at @binding(");
+    buf_int(w, binding);
+    buf_bytes(w, ") ");
+    buf_bytes(w, bind_kind_text(kind));
+    buf_bytes(w, " '");
+    buf_bytes(w, sym_text(BIND_NAME.get(d)));
+    buf_byte(w, '\'');
+    usage_error(res, l, need, "bound", buf_slice(w));
+}
+
+fn bind_kind_text(kind: i64) -> [u8] {
+    if kind == BK_UNIFORM { "uniform" } else if kind == BK_STORAGE { "storage, read" }
+    else if kind == BK_STORAGE_RW { "storage, read_write" } else if kind == BK_TEXTURE {
+        "texture" } else if kind == BK_SAMPLER { "sampler" } else { "storage texture" }
+}
+
+// gpu.layout at bind entry en: binding d of block b's group `group` (-1:
+// none) and what the entry is (`is`, "" when d is none).
+fn layout_error(b: i64, group: i64, entry: i64, en: i64, d: i64, is: [u8]) {
+    let e = BLOCK_NODE.get(b);
+    let binding = NODES[strip(child(en, 0))].a;
+    let saved = ERR_KIND;
+    ERR_KIND = c"gpu.layout";
+    err_begin(NODES[en].start);
+    let m = buf_new();
+    buf_bytes(m, "bind group ");
+    buf_int(m, group);
+    buf_bytes(m, " of '");
+    buf_bytes(m, sym_text(NODES[e].a));
+    if entry > 0 {
+        buf_byte(m, '.');
+        buf_bytes(m, sym_text(entry));
+    }
+    buf_bytes(m, "' (");
+    buf_file_line(m, NODES[e].start);
+    buf_bytes(m, ") ");
+    if d < 0 {
+        buf_bytes(m, "has no @binding(");
+        buf_int(m, binding);
+        buf_bytes(m, ")");
+        var any = false;
+        for i in 0..BIND_BLOCK.count {
+            if BIND_BLOCK.get(i) == b && BIND_G.get(i) == group {
+                buf_bytes(m, if any { ", " } else { "; its bindings: " });
+                bind_text(m, i);
+                any = true;
+            }
+        }
+        if !any {
+            buf_bytes(m, "; the group has no bindings");
+        }
+    } else {
+        buf_bytes(m, "wants ");
+        bind_text(m, d);
+        buf_bytes(m, ", but entry ");
+        buf_int(m, binding);
+        buf_bytes(m, " is ");
+        buf_bytes(m, is);
+    }
+    err_fmt(buf_slice(m));
+    err_help(c"a bind group's entries are the bindings the shader declares for its group, each of its kind: gpu::bind for a uniform or storage buffer, gpu::bind_texture for a texture, gpu::bind_sampler for a sampler");
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// `@binding(B) uniform 'params'` of binding i.
+fn bind_text(m: i64, i: i64) {
+    buf_bytes(m, "@binding(");
+    buf_int(m, BIND_B.get(i));
+    buf_bytes(m, ") ");
+    buf_bytes(m, bind_kind_text(BIND_KIND.get(i)));
+    buf_bytes(m, " '");
+    buf_bytes(m, sym_text(BIND_NAME.get(i)));
+    buf_byte(m, '\'');
+}
+
+// gpu.unwritten (a warning) of followed buffer l.
+fn unwritten(l: i64) {
+    let en = L_UNIFORM.get(l);
+    let d = L_UNIFORM_BIND.get(l);
+    let m = buf_new();
+    buf_bytes(m, "buffer '");
+    buf_bytes(m, sym_text(L_NAME.get(l)));
+    buf_bytes(m, "' (");
+    buf_file_line(m, L_POS.get(l));
+    buf_bytes(m, ") is bound at uniform '");
+    buf_bytes(m, sym_text(BIND_NAME.get(d)));
+    buf_bytes(m, "' (");
+    buf_file_line(m, BIND_POS.get(d));
+    buf_bytes(m, "), but no write_buffer, map_write or copy into it is in this function");
+    buf_byte(m, 0);
+    let h = buf_new();
+    buf_bytes(h, "a new buffer holds zeros, no value: write it before the first submit that reads it, `queue.write_buffer(");
+    buf_bytes(h, sym_text(L_NAME.get(l)));
+    buf_bytes(h, ", 0, bytes)`, or make it with its bytes (`dev.buffer_init`)");
+    buf_byte(h, 0);
+    report_warning(NODES[en].start, 0, c"gpu.unwritten", buf_slice(m).ptr, buf_slice(h).ptr);
+}
