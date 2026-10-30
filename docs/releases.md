@@ -101,18 +101,21 @@ compiler/src/places/README.md):
 The places IR, the code generators' half (placesir261b; §8 steps 1 to 5,
 compiler/src/middle/README.md, compiler/src/gen0/README.md):
 
-- `VOLE_LOWER=places`: both code generators read each function's kept
-  body. -O1 and -O2 lower it to the SSA IR (middle/lower/places.vl): a
-  scalar never borrowed is an SSA variable, blocks in reverse postorder,
-  the IR's drops as calls of their shims (a flagged one under its flag),
-  switches as one Switch, an assert's condition from the IR. -O0
-  generates from it (gen0/gen/places.vl): a statement temporary's slot
-  shared once it is dead, a value read first by the next statement (or
-  at a block's start, by every predecessor's end) kept in the
-  accumulator, a call's compound result made in its destination. Every
-  function of compiler/src and of tests/run comes from the IR but under
-  `--check-unsafe`; compilers built so compile compiler/src
-  byte-identically. The default is still the AST walk.
+- Both code generators read each function's kept body, at every level
+  (step 6; `VOLE_LOWER=ast` or `--no-places`: the AST walks, until step
+  8 removes them). -O1 and -O2 lower it to the SSA IR
+  (middle/lower/places.vl): a scalar never borrowed is an SSA variable,
+  blocks in reverse postorder, the IR's drops as calls of their shims (a
+  flagged one under its flag), switches as one Switch, an assert's
+  condition from the IR. -O0 generates from it (gen0/gen/places.vl): a
+  statement temporary's slot shared once it is dead, a value read first
+  by the next statement (or at a block's start, by every predecessor's
+  end) kept in the accumulator, a call's compound result made in its
+  destination. Every function of compiler/src and of tests/run comes
+  from the IR but under `--check-unsafe`; compilers built so compile
+  compiler/src byte-identically. The cost, compiler/src at -O0 (the
+  gate's measure, instructions): 1.13x the AST walk's, under the 1.15x
+  bar set for it; -O1 1.02x, -O2 0.985x; objects -0.2%, +0.1%, -0.8%.
 - fold: a three-way select whose two constants were equal took the
   wrong one (`k ? false : false` for `!k`); tests/run/opt_ifconv_three_way.vl.
 - ir: a block's predecessor list starts with room for 4, not 64, so
