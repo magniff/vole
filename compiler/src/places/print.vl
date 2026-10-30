@@ -1,0 +1,402 @@
+// `--emit-places` (0.26.0, docs/design/places-ir.md §3.12): the body held
+// in places/ir.vl as text, one line per local, statement and terminator,
+// what `// PLACES:` lines of tests/run match (tests/run.sh). A function:
+//
+//   fn NAME                              // FILE:LINE:COL
+//       let _0: R                        // return
+//       let _1: T                        // param x
+//       let mut _2: T                    // x
+//       let borrowed _3: T               // y (a copy owned elsewhere)
+//       let _4: T                        // temp
+//     bb0:
+//       StorageLive(_2)
+//       _2 = call f(copy _1, const 1)    // FILE:LINE:COL
+//       drop(_2)                         // [kept]
+//       switch copy _5 [0: bb1, otherwise: bb2]
+//
+// Places print as rustc's MIR does: `(*_1).0`, `_2[_5]`, `(_3 as Some).0`;
+// fields and tuple elements by their index.
+
+use crate::base::{SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
+use crate::base::diag::{buf_position, put_short_positions};
+use crate::front::ast::NODES;
+use crate::front::check::LOCALS;
+use crate::front::types::{FNS, TY_BOOL, VARIANTS, buf_type};
+use crate::places::ir::{
+    AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_ENUM, AK_RANGE, AK_REQUIRES, AK_STRUCT, AK_TUPLE,
+    AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW, B_FN, B_NODE, DS_FLAG, DS_KEPT, DS_OPEN, DS_REMOVED,
+    IK_ARCH, IK_CONTRACT, IK_NEEDS_DROP, IK_PANIC, IK_VECTOR, LF_BORROWED, LF_FLAG, LF_MUT,
+    LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN,
+    OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION,
+    PJ_VARIANT, P_LOCALS, P_STMTS, P_TARGETS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR, RV_LEN, RV_REF,
+    RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP,
+    SK_INTRINSIC, SK_LIVE, SK_MENTION, SK_NOP, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE,
+    block_count, block_len, block_start, block_term, local_count, op_a, op_b, op_kind, proj_kind,
+    proj_parent, proj_val,
+};
+
+// Position pos as `FILE:LINE:COL`.
+pub fn buf_pos(out: i64, pos: i64) {
+    let tmp = buf_new();
+    buf_position(tmp, pos);
+    put_short_positions(out, buf_slice(tmp));
+}
+
+// The name of a symbol.
+fn buf_sym(out: i64, sym: i64) {
+    buf_bytes(out, SYMS[sym].text);
+}
+
+// The name of function f (its display name).
+pub fn buf_fn_name(out: i64, f: i64) {
+    // UNSAFE: FNS is the checker's raw table of functions.
+    // SAFETY: f is a checked function (a body's) or a call's resolved
+    // callee, below FN_COUNT.
+    let display = unsafe { FNS[f].display };
+    buf_sym(out, display);
+}
+
+// The name of AST local l (LOCALS).
+fn buf_ast_local(out: i64, l: i64) {
+    // UNSAFE: LOCALS is the checker's raw table of locals.
+    // SAFETY: l is a local the checker defined (a body's src), below
+    // LOCAL_COUNT.
+    let name = unsafe { LOCALS[l].name };
+    buf_sym(out, name);
+}
+
+// Place (l, p).
+pub fn buf_place(out: i64, l: i64, p: i64) {
+    if p == 0 {
+        buf_str(out, c"_");
+        buf_int(out, l);
+        return;
+    }
+    let k = proj_kind(p);
+    let parent = proj_parent(p);
+    if k == PJ_DEREF {
+        buf_str(out, c"(*");
+        buf_place(out, l, parent);
+        buf_str(out, c")");
+        return;
+    }
+    if k == PJ_VARIANT {
+        buf_str(out, c"(");
+        buf_place(out, l, parent);
+        buf_str(out, c" as ");
+        // UNSAFE: VARIANTS is the checker's raw table of variants.
+        // SAFETY: the projection's value is a variant the checker resolved.
+        let name = unsafe { VARIANTS[proj_val(p)].name };
+        buf_sym(out, name);
+        buf_str(out, c")");
+        return;
+    }
+    buf_place(out, l, parent);
+    if k == PJ_FIELD || k == PJ_UNION {
+        buf_str(out, c".");
+        buf_int(out, proj_val(p));
+    } else if k == PJ_INDEX {
+        buf_str(out, c"[_");
+        buf_int(out, proj_val(p));
+        buf_str(out, c"]");
+    } else if k == PJ_CONST {
+        buf_str(out, c"[");
+        buf_int(out, proj_val(p));
+        buf_str(out, c"]");
+    }
+}
+
+// Operand i of the list at `at`.
+pub fn buf_operand(out: i64, at: i64, i: i64) {
+    let k = op_kind(at, i);
+    let a = op_a(at, i);
+    let b = op_b(at, i);
+    if k == OK_COPY {
+        buf_str(out, c"copy ");
+        buf_place(out, a, b);
+    } else if k == OK_MOVE {
+        buf_str(out, c"move ");
+        buf_place(out, a, b);
+    } else if k == OK_PLACE {
+        buf_place(out, a, b);
+    } else if k == OK_INT {
+        if b == TY_BOOL {
+            buf_str(out, if a != 0 { c"const true" } else { c"const false" });
+        } else {
+            buf_str(out, c"const ");
+            buf_int(out, a);
+        }
+    } else if k == OK_FLOAT {
+        buf_str(out, c"const float 0x");
+        crate::base::buf_hex(out, a as u64, 16);
+    } else if k == OK_STR || k == OK_CSTR {
+        buf_str(out, if k == OK_CSTR { c"const c\"" } else { c"const \"" });
+        let text = crate::front::lexer::str_at(a);
+        let n = if text.len > 24 { 24 } else { text.len };
+        for j in 0..n {
+            let ch = text[j];
+            if ch == '\n' {
+                buf_str(out, c"\\n");
+            } else if ch < 32 || ch == '"' || ch == '\\' {
+                buf_byte(out, '?');
+            } else {
+                buf_byte(out, ch);
+            }
+        }
+        if text.len > n {
+            buf_str(out, c"..");
+        }
+        buf_str(out, c"\"");
+    } else if k == OK_FN {
+        buf_str(out, c"const ");
+        buf_fn_name(out, a);
+    } else if k == OK_CONST {
+        buf_str(out, c"const ");
+        // UNSAFE: CONSTS is the checker's raw table of constants.
+        // SAFETY: a is the constant an identifier resolved to.
+        let node = unsafe { crate::front::types::CONSTS[a].node };
+        buf_sym(out, NODES[node].a);
+    } else if k == OK_UNIT {
+        buf_str(out, c"const ()");
+    } else {
+        buf_str(out, c"?");
+    }
+}
+
+fn buf_operands(out: i64, at: i64, from: i64, n: i64) {
+    for i in from..n {
+        if i > from {
+            buf_str(out, c", ");
+        }
+        buf_operand(out, at, i);
+    }
+}
+
+fn buf_rvalue(out: i64, s: i64) {
+    let st = P_STMTS[s];
+    let rk = st.c;
+    if rk == RV_USE {
+        buf_operand(out, st.ops, 0);
+    } else if rk == RV_REF {
+        buf_str(out, if st.d == BK_MUT { c"&mut " } else if st.d == BK_MUT2 { c"&mut2 " }
+            else if st.d == BK_RAW { c"&raw " } else { c"&" });
+        buf_operand(out, st.ops, 0);
+    } else if rk == RV_BINARY {
+        buf_operand(out, st.ops, 0);
+        buf_str(out, c" ");
+        buf_str(out, NODES[st.d].op.text());
+        buf_str(out, c" ");
+        buf_operand(out, st.ops, 1);
+    } else if rk == RV_UNARY {
+        buf_str(out, NODES[st.d].op.text());
+        buf_operand(out, st.ops, 0);
+    } else if rk == RV_CAST {
+        buf_operand(out, st.ops, 0);
+        buf_str(out, c" as ");
+        buf_type(out, st.d);
+    } else if rk == RV_DISCR {
+        buf_str(out, c"discriminant ");
+        buf_operand(out, st.ops, 0);
+    } else if rk == RV_AGG {
+        buf_str(out, c"aggregate ");
+        if st.d == AK_TUPLE {
+            buf_str(out, c"tuple");
+        } else if st.d == AK_ARRAY {
+            buf_str(out, c"array");
+        } else if st.d == AK_STRUCT || st.d == AK_CLOSURE {
+            buf_str(out, if st.d == AK_CLOSURE { c"closure " } else { c"" });
+            buf_type(out, st.e);
+        } else if st.d == AK_VARIANT {
+            // UNSAFE: VARIANTS is the checker's raw table of variants.
+            // SAFETY: e is a variant the checker resolved.
+            let name = unsafe { VARIANTS[st.e].name };
+            buf_sym(out, name);
+        }
+        buf_str(out, c"(");
+        buf_operands(out, st.ops, 0, st.nops);
+        buf_str(out, c")");
+    } else if rk == RV_REPEAT {
+        buf_str(out, c"[");
+        buf_operand(out, st.ops, 0);
+        buf_str(out, c"; ");
+        buf_int(out, st.d);
+        buf_str(out, c"]");
+    } else if rk == RV_LEN {
+        buf_str(out, c"len ");
+        buf_operand(out, st.ops, 0);
+    } else if rk == RV_SLICE {
+        buf_str(out, c"slice ");
+        buf_operand(out, st.ops, 0);
+        buf_str(out, c"[");
+        buf_operand(out, st.ops, 1);
+        buf_str(out, c"..");
+        buf_operand(out, st.ops, 2);
+        buf_str(out, c"]");
+    } else {
+        buf_str(out, c"?");
+    }
+}
+
+// The comment at the end of a line: the statement's position.
+fn buf_at(out: i64, node: i64) {
+    if node > 0 {
+        buf_str(out, c"    // ");
+        buf_pos(out, NODES[node].start);
+    }
+}
+
+// Statement (or terminator) s, one line.
+pub fn buf_stmt(out: i64, s: i64) {
+    let st = P_STMTS[s];
+    let k = st.kind;
+    buf_str(out, c"        ");
+    if k == SK_ASSIGN {
+        buf_place(out, st.a, st.b);
+        buf_str(out, c" = ");
+        buf_rvalue(out, s);
+    } else if k == SK_CALL {
+        buf_place(out, st.a, st.b);
+        buf_str(out, c" = call ");
+        if st.c >= 0 {
+            buf_fn_name(out, st.c);
+            buf_str(out, c"(");
+            buf_operands(out, st.ops, 0, st.nops);
+        } else {
+            buf_operand(out, st.ops, 0);
+            buf_str(out, c"(");
+            buf_operands(out, st.ops, 1, st.nops);
+        }
+        buf_str(out, c")");
+    } else if k == SK_INTRINSIC {
+        buf_place(out, st.a, st.b);
+        buf_str(out, c" = intrinsic ");
+        buf_str(out, if st.c == IK_VECTOR { c"vector" } else if st.c == IK_ARCH { c"arch" }
+            else if st.c == IK_NEEDS_DROP { c"needs_drop" }
+            else if st.c == IK_CONTRACT { c"contract_check" }
+            else if st.c == IK_PANIC { c"panic" } else { c"?" });
+        buf_str(out, c"(");
+        buf_operands(out, st.ops, 0, st.nops);
+        buf_str(out, c")");
+    } else if k == SK_DROP {
+        buf_str(out, c"drop(");
+        buf_place(out, st.a, st.b);
+        buf_str(out, c")");
+        if st.c == DS_KEPT {
+            buf_str(out, c" [kept]");
+        } else if st.c == DS_REMOVED {
+            buf_str(out, c" [removed]");
+        } else if st.c == DS_FLAG {
+            buf_str(out, c" [flag _");
+            buf_int(out, st.d);
+            buf_str(out, c"]");
+        } else if st.c == DS_OPEN {
+            buf_str(out, c" [open]");
+        }
+    } else if k == SK_ASSERT {
+        buf_str(out, c"assert(");
+        buf_operand(out, st.ops, 0);
+        buf_str(out, if st.c == AK_BOUNDS { c", bounds)" } else if st.c == AK_RANGE {
+            c", range)"
+        } else if st.c == AK_ENUM { c", enum)" } else if st.c == AK_REQUIRES { c", requires)" }
+            else { c")" });
+    } else if k == SK_LIVE || k == SK_DEAD {
+        buf_str(out, if k == SK_LIVE { c"StorageLive(_" } else { c"StorageDead(_" });
+        buf_int(out, st.a);
+        buf_str(out, c")");
+    } else if k == SK_MENTION {
+        buf_str(out, c"mention ");
+        buf_place(out, st.a, st.b);
+    } else if k == SK_NOP {
+        buf_str(out, c"nop");
+    } else if k == TK_GOTO {
+        buf_str(out, c"goto bb");
+        buf_int(out, st.a);
+        if st.c != 0 {
+            buf_str(out, c" (back edge)");
+        }
+    } else if k == TK_SWITCH {
+        buf_str(out, c"switch ");
+        buf_operand(out, st.ops, 0);
+        buf_str(out, c" [");
+        for i in 0..st.b {
+            buf_int(out, P_TARGETS[st.a + 2 * i]);
+            buf_str(out, c": bb");
+            buf_int(out, P_TARGETS[st.a + 2 * i + 1]);
+            buf_str(out, c", ");
+        }
+        buf_str(out, c"otherwise: bb");
+        buf_int(out, st.c);
+        buf_str(out, c"]");
+    } else if k == TK_RETURN {
+        buf_str(out, c"return");
+    } else if k == TK_UNREACHABLE {
+        buf_str(out, c"unreachable");
+    } else {
+        buf_str(out, c"?");
+    }
+    if k != SK_LIVE && k != SK_DEAD && k != TK_GOTO {
+        buf_at(out, st.node);
+    }
+    buf_str(out, c"\n");
+}
+
+// Local l's declaration line.
+fn buf_local(out: i64, l: i64) {
+    let lc = P_LOCALS[l];
+    buf_str(out, c"    let ");
+    if (lc.flags & LF_MUT) != 0 {
+        buf_str(out, c"mut ");
+    }
+    if (lc.flags & LF_BORROWED) != 0 {
+        buf_str(out, c"borrowed ");
+    }
+    buf_str(out, c"_");
+    buf_int(out, l);
+    buf_str(out, c": ");
+    buf_type(out, lc.ty);
+    buf_str(out, c"    // ");
+    if (lc.flags & LF_RETURN) != 0 {
+        buf_str(out, c"return");
+    } else if (lc.flags & LF_PARAM) != 0 {
+        buf_str(out, c"param");
+        if lc.src >= 0 {
+            buf_str(out, c" ");
+            buf_ast_local(out, lc.src);
+        }
+    } else if (lc.flags & LF_STATIC) != 0 {
+        buf_str(out, c"static ");
+        buf_sym(out, lc.src);
+    } else if (lc.flags & LF_FLAG) != 0 {
+        buf_str(out, c"drop flag");
+    } else if (lc.flags & LF_USER) != 0 && lc.src >= 0 {
+        buf_ast_local(out, lc.src);
+    } else if (lc.flags & LF_TEMP) != 0 {
+        buf_str(out, c"temp");
+    }
+    buf_str(out, c"\n");
+}
+
+// The body held, as text.
+pub fn print_body(out: i64) {
+    buf_str(out, c"fn ");
+    buf_fn_name(out, B_FN);
+    buf_at(out, B_NODE);
+    buf_str(out, c"\n");
+    for l in 0..local_count() {
+        buf_local(out, l);
+    }
+    for b in 0..block_count() {
+        if block_start(b) < 0 {
+            continue;
+        }
+        buf_str(out, c"    bb");
+        buf_int(out, b);
+        buf_str(out, c":\n");
+        let start = block_start(b);
+        for s in start..start + block_len(b) {
+            buf_stmt(out, s);
+        }
+        buf_stmt(out, block_term(b));
+    }
+    buf_str(out, c"\n");
+}
