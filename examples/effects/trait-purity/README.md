@@ -52,7 +52,7 @@ crate::lower	none
 <crate::Count as Ord>::cmp	panic
 crate::trim_word	panic
 crate::is_letter	none
-crate::main	alloc(Gpa) io global panic diverge
+crate::main	alloc(Gpa) io panic diverge
 ```
 
 `Word::hash` is `none`. `Word::eq` and `Count::cmp` index (`panic`),

@@ -44,8 +44,8 @@ error). Each program also has a test case in
   allocator can be had from nothing (`volec guide allocators`), so a
   function allocates only from allocators it was handed (parameters,
   captures, containers) or reaches through statics.
-- `io global` together usually mean printing: std's print functions
-  write through a static buffer.
+- `io` without `global` is printing: std's print buffer is an
+  immutable static its lock guards (0.26.1), not a `static var`.
 - Callers see the inferred set, which may be smaller than a declared
   one: a declaration is an upper bound.
 

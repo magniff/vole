@@ -3,7 +3,7 @@
 // materialized at a given iteration (eval_at), the vector form of a value
 // and the body on VF lanes (emit_body), and the identities of reductions.
 
-use crate::front::types::{TY_BOOL, TY_F64};
+use crate::front::types::{TY_BOOL, TY_F64, TY_I64, TY_U64, int_bits, is_signed};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, Op, ir_append, ir_make, ir_val};
 use crate::middle::ir::Op::{
@@ -11,7 +11,7 @@ use crate::middle::ir::Op::{
 };
 use crate::middle::loops::invariant_in;
 use crate::middle::vectorize::{VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL};
-use crate::middle::vectorize::legality::{class_of, loads_in};
+use crate::middle::vectorize::legality::{class_of, lane_type, loads_in};
 
 pub fn map_get(cx: sink *FnCtx, v: i64) -> i64 {
     unsafe {
@@ -190,6 +190,145 @@ pub fn emit_body(cx: sink *FnCtx, l: i64, vh: i64, vp: i64) {
             }
         }
     }
+}
+
+// (0.26.2, a prototype) A vector of `value` in every lane (of type lt),
+// made in the vector preheader vp.
+fn splat_const(cx: sink *FnCtx, vp: i64, vt: i64, value: i64, lt: i64) -> i64 {
+    append(cx, vp, VSplat, vt, konst(cx, vp, value, lt), 0, 0)
+}
+
+fn vbin(cx: sink *FnCtx, b: i64, vt: i64, op: Op, x: i64, y: i64) -> i64 {
+    append(cx, b, VBin, vt, x, y, op as i64)
+}
+
+// (0.26.2, a prototype) The lanes' overflow of check o (OVK_LANE), in
+// block vh: a vector whose lanes have the sign bit set where o's operation
+// overflows: signed, the result's sign against the operands'; unsigned,
+// the carry (borrow) out of the top bit; a negation's operand the minimum
+// (unsigned: not 0).
+pub fn lane_overflow(cx: sink *FnCtx, l: i64, o: i64, vh: i64, vp: i64) -> i64 {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in emit_body.
+    // SAFETY: o and its operands are instructions of the loop's function.
+    unsafe {
+        let vt = cx.v_vt;
+        let imm = cx.insts[o].imm;
+        let op = (imm & 255) as Op;
+        let ty = imm >> 8;
+        let lt = lane_type(ty);
+        let signed = is_signed(ty);
+        let a = vector_of(cx, cx.insts[o].a, vh, vp, l);
+        if op == Neg {
+            let bits = int_bits(ty);
+            let edge = if !signed { 0 } else if bits == 64 { 0 - 9223372036854775807 - 1 }
+                else { 0 - (1 << (bits - 1) as u64) };
+            let m = append(cx, vh, VCmp, vt, a, splat_const(cx, vp, vt, edge, lt), 0);
+            cx.insts[m].cond = if signed { Cond::Eq } else { Cond::Ne };
+            cx.insts[m].imm2 = vt;
+            return m;
+        }
+        let b = vector_of(cx, cx.insts[o].b, vh, vp, l);
+        let r = vbin(cx, vh, vt, op, a, b);
+        if signed && op == Op::Add {
+            return vbin(cx, vh, vt, And, vbin(cx, vh, vt, Op::Xor, r, a),
+                vbin(cx, vh, vt, Op::Xor, r, b));
+        }
+        if signed {
+            return vbin(cx, vh, vt, And, vbin(cx, vh, vt, Op::Xor, a, b),
+                vbin(cx, vh, vt, Op::Xor, a, r));
+        }
+        let ones = splat_const(cx, vp, vt, -1, lt);
+        if op == Op::Add {
+            // (a & b) | ((a | b) & ~r)
+            let nr = vbin(cx, vh, vt, Op::Xor, r, ones);
+            return vbin(cx, vh, vt, Op::Or, vbin(cx, vh, vt, And, a, b),
+                vbin(cx, vh, vt, And, vbin(cx, vh, vt, Op::Or, a, b), nr));
+        }
+        // (~a & b) | ((~a | b) & r)
+        let na = vbin(cx, vh, vt, Op::Xor, a, ones);
+        vbin(cx, vh, vt, Op::Or, vbin(cx, vh, vt, And, na, b),
+            vbin(cx, vh, vt, And, vbin(cx, vh, vt, Op::Or, na, b), r))
+    }
+}
+
+// (0.26.2, a prototype) A bound of the magnitude of the addend of reduction
+// check o (OVK_RED) on reduction phi `phi`, in lanes, in block vh: x ^ (x <
+// 0), |x| - 1 when x is negative, signed; x itself unsigned.
+pub fn addend_bound(cx: sink *FnCtx, l: i64, o: i64, phi: i64, vh: i64, vp: i64) -> i64 {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in emit_body.
+    // SAFETY: o and its operands are instructions of the loop's function.
+    unsafe {
+        let x = if ir_val(cx, cx.insts[o].a) == phi { cx.insts[o].b } else { cx.insts[o].a };
+        let xv = vector_of(cx, x, vh, vp, l);
+        let ty = cx.insts[o].imm >> 8;
+        if !is_signed(ty) {
+            return xv;
+        }
+        let neg = append(cx, vh, VCmp, cx.v_vt, xv, splat_const(cx, vp, cx.v_vt, 0, lane_type(ty)),
+            0);
+        cx.insts[neg].cond = Cond::Lt;
+        cx.insts[neg].imm2 = cx.v_vt;
+        vbin(cx, vh, cx.v_vt, Op::Xor, xv, neg)
+    }
+}
+
+// (0.26.2, a prototype) Whether a reduction checked by OVF imm (OVK_RED),
+// from `init`, may have overflowed in `count` iterations of `steps` steps
+// each, in block b, from u, its addends' bounds or'ed (a scalar of the lane
+// type): unless every partial sum, in any order, stays inside the type:
+// |init| + count * steps * (u + 1) at most its maximum, signed; init +
+// count * steps * u, unsigned (a difference's, at most init).
+pub fn reduction_may_overflow(cx: sink *FnCtx, b: i64, imm: i64, init: i64, u: i64, count: i64,
+    steps: i64) -> i64 {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in emit_body.
+    // SAFETY: the instructions made are of the function entered.
+    unsafe {
+        let op = (imm & 255) as Op;
+        let ty = imm >> 8;
+        let lt = lane_type(ty);
+        let bits = int_bits(ty);
+        if is_signed(ty) {
+            let wide_u = if lt == TY_I64 { u } else { widen(cx, b, TY_I64, u, lt) };
+            let wide_init = if ty == TY_I64 { init } else { widen(cx, b, TY_I64, init, ty) };
+            let sign = append(cx, b, Op::Shr, TY_I64, wide_init, konst(cx, b, 63, TY_I64), 0);
+            let magnitude = append(cx, b, Op::Xor, TY_I64, wide_init, sign, 0);
+            let max = if bits == 64 { 9223372036854775807 } else { (1 << (bits - 1) as u64) - 1 };
+            // count * (u + 1) <= max - (magnitude + 1): u < (max - 1 - magnitude) / count
+            let room = append(cx, b, Op::Sub, TY_I64, konst(cx, b, max - 1, TY_I64), magnitude, 0);
+            var q = append(cx, b, Op::Div, TY_I64, room, count, 0);
+            if steps > 1 {
+                q = append(cx, b, Op::Div, TY_I64, q, konst(cx, b, steps, TY_I64), 0);
+            }
+            return cmp(cx, b, Cond::Ge, TY_I64, wide_u, q);
+        }
+        let wide_u = if bits == 64 { u } else {
+            append(cx, b, And, TY_U64, widen(cx, b, TY_I64, u, lt),
+                konst(cx, b, (1 << bits as u64) - 1, TY_U64), 0)
+        };
+        let wide_init = if bits == 64 { init } else { widen(cx, b, TY_U64, init, ty) };
+        let max = if bits == 64 { -1 } else { (1 << bits as u64) - 1 };
+        let room = if op == Op::Add {
+            append(cx, b, Op::Sub, TY_U64, konst(cx, b, max, TY_U64), wide_init, 0)
+        } else {
+            wide_init
+        };
+        var q = append(cx, b, Op::Div, TY_U64, room, count, 0);
+        if steps > 1 {
+            q = append(cx, b, Op::Div, TY_U64, q, konst(cx, b, steps, TY_U64), 0);
+        }
+        cmp(cx, b, Cond::Gt, TY_U64, wide_u, q)
+    }
+}
+
+// x of type `from` as type ty, in block b.
+fn widen(cx: sink *FnCtx, b: i64, ty: i64, x: i64, from: i64) -> i64 {
+    let v = append(cx, b, Op::Conv, ty, x, 0, 0);
+    // UNSAFE: the function's IR is FnCtx's raw arrays.
+    // SAFETY: v was just made, an instruction of the function entered.
+    unsafe {
+        cx.insts[v].imm2 = from;
+    }
+    v
 }
 
 // (0.16) The vector loop's value of v = x + k * (load as u64) (VC_WMUL's
