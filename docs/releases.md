@@ -73,6 +73,10 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.26.2
+
+Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
+
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
