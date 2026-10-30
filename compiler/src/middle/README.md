@@ -14,7 +14,7 @@ again. `back` takes the optimized IR.
 | module | |
 |---|---|
 | `ir/` | the IR: functions, blocks, instructions, slots; terminators and edges (`cfg`), printing (`print`), the verifier (`verify`) |
-| `lower/` | the AST to IR, building SSA on the fly (`ssa`): expressions, calls, control flow, `match`, vectors |
+| `lower/` | the AST to IR, building SSA on the fly (`ssa`): expressions, calls, control flow, `match`, vectors; or (0.26.1, `VOLE_LOWER=places`) a function's places IR to the IR (`places`: its blocks in reverse postorder, scalars never borrowed as SSA variables, the IR's drops through the shims) |
 | `opt.vl` | the pipeline; CFG cleanups, dominators, dead code |
 | `fold.vl` | constant folding, SCCP, instruction combining |
 | `gvn.vl` | global value numbering, alias analysis, memory forwarding, dead stores |
