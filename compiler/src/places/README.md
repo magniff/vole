@@ -177,6 +177,12 @@ code generators' agent (0.26.1) sees what moved.
   reports any with a drop that runs: none over compiler/src and every
   tests/run source. The backstop sees only the bodies built. When step 7
   deletes the own pass's drops, the type rule is what is left (1.047x).
+- 0.26.1 (LF_SSA, for gen0): a kept body's temporaries that are scalar,
+  never borrowed, written whole once and read whole once by a later
+  statement of the same block, and mentioned nowhere else are flagged
+  LF_SSA (keep.vl `mark_ssa`, run before `keep_body` at a build; the
+  printer says `temp ssa`). Over compiler/src 98,251 of 149,332
+  temporaries; the build's places phase +57M instructions.
 
 ## `--places-diff`: the differences left
 
