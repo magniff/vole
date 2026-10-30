@@ -492,7 +492,7 @@ fn decide(cx: sink *FnCtx, c: i64) -> i64 {
 
 // (0.26.2, a prototype) Whether OVF c (middle/ir) cannot overflow at a
 // block with facts FACTS: by interval arithmetic on its operands' ranges,
-// or, for `x + 1` (`x - 1`), by a fact x < w (x > w) of its type.
+// or, for `x + c` (`x - c`), by a fact x < w (x > w): offset_bounded.
 fn overflow_ruled_out(cx: sink *FnCtx, c: i64) -> bool {
     // UNSAFE: the function's IR is FnCtx's raw arrays (insts), as in all of
     // this pass.
@@ -511,13 +511,19 @@ fn overflow_ruled_out(cx: sink *FnCtx, c: i64) -> bool {
         if op == Op::Neg {
             return if signed { alo > type_min(ty) } else { alo == 0 && ahi == 0 };
         }
-        // x + 1 below a bound w; x - 1 above one.
-        if (op == Op::Add || op == Op::Sub) && is_const(cx, b) && cx.insts[b].imm == 1
-            && one_step_bounded(cx, a, ty, op == Op::Add) {
-            return true;
+        // x + c below a bound w; x - c above one (c a small constant).
+        let small_c = 4294967296;
+        if (op == Op::Add || op == Op::Sub) && is_const(cx, b) && cx.insts[b].imm != 0
+            && cx.insts[b].imm > 0 - small_c && cx.insts[b].imm < small_c {
+            let k = cx.insts[b].imm;
+            let up = (op == Op::Add) == (k > 0);
+            // (an unsigned type's constants are not negative: a large one's bits)
+            if (k > 0 || signed) && offset_bounded(cx, a, ty, up, if k > 0 { k } else { 0 - k }) {
+                return true;
+            }
         }
-        if op == Op::Add && is_const(cx, a) && cx.insts[a].imm == 1
-            && one_step_bounded(cx, b, ty, true) {
+        if op == Op::Add && is_const(cx, a) && cx.insts[a].imm > 0 && cx.insts[a].imm < small_c
+            && offset_bounded(cx, b, ty, true, cx.insts[a].imm) {
             return true;
         }
         if !signed && alo < 0 {
@@ -559,34 +565,60 @@ fn overflow_ruled_out(cx: sink *FnCtx, c: i64) -> bool {
     }
 }
 
-// Whether a fact x < w (`up`) or x > w holds, of x's type ty (its
-// signedness and width): then x + 1 (x - 1) stays inside it.
-fn one_step_bounded(cx: sink *FnCtx, v: i64, ty: i64, up: bool) -> bool {
+// Whether x + c (`up`) or x - c, c >= 1, stays inside x's type ty (its
+// signedness and width) by a fact x < w or x <= w (x > w, x >= w) of its
+// type: for c = 1 and x < w always; else when w's range leaves room for c.
+// (0.26.2) Or, x signed, by an unsigned fact x < w (x <= w) with w not
+// negative: then x is not either (a bounds check's index).
+fn offset_bounded(cx: sink *FnCtx, v: i64, ty: i64, up: bool, c: i64) -> bool {
     // UNSAFE: FnCtx's raw arrays (facts, insts), as in decide.
     // SAFETY: i stays below cx.facts.count (pairs); the facts and their
     // operands are instructions of the function entered.
     unsafe {
         let x = bits_of_value(cx, v);
+        let signed = is_signed(ty);
         var i = 0;
         while i < cx.facts.count {
             let f = cx.facts.data[i];
             let holds = cx.facts.data[i + 1] != 0;
             i += 2;
             let fty = cx.insts[f].imm2;
-            if cx.insts[f].op != Op::Cmp || !is_integer(fty) || is_signed(fty) != is_signed(ty)
-                || int_bits(fty) != int_bits(ty) {
+            if cx.insts[f].op != Op::Cmp || !is_integer(fty) || int_bits(fty) != int_bits(ty) {
+                continue;
+            }
+            let mixed = is_signed(fty) != signed;
+            if mixed && !(signed && up) {
                 continue;
             }
             var fs = cond_set(cx.insts[f].cond);
             if !holds {
                 fs = 7 & ~fs;
             }
+            var w = cx.insts[f].b;
             if bits_of_value(cx, cx.insts[f].b) == x && bits_of_value(cx, cx.insts[f].a) != x {
                 fs = mirror_set(fs);
+                w = cx.insts[f].a;
             } else if bits_of_value(cx, cx.insts[f].a) != x {
                 continue;
             }
-            if fs == if up { 1 } else { 4 } {
+            let strict = fs == if up { 1 } else { 4 };
+            if !strict && fs != if up { 3 } else { 6 } {
+                continue;
+            }
+            if strict && c == 1 && !mixed {
+                return true;
+            }
+            if !signed {
+                continue;
+            }
+            var wlo = MIN_I64;
+            var whi = MAX_I64;
+            range_at(cx, w, &wlo, &whi);
+            if mixed && wlo < 0 {
+                continue;
+            }
+            let slack = if strict { 1 } else { 0 };
+            if up && whi <= type_max(ty) - c + slack || !up && wlo >= type_min(ty) + c - slack {
                 return true;
             }
         }
