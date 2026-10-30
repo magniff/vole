@@ -28,5 +28,5 @@ error fix.alloc016-manual: crate::make needs an allocator (it allocates at main.
 try: volec query show main.vl:18
 [exit 1]
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr or fstring, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize or fstring, not 'nonsense'
 [exit 2]
