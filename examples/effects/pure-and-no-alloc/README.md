@@ -44,7 +44,7 @@ crate::bucket	none
 crate::histogram	panic
 crate::peak	none
 crate::outliers	alloc(Gpa) panic
-crate::main	alloc(Gpa) io global panic
+crate::main	alloc(Gpa) io panic
 ```
 
 `clamp`, `scaled` and `bucket` do nothing but compute: `none`.
@@ -53,8 +53,7 @@ does `score`, which calls it; `#[pure]` allows that. `peak` is `none`:
 it reads its slice with `get(0)` (an `Option`) and `for x in s`, neither
 of which can fail. `outliers` takes no allocator, yet it is `alloc(Gpa)`:
 it pushes onto a `Vec` it was given, and `push` grows the Vec with the
-allocator the Vec holds. `main` prints: `io`, and `global` (std's print
-buffer is a static).
+allocator the Vec holds. `main` prints: `io`.
 
 ## Breaking `#[pure]` three calls down
 
@@ -88,7 +87,7 @@ patched crate::clamp	main.vl	+1 -0 lines
 warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check); the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
 try: volec check
 $ volec query effects score --why io | head -5
-crate::score	io global panic
+crate::score	io panic
   'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
   'scaled(s[i], gain)' at main.vl:29:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.vl:23:5 calls 'clamp'
