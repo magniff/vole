@@ -69,21 +69,21 @@ pub struct Point {
 $ def len
 crate::geom::V2::len	clash/geom.vl:15:12	method	pub fn len(self) -> i64	effects: none
 crate::myvec::Vec::len	clash/myvec.vl:11:12	method	pub fn len(self) -> i64	effects: none
-std::Vec::len	../../compiler/std/std.vl:215:12	method	pub fn len(self) -> i64
-std::Buf::len	../../compiler/std/std.vl:533:12	method	pub fn len(self) -> i64
-std::BinaryHeap::len	../../compiler/std/flat/collections.vl:224:12	method	pub fn len(self) -> i64
-std::MinHeap::len	../../compiler/std/flat/collections.vl:322:12	method	pub fn len(self) -> i64
-std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.vl:38:12	method	pub fn len(self) -> i64
-std::collections::hash_set::HashSet::len	../../compiler/std/collections/hash_set.vl:36:12	method	pub fn len(self) -> i64
-std::collections::raw_table::RawTable::len	../../compiler/std/collections/raw_table.vl:140:12	method	pub fn len(self) -> i64
-std::collections::btree_node::BTreeRaw::len	../../compiler/std/collections/btree_node.vl:264:12	method	pub fn len(self) -> i64
-std::collections::btree_map::BTreeMap::len	../../compiler/std/collections/btree_map.vl:26:12	method	pub fn len(self) -> i64
-std::collections::btree_map::BTreeSet::len	../../compiler/std/collections/btree_map.vl:244:12	method	pub fn len(self) -> i64
-str::len	../../compiler/std/string.vl:290:12	method	pub fn len(self) -> i64	effects: none
-std::string::String::len	../../compiler/std/string.vl:1168:12	method	pub fn len(self) -> i64
-Path::len	../../compiler/std/path.vl:49:12	method	pub fn len(self) -> i64	effects: none
-std::fs::Metadata::len	../../compiler/std/fs.vl:205:12	method	pub fn len(self) -> i64	effects: none
-std::env::Args::len	../../compiler/std/env.vl:71:12	method	pub fn len(self) -> i64	effects: none
+std::Vec::len	../../compiler/std/std.vl:215:12	method	pub fn len(self) -> usize
+std::Buf::len	../../compiler/std/std.vl:541:12	method	pub fn len(self) -> usize
+std::BinaryHeap::len	../../compiler/std/flat/collections.vl:222:12	method	pub fn len(self) -> usize
+std::MinHeap::len	../../compiler/std/flat/collections.vl:320:12	method	pub fn len(self) -> usize
+std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.vl:39:12	method	pub fn len(self) -> usize
+std::collections::hash_set::HashSet::len	../../compiler/std/collections/hash_set.vl:35:12	method	pub fn len(self) -> usize
+std::collections::raw_table::RawTable::len	../../compiler/std/collections/raw_table.vl:139:12	method	pub fn len(self) -> usize
+std::collections::btree_node::BTreeRaw::len	../../compiler/std/collections/btree_node.vl:263:12	method	pub fn len(self) -> usize
+std::collections::btree_map::BTreeMap::len	../../compiler/std/collections/btree_map.vl:25:12	method	pub fn len(self) -> usize
+std::collections::btree_map::BTreeSet::len	../../compiler/std/collections/btree_map.vl:242:12	method	pub fn len(self) -> usize
+str::len	../../compiler/std/string.vl:291:12	method	pub fn len(self) -> usize	effects: none
+std::string::String::len	../../compiler/std/string.vl:1191:12	method	pub fn len(self) -> usize
+Path::len	../../compiler/std/path.vl:49:12	method	pub fn len(self) -> usize	effects: none
+std::fs::Metadata::len	../../compiler/std/fs.vl:205:12	method	pub fn len(self) -> u64	effects: none
+std::env::Args::len	../../compiler/std/env.vl:71:12	method	pub fn len(self) -> usize	effects: none
 $ refs V2::len
 # clash/geom.vl
 15:12	def	pub fn len(self) -> i64 {

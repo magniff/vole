@@ -46,7 +46,7 @@ fn zz_probe_some(v: Vec<String>) -> Option<String> {
     Some(v[0])
 }
 
-fn zz_probe_read(v: Vec<String>) -> i64 {
+fn zz_probe_read(v: Vec<String>) -> usize {
     let x = v[0];
     x.len()
 }

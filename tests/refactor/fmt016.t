@@ -36,6 +36,6 @@ fn main(gpa: Gpa) {
     var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     grow(&v);
     let p: Pair<i64> = Pair { a: 1, b: 2 };
-    println(apply(|x| x + 1, |x| x, p.a) + v.len());
+    println(apply(|x| x + 1, |x| x, p.a) + v.len() as i64);
 }
 $ fmt --check

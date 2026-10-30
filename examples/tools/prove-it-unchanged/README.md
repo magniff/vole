@@ -123,7 +123,7 @@ $ volec query show run_at
 fn run_at(s: [u8], i: i64) -> i64 {
     var n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
-    while i + n < s.len && s[i + n] == s[i] && n < 255 { n += 1; }
+    while i + n < s.len as i64 && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
