@@ -885,7 +885,14 @@ nothing more for it), R3 (a moved capture's live flag cleared), union
 literals' parts, R4 (a match on values is one switch with many targets;
 `middle/lower/places.vl`'s `lower_switch` still makes a chain of
 compares of it, so `opt_switch` fails under `VOLE_LOWER=places` until it
-uses `ir_switch`). Waiting on B's steps 4 and 5: the default (step 6's
+uses `ir_switch`). From B's step 3: R5 (a statement temporary drops at
+the end of its prelude's scope, not of the hidden `let` that holds an
+operand), R6 (an open drop's part flags made before the rewrite), R7 (a
+sink closure's second move out stops the program), R8 (a parametric
+copy's temporary is not owned); R9 (`v[i]` on a Vec) did not reproduce
+here: both paths lower the checker's `v.as_slice()[i]` alike. And
+`--places-diff` checks where each drop runs and its flag
+(places/README.md). Waiting on B's steps 4 and 5: the default (step 6's
 switch: `PLACES_ON` true, `--no-places` the escape) and step 7.
 
 ## 9. The chain rule
