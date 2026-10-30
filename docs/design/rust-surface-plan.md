@@ -975,11 +975,19 @@ without new keywords. A block is an item that names its constant,
 the LSP and errors; the file form is `embed wgsl CELLS from "x.wgsl";`
 (decision 15).
 
-**Parts (0.26.2, proposed).** WGSL has no includes, and fluid2d and three
+**Parts (0.26.2).** WGSL has no includes, and fluid2d and three
 of the eval programs build each kernel from shared text. A block may
-name other blocks whose text comes before its own, in one module:
-`embed wgsl STEP with COMMON, NOISE { .. }`. A part has no entry points,
-and parts may not form a cycle. `with` is a contextual word, like
+name other blocks, by path as any other name, whose text comes before
+its own in one WGSL module: `embed wgsl STEP with COMMON, NOISE { .. }`.
+A block named in a `with` is a part: it is checked only inside the
+modules that include it, and it may hold entry points, which become
+fields of each block that includes it (fluid2d's BLUR holds `main` and
+reads the `DIR` that `K_BLUR_X` and `K_BLUR_Y` declare, so
+`K_BLUR_X.main` is BLUR's). A part has no module of its own: a use of its
+`.src` or of its entry fields where a whole block is meant is `error
+embed.part_use`, whose `try:` names the including blocks' fields, so
+naming a working block in a `with` never silently takes its `.src` away.
+Parts may not form a cycle. `with` is a contextual word, like
 `embed` and `wgsl`, not Rust's `use`, so no Rust token gains a second
 meaning; `K(A, B)` was rejected because it reads as a call or a
 tuple-struct constructor. The clause is additive, so 0.26.0's blocks
@@ -1088,7 +1096,12 @@ Taken after the 0.26.0 review (2026-10-30), the user accepting both:
       (101 against 134), and a test expecting a panic is compared by
       its exit code only.
 19. **Shader parts are spelled `embed wgsl K with A, B { .. }`** (§11),
-    in 0.26.2.
+    in 0.26.2. A part may hold entry points, which become fields of the
+    blocks that include it; using a part's own `.src` or entry fields is
+    `error embed.part_use`. `with` names blocks by path, in any module.
+    (Refined 2026-10-30 after the 0.26.2 review. §11 said "a part has no
+    entry points", which fluid2d's BLUR contradicts, and "in one
+    module".)
 
 ## 13. How the work runs (the user's constraints, 2026-10-30)
 
