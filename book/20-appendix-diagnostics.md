@@ -113,6 +113,7 @@ to search for. The families are:
 | `contract.*` | `requires` and `ensures` | [13](13-contracts-testing.md) |
 | `test.*` | tests and properties | [13](13-contracts-testing.md) |
 | `sync.*` | what may cross to another thread | [14](14-threads.md) |
+| `cell.*` | what a cell may hold | `volec guide memory` |
 | `import.*` | `use` lines | [11](11-modules-and-programs.md) |
 | `distinct.*` | distinct types | `volec guide types` |
 | `arch.*` | CPU features and intrinsics | `volec guide arch` |
@@ -131,6 +132,7 @@ own.views
 own.drop_view
 own.readonly
 own.drop_call
+own.interior_copy
 ```
 
 and the `sync` family:
@@ -148,6 +150,7 @@ sync.scope_local
 sync.scope_spawn
 sync.spawn_closure
 sync.view_item
+sync.static
 ```
 
 `volec explain --list` without the `grep` prints every code, the tools'
