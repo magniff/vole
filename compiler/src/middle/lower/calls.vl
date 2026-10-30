@@ -29,7 +29,9 @@ use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::{is_fresh, lower_branch, lower_copy, new_slot_for, start_dead_block};
 use crate::middle::lower::arch::{NOT_LOWERED, lower_intrinsic};
 use crate::middle::lower::atomic::{atomic_intrinsic, lower_atomic_call};
-use crate::middle::lower::expr::{ir_conv, lower_expr, lower_operand, need_value};
+use crate::middle::lower::expr::{
+    ir_conv, lower_expr, lower_operand, need_value, operand_expr, operand_value,
+};
 use crate::middle::lower::ssa::ir_seal;
 use crate::middle::profile::PROFILE_MODULE;
 use crate::middle::unsafecheck::{
@@ -137,13 +139,13 @@ pub fn lower_call(cx: sink *FnCtx, n: i64) -> i64 {
         }
         let kind = bits_kind(direct);
         if kind >= 0 {
-            let x = need_value(cx, lower_expr(cx, child(n, 0)), TY_U64);
+            let x = need_value(cx, operand_expr(cx, child(n, 0)), TY_U64);
             return emit_ir(cx, Op::Bits, TY_I64, x, 0, kind);
         }
         if is_std_mul_hi(direct) {
             // (0.20) std::num::mul_hi: one umulh
-            let a = need_value(cx, lower_expr(cx, child(n, 0)), TY_U64);
-            let b = need_value(cx, lower_expr(cx, child(n, 1)), TY_U64);
+            let a = need_value(cx, operand_expr(cx, child(n, 0)), TY_U64);
+            let b = need_value(cx, operand_expr(cx, child(n, 1)), TY_U64);
             return emit_ir(cx, Op::MulH, TY_U64, a, b, 0);
         }
         // (0.21: std's atomic intrinsics, ATOMIC and FENCE)
@@ -151,70 +153,117 @@ pub fn lower_call(cx: sink *FnCtx, n: i64) -> i64 {
         if akind >= 0 {
             return lower_atomic_call(cx, n, direct, akind);
         }
-        var param_count = 0;
-        var ret = 0;
-        var variadic = false;
-        var callee_ty = 0;
-        var c = true;
-        if direct >= 0 {
-            param_count = FNS[direct].param_count;
-            ret = FNS[direct].ret;
-            variadic = FNS[direct].variadic;
-            c = fn_uses_c(direct);
-        } else {
-            callee_ty = NODES[callee].ty;
-            param_count = TYPES[callee_ty].count;
-            ret = TYPES[callee_ty].a;
-            c = fn_type_uses_c(callee_ty);
-        }
+        let conv = call_conv(direct, if direct >= 0 { 0 } else { NODES[callee].ty });
         let mark = cx.ssa_stack.count;
         for i in 0..NODES[n].count {
             let arg = child(n, i);
-            var ty = NODES[arg].ty;
-            if i < param_count {
-                ty = if direct >= 0 { fn_param(direct, i) } else { type_elem(callee_ty, i) };
-            }
-            var value = lower_expr(cx, arg);
-            if is_void(ty) {
-                continue;
-            }
-            value = need_value(cx, value, ty);
-            let extra = variadic && i >= param_count;
-            if is_compound(ty) {
-                if !is_fresh(arg) {
-                    let copy = ir_slot_addr(cx, new_slot_for(cx, ty));
-                    lower_copy(cx, copy, value, type_size(ty));
-                    value = copy;
-                }
-                let kind = if extra { variadic_kind(cx, ty) } else { conv_classify(cx, c, ty) };
-                if kind == AbiClass::Pieces {
-                    // Its pieces, read from the (new) slot; a variadic one's
-                    // first piece carries its type (see call_locations).
-                    for k in 0..cx.abi_piece_count {
-                        let piece = ir_load(cx, cx.abi_piece_ty[k], value, cx.abi_piece_offset[k]);
-                        var arg_ty = cx.abi_piece_ty[k];
-                        if extra {
-                            arg_ty = if k == 0 { 0 - ty } else { VARIADIC_PIECE };
-                        }
-                        push_arg(cx, piece, arg_ty);
-                    }
-                    continue;
-                }
-                push_arg(cx, value, if extra { 0 - ty } else { ty });
-                continue;
-            }
-            if extra && ty == TY_F32 {
-                // C's default promotion.
-                value = ir_conv(cx, value, TY_F32, TY_F64);
-                ty = TY_F64;
-            }
-            let arg_ty = scalar_type(ty);
-            push_arg(cx, value, if extra { 0 - arg_ty } else { arg_ty });
+            let ty = call_param_ty(conv, i, NODES[arg].ty);
+            push_call_arg(cx, conv, i, operand_expr(cx, arg), ty, is_fresh(arg));
         }
         var callee_value = 0;
         if direct < 0 {
-            callee_value = lower_operand(cx, callee);
+            callee_value = operand_value(cx, callee);
         }
+        emit_call_of(cx, conv, callee_value, mark, n)
+    }
+}
+
+// (0.26.1) A call's convention: its function (FNS; -1 for a call of a
+// function value, of type callee_ty), its parameters' count, its result's
+// type, whether it is variadic and whether it takes C's convention. The
+// ABI part of a call, from either lowering: call_conv, then each argument
+// with push_call_arg, then emit_call_of.
+pub struct CallConv {
+    pub direct: i64, pub callee_ty: i64, pub param_count: i64, pub ret: i64, pub variadic: bool,
+    pub c: bool,
+}
+
+pub fn call_conv(direct: i64, callee_ty: i64) -> CallConv {
+    // UNSAFE: FNS and TYPES are the checker's raw tables of functions and types.
+    // SAFETY: direct is a function the checker resolved (below FN_COUNT), callee_ty a
+    // function type of the checked call; both tables are read only after checking.
+    unsafe {
+        if direct >= 0 {
+            return CallConv {
+                direct, callee_ty: 0, param_count: FNS[direct].param_count, ret: FNS[direct].ret,
+                variadic: FNS[direct].variadic, c: fn_uses_c(direct),
+            };
+        }
+        CallConv {
+            direct, callee_ty, param_count: TYPES[callee_ty].count, ret: TYPES[callee_ty].a,
+            variadic: false, c: fn_type_uses_c(callee_ty),
+        }
+    }
+}
+
+// The type argument i is passed as: its parameter's, or for a variadic
+// one past them, its own (arg_ty).
+pub fn call_param_ty(conv: CallConv, i: i64, arg_ty: i64) -> i64 {
+    if i >= conv.param_count {
+        return arg_ty;
+    }
+    if conv.direct >= 0 { fn_param(conv.direct, i) } else { type_elem(conv.callee_ty, i) }
+}
+
+// Argument i of a call, `value` (0 when it has none) of type ty, pushed as
+// the convention passes it: a compound one copied unless it is `fresh` (a
+// new temporary), in pieces or by its address; a variadic f32 promoted.
+pub fn push_call_arg(cx: sink *FnCtx, conv: CallConv, i: i64, value0: i64, ty0: i64, fresh: bool) {
+    if is_void(ty0) {
+        return;
+    }
+    var ty = ty0;
+    var value = need_value(cx, value0, ty);
+    let extra = conv.variadic && i >= conv.param_count;
+    if is_compound(ty) {
+        if !fresh {
+            let copy = ir_slot_addr(cx, new_slot_for(cx, ty));
+            lower_copy(cx, copy, value, type_size(ty));
+            value = copy;
+        }
+        let kind = if extra { variadic_kind(cx, ty) } else { conv_classify(cx, conv.c, ty) };
+        if kind == AbiClass::Pieces {
+            // Its pieces, read from the (new) slot; a variadic one's
+            // first piece carries its type (see call_locations).
+            // UNSAFE: cx is the lowering's raw *FnCtx; its ABI piece tables are fields of it.
+            // SAFETY: cx points at the function's live context for the whole lowering, and
+            // conv_classify just filled abi_piece_count (at most 4) pieces.
+            unsafe {
+                for k in 0..cx.abi_piece_count {
+                    let piece = ir_load(cx, cx.abi_piece_ty[k], value, cx.abi_piece_offset[k]);
+                    var arg_ty = cx.abi_piece_ty[k];
+                    if extra {
+                        arg_ty = if k == 0 { 0 - ty } else { VARIADIC_PIECE };
+                    }
+                    push_arg(cx, piece, arg_ty);
+                }
+            }
+            return;
+        }
+        push_arg(cx, value, if extra { 0 - ty } else { ty });
+        return;
+    }
+    if extra && ty == TY_F32 {
+        // C's default promotion.
+        value = ir_conv(cx, value, TY_F32, TY_F64);
+        ty = TY_F64;
+    }
+    let arg_ty = scalar_type(ty);
+    push_arg(cx, value, if extra { 0 - arg_ty } else { arg_ty });
+}
+
+// The call of a call whose arguments were pushed since `mark` (callee_value
+// the function value of an indirect one), for call node n (its
+// --check-alloc site): its value (a compound result's address; 0 for
+// none).
+pub fn emit_call_of(cx: sink *FnCtx, conv: CallConv, callee_value: i64, mark: i64, n: i64)
+    -> i64 {
+    // UNSAFE: cx is the lowering's raw *FnCtx (its instructions and ABI piece tables).
+    // SAFETY: cx points at the function's live context for the whole lowering; call is
+    // the instruction emit_ir just made, and conv_classify fills at most 4 pieces.
+    unsafe {
+        let ret = conv.ret;
+        let c = conv.c;
         var result_ptr = 0;
         if is_compound(ret) {
             result_ptr = ir_slot_addr(cx, new_slot_for(cx, ret));
@@ -223,10 +272,10 @@ pub fn lower_call(cx: sink *FnCtx, n: i64) -> i64 {
         // (0.16: --check-alloc's allocation site, the arguments lowered)
         site_before_call(cx, n);
         var call = 0;
-        if direct >= 0 {
-            call = emit_ir(cx, Op::Call, result_ty, 0, 0, direct);
+        if conv.direct >= 0 {
+            call = emit_ir(cx, Op::Call, result_ty, 0, 0, conv.direct);
         } else {
-            call = emit_ir(cx, Op::CallI, result_ty, callee_value, 0, callee_ty);
+            call = emit_ir(cx, Op::CallI, result_ty, callee_value, 0, conv.callee_ty);
         }
         let in_registers = is_compound(ret) && !conv_returns_through_pointer(cx, c, ret);
         cx.insts[call].c = if in_registers { 0 } else { result_ptr };
