@@ -17,11 +17,18 @@ use crate::base::{
     IntVec, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, intern, intern_c, sym_name,
     sym_text,
 };
-use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, err_fmt, err_help, err_str, err_sym};
+use crate::base::diag::{
+    ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_str, err_sym,
+};
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::PROGRAM;
 use crate::front::check::names::near_to;
-use crate::front::lexer::{Tok, keyword_of_sym, str_at};
+use crate::front::embed::append_block_file;
+use crate::front::embed::made::write_made;
+use crate::front::embed::parts::{
+    BLOCKS, file_line_text, is_part, module_items, module_order, resolve_parts, users_of,
+};
+use crate::front::lexer::{Tok, add_string, keyword_of_sym, str_at};
 use crate::front::lexer::embedded::comment_end;
 use crate::front::parser::items::ITEM_PUBLIC;
 
@@ -40,8 +47,22 @@ pub static var ENTRY_SYM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static var ENTRY_STAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static var ENTRY_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (0.26.2) The module being checked, in pieces: for each, its offset in
+// the module's text, its start in SRC (-1: none, its node's `from`
+// string), its length and its block's node. Made again for each module.
+static var PIECE_MOD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var PIECE_SRC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var PIECE_LEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var PIECE_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The errors reported so far, their positions in SRC: a part's error is
+// reported once, not once for each module that includes it.
+static var REPORTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // The program's blocks made into their structs and statics, appended to
-// the program (before collect_phase, next to expand_derives).
+// the program (before collect_phase, next to expand_derives). (0.26.2)
+// First the parts (parts.vl) and the files of the file form (each a
+// SOURCE_WGSL file of the program), so that every block's text has its
+// place in SRC before any module is put together.
 pub fn expand_embeds() {
     BLOCK_NODE.count = 0;
     BLOCK_STRUCT.count = 0;
@@ -49,16 +70,26 @@ pub fn expand_embeds() {
     ENTRY_SYM.count = 0;
     ENTRY_STAGE.count = 0;
     ENTRY_POS.count = 0;
-    var made = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let wgsl = intern_c(c"wgsl");
-    for i in 0..NODES[PROGRAM].count {
-        let item = child(PROGRAM, i);
-        if NODES[item].kind == NodeKind::Embed && NODES[item].b == wgsl {
-            make_items(item, &made);
+    REPORTED.count = 0;
+    BIND_BLOCK.count = 0;
+    BIND_G.count = 0;
+    BIND_B.count = 0;
+    BIND_KIND.count = 0;
+    BIND_NAME.count = 0;
+    BIND_POS.count = 0;
+    resolve_parts();
+    if BLOCKS.count == 0 {
+        return;
+    }
+    for b in 0..BLOCKS.count {
+        let e = BLOCKS.get(b);
+        if NODES[e].d < 0 {
+            NODES[e].g = append_block_file(NODES[e].h, str_at(NODES[e].x));
         }
     }
-    if made.count == 0 {
-        return;
+    var made = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    for b in 0..BLOCKS.count {
+        make_items(b, &made);
     }
     let all = list_begin();
     for i in 0..NODES[PROGRAM].count {
@@ -70,16 +101,58 @@ pub fn expand_embeds() {
     list_end(PROGRAM, all);
 }
 
-// Block e's struct and static, into `made`.
-fn make_items(e: i64, made: inout IntVec) {
-    let text = str_at(NODES[e].c);
-    let block = NODES[e].d >= 0;
-    // (positions: in the block's text, or the `from` string's)
-    let base = if block { NODES[e].d } else { NODES[e].h };
-    let open = if block { NODES[e].d - 1 } else { NODES[e].h };
+// Block b's struct and static, into `made`. A block that is no part gets
+// its module (its parts' texts, then its own: module_order), scanned for
+// entry points and checked; a part only its own text's entry points.
+fn make_items(b: i64, made: inout IntVec) {
+    let e = BLOCKS.get(b);
     let first = ENTRY_SYM.count;
-    scan_entries(text, if block { base } else { -1 }, base);
-    check_block(e, text);
+    var src_id = NODES[e].c;
+    PIECE_MOD.count = 0;
+    PIECE_SRC.count = 0;
+    PIECE_LEN.count = 0;
+    PIECE_NODE.count = 0;
+    if is_part(b) {
+        scan_block(e, first);
+    } else {
+        var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        module_order(b, &order);
+        var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let shared_ok = module_items(order, &items);
+        let bfirst = BIND_BLOCK.count;
+        if order.count == 1 && items.count == 0 {
+            add_piece(0, e);
+            scan_block(e, first);
+            scan_bindings(e, b);
+            if !duplicate_bindings(b, bfirst) {
+                check_block(e, str_at(NODES[e].c));
+            }
+        } else {
+            let m = buf_new();
+            // (0.26.2) the WGSL of the consts and structs it names, first
+            for i in 0..items.count {
+                let at = buf_slice(m).len;
+                write_made(items.get(i), m);
+                PIECE_MOD.push(at);
+                PIECE_SRC.push(-1);
+                PIECE_LEN.push(buf_slice(m).len - at);
+                PIECE_NODE.push(items.get(i));
+            }
+            for i in 0..order.count {
+                let p = BLOCKS.get(order.get(i));
+                add_piece(buf_slice(m).len, p);
+                buf_bytes(m, str_at(NODES[p].c));
+                buf_byte(m, '\n');
+                scan_block(p, first);
+                scan_bindings(p, b);
+            }
+            src_id = add_string(buf_slice(m));
+            if shared_ok && !duplicate_bindings(b, bfirst) {
+                check_block(e, buf_slice(m));
+            }
+        }
+    }
+    let open = if NODES[e].d >= 0 { NODES[e].d - 1 } else { NODES[e].h };
     let name = NODES[e].a;
     let at = NODES[e].y;
     let public = (NODES[e].p & ITEM_PUBLIC) != 0;
@@ -100,9 +173,9 @@ fn make_items(e: i64, made: inout IntVec) {
     let lit = new_node(NodeKind::StructLit, at, NODES[e].end);
     NODES[lit].a = ty_sym;
     let inits = list_begin();
-    list_push(init(intern_c(c"src"), NODES[e].c, open));
+    list_push(init(intern_c(c"src"), src_id, open));
     for k in first..ENTRY_SYM.count {
-        let id = crate::front::lexer::add_string(sym_text(ENTRY_SYM.get(k)));
+        let id = add_string(sym_text(ENTRY_SYM.get(k)));
         list_push(init(ENTRY_SYM.get(k), id, ENTRY_POS.get(k)));
     }
     list_end(lit, inits);
@@ -116,6 +189,27 @@ fn make_items(e: i64, made: inout IntVec) {
     BLOCK_FIRST.push(first);
     made.push(s);
     made.push(st);
+}
+
+// The start in SRC of block e's text: the block's own, or its file's (-1:
+// the file could not be read).
+fn text_start(e: i64) -> i64 {
+    if NODES[e].d >= 0 { NODES[e].d } else { NODES[e].g }
+}
+
+// Block e's text at module offset `at`, a piece of the module.
+fn add_piece(at: i64, e: i64) {
+    PIECE_MOD.push(at);
+    PIECE_SRC.push(text_start(e));
+    PIECE_LEN.push(str_at(NODES[e].c).len);
+    PIECE_NODE.push(e);
+}
+
+// The entry points of block e's text, into the ENTRY_ lists of the block
+// whose first is `first`.
+fn scan_block(e: i64, first: i64) {
+    let at = text_start(e);
+    scan_entries(str_at(NODES[e].c), at, if at >= 0 { at } else { NODES[e].h }, first);
 }
 
 // The made type's name, `embed wgsl K`.
@@ -159,12 +253,11 @@ fn init(name: i64, id: i64, pos: i64) -> i64 {
 // (the file form: the `from` string's). An entry named `src` (the text's
 // field) or a vole keyword is embed.name, and makes no field; one named
 // twice makes one (WGSL's check reports it).
-fn scan_entries(text: [u8], at: i64, base: i64) {
+fn scan_entries(text: [u8], at: i64, base: i64, first: i64) {
     let compute = intern_c(c"compute");
     let vertex = intern_c(c"vertex");
     let fragment = intern_c(c"fragment");
     let fn_sym = intern_c(c"fn");
-    let first = ENTRY_SYM.count;
     var stage = 0;
     var after_fn = false;
     var after_at = false;
@@ -225,6 +318,202 @@ fn scan_entries(text: [u8], at: i64, base: i64) {
 
 fn ident_start(c: u8) -> bool {
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+// ---- (0.26.2) A module's bindings, from a scan of its text ----
+//
+// `@group(G) @binding(B) var<uniform> NAME: T` (either attribute first;
+// `var<storage, read>`, `var<storage, read_write>`, `var NAME:
+// texture_..`, `var NAME: sampler`), comments skipped: for gpu_lint.vl's
+// diagnostics and wgsl.binding across parts, never from std::gpu::wgsl's
+// reflection.
+
+pub const BK_UNIFORM: i64 = 1;
+pub const BK_STORAGE: i64 = 2;
+pub const BK_STORAGE_RW: i64 = 3;
+pub const BK_TEXTURE: i64 = 4;
+pub const BK_SAMPLER: i64 = 5;
+pub const BK_STORAGE_TEXTURE: i64 = 6;
+
+// The bindings of every module: its block (an index of BLOCK_NODE), group,
+// binding, kind (BK_), name (a symbol) and position in SRC.
+pub static var BIND_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_G: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var BIND_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The bindings of block e's text (at `at` in SRC; -1: none), into the
+// BIND_ lists for module b.
+fn scan_bindings(e: i64, b: i64) {
+    let text = str_at(NODES[e].c);
+    let at = if NODES[e].d >= 0 { NODES[e].d } else { NODES[e].g };
+    if at < 0 {
+        return;
+    }
+    var p = 0;
+    while p < text.len {
+        let c = text[p];
+        if c == '/' && p + 1 < text.len && (text[p + 1] == '/' || text[p + 1] == '*') {
+            p = comment_end(text, p);
+            continue;
+        }
+        if c != '@' {
+            p += 1;
+            continue;
+        }
+        // the attributes, then `var`
+        let start = p;
+        var group = -1;
+        var binding = -1;
+        var q = p;
+        while q < text.len && text[q] == '@' {
+            let (word, w_end) = word_at(text, q + 1);
+            q = skip_space(text, w_end);
+            var value = -1;
+            if q < text.len && text[q] == '(' {
+                let v0 = skip_space(text, q + 1);
+                var v = v0;
+                value = 0;
+                while v < text.len && text[v] >= '0' && text[v] <= '9' {
+                    value = value * 10 + (text[v] - '0') as i64;
+                    v += 1;
+                }
+                if v == v0 {
+                    value = -1;
+                }
+                while q < text.len && text[q] != ')' {
+                    q += 1;
+                }
+                q = skip_space(text, q + 1);
+            }
+            if word == "group" {
+                group = value;
+            } else if word == "binding" {
+                binding = value;
+            }
+        }
+        let (kw, kw_end) = word_at(text, q);
+        if group < 0 || binding < 0 || kw != "var" {
+            p = if q > start { q } else { start + 1 };
+            continue;
+        }
+        q = skip_space(text, kw_end);
+        var space: [u8] = "";
+        var access: [u8] = "";
+        if q < text.len && text[q] == '<' {
+            let (s, s_end) = word_at(text, skip_space(text, q + 1));
+            space = s;
+            q = skip_space(text, s_end);
+            if q < text.len && text[q] == ',' {
+                let (a, a_end) = word_at(text, skip_space(text, q + 1));
+                access = a;
+                q = a_end;
+            }
+            while q < text.len && text[q] != '>' {
+                q += 1;
+            }
+            q = skip_space(text, q + 1);
+        }
+        let (name, n_end) = word_at(text, q);
+        q = skip_space(text, n_end);
+        var ty: [u8] = "";
+        if q < text.len && text[q] == ':' {
+            let (t, _t_end) = word_at(text, skip_space(text, q + 1));
+            ty = t;
+        }
+        let kind = if space == "uniform" { BK_UNIFORM } else if space == "storage" {
+            if access == "read_write" { BK_STORAGE_RW } else { BK_STORAGE } }
+            else if ty == "sampler" || ty == "sampler_comparison" { BK_SAMPLER }
+            else if ty.len > 16 && ty[0..16] == "texture_storage_" { BK_STORAGE_TEXTURE }
+            else { BK_TEXTURE };
+        if name.len > 0 {
+            BIND_BLOCK.push(b);
+            BIND_G.push(group);
+            BIND_B.push(binding);
+            BIND_KIND.push(kind);
+            BIND_NAME.push(intern(name));
+            BIND_POS.push(at + start);
+        }
+        p = q;
+    }
+}
+
+// The identifier at text[p] (empty when none) and its end.
+fn word_at(text: [u8], p: i64) -> ([u8], i64) {
+    var q = p;
+    while q < text.len && (ident_start(text[q]) || (text[q] >= '0' && text[q] <= '9')) {
+        q += 1;
+    }
+    (text[p..q], q)
+}
+
+fn skip_space(text: [u8], p0: i64) -> i64 {
+    var p = p0;
+    while p < text.len
+        && (text[p] == ' ' || text[p] == '\t' || text[p] == '\n' || text[p] == '\r') {
+        p += 1;
+    }
+    p
+}
+
+// (wgsl.binding across parts) Two bindings of module b at one group and
+// binding, from `first` of the BIND_ lists: reported at the second, naming
+// the first's block and line; true when there was one.
+fn duplicate_bindings(b: i64, first: i64) -> bool {
+    for j in first..BIND_BLOCK.count {
+        for i in first..j {
+            if BIND_G.get(i) == BIND_G.get(j) && BIND_B.get(i) == BIND_B.get(j) {
+                duplicate_error(b, i, j);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn duplicate_error(b: i64, i: i64, j: i64) {
+    // the block whose text holds the first
+    let holder = piece_node_at(BIND_POS.get(i));
+    let saved = ERR_KIND;
+    ERR_KIND = c"wgsl.binding";
+    err_begin(BIND_POS.get(j));
+    let m = buf_new();
+    buf_bytes(m, "@group(");
+    buf_int(m, BIND_G.get(j));
+    buf_bytes(m, ") @binding(");
+    buf_int(m, BIND_B.get(j));
+    buf_bytes(m, ") is already '");
+    buf_bytes(m, sym_text(BIND_NAME.get(i)));
+    buf_bytes(m, "' (");
+    if holder > 0 {
+        buf_bytes(m, sym_text(NODES[holder].a));
+        buf_bytes(m, ", ");
+    }
+    buf_file_line(m, BIND_POS.get(i));
+    buf_bytes(m, ")");
+    err_fmt(buf_slice(m));
+    let h = buf_new();
+    buf_bytes(h, "two resources of one module at one group and binding: give each its own, or put them in different modules; the module of '");
+    buf_bytes(h, sym_text(NODES[BLOCKS.get(b)].a));
+    buf_bytes(h, "' is the text of its parts (`with`) and its own");
+    buf_byte(h, 0);
+    err_help(buf_slice(h).ptr);
+    err_end_soft();
+    ERR_KIND = saved;
+}
+
+// The block whose piece of the module being made holds SRC position pos
+// (its Embed node), or 0.
+fn piece_node_at(pos: i64) -> i64 {
+    for k in 0..PIECE_SRC.count {
+        let at = PIECE_SRC.get(k);
+        if at >= 0 && pos >= at && pos < at + PIECE_LEN.get(k) {
+            return PIECE_NODE.get(k);
+        }
+    }
+    0
 }
 
 // Entry `sym` at pos (stage), unless it is no field's name (embed.name)
@@ -310,29 +599,45 @@ fn check_block(e: i64, text: [u8]) {
     }
 }
 
-// The error FAIL_ holds, of block e (text its WGSL).
+// The error FAIL_ holds, of block e's module (text): at its position in
+// the piece it is in (0.26.2: a part's text, the block's own, or its
+// file's, a file of the program: `x.wgsl:L:C`), once.
 fn report(e: i64, text: [u8]) {
-    let block = NODES[e].d >= 0;
+    let pos = if FAIL_POS < 0 { 0 } else if FAIL_POS > text.len { text.len } else { FAIL_POS };
+    var at = NODES[e].h;
+    var made = -1;
+    if PIECE_MOD.count > 0 {
+        var k = 0;
+        while k + 1 < PIECE_MOD.count && PIECE_MOD.get(k + 1) <= pos {
+            k += 1;
+        }
+        let off = pos - PIECE_MOD.get(k);
+        let len = PIECE_LEN.get(k);
+        let node = PIECE_NODE.get(k);
+        if PIECE_SRC.get(k) >= 0 {
+            at = PIECE_SRC.get(k) + (if off > len { len } else { off });
+        } else if NODES[node].kind == NodeKind::Embed {
+            at = NODES[node].h;
+        } else {
+            // (0.26.2: the WGSL written for a const or a struct: at its
+            // declaration)
+            at = NODES[node].start;
+            made = node;
+        }
+    }
+    for i in 0..REPORTED.count {
+        if REPORTED.get(i) == at {
+            return;
+        }
+    }
+    REPORTED.push(at);
     let saved = ERR_KIND;
     ERR_KIND = sym_name(intern(buf_slice(FAIL_CODE)));
-    let pos = if FAIL_POS < 0 { 0 } else if FAIL_POS > text.len { text.len } else { FAIL_POS };
-    let m = buf_new();
-    if block {
-        err_begin(NODES[e].d + pos);
-    } else {
-        // (the file's text is no file of the program in 0.26.0: its line
-        // and column first, at the `from` string)
-        err_begin(NODES[e].h);
-        let (line, col) = line_col(text, pos);
-        buf_bytes(m, str_at(NODES[e].x));
-        buf_byte(m, ':');
-        buf_int(m, line);
-        buf_byte(m, ':');
-        buf_int(m, col);
-        buf_bytes(m, ": ");
+    err_begin(at);
+    err_fmt(buf_slice(FAIL_MSG));
+    if made >= 0 {
+        err_fmt(f" (in the WGSL made for '{sym_text(NODES[made].a)}')");
     }
-    buf_bytes(m, buf_slice(FAIL_MSG));
-    err_fmt(buf_slice(m));
     if buf_slice(FAIL_HELP).len > 0 {
         let h = buf_new();
         buf_bytes(h, buf_slice(FAIL_HELP));
@@ -341,21 +646,6 @@ fn report(e: i64, text: [u8]) {
     }
     err_end_soft();
     ERR_KIND = saved;
-}
-
-// The 1-based line and column of byte pos of text.
-fn line_col(text: [u8], pos: i64) -> (i64, i64) {
-    var line = 1;
-    var col = 1;
-    for i in 0..pos {
-        if text[i] == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
 }
 
 // ---- gpu.entry: a block's entry point that is not there ----
@@ -402,6 +692,57 @@ pub fn entry_error(n: i64, node: i64, name: i64) -> bool {
         near.offer(ENTRY_SYM.get(k));
     }
     near.help();
+    err_end_soft();
+    ERR_KIND = saved;
+    true
+}
+
+// ---- embed.part_use: a part's own `.src` or entry field (0.26.2) ----
+
+// (synth_field) Field `name` of a struct (its node `node`) at node n: when
+// the struct is a part's type, embed.part_use, naming the fields of the
+// blocks that include it (the first as the fix), and true; else false.
+pub fn part_use_error(n: i64, node: i64, name: i64) -> bool {
+    var b = -1;
+    for i in 0..BLOCK_STRUCT.count {
+        if BLOCK_STRUCT.get(i) == node {
+            b = i;
+        }
+    }
+    if !is_part(b) {
+        return false;
+    }
+    let e = BLOCK_NODE.get(b);
+    var users = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let named_at = users_of(b, &users);
+    let part = sym_text(NODES[e].a);
+    let saved = ERR_KIND;
+    ERR_KIND = c"embed.part_use";
+    err_begin(NODES[n].start);
+    err_fmt(
+        f"'{part}' is a part (named in 'with' at {file_line_text(named_at)}): it has no module of its own, so '{part}.{sym_text(name)}' is no value");
+    let h = buf_new();
+    if users.count == 0 {
+        buf_bytes(h, "no block that is no part includes it");
+    } else {
+        buf_bytes(h, "the modules that include it: ");
+        for i in 0..users.count {
+            if i > 0 {
+                buf_bytes(h, ", ");
+            }
+            buf_bytes(h, sym_text(NODES[BLOCKS.get(users.get(i))].a));
+            buf_byte(h, '.');
+            buf_bytes(h, sym_text(name));
+        }
+    }
+    buf_byte(h, 0);
+    err_help(buf_slice(h).ptr);
+    // the fix: the first user's field, when the part is named by its name
+    let base = NODES[n].a;
+    if users.count > 0 && NODES[base].kind == NodeKind::Ident && NODES[base].a == NODES[e].a {
+        err_fix(NODES[base].start, NODES[base].end,
+            sym_text(NODES[BLOCKS.get(users.get(0))].a));
+    }
     err_end_soft();
     ERR_KIND = saved;
     true

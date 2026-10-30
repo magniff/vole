@@ -57,7 +57,7 @@ texture of one mip level, or code outside uniform control flow); an
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, SamplerDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const QUAD: [u8] = r"""
+embed wgsl QUAD {
     struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
     @group(0) @binding(0) var t: texture_2d<f32>;
     @group(0) @binding(1) var s: sampler;
@@ -68,13 +68,13 @@ const QUAD: [u8] = r"""
         let r = textureSampleLevel(t, s, v.uv, 0.0).r;
         return vec4<f32>(r, r, r, 1.0);
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(QUAD)?;
-    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm);
+    let shader = dev.shader_wgsl(QUAD.src)?;
+    var desc = gpu::RenderDesc::new(shader, QUAD.vs, QUAD.fs, Format::Rgba8Unorm);
     var layout = VertexLayout::new(16); // x, y, u, v: four f32s a vertex
     layout.attribute(0, VertexFormat::Float32x2, 0);
     layout.attribute(1, VertexFormat::Float32x2, 8);
@@ -139,7 +139,7 @@ use std::gpu::{
     VertexLayout,
 };
 
-const UI: [u8] = r"""
+embed wgsl UI {
     struct VIn {
         @location(0) pos: vec2<f32>, @location(1) color: vec4<f32>, @location(2) uv: vec2<f32>,
     }
@@ -155,7 +155,7 @@ const UI: [u8] = r"""
         let coverage = textureSampleLevel(atlas, samp, v.uv, 0.0).r; // ink, or the white texel
         return vec4<f32>(v.color.rgb, v.color.a * coverage);
     }
-    """;
+}
 
 // The atlas (R8Unorm, 12 x 5 texels, '#' is 255): the white texel at
 // (0, 0) for solid quads, then 'H' and 'I', 3 x 5 each, at x 4 and 8.
@@ -214,8 +214,8 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     queue.submit(enc.finish());
 
     // the overlay: a blended pipeline of position, colour and uv
-    let shader = dev.shader_wgsl(UI)?;
-    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm); // a frame: Bgra8Unorm
+    let shader = dev.shader_wgsl(UI.src)?;
+    var desc = gpu::RenderDesc::new(shader, UI.vs, UI.fs, Format::Rgba8Unorm); // a frame: Bgra8Unorm
     var layout = VertexLayout::new(32); // 8 f32s a vertex
     layout.attribute(0, VertexFormat::Float32x2, 0); // x, y
     layout.attribute(1, VertexFormat::Float32x4, 8); // r, g, b, a
@@ -298,7 +298,7 @@ same order (`RenderDesc::new`'s format is target 0, then
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage};
 
-const GBUFFER: [u8] = r"""
+embed wgsl GBUFFER {
     struct G {
         @location(0) albedo: vec4<f32>,
         @location(1) normal: vec4<f32>,
@@ -313,13 +313,13 @@ const GBUFFER: [u8] = r"""
     @fragment fn fs(@builtin(position) pos: vec4<f32>) -> G {
         return G(vec4<f32>(1.0, 0.5, 0.0, 1.0), vec4<f32>(0.0, 0.0, 1.0, 1.0), pos.z);
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(GBUFFER)?;
-    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm); // target 0
+    let shader = dev.shader_wgsl(GBUFFER.src)?;
+    var desc = gpu::RenderDesc::new(shader, GBUFFER.vs, GBUFFER.fs, Format::Rgba8Unorm); // target 0
     desc.target(Format::Rgba8Unorm); // target 1
     desc.target(Format::R32Float); // target 2
     let pipe = dev.render_pipeline(desc)?;
@@ -372,17 +372,17 @@ with a comparison sampler); it needs `TEXTURE_BINDING` for that.
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, TextureUsage, VertexFormat, VertexLayout};
 
-const SHADOW: [u8] = r"""
+embed wgsl SHADOW {
     @vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
         return vec4<f32>(p, 1.0);
     }
-    """;
+}
 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let shader = dev.shader_wgsl(SHADOW)?;
-    var desc = gpu::RenderDesc::depth_only(shader, "vs");
+    let shader = dev.shader_wgsl(SHADOW.src)?;
+    var desc = gpu::RenderDesc::depth_only(shader, SHADOW.vs);
     var layout = VertexLayout::new(12);
     layout.attribute(0, VertexFormat::Float32x3, 0);
     desc.vertex_buffer(layout);

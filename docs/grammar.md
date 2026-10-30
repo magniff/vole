@@ -2114,8 +2114,10 @@ a C keyword is an error.
 the compiler. WGSL is the one language.
 
 ```ebnf
-embed_item   = [ "pub" ] "embed" lang name ( "{" embedded "}" | "from" string_lit ";" ) ;
+embed_item   = [ "pub" ] "embed" lang name [ "with" part { "," part } ]
+               ( "{" embedded "}" | "from" string_lit ";" ) ;
 lang         = ident ;                                 (* "wgsl" *)
+part         = ident { "::" ident } ;                  (* 0.26.2: a path *)
 embedded     = { any } ;                               (* to the "}" that matches, by the language's rule *)
 ```
 
@@ -2124,7 +2126,8 @@ embedded     = { any } ;                               (* to the "}" that matche
   `wgsl` stay names everywhere else (`std::gpu::wgsl`, `let wgsl`). An
   item only, at module scope (in `mod m { .. }` and `#[cfg(test)]` too).
 - The lexer does not lex the text: after the `{` of `embed LANG NAME {`
-  (the three words and the `{` in one file), the text ends at the `}`
+  or `embed LANG NAME with A, b::B {` (the words, the list and the `{`
+  in one file, at most 64 tokens back), the text ends at the `}`
   that matches it outside WGSL's comments, `//` to the line's end and
   nested `/* */` (WGSL has no strings). A `}` in a comment does not
   count. No matching `}` is `embed.unterminated`, at the `{`, naming
@@ -2133,7 +2136,9 @@ embedded     = { any } ;                               (* to the "}" that matche
   delimited by WGSL's rule).
 - `embed wgsl K from "x.wgsl";` takes the text from a file, relative to
   the directory of the file holding the block, as `include_str` does:
-  `embed.missing`, `embed.path` and `embed.utf8` apply.
+  `embed.missing`, `embed.path` and `embed.utf8` apply. *(0.26.2)* The
+  file is a file of the program: its errors are at `x.wgsl:L:C`, the LSP
+  publishes them to the file's own URI, and `query grep` lists its lines.
 - The block is an immutable `static K` of a struct type the compiler
   makes, `embed wgsl K` in messages (source cannot name it in 0.26). Its
   fields are `pub` and `[u8]`: `src`, the text, and one per entry point
@@ -2144,15 +2149,52 @@ embedded     = { any } ;                               (* to the "}" that matche
   `gpu.entry`, listing its entry points.
 - `volec check` (and the LSP, and every checked edit) runs the text
   through std::gpu::wgsl's front end: its first error is reported at
-  its position in the `.vl` file, with its `wgsl.*` code; in the file
-  form at the `from` string, the file's `x.wgsl:L:C:` first.
+  its position in the `.vl` file (or the `.wgsl` file), with its
+  `wgsl.*` code.
 - `volec fmt` keeps a block's lines as they are, from its `{` to its
   `}`. `query grep` classifies its text by WGSL's rules (comments, the
   rest code); `query show K` and `edit patch K` take the item.
 
-*Coming in 0.26.2: shader parts.* `embed wgsl K with A, B { .. }` puts
-the text of the blocks `A` and `B`, then `K`'s own text, into one WGSL
-module (module-scope order is free in WGSL). A part is an `embed wgsl`
-block found by ordinary path resolution; it has no entry points, and
-parts form no cycle. `with` is not a Rust keyword: like `embed` and
-`wgsl` it stays an identifier everywhere else.
+**Parts** *(0.26.2)*. `embed wgsl K with A, b::B { .. }` (and `embed
+wgsl K with A from "x.wgsl";`) makes K's module from the texts of the
+blocks it names, then its own: each part's own parts first, depth-first,
+each block once (module-scope order is free in WGSL, so a part may read
+what K declares after it).
+
+- The names are paths from K's module: `A`, `shaders::A`, `crate::A`,
+  `super::A` (a `use` does not bring one in); a part in another module is
+  `pub`. A name that is no block is `embed.with`; parts that include
+  themselves, `embed.cycle`, at the `with` entry that closes the cycle.
+- A block named in any `with` is a part. It is checked only inside the
+  modules that include it, never alone, and an error in it is reported
+  once, at its own line. Its entry points are fields of each block that
+  includes it: `K_BLUR_X.main` is BLUR's `main`, and `K.src` is the whole
+  module.
+- A part has no module of its own: its `.src` and its entry fields are
+  no values (`embed.part_use`, the help naming the including blocks'
+  fields, `volec fix --suggested` the first).
+- `with` is not a Rust keyword: like `embed` and `wgsl` it stays an
+  identifier everywhere else. `volec fmt` keeps the header on its line.
+
+**Shared consts and structs** *(0.26.2)*. A `with` list may also name
+a `const` and a `#[repr(wgsl)]` struct; the compiler writes their WGSL
+before the module's blocks, so one definition serves host and shader:
+
+- a const of `i32`, `u32`, `f32` or `bool`, or an array of them, with a
+  literal value (`pub const W: u32 = 64;` is `const W: u32 = 64u;`; an
+  `f32` is written as it reads back, `0.1f`); another const is
+  `embed.with`;
+- `#[repr(wgsl)] struct` (alone: no `C`, `packed` or `align`) lays the
+  struct out as WGSL does: its fields in order, a `[T; 2]` of `i32`,
+  `u32` or `f32` a `vec2<T>` aligned to 8, a `[T; 3]` or `[T; 4]` a
+  `vec3`/`vec4` aligned to 16 (a vec3's size stays 12), a nested
+  `#[repr(wgsl)]` struct by its own layout, `[T; N]` an `array<T, N>`;
+  the size rounds up to the alignment, so `size_of(T)` is WGSL's
+  `SizeOf`. The block gets its WGSL `struct`, nested structs first, once
+  each. A `bool`, `usize`, 64-bit number, pointer, `Vec`, slice, tuple,
+  enum or array of 3-element arrays in one is `gpu.repr`, naming the
+  field (`fix --suggested` writes `u32` for a `bool`). Named from another
+  module, the struct and its fields are `pub`.
+- An error in the written WGSL is reported at the item's declaration,
+  "in the WGSL made for 'P'". Resolution is one way: a block exports only
+  its entry points.

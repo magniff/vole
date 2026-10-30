@@ -40,3 +40,14 @@ $ refs SIM.step
 39:31	read	main	println(f"{SIM.init} {SIM.step}");
 $ def FILL
 crate::FILL	embedwgsl/main.vl:35:12	static	embed wgsl FILL from "shaders/fill.wgsl"
+## (0.26.2) the file form's file is a file of the program: grep lists its
+## lines, by WGSL's rules, and FILL.fill is defined in it.
+$ grep workgroup_size
+# embedwgsl/main.vl
+19:15	code	SIM	@compute @workgroup_size(64)
+29:15	code	SIM	@compute @workgroup_size(64)
+# embedwgsl/shaders/fill.wgsl
+1:11	code	crate	@compute @workgroup_size(1)
+$ refs FILL.fill
+# embedwgsl/shaders/fill.wgsl
+2:4	def	fn fill() {}

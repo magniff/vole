@@ -159,12 +159,12 @@ gives.
 use std::gpu;
 use std::gpu::BufferUsage;
 
-const STEP: [u8] = """
+embed wgsl STEP {
     @group(0) @binding(0) var<storage, read_write> xs: array<u32>;
     @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         xs[id.x] = xs[id.x] * 3u + 1u;
     }
-    """;
+}
 
 // A frame's GPU work: what the windowed program submits each frame.
 fn frame(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline, group: gpu::BindGroup) {
@@ -180,7 +180,7 @@ fn frame(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline, 
 fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
-    let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP)?, "main")?;
+    let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let xs = dev.buffer(1024 * 64 * 4, BufferUsage::STORAGE);
     let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, xs)][..]);
     frame(dev, &queue, pipe, group); // a warm-up: the first submit sets things up
