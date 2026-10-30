@@ -90,8 +90,9 @@ match store.values.get_mut(key.as_slice()) {
 ```
 
 `intern` copies the bytes into `names`, an `Arena` made once in `main`
-(`Arena::new_in(gpa)`) and freed at the end (`unsafe { names.free_all()
-}`: unsafe because a view into it could still be used after). The view
+(`Arena::new_in(gpa)`) and freed at the end by a guard, `FreeAll`, whose
+`Drop` calls `unsafe { self.arena.free_all() }` (unsafe because a view
+into it could still be used after). The view
 it returns lives as long as the arena, not as long as the `Vec` that
 copied the bytes there, which safe code cannot say yet (a view of a
 `Vec` ends when the `Vec` is dropped).
@@ -112,11 +113,15 @@ fn intern(names: Arena, s: [u8]) -> [u8] {
 
 ```console
 $ volec query effects crate
+<crate::FreeAll as Drop>::drop	alloc(Gpa) panic unsafe
 crate::intern	alloc(Arena) panic unsafe
 lower_in<ScopedArena>	alloc(ScopedArena) panic
 answer<ScopedArena>	alloc(Gpa, Arena, ScopedArena) io panic diverge
-crate::main	alloc(Gpa, Arena) io global panic diverge unsafe
+crate::main	alloc(Gpa, Arena) io global panic diverge
 ```
+
+(The guard's drop gives the keys' arena back to `Gpa`, in its own
+`unsafe` block: `main` has none left.)
 
 `answer<ScopedArena>` allocates from all three: `Gpa` (the map grows),
 `Arena` (a new key is interned), `ScopedArena` (the scratch). In `main`

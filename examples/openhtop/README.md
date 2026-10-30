@@ -134,8 +134,8 @@ one.
 
 **The terminal.** `std::sys` puts the terminal in raw mode (`sys_make_raw`,
 `sys_tcsetattr`), the alternate screen (`\x1b[?1049h`) is opened, the
-cursor hidden, and all three restored with a `defer`, including on the
-early return paths. Keys are read with `poll` and `read`; the escape
+cursor hidden, and all three restored by a guard, `Restore`, whose `Drop`
+runs on every way out of `run_tui`. Keys are read with `poll` and `read`; the escape
 sequences of the arrows, PgUp/PgDn, Home/End and F1 to F12 (both the CSI
 `\x1b[15~` and the SS3 `\x1bOP` forms) are decoded by hand. The window
 size is `ioctl(TIOCGWINSZ)` on a `#[repr(C)]` `struct winsize`; `--width`
@@ -166,7 +166,7 @@ not change what is selected.
 - modules, `pub`, `use` and a module tree: `volec guide modules`
 - `fn main(gpa: Gpa)`, `Vec`/`Buf` on an allocator, f-strings and
   `format_in`: `volec guide allocators`, `volec guide formatting`
-- `inout` parameters and `&x` at the call, `sink`, `defer`:
+- `inout` parameters and `&x` at the call, `sink`, a guard with `Drop`:
   `volec guide memory`
 - `extern "C"` (`getloadavg`, `getpagesize`, `ioctl`), `#[repr(C)]`,
   `unsafe`: `volec guide c-interop`
