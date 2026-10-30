@@ -76,8 +76,41 @@ fn main(gpa: Gpa) -> i32 {
   borrow where it is owned; `x: sink T` moves an owned `T`. A function
   that keeps or returns its argument (`push`, `swap`) takes it `sink`.
 - `size_of(T)` and `align_of(T)` work on type parameters.
+- `where` (0.26.2) writes the bounds after the signature, Rust's way:
+  `fn f<T>(x: T) where T: Display + Copy`, on a struct, an enum, a trait
+  and an impl too (`impl<T> Stack<T> where T: Ord {`). Its left side is a
+  parameter of the item: `where I::Item: Display` is
+  `where.unsupported`, write `I: Iterator<Item = X>, X: Display`.
+- `x: impl Display` (0.26.2) is a type parameter without a name, as in
+  Rust: `fn show(x: impl Display)` is `fn show<T: Display>(x: T)`; also
+  `f: impl Fn(i64) -> i64` and `f: inout impl FnMut(i64)`. Messages call
+  it `impl Display`; a turbofish gives only the named parameters. Only a
+  parameter's type may be `impl Trait` (`type.impl-position`).
+
+```vole
+use std::Display;
+
+fn show<T>(label: T, x: impl Display) where T: Display {
+    println(f"{label}={x}");
+}
+
+fn apply(f: impl Fn(i64) -> i64, x: i64) -> i64 { f(x) }
+
+fn main() -> i32 {
+    show("n", 4);
+    show::<[u8]>("pi", 3.5);
+    println(apply(|x| x * 2, 21));
+    0
+}
+```
+```out
+n=4
+pi=3.5
+42
+```
+
 - Not there: const generics (`[T; N]` with `N` a parameter), generic
-  traits (`trait Conv<T>`), `where` clauses, variadic generics.
+  traits (`trait Conv<T>`), variadic generics.
   Associated types (0.14): `I::Item` for `I: Iterator`, and bounds
   `I: Iterator<Item = i64>`, `F: Fn(i64) -> bool` (`volec guide
   iterators`, `guide closures`).

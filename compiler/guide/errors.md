@@ -166,12 +166,12 @@ error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Cl
 and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
 
 ```vole
-fn f<T>(x: sink T) -> T where T: Ord { x }
+fn f<I>(it: I) -> i64 where I: Iterator, I::Item: Ord { 0 }
 ```
 ```err
-error[parser error] expected '{', got 'where'
+error[where.unsupported] 'I::Item: Ord': a 'where' bound is on a type parameter of the item, and 'I::Item' is not one
 ```
-Bounds go in the list: `fn f<T: Ord>(x: T) -> T`.
+`where` (0.26.2) bounds the item's parameters: `I: Iterator<Item = X>, X: Ord`.
 
 ```vole
 fn main() -> i32 {

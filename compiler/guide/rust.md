@@ -241,13 +241,14 @@ fn main() -> i32 {
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
 | `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
-| `where T: Ord` | `<T: Ord>` |
+| `where T: Ord` | the same (0.26.2), on a parameter of the item; `where I::Item: Ord` comes with the rust edition |
 | `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children; fields too, 0.26); `pub(crate)` and `pub(super)` come in 0.26.2 |
 | `fn` inside a `fn` | items only at module level |
 | `macro_rules!`, `println!`, `vec!` | none: `println(f"{x}")` (0.15) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
 | `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
-| `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
+| `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
+| `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |
 | `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |
 | `assert!`, `debug_assert!`, contracts crates | `assert(c)`, `assert_eq(a, b)`; `requires`/`ensures` clauses (0.18; guide contracts) |
 | `use a::b::*;` | `use a::b::{c, d};` |

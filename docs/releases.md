@@ -77,6 +77,19 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
 
+`where`, `impl Trait`, visibility and format literals (text262; grammar.md, "Items", "Modules", "Formatting"):
+
+- `where P: B + C, Q: D` after a function's result type, a struct's,
+  enum's or trait's generics, or before an impl's `{`: the bounds join
+  the parameters' inline ones. A bound on a type that is not a parameter
+  of the item (`I::Item: Display`) is `where.unsupported`. `where` is a
+  keyword (it was reserved).
+- Argument-position `impl Trait`, `fn show(x: impl Display)` (also `impl
+  Fn(i64) -> i64`, `inout impl FnMut(i64)`): a hidden type parameter,
+  named `impl Display` in messages; a turbofish gives only the written
+  parameters. Anywhere else it is `type.impl-position`.
+- `volec fmt` lays `where` out as a signature's continuation.
+
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.

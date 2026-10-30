@@ -90,7 +90,7 @@ from C
 Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
 to take what it captures), `impl Trait for T`, `T: Trait`,
-`#[derive(Eq, Debug)]`; no `dyn`, `where`, `Box`. A let or inout
+`#[derive(Eq, Debug)]`, `where T: Ord` and `x: impl Display` (0.26.2); no `dyn`, `Box`. A let or inout
 parameter is used as the value itself: `n + 1`, `out = acc`, `p.x`
 (`*` is only for raw `*T` pointers, which need `unsafe`). `inout r =
 &st;` names an access to pass on: `f(&r)`, `g(&r)`. `match e` on a let

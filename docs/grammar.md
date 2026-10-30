@@ -80,12 +80,12 @@ directly by other letters (`3e` and `1foo` are errors).
 
 **Keywords:** `as break const continue defer else enum extern false fn for
 if impl import in let loop match mod mut pub return static struct trait true
-type union unsafe use while move` (`import` and `use` since 0.4, `pub` and
+type union unsafe use while move where` (`import` and `use` since 0.4, `pub` and
 `mod` since 0.5, `defer` since 0.6, `unsafe` and `trait` since 0.9, `move`
-since 0.14).
+since 0.14, `where` since 0.26.2).
 
-**Reserved** (an error if used): the keywords `where dyn` (and `move` until
-0.14, a keyword since), and the
+**Reserved** (an error if used): the keyword `dyn` (and `move` until
+0.14, `where` until 0.26.2, keywords since), and the
 token `@` (and `?` until 0.15, an operator since). `self` and `Self` are
 ordinary names, with a meaning in methods (see Items).
 
@@ -111,8 +111,10 @@ mod_item     = "mod" ident ";"                         (* (0.5) the module in id
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
 
-fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] block ;
-                                                       (* unsafe: (0.9), see "Unsafe code" *)
+fn_decl      = [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] [ where ] block ;
+                                                       (* unsafe: (0.9), see "Unsafe code"; where: (0.26.2) *)
+where        = "where" pred { "," pred } [ "," ] ;      (* (0.26.2) a type parameter's bounds, see below *)
+pred         = ident ":" bound { "+" bound } ;
 generics     = "<" tparam { "," tparam } [ "," ] ">" ;  (* (0.5) type parameters, see "Generics" *)
 tparam       = ident [ ":" path { "+" path } ] ;       (* bounds: (0.9), see "Traits" *)
 params       = param { "," param } [ "," ] ;
@@ -132,20 +134,36 @@ attribute    = "repr" "(" repr { "," repr } ")"        (* (0.3) structs, unions,
              | "inline" [ "(" "never" ")" ] | "cold" ;  (* (0.6) functions *)
 repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
-struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "}" ;
+struct_decl  = "struct" ident [ generics ] [ where ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
 field        = [ "pub" ] ident ":" type ;              (* (0.26) private to the struct's module unless pub *)
-enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
+enum_decl    = "enum" ident [ generics ] [ where ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
-impl_block   = "impl" [ generics ] [ path "for" ] type "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
+impl_block   = "impl" [ generics ] [ path "for" ] type [ where ] "{" { [ attributes ] [ "pub" ] fn_decl } "}" ;
                                                        (* (0.3); generics, a type with arguments: (0.5); a trait's: (0.9) *)
-trait_decl   = "trait" ident "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] ( ";" | block ) } "}" ;
+trait_decl   = "trait" ident [ generics ] [ where ] "{" { [ attributes ] [ "unsafe" ] "fn" ident [ generics ] "(" [ params ] ")" [ "->" type ] [ where ] ( ";" | block ) } "}" ;
 
 const_decl   = "const" ident ":" type "=" expr ";" ;   (* integer, float, bool, fieldless enum (0.4) or C string (0.4) *)
 static_decl  = "static" [ "mut" ] ident ":" type "=" expr ";" ;   (* constant initializer *)
 type_alias   = "type" ident [ generics ] "=" type ";" ;   (* generics: (0.6) *)
 ```
+
+**`where` and `impl Trait`** *(0.26.2)* are other ways to write type
+parameters and their bounds, as in Rust. `where P: B + C, Q: D` after a
+function's result type (before its contract clauses), after a struct's,
+enum's or trait's generics, or before an impl's `{`, adds the bounds to
+those written inline: `fn f<T>(x: T) where T: Display` is `fn f<T:
+Display>(x: T)`. A method's `where` may bound its impl's parameters too.
+The left side is a type parameter of the item; a bound on another type
+(`I::Item: Display`, `Vec<T>: Debug`) is `where.unsupported` until the
+rust edition (bound a parameter instead: `I: Iterator<Item = X>, X:
+Display`). A parameter's type `impl B + C` (also `impl Fn(i64) -> i64`,
+after a mode: `f: inout impl FnMut(i64)`) is a hidden type parameter
+with those bounds, after the written ones: messages name it by its text,
+`impl Display`, and a turbofish gives only the written ones
+(`pick::<i64>(t, u)`). `impl Trait` anywhere else (a result, a field, a
+`let`) is `type.impl-position`.
 
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
@@ -192,7 +210,8 @@ type = path [ type_args ]                             (* i8 ... u64, isize, usiz
      | "[" type "]"                                   (* (0.3) a slice: a pointer and a length *)
      | [ "extern" '"C"' ] "fn" "(" [ type { "," type } [ "," ] ] ")" [ "->" type ]
                                                       (* not variadic; extern "C" fn (0.3) is another type *)
-     | "!" ;                                          (* never: e.g. `fn exit(c: i32) -> !` *)
+     | "!"                                            (* never: e.g. `fn exit(c: i32) -> !` *)
+     | "impl" bound { "+" bound } ;                   (* (0.26.2) a parameter's type only: see "Items" *)
 type_args = "<" type { "," type } [ "," ] ">" ;       (* (0.5); `>>` closes two lists *)
 ```
 

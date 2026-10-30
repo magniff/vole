@@ -54,7 +54,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
-| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
+| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, supertraits; `where` (0.26.2) |
 | `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
 | `!x` on integers | `~x`; `!` is for `bool` only |
 | `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers `abs`, `signum`, `min`, `max`, `clamp`, `pow` (0.25.2.2) |
