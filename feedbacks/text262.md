@@ -66,6 +66,20 @@ type error "'println<[u8]>' expects 1 arguments, got 2", and
 `println("plain {x}")` prints `{x}` with a warning. compiler/src keeps its
 f-strings until the release after 0.26.2 builds it.
 
+## `defer` removed (decision 20)
+
+compiler/src's one use was macro_fstring_help's, gone with its rewrite.
+The Defer node stays: the own pass places every drop as an implicit
+Defer and a temporary's drop (drops.vl temp_make) as a plain one, so
+middle/lower's and gen0's DEFERS, places/build's EN_DEFER and the plain
+Defer branches of the checker, the own walk, fixvalues' scan and
+extract serve the compiler's own defers: there is nothing for A and B
+to delete in the places IR. What went: the parser's statement (now
+syntax.defer), the checker's no-return/`?`/break rules, IN_DEFER, fix
+--values' rule 1. Eight tests of the deferred statement's own rules are
+gone (a guard cannot write a local, `return` from itself or hold an
+inout access); lang06_defer is lang06_guard.
+
 ## Never used
 
 `refactor extract-function`, `inline`, `split`; `probe` and `reduce`
@@ -90,3 +104,9 @@ f-strings until the release after 0.26.2 builds it.
    (Debug) following it.
 7. [tool] `query stats --all` is the only way to list a program's files;
    a `query files ROOT` would do it directly.
+8. [tool] the check hook's mechanical fixes rewrite test fixtures:
+   editing tests/refactor/tools017/main.vl removed calc.vl's unused
+   import, which the transcript needs. Fixtures under tests/ should be
+   checked, not fixed.
+9. [compiler] the Defer node now means "a drop": rename it (NodeKind::Drop,
+   temp_make's a DropIf) once the places IR is the only lowering.
