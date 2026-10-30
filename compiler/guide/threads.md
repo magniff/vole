@@ -20,8 +20,10 @@ integers' (`AtomicInteger`), `fetch_and`/`or`/`xor` also bool's
 (`AtomicBitwise`); no program can implement these traits. The orderings
 are C++'s (`Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`,
 `SeqCst`); one an operation cannot have (a load with `Release`) is made
-`SeqCst`. An atomic is move-only. A static one needs no `var` (and so has
-no `global`): `static HITS: AtomicI64 = AtomicI64 { v: 0 };`.
+`SeqCst`. An atomic is move-only (0.26.1: it holds an UnsafeCell, `guide
+memory#cells`, so a `#[pure]` function or a contract may not use one). A
+static one needs no `var` (and so has no `global`): `static HITS:
+AtomicI64 = AtomicI64::new(0);`.
 
 ```vole
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -141,6 +143,34 @@ fn main(gpa: Gpa) {
 ```
 
 The locks wait on a futex (Linux) or `__ulock` (macOS).
+
+## Cells and threads
+
+*(0.26.1)* A `Cell` (`guide memory#cells`) is Send when its value is and
+never Sync: a scoped thread may not share one (`sync.not_sync`), and an
+immutable `static` of one is `sync.static`. Keep a cell in a `static var`
+(the main thread's) or a `#[thread_local] static var` (one per thread),
+or share an atomic or a Mutex instead:
+
+```vole
+use std::cell::Cell;
+
+#[thread_local]
+static var CALLS: Cell<i64> = Cell::new(0);
+
+fn work() -> i64 {
+    CALLS.set(CALLS.get() + 1);
+    CALLS.get()
+}
+
+fn main() {
+    work();
+    println(f"{work()}");
+}
+```
+```out
+2
+```
 
 ## Thread-locals
 

@@ -1110,6 +1110,16 @@ Taken after the 0.26.0 review (2026-10-30), the user accepting both:
     (Refined 2026-10-30 after the 0.26.2 review. §11 said "a part has no
     entry points", which fluid2d's BLUR contradicts, and "in one
     module".)
+20. **`defer` is removed** (the user, 2026-10-30), in 0.26.2: Rust has
+    none, and what it did is a guard with `Drop` (an fd, a directory, a
+    buffer that closes or frees itself). `defer` becomes
+    `error syntax.defer`, with an `explain` entry showing the guard.
+    The uses are few: one in compiler/src (front/parser, a `free`), none
+    in std, 9 in examples (fds and directories closed), about 20 test
+    files and 2 guide pages. compiler/src's use goes first, so the chain
+    still builds. The places IR loses one way out of a block. As decision
+    18 says, a guard's `Drop` does not run on a panic until unwinding is
+    built, and neither did `defer`.
 
 ## 13. How the work runs (the user's constraints, 2026-10-30)
 

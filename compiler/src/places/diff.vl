@@ -10,6 +10,8 @@
 //   every local whose two differ, every IR drop with no placeholder and
 //   every placeholder with no IR drop, one line each,
 //   `places.diff: FN: FILE:LINE:COL: 'NAME' own KIND, places KIND`.
+// - (0.26.1) where each drop runs and its flag, check_drops below: a use
+//   after a drop, a flag read before it is written.
 //
 // The IR's decisions are compared as classes: kept, removed, under a flag
 // (the IR's kept at some exits and removed at others is one: the own pass
@@ -32,9 +34,10 @@ use crate::front::types::{TYPES, TyKind};
 use crate::places::cfg::RPO_INDEX;
 use crate::places::front::{ast_local_count, ast_local_name};
 use crate::places::ir::{
-    B_FN, DS_FLAG, DS_KEPT, DS_OPEN, DS_REMOVED, LF_BORROWED, LF_STATIC, OK_MOVE, PJ_DEREF,
-    PJ_INDEX, PStmt, P_LOCALS, P_STMTS, SK_DROP, block_count, block_len, block_start, has_flag,
-    op_a, op_b, op_kind, place_type, proj_kind, proj_parent, undistinct,
+    B_FN, DS_FLAG, DS_KEPT, DS_OPEN, DS_REMOVED, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF,
+    PJ_INDEX, PStmt, P_LOCALS, P_STMTS, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC,
+    SK_LIVE, block_count, block_len, block_start, has_flag, op_a, op_b, op_is_place, op_kind,
+    place_type, proj_kind, proj_parent, succ, succ_count, undistinct,
 };
 use crate::places::print::{buf_fn_name, buf_pos};
 
@@ -70,7 +73,7 @@ fn note_local(l: i64, node: i64) {
     if l < 0 || l >= ast_local_count() {
         return;
     }
-    while D_BITS.len() <= l {
+    while D_BITS.len() as i64 <= l {
         D_BITS.push(0);
         D_FN.push(-1);
         D_NODE.push(0);
@@ -89,13 +92,18 @@ fn note_local(l: i64, node: i64) {
 // statements of blocks never reached left out.
 pub fn record_body(diff: bool) {
     if diff {
-        for l in 0..P_LOCALS.len() {
+        check_drops();
+        for l in 0..P_LOCALS.len() as i64 {
             if P_LOCALS[l].src >= 0 && !has_flag(l, LF_STATIC) && !has_flag(l, LF_BORROWED) {
                 let a = P_LOCALS[l].src;
                 note_local(a, P_LOCALS[l].node);
-                if a < D_BITS.len() && has_glue(P_LOCALS[l].ty) {
+                if a < D_BITS.len() as i64 && has_glue(P_LOCALS[l].ty) {
                     D_BITS[a] = D_BITS[a] | OWNED;
                 }
+            } else if P_LOCALS[l].src >= 0 && has_flag(l, LF_BORROWED) && has_glue(P_LOCALS[l].ty) {
+                // (a borrowed copy the IR never drops: compared too, so that
+                // one the own pass drops is a difference, R10)
+                note_local(P_LOCALS[l].src, P_LOCALS[l].node);
             }
         }
     }
@@ -116,7 +124,7 @@ pub fn record_body(diff: bool) {
 fn record_stmt(st: PStmt, diff: bool, moves: bool) {
     if diff && st.kind == SK_DROP && st.e >= 0 {
         note_local(st.e, st.node);
-        if st.e < D_BITS.len() {
+        if st.e < D_BITS.len() as i64 {
             D_BITS[st.e] = D_BITS[st.e] | (1 << st.c);
         }
     }
@@ -138,7 +146,7 @@ fn record_stmt(st: PStmt, diff: bool, moves: bool) {
 // Whether block b is reached from bb0 (elaboration's order, when it made
 // one for this body; a block it added is).
 fn reached(b: i64) -> bool {
-    !crate::places::elab::RPO_FRESH || b >= RPO_INDEX.len() || RPO_INDEX[b] >= 0
+    !crate::places::elab::RPO_FRESH || b >= RPO_INDEX.len() as i64 || RPO_INDEX[b] >= 0
 }
 
 // Whether a move of place (l, p) is one the own pass forbids: out of an
@@ -196,7 +204,7 @@ fn class_text(c: i64) -> *u8 {
 // After the own pass, in a program it passed: the backstop's errors.
 pub fn report_moves() {
     var i = 0;
-    while i < MOVES.len() {
+    while i < MOVES.len() as i64 {
         let node = MOVES[i];
         let what = MOVES[i + 1];
         i += 3;
@@ -219,7 +227,7 @@ pub fn report_diff() {
     // (the locals the own pass has a placeholder for)
     for r in 0..own_row_count() {
         let l = own_row_local(r);
-        if l < 0 || l >= D_BITS.len() || D_BITS[l] == 0 {
+        if l < 0 || l >= D_BITS.len() as i64 || D_BITS[l] == 0 {
             continue;
         }
         COMPARED += 1;
@@ -240,7 +248,7 @@ pub fn report_diff() {
         }
     }
     // (an IR drop with no placeholder)
-    for l in 0..D_BITS.len() {
+    for l in 0..D_BITS.len() as i64 {
         let v = D_BITS[l];
         if v > 0 {
             let ir = ir_class(v);
@@ -263,7 +271,7 @@ fn name_starts(l: i64, prefix: [u8]) -> bool {
         return false;
     }
     let text = SYMS[name].text;
-    text.len >= prefix.len && text[0..prefix.len] == prefix
+    text.len as i64 >= prefix.len as i64 && text[0..prefix.len as i64] == prefix
 }
 
 fn own_temporary(l: i64) -> bool {
@@ -304,5 +312,255 @@ pub fn report_count() {
     buf_str(out, c" differences in ");
     buf_int(out, COMPARED);
     buf_str(out, c" locals compared\n");
+    buf_write_fd(out, STDERR);
+}
+
+// ---- Where a drop runs, and its flag (0.26.1) ----
+//
+// A per-local comparison of decisions misses a drop in the wrong place
+// and a flag never written (R5, R6: --places-diff found 0 differences on
+// both). Two checks of the body held, each difference one line:
+//
+// - a use after its drop: after a kept or flagged drop of place P, on a
+//   path that does not make P again, a statement that reads P, or a
+//   borrowed copy or a reference made from P (`_7 = copy _8; drop(_8);
+//   eq(&_6, &_7)`): the own pass drops at the end of the statement (or
+//   of the block), after its last use, `'NAME' used after its drop`;
+// - a flag read before it is written: a flagged drop reached from the
+//   entry on a path with no write to its flag, or a flag no statement
+//   sets true (its drop never runs), `'NAME' under a flag never set`.
+
+// The blocks seen by one search, and the search's work list.
+static var SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var WORK: Vec<i64, Comp> = Vec::new_in(Comp {});
+// The aliases of the body held: (alias local, local, projection) triples,
+// a borrowed copy or a reference made from that place.
+static var ALIASES: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// Whether projection a is b or one of b's parents (0, the whole, is every
+// projection's).
+fn proj_within(a: i64, b: i64) -> bool {
+    var q = b;
+    while q > 0 {
+        if q == a {
+            return true;
+        }
+        q = proj_parent(q);
+    }
+    a == q
+}
+
+fn overlaps(a: i64, b: i64) -> bool {
+    proj_within(a, b) || proj_within(b, a)
+}
+
+fn find_aliases() {
+    ALIASES.clear();
+    for b in 0..block_count() {
+        let start = block_start(b);
+        if start < 0 {
+            continue;
+        }
+        for s in start..start + block_len(b) {
+            let st = P_STMTS[s];
+            if st.kind != SK_ASSIGN || st.b != 0 || st.a < 0 {
+                continue;
+            }
+            if st.c != RV_REF && !(st.c == RV_USE && has_flag(st.a, LF_BORROWED)) {
+                continue;
+            }
+            for i in 0..st.nops {
+                if op_is_place(op_kind(st.ops, i)) && op_a(st.ops, i) != st.a {
+                    ALIASES.push(st.a);
+                    ALIASES.push(op_a(st.ops, i));
+                    ALIASES.push(op_b(st.ops, i));
+                }
+            }
+        }
+    }
+}
+
+// Whether statement st reads place (l, p), or an alias of it.
+fn reads(st: PStmt, l: i64, p: i64) -> bool {
+    for i in 0..st.nops {
+        if !op_is_place(op_kind(st.ops, i)) {
+            continue;
+        }
+        let a = op_a(st.ops, i);
+        if a == l && overlaps(p, op_b(st.ops, i)) {
+            return true;
+        }
+        var k = 0;
+        while k < ALIASES.len() as i64 {
+            if ALIASES[k] == a && ALIASES[k + 1] == l && overlaps(p, ALIASES[k + 2]) {
+                return true;
+            }
+            k += 3;
+        }
+    }
+    if st.kind == SK_DROP && st.a == l && overlaps(p, st.b)
+        && (st.c == DS_KEPT || st.c == DS_FLAG) {
+        return true;
+    }
+    false
+}
+
+// Whether statement st makes place (l, p) again (all of it).
+fn remakes(st: PStmt, l: i64, p: i64) -> bool {
+    if st.kind == SK_LIVE && st.a == l {
+        return true;
+    }
+    (st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC) && st.a == l
+        && proj_within(st.b, p)
+}
+
+// From statement s + 1 of block b: the first statement that reads place
+// (l, p) before it is made again, or -1.
+fn use_after(b: i64, s: i64, l: i64, p: i64) -> i64 {
+    SEEN.clear();
+    WORK.clear();
+    for _ in 0..block_count() {
+        SEEN.push(0);
+    }
+    let end = block_start(b) + block_len(b);
+    for t in s + 1..end {
+        let st = P_STMTS[t];
+        if reads(st, l, p) {
+            return t;
+        }
+        if remakes(st, l, p) {
+            return -1;
+        }
+    }
+    let term = P_STMTS[end];
+    if reads(term, l, p) {
+        return end;
+    }
+    for i in 0..succ_count(b) {
+        WORK.push(succ(b, i));
+    }
+    while WORK.len() as i64 > 0 {
+        let c = WORK.pop().unwrap();
+        if c < 0 || SEEN[c] != 0 || block_start(c) < 0 || !reached(c) {
+            continue;
+        }
+        SEEN[c] = 1;
+        let start = block_start(c);
+        var made = false;
+        for t in start..start + block_len(c) + 1 {
+            let st = P_STMTS[t];
+            if reads(st, l, p) {
+                return t;
+            }
+            if remakes(st, l, p) {
+                made = true;
+                break;
+            }
+        }
+        if !made {
+            for i in 0..succ_count(c) {
+                WORK.push(succ(c, i));
+            }
+        }
+    }
+    -1
+}
+
+// Whether flag f is written on every path from the entry to statement s
+// of block b.
+fn flag_written(f: i64, b: i64, s: i64) -> bool {
+    SEEN.clear();
+    WORK.clear();
+    for _ in 0..block_count() {
+        SEEN.push(0);
+    }
+    WORK.push(0);
+    while WORK.len() as i64 > 0 {
+        let c = WORK.pop().unwrap();
+        if c < 0 || SEEN[c] != 0 || block_start(c) < 0 {
+            continue;
+        }
+        SEEN[c] = 1;
+        let start = block_start(c);
+        var written = false;
+        for t in start..start + block_len(c) {
+            if c == b && t == s {
+                return false;
+            }
+            let st = P_STMTS[t];
+            if st.kind == SK_ASSIGN && st.a == f && st.b == 0 {
+                written = true;
+                break;
+            }
+        }
+        if !written {
+            for i in 0..succ_count(c) {
+                WORK.push(succ(c, i));
+            }
+        }
+    }
+    true
+}
+
+// Whether some statement sets flag f true.
+fn flag_ever_set(f: i64) -> bool {
+    for s in 0..P_STMTS.len() as i64 {
+        let st = P_STMTS[s];
+        if st.kind == SK_ASSIGN && st.a == f && st.b == 0 && st.nops == 1
+            && (op_kind(st.ops, 0) != OK_INT || op_a(st.ops, 0) != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+// The body held: its drops' places and flags checked.
+fn check_drops() {
+    find_aliases();
+    for b in 0..block_count() {
+        let start = block_start(b);
+        if start < 0 || !reached(b) {
+            continue;
+        }
+        for s in start..start + block_len(b) {
+            let st = P_STMTS[s];
+            if st.kind != SK_DROP || st.c != DS_KEPT && st.c != DS_FLAG {
+                continue;
+            }
+            let u = use_after(b, s, st.a, st.b);
+            if u >= 0 {
+                place_line(st.a, P_STMTS[u].node, c"used after its drop");
+            }
+            if st.c == DS_FLAG && st.d >= 0 && (!flag_written(st.d, b, s) || !flag_ever_set(st.d)) {
+                place_line(st.a, st.node, c"under a flag never set");
+            }
+        }
+    }
+}
+
+// `places.diff: FN: FILE:LINE:COL: 'NAME' WHAT`, for IR local l.
+fn place_line(l: i64, node: i64, what: *u8) {
+    DIFFS += 1;
+    COMPARED += 1;
+    let out = buf_new();
+    buf_str(out, c"places.diff: ");
+    buf_fn_name(out, B_FN);
+    buf_str(out, c": ");
+    if node > 0 {
+        buf_pos(out, NODES[node].start);
+        buf_str(out, c": ");
+    }
+    buf_str(out, c"'");
+    let a = P_LOCALS[l].src;
+    let name = if a >= 0 { ast_local_name(a) } else { 0 };
+    if name > 0 {
+        buf_bytes(out, SYMS[name].text);
+    } else {
+        buf_str(out, c"_");
+        buf_int(out, l);
+    }
+    buf_str(out, c"' ");
+    buf_str(out, what);
+    buf_str(out, c"\n");
     buf_write_fd(out, STDERR);
 }

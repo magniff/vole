@@ -168,6 +168,43 @@ and is reported with where the block was allocated and freed; bad frees
 and leaks are reported too (`gpa.live_blocks()`, `gpa.check_leaks()` for
 tests).
 
+## Cells
+
+*(0.26.1)* `std::cell::Cell<T>` is a value that changes through a shared
+(let) access, Rust's Cell: `get` (a copy, T: Copy), `set`, `replace`,
+`take`, `swap`, `update`. A cell is owned, so a let parameter of one is
+the caller's cell, and the callee's `set` reaches it:
+
+```vole
+use std::cell::Cell;
+
+struct Counter { hits: Cell<i64> }
+
+fn hit(c: Counter) { c.hits.set(c.hits.get() + 1); }
+
+fn main() {
+    let c = Counter { hits: Cell::new(0) };
+    hit(c);
+    hit(c);
+    let arr = [Cell::new(1), Cell::new(2)];
+    for x in arr { x.set(x.get() * 10); }
+    println(f"{c.hits.get()} {arr[1].get()}");
+}
+```
+```out
+2 20
+```
+
+- A cell moves (`let d = c`) and has no drop of its own.
+- No copy of a cell is made where its place is meant: a `for` over an
+  array of cells iterates the array itself; `v.get(i)` of one is
+  `own.interior_copy` (write `v[i].set(x)`).
+- `UnsafeCell<T>` is the primitive under Cell, Atomic and Mutex: `get`
+  gives a `*T` to write through in `unsafe`.
+- A type that holds a cell by value is not `Freeze` (`std::Freeze`): not
+  Sync (`guide threads#cells-and-threads`), and a `#[pure]` function or a
+  contract condition may not read it (`query effects F --why interior`).
+
 ## Raw memory
 
 `malloc` and `free` from C, raw `*T` pointers, in `unsafe` (`volec

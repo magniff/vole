@@ -41,7 +41,7 @@ use crate::middle::ir::{
     ir_cmp, ir_const, ir_enter, ir_load, ir_new_block, ir_new_func, ir_offset, ir_shrink,
     ir_slot_addr, ir_store, ir_type,
 };
-use crate::middle::ir::cfg::ir_terminate;
+use crate::middle::ir::cfg::{ir_switch, ir_terminate};
 use crate::middle::lower::{
     bind_local, is_dead_block, lower_branch, lower_jump, lower_return, new_slot_for,
 };
@@ -61,16 +61,18 @@ use crate::middle::unsafecheck::CHECK_UNSAFE;
 use crate::places::cfg::{RPO, compute_rpo};
 use crate::places::ir::{
     AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GT,
-    BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR, BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, B_PARAMS,
-    DS_REMOVED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR, LF_BORROWED, LF_STATIC, LF_TEMP,
-    OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT,
-    PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_STMTS,
+    BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR, BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, B_PARAMS, DS_FLAG,
+    DS_KEPT, DS_OPEN, DS_REMOVED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR, LF_BORROWED, LF_STATIC,
+    LF_TEMP, OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR,
+    OK_UNIT, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_STMTS,
     P_TARGETS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY,
     RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION,
     SK_NOP, TK_GOTO, TK_RETURN, TK_SWITCH, UO_NEG, UO_NOT, block_count, block_len, block_start,
-    block_term, has_flag, local_count, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val,
+    block_term, full_place_type, has_flag, local_count, op_a, op_b, op_kind, proj_kind, proj_parent,
+    proj_val,
 };
 use crate::places::keep::{free_body, load_body};
+use crate::places::shim::drop_shim_fn;
 
 // Whether functions are lowered from the places IR (VOLE_LOWER=places).
 pub static var LOWER_PLACES: bool = false;
@@ -114,23 +116,14 @@ pub fn lower_places_function(cx: sink *FnCtx, item: i64, f: i64) -> bool {
         PL_NO_BODY += 1;
         return false;
     }
-    L_TY.clear();
-    for l in 0..local_count() {
-        L_TY.push(erase_type(P_LOCALS[l].ty));
-    }
-    PJ_TY.clear();
-    PJ_ROOT.clear();
-    for _ in 0..crate::places::ir::P_PROJS.len() {
-        PJ_TY.push(0);
-        PJ_ROOT.push(-1);
-    }
-    let reason = unlowered();
+    compute_rpo();
+    let reason = scan_body();
     if reason != 0 {
         if reason < 0 {
             PL_DROP += 1;
         } else {
             PL_KIND += 1;
-            while KIND_COUNTS.len() <= reason {
+            while KIND_COUNTS.len() as i64 <= reason {
                 KIND_COUNTS.push(0);
             }
             KIND_COUNTS[reason] += 1;
@@ -142,43 +135,6 @@ pub fn lower_places_function(cx: sink *FnCtx, item: i64, f: i64) -> bool {
     free_body(f);
     PL_LOWERED += 1;
     true
-}
-
-// What keeps the body held from being lowered here: 0 nothing, -1 a drop
-// that runs, else a code for the statement (kind * 100 + its subkind).
-fn unlowered() -> i64 {
-    for i in 0..P_STMTS.len() {
-        let s = P_STMTS[i];
-        let k = s.kind;
-        if moves_capture(s) {
-            return ENV_MOVE;
-        }
-        if k == SK_DROP {
-            if s.c != DS_REMOVED {
-                return -1;
-            }
-        } else if k == SK_INTRINSIC {
-            if s.c != IK_VECTOR && s.c != IK_ARCH && s.c != IK_PANIC && s.c != IK_CONTRACT {
-                return k * 100 + s.c;
-            }
-        } else if k == SK_ASSERT {
-            if s.c != AK_BOUNDS {
-                return k * 100 + s.c;
-            }
-        } else if k == SK_ASSIGN {
-            // (a union literal: its one field by name, not a part per field)
-            if s.c == RV_AGG && s.d == AK_STRUCT && crate::places::ir::is_union_type(s.e) {
-                return k * 100 + s.c;
-            }
-            if s.c == RV_BINARY || s.c == RV_UNARY {
-                // (a vector operation the builder made has no node)
-                if s.e == 0 && is_vector(op_type(s.ops, 0)) {
-                    return k * 100 + s.c;
-                }
-            }
-        }
-    }
-    0
 }
 
 // `places lowering: N functions; AST: no body N, drop N, kind K N...` on
@@ -198,7 +154,7 @@ pub fn lower_stats() {
     buf_int(out, PL_CHECKED);
     buf_str(out, c", kind ");
     buf_int(out, PL_KIND);
-    for k in 0..KIND_COUNTS.len() {
+    for k in 0..KIND_COUNTS.len() as i64 {
         if KIND_COUNTS[k] > 0 {
             buf_str(out, c" (");
             buf_int(out, k);
@@ -282,20 +238,19 @@ fn lower_body(cx: sink *FnCtx, item: i64, f: i64) {
         if conv_returns_through_pointer(cx, c, ret) {
             IRFUNCS[cx.irf].result_ptr = emit_ir(cx, Op::Param, TY_U64, 0, 0, -1);
         }
-        compute_rpo();
-        scan_blocks();
         place_locals(cx);
+        // (0.18.1) -O2: its checked requires as facts (middle::entryfacts),
+        // which reads the parameters as the AST's locals (bound by lower_param)
+        let facts = OPT_LEVEL >= 2 && crate::front::contracts::desugar::entry_pre(f) >= 0;
         for i in 0..FNS[f].param_count {
             let ty = fn_param(f, i);
             let ast_local = NODES[child(item, i)].x;
             if is_void(ty) || ast_local < 0 {
                 continue;
             }
-            lower_param(cx, i, i + 1, ast_local, ty, c);
+            lower_param(cx, i, i + 1, ast_local, ty, c, facts);
         }
-        // (0.18.1) -O2: its checked requires as facts (middle::entryfacts),
-        // which reads the parameters as the AST's locals (bound above)
-        if OPT_LEVEL >= 2 {
+        if facts {
             lower_entry_facts(cx, item, f);
         }
         if (fn_needs(f) & ~own_features()) != 0 {
@@ -321,23 +276,9 @@ fn place_locals(cx: sink *FnCtx) {
     let n = local_count();
     L_VAR.clear();
     L_ADDR.clear();
-    L_BORROWED.clear();
-    for l in 0..n {
+    for _ in 0..n {
         L_VAR.push(-1);
         L_ADDR.push(0);
-        L_BORROWED.push(0);
-    }
-    // (borrowed: the place of an RV_REF, or the base of an RV_SLICE, with
-    // no `*` in it; a pointer slicing's base is read)
-    for i in 0..P_STMTS.len() {
-        let s = P_STMTS[i];
-        if s.kind == SK_ASSIGN && (s.c == RV_REF || s.c == RV_SLICE) {
-            let l = op_a(s.ops, 0);
-            let p = op_b(s.ops, 0);
-            if !through_deref(p) && (s.c == RV_REF || TYPES[place_ty(l, p)].kind != TyKind::Ptr) {
-                L_BORROWED[l] = 1;
-            }
-        }
     }
     for l in 0..n {
         let ty = L_TY[l];
@@ -380,7 +321,7 @@ fn through_deref(p: i64) -> bool {
 // lower_function binds it: its pieces stored into a slot, or its value (a
 // compound one's address, the caller's copy). The AST local is bound too,
 // for lower_entry_facts' call.
-fn lower_param(cx: sink *FnCtx, i: i64, l: i64, ast_local: i64, ty: i64, c: bool) {
+fn lower_param(cx: sink *FnCtx, i: i64, l: i64, ast_local: i64, ty: i64, c: bool, facts: bool) {
     // UNSAFE: cx is the lowering's raw context pointer; its abi_piece and insts
     // arrays are raw (as in mod.vl's lower_function, which this follows).
     // SAFETY: cx points at the live FnCtx; k is below abi_piece_count, set by
@@ -402,7 +343,8 @@ fn lower_param(cx: sink *FnCtx, i: i64, l: i64, ast_local: i64, ty: i64, c: bool
                 cx.insts[value].imm2 = -1;
             }
         }
-        if OPT_LEVEL >= 2 {
+        if facts {
+            crate::middle::lower::need_promote();
             bind_local(cx, ast_local, value, ty, true);
         }
         if l >= local_count() {
@@ -427,26 +369,51 @@ fn lower_blocks(cx: sink *FnCtx) {
     let nb = block_count();
     B_MID.clear();
     B_LEFT.clear();
-    for _ in 0..nb {
+    FWD.clear();
+    for b in 0..nb {
         B_MID.push(0);
         B_LEFT.push(0);
+        FWD.push(b);
     }
-    for i in 0..RPO.len() {
-        B_MID[RPO[i]] = ir_new_block(cx);
-    }
-    for i in 0..RPO.len() {
+    // (an empty block that jumps on is its target's: no block of its own)
+    for i in 0..RPO.len() as i64 {
         let b = RPO[i];
+        var t = b;
+        var steps = 0;
+        while steps < 64 && is_forward(t) {
+            t = P_STMTS[block_term(t)].a;
+            steps += 1;
+        }
+        if steps < 64 {
+            FWD[b] = t;
+        }
+    }
+    for i in 0..RPO.len() as i64 {
+        let b = RPO[i];
+        if FWD[b] == b {
+            B_MID[b] = ir_new_block(cx);
+        }
+    }
+    for i in 0..RPO.len() as i64 {
+        let b = RPO[i];
+        if FWD[b] != b {
+            B_MID[b] = B_MID[FWD[b]];
+            continue;
+        }
         for k in 0..crate::places::ir::succ_count(b) {
-            B_LEFT[crate::places::ir::succ(b, k)] += 1;
+            B_LEFT[FWD[crate::places::ir::succ(b, k)]] += 1;
         }
     }
     // (the entry's jump to bb0)
-    let first = RPO[0];
+    let first = FWD[RPO[0]];
     B_LEFT[first] += 1;
     lower_jump(cx, B_MID[first]);
     done_edge(cx, first);
-    for i in 0..RPO.len() {
+    for i in 0..RPO.len() as i64 {
         let b = RPO[i];
+        if FWD[b] != b {
+            continue;
+        }
         CUR = B_MID[b];
         let start = block_start(b);
         for j in 0..block_len(b) {
@@ -454,9 +421,30 @@ fn lower_blocks(cx: sink *FnCtx) {
         }
         lower_term(cx, block_term(b));
         for k in 0..crate::places::ir::succ_count(b) {
-            done_edge(cx, crate::places::ir::succ(b, k));
+            done_edge(cx, FWD[crate::places::ir::succ(b, k)]);
         }
     }
+}
+
+// Per block: the block it forwards to (itself, but for an empty block that
+// jumps on).
+static var FWD: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// Whether block b has no statement that does anything and ends in a jump
+// elsewhere.
+fn is_forward(b: i64) -> bool {
+    let term = P_STMTS[block_term(b)];
+    if term.kind != TK_GOTO || term.a == b {
+        return false;
+    }
+    let start = block_start(b);
+    for j in 0..block_len(b) {
+        let k = P_STMTS[start + j].kind;
+        if k != SK_LIVE && k != SK_DEAD && k != SK_NOP {
+            return false;
+        }
+    }
+    true
 }
 
 // An edge into block b lowered: b is sealed after its last one.
@@ -628,7 +616,7 @@ fn unbind() {
 fn lower_stmt(cx: sink *FnCtx, at: i64) {
     let s = P_STMTS[at];
     let k = s.kind;
-    if k == SK_LIVE || k == SK_DEAD || k == SK_NOP || k == SK_MENTION || k == SK_DROP {
+    if k == SK_LIVE || k == SK_DEAD || k == SK_NOP || k == SK_MENTION {
         return;
     }
     if IR_LOCS && s.node > 0 {
@@ -644,12 +632,48 @@ fn lower_stmt(cx: sink *FnCtx, at: i64) {
         lower_call_stmt(cx, s);
     } else if k == SK_INTRINSIC {
         lower_intrinsic_stmt(cx, s);
+    } else if k == SK_DROP {
+        lower_drop(cx, s);
     } else if k == SK_ASSERT {
         // AK_BOUNDS: the index, as unsigned, below the length
         let idx = operand(cx, s.ops, 0);
         let len = operand(cx, s.ops, 1);
         lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, idx, len),
             panic_kind(op_type(s.ops, 0), false), idx, len, 0, site_of(s.d, 0));
+    }
+}
+
+// `drop(P)` kept: its type's drop shim called with `&mut P`; under a flag
+// (DS_FLAG, flag local d): only when the flag is true. An opened drop
+// does nothing itself (its parts' drops follow it), a removed one is gone.
+fn lower_drop(cx: sink *FnCtx, s: PStmt) {
+    if s.c != DS_KEPT && s.c != DS_FLAG {
+        return;
+    }
+    let f = drop_shim_fn(full_place_type(s.a, s.b));
+    if f < 0 {
+        return;
+    }
+    var after = 0;
+    if s.c == DS_FLAG {
+        let run = ir_new_block(cx);
+        after = ir_new_block(cx);
+        lower_branch(cx, place_value(cx, s.d, 0), run, after);
+        ir_seal(cx, run);
+        CUR = run;
+    }
+    let addr = place_addr(cx, s.a, s.b);
+    let conv = call_conv(f, 0);
+    // UNSAFE: cx is the lowering's raw context pointer.
+    // SAFETY: cx points at the live FnCtx for the whole lowering.
+    let mark = unsafe { cx.ssa_stack.count };
+    push_call_arg(cx, conv, 0, addr, crate::middle::lower::calls::call_param_ty(conv, 0, TY_U64),
+        false);
+    emit_call_of(cx, conv, 0, mark, 0);
+    if after != 0 {
+        lower_jump(cx, after);
+        ir_seal(cx, after);
+        CUR = after;
     }
 }
 
@@ -840,6 +864,10 @@ fn lower_aggregate(cx: sink *FnCtx, s: PStmt, dt: i64) {
                     elem_ty = erase_type(TYPES[dt].a);
                     offset = i * type_size(elem_ty);
                 }
+                // (a union literal's fields not written: `const ()`)
+                if op_kind(s.ops, i) == OK_UNIT {
+                    continue;
+                }
                 store_value(cx, base, offset, operand(cx, s.ops, i), elem_ty);
             }
         }
@@ -966,8 +994,22 @@ fn lower_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
     }
     var value = 0;
     if s.c == IK_CONTRACT {
+        // An assert's condition (which may change state: `v.pop() == x`)
+        // is the IR's, evaluated once; a requires', ensures' or
+        // invariant's (pure) is lowered again from the AST, a check per
+        // conjunct, the form entry facts read (middle/entryfacts.vl). The
+        // AST's locals are bound for that and for the failing path's
+        // message and shown operands.
+        let check = NODES[child(n, 2)].a;
+        let assert = crate::front::contracts::checks::CHECK_KIND.get(check)
+            == crate::front::contracts::checks::CHK_ASSERT;
+        let ok = if assert { operand(cx, s.ops, 0) } else { 0 };
         bind_ast_locals(cx);
-        lower_call(cx, n);
+        if assert {
+            crate::middle::lower::calls::lower_contract_check_of(cx, n, ok);
+        } else {
+            lower_call(cx, n);
+        }
         return;
     }
     if s.c == IK_VECTOR {
@@ -1044,67 +1086,38 @@ fn lower_ret(cx: sink *FnCtx) {
     ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
 }
 
-// `switch op [v: b, .., otherwise: c]`: a bool's a branch, else a test per
-// value.
+// `switch op [v: b, .., otherwise: c]`: a bool's a branch, else a Switch.
 fn lower_switch(cx: sink *FnCtx, s: PStmt) {
     let ty = op_type(s.ops, 0);
     let v = operand(cx, s.ops, 0);
     let otherwise = B_MID[s.c];
     if s.b == 1 && P_TARGETS[s.a] == 0 && ty == TY_BOOL {
-        lower_branch(cx, v, otherwise, B_MID[P_TARGETS[s.a + 1]]);
+        let when_false = B_MID[P_TARGETS[s.a + 1]];
+        // (both ways forwarded to one block: a jump, no branch to one
+        // block twice)
+        if when_false == otherwise {
+            lower_jump(cx, otherwise);
+        } else {
+            lower_branch(cx, v, otherwise, when_false);
+        }
         return;
     }
-    let t = ir_type(ty);
-    for i in 0..s.b {
-        let value = P_TARGETS[s.a + 2 * i];
-        let target = B_MID[P_TARGETS[s.a + 2 * i + 1]];
-        let next = ir_new_block(cx);
-        lower_branch(cx, ir_cmp(cx, Cond::Eq, t, v, ir_const(cx, value, t)), target, next);
-        ir_seal(cx, next);
-        CUR = next;
+    if is_dead_block(cx, CUR) {
+        ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
+        return;
     }
-    lower_jump(cx, otherwise);
-}
-
-// The reason code of a sink closure's body that moves a capture out: the
-// own pass clears the capture's `__live_` flag in the env there (glue.vl),
-// which the IR does not write yet; the AST walk lowers such a body.
-const ENV_MOVE: i64 = 9001;
-
-// Whether statement s moves a capture with a `__live_` flag out of the
-// env of the closure body held (`move (*_1).k...`).
-fn moves_capture(s: PStmt) -> bool {
-    // UNSAFE: struct_field returns a raw pointer into the checker's field table.
-    // SAFETY: st is the closure env's struct and proj_val(second) a field index of
-    // it, from the builder's checked projection.
+    // (one Switch, as matching.vl's lower_match_switch: the (value, block)
+    // pairs on the SSA stack)
+    // UNSAFE: cx is the lowering's raw context pointer.
+    // SAFETY: cx points at the live FnCtx for the whole lowering; ir_switch pops
+    // the pairs pushed here.
     unsafe {
-        for i in 0..s.nops {
-            if op_kind(s.ops, i) != OK_MOVE || op_a(s.ops, i) != 1 || local_count() < 2 {
-                continue;
-            }
-            // (the steps from the root: `*`, then field k)
-            var second = 0;
-            var first = op_b(s.ops, i);
-            while first > 0 && proj_parent(first) > 0 {
-                second = first;
-                first = proj_parent(first);
-            }
-            if first <= 0 || proj_kind(first) != PJ_DEREF || second <= 0
-                || proj_kind(second) != PJ_FIELD {
-                continue;
-            }
-            let env = L_TY[1];
-            let pt = if TYPES[env].kind == TyKind::Ptr { TYPES[env].a } else { 0 };
-            if pt <= 0 || !crate::places::ir::struct_closure(pt) {
-                continue;
-            }
-            let st = TYPES[pt].a;
-            let name = (*crate::front::types::struct_field(st, proj_val(second))).name;
-            if crate::front::own::glue::flag_field(st, name) != 0 {
-                return true;
-            }
+        let mark = cx.ssa_stack.count;
+        for i in 0..s.b {
+            cx.ssa_stack.push(P_TARGETS[s.a + 2 * i]);
+            cx.ssa_stack.push(B_MID[P_TARGETS[s.a + 2 * i + 1]]);
         }
-        false
+        ir_switch(cx, CUR, v, otherwise, mark);
     }
 }
 
@@ -1151,40 +1164,91 @@ fn place_seen(l: i64, p: i64, b: i64) {
     }
 }
 
-// L_BLK for the body held: each reachable block's statements and
-// terminator, their destinations and operands; the parameters are written
-// in the entry, so used in several blocks.
-fn scan_blocks() {
+// The one pass over the body held before it is lowered, its reachable
+// blocks (RPO) only: each local's type (erased, L_TY), the block it is used
+// in (L_BLK: -2 several; the result and the parameters are written in the
+// entry), whether it is borrowed whole (L_BORROWED: the place of an
+// RV_REF, or the base of an RV_SLICE, with no `*` in it; a pointer
+// slicing's base is read); and what keeps the body from being lowered
+// here: 0 nothing, -1 a drop that runs, else a code for the statement
+// (kind * 100 + its subkind).
+fn scan_body() -> i64 {
     let n = local_count();
+    L_TY.clear();
     L_BLK.clear();
     L_VAL.clear();
-    for _ in 0..n {
-        L_BLK.push(-1);
-        L_VAL.push(0);
-    }
+    L_BORROWED.clear();
     for l in 0..n {
-        if l >= 1 && l <= B_PARAMS || l == 0 {
-            L_BLK[l] = -2;
-        }
+        L_TY.push(erase_type(P_LOCALS[l].ty));
+        L_BLK.push(if l <= B_PARAMS { -2 } else { -1 });
+        L_VAL.push(0);
+        L_BORROWED.push(0);
     }
-    for i in 0..RPO.len() {
+    PJ_TY.clear();
+    PJ_ROOT.clear();
+    for _ in 0..crate::places::ir::P_PROJS.len() as i64 {
+        PJ_TY.push(0);
+        PJ_ROOT.push(-1);
+    }
+    for i in 0..RPO.len() as i64 {
         let b = RPO[i];
         let start = block_start(b);
         for j in 0..block_len(b) + 1 {
-            let s = P_STMTS[start + j];
-            let k = s.kind;
+            let at = start + j;
+            let k = P_STMTS[at].kind;
+            let c = P_STMTS[at].c;
+            let ops = P_STMTS[at].ops;
+            let nops = P_STMTS[at].nops;
+            if k == SK_ASSIGN {
+                let e = P_STMTS[at].e;
+                // (a vector operation the builder made has no node)
+                if (c == RV_BINARY || c == RV_UNARY) && e == 0 && is_vector(op_type(ops, 0)) {
+                    return k * 100 + c;
+                }
+                if c == RV_REF || c == RV_SLICE {
+                    let l = op_a(ops, 0);
+                    let p = op_b(ops, 0);
+                    if !through_deref(p)
+                        && (c == RV_REF || TYPES[place_ty(l, p)].kind != TyKind::Ptr) {
+                        L_BORROWED[l] = 1;
+                    }
+                }
+            } else if k == SK_DROP {
+                // (a drop that runs: its place's address goes to the shim; a
+                // shim made for its type, places/shim.vl)
+                if c == DS_KEPT || c == DS_FLAG {
+                    let t = crate::places::ir::full_place_type(P_STMTS[at].a, P_STMTS[at].b);
+                    if drop_shim_fn(t) < 0 && crate::front::own::glue::has_glue(t) {
+                        return -1;
+                    }
+                    if !through_deref(P_STMTS[at].b) {
+                        L_BORROWED[P_STMTS[at].a] = 1;
+                    }
+                } else if c != DS_REMOVED && c != DS_OPEN {
+                    return -1;
+                }
+            } else if k == SK_INTRINSIC {
+                if c != IK_VECTOR && c != IK_ARCH && c != IK_PANIC && c != IK_CONTRACT {
+                    return k * 100 + c;
+                }
+            } else if k == SK_ASSERT {
+                if c != AK_BOUNDS {
+                    return k * 100 + c;
+                }
+            }
             if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP
                 || k == SK_MENTION {
-                place_seen(s.a, s.b, b);
+                place_seen(P_STMTS[at].a, P_STMTS[at].b, b);
             }
-            for o in 0..s.nops {
-                let ok = op_kind(s.ops, o);
+            for o in 0..nops {
+                let ok = op_kind(ops, o);
                 if ok == OK_COPY || ok == OK_MOVE || ok == OK_PLACE {
-                    place_seen(op_a(s.ops, o), op_b(s.ops, o), b);
+                    place_seen(op_a(ops, o), op_b(ops, o), b);
                 }
             }
         }
     }
+    0
 }
 
 // The AST's locals bound to the IR's (each user local and parameter its
@@ -1192,6 +1256,7 @@ fn scan_blocks() {
 // contract check's conditions and shown operands, evaluated again from
 // the AST (a condition is pure) by calls.vl's lower_contract_check.
 fn bind_ast_locals(cx: sink *FnCtx) {
+    crate::middle::lower::need_promote();
     // UNSAFE: the SSA builder's PROMOTE and LOCAL_ADDR are static mut tables.
     // SAFETY: ast is checked to be below the checker's LOCAL_COUNT, the tables'
     // length, just above; lowering is single-threaded.
