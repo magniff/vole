@@ -731,6 +731,34 @@ and every tests/run source. The objects of a build under
 -O2. Step 7, which deletes the own pass's drops, needs a rule of its own
 to keep this (the types rule alone is 1.047x).
 
+**The builder's cost at a build (0.26.1, later).** The flip's bar is
+-O0 total within 1.10x of the AST lowering. A build of compiler/src
+(`-c -O0`, `VOLE_LOWER=places`, caches off, fewest of 3):
+
+| step | instructions | objects |
+|---|---|---|
+| before | 11,776.8M | |
+| the check's work skipped at a build (record_body unless a move is suspect or `--places-diff` runs; drop edges and shims only when a drop is kept; live_writes with no flag) | 11,663.8M | identical |
+| load_body takes the kept tables instead of copying them | 11,638.9M | identical |
+| `a && b`, `a \|\| b` made in their destination (no temporary copied at the end) | 11,382.9M (1.186x) | text 17.85M to 17.70M |
+| the AST lowering | 9,601.0M | text 15.22M |
+
+With gen0's accumulator across blocks (35ee705c) the code is at parity
+(text 15.19M against 15.23M), and the gap is the work. By phase, `-j1
+--time-passes=instructions` on 62828865 (millions):
+
+| phase | AST | places |
+|---|---|---|
+| check | 2,511 | 2,882 |
+| places (build) | | 822 (878 with LF_SSA) |
+| places (elaborate) | | 379 |
+| register allocation and emission | 2,237 | 3,045 |
+| data and output | 2,628 | 2,660 |
+| total | 10,351 | 12,774 (1.234x) |
+
+LF_SSA (places/README.md) flags 98,251 of 149,332 temporaries for gen0,
+which then need not scan the body for them.
+
 **How it stays cheap.**
 
 - One pass per function over the checked AST, in evaluation order, into
