@@ -138,7 +138,7 @@ it too, so no path leaks it.
 **Display for people, Debug for programmers.** `impl Display` writes
 the messages printed for the rejected samples (`{e}`); the derived Debug
 is what `main` prints on failure. Each `Display` impl may use the inner
-error's own `Display`: `f.write(f"not a number ({e})")`.
+error's own `Display`: `f.write("not a number ({e})")`.
 
 **`main` returns a Result.** On `Ok(())` the exit status is 0; on
 `Err(e)` the program prints `Error: ` and `e`'s Debug text on stderr and

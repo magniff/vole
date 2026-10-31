@@ -89,7 +89,7 @@ with a zero to a width of 2:
 
 ```tach
 for byte in hash.finish() {
-    hex.push_fmt(f"{byte:02x}");
+    hex.push_fmt("{byte:02x}");
 }
 ```
 

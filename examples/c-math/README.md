@@ -68,7 +68,7 @@ Newton on x^2 = 4 from 0: None
 ```tach
 import "math.h" as c;
 
-println(f"sqrt(2)      = {c::sqrt(2.0):.12}");
+println("sqrt(2)      = {:.12}", c::sqrt(2.0));
 ```
 
 `import "math.h" as c;` declares libm's functions as `c::sqrt`,
@@ -87,7 +87,7 @@ instead.
 ```tach
 var exponent: i32 = 0;
 let mantissa = unsafe { c::frexp(48.0, &exponent) };
-println(f"frexp(48)    = {mantissa:.4} * 2^{exponent}");
+println("frexp(48)    = {mantissa:.4} * 2^{exponent}");
 ```
 
 C functions that return two values write the second through a pointer

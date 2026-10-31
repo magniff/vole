@@ -32,8 +32,8 @@ pub fn restock(items: inout Vec<Item>, i: i64, n: i64) {
     }
 }
 // calls (2)
-std::Vec::set	../../compiler/std/std.vl:332:12	method	pub fn set(inout self, i: usize, x: sink T) requires i < self.len as usize else f"index out of bounds: index {i as i64}, length {self.len}"
-std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else f"index out of bounds: index {i as i64}, length {self.len}"
+std::Vec::set	../../compiler/std/std.vl:332:12	method	pub fn set(inout self, i: usize, x: sink T) requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
+std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
 // types (2)
 crate::stock::Item	context/stock.vl:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.vl:190:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -51,7 +51,7 @@ pub fn total(items: Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else f"index out of bounds: index {i as i64}, length {self.len}"
+std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
 std::Vec::len	../../compiler/std/std.vl:215:12	method	pub fn len(self) -> usize
 // types (2)
 crate::stock::Item	context/stock.vl:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
