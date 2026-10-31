@@ -286,7 +286,7 @@ runs statements with std imported and prints the last value with its
 type):
 
 ```console
-$ volec try 'println(f"[{65u8:c}] [{65u8}]")'
+$ volec try 'println("[{:c}] [{}]", 65u8, 65u8)'
 [A] [65]
 $ volec try 'let here: u8 = 0; let line = 65u8; here != 0 && line != here'
 bool = false

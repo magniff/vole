@@ -61,13 +61,13 @@ allocator the Vec holds. `main` prints: `io`.
 debugging print in `clamp`:
 
 ```console
-$ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+$ volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x}");
 >     if x < lo {'
 main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
 error edit.breaks: 1 new error (1 in crate::score, which the edit does not change); nothing written; the error: main.vl:36:1: 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
 note edit.together: change crate::score in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: volec query show crate::score
-try: volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+try: volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x}");
     if x < lo {' --no-check
 [exit 1]
 ```
@@ -80,7 +80,7 @@ chain. To see it, write the change anyway (`--no-check`, as the `try:`
 line says):
 
 ```console
-$ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+$ volec edit patch clamp --old '    if x < lo {' --new '    println("clamp {x}");
 >     if x < lo {' --no-check
 main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
 patched crate::clamp	main.vl	+1 -0 lines
@@ -91,7 +91,7 @@ crate::score	io panic
   'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
   'scaled(s[i], gain)' at main.vl:29:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.vl:23:5 calls 'clamp'
-  'println(f"clamp {x}")' at main.vl:12:5 calls 'std::fmt::println'
+  'println("clamp {x}")' at main.vl:12:5 calls 'std::fmt::println'
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: volec --diagnostics=short main.vl -c -o /dev/null
 $ volec undo
