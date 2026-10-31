@@ -34,9 +34,15 @@ struct Ball {
     c: vec4<f32>,   // xyz centre, w radius
     col: vec4<f32>, // rgb albedo, w emissive
 };
+struct Scene {
+    boxes: array<Box, 58>,
+    balls: array<Ball, 30>,
+    orbs: array<Ball, 8>,
+};
+@group(0) @binding(2) var<storage, read_write> scene: Scene;
 
 const BOX_COUNT: u32 = 58u;
-var<private> BOXES: array<Box, 58> = array<Box, 58>(
+const BOXES_SRC: array<Box, 58> = array<Box, 58>(
     Box(vec4<f32>(0, 1.4, -12, 0.998), vec4<f32>(1.8, 1.4, 1.5, 0.06), vec4<f32>(0.8, 0.72, 0.56, 0)),
     Box(vec4<f32>(0, 3, -12, 0.998), vec4<f32>(2.1, 0.2, 1.8, 0.06), vec4<f32>(0.4, 0.13, 0.1, 0)),
     Box(vec4<f32>(1.118, 3.65, -12.594, 0.998), vec4<f32>(0.16, 0.55, 0.16, 0.06), vec4<f32>(0.4, 0.13, 0.1, 0)),
@@ -98,7 +104,7 @@ var<private> BOXES: array<Box, 58> = array<Box, 58>(
 );
 
 const BALL_COUNT: u32 = 30u;
-var<private> BALLS: array<Ball, 30> = array<Ball, 30>(
+const BALLS_SRC: array<Ball, 30> = array<Ball, 30>(
     Ball(vec4<f32>(-4.5, 4.08, 8.5, 1.68), vec4<f32>(0.16, 0.33, 0.12, 0)),
     Ball(vec4<f32>(-5.38, 3.44, 9.06, 1.248), vec4<f32>(0.21, 0.39, 0.15, 0)),
     Ball(vec4<f32>(-3.7, 3.28, 7.86, 1.152), vec4<f32>(0.16, 0.33, 0.12, 0)),
@@ -132,7 +138,7 @@ var<private> BALLS: array<Ball, 30> = array<Ball, 30>(
 );
 
 const ORB_COUNT: u32 = 8u;
-var<private> ORBS: array<Ball, 8> = array<Ball, 8>(
+const ORBS_SRC: array<Ball, 8> = array<Ball, 8>(
     Ball(vec4<f32>(2.6, 1.35, 5, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
     Ball(vec4<f32>(-4.2, 1.35, 2.2, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
     Ball(vec4<f32>(-8.6, 1.35, -3.4, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
@@ -157,6 +163,15 @@ fn rot_y(p: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
 // A box rotated about y: move the ray into the box's frame, slab test, and
 // rotate the normal back. Rotations keep t, so no rescaling is needed.
 fn hit_box(ro: vec3<f32>, rd: vec3<f32>, b: Box, limit: f32) -> f32 {
+    // The bounding sphere first (rd is unit length): most boxes are missed,
+    // behind the ray or beyond the nearest hit, and need no slab test.
+    let oc = b.c.xyz - ro;
+    let r2 = dot(b.h.xyz, b.h.xyz);
+    let tca = dot(oc, rd);
+    let d2 = dot(oc, oc) - tca * tca;
+    if (d2 > r2) { return -1.0; }
+    let r = sqrt(r2);
+    if (tca + r < 0.0 || tca - r > limit) { return -1.0; }
     let co = b.c.w;
     let si = b.h.w;
     let lc = rot_y(ro - b.c.xyz, co, si);
@@ -231,7 +246,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, far: f32) -> Hit {
         }
     }
     for (var i = 0u; i < BOX_COUNT; i = i + 1u) {
-        let b = BOXES[i];
+        let b = scene.boxes[i];
         let t = hit_box(ro, rd, b, best.t);
         if (t > 0.0) {
             best.t = t;
@@ -241,7 +256,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, far: f32) -> Hit {
         }
     }
     for (var i = 0u; i < BALL_COUNT; i = i + 1u) {
-        let b = BALLS[i];
+        let b = scene.balls[i];
         let t = hit_ball(ro, rd, b, best.t);
         if (t > 0.0) {
             best.t = t;
@@ -253,7 +268,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, far: f32) -> Hit {
     let mask = u32(u.misc.x);
     for (var i = 0u; i < ORB_COUNT; i = i + 1u) {
         if ((mask & (1u << i)) != 0u) { continue; }
-        let b = ORBS[i];
+        let b = scene.orbs[i];
         let t = hit_ball(ro, rd, b, best.t);
         if (t > 0.0) {
             best.t = t;
@@ -262,15 +277,62 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, far: f32) -> Hit {
             best.emissive = b.col.w;
         }
     }
+    return hit_lamps(ro, rd, best);
+}
+
+// The lamps: a ring around the plaza that blinks once a second of village
+// time, every lamp at the same moment. What you see of a lamp is light that
+// left it d / c ago, so with c a few metres a second the ring blinks as a
+// wave, nearest last; walking toward a lamp you meet its flashes sooner
+// (they come faster), walking away later (slower).
+const LAMP_COUNT: u32 = 12u;
+const LAMP_RING: f32 = 6.6;
+
+fn lamp_base(i: u32) -> vec3<f32> {
+    // Half a step off the axes, so no lamp stands on a road.
+    let a = (f32(i) + 0.5) * 6.2831853 / f32(LAMP_COUNT);
+    return vec3<f32>(LAMP_RING * cos(a), 0.0, 6.0 + LAMP_RING * sin(a));
+}
+
+// The glow of a lamp at village time t: on for the first 0.3 s of each second.
+fn lamp_glow(t: f32) -> f32 {
+    if (fract(t) < 0.3) { return 4.0; }
+    return 0.06;
+}
+
+fn hit_lamps(ro: vec3<f32>, rd: vec3<f32>, best_in: Hit) -> Hit {
+    var best = best_in;
+    let c_light = u.gamma.y * u.gamma.z;
+    for (var i = 0u; i < LAMP_COUNT; i = i + 1u) {
+        let base = lamp_base(i);
+        let post = Box(vec4<f32>(base.x, 1.0, base.z, 1.0), vec4<f32>(0.06, 1.0, 0.06, 0.0),
+            vec4<f32>(0.10, 0.10, 0.12, 0.0));
+        let tp = hit_box(ro, rd, post, best.t);
+        if (tp > 0.0) {
+            best.t = tp;
+            best.n = box_normal(ro, rd, tp, post);
+            best.albedo = post.col.rgb;
+            best.emissive = 0.0;
+        }
+        let head = Ball(vec4<f32>(base.x, 2.15, base.z, 0.26), vec4<f32>(1.0, 0.82, 0.50, 0.0));
+        let th = hit_ball(ro, rd, head, best.t);
+        if (th > 0.0) {
+            best.t = th;
+            best.n = normalize(ro + rd * th - head.c.xyz);
+            best.albedo = head.col.rgb;
+            // The light reaching the eye now left the lamp th / c ago.
+            best.emissive = lamp_glow(u.eye.w - th / c_light);
+        }
+    }
     return best;
 }
 
 fn occluded(ro: vec3<f32>, rd: vec3<f32>) -> bool {
     for (var i = 0u; i < BOX_COUNT; i = i + 1u) {
-        if (hit_box(ro, rd, BOXES[i], 48.0) > 0.0) { return true; }
+        if (hit_box(ro, rd, scene.boxes[i], 48.0) > 0.0) { return true; }
     }
     for (var i = 0u; i < BALL_COUNT; i = i + 1u) {
-        if (hit_ball(ro, rd, BALLS[i], 48.0) > 0.0) { return true; }
+        if (hit_ball(ro, rd, scene.balls[i], 48.0) > 0.0) { return true; }
     }
     return false;
 }
@@ -348,6 +410,17 @@ fn contract_dir(d: vec3<f32>, beta: vec3<f32>) -> vec3<f32> {
     if (b2 < 1e-8) { return d; }
     let bh = beta * inverseSqrt(b2);
     return normalize(d + (u.gamma.x - 1.0) * dot(d, bh) * bh);
+}
+
+// `init` copies the constants into the storage buffer once, the first
+// frame; every ray then reads the buffer. Indexing a const array with a
+// variable rebuilds the whole array per access in the Metal translation,
+// which cost most of the frame when each thread did it.
+@compute @workgroup_size(64)
+fn init(@builtin(local_invocation_index) li: u32) {
+    if (li < BOX_COUNT) { scene.boxes[li] = BOXES_SRC[li]; }
+    if (li < BALL_COUNT) { scene.balls[li] = BALLS_SRC[li]; }
+    if (li < ORB_COUNT) { scene.orbs[li] = ORBS_SRC[li]; }
 }
 
 @compute @workgroup_size(8, 8)
