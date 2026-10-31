@@ -219,6 +219,16 @@ code generators' agent (0.26.1) sees what moved.
   operands and check_message, with nothing of the condition left to lower
   from the AST.
 
+- 0.26.2 (R11, shims by the erased type): the IR is built before the
+  distinct types are erased and the code generators read it after, so a
+  local's type is as built (`(str, Matches)`) while a field's or a
+  variant's comes from the erased tables (`([u8], Matches)`). The shims
+  are found by the type with its distinct types erased (shim.vl
+  shim_key): before, `Option<(str, Matches)>::unwrap`'s drop of `(self
+  as Some).0` found none and the body went back to the AST lowering.
+  `--verify-places` checks the lookup for every drop that runs
+  (shim_found).
+
 ## `--places-diff`: the differences left
 
 Over compiler/src (142 locals compared) and every tests/run source
