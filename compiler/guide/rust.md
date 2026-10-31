@@ -213,7 +213,7 @@ fn main() -> i32 {
 
 | Rust | vole |
 |---|---|
-| `usize` for lengths and indices | the same (0.26.2: `v.len()`, `s.len`; a slice's `s.len()` is still an `i64`); indexing takes any integer type |
+| `usize` for lengths and indices | the same (0.26.2: `v.len()`, `s.len()`, `s.len`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |

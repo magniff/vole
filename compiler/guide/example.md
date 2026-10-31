@@ -111,7 +111,7 @@ pub fn parse(line: [u8], gpa: Gpa) -> Result<Command, Error> {
 }
 
 fn arity(w: [[u8]], n: i64) -> Result<(), Error> {
-    if w.len() != n {
+    if w.len() as i64 != n {
         return Err(Error::Arity(w[0], n));
     }
     Ok(())
