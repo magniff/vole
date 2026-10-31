@@ -80,6 +80,58 @@ syntax.defer), the checker's no-return/`?`/break rules, IN_DEFER, fix
 gone (a guard cannot write a local, `return` from itself or hold an
 inout access); lang06_defer is lang06_guard.
 
+## The tests the migration left (76: the check refuses their fix)
+
+`fix --only fstring --keep-braces` checks each program after its edit;
+these 76 got a new error and were left as they are. An f-string hole is
+read as `NO_MOVE` code by the own pass (front/own/walk.vl: "an
+f-string's holes, they read, never move"), and as an argument of the
+call the same expression is an ordinary use. What it shows:
+
+- own.conflict (47): a view used in a hole after a call that changes its
+  owner (tests/own-try/lexer_owns: `let a = lx.word(); let b =
+  lx.word(); println(f"{a} {b}")`, a views lx). Most are tests that
+  expect own errors already, now one more or one elsewhere; the rest are
+  real conflicts the hole hid.
+- own.escape (15): a view of a dropped temporary or a captured local used
+  in a hole (closure_store_capture_direct).
+- own.moved (6): a call with a `sink` parameter in a hole does not move
+  its argument (checkalloc_uaf_copy: `println(f"{sum(copy)}")` twice,
+  `sum(sink v)`): as an argument it moves, and the second use is
+  own.moved. **The hole hides a move: a bug in the own pass's reading of
+  holes**, worth a case of its own.
+- own.static (2), own.move_out (1), sync.not_send (1), effect (1): the
+  error message quotes the f-string (sem_core_eff_display_io expects
+  `format_in(f"{x}", gpa)`), so the "new" error is the old one reworded.
+- other (3): **two compiler bugs** the migration found.
+  err_conv_keywords' `f"{sink}"` becomes `"{sink}"`, whose hole is
+  parsed as a `sink ||` closure (parser error "expected '|'"): a hole's
+  name that is a contextual keyword (`sink`, `inout`) must be read as a
+  name. sem_own_closure_temp_to_let_param: a closure passed as a format
+  argument is typed `closure` where the hole typed it `let closure`
+  (type error at 14:23). fmt_err_holes is an f-string test itself.
+
+own.conflict: arch_err_store_view.vl, checkalloc_arena_grow.vl, checkalloc_slice_push.vl, closure_returns_capture_view.vl, err_closure_view_across_call.vl, err_own_cast_view_grow.vl, err_own_unmap_live_view.vl, err_own_user_dunder.vl, err_temporary_own.vl, err_vec_elem_receiver.vl, generic_struct_fcall_view.vl, own_report_basics.vl, own_slice_receiver.vl, scope_result_view_grow.vl, sem_excl_cl_capture_vec_push_while_view.vl, sem_excl_cl_view_live_closure_call.vl, sem_excl_cl_view_made_after_closure.vl, sem_excl_cp_closure_capture_by_copy_mutated_after.vl, sem_excl_ex_slice_noalias_O2.vl, sem_excl_il_borrowed_elem_across.vl, sem_excl_il_field_of_local.vl, sem_excl_il_loop_carried.vl, sem_excl_il_view_across_inout.vl, sem_excl_il_view_struct_across_inout.vl, sem_excl_lb_view_result_then_write.vl, sem_excl_lv_borrowed_elem_assign.vl, sem_excl_pj_let_result.vl, sem_excl_vf_inout_field_slice_passed.vl, sem_poly_c03_var_change_while_closure_live.vl, sem_poly_c04_owned_let_moved_while_live.vl, sem_poly_f12_fnptr_returns_view_of_arg.vl, sem_poly_f13_fnptr_field_returns_view.vl, sem_poly_g07_closure_view_then_mutate.vl, sem_poly_g16_pick_view.vl, sem_poly_g25_generic_view_struct_mutate.vl, sem_poly_r13_default_returns_view.vl, sem_poly_r14_trait_generic_returns_view.vl, sem_poly_r16_assoc_item_view.vl, sem_poly_x04_closure_field_returns_view.vl, sem_poly_x05_map_returns_captured_view.vl, sem_poly_x06_sink_closure_holds_view.vl, sem_poly_y01_closure_in_vec_conflict.vl, sem_poly_y02_closure_in_option_conflict.vl, sem_views_l_l11.vl, sem_views_sv_sv15_lexer_owns.vl, tests/own-try/lexer_owns/main.vl, tests/own-try/view_push/main.vl.
+
+own.escape: closure_store_capture_direct.vl, closure_store_generic_capture.vl, closure_store_nested_capture.vl, closure_store_std_generic.vl, sem_poly_f14_fnptr_stores_arg.vl, sem_poly_f15_fnptr_stores_arg_direct.vl, sem_poly_f17_closure_stores_arg.vl, sem_poly_g15_push_view_param.vl, sem_views_lb_lb12_temp_loop.vl, sem_views_lb_lb13_temp_loop_method.vl, sem_views_lb_lb14_temp_struct_lit.vl, sem_views_lb_lb15_array_temp.vl, sem_views_lb_lb16_temp_owned_loop.vl, sem_views_lb_lb17_temp_owned_user.vl, sem_views_temp_receiver_escape_loop.vl.
+
+own.moved: checkalloc_uaf_copy.vl, sem_excl_cp_vec_move.vl, sem_excl_sk_sink_then_inout.vl, sem_poly_f06_fnptr_sink_moves.vl, sem_poly_f24_fnptr_sink_twice.vl, sem_poly_y17_sink_generic_twice.vl.
+
+other: err_conv_keywords.vl, fmt_err_holes.vl, sem_own_closure_temp_to_let_param.vl.
+
+own.static: err_own_static_readonly.vl, sem_excl_st_view_static_across_global.vl.
+
+effect: sem_core_eff_display_io.vl.
+
+sync.not_send: sem_poly_th23_spawn_generic_closure.vl.
+
+own.move_out: sem_poly_x13_sink_partial_move.vl.
+
+Left as well: the 13 generated sweep tests (tools/sinksweep), the 4
+f-string tests (fstring, interp in their names), tests/refactor,
+tests/query and tests/lsp (their transcripts quote the code) and
+tests/agent-eval (a solution.patch must apply).
+
 ## Never used
 
 `refactor extract-function`, `inline`, `split`; `probe` and `reduce`
