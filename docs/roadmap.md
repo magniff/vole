@@ -2779,3 +2779,24 @@ under the load), threads 8521, incremental 172 series, objcheck 5520
 from the cache), unsafe-audit 3414 unjustified (baseline 3425) and 0 in
 std, chain-diverse, chain-fresh 34 releases. compile-cost against
 v0.25.5: a hello world 1.00x, std 1.01x, check of the compiler 0.99x.
+
+### 0.26.1
+
+The release gate (`gate.sh --release --no-linux`, 53:35 wall), macOS
+only. Its first run failed two rows, both real and both fixed before
+the tag:
+- fuzz-sem seed 89: a value whose type has a `Drop` impl, with a field
+  assigned on one path and the value moved on another, had its fields
+  dropped and its `drop` never called (the places IR's elaboration; it is
+  now dropped whole, and a field assigned after a move is own.partial);
+- threads: the Freeze memo, written by task code and read without the
+  code cache covering it (types_hash now holds each type's Freeze fact).
+
+The second run, on the fixes, passed every row. The suite 4556 at -O0,
+-O1 and -O2 (70 XFAIL; SKIPPED: no spirv-val), threads 8659, incremental
+172 series, objcheck 5648 (and 256 for x86_64-macos), compiler-memcheck
+711, examples-checkalloc 180, fuzz-sem 300 ok, every fuzz and ABI row,
+stress-grow, cachediff 1374 lines (407 from the cache), unsafe-audit
+3409 unjustified (baseline 3425) and 0 in std, chain-diverse,
+chain-fresh 35 releases. compile-cost against v0.26.0: a hello world
+1.09x (0.26.2 brings it back), std 1.01x, check of the compiler 0.99x.
