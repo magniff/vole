@@ -76,6 +76,17 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.26.3
+
+Allocation as a capability; compiler/src on 0.26.2's language (format
+literals, `usize`); f-strings removed; std's text on `String<A>`;
+`wrapping_*` and Rust's overflow checks. Built and tested on
+aarch64-macos only.
+
+- tools/unicode, the generator of std's Unicode tables, is removed: it
+  had not compiled since 0.20's spellings and nothing built it. The
+  tables stay as generated (Unicode 18.0.0); v0.26.2 has the generator.
+
 ### What's new in 0.26.2
 
 `usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.
