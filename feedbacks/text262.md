@@ -82,34 +82,20 @@ inout access); lang06_defer is lang06_guard.
 
 ## The tests the migration left (76: the check refuses their fix)
 
-`fix --only fstring --keep-braces` checks each program after its edit;
-these 76 got a new error and were left as they are. An f-string hole is
-read as `NO_MOVE` code by the own pass (front/own/walk.vl: "an
-f-string's holes, they read, never move"), and as an argument of the
-call the same expression is an ordinary use. What it shows:
+`fix --only fstring --keep-braces` checks each program after its edit
+and refuses an edit that brings a new error. All 76 had errors before
+the edit, exactly as they stand: they are error tests, or tests whose
+FLAGS (`--values=off`) the fixer's check does not use. The edit
+reworded or moved those errors (an f-string quoted in a message, a
+column), and the check counts a reworded error as a new one. They hide
+nothing: f-string holes are read as ordinary code by the own pass (a
+`sink` call in a hole moves its argument, own.moved as an argument
+does), `sink` is never a name (`"{sink}"` and `f"{sink}"` are both
+parser errors), and sem_own_closure_temp_to_let_param is an XFAIL with
+that very error. (A first reading of their error lines, in this file's
+previous version, took three of them for compiler bugs: wrong.)
 
-- own.conflict (47): a view used in a hole after a call that changes its
-  owner (tests/own-try/lexer_owns: `let a = lx.word(); let b =
-  lx.word(); println(f"{a} {b}")`, a views lx). Most are tests that
-  expect own errors already, now one more or one elsewhere; the rest are
-  real conflicts the hole hid.
-- own.escape (15): a view of a dropped temporary or a captured local used
-  in a hole (closure_store_capture_direct).
-- own.moved (6): a call with a `sink` parameter in a hole does not move
-  its argument (checkalloc_uaf_copy: `println(f"{sum(copy)}")` twice,
-  `sum(sink v)`): as an argument it moves, and the second use is
-  own.moved. **The hole hides a move: a bug in the own pass's reading of
-  holes**, worth a case of its own.
-- own.static (2), own.move_out (1), sync.not_send (1), effect (1): the
-  error message quotes the f-string (sem_core_eff_display_io expects
-  `format_in(f"{x}", gpa)`), so the "new" error is the old one reworded.
-- other (3): **two compiler bugs** the migration found.
-  err_conv_keywords' `f"{sink}"` becomes `"{sink}"`, whose hole is
-  parsed as a `sink ||` closure (parser error "expected '|'"): a hole's
-  name that is a contextual keyword (`sink`, `inout`) must be read as a
-  name. sem_own_closure_temp_to_let_param: a closure passed as a format
-  argument is typed `closure` where the hole typed it `let closure`
-  (type error at 14:23). fmt_err_holes is an f-string test itself.
+The categories, by the error the check saw:
 
 own.conflict: arch_err_store_view.vl, checkalloc_arena_grow.vl, checkalloc_slice_push.vl, closure_returns_capture_view.vl, err_closure_view_across_call.vl, err_own_cast_view_grow.vl, err_own_unmap_live_view.vl, err_own_user_dunder.vl, err_temporary_own.vl, err_vec_elem_receiver.vl, generic_struct_fcall_view.vl, own_report_basics.vl, own_slice_receiver.vl, scope_result_view_grow.vl, sem_excl_cl_capture_vec_push_while_view.vl, sem_excl_cl_view_live_closure_call.vl, sem_excl_cl_view_made_after_closure.vl, sem_excl_cp_closure_capture_by_copy_mutated_after.vl, sem_excl_ex_slice_noalias_O2.vl, sem_excl_il_borrowed_elem_across.vl, sem_excl_il_field_of_local.vl, sem_excl_il_loop_carried.vl, sem_excl_il_view_across_inout.vl, sem_excl_il_view_struct_across_inout.vl, sem_excl_lb_view_result_then_write.vl, sem_excl_lv_borrowed_elem_assign.vl, sem_excl_pj_let_result.vl, sem_excl_vf_inout_field_slice_passed.vl, sem_poly_c03_var_change_while_closure_live.vl, sem_poly_c04_owned_let_moved_while_live.vl, sem_poly_f12_fnptr_returns_view_of_arg.vl, sem_poly_f13_fnptr_field_returns_view.vl, sem_poly_g07_closure_view_then_mutate.vl, sem_poly_g16_pick_view.vl, sem_poly_g25_generic_view_struct_mutate.vl, sem_poly_r13_default_returns_view.vl, sem_poly_r14_trait_generic_returns_view.vl, sem_poly_r16_assoc_item_view.vl, sem_poly_x04_closure_field_returns_view.vl, sem_poly_x05_map_returns_captured_view.vl, sem_poly_x06_sink_closure_holds_view.vl, sem_poly_y01_closure_in_vec_conflict.vl, sem_poly_y02_closure_in_option_conflict.vl, sem_views_l_l11.vl, sem_views_sv_sv15_lexer_owns.vl, tests/own-try/lexer_owns/main.vl, tests/own-try/view_push/main.vl.
 
@@ -131,6 +117,16 @@ Left as well: the 13 generated sweep tests (tools/sinksweep), the 4
 f-string tests (fstring, interp in their names), tests/refactor,
 tests/query and tests/lsp (their transcripts quote the code) and
 tests/agent-eval (a solution.patch must apply).
+
+## std migrated (0.26.2)
+
+`fix --only fstring --keep-braces` over std: 368 f-strings from the
+std.vl root and 14 in flat/test.vl and flat/fuzz.vl (which a plain
+std.vl root does not load: `--in` them), 0 left. std's core is then
+168410 of 168960 bytes (tests/std/core_sections.sh): 550 bytes of room,
+tight; the next std change to the core sections needs the bound raised
+or a section made lazy. The hello world's compile cost against 0.25.5
+went to 1.13x (it was 1.07x): the format literals' calls in std's core.
 
 ## Never used
 
@@ -156,9 +152,13 @@ tests/agent-eval (a solution.patch must apply).
    (Debug) following it.
 7. [tool] `query stats --all` is the only way to list a program's files;
    a `query files ROOT` would do it directly.
-8. [tool] the check hook's mechanical fixes rewrite test fixtures:
+8. [tool] `fix`'s check compares errors by their text: an edit that
+   rewords an error the program already has is refused as "new"
+   (edit.breaks). Comparing by code and item would let the 76 error
+   tests above migrate.
+9. [tool] the check hook's mechanical fixes rewrite test fixtures:
    editing tests/refactor/tools017/main.vl removed calc.vl's unused
    import, which the transcript needs. Fixtures under tests/ should be
    checked, not fixed.
-9. [compiler] the Defer node now means "a drop": rename it (NodeKind::Drop,
+10. [compiler] the Defer node now means "a drop": rename it (NodeKind::Drop,
    temp_make's a DropIf) once the places IR is the only lowering.
