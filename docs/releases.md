@@ -87,6 +87,15 @@ aarch64-macos only.
   had not compiled since 0.20's spellings and nothing built it. The
   tables stay as generated (Unicode 18.0.0); v0.26.2 has the generator.
 
+Text (text263; grammar.md, "Items"):
+
+- Rust's `#[deprecated]`, `#[deprecated = "note"]` and
+  `#[deprecated(since = "..", note = "..")]` on any item, a method or a
+  struct's field: each use (a call, a name, a type, a path, a `use`, a
+  field read, a struct literal) is `warning item.deprecated` with the
+  note, and the help says where the item is marked. A use inside a
+  deprecated item, and std's own uses, are not reported.
+
 ### What's new in 0.26.2
 
 `usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.
