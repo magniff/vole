@@ -594,6 +594,25 @@ revisited in 0.28, when `--values` goes.
 | the effects' SCCs it reuses | kept | kept | from the IR's call graph | |
 | `noalias` facts for the optimizer | kept | | | from `&mut T` types |
 
+**Step 7's scope, decided 2026-10-30 (0.26.2): the drop half only.** It
+deletes the implicit defers (DEFER_IMPLICIT) and their placement at the
+checker's call sites, the statement temporaries' drop flags and pointers
+(`__own_tf`, `__own_tp`, their defers), the assignment desugaring,
+`finish_drops` and the walk's drop recording, and the tools' reads of them
+(fixvalues, refactor extract). It keeps `visit_temps` and the hidden `let`s
+of the statement temporaries (`__own_tv`) that the own walk's checks read:
+own.escape (an argument's local lent past its arm, hold_args), own.partial
+(an element moved out of a temporary array by a run-time index),
+own.move_out (a part moved out of a temporary, part_move) and own.moved.
+An experiment build with them off fails 26 of the 650 places/own/temp
+cases, 15 of them those checks' errors. They go with those checks to the
+borrow checker (NLL, 0.27). own.drop_view, reported today from the
+parameters' implicit defers (finish_drops), moves onto the IR's drops.
+The builder makes its own temporaries and assignment drops already
+(0.26.2, places/README.md), and drops the old value at every owned
+assignment, as Rust does (0.25's own pass leaked it at an arm's value or
+inside an expression).
+
 Nothing of the own pass goes in 0.26.0. About 3,300 lines go in 0.26.1
 (`drops.vl` but its predicates, `glue.vl` moved, the drop recording in
 the walk), and with them the AST lowerings of function bodies in
@@ -919,6 +938,38 @@ suite: both are in 0.26.0. Step 7 waits for steps 4 and 5: while one code
 generator reads the AST, own's drops are still the ones it runs. Step 6
 waits for step 3's cases to pass under `VOLE_LOWER=places` at both
 levels. Effects move onto the IR in 0.26.2, after steps 6 and 7.
+
+**Step 8 in 0.26.2 (agent B, placesir262b).** Step 6 left most of the
+AST lowering live: the IR path drives the calls' and intrinsics'
+lowerings (AST-indexed, their operands bound), and lowers constant
+operands and contract and assert conditions from the AST, whose
+expressions hold blocks, `if`s and `match`es (a desugared method call,
+`?`, an f-string). So step 8 is three parts:
+
+- 8.0: `--check-unsafe` from the IR (it lowered every function from the
+  AST): a raw pointer's `*` and element checked in `place_addr`.
+- 8a: the roots: no function from the AST (`lower_function` deleted,
+  gen0's function walk cut to an atomic intrinsic's body), `VOLE_LOWER`
+  gone, a build under `--no-places` an error. Everything else of the AST
+  walks stays reachable through the conditions.
+- 8b, after A2's contract (5391c11d) and assert conditions in the IR,
+  each conjunct an IR value checked by an `IK_CONTRACT` with `e > 0`:
+  the generators read that form; then the AST walks of statements and
+  control flow (1,439 lines: `matching.vl`, both `control.vl`s,
+  `lower_block`, `lower_let`, the AST's assignments, the defers,
+  `gen_block`, the dispatchers' statement arms; front/ast.vl's DEFERS)
+  and the pure expressions' AST lowering (about 520 lines) are deleted,
+  with `bind_ast_locals`. Step 7's deletion of the own pass's drops
+  waits for 8b's first part: until then a condition's temporaries are
+  dropped by the AST lowering's defers.
+
+Left on the AST after 8b, a later release's item (a rewrite, not a
+deletion): the calls and intrinsics the IR path drives through bound AST
+nodes, 2,539 lines (`middle/lower`: `calls.vl` 586, `vector.vl` 372,
+`arch.vl` 347, `atomic.vl` 135; `gen0/gen`: `call.vl` 378, `arch.vl`
+336, `vector.vl` 331, `atomic.vl` 54), to become calls of the IR's
+operands with no AST node; and the constant operands' lowering
+(literals, constants, string ids, RT_SITE values).
 
 **State, agent A (placesir261a).** Done: R1 (kept bodies) and R2 (drop
 shims) for B; step 2's builder cost (§6, "Measured in 0.26.1"); step 6's
