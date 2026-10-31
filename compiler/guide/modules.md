@@ -25,7 +25,31 @@ with a private field is made by its module's functions). On your own
 field the help is its declaration with `pub`, which `volec fix --only
 pub` writes. Methods are visible wherever their type is. A `pub mod` can
 be reached from outside its parent. `pub use a::b;` re-exports `b`.
-`pub(crate)` and `pub(super)` come in 0.26.2.
+`pub(crate)` (0.26.2) is visible in the crate only, `pub(super)` in the
+parent module (and inside it), `pub(in crate::a)` in module `a`, which
+must be the item's own or one around it (`vis.path`); `pub(self)` is
+private. They go on items, fields, `use` and `mod`. Used outside, the
+error (`item.private`, `field.private`) says where it is visible, and
+`fix --only pub` widens it to `pub(crate)`. Std's crate is std: a std
+item marked `pub(crate)` is not a program's to use.
+
+```vole
+mod shop {
+    pub mod till {
+        pub(super) fn tax(n: i64) -> i64 { n / 10 }
+        pub(crate) fn total(n: i64) -> i64 { n + tax(n) }
+    }
+    pub fn quote(n: i64) -> i64 { till::tax(n) }   // the parent sees it
+}
+
+fn main() -> i32 {
+    println(shop::till::total(50) + shop::quote(50));   // not shop::till::tax
+    0
+}
+```
+```out
+60
+```
 
 ```vole
 mod geo {

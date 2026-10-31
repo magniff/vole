@@ -19,7 +19,7 @@ use crate::front::consteval::{f32_bits, f64_of_bits};
 use crate::front::lexer::Tok;
 use crate::front::lexer::Tok::{Amp, Caret, Minus, Percent, Pipe, Plus, Shl, Shr, Slash, Star};
 use crate::front::types::{
-    FNS, TY_F32, TY_F64, TY_I16, TY_I32, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, int_bits, is_float,
+    FNS, TY_F32, TY_F64, TY_I16, TY_I32, TY_I8, TY_U16, TY_U32, TY_U8, int_bits, is_float,
     is_signed, type_size,
 };
 use crate::gen0::gen::fn_symbol_prefix;
@@ -297,24 +297,6 @@ pub fn x64_pop_float(cx: sink *FnCtx, reg: i64) {
     ins(cx, c"addq $16, %rsp");
 }
 
-pub fn x64_peek(cx: sink *FnCtx, reg: i64) {
-    x64_load_from(cx, c"movq", 0, c"%rsp", x64_r(reg));
-}
-
-pub fn x64_peek_at(cx: sink *FnCtx, reg: i64, depth: i64, float: bool) {
-    if float {
-        o(cx, c"    movsd ");
-        x64_mem(cx, depth * 16, c"%rsp");
-        end_i(cx, c", %xmm", reg, c"");
-    } else {
-        x64_load_from(cx, c"movq", depth * 16, c"%rsp", x64_r(reg));
-    }
-}
-
-pub fn x64_drop_temps(cx: sink *FnCtx, count: i64) {
-    x64_imm(cx, c"addq", count * 16, c"%rsp");
-}
-
 // ---- Loads and stores ----
 
 pub fn x64_load(cx: sink *FnCtx, ty: i64, addr: i64) {
@@ -584,7 +566,7 @@ pub fn x64_float_binary(cx: sink *FnCtx, op: Tok, ty: i64) {
 
 pub fn x64_int_to_float(cx: sink *FnCtx, from: i64, to: i64) {
     let convert = if to == TY_F32 { c"cvtsi2ssq" } else { c"cvtsi2sdq" };
-    if from != TY_U64 {
+    if is_signed(from) || int_bits(from) < 64 {
         // Signed, or unsigned below 2^32 (zero-extended): exact as signed.
         x64_ins2(cx, convert, c"%rax", c"%xmm0");
         return;
@@ -627,10 +609,13 @@ pub fn x64_float_to_int(cx: sink *FnCtx, from: i64, to: i64) {
             emit_label(cx, fits);
         }
         ins(cx, c"movslq %eax, %rax");
-    } else if to != TY_U64 {
+    } else if is_signed(to) {
         x64_truncate(cx, f32, 64);
     } else {
-        // value >= 2^63 ? the unsigned conversion : the signed one.
+        // (0.26.2) Unsigned, as Rust's `as` (mx_conv): below 2^63 (and NaN)
+        // the signed conversion clamped at 0, and a narrower type's at its
+        // maximum; from 2^63 up a narrower type's maximum, or u64's
+        // unsigned conversion.
         let big = new_label(cx);
         let done = new_label(cx);
         if f32 {
@@ -644,19 +629,32 @@ pub fn x64_float_to_int(cx: sink *FnCtx, from: i64, to: i64) {
         }
         x64_jcc(cx, c"ae", big);
         x64_truncate(cx, f32, 64);
+        ins(cx, c"xorl %r10d, %r10d");
+        ins(cx, c"testq %rax, %rax");
+        ins(cx, c"cmovsq %r10, %rax");
+        if int_bits(to) < 64 {
+            ins(cx, unsigned_max_to_r10(to));
+            ins(cx, c"cmpq %r10, %rax");
+            ins(cx, c"cmovaq %r10, %rax");
+        }
         x64_jump(cx, done);
         emit_label(cx, big);
-        // value - 2^63 converts exactly below 2^64; above, the indefinite
-        // result means "saturate to the maximum".
-        ins(cx, if f32 { c"subss %xmm1, %xmm0" } else { c"subsd %xmm1, %xmm0" });
-        x64_ins2(cx, if f32 { c"cvttss2si" } else { c"cvttsd2si" }, c"%xmm0", c"%rax");
-        let saturate = new_label(cx);
-        ins(cx, c"testq %rax, %rax");
-        x64_jcc(cx, c"s", saturate);
-        ins(cx, c"btsq $63, %rax");
-        x64_jump(cx, done);
-        emit_label(cx, saturate);
-        ins(cx, c"movq $-1, %rax");
+        if int_bits(to) < 64 {
+            ins(cx, unsigned_max_to_r10(to));
+            ins(cx, c"movq %r10, %rax");
+        } else {
+            // value - 2^63 converts exactly below 2^64; above, the indefinite
+            // result means "saturate to the maximum".
+            let saturate = new_label(cx);
+            ins(cx, if f32 { c"subss %xmm1, %xmm0" } else { c"subsd %xmm1, %xmm0" });
+            x64_ins2(cx, if f32 { c"cvttss2si" } else { c"cvttsd2si" }, c"%xmm0", c"%rax");
+            ins(cx, c"testq %rax, %rax");
+            x64_jcc(cx, c"s", saturate);
+            ins(cx, c"btsq $63, %rax");
+            x64_jump(cx, done);
+            emit_label(cx, saturate);
+            ins(cx, c"movq $-1, %rax");
+        }
         emit_label(cx, done);
     }
     x64_normalize(cx, to);
@@ -928,4 +926,13 @@ fn x64_rt_addr(cx: sink *FnCtx, name: *u8, reg: *u8) {
     o(cx, c"(%rip), ");
     o(cx, reg);
     on(cx);
+}
+
+// (0.26.2) `movl $MAX, %r10d` for unsigned type ty of at most 32 bits.
+pub fn unsigned_max_to_r10(ty: i64) -> *u8 {
+    if int_bits(ty) == 8 { c"movl $255, %r10d" } else if int_bits(ty) == 16 {
+        c"movl $65535, %r10d"
+    } else {
+        c"movl $4294967295, %r10d"
+    }
 }

@@ -21,12 +21,12 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ volec check
-main.vl:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
+main.vl:8:38: error[item.private] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
 main.vl:9:14: error[type error] unresolved import 'roster::add_score'
 main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:31:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
+main.vl:32:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 grades.vl:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
 roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
@@ -93,7 +93,7 @@ $ volec query show roster.vl:26
 pub fn with_scores(r: Roster, n: i64) -> i64 {
     let count = 0;
     for s in r.students.as_slice() {
-        if s.scores.len() >= n {
+        if s.scores.len() as i64 >= n {
             count += 1;
         }
     }
@@ -119,13 +119,13 @@ writes the field, `scores.len` (a slice has both, `.len` and `.len()`):
 
 ```console
 $ volec edit patch grades.vl:18 --old 'totl / scores.len()' --new 'total / scores.len()'
-error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len
+error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len as i64
 try: volec edit patch grades.vl:18 --old 'totl / scores.len' --new 'total / scores.len()'
 [exit 1]
 $ volec edit patch grades.vl:18 --old 'totl' --new 'total' --show
 patched crate::grades::average	grades.vl	+1 -1 lines
 // grades.vl:18
-18	    total / scores.len
+18	    total / scores.len as i64
 ```
 
 ## 4. A fix that spans items: `edit apply`

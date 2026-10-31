@@ -19,7 +19,7 @@
 #   -g            the generics mode of gen.awk (0.5)
 #   -p            the pressure mode of gen.awk (many parameters and locals)
 #   -C            the calls mode of gen.awk (aggregates passed and returned)
-#   -N            the 0.6 language mode of gen.awk (defer, if let, ==, strings)
+#   -N            the 0.6 language mode of gen.awk (Drop guards, if let, ==, strings)
 #   -V            vectorizable loops and vector code, from genvec.awk (0.10)
 #   -D            divisions by constants of every type, from gendiv.awk
 #                 (0.11), each also checked against a division by an

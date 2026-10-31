@@ -78,7 +78,7 @@ fn main() {
     let wrapped = vaddq_u8(a, b);      // 300 wraps to 44
     let floor = vqsubq_u8(b, a);       // saturates at 0
     let both = vextq_u8(wrapped, floor, 15);
-    println(f"{vgetq_lane_u8(wrapped, 0)} {vgetq_lane_u8(floor, 0)} {vgetq_lane_u8(both, 1)}");
+    println("{} {} {}", vgetq_lane_u8(wrapped, 0), vgetq_lane_u8(floor, 0), vgetq_lane_u8(both, 1));
 }
 ```
 ```out
@@ -140,7 +140,7 @@ fn crc32c(s: [u8]) -> u32 {
 }
 
 fn main() {
-    println(f"{crc32c("123456789"):x} {crc32c_portable("123456789"):x}");
+    println("{:x} {:x}", crc32c("123456789"), crc32c_portable("123456789"));
 }
 ```
 ```out
@@ -190,7 +190,7 @@ fn dot(a: [u8], b: [u8]) -> u32 {
     if has("dotprod") {
         var acc = vdupq_n_u32(0);
         var i = 0;
-        while i + 16 <= a.len {
+        while i + 16 <= a.len as i64 {
             acc = vdotq_u32(acc, vld1q_u8(a, i), vld1q_u8(b, i));
             i += 16;
         }
@@ -207,7 +207,7 @@ fn dot(a: [u8], b: [u8]) -> u32 {
 fn main() {
     let a: [u8; 32] = [3; 32];
     let b: [u8; 32] = [2; 32];
-    println(f"{dot(a[..], b[..])}");
+    println("{}", dot(a[..], b[..]));
 }
 ```
 ```out
@@ -256,7 +256,7 @@ fn find(s: [u8], b: u8) -> i64 {
     var i = 0;
     if has("neon") {
         let needle = vdupq_n_u8(b);
-        while i + 16 <= s.len {
+        while i + 16 <= s.len as i64 {
             let eq = vceqq_u8(vld1q_u8(s, i), needle);
             if vmaxvq_u8(eq) != 0 {
                 let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
@@ -266,7 +266,7 @@ fn find(s: [u8], b: u8) -> i64 {
         }
     } else if has("sse2") {
         let needle = _mm_set1_epi8(b as i8);
-        while i + 16 <= s.len {
+        while i + 16 <= s.len as i64 {
             let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s, i), needle));
             if m != 0 {
                 return i + trailing_zeros(m as u64);
@@ -274,7 +274,7 @@ fn find(s: [u8], b: u8) -> i64 {
             i += 16;
         }
     }
-    while i < s.len {
+    while i < s.len as i64 {
         if s[i] == b {
             return i;
         }
@@ -285,7 +285,7 @@ fn find(s: [u8], b: u8) -> i64 {
 
 fn main() {
     let text = "the quick brown fox jumps over the lazy dog";
-    println(f"{find(text, 'z')} {find(text, 'q')} {find(text, '!')}");
+    println("{} {} {}", find(text, 'z'), find(text, 'q'), find(text, '!'));
 }
 ```
 ```out
@@ -372,7 +372,7 @@ fn main() {
     }
     compress(&state[..], block[..]);
     for k in 0..8 {
-        print(f"{state[k]:08x}");
+        print("{:08x}", state[k]);
     }
     println("");
 }

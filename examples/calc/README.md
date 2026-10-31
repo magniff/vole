@@ -93,8 +93,8 @@ character, and `{t}` uses `Token`'s own `Display`:
 impl Display for Error {
     fn fmt(self, f: inout Fmt) {
         match self {
-            BadChar(c) => f.write(f"unexpected character '{c:c}'"),
-            Unexpected(t) => f.write(f"unexpected {t}"),
+            BadChar(c) => f.write("unexpected character '{c:c}'"),
+            Unexpected(t) => f.write("unexpected {t}"),
             DivideByZero => f.str("division by zero"),
         }
     }
@@ -107,8 +107,8 @@ which returns `Ok(false)` at the end of the input:
 ```tach
 while read_line(&line).unwrap_or(false) {
     match evaluate(line.as_slice(), gpa) {
-        Ok(value) => println(f"{value}"),
-        Err(e) => println(f"error: {e}"),
+        Ok(value) => println("{value}"),
+        Err(e) => println("error: {e}"),
     }
 }
 ```

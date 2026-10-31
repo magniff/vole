@@ -1,6 +1,6 @@
 # formatting
 
-Formatted text in vole: f-strings and every part of a format spec
+Formatted text in vole: format strings and every part of a spec
 (width, alignment, zero padding, precision, hex, binary, characters,
 Debug), `Display` and `Debug` written by hand and derived, and the ways
 to send formatted text somewhere (`println`, `eprintln`, `format`,
@@ -33,9 +33,9 @@ On stdout:
 {x:>9.3}      [    3.142]  width and precision
 {name:>9}     [     vole]  text goes left by default
 {name:?}      ["vole"]     Debug: quoted and escaped
-{'A':c}       [A]          a u8 as a character
-{n * 2 + 1}   [85]         any expression
-{{ and }} in an f-string are literal braces: {n}
+{:c}, 'A'     [A]          a u8 as a character
+{}, n * 2 + 1 [85]         the next argument
+{{ and }} in a format string are literal braces: {n}
 == inventory
 sku    item               qty      price        value
 -----------------------------------------------------
@@ -65,10 +65,12 @@ warning: workbench (SKU-1500) is low: 2 left
 
 ## How it works
 
-**f-strings.** `f"... {expr} ..."` is formatted text: each hole holds
-any expression whose type has `Display` (with `:?`, `Debug`). A plain
-`"..."` never formats; `{{` and `}}` are literal braces in an f-string.
-The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c]`:
+**Format strings.** The first argument of `println` and the other
+printing calls is a format string, Rust's `format!` without the `!`:
+`{}` takes the next argument, `{name}` a local or a constant, `{0}` the
+first argument; each argument's type has `Display` (with `:?`, `Debug`).
+`{{` and `}}` are literal braces. The spec after `:` is Rust's,
+`[[fill]align][+][#][0][width][.precision][type]`:
 
 | spec | meaning |
 |---|---|
@@ -78,28 +80,29 @@ The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c]`:
 | `{x:.2}` `{x:>9.3}` | a float with 2 decimals; width 9 with 3 decimals |
 | `{b:c}` | a `u8` as its character (otherwise a `u8` prints as a number) |
 | `{v:?}` `{v:<26?}` | Debug, also with a width |
+| `{s:*^9}` `{n:+}` `{n:#x}` | a fill byte and centring, a sign, `0x` |
+| `{x:>w$}` `{x:.*}` | a width or a precision from a local or an argument |
 
 A float without a precision prints the shortest text that reads back as
 the same value (`3.14159`, `0.1`).
 
-**An f-string is a value.** It is passed to anything taking a
-`T: Display`: `println`, `eprintln` (stderr), `format_in` (returns a
-new `Buf`, dropped when its owner's scope ends), `buf.push_fmt(..)`
-(appends to a `Buf`) and `f.write(..)` inside a Display impl. The cheat
-sheet passes `format_in(f"...", gpa)` results to a helper that reads
-them (a temporary, dropped at the end of the call's statement); the hex
+**Where a format string goes.** `println`, `eprintln` (stderr),
+`format_in` (returns a new `Buf`, dropped when its owner's scope ends;
+the allocator comes last), `buf.push_fmt(..)` (appends to a `Buf`) and
+`f.write(..)` inside a Display impl. The cheat sheet passes
+`format_in("...", args, gpa)` results to a helper that reads them (a temporary, dropped at the end of the call's statement); the hex
 dump builds each line in a `Buf`:
 
 ```tach
-var line = format_in(f"{at:04x}  ", gpa); // format: a new Buf to keep
+var line = format_in("{at:04x}  ", gpa); // format: a new Buf to keep
 for i in at..at + 8 {
-    if i < end { line.push_fmt(f"{bytes[i]:02x} "); } else { line.push_str("   "); }
+    if i < end { line.push_fmt("{:02x} ", bytes[i]); } else { line.push_str("   "); }
 }
 ```
 
 **Display by hand.** `Display` has one method, `fmt(self, f: inout
 Fmt)`, which writes through the `Fmt` with `f.str`, `f.byte` and
-`f.write` (any Display value, an f-string included). Unlike Rust there is
+`f.write` (a format string and its arguments, or any Display value). Unlike Rust there is
 no `fmt::Result` to return. `Money` prints cents as dollars with
 thousands separators, using a zero-padded spec for each group:
 
@@ -110,9 +113,9 @@ impl Display for Money {
         f.write(dollars / group);
         while group > 1 {
             group /= 1000;
-            f.write(f",{dollars / group % 1000:03}");
+            f.write(",{:03}", dollars / group % 1000);
         }
-        f.write(f".{c % 100:02}");
+        f.write(".{:02}", c % 100);
     }
 }
 ```
@@ -143,9 +146,9 @@ std has Debug for the numbers, `[u8]` (quoted and escaped:
 are left-aligned while numbers and money are right-aligned:
 
 ```tach
-println(f"{"sku":<6} {"item":<16} {"qty":>5} {"price":>10} {"value":>12}");
+println("{:<6} {:<16} {:>5} {:>10} {:>12}", "sku", "item", "qty", "price", "value");
 ...
-println(f"{it.sku:<6} {it.name:<16} {it.qty:>5} {it.price:>10} {value:>12}");
+println("{:<6} {:<16} {:>5} {:>10} {value:>12}", it.sku, it.name, it.qty, it.price);
 ```
 
 String literals are allowed inside holes (`{"sku":<6}`).
@@ -157,15 +160,13 @@ allocation.
 
 ## Language features
 
-- f-strings, specs, `Display`, `Debug`, `format`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
+- format strings, specs, `Display`, `Debug`, `format_in`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
 - `Buf`, `Vec`, drops: `volec guide std`, `volec guide memory`
 - struct field shorthand (`Item { sku: Sku { id }, name, ... }`): `volec guide syntax`
 
 ## Going further
 
-- Widths and precisions are literal: there is no `{x:>width$}`. For a
-  computed width, pad by hand (push spaces into a `Buf`).
-- No `{:+}` or `{:#x}`: write the sign or `0x` yourself
-  (`f"0x{n:x}"`). `{x:e}` and `{x:E}` print a float in exponent
-  notation (`volec guide formatting`).
+- A computed width or precision is `{x:>w$}` (w a local) or `{x:.*}`
+  (the precision an argument before x). `{x:e}` and `{x:E}` print a
+  float in exponent notation (`volec guide formatting`).
 - Display has no derive; write the text you want.

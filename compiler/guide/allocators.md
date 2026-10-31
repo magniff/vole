@@ -11,7 +11,7 @@ so a function's signature says whether it allocates.
 
 ```vole
 fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
-    var v: Vec<i64> = Vec::with_capacity_in(n, gpa);
+    var v: Vec<i64> = Vec::with_capacity_in(n as usize, gpa);
     for i in 0..n { v.push(i * i); }
     v
 }
@@ -26,7 +26,7 @@ fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
     var b = Buf::new_in(gpa);
     b.push_int(total(v));
     let words: Vec<i64> = (1..4).map(|x| x * 10).collect_in(gpa);
-    println(f"{b.as_slice()} {words:?}");
+    println("{} {words:?}", b.as_slice());
     0
 }                                             // words, b, v dropped: freed
 ```
@@ -117,7 +117,7 @@ fn main() {
     var v: Vec<i64, FixedBuf> = Vec::new_in(FixedBuf::new(&mem[..]));
     v.push(7);
     v.push(8);
-    println(f"{v[0] + v[1]}");
+    println("{}", v[0] + v[1]);
 }
 ```
 ```out
@@ -125,11 +125,11 @@ fn main() {
 ```
 
 ```vole
-fn longest(words: [[u8]], gpa: Gpa) -> i64 {
+fn longest(words: [[u8]], gpa: Gpa) -> usize {
     arena_scope(gpa, |a| {
-        var lens: Vec<i64, ScopedArena> = Vec::new_in(a);
+        var lens: Vec<usize, ScopedArena> = Vec::new_in(a);
         for w in words { lens.push(w.len()); }
-        lens.iter().max().unwrap_or(0)        // an i64 leaves, the Vec does not
+        lens.iter().max().unwrap_or(0)        // a usize leaves, the Vec does not
     })
 }
 ```

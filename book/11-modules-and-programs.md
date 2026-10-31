@@ -50,7 +50,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -78,7 +78,7 @@ And `report.vl`, the table:
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
@@ -208,7 +208,7 @@ fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```
 
 ```err
-error[type error]: 'add_words' is private
+error[item.private]: 'add_words' is private
  --> main.vl: line 5, column 5
   = help: make it public: `pub fn add_words` at count.vl: line 1, column 1
   = try: volec fix --suggested main.vl
@@ -388,7 +388,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
         count::add_words(&counts, text, gpa);
     }
     let n = match env::get_in("WC_TOP", gpa) {
-        Ok(s) => s.parse::<i64>().unwrap_or(5),
+        Ok(s) => s.parse::<usize>().unwrap_or(5),
         Err(_) => 5,
     };
     let top = report::top(counts, n, gpa);
@@ -422,7 +422,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -448,7 +448,7 @@ pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)> {
+pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
     var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));

@@ -7,15 +7,17 @@ use crate::arch::intrinsic_of_fn;
 use crate::back::abi::{
     AbiClass, conv_classify, conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::base::{IntVec, die, free, intern_c};
+use crate::base::{FILES, IntVec, die, free, intern_c};
+use crate::base::comp::Comp;
 use crate::base::target::X86;
 use crate::front::ast::{NODES, NODE_RAW, child};
-use crate::front::contracts::checks::{CHECK_FN, check_message, check_values, conjuncts};
+use crate::front::contracts::checks::{check_message, check_values};
+use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE};
 use crate::front::modules::{item_symbol, within_std};
 use crate::front::threadlocal::{symbol_is_thread_local, tls_addr_fn};
 use crate::front::types::{
-    FNS, STATICS, SYM_STATIC, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, int_bits,
-    is_compound, is_signed, is_void, scalar_type, type_elem, type_size,
+    FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param,
+    is_compound, is_integer, is_void, scalar_type, type_elem, type_size,
 };
 use crate::gen0::target::{PANIC_USED, message_kind, rt_panic_sym};
 use crate::middle::checkalloc::site_before_call;
@@ -29,9 +31,7 @@ use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::{is_fresh, lower_branch, lower_copy, new_slot_for, start_dead_block};
 use crate::middle::lower::arch::{NOT_LOWERED, lower_intrinsic};
 use crate::middle::lower::atomic::{atomic_intrinsic, lower_atomic_call};
-use crate::middle::lower::expr::{
-    ir_conv, lower_expr, lower_operand, need_value, operand_expr, operand_value,
-};
+use crate::middle::lower::expr::{ir_conv, need_value, operand_expr, operand_value};
 use crate::middle::lower::ssa::ir_seal;
 use crate::middle::profile::PROFILE_MODULE;
 use crate::middle::unsafecheck::{
@@ -125,10 +125,6 @@ pub fn lower_call(cx: sink *FnCtx, n: i64) -> i64 {
         let callee = NODES[n].a;
         // (--check-unsafe: malloc and the like go through the runtime)
         let direct = redirect_alloc(NODES[n].x - 1, FNS[IRFUNCS[cx.irf].f].module);
-        // (0.18: a contract check, front/contracts)
-        if direct >= 0 && direct == CHECK_FN {
-            return lower_contract_check(cx, n);
-        }
         // (0.19: std::arch's intrinsics, by their table's IR form)
         let intr = intrinsic_of_fn(direct);
         if intr >= 0 {
@@ -325,6 +321,95 @@ pub fn lower_check(cx: sink *FnCtx, ok: i64, kind: i64, a: i64, b: i64, c: i64, 
     CUR = pass;
 }
 
+// (0.26.2, a prototype: $VOLE_PROTO_OVF=1) Whether the operators' overflow
+// checks are made (-1: not read yet).
+static var PROTO_OVF: i64 = -1;
+
+// (measuring only) $VOLE_PROTO_OVF_SKIP: the sites whose operations are
+// meant to wrap (what their source would write as `wrapping_*`), unchecked:
+// `LINE:COL` of the program's file or `<std>:LINE:COL`, separated by commas.
+static var PROTO_SKIP: Vec<u8, Comp> = Vec::new_in(Comp {});
+
+pub fn proto_ovf() -> bool {
+    if PROTO_OVF < 0 {
+        // (measuring) VOLE_PROTO_OVF=user: none in std, as Rust ships its std
+        // built without them.
+        PROTO_OVF = match std::env::var_os_in("VOLE_PROTO_OVF", Comp {}) {
+            Option::Some(v) => if v.as_slice() == "user" { 2 } else { 1 },
+            Option::None => 0,
+        };
+        match std::env::var_os_in("VOLE_PROTO_OVF_SKIP", Comp {}) {
+            Option::Some(v) => {
+                PROTO_SKIP.extend_from_slice(v.as_slice());
+            }
+            Option::None => {}
+        }
+    }
+    PROTO_OVF >= 1
+}
+
+fn proto_skipped(site: i64) -> bool {
+    let n = PROTO_SKIP.len() as i64;
+    if site <= 0 {
+        return false;
+    }
+    let in_std = within_std(FILES[SITE_FILE.get(site)].module);
+    if in_std && PROTO_OVF == 2 {
+        return true;
+    }
+    var i = 0;
+    while i < n {
+        var j = i;
+        while j < n && PROTO_SKIP[j] != ',' {
+            j += 1;
+        }
+        var k = i;
+        var item_std = false;
+        if j - i > 6 && PROTO_SKIP[i] == '<' {
+            item_std = true;
+            k = i + 6;
+        }
+        var line = 0;
+        while k < j && PROTO_SKIP[k] != ':' {
+            line = line * 10 + (PROTO_SKIP[k] - '0') as i64;
+            k += 1;
+        }
+        k += 1;
+        var col = 0;
+        while k < j {
+            col = col * 10 + (PROTO_SKIP[k] - '0') as i64;
+            k += 1;
+        }
+        if item_std == in_std && line == SITE_LINE.get(site) && col == SITE_COL.get(site) {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
+// (0.26.2, a prototype) The check that `a <op> b` (op Add, Sub, Mul, or Neg
+// with b 0) does not overflow integer type `ty` (a checker type): an OVF
+// and a branch to the panic when it holds. Made only with $VOLE_PROTO_OVF.
+pub fn lower_overflow_check(cx: sink *FnCtx, op: Op, ty: i64, a: i64, b: i64, site: i64) {
+    if !proto_ovf() || !is_integer(ty) {
+        return;
+    }
+    if op != Op::Add && op != Op::Sub && op != Op::Mul && op != Op::Neg || proto_skipped(site) {
+        return;
+    }
+    PANIC_USED = true;
+    let ovf = emit_ir(cx, Op::Ovf, TY_BOOL, a, b, (op as i64) | (ir_type(ty) << 8));
+    let pass = ir_new_block(cx);
+    let fail = ir_new_block(cx);
+    lower_branch(cx, ovf, fail, pass);
+    ir_seal(cx, fail);
+    CUR = fail;
+    rt_panic_call(cx, 0, 0, 0, 0, site, 0);
+    ir_seal(cx, pass);
+    CUR = pass;
+}
+
 // (0.18) The call of the run-time helper in the current (failing) block,
 // which ends it.
 pub fn rt_panic_call(cx: sink *FnCtx, kind: i64, a: i64, b: i64, c: i64, site: i64, site_value: i64) {
@@ -349,92 +434,23 @@ pub fn rt_panic_call(cx: sink *FnCtx, kind: i64, a: i64, b: i64, c: i64, site: i
     ir_terminate(cx, CUR, Term::Unreach, 0, 0, 0);
 }
 
-// (0.18) `std::contract_check(cond, site, check)` (front/contracts): each
-// conjunct of cond checked in turn; a false one calls the helper with its
-// message (front/contracts/checks.vl), its shown operands, evaluated
-// again on the failing path (a condition is pure), and the site.
-fn lower_contract_check(cx: sink *FnCtx, n: i64) -> i64 {
-    // UNSAFE: conjs is a raw IntVec this function owns.
-    // SAFETY: its data is made by conjuncts and freed once here.
-    unsafe {
-        let cond = child(n, 0);
-        let site = need_value(cx, lower_expr(cx, child(n, 1)), TY_I64);
-        var conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        conjuncts(cond, &conjs);
-        for k in 0..conjs.count {
-            let conj = conjs.data[k];
-            let ok = lower_operand(cx, conj);
-            let pass = ir_new_block(cx);
-            let fail = ir_new_block(cx);
-            lower_branch(cx, ok, pass, fail);
-            ir_seal(cx, fail);
-            CUR = fail;
-            contract_failure(cx, n, conj, site);
-            ir_seal(cx, pass);
-            CUR = pass;
-        }
-        free(conjs.data as *u8);
-        0
-    }
-}
-
-// (0.26.1) The same for a condition already evaluated, `ok` (the places
-// IR's): on its failing path the conjunct that failed (when there are
-// several: each evaluated again from the AST, as the shown operands are),
-// its message and the site; cond is evaluated once on the passing path.
-pub fn lower_contract_check_of(cx: sink *FnCtx, n: i64, ok: i64) {
-    // UNSAFE: conjs is a raw IntVec this function owns.
-    // SAFETY: its data is made by conjuncts and freed once here.
-    unsafe {
-        let site = need_value(cx, lower_expr(cx, child(n, 1)), TY_I64);
-        var conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        conjuncts(child(n, 0), &conjs);
-        let pass = ir_new_block(cx);
-        let fail = ir_new_block(cx);
-        lower_branch(cx, ok, pass, fail);
-        ir_seal(cx, fail);
-        CUR = fail;
-        for k in 0..conjs.count - 1 {
-            let conj = conjs.data[k];
-            let next = ir_new_block(cx);
-            let this = ir_new_block(cx);
-            lower_branch(cx, lower_operand(cx, conj), next, this);
-            ir_seal(cx, this);
-            CUR = this;
-            contract_failure(cx, n, conj, site);
-            ir_seal(cx, next);
-            CUR = next;
-        }
-        contract_failure(cx, n, conjs.data[conjs.count - 1], site);
-        ir_seal(cx, pass);
-        CUR = pass;
-        free(conjs.data as *u8);
-    }
-}
-
-// The failing path of conjunct conj of contract check n: its shown
-// operands evaluated, its message, the helper called with the site.
-fn contract_failure(cx: sink *FnCtx, n: i64, conj: i64, site: i64) {
-    // UNSAFE: ops is a raw IntVec this function owns; IRFUNCS the IR's raw table.
-    // SAFETY: ops' data is made by check_values and freed once here; cx.irf is the
-    // function being lowered.
+// (0.26.2) The failing path of conjunct conj of contract check n, its
+// shown values a, b, c and its site the IR's (places.vl's
+// lower_contract_failure): the message, from the AST's text, and the
+// helper called.
+pub fn contract_failure_at(cx: sink *FnCtx, n: i64, conj: i64, site: i64, a: i64, b: i64,
+    c: i64) {
+    // UNSAFE: ops is a raw IntVec this function owns; NODES and IRFUNCS are raw
+    // tables.
+    // SAFETY: ops' data is made by check_values and freed once here; n is the
+    // check's call node, cx.irf the function being lowered.
     unsafe {
         let check = NODES[child(n, 2)].a;
         var ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         check_values(n, conj, &ops);
-        var values: [i64; 3] = [0; 3];
-        for i in 0..ops.count {
-            let op = ops.data[i];
-            let ty = NODES[op].ty;
-            var v = need_value(cx, lower_expr(cx, op), ty);
-            if int_bits(ty) < 64 {
-                v = ir_conv(cx, v, ty, if is_signed(ty) { TY_I64 } else { TY_U64 });
-            }
-            values[i] = v;
-        }
         let kind = message_kind(check_message(check, conj, ops, IRFUNCS[cx.irf].f));
-        rt_panic_call(cx, kind, values[0], values[1], values[2], 0, site);
         free(ops.data as *u8);
+        rt_panic_call(cx, kind, a, b, c, 0, site);
     }
 }
 
@@ -450,10 +466,30 @@ pub fn lower_panic(cx: sink *FnCtx, kind: i64, a: i64, site: i64 = 0) {
 // With --check-unsafe: the check of `size` bytes (an IR value) at addr,
 // for the raw-pointer access n.
 pub fn raw_check(cx: sink *FnCtx, n: i64, addr: i64, size: i64) {
+    if !CHECK_UNSAFE {
+        return;
+    }
+    // UNSAFE: NODES is the parser's raw table of nodes.
+    // SAFETY: n is a node of the function being lowered, below the node count;
+    // read only, single-threaded.
+    unsafe {
+        if (NODES[n].p & NODE_RAW) != 0 {
+            raw_check_at(cx, NODES[n].start, addr, size);
+        }
+    }
+}
+
+// (0.26.2) With --check-unsafe: the check of `size` bytes at addr, for a
+// raw-pointer access at source position pos (the places IR's: its
+// statement's).
+pub fn raw_check_at(cx: sink *FnCtx, pos: i64, addr: i64, size: i64) {
+    // UNSAFE: cx is the lowering's raw context pointer; FNS and IRFUNCS are
+    // raw tables.
+    // SAFETY: cx points at the live FnCtx, cx.irf its function's entry, whose
+    // f is below FN_COUNT; lowering is single-threaded.
     unsafe {
         let m = FNS[IRFUNCS[cx.irf].f].module;
-        if !CHECK_UNSAFE || (NODES[n].p & NODE_RAW) == 0 || m == CHECK_MODULE
-            || m == PROFILE_MODULE {
+        if !CHECK_UNSAFE || m == CHECK_MODULE || m == PROFILE_MODULE {
             return;
         }
         let f = check_function();
@@ -463,7 +499,7 @@ pub fn raw_check(cx: sink *FnCtx, n: i64, addr: i64, size: i64) {
         let mark = cx.ssa_stack.count;
         push_arg(cx, addr, TY_U64);
         push_arg(cx, size, TY_U64);
-        push_arg(cx, emit_ir(cx, Op::SAddr, TY_U64, 0, 0, site_string(NODES[n].start)), TY_U8_PTR);
+        push_arg(cx, emit_ir(cx, Op::SAddr, TY_U64, 0, 0, site_string(pos)), TY_U8_PTR);
         let call = emit_ir(cx, Op::Call, 0, 0, 0, f);
         take_args(cx, call, mark);
     }

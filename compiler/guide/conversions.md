@@ -13,7 +13,11 @@ elements. It is lossless, so it is implicit; nothing else is:
 
 - it widens: `i8 -> i16 -> i32 -> i64` and `u8 -> u16 -> u32 -> u64`
   (the same signedness), and unsigned to a strictly wider signed type
-  (`u8 -> i16`, `u32 -> i64`); `isize`/`usize` are `i64`/`u64`;
+  (`u8 -> i16`, `u32 -> i64`); `usize` and `isize` are 64-bit types of
+  their own (0.26.2): `u8`..`u32` widen to `usize`, `i8`..`i32` and
+  `u8`..`u32` to `isize`, and `usize`/`u64` (`isize`/`i64`) take `x as T`
+  or `T::try_from(x)` (a `Result`, `Err(TryFromIntError)` when the value
+  does not fit);
 - it never converts int to float, `bool` to int, signed to unsigned, or
   to a narrower type: write `x as T`;
 - it applies to a value, never inside another type: `*i32`, `[i32]`,
@@ -99,8 +103,8 @@ fn main() -> i32 {
 function. On a `Result<T, E>` it gives the `T`, or returns `Err`: the
 error as it is when `E` is the function's error type `F`, widened when
 `E` widens to `F`, else `F::from(err)` through an `impl From<E> for F`.
-Inside a closure it returns from the closure (give it `-> T`). `defer`s
-run, as for `return`.
+Inside a closure it returns from the closure (give it `-> T`). The
+drops run, as for `return`.
 
 ```vole
 use std::ParseIntError;
@@ -164,9 +168,9 @@ fn port(raw: i64) -> Result<i64, ConfigError> {
 
 fn main() -> Result<(), ConfigError> {
     let p = port(8080)?;
-    println(f"port {p}");
+    println("port {p}");
     let q = port(-1)?;
-    println(f"port {q}");
+    println("port {q}");
     Ok(())
 }
 ```

@@ -156,7 +156,7 @@ extern "C" {
 }
 
 fn main() {
-    println(f"{unsafe { ilogb(8.0) }}");
+    println("{}", unsafe { ilogb(8.0) });
 }
 ```
 ```out
@@ -187,7 +187,7 @@ fn main(gpa: Gpa) -> i32 {
         line.push(ch as u8);
     }
     print("read ");
-    std::print_int(line.len());
+    std::print_int(line.len() as i64);
     println(" bytes");
     0
 }

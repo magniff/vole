@@ -40,7 +40,7 @@ use crate::base::{
     IntVec, STDERR, SYMS, buf_byte, buf_fmt, buf_new, buf_write_fd, cstr, free, strlen,
 };
 use crate::base::target::X86;
-use crate::front::types::{FNS, TY_I64, TY_U64, is_float, type_size};
+use crate::front::types::{FNS, TY_BOOL, TY_I64, TY_U64, is_float, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::is_const;
 use crate::middle::gvn::find_escaping_slots;
@@ -61,9 +61,13 @@ use crate::middle::opt::resolve_all;
 use crate::middle::profile::{PROFILE_MAX, is_cold_block};
 use crate::middle::scev::full_unroll_trips;
 use crate::middle::vectorize::build::{
-    append, cmp, emit_body, eval_at, identity, konst, map_get, map_put, minmax_of,
+    addend_bound, append, cmp, emit_body, eval_at, identity, konst, lane_overflow, map_get, map_put,
+    minmax_of, reduction_may_overflow,
 };
-use crate::middle::vectorize::checks::{build_groups, check_tests, overlap_pairs, overlap_tests};
+use crate::middle::vectorize::checks::{
+    OVK_LANE, OVK_RED, build_groups, check_tests, has_ovf_kind, overlap_pairs, overlap_tests,
+    ovf_tests,
+};
 use crate::middle::vectorize::legality::{
     NONAFFINE, analyze, class_of, coef, lane_type, reduction_of_next, why,
 };
@@ -93,8 +97,8 @@ pub fn vec_stats_wanted(f: i64) -> bool {
         let name = SYMS[FNS[f].display].text;
         let n = strlen(want) as i64;
         var start = 0;
-        for i in 0..name.len {
-            if i + 1 < name.len && name[i] == ':' && name[i + 1] == ':' {
+        for i in 0..name.len as i64 {
+            if i + 1 < name.len as i64 && name[i] == ':' && name[i + 1] == ':' {
                 start = i + 2;
             }
             if name[i] == '<' || name[i] == '$' {
@@ -102,8 +106,8 @@ pub fn vec_stats_wanted(f: i64) -> bool {
             }
         }
         for s in [0, start] {
-            if s + n <= name.len && (0..n).all(|i| name[s + i] == want[i])
-                && (s + n == name.len || name[s + n] == '<' || name[s + n] == '$') {
+            if s + n <= name.len as i64 && (0..n).all(|i| name[s + i] == want[i])
+                && (s + n == name.len as i64 || name[s + n] == '<' || name[s + n] == '$') {
                 return true;
             }
         }
@@ -445,6 +449,7 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
         var ok = cmp(cx, c, Cond::Ge, TY_U64, trips, konst(cx, c, unroll * vf, TY_I64));
         let last = append(cx, c, Sub, TY_I64, n, konst(cx, c, 1, TY_I64), 0);
         ok = check_tests(cx, l, c, ok, start, last);
+        ok = ovf_tests(cx, l, c, ok, start, last);
         build_groups(cx);
         ok = overlap_tests(cx, l, c, ok, start, last, 0, 0);
         ir_terminate(cx, c, Term::Branch, ok, vp, sp);
@@ -455,11 +460,13 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
         let vend = append(cx, vp, Add, TY_I64, start, vtrips, 0);
         var red_init = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var red_id = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var red_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for r in 0..cx.v_reds.count / 3 {
             let phi = cx.v_reds.data[3 * r];
             let raw = cx.v_reds.data[3 * r + 2];
             let op = raw as Op;
             let init = ir_val(cx, ir_arg(cx, phi, pred_index(cx, h, p)));
+            red_start.push(init);
             // (0.15: a minimum starts every lane at the start)
             let id = if op == Op::Sel { append(cx, vp, VSplat, vt, init, 0, 0) }
                 else { append(cx, vp, VSplat, vt, konst(cx, vp, identity(op), lt), 0, 0) };
@@ -493,6 +500,34 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
                 red_phis.push(rp);
             }
         }
+        // (0.26.2, a prototype) The overflow checks on lanes (OVK_LANE,
+        // OVK_RED) are accumulated, one vector each a copy, from 0: the
+        // lanes' overflow or'ed, or the addends' bounds; tested after the
+        // vector loop, which the scalar loop redoes from the start when they
+        // fail (it has no store).
+        let spec = has_ovf_kind(cx, OVK_LANE) || has_ovf_kind(cx, OVK_RED);
+        var nspec = 0;
+        for k in 0..cx.v_ovfs.count / 3 {
+            if cx.v_ovfs.data[3 * k + 1] == OVK_LANE || cx.v_ovfs.data[3 * k + 1] == OVK_RED {
+                nspec += 1;
+            }
+        }
+        var spec_phis = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var spec_nexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if spec {
+            let zero = append(cx, vp, VSplat, vt, konst(cx, vp, 0, lt), 0, 0);
+            for _ in 0..unroll * nspec {
+                let sp_phi = ir_make(cx, Phi, vt, 0, 0, 0);
+                cx.insts[sp_phi].args = cx.args.count;
+                cx.insts[sp_phi].nargs = 2;
+                cx.args.push(zero);
+                cx.argty.push(0);
+                cx.args.push(0);
+                cx.argty.push(0);
+                ir_append(cx, vh, sp_phi);
+                spec_phis.push(sp_phi);
+            }
+        }
         for u in 0..unroll {
             // A fresh map per copy (the splats of invariants stay).
             var k = 0;
@@ -520,12 +555,29 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
             for r in 0..cx.v_reds.count / 3 {
                 red_nexts.push(map_get(cx, cx.v_reds.data[3 * r + 1]));
             }
+            var j = 0;
+            for k in 0..cx.v_ovfs.count / 3 {
+                let kind = cx.v_ovfs.data[3 * k + 1];
+                if kind != OVK_LANE && kind != OVK_RED {
+                    continue;
+                }
+                let o = cx.v_ovfs.data[3 * k];
+                let x = if kind == OVK_LANE { lane_overflow(cx, l, o, vh, vp) } else {
+                    addend_bound(cx, l, o, cx.v_reds.data[3 * cx.v_ovfs.data[3 * k + 2]], vh, vp)
+                };
+                spec_nexts.push(append(cx, vh, VBin, vt, spec_phis.data[u * nspec + j], x,
+                    Op::Or as i64));
+                j += 1;
+            }
         }
         let vnext = append(cx, vh, Add, cx.insts[cx.v_iv].ty, viv,
             konst(cx, vh, unroll * vf, cx.insts[cx.v_iv].ty), 0);
         ir_set_arg(cx, viv, 1, vnext);
         for i in 0..red_phis.count {
             ir_set_arg(cx, red_phis.data[i], 1, red_nexts.data[i]);
+        }
+        for i in 0..spec_phis.count {
+            ir_set_arg(cx, spec_phis.data[i], 1, spec_nexts.data[i]);
         }
         let more = cmp(cx, vh, Cond::Ne, TY_I64, vnext, vend);
         // (Its predecessors: vp, then vh, the phis' operand order.)
@@ -570,14 +622,57 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
             }
             red_final.push(s);
         }
-        let done = cmp(cx, vx, Cond::Eq, TY_I64, vend, n);
-        ir_terminate(cx, vx, Term::Branch, done, e, sp);
+        // (0.26.2) VX2: on when the overflow checks on lanes pass, to R,
+        // the scalar loop from the start, when they fail.
+        var vx2 = vx;
+        var restart = 0;
+        if spec {
+            var bad = 0;
+            var j = 0;
+            for k in 0..cx.v_ovfs.count / 3 {
+                let kind = cx.v_ovfs.data[3 * k + 1];
+                if kind != OVK_LANE && kind != OVK_RED {
+                    continue;
+                }
+                var acc = spec_nexts.data[j];
+                for u in 1..unroll {
+                    acc = append(cx, vx, VBin, vt, acc, spec_nexts.data[u * nspec + j],
+                        Op::Or as i64);
+                }
+                var s = append(cx, vx, VExt, lt, acc, 0, 0);
+                for q in 1..vf {
+                    s = append(cx, vx, Op::Or, lt, s, append(cx, vx, VExt, lt, acc, 0, q), 0);
+                }
+                let o = cx.v_ovfs.data[3 * k];
+                let this = if kind == OVK_LANE {
+                    cmp(cx, vx, Cond::Lt, lt, s, konst(cx, vx, 0, lt))
+                } else {
+                    reduction_may_overflow(cx, vx, cx.insts[o].imm,
+                        red_start.data[cx.v_ovfs.data[3 * k + 2]], s, vtrips, 1)
+                };
+                bad = if bad == 0 { this } else { append(cx, vx, Op::Or, TY_BOOL, bad, this, 0) };
+                j += 1;
+            }
+            vx2 = ir_new_block(cx);
+            restart = ir_new_block(cx);
+            cx.blocks[vx2].sealed = 1;
+            cx.blocks[restart].sealed = 1;
+            ir_terminate(cx, vx, Term::Branch, bad, restart, vx2);
+        }
+        let done = cmp(cx, vx2, Cond::Eq, TY_I64, vend, n);
+        ir_terminate(cx, vx2, Term::Branch, done, e, sp);
+        if spec {
+            ir_terminate(cx, restart, Term::Jump, 0, sp, 0);
+        }
         // SP: the scalar loop's preheader, from C or VX (its predecessors, in
         // that order).
         var vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         vals.push(start);
         vals.push(vend);
-        let iv0 = new_phi_in(cx, sp, cx.insts[cx.v_iv].ty, &vals, 0, 2);
+        // (R's: the start again)
+        vals.push(start);
+        let ways = if spec { 3 } else { 2 };
+        let iv0 = new_phi_in(cx, sp, cx.insts[cx.v_iv].ty, &vals, 0, ways);
         let hp = pred_index(cx, h, p);
         ir_set_arg(cx, cx.v_iv, hp, iv0);
         for r in 0..cx.v_reds.count / 3 {
@@ -585,7 +680,8 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
             vals.count = 0;
             vals.push(ir_val(cx, ir_arg(cx, phi, hp)));
             vals.push(red_final.data[r]);
-            let r0 = new_phi_in(cx, sp, cx.insts[phi].ty, &vals, 0, 2);
+            vals.push(ir_val(cx, ir_arg(cx, phi, hp)));
+            let r0 = new_phi_in(cx, sp, cx.insts[phi].ty, &vals, 0, ways);
             ir_set_arg(cx, phi, hp, r0);
         }
         ir_terminate(cx, sp, Term::Jump, 0, h, 0);
@@ -607,11 +703,14 @@ fn vectorize_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
             x = cx.insts[x].next;
         }
         cx.blocks[e].preds.count -= 1;
-        add_pred_values(cx, e, vx, &vals, 0);
+        add_pred_values(cx, e, vx2, &vals, 0);
         cx.blocks[h].novec = 1;
         free(vals.data as *u8);
         free(red_init.data as *u8);
         free(red_id.data as *u8);
+        free(red_start.data as *u8);
+        free(spec_phis.data as *u8);
+        free(spec_nexts.data as *u8);
         free(red_nexts.data as *u8);
         free(red_phis.data as *u8);
         free(red_final.data as *u8);

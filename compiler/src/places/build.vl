@@ -9,15 +9,17 @@
 // order of registration. Every needs-drop local and temporary gets a drop
 // there, whether it moved or not: elaboration decides each (elab.vl).
 //
-// The own pass's nodes are read through (§4):
-// - its implicit defers (DEFER_IMPLICIT) are skipped: the IR places its
-//   own drops;
-// - a statement temporary (drops.vl temp_make: a NODE_TEMP block, its
-//   `__own_tp` and `__own_tf` lets, their defer) is the temporary it
-//   stands for, `__own_tv`, dropped with its statement;
-// - the assignment desugaring `{ let __own_new = rhs; { let =o = p; p =
-//   __own_new; } }` is the one assignment `tmp = rhs; drop(p); p = move
-//   tmp` (§3.8);
+// Temporaries (0.26.2) are the builder's own: a value where a place is
+// needed (`&e`, a field read out of it, a receiver) or an operand gets a
+// temporary, whose drop is an entry of its statement's scope (temp_home,
+// R5's rule: the end of its statement, or of its block for a tail and a
+// `let` that may view it); so is an owned assignment's drop of the old
+// value, `tmp = v; drop(p); p = move tmp` (§3.8, lower_assign_at).
+//
+// The own pass's nodes are read through (§4; 0.26.2: it places no drop):
+// - a statement temporary (drops.vl temp_value: a NODE_TEMP block, `{ let
+//   __own_tv = e; &__own_tv }`) is read as the `&e` it stands for
+//   (own_temp_block);
 // - the checker's transparent blocks (BLOCK_TRANSPARENT: `?`'s and a
 //   requires call's) are no scope: their `let`s are temporaries of the
 //   statement;
@@ -28,11 +30,10 @@
 // A construct the builder does not handle yet makes the body a fallback
 // (BUILD_FAILED, FAIL_NODE): no body, counted by the driver.
 
-use crate::base::{SYMS, intern_c};
+use crate::base::{IntVec, SYMS, intern_c, len_arg};
 use crate::base::comp::Comp;
 use crate::front::ast::{
-    BLOCK_TRANSPARENT, CLOSURE_MOVE, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind,
-    child,
+    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
@@ -40,7 +41,7 @@ use crate::front::consteval::wrap_int;
 use crate::front::contracts::expand::is_pre_fn;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::Tok;
-use crate::front::own::byref::{ASSIGN_OLD, BYREF, MATCH_BYREF, NO_DROP, borrowed_call};
+use crate::front::own::byref::{BYREF, MATCH_BYREF, NO_DROP, borrowed_call, indexable_place};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
 use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_referent};
@@ -83,8 +84,10 @@ static var GEN: i64 = 0;
 static var STATICS_SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
 // The scope stack: records of SW words (kind, first entry, its node
 // (where its drops run, places/print.vl drop_pos; a loop's: the loop),
-// break block, continue block, the loop's result local and projection).
-const SW: i64 = 8;
+// break block, continue block, the loop's result local and projection,
+// whether `continue` takes a back edge, and whether it is a home of
+// statement temporaries: temp_home).
+const SW: i64 = 9;
 const SC_BODY: i64 = 1;
 const SC_BLOCK: i64 = 2;
 const SC_STMT: i64 = 3;
@@ -117,11 +120,6 @@ static var DROPS: bool = false;
 // (its values borrowed copies).
 static var AGG_BORROW: bool = false;
 // The symbols of the own pass's names the builder reads.
-static var SYM_TP: i64 = 0;
-static var SYM_TF: i64 = 0;
-static var SYM_TV: i64 = 0;
-static var SYM_NEW: i64 = 0;
-static var SYM_OLD: i64 = 0;
 static var SYM_FOR_SEQ: i64 = 0;
 
 // Counts, for --time-passes and the README.
@@ -133,12 +131,7 @@ pub static var STMTS_MADE: i64 = 0;
 pub static var ALL_STORAGE: bool = true;
 
 fn syms() {
-    if SYM_TP == 0 {
-        SYM_TP = intern_c(c"__own_tp");
-        SYM_TF = intern_c(c"__own_tf");
-        SYM_TV = intern_c(c"__own_tv");
-        SYM_NEW = intern_c(c"__own_new");
-        SYM_OLD = intern_c(c"=o");
+    if SYM_FOR_SEQ == 0 {
         SYM_FOR_SEQ = intern_c(c"__for_seq");
     }
 }
@@ -153,7 +146,7 @@ fn unsupported(n: i64) {
 // ---- Locals ----
 
 fn map_local(l: i64, ir: i64, p: i64) {
-    while MAP_GEN.len() <= l {
+    while MAP_GEN.len() as i64 <= l {
         MAP_L.push(0);
         MAP_P.push(0);
         MAP_GEN.push(0);
@@ -165,7 +158,7 @@ fn map_local(l: i64, ir: i64, p: i64) {
 
 // The IR place of AST local l (PL_L, PL_P); false when it has none.
 fn mapped(l: i64) -> bool {
-    if l < 0 || l >= MAP_GEN.len() || MAP_GEN[l] != GEN {
+    if l < 0 || l >= MAP_GEN.len() as i64 || MAP_GEN[l] != GEN {
         return false;
     }
     PL_L = MAP_L[l];
@@ -197,17 +190,93 @@ fn user_local(l: i64, node: i64, borrowed: bool) -> i64 {
     ir
 }
 
-// A temporary of type ty: its storage begins now, and its storage end
-// (and drop, when its type needs one and it is not borrowed) are entries of
-// the innermost scope.
+// A temporary of type ty, which the builder writes itself (a result, a
+// counter, an assignment's value): its storage begins now, and its storage
+// end is an entry of the innermost scope. Its drop, when its type needs one
+// and it is not borrowed, is an entry of its statement's scope (temp_home,
+// R5): when that is not the innermost, the temporary has no storage markers
+// (made on some paths of the scope it drops in, an arm's: its storage is
+// the body's).
 fn new_temp(ty: i64, node: i64, borrowed: bool) -> i64 {
     let l = new_local(ty, LF_TEMP | if borrowed { LF_BORROWED } else { 0 }, -1, node);
-    live(l);
-    schedule(EN_DEAD, l);
-    if !borrowed && needs_drop(ty) {
-        schedule(EN_DROP, l);
+    let drop = !borrowed && needs_drop(ty);
+    let h = if drop { temp_home() } else { scope_depth() - 1 };
+    if h == scope_depth() - 1 {
+        live(l);
+        schedule(EN_DEAD, l);
+        if drop {
+            schedule(EN_DROP, l);
+        }
+    } else {
+        schedule_in(h, EN_DROP, l);
     }
     l
+}
+
+// A temporary holding the value of expression e, made into it, dropped at
+// the end of scope h (an operand's: new_temp's rule, value_home; a place's,
+// `&e` or a part read out of e: its statement's, temp_home, so that what
+// the statement makes of it outlives none of it). Its entries are
+// registered once it holds the value, so that the temporaries e makes drop
+// after it (`r(1).next().show()`: the last made first). Borrowed (no drop)
+// for a copy its result is (copied_call).
+fn value_temp(e: i64, borrowed: bool, h: i64) -> i64 {
+    let ty = NODES[e].ty;
+    let l = new_local(ty, LF_TEMP | if borrowed { LF_BORROWED } else { 0 }, -1, e);
+    let drop = !borrowed && needs_drop(ty);
+    let inner = h == scope_depth() - 1;
+    if inner {
+        live(l);
+    }
+    expr_into(e, l, 0);
+    if inner {
+        schedule(EN_DEAD, l);
+        if drop {
+            schedule(EN_DROP, l);
+        }
+    } else if drop {
+        schedule_in(h, EN_DROP, l);
+    }
+    l
+}
+
+// The scope a temporary of type ty drops in by new_temp's rule.
+fn value_home(ty: i64, borrowed: bool) -> i64 {
+    if !borrowed && needs_drop(ty) { temp_home() } else { scope_depth() - 1 }
+}
+
+// The temporary holding the value of e where a place is needed (value_temp,
+// in its statement's scope).
+fn place_temp(e: i64) -> i64 {
+    value_temp(e, copied_call(e), temp_home())
+}
+
+// (0.26.2, drops.vl hold_args) The statement scope of the call (or struct
+// literal, or requires check) whose argument being lowered is a value lent
+// to a let parameter (or a let field) that is a branch's (lent_branch), -1
+// outside one: a temporary its branches make of a local declared in it
+// (`count(match make() { Ok(s) => s, .. }, 8)` lends `&s`) drops there,
+// with the statement, not with the local's arm. A block's statements are
+// none of its branches (only its tail is).
+static var LENT_HOME: i64 = -1;
+
+// Whether e, an argument, is a branch's value lent to a let parameter: of
+// type `&T`, a match, an if, a block or a `?`.
+fn lent_branch(e: i64) -> bool {
+    let t = NODES[e].ty;
+    let k = NODES[e].kind;
+    t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED && (k == NodeKind::Match
+        || k == NodeKind::If || k == NodeKind::Try || k == NodeKind::Block
+        && (NODES[e].p & NODE_TEMP) == 0)
+}
+
+// operand(e, moving) for an argument (a call's, a struct literal's field):
+// LENT_HOME set for it.
+fn arg_operand(e: i64, moving: bool) {
+    let saved = LENT_HOME;
+    LENT_HOME = if lent_branch(e) { temp_home() } else { -1 };
+    operand(e, moving);
+    LENT_HOME = saved;
 }
 
 fn live(l: i64) {
@@ -237,7 +306,7 @@ fn unit_local() -> i64 {
 // The IR local of static `name` (a symbol).
 fn static_local(name: i64, node: i64) -> i64 {
     var i = 0;
-    while i < STATICS_SEEN.len() {
+    while i < STATICS_SEEN.len() as i64 {
         if STATICS_SEEN[i] == name {
             return STATICS_SEEN[i + 1];
         }
@@ -251,21 +320,44 @@ fn static_local(name: i64, node: i64) -> i64 {
 
 // ---- Scopes ----
 
-fn push_scope(kind: i64, node: i64) -> i64 {
-    let at = SCOPES.len() / SW;
+// A new innermost scope; `home` when the temporaries made in it (and in the
+// scopes inside it that are none) drop at its end (temp_home).
+fn push_scope(kind: i64, node: i64, home: bool) -> i64 {
+    let at = SCOPES.len() as i64 / SW;
     SCOPES.push(kind);
-    SCOPES.push(ENTRIES.len() / 2);
+    SCOPES.push(ENTRIES.len() as i64 / 2);
     SCOPES.push(node);
     SCOPES.push(-1);
     SCOPES.push(-1);
     SCOPES.push(-1);
     SCOPES.push(0);
     SCOPES.push(0);
+    SCOPES.push(if home { 1 } else { 0 });
     at
 }
 
+// (0.26.2) The scope a statement temporary drops at the end of, R5's rule
+// (conventions.md §2.2, "Temporaries"): its statement's (a `let`, an
+// expression statement, a `while` condition, a `defer`'s), or its block's
+// for a block's tail and a `let` that may keep a view of it (lower_let
+// makes no statement scope for one). Not an arm's, a guard's or a loop's,
+// nor a checker's desugaring of an expression (desugared_block: an
+// operator's `{ let ==l = a; .. }`, an f-string's, a `?`'s): a temporary
+// made there is its statement's.
+fn temp_home() -> i64 {
+    var s = scope_depth() - 1;
+    while s > 0 && SCOPES[s * SW + 8] == 0 {
+        s -= 1;
+    }
+    s
+}
+
+// Whether the statements of the block being lowered are temporaries' homes
+// (false in a desugared_block's).
+static var STMT_HOME: bool = true;
+
 fn scope_depth() -> i64 {
-    SCOPES.len() / SW
+    SCOPES.len() as i64 / SW
 }
 
 fn schedule(kind: i64, v: i64) {
@@ -279,7 +371,8 @@ fn schedule(kind: i64, v: i64) {
 // The entries of scope s, emitted (innermost last registered first).
 fn emit_scope(s: i64) {
     let first = SCOPES[s * SW + 1];
-    let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] } else { ENTRIES.len() / 2 };
+    let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] }
+        else { ENTRIES.len() as i64 / 2 };
     // (where its drops run: the exit taken, or the scope's own end)
     let at = if EXIT_NODE > 0 { EXIT_NODE } else { SCOPES[s * SW + 2] };
     var e = end - 1;
@@ -317,8 +410,8 @@ fn pop_scope() {
     if reachable() {
         emit_scope(s);
     }
-    ENTRIES.truncate(2 * SCOPES[s * SW + 1]);
-    SCOPES.truncate(s * SW);
+    ENTRIES.truncate(len_arg(2 * SCOPES[s * SW + 1]));
+    SCOPES.truncate(len_arg(s * SW));
 }
 
 // The loop scope of loop node lp, or -1.
@@ -339,7 +432,7 @@ fn run_defer(d: i64) {
     if e == 0 {
         return;
     }
-    let s = push_scope(SC_STMT, d);
+    let s = push_scope(SC_STMT, d, true);
     expr_into(e, -1, 0);
     pop_scope_at(s);
 }
@@ -371,8 +464,8 @@ fn push_now() {
 // ours are moved to the end first. The new start of the operands.
 fn ops_add(at: i64, n: i64) -> i64 {
     var start = at;
-    if P_OPS.len() != at + 3 * n {
-        start = P_OPS.len();
+    if P_OPS.len() as i64 != at + 3 * n {
+        start = P_OPS.len() as i64;
         for j in 0..3 * n {
             let w = P_OPS[at + j];
             P_OPS.push(w);
@@ -448,8 +541,7 @@ fn operand(e: i64, moving: bool) {
         set_op(OK_UNIT, 0, TY_UNIT);
         return;
     }
-    let t = new_temp(ty, e, false);
-    expr_into(e, t, 0);
+    let t = value_temp(e, false, value_home(ty, false));
     place_operand(t, 0, ty, true);
 }
 
@@ -543,31 +635,17 @@ fn place_of(e: i64) -> bool {
 }
 
 // The place pointer expression e points to: `*e`, or, when e takes an
-// address, the place it takes (`*&x` is x; a statement temporary's block
-// gives `&__own_tv`, so `*{ .. }` is the temporary itself).
+// address, the place it takes (`*&x` is x; the own pass's statement
+// temporary's block stands for `&e`, so `*{ .. }` is the temporary itself).
 fn deref_place(e: i64) {
     let k = NODES[e].kind;
     if k == NodeKind::Unary && NODES[e].op == Tok::Amp && is_place_expr(NODES[e].b)
         && place_of(NODES[e].b) {
         return;
     }
-    if k == NodeKind::Block && (NODES[e].p & NODE_TEMP) != 0 {
-        let tail = NODES[e].a;
-        if tail != 0 && NODES[tail].kind == NodeKind::Unary && NODES[tail].op == Tok::Amp
-            && is_place_expr(NODES[tail].b) {
-            let saved_tv = TV_SCOPE;
-            TV_SCOPE = temp_scope(e);
-            for i in 0..NODES[e].count {
-                if !reachable() {
-                    break;
-                }
-                lower_stmt(child(e, i));
-            }
-            TV_SCOPE = saved_tv;
-            if place_of(NODES[tail].b) {
-                return;
-            }
-        }
+    if k == NodeKind::Block && own_temp_block(e) && own_temp_addr(e) {
+        own_temp_place(e);
+        return;
     }
     as_place(e);
     PL_P = proj(PL_P, PJ_DEREF, 0);
@@ -652,11 +730,59 @@ fn as_place(e: i64) {
     if is_place_expr(e) && place_of(e) {
         return;
     }
-    let ty = NODES[e].ty;
-    let t = new_temp(ty, e, copied_call(e));
-    expr_into(e, t, 0);
-    PL_L = t;
+    PL_L = place_temp(e);
     PL_P = 0;
+}
+
+// ---- The own pass's statement temporaries, read as what they stand for ----
+//
+// (0.26.2) drops.vl's temp_value puts a NODE_TEMP block where a statement
+// temporary is made, `{ let __own_tv = e; &__own_tv }`, for the own walk's
+// view checks. The builder reads the block as `&e` (or, a tail of no `&`,
+// `e`) and makes the temporary itself (value_temp, dropped by temp_home's
+// rule).
+
+// Whether b is one: a block flagged NODE_TEMP whose first statement is a
+// `let` (an Ident flagged NODE_TEMP is the checker's, temps.vl).
+fn own_temp_block(b: i64) -> bool {
+    NODES[b].kind == NodeKind::Block && (NODES[b].p & NODE_TEMP) != 0 && NODES[b].count > 0
+        && NODES[child(b, 0)].kind == NodeKind::Let
+}
+
+// The value of own_temp_block b, e.
+fn own_temp_value(b: i64) -> i64 {
+    NODES[child(b, 0)].c
+}
+
+// Whether own_temp_block b gives its temporary's address (`&e`), not its
+// value.
+fn own_temp_addr(b: i64) -> bool {
+    let tail = NODES[b].a;
+    tail != 0 && NODES[tail].kind == NodeKind::Unary && NODES[tail].op == Tok::Amp
+}
+
+// The temporary holding the value of own_temp_block b (an address block):
+// e moved into it, even when e is a place (hold_args' `&s` of a local
+// declared in the argument: the statement keeps it, not s's scope).
+fn own_temp_place(b: i64) {
+    let e = own_temp_value(b);
+    let local = NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local;
+    PL_L = value_temp(e, copied_call(e),
+        if local && LENT_HOME >= 0 { LENT_HOME } else { temp_home() });
+    PL_P = 0;
+}
+
+// The borrow kind of `&` node e (or a block standing for one) of type ty.
+fn ref_kind(e: i64, ty: i64) -> i64 {
+    let t = undistinct(ty);
+    if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
+        return BK_RAW;
+    }
+    if (NODES[e].p & NODE_REF_MUT) != 0 || t > 0 && TYPES[t].kind == TyKind::Ptr
+        && TYPES[t].b == REF_MUT {
+        return BK_MUT;
+    }
+    BK_SHARED
 }
 
 // ---- Statements of assignment ----
@@ -704,7 +830,7 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
         return;
     }
     if k == NodeKind::Assign {
-        lower_assign(e);
+        lower_assign_at(e);
         return;
     }
     if k == NodeKind::Return {
@@ -763,14 +889,12 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
         }
         if k == NodeKind::Unary || k == NodeKind::Binary || k == NodeKind::Cast {
             // (its operands evaluated for what they do)
-            let t = new_temp(ty, e, false);
-            expr_into(e, t, 0);
+            value_temp(e, false, value_home(ty, false));
             return;
         }
         if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
             || k == NodeKind::VariantLit || k == NodeKind::Repeat || k == NodeKind::Index {
-            let t = new_temp(ty, e, false);
-            expr_into(e, t, 0);
+            value_temp(e, false, value_home(ty, false));
             return;
         }
         if k == NodeKind::Int || k == NodeKind::Bool || k == NodeKind::Unit || k == NodeKind::Char
@@ -832,16 +956,8 @@ fn lower_unary(e: i64, dl: i64, dp: i64) {
     let op = NODES[e].op;
     let ty = undistinct(NODES[e].ty);
     if op == Tok::Amp {
-        let operand_e = NODES[e].b;
-        as_place(operand_e);
-        var kind = BK_SHARED;
-        if ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == 0 {
-            kind = BK_RAW;
-        } else if (NODES[e].p & NODE_REF_MUT) != 0
-            || ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == REF_MUT {
-            kind = BK_MUT;
-        }
-        emit_ref(dl, dp, PL_L, PL_P, kind, e);
+        as_place(NODES[e].b);
+        emit_ref(dl, dp, PL_L, PL_P, ref_kind(e, ty), e);
         return;
     }
     if op == Tok::Star {
@@ -938,7 +1054,7 @@ fn bo_of(op: Tok) -> i64 {
 
 // A switch on bool operand `at` (in P_OPS): false to `f`, true to `t`.
 fn switch_bool(at: i64, f: i64, t: i64, node: i64) {
-    let ti = crate::places::ir::P_TARGETS.len();
+    let ti = crate::places::ir::P_TARGETS.len() as i64;
     crate::places::ir::P_TARGETS.push(0);
     crate::places::ir::P_TARGETS.push(f);
     terminate(TK_SWITCH, ti, 1, t, at, 1, node);
@@ -992,6 +1108,8 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64) {
                 emit_use(t, 0, value);
                 set_op(OK_COPY, t, 0);
             }
+        } else if k == NodeKind::StructLit {
+            arg_operand(value, true);
         } else {
             operand(value, true);
         }
@@ -1088,6 +1206,12 @@ fn lower_call(n: i64, dl: i64, dp: i64) {
     var ik = -1;
     if f >= 0 && f == crate::front::contracts::checks::CHECK_FN {
         ik = IK_CONTRACT;
+        lower_contract(n);
+        if dl >= 0 && dl != unit_local() && reachable() && !is_void_dest(dl, dp) {
+            set_op(OK_UNIT, 0, TY_UNIT);
+            emit_use(dl, dp, n);
+        }
+        return;
     } else if f >= 0 && crate::arch::intrinsic_of_fn(f) >= 0 {
         ik = IK_ARCH;
     }
@@ -1126,6 +1250,83 @@ fn lower_call(n: i64, dl: i64, dp: i64) {
     }
 }
 
+// (0.26.2) The conjuncts and the shown values of the contract checks being
+// lowered (lower_contract), each check's from its mark on.
+static var CONJS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SHOWN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.26.2) A contract check, call n, `std::contract_check(COND, SITE,
+// CHECK, HOLES..)` (front/contracts): each conjunct of COND (its `&&`
+// chain, checks.vl conjuncts) evaluated and branched on in turn, exactly
+// once on every path as `&&` evaluates it, its failing path made by
+// contract_failure (which names it). The same for an assert's (whose
+// condition may change state: `assert(v.pop() == x)`) as for a
+// requires', ensures' or invariant's (the form entry facts read,
+// middle/entryfacts.vl).
+fn lower_contract(n: i64) {
+    let cmark = CONJS.count;
+    crate::front::contracts::checks::conjuncts(child(n, 0), &CONJS);
+    let cend = CONJS.count;
+    for k in cmark..cend {
+        let conj = CONJS.get(k);
+        operand(conj, false);
+        if !reachable() {
+            break;
+        }
+        let pass = new_block();
+        let fail = new_block();
+        let at = ops_mark();
+        push_now();
+        switch_bool(at, fail, pass, conj);
+        enter_block(fail);
+        contract_failure(n, conj);
+        enter_block(pass);
+    }
+    CONJS.count = cmark;
+}
+
+// The failing path of conjunct conj of contract check n, in the block
+// being made: the values its report shows (the conjunct's operands, or an
+// f-string message's holes, checks.vl check_values), made first as they
+// may emit statements of their own, then
+//     intrinsic contract_check(const false, SITE, VALUE..) [d n, e conj]
+//     unreachable
+// (the message is check_message's, of n's check and conj; ops[0] is the
+// condition's value, false here, as an assert's was before 0.26.2).
+fn contract_failure(n: i64, conj: i64) {
+    let smark = SHOWN.count;
+    crate::front::contracts::checks::check_values(n, conj, &SHOWN);
+    let send = SHOWN.count;
+    let vals = OP_HOLD.len() as i64;
+    OP_HOLD.push(OK_INT);
+    OP_HOLD.push(0);
+    OP_HOLD.push(TY_BOOL);
+    operand(child(n, 1), false);
+    OP_HOLD.push(OPK);
+    OP_HOLD.push(OPA);
+    OP_HOLD.push(OPB);
+    for i in smark..send {
+        operand(SHOWN.get(i), false);
+        OP_HOLD.push(OPK);
+        OP_HOLD.push(OPA);
+        OP_HOLD.push(OPB);
+    }
+    SHOWN.count = smark;
+    let count = (OP_HOLD.len() as i64 - vals) / 3;
+    let at = ops_mark();
+    for j in 0..count {
+        push_op(OP_HOLD[vals + 3 * j], OP_HOLD[vals + 3 * j + 1], OP_HOLD[vals + 3 * j + 2]);
+    }
+    OP_HOLD.truncate(len_arg(vals));
+    if reachable() {
+        emit(SK_INTRINSIC, unit_local(), 0, IK_CONTRACT, n, conj, at, count, conj);
+        terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, conj);
+    }
+}
+
+// Operands held while the ones after them are made (lower_contract).
+static var OP_HOLD: Vec<i64, Comp> = Vec::new_in(Comp {});
+
 // The mode of an argument of a call through a function value: by its type.
 fn arg_mode_of(arg: i64) -> i64 {
     let t = undistinct(NODES[arg].ty);
@@ -1139,10 +1340,16 @@ fn arg_mode_of(arg: i64) -> i64 {
 // Argument i (node arg) of call n: its operand (OPK..).
 fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool) {
     let k = NODES[arg].kind;
-    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
-        let operand_e = NODES[arg].b;
+    let temp = k == NodeKind::Block && own_temp_block(arg) && own_temp_addr(arg);
+    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp || temp {
+        // (`&value` lent, the own pass's temporary's block: `&e`)
+        let operand_e = if temp { own_temp_value(arg) } else { NODES[arg].b };
         let at_ty = undistinct(NODES[arg].ty);
-        as_place(operand_e);
+        if temp {
+            own_temp_place(arg);
+        } else {
+            as_place(operand_e);
+        }
         let pl = PL_L;
         let pp = PL_P;
         var kind = BK_SHARED;
@@ -1161,7 +1368,7 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool) {
     // (a value: moved into a by-value parameter; read where the callee
     // only reads it: a raw or C parameter, a view)
     let moving = mode == P_VALUE && !c_callee;
-    operand(arg, moving);
+    arg_operand(arg, moving);
 }
 
 // ---- Assignment ----
@@ -1205,96 +1412,46 @@ fn lower_assign(n: i64) {
     emit(SK_ASSIGN, PL_L, PL_P, RV_BINARY, bo_of(op), n, at, 2, n);
 }
 
-// The own pass's desugaring of an owned assignment, block b: `{ let
-// __own_new = rhs; [let __own_iK = i;] { let =o = p; p = __own_new; } }`,
-// read as `tmp = rhs; drop(p); p = move tmp` (§3.8). False when b is not
-// one.
-fn lower_own_assign(b: i64) -> bool {
-    // (the inner block is the outer's last statement, or its tail once
-    // checked; the assignment the inner's second statement, or its tail)
-    let tail = NODES[b].a;
-    let stmts = if tail != 0 { NODES[b].count } else { NODES[b].count - 1 };
-    if stmts < 1 {
-        return false;
+// (0.26.2) An assignment: `p = v` on an owned place drops p's old value
+// wherever it stands (a statement, a block's tail, an arm's value, inside
+// an expression: Rust's rule; 0.25's own pass dropped it only at the first
+// two, and leaked it elsewhere), `tmp = v; drop(p); p = move tmp` (§3.8:
+// the right side, then the place and its index, then the old value's
+// drop, then the write; the right side's temporaries at the statement's
+// end, ea70255c), elaboration deciding the drop (removed where p is moved,
+// under a flag where it may be); drops_old says which.
+fn lower_assign_at(n: i64) {
+    if !drops_old(n) {
+        lower_assign(n);
+        return;
     }
-    // (the right side's temporaries' preludes come first, drops.vl
-    // temps_before: nothing for the IR)
-    var j = 0;
-    while j < stmts - 1 && prelude_stmt(child(b, j)) {
-        j += 1;
-    }
-    let first = child(b, j);
-    if NODES[first].kind != NodeKind::Let || (NODES[first].p & NO_DROP) == 0 {
-        return false;
-    }
-    let npat = NODES[first].a;
-    if npat == 0 || NODES[npat].kind != NodeKind::PatBind || NODES[npat].a != SYM_NEW {
-        return false;
-    }
-    var inner = tail;
-    if inner == 0 {
-        let last = child(b, NODES[b].count - 1);
-        if NODES[last].kind != NodeKind::ExprStmt {
-            return false;
-        }
-        inner = NODES[last].a;
-    }
-    if inner == 0 || NODES[inner].kind != NodeKind::Block || NODES[inner].count < 1 {
-        return false;
-    }
-    // (`let =o = p;`, the own pass's implicit defer of `=o`, then `p =
-    // __own_new;`)
-    let olet = child(inner, 0);
-    var asg = NODES[inner].a;
-    var last_stmt = NODES[inner].count;
-    if asg == 0 {
-        let ast = child(inner, NODES[inner].count - 1);
-        if NODES[inner].count < 2 || NODES[ast].kind != NodeKind::ExprStmt {
-            return false;
-        }
-        asg = NODES[ast].a;
-        last_stmt -= 1;
-    }
-    for i in 1..last_stmt {
-        let d = child(inner, i);
-        if NODES[d].kind != NodeKind::Defer || (NODES[d].p & DEFER_IMPLICIT) == 0 {
-            return false;
-        }
-    }
-    if NODES[olet].kind != NodeKind::Let {
-        return false;
-    }
-    let read = NODES[olet].c;
-    if asg == 0 || NODES[asg].kind != NodeKind::Assign || read == 0
-        || (NODES[read].p & ASSIGN_OLD) == 0 {
-        return false;
-    }
-    // tmp = rhs
-    let nl = NODES[npat].x;
-    let vt = NODES[NODES[first].c].ty;
-    let tmp = new_temp(vt, first, false);
-    if nl >= 0 {
-        map_local(nl, tmp, 0);
-    }
-    expr_into(NODES[first].c, tmp, 0);
-    // the hoisted indexes, in order
-    for i in j + 1..stmts {
-        lower_stmt(child(b, i));
-    }
+    let target = NODES[n].b;
+    let value = NODES[n].c;
+    let tmp = new_temp(NODES[value].ty, n, false);
+    expr_into(value, tmp, 0);
     if !reachable() {
-        return true;
+        return;
     }
-    // drop(p); p = move tmp
-    let target = NODES[asg].b;
     if !place_of(target) {
         unsupported(target);
-        return true;
+        return;
     }
-    let ol = NODES[NODES[olet].a].x;
-    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, ol, 0, 0, asg);
+    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, -1, 0, 0, n);
     set_op(OK_MOVE, tmp, 0);
-    emit_use(PL_L, PL_P, asg);
-    true
+    emit_use(PL_L, PL_P, n);
+}
+
+// Whether assignment n drops the old value: `=` (not one the checker
+// writes without a drop, NO_DROP) of a value with glue to a place of names,
+// fields, `*` and indexes (not one a call makes, nor a raw access,
+// NODE_RAW), with drops on.
+fn drops_old(n: i64) -> bool {
+    if !DROPS || NODES[n].op != Tok::Eq || (NODES[n].p & NO_DROP) != 0 {
+        return false;
+    }
+    let target = NODES[n].b;
+    target != 0 && NODES[n].c != 0 && NODES[target].ty > 0 && type_glue(NODES[target].ty)
+        && indexable_place(target)
 }
 
 // ---- Control flow ----
@@ -1389,7 +1546,7 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     let exit = new_block();
     goto(head);
     enter_block(head);
-    let s = push_scope(SC_LOOP, n);
+    let s = push_scope(SC_LOOP, n, false);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = head;
@@ -1400,7 +1557,7 @@ fn lower_loop(n: i64, dl: i64, dp: i64) {
     if NODES[n].kind == NodeKind::While {
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
-        let c = push_scope(SC_STMT, n);
+        let c = push_scope(SC_STMT, n, true);
         operand(NODES[n].b, false);
         let at = ops_mark();
         push_now();
@@ -1462,11 +1619,11 @@ fn lower_for(n: i64) {
     push_now();
     switch_bool(at2, exit, body, n);
     enter_block(body);
-    let s = push_scope(SC_LOOP, n);
+    let s = push_scope(SC_LOOP, n, false);
     SCOPES[s * SW + 2] = n;
     SCOPES[s * SW + 3] = exit;
     SCOPES[s * SW + 4] = next;
-    let arm = push_scope(SC_ARM, n);
+    let arm = push_scope(SC_ARM, n, false);
     let pat = NODES[n].b;
     if NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
         let l = user_local(NODES[pat].x, pat, false);
@@ -1535,13 +1692,13 @@ fn lower_match(n: i64, dl: i64, dp: i64) {
         let arm = child(n, i);
         let pat = NODES[arm].a;
         let fail = new_block();
-        let s = push_scope(SC_ARM, arm);
+        let s = push_scope(SC_ARM, arm, false);
         test_pattern(pat, sl, sp, st, fail);
         let guard = NODES[arm].b;
         if guard != 0 && reachable() {
             phase_begin(-1);
             bind_pattern(pat, sl, sp, st, true);
-            let g = push_scope(SC_STMT, guard);
+            let g = push_scope(SC_STMT, guard, false);
             operand(guard, false);
             if reachable() {
                 let at = ops_mark();
@@ -1627,7 +1784,7 @@ fn switch_cases(n: i64, st: i64) -> bool {
             return false;
         }
     }
-    let cases = SW_CASES.len() / 2;
+    let cases = SW_CASES.len() as i64 / 2;
     cases >= 6 || is_enum && is_compound(t) && cases >= 4
 }
 
@@ -1642,7 +1799,7 @@ fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool) -> bool {
     }
     if kind == NodeKind::PatRange && integer {
         let count = int_key(NODES[p].y, t) - int_key(NODES[p].x, t) + 1;
-        if count < 1 || count > 256 || SW_CASES.len() + 2 * count > 2048 {
+        if count < 1 || count > 256 || SW_CASES.len() as i64 + 2 * count > 2048 {
             return false;
         }
         for k in 0..count {
@@ -1672,7 +1829,7 @@ fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool) -> bool {
 
 fn add_switch_value(value: i64, arm: i64) {
     var i = 0;
-    while i < SW_CASES.len() {
+    while i < SW_CASES.len() as i64 {
         if SW_CASES[i] == value {
             return;
         }
@@ -1722,8 +1879,8 @@ fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64) {
     } else {
         default = new_block();
     }
-    let cases = SW_CASES.len() / 2;
-    let ti = crate::places::ir::P_TARGETS.len();
+    let cases = SW_CASES.len() as i64 / 2;
+    let ti = crate::places::ir::P_TARGETS.len() as i64;
     for c in 0..cases {
         let arm = SW_CASES[2 * c + 1];
         var many = false;
@@ -1748,7 +1905,7 @@ fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64) {
     for i in 0..count {
         let arm = child(n, i);
         enter_block(first + i);
-        let s = push_scope(SC_ARM, arm);
+        let s = push_scope(SC_ARM, arm, false);
         phase_begin(-1);
         bind_pattern(NODES[arm].a, sl, sp, st, false);
         expr_into(NODES[arm].c, dl, dp);
@@ -1775,9 +1932,7 @@ fn scrutinee_place(e: i64) {
         return;
     }
     let borrowed = borrowed_call(e) || (NODES[e].p & MATCH_BYREF) != 0;
-    let t = new_temp(NODES[e].ty, e, borrowed);
-    expr_into(e, t, 0);
-    PL_L = t;
+    PL_L = value_temp(e, borrowed, value_home(NODES[e].ty, borrowed));
     PL_P = 0;
 }
 
@@ -1860,7 +2015,7 @@ fn switch_variant(l: i64, p: i64, ty: i64, v: i64, fail: i64, node: i64) {
     set_op(OK_COPY, d, 0);
     push_now();
     let next = new_block();
-    let ti = crate::places::ir::P_TARGETS.len();
+    let ti = crate::places::ir::P_TARGETS.len() as i64;
     crate::places::ir::P_TARGETS.push(variant_discr(v));
     crate::places::ir::P_TARGETS.push(next);
     terminate(TK_SWITCH, ti, 1, fail, at2, 1, node);
@@ -1939,7 +2094,7 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool) {
     // (the IR local: the phase's when an earlier alternative made it)
     var ir = -1;
     var i = 0;
-    while i < PHASE.len() {
+    while i < PHASE.len() as i64 {
         if PHASE[i] == al {
             ir = PHASE[i + 1];
             break;
@@ -1986,10 +2141,10 @@ fn lower_let_pattern(pat: i64, init: i64, s: i64) {
     let l = PL_L;
     let p = PL_P;
     let ty = NODES[init].ty;
-    let targets = crate::places::ir::P_TARGETS.len();
+    let targets = crate::places::ir::P_TARGETS.len() as i64;
     let fail = new_block();
     test_pattern(pat, l, p, ty, fail);
-    if crate::places::ir::P_TARGETS.len() != targets && reachable() {
+    if crate::places::ir::P_TARGETS.len() as i64 != targets && reachable() {
         let ok = new_block();
         goto(ok);
         enter_block(fail);
@@ -2004,28 +2159,51 @@ fn lower_let_pattern(pat: i64, init: i64, s: i64) {
 // ---- Blocks and statements ----
 
 fn lower_block(b: i64, dl: i64, dp: i64) {
-    if lower_own_assign(b) {
-        if dl >= 0 && dl != unit_local() {
-            set_op(OK_UNIT, 0, TY_UNIT);
-            emit_use(dl, dp, b);
+    let flags = NODES[b].p;
+    if (flags & NODE_TEMP) != 0 && own_temp_block(b) {
+        // (the own pass's statement temporary: `&e`, or `e`)
+        let e = own_temp_value(b);
+        if !own_temp_addr(b) {
+            expr_into(e, dl, dp);
+            return;
+        }
+        own_temp_place(b);
+        if dl >= 0 && reachable() {
+            emit_ref(dl, dp, PL_L, PL_P, ref_kind(NODES[b].a, NODES[b].ty), b);
         }
         return;
     }
-    let flags = NODES[b].p;
-    // (a statement temporary's block, or a transparent desugaring: no scope
-    // of its own)
+    // (a transparent desugaring: no scope of its own; its statements', and
+    // a desugared expression's, are no temporaries' homes)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
-    let s = if scoped { push_scope(SC_BLOCK, b) } else { -1 };
-    let saved_tv = TV_SCOPE;
-    TV_SCOPE = if (flags & NODE_TEMP) != 0 { temp_scope(b) } else { -1 };
+    let home = scoped && !desugared_block(b);
+    let s = if scoped { push_scope(SC_BLOCK, b, home) } else { -1 };
+    let saved_home = STMT_HOME;
+    let saved_lent = LENT_HOME;
+    STMT_HOME = home;
+    LENT_HOME = -1;
     for i in 0..NODES[b].count {
         if !reachable() {
             break;
         }
         lower_stmt(child(b, i));
     }
-    TV_SCOPE = saved_tv;
+    STMT_HOME = saved_home;
+    LENT_HOME = saved_lent;
     let tail = NODES[b].a;
+    if tail != 0 && NODES[tail].kind == NodeKind::Assign {
+        if reachable() {
+            lower_assign_at(tail);
+        }
+        if dl >= 0 && dl != unit_local() && reachable() && !is_void_dest(dl, dp) {
+            set_op(OK_UNIT, 0, TY_UNIT);
+            emit_use(dl, dp, b);
+        }
+        if scoped {
+            pop_scope_at(s);
+        }
+        return;
+    }
     if tail != 0 && reachable() {
         expr_into(tail, dl, dp);
     } else if tail == 0 && dl >= 0 && reachable() && !is_void_dest(dl, dp) {
@@ -2041,18 +2219,31 @@ fn is_void_dest(dl: i64, dp: i64) -> bool {
     dl == unit_local() || dp == 0 && is_void(P_LOCALS[dl].ty)
 }
 
+// Whether block b is the checker's desugaring of an expression, whose
+// statements' temporaries are the enclosing statement's (temp_home): its
+// first `let`s bind its hidden names (`==l`, `=+l`, an f-string's `=fN`,
+// `==nn`), which no program can write.
+fn desugared_block(b: i64) -> bool {
+    for i in 0..NODES[b].count {
+        let s = child(b, i);
+        if NODES[s].kind != NodeKind::Let {
+            return false;
+        }
+        let pat = NODES[s].a;
+        if pat != 0 && NODES[pat].kind == NodeKind::PatBind {
+            let text = SYMS[NODES[pat].a].text;
+            if text.len as i64 > 0 && text[0] == '=' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn lower_stmt(st: i64) {
     let k = NODES[st].kind;
     if k == NodeKind::Defer {
-        if (NODES[st].p & DEFER_IMPLICIT) != 0 {
-            return;
-        }
-        if temp_defer(st) {
-            // (the temporary it drops drops at the end of this scope)
-            TEMP_SCOPES.push(temp_flag(st));
-            TEMP_SCOPES.push(scope_depth() - 1);
-            return;
-        }
+        // (`defer`: error syntax.defer since 0.26.2)
         schedule(EN_DEFER, st);
         return;
     }
@@ -2062,109 +2253,21 @@ fn lower_stmt(st: i64) {
     }
     if k == NodeKind::ExprStmt {
         let e = NODES[st].a;
-        if e == 0 || own_flag_write(e) {
+        if e == 0 {
             return;
         }
-        let s = push_scope(SC_STMT, st);
-        expr_into(e, -1, 0);
+        let s = push_scope(SC_STMT, st, STMT_HOME);
+        if NODES[e].kind == NodeKind::Assign {
+            lower_assign_at(e);
+        } else {
+            expr_into(e, -1, 0);
+        }
         pop_scope_at(s);
         return;
     }
-    let s = push_scope(SC_STMT, st);
+    let s = push_scope(SC_STMT, st, STMT_HOME);
     expr_into(st, -1, 0);
     pop_scope_at(s);
-}
-
-// Whether local l is one of the own pass's temporaries' bookkeeping
-// (`__own_tp`, `__own_tf`), which the IR has no use for.
-fn own_temp_local(l: i64) -> bool {
-    if l < 0 {
-        return false;
-    }
-    let name = crate::places::front::ast_local_name(l);
-    name == SYM_TP || name == SYM_TF
-}
-
-// Whether statement s is a statement temporary's prelude: its `__own_tp`
-// or `__own_tf` let, its defer.
-fn prelude_stmt(s: i64) -> bool {
-    let k = NODES[s].kind;
-    if k == NodeKind::Defer {
-        return (NODES[s].p & DEFER_IMPLICIT) == 0 && temp_defer(s);
-    }
-    if k != NodeKind::Let {
-        return false;
-    }
-    let pat = NODES[s].a;
-    pat != 0 && NODES[pat].kind == NodeKind::PatBind && own_temp_local(NODES[pat].x)
-}
-
-// Whether expression e writes one (`__own_tp = &__own_tv;`, `__own_tf =
-// true;`).
-fn own_flag_write(e: i64) -> bool {
-    if NODES[e].kind != NodeKind::Assign {
-        return false;
-    }
-    let t = NODES[e].b;
-    NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && own_temp_local(NODES[t].y)
-}
-
-// Whether defer d is a statement temporary's (`defer { if __own_tf { .. }
-// }`, drops.vl temp_make): the IR's drop of the temporary is its own.
-fn temp_defer(d: i64) -> bool {
-    let body = NODES[d].a;
-    if body == 0 || NODES[body].kind != NodeKind::Block || NODES[body].count != 1 {
-        return false;
-    }
-    let s = child(body, 0);
-    if NODES[s].kind != NodeKind::ExprStmt {
-        return false;
-    }
-    let f = NODES[s].a;
-    if f == 0 || NODES[f].kind != NodeKind::If {
-        return false;
-    }
-    let c = NODES[f].a;
-    NODES[c].kind == NodeKind::Ident && NODES[c].res == Res::Local && own_temp_local(NODES[c].y)
-}
-
-// (0.26.1, R5) Statement temporaries: each skipped prelude defer's
-// `__own_tf` and the scope it is in, (tf, scope) pairs. A temporary's
-// value drops at the end of that scope, as the defer ran (the end of its
-// statement, or of the block when a binding views it), not at the end of
-// the statement that makes it.
-static var TEMP_SCOPES: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The scope the temporary made by the statement temporary's block being
-// lowered drops in, -1 outside one.
-static var TV_SCOPE: i64 = -1;
-
-// The `__own_tf` local of a statement temporary's defer d (temp_defer).
-fn temp_flag(d: i64) -> i64 {
-    let s = child(NODES[d].a, 0);
-    NODES[NODES[NODES[s].a].a].y
-}
-
-// The scope where the temporary of statement temporary block b drops: the
-// scope of the defer its `__own_tf = true;` names, -1 when none is known.
-fn temp_scope(b: i64) -> i64 {
-    for i in 0..NODES[b].count {
-        let st = child(b, i);
-        if NODES[st].kind == NodeKind::ExprStmt && NODES[st].a != 0 && own_flag_write(NODES[st].a) {
-            let l = NODES[NODES[NODES[st].a].b].y;
-            if crate::places::front::ast_local_name(l) == SYM_TF {
-                var k = TEMP_SCOPES.len() - 2;
-                while k >= 0 {
-                    if TEMP_SCOPES[k] == l {
-                        let s = TEMP_SCOPES[k + 1];
-                        return if s < scope_depth() { s } else { -1 };
-                    }
-                    k -= 2;
-                }
-                return -1;
-            }
-        }
-    }
-    -1
 }
 
 // Schedules an entry at the end of scope s, below the scopes inside it.
@@ -2183,13 +2286,10 @@ fn lower_let(st: i64) {
         return;
     }
     let pk = NODES[pat].kind;
-    if pk == NodeKind::PatBind && own_temp_local(NODES[pat].x) {
-        return;
-    }
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
     let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);
-    let s = if keep { -1 } else { push_scope(SC_STMT, st) };
+    let s = if keep { -1 } else { push_scope(SC_STMT, st, STMT_HOME) };
     if pk == NodeKind::PatWild {
         if init != 0 {
             expr_into(init, -1, 0);
@@ -2203,31 +2303,20 @@ fn lower_let(st: i64) {
         } else {
             let borrowed = let_borrows(pat, init);
             let ir = user_local(l, pat, borrowed);
-            // (a statement temporary's value: in the scope of its
-            // prelude, R5)
-            var into = -1;
-            if TV_SCOPE >= 0 && crate::places::front::ast_local_name(l) == SYM_TV {
-                into = TV_SCOPE;
-                TV_SCOPE = -1;
-            }
             // (its storage begins first; its drop is registered once it
-            // holds its value, in the block's scope. A statement
-            // temporary made on some paths of the scope it drops in, an
-            // arm's, has no storage markers: its storage is the body's, as
-            // the own pass's `__own_tv`)
-            if into < 0 {
-                live(ir);
-                schedule_outer(s, EN_DEAD, ir);
-            }
+            // holds its value, in the block's scope)
+            live(ir);
+            schedule_outer(s, EN_DEAD, ir);
             if init != 0 {
+                // (a requires check's argument, `let ?aI = argI`: an
+                // argument, arg_operand)
+                let saved = LENT_HOME;
+                LENT_HOME = if !STMT_HOME && lent_branch(init) { temp_home() } else { -1 };
                 expr_into(init, ir, 0);
+                LENT_HOME = saved;
             }
             if !has_flag(ir, LF_BORROWED) && needs_drop(P_LOCALS[ir].ty) {
-                if into >= 0 {
-                    schedule_in(into, EN_DROP, ir);
-                } else {
-                    schedule_outer(s, EN_DROP, ir);
-                }
+                schedule_outer(s, EN_DROP, ir);
             }
         }
     } else {
@@ -2253,7 +2342,7 @@ fn schedule_outer(s: i64, kind: i64, v: i64) {
     let at = SCOPES[s * SW + 1];
     ENTRIES.push(0);
     ENTRIES.push(0);
-    var e = ENTRIES.len() / 2 - 1;
+    var e = ENTRIES.len() as i64 / 2 - 1;
     while e > at {
         ENTRIES[2 * e] = ENTRIES[2 * e - 2];
         ENTRIES[2 * e + 1] = ENTRIES[2 * e - 1];
@@ -2287,7 +2376,7 @@ fn let_borrows(pat: i64, init: i64) -> bool {
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
     // an operator's operand: a borrowed copy, as the own pass's let_drops)
     let text = SYMS[name].text;
-    text.len > 0 && text[0] == '='
+    text.len as i64 > 0 && text[0] == '='
 }
 
 // ---- The body ----
@@ -2305,9 +2394,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     SCOPES.clear();
     ENTRIES.clear();
     STATICS_SEEN.clear();
-    TEMP_SCOPES.clear();
     MOVES_SUSPECT = false;
-    TV_SCOPE = -1;
     UNIT_LOCAL = -1;
     let ret = fn_ret(f);
     new_local(ret, LF_RETURN, -1, 0);
@@ -2315,7 +2402,7 @@ pub fn build_body(f: i64, item: i64) -> bool {
     crate::places::ir::B_PARAMS = count;
     let entry = new_block();
     RET_BLOCK = new_block();
-    let body_scope = push_scope(SC_BODY, NODES[item].c);
+    let body_scope = push_scope(SC_BODY, NODES[item].c, true);
     // the parameters: _1.._n
     let keep = keep_params(f);
     for i in 0..count {
@@ -2458,7 +2545,7 @@ fn live_writes() {
         return;
     }
     var any = false;
-    for s in 0..P_STMTS.len() {
+    for s in 0..P_STMTS.len() as i64 {
         if moved_capture_flag(P_STMTS[s]) >= 0 {
             any = true;
             break;
@@ -2468,12 +2555,12 @@ fn live_writes() {
         return;
     }
     OLD_STMTS.clear();
-    for s in 0..P_STMTS.len() {
+    for s in 0..P_STMTS.len() as i64 {
         OLD_STMTS.push(P_STMTS[s]);
     }
     let n = block_count();
     // (the blocks' ranges before: entering a block resets its start)
-    let ranges = TMP_RANGES.len();
+    let ranges = TMP_RANGES.len() as i64;
     for b in 0..n {
         TMP_RANGES.push(block_start(b));
         TMP_RANGES.push(block_len(b));
@@ -2521,7 +2608,7 @@ fn live_writes() {
         let term = OLD_STMTS[start + len];
         terminate(term.kind, term.a, term.b, term.c, term.ops, term.nops, term.node);
     }
-    TMP_RANGES.truncate(ranges);
+    TMP_RANGES.truncate(len_arg(ranges));
 }
 
 static var TMP_RANGES: Vec<i64, Comp> = Vec::new_in(Comp {});

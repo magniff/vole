@@ -161,7 +161,7 @@ fn main(gpa: Gpa) {
     });
     println(f"two threads: {total}");
 
-    let n = thread::available_parallelism();
+    let n = thread::available_parallelism() as usize;
     let chunk = (xs.len() + n - 1) / n;
     let total = thread::scope(|s| {
         var handles: Vec<ScopedJoinHandle<i64>> = Vec::new_in(gpa);
@@ -421,10 +421,10 @@ fn main(gpa: Gpa) {
     let text = String::from_buf(input).unwrap();
     let all: Vec<str> = text.lines().collect_in(gpa);
     let lines = all.as_slice();
-    let workers = 3;
+    let workers: usize = 3;
 
     var results = thread::scope(|s| {
-        let (tx, rx) = mpsc::channel_in::<(i64, u64)>(gpa);
+        let (tx, rx) = mpsc::channel_in::<(usize, u64)>(gpa);
         for w in 0..workers {
             let tx = tx.clone();
             s.spawn(sink || {
@@ -436,7 +436,7 @@ fn main(gpa: Gpa) {
             });
         }
         drop(tx);
-        var got: Vec<(i64, u64)> = Vec::new_in(gpa);
+        var got: Vec<(usize, u64)> = Vec::new_in(gpa);
         for r in rx.iter() {
             got.push(r);
         }

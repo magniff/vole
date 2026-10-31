@@ -432,10 +432,17 @@ done
     echo "back::objfile::assemble_bytes"
     "$COMPILER" query callees crate::back::objfile::assemble_bytes --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
 } | sort -u >"$WORK/assembler"
+# (0.26.2) gen0 generates every function from its kept body
+# (gen_places_function; an atomic intrinsic's, gen_atomic_function); a
+# name that is gone fails here, not by checking less.
+GEN0_MAIN="gen0::gen::places::gen_places_function gen0::gen::gen_atomic_function back::objfile::asm_hand_over"
+for f in $GEN0_MAIN; do
+    "$COMPILER" query callees "crate::$f" >/dev/null 2>&1 \
+        || { echo "threads-writes: no function $f (tests/threads_writes.sh GEN0_MAIN)"; exit 1; }
+done
 {
-    echo "gen0::gen::gen_function"
-    echo "back::objfile::asm_hand_over"
-    "$COMPILER" query callees crate::gen0::gen::gen_function crate::back::objfile::asm_hand_over --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+    printf '%s\n' $GEN0_MAIN
+    "$COMPILER" query callees $(printf 'crate::%s ' $GEN0_MAIN) --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
 } | sort -u >"$WORK/gen0"
 awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
     BEGIN {

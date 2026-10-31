@@ -72,7 +72,7 @@ one `write`. The colour of a dead cell is an f-string appended with
 
 ```tach
 let color = 255 - cell.age as i64;
-out.push_fmt(f"\x1B[48;2;{color / 2};{color / 5};{color}m ");
+out.push_fmt("\x1B[48;2;{};{};{color}m ", color / 2, color / 5);
 ```
 
 ## Language features

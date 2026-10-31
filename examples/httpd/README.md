@@ -105,19 +105,26 @@ its NUL.
 and sent with one `write` loop:
 
 ```tach
-h.push_fmt(f"HTTP/1.0 {status}\r\nContent-Type: {content_type}");
+h.push_fmt("HTTP/1.0 {status}\r\nContent-Type: {content_type}");
 if let Some(n) = length {
-    h.push_fmt(f"\r\nContent-Length: {n}");
+    h.push_fmt("\r\nContent-Length: {n}");
 }
 ```
 
-**Resources freed on every path.** `defer` closes each descriptor when
-its block ends, whichever `return` is taken; the buffers (a `Path` holds
-one) are dropped at the end of their scope, so they need no `free`:
+**Resources freed on every path.** A guard, `Fd` (or `Dir`), holds each
+descriptor, and its `Drop` closes it when its block ends, whichever
+`return` is taken; the buffers (a `Path` holds one) are dropped at the
+end of their scope too, so they need no `free`:
 
 ```tach
+struct Fd { fd: i32 }
+
+impl Drop for Fd {
+    fn drop(inout self) { unsafe { close(self.fd) }; }
+}
+
 fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
-    defer unsafe { close(fd) };
+    let _connection = Fd { fd };
     ...
     let path = Path::join(root, url, gpa);   // dropped when the function returns
 ```
@@ -131,6 +138,6 @@ extension) are ordinary safe code over slices, with `match` on bytes and
 - `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `volec guide c-interop`
 - `unsafe fn` with a stated contract, `unsafe` blocks, raw pointers: `volec guide unsafe`
 - inline modules (`mod sys { ... }`), `pub`, `use super::`: `volec guide modules`
-- `defer` for descriptors, `Buf` and its drop: `volec guide memory`
+- guards with `Drop` for descriptors, `Buf` and its drop: `volec guide memory`
 - `Result`, `Option`, `if let`: `volec guide conversions`
 - f-strings, `push_fmt`, `eprintln`: `volec guide formatting`

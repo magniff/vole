@@ -73,7 +73,171 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 | 0.26.0 | `v0.26.0` | 0.25.5 | aarch64-macos | the first step to Rust's surface: the places IR (places, moves, drop flags) at `check` behind `--places`; struct fields private unless `pub` (`field.private`, `fix --only pub`; `#[sealed]` retired); shaders as `embed wgsl` blocks, checked at `check` and in the LSP |
 | 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
+| 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.26.2
+
+`usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.
+
+`where`, `impl Trait`, visibility and format literals (text262; grammar.md, "Items", "Modules", "Formatting"):
+
+- `where P: B + C, Q: D` after a function's result type, a struct's,
+  enum's or trait's generics, or before an impl's `{`: the bounds join
+  the parameters' inline ones. A bound on a type that is not a parameter
+  of the item (`I::Item: Display`) is `where.unsupported`. `where` is a
+  keyword (it was reserved).
+- Argument-position `impl Trait`, `fn show(x: impl Display)` (also `impl
+  Fn(i64) -> i64`, `inout impl FnMut(i64)`): a hidden type parameter,
+  named `impl Display` in messages; a turbofish gives only the written
+  parameters. Anywhere else it is `type.impl-position`.
+- `volec fmt` lays `where` out as a signature's continuation.
+- `pub(crate)`, `pub(super)`, `pub(self)` and `pub(in path)` on items,
+  fields, `use` and `mod`, as Rust's; `pub(in path)` naming no module
+  around its item is `vis.path`. A private or restricted item used
+  outside is `item.private` (it was a `type error`); it and
+  `field.private` say where a restricted one is visible. `fix --only pub`
+  widens a restriction to `pub(crate)` (and still writes plain `pub` on a
+  private item: compiler/src may write `pub(crate)` from 0.26.3);
+  `query context` and hover show a field's restriction.
+- Format literals, Rust's `format!` without the `!`: a plain literal that
+  is the first argument of `print`, `println`, `eprint`, `eprintln`,
+  `format_args` (new: Rust's `format_args!`), `format_in` (the allocator
+  last), `push_fmt`, `Fmt::write`, `panic`, assert's message or a
+  contract's `else` is a format string: `println("{} {x:>4}", a.b)`,
+  positional and named (`name = e`) arguments, `{0}`, `{name}`, `N$`,
+  `.*`, and Rust's whole spec (fill, `^`, `+`, `#`, `o`, `e`, `p`), byte
+  for byte rustc's. The errors `format.syntax`, `format.spec`,
+  `format.args`, `format.expr-hole` (its fix moves the expression to an
+  argument). `panic("bad {x}")` formats on the stack, so `#[no_alloc]`
+  code may. **Breaking:** such a literal's braces are holes now
+  (`println("{")` is `format.syntax`, `warning[format]` is gone); `fix
+  --only fstring` doubles them. f-strings stay, with no warning, until
+  0.26.3. `{:#?}` is `format.spec` "not in this release".
+- The tools see a format string's holes as an f-string's: `query refs`,
+  `refactor rename` (a local, an item, a width's `name$`), `query type`
+  and hover; `volec fmt` keeps a literal's bytes.
+- `volec fix --only fstring`, the migration, run once on code written
+  before 0.26.2: an f-string at a format position loses its `f` (a name
+  hole stays, the other holes' expressions become its arguments, in
+  order), one anywhere else becomes `format_args(..)`, 0.17's
+  `b.push_str(f"..")` becomes `push_fmt`, and a plain literal at a
+  format position gets its braces doubled. It refuses nothing. The
+  guide's examples are migrated; compiler/src, std, the examples and the
+  tests are not yet (their migrated copies check clean).
+- Rust's print macros get the call without the `!` as their help
+  (`println!("{} {x:?}", a)`: write `println("{} {x:?}", a)`; `format!`
+  is `format_in(.., gpa)`, `write!(f, ..)` `f.write(..)`).
+- **Breaking:** `defer` is removed (Rust has none): `defer e;` and
+  `defer { .. }` are `syntax.defer` (`explain` shows the guard that
+  replaces it, a struct whose `Drop` does the work, alive to the end of
+  the scope; `defer` stays a keyword so the error can name it). The
+  examples close their descriptors and directories with guards (`Fd`,
+  `Dir`, openhtop's `Restore`). `fix --values` no longer deletes `defer
+  v.free()`.
+- `edit`, `fix`, `fmt` and `undo` write a file reached through a symlink
+  through it: the link stays a link.
+
+- `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Indexing takes any integer type.
+- **Breaking:** std's lengths, indices and counts are `usize` (`len()`,
+  `capacity()`, `find`'s position, `Vec`'s and slices' indices), and so is
+  a slice's or an array's `.len()`. `volec fix --only usize` writes the
+  conversions the errors name; the examples, tests/run, the transcripts,
+  the guide and the Book are migrated so. The new warning
+  `num.unsigned-cmp` names a comparison a `usize` cannot fail (`i >= 0`):
+  it found a countdown in bigint that never ended. std's UTF-8 counts,
+  `splitn`/`replacen`'s and the SIMD loads' index stay `i64` until the
+  next std migration.
+- Rust's overflow checks are measured, not on: `$VOLE_PROTO_OVF` builds
+  them (checks at -O0, wrapping at -O1 and up, decision 6 as revised);
+  by default the code is unchanged.
+- Float to integer `as` saturates for every target type, as Rust's: `300.7 as u8 == 255`, `70000.0 as u16 == 65535`, `-1.0 as u64 == 0` (they were 44, 4464 and `u64::MAX`); NaN is 0. The same in constants, the folder, both code generators and x86-64.
+
+Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
+"Embedded blocks"; `guide gpu#one-module-per-kernel`,
+`gpu#shared-constants-and-structs`):
+
+- Parts: `embed wgsl K with A, shaders::B { .. }` makes K's module of
+  its parts' texts (each part's own parts first, each once), then its
+  own. A part is checked only inside the blocks that use it and has no
+  `src` or entry points of its own (`embed.part_use`); `embed.with` (a
+  name that is no block, const or struct), `embed.cycle`; a binding two
+  parts declare is `wgsl.binding`, naming both.
+- A block's `.wgsl` file is a file of the program: its errors are at
+  `x.wgsl:L:C`, published by the LSP to its own URI, and `query grep`
+  finds its lines; the code cache's version changes (10).
+- `#[repr(wgsl)]` structs have WGSL's layout (`[f32; 3]` a `vec3<f32>`,
+  16-aligned), and `with` names them and `const`s of literal values: the
+  compiler writes their WGSL into the module (`gpu.repr` for a field
+  WGSL cannot share).
+- Check-time GPU diagnostics in one function's `let`s
+  (front/embed/gpu_lint.vl): `gpu.entry` for an entry point named by a
+  string, `gpu.layout` for a bind group entry the shader's group has
+  not or of another kind, `gpu.usage` for a buffer of a constant usage
+  used without its flag (`try:` the edit), and the warning
+  `gpu.unwritten` for a uniform buffer nothing in the function writes.
+- The examples' shaders are blocks: fluid2d's 17 constants are 5 parts
+  and 12 kernels with a `#[repr(wgsl)] GpuParams`, and galaga, galaxy,
+  life and nes; so are the guide's 20.
+
+The places IR, the own pass's drops' end (placesir262a; places-ir.md §5,
+step 7; compiler/src/places/README.md):
+
+- The builder makes its own statement temporaries and assignment drops,
+  and drops the old value at every owned assignment, wherever it stands
+  (an arm's value, inside an expression), as Rust does: the own pass's
+  desugaring leaked it there.
+- A contract's and an assert's condition in the IR, a branch per
+  conjunct, each evaluated exactly once on every path, as `&&` does; the
+  failing path's form is `intrinsic contract_check(false, SITE, VALUE..)`
+  and the conjunct.
+- Drop shims are found by the type with its distinct types erased (R11:
+  `Option<(str, Matches)>::unwrap` found none); `--verify-places` checks
+  every drop that runs finds its shim.
+- The own pass's drop half is deleted (step 7): the implicit defers and
+  their placement at the checker's call sites, the statement
+  temporaries' flags and defers, the assignment desugaring,
+  `finish_drops` and the walk's drop recording, glue.vl's AST glue and
+  `--no-places`; the IR places every drop. The own walk keeps the
+  temporaries' hidden `let`s for its view checks and takes its drop
+  events from the scopes; own.drop_view is reported on its own.
+- A check builds the bodies that may drop (no `--places` needed, which
+  now asks nothing more): their drop edges give the effects and `query
+  refs`/`callees` the drops' calls, each named by the value dropped
+  (`'l' at a.vl:13:9 calls 'Loud::drop'`); a value moved out is no
+  longer counted as dropped.
+
+The places IR, the AST lowerings' end (placesir262b; places-ir.md §8
+step 8):
+
+- `--check-unsafe` from the IR: a `*` of a raw pointer checks its
+  pointee, an element of one (`p[i]`) the element, a slice of one its
+  bytes, each at the statement's position (the 9 cases' reports are
+  unchanged). No function falls back to the AST lowering any more.
+- No function is lowered from the AST (step 8a): `lower_function` is
+  gone and gen0's function walk is an atomic intrinsic's body only;
+  `VOLE_LOWER` is gone (from the code cache's key too), and a build
+  under `--no-places` is an error. compiler/src's objects are
+  byte-identical before and after, at -O0 and -O2.
+- A contract's or an assert's failing path from the IR (step 8b), in
+  both generators: its site and its shown values are the IR's operands
+  (`contract_assert_conj_side_effect` passes: a conjunct is evaluated
+  once). Then the AST walks are deleted: statements, blocks and the
+  defers, `if`, the loops, `match` and its patterns, assignments,
+  operators, places, aggregates, variants and slicing, in both
+  generators (2,267 lines net; `middle/lower/matching.vl` and both
+  `control.vl`s gone). What the IR does not lower itself: a literal, a
+  name or a check's site of an operand, and the calls, intrinsics and
+  vector operations it drives with their operands bound.
+- A hello world's compile cost back to before the flip (1.12x of 0.25.5
+  to 1.08x): the calling conventions' classification no longer walks a
+  large array's every element (std's 4096-byte print buffer cost 1.5M
+  instructions in one 7-instruction function), and a function's entry
+  block starts with its parameters again, so interprocedural constants
+  reach them (println's length into fmt_str_fd, whose long-string loop
+  then folds away). std_heavy: -2.1%.
+- tests/run.sh builds every other case with `--verify-places` (by its
+  name's cksum; `VOLE_VERIFY_EVERY=N`: every N-th, 0: none).
 
 ### What's new in 0.26.1
 

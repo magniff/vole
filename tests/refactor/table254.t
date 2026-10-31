@@ -20,7 +20,7 @@ $ refactor table ITEMS --dry-run
 +use crate::items::{ITEMS, add_item, add_pair, drop_last, drop_some, reset_items, total};
 @@ -30 +30 @@
 -    println(f"{ITEM_COUNT} {total()} {crate::items::PLACES} {crate::count::count()}");
-+    println(f"{ITEMS.len()} {total()} {crate::items::PLACES} {crate::count::count()}");
++    println(f"{ITEMS.len() as i64} {total()} {crate::items::PLACES} {crate::count::count()}");
 --- a/count.vl
 +++ b/count.vl
 @@ -2 +1,0 @@
@@ -30,7 +30,7 @@ $ refactor table ITEMS --dry-run
 +
 @@ -5 +6 @@
 -    ITEM_COUNT * 10
-+    ITEMS.len() * 10
++    ITEMS.len() as i64 * 10
 --- a/items.vl
 +++ b/items.vl
 @@ -2 +1,0 @@
@@ -47,31 +47,31 @@ $ refactor table ITEMS --dry-run
 -        ITEMS = grow(ITEMS, ITEM_COUNT, &ITEM_CAP);
 -        ITEMS[ITEM_COUNT] = Item { v, next: ITEM_COUNT + 1 };
 -        PLACES += ITEM_COUNT * 2 + (ITEM_COUNT + 1);
-+        ITEMS.push(Item { v, next: ITEMS.len() + 1 });
-+        PLACES += (ITEMS.len() - 1) * 2 + ITEMS.len();
++        ITEMS.push(Item { v, next: ITEMS.len() as i64 + 1 });
++        PLACES += (ITEMS.len() as i64 - 1) * 2 + ITEMS.len() as i64;
 @@ -22,2 +20 @@
 -    ITEM_COUNT += 1;
 -    ITEM_COUNT - 1
-+    ITEMS.len() - 1
++    ITEMS.len() as i64 - 1
 @@ -29,4 +26,2 @@
 -        ITEMS = grow(ITEMS, ITEM_COUNT, &ITEM_CAP);
 -        let n = ITEM_COUNT;
 -        ITEMS[n] = Item { v, next: -1 };
 -        ITEM_COUNT += 1;
-+        let n = ITEMS.len();
++        let n = ITEMS.len() as i64;
 +        ITEMS.push(Item { v, next: -1 });
 @@ -38 +33 @@
 -    ITEM_COUNT = 0;
 +    ITEMS.clear();
 @@ -42 +37 @@
 -    ITEM_COUNT -= k;
-+    ITEMS.truncate(ITEMS.len() - k);
++    ITEMS.truncate(ITEMS.len() - k as usize);
 @@ -46 +41 @@
 -    ITEM_COUNT -= k - 1;
-+    ITEMS.truncate(ITEMS.len() - (k - 1));
++    ITEMS.truncate(ITEMS.len() - (k - 1) as usize);
 @@ -51 +46 @@
 -    for i in 0..ITEM_COUNT {
-+    for i in 0..ITEMS.len() {
++    for i in 0..ITEMS.len() as i64 {
 --- a/report.vl
 +++ b/report.vl
 @@ -2 +2 @@
@@ -79,10 +79,10 @@ $ refactor table ITEMS --dry-run
 +use crate::items::ITEMS;
 @@ -6 +6 @@
 -    for i in 0..ITEM_COUNT {
-+    for i in 0..ITEMS.len() {
++    for i in 0..ITEMS.len() as i64 {
 @@ -9 +9 @@
 -    s + crate::items::ITEM_COUNT * 100 + unsafe { crate::items::ITEMS[0].v }
-+    s + crate::items::ITEMS.len() * 100 + unsafe { crate::items::ITEMS[0].v }
++    s + crate::items::ITEMS.len() as i64 * 100 + unsafe { crate::items::ITEMS[0].v }
 note edit.imports: added the imports the new text needs (fix --only imports)
 ## The increment before the store (at a local set before it): reads
 ## between them one more.
@@ -91,7 +91,7 @@ $ refactor table MARKS --dry-run
 +++ b/main.vl
 @@ -31 +31 @@
 -    println(f"{crate::marks::MARK_COUNT} {last()} {crate::marks::seen(1)}");
-+    println(f"{crate::marks::MARKS.len()} {last()} {crate::marks::seen(1)}");
++    println(f"{crate::marks::MARKS.len() as i64} {last()} {crate::marks::seen(1)}");
 --- a/marks.vl
 +++ b/marks.vl
 @@ -2 +1,0 @@
@@ -110,12 +110,12 @@ $ refactor table MARKS --dry-run
 -        MARK_COUNT += 1;
 -        let seen = MARK_COUNT - 1 + MARK_COUNT * 10;
 -        MARKS[id] = Mark { at, seen: seen + MARK_COUNT };
-+        let id = MARKS.len();
-+        let seen = MARKS.len() + (MARKS.len() + 1) * 10;
-+        MARKS.push(Mark { at, seen: seen + (MARKS.len() + 1) });
++        let id = MARKS.len() as i64;
++        let seen = MARKS.len() as i64 + (MARKS.len() as i64 + 1) * 10;
++        MARKS.push(Mark { at, seen: seen + (MARKS.len() as i64 + 1) });
 @@ -25 +22 @@
 -    unsafe { MARKS[MARK_COUNT - 1].at }
-+    unsafe { MARKS[MARKS.len() - 1].at }
++    unsafe { MARKS[MARKS.len() as i64 - 1].at }
 note edit.imports: added the imports the new text needs (fix --only imports)
 ## A grow in `if TOK_COUNT >= TOK_CAP { ... }`: the `if` goes with it;
 ## `TOKS = reserve(TOKS, &TOK_CAP, n)` (room for n in all) is a Vec's
@@ -131,8 +131,8 @@ $ refactor table TOKS --dry-run
 @@ -32,2 +32,2 @@
 -    println(f"{TOK_COUNT} {crate::tokens::tok(99)} {crate::report::report()}");
 -    println(f"{crate::tokens::try_toks(5)} {TOK_COUNT}");
-+    println(f"{TOKS.len()} {crate::tokens::tok(99)} {crate::report::report()}");
-+    println(f"{crate::tokens::try_toks(5)} {TOKS.len()}");
++    println(f"{TOKS.len() as i64} {crate::tokens::tok(99)} {crate::report::report()}");
++    println(f"{crate::tokens::try_toks(5)} {TOKS.len() as i64}");
 --- a/tokens.vl
 +++ b/tokens.vl
 @@ -2 +1,0 @@
@@ -147,7 +147,7 @@ $ refactor table TOKS --dry-run
 +
 @@ -10 +9 @@
 -    TOKS = reserve(TOKS, &TOK_CAP, n + 1);
-+    TOKS.reserve(n + 1 - TOKS.len());
++    TOKS.reserve((n + 1 - TOKS.len() as i64).max(0) as usize);
 @@ -15,4 +14 @@
 -        if TOK_COUNT >= TOK_CAP {
 -            TOKS = grow(TOKS, TOK_COUNT, &TOK_CAP);
@@ -158,12 +158,12 @@ $ refactor table TOKS --dry-run
 -    TOK_COUNT += 1;
 @@ -30 +25 @@
 -    let mark = TOK_COUNT;
-+    let mark = TOKS.len();
++    let mark = TOKS.len() as i64;
 @@ -34,2 +29,2 @@
 -    let added = TOK_COUNT - mark;
 -    TOK_COUNT = mark;
-+    let added = TOKS.len() - mark;
-+    TOKS.truncate(mark);
++    let added = TOKS.len() as i64 - mark;
++    TOKS.truncate(mark as usize);
 note edit.imports: added the imports the new text needs (fix --only imports)
 ## Refused, each use listed: a pointer into the table, the table passed
 ## and assigned, the capacity read, the count written, a call between the

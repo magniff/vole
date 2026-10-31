@@ -26,18 +26,18 @@ manager), Windows, a stable language or a track record.
 // Quicksort, in place: `inout` lends the slice for writing, nothing is copied.
 #[no_alloc] // checked: sorting allocates nothing
 fn quicksort<T: Ord>(xs: inout [T]) {
-    if xs.len() <= 1 { return; }
+    if xs.len <= 1 { return; }
     let p = partition(&xs);
     quicksort(&xs[0..p]); // the two halves are disjoint places
-    quicksort(&xs[p + 1..xs.len()]);
+    quicksort(&xs[p + 1..xs.len]);
 }
 
-fn partition<T: Ord>(xs: inout [T]) -> i64
-    ensures 0 <= result && result < xs.len()
+fn partition<T: Ord>(xs: inout [T]) -> usize
+    ensures result < xs.len
 {
-    let last = xs.len() - 1;
+    let last = xs.len - 1;
     xs.swap(last / 2, last); // the middle element is the pivot
-    var store = 0;
+    var store: usize = 0;
     for i in 0..last {
         if xs[i] < xs[last] {
             xs.swap(i, store);
@@ -52,7 +52,7 @@ fn main(gpa: Gpa) {
     var v: Vec<i64> = Vec::new_in(gpa); // the allocator is explicit
     for x in [5, 3, 9, 1, 4, 8, 2, 7, 6] { v.push(x); }
     quicksort(&v); // & marks what the callee may change
-    println(f"{v:?}"); // [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    println("{v:?}"); // [1, 2, 3, 4, 5, 6, 7, 8, 9]
 }
 ```
 
@@ -74,8 +74,8 @@ way, but it means different things:
 | effects | none | inferred: `alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`, `thread`, `sync`, `tls`, CPU features; `query effects --why`; `#[pure]`, `#[no_alloc]`, `#[effects(..)]` are checked bounds |
 | contracts | crates | `requires`, `ensures`: checked at run time in every build, and used by the optimizer |
 | arithmetic | overflow panics in debug, `x / 0` panics | integers always wrap, `x / 0 == 0`, indexing checked: no undefined behaviour in safe code; raw `*T` and C calls need `unsafe` |
-| macros, imports | `macro_rules!`, `use x::*` | neither: `println(f"{x}")` is a function; every name is declared, imported by name or written with its path |
-| generics | monomorphized or `dyn`; `where` | monomorphized only: no `dyn`, no `where`; lengths are `i64`, text `str` or `[u8]` |
+| macros, imports | `macro_rules!`, `use x::*` | neither: `println("{x}")` is a function; every name is declared, imported by name or written with its path |
+| generics | monomorphized or `dyn`; `where` | monomorphized only: no `dyn`, no `where`; lengths are `usize`, text `str` or `[u8]` |
 | C | `extern "C"`, `#[repr(C)]` | the same, and `import "stdio.h" as c;` reads a header into `c::` |
 
 The whole mapping is `volec guide rust`; the grammar is

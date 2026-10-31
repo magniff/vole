@@ -5,7 +5,7 @@
 use crate::back::emit::machine::stays_canonical;
 use crate::back::mc_arm64::{ma_f, ma_lea, ma_normalize, ma_r, ma_rr, ma_rrr, ma_w, o_back_imm};
 use crate::base::BUFS;
-use crate::front::types::{TY_F64, TY_U32, TY_U64, int_bits, is_float, is_signed};
+use crate::front::types::{TY_F64, TY_U32, int_bits, is_float, is_signed};
 use crate::gen0::arm64::{a64_condition, a64_label, a64_load_imm};
 use crate::gen0::target::{emit_label, ins, log2, new_label, o, oi, on};
 use crate::middle::ctx::FnCtx;
@@ -276,6 +276,202 @@ pub fn ma_cmp_branch(cx: sink *FnCtx, op: Cond, ty: i64, a: i64, b: i64, b_is_im
     on(cx);
 }
 
+// (0.26.2, a prototype) OVF imm (middle/ir) on a and b: sets the flags so
+// that ovf_cond(imm, true) holds when the operation overflows its type.
+// 64 bits: adds' flags, or the high half of the product against the sign
+// of the low one; narrower types: the result in 64 bits (x16) against its
+// own extension (x17).
+fn ma_ovf_flags(cx: sink *FnCtx, imm: i64, a: i64, b: i64) {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    let bits = int_bits(ty);
+    let signed = is_signed(ty);
+    if bits == 64 {
+        if op == Add {
+            ma_rr(cx, c"cmn", a, b);
+        } else if op == Sub {
+            ma_rr(cx, c"cmp", a, b);
+        } else if op == Neg {
+            // 0 - a overflows when a is MIN: when a - 1 does.
+            ma_compare_imm(cx, a, 1);
+        } else if signed {
+            ma_rrr(cx, c"mul", 16, a, b);
+            ma_rrr(cx, c"smulh", 17, a, b);
+            ins(cx, c"cmp x17, x16, asr #63");
+        } else {
+            ma_rrr(cx, c"umulh", 17, a, b);
+            ins(cx, c"cmp x17, #0");
+        }
+        return;
+    }
+    if op == Add {
+        ma_rrr(cx, c"add", 16, a, b);
+    } else if op == Sub {
+        ma_rrr(cx, c"sub", 16, a, b);
+    } else if op == Neg {
+        ma_rr(cx, c"neg", 16, a);
+    } else {
+        ma_rrr(cx, c"mul", 16, a, b);
+    }
+    if signed {
+        ins(cx, if bits == 8 { c"sxtb x17, w16" } else if bits == 16 { c"sxth x17, w16" } else {
+            c"sxtw x17, w16"
+        });
+    } else {
+        ins(cx, if bits == 8 { c"and x17, x16, #255" } else if bits == 16 {
+            c"and x17, x16, #65535"
+        } else {
+            c"and x17, x16, #4294967295"
+        });
+    }
+    ins(cx, c"cmp x16, x17");
+}
+
+// The condition that holds after ma_ovf_flags when the operation
+// overflows (`overflow`), or when it does not.
+fn ovf_cond(imm: i64, overflow: bool) -> *u8 {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    if int_bits(ty) == 64 && op != Mul {
+        if is_signed(ty) || op == Neg {
+            return if overflow { c"vs" } else { c"vc" };
+        }
+        if op == Add {
+            return if overflow { c"hs" } else { c"lo" };
+        }
+        return if overflow { c"lo" } else { c"hs" };
+    }
+    if overflow { c"ne" } else { c"eq" }
+}
+
+// (0.26.2, a prototype) d = whether OVF imm on a and b overflows.
+pub fn ma_ovf(cx: sink *FnCtx, imm: i64, d: i64, a: i64, b: i64) {
+    ma_ovf_flags(cx, imm, a, b);
+    o(cx, c"    cset ");
+    ma_r(cx, d);
+    o(cx, c", ");
+    o(cx, ovf_cond(imm, true));
+    on(cx);
+}
+
+// (0.26.2, a prototype) Jumps to `label` when OVF imm on a and b overflows
+// (`if_overflow`), or when it does not.
+pub fn ma_ovf_branch(cx: sink *FnCtx, imm: i64, a: i64, b: i64, if_overflow: bool, label: i64) {
+    ma_ovf_flags(cx, imm, a, b);
+    o(cx, c"    b.");
+    o(cx, ovf_cond(imm, if_overflow));
+    o(cx, c" ");
+    a64_label(cx, label);
+    on(cx);
+}
+
+// (0.26.2, a prototype) Whether OVF imm can take its flags from the
+// operation it checks (ma_ovf_op): 32- and 64-bit additions and
+// subtractions, 64-bit signed multiplications.
+pub fn ovf_fusable(imm: i64) -> bool {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    let bits = int_bits(ty);
+    (op == Add || op == Sub) && (bits == 32 || bits == 64)
+        || op == Mul && bits == 64 && is_signed(ty)
+}
+
+// The condition that holds after ma_ovf_op when its operation overflows
+// (`overflow`), or when it does not.
+fn ovf_fused_cond(imm: i64, overflow: bool) -> *u8 {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    if op == Mul {
+        return if overflow { c"ne" } else { c"eq" };
+    }
+    if is_signed(ty) {
+        return if overflow { c"vs" } else { c"vc" };
+    }
+    if op == Add {
+        return if overflow { c"hs" } else { c"lo" };
+    }
+    if overflow { c"lo" } else { c"hs" }
+}
+
+// Register r, written w<n> when `w32`.
+fn ma_ovf_reg(cx: sink *FnCtx, r: i64, w32: bool) {
+    if w32 { ma_w(cx, r); } else { ma_r(cx, r); }
+}
+
+// (0.26.2, a prototype) d = a <op> b, the operation OVF imm checks (one
+// ovf_fusable says), setting the flags for ma_ovf_flag_branch: adds or subs
+// (on the w registers for 32 bits), or for a multiplication the high half
+// of the product against the sign of the low one.
+pub fn ma_ovf_op(cx: sink *FnCtx, imm: i64, d: i64, a: i64, b: i64) {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    if op == Mul {
+        // The high half first: d may be a or b.
+        ma_rrr(cx, c"smulh", 17, a, b);
+        ma_rrr(cx, c"mul", d, a, b);
+        o(cx, c"    cmp x17, ");
+        ma_r(cx, d);
+        o(cx, c", asr #63");
+        on(cx);
+        return;
+    }
+    let w32 = int_bits(ty) == 32;
+    o(cx, if op == Add { c"    adds " } else { c"    subs " });
+    ma_ovf_reg(cx, d, w32);
+    o(cx, c", ");
+    ma_ovf_reg(cx, a, w32);
+    o(cx, c", ");
+    ma_ovf_reg(cx, b, w32);
+    on(cx);
+    if w32 && is_signed(ty) {
+        ma_normalize(cx, d, ty);
+    }
+}
+
+// (0.26.2, a prototype) ma_ovf_op with an immediate b: false when it does
+// not encode (a multiplication; an addition or subtraction of more than 12
+// bits, or of a negative amount to an unsigned type).
+pub fn ma_ovf_op_imm(cx: sink *FnCtx, imm: i64, d: i64, a: i64, value: i64) -> bool {
+    let op = (imm & 255) as Op;
+    let ty = imm >> 8;
+    if op == Mul {
+        return false;
+    }
+    var amount = value;
+    var subtract = op == Sub;
+    if amount < 0 && amount > -4096 && is_signed(ty) {
+        // a + -k overflows when a - k does.
+        amount = 0 - amount;
+        subtract = !subtract;
+    }
+    if amount < 0 || amount >= 4096 {
+        return false;
+    }
+    let w32 = int_bits(ty) == 32;
+    o(cx, if subtract { c"    subs " } else { c"    adds " });
+    ma_ovf_reg(cx, d, w32);
+    o(cx, c", ");
+    ma_ovf_reg(cx, a, w32);
+    o(cx, c", #");
+    oi(cx, amount);
+    on(cx);
+    if w32 && is_signed(ty) {
+        ma_normalize(cx, d, ty);
+    }
+    true
+}
+
+// (0.26.2, a prototype) Jumps to `label` when the operation ma_ovf_op (or
+// ma_ovf_op_imm) emitted for OVF imm overflowed (`if_overflow`), or when it
+// did not.
+pub fn ma_ovf_flag_branch(cx: sink *FnCtx, imm: i64, if_overflow: bool, label: i64) {
+    o(cx, c"    b.");
+    o(cx, ovf_fused_cond(imm, if_overflow));
+    o(cx, c" ");
+    a64_label(cx, label);
+    on(cx);
+}
+
 pub fn ma_branch_bool(cx: sink *FnCtx, r: i64, if_nonzero: bool, label: i64) {
     o(cx, if if_nonzero { c"    cbnz " } else { c"    cbz " });
     ma_r(cx, r);
@@ -342,26 +538,36 @@ pub fn ma_conv(cx: sink *FnCtx, from: i64, to: i64, d: i64, src: i64) {
             ma_r(cx, d);
             o(cx, c", x17, eq\n");
         }
-    } else if to != TY_U64 {
+    } else if is_signed(to) {
         o(cx, c"    fcvtzs ");
         ma_r(cx, d);
         o(cx, c", ");
         ma_f(cx, src, from);
         on(cx);
     } else {
-        // d = value >= 2^63 ? fcvtzu(value) : fcvtzs(value); fcvtzs gives
-        // INT64_MAX exactly for those values (no smaller float rounds to
-        // it), the one value whose increment overflows.
-        o(cx, c"    fcvtzs x16, ");
+        // (0.26.2) Unsigned, as Rust's `as`: fcvtzu saturates at 0 and at
+        // the maximum of its register (NaN gives 0); u8 and u16 then at
+        // their own maximum.
+        o(cx, c"    fcvtzu ");
+        if int_bits(to) == 64 {
+            ma_r(cx, d);
+        } else {
+            ma_w(cx, d);
+        }
+        o(cx, c", ");
         ma_f(cx, src, from);
         on(cx);
-        o(cx, c"    fcvtzu x17, ");
-        ma_f(cx, src, from);
-        on(cx);
-        ins(cx, c"cmn x16, #1");
-        o(cx, c"    csel ");
-        ma_r(cx, d);
-        o(cx, c", x17, x16, vs\n");
+        if int_bits(to) < 32 {
+            a64_load_imm(cx, 16, if int_bits(to) == 8 { 255 } else { 65535 });
+            o(cx, c"    cmp ");
+            ma_r(cx, d);
+            o(cx, c", x16\n");
+            o(cx, c"    csel ");
+            ma_r(cx, d);
+            o(cx, c", ");
+            ma_r(cx, d);
+            o(cx, c", x16, ls\n");
+        }
     }
     ma_normalize(cx, d, to);
 }

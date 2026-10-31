@@ -6,9 +6,9 @@
 use crate::front::types::{TY_BOOL, TY_I64, TY_U64, int_bits, is_signed};
 use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{address_base, params_disjoint};
-use crate::middle::ir::{Cond, ir_val};
+use crate::middle::ir::{Cond, Op, ir_val};
 use crate::middle::ir::Op::{Add, Cmp, Or, Store};
-use crate::middle::loops::invariant_in;
+use crate::middle::loops::{invariant_in, loop_contains};
 use crate::middle::vectorize::VEC_MAX_CHECKS;
 use crate::middle::vectorize::build::{and_into, append, cmp, eval_at, konst};
 use crate::middle::vectorize::legality::{NONAFFINE, coef, coef_wrt};
@@ -45,6 +45,163 @@ pub fn record_check(cx: sink *FnCtx, l: i64, b: i64, next: i64) -> bool {
         cx.v_checks.push(idx);
         cx.v_checks.push(len);
         true
+    }
+}
+
+// (0.26.2, a prototype) The kinds of the overflow checks in V_OVFS: not yet
+// known; of values every lane shares, exactly affine in the counter (tested
+// at the first and the last iteration, before the loop: ovf_tests); of
+// lanes (their overflow accumulated, tested after the vector loop); of a
+// reduction's own step (its addends' magnitudes accumulated, bounded after
+// the vector loop); kept in every copy (the unroller's).
+pub const OVK_NEW: i64 = 0;
+pub const OVK_UNIFORM: i64 = 1;
+pub const OVK_LANE: i64 = 2;
+pub const OVK_RED: i64 = 3;
+pub const OVK_KEEP: i64 = 4;
+// (the unroller's: a step of a reduction split speculatively)
+pub const OVK_STEP: i64 = 5;
+const VEC_MAX_OVFS: i64 = 16;
+
+// (0.26.2, a prototype) Records the overflow check ending block b of loop
+// l (into V_OVFS, of kind OVK_NEW), whose way on is `next`, the other way
+// an unreachable exit (its first way): false unless the check is an OVF whose holding
+// leaves the loop.
+pub fn record_ovf(cx: sink *FnCtx, l: i64, b: i64, next: i64) -> bool {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in record_check.
+    // SAFETY: b is a block of loop l and its condition an instruction of the
+    // function entered.
+    unsafe {
+        let c = ir_val(cx, cx.blocks[b].cond);
+        if c == 0 || cx.insts[c].op != Op::Ovf || next != cx.blocks[b].s1
+            || cx.v_ovfs.count >= 3 * VEC_MAX_OVFS || !loop_contains(cx, l, cx.insts[c].block) {
+            return false;
+        }
+        cx.v_ovfs.push(c);
+        cx.v_ovfs.push(OVK_NEW);
+        // (the block, until a reduction's index replaces it: classify_ovf)
+        cx.v_ovfs.push(b);
+        true
+    }
+}
+
+// The index in V_OVFS (of its triple) of overflow check c, or -1.
+pub fn ovf_index(cx: sink *FnCtx, c: i64) -> i64 {
+    // UNSAFE: V_OVFS is one of FnCtx's raw arrays.
+    // SAFETY: k stays below its count.
+    unsafe {
+        if c == 0 {
+            return -1;
+        }
+        let x = ir_val(cx, c);
+        for k in 0..cx.v_ovfs.count / 3 {
+            if cx.v_ovfs.data[3 * k] == x {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+// Whether instruction x (+, -, * or negation) has its overflow check in
+// V_OVFS: one of the same operation, type and operands.
+fn has_ovf(cx: sink *FnCtx, x: i64) -> bool {
+    // UNSAFE: FnCtx's raw arrays (insts, V_OVFS).
+    // SAFETY: k stays below V_OVFS' count; its checks and x are
+    // instructions of the function entered.
+    unsafe {
+        for k in 0..cx.v_ovfs.count / 3 {
+            let c = cx.v_ovfs.data[3 * k];
+            let imm = cx.insts[c].imm;
+            if (imm & 255) == cx.insts[x].op as i64 && (imm >> 8) == cx.insts[x].ty
+                && ir_val(cx, cx.insts[c].a) == ir_val(cx, cx.insts[x].a)
+                && (cx.insts[x].b == 0 && cx.insts[c].b == 0
+                    || cx.insts[x].b != 0 && cx.insts[c].b != 0
+                    && ir_val(cx, cx.insts[c].b) == ir_val(cx, cx.insts[x].b)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether the exact value of x is affine in the counter of loop l: the
+// counter, an invariant, or a checked +, - or negation of such values, or a
+// checked product of one and an invariant (so that between the first and
+// the last iteration it lies between its values at them).
+fn exact_affine(cx: sink *FnCtx, l: i64, v: i64, depth: i64) -> bool {
+    // UNSAFE: FnCtx's raw arrays (insts).
+    // SAFETY: x is an instruction of the function entered.
+    unsafe {
+        let x = ir_val(cx, v);
+        if x == cx.v_iv || invariant_in(cx, l, x) {
+            return true;
+        }
+        let op = cx.insts[x].op;
+        if depth > 8 || op != Add && op != Op::Sub && op != Op::Mul && op != Op::Neg
+            || !has_ovf(cx, x) {
+            return false;
+        }
+        operands_affine(cx, l, x, op, depth + 1)
+    }
+}
+
+// Whether the operands of x (an operation op, or op's overflow check) are
+// exact_affine, a product's one of them invariant.
+fn operands_affine(cx: sink *FnCtx, l: i64, x: i64, op: Op, depth: i64) -> bool {
+    // UNSAFE: FnCtx's raw arrays (insts).
+    // SAFETY: x and its operands are instructions of the function entered.
+    unsafe {
+        let a = cx.insts[x].a;
+        let b = cx.insts[x].b;
+        if !exact_affine(cx, l, a, depth) || b != 0 && !exact_affine(cx, l, b, depth) {
+            return false;
+        }
+        op != Op::Mul || invariant_in(cx, l, ir_val(cx, a)) || invariant_in(cx, l, ir_val(cx, b))
+    }
+}
+
+// Whether overflow check c of loop l can be tested before the loop, at its
+// first and last iteration (OVK_UNIFORM).
+pub fn ovf_uniform(cx: sink *FnCtx, l: i64, c: i64) -> bool {
+    // UNSAFE: FnCtx's raw arrays (insts).
+    // SAFETY: c is an instruction of the function entered.
+    unsafe { operands_affine(cx, l, c, (cx.insts[c].imm & 255) as Op, 0) }
+}
+
+// The run-time test, and'ed into ok in block c, that no overflow check of
+// kind OVK_UNIFORM overflows from iteration `start` to `last`: their
+// values are exactly affine, so it overflows at neither end.
+pub fn ovf_tests(cx: sink *FnCtx, l: i64, c: i64, ok0: i64, start: i64, last: i64) -> i64 {
+    // UNSAFE: V_OVFS is one of FnCtx's raw arrays.
+    // SAFETY: k stays below its count.
+    unsafe {
+        var ok = ok0;
+        for k in 0..cx.v_ovfs.count / 3 {
+            if cx.v_ovfs.data[3 * k + 1] != OVK_UNIFORM {
+                continue;
+            }
+            let o = cx.v_ovfs.data[3 * k];
+            let bad = append(cx, c, Or, TY_BOOL, eval_at(cx, l, o, start, c),
+                eval_at(cx, l, o, last, c), 0);
+            ok = and_into(cx, c, ok,
+                append(cx, c, Op::Xor, TY_BOOL, bad, konst(cx, c, 1, TY_BOOL), 0));
+        }
+        ok
+    }
+}
+
+// Whether some overflow check of V_OVFS is of kind `kind`.
+pub fn has_ovf_kind(cx: sink *FnCtx, kind: i64) -> bool {
+    // UNSAFE: V_OVFS is one of FnCtx's raw arrays.
+    // SAFETY: k stays below its count.
+    unsafe {
+        for k in 0..cx.v_ovfs.count / 3 {
+            if cx.v_ovfs.data[3 * k + 1] == kind {
+                return true;
+            }
+        }
+        false
     }
 }
 

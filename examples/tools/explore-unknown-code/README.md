@@ -80,6 +80,7 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::cell	<std>	19
 std::sync	<std>	29
 std::sync::atomic	<std>	48
 std::sync::mpsc	<std>	24
@@ -153,8 +154,8 @@ $ volec query context quickest --budget 600
 // crate::route::quickest	route.vl:34-63	effects: alloc(Gpa) panic diverge
 pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     let n = size(g);
-    var best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
-    var how: Vec<Step> = Vec::filled_in(n, Step { from: -1, line: 0, minutes: 0 }, gpa);
+    var best: Vec<i64> = Vec::filled_in(n as usize, i64::MAX, gpa);
+    var how: Vec<Step> = Vec::filled_in(n as usize, Step { from: -1, line: 0, minutes: 0 }, gpa);
     var h = new_heap(gpa);
 
     best[from] = 0;
@@ -190,14 +191,14 @@ crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: Heap) -> bool
 crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout Heap) -> Option<Entry>
 crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
 crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap, e: Entry)
-std::Vec::filled_in	<std>:1518:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1613:12	method	pub fn filled_in(n: usize, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
 <std::Vec as Drop>::drop	<std>:436:8	method	fn drop(inout self)
+std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
 std::Vec::as_slice	<std>:390:12	method	pub fn as_slice(self) -> [T]
-// types (9)
+// types (8)
 crate::route::Route	route.vl:17:12	struct	pub struct Route { pub legs: Vec<Leg>, pub total: i64, }
-note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1
+note query.budget: over the budget of 600 tokens, left out: types or uses 7, callers 1
 try: volec query callers quickest
 try: volec query context quickest --budget 1800
 ```
@@ -267,17 +268,17 @@ guide answers from its own text:
 
 ```console
 $ volec guide --find 'spec width align' --budget 900 | head -11
-# formatting#f-strings
-- `{{` and `}}` are a brace; the text takes a string's escapes.
-- A hole holds any expression but a top-level `:` (parenthesize it);
-  string literals work in it (`{m.get("k"):?}`); f-strings do not nest.
-- The holes are evaluated where the f-string is written, once, left to
-  right; the value holds copies, so it can be stored and printed later.
-- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c|e|E]`:
-  `<` and `>` align (numbers go right by default, text left), `0` pads
-  with zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex,
-  `b` binary, `c` a `u8` as its byte (a `u8` is a number otherwise),
-  `e`/`E` a float with an exponent (0.20: `1.5e3`).
+# formatting#format-strings
+`{name:spec}`, `spec = [[fill]align][+][#][0][width][.precision][type]`:
+`<` `^` `>` align (numbers go right by default, text left) with any fill
+byte (`{s:*^9}`), `+` signs a number, `#` writes `0x`/`0o`/`0b` (and `0`
+pads after them), `0` pads a number with zeros after its sign, the width
+and the precision are digits, `N$`, `name$` (precision also `*`: the
+next argument), `.N` gives a float N decimals and cuts text to N; the
+type is `?` Debug (`x?`, `X?` with hex numbers), `x`/`X` hex, `o` octal,
+`b` binary, `e`/`E` an exponent (`1.5e3`), `p` a pointer as `0x..`, and
+vole's `c`, a `u8` as its byte (a `u8` is a number otherwise). `{:#?}`,
+Debug over several lines, is not in this release.
 ```
 
 And the fix's condition, tried on a snippet before it goes in (`try`

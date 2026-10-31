@@ -128,7 +128,6 @@ $ cat > steps.txt <<'EOF'
 >     // One arena for every document: what render makes for a document
 >     // is freed at once, before the next one.
 >     var arena = Arena::new_in(gpa);
->     defer unsafe { arena.free_all() };
 >     for doc in docs {
 >         // (the rendered Buf is a temporary: dropped at the end of the
 >         // statement, before the reset)
@@ -136,6 +135,7 @@ $ cat > steps.txt <<'EOF'
 >         // (unsafe: every view into the arena is dead from here)
 >         unsafe { arena.reset() };
 >     }
+>     unsafe { arena.free_all() };
 >     0
 > }
 > END

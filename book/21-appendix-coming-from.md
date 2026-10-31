@@ -106,7 +106,7 @@ is designed so that ordinary code can't have undefined behaviour.
 | destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
 | a pointer and a length, passed separately | a slice, `[T]`, which carries its length | 7 |
 | `char *` strings | `str`, UTF-8 with a length; `c"..."` for C | 7, 15 |
-| `int`, `long`, `size_t` | `i32`, `i64`, `u64`; lengths and indices are `i64` | 3 |
+| `int`, `long`, `size_t` | `i32`, `i64`, `usize`; lengths and indices are `usize` | 3 |
 | `#include` and the preprocessor | `mod` and `use`; no macros | 11 |
 | exceptions (C++), error codes | `Result` and `?` | 6 |
 | templates (C++) | generics, compiled once per type as templates are; bounds are checked at each call | 9 |
@@ -176,7 +176,7 @@ choice about memory.
 | interfaces, satisfied implicitly | traits, implemented explicitly, resolved at compile time; enums for "one of several types" | 5, 9 |
 | generics | generics, specialized for each type (no boxing) | 9 |
 | slices that share an array | `[T]` views, which can't outlive or see changes to what they view | 4 |
-| `defer` | `defer` (`volec guide syntax`), and `Drop` for values that clean up after themselves | 4, 15 |
+| `defer` | a guard, a struct whose `Drop` cleans up, made where the defer was (`volec guide memory`); `defer` itself is removed in 0.26.2 | 4, 15 |
 | `go fmt`, `go vet` | `volec fmt`, and the compiler's own checks | 17 |
 | modules and packages | modules (`mod`, `use`, `pub`); no packages yet | 11 |
 | zero values | every variable is set when it's declared | 3 |

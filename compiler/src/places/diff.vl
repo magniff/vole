@@ -5,55 +5,32 @@
 // - the move-out backstop: a `move` out of an index, through a reference,
 //   out of a static or of a BORROWED local is own.move_out, reported for
 //   any the own pass let through (a program it passed);
-// - `--places-diff`: per AST local, the IR's drop decisions (over all its
-//   drops) beside the own pass's (finish_drops, drops.vl's own_row_*):
-//   every local whose two differ, every IR drop with no placeholder and
-//   every placeholder with no IR drop, one line each,
-//   `places.diff: FN: FILE:LINE:COL: 'NAME' own KIND, places KIND`.
-// - (0.26.1) where each drop runs and its flag, check_drops below: a use
-//   after a drop, a flag read before it is written.
-//
-// The IR's decisions are compared as classes: kept, removed, under a flag
-// (the IR's kept at some exits and removed at others is one: the own pass
-// needs a flag there, the IR none), its parts apart (an open drop). Two
-// differences are of form, not listed: a flag beside parts apart (the own
-// pass flags a whole enum whose payload moved on some arms, the IR opens
-// it and flags the payload), and a statement temporary's drop (the own
-// pass's is under a run-time flag, `__own_tf`, with no placeholder), and
-// a requires call's argument `?aN` (the own pass drops the statement
-// temporary it holds instead). places/README.md lists the differences
-// left over compiler/src and tests/run, each with its reason.
+// - `--places-diff` (0.26.1; 0.26.2: the comparison with the own pass's
+//   drops gone with them): where each drop runs and its flag, check_drops
+//   below, a use after a drop, a flag read before it is written, one line
+//   each, `places.diff: FN: FILE:LINE:COL: 'NAME' WHAT`, then the count,
+//   `places.diff: N differences in M drops checked`.
 
 use crate::base::{STDERR, SYMS, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
 use crate::base::comp::Comp;
 use crate::front::ast::NODES;
 use crate::front::own::diag::{OWN_MOVE_OUT, own_begin, own_end, own_flush, own_str};
-use crate::front::own::drops::{own_row_class, own_row_count, own_row_local};
-use crate::front::own::glue::has_glue;
 use crate::front::types::{TYPES, TyKind};
 use crate::places::cfg::RPO_INDEX;
-use crate::places::front::{ast_local_count, ast_local_name};
+use crate::places::front::ast_local_name;
 use crate::places::ir::{
-    B_FN, DS_FLAG, DS_KEPT, DS_OPEN, DS_REMOVED, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF,
-    PJ_INDEX, PStmt, P_LOCALS, P_STMTS, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC,
-    SK_LIVE, block_count, block_len, block_start, has_flag, op_a, op_b, op_is_place, op_kind,
-    place_type, proj_kind, proj_parent, succ, succ_count, undistinct,
+    B_FN, DS_FLAG, DS_KEPT, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF, PJ_INDEX, PStmt,
+    P_LOCALS, P_STMTS, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC, SK_LIVE,
+    block_count, block_len, block_start, has_flag, op_a, op_b, op_is_place, op_kind, place_type,
+    proj_kind, proj_parent, succ, succ_count, undistinct,
 };
 use crate::places::print::{buf_fn_name, buf_pos};
 
-// Per AST local: its decisions' bits + 1 (0: not in a body built), the
-// function, the node of a drop of it.
-static var D_BITS: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var D_FN: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var D_NODE: Vec<i64, Comp> = Vec::new_in(Comp {});
 // The backstop's moves: (node, what, function) triples.
 static var MOVES: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The differences found, the locals compared.
+// The differences found, the drops checked.
 pub static var DIFFS: i64 = 0;
 pub static var COMPARED: i64 = 0;
-
-// (a D_BITS bit: the local is owned and needs drop in the IR)
-const OWNED: i64 = 1 << 10;
 
 const W_INDEX: i64 = 1;
 const W_REF: i64 = 2;
@@ -61,57 +38,23 @@ const W_STATIC: i64 = 3;
 const W_BORROWED: i64 = 4;
 
 pub fn diff_begin() {
-    D_BITS.clear();
-    D_FN.clear();
-    D_NODE.clear();
     MOVES.clear();
     DIFFS = 0;
     COMPARED = 0;
 }
 
-fn note_local(l: i64, node: i64) {
-    if l < 0 || l >= ast_local_count() {
-        return;
-    }
-    while D_BITS.len() <= l {
-        D_BITS.push(0);
-        D_FN.push(-1);
-        D_NODE.push(0);
-    }
-    if D_BITS[l] == 0 {
-        D_BITS[l] = 1;
-        D_FN[l] = B_FN;
-    }
-    if D_NODE[l] == 0 {
-        D_NODE[l] = node;
-    }
-}
-
-// The body held, elaborated: its locals' decisions (for --places-diff,
-// when `diff`), its moves out of places the own pass forbids; the
-// statements of blocks never reached left out.
+// The body held, elaborated: its drops checked (--places-diff, when
+// `diff`), its moves out of places the own pass forbids; the statements of
+// blocks never reached left out.
 pub fn record_body(diff: bool) {
     if diff {
         check_drops();
-        for l in 0..P_LOCALS.len() {
-            if P_LOCALS[l].src >= 0 && !has_flag(l, LF_STATIC) && !has_flag(l, LF_BORROWED) {
-                let a = P_LOCALS[l].src;
-                note_local(a, P_LOCALS[l].node);
-                if a < D_BITS.len() && has_glue(P_LOCALS[l].ty) {
-                    D_BITS[a] = D_BITS[a] | OWNED;
-                }
-            } else if P_LOCALS[l].src >= 0 && has_flag(l, LF_BORROWED) && has_glue(P_LOCALS[l].ty) {
-                // (a borrowed copy the IR never drops: compared too, so that
-                // one the own pass drops is a difference, R10)
-                note_local(P_LOCALS[l].src, P_LOCALS[l].node);
-            }
-        }
     }
     // (std's containers and iterators copy elements as unsafe code does,
     // as the own pass's move_out: no backstop there)
     let moves = crate::places::build::MOVES_SUSPECT
         && !crate::front::modules::std_moves_bits(crate::places::front::fn_module(B_FN));
-    if !diff && !moves {
+    if !moves {
         return;
     }
     for b in 0..block_count() {
@@ -120,21 +63,12 @@ pub fn record_body(diff: bool) {
             continue;
         }
         for s in start..start + block_len(b) {
-            record_stmt(P_STMTS[s], diff, moves);
+            record_moves(P_STMTS[s]);
         }
     }
 }
 
-fn record_stmt(st: PStmt, diff: bool, moves: bool) {
-    if diff && st.kind == SK_DROP && st.e >= 0 {
-        note_local(st.e, st.node);
-        if st.e < D_BITS.len() {
-            D_BITS[st.e] = D_BITS[st.e] | (1 << st.c);
-        }
-    }
-    if !moves {
-        return;
-    }
+fn record_moves(st: PStmt) {
     for i in 0..st.nops {
         if op_kind(st.ops, i) == OK_MOVE {
             let what = forbidden_move(op_a(st.ops, i), op_b(st.ops, i));
@@ -150,7 +84,7 @@ fn record_stmt(st: PStmt, diff: bool, moves: bool) {
 // Whether block b is reached from bb0 (elaboration's order, when it made
 // one for this body; a block it added is).
 fn reached(b: i64) -> bool {
-    !crate::places::elab::RPO_FRESH || b >= RPO_INDEX.len() || RPO_INDEX[b] >= 0
+    !crate::places::elab::RPO_FRESH || b >= RPO_INDEX.len() as i64 || RPO_INDEX[b] >= 0
 }
 
 // Whether a move of place (l, p) is one the own pass forbids: out of an
@@ -185,30 +119,10 @@ fn forbidden_move(l: i64, p: i64) -> i64 {
     0
 }
 
-// The IR's class of a local's decisions (bits + 1): 0 none, 1 kept, 2
-// removed, 3 under a flag, 4 open.
-fn ir_class(v: i64) -> i64 {
-    let bits = v - 1;
-    let kept = (bits & (1 << DS_KEPT)) != 0;
-    let removed = (bits & (1 << DS_REMOVED)) != 0;
-    if (bits & (1 << DS_OPEN)) != 0 {
-        return 4;
-    }
-    if (bits & (1 << DS_FLAG)) != 0 || kept && removed {
-        return 3;
-    }
-    if kept { 1 } else if removed { 2 } else { 0 }
-}
-
-fn class_text(c: i64) -> *u8 {
-    if c == 1 { c"kept" } else if c == 2 { c"removed" } else if c == 3 { c"under a flag" }
-    else if c == 4 { c"its parts apart" } else { c"no drop" }
-}
-
 // After the own pass, in a program it passed: the backstop's errors.
 pub fn report_moves() {
     var i = 0;
-    while i < MOVES.len() {
+    while i < MOVES.len() as i64 {
         let node = MOVES[i];
         let what = MOVES[i + 1];
         i += 3;
@@ -226,96 +140,13 @@ pub fn report_moves() {
     own_flush();
 }
 
-// After the own pass: each local whose decisions differ, one line.
-pub fn report_diff() {
-    // (the locals the own pass has a placeholder for)
-    for r in 0..own_row_count() {
-        let l = own_row_local(r);
-        if l < 0 || l >= D_BITS.len() || D_BITS[l] == 0 {
-            continue;
-        }
-        COMPARED += 1;
-        let own = own_row_class(r);
-        let ir = ir_class(D_BITS[l]);
-        // (marked: compared)
-        D_BITS[l] = -D_BITS[l];
-        // (forms, not differences: a flag beside parts apart; a local the
-        // IR owns with no drop at all, which no exit reaches: every path
-        // from it ends in a `!` call)
-        let diverges = ir == 0 && (-D_BITS[l] & OWNED) != 0;
-        // (and a requires call's argument `?aN` the own pass leaves to the
-        // statement temporary it holds, `__own_tv`, dropped under its
-        // run-time flag; the IR moves the temporary into it and drops it)
-        let requires_arg = own == 0 && name_starts(l, "?a");
-        if own != ir && !(own >= 3 && ir >= 3) && !diverges && !requires_arg {
-            diff_line(l, own, ir);
-        }
-    }
-    // (an IR drop with no placeholder)
-    for l in 0..D_BITS.len() {
-        let v = D_BITS[l];
-        if v > 0 {
-            let ir = ir_class(v);
-            if (ir == 1 || ir == 3 || ir == 4) && !own_temporary(l) && !name_starts(l, "?a") {
-                COMPARED += 1;
-                diff_line(l, 0, ir);
-            }
-        } else if v < 0 {
-            D_BITS[l] = -v;
-        }
-    }
-}
-
-// Whether AST local l is a statement temporary's (`__own_tv`): the own
-// pass drops it under its run-time flag (`__own_tf`), with no placeholder
-// to compare.
-fn name_starts(l: i64, prefix: [u8]) -> bool {
-    let name = ast_local_name(l);
-    if name <= 0 {
-        return false;
-    }
-    let text = SYMS[name].text;
-    text.len >= prefix.len && text[0..prefix.len] == prefix
-}
-
-fn own_temporary(l: i64) -> bool {
-    let name = ast_local_name(l);
-    name > 0 && SYMS[name].text == "__own_tv"
-}
-
-fn diff_line(l: i64, own: i64, ir: i64) {
-    DIFFS += 1;
-    let out = buf_new();
-    buf_str(out, c"places.diff: ");
-    if D_FN[l] >= 0 {
-        buf_fn_name(out, D_FN[l]);
-    }
-    buf_str(out, c": ");
-    let node = D_NODE[l];
-    if node > 0 {
-        buf_pos(out, NODES[node].start);
-        buf_str(out, c": ");
-    }
-    buf_str(out, c"'");
-    let name = ast_local_name(l);
-    if name > 0 {
-        buf_bytes(out, SYMS[name].text);
-    }
-    buf_str(out, c"' own ");
-    buf_str(out, class_text(own));
-    buf_str(out, c", places ");
-    buf_str(out, class_text(ir));
-    buf_str(out, c"\n");
-    buf_write_fd(out, STDERR);
-}
-
 pub fn report_count() {
     let out = buf_new();
     buf_str(out, c"places.diff: ");
     buf_int(out, DIFFS);
     buf_str(out, c" differences in ");
     buf_int(out, COMPARED);
-    buf_str(out, c" locals compared\n");
+    buf_str(out, c" drops checked\n");
     buf_write_fd(out, STDERR);
 }
 
@@ -395,7 +226,7 @@ fn reads(st: PStmt, l: i64, p: i64) -> bool {
             return true;
         }
         var k = 0;
-        while k < ALIASES.len() {
+        while k < ALIASES.len() as i64 {
             if ALIASES[k] == a && ALIASES[k + 1] == l && overlaps(p, ALIASES[k + 2]) {
                 return true;
             }
@@ -443,7 +274,7 @@ fn use_after(b: i64, s: i64, l: i64, p: i64) -> i64 {
     for i in 0..succ_count(b) {
         WORK.push(succ(b, i));
     }
-    while WORK.len() > 0 {
+    while WORK.len() as i64 > 0 {
         let c = WORK.pop().unwrap();
         if c < 0 || SEEN[c] != 0 || block_start(c) < 0 || !reached(c) {
             continue;
@@ -479,7 +310,7 @@ fn flag_written(f: i64, b: i64, s: i64) -> bool {
         SEEN.push(0);
     }
     WORK.push(0);
-    while WORK.len() > 0 {
+    while WORK.len() as i64 > 0 {
         let c = WORK.pop().unwrap();
         if c < 0 || SEEN[c] != 0 || block_start(c) < 0 {
             continue;
@@ -508,7 +339,7 @@ fn flag_written(f: i64, b: i64, s: i64) -> bool {
 
 // Whether some statement sets flag f true.
 fn flag_ever_set(f: i64) -> bool {
-    for s in 0..P_STMTS.len() {
+    for s in 0..P_STMTS.len() as i64 {
         let st = P_STMTS[s];
         if st.kind == SK_ASSIGN && st.a == f && st.b == 0 && st.nops == 1
             && (op_kind(st.ops, 0) != OK_INT || op_a(st.ops, 0) != 0) {
@@ -531,6 +362,7 @@ fn check_drops() {
             if st.kind != SK_DROP || st.c != DS_KEPT && st.c != DS_FLAG {
                 continue;
             }
+            COMPARED += 1;
             let u = use_after(b, s, st.a, st.b);
             if u >= 0 {
                 place_line(st.a, P_STMTS[u].node, c"used after its drop");
@@ -545,7 +377,6 @@ fn check_drops() {
 // `places.diff: FN: FILE:LINE:COL: 'NAME' WHAT`, for IR local l.
 fn place_line(l: i64, node: i64, what: *u8) {
     DIFFS += 1;
-    COMPARED += 1;
     let out = buf_new();
     buf_str(out, c"places.diff: ");
     buf_fn_name(out, B_FN);

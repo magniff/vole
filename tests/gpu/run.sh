@@ -215,12 +215,23 @@ case noalloc in
                 # unknown C is the analysis's: such a call may run any
                 # address-taken `extern "C" fn` of the program, and
                 # std::window's Cocoa callbacks queue events (query loads
-                # all of std; an implicit drop's call is not shown: "no
-                # source found"). The gpu path itself must not allocate.
+                # all of std). The gpu path itself must not allocate.
+                # (0.26.2) One exemption: Frame::present does allocate from
+                # Gpa when a capture is pending (capture::write builds the
+                # file's path in a Buf, std::capture::take_capture). That
+                # runs only after capture_next_frame, a debugging path, not
+                # the per-frame one, so a chain whose first step is
+                # capture::write passes. Until 0.26.2 the check never saw
+                # it: the first step found was the drop of `f` (Id::drop,
+                # into C); a drop's call is now found after the body's.
                 chain=$("$COMPILER" query effects "$f" --root "$WORK/noalloc.vl" --why 'alloc(Gpa)' 2>&1)
                 last=$(printf '%s\n' "$chain" | tail -1)
+                first=$(printf '%s\n' "$chain" | sed -n 2p)
+                case "$first" in
+                    *"calls 'std::gpu::capture::write'"*) last="(the capture)" ;;
+                esac
                 case "$last" in
-                    *"calls C's"*|*"(no source found)"*) ;;
+                    *"calls C's"*|*"(no source found)"*|"(the capture)") ;;
                     *) echo "$f allocates from Gpa: $out" >>"$why"
                        printf '%s\n' "$chain" | sed 's/^/    /' >>"$why" ;;
                 esac ;;

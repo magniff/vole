@@ -64,7 +64,7 @@ let copy = grid;                  // arrays are values: copied whole
 grid[0][0] = 1;
 let row = grid[1][..];            // [i64]: a view of the array
 let part = row[1..];              // checked: lo <= hi <= len
-std::print_int(copy[0][0] + part.len() + part[1]);
+std::print_int(copy[0][0] + part.len() as i64 + part[1]);
 println("");
 ```
 ```out
@@ -145,7 +145,7 @@ fn main() {
     let x: f64 = 0.5;
     let d: Meters = 2.0;
     let e = d + x as Meters;           // `d + x` is distinct.mix
-    println(f"{b} {a < b} {e} {b as i64 + 1}");
+    println("{b} {} {e} {}", a < b, b as i64 + 1);
 }
 ```
 ```out
@@ -181,7 +181,7 @@ fn main() {
             cur = (*p.as_ptr()).next;
         }
     }
-    println(f"{total} {size_of(Option<NonNull<Node>>)}");
+    println("{total} {}", size_of(Option<NonNull<Node>>));
 }
 ```
 ```out

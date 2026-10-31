@@ -8,6 +8,7 @@
 #   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
 #   fmt      every changed .vl outside tests/ is in the standard style
 #   check    every program the change touches checks with no error and no warning
+#            (but one whose main.vl says `// premerge: broken on purpose`)
 #            (but unsafe.unjustified: legacy sites are the baseline's, and new
 #            ones the unsafe row's)
 #   std      the committed compiler/src/front/stdsrc.vl is what compiler/std/embed.sh
@@ -101,6 +102,9 @@ else
     done | sort -u > "$TMP/roots"
     : > "$TMP/check"
     while read -r r; do
+        # (a program that fails on purpose, e.g. a walkthrough's: its
+        # main.vl has the line `// premerge: broken on purpose (why)`)
+        grep -q '^// premerge: broken on purpose' "$r" && continue
         out=$( (cd "$(dirname "$r")" && "$VOLEC" check main.vl) 2>&1 )
         # (0.25.3: not unsafe.unjustified, the unsafe row's and the baseline's)
         out=$(printf '%s\n' "$out" | grep -v 'warning\[unsafe\.unjustified\]')

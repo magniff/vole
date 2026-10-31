@@ -164,7 +164,9 @@
 # to 8 times, while the load average is above the CPUs); a program killed
 # at its limit fails with "timed out: killed after N s ...". $VOLE_TEST_FLAGS (0.16): more compiler options for every
 # case but those with NO-EXTRA-FLAGS (the gate's examples-checkalloc
-# step: --check-alloc).
+# step: --check-alloc). Every other case is built with --verify-places
+# (0.26.2; $VOLE_VERIFY_EVERY=N: every N-th, 0: none), but those with
+# NO-EXTRA-FLAGS.
 
 set -u
 LC_ALL=C
@@ -184,6 +186,7 @@ CC_IS_CLANG=0
 TARGET=""
 OPT=""
 TIMEOUT=${VOLE_TEST_TIMEOUT:-20}
+VERIFY_EVERY=${VOLE_VERIFY_EVERY:-2}
 JOBS=""
 OUT=prog.o
 DIAG=human
@@ -554,6 +557,15 @@ check_case() {
     # (0.16: options for every case, from the environment)
     if [ -n "${VOLE_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
         FLAGS="$FLAGS $VOLE_TEST_FLAGS"
+    fi
+    # (0.26.2: --verify-places on every VERIFY_EVERY-th case, chosen by its
+    # name's cksum: the places IR's form checked where the suite builds
+    # it, now that both code generators read it and -O0 is no independent
+    # lowering; every case would add 8% to the cases' time, every other
+    # one 4%)
+    if [ "$VERIFY_EVERY" -gt 0 ] && [ "$(cat "$dir/noextra")" != 1 ] \
+        && [ $(($(printf '%s' "$file" | cksum | cut -d' ' -f1) % VERIFY_EVERY)) = 0 ]; then
+        FLAGS="$FLAGS --verify-places"
     fi
     if [ -s "$dir/errors" ]; then
         # shellcheck disable=SC2086

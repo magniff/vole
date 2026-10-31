@@ -748,7 +748,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -887,7 +887,7 @@ fn is_word_byte(b: u8) -> bool {
 
 // The word without the punctuation around it: "end!" is "end".
 fn trim_punct(word: str) -> str {
-    var start = 0;
+    var start: usize = 0;
     var end = word.len();
     while start < end && !is_word_byte(word[start]) {
         start += 1;
@@ -921,7 +921,7 @@ fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
     rows
 }
 
-fn print_table(rows: [(String, i64)], top: i64) {
+fn print_table(rows: [(String, i64)], top: usize) {
     let shown = if rows.len() < top { rows.len() } else { top };
     println(f"{"word":<12} {"count":>5}");
     println(f"{"----":<12} {"-----":>5}");

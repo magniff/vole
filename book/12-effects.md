@@ -50,9 +50,9 @@ fn mean(xs: [f64]) -> f64 {
     total / xs.len() as f64
 }
 
-fn bucket(x: f64, lo: f64, hi: f64, n: i64) -> i64 {
+fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
     let i = ((x - lo) / (hi - lo) * n as f64) as i64;
-    if i < 0 { 0 } else if i >= n { n - 1 } else { i }
+    if i < 0 { 0 } else if i >= n as i64 { n - 1 } else { i as usize }
 }
 
 fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
@@ -181,9 +181,9 @@ fn mean(xs: [f64]) -> f64 {
     total / xs.len() as f64
 }
 
-fn bucket(x: f64, lo: f64, hi: f64, n: i64) -> i64 {
+fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
     let i = ((x - lo) / (hi - lo) * n as f64) as i64;
-    if i < 0 { 0 } else if i >= n { n - 1 } else { i }
+    if i < 0 { 0 } else if i >= n as i64 { n - 1 } else { i as usize }
 }
 
 #[pure]
@@ -251,10 +251,10 @@ Months later, someone is chasing a strange histogram and adds a debug
 print to `bucket`. Here is the core with that change:
 
 ```vole
-fn bucket(x: f64, lo: f64, hi: f64, n: i64) -> i64 {
+fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
     println(f"bucket of {x}");
     let i = ((x - lo) / (hi - lo) * n as f64) as i64;
-    if i < 0 { 0 } else if i >= n { n - 1 } else { i }
+    if i < 0 { 0 } else if i >= n as i64 { n - 1 } else { i as usize }
 }
 
 #[pure]

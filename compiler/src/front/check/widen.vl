@@ -6,8 +6,10 @@
 // is the wider one. Never between integers and floats, from bool, signed
 // to unsigned, or narrowing; never inside other types (`*i32`, `[i32]`).
 
-use crate::base::{SRC, buf_bytes, intern_c, sym_text};
-use crate::base::diag::{ERR_HELP, err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str};
+use crate::base::{SRC, buf_bytes, buf_fmt, buf_new, buf_slice, intern_c, sym_text};
+use crate::base::diag::{
+    ERR_HELP, err_begin, err_end, err_fix, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
+};
 use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind, child, new_node};
 use crate::front::check::{Res, mismatch_error};
 use crate::front::check::body::names_context_variant;
@@ -16,17 +18,19 @@ use crate::front::check::unsafety::check_wrapped;
 use crate::front::check::vectors::sym_is_c;
 use crate::front::generics::{HINT_NODE, HINT_TY};
 use crate::front::lexer::{
-    SUF_F32, SUF_F64, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
-    SUF_U8, Tok,
+    SUF_F32, SUF_F64, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32,
+    SUF_U64, SUF_U8, SUF_USIZE, Tok,
 };
 use crate::front::types::{
-    TY_ERROR, TY_F32, TY_I16, TY_I32, TY_I64, TY_I8, TY_NEVER, TY_U16, TY_U32, TY_U8, buf_type,
-    err_type, int_bits, int_max, is_integer, is_signed, primitive_name,
+    TY_ERROR, TY_F32, TY_I16, TY_I32, TY_I64, TY_I8, TY_ISIZE, TY_NEVER, TY_U16, TY_U32, TY_U64,
+    TY_U8, TY_USIZE, buf_type, err_type, int_bits, int_max, is_integer, is_signed, primitive_name,
 };
 
 // Whether integer type a widens to integer type b (a != b): from i8 to
 // i16, i32, i64; from u8 to u16, u32, u64 and to i16, i32, i64; ...
-// (isize and usize are i64 and u64.)
+// (0.26.2: usize and isize are types of their own, of 64 bits: u8 to u32
+// widen to usize, i8 to i32 and u8 to u32 to isize; u64 and usize, i64 and
+// isize, take `as`.)
 pub fn widens(a: i64, b: i64) -> bool {
     if a == b || !is_integer(a) || !is_integer(b) {
         return false;
@@ -64,6 +68,13 @@ pub fn widen_node(n: i64, to: i64) {
 // otherwise (the caller reports the mismatch).
 pub fn try_widen(n: i64, actual: i64, expected: i64) -> bool {
     if !widens(actual, expected) {
+        // (0.26.2) a contract message's hole of a 64-bit unsigned type (a
+        // usize length or index) is passed as the i64 it holds
+        if expected == TY_I64 && (actual == TY_USIZE || actual == TY_U64)
+            && crate::front::contracts::expand::is_message_hole(n) {
+            widen_node(n, expected);
+            return true;
+        }
         return false;
     }
     widen_value(n, expected);
@@ -93,7 +104,8 @@ pub fn int_limit(n: i64, t: i64, max: bool) -> i64 {
     let suffix = if t == TY_I8 { SUF_I8 } else if t == TY_I16 { SUF_I16 }
         else if t == TY_I32 { SUF_I32 } else if t == TY_I64 { SUF_I64 }
         else if t == TY_U8 { SUF_U8 } else if t == TY_U16 { SUF_U16 }
-        else if t == TY_U32 { SUF_U32 } else { SUF_U64 };
+        else if t == TY_U32 { SUF_U32 } else if t == TY_USIZE { SUF_USIZE }
+        else if t == TY_ISIZE { SUF_ISIZE } else { SUF_U64 };
     let lit = if max || !is_signed(t) { n } else { new_node(NodeKind::Int, NODES[n].start,
         NODES[n].end) };
     NODES[lit].kind = NodeKind::Int;
@@ -360,7 +372,8 @@ pub fn join_operands(lhs: i64, lhs_ty: i64, rhs: i64) -> i64 {
 // Two integer values of types that do not widen one to the other (`i32`
 // and `u32`, `i64` and `u64`): the mismatch, with the conversion to write
 // (both to i64 when both widen to it, else the right one to the left's
-// type).
+// type; 0.26.2: of a usize and an i64, the usize, a length, to i64, as
+// `fix --only usize` writes it).
 fn int_mismatch_error(lhs: i64, lhs_ty: i64, rhs: i64, rhs_ty: i64) -> ! {
     err_begin(NODES[rhs].start);
     err_str(c"expected '");
@@ -368,6 +381,20 @@ fn int_mismatch_error(lhs: i64, lhs_ty: i64, rhs: i64, rhs_ty: i64) -> ! {
     err_str(c"', got '");
     err_type(rhs_ty);
     err_str(c"'");
+    if lhs_ty == TY_USIZE && rhs_ty == TY_I64 || lhs_ty == TY_I64 && rhs_ty == TY_USIZE {
+        let u = if lhs_ty == TY_USIZE { lhs } else { rhs };
+        let text = SRC[NODES[u].start..NODES[u].end];
+        let t = buf_new();
+        if operand_is_simple(u) {
+            buf_fmt(t, f"{text} as i64");
+        } else {
+            buf_fmt(t, f"({text}) as i64");
+        }
+        err_help(c"a length or an index is a usize: convert it to the i64's type");
+        err_try_fmt(buf_slice(t));
+        err_fix(NODES[u].start, NODES[u].end, buf_slice(t));
+        err_end();
+    }
     let both = widens(lhs_ty, TY_I64) && widens(rhs_ty, TY_I64);
     err_help(c"convert explicitly: '");
     if both {
@@ -376,14 +403,25 @@ fn int_mismatch_error(lhs: i64, lhs_ty: i64, rhs: i64, rhs_ty: i64) -> ! {
         err_help(c" as i64)");
         buf_bytes(ERR_HELP, SRC[NODES[lhs].end..NODES[rhs].start]);
     }
+    // (`(x as T)`; 0.26.2: `(a - b) as T` of an operation)
+    let simple = operand_is_simple(rhs);
     err_help(c"(");
     buf_bytes(ERR_HELP, SRC[NODES[rhs].start..NODES[rhs].end]);
-    err_help(c" as ");
+    err_help(if simple { c" as " } else { c") as " });
     if both {
         err_help(c"i64");
     } else {
         buf_type(ERR_HELP, lhs_ty);
     }
-    err_help(c")'");
+    err_help(if simple { c")'" } else { c"'" });
     err_end()
+}
+
+// (0.26.2) Whether operand n is written `x as T` without parentheses: it
+// binds tighter than `as` (not an operator's own expression).
+pub fn operand_is_simple(n: i64) -> bool {
+    let k = NODES[n].kind;
+    !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
+        || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
+        || k == NodeKind::Block || k == NodeKind::Closure)
 }

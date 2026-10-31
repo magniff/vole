@@ -3,7 +3,7 @@
 $ check
 main.vl:15:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;` | try: volec fix --suggested main.vl
 main.vl:17:13: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
-main.vl:18:13: error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at util.vl:19:1 | try: volec fix --suggested main.vl
+main.vl:18:13: error[item.private] 'hidden' is private | help: make it public: `pub fn hidden` at util.vl:19:1 | try: volec fix --suggested main.vl
 [exit 1]
 $ fix --dry-run
 --- a/main.vl
@@ -88,5 +88,5 @@ $ undo
 undid fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 % git status --short
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified or obsolete-attr, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize or fstring, not 'nonsense'
 [exit 2]

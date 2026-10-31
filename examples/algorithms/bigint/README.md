@@ -192,10 +192,10 @@ nine digits, with an f-string spec (`{x:09}`: zero-padded to 9):
 impl Display for BigUint {
     fn fmt(self, f: inout Fmt) {
         ...
-        f.write(f"{s[s.len() - 1]}");
+        f.write("{}", s[s.len() - 1]);
         var i = s.len() - 2;
         while i >= 0 {
-            f.write(f"{s[i]:09}");
+            f.write("{:09}", s[i]);
             i -= 1;
         }
     }

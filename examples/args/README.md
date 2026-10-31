@@ -27,10 +27,10 @@ strings, each a NUL-terminated `*u8`:
 
 ```tach
 fn main(argc: i64, argv: **u8) -> i32 {
-    println(f"argc: {argc}");
+    println("argc: {argc}");
     for i in 0..argc {
         let arg = unsafe { c_bytes(argv[i]) };
-        println(f"-- {arg}");
+        println("-- {arg}");
     }
     0
 }
@@ -52,7 +52,7 @@ unsafe fn c_bytes(s: *u8) -> [u8] {
 `c_bytes` is an `unsafe fn` because its argument must be a valid C string,
 a promise its caller makes by calling it inside `unsafe { }`. The slice
 `s[0..n]` of a raw pointer is how memory from C becomes a `[u8]`, which
-the f-string `f"-- {arg}"` then prints as text.
+the format string `"-- {arg}"` then prints as text.
 
 ## The same with std::cli
 

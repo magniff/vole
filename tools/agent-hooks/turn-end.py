@@ -79,15 +79,19 @@ def candidates(event, st):
 def expects_errors(root):
     """A test case that is meant to fail to compile (`// ERROR:` or
     `// ERROR-COUNT:` directives, under a tests/ directory): its errors are
-    the test, not unchecked changes."""
-    if os.sep + "tests" + os.sep not in root:
-        return False
+    the test, not unchecked changes; or any program whose main.vl has the
+    line `// premerge: broken on purpose (why)`, as tools/premerge.sh
+    skips it (examples/tools/fix-the-errors, a walkthrough's)."""
     try:
         with open(root) as fh:
-            head = fh.read(4096)
+            text = fh.read()
     except OSError:
         return False
-    return "// ERROR" in head
+    if any(line.startswith("// premerge: broken on purpose") for line in text.splitlines()):
+        return True
+    if os.sep + "tests" + os.sep not in root:
+        return False
+    return "// ERROR" in text[:4096]
 
 
 def needs_check(event, st, root, start):

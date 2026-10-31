@@ -47,14 +47,14 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `fn f(&self)`, `fn f(&mut self)`, `fn f(self)` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)` |
 | `let mut x`, `move \|\|` | `var x`, `sink \|\|`; `inout r = &x;` keeps an access, used as `x` itself (no `*r`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
-| `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
+| `println!("{}", x)`, `format!` | no macros: `println("x = {x:>4} {:?}", v)`, `format_in("..", args, gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `volec query effects f` (0.16, `guide effects`) |
 | `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
-| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
+| `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, supertraits; `where` (0.26.2) |
 | `Drop`, RAII | the same (0.17): values are dropped at the end of their scope; `impl Drop for T`, `drop(x)`, `std::forget(x)`; no `free` calls (`guide memory`) |
 | `!x` on integers | `~x`; `!` is for `bool` only |
 | `i64::MAX`, `x.abs()`, `x.pow(2)` | `i64::MAX`, `u8::MIN` the same (0.15); floats have Rust's methods (`x.sqrt()`, `x.powi(2)`, `f64::consts::PI`: `guide math`, 0.25.2.1), integers `abs`, `signum`, `min`, `max`, `clamp`, `pow` (0.25.2.2) |
@@ -62,7 +62,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `match s { "add" => ... }` | strings are not patterns: `if s == "add" { ... }` |
 | `char` | none: `'a'` is a `u8` (one ASCII byte) |
 | no default or named arguments | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15): named ones last, in order |
-| `usize`, implicit `i32` -> `i64` | lengths and indices are `i64`; lossless widening (0.15), `a as i32` narrows |
+| `usize`, implicit `i32` -> `i64` | lengths and indices are `usize` (0.26.2); lossless widening (0.15), `a as i32` narrows |
 
 The prelude, in every module without `use`: `Option`, `Some`, `None`,
 `Result`, `Ok`, `Err`, `Vec`, `print`, `println`, `eprint`, `eprintln`,
@@ -106,7 +106,7 @@ fn classify(n: i64) -> [u8] {
 }
 
 fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {   // defaults (0.15)
-    for _ in 0..times { print(f"hi {name}{sep}"); }
+    for _ in 0..times { print("hi {name}{sep}"); }
 }
 
 fn main() -> i32 {
@@ -166,7 +166,7 @@ fn main(gpa: Gpa) {
     report(b, &sum);
     var all: Vec<Account> = Vec::new_in(gpa);
     keep(&all, a);                        // a moves: dead from here
-    println(f"{sum} {all[0].log.len()} {b.balance}");
+    println("{sum} {} {}", all[0].log.len(), b.balance);
 }
 ```
 ```out
@@ -266,7 +266,7 @@ impl<T: Ord> Pair<T> {
 fn main() -> i32 {
     let squares = [Square { side: 2 }, Square { side: 3 }];
     let p = Pair::<i64> { a: 3, b: 9 };   // the turbofish: Pair::<i64>
-    println(f"{total(squares[..])} {squares[0].twice()} {p.max()}");   // a[..]: a slice
+    println("{} {} {}", total(squares[..]), squares[0].twice(), p.max()); // a[..]: a slice
     0
 }
 ```
@@ -294,7 +294,7 @@ re-exports. A missing import's error says which `use` line to add, and
 ```vole
 fn sum(xs: [i64]) -> i64 {
     var t = 0;
-    for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
+    for i in 0..xs.len() { t += xs[i]; }    // indices are usize; checked
     t
 }
 
@@ -354,7 +354,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     var b = Buf::new_in(gpa);              // text builder
     let e = evens(4, gpa);
     b.push_str("n=");
-    b.push_int(m.len() + e.len());
+    b.push_int(m.len() as i64 + e.len() as i64);
     b.push('!');
     println(b.as_slice());
     0
@@ -407,7 +407,7 @@ fn main(gpa: Gpa) -> i32 {
     for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
         adj[u].push((v, w));
     }
-    var dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    var dist: Vec<i64> = Vec::filled_in(n as usize, i64::MAX, gpa);
     var heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);      // (distance, node)
     dist[0] = 0;
     heap.push((0, 0));
@@ -422,7 +422,7 @@ fn main(gpa: Gpa) -> i32 {
             }
         }
     }
-    println(f"{dist[1]} {dist[2]} {dist[3]} {dist[4] == i64::MAX}");
+    println("{} {} {} {}", dist[1], dist[2], dist[3], dist[4] == i64::MAX);
     0
 }
 ```
@@ -503,7 +503,7 @@ and linking: `guide c-interop`.
 | `own.readonly: '&n' changes 'n', a let binding` (or `v.push(x)`) | `var n`; a parameter `x: inout T`; `inout self`; `static var` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
-| `'println!' is a macro call` | no macros: `println(f"{x}")` |
+| `'println!' is a macro call` | no macros: `println("{}", x)` |
 | `cannot assign to immutable variable 'x'` | `var x` |
 | `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
 | `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc016` |

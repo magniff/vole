@@ -55,7 +55,7 @@ stderr with `eprintln` (it never happens: `i64` holds every factorial up
 to 20!).
 
 ```tach
-println(f"Factorial of {n} == {f}");
+println("Factorial of {n} == {f}");
 ```
 
 ## Language features

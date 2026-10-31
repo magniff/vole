@@ -20,7 +20,7 @@
 // id. The glue's rules are front/own/glue.vl's (push_glue), which the own
 // pass's drops still run until 0.26.1's step 7.
 
-use crate::base::{buf_new, buf_slice, buf_str, intern, intern_c};
+use crate::base::{buf_new, buf_slice, buf_str, intern, intern_c, len_arg};
 use crate::base::comp::Comp;
 use crate::front::ast::{NODES, NodeKind, list_begin, list_end, list_push, new_node};
 use crate::front::generics::{INST_QUEUE, mangle_type};
@@ -60,22 +60,33 @@ static var SYM_DROP: i64 = 0;
 // place of type t calls with `&mut P`. t must have glue (has_glue).
 pub fn shim_of(t: i64) -> i64 {
     let u = undistinct(t);
-    while SHIM_OF.len() <= u {
+    let key = shim_key(u);
+    while SHIM_OF.len() as i64 <= key {
         SHIM_OF.push(0);
     }
-    if SHIM_OF[u] > 0 {
-        return SHIM_OF[u] - 1;
+    if SHIM_OF[key] > 0 {
+        return SHIM_OF[key] - 1;
     }
     SHIM_TY.push(u);
-    let id = SHIM_TY.len() - 1;
-    SHIM_OF[u] = id + 1;
+    let id = SHIM_TY.len() as i64 - 1;
+    SHIM_OF[key] = id + 1;
     SHIM_FN.push(-1);
     id
 }
 
+// (0.26.2, R11) The type shims are found by: t with every distinct type
+// in it erased (front/distinct.vl erase_type, its whole mode). The IR is
+// built before the erasure and the code generators read it after:
+// a local keeps its type as built, `(str, Matches)`, while a field's or a
+// variant's comes from the tables erase_program_types rewrote,
+// `([u8], Matches)`; both must find the one shim.
+fn shim_key(t: i64) -> i64 {
+    crate::front::distinct::erase_type(undistinct(t))
+}
+
 // The number of shims made so far (it grows as shims are asked for).
 pub fn shim_count() -> i64 {
-    SHIM_TY.len()
+    SHIM_TY.len() as i64
 }
 
 // The type shim `id` drops.
@@ -203,7 +214,7 @@ fn field_index(s: i64, name: i64) -> i64 {
 
 // A switch on the bool operand at m: false to f, true to t.
 fn switch_bool(m: i64, f: i64, t: i64) {
-    let ti = P_TARGETS.len();
+    let ti = P_TARGETS.len() as i64;
     P_TARGETS.push(0);
     P_TARGETS.push(f);
     terminate(TK_SWITCH, ti, 1, t, m, 1, 0);
@@ -259,7 +270,7 @@ fn enum_switch(t: i64, p: i64) {
     push_op(OK_PLACE, 1, p);
     emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, m, 1, 0);
     let next = new_block();
-    let ti = P_TARGETS.len();
+    let ti = P_TARGETS.len() as i64;
     // (the arms' blocks, made before the switch names them)
     let arm0 = crate::places::ir::block_count();
     for i in 0..count {
@@ -305,29 +316,84 @@ fn variant_glue(v: i64) -> bool {
 // ---- Drop::drop's instance of a type ----
 
 // The function `t.drop()` calls (t has an `impl Drop`): its method, or
-// the instance of its generic impl's method for t. That instance is the
-// one the checker made for the own pass's glue, or, when there is none,
-// made and checked now (the checker's way: instantiate_call on a `drop()`
-// call of no arguments, then the instances it queued), so that a shim
-// never lacks one; -1 only when t has no `drop` method.
+// the instance of its generic impl's method for t. That instance is one
+// the checker made already, or one made and checked now (the checker's
+// way: instantiate_call on a `drop()` call of no arguments, then the
+// instances it queued), so that a shim never lacks one; a method std
+// declares and nothing calls is checked now too (check_lazy_drop); -1 only
+// when t has no `drop` method.
 fn drop_fn(t: i64) -> i64 {
     if SYM_DROP == 0 {
         SYM_DROP = intern_c(c"drop");
     }
     let f0 = crate::front::check::calls::method_of(t, SYM_DROP);
-    if f0 < 0 || !crate::places::front::fn_generic(f0) {
+    if f0 < 0 {
+        return f0;
+    }
+    if !crate::places::front::fn_generic(f0) {
+        check_lazy_drop(f0);
         return f0;
     }
     scan_drop_instances();
-    if t < DROP_OF.len() && DROP_OF[t] > 0 {
+    if t < DROP_OF.len() as i64 && DROP_OF[t] > 0 {
         return DROP_OF[t] - 1;
     }
     let f = make_drop_instance(f0, t);
-    while DROP_OF.len() <= t {
+    while DROP_OF.len() as i64 <= t {
         DROP_OF.push(0);
     }
     DROP_OF[t] = f + 1;
     f
+}
+
+// (0.26.2) The functions checked for a drop that no call made the checker
+// check (a `drop` method std declares, a lazy std function, FN_LAZY, and
+// the ones it calls; the own pass's glue called them until 0.26.2), when
+// a drop first needs one, whose bodies run_places has gone past (an index
+// below NEXT_FN): it builds them before going on (check_late).
+static var LATE_DROPS: Vec<i64, Comp> = Vec::new_in(Comp {});
+pub static var NEXT_FN: i64 = 0;
+
+pub fn late_drop_count() -> i64 {
+    LATE_DROPS.len() as i64
+}
+
+pub fn late_drop(i: i64) -> i64 {
+    LATE_DROPS[i]
+}
+
+// Method f0 (a `drop`, not generic): checked now when it is a lazy std
+// function not checked yet, with the instances it queues, as a call of it
+// would have (assoc.vl ensure_checked).
+fn check_lazy_drop(f0: i64) {
+    let item = fn_node(f0);
+    if item <= 0 || (NODES[item].p & crate::front::ast::FN_LAZY) == 0 {
+        return;
+    }
+    let at = if B_FN >= 0 { NODES[fn_node(B_FN)].start } else { 0 };
+    let n = new_node(NodeKind::MethodCall, at, at);
+    NODES[n].b = SYM_DROP;
+    let mark = list_begin();
+    list_end(n, mark);
+    let q = INST_QUEUE.count;
+    crate::front::assoc::ensure_checked(f0, n);
+    if INST_QUEUE.count == q {
+        return;
+    }
+    check_late(q);
+}
+
+// The functions queued from INST_QUEUE[q..] checked (a drop method and the
+// lazy std functions it calls), those run_places has gone past kept for
+// it to build (LATE_DROPS).
+fn check_late(q: i64) {
+    crate::front::check::check_queued_instances(q);
+    for i in q..INST_QUEUE.count {
+        let g = INST_QUEUE.get(i);
+        if g < NEXT_FN {
+            LATE_DROPS.push(g);
+        }
+    }
 }
 
 // The `Drop::drop` instances made since the last scan, by their
@@ -344,7 +410,7 @@ fn scan_drop_instances() {
         if st <= 0 {
             continue;
         }
-        while DROP_OF.len() <= st {
+        while DROP_OF.len() as i64 <= st {
             DROP_OF.push(0);
         }
         if DROP_OF[st] == 0 {
@@ -365,7 +431,7 @@ fn make_drop_instance(f0: i64, t: i64) -> i64 {
     let q = INST_QUEUE.count;
     let f = crate::front::generics::instantiate::instantiate_call(f0, n, 1, t, 0);
     crate::front::assoc::ensure_checked(f, n);
-    crate::front::check::check_queued_instances(q);
+    check_late(q);
     DROP_MADE += 1;
     f
 }
@@ -392,7 +458,7 @@ static var DF_TMP: Vec<i64, Comp> = Vec::new_in(Comp {});
 pub fn drop_fn_count(t0: i64) -> i64 {
     let t = undistinct(t0);
     make_drop_fns(t);
-    if t < DF_AT.len() && DF_AT[t] > 0 { DF_N[t] } else { 0 }
+    if t < DF_AT.len() as i64 && DF_AT[t] > 0 { DF_N[t] } else { 0 }
 }
 
 pub fn drop_fn_at(t0: i64, i: i64) -> i64 {
@@ -404,7 +470,7 @@ fn make_drop_fns(t: i64) {
     if t <= 0 || !has_glue(t) {
         return;
     }
-    while DF_AT.len() <= t {
+    while DF_AT.len() as i64 <= t {
         DF_AT.push(0);
         DF_N.push(0);
     }
@@ -412,7 +478,7 @@ fn make_drop_fns(t: i64) {
         return;
     }
     DF_AT[t] = -1;
-    let mark = DF_TMP.len();
+    let mark = DF_TMP.len() as i64;
     if has_drop_impl(t) {
         let f = drop_fn(t);
         if f >= 0 {
@@ -441,13 +507,13 @@ fn make_drop_fns(t: i64) {
             }
         }
     }
-    DF_AT[t] = DF_LIST.len() + 1;
-    DF_N[t] = DF_TMP.len() - mark;
-    for i in mark..DF_TMP.len() {
+    DF_AT[t] = DF_LIST.len() as i64 + 1;
+    DF_N[t] = DF_TMP.len() as i64 - mark;
+    for i in mark..DF_TMP.len() as i64 {
         let f = DF_TMP[i];
         DF_LIST.push(f);
     }
-    DF_TMP.truncate(mark);
+    DF_TMP.truncate(len_arg(mark));
 }
 
 // The drop functions of part type pt added to those being collected from
@@ -464,7 +530,7 @@ fn add_part(pt0: i64, mark: i64) {
     for i in 0..DF_N[pt] {
         let f = DF_LIST[DF_AT[pt] - 1 + i];
         var seen = false;
-        for j in mark..DF_TMP.len() {
+        for j in mark..DF_TMP.len() as i64 {
             if DF_TMP[j] == f {
                 seen = true;
             }
@@ -485,22 +551,33 @@ static var IS_SHIM: Vec<bool, Comp> = Vec::new_in(Comp {});
 
 // Whether function f is a drop shim's (make_shim_functions).
 pub fn is_shim_fn(f: i64) -> bool {
-    f >= 0 && f < IS_SHIM.len() && IS_SHIM[f]
+    f >= 0 && f < IS_SHIM.len() as i64 && IS_SHIM[f]
 }
 
 // The function of shim id (-1: not made).
 pub fn shim_fn(id: i64) -> i64 {
-    if id < SHIM_FN.len() { SHIM_FN[id] } else { -1 }
+    if id < SHIM_FN.len() as i64 { SHIM_FN[id] } else { -1 }
 }
 
 // The function `drop(P)` of a place of type t calls with `&mut P` (its
 // shim's), -1 when t has none (no glue, or no body kept that drops one).
 pub fn drop_shim_fn(t: i64) -> i64 {
-    let u = undistinct(t);
-    if u <= 0 || u >= SHIM_OF.len() || SHIM_OF[u] == 0 {
+    let key = shim_key(t);
+    if key <= 0 || key >= SHIM_OF.len() as i64 || SHIM_OF[key] == 0 {
         return -1;
     }
-    shim_fn(SHIM_OF[u] - 1)
+    shim_fn(SHIM_OF[key] - 1)
+}
+
+// (0.26.2, R11; --verify-places) Whether a drop of type t that runs
+// finds its shim as the code generators look for it: t asked for
+// (shim_of), then found again by t with its distinct types erased, as a
+// field's or a variant's type is when they read it (erase_program_types
+// runs between the two).
+pub fn shim_found(t: i64) -> bool {
+    let id = shim_of(t);
+    let key = shim_key(crate::front::distinct::erase_type(t));
+    key > 0 && key < SHIM_OF.len() as i64 && SHIM_OF[key] == id + 1
 }
 
 // run_places, every body kept: each shim asked for (and the shims their
@@ -513,7 +590,7 @@ pub fn make_shim_functions() {
     var id = 0;
     while id < shim_count() {
         build_shim(id);
-        for s in 0..P_STMTS.len() {
+        for s in 0..P_STMTS.len() as i64 {
             let st = P_STMTS[s];
             if st.kind == SK_DROP && st.c == DS_KEPT {
                 shim_of(full_place_type(st.a, st.b));
@@ -530,7 +607,7 @@ pub fn make_shim_functions() {
 // Shim id's function: a Fn node (no body: the IR is the body) with its
 // parameter, an AST local for it, the FNS entry.
 fn shim_function(id: i64) -> i64 {
-    while SHIM_FN.len() <= id {
+    while SHIM_FN.len() as i64 <= id {
         SHIM_FN.push(-1);
     }
     if SHIM_FN[id] >= 0 {
@@ -560,7 +637,7 @@ fn shim_function(id: i64) -> i64 {
     let f = FN_COUNT - 1;
     crate::places::front::fn_set_shim_signature(f, pt);
     SHIM_FN[id] = f;
-    while IS_SHIM.len() <= f {
+    while IS_SHIM.len() as i64 <= f {
         IS_SHIM.push(false);
     }
     IS_SHIM[f] = true;

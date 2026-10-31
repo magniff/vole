@@ -133,7 +133,7 @@ returning negative, zero or positive, so `b.cmp(a)` sorts descending:
 var slow = all.iter().filter(is_slow).collect_in(gpa);
 slow.sort_by(|a, b| b.millis.cmp(a.millis)); // slowest first
 for (rank, e) in slow.iter().enumerate().take(3) {
-    println(f"  {rank + 1}. {e.millis:>4} ms  {e.service:<5} {e.path}");
+    println("  {}. {:>4} ms  {:<5} {}", rank + 1, e.millis, e.service, e.path);
 }
 ```
 

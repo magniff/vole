@@ -145,7 +145,7 @@ BEGIN {
         print "}\n"
     }
     print "fn main() -> i32 {"
-    print "    Z = std::env::args().len() - 1;"
+    print "    Z = std::env::args().len() as i64 - 1;"
     print "    let x = " (rnd(2) ? "-1099511627776" : "1099511627776") " + Z;"
     print "    let y = -9223372036854775807 + Z;"
     print "    let big = 4611686018427387904 + Z;"

@@ -85,7 +85,7 @@ impl<T> Stack<T> {
         self.items.pop()
     }
 
-    fn len(self) -> i64 {
+    fn len(self) -> usize {
         self.items.len()
     }
 }
@@ -516,7 +516,7 @@ error[type error]: cannot derive 'Debg' (derivable: Eq, Ord, Hash, Debug, Clone)
   = help: did you mean 'Debug'?
 error[type error]: 'Point' does not implement Debug, which '{x:?}' needs
  --> main.vl: line 9, column 16
-  = help: derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for Point { fn fmt_debug(self, f: inout std::Fmt) { f.write(f"..."); } }'
+  = help: derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for Point { fn fmt_debug(self, f: inout std::Fmt) { f.write("..", args); } }'
 ```
 
 The second error follows from the first: fix the spelling and both go

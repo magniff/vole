@@ -7,14 +7,14 @@ $ context report
 // The total, after restocking the empty items.
 fn report(items: inout Vec<Item>) -> i64 {
     for i in 0..items.len() {
-        restock(&items, i, 5);
+        restock(&items, i as i64, 5);
     }
     total(items)
 }
 // calls (3)
 crate::stock::restock	context/stock.vl:10:8	fn	pub fn restock(items: inout Vec<Item>, i: i64, n: i64)
 crate::stock::total	context/stock.vl:19:8	fn	pub fn total(items: Vec<Item>) -> i64
-std::Vec::len	../../compiler/std/std.vl:205:12	method	pub fn len(self) -> i64
+std::Vec::len	../../compiler/std/std.vl:215:12	method	pub fn len(self) -> usize
 // types (2)
 crate::stock::Item	context/stock.vl:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.vl:190:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -25,22 +25,22 @@ $ context restock total
 // crate::stock::restock	context/stock.vl:9-16	effects: panic
 // Sets item i's count to n when it is empty.
 pub fn restock(items: inout Vec<Item>, i: i64, n: i64) {
-    var it = items.get(i);
+    var it = items.get(i as usize);
     if it.count == 0 && n <= MAX {
         it.count = n;
-        items.set(i, it);
+        items.set(i as usize, it);
     }
 }
 // calls (2)
-std::Vec::set	../../compiler/std/std.vl:312:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Vec::get	../../compiler/std/std.vl:305:12	method	pub fn get(self, i: i64) -> T requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Vec::set	../../compiler/std/std.vl:332:12	method	pub fn set(inout self, i: usize, x: sink T) requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
+std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
 // types (2)
 crate::stock::Item	context/stock.vl:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.vl:190:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
 // uses (1)
 crate::stock::MAX	context/stock.vl:7:11	const	pub const MAX: i64 = 100
 // callers (1)
-report	context/main.vl:12:9	restock(&items, i, 5);
+report	context/main.vl:12:9	restock(&items, i as i64, 5);
 // crate::stock::total	context/stock.vl:18-25	effects: panic
 // The sum of the counts.
 pub fn total(items: Vec<Item>) -> i64 {
@@ -51,8 +51,8 @@ pub fn total(items: Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::get	../../compiler/std/std.vl:305:12	method	pub fn get(self, i: i64) -> T requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Vec::len	../../compiler/std/std.vl:205:12	method	pub fn len(self) -> i64
+std::Vec::get	../../compiler/std/std.vl:324:12	method	pub fn get(self, i: usize) -> T requires i < self.len as usize else "index out of bounds: index {}, length {}", i as i64, self.len
+std::Vec::len	../../compiler/std/std.vl:215:12	method	pub fn len(self) -> usize
 // types (2)
 crate::stock::Item	context/stock.vl:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.vl:190:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -78,10 +78,10 @@ $ context stock
 // crate::stock::restock	context/stock.vl:9-16	used 0 times in the module, 1 outside
 // Sets item i's count to n when it is empty.
 pub fn restock(items: inout Vec<Item>, i: i64, n: i64) {
-    var it = items.get(i);
+    var it = items.get(i as usize);
     if it.count == 0 && n <= MAX {
         it.count = n;
-        items.set(i, it);
+        items.set(i as usize, it);
     }
 }
 // crate::stock::total	context/stock.vl:18-25	used 0 times in the module, 1 outside
@@ -98,7 +98,7 @@ $ context report --budget 120
 // The total, after restocking the empty items.
 fn report(items: inout Vec<Item>) -> i64 {
     for i in 0..items.len() {
-        restock(&items, i, 5);
+        restock(&items, i as i64, 5);
     }
     total(items)
 }
@@ -116,10 +116,10 @@ $ show report --budget 40
 // crate::report	context/main.vl:9-15	effects: panic
 // The total, after restocking the empty items.
 fn report(items: inout Vec<Item>) -> i64 {
-note query.budget: cut at about 40 tokens: 3 of 8 lines (about 58 tokens in all)
+note query.budget: cut at about 40 tokens: 3 of 8 lines (about 60 tokens in all)
 try: volec query show report --budget 100
 $ refs restock --budget 20
 # context/main.vl
 5:19	use	crate	use stock::{Item, restock, total};
-note query.budget: cut at about 20 tokens: 2 of 5 lines (about 49 tokens in all)
+note query.budget: cut at about 20 tokens: 2 of 5 lines (about 50 tokens in all)
 try: volec query refs restock --budget 100

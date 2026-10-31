@@ -17,9 +17,9 @@ b.push_str(s: [u8])
 Buf::new_in(gpa) -> Buf          text you build (there is no String)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
-print(x), println(x)             any Display; f"{x} {v:?} {v[i]} {s.len()}"
+print(x), println(x)             any Display; println("{x} {:?}", v)
 b.push_int(v: i64)
-v.set(i: i64, x: T)              checked, as v[i] = x
+v.set(i: usize, x: T)            checked, as v[i] = x
 Scanner::new(text: [u8]) -> Scanner
 sc.next_int() -> Result<i64, ScanError>
 o.unwrap_or(x: T) -> T           Option, Result
@@ -27,20 +27,20 @@ v.clear()                        Vec, Buf
 v.sort()                         by Ord: numbers, [u8], tuples, #[derive(Eq, Ord)]
 v.sort_by(|a, b| a.x - b.x)      a, b: let T (a - b); < 0: a first; cmp_of(a, b)
 HashMap::new_in(gpa) -> HashMap<K, V>
-v.pop() -> Option<T>             v.remove(i: i64) -> T; m.remove(k) -> Option<V>
-Vec::filled_in(n: i64, x: T, gpa) -> Vec<T>
+v.pop() -> Option<T>             v.remove(i: usize) -> T; m.remove(k) -> Option<V>
+Vec::filled_in(n: usize, x: T, gpa) -> Vec<T>
 sort(s: inout [T])               a slice in place: sort(&v[a..b]), v.sort()
 for (k, x) in m.iter()           in slot order (not insertion order)
 m.get_or_insert(k: K, d: V) -> inout [V]   m.get_or_insert(w, 0)[0] += 1;
 sc.next_token() -> Option<[u8]>  sc.next_line() -> Option<[u8]>
 parse_int(s: [u8]) -> Result<i64, ParseIntError>
-m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: i64, x: T)
+m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: usize, x: T)
 std::print_int(v: i64)           std::is_digit(b: u8) -> bool
 trim(s: [u8]) -> [u8]
 read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
-v.swap(i: i64, j: i64)           m.contains_key(k: K) -> bool
+v.swap(i: usize, j: usize)       m.contains_key(k: K) -> bool
 MinHeap::new_in(gpa), h.push(x), h.pop() -> Option<T>   a priority queue, smallest first; BinaryHeap: largest
 ```
 
@@ -82,8 +82,8 @@ Anything else is used by path (`std::print_int(n)`) or imported by name
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no file reading (call C; iterators: `volec guide
 iterators`). A `Vec` (and a `Buf`) indexes as
-its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
-`println(f"{x:>4}")` (`volec guide formatting`); errors are enums in a
+its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's,
+`println("{x:>4}")` (`volec guide formatting`); errors are enums in a
 `Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
@@ -139,7 +139,7 @@ fn main(gpa: Gpa) -> i32 {
         }
     }
     println("");
-    std::print_int(counts.len());
+    std::print_int(counts.len() as i64);
     if counts.contains_key("b") { println(" has b"); }
     0
 }

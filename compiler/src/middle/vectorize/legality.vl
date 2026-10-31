@@ -24,7 +24,10 @@ use crate::middle::scev::counted_loop;
 use crate::middle::vectorize::{
     VC_SKIP, VC_UNIFORM, VC_VECTOR, VC_WIDE, VC_WMUL, VEC_MAX_INSTS, VEC_MAX_OVERLAPS,
 };
-use crate::middle::vectorize::checks::{overlap_pairs, record_check};
+use crate::middle::vectorize::checks::{
+    OVK_LANE, OVK_RED, OVK_UNIFORM, has_ovf_kind, overlap_pairs, ovf_index, ovf_uniform,
+    record_check, record_ovf,
+};
 
 pub fn class_of(cx: sink *FnCtx, v: i64) -> i64 {
     unsafe {
@@ -129,7 +132,10 @@ pub fn use_elem(cx: sink *FnCtx, t: i64) -> bool {
             cx.v_elem = t;
             return true;
         }
-        cx.v_elem == t
+        // (0.26.2) Integers of one width share their lanes, whatever their
+        // sign: a usize count (u64) of i64 elements is one vector type; a
+        // comparison or a minimum that depends on the sign checks it itself.
+        cx.v_elem == t || lane_type(cx.v_elem) == lt
     }
 }
 
@@ -188,6 +194,7 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
         cx.v_iv2 = 0;
         cx.v_chain.count = 0;
         cx.v_checks.count = 0;
+        cx.v_ovfs.count = 0;
         cx.v_access.count = 0;
         cx.v_reds.count = 0;
         cx.v_why = 0 as *u8;
@@ -236,7 +243,8 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
                 } else if loop_contains(cx, l, s1) && is_unreachable_exit(cx, l, s0) {
                     next = s1;
                 }
-                if next == 0 || cx.blocks[next].preds.count != 1 || !record_check(cx, l, b, next) {
+                if next == 0 || cx.blocks[next].preds.count != 1
+                    || !record_check(cx, l, b, next) && !record_ovf(cx, l, b, next) {
                     return why(cx,
                         c"a branch in its body that is no bounds check (an if, a break)");
                 }
@@ -356,7 +364,7 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
             let next = cx.v_reds.data[3 * r + 1];
             // (a minimum's phi is compared too)
             let also = if cx.insts[next].op == Op::Sel { ir_val(cx, cx.insts[next].a) }
-                else { next };
+                else { reduction_ovf(cx, r, next) };
             if !uses_only(cx, l, p, next, also) {
                 return why_at(cx, c"a reduction's running value used inside the loop", p);
             }
@@ -390,6 +398,10 @@ pub fn analyze(cx: sink *FnCtx, l: i64, exit: inout i64) -> bool {
                 return why_at(cx, c"an access address that depends on a load in the loop",
                     cx.v_access.data[3 * k]);
             }
+        }
+        if cx.v_has_store && (has_ovf_kind(cx, OVK_LANE) || has_ovf_kind(cx, OVK_RED)) {
+            return why(cx,
+                c"an overflow check on lanes in a loop that stores (the scalar loop that redoes it would see its stores)");
         }
         if overlap_pairs(cx) > VEC_MAX_OVERLAPS {
             return why(cx, c"too many pairs of accesses to test for overlap (more than 16)");
@@ -523,6 +535,9 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
             set_class(cx, v, VC_SKIP);
             return true;
         }
+        if op == Op::Ovf {
+            return classify_ovf(cx, l, v);
+        }
         if op == Load {
             let ty = cx.insts[v].ty;
             let addr = ir_val(cx, cx.insts[v].a);
@@ -643,6 +658,77 @@ fn classify(cx: sink *FnCtx, l: i64, v: i64, latch_cond: i64) -> bool {
         }
         // (0.25.5: a call, an atomic, a division of integers...)
         why_at(cx, c"an operation it has no vector form for", v)
+    }
+}
+
+// (0.26.2, a prototype) Classifies overflow check v (VC_SKIP: its branch
+// goes) and gives it its kind in V_OVFS; false when it is no recorded
+// check (a value) or the vector loop cannot keep it: a product's on lanes,
+// or one on a reduction's running value that is not its step.
+fn classify_ovf(cx: sink *FnCtx, l: i64, v: i64) -> bool {
+    // UNSAFE: the function's IR is FnCtx's raw arrays, as in classify.
+    // SAFETY: v and its operands are instructions of the loop's function;
+    // k indexes V_OVFS' triples, r V_REDS'.
+    unsafe {
+        let k = ovf_index(cx, v);
+        if k < 0 {
+            return why_at(cx, c"an overflow check used as a value", v);
+        }
+        let imm = cx.insts[v].imm;
+        let op = (imm & 255) as Op;
+        let ty = imm >> 8;
+        let a = ir_val(cx, cx.insts[v].a);
+        let b = if cx.insts[v].b != 0 { ir_val(cx, cx.insts[v].b) } else { 0 };
+        let lanes = class_of(cx, a) == VC_VECTOR || b != 0 && class_of(cx, b) == VC_VECTOR;
+        set_class(cx, v, VC_SKIP);
+        if !lanes {
+            if !ovf_uniform(cx, l, v) {
+                return why_at(cx,
+                    c"an overflow check of values not exactly affine in the counter", v);
+            }
+            cx.v_ovfs.data[3 * k + 1] = OVK_UNIFORM;
+            return true;
+        }
+        if !use_elem(cx, ty) {
+            return why_at(cx, c"elements of two widths (one vector type per loop)", v);
+        }
+        for r in 0..cx.v_reds.count / 3 {
+            let phi = cx.v_reds.data[3 * r];
+            if a != phi && b != phi {
+                continue;
+            }
+            let next = cx.v_reds.data[3 * r + 1];
+            let na = ir_val(cx, cx.insts[next].a);
+            let nb = ir_val(cx, cx.insts[next].b);
+            if (op == Add || op == Sub) && cx.insts[next].op == op && cx.insts[next].ty == ty
+                && (a == na && b == nb || op == Add && a == nb && b == na) {
+                cx.v_ovfs.data[3 * k + 1] = OVK_RED;
+                cx.v_ovfs.data[3 * k + 2] = r;
+                return true;
+            }
+            return why_at(cx,
+                c"an overflow check on a reduction's running value that is not its step", v);
+        }
+        if op == Mul {
+            return why_at(cx, c"an overflow check of a product in vector lanes", v);
+        }
+        cx.v_ovfs.data[3 * k + 1] = OVK_LANE;
+        true
+    }
+}
+
+// (0.26.2) The overflow check of reduction r's step (OVK_RED), or
+// `otherwise`.
+fn reduction_ovf(cx: sink *FnCtx, r: i64, otherwise: i64) -> i64 {
+    // UNSAFE: V_OVFS is one of FnCtx's raw arrays.
+    // SAFETY: k stays below its count.
+    unsafe {
+        for k in 0..cx.v_ovfs.count / 3 {
+            if cx.v_ovfs.data[3 * k + 1] == OVK_RED && cx.v_ovfs.data[3 * k + 2] == r {
+                return cx.v_ovfs.data[3 * k];
+            }
+        }
+        otherwise
     }
 }
 

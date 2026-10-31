@@ -1,48 +1,35 @@
-// Lowering expressions: the dispatch on an expression's kind, names and
-// addresses (places), operators, `&&` and `||`, casts, enum variants,
-// slicing, and aggregates (struct, tuple and array literals, repeats).
-// Calls, vectors, `match` and control flow are in their own files.
+// Lowering expressions: lower_expr lowers an operand the places-IR
+// lowering did not bind (places.vl): a literal, a check's site or a name
+// (0.26.2: the AST lowering of the other expressions, of statements and
+// of control flow is gone). Here too: the bound operands of the calls',
+// intrinsics' and vector operations' lowerings, casts, and string
+// values.
 
 use crate::base::intern_c;
 use crate::base::comp::Comp;
-use crate::front::ast::{INT_SITE, NODES, NodeKind, child, defer_loop_depth, field_order};
-use crate::front::ast::NodeKind::{
-    Array, Assign, Binary, Bool, Break, CStr, Call, Cast, Char, Continue, EnumPanic, FieldAccess,
-    Float, For, Ident, If, Index, Int, Loop, Match, Range, Repeat, Return, Str, StructLit, Tuple,
-    TupleField, Unary, Unit, VariantLit, While,
-};
+use crate::front::ast::{INT_SITE, NODES, NodeKind};
+use crate::front::ast::NodeKind::{Array, Bool, CStr, Char, Float, Ident, Int, Str, Unit};
 use crate::front::check::{Res, type_error};
 use crate::front::consteval::{const_value, f64_of_bits, float_const, wrap_int};
 use crate::front::contracts::sites::site_of;
-use crate::front::distinct::enum_niche;
 use crate::front::lexer::{Tok, str_at};
 use crate::front::parser::exprs::is_comparison;
 use crate::front::types::{
-    ENUMS, TYPES, TY_BOOL, TY_F32, TY_I64, TY_NEVER, TY_STRING, TY_U64, TyKind, VARIANTS,
-    field_offset, int_bits, is_compound, is_float, is_integer, is_slice, is_vector, is_void,
-    scalar_type, struct_field, tuple_offset, type_elem, type_size, variant_field,
-    variant_field_offset,
+    TYPES, TY_BOOL, TY_F32, TY_NEVER, TY_STRING, TY_U64, TyKind, int_bits, is_compound, is_float,
+    is_integer, is_signed, is_slice, is_void, scalar_type, type_size,
 };
-use crate::gen0::gen::expr::{field_offset_of, panic_kind, pointer_place};
+use crate::gen0::gen::expr::panic_kind;
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
     CUR, Cond, IR_CALL_LOCS, IR_EXPR_LOC, Op, RT_SITE, Term, cond_of_token, emit_ir, ir_binary,
-    ir_cmp, ir_const, ir_load, ir_new_block, ir_offset, ir_rtid, ir_slot_addr, ir_store, ir_type,
+    ir_cmp, ir_const, ir_load, ir_offset, ir_rtid, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
-use crate::middle::lower::{
-    is_dead_block, keep_value, lower_assign, lower_block, lower_branch, lower_copy, lower_defers,
-    lower_jump, lower_return, new_slot_for, start_dead_block,
-};
+use crate::middle::lower::{is_dead_block, lower_copy, new_slot_for, start_dead_block};
 use crate::middle::lower::calls::{
-    lower_call, lower_check, lower_panic, push_arg, raw_check, static_address, take_args,
+    lower_check, lower_overflow_check, push_arg, raw_check, static_address, take_args,
 };
-use crate::middle::lower::control::{LOOP_INFO, lower_break, lower_for, lower_if, lower_loop};
-use crate::middle::lower::matching::lower_match;
-use crate::middle::lower::ssa::{
-    LOCAL_ADDR, PROMOTE, ir_seal, new_synth_var, ssa_read, ssa_undef, ssa_write,
-};
-use crate::middle::lower::vector::{lower_vecop, lower_vector_binary, lower_vector_negate};
+use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE, ssa_read, ssa_undef};
 
 // ---- Expressions ----
 
@@ -55,10 +42,6 @@ pub fn need_value(cx: sink *FnCtx, value: i64, ty: i64) -> i64 {
     ssa_undef(cx, ir_type(ty))
 }
 
-pub fn lower_operand(cx: sink *FnCtx, n: i64) -> i64 {
-    need_value(cx, lower_expr(cx, n), NODES[n].ty)
-}
-
 // (0.26.1) An operand of a call, an intrinsic or a vector operation,
 // expression e: the one point where those lowerings read their operands,
 // so that the places-IR lowering gives them its operands' values instead
@@ -66,8 +49,8 @@ pub fn lower_operand(cx: sink *FnCtx, n: i64) -> i64 {
 // is lower_expr's value (0 when there is none), `operand_value` its value
 // of e's type.
 pub fn operand_expr(cx: sink *FnCtx, e: i64) -> i64 {
-    if BOUND_NODES.len() > 0 {
-        for k in 0..BOUND_NODES.len() {
+    if BOUND_NODES.len() as i64 > 0 {
+        for k in 0..BOUND_NODES.len() as i64 {
             if BOUND_NODES[k] == e {
                 return BOUND_VALUES[k];
             }
@@ -127,62 +110,6 @@ fn lower_expr_inner(cx: sink *FnCtx, n: i64) -> i64 {
             Str => lower_string(cx, n),
             CStr => emit_ir(cx, Op::SAddr, TY_U64, 0, 0, NODES[n].a),
             Ident => lower_ident(cx, n),
-            Binary => lower_binary(cx, n),
-            Unary => lower_unary(cx, n),
-            Cast => {
-                let operand = NODES[n].a;
-                let value = lower_expr(cx, operand);
-                lower_cast(cx, value, NODES[operand].ty, ty)
-            }
-            Call => lower_call(cx, n),
-            Index if NODES[NODES[n].b].kind == Range => lower_slicing(cx, n),
-            Index | FieldAccess | TupleField => load_scalar(cx, lower_addr(cx, n), ty),
-            VariantLit => lower_variant(cx, n),
-            NodeKind::VecOp => lower_vecop(cx, n),
-            // (0.14: its env, or its function as a value)
-            NodeKind::Closure => lower_expr(cx, NODES[n].y),
-            // (0.15: the Match of `?`, the Block of an f-string)
-            NodeKind::Try | NodeKind::Interp => lower_expr(cx, NODES[n].y),
-            Match => lower_match(cx, n),
-            Tuple | Array | StructLit => lower_aggregate(cx, n),
-            Repeat => lower_repeat(cx, n),
-            NodeKind::Block => lower_block(cx, n),
-            If => lower_if(cx, n),
-            Loop | While => lower_loop(cx, n),
-            For => {
-                lower_for(cx, n);
-                0
-            }
-            Assign => {
-                lower_assign(cx, n);
-                0
-            }
-            EnumPanic => {
-                let operand = NODES[n].a;
-                let value = lower_cast(cx, lower_operand(cx, operand), NODES[operand].ty, TY_I64);
-                lower_panic(cx, NODES[n].x, value, site_of(n, 0));
-                0
-            }
-            Return => {
-                var value = 0;
-                if NODES[n].a != 0 {
-                    value = keep_value(cx, lower_expr(cx, NODES[n].a), NODES[NODES[n].a].ty, 0);
-                }
-                lower_defers(cx, 0);
-                lower_return(cx, value);
-                0
-            }
-            Break => {
-                lower_break(cx, n);
-                0
-            }
-            Continue => {
-                let info = NODES[NODES[n].x].z;
-                lower_defers(cx, defer_loop_depth(NODES[n].x));
-                lower_jump(cx, LOOP_INFO.data[info]);
-                start_dead_block(cx);
-                0
-            }
             _ => type_error(n, c"internal error: unexpected node in IR lowering"),
         }
     }
@@ -225,101 +152,6 @@ fn lower_ident(cx: sink *FnCtx, n: i64) -> i64 {
     }
 }
 
-// The pointer base of `p[i]` or `p[lo..hi]`, before its index or bounds:
-// a place's address (`pointer_place`), 0 for a promoted local, else its
-// value. `late_pointer` gives the pointer after them.
-fn early_pointer(cx: sink *FnCtx, base: i64) -> i64 {
-    unsafe {
-        if NODES[base].kind == Ident && NODES[base].res == Res::Local
-            && PROMOTE[NODES[base].y] != 0 {
-            return 0;
-        }
-        if pointer_place(base) {
-            return lower_addr(cx, base);
-        }
-        lower_operand(cx, base)
-    }
-}
-
-fn late_pointer(cx: sink *FnCtx, base: i64, early: i64) -> i64 {
-    unsafe {
-        if NODES[base].kind == Ident && NODES[base].res == Res::Local
-            && PROMOTE[NODES[base].y] != 0 {
-            return lower_operand(cx, base);
-        }
-        if pointer_place(base) {
-            return ir_load(cx, TY_U64, early, 0);
-        }
-        early
-    }
-}
-
-// The address of a place (or of a compound value).
-pub fn lower_addr(cx: sink *FnCtx, n: i64) -> i64 {
-    unsafe {
-        match NODES[n].kind {
-            Ident if NODES[n].res == Res::Local => {
-                let local = NODES[n].y;
-                if PROMOTE[local] != 0 {
-                    type_error(n, c"internal error: address of an SSA variable");
-                }
-                LOCAL_ADDR[local]
-            }
-            Ident if NODES[n].res
-                == Res::Static => static_address(cx, NODES[n].a),
-            Unary if NODES[n].op == Tok::Star => {
-                let addr = lower_operand(cx, NODES[n].b);
-                raw_check(cx, n, addr, ir_const(cx, type_size(NODES[n].ty), TY_U64));
-                addr
-            }
-            FieldAccess => {
-                let addr = lower_operand(cx, NODES[n].a);
-                let field = ir_offset(cx, addr, field_offset_of(n));
-                raw_check(cx, n, field, ir_const(cx, type_size(NODES[n].ty), TY_U64));
-                field
-            }
-            TupleField => {
-                let base = NODES[n].a;
-                let addr = lower_operand(cx, base);
-                ir_offset(cx, addr, tuple_offset(NODES[base].ty, NODES[n].b))
-            }
-            Index => {
-                let base = NODES[n].a;
-                let base_ty = NODES[base].ty;
-                let elem_size = type_size(TYPES[base_ty].a);
-                // A slice's address (its pointer and length are read after
-                // the index), an array's, or a pointer read after it.
-                let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
-                var addr = if is_pointer { early_pointer(cx, base) }
-                    else { lower_operand(cx, base) };
-                let index = lower_operand(cx, NODES[n].b);
-                if is_pointer {
-                    addr = late_pointer(cx, base, addr);
-                } else if is_slice(base_ty) {
-                    let length = ir_load(cx, TY_U64, addr, 8);
-                    lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
-                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
-                    addr = ir_load(cx, TY_U64, addr, 0);
-                } else if TYPES[base_ty].kind == TyKind::Array {
-                    // Checked (0.7), against the constant length: SCCP and
-                    // the value ranges remove what they prove.
-                    let length = ir_const(cx, TYPES[base_ty].b, TY_U64);
-                    lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
-                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
-                }
-                var scaled = index;
-                if elem_size != 1 {
-                    scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64));
-                }
-                let at = ir_binary(cx, Op::Add, TY_U64, addr, scaled);
-                raw_check(cx, n, at, ir_const(cx, elem_size, TY_U64));
-                at
-            }
-            _ => lower_operand(cx, n),
-        }
-    }
-}
-
 // ---- Operators ----
 
 pub fn arith_op(token: Tok) -> Op {
@@ -338,7 +170,9 @@ pub fn arith_op(token: Tok) -> Op {
 }
 
 // a <token> b, for operands of type `operand_ty` and a result of type `ty`.
-pub fn lower_operator(cx: sink *FnCtx, token: Tok, operand_ty: i64, ty: i64, a: i64, b: i64) -> i64 {
+// (0.26.2, a prototype) site: the operation's, for its overflow check.
+pub fn lower_operator(cx: sink *FnCtx, token: Tok, operand_ty: i64, ty: i64, a: i64, b: i64,
+    site: i64 = 0) -> i64 {
     if is_comparison(token) {
         return ir_cmp(cx, cond_of_token(token), ir_type(operand_ty), a, b);
     }
@@ -351,67 +185,22 @@ pub fn lower_operator(cx: sink *FnCtx, token: Tok, operand_ty: i64, ty: i64, a: 
         take_args(cx, call, mark);
         return call;
     }
-    ir_binary(cx, arith_op(token), ir_type(ty), a, b)
-}
-
-fn lower_binary(cx: sink *FnCtx, n: i64) -> i64 {
-    let op = NODES[n].op;
-    let lhs = NODES[n].b;
-    let rhs = NODES[n].c;
-    if op == Tok::AmpAmp || op == Tok::PipePipe {
-        return lower_short_circuit(cx, op, lhs, rhs);
-    }
-    if is_vector(NODES[lhs].ty) {
-        return lower_vector_binary(cx, op, lhs, rhs, NODES[n].ty);
-    }
-    let a = lower_operand(cx, lhs);
-    let b = lower_operand(cx, rhs);
-    lower_operator(cx, op, NODES[lhs].ty, NODES[n].ty, a, b)
-}
-
-fn lower_short_circuit(cx: sink *FnCtx, op: Tok, lhs: i64, rhs: i64) -> i64 {
-    let result = new_synth_var(cx, TY_BOOL);
-    let a = lower_operand(cx, lhs);
-    ssa_write(cx, result, CUR, a);
-    let rhs_block = ir_new_block(cx);
-    let join = ir_new_block(cx);
-    if op == Tok::AmpAmp {
-        lower_branch(cx, a, rhs_block, join);
-    } else {
-        lower_branch(cx, a, join, rhs_block);
-    }
-    ir_seal(cx, rhs_block);
-    CUR = rhs_block;
-    let b = lower_operand(cx, rhs);
-    ssa_write(cx, result, CUR, b);
-    lower_jump(cx, join);
-    ir_seal(cx, join);
-    CUR = join;
-    ssa_read(cx, result, join)
-}
-
-fn lower_unary(cx: sink *FnCtx, n: i64) -> i64 {
-    let op = NODES[n].op;
-    let operand = NODES[n].b;
-    let ty = NODES[n].ty;
-    if op == Tok::Amp {
-        return lower_addr(cx, operand);
-    }
-    if op == Tok::Minus && is_vector(ty) {
-        return lower_vector_negate(cx, operand, ty);
-    }
-    let value = lower_operand(cx, operand);
-    if op == Tok::Minus || op == Tok::Bang || op == Tok::Tilde {
-        return lower_unop(cx, op, ty, value);
-    }
-    raw_check(cx, n, value, ir_const(cx, type_size(ty), TY_U64));
-    load_scalar(cx, value, ty)
+    let op = arith_op(token);
+    let r = ir_binary(cx, op, ir_type(ty), a, b);
+    lower_overflow_check(cx, op, ty, a, b, site);
+    r
 }
 
 // (0.26.1) <token> value, `-`, `!` or `~` on a scalar, of type `ty`.
-pub fn lower_unop(cx: sink *FnCtx, token: Tok, ty: i64, value: i64) -> i64 {
+// (0.26.2, a prototype) site: the operation's, for its overflow check (-1:
+// none, as for a literal's sign).
+pub fn lower_unop(cx: sink *FnCtx, token: Tok, ty: i64, value: i64, site: i64 = -1) -> i64 {
     if token == Tok::Minus {
-        return emit_ir(cx, Op::Neg, ir_type(ty), value, 0, 0);
+        let r = emit_ir(cx, Op::Neg, ir_type(ty), value, 0, 0);
+        if site >= 0 && is_signed(ty) {
+            lower_overflow_check(cx, Op::Neg, ty, value, 0, site);
+        }
+        return r;
     }
     if token == Tok::Bang {
         return emit_ir(cx, Op::Not, TY_BOOL, value, 0, 0);
@@ -444,64 +233,6 @@ pub fn lower_cast(cx: sink *FnCtx, value: i64, checker_from: i64, to: i64) -> i6
 }
 
 // ---- Enums and slices ----
-
-fn lower_variant(cx: sink *FnCtx, n: i64) -> i64 {
-    unsafe {
-        let ty = NODES[n].ty;
-        let v = NODES[n].a;
-        let tag = ENUMS[TYPES[ty].a].tag;
-        let discr = wrap_int(VARIANTS[v].discr, tag);
-        if !is_compound(ty) {
-            return ir_const(cx, discr, tag);
-        }
-        let base = ir_slot_addr(cx, new_slot_for(cx, ty));
-        // (0.18: the null niche: the pointer, or null)
-        if enum_niche(TYPES[ty].a) {
-            if NODES[n].count == 1 {
-                store_value(cx, base, 0, lower_expr(cx, child(n, 0)), variant_field(v, 0));
-            } else {
-                ir_store(cx, TY_U64, base, ir_const(cx, 0, TY_U64), 0);
-            }
-            return base;
-        }
-        for j in 0..NODES[n].count {
-            let i = field_order(n, j);
-            let value = lower_expr(cx, child(n, i));
-            store_value(cx, base, variant_field_offset(v, i), value, variant_field(v, i));
-        }
-        ir_store(cx, tag, base, ir_const(cx, discr, tag), 0);
-        base
-    }
-}
-
-// `a[lo..hi]`: as gen_slicing (gen.vl).
-fn lower_slicing(cx: sink *FnCtx, n: i64) -> i64 {
-    let base = NODES[n].a;
-    let base_ty = NODES[base].ty;
-    let range = NODES[n].b;
-    let low = NODES[range].a;
-    let high = NODES[range].b;
-    // The base first (a slice's address, a pointer's location or
-    // value, an array's address), then the bounds, then what the base
-    // holds, so that bounds that change it are seen.
-    let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
-    let value = if is_pointer { early_pointer(cx, base) } else { lower_operand(cx, base) };
-    var bound_ty = TY_U64;
-    var lo = 0;
-    if low != 0 {
-        lo = lower_operand(cx, low);
-        bound_ty = NODES[low].ty;
-    } else {
-        lo = ir_const(cx, 0, TY_U64);
-    }
-    var hi = 0;
-    if high != 0 {
-        hi = lower_operand(cx, high);
-        bound_ty = NODES[high].ty;
-    }
-    let at = if is_pointer { late_pointer(cx, base, value) } else { value };
-    slice_of_values(cx, n, base_ty, at, lo, hi, bound_ty)
-}
 
 // (0.26.1) The slice `base[lo..hi]` (node n: inclusive or not, its site),
 // of the base of type base_ty at `value` (a pointer's value; a slice's or
@@ -562,35 +293,6 @@ pub fn slice_of_values(cx: sink *FnCtx, n: i64, base_ty: i64, value: i64, lo: i6
 
 // ---- Aggregates ----
 
-fn lower_aggregate(cx: sink *FnCtx, n: i64) -> i64 {
-    unsafe {
-        let ty = NODES[n].ty;
-        let kind = NODES[n].kind;
-        let base = ir_slot_addr(cx, new_slot_for(cx, ty));
-        for i in 0..NODES[n].count {
-            let elem = child(n, i);
-            var value_node = elem;
-            var offset = 0;
-            var elem_ty = 0;
-            if kind == StructLit {
-                let s = TYPES[ty].a;
-                value_node = NODES[elem].b;
-                offset = field_offset(s, NODES[elem].x);
-                elem_ty = (*struct_field(s, NODES[elem].x)).ty;
-            } else if kind == Tuple {
-                offset = tuple_offset(ty, i);
-                elem_ty = type_elem(ty, i);
-            } else {
-                elem_ty = TYPES[ty].a;
-                offset = i * type_size(elem_ty);
-            }
-            let value = lower_expr(cx, value_node);
-            store_value(cx, base, offset, value, elem_ty);
-        }
-        base
-    }
-}
-
 // Stores `value` (of checker type `ty`) at addr + offset.
 pub fn store_value(cx: sink *FnCtx, addr: i64, offset: i64, value: i64, ty: i64) {
     if is_void(ty) {
@@ -602,39 +304,4 @@ pub fn store_value(cx: sink *FnCtx, addr: i64, offset: i64, value: i64, ty: i64)
     } else {
         ir_store(cx, ir_type(ty), addr, v, offset);
     }
-}
-
-// `[value; count]`: the value is evaluated once.
-fn lower_repeat(cx: sink *FnCtx, n: i64) -> i64 {
-    let ty = NODES[n].ty;
-    let elem_ty = TYPES[ty].a;
-    let count = TYPES[ty].b;
-    let elem_size = type_size(elem_ty);
-    let base = ir_slot_addr(cx, new_slot_for(cx, ty));
-    let value = lower_expr(cx, NODES[n].a);
-    if count == 0 || is_void(elem_ty) || elem_size == 0 {
-        return base;
-    }
-    if count <= 4 {
-        for i in 0..count {
-            store_value(cx, base, i * elem_size, value, elem_ty);
-        }
-        return base;
-    }
-    let cursor = new_synth_var(cx, TY_U64);
-    ssa_write(cx, cursor, CUR, base);
-    let end = ir_offset(cx, base, count * elem_size);
-    let body = ir_new_block(cx);
-    let exit = ir_new_block(cx);
-    lower_jump(cx, body);
-    CUR = body;
-    let at = ssa_read(cx, cursor, body);
-    store_value(cx, at, 0, value, elem_ty);
-    let next = ir_offset(cx, at, elem_size);
-    ssa_write(cx, cursor, CUR, next);
-    lower_branch(cx, ir_cmp(cx, Cond::Ne, TY_U64, next, end), body, exit);
-    ir_seal(cx, body);
-    ir_seal(cx, exit);
-    CUR = exit;
-    base
 }

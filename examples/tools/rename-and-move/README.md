@@ -44,7 +44,7 @@ prints the word, and comments use it. A text search sees all of them:
 ```console
 $ grep -n count *.vl
 catalog.vl:9:    pub count: i64,
-catalog.vl:25:        self.books.push(Book { id: id, title: title, author: author, count: n, owned: n });
+catalog.vl:25:        self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
 catalog.vl:39:            if cat.books[i].count == 0 {
 catalog.vl:42:            cat.books[i].count -= 1;
 catalog.vl:52:        cat.books[i].count += 1;
@@ -52,10 +52,10 @@ loans.vl:38:    ms.list[i].count += 1;
 loans.vl:64:                ms.list[i].count -= 1;
 members.vl:6:    // the count of books held now
 members.vl:7:    pub count: i64,
-members.vl:24:        self.list.push(Member { id: id, name: name, count: 0, limit: limit, owed: 0 });
+members.vl:24:        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
 members.vl:35:    m.count < m.limit && m.owed == 0
-report.vl:10:        println(f"  {b.title:<28} {b.author:<18} count {b.count}/{b.owned}");
-report.vl:17:        println(f"  {m.name:<10} holds {m.count} of {m.limit}, owes {m.owed} cents");
+report.vl:10:        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
+report.vl:17:        println("  {:<10} holds {} of {}, owes {} cents", m.name, m.count, m.limit, m.owed);
 ```
 
 The compiler knows which ones are `Book`'s field, including the use
@@ -65,12 +65,12 @@ inside an f-string hole and the one in a struct literal:
 $ volec query refs Book.count
 # catalog.vl
 9:9	def	pub count: i64,
-25:70	init	catalog::Catalog::add	self.books.push(Book { id: id, title: title, author: author, count: n, owned: n });
+25:77	init	catalog::Catalog::add	self.books.push(Book { id: id as i64, title: title, author: author, count: n, owned: n });
 39:29	read	catalog::take	if cat.books[i].count == 0 {
 42:26	write	catalog::take	cat.books[i].count -= 1;
 52:22	write	catalog::put_back	cat.books[i].count += 1;
 # report.vl
-10:59	read	report::shelf	println(f"  {b.title:<28} {b.author:<18} count {b.count}/{b.owned}");
+10:69	read	report::shelf	println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.count, b.owned);
 ```
 
 So the rename changes exactly those, and leaves `Member.count`, the
@@ -82,7 +82,7 @@ renamed crate::catalog::Book.count to copies	2 files	+6 -6 lines
 // catalog.vl:9
 9	    pub copies: i64,
 // catalog.vl:25
-25	        self.books.push(Book { id: id, title: title, author: author, copies: n, owned: n });
+25	        self.books.push(Book { id: id as i64, title: title, author: author, copies: n, owned: n });
 // catalog.vl:39
 39	            if cat.books[i].copies == 0 {
 // catalog.vl:42
@@ -90,7 +90,7 @@ renamed crate::catalog::Book.count to copies	2 files	+6 -6 lines
 // catalog.vl:52
 52	        cat.books[i].copies += 1;
 // report.vl:10
-10	        println(f"  {b.title:<28} {b.author:<18} count {b.copies}/{b.owned}");
+10	        println("  {:<28} {:<18} count {}/{}", b.title, b.author, b.copies, b.owned);
 ```
 
 `--show` prints the lines the edit wrote, numbered, so nothing needs to
@@ -213,8 +213,8 @@ $ volec query diff
 -    pub list: Vec<Member>,
 +    pub list: Vec<Patron>,
 @@ -24 +24 @@
--        self.list.push(Member { id: id, name: name, count: 0, limit: limit, owed: 0 });
-+        self.list.push(Patron { id: id, name: name, count: 0, limit: limit, owed: 0 });
+-        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
++        self.list.push(Patron { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
 @@ -34 +34 @@
 -pub fn can_borrow(m: Member) -> bool {
 +pub fn can_borrow(m: Patron) -> bool {

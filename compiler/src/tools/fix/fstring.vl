@@ -1,0 +1,261 @@
+// `volec fix --only fstring` (0.26.2; docs/grammar.md, "Formatting"): the
+// move from f-strings to format literals, mechanical, refusing nothing:
+//
+//   (1) an f-string at a format position loses its `f`;
+//   (2) a hole holding a name stays where it is; every other hole becomes
+//       `{}` (`{:spec}`), its expression a positional argument after the
+//       literal, in hole order: the same evaluation order, and a string
+//       literal in a hole needs no escaping;
+//   (3) an f-string anywhere else becomes `format_args("..", args)`;
+//   (4) a plain literal with braces at a format position gets them
+//       doubled, so that it prints what it printed before 0.26.2.
+//
+// Rule 4 reads the program as written before 0.26.2 (`--keep-braces`
+// turns it off, for code already read as 0.26.2 reads it): the fix is one run
+// (`one_round`, fix/command.vl), and a second one would double the braces
+// rule 1 left. The format positions are the checker's
+// (front/check/format.vl: FORMAT_SITES, recorded as the calls are
+// checked); an f-string the checker never saw (in a generic function
+// never instantiated) is placed by its call as written.
+
+use crate::base::{SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_str};
+use crate::front::check::format::{FORMAT_SITES, SITE_FORMAT};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, Token};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::fix::user_pos;
+use crate::tools::query::refs::ref_in;
+
+// Token t of the program.
+fn tok(t: i64) -> Token {
+    // UNSAFE: TOKS is the lexer's token table, a raw pointer (front/lexer).
+    // SAFETY: every caller's t is in 0..TOK_COUNT (checked where it is made).
+    unsafe { TOKS[t] }
+}
+
+// (`--keep-braces`) rule 4 off: the code is read as 0.26.2 reads it, its
+// plain literals already format strings (a tree migrated after 0.26.2
+// went in, whose tests pass).
+pub static var KEEP_BRACES: bool = false;
+
+// The edits of the f-strings and of the plain literals at format
+// positions; their number.
+pub fn fstring_edits() -> i64 {
+    // (a position's kind: SITE_FORMAT wins, a call checked once per
+    // instance of its function records it each time)
+    var sites = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    var i = 0;
+    while i + 1 < FORMAT_SITES.count {
+        let p = FORMAT_SITES.get(i);
+        if sites.get(p + 1) != SITE_FORMAT {
+            sites.put(p + 1, FORMAT_SITES.get(i + 1));
+        }
+        i += 2;
+    }
+    var fixes = 0;
+    var t = 0;
+    while t < TOK_COUNT {
+        let k = tok(t);
+        if k.kind == Tok::FHead {
+            let last = fstring_end(t);
+            if user_pos(k.start) && ref_in(k.start) {
+                let site = sites.get(k.start + 1);
+                let at_format = site == SITE_FORMAT || site == 0 && written_format_position(t);
+                if fstring_edit(t, last, at_format) {
+                    fixes += 1;
+                    if at_format {
+                        push_str_renamed(t);
+                    }
+                }
+            }
+            t = last + 1;
+            continue;
+        }
+        if !KEEP_BRACES && k.kind == Tok::Str && sites.get(k.start + 1) == SITE_FORMAT
+            && user_pos(k.start)
+            && ref_in(k.start) && double_braces(k) {
+            fixes += 1;
+        }
+        t += 1;
+    }
+    fixes
+}
+
+// The FTail of the f-string whose FHead is token t (t itself without a
+// hole).
+fn fstring_end(t: i64) -> i64 {
+    if tok(t).suffix == 1 {
+        return t;
+    }
+    var k = t + 1;
+    while k + 1 < TOK_COUNT && tok(k).kind != Tok::FTail {
+        k += 1;
+    }
+    k
+}
+
+// The position of the next `{` that opens a hole in an f-string's text
+// from p, or of its closing quote (`"`, a text block's `"""`).
+fn scan_text(p0: i64, block: bool) -> i64 {
+    var p = p0;
+    while p < SRC.len as i64 {
+        let c = SRC[p];
+        if c == '\\' {
+            p += 2;
+        } else if (c == '{' || c == '}') && p + 1 < SRC.len as i64 && SRC[p + 1] == c {
+            p += 2;
+        } else if c == '{' {
+            return p;
+        }
+        else if c == '"'
+            && (!block || p + 2 < SRC.len as i64 && SRC[p + 1] == '"' && SRC[p + 2] == '"') {
+            return p;
+        } else {
+            p += 1;
+        }
+    }
+    p
+}
+
+// Whether the f-string of tokens t..last (FHead to FTail) was rewritten:
+// a format literal and its arguments (rules 1 and 2), as format_args'
+// arguments when it is not at a format position (rule 3).
+fn fstring_edit(t: i64, last: i64, at_format: bool) -> bool {
+    let start = tok(t).start;
+    let block = start + 3 < SRC.len as i64 && SRC[start + 2] == '"' && SRC[start + 3] == '"';
+    let quote = if block { 3 } else { 1 };
+    let lit = buf_new();
+    let args = buf_new();
+    // `"` (or `"""`) and the text up to the first hole
+    var p = start + 1;
+    var q = scan_text(start + 1 + quote, block);
+    buf_bytes(lit, SRC[p..q]);
+    var piece = t;
+    while SRC[q] == '{' {
+        // the hole: its tokens up to the next FMid or FTail
+        let first = piece + 1;
+        var next = first;
+        while next < last && tok(next).kind != Tok::FMid {
+            next += 1;
+        }
+        let at = tok(next).start;
+        buf_byte(lit, '{');
+        if next == first + 1 && tok(first).kind == Tok::Ident {
+            buf_bytes(lit, SRC[tok(first).start..tok(first).end]);
+        } else {
+            buf_str(args, c", ");
+            buf_bytes(args, trimmed(SRC[q + 1..at]));
+        }
+        // its spec and `}`, then the text up to the next hole
+        var close = at;
+        while close < SRC.len as i64 && SRC[close] != '}' {
+            close += 1;
+        }
+        buf_bytes(lit, SRC[at..close + 1]);
+        p = close + 1;
+        q = scan_text(p, block);
+        buf_bytes(lit, SRC[p..q]);
+        piece = next;
+    }
+    let end = q + quote;
+    buf_bytes(lit, SRC[q..end]);
+    let text = buf_new();
+    if !at_format {
+        buf_str(text, c"format_args(");
+    }
+    buf_bytes(text, crate::base::buf_slice(lit));
+    buf_bytes(text, crate::base::buf_slice(args));
+    if !at_format {
+        buf_byte(text, ')');
+    }
+    edit_replace(start, end, text)
+}
+
+// s without the blanks around it.
+fn trimmed(s: [u8]) -> [u8] {
+    var a = 0;
+    var b = s.len as i64;
+    while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\n' || s[a] == '\r') {
+        a += 1;
+    }
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n' || s[b - 1] == '\r') {
+        b -= 1;
+    }
+    s[a..b]
+}
+
+// Whether plain literal k's braces were doubled (rule 4).
+fn double_braces(k: Token) -> bool {
+    let text = buf_new();
+    for i in k.start..k.end {
+        let c = SRC[i];
+        buf_byte(text, c);
+        if c == '{' || c == '}' {
+            buf_byte(text, c);
+        }
+    }
+    edit_replace(k.start, k.end, text)
+}
+
+// The call whose argument the f-string at token t is, as written: the
+// token of its function's name (-1: none, `(` not after a name) and the
+// commas before the f-string in its arguments.
+fn written_call(t: i64) -> (i64, i64) {
+    var k = t - 1;
+    var depth = 0;
+    var commas = 0;
+    while k >= 0 {
+        let kind = tok(k).kind;
+        if kind == Tok::RParen || kind == Tok::RBracket || kind == Tok::RBrace {
+            depth += 1;
+        } else if kind == Tok::LParen || kind == Tok::LBracket || kind == Tok::LBrace {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else if depth == 0 && kind == Tok::Comma {
+            commas += 1;
+        } else if depth == 0 && kind == Tok::Semi {
+            return (-1, 0);
+        }
+        k -= 1;
+    }
+    if k < 1 || tok(k).kind != Tok::LParen || tok(k - 1).kind != Tok::Ident {
+        return (-1, 0);
+    }
+    (k - 1, commas)
+}
+
+// Whether the f-string whose FHead is token t is, as written, the format
+// argument of a format function's call: `println(f"..")`, `format_in(f"..",
+// a)`, `assert(c, f"..")`, `b.push_fmt(f"..")` (for one the checker never
+// saw).
+fn written_format_position(t: i64) -> bool {
+    let (c, commas) = written_call(t);
+    if c < 0 {
+        return false;
+    }
+    let name = SYMS[tok(c).value as i64].text;
+    if c >= 1 && tok(c - 1).kind == Tok::Dot {
+        return commas == 0 && (name == "push_fmt" || name == "write" || name == "push_str");
+    }
+    if commas == 1 {
+        return name == "assert" || name == "debug_assert";
+    }
+    commas == 0 && (name == "print" || name == "println" || name == "eprint"
+        || name == "eprintln" || name == "format_in" || name == "format_args"
+        || name == "panic")
+}
+
+// (0.17's `b.push_str(f"..")`, which is `b.push_fmt(f"..")`) The call of
+// the f-string at token t named push_fmt when it is written `push_str`:
+// a format literal's arguments are push_fmt's.
+fn push_str_renamed(t: i64) {
+    let (c, commas) = written_call(t);
+    if c >= 1 && commas == 0 && tok(c - 1).kind == Tok::Dot
+        && SYMS[tok(c).value as i64].text == "push_str" {
+        let name = buf_new();
+        buf_str(name, c"push_fmt");
+        edit_replace(tok(c).start, tok(c).end, name);
+    }
+}

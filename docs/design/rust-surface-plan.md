@@ -1042,9 +1042,17 @@ which the user accepted as a whole.
    as a gate row.
 5. **Panics** format into a fixed buffer and truncate; they never
    allocate.
-6. **Arithmetic:** overflow checks always on, no release switch, as for
-   contracts. Their cost on the bench is measured in Phase 1(b) before
-   anything else depends on it.
+6. **Arithmetic** (revised 2026-10-30, after Phase 1(b)'s measurement):
+   Rust's default. Overflow checks are on at -O0 and off at -O1 and up,
+   where `+ - *` wrap (defined, as Rust's release builds);
+   `--overflow-checks=on|off` overrides, as rustc's `-C overflow-checks`.
+   `/` and `%` by zero and `MIN / -1` panic at every level; over-long
+   shifts panic in debug and are masked in release. std is built with the
+   program's setting. Always-on was the first choice; on the bench it cost
+   1.285x instructions (geomean of 43 programs; Rust's own checks 1.005x)
+   and 1.207x after a round of mitigations (fused checks, checked vector
+   loops, range offsets), against a limit of 1.05x, so the user's
+   fallback applied. The mitigations stay, for `on` at -O2.
 7. **No deprecation period:** MVS is deleted in 0.28.
 8. **The cuts of §6** move to 0.29; gate 3 says whether compiler/src
    needs any of them earlier.
@@ -1102,6 +1110,16 @@ Taken after the 0.26.0 review (2026-10-30), the user accepting both:
     (Refined 2026-10-30 after the 0.26.2 review. §11 said "a part has no
     entry points", which fluid2d's BLUR contradicts, and "in one
     module".)
+20. **`defer` is removed** (the user, 2026-10-30), in 0.26.2: Rust has
+    none, and what it did is a guard with `Drop` (an fd, a directory, a
+    buffer that closes or frees itself). `defer` becomes
+    `error syntax.defer`, with an `explain` entry showing the guard.
+    The uses are few: one in compiler/src (front/parser, a `free`), none
+    in std, 9 in examples (fds and directories closed), about 20 test
+    files and 2 guide pages. compiler/src's use goes first, so the chain
+    still builds. The places IR loses one way out of a block. As decision
+    18 says, a guard's `Drop` does not run on a panic until unwinding is
+    built, and neither did `defer`.
 
 ## 13. How the work runs (the user's constraints, 2026-10-30)
 

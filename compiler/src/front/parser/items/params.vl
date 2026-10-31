@@ -1,11 +1,15 @@
 // A function's parameter list: `self`, the named parameters with their
 // defaults, a C function's `...` (split from items).
 
-use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, intern_c};
-use crate::base::diag::{err_begin, err_end, err_help, err_str, error_at};
+use crate::base::{
+    IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, intern, intern_c,
+};
+use crate::base::diag::{
+    ERR_KIND, err_begin, err_end, err_end_soft, err_fmt, err_help, err_jump, err_str, error_at,
+};
 use crate::front::ast::{
-    CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF, NODE_REF_MUT, NodeKind, list_begin, list_end,
-    list_push, new_node,
+    CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind,
+    SCRATCH, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::conv::{conv_error, rust_spelling, starts_type, strict_at, word_at};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
@@ -14,7 +18,7 @@ use crate::front::parser::{
     P, advance, at, cur_start, eat, expect, expect_binding_name, expect_ident, prev_end, tok_kind,
 };
 use crate::front::parser::exprs::parse_expr;
-use crate::front::parser::types::parse_type;
+use crate::front::parser::types::{parse_bound, parse_type};
 
 // The parameters of `n` up to `)`; whether they end with `...`.
 pub fn parse_params(n: i64, allow_ellipsis: bool) -> bool {
@@ -127,11 +131,11 @@ fn parse_param() -> i64 {
 fn mode_order_error(start: i64, mode: crate::front::lexer::Token, name: i64, end: i64) {
     let (text, word) = (SRC[start..end], SRC[mode.start..mode.end]);
     var colon = 0;
-    while colon < text.len && text[colon] != ':' {
+    while colon < text.len as i64 && text[colon] != ':' {
         colon += 1;
     }
     var t = colon + 1;
-    while t < text.len && (text[t] == ' ' || text[t] == '\t' || text[t] == '\n') {
+    while t < text.len as i64 && (text[t] == ' ' || text[t] == '\t' || text[t] == '\n') {
         t += 1;
     }
     let new = buf_new();
@@ -141,7 +145,7 @@ fn mode_order_error(start: i64, mode: crate::front::lexer::Token, name: i64, end
         buf_bytes(new, word);
         buf_bytes(new, " ");
     }
-    buf_bytes(new, text[t..text.len]);
+    buf_bytes(new, text[t..text.len as i64]);
     let msg = buf_new();
     buf_bytes(msg, "a parameter's mode goes after the colon: '");
     buf_bytes(msg, buf_slice(new));
@@ -217,10 +221,273 @@ fn self_param_error(message: *u8) -> ! {
             i += 1;
         }
         if formatter {
-            err_help(c"Display and Debug in vole: `fn fmt(self, f: inout std::Fmt)` and `fn fmt_debug(self, f: inout std::Fmt)` (0.19: `self: &Self, f: &mut std::Fmt`), with no result; write with `f.write(f\"({self.x}, {self.y})\")`, `f.str(s)`, `f.debug(&x)`");
+            err_help(c"Display and Debug in vole: `fn fmt(self, f: inout std::Fmt)` and `fn fmt_debug(self, f: inout std::Fmt)` (0.19: `self: &Self, f: &mut std::Fmt`), with no result; write with `f.write(\"({}, {})\", self.x, self.y)`, `f.str(s)`, `f.debug(&x)`");
         } else {
             err_help(c"`self` for `&self`, `inout self` for `&mut self`, `sink self` for `self` (0.19: `self: &Self`, `self: &mut Self`, `self: Self`)");
         }
         err_end()
     }
+}
+
+// (0.26.2) Argument-position `impl Trait`, `x: impl Display` (also
+// `impl Fn(i64) -> i64`, `inout impl FnMut(i64)`): a hidden type parameter
+// of the function, flagged NODE_IMPLICIT and named by its text (`impl
+// Display`, so messages and hover show it so), appended after the written
+// ones (a turbofish counts only those). IMPL_OWNER is the function whose
+// parameters are being parsed (0 anywhere else: a result, a field, a
+// `let`, which are type.impl-position); IMPL_HIDDEN its hidden parameters.
+pub static var IMPL_OWNER: i64 = 0;
+static var IMPL_HIDDEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// At `impl` in a type.
+pub fn parse_impl_type(start: i64) -> i64 {
+    advance();
+    let bounds = new_node(NodeKind::Generics, cur_start(), 0);
+    let mark = list_begin();
+    loop {
+        list_push(parse_bound());
+        if !eat(Tok::Plus) {
+            break;
+        }
+    }
+    list_end(bounds, mark);
+    NODES[bounds].end = prev_end();
+    if IMPL_OWNER == 0 || !PARAM_TYPE {
+        impl_position_error(start, prev_end());
+    }
+    let param = new_node(NodeKind::TyName, start, prev_end());
+    NODES[param].a = impl_param_name(start, prev_end());
+    NODES[param].h = bounds;
+    NODES[param].p |= NODE_IMPLICIT;
+    IMPL_HIDDEN.push(param);
+    let t = new_node(NodeKind::TyName, start, prev_end());
+    NODES[t].a = NODES[param].a;
+    t
+}
+
+// `impl Trait` outside a parameter's type: error type.impl-position.
+fn impl_position_error(start: i64, end: i64) -> ! {
+    let saved = ERR_KIND;
+    ERR_KIND = c"type.impl-position";
+    err_begin(start);
+    err_fmt(f"'{SRC[start..end]}' is a parameter's type only, in this release");
+    err_help(c"name a type parameter instead, 'fn f<T: Display>() -> T'; 'impl Trait' in a result, a field or a 'let' comes with the rust edition");
+    err_end_soft();
+    ERR_KIND = saved;
+    err_jump()
+}
+
+// The hidden parameter's name: `impl ` and its bounds' text with each run
+// of blanks one space; `impl Display #2` for the second of the same text.
+fn impl_param_name(start: i64, end: i64) -> i64 {
+    let text = SRC[start..end];
+    let b = buf_new();
+    var blank = false;
+    for i in 0..text.len as i64 {
+        let c = text[i];
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+            blank = true;
+            continue;
+        }
+        if blank && buf_slice(b).len as i64 > 0 {
+            buf_bytes(b, " ");
+        }
+        blank = false;
+        buf_byte(b, c);
+    }
+    let base = intern(buf_slice(b));
+    var k = 1;
+    loop {
+        var sym = base;
+        if k > 1 {
+            let named = buf_new();
+            buf_fmt(named, f"{SYMS[base].text} #{k}");
+            sym = intern(buf_slice(named));
+        }
+        var taken = false;
+        for i in IMPL_MARK..IMPL_HIDDEN.count {
+            if NODES[IMPL_HIDDEN.get(i)].a == sym {
+                taken = true;
+            }
+        }
+        if !taken {
+            return sym;
+        }
+        k += 1;
+    }
+}
+
+static var IMPL_MARK: i64 = 0;
+
+// Before function n's parameters: IMPL_OWNER is n (the previous owner is
+// returned, for end_impl_params).
+pub fn begin_impl_params(n: i64) -> i64 {
+    let saved = IMPL_OWNER;
+    IMPL_OWNER = n;
+    IMPL_MARK = IMPL_HIDDEN.count;
+    saved
+}
+
+// After them: the hidden parameters met go after the written ones in n's
+// generics.
+pub fn end_impl_params(n: i64, saved: i64) {
+    IMPL_OWNER = saved;
+    if IMPL_HIDDEN.count == IMPL_MARK {
+        return;
+    }
+    let old = NODES[n].g;
+    let first = IMPL_HIDDEN.get(IMPL_MARK);
+    let g = new_node(NodeKind::Generics, if old != 0 { NODES[old].start }
+        else { NODES[first].start }, if old != 0 { NODES[old].end } else { NODES[first].end });
+    let mark = list_begin();
+    if old != 0 {
+        for i in 0..NODES[old].count {
+            list_push(child(old, i));
+        }
+        NODES[g].a = NODES[old].a;
+    }
+    for i in IMPL_MARK..IMPL_HIDDEN.count {
+        list_push(IMPL_HIDDEN.get(i));
+    }
+    list_end(g, mark);
+    IMPL_HIDDEN.count = IMPL_MARK;
+    NODES[n].g = g;
+}
+
+// How many of the type parameters `params` (a Generics node, 0 for none)
+// are hidden ones, `impl Trait` (always the last).
+pub fn hidden_param_count(params: i64) -> i64 {
+    var n = 0;
+    if params != 0 {
+        for i in 0..NODES[params].count {
+            if (NODES[child(params, i)].p & NODE_IMPLICIT) != 0 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+// At `where` (a reserved word, read as a keyword after a signature).
+pub fn at_where() -> bool {
+    if !at(Tok::Reserved) {
+        return false;
+    }
+    // UNSAFE: TOKS is the lexer's raw token array (no safe view of it in the parser)
+    // SAFETY: P is a token of the array: the parser stops at its Eof, which is last
+    let sym = unsafe { TOKS[P].value } as i64;
+    SYMS[sym].text == "where"
+}
+
+// The type parameters of the impl block whose functions are being parsed
+// (0 outside one): a function's `where` may bound them too.
+pub static var WHERE_OUTER: i64 = 0;
+
+// After a syntax error, at the next item: no function's parameters or
+// impl block are being parsed.
+pub fn reset_item_state() {
+    IMPL_OWNER = 0;
+    IMPL_HIDDEN.count = 0;
+    WHERE_OUTER = 0;
+    PARAM_TYPE = false;
+}
+
+// (0.26.2) `where P: B + C, Q: D` after an item's signature (a function's
+// result type, a struct's, enum's or trait's generics, an impl's type):
+// each bound joins those of its type parameter in `generics` (or in
+// `outer`, an impl's, for one of its functions), as if written inline.
+// Any other left side is where.unsupported.
+pub fn parse_where(generics: i64, outer: i64) {
+    if !at_where() {
+        return;
+    }
+    advance();
+    while at_predicate() {
+        let start = cur_start();
+        let left = parse_type();
+        let left_end = prev_end();
+        expect(Colon);
+        let bstart = cur_start();
+        let mark = list_begin();
+        loop {
+            list_push(parse_bound());
+            if !eat(Tok::Plus) {
+                break;
+            }
+        }
+        let param = where_param(left, generics, outer);
+        if param == 0 {
+            SCRATCH.count = mark;
+            where_unsupported(start, left_end, prev_end());
+        } else {
+            join_bounds(param, mark, bstart);
+        }
+        if !eat(Comma) {
+            break;
+        }
+    }
+}
+
+// At a `where` predicate's left side (a type), not at the body, a `;` or
+// a contract clause (`requires c`).
+fn at_predicate() -> bool {
+    if at(Ident) {
+        let next = tok_kind(1);
+        return next == Colon || next == Tok::ColonColon || next == Tok::Lt;
+    }
+    at(Tok::LParen) || at(Tok::LBracket) || at(Amp) || at(Tok::Star)
+}
+
+// The type parameter `left` names (a TyName of one segment and no type
+// arguments), 0 when it is none of them.
+fn where_param(left: i64, generics: i64, outer: i64) -> i64 {
+    if NODES[left].kind != NodeKind::TyName || NODES[left].count != 0 || NODES[left].g != 0 {
+        return 0;
+    }
+    for g in [generics, outer] {
+        if g != 0 {
+            for i in 0..NODES[g].count {
+                let p = child(g, i);
+                if NODES[p].a == NODES[left].a && (NODES[p].p & NODE_IMPLICIT) == 0 {
+                    return p;
+                }
+            }
+        }
+    }
+    0
+}
+
+// The bounds SCRATCH[mark..] after those `param` has (its h).
+fn join_bounds(param: i64, mark: i64, pos: i64) {
+    let end = SCRATCH.count;
+    let old = NODES[param].h;
+    if old != 0 {
+        for i in 0..NODES[old].count {
+            list_push(child(old, i));
+        }
+    }
+    for i in mark..end {
+        list_push(SCRATCH.get(i));
+    }
+    let count = SCRATCH.count - end;
+    for i in 0..count {
+        SCRATCH.set(mark + i, SCRATCH.get(end + i));
+    }
+    SCRATCH.count = mark + count;
+    let n = new_node(NodeKind::Generics, if old != 0 { NODES[old].start } else { pos }, 0);
+    list_end(n, mark);
+    NODES[n].end = prev_end();
+    NODES[param].h = n;
+}
+
+// error where.unsupported, soft: the predicate is left out.
+fn where_unsupported(start: i64, left_end: i64, end: i64) {
+    let saved = ERR_KIND;
+    ERR_KIND = c"where.unsupported";
+    err_begin(start);
+    err_fmt(
+        f"'{SRC[start..end]}': a 'where' bound is on a type parameter of the item, and '{SRC[start..left_end]}' is not one");
+    err_help(c"a bound on a type that is not a parameter comes with the rust edition; bound a parameter instead: 'I: Iterator<Item = X>, X: Display'");
+    err_end_soft();
+    ERR_KIND = saved;
 }

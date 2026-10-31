@@ -8,9 +8,9 @@ use crate::base::{
     intern_c, sym_table, sym_text,
 };
 use crate::base::diag::{
-    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix, err_fixable,
-    err_fmt, err_help, err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt, error_at,
-    fail_name, fix_at_ok,
+    ERR_HELP, ERR_KIND, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix,
+    err_fixable, err_fmt, err_help, err_help_fmt, err_help_sym, err_jump, err_str, err_sym, err_try,
+    err_try_fmt, error_at, fail_name, fix_at_ok,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
@@ -23,6 +23,7 @@ use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
     item_key_if_known, module_of, qualified_if_known, qualify, within_std,
 };
+use crate::front::modules::vis::{admits, module_admits};
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::stdtree::STD_TREE;
 use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, enum_variant, find_variant, item_node_of};
@@ -116,6 +117,8 @@ pub fn collect_uses() {
         SYM_CRATE = intern_c(c"crate");
         SYM_SUPER = intern_c(c"super");
         SYM_STD = intern_c(c"std");
+        // (0.26.2: each `pub(in path)` names a module around its item)
+        crate::front::modules::vis::check_vis_paths();
         // (0.25) Each module's entries, filled as they are added: an
         // import is compared with its own module's entries only, not with
         // every entry of the program (that scan was 21% of `check`).
@@ -362,7 +365,7 @@ fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64) -> ! {
             BUFS[ERR_HELP].len > 0);
         // (0.25.2.1: a function std has under another name)
         let syn = crate::front::check::names::std_synonym_help(SYMS[name].text);
-        if within_std(pm) && syn.len > 0 && BUFS[ERR_HELP].len == 0 {
+        if within_std(pm) && syn.len as i64 > 0 && BUFS[ERR_HELP].len == 0 {
             err_help_fmt(syn);
         }
         help_near_item(pm, name);
@@ -378,11 +381,24 @@ fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64) -> ! {
     }
 }
 
+// (0.26.2: item.private, Rust's E0603; a restricted item, `pub(crate)`,
+// says where it is visible)
 pub fn private_error(pos: i64, name: i64, key: i64) -> ! {
+    let saved = ERR_KIND;
+    ERR_KIND = c"item.private";
     err_begin(pos);
-    err_fmt(f"'{sym_text(name)}' is private");
+    let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key) } else { 0 };
+    let end = if item != 0 { crate::front::modules::vis::vis_end_of(item) } else { -1 };
+    if end >= 0 {
+        err_fmt(
+            f"'{sym_text(name)}' is visible only in {crate::front::modules::vis::vis_where(end)}");
+    } else {
+        err_fmt(f"'{sym_text(name)}' is private");
+    }
     help_make_public(key, name);
-    err_end()
+    err_end_soft();
+    ERR_KIND = saved;
+    err_jump()
 }
 
 // The help of a private item (by key): its declaration with `pub` (0.14),
@@ -390,7 +406,7 @@ pub fn private_error(pos: i64, name: i64, key: i64) -> ! {
 // first line up to its name, where `volec fix --only pub` writes `pub`.
 fn help_make_public(key: i64, name: i64) {
     unsafe {
-        let item = if key >= 0 && key < SYMS.len() { item_node_of(key) } else { 0 };
+        let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key) } else { 0 };
         if item == 0 {
             if child_module_key(key) {
                 err_help_fmt(f"make it public: `pub mod {sym_text(name)}`");
@@ -410,15 +426,18 @@ fn help_make_public(key: i64, name: i64) {
         // The first whole word `name` on the line.
         var stop = -1;
         var i = start;
-        while i + text.len <= e && stop < 0 {
-            let same = (0..text.len).all(|k| SRC[i + k] == text[k]);
+        while i + text.len as i64 <= e && stop < 0 {
+            let same = (0..text.len as i64).all(|k| SRC[i + k] == text[k]);
             if same && (i == start || !ident_byte(SRC[i - 1]))
-                && (i + text.len == e || !ident_byte(SRC[i + text.len])) {
-                stop = i + text.len;
+                && (i + text.len as i64 == e || !ident_byte(SRC[i + text.len as i64])) {
+                stop = i + text.len as i64;
             }
             i += 1;
         }
-        err_help(c"make it public: `pub ");
+        // (0.26.2: a restricted one, widened to its crate)
+        let restricted = crate::front::modules::vis::vis_token(item) >= 0;
+        err_help(if restricted { c"make it visible in its crate: `pub(crate) " }
+            else { c"make it public: `pub " });
         if stop > 0 {
             buf_bytes(ERR_HELP, SRC[start..stop]);
         } else {
@@ -569,14 +588,17 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         let key = qualified_if_known(m, name);
         let item = if key >= 0 { item_node_of(key) } else { 0 };
         if item != 0 {
-            if inside || (NODES[item].p & ITEM_PUBLIC) != 0 || MODULES[m].is_c {
+            // (0.26.2: `pub(crate)`, `pub(super)`, `pub(in path)`: public
+            // up to a module, front/modules/vis.vl)
+            if inside || (NODES[item].p & ITEM_PUBLIC) != 0 && admits(item, from)
+                || MODULES[m].is_c {
                 return binding(B_ITEM, key);
             }
             return binding(B_PRIVATE, key);
         }
         let c = child_module(m, name);
         if c >= 0 {
-            if inside || MODULES[c].public {
+            if inside || MODULES[c].public && module_admits(c, from) {
                 return binding(B_MODULE, c);
             }
             return binding(B_PRIVATE, qualify(m, name));
@@ -589,7 +611,7 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         for k in 0..count {
             let u = MODULE_USES[m].data[k];
             if USE_ENTRIES[u].name == name && !USE_ENTRIES[u].glob
-                && (inside || USE_ENTRIES[u].public) {
+                && (inside || USE_ENTRIES[u].public && admits(USE_ENTRIES[u].node, from)) {
                 return resolve_use(u);
             }
         }
@@ -599,7 +621,8 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         var via = -1;
         for k in 0..count {
             let u = MODULE_USES[m].data[k];
-            if !USE_ENTRIES[u].glob || !(inside || USE_ENTRIES[u].public) {
+            if !USE_ENTRIES[u].glob
+                || !(inside || USE_ENTRIES[u].public && admits(USE_ENTRIES[u].node, from)) {
                 continue;
             }
             let what = resolve_use(u);
@@ -825,7 +848,7 @@ static var SYM_PRELUDE: *i64 = 0 as *i64;
 // (front::modules::uses_prelude015). (0.18) The one bound of the prelude's
 // tables (its names here, PRELUDE_DECLARED): a name is added to
 // prelude_name's list and counted here.
-pub const PRELUDE_COUNT: i64 = 69;
+pub const PRELUDE_COUNT: i64 = 71;
 
 pub const PRELUDE_LATE: i64 = 18;
 
@@ -847,7 +870,8 @@ pub fn prelude_name(i: i64) -> i64 {
         // text and input, Buf, HashMap, sorting, cmp_of/eq_of, Fmt, a safe
         // panic and unreachable; the stable sorts; value semantics: Drop,
         // drop, forget, needs_drop, Copy; 0.18: the assertions; 0.18.1: the heaps;
-        // 0.20: text, str and String, std::string's: prelude_lookup)
+        // 0.20: text, str and String, std::string's: prelude_lookup; 0.26.2:
+        // TryFrom, as Rust 2021's)
         let names: [*u8; PRELUDE_COUNT] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err",
             c"Vec", c"print", c"println", c"Add", c"Sub", c"Mul", c"Div", c"Neg", c"Eq", c"Ord",
             c"Hash", c"Iterator", c"Display", c"Debug", c"Clone", c"From", c"Into", c"format",
@@ -858,7 +882,7 @@ pub fn prelude_name(i: i64) -> i64 {
             c"unreachable", c"sort_stable", c"sort_stable_by", c"sort_stable_in",
             c"sort_stable_by_in", c"Drop", c"drop", c"forget", c"needs_drop", c"Copy", c"assert",
             c"assert_eq", c"assert_ne", c"debug_assert", c"BinaryHeap", c"MinHeap", c"str",
-            c"String", c"to_string_in"];
+            c"String", c"to_string_in", c"TryFrom", c"format_args"];
         unsafe {
             sym_table(&SYM_PRELUDE);
             for k in 0..PRELUDE_COUNT {
@@ -992,7 +1016,7 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
                         STD_MODULE, CUR_MOD, BUFS[ERR_HELP].len > 0);
                     // (0.25.2.1: a function std has under another name)
                     let syn = crate::front::check::names::std_synonym_help(SYMS[name].text);
-                    if within_std(here) && syn.len > 0 && BUFS[ERR_HELP].len == 0 {
+                    if within_std(here) && syn.len as i64 > 0 && BUFS[ERR_HELP].len == 0 {
                         err_help_fmt(syn);
                     }
                     help_near_item(here, name);
@@ -1156,10 +1180,10 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
         // (0.25.2.2: a module file checked alone, its sibling beside it)
         if m == 0 {
             var r = 0;
-            while r < crate::base::FILES.len() && crate::base::FILES[r].path[0] == '<' {
+            while r < crate::base::FILES.len() as i64 && crate::base::FILES[r].path[0] == '<' {
                 r += 1;
             }
-            if r < crate::base::FILES.len() && crate::front::modules::beside_root_help(
+            if r < crate::base::FILES.len() as i64 && crate::front::modules::beside_root_help(
                 cstr(crate::base::FILES[r].path), SYMS[name].text) {
                 return;
             }
@@ -1206,9 +1230,9 @@ pub fn std_has_module(name: [u8]) -> bool {
     crate::front::stdsrc::std_files(files);
     let list = buf_slice(files);
     var a = 0;
-    while a < list.len {
+    while a < list.len as i64 {
         var e = a;
-        while e < list.len && list[e] != '\n' {
+        while e < list.len as i64 && list[e] != '\n' {
             e += 1;
         }
         var s = a;
@@ -1220,9 +1244,9 @@ pub fn std_has_module(name: [u8]) -> bool {
             continue;
         }
         let file = list[s + 1..e];
-        var f = if file.len > 3 { file[0..file.len - 3] } else { file };
-        if f.len > 4 && f[f.len - 4..f.len] == "/mod" {
-            f = f[0..f.len - 4];
+        var f = if file.len as i64 > 3 { file[0..file.len as i64 - 3] } else { file };
+        if f.len as i64 > 4 && f[f.len as i64 - 4..f.len as i64] == "/mod" {
+            f = f[0..f.len as i64 - 4];
         }
         if f == name {
             return true;
@@ -1261,10 +1285,10 @@ pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64) {
 // (-1: unknown), is written from the crate's root: `full` in its place.
 fn path_fix(at: i64, name: i64, full: [u8]) {
     let text = SYMS[name].text;
-    if at < 0 || SRC[at..at + text.len] != text || SRC[at + text.len] != ':' {
+    if at < 0 || SRC[at..at + text.len as i64] != text || SRC[at + text.len as i64] != ':' {
         return;
     }
-    err_fix(at, at + text.len, full);
+    err_fix(at, at + text.len as i64, full);
 }
 
 // (0.17) The help of a path through `std::name` that std does not have,

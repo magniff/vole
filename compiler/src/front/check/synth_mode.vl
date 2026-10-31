@@ -5,11 +5,12 @@
 // (`size_of`, `align_of`) folded to constants.
 
 use crate::base::{
-    FILES, SRC, SYMS, buf_bytes, buf_fmt, buf_new, buf_slice, buf_uint, intern, intern_c,
+    FILES, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, buf_uint, intern,
+    intern_c,
 };
 use crate::base::diag::{
     ERR, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_help_sym,
-    err_int, err_str, err_sym, err_try_fmt,
+    err_int, err_str, err_sym, err_try_fmt, report_warning,
 };
 use crate::front::ast::{
     CONV_NEW, NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
@@ -62,11 +63,11 @@ use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
     ENUMS, REF_MUT, REF_SHARED, STRUCTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_F64, TY_I16,
-    TY_I32, TY_I64, TY_I8, TY_NEVER, TY_STRING, TY_U16, TY_U32, TY_U64, TY_U8, TY_U8_PTR, TY_UNIT,
-    TyKind, VARIANTS, array_of, buf_type, enum_variant, err_type, find_field, find_method, int_bits,
-    int_max, is_compound, is_fieldless_enum, is_integer, is_numeric, is_opaque_vector, is_pointer,
-    is_ref, is_signed, is_vector, make_type, mut_slice_of, primitive_name, ptr_to, ref_to, slice_of,
-    struct_field, type_align, type_elem, type_size,
+    TY_I32, TY_I64, TY_I8, TY_ISIZE, TY_NEVER, TY_STRING, TY_U16, TY_U32, TY_U64, TY_U8, TY_U8_PTR,
+    TY_UNIT, TY_USIZE, TyKind, VARIANTS, array_of, buf_type, enum_variant, err_type, find_field,
+    find_method, int_bits, int_max, is_compound, is_fieldless_enum, is_integer, is_numeric,
+    is_opaque_vector, is_pointer, is_ref, is_signed, is_vector, make_type, mut_slice_of,
+    primitive_name, ptr_to, ref_to, slice_of, struct_field, type_align, type_elem, type_size,
 };
 use crate::gen0::target::enum_panic_kind;
 
@@ -169,11 +170,13 @@ fn suffix_type(suffix: i64) -> i64 {
     if suffix == SUF_I8 { return TY_I8; }
     if suffix == SUF_I16 { return TY_I16; }
     if suffix == SUF_I32 { return TY_I32; }
-    if suffix == SUF_I64 || suffix == SUF_ISIZE { return TY_I64; }
+    if suffix == SUF_I64 { return TY_I64; }
+    if suffix == SUF_ISIZE { return TY_ISIZE; }
     if suffix == SUF_U8 { return TY_U8; }
     if suffix == SUF_U16 { return TY_U16; }
     if suffix == SUF_U32 { return TY_U32; }
-    if suffix == SUF_U64 || suffix == SUF_USIZE { return TY_U64; }
+    if suffix == SUF_U64 { return TY_U64; }
+    if suffix == SUF_USIZE { return TY_USIZE; }
     if suffix == SUF_F32 { return TY_F32; }
     TY_F64
 }
@@ -550,9 +553,9 @@ fn synth_field(n: i64) -> i64 {
         if TYPES[base_ty].kind == TyKind::Slice {
             NODES[n].y = 2;
             if name == intern_c(c"len") {
-                // i64 (0.4; u64 before): lengths and indices mix without casts.
+                // usize (0.26.2, as Rust; i64 from 0.4, u64 before)
                 NODES[n].x = 1;
-                return TY_I64;
+                return TY_USIZE;
             }
             if name == intern_c(c"ptr") {
                 NODES[n].x = 0;
@@ -616,6 +619,11 @@ fn synth_field(n: i64) -> i64 {
             }
             help_near_field(s, name);
             err_end();
+        }
+        // (0.26.2: a part's own `.src` or entry field, embed.part_use)
+        if crate::front::embed::wgsl::BLOCK_STRUCT.count > 0
+            && crate::front::embed::wgsl::part_use_error(n, STRUCTS[s].node, name) {
+            return TY_ERROR;
         }
         NODES[n].x = field;
         // (0.16: a #[sealed] struct's fields)
@@ -890,6 +898,7 @@ pub fn binary_result(n: i64, op: Tok, ty: i64) -> i64 {
             if !(is_numeric(ty) || is_pointer(ty)) {
                 type_error_got(n, c"comparison requires numeric type", ty);
             }
+            unsigned_compare(n, op, ty);
             return TY_BOOL;
         }
         if op == Tok::EqEq || op == Tok::BangEq {
@@ -927,6 +936,35 @@ pub fn binary_result(n: i64, op: Tok, ty: i64) -> i64 {
     }
 }
 
+// (0.26.2) `i >= 0` or `i < 0` of a usize local i (a length, since
+// 0.26.2): always true or false, as a count down to 0 in a usize that
+// never stops (num.unsigned-cmp, a warning; outside std).
+fn unsigned_compare(n: i64, op: Tok, ty: i64) {
+    if ty != TY_USIZE || within_std(CUR_MOD) {
+        return;
+    }
+    // (a local against 0: a count; `v.len() >= 0` is only redundant)
+    let l = NODES[n].b;
+    let r = NODES[n].c;
+    let zero_r = NODES[r].kind == NodeKind::Int && NODES[r].a == 0
+        && NODES[l].kind == NodeKind::Ident;
+    let zero_l = NODES[l].kind == NodeKind::Int && NODES[l].a == 0
+        && NODES[r].kind == NodeKind::Ident;
+    let always_true = zero_r && op == Tok::GtEq || zero_l && op == Tok::LtEq;
+    let always_false = zero_r && op == Tok::Lt || zero_l && op == Tok::Gt;
+    if !always_true && !always_false {
+        return;
+    }
+    let m = buf_new();
+    buf_str(m, c"a '");
+    buf_type(m, ty);
+    buf_str(m, if always_true { c"' is never below 0: this comparison is always true" }
+        else { c"' is never below 0: this comparison is always false" });
+    buf_byte(m, 0);
+    report_warning(NODES[n].start, 4, c"num.unsigned-cmp", buf_slice(m).ptr,
+        c"a count down to 0 in an unsigned type: `while i > 0 { i -= 1; ... }`; or convert the length to i64 where it is made (`v.len() as i64`)");
+}
+
 // (0.25.3, eval 0.25.2.2: qwen35, `Duration - Duration`) An arithmetic
 // operator on a type that is not a number: the methods of its type that
 // do it (`a.saturating_sub(b)`, `a.checked_sub(b)`), the first the try:
@@ -955,7 +993,7 @@ fn arithmetic_error(n: i64, op: Tok, ty: i64) -> ! {
     if k == TyKind::Struct || k == TyKind::Enum {
         for m in names {
             if crate::front::check::calls::method_of(ty, intern(m)) >= 0 {
-                if first.len == 0 {
+                if first.len as i64 == 0 {
                     first = m;
                 } else {
                     buf_bytes(found, ", ");
@@ -966,7 +1004,7 @@ fn arithmetic_error(n: i64, op: Tok, ty: i64) -> ! {
             }
         }
     }
-    if first.len > 0 {
+    if first.len as i64 > 0 {
         err_help(c"'");
         crate::front::types::buf_type(crate::base::diag::ERR_HELP, ty);
         err_help_fmt(f"' has no operator; its methods do it: {buf_slice(found)} (`a.{first}(b)`)");
@@ -1118,7 +1156,7 @@ fn synth_unary(n: i64) -> i64 {
 // in`, or t in its pattern (`for (i, t) in`), after the start of the
 // function it is in.
 fn bound_by_for(text: [u8], t: [u8]) -> bool {
-    let pos = text.len;
+    let pos = text.len as i64;
     var i = pos;
     while i > 1 {
         i -= 1;
@@ -1146,13 +1184,13 @@ fn bound_by_for(text: [u8], t: [u8]) -> bool {
 
 // Whether text[j..] starts with the whole word t.
 fn word_at(text: [u8], j: i64, t: [u8]) -> bool {
-    if j < 1 || j + t.len >= text.len {
+    if j < 1 || j + t.len as i64 >= text.len as i64 {
         return false;
     }
-    if is_word_char(text[j - 1]) || is_word_char(text[j + t.len]) {
+    if is_word_char(text[j - 1]) || is_word_char(text[j + t.len as i64]) {
         return false;
     }
-    text[j..j + t.len] == t
+    text[j..j + t.len as i64] == t
 }
 
 fn is_word_char(c: u8) -> bool {
@@ -1201,7 +1239,7 @@ fn non_lvalue_error(n: i64, operand: i64) {
     if s > 0 && NODES[s].start <= a && b <= NODES[s].end {
         let text = SRC[NODES[s].start..NODES[s].end];
         var one_line = true;
-        for i in 0..text.len() {
+        for i in 0..text.len() as i64 {
             if text[i] == '\n' {
                 one_line = false;
             }
@@ -1233,9 +1271,9 @@ fn non_lvalue_error(n: i64, operand: i64) {
 // Whether text has the identifier w (not inside a longer name).
 fn uses_word(text: [u8], w: [u8]) -> bool {
     var i = 0;
-    while i + w.len() <= text.len() {
-        if text[i..i + w.len()] == w && (i == 0 || !is_word_byte(text[i - 1]))
-            && (i + w.len() == text.len() || !is_word_byte(text[i + w.len()])) {
+    while i + w.len() as i64 <= text.len() as i64 {
+        if text[i..i + w.len() as i64] == w && (i == 0 || !is_word_byte(text[i - 1]))
+            && (i + w.len() as i64 == text.len() as i64 || !is_word_byte(text[i + w.len() as i64])) {
             return true;
         }
         i += 1;

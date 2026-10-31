@@ -62,11 +62,21 @@ exception: `self.compress(self.block[..])` would view `self` while the
 call changes it, so `update` copies the 64 bytes first.
 
 **Reading through C.** The file is read 64 KB at a time with the C
-library's `read`, declared by hand; `defer` closes the file whatever
-path `main` leaves by:
+library's `read`, declared by hand; a guard, `Fd`, whose `Drop` closes
+the file, closes it whatever path `main` leaves by:
 
 ```tach
-defer if fd != 0 { unsafe { close(fd); } };
+struct Fd { fd: i32 }
+
+impl Drop for Fd {
+    fn drop(inout self) {
+        if self.fd != 0 {
+            unsafe { close(self.fd); }
+        }
+    }
+}
+
+let _file = Fd { fd };
 loop {
     let n = unsafe { read(fd, &chunk as *u8, 65536) };
     if n <= 0 { break; }
@@ -79,7 +89,7 @@ with a zero to a width of 2:
 
 ```tach
 for byte in hash.finish() {
-    hex.push_fmt(f"{byte:02x}");
+    hex.push_fmt("{byte:02x}");
 }
 ```
 
@@ -87,6 +97,6 @@ for byte in hash.finish() {
 
 - fixed-size arrays, slices, `u32`/`u64` and wrapping arithmetic: `volec guide types`
 - statics, structs, methods on `inout self`: `volec guide syntax`
-- `defer`: `volec guide memory`
+- a guard with `Drop`: `volec guide memory`
 - `extern "C"` and `unsafe` calls: `volec guide c-interop`
 - hex format specs, `push_fmt`: `volec guide formatting`

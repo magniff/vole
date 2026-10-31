@@ -124,7 +124,7 @@ renamed field limit to overdraft of crate::account::Account, 5 uses	3 files	+6 -
 // account.vl:21
 21	    a.balance + a.overdraft >= amount
 // report.vl:26
-26	    println(f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}");
+26	    println("#{} {:<10} balance {:>6}, may go to -{}", a.id, a.owner, a.balance, a.overdraft);
 ```
 
 `open`'s parameter is still called `limit`; a parameter rename changes
@@ -231,15 +231,15 @@ one `edit patch` with a target per item (`--in NAME` starts the next
 target's pairs), checked and written as one edit:
 
 ```console
-$ volec edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fee(n) => charge(&l, who, n)' --in report::describe --old 'Event::Fee(_) => format_in("a fee", gpa)' --new 'Event::Fee(n) => format_in(f"fee of {n}", gpa)' --in report::summary --old 'may go to -{a.overdraft}' --new 'may go to -{a.overdraft}, fees {a.fees_paid}' --show
+$ volec edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fee(n) => charge(&l, who, n)' --in report::describe --old 'Event::Fee(_) => format_in("a fee", gpa)' --new 'Event::Fee(n) => format_in("fee of {n}", gpa)' --in report::summary --old 'may go to -{}", a.id, a.owner, a.balance, a.overdraft' --new 'may go to -{}, fees {}", a.id, a.owner, a.balance, a.overdraft, a.fees_paid' --show
 patched crate::report::describe, crate::report::summary, crate::ledger::apply	2 files	+4 -3 lines
 // ledger.vl:85
 85	        Event::Fee(n) => charge(&l, who, n),
 // report.vl:14
-14	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
+14	        Event::Fee(n) => format_in("fee of {n}", gpa),
 // report.vl:28-29
-28	    println(
-29	        f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}, fees {a.fees_paid}");
+28	    println("#{} {:<10} balance {:>6}, may go to -{}, fees {}", a.id, a.owner, a.balance,
+29	        a.overdraft, a.fees_paid);
 ```
 
 ## 4. The new program

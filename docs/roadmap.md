@@ -2800,3 +2800,20 @@ stress-grow, cachediff 1374 lines (407 from the cache), unsafe-audit
 3409 unjustified (baseline 3425) and 0 in std, chain-diverse,
 chain-fresh 35 releases. compile-cost against v0.26.0: a hello world
 1.09x (0.26.2 brings it back), std 1.01x, check of the compiler 0.99x.
+
+### 0.26.2
+
+The release gate (`gate.sh --release --no-linux`, 59:10 wall), macOS
+only, on the release commit with 0.26.1's two fixes merged. Every row
+passed but fuzz-guard: its generator stored `std::env::args().len()` in
+an `i64` static, which 0.26.2's usize lengths reject, so it compiled
+none of its programs. With the generator fixed (`as i64`) the row passed
+alone, 60 programs, 0 failing. (fuzz-sem's generator was ported the same
+way before the gate.) The suite 4616 at -O0, -O1 and -O2 (70 XFAIL;
+SKIPPED: no spirv-val), threads 8749, incremental 172 series, objcheck
+5708 (and 256 for x86_64-macos), compiler-memcheck 727,
+examples-checkalloc 180, fuzz-sem 300 ok, every other fuzz and ABI row,
+stress-grow, cachediff 1424 lines (422 from the cache), unsafe-audit
+3340 unjustified (baseline 3425) and 0 in std, chain-diverse,
+chain-fresh 36 releases. compile-cost against v0.26.1: a hello world
+0.98x, std 1.03x, check of the compiler 1.01x.

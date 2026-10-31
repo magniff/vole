@@ -62,7 +62,7 @@ renamed local c1 to sum_in in crate::main, 1 use	main.vl	+2 -2 lines
 $ volec refactor rename main::c2 sum_out
 renamed local c2 to sum_out in crate::main, 1 use	main.vl	+2 -2 lines
 $ volec refactor rename main::p out
-renamed local p to out in crate::main, 4 uses	main.vl	+4 -4 lines
+renamed local p to out in crate::main, 4 uses	main.vl	+5 -5 lines
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
@@ -123,7 +123,7 @@ $ volec query show run_at
 fn run_at(s: [u8], i: i64) -> i64 {
     var n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
-    while i + n < s.len && s[i + n] == s[i] && n < 255 { n += 1; }
+    while i + n < s.len as i64 && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
 $ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
@@ -145,15 +145,15 @@ $ volec refactor extract-function main --lines 22-25 --to round_trips --show
 extracted lines 22-25 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
 // main.vl:22
 22	    let ok = round_trips(out, gpa, s);
-// main.vl:35-42
-35	}
-36	
-37	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
-38	    let ok = match rle::decode(out, gpa) {
-39	        Some(back) => back.as_slice() == s,
-40	        None => false,
-41	    };
-42	    ok
+// main.vl:36-43
+36	}
+37	
+38	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
+39	    let ok = match rle::decode(out, gpa) {
+40	        Some(back) => back.as_slice() == s,
+41	        None => false,
+42	    };
+43	    ok
 ```
 
 The compiled code changes now (there is a new function), so the
@@ -188,9 +188,9 @@ identical	12 compilations	1 programs	4 targets	-O0 -O1 -O2
 ```console
 $ git diff --stat
  adler.vl | 13 ++++++++-----
- main.vl  | 23 ++++++++++++++---------
+ main.vl  | 25 +++++++++++++++----------
  rle.vl   |  5 ++---
- 3 files changed, 24 insertions(+), 17 deletions(-)
+ 3 files changed, 25 insertions(+), 18 deletions(-)
 ```
 
 ## Why not by hand
