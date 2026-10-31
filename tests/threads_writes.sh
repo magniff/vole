@@ -96,6 +96,8 @@ front::types::TYPES	compute_layout: every layout is made before a phase (prepare
 front::types::ENUMS	compute_layout, the same
 front::types::FIELDS	compute_layout (the fields'"'"' offsets), the same
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
+front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
+front::cells::SYM_UNSAFE_CELL	is_unsafe_cell_struct: set by the first struct prepare_layouts decides, the same
 front::types::TYPE_CAP	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TYPE_COUNT	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TLISTS	make_type, the same
@@ -254,6 +256,10 @@ front::check::LOCAL_COUNT	own: the same; a variable'"'"'s number is never output
 front::distinct::ANY_DISTINCT	key: options_hash
 front::distinct::NICHE	key: types_hash (enum_niche)
 front::distinct::NICHE_ALIASES	key: types_hash
+front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
+front::cells::SYM_UNSAFE_CELL	key: the same
+front::modules::MODULES	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
+front::modules::STD_MODULE	key: the same (within_std)
 front::effects::FN_EFFECTS	IR: a function'"'"'s effects (fn_canon)
 front::effects::FN_EFFECTS_COUNT	IR: the same
 front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
