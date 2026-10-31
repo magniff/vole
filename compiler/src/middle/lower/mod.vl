@@ -1,13 +1,13 @@
-// Lowering: the checked AST to the IR of ir.vl, building SSA form on
+// Lowering: each function's places-IR body (places.vl; 0.26.2: the AST
+// lowering is gone) to the IR of ir.vl, building SSA form on
 // the fly (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau: "Simple and
 // Efficient Construction of Static Single Assignment Form", CC 2013).
 //
 // SSA variables are the scalar locals whose address is never taken (the
-// others live in frame slots), and synthetic variables for the values of
-// `if`, `&&`/`||`, `loop` with `break` values and loop counters. A block
-// is sealed once all its predecessors are known; reading a variable in an
+// others live in frame slots), and synthetic variables. A block is
+// sealed once all its predecessors are known; reading a variable in an
 // unsealed block makes an incomplete phi, completed when the block is
-// sealed. Structured control flow makes the sealing points obvious.
+// sealed.
 //
 // Semantics are those of the 0.1 code generator (gen.vl): the same
 // evaluation order, the same calling convention (compound arguments are
@@ -15,9 +15,7 @@
 // result pointer), and the same arithmetic.
 
 pub mod calls;
-mod control;
 mod expr;
-mod matching;
 pub mod places;
 pub mod ssa;
 mod vector;
@@ -27,37 +25,27 @@ pub mod atomic;
 use crate::back::abi::{conv_classify, conv_returns_through_pointer, fn_uses_c};
 use crate::base::{alloc_array, intern_c};
 use crate::base::target::X86;
-use crate::front::ast::{DEFERS, NODES, NodeKind, PAT_DEREF, child};
+use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::ast::NodeKind::{
-    Array, Call, Defer, Fn, Ident, Index, Let, PatBind, PatVariant, PatWild, Range, Repeat, Str,
-    StructLit, Tuple, Unary, VariantLit,
+    Array, Call, Fn, Ident, Index, Range, Repeat, Str, StructLit, Tuple, Unary, VariantLit,
 };
 use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
-use crate::front::contracts::sites::site_of;
 use crate::front::lexer::Tok;
-use crate::front::patterns::binds_ref;
 use crate::front::types::{
-    FNS, TY_I64, TY_NEVER, TY_U64, align_to, is_compound, is_vector, is_void, tuple_offset,
-    type_align, type_elem, type_size, variant_field, variant_field_offset,
+    FNS, TY_I64, TY_U64, align_to, is_compound, is_void, type_align, type_size,
 };
 use crate::gen0::gen::MAIN_SYM;
-use crate::gen0::gen::expr::arith_op_of_assign;
-use crate::middle::copies::{moves_local, note_move_copies};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    CUR, INLINE_COPY_MAX, IRFUNCS, IR_EXPR_LOC, IR_LOC, IR_LOCS, Op, Term, emit_ir, init_ir,
-    ir_const, ir_load, ir_new_block, ir_new_slot, ir_offset, ir_slot_addr, ir_store, ir_type,
+    CUR, INLINE_COPY_MAX, IRFUNCS, Op, Term, emit_ir, init_ir, ir_const, ir_load, ir_new_block,
+    ir_new_slot, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
-use crate::middle::lower::calls::{proto_ovf, push_arg, take_args};
-use crate::middle::lower::expr::{
-    lower_addr, lower_expr, lower_operand, lower_operator, need_value, store_value,
-};
-use crate::middle::lower::matching::referent_value;
+use crate::middle::lower::calls::{push_arg, take_args};
+use crate::middle::lower::expr::need_value;
 use crate::middle::lower::ssa::{LOCAL_ADDR, PROMOTE};
-use crate::middle::lower::vector::{arith_token_of, vector_assign_store, vector_assign_value};
 
-use ssa::{ssa_read, ssa_write};
+use ssa::ssa_write;
 
 // ---- Blocks during lowering ----
 
@@ -207,67 +195,6 @@ fn lower_return(cx: sink *FnCtx, value: i64) {
 
 // ---- Statements and bindings ----
 
-fn lower_block(cx: sink *FnCtx, block: i64) -> i64 {
-    let mark = DEFERS.count;
-    // (-g) Instructions come from the statement being lowered, and after
-    // the block from the statement holding it.
-    let outer = IR_LOC;
-    for i in 0..NODES[block].count {
-        let stmt = child(block, i);
-        if IR_LOCS {
-            IR_LOC = NODES[stmt].start + 1;
-            IR_EXPR_LOC = 0;
-        }
-        if NODES[stmt].kind == Let {
-            lower_let(cx, stmt);
-        } else if NODES[stmt].kind == Defer {
-            DEFERS.push(stmt);
-        } else {
-            lower_expr(cx, NODES[stmt].a);
-        }
-    }
-    let tail = NODES[block].a;
-    var value = 0;
-    if tail != 0 {
-        if IR_LOCS {
-            IR_LOC = NODES[tail].start + 1;
-            IR_EXPR_LOC = 0;
-        }
-        value = lower_expr(cx, tail);
-    }
-    if DEFERS.count > mark {
-        if tail != 0 {
-            value = keep_value(cx, value, NODES[tail].ty, mark);
-        }
-        lower_defers(cx, mark);
-        DEFERS.count = mark;
-    }
-    IR_LOC = outer;
-    IR_EXPR_LOC = 0;
-    value
-}
-
-// The deferred statements registered above DEFERS depth `depth`, last
-// first (0.6): at the end of their block, or at a jump out of it.
-fn lower_defers(cx: sink *FnCtx, depth: i64) {
-    var i = DEFERS.count - 1;
-    while i >= depth && !is_dead_block(cx, CUR) {
-        unsafe { lower_expr(cx, NODES[DEFERS.data[i]].a); }
-        i -= 1;
-    }
-}
-
-// A value computed before deferred statements run: a compound value is
-// copied, so a deferred statement changing its source does not change it.
-fn keep_value(cx: sink *FnCtx, value: i64, ty: i64, depth: i64) -> i64 {
-    if DEFERS.count > depth && value != 0 && is_compound(ty) && !is_dead_block(cx, CUR) {
-        let copy = ir_slot_addr(cx, new_slot_for(cx, ty));
-        lower_copy(cx, copy, value, type_size(ty));
-        return copy;
-    }
-    value
-}
-
 // Expressions whose compound value is a new temporary, which a binding or
 // an argument may take over without copying.
 pub fn is_fresh(n: i64) -> bool {
@@ -276,57 +203,6 @@ pub fn is_fresh(n: i64) -> bool {
             | Call | Str | VariantLit => true,
         Index => NODES[NODES[n].b].kind == Range,
         _ => false,
-    }
-}
-
-fn lower_let(cx: sink *FnCtx, stmt: i64) {
-    unsafe {
-        let init = NODES[stmt].c;
-        let value = lower_expr(cx, init);
-        if NODES[init].ty == TY_NEVER {
-            return;
-        }
-        let first = cx.inst_count;
-        bind_pattern_ir(cx, NODES[stmt].a, value, is_fresh(init));
-        // (0.17: a move, COPY_MOVE; copies.vl)
-        if moves_local(init) {
-            note_move_copies(cx, first);
-        }
-    }
-}
-
-fn bind_pattern_ir(cx: sink *FnCtx, pattern: i64, value: i64, fresh: bool) {
-    let kind = NODES[pattern].kind;
-    let ty = NODES[pattern].ty;
-    if kind == PatWild || ty == TY_NEVER {
-        return;
-    }
-    if kind == PatBind {
-        bind_local(cx, NODES[pattern].x, value, ty, fresh);
-        return;
-    }
-    var value = value;
-    if (NODES[pattern].p & PAT_DEREF) != 0 {
-        // (0.18.1) value is a reference; ty, what it points to
-        value = referent_value(cx, value, ty);
-    }
-    for i in 0..NODES[pattern].count {
-        var elem_ty = 0;
-        var offset = 0;
-        if kind == PatVariant {
-            elem_ty = variant_field(NODES[pattern].x, i);
-            offset = variant_field_offset(NODES[pattern].x, i);
-        } else {
-            elem_ty = type_elem(ty, i);
-            offset = tuple_offset(ty, i);
-        }
-        var elem = 0;
-        if is_compound(elem_ty) || binds_ref(child(pattern, i)) {
-            elem = ir_offset(cx, value, offset);
-        } else if !is_void(elem_ty) {
-            elem = ir_load(cx, ir_type(elem_ty), value, offset);
-        }
-        bind_pattern_ir(cx, child(pattern, i), elem, false);
     }
 }
 
@@ -385,52 +261,3 @@ fn lower_copy(cx: sink *FnCtx, dst: i64, src: i64, size: i64) {
 }
 
 // ---- Assignment ----
-
-// The right-hand side is evaluated first, then the target's address; a
-// compound assignment then reads the old value.
-fn lower_assign(cx: sink *FnCtx, n: i64) {
-    unsafe {
-        let op = NODES[n].op;
-        let target = NODES[n].b;
-        let value = NODES[n].c;
-        let ty = NODES[target].ty;
-        if NODES[target].kind == Ident && NODES[target].res == Res::Local
-            && (PROMOTE[NODES[target].y] != 0 || is_void(ty)) {
-            let local = NODES[target].y;
-            if is_void(ty) {
-                lower_expr(cx, value);
-                return;
-            }
-            let v = lower_operand(cx, value);
-            if op == Tok::Eq {
-                ssa_write(cx, local, CUR, v);
-                return;
-            }
-            let old = ssa_read(cx, local, CUR);
-            // (the check, when there is one, moves CUR on: the value first)
-            let r = lower_operator(cx, arith_op_of_assign(op), ty, ty, old, v,
-                if proto_ovf() { site_of(n, 0) } else { 0 });
-            ssa_write(cx, local, CUR, r);
-            return;
-        }
-        if op == Tok::Eq {
-            let v = lower_expr(cx, value);
-            let addr = lower_addr(cx, target);
-            store_value(cx, addr, 0, v, ty);
-            return;
-        }
-        if is_vector(ty) {
-            var hi = 0;
-            let v = vector_assign_value(cx, value, &hi);
-            let addr = lower_addr(cx, target);
-            vector_assign_store(cx, arith_token_of(arith_op_of_assign(op)), ty, addr, v, hi);
-            return;
-        }
-        let v = lower_operand(cx, value);
-        let addr = lower_addr(cx, target);
-        let old = ir_load(cx, ir_type(ty), addr, 0);
-        let r = lower_operator(cx, arith_op_of_assign(op), ty, ty, old, v,
-            if proto_ovf() { site_of(n, 0) } else { 0 });
-        ir_store(cx, ir_type(ty), addr, r, 0);
-    }
-}
