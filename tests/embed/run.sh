@@ -14,6 +14,8 @@
 #                       what an embedded file's change changes: the output
 #                       runs with the new text and is the object a build
 #                       without the cache makes, the rest from the cache
+#   embed_wgsl_tokens   (0.26.0) an embedded block's text is one token,
+#                       `embedded`, between its braces (`volec --tokens`)
 #
 # usage: tests/embed/run.sh [-c COMPILER]
 #
@@ -131,5 +133,13 @@ ok=0
 [ "$first" = first ] && [ "$second" = second ] && [ "$clean" = second ] && cmp -s "$d/b.o" "$d/c.o" \
     && [ "$hits" -gt 0 ] && ok=1
 check embed_code_cache "$ok" "first: $first; after the change: $second (hits $hits); clean: $clean; objects $(cmp "$d/b.o" "$d/c.o" 2>&1 || true)"
+
+# embed_wgsl_tokens
+d="$WORK/tokens"
+mkdir -p "$d"
+printf 'embed wgsl K {\n    fn f() -> u32 { return 1u; } // }\n}\n' >"$d/main.vl"
+out=$("$COMPILER" --tokens "$d/main.vl" 2>&1)
+want=$(printf '0 5 0 ident embed\n6 10 0 ident wgsl\n11 12 0 ident K\n13 14 0 {\n14 53 1 embedded\n53 54 0 }')
+check embed_wgsl_tokens "$([ "$(printf '%s\n' "$out" | head -6)" = "$want" ] && echo 1)" "$out"
 
 exit $STATUS

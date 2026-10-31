@@ -134,7 +134,7 @@ repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | in
 
 struct_decl  = "struct" ident [ generics ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
-field        = [ "pub" ] ident ":" type ;              (* pub (0.5): fields are as visible as their struct *)
+field        = [ "pub" ] ident ":" type ;              (* (0.26) private to the struct's module unless pub *)
 enum_decl    = "enum" ident [ generics ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
@@ -440,7 +440,7 @@ using a view after its storage was gone was the one way safe code could
 still reach undefined behaviour; from 0.17 the own pass rejects it under
 `--values=error`, the default (its opt-outs `warn`, `report` and `off`
 do not; std's types also assume their fields are changed by their
-methods only, as vole has no private fields yet). A view need not have a name: a slice argument (or a
+methods only: from 0.26 their fields are private to std). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
 place, before its index (`v.as_slice()[grow(&v)]`); and `for x in v`,
@@ -712,9 +712,27 @@ fn helper() { ... }               // private to geometry (and its children)
 
 Every item is private to its module (and the modules inside it) unless
 declared `pub`; a module declared `pub mod` can be reached from outside
-its parent. A struct's fields are as visible as the struct (`pub` on a
-field is allowed and changes nothing). Methods are visible wherever their
-type is.
+its parent. Methods are visible wherever their type is.
+
+A struct's field (0.26, Rust's rule) is private to the module that
+declares the struct and to the modules inside it, unless it is marked
+`pub`: a `pub` field is visible wherever its struct is. Outside, reading
+a private field, writing it or borrowing it (`&x.f`) is an error
+(`field.private`), and so is a struct literal unless every field is
+visible (`field.literal-private`): a struct with a private field is made
+by its module's functions (`Rect::new`), which keep what the fields mean.
+A struct with no fields has its literal anywhere; enum variants' fields
+are public. std's modules are modules like any: a child sees its
+parent's private fields, a sibling does not. What the compiler writes
+itself (main's `Gpa {}`, structural `==`, a derive, a closure's
+captures, an f-string) is let through. On a field of your own program
+the error's help is the declaration with `pub` and where it is, which
+`volec fix --only pub` writes; on a field with a method of its name
+(`v.len`), the call. (Until 0.26 a field was as visible as its struct,
+and `pub` on it changed nothing; `#[sealed]` asked for this rule.)
+`pub(crate)`, `pub(super)` and `pub(in path)`, for items and fields, come
+in 0.26.2; until then a field read from a sibling module is plain
+`pub`.
 
 Paths name items through modules: `geometry::shapes::area(s)`,
 `geometry::Rect { w: 1, h: 2 }`, `shapes::Shape::Rect(r)` (a variant),
@@ -1568,9 +1586,12 @@ from `main` to them ([refactor.md](refactor.md)).
 
 ### sealed, scoped
 
-`#[sealed]` (to come: checked) hides a struct's fields not marked `pub`,
-and its literals, outside its module; `#[scoped]` (to come) keeps values
-of the type from outliving the scope that made them.
+`#[sealed]` (0.16) hid a struct's fields not marked `pub`, and its
+literals, outside its module. From 0.26 that is every struct's rule
+(Modules), so `#[sealed]` changes nothing: it is accepted with the
+warning `attr.obsolete`, and `volec fix --only obsolete-attr` deletes it.
+`#[scoped]` (to come) keeps values of the type from outliving the scope
+that made them.
 
 ## Additions of 0.17: familiar forms
 
@@ -1671,7 +1692,7 @@ take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
 an array (a variable, constant, static or a field of one) is its
 length, an `i64`. The field stays. The other way round, `a.len` on such
 an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
-(whose `len` field is sealed, or which have none) is `v.len()`: a read
+(whose `len` field is private, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.
 
 **Paths.** A path's first segment that is not `crate`, `self`, `super`,
@@ -2084,3 +2105,52 @@ of `struct { _0; _1; } V`), an integer-repr one a union of structs that
 start with the tag; `packed(N)` is `#pragma pack(N)`. Types of default
 layout appear only behind pointers, as incomplete structs. A name that is
 a C keyword is an error.
+
+## Embedded blocks
+
+*(0.26.0)* A block of another language inside vole source, checked by
+the compiler. WGSL is the one language.
+
+```ebnf
+embed_item   = [ "pub" ] "embed" lang name ( "{" embedded "}" | "from" string_lit ";" ) ;
+lang         = ident ;                                 (* "wgsl" *)
+embedded     = { any } ;                               (* to the "}" that matches, by the language's rule *)
+```
+
+- `embed`, the language and `from` are identifiers, not keywords:
+  three identifiers in a row start no other item, and `embed` and
+  `wgsl` stay names everywhere else (`std::gpu::wgsl`, `let wgsl`). An
+  item only, at module scope (in `mod m { .. }` and `#[cfg(test)]` too).
+- The lexer does not lex the text: after the `{` of `embed LANG NAME {`
+  (the three words and the `{` in one file), the text ends at the `}`
+  that matches it outside WGSL's comments, `//` to the line's end and
+  nested `/* */` (WGSL has no strings). A `}` in a comment does not
+  count. No matching `}` is `embed.unterminated`, at the `{`, naming
+  the innermost `{` left open; the rest of the file is not read. A
+  language other than `wgsl` is `embed.language` (its text is still
+  delimited by WGSL's rule).
+- `embed wgsl K from "x.wgsl";` takes the text from a file, relative to
+  the directory of the file holding the block, as `include_str` does:
+  `embed.missing`, `embed.path` and `embed.utf8` apply.
+- The block is an immutable `static K` of a struct type the compiler
+  makes, `embed wgsl K` in messages (source cannot name it in 0.26). Its
+  fields are `pub` and `[u8]`: `src`, the text, and one per entry point
+  (`@compute`, `@vertex` or `@fragment` then `fn NAME`, outside
+  comments) holding its name: `dev.shader_wgsl(K.src)?`,
+  `dev.compute_pipeline(shader, K.step)`. An entry point named `src` or
+  a vole keyword is `embed.name`; a field the block does not have is
+  `gpu.entry`, listing its entry points.
+- `volec check` (and the LSP, and every checked edit) runs the text
+  through std::gpu::wgsl's front end: its first error is reported at
+  its position in the `.vl` file, with its `wgsl.*` code; in the file
+  form at the `from` string, the file's `x.wgsl:L:C:` first.
+- `volec fmt` keeps a block's lines as they are, from its `{` to its
+  `}`. `query grep` classifies its text by WGSL's rules (comments, the
+  rest code); `query show K` and `edit patch K` take the item.
+
+*Coming in 0.26.2: shader parts.* `embed wgsl K with A, B { .. }` puts
+the text of the blocks `A` and `B`, then `K`'s own text, into one WGSL
+module (module-scope order is free in WGSL). A part is an `embed wgsl`
+block found by ordinary path resolution; it has no entry points, and
+parts form no cycle. `with` is not a Rust keyword: like `embed` and
+`wgsl` it stays an identifier everywhere else.

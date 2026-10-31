@@ -284,7 +284,8 @@ objects: dispatch is static.
 `mod geometry;` loads geometry.vl (or `mod geometry { ... }` inline);
 `use geometry::{Rect, area};` imports by name, never `*`. Paths start
 with a name in scope, `crate`, `self`, `super` or `std`. Items are
-private (to their module and its children) unless `pub`; `pub use`
+private (to their module and its children) unless `pub`, and so are a
+struct's fields (0.26: `pub w: i64` to show one); `pub use`
 re-exports. A missing import's error says which `use` line to add, and
 `volec fix` adds it.
 

@@ -105,6 +105,15 @@
 #   // CHECK-NOT: text   no line containing text between the neighbouring
 #                        CHECKs' lines (or the start and end)
 #   // CHECK-OPT: n      the level for the CHECKs (default 2)
+#   // PLACES: text     (0.26.0) the elaborated places IR (`volec check
+#                        --emit-places --places-diff`) has a line containing
+#                        text, after the previous PLACES's line; no
+#                        `places.diff:` difference may be listed. It runs
+#                        after a plain `check` made the tools' cache in a
+#                        directory of the case's: the places options must
+#                        not be answered from it
+#   // PLACES-NOT: text  no line containing text between the neighbouring
+#                        PLACES's lines
 #   // ASM(T): text      the assembly for target T (at the CHECK-OPT level)
 #                        has a line containing text, after the previous
 #                        ASM(T)'s line; checked only when testing T
@@ -582,6 +591,9 @@ check_case() {
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
     fi
+    if [ -s "$dir/places" ] && ! check_places "$source" "$dir"; then
+        return 1
+    fi
     # shellcheck disable=SC2086
     [ "$OPT" = -O0 ] && PFLAGS=""
     csources=""
@@ -769,6 +781,30 @@ check_ir() {
     fi
     match_checks "$2/ir.txt" "$2/checks" "$2/check.out" && return 0
     { cat "$2/check.out"; echo "--- IR:"; cat "$2/ir.txt"; } >"$2/why"
+    return 1
+}
+
+# PLACES (0.26.0): the elaborated places IR of $1 (`check --emit-places
+# --places-diff`) matched against the PLACES lines, with no difference
+# listed; first a plain `check` makes the tools' cache in $2/pcache, which
+# the places options must not answer from (tools/query/cache.vl).
+check_places() {
+    rm -rf "$2/pcache"
+    # (FLAGS but a build's own: --check-alloc)
+    cflags=$(printf '%s\n' $FLAGS | grep -v -e '^--check-alloc$' | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    VOLE_CACHE="$2/pcache" VOLE_CACHE_TRACE="$2/ptrace" "$COMPILER" check $cflags "$1" >/dev/null 2>&1
+    # shellcheck disable=SC2086
+    if ! VOLE_CACHE="$2/pcache" "$COMPILER" check $cflags --emit-places --places-diff "$1" >"$2/places.txt" 2>"$2/places.err"; then
+        { echo "check --emit-places failed:"; cat "$2/places.err"; } >"$2/why"
+        return 1
+    fi
+    if grep -q '^places\.diff: .*: ' "$2/places.err"; then
+        { echo "--places-diff lists differences:"; grep '^places\.diff' "$2/places.err"; } >"$2/why"
+        return 1
+    fi
+    match_checks "$2/places.txt" "$2/places" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- places IR:"; cat "$2/places.txt"; } >"$2/why"
     return 1
 }
 

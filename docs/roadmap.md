@@ -1479,10 +1479,9 @@ transcripts that pin std's shape (the LSP runner's std positions), the
 add-a-std-module docs, compile-cost in tests/affected.sh for std, zero
 statics as bss, `Atomic<T>` bounded to integers, bool and pointers,
 std's print and stdin statics made thread-safe, the book's property-test
-time limit under load. Then 0.25.6, after a design doc the user
-approves: private fields as in Rust, one std cell type as the only
-interior mutability (`#[sealed]` retired), and the thread-sharing marker
-(Rust's Send and Sync, or one Swift-style marker: undecided).
+time limit under load. The 0.25.6 planned here (private fields, one
+cell type, the thread-sharing marker) is folded into 0.26: see "0.26 to
+0.30: Rust's surface" at the end.
 
 ## After 0.23: the specification
 
@@ -2737,9 +2736,46 @@ lock code in println), std 1.02x, check of the compiler 1.03x (the six
 tables as Vec). The compiler's own -O2 self-compile is not gated: 46G to
 61.5G instructions with the tables (feedbacks/DIGEST-0.25.5.md §2.1).
 
-0.25.5 is the last release before 0.26, which is a rethink and cleanup of the
-core semantics with the user: a small, checkable core language with the
-rest elaborated onto it. Its inputs: the inventory of 136 rules and 33
-contradictions, the literature on mutable value semantics, safety and
-concurrency, and a first draft of the core (in the working notes,
-.claude/briefs/research-026/).
+0.25.5 is the last release before 0.26.
+
+## 0.26 to 0.30: Rust's surface
+
+Decided with the user on 2026-10-30: vole leaves mutable value semantics
+for Rust's surface in full (`&T` and `&mut T` as first-class types,
+Rust's syntax with Rust's meaning, Polonius), keeping contracts, effects
+and explicit allocators, with allocation as a capability (a function
+allocates only through an allocator reachable from its parameters; no
+default allocator type) and first-class arenas in std. No macros and no
+`dyn` for now. The proposal is
+[design/rust-with-allocators-contracts-polonius.md](design/rust-with-allocators-contracts-polonius.md);
+the plan, with its decisions and gates, is
+[design/rust-surface-plan.md](design/rust-surface-plan.md).
+
+| release | what |
+|---|---|
+| 0.26.x | the decisions under MVS: a places IR, private fields, Rust's arithmetic with overflow checks, `usize`, `String`, the raw-pointer parameters decided, statics into context structs, `Cell`/`UnsafeCell` (`#[sealed]` retired), the allocation capability rules, Rust's format grammar, `where`, `embed wgsl` |
+| 0.27.x | the rust edition beside MVS, gates 0 to 3, the translator (`fix --edition rust`) |
+| 0.28 | the flip: compiler/src and std in the rust edition, MVS deleted; then invariant newtypes and `debug requires` |
+| 0.29 | the cuts of 0.27 (const generics, `Rc`/`Arc`, `RefCell`, `for<'a>`, ...), std::gpu first class |
+| 0.30 | `embed regex`; Vulkan and Linux when that backend returns |
+
+While this runs, releases are built and tested on aarch64-macos only:
+the Linux rows of the gate are off (their SKIP is expected) and the
+release notes say Linux is untested. The Linux backend and the Vulkan
+hal come back later, as their own work.
+
+### 0.26.0
+
+The release gate (`gate.sh --release --no-linux`, 53:41 wall), on the
+release commit, macOS only (the Linux rows off, as above). Every row
+passed but stress-grow, whose -O0 suite failed `timestamp_query` under a
+load of 117: the long GPU kernel measured shorter than the short one.
+Alone it passed three times, and the row passed alone (`gate.sh --only
+stress-grow`, 12:20). The suite 4505 at -O0 and -O1, 4504 at -O2 (70
+XFAIL; SKIPPED: no spirv-val, and at -O2 a terminal-render time budget
+under the load), threads 8521, incremental 172 series, objcheck 5520
+(and 256 for x86_64-macos), compiler-memcheck 695, examples-checkalloc
+180, fuzz-sem 300 ok, every fuzz and ABI row, cachediff 1370 lines (407
+from the cache), unsafe-audit 3414 unjustified (baseline 3425) and 0 in
+std, chain-diverse, chain-fresh 34 releases. compile-cost against
+v0.25.5: a hello world 1.00x, std 1.01x, check of the compiler 0.99x.

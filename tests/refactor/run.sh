@@ -320,16 +320,29 @@ ok=0
 printf '%s\n' "$out" | grep -q '^made module report' \
     && printf '%s\n' "$out" | grep -q "^crate::report::helper${TAB}report.vl:1:8${TAB}" && ok=1
 check module_path_without_crate "$ok" "$out"
+# (0.26.0) rename and fix leave an embedded block's text as it is: a vole
+# `helper` renamed, the WGSL `helper` in the block not
+mkdir -p "$WORK/embedren"
+printf 'embed wgsl K {\n    fn helper(x: f32) -> f32 { return x; }\n    @compute @workgroup_size(1)\n    fn main() { _ = helper(1.0); }\n}\n\nfn helper(x: i64) -> i64 {\n    x\n}\n\nfn main() -> i32 {\n    helper(0) as i32\n}\n' >"$WORK/embedren/main.vl"
+out=$(cd "$WORK/embedren" && git init -q . 2>/dev/null; "$COMPILER" refactor rename helper assist 2>&1 && "$COMPILER" fix 2>&1)
+ok=0
+sed -n 1,5p "$WORK/embedren/main.vl" | grep -c helper | grep -q '^2$' \
+    && grep -q '^fn assist(x: i64)' "$WORK/embedren/main.vl" && grep -q '^    assist(0)' "$WORK/embedren/main.vl" && ok=1
+check rename_embed_body "$ok" "$out
+$(cat "$WORK/embedren/main.vl")"
 # explain (0.13): every code the compiler's source can print has an
 # entry: the tools' codes (`c"query.no-match"`; 0.17: the own pass's,
 # `c"own.moved"`), the kinds of the
 # compiler's errors (ERR_KIND; 0.25.3: main.missing) and warnings and keyed errors (their
 # third argument); and every entry is such a code. (0.25.3: lex.* and
 # embed.*, text blocks and include_str; `embed.sh`, a script's name, is
-# not one.)
+# not one. 0.26.0: gpu.* and wgsl.*, and std's own: the shader compiler's
+# `"wgsl.X"` and `error wgsl.target`, std::gpu's `gpu.X:` texts.)
 {
-    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run)\.[a-z0-9_-]+"' \
+    grep -rhoE --exclude-dir=.volec 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|sync|extension|use|link|cli|lex|embed|unsafe|run|gpu|wgsl|field|attr)\.[a-z0-9_-]+"' \
         compiler/src
+    grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
+    grep -rhoE 'gpu\.[a-z]+:' compiler/std/gpu | sed -e 's/^\(.*\):$/c"\1"/'
     grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
     # (0.15: guide's codes, written into its own messages)

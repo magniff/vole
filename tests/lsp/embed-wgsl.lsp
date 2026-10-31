@@ -1,0 +1,18 @@
+## (0.26.0) embed wgsl blocks: the block's WGSL error is published at its
+## .vl position; go to definition on the file form's path opens the file,
+## on `SIM.step` lands on the WGSL `fn step`; the blocks are document
+## symbols.
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"rootUri":"file://@DIR@"}}
+< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true,"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"completionProvider":{"triggerCharacters":[".",":"],"resolveProvider":true},"signatureHelpProvider":{"triggerCharacters":["(",","]}},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
+> {"jsonrpc":"2.0","method":"initialized","params":{}}
+> @open main.vl
+> {"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":7,"character":24}}}
+< {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/main.vl","diagnostics":[{"range":{"start":{"line":3,"character":19},"end":{"line":3,"character":20}},"severity":1,"code":"wgsl.type","source":"volec","message":"'+' cannot take u32 and i32"}]}}
+< {"jsonrpc":"2.0","id":2,"result":{"uri":"file://@DIR@/shaders/fill.wgsl","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
+> {"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":10,"character":20}}}
+< {"jsonrpc":"2.0","id":3,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":2,"character":7},"end":{"line":2,"character":8}}}}
+> {"jsonrpc":"2.0","id":4,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file://@DIR@/main.vl"}}}
+< {"jsonrpc":"2.0","id":4,"result":[{"name":"SIM","detail":"embed wgsl SIM","kind":13,"range":{"start":{"line":0,"character":0},"end":{"line":5,"character":1}},"selectionRange":{"start":{"line":0,"character":11},"end":{"line":0,"character":14}},"children":[{"name":"src","detail":"pub {","kind":8,"range":{"start":{"line":0,"character":15},"end":{"line":1,"character":1}},"selectionRange":{"start":{"line":0,"character":15},"end":{"line":0,"character":16}}},{"name":"step","detail":"pub step","kind":8,"range":{"start":{"line":2,"character":7},"end":{"line":2,"character":11}},"selectionRange":{"start":{"line":2,"character":7},"end":{"line":2,"character":8}}}]},{"name":"FILL","detail":"embed wgsl FILL from \"shaders/fill.wgsl\"","kind":13,"range":{"start":{"line":7,"character":0},"end":{"line":7,"character":41}},"selectionRange":{"start":{"line":7,"character":11},"end":{"line":7,"character":15}},"children":[{"name":"src","detail":"pub \"sh","kind":8,"range":{"start":{"line":7,"character":21},"end":{"line":7,"character":24}},"selectionRange":{"start":{"line":7,"character":21},"end":{"line":7,"character":40}}},{"name":"fill","detail":"pub \"sha","kind":8,"range":{"start":{"line":7,"character":21},"end":{"line":7,"character":25}},"selectionRange":{"start":{"line":7,"character":21},"end":{"line":7,"character":40}}}]},{"name":"main","detail":"fn main() -> i32","kind":12,"range":{"start":{"line":9,"character":0},"end":{"line":12,"character":1}},"selectionRange":{"start":{"line":9,"character":3},"end":{"line":9,"character":7}}}]}
+> {"jsonrpc":"2.0","id":5,"method":"shutdown"}
+< {"jsonrpc":"2.0","id":5,"result":null}
+> {"jsonrpc":"2.0","method":"exit"}
