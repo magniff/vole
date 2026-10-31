@@ -302,3 +302,110 @@ binary still treats usize as u64, so until it is refreshed it reports 24
    step 5): affected.map runs it @none, and many tasks' solutions no
    longer compile (`.len()` into an i64, an i64 into a usize parameter).
    Migrate it with `fix --only usize` before the next eval run.
+5. [optimizer] Known, not fixed: three gaps the usize std exposes, none
+   visible in the bench at -O2 (0.26.1's head against release-0.26.2,
+   instructions retired; heap and sort did not regress):
+   - unsigned phi ranges are weaker than signed ones: a usize heap root
+     keeps its bounds check (tests/run/opt_range_phi keeps its heap in
+     i64 from `s.len as i64`);
+   - `x % n < n` is not seen through the length's i64-to-u64
+     conversion (tests/run/opt_entry_facts' `bucket` keeps
+     `v.len() as i64`);
+   - a usize countdown in Take does not vectorize (Take keeps an i64
+     count; `take` saturates with std::min).
+   Fix them when a benchmark shows one.
+
+## The final account (0.26.2)
+
+### What landed
+
+In release-0.26.2, by merge:
+
+- 9079b37b (part 1): the overflow-check prototype behind
+  $VOLE_PROTO_OVF (step 1, 3e1d6322); float-to-integer `as` saturates
+  on every target, as Rust's does (step 2, ee440c12); `usize` and
+  `isize` are types of their own (step 3, a2b2574d).
+- efae6f89 (part 2): one round of mitigation for the prototype, then
+  measured (dd9298aa, 7f9a699f). Decision 6 was revised to Rust's
+  default: checks at -O0, wrapping at -O1 and up (8afedd0b). With the
+  prototype off, the default code is byte-identical.
+- fd64d7ef (step 5a): compiler/src reads lengths as i64 through
+  explicit casts, so stage 1 (0.25.5) and the fixpoint both build it.
+  Also `volec fix --only usize`, which writes the conversions the
+  errors name.
+- c4835606 (steps 5b to 5d): std's lengths, indices and counts are
+  usize. The `num.unsigned-cmp` warning and its explain entry. The
+  examples, tests/run, the transcripts, the guide, the Book, and the
+  gpu, window, tools, bench and lsp trees are migrated. Take saturates
+  through std::min. The refactor table writes `as i64`/`as usize`.
+  Contract message holes take usize and u64. std's core budget is
+  168960 bytes.
+- ff41d925 (the bench after the usize std): the vectorizer shares one
+  lane type per integer width (`use_elem`), and the unroller counts a
+  constant step once (`repeats_const`). Tests: opt_vec_usize_lanes,
+  opt_unroll_usize_step. The bench is back within 1.1% of 0.26.1.
+- 4419ad58 (step 5e): a slice's and an array's `.len()` is a usize, as
+  the field is, and the LSP's hover and completion say so. std's
+  conversions:
+  - Before this, std had 16 mixed reads that compiler/src's check never
+    reached: the io buffers, std::gpu, Metal's write_buffer, the MSL
+    writer and capture. A std item is checked only when a program
+    instantiates it.
+  - These reads surfaced in the examples' and tests' builds. A scan of
+    the tree's 3,233 programs then found no type error the base lacked.
+
+  The migration, from `fix --only usize`:
+
+  | tree | files | conversions |
+  |---|---|---|
+  | examples | 25 | 90 |
+  | tests/run | 44 | 71 |
+
+  Also the transcripts, five guide topics, Book chapters 1, 7, 12, 13,
+  14 and 16, and grammar.md.
+
+  The hand edits:
+  - string-search: positions are usize.
+  - bigint's countdown: a real bug. `var i = s.len() - 1;
+    while i >= 0` never ends in a usize, and `num.unsigned-cmp` named
+    it. `i` is an i64 there now.
+  - pure-and-no-alloc: `smoothed` takes a usize index.
+
+### Known, and left
+
+- The three optimizer gaps of entry 5 above: unsigned phi ranges,
+  `x % n < n` through the length's conversion, and a usize countdown in
+  Take. None shows in the bench at -O2.
+- std's UTF-8 functions still count in i64: lossy_next, decode_into,
+  is_char_boundary, count_chars, ascii_prefix_len, and
+  Utf8Error::valid_up_to and error_len. So do `splitn`/`replacen`'s
+  counts, and the SIMD loads' index (`v16u8::load(s, i)`; the Book's
+  chapter 16 writes `i as i64`). Each is a boundary conversion at its
+  callers. They go to usize with the next std migration, through
+  `fix --only usize`.
+- tests/agent-eval is not migrated (entry 4): affected.map runs it
+  @none. Run `fix --only usize` on its solutions before the next eval
+  run.
+- compiler/src still reads lengths through 5a's `as i64` casts. 0.26.3
+  takes them back out, once 0.26.2 builds compiler/src: a fix removes
+  the no-op casts.
+- Decision 6's implementation was not in this stream's 0.26.2 list:
+  the checked rvalue in the places IR, `--overflow-checks=on|off` and
+  the census of panic sites.
+
+### What cost time in step 5
+
+1. std code a program reaches is checked only in that program. A green
+   compiler/src check says nothing about std::gpu or a generic default
+   method. The tree-wide scan against the base compiler's error counts
+   found the 16 sites. It should be the first check after a std type
+   change.
+2. The base compiler run from inside the worktree reads the worktree's
+   compiler/std, not its own, so a base comparison made after a std
+   edit compares the new std twice. Run it from outside the tree.
+3. `fix --only usize` leaves a correct but cast-heavy text (`i + m as
+   i64 <= s.len() as i64`). That is right for tests, but a showcase
+   example reads better rewritten in usize by hand.
+4. The check hook rewrote a deliberately broken refactor input
+   (tests/refactor/conv020) after a one-line `sed -i`. `git apply`
+   avoided it, and the problem is recorded with agent-feedback.
