@@ -277,7 +277,7 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>, far: f32) -> Hit {
             best.emissive = b.col.w;
         }
     }
-    return hit_lamps(ro, rd, best);
+    return hit_pendulums(ro, rd, hit_lamps(ro, rd, best));
 }
 
 // The lamps: a ring around the plaza that blinks once a second of village
@@ -322,6 +322,122 @@ fn hit_lamps(ro: vec3<f32>, rd: vec3<f32>, best_in: Hit) -> Hit {
             best.albedo = head.col.rgb;
             // The light reaching the eye now left the lamp th / c ago.
             best.emissive = lamp_glow(u.eye.w - th / c_light);
+        }
+    }
+    return best;
+}
+
+// A pendulum wave west of the stall: a frame along z with eight pendulums
+// swinging across it (in x). Pendulum n makes 20 + n swings every 60 s of
+// village time (periods 2.2 to 3 s, lengths 1.2 to 2.2 m), so their phases
+// drift apart and come back together every minute. Each is drawn as it was d / c ago (d to its pivot, which is within
+// a metre of the bob), so the nearer ones lag the farther ones, and moving
+// along the row speeds the swings up ahead of you and slows them behind.
+const PEND_COUNT: u32 = 8u;
+const PEND_X: f32 = -2.2;
+const PEND_TOP: f32 = 3.2;
+const PEND_Z0: f32 = 1.75;
+const PEND_CYCLE: f32 = 60.0;
+const PEND_AMP: f32 = 0.45;
+
+// The capsule from pa to pb of radius r: its nearest hit before `limit`.
+fn hit_capsule(ro: vec3<f32>, rd: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>, r: f32,
+    limit: f32) -> f32 {
+    let ba = pb - pa;
+    let oa = ro - pa;
+    let baba = dot(ba, ba);
+    let bard = dot(ba, rd);
+    let baoa = dot(ba, oa);
+    let rdoa = dot(rd, oa);
+    let oaoa = dot(oa, oa);
+    let a = baba - bard * bard;
+    let b = baba * rdoa - baoa * bard;
+    let c = baba * oaoa - baoa * baoa - r * r * baba;
+    let h = b * b - a * c;
+    if (h < 0.0) { return -1.0; }
+    let t = (-b - sqrt(h)) / a;
+    let y = baoa + t * bard;
+    if (y > 0.0 && y < baba) {
+        if (t > 0.001 && t < limit) { return t; }
+        return -1.0;
+    }
+    // An end cap.
+    let oc = select(ro - pb, oa, y <= 0.0);
+    let bb = dot(rd, oc);
+    let cc = dot(oc, oc) - r * r;
+    let hh = bb * bb - cc;
+    if (hh < 0.0) { return -1.0; }
+    let t2 = -bb - sqrt(hh);
+    if (t2 > 0.001 && t2 < limit) { return t2; }
+    return -1.0;
+}
+
+fn capsule_normal(p: vec3<f32>, pa: vec3<f32>, pb: vec3<f32>) -> vec3<f32> {
+    let ba = pb - pa;
+    let k = clamp(dot(p - pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return normalize(p - (pa + ba * k));
+}
+
+// Whether the ray meets the box lo..hi before `limit` (the installation's
+// bounds, so most rays skip it).
+fn meets_aabb(ro: vec3<f32>, rd: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>, limit: f32) -> bool {
+    let inv = vec3<f32>(1.0) / rd;
+    let a = (lo - ro) * inv;
+    let z = (hi - ro) * inv;
+    let tmin = max(max(min(a.x, z.x), min(a.y, z.y)), min(a.z, z.z));
+    let tmax = min(min(max(a.x, z.x), max(a.y, z.y)), max(a.z, z.z));
+    return tmax >= max(tmin, 0.0) && tmin < limit;
+}
+
+fn hit_pendulums(ro: vec3<f32>, rd: vec3<f32>, best_in: Hit) -> Hit {
+    var best = best_in;
+    let z1 = PEND_Z0 + f32(PEND_COUNT - 1u) + 0.5;
+    if (!meets_aabb(ro, rd, vec3<f32>(PEND_X - 1.3, 0.2, PEND_Z0 - 0.6),
+        vec3<f32>(PEND_X + 1.3, PEND_TOP + 0.2, z1 + 0.1), best.t)) {
+        return best;
+    }
+    let wood = vec3<f32>(0.30, 0.20, 0.12);
+    let zc = (PEND_Z0 - 0.5 + z1) * 0.5;
+    let hz = (z1 - PEND_Z0 + 0.5) * 0.5;
+    var frame: array<Box, 3>;
+    frame[0] = Box(vec4<f32>(PEND_X, PEND_TOP + 0.07, zc, 1.0), vec4<f32>(0.08, 0.08, hz, 0.0),
+        vec4<f32>(wood, 0.0));
+    frame[1] = Box(vec4<f32>(PEND_X, (PEND_TOP + 0.1) * 0.5, PEND_Z0 - 0.5, 1.0),
+        vec4<f32>(0.08, (PEND_TOP + 0.1) * 0.5, 0.08, 0.0), vec4<f32>(wood, 0.0));
+    frame[2] = Box(vec4<f32>(PEND_X, (PEND_TOP + 0.1) * 0.5, z1, 1.0),
+        vec4<f32>(0.08, (PEND_TOP + 0.1) * 0.5, 0.08, 0.0), vec4<f32>(wood, 0.0));
+    for (var k = 0u; k < 3u; k = k + 1u) {
+        let t = hit_box(ro, rd, frame[k], best.t);
+        if (t > 0.0) {
+            best.t = t;
+            best.n = box_normal(ro, rd, t, frame[k]);
+            best.albedo = wood;
+            best.emissive = 0.0;
+        }
+    }
+    let c_light = u.gamma.y * u.gamma.z;
+    for (var i = 0u; i < PEND_COUNT; i = i + 1u) {
+        let pivot = vec3<f32>(PEND_X, PEND_TOP, PEND_Z0 + f32(i));
+        let period = PEND_CYCLE / (20.0 + f32(i));
+        // The length that swings with this period: L = g (T / 2 pi)^2.
+        let len = 9.81 * pow(period / 6.2831853, 2.0);
+        // The time the light now arriving left it, and its angle then.
+        let te = u.eye.w - length(pivot - ro) / c_light;
+        let ang = PEND_AMP * sin(6.2831853 * te / period);
+        let bob = pivot + len * vec3<f32>(sin(ang), -cos(ang), 0.0);
+        let tr = hit_capsule(ro, rd, pivot, bob, 0.025, best.t);
+        if (tr > 0.0) {
+            best.t = tr;
+            best.n = capsule_normal(ro + rd * tr, pivot, bob);
+            best.albedo = vec3<f32>(0.25, 0.25, 0.28);
+            best.emissive = 0.0;
+        }
+        let tb = hit_ball(ro, rd, Ball(vec4<f32>(bob, 0.17), vec4<f32>(0.0)), best.t);
+        if (tb > 0.0) {
+            best.t = tb;
+            best.n = normalize(ro + rd * tb - bob);
+            best.albedo = vec3<f32>(0.85, 0.62, 0.22);
+            best.emissive = 0.0;
         }
     }
     return best;
