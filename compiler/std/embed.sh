@@ -188,6 +188,13 @@ index() {
     echo "pub fn std_files(out: i64) {"
     lines <"$map"
     echo "}"
+    echo ""
+    echo "// (0.26.2) Where lines 1, 65, 129 and so on (every 64th) start in"
+    echo "// std_source's text, a line each, so that the line of a position in"
+    echo "// std counts 64 lines at most (base/diag: std_line_col)."
+    echo "pub fn std_line_marks(out: i64) {"
+    LC_ALL=C awk '(NR - 1) % 64 == 0 { print at + 0 } { at += length($0) + 1 }' "$text" | lines
+    echo "}"
 } >"$tmp"
 if [ "${1:-}" = "-c" ]; then
     if cmp -s "$tmp" "$out"; then rm -f "$tmp"; exit 0; fi
