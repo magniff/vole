@@ -77,7 +77,7 @@ vecloop/vec           2280922119   3.496    344    487   1.32  3>0
 vecloop/raw           2595011066   3.068    352    496   1.30  2>0
 ```
 
-The method is `/private/tmp/claude-501/-Users-magniff-workspace-vole/5ddff364-ae3e-4efe-9d23-745cc47fc2f3/scratchpad/numbers262/measure.sh`, `/private/tmp/claude-501/-Users-magniff-workspace-vole/5ddff364-ae3e-4efe-9d23-745cc47fc2f3/scratchpad/numbers262/rust.sh` and `/private/tmp/claude-501/-Users-magniff-workspace-vole/5ddff364-ae3e-4efe-9d23-745cc47fc2f3/scratchpad/numbers262/wrapsites.sh`,
+The method is the stream's measuring scripts (measure.sh, rust.sh and their helpers, not kept in the tree),
 described in commit 3e1d6322. The sites a program means to wrap, which
 the Rust twins write as `wrapping_*`, were found by running the program:
 each panic's site went on `$VOLE_PROTO_OVF_SKIP` until no panic was left.
