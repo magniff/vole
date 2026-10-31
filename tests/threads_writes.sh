@@ -96,6 +96,8 @@ front::types::TYPES	compute_layout: every layout is made before a phase (prepare
 front::types::ENUMS	compute_layout, the same
 front::types::FIELDS	compute_layout (the fields'"'"' offsets), the same
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
+front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
+front::cells::SYM_UNSAFE_CELL	is_unsafe_cell_struct: set by the first struct prepare_layouts decides, the same
 front::types::TYPE_CAP	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TYPE_COUNT	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TLISTS	make_type, the same
@@ -254,6 +256,10 @@ front::check::LOCAL_COUNT	own: the same; a variable'"'"'s number is never output
 front::distinct::ANY_DISTINCT	key: options_hash
 front::distinct::NICHE	key: types_hash (enum_niche)
 front::distinct::NICHE_ALIASES	key: types_hash
+front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
+front::cells::SYM_UNSAFE_CELL	key: the same
+front::modules::MODULES	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
+front::modules::STD_MODULE	key: the same (within_std)
 front::effects::FN_EFFECTS	IR: a function'"'"'s effects (fn_canon)
 front::effects::FN_EFFECTS_COUNT	IR: the same
 front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
@@ -426,10 +432,17 @@ done
     echo "back::objfile::assemble_bytes"
     "$COMPILER" query callees crate::back::objfile::assemble_bytes --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
 } | sort -u >"$WORK/assembler"
+# (0.26.2) gen0 generates every function from its kept body
+# (gen_places_function; an atomic intrinsic's, gen_atomic_function); a
+# name that is gone fails here, not by checking less.
+GEN0_MAIN="gen0::gen::places::gen_places_function gen0::gen::gen_atomic_function back::objfile::asm_hand_over"
+for f in $GEN0_MAIN; do
+    "$COMPILER" query callees "crate::$f" >/dev/null 2>&1 \
+        || { echo "threads-writes: no function $f (tests/threads_writes.sh GEN0_MAIN)"; exit 1; }
+done
 {
-    echo "gen0::gen::gen_function"
-    echo "back::objfile::asm_hand_over"
-    "$COMPILER" query callees crate::gen0::gen::gen_function crate::back::objfile::asm_hand_over --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
+    printf '%s\n' $GEN0_MAIN
+    "$COMPILER" query callees $(printf 'crate::%s ' $GEN0_MAIN) --transitive --all | awk -F'\t' 'NF >= 3 { print $3 }'
 } | sort -u >"$WORK/gen0"
 awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
     BEGIN {
