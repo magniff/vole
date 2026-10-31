@@ -1,0 +1,852 @@
+// (0.26.3) Allocation is a capability (docs/design/rust-surface-plan.md
+// §2.0, docs/grammar.md "Allocators"): a function allocates only through
+// an allocator reachable from its parameters, and its signature shows
+// that one is. The rules, each an error with its code:
+//
+// - alloc.default (rule 2): no default allocator type. `Vec<u8>` names
+//   no allocator: `Vec<u8, Gpa>`, or a generic `A: Allocator`. A type
+//   parameter bounded by Allocator takes no default.
+//
+// Its exact fix (`fix --only alloc`) writes `Gpa`, what the 0.26.2
+// default meant; it is refused inside an item generic over an allocator
+// (`A` may be what was meant).
+
+use crate::base::{SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::diag::{
+    ERR_KIND, err_begin, err_end_soft, err_fix, err_help, err_help_fmt, err_str, err_sym,
+    err_try_tool, errors_forget, errors_mark,
+};
+use crate::front::ast::{FN_DEFAULT_COPY, NODES, NodeKind, child};
+use crate::front::check::{PROGRAM, TRY_RESULT, Try, attempt};
+use crate::front::generics::{TP_BASE, TP_NAMES, TP_TYPES, instance_of};
+use crate::front::modules::{CUR_MOD, MODULES, module_of, within_std};
+use crate::front::traits::{IMPLS, IMPL_COUNT, bound_trait, std_trait};
+use crate::front::types::{
+    ENUMS, FNS, FN_COUNT, STATICS, STATIC_COUNT, STRUCTS, STRUCT_COUNT, TSCRATCH, TYPES, TY_ERROR,
+    TyKind, VARIANTS, enum_variant, err_type, struct_field, struct_type, type_elem, variant_field,
+};
+use crate::middle::lower::ssa::HMap;
+
+// ---- Allocator types ----
+
+static var ALLOCATOR_TRAIT: i64 = -2;
+
+// std's Allocator trait, -1 when std is not loaded.
+pub fn allocator_trait() -> i64 {
+    if ALLOCATOR_TRAIT == -2 {
+        ALLOCATOR_TRAIT = std_trait(c"Allocator");
+    }
+    ALLOCATOR_TRAIT
+}
+
+// Whether type t is an allocator: it has an impl of std's Allocator.
+pub fn is_allocator_type(t: i64) -> bool {
+    let tr = allocator_trait();
+    if tr < 0 || t <= 0 || TYPES[t].kind != TyKind::Struct {
+        return false;
+    }
+    // UNSAFE: IMPLS is the checker's raw table of impls.
+    // SAFETY: i < IMPL_COUNT.
+    unsafe {
+        for i in 0..IMPL_COUNT {
+            if IMPLS[i].tr != tr {
+                continue;
+            }
+            if IMPLS[i].ty == t || (IMPLS[i].ty == 0 && instance_of(t, IMPLS[i].tpl)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether type parameter node p (of a Generics node) is bounded by
+// Allocator.
+pub fn is_allocator_param(p: i64) -> bool {
+    let tr = allocator_trait();
+    if tr < 0 {
+        return false;
+    }
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: p is a type parameter node; its h, when set, a list of bounds.
+    unsafe {
+        let bounds = NODES[p].h;
+        if bounds == 0 {
+            return false;
+        }
+        for j in 0..NODES[bounds].count {
+            if bound_trait(child(bounds, j)) == tr {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+static var GPA_TYPE: i64 = 0;
+
+// std's Gpa, 0 when std is not loaded.
+pub fn gpa_type() -> i64 {
+    if GPA_TYPE != 0 {
+        return GPA_TYPE;
+    }
+    let name = intern_c(c"Gpa");
+    // UNSAFE: STRUCTS is the checker's raw table of structs.
+    // SAFETY: s < STRUCT_COUNT.
+    unsafe {
+        for s in 0..STRUCT_COUNT {
+            if STRUCTS[s].name == name && STRUCTS[s].tmpl == 0 && STRUCTS[s].generic == 0
+                && within_std(STRUCTS[s].module) {
+                GPA_TYPE = struct_type(s);
+                return GPA_TYPE;
+            }
+        }
+    }
+    0
+}
+
+// The name of a type parameter in scope bound to an allocator (the
+// instance being checked or made is generic over one), or 0.
+fn allocator_param_in_scope() -> i64 {
+    var i = TP_NAMES.count - 1;
+    while i >= 0 {
+        // UNSAFE: TP_NAMES and TP_TYPES are the checker's raw IntVecs.
+        // SAFETY: 0 <= i < TP_NAMES.count == TP_TYPES.count (pushed in pairs).
+        unsafe {
+            if is_allocator_type(TP_TYPES.data[i]) {
+                return TP_NAMES.data[i];
+            }
+        }
+        i -= 1;
+    }
+    0
+}
+
+// ---- Rule 2: no default allocator type ----
+
+// The type arguments TSCRATCH[mark..] of `name`<..> (a struct or enum
+// with type parameters `params`, `generic` of them), written at pos, when
+// fewer than its parameters: when those left out are its allocator
+// parameters, alloc.default, and Gpa in their place (what the 0.26.2
+// default meant, so the check goes on); false (nothing pushed) when they
+// are not.
+pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i64) -> bool {
+    let count = TSCRATCH.count - mark;
+    let gpa = gpa_type();
+    if count >= generic || gpa == 0 {
+        return false;
+    }
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: params is the item's Generics node, with `generic` children.
+    unsafe {
+        for k in count..generic {
+            if !is_allocator_param(child(params, k)) {
+                return false;
+            }
+        }
+        let missing = generic - count;
+        let saved = ERR_KIND;
+        ERR_KIND = c"alloc.default";
+        err_begin(pos);
+        err_str(c"'");
+        err_sym(name);
+        err_str(c"' names no allocator: its '");
+        err_sym(NODES[child(params, generic - 1)].a);
+        err_str(c"' is written (no default allocator type since 0.26.3)");
+        let inside = allocator_param_in_scope();
+        if inside != 0 {
+            err_help_fmt(format_args(
+                "this item is generic over the allocator '{}': write it, or Gpa (what the default meant)",
+                SYMS[inside].text));
+        } else {
+            err_help(c"the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator`");
+            default_fix(pos, name, count, missing);
+        }
+        err_try_tool("fix --only alloc", true);
+        err_end_soft();
+        ERR_KIND = saved;
+        for _ in 0..missing {
+            TSCRATCH.push(gpa);
+        }
+    }
+    true
+}
+
+// The fix of a type written at pos, `name` or `name<..count..>`: `Gpa`
+// for each of the `missing` allocators, as the last type arguments.
+fn default_fix(pos: i64, name: i64, count: i64, missing: i64) {
+    // The name as written: a path, its last part `name`.
+    var i = pos;
+    var last = pos;
+    while i < SRC.len() as i64 && (ident_byte(SRC[i]) || SRC[i] == ':') {
+        if SRC[i] == ':' {
+            last = i + 1;
+        }
+        i += 1;
+    }
+    let end = i;
+    if SRC[last..end] != SYMS[name].text {
+        return;
+    }
+    var j = end;
+    while j < SRC.len() as i64 && SRC[j] == ' ' {
+        j += 1;
+    }
+    let text = buf_new();
+    if j < SRC.len() as i64 && SRC[j] == '<' && count > 0 {
+        // the matching `>`
+        var depth = 0;
+        var brackets = 0;
+        var k = j;
+        while k < SRC.len() as i64 {
+            let c = SRC[k];
+            if c == '<' {
+                depth += 1;
+            } else if c == '>' && SRC[k - 1] != '-' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if c == '[' || c == '(' {
+                brackets += 1;
+            } else if c == ']' || c == ')' {
+                brackets -= 1;
+            } else if (c == ';' && brackets == 0) || c == '{' {
+                return;
+            }
+            k += 1;
+        }
+        if k >= SRC.len() as i64 {
+            return;
+        }
+        for _ in 0..missing {
+            buf_str(text, c", Gpa");
+        }
+        err_fix(k, k, buf_slice(text));
+    } else if count == 0 {
+        buf_str(text, c"<Gpa");
+        for _ in 1..missing {
+            buf_str(text, c", Gpa");
+        }
+        buf_str(text, c">");
+        err_fix(end, end, buf_slice(text));
+    }
+}
+
+fn ident_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// ---- The declarations' rules ----
+
+// (after the declarations are collected) Each rule on the program's items.
+pub fn check_alloc_rules() {
+    if allocator_trait() < 0 {
+        return;
+    }
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: k < the program's item count.
+    unsafe {
+        for k in 0..NODES[PROGRAM].count {
+            let item = child(PROGRAM, k);
+            let kind = NODES[item].kind;
+            if (kind == NodeKind::Struct || kind == NodeKind::Enum) && NODES[item].g != 0 {
+                check_declared_defaults(NODES[item].g);
+            }
+        }
+    }
+}
+
+// alloc.default on a declaration: a type parameter bounded by Allocator
+// with a default (`A: Allocator = Gpa`).
+fn check_declared_defaults(g: i64) {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: g is a Generics node; its children type parameters.
+    unsafe {
+        for i in 0..NODES[g].count {
+            let p = child(g, i);
+            let def = NODES[p].b;
+            if def == 0 || !is_allocator_param(p) {
+                continue;
+            }
+            let saved = ERR_KIND;
+            ERR_KIND = c"alloc.default";
+            err_begin(NODES[p].start);
+            err_str(c"the allocator parameter '");
+            err_sym(NODES[p].a);
+            err_str(c"' has a default: an allocator type is always written (0.26.3)");
+            err_help(c"take the default out: each use writes its allocator (`Vec<u8, Gpa>`)");
+            // (` = Gpa`: from the end of the bounds to the end of the default)
+            var s = NODES[def].start;
+            while s > NODES[p].start && SRC[s - 1] != '=' {
+                s -= 1;
+            }
+            if s > NODES[p].start {
+                s -= 1;
+                while s > NODES[p].start && SRC[s - 1] == ' ' {
+                    s -= 1;
+                }
+                err_fix(s, NODES[def].end, "");
+            }
+            err_try_tool("fix --only alloc", true);
+            err_end_soft();
+            ERR_KIND = saved;
+        }
+    }
+}
+
+// Whether template tpl (generics.vl's encoding: struct + 1, or -(enum +
+// 1)) has only allocator parameters, so that its bare name (`Buf`) is an
+// instance missing its allocator (alloc.default) rather than a template.
+pub fn bare_allocator_only(tpl: i64) -> bool {
+    // UNSAFE: STRUCTS, ENUMS and NODES are the checker's raw tables.
+    // SAFETY: tpl encodes a struct or enum id in range; its node's g a
+    // Generics node.
+    unsafe {
+        let node = if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node };
+        let g = NODES[node].g;
+        if g == 0 || NODES[g].count == 0 {
+            return false;
+        }
+        for k in 0..NODES[g].count {
+            if !is_allocator_param(child(g, k)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---- The exemption (0.26.3 only; 0.26.4 deletes it) ----
+
+// ALLOC_EXEMPT: compiler/src's tables are statics holding `Vec<T, Comp>`
+// (base::comp), and its WGSL checks' arena a static (front::embed::wgsl),
+// until 0.26.4's (f) moves them into context structs passed down; and
+// Comp's impl of Allocator stays safe until the release that builds the
+// compiler parses `unsafe impl` (0.26.3's, stage 1 of 0.26.4). For these
+// alone: a static may hold Comp, a struct may hold Comp without naming it
+// in its parameters, Comp's impl is safe, and the static
+// front::embed::wgsl::WGSL_ARENA may hold its Arena. Its uses:
+// `volec query refs base::comp::Comp --count`, `query refs WGSL_ARENA`.
+// 0.26.4 deletes this table: (f) for the statics and fields, `unsafe
+// impl` once 0.26.3's parser is stage 1.
+const EXEMPT_MODULE: [u8] = "base::comp";
+const EXEMPT_TYPE: [u8] = "Comp";
+const EXEMPT_STATIC_MODULE: [u8] = "front::embed::wgsl";
+const EXEMPT_STATIC: [u8] = "WGSL_ARENA";
+
+// Whether module m's path is `path` (outside std).
+fn module_is(m: i64, path: [u8]) -> bool {
+    // UNSAFE: MODULES is the checker's raw table of modules.
+    // SAFETY: m is a module id (an item's module).
+    unsafe { m > 0 && !within_std(m) && SYMS[MODULES[m].key].text == path }
+}
+
+// Whether type t is an allocator of the exemption (base::comp::Comp).
+pub fn is_exempt_allocator(t: i64) -> bool {
+    if t <= 0 || TYPES[t].kind != TyKind::Struct {
+        return false;
+    }
+    // UNSAFE: STRUCTS is the checker's raw table of structs.
+    // SAFETY: a struct type's TYPES[t].a is a struct id.
+    unsafe {
+        let s = TYPES[t].a;
+        SYMS[STRUCTS[s].name].text == EXEMPT_TYPE && module_is(STRUCTS[s].module, EXEMPT_MODULE)
+    }
+}
+
+// Whether static s is the exemption's (front::embed::wgsl::WGSL_ARENA).
+fn is_exempt_static(s: i64) -> bool {
+    // UNSAFE: STATICS and NODES are the checker's raw tables.
+    // SAFETY: s < STATIC_COUNT; its node a Static item.
+    unsafe {
+        let node = STATICS[s].node;
+        SYMS[NODES[node].a].text == EXEMPT_STATIC
+            && module_is(module_of(node), EXEMPT_STATIC_MODULE)
+    }
+}
+
+// ---- AllocFree (rule 1): what holds no allocator ----
+
+// Per type id + 1: the allocator type it holds + 1 (1: none); KEPT_MEMO
+// the same with the exemption's allocators left out.
+static var ALLOC_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var KEPT_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Whether type t is AllocFree: it holds no allocator, looking through
+// everything (fields, enum payloads, tuples, arrays, slices, pointers and
+// references, closure environments), not through a function type.
+pub fn is_alloc_free(t: i64) -> bool {
+    alloc_part(t, false) == 0
+}
+
+// The allocator type that t holds, the first found, 0: none; with
+// `exempt`, the exemption's allocators are not counted.
+pub fn alloc_part(t: i64, exempt: bool) -> i64 {
+    if t <= 0 || t == TY_ERROR || allocator_trait() < 0 {
+        return 0;
+    }
+    let known = if exempt { KEPT_MEMO.get(t + 1) } else { ALLOC_MEMO.get(t + 1) };
+    if known != 0 {
+        return known - 1;
+    }
+    // (a type reached again while it is decided: none there)
+    if exempt {
+        KEPT_MEMO.put(t + 1, 1);
+    } else {
+        ALLOC_MEMO.put(t + 1, 1);
+    }
+    let r = alloc_of(t, exempt);
+    if exempt {
+        KEPT_MEMO.put(t + 1, r + 1);
+    } else {
+        ALLOC_MEMO.put(t + 1, r + 1);
+    }
+    r
+}
+
+fn alloc_of(t: i64, exempt: bool) -> i64 {
+    // UNSAFE: STRUCTS, ENUMS and VARIANTS are the checker's raw tables.
+    // SAFETY: t > 0 is a type id; a struct type's TYPES[t].a is a struct id,
+    // an enum type's an enum id, whose variants and fields are in range.
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct {
+            if is_allocator_type(t) {
+                if !(exempt && is_exempt_allocator(t)) {
+                    return t;
+                }
+                return 0;
+            }
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].field_count {
+                let r = alloc_part((*struct_field(s, i)).ty, exempt);
+                if r != 0 {
+                    return r;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                let r = alloc_part(type_elem(t, i), exempt);
+                if r != 0 {
+                    return r;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Array || kind == TyKind::Distinct || kind == TyKind::Ptr
+            || kind == TyKind::Slice {
+            return alloc_part(TYPES[t].a, exempt);
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    let r = alloc_part(variant_field(v, k), exempt);
+                    if r != 0 {
+                        return r;
+                    }
+                }
+            }
+        }
+        0
+    }
+}
+
+// ---- Rule 1: no static holds an allocator ----
+
+// alloc.static: a `static`, `static var` or thread-local whose type holds
+// an allocator: any function could allocate through it with nothing in
+// its signature saying so. No fix: the value moves into main.
+fn check_alloc_statics() {
+    // UNSAFE: STATICS and NODES are the checker's raw tables.
+    // SAFETY: s < STATIC_COUNT; its node a Static item.
+    unsafe {
+        for s in 0..STATIC_COUNT {
+            let t = STATICS[s].ty;
+            if t <= 0 || t == TY_ERROR || STATICS[s].linkage != 0 || is_exempt_static(s) {
+                continue;
+            }
+            let part = alloc_part(t, true);
+            if part == 0 {
+                continue;
+            }
+            let node = STATICS[s].node;
+            let saved = ERR_KIND;
+            ERR_KIND = c"alloc.static";
+            err_begin(NODES[node].start);
+            err_str(c"the static '");
+            err_sym(NODES[node].a);
+            err_str(c"' holds an allocator, '");
+            err_type(part);
+            if part != t {
+                err_str(c"' (in its type '");
+                err_type(t);
+                err_str(c"')");
+            } else {
+                err_str(c"'");
+            }
+            err_str(c": a static's type may not hold one");
+            err_help(c"any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)");
+            err_end_soft();
+            ERR_KIND = saved;
+        }
+    }
+}
+
+// ---- Rule 3: a type holding an allocator names it in its parameters ----
+
+// alloc.field: a struct's field (an enum variant's payload) holds an
+// allocator its type parameters do not name (`struct P { v: Vec<u8, Gpa> }`):
+// `fn f(p: &mut P)` could allocate with nothing in its signature saying
+// so. Its fix makes the type generic over the allocator,
+// `struct P<A: Allocator> { v: Vec<u8, A> }`; its uses then name it
+// (`P<Gpa>`, alloc.default's fix).
+fn check_alloc_fields() {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: k < the program's item count; a Struct's children are its
+    // Field nodes, an Enum's its Variant nodes (whose list are types).
+    unsafe {
+        for k in 0..NODES[PROGRAM].count {
+            let item = child(PROGRAM, k);
+            let kind = NODES[item].kind;
+            if kind != NodeKind::Struct && kind != NodeKind::Enum {
+                continue;
+            }
+            let module = module_of(item);
+            let g = NODES[item].g;
+            for i in 0..NODES[item].count {
+                let f = child(item, i);
+                if kind == NodeKind::Struct {
+                    let part = field_allocator(NODES[f].b, g, module);
+                    if part != 0 {
+                        field_error(item, f, NODES[f].b, part);
+                        break;
+                    }
+                } else {
+                    var found = false;
+                    for j in 0..NODES[f].count {
+                        let ty = child(f, j);
+                        let part = field_allocator(ty, g, module);
+                        if part != 0 {
+                            field_error(item, f, ty, part);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Whether type node n names a type parameter of Generics node g.
+fn mentions_param(n: i64, g: i64) -> bool {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: n is a type node; g a Generics node (or 0).
+    unsafe {
+        if n == 0 || g == 0 {
+            return false;
+        }
+        let kind = NODES[n].kind;
+        if kind == NodeKind::TyName {
+            if NODES[n].count == 0 {
+                for i in 0..NODES[g].count {
+                    if NODES[child(g, i)].a == NODES[n].a {
+                        return true;
+                    }
+                }
+            }
+            let args = NODES[n].g;
+            if args != 0 {
+                for i in 0..NODES[args].count {
+                    if mentions_param(child(args, i), g) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        if kind == NodeKind::TyPtr || kind == NodeKind::TySlice || kind == NodeKind::TyArray {
+            return mentions_param(NODES[n].a, g);
+        }
+        if kind == NodeKind::TyTuple || kind == NodeKind::TyFn {
+            for i in 0..NODES[n].count {
+                if mentions_param(child(n, i), g) {
+                    return true;
+                }
+            }
+            return kind == NodeKind::TyFn && mentions_param(NODES[n].a, g);
+        }
+    }
+    false
+}
+
+// The allocator type that field type node n (of an item with type
+// parameters g, in module) holds without naming it through g; 0: none.
+// A part written with g's parameters is theirs (`Vec<T, A>`, `&'a
+// Arena<P>`); a part without is resolved and looked through (AllocFree,
+// the exemption left out).
+fn field_allocator(n: i64, g: i64, module: i64) -> i64 {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: n is a type node (or 0); g a Generics node (or 0).
+    unsafe {
+        if n == 0 {
+            return 0;
+        }
+        let kind = NODES[n].kind;
+        if kind == NodeKind::TyFn {
+            return 0;
+        }
+        if !mentions_param(n, g) {
+            let t = resolve_quietly(n, module);
+            return alloc_part(t, true);
+        }
+        if kind == NodeKind::TyName {
+            let args = NODES[n].g;
+            if args != 0 {
+                for i in 0..NODES[args].count {
+                    let r = field_allocator(child(args, i), g, module);
+                    if r != 0 {
+                        return r;
+                    }
+                }
+            }
+            return 0;
+        }
+        if kind == NodeKind::TyPtr || kind == NodeKind::TySlice || kind == NodeKind::TyArray {
+            return field_allocator(NODES[n].a, g, module);
+        }
+        if kind == NodeKind::TyTuple {
+            for i in 0..NODES[n].count {
+                let r = field_allocator(child(n, i), g, module);
+                if r != 0 {
+                    return r;
+                }
+            }
+        }
+    }
+    0
+}
+
+// Type node n resolved in module, with no type parameter in scope; 0 when
+// it does not resolve (its error is the declaration's, reported there).
+fn resolve_quietly(n: i64, module: i64) -> i64 {
+    let mark = errors_mark();
+    let saved_mod = CUR_MOD;
+    let saved_base = TP_BASE;
+    TP_BASE = TP_NAMES.count;
+    CUR_MOD = module;
+    let ok = attempt(Try::Type, n);
+    CUR_MOD = saved_mod;
+    TP_BASE = saved_base;
+    if !ok {
+        errors_forget(mark);
+        return 0;
+    }
+    TRY_RESULT
+}
+
+fn field_error(item: i64, f: i64, ty: i64, part: i64) {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: item is a Struct or Enum item, f one of its children, ty a
+    // type node in it.
+    unsafe {
+        let is_enum = NODES[item].kind == NodeKind::Enum;
+        let saved = ERR_KIND;
+        ERR_KIND = c"alloc.field";
+        err_begin(NODES[ty].start);
+        err_str(if is_enum { c"the enum '" } else { c"the struct '" });
+        err_sym(NODES[item].a);
+        err_str(c"' holds an allocator its parameters do not name: '");
+        err_type(part);
+        err_str(c"', in ");
+        if is_enum {
+            err_str(c"variant '");
+        } else {
+            err_str(c"field '");
+        }
+        err_sym(NODES[f].a);
+        err_str(c"'");
+        err_help(c"a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`)");
+        generic_fix(item, part);
+        err_try_tool("fix --only alloc", true);
+        err_end_soft();
+        ERR_KIND = saved;
+    }
+}
+
+// The fix of alloc.field: item (a struct or enum) made generic over a new
+// parameter `A: Allocator` (a name it does not use), which replaces the
+// allocator `part` where its fields write it by name. None when the
+// allocator is not written in them (held through another type).
+fn generic_fix(item: i64, part: i64) {
+    // UNSAFE: NODES and STRUCTS are the checker's raw tables.
+    // SAFETY: item is a Struct or Enum item; part a struct type.
+    unsafe {
+        let pname = SYMS[STRUCTS[TYPES[part].a].name].text;
+        let g = NODES[item].g;
+        // The parameter's name: A, else B, C...
+        var letter: u8 = 'A';
+        var free = false;
+        while !free && letter <= 'Z' {
+            free = true;
+            if g != 0 {
+                for i in 0..NODES[g].count {
+                    let n = SYMS[NODES[child(g, i)].a].text;
+                    if n.len() == 1 && n[0] == letter {
+                        free = false;
+                    }
+                }
+            }
+            if !free {
+                letter += 1;
+            }
+        }
+        if !free || pname.len() == 1 && pname[0] == letter {
+            return;
+        }
+        // From the end of the name to the end of the item: the parameter
+        // added, and `pname` (a whole word, in the fields) replaced.
+        var name_end = NODES[item].start;
+        let word = SYMS[NODES[item].a].text;
+        while name_end + word.len() as i64 <= NODES[item].end
+            && SRC[name_end..name_end + word.len() as i64] != word {
+            name_end += 1;
+        }
+        name_end += word.len() as i64;
+        var body = name_end;
+        let text = buf_new();
+        if g != 0 && SRC[name_end] == '<' {
+            // (before the `>` of its parameters)
+            var depth = 0;
+            var k = name_end;
+            while k < NODES[item].end {
+                if SRC[k] == '<' {
+                    depth += 1;
+                } else if SRC[k] == '>' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            buf_bytes(text, SRC[name_end..k]);
+            buf_str(text, c", ");
+            buf_byte(text, letter);
+            buf_str(text, c": Allocator>");
+            body = k + 1;
+        } else {
+            buf_byte(text, '<');
+            buf_byte(text, letter);
+            buf_str(text, c": Allocator>");
+        }
+        var replaced = 0;
+        var i = body;
+        let end = NODES[item].end;
+        while i < end {
+            let c = SRC[i];
+            if c == '/' && i + 1 < end && SRC[i + 1] == '/' {
+                while i < end && SRC[i] != '\n' {
+                    buf_byte(text, SRC[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            if i + pname.len() as i64 <= end && SRC[i..i + pname.len() as i64] == pname
+                && !ident_byte(SRC[i - 1])
+                && (i + pname.len() as i64 >= end || !ident_byte(SRC[i + pname.len() as i64])) {
+                buf_byte(text, letter);
+                replaced += 1;
+                i += pname.len() as i64;
+                continue;
+            }
+            buf_byte(text, c);
+            i += 1;
+        }
+        if replaced > 0 {
+            err_fix(name_end, end, buf_slice(text));
+        }
+    }
+}
+
+// ---- Allocator last ----
+
+// alloc.last: a function named `*_in` takes its allocator last (Rust's
+// allocator API, `Vec::with_capacity_in(cap, alloc)`); an allocator
+// parameter before its last one is the error. No fix: `volec refactor
+// signature` moves it, with every call.
+fn check_alloc_last() {
+    // UNSAFE: NODES and FNS are the checker's raw tables.
+    // SAFETY: f < FN_COUNT; its node a Fn whose children are Param nodes.
+    unsafe {
+        for f in 0..FN_COUNT {
+            let node = FNS[f].node;
+            if FNS[f].tmpl != 0 || NODES[node].kind != NodeKind::Fn
+                || (NODES[node].p & FN_DEFAULT_COPY) != 0 {
+                continue;
+            }
+            let name = SYMS[NODES[node].a].text;
+            if name.len() < 4 || !name.ends_with("_in") {
+                continue;
+            }
+            let count = NODES[node].count;
+            var at = -1;
+            for i in 0..count {
+                if is_allocator_param_type(NODES[child(node, i)].b, node, FNS[f].module) {
+                    at = i;
+                }
+            }
+            if at < 0 || at == count - 1 {
+                continue;
+            }
+            let p = child(node, at);
+            let saved = ERR_KIND;
+            ERR_KIND = c"alloc.last";
+            err_begin(NODES[p].start);
+            err_str(c"'");
+            err_sym(NODES[node].a);
+            err_str(c"' takes its allocator '");
+            err_sym(NODES[p].a);
+            err_str(c"' before its last parameter: an `_in` function takes it last");
+            err_help(c"move the allocator to the end of the parameters (Rust's `with_capacity_in(cap, alloc)`), and at every call: `volec refactor signature` does both");
+            err_try_tool("refactor signature --help", false);
+            err_end_soft();
+            ERR_KIND = saved;
+        }
+    }
+}
+
+// Whether parameter type node n of function node fnode is an allocator:
+// a type parameter (of the function or its impl) bounded by Allocator, or
+// a type that is one.
+fn is_allocator_param_type(n: i64, fnode: i64, module: i64) -> bool {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: n is a type node (or 0); fnode a Fn node.
+    unsafe {
+        if n == 0 || NODES[n].kind != NodeKind::TyName || NODES[n].count != 0 || NODES[n].g != 0 {
+            return false;
+        }
+        let g = NODES[fnode].g;
+        if g != 0 {
+            for i in 0..NODES[g].count {
+                let p = child(g, i);
+                if NODES[p].a == NODES[n].a {
+                    return is_allocator_param(p);
+                }
+            }
+        }
+        let name = SYMS[NODES[n].a].text;
+        if name == "Self" || name.len() == 1 {
+            return false;
+        }
+        is_allocator_type(resolve_quietly(n, module))
+    }
+}
