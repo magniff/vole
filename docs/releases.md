@@ -243,6 +243,12 @@ step 8):
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
 
+A value whose type has a `Drop` impl is dropped whole, under its flag
+(the release gate's fuzz-sem, seed 89): with a field assigned on one path
+and the value moved on another, the IR dropped its fields and never
+called its `drop`. A field assigned after the value may have moved is
+now own.partial, as moving a field out of it is (Rust's E0382).
+
 The places IR, agent A's half (placesir261a; design/places-ir.md §8,
 compiler/src/places/README.md):
 

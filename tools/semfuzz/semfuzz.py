@@ -651,6 +651,9 @@ class Call(E):
 
     def code(self):
         a = ', '.join(x.code() for x in self.args)
+        if self.method and self.name == 'len':
+            # (0.26.2: a length is a usize; the programs' values are i64)
+            return '(%s.len() as i64)' % self.recv.code()
         if self.method:
             return '%s.%s(%s)' % (self.recv.code(), self.name, a)
         return '%s(%s)' % (self.name, a)
@@ -1216,7 +1219,8 @@ class IterSum(E):
     def code(self):
         if self.kind == 'sum':
             return '%s.iter().map(|t| t.v).sum()' % self.p.code()
-        return '%s.iter().filter(|t| t.v > %d).count()' % (self.p.code(), self.k)
+        # (0.26.2: a count is a usize; the programs' values are i64)
+        return '(%s.iter().filter(|t| t.v > %d).count() as i64)' % (self.p.code(), self.k)
 
     def ev(self, it, fr):
         w = rd(self.p.place(it, fr).get())
@@ -1857,7 +1861,7 @@ struct Pt { x: i64, y: i64 }
 
 trait Score { fn score(self) -> i64; }
 impl Score for T { fn score(self) -> i64 { self.v * 2 + 1 } }
-impl Score for S { fn score(self) -> i64 { self.t.v + self.w.len() + self.n } }
+impl Score for S { fn score(self) -> i64 { self.t.v + self.w.len() as i64 + self.n } }
 
 fn total<X: Score>(x: X) -> i64 { x.score() }
 fn gid<X>(x: sink X) -> X { x }
@@ -1878,7 +1882,7 @@ fn vsig(w: Vec<T>) -> i64 {
 fn vbump(w: inout Vec<T>, k: i64) {
     for i in 0..w.len() { w[i].v += k; }
 }
-fn veat(w: sink Vec<T>) -> i64 { w.len() }
+fn veat(w: sink Vec<T>) -> i64 { w.len() as i64 }
 fn keep(w: inout Vec<T>, t: sink T) { w.push(t); }
 fn ssig(s: S) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
 fn vssig(ws: Vec<S>) -> i64 {
@@ -1915,7 +1919,7 @@ fn psink(p: sink Pt) -> i64 {
     p.x += 1;
     p.x * 10 + p.y
 }
-fn seat(s: sink String) -> i64 { s.len() }
+fn seat(s: sink String) -> i64 { s.len() as i64 }
 fn apply<F: Fn(i64) -> i64>(f: F, a: i64) -> i64 { f(a) }
 fn twice<F: FnMut(i64)>(f: sink F) { f(1); f(2); }
 fn callf<F: Fn() -> i64>(f: sink F) -> i64 { f() }
@@ -2537,7 +2541,8 @@ class Gen:
             (2, self.st_plain),
             (1, self.st_string),
             (1, self.st_inout),
-            (1, self.st_defer),
+            # (0.26.2: `defer` is removed)
+            (0, self.st_defer),
             (1, self.st_shadow),
             (2 if c.loop > 0 else 0, self.st_break),
             (2 if depth < 7 else 0, self.st_return),
