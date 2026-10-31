@@ -2817,3 +2817,5 @@ stress-grow, cachediff 1424 lines (422 from the cache), unsafe-audit
 3340 unjustified (baseline 3425) and 0 in std, chain-diverse,
 chain-fresh 36 releases. compile-cost against v0.26.1: a hello world
 0.98x, std 1.03x, check of the compiler 1.01x.
+The bench (`gate.sh --only bench`, after the tag, the machine idle):
+the -O2 geomean 0.884 of `cc -O2`'s time, 0.26.1's 0.888; -O1 1.433.
