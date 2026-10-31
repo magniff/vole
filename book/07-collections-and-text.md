@@ -921,7 +921,7 @@ fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
     rows
 }
 
-fn print_table(rows: [(String, i64)], top: i64) {
+fn print_table(rows: [(String, i64)], top: usize) {
     let shown = if rows.len() < top { rows.len() } else { top };
     println(f"{"word":<12} {"count":>5}");
     println(f"{"----":<12} {"-----":>5}");

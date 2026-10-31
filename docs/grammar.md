@@ -1780,7 +1780,7 @@ take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
 
 **`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
 an array (a variable, constant, static or a field of one) is its
-length, an `i64` (still in 0.26.2, where the field is a `usize`). The field stays. The other way round, `a.len` on such
+length; both are a `usize` (0.26.2), as the field is. The field stays. The other way round, `a.len` on such
 an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
 (whose `len` field is private, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.

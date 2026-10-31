@@ -294,7 +294,7 @@ re-exports. A missing import's error says which `use` line to add, and
 ```vole
 fn sum(xs: [i64]) -> i64 {
     var t = 0;
-    for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
+    for i in 0..xs.len() { t += xs[i]; }    // indices are usize; checked
     t
 }
 

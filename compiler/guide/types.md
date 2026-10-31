@@ -64,7 +64,7 @@ let copy = grid;                  // arrays are values: copied whole
 grid[0][0] = 1;
 let row = grid[1][..];            // [i64]: a view of the array
 let part = row[1..];              // checked: lo <= hi <= len
-std::print_int(copy[0][0] + part.len() + part[1]);
+std::print_int(copy[0][0] + part.len() as i64 + part[1]);
 println("");
 ```
 ```out

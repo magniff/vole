@@ -359,9 +359,9 @@ fn count_simd(s: [u8], b: u8) -> usize {
     let needle = v16u8::splat(b);
     let one = v16u8::splat(1);
     var n: usize = 0;
-    var i = 0;
+    var i: usize = 0;
     while i + 16 <= s.len() {
-        let eq = v16u8::load(s, i) == needle; // 0xff where equal, else 0
+        let eq = v16u8::load(s, i as i64) == needle; // 0xff where equal, else 0
         n += (eq & one).sum() as usize;
         i += 16;
     }
