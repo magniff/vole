@@ -187,6 +187,13 @@ step 8):
   `control.vl`s gone). What the IR does not lower itself: a literal, a
   name or a check's site of an operand, and the calls, intrinsics and
   vector operations it drives with their operands bound.
+- A hello world's compile cost back to before the flip (1.12x of 0.25.5
+  to 1.08x): the calling conventions' classification no longer walks a
+  large array's every element (std's 4096-byte print buffer cost 1.5M
+  instructions in one 7-instruction function), and a function's entry
+  block starts with its parameters again, so interprocedural constants
+  reach them (println's length into fmt_str_fd, whose long-string loop
+  then folds away). std_heavy: -2.1%.
 - tests/run.sh builds every other case with `--verify-places` (by its
   name's cksum; `VOLE_VERIFY_EVERY=N`: every N-th, 0: none).
 
