@@ -1,0 +1,559 @@
+// `volec fix --only casts` (0.26.3): the `as i64` conversions of a usize
+// (a length, `s.len as i64`, `v.len() as i64`) taken away where the value
+// means the same as a usize: so that a length stays a usize.
+//
+// A cast goes when every place its value reaches takes a usize and does
+// the same with it (the value is a length, below 2^63, never negative):
+//
+//   (1) an index, `a[n as i64]`, or an end of a slicing, `a[i..n as i64]`
+//       whose other end is a usize too (or absent, or a literal); and the
+//       end of `a[i..a.len as i64]` (`a.len()`), a slicing to a's own end
+//       whatever i is: it becomes `a[i..]` (a is a name or its fields);
+//   (2) a comparison with a usize: another length, a literal at least 0,
+//       a usize expression, or a value this fix makes a usize; never `< 0`
+//       or `>= 0`, whose answer depends on the sign;
+//   (3) the end of a `for i in A..n as i64` whose other end is a usize,
+//       and whose counter i reaches only (1), (2), (3), (4) or a cast;
+//   (4) the value of a `let x = n as i64;` (not `var`, no type written)
+//       whose x reaches only (1), (2), (3), (4) or a cast.
+//
+// Everything else keeps its cast, and is counted by where the value goes:
+// arithmetic (`-` may go below 0; the others are counted apart), a value
+// stored as an i64 (a field, an argument, a returned value, an assignment),
+// a comparison with an i64, or another use. So is a cast copied by the
+// checker (a generic function's instances, a contract's check), and one
+// whose value a closure reaches. Each decision is the fixed point of the
+// rules above, over the whole program; the edited program is then checked
+// (a fix whose result does not check is refused, as every fix's).
+
+use crate::base::{FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_str};
+use crate::front::ast::{CONV_NEW, NODES, NODE_IMPLICIT, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::generics::instantiate::{node_field_a, node_field_b, node_field_c};
+use crate::front::lexer::Tok;
+use crate::front::modules::file_of_pos;
+use crate::front::types::{TY_I64, TY_USIZE};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::refs::ref_in;
+
+// Where a cast's value goes (the census, CAST_COUNTS); CK_INDEX to CK_LET
+// and CK_SLICE_END are removed when the fixed point keeps them.
+pub const CK_INDEX: i64 = 0;
+pub const CK_COMPARE: i64 = 1;
+pub const CK_LOOP: i64 = 2;
+pub const CK_LET: i64 = 3;
+// (kept) `-`, or `-=`
+pub const CK_SUB: i64 = 4;
+// (kept) `+ * / % & | ^ << >>`
+pub const CK_ARITH: i64 = 5;
+// (kept) a comparison with an i64 (a counter `var i = 0`), or by its sign
+pub const CK_CMP_I64: i64 = 6;
+// (kept) a field, a struct literal, an argument, a returned value, an
+// assignment, a `var`, a `let` with a type
+pub const CK_STORED: i64 = 7;
+// (kept) anything else: a match, a format argument, a method's receiver
+pub const CK_OTHER: i64 = 8;
+// (kept) a candidate of (1)-(4) whose fixed point refused it: a counter or
+// a local that reaches something else
+pub const CK_REFUSED: i64 = 9;
+// (kept) copied by the checker (a node with two parents: a generic
+// instance's, a contract's, a tail value's), or reached by a closure
+pub const CK_COPIED: i64 = 10;
+// `a[i..a.len as i64]` to `a[i..]` (removed)
+pub const CK_SLICE_END: i64 = 11;
+// (not counted above) `x as i64` of an i64: no conversion at all
+pub const CK_NOOP: i64 = 12;
+// (not counted above) a conversion of another type (u8, bool, an enum, a
+// pointer)
+pub const CK_NOT_USIZE: i64 = 13;
+const CK_N: i64 = 14;
+
+pub static var CAST_COUNTS: [i64; 14] = [0; 14];
+// (`--only casts-list`, a dry run) each usize cast on stdout: FILE:LINE,
+// what was decided, where its value goes first, its text
+pub static var CAST_LIST: bool = false;
+
+// The parent of each node (+1; MULTI: more than one).
+static var PARENT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+const MULTI: i64 = -1;
+// The uses of each local: USE_HEAD (local+1 -> first Ident+1), USE_NEXT
+// (Ident+1 -> next Ident+1).
+static var USE_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var USE_NEXT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The candidates: a cast node, or a local (its binding PatBind node), with
+// its state (+1): 1 kept so far, 2 refused.
+static var STATE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+const ST_OK: i64 = 1;
+const ST_NO: i64 = 2;
+static var CASTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LOCAL_UNITS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Spans of written casts seen, start+1 -> how many nodes
+static var SPANS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Whether pos is in a file of the program (std's paths start with `<`).
+fn user_pos(pos: i64) -> bool {
+    // UNSAFE: FILES is the loader's table of source files, a raw pointer (base).
+    // SAFETY: file_of_pos gives the index of a loaded file, and every path is NUL-terminated.
+    unsafe { FILES[file_of_pos(pos)].path[0] != '<' }
+}
+
+fn parent(n: i64) -> i64 {
+    let p = PARENT.get(n + 1);
+    if p <= 0 { -1 } else { p - 1 }
+}
+
+fn set_parent(c: i64, n: i64) {
+    if c <= 0 {
+        return;
+    }
+    let old = PARENT.get(c + 1);
+    if old == 0 {
+        PARENT.put(c + 1, n + 1);
+    } else if old != n + 1 {
+        PARENT.put(c + 1, MULTI);
+    }
+}
+
+fn is_blank(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// Where the ` as i64` of cast n starts (the end of its operand's text), or
+// -1 when n is not written so (a cast the checker made).
+fn as_start(n: i64) -> i64 {
+    let e = NODES[n].end;
+    let s = NODES[n].start;
+    if e - s < 7 || e > SRC.len as i64 || SRC[e - 3] != 'i' || SRC[e - 2] != '6'
+        || SRC[e - 1] != '4' {
+        return -1;
+    }
+    var p = e - 3;
+    if !is_blank(SRC[p - 1]) {
+        return -1;
+    }
+    while p > s && is_blank(SRC[p - 1]) {
+        p -= 1;
+    }
+    if p - 2 <= s || SRC[p - 1] != 's' || SRC[p - 2] != 'a' || !is_blank(SRC[p - 3]) {
+        return -1;
+    }
+    p -= 2;
+    while p > s && is_blank(SRC[p - 1]) {
+        p -= 1;
+    }
+    p
+}
+
+// Whether n is an integer literal at least 0 with no suffix.
+fn plain_literal(n: i64) -> bool {
+    n > 0 && NODES[n].kind == NodeKind::Int && NODES[n].a >= 0 && NODES[n].b == 0
+}
+
+// The candidate expression n stands for: a cast candidate, or a use of a
+// local candidate (its PatBind); -1.
+fn unit_of(n: i64) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    if NODES[n].kind == NodeKind::Cast && STATE.get(n + 1) != 0 {
+        return n;
+    }
+    if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
+        let b = LOCAL_BIND.get(NODES[n].y + 1);
+        if b > 0 && STATE.get(b) != 0 {
+            return b - 1;
+        }
+    }
+    -1
+}
+
+// The PatBind of each local candidate (local+1 -> PatBind+1).
+static var LOCAL_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn ok(u: i64) -> bool {
+    STATE.get(u + 1) == ST_OK
+}
+
+// Whether partner o of a comparison or a range is a usize as it is, or
+// will be: a literal, a usize, a candidate kept so far.
+fn usize_partner(o: i64) -> bool {
+    if plain_literal(o) || o > 0 && NODES[o].ty == TY_USIZE {
+        return true;
+    }
+    let u = unit_of(o);
+    u >= 0 && ok(u)
+}
+
+fn is_compare(op: Tok) -> bool {
+    op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::LtEq || op == Tok::Gt
+        || op == Tok::GtEq
+}
+
+// A local candidate for the binding of `let` (or the counter of `for`) p:
+// its PatBind, when it may become one (not `var`, no type, no closure),
+// else -1.
+fn local_unit(pat: i64) -> i64 {
+    if pat <= 0 || NODES[pat].kind != NodeKind::PatBind || NODES[pat].b != 0
+        || NODES[pat].x < 0 || NODES[pat].count != 0 {
+        return -1;
+    }
+    if STATE.get(pat + 1) == 0 {
+        STATE.put(pat + 1, ST_OK);
+        LOCAL_BIND.put(NODES[pat].x + 1, pat + 1);
+        LOCAL_UNITS.push(pat);
+    }
+    pat
+}
+
+// Where the value of expression e goes (CK_*), for a candidate e (a cast,
+// or a use of a local candidate); with what it needs kept in *needs (a
+// candidate, or -1) and whether the rule holds now in *holds.
+fn context(e: i64, holds: inout bool) -> i64 {
+    holds = false;
+    let p = parent(e);
+    if p < 0 {
+        return CK_COPIED;
+    }
+    let k = NODES[p].kind;
+    if k == NodeKind::Index {
+        if NODES[p].b == e {
+            holds = true;
+            return CK_INDEX;
+        }
+        return CK_OTHER;
+    }
+    if k == NodeKind::Range {
+        let other = if NODES[p].a == e { NODES[p].b } else { NODES[p].a };
+        let other_ok = other <= 0 || usize_partner(other);
+        let q = parent(p);
+        if q >= 0 && NODES[q].kind == NodeKind::Index && NODES[q].b == p {
+            if !other_ok && NODES[p].b == e && NODES[p].c == 0 && own_end(NODES[q].a, e) {
+                holds = true;
+                return CK_SLICE_END;
+            }
+            holds = other_ok;
+            return CK_INDEX;
+        }
+        if q >= 0 && NODES[q].kind == NodeKind::For && NODES[q].c == p && NODES[p].b == e {
+            let l = local_unit(NODES[q].b);
+            holds = other_ok && other > 0 && l >= 0 && ok(l);
+            return CK_LOOP;
+        }
+        return CK_OTHER;
+    }
+    if k == NodeKind::Binary {
+        let op = NODES[p].op;
+        let left = NODES[p].b == e;
+        let other = if left { NODES[p].c } else { NODES[p].b };
+        if is_compare(op) {
+            // (by its sign: `n < 0`, `n >= 0`, `0 > n`, `0 <= n`)
+            let zero = plain_literal(other) && NODES[other].a == 0;
+            if zero && (left && (op == Tok::Lt || op == Tok::GtEq)
+                || !left && (op == Tok::Gt || op == Tok::LtEq)) {
+                return CK_CMP_I64;
+            }
+            if usize_partner(other) {
+                holds = true;
+                return CK_COMPARE;
+            }
+            return CK_CMP_I64;
+        }
+        if op == Tok::Minus {
+            return CK_SUB;
+        }
+        return CK_ARITH;
+    }
+    if k == NodeKind::Let && NODES[p].c == e {
+        if NODES[p].b != 0 || (NODES[p].p & CONV_NEW) != 0 {
+            return CK_STORED;
+        }
+        let l = local_unit(NODES[p].a);
+        if l < 0 {
+            return CK_STORED;
+        }
+        holds = ok(l);
+        return CK_LET;
+    }
+    if k == NodeKind::Cast && NODES[p].a == e && NODES[e].kind == NodeKind::Ident {
+        // (a local's use converted again: the same value either way)
+        holds = true;
+        return CK_OTHER;
+    }
+    if k == NodeKind::Assign {
+        return if NODES[p].op == Tok::MinusEq { CK_SUB } else { CK_STORED };
+    }
+    if k == NodeKind::FieldInit || k == NodeKind::Return || k == NodeKind::Call
+        || k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::NamedArg {
+        return CK_STORED;
+    }
+    CK_OTHER
+}
+
+// The closures' spans, start and end in pairs.
+static var CLOSURES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether n's text is a name or a name's fields (`a`, `self.b.c`).
+fn pure_path(n: i64) -> bool {
+    let k = NODES[n].kind;
+    if k != NodeKind::Ident && k != NodeKind::FieldAccess {
+        return false;
+    }
+    for i in NODES[n].start..NODES[n].end {
+        let c = SRC[i];
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '_' || c == '.') {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether cast e (`X.len as i64`, `X.len() as i64`) is the length of
+// base, the slice or Vec it slices: X's text is base's, a pure path.
+fn own_end(base: i64, e: i64) -> bool {
+    if base <= 0 || !pure_path(base) {
+        return false;
+    }
+    let b = SRC[NODES[base].start..NODES[base].end];
+    let s = NODES[e].start;
+    let w = NODES[NODES[e].a].end;
+    let x = SRC[s..w];
+    let n = b.len as i64;
+    if x.len as i64 == n + 4 && x[n..n + 4] == ".len" || x.len as i64 == n + 6
+        && x[n..n + 6] == ".len()" {
+        return x[0..n] == b;
+    }
+    false
+}
+
+// Where the `..` of the slicing whose end is e ends, or -1.
+fn dots_end(e: i64) -> i64 {
+    var p = NODES[e].start;
+    while p > 0 && is_blank(SRC[p - 1]) {
+        p -= 1;
+    }
+    if p >= 2 && SRC[p - 1] == '.' && SRC[p - 2] == '.' { p } else { -1 }
+}
+
+// Whether node n is in a closure (by its position).
+fn in_closure(n: i64) -> bool {
+    let pos = NODES[n].start;
+    var i = 0;
+    while i + 1 < CLOSURES.count {
+        if pos >= CLOSURES.get(i) && pos < CLOSURES.get(i + 1) {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
+// Whether candidate u holds now: a cast by its context, a local by all its
+// uses.
+fn holds_now(u: i64) -> bool {
+    if NODES[u].kind == NodeKind::Cast {
+        if SPANS.get(NODES[u].start + 1) > 1 || in_closure(u) {
+            return false;
+        }
+        var h = false;
+        context(u, &h);
+        return h;
+    }
+    // a local: every use
+    var x = USE_HEAD.get(NODES[u].x + 1);
+    while x > 0 {
+        let id = x - 1;
+        if in_closure(id) {
+            return false;
+        }
+        var h = false;
+        context(id, &h);
+        if !h {
+            return false;
+        }
+        x = USE_NEXT.get(x);
+    }
+    true
+}
+
+// The edits; their number.
+pub fn cast_edits() -> i64 {
+    for i in 0..CK_N {
+        CAST_COUNTS[i] = 0;
+    }
+    let total = NODES.len() as i64;
+    // parents, uses, candidates
+    for n in 1..total {
+        let kind = NODES[n].kind;
+        if kind == NodeKind::None {
+            continue;
+        }
+        if node_field_a(kind) {
+            set_parent(NODES[n].a, n);
+        }
+        if node_field_b(kind) {
+            set_parent(NODES[n].b, n);
+        }
+        if node_field_c(kind) {
+            set_parent(NODES[n].c, n);
+        }
+        if kind == NodeKind::For || kind == NodeKind::Param {
+            set_parent(NODES[n].d, n);
+        }
+        if kind == NodeKind::Fn {
+            set_parent(NODES[n].c, n);
+        }
+        for i in 0..NODES[n].count {
+            set_parent(child(n, i), n);
+        }
+        if kind == NodeKind::Closure && user_pos(NODES[n].start) {
+            CLOSURES.push(NODES[n].start);
+            CLOSURES.push(NODES[n].end);
+        }
+        if kind == NodeKind::Ident && NODES[n].res == Res::Local && NODES[n].y >= 0 {
+            let head = USE_HEAD.get(NODES[n].y + 1);
+            if head > 0 {
+                USE_NEXT.put(n + 1, head);
+            }
+            USE_HEAD.put(NODES[n].y + 1, n + 1);
+        }
+        if kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) == 0
+            && NODES[n].ty == TY_I64 && user_pos(NODES[n].start) && ref_in(NODES[n].start)
+            && as_start(n) >= 0 {
+            SPANS.put(NODES[n].start + 1, SPANS.get(NODES[n].start + 1) + 1);
+            let from = NODES[NODES[n].a].ty;
+            if from == TY_USIZE {
+                STATE.put(n + 1, ST_OK);
+                CASTS.push(n);
+            } else if from == TY_I64 {
+                CAST_COUNTS[CK_NOOP] += 1;
+            } else {
+                CAST_COUNTS[CK_NOT_USIZE] += 1;
+            }
+        }
+    }
+    // the contexts, once, to make the local candidates
+    for i in 0..CASTS.count {
+        var h = false;
+        context(CASTS.get(i), &h);
+    }
+    // the fixed point: refuse what does not hold, until nothing changes
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..CASTS.count {
+            let u = CASTS.get(i);
+            if ok(u) && !holds_now(u) {
+                STATE.put(u + 1, ST_NO);
+                changed = true;
+            }
+        }
+        var j = 0;
+        while j < LOCAL_UNITS.count {
+            let u = LOCAL_UNITS.get(j);
+            if ok(u) && !holds_now(u) {
+                STATE.put(u + 1, ST_NO);
+                changed = true;
+            }
+            j += 1;
+        }
+    }
+    // the edits, and the census
+    var fixes = 0;
+    let list = buf_new();
+    for i in 0..CASTS.count {
+        let u = CASTS.get(i);
+        var h = false;
+        let first = context(u, &h);
+        var class = first;
+        if SPANS.get(NODES[u].start + 1) > 1 || in_closure(u) {
+            class = CK_COPIED;
+        } else if !ok(u) && (class <= CK_LET || class == CK_SLICE_END) {
+            class = CK_REFUSED;
+        }
+        CAST_COUNTS[class] += 1;
+        if CAST_LIST {
+            put_site(list, u, class, first);
+        }
+        if ok(u) && class == CK_SLICE_END {
+            let d = dots_end(u);
+            if d > 0 && edit_replace(d, NODES[u].end, buf_new()) {
+                fixes += 1;
+            }
+        } else if ok(u) && class <= CK_LET && edit_replace(as_start(u), NODES[u].end, buf_new()) {
+            fixes += 1;
+        }
+    }
+    if CAST_LIST {
+        crate::base::buf_write_fd(list, crate::base::STDOUT);
+    }
+    fixes
+}
+
+// `FILE:LINE CLASS CONTEXT TEXT` of cast u: what was decided, where its
+// value goes first.
+fn put_site(out: i64, u: i64, class: i64, first: i64) {
+    // UNSAFE: FILES is the loader's table of source files, a raw pointer (base).
+    // SAFETY: file_of_pos gives the index of a loaded file; pos is in it, so start..pos is in SRC.
+    unsafe {
+        let pos = NODES[u].start;
+        let f = file_of_pos(pos);
+        buf_str(out, FILES[f].path);
+        buf_byte(out, ':');
+        var line = 1;
+        for i in FILES[f].start..pos {
+            if SRC[i] == '\n' {
+                line += 1;
+            }
+        }
+        buf_int(out, line);
+        buf_byte(out, '\t');
+        buf_str(out, class_name(class));
+        buf_byte(out, '\t');
+        buf_str(out, class_name(first));
+        buf_byte(out, '\t');
+        buf_bytes(out, SRC[NODES[u].start..NODES[u].end]);
+        buf_byte(out, '\n');
+    }
+}
+
+pub fn class_name(c: i64) -> *u8 {
+    if c == CK_INDEX { c"index" }
+    else if c == CK_COMPARE { c"compare" }
+    else if c == CK_LOOP { c"loop" }
+    else if c == CK_LET { c"let" }
+    else if c == CK_SUB { c"sub" }
+    else if c == CK_ARITH { c"arith" }
+    else if c == CK_CMP_I64 { c"cmp-i64" }
+    else if c == CK_STORED { c"stored" }
+    else if c == CK_OTHER { c"other" }
+    else if c == CK_REFUSED { c"refused" }
+    else if c == CK_COPIED { c"copied" }
+    else if c == CK_SLICE_END { c"slice-end" }
+    else if c == CK_NOOP { c"noop" }
+    else { c"not-usize" }
+}
+
+// The census after a run: `note fix.casts: ...`.
+pub fn cast_report() {
+    let d = diag(c"note", c"fix.casts");
+    buf_str(d, c"usize to i64 casts: removed");
+    let order = [CK_INDEX, CK_SLICE_END, CK_COMPARE, CK_LOOP, CK_LET, CK_SUB, CK_ARITH,
+        CK_CMP_I64, CK_STORED, CK_OTHER, CK_REFUSED, CK_COPIED, CK_NOOP, CK_NOT_USIZE];
+    for i in 0..14 {
+        let c = order[i];
+        if c == CK_SUB {
+            buf_str(d, c"; kept");
+        }
+        if c == CK_NOOP {
+            buf_str(d, c"; other casts to i64");
+        }
+        buf_byte(d, ' ');
+        buf_str(d, class_name(c));
+        buf_byte(d, ' ');
+        buf_int(d, CAST_COUNTS[c]);
+    }
+    buf_byte(d, '\n');
+}

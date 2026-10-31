@@ -44,7 +44,7 @@ unsafe {
 ```
 
 The types must match the format, as in C: nothing checks them. Vole's
-own printing (`println(f"{x}")`) is checked and needs no `unsafe`; use
+own printing (`println("{x}")`) is checked and needs no `unsafe`; use
 `printf` when you are talking to C anyway.
 
 ## Language features
