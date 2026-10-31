@@ -69,3 +69,9 @@ let_drops, arm_drops), `rewrite`, `batch`, `undo`.
 4. [process] A brief that deletes code should name what the code did as
    a side effect (checking lazy std functions; the walk's events), not
    only what it was for.
+5. [verify] (fix261drop, fuzz-sem seed 89: a Drop impl's value opened
+   into its fields, its `drop` never called) `--verify-places` could
+   refuse an open drop, or a move path, under a place whose type has a
+   Drop impl; only the fuzzer found it: `--places-diff` (0 differences on
+   the repro) compares per local whether it drops and under which flag,
+   not whether the drop is opened.
