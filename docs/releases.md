@@ -87,6 +87,19 @@ aarch64-macos only.
   had not compiled since 0.20's spellings and nothing built it. The
   tables stay as generated (Unicode 18.0.0); v0.26.2 has the generator.
 
+compiler/src on `usize` (usize263):
+
+- `volec fix --only casts` removes a usize's `as i64` (`s.len as i64`,
+  `v.len() as i64`) where the value means the same as a usize: an index;
+  a slicing's end (`a[i..a.len as i64]` becomes `a[i..]`); a comparison
+  with a usize, a literal or another removed cast; the bound of a `for`
+  whose counter is used only in those ways; a `let` used only in those
+  ways. It never touches a value that reaches `-` or other arithmetic,
+  an i64 (a field, an argument, a comparison with an i64 counter), a sign
+  test, a closure, or a generic instance's copy. `note fix.casts` counts
+  every cast by class, and `--only casts-list` is a dry run that lists
+  them.
+
 Text (text263; grammar.md, "Items"):
 
 - Rust's `#[deprecated]`, `#[deprecated = "note"]` and
