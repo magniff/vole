@@ -165,6 +165,23 @@ Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
   and 12 kernels with a `#[repr(wgsl)] GpuParams`, and galaga, galaxy,
   life and nes; so are the guide's 20.
 
+The places IR, the AST lowerings' end (placesir262b; places-ir.md §8
+step 8):
+
+- `--check-unsafe` from the IR: a `*` of a raw pointer checks its
+  pointee, an element of one (`p[i]`) the element, a slice of one its
+  bytes, each at the statement's position (the 9 cases' reports are
+  unchanged). No function falls back to the AST lowering any more.
+- No function is lowered from the AST (step 8a): `lower_function` is
+  gone and gen0's function walk is an atomic intrinsic's body only;
+  `VOLE_LOWER` is gone (from the code cache's key too), and a build
+  under `--no-places` is an error. compiler/src's objects are
+  byte-identical before and after, at -O0 and -O2. The AST walks of
+  statements stay while contract and assert conditions are lowered from
+  the AST (step 8b).
+- tests/run.sh builds every other case with `--verify-places` (by its
+  name's cksum; `VOLE_VERIFY_EVERY=N`: every N-th, 0: none).
+
 ### What's new in 0.26.1
 
 The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.

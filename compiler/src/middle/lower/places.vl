@@ -1,6 +1,6 @@
 // Lowering from the places IR (0.26.1, docs/design/places-ir.md §2, §8
 // step 4): a function's kept body (places/keep.vl) to the IR of ir.vl, in
-// place of the AST walk of mod.vl, under VOLE_LOWER=places.
+// place of the AST walk of mod.vl (0.26.2: lower_function, gone).
 //
 // A local that is scalar and never borrowed whole (the place of an
 // RV_REF, with no `*` in it) is an SSA variable; every other local is a
@@ -31,7 +31,8 @@ use crate::front::features::fn_needs;
 use crate::front::lexer::Tok;
 use crate::front::types::{
     ENUMS, FNS, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, VARIANTS, field_offset, fn_param,
-    is_compound, is_slice, is_vector, is_void, tuple_offset, type_size, variant_field_offset,
+    is_compound, is_signed, is_slice, is_vector, is_void, tuple_offset, type_size,
+    variant_field_offset,
 };
 use crate::gen0::gen::expr::panic_kind;
 use crate::middle::ctx::FnCtx;
@@ -74,9 +75,6 @@ use crate::places::ir::{
 use crate::places::keep::{free_body, load_body};
 use crate::places::shim::drop_shim_fn;
 
-// Whether functions are lowered from the places IR (VOLE_LOWER=places).
-pub static var LOWER_PLACES: bool = false;
-
 // The functions lowered here, and the ones left to the AST walk, by
 // reason: no kept body; a drop that runs (until step 4b); a statement
 // kind not lowered here (by kind, KIND_COUNTS); --check-unsafe (its
@@ -85,7 +83,6 @@ pub static var PL_LOWERED: i64 = 0;
 pub static var PL_NO_BODY: i64 = 0;
 pub static var PL_DROP: i64 = 0;
 pub static var PL_KIND: i64 = 0;
-pub static var PL_CHECKED: i64 = 0;
 static var KIND_COUNTS: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // Per local of the body held: its type (erased), its SSA variable (-1:
@@ -119,15 +116,11 @@ pub fn lower_places_function(cx: sink *FnCtx, item: i64, f: i64) -> bool {
 // Function f's kept body held for a code generator (this file, or gen0's
 // places.vl), its blocks ordered (RPO) and scanned (scan_body); counted
 // by the reason when it cannot be (none kept, a drop that does not run, a
-// statement kind not handled, --check-unsafe), and then not held. The
+// statement kind not handled), and then not held. The
 // caller frees a body held (free_body). `types_only`: the scan makes the
 // locals' and places' types only, not what the SSA lowering needs (where
 // each local is used, which are borrowed): gen0's.
 pub fn take_body(f: i64, types_only: bool) -> bool {
-    if CHECK_UNSAFE {
-        PL_CHECKED += 1;
-        return false;
-    }
     if !load_body(f) {
         PL_NO_BODY += 1;
         return false;
@@ -154,9 +147,6 @@ pub fn take_body(f: i64, types_only: bool) -> bool {
 // `places lowering: N functions; AST: no body N, drop N, kind K N...` on
 // stderr (--time-passes).
 pub fn lower_stats() {
-    if !LOWER_PLACES {
-        return;
-    }
     let out = buf_new();
     buf_str(out, c"places lowering: ");
     buf_int(out, PL_LOWERED);
@@ -164,8 +154,6 @@ pub fn lower_stats() {
     buf_int(out, PL_NO_BODY);
     buf_str(out, c", drop ");
     buf_int(out, PL_DROP);
-    buf_str(out, c", check-unsafe ");
-    buf_int(out, PL_CHECKED);
     buf_str(out, c", kind ");
     buf_int(out, PL_KIND);
     for k in 0..KIND_COUNTS.len() as i64 {
@@ -475,7 +463,19 @@ fn done_edge(cx: sink *FnCtx, b: i64) {
 
 // ---- Places and operands ----
 
-// The address of place (l, p).
+// (0.26.2) --check-unsafe's position for a raw access: the statement's
+// (lower_stmt, lower_term).
+static var RAW_POS: i64 = 0;
+
+// Whether type t is a raw pointer (not a reference, 0.17).
+fn is_raw_pointer(t: i64) -> bool {
+    TYPES[t].kind == TyKind::Ptr && !crate::front::types::is_ref(t)
+}
+
+// The address of place (l, p). With --check-unsafe, an access through a
+// raw pointer is checked, at the statement's position: a `*` of one, the
+// whole pointee (as the AST lowering's lower_addr checks `*p`), and an
+// element of one (`p[i]`).
 fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     if p == 0 {
         if has_flag(l, LF_STATIC) {
@@ -487,7 +487,15 @@ fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     let k = proj_kind(p);
     let v = proj_val(p);
     if k == PJ_DEREF {
-        return place_value(cx, l, parent);
+        let pointer = place_value(cx, l, parent);
+        if CHECK_UNSAFE {
+            let pointer_ty = place_ty(l, parent);
+            if is_raw_pointer(pointer_ty) {
+                crate::middle::lower::calls::raw_check_at(cx, RAW_POS, pointer,
+                    ir_const(cx, type_size(TYPES[pointer_ty].a), TY_U64));
+            }
+        }
+        return pointer;
     }
     if k == PJ_VARIANT {
         return place_addr(cx, l, parent);
@@ -527,7 +535,13 @@ fn place_addr(cx: sink *FnCtx, l: i64, p: i64) -> i64 {
     if elem_size != 1 {
         scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64));
     }
-    ir_binary(cx, Op::Add, TY_U64, base, scaled)
+    let at = ir_binary(cx, Op::Add, TY_U64, base, scaled);
+    // (a raw pointer's element: checked, as lower_addr's `p[i]`)
+    if CHECK_UNSAFE && is_raw_pointer(pt) {
+        crate::middle::lower::calls::raw_check_at(cx, RAW_POS, at,
+            ir_const(cx, elem_size, TY_U64));
+    }
+    at
 }
 
 // The value of place (l, p): an SSA use, a load, or a compound value's
@@ -647,6 +661,9 @@ fn lower_stmt(cx: sink *FnCtx, at: i64) {
     if IR_LOCS && s.node > 0 {
         IR_LOC = NODES[s.node].start + 1;
         IR_EXPR_LOC = 0;
+    }
+    if s.node > 0 {
+        RAW_POS = NODES[s.node].start;
     }
     if is_dead_block(cx, CUR) {
         return;
@@ -1013,6 +1030,40 @@ fn lower_call_stmt(cx: sink *FnCtx, s: PStmt) {
     }
 }
 
+// (0.26.2) A check's failing path, the places IR's: the builder branches
+// on each conjunct (s.e) of a requires, ensures, invariant or assert and
+// makes this block for its false, then `unreachable`; ops[0] is that
+// false, ops[1] the site, ops[2..] the shown values (0 to 3, of any
+// integer width: widened to 64 bits). Only the message's text is the
+// AST's (calls.vl's contract_failure_at).
+fn lower_contract_failure(cx: sink *FnCtx, s: PStmt) {
+    // (the site: a `$pre` function's SITE parameter, or the check's own,
+    // an RT_SITE value: the AST's constant, as bind leaves it)
+    var site = 0;
+    let site_kind = op_kind(s.ops, 1);
+    if site_kind == OK_COPY || site_kind == OK_MOVE {
+        let site_ty = op_type(s.ops, 1);
+        site = need_value(cx, operand(cx, s.ops, 1), site_ty);
+        if site_ty != TY_I64 {
+            site = lower_cast(cx, site, site_ty, TY_I64);
+        }
+    } else {
+        site = need_value(cx, crate::middle::lower::expr::lower_expr(cx, child(s.d, 1)), TY_I64);
+    }
+    var values: [i64; 3] = [0; 3];
+    for i in 0..s.nops - 2 {
+        let ty = op_type(s.ops, i + 2);
+        var v = need_value(cx, operand(cx, s.ops, i + 2), ty);
+        let wide = if is_signed(ty) { TY_I64 } else { TY_U64 };
+        if ty != wide {
+            v = lower_cast(cx, v, ty, wide);
+        }
+        values[i] = v;
+    }
+    crate::middle::lower::calls::contract_failure_at(cx, s.d, s.e, site, values[0], values[1],
+        values[2]);
+}
+
 fn lower_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
     let n = s.d;
     if s.c == IK_PANIC {
@@ -1022,22 +1073,7 @@ fn lower_intrinsic_stmt(cx: sink *FnCtx, s: PStmt) {
     }
     var value = 0;
     if s.c == IK_CONTRACT {
-        // An assert's condition (which may change state: `v.pop() == x`)
-        // is the IR's, evaluated once; a requires', ensures' or
-        // invariant's (pure) is lowered again from the AST, a check per
-        // conjunct, the form entry facts read (middle/entryfacts.vl). The
-        // AST's locals are bound for that and for the failing path's
-        // message and shown operands.
-        let check = NODES[child(n, 2)].a;
-        let assert = crate::front::contracts::checks::CHECK_KIND.get(check)
-            == crate::front::contracts::checks::CHK_ASSERT;
-        let ok = if assert { operand(cx, s.ops, 0) } else { 0 };
-        bind_ast_locals(cx);
-        if assert {
-            crate::middle::lower::calls::lower_contract_check_of(cx, n, ok);
-        } else {
-            lower_call(cx, n);
-        }
+        lower_contract_failure(cx, s);
         return;
     }
     if s.c == IK_VECTOR {
@@ -1070,6 +1106,9 @@ fn lower_term(cx: sink *FnCtx, at: i64) {
     if IR_LOCS && s.node > 0 {
         IR_LOC = NODES[s.node].start + 1;
         IR_EXPR_LOC = 0;
+    }
+    if s.node > 0 {
+        RAW_POS = NODES[s.node].start;
     }
     if k == TK_GOTO {
         // (a jump to the return block, which has nothing else: the return
