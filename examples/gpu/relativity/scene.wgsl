@@ -36,7 +36,7 @@ struct Ball {
 };
 
 const BOX_COUNT: u32 = 58u;
-const BOXES: array<Box, 58> = array<Box, 58>(
+var<private> BOXES: array<Box, 58> = array<Box, 58>(
     Box(vec4<f32>(0, 1.4, -12, 0.998), vec4<f32>(1.8, 1.4, 1.5, 0.06), vec4<f32>(0.8, 0.72, 0.56, 0)),
     Box(vec4<f32>(0, 3, -12, 0.998), vec4<f32>(2.1, 0.2, 1.8, 0.06), vec4<f32>(0.4, 0.13, 0.1, 0)),
     Box(vec4<f32>(1.118, 3.65, -12.594, 0.998), vec4<f32>(0.16, 0.55, 0.16, 0.06), vec4<f32>(0.4, 0.13, 0.1, 0)),
@@ -98,7 +98,7 @@ const BOXES: array<Box, 58> = array<Box, 58>(
 );
 
 const BALL_COUNT: u32 = 30u;
-const BALLS: array<Ball, 30> = array<Ball, 30>(
+var<private> BALLS: array<Ball, 30> = array<Ball, 30>(
     Ball(vec4<f32>(-4.5, 4.08, 8.5, 1.68), vec4<f32>(0.16, 0.33, 0.12, 0)),
     Ball(vec4<f32>(-5.38, 3.44, 9.06, 1.248), vec4<f32>(0.21, 0.39, 0.15, 0)),
     Ball(vec4<f32>(-3.7, 3.28, 7.86, 1.152), vec4<f32>(0.16, 0.33, 0.12, 0)),
@@ -132,7 +132,7 @@ const BALLS: array<Ball, 30> = array<Ball, 30>(
 );
 
 const ORB_COUNT: u32 = 8u;
-const ORBS: array<Ball, 8> = array<Ball, 8>(
+var<private> ORBS: array<Ball, 8> = array<Ball, 8>(
     Ball(vec4<f32>(2.6, 1.35, 5, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
     Ball(vec4<f32>(-4.2, 1.35, 2.2, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
     Ball(vec4<f32>(-8.6, 1.35, -3.4, 0.34), vec4<f32>(0.35, 0.8, 1, 3.2)),
