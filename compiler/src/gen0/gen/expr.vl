@@ -73,7 +73,20 @@ pub fn emit_static_addr(cx: sink *FnCtx, name: i64) {
     }
 }
 
+// (0.26.1) Accumulator = operand e of a call, an intrinsic or a vector
+// operation: the one point where those read their operands, so that the
+// places-IR walk gives them its operands instead of the AST's (call.vl,
+// arch.vl, vector.vl).
+pub fn gen_operand(cx: sink *FnCtx, e: i64) {
+    gen_expr(cx, e);
+}
+
 pub fn gen_expr(cx: sink *FnCtx, n: i64) {
+    // (0.26.1: a node the places-IR walk bound to its operand, gen0's
+    // places.vl)
+    if crate::gen0::gen::places::G_BOUND.len() > 0 && crate::gen0::gen::places::gen_bound(cx, n) {
+        return;
+    }
     unsafe {
         let ty = NODES[n].ty;
         match NODES[n].kind {
@@ -144,11 +157,17 @@ pub fn gen_expr(cx: sink *FnCtx, n: i64) {
 
 // A string literal is a (pointer, length) tuple.
 fn gen_string(cx: sink *FnCtx, n: i64) {
+    gen_string_id(cx, NODES[n].a);
+}
+
+// (0.26.1) Accumulator = the address of a new (pointer, length) tuple of
+// string `id`.
+pub fn gen_string_id(cx: sink *FnCtx, id: i64) {
     let slot = alloc_slot(16, 8);
-    emit_string_addr(cx, NODES[n].a);
+    emit_string_addr(cx, id);
     emit_frame_addr(cx, R_ADDR, slot);
     emit_store(cx, TY_U64, R_ACC, R_ADDR);
-    emit_load_imm(cx, R_ACC, str_at(NODES[n].a).len as u64);
+    emit_load_imm(cx, R_ACC, str_at(id).len as u64);
     emit_store_offset(cx, R_ACC, R_ADDR, 8);
     emit_frame_addr(cx, R_ACC, slot);
 }
@@ -177,7 +196,7 @@ fn gen_ident(cx: sink *FnCtx, n: i64) {
     }
 }
 
-fn gen_fn_address(cx: sink *FnCtx, f: i64) {
+pub fn gen_fn_address(cx: sink *FnCtx, f: i64) {
     unsafe {
         if FNS[f].is_extern {
             emit_extern_symbol_addr(cx, FNS[f].name);
@@ -321,8 +340,9 @@ fn gen_binary(cx: sink *FnCtx, n: i64) {
     gen_operator(cx, op, operand_ty, NODES[n].ty);
 }
 
-// Accumulator = accumulator <op> second operand.
-fn gen_operator(cx: sink *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
+// Accumulator = accumulator <op> second operand (the one function -O0's
+// binary operators go through, from either walk).
+pub fn gen_operator(cx: sink *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
     if is_comparison(op) {
         emit_compare(cx, cond_of_token(op), operand_ty);
     } else if is_float(operand_ty) {
@@ -345,19 +365,28 @@ fn gen_unary(cx: sink *FnCtx, n: i64) {
         return;
     }
     gen_expr(cx, operand);
-    if op == Tok::Minus {
-        emit_negate(cx, ty);
-    } else if op == Tok::Bang {
-        emit_not_bool(cx);
-    } else if op == Tok::Tilde {
-        emit_bitnot(cx, ty);
+    if op == Tok::Minus || op == Tok::Bang || op == Tok::Tilde {
+        gen_unop(cx, op, ty);
     } else {
         // Deref: the accumulator is the pointer.
         load_from_x0(cx, ty);
     }
 }
 
-fn gen_cast(cx: sink *FnCtx, from: i64, to: i64) {
+// (0.26.1) Accumulator = <op> accumulator, `-`, `!` or `~` on a scalar of
+// type `ty`.
+pub fn gen_unop(cx: sink *FnCtx, op: Tok, ty: i64) {
+    if op == Tok::Minus {
+        emit_negate(cx, ty);
+    } else if op == Tok::Bang {
+        emit_not_bool(cx);
+    } else {
+        emit_bitnot(cx, ty);
+    }
+}
+
+// Accumulator = accumulator (of type `from`) as `to`.
+pub fn gen_cast(cx: sink *FnCtx, from: i64, to: i64) {
     if from == TY_NEVER || from == to {
         return;
     }
@@ -409,11 +438,18 @@ pub fn gen_aggregate(cx: sink *FnCtx, n: i64) {
 // `[value; count]`: the value is evaluated once.
 fn gen_repeat(cx: sink *FnCtx, n: i64) {
     let ty = NODES[n].ty;
+    let slot = alloc_slot_for(ty);
+    gen_expr(cx, NODES[n].a);
+    gen_repeat_fill(cx, ty, slot);
+    emit_frame_addr(cx, R_ACC, slot);
+}
+
+// (0.26.1) Array slot `slot` of type ty = the accumulator's value (an
+// element's; a compound one's address), in each element.
+pub fn gen_repeat_fill(cx: sink *FnCtx, ty: i64, slot: i64) {
     let elem_ty = TYPES[ty].a;
     let count = TYPES[ty].b;
     let elem_size = type_size(elem_ty);
-    let slot = alloc_slot_for(ty);
-    gen_expr(cx, NODES[n].a);
     if count > 0 && !is_void(elem_ty) && elem_size > 0 {
         let top = new_label(cx);
         if is_compound(elem_ty) {
@@ -448,7 +484,6 @@ fn gen_repeat(cx: sink *FnCtx, n: i64) {
             emit_jump_unless_zero_result(cx, top);
         }
     }
-    emit_frame_addr(cx, R_ACC, slot);
 }
 
 // ---- Enums and slices ----
@@ -495,8 +530,6 @@ fn gen_slicing(cx: sink *FnCtx, n: i64) {
     let range = NODES[n].b;
     let low = NODES[range].a;
     let high = NODES[range].b;
-    let inclusive = NODES[range].c != 0;
-    let elem_size = type_size(TYPES[base_ty].a);
     // The result: the pointer at `slot`, the length at `slot - 8`.
     let slot = alloc_slot(16, 8);
     let length = alloc_slot(8, 8);
@@ -525,6 +558,19 @@ fn gen_slicing(cx: sink *FnCtx, n: i64) {
         bound_ty = NODES[high].ty;
         store_reg_to_frame(cx, R_ACC, high_slot);
     }
+    gen_slice_tail(cx, n, base_ty, late_pointer, high != 0, bound_ty, slot, length, low_slot,
+        high_slot);
+}
+
+// (0.26.1) The rest of a slicing (node n, of a base of type base_ty), its
+// base (a slice's or an array's address, a pointer's value, or with
+// late_pointer its location) at frame slot `slot` (16 bytes), lo at
+// low_slot, hi at high_slot when given; `length` a slot of 8 bytes: what
+// the base holds read, the bounds checked, the slice made at slot.
+pub fn gen_slice_tail(cx: sink *FnCtx, n: i64, base_ty: i64, late_pointer: bool, has_high: bool,
+    bound_ty: i64, slot: i64, length: i64, low_slot: i64, high_slot: i64) {
+    let inclusive = NODES[NODES[n].b].c != 0;
+    let elem_size = type_size(TYPES[base_ty].a);
     if is_slice(base_ty) {
         load_reg_from_frame(cx, R_SECOND, slot);
         emit_load_reg(cx, R_ACC, R_SECOND);
@@ -540,7 +586,7 @@ fn gen_slicing(cx: sink *FnCtx, n: i64) {
         emit_load_imm(cx, R_ACC, TYPES[base_ty].b as u64);
         store_reg_to_frame(cx, R_ACC, length);
     }
-    if high == 0 {
+    if !has_high {
         load_reg_from_frame(cx, R_ACC, length);
         store_reg_to_frame(cx, R_ACC, high_slot);
     }

@@ -14,7 +14,7 @@ $ callees main --transitive --limit 3
 1	call	add_and_sum	calls016/main.vl:6
 1	call	apply	calls016/main.vl:21
 1	call	sum	calls016/main.vl:11
-note query.truncated: showing 3 of 53 callees
+note query.truncated: showing 3 of 57 callees
 try: volec query callees main --transitive --all
 $ callees main
 1	call	add_and_sum	calls016/main.vl:6

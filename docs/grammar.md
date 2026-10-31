@@ -2154,3 +2154,38 @@ module (module-scope order is free in WGSL). A part is an `embed wgsl`
 block found by ordinary path resolution; it has no entry points, and
 parts form no cycle. `with` is not a Rust keyword: like `embed` and
 `wgsl` it stays an identifier everywhere else.
+
+## Interior mutability
+
+*(0.26.1)* std::cell's `UnsafeCell<T>` and `Cell<T>`: memory that
+changes through a shared reference. No new syntax; these are the rules.
+
+- **A cell is owned.** `let d = c` moves it (Rust's Cell is not Copy);
+  it has no drop of its own (`needs_drop::<Cell<i64>>()` is false; a
+  `Cell<Vec<u8>>` drops its Vec).
+- **The `let` rule.** A `let` parameter (and `let self`) of an owned
+  type is a shared reference to the caller's place, so a write through a
+  cell in it reaches the caller: `fn bump(c: Cell<i64>) { c.set(c.get()
+  + 1); }`. A Copy compound is copied, however large, so a Copy struct
+  that writes through `&self.v as *T` loses the write: only a cell may
+  be written through a shared reference.
+- **Freeze** (`std::Freeze`, an auto trait, no impl): a type is Freeze
+  unless it holds an UnsafeCell by value, looking through arrays,
+  tuples, structs, enum payloads and closure environments, never through
+  `*T`, a reference or `[T]` (`Vec<Cell<i64>>` is Freeze). The
+  optimizer keeps no fact through a shared reference to what is not
+  Freeze; an immutable static of it is in writable data.
+- **No copy of a cell.** Where the compiler would make a bit copy of a
+  value that is not Freeze, it uses the place or refuses: `for c in arr`
+  over an array place iterates `arr[0..N]`; std's copying getters
+  (`v.get(i)`, `v.last()`) and a closure given a borrowing iterator's
+  items are `own.interior_copy`.
+- **Threads.** UnsafeCell is Send when T is and never Sync; what holds
+  one follows structurally (std's Atomic, its locks and its print state
+  are Sync by std's vouch). An immutable `static` that is not Freeze and
+  not Sync is `sync.static`; a `static var` and a `#[thread_local]
+  static var` may hold a cell. A cell of a view is `cell.view_item`.
+- **Effects.** A call of `UnsafeCell::get` has the hidden effect
+  `interior` (memory for the optimizer, `query effects F --why
+  interior`); a contract condition and a `#[pure]` function refuse it
+  (a trait method's `#[pure]` does not bind an impl to it: Cell's Eq).

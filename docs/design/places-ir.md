@@ -680,7 +680,84 @@ allows is the first change to make; estimated 15-20% of the builder.
 hello world checks (fmt, Buf, the allocator), about 23M. 0.26.1 needs
 bodies only for the functions emitted or checked for the program (std's
 reached ones built on demand, as the code generators ask), not all of
-std's checked ones.
+std's checked ones. *Corrected in 0.26.1:* the 23M was the measuring
+wrapper's, not the IR's: `--places` was added by a shell script around
+the compiler, and `/usr/bin/time` counts the shell's start (22.7M: the
+same wrapper without the flag gives 110.2M against 87.5M). The IR's
+own share of `hello` is 0.7M (49 bodies), so nothing is to be won there.
+
+**Measured in 0.26.1, step 2 (the builder's cost).** `check` of
+compiler/src (a copy, `VOLE_CACHE=off`, fewest of 3 to 5 runs), the same
+compiler with and without `--places`; the builder alone by a build that
+builds each body 200 times more (its cost: the difference / 200):
+
+| change | the IR's share | the builder |
+|---|---|---|
+| R1 and R2 (a230cedc) | +544M | 440M |
+| a block's length set at its terminator, not by each `emit` | | |
+| operands written straight to `P_OPS` (no OPSTACK staging) | +501M | 395M, then 375M |
+| `has_glue` memoized per type | | |
+| storage markers only for locals with glue (595,544 of 1,120,167 statements were markers) | +421M | 357M |
+
+With the IR on by default (an uncommitted build, the placeholders still
+there), `tests/compile_cost.sh -r 5`: `check` 5,982M against 0.25.5's
+5,535M (1.08x, inside the IR's 1.10x before the placeholders' 228M come
+back), against the base 1.07x; `hello` 1.03x and `std` 1.00x against
+0.25.5. RSS of `check`: 531 MB against 529 MB. Kept bodies at a build
+(R1, every body kept, none freed yet): -O0 737 MB against 661 MB, -O2
+1,323 MB against 1,246 MB (+77 MB; +117 MB before the lean markers).
+The profile left is flat (the statement and operand pushes, `operand`,
+`expr_into`, the scope stack, `proj`'s interning), each a few percent.
+
+**The builder's cost at check (0.26.1, later).** At a check no code
+generator reads the bodies, and a body without a drop that runs gives
+nothing the check uses (no drop, flag or drop edge; the backstop is a
+second check of the own pass). So a check builds only the bodies that
+may drop (front/own/fast.vl `glue_met`: the own pass gave the function
+a drop; with its drops off, any type with glue met in it); a build,
+`--verify-places`, `--places-diff` and `--emit-places` build all.
+`check` of compiler/src, fewest of 5 runs:
+
+| compiler | without `--places` | with | the IR's share |
+|---|---|---|---|
+| before (every body built) | 5,557.3M | 6,043.4M | 1.087x |
+| a body built when it may drop (by the own pass's drops) | 5,555.0M | 5,594.4M | 1.007x |
+| (by the types met alone, the rule left after step 7) | 5,598.0M | 5,863.8M | 1.047x |
+
+700 of 10,872 bodies are built. `--places-noglue-check` builds the
+others too and names any with a drop that runs: none over compiler/src
+and every tests/run source. The objects of a build under
+`VOLE_LOWER=places` (every body built) are byte-identical at -O0 and
+-O2. Step 7, which deletes the own pass's drops, needs a rule of its own
+to keep this (the types rule alone is 1.047x).
+
+**The builder's cost at a build (0.26.1, later).** The flip's bar is
+-O0 total within 1.10x of the AST lowering. A build of compiler/src
+(`-c -O0`, `VOLE_LOWER=places`, caches off, fewest of 3):
+
+| step | instructions | objects |
+|---|---|---|
+| before | 11,776.8M | |
+| the check's work skipped at a build (record_body unless a move is suspect or `--places-diff` runs; drop edges and shims only when a drop is kept; live_writes with no flag) | 11,663.8M | identical |
+| load_body takes the kept tables instead of copying them | 11,638.9M | identical |
+| `a && b`, `a \|\| b` made in their destination (no temporary copied at the end) | 11,382.9M (1.186x) | text 17.85M to 17.70M |
+| the AST lowering | 9,601.0M | text 15.22M |
+
+With gen0's accumulator across blocks (35ee705c) the code is at parity
+(text 15.19M against 15.23M), and the gap is the work. By phase, `-j1
+--time-passes=instructions` on 62828865 (millions):
+
+| phase | AST | places |
+|---|---|---|
+| check | 2,511 | 2,882 |
+| places (build) | | 822 (878 with LF_SSA) |
+| places (elaborate) | | 379 |
+| register allocation and emission | 2,237 | 3,045 |
+| data and output | 2,628 | 2,660 |
+| total | 10,351 | 12,774 (1.234x) |
+
+LF_SSA (places/README.md) flags 98,251 of 149,332 temporaries for gen0,
+which then need not scan the body for them.
 
 **How it stays cheap.**
 
@@ -842,6 +919,31 @@ suite: both are in 0.26.0. Step 7 waits for steps 4 and 5: while one code
 generator reads the AST, own's drops are still the ones it runs. Step 6
 waits for step 3's cases to pass under `VOLE_LOWER=places` at both
 levels. Effects move onto the IR in 0.26.2, after steps 6 and 7.
+
+**State, agent A (placesir261a).** Done: R1 (kept bodies) and R2 (drop
+shims) for B; step 2's builder cost (§6, "Measured in 0.26.1"); step 6's
+front half without the switch: the drop edges into effects (each
+function's kept and flagged drops give an edge to the `Drop::drop`
+functions their shims call; with the placeholders skipped by the effect
+walk, `query effects` of compiler/src's 20,275 functions differs in 3,
+each more precise); step 9's `query drops`. `check_program`'s order is
+§4's already (the IR before the effects). Then, for B: shims as
+functions of `FNS` after the program's (`shim_fn(id)`, not program
+items: lowered in a loop over `shim_count()`), a generic `Drop::drop`
+instance made at check time when the glue made none (so step 7 needs
+nothing more for it), R3 (a moved capture's live flag cleared), union
+literals' parts, R4 (a match on values is one switch with many targets;
+`middle/lower/places.vl`'s `lower_switch` still makes a chain of
+compares of it, so `opt_switch` fails under `VOLE_LOWER=places` until it
+uses `ir_switch`). From B's step 3: R5 (a statement temporary drops at
+the end of its prelude's scope, not of the hidden `let` that holds an
+operand), R6 (an open drop's part flags made before the rewrite), R7 (a
+sink closure's second move out stops the program), R8 (a parametric
+copy's temporary is not owned); R9 (`v[i]` on a Vec) did not reproduce
+here: both paths lower the checker's `v.as_slice()[i]` alike. And
+`--places-diff` checks where each drop runs and its flag
+(places/README.md). Waiting on B's steps 4 and 5: the default (step 6's
+switch: `PLACES_ON` true, `--no-places` the escape) and step 7.
 
 ## 9. The chain rule
 

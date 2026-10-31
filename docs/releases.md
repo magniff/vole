@@ -72,7 +72,88 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.4 | `v0.25.4` | 0.25.3 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | `volec run`; the pathtrace feedback (`fmt_f64`, overlay and headless guides, adaptive array literals); a scripted event loop and GPU timestamps; std's unsafe all justified, six std soundness fixes; compiler/src's modernization begun (938 unneeded unsafe blocks gone, Vec facts in the optimizer, `refactor table`) |
 | 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 | 0.26.0 | `v0.26.0` | 0.25.5 | aarch64-macos | the first step to Rust's surface: the places IR (places, moves, drop flags) at `check` behind `--places`; struct fields private unless `pub` (`field.private`, `fix --only pub`; `#[sealed]` retired); shaders as `embed wgsl` blocks, checked at `check` and in the LSP |
+| 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.26.1
+
+The places IR becomes the one source of drops for both code generators, and std gains `Cell` and `UnsafeCell`. Built and tested on aarch64-macos only.
+
+A value whose type has a `Drop` impl is dropped whole, under its flag
+(the release gate's fuzz-sem, seed 89): with a field assigned on one path
+and the value moved on another, the IR dropped its fields and never
+called its `drop`. A field assigned after the value may have moved is
+now own.partial, as moving a field out of it is (Rust's E0382).
+
+The places IR, agent A's half (placesir261a; design/places-ir.md §8,
+compiler/src/places/README.md):
+
+- Kept bodies: at a build whose code generators read the IR, each
+  elaborated body is kept and loaded back when its function is generated
+  (places/keep.vl); `check --keep-places --emit-places` prints them so.
+- Drop shims (places/shim.vl, §3.9): one body per type with drop glue,
+  `drop_in_place::<T>` (a `Drop` impl's call, then the fields', an
+  enum's switch, an array's loop, a sink closure's capture under its
+  flag), made on demand; `check --emit-places --emit-shims` prints them.
+- The builder's cost: operands written straight into the IR, storage
+  markers only for locals with drop glue outside `--emit-places` and
+  `--verify-places`; the IR's share of `check` of compiler/src from
+  544M to about 420M instructions.
+- Effects see the IR's drops: each function's kept and flagged drops
+  give its effect graph an edge to the `Drop::drop` functions their
+  shims call (front/effects/infer.vl), the edges the own pass's drop
+  placeholders give until they go.
+- `volec query drops FILE:LINE`: a function's drops as the IR decides
+  them, each with where it runs (query.md, "drops").
+
+The places IR, the code generators' half (placesir261b; §8 steps 1 to 5,
+compiler/src/middle/README.md, compiler/src/gen0/README.md):
+
+- Both code generators read each function's kept body, at every level
+  (step 6; `VOLE_LOWER=ast` or `--no-places`: the AST walks, until step
+  8 removes them). -O1 and -O2 lower it to the SSA IR
+  (middle/lower/places.vl): a scalar never borrowed is an SSA variable,
+  blocks in reverse postorder, the IR's drops as calls of their shims (a
+  flagged one under its flag), switches as one Switch, an assert's
+  condition from the IR. -O0 generates from it (gen0/gen/places.vl): a
+  statement temporary's slot shared once it is dead, a value read first
+  by the next statement (or at a block's start, by every predecessor's
+  end) kept in the accumulator, a call's compound result made in its
+  destination. Every function of compiler/src and of tests/run comes
+  from the IR but under `--check-unsafe`; compilers built so compile
+  compiler/src byte-identically. The cost, compiler/src at -O0 (the
+  gate's measure, instructions): 1.13x the AST walk's, under the 1.15x
+  bar set for it; -O1 1.02x, -O2 0.985x; objects -0.2%, +0.1%, -0.8%.
+- fold: a three-way select whose two constants were equal took the
+  wrong one (`k ? false : false` for `!k`); tests/run/opt_ifconv_three_way.vl.
+- ir: a block's predecessor list starts with room for 4, not 64, so
+  that ir_shrink leaves it alone: -O1's lower to SSA of compiler/src
+  1,489M to 1,352M instructions.
+
+Cells (cells261, plan §1 g; grammar.md, "Interior mutability"; `guide
+memory#cells`):
+
+- `std::cell::UnsafeCell<T>` and `Cell<T>`, Rust's API: `new`, `get`
+  (T: Copy), `set`, `replace`, `take` (T: Default), `swap`, `update`,
+  `into_inner`, `as_ptr`; Clone, Default, Debug, Eq and Ord. A cell is
+  owned (move-only) with no drop of its own: `needs_drop::<Cell<i64>>()`
+  is false, and a `let` parameter of one is a reference to the caller's
+  cell, so `fn bump(c: Cell<i64>) { c.set(c.get() + 1); }` changes it.
+- `std::Freeze`, an auto trait: a type holding no UnsafeCell by value.
+  The optimizer keeps no fact through a shared reference to what is not
+  Freeze; an immutable static of it lives in writable data.
+- No bit copy of a cell: `for c in arr` over an array of cells iterates
+  the array in place; `v.get(i)` of a cell, and a closure given a
+  borrowing iterator's cells, are `own.interior_copy` (try: `v[i]`).
+- A cell is not Sync: an immutable `static` of one is `sync.static` (a
+  `static var` or a `#[thread_local] static var` may hold one); a cell
+  of a view is `cell.view_item`.
+- A contract condition or a `#[pure]` function may not read a cell or an
+  atomic (`contract.effect`, `effect`): the hidden effect `interior`,
+  `query effects F --why interior`.
+- std's Atomic and Mutex hold an UnsafeCell, and std::fmt's print state
+  is one immutable static behind one: printing is `io panic`, no longer
+  `global` (`query effects std::println`).
 
 ### What's new in 0.26.0
 

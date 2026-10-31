@@ -104,6 +104,11 @@ BEGIN {
     # and std::gpu both reach it, and neither can reach the other
     LAZY["std::capture"] = 1
     LAZY["Frame capture (0.25.4)"] = 1
+    # (0.26.1) std::cell: lazy, no gate (std::sync and std::fmt reach
+    # UnsafeCell; Cell, with its trait impls, only a program that names it)
+    LAZY["std::cell"] = 1
+    LAZY["Cells: UnsafeCell (0.26.1)"] = 1
+    LAZY["Cells: Cell (0.26.1)"] = 1
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)

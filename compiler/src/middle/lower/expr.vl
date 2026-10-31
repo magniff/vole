@@ -4,6 +4,7 @@
 // Calls, vectors, `match` and control flow are in their own files.
 
 use crate::base::intern_c;
+use crate::base::comp::Comp;
 use crate::front::ast::{INT_SITE, NODES, NodeKind, child, defer_loop_depth, field_order};
 use crate::front::ast::NodeKind::{
     Array, Assign, Binary, Bool, Break, CStr, Call, Cast, Char, Continue, EnumPanic, FieldAccess,
@@ -56,6 +57,34 @@ pub fn need_value(cx: sink *FnCtx, value: i64, ty: i64) -> i64 {
 
 pub fn lower_operand(cx: sink *FnCtx, n: i64) -> i64 {
     need_value(cx, lower_expr(cx, n), NODES[n].ty)
+}
+
+// (0.26.1) An operand of a call, an intrinsic or a vector operation,
+// expression e: the one point where those lowerings read their operands,
+// so that the places-IR lowering gives them its operands' values instead
+// of the AST's (lower_call, arch.vl, vector.vl, atomic.vl). `operand_expr`
+// is lower_expr's value (0 when there is none), `operand_value` its value
+// of e's type.
+pub fn operand_expr(cx: sink *FnCtx, e: i64) -> i64 {
+    if BOUND_NODES.len() > 0 {
+        for k in 0..BOUND_NODES.len() {
+            if BOUND_NODES[k] == e {
+                return BOUND_VALUES[k];
+            }
+        }
+    }
+    lower_expr(cx, e)
+}
+
+// (0.26.1) The operands the places-IR lowering has bound (places.vl,
+// bind_operand): AST node BOUND_NODES[k] is the value BOUND_VALUES[k]
+// while a call, an intrinsic or a vector operation of the IR is lowered
+// by the AST's lowering of its node.
+pub static var BOUND_NODES: Vec<i64, Comp> = Vec::new_in(Comp {});
+pub static var BOUND_VALUES: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+pub fn operand_value(cx: sink *FnCtx, e: i64) -> i64 {
+    need_value(cx, operand_expr(cx, e), NODES[e].ty)
 }
 
 fn load_scalar(cx: sink *FnCtx, addr: i64, ty: i64) -> i64 {
@@ -160,9 +189,15 @@ fn lower_expr_inner(cx: sink *FnCtx, n: i64) -> i64 {
 }
 
 fn lower_string(cx: sink *FnCtx, n: i64) -> i64 {
+    string_value(cx, NODES[n].a)
+}
+
+// (0.26.1) String literal s (its id): a new slot holding its pointer and
+// length.
+pub fn string_value(cx: sink *FnCtx, s: i64) -> i64 {
     let base = ir_slot_addr(cx, new_slot_for(cx, TY_STRING));
-    ir_store(cx, TY_U64, base, emit_ir(cx, Op::SAddr, TY_U64, 0, 0, NODES[n].a), 0);
-    ir_store(cx, TY_U64, base, ir_const(cx, str_at(NODES[n].a).len as i64, TY_U64), 8);
+    ir_store(cx, TY_U64, base, emit_ir(cx, Op::SAddr, TY_U64, 0, 0, s), 0);
+    ir_store(cx, TY_U64, base, ir_const(cx, str_at(s).len as i64, TY_U64), 8);
     base
 }
 
@@ -366,17 +401,22 @@ fn lower_unary(cx: sink *FnCtx, n: i64) -> i64 {
         return lower_vector_negate(cx, operand, ty);
     }
     let value = lower_operand(cx, operand);
-    if op == Tok::Minus {
-        return emit_ir(cx, Op::Neg, ir_type(ty), value, 0, 0);
-    }
-    if op == Tok::Bang {
-        return emit_ir(cx, Op::Not, TY_BOOL, value, 0, 0);
-    }
-    if op == Tok::Tilde {
-        return emit_ir(cx, Op::BNot, ir_type(ty), value, 0, 0);
+    if op == Tok::Minus || op == Tok::Bang || op == Tok::Tilde {
+        return lower_unop(cx, op, ty, value);
     }
     raw_check(cx, n, value, ir_const(cx, type_size(ty), TY_U64));
     load_scalar(cx, value, ty)
+}
+
+// (0.26.1) <token> value, `-`, `!` or `~` on a scalar, of type `ty`.
+pub fn lower_unop(cx: sink *FnCtx, token: Tok, ty: i64, value: i64) -> i64 {
+    if token == Tok::Minus {
+        return emit_ir(cx, Op::Neg, ir_type(ty), value, 0, 0);
+    }
+    if token == Tok::Bang {
+        return emit_ir(cx, Op::Not, TY_BOOL, value, 0, 0);
+    }
+    emit_ir(cx, Op::BNot, ir_type(ty), value, 0, 0)
 }
 
 pub fn ir_conv(cx: sink *FnCtx, value: i64, from: i64, to: i64) -> i64 {
@@ -385,7 +425,9 @@ pub fn ir_conv(cx: sink *FnCtx, value: i64, from: i64, to: i64) -> i64 {
     v
 }
 
-fn lower_cast(cx: sink *FnCtx, value: i64, checker_from: i64, to: i64) -> i64 {
+// `value as to`, value of checker type `checker_from` (the one function
+// both lowerings convert with).
+pub fn lower_cast(cx: sink *FnCtx, value: i64, checker_from: i64, to: i64) -> i64 {
     let from = scalar_type(checker_from);
     if from == TY_NEVER || from == to || from == TY_BOOL {
         return value;
@@ -434,43 +476,54 @@ fn lower_variant(cx: sink *FnCtx, n: i64) -> i64 {
 
 // `a[lo..hi]`: as gen_slicing (gen.vl).
 fn lower_slicing(cx: sink *FnCtx, n: i64) -> i64 {
+    let base = NODES[n].a;
+    let base_ty = NODES[base].ty;
+    let range = NODES[n].b;
+    let low = NODES[range].a;
+    let high = NODES[range].b;
+    // The base first (a slice's address, a pointer's location or
+    // value, an array's address), then the bounds, then what the base
+    // holds, so that bounds that change it are seen.
+    let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
+    let value = if is_pointer { early_pointer(cx, base) } else { lower_operand(cx, base) };
+    var bound_ty = TY_U64;
+    var lo = 0;
+    if low != 0 {
+        lo = lower_operand(cx, low);
+        bound_ty = NODES[low].ty;
+    } else {
+        lo = ir_const(cx, 0, TY_U64);
+    }
+    var hi = 0;
+    if high != 0 {
+        hi = lower_operand(cx, high);
+        bound_ty = NODES[high].ty;
+    }
+    let at = if is_pointer { late_pointer(cx, base, value) } else { value };
+    slice_of_values(cx, n, base_ty, at, lo, hi, bound_ty)
+}
+
+// (0.26.1) The slice `base[lo..hi]` (node n: inclusive or not, its site),
+// of the base of type base_ty at `value` (a pointer's value; a slice's or
+// an array's address), its bounds lo and hi (0: none, its length) of type
+// bound_ty: checked unless the base is a pointer, in a new slot.
+pub fn slice_of_values(cx: sink *FnCtx, n: i64, base_ty: i64, value: i64, lo: i64, hi0: i64,
+    bound_ty: i64) -> i64 {
     unsafe {
-        let base = NODES[n].a;
-        let base_ty = NODES[base].ty;
-        let range = NODES[n].b;
-        let low = NODES[range].a;
-        let high = NODES[range].b;
-        let inclusive = NODES[range].c != 0;
+        let inclusive = NODES[NODES[n].b].c != 0;
         let elem_size = type_size(TYPES[base_ty].a);
-        // The base first (a slice's address, a pointer's location or
-        // value, an array's address), then the bounds, then what the base
-        // holds, so that bounds that change it are seen.
-        let is_pointer = TYPES[base_ty].kind == TyKind::Ptr;
-        let value = if is_pointer { early_pointer(cx, base) } else { lower_operand(cx, base) };
-        var bound_ty = TY_U64;
-        var lo = 0;
-        if low != 0 {
-            lo = lower_operand(cx, low);
-            bound_ty = NODES[low].ty;
-        } else {
-            lo = ir_const(cx, 0, TY_U64);
-        }
-        var hi = 0;
-        if high != 0 {
-            hi = lower_operand(cx, high);
-            bound_ty = NODES[high].ty;
-        }
+        var hi = hi0;
         var pointer = value;
         var length = 0;
-        if is_pointer {
-            pointer = late_pointer(cx, base, value);
+        if TYPES[base_ty].kind == TyKind::Ptr {
+            pointer = value;
         } else if is_slice(base_ty) {
             pointer = ir_load(cx, TY_U64, value, 0);
             length = ir_load(cx, TY_U64, value, 8);
         } else if TYPES[base_ty].kind == TyKind::Array {
             length = ir_const(cx, TYPES[base_ty].b, TY_U64);
         }
-        if high == 0 {
+        if hi == 0 {
             hi = length;
         }
         var end = hi;

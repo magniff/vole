@@ -27,6 +27,7 @@ mod call;
 mod checkalloc;
 mod arch;
 mod atomic;
+mod places;
 
 use crate::version;
 use crate::back::abi::{
@@ -233,6 +234,16 @@ pub fn compile_program(cx: sink *FnCtx, output: *u8) {
     unsafe {
         var t = timer_now();
         phase_time(0 as *u8);
+        // (0.26.1) Both code generators read the places IR, from each
+        // function's kept body (middle/lower/places.vl, gen0/gen/places.vl);
+        // VOLE_LOWER=ast or --no-places: the AST, as before 0.26.1 (until
+        // step 8 removes it)
+        let lower = crate::base::getenv(c"VOLE_LOWER");
+        if !crate::places::PLACES_OFF
+            && (lower == 0 as *u8 || !crate::base::streq(lower, c"ast")) {
+            crate::middle::lower::places::LOWER_PLACES = true;
+            crate::places::keep::KEEP_BODIES = true;
+        }
         init_ast();
         ERR_KIND = c"parser error";
         let program = parse_program();
@@ -284,6 +295,9 @@ pub fn compile_program(cx: sink *FnCtx, output: *u8) {
             flush_warnings();
             timer_add(T_LOWER, t);
             phase_time(c"lowering");
+            if TIME_PASSES {
+                crate::middle::lower::places::lower_stats();
+            }
             PER_FUNCTION = OPT_LEVEL == 1 && !EMIT_IR && !EMIT_MIR;
             if TIME_PASSES {
                 T_IR_BYTES[0] = ir_tables_bytes(cx);
@@ -342,15 +356,40 @@ pub fn compile_program(cx: sink *FnCtx, output: *u8) {
             if threaded {
                 asm_thread_start();
             }
+            // (0.26.1: from the kept bodies, gen0's places.vl, and the drop
+            // shims those call; VOLE_LOWER=ast or --no-places: the AST walk)
+            let lower_places = crate::middle::lower::places::LOWER_PLACES;
             for item in kids(program) {
                 if NODES[item].kind == Fn {
-                    gen_function(cx, item);
+                    if !lower_places || !places::gen_places_function(cx, item, NODES[item].x - 1) {
+                        gen_function(cx, item);
+                    }
                     if threaded {
                         asm_hand_over(cx);
                     } else {
                         asm_flush(cx);
                     }
                 }
+            }
+            if lower_places && !crate::middle::unsafecheck::CHECK_UNSAFE {
+                for id in 0..crate::places::shim::shim_count() {
+                    let f = crate::places::shim::shim_fn(id);
+                    if f < 0 {
+                        continue;
+                    }
+                    if !places::gen_places_function(cx, crate::places::front::fn_node(f), f) {
+                        crate::middle::lower::places::lower_stats();
+                        crate::base::die(c"places: a drop shim not generated from its body");
+                    }
+                    if threaded {
+                        asm_hand_over(cx);
+                    } else {
+                        asm_flush(cx);
+                    }
+                }
+            }
+            if TIME_PASSES {
+                crate::middle::lower::places::lower_stats();
             }
             if threaded {
                 asm_thread_finish();
@@ -489,19 +528,7 @@ fn gen_function(cx: sink *FnCtx, item: i64) {
         if !intrinsic {
             gen_params(cx, item, f);
         }
-        // (0.19 T3) std::arch::detect's word, filled before main's body
-        if FNS[f].name == MAIN_SYM && crate::arch::ARCH_USED
-            && crate::front::features::any_runtime_detect() {
-            let init = crate::back::isel::arch::arch_std_fn(true);
-            if init >= 0 {
-                // (its argument: the build's features)
-                emit_load_imm(cx, R_ACC, crate::arch::features::build_features() as u64);
-                if X86 {
-                    ins(cx, c"movq %rax, %rdi");
-                }
-                emit_call(cx, fn_symbol_prefix(init), FNS[init].name, false, false, 0);
-            }
-        }
+        gen_main_arch_init(cx, f);
         if !intrinsic {
             let body = NODES[item].c;
             gen_block(cx, body);
@@ -518,6 +545,27 @@ fn gen_function(cx: sink *FnCtx, item: i64) {
         emit_frame_reserve(cx, FRAME_SIZE);
         buf_bytes(cx.asm, buf_slice(cx.code));
         dbg_function_end(cx);
+    }
+}
+
+// (0.19 T3) std::arch::detect's word, filled before main's body (f).
+fn gen_main_arch_init(cx: sink *FnCtx, f: i64) {
+    // UNSAFE: FNS is the checker's raw table of functions.
+    // SAFETY: f is the function being generated and init std's (both below
+    // FN_COUNT: arch_std_fn gives -1 when std has none).
+    unsafe {
+        if FNS[f].name == MAIN_SYM && crate::arch::ARCH_USED
+            && crate::front::features::any_runtime_detect() {
+            let init = crate::back::isel::arch::arch_std_fn(true);
+            if init >= 0 {
+                // (its argument: the build's features)
+                emit_load_imm(cx, R_ACC, crate::arch::features::build_features() as u64);
+                if X86 {
+                    ins(cx, c"movq %rax, %rdi");
+                }
+                emit_call(cx, fn_symbol_prefix(init), FNS[init].name, false, false, 0);
+            }
+        }
     }
 }
 

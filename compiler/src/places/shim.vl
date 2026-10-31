@@ -1,0 +1,568 @@
+// Drop shims (0.26.1, request R2 of the code generators' agent;
+// docs/design/places-ir.md §3.9): what `drop(P)` of a type T runs, made
+// once per type as a body of its own (rustc's `drop_in_place::<T>`), from
+// the type: `_1: &mut T`, then
+//
+// - T's `Drop::drop(&mut *_1)` when it has one;
+// - std's containers (Vec, Buf, HashMap, ...): that only;
+// - a struct or a tuple: `drop((*_1).k)` of each field with glue, in
+//   declaration order; a sink closure's capture under its `__live_` flag
+//   field (a switch on it);
+// - an enum: a switch on its discriminant, the glue fields of each
+//   variant dropped in their block (`drop(((*_1) as V).k)`);
+// - an array: a counted loop, `drop((*_1)[_i])`.
+//
+// Each of its drops is DS_KEPT (a place through `*` has no move path): a
+// code generator lowers it as a call of the shim of its type, made on
+// demand by shim_of, so the list grows while the bodies (and the shims)
+// are lowered. A shim is not a program item: its body is built when asked
+// (build_shim), into the P_* tables like any body, B_FN -1 and B_SHIM its
+// id. The glue's rules are front/own/glue.vl's (push_glue), which the own
+// pass's drops still run until 0.26.1's step 7.
+
+use crate::base::{buf_new, buf_slice, buf_str, intern, intern_c};
+use crate::base::comp::Comp;
+use crate::front::ast::{NODES, NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::generics::{INST_QUEUE, mangle_type};
+use crate::front::own::glue::{flag_field, has_glue};
+use crate::front::own::kinds::{has_drop_impl, owned_base_type};
+use crate::front::types::{
+    FN_COUNT, REF_MUT, TYPES, TY_BOOL, TY_I64, TY_UNIT, TyKind, fn_param, ref_to, type_elem,
+};
+use crate::places::front::{
+    enum_tag_ty, enum_variant_count, enum_variants, fn_name_sym, fn_node, fn_self_ty, fn_template,
+    struct_field_name, variant_discr,
+};
+use crate::places::ir::{
+    BK_MUT, BO_ADD, BO_LT, B_FN, DS_KEPT, LF_MUT, LF_PARAM, LF_RETURN, LF_TEMP, OK_COPY, OK_INT,
+    OK_MOVE, OK_PLACE, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_VARIANT, P_STMTS, P_TARGETS, RV_BINARY,
+    RV_DISCR, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, TK_GOTO, TK_RETURN, TK_SWITCH,
+    body_begin, emit, enter_block, full_place_type, new_block, new_local, ops_mark, proj, push_op,
+    struct_field_count, struct_field_ty, terminate, undistinct, variant_field_count,
+    variant_part_type,
+};
+
+// The shims made: their type (distinct types erased), and per type id + 1
+// its shim + 1 (0: none yet).
+static var SHIM_TY: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var SHIM_OF: Vec<i64, Comp> = Vec::new_in(Comp {});
+// Per type id: its `Drop::drop` instance + 1 (0: none found), from the
+// functions FNS[0..DROP_SCANNED].
+static var DROP_OF: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DROP_SCANNED: i64 = 0;
+
+// The `Drop::drop` instances made here (no glue of the own pass's asked
+// for them).
+pub static var DROP_MADE: i64 = 0;
+static var SYM_DROP: i64 = 0;
+
+// The shim of type t (made now when t has none): what `drop(P)` of a
+// place of type t calls with `&mut P`. t must have glue (has_glue).
+pub fn shim_of(t: i64) -> i64 {
+    let u = undistinct(t);
+    while SHIM_OF.len() <= u {
+        SHIM_OF.push(0);
+    }
+    if SHIM_OF[u] > 0 {
+        return SHIM_OF[u] - 1;
+    }
+    SHIM_TY.push(u);
+    let id = SHIM_TY.len() - 1;
+    SHIM_OF[u] = id + 1;
+    SHIM_FN.push(-1);
+    id
+}
+
+// The number of shims made so far (it grows as shims are asked for).
+pub fn shim_count() -> i64 {
+    SHIM_TY.len()
+}
+
+// The type shim `id` drops.
+pub fn shim_type(id: i64) -> i64 {
+    SHIM_TY[id]
+}
+
+// The symbol of shim id's function: `$drop.G` and its type mangled (the
+// type's code, stable from one compilation to the next).
+pub fn shim_fn_symbol(id: i64) -> i64 {
+    let out = buf_new();
+    buf_str(out, c"$drop.G");
+    mangle_type(out, SHIM_TY[id]);
+    intern(buf_slice(out))
+}
+
+// ---- The body ----
+
+static var S_T: i64 = 0;
+static var S_UNIT: i64 = -1;
+static var S_DONE: i64 = -1;
+
+// Shim id's body built into the P_* tables (ir.vl), as a body's: _0 `()`,
+// _1 `&mut T`.
+pub fn build_shim(id: i64) {
+    let t = SHIM_TY[id];
+    body_begin(-1, 0);
+    crate::places::ir::B_SHIM = id;
+    crate::places::ir::B_PARAMS = 1;
+    S_T = t;
+    new_local(TY_UNIT, LF_RETURN, -1, 0);
+    new_local(ref_to(t, REF_MUT), LF_PARAM, -1, 0);
+    S_UNIT = new_local(TY_UNIT, LF_TEMP, -1, 0);
+    let entry = new_block();
+    let ret = new_block();
+    enter_block(entry);
+    // (the place *_1)
+    let root = proj(0, PJ_DEREF, 0);
+    glue(t, root);
+    goto(ret);
+    enter_block(ret);
+    terminate(TK_RETURN, 0, 0, 0, 0, 0, 0);
+}
+
+fn goto(b: i64) {
+    terminate(TK_GOTO, b, 0, 0, 0, 0, 0);
+}
+
+// The glue of a value of type t at place (_1, p): its statements emitted.
+fn glue(t: i64, p: i64) {
+    if has_drop_impl(t) {
+        let f = drop_fn(t);
+        if f < 0 {
+            // (the own pass's glue made every instance a drop calls, until
+            // 0.26.1's step 7)
+            crate::base::die(c"places: a drop shim found no Drop::drop instance for its type");
+        }
+        // `_r = &mut (*_1)...; drop(move _r)`
+        let r = new_local(fn_param(f, 0), LF_TEMP, -1, 0);
+        let m = ops_mark();
+        push_op(OK_PLACE, 1, p);
+        emit(SK_ASSIGN, r, 0, RV_REF, BK_MUT, 0, m, 1, 0);
+        let m2 = ops_mark();
+        push_op(OK_MOVE, r, 0);
+        emit(SK_CALL, S_UNIT, 0, f, 0, 0, m2, 1, 0);
+    }
+    if owned_base_type(t) {
+        return;
+    }
+    let kind = TYPES[t].kind;
+    if kind == TyKind::Struct {
+        let s = TYPES[t].a;
+        let closure = crate::places::ir::struct_closure(t);
+        for k in 0..struct_field_count(s) {
+            let ft = struct_field_ty(s, k);
+            if !has_glue(ft) {
+                continue;
+            }
+            let flag = if closure { flag_field(s, struct_field_name(s, k)) } else { 0 };
+            if flag == 0 {
+                drop_part(ft, proj(p, PJ_FIELD, k));
+                continue;
+            }
+            // (a sink closure's capture, if it still holds it: `switch copy
+            // (*_1).__live_x [0: next, otherwise: then]`)
+            let fk = field_index(s, flag);
+            let then = new_block();
+            let next = new_block();
+            let m = ops_mark();
+            push_op(OK_COPY, 1, proj(p, PJ_FIELD, fk));
+            switch_bool(m, next, then);
+            enter_block(then);
+            drop_part(ft, proj(p, PJ_FIELD, k));
+            goto(next);
+            enter_block(next);
+        }
+    } else if kind == TyKind::Tuple {
+        for k in 0..TYPES[t].count {
+            let et = type_elem(t, k);
+            if has_glue(et) {
+                drop_part(et, proj(p, PJ_FIELD, k));
+            }
+        }
+    } else if kind == TyKind::Array {
+        array_loop(TYPES[t].a, TYPES[t].b, p);
+    } else if kind == TyKind::Enum {
+        enum_switch(t, p);
+    }
+}
+
+// `drop((_1, p))`, decided: kept (a code generator calls t's shim).
+fn drop_part(t: i64, p: i64) {
+    emit(SK_DROP, 1, p, DS_KEPT, -1, -1, 0, 0, 0);
+}
+
+// The index of the field of struct s named `name`.
+fn field_index(s: i64, name: i64) -> i64 {
+    for k in 0..struct_field_count(s) {
+        if struct_field_name(s, k) == name {
+            return k;
+        }
+    }
+    -1
+}
+
+// A switch on the bool operand at m: false to f, true to t.
+fn switch_bool(m: i64, f: i64, t: i64) {
+    let ti = P_TARGETS.len();
+    P_TARGETS.push(0);
+    P_TARGETS.push(f);
+    terminate(TK_SWITCH, ti, 1, t, m, 1, 0);
+}
+
+// `_i = 0; head: _c = _i < n; switch _c [0: exit, otherwise: body]; body:
+// drop((_1, p)[_i]); _i = _i + 1; goto head; exit:`.
+fn array_loop(elem: i64, n: i64, p: i64) {
+    let i = new_local(TY_I64, LF_TEMP | LF_MUT, -1, 0);
+    let c = new_local(TY_BOOL, LF_TEMP, -1, 0);
+    let m = ops_mark();
+    push_op(OK_INT, 0, TY_I64);
+    emit(SK_ASSIGN, i, 0, RV_USE, 0, 0, m, 1, 0);
+    let head = new_block();
+    let body = new_block();
+    let exit = new_block();
+    goto(head);
+    enter_block(head);
+    let m2 = ops_mark();
+    push_op(OK_COPY, i, 0);
+    push_op(OK_INT, n, TY_I64);
+    emit(SK_ASSIGN, c, 0, RV_BINARY, BO_LT, 0, m2, 2, 0);
+    let m3 = ops_mark();
+    push_op(OK_COPY, c, 0);
+    switch_bool(m3, exit, body);
+    enter_block(body);
+    drop_part(elem, proj(p, PJ_INDEX, i));
+    let m4 = ops_mark();
+    push_op(OK_COPY, i, 0);
+    push_op(OK_INT, 1, TY_I64);
+    emit(SK_ASSIGN, i, 0, RV_BINARY, BO_ADD, 0, m4, 2, 0);
+    // (the back edge of an uncounted loop)
+    terminate(TK_GOTO, head, 0, 1, 0, 0, 0);
+    enter_block(exit);
+}
+
+// `_d = discriminant((_1, p)); switch _d [discr(V): bbV, ..., otherwise:
+// next]`, bbV dropping V's fields that have glue.
+fn enum_switch(t: i64, p: i64) {
+    let first = enum_variants(t);
+    let count = enum_variant_count(t);
+    var arms = 0;
+    for i in 0..count {
+        if variant_glue(first + i) {
+            arms += 1;
+        }
+    }
+    if arms == 0 {
+        return;
+    }
+    let d = new_local(enum_tag_ty(t), LF_TEMP, -1, 0);
+    let m = ops_mark();
+    push_op(OK_PLACE, 1, p);
+    emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, m, 1, 0);
+    let next = new_block();
+    let ti = P_TARGETS.len();
+    // (the arms' blocks, made before the switch names them)
+    let arm0 = crate::places::ir::block_count();
+    for i in 0..count {
+        let v = first + i;
+        if variant_glue(v) {
+            P_TARGETS.push(variant_discr(v));
+            P_TARGETS.push(new_block());
+        }
+    }
+    let m2 = ops_mark();
+    push_op(OK_COPY, d, 0);
+    terminate(TK_SWITCH, ti, arms, next, m2, 1, 0);
+    var b = arm0;
+    for i in 0..count {
+        let v = first + i;
+        if !variant_glue(v) {
+            continue;
+        }
+        enter_block(b);
+        b += 1;
+        let vp = proj(p, PJ_VARIANT, v);
+        for k in 0..variant_field_count(v) {
+            let ft = variant_part_type(v, k);
+            if has_glue(ft) {
+                drop_part(ft, proj(vp, PJ_FIELD, k));
+            }
+        }
+        goto(next);
+    }
+    enter_block(next);
+}
+
+// Whether variant v has a field with glue.
+fn variant_glue(v: i64) -> bool {
+    for k in 0..variant_field_count(v) {
+        if has_glue(variant_part_type(v, k)) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---- Drop::drop's instance of a type ----
+
+// The function `t.drop()` calls (t has an `impl Drop`): its method, or
+// the instance of its generic impl's method for t. That instance is the
+// one the checker made for the own pass's glue, or, when there is none,
+// made and checked now (the checker's way: instantiate_call on a `drop()`
+// call of no arguments, then the instances it queued), so that a shim
+// never lacks one; -1 only when t has no `drop` method.
+fn drop_fn(t: i64) -> i64 {
+    if SYM_DROP == 0 {
+        SYM_DROP = intern_c(c"drop");
+    }
+    let f0 = crate::front::check::calls::method_of(t, SYM_DROP);
+    if f0 < 0 || !crate::places::front::fn_generic(f0) {
+        return f0;
+    }
+    scan_drop_instances();
+    if t < DROP_OF.len() && DROP_OF[t] > 0 {
+        return DROP_OF[t] - 1;
+    }
+    let f = make_drop_instance(f0, t);
+    while DROP_OF.len() <= t {
+        DROP_OF.push(0);
+    }
+    DROP_OF[t] = f + 1;
+    f
+}
+
+// The `Drop::drop` instances made since the last scan, by their
+// receiver's type (DROP_OF).
+fn scan_drop_instances() {
+    while DROP_SCANNED < FN_COUNT {
+        let f = DROP_SCANNED;
+        DROP_SCANNED += 1;
+        let tf = fn_template(f);
+        if tf == f || fn_name_sym(tf) != SYM_DROP || crate::places::front::fn_generic(f) {
+            continue;
+        }
+        let st = fn_self_ty(f);
+        if st <= 0 {
+            continue;
+        }
+        while DROP_OF.len() <= st {
+            DROP_OF.push(0);
+        }
+        if DROP_OF[st] == 0 {
+            DROP_OF[st] = f + 1;
+        }
+    }
+}
+
+// The instance of template f0 (a generic impl's `drop`) for receiver type
+// t, made as synth_method makes a method's (a `drop()` call node at the
+// body's function, for the messages), and checked with what it queues.
+fn make_drop_instance(f0: i64, t: i64) -> i64 {
+    let at = if B_FN >= 0 { NODES[fn_node(B_FN)].start } else { 0 };
+    let n = new_node(NodeKind::MethodCall, at, at);
+    NODES[n].b = SYM_DROP;
+    let mark = list_begin();
+    list_end(n, mark);
+    let q = INST_QUEUE.count;
+    let f = crate::front::generics::instantiate::instantiate_call(f0, n, 1, t, 0);
+    crate::front::assoc::ensure_checked(f, n);
+    crate::front::check::check_queued_instances(q);
+    DROP_MADE += 1;
+    f
+}
+
+// The shim's name, for --emit-places: `drop_in_place::<T>`.
+pub fn buf_shim_name(out: i64, id: i64) {
+    buf_str(out, c"drop_in_place::<");
+    crate::front::types::buf_type(out, SHIM_TY[id]);
+    buf_str(out, c">");
+}
+
+// ---- The functions a drop calls (effects' drop edges) ----
+
+// Per type id: its drop functions, DF_LIST[DF_AT[t] - 1 ..][..DF_N[t]]:
+// the `Drop::drop` instances its shim calls, and its parts' shims' (0:
+// not made yet; -1: being made, a type reached again through itself).
+static var DF_AT: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DF_N: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DF_LIST: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DF_TMP: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// The number of drop functions dropping a value of type t calls (its
+// shim, inlined: no shim is a node of the call graph), each drop_fn_at.
+pub fn drop_fn_count(t0: i64) -> i64 {
+    let t = undistinct(t0);
+    make_drop_fns(t);
+    if t < DF_AT.len() && DF_AT[t] > 0 { DF_N[t] } else { 0 }
+}
+
+pub fn drop_fn_at(t0: i64, i: i64) -> i64 {
+    let t = undistinct(t0);
+    DF_LIST[DF_AT[t] - 1 + i]
+}
+
+fn make_drop_fns(t: i64) {
+    if t <= 0 || !has_glue(t) {
+        return;
+    }
+    while DF_AT.len() <= t {
+        DF_AT.push(0);
+        DF_N.push(0);
+    }
+    if DF_AT[t] != 0 {
+        return;
+    }
+    DF_AT[t] = -1;
+    let mark = DF_TMP.len();
+    if has_drop_impl(t) {
+        let f = drop_fn(t);
+        if f >= 0 {
+            DF_TMP.push(f);
+        }
+    }
+    if !owned_base_type(t) {
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct {
+            let s = TYPES[t].a;
+            for k in 0..struct_field_count(s) {
+                add_part(struct_field_ty(s, k), mark);
+            }
+        } else if kind == TyKind::Tuple {
+            for k in 0..TYPES[t].count {
+                add_part(type_elem(t, k), mark);
+            }
+        } else if kind == TyKind::Array {
+            add_part(TYPES[t].a, mark);
+        } else if kind == TyKind::Enum {
+            let first = enum_variants(t);
+            for i in 0..enum_variant_count(t) {
+                for k in 0..variant_field_count(first + i) {
+                    add_part(variant_part_type(first + i, k), mark);
+                }
+            }
+        }
+    }
+    DF_AT[t] = DF_LIST.len() + 1;
+    DF_N[t] = DF_TMP.len() - mark;
+    for i in mark..DF_TMP.len() {
+        let f = DF_TMP[i];
+        DF_LIST.push(f);
+    }
+    DF_TMP.truncate(mark);
+}
+
+// The drop functions of part type pt added to those being collected from
+// mark (each once).
+fn add_part(pt0: i64, mark: i64) {
+    let pt = undistinct(pt0);
+    if !has_glue(pt) {
+        return;
+    }
+    make_drop_fns(pt);
+    if DF_AT[pt] <= 0 {
+        return;
+    }
+    for i in 0..DF_N[pt] {
+        let f = DF_LIST[DF_AT[pt] - 1 + i];
+        var seen = false;
+        for j in mark..DF_TMP.len() {
+            if DF_TMP[j] == f {
+                seen = true;
+            }
+        }
+        if !seen {
+            DF_TMP.push(f);
+        }
+    }
+}
+
+// ---- Shims as functions (at a build whose code generators read the IR) ----
+
+// Per shim: its function (FNS), or -1 before make_shim_functions.
+static var SHIM_FN: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// Per function (FNS): whether it is a shim's.
+static var IS_SHIM: Vec<bool, Comp> = Vec::new_in(Comp {});
+
+// Whether function f is a drop shim's (make_shim_functions).
+pub fn is_shim_fn(f: i64) -> bool {
+    f >= 0 && f < IS_SHIM.len() && IS_SHIM[f]
+}
+
+// The function of shim id (-1: not made).
+pub fn shim_fn(id: i64) -> i64 {
+    if id < SHIM_FN.len() { SHIM_FN[id] } else { -1 }
+}
+
+// The function `drop(P)` of a place of type t calls with `&mut P` (its
+// shim's), -1 when t has none (no glue, or no body kept that drops one).
+pub fn drop_shim_fn(t: i64) -> i64 {
+    let u = undistinct(t);
+    if u <= 0 || u >= SHIM_OF.len() || SHIM_OF[u] == 0 {
+        return -1;
+    }
+    shim_fn(SHIM_OF[u] - 1)
+}
+
+// run_places, every body kept: each shim asked for (and the shims their
+// drops ask for) made a function, its body built and kept like a
+// function's. A shim is then a function like any (FNS, a Fn node, a
+// parameter `_1: &mut T` with an AST local, its symbol shim_fn_symbol),
+// made before the code generators size their tables by FN_COUNT, but not
+// a program item: a code generator lowers them by shim_count and shim_fn.
+pub fn make_shim_functions() {
+    var id = 0;
+    while id < shim_count() {
+        build_shim(id);
+        for s in 0..P_STMTS.len() {
+            let st = P_STMTS[s];
+            if st.kind == SK_DROP && st.c == DS_KEPT {
+                shim_of(full_place_type(st.a, st.b));
+            }
+        }
+        let f = shim_function(id);
+        crate::places::ir::B_FN = f;
+        crate::places::ir::B_NODE = fn_node(f);
+        crate::places::keep::keep_body();
+        id += 1;
+    }
+}
+
+// Shim id's function: a Fn node (no body: the IR is the body) with its
+// parameter, an AST local for it, the FNS entry.
+fn shim_function(id: i64) -> i64 {
+    while SHIM_FN.len() <= id {
+        SHIM_FN.push(-1);
+    }
+    if SHIM_FN[id] >= 0 {
+        return SHIM_FN[id];
+    }
+    let t = SHIM_TY[id];
+    let pt = ref_to(t, REF_MUT);
+    let name = shim_fn_symbol(id);
+    let shown = buf_new();
+    buf_shim_name(shown, id);
+    let display = intern(buf_slice(shown));
+    let item = new_node(NodeKind::Fn, 0, 0);
+    NODES[item].a = name;
+    let p = new_node(NodeKind::Param, 0, 0);
+    let self_sym = intern_c(c"self");
+    NODES[p].a = self_sym;
+    NODES[p].ty = pt;
+    // (an AST local for the parameter, as a checked function's: the code
+    // generators bind it; not in any scope)
+    let l = crate::front::check::define_local(self_sym, pt, false, true);
+    crate::front::check::ENV.count -= 1;
+    NODES[p].x = l;
+    let mark = list_begin();
+    list_push(p);
+    list_end(item, mark);
+    crate::front::check::collect::add_fn(item, name, display);
+    let f = FN_COUNT - 1;
+    crate::places::front::fn_set_shim_signature(f, pt);
+    SHIM_FN[id] = f;
+    while IS_SHIM.len() <= f {
+        IS_SHIM.push(false);
+    }
+    IS_SHIM[f] = true;
+    f
+}

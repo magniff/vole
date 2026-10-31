@@ -4,7 +4,8 @@
 // 1. Move paths: a tree per local of the places moved or dropped (and,
 //    once a place has a moved part, all its parts that need drop), with a
 //    child per field and per variant payload. A place reached through `*`
-//    or an index, a static's, a BORROWED local's has none.
+//    or an index, a static's, a BORROWED local's has none, and so has a
+//    part of a value whose type has a Drop impl (dropped only whole).
 // 2. Two forward dataflows over them, maybe-initialized and
 //    maybe-uninitialized, one bit per path, iterated over the reverse
 //    postorder to a fixed point: an assignment initializes its place's
@@ -27,10 +28,11 @@
 // The fast path: a body with no drop is left as it is.
 
 use crate::base::comp::Comp;
-use crate::front::own::glue::has_glue;
 use crate::front::types::{TYPES, TY_BOOL, TyKind, type_elem};
 use crate::places::cfg::{RPO, RPO_INDEX, compute_preds, compute_rpo, pred, pred_count};
-use crate::places::front::{enum_tag_ty, enum_variant_count, enum_variants, variant_discr};
+use crate::places::front::{
+    enum_tag_ty, enum_variant_count, enum_variants, type_glue, variant_discr,
+};
 use crate::places::ir::{
     DS_FLAG, DS_KEPT, DS_OPEN, DS_REMOVED, DS_UNDECIDED, LF_BORROWED, LF_FLAG, LF_PARAM, LF_STATIC,
     LF_TEMP, OK_COPY, OK_INT, OK_MOVE, OK_PLACE, PJ_CONST, PJ_FIELD, PJ_VARIANT, PStmt, P_OPS,
@@ -90,7 +92,7 @@ fn trackable(l: i64) -> bool {
 
 // The path of place (l, p), made when `make` (and every path above it);
 // -1 when the place has none (a projection through `*`, an index, a
-// union's field).
+// union's field, a part of a value dropped only whole: whole_only).
 fn path_of(l: i64, p: i64, make: bool) -> i64 {
     if p == 0 {
         if l < 0 || l >= LOCAL_PATH.len() || !trackable(l) {
@@ -116,10 +118,24 @@ fn path_of(l: i64, p: i64, make: bool) -> i64 {
         }
         c = MP_NEXT[c];
     }
-    if !make {
+    if !make || whole_only(l, proj_parent(p)) {
         return -1;
     }
     new_path(l, p, parent)
+}
+
+// Whether place (l, p) is dropped only whole: its type has a Drop impl,
+// whose drop needs all of it (no part of it moves: own.partial). Its
+// parts have no paths: a part's drop (an assignment's old value) is
+// decided by the whole's state (decide_all: ancestor_path), and a part's
+// write leaves the whole as it was. With paths of its own, a part
+// written on one branch and the whole moved on another made the whole's
+// drop open: its fields dropped, never its `drop` (0.26.1, fuzz-sem seed
+// 89).
+fn whole_only(l: i64, p: i64) -> bool {
+    let t = full_place_type(l, p);
+    crate::front::own::kinds::has_drop_impl(t)
+        || crate::front::own::kinds::has_drop_impl(undistinct(t))
 }
 
 fn new_path(l: i64, p: i64, parent: i64) -> i64 {
@@ -214,19 +230,19 @@ fn complete_parts(q: i64) {
     if tk == TyKind::Struct {
         let s = TYPES[t].a;
         for k in 0..struct_field_count(s) {
-            if has_glue(struct_field_ty(s, k)) {
+            if type_glue(struct_field_ty(s, k)) {
                 path_of(l, proj(p, PJ_FIELD, k), true);
             }
         }
     } else if tk == TyKind::Tuple {
         for k in 0..TYPES[t].count {
-            if has_glue(type_elem(t, k)) {
+            if type_glue(type_elem(t, k)) {
                 path_of(l, proj(p, PJ_FIELD, k), true);
             }
         }
     } else if tk == TyKind::Array {
         // (an element moved by a constant index, `a[1]`: each element)
-        if has_glue(TYPES[t].a) {
+        if type_glue(TYPES[t].a) {
             for k in 0..TYPES[t].b {
                 path_of(l, proj(p, PJ_CONST, k), true);
             }
@@ -237,7 +253,7 @@ fn complete_parts(q: i64) {
             if proj_kind_of(c) == PJ_VARIANT {
                 let v = proj_val(MP_PROJ[c]);
                 for k in 0..variant_field_count(v) {
-                    if has_glue(variant_part_type(v, k)) {
+                    if type_glue(variant_part_type(v, k)) {
                         path_of(l, proj(MP_PROJ[c], PJ_FIELD, k), true);
                     }
                 }
@@ -445,7 +461,7 @@ fn others_drop(q: i64) -> bool {
             continue;
         }
         for k in 0..variant_field_count(v) {
-            if has_glue(variant_part_type(v, k)) {
+            if type_glue(variant_part_type(v, k)) {
                 return true;
             }
         }
@@ -604,6 +620,10 @@ fn decide_all() {
                             for w in 0..3 * NW {
                                 SNAPS.push(CUR[w]);
                             }
+                            // (the flags its parts' drops will read, made
+                            // now: the rewrite writes a flag only once
+                            // it exists, R6)
+                            open_flags(st.a, st.b, q);
                         }
                     } else if trackable(st.a) {
                         let anc = ancestor_path(st.a, st.b);
@@ -616,6 +636,7 @@ fn decide_all() {
                     }
                 }
                 P_STMTS[s].c = ds;
+                RUNS_DROPS = RUNS_DROPS || ds != DS_REMOVED;
                 P_STMTS[s].d = flag;
             }
             if reached {
@@ -710,7 +731,6 @@ fn rewrite() {
         for s in start..start + len {
             let st = OLD[s];
             P_STMTS.push(st);
-            crate::places::ir::P_BLOCKS[crate::places::ir::CUR_BLOCK].len += 1;
             if st.kind == SK_DROP && st.c == DS_OPEN && SNAP_AT[s] >= 0 {
                 for w in 0..3 * NW {
                     CUR[w] = SNAPS[SNAP_AT[s] + w];
@@ -723,6 +743,7 @@ fn rewrite() {
             }
         }
         // (its terminator, as it was)
+        crate::places::ir::close_block();
         P_STMTS.push(OLD[start + len]);
         crate::places::ir::CUR_BLOCK = -1;
     }
@@ -742,7 +763,7 @@ fn open_parts(l: i64, p: i64, q: i64, node: i64) {
     if tk == TyKind::Struct {
         let s = TYPES[t].a;
         for k in 0..struct_field_count(s) {
-            if has_glue(struct_field_ty(s, k)) {
+            if type_glue(struct_field_ty(s, k)) {
                 drop_part(l, proj(p, PJ_FIELD, k), node);
             }
         }
@@ -750,7 +771,7 @@ fn open_parts(l: i64, p: i64, q: i64, node: i64) {
     }
     if tk == TyKind::Tuple {
         for k in 0..TYPES[t].count {
-            if has_glue(type_elem(t, k)) {
+            if type_glue(type_elem(t, k)) {
                 drop_part(l, proj(p, PJ_FIELD, k), node);
             }
         }
@@ -801,7 +822,7 @@ fn open_parts(l: i64, p: i64, q: i64, node: i64) {
             enter_block(P_TARGETS[ti + 2 * i + 1]);
             let v = proj_val(MP_PROJ[c]);
             for k in 0..variant_field_count(v) {
-                if has_glue(variant_part_type(v, k)) {
+                if type_glue(variant_part_type(v, k)) {
                     drop_part(l, proj(MP_PROJ[c], PJ_FIELD, k), node);
                 }
             }
@@ -824,6 +845,71 @@ fn open_parts(l: i64, p: i64, q: i64, node: i64) {
     enter_block(join);
 }
 
+// The flags the parts' drops of an open drop of place (l, p), path q, will
+// read (open_parts, from the same state CUR): made before the rewrite, so
+// that the rewrite clears each at entry and writes it wherever its path
+// is initialized or moved (0.26.1, R6: a flag made by open_parts itself
+// had no write before its drop).
+fn open_flags(l: i64, p: i64, q: i64) {
+    let t = undistinct(full_place_type(l, p));
+    if t <= 0 {
+        return;
+    }
+    let tk = TYPES[t].kind;
+    if tk == TyKind::Struct {
+        let s = TYPES[t].a;
+        for k in 0..struct_field_count(s) {
+            if type_glue(struct_field_ty(s, k)) {
+                part_flags(l, proj(p, PJ_FIELD, k));
+            }
+        }
+        return;
+    }
+    if tk == TyKind::Tuple {
+        for k in 0..TYPES[t].count {
+            if type_glue(type_elem(t, k)) {
+                part_flags(l, proj(p, PJ_FIELD, k));
+            }
+        }
+        return;
+    }
+    if tk == TyKind::Array {
+        for k in 0..TYPES[t].b {
+            part_flags(l, proj(p, PJ_CONST, k));
+        }
+        return;
+    }
+    if tk != TyKind::Enum {
+        return;
+    }
+    var c = MP_FIRST[q];
+    while c >= 0 {
+        if proj_kind_of(c) == PJ_VARIANT && bit_get(2, c) {
+            let v = proj_val(MP_PROJ[c]);
+            for k in 0..variant_field_count(v) {
+                if type_glue(variant_part_type(v, k)) {
+                    part_flags(l, proj(MP_PROJ[c], PJ_FIELD, k));
+                }
+            }
+        }
+        c = MP_NEXT[c];
+    }
+    if bit_get(2, q) && others_drop(q) {
+        decide(q, true);
+    }
+}
+
+// drop_part's decision, for its flag only.
+fn part_flags(l: i64, p: i64) {
+    let q = path_of(l, p, false);
+    if q < 0 {
+        return;
+    }
+    if decide(q, false) == DS_OPEN {
+        open_flags(l, p, q);
+    }
+}
+
 // A part's drop, decided from CUR (its path made by complete_parts);
 // opened again when its own parts moved.
 fn drop_part(l: i64, p: i64, node: i64) {
@@ -843,11 +929,17 @@ fn drop_part(l: i64, p: i64, node: i64) {
 }
 
 fn push_term(kind: i64, a: i64, b: i64, c: i64, ops: i64, nops: i64, node: i64) {
+    crate::places::ir::close_block();
     P_STMTS.push(PStmt { kind, a, b, c, d: 0, e: 0, ops, nops, node });
     crate::places::ir::CUR_BLOCK = -1;
 }
 
 // ---- The driver ----
+
+// Whether the body elaborated last has a drop that runs (kept, flagged,
+// open): none, and nothing reads its drops (places::ask_shims,
+// record_drop_edges).
+pub static var RUNS_DROPS: bool = false;
 
 // Elaborates the body held (after build_body): its drops decided, its
 // flags made. Nothing for a body with no drop.
@@ -860,6 +952,7 @@ pub fn elaborate() {
         }
     }
     RPO_FRESH = false;
+    RUNS_DROPS = false;
     if !any {
         return;
     }

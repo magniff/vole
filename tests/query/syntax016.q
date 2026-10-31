@@ -37,6 +37,7 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::cell	<std>	19
 std::sync	<std>	29
 std::sync::atomic	<std>	48
 std::sync::mpsc	<std>	24
@@ -110,6 +111,6 @@ $ refs Pair
 $ effects apply grow main
 apply<closure(i64) -> i64 at syntax016/main.vl:47:32>	none
 crate::grow	alloc(Gpa) panic
-crate::main	alloc(Gpa) io global panic unsafe
+crate::main	alloc(Gpa) io panic unsafe
 $ def Vec::new_in
 std::Vec::new_in	../../compiler/std/std.vl:195:12	method	pub fn new_in(a: sink A) -> Vec<T, A>

@@ -21,7 +21,7 @@ use crate::front::types::{
 use crate::gen0::gen::{alloc_slot, alloc_slot_for, fn_symbol_prefix};
 use crate::gen0::gen::arch::gen_intrinsic;
 use crate::gen0::gen::checkalloc::site_before_call;
-use crate::gen0::gen::expr::gen_expr;
+use crate::gen0::gen::expr::{gen_expr, gen_operand};
 use crate::gen0::target::{
     DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, emit_call, emit_call_indirect,
     emit_copy, emit_frame_addr, emit_jump_if_nonzero, emit_label, emit_load_arg_reg,
@@ -73,32 +73,40 @@ pub fn gen_call(cx: sink *FnCtx, n: i64) {
             if i < param_count {
                 ty = if direct >= 0 { fn_param(direct, i) } else { type_elem(callee_ty, i) };
             }
-            gen_expr(cx, arg);
-            if is_void(ty) {
-                continue;
+            gen_operand(cx, arg);
+            if gen_pass_arg(cx, ty, is_fresh(arg)) {
+                arg_types[i] = ty;
+                pushed += 1;
             }
-            // A private copy, of a multiple of 8 bytes (read in pieces), unless
-            // the value is a new temporary.
-            if is_compound(ty) && !is_fresh(arg) {
-                let copy = alloc_slot_for(ty);
-                emit_frame_addr(cx, R_SECOND, copy);
-                emit_copy(cx, type_size(ty));
-                emit_frame_addr(cx, R_ACC, copy);
-            }
-            push_value(cx, ty);
-            arg_types[i] = ty;
-            pushed += 1;
         }
         if direct < 0 {
-            gen_expr(cx, callee);
+            gen_operand(cx, callee);
             push_x0(cx);
             pushed += 1;
         }
         // (0.16: --check-alloc's allocation site, the arguments pushed)
         site_before_call(cx, n);
-        gen_call_sequence(cx, n, direct, &arg_types as *i64, count, param_count, variadic, pushed,
+        gen_call_sequence(cx, direct, &arg_types as *i64, count, param_count, variadic, pushed,
             ret);
     }
+}
+
+// (0.26.1) An argument of type ty, in the accumulator, pushed for a call
+// (gen_call_sequence): a compound one as the address of a private copy,
+// of a multiple of 8 bytes (read in pieces), unless it is `fresh` (a new
+// temporary). False for a unit argument, which is not passed.
+pub fn gen_pass_arg(cx: sink *FnCtx, ty: i64, fresh: bool) -> bool {
+    if is_void(ty) {
+        return false;
+    }
+    if is_compound(ty) && !fresh {
+        let copy = alloc_slot_for(ty);
+        emit_frame_addr(cx, R_SECOND, copy);
+        emit_copy(cx, type_size(ty));
+        emit_frame_addr(cx, R_ACC, copy);
+    }
+    push_value(cx, ty);
+    true
 }
 
 // (0.18) `std::contract_check(cond, site, check)`, as middle's
@@ -108,39 +116,81 @@ pub fn gen_call(cx: sink *FnCtx, n: i64) {
 fn gen_contract_check(cx: sink *FnCtx, n: i64) {
     unsafe {
         let cond = child(n, 0);
-        let site = child(n, 1);
         let check = NODES[child(n, 2)].a;
         var conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         conjuncts(cond, &conjs);
-        var ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..conjs.count {
             let conj = conjs.data[k];
             gen_expr(cx, conj);
             let ok = new_label(cx);
             emit_jump_if_nonzero(cx, ok);
-            ops.count = 0;
-            check_values(n, conj, &ops);
-            gen_expr(cx, site);
-            push_x0(cx);
-            for i in 0..ops.count {
-                gen_expr(cx, ops.data[i]);
-                push_x0(cx);
-            }
-            if ops.count > 2 {
-                pop_x(cx, R_ADDR);
-            }
-            if ops.count > 1 {
-                pop_x(cx, R_SECOND);
-            }
-            if ops.count > 0 {
-                pop_x(cx, R_ACC);
-            }
-            let kind = message_kind(check_message(check, conj, ops, crate::gen0::gen::CUR_FN));
-            emit_panic_site_popped(cx, kind);
+            gen_contract_failure(cx, n, conj, check);
             emit_label(cx, ok);
         }
         free(conjs.data as *u8);
+    }
+}
+
+// (0.26.1) The failing path of contract check n (its kind `check`) on
+// conjunct conj: the shown operands (evaluated again: a condition is
+// pure), the message and the site, to the helper.
+fn gen_contract_failure(cx: sink *FnCtx, n: i64, conj: i64, check: i64) {
+    // UNSAFE: ops is a raw IntVec (its data freed by hand), read through
+    // its raw data pointer; NODES is the checker's raw table.
+    // SAFETY: check_values fills ops (count entries at data); i < count;
+    // the data is freed once, here; n is a contract check's Call node.
+    unsafe {
+        let site = child(n, 1);
+        var ops = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        check_values(n, conj, &ops);
+        gen_expr(cx, site);
+        push_x0(cx);
+        for i in 0..ops.count {
+            gen_expr(cx, ops.data[i]);
+            push_x0(cx);
+        }
+        if ops.count > 2 {
+            pop_x(cx, R_ADDR);
+        }
+        if ops.count > 1 {
+            pop_x(cx, R_SECOND);
+        }
+        if ops.count > 0 {
+            pop_x(cx, R_ACC);
+        }
+        let kind = message_kind(check_message(check, conj, ops, crate::gen0::gen::CUR_FN));
+        emit_panic_site_popped(cx, kind);
         free(ops.data as *u8);
+    }
+}
+
+// (0.26.1) Contract check n of a condition already evaluated, in the
+// accumulator (the places IR's, gen0's places.vl): on its failing path
+// the conjunct that failed (when there are several: each evaluated again
+// from the AST, as the shown operands are), its message and the site.
+pub fn gen_contract_check_of(cx: sink *FnCtx, n: i64) {
+    // UNSAFE: conjs is a raw IntVec (its data freed by hand), read through
+    // its raw data pointer; NODES is the checker's raw table.
+    // SAFETY: conjuncts fills conjs with at least one conjunct (the
+    // condition itself); k < count - 1; the data is freed once, here; n is a
+    // contract check's Call node, its third argument the check's kind.
+    unsafe {
+        let check = NODES[child(n, 2)].a;
+        var conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        conjuncts(child(n, 0), &conjs);
+        let pass = new_label(cx);
+        emit_jump_if_nonzero(cx, pass);
+        for k in 0..conjs.count - 1 {
+            let conj = conjs.data[k];
+            gen_expr(cx, conj);
+            let next = new_label(cx);
+            emit_jump_if_nonzero(cx, next);
+            gen_contract_failure(cx, n, conj, check);
+            emit_label(cx, next);
+        }
+        gen_contract_failure(cx, n, conjs.data[conjs.count - 1], check);
+        emit_label(cx, pass);
+        free(conjs.data as *u8);
     }
 }
 
@@ -240,10 +290,15 @@ fn place_args(cx: sink *FnCtx, arg_types: *i64, count: i64, param_count: i64, va
     }
 }
 
+// (0.26.1) The frame slot the next call sequence makes its compound
+// result in (0: a new one), set by gen0's places.vl for a call into a
+// local's slot.
+pub static var RESULT_INTO: i64 = 0;
+
 // Moves the pushed arguments into place, calls, and pops them. A compound
 // result is in a new frame slot (through the result pointer, or stored
-// from the result registers).
-fn gen_call_sequence(cx: sink *FnCtx, n: i64, direct: i64, arg_types: *i64, count: i64,
+// from the result registers; RESULT_INTO's when set).
+pub fn gen_call_sequence(cx: sink *FnCtx, direct: i64, arg_types: *i64, count: i64,
     param_count: i64, variadic: bool, pushed: i64, ret: i64) {
     unsafe {
         var locations: [i64; 64] = [0; 64];
@@ -279,8 +334,9 @@ fn gen_call_sequence(cx: sink *FnCtx, n: i64, direct: i64, arg_types: *i64, coun
         var result_slot = 0;
         let through_pointer = returns_through_pointer(cx, ret);
         if is_compound(ret) {
-            result_slot = alloc_slot_for(ret);
+            result_slot = if RESULT_INTO != 0 { RESULT_INTO } else { alloc_slot_for(ret) };
         }
+        RESULT_INTO = 0;
         if through_pointer {
             emit_frame_addr(cx, R_RESULT, result_slot);
         }

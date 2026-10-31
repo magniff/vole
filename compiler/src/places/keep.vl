@@ -1,0 +1,229 @@
+// Kept bodies (0.26.1, request R1 of the code generators' agent;
+// docs/design/places-ir.md §4): at a build, run_places keeps each
+// elaborated body (keep_body, after elaborate), and a code generator puts
+// it back into the P_* tables (load_body) when it generates the function,
+// then frees it (free_body). Each of the six tables is kept as a copy of
+// the exact size, made and put back whole (extend_from_slice: no field by
+// field packing, 0.26.1 the builder's cost at a build), beside a header of
+// three words.
+//
+// A kept body is the body as elaboration left it; its types are the
+// checker's, distinct ones not erased (ir.vl: undistinct).
+
+use crate::base::comp::Comp;
+use crate::front::types::{TY_NEVER, is_compound, is_void};
+use crate::places::ir::{
+    B_FN, B_NODE, B_PARAMS, LF_BORROWED, LF_FLAG, LF_SSA, LF_STATIC, LF_TEMP, OK_COPY, OK_MOVE,
+    OK_PLACE, PBlock, PJ_INDEX, PLocal, PProj, PStmt, P_BLOCKS, P_LOCALS, P_OPS, P_PROJS, P_STMTS,
+    P_TARGETS, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, SK_NOP,
+    op_a, op_b, op_kind, proj_kind, proj_parent, proj_val, undistinct,
+};
+
+// Whether run_places keeps the bodies (a build whose code generators
+// read the IR; `--keep-places` at check, for the tests).
+pub static var KEEP_BODIES: bool = false;
+
+// Per function (FNS index): its body's header (B_NODE, B_PARAMS, then 1:
+// kept; three words a function), and its tables, empty when it has none.
+static var K_HEAD: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var K_LOCALS: Vec<Vec<PLocal, Comp>, Comp> = Vec::new_in(Comp {});
+static var K_PROJS: Vec<Vec<PProj, Comp>, Comp> = Vec::new_in(Comp {});
+static var K_STMTS: Vec<Vec<PStmt, Comp>, Comp> = Vec::new_in(Comp {});
+static var K_BLOCKS: Vec<Vec<PBlock, Comp>, Comp> = Vec::new_in(Comp {});
+static var K_OPS: Vec<Vec<i64, Comp>, Comp> = Vec::new_in(Comp {});
+static var K_TARGETS: Vec<Vec<i64, Comp>, Comp> = Vec::new_in(Comp {});
+// The bodies kept and not freed, and the words they hold.
+pub static var KEPT_COUNT: i64 = 0;
+pub static var KEPT_WORDS: i64 = 0;
+
+// The words of a kept local, projection, statement, block.
+const W_LOCAL: i64 = 4;
+const W_PROJ: i64 = 5;
+const W_STMT: i64 = 9;
+const W_BLOCK: i64 = 2;
+
+// The body held (P_* tables), kept for its function B_FN.
+pub fn keep_body() {
+    let f = B_FN;
+    if f < 0 {
+        return;
+    }
+    while K_LOCALS.len() <= f {
+        K_HEAD.push(0);
+        K_HEAD.push(0);
+        K_HEAD.push(0);
+        K_LOCALS.push(Vec::new_in(Comp {}));
+        K_PROJS.push(Vec::new_in(Comp {}));
+        K_STMTS.push(Vec::new_in(Comp {}));
+        K_BLOCKS.push(Vec::new_in(Comp {}));
+        K_OPS.push(Vec::new_in(Comp {}));
+        K_TARGETS.push(Vec::new_in(Comp {}));
+    }
+    if has_kept(f) {
+        free_body(f);
+    }
+    K_HEAD[3 * f] = B_NODE;
+    K_HEAD[3 * f + 1] = B_PARAMS;
+    K_HEAD[3 * f + 2] = 1;
+    var l: Vec<PLocal, Comp> = Vec::with_capacity_in(P_LOCALS.len(), Comp {});
+    l.extend_from_slice(P_LOCALS.as_slice());
+    K_LOCALS.set(f, l);
+    var p: Vec<PProj, Comp> = Vec::with_capacity_in(P_PROJS.len(), Comp {});
+    p.extend_from_slice(P_PROJS.as_slice());
+    K_PROJS.set(f, p);
+    var s: Vec<PStmt, Comp> = Vec::with_capacity_in(P_STMTS.len(), Comp {});
+    s.extend_from_slice(P_STMTS.as_slice());
+    K_STMTS.set(f, s);
+    var b: Vec<PBlock, Comp> = Vec::with_capacity_in(P_BLOCKS.len(), Comp {});
+    b.extend_from_slice(P_BLOCKS.as_slice());
+    K_BLOCKS.set(f, b);
+    var o: Vec<i64, Comp> = Vec::with_capacity_in(P_OPS.len(), Comp {});
+    o.extend_from_slice(P_OPS.as_slice());
+    K_OPS.set(f, o);
+    var t: Vec<i64, Comp> = Vec::with_capacity_in(P_TARGETS.len(), Comp {});
+    t.extend_from_slice(P_TARGETS.as_slice());
+    K_TARGETS.set(f, t);
+    KEPT_COUNT += 1;
+    KEPT_WORDS += words(f);
+}
+
+// The words function f's kept tables hold.
+fn words(f: i64) -> i64 {
+    3 + W_LOCAL * K_LOCALS[f].len() + W_PROJ * K_PROJS[f].len() + W_STMT * K_STMTS[f].len()
+        + W_BLOCK * K_BLOCKS[f].len() + K_OPS[f].len() + K_TARGETS[f].len()
+}
+
+// Whether function f has a kept body.
+pub fn has_kept(f: i64) -> bool {
+    f >= 0 && f < K_LOCALS.len() && K_HEAD[3 * f + 2] != 0
+}
+
+// Function f's kept body put back into the P_* tables (as body_begin and
+// the builder left them, with no block open): false when it has none. The
+// tables are taken, not copied: the body is no longer kept (a code
+// generator frees it once generated; one that only prints it keeps it
+// again, keep_body).
+pub fn load_body(f: i64) -> bool {
+    if !has_kept(f) {
+        return false;
+    }
+    crate::places::ir::B_FN = f;
+    crate::places::ir::B_NODE = K_HEAD[3 * f];
+    crate::places::ir::B_PARAMS = K_HEAD[3 * f + 1];
+    crate::places::ir::B_SHIM = -1;
+    KEPT_COUNT -= 1;
+    KEPT_WORDS -= words(f);
+    K_HEAD[3 * f + 2] = 0;
+    crate::places::ir::set_tables(K_LOCALS[f].take(), K_PROJS[f].take(), K_STMTS[f].take(),
+        K_BLOCKS[f].take(), K_OPS[f].take(), K_TARGETS[f].take());
+    crate::places::ir::CUR_BLOCK = -1;
+    true
+}
+
+// Function f's kept body freed (once its function is generated).
+pub fn free_body(f: i64) {
+    if !has_kept(f) {
+        return;
+    }
+    KEPT_COUNT -= 1;
+    KEPT_WORDS -= words(f);
+    K_HEAD[3 * f + 2] = 0;
+    K_LOCALS[f].free();
+    K_PROJS[f].free();
+    K_STMTS[f].free();
+    K_BLOCKS[f].free();
+    K_OPS[f].free();
+    K_TARGETS[f].free();
+}
+
+// Every kept body freed.
+pub fn free_all() {
+    for f in 0..K_LOCALS.len() {
+        free_body(f);
+    }
+}
+
+// Per local, while mark_ssa runs: 0 not seen, 4b + 1 written whole in
+// block b, 4b + 3 then read whole there, -1 mentioned any other way.
+static var SSA_ST: Vec<i64, Comp> = Vec::new_in(Comp {});
+
+// (0.26.1, for gen0) Flags LF_SSA the held body's temporaries with one
+// whole write and one whole read, the read by a later statement of the
+// write's block (ir.vl): a value a code generator can keep out of the
+// frame without scanning the body for it.
+pub fn mark_ssa() {
+    let n = P_LOCALS.len();
+    SSA_ST.clear();
+    for _ in 0..n {
+        SSA_ST.push(0);
+    }
+    for b in 0..P_BLOCKS.len() {
+        let start = P_BLOCKS[b].start;
+        if start < 0 {
+            // (a block never entered)
+            continue;
+        }
+        let written = 4 * b + 1;
+        for at in start..start + P_BLOCKS[b].len + 1 {
+            let s = P_STMTS[at];
+            let k = s.kind;
+            if k == SK_LIVE || k == SK_DEAD || k == SK_NOP {
+                continue;
+            }
+            // (the operands read first, then the place written)
+            for o in 0..s.nops {
+                let ok = op_kind(s.ops, o);
+                if ok != OK_COPY && ok != OK_MOVE && ok != OK_PLACE {
+                    continue;
+                }
+                let l = op_a(s.ops, o);
+                let p = op_b(s.ops, o);
+                if ok != OK_PLACE && p == 0 && SSA_ST[l] == written {
+                    SSA_ST[l] = written + 2;
+                } else {
+                    SSA_ST[l] = -1;
+                    ssa_bad_indices(p);
+                }
+            }
+            if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC {
+                if s.b == 0 && SSA_ST[s.a] == 0 {
+                    SSA_ST[s.a] = written;
+                } else {
+                    SSA_ST[s.a] = -1;
+                    ssa_bad_indices(s.b);
+                }
+            } else if k == SK_DROP || k == SK_MENTION {
+                SSA_ST[s.a] = -1;
+                ssa_bad_indices(s.b);
+                if k == SK_DROP && s.d >= 0 {
+                    SSA_ST[s.d] = -1;
+                }
+            }
+        }
+    }
+    for l in 0..n {
+        if SSA_ST[l] < 0 || (SSA_ST[l] & 3) != 3 {
+            continue;
+        }
+        let flags = P_LOCALS[l].flags;
+        if (flags & LF_TEMP) == 0 || (flags & (LF_BORROWED | LF_STATIC | LF_FLAG)) != 0 {
+            continue;
+        }
+        let ty = undistinct(P_LOCALS[l].ty);
+        if is_void(ty) || ty == TY_NEVER || is_compound(ty) {
+            continue;
+        }
+        P_LOCALS[l].flags = flags | LF_SSA;
+    }
+}
+
+// The locals indexing projection list p: not SSA (a place names them).
+fn ssa_bad_indices(p: i64) {
+    var q = p;
+    while q > 0 {
+        if proj_kind(q) == PJ_INDEX {
+            SSA_ST[proj_val(q)] = -1;
+        }
+        q = proj_parent(q);
+    }
+}

@@ -40,8 +40,8 @@ use crate::front::own::kinds::{
     P_MUT, P_MUT_VIEW, P_RAW, is_owned_type, is_plain_type, is_view_type, param_mode,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TY_ERROR, TyKind, VARIANTS,
-    buf_type, enum_variant, struct_field,
+    ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STATICS, STATIC_COUNT, STRUCTS, TLISTS, TYPES,
+    TY_ERROR, TyKind, VARIANTS, buf_type, enum_variant, struct_field,
 };
 use crate::middle::lower::ssa::HMap;
 
@@ -53,6 +53,8 @@ const W_VIEW: i64 = 2;
 const W_VIEW_MUT: i64 = 3;
 const W_FN: i64 = 4;
 const W_SHARED: i64 = 5;
+// (0.26.1) std::cell::UnsafeCell: Send when its T is, never Sync
+const W_CELL: i64 = 6;
 
 static var F_WHY: i64 = 0;
 static var F_IN: i64 = 0;
@@ -194,8 +196,17 @@ fn decide(t: i64, mode: i64) -> bool {
             return true;
         }
         let s = TYPES[t].a;
+        if crate::front::cells::is_unsafe_cell_struct(s) {
+            // (0.26.1: the negative leaf; Cell and what holds one follow
+            // structurally)
+            if mode == M_SYNC {
+                return fail(W_CELL, t);
+            }
+            return targs_hold(s, mode);
+        }
         let name = std_name(s);
-        if name == "Atomic" || name == "RawLock" || name == "JoinHandle" {
+        // (0.26.1: PrintCell, std::fmt's print state, which FMT_LOCK guards)
+        if name == "Atomic" || name == "RawLock" || name == "JoinHandle" || name == "PrintCell" {
             return true;
         }
         if name == "Mutex" {
@@ -250,6 +261,8 @@ fn buf_reason(out: i64, t: i64) {
         buf_str(out, c"a raw pointer");
     } else if F_WHY == W_FN {
         buf_str(out, c"a fn pointer, which may reach any static");
+    } else if F_WHY == W_CELL {
+        buf_str(out, c"a cell (std::cell), which is not Sync");
     } else if F_WHY == W_VIEW_MUT {
         buf_str(out, c"an exclusive view");
     } else {
@@ -1072,20 +1085,27 @@ fn check_scoped_spawn(f: i64) {
 static var CHANNEL_FN: i64 = -2;
 static var MUTEX_NEW_FN: i64 = -2;
 static var ATOMIC_NEW_FN: i64 = -2;
+// (0.26.1) std::cell::Cell::new and UnsafeCell::new: cell.view_item
+static var CELL_NEW_FN: i64 = -2;
+static var UNSAFE_CELL_NEW_FN: i64 = -2;
 
 pub fn check_sync_items() {
+    check_static_cells();
     unsafe {
         if CHANNEL_FN == -2 {
             CHANNEL_FN = find_std_fn("std.sync.mpsc.channel_in");
             MUTEX_NEW_FN = find_std_fn("std.sync.Mutex.new");
             ATOMIC_NEW_FN = find_std_fn("std.sync.atomic.Atomic.new");
+            CELL_NEW_FN = find_std_fn("std.cell.Cell.new");
+            UNSAFE_CELL_NEW_FN = find_std_fn("std.cell.UnsafeCell.new");
             WITH_FNS.count = 0;
             WITH_FNS.push(find_std_fn("std.sync.Mutex.with"));
             WITH_FNS.push(find_std_fn("std.sync.Mutex.try_with"));
             WITH_FNS.push(find_std_fn("std.sync.MutexGuard.with"));
             WITH_FNS.push(find_std_fn("std.sync.Condvar.wait_then"));
         }
-        if CHANNEL_FN < 0 && MUTEX_NEW_FN < 0 && ATOMIC_NEW_FN < 0 {
+        if CHANNEL_FN < 0 && MUTEX_NEW_FN < 0 && ATOMIC_NEW_FN < 0 && CELL_NEW_FN < 0
+            && UNSAFE_CELL_NEW_FN < 0 {
             return;
         }
         for f in 0..FN_COUNT {
@@ -1099,7 +1119,8 @@ pub fn check_sync_items() {
                     with = true;
                 }
             }
-            if t != CHANNEL_FN && t != MUTEX_NEW_FN && t != ATOMIC_NEW_FN && !with {
+            let cell = t >= 0 && (t == CELL_NEW_FN || t == UNSAFE_CELL_NEW_FN);
+            if t != CHANNEL_FN && t != MUTEX_NEW_FN && t != ATOMIC_NEW_FN && !cell && !with {
                 continue;
             }
             let p = FNS[f].parent - 1;
@@ -1118,6 +1139,23 @@ pub fn check_sync_items() {
             let pos = call_pos(f);
             let msg = buf_new();
             let help = buf_new();
+            if cell {
+                // (0.26.1: a write through a shared reference to the cell
+                // would put a view where the own pass does not look; 0.27,
+                // regions: Cell<&'a T>)
+                buf_str(msg, c"a cell of ");
+                buf_type(msg, item);
+                let ik = TYPES[item].kind;
+                buf_str(msg, if ik == TyKind::Slice || ik == TyKind::Ptr || ik == TyKind::Distinct {
+                    c", a view: "
+                } else {
+                    c", which holds views: "
+                });
+                buf_str(msg, c"a write through a shared reference to the cell would store a view the borrow rules do not follow");
+                buf_str(help, c"keep owned or plain values in a cell: a copy of the view (`s.to_vec_in(gpa)`), or an index into the data it views | try: volec explain cell.view_item");
+                report(pos, c"cell.view_item", msg, help);
+                continue;
+            }
             if with {
                 buf_str(msg, c"the closure given to the lock returns ");
             } else {
@@ -1147,44 +1185,52 @@ pub fn check_sync_items() {
     }
 }
 
+// (0.26.1) sync.static (Rust's E0277 for a static): an immutable `static`
+// whose type is not Freeze (it holds a cell) and not Sync, vouched or
+// structural (an atomic, a lock and std's print state are): every thread
+// may reach it and write it at once. A `static var` and a
+// `#[thread_local] static var` may hold a cell. (Rust's whole rule, that
+// every immutable static is Sync, is 0.27's, with the auto traits.)
+fn check_static_cells() {
+    // UNSAFE: STATICS and NODES are the checker's raw tables.
+    // SAFETY: s < STATIC_COUNT; STATICS[s].node is its item's node.
+    unsafe {
+        for s in 0..STATIC_COUNT {
+            let t = STATICS[s].ty;
+            if STATICS[s].mutable || STATICS[s].linkage != 0 || t <= 0 || t == TY_ERROR
+                || crate::front::cells::is_freeze(t) {
+                continue;
+            }
+            reset_fault();
+            if holds(t, M_SYNC) {
+                continue;
+            }
+            let node = STATICS[s].node;
+            let pos = NODES[node].start;
+            let msg = buf_new();
+            let help = buf_new();
+            buf_str(msg, c"the static '");
+            buf_bytes(msg, SYMS[NODES[node].a].text);
+            buf_str(msg, c"' is not Sync: ");
+            buf_reason(msg, t);
+            buf_str(msg, c"; every thread may reach it and write through it at once");
+            buf_str(help, c"make it a `static var` (one thread's, the main one's) or a `#[thread_local] static var`, or hold an atomic or a Mutex instead | try: volec explain sync.static");
+            report(pos, c"sync.static", msg, help);
+        }
+    }
+}
+
 // Mutex::with, try_with, MutexGuard::with, Condvar::wait_then: their
 // result holds no view of the data they lock.
 static var WITH_FNS: crate::base::IntVec = crate::base::IntVec {
     data: 0 as *i64, count: 0, cap: 0,
 };
 
-// (0.21) Whether type t holds std's Atomic (or a lock built on one)
-// anywhere: memory that changes through a shared reference, so an
-// immutable static of it lives in writable data.
+// (0.21) Whether type t holds memory that changes through a shared
+// reference, so that an immutable static of it lives in writable data
+// (gen0's gen_data) and a lock lends it (own::calls::lends_interior).
+// (0.26.1) What is not Freeze: it holds a std::cell::UnsafeCell by value,
+// as std's Atomic, Mutex and the locks do (front/cells.vl).
 pub fn is_interior_type(t: i64) -> bool {
-    unsafe {
-        if t <= 0 {
-            return false;
-        }
-        let kind = TYPES[t].kind;
-        if kind == TyKind::Array {
-            return is_interior_type(TYPES[t].a);
-        }
-        if kind == TyKind::Tuple {
-            for i in 0..TYPES[t].count {
-                if is_interior_type(TLISTS.data[TYPES[t].list + i]) {
-                    return true;
-                }
-            }
-            return false;
-        }
-        if kind != TyKind::Struct {
-            return false;
-        }
-        let s = TYPES[t].a;
-        if std_name(s) == "Atomic" {
-            return true;
-        }
-        for i in 0..STRUCTS[s].field_count {
-            if is_interior_type((*struct_field(s, i)).ty) {
-                return true;
-            }
-        }
-        false
-    }
+    t > 0 && !crate::front::cells::is_freeze(t)
 }

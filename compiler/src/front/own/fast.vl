@@ -18,6 +18,7 @@
 use crate::base::{IntVec, alloc_array};
 use crate::front::ast::{NODES, NODE_RAW, NodeKind, child};
 use crate::front::check::{LOCALS, Res};
+use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::{K_OWNED, K_VIEW, type_kind};
 use crate::front::types::{FNS, TYPES, TyKind};
 
@@ -208,6 +209,115 @@ static var BY_START: *i64 = 0 as *i64;
 static var BY_FN: *i64 = 0 as *i64;
 static var BY_N: i64 = -1;
 
+// (0.26.1) What a function may drop, as the checker meets it: the types
+// of the values it makes, (function, type) pairs, each once in a row
+// (FSTAMP): a local's (not a parameter's), a call's result, an
+// aggregate's, a closure's. A place read is not one: what it reads is a
+// local's (or a parameter's, or a static's) already. glue_met asks their
+// glue after the checker, by function (FBY_START, FBY: a counting sort,
+// once).
+static var FRESH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var FSTAMP: *i64 = 0 as *i64;
+static var FSTAMP_CAP: i64 = 0;
+static var FBY_START: *i64 = 0 as *i64;
+static var FBY: *i64 = 0 as *i64;
+static var FBY_N: i64 = -1;
+
+// Per node kind: whether an expression of it makes a new value (byref.vl
+// fresh's kinds, but an f-string: its value is printed or passed on,
+// never held by a temporary), one a temporary may hold; filled once
+// (the checker asks it of every node).
+static var MAKES: [bool; 256] = [false; 256];
+static var MAKES_SET: bool = false;
+
+#[inline]
+fn makes_value(k: NodeKind) -> bool {
+    if !MAKES_SET {
+        MAKES_SET = true;
+        MAKES[NodeKind::Call as i64] = true;
+        MAKES[NodeKind::MethodCall as i64] = true;
+        MAKES[NodeKind::StructLit as i64] = true;
+        MAKES[NodeKind::Tuple as i64] = true;
+        MAKES[NodeKind::Array as i64] = true;
+        MAKES[NodeKind::VariantLit as i64] = true;
+        MAKES[NodeKind::Repeat as i64] = true;
+        MAKES[NodeKind::Closure as i64] = true;
+    }
+    MAKES[k as i64]
+}
+
+// Whether the values a function makes are recorded (FRESH): only for a
+// check that builds bodies by glue_met, not every body
+// (places::by_glue); asked once a program, the options set by then.
+static var FRESH_STATE: i64 = 0;
+
+fn fresh_on() -> bool {
+    if FRESH_STATE == 0 {
+        FRESH_STATE = if crate::places::by_glue() { 1 } else { 2 };
+    }
+    FRESH_STATE == 1
+}
+
+// Type t of a value the function being checked makes.
+fn note_fresh(t: i64) {
+    // UNSAFE: FSTAMP is this file's raw array of stamps, grown as STAMP is (alloc_array).
+    // SAFETY: t < FSTAMP_CAP before FSTAMP[t]; a grown array copies the old one first.
+    unsafe {
+        let f = REC_F;
+        if f < 0 || t <= 0 || t < FSTAMP_CAP && FSTAMP[t] == f + 1 {
+            return;
+        }
+        if t >= FSTAMP_CAP {
+            let n = t * 2 + 1024;
+            let a = alloc_array::<i64>(n);
+            for i in 0..FSTAMP_CAP {
+                a[i] = FSTAMP[i];
+            }
+            FSTAMP = a;
+            FSTAMP_CAP = n;
+        }
+        FSTAMP[t] = f + 1;
+        FRESH.push(f);
+        FRESH.push(t);
+    }
+}
+
+// FRESH by function, once (by_fn's counting sort).
+fn fresh_by_fn() {
+    // UNSAFE: FRESH's data and the arrays made here are raw (*i64).
+    // SAFETY: start has n + 1 entries for f < n; out has one per pair; FRESH.data has
+    // FRESH.count entries.
+    unsafe {
+        if FBY_N >= 0 {
+            return;
+        }
+        let n = crate::front::types::FN_COUNT + 1;
+        let start = alloc_array::<i64>(n + 1);
+        let pairs = FRESH.count / 2;
+        for i in 0..pairs {
+            let f = FRESH.data[2 * i];
+            if f < n {
+                start[f + 1] += 1;
+            }
+        }
+        for f in 0..n {
+            start[f + 1] += start[f];
+        }
+        let fill = alloc_array::<i64>(n + 1);
+        let out = alloc_array::<i64>(pairs + 1);
+        for i in 0..pairs {
+            let f = FRESH.data[2 * i];
+            if f < n {
+                out[start[f] + fill[f]] = FRESH.data[2 * i + 1];
+                fill[f] += 1;
+            }
+        }
+        FBY_START = start;
+        FBY = out;
+        FBY_N = n;
+    }
+}
+
 fn rec_flags(f: i64) -> *u8 {
     unsafe {
         if f >= REC_CAP {
@@ -239,6 +349,7 @@ pub fn check_begin(f: i64) {
             *rec_flags(f) |= R_CHECKED;
         }
         BY_N = -1;
+        FBY_N = -1;
     }
 }
 
@@ -258,10 +369,18 @@ pub fn check_end() {
     }
 }
 
-// Type t is met in the function being checked.
+// Type t is met in the function being checked: a local's, defined now
+// (front::check::define_local).
 #[inline]
 pub fn note_type(t: i64) {
+    // UNSAFE: LOCALS and STAMP are raw arrays (*Local, *i64).
+    // SAFETY: define_local, the one caller, made local LOCAL_COUNT - 1 just before;
+    // t < STAMP_CAP before STAMP[t].
     unsafe {
+        // (a local, not a parameter: a value the function makes)
+        if REC_F >= 0 && !LOCALS[crate::front::check::LOCAL_COUNT - 1].is_param && fresh_on() {
+            note_fresh(t);
+        }
         let f = REC_F;
         if f < 0 || t <= 0 || t < STAMP_CAP && STAMP[t] == f + 1 {
             return;
@@ -319,6 +438,9 @@ pub fn check_exit(n: i64, t: i64, m: i64) {
             return;
         }
         let k = NODES[n].kind;
+        if makes_value(k) && fresh_on() {
+            note_fresh(t);
+        }
         if (k == NodeKind::Unary || k == NodeKind::Ident
             || CDEPTH > 0 && (k == NodeKind::FieldAccess || k == NodeKind::Index))
             && check_loans(n, t, k) {
@@ -380,6 +502,9 @@ pub fn synth_exit(n: i64, t: i64, m: i64) {
             return;
         }
         let k = NODES[n].kind;
+        if makes_value(k) && fresh_on() {
+            note_fresh(t);
+        }
         if k == NodeKind::Assign {
             check_loan(place_root(NODES[n].b), false);
         }
@@ -434,7 +559,12 @@ pub fn note_synthetic(u: i64) {
     if NODES[u].op == crate::front::lexer::Tok::Amp {
         check_loan(place_root(NODES[u].b), true);
     }
-    note_type(NODES[u].ty);
+    let t = NODES[u].ty;
+    // UNSAFE: STAMP is a raw array (*i64).
+    // SAFETY: t < STAMP_CAP before STAMP[t].
+    if t > 0 && !(t < STAMP_CAP && unsafe { STAMP[t] } == REC_F + 1) {
+        note_new(REC_F, t);
+    }
 }
 
 // A loan of root r (-1: none) in the call being checked: one an enclosing
@@ -492,6 +622,60 @@ fn record_says(f: i64) -> bool {
         }
         false
     }
+}
+
+// glue_met's rule: a
+// parameter it takes by value (`sink`) with glue, or a value it makes
+// (FRESH: a local's, a call's result, an aggregate's, a closure's) with
+// glue.
+fn makes_glue(f: i64) -> bool {
+    // UNSAFE: FBY_START and FBY are raw arrays (*i64), LOCALS too (*Local).
+    // SAFETY: f < FBY_N, the length of FBY_START less one, before FBY_START[f + 1], whose
+    // range lies in FBY; l is a parameter's local, below LOCAL_COUNT.
+    unsafe {
+        let item = FNS[f].node;
+        for i in 0..NODES[item].count {
+            let l = NODES[child(item, i)].x;
+            if l >= 0 && i < FNS[f].param_count
+                && crate::front::own::kinds::param_mode(f, i) == crate::front::own::kinds::P_VALUE
+                && has_glue(LOCALS[l].ty) {
+                return true;
+            }
+        }
+        fresh_by_fn();
+        if f >= FBY_N {
+            return true;
+        }
+        for i in FBY_START[f]..FBY_START[f + 1] {
+            if has_glue(FBY[i]) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// (0.26.1, the places IR's cost at check) Whether function f may drop
+// anything, so that places::run_places builds its body at check: whether
+// it takes a parameter by value (`sink`) whose type has glue, or makes a
+// value whose type has glue (makes_glue: a local, a call's result, an
+// aggregate, a closure, as the checker met them). Over compiler/src 1,033
+// bodies of 10,933, and the IR finds no drop that runs in the others
+// (--places-noglue-check, over compiler/src and every tests/run source).
+// A function with no record of its own, or one holding a closure (R_SCAN),
+// may. The own pass's drops are not asked: it stays when they go (step
+// 7). Unlike needs_walk it memoizes nothing: it runs before the own pass,
+// whose kinds of views may change meanwhile.
+pub fn glue_met(f: i64) -> bool {
+    // UNSAFE: REC_FLAGS is a raw array (*u8).
+    // SAFETY: f < REC_CAP before REC_FLAGS[f].
+    unsafe {
+        mark_closures();
+        if f >= REC_CAP || (REC_FLAGS[f] & R_CHECKED) == 0 || (REC_FLAGS[f] & R_SCAN) != 0 {
+            return true;
+        }
+    }
+    makes_glue(f)
 }
 
 // The records by function (a counting sort of REC), once.
