@@ -11,13 +11,13 @@
 // default meant; it is refused inside an item generic over an allocator
 // (`A` may be what was meant).
 
-use crate::base::{SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::{SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c, sym_text};
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end_soft, err_fix, err_help, err_help_fmt, err_str, err_sym,
-    err_try_tool, errors_forget, errors_mark,
+    ERR_KIND, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_str,
+    err_sym, err_try_tool, errors_forget, errors_mark,
 };
 use crate::front::ast::{FN_DEFAULT_COPY, NODES, NodeKind, child};
-use crate::front::check::{PROGRAM, TRY_RESULT, Try, attempt};
+use crate::front::check::{CUR_FN, ENV, LOCALS, PROGRAM, TRY_RESULT, Try, attempt};
 use crate::front::generics::{TP_BASE, TP_NAMES, TP_TYPES, instance_of};
 use crate::front::modules::{CUR_MOD, MODULES, module_of, within_std};
 use crate::front::traits::{IMPLS, IMPL_COUNT, bound_trait, std_trait};
@@ -848,5 +848,148 @@ fn is_allocator_param_type(n: i64, fnode: i64, module: i64) -> bool {
             return false;
         }
         is_allocator_type(resolve_quietly(n, module))
+    }
+}
+
+// ---- No constructor without `_in` (rule 1) ----
+
+// alloc.no_in: call n (a Call or MethodCall) of `name`, which std does
+// not have, when `name_in` is what it has (`Vec::new()`, `collect()`,
+// `format(x)`, `s.to_string()`): std has no function that allocates from
+// an allocator nobody passed. `what` is the call as named (`Vec::new`).
+// The fix names the `_in` form and passes, last, the one allocator value
+// in scope (`gpa` first); none when there is none, or several.
+pub fn no_in_error(n: i64, name: i64, what: [u8]) -> ! {
+    let saved = ERR_KIND;
+    ERR_KIND = c"alloc.no_in";
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: n is a call node.
+    unsafe {
+        err_begin(NODES[n].start);
+    }
+    err_fmt(format_args("'{what}' allocates from nothing: pass the allocator, last, to '{}_in'",
+        SYMS[name].text));
+    let a = allocator_in_scope();
+    if a > 0 {
+        err_help_fmt(format_args("this function's `{}` is the allocator to pass",
+            SYMS[a].text));
+        in_fix(n, name, SYMS[a].text);
+    } else if a < 0 {
+        err_help(c"several allocators are in scope: pass the one it allocates from");
+    } else {
+        // UNSAFE: FNS is the checker's raw table of functions.
+        // SAFETY: CUR_FN, when >= 0, is the function being checked.
+        unsafe {
+            crate::front::ambient::gpa_param_help(
+                if CUR_FN >= 0 { FNS[CUR_FN].node } else { -1 },
+                if CUR_FN >= 0 { sym_text(FNS[CUR_FN].display) } else { "" });
+        }
+    }
+    err_try_tool("fix --only alloc", true);
+    ERR_KIND = saved;
+    err_end()
+}
+
+// The name of the one local or parameter in scope whose type is an
+// allocator (one named `gpa` first); 0: none; -1: several.
+fn allocator_in_scope() -> i64 {
+    let gpa = intern_c(c"gpa");
+    var found = 0;
+    // UNSAFE: ENV and LOCALS are the checker's raw tables of locals.
+    // SAFETY: i < ENV.count; ENV's entries are local ids.
+    unsafe {
+        var i = ENV.count - 1;
+        while i >= 0 {
+            let id = ENV.data[i];
+            let t = LOCALS[id].ty;
+            if is_allocator_type(t) || is_allocator_type(pointee_of(t)) {
+                if LOCALS[id].name == gpa {
+                    return gpa;
+                }
+                if found != 0 && found != LOCALS[id].name {
+                    found = -1;
+                } else if found == 0 {
+                    found = LOCALS[id].name;
+                }
+            }
+            i -= 1;
+        }
+    }
+    found
+}
+
+fn pointee_of(t: i64) -> i64 {
+    if t > 0 && TYPES[t].kind == TyKind::Ptr { TYPES[t].a } else { 0 }
+}
+
+// The fix of alloc.no_in at node n (the call, or its callee's name):
+// `name` (the last place it is written before a `(`) becomes `name_in`,
+// and `alloc` the call's last argument.
+fn in_fix(n: i64, name: i64, alloc: [u8]) {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: n is a node of the call.
+    unsafe {
+        let start = NODES[n].start;
+        let word = SYMS[name].text;
+        let w = word.len() as i64;
+        var at = -1;
+        var i = start;
+        while i < NODES[n].end && i + w < SRC.len() as i64 {
+            if SRC[i] == '"' {
+                break;
+            }
+            if SRC[i..i + w] == word && (i == start || !ident_byte(SRC[i - 1]))
+                && (SRC[i + w] == '(' || SRC[i + w] == ':') {
+                at = i;
+            }
+            i += 1;
+        }
+        if at < 0 {
+            return;
+        }
+        var open = at + w;
+        while open < SRC.len() as i64 && SRC[open] != '(' {
+            if SRC[open] == ';' || SRC[open] == '{' {
+                return;
+            }
+            open += 1;
+        }
+        // its `)`
+        var depth = 0;
+        var close = open;
+        while close < SRC.len() as i64 {
+            let c = SRC[close];
+            if c == '"' || c == '\'' {
+                return;
+            }
+            if c == '(' || c == '[' {
+                depth += 1;
+            } else if c == ')' || c == ']' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            close += 1;
+        }
+        if close >= SRC.len() as i64 {
+            return;
+        }
+        var blank = true;
+        for k in open + 1..close {
+            if SRC[k] != ' ' && SRC[k] != '\n' && SRC[k] != '\t' {
+                blank = false;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, word);
+        buf_str(b, c"_in");
+        buf_bytes(b, SRC[at + w..close]);
+        if !blank {
+            buf_str(b, c", ");
+        }
+        buf_bytes(b, alloc);
+        buf_byte(b, ')');
+        err_fix(at, close + 1, buf_slice(b));
     }
 }
