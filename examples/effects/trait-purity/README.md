@@ -95,11 +95,11 @@ calls of `insert` and `get` that you make.)
 A debugging print in `eq`:
 
 ```console
-$ volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
+$ volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println("comparing {} and {}", self.text, other.text);
 >         if self.text.len() != other.text.len() {'
-main.vl:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.vl:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:30:5: 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.vl:31:9 calls 'std::fmt::println'
-try: volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
+main.vl:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:30:5: 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println("comparing {} and {}", self.text, ot..' at main.vl:31:9 calls 'std::fmt::println'
+try: volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println("comparing {} and {}", self.text, other.text);
         if self.text.len() != other.text.len() {' --no-check
 [exit 1]
 ```

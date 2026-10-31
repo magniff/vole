@@ -26,7 +26,7 @@ EOF
 volec edit insert --in main --before 'println("kg  pounds");' >/dev/null 2>&1 <<'EOF'
 println("pounds  kg");
 for lb in [1, 100, 150] {
-    println(f"{lb:>6}  {lb_to_kg(lb):>2}");
+    println("{lb:>6}  {:>2}", lb_to_kg(lb));
 }
 EOF
 git commit -q -a -m 'Round every conversion to the nearest whole number'
@@ -46,7 +46,7 @@ EOF
 volec edit insert --in main --before 'println("kg  pounds");' >/dev/null 2>&1 <<'EOF'
 println("miles  km");
 for mi in [1, 26, 100] {
-    println(f"{mi:>5}  {mi_to_km(mi):>3}");
+    println("{mi:>5}  {:>3}", mi_to_km(mi));
 }
 EOF
 git commit -q -a -m 'Miles to kilometres'
