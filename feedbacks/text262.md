@@ -95,7 +95,9 @@ parser errors), and sem_own_closure_temp_to_let_param is an XFAIL with
 that very error. (A first reading of their error lines, in this file's
 previous version, took three of them for compiler bugs: wrong.)
 
-The categories, by the error the check saw:
+Migrated after all (1ab53563, the check by code and item), but for
+fmt_err_holes, an f-string test: 75, their cases passing as before. The
+categories, by the error the check had seen:
 
 own.conflict: arch_err_store_view.vl, checkalloc_arena_grow.vl, checkalloc_slice_push.vl, closure_returns_capture_view.vl, err_closure_view_across_call.vl, err_own_cast_view_grow.vl, err_own_unmap_live_view.vl, err_own_user_dunder.vl, err_temporary_own.vl, err_vec_elem_receiver.vl, generic_struct_fcall_view.vl, own_report_basics.vl, own_slice_receiver.vl, scope_result_view_grow.vl, sem_excl_cl_capture_vec_push_while_view.vl, sem_excl_cl_view_live_closure_call.vl, sem_excl_cl_view_made_after_closure.vl, sem_excl_cp_closure_capture_by_copy_mutated_after.vl, sem_excl_ex_slice_noalias_O2.vl, sem_excl_il_borrowed_elem_across.vl, sem_excl_il_field_of_local.vl, sem_excl_il_loop_carried.vl, sem_excl_il_view_across_inout.vl, sem_excl_il_view_struct_across_inout.vl, sem_excl_lb_view_result_then_write.vl, sem_excl_lv_borrowed_elem_assign.vl, sem_excl_pj_let_result.vl, sem_excl_vf_inout_field_slice_passed.vl, sem_poly_c03_var_change_while_closure_live.vl, sem_poly_c04_owned_let_moved_while_live.vl, sem_poly_f12_fnptr_returns_view_of_arg.vl, sem_poly_f13_fnptr_field_returns_view.vl, sem_poly_g07_closure_view_then_mutate.vl, sem_poly_g16_pick_view.vl, sem_poly_g25_generic_view_struct_mutate.vl, sem_poly_r13_default_returns_view.vl, sem_poly_r14_trait_generic_returns_view.vl, sem_poly_r16_assoc_item_view.vl, sem_poly_x04_closure_field_returns_view.vl, sem_poly_x05_map_returns_captured_view.vl, sem_poly_x06_sink_closure_holds_view.vl, sem_poly_y01_closure_in_vec_conflict.vl, sem_poly_y02_closure_in_option_conflict.vl, sem_views_l_l11.vl, sem_views_sv_sv15_lexer_owns.vl, tests/own-try/lexer_owns/main.vl, tests/own-try/view_push/main.vl.
 
