@@ -183,6 +183,15 @@ code generators' agent (0.26.1) sees what moved.
   LF_SSA (keep.vl `mark_ssa`, run before `keep_body` at a build; the
   printer says `temp ssa`). Over compiler/src 98,251 of 149,332
   temporaries; the build's places phase +57M instructions.
+- 0.26.1 (a Drop impl's value dropped whole; fuzz-sem seed 89): no move
+  path under a place whose type has a Drop impl (elab.vl `whole_only`).
+  A field written on one path (its old value's drop, then the write) and
+  the whole moved on another gave the field a path of its own, and the
+  whole's drop at the scope's end was opened into its fields: the fields
+  dropped, its `drop` never called. Now a part's drop is decided by the
+  whole's state and a part's write leaves the whole as it was; the whole
+  drops under its flag. A field assigned after the whole may have moved
+  is own.partial (as a field moved out of it is).
 
 ## `--places-diff`: the differences left
 
