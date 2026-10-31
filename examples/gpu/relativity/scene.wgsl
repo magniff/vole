@@ -327,17 +327,19 @@ fn hit_lamps(ro: vec3<f32>, rd: vec3<f32>, best_in: Hit) -> Hit {
     return best;
 }
 
-// A pendulum wave west of the stall: a frame along z with eight pendulums
-// swinging across it (in x). Pendulum n makes 20 + n swings every 60 s of
-// village time (periods 2.2 to 3 s, lengths 1.2 to 2.2 m), so their phases
-// drift apart and come back together every minute. Each is drawn as it was d / c ago (d to its pivot, which is within
-// a metre of the bob), so the nearer ones lag the farther ones, and moving
-// along the row speeds the swings up ahead of you and slows them behind.
+// A row of pendulums west of the stall: a frame along z with eight equal
+// pendulums swinging across it (in x), all in step in village time. Each is
+// drawn as it was d / c ago (d to its pivot, within a metre and a half of
+// the bob), so they look in step only where the distances to them agree
+// (from far off broadside, or when c is large). Moving along the row you
+// meet the swings ahead of you sooner and those behind later: the ones ahead
+// swing faster, by gamma (1 + beta), the ones behind slower, by
+// gamma (1 - beta), and the row falls out of step the faster you go.
 const PEND_COUNT: u32 = 8u;
 const PEND_X: f32 = -2.2;
 const PEND_TOP: f32 = 3.2;
 const PEND_Z0: f32 = 1.75;
-const PEND_CYCLE: f32 = 60.0;
+const PEND_PERIOD: f32 = 2.4;
 const PEND_AMP: f32 = 0.45;
 
 // The capsule from pa to pb of radius r: its nearest hit before `limit`.
@@ -418,8 +420,8 @@ fn hit_pendulums(ro: vec3<f32>, rd: vec3<f32>, best_in: Hit) -> Hit {
     let c_light = u.gamma.y * u.gamma.z;
     for (var i = 0u; i < PEND_COUNT; i = i + 1u) {
         let pivot = vec3<f32>(PEND_X, PEND_TOP, PEND_Z0 + f32(i));
-        let period = PEND_CYCLE / (20.0 + f32(i));
-        // The length that swings with this period: L = g (T / 2 pi)^2.
+        let period = PEND_PERIOD;
+        // The length that swings with this period: L = g (T / 2 pi)^2, 1.43 m.
         let len = 9.81 * pow(period / 6.2831853, 2.0);
         // The time the light now arriving left it, and its angle then.
         let te = u.eye.w - length(pivot - ro) / c_light;
