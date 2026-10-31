@@ -614,6 +614,29 @@ The builder makes its own temporaries and assignment drops already
 assignment, as Rust does (0.25's own pass leaked it at an arm's value or
 inside an expression).
 
+**Step 7 done (0.26.2).** As scoped above: the implicit defers and their
+placement at the checker's call sites (param_drops, closure_param_drops,
+let_drops, arm_drops, the block insertions of check_block and
+check_for_iter), the temporaries' `__own_tf`/`__own_tp` and their defers
+(a temporary is `{ let __own_tv = e; &__own_tv }`), hold_values, the
+assignment desugaring (assign_drops, byref.vl's records of it),
+finish_drops and the flags, drop_state/assign_read/note_move and the
+walk's defers (DEFS, run_defers), the tools' reads of DEFER_IMPLICIT,
+glue.vl's AST glue (everything but has_glue and the capture flags'
+names), `--places-diff`'s comparison with the own pass (its IR checks
+stay) and `--no-places`. The walk gets its drop events structurally:
+at a scope's exits (its end, an arm's end, `break`, `continue`, the
+body's end for the parameters) each owned local with glue that does not
+borrow is a `W_DROP` write for the view checks (walk.vl drop_bound), as
+the defers were. own.drop_view is reported on its own (report_drop_views,
+from the `Drop` impls param_drops notes). A std `drop` method nothing
+calls, which the glue's calls used to check, is checked when a drop
+first needs it and built late (shim.vl check_lazy_drop, run_places'
+late list). The placeholders also gave the effects and `query
+refs`/`callees` the drops' calls at a check; the IR's drop edges give
+them now, each with the node of the value dropped, so a check builds the
+bodies that may drop (`glue_met`, the types rule) without `--places`.
+
 Nothing of the own pass goes in 0.26.0. About 3,300 lines go in 0.26.1
 (`drops.vl` but its predicates, `glue.vl` moved, the drop recording in
 the walk), and with them the AST lowerings of function bodies in

@@ -1,19 +1,20 @@
 // The places IR (0.26.0, docs/design/places-ir.md): a MIR-like form of
-// every checked function body, built beside the own pass's drops, its
-// drops elaborated per place, checked against the own pass's
-// (`--places-diff`). places/README.md says what is where.
+// every checked function body, its drops placed and elaborated per place
+// (0.26.2: the own pass places none), which both code generators read.
+// places/README.md says what is where.
 //
 // The driver: check_program calls run_places once the bodies are
 // checked (and before the effects), and after_own once the own pass ran.
-// The options (main's arguments, every command that checks):
+// A build builds every body; a check the bodies that may drop, for the
+// effects' drop edges (by_glue). The options (main's arguments, every
+// command that checks):
 //
-//   --places            build the IR (0.26.0, step 2: off by default)
-//   --no-places         do not
+//   --places            nothing more since 0.26.2 (the IR is always built)
 //   --emit-places       print the program's bodies (stdout); =all: std's
 //                       too
 //   --verify-places     check every body (places/verify.vl); a fallback
 //                       is reported with the construct it stopped at
-//   --places-diff       compare the drops with the own pass's
+//   --places-diff       check where each drop runs and its flag (diff.vl)
 //   --keep-places       keep each body (as a build whose code generators
 //                       read the IR does: keep.vl), and print the kept
 //                       ones (--emit-places) loaded back
@@ -43,21 +44,20 @@ use crate::front::modules::within_std;
 use crate::front::own::drops::drops_on;
 use crate::front::types::FN_COUNT;
 use crate::places::build::{BUILT, FAIL_NODE, build_body};
-use crate::places::diff::{diff_begin, record_body, report_count, report_diff, report_moves};
+use crate::places::diff::{diff_begin, record_body, report_count, report_moves};
 use crate::places::elab::elaborate;
 use crate::places::front::{fn_generic, fn_is_extern, fn_module, fn_node};
-use crate::places::ir::{DS_FLAG, DS_KEPT, P_STMTS, SK_DROP, full_place_type};
+use crate::places::ir::{DS_FLAG, DS_KEPT, P_LOCALS, P_STMTS, SK_DROP, full_place_type};
 use crate::places::keep::{KEEP_BODIES, keep_body, load_body};
 use crate::places::print::{buf_fn_name, buf_pos, print_body};
 use crate::places::shim::{
-    build_shim, drop_fn_at, drop_fn_count, make_shim_functions, shim_count, shim_fn, shim_of,
-    shim_type,
+    build_shim, drop_fn_at, drop_fn_count, late_drop, late_drop_count, make_shim_functions,
+    shim_count, shim_fn, shim_of, shim_type,
 };
 use crate::places::verify::{VERIFY_ERRORS, verify_body};
 use crate::std::string::str;
 
 pub static var PLACES_ON: bool = false;
-pub static var PLACES_OFF: bool = false;
 // 0: no; 1: the program's functions; 2: std's too.
 pub static var EMIT_PLACES: i64 = 0;
 pub static var VERIFY_PLACES: bool = false;
@@ -76,8 +76,6 @@ static var RAN: bool = false;
 pub fn places_option(arg: str) -> bool {
     if arg == "--places" {
         PLACES_ON = true;
-    } else if arg == "--no-places" {
-        PLACES_OFF = true;
     } else if arg == "--emit-places" {
         EMIT_PLACES = 1;
     } else if arg == "--emit-places=all" {
@@ -102,10 +100,12 @@ pub fn places_option(arg: str) -> bool {
     true
 }
 
-// Whether the IR is built.
+// Whether one of the IR's options is on (the tools' cache is not used
+// then). The IR is built without one too (run_places): at a check, the
+// bodies that may drop; `--places` asks nothing more since 0.26.2.
 pub fn places_enabled() -> bool {
-    !PLACES_OFF && (PLACES_ON || EMIT_PLACES > 0 || VERIFY_PLACES || PLACES_DIFF
-        || crate::places::keep::KEEP_BODIES)
+    PLACES_ON || EMIT_PLACES > 0 || VERIFY_PLACES || PLACES_DIFF
+        || crate::places::keep::KEEP_BODIES
 }
 
 // Whether function f has a checked body to build: not a generic template,
@@ -179,18 +179,18 @@ fn check_no_glue(f: i64) {
 }
 
 // Whether run_places builds only the bodies that may drop (glue_met): at
-// a check with the IR on that neither keeps nor prints nor verifies every
-// body.
+// a check that neither keeps nor prints nor verifies every body.
 pub fn by_glue() -> bool {
-    places_enabled()
-        && !(crate::places::keep::KEEP_BODIES || VERIFY_PLACES || PLACES_DIFF || EMIT_PLACES > 0)
+    !(crate::places::keep::KEEP_BODIES || VERIFY_PLACES || PLACES_DIFF || EMIT_PLACES > 0)
 }
 
 // check_program, the bodies checked: every body built (and verified,
-// printed, when asked). Not when the program has errors already: it stops
-// before code anyway, and a body that failed is not whole.
+// printed, when asked); at a check, the bodies that may drop (by_glue),
+// for the drop edges the effects take (0.26.2: the own pass gives none
+// since step 7). Not when the program has errors already: it stops before
+// code anyway, and a body that failed is not whole.
 pub fn run_places() {
-    if !places_enabled() || error_count() > 0 {
+    if error_count() > 0 {
         return;
     }
     let t = timer_now();
@@ -203,54 +203,20 @@ pub fn run_places() {
     RAN = true;
     diff_begin();
     // (FN_COUNT grows: a `Drop::drop` instance a drop needs is made here,
-    // shim.vl: drop_fn, and built in turn)
+    // shim.vl: drop_fn, and built in turn; 0.26.2: a std `drop` that
+    // nothing called, checked only now, is built before the functions
+    // after the one that needs it, shim.vl late_drop)
     var f = 0;
-    while f < FN_COUNT {
-        if !wanted(f) {
+    var late = 0;
+    while f < FN_COUNT || late < late_drop_count() {
+        if late < late_drop_count() {
+            place_body(late_drop(late), out);
+            late += 1;
+        } else {
+            crate::places::shim::NEXT_FN = f + 1;
+            place_body(f, out);
             f += 1;
-            continue;
         }
-        if !ALL_BODIES && !crate::front::own::fast::glue_met(f) {
-            // (nothing in it has glue: no drop, no flag, no drop edge to
-            // build at check; a build, --verify-places and --places-diff
-            // build every body)
-            NO_GLUE += 1;
-            if SKIP_CHECK {
-                check_no_glue(f);
-            }
-            f += 1;
-            continue;
-        }
-        if !build_body(f, fn_node(f)) {
-            FALLBACKS += 1;
-            if VERIFY_PLACES {
-                report_fallback(f);
-            }
-            f += 1;
-            continue;
-        }
-        // (not timed apart from the build: a timer read is a system call,
-        // some 30k instructions, as much as a small body costs)
-        elaborate();
-        if drops_on() {
-            record_body(PLACES_DIFF);
-            if crate::places::elab::RUNS_DROPS {
-                record_drop_edges(f);
-            }
-        }
-        if VERIFY_PLACES {
-            verify_body();
-        }
-        if KEEP_BODIES {
-            if crate::places::elab::RUNS_DROPS {
-                ask_shims();
-            }
-            crate::places::keep::mark_ssa();
-            keep_body();
-        } else if printed(f) {
-            print_body(out);
-        }
-        f += 1;
     }
     if KEEP_BODIES && drops_on() {
         // (the shims as functions, before the code generators size their
@@ -286,6 +252,52 @@ pub fn run_places() {
         buf_str(msg, c" problems in the places IR (internal)\n");
         buf_write_fd(msg, STDERR);
         die(c"places.verify failed");
+    }
+}
+
+// Function f's body (run_places), when it has one to build: built,
+// elaborated, recorded, verified, then kept or printed.
+fn place_body(f: i64, out: i64) {
+    if !wanted(f) {
+        return;
+    }
+    if !ALL_BODIES && !crate::front::own::fast::glue_met(f) {
+        // (nothing in it has glue: no drop, no flag, no drop edge to
+        // build at check; a build, --verify-places and --places-diff
+        // build every body)
+        NO_GLUE += 1;
+        if SKIP_CHECK {
+            check_no_glue(f);
+        }
+        return;
+    }
+    if !build_body(f, fn_node(f)) {
+        FALLBACKS += 1;
+        if VERIFY_PLACES {
+            report_fallback(f);
+        }
+        return;
+    }
+    // (not timed apart from the build: a timer read is a system call,
+    // some 30k instructions, as much as a small body costs)
+    elaborate();
+    if drops_on() {
+        record_body(PLACES_DIFF);
+        if crate::places::elab::RUNS_DROPS {
+            record_drop_edges(f);
+        }
+    }
+    if VERIFY_PLACES {
+        verify_body();
+    }
+    if KEEP_BODIES {
+        if crate::places::elab::RUNS_DROPS {
+            ask_shims();
+        }
+        crate::places::keep::mark_ssa();
+        keep_body();
+    } else if printed(f) {
+        print_body(out);
     }
 }
 
@@ -378,8 +390,8 @@ fn report_fallback(f: i64) {
 }
 
 // check_program, after the own pass (in a program it passed): the
-// move-out backstop's errors, then, with --places-diff, the differences
-// between the IR's drops and the own pass's (places/diff.vl).
+// move-out backstop's errors, then, with --places-diff, the count of
+// the drops checked and the differences (places/diff.vl).
 pub fn after_own() {
     if !RAN || error_count() > 0 {
         return;
@@ -388,7 +400,6 @@ pub fn after_own() {
         report_moves();
     }
     if PLACES_DIFF && error_count() == 0 {
-        report_diff();
         report_count();
     }
 }
@@ -397,11 +408,14 @@ pub fn after_own() {
 
 // Per function (FNS index): the drop functions its drops that run (kept,
 // or under a flag) call, through their shims: DE_LIST[DE_AT[f] - 1 ..]
-// [..DE_N[f]] (DE_AT[f] 0: none recorded). Effect inference adds an edge
-// to each (front/effects/infer.vl: node_locals).
+// [..DE_N[f]] (DE_AT[f] 0: none recorded), and DE_NODE the node of the
+// first value dropped by each (the local's, else the drop's; 0 for a
+// shim's). Effect inference adds an edge to each, and names the node as
+// the step that calls it (front/effects/infer.vl: drop_edges).
 static var DE_AT: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var DE_N: Vec<i64, Comp> = Vec::new_in(Comp {});
 static var DE_LIST: Vec<i64, Comp> = Vec::new_in(Comp {});
+static var DE_NODE: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // The drop edges of the body held (function f), recorded.
 fn record_drop_edges(f: i64) {
@@ -416,6 +430,8 @@ fn record_drop_edges(f: i64) {
             continue;
         }
         let t = full_place_type(st.a, st.b);
+        let local = P_LOCALS[st.a].node;
+        let node = if local > 0 { local } else { st.node };
         for i in 0..drop_fn_count(t) {
             let df = drop_fn_at(t, i);
             var seen = false;
@@ -426,6 +442,7 @@ fn record_drop_edges(f: i64) {
             }
             if !seen {
                 DE_LIST.push(df);
+                DE_NODE.push(node);
             }
         }
     }
@@ -445,6 +462,7 @@ fn record_type_edges(f: i64, t: i64) {
     let start = DE_LIST.len() as i64;
     for i in 0..drop_fn_count(t) {
         DE_LIST.push(drop_fn_at(t, i));
+        DE_NODE.push(0);
     }
     if DE_LIST.len() as i64 > start {
         DE_AT[f] = start + 1;
@@ -460,4 +478,9 @@ pub fn drop_edge_count(f: i64) -> i64 {
 // Function f's drop edge i: the function it calls.
 pub fn drop_edge(f: i64, i: i64) -> i64 {
     DE_LIST[DE_AT[f] - 1 + i]
+}
+
+// Function f's drop edge i: the node of the value it drops (0: a shim's).
+pub fn drop_edge_node(f: i64, i: i64) -> i64 {
+    DE_NODE[DE_AT[f] - 1 + i]
 }

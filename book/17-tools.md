@@ -188,7 +188,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Ve
     pairs.truncate(n);
     pairs
 }
-// calls (10)
+// calls (9)
 ...
 // types (6)
 ...

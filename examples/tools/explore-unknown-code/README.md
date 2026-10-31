@@ -193,12 +193,12 @@ crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph, i: i64) ->
 crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap, e: Entry)
 std::Vec::filled_in	<std>:1613:12	method	pub fn filled_in(n: usize, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:131:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
 <std::Vec as Drop>::drop	<std>:436:8	method	fn drop(inout self)
+std::Vec::as_mut_slice	<std>:396:12	method	pub fn as_mut_slice(inout self) -> inout [T]
 std::Vec::as_slice	<std>:390:12	method	pub fn as_slice(self) -> [T]
-// types (9)
+// types (8)
 crate::route::Route	route.vl:17:12	struct	pub struct Route { pub legs: Vec<Leg>, pub total: i64, }
-note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1
+note query.budget: over the budget of 600 tokens, left out: types or uses 7, callers 1
 try: volec query callers quickest
 try: volec query context quickest --budget 1800
 ```
