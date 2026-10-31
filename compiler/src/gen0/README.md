@@ -15,13 +15,12 @@ later ones, one read by the next statement left in the accumulator),
 the blocks in reverse postorder, calls, intrinsics and vectors through
 the AST walk's functions with their operands bound (`gen_expr` of a
 bound node is its IR operand). What stays of the AST walk: those
-functions, the expressions of constant operands and of contract and
-assert conditions (until places-ir.md §8's step 8b), and an atomic
-intrinsic's body.
+functions, a literal's or a name's value (`gen_expr`), and an atomic
+intrinsic's body (0.26.2's step 8b deleted the rest).
 
 | module | |
 |---|---|
-| `gen/` | the driver, and -O0's generator: functions and statements (`mod`), expressions (`expr`), control flow and `match` (`control`), calls (`call`), vectors (`vector`); from the places IR (`places`, 0.26.1) |
+| `gen/` | the driver, and -O0's generator: functions (`mod`), the places IR's statements and terminators (`places`, 0.26.1), literals, names, operators and casts (`expr`), calls (`call`), vectors (`vector`) |
 | `target.vl` | the target interface: the machine model's virtual registers, output helpers, data, run-time checks, dispatch to the instruction set |
 | `arm64.vl` | AArch64 for -O0 (Apple's arm64 ABI, AAPCS64; Mach-O, ELF) |
 | `x86_64.vl` | x86-64 for -O0 (System V; AT&T syntax) |

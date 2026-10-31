@@ -176,9 +176,17 @@ step 8):
   gone and gen0's function walk is an atomic intrinsic's body only;
   `VOLE_LOWER` is gone (from the code cache's key too), and a build
   under `--no-places` is an error. compiler/src's objects are
-  byte-identical before and after, at -O0 and -O2. The AST walks of
-  statements stay while contract and assert conditions are lowered from
-  the AST (step 8b).
+  byte-identical before and after, at -O0 and -O2.
+- A contract's or an assert's failing path from the IR (step 8b), in
+  both generators: its site and its shown values are the IR's operands
+  (`contract_assert_conj_side_effect` passes: a conjunct is evaluated
+  once). Then the AST walks are deleted: statements, blocks and the
+  defers, `if`, the loops, `match` and its patterns, assignments,
+  operators, places, aggregates, variants and slicing, in both
+  generators (2,267 lines net; `middle/lower/matching.vl` and both
+  `control.vl`s gone). What the IR does not lower itself: a literal, a
+  name or a check's site of an operand, and the calls, intrinsics and
+  vector operations it drives with their operands bound.
 - tests/run.sh builds every other case with `--verify-places` (by its
   name's cksum; `VOLE_VERIFY_EVERY=N`: every N-th, 0: none).
 

@@ -103,7 +103,8 @@ the AST as ordinary nodes that both code generators already lower:
    rest.
 
 Both back ends then lower `defer` on every exit (`middle/lower/mod.vl:
-lower_defers`, gen0 the same), so neither has drop logic of its own.
+lower_defers`, gen0 the same; from 0.26.1 the IR's drops, and in 0.26.2
+those two are deleted), so neither has drop logic of its own.
 Temporary lifetime extension is decided by type: a `let` whose
 initializer has a view type keeps that statement's temporaries to the end
 of the block (`drops::after_stmt`, `is_view_type(NODES[init].ty)`).
@@ -963,13 +964,29 @@ expressions hold blocks, `if`s and `match`es (a desugared method call,
   waits for 8b's first part: until then a condition's temporaries are
   dropped by the AST lowering's defers.
 
+  Done in two parts. Part 1 (135b475d): a check's failing path from the
+  IR in both generators (`lower_contract_failure`,
+  `gen_contract_failure`: the site is ops[1], the shown values
+  ops[2..], widened to 64 bits; only the message text is read from the
+  AST); the calls' `CHECK_FN` dispatch to the AST conditions is gone,
+  and `contract_assert_conj_side_effect` passes. Part 2: every constant
+  operand is bound too (all but a check's site, `is_site`), so both
+  dispatchers are cut to a literal, a site and a name (`Ident`), and
+  what that leaves unreachable is deleted: 2,267 lines net in
+  compiler/src, by reachability from the drivers and `query unused`
+  to a fixpoint. compiler/src's -O0 object is byte-identical before
+  and after part 2; at -O2 one function's registers differ
+  (`init_x86`, 32 bytes). Every case passes at -O0 and -O2 with the
+  dispatchers cut.
+
 Left on the AST after 8b, a later release's item (a rewrite, not a
 deletion): the calls and intrinsics the IR path drives through bound AST
-nodes, 2,539 lines (`middle/lower`: `calls.vl` 586, `vector.vl` 372,
-`arch.vl` 347, `atomic.vl` 135; `gen0/gen`: `call.vl` 378, `arch.vl`
-336, `vector.vl` 331, `atomic.vl` 54), to become calls of the IR's
-operands with no AST node; and the constant operands' lowering
-(literals, constants, string ids, RT_SITE values).
+nodes, 2,370 lines after 8b (`middle/lower`: `calls.vl` 511,
+`vector.vl` 372, `arch.vl` 347, `atomic.vl` 135; `gen0/gen`: `call.vl`
+284, `arch.vl` 336, `vector.vl` 331, `atomic.vl` 54), to become calls
+of the IR's operands with no AST node; and the constant operands'
+lowering (literals, constants, string ids, RT_SITE values: `lower_expr`
+and `gen_expr`, cut to those in 8b).
 
 **State, agent A (placesir261a).** Done: R1 (kept bodies) and R2 (drop
 shims) for B; step 2's builder cost (§6, "Measured in 0.26.1"); step 6's

@@ -1,46 +1,38 @@
-// Expressions (gen0): gen_expr dispatches on the node kind and leaves the
-// value in the accumulator. Here: names and addresses (places, indexing),
-// operators and casts, struct, tuple and array literals, enum variants,
-// slicing, and assignment; match, if and loops are in control.vl,
-// vectors in vector.vl, calls in call.vl.
+// Expressions (gen0): gen_expr leaves the value of an operand the
+// places-IR walk did not bind (places.vl) in the accumulator: a literal
+// or a name (0.26.2: the AST walk of the other expressions, of
+// statements and of control flow is gone). Here too: casts, a string's
+// tuple, a function's or a static's address, and the helpers call.vl,
+// vector.vl and places.vl share.
 
 use crate::base::target::X86;
-use crate::front::ast::{NODES, NodeKind, child, defer_loop_depth, field_order};
+use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::ast::NodeKind::{
-    Array, Assign, Binary, Bool, Break, CStr, Call, Cast, Char, Continue, EnumPanic, FieldAccess,
-    Float, For, Ident, If, Index, Int, Loop, Match, Range, Repeat, Return, Str, StructLit, Tuple,
-    TupleField, Unary, Unit, VariantLit, While,
+    Array, Bool, CStr, Char, Float, Ident, Int, Str, StructLit, Tuple, Unit,
 };
 use crate::front::check::{LOCALS, Res, type_error};
 use crate::front::consteval::{const_value, f64_of_bits, float_const, wrap_int};
 use crate::front::contracts::sites::site_of;
-use crate::front::distinct::enum_niche;
 use crate::front::lexer::{Tok, str_at};
 use crate::front::parser::exprs::is_comparison;
 use crate::front::threadlocal::{is_thread_local, tls_addr_fn};
 use crate::front::types::{
-    ENUMS, FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_NEVER, TY_U64, TY_UNIT, TyKind, VARIANTS,
-    field_offset, is_compound, is_float, is_signed, is_slice, is_vector, is_void, struct_field,
-    tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
+    FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_NEVER, TY_U64, TyKind, field_offset, is_compound,
+    is_float, is_signed, is_slice, is_void, struct_field, tuple_offset, type_elem, type_size,
 };
 use crate::gen0::gen::{
-    CUR_FN, RETURN_LABEL, alloc_slot, alloc_slot_for, fn_symbol_prefix, gen_block, gen_defers,
-    gen_return_value, load_from_x0, load_reg_from_frame, pop_second_operand, static_symbol_prefix,
-    store_reg_to_frame, store_to_frame,
+    alloc_slot, alloc_slot_for, fn_symbol_prefix, load_from_x0, load_reg_from_frame,
+    static_symbol_prefix, store_reg_to_frame, store_to_frame,
 };
-use crate::gen0::gen::call::gen_call;
-use crate::gen0::gen::control::{gen_for, gen_if, gen_loop, gen_match, jump_out_to_loop};
-use crate::gen0::gen::vector::{gen_vecop, gen_vector_assign, gen_vector_binary, gen_vector_negate};
 use crate::gen0::target::{
-    DEPTH, PANIC_INDEX_SIGNED, PANIC_INDEX_UNSIGNED, PANIC_RANGE_SIGNED, PANIC_RANGE_UNSIGNED,
-    R_ACC, R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_SECOND, emit_add_imm, emit_bitnot, emit_call,
-    emit_compare, emit_compare_jump, emit_copy, emit_decrement, emit_drop_temps,
-    emit_extern_symbol_addr, emit_float_binary, emit_float_to_float, emit_float_to_int,
-    emit_frame_addr, emit_index_addr, emit_int_binary, emit_int_to_float, emit_jump,
-    emit_jump_if_nonzero, emit_jump_if_zero, emit_jump_unless_zero_result, emit_label, emit_load,
-    emit_load_float, emit_load_imm, emit_load_reg, emit_local_symbol_addr, emit_move_to_second,
-    emit_negate, emit_normalize, emit_not_bool, emit_panic, emit_peek, emit_peek_at, emit_store,
-    emit_store_offset, emit_string_addr, ins, new_label, pop_d, pop_x, push_value, push_x0,
+    PANIC_INDEX_SIGNED, PANIC_INDEX_UNSIGNED, PANIC_RANGE_SIGNED, PANIC_RANGE_UNSIGNED, R_ACC,
+    R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_SECOND, emit_add_imm, emit_bitnot, emit_call, emit_compare,
+    emit_compare_jump, emit_copy, emit_decrement, emit_extern_symbol_addr, emit_float_binary,
+    emit_float_to_float, emit_float_to_int, emit_frame_addr, emit_index_addr, emit_int_binary,
+    emit_int_to_float, emit_jump_unless_zero_result, emit_label, emit_load_float, emit_load_imm,
+    emit_load_reg, emit_local_symbol_addr, emit_move_to_second, emit_negate, emit_normalize,
+    emit_not_bool, emit_panic, emit_store, emit_store_offset, emit_string_addr, ins, new_label,
+    pop_x, push_x0,
 };
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, cond_of_token};
@@ -98,59 +90,6 @@ pub fn gen_expr(cx: sink *FnCtx, n: i64) {
             Str => gen_string(cx, n),
             CStr => emit_string_addr(cx, NODES[n].a),
             Ident => gen_ident(cx, n),
-            Binary => gen_binary(cx, n),
-            Unary => gen_unary(cx, n),
-            Cast => {
-                gen_expr(cx, NODES[n].a);
-                gen_cast(cx, NODES[NODES[n].a].ty, ty);
-            }
-            Call => gen_call(cx, n),
-            Index if NODES[NODES[n].b].kind == Range => gen_slicing(cx, n),
-            Index | FieldAccess | TupleField => {
-                gen_addr(cx, n);
-                load_from_x0(cx, ty);
-            }
-            Tuple | Array | StructLit => gen_aggregate(cx, n),
-            // (0.14: its env, or its function as a value)
-            NodeKind::Closure => gen_expr(cx, NODES[n].y),
-            // (0.15: the Match of `?`, the Block of an f-string)
-            NodeKind::Try | NodeKind::Interp => gen_expr(cx, NODES[n].y),
-            Repeat => gen_repeat(cx, n),
-            NodeKind::Block => gen_block(cx, n),
-            If => gen_if(cx, n),
-            Match => gen_match(cx, n),
-            VariantLit => gen_variant(cx, n),
-            NodeKind::VecOp => gen_vecop(cx, n),
-            Loop | While => gen_loop(cx, n),
-            For => gen_for(cx, n),
-            Assign => gen_assign(cx, n),
-            EnumPanic => {
-                gen_expr(cx, NODES[n].a);
-                emit_panic(cx, NODES[n].x, site_of(n, 0));
-            }
-            Return => {
-                if NODES[n].a != 0 {
-                    gen_expr(cx, NODES[n].a);
-                    gen_defers(cx, 0, NODES[NODES[n].a].ty);
-                    gen_return_value(cx, FNS[CUR_FN].ret);
-                } else {
-                    gen_defers(cx, 0, TY_UNIT);
-                }
-                emit_jump(cx, RETURN_LABEL);
-            }
-            Break => {
-                var ty = TY_UNIT;
-                if NODES[n].b != 0 {
-                    gen_expr(cx, NODES[n].b);
-                    ty = NODES[NODES[n].b].ty;
-                }
-                gen_defers(cx, defer_loop_depth(NODES[n].x), ty);
-                jump_out_to_loop(cx, NODES[n].x, 1);
-            }
-            Continue => {
-                gen_defers(cx, defer_loop_depth(NODES[n].x), TY_UNIT);
-                jump_out_to_loop(cx, NODES[n].x, 0);
-            }
             _ => type_error(n, c"internal error: unexpected node in code generation"),
         }
     }
@@ -207,43 +146,6 @@ pub fn gen_fn_address(cx: sink *FnCtx, f: i64) {
     }
 }
 
-// The accumulator = the address of a place (or of a compound value).
-pub fn gen_addr(cx: sink *FnCtx, n: i64) {
-    unsafe {
-        match NODES[n].kind {
-            Ident if NODES[n].res
-                == Res::Local => emit_frame_addr(cx, R_ACC, LOCALS[NODES[n].y].offset),
-            Ident if NODES[n].res == Res::Static => emit_static_addr(cx, NODES[n].a),
-            Unary if NODES[n].op == Tok::Star => gen_expr(cx, NODES[n].b),
-            FieldAccess => {
-                // The struct's (or slice's) address, or the pointer to the struct.
-                gen_expr(cx, NODES[n].a);
-                emit_add_imm(cx, R_ACC, field_offset_of(n));
-            }
-            TupleField => {
-                let base = NODES[n].a;
-                gen_expr(cx, base);
-                emit_add_imm(cx, R_ACC, tuple_offset(NODES[base].ty, NODES[n].b));
-            }
-            Index => gen_index_addr(cx, n),
-            _ => gen_expr(cx, n),
-        }
-    }
-}
-
-// The offset of the field of NodeKind::FieldAccess n in its base: a struct (also through
-// a pointer), or a slice.
-pub fn field_offset_of(n: i64) -> i64 {
-    let base_ty = NODES[NODES[n].a].ty;
-    if NODES[n].y == 2 {
-        return NODES[n].x * 8;
-    }
-    if NODES[n].y == 1 {
-        return field_offset(TYPES[TYPES[base_ty].a].a, NODES[n].x);
-    }
-    field_offset(TYPES[base_ty].a, NODES[n].x)
-}
-
 pub fn panic_kind(index_ty: i64, range: bool) -> i64 {
     let signed = is_signed(index_ty);
     if range {
@@ -252,94 +154,7 @@ pub fn panic_kind(index_ty: i64, range: bool) -> i64 {
     if signed { PANIC_INDEX_SIGNED } else { PANIC_INDEX_UNSIGNED }
 }
 
-// Whether the pointer `n`, the base of `p[i]` or `p[lo..hi]`, is a place:
-// evaluated to its location first and read only after the index or bounds
-// (as a slice's pointer and length are), so that an index that changes it,
-// a call that grows the table it points to, is seen (0.14).
-pub fn pointer_place(n: i64) -> bool {
-    match NODES[n].kind {
-        Ident => NODES[n].res == Res::Local || NODES[n].res == Res::Static,
-        Unary => NODES[n].op == Tok::Star,
-        FieldAccess | TupleField => true,
-        Index => NODES[NODES[n].b].kind != Range,
-        _ => false,
-    }
-}
-
-fn gen_index_addr(cx: sink *FnCtx, n: i64) {
-    let base = NODES[n].a;
-    let base_ty = NODES[base].ty;
-    let elem_size = type_size(TYPES[base_ty].a);
-    if TYPES[base_ty].kind == TyKind::Ptr && pointer_place(base) {
-        // The pointer's location, the index, then the pointer.
-        gen_addr(cx, base);
-        push_x0(cx);
-        gen_expr(cx, NODES[n].b);
-        pop_x(cx, R_SECOND);
-        emit_load_reg(cx, R_SECOND, R_SECOND);
-        emit_index_addr(cx, elem_size);
-        return;
-    }
-    // A slice's address (its pointer and length are read after the
-    // index), an array's, or a pointer value.
-    gen_expr(cx, base);
-    push_x0(cx);
-    gen_expr(cx, NODES[n].b);
-    if is_slice(base_ty) {
-        // Checked: the index against the slice's length.
-        emit_peek(cx, R_SECOND);
-        emit_add_imm(cx, R_SECOND, 8);
-        emit_load_reg(cx, R_SECOND, R_SECOND);
-        let ok = new_label(cx);
-        emit_compare_jump(cx, Cond::Lt, false, ok);
-        emit_panic(cx, panic_kind(NODES[NODES[n].b].ty, range: false), site_of(n, 0));
-        emit_label(cx, ok);
-        pop_x(cx, R_SECOND);
-        emit_load_reg(cx, R_SECOND, R_SECOND);
-        emit_index_addr(cx, elem_size);
-        return;
-    }
-    if TYPES[base_ty].kind == TyKind::Array {
-        // Checked (0.7): the index against the array's length.
-        emit_load_imm(cx, R_SECOND, TYPES[base_ty].b as u64);
-        let ok = new_label(cx);
-        emit_compare_jump(cx, Cond::Lt, false, ok);
-        emit_panic(cx, panic_kind(NODES[NODES[n].b].ty, range: false), site_of(n, 0));
-        emit_label(cx, ok);
-    }
-    pop_x(cx, R_SECOND);
-    emit_index_addr(cx, elem_size);
-}
-
 // ---- Operators ----
-
-fn gen_binary(cx: sink *FnCtx, n: i64) {
-    let op = NODES[n].op;
-    let lhs = NODES[n].b;
-    let rhs = NODES[n].c;
-    if op == Tok::AmpAmp || op == Tok::PipePipe {
-        let end = new_label(cx);
-        gen_expr(cx, lhs);
-        if op == Tok::AmpAmp {
-            emit_jump_if_zero(cx, end);
-        } else {
-            emit_jump_if_nonzero(cx, end);
-        }
-        gen_expr(cx, rhs);
-        emit_label(cx, end);
-        return;
-    }
-    let operand_ty = NODES[lhs].ty;
-    if is_vector(operand_ty) {
-        gen_vector_binary(cx, op, lhs, rhs, NODES[n].ty);
-        return;
-    }
-    gen_expr(cx, lhs);
-    push_value(cx, operand_ty);
-    gen_expr(cx, rhs);
-    pop_second_operand(cx, operand_ty);
-    gen_operator(cx, op, operand_ty, NODES[n].ty);
-}
 
 // Accumulator = accumulator <op> second operand (the one function -O0's
 // binary operators go through, from either walk).
@@ -350,27 +165,6 @@ pub fn gen_operator(cx: sink *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
         emit_float_binary(cx, op, result_ty);
     } else {
         emit_int_binary(cx, op, result_ty);
-    }
-}
-
-fn gen_unary(cx: sink *FnCtx, n: i64) {
-    let op = NODES[n].op;
-    let operand = NODES[n].b;
-    let ty = NODES[n].ty;
-    if op == Tok::Amp {
-        gen_addr(cx, operand);
-        return;
-    }
-    if op == Tok::Minus && is_vector(ty) {
-        gen_vector_negate(cx, operand, ty);
-        return;
-    }
-    gen_expr(cx, operand);
-    if op == Tok::Minus || op == Tok::Bang || op == Tok::Tilde {
-        gen_unop(cx, op, ty);
-    } else {
-        // Deref: the accumulator is the pointer.
-        load_from_x0(cx, ty);
     }
 }
 
@@ -436,15 +230,6 @@ pub fn gen_aggregate(cx: sink *FnCtx, n: i64) {
     }
 }
 
-// `[value; count]`: the value is evaluated once.
-fn gen_repeat(cx: sink *FnCtx, n: i64) {
-    let ty = NODES[n].ty;
-    let slot = alloc_slot_for(ty);
-    gen_expr(cx, NODES[n].a);
-    gen_repeat_fill(cx, ty, slot);
-    emit_frame_addr(cx, R_ACC, slot);
-}
-
 // (0.26.1) Array slot `slot` of type ty = the accumulator's value (an
 // element's; a compound one's address), in each element.
 pub fn gen_repeat_fill(cx: sink *FnCtx, ty: i64, slot: i64) {
@@ -488,80 +273,6 @@ pub fn gen_repeat_fill(cx: sink *FnCtx, ty: i64, slot: i64) {
 }
 
 // ---- Enums and slices ----
-
-// `E::V(...)`: a fieldless enum's tag, or a new value in a frame slot.
-fn gen_variant(cx: sink *FnCtx, n: i64) {
-    unsafe {
-        let ty = NODES[n].ty;
-        let v = NODES[n].a;
-        let tag = ENUMS[TYPES[ty].a].tag;
-        if !is_compound(ty) {
-            emit_load_imm(cx, R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
-            return;
-        }
-        let slot = alloc_slot_for(ty);
-        // (0.18: the null niche: the pointer, or null)
-        if enum_niche(TYPES[ty].a) {
-            if NODES[n].count == 1 {
-                gen_expr(cx, child(n, 0));
-            } else {
-                emit_load_imm(cx, R_ACC, 0);
-            }
-            store_to_frame(cx, TY_U64, slot);
-            emit_frame_addr(cx, R_ACC, slot);
-            return;
-        }
-        for j in 0..NODES[n].count {
-            let i = field_order(n, j);
-            gen_expr(cx, child(n, i));
-            store_to_frame(cx, variant_field(v, i), slot - variant_field_offset(v, i));
-        }
-        emit_load_imm(cx, R_ACC, wrap_int(VARIANTS[v].discr, tag) as u64);
-        store_to_frame(cx, tag, slot);
-        emit_frame_addr(cx, R_ACC, slot);
-    }
-}
-
-// `a[lo..hi]` (and the other ranges) of an array, a slice or a pointer: a
-// new slice in a frame slot. Arrays and slices are checked: lo <= hi <=
-// the length (lo <= hi + 1 and hi < the length for `..=`).
-fn gen_slicing(cx: sink *FnCtx, n: i64) {
-    let base = NODES[n].a;
-    let base_ty = NODES[base].ty;
-    let range = NODES[n].b;
-    let low = NODES[range].a;
-    let high = NODES[range].b;
-    // The result: the pointer at `slot`, the length at `slot - 8`.
-    let slot = alloc_slot(16, 8);
-    let length = alloc_slot(8, 8);
-    let low_slot = alloc_slot(8, 8);
-    let high_slot = alloc_slot(8, 8);
-    // The base first: a slice's address, a pointer's location (a
-    // place) or value, an array's address; then the bounds; then what
-    // the base holds, so that bounds that change it are seen.
-    let late_pointer = TYPES[base_ty].kind == TyKind::Ptr && pointer_place(base);
-    if late_pointer {
-        gen_addr(cx, base);
-    } else {
-        gen_expr(cx, base);
-    }
-    store_reg_to_frame(cx, R_ACC, slot);
-    var bound_ty = TY_U64;
-    if low != 0 {
-        gen_expr(cx, low);
-        bound_ty = NODES[low].ty;
-    } else {
-        emit_load_imm(cx, R_ACC, 0);
-    }
-    store_reg_to_frame(cx, R_ACC, low_slot);
-    if high != 0 {
-        gen_expr(cx, high);
-        bound_ty = NODES[high].ty;
-        store_reg_to_frame(cx, R_ACC, high_slot);
-    }
-    gen_slice_tail(cx, n, base_ty, late_pointer, high != 0, bound_ty, slot, length, low_slot,
-        high_slot);
-}
 
 // (0.26.1) The rest of a slicing (node n, of a base of type base_ty), its
 // base (a slice's or an array's address, a pointer's value, or with
@@ -633,66 +344,3 @@ pub fn gen_slice_tail(cx: sink *FnCtx, n: i64, base_ty: i64, late_pointer: bool,
 }
 
 // ---- Assignment ----
-
-pub fn arith_op_of_assign(op: Tok) -> Tok {
-    match op {
-        Tok::PlusEq => Tok::Plus,
-        Tok::MinusEq => Tok::Minus,
-        Tok::StarEq => Tok::Star,
-        Tok::SlashEq => Tok::Slash,
-        Tok::PercentEq => Tok::Percent,
-        Tok::AmpEq => Tok::Amp,
-        Tok::PipeEq => Tok::Pipe,
-        Tok::CaretEq => Tok::Caret,
-        Tok::ShlEq => Tok::Shl,
-        _ => Tok::Shr,
-    }
-}
-
-// The right-hand side is evaluated first, then the target's address; a
-// compound assignment then reads the old value.
-fn gen_assign(cx: sink *FnCtx, n: i64) {
-    let op = NODES[n].op;
-    let target = NODES[n].b;
-    let value = NODES[n].c;
-    let ty = NODES[target].ty;
-    gen_expr(cx, value);
-    if op == Tok::Eq {
-        if is_void(ty) {
-            gen_addr(cx, target);
-            return;
-        }
-        // The value (the source's address for compound values) waits on the
-        // stack while the target's address is computed.
-        push_value(cx, ty);
-        gen_addr(cx, target);
-        emit_move_to_second(cx, TY_U64);
-        if is_float(ty) {
-            pop_d(cx, 0);
-        } else {
-            pop_x(cx, R_ACC);
-        }
-        if is_compound(ty) {
-            emit_copy(cx, type_size(ty));
-        } else {
-            emit_store(cx, ty, R_ACC, R_SECOND);
-        }
-        return;
-    }
-    let value_ty = NODES[value].ty;
-    if is_vector(ty) {
-        gen_vector_assign(cx, arith_op_of_assign(op), target, ty);
-        return;
-    }
-    push_value(cx, value_ty);
-    gen_addr(cx, target);
-    push_x0(cx);
-    emit_peek(cx, R_ADDR);
-    emit_load(cx, ty, R_ADDR);
-    emit_peek_at(cx, R_SECOND, 1, is_float(value_ty));
-    gen_operator(cx, arith_op_of_assign(op), ty, ty);
-    pop_x(cx, R_ADDR);
-    emit_store(cx, ty, R_ACC, R_ADDR);
-    emit_drop_temps(cx, 1);
-    DEPTH -= 1;
-}
