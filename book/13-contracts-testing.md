@@ -288,7 +288,7 @@ fn is_sorted(v: [i64]) -> bool {
 fn contains(v: [i64], x: i64) -> bool
     debug requires is_sorted(v) else "contains needs a sorted slice"
 {
-    var lo = 0;
+    var lo: usize = 0;
     var hi = v.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;

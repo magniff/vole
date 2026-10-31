@@ -244,11 +244,11 @@ snippet and tells you its type and its value:
 $ volec try '6 * 7'
 i64 = 42
 $ volec try 'let name = "vole"; name.len()'
-i64 = 4
+usize = 4
 ```
 
 `i64` is a 64-bit integer, the type vole gives a whole number unless
-you ask for another. Keep `volec try` in mind as you read: whenever
+you ask for another; a length is a `usize`, an unsigned one. Keep `volec try` in mind as you read: whenever
 you wonder how something behaves, try it.
 
 ## Asking the compiler

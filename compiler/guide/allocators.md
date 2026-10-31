@@ -125,11 +125,11 @@ fn main() {
 ```
 
 ```vole
-fn longest(words: [[u8]], gpa: Gpa) -> i64 {
+fn longest(words: [[u8]], gpa: Gpa) -> usize {
     arena_scope(gpa, |a| {
-        var lens: Vec<i64, ScopedArena> = Vec::new_in(a);
+        var lens: Vec<usize, ScopedArena> = Vec::new_in(a);
         for w in words { lens.push(w.len()); }
-        lens.iter().max().unwrap_or(0)        // an i64 leaves, the Vec does not
+        lens.iter().max().unwrap_or(0)        // a usize leaves, the Vec does not
     })
 }
 ```
