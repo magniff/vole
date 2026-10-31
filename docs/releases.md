@@ -73,11 +73,12 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.25.5 | `v0.25.5` | 0.25.4 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | no language change: six compiler tables to `Vec` (unsafe 4,365 → 3,425 unjustified); dependent edits in one checked call; the hooks check with the tree's std; transcripts a std change cannot break; `Atomic<T>` bounded (breaking), std's statics safe under threads; zero statics in bss, unused statics dropped, the `volec -o` 10x slowdown fixed; `--time-passes=instructions`, `--vec-stats=FN` |
 | 0.26.0 | `v0.26.0` | 0.25.5 | aarch64-macos | the first step to Rust's surface: the places IR (places, moves, drop flags) at `check` behind `--places`; struct fields private unless `pub` (`field.private`, `fix --only pub`; `#[sealed]` retired); shaders as `embed wgsl` blocks, checked at `check` and in the LSP |
 | 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
+| 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.26.2
 
-Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `impl Trait` arguments and `pub(crate)`; shader parts and the rest of `embed wgsl`. Built and tested on aarch64-macos only.
+`usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.
 
 `where`, `impl Trait`, visibility and format literals (text262; grammar.md, "Items", "Modules", "Formatting"):
 
@@ -137,7 +138,19 @@ Rust's arithmetic and `usize`, Rust's format strings and `String`, `where`, `imp
 - `edit`, `fix`, `fmt` and `undo` write a file reached through a symlink
   through it: the link stays a link.
 
-- `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Lengths and indices stay `i64` for now; indexing takes any integer type.
+- `usize` and `isize` are types of their own, 64 bits, no longer names of `u64` and `i64`: `u8`..`u32` widen to `usize` (and `i8`..`i32` to `isize`), and `usize`/`u64`, `isize`/`i64` convert by `as` or `TryFrom` (new in std and the prelude, with `TryFromIntError`; for every integer type to and from `usize` and `isize`). Indexing takes any integer type.
+- **Breaking:** std's lengths, indices and counts are `usize` (`len()`,
+  `capacity()`, `find`'s position, `Vec`'s and slices' indices), and so is
+  a slice's or an array's `.len()`. `volec fix --only usize` writes the
+  conversions the errors name; the examples, tests/run, the transcripts,
+  the guide and the Book are migrated so. The new warning
+  `num.unsigned-cmp` names a comparison a `usize` cannot fail (`i >= 0`):
+  it found a countdown in bigint that never ended. std's UTF-8 counts,
+  `splitn`/`replacen`'s and the SIMD loads' index stay `i64` until the
+  next std migration.
+- Rust's overflow checks are measured, not on: `$VOLE_PROTO_OVF` builds
+  them (checks at -O0, wrapping at -O1 and up, decision 6 as revised);
+  by default the code is unchanged.
 - Float to integer `as` saturates for every target type, as Rust's: `300.7 as u8 == 255`, `70000.0 as u16 == 65535`, `-1.0 as u64 == 0` (they were 44, 4464 and `u64::MAX`); NaN is 0. The same in constants, the folder, both code generators and x86-64.
 
 Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
