@@ -4,9 +4,10 @@ A MIR-like form of every checked function body (0.26.0; the design is
 [docs/design/places-ir.md](../../../docs/design/places-ir.md)): typed
 locals, places with interned projections, explicit temporaries, borrows as
 rvalues, storage markers, and drops decided per place with drop flags. In
-0.26.0 it is built and elaborated beside the own pass's drops, which are
-still the ones the code generators run; `--places-diff` compares the two.
-From 0.26.1 both code generators read it.
+0.26.0 it was built and elaborated beside the own pass's drops, which
+were still the ones the code generators ran, and `--places-diff` compared
+the two. From 0.26.1 both code generators read it; from 0.26.2 it places
+every drop, the own pass's drop half deleted (places-ir.md §5, step 7).
 
 | file | |
 |---|---|
@@ -14,13 +15,13 @@ From 0.26.1 both code generators read it.
 | `cfg.vl` | predecessors, reverse postorder, immediate dominators of the body held |
 | `print.vl` | `--emit-places`: a body as text, what `// PLACES:` lines match |
 | `verify.vl` | `--verify-places`: the form, the places, the copy rule, `as V` dominance, storage |
-| `build.vl` | the builder: a checked body to the IR, in evaluation order, its temporaries and assignment drops its own (0.26.2), reading the own pass's nodes as what they stand for; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
+| `build.vl` | the builder: a checked body to the IR, in evaluation order, its temporaries and assignment drops its own (0.26.2), reading the own pass's statement temporaries as what they stand for; a construct it does not build makes the body a fallback (`--verify-places` names it; none left in 0.26.0) |
 | `elab.vl` | drop elaboration: move paths, maybe-initialized and maybe-uninitialized (and the variants an enum may hold) over the reverse postorder, each drop kept, removed, under a flag or opened; the flags' writes |
-| `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` |
+| `diff.vl` | what is left for after the own pass: the move-out backstop (`own.move_out`) and `--places-diff` (where each drop runs, its flag) |
 | `keep.vl` | kept bodies (0.26.1, R1): at a build whose code generators read the IR, each elaborated body's six tables copied whole, each of its exact size (`keep_body`), put back into the `P_*` tables (`load_body(f) -> bool`) and freed once generated (`free_body(f)`) |
 | `shim.vl` | drop shims (0.26.1, R2, places-ir.md §3.9): `shim_of(t) -> id` made on demand, `shim_count()`, `build_shim(id)` (a body, `_1: &mut T`, B_FN -1 and B_SHIM id), `shim_fn_symbol(id)` (`$drop.G` and the type mangled) |
 | `front.vl` | what the IR reads of the checker's raw tables, one justified accessor each |
-| `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--no-places`, `--emit-places[=all]`, `--verify-places`, `--places-diff`; `--keep-places` (keep the bodies, print them loaded back) and `--emit-shims` (with `--emit-places`: the shims the printed bodies' drops call, and theirs) |
+| `mod.vl` | the driver (check_program calls `run_places`, then `after_own` after the own pass) and the options: `--places`, `--emit-places[=all]`, `--verify-places`, `--places-diff`; `--keep-places` (keep the bodies, print them loaded back) and `--emit-shims` (with `--emit-places`: the shims the printed bodies' drops call, and theirs) |
 
 In 0.26.0 the IR is built only under `--places` (or `--emit-places`,
 `--verify-places`, `--places-diff`; the tools' cache is not used with
@@ -229,30 +230,41 @@ code generators' agent (0.26.1) sees what moved.
   `--verify-places` checks the lookup for every drop that runs
   (shim_found).
 
-## `--places-diff`: the differences left
+- 0.26.2 (step 7, the drop half of the own pass deleted): the implicit
+  defers (DEFER_IMPLICIT) and their placement at the checker's call sites,
+  the statement temporaries' flags and pointers (`__own_tf`, `__own_tp`,
+  their defers: a temporary is `{ let __own_tv = e; &__own_tv }`), the
+  assignment desugaring, finish_drops and the walk's drop recording, the
+  AST glue (glue.vl's builder), `--no-places`. The builder reads no more
+  of them: the IR places every drop, the old value's at every owned
+  assignment (drops_old). The own walk keeps the statement temporaries'
+  hidden `let`s for its view checks and gets its drop events from the
+  scopes (walk.vl drop_bound: each owned local with glue at its scope's
+  exits, as the defers were); own.drop_view is reported on its own
+  (drops.vl report_drop_views). A std `drop` method nothing calls is
+  checked when a drop first needs it, and built late (shim.vl
+  check_lazy_drop, run_places' late list): the glue's calls checked them
+  before. The effects and the tools took the drops' calls from the
+  placeholders, at `check` too: now a check always builds the bodies that
+  may drop (by_glue, without `--places`, which asks nothing more), and
+  each drop edge carries the node of the value it drops, the step a
+  `--why` names (`'l' at ... calls 'Loud::drop'`, front/effects/infer.vl
+  drop_edges) and the call `query refs`/`callees` list
+  (tools/query/refs.vl collect_refs). A value moved out has no edge (the
+  placeholders gave one).
 
-Over compiler/src (142 locals compared) and every tests/run source
-(30,699 locals), after step 3a: none in compiler/src; 5 in tests/run,
-each where the IR is the more precise of the two (the own pass flags a
-drop the IR proves never runs):
+## `--places-diff`
 
-| case | local | own | IR | why |
-|---|---|---|---|---|
-| sem_own_match_arm_return `f` | `e` | under a flag | removed | `match e { E::A(d) => return .., E::N => {} }`: past the match `e` is `E::N`, which has nothing to drop |
-| sem_own_pat_arms_matrix `m_A_whole`, `m_B_whole`, `m_C_whole`, `m_N_whole` | `e` | under a flag | removed | every arm moves `e` or its owned payload: nothing is left at the end |
-
-Differences of form, not listed by `--places-diff` (diff.vl):
-
-- a flag beside parts apart: the own pass flags a whole enum whose
-  payload moved on some arms; the IR opens it and flags the payload;
-- a local the IR owns with no drop at all: no exit reaches it (every
-  path ends in a `!` call, `worker_exit`, `exit`); the own pass's
-  placeholder never runs either;
-- a statement temporary (`__own_tv`): the own pass drops it under its
-  run-time flag (`__own_tf`), with no placeholder to compare;
-- a requires call's argument `?aN`: the own pass drops the statement
-  temporary it holds, the IR the `?aN` it was moved into;
-- the IR's kept-at-some-exits, removed-at-others is the own pass's flag.
+Until 0.26.2 it compared the IR's drop decisions per local with the own
+pass's. Over compiler/src (142 locals compared) and every tests/run source
+(30,699 locals), after step 3a, the two differed in 5 locals of tests/run
+only, each where the IR is the more precise (the own pass flagged a drop
+the IR proves never runs: sem_own_match_arm_return's `e`,
+sem_own_pat_arms_matrix's four `m_*_whole`). Step 7 deleted the own
+pass's side; what is left are the IR's own checks (diff.vl check_drops,
+0.26.1): a use after a drop and a flag read before it is written, one
+`places.diff:` line each, then `places.diff: N differences in M drops
+checked`.
 
 The move-out backstop reports nothing over the same sources. As the own
 pass's move_out, it does not look at std's modules that move by bits

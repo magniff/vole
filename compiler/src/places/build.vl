@@ -16,15 +16,10 @@
 // `let` that may view it); so is an owned assignment's drop of the old
 // value, `tmp = v; drop(p); p = move tmp` (§3.8, lower_assign_at).
 //
-// The own pass's nodes are read through (§4), until step 7 deletes them:
-// - its implicit defers (DEFER_IMPLICIT) are skipped: the IR places its
-//   own drops;
-// - a statement temporary (drops.vl temp_make: a NODE_TEMP block, its
-//   `__own_tp` and `__own_tf` lets, their defer) is read as the `&e` (or
-//   `e`) it stands for, its prelude skipped (own_temp_block);
-// - the assignment desugaring `{ let __own_new = rhs; { let =o = p; p =
-//   __own_new; } }` is read as the assignment it was made of (byref.vl
-//   own_assign_of), which also says whether it drops until then;
+// The own pass's nodes are read through (§4; 0.26.2: it places no drop):
+// - a statement temporary (drops.vl temp_value: a NODE_TEMP block, `{ let
+//   __own_tv = e; &__own_tv }`) is read as the `&e` it stands for
+//   (own_temp_block);
 // - the checker's transparent blocks (BLOCK_TRANSPARENT: `?`'s and a
 //   requires call's) are no scope: their `let`s are temporaries of the
 //   statement;
@@ -38,8 +33,7 @@
 use crate::base::{IntVec, SYMS, intern_c, len_arg};
 use crate::base::comp::Comp;
 use crate::front::ast::{
-    BLOCK_TRANSPARENT, CLOSURE_MOVE, DEFER_IMPLICIT, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind,
-    child,
+    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
@@ -47,9 +41,7 @@ use crate::front::consteval::wrap_int;
 use crate::front::contracts::expand::is_pre_fn;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::Tok;
-use crate::front::own::byref::{
-    BYREF, MATCH_BYREF, NO_DROP, borrowed_call, indexable_place, own_assign_of, own_assign_old,
-};
+use crate::front::own::byref::{BYREF, MATCH_BYREF, NO_DROP, borrowed_call, indexable_place};
 use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
 use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_referent};
@@ -128,8 +120,6 @@ static var DROPS: bool = false;
 // (its values borrowed copies).
 static var AGG_BORROW: bool = false;
 // The symbols of the own pass's names the builder reads.
-static var SYM_TP: i64 = 0;
-static var SYM_TF: i64 = 0;
 static var SYM_FOR_SEQ: i64 = 0;
 
 // Counts, for --time-passes and the README.
@@ -141,9 +131,7 @@ pub static var STMTS_MADE: i64 = 0;
 pub static var ALL_STORAGE: bool = true;
 
 fn syms() {
-    if SYM_TP == 0 {
-        SYM_TP = intern_c(c"__own_tp");
-        SYM_TF = intern_c(c"__own_tf");
+    if SYM_FOR_SEQ == 0 {
         SYM_FOR_SEQ = intern_c(c"__for_seq");
     }
 }
@@ -748,14 +736,11 @@ fn as_place(e: i64) {
 
 // ---- The own pass's statement temporaries, read as what they stand for ----
 //
-// (0.26.2, until step 7 deletes them) drops.vl's temp_make, temp_value and
-// hold_values put a NODE_TEMP block where a statement temporary is made:
-// `{ let __own_tv = e; __own_tp = &__own_tv; __own_tf = true; &__own_tv }`
-// (or the value itself, `__own_tv`, moved on), with its prelude, the
-// `__own_tp` and `__own_tf` lets and their defer, at its statement. The
-// builder reads the block as `&e` (or `e`) and makes the temporary itself
-// (value_temp, dropped by temp_home's rule); the prelude it skips
-// (own_temp_local, temp_defer, own_flag_write).
+// (0.26.2) drops.vl's temp_value puts a NODE_TEMP block where a statement
+// temporary is made, `{ let __own_tv = e; &__own_tv }`, for the own walk's
+// view checks. The builder reads the block as `&e` (or, a tail of no `&`,
+// `e`) and makes the temporary itself (value_temp, dropped by temp_home's
+// rule).
 
 // Whether b is one: a block flagged NODE_TEMP whose first statement is a
 // `let` (an Ident flagged NODE_TEMP is the checker's, temps.vl).
@@ -845,7 +830,7 @@ fn expr_into(e: i64, dl: i64, dp: i64) {
         return;
     }
     if k == NodeKind::Assign {
-        lower_assign_at(e, false, false);
+        lower_assign_at(e);
         return;
     }
     if k == NodeKind::Return {
@@ -1429,21 +1414,14 @@ fn lower_assign(n: i64) {
 
 // (0.26.2) An assignment: `p = v` on an owned place drops p's old value
 // wherever it stands (a statement, a block's tail, an arm's value, inside
-// an expression: Rust's rule; the own pass drops it only at the first
-// two, and leaked it elsewhere), `tmp = v;
-// drop(p); p = move tmp` (§3.8: the right side, then the place and its
-// index, then the old value's drop, then the write; the right side's
-// temporaries at the statement's end, ea70255c), elaboration deciding the
-// drop (removed where p is moved, under a flag where it may be). `stmt`:
-// in a statement's place; `own`: the own pass desugared it (drops.vl
-// assign_drops), which decides the drop in a statement's place until step
-// 7 deletes it (--places-diff reports where drops_old decides otherwise);
-// elsewhere drops_old decides.
-fn lower_assign_at(n: i64, stmt: bool, own: bool) {
-    if stmt && crate::places::PLACES_DIFF && drops_old(n) != own {
-        crate::places::diff::assign_mismatch(n, own);
-    }
-    if !own && (stmt || !drops_old(n)) {
+// an expression: Rust's rule; 0.25's own pass dropped it only at the first
+// two, and leaked it elsewhere), `tmp = v; drop(p); p = move tmp` (§3.8:
+// the right side, then the place and its index, then the old value's
+// drop, then the write; the right side's temporaries at the statement's
+// end, ea70255c), elaboration deciding the drop (removed where p is moved,
+// under a flag where it may be); drops_old says which.
+fn lower_assign_at(n: i64) {
+    if !drops_old(n) {
         lower_assign(n);
         return;
     }
@@ -1458,16 +1436,15 @@ fn lower_assign_at(n: i64, stmt: bool, own: bool) {
         unsupported(target);
         return;
     }
-    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, own_assign_old(n), 0, 0, n);
+    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, -1, 0, 0, n);
     set_op(OK_MOVE, tmp, 0);
     emit_use(PL_L, PL_P, n);
 }
 
-// Whether assignment n, in a statement's place, drops the old value: `=`
-// (not one the checker or the own pass writes without a drop, NO_DROP) of
-// a value with glue to a place of names, fields, `*` and indexes (not one
-// a call makes, nor a raw access, NODE_RAW), with drops on; as the own
-// pass's assign_drops.
+// Whether assignment n drops the old value: `=` (not one the checker
+// writes without a drop, NO_DROP) of a value with glue to a place of names,
+// fields, `*` and indexes (not one a call makes, nor a raw access,
+// NODE_RAW), with drops on.
 fn drops_old(n: i64) -> bool {
     if !DROPS || NODES[n].op != Tok::Eq || (NODES[n].p & NO_DROP) != 0 {
         return false;
@@ -2196,17 +2173,6 @@ fn lower_block(b: i64, dl: i64, dp: i64) {
         }
         return;
     }
-    let asg = own_assign_of(b);
-    if asg > 0 {
-        // (the own pass's desugaring of an owned assignment: the
-        // assignment it was made of, lower_assign_at)
-        lower_assign_at(asg, true, true);
-        if dl >= 0 && dl != unit_local() && reachable() {
-            set_op(OK_UNIT, 0, TY_UNIT);
-            emit_use(dl, dp, b);
-        }
-        return;
-    }
     // (a transparent desugaring: no scope of its own; its statements', and
     // a desugared expression's, are no temporaries' homes)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
@@ -2227,7 +2193,7 @@ fn lower_block(b: i64, dl: i64, dp: i64) {
     let tail = NODES[b].a;
     if tail != 0 && NODES[tail].kind == NodeKind::Assign {
         if reachable() {
-            lower_assign_at(tail, true, false);
+            lower_assign_at(tail);
         }
         if dl >= 0 && dl != unit_local() && reachable() && !is_void_dest(dl, dp) {
             set_op(OK_UNIT, 0, TY_UNIT);
@@ -2277,11 +2243,7 @@ fn desugared_block(b: i64) -> bool {
 fn lower_stmt(st: i64) {
     let k = NODES[st].kind;
     if k == NodeKind::Defer {
-        // (the own pass's: its drops, its statement temporaries';
-        // the IR places its own)
-        if (NODES[st].p & DEFER_IMPLICIT) != 0 || temp_defer(st) {
-            return;
-        }
+        // (`defer`: error syntax.defer since 0.26.2)
         schedule(EN_DEFER, st);
         return;
     }
@@ -2291,12 +2253,12 @@ fn lower_stmt(st: i64) {
     }
     if k == NodeKind::ExprStmt {
         let e = NODES[st].a;
-        if e == 0 || own_flag_write(e) {
+        if e == 0 {
             return;
         }
         let s = push_scope(SC_STMT, st, STMT_HOME);
         if NODES[e].kind == NodeKind::Assign {
-            lower_assign_at(e, true, false);
+            lower_assign_at(e);
         } else {
             expr_into(e, -1, 0);
         }
@@ -2306,45 +2268,6 @@ fn lower_stmt(st: i64) {
     let s = push_scope(SC_STMT, st, STMT_HOME);
     expr_into(st, -1, 0);
     pop_scope_at(s);
-}
-
-// Whether local l is one of the own pass's temporaries' bookkeeping
-// (`__own_tp`, `__own_tf`), which the IR has no use for.
-fn own_temp_local(l: i64) -> bool {
-    if l < 0 {
-        return false;
-    }
-    let name = crate::places::front::ast_local_name(l);
-    name == SYM_TP || name == SYM_TF
-}
-
-// Whether expression e writes one (`__own_tp = &__own_tv;`, `__own_tf =
-// true;`).
-fn own_flag_write(e: i64) -> bool {
-    if NODES[e].kind != NodeKind::Assign {
-        return false;
-    }
-    let t = NODES[e].b;
-    NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && own_temp_local(NODES[t].y)
-}
-
-// Whether defer d is a statement temporary's (`defer { if __own_tf { .. }
-// }`, drops.vl temp_make): the IR's drop of the temporary is its own.
-fn temp_defer(d: i64) -> bool {
-    let body = NODES[d].a;
-    if body == 0 || NODES[body].kind != NodeKind::Block || NODES[body].count != 1 {
-        return false;
-    }
-    let s = child(body, 0);
-    if NODES[s].kind != NodeKind::ExprStmt {
-        return false;
-    }
-    let f = NODES[s].a;
-    if f == 0 || NODES[f].kind != NodeKind::If {
-        return false;
-    }
-    let c = NODES[f].a;
-    NODES[c].kind == NodeKind::Ident && NODES[c].res == Res::Local && own_temp_local(NODES[c].y)
 }
 
 // Schedules an entry at the end of scope s, below the scopes inside it.
@@ -2363,9 +2286,6 @@ fn lower_let(st: i64) {
         return;
     }
     let pk = NODES[pat].kind;
-    if pk == NodeKind::PatBind && own_temp_local(NODES[pat].x) {
-        return;
-    }
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
     let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);

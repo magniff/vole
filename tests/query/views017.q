@@ -42,10 +42,10 @@ Vec<[u8], ScopedArena>::as_slice	views(self) declared
 Vec<Global, ScopedArena>::as_slice	views(self) declared
 Vec<Decl, ScopedArena>::as_slice	views(self) declared
 Vec<Expr, ScopedArena>::as_slice	views(self) declared
-Vec<Function, ScopedArena>::as_slice	views(self) declared
 Vec<Entry, ScopedArena>::as_slice	views(self) declared
 Vec<Stmt, ScopedArena>::as_slice	views(self) declared
 Vec<Case, ScopedArena>::as_slice	views(self) declared
+Vec<Function, ScopedArena>::as_slice	views(self) declared
 Vec<ScopeEntry, ScopedArena>::as_slice	views(self) declared
 Vec<Val, ScopedArena>::as_slice	views(self) declared
 Vec<Local, ScopedArena>::as_slice	views(self) declared
@@ -54,8 +54,8 @@ Vec<Vec<bool, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<bool, ScopedArena>::as_slice	views(self) declared
 Vec<Nm, ScopedArena>::as_slice	views(self) declared
 Vec<u32, ScopedArena>::as_slice	views(self) declared
-Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<FnInfo, ScopedArena>::as_slice	views(self) declared
+Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared

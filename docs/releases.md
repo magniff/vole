@@ -165,6 +165,33 @@ Shader parts and the rest of `embed wgsl` (embed262; grammar.md,
   and 12 kernels with a `#[repr(wgsl)] GpuParams`, and galaga, galaxy,
   life and nes; so are the guide's 20.
 
+The places IR, the own pass's drops' end (placesir262a; places-ir.md §5,
+step 7; compiler/src/places/README.md):
+
+- The builder makes its own statement temporaries and assignment drops,
+  and drops the old value at every owned assignment, wherever it stands
+  (an arm's value, inside an expression), as Rust does: the own pass's
+  desugaring leaked it there.
+- A contract's and an assert's condition in the IR, a branch per
+  conjunct, each evaluated exactly once on every path, as `&&` does; the
+  failing path's form is `intrinsic contract_check(false, SITE, VALUE..)`
+  and the conjunct.
+- Drop shims are found by the type with its distinct types erased (R11:
+  `Option<(str, Matches)>::unwrap` found none); `--verify-places` checks
+  every drop that runs finds its shim.
+- The own pass's drop half is deleted (step 7): the implicit defers and
+  their placement at the checker's call sites, the statement
+  temporaries' flags and defers, the assignment desugaring,
+  `finish_drops` and the walk's drop recording, glue.vl's AST glue and
+  `--no-places`; the IR places every drop. The own walk keeps the
+  temporaries' hidden `let`s for its view checks and takes its drop
+  events from the scopes; own.drop_view is reported on its own.
+- A check builds the bodies that may drop (no `--places` needed, which
+  now asks nothing more): their drop edges give the effects and `query
+  refs`/`callees` the drops' calls, each named by the value dropped
+  (`'l' at a.vl:13:9 calls 'Loud::drop'`); a value moved out is no
+  longer counted as dropped.
+
 The places IR, the AST lowerings' end (placesir262b; places-ir.md §8
 step 8):
 
