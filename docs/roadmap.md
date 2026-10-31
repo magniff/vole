@@ -2763,3 +2763,19 @@ While this runs, releases are built and tested on aarch64-macos only:
 the Linux rows of the gate are off (their SKIP is expected) and the
 release notes say Linux is untested. The Linux backend and the Vulkan
 hal come back later, as their own work.
+
+### 0.26.0
+
+The release gate (`gate.sh --release --no-linux`, 53:41 wall), on the
+release commit, macOS only (the Linux rows off, as above). Every row
+passed but stress-grow, whose -O0 suite failed `timestamp_query` under a
+load of 117: the long GPU kernel measured shorter than the short one.
+Alone it passed three times, and the row passed alone (`gate.sh --only
+stress-grow`, 12:20). The suite 4505 at -O0 and -O1, 4504 at -O2 (70
+XFAIL; SKIPPED: no spirv-val, and at -O2 a terminal-render time budget
+under the load), threads 8521, incremental 172 series, objcheck 5520
+(and 256 for x86_64-macos), compiler-memcheck 695, examples-checkalloc
+180, fuzz-sem 300 ok, every fuzz and ABI row, cachediff 1370 lines (407
+from the cache), unsafe-audit 3414 unjustified (baseline 3425) and 0 in
+std, chain-diverse, chain-fresh 34 releases. compile-cost against
+v0.25.5: a hello world 1.00x, std 1.01x, check of the compiler 0.99x.
