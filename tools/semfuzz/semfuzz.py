@@ -1781,9 +1781,9 @@ class GenFn:
         out.append('')
 
 
-TYNAME = {'T': 'T', 'V': 'Vec<T>', 'S': 'S', 'E': 'E', 'O': 'Option<T>',
-          'P': 'Pt', 'Str': 'String', 'i': 'i64', 'G': 'G', 'VS': 'Vec<S>'}
-RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T>', 'OI': 'Option<i64>',
+TYNAME = {'T': 'T', 'V': 'Vec<T, Gpa>', 'S': 'S<Gpa>', 'E': 'E', 'O': 'Option<T>',
+          'P': 'Pt', 'Str': 'String<Gpa>', 'i': 'i64', 'G': 'G', 'VS': 'Vec<S<Gpa>, Gpa>'}
+RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T, Gpa>', 'OI': 'Option<i64>',
            'RI': 'Result<i64, i64>'}
 
 
@@ -1823,7 +1823,7 @@ fn mk(v: i64) -> T {
 impl Drop for T {
     fn drop(inout self) {
         LIVE -= 1;
-        println(f"d{self.id}");
+        println("d{}", self.id);
     }
 }
 
@@ -1838,9 +1838,9 @@ impl T {
 }
 
 #[derive(Clone)]
-struct S { t: T, w: Vec<T>, n: i64 }
+struct S<A: Allocator> { t: T, w: Vec<T, A>, n: i64 }
 
-impl S {
+impl S<Gpa> {
     fn tv(self) -> i64 { self.t.v + self.n }
     fn grow(inout self, k: i64) {
         self.w.push(mk(k));
@@ -1862,7 +1862,7 @@ struct Pt { x: i64, y: i64 }
 
 trait Score { fn score(self) -> i64; }
 impl Score for T { fn score(self) -> i64 { self.v * 2 + 1 } }
-impl Score for S { fn score(self) -> i64 { self.t.v + self.w.len() as i64 + self.n } }
+impl Score for S<Gpa> { fn score(self) -> i64 { self.t.v + self.w.len() as i64 + self.n } }
 
 fn total<X: Score>(x: X) -> i64 { x.score() }
 fn gid<X>(x: sink X) -> X { x }
@@ -1875,18 +1875,18 @@ fn pick(a: sink T, b: sink T, c: bool) -> T {
     if c { return a; }
     b
 }
-fn vsig(w: Vec<T>) -> i64 {
+fn vsig(w: Vec<T, Gpa>) -> i64 {
     var h = 7;
     for x in w { h = h * 31 + x.id * 100 + x.v; }
     h
 }
-fn vbump(w: inout Vec<T>, k: i64) {
+fn vbump(w: inout Vec<T, Gpa>, k: i64) {
     for i in 0..w.len() { w[i].v += k; }
 }
-fn veat(w: sink Vec<T>) -> i64 { w.len() as i64 }
-fn keep(w: inout Vec<T>, t: sink T) { w.push(t); }
-fn ssig(s: S) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
-fn vssig(ws: Vec<S>) -> i64 {
+fn veat(w: sink Vec<T, Gpa>) -> i64 { w.len() as i64 }
+fn keep(w: inout Vec<T, Gpa>, t: sink T) { w.push(t); }
+fn ssig(s: S<Gpa>) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
+fn vssig(ws: Vec<S<Gpa>, Gpa>) -> i64 {
     var h = 3;
     for s in ws { h = h * 17 + ssig(s); }
     h
@@ -1920,7 +1920,7 @@ fn psink(p: sink Pt) -> i64 {
     p.x += 1;
     p.x * 10 + p.y
 }
-fn seat(s: sink String) -> i64 { s.len() as i64 }
+fn seat(s: sink String<Gpa>) -> i64 { s.len() as i64 }
 fn apply<F: Fn(i64) -> i64>(f: F, a: i64) -> i64 { f(a) }
 fn twice<F: FnMut(i64)>(f: sink F) { f(1); f(2); }
 fn callf<F: Fn() -> i64>(f: sink F) -> i64 { f() }
@@ -1929,7 +1929,7 @@ fn feed<F: FnMut(sink T) -> i64>(f: sink F, t: sink T) -> i64 { f(t) }
 
 MAIN = '''fn main(gpa: Gpa) -> i32 {
     run(gpa);
-    println(f"live {LIVE}");
+    println("live {LIVE}");
     0
 }
 '''
@@ -2571,7 +2571,7 @@ class Gen:
             n = self.name('w')
             x = self.vexpr(c)
             self.declare(c, n, 'V', True)
-            return Decl(n, True, 'Vec<T>', x)
+            return Decl(n, True, 'Vec<T, Gpa>', x)
         if r < 0.85:
             n = self.name('o')
             x = NewO(self.texpr(c)) if self.chance(0.7) else NewO(None)
@@ -2694,7 +2694,7 @@ class Gen:
         if not vp:
             n = self.name('w')
             self.declare(c, n, 'V', True)
-            return Decl(n, True, 'Vec<T>', NewVec())
+            return Decl(n, True, 'Vec<T, Gpa>', NewVec())
         p = self.r.choice(vp)
         used = {p.root()}
         r = self.r.random()
@@ -3192,7 +3192,7 @@ class Gen:
         if not vss or self.chance(0.3):
             n = self.name('q')
             self.declare(c, n, 'VS', True)
-            return Decl(n, True, 'Vec<S>', NewVec())
+            return Decl(n, True, 'Vec<S<Gpa>, Gpa>', NewVec())
         v = self.r.choice(vss)
         p = PVar(v.name)
         r = self.r.random()

@@ -116,7 +116,7 @@ function var_of(t,    i, n, cands) {
 }
 
 # An expression of type t.
-function expr(t, depth,    k, v, u, op, ops) {
+function expr(t, depth,    k, v, u, op, ops, lhs, amount) {
     if (is_float(t)) return float_expr(t, depth)
     if (depth <= 0) {
         v = var_of(t)
@@ -135,7 +135,15 @@ function expr(t, depth,    k, v, u, op, ops) {
     }
     if (k == 4) {
         u = pick_int_type()
-        return "(" expr(t, depth - 1) " " (rnd(2) ? "<<" : ">>") " " expr(u, depth - 2) ")"
+        lhs = expr(t, depth - 1)
+        op = rnd(2) ? "<<" : ">>"
+        amount = expr(u, depth - 2)
+        # (0.26.3: an amount of the type's bits or more is taken modulo
+        # them, as Rust's, also for 8- and 16-bit operands; the seed takes
+        # it modulo 32 or 64, so for it the amount is kept in range.)
+        if (nonzero)
+            amount = "(" amount " & " (bits(t) - 1) u ")"
+        return "(" lhs " " op " " amount ")"
     }
     if (k == 5) {
         u = pick_type()
