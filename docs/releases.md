@@ -81,6 +81,30 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 The compiler on Rust's overflow checks, its raw-pointer parameters decided, and its statics in context structs. Built and tested on aarch64-macos only.
 
+The compiler on Rust's overflow checks (wrap264):
+
+- compiler/src writes every place it relies on wrapping with
+  `wrapping_*`: its hashes, the division magic numbers, the constant
+  folders, negations of MIN, the C preprocessor's `#if` arithmetic. The
+  census (the compiler built with `--overflow-checks=on` and
+  `VOLE_OVF_CENSUS`, run over the suite and itself) finds none left.
+- The bootstrap's -O0 compilers (chain-diverse's B2 and A2O0) are built
+  and run with the overflow checks on: `--overflow-checks=off` is gone
+  from bootstrap/.
+- A C header's `#if` with `MIN / -1` no longer stops the compiler with a
+  division overflow: the preprocessor's words wrap, as C's do.
+- A program that names nothing else of std has std's integer methods
+  (`wrapping_*`, `checked_*`, `overflowing_*`, `saturating_*`); before,
+  `no method 'wrapping_mul' on type 'i64'`.
+- Of tests/run's 60 cases built with `--overflow-checks=off`, 11 write
+  their PRNGs and checksums with `wrapping_*` and lose the flag; the
+  other 49 keep it, each with a one-line reason (they test wrapping, or
+  the optimizer on wrapping operators).
+- `base::comp::Comp`'s impl is `unsafe impl Allocator`, with its SAFETY
+  comment; the alloc exemption keeps only Comp in statics and fields and
+  the static `WGSL_ARENA`, until the statics work moves them into
+  context structs.
+
 The raw-pointer parameters (rawptr264):
 
 - `volec fix --only rawptr` (`explain fix.rawptr`) decides each `p: *T`

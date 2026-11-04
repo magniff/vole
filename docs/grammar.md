@@ -1738,9 +1738,9 @@ in scope, and a struct holding one made generic over it, then its uses
 `P<Gpa>`. `alloc.static`, `alloc.safe_impl` and `alloc.last` have no
 fix: the value moves into main, the SAFETY comment is the author's,
 `volec refactor signature` moves a parameter. (The compiler's own
-sources keep one exemption until 0.26.4: the allocator `base::comp::Comp`,
-which its statics may hold and whose impl stays safe, and the static
-`WGSL_ARENA`.)
+sources keep one exemption until 0.26.4's statics work: the allocator
+`base::comp::Comp`, which its statics may hold, and the static
+`WGSL_ARENA`. Comp's impl is `unsafe impl` from 0.26.4.)
 
 ### sealed, scoped
 
