@@ -532,7 +532,7 @@ fn run(m: Matches, top: usize, gpa: Gpa) -> Result<(), TallyError> {
     var totals: HashMap<String, i64> = HashMap::new_in(gpa);
     let files = m.values("file");
     if files.len() == 0 {
-        let text = String::from_buf(io::read_stdin_in(gpa)?)?;
+        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
         report::print_counts(tally(text, fold, &totals, gpa), "", words_only);
     }
     var all = Counts { lines: 0, words: 0, bytes: 0 };
@@ -620,10 +620,10 @@ The two `From` impls let `?` convert errors (chapter 6). In `run`, the
 line that reads standard input uses `?` twice:
 
 ```vole skip
-        let text = String::from_buf(io::read_stdin_in(gpa)?)?;
+        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
 ```
 
-`read_stdin_in` can fail with an `IoError`, and `String::from_buf`,
+`read_stdin_in` can fail with an `IoError`, and `String::from_utf8`,
 which checks that the bytes are UTF-8 text, with a `Utf8Error`. `?`
 turns each into a `TallyError` through its `From` impl and returns it.
 (The two kinds of I/O error, `IoError` from reading stdin and
@@ -682,7 +682,7 @@ $ echo $?
 ```
 
 `\377` is a byte that can't appear in UTF-8 text, so the input isn't
-text, and `String::from_buf` said so.
+text, and `String::from_utf8` said so.
 
 ## Step 3: tests
 

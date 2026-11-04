@@ -418,7 +418,7 @@ fn hash(line: str) -> u64 {
 
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_buf(input).unwrap();
+    let text = String::from_utf8(input).unwrap();
     let all: Vec<str> = text.lines().collect_in(gpa);
     let lines = all.as_slice();
     let workers: usize = 3;

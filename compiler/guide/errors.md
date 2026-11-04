@@ -637,7 +637,7 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Vec<u8>)
 ```
 std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `volec

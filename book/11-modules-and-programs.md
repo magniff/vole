@@ -25,7 +25,7 @@ mod report;
 
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_buf(input).unwrap();
+    let text = String::from_utf8(input).unwrap();
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     count::add_words(&counts, text, gpa);
     let top = report::top(counts, 5, gpa);

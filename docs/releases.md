@@ -147,6 +147,12 @@ Text (text263; grammar.md, "Items"):
   `wgsl::target_error`. std's ambient `format(x)` is gone: write
   `format_in(x, gpa)`. A program written for the `Buf` these returned:
   `volec fix --only buf`.
+- std's byte buffers are `Vec<u8, A>` (breaking): `read_stdin_in`
+  (and the ambient `read_stdin`) return one, as Rust's `read_to_end`
+  fills, and so does `gen_buf`; std's snapshot, fuzz, window
+  and SPIR-V buffers moved too. std::gpu::wgsl's text buffers stay `Buf`
+  for 0.26.3: its names are `[u8]` slices of the WGSL source, and they
+  become `str` in 0.27.
 
 ### What's new in 0.26.2
 
