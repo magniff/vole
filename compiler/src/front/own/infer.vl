@@ -39,22 +39,19 @@ use crate::front::effects::infer::{
     ADDRESS_TAKEN, COMPONENT, EDGES, EDGE_START, GRAPH_FNS, GRAPH_SIZE, body_walked, infer_effects,
 };
 use crate::front::modules::within_std;
+use crate::front::own::ctx::OwnCx;
 use crate::front::own::diag::{
     OWN_VIEWS, own_begin, own_bytes, own_discard, own_end, own_flush, own_help, own_str, own_try,
 };
 use crate::front::own::kinds::{K_LEVEL2, is_view_type, owned_base_type, type_kind, view_elem};
-use crate::front::own::state::{
-    CUR, NW, PL_COUNT, PL_FIELD, PL_PARENT, PL_RID, PL_RKIND, POOL, RK_LOCAL, RK_ROOT, RK_STATIC,
-    root_of, slot_of_local, slot_off,
-};
+use crate::front::own::state::{RK_LOCAL, RK_ROOT, RK_STATIC, root_of, slot_of_local, slot_off};
 use crate::front::own::summary::{
     S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, closure_param, decl_of, declared_summary,
     empty_summary, env_param, env_ref_field, floor_summary, has_mut_ref_param, join_summary,
     put_params, ret_parametric, same_summary, store_param, summary_inferred, summary_of,
     summary_store, summary_store_casts, summary_text, top_summary, view_fn,
 };
-use crate::front::own::views::CAPTURES_STORED;
-use crate::front::own::walk::{PARAM_LOCALS, walk_fn};
+use crate::front::own::walk::walk_fn;
 use crate::front::types::{
     ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TYPES, TyKind, VARIANTS, enum_variant, fn_param,
     struct_field, type_elem,
@@ -545,10 +542,10 @@ pub fn col_begin(f: i64, round: i64) {
 }
 
 // The index of parameter local l (walk::PARAM_LOCALS), -1.
-fn param_index(l: i64) -> i64 {
+fn param_index(l: i64, ocx: OwnCx) -> i64 {
     unsafe {
-        for i in 0..PARAM_LOCALS.count {
-            if PARAM_LOCALS.data[i] == l {
+        for i in 0..ocx.param_locals.count {
+            if ocx.param_locals.data[i] == l {
                 return i;
             }
         }
@@ -559,34 +556,34 @@ fn param_index(l: i64) -> i64 {
 // The parameter root place q comes from: parameter * 2 (+ 1 for `*p`), or
 // -1 (a local, a static, a by-value parameter's own storage, or local
 // skip's own roots).
-fn root_param(q: i64, skip: i64) -> i64 {
+fn root_param(q: i64, skip: i64, ocx: OwnCx) -> i64 {
     unsafe {
-        let r = root_of(q);
-        if PL_RKIND[r] == RK_STATIC {
+        let r = root_of(q, ocx);
+        if ocx.pl_rkind[r] == RK_STATIC {
             return -1;
         }
-        let l = PL_RID[r];
+        let l = ocx.pl_rid[r];
         if l < 0 || l == skip || !LOCALS[l].is_param {
             return -1;
         }
-        let i = param_index(l);
+        let i = param_index(l, ocx);
         if i < 0 {
             return -1;
         }
-        if PL_RKIND[r] == RK_ROOT {
-            return i * 2 + PL_FIELD[r];
+        if ocx.pl_rkind[r] == RK_ROOT {
+            return i * 2 + ocx.pl_field[r];
         }
         // (a place reached through a reference parameter: its referent)
         let t = LOCALS[l].ty;
-        if PL_RKIND[r] == RK_LOCAL && t > 0 && TYPES[t].kind == TyKind::Ptr {
+        if ocx.pl_rkind[r] == RK_LOCAL && t > 0 && TYPES[t].kind == TyKind::Ptr {
             if q != r && env_param(COL_F, i) {
                 // (a closure's capture by reference: the captured variable,
                 // what the env's views point into)
                 var a = q;
-                while PL_PARENT[a] != r {
-                    a = PL_PARENT[a];
+                while ocx.pl_parent[a] != r {
+                    a = ocx.pl_parent[a];
                 }
-                if env_ref_field(COL_F, PL_FIELD[a]) {
+                if env_ref_field(COL_F, ocx.pl_field[a]) {
                     return i * 2 + 1;
                 }
             }
@@ -598,13 +595,13 @@ fn root_param(q: i64, skip: i64) -> i64 {
 
 // Masks m[lv] (p) and m[lv + 1] (`*p`) get the parameter roots of bitset
 // words POOL[w..w + NW].
-fn add_roots(w: i64, skip: i64, m: *i64, lv: i64) {
+fn add_roots(w: i64, skip: i64, m: *i64, lv: i64, ocx: OwnCx) {
     unsafe {
-        for q in 0..PL_COUNT {
-            if (POOL[w + (q >> 6)] & (1 << (q & 63))) == 0 {
+        for q in 0..ocx.pl_count {
+            if (ocx.pool[w + (q >> 6)] & (1 << (q & 63))) == 0 {
                 continue;
             }
-            let pr = root_param(q, skip);
+            let pr = root_param(q, skip, ocx);
             if pr < 0 {
                 continue;
             }
@@ -618,7 +615,7 @@ fn add_roots(w: i64, skip: i64, m: *i64, lv: i64) {
 // The function's result at node e (origin v, -1: none): an exit. Its
 // levels' parameter roots go to the result's masks; the `&mut`
 // parameters' slots at this exit, to the stores'.
-pub fn col_result(e: i64, v: i64) {
+pub fn col_result(e: i64, v: i64, ocx: OwnCx) {
     unsafe {
         if !COL_ON {
             return;
@@ -627,24 +624,24 @@ pub fn col_result(e: i64, v: i64) {
         var ret: [i64; 4] = [0, 0, 0, 0];
         var sto: [i64; 4] = [0, 0, 0, 0];
         if v >= 0 && is_view_type(FNS[f].ret) {
-            add_roots(v, -1, &ret[0], S_L1_P);
-            add_roots(v + NW, -1, &ret[0], S_L2_P);
+            add_roots(v, -1, &ret[0], S_L1_P, ocx);
+            add_roots(v + ocx.nw, -1, &ret[0], S_L2_P, ocx);
         }
         var target: [i64; 4] = [-1, -1, -1, -1];
-        for i in 0..PARAM_LOCALS.count {
-            let l = PARAM_LOCALS.data[i];
+        for i in 0..ocx.param_locals.count {
+            let l = ocx.param_locals.data[i];
             if l < 0 || i >= FNS[f].param_count || !store_param(f, i) {
                 continue;
             }
-            let s = slot_of_local(l);
+            let s = slot_of_local(l, ocx);
             if s < 0 {
                 continue;
             }
-            let off = slot_off(CUR, s);
+            let off = slot_off(ocx.cur, s, ocx);
             var m: [i64; 2] = [0, 0];
-            add_roots(off, l, &m[0], 0);
-            add_roots(off + NW, l, &m[0], 0);
-            if i < 63 && (CAPTURES_STORED & (1 << i)) != 0 {
+            add_roots(off, l, &m[0], 0, ocx);
+            add_roots(off + ocx.nw, l, &m[0], 0, ocx);
+            if i < 63 && (ocx.captures_stored & (1 << i)) != 0 {
                 // (a closure stored into: one capture may now view another,
                 // its own roots among what was stored, col_stored)
                 m[0] |= COL_STORED[0];
@@ -687,10 +684,10 @@ pub fn col_callable(f: i64) -> bool {
 
 // The origin v of a callable's result (col_callable): the parameters it
 // views, at any level.
-pub fn col_call(v: i64) {
+pub fn col_call(v: i64, ocx: OwnCx) {
     var m: [i64; 4] = [0, 0, 0, 0];
-    add_roots(v, -1, &m[0], S_L1_P);
-    add_roots(v + NW, -1, &m[0], S_L2_P);
+    add_roots(v, -1, &m[0], S_L1_P, ocx);
+    add_roots(v + ocx.nw, -1, &m[0], S_L2_P, ocx);
     COL_CALL |= m[0] | m[1] | m[2] | m[3];
 }
 
@@ -701,12 +698,12 @@ pub fn col_call(v: i64) {
 static var COL_CAST: i64 = 0;
 
 // The origin v of a cast's argument (calls::on_call).
-pub fn col_cast(v: i64) {
+pub fn col_cast(v: i64, ocx: OwnCx) {
     if !COL_ON {
         return;
     }
     var m: [i64; 2] = [0, 0];
-    add_roots(v, -1, &m[0], 0);
+    add_roots(v, -1, &m[0], 0, ocx);
     COL_CAST |= m[0] | m[1];
 }
 
@@ -715,12 +712,12 @@ pub fn col_cast(v: i64) {
 // col_result otherwise leaves out of a target's stores.
 static var COL_STORED: [i64; 2] = [0, 0];
 
-pub fn col_stored(v: i64) {
+pub fn col_stored(v: i64, ocx: OwnCx) {
     if !COL_ON {
         return;
     }
-    add_roots(v, -1, &COL_STORED[0], 0);
-    add_roots(v + NW, -1, &COL_STORED[0], 0);
+    add_roots(v, -1, &COL_STORED[0], 0, ocx);
+    add_roots(v + ocx.nw, -1, &COL_STORED[0], 0, ocx);
 }
 
 // The why of the bits of m that are new (not in old): (mask base + k,
@@ -1125,11 +1122,11 @@ fn start_summary(f: i64) -> ViewSummary {
 const MAX_ROUNDS: i64 = 24;
 
 // Walks f once, its findings kept; its summary stored.
-fn walk_kept(f: i64, all: bool) {
+fn walk_kept(f: i64, all: bool, ocx: inout OwnCx) {
     if !all && !view_fn(f) {
         return;
     }
-    let s = walk_fn(f, 0);
+    let s = walk_fn(f, 0, &ocx);
     own_flush();
     if view_fn(f) && decl_of(f) == 0 {
         summary_store(f, s);
@@ -1141,7 +1138,7 @@ fn walk_kept(f: i64, all: bool) {
 // --print-views without --values). Rounds of recursive components.
 pub static var SCC_ROUNDS: i64 = 0;
 
-pub fn infer_summaries(all: bool) {
+pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
     unsafe {
         if COMPONENT == 0 as *i64 || GRAPH_FNS > FN_COUNT {
             infer_effects();
@@ -1190,7 +1187,7 @@ pub fn infer_summaries(all: bool) {
                 for k in a..b {
                     let f = order[k];
                     if f < n && walkable(f) {
-                        walk_kept(f, all);
+                        walk_kept(f, all, &ocx);
                     }
                 }
                 continue;
@@ -1210,7 +1207,7 @@ pub fn infer_summaries(all: bool) {
                     if f >= n || !walkable(f) || !view_fn(f) {
                         continue;
                     }
-                    let s = walk_fn(f, round);
+                    let s = walk_fn(f, round, &ocx);
                     own_discard();
                     if decl_of(f) == 0 {
                         let old = crate::front::own::summary::summary_stored(f);
@@ -1243,14 +1240,14 @@ pub fn infer_summaries(all: bool) {
                 if f >= n || !walkable(f) || !all && !view_fn(f) {
                     continue;
                 }
-                walk_fn(f, round);
+                walk_fn(f, round, &ocx);
                 own_flush();
             }
         }
         // (functions made after the effects' graph: none, usually)
         for f in n..FN_COUNT {
             if walkable(f) {
-                walk_kept(f, all);
+                walk_kept(f, all, &ocx);
             }
         }
     }

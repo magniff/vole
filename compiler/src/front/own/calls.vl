@@ -29,6 +29,7 @@ use crate::front::check::{LOCALS, Res};
 use crate::front::closures::{CAPTURE_LIST, CLOSURES, closure_of_type};
 use crate::front::effects::{EFF_GLOBAL, effects_top, fn_effects};
 use crate::front::modules::within_std;
+use crate::front::own::ctx::OwnCx;
 use crate::front::own::diag::{
     OWN_CONFLICT, OWN_ESCAPE, OWN_STATIC, own_begin, own_end, own_help, own_pos, own_soft, own_str,
     own_sym, own_try,
@@ -36,9 +37,8 @@ use crate::front::own::diag::{
 use crate::front::own::infer::{col_callable, deep, holds, summary_at_call};
 use crate::front::own::kinds::{is_view_type, view_elem};
 use crate::front::own::state::{
-    CUR, NSLOT, NW, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW,
-    PK_NONE, PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, PL_PARENT, PL_RID, PL_RKIND,
-    POOL_TOP, RK_LOCAL, RK_STATIC, STATIC_MASK, at, clear_bit, get_bit, is_empty, l1, l2,
+    PE, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW, PK_NONE, PK_RAW,
+    PK_RESERVE, PK_SHARED, PK_VIEW, RK_LOCAL, RK_STATIC, at, clear_bit, get_bit, is_empty, l1, l2,
     local_place, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_or, root_of, set_bit,
     slot_of_local, slot_off,
 };
@@ -46,28 +46,27 @@ use crate::front::own::summary::{
     S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, captures_by_ref, env_param, store_param,
 };
 use crate::front::own::views::{
-    H_CALL, H_GLOBAL, QUIET, close_mask, env_slot, first_place, hidden_place, invalidate,
-    note_env_store, own_place, own_src, seen,
+    H_CALL, H_GLOBAL, close_mask, env_slot, first_place, hidden_place, invalidate, note_env_store,
+    own_place, own_src, seen,
 };
-use crate::front::own::walk::CUR_F;
 use crate::front::threads::is_interior_type;
 use crate::front::types::{FNS, STATICS, STRUCTS, TYPES, TyKind, struct_field};
 
 // Whether origin o holds the mark place (it came in part from a top
 // summary).
-pub fn any_mark(o: i64) -> bool {
+pub fn any_mark(o: i64, ocx: inout OwnCx) -> bool {
     if o < 0 {
         return false;
     }
-    let p = mark_place();
-    p >= 0 && (get_bit(l1(o), p) || get_bit(l2(o), p))
+    let p = mark_place(&ocx);
+    p >= 0 && (get_bit(l1(o, &ocx), p) || get_bit(l2(o, &ocx), p))
 }
 
-fn set_mark(o: i64) {
-    let p = mark_place();
+fn set_mark(o: i64, ocx: inout OwnCx) {
+    let p = mark_place(&ocx);
     if p >= 0 {
-        set_bit(l1(o), p);
-        set_bit(l2(o), p);
+        set_bit(l1(o, &ocx), p);
+        set_bit(l2(o, &ocx), p);
     }
 }
 
@@ -75,28 +74,28 @@ fn is_mut_kind(k: i64) -> bool {
     k == PK_MUT || k == PK_RESERVE || k == PK_MUT_VIEW
 }
 
-fn reporting(n: i64) -> bool {
-    !QUIET && !seen(n)
+fn reporting(n: i64, ocx: inout OwnCx) -> bool {
+    !ocx.quiet && !seen(n, &ocx)
 }
 
 // The slot an argument goes through (a slot local, a place under one, a
 // reference passed on), or -1.
-fn arg_slot(e: i64) -> i64 {
+fn arg_slot(e: i64, ocx: OwnCx) -> i64 {
     let k = NODES[e].kind;
     if k == NodeKind::Ident && NODES[e].res == Res::Local {
-        return crate::front::own::state::slot_of_local(NODES[e].y);
+        return crate::front::own::state::slot_of_local(NODES[e].y, ocx);
     }
     if k == NodeKind::Index || k == NodeKind::Cast || k == NodeKind::FieldAccess
         || k == NodeKind::TupleField {
-        return arg_slot(NODES[e].a);
+        return arg_slot(NODES[e].a, ocx);
     }
     if k == NodeKind::Unary {
-        return arg_slot(NODES[e].b);
+        return arg_slot(NODES[e].b, ocx);
     }
     if k == NodeKind::Call && NODES[e].count > 0 && is_view_type(NODES[e].ty) {
         // (a view a method makes of its receiver: a reborrow of it,
         // views::root_slot)
-        return arg_slot(child(e, 0));
+        return arg_slot(child(e, 0), ocx);
     }
     -1
 }
@@ -129,10 +128,10 @@ fn path_derefs(e: i64) -> bool {
 // closure, called (its env `&g`) or passed (`g`, `&g`, `|| ..`): the
 // captures it changes, its inout accesses (conventions.md §5.4), and no
 // more: its let captures are read.
-fn write_mask(e: i64) -> i64 {
+fn write_mask(e: i64, ocx: inout OwnCx) -> i64 {
     unsafe {
-        let m = new_ov();
-        let t = NODES[PEND.data[e + PE_NODE]].ty;
+        let m = new_ov(&ocx);
+        let t = NODES[ocx.pend.data[e + PE_NODE]].ty;
         let inner = if t > 0 && TYPES[t].kind == TyKind::Ptr { TYPES[t].a } else { t };
         let c = crate::front::closures::closure_of_type(inner) - 1;
         if c >= 0 {
@@ -140,24 +139,24 @@ fn write_mask(e: i64) -> i64 {
             for j in 0..cl.capture_count {
                 if crate::front::closures::CAPTURE_LIST.data[cl.captures + 2 * j + 1] == 2 {
                     let p = crate::front::own::state::local_place(
-                        crate::front::closures::CAPTURE_LIST.data[cl.captures + 2 * j]);
+                        crate::front::closures::CAPTURE_LIST.data[cl.captures + 2 * j], &ocx);
                     if p >= 0 {
-                        or_into(at(m), &crate::front::own::state::PL_MASK[p * NW]);
+                        or_into(at(m, &ocx), &ocx.pl_mask[p * ocx.nw], ocx);
                     }
                 }
             }
-            close_mask(at(m));
+            close_mask(at(m, &ocx), &ocx);
             return m;
         }
-        or_expanded(at(m), l1(PEND.data[e + PE_OV]));
+        or_expanded(at(m, &ocx), l1(ocx.pend.data[e + PE_OV], &ocx), &ocx);
         // (0.25) `&c` of a value holding an inout access (a struct with an
         // inout field): the callee may write through it, what c views at
         // level 2
         if t > 0 && TYPES[t].kind == TyKind::Ptr
-            && crate::front::own::views::holds_mut(TYPES[t].a, 0) {
-            or_expanded(at(m), l2(PEND.data[e + PE_OV]));
+            && crate::front::own::views::holds_mut(TYPES[t].a, 0, &ocx) {
+            or_expanded(at(m, &ocx), l2(ocx.pend.data[e + PE_OV], &ocx), &ocx);
         }
-        close_mask(at(m));
+        close_mask(at(m, &ocx), &ocx);
         m
     }
 }
@@ -167,20 +166,20 @@ fn write_mask(e: i64) -> i64 {
 
 // dst gets the levels argument j (origin o) gives through the summary
 // masks m (S_* indexed).
-fn apply(dst: i64, o: i64, j: i64, m: *i64) {
+fn apply(dst: i64, o: i64, j: i64, m: *i64, ocx: inout OwnCx) {
     unsafe {
         let bit = if j >= 63 { -1 } else { 1 << j };
         if (m[S_L1_P] & bit) != 0 {
-            or_into(l1(dst), l1(o));
+            or_into(l1(dst, &ocx), l1(o, &ocx), ocx);
         }
         if (m[S_L1_STAR] & bit) != 0 {
-            or_into(l1(dst), l2(o));
+            or_into(l1(dst, &ocx), l2(o, &ocx), ocx);
         }
         if (m[S_L2_P] & bit) != 0 {
-            or_into(l2(dst), l2(o));
+            or_into(l2(dst, &ocx), l2(o, &ocx), ocx);
         }
         if (m[S_L2_STAR] & bit) != 0 {
-            or_into(l2(dst), l2(o));
+            or_into(l2(dst, &ocx), l2(o, &ocx), ocx);
         }
     }
 }
@@ -190,27 +189,27 @@ fn apply(dst: i64, o: i64, j: i64, m: *i64) {
 // storage that can hold an E, so a loan on a whole local whose type holds
 // no E, by itself or through its views, is dropped (a `[u8]` made by a
 // closure an iterator over a `Vec<i64>` calls views none of the Vec).
-fn type_narrow(o: i64, rt: i64) {
+fn type_narrow(o: i64, rt: i64, ocx: inout OwnCx) {
     unsafe {
         let e = view_elem(rt);
         if e <= 0 {
             return;
         }
-        for q in 0..PL_COUNT {
-            if PL_PARENT[q] >= 0 || PL_RKIND[q] != RK_LOCAL || !get_bit(l1(o), q) {
+        for q in 0..ocx.pl_count {
+            if ocx.pl_parent[q] >= 0 || ocx.pl_rkind[q] != RK_LOCAL || !get_bit(l1(o, &ocx), q) {
                 continue;
             }
-            if crate::front::own::state::is_cast_root(q) {
+            if crate::front::own::state::is_cast_root(q, ocx) {
                 // (0.25.3: its storage viewed by a cast as another element)
                 continue;
             }
-            let l = PL_RID[q];
+            let l = ocx.pl_rid[q];
             if l < 0 {
                 continue;
             }
             let t = LOCALS[l].ty;
             if t > 0 && !holds(t, e) && !deep(t, e) {
-                clear_bit(l1(o), q);
+                clear_bit(l1(o, &ocx), q);
             }
         }
     }
@@ -222,77 +221,79 @@ fn type_narrow(o: i64, rt: i64) {
 // Call n of function f (-1: through a fn value), its arguments pending at
 // state::PEND[base..] (PE words each); dst (-1: none) gets the result's
 // views.
-pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
+pub fn on_call(n: i64, f: i64, base: i64, dst: i64, ocx: inout OwnCx) {
     unsafe {
-        crate::front::own::observe::at(n);
-        let end = PEND.count;
-        let mark = POOL_TOP;
+        crate::front::own::observe::at(n, &ocx);
+        let end = ocx.pend.count;
+        let mark = ocx.pool_top;
         // (whether a written argument's referent holds views: the stores)
         var stores = false;
         // 1. Arguments a later one changed.
         var e = base;
         while e < end {
-            if PEND.data[e + PE_INVALID] != 0 {
-                changed_by_later(e, n);
+            if ocx.pend.data[e + PE_INVALID] != 0 {
+                changed_by_later(e, n, &ocx);
             }
             e += PE;
         }
         // 2. Arguments overlapping one the call writes; 3. what it writes.
         var a = base;
         while a < end {
-            let ka = PEND.data[a];
-            if is_mut_kind(ka) && PEND.data[a + PE_OV] >= 0 {
-                let m = write_mask(a);
+            let ka = ocx.pend.data[a];
+            if is_mut_kind(ka) && ocx.pend.data[a + PE_OV] >= 0 {
+                let m = write_mask(a, &ocx);
                 var b = base;
                 while b < end {
-                    let kb = PEND.data[b];
-                    let ob = PEND.data[b + PE_OV];
+                    let kb = ocx.pend.data[b];
+                    let ob = ocx.pend.data[b + PE_OV];
                     if b != a && kb != PK_NONE && kb != PK_RAW && ob >= 0
-                        && !(is_mut_kind(kb) && b < a) && ov_hits(ob, at(m)) {
-                        overlap(a, b, m);
-                    } else if b < a && is_mut_kind(kb) && ob >= 0 && ov_hits(ob, at(m)) {
+                        && !(is_mut_kind(kb) && b < a) && ov_hits(ob, at(m, &ocx), &ocx) {
+                        overlap(a, b, m, &ocx);
+                    }
+                    else if b < a && is_mut_kind(kb) && ob >= 0 && ov_hits(ob, at(m, &ocx), &ocx) {
                         // (0.25) an earlier written argument that b's own pass
                         // missed: what a writes reaches what b views (`run(&g,
                         // &n)`, g a closure reading n)
-                        let top = POOL_TOP;
-                        let mb = write_mask(b);
-                        if !ov_hits(PEND.data[a + PE_OV], at(mb)) {
-                            overlap(a, b, m);
+                        let top = ocx.pool_top;
+                        let mb = write_mask(b, &ocx);
+                        if !ov_hits(ocx.pend.data[a + PE_OV], at(mb, &ocx), &ocx) {
+                            overlap(a, b, m, &ocx);
                         }
-                        POOL_TOP = top;
+                        ocx.pool_top = top;
                     }
                     b += PE;
                 }
-                if NSLOT > 0 || base > 0 {
-                    invalidate(at(m), n, H_CALL, arg_slot(PEND.data[a + PE_NODE]), base);
+                if ocx.nslot > 0 || base > 0 {
+                    invalidate(at(m, &ocx), n, H_CALL, arg_slot(ocx.pend.data[a + PE_NODE], ocx),
+                        base, &ocx);
                 }
-                POOL_TOP = m;
-                if !stores && end - base > PE && NSLOT > 0 {
-                    stores = arg_slot(PEND.data[a + PE_NODE]) >= 0;
+                ocx.pool_top = m;
+                if !stores && end - base > PE && ocx.nslot > 0 {
+                    stores = arg_slot(ocx.pend.data[a + PE_NODE], ocx) >= 0;
                 }
             }
             a += PE;
         }
         // (0.25) statics lent to a callee that reaches them by name
-        if end > base && !is_empty(STATIC_MASK) {
-            static_args(n, f, base, end);
+        if end > base && !is_empty(ocx.static_mask, ocx) {
+            static_args(n, f, base, end, &ocx);
         }
         // 5. Statics (before the stores and the result: they do not hold
         // views of statics that the call may have changed).
-        if (NSLOT > 0 || base > 0) && !is_empty(STATIC_MASK) {
+        if (ocx.nslot > 0 || base > 0) && !is_empty(ocx.static_mask, ocx) {
             let eff = if f >= 0 { fn_effects(f) } else { effects_top() };
             if (eff.bits & EFF_GLOBAL) != 0 {
-                global_call(n, base);
+                global_call(n, base, &ocx);
             }
         }
         // (0.25) A closure given to the call (or called: its env) may
         // keep anything the other arguments view in what it captures by
         // reference, whatever the summary says (closure_stores)
-        if NSLOT > 0 && end > base {
+        if ocx.nslot > 0 && end > base {
             var c = base;
             while c < end {
-                if closure_arg(PEND.data[c + PE_NODE]) && PEND.data[c + PE_OV] >= 0 {
-                    closure_stores(c, base, end);
+                if closure_arg(ocx.pend.data[c + PE_NODE]) && ocx.pend.data[c + PE_OV] >= 0 {
+                    closure_stores(c, base, end, &ocx);
                 }
                 c += PE;
             }
@@ -303,40 +304,40 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
         // receiver's, a view of all the receiver views
         if dst >= 0 && end > base && !is_view_type(rt)
             && crate::front::own::byref::borrowed_call(n) {
-            deep_into(dst, PEND.data[base + PE_OV]);
+            deep_into(dst, ocx.pend.data[base + PE_OV], &ocx);
         }
         let result = dst >= 0 && end > base && is_view_type(rt);
         // (a closure's captures written: its env given to its function, a
         // closure given to a function that calls it; store_captures)
         var captures = false;
-        if f >= 0 && NSLOT > 0 {
+        if f >= 0 && ocx.nslot > 0 {
             var a1 = base;
             var j1 = 0;
             while a1 < end {
-                if closure_target(f, j1, PEND.data[a1 + PE_NODE]) {
+                if closure_target(f, j1, ocx.pend.data[a1 + PE_NODE]) {
                     captures = true;
                 }
                 a1 += PE;
                 j1 += 1;
             }
         }
-        if f >= 0 && within_std(FNS[f].module) && NSLOT > 0 {
-            interior_stores(base, end);
+        if f >= 0 && within_std(FNS[f].module) && ocx.nslot > 0 {
+            interior_stores(base, end, &ocx);
         }
         if !stores && !result && !captures {
             return;
         }
         let s = summary_at_call(n, f);
-        if FNS[CUR_F].tmpl != 0 && within_std(FNS[CUR_F].module)
+        if FNS[ocx.cur_f].tmpl != 0 && within_std(FNS[ocx.cur_f].module)
             && (f < 0 || !within_std(FNS[f].module)) {
-            lent_escape(n, f, base, end, s);
+            lent_escape(n, f, base, end, s, &ocx);
         }
         if captures && !s.top {
             var a3 = base;
             var j3 = 0;
             while a3 < end {
-                if closure_target(f, j3, PEND.data[a3 + PE_NODE]) {
-                    store_captures(a3, base, end, s.sto);
+                if closure_target(f, j3, ocx.pend.data[a3 + PE_NODE]) {
+                    store_captures(a3, base, end, s.sto, &ocx);
                 }
                 a3 += PE;
                 j3 += 1;
@@ -348,64 +349,64 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
         if stores && !(s.top && f >= 0 && within_std(FNS[f].module)) {
             var a2 = base;
             while a2 < end {
-                if is_mut_kind(PEND.data[a2]) {
-                    store(a2, base, end, s.sto, s.top);
+                if is_mut_kind(ocx.pend.data[a2]) {
+                    store(a2, base, end, s.sto, s.top, &ocx);
                 }
                 a2 += PE;
             }
         }
-        POOL_TOP = mark;
+        ocx.pool_top = mark;
         // 6. The result.
         if result {
             // (a callable result in a generic body: what it views is kept
             // apart for the parametric result, infer::col_call)
             let callable = col_callable(f);
-            let into = new_ov();
+            let into = new_ov(&ocx);
             var b = base;
             var j = 0;
             while b < end {
-                let o = PEND.data[b + PE_OV];
-                if o >= 0 && PEND.data[b] != PK_NONE {
-                    apply(into, o, j, &s.ret[0]);
+                let o = ocx.pend.data[b + PE_OV];
+                if o >= 0 && ocx.pend.data[b] != PK_NONE {
+                    apply(into, o, j, &s.ret[0], &ocx);
                 }
                 b += PE;
                 j += 1;
             }
-            type_narrow(into, rt);
+            type_narrow(into, rt, &ocx);
             if callable {
-                crate::front::own::infer::col_call(into);
+                crate::front::own::infer::col_call(into, ocx);
             }
-            or_into(l1(dst), l1(into));
-            or_into(l2(dst), l2(into));
-            POOL_TOP = into;
-            if s.top && !is_empty(l1(dst)) {
-                set_mark(dst);
+            or_into(l1(dst, &ocx), l1(into, &ocx), ocx);
+            or_into(l2(dst, &ocx), l2(into, &ocx), ocx);
+            ocx.pool_top = into;
+            if s.top && !is_empty(l1(dst, &ocx), ocx) {
+                set_mark(dst, &ocx);
             }
             // (0.25) and what a closure among the arguments views, at any
             // depth: its captures (a closure called, its env); a declared
             // summary (#[views], checked against the body) says it all
             var c = base;
             while c < end && !s.declared {
-                let cn = PEND.data[c + PE_NODE];
-                let co = PEND.data[c + PE_OV];
+                let cn = ocx.pend.data[c + PE_NODE];
+                let co = ocx.pend.data[c + PE_OV];
                 if closure_arg(cn) && co >= 0 {
                     if NODES[cn].ty > 0 && TYPES[NODES[cn].ty].kind == TyKind::Ptr {
                         // (an env, `&c`: its level 1 is the loan on c, not
                         // what the closure gives; its captures are level 2)
-                        or_into(l1(dst), l2(co));
-                        or_into(l2(dst), l2(co));
+                        or_into(l1(dst, &ocx), l2(co, &ocx), ocx);
+                        or_into(l2(dst, &ocx), l2(co, &ocx), ocx);
                     } else {
                         // (its captures' loans, at level 1 only: the type
                         // filter below drops those that cannot hold the
                         // result's views)
-                        or_into(l1(dst), l1(co));
-                        or_into(l1(dst), l2(co));
-                        or_into(l2(dst), l2(co));
+                        or_into(l1(dst, &ocx), l1(co, &ocx), ocx);
+                        or_into(l1(dst, &ocx), l2(co, &ocx), ocx);
+                        or_into(l2(dst, &ocx), l2(co, &ocx), ocx);
                     }
                 }
                 c += PE;
             }
-            filter_places(dst, rt);
+            filter_places(dst, rt, &ocx);
             // (0.25.3) a cast (summary::cast_mask): the loans of the
             // arguments it views as another element type, past the filter
             let cast = if f >= 0 { crate::front::own::summary::cast_mask(f, rt) } else { 0 };
@@ -413,12 +414,12 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
                 var b2 = base;
                 var j2 = 0;
                 while b2 < end {
-                    let o = PEND.data[b2 + PE_OV];
+                    let o = ocx.pend.data[b2 + PE_OV];
                     let bit = if j2 >= 63 { -1 } else { 1 << j2 };
-                    if (cast & bit) != 0 && o >= 0 && PEND.data[b2] != PK_NONE {
-                        or_into(l1(dst), l1(o));
-                        crate::front::own::infer::col_cast(o);
-                        crate::front::own::state::mark_cast_roots(l1(o));
+                    if (cast & bit) != 0 && o >= 0 && ocx.pend.data[b2] != PK_NONE {
+                        or_into(l1(dst, &ocx), l1(o, &ocx), ocx);
+                        crate::front::own::infer::col_cast(o, ocx);
+                        crate::front::own::state::mark_cast_roots(l1(o, &ocx), &ocx);
                     }
                     b2 += PE;
                     j2 += 1;
@@ -433,39 +434,39 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
 // hold an E, so a loan on a local whose own storage cannot (`order:
 // Vec<i64>` for a Vec<[u8]> result) is dropped. Paths through a reference
 // (DEREF), statics and the parameters' roots are kept.
-fn filter_places(dst: i64, rt: i64) {
+fn filter_places(dst: i64, rt: i64, ocx: inout OwnCx) {
     unsafe {
         let e = crate::front::own::kinds::view_elem(rt);
         if e <= 0 || dst < 0 {
             return;
         }
-        for q in 0..PL_COUNT {
-            if !get_bit(l1(dst), q) {
+        for q in 0..ocx.pl_count {
+            if !get_bit(l1(dst, &ocx), q) {
                 continue;
             }
             var through = false;
             var a = q;
             while a >= 0 {
-                if crate::front::own::state::is_deref_place(a) {
+                if crate::front::own::state::is_deref_place(a, ocx) {
                     through = true;
                 }
-                a = crate::front::own::state::PL_PARENT[a];
+                a = ocx.pl_parent[a];
             }
-            let r = root_of(q);
-            if crate::front::own::state::is_cast_root(r) {
+            let r = root_of(q, ocx);
+            if crate::front::own::state::is_cast_root(r, ocx) {
                 // (0.25.3: its storage viewed by a cast as another element)
                 continue;
             }
-            let rk = crate::front::own::state::PL_RKIND[r];
+            let rk = ocx.pl_rkind[r];
             if through || rk != crate::front::own::state::RK_LOCAL
                 && rk != crate::front::own::state::RK_TEMP {
                 continue;
             }
-            let rid = crate::front::own::state::PL_RID[r];
+            let rid = ocx.pl_rid[r];
             let t = if rk == crate::front::own::state::RK_TEMP { NODES[rid].ty }
                 else { crate::front::check::LOCALS[rid].ty };
             if t > 0 && TYPES[t].kind != TyKind::Ptr && !crate::front::own::infer::holds(t, e) {
-                clear_bit(l1(dst), q);
+                clear_bit(l1(dst, &ocx), q);
             }
         }
     }
@@ -487,14 +488,14 @@ fn closure_type(t0: i64) -> bool {
 }
 
 // (0.25) dst gets, at both levels, everything origin o views at any depth.
-pub fn deep_into(dst: i64, o: i64) {
+pub fn deep_into(dst: i64, o: i64, ocx: inout OwnCx) {
     if dst < 0 || o < 0 {
         return;
     }
-    or_into(l1(dst), l1(o));
-    or_into(l1(dst), l2(o));
-    or_into(l2(dst), l1(o));
-    or_into(l2(dst), l2(o));
+    or_into(l1(dst, &ocx), l1(o, &ocx), ocx);
+    or_into(l1(dst, &ocx), l2(o, &ocx), ocx);
+    or_into(l2(dst, &ocx), l1(o, &ocx), ocx);
+    or_into(l2(dst, &ocx), l2(o, &ocx), ocx);
 }
 
 // (0.25) Pending closure c (an argument, or the env of the closure called)
@@ -502,66 +503,66 @@ pub fn deep_into(dst: i64, o: i64) {
 // reference (the places at its level 1): no summary says what its body
 // does with them, so each of those locals' slots gets all of it, at both
 // levels, minus loans on the local itself.
-fn closure_stores(c: i64, base: i64, end: i64) {
+fn closure_stores(c: i64, base: i64, end: i64, ocx: inout OwnCx) {
     unsafe {
-        let oc = PEND.data[c + PE_OV];
-        let u = new_ov();
+        let oc = ocx.pend.data[c + PE_OV];
+        let u = new_ov(&ocx);
         var b = base;
         while b < end {
-            let o = PEND.data[b + PE_OV];
-            if b != c && o >= 0 && PEND.data[b] != PK_NONE {
-                deep_into(u, o);
+            let o = ocx.pend.data[b + PE_OV];
+            if b != c && o >= 0 && ocx.pend.data[b] != PK_NONE {
+                deep_into(u, o, &ocx);
             }
             b += PE;
         }
         // (the env of a closure called, `&c`: its captures are at level 2,
         // level 1 is the loan on c)
-        let at_ty = NODES[PEND.data[c + PE_NODE]].ty;
+        let at_ty = NODES[ocx.pend.data[c + PE_NODE]].ty;
         let env = at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr;
-        let caps = if env { l2(oc) } else { l1(oc) };
+        let caps = if env { l2(oc, &ocx) } else { l1(oc, &ocx) };
         // and what the closure itself views: it may store one capture into
         // another (`|i| out.push(s)`)
         if env {
-            or_into(l1(u), l2(oc));
-            or_into(l2(u), l2(oc));
+            or_into(l1(u, &ocx), l2(oc, &ocx), ocx);
+            or_into(l2(u, &ocx), l2(oc, &ocx), ocx);
         } else {
-            deep_into(u, oc);
+            deep_into(u, oc, &ocx);
         }
-        if is_empty(l1(u)) {
-            POOL_TOP = u;
+        if is_empty(l1(u, &ocx), ocx) {
+            ocx.pool_top = u;
             return;
         }
-        for p in 0..PL_COUNT {
-            if !get_bit(caps, p) || root_of(p) != p {
+        for p in 0..ocx.pl_count {
+            if !get_bit(caps, p) || root_of(p, ocx) != p {
                 continue;
             }
-            let s = crate::front::own::state::slot_of_place(p);
+            let s = crate::front::own::state::slot_of_place(p, ocx);
             if s < 0 || closure_type(crate::front::check::LOCALS[
-                crate::front::own::state::SLOT_LOCAL.data[s]].ty) {
+                ocx.slot_local.data[s]].ty) {
                 continue;
             }
-            let t = new_ov();
-            ov_or(t, u);
-            for q in 0..PL_COUNT {
-                if root_of(q) == p {
-                    clear_bit(l1(t), q);
-                    clear_bit(l2(t), q);
+            let t = new_ov(&ocx);
+            ov_or(t, u, &ocx);
+            for q in 0..ocx.pl_count {
+                if root_of(q, ocx) == p {
+                    clear_bit(l1(t, &ocx), q);
+                    clear_bit(l2(t, &ocx), q);
                 }
             }
-            crate::front::own::views::store_deep(s, t);
-            crate::front::own::views::store_through_loans(s, t, 0);
-            POOL_TOP = t;
+            crate::front::own::views::store_deep(s, t, &ocx);
+            crate::front::own::views::store_through_loans(s, t, 0, &ocx);
+            ocx.pool_top = t;
         }
-        POOL_TOP = u;
+        ocx.pool_top = u;
     }
 }
 
 // Pending entry a (written by the call) stores the other arguments' views
 // as the summary's stores say (sto, top: a top summary).
-fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
+fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool, ocx: inout OwnCx) {
     unsafe {
-        let arg = PEND.data[a + PE_NODE];
-        let ts = arg_slot(arg);
+        let arg = ocx.pend.data[a + PE_NODE];
+        let ts = arg_slot(arg, ocx);
         if ts < 0 {
             return;
         }
@@ -571,56 +572,56 @@ fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
         // `&s` of a slice variable, which may be replaced), what is stored
         // goes into its elements: a `[(i64, i64)]` sorted with a closure
         // holds no views
-        if PEND.data[a] == PK_MUT_VIEW && rt > 0 && TYPES[rt].kind == TyKind::Slice {
+        if ocx.pend.data[a] == PK_MUT_VIEW && rt > 0 && TYPES[rt].kind == TyKind::Slice {
             rt = TYPES[rt].a;
         }
         if rt <= 0 || !is_view_type(rt) {
             return;
         }
-        let tmp = new_ov();
+        let tmp = new_ov(&ocx);
         var b = base;
         var j = 0;
         while b < end {
-            let o = PEND.data[b + PE_OV];
-            if b != a && o >= 0 && PEND.data[b] != PK_NONE {
-                apply(tmp, o, j, &sto[0]);
+            let o = ocx.pend.data[b + PE_OV];
+            if b != a && o >= 0 && ocx.pend.data[b] != PK_NONE {
+                apply(tmp, o, j, &sto[0], &ocx);
             }
             b += PE;
             j += 1;
         }
-        if is_empty(l1(tmp)) && is_empty(l2(tmp)) {
-            POOL_TOP = tmp;
+        if is_empty(l1(tmp, &ocx), ocx) && is_empty(l2(tmp, &ocx), ocx) {
+            ocx.pool_top = tmp;
             return;
         }
         // (minus loans on the referent itself)
-        let pa = PEND.data[a + PE_PLACE];
+        let pa = ocx.pend.data[a + PE_PLACE];
         if pa >= 0 {
-            let r = root_of(pa);
-            for q in 0..PL_COUNT {
-                if root_of(q) == r {
-                    clear_bit(l1(tmp), q);
-                    clear_bit(l2(tmp), q);
+            let r = root_of(pa, ocx);
+            for q in 0..ocx.pl_count {
+                if root_of(q, ocx) == r {
+                    clear_bit(l1(tmp, &ocx), q);
+                    clear_bit(l2(tmp, &ocx), q);
                 }
             }
         }
         if top {
-            set_mark(tmp);
+            set_mark(tmp, &ocx);
         }
-        crate::front::own::views::note_env_store(ts, tmp);
-        let off = slot_off(CUR, ts);
-        let through = NODES[arg].kind == NodeKind::Ident || PEND.data[a] == PK_MUT_VIEW
+        crate::front::own::views::note_env_store(ts, tmp, &ocx);
+        let off = slot_off(ocx.cur, ts, ocx);
+        let through = NODES[arg].kind == NodeKind::Ident || ocx.pend.data[a] == PK_MUT_VIEW
             || NODES[arg].kind == NodeKind::Unary && path_derefs(NODES[arg].b);
         if through {
             // (what the slot points to now holds them)
-            or_into(l2(off), l1(tmp));
-            or_into(l2(off), l2(tmp));
+            or_into(l2(off, &ocx), l1(tmp, &ocx), ocx);
+            or_into(l2(off, &ocx), l2(tmp, &ocx), ocx);
         } else {
-            or_into(l1(off), l1(tmp));
-            or_into(l2(off), l2(tmp));
+            or_into(l1(off, &ocx), l1(tmp, &ocx), ocx);
+            or_into(l2(off, &ocx), l2(tmp, &ocx), ocx);
         }
         // (0.25) and what the slot holds loans on: `r = &mut v; r.push(w)`
-        crate::front::own::views::store_through_loans(ts, tmp, 0);
-        POOL_TOP = tmp;
+        crate::front::own::views::store_through_loans(ts, tmp, 0, &ocx);
+        ocx.pool_top = tmp;
     }
 }
 
@@ -647,9 +648,9 @@ fn closure_target(f: i64, j: i64, arg: i64) -> bool {
 // the variables it captures by reference: their slots when they are this
 // function's; else this closure's env, when it captures them too (a
 // nested closure); and the closure's own slot.
-fn store_captures(a: i64, base: i64, end: i64, sto: [i64; 4]) {
+fn store_captures(a: i64, base: i64, end: i64, sto: [i64; 4], ocx: inout OwnCx) {
     unsafe {
-        let arg = PEND.data[a + PE_NODE];
+        let arg = ocx.pend.data[a + PE_NODE];
         var t = NODES[arg].ty;
         if t > 0 && TYPES[t].kind == TyKind::Ptr {
             t = TYPES[t].a;
@@ -658,81 +659,81 @@ fn store_captures(a: i64, base: i64, end: i64, sto: [i64; 4]) {
         if c < 0 {
             return;
         }
-        let tmp = new_ov();
+        let tmp = new_ov(&ocx);
         var b = base;
         var j = 0;
         while b < end {
-            let o = PEND.data[b + PE_OV];
-            if o >= 0 && PEND.data[b] != PK_NONE {
-                apply(tmp, o, j, &sto[0]);
+            let o = ocx.pend.data[b + PE_OV];
+            if o >= 0 && ocx.pend.data[b] != PK_NONE {
+                apply(tmp, o, j, &sto[0], &ocx);
             }
             b += PE;
             j += 1;
         }
-        if is_empty(l1(tmp)) && is_empty(l2(tmp)) {
-            POOL_TOP = tmp;
+        if is_empty(l1(tmp, &ocx), ocx) && is_empty(l2(tmp, &ocx), ocx) {
+            ocx.pool_top = tmp;
             return;
         }
-        let env = env_slot();
+        let env = env_slot(ocx);
         for k in 0..CLOSURES[c].capture_count {
             if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * k + 1] == 0 {
                 continue;
             }
             let l = CAPTURE_LIST.data[CLOSURES[c].captures + 2 * k];
-            let s = slot_of_local(l);
+            let s = slot_of_local(l, ocx);
             if s >= 0 {
-                let off = slot_off(CUR, s);
-                let r = local_place(l);
-                let m = new_ov();
-                or_into(l1(m), l1(tmp));
-                or_into(l2(m), l2(tmp));
+                let off = slot_off(ocx.cur, s, ocx);
+                let r = local_place(l, &ocx);
+                let m = new_ov(&ocx);
+                or_into(l1(m, &ocx), l1(tmp, &ocx), ocx);
+                or_into(l2(m, &ocx), l2(tmp, &ocx), ocx);
                 // (minus loans on the variable itself)
                 if r >= 0 {
-                    for q in 0..PL_COUNT {
-                        if root_of(q) == r {
-                            clear_bit(l1(m), q);
-                            clear_bit(l2(m), q);
+                    for q in 0..ocx.pl_count {
+                        if root_of(q, ocx) == r {
+                            clear_bit(l1(m, &ocx), q);
+                            clear_bit(l2(m, &ocx), q);
                         }
                     }
                 }
-                or_into(l1(off), l1(m));
-                or_into(l2(off), l2(m));
-                POOL_TOP = m;
-            } else if env >= 0 && captures_by_ref(CUR_F, l) {
-                let off = slot_off(CUR, env);
-                note_env_store(env, tmp);
-                or_into(l2(off), l1(tmp));
-                or_into(l2(off), l2(tmp));
+                or_into(l1(off, &ocx), l1(m, &ocx), ocx);
+                or_into(l2(off, &ocx), l2(m, &ocx), ocx);
+                ocx.pool_top = m;
+            } else if env >= 0 && captures_by_ref(ocx.cur_f, l) {
+                let off = slot_off(ocx.cur, env, ocx);
+                note_env_store(env, tmp, &ocx);
+                or_into(l2(off, &ocx), l1(tmp, &ocx), ocx);
+                or_into(l2(off, &ocx), l2(tmp, &ocx), ocx);
             }
         }
         // (a parameter of the same closure type, of which the argument may
         // be a copy, `var g = f`: the same closure, so the same captures)
-        for i in 0..crate::front::own::walk::PARAM_LOCALS.count {
-            let pl = crate::front::own::walk::PARAM_LOCALS.data[i];
-            if pl < 0 || i >= FNS[CUR_F].param_count
-                || crate::front::types::fn_param(CUR_F, i) != t {
+        for i in 0..ocx.param_locals.count {
+            let pl = ocx.param_locals.data[i];
+            if pl < 0 || i >= FNS[ocx.cur_f].param_count
+                || crate::front::types::fn_param(ocx.cur_f, i) != t {
                 continue;
             }
-            let ps = slot_of_local(pl);
-            if ps >= 0 && ps != arg_slot(arg) {
-                let off = slot_off(CUR, ps);
-                note_env_store(ps, tmp);
-                or_into(l1(off), l1(tmp));
-                or_into(l2(off), l2(tmp));
+            let ps = slot_of_local(pl, ocx);
+            if ps >= 0 && ps != arg_slot(arg, ocx) {
+                let off = slot_off(ocx.cur, ps, ocx);
+                note_env_store(ps, tmp, &ocx);
+                or_into(l1(off, &ocx), l1(tmp, &ocx), ocx);
+                or_into(l2(off, &ocx), l2(tmp, &ocx), ocx);
             }
         }
-        let own = arg_slot(arg);
+        let own = arg_slot(arg, ocx);
         if own >= 0 {
-            let off = slot_off(CUR, own);
-            note_env_store(own, tmp);
+            let off = slot_off(ocx.cur, own, ocx);
+            note_env_store(own, tmp, &ocx);
             if own == env {
-                or_into(l2(off), l1(tmp));
+                or_into(l2(off, &ocx), l1(tmp, &ocx), ocx);
             } else {
-                or_into(l1(off), l1(tmp));
+                or_into(l1(off, &ocx), l1(tmp, &ocx), ocx);
             }
-            or_into(l2(off), l2(tmp));
+            or_into(l2(off, &ocx), l2(tmp, &ocx), ocx);
         }
-        POOL_TOP = tmp;
+        ocx.pool_top = tmp;
     }
 }
 
@@ -766,15 +767,15 @@ fn lends_interior(t: i64) -> bool {
 // pointer into data it locks (`&*p`) must not be viewed by f's result nor
 // stored by f, as the lock is released when the instance returns: own.escape
 // at the call that made the instance.
-fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary) {
+fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary, ocx: inout OwnCx) {
     unsafe {
-        let origin = FNS[CUR_F].origin;
+        let origin = FNS[ocx.cur_f].origin;
         if origin <= 0 {
             return;
         }
         var lends = false;
-        for i in 0..FNS[CUR_F].param_count {
-            if lends_interior(crate::front::types::fn_param(CUR_F, i)) {
+        for i in 0..FNS[ocx.cur_f].param_count {
+            if lends_interior(crate::front::types::fn_param(ocx.cur_f, i)) {
                 lends = true;
             }
         }
@@ -784,16 +785,17 @@ fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary) {
         var b = base;
         var j = 0;
         while b < end && j < 63 {
-            let arg = PEND.data[b + PE_NODE];
+            let arg = ocx.pend.data[b + PE_NODE];
             let t = NODES[arg].ty;
-            let o = PEND.data[b + PE_OV];
-            let raw = PEND.data[b] == PK_RAW || o < 0 || is_empty(l1(o)) && is_empty(l2(o));
+            let o = ocx.pend.data[b + PE_OV];
+            let raw = ocx.pend.data[b] == PK_RAW || o < 0
+                || is_empty(l1(o, &ocx), ocx) && is_empty(l2(o, &ocx), ocx);
             if raw && !(j == 0 && env_param(f, 0)) && t > 0 && TYPES[t].kind == TyKind::Ptr
                 && (f < 0 || j < FNS[f].param_count) {
                 let bit = 1 << j;
                 let ret = (s.ret[S_L1_P] & bit) != 0;
                 if ret || (s.sto[S_L1_P] & bit) != 0 {
-                    if seen(origin) {
+                    if seen(origin, &ocx) {
                         return;
                     }
                     own_begin(origin, OWN_ESCAPE);
@@ -811,9 +813,9 @@ fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary) {
                         }
                     }
                     own_str(c", the data ");
-                    own_sym(NODES[FNS[CUR_F].node].a);
+                    own_sym(NODES[FNS[ocx.cur_f].node].a);
                     own_str(c" locks: the lock is released when ");
-                    own_sym(NODES[FNS[CUR_F].node].a);
+                    own_sym(NODES[FNS[ocx.cur_f].node].a);
                     own_str(c" returns, and the view would outlive it");
                     own_help(c"copy what you need out inside the closure ('.to_vec()', an element), or do the work there");
                     own_end();
@@ -831,26 +833,26 @@ fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary) {
 // no summary's stores can say): the closures given to it that store views
 // (their summaries' stores) may store them into the data, so the argument
 // comes to view everything those closures hold.
-fn interior_stores(base: i64, end: i64) {
+fn interior_stores(base: i64, end: i64, ocx: inout OwnCx) {
     unsafe {
         var a = base;
         while a < end {
-            let arg = PEND.data[a + PE_NODE];
+            let arg = ocx.pend.data[a + PE_NODE];
             let at_ty = NODES[arg].ty;
             let u = if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a }
                 else { at_ty };
-            let ts = arg_slot(arg);
+            let ts = arg_slot(arg, ocx);
             if ts >= 0 && is_view_type(u) && lends_interior(at_ty) {
-                let off = slot_off(CUR, ts);
+                let off = slot_off(ocx.cur, ts, ocx);
                 var b = base;
                 while b < end {
-                    let o = PEND.data[b + PE_OV];
-                    let bt = NODES[PEND.data[b + PE_NODE]].ty;
+                    let o = ocx.pend.data[b + PE_OV];
+                    let bt = NODES[ocx.pend.data[b + PE_NODE]].ty;
                     let c = closure_of_type(bt) - 1;
                     if b != a && o >= 0 && c >= 0 && stores_any(CLOSURES[c].f) {
-                        or_into(l1(off), l1(o));
-                        or_into(l1(off), l2(o));
-                        or_into(l2(off), l2(o));
+                        or_into(l1(off, &ocx), l1(o, &ocx), ocx);
+                        or_into(l1(off, &ocx), l2(o, &ocx), ocx);
+                        or_into(l2(off, &ocx), l2(o, &ocx), ocx);
                     }
                     b += PE;
                 }
@@ -869,25 +871,25 @@ fn stores_any(f: i64) -> bool {
 // A call whose effects include `global`: the views of statics are invalid
 // from here (slots, and pending views of enclosing calls; a loan on a
 // static's own place stays: its address does not change).
-fn global_call(n: i64, base: i64) {
+fn global_call(n: i64, base: i64, ocx: inout OwnCx) {
     unsafe {
-        let m = new_ov();
-        or_expanded(at(m), STATIC_MASK);
-        close_mask(at(m));
+        let m = new_ov(&ocx);
+        or_expanded(at(m, &ocx), ocx.static_mask, &ocx);
+        close_mask(at(m, &ocx), &ocx);
         // (the pending views only)
         var e = 0;
         while e < base {
-            let k = PEND.data[e];
-            let o = PEND.data[e + PE_OV];
-            if (k == PK_VIEW || k == PK_MUT_VIEW) && o >= 0 && PEND.data[e + PE_INVALID] == 0
-                && ov_hits(o, at(m)) {
-                PEND.data[e + PE_INVALID] = H_GLOBAL;
-                PEND.data[e + PE_BY] = n;
+            let k = ocx.pend.data[e];
+            let o = ocx.pend.data[e + PE_OV];
+            if (k == PK_VIEW || k == PK_MUT_VIEW) && o >= 0 && ocx.pend.data[e + PE_INVALID] == 0
+                && ov_hits(o, at(m, &ocx), &ocx) {
+                ocx.pend.data[e + PE_INVALID] = H_GLOBAL;
+                ocx.pend.data[e + PE_BY] = n;
             }
             e += PE;
         }
-        invalidate(at(m), n, H_GLOBAL, -1, 0);
-        POOL_TOP = m;
+        invalidate(at(m, &ocx), n, H_GLOBAL, -1, 0, &ocx);
+        ocx.pool_top = m;
     }
 }
 
@@ -898,26 +900,26 @@ fn global_call(n: i64, base: i64) {
 // what it calls (effects::infer::static_access), and an inout one with a
 // callee that reads it: the callee would see S through two names, which
 // the optimizer takes to be apart (noalias). own.static, at the argument.
-fn static_args(n: i64, f: i64, base: i64, end: i64) {
+fn static_args(n: i64, f: i64, base: i64, end: i64, ocx: inout OwnCx) {
     unsafe {
         var e = base;
         while e < end {
-            let k = PEND.data[e];
-            let o = PEND.data[e + PE_OV];
+            let k = ocx.pend.data[e];
+            let o = ocx.pend.data[e + PE_OV];
             if k != PK_NONE && k != PK_RAW && o >= 0 {
-                let arg = PEND.data[e + PE_NODE];
-                for p in 0..PL_COUNT {
-                    if !get_bit(l1(o), p) && !get_bit(l2(o), p) {
+                let arg = ocx.pend.data[e + PE_NODE];
+                for p in 0..ocx.pl_count {
+                    if !get_bit(l1(o, &ocx), p) && !get_bit(l2(o, &ocx), p) {
                         continue;
                     }
-                    let r = root_of(p);
-                    if PL_RKIND[r] != RK_STATIC {
+                    let r = root_of(p, ocx);
+                    if ocx.pl_rkind[r] != RK_STATIC {
                         continue;
                     }
-                    let s = PL_RID[r];
+                    let s = ocx.pl_rid[r];
                     let how = crate::front::effects::infer::static_access(f, s);
                     if (how & 2) != 0 || is_mut_kind(k) && how != 0 {
-                        static_arg_error(n, f, arg, s, how);
+                        static_arg_error(n, f, arg, s, how, &ocx);
                         break;
                     }
                 }
@@ -927,9 +929,9 @@ fn static_args(n: i64, f: i64, base: i64, end: i64) {
     }
 }
 
-fn static_arg_error(n: i64, f: i64, arg: i64, s: i64, how: i64) {
+fn static_arg_error(n: i64, f: i64, arg: i64, s: i64, how: i64, ocx: inout OwnCx) {
     unsafe {
-        if !reporting(arg) {
+        if !reporting(arg, &ocx) {
             return;
         }
         let name = NODES[STATICS[s].node].a;
@@ -984,20 +986,20 @@ fn static_arg_error(n: i64, f: i64, arg: i64, s: i64, how: i64) {
 
 // Pending entry e was changed by a later argument (PE_BY, how PE_INVALID)
 // before call n: the finding, at the later argument.
-fn changed_by_later(e: i64, n: i64) {
+fn changed_by_later(e: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
-        let arg = PEND.data[e + PE_NODE];
-        let by = PEND.data[e + PE_BY];
-        let k = PEND.data[e];
+        let arg = ocx.pend.data[e + PE_NODE];
+        let by = ocx.pend.data[e + PE_BY];
+        let k = ocx.pend.data[e];
         // (the change at a node with no text of its own inside the call, a
         // drop or a scope's end: the finding is at the call, unnamed)
         let named = by > 0 && NODES[by].end > NODES[by].start
             && NODES[by].start >= NODES[n].start && NODES[by].end <= NODES[n].end;
         let at_node = if named { by } else { n };
-        let pl = PEND.data[e + PE_PLACE];
-        let o = PEND.data[e + PE_OV];
-        if hidden_place(pl) || o >= 0 && hidden_place(first_place(o, 0 as *i64))
-            || !reporting(at_node) {
+        let pl = ocx.pend.data[e + PE_PLACE];
+        let o = ocx.pend.data[e + PE_OV];
+        if hidden_place(pl, ocx) || o >= 0 && hidden_place(first_place(o, 0 as *i64, &ocx), ocx)
+            || !reporting(at_node, &ocx) {
             return;
         }
         own_begin(at_node, OWN_CONFLICT);
@@ -1029,7 +1031,7 @@ fn changed_by_later(e: i64, n: i64) {
             own_str(c" uses it");
             own_help(c"evaluate the later argument into a 'let' before the call, then take the view (or the access) in the call");
         }
-        if any_mark(PEND.data[e + PE_OV]) {
+        if any_mark(ocx.pend.data[e + PE_OV], &ocx) {
             own_soft();
         }
         own_end();
@@ -1038,44 +1040,45 @@ fn changed_by_later(e: i64, n: i64) {
 
 // Pending entries a (written by the call) and b overlap (mask m: what a
 // writes): the finding, at b.
-fn overlap(a: i64, b: i64, m: i64) {
+fn overlap(a: i64, b: i64, m: i64, ocx: inout OwnCx) {
     unsafe {
-        let an = PEND.data[a + PE_NODE];
-        let bn = PEND.data[b + PE_NODE];
-        let ob = PEND.data[b + PE_OV];
+        let an = ocx.pend.data[a + PE_NODE];
+        let bn = ocx.pend.data[b + PE_NODE];
+        let ob = ocx.pend.data[b + PE_OV];
         var q = -1;
-        for p in 0..PL_COUNT {
-            if get_bit(at(m), p) && (get_bit(l1(ob), p) || get_bit(l2(ob), p))
-                && crate::front::own::state::PL_RKIND[root_of(p)]
+        for p in 0..ocx.pl_count {
+            if get_bit(at(m, &ocx), p) && (get_bit(l1(ob, &ocx), p) || get_bit(l2(ob, &ocx), p))
+                && ocx.pl_rkind[root_of(p, ocx)]
                 != crate::front::own::state::RK_MARK {
                 q = p;
                 break;
             }
         }
         // (a desugaring's own temporaries: views::hidden_local)
-        if hidden_place(q) || hidden_place(PEND.data[a + PE_PLACE]) || !reporting(bn) {
+        if hidden_place(q, ocx) || hidden_place(ocx.pend.data[a + PE_PLACE], ocx)
+            || !reporting(bn, &ocx) {
             return;
         }
         own_begin(bn, OWN_CONFLICT);
         if q >= 0 {
-            own_place(q);
+            own_place(q, ocx);
         } else {
             own_str(c"a place");
         }
         own_str(c" has an inout access, ");
         own_src(an);
-        let kb = PEND.data[b];
+        let kb = ocx.pend.data[b];
         let named = is_mut_kind(kb) || kb == PK_VIEW;
         own_str(if is_mut_kind(kb) { c", and another one, " }
             else if kb == PK_VIEW { c", and a view, " } else { c", and is read by " });
         own_src(bn);
         own_str(if named { c", in the same call" } else { c" in the same call" });
-        if PEND.data[a] == PK_RESERVE {
+        if ocx.pend.data[a] == PK_RESERVE {
             own_help(c"the call changes its receiver while this argument still views it: copy what it views first ('.clone()'), or pass a part the receiver does not hold");
         } else {
             own_help(c"pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'");
         }
-        if any_mark(ob) || any_mark(PEND.data[a + PE_OV]) {
+        if any_mark(ob, &ocx) || any_mark(ocx.pend.data[a + PE_OV], &ocx) {
             own_soft();
         }
         own_end();
