@@ -51,7 +51,7 @@ extern "C" {
 fn main() {
     for i in 1..5 {
         let r = sqrt(i as f64);
-        println(f"sqrt({i}) = {r:.4}");
+        println("sqrt({i}) = {r:.4}");
     }
 }
 ```
@@ -89,7 +89,7 @@ extern "C" {
 fn main() {
     for i in 1..5 {
         let r = unsafe { sqrt(i as f64) };
-        println(f"sqrt({i}) = {r:.4}");
+        println("sqrt({i}) = {r:.4}");
     }
 }
 $ volec roots.vl -o roots
@@ -139,13 +139,13 @@ fn main(gpa: Gpa) {
     v.push(1);
     let i = v.len() + 2;
     unsafe {
-        println(f"{v[i]}");
+        println("{}", v[i]);
     }
 }
 ```
 
 ```out exit=101
-main.vl:6:20: index out of bounds: index 3, length 1
+main.vl:6:23: index out of bounds: index 3, length 1
 ```
 
 So `unsafe` is narrow on purpose: it's a short list of things you take
@@ -167,9 +167,9 @@ fn main() {
     let xs: [i64; 4] = [10, 20, 30, 40];
     let p = &xs as *i64; // a raw pointer to the first element
     let null = 0 as *i64;
-    println(f"{p.is_null()} {null.is_null()}");
+    println("{} {}", p.is_null(), null.is_null());
     let third = unsafe { p[2] };
-    println(f"{third}");
+    println("{third}");
 }
 ```
 
@@ -197,7 +197,7 @@ there's rarely anything you can know about an address you made up:
 ```vole
 fn main() {
     let p = 4096 as *u8;
-    println(f"{p.is_null()}");
+    println("{}", p.is_null());
 }
 ```
 
@@ -242,7 +242,7 @@ unsafe fn c_text(p: *u8) -> [u8] {
 
 fn main() {
     let t = c_text(c"hello");
-    println(f"{t.len()}");
+    println("{}", t.len());
 }
 ```
 
@@ -280,8 +280,8 @@ fn main() {
     var exp: i32 = 0;
     let frac = unsafe { m::frexp(48.0, &exp) };
     let e = unsafe { m::erf(0.5) };
-    println(f"48 = {frac} * 2^{exp}");
-    println(f"erf(0.5) = {e:.6}");
+    println("48 = {frac} * 2^{exp}");
+    println("erf(0.5) = {e:.6}");
 }
 ```
 
@@ -321,11 +321,11 @@ import "string.h" as c;
 
 fn main() {
     let missing = unsafe { c::getenv(c"VOLE_BOOK_NO_SUCH_VARIABLE") };
-    println(f"{missing.is_null()}");
+    println("{}", missing.is_null());
     let path = unsafe { c::getenv(c"PATH") };
     if !path.is_null() {
         let n = unsafe { c::strlen(path) };
-        println(f"PATH is set: {n > 0}");
+        println("PATH is set: {}", n > 0);
     }
 }
 ```
@@ -395,7 +395,7 @@ extern "C" {
 }
 
 fn main() {
-    println(f"{unsafe { ilogb(1000.0) }}");
+    println("{}", unsafe { ilogb(1000.0) });
 }
 ```
 
@@ -440,8 +440,8 @@ enum Color {
 }
 
 fn main() {
-    println(f"{size_of(Header)} {size_of(Packed)} {size_of(Color)}");
-    println(f"{Color::Blue as u8}");
+    println("{} {} {}", size_of(Header), size_of(Packed), size_of(Color));
+    println("{}", Color::Blue as u8);
 }
 ```
 
@@ -472,7 +472,7 @@ union Bits {
 fn main() {
     let b = Bits { f: 1.0 };
     let raw = unsafe { b.u };
-    println(f"{raw:08x}");
+    println("{raw:08x}");
 }
 ```
 
@@ -520,7 +520,7 @@ fn main() {
     let size = size_of(Score) as u64;
     unsafe { c::qsort(&scores as *u8, n, size, by_points); }
     for s in scores {
-        println(f"player {s.player}: {s.points}");
+        println("player {}: {}", s.player, s.points);
     }
 }
 ```
@@ -564,7 +564,7 @@ extern "C" {
 }
 
 fn main() {
-    println(f"1 + 4 + 9 + 16 = {unsafe { sum_squares(4) }}");
+    println("1 + 4 + 9 + 16 = {}", unsafe { sum_squares(4) });
 }
 ```
 
@@ -592,7 +592,7 @@ its first two commands write the two files; you'd save them from your
 editor.)
 
 ```console
-$ printf '%s\n' '// Called by C: the C calling convention, and a name C can link to.' 'extern "C" fn vole_square(x: i64) -> i64 {' '    x * x' '}' '' 'extern "C" {' '    fn sum_squares(n: i64) -> i64; // defined in sum.c' '}' '' 'fn main() {' '    println(f"1 + 4 + 9 + 16 = {unsafe { sum_squares(4) }}");' '}' > main.vl
+$ printf '%s\n' '// Called by C: the C calling convention, and a name C can link to.' 'extern "C" fn vole_square(x: i64) -> i64 {' '    x * x' '}' '' 'extern "C" {' '    fn sum_squares(n: i64) -> i64; // defined in sum.c' '}' '' 'fn main() {' '    println("1 + 4 + 9 + 16 = {}", unsafe { sum_squares(4) });' '}' > main.vl
 $ printf '%s\n' '#include "main.h"' '' 'int64_t sum_squares(int64_t n) {' '    int64_t total = 0;' '    for (int64_t i = 1; i <= n; i++) {' '        total += vole_square(i);' '    }' '    return total;' '}' > sum.c
 $ volec --emit-header main.vl -o main.h
 ok: wrote main.h
@@ -672,7 +672,7 @@ fn main() {
     for i in 0..10 {
         xs.push(i * i);
     }
-    println(f"{xs.len()} items, the last {xs.get(xs.len() - 1)}");
+    println("{} items, the last {}", xs.len(), xs.get(xs.len() - 1));
 }
 ```
 
@@ -702,7 +702,7 @@ freed memory. Because it's owned, the compiler stops that:
 
 ```vole skip
     let ys = xs;
-    println(f"{xs.len()} {ys.len()}");
+    println("{} {}", xs.len(), ys.len());
 ```
 
 ```text
@@ -788,7 +788,7 @@ fn main() {
     for i in 0..10 {
         xs.push(i * i);
     }
-    println(f"{xs.len()} items, the last {xs.get(xs.len() - 1)}");
+    println("{} items, the last {}", xs.len(), xs.get(xs.len() - 1));
 }
 ```
 
@@ -840,7 +840,7 @@ fn main(gpa: Gpa) {
         v.push(i); // the Vec grows: its elements move to a new block
     }
     let first = unsafe { p[0] };
-    println(f"{first}");
+    println("{first}");
 }
 ```
 

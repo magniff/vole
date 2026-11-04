@@ -30,7 +30,7 @@ fn main(gpa: Gpa) {
     var line = String::new_in(gpa);
     input.read_line(&line).unwrap();
 
-    println(f"You guessed: {line.trim()}");
+    println("You guessed: {}", line.trim());
 }
 ```
 
@@ -163,7 +163,7 @@ fn main(gpa: Gpa) {
     var line = String::new_in(gpa);
     input.read_line(line).unwrap();
 
-    println(f"You guessed: {line.trim()}");
+    println("You guessed: {}", line.trim());
 }
 ```
 
@@ -197,14 +197,15 @@ stops the program with an error message if it's an `Err`. That's
 the right choice for a first program; chapter 6 shows how to handle
 errors properly.
 
-### Printing with an f-string
+### Printing with a format string
 
 ```vole skip
-    println(f"You guessed: {line.trim()}");
+    println("You guessed: {}", line.trim());
 ```
 
-A string with an `f` in front is an *f-string*: each `{...}` in it is
-replaced by the value of the expression inside. `line.trim()` is
+The first argument of `println` is a *format string*: each `{}` in it is
+replaced by the value of the next argument, and `{name}` by the value of
+the variable `name` (`println("{line}")`). `line.trim()` is
 `line` without the spaces and the newline around it. (When you type a
 number and press Enter, the Enter is part of the line.)
 
@@ -228,7 +229,7 @@ fn main(gpa: Gpa) {
     input.read_line(&line).unwrap();
 
     let guess = line.trim().parse::<i64>().unwrap();
-    println(f"You guessed: {guess}");
+    println("You guessed: {guess}");
 
     if guess < secret {
         println("Too small!");
@@ -321,7 +322,7 @@ fn main(gpa: Gpa) {
         println("Please input your guess.");
         line.clear();
         if input.read_line(&line).unwrap() == 0 {
-            println(f"Giving up? The number was {secret}.");
+            println("Giving up? The number was {secret}.");
             return;
         }
 
@@ -339,7 +340,7 @@ fn main(gpa: Gpa) {
         } else if guess > secret {
             println("Too big!");
         } else {
-            println(f"You win! It took you {tries} tries.");
+            println("You win! It took you {tries} tries.");
             break;
         }
     }
@@ -437,7 +438,7 @@ would tell you:
 fn main() {
     let tries = 0;
     tries += 1;
-    println(f"{tries}");
+    println("{tries}");
 }
 ```
 
@@ -471,7 +472,7 @@ fn main(gpa: Gpa) {
         println("Please input your guess.");
         line.clear();
         if input.read_line(&line).unwrap() == 0 {
-            println(f"Giving up? The number was {secret}.");
+            println("Giving up? The number was {secret}.");
             return;
         }
 
@@ -489,7 +490,7 @@ fn main(gpa: Gpa) {
         } else if guess > secret {
             println("Too big!");
         } else {
-            println(f"You win! It took you {tries} tries.");
+            println("You win! It took you {tries} tries.");
             break;
         }
     }
@@ -561,7 +562,7 @@ You wrote a complete program, and on the way you met:
 - `let` for values that stay put, `var` for ones that change;
 - `&` at a call, marking the argument the function may change;
 - `Result`, `unwrap`, and `match` on `Ok` and `Err`;
-- f-strings;
+- format strings;
 - `if`/`else`, `loop`, `break`, `continue` and `return`;
 - panics: clean stops with a message and exit status 101.
 

@@ -49,7 +49,7 @@ fn main() {
     let a = 5;
     var b = a;
     b += 1;
-    println(f"{a} {b}");
+    println("{a} {b}");
 }
 ```
 
@@ -78,12 +78,12 @@ fn main(gpa: Gpa) {
     let first = Song { title: "Blue Moon", seconds: 185 };
     var edit = first;
     edit.seconds = 190;
-    println(f"{first.seconds} {edit.seconds}");
+    println("{} {}", first.seconds, edit.seconds);
 
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(first);
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -116,7 +116,7 @@ fn main(gpa: Gpa) {
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let backup = list;
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{backup.len()} {list.len()}");
+    println("{} {}", backup.len(), list.len());
 }
 ```
 
@@ -152,7 +152,7 @@ fn main(gpa: Gpa) {
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let backup = list.clone();
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{backup.len()} {list.len()}");
+    println("{} {}", backup.len(), list.len());
 }
 ```
 
@@ -182,7 +182,7 @@ struct Noisy { id: i64 }
 
 impl Drop for Noisy {
     fn drop(inout self) {
-        println(f"dropping {self.id}");
+        println("dropping {}", self.id);
     }
 }
 
@@ -191,11 +191,11 @@ fn main() {
     let b = Noisy { id: 2 };
     {
         let c = Noisy { id: 3 };
-        println(f"the inner block ends ({c.id})");
+        println("the inner block ends ({})", c.id);
     }
     let d = Noisy { id: 4 };
     drop(d);
-    println(f"main ends ({a.id} {b.id})");
+    println("main ends ({} {})", a.id, b.id);
 }
 ```
 
@@ -246,8 +246,8 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{total_seconds(list)} seconds");
-    println(f"{list.len()} songs, still here");
+    println("{} seconds", total_seconds(list));
+    println("{} songs, still here", list.len());
 }
 ```
 
@@ -286,7 +286,7 @@ fn add(list: Vec<Song>, song: Song) {
 fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     add(list, Song { title: "Blue Moon", seconds: 185 });
-    println(f"{list.len()}");
+    println("{}", list.len());
 }
 ```
 
@@ -312,7 +312,7 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     add(&list, Song { title: "Blue Moon", seconds: 185 });
     add(&list, Song { title: "Summertime", seconds: 210 });
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -340,7 +340,7 @@ fn main() {
     var plays = 0;
     bump(&plays);
     bump(&plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -360,7 +360,7 @@ fn bump(count: inout i64) {
 fn main() {
     let plays = 0;
     bump(&plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -382,7 +382,7 @@ fn bump(count: inout i64) {
 fn main() {
     var plays = 0;
     bump(plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -410,13 +410,13 @@ fn total_seconds(list: Vec<Song>) -> i64 {
 fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
-    println(f"{total_seconds(&list)}");
+    println("{}", total_seconds(&list));
 }
 ```
 
 ```err
 error[conv.marker_extra]: '&' marks an argument the callee may change; 'list' is taken let or sink here (read, or moved): pass 'list'
- --> playlist.vl: line 14, column 30
+ --> playlist.vl: line 14, column 33
   = try: volec edit patch playlist.vl:14 --old '&list' --new 'list'
   = try: volec fix --suggested playlist.vl
 ```
@@ -484,7 +484,7 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     add_copies(&list, list.len());
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -514,7 +514,7 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     add_all(&list, list[..]);
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -546,7 +546,7 @@ fn main() {
     bump(&middle);
     bump(&middle);
     middle += 10;
-    println(f"{plays[1]}");
+    println("{}", plays[1]);
 }
 ```
 
@@ -576,7 +576,7 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     archive(&shelf, list);
-    println(f"{shelf.len()} playlist, {shelf[0].len()} song");
+    println("{} playlist, {} song", shelf.len(), shelf[0].len());
 }
 ```
 
@@ -611,7 +611,7 @@ fn main(gpa: Gpa) {
     var list: Vec<Song> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let concert = with_encore(list, Song { title: "Summertime", seconds: 210 });
-    println(f"{concert.len()} songs");
+    println("{} songs", concert.len());
 }
 ```
 
@@ -660,7 +660,7 @@ impl Playlist {
     }
 
     fn finish(sink self) -> Vec<Song> {
-        println(f"closing {self.name}");
+        println("closing {}", self.name);
         self.songs
     }
 }
@@ -669,9 +669,9 @@ fn main(gpa: Gpa) {
     var mix = Playlist::new("Sunday", gpa);
     mix.add(Song { title: "Blue Moon", seconds: 185 });
     mix.add(Song { title: "Summertime", seconds: 210 });
-    println(f"{mix.name} has {mix.len()} songs");
+    println("{} has {} songs", mix.name, mix.len());
     let songs = mix.finish();
-    println(f"{songs.len()} songs kept");
+    println("{} songs kept", songs.len());
 }
 ```
 
@@ -714,7 +714,7 @@ fn sampler(gpa: Gpa) -> Vec<Song> {
 
 fn main(gpa: Gpa) {
     let list = sampler(gpa);
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -748,7 +748,7 @@ fn main(gpa: Gpa) {
     list.push(Song { title: "Summertime", seconds: 210 });
     list.push(Song { title: "Cheek to Cheek", seconds: 300 });
     let start = opening(list);
-    println(f"{start.len()} songs, starting with {start[0].title}");
+    println("{} songs, starting with {}", start.len(), start[0].title);
 }
 ```
 
