@@ -526,11 +526,11 @@ character in single quotes, `'c'`, is a byte (`u8`), and `{b:c}` prints
 a byte as the character it stands for. `word[0]` is the first byte of
 the text.
 
-## Bytes: [u8] and Buf
+## Bytes: [u8] and Vec<u8, A>
 
 Not all data is text. A file might be an image, and a network packet
-is just bytes. For those, vole has `[u8]`, a slice of bytes, and `Buf`,
-a growable buffer of them, the bytes' `String`:
+is just bytes. For those, vole has `[u8]`, a slice of bytes, and
+`Vec<u8, A>`, a growable buffer of them, the bytes' `String`:
 
 ```vole
 fn show(bytes: [u8]) {
@@ -541,12 +541,12 @@ fn show(bytes: [u8]) {
 }
 
 fn main(gpa: Gpa) {
-    var b = Buf::new_in(gpa);
-    b.push_str("hi");
+    var b: Vec<u8, Gpa> = Vec::new_in(gpa);
+    b.extend_from_slice("hi");
     b.push(0x21);
     show(b.as_slice());
 
-    var raw = Buf::new_in(gpa);
+    var raw: Vec<u8, Gpa> = Vec::new_in(gpa);
     raw.push(0xff);
     raw.push(0x41);
     show(raw.as_slice());
@@ -558,12 +558,12 @@ text: hi!
 not text: invalid utf-8 sequence of 1 bytes from index 0
 ```
 
-`b.as_slice()` is a view of the `Buf`'s bytes. `str::from_utf8` checks
+`b.as_slice()` is a view of the `Vec`'s bytes. `str::from_utf8` checks
 that bytes are valid UTF-8 and, if they are, gives you a `str` of the
 same bytes, without copying them. Bytes that aren't UTF-8 are an `Err`.
 
-Use `str` and `String` for text, and `[u8]` and `Buf` when the topic is
-bytes. A `str` goes where a `[u8]` is wanted for free; the other way
+Use `str` and `String` for text, and `[u8]` and `Vec<u8, A>` when the topic
+is bytes. A `str` goes where a `[u8]` is wanted for free; the other way
 round goes through `str::from_utf8`, because not every byte sequence is
 text.
 

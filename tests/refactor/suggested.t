@@ -9,6 +9,7 @@
 ## `crate::` (a value, a type, a `use` line), Rust's types (`&str`,
 ## `String`, `char`); a tie (`cut`: `cat` and `cot`) is left.
 $ check
+main.vl:33:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:7:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:20:12: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:22:13: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
@@ -126,6 +127,7 @@ table.vl:1:46: error[alloc.field] the struct 'Table' holds an allocator its para
 note fix.refused: table.vl:1:46: not applied: `, Gpa`: the edited program has a new error with it: table.vl:1:46: error[alloc.field] the struct 'Table' holds an allocator its parameters do not name: 'Gpa', in field 'rows'
 note fix.left: 4 errors left (above)
 $ check
+main.vl:37:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:27:21: error[type error] expected 'u8', got 'i64' | help: only widening is implicit: convert explicitly | try: t as u8
 main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 table.vl:1:46: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl

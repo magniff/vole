@@ -69,7 +69,7 @@ The prelude, in every module without `use`: `Option`, `Some`, `None`,
 `format_in`, `Gpa`, `Arena`, `ScopedArena`, `arena_scope`, and the traits
 `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`, `Hash`, `Display`, `Debug`,
 `Clone`, `From`, `Into`, `Allocator`. The rest of std is used by path
-(`std::print_int(n)`) or imported (`use std::{Buf, HashMap};`).
+(`std::print_int(n)`) or imported (`use std::{HashMap, is_digit};`).
 Calling C or an `unsafe fn`, and dereferencing or indexing a raw
 pointer, are allowed only in `unsafe { }` (`volec guide rust`: the
 full list).
@@ -323,7 +323,7 @@ An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
 array, a `Vec` or memory. A `[T]` is read-only; `inout [T]`
 (`&a[..]`, `v.as_mut_slice()`) writes its elements.
 
-## std: Vec, HashMap, Buf; allocation
+## std: Vec, HashMap, String; allocation
 
 ```vole
 fn evens(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // it allocates: it takes an allocator
@@ -351,11 +351,11 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     for (k, _) in m.iter() { print(k); }   // (K, V) pairs, in slot order
     println("");
 
-    var b = Buf::new_in(gpa);              // text builder
+    var b = String::new_in(gpa);           // text builder
     let e = evens(4, gpa);
     b.push_str("n=");
-    b.push_int(m.len() as i64 + e.len() as i64);
-    b.push('!');
+    b.push_fmt(m.len() as i64 + e.len() as i64);
+    b.push_str("!");
     println(b.as_slice());
     0
 }

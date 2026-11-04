@@ -23,8 +23,8 @@ fn total(v: Vec<i64, Gpa>) -> i64 { // grows nothing: no allocator
 fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
     var v = squares(4, gpa);
     v.push(100);                              // the Vec's own allocator
-    var b = Buf::new_in(gpa);
-    b.push_int(total(v));
+    var b = String::new_in(gpa);
+    b.push_fmt(total(v));
     let words: Vec<i64, Gpa> = (1..4).map(|x| x * 10).collect_in(gpa);
     println("{} {words:?}", b.as_slice());
     0
@@ -39,7 +39,7 @@ let parameter (`gpa: Gpa`, no convention to write), and every container
 made from it shares it. Only `main` gets one (std's
 types have private fields: no `Gpa {}` outside std). Each 0.15 form that
 allocated has an `_in` form taking the allocator last: `Vec::new_in(a)`,
-`with_capacity_in(n, a)`, `filled_in(n, x, a)`, `Buf::new_in(a)`,
+`with_capacity_in(n, a)`, `filled_in(n, x, a)`, `String::new_in(a)`,
 `HashMap::new_in(a)`, `it.collect_in(a)`, `format_in(x, a)`,
 `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s, a)`,
 `sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`, `v.clone_in(b)`,
@@ -61,7 +61,7 @@ error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, 
 
 ## Containers and their allocator
 
-`Vec<T, A: Allocator>`, `Buf<A>`, `HashMap<K, V, A>`: the allocator is a
+`Vec<T, A: Allocator>`, `String<A>`, `HashMap<K, V, A>`: the allocator is a
 type parameter, always written (0.26.3: no default, `alloc.default`), so
 `Vec<i64, Gpa>` says it may grow from `Gpa`, which takes no bytes. Code
 generic over the allocator names it, and changes the container through

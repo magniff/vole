@@ -2,20 +2,31 @@
 // becomes `String<A>` where it holds text and `Vec<u8, A>` where it holds
 // bytes, binding by binding, by the evidence of its writes:
 //
-//   text:  a push_str of a `str` (a string literal is one), a format
-//          write (push_fmt, push_int), a push of a constant byte below
-//          0x80, Buf::from_in of a `str`;
+//   text:  Buf::from_in of a `str`, a Buf printed (`{b}`), given a String
+//          or passed where std takes one; and, weakly, a push_str of a
+//          `str` (a string literal is one), a push of a constant byte
+//          below 0x80 and a format write (push_fmt, push_int; on a Vec,
+//          `extend_from_slice(format_in(.., v.allocator()).as_bytes())`):
+//          the same bytes in a Vec<u8, A>, so they decide text only when
+//          nothing says bytes (0.26.3, the mass run);
 //   bytes: a push of a byte that is not a constant, a push of a constant
-//          at or above 0x80, a push_str of a `[u8]`, as_mut_slice;
-//   mixed evidence, or none: refused, with the binding and the writes on
-//          each side named. It never guesses.
+//          at or above 0x80, a push_str of a `[u8]` (a `[u8]` constant
+//          too), as_mut_slice, an index (`b[i]`); and a binding with no
+//          write at all, which a Vec<u8, A> holds as the Buf did;
+//   mixed (text the weak rule does not cover, and bytes): refused, with
+//          the binding and the writes on each side named; so is a binding
+//          written through a by-value parameter (a Buf is a handle there,
+//          a String or a Vec a copy). It never guesses.
 //
 // A binding is a local or a parameter, a field, a function's result or a
 // constructor call (`Buf::new_in(gpa)`); bindings a value flows between
 // (`let b = c`, `b = c`, an argument and its parameter, a returned value
-// and the result, a field's initializer) are one, decided together. A
-// binding passed to a std function that takes a Buf is refused too (std
-// keeps the Buf there). The methods map through TABLE, which the run
+// and the result, a field's initializer) are one, decided together; so
+// are a value and what holds it (an `Option<Buf<A>>`, a `Vec<Buf<A>, A>`:
+// a variant's payload, a pattern's binding, a std generic's argument and
+// result, an enum variant's `Buf` field), and a use a closure captured
+// and its local. A binding passed to a std function whose parameter is
+// written `Buf` is refused too (std keeps the Buf there). The methods map through TABLE, which the run
 // prints; a method with no form on the side decided refuses its binding.
 //
 // The checker's view is read before std's `str` is erased to `[u8]`
@@ -23,18 +34,18 @@
 // after (buf_edits, from fix/command.vl).
 
 use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_str};
-use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind, child};
-use crate::front::check::Res;
+use crate::front::ast::{CONV_INOUT, CONV_SINK, NODES, NODE_CAPTURE, NODE_IMPLICIT, NodeKind, child};
+use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
 use crate::front::lexer::Tok;
 use crate::front::modules::{file_of_pos, within_std};
-use crate::front::types::{FNS, STRUCTS, TLISTS, TYPES, TyKind, buf_type};
+use crate::front::types::{ENUMS, FNS, STRUCTS, TLISTS, TYPES, TyKind, VARIANTS, buf_type};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::fix::user_pos;
 use crate::tools::query::diagnostics::diag;
-use crate::tools::query::positions::{line_of, line_start};
+use crate::tools::query::positions::{find_name, line_of, line_start};
 use crate::tools::query::refs::{file_text, ref_in};
-use crate::tools::refactor_mod::local::{decl_name_pos, load_decls, use_decl};
+use crate::tools::refactor_mod::local::load_decls;
 
 // Set by `fix --only buf`: check_program calls collect.
 pub static var RECORD: bool = false;
@@ -65,6 +76,20 @@ static var BYTES_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var BYTES_WHY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var EXTERN_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var EXTERN_FN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The first text write that decides text against bytes (strong_text), as
+// TEXT_AT and TEXT_WHY; whether a binding is a by-value parameter
+// (LET_PARAM) and the first write through it (LETW_AT, -1: none).
+static var STRONG_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var STRONG_WHY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LET_PARAM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LETW_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Every declaration of a local, by its index l: l + 1 -> entry + 1
+// (DECL_HEAD), the entry's name position (DECL_AT) and the entry before it
+// of the same index (DECL_NEXT, -1: none).
+static var DECL_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var DECL_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DECL_NEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DECL_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The method calls on a binding (call node, binding id, the method's
 // symbol, the name's position), in fours.
 static var CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -95,6 +120,14 @@ const WHY_FROM_BYTES: i64 = 9;
 const WHY_STRING: i64 = 10;
 const WHY_STD_STRING: i64 = 11;
 const WHY_PRINTED: i64 = 12;
+const WHY_INDEX: i64 = 13;
+
+// Whether write `why` on the text side decides text even against bytes:
+// not a push_str of a str or a constant ASCII byte, which a Vec<u8, A>
+// takes as the same bytes.
+fn strong_text(why: i64) -> bool {
+    why != WHY_STR && why != WHY_ASCII && why != WHY_FMT
+}
 
 fn why_text(w: i64) -> [u8] {
     if w == WHY_STR { "push_str of a str" }
@@ -109,6 +142,7 @@ fn why_text(w: i64) -> [u8] {
     else if w == WHY_STRING { "given a String (format_in's, 0.26.3)" }
     else if w == WHY_PRINTED { "printed as text" }
     else if w == WHY_STD_STRING { "passed where std takes a String (read_line, 0.26.3)" }
+    else if w == WHY_INDEX { "indexed (`b[i]`: a String has no index)" }
     else { "a write" }
 }
 
@@ -122,13 +156,13 @@ static TABLE: [[[u8]; 3]; 18] = [
     ["len", "len", "len"],
     ["push", "push", "push"],
     ["push_str", "push_str", "extend_from_slice"],
-    ["push_fmt", "push_fmt", ""],
-    ["push_int", "push_fmt", ""],
+    ["push_fmt", "push_fmt", "extend_from_slice(format_in(.., v.allocator()).as_bytes())"],
+    ["push_int", "push_fmt", "extend_from_slice(format_in(\"{}\", .., v.allocator()).as_bytes())"],
     ["push_cstr", "", ""],
     ["as_slice", "as_slice", "as_slice"],
     ["as_mut_slice", "", "as_mut_slice"],
     ["clear", "clear", "clear"],
-    ["free", "clear", "free"],
+    ["free", "free", "free"],
     ["take", "", "take"],
     ["capacity", "capacity", "capacity"],
     ["reserve", "reserve", "reserve"],
@@ -179,6 +213,10 @@ fn id_of(key: i64) -> i64 {
     BYTES_WHY.push(0);
     EXTERN_AT.push(-1);
     EXTERN_FN.push(-1);
+    STRONG_AT.push(-1);
+    STRONG_WHY.push(0);
+    LET_PARAM.push(0);
+    LETW_AT.push(-1);
     id
 }
 
@@ -211,9 +249,15 @@ fn note_write(id: i64, side: i64, why: i64, pos: i64) {
     if id < 0 {
         return;
     }
-    if side == TEXT && get(TEXT_AT, id) < 0 {
-        set(&TEXT_AT, id, pos);
-        set(&TEXT_WHY, id, why);
+    if side == TEXT {
+        if get(TEXT_AT, id) < 0 {
+            set(&TEXT_AT, id, pos);
+            set(&TEXT_WHY, id, why);
+        }
+        if strong_text(why) && get(STRONG_AT, id) < 0 {
+            set(&STRONG_AT, id, pos);
+            set(&STRONG_WHY, id, why);
+        }
     } else if side == BYTES && get(BYTES_AT, id) < 0 {
         set(&BYTES_AT, id, pos);
         set(&BYTES_WHY, id, why);
@@ -268,6 +312,69 @@ fn is_string_type(t0: i64) -> bool {
     }
 }
 
+// Whether type t is a Buf or holds one through its type arguments, a
+// pointer, a slice or an array (`Option<Buf<A>>`, `Vec<Buf<A>, A>`).
+fn has_buf(t: i64) -> bool {
+    has_buf_at(t, 0)
+}
+
+fn has_buf_at(t: i64, depth: i64) -> bool {
+    if t <= 0 || depth > 6 {
+        return false;
+    }
+    if is_buf_type(t) {
+        return true;
+    }
+    // UNSAFE: TYPES, STRUCTS, ENUMS and TLISTS are the type tables, raw
+    // pointers (front/types).
+    // SAFETY: t is a checked node's type, a TYPES index; a struct's or an
+    // enum's a is its table's index, its targs a run of targ_count TLISTS.
+    unsafe {
+        let k = TYPES[t].kind;
+        if k == TyKind::Ptr || k == TyKind::Slice || k == TyKind::Array {
+            return has_buf_at(TYPES[t].a, depth + 1);
+        }
+        if k == TyKind::Struct {
+            let s = TYPES[t].a;
+            if STRUCTS[s].closure != 0 {
+                return false;
+            }
+            for i in 0..STRUCTS[s].targ_count {
+                if has_buf_at(TLISTS.data[STRUCTS[s].targs + i], depth + 1) {
+                    return true;
+                }
+            }
+        } else if k == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].targ_count {
+                if has_buf_at(TLISTS.data[ENUMS[e].targs + i], depth + 1) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// Whether type node n is written with a `Buf` in it (`Buf<A>`,
+// `Option<Buf<A>>`, `inout Vec<Buf<A>, A>`): rewrite_type's `Buf`s.
+fn mentions_buf(n: i64) -> bool {
+    if n <= 0 {
+        return false;
+    }
+    var i = NODES[n].start;
+    let end = NODES[n].end;
+    while i + 3 <= end {
+        if SRC[i] == 'B' && SRC[i + 1] == 'u' && SRC[i + 2] == 'f'
+            && (i == 0 || !ident_byte(SRC[i - 1]))
+            && (i + 3 >= SRC.len as i64 || !ident_byte(SRC[i + 3])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 // Value v given to binding id (its initializer, a value assigned or
 // returned, an argument): a String is text evidence (a program written
 // before format_in made one).
@@ -293,7 +400,14 @@ fn flow(id: i64, v: i64) {
         for i in 0..NODES[v].count {
             flow(id, NODES[child(v, i)].c);
         }
-    } else if is_buf_type(NODES[v].ty) {
+    } else if k == NodeKind::VariantLit && vfield_binding(NODES[v].a, 0) < 0 {
+        // (std's `Some(b)`, `Err(b)`: the payload is the holder's; a
+        // program's variant's Buf fields are bindings of their own,
+        // collect's VariantLit)
+        for i in 0..NODES[v].count {
+            flow(id, child(v, i));
+        }
+    } else if has_buf(NODES[v].ty) {
         join(id, binding(v));
     } else {
         note_given(id, v);
@@ -302,6 +416,36 @@ fn flow(id: i64, v: i64) {
             join(id, binding(v));
         }
     }
+}
+
+// Whether e is a `[u8]` constant of a literal (`const HEAD: [u8] = "..";`):
+// the checker makes its use a Str node, its name left in the source. Bytes,
+// as its type says.
+fn bytes_const(e: i64) -> bool {
+    if e <= 0 || NODES[e].kind != NodeKind::Str || is_str_type(NODES[e].ty) {
+        return false;
+    }
+    let at = NODES[e].start;
+    ident_byte(SRC[at]) && !(SRC[at] == 'r' && (SRC[at + 1] == '"' || SRC[at + 1] == '#'))
+}
+
+// Whether e is a local declared `str` (its use given to Buf's push_str is
+// typed as the parameter, `[u8]`), through a `&` or a `*`.
+fn str_local(e: i64) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    if NODES[e].kind == NodeKind::Unary {
+        return str_local(NODES[e].b);
+    }
+    if NODES[e].kind != NodeKind::Ident || NODES[e].res != Res::Local {
+        return false;
+    }
+    let l = NODES[e].y;
+    // UNSAFE: LOCALS is the checker's table of locals, a raw pointer.
+    // SAFETY: l is checked below LOCAL_COUNT first.
+    l >= 0 && l < LOCAL_COUNT
+        && unsafe { LOCALS[l].name == NODES[e].a && is_str_type(LOCALS[l].ty) }
 }
 
 // Whether type t is std's `str`.
@@ -439,16 +583,119 @@ fn field_binding(f: i64) -> i64 {
         return -1;
     }
     let id = id_of(NODES[f].start * 4 + K_FIELD);
-    if buf_type_node(NODES[f].b) {
+    if mentions_buf(NODES[f].b) {
         set(&TYPE_NODE, id, NODES[f].b);
         anchor(id);
     }
     id
 }
 
+// The binding of field i of enum variant v (VARIANTS), a program's that
+// is written with a `Buf` (its type node's position, as a field's), or -1.
+fn vfield_binding(v: i64, i: i64) -> i64 {
+    if v < 0 {
+        return -1;
+    }
+    // UNSAFE: VARIANTS is the table of variants, a raw pointer (front/types).
+    // SAFETY: v is a checked VariantLit's or PatVariant's variant, below
+    // VARIANT_COUNT.
+    let vn = unsafe { VARIANTS[v].node };
+    if vn <= 0 || NODES[vn].kind != NodeKind::Variant || i < 0 || i >= NODES[vn].count {
+        return -1;
+    }
+    let t = child(vn, i);
+    if t <= 0 || !user_pos(NODES[t].start) || !mentions_buf(t) {
+        return -1;
+    }
+    let id = id_of(NODES[t].start * 4 + K_FIELD);
+    set(&TYPE_NODE, id, t);
+    anchor(id);
+    id
+}
+
+// Pattern pat matched against a value of binding sid (-1: none): each of
+// its bindings that holds a Buf is one with it (`Some(b)` of an
+// `Option<Buf<A>>`), or with a program's variant's Buf field (`Msg::Text(t)`).
+fn bind_pattern(pat: i64, sid: i64) {
+    if pat <= 0 {
+        return;
+    }
+    let k = NODES[pat].kind;
+    if k == NodeKind::PatBind {
+        let id = decl_binding(pat);
+        if sid >= 0 && id >= 0 && (NODES[pat].ty <= 0 || has_buf(NODES[pat].ty)) {
+            join(sid, id);
+        }
+    } else if k == NodeKind::PatVariant {
+        for i in 0..NODES[pat].count {
+            let fid = vfield_binding(NODES[pat].x, i);
+            bind_pattern(child(pat, i), if fid >= 0 { fid } else { sid });
+        }
+    } else if k == NodeKind::PatTuple || k == NodeKind::PatOr {
+        for i in 0..NODES[pat].count {
+            bind_pattern(child(pat, i), sid);
+        }
+    }
+}
+
+// Fills DECL_HEAD, DECL_AT, DECL_NAME and DECL_NEXT: every declaration of
+// a local.
+fn load_local_decls() {
+    if DECL_AT.count > 0 {
+        return;
+    }
+    for n in 1..NODES.len() as i64 {
+        let p = decl_pos(n);
+        if p >= 0 {
+            let l = NODES[n].x;
+            let e = DECL_AT.count;
+            DECL_AT.push(p);
+            DECL_NAME.push(NODES[n].a);
+            DECL_NEXT.push(DECL_HEAD.get(l + 1) - 1);
+            DECL_HEAD.put(l + 1, e + 1);
+        }
+    }
+}
+
+// The position of the declaration of the local use e names (an Ident, or
+// a use a closure captured), or -1: of the declarations of its local's
+// index (with its name), the nearest before it. (The checker numbers each
+// function's locals from 0 and a generic one's body is checked after, so
+// an index names a local of each function, and LOCALS holds the last
+// one's: use_decl and decl_name_pos, which check LOCALS, miss the others.)
+fn local_decl(e: i64) -> i64 {
+    let captured = (NODES[e].p & NODE_CAPTURE) != 0 && NODES[e].d > 0;
+    if !captured && (NODES[e].kind != NodeKind::Ident || NODES[e].res != Res::Local) {
+        return -1;
+    }
+    let l = if captured { NODES[e].d - 1 } else { NODES[e].y };
+    let at = NODES[e].start;
+    var best = -1;
+    var i = DECL_HEAD.get(l + 1) - 1;
+    while i >= 0 {
+        let p = get(DECL_AT, i);
+        if p <= at && p > best && (captured || get(DECL_NAME, i) == NODES[e].a) {
+            best = p;
+        }
+        i = get(DECL_NEXT, i);
+    }
+    best
+}
+
+// The position of the name the PatBind or Param node n declares, in a
+// file of the program, or -1 (decl_name_pos without its LOCALS check).
+fn decl_pos(n: i64) -> i64 {
+    let k = NODES[n].kind;
+    if k != NodeKind::PatBind && k != NodeKind::Param || NODES[n].x < 0
+        || NODES[n].end <= NODES[n].start || !user_pos(NODES[n].start) {
+        return -1;
+    }
+    find_name(NODES[n].start, NODES[n].end, NODES[n].a, false)
+}
+
 // The binding of local `l`'s declaration (a PatBind or Param node d).
 fn decl_binding(d: i64) -> i64 {
-    let p = decl_name_pos(d);
+    let p = decl_pos(d);
     if p < 0 { -1 } else { id_of(p * 4 + K_LOCAL) }
 }
 
@@ -457,6 +704,11 @@ fn binding(e: i64) -> i64 {
     if e <= 0 {
         return -1;
     }
+    if (NODES[e].p & NODE_CAPTURE) != 0 && NODES[e].d > 0 {
+        // (a use a closure captured, now `*(*env).x`: its local's)
+        let p = local_decl(e);
+        return if p < 0 { -1 } else { id_of(p * 4 + K_LOCAL) };
+    }
     let k = NODES[e].kind;
     if k == NodeKind::Unary && (NODES[e].op == Tok::Amp || NODES[e].op == Tok::Star) {
         return binding(NODES[e].b);
@@ -464,9 +716,16 @@ fn binding(e: i64) -> i64 {
     if k == NodeKind::Block {
         return if NODES[e].a != 0 { binding(NODES[e].a) } else { -1 };
     }
+    if k == NodeKind::Try {
+        return binding(NODES[e].a);
+    }
     if k == NodeKind::Ident && NODES[e].res == Res::Local {
-        let p = use_decl(e);
+        let p = local_decl(e);
         return if p < 0 { -1 } else { id_of(p * 4 + K_LOCAL) };
+    }
+    if k == NodeKind::Index && !is_buf_type(NODES[NODES[e].a].ty) && has_buf(NODES[NODES[e].a].ty) {
+        // (`v[i]` of a Vec<Buf<A>, A>: the holder's)
+        return binding(NODES[e].a);
     }
     if k == NodeKind::FieldAccess && NODES[e].y != 2 {
         let s = struct_node(NODES[NODES[e].a].ty);
@@ -480,9 +739,25 @@ fn binding(e: i64) -> i64 {
             CTOR_OF.put(id + 1, e + 1);
             return id;
         }
+        if is_buf_fn(f) && NODES[e].count > 0 && is_buf_type(NODES[e].ty) {
+            // (`b.clone()`, `b.take()`: the receiver's)
+            return binding(child(e, 0));
+        }
         let def = fn_node(template(f));
-        if def > 0 && user_pos(NODES[def].start) && is_buf_type(NODES[e].ty) {
+        if def > 0 && user_pos(NODES[def].start) && has_buf(NODES[e].ty)
+            && mentions_buf(NODES[def].b) {
             return id_of(NODES[def].start * 4 + K_RESULT);
+        }
+        if def > 0 && !user_pos(NODES[def].start) && has_buf(NODES[e].ty)
+            && !mentions_buf(NODES[def].b) {
+            // (a std generic's result, `v.get(0)`, `o.unwrap()`,
+            // `std::replace(&s.f, b)`: its first argument's that holds one)
+            for i in 0..NODES[e].count {
+                let arg = child(e, i);
+                if NODES[arg].kind != NodeKind::NamedArg && has_buf(NODES[arg].ty) {
+                    return binding(arg);
+                }
+            }
         }
     }
     -1
@@ -522,6 +797,15 @@ fn note_method(n: i64, f: i64, recv: i64) {
     CALLS.push(name);
     CALLS.push(name_after_dot(NODES[recv].end, NODES[n].end));
     let pos = NODES[n].start;
+    if get(LET_PARAM, id) != 0 && get(LETW_AT, id) < 0 && text != "len" && text != "as_slice"
+        && text != "capacity" && text != "allocator" && text != "clone" {
+        set(&LETW_AT, id, pos);
+    }
+    if (text == "as_slice" || text == "as_mut_slice") && NODES[n].end > NODES[n].start
+        && SRC[NODES[n].end - 1] == ']' {
+        // (`b[..]`, `b[i]`: the checker's as_slice call in its place)
+        note_write(id, BYTES, WHY_INDEX, pos);
+    }
     if text == "push_fmt" || text == "push_int" {
         note_write(id, TEXT, WHY_FMT, pos);
     } else if text == "as_mut_slice" {
@@ -530,7 +814,11 @@ fn note_method(n: i64, f: i64, recv: i64) {
         && NODES[n].count > 1 {
         let arg = child(n, 1);
         if text == "push_str" {
-            if NODES[arg].kind == NodeKind::Str || is_str_type(NODES[arg].ty) {
+            if bytes_const(arg) {
+                note_write(id, BYTES, WHY_BYTES_STR, pos);
+            }
+            else if NODES[arg].kind == NodeKind::Str || is_str_type(NODES[arg].ty)
+                || str_local(arg) {
                 note_write(id, TEXT, WHY_STR, pos);
             } else {
                 note_write(id, BYTES, WHY_BYTES_STR, pos);
@@ -554,7 +842,7 @@ fn note_ctor(n: i64, f: i64) {
     let def = fn_node(template(f));
     if sym_is(NODES[def].a, "from_in") && NODES[n].count > 0 {
         let arg = child(n, 0);
-        if NODES[arg].kind == NodeKind::Str || is_str_type(NODES[arg].ty) {
+        if !bytes_const(arg) && (NODES[arg].kind == NodeKind::Str || is_str_type(NODES[arg].ty)) {
             note_write(id, TEXT, WHY_FROM_STR, NODES[n].start);
         } else {
             note_write(id, BYTES, WHY_FROM_BYTES, NODES[n].start);
@@ -585,7 +873,7 @@ fn note_args(n: i64, f: i64) {
             }
             continue;
         }
-        if !is_buf_type(NODES[arg].ty) {
+        if !has_buf(NODES[arg].ty) {
             continue;
         }
         let id = binding(arg);
@@ -596,11 +884,23 @@ fn note_args(n: i64, f: i64) {
         if user && i < NODES[def].count {
             let p = child(def, i);
             let pid = decl_binding(p);
-            if pid >= 0 && buf_type_node(NODES[p].b) {
+            if pid >= 0 && mentions_buf(NODES[p].b) {
                 set(&TYPE_NODE, pid, NODES[p].b);
                 anchor(pid);
             }
             join(id, pid);
+        } else if !is_buf_type(NODES[arg].ty) || !user && def > 0 && i < NODES[def].count
+            && NODES[child(def, i)].kind == NodeKind::Param && !mentions_buf(NODES[child(def, i)].b)
+            && !param_is_string(f, i) && !printer(f) {
+            // (a holder given to std, or a Buf given to a std generic,
+            // `names.push(b)`, `std::replace(&s.f, b)`: one with the
+            // other arguments that hold one)
+            for j in 0..NODES[n].count {
+                let other = child(n, j);
+                if j != i && NODES[other].kind != NodeKind::NamedArg && has_buf(NODES[other].ty) {
+                    join(id, binding(other));
+                }
+            }
         } else if !user && param_is_string(f, i) {
             note_write(id, TEXT, WHY_STD_STRING, NODES[arg].start);
         } else if !user && printer(f) {
@@ -616,6 +916,7 @@ fn note_args(n: i64, f: i64) {
 // The bindings, their flows and writes.
 pub fn collect() {
     load_decls();
+    load_local_decls();
     for n in 1..NODES.len() as i64 {
         let k = NODES[n].kind;
         if (NODES[n].p & NODE_IMPLICIT) != 0 || !user_pos(NODES[n].start) {
@@ -624,26 +925,52 @@ pub fn collect() {
         if k == NodeKind::Let {
             let pat = NODES[n].a;
             let id = if pat > 0 { decl_binding(pat) } else { -1 };
-            if id >= 0 && buf_type_node(NODES[n].b) {
+            if id >= 0 && mentions_buf(NODES[n].b) {
                 set(&TYPE_NODE, id, NODES[n].b);
                 anchor(id);
             }
             let init = NODES[n].c;
-            if id >= 0 && init > 0 && is_buf_type(NODES[init].ty) {
+            if id >= 0 && init > 0 && has_buf(NODES[init].ty) {
                 anchor(id);
             }
             if id >= 0 && get(ANCHOR, id) != 0 {
                 flow(id, init);
             }
+            if pat > 0 && NODES[pat].kind != NodeKind::PatBind && init > 0 {
+                // (`let Some(b) = e else { .. }`)
+                bind_pattern(pat, if has_buf(NODES[init].ty) { binding(init) } else { -1 });
+            }
         } else if k == NodeKind::Param {
             let id = decl_binding(n);
-            if id >= 0 && buf_type_node(NODES[n].b) {
+            if id >= 0 && mentions_buf(NODES[n].b) {
                 set(&TYPE_NODE, id, NODES[n].b);
                 anchor(id);
+                // (a by-value parameter: a Buf written through it writes
+                // the caller's, a String or a Vec a copy)
+                if NODES[NODES[n].b].kind != NodeKind::TyPtr
+                    && (NODES[n].p & (CONV_INOUT | CONV_SINK)) == 0 {
+                    set(&LET_PARAM, id, 1);
+                }
             }
         } else if k == NodeKind::Field {
             field_binding(n);
-        } else if k == NodeKind::Fn && buf_type_node(NODES[n].b) {
+        } else if k == NodeKind::VariantLit {
+            // (a program's variant's Buf fields: `Msg::Text(b)`)
+            for i in 0..NODES[n].count {
+                let fid = vfield_binding(NODES[n].a, i);
+                if fid >= 0 {
+                    flow(fid, child(n, i));
+                }
+            }
+        } else if k == NodeKind::Match && NODES[n].a > 0 {
+            let s = NODES[n].a;
+            let sid = if has_buf(NODES[s].ty) { binding(s) } else { -1 };
+            for i in 0..NODES[n].count {
+                bind_pattern(NODES[child(n, i)].a, sid);
+            }
+        } else if k == NodeKind::Index && NODES[n].a > 0 && is_buf_type(NODES[NODES[n].a].ty) {
+            note_write(binding(NODES[n].a), BYTES, WHY_INDEX, NODES[n].start);
+        } else if k == NodeKind::Fn && mentions_buf(NODES[n].b) {
             let id = id_of(NODES[n].start * 4 + K_RESULT);
             set(&TYPE_NODE, id, NODES[n].b);
             anchor(id);
@@ -652,8 +979,11 @@ pub fn collect() {
             if body > 0 && NODES[body].kind == NodeKind::Block && NODES[body].a != 0 {
                 flow(id, NODES[body].a);
             }
-        } else if k == NodeKind::Assign && NODES[n].c > 0 && is_buf_type(NODES[NODES[n].c].ty) {
-            join(binding(NODES[n].b), binding(NODES[n].c));
+        } else if k == NodeKind::Assign && NODES[n].c > 0 && has_buf(NODES[NODES[n].c].ty) {
+            let target = binding(NODES[n].b);
+            if target >= 0 {
+                flow(target, NODES[n].c);
+            }
         } else if k == NodeKind::Assign && NODES[n].c > 0 && is_buf_type(NODES[NODES[n].b].ty) {
             note_given(binding(NODES[n].b), NODES[n].c);
         } else if k == NodeKind::StructLit {
@@ -661,8 +991,11 @@ pub fn collect() {
             for i in 0..NODES[n].count {
                 let init = child(n, i);
                 let v = NODES[init].b;
-                if v > 0 && is_buf_type(NODES[v].ty) {
-                    join(field_binding(field_of(s, NODES[init].x, NODES[init].a)), binding(v));
+                if v > 0 && has_buf(NODES[v].ty) {
+                    let fid = field_binding(field_of(s, NODES[init].x, NODES[init].a));
+                    if fid >= 0 {
+                        flow(fid, v);
+                    }
                 } else if v > 0 {
                     note_given(field_binding(field_of(s, NODES[init].x, NODES[init].a)), v);
                 }
@@ -713,9 +1046,14 @@ pub fn collect() {
             && NODES[n].y > 0 && NODES[NODES[n].y].count > 0 {
             // (a `b.push_fmt("..")` the checker wrote in place: its
             // receiver is the block's first `let`'s, `__r`)
-            let first = child(NODES[n].y, 0);
-            if NODES[first].kind == NodeKind::Let {
-                note_method(n, NODES[n].x - 1, NODES[first].c);
+            // (`b.push_fmt("{}", x)`: its arguments' lets may come first)
+            for i in 0..NODES[NODES[n].y].count {
+                let s = child(NODES[n].y, i);
+                if NODES[s].kind == NodeKind::Let && NODES[s].c > 0
+                    && is_buf_type(NODES[NODES[s].c].ty) {
+                    note_method(n, NODES[n].x - 1, NODES[s].c);
+                    break;
+                }
             }
         }
     }
@@ -903,6 +1241,35 @@ fn rewrite_ctor(n: i64, side: i64) -> i64 {
     0
 }
 
+// Call n's `name(ARGS)` at `at` (push_fmt, push_int on a binding decided
+// bytes) written as a Vec<u8, A>'s `extend_from_slice(format_in(ARGS,
+// R.allocator()).as_bytes())`, R its receiver as written: the same bytes.
+// The number of edits.
+fn fmt_into_bytes(n: i64, at: i64, name: [u8]) -> i64 {
+    let end = NODES[n].end;
+    var dot = at - 1;
+    while dot > NODES[n].start && SRC[dot] != '.' {
+        dot -= 1;
+    }
+    var p = at + name.len as i64;
+    while p < end && SRC[p] == ' ' {
+        p += 1;
+    }
+    if dot <= NODES[n].start || p >= end || SRC[p] != '(' || SRC[end - 1] != ')' {
+        return 0;
+    }
+    let text = buf_new();
+    buf_str(text, c"extend_from_slice(format_in(");
+    if name == "push_int" {
+        buf_str(text, c"\"{}\", ");
+    }
+    buf_bytes(text, SRC[p + 1..end - 1]);
+    buf_str(text, c", ");
+    buf_bytes(text, SRC[NODES[n].start..dot]);
+    buf_str(text, c".allocator()).as_bytes())");
+    if ref_in(at) && edit_replace(at, end, text) { 1 } else { 0 }
+}
+
 // The method table, printed.
 fn put_table() {
     let d = diag(c"note", c"fix.buf-table");
@@ -948,6 +1315,8 @@ pub fn buf_edits() -> i64 {
         var text_id = -1;
         var bytes_id = -1;
         var extern_id = -1;
+        var strong_id = -1;
+        var letw_id = -1;
         for m in 0..count {
             if root(m) != r {
                 continue;
@@ -957,6 +1326,12 @@ pub fn buf_edits() -> i64 {
             }
             if get(TEXT_AT, m) >= 0 && text_id < 0 {
                 text_id = m;
+            }
+            if get(STRONG_AT, m) >= 0 && strong_id < 0 {
+                strong_id = m;
+            }
+            if get(LETW_AT, m) >= 0 && letw_id < 0 {
+                letw_id = m;
             }
             if get(BYTES_AT, m) >= 0 && bytes_id < 0 {
                 bytes_id = m;
@@ -980,20 +1355,29 @@ pub fn buf_edits() -> i64 {
             buf_str(why, c"' at ");
             put_place(why, get(EXTERN_AT, extern_id));
             buf_str(why, c", which takes a Buf");
-        } else if text_id >= 0 && bytes_id >= 0 {
+        } else if strong_id >= 0 && bytes_id >= 0 {
             buf_str(why, c"mixed: text (");
-            buf_bytes(why, why_text(get(TEXT_WHY, text_id)));
+            buf_bytes(why, why_text(get(STRONG_WHY, strong_id)));
             buf_str(why, c" at ");
-            put_place(why, get(TEXT_AT, text_id));
+            put_place(why, get(STRONG_AT, strong_id));
             buf_str(why, c") and bytes (");
             buf_bytes(why, why_text(get(BYTES_WHY, bytes_id)));
             buf_str(why, c" at ");
             put_place(why, get(BYTES_AT, bytes_id));
             buf_str(why, c")");
-        } else if text_id < 0 && bytes_id < 0 {
-            buf_str(why, c"no write says text or bytes");
+        } else if letw_id >= 0 {
+            if letw_id != anchored {
+                put_binding(why, letw_id);
+                buf_str(why, c", ");
+            }
+            buf_str(why, c"a by-value parameter, written at ");
+            put_place(why, get(LETW_AT, letw_id));
+            buf_str(why,
+                c" (a Buf there is the caller's, a String or a Vec a copy): make it `inout` first (refactor signature)");
         } else {
-            s = if text_id >= 0 { TEXT } else { BYTES };
+            // (bytes win over the weak text writes; no write at all: a
+            // Vec<u8, A>, the bytes the Buf held)
+            s = if text_id >= 0 && bytes_id < 0 { TEXT } else { BYTES };
             // (a constructor with no form on that side: Buf::from_in as bytes)
             for m in 0..count {
                 let c = CTOR_OF.get(m + 1) - 1;
@@ -1060,7 +1444,10 @@ pub fn buf_edits() -> i64 {
             // SAFETY: CALLS holds methods' names, symbols.
             let name = unsafe { SYMS[get(CALLS, k + 2)].text };
             let row = row_of(name);
-            if row >= 0 && TABLE[row][s] != name && SRC[at..at + name.len as i64] == name {
+            if s == BYTES && (name == "push_fmt" || name == "push_int")
+                && SRC[at..at + name.len as i64] == name {
+                edits += fmt_into_bytes(get(CALLS, k), at, name);
+            } else if row >= 0 && TABLE[row][s] != name && SRC[at..at + name.len as i64] == name {
                 let text = buf_new();
                 buf_bytes(text, TABLE[row][s]);
                 if ref_in(at) && edit_replace(at, at + name.len as i64, text) {

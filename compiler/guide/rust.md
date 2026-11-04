@@ -26,14 +26,14 @@ more often than to something else, and each error names the fix.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var b = Buf::new_in(gpa);                  // freed at the end of main
+    var b = String::new_in(gpa);               // freed at the end of main
     b.push_str("sum=");
     let parts = split_in("40,2", ',', gpa);
     var sum = 0;
     for p in parts.as_slice() {
         sum += parse_int(p).unwrap_or(0);
     }
-    b.push_int(sum);
+    b.push_fmt(sum);
     println(b.as_slice());
     if parse_int("4x").is_err() { println("not a number"); }
     0

@@ -62,11 +62,11 @@ fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
     var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
     keep(&all, v);                     // v moved into keep: dead from here
     let s = "hi";
-    println(s.len());                  // an i64 (slices, Vec, Buf, HashMap)
-    var b = Buf::new_in(gpa);          // a text builder
+    println(s.len());                  // an i64 (slices, Vec, String, HashMap)
+    var b = String::new_in(gpa);       // a text builder
     let o = odds(7, gpa);
     b.push_str("n=");
-    b.push_int(o.len() as i64);
+    b.push_fmt(o.len());
     println(b.as_slice());
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
     var m: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);

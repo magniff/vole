@@ -2,7 +2,7 @@
 
 One complete program, written the way vole code is written: modules
 and `use`, enums with data and `match`, `Result` and `?`, `Vec`,
-`HashMap`, `Buf`, text as `[u8]`, a sort closure, format strings, the
+`HashMap`, `String`, text as `[u8]`, a sort closure, format strings, the
 allocator passed down from `main`, and a test case. A program of this
 kind needs only what it shows: copy its patterns.
 
@@ -176,14 +176,14 @@ impl Store<Gpa> {
             let d = b.count * b.price - a.count * a.price;
             if d != 0 { d } else { cmp_of(a.name, b.name) }
         });
-        var out = Buf::new_in(gpa);             // Rust's String
+        var out = String::new_in(gpa);          // as Rust's String
         var total = 0;
         for it in order {
             out.push_fmt("{:<5}{:>3} x {:>2} = {}\n", it.name, it.count, it.price, value(it));
             total += value(it);
         }
         out.push_str("total ");
-        out.push_int(total);
+        out.push_fmt(total);
         println(out.as_slice());
     }
 }
@@ -250,5 +250,5 @@ total 129
   value. Bindings: `let` (fixed), `var` (changes).
 - Comparators return an `i64` (negative: `a` first) and take their
   elements let: `sort_by(|a, b| ..)`, `cmp_of(a, b)`.
-- `Buf` is Rust's `String`: `push_str`, `push_int`, `push_fmt("..", args)`,
-  `as_slice()`.
+- `String<A>` is Rust's `String`: `push_str`, `push_fmt("..", args)`,
+  `as_str()`, `as_slice()`.
