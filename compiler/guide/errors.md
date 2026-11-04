@@ -551,13 +551,14 @@ f.write("P({})", self.x); } }`), or print with `{p:?}` and
 fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 
 ```vole
-fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
+fn main() -> i32 { let x = 1; println(f"x = {x + 1}"); 0 }
 ```
 ```err
-f-strings cannot be nested
+f-strings are removed (0.26.3)
 ```
-Compute the inner one in a `let` first. A `:` outside brackets ends a
-hole (the spec follows): parenthesize, `{(|x: i64| x + 1)(n)}`.
+`volec fix --only fstring --keep-braces FILE` rewrites them: a name
+stays in its hole, an expression becomes `{}` and an argument,
+`println("x = {}", x + 1)`.
 
 ## Generics and traits
 

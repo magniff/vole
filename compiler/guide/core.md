@@ -58,7 +58,7 @@ fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
     v.sort();                          // or sort(v.as_mut_slice())
     var p = P { x: 1 };
     p.bump();                          // a receiver needs no &; p must be var
-    println("{} {v:?} {}", p.get(), total(v)); // f-strings; total(v) only reads
+    println("{} {v:?} {}", p.get(), total(v)); // formatted; total(v) only reads
     var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
     keep(&all, v);                     // v moved into keep: dead from here
     let s = "hi";

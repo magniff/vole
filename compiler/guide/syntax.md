@@ -20,8 +20,9 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
   `'\x41'`, `'\''` (one byte, a `u8`). Strings: `"a\tb\n\"q\"\\"`,
   `"\x41"`, `"\u{e9}"` (UTF-8 bytes); `c"..."` is NUL-terminated;
-  `f"x = {x:>4}"` is an f-string (0.15; `guide formatting`: since
-  0.26.2 a format string, `println("x = {x:>4}")`, writes it). A
+  `f"x = {x:>4}"`, an f-string (0.15 to 0.26.2), is removed
+  (`syntax.fstring`, 0.26.3): a format string, `println("x = {x:>4}")`,
+  writes it (`guide formatting`). A
   backslash at the end of a line inside a string continues it, leaving
   out the line break and the next line's indentation.
 - Text blocks (0.25.3), for text of several lines (WGSL, SQL, a usage
@@ -32,9 +33,10 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   before the closing line are not in the value; escapes work as in
   `"..."`, a `\` at a line's end joins it to the next. `r"""` is a raw
   block: no escapes, a `\` is a backslash; text with a line starting
-  with `"""` goes in `r#"""` .. `"""#`. `f"""` (0.25.4) is an f-string
-  text block: the same lines and dedent, with holes (`{x}`, `{x:>4}`,
-  `{{` for a brace) and quotes as text. A text block is a string
+  with `"""` goes in `r#"""` .. `"""#`. A text block
+  at a format position, `println("""` .. `""")` or `format_args("""`
+  .. `""", args)`, is a format string: the same lines and dedent, with
+  holes (`{x}`, `{x:>4}`, `{{` for a brace) and quotes as text. A text block is a string
   literal: a `[u8]` or a `str`, in a `const` too. `volec fmt` leaves its
   lines as they are.
 - `include_str("shader.wgsl")` is the file's text as a string literal,
