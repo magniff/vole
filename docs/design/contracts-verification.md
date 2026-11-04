@@ -244,7 +244,7 @@ No program breaks.
 `contract.effect` names the effect and its chain.
 
 **Several clauses** are checked in order, and the first false one is reported.
-`else "message"` (or `else f"..."`, evaluated only on failure) replaces the
+`else "message"` (a format string since 0.26.2, `else "bad {x}"`, evaluated only on failure; an f-string before) replaces the
 condition's text in the report; the values are still printed.
 
 **`debug` clauses** are checked only in test builds (`volec test`,
