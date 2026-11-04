@@ -16,7 +16,7 @@ v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
 String::new_in(gpa) -> String   text you build (Buf: bytes)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
-read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
+read_stdin_in(gpa) -> Result<Vec<u8, Gpa>, IoError> all of stdin
 print(x), println(x)             any Display; println("{x} {:?}", v)
 b.push_int(v: i64)
 v.set(i: usize, x: T)            checked, as v[i] = x
@@ -163,9 +163,9 @@ MinHeap: `volec guide --find dijkstra`.
 `read_line(&buf)` reads stdin a line at a time: the line goes into the
 `String` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
-`Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left
-(a `Result<Buf, IoError>`); the two share a buffer, so they mix, but not with
-C's `getchar` or `scanf`. A `Scanner` reads a text's tokens
+`Err(IoError::Read)`). `read_stdin_in(gpa)` returns the rest of stdin (a
+`Result<Vec<u8, Gpa>, IoError>`); the two share a buffer: they mix, but
+not with C's `getchar`. A `Scanner` reads a text's tokens
 (`next_token`; `next_int`, a `Result<i64, ScanError>`) and lines
 (`next_line`); `parse_int` (a `Result<i64, ParseIntError>`),
 `split_in`, `split_whitespace_in` and `trim` work on any `[u8]`. An Option

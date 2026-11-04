@@ -20,7 +20,7 @@ use command::{Error, parse};
 use store::Store;
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Buf
+    let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Vec<u8, Gpa>
     var store = Store::new(gpa);                // it allocates: give it gpa
     var sc = Scanner::new(input.as_slice());
     var line_no = 0;

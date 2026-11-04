@@ -115,7 +115,7 @@ struct Item { name: [u8], qty: i64 }
 fn add(v: inout Vec<Item, Gpa>, it: Item) { v.push(it); } // called as add(&items, ..)
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Buf, IoError>
+    let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Vec<u8, Gpa>, IoError>
     var sc = Scanner::new(input.as_slice());
     let n = sc.next_int().unwrap();            // Result<i64, ScanError>
     var items: Vec<Item, Gpa> = Vec::new_in(gpa);

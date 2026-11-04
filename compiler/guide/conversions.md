@@ -187,7 +187,7 @@ with an error enum means failure. std's input (0.15):
 | function | returns | at the end, on failure |
 |---|---|---|
 | `read_line(&buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
-| `read_stdin_in(gpa)` | `Result<Buf, IoError>` | `Err(IoError::Read)` |
+| `read_stdin_in(gpa)` | `Result<Vec<u8, Gpa>, IoError>` | `Err(IoError::Read)` |
 | `parse_int(s)` | `Result<i64, ParseIntError>` | `Empty`, `InvalidDigit(at)` (the byte's index), `Overflow` |
 | `sc.next_int()` | `Result<i64, ScanError>` | `ScanError::End`, `ScanError::Parse(e)` |
 | `sc.next_token()`, `sc.next_line()` | `Option<[u8]>` | `None` at the end |

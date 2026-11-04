@@ -266,7 +266,7 @@ fn main() -> i32 {
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
 | `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
+| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Vec<u8, Gpa>, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C
