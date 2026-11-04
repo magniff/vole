@@ -360,8 +360,8 @@ def program(cs, header, extra=""):
     src += """
 fn show(n: str, r: Result<i64, i64>) {
     match r {
-        Ok(v) => println(f"{n} ok {v}"),
-        Err(e) => println(f"{n} err {e}"),
+        Ok(v) => println("{n} ok {v}"),
+        Err(e) => println("{n} err {e}"),
     }
 }
 """

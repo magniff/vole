@@ -25,7 +25,7 @@ fn main() {
     var player = Player { room: 0, moves: 0 };
     player.room = 1;
     player.moves += 1;
-    println(f"room {player.room}, {player.moves} moves");
+    println("room {}, {} moves", player.room, player.moves);
 }
 ```
 
@@ -45,7 +45,7 @@ struct Player { room: i64, moves: i64 }
 
 fn main() {
     let player = Player { room: 0 };
-    println(f"room {player.room}");
+    println("room {}", player.room);
 }
 ```
 
@@ -66,7 +66,7 @@ fn main() {
     let moves = 5;
     let a = Player { room, moves };
     let b = Player { room: 2, moves: 5 };
-    println(f"{a == b}");
+    println("{}", a == b);
 }
 ```
 
@@ -96,7 +96,7 @@ impl Player {
     }
 
     fn describe(self) {
-        println(f"You are in room {self.room}, after {self.moves} moves.");
+        println("You are in room {}, after {} moves.", self.room, self.moves);
     }
 
     fn walk_to(inout self, room: i64) {
@@ -403,7 +403,7 @@ fn is_move(c: Command) -> bool {
 }
 
 fn main() {
-    println(f"{verb(Command::Look)} {is_move(Command::Quit)}");
+    println("{} {}", verb(Command::Look), is_move(Command::Quit));
 }
 ```
 
@@ -452,7 +452,7 @@ fn next_room(room: i64, d: Direction) -> Option<i64> {
 
 fn main() {
     match next_room(0, Direction::West) {
-        Some(r) => println(f"you walk into room {r}"),
+        Some(r) => println("you walk into room {r}"),
         None => println("you can't go that way"),
     }
 }
@@ -477,7 +477,7 @@ A full `match` is a lot of ceremony when you care about one case.
 fn main() {
     let found: Option<i64> = Some(3);
     if let Some(room) = found {
-        println(f"found room {room}");
+        println("found room {room}");
     } else {
         println("nothing found");
     }
@@ -498,7 +498,7 @@ fn main(gpa: Gpa) {
     path.push(1);
     path.push(2);
     while let Some(room) = path.pop() {
-        print(f"{room} ");
+        print("{room} ");
     }
     println("back at the start");
 }
@@ -540,7 +540,7 @@ the first space and the text after it, or `None` if there is no space.
 Here's everything together: a game you can play from standard input,
 as in chapter 2. `parse` turns a line into a `Command`, and `apply`
 carries it out. `#[derive(Debug)]` on a type lets you print it with
-`{c:?}` in an f-string, which is a quick way to see what your code is
+`{c:?}` in a format string, which is a quick way to see what your code is
 working with:
 
 ```vole adventure.vl
@@ -571,7 +571,7 @@ impl Player {
             1 => "the kitchen",
             _ => "the garden",
         };
-        println(f"You are in {name}.");
+        println("You are in {name}.");
     }
 
     // Returns false when the game is over.
@@ -590,7 +590,7 @@ impl Player {
                     self.lamp = true;
                     println("Taken.");
                 } else {
-                    println(f"There is no {item} here.");
+                    println("There is no {item} here.");
                 }
             }
             Command::Look => self.describe(),
@@ -654,12 +654,12 @@ fn main(gpa: Gpa) {
             println("I don't understand.");
             continue;
         };
-        println(f"> {c:?}");
+        println("> {c:?}");
         if !player.apply(c) {
             break;
         }
     }
-    println(f"You made {player.moves} moves.");
+    println("You made {} moves.", player.moves);
 }
 ```
 
@@ -716,14 +716,14 @@ enum Light { Dark = 0, Dim = 1, Bright = 2 }
 
 fn main() {
     let l = Light::Dim;
-    println(f"{l as i64}");
+    println("{}", l as i64);
     let n = 2;
     let back = n as Light;
     if back == Light::Bright {
         println("bright");
     }
     let bad = 7 as Light;
-    println(f"{bad as i64}");
+    println("{}", bad as i64);
 }
 ```
 

@@ -87,6 +87,26 @@ aarch64-macos only.
   had not compiled since 0.20's spellings and nothing built it. The
   tables stay as generated (Unicode 18.0.0); v0.26.2 has the generator.
 
+f-strings removed (fstr263):
+
+- `f"..."` is `error syntax.fstring` (`explain syntax.fstring`): once
+  per file, at its first f-string, with how many the file has, and
+  `try: volec fix --only fstring --keep-braces FILE`, which still reads
+  them and rewrites every one as a format literal (a name hole stays, an
+  expression becomes `{}` and an argument after the literal) or, away
+  from a format function, `format_args(..)`. The rest of the file is
+  checked as before. Use `--keep-braces` for code written for 0.26.2;
+  without it the fix also doubles the braces of plain literals at format
+  positions, as code from before 0.26.2 needs.
+- The tree has none left: compiler/src (444, the release's first
+  migration), std's comments, tools/ and the generators' output, bench/,
+  examples/, tests/, tests/agent-eval (with `fix --only usize`), the
+  Book, the guide's examples and docs/' examples. What remains is `fix --only fstring`'s own
+  cases and the error's.
+- The messages that named an f-string name the value of `format_args`:
+  `a format_args value is a 'std::Interp' (a value that prints), not
+  '[u8]'`; a contract message's holes (`contract.message`).
+
 compiler/src on `usize` (usize263):
 
 - `volec fix --only casts` removes a usize's `as i64` (`s.len as i64`,

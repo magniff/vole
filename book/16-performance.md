@@ -90,7 +90,7 @@ fn time_it(name: str, f: fn([u8], u8) -> usize, s: [u8]) {
             best = took;
         }
     }
-    println(f"{name:<5} {result} lines in {best.as_millis_f64():.1} ms");
+    println("{name:<5} {result} lines in {:.1} ms", best.as_millis_f64());
 }
 
 fn main(gpa: Gpa) {
@@ -101,7 +101,7 @@ fn main(gpa: Gpa) {
         time_it("loop", count_loop, s);
         time_it("iter", count_iter, s);
     } else {
-        println(f"{count_loop(s, '\n')} {count_iter(s, '\n')}");
+        println("{} {}", count_loop(s, '\n'), count_iter(s, '\n'));
     }
 }
 ```
@@ -255,7 +255,7 @@ fn main(gpa: Gpa) {
     for c in "one\ntwo\nthree\nfour\n" {
         v.push(c);
     }
-    println(f"{count_window(v, 0, 8, '\n')} {count_window(v, 8, v.len(), '\n')}");
+    println("{} {}", count_window(v, 0, 8, '\n'), count_window(v, 8, v.len(), '\n'));
 }
 ```
 
@@ -301,7 +301,7 @@ fn main(gpa: Gpa) {
     for c in "one\ntwo\nthree\nfour\n" {
         v.push(c);
     }
-    println(f"{count_window(v, 0, 8, '\n')} {count_window(v, 8, v.len(), '\n')}");
+    println("{} {}", count_window(v, 0, 8, '\n'), count_window(v, 8, v.len(), '\n'));
 }
 ```
 
@@ -370,7 +370,7 @@ fn count_simd(s: [u8], b: u8) -> usize {
 
 fn main() {
     let text = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
-    println(f"{count_loop(text, '\n')} {count_simd(text, '\n')}");
+    println("{} {}", count_loop(text, '\n'), count_simd(text, '\n'));
 }
 ```
 
@@ -434,7 +434,7 @@ fn crc32c_hw(s: [u8]) -> u32 {
 }
 
 fn main() {
-    println(f"{crc32c_hw("123456789"):08x}");
+    println("{:08x}", crc32c_hw("123456789"));
 }
 ```
 
@@ -453,7 +453,7 @@ does, and see:
 ```console macos
 $ volec -C target-cpu=generic crc.vl -o crc
 error[arch.feature]: 'crc32c_hw' needs crc (from '__crc32cb' at crc.vl:7:13), which 'main' does not know here: the build's features are neon
- --> crc.vl: line 13, column 16
+ --> crc.vl: line 13, column 23
   = help: test the CPU with `if std::arch::detect("crc") { ... } else { ... }` and a fallback in the else branch (one of the same signature named `crc32c_hw_portable`, `_scalar` or `_fallback` is offered here), declare #[target_feature] on the caller, or build for CPUs that have it
   = try: volec -C target-feature=+crc -C target-cpu=generic -o crc crc.vl
   = try: volec query features crc32c_hw --why crc -C target-cpu=generic crc.vl
@@ -496,7 +496,7 @@ fn crc32c(s: [u8]) -> u32 {
 }
 
 fn main() {
-    println(f"{crc32c("123456789"):08x} (crc: {detect("crc")})");
+    println("{:08x} (crc: {})", crc32c("123456789"), detect("crc"));
 }
 ```
 

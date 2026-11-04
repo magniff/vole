@@ -7,18 +7,21 @@
 ## a plain literal at a format position gets its braces doubled (it
 ## printed them before 0.26.2). The program prints what it printed but
 ## for that literal, which prints as 0.26.1 printed it.
-% volec main.vl -o before >/dev/null && ./before 2>&1
-n = 42,    42 2 lit {brace}
-text 42 {
-no holes
-42-1
-42 P(1, "x")
-2a
-[1]
-block 42
-and 1
-1
-ok: built before
+## (0.26.3) f-strings are removed, so the program no longer builds
+## before the fix; 0.26.2 built it, and it printed what it prints after:
+##   n = 42,    42 2 lit {brace}
+##   text 42 {
+##   no holes
+##   42-1
+##   42 P(1, "x")
+##   2a
+##   [1]
+##   block 42
+##   and 1
+##   1
+$ check
+main.vl:5:17: error[syntax.fstring] f-strings are removed (0.26.3): a format string takes the values as arguments (12 in this file, the first here) | help: a name stays in its hole and an expression goes after the literal: `println("{n} {}", v.len())`; elsewhere `format_args("..", args)` | try: volec fix --only fstring --keep-braces main.vl
+[exit 1]
 $ fix --only fstring
 fixed 13 f-strings and format literals	main.vl	+15 -15 lines
 % cat main.vl

@@ -746,7 +746,7 @@ A struct with no fields has its literal anywhere; enum variants' fields
 are public. std's modules are modules like any: a child sees its
 parent's private fields, a sibling does not. What the compiler writes
 itself (main's `Gpa {}`, structural `==`, a derive, a closure's
-captures, an f-string) is let through. On a field of your own program
+captures, a format literal's writes) is let through. On a field of your own program
 the error's help is the declaration with `pub` and where it is, which
 `volec fix --only pub` writes; on a field with a method of its name
 (`v.len`), the call. (Until 0.26 a field was as visible as its struct,
@@ -1427,7 +1427,7 @@ formatting`.
 
 ```ebnf
 postfix    += expr "?"                                   (* as tight as . ( [ *)
-primary    += fstring
+primary    += fstring                                  (* error syntax.fstring, 0.26.3 *)
 fstring     = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
 spec        = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
 args        = [ arg { "," arg } [ "," ] ]
@@ -1559,8 +1559,12 @@ Until 0.26.1 a plain literal at a format position was printed as it is,
 braces and all; `volec fix --only fstring` doubles such a literal's
 braces, so that its output stays the same.
 
-**f-strings** (`f"..."`, until 0.28) stay accepted: an f-string is an
-expression of the same `std::Interp` type. Its text takes the escapes of
+**f-strings** (`f"..."`, 0.15 to 0.26.2) are removed (0.26.3): an
+f-string is `error syntax.fstring`, once per file, at its first, with
+how many the file has; its `try:` line is `volec fix --only fstring
+--keep-braces FILE`. The lexer and the parser still read the form, so
+that the rest of the file is checked and the fix rewrites it, as
+below. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
 a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
 any expression, `{expr:spec}` one with a spec (the same specs). The lexer
 reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
@@ -1822,10 +1826,10 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
   In an `ensures`, `result` is the returned value and `old(e)` is `e` at
   the function's entry (T1).
 - A clause's condition is an expression in which `{` ends it, as in an
-  `if`'s condition. The message after `else` is a string or an f-string;
+  `if`'s condition. The message after `else` is a string;
   (0.26.2) a plain literal is a format literal, its arguments after it:
   `requires v.len() > 0 else "empty: {} items", v.len()` (at most three
-  holes, as an f-string's).
+  holes, integers).
 - `#[cfg(test)]` marks the item after it (all of a module's items);
   `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
   compiles them as ordinary items (T2 leaves them out of builds that are

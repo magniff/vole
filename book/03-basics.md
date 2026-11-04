@@ -23,7 +23,7 @@ fn main() {
     var total = 0;
     total += rate;
     total += rate;
-    println(f"{total}");
+    println("{total}");
 }
 ```
 
@@ -40,7 +40,7 @@ says so, and how to fix it:
 fn main() {
     let total = 0;
     total += 3;
-    println(f"{total}");
+    println("{total}");
 }
 ```
 
@@ -61,7 +61,7 @@ fn main() {
     let width = "42";
     let width = width.len();
     let width = width * 10;
-    println(f"{width}");
+    println("{width}");
 }
 ```
 
@@ -124,7 +124,7 @@ fn main() {
     let flags = 0b1010;
     let small = 7u8;
     let half = 0.5f32;
-    println(f"{million} {mask} {flags} {small} {half}");
+    println("{million} {mask} {flags} {small} {half}");
 }
 ```
 
@@ -139,7 +139,7 @@ with `x` a `u32`, the 1 is a `u32`. But it has to fit:
 ```vole
 fn main() {
     let b: u8 = 300;
-    println(f"{b}");
+    println("{b}");
 }
 ```
 
@@ -162,7 +162,7 @@ fn main() {
     let x: i32 = 5;
     let y: i64 = 7;
     let z: i32 = x + y;
-    println(f"{z}");
+    println("{z}");
 }
 ```
 
@@ -187,7 +187,7 @@ an integer drops the fraction:
 fn main() {
     let price = 3.99;
     let cents: i64 = 250;
-    println(f"{price as i64} {cents as f64 / 100.0}");
+    println("{} {}", price as i64, cents as f64 / 100.0);
 }
 ```
 
@@ -211,11 +211,11 @@ defined answer:
 fn main() {
     let big = i64::MAX;
     let small: u8 = 250;
-    println(f"{big + 1}");
-    println(f"{small + 10}");
-    println(f"{7 / 0} {7 % 0}");
-    println(f"{-7 / 2} {-7 % 2}");
-    println(f"{1e30 as i64} {-1.5 as i64}");
+    println("{}", big + 1);
+    println("{}", small + 10);
+    println("{} {}", 7 / 0, 7 % 0);
+    println("{} {}", -7 / 2, -7 % 2);
+    println("{} {}", 1e30 as i64, -1.5 as i64);
 }
 ```
 
@@ -266,7 +266,7 @@ a `bool`; flipping the bits of an integer is `~`:
 ```vole
 fn main() {
     let warm = 25 > 20;
-    println(f"{warm && !false} {~5}");
+    println("{} {}", warm && !false, ~5);
 }
 ```
 
@@ -287,7 +287,7 @@ it. A byte prints as a number, unless you format it with `:c`:
 ```vole
 fn main() {
     let letter = 'a';
-    println(f"{letter} {letter:c} {(letter + 1):c}");
+    println("{letter} {letter:c} {:c}", (letter + 1));
 }
 ```
 
@@ -303,9 +303,9 @@ so on, or you can take it apart with a `let`:
 ```vole
 fn main() {
     let city = ("Oslo", 59.9, 709000);
-    println(f"{city.0} is at latitude {city.1}");
+    println("{} is at latitude {}", city.0, city.1);
     let (name, _, people) = city;
-    println(f"{name} has {people} people");
+    println("{name} has {people} people");
 }
 ```
 
@@ -330,7 +330,7 @@ fn main() {
     let days = [31, 28, 31, 30];
     var leap = days;
     leap[1] = 29;
-    println(f"{days[1]} {leap[1]} {days.len()}");
+    println("{} {} {}", days[1], leap[1], days.len());
 }
 ```
 
@@ -349,12 +349,12 @@ program stops with a message:
 fn main() {
     let days = [31, 28, 31, 30];
     let month = 4;
-    println(f"{days[month]}");
+    println("{}", days[month]);
 }
 ```
 
 ```out exit=101
-main.vl:4:16: index out of bounds: index 4, length 4
+main.vl:4:19: index out of bounds: index 4, length 4
 ```
 
 That's a panic, as in chapter 2: the program prints where it stopped
@@ -383,7 +383,7 @@ fn celsius_to_fahrenheit(c: f64) -> f64 {
 
 fn main() {
     let body = 37.0;
-    println(f"{body} C is {celsius_to_fahrenheit(body)} F");
+    println("{body} C is {} F", celsius_to_fahrenheit(body));
 }
 ```
 
@@ -433,9 +433,9 @@ fn years_to_double(start: f64, rate: f64 = 0.05) -> i64 {
 }
 
 fn main() {
-    println(f"37 C is {celsius_to_fahrenheit(37.0)} F");
-    println(f"at 5%: {years_to_double(1000.0)} years");
-    println(f"at 7%: {years_to_double(1000.0, rate: 0.07)} years");
+    println("37 C is {} F", celsius_to_fahrenheit(37.0));
+    println("at 5%: {} years", years_to_double(1000.0));
+    println("at 7%: {} years", years_to_double(1000.0, rate: 0.07));
 }
 ```
 
@@ -479,7 +479,7 @@ fn main() {
         let t = temperature * 2;
         t + 1
     };
-    println(f"{advice} {doubled}");
+    println("{advice} {doubled}");
 }
 ```
 
@@ -509,7 +509,7 @@ fn add_one(x: i64) -> i64 {
 }
 
 fn main() {
-    println(f"{add_one(1)}");
+    println("{}", add_one(1));
 }
 ```
 
@@ -550,7 +550,7 @@ fn main() {
     for step in 0..5 {
         let c = step * 10;
         let f = celsius_to_fahrenheit(c as f64);
-        println(f"{c:>4} C = {f:>6.1} F");
+        println("{c:>4} C = {f:>6.1} F");
     }
 }
 ```
@@ -563,7 +563,7 @@ fn main() {
   40 C =  104.0 F
 ```
 
-`step` is 0, 1, 2, 3 and 4 in turn. In the f-string, `{c:>4}` prints `c`
+`step` is 0, 1, 2, 3 and 4 in turn. In the format string, `{c:>4}` prints `c`
 right-aligned in four columns, and `{f:>6.1}` prints `f` in six columns
 with one decimal. (Chapter 7 has the rest of the format specs.)
 
@@ -573,7 +573,7 @@ for now `.rev()` works on `a..b` ranges, not on `a..=b` ones):
 ```vole
 fn main() {
     for i in (1..4).rev() {
-        print(f"{i}... ");
+        print("{i}... ");
     }
     println("go!");
 }
@@ -591,7 +591,7 @@ fn main() {
     for d in [31, 28, 31] {
         total += d;
     }
-    println(f"{total}");
+    println("{total}");
 }
 ```
 
@@ -614,7 +614,7 @@ fn main() {
             break n;
         }
     };
-    println(f"{first} is the first number whose square is over 200");
+    println("{first} is the first number whose square is over 200");
 }
 ```
 
@@ -647,7 +647,7 @@ fn main() {
         count += 1;
         largest = n;
     }
-    println(f"{count} primes below 50, the largest is {largest}");
+    println("{count} primes below 50, the largest is {largest}");
 }
 ```
 
@@ -682,7 +682,7 @@ fn boiling() -> f64 {
 }
 
 fn main() {
-    println(f"water boils at {boiling()} F");
+    println("water boils at {} F", boiling());
 }
 ```
 

@@ -69,7 +69,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"wc: {e}");
+            eprintln("wc: {e}");
             1
         }
     }
@@ -143,7 +143,7 @@ fn by_count(a: (String, i64), b: (String, i64)) -> i64 {
 
 pub fn print_table(rows: [(String, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -281,9 +281,9 @@ widen the table's count column. Suppose we misremember what the format
 says:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>4}' --new '{row.1:>6}'
-error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 29: println(f"{row.0:<12}{row.1:>5}");
-try: volec edit patch print_table --old '{row.1:>5}' --new '{row.1:>6}'
+$ volec edit patch print_table --old '{:>4}' --new '{:>6}'
+error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 29: println("{:<12}{:>5}", row.0, row.1);
+try: volec edit patch print_table --old '{:>5}' --new '{:>6}'
 ```
 
 Nothing was changed. The problem is one line with a stable code
@@ -292,7 +292,7 @@ Nothing was changed. The problem is one line with a stable code
 vole tool reports a problem in this shape. Running the `try:` line:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>5}' --new '{row.1:>6}'
+$ volec edit patch print_table --old '{:>5}' --new '{:>6}'
 patched crate::report::print_table	report.vl	+1 -1 lines
 ```
 
@@ -308,11 +308,11 @@ error, it writes nothing. Let's try to print a variable that doesn't
 exist:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}'
-report.vl:29:42: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:29:42: undefined variable 'share'
+$ volec edit patch print_table --old '{:>6}' --new '{:>6} {share}'
+report.vl:29:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:29:31: undefined variable 'share'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
-try: volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}' --no-check
+try: volec edit patch print_table --old '{:>6}' --new '{:>6} {share}' --no-check
 ```
 
 The error says what would go wrong, tagged `[edited: ...]` to show it

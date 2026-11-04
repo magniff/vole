@@ -28,17 +28,17 @@ library uses it that way everywhere:
 ```vole
 fn main(gpa: Gpa) {
     let line: str = "port = 8080";
-    println(f"{line.find("="):?} {line.find("#"):?}");
+    println("{:?} {:?}", line.find("="), line.find("#"));
 
     var defaults: HashMap<str, i64> = HashMap::new_in(gpa);
     defaults.insert("port", 80);
     defaults.insert("workers", 4);
     let port = defaults.get("port").unwrap_or(0);
     let timeout = defaults.get("timeout").unwrap_or(30);
-    println(f"{port} {timeout}");
+    println("{port} {timeout}");
 
     if let Some(w) = defaults.get("workers") {
-        println(f"{w} workers");
+        println("{w} workers");
     }
 }
 ```
@@ -80,12 +80,12 @@ fn main() {
     let good: str = "8080";
     let bad: str = "80x80";
     match good.parse::<i64>() {
-        Ok(n) => println(f"got {n}"),
-        Err(e) => println(f"error: {e}"),
+        Ok(n) => println("got {n}"),
+        Err(e) => println("error: {e}"),
     }
     match bad.parse::<i64>() {
-        Ok(n) => println(f"got {n}"),
-        Err(e) => println(f"error: {e}"),
+        Ok(n) => println("got {n}"),
+        Err(e) => println("error: {e}"),
     }
 }
 ```
@@ -145,11 +145,11 @@ fn parse_line(s: str, number: i64) -> Result<Setting, ConfigError> {
 
 fn report(line: str, number: i64) {
     match parse_line(line, number) {
-        Ok(Setting::Port(p)) => println(f"port {p}"),
-        Ok(Setting::Name(n)) => println(f"name {n}"),
-        Err(ConfigError::MissingEquals(n)) => println(f"line {n}: no '='"),
-        Err(ConfigError::BadNumber(e)) => println(f"bad number: {e}"),
-        Err(ConfigError::Unknown(n)) => println(f"line {n}: unknown setting"),
+        Ok(Setting::Port(p)) => println("port {p}"),
+        Ok(Setting::Name(n)) => println("name {n}"),
+        Err(ConfigError::MissingEquals(n)) => println("line {n}: no '='"),
+        Err(ConfigError::BadNumber(e)) => println("bad number: {e}"),
+        Err(ConfigError::Unknown(n)) => println("line {n}: unknown setting"),
     }
 }
 
@@ -267,7 +267,7 @@ change:
 ```vole
 fn main() {
     let port = "8080".parse::<i64>()?;
-    println(f"{port}");
+    println("{port}");
 }
 ```
 
@@ -299,7 +299,7 @@ fn parse_port(value: str) -> Result<i64, ConfigError> {
 
 fn main() {
     if let Ok(p) = parse_port("8080") {
-        println(f"{p}");
+        println("{p}");
     }
 }
 ```
@@ -443,7 +443,7 @@ fn main(gpa: Gpa) -> Result<(), ConfigError> {
     var text = String::new_in(gpa);
     while input.read_line(&text).unwrap() > 0 {}
     let config = load(text.as_str())?;
-    println(f"serving {config.name} on port {config.port}");
+    println("serving {} on port {}", config.name, config.port);
     Ok(())
 }
 ```
@@ -509,7 +509,7 @@ fn port_of(value: str) -> i64 {
 }
 
 fn show(value: str) {
-    println(f"port {port_of(value)}");
+    println("port {}", port_of(value));
 }
 
 fn main() {
@@ -616,7 +616,7 @@ between its signature and its body:
 fn listen(port: i64)
     requires port > 0 && port < 65536 else "a port is between 1 and 65535"
 {
-    println(f"listening on {port}");
+    println("listening on {port}");
 }
 
 fn main() {
