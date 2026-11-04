@@ -1,0 +1,237 @@
+// `#[deprecated]` (0.26.3, Rust's): a use of a deprecated item outside std
+// is warning item.deprecated, at the name, with the item's note. The
+// attribute's table is DEPRECATED (front/parser/items/attrs.vl), keyed by
+// the item's start. The uses are what the checker resolved: the names, the
+// calls, the fields and the struct literals its nodes keep (as `query
+// refs` reads them, report_deprecated_uses, after the checks), and the
+// type names, paths and imports it notes (note_deprecated_use, from
+// qnote). Std's own uses are std's: none is reported, and neither is a
+// use inside a deprecated item (a recursive call, a derived impl), as in
+// Rust.
+
+use crate::base::{SRC, buf_bytes, buf_new, buf_slice, buf_str, sym_text};
+use crate::base::diag::{buf_position, report_warning};
+use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::modules::{module_at, within_std};
+use crate::front::parser::items::attrs::{DEPRECATED, DEPRECATED_AT, DEPRECATED_NODES};
+use crate::front::types::{CONSTS, FNS, STATICS, STRUCTS, TYPES, TyKind};
+
+// The key of the warnings (report_warning tells warnings at one position
+// apart by it).
+const KEY: i64 = 7300;
+
+// The note of item node def + 2 (1: deprecated with no note), 0 when it
+// is not deprecated.
+fn note_of(def: i64) -> i64 {
+    if def <= 0 {
+        return 0;
+    }
+    DEPRECATED.get(NODES[def].start + 1)
+}
+
+// What item node def is, for the message.
+fn kind_word(def: i64, method: bool) -> *u8 {
+    let k = NODES[def].kind;
+    if k == NodeKind::Fn {
+        if method { c"method" } else { c"function" }
+    } else if k == NodeKind::Struct {
+        c"struct"
+    } else if k == NodeKind::Enum {
+        c"enum"
+    } else if k == NodeKind::TypeAlias {
+        c"type alias"
+    } else if k == NodeKind::Trait {
+        c"trait"
+    } else if k == NodeKind::Const {
+        c"constant"
+    } else if k == NodeKind::Static {
+        c"static"
+    } else if k == NodeKind::Field {
+        c"field"
+    } else {
+        c"item"
+    }
+}
+
+// Whether pos is inside a deprecated item, from its attributes on (a
+// recursive call, a derived impl's names, a deprecated method's field):
+// Rust reports no use there.
+fn inside_deprecated(pos: i64) -> bool {
+    for i in 0..DEPRECATED_NODES.count {
+        // UNSAFE: an IntVec's data is a raw pointer (base).
+        // SAFETY: i is below its count, the number of items it holds.
+        let d = unsafe { DEPRECATED_NODES.data[i] };
+        let from = DEPRECATED_AT.get(NODES[d].start + 1) - 1;
+        let start = if from >= 0 && from < NODES[d].start { from } else { NODES[d].start };
+        if pos >= start && pos < NODES[d].end {
+            return true;
+        }
+    }
+    false
+}
+
+// The warning for a use at pos of deprecated item node def, named `name`
+// (its symbol, or for a field `owner.name`), when pos is outside std and
+// outside the item.
+fn warn(pos: i64, def: i64, owner: i64, name: i64, method: bool) {
+    let note = note_of(def);
+    if note == 0 || pos < 0 {
+        return;
+    }
+    if inside_deprecated(pos) || within_std(module_at(pos)) {
+        return;
+    }
+    let m = buf_new();
+    buf_str(m, c"use of deprecated ");
+    buf_str(m, kind_word(def, method));
+    buf_str(m, c" '");
+    if owner >= 0 {
+        buf_bytes(m, sym_text(owner));
+        buf_bytes(m, if NODES[def].kind == NodeKind::Field { "." } else { "::" });
+    }
+    buf_bytes(m, sym_text(name));
+    buf_str(m, c"'");
+    if note >= 2 {
+        buf_str(m, c": ");
+        buf_bytes(m, sym_text(note - 2));
+    }
+    let h = buf_new();
+    buf_str(h, c"marked #[deprecated] at ");
+    buf_position(h, NODES[def].start);
+    report_warning(pos, KEY, c"item.deprecated", buf_slice(m).ptr, buf_slice(h).ptr);
+}
+
+// The name noted at `from` stands for item node def (qnote: a type name,
+// a path, an import).
+pub fn note_deprecated_use(from: i64, def: i64) {
+    if DEPRECATED.count == 0 || note_of(def) == 0 {
+        return;
+    }
+    warn(from, def, -1, NODES[def].a, false);
+}
+
+// The start of the name after the `.` at or after pos (a method's or a
+// field's, after its receiver), or `at`.
+fn name_after_dot(pos: i64, end: i64, at: i64) -> i64 {
+    var i = pos;
+    while i < end && SRC[i] != '.' {
+        i += 1;
+    }
+    if i >= end {
+        return at;
+    }
+    i += 1;
+    while i < end && (SRC[i] == ' ' || SRC[i] == '\n' || SRC[i] == '\t' || SRC[i] == '\r') {
+        i += 1;
+    }
+    i
+}
+
+// A use of function f at pos.
+fn warn_fn(pos: i64, f: i64) {
+    // UNSAFE: FNS is the table of functions, a raw pointer (front/types).
+    // SAFETY: f is a resolved call's or name's function, below FN_COUNT;
+    // an instance's template (tmpl - 1) is one too.
+    unsafe {
+        let def = FNS[f].node;
+        if note_of(def) == 0 {
+            return;
+        }
+        let t = if FNS[f].tmpl != 0 { FNS[f].tmpl - 1 } else { f };
+        let method = FNS[t].self_ty != 0;
+        warn(pos, def, -1, if method { FNS[t].display } else { NODES[def].a }, method);
+    }
+}
+
+// The struct item of struct type t (through a pointer), or 0.
+fn struct_node(t0: i64) -> i64 {
+    // UNSAFE: TYPES and STRUCTS are the type tables, raw pointers
+    // (front/types).
+    // SAFETY: t0 is a checked node's type, a TYPES index (0: none); a
+    // struct type's a is its STRUCTS index.
+    unsafe {
+        if t0 <= 0 {
+            return 0;
+        }
+        let t = if TYPES[t0].kind == TyKind::Ptr { TYPES[t0].a } else { t0 };
+        if t <= 0 || TYPES[t].kind != TyKind::Struct || STRUCTS[TYPES[t].a].closure != 0 {
+            return 0;
+        }
+        STRUCTS[TYPES[t].a].node
+    }
+}
+
+// Field i of struct item s, if it is named `name`; or 0.
+fn field_of(s: i64, i: i64, name: i64) -> i64 {
+    if s <= 0 || i < 0 || i >= NODES[s].count || NODES[child(s, i)].a != name {
+        return 0;
+    }
+    child(s, i)
+}
+
+// After the checks: the uses the nodes keep (a name, a call, a field, a
+// struct literal and its fields) of a deprecated item.
+pub fn report_deprecated_uses() {
+    if DEPRECATED.count == 0 {
+        return;
+    }
+    // UNSAFE: CONSTS and STATICS are the checker's tables, raw pointers
+    // (front/types).
+    // SAFETY: an Ident resolved to a constant or a static has its index in
+    // y, below the table's count.
+    unsafe {
+        for n in 1..NODES.len() as i64 {
+            let kind = NODES[n].kind;
+            if (NODES[n].p & NODE_IMPLICIT) != 0 {
+                continue;
+            }
+            if kind == NodeKind::Ident {
+                let res = NODES[n].res;
+                let y = NODES[n].y;
+                if res == Res::Fn {
+                    warn_fn(NODES[n].start, y);
+                } else if res == Res::Const {
+                    warn(NODES[n].start, CONSTS[y].node, -1, NODES[CONSTS[y].node].a, false);
+                } else if res == Res::Static {
+                    warn(NODES[n].start, STATICS[y].node, -1, NODES[STATICS[y].node].a, false);
+                }
+            } else if kind == NodeKind::Call {
+                if NODES[n].x <= 0 {
+                    continue;
+                }
+                let callee = NODES[n].a;
+                if callee != 0 {
+                    warn_fn(NODES[callee].start, NODES[n].x - 1);
+                } else if NODES[n].count > 0 {
+                    let recv = child(n, 0);
+                    warn_fn(name_after_dot(NODES[recv].end, NODES[n].end, NODES[n].start),
+                        NODES[n].x - 1);
+                }
+            } else if kind == NodeKind::FieldAccess {
+                if NODES[n].y == 2 {
+                    continue;
+                }
+                let s = struct_node(NODES[NODES[n].a].ty);
+                let field = field_of(s, NODES[n].x, NODES[n].b);
+                if field != 0 && note_of(field) != 0 {
+                    warn(name_after_dot(NODES[NODES[n].a].end, NODES[n].end, NODES[n].start),
+                        field, NODES[s].a, NODES[n].b, false);
+                }
+            } else if kind == NodeKind::StructLit {
+                let s = struct_node(NODES[n].ty);
+                if s == 0 {
+                    continue;
+                }
+                warn(NODES[n].start, s, -1, NODES[s].a, false);
+                for i in 0..NODES[n].count {
+                    let init = child(n, i);
+                    let field = field_of(s, NODES[init].x, NODES[init].a);
+                    if field != 0 {
+                        warn(NODES[init].start, field, NODES[s].a, NODES[init].a, false);
+                    }
+                }
+            }
+        }
+    }
+}

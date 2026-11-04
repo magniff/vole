@@ -7,7 +7,7 @@ family, and `#[derive]`.
 
 (0.26.2) Rust's `format!` family without the `!`: a plain literal that is
 the first argument of `print`, `println`, `eprint`, `eprintln` (stderr),
-`format_in(.., gpa)` (a new `Buf`, the allocator last), `format_args`,
+`format_in(.., gpa)` (a new `String<A>` on allocator `gpa`, the allocator last), `format_args`,
 `b.push_fmt(..)` (appends to a `Buf` or a `String`), `f.write(..)`
 (inside a Display impl), `panic`, `assert`'s message or a contract's
 `else` is a format string, its arguments after it:
@@ -76,7 +76,7 @@ fn main(gpa: Gpa) -> i32 {
     println("{name} has {n} and {x}");
     println("[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
     println("[{name:>9}] [{x:.3}] [{:c}] {{braces}} {}", 'A', n * 2 + 1);
-    let s = format_in("{n}-{}", n + 1, gpa); // a Buf, dropped at the end
+    let s = format_in("{n}-{}", n + 1, gpa); // a String, dropped at the end
     eprintln("to stderr: {}", s.as_slice());
     0
 }

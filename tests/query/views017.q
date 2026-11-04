@@ -25,6 +25,7 @@ Vec<[i64; 2]>::as_slice	views(self) declared
 Vec<Binding>::as_slice	views(self) declared
 Vec<VertexInput>::as_slice	views(self) declared
 Vec<ShaderEntry>::as_slice	views(self) declared
+Vec<u8>::as_slice	views(self) declared
 Vec<EntryPoint>::as_slice	views(self) declared
 Vec<EntryInfo>::as_slice	views(self) declared
 Vec<BindingInfo>::as_slice	views(self) declared
@@ -66,7 +67,6 @@ Vec<Watch>::as_slice	views(self) declared
 Vec<Event>::as_slice	views(self) declared
 Vec<Req>::as_slice	views(self) declared
 Vec<State>::as_slice	views(self) declared
-Vec<u8>::as_slice	views(self) declared
 Vec<Step>::as_slice	views(self) declared
 Vec<str>::as_slice	views(self) declared
 Vec<Buffer>::as_slice	views(self) declared

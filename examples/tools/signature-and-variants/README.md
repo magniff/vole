@@ -175,7 +175,7 @@ try: volec refactor variant crate::event::Event --add 'Fee(i64)' --arm-in ledger
 [exit 1]
 ```
 
-The matches return different types (`bool`, a `Buf`, `bool`), so each
+The matches return different types (`bool`, a `String`, `bool`), so each
 gets its own arm with `--arm-in FUNCTION EXPR`: first a placeholder that
 compiles, so the variant and all three arms land in one checked edit:
 

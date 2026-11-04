@@ -609,7 +609,7 @@ try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
 try_case file 'i64 = 40' --file "$WORK/snip.vl"
-got=$(printf '7\n' | "$COMPILER" try 'var b = Buf::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
+got=$(printf '7\n' | "$COMPILER" try 'var b = String::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?
