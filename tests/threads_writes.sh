@@ -88,19 +88,15 @@ middle::egraph::R_VARS_NOW	the rules
 middle::egraph::R_BY_OP	the rules
 middle::egraph::R_BY_OP_START	the rules
 base::SYMS	interned by the lazy branches above only (prepare_tasks)
-base::SYM_COUNT	the same
 base::SYM_TABLE	the same
 base::SYM_TABLE_SIZE	the same
 base::SYM_TABLES_CAP	the same
-base::SYM_CAP	the same
 front::types::TYPES	compute_layout: every layout is made before a phase (prepare_layouts)
 front::types::ENUMS	compute_layout, the same
 front::types::FIELDS	compute_layout (the fields'"'"' offsets), the same
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
 front::cells::SYM_UNSAFE_CELL	is_unsafe_cell_struct: set by the first struct prepare_layouts decides, the same
-front::types::TYPE_CAP	make_type: only on abi'"'"'s serial branches (task_phase 0)
-front::types::TYPE_COUNT	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TLISTS	make_type, the same
 front::types::TSCRATCH	make_type, the same
 front::types::TYPE_HASH	make_type, the same
@@ -139,8 +135,6 @@ base::FMT_SCRATCH	asm_error (an internal error, which exits) and -g (one thread)
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
 base::SYMS	the -g directives (dwarf_file: one thread)
-base::SYM_COUNT	the same
-base::SYM_CAP	the same
 base::SYM_TABLE	the same
 base::SYM_TABLE_SIZE	the same
 base::SYM_TABLES_CAP	the same
@@ -153,8 +147,6 @@ base::BUF_CAP	the same
 base::BUF_COUNT	the same
 base::FMT_SCRATCH	the same
 base::SYMS	dwarf_file (-g: no thread)
-base::SYM_CAP	the same
-base::SYM_COUNT	the same
 base::SYM_TABLE	the same
 base::SYM_TABLES	the same
 base::SYM_TABLES_CAP	the same
@@ -176,7 +168,6 @@ middle::vecfacts::WRAPS	key: the same (std'"'"'s Vec wrappers)
 back::mc_arm64::atomic::A64_LSE_FLAG	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
 arch::ARCH_USED	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
 back::isel::arch::ARCH_WORD_SYM	IR: set before the tasks (arch_after_lowering); a function reaches instruction selection with a CPUFEAT, which ir_hash covers, only in a program whose main fills std::ARCH_FEATURES, and the symbol is the same in every build
-front::conv::LEGACY_ROOT	key: set by the front end from the root file'"'"'s first line before the tasks, read-only after; a task reads it only for a diagnostic'"'"'s words, 0.19 or 0.20, which the code cache does not keep
 arch::INTRS	key: the intrinsic tables are part of the compiler (its identity), parsed by the front end before the tasks, read-only after
 arch::INTR_COUNT	key: the same
 arch::TABLE_BUF	key: the same
@@ -229,7 +220,6 @@ base::BUF_CAP	own: buf_new on internal errors and printers
 base::BUF_COUNT	own: the same
 base::CWD	off: -g (out_path)
 base::FILES	off: -g (dbg_loc, out_path)
-base::FILE_COUNT	off: -g
 base::FMT_SCRATCH	off: printers and -g
 base::OUT_PATHS	off: -g
 base::ROOT_DIR	off: -g
@@ -239,8 +229,6 @@ base::SRC	off: -g
 base::STDOUT_CAPTURE	own: messages
 base::STRESS_GROW	key: options_hash (stress_grow)
 base::SYMS	IR: a symbol by its text
-base::SYM_CAP	IR: the same (no symbol is made in a task)
-base::SYM_COUNT	IR: the same
 base::SYM_TABLE	IR: the same
 base::SYM_TABLES	IR: the same
 base::SYM_TABLES_CAP	IR: the same
@@ -279,8 +267,6 @@ front::types::SYM_STATIC	IR: the same
 front::types::TLISTS	key: types_hash
 front::types::TSCRATCH	key: types_hash (no type is made in a task)
 front::types::TYPES	key: types_hash
-front::types::TYPE_CAP	key: types_hash
-front::types::TYPE_COUNT	key: types_hash
 front::types::TYPE_HASH	key: types_hash
 front::types::TYPE_HASH_SIZE	key: types_hash
 front::types::TYPE_HASH_USED	key: types_hash

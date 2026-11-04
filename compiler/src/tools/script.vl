@@ -19,9 +19,10 @@
 // added there runs in scripts too.
 
 use crate::base::{
-    IntVec, OVERLAY, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
+    IntVec, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_OPTION, EV_WORD, Leaf, Line, option, word_of};
 use crate::tools::commands::{is_tool, run_tool};
 use crate::tools::ctx::Tcx;
@@ -34,7 +35,7 @@ use crate::tools::proc::{
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::bytes_eq;
-use crate::tools::query::diagnostics::{PROG, diag, program_errors, put_root, write_diags};
+use crate::tools::query::diagnostics::{diag, program_errors, put_root, write_diags};
 
 extern "C" {
     fn open(path: *u8, flags: i32) -> i32;
@@ -42,19 +43,19 @@ extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-pub fn run_script(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    let status = script_inner(c, &tcx);
+pub fn run_script(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let status = script_inner(c, &tcx, &pcx);
     write_diags(tcx);
     status
 }
 
-fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn usage(message: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"refactor.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
     let out = crate::tools::query::diagnostics::diags(&tcx);
     buf_str(out, c"try:");
-    crate::tools::query::diagnostics::put_cword(out, PROG);
+    crate::tools::query::diagnostics::put_cword(out, pcx.prog);
     buf_str(out, c" refactor --script steps.txt --dry-run");
     put_root(out, tcx);
     crate::tools::query::diagnostics::try_end(out);
@@ -102,7 +103,7 @@ fn split_words(line: [u8], words: *IntVec) -> bool {
     }
 }
 
-fn note_file(path: [u8], state: i64, tcx: inout Tcx<Comp>) {
+fn note_file(path: [u8], state: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         for i in 0..tcx.script_changed.count {
             if crate::tools::proc::same_bytes(c_slice(tcx.script_changed.data[i] as *u8), path) {
@@ -110,7 +111,7 @@ fn note_file(path: [u8], state: i64, tcx: inout Tcx<Comp>) {
                 if state == 2 {
                     // (moved away: a file made by a step before is none)
                     tcx.made.data[i] = if was == 1 { 3 } else { 2 };
-                    remove_file(copy_path(tcx.script_changed.data[i] as *u8));
+                    remove_file(copy_path(tcx.script_changed.data[i] as *u8, pcx));
                 } else if state == 1 && was == 2 {
                     tcx.made.data[i] = 0;
                 } else if state == 1 && was == 3 {
@@ -127,7 +128,7 @@ fn note_file(path: [u8], state: i64, tcx: inout Tcx<Comp>) {
 }
 
 // The files a step listed (`file PATH`, `new PATH`).
-fn read_report(path: *u8, tcx: inout Tcx<Comp>) {
+fn read_report(path: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let b = buf_new();
     if !read_file_if(path, b) {
         return;
@@ -141,11 +142,11 @@ fn read_report(path: *u8, tcx: inout Tcx<Comp>) {
         }
         let line = t[i..e];
         if line.len > 5 && line[0] == 'f' && line[4] == '\t' {
-            note_file(line[5..line.len], 0, &tcx);
+            note_file(line[5..line.len], 0, &tcx, pcx);
         } else if line.len > 4 && line[0] == 'n' && line[3] == '\t' {
-            note_file(line[4..line.len], 1, &tcx);
+            note_file(line[4..line.len], 1, &tcx, pcx);
         } else if line.len > 5 && line[0] == 'g' && line[4] == '\t' {
-            note_file(line[5..line.len], 2, &tcx);
+            note_file(line[5..line.len], 2, &tcx, pcx);
         } else if line.len == 7 && line[0] == 'i' && line[6] == 's' {
             // (0.16: the step said edit.imports)
             tcx.imports_noted = true;
@@ -154,10 +155,10 @@ fn read_report(path: *u8, tcx: inout Tcx<Comp>) {
     }
 }
 
-fn remove_all_copies(tcx: Tcx<Comp>) {
+fn remove_all_copies(tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         for i in 0..tcx.script_changed.count {
-            remove_file(copy_path(tcx.script_changed.data[i] as *u8));
+            remove_file(copy_path(tcx.script_changed.data[i] as *u8, pcx));
             if tcx.made.data[i] == 1 {
                 remove_empty_dirs(tcx.script_changed.data[i] as *u8);
             }
@@ -167,7 +168,8 @@ fn remove_all_copies(tcx: Tcx<Comp>) {
 
 // Runs step `words` (stdin from `input`, when not 0) in a copy of this
 // process: its exit status.
-fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8, gpa: Gpa, tcx: inout Tcx<Comp>) -> i64 {
+fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8, gpa: Gpa, tcx: inout Tcx<Comp>,
+    pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let pid = fork_worker();
         if pid < 0 {
@@ -177,9 +179,9 @@ fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8, gpa: Gpa, tcx: i
             // The copy: the program as the steps before left it.
             for i in 0..tcx.script_changed.count {
                 let p = tcx.script_changed.data[i] as *u8;
-                OVERLAY.push(p as i64);
-                OVERLAY.push(if tcx.made.data[i] >= 2 { gone_path(p) }
-                    else { copy_path(p) } as i64);
+                pcx.overlay.push(p as i64);
+                pcx.overlay.push(if tcx.made.data[i] >= 2 { gone_path(p) }
+                    else { copy_path(p, pcx) } as i64);
             }
             tcx.step_report = report;
             tcx.dry_run = false;
@@ -199,7 +201,7 @@ fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8, gpa: Gpa, tcx: i
             }
             let n = (*words).count;
             var w: Vec<str, Gpa> = Vec::new_in(gpa);
-            w.push(word_of(PROG));
+            w.push(word_of(pcx.prog));
             for i in 0..n {
                 w.push(word_of((*words).get(i) as *u8));
             }
@@ -209,7 +211,7 @@ fn run_step(words: *IntVec, input: *u8, root: *u8, report: *u8, gpa: Gpa, tcx: i
                 w.push("--target");
                 w.push(word_of(tcx.target_name));
             }
-            let status = run_tool(Line { words: w.as_slice() }, gpa, &tcx);
+            let status = run_tool(Line { words: w.as_slice() }, gpa, &tcx, &pcx);
             worker_exit(status);
         }
         var status = 0;
@@ -225,10 +227,10 @@ pub fn script_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(table, "file")
 }
 
-fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let gpa = c.gpa;
     set_command(c.line, &tcx);
-    PROG = c.prog();
+    pcx.prog = c.prog();
     tcx.tool = c"refactor";
     var root = 0 as *u8;
     var file = 0 as *u8;
@@ -236,7 +238,7 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     for e in c.evs.iter() {
         var ev = e;
         let a = ev.value;
-        if take_edit_event(&ev, &root, &tcx) {
+        if take_edit_event(&ev, &root, &tcx, &pcx) {
             continue;
         }
         // (0.17: the edit's words, for a command run as a script)
@@ -256,15 +258,15 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         } else if root == 0 as *u8 && crate::base::is_source_path(a) {
             root = a;
         } else {
-            return usage(c"one FILE of commands", &tcx);
+            return usage(c"one FILE of commands", &tcx, pcx);
         }
     }
     unsafe {
         if file == 0 as *u8 {
-            return usage(c"a FILE of commands is needed", &tcx);
+            return usage(c"a FILE of commands is needed", &tcx, pcx);
         }
         tcx.root_given = root;
-        root = root_or_diag(root, c"--script", c_slice(file), true, &tcx);
+        root = root_or_diag(root, c"--script", c_slice(file), true, &tcx, pcx);
         if root == 0 as *u8 {
             return 2;
         }
@@ -314,7 +316,7 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         buf_str(report_buf, root);
         // (0.25.5: tagged as the edit copies are, apply.vl copy_path)
         buf_str(report_buf, c".vole-script-");
-        buf_str(report_buf, crate::base::diag::EDIT_TAG);
+        buf_str(report_buf, pcx.edit_tag);
         buf_byte(report_buf, '~');
         let report = buf_cstr(report_buf);
         let dry = tcx.dry_run;
@@ -328,25 +330,25 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             let stdin_buf = buf_new();
             buf_str(stdin_buf, root);
             buf_str(stdin_buf, c".vole-stdin-");
-            buf_str(stdin_buf, crate::base::diag::EDIT_TAG);
+            buf_str(stdin_buf, pcx.edit_tag);
             buf_byte(stdin_buf, '~');
             let stdin_path = buf_cstr(stdin_buf);
             if bodies.data[k] >= 0 {
                 if !write_file_if(stdin_path, buf_slice(bodies.data[k])) {
-                    remove_all_copies(tcx);
+                    remove_all_copies(tcx, pcx);
                     return line_error(file, numbers.data[k], c"cannot write the text after <<",
                         &tcx);
                 }
                 input = stdin_path;
             }
-            let status = run_step(steps.data[k] as *IntVec, input, root, report, gpa, &tcx);
+            let status = run_step(steps.data[k] as *IntVec, input, root, report, gpa, &tcx, &pcx);
             if bodies.data[k] >= 0 {
                 remove_file(stdin_path);
             }
             if status != 0 {
-                read_report(report, &tcx);
+                read_report(report, &tcx, pcx);
                 remove_file(report);
-                remove_all_copies(tcx);
+                remove_all_copies(tcx, pcx);
                 let d = diag(c"error", c"refactor.script", &tcx);
                 buf_str(d, file);
                 buf_byte(d, ':');
@@ -361,7 +363,7 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 buf_str(d, c"; nothing written\n");
                 return 1;
             }
-            read_report(report, &tcx);
+            read_report(report, &tcx, pcx);
         }
         remove_file(report);
         tcx.dry_run = dry;
@@ -372,9 +374,9 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             return 0;
         }
         // One edit: the copies, checked once.
-        if !load_program(root, tcx.target, &tcx) {
-            program_errors(c"error", root, true, &tcx);
-            remove_all_copies(tcx);
+        if !load_program(root, tcx.target, &tcx, &pcx) {
+            program_errors(c"error", root, true, &tcx, &pcx);
+            remove_all_copies(tcx, pcx);
             return 1;
         }
         for k in 0..tcx.script_changed.count {
@@ -384,10 +386,10 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 continue;
             }
             let ok = if state == 2 { edit_remove_file(c_slice(path), &tcx) }
-                else if state == 1 { copy_made(path, &tcx) }
-                else { copy_rewritten(c_slice(path), &tcx) };
+                else if state == 1 { copy_made(path, &tcx, &pcx) }
+                else { copy_rewritten(c_slice(path), &tcx, pcx) };
             if !ok {
-                remove_all_copies(tcx);
+                remove_all_copies(tcx, pcx);
                 let d = diag(c"error", c"edit.write", &tcx);
                 buf_str(d, c"cannot read the copy of '");
                 buf_str(d, path);
@@ -405,7 +407,7 @@ fn script_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_int(what, steps.count);
             buf_str(what, if steps.count == 1 { c" command" } else { c" commands" });
         }
-        finish_edit(buf_slice(what), root, &tcx)
+        finish_edit(buf_slice(what), root, &tcx, &pcx)
     }
 }
 

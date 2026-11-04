@@ -7,27 +7,25 @@ use crate::base::{
     BUFS, FILES, IntVec, SRC, SYMS, alloc_array, buf_bytes, buf_new, buf_slice, buf_str, cstr, grow,
     intern_c, sym_table, sym_text,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, ERR_KIND, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix,
-    err_fixable, err_fmt, err_help, err_help_fmt, err_help_sym, err_jump, err_str, err_sym, err_try,
-    err_try_fmt, error_at, fail_name, fix_at_ok,
+    buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix, err_fixable, err_fmt,
+    err_help, err_help_fmt, err_help_sym, err_jump, err_str, err_sym, err_try, err_try_fmt,
+    error_at, fail_name, fix_at_ok,
 };
 use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
+use crate::front::check::{Try, attempt, name_error};
 use crate::front::check::collect::template_variant_named;
-use crate::front::check::names::{
-    NEAR_ALL, NEAR_COLLECT, help_near_item, help_nearest, import_path_for, near_to,
-};
+use crate::front::check::names::{help_near_item, help_nearest, import_path_for, near_to};
 use crate::front::lexer::is_ident_byte;
 use crate::front::modules::{
-    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
-    item_key_if_known, module_of, qualified_if_known, qualify, within_std,
+    MODULES, STD_MODULE, child_module, file_of_pos, is_within, item_key_if_known, module_of,
+    qualified_if_known, qualify, within_std,
 };
 use crate::front::modules::vis::{admits, module_admits};
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::front::stdtree::STD_TREE;
-use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, enum_variant, find_variant, item_node_of};
-use crate::middle::lower::ssa::HMap;
+use crate::front::types::{ENUMS, VARIANTS, enum_variant, find_variant, item_node_of};
 use crate::tools::fix::note_private;
 use crate::tools::query::QF_USE;
 use crate::tools::query::command_line::{qnote, qnote_module};
@@ -67,231 +65,204 @@ pub fn binding_value(b: i64) -> i64 {
 }
 
 // `use` items: one entry per imported name, one per `*`.
-struct UseEntry {
+pub struct UseEntry {
     module: i64, name: i64, item: i64, path: i64, glob: bool, public: bool,
     state: i64, result: i64, node: i64,
 }
 
-static var USE_ENTRIES: *UseEntry = 0 as *UseEntry;
-
-static var USE_ENTRY_COUNT: i64 = 0;
-
-static var USE_ENTRY_CAP: i64 = 0;
-
-// Lookups by (module, name), once the items are known.
-static var SCOPE_CACHE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-static var SCOPES_READY: bool = false;
-
-// (0.25.3) std_item_key's answers, restored from the tools' cache: symbol
-// + 1 to key + 1.
-static var STD_KEYS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-static var STD_KEYS_RESTORED: bool = false;
-
-// Per module (below USES_INDEXED), the indices of its use entries in order.
-static var MODULE_USES: *IntVec = 0 as *IntVec;
-
-static var USES_INDEXED: i64 = 0;
-
-pub static var SYM_CRATE: i64 = 0;
-
-pub static var SYM_SUPER: i64 = 0;
-
-pub static var SYM_STD: i64 = 0;
-
-fn add_use_entry(module: i64, name: i64, item: i64, path: i64, glob: bool, public: bool, node: i64) {
+fn add_use_entry(module: i64, name: i64, item: i64, path: i64, glob: bool, public: bool, node: i64,
+    pcx: inout Ctx<Comp>) {
     unsafe {
-        USE_ENTRIES = grow(USE_ENTRIES, USE_ENTRY_COUNT, &USE_ENTRY_CAP);
-        USE_ENTRIES[USE_ENTRY_COUNT] = UseEntry {
+        pcx.use_entries = grow(pcx.use_entries, pcx.use_entry_count, &pcx.use_entry_cap);
+        pcx.use_entries[pcx.use_entry_count] = UseEntry {
             module, name, item, path, glob, public, state: 0, result: 0, node,
         };
     }
-    unsafe { MODULE_USES[module].push(USE_ENTRY_COUNT); }
-    USE_ENTRY_COUNT += 1;
+    unsafe { pcx.module_uses[module].push(pcx.use_entry_count); }
+    pcx.use_entry_count += 1;
 }
 
 // The entries of the program's `use` and `import` items.
-pub fn collect_uses() {
+pub fn collect_uses(pcx: inout Ctx<Comp>) {
     unsafe {
-        SYM_CRATE = intern_c(c"crate");
-        SYM_SUPER = intern_c(c"super");
-        SYM_STD = intern_c(c"std");
+        pcx.sym_crate = intern_c(c"crate");
+        pcx.sym_super = intern_c(c"super");
+        pcx.sym_std = intern_c(c"std");
         // (0.26.2: each `pub(in path)` names a module around its item)
-        crate::front::modules::vis::check_vis_paths();
+        crate::front::modules::vis::check_vis_paths(&pcx);
         // (0.25) Each module's entries, filled as they are added: an
         // import is compared with its own module's entries only, not with
         // every entry of the program (that scan was 21% of `check`).
-        MODULE_USES = alloc_array::<IntVec>(MODULE_COUNT);
-        USES_INDEXED = 0;
-        for i in 0..NODES[PROGRAM].count {
-            let item = child(PROGRAM, i);
+        pcx.module_uses = alloc_array::<IntVec>(pcx.module_count);
+        pcx.uses_indexed = 0;
+        for i in 0..NODES[pcx.program].count {
+            let item = child(pcx.program, i, pcx);
             if NODES[item].kind != NodeKind::Use {
                 continue;
             }
-            let m = module_of(item);
+            let m = module_of(item, &pcx);
             let public = (NODES[item].p & ITEM_PUBLIC) != 0;
             if NODES[item].d == 2 {
                 // `import "h.h";` sees the C module's items; `import "h.h"
                 // as c;` names the module.
-                if C_MODULE < 0 {
+                if pcx.c_module < 0 {
                     continue;
                 }
-                let entry = USE_ENTRY_COUNT;
+                let entry = pcx.use_entry_count;
                 if NODES[item].a == 0 {
-                    LEGACY_IMPORTS = true;
+                    pcx.legacy_imports = true;
                 }
-                add_use_entry(m, NODES[item].a, 0, 0, NODES[item].a == 0, public, item);
-                USE_ENTRIES[entry].state = 2;
-                USE_ENTRIES[entry].result = binding(B_MODULE, C_MODULE);
+                add_use_entry(m, NODES[item].a, 0, 0, NODES[item].a == 0, public, item, &pcx);
+                pcx.use_entries[entry].state = 2;
+                pcx.use_entries[entry].result = binding(B_MODULE, pcx.c_module);
                 continue;
             }
             let path = NODES[item].c;
             if NODES[item].b == 1 {
-                LEGACY_IMPORTS = true;
-                add_use_entry(m, -1, 0, path, true, public, item);
+                pcx.legacy_imports = true;
+                add_use_entry(m, -1, 0, path, true, public, item, &pcx);
                 continue;
             }
             for k in 0..NODES[item].count {
-                let id = child(item, k);
+                let id = child(item, k, pcx);
                 let name = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
                 // (a counted loop, not `.any`: a loop over a range's
                 // iterator costs a move per element more at -O2)
                 var twice = false;
-                let own = MODULE_USES[m];
+                let own = pcx.module_uses[m];
                 for k2 in 0..own.count {
                     let e = own.data[k2];
-                    if USE_ENTRIES[e].name == name && !USE_ENTRIES[e].glob {
+                    if pcx.use_entries[e].name == name && !pcx.use_entries[e].glob {
                         twice = true;
                         break;
                     }
                 }
                 if twice {
-                    err_begin(NODES[id].start);
-                    err_fmt(format_args("'{}' is imported twice", sym_text(name)));
-                    err_end_soft();
+                    err_begin(NODES[id].start, &pcx);
+                    err_fmt(format_args("'{}' is imported twice", sym_text(name)), pcx);
+                    err_end_soft(&pcx);
                     continue;
                 }
-                add_use_entry(m, name, id, path, false, public, item);
+                add_use_entry(m, name, id, path, false, public, item, &pcx);
             }
         }
-        USES_INDEXED = MODULE_COUNT;
-        SCOPES_READY = true;
+        pcx.uses_indexed = pcx.module_count;
+        pcx.scopes_ready = true;
     }
 }
 
 // What use entry u imports: for `use p::x`, what x names in p; for `use
 // p::*`, the module (or enum) p.
-fn resolve_use(u: i64) -> i64 {
+fn resolve_use(u: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if USE_ENTRIES[u].state == 2 {
-            return USE_ENTRIES[u].result;
+        if pcx.use_entries[u].state == 2 {
+            return pcx.use_entries[u].result;
         }
-        if USE_ENTRIES[u].state == 1 {
+        if pcx.use_entries[u].state == 1 {
             // (0.25.2.1) When the path starts with the name it imports
             // (`use text::{text, width};` in a module beside module
             // `text`), that name is the import, which hides the module: the
             // error names the clash, the path from the root its try: line.
-            let path = USE_ENTRIES[u].path;
-            let name = USE_ENTRIES[u].name;
-            if !USE_ENTRIES[u].glob && path > 0 && NODES[path].count > 0
-                && NODES[child(path, 0)].a == name {
-                let seg = child(path, 0);
-                let other = sibling_module(USE_ENTRIES[u].module, name, seg, path, u);
+            let path = pcx.use_entries[u].path;
+            let name = pcx.use_entries[u].name;
+            if !pcx.use_entries[u].glob && path > 0 && NODES[path].count > 0
+                && NODES[child(path, 0, pcx)].a == name {
+                let seg = child(path, 0, pcx);
+                let other = sibling_module(pcx.use_entries[u].module, name, seg, path, u, &pcx);
                 if other >= 0 {
-                    err_begin(NODES[USE_ENTRIES[u].node].start);
-                    err_failed_name(name);
+                    err_begin(NODES[pcx.use_entries[u].node].start, &pcx);
+                    err_failed_name(name, pcx);
                     err_fmt(
-                        format_args("this import depends on itself: its path starts with '{}', the name it imports, so '{}' is this import, not module 'crate::{}'", sym_text(name), sym_text(name), sym_text(MODULES[other].key)));
-                    err_help(c"a name imported into a module hides the module of that name beside it: start the path at the root (or rename the module or the item)");
+                        format_args("this import depends on itself: its path starts with '{}', the name it imports, so '{}' is this import, not module 'crate::{}'", sym_text(name), sym_text(name), sym_text(MODULES[other].key)), pcx);
+                    err_help(c"a name imported into a module hides the module of that name beside it: start the path at the root (or rename the module or the item)", pcx);
                     let parent = MODULES[other].parent;
                     if parent <= 0 {
-                        path_try(u, seg, path, "crate");
+                        path_try(u, seg, path, "crate", &pcx);
                     } else {
                         let a = buf_new();
                         buf_str(a, c"crate::");
                         buf_bytes(a, SYMS[MODULES[parent].key].text);
-                        path_try(u, seg, path, buf_slice(a));
+                        path_try(u, seg, path, buf_slice(a), &pcx);
                     }
-                    err_end();
+                    err_end(&pcx);
                 }
             }
-            error_at(NODES[USE_ENTRIES[u].node].start, c"this import depends on itself");
+            error_at(NODES[pcx.use_entries[u].node].start, c"this import depends on itself", &pcx);
         }
-        USE_ENTRIES[u].state = 1;
+        pcx.use_entries[u].state = 1;
         // (an import that fails imports nothing, and the errors saying
         // its name is unknown follow from it: 0.10)
-        if !attempt(Try::Use, u) {
-            USE_ENTRIES[u].result = B_NONE;
-            if !USE_ENTRIES[u].glob {
-                fail_name(USE_ENTRIES[u].name);
+        if !attempt(Try::Use, u, &pcx) {
+            pcx.use_entries[u].result = B_NONE;
+            if !pcx.use_entries[u].glob {
+                fail_name(pcx.use_entries[u].name, &pcx);
             }
         }
-        USE_ENTRIES[u].state = 2;
-        USE_ENTRIES[u].result
+        pcx.use_entries[u].state = 2;
+        pcx.use_entries[u].result
     }
 }
 
-pub fn resolve_use_of(u: i64) {
+pub fn resolve_use_of(u: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let m = USE_ENTRIES[u].module;
-        let path = USE_ENTRIES[u].path;
-        let prefix = resolve_path(m, path, NODES[path].count, u);
+        let m = pcx.use_entries[u].module;
+        let path = pcx.use_entries[u].path;
+        let prefix = resolve_path(m, path, NODES[path].count, u, &pcx);
         var result = 0;
-        if USE_ENTRIES[u].glob {
+        if pcx.use_entries[u].glob {
             if binding_kind(prefix) == B_MODULE {
                 result = prefix;
-            } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
+            } else if binding_kind(prefix) == B_ITEM && pcx.sym_enum[binding_value(prefix)] != 0 {
                 result = prefix;
             } else {
-                not_enum_or_module(path);
+                not_enum_or_module(path, &pcx);
             }
         } else {
-            let id = USE_ENTRIES[u].item;
+            let id = pcx.use_entries[u].item;
             let name = NODES[id].a;
             if binding_kind(prefix) == B_MODULE {
-                result = lookup_name(binding_value(prefix), name, m);
+                result = lookup_name(binding_value(prefix), name, m, &pcx);
                 if binding_kind(result) == B_PRIVATE {
-                    access_error(result, NODES[id].start, name);
+                    access_error(result, NODES[id].start, name, &pcx);
                 }
                 // (0.20: std's built-in text is read in sections, and an
                 // import of std's from a section not read imports nothing)
-                if result == B_NONE && !(within_std(m) && STD_TREE == 0 as *u8) {
-                    unresolved_import(id, path, prefix, m);
+                if result == B_NONE && !(within_std(m) && pcx.std_tree == 0 as *u8) {
+                    unresolved_import(id, path, prefix, m, &pcx);
                 }
-            } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
-                let e = SYM_ENUM[binding_value(prefix)] - 1;
-                let v = enum_variant_binding(e, name);
+            } else if binding_kind(prefix) == B_ITEM && pcx.sym_enum[binding_value(prefix)] != 0 {
+                let e = pcx.sym_enum[binding_value(prefix)] - 1;
+                let v = enum_variant_binding(e, name, pcx);
                 if v == B_NONE {
-                    err_begin(NODES[id].start);
+                    err_begin(NODES[id].start, &pcx);
                     err_fmt(format_args("enum '{}' has no variant '{}'", sym_text(ENUMS[e].name),
-                        sym_text(name)));
+                        sym_text(name)), pcx);
                     // (0.25.2.1: the nearest variants)
-                    NEAR_ALL.count = 0;
-                    NEAR_COLLECT = true;
+                    pcx.near_all.count = 0;
+                    pcx.near_collect = true;
                     var near = near_to(name);
                     for i in 0..ENUMS[e].variant_count {
-                        near.offer(VARIANTS[enum_variant(e, i)].name);
+                        near.offer(VARIANTS[enum_variant(e, i)].name, &pcx);
                     }
-                    NEAR_COLLECT = false;
-                    near.help();
-                    if BUFS[ERR_HELP].len == 0 {
-                        help_nearest(c"its variants: ", name);
+                    pcx.near_collect = false;
+                    near.help(&pcx);
+                    if BUFS[pcx.err_help].len == 0 {
+                        help_nearest(c"its variants: ", name, pcx);
                     }
-                    err_end();
+                    err_end(&pcx);
                 }
                 result = v;
             } else {
-                not_enum_or_module(path);
+                not_enum_or_module(path, &pcx);
             }
         }
-        USE_ENTRIES[u].result = result;
-        note_import(USE_ENTRIES[u].item, result);
+        pcx.use_entries[u].result = result;
+        note_import(pcx.use_entries[u].item, result, &pcx);
     }
 }
 
 // `volec query` (0.11): what the name `use` item `id` imports.
-fn note_import(id: i64, b: i64) {
+fn note_import(id: i64, b: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if id == 0 {
             return;
@@ -300,118 +271,119 @@ fn note_import(id: i64, b: i64) {
         let name = NODES[id].a;
         let kind = binding_kind(b);
         if kind == B_ITEM {
-            qnote(pos, name, item_node_of(binding_value(b)), QF_USE);
+            qnote(pos, name, item_node_of(binding_value(b), pcx), QF_USE, &pcx);
         } else if kind == B_VARIANT {
-            qnote(pos, name, VARIANTS[binding_value(b)].node, QF_USE);
+            qnote(pos, name, VARIANTS[binding_value(b)].node, QF_USE, &pcx);
         } else if kind == B_TVARIANT {
             let item = ENUMS[binding_value(b)].node;
             for i in 0..NODES[item].count {
-                if NODES[child(item, i)].a == name {
-                    qnote(pos, name, child(item, i), QF_USE);
+                if NODES[child(item, i, pcx)].a == name {
+                    qnote(pos, name, child(item, i, pcx), QF_USE, &pcx);
                 }
             }
         } else if kind == B_MODULE {
-            qnote_module(pos, name, binding_value(b), QF_USE);
+            qnote_module(pos, name, binding_value(b), QF_USE, &pcx);
         }
     }
 }
 
-fn not_enum_or_module(path: i64) -> ! {
-    let last = child(path, NODES[path].count - 1);
-    name_error(NODES[last].start, c"'", NODES[last].a, c"' is not an enum or a module (use brings the variants of an enum, or the items of a module, into scope)")
+fn not_enum_or_module(path: i64, pcx: inout Ctx<Comp>) -> ! {
+    let last = child(path, NODES[path].count - 1, pcx);
+    name_error(NODES[last].start, c"'", NODES[last].a, c"' is not an enum or a module (use brings the variants of an enum, or the items of a module, into scope)", &pcx)
 }
 
 // Every use is resolved (once the enums' variants are known), the
 // unused ones too: an import that names nothing still has its errors (the
 // warning use.unused is check_program's, tools/fix).
-pub fn resolve_all_uses() {
-    for u in 0..USE_ENTRY_COUNT {
-        resolve_use(u);
+pub fn resolve_all_uses(pcx: inout Ctx<Comp>) {
+    for u in 0..pcx.use_entry_count {
+        resolve_use(u, &pcx);
     }
 }
 
 // `use path::name;` where the module of path has no `name` (0.17: what
 // std has instead, the nearest name there, or the module that has it).
-fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64) -> ! {
+fn unresolved_import(id: i64, path: i64, prefix: i64, from: i64, pcx: inout Ctx<Comp>) -> ! {
     unsafe {
-        err_begin(NODES[id].start);
-        err_str(c"unresolved import '");
+        err_begin(NODES[id].start, &pcx);
+        err_str(c"unresolved import '", pcx);
         for i in 0..NODES[path].count {
-            err_fmt(format_args("{}::", sym_text(NODES[child(path, i)].a)));
+            err_fmt(format_args("{}::", sym_text(NODES[child(path, i, pcx)].a)), pcx);
         }
         let name = NODES[id].a;
-        err_fmt(format_args("{}'", sym_text(name)));
+        err_fmt(format_args("{}'", sym_text(name)), pcx);
         let pm = binding_value(prefix);
-        if name == SELF_SYM && NODES[path].count > 0 {
+        if name == pcx.self_sym && NODES[path].count > 0 {
             // (0.17) Rust's `use m::{self, X};`
             let p = buf_new();
             for i in 0..NODES[path].count {
                 if i > 0 {
                     buf_str(p, c"::");
                 }
-                buf_bytes(p, SYMS[NODES[child(path, i)].a].text);
+                buf_bytes(p, SYMS[NODES[child(path, i, pcx)].a].text);
             }
             err_help_fmt(
-                format_args("`self` in a `use` list is not supported: import the module on a line of its own, `use {};`, and the rest from it", buf_slice(p)));
-            err_try_fmt(format_args("use {};", buf_slice(p)));
-            err_end();
+                format_args("`self` in a `use` list is not supported: import the module on a line of its own, `use {};`, and the rest from it", buf_slice(p)), pcx);
+            err_try_fmt(format_args("use {};", buf_slice(p)), pcx);
+            err_end(&pcx);
         }
         if pm == STD_MODULE {
-            if !help_std_path(name, 0, from, true) && SYMS[name].text == "gpa" {
-                err_help(c"the allocator is main's parameter, `fn main(gpa: Gpa)`, passed down");
+            if !help_std_path(name, 0, from, true, &pcx) && SYMS[name].text == "gpa" {
+                err_help(c"the allocator is main's parameter, `fn main(gpa: Gpa)`, passed down",
+                    pcx);
             }
         }
         // (0.25.2.2: the prelude's item, or another module's of std)
-        crate::front::check::names::help_std_elsewhere(pm, name, true, STD_MODULE, CUR_MOD,
-            BUFS[ERR_HELP].len > 0);
+        crate::front::check::names::help_std_elsewhere(pm, name, true, STD_MODULE, pcx.cur_mod,
+            BUFS[pcx.err_help].len > 0, &pcx);
         // (0.25.2.1: a function std has under another name)
         let syn = crate::front::check::names::std_synonym_help(SYMS[name].text);
-        if within_std(pm) && syn.len > 0 && BUFS[ERR_HELP].len == 0 {
-            err_help_fmt(syn);
+        if within_std(pm) && syn.len > 0 && BUFS[pcx.err_help].len == 0 {
+            err_help_fmt(syn, pcx);
         }
-        help_near_item(pm, name);
-        if BUFS[ERR_HELP].len == 0 {
-            let other = import_path_for(name, true);
-            let at = if other != 0 { other } else { import_path_for(name, false) };
+        help_near_item(pm, name, &pcx);
+        if BUFS[pcx.err_help].len == 0 {
+            let other = import_path_for(name, true, &pcx);
+            let at = if other != 0 { other } else { import_path_for(name, false, &pcx) };
             if at != 0 {
-                err_help_fmt(format_args("'{}' is in {}", sym_text(name), buf_slice(at)));
-                err_try_fmt(format_args("use {}::{};", buf_slice(at), sym_text(name)));
+                err_help_fmt(format_args("'{}' is in {}", sym_text(name), buf_slice(at)), pcx);
+                err_try_fmt(format_args("use {}::{};", buf_slice(at), sym_text(name)), pcx);
             }
         }
-        err_end()
+        err_end(&pcx)
     }
 }
 
 // (0.26.2: item.private, Rust's E0603; a restricted item, `pub(crate)`,
 // says where it is visible)
-pub fn private_error(pos: i64, name: i64, key: i64) -> ! {
-    let saved = ERR_KIND;
-    ERR_KIND = c"item.private";
-    err_begin(pos);
-    let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key) } else { 0 };
-    let end = if item != 0 { crate::front::modules::vis::vis_end_of(item) } else { -1 };
+pub fn private_error(pos: i64, name: i64, key: i64, pcx: inout Ctx<Comp>) -> ! {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"item.private";
+    err_begin(pos, &pcx);
+    let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key, pcx) } else { 0 };
+    let end = if item != 0 { crate::front::modules::vis::vis_end_of(item, &pcx) } else { -1 };
     if end >= 0 {
         err_fmt(
             format_args("'{}' is visible only in {}", sym_text(name),
-                crate::front::modules::vis::vis_where(end)));
+                crate::front::modules::vis::vis_where(end)), pcx);
     } else {
-        err_fmt(format_args("'{}' is private", sym_text(name)));
+        err_fmt(format_args("'{}' is private", sym_text(name)), pcx);
     }
-    help_make_public(key, name);
-    err_end_soft();
-    ERR_KIND = saved;
-    err_jump()
+    help_make_public(key, name, &pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
+    err_jump(&pcx)
 }
 
 // The help of a private item (by key): its declaration with `pub` (0.14),
 // `make it public: `pub fn f` at FILE: line L, column C`: the text of its
 // first line up to its name, where `volec fix --only pub` writes `pub`.
-fn help_make_public(key: i64, name: i64) {
+fn help_make_public(key: i64, name: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key) } else { 0 };
+        let item = if key >= 0 && key < SYMS.len() as i64 { item_node_of(key, pcx) } else { 0 };
         if item == 0 {
-            if child_module_key(key) {
-                err_help_fmt(format_args("make it public: `pub mod {}`", sym_text(name)));
+            if child_module_key(key, pcx) {
+                err_help_fmt(format_args("make it public: `pub mod {}`", sym_text(name)), pcx);
             }
             return;
         }
@@ -437,18 +409,18 @@ fn help_make_public(key: i64, name: i64) {
             i += 1;
         }
         // (0.26.2: a restricted one, widened to its crate)
-        let restricted = crate::front::modules::vis::vis_token(item) >= 0;
+        let restricted = crate::front::modules::vis::vis_token(item, pcx) >= 0;
         err_help(if restricted { c"make it visible in its crate: `pub(crate) " }
-            else { c"make it public: `pub " });
+            else { c"make it public: `pub " }, pcx);
         if stop > 0 {
-            buf_bytes(ERR_HELP, SRC[start..stop]);
+            buf_bytes(pcx.err_help, SRC[start..stop]);
         } else {
-            err_help_sym(name);
+            err_help_sym(name, pcx);
         }
-        err_help(c"` at ");
-        buf_position(ERR_HELP, start);
+        err_help(c"` at ", pcx);
+        buf_position(pcx.err_help, start, &pcx);
         // (0.18: `fix --suggested` adds it, as `fix --only pub`)
-        err_fixable();
+        err_fixable(&pcx);
     }
 }
 
@@ -457,9 +429,9 @@ fn ident_byte(c: u8) -> bool {
 }
 
 // Whether key is a module's (`a::b` of `mod b;` in a).
-fn child_module_key(key: i64) -> bool {
+fn child_module_key(key: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        for m in 1..MODULE_COUNT {
+        for m in 1..pcx.module_count {
             if MODULES[m].key == key {
                 return true;
             }
@@ -470,31 +442,31 @@ fn child_module_key(key: i64) -> bool {
 
 // The error for a binding that cannot be used: private, or (0.6) brought
 // by two `*` imports.
-pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
+pub fn access_error(b: i64, pos: i64, name: i64, pcx: inout Ctx<Comp>) -> ! {
     // (0.18: `fix --suggested --at FILE:LINE`, the error at that line)
-    if fix_at_ok(pos) {
-        note_private(b);
+    if fix_at_ok(pos, &pcx) {
+        note_private(b, &pcx);
     }
     if b == B_AMBIGUOUS {
-        name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
+        name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)", &pcx);
     }
-    private_error(pos, name, binding_value(b))
+    private_error(pos, name, binding_value(b), &pcx)
 }
 
 // What `name` stands for in module m, seen from code in module `from`.
-pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
+pub fn lookup_name(m: i64, name: i64, from: i64, pcx: inout Ctx<Comp>) -> i64 {
     // (not while the imports are recorded: see LEGACY_IMPORTS)
-    let cacheable = SCOPES_READY && m == from && !LEGACY_IMPORTS;
+    let cacheable = pcx.scopes_ready && m == from && !pcx.legacy_imports;
     let k = (name + 1) * 65536 + m;
     if cacheable {
-        let known = SCOPE_CACHE.get(k);
+        let known = pcx.scope_cache.get(k);
         if known != 0 {
             return known - 1;
         }
     }
-    let result = lookup_uncached(m, name, from, 0);
+    let result = lookup_uncached(m, name, from, 0, &pcx);
     if cacheable {
-        SCOPE_CACHE.put(k, result + 1);
+        pcx.scope_cache.put(k, result + 1);
     }
     result
 }
@@ -506,25 +478,25 @@ pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
 // (0.25.3) A program from the tools' cache has neither the items' nodes
 // nor the scopes this asks: there, what the front end answered, as the
 // cache keeps it (std_item_keys, restore_std_keys).
-pub fn std_item_key(name: i64) -> i64 {
+pub fn std_item_key(name: i64, pcx: inout Ctx<Comp>) -> i64 {
     if STD_MODULE < 0 || name < 0 {
         return -1;
     }
-    if STD_KEYS_RESTORED {
-        return STD_KEYS.get(name + 1) - 1;
+    if pcx.std_keys_restored {
+        return pcx.std_keys.get(name + 1) - 1;
     }
-    let own = item_key_if_known(STD_MODULE, name);
-    if own >= 0 && item_node_of(own) != 0 {
+    let own = item_key_if_known(STD_MODULE, name, &pcx);
+    if own >= 0 && item_node_of(own, pcx) != 0 {
         return own;
     }
-    if SCOPES_READY {
-        let b = lookup_quiet(STD_MODULE, name, STD_MODULE);
+    if pcx.scopes_ready {
+        let b = lookup_quiet(STD_MODULE, name, STD_MODULE, &pcx);
         return if binding_kind(b) == B_ITEM { binding_value(b) } else { -1 };
     }
-    for m in 0..MODULE_COUNT {
+    for m in 0..pcx.module_count {
         if m != STD_MODULE && within_std(m) {
-            let k = item_key_if_known(m, name);
-            if k >= 0 && item_node_of(k) != 0 {
+            let k = item_key_if_known(m, name, &pcx);
+            if k >= 0 && item_node_of(k, pcx) != 0 {
                 return k;
             }
         }
@@ -536,9 +508,9 @@ pub fn std_item_key(name: i64) -> i64 {
 // first n symbols that `std::NAME` names an item by, the symbol and the
 // item's key, into out (pairs). Asked of every symbol, as an answer from
 // the cache may ask of any.
-pub fn std_item_keys(n: i64, out: inout IntVec) {
+pub fn std_item_keys(n: i64, out: inout IntVec, pcx: inout Ctx<Comp>) {
     for s in 0..n {
-        let k = std_item_key(s);
+        let k = std_item_key(s, &pcx);
         if k >= 0 {
             out.push(s);
             out.push(k);
@@ -548,32 +520,32 @@ pub fn std_item_keys(n: i64, out: inout IntVec) {
 
 // (0.25.3) The answers std_item_keys kept, for a program restored from
 // the tools' cache: std_item_key answers from them from then on.
-pub fn restore_std_keys(pairs: IntVec) {
+pub fn restore_std_keys(pairs: IntVec, pcx: inout Ctx<Comp>) {
     var i = 0;
     while i + 1 < pairs.count {
-        STD_KEYS.put(pairs.get(i) + 1, pairs.get(i + 1) + 1);
+        pcx.std_keys.put(pairs.get(i) + 1, pairs.get(i + 1) + 1);
         i += 2;
     }
-    STD_KEYS_RESTORED = true;
+    pcx.std_keys_restored = true;
 }
 
 // What `name` stands for in module m, seen from `from`, where a value or a
 // type is wanted (0.14): when m has a child module `name` and imports an
 // item of that name too (`mod eval; use eval::eval;`), the item, as in
 // Rust; paths (`eval::other`) still go through the module.
-pub fn lookup_item(m: i64, name: i64, from: i64) -> i64 {
+pub fn lookup_item(m: i64, name: i64, from: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let b = lookup_name(m, name, from);
-        if binding_kind(b) != B_MODULE || !SCOPES_READY {
+        let b = lookup_name(m, name, from, &pcx);
+        if binding_kind(b) != B_MODULE || !pcx.scopes_ready {
             return b;
         }
         let inside = is_within(from, m);
-        let count = if m < USES_INDEXED { MODULE_USES[m].count } else { 0 };
+        let count = if m < pcx.uses_indexed { pcx.module_uses[m].count } else { 0 };
         for k in 0..count {
-            let u = MODULE_USES[m].data[k];
-            if USE_ENTRIES[u].name == name && !USE_ENTRIES[u].glob
-                && (inside || USE_ENTRIES[u].public) {
-                let item = resolve_use(u);
+            let u = pcx.module_uses[m].data[k];
+            if pcx.use_entries[u].name == name && !pcx.use_entries[u].glob
+                && (inside || pcx.use_entries[u].public) {
+                let item = resolve_use(u, &pcx);
                 if binding_kind(item) == B_ITEM || binding_kind(item) == B_PRIVATE {
                     return item;
                 }
@@ -583,38 +555,39 @@ pub fn lookup_item(m: i64, name: i64, from: i64) -> i64 {
     }
 }
 
-fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
+fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let inside = is_within(from, m);
         // (no symbol is made for the names looked for and not found)
-        let key = qualified_if_known(m, name);
-        let item = if key >= 0 { item_node_of(key) } else { 0 };
+        let key = qualified_if_known(m, name, &pcx);
+        let item = if key >= 0 { item_node_of(key, pcx) } else { 0 };
         if item != 0 {
             // (0.26.2: `pub(crate)`, `pub(super)`, `pub(in path)`: public
             // up to a module, front/modules/vis.vl)
-            if inside || (NODES[item].p & ITEM_PUBLIC) != 0 && admits(item, from)
+            if inside || (NODES[item].p & ITEM_PUBLIC) != 0 && admits(item, from, &pcx)
                 || MODULES[m].is_c {
                 return binding(B_ITEM, key);
             }
             return binding(B_PRIVATE, key);
         }
-        let c = child_module(m, name);
+        let c = child_module(m, name, pcx);
         if c >= 0 {
-            if inside || MODULES[c].public && module_admits(c, from) {
+            if inside || MODULES[c].public && module_admits(c, from, &pcx) {
                 return binding(B_MODULE, c);
             }
-            return binding(B_PRIVATE, qualify(m, name));
+            return binding(B_PRIVATE, qualify(m, name, &pcx));
         }
-        if !SCOPES_READY || depth > 8 {
+        if !pcx.scopes_ready || depth > 8 {
             return B_NONE;
         }
         // (only the module's own entries: its imports, then its `*` imports)
-        let count = if m < USES_INDEXED { MODULE_USES[m].count } else { 0 };
+        let count = if m < pcx.uses_indexed { pcx.module_uses[m].count } else { 0 };
         for k in 0..count {
-            let u = MODULE_USES[m].data[k];
-            if USE_ENTRIES[u].name == name && !USE_ENTRIES[u].glob
-                && (inside || USE_ENTRIES[u].public && admits(USE_ENTRIES[u].node, from)) {
-                return resolve_use(u);
+            let u = pcx.module_uses[m].data[k];
+            if pcx.use_entries[u].name == name && !pcx.use_entries[u].glob
+                && (inside
+                    || pcx.use_entries[u].public && admits(pcx.use_entries[u].node, from, &pcx)) {
+                return resolve_use(u, &pcx);
             }
         }
         // `*` imports: two that bring different things make the name
@@ -622,25 +595,26 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         var globbed = B_NONE;
         var via = -1;
         for k in 0..count {
-            let u = MODULE_USES[m].data[k];
-            if !USE_ENTRIES[u].glob
-                || !(inside || USE_ENTRIES[u].public && admits(USE_ENTRIES[u].node, from)) {
+            let u = pcx.module_uses[m].data[k];
+            if !pcx.use_entries[u].glob
+                || !(inside
+                    || pcx.use_entries[u].public && admits(pcx.use_entries[u].node, from, &pcx)) {
                 continue;
             }
-            let what = resolve_use(u);
+            let what = resolve_use(u, &pcx);
             var found = B_NONE;
             if what == B_NONE {
                 // (an import that failed)
                 continue;
             }
             if binding_kind(what) == B_MODULE {
-                let item = lookup_uncached(binding_value(what), name, m, depth + 1);
+                let item = lookup_uncached(binding_value(what), name, m, depth + 1, &pcx);
                 let kind = binding_kind(item);
                 if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
                     found = item;
                 }
             } else {
-                found = enum_variant_binding(SYM_ENUM[binding_value(what)] - 1, name);
+                found = enum_variant_binding(pcx.sym_enum[binding_value(what)] - 1, name, pcx);
             }
             if found != B_NONE {
                 if globbed == B_NONE {
@@ -652,20 +626,20 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
             }
         }
         if globbed != B_NONE {
-            if LOOKUP_QUIET == 0 {
-                note_glob_use(via, name, m == from && depth == 0);
+            if pcx.lookup_quiet == 0 {
+                note_glob_use(via, name, m == from && depth == 0, &pcx);
             }
             return globbed;
         }
         if MODULES[m].is_c {
             // The imported declarations see the root's names (its types
             // replace the headers' of the same names).
-            return lookup_uncached(0, name, 0, depth + 1);
+            return lookup_uncached(0, name, 0, depth + 1, &pcx);
         }
         // (0.18) A `#[cfg(test)]` module sees its parent's items, private
         // ones too, as a nested scope sees its parent's names (front/tests).
-        if depth == 0 && m == from && crate::front::tests::is_test_module(m) {
-            let up = lookup_uncached(MODULES[m].parent, name, m, depth + 1);
+        if depth == 0 && m == from && crate::front::tests::is_test_module(m, &pcx) {
+            let up = lookup_uncached(MODULES[m].parent, name, m, depth + 1, &pcx);
             if up != B_NONE {
                 return up;
             }
@@ -674,7 +648,7 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
         // item of the modules its `*` imports and paths go through.
         // (0.17: std's own code too: `None`, `Some(x)`)
         if STD_MODULE >= 0 && depth == 0 && m == from {
-            return prelude_lookup(name, m, depth);
+            return prelude_lookup(name, m, depth, &pcx);
         }
         B_NONE
     }
@@ -691,41 +665,10 @@ fn lookup_uncached(m: i64, name: i64, from: i64, depth: i64) -> i64 {
 // (a lookup that only asks, LOOKUP_QUIET, records nothing; its caller
 // repeats it with lookup_commit once the answer is used).
 
-pub static var LEGACY_IMPORTS: bool = false;
-
-pub static var LOOKUP_QUIET: i64 = 0;
-
-// (entry, name) pairs, in the order found; GLOB_SEEN: the same, as keys.
-pub static var GLOB_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var GLOB_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-// The `*` entry (+ 1) a bare name of a module came through, by (module,
-// name).
-static var GLOB_VIA: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-// The uses of C declarations through a plain `import "h.h";`: (position,
-// entry, name) triples, to be written `c::name`; QUAL_SEEN: by position,
-// and by (entry, name) for the names no longer imported by name.
-pub static var C_QUALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var QUAL_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-static var QUAL_NAMES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-// The positions of patterns (a constant cannot be written with its path
-// there), and the C declarations used in them: (entry, name) pairs, to be
-// imported by name (`use c::EOF;`).
-static var PATTERN_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-pub static var C_BY_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var BY_NAME_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
 // The name at `pos` is a pattern's.
-pub fn note_pattern_pos(pos: i64) {
-    if LEGACY_IMPORTS {
-        PATTERN_POS.put(pos + 1, 1);
+pub fn note_pattern_pos(pos: i64, pcx: inout Ctx<Comp>) {
+    if pcx.legacy_imports {
+        pcx.pattern_pos.put(pos + 1, 1);
     }
 }
 
@@ -733,90 +676,91 @@ fn glob_key(u: i64, name: i64) -> i64 {
     (u + 1) * 16777216 + name + 1
 }
 
-fn note_glob_use(u: i64, name: i64, bare: bool) {
+fn note_glob_use(u: i64, name: i64, bare: bool, pcx: inout Ctx<Comp>) {
     if bare {
-        unsafe { GLOB_VIA.put((name + 1) * 65536 + USE_ENTRIES[u].module, u + 1); }
+        unsafe { pcx.glob_via.put((name + 1) * 65536 + pcx.use_entries[u].module, u + 1); }
     }
     let k = glob_key(u, name);
-    if GLOB_SEEN.get(k) == 0 {
-        GLOB_SEEN.put(k, 1);
-        GLOB_USES.push(u);
-        GLOB_USES.push(name);
+    if pcx.glob_seen.get(k) == 0 {
+        pcx.glob_seen.put(k, 1);
+        pcx.glob_uses.push(u);
+        pcx.glob_uses.push(name);
     }
 }
 
 // A lookup whose answer may go unused (records nothing).
-pub fn lookup_quiet(m: i64, name: i64, from: i64) -> i64 {
-    LOOKUP_QUIET += 1;
-    let b = lookup_name(m, name, from);
-    LOOKUP_QUIET -= 1;
+pub fn lookup_quiet(m: i64, name: i64, from: i64, pcx: inout Ctx<Comp>) -> i64 {
+    pcx.lookup_quiet += 1;
+    let b = lookup_name(m, name, from, &pcx);
+    pcx.lookup_quiet -= 1;
     b
 }
 
 // Bare name `name` at `pos`, looked up quietly in the current module, is
 // used.
-pub fn lookup_commit(name: i64, pos: i64) {
-    if LEGACY_IMPORTS {
-        note_c_use(pos, name, lookup_name(CUR_MOD, name, CUR_MOD));
+pub fn lookup_commit(name: i64, pos: i64, pcx: inout Ctx<Comp>) {
+    if pcx.legacy_imports {
+        note_c_use(pos, name, lookup_name(pcx.cur_mod, name, pcx.cur_mod, &pcx), &pcx);
     }
 }
 
 // Bare name `name` at `pos` in the current module stands for b: when b is
 // a C declaration found through a `*` entry (a plain import, or a `*`
 // that leads to one), the use is recorded for --fix-imports.
-pub fn note_c_use(pos: i64, name: i64, b: i64) {
-    if !LEGACY_IMPORTS || LOOKUP_QUIET > 0 || C_MODULE < 0 || binding_kind(b) != B_ITEM {
+pub fn note_c_use(pos: i64, name: i64, b: i64, pcx: inout Ctx<Comp>) {
+    if !pcx.legacy_imports || pcx.lookup_quiet > 0 || pcx.c_module < 0
+        || binding_kind(b) != B_ITEM {
         return;
     }
-    let via = GLOB_VIA.get((name + 1) * 65536 + CUR_MOD) - 1;
-    if via < 0 || qualified_if_known(C_MODULE, name) != binding_value(b)
-        || QUAL_SEEN.get(pos + 1) != 0 {
+    let via = pcx.glob_via.get((name + 1) * 65536 + pcx.cur_mod) - 1;
+    if via < 0 || qualified_if_known(pcx.c_module, name, &pcx) != binding_value(b)
+        || pcx.qual_seen.get(pos + 1) != 0 {
         return;
     }
-    QUAL_SEEN.put(pos + 1, 1);
-    QUAL_NAMES.put(glob_key(via, name), 1);
-    if PATTERN_POS.get(pos + 1) != 0 {
-        if BY_NAME_SEEN.get(glob_key(via, name)) == 0 {
-            BY_NAME_SEEN.put(glob_key(via, name), 1);
-            C_BY_NAME.push(via);
-            C_BY_NAME.push(name);
+    pcx.qual_seen.put(pos + 1, 1);
+    pcx.qual_names.put(glob_key(via, name), 1);
+    if pcx.pattern_pos.get(pos + 1) != 0 {
+        if pcx.by_name_seen.get(glob_key(via, name)) == 0 {
+            pcx.by_name_seen.put(glob_key(via, name), 1);
+            pcx.c_by_name.push(via);
+            pcx.c_by_name.push(name);
         }
         return;
     }
-    C_QUALS.push(pos);
-    C_QUALS.push(via);
-    C_QUALS.push(name);
+    pcx.c_quals.push(pos);
+    pcx.c_quals.push(via);
+    pcx.c_quals.push(name);
 }
 
 // Whether the C declaration `name`, found through entry u, is written
 // with its path instead (so it is not imported by name).
-pub fn glob_name_qualified(u: i64, name: i64) -> bool {
-    QUAL_NAMES.get(glob_key(u, name)) != 0
+pub fn glob_name_qualified(u: i64, name: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.qual_names.get(glob_key(u, name)) != 0
 }
 
-pub fn use_entry_count() -> i64 {
-    USE_ENTRY_COUNT
+pub fn use_entry_count(pcx: Ctx<Comp>) -> i64 {
+    pcx.use_entry_count
 }
 
 // Entry u: its `use`/`import` node, module, and whether it is a `*` (or a
 // plain import, d = 2).
-pub fn use_entry_node(u: i64) -> i64 {
-    unsafe { USE_ENTRIES[u].node }
+pub fn use_entry_node(u: i64, pcx: Ctx<Comp>) -> i64 {
+    unsafe { pcx.use_entries[u].node }
 }
 
-pub fn use_entry_module(u: i64) -> i64 {
-    unsafe { USE_ENTRIES[u].module }
+pub fn use_entry_module(u: i64, pcx: Ctx<Comp>) -> i64 {
+    unsafe { pcx.use_entries[u].module }
 }
 
-pub fn use_entry_glob(u: i64) -> bool {
-    unsafe { USE_ENTRIES[u].glob }
+pub fn use_entry_glob(u: i64, pcx: Ctx<Comp>) -> bool {
+    unsafe { pcx.use_entries[u].glob }
 }
 
 // Variant `name` of enum e: B_VARIANT, or B_TVARIANT for a generic enum,
 // or B_NONE.
-pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
+pub fn enum_variant_binding(e: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
     if unsafe { ENUMS[e].generic > 0 } {
-        if template_variant_named(e, name) {
+        if template_variant_named(e, name, pcx) {
             return binding(B_TVARIANT, e);
         }
         return B_NONE;
@@ -837,14 +781,6 @@ pub fn enum_variant_binding(e: i64, name: i64) -> i64 {
 // 0.14: or uses a range as a value, see load_std_if_named). (0.17) std's
 // own code sees the prelude too.
 
-// The prelude's names, interned once (it is asked about every identifier
-// while the modules load): Option, Some, None, Result, Ok, Err, Vec,
-// print, println, ... (prelude_name). SYM_PRELUDE[sym] is a name's index
-// in it plus one, 0 for a name not in it.
-static var PRELUDE_NAMES: [i64; PRELUDE_COUNT] = [0; PRELUDE_COUNT];
-
-static var SYM_PRELUDE: *i64 = 0 as *i64;
-
 // The number of the prelude's names; those from PRELUDE_LATE on (0.15's,
 // 0.16's and 0.17's) load std only where the program uses them
 // (front::modules::uses_prelude015). (0.18) The one bound of the prelude's
@@ -862,10 +798,8 @@ const PRELUDE_PANIC: i64 = 49;
 // std::string's, not std's (where `str` is the module std::str).
 const PRELUDE_STR: i64 = 66;
 
-static var PRELUDE_INTERNED: bool = false;
-
-pub fn prelude_name(i: i64) -> i64 {
-    if !PRELUDE_INTERNED {
+pub fn prelude_name(i: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if !pcx.prelude_interned {
         // (0.9: and the traits of the operators, and Hash; 0.14: Iterator;
         // 0.15: formatting, conversions, Clone; 0.16: allocators, format_in;
         // 0.17: what Rust has without a `use` or programs reach for first:
@@ -886,26 +820,26 @@ pub fn prelude_name(i: i64) -> i64 {
             c"assert_eq", c"assert_ne", c"debug_assert", c"BinaryHeap", c"MinHeap", c"str",
             c"String", c"to_string_in", c"TryFrom", c"format_args"];
         unsafe {
-            sym_table(&SYM_PRELUDE);
+            sym_table(&pcx.sym_prelude);
             for k in 0..PRELUDE_COUNT {
                 let sym = intern_c(names[k]);
-                PRELUDE_NAMES[k] = sym;
-                SYM_PRELUDE[sym] = k + 1;
+                pcx.prelude_names[k] = sym;
+                pcx.sym_prelude[sym] = k + 1;
             }
         }
-        PRELUDE_INTERNED = true;
+        pcx.prelude_interned = true;
     }
-    PRELUDE_NAMES[i]
+    pcx.prelude_names[i]
 }
 
 // The index of `name` in the prelude, -1 when it is not one of its names.
-pub fn prelude_index(name: i64) -> i64 {
-    prelude_name(0);
-    unsafe { SYM_PRELUDE[name] - 1 }
+pub fn prelude_index(name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    prelude_name(0, &pcx);
+    unsafe { pcx.sym_prelude[name] - 1 }
 }
 
-pub fn is_prelude_name(name: i64) -> bool {
-    prelude_index(name) >= 0
+pub fn is_prelude_name(name: i64, pcx: inout Ctx<Comp>) -> bool {
+    prelude_index(name, &pcx) >= 0
 }
 
 // Whether name is one the prelude gained in 0.15 or later (Display, Debug,
@@ -913,13 +847,13 @@ pub fn is_prelude_name(name: i64) -> bool {
 // Arena, ScopedArena, arena_scope, format_in; 0.17's Buf, HashMap, trim,
 // ...): load_std_if_named looks at how a program uses these before it
 // loads std for them.
-pub fn is_prelude015(name: i64) -> bool {
-    prelude_index(name) >= PRELUDE_LATE
+pub fn is_prelude015(name: i64, pcx: inout Ctx<Comp>) -> bool {
+    prelude_index(name, &pcx) >= PRELUDE_LATE
 }
 
-fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
+fn prelude_lookup(name: i64, m: i64, depth: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let k = prelude_index(name);
+        let k = prelude_index(name, &pcx);
         if k < 0 {
             return B_NONE;
         }
@@ -927,23 +861,24 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
         let ok = k == 4 || k == 5;
         if some || ok {
             let e = lookup_uncached(STD_MODULE,
-                if some { prelude_name(0) } else { prelude_name(3) }, m, depth + 1);
-            if binding_kind(e) != B_ITEM || SYM_ENUM[binding_value(e)] == 0 {
+                if some { prelude_name(0, &pcx) } else { prelude_name(3, &pcx) }, m, depth + 1,
+                &pcx);
+            if binding_kind(e) != B_ITEM || pcx.sym_enum[binding_value(e)] == 0 {
                 return B_NONE;
             }
-            return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+            return enum_variant_binding(pcx.sym_enum[binding_value(e)] - 1, name, pcx);
         }
         if k >= PRELUDE_STR && k <= PRELUDE_STR + 2 {
-            let sm = lookup_uncached(STD_MODULE, intern_c(c"string"), m, depth + 1);
+            let sm = lookup_uncached(STD_MODULE, intern_c(c"string"), m, depth + 1, &pcx);
             if binding_kind(sm) != B_MODULE {
                 return B_NONE;
             }
-            return lookup_uncached(binding_value(sm), name, m, depth + 1);
+            return lookup_uncached(binding_value(sm), name, m, depth + 1, &pcx);
         }
         if k == PRELUDE_PANIC {
-            return lookup_uncached(STD_MODULE, intern_c(c"panic_str"), m, depth + 1);
+            return lookup_uncached(STD_MODULE, intern_c(c"panic_str"), m, depth + 1, &pcx);
         }
-        lookup_uncached(STD_MODULE, name, m, depth + 1)
+        lookup_uncached(STD_MODULE, name, m, depth + 1, &pcx)
     }
 }
 
@@ -951,83 +886,84 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
 // `count` segments of `path` (a Path node whose list holds Ident nodes),
 // from module m: `crate`, `self` and `super` first; `std`. `entry`: the
 // use entry whose path it is, or -1 (for the helps of its errors, 0.17).
-pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
+pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var cur = binding(B_MODULE, m);
         for i in 0..count {
-            let seg = child(path, i);
+            let seg = child(path, i, pcx);
             let name = NODES[seg].a;
             if binding_kind(cur) != B_MODULE {
-                name_error(NODES[seg].start, c"'", NODES[child(path, i - 1)].a,
-                    c"' is not a module");
+                name_error(NODES[seg].start, c"'", NODES[child(path, i - 1, pcx)].a,
+                    c"' is not a module", &pcx);
             }
             let here = binding_value(cur);
-            if i == 0 && name == SYM_CRATE {
+            if i == 0 && name == pcx.sym_crate {
                 cur = binding(B_MODULE, 0);
                 continue;
             }
-            if i == 0 && name == SELF_SYM {
+            if i == 0 && name == pcx.self_sym {
                 continue;
             }
-            if name == SYM_SUPER && (i == 0 || NODES[child(path, i - 1)].a == SYM_SUPER) {
+            if name == pcx.sym_super
+                && (i == 0 || NODES[child(path, i - 1, pcx)].a == pcx.sym_super) {
                 if MODULES[here].parent < 0 {
-                    error_at(NODES[seg].start, c"the root module has no 'super'");
+                    error_at(NODES[seg].start, c"the root module has no 'super'", &pcx);
                 }
                 cur = binding(B_MODULE, MODULES[here].parent);
                 continue;
             }
-            let found = lookup_name(here, name, m);
+            let found = lookup_name(here, name, m, &pcx);
             if binding_kind(found) == B_PRIVATE {
-                access_error(found, NODES[seg].start, name);
+                access_error(found, NODES[seg].start, name, &pcx);
             }
             if found == B_NONE {
-                if i == 0 && name == SYM_STD && STD_MODULE >= 0 {
+                if i == 0 && name == pcx.sym_std && STD_MODULE >= 0 {
                     cur = binding(B_MODULE, STD_MODULE);
                     continue;
                 }
                 if i == 0 {
-                    let other = sibling_module(m, name, seg, path, entry);
+                    let other = sibling_module(m, name, seg, path, entry, &pcx);
                     if other >= 0 {
                         cur = binding(B_MODULE, other);
-                        qnote_module(NODES[seg].start, name, other, 0);
+                        qnote_module(NODES[seg].start, name, other, 0, &pcx);
                         continue;
                     }
                 }
-                err_begin(NODES[seg].start);
-                err_failed_name(name);
+                err_begin(NODES[seg].start, &pcx);
+                err_failed_name(name, pcx);
                 if i == 0 {
-                    err_fmt(format_args("unknown module '{}'", sym_text(name)));
-                    help_unknown_module(m, name, path, entry);
+                    err_fmt(format_args("unknown module '{}'", sym_text(name)), pcx);
+                    help_unknown_module(m, name, path, entry, &pcx);
                 } else {
-                    err_fmt(format_args("no '{}' in module '", sym_text(name)));
+                    err_fmt(format_args("no '{}' in module '", sym_text(name)), pcx);
                     if here == 0 {
-                        err_str(c"crate");
+                        err_str(c"crate", pcx);
                     } else {
-                        err_sym(MODULES[here].key);
+                        err_sym(MODULES[here].key, pcx);
                     }
-                    err_str(c"'");
+                    err_str(c"'", pcx);
                     if here == STD_MODULE {
-                        let next = if i + 1 < NODES[path].count { NODES[child(path, i + 1)].a }
-                            else if entry >= 0 && !USE_ENTRIES[entry].glob {
-                                NODES[USE_ENTRIES[entry].item].a
+                        let next = if i + 1 < NODES[path].count { NODES[child(path, i + 1, pcx)].a }
+                            else if entry >= 0 && !pcx.use_entries[entry].glob {
+                                NODES[pcx.use_entries[entry].item].a
                             } else { 0 };
-                        help_std_path(name, next, m, entry >= 0);
+                        help_std_path(name, next, m, entry >= 0, &pcx);
                     }
                     // (0.25.2.2: the prelude's item, or another module's of std)
                     crate::front::check::names::help_std_elsewhere(here, name, entry >= 0,
-                        STD_MODULE, CUR_MOD, BUFS[ERR_HELP].len > 0);
+                        STD_MODULE, pcx.cur_mod, BUFS[pcx.err_help].len > 0, &pcx);
                     // (0.25.2.1: a function std has under another name)
                     let syn = crate::front::check::names::std_synonym_help(SYMS[name].text);
-                    if within_std(here) && syn.len > 0 && BUFS[ERR_HELP].len == 0 {
-                        err_help_fmt(syn);
+                    if within_std(here) && syn.len > 0 && BUFS[pcx.err_help].len == 0 {
+                        err_help_fmt(syn, pcx);
                     }
-                    help_near_item(here, name);
+                    help_near_item(here, name, &pcx);
                 }
-                err_end();
+                err_end(&pcx);
             }
             cur = found;
             if binding_kind(found) == B_MODULE {
-                qnote_module(NODES[seg].start, name, binding_value(found), 0);
+                qnote_module(NODES[seg].start, name, binding_value(found), 0, &pcx);
             }
         }
         cur
@@ -1042,7 +978,7 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
 // -1: a type's, a literal's, an expression's, ending where node path
 // ends) alike. Both, and different modules: an error, the two paths from
 // the root its try: lines.
-pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
+pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         // (0.20: std's root is std, not the program's)
         if m == 0 || m == STD_MODULE {
@@ -1052,30 +988,30 @@ pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64
         let parent = MODULES[m].parent;
         var sibling = -1;
         if parent >= 0 {
-            sibling = child_module(parent, name);
+            sibling = child_module(parent, name, pcx);
         }
         var top = -1;
         if parent != root {
-            top = child_module(root, name);
+            top = child_module(root, name, pcx);
         }
-        if sibling == STD_MODULE || sibling == C_MODULE {
+        if sibling == STD_MODULE || sibling == pcx.c_module {
             sibling = -1;
         }
-        if top == STD_MODULE || top == C_MODULE {
+        if top == STD_MODULE || top == pcx.c_module {
             top = -1;
         }
         if sibling >= 0 && top >= 0 && sibling != top {
-            err_begin(NODES[seg].start);
-            err_failed_name(name);
+            err_begin(NODES[seg].start, &pcx);
+            err_failed_name(name, pcx);
             err_fmt(
-                format_args("ambiguous module '{}': crate::{} (beside this module) or crate::{} (at the root)", sym_text(name), sym_text(MODULES[sibling].key), sym_text(name)));
-            err_help(c"a path that starts with neither `crate`, `self`, `super` nor a name of this module starts beside it, or at the root: name the one you mean");
+                format_args("ambiguous module '{}': crate::{} (beside this module) or crate::{} (at the root)", sym_text(name), sym_text(MODULES[sibling].key), sym_text(name)), pcx);
+            err_help(c"a path that starts with neither `crate`, `self`, `super` nor a name of this module starts beside it, or at the root: name the one you mean", pcx);
             let a = buf_new();
             buf_str(a, c"crate::");
             buf_bytes(a, SYMS[MODULES[parent].key].text);
-            path_try(entry, seg, path, buf_slice(a));
-            path_try(entry, seg, path, "crate");
-            err_end();
+            path_try(entry, seg, path, buf_slice(a), &pcx);
+            path_try(entry, seg, path, "crate", &pcx);
+            err_end(&pcx);
         }
         if sibling >= 0 { sibling } else { top }
     }
@@ -1083,9 +1019,9 @@ pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64
 
 // (0.17) A try: line for use entry `entry`: its line with `prefix::`
 // written before its path (`use crate::lexer::{Tok, mk};`).
-fn use_line_try(entry: i64, path: i64, prefix: [u8]) {
+fn use_line_try(entry: i64, path: i64, prefix: [u8], pcx: inout Ctx<Comp>) {
     unsafe {
-        let node = USE_ENTRIES[entry].node;
+        let node = pcx.use_entries[entry].node;
         let at = NODES[path].start;
         let t = buf_new();
         buf_bytes(t, SRC[NODES[node].start..at]);
@@ -1097,18 +1033,18 @@ fn use_line_try(entry: i64, path: i64, prefix: [u8]) {
         }
         let stop = if e > at { e } else { NODES[node].end };
         buf_bytes(t, SRC[at..stop]);
-        err_try_fmt(buf_slice(t));
+        err_try_fmt(buf_slice(t), pcx);
         // (0.18) the fix: the line so written
-        err_fix(NODES[node].start, stop, buf_slice(t));
+        err_fix(NODES[node].start, stop, buf_slice(t), &pcx);
     }
 }
 
 // (0.17) A try: line for a path (its first segment, node seg) with
 // `prefix::` written before it: a `use` entry's line (use_line_try), or the
 // path in code, its names and `::`s (`crate::front::util::twice`).
-fn path_try(entry: i64, seg: i64, path: i64, prefix: [u8]) {
+fn path_try(entry: i64, seg: i64, path: i64, prefix: [u8], pcx: inout Ctx<Comp>) {
     if entry >= 0 {
-        use_line_try(entry, path, prefix);
+        use_line_try(entry, path, prefix, &pcx);
         return;
     }
     let start = NODES[seg].start;
@@ -1123,34 +1059,34 @@ fn path_try(entry: i64, seg: i64, path: i64, prefix: [u8]) {
     buf_bytes(t, prefix);
     buf_str(t, c"::");
     buf_bytes(t, SRC[start..end]);
-    err_try_fmt(buf_slice(t));
+    err_try_fmt(buf_slice(t), pcx);
     // (0.18) the fix: the first segment so written
     let full = buf_new();
     buf_bytes(full, prefix);
     buf_str(full, c"::");
     buf_bytes(full, SYMS[NODES[seg].a].text);
-    path_fix(start, NODES[seg].a, buf_slice(full));
+    path_fix(start, NODES[seg].a, buf_slice(full), &pcx);
 }
 
 // (0.17) The help of `unknown module 'name'` at the start of path, from
 // module m: a module of that name elsewhere in the crate is reached from
 // the root (`crate::name::...`; for a `use`, its line so written is the
 // try:); a Rust std module is std's item; else the nearest module.
-fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
+fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         var found = -1;
         if m != 0 && MODULES[m].parent >= 0 {
-            found = child_module(MODULES[m].parent, name);
+            found = child_module(MODULES[m].parent, name, pcx);
         }
         if m != 0 && found < 0 {
-            found = child_module(0, name);
+            found = child_module(0, name, pcx);
         }
-        if found == m || found == STD_MODULE || found == C_MODULE {
+        if found == m || found == STD_MODULE || found == pcx.c_module {
             found = -1;
         }
         if found < 0 {
-            for k in 1..MODULE_COUNT {
-                if MODULES[k].name == name && k != STD_MODULE && k != C_MODULE && k != m
+            for k in 1..pcx.module_count {
+                if MODULES[k].name == name && k != STD_MODULE && k != pcx.c_module && k != m
                     && !is_within(k, STD_MODULE) {
                     found = k;
                     break;
@@ -1165,17 +1101,18 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
                 buf_bytes(full, SYMS[MODULES[MODULES[found].parent].key].text);
             }
             err_help_fmt(
-                format_args("'{}' is the module {}::{}; a path starts in this module, beside it or at the root: write `{}::{}::...`", sym_text(name), buf_slice(full), sym_text(name), buf_slice(full), sym_text(name)));
+                format_args("'{}' is the module {}::{}; a path starts in this module, beside it or at the root: write `{}::{}::...`", sym_text(name), buf_slice(full), sym_text(name), buf_slice(full), sym_text(name)), pcx);
             if entry >= 0 {
-                use_line_try(entry, path, buf_slice(full));
+                use_line_try(entry, path, buf_slice(full), &pcx);
             } else {
                 // (a type or a literal's path: the module imported, as
                 // module_as_path_error's for an expression)
-                err_try_fmt(format_args("use {}::{};", buf_slice(full), sym_text(name)));
+                err_try_fmt(format_args("use {}::{};", buf_slice(full), sym_text(name)), pcx);
                 // (0.18) the fix: the path from the crate's root
                 buf_str(full, c"::");
                 buf_bytes(full, SYMS[name].text);
-                path_fix(if path > 0 { NODES[path].start } else { -1 }, name, buf_slice(full));
+                path_fix(if path > 0 { NODES[path].start } else { -1 }, name, buf_slice(full),
+                    &pcx);
             }
             return;
         }
@@ -1186,20 +1123,20 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
                 r += 1;
             }
             if r < crate::base::FILES.len() as i64 && crate::front::modules::beside_root_help(
-                cstr(crate::base::FILES[r].path), SYMS[name].text) {
+                cstr(crate::base::FILES[r].path), SYMS[name].text, pcx) {
                 return;
             }
         }
         // (0.25.3) a module std has (before help_std_path: Rust's modules)
         if STD_MODULE >= 0 && m != STD_MODULE && !is_within(m, STD_MODULE)
             && std_has_module(SYMS[name].text) {
-            std_module_help(m, name, path, entry, entry >= 0);
+            std_module_help(m, name, path, entry, entry >= 0, &pcx);
             return;
         }
-        if help_std_path(name, 0, m, entry >= 0) {
+        if help_std_path(name, 0, m, entry >= 0, &pcx) {
             return;
         }
-        help_near_item(m, name);
+        help_near_item(m, name, &pcx);
     }
 }
 
@@ -1208,20 +1145,20 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
 // does not bring its name, `use std::gpu;` does (the fix adds it); in a
 // `use` line (in_use), the path from std (`use std::gpu::Surface;`, the
 // line so written when its entry is known).
-fn std_module_help(m: i64, name: i64, path: i64, entry: i64, in_use: bool) {
+fn std_module_help(m: i64, name: i64, path: i64, entry: i64, in_use: bool, pcx: inout Ctx<Comp>) {
     let t = sym_text(name);
     if in_use {
         err_help_fmt(
-            format_args("'{t}' is std's module std::{t}: a path in a `use` starts at `std`, `crate` or a module of this one"));
+            format_args("'{t}' is std's module std::{t}: a path in a `use` starts at `std`, `crate` or a module of this one"), pcx);
         if entry >= 0 && path > 0 {
-            use_line_try(entry, path, "std");
+            use_line_try(entry, path, "std", &pcx);
         }
         return;
     }
     err_help_fmt(
-        format_args("'{t}' is std's module std::{t}: its name comes with `use std::{t};` (then `{t}::NAME`; importing its items, `use std::{t}::{{A, B}};`, does not bring it), or write the path `std::{t}::NAME`"));
-    crate::tools::fix::note_missing_use(m, intern_c(c"std"), name);
-    err_fixable();
+        format_args("'{t}' is std's module std::{t}: its name comes with `use std::{t};` (then `{t}::NAME`; importing its items, `use std::{t}::{{A, B}};`, does not bring it), or write the path `std::{t}::NAME`"), pcx);
+    crate::tools::fix::note_missing_use(m, intern_c(c"std"), name, &pcx);
+    err_fixable(&pcx);
 }
 
 // (0.25.3) Whether std has a module `name` of its own (std::gpu, std::fs),
@@ -1262,11 +1199,11 @@ pub fn std_has_module(name: [u8]) -> bool {
 // (those are found as a `use` path's are), but a module elsewhere in the
 // crate: the error names it and its `use` line; returns when no module
 // has that name.
-pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64) {
+pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         var found = -1;
-        for k in 1..MODULE_COUNT {
-            if MODULES[k].name == name && k != STD_MODULE && k != C_MODULE && k != m
+        for k in 1..pcx.module_count {
+            if MODULES[k].name == name && k != STD_MODULE && k != pcx.c_module && k != m
                 && !is_within(k, STD_MODULE) {
                 found = k;
                 break;
@@ -1275,22 +1212,22 @@ pub fn module_as_path_error(m: i64, name: i64, at: i64, path: i64) {
         if found < 0 {
             return;
         }
-        err_begin(at);
-        err_failed_name(name);
-        err_fmt(format_args("unknown module '{}'", sym_text(name)));
-        help_unknown_module(m, name, path, -1);
-        err_end()
+        err_begin(at, &pcx);
+        err_failed_name(name, pcx);
+        err_fmt(format_args("unknown module '{}'", sym_text(name)), pcx);
+        help_unknown_module(m, name, path, -1, &pcx);
+        err_end(&pcx)
     }
 }
 
 // (0.18) The fix of a path whose first segment, module `name` at `at`
 // (-1: unknown), is written from the crate's root: `full` in its place.
-fn path_fix(at: i64, name: i64, full: [u8]) {
+fn path_fix(at: i64, name: i64, full: [u8], pcx: inout Ctx<Comp>) {
     let text = SYMS[name].text;
     if at < 0 || SRC[at..at + text.len as i64] != text || SRC[at + text.len as i64] != ':' {
         return;
     }
-    err_fix(at, at + text.len as i64, full);
+    err_fix(at, at + text.len as i64, full, &pcx);
 }
 
 // (0.17) The help of a path through `std::name` that std does not have,
@@ -1299,41 +1236,43 @@ fn path_fix(at: i64, name: i64, full: [u8]) {
 // std's item itself (`std::HashMap`, the `use` line as try:), or what
 // replaces that module (`in_use`: the path is a `use` item's; else the
 // try: is the path to write). Whether there was a help.
-pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
+pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool, pcx: inout Ctx<Comp>) -> bool {
     let t = SYMS[name].text;
     // (0.25.3) a module std has, written without `std::` (`fs::read_in`)
     if next == 0 && STD_MODULE >= 0 && m != STD_MODULE && !is_within(m, STD_MODULE)
         && std_has_module(t) {
-        std_module_help(m, name, 0, -1, in_use);
+        std_module_help(m, name, 0, -1, in_use, &pcx);
         return true;
     }
     if next != 0 && STD_MODULE >= 0
-        && binding_kind(lookup_quiet(STD_MODULE, next, m)) == B_ITEM {
+        && binding_kind(lookup_quiet(STD_MODULE, next, m, &pcx)) == B_ITEM {
         err_help_fmt(
-            format_args("vole's std has no module '{t}': std's items are all `std::NAME` too"));
+            format_args("vole's std has no module '{t}': std's items are all `std::NAME` too"),
+            pcx);
         if in_use {
-            err_try_fmt(format_args("use std::{};", sym_text(next)));
+            err_try_fmt(format_args("use std::{};", sym_text(next)), pcx);
         } else {
-            err_try_fmt(format_args("std::{}", sym_text(next)));
+            err_try_fmt(format_args("std::{}", sym_text(next)), pcx);
         }
         return true;
     }
     if t == "io" {
-        err_help(c"stdin is `read_line(&buf)` (a line), `read_stdin_in(gpa)` (all of it, a Vec<u8>), `Scanner` (tokens); output is `print`, `println`");
-        err_try(c"use std::{Scanner, read_line, read_stdin_in};");
+        err_help(c"stdin is `read_line(&buf)` (a line), `read_stdin_in(gpa)` (all of it, a Vec<u8>), `Scanner` (tokens); output is `print`, `println`", pcx);
+        err_try(c"use std::{Scanner, read_line, read_stdin_in};", pcx);
     } else if t == "collections" {
-        err_help(c"`HashMap<K, V>` (a set: `HashMap<K, bool>`), `Vec<T>` (in the prelude)");
-        err_try(c"use std::HashMap;");
+        err_help(c"`HashMap<K, V>` (a set: `HashMap<K, bool>`), `Vec<T>` (in the prelude)", pcx);
+        err_try(c"use std::HashMap;", pcx);
     } else if t == "fmt" {
         err_help(
-            c"`Display` (`fn fmt(self: *T, f: *Fmt)`), `Fmt`");
-        err_try(c"use std::{Display, Fmt};");
+            c"`Display` (`fn fmt(self: *T, f: *Fmt)`), `Fmt`", pcx);
+        err_try(c"use std::{Display, Fmt};", pcx);
     } else if t == "string" || t == "str" || t == "char" {
-        err_help(c"text is `[u8]` (string literals are one), built in a `std::Buf`; std's text functions are `std::trim`, `std::split_in`, `std::parse_int`, ...");
-        err_try(c"use std::Buf;");
+        err_help(c"text is `[u8]` (string literals are one), built in a `std::Buf`; std's text functions are `std::trim`, `std::split_in`, `std::parse_int`, ...", pcx);
+        err_try(c"use std::Buf;", pcx);
     } else if t == "vec" || t == "option" || t == "result" || t == "prelude" {
         err_help(
-            c"`Vec`, `Option`, `Result` and their variants are in the prelude: no `use` needed");
+            c"`Vec`, `Option`, `Result` and their variants are in the prelude: no `use` needed",
+            pcx);
     } else if t == "mem" || t == "cmp" || t == "iter" || t == "ops" || t == "convert"
         || t == "hash" || t == "process" || t == "env" || t == "fs" || t == "num"
         || t == "boxed" || t == "rc" || t == "cell" || t == "sync" || t == "thread"
@@ -1341,7 +1280,7 @@ pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
         || t == "alloc" {
         // (0.20: std's modules are iter, ops, slice, collections, io, fmt,
         // num, convert and clone)
-        err_help(c"vole's std has no such module: std's items are all `std::NAME` too (`volec query items std` lists them)");
+        err_help(c"vole's std has no such module: std's items are all `std::NAME` too (`volec query items std` lists them)", pcx);
     } else {
         return false;
     }
@@ -1351,11 +1290,11 @@ pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
 // The item a node names through a path of modules (h of a StructLit or a
 // PatVariant, the list of a TyName or a Path): the module after its
 // segments, from the module being checked.
-pub fn path_module(path: i64, count: i64) -> i64 {
-    let b = resolve_path(CUR_MOD, path, count, -1);
+pub fn path_module(path: i64, count: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let b = resolve_path(pcx.cur_mod, path, count, -1, &pcx);
     if binding_kind(b) != B_MODULE {
-        name_error(NODES[child(path, count - 1)].start, c"'", NODES[child(path, count - 1)].a,
-            c"' is not a module");
+        name_error(NODES[child(path, count - 1, pcx)].start, c"'",
+            NODES[child(path, count - 1, pcx)].a, c"' is not a module", &pcx);
     }
     binding_value(b)
 }

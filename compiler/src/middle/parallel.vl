@@ -46,11 +46,13 @@ use crate::base::{
     IntVec, alloc_array, alloc_zeroed, buf_bytes, buf_clear, buf_int, buf_slice, cstr, die, free,
     memcpy,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 use crate::base::timer::TIME_PASSES;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::{STR_COUNT, str_at};
-use crate::front::types::{ENUM_COUNT, TYPES, compute_layout};
+use crate::front::types::{TYPES, compute_layout};
 use crate::gen0::target::{RT_RENUMBERED, add_const_data, rt_output};
 use crate::middle::ctx::{FnCtx, main_cx};
 use crate::middle::inline::{
@@ -138,9 +140,9 @@ pub fn assembler_thread_wanted() -> bool {
 // Starts the pool for the program's functions (main thread, before the
 // first phase): the program's state the tasks only read is made first
 // (prepare_tasks).
-pub fn parallel_begin(cx: inout FnCtx) {
+pub fn parallel_begin(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        prepare_tasks(&cx);
+        prepare_tasks(&cx, pcx);
         FN_CONSTS = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(ConstList)) as *ConstList;
         FN_TEXT = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(FnText)) as *FnText;
         let fresh = crate::base::getenv(c"VOLE_FRESH_CONTEXTS");
@@ -492,9 +494,9 @@ fn fresh_context(cx: inout FnCtx) -> *FnCtx {
 }
 
 // Runs tasks first..end of ITEMS (a phase, or a level of one).
-fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64) {
+fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) {
     unsafe {
-        var tasks = task_list(&cx, kind, first, end);
+        var tasks = task_list(&cx, kind, first, end, pcx);
         pool_run(kind, tasks);
         free(tasks.data as *u8);
     }
@@ -506,10 +508,10 @@ fn run_tasks(cx: inout FnCtx, kind: i64, first: i64, end: i64) {
 // function started last would keep the others waiting), but emission's in
 // order (its texts are joined in order as they are done). What the tasks
 // read is made first (ir_release, prepare_layouts).
-fn task_list(cx: inout FnCtx, kind: i64, first: i64, end: i64) -> IntVec {
+fn task_list(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) -> IntVec {
     unsafe {
         ir_release(&cx);
-        prepare_layouts();
+        prepare_layouts(pcx);
         var tasks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var i = end;
         while i > first {
@@ -581,28 +583,28 @@ fn sort_tasks(tasks: IntVec, weight: *i64) {
 
 // A per-function phase over ITEMS[first..end], then its constant data
 // numbered.
-fn run_functions(cx: inout FnCtx, kind: i64, first: i64, end: i64) {
-    run_tasks(&cx, kind, first, end);
+fn run_functions(cx: inout FnCtx, kind: i64, first: i64, end: i64, pcx: Ctx<Comp>) {
+    run_tasks(&cx, kind, first, end, pcx);
     resolve_consts();
 }
 
 // Every live function's cleanup (-O1, -O2).
-pub fn cleanup_all(cx: inout FnCtx) {
+pub fn cleanup_all(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        cc_phase(K_CLEANUP);
+        cc_phase(K_CLEANUP, pcx);
         ITEMS.count = 0;
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
                 ITEMS.push(fi);
             }
         }
-        run_functions(&cx, K_CLEANUP, 0, ITEMS.count);
+        run_functions(&cx, K_CLEANUP, 0, ITEMS.count, pcx);
     }
 }
 
 // Every live function's scalar pipeline (-O2, before interprocedural
 // constants).
-pub fn simplify_all(cx: inout FnCtx) {
+pub fn simplify_all(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         ITEMS.count = 0;
         for fi in 0..IRFUNC_COUNT {
@@ -610,7 +612,7 @@ pub fn simplify_all(cx: inout FnCtx) {
                 ITEMS.push(fi);
             }
         }
-        run_functions(&cx, K_SIMPLIFY, 0, ITEMS.count);
+        run_functions(&cx, K_SIMPLIFY, 0, ITEMS.count, pcx);
     }
 }
 
@@ -725,10 +727,10 @@ fn callees_and_addresses(cx: inout FnCtx, fi: i64, out: inout IntVec) {
 }
 
 // Runs the -O2 bottom-up phase, a level at a time.
-pub fn optimize_components(cx: inout FnCtx) {
+pub fn optimize_components(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         build_components(&cx);
-        cc_phase(K_COMPONENT);
+        cc_phase(K_COMPONENT, pcx);
         // The components of each level, in SCC_ORDER.
         var by_level = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let start = alloc_array::<i64>(LEVEL_COUNT + 2);
@@ -752,7 +754,7 @@ pub fn optimize_components(cx: inout FnCtx) {
             for k in start[l]..start[l + 1] {
                 ITEMS.push(by_level.data[k]);
             }
-            run_tasks(&cx, K_COMPONENT, 0, ITEMS.count);
+            run_tasks(&cx, K_COMPONENT, 0, ITEMS.count, pcx);
             // The barrier: the level's growth and inlined calls, for the
             // next levels.
             for k in start[l]..start[l + 1] {
@@ -849,7 +851,7 @@ pub static var FN_TEXT: *FnText = 0 as *FnText;
 // others inline as the middle end left them), and joins their texts into
 // cx's (the program's) in that order: as they are done, beside the
 // emission (pool_run_joined); with one thread, after it.
-pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64) {
+pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64, pcx: Ctx<Comp>) {
     unsafe {
         ITEMS.count = 0;
         for i in 0..order.count {
@@ -860,9 +862,9 @@ pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64) {
         if RT_CX == 0 as *FnCtx {
             RT_CX = crate::middle::ctx::fnctx_new();
         }
-        cc_phase(K_EMIT);
-        emit_range(&*cx, 0, split);
-        emit_range(&*cx, split, ITEMS.count);
+        cc_phase(K_EMIT, pcx);
+        emit_range(&*cx, 0, split, pcx);
+        emit_range(&*cx, split, ITEMS.count, pcx);
         phase_time(c"emission, join and assembly");
     }
 }
@@ -870,19 +872,19 @@ pub fn emit_functions(cx: sink *FnCtx, order: IntVec, split: i64) {
 // The program's context, which the join appends to (main thread).
 static var JOIN_CX: *FnCtx = 0 as *FnCtx;
 
-fn emit_range(cx: inout FnCtx, first: i64, end: i64) {
+fn emit_range(cx: inout FnCtx, first: i64, end: i64, pcx: Ctx<Comp>) {
     unsafe {
-        var tasks = task_list(&cx, K_EMIT, first, end);
+        var tasks = task_list(&cx, K_EMIT, first, end, pcx);
         var next = first;
         if POOL_THREADS > 1 {
-            next = pool_run_joined(K_EMIT, tasks, first, end);
+            next = pool_run_joined(K_EMIT, tasks, first, end, pcx);
         } else {
             pool_run(K_EMIT, tasks);
         }
         free(tasks.data as *u8);
         resolve_consts();
         while next < end {
-            join_task(next);
+            join_task(next, pcx);
             next += 1;
         }
     }
@@ -891,7 +893,7 @@ fn emit_range(cx: inout FnCtx, first: i64, end: i64) {
 // Joins the text of task i (ITEMS' position i) to the program's (main
 // thread): false when it names constant data its phase has not numbered
 // yet (that waits for the phase's end, resolve_consts).
-pub fn join_task(i: i64) -> bool {
+pub fn join_task(i: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let fi = ITEMS.data[i];
         let t = &FN_TEXT[fi] as *FnText;
@@ -907,7 +909,7 @@ pub fn join_task(i: i64) -> bool {
             }
             join_text(&*JOIN_CX, *t);
             JOIN_CX.label_count += (*t).labels;
-            asm_flush(&*JOIN_CX);
+            asm_flush(&*JOIN_CX, pcx);
         }
         free((*t).data);
         free((*t).relocs as *u8);
@@ -1055,17 +1057,17 @@ fn next_marker(text: *u8, from: i64, len: i64, byte: i32) -> i64 {
 // what the passes would otherwise make the first time they need it, on
 // whichever thread (the symbols they compare with, the e-graph's rules,
 // the C library's table, every type's layout, the growth mode).
-fn prepare_tasks(cx: inout FnCtx) {
+fn prepare_tasks(cx: inout FnCtx, pcx: Ctx<Comp>) {
     crate::base::stress_grow();
     crate::gen0::target::rt_panic_sym();
     // (emission compares a CallC with both: interned here, as a task
     // would race the other threads on the symbol table)
     crate::gen0::target::rt_note_sym();
-    crate::middle::gvn::init_syms();
+    crate::middle::gvn::init_syms(pcx);
     crate::middle::ipo::init_syms();
     crate::front::effects::builtin::c_class(0);
     crate::middle::egraph::init_rules();
-    prepare_layouts();
+    prepare_layouts(pcx);
 }
 
 // The types laid out for the tasks: TYPES[..LAID_OUT].
@@ -1076,13 +1078,13 @@ static var LAID_OUT: i64 = 0;
 // the first time it is asked (is_freeze in a shared map), and a task may
 // ask: GVN asks is_freeze of a parameter's type (the types a serial phase
 // made since the last are prepared here too).
-fn prepare_layouts() {
+fn prepare_layouts(pcx: Ctx<Comp>) {
     while LAID_OUT < TYPES.len() as i64 {
         compute_layout(LAID_OUT);
         crate::front::cells::is_freeze(LAID_OUT);
         LAID_OUT += 1;
     }
-    for e in 0..ENUM_COUNT {
+    for e in 0..pcx.enum_count {
         enum_niche(e);
     }
 }

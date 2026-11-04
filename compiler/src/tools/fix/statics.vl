@@ -37,22 +37,21 @@ use crate::base::{
     buf_write_fd, intern, read_file,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ast::{FN_CLOSURE, FN_DERIVED, NODES, NODE_IMPLICIT, NodeKind, child};
 use crate::front::check::Res;
 use crate::front::generics::instantiate::{node_field_a, node_field_b, node_field_c};
 use crate::front::lexer::Tok;
 use crate::front::modules::{file_of_pos, module_of};
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::front::types::{
-    FNS, FN_COUNT, REF_SHARED, STATICS, STATIC_COUNT, TYPES, TyKind, fn_param,
-};
+use crate::front::types::{FNS, FN_COUNT, REF_SHARED, STATICS, TYPES, TyKind, fn_param};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::edit::items::{after_line, item_tail};
 use crate::tools::fix::remove_use_names;
-use crate::tools::query::defs::{DEFS, def_of_node, mod_fqn_text};
+use crate::tools::query::defs::{def_of_node, mod_fqn_text};
 use crate::tools::query::diagnostics::diag;
 use crate::tools::query::positions::line_start;
 use crate::tools::query::show::text_start;
@@ -107,9 +106,9 @@ fn is_space(c: u8) -> bool {
 // ---- The group file ----
 
 // Reads GROUP_FILE; false (with an error) when it is not a group.
-fn read_group(tcx: inout Tcx<Comp>) -> bool {
+fn read_group(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     let b = buf_new();
-    read_file(tcx.group_file, b);
+    read_file(tcx.group_file, b, pcx);
     let s = buf_slice(b);
     var k: usize = 0;
     var ok = true;
@@ -181,17 +180,17 @@ fn read_group(tcx: inout Tcx<Comp>) -> bool {
 }
 
 // The group's statics, by their ids (those --prune dropped left out).
-fn resolve_group(tcx: inout Tcx<Comp>) {
+fn resolve_group(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     // UNSAFE: STATICS is the checker's table of statics, a raw pointer (front::types).
     // SAFETY: s is below STATIC_COUNT, the table's length.
     unsafe {
-        for s in 0..STATIC_COUNT {
+        for s in 0..pcx.static_count {
             let d = def_of_node(STATICS[s].node, tcx);
             if d < 0 {
                 continue;
             }
             for i in 0..tcx.g_paths.count {
-                if tcx.g_dropped.get(i + 1) == 0 && path_is(DEFS[d].fqn, tcx.g_paths.get(i)) {
+                if tcx.g_dropped.get(i + 1) == 0 && path_is(pcx.defs[d].fqn, tcx.g_paths.get(i)) {
                     tcx.field_of.put(s + 1, i + 1);
                     tcx.statics_counts[0] += 1;
                 }
@@ -296,7 +295,7 @@ fn wrote(n: i64, tcx: inout Tcx<Comp>) {
     }
 }
 
-fn walk(n: i64, tcx: inout Tcx<Comp>) {
+fn walk(n: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     if n <= 0 {
         return;
     }
@@ -360,7 +359,7 @@ fn walk(n: i64, tcx: inout Tcx<Comp>) {
         let g = NODES[n].x - 1;
         if NODES[n].a != 0 {
             tcx.statics_callees.put(NODES[n].a + 1, 1);
-        } else if NODES[n].count > 0 && group_root(child(n, 0), tcx) != 0 {
+        } else if NODES[n].count > 0 && group_root(child(n, 0, pcx), tcx) != 0 {
             // (a method of the context's field: a write unless its receiver is a let)
             if receiver_writes(g) {
                 wrote(n, &tcx);
@@ -376,25 +375,25 @@ fn walk(n: i64, tcx: inout Tcx<Comp>) {
         }
     }
     if node_field_a(kind) {
-        walk(NODES[n].a, &tcx);
+        walk(NODES[n].a, &tcx, pcx);
     }
     if node_field_b(kind) {
-        walk(NODES[n].b, &tcx);
+        walk(NODES[n].b, &tcx, pcx);
     }
     if node_field_c(kind) {
-        walk(NODES[n].c, &tcx);
+        walk(NODES[n].c, &tcx, pcx);
     }
     if kind == NodeKind::For || kind == NodeKind::Param {
-        walk(NODES[n].d, &tcx);
+        walk(NODES[n].d, &tcx, pcx);
     }
     // (a format literal's and a `?`'s checked form: the calls in it are
     // resolved there; a static in a literal's hole is named by the call
     // the literal is given to)
     if kind == NodeKind::Interp || kind == NodeKind::Try {
-        walk(NODES[n].y, &tcx);
+        walk(NODES[n].y, &tcx, pcx);
     }
     for i in 0..NODES[n].count {
-        walk(child(n, i), &tcx);
+        walk(child(n, i, pcx), &tcx, pcx);
     }
     tcx.statics_call = saved_call;
     tcx.statics_stmt = saved_stmt;
@@ -446,7 +445,7 @@ fn param_type_at(n: i64) -> i64 {
 
 // Every function of the program (each instance of a generic one: its
 // checked copy), walked.
-fn walk_all(tcx: inout Tcx<Comp>) {
+fn walk_all(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     for f in 0..FN_COUNT {
         if !editable(f) {
             continue;
@@ -459,14 +458,14 @@ fn walk_all(tcx: inout Tcx<Comp>) {
             let d = def_of_node(item, tcx);
             if d >= 0 {
                 for i in 0..tcx.g_owners.count {
-                    if path_is(DEFS[d].fqn, tcx.g_owners.get(i)) {
+                    if path_is(pcx.defs[d].fqn, tcx.g_owners.get(i)) {
                         set(pos, F_OWNER, &tcx);
                     }
                 }
-                if DEFS[d].tr >= 0 {
+                if pcx.defs[d].tr >= 0 {
                     set(pos, F_TRAIT, &tcx);
                 }
-                if trimmed(SYMS[DEFS[d].fqn].text) == "main" || NODES[item].y == 1 {
+                if trimmed(SYMS[pcx.defs[d].fqn].text) == "main" || NODES[item].y == 1 {
                     set(pos, F_ENTRY, &tcx);
                 }
                 let fs = FILES[file_of_pos(pos)].start;
@@ -477,9 +476,9 @@ fn walk_all(tcx: inout Tcx<Comp>) {
         }
         tcx.statics_cur = pos;
         for j in 0..NODES[item].count {
-            walk(child(item, j), &tcx);
+            walk(child(item, j, pcx), &tcx, pcx);
         }
-        walk(NODES[item].c, &tcx);
+        walk(NODES[item].c, &tcx, pcx);
     }
 }
 
@@ -541,9 +540,9 @@ fn upgraded(p: i64, tcx: Tcx<Comp>) -> bool {
 }
 
 // Function item's Param node named NAME, or 0.
-fn param_named(item: i64, name: i64) -> i64 {
+fn param_named(item: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
     for j in 0..NODES[item].count {
-        let p = child(item, j);
+        let p = child(item, j, pcx);
         if NODES[p].kind == NodeKind::Param && NODES[p].a == name {
             return p;
         }
@@ -553,7 +552,7 @@ fn param_named(item: i64, name: i64) -> i64 {
 
 // The index among function item's parameters of the one named by the
 // identifier at s (a named argument's), or -1.
-fn named_index(item: i64, s: i64) -> i64 {
+fn named_index(item: i64, s: i64, pcx: Ctx<Comp>) -> i64 {
     var e = s;
     while e < SRC.len() as i64 && (SRC[e] == '_' || (SRC[e] >= 'a' && SRC[e] <= 'z')
         || (SRC[e] >= 'A' && SRC[e] <= 'Z') || (SRC[e] >= '0' && SRC[e] <= '9')) {
@@ -561,7 +560,7 @@ fn named_index(item: i64, s: i64) -> i64 {
     }
     var k = 0;
     for j in 0..NODES[item].count {
-        let p = child(item, j);
+        let p = child(item, j, pcx);
         if NODES[p].kind == NodeKind::Param {
             if SYMS[NODES[p].a].text == SRC[s..e] {
                 return k;
@@ -576,11 +575,11 @@ fn named_index(item: i64, s: i64) -> i64 {
 
 // The index the parameter takes in function item's parameters: before the
 // first with a default, else last; and the Param nodes' count.
-fn param_index(item: i64, count: inout i64) -> i64 {
+fn param_index(item: i64, count: inout i64, pcx: Ctx<Comp>) -> i64 {
     var k = -1;
     count = 0;
     for j in 0..NODES[item].count {
-        let p = child(item, j);
+        let p = child(item, j, pcx);
         if NODES[p].kind != NodeKind::Param {
             continue;
         }
@@ -592,10 +591,10 @@ fn param_index(item: i64, count: inout i64) -> i64 {
     if k < 0 { count } else { k }
 }
 
-fn param_at(item: i64, i: i64) -> i64 {
+fn param_at(item: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
     var k = 0;
     for j in 0..NODES[item].count {
-        let p = child(item, j);
+        let p = child(item, j, pcx);
         if NODES[p].kind == NodeKind::Param {
             if k == i {
                 return p;
@@ -673,10 +672,10 @@ fn render_inside(out: i64, a: i64, b: i64, tcx: inout Tcx<Comp>) {
     }
 }
 
-fn flush_edits(tcx: Tcx<Comp>) {
+fn flush_edits(tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     for i in 0..tcx.x_start.count {
         if tcx.statics_x_text.get(i) >= 0 {
-            edit_replace(tcx.x_start.get(i), tcx.x_end.get(i), tcx.statics_x_text.get(i));
+            edit_replace(tcx.x_start.get(i), tcx.x_end.get(i), tcx.statics_x_text.get(i), &pcx);
         }
     }
 }
@@ -688,12 +687,12 @@ fn param_text(b: i64, inout_: bool, tcx: Tcx<Comp>) {
     buf_bytes(b, SYMS[tcx.g_type].text);
 }
 
-fn edit_params(pos: i64, tcx: inout Tcx<Comp>) {
+fn edit_params(pos: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let item = tcx.item.get(pos + 1);
     if has(pos, F_HAS, tcx) {
         // (given before: `inout` when it now changes the context)
         if upgraded(pos, tcx) {
-            let p = param_named(item, tcx.g_param);
+            let p = param_named(item, tcx.g_param, pcx);
             let b = buf_new();
             buf_str(b, c"inout ");
             insert(param_type_at(p), b, &tcx);
@@ -702,17 +701,17 @@ fn edit_params(pos: i64, tcx: inout Tcx<Comp>) {
         return;
     }
     var count = 0;
-    let k = param_index(item, &count);
+    let k = param_index(item, &count, pcx);
     let b = buf_new();
     let inout_ = has(pos, F_INOUT, tcx);
     if k < count {
         param_text(b, inout_, tcx);
         buf_str(b, c", ");
-        insert(NODES[param_at(item, k)].start, b, &tcx);
+        insert(NODES[param_at(item, k, pcx)].start, b, &tcx);
     } else if count > 0 {
         buf_str(b, c", ");
         param_text(b, inout_, tcx);
-        insert(NODES[param_at(item, count - 1)].end, b, &tcx);
+        insert(NODES[param_at(item, count - 1, pcx)].end, b, &tcx);
     } else {
         param_text(b, inout_, tcx);
         // (the `(` after the name)
@@ -817,14 +816,14 @@ fn named_at(s: i64) -> bool {
     k + 1 < SRC.len() as i64 && SRC[k] == ':' && SRC[k + 1] != ':'
 }
 
-fn edit_call(n: i64, g: i64, tcx: inout Tcx<Comp>) {
+fn edit_call(n: i64, g: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let key = NODES[n].start * 4096 + (NODES[n].end - NODES[n].start) % 4096;
     if tcx.statics_done.get(key + 1) != 0 {
         return;
     }
     tcx.statics_done.put(key + 1, 1);
     let method = NODES[n].a == 0;
-    let from = if method { NODES[child(n, 0)].end } else { NODES[NODES[n].a].end };
+    let from = if method { NODES[child(n, 0, pcx)].end } else { NODES[NODES[n].a].end };
     let open = after_paren(from);
     if split_args(open, &tcx) < 0 {
         tcx.statics_counts[8] += 1;
@@ -858,7 +857,7 @@ fn edit_call(n: i64, g: i64, tcx: inout Tcx<Comp>) {
     }
     var count = 0;
     let item = tcx.item.get(g + 1);
-    let k = param_index(item, &count);
+    let k = param_index(item, &count, pcx);
     // (the index among the arguments written in the parentheses)
     let at = if method { k - 1 } else { k };
     var positional = 0;
@@ -878,7 +877,7 @@ fn edit_call(n: i64, g: i64, tcx: inout Tcx<Comp>) {
         // named, before the first whose parameter comes after it)
         var before = -1;
         for s in positional..segs {
-            if before < 0 && named_index(item, tcx.seg_start.get(s)) >= k {
+            if before < 0 && named_index(item, tcx.seg_start.get(s), pcx) >= k {
                 before = s;
             }
         }
@@ -974,7 +973,7 @@ fn edit_owner(pos: i64, tcx: inout Tcx<Comp>) {
 
 // ---- The list ----
 
-fn put_fn(out: i64, pos: i64, what: *u8, tcx: Tcx<Comp>) {
+fn put_fn(out: i64, pos: i64, what: *u8, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     let file = file_of_pos(pos);
     buf_str(out, FILES[file].path);
     buf_byte(out, ':');
@@ -982,7 +981,7 @@ fn put_fn(out: i64, pos: i64, what: *u8, tcx: Tcx<Comp>) {
     buf_byte(out, '\t');
     buf_str(out, what);
     buf_byte(out, '\t');
-    put_name(out, pos, tcx);
+    put_name(out, pos, tcx, pcx);
     // (why it is inout: the first write in it)
     let w = tcx.write_at.get(pos + 1);
     if w > 0 {
@@ -1002,7 +1001,7 @@ fn put_fn(out: i64, pos: i64, what: *u8, tcx: Tcx<Comp>) {
         buf_bytes(out, SYMS[tcx.g_fields.get(u - 1)].text);
     } else if tcx.via.get(pos + 1) > 0 {
         buf_str(out, c"\tvia ");
-        put_name(out, tcx.via.get(pos + 1) - 1, tcx);
+        put_name(out, tcx.via.get(pos + 1) - 1, tcx, pcx);
     }
     buf_byte(out, '\n');
 }
@@ -1019,10 +1018,10 @@ fn line_of(pos: i64) -> i64 {
     line
 }
 
-fn put_name(out: i64, pos: i64, tcx: Tcx<Comp>) {
+fn put_name(out: i64, pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     let d = def_of_node(tcx.item.get(pos + 1), tcx);
     if d >= 0 {
-        buf_bytes(out, trimmed(SYMS[DEFS[d].fqn].text));
+        buf_bytes(out, trimmed(SYMS[pcx.defs[d].fqn].text));
     }
 }
 
@@ -1052,21 +1051,21 @@ fn what_of(p: i64, tcx: Tcx<Comp>) -> *u8 {
 
 // `fix --only statics`: the group moved; the number of functions given
 // the parameter (0 when the group is refused).
-pub fn statics_edits(tcx: inout Tcx<Comp>) -> i64 {
+pub fn statics_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     if tcx.group_file == 0 as *u8 {
         let d = diag(c"error", c"fix.statics", &tcx);
         buf_str(d, c"--only statics takes --group FILE (the statics, their fields, the parameter and its owners)\n");
         return 0;
     }
-    if !read_group(&tcx) {
+    if !read_group(&tcx, pcx) {
         return 0;
     }
     if tcx.statics_prune {
-        prune(&tcx);
+        prune(&tcx, pcx);
         return 0;
     }
-    resolve_group(&tcx);
-    walk_all(&tcx);
+    resolve_group(&tcx, pcx);
+    walk_all(&tcx, pcx);
     close(&tcx);
     var any_refused = false;
     let out = buf_new();
@@ -1086,7 +1085,7 @@ pub fn statics_edits(tcx: inout Tcx<Comp>) -> i64 {
             if !any_refused {
                 let d = diag(c"error", c"fix.statics", &tcx);
                 buf_str(d, c"'");
-                put_name(d, p, tcx);
+                put_name(d, p, tcx, pcx);
                 buf_str(d, c"' needs the group's context, and no owner gives it (");
                 buf_str(d, what_of(p, tcx));
                 buf_str(d, c"): nothing is changed\n  help: name an owner above it in the group file, or leave out the statics that reach it (--prune)\n  try: volec fix --only statics-list --group ");
@@ -1096,7 +1095,7 @@ pub fn statics_edits(tcx: inout Tcx<Comp>) -> i64 {
             any_refused = true;
         }
         if tcx.statics_list && (member || has(p, F_OWNER, tcx)) {
-            put_fn(out, p, what_of(p, tcx), tcx);
+            put_fn(out, p, what_of(p, tcx), tcx, pcx);
         }
     }
     if tcx.statics_list {
@@ -1109,7 +1108,7 @@ pub fn statics_edits(tcx: inout Tcx<Comp>) -> i64 {
     for i in 0..tcx.statics_items.count {
         let p = tcx.statics_items.get(i);
         if has(p, F_MEMBER, tcx) {
-            edit_params(p, &tcx);
+            edit_params(p, &tcx, pcx);
         } else if owner_used(p, tcx) && !has(p, F_LOCAL, tcx) {
             edit_owner(p, &tcx);
         }
@@ -1119,19 +1118,19 @@ pub fn statics_edits(tcx: inout Tcx<Comp>) -> i64 {
         let g = tcx.statics_e_to.get(e);
         if has(g, F_MEMBER, tcx) && (has(c, F_MEMBER, tcx) || has(c, F_OWNER, tcx))
             && (NODES[tcx.e_node.get(e)].p & NODE_IMPLICIT) == 0 {
-            edit_call(tcx.e_node.get(e), g, &tcx);
+            edit_call(tcx.e_node.get(e), g, &tcx, pcx);
         }
     }
     for i in 0..tcx.u_node.count {
         edit_use(i, &tcx);
     }
     lend_all(&tcx);
-    hoist_all(&tcx);
-    flush_edits(tcx);
+    hoist_all(&tcx, pcx);
+    flush_edits(tcx, &pcx);
     if tcx.statics_counts[0] > 0 {
-        delete_statics(&tcx);
-        unimport_statics(&tcx);
-        import_context(&tcx);
+        delete_statics(&tcx, &pcx);
+        unimport_statics(&tcx, &pcx);
+        import_context(&tcx, &pcx);
     }
     tcx.statics_counts[3]
 }
@@ -1285,13 +1284,13 @@ fn put_fn_at(out: i64, pos: i64) {
 // The group's statics' declarations deleted (their comments with them);
 // declarations on adjacent lines in one deletion, so that no blank lines
 // are left together.
-fn delete_statics(tcx: inout Tcx<Comp>) {
+fn delete_statics(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     var heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var tails = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     // UNSAFE: STATICS is the checker's table of statics, a raw pointer (front::types).
     // SAFETY: s is below STATIC_COUNT, the table's length.
     unsafe {
-        for s in 0..STATIC_COUNT {
+        for s in 0..pcx.static_count {
             if tcx.field_of.get(s + 1) == 0 {
                 continue;
             }
@@ -1300,28 +1299,28 @@ fn delete_statics(tcx: inout Tcx<Comp>) {
                 continue;
             }
             // (in position order)
-            let h = line_start(text_start(d));
+            let h = line_start(text_start(d, pcx), pcx);
             var k = heads.count;
             heads.push(h);
-            tails.push(item_tail(d, tcx));
+            tails.push(item_tail(d, tcx, pcx));
             while k > 0 && heads.get(k - 1) > h {
                 heads.set(k, heads.get(k - 1));
                 tails.set(k, tails.get(k - 1));
                 k -= 1;
             }
             heads.set(k, h);
-            tails.set(k, item_tail(d, tcx));
+            tails.set(k, item_tail(d, tcx, pcx));
         }
     }
     var i = 0;
     while i < heads.count {
         var tail = tails.get(i);
         var j = i + 1;
-        while j < heads.count && heads.get(j) == after_line(tail - 1) {
+        while j < heads.count && heads.get(j) == after_line(tail - 1, pcx) {
             tail = tails.get(j);
             j += 1;
         }
-        if delete_lines(heads.get(i), tail) {
+        if delete_lines(heads.get(i), tail, &pcx) {
             tcx.statics_counts[10] += j - i;
         }
         i = j;
@@ -1331,19 +1330,20 @@ fn delete_statics(tcx: inout Tcx<Comp>) {
 // The module path a Use node's path names (`crate::` taken away; `self`
 // and `super` from its module; another first segment, a module of the
 // crate's root, or with RELATIVE one of its own module's), into buffer out.
-fn use_prefix(out: i64, u: i64, relative: bool, tcx: inout Tcx<Comp>) {
+fn use_prefix(out: i64, u: i64, relative: bool, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     let path = NODES[u].c;
-    var m = trimmed(mod_fqn_text(module_of(u), &tcx));
+    var m = trimmed(mod_fqn_text(module_of(u, &pcx), &tcx, pcx));
     var first = 0;
     if NODES[path].count > 0 {
-        let s0 = SYMS[NODES[child(path, 0)].a].text;
+        let s0 = SYMS[NODES[child(path, 0, pcx)].a].text;
         if s0 == "crate" {
             m = "";
             first = 1;
         } else if s0 == "self" {
             first = 1;
         } else if s0 == "super" {
-            while first < NODES[path].count && SYMS[NODES[child(path, first)].a].text == "super" {
+            while first < NODES[path].count
+                && SYMS[NODES[child(path, first, pcx)].a].text == "super" {
                 var e = m.len();
                 while e > 0 && m[e - 1] != ':' {
                     e -= 1;
@@ -1360,13 +1360,13 @@ fn use_prefix(out: i64, u: i64, relative: bool, tcx: inout Tcx<Comp>) {
         if buf_slice(out).len() > 0 {
             buf_str(out, c"::");
         }
-        buf_bytes(out, SYMS[NODES[child(path, k)].a].text);
+        buf_bytes(out, SYMS[NODES[child(path, k, pcx)].a].text);
     }
 }
 
 // The imports of the group's statics taken out of the `use` lines, a
 // `pub use` of one too and the imports through it.
-fn unimport_statics(tcx: inout Tcx<Comp>) {
+fn unimport_statics(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     var moved = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for i in 0..tcx.g_paths.count {
         if tcx.g_dropped.get(i + 1) == 0 {
@@ -1390,11 +1390,11 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
                 continue;
             }
             for k in 0..NODES[u].count {
-                if imports_moved(u, k, moved, &tcx) {
-                    let id = child(u, k);
+                if imports_moved(u, k, moved, &tcx, &pcx) {
+                    let id = child(u, k, pcx);
                     let local = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
                     let alias = buf_new();
-                    buf_bytes(alias, trimmed(mod_fqn_text(module_of(u), &tcx)));
+                    buf_bytes(alias, trimmed(mod_fqn_text(module_of(u, &pcx), &tcx, pcx)));
                     buf_str(alias, c"::");
                     buf_bytes(alias, SYMS[local].text);
                     let s = intern(buf_slice(alias));
@@ -1410,7 +1410,7 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
         let u = uses.get(i);
         var gone = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..NODES[u].count {
-            if imports_moved(u, k, moved, &tcx) {
+            if imports_moved(u, k, moved, &tcx, &pcx) {
                 gone.push(k);
             }
         }
@@ -1419,7 +1419,7 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
             tcx.statics_done.put(-(u + (1 << 44) + 1), 1);
         }
         if gone.count == NODES[u].count {
-            tcx.statics_counts[11] += remove_use_names(u, gone);
+            tcx.statics_counts[11] += remove_use_names(u, gone, &pcx);
         } else if gone.count > 0 {
             // (the names left, written again: two names next to each other
             // are one edit; `volec fmt` lays the line out)
@@ -1441,7 +1441,7 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
                     if w > 0 {
                         buf_str(text, c", ");
                     }
-                    let id = child(u, k);
+                    let id = child(u, k, pcx);
                     buf_bytes(text, SRC[NODES[id].start..NODES[id].end]);
                     w += 1;
                 }
@@ -1450,7 +1450,7 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
                 buf_byte(text, '}');
             }
             buf_byte(text, ';');
-            if edit_replace(NODES[u].start, NODES[u].end, text) {
+            if edit_replace(NODES[u].start, NODES[u].end, text, &pcx) {
                 tcx.statics_counts[11] += gone.count;
             }
         }
@@ -1459,12 +1459,12 @@ fn unimport_statics(tcx: inout Tcx<Comp>) {
 
 // Whether name k of Use node u imports a path in MOVED (as the crate's or
 // as its module's).
-fn imports_moved(u: i64, k: i64, moved: HMap, tcx: inout Tcx<Comp>) -> bool {
+fn imports_moved(u: i64, k: i64, moved: HMap, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     for r in 0..2 {
         let full = buf_new();
-        use_prefix(full, u, r == 1, &tcx);
+        use_prefix(full, u, r == 1, &tcx, &pcx);
         buf_str(full, c"::");
-        buf_bytes(full, SYMS[NODES[child(u, k)].a].text);
+        buf_bytes(full, SYMS[NODES[child(u, k, pcx)].a].text);
         if moved.get(intern(buf_slice(full)) + 1) != 0 {
             return true;
         }
@@ -1482,7 +1482,7 @@ fn user_file(f: i64) -> bool {
 // The group's `use PATH` lines added to each file that gives a function
 // the parameter or (and `owner-use PATH`) an owner the local, where the
 // file does not import the name already nor defines it.
-fn import_context(tcx: inout Tcx<Comp>) {
+fn import_context(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     if tcx.g_uses.count == 0 && tcx.g_owner_uses.count == 0 {
         return;
     }
@@ -1518,16 +1518,16 @@ fn import_context(tcx: inout Tcx<Comp>) {
             }
             let path = if owner_only { tcx.g_owner_uses.get(j - tcx.g_uses.count) }
                 else { tcx.g_uses.get(j) };
-            add_use(f, path, uses, &tcx);
+            add_use(f, path, uses, &tcx, &pcx);
         }
     }
 }
 
 // `use PATH;` added to file f, after its last `use` (else before its
 // first item), unless f imports PATH's name or its module defines it.
-fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>) {
+fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     let mt = buf_new();
-    buf_bytes(mt, trimmed(mod_fqn_text(FILES[f].module, &tcx)));
+    buf_bytes(mt, trimmed(mod_fqn_text(FILES[f].module, &tcx, pcx)));
     let p = trimmed(SYMS[path].text);
     var e = p.len();
     while e > 0 && p[e - 1] != ':' {
@@ -1546,7 +1546,7 @@ fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>) {
             continue;
         }
         for k in 0..NODES[u].count {
-            let id = child(u, k);
+            let id = child(u, k, pcx);
             let local = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
             if SYMS[local].text == name {
                 return;
@@ -1555,7 +1555,7 @@ fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>) {
         if tcx.statics_done.get(-(u + (1 << 44) + 1)) != 0 && NODES[u].end > gone_end {
             gone_end = NODES[u].end;
         }
-        if line_start(NODES[u].start) == NODES[u].start && NODES[u].end > last
+        if line_start(NODES[u].start, pcx) == NODES[u].start && NODES[u].end > last
             && tcx.statics_done.get(-(u + (1 << 44) + 1)) == 0 {
             last = NODES[u].end;
         }
@@ -1570,11 +1570,11 @@ fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>) {
         buf_str(b, c"\nuse ");
         buf_bytes(b, SYMS[path].text);
         buf_byte(b, ';');
-        edit_replace(last, last, b);
+        edit_replace(last, last, b, &pcx);
     } else {
         // (the first line that is no comment, not blank and no `use` taken
         // out)
-        var at = if gone_end > 0 { after_line(gone_end - 1) } else { FILES[f].start };
+        var at = if gone_end > 0 { after_line(gone_end - 1, pcx) } else { FILES[f].start };
         loop {
             var k = at;
             while k < FILES[f].end && (SRC[k] == ' ' || SRC[k] == '\t') {
@@ -1594,7 +1594,7 @@ fn add_use(f: i64, path: i64, uses: IntVec, tcx: inout Tcx<Comp>) {
         buf_str(b, c"use ");
         buf_bytes(b, SYMS[path].text);
         buf_str(b, c";\n\n");
-        edit_replace(at, at, b);
+        edit_replace(at, at, b, &pcx);
     }
     tcx.statics_counts[12] += 1;
 }
@@ -1628,12 +1628,12 @@ fn reset_walk(tcx: inout Tcx<Comp>) {
 }
 
 // Whether member p is under one of --prune's prefixes.
-fn inside(p: i64, tcx: Tcx<Comp>) -> bool {
+fn inside(p: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     let d = def_of_node(tcx.item.get(p + 1), tcx);
     if d < 0 {
         return true;
     }
-    let t = trimmed(SYMS[DEFS[d].fqn].text);
+    let t = trimmed(SYMS[pcx.defs[d].fqn].text);
     for i in 0..tcx.prune_prefixes.count {
         let x = trimmed(SYMS[tcx.prune_prefixes.get(i)].text);
         if x == "crate" || x.len() == 0 {
@@ -1652,18 +1652,18 @@ fn inside(p: i64, tcx: Tcx<Comp>) -> bool {
 // rounds: each such function is followed down its `via`s to the function
 // using a static, whose first static is dropped. The group that is left
 // is printed, as a group file, the dropped as comments.
-fn prune(tcx: inout Tcx<Comp>) {
+fn prune(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     var rounds = 0;
     loop {
         reset_walk(&tcx);
-        resolve_group(&tcx);
-        walk_all(&tcx);
+        resolve_group(&tcx, pcx);
+        walk_all(&tcx, pcx);
         close(&tcx);
         rounds += 1;
         var dropped = 0;
         for i in 0..tcx.statics_items.count {
             let p = tcx.statics_items.get(i);
-            if !has(p, F_MEMBER, tcx) || (!refused(p, tcx) && inside(p, tcx)) {
+            if !has(p, F_MEMBER, tcx) || (!refused(p, tcx) && inside(p, tcx, pcx)) {
                 continue;
             }
             var q = p;
@@ -1719,7 +1719,7 @@ fn prune(tcx: inout Tcx<Comp>) {
         buf_bytes(out, SYMS[tcx.g_fields.get(i)].text);
         if why != 0 {
             buf_str(out, c"\t(reaches ");
-            put_name(out, why - 1, tcx);
+            put_name(out, why - 1, tcx, pcx);
             buf_byte(out, ')');
         }
         buf_byte(out, '\n');
@@ -1787,12 +1787,12 @@ fn lends_context(a: i64, b: i64, tcx: Tcx<Comp>) -> bool {
 // arguments up to the last that changes it become `let`s before the
 // statement, in order (`let pbody_arg = new_block(&pbody);`). The
 // statement is written whole, with the other edits inside it.
-fn hoist_all(tcx: inout Tcx<Comp>) {
+fn hoist_all(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let name = SYMS[tcx.g_param].text;
     for i in 0..tcx.h_stmt.count {
         let stmt = tcx.h_stmt.get(i);
         let call = tcx.h_call.get(i);
-        var recv = child(call, 0);
+        var recv = child(call, 0, pcx);
         while NODES[recv].kind == NodeKind::Unary && NODES[recv].op == Tok::Amp {
             recv = NODES[recv].b;
         }
@@ -1809,7 +1809,7 @@ fn hoist_all(tcx: inout Tcx<Comp>) {
         // (the arguments as written: within the call)
         var last = 0;
         for k in 1..NODES[call].count {
-            let arg = child(call, k);
+            let arg = child(call, k, pcx);
             if NODES[arg].start < NODES[recv].end || NODES[arg].end > NODES[call].end {
                 continue;
             }
@@ -1836,7 +1836,7 @@ fn hoist_all(tcx: inout Tcx<Comp>) {
         var at = NODES[stmt].start;
         let rest = buf_new();
         for k in 1..last + 1 {
-            let arg = child(call, k);
+            let arg = child(call, k, pcx);
             if NODES[arg].start < NODES[recv].end || NODES[arg].end > NODES[call].end {
                 continue;
             }

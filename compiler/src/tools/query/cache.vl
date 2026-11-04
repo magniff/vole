@@ -27,15 +27,12 @@ use crate::base::{
     fclose, fopen, fwrite, memcpy, memset, restore_sources, restore_sym, strlen, sym_hash,
 };
 use crate::base::comp::Comp;
-use crate::base::diag::{DIAG_PROG, diag_records, diag_restore};
+use crate::base::ctx::Ctx;
+use crate::base::diag::{diag_records, diag_restore};
 use crate::base::timer::{TIME_PASSES, T_CACHE, timer_add, timer_now};
-use crate::front::cimport::IMPORTED_START;
 use crate::front::embed::{embed_count, embed_path_at, read_embedded};
 use crate::front::lexer::init_lexer;
-use crate::front::modules::{
-    C_MODULE, INLINE_MODS, MODULES, MODULE_PROBES, STD_MODULE, add_module, init_modules,
-    module_count,
-};
+use crate::front::modules::{MODULES, STD_MODULE, add_module, init_modules, module_count};
 use crate::front::modules::lookup::{restore_std_keys, std_item_keys};
 use crate::front::own::diag::OWN_MODE;
 use crate::tools::ctx::Tcx;
@@ -44,13 +41,8 @@ use crate::tools::proc::{
     fork_worker, make_dirs, read_file_if, remove_file, rename_file, worker_exit, write_file_if,
 };
 use crate::tools::query::QF_USE;
-use crate::tools::query::command_line::NOTES;
-use crate::tools::query::defs::{
-    DEFS, Def, K_IMPL_METHOD, K_METHOD, MOD_DEF, def_of_node, restore_def, trait_of,
-};
-use crate::tools::query::diagnostics::PROG;
+use crate::tools::query::defs::{Def, K_IMPL_METHOD, K_METHOD, def_of_node, restore_def, trait_of};
 use crate::tools::query::effects::cache_texts;
-use crate::tools::query::positions::LINES;
 use crate::tools::query::refs::collect_all_refs;
 use crate::tools::query::sections::code_start;
 use crate::tools::query::show::{impl_block, impl_header_span, signature_end};
@@ -192,9 +184,9 @@ fn hash_region(p: *u8, n: i64) -> u64 {
 
 // (0.25.3) The hash of embedded file `path`'s bytes (include_str,
 // include_bytes; a NUL after the path), -1 when it cannot be read.
-fn embedded_hash(path: [u8]) -> i64 {
+fn embedded_hash(path: [u8], pcx: Ctx<Comp>) -> i64 {
     let b = buf_new();
-    if !read_embedded(path, b) {
+    if !read_embedded(path, b, pcx) {
         return -1;
     }
     let text = buf_slice(b);
@@ -212,66 +204,61 @@ fn body_hash(b: i64, from: i64) -> i64 {
     }
 }
 
-// The hash of the compiler's executable (0: not found by its path).
-static var IDENT: i64 = -1;
-
-pub fn ident() -> i64 {
+pub fn ident(pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if IDENT >= 0 {
-            return IDENT;
+        if pcx.ident >= 0 {
+            return pcx.ident;
         }
-        IDENT = 0;
+        pcx.ident = 0;
         var slash = false;
         var i = 0;
-        while PROG != 0 as *u8 && PROG[i] != 0 {
-            slash = slash || PROG[i] == '/';
+        while pcx.prog != 0 as *u8 && pcx.prog[i] != 0 {
+            slash = slash || pcx.prog[i] == '/';
             i += 1;
         }
         // (0.25.3: `volec` run from $PATH, without a `/`, is the file the
         // shell found; it had no cache before)
-        var exe = PROG;
-        if !slash && PROG != 0 as *u8 {
-            exe = crate::tools::proc::find_in_path(PROG[0..i]);
+        var exe = pcx.prog;
+        if !slash && pcx.prog != 0 as *u8 {
+            exe = crate::tools::proc::find_in_path(pcx.prog[0..i], pcx);
         }
         let b = buf_new();
         if exe != 0 as *u8 && read_file_if(exe, b) {
-            IDENT = (hash_region(BUFS[b].data, BUFS[b].len) >> 1) as i64;
-            if IDENT == 0 {
-                IDENT = 1;
+            pcx.ident = (hash_region(BUFS[b].data, BUFS[b].len) >> 1) as i64;
+            if pcx.ident == 0 {
+                pcx.ident = 1;
             }
         }
-        IDENT
+        pcx.ident
     }
 }
 
 // ---- Where ----
 
-static var DIR: *u8 = 0 as *u8;
-
 // The cache directory, or 0: none.
-pub fn cache_dir() -> *u8 {
+pub fn cache_dir(pcx: inout Ctx<Comp>) -> *u8 {
     unsafe {
-        if DIR != 0 as *u8 {
-            return DIR;
+        if pcx.dir != 0 as *u8 {
+            return pcx.dir;
         }
         let env = getenv(c"VOLE_CACHE");
         if env != 0 as *u8 {
             if env[0] == 0 || (env[0] == 'o' && env[1] == 'f' && env[2] == 'f' && env[3] == 0) {
                 return 0 as *u8;
             }
-            DIR = env;
+            pcx.dir = env;
         } else if access(c"target/.", 0) == 0 {
-            DIR = c"target/volec-cache";
+            pcx.dir = c"target/volec-cache";
         }
-        DIR
+        pcx.dir
     }
 }
 
 // (0.25.4) Where the cache is when the environment names none ($VOLE_CACHE
 // unset, no ./target): `volec run`'s, so that its builds have the code
 // cache wherever they run. $VOLE_CACHE=off keeps it off.
-pub fn cache_dir_or(dir: *u8) -> *u8 {
-    let have = cache_dir();
+pub fn cache_dir_or(dir: *u8, pcx: inout Ctx<Comp>) -> *u8 {
+    let have = cache_dir(&pcx);
     if have != 0 as *u8 {
         return have;
     }
@@ -279,7 +266,7 @@ pub fn cache_dir_or(dir: *u8) -> *u8 {
     // SAFETY: a NUL-terminated literal's name; only compared to null.
     let env = unsafe { getenv(c"VOLE_CACHE") };
     if env == 0 as *u8 {
-        DIR = dir;
+        pcx.dir = dir;
     }
     dir
 }
@@ -296,7 +283,7 @@ fn cwd() -> *u8 {
 }
 
 // The cache's file for root and target, with suffix `ext`.
-fn cache_file(root: *u8, target: i64, ext: *u8) -> *u8 {
+fn cache_file(root: *u8, target: i64, ext: *u8, pcx: inout Ctx<Comp>) -> *u8 {
     unsafe {
         let k = buf_new();
         put_cstr(k, root);
@@ -308,10 +295,10 @@ fn cache_file(root: *u8, target: i64, ext: *u8) -> *u8 {
         // lines kept in the cache name: `target/volec check`, then `volec
         // edit ...` from $PATH, read them as other errors, new ones, and
         // refused the edit; `volec check` printed `try: target/volec ...`)
-        put_cstr(k, if DIAG_PROG == 0 as *u8 { c"volec" } else { DIAG_PROG });
+        put_cstr(k, if pcx.diag_prog == 0 as *u8 { c"volec" } else { pcx.diag_prog });
         let h = hash_region(BUFS[k].data, BUFS[k].len);
         let out = buf_new();
-        buf_str(out, cache_dir());
+        buf_str(out, cache_dir(&pcx));
         buf_str(out, c"/q-");
         for i in 0..16 {
             let d = ((h >> ((15 - i) * 4) as u64) & 15) as u8;
@@ -326,13 +313,13 @@ fn cache_file(root: *u8, target: i64, ext: *u8) -> *u8 {
 // Whether the cache can be used at all: a directory, and the compiler
 // found. Not with the places IR's options (0.26.0): what they print and
 // check is made by checking, which a cached answer skips.
-fn usable() -> bool {
-    cache_dir() != 0 as *u8 && ident() != 0 && !crate::places::places_enabled()
+fn usable(pcx: inout Ctx<Comp>) -> bool {
+    cache_dir(&pcx) != 0 as *u8 && ident(&pcx) != 0 && !crate::places::places_enabled(pcx)
 }
 
 // Whether a command that reads a program in full should make its cache.
-pub fn cache_on() -> bool {
-    usable()
+pub fn cache_on(pcx: inout Ctx<Comp>) -> bool {
+    usable(&pcx)
 }
 
 // ---- Reading ----
@@ -365,22 +352,22 @@ fn read_exact(path: *u8, dst: *u8, n: i64) -> bool {
 // The cache is q-KEY.bin, or else q-KEY.next.bin: what the check of an
 // edit (`check --overlay`) made of the edited program, which holds once
 // the edit is written (it is then renamed the cache), and else is removed.
-pub fn cache_restore(root: *u8, target: i64, refs: bool, tcx: inout Tcx<Comp>) -> bool {
+pub fn cache_restore(root: *u8, target: i64, refs: bool, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     let t = timer_now();
-    var ok = restore(root, target, refs, false, &tcx);
-    if !ok && usable() {
-        let next_bin = cache_file(root, target, c".next.bin");
-        let next_refs = cache_file(root, target, c".next.refs");
-        ok = restore(root, target, refs, true, &tcx);
+    var ok = restore(root, target, refs, false, &tcx, &pcx);
+    if !ok && usable(&pcx) {
+        let next_bin = cache_file(root, target, c".next.bin", &pcx);
+        let next_refs = cache_file(root, target, c".next.refs", &pcx);
+        ok = restore(root, target, refs, true, &tcx, &pcx);
         if ok {
-            rename_file(next_refs, cache_file(root, target, c".refs"));
-            rename_file(next_bin, cache_file(root, target, c".bin"));
+            rename_file(next_refs, cache_file(root, target, c".refs", &pcx));
+            rename_file(next_bin, cache_file(root, target, c".bin", &pcx));
         } else {
             remove_file(next_bin);
             remove_file(next_refs);
         }
     }
-    if usable() {
+    if usable(&pcx) {
         trace(if ok { c"hit" } else { c"miss" });
     }
     timer_add(T_CACHE, t);
@@ -404,18 +391,20 @@ fn trace(word: *u8) {
     }
 }
 
-fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>) -> bool {
+fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>,
+    pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if !usable() || SYMS.len() != 0 || crate::base::OVERLAY.count > 0
-            || crate::front::stdtree::STD_TREE != 0 as *u8 {
+        if !usable(&pcx) || SYMS.len() != 0 || pcx.overlay.count > 0
+            || pcx.std_tree != 0 as *u8 {
             return false;
         }
         let b = buf_new();
-        if !read_file_if(cache_file(root, target, if next { c".next.bin" } else { c".bin" }), b) {
+        if !read_file_if(cache_file(root, target, if next { c".next.bin" } else { c".bin" }, &pcx),
+            b) {
             return false;
         }
         read_words(b, &tcx);
-        if get(&tcx) != MAGIC || get(&tcx) != VERSION || get(&tcx) != ident()
+        if get(&tcx) != MAGIC || get(&tcx) != VERSION || get(&tcx) != ident(&pcx)
             || get(&tcx) != tcx.rd_n
             || get(&tcx) != body_hash(b, 5) {
             return false;
@@ -480,7 +469,7 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>)
         let n_embeds = get_count(2, &tcx);
         for _ in 0..n_embeds {
             let path = get_str(&tcx);
-            if tcx.rd_bad || get(&tcx) != embedded_hash(path) {
+            if tcx.rd_bad || get(&tcx) != embedded_hash(path, pcx) {
                 return false;
             }
         }
@@ -488,14 +477,16 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>)
         var n_refs = 0;
         if refs {
             let r = buf_new();
-            if !read_file_if(cache_file(root, target, if next { c".next.refs" } else { c".refs" }),
+            if !read_file_if(cache_file(root, target, if next { c".next.refs" } else { c".refs" },
+                &pcx),
                 r)
                 || BUFS[r].len % 8 != 0 || BUFS[r].len < 40 {
                 return false;
             }
             words = BUFS[r].data as *i64;
             n_refs = BUFS[r].len / 8 - 5;
-            if words[0] != MAGIC || words[1] != ident() || words[2] != stamp || words[3] != n_refs
+            if words[0] != MAGIC || words[1] != ident(&pcx) || words[2] != stamp
+                || words[3] != n_refs
                 || words[4] != body_hash(r, 5) {
                 return false;
             }
@@ -504,11 +495,11 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>)
             return false;
         }
         // It holds: the tables, as the front end left them.
-        restore_sources(all, files);
-        restore_tables(&tcx);
+        restore_sources(all, files, &pcx);
+        restore_tables(&tcx, &pcx);
         // (the lexer as the front end left it: its keywords, for what
         // lexes a text again, the layout of an edit)
-        init_lexer();
+        init_lexer(&pcx);
         if tcx.rd_bad {
             crate::base::die(c"the tools' cache is damaged; remove target/volec-cache");
         }
@@ -529,7 +520,7 @@ fn get_ints(v: inout IntVec, tcx: inout Tcx<Comp>) {
     }
 }
 
-fn restore_tables(tcx: inout Tcx<Comp>) {
+fn restore_tables(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         let n_syms = get_count(2, &tcx);
         for _ in 0..n_syms {
@@ -537,20 +528,20 @@ fn restore_tables(tcx: inout Tcx<Comp>) {
             restore_sym(get_str(&tcx), h);
         }
         let n_modules = get_count(4, &tcx);
-        init_modules();
+        init_modules(&pcx);
         for m in 0..n_modules {
             let name = get(&tcx);
             let parent = get(&tcx);
             let public = get(&tcx) != 0;
             let is_c = get(&tcx) != 0;
             if m > 0 {
-                add_module(name, parent, public);
+                add_module(name, parent, public, &pcx);
             }
             MODULES[m].is_c = is_c;
         }
         STD_MODULE = get(&tcx);
-        C_MODULE = get(&tcx);
-        get_ints(&INLINE_MODS, &tcx);
+        pcx.c_module = get(&tcx);
+        get_ints(&pcx.inline_mods, &tcx);
         let n_defs = get_count(26, &tcx);
         tcx.c_eff_buf = buf_new();
         tcx.c_own_buf = buf_new();
@@ -562,7 +553,7 @@ fn restore_tables(tcx: inout Tcx<Comp>) {
                 fqn: get(&tcx),
                 path: get(&tcx), owner: get(&tcx), tr: get(&tcx),
             };
-            restore_def(def);
+            restore_def(def, &pcx);
             let tcx_arg = get(&tcx);
             tcx.c_sig_end.push(tcx_arg);
             let tcx_arg = get(&tcx);
@@ -592,14 +583,14 @@ fn restore_tables(tcx: inout Tcx<Comp>) {
                 tcx.c_own_text.push(buf_slice(tcx.c_own_buf).len as i64);
             }
         }
-        get_ints(&MOD_DEF, &tcx);
+        get_ints(&pcx.mod_def, &tcx);
         var aliases = tcx.aliases;
         get_ints(&aliases, &tcx);
         tcx.aliases = aliases;
         tcx.c_alias = get(&tcx);
         tcx.c_alias_module = get(&tcx);
-        get_ints(&NOTES, &tcx);
-        get_ints(&LINES, &tcx);
+        get_ints(&pcx.notes, &tcx);
+        get_ints(&pcx.lines, &tcx);
         var file_rank = tcx.file_rank;
         get_ints(&file_rank, &tcx);
         tcx.file_rank = file_rank;
@@ -623,7 +614,7 @@ fn restore_tables(tcx: inout Tcx<Comp>) {
             warnings.push(text_buf(get_str(&tcx)));
             warnings.push(get(&tcx));
         }
-        diag_restore(&errors, &warnings, error_count);
+        diag_restore(&errors, &warnings, error_count, &pcx);
         // (0.25.3) std_item_key's answers, symbols both (a pair naming no item
         // is none)
         var std_keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -638,7 +629,7 @@ fn restore_tables(tcx: inout Tcx<Comp>) {
                 std_keys.push(k);
             }
         }
-        restore_std_keys(std_keys);
+        restore_std_keys(std_keys, &pcx);
     }
 }
 
@@ -650,16 +641,16 @@ fn text_buf(s: [u8]) -> i64 {
 
 // The references of collect_refs, from the cache: those to the
 // definitions of GROUP.
-pub fn cached_refs(tcx: inout Tcx<Comp>) {
+pub fn cached_refs(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
-        let group = crate::base::alloc_array::<i64>(DEFS.len() as i64 + 1);
-        for d in 0..DEFS.len() as i64 {
+        let group = crate::base::alloc_array::<i64>(pcx.defs.len() as i64 + 1);
+        for d in 0..pcx.defs.len() as i64 {
             group[d] = tcx.refs_group.get(d + 1) - 1;
         }
         for i in 0..tcx.c_ref_count {
             let w = tcx.c_refs[i];
             let d = (w & 4294967295) >> 6;
-            if d >= DEFS.len() as i64 || group[d] < 0 {
+            if d >= pcx.defs.len() as i64 || group[d] < 0 {
                 continue;
             }
             tcx.r_pos.push(w >> 32);
@@ -680,9 +671,9 @@ pub fn cached_refs(tcx: inout Tcx<Comp>) {
 // while this one ends, its output to /dev/null. Here instead with
 // --time-passes and $VOLE_CACHE_TRACE (the tests: the next command
 // must find it).
-pub fn cache_save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
+pub fn cache_save(root: *u8, target: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        if tcx.restored || !tcx.parsed || IMPORTED_START >= 0 || !usable() {
+        if tcx.restored || !tcx.parsed || pcx.imported_start >= 0 || !usable(&pcx) {
             return;
         }
         if !TIME_PASSES && getenv(c"VOLE_CACHE_TRACE") == 0 as *u8 {
@@ -698,12 +689,12 @@ pub fn cache_save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
                     dup2(null, 1);
                     dup2(null, 2);
                 }
-                save(root, target, &tcx);
+                save(root, target, &tcx, &pcx);
                 worker_exit(0);
             }
         }
         let t = timer_now();
-        save(root, target, &tcx);
+        save(root, target, &tcx, &pcx);
         timer_add(T_CACHE, t);
     }
 }
@@ -733,22 +724,22 @@ fn write_atomic(b: i64, path: *u8) -> bool {
     }
 }
 
-fn save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
+fn save(root: *u8, target: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        if FILES.len() == 0 || crate::front::stdtree::STD_TREE != 0 as *u8
-            || !make_dirs(cache_dir()) {
+        if FILES.len() == 0 || pcx.std_tree != 0 as *u8
+            || !make_dirs(cache_dir(&pcx)) {
             return;
         }
         // (with --overlay, the edited program: its cache for after the edit)
-        let next = crate::base::OVERLAY.count > 0;
+        let next = pcx.overlay.count > 0;
         let src_len = FILES[FILES.len() as i64 - 1].end + 1;
         let stamp = (hash_region(SRC.ptr, src_len) >> 1) as i64;
         // The references, apart (only refs and callers read them).
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        collect_all_refs(&all, &tcx);
+        collect_all_refs(&all, &tcx, pcx);
         let r = buf_new();
         put(r, MAGIC);
-        put(r, ident());
+        put(r, ident(&pcx));
         put(r, stamp);
         put(r, all.count / 3);
         put(r, 0);
@@ -759,13 +750,14 @@ fn save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
         }
         let refs_header = BUFS[r].data as *i64;
         refs_header[4] = body_hash(r, 5);
-        if !write_atomic(r, cache_file(root, target, if next { c".next.refs" } else { c".refs" })) {
+        if !write_atomic(r,
+            cache_file(root, target, if next { c".next.refs" } else { c".refs" }, &pcx)) {
             return;
         }
         let b = buf_new();
         put(b, MAGIC);
         put(b, VERSION);
-        put(b, ident());
+        put(b, ident(&pcx));
         put(b, 0);
         put(b, 0);
         put_cstr(b, root);
@@ -786,29 +778,30 @@ fn save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
                 put_str(b, SRC[FILES[f].start..FILES[f].end]);
             }
         }
-        put(b, MODULE_PROBES.count);
-        for k in 0..MODULE_PROBES.count {
-            put_cstr(b, MODULE_PROBES.data[k] as *u8);
+        put(b, pcx.module_probes.count);
+        for k in 0..pcx.module_probes.count {
+            put_cstr(b, pcx.module_probes.data[k] as *u8);
         }
         // (0.25.3) the embedded files, each with the hash of its bytes
-        put(b, embed_count());
-        for k in 0..embed_count() {
-            let path = embed_path_at(k);
+        put(b, embed_count(pcx));
+        for k in 0..embed_count(pcx) {
+            let path = embed_path_at(k, pcx);
             put_str(b, path);
-            put(b, embedded_hash(path));
+            put(b, embedded_hash(path, pcx));
         }
-        save_tables(b, tcx);
+        save_tables(b, tcx, &pcx);
         // (the number of words, in the header)
         let header = BUFS[b].data as *i64;
         header[3] = BUFS[b].len / 8;
         header[4] = body_hash(b, 5);
-        if write_atomic(b, cache_file(root, target, if next { c".next.bin" } else { c".bin" })) {
+        if write_atomic(b,
+            cache_file(root, target, if next { c".next.bin" } else { c".bin" }, &pcx)) {
             trace(c"save");
         }
     }
 }
 
-fn save_tables(b: i64, tcx: Tcx<Comp>) {
+fn save_tables(b: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         let n_syms = SYMS.len() as i64;
         put(b, n_syms);
@@ -816,19 +809,19 @@ fn save_tables(b: i64, tcx: Tcx<Comp>) {
             put(b, sym_hash(s) as i64);
             put_str(b, SYMS[s].text);
         }
-        put(b, module_count());
-        for m in 0..module_count() {
+        put(b, module_count(pcx));
+        for m in 0..module_count(pcx) {
             put(b, MODULES[m].name);
             put(b, MODULES[m].parent);
             put(b, if MODULES[m].public { 1 } else { 0 });
             put(b, if MODULES[m].is_c { 1 } else { 0 });
         }
         put(b, STD_MODULE);
-        put(b, C_MODULE);
-        put_ints(b, INLINE_MODS);
-        put(b, DEFS.len() as i64);
-        for d in 0..DEFS.len() as i64 {
-            let x = DEFS[d];
+        put(b, pcx.c_module);
+        put_ints(b, pcx.inline_mods);
+        put(b, pcx.defs.len() as i64);
+        for d in 0..pcx.defs.len() as i64 {
+            let x = pcx.defs[d];
             put(b, d + 1);
             put(b, x.kind);
             put(b, x.name);
@@ -843,35 +836,35 @@ fn save_tables(b: i64, tcx: Tcx<Comp>) {
             put(b, x.path);
             put(b, x.owner);
             put(b, x.tr);
-            put(b, signature_end(d, tcx));
-            put(b, trait_of(d, tcx));
+            put(b, signature_end(d, tcx, pcx));
+            put(b, trait_of(d, tcx, pcx));
             let method = x.kind == K_METHOD || x.kind == K_IMPL_METHOD;
-            put(b, if method { impl_block(d, tcx) } else { 0 });
+            put(b, if method { impl_block(d, tcx, pcx) } else { 0 });
             var to = 0;
-            let from = if method { impl_header_span(d, &to, tcx) } else { 0 };
+            let from = if method { impl_header_span(d, &to, tcx, pcx) } else { 0 };
             put(b, from);
             put(b, to);
-            put(b, item_head(d, tcx));
-            put(b, item_tail(d, tcx));
-            put(b, keyword_head(d, tcx));
+            put(b, item_head(d, tcx, pcx));
+            put(b, item_tail(d, tcx, pcx));
+            put(b, keyword_head(d, tcx, pcx));
             // (0.16: the effects def, show and `query effects` print)
             let set = buf_new();
             let lines = buf_new();
-            cache_texts(d, set, lines, tcx);
+            cache_texts(d, set, lines, tcx, pcx);
             put_str(b, buf_slice(set));
             put_str(b, buf_slice(lines));
             // (0.19: what it needs beyond the build's features)
             let feats = buf_new();
-            crate::tools::query::features::def_features_text(feats, d, tcx);
+            crate::tools::query::features::def_features_text(feats, d, tcx, pcx);
             put_str(b, buf_slice(feats));
             // (0.17: the kind and the view summary, tools/query/values)
             let kind = buf_new();
             let views = buf_new();
-            own_cache_texts(d, kind, views, tcx);
+            own_cache_texts(d, kind, views, tcx, &pcx);
             put_str(b, buf_slice(kind));
             put_str(b, buf_slice(views));
         }
-        put_ints(b, MOD_DEF);
+        put_ints(b, pcx.mod_def);
         put_ints(b, tcx.aliases);
         put(b, tcx.c_alias);
         put(b, tcx.c_alias_module);
@@ -879,29 +872,29 @@ fn save_tables(b: i64, tcx: Tcx<Comp>) {
         // the definition + 1 in place of its node (def_of_node).
         var notes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var k = 0;
-        while k < NOTES.count {
-            if (NOTES.data[k + 3] & QF_USE) != 0 && is_alias_at(NOTES.data[k], tcx) {
-                let d = def_of_node(NOTES.data[k + 2], tcx);
+        while k < pcx.notes.count {
+            if (pcx.notes.data[k + 3] & QF_USE) != 0 && is_alias_at(pcx.notes.data[k], tcx) {
+                let d = def_of_node(pcx.notes.data[k + 2], tcx);
                 if d >= 0 {
-                    notes.push(NOTES.data[k]);
-                    notes.push(NOTES.data[k + 1]);
+                    notes.push(pcx.notes.data[k]);
+                    notes.push(pcx.notes.data[k + 1]);
                     notes.push(d + 1);
-                    notes.push(NOTES.data[k + 3]);
+                    notes.push(pcx.notes.data[k + 3]);
                 }
             }
             k += 4;
         }
         put_ints(b, notes);
-        put_ints(b, LINES);
+        put_ints(b, pcx.lines);
         put_ints(b, tcx.file_rank);
         put_ints(b, tcx.containers);
         put(b, FILES.len() as i64);
         for f in 0..FILES.len() as i64 {
-            put(b, code_start(f, tcx));
+            put(b, code_start(f, tcx, pcx));
         }
         var errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var warnings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let error_count = diag_records(&errors, &warnings);
+        let error_count = diag_records(&errors, &warnings, &pcx);
         put(b, error_count);
         put(b, errors.count / 2);
         var e = 0;
@@ -922,7 +915,7 @@ fn save_tables(b: i64, tcx: Tcx<Comp>) {
         // the restored program has no scopes to ask). Last: what asking
         // does to the tables is not in what was written above.
         var std_keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        std_item_keys(n_syms, &std_keys);
+        std_item_keys(n_syms, &std_keys, &pcx);
         put(b, std_keys.count / 2);
         var p = 0;
         while p + 1 < std_keys.count {

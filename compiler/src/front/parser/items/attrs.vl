@@ -1,5 +1,7 @@
 use crate::arch::virtual::in_arch_source;
-use crate::base::{IntVec, intern, intern_c};
+use crate::base::{intern, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::error_at;
 use crate::front::ast::{
     EFFECTS_DECL, EFFECTS_NO_ALLOC, EFFECTS_NO_IO, EFFECTS_NO_PANIC, EFFECTS_PURE, FN_COLD,
@@ -8,29 +10,19 @@ use crate::front::ast::{
 };
 use crate::front::check::name_error;
 use crate::front::features::{FA_MULTIVERSION, FA_TARGET_FEATURE, note_feature_attr};
-use crate::front::lexer::{TOKS, str_at};
+use crate::front::lexer::str_at;
 use crate::front::lexer::Tok::{
     Comma, Eof, Eq, Hash, Int, LBracket, LParen, RBracket, RParen, Star, Str,
 };
 use crate::front::parser::{
-    P, advance, at, cur_start, eat, expect, expect_ident, prev_end, syntax_error,
+    advance, at, cur_start, eat, expect, expect_ident, prev_end, syntax_error,
 };
 use crate::front::parser::types::parse_effect_list;
-use crate::middle::lower::ssa::HMap;
-
-// The effect declarations parsed before the function being parsed (0.16):
-// the first EffectSet and the last (chained by b).
-static var EFFECT_DECLS: i64 = 0;
-static var EFFECT_DECLS_LAST: i64 = 0;
-
-// (0.19) The id of an #[intrinsic(ID)] before the function being parsed
-// (-1: none).
-pub static var INTRINSIC_PENDING: i64 = -1;
 
 // After `#[` and the name `name` (at pos): when it is an effect
 // declaration (0.16), parses it as an EffectSet (its arguments, for
 // `effects`), adds it to EFFECT_DECLS and returns true.
-pub fn parse_effect_attribute(name: i64, pos: i64) -> bool {
+pub fn parse_effect_attribute(name: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
     let form = if name == intern_c(c"effects") { EFFECTS_DECL }
         else if name == intern_c(c"pure") { EFFECTS_PURE }
         else if name == intern_c(c"no_alloc") { EFFECTS_NO_ALLOC }
@@ -40,132 +32,116 @@ pub fn parse_effect_attribute(name: i64, pos: i64) -> bool {
     if form == 0 {
         return false;
     }
-    let n = new_node(NodeKind::EffectSet, pos, prev_end());
+    let n = new_node(NodeKind::EffectSet, pos, prev_end(pcx));
     NODES[n].c = form;
     if form == EFFECTS_DECL {
-        parse_effect_list(n);
+        parse_effect_list(n, &pcx);
     }
-    if EFFECT_DECLS == 0 {
-        EFFECT_DECLS = n;
+    if pcx.effect_decls == 0 {
+        pcx.effect_decls = n;
     } else {
-        NODES[EFFECT_DECLS_LAST].b = n;
+        NODES[pcx.effect_decls_last].b = n;
     }
-    EFFECT_DECLS_LAST = n;
+    pcx.effect_decls_last = n;
     true
 }
 
-// (0.26.3) Rust's `#[deprecated]`, `#[deprecated = "note"]` and
-// `#[deprecated(since = "..", note = "..")]`: the item's start position +
-// 1 -> its note's symbol + 2 (1: no note). A use of the item outside std
-// is warning item.deprecated (front/check/deprecated.vl). Keyed by the
-// start, as AMBIENT_TRY is: a function's copies (instances, a trait's
-// defaults) have its start.
-pub static var DEPRECATED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// Item start + 1 -> the start of its first attribute + 1: a use from
-// there to the item's end is the item's own (a derived impl's).
-pub static var DEPRECATED_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// The deprecated items' nodes: a use inside one is no use (Rust's rule).
-pub static var DEPRECATED_NODES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The #[deprecated] before the item being parsed: -2 none, -1 one with no
-// note, else its note's symbol; and where the item's attributes start.
-static var DEPRECATED_PENDING: i64 = -2;
-static var DEPRECATED_PENDING_AT: i64 = 0;
-
 // After `#[` (at pos) and the name `name`: when it is `deprecated`, parses the
 // rest of it up to the `]` and returns true.
-pub fn parse_deprecated_attribute(name: i64, pos: i64) -> bool {
+pub fn parse_deprecated_attribute(name: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
     if name != intern_c(c"deprecated") {
         return false;
     }
     var note = -1;
-    if eat(Eq) {
-        note = expect_note();
-    } else if eat(LParen) {
-        while !at(RParen) && !at(Eof) {
-            let key_pos = cur_start();
-            let key = expect_ident();
-            expect(Eq);
-            let text = expect_note();
+    if eat(Eq, &pcx) {
+        note = expect_note(&pcx);
+    } else if eat(LParen, &pcx) {
+        while !at(RParen, pcx) && !at(Eof, pcx) {
+            let key_pos = cur_start(pcx);
+            let key = expect_ident(&pcx);
+            expect(Eq, &pcx);
+            let text = expect_note(&pcx);
             if key == intern_c(c"note") {
                 note = text;
             } else if key != intern_c(c"since") {
                 name_error(key_pos, c"unknown deprecated option '", key,
-                    c"' (expected #[deprecated(since = \"1.0\", note = \"use new_fn\")])");
+                    c"' (expected #[deprecated(since = \"1.0\", note = \"use new_fn\")])", &pcx);
             }
-            if !eat(Comma) {
+            if !eat(Comma, &pcx) {
                 break;
             }
         }
-        expect(RParen);
+        expect(RParen, &pcx);
     }
-    if DEPRECATED_PENDING == -2 {
-        DEPRECATED_PENDING_AT = pos;
+    if pcx.deprecated_pending == -2 {
+        pcx.deprecated_pending_at = pos;
     }
-    DEPRECATED_PENDING = note;
+    pcx.deprecated_pending = note;
     true
 }
 
 // A #[deprecated]'s string, interned.
-fn expect_note() -> i64 {
+fn expect_note(pcx: inout Ctx<Comp>) -> i64 {
     // UNSAFE: TOKS is the lexer's token table, a raw pointer (front/lexer).
     // SAFETY: P is the parser's current token, below TOK_COUNT (the last is
     // Eof, never a Str); a Str token's value is its string's id.
     unsafe {
-        if !at(Str) {
-            syntax_error(c"expected the note as a string: #[deprecated(note = \"use new_fn\")]");
+        if !at(Str, pcx) {
+            syntax_error(c"expected the note as a string: #[deprecated(note = \"use new_fn\")]",
+                &pcx);
         }
-        let s = intern(str_at(TOKS[P].value as i64));
-        advance();
+        let s = intern(str_at(pcx.toks[pcx.p].value as i64));
+        advance(&pcx);
         s
     }
 }
 
 // Gives item node `item` the #[deprecated] parsed before it; with item 0,
 // drops it.
-pub fn take_deprecated(item: i64) {
-    if item > 0 && DEPRECATED_PENDING != -2 {
-        DEPRECATED.put(NODES[item].start + 1, DEPRECATED_PENDING + 2);
-        DEPRECATED_AT.put(NODES[item].start + 1, DEPRECATED_PENDING_AT + 1);
-        DEPRECATED_NODES.push(item);
+pub fn take_deprecated(item: i64, pcx: inout Ctx<Comp>) {
+    if item > 0 && pcx.deprecated_pending != -2 {
+        pcx.deprecated.put(NODES[item].start + 1, pcx.deprecated_pending + 2);
+        pcx.deprecated_at.put(NODES[item].start + 1, pcx.deprecated_pending_at + 1);
+        pcx.deprecated_nodes.push(item);
     }
-    DEPRECATED_PENDING = -2;
+    pcx.deprecated_pending = -2;
 }
 
 // The #[deprecated] waiting for its item, taken (a struct's, while its
 // fields are parsed); put back by restore_deprecated.
-pub fn save_deprecated() -> i64 {
-    let saved = DEPRECATED_PENDING;
-    DEPRECATED_PENDING = -2;
+pub fn save_deprecated(pcx: inout Ctx<Comp>) -> i64 {
+    let saved = pcx.deprecated_pending;
+    pcx.deprecated_pending = -2;
     saved
 }
 
 // (its item's attributes start at `at`)
-pub fn restore_deprecated(saved: i64, at: i64) {
-    DEPRECATED_PENDING = saved;
-    DEPRECATED_PENDING_AT = at;
+pub fn restore_deprecated(saved: i64, at: i64, pcx: inout Ctx<Comp>) {
+    pcx.deprecated_pending = saved;
+    pcx.deprecated_pending_at = at;
 }
 
 // Gives function (or extern) node f the effect declarations parsed before
 // it (0.16): its z, and FN_EFFECT_DECL. Called with f = 0, drops them.
 // (0.26.3) The #[deprecated] before it too.
-pub fn take_effect_decls(f: i64) {
-    take_deprecated(f);
-    if f != 0 && EFFECT_DECLS != 0 {
-        NODES[f].z = EFFECT_DECLS;
+pub fn take_effect_decls(f: i64, pcx: inout Ctx<Comp>) {
+    take_deprecated(f, &pcx);
+    if f != 0 && pcx.effect_decls != 0 {
+        NODES[f].z = pcx.effect_decls;
         NODES[f].p |= FN_EFFECT_DECL;
     }
-    if f != 0 && VIEWS_PENDING != 0 {
-        VIEWS_OF.put(f + 1, VIEWS_PENDING + 1);
+    if f != 0 && pcx.views_pending != 0 {
+        pcx.views_of.put(f + 1, pcx.views_pending + 1);
     }
-    VIEWS_PENDING = 0;
-    VIEWS_PENDING_LAST = 0;
-    EFFECT_DECLS = 0;
-    EFFECT_DECLS_LAST = 0;
+    pcx.views_pending = 0;
+    pcx.views_pending_last = 0;
+    pcx.effect_decls = 0;
+    pcx.effect_decls_last = 0;
 }
 
 // Whether effect declarations wait for their function (0.16).
-pub fn has_effect_decls() -> bool {
-    EFFECT_DECLS != 0 || VIEWS_PENDING != 0
+pub fn has_effect_decls(pcx: Ctx<Comp>) -> bool {
+    pcx.effect_decls != 0 || pcx.views_pending != 0
 }
 
 // (0.17) `#[views(a, *b)]`, `#[stores(c)]` before a function
@@ -175,12 +151,8 @@ pub fn has_effect_decls() -> bool {
 // take_effect_decls gives them to the function (VIEWS_OF).
 pub const VIEWS_FORM: i64 = 7;
 pub const STORES_FORM: i64 = 8;
-static var VIEWS_PENDING: i64 = 0;
-static var VIEWS_PENDING_LAST: i64 = 0;
-// Per function node + 1: its first views/stores node + 1.
-pub static var VIEWS_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
-pub fn parse_views_attribute(name: i64, pos: i64) -> bool {
+pub fn parse_views_attribute(name: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
     let form = if name == intern_c(c"views") { VIEWS_FORM }
         else if name == intern_c(c"stores") { STORES_FORM }
         else { 0 };
@@ -189,35 +161,35 @@ pub fn parse_views_attribute(name: i64, pos: i64) -> bool {
     }
     let n = new_node(NodeKind::EffectSet, pos, 0);
     NODES[n].c = form;
-    expect(LParen);
-    let mark = list_begin();
-    while !at(RParen) && !at(Eof) {
-        let item = new_node(NodeKind::EffectItem, cur_start(), 0);
-        if eat(Star) {
+    expect(LParen, &pcx);
+    let mark = list_begin(pcx);
+    while !at(RParen, pcx) && !at(Eof, pcx) {
+        let item = new_node(NodeKind::EffectItem, cur_start(pcx), 0);
+        if eat(Star, &pcx) {
             NODES[item].b = 1;
         }
-        NODES[item].a = expect_ident();
-        NODES[item].end = prev_end();
-        list_push(item);
-        if !eat(Comma) {
+        NODES[item].a = expect_ident(&pcx);
+        NODES[item].end = prev_end(pcx);
+        list_push(item, &pcx);
+        if !eat(Comma, &pcx) {
             break;
         }
     }
-    list_end(n, mark);
-    expect(RParen);
-    NODES[n].end = prev_end();
-    if VIEWS_PENDING == 0 {
-        VIEWS_PENDING = n;
+    list_end(n, mark, &pcx);
+    expect(RParen, &pcx);
+    NODES[n].end = prev_end(pcx);
+    if pcx.views_pending == 0 {
+        pcx.views_pending = n;
     } else {
-        NODES[VIEWS_PENDING_LAST].b = n;
+        NODES[pcx.views_pending_last].b = n;
     }
-    VIEWS_PENDING_LAST = n;
+    pcx.views_pending_last = n;
     true
 }
 
 // The first views/stores declaration of function node f, 0: none.
-pub fn views_of(f: i64) -> i64 {
-    let v = VIEWS_OF.get(f + 1);
+pub fn views_of(f: i64, pcx: Ctx<Comp>) -> i64 {
+    let v = pcx.views_of.get(f + 1);
     if v == 0 { 0 } else { v - 1 }
 }
 
@@ -226,12 +198,12 @@ pub fn views_of(f: i64) -> i64 {
 // effect declaration, `#[effects(...)]`, `#[pure]`, `#[no_alloc]`,
 // `#[no_io]` or `#[no_panic]`: FN_EFFECT_DECL, its EffectSet added to
 // those take_effect_decls gives the function.
-pub fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
-    if parse_effect_attribute(name, pos) {
+pub fn parse_fn_attribute(name: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if parse_effect_attribute(name, pos, &pcx) {
         return FN_EFFECT_DECL;
     }
     // (0.17: a view summary, front/own/summary.vl)
-    if parse_views_attribute(name, pos) {
+    if parse_views_attribute(name, pos, &pcx) {
         return FN_VIEWS_DECL;
     }
     if name == intern_c(c"cold") {
@@ -243,90 +215,91 @@ pub fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
     if name == intern_c(c"intrinsic") {
         if !in_arch_source(pos) {
             name_error(pos, c"unknown attribute '", name,
-                c"' (#[intrinsic] is std::arch's own)");
+                c"' (#[intrinsic] is std::arch's own)", &pcx);
         }
-        expect(LParen);
-        if !at(Int) {
-            syntax_error(c"expected the intrinsic's id");
+        expect(LParen, &pcx);
+        if !at(Int, pcx) {
+            syntax_error(c"expected the intrinsic's id", &pcx);
         }
-        INTRINSIC_PENDING = TOKS[P].value as i64;
-        advance();
-        expect(RParen);
+        pcx.intrinsic_pending = pcx.toks[pcx.p].value as i64;
+        advance(&pcx);
+        expect(RParen, &pcx);
         return FN_INTRINSIC;
     }
     if name == intern_c(c"target_feature") {
-        expect(LParen);
-        let word = expect_ident();
+        expect(LParen, &pcx);
+        let word = expect_ident(&pcx);
         if word != intern_c(c"enable") {
             name_error(pos, c"unknown target_feature option '", word,
-                c"' (expected #[target_feature(enable = \"avx2,fma\")])");
+                c"' (expected #[target_feature(enable = \"avx2,fma\")])", &pcx);
         }
-        expect(Eq);
-        if !at(Str) {
+        expect(Eq, &pcx);
+        if !at(Str, pcx) {
             syntax_error(
-                c"expected the features as a string: #[target_feature(enable = \"avx2,fma\")]");
+                c"expected the features as a string: #[target_feature(enable = \"avx2,fma\")]",
+                &pcx);
         }
-        note_feature_attr(FA_TARGET_FEATURE, TOKS[P].value as i64, pos);
-        advance();
-        expect(RParen);
+        note_feature_attr(FA_TARGET_FEATURE, pcx.toks[pcx.p].value as i64, pos, &pcx);
+        advance(&pcx);
+        expect(RParen, &pcx);
         return FN_FEATURES;
     }
     if name == intern_c(c"multiversion") {
-        expect(LParen);
-        while at(Str) {
-            note_feature_attr(FA_MULTIVERSION, TOKS[P].value as i64, pos);
-            advance();
-            if !eat(Comma) {
+        expect(LParen, &pcx);
+        while at(Str, pcx) {
+            note_feature_attr(FA_MULTIVERSION, pcx.toks[pcx.p].value as i64, pos, &pcx);
+            advance(&pcx);
+            if !eat(Comma, &pcx) {
                 break;
             }
         }
-        expect(RParen);
+        expect(RParen, &pcx);
         return FN_FEATURES;
     }
     if name != intern_c(c"inline") {
         return 0;
     }
-    if eat(LParen) {
-        let arg = expect_ident();
+    if eat(LParen, &pcx) {
+        let arg = expect_ident(&pcx);
         if arg != intern_c(c"never") {
             name_error(pos, c"unknown inline option '", arg,
-                c"' (expected #[inline] or #[inline(never)])");
+                c"' (expected #[inline] or #[inline(never)])", &pcx);
         }
-        expect(RParen);
+        expect(RParen, &pcx);
         return FN_NO_INLINE;
     }
     FN_INLINE
 }
 
 // The function attributes before a function in an impl block (0.6).
-pub fn parse_fn_attributes() -> i64 {
+pub fn parse_fn_attributes(pcx: inout Ctx<Comp>) -> i64 {
     var flags = 0;
-    let start = cur_start();
-    take_effect_decls(0);
-    while at(Hash) {
-        let pos = cur_start();
-        advance();
-        expect(LBracket);
-        let name = expect_ident();
+    let start = cur_start(pcx);
+    take_effect_decls(0, &pcx);
+    while at(Hash, pcx) {
+        let pos = cur_start(pcx);
+        advance(&pcx);
+        expect(LBracket, &pcx);
+        let name = expect_ident(&pcx);
         // (0.26.3: #[deprecated], which take_effect_decls gives the function)
-        if parse_deprecated_attribute(name, pos) {
-            expect(RBracket);
+        if parse_deprecated_attribute(name, pos, &pcx) {
+            expect(RBracket, &pcx);
             continue;
         }
-        let flag = parse_fn_attribute(name, pos);
+        let flag = parse_fn_attribute(name, pos, &pcx);
         if flag == 0 {
             name_error(pos, c"unknown attribute '", name,
-                c"' before a function (expected inline, inline(never), cold, effects, pure, no_alloc, no_io, no_panic, views or stores)");
+                c"' before a function (expected inline, inline(never), cold, effects, pure, no_alloc, no_io, no_panic, views or stores)", &pcx);
         }
         flags |= flag;
-        expect(RBracket);
+        expect(RBracket, &pcx);
     }
-    check_fn_attributes(flags, start);
+    check_fn_attributes(flags, start, &pcx);
     flags
 }
 
-pub fn check_fn_attributes(flags: i64, pos: i64) {
+pub fn check_fn_attributes(flags: i64, pos: i64, pcx: inout Ctx<Comp>) {
     if (flags & FN_INLINE) != 0 && (flags & FN_NO_INLINE) != 0 {
-        error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]");
+        error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]", &pcx);
     }
 }

@@ -27,24 +27,24 @@ use crate::base::{
     BUFS, FILES, IntVec, SYMS, add_source, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_new,
     buf_slice, buf_str, cstr, find_sym, grow, intern, intern_c, read_file, streq, strlen, sym_text,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    STD_TEXT_FILE, err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_try_tool,
-    error_at_soft, fail_name,
+    err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_try_tool, error_at_soft,
+    fail_name,
 };
 use crate::front::ast::NODES;
 use crate::front::cpp::directives::{file_exists, path_dir};
-use crate::front::lexer::{TOKS, Tok, lex_range};
-use crate::front::modules::lookup::{PRELUDE_COUNT, is_prelude015, is_prelude_name, prelude_index};
+use crate::front::lexer::{Tok, lex_range};
+use crate::front::modules::lookup::{is_prelude015, is_prelude_name, prelude_index};
 use crate::front::modules::stdsections::{
     float_method_kind, float_method_names, int_method_name, load_std_sections,
 };
 use crate::front::stdsrc::std_source;
-use crate::front::stdtree::{STD_TREE, add_std_tree};
-use crate::middle::lower::ssa::HMap;
+use crate::front::stdtree::add_std_tree;
 use crate::middle::profile::{PROFILE_GENERATE, PROFILE_MODULE, profile_runtime_source};
 use crate::middle::trace::{TRACE, TRACE_MODULE, trace_runtime_source};
 use crate::middle::unsafecheck::{CHECK_MODULE, CHECK_UNSAFE, check_runtime_source};
-use crate::tools::query::command_line::QUERY;
 
 // What other modules use of the parts.
 
@@ -55,99 +55,86 @@ struct Module {
 }
 
 pub static var MODULES: *Module = 0 as *Module;
-static var MODULE_COUNT: i64 = 0;
-static var MODULE_CAP: i64 = 0;
-// The module of the imported C declarations, and of the standard library
-// (-1: none).
-pub static var C_MODULE: i64 = -1;
 pub static var STD_MODULE: i64 = -1;
-// The module of the code being checked.
-pub static var CUR_MOD: i64 = 0;
 
-pub fn add_module(name: i64, parent: i64, public: bool) -> i64 {
+pub fn add_module(name: i64, parent: i64, public: bool, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        MODULES = grow(MODULES, MODULE_COUNT, &MODULE_CAP);
-        let m = MODULE_COUNT;
+        MODULES = grow(MODULES, pcx.module_count, &pcx.module_cap);
+        let m = pcx.module_count;
         var key = name;
         var sym = name;
         if parent > 0 {
-            key = join_sym(MODULES[parent].key, c"::", name);
-            sym = join_sym(MODULES[parent].sym, c".", name);
+            key = join_sym(MODULES[parent].key, c"::", name, &pcx);
+            sym = join_sym(MODULES[parent].sym, c".", name, &pcx);
         }
         MODULES[m] = Module { name, parent, key, sym, public, is_c: false };
         let k = child_key(parent, name);
-        if m > 0 && k != 0 && CHILDREN.get(k) == 0 {
-            CHILDREN.put(k, m);
+        if m > 0 && k != 0 && pcx.children.get(k) == 0 {
+            pcx.children.put(k, m);
         }
-        MODULE_COUNT += 1;
+        pcx.module_count += 1;
         m
     }
 }
 
-pub fn init_modules() {
-    if MODULE_COUNT == 0 {
-        add_module(-1, -1, public: true);
+pub fn init_modules(pcx: inout Ctx<Comp>) {
+    if pcx.module_count == 0 {
+        add_module(-1, -1, public: true, pcx: &pcx);
     }
 }
 
-pub fn join_sym(a: i64, sep: *u8, b: i64) -> i64 {
-    intern(joined(a, sep, b))
+pub fn join_sym(a: i64, sep: *u8, b: i64, pcx: inout Ctx<Comp>) -> i64 {
+    intern(joined(a, sep, b, &pcx))
 }
 
-// The text of symbols a and b joined by sep, in a buffer reused by the
-// next call.
-static var JOIN_BUF: i64 = -1;
-
-fn joined(a: i64, sep: *u8, b: i64) -> [u8] {
-    if JOIN_BUF < 0 {
-        JOIN_BUF = buf_new();
+fn joined(a: i64, sep: *u8, b: i64, pcx: inout Ctx<Comp>) -> [u8] {
+    if pcx.join_buf < 0 {
+        pcx.join_buf = buf_new();
     }
-    buf_clear(JOIN_BUF);
-    buf_bytes(JOIN_BUF, SYMS[a].text);
-    buf_str(JOIN_BUF, sep);
-    buf_bytes(JOIN_BUF, SYMS[b].text);
-    buf_slice(JOIN_BUF)
+    buf_clear(pcx.join_buf);
+    buf_bytes(pcx.join_buf, SYMS[a].text);
+    buf_str(pcx.join_buf, sep);
+    buf_bytes(pcx.join_buf, SYMS[b].text);
+    buf_slice(pcx.join_buf)
 }
-
-static var QUALIFIED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // The key of item `name` of module m.
-pub fn qualify(m: i64, name: i64) -> i64 {
+pub fn qualify(m: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
     if m <= 0 {
         return name;
     }
     let k = (name + 1) * 65536 + m;
-    let known = QUALIFIED.get(k);
+    let known = pcx.qualified.get(k);
     if known != 0 {
         return known - 1;
     }
-    let key = unsafe { join_sym(MODULES[m].key, c"::", name) };
-    QUALIFIED.put(k, key + 1);
+    let key = unsafe { join_sym(MODULES[m].key, c"::", name, &pcx) };
+    pcx.qualified.put(k, key + 1);
     key
 }
 
 // The key of item `name` of module m if it has been made (an item of that
 // name exists there), else -1; makes no symbol.
-fn qualified_if_known(m: i64, name: i64) -> i64 {
+fn qualified_if_known(m: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
     if m <= 0 {
         return name;
     }
-    let known = QUALIFIED.get((name + 1) * 65536 + m);
+    let known = pcx.qualified.get((name + 1) * 65536 + m);
     if known != 0 {
         return known - 1;
     }
-    unsafe { find_sym(joined(MODULES[m].key, c"::", name)) }
+    unsafe { find_sym(joined(MODULES[m].key, c"::", name, &pcx)) }
 }
 
 // The key of item `name` of module m, if it has one, else -1 (0.11:
 // suggestions for unknown names).
-pub fn item_key_if_known(m: i64, name: i64) -> i64 {
-    qualified_if_known(m, name)
+pub fn item_key_if_known(m: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    qualified_if_known(m, name, &pcx)
 }
 
 // The assembly symbol of item `name` of module m.
-pub fn item_symbol(m: i64, name: i64) -> i64 {
-    if m <= 0 { name } else { unsafe { join_sym(MODULES[m].sym, c".", name) } }
+pub fn item_symbol(m: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if m <= 0 { name } else { unsafe { join_sym(MODULES[m].sym, c".", name, &pcx) } }
 }
 
 // The file holding position `pos`.
@@ -166,29 +153,25 @@ fn file_of(pos: i64) -> i64 {
     lo
 }
 
-pub fn module_of(n: i64) -> i64 {
-    module_at(NODES[n].start)
+pub fn module_of(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    module_at(NODES[n].start, &pcx)
 }
-
-// Inline modules (0.6): (start, end, module) for each `mod m { ... }`, the
-// positions of its braces.
-pub static var INLINE_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The module of the code at position `pos`: the innermost inline module
 // around it, else its file's. (0.22) By the index below: the entry with
 // the last start at or before pos, else the nearest of its ancestors
 // around pos (inline modules nest or are disjoint), in O(log n) rather
 // than a scan of every inline module, std's included, for each token.
-pub fn module_at(pos: i64) -> i64 {
+pub fn module_at(pos: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if IM_INDEXED != INLINE_MODS.count {
-            index_inline_mods();
+        if pcx.im_indexed != pcx.inline_mods.count {
+            index_inline_mods(&pcx);
         }
         var lo = 0;
-        var hi = IM_ORDER.count;
+        var hi = pcx.im_order.count;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if INLINE_MODS.data[3 * IM_ORDER.data[mid]] <= pos {
+            if pcx.inline_mods.data[3 * pcx.im_order.data[mid]] <= pos {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -196,78 +179,68 @@ pub fn module_at(pos: i64) -> i64 {
         }
         var p = lo - 1;
         while p >= 0 {
-            let e = 3 * IM_ORDER.data[p];
-            if pos < INLINE_MODS.data[e + 1] {
-                return INLINE_MODS.data[e + 2];
+            let e = 3 * pcx.im_order.data[p];
+            if pos < pcx.inline_mods.data[e + 1] {
+                return pcx.inline_mods.data[e + 2];
             }
-            p = IM_PARENT.data[p];
+            p = pcx.im_parent.data[p];
         }
         FILES[file_of(pos)].module
     }
 }
 
-// (0.22) module_at's index of INLINE_MODS: the entries (their numbers) by
-// start, each one's parent (the position in IM_ORDER of the innermost
-// entry around it, or -1), and how many words of INLINE_MODS it covers
-// (the table only grows: it is rebuilt when a module is added).
-static var IM_ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var IM_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var IM_INDEXED: i64 = 0;
-
-// (its scratch stack, kept between rebuilds)
-static var IM_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn index_inline_mods() {
+fn index_inline_mods(pcx: inout Ctx<Comp>) {
     unsafe {
-        let n = INLINE_MODS.count / 3;
-        IM_ORDER.count = 0;
-        IM_PARENT.count = 0;
+        let n = pcx.inline_mods.count / 3;
+        pcx.im_order.count = 0;
+        pcx.im_parent.count = 0;
         for k in 0..n {
-            IM_ORDER.push(k);
+            pcx.im_order.push(k);
         }
         // by start (an insertion sort: stable, and the table is short and
         // already in order but for modules added out of it)
         for a in 1..n {
             var b = a;
             while b > 0
-                && INLINE_MODS.data[3 * IM_ORDER.data[b - 1]]
-                > INLINE_MODS.data[3 * IM_ORDER.data[b]] {
-                let t = IM_ORDER.data[b - 1];
-                IM_ORDER.data[b - 1] = IM_ORDER.data[b];
-                IM_ORDER.data[b] = t;
+                && pcx.inline_mods.data[3 * pcx.im_order.data[b - 1]]
+                > pcx.inline_mods.data[3 * pcx.im_order.data[b]] {
+                let t = pcx.im_order.data[b - 1];
+                pcx.im_order.data[b - 1] = pcx.im_order.data[b];
+                pcx.im_order.data[b] = t;
                 b -= 1;
             }
         }
         // parents: the open entries on a stack
-        var stack = std::replace(&IM_STACK, IntVec { data: 0 as *i64, count: 0, cap: 0 });
+        var stack = std::replace(&pcx.im_stack, IntVec { data: 0 as *i64, count: 0, cap: 0 });
         stack.count = 0;
         for p in 0..n {
-            let start = INLINE_MODS.data[3 * IM_ORDER.data[p]];
+            let start = pcx.inline_mods.data[3 * pcx.im_order.data[p]];
             while stack.count > 0
-                && INLINE_MODS.data[3 * IM_ORDER.data[stack.data[stack.count - 1]] + 1] <= start {
+                && pcx.inline_mods.data[3 * pcx.im_order.data[stack.data[stack.count - 1]] + 1]
+                <= start {
                 stack.count -= 1;
             }
-            IM_PARENT.push(if stack.count > 0 { stack.data[stack.count - 1] } else { -1 });
+            pcx.im_parent.push(if stack.count > 0 { stack.data[stack.count - 1] } else { -1 });
             stack.push(p);
         }
-        IM_STACK = stack;
-        IM_INDEXED = INLINE_MODS.count;
+        pcx.im_stack = stack;
+        pcx.im_indexed = pcx.inline_mods.count;
     }
 }
 
-pub fn module_count() -> i64 {
-    MODULE_COUNT
+pub fn module_count(pcx: Ctx<Comp>) -> i64 {
+    pcx.module_count
 }
 
 // (0.25) The module named `name` in `m` (the first added), by CHILDREN,
 // not a scan of every module: lookups and imports ask it often.
-pub fn child_module(m: i64, name: i64) -> i64 {
+pub fn child_module(m: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
     let k = child_key(m, name);
     if k != 0 {
-        let c = CHILDREN.get(k);
+        let c = pcx.children.get(k);
         return if c > 0 { c } else { -1 };
     }
-    for c in 1..MODULE_COUNT {
+    for c in 1..pcx.module_count {
         if unsafe { MODULES[c].parent == m && MODULES[c].name == name } {
             return c;
         }
@@ -283,9 +256,6 @@ fn child_key(parent: i64, name: i64) -> i64 {
     }
     ((parent + 2) << 32) | name
 }
-
-// Each module (but the root) by child_key of its parent and name.
-static var CHILDREN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Whether module `inner` is `outer` or one of its descendants.
 pub fn is_within(inner: i64, outer: i64) -> bool {
@@ -361,82 +331,75 @@ pub fn std_wraps(m: i64) -> bool {
 
 // `mod name;` in the files read so far (and in the files they load): the
 // child modules' files are read, lexed and appended. Done before parsing.
-pub fn load_modules() {
-    init_modules();
-    load_std_if_named();
-    scan_modules(0);
+pub fn load_modules(pcx: inout Ctx<Comp>) {
+    init_modules(&pcx);
+    load_std_if_named(&pcx);
+    scan_modules(0, &pcx);
     // (0.18: a test build's code, front/tests)
-    crate::front::tests::add_test_code();
+    crate::front::tests::add_test_code(&pcx);
     // Named only in a module's file (fixed in 0.6: 0.5 looked at the files
     // of the command line alone; 0.20: then std's modules).
-    let before = TOKS.len() as i64;
-    load_std_if_named();
-    scan_modules(before);
+    let before = pcx.toks.len() as i64;
+    load_std_if_named(&pcx);
+    scan_modules(before, &pcx);
     // (0.19: std::arch's virtual modules, when the program names them)
-    load_arch_modules();
+    load_arch_modules(&pcx);
     // (0.10: --check-unsafe's runtime)
     if CHECK_UNSAFE && CHECK_MODULE < 0 {
         let text = buf_new();
         check_runtime_source(text);
-        let start = add_source(c"<check>", text);
-        CHECK_MODULE = add_module(intern_c(c"__check"), 0, public: false);
+        let start = add_source(c"<check>", text, &pcx);
+        CHECK_MODULE = add_module(intern_c(c"__check"), 0, public: false, pcx: &pcx);
         FILES[FILES.len() as i64 - 1].module = CHECK_MODULE;
-        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
     }
     // (0.10: --profile-generate's runtime)
     if PROFILE_GENERATE != 0 as *u8 && PROFILE_MODULE < 0 {
         let text = buf_new();
         profile_runtime_source(text);
-        let start = add_source(c"<profile>", text);
-        PROFILE_MODULE = add_module(intern_c(c"__profile"), 0, public: false);
+        let start = add_source(c"<profile>", text, &pcx);
+        PROFILE_MODULE = add_module(intern_c(c"__profile"), 0, public: false, pcx: &pcx);
         FILES[FILES.len() as i64 - 1].module = PROFILE_MODULE;
-        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
     }
     // (0.17: --trace's runtime)
     if TRACE && TRACE_MODULE < 0 {
         let text = buf_new();
         trace_runtime_source(text);
-        let start = add_source(c"<trace>", text);
-        TRACE_MODULE = add_module(intern_c(c"__trace"), 0, public: false);
+        let start = add_source(c"<trace>", text, &pcx);
+        TRACE_MODULE = add_module(intern_c(c"__trace"), 0, public: false, pcx: &pcx);
         FILES[FILES.len() as i64 - 1].module = TRACE_MODULE;
-        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+        lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
     }
 }
 
 // One pass over the tokens from token i, in the order of the files (a
 // module's file and its tokens are appended when it is loaded, so its own
 // `mod` items come later in the pass).
-fn scan_modules(from: i64) {
+fn scan_modules(from: i64, pcx: inout Ctx<Comp>) {
     var i = from;
-    while i + 2 < TOKS.len() as i64 {
-        if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
-            && TOKS[i + 2].kind == Tok::Semi {
-            let f = file_of(TOKS[i].start);
+    while i + 2 < pcx.toks.len() as i64 {
+        if pcx.toks[i].kind == Tok::Mod && pcx.toks[i + 1].kind == Tok::Ident
+            && pcx.toks[i + 2].kind == Tok::Semi {
+            let f = file_of(pcx.toks[i].start);
             // (after an error, on with the next one: 0.10)
-            if f == STD_FILE && STD_TREE == 0 as *u8 {
+            if f == pcx.std_file && pcx.std_tree == 0 as *u8 {
                 // (0.20) std's built-in text: its modules are there, as
                 // `mod name { }` after their parent's text (embed.sh)
-            } else if module_at(TOKS[i].start) != FILES[f].module {
-                error_at_soft(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
-                fail_name(TOKS[i + 1].value as i64);
+            } else if module_at(pcx.toks[i].start, &pcx) != FILES[f].module {
+                error_at_soft(pcx.toks[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)", &pcx);
+                fail_name(pcx.toks[i + 1].value as i64, &pcx);
             } else {
-                load_module(f, i);
+                load_module(f, i, &pcx);
             }
         }
-        if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
-            && TOKS[i + 2].kind == Tok::LBrace {
-            add_inline_module(i);
+        if pcx.toks[i].kind == Tok::Mod && pcx.toks[i + 1].kind == Tok::Ident
+            && pcx.toks[i + 2].kind == Tok::LBrace {
+            add_inline_module(i, &pcx);
         }
         i += 1;
     }
 }
-
-// (0.15) The standard library whether the program names it or not:
-// `volec query` about std from a program that does not use it.
-pub static var STD_ALWAYS: bool = false;
-
-// (0.15) std's file, when it is loaded.
-static var STD_FILE: i64 = -1;
 
 // The standard library, when the program names it (`std::...`) or (0.6) a
 // name of the prelude (0.14: or uses a range as a value; 0.15: or an
@@ -444,64 +407,64 @@ static var STD_FILE: i64 = -1;
 // once. (0.15) Only the sections of std the program reaches are lexed
 // (stdsections); at the second call, once the modules' files are read,
 // what they reach more.
-fn load_std_if_named() {
+fn load_std_if_named(pcx: inout Ctx<Comp>) {
     if STD_MODULE >= 0 {
-        if STD_TREE != 0 as *u8 {
+        if pcx.std_tree != 0 as *u8 {
             return;
         }
-        let f = STD_FILE;
-        load_std_sections(FILES[f].start, FILES[f].end, STD_ALWAYS || QUERY);
+        let f = pcx.std_file;
+        load_std_sections(FILES[f].start, FILES[f].end, pcx.std_always || pcx.query, &pcx);
         return;
     }
     // (0.25.2.1) a Float method, `x.sqrt()`: std::math (a common name,
     // `x.abs()`, only in a program with floats)
     let floats = float_method_names();
     var has_floats = -1;
-    for i in 0..TOKS.len() as i64 - 1 {
+    for i in 0..pcx.toks.len() as i64 - 1 {
         var float_call = false;
-        if TOKS[i].kind == Tok::Dot && TOKS[i + 1].kind == Tok::Ident {
-            let m = float_method_kind(floats, TOKS[i + 1].value as i64);
+        if pcx.toks[i].kind == Tok::Dot && pcx.toks[i + 1].kind == Tok::Ident {
+            let m = float_method_kind(floats, pcx.toks[i + 1].value as i64);
             if m == 2 && has_floats < 0 {
                 has_floats = 0;
-                for j in 0..TOKS.len() as i64 {
-                    let k = TOKS[j].kind;
+                for j in 0..pcx.toks.len() as i64 {
+                    let k = pcx.toks[j].kind;
                     if k == Tok::Float || k == Tok::Import || k == Tok::Ident
-                        && (SYMS[TOKS[j].value as i64].text == "f64"
-                            || SYMS[TOKS[j].value as i64].text == "f32") {
+                        && (SYMS[pcx.toks[j].value as i64].text == "f64"
+                            || SYMS[pcx.toks[j].value as i64].text == "f32") {
                         has_floats = 1;
                         break;
                     }
                 }
             }
             float_call = m == 1 || m == 2 && has_floats == 1
-                || int_method_name(TOKS[i + 1].value as i64);
+                || int_method_name(pcx.toks[i + 1].value as i64);
         }
-        if float_call || TOKS[i].kind == Tok::Ident
-            && ((TOKS[i + 1].kind == Tok::ColonColon
-                && TOKS[i].value as i64 == intern_c(c"std"))
-                || is_prelude_name(TOKS[i].value as i64)
-                && (!is_prelude015(TOKS[i].value as i64) || uses_prelude015(i)))
-            || (TOKS[i].kind == Tok::DotDot || TOKS[i].kind == Tok::DotDotEq)
-            && range_as_value(i)
-            || needs_std015(i) || contract_word(i) || STD_ALWAYS {
+        if float_call || pcx.toks[i].kind == Tok::Ident
+            && ((pcx.toks[i + 1].kind == Tok::ColonColon
+                && pcx.toks[i].value as i64 == intern_c(c"std"))
+                || is_prelude_name(pcx.toks[i].value as i64, &pcx)
+                && (!is_prelude015(pcx.toks[i].value as i64, &pcx) || uses_prelude015(i, &pcx)))
+            || (pcx.toks[i].kind == Tok::DotDot || pcx.toks[i].kind == Tok::DotDotEq)
+            && range_as_value(i, pcx)
+            || needs_std015(i, pcx) || contract_word(i, pcx) || pcx.std_always {
             // (0.17: from its files, every section; stdtree.vl)
-            if STD_TREE != 0 as *u8 {
-                STD_MODULE = add_module(intern_c(c"std"), 0, public: true);
+            if pcx.std_tree != 0 as *u8 {
+                STD_MODULE = add_module(intern_c(c"std"), 0, public: true, pcx: &pcx);
                 var start = 0;
                 var end = 0;
-                STD_FILE = add_std_tree(STD_MODULE, &start, &end);
-                lex_range(start, end, last: false);
+                pcx.std_file = add_std_tree(STD_MODULE, &start, &end, &pcx);
+                lex_range(start, end, last: false, pcx: &pcx);
                 return;
             }
             let text = buf_new();
             std_source(text);
-            let start = add_source(c"<std>", text);
-            STD_MODULE = add_module(intern_c(c"std"), 0, public: true);
-            STD_FILE = FILES.len() as i64 - 1;
-            FILES[STD_FILE].module = STD_MODULE;
+            let start = add_source(c"<std>", text, &pcx);
+            STD_MODULE = add_module(intern_c(c"std"), 0, public: true, pcx: &pcx);
+            pcx.std_file = FILES.len() as i64 - 1;
+            FILES[pcx.std_file].module = STD_MODULE;
             // (0.26.2: its lines from std_line_marks, base/diag)
-            STD_TEXT_FILE = STD_FILE;
-            load_std_sections(start, FILES[STD_FILE].end, STD_ALWAYS || QUERY);
+            pcx.std_text_file = pcx.std_file;
+            load_std_sections(start, FILES[pcx.std_file].end, pcx.std_always || pcx.query, &pcx);
             return;
         }
     }
@@ -510,18 +473,18 @@ fn load_std_if_named() {
 // Whether token i is syntax of 0.15 that std's items implement: an
 // f-string (std::Interp, Fmt), `?` (Option, Result, From) or the `derive`
 // of `#[derive(...)]`.
-fn needs_std015(i: i64) -> bool {
-    let k = TOKS[i].kind;
+fn needs_std015(i: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.toks[i].kind;
     k == Tok::FHead || k == Tok::Question
-        || k == Tok::Ident && i >= 2 && TOKS[i - 1].kind == Tok::LBracket
-        && TOKS[i - 2].kind == Tok::Hash && SYMS[TOKS[i].value as i64].text == "derive"
+        || k == Tok::Ident && i >= 2 && pcx.toks[i - 1].kind == Tok::LBracket
+        && pcx.toks[i - 2].kind == Tok::Hash && SYMS[pcx.toks[i].value as i64].text == "derive"
 }
 
 // (0.25.2) Whether token i is the word of a contract clause, `requires` or
 // `ensures` after a signature (or a clause before it): the clauses are
 // checked by std::contract_check. (A word in the position of a name, a
 // field or a binding is not one.)
-fn contract_word(i: i64) -> bool {
+fn contract_word(i: i64, pcx: Ctx<Comp>) -> bool {
     // UNSAFE: the lexer's token table (TOKS, TOK_COUNT entries) and the symbol
     // table (SYMS) are raw-pointer globals, which only unsafe code may read
     // (until 0.25.4 moves the compiler's tables to Vec).
@@ -529,13 +492,13 @@ fn contract_word(i: i64) -> bool {
     // checked, so i - 1, i and i + 1 are inside TOKS; an Ident token's value
     // is the SYMS index the lexer interned its text at.
     let (word, p, k) = unsafe {
-        if i == 0 || i + 1 >= TOKS.len() as i64 {
+        if i == 0 || i + 1 >= pcx.toks.len() as i64 {
             return false;
         }
-        let t = TOKS[i];
+        let t = pcx.toks[i];
         let word = t.kind == Tok::Ident
             && (SYMS[t.value as i64].text == "requires" || SYMS[t.value as i64].text == "ensures");
-        (word, TOKS[i - 1].kind, TOKS[i + 1].kind)
+        (word, pcx.toks[i - 1].kind, pcx.toks[i + 1].kind)
     };
     if !word {
         return false;
@@ -553,36 +516,29 @@ fn contract_word(i: i64) -> bool {
 // parameter, field or named argument (`format: *u8`), a member
 // (`.format`), or a name the program declares itself (`fn eprint` at
 // another token), so that programs of 0.14 using these names get no std.
-fn uses_prelude015(i: i64) -> bool {
-    if i > 0 && (is_declaring(TOKS[i - 1].kind) || TOKS[i - 1].kind == Tok::Dot) {
+fn uses_prelude015(i: i64, pcx: inout Ctx<Comp>) -> bool {
+    if i > 0 && (is_declaring(pcx.toks[i - 1].kind) || pcx.toks[i - 1].kind == Tok::Dot) {
         return false;
     }
-    if TOKS[i + 1].kind == Tok::Colon {
+    if pcx.toks[i + 1].kind == Tok::Colon {
         return false;
     }
-    !declares_prelude_name(TOKS[i].value as i64)
+    !declares_prelude_name(pcx.toks[i].value as i64, &pcx)
 }
 
-// Which of the prelude's names the program declares itself (`fn trim`,
-// `let split`), over the tokens read so far (0.17: one pass, not one per
-// use; more tokens come as the modules' files are read).
-static var PRELUDE_DECLARED: [bool; PRELUDE_COUNT] = [false; PRELUDE_COUNT];
-
-static var DECLARED_UPTO: i64 = 1;
-
-fn declares_prelude_name(name: i64) -> bool {
-    while DECLARED_UPTO < TOKS.len() as i64 {
-        let j = DECLARED_UPTO;
-        if TOKS[j].kind == Tok::Ident && is_declaring(TOKS[j - 1].kind) {
-            let k = prelude_index(TOKS[j].value as i64);
+fn declares_prelude_name(name: i64, pcx: inout Ctx<Comp>) -> bool {
+    while pcx.declared_upto < pcx.toks.len() as i64 {
+        let j = pcx.declared_upto;
+        if pcx.toks[j].kind == Tok::Ident && is_declaring(pcx.toks[j - 1].kind) {
+            let k = prelude_index(pcx.toks[j].value as i64, &pcx);
             if k >= 0 {
-                PRELUDE_DECLARED[k] = true;
+                pcx.prelude_declared[k] = true;
             }
         }
-        DECLARED_UPTO += 1;
+        pcx.declared_upto += 1;
     }
-    let k = prelude_index(name);
-    k >= 0 && PRELUDE_DECLARED[k]
+    let k = prelude_index(name, &pcx);
+    k >= 0 && pcx.prelude_declared[k]
 }
 
 // A token after which an identifier is declared.
@@ -598,11 +554,11 @@ fn is_declaring(k: Tok) -> bool {
 // within its statement, no `=>` or `=` (a match arm's or an `if let`'s
 // pattern); before it, no `for` loop's `in` and no `[` (a slicing), or
 // the `in` of `for x in (a..b).m() {`.
-pub fn range_as_value(i: i64) -> bool {
+pub fn range_as_value(i: i64, pcx: Ctx<Comp>) -> bool {
     var depth = 0;
     var j = i + 1;
-    while j < TOKS.len() as i64 && j < i + 1000 {
-        let k = TOKS[j].kind;
+    while j < pcx.toks.len() as i64 && j < i + 1000 {
+        let k = pcx.toks[j].kind;
         if k == Tok::LParen || k == Tok::LBracket || k == Tok::LBrace && depth > 0 {
             depth += 1;
         } else if k == Tok::RParen || k == Tok::RBracket || k == Tok::RBrace {
@@ -623,7 +579,7 @@ pub fn range_as_value(i: i64) -> bool {
     depth = 0;
     j = i - 1;
     while j >= 0 && j > i - 1000 {
-        let k = TOKS[j].kind;
+        let k = pcx.toks[j].kind;
         if depth == 0 && (k == Tok::Semi || k == Tok::RBrace) {
             // (the statement before ends)
             return true;
@@ -635,7 +591,7 @@ pub fn range_as_value(i: i64) -> bool {
             } else if k == Tok::LParen {
                 // `for x in (a..b) {`, or a value: `f(a..b)`, `for x in
                 // (a..b).rev() {`
-                return j == 0 || TOKS[j - 1].kind != Tok::In || !closes_before_brace(j);
+                return j == 0 || pcx.toks[j - 1].kind != Tok::In || !closes_before_brace(j, pcx);
             } else {
                 return k == Tok::LBrace;
             }
@@ -648,17 +604,17 @@ pub fn range_as_value(i: i64) -> bool {
 }
 
 // Whether the `(` at j is closed by a `)` right before a `{`.
-fn closes_before_brace(j: i64) -> bool {
+fn closes_before_brace(j: i64, pcx: Ctx<Comp>) -> bool {
     var depth = 0;
     var k = j;
-    while k < TOKS.len() as i64 - 1 {
-        let kind = TOKS[k].kind;
+    while k < pcx.toks.len() as i64 - 1 {
+        let kind = pcx.toks[k].kind;
         if kind == Tok::LParen || kind == Tok::LBracket || kind == Tok::LBrace {
             depth += 1;
         } else if kind == Tok::RParen || kind == Tok::RBracket || kind == Tok::RBrace {
             depth -= 1;
             if depth == 0 {
-                return TOKS[k + 1].kind == Tok::LBrace;
+                return pcx.toks[k + 1].kind == Tok::LBrace;
             }
         }
         k += 1;
@@ -668,22 +624,22 @@ fn closes_before_brace(j: i64) -> bool {
 
 // `mod name { ... }` at token i (0.6): a child module of the module around
 // it, holding the code between the braces.
-fn add_inline_module(i: i64) {
-    let parent = module_at(TOKS[i].start);
-    let name = TOKS[i + 1].value as i64;
-    if child_module(parent, name) >= 0 {
-        err_begin(TOKS[i + 1].start);
-        err_fmt(format_args("module '{}' is declared twice", sym_text(name)));
-        err_end_soft();
+fn add_inline_module(i: i64, pcx: inout Ctx<Comp>) {
+    let parent = module_at(pcx.toks[i].start, &pcx);
+    let name = pcx.toks[i + 1].value as i64;
+    if child_module(parent, name, pcx) >= 0 {
+        err_begin(pcx.toks[i + 1].start, &pcx);
+        err_fmt(format_args("module '{}' is declared twice", sym_text(name)), pcx);
+        err_end_soft(&pcx);
     }
-    let public = crate::front::modules::vis::module_public(i);
+    let public = crate::front::modules::vis::module_public(i, pcx);
     // The matching closing brace.
     var depth = 0;
     var j = i + 2;
-    while j < TOKS.len() as i64 {
-        if TOKS[j].kind == Tok::LBrace {
+    while j < pcx.toks.len() as i64 {
+        if pcx.toks[j].kind == Tok::LBrace {
             depth += 1;
-        } else if TOKS[j].kind == Tok::RBrace {
+        } else if pcx.toks[j].kind == Tok::RBrace {
             depth -= 1;
             if depth == 0 {
                 break;
@@ -691,58 +647,58 @@ fn add_inline_module(i: i64) {
         }
         j += 1;
     }
-    let m = add_module(name, parent, public);
-    crate::front::modules::vis::note_module_vis(m, i);
-    INLINE_MODS.push(TOKS[i + 2].start);
-    INLINE_MODS.push(if j < TOKS.len() as i64 { TOKS[j].start + 1 }
-        else { TOKS[TOKS.len() as i64 - 1].start + 1 });
-    INLINE_MODS.push(m);
+    let m = add_module(name, parent, public, &pcx);
+    crate::front::modules::vis::note_module_vis(m, i, &pcx);
+    pcx.inline_mods.push(pcx.toks[i + 2].start);
+    pcx.inline_mods.push(if j < pcx.toks.len() as i64 { pcx.toks[j].start + 1 }
+        else { pcx.toks[pcx.toks.len() as i64 - 1].start + 1 });
+    pcx.inline_mods.push(m);
 }
 
-fn load_module(f: i64, i: i64) {
+fn load_module(f: i64, i: i64, pcx: inout Ctx<Comp>) {
     let parent = FILES[f].module;
-    let name = TOKS[i + 1].value as i64;
-    if child_module(parent, name) >= 0 {
-        err_begin(TOKS[i + 1].start);
-        err_fmt(format_args("module '{}' is declared twice", sym_text(name)));
-        err_end_soft();
+    let name = pcx.toks[i + 1].value as i64;
+    if child_module(parent, name, pcx) >= 0 {
+        err_begin(pcx.toks[i + 1].start, &pcx);
+        err_fmt(format_args("module '{}' is declared twice", sym_text(name)), pcx);
+        err_end_soft(&pcx);
         return;
     }
-    let public = crate::front::modules::vis::module_public(i);
-    let path = module_file(f, name);
+    let public = crate::front::modules::vis::module_public(i, pcx);
+    let path = module_file(f, name, &pcx);
     if path == 0 as *u8 {
-        err_begin(TOKS[i + 1].start);
-        err_fmt(format_args("cannot find the file of module '{}'", sym_text(name)));
-        missing_module_help(f, name);
-        err_end_soft();
+        err_begin(pcx.toks[i + 1].start, &pcx);
+        err_fmt(format_args("cannot find the file of module '{}'", sym_text(name)), pcx);
+        missing_module_help(f, name, pcx);
+        err_end_soft(&pcx);
         // (what it would have declared is unknown: no errors for it)
-        fail_name(name);
+        fail_name(name, &pcx);
         return;
     }
-    if MODULE_CONFLICT != 0 as *u8 {
+    if pcx.module_conflict != 0 as *u8 {
         // (0.21) `x.vl` and `x.vl` both: which one is the module
-        err_begin(TOKS[i + 1].start);
+        err_begin(pcx.toks[i + 1].start, &pcx);
         err_fmt(
             format_args("module '{}' has two files, {} and {}", sym_text(name), cstr(path),
-                cstr(MODULE_CONFLICT)));
+                cstr(pcx.module_conflict)), pcx);
         err_help(
-            c"a module is one file: delete or rename one of them (`.vl` is the extension from 0.24)");
-        err_end_soft();
+            c"a module is one file: delete or rename one of them (`.vl` is the extension from 0.24)", pcx);
+        err_end_soft(&pcx);
     }
-    let m = add_module(name, parent, public);
-    crate::front::modules::vis::note_module_vis(m, i);
+    let m = add_module(name, parent, public, &pcx);
+    crate::front::modules::vis::note_module_vis(m, i, &pcx);
     let text = buf_new();
-    read_file(path, text);
-    let start = add_source(path, text);
+    read_file(path, text, pcx);
+    let start = add_source(path, text, &pcx);
     FILES[FILES.len() as i64 - 1].module = m;
-    lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+    lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
 }
 
 // (0.17) The help of `mod name;` in file f without its file: when f is
 // not the root and the file is next to f, it is the root's module (the
 // `mod` line goes there, f imports it through `crate::`); else where the
 // compiler looked, and the command that makes the file.
-fn missing_module_help(f: i64, name: i64) {
+fn missing_module_help(f: i64, name: i64, pcx: Ctx<Comp>) {
     unsafe {
         // (0.21: the file f's own extension, `.vl` or `.vl`)
         let ext = if crate::base::source_ext_len(FILES[f].path[0..strlen(FILES[f].path) as i64])
@@ -760,26 +716,26 @@ fn missing_module_help(f: i64, name: i64) {
                 format_args("{}/{}{}", cstr(path_dir(FILES[f].path)), sym_text(name), cstr(ext)));
             buf_byte(side, 0);
             let sp = BUFS[side].data;
-            if file_exists(sp) {
+            if file_exists(sp, pcx) {
                 var r = 0;
                 while r < FILES.len() as i64 && FILES[r].path[0] == '<' {
                     r += 1;
                 }
                 let root = if r < FILES.len() as i64 { FILES[r].path } else { c"main.vl" };
                 err_help_fmt(
-                    format_args("{} is a module of the root: its `mod {};` goes in {}, and this file imports it as `use crate::{}::...;`", cstr(if sp[0] == '.' && sp[1] == '/' { &sp[2] } else { sp }), sym_text(name), cstr(path_base(root)), sym_text(name)));
+                    format_args("{} is a module of the root: its `mod {};` goes in {}, and this file imports it as `use crate::{}::...;`", cstr(if sp[0] == '.' && sp[1] == '/' { &sp[2] } else { sp }), sym_text(name), cstr(path_base(root)), sym_text(name)), pcx);
                 return;
             }
         }
-        err_help(c"looked for ");
-        err_help(shown);
-        err_help(c" and ");
+        err_help(c"looked for ", pcx);
+        err_help(shown, pcx);
+        err_help(c" and ", pcx);
         let nested = module_candidate(f, name, nested: true, ext: ext);
-        err_help(if nested[0] == '.' && nested[1] == '/' { &nested[2] } else { nested });
-        err_help(c": write the file (`edit new-file` takes its text on stdin)");
+        err_help(if nested[0] == '.' && nested[1] == '/' { &nested[2] } else { nested }, pcx);
+        err_help(c": write the file (`edit new-file` takes its text on stdin)", pcx);
         let args = buf_new();
         buf_fmt(args, format_args("edit new-file {}", cstr(shown)));
-        err_try_tool(buf_slice(args), true);
+        err_try_tool(buf_slice(args), true, pcx);
     }
 }
 
@@ -789,7 +745,7 @@ fn missing_module_help(f: i64, name: i64) {
 // main.vl (beside it) does not `mod` it (yet), so it was checked as a
 // program of its own; or the program lacks `mod name;`. Whether there was a
 // help.
-pub fn beside_root_help(root: [u8], name: [u8]) -> bool {
+pub fn beside_root_help(root: [u8], name: [u8], pcx: Ctx<Comp>) -> bool {
     var cut = root.len as i64;
     while cut > 0 && root[cut - 1] != '/' {
         cut -= 1;
@@ -800,7 +756,7 @@ pub fn beside_root_help(root: [u8], name: [u8]) -> bool {
     buf_bytes(side, dir);
     buf_bytes(side, name);
     buf_str(side, c".vl");
-    if !file_exists(crate::tools::proc::buf_cstr(side)) {
+    if !file_exists(crate::tools::proc::buf_cstr(side), pcx) {
         return false;
     }
     let main = buf_new();
@@ -810,15 +766,15 @@ pub fn beside_root_help(root: [u8], name: [u8]) -> bool {
     buf_str(main, c"main.vl");
     let shown = buf_slice(main);
     let stem = if base.len > 3 { base[0..base.len as i64 - 3] } else { base };
-    if base != "main.vl" && file_exists(crate::tools::proc::buf_cstr(main)) {
+    if base != "main.vl" && file_exists(crate::tools::proc::buf_cstr(main), pcx) {
         err_help_fmt(
-            format_args("{base} was checked as a program of its own (no `mod {stem};` in {shown} names it), so {name}.vl beside it is not its module: a module is checked through its program's root, once the root has `mod {stem};`"));
+            format_args("{base} was checked as a program of its own (no `mod {stem};` in {shown} names it), so {name}.vl beside it is not its module: a module is checked through its program's root, once the root has `mod {stem};`"), pcx);
         let args = buf_new();
         buf_fmt(args, format_args("check {shown}"));
-        err_try_tool(buf_slice(args), false);
+        err_try_tool(buf_slice(args), false, pcx);
     } else {
         err_help_fmt(
-            format_args("{name}.vl is beside {base} but not a module of the program: `mod {name};` in {base} makes it one"));
+            format_args("{name}.vl is beside {base} but not a module of the program: `mod {name};` in {base} makes it one"), pcx);
     }
     true
 }
@@ -853,33 +809,29 @@ fn is_mod_file(base: *u8) -> bool {
     streq(base, c"mod.vl") || streq(base, c"mod.vl")
 }
 
-// The files looked for and not found (the tools' cache, 0.13: the program
-// is another once one of them exists).
-pub static var MODULE_PROBES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // The file of `mod name;` in file f (module_candidate), `.vl` or (0.21)
 // `.vl`; 0 when there is none. Both of one candidate: MODULE_CONFLICT is
 // the `.vl` one, which load_module reports, and the `.vl` one is read.
-fn module_file(f: i64, name: i64) -> *u8 {
-    MODULE_CONFLICT = 0 as *u8;
+fn module_file(f: i64, name: i64, pcx: inout Ctx<Comp>) -> *u8 {
+    pcx.module_conflict = 0 as *u8;
     for k in 0..2 {
         let nested = k == 1;
         let tach = module_candidate(f, name, nested, c".vl");
         let vl = module_candidate(f, name, nested, c".vl");
-        let has_tach = file_exists(tach);
-        let has_vl = file_exists(vl);
+        let has_tach = file_exists(tach, pcx);
+        let has_vl = file_exists(vl, pcx);
         // (one file when the two are one path: 0.24's rename makes the
         // `.vl` here `.vl`, tools/rename-vole.sh)
         if has_tach && has_vl && !crate::base::streq(tach, vl) {
-            MODULE_CONFLICT = vl;
+            pcx.module_conflict = vl;
         }
         // (the other extension, absent: a cached answer is stale once
         // it appears, MODULE_PROBES)
         if has_tach && !has_vl {
-            MODULE_PROBES.push(vl as i64);
+            pcx.module_probes.push(vl as i64);
         }
         if has_vl && !has_tach {
-            MODULE_PROBES.push(tach as i64);
+            pcx.module_probes.push(tach as i64);
         }
         if has_tach {
             return tach;
@@ -887,15 +839,11 @@ fn module_file(f: i64, name: i64) -> *u8 {
         if has_vl {
             return vl;
         }
-        MODULE_PROBES.push(tach as i64);
-        MODULE_PROBES.push(vl as i64);
+        pcx.module_probes.push(tach as i64);
+        pcx.module_probes.push(vl as i64);
     }
     0 as *u8
 }
-
-// (0.21) Set by module_file: the second file of a module that has both a
-// `.vl` and a `.vl` file.
-static var MODULE_CONFLICT: *u8 = 0 as *u8;
 
 fn path_base(path: *u8) -> *u8 {
     unsafe {

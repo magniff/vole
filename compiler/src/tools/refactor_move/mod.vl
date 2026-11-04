@@ -31,17 +31,17 @@ use crate::base::{
     buf_str, intern,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ast::{NODES, child};
-use crate::front::lexer::{TOKS, Tok};
+use crate::front::lexer::Tok;
 use crate::front::modules::{file_of_pos, module_at, module_count};
-use crate::front::stdtree::STD_TREE;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::proc::{buf_cstr, remove_file, run_inherit, write_file_if};
 use crate::tools::query::c_slice;
-use crate::tools::query::defs::{DEFS, K_IMPL_METHOD, K_METHOD, K_MOD, bytes_eq, mod_fqn_text};
-use crate::tools::query::diagnostics::{PROG, diag, try_begin, try_end, write_diags};
+use crate::tools::query::defs::{K_IMPL_METHOD, K_METHOD, K_MOD, bytes_eq, mod_fqn_text};
+use crate::tools::query::diagnostics::{diag, try_begin, try_end, write_diags};
 use crate::tools::query::positions::token_at;
 use crate::tools::refactor_mod::{
     binding_of, collision, emit_regions, is_new, item_binding, load_refs, own_file, put_edit,
@@ -60,7 +60,7 @@ use crate::tools::refactor_move::units::{
 // ---- Blocks: the text that moves ----
 
 // The region the code at pos is in after the edit.
-fn region_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
+fn region_at(pos: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var lo = 0;
         var hi = tcx.bl_start.count;
@@ -75,7 +75,7 @@ fn region_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
         if lo > 0 && pos < tcx.bl_end.data[lo - 1] {
             return tcx.bl_dest.data[lo - 1];
         }
-        module_at(pos)
+        module_at(pos, &pcx)
     }
 }
 
@@ -109,31 +109,31 @@ fn add_block(start: i64, end: i64, dest: i64, wrap: i64, banner: i64, tcx: inout
 }
 
 // Whether item d can move (diagnosed when not).
-fn movable(d: i64, tcx: inout Tcx<Comp>) -> bool {
-    let k = DEFS[d].kind;
+fn movable(d: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    let k = pcx.defs[d].kind;
     var why = 0 as *u8;
     if k == K_METHOD || k == K_IMPL_METHOD {
         why = c" is a method: it moves with its type's impl block";
-    } else if DEFS[d].parent >= 0 {
+    } else if pcx.defs[d].parent >= 0 {
         why = c" is part of an item: move the item";
     } else if k == K_MOD {
         why = c" is a module: use move-module";
     }
     if why != 0 as *u8 {
         let e = diag(c"error", c"refactor.not-movable", &tcx);
-        buf_bytes(e, SYMS[DEFS[d].fqn].text);
+        buf_bytes(e, SYMS[pcx.defs[d].fqn].text);
         buf_str(e, why);
         buf_byte(e, '\n');
         if k == K_MOD {
-            let out = try_begin(c"move-module", SYMS[DEFS[d].fqn].text, true, &tcx);
+            let out = try_begin(c"move-module", SYMS[pcx.defs[d].fqn].text, true, &tcx, pcx);
             buf_str(out, c" crate::NEW::PATH");
             try_end(out);
         }
         return false;
     }
-    let f = file_of_pos(DEFS[d].start);
-    if module_at(DEFS[d].start) != FILES[f].module {
-        inline_module(module_at(DEFS[d].start), &tcx);
+    let f = file_of_pos(pcx.defs[d].start);
+    if module_at(pcx.defs[d].start, &pcx) != FILES[f].module {
+        inline_module(module_at(pcx.defs[d].start, &pcx), &tcx, pcx);
         return false;
     }
     true
@@ -209,29 +209,29 @@ fn in_block(pos: i64, tcx: Tcx<Comp>) -> bool {
 // ---- The analysis ----
 
 // The `super::` and `self::` paths of the moved code, written from `crate`.
-fn moved_relative_paths(tcx: inout Tcx<Comp>) {
+fn moved_relative_paths(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         let sup = intern(c_slice(c"super"));
         let slf = intern(c_slice(c"self"));
         for k in 0..tcx.bl_start.count {
-            var i = token_at(tcx.bl_start.data[k]);
-            while i + 1 < TOKS.len() as i64 && TOKS[i].start < tcx.bl_end.data[k] {
-                let v = TOKS[i].value as i64;
-                if TOKS[i].kind != Tok::Ident || (v != sup && v != slf)
-                    || TOKS[i + 1].kind != Tok::ColonColon
-                    || (i > 0 && TOKS[i - 1].kind == Tok::ColonColon) {
+            var i = token_at(tcx.bl_start.data[k], pcx);
+            while i + 1 < pcx.toks.len() as i64 && pcx.toks[i].start < tcx.bl_end.data[k] {
+                let v = pcx.toks[i].value as i64;
+                if pcx.toks[i].kind != Tok::Ident || (v != sup && v != slf)
+                    || pcx.toks[i + 1].kind != Tok::ColonColon
+                    || (i > 0 && pcx.toks[i - 1].kind == Tok::ColonColon) {
                     i += 1;
                     continue;
                 }
                 let first = i;
-                var m = module_at(TOKS[i].start);
+                var m = module_at(pcx.toks[i].start, &pcx);
                 if v == slf {
                     i += 2;
                 } else {
-                    while i + 1 < TOKS.len() as i64 && TOKS[i].kind == Tok::Ident
-                        && TOKS[i].value as i64 == sup
-                        && TOKS[i + 1].kind == Tok::ColonColon {
-                        m = crate::tools::refactor_mod::region_parent(m, tcx);
+                    while i + 1 < pcx.toks.len() as i64 && pcx.toks[i].kind == Tok::Ident
+                        && pcx.toks[i].value as i64 == sup
+                        && pcx.toks[i + 1].kind == Tok::ColonColon {
+                        m = crate::tools::refactor_mod::region_parent(m, tcx, pcx);
                         i += 2;
                     }
                 }
@@ -239,9 +239,9 @@ fn moved_relative_paths(tcx: inout Tcx<Comp>) {
                     continue;
                 }
                 let b = buf_new();
-                buf_bytes(b, mod_fqn_text(m, &tcx));
+                buf_bytes(b, mod_fqn_text(m, &tcx, pcx));
                 buf_str(b, c"::");
-                later_edit(TOKS[first].start, TOKS[i].start, b, &tcx);
+                later_edit(pcx.toks[first].start, pcx.toks[i].start, b, &tcx);
             }
         }
     }
@@ -249,7 +249,7 @@ fn moved_relative_paths(tcx: inout Tcx<Comp>) {
 
 // The imports of the modules the moved code leaves that nothing there
 // names any more.
-fn unused_imports(tcx: inout Tcx<Comp>) {
+fn unused_imports(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..tcx.bl_start.count {
@@ -280,14 +280,14 @@ fn unused_imports(tcx: inout Tcx<Comp>) {
                 continue;
             }
             for k in 0..NODES[u].count {
-                let id = child(u, k);
+                let id = child(u, k, pcx);
                 let name = crate::tools::refactor_mod::use_local(id);
                 var before = 0;
                 var after = 0;
-                var i = token_at(FILES[f].start);
-                while i < TOKS.len() as i64 && TOKS[i].start < FILES[f].end {
-                    let s = TOKS[i].start;
-                    if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
+                var i = token_at(FILES[f].start, pcx);
+                while i < pcx.toks.len() as i64 && pcx.toks[i].start < FILES[f].end {
+                    let s = pcx.toks[i].start;
+                    if pcx.toks[i].kind == Tok::Ident && pcx.toks[i].value as i64 == name
                         && (s < NODES[u].start || s >= NODES[u].end) {
                         before += 1;
                         if !in_block(s, tcx) {
@@ -308,39 +308,40 @@ fn unused_imports(tcx: inout Tcx<Comp>) {
 
 // Makes the moves of MV_DEF / MV_DEST (the references collected): false
 // after a diagnostic.
-pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
+pub fn move_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         // Names taken where the items go.
         for i in 0..tcx.mv_def.count {
             let d = tcx.mv_def.data[i];
             let r = tcx.mv_dest.data[i];
             for j in 0..i {
-                if tcx.mv_dest.data[j] == r && DEFS[tcx.mv_def.data[j]].name == DEFS[d].name {
-                    collision(SYMS[DEFS[d].name].text, r, tcx.mv_def.data[j], false, &tcx);
+                if tcx.mv_dest.data[j] == r
+                    && pcx.defs[tcx.mv_def.data[j]].name == pcx.defs[d].name {
+                    collision(SYMS[pcx.defs[d].name].text, r, tcx.mv_def.data[j], false, &tcx, pcx);
                     return false;
                 }
             }
-            if !is_new(r) {
-                let b = binding_of(r, DEFS[d].name, tcx);
+            if !is_new(r, pcx) {
+                let b = binding_of(r, pcx.defs[d].name, tcx, pcx);
                 if b >= 0 && b != d {
-                    collision(SYMS[DEFS[d].name].text, r, b, item_binding(r, DEFS[d].name, tcx) < 0,
-                        &tcx);
+                    collision(SYMS[pcx.defs[d].name].text, r, b,
+                        item_binding(r, pcx.defs[d].name, tcx) < 0, &tcx, pcx);
                     return false;
                 }
             }
         }
-        if !make_blocks(&tcx) {
+        if !make_blocks(&tcx, &pcx) {
             return false;
         }
-        if !analyze(&tcx) {
+        if !analyze(&tcx, &pcx) {
             return false;
         }
-        rewrite_imports(&tcx);
+        rewrite_imports(&tcx, &pcx);
         if tcx.refused {
             return false;
         }
-        moved_relative_paths(&tcx);
-        unused_imports(&tcx);
+        moved_relative_paths(&tcx, &pcx);
+        unused_imports(&tcx, pcx);
         // The moved text, from where it was.
         var texts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..tcx.bl_start.count {
@@ -356,13 +357,14 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                 j += 1;
             }
             if tcx.bl_wrap.data[k] >= 0 || tcx.bl_wrap.data[j] >= 0 {
-                delete_lines(tcx.bl_start.data[k], tcx.bl_end.data[j]);
+                delete_lines(tcx.bl_start.data[k], tcx.bl_end.data[j], &pcx);
             } else {
-                let last = if tcx.bl_wrap.data[j] == -1 { run_key_at(tcx.bl_start.data[j], tcx) }
+                let last = if tcx.bl_wrap.data[j]
+                    == -1 { run_key_at(tcx.bl_start.data[j], tcx, pcx) }
                     else { 0 };
                 delete_moved(tcx.bl_start.data[k], tcx.bl_end.data[j],
-                    if tcx.bl_wrap.data[k] == -1 { run_key_at(tcx.bl_start.data[k], tcx) }
-                    else { 0 }, last, &tcx);
+                    if tcx.bl_wrap.data[k] == -1 { run_key_at(tcx.bl_start.data[k], tcx, pcx) }
+                    else { 0 }, last, &tcx, &pcx);
             }
             k = j + 1;
         }
@@ -370,12 +372,12 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
         for e in 0..tcx.refactor_move_l_start.count {
             if !in_block(tcx.refactor_move_l_start.data[e], tcx) {
                 put_edit(tcx.refactor_move_l_start.data[e], tcx.refactor_move_l_end.data[e],
-                    tcx.l_text.data[e], &tcx);
+                    tcx.l_text.data[e], &tcx, &pcx);
             }
         }
-        emit_use_edits(&tcx);
+        emit_use_edits(&tcx, &pcx);
         // The imports, where they go (and split --reexport's re-exports).
-        let reex = reexport_lines(&tcx);
+        let reex = reexport_lines(&tcx, &pcx);
         var regions = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..tcx.im_region.count {
             if tcx.im_region.data[i] >= 0 {
@@ -387,16 +389,16 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
         }
         for i in 0..regions.count {
             let r = regions.data[i];
-            let lines = region_uses(r, &tcx);
+            let lines = region_uses(r, &tcx, &pcx);
             if r == tcx.split_from {
                 buf_bytes(lines, buf_slice(reex));
             }
-            if is_new(r) {
-                buf_bytes(tcx.nm_uses.data[r - module_count()], buf_slice(lines));
+            if is_new(r, pcx) {
+                buf_bytes(tcx.nm_uses.data[r - module_count(pcx)], buf_slice(lines));
                 continue;
             }
             var after = false;
-            let at = import_anchor(r, &after, &tcx);
+            let at = import_anchor(r, &after, &tcx, &pcx);
             let text = buf_new();
             if after {
                 buf_byte(text, '\n');
@@ -408,7 +410,7 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                     buf_byte(text, '\n');
                 }
             }
-            put_edit(at, at, text, &tcx);
+            put_edit(at, at, text, &tcx, &pcx);
         }
         // The moved text, where it goes.
         var dests = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -431,11 +433,12 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                     continue;
                 }
                 var text = buf_slice(texts.data[k]);
-                if prev < 0 && is_new(r) && BUFS[tcx.nm_head.data[r - module_count()]].len == 0 {
+                if prev < 0 && is_new(r, pcx)
+                    && BUFS[tcx.nm_head.data[r - module_count(pcx)]].len == 0 {
                     // A part's header: --header, or the banner it starts
                     // with (then not repeated), or the banner above its
                     // first block where it was.
-                    let head = tcx.nm_head.data[r - module_count()];
+                    let head = tcx.nm_head.data[r - module_count(pcx)];
                     if tcx.opt_header != 0 as *u8 {
                         put_header(head, c_slice(tcx.opt_header));
                     } else if tcx.bl_banner.data[k] >= 0 {
@@ -444,7 +447,7 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                             tcx.bl_banner.data[k] - tcx.bl_start.data[k]);
                     } else {
                         var e = 0;
-                        let b = banner_above(tcx.bl_start.data[k], &e, tcx);
+                        let b = banner_above(tcx.bl_start.data[k], &e, tcx, pcx);
                         if b >= 0 {
                             put_header(head, SRC[b..e]);
                         }
@@ -477,7 +480,7 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                     }
                 }
                 let x = tcx.bl_wrap.data[k];
-                let key = if x == -1 { run_key_at(tcx.bl_start.data[k], tcx) } else { 0 };
+                let key = if x == -1 { run_key_at(tcx.bl_start.data[k], tcx, pcx) } else { 0 };
                 if first_key < 0 {
                     first_key = key;
                 } else if key > 0 && key == last_key && exact {
@@ -495,10 +498,10 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                 // Functions of an extern block: in one like it.
                 let t = tcx.un_first.data[x];
                 var lb = t;
-                while TOKS[lb].kind != Tok::LBrace {
+                while pcx.toks[lb].kind != Tok::LBrace {
                     lb += 1;
                 }
-                buf_bytes(body, SRC[TOKS[t].start..TOKS[lb].end]);
+                buf_bytes(body, SRC[pcx.toks[t].start..pcx.toks[lb].end]);
                 buf_byte(body, '\n');
                 while k < tcx.bl_start.count && tcx.bl_dest.data[k] == r
                     && tcx.bl_wrap.data[k] == x {
@@ -507,13 +510,13 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                 }
                 buf_str(body, c"}\n");
             }
-            if is_new(r) {
-                buf_bytes(tcx.nm_body.data[r - module_count()], buf_slice(body));
+            if is_new(r, pcx) {
+                buf_bytes(tcx.nm_body.data[r - module_count(pcx)], buf_slice(body));
                 continue;
             }
             if tcx.place_at >= 0 && r == tcx.mv_dest.data[0] {
                 place_moved(tcx.place_at, tcx.place_before, buf_slice(body), first_key, last_key,
-                    &tcx);
+                    &tcx, &pcx);
                 continue;
             }
             let f = own_file(r);
@@ -525,7 +528,7 @@ pub fn move_edits(tcx: inout Tcx<Comp>) -> bool {
                 buf_byte(text, '\n');
             }
             buf_bytes(text, buf_slice(body));
-            put_edit(end, end, text, &tcx);
+            put_edit(end, end, text, &tcx, &pcx);
         }
         true
     }
@@ -598,27 +601,27 @@ fn after_blank_lines(text: [u8], n: i64) -> [u8] {
 // ---- move ----
 
 // `refactor move PATH... --to MODULE`.
-pub fn run_move(words: IntVec, to: *u8, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn run_move(words: IntVec, to: *u8, root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         tcx.tidy_after = true;
-        let t = module_named(c_slice(to), &tcx);
+        let t = module_named(c_slice(to), &tcx, pcx);
         if t == -1 {
-            return move_to_new(words, c_slice(to), root, &tcx);
+            return move_to_new(words, c_slice(to), root, &tcx, pcx);
         }
         if t < 0 {
-            return no_module(c_slice(to), c"new-module", &tcx);
+            return no_module(c_slice(to), c"new-module", &tcx, pcx);
         }
         if own_file(t) < 0 {
-            return inline_module(t, &tcx);
+            return inline_module(t, &tcx, pcx);
         }
-        load_refs(&tcx);
+        load_refs(&tcx, &pcx);
         for i in 0..words.count {
             let name = c_slice(words.data[i] as *u8);
-            let d = one_definition(c"move", name, c_slice(c""), &tcx);
-            if d < 0 || !movable(d, &tcx) {
+            let d = one_definition(c"move", name, c_slice(c""), &tcx, &pcx);
+            if d < 0 || !movable(d, &tcx, &pcx) {
                 return 1;
             }
-            if DEFS[d].module == t {
+            if pcx.defs[d].module == t {
                 continue;
             }
             tcx.mv_def.push(d);
@@ -629,31 +632,32 @@ pub fn run_move(words: IntVec, to: *u8, root: *u8, tcx: inout Tcx<Comp>) -> i64 
             buf_str(e, c"nothing to change\n");
             return 0;
         }
-        if (tcx.opt_after != 0 as *u8 || tcx.opt_before != 0 as *u8) && !find_anchor(t, &tcx) {
+        if (tcx.opt_after != 0 as *u8 || tcx.opt_before != 0 as *u8)
+            && !find_anchor(t, &tcx, &pcx) {
             return 1;
         }
-        if !move_edits(&tcx) {
+        if !move_edits(&tcx, &pcx) {
             return 1;
         }
-        emit_regions(&tcx);
+        emit_regions(&tcx, &pcx);
         let what = buf_new();
         buf_str(what, c"moved ");
         if tcx.mv_def.count == 1 {
-            buf_bytes(what, SYMS[DEFS[tcx.mv_def.data[0]].fqn].text);
+            buf_bytes(what, SYMS[pcx.defs[tcx.mv_def.data[0]].fqn].text);
         } else {
             buf_int(what, tcx.mv_def.count);
             buf_str(what, c" items");
         }
         buf_str(what, c" to ");
-        buf_bytes(what, mod_fqn_text(t, &tcx));
-        finish(what, root, &tcx)
+        buf_bytes(what, mod_fqn_text(t, &tcx, pcx));
+        finish(what, root, &tcx, &pcx)
     }
 }
 
 // (0.17) `refactor move PATH... --to MODULE` when MODULE does not exist:
 // a script of two steps, `refactor new-module MODULE` and the move, run
 // as one edit by a copy of this program (stdout and stderr its own).
-fn move_to_new(words: IntVec, to: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn move_to_new(words: IntVec, to: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let path = buf_new();
         if !bytes_eq(to, c_slice(c"crate"))
@@ -710,7 +714,7 @@ fn move_to_new(words: IntVec, to: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 
         buf_bytes(label, buf_slice(path));
         buf_str(label, c", a new module");
         let args = alloc_array::<*u8>(16);
-        args[0] = PROG;
+        args[0] = pcx.prog;
         args[1] = c"refactor";
         args[2] = c"--script";
         args[3] = file;
@@ -737,9 +741,9 @@ fn move_to_new(words: IntVec, to: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 
             n += 2;
         }
         // (0.20: a move in std's files)
-        if STD_TREE != 0 as *u8 {
+        if pcx.std_tree != 0 as *u8 {
             args[n] = c"--std-tree";
-            args[n + 1] = STD_TREE;
+            args[n + 1] = pcx.std_tree;
             n += 2;
         }
         args[n] = 0 as *u8;
@@ -758,14 +762,14 @@ fn move_to_new(words: IntVec, to: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 
 
 // Finds the item of --after or --before in module t (by its name there,
 // or its path): false after a diagnostic.
-fn find_anchor(t: i64, tcx: inout Tcx<Comp>) -> bool {
+fn find_anchor(t: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         tcx.place_before = tcx.opt_after == 0 as *u8;
         let name = c_slice(if tcx.place_before { tcx.opt_before } else { tcx.opt_after });
         // (a name of module t, or a path)
         var d = -1;
         if has_colons(name) {
-            d = one_definition(c"move", name, c_slice(c""), &tcx);
+            d = one_definition(c"move", name, c_slice(c""), &tcx, &pcx);
             if d < 0 {
                 return false;
             }
@@ -778,17 +782,18 @@ fn find_anchor(t: i64, tcx: inout Tcx<Comp>) -> bool {
                 moved = true;
             }
         }
-        let u = if d >= 0 && DEFS[d].module == t && !moved { anchor_unit(d, &tcx) } else { -1 };
+        let u = if d >= 0 && pcx.defs[d].module == t && !moved { anchor_unit(d, &tcx, &pcx) }
+            else { -1 };
         if u < 0 {
             let e = diag(c"error", c"refactor.anchor", &tcx);
             buf_str(e, if tcx.place_before { c"--before " } else { c"--after " });
             buf_bytes(e, name);
             buf_str(e, c": not an item of ");
-            buf_bytes(e, mod_fqn_text(t, &tcx));
+            buf_bytes(e, mod_fqn_text(t, &tcx, pcx));
             buf_str(e,
                 if moved { c" that stays there\n" }
                 else { c" with lines of its own (a function, type, constant, static)\n" });
-            let tr = try_begin(c"items", mod_fqn_text(t, &tcx), true, &tcx);
+            let tr = try_begin(c"items", mod_fqn_text(t, &tcx, pcx), true, &tcx, pcx);
             try_end(tr);
             return false;
         }
@@ -805,40 +810,40 @@ fn find_anchor(t: i64, tcx: inout Tcx<Comp>) -> bool {
 // --max-lines lines (query deps's clustering, on its items with their impl
 // blocks), as the commands that make it; `--auto`: that split, made in one
 // edit.
-pub fn run_split(name: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn run_split(name: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     tcx.tidy_after = true;
-    let m = module_named(name, &tcx);
+    let m = module_named(name, &tcx, pcx);
     if m < 0 {
-        return no_module(name, 0 as *u8, &tcx);
+        return no_module(name, 0 as *u8, &tcx, pcx);
     }
     if tcx.opt_reexport {
         tcx.split_from = m;
     }
     let f = own_file(m);
     if f < 0 {
-        return inline_module(m, &tcx);
+        return inline_module(m, &tcx, pcx);
     }
-    load_refs(&tcx);
-    units_of(f, &tcx);
+    load_refs(&tcx, &pcx);
+    units_of(f, &tcx, &pcx);
     if tcx.opt_plan || tcx.opt_auto {
-        return split_plan(m, f, root, &tcx);
+        return split_plan(m, f, root, &tcx, &pcx);
     }
     var segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     let into = c_slice(tcx.opt_into);
     if !path_segments(into, &segs) || segs.count == 0 {
         return crate::tools::refactor_mod::cli::usage(
-            c"--into takes a module path (crate::a::b)", 0 as *u8, &tcx);
+            c"--into takes a module path (crate::a::b)", 0 as *u8, &tcx, pcx);
     }
     var converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    var t = make_path(segs, segs.count, false, &converts, &tcx);
+    var t = make_path(segs, segs.count, false, &converts, &tcx, pcx);
     if t == -2 {
-        t = module_named(into, &tcx);
+        t = module_named(into, &tcx, pcx);
     }
     if t < 0 {
         return 1;
     }
-    if !is_new(t) && own_file(t) < 0 {
-        return inline_module(t, &tcx);
+    if !is_new(t, pcx) && own_file(t) < 0 {
+        return inline_module(t, &tcx, pcx);
     }
     // The items, by their names in MODULE (or their paths).
     let items = c_slice(tcx.opt_items);
@@ -855,32 +860,33 @@ pub fn run_split(name: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         }
         let full = buf_new();
         if !has_colons(w) {
-            buf_bytes(full, mod_fqn_text(m, &tcx));
+            buf_bytes(full, mod_fqn_text(m, &tcx, pcx));
             buf_str(full, c"::");
         }
         buf_bytes(full, w);
-        let d = one_definition(c"move", buf_slice(full), c_slice(c""), &tcx);
-        if d < 0 || !movable(d, &tcx) {
+        let d = one_definition(c"move", buf_slice(full), c_slice(c""), &tcx, &pcx);
+        if d < 0 || !movable(d, &tcx, &pcx) {
             return 1;
         }
         tcx.mv_def.push(d);
         tcx.mv_dest.push(t);
     }
     if tcx.mv_def.count == 0 {
-        return crate::tools::refactor_mod::cli::usage(c"--items names no item", 0 as *u8, &tcx);
+        return crate::tools::refactor_mod::cli::usage(c"--items names no item", 0 as *u8, &tcx,
+            pcx);
     }
-    if !move_edits(&tcx) {
+    if !move_edits(&tcx, &pcx) {
         return 1;
     }
-    emit_regions(&tcx);
+    emit_regions(&tcx, &pcx);
     let what = buf_new();
     buf_str(what, c"split ");
-    buf_bytes(what, mod_fqn_text(m, &tcx));
+    buf_bytes(what, mod_fqn_text(m, &tcx, pcx));
     buf_str(what, c": ");
     buf_int(what, tcx.mv_def.count);
     buf_str(what, if tcx.mv_def.count == 1 { c" item into " } else { c" items into " });
     buf_bytes(what, into);
-    finish(what, root, &tcx)
+    finish(what, root, &tcx, &pcx)
 }
 
 fn has_colons(s: [u8]) -> bool {
