@@ -12,7 +12,7 @@ fixed 9 parameters to &mut T, 17 parameters to &T, 2 arguments	main.vl	+22 -22 l
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
 ## 0.19's spelling itself), before the fixes that read 0.20's.
 $ fix --only conventions
-fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.vl	+28 -27 lines
+fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.vl	+27 -27 lines
 % cat main.vl
 trait Shape {
     fn area(self) -> i64;
@@ -51,7 +51,7 @@ impl Eq for Key { fn eq(self, other: Key) -> bool { self.k == other.k } }
 
 // Display declares `&Self` and `&mut Fmt` (0.18): spelled so too.
 struct Money { c: i64 }
-impl Display for Money { fn fmt(self, f: inout Fmt) { f.write(f"${self.c}"); } }
+impl Display for Money { fn fmt(self, f: inout Fmt) { f.write("${}", self.c); } }
 
 fn total<T: Shape>(s: T) -> i64 { s.area() }
 fn bump<T: Shape>(s: inout T) { s.grow(1); }
@@ -69,8 +69,8 @@ fn main() {
     let x = Key { k: 1 };
     let y = Key { k: 2 };
     let m = Money { c: 7 };
-    println(
-        f"{total(a)} {total(r)} {a.name()} {r.name()} {a.same(b)} {twice(&fx)} {twice(&lv)} {x < y} {x == y} {m}");
+    println("{} {} {} {} {} {} {} {} {} {m}", total(a), total(r), a.name(), r.name(), a.same(b),
+        twice(&fx), twice(&lv), x < y, x == y);
 }
 $ fix --only unsafe
 note fix.none: nothing to fix

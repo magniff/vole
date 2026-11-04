@@ -122,9 +122,13 @@ $ refactor inline percent --dry-run
 @@ -8,0 +8,2 @@
 +use calc::{empties, twice};
 +
-@@ -21 +22 @@
--    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
-+    println(f"{TITLE}: share {if b == 0 { 0 } else { a * 100 / b }}%, twice {twice(a)}");
+@@ -21 +22,5 @@
+-    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
++    println("{TITLE}: share {}%, twice {}", if b == 0 {
++        0
++    } else {
++        a * 100 / b
++    }, twice(a));
 --- a/calc.vl
 +++ b/calc.vl
 @@ -7,8 +6,0 @@
@@ -146,11 +150,11 @@ $ rewrite 'twice($x)' '$x + $x' --in main --dry-run
 +use calc::{empties, percent};
 +
 @@ -21 +22 @@
--    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
-+    println(f"{TITLE}: share {percent(a, b)}%, twice {a + a}");
+-    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
++    println("{TITLE}: share {}%, twice {}", percent(a, b), a + a);
 @@ -25 +26 @@
--    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::header()}");
-+    println(f"{geo::area(2)} {A + B} {b + b} {calc::header()}");
+-    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::header());
++    println("{} {} {} {}", geo::area(2), A + B, b + b, calc::header());
 note rewrite.imports: removed 1 import the rewrite left unused
 $ rewrite 'twice($x)' '$x + $x' --in main --in crate::nowhere
 error rewrite.bad-in: no file, module or item 'crate::nowhere' in the program
@@ -177,8 +181,8 @@ $ refactor rename crate::calc::header top --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -25 +25 @@
--    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::header()}");
-+    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::top()}");
+-    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::header());
++    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::top());
 --- a/calc.vl
 +++ b/calc.vl
 @@ -1 +1 @@
@@ -192,7 +196,7 @@ $ query refs GREETING TITLE
 # main.vl
 9:7	def	->GREETING	const GREETING: *u8 = c"hello";
 10:7	def	->TITLE	const TITLE: [u8] = "totals";
-21:16	read	main	->TITLE	println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
+21:15	read	main	->TITLE	println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
 23:14	read	main	->GREETING	puts(GREETING);
 ## query grep --comments: a doc comment is its item's.
 $ query grep 'area of a square' --comments

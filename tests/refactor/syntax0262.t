@@ -8,7 +8,7 @@ formatted	main.vl	+8 -6 lines
 use std::Display;
 
 fn show<T>(x: T, y: impl Display) where T: Display + Copy, {
-    println(f"{x} {y}");
+    println("{x} {y}");
 }
 
 struct Pair<A, B> where A: Display, B: Display { a: A, b: B }
@@ -24,14 +24,14 @@ fn own_line<T, U>(x: T, u: U)
         T: Display,
         U: Copy,
 {
-    println(f"{x}");
+    println("{x}");
 }
 
 fn main() -> i32 {
     show(1, "a");
     own_line(2, 3);
     let p = Pair { a: 1, b: 2 };
-    println(f"{p.a}");
+    println("{}", p.a);
     long_one(1, 2, 3) as i32
 }
 $ fmt

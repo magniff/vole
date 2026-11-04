@@ -22,18 +22,13 @@ $ fmt --dry-run main.vl
 -    Some(v/2)
 +    let v = o?;
 +    Some(v / 2)
-@@ -23,4 +23,5 @@
+@@ -23,2 +23,2 @@
 -    let p = P{x,y};
 -    let n = scale(1, b:5, c : 6) + scale(1,c: 4);
--    println(f"x = {x}, y = { y } {p.x:>5} {{text}} {p:?} {n+1:08.3}");
--    println(f"the first value is {x} and the second is {scale(x, b: y, c: x * y + 1000000)} at last");
 +    let p = P { x, y };
 +    let n = scale(1, b: 5, c: 6) + scale(1, c: 4);
-+    println(f"x = {x}, y = {y} {p.x:>5} {{text}} {p:?} {n + 1:08.3}");
-+    println(
-+        f"the first value is {x} and the second is {scale(x, b: y, c: x * y + 1000000)} at last");
 $ fmt
-formatted	main.vl	+10 -9 lines
+formatted	main.vl	+7 -7 lines
 % cat main.vl
 // The syntax of 0.15 laid out by hand, for `volec fmt`.
 #[derive(Eq, Ord, Debug)]
@@ -59,8 +54,8 @@ fn main() {
     let y = 2;
     let p = P { x, y };
     let n = scale(1, b: 5, c: 6) + scale(1, c: 4);
-    println(f"x = {x}, y = {y} {p.x:>5} {{text}} {p:?} {n + 1:08.3}");
-    println(
-        f"the first value is {x} and the second is {scale(x, b: y, c: x * y + 1000000)} at last");
+    println("x = {x}, y = {y} {:>5} {{text}} {p:?} {:08.3}", p.x, n + 1);
+    println("the first value is {x} and the second is {} at last",
+        scale(x, b: y, c: x * y + 1000000));
 }
 $ fmt --check

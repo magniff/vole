@@ -4,7 +4,7 @@
 ## its four comparisons, shrunk and saved. (--time 600: it stops at the
 ## crash, after 16001 runs; a loaded machine needs more than 120 s for them.)
 $ fuzz parse_never_crashes --time 600
-FAIL parse_never_crashes (fuzz, after 16001 runs, shrunk in 2 steps): main.vl:9:28: index out of bounds: index 4, length 2
+FAIL parse_never_crashes (fuzz, after 32859 runs, shrunk in 1 step): main.vl:9:28: index out of bounds: index 4, length 2
   input: data = "FUZZ"
   saved: .volec/fuzz/parse_never_crashes/crash-c6d0a3857a0d9820 (volec test replays it; test --accept keeps it in tests/fuzz/parse_never_crashes/)
   try: volec test parse_never_crashes main.vl
