@@ -2819,3 +2819,23 @@ chain-fresh 36 releases. compile-cost against v0.26.1: a hello world
 0.98x, std 1.03x, check of the compiler 1.01x.
 The bench (`gate.sh --only bench`, after the tag, the machine idle):
 the -O2 geomean 0.884 of `cc -O2`'s time, 0.26.1's 0.888; -O1 1.433.
+
+### 0.26.3
+
+The release gate (`gate.sh --release --no-linux`, 62:08 wall), macOS
+only, on the release commit. Every row passed but fuzz-sem: one of its
+300 programs (seed 82) panicked at -O0 in its own hash helper (`h * 31`
+over a long `Vec`), because 0.26.3 checks overflow at -O0 and the
+generator's model wraps. With semfuzz compiling at every level with
+`--overflow-checks=off`, as tests/fuzz does, the row passed alone, 300
+programs, 0 failing. (The quick gates before it found the threads list
+missing the intern fix's statics, fuzz-seed's shifts against the seed's
+rule, semfuzz on 0.26.2's language, and a struct literal's call argument
+checked without its parameter's type; all fixed.) The suite 4673 at
+-O0, -O1 and -O2 (69 XFAIL; SKIPPED: no spirv-val), threads 8866,
+incremental 172 series, objcheck 5836 (and 256 for x86_64-macos),
+compiler-memcheck 727, examples-checkalloc 180, every other fuzz and ABI
+row, stress-grow, cachediff 1446 lines (425 from the cache),
+unsafe-audit 3329 unjustified (baseline 3425) and 0 in std,
+chain-diverse, chain-fresh 37 releases. compile-cost against v0.26.2: a
+hello world 1.03x, std 1.05x, check of the compiler 1.02x.
