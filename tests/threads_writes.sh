@@ -67,6 +67,7 @@ middle::ipo::MALLOC_SYM	made by prepare_tasks
 middle::ipo::CALLOC_SYM	made by prepare_tasks
 middle::ipo::FREE_SYM	made by prepare_tasks
 gen0::target::RT_PANIC_SYM	made by prepare_tasks
+gen0::target::RT_NOTE_SYM	made by prepare_tasks
 front::effects::builtin::TABLE	filled by prepare_tasks (c_class)
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 middle::egraph::P_KIND	the rules, parsed by prepare_tasks (init_rules)
@@ -164,7 +165,8 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # covers it (key: in the entry's key; read: recorded, cc_note; IR: in
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
-READ='base::timer::TIME_INSTRUCTIONS	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
+READ='base::SYMS_FROZEN	own: set by pool_run around every phase, the same in every task (no new symbol)
+base::timer::TIME_INSTRUCTIONS	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
 base::timer::PERF_FD	off: the same; opened by counters_open on the main thread before the tasks, read-only after
 base::timer::COUNTERS_OFF	off: the same (counters_open)
 middle::vectorize::VEC_STATS_FN	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
@@ -293,6 +295,7 @@ front::types::VARIANTS	key: types_hash
 gen0::gen::MAIN_SYM	IR: a symbol by its text
 gen0::target::LINK_NAMES	IR: fn_canon
 gen0::target::RT_PANIC_SYM	IR: a symbol by its text
+gen0::target::RT_NOTE_SYM	IR: a symbol by its text
 gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
 middle::copies::MOVE_COPIES	IR: FN_MOVES
 middle::egraph::EGRAPH	key: options_hash
