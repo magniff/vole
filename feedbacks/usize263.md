@@ -67,3 +67,10 @@ made on the checked AST by where each cast's value goes first:
    by span.
 3. [query] `query grep` without `--in` prints per-file counts when piped,
    not hits. A `--list` with every hit would have saved the per-file loop.
+4. [fix, tests] A new `--only` mode breaks three transcripts. alloc016,
+   fixes and std015 pin all of fix.usage's line, which lists every mode,
+   and tests/guide's `help-fix` holds `fix --help` to 15 lines. Both
+   surfaced only in the -O0 plan after the merge (they were re-recorded
+   at 6430082d, and the help went back to 15 lines in this branch's last
+   commit). Either the transcripts pin less of the line, or the fix's
+   `guide how` says to run those four checks when adding a mode.
