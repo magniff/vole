@@ -2,7 +2,7 @@
 
 One complete program, written the way vole code is written: modules
 and `use`, enums with data and `match`, `Result` and `?`, `Vec`,
-`HashMap`, `Buf`, text as `[u8]`, a sort closure, f-strings, the
+`HashMap`, `Buf`, text as `[u8]`, a sort closure, format strings, the
 allocator passed down from `main`, and a test case. A program of this
 kind needs only what it shows: copy its patterns.
 
@@ -78,7 +78,7 @@ pub enum Error {
     Short([u8], i64),
 }
 
-// What `{e}` in an f-string prints.
+// What `{e}` in a format string prints.
 impl Display for Error {
     fn fmt(self, f: inout Fmt) {
         match self {

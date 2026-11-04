@@ -37,10 +37,12 @@ Rust's std::fmt, byte for byte (`guide formatting#the-spec`).
 - `panic("bad {x}")` formats into 256 bytes on the stack (a piece that
   does not fit is left out), so a `#[no_alloc]` function may panic with
   one.
-- f-strings, `f"{p.x + 1}"`, the form before 0.26.2, are still read (a
-  hole holds any expression); `volec fix --only fstring` rewrites them as
-  format strings, once (it also doubles the braces of a plain literal
-  that 0.26.1 printed as it is).
+- f-strings, `f"{p.x + 1}"` (0.15 to 0.26.2), are removed: error
+  `syntax.fstring` (0.26.3), once per file. `volec fix --only fstring
+  --keep-braces FILE` rewrites them as format strings, once: a name hole
+  stays, an expression becomes `{}` and an argument. (Without
+  `--keep-braces` it also doubles the braces of a plain literal, for
+  code from before 0.26.2, which printed them as they are.)
 
 ### The spec
 
@@ -160,7 +162,7 @@ trait Debug { fn fmt_debug(self, f: inout Fmt); }
 
 Write `impl Display for T` (no derive: the text is yours) with the
 methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
-(any Display value, an f-string too), `f.display(x)`, `f.debug(x)`.
+(any Display value, `format_args(..)` too), `f.display(x)`, `f.debug(x)`.
 `self` is read (let), `f` is changed (inout); there is no result to
 return. Display is in std for the numbers, `[u8]` and the
 error enums; Debug for those (a `[u8]` quoted and
