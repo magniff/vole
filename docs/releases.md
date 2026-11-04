@@ -98,6 +98,18 @@ The statics into context structs, phases 4-6 (statics265):
   group without the statics that make a refused function, or one outside
   the prefixes, take the context, in rounds (`--prune crate`: refusals
   only): what 0.26.4's phase 3 did in up to 80 runs by hand.
+- compiler/src, phase 4: 772 statics of base, front, places, the tools,
+  guide and cli are fields of `base::ctx::Ctx<Comp>` (base/ctx.vl), made
+  once per process by `main` and passed as `pcx` to 3,441 functions (2,153
+  inout), from `tools/statics/p4-ctx.group`; the tool added the 437 use
+  lines and deleted the declarations, and ten arguments after the context
+  were taken into lets by hand. Left for phase 5: the 70 tables code
+  generation's tasks read (the AST, types, functions, symbols, buffers,
+  files), which need the tasks' let view. Before it, six front tables
+  became `Vec`s (`refactor table`) and 154 unsafe blocks went. Statics in
+  compiler/src: 1,234 to 451; unjustified unsafe 3,217 to 3,063. `check`
+  of compiler/src: 1.03x 0.26.4's; with one compiler, checking the source
+  itself costs 11% more (the own pass +29%, over the `&pcx` arguments).
 
 ### What's new in 0.26.4
 
