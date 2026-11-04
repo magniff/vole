@@ -105,6 +105,32 @@ The compiler on Rust's overflow checks (wrap264):
   the static `WGSL_ARENA`, until the statics work moves them into
   context structs.
 
+The raw-pointer parameters (rawptr264):
+
+- `volec fix --only rawptr` (`explain fix.rawptr`) decides each `p: *T`
+  and `p: sink *T` parameter of a program's own safe functions by what
+  its function does with it, over the whole program: one only read or
+  written through becomes `p: inout T` (a let `p: T` when T is small or
+  owned: a let parameter copies a larger plain value and reads it as a
+  snapshot), its calls give `&x`, a parameter passed on `&p`, a raw
+  pointer `&*q` (in a new unsafe block, with its comments, outside
+  unsafe code), and `*p` becomes `p`. A pointer used as one (stored,
+  returned, cast, compared, indexed, assigned, captured, given null or a
+  C string, passed on to a parameter used as an address) stays `*T`, and
+  so does one given to a call nested in the arguments of another call
+  that takes the same place (`f(&cx, g(&cx))`: two inout accesses would
+  be own.conflict). `--only rawptr-list` is the dry run, each parameter
+  with its class and reason. A second run changes nothing.
+- compiler/src on it: of its 2,583 `*T` parameters, 1,416 are `inout T`
+  now (1,399 of them `FnCtx`: 580 only read, 731 written, 105 given a
+  raw pointer by a thread or task root), 1,139 stay raw (813 C strings,
+  141 nested calls, 211 indexed) and 28 cannot change (unsafe fns,
+  receivers, `**T`). 104 unsafe blocks left with nothing unsafe are
+  gone: unjustified unsafe sites 3,329 to 3,224 (docs/unsafe-baseline.md).
+- The own pass memoizes, per function, whether a type holds an inout
+  access (kinds::holds_inout walked every field of an inout context at
+  every call): `check` of compiler/src 0.95x 0.26.3's.
+
 ### What's new in 0.26.3
 
 Allocation as a capability; compiler/src on 0.26.2's language (format
