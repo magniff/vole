@@ -103,7 +103,7 @@ note fix.buf-table: Buf's methods, as String<A> (text) and Vec<u8, A> (bytes); '
   as_slice -> as_slice | as_slice
   as_mut_slice -> - | as_mut_slice
   clear -> clear | clear
-  free -> clear | free
+  free -> free | free
   take -> - | take
   capacity -> capacity | capacity
   reserve -> reserve | reserve
@@ -129,7 +129,7 @@ note fix.buf-table: Buf's methods, as String<A> (text) and Vec<u8, A> (bytes); '
   as_slice -> as_slice | as_slice
   as_mut_slice -> - | as_mut_slice
   clear -> clear | clear
-  free -> clear | free
+  free -> free | free
   take -> - | take
   capacity -> capacity | capacity
   reserve -> reserve | reserve

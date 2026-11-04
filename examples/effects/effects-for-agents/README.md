@@ -33,7 +33,7 @@ ok: built render-checked
 Nothing is left allocated: every value is dropped at the end of its
 scope (0.16's version of this program leaked nine blocks here). They are
 made at five lines of `markup.vl`: the lines' `Vec` (line 11), each
-heading's id (25), the headings' `Vec` (59), and the HTML's `Buf`, grown
+heading's id (25), the headings' `Vec` (59), and the HTML's `Vec<u8, Gpa>`, grown
 at lines 49 and 105, which `render` returns and `main` drops after
 printing it. One arena can hold all of them, emptied at once.
 
@@ -59,22 +59,24 @@ $ volec query refs Gpa --in crate::markup
 # markup.vl
 10:26	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8], Gpa> {
 10:44	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8], Gpa> {
-16:27	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf<Gpa> {
-16:39	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf<Gpa> {
-36:38	type	markup::inline	fn inline(text: [u8], out: inout Buf<Gpa>) {
+16:27	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
+16:43	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
+17:24	type	markup::slug	var id = Vec::<u8, Gpa>::new_in(gpa);
+36:42	type	markup::inline	fn inline(text: [u8], out: inout Vec<u8, Gpa>) {
 55:30	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
 55:50	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
 55:56	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
 56:25	type	markup::headings	var hs: Vec<Heading<Gpa>, Gpa> = Vec::new_in(gpa);
 56:31	type	markup::headings	var hs: Vec<Heading<Gpa>, Gpa> = Vec::new_in(gpa);
-66:31	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf<Gpa> {
-66:43	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf<Gpa> {
+66:31	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
+66:47	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Vec<u8, Gpa> {
+67:25	type	markup::render	var out = Vec::<u8, Gpa>::new_in(gpa);
 $ volec query effects markup::inline --why 'alloc(Gpa)' | head -2
 crate::markup::inline	alloc(Gpa) panic
-  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 grows a Buf<Gpa>
+  'out.extend_from_slice(if code { "</code>" } ..' at markup.vl:41:13 grows a Vec<u8, Gpa>
 ```
 
-`inline` appends to a `Buf` it is given, and a `Buf` grows with the
+`inline` appends to a `Vec<u8, Gpa>` it is given, and a Vec grows with the
 allocator it holds: the `out` that `render` made on `gpa`. `--why`
 follows the chain from a function to the line that has the effect; the
 first step is the one in the function asked about.
@@ -96,18 +98,15 @@ $ cat > steps.txt <<'EOF'
 $ volec refactor --script steps.txt --dry-run | grep ': error'
 main.vl:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
 markup.vl:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
-markup.vl:31:5: error[type error] expected 'Buf<Gpa>', got 'Buf<Arena>'  [edited: crate::markup::slug]
+markup.vl:17:37: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::slug]
 markup.vl:56:50: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.vl:75:25: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:90:28: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:100:23: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:107:5: error[type error] expected 'Buf<Gpa>', got 'Buf<Arena>'  [edited: crate::markup::render]
-warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: markup.vl:11:25: expected 'Gpa', got 'Arena'
+markup.vl:67:38: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::render]
+warning edit.breaks: 5 new errors (4 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: markup.vl:11:25: expected 'Gpa', got 'Arena'
 ```
 
 The errors are the rest of the plan: the types that name `Gpa`
 (`Vec<[u8], Gpa>` from `split_in` on an `Arena` is `Vec<[u8], Arena>`;
-`Buf<Gpa>` is `Buf<Arena>`, `Heading<Gpa>` is `Heading<Arena>`),
+`Vec<u8, Gpa>` is `Vec<u8, Arena>`, `Heading<Gpa>` is `Heading<Arena>`),
 `inline`'s `out`, and the call in `main`, which must now pass an
 arena. The script grows to cover them,
 and renames the parameters to say what they are:
@@ -118,11 +117,11 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::slug --type gpa Arena
 > refactor signature markup::headings --type gpa Arena
 > refactor signature markup::render --type gpa Arena
-> refactor signature markup::inline --type out 'inout Buf<Arena>'
+> refactor signature markup::inline --type out 'inout Vec<u8, Arena>'
 > edit patch markup::lines --old '-> Vec<[u8], Gpa>' --new '-> Vec<[u8], Arena>'
-> edit patch markup::slug --old '-> Buf<Gpa>' --new '-> Buf<Arena>'
+> edit patch markup::slug --old '-> Vec<u8, Gpa>' --new '-> Vec<u8, Arena>' --old 'Vec::<u8, Gpa>::new_in' --new 'Vec::<u8, Arena>::new_in'
 > edit patch markup::headings --old 'Vec<Heading<Gpa>, Gpa>' --new 'Vec<Heading<Arena>, Arena>' --all
-> edit patch markup::render --old '-> Buf<Gpa>' --new '-> Buf<Arena>'
+> edit patch markup::render --old '-> Vec<u8, Gpa>' --new '-> Vec<u8, Arena>' --old 'Vec::<u8, Gpa>::new_in' --new 'Vec::<u8, Arena>::new_in'
 > refactor signature markup::lines --rename-param gpa arena
 > refactor signature markup::slug --rename-param gpa arena
 > refactor signature markup::headings --rename-param gpa arena
@@ -137,7 +136,7 @@ $ cat > steps.txt <<'EOF'
 >     // is freed at once, before the next one.
 >     var arena = Arena::new_in(gpa);
 >     for doc in docs {
->         // (the rendered Buf is a temporary: dropped at the end of the
+>         // (the rendered Vec is a temporary: dropped at the end of the
 >         // statement, before the reset)
 >         print(markup::render(doc, arena).as_slice());
 >         // (unsafe: every view into the arena is dead from here)
@@ -153,11 +152,11 @@ changed parameter gpa to Arena in crate::markup::lines	markup.vl	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::slug	markup.vl	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::headings	markup.vl	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::render	markup.vl	+1 -1 lines
-changed parameter out to inout Buf<Arena> in crate::markup::inline	markup.vl	+1 -1 lines
+changed parameter out to inout Vec<u8, Arena> in crate::markup::inline	markup.vl	+1 -1 lines
 patched crate::markup::lines	markup.vl	+1 -1 lines
-patched crate::markup::slug	markup.vl	+1 -1 lines
+patched crate::markup::slug	markup.vl	+2 -2 lines
 patched crate::markup::headings	markup.vl	+2 -2 lines
-patched crate::markup::render	markup.vl	+1 -1 lines
+patched crate::markup::render	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::lines	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::slug	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::headings	markup.vl	+3 -3 lines
