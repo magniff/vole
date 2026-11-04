@@ -12,7 +12,7 @@ usages and formats, limits and contracts): a render pipeline
 use std::gpu;
 use std::gpu::{BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureUsage};
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let code = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vs(uint v [[vertex_id]]) { float2 p[3] = { float2(-1, -1), float2(3, -1), float2(-1, 3) }; return float4(p[v], 0, 1); }\nfragment float4 fs() { return float4(1, 0.5, 0, 1); }\n";
@@ -70,7 +70,7 @@ embed wgsl QUAD {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(QUAD.src)?;
@@ -173,7 +173,7 @@ const H: i64 = 8;
 
 // Pixels (x0, y0)-(x1, y1) showing atlas texels (u0, v0)-(u1, v1) (in
 // 0..1) in colour c: two triangles of x, y, r, g, b, a, u, v.
-fn quad(vs: inout Vec<f32>, x0: f64, y0: f64, x1: f64, y1: f64, uv: [f64; 4], c: [f32; 4]) {
+fn quad(vs: inout Vec<f32, Gpa>, x0: f64, y0: f64, x1: f64, y1: f64, uv: [f64; 4], c: [f32; 4]) {
     let (l, r) = (2.0 * x0 / W as f64 - 1.0, 2.0 * x1 / W as f64 - 1.0);
     let (t, b) = (1.0 - 2.0 * y0 / H as f64, 1.0 - 2.0 * y1 / H as f64);
     let corners = [
@@ -193,7 +193,7 @@ fn text_width(s: [u8]) -> f64 {
 }
 
 // One quad a glyph from (x, y), the top left; its cell from the byte.
-fn text(vs: inout Vec<f32>, x: f64, y: f64, s: [u8], c: [f32; 4]) {
+fn text(vs: inout Vec<f32, Gpa>, x: f64, y: f64, s: [u8], c: [f32; 4]) {
     var cx = x;
     for ch in s {
         let u = if ch == 'H' { 4.0 } else { 8.0 }; // a real font: a table of cells
@@ -202,7 +202,7 @@ fn text(vs: inout Vec<f32>, x: f64, y: f64, s: [u8], c: [f32; 4]) {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let target = dev.texture(W, H, Format::Rgba8Unorm,
@@ -223,7 +223,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     desc.vertex_buffer(layout);
     desc.blend(Blend::alpha()); // source over what is there
     let pipe = dev.render_pipeline(desc)?;
-    var texels: Vec<u8> = Vec::new_in(gpa);
+    var texels: Vec<u8, Gpa> = Vec::new_in(gpa);
     for r in 0..5 {
         for ch in ART[r].as_bytes() {
             texels.push(if ch == '#' { 255 } else { 0 });
@@ -236,7 +236,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         [gpu::bind_texture(0, atlas.view()), gpu::bind_sampler(1, sampler)][..]);
 
     // the draw list: a half-dark box, then "HI" measured and centred in it
-    var verts: Vec<f32> = Vec::new_in(gpa);
+    var verts: Vec<f32, Gpa> = Vec::new_in(gpa);
     let white = [0.5 / AW, 0.5 / AH, 0.5 / AW, 0.5 / AH];
     quad(&verts, 1.0, 1.0, 10.0, 8.0, white, [0.0, 0.0, 0.0, 0.5]);
     let label = "HI";
@@ -315,7 +315,7 @@ embed wgsl GBUFFER {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(GBUFFER.src)?;
@@ -378,7 +378,7 @@ embed wgsl SHADOW {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(SHADOW.src)?;

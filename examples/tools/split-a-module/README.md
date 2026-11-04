@@ -109,15 +109,15 @@ the parts other names, in the plan's order; `prices_discounts` becomes
 
 ```console
 $ volec refactor split shop --auto --max-lines 170 --names commands,carts,receipts,pricing
-split crate::shop into 4 modules	6 files	+329 -302 lines
+split crate::shop into 4 modules	6 files	+325 -302 lines
 $ volec query stats
 96	4	shop/commands.vl
 92	11	shop/carts.vl
-88	10	shop/mod.vl
-75	6	shop/receipts.vl
+86	10	shop/mod.vl
+73	6	shop/receipts.vl
 54	6	shop/pricing.vl
-33	1	main.vl
-438	38	total
+31	1	main.vl
+432	38	total
 $ volec lint --max-lines 170 && echo every file fits
 every file fits
 ```
@@ -141,16 +141,16 @@ $ volec query items shop
 6	mod	pub mod carts
 7	mod	pub mod receipts
 8	mod	mod pricing
-16	struct	pub struct Product
-24	struct	pub struct Store
-30	fn	pub fn new_store(gpa: Gpa) -> Store
-34	fn	pub fn add_product(st: inout Store, sku: i64, name: [u8], price: i64, stock: i64)
-39	fn	pub fn find_sku(st: Store, sku: i64) -> Option<i64>
-43	fn	pub fn product(st: Store, sku: i64) -> Option<Product>
-50	fn	pub fn in_stock(st: Store, sku: i64) -> i64
-58	fn	pub fn restock(st: inout Store, sku: i64, n: i64) -> bool
-69	fn	fn take_stock(st: inout Store, sku: i64, n: i64) -> i64
-81	fn	pub fn print_stock(st: Store, gpa: Gpa)
+14	struct	pub struct Product
+22	struct	pub struct Store<A: Allocator>
+28	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
+32	fn	pub fn add_product(st: inout Store<Gpa>, sku: i64, name: [u8], price: i64, stock: i64)
+37	fn	pub fn find_sku(st: Store<Gpa>, sku: i64) -> Option<i64>
+41	fn	pub fn product(st: Store<Gpa>, sku: i64) -> Option<Product>
+48	fn	pub fn in_stock(st: Store<Gpa>, sku: i64) -> i64
+56	fn	pub fn restock(st: inout Store<Gpa>, sku: i64, n: i64) -> bool
+67	fn	fn take_stock(st: inout Store<Gpa>, sku: i64, n: i64) -> i64
+79	fn	pub fn print_stock(st: Store<Gpa>, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.vl` imports from where
@@ -159,12 +159,12 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index 9c9753d..f3e61fc 100644
+index e5a0161..ecc6b62 100644
 --- a/main.vl
 +++ b/main.vl
-@@ -4,7 +4,10 @@ mod shop;
+@@ -2,7 +2,10 @@
  
- use std::Buf;
+ mod shop;
  
 -use shop::{Store, add_product, money, new_cart, new_store, run};
 +use shop::{Store, add_product, new_store};
@@ -173,7 +173,7 @@ index 9c9753d..f3e61fc 100644
 +use shop::receipts::money;
  
  fn main(gpa: Gpa) -> i32 {
-     var st: Store = new_store(gpa);
+     var st: Store<Gpa> = new_store(gpa);
 ```
 
 (`--reexport` does the opposite: it leaves the code outside as it is,
@@ -194,7 +194,7 @@ The split was one edit: one `undo` puts `shop.vl` back whole.
 
 ```console
 $ volec undo
-undid split crate::shop into 4 modules	6 files	+329 -302 lines
+undid split crate::shop into 4 modules	6 files	+325 -302 lines
 $ ls *.vl
 main.vl
 shop.vl

@@ -45,13 +45,13 @@ fn main(gpa: Gpa) {
     var a = Acc { n: 0, sum: 0 };
     add(&a, 4);
     add(&a, 6);
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(3);
     v.push(1);
     sort_by(v.as_mut_slice(), |x: i64, y: i64| x - y);
     let k = Key { k: 1 };
     let j = Key { k: 2 };
-    println(f"{mean(a)} {v[0]} {k < j} {first_byte(c"hi")}");
+    println("{} {} {} {}", mean(a), v[0], k < j, first_byte(c"hi"));
 }
 $ main.vl -o prog
 ok: built prog

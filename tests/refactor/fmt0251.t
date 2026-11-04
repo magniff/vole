@@ -40,7 +40,7 @@ fn main(gpa: Gpa) {
     };
     var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     xs.push(one.0 + r + w + v[0]);
-    print(f"{t.1} ");
+    print("{} ", t.1);
     println(xs.len());
 }
 % cat shapes/mod.vl

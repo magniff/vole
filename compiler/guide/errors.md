@@ -25,10 +25,10 @@ error (short form, without the position), and the fix.
 ## Rust habits
 
 ```vole
-let s: String = String::new();
+let s: String<Gpa> = String::new();
 ```
 ```err
-error[type error] allocation is explicit: pass an allocator (try: String::new_in(gpa)) | help: this function's `gpa` is the allocator to pass
+error[alloc.no_in] 'String::new' allocates from nothing: pass the allocator, last, to 'String::new_in' | help: this function's `gpa` is the allocator to pass
 ```
 `String` and `str` are std's (0.20, `guide text`); what allocates
 takes an allocator: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`.
@@ -63,7 +63,7 @@ query items TYPE`, which lists them all.
 
 `fn count(s: str)` takes a `str` (0.20: Rust's `&str` is `str`, as
 `&[T]` is `[T]`), and a literal, a `str` or a String goes there. A
-parameter is read-only by default (let: `s: str`, `v: Vec<i64>`,
+parameter is read-only by default (let: `s: str`, `v: Vec<i64, Gpa>`,
 nothing to write); `x: inout T` may change the caller's value, called
 with `&x`; `x: sink T` takes it. `*T` is the raw pointer.
 
@@ -346,11 +346,11 @@ error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fi
 ## Slices, Vec, std
 
 ```vole
-var m: HashMap<i64, i64> = HashMap::new_in(gpa);
+var m: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
 let a = m[0];
 ```
 ```err
-error[type error] cannot index type 'HashMap<i64, i64>'
+error[type error] cannot index type 'HashMap<i64, i64, Gpa>'
 ```
 `m.get(0)` (an Option), `m.insert(0, x)`. A `Vec` and a `Buf` index as
 their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
@@ -372,7 +372,7 @@ A misspelt method, field or item gets the nearest name of its kind:
 fn main(gpa: Gpa) -> i32 { var b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
-error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'?
+error[type error] no method 'push_string' on type 'Buf<Gpa>' | help: did you mean 'push_str'?
 ```
 
 An array, a Vec or a Buf goes where a slice of its elements does:
@@ -551,13 +551,14 @@ f.write("P({})", self.x); } }`), or print with `{p:?}` and
 fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 
 ```vole
-fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
+fn main() -> i32 { let x = 1; println(f"x = {x + 1}"); 0 }
 ```
 ```err
-f-strings cannot be nested
+f-strings are removed (0.26.3)
 ```
-Compute the inner one in a `let` first. A `:` outside brackets ends a
-hole (the spec follows): parenthesize, `{(|x: i64| x + 1)(n)}`.
+`volec fix --only fstring --keep-braces FILE` rewrites them: a name
+stays in its hole, an expression becomes `{}` and an argument,
+`println("x = {}", x + 1)`.
 
 ## Generics and traits
 
@@ -637,7 +638,7 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Vec<u8>)
 ```
 std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `volec
@@ -689,16 +690,17 @@ main.vl`, wraps every such place; the check hook prints it once at the
 head of its report, with how many errors it answers.
 
 ```vole
-fn helper() -> i64 { let v: Vec<i64> = Vec::new(); v.len() }
+fn helper() -> i64 { let v: Vec<i64, Gpa> = Vec::new(); v.len() as i64 }
 fn main() -> i32 { helper() as i32 }
 ```
 ```err
 add the parameter `gpa: Gpa` to 'helper' and pass it down
 ```
-Allocation is explicit (0.16): the help says where the allocator comes
-from here (this function's `gpa`, main's parameter, or one to add), and
-the `try:`, `volec fix --only alloc016 main.vl`, threads main's
-`gpa` down to every such call.
+Allocation is explicit (0.16; `alloc.no_in` since 0.26.3): the help
+says where the allocator comes from here (this function's `gpa`, main's
+parameter, or one to add). `volec fix --only alloc` writes the call
+when one allocator is in scope; here there is none, and the parameter
+is yours to add (`volec refactor signature`).
 
 ```vole
 struct P { x: i64 }
@@ -750,7 +752,7 @@ fn first(p: *i64) -> i64 { p[1] }
 error[unsafe] indexing a raw pointer is unsafe
 ```
 A pointer is one value; for many, take a slice `[i64]`. A Vec, Buf or
-slice parameter (`v: Vec<i64>`, `v: inout Vec<i64>`) indexes its
+slice parameter (`v: Vec<i64, Gpa>`, `v: inout Vec<i64, Gpa>`) indexes its
 elements, checked and safe; through a `*T` it needs `unsafe`. To write
 one number for the caller, take `out: inout i64` and write `out = acc`.
 
@@ -814,12 +816,12 @@ error[conv.marker_extra] '&' marks an argument the callee may change; 'v' is tak
 stays the caller's.
 
 ```vole
-fn fill(v: Vec<i64>) { v.push(1); }
+fn fill(v: Vec<i64, Gpa>) { v.push(1); }
 ```
 ```err
 error[own.readonly] writes through 'v'
 ```
-A let parameter is read-only: take it `v: inout Vec<i64>` and call
+A let parameter is read-only: take it `v: inout Vec<i64, Gpa>` and call
 `fill(&v)` (the `try:`, `volec refactor signature fill --convention
 v inout`, changes both); a slice to sort in place is `s: inout [T]`,
 passed as `&v` or `&a[..]`.
@@ -838,14 +840,14 @@ errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
 self`, `static var N`.
 
 ```vole
-fn keep(v: sink Vec<i64>) -> usize { v.len() }
-fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
+fn keep(v: sink Vec<i64, Gpa>) -> usize { v.len() }
+fn main(gpa: Gpa) -> i32 { let v: Vec<i64, Gpa> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
 ```err
 error[own.moved] 'v' is used here after it moved into 'keep(sink v)'
 ```
 A `sink` parameter takes the value; the caller's `v` is dead after the
-call. When `keep` only reads, make it let (`v: Vec<i64>`: nothing
+call. When `keep` only reads, make it let (`v: Vec<i64, Gpa>`: nothing
 moves; `refactor signature keep --convention v let`); else pass
 `keep(v.clone())` or use `v` before. An owned value also moves with
 `let w = v;`, `return v` and into a struct literal.
@@ -856,11 +858,11 @@ each in full, `volec query own FILE:LINE:COL` the state of every
 local there.
 
 ```vole
-struct T { keys: Vec<i64> }
-impl T { fn rehash(inout self) { var old = self.keys; old.push(1); } }
+struct T<A: Allocator> { keys: Vec<i64, A> }
+impl T<Gpa> { fn rehash(inout self) { var old = self.keys; old.push(1); } }
 ```
 ```err
-error[own.move_out] cannot move 'self.keys' (Vec<i64>) out of a reference
+error[own.move_out] cannot move 'self.keys' (Vec<i64, Gpa>) out of a reference
 ```
 `var old = self.keys.take();` leaves an empty Vec on the same allocator
 (`std::take(&x)` for a `Default` value, `std::replace(&x, v)`); `let

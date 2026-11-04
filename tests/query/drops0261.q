@@ -5,20 +5,20 @@
 ## line outside every body, a line past the file's end.
 $ drops main.vl:22
 drops0261/main.vl:22 in pick
-  31:13  drop(_12) [kept]  t: D
-  34:5  drop(_12) [kept]  t: D
-  35:33  drop(_20) [open]  a temporary (35:18): (D, D)
-  35:33  drop(_20.1) [kept]  a temporary (35:18): D
-  35:33  drop(_21) [removed]  a temporary (35:22): D
-  37:1  drop(_22) [kept]  x: D
-  37:1  drop(_5) [kept]  all: Vec<D>
-  37:1  drop(_4) [removed]  b: D
-  37:1  drop(_3) [flag _26]  a: D
+  31:13  drop(_12) [kept]  t: D<Gpa>
+  34:5  drop(_12) [kept]  t: D<Gpa>
+  35:33  drop(_20) [open]  a temporary (35:18): (D<Gpa>, D<Gpa>)
+  35:33  drop(_20.1) [kept]  a temporary (35:18): D<Gpa>
+  35:33  drop(_21) [removed]  a temporary (35:22): D<Gpa>
+  37:1  drop(_22) [kept]  x: D<Gpa>
+  37:1  drop(_5) [kept]  all: Vec<D<Gpa>, Gpa>
+  37:1  drop(_4) [removed]  b: D<Gpa>
+  37:1  drop(_3) [flag _26]  a: D<Gpa>
 $ drops main.vl:18 main.vl:12
 drops0261/main.vl:18 in keep
-  19:1  drop(_2) [removed]  d: D
+  19:1  drop(_2) [removed]  d: D<Gpa>
 drops0261/main.vl:12 in mk
-  15:1  drop(_3) [removed]  v: Vec<i64>
+  15:1  drop(_3) [removed]  v: Vec<i64, Gpa>
 $ drops main.vl:3
 error query.no-match: main.vl:3 is in no function with a body in the places IR (a generic one never instantiated, C's, or one with errors)
 try: volec query show main.vl:3

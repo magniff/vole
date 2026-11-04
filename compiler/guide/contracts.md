@@ -8,9 +8,9 @@ release switch; `debug` clauses are the ones only test builds check.
 ## requires and ensures
 
 ```vole
-struct Stack { items: Vec<i64> }
+struct Stack<A: Allocator> { items: Vec<i64, A> }
 
-impl Stack {
+impl Stack<Gpa> {
     fn top(self, i: i64) -> i64
         requires 0 <= i && i < self.items.len() as i64 else "no item {i}"
         ensures result == self.items.get(i as usize)
@@ -46,9 +46,9 @@ main.vl:22:19: pop on an empty stack: self.items.len() = 0
   returned; `old(e)` is e evaluated at entry.
 - A failure reads `requires failed: 'COND' of 'f' (FILE:L:C): x = 4, ...`
   (the integer operands' values; a float's in millionths, `d = 707106e-6`,
-  0.25.2.1). `else "text"` (or an f-string,
-  evaluated only on failure) replaces all before the values. The
-  f-string's holes are integers, three at most (`contract.message`): a
+  0.25.2.1). `else "text"` (a format string,
+  `else "bad {x}"`, evaluated only on failure) replaces all before the
+  values. Its holes are integers, three at most (`contract.message`): a
   float or text shows as an operand of the condition instead.
 - `debug requires` / `debug ensures` are checked only by `volec test`
   (and `--debug-contracts`): for conditions that cost more than the

@@ -43,7 +43,7 @@ the chapter shows each rule, and the error you get when you break it.
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..=100 {
         v.push(i);
     }
@@ -56,7 +56,7 @@ fn main(gpa: Gpa) {
     });
     println("started a thread");
     let total = h.join();
-    println(f"the thread says: {total}");
+    println("the thread says: {total}");
 }
 ```
 
@@ -82,13 +82,13 @@ because the data they view stays behind:
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..10 {
         v.push(i);
     }
     let xs = v.as_slice();
     let h = thread::spawn(sink || xs.len());
-    println(f"{h.join()}");
+    println("{}", h.join());
 }
 ```
 
@@ -114,7 +114,7 @@ fn main() {
         let i = 3;
         v[i]
     });
-    println(f"{h.join()}");
+    println("{}", h.join());
     println("not reached");
 }
 ```
@@ -147,7 +147,7 @@ fn sum(xs: [i64]) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..1000000 {
         v.push(i % 1000);
     }
@@ -159,12 +159,12 @@ fn main(gpa: Gpa) {
         let b = s.spawn(|| sum(xs[half..]));
         a.join() + b.join()
     });
-    println(f"two threads: {total}");
+    println("two threads: {total}");
 
     let n = thread::available_parallelism() as usize;
     let chunk = (xs.len() + n - 1) / n;
     let total = thread::scope(|s| {
-        var handles: Vec<ScopedJoinHandle<i64>> = Vec::new_in(gpa);
+        var handles: Vec<ScopedJoinHandle<i64>, Gpa> = Vec::new_in(gpa);
         for k in 0..n {
             let lo = k * chunk;
             let hi = if lo + chunk < xs.len() { lo + chunk } else { xs.len() };
@@ -176,7 +176,7 @@ fn main(gpa: Gpa) {
         }
         t
     });
-    println(f"one thread per core: {total}");
+    println("one thread per core: {total}");
 }
 ```
 
@@ -225,7 +225,7 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
@@ -248,7 +248,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes: {primes}");
+    println("primes: {primes}");
 }
 ```
 
@@ -297,7 +297,7 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
@@ -321,7 +321,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes (mutex): {primes.with(|n| n)}");
+    println("primes (mutex): {}", primes.with(|n| n));
 
     let count = AtomicI64::new(0);
     thread::scope(|s| {
@@ -340,7 +340,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes (atomic): {count.load(Ordering::Relaxed)}");
+    println("primes (atomic): {}", count.load(Ordering::Relaxed));
 }
 ```
 
@@ -418,8 +418,8 @@ fn hash(line: str) -> u64 {
 
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_buf(input).unwrap();
-    let all: Vec<str> = text.lines().collect_in(gpa);
+    let text = String::from_utf8(input).unwrap();
+    let all: Vec<str, Gpa> = text.lines().collect_in(gpa);
     let lines = all.as_slice();
     let workers: usize = 3;
 
@@ -436,7 +436,7 @@ fn main(gpa: Gpa) {
             });
         }
         drop(tx);
-        var got: Vec<(usize, u64)> = Vec::new_in(gpa);
+        var got: Vec<(usize, u64), Gpa> = Vec::new_in(gpa);
         for r in rx.iter() {
             got.push(r);
         }
@@ -444,7 +444,7 @@ fn main(gpa: Gpa) {
     });
     results.sort();
     for (i, h) in results {
-        println(f"{lines[i]:<8} {h:016x}");
+        println("{:<8} {h:016x}", lines[i]);
     }
 }
 ```
@@ -515,7 +515,7 @@ fn main() {
         0
     });
     bump();
-    println(f"{h.join()} {COUNT}");
+    println("{} {COUNT}", h.join());
 }
 ```
 
@@ -550,7 +550,7 @@ fn work() -> i64 {
 fn main() {
     let h = thread::spawn(sink || work());
     CALLS = 100;
-    println(f"the thread counted {h.join()}, main has {CALLS}");
+    println("the thread counted {}, main has {CALLS}", h.join());
 }
 ```
 
@@ -593,7 +593,7 @@ fn main() {
     var x = 5;
     let p: *i64 = &x;
     let h = thread::spawn(sink || unsafe { *p });
-    println(f"{h.join()}");
+    println("{}", h.join());
 }
 ```
 

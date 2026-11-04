@@ -10,7 +10,7 @@ more often than to something else, and each error names the fix.
 | Rust | vole |
 |---|---|
 | `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
-| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `std::Buf` for bytes, `format_in("..", args, gpa)` (a Buf) |
+| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `Vec<u8, A>` for bytes, `format_in("..", args, gpa)` (a `String<A>`, as `format!` makes) |
 | `&[u8]` | `[u8]`: bytes; `str::from_utf8(b)?` makes a `str` of them (checked); `"abc"` is a `[u8]` where no `str` goes |
 | `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
@@ -26,14 +26,14 @@ more often than to something else, and each error names the fix.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var b = Buf::new_in(gpa);                  // freed at the end of main
+    var b = String::new_in(gpa);               // freed at the end of main
     b.push_str("sum=");
     let parts = split_in("40,2", ',', gpa);
     var sum = 0;
     for p in parts.as_slice() {
         sum += parse_int(p).unwrap_or(0);
     }
-    b.push_int(sum);
+    b.push_fmt(sum);
     println(b.as_slice());
     if parse_int("4x").is_err() { println("not a number"); }
     0
@@ -70,7 +70,7 @@ value itself.
 | `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
 | lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
 | the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`volec explain own.conflict`) |
-| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, an index, or `malloc` in `unsafe` |
+| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T, A>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` |
 | `&mut v[i]`, `m.get_mut(&k)` | `&v[i]` to an inout parameter, `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
@@ -85,18 +85,18 @@ whole program). Pass a container to a function that changes it as
 one by value (the caller owns it):
 
 ```vole
-fn fill(v: inout Vec<i64>, n: i64) {     // v.push changes the caller's Vec
+fn fill(v: inout Vec<i64, Gpa>, n: i64) { // v.push changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
 
-fn sum(v: Vec<i64>) -> i64 {             // let: reads it in place
+fn sum(v: Vec<i64, Gpa>) -> i64 { // let: reads it in place
     var s = 0;
     for x in v { s += x; }
     s
 }
 
 fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     fill(&v, 4);
     inout r = &v;                        // an inout access in a local: passed on twice
     fill(&r, 1);
@@ -216,11 +216,11 @@ fn main() -> i32 {
 | `usize` for lengths and indices | the same (0.26.2: `v.len()`, `s.len()`, `s.len`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
-| overflow: panic in debug, wrap in release | always wraps (two's complement) |
-| `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
+| overflow: panic in debug, wrap in release | the same (0.26.3): checked at -O0, wrapping at -O1 and -O2, `--overflow-checks=on\|off`; `wrapping_*`, `checked_*`, `overflowing_*`, `saturating_*`, `Wrapping<T>` (`.value` for `.0`) |
+| `x / 0` panics | the same (0.26.3), and `MIN / -1`, at every level |
 | `!x` (bitwise not) | `~x` |
 | `f.sqrt()`, `f.sin()`, `f.powi(n)`, `f64::consts::PI`, `f64::EPSILON` | the same (0.25.2.1, `guide math`), in vole: no C, no `unsafe` |
-| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they wrap, as `*` does |
+| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they overflow as `*` does |
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
@@ -246,7 +246,7 @@ fn main() -> i32 {
 | `fn` inside a `fn` | items only at module level |
 | `macro_rules!`, `println!`, `vec!` | none: `println("{}", x)`, a format string (0.26.2) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
-| `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
+| `impl<T, A: Allocator> Trait for Vec<T, A>` | the same (one impl per trait and type) |
 | `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
 | `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |
 | `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |
@@ -266,7 +266,7 @@ fn main() -> i32 {
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
 | `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
-| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
+| `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Vec<u8, Gpa>, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 
 ## unsafe and C

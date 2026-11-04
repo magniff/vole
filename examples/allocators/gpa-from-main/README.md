@@ -94,14 +94,16 @@ parse_orders --why diverge` shows the chain.
 
 ## Forgetting the allocator
 
-A 0.15 program allocated without saying so. Here is one, using the old
-forms:
+A program written before 0.26.3 named no allocator in its types and
+called the forms that took one from nowhere. Here is one: `main` has
+the allocator and `shout` takes it, but the calls and the types do not
+say so:
 
 ```console
 $ cat > old.vl <<'EOF'
 > use std::Buf;
 >
-> fn shout(words: [[u8]]) -> Buf {
+> fn shout(words: [[u8]], gpa: Gpa) -> Buf {
 >     var b = Buf::new();
 >     for w in words {
 >         if b.len() > 0 {
@@ -113,44 +115,49 @@ $ cat > old.vl <<'EOF'
 >     b
 > }
 >
-> fn main() -> i32 {
+> fn main(gpa: Gpa) -> i32 {
 >     let words: Vec<[u8]> = std::split_whitespace("hello explicit allocation");
->     let b = shout(words.as_slice());
+>     let b = shout(words.as_slice(), gpa);
 >     println(b.as_slice());
 >     0
 > }
 > EOF
 $ volec check old.vl
-old.vl:4:13: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: volec fix --only alloc016 old.vl
-old.vl:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter | try: volec fix --only alloc016 old.vl
+old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:3:38: error[alloc.default] 'Buf' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:4:13: error[alloc.no_in] 'Buf::new' allocates from nothing: pass the allocator, last, to 'Buf::new_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:16:16: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
+old.vl:16:28: error[alloc.no_in] 'std::split_whitespace' allocates from nothing: pass the allocator, last, to 'std::split_whitespace_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc old.vl | try: volec fix --suggested old.vl
 [exit 1]
 ```
 
-Each old form is an error naming its `_in` form. `fix --only alloc016`
-makes the whole change: every call becomes its `_in` form, and `gpa:
-Gpa` is added to each function from `main` down to the calls, and passed
-at each call:
+A call that allocates from nothing is `alloc.no_in`, naming its `_in`
+form; a type that names no allocator is `alloc.default` (there is no
+default allocator type). `fix --only alloc` makes the whole change:
+every call becomes its `_in` form, passed the allocator in scope, and
+every type names it:
 
 ```console
-$ volec fix --only alloc016 --dry-run old.vl
+$ volec fix --only alloc --dry-run old.vl
 --- a/old.vl
 +++ b/old.vl
 @@ -3,2 +3,2 @@
--fn shout(words: [[u8]]) -> Buf {
+-fn shout(words: [[u8]], gpa: Gpa) -> Buf {
 -    var b = Buf::new();
-+fn shout(words: [[u8]], gpa: Gpa) -> Buf {
++fn shout(words: [[u8]], gpa: Gpa) -> Buf<Gpa> {
 +    var b = Buf::new_in(gpa);
-@@ -15,3 +15,3 @@
--fn main() -> i32 {
+@@ -16 +16 @@
 -    let words: Vec<[u8]> = std::split_whitespace("hello explicit allocation");
--    let b = shout(words.as_slice());
-+fn main(gpa: Gpa) -> i32 {
-+    let words: Vec<[u8]> = std::split_whitespace_in("hello explicit allocation", gpa);
-+    let b = shout(words.as_slice(), gpa);
-$ volec fix --only alloc016 old.vl
-fixed 2 allocations made explicit	old.vl	+5 -5 lines
++    let words: Vec<[u8], Gpa> = std::split_whitespace_in("hello explicit allocation", gpa);
+$ volec fix --only alloc old.vl
+fixed 4 suggested fixes	old.vl	+3 -3 lines
 $ volec old.vl -o old && ./old
 hello! explicit! allocation!
+old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built old
 ```
 
@@ -161,6 +168,9 @@ finds nothing left:
 ```console
 $ volec --check-alloc old.vl -o old && ./old
 hello! explicit! allocation!
+old.vl:1:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:3:38: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+old.vl:4:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built old
 ```
 
@@ -197,12 +207,12 @@ ok: built count
 ```
 
 Nor can a `Gpa` be made, or kept in a static: `Gpa`'s one field is
-private to std, so only std makes one (the one `main` gets), and no
-constant expression does.
+private to std, so only std makes one (the one `main` gets), and a
+static's type may hold no allocator (`alloc.static`).
 
 ```console
 $ cat > forge.vl <<'EOF'
-> static var CACHE: Vec<i64> = Vec::new_in(Gpa {});
+> static var CACHE: Vec<i64, Gpa> = Vec::new_in(Gpa {});
 >
 > fn main() -> i32 {
 >     let mine = Gpa {};
@@ -210,7 +220,8 @@ $ cat > forge.vl <<'EOF'
 > }
 > EOF
 $ volec check forge.vl
-forge.vl:1:42: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:1:1: error[alloc.static] the static 'CACHE' holds an allocator, 'Gpa' (in its type 'Vec<i64, Gpa>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)
+forge.vl:1:47: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 forge.vl:4:16: error[field.literal-private] cannot make a 'Gpa' here: its field '_private' is private to module 'std' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 [exit 1]
 ```
@@ -238,7 +249,7 @@ skipped: bob apples one 120
 ## Read more
 
 - `volec guide allocators`: the `_in` forms, containers and their
-  allocator, arenas, `--check-alloc`, `fix --only alloc016`.
+  allocator, arenas, `--check-alloc`, `fix --only alloc`.
 - `volec guide effects`: what `alloc(Gpa)`, `io`, `global`, `panic`,
   `diverge` mean, and how to promise them.
 - [arena-parser](../arena-parser/), [scoped-arena](../scoped-arena/) and

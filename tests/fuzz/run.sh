@@ -148,7 +148,10 @@ test_seed() {
             # alias checks; the own pass is not what they test, and they
             # hold no owned or reference values, so their code is the
             # default's)
-            "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir --values=off "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            # (0.26.3, decision 6: the programs' arithmetic wraps, at
+            # every level, with the overflow checks off; -O0 would check
+            # it. tests/run's ovf_ cases test the checks.)
+            "$COMPILER" --target "$TARGET" "-$level" --overflow-checks=off --deny-warnings --verify-ir --values=off "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }

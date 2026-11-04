@@ -80,7 +80,7 @@ a snapshot with `sink`.
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     var add = |x: i64| v.push(x);
     add(1);
     add(2);
@@ -122,7 +122,7 @@ skips that one. Called again after such a move, it stops the program
 fn call<F: FnMut() -> usize>(f: sink F) -> usize { f() }
 
 fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(4);
     let w = v.clone();
     let count = || w.len();            // an owned let: read through an access

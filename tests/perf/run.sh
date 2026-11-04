@@ -109,7 +109,7 @@ fn main() {
     for i in 0..1024 {
         idx[i] = (i * 7) & 1023;
     }
-    println(f"{kernels(&a, idx, &f)}");
+    println("{}", kernels(&a, idx, &f));
 }
 EOF
 cat >loops.want <<'EOF'

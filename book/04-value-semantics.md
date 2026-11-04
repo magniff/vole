@@ -49,7 +49,7 @@ fn main() {
     let a = 5;
     var b = a;
     b += 1;
-    println(f"{a} {b}");
+    println("{a} {b}");
 }
 ```
 
@@ -78,12 +78,12 @@ fn main(gpa: Gpa) {
     let first = Song { title: "Blue Moon", seconds: 185 };
     var edit = first;
     edit.seconds = 190;
-    println(f"{first.seconds} {edit.seconds}");
+    println("{} {}", first.seconds, edit.seconds);
 
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(first);
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -112,11 +112,11 @@ with an owned value? Let's try:
 struct Song { title: str, seconds: i64 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let backup = list;
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{backup.len()} {list.len()}");
+    println("{} {}", backup.len(), list.len());
 }
 ```
 
@@ -148,11 +148,11 @@ that changes line 6 to `let backup = list.clone();`.
 struct Song { title: str, seconds: i64 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let backup = list.clone();
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{backup.len()} {list.len()}");
+    println("{} {}", backup.len(), list.len());
 }
 ```
 
@@ -182,7 +182,7 @@ struct Noisy { id: i64 }
 
 impl Drop for Noisy {
     fn drop(inout self) {
-        println(f"dropping {self.id}");
+        println("dropping {}", self.id);
     }
 }
 
@@ -191,11 +191,11 @@ fn main() {
     let b = Noisy { id: 2 };
     {
         let c = Noisy { id: 3 };
-        println(f"the inner block ends ({c.id})");
+        println("the inner block ends ({})", c.id);
     }
     let d = Noisy { id: 4 };
     drop(d);
-    println(f"main ends ({a.id} {b.id})");
+    println("main ends ({} {})", a.id, b.id);
 }
 ```
 
@@ -234,7 +234,7 @@ reads it:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn total_seconds(list: Vec<Song>) -> i64 {
+fn total_seconds(list: Vec<Song, Gpa>) -> i64 {
     var total = 0;
     for s in list {
         total += s.seconds;
@@ -243,11 +243,11 @@ fn total_seconds(list: Vec<Song>) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     list.push(Song { title: "Summertime", seconds: 210 });
-    println(f"{total_seconds(list)} seconds");
-    println(f"{list.len()} songs, still here");
+    println("{} seconds", total_seconds(list));
+    println("{} songs, still here", list.len());
 }
 ```
 
@@ -279,22 +279,22 @@ a first try at a function that adds a song:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add(list: Vec<Song>, song: Song) {
+fn add(list: Vec<Song, Gpa>, song: Song) {
     list.push(song);
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     add(list, Song { title: "Blue Moon", seconds: 185 });
-    println(f"{list.len()}");
+    println("{}", list.len());
 }
 ```
 
 ```err
-error[own.readonly]: writes through 'list', a 'let Vec<Song>', which is read-only (let: read-only)
+error[own.readonly]: writes through 'list', a 'let Vec<Song, Gpa>', which is read-only (let: read-only)
  --> playlist.vl: line 4, column 5
   = help: take it inout ('x: inout T', called with '&x') to change it
-  = try: volec refactor signature add --type list 'inout Vec<Song>'
+  = try: volec refactor signature add --type list 'inout Vec<Song, Gpa>'
 ```
 
 The help says how to fix it, and that's the next convention.
@@ -304,15 +304,15 @@ The help says how to fix it, and that's the next convention.
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add(list: inout Vec<Song>, song: Song) {
+fn add(list: inout Vec<Song, Gpa>, song: Song) {
     list.push(song);
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     add(&list, Song { title: "Blue Moon", seconds: 185 });
     add(&list, Song { title: "Summertime", seconds: 210 });
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -340,7 +340,7 @@ fn main() {
     var plays = 0;
     bump(&plays);
     bump(&plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -360,7 +360,7 @@ fn bump(count: inout i64) {
 fn main() {
     let plays = 0;
     bump(&plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -382,7 +382,7 @@ fn bump(count: inout i64) {
 fn main() {
     var plays = 0;
     bump(plays);
-    println(f"{plays}");
+    println("{plays}");
 }
 ```
 
@@ -399,7 +399,7 @@ Or put one where the function only reads:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn total_seconds(list: Vec<Song>) -> i64 {
+fn total_seconds(list: Vec<Song, Gpa>) -> i64 {
     var total = 0;
     for s in list {
         total += s.seconds;
@@ -408,15 +408,15 @@ fn total_seconds(list: Vec<Song>) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
-    println(f"{total_seconds(&list)}");
+    println("{}", total_seconds(&list));
 }
 ```
 
 ```err
 error[conv.marker_extra]: '&' marks an argument the callee may change; 'list' is taken let or sink here (read, or moved): pass 'list'
- --> playlist.vl: line 14, column 30
+ --> playlist.vl: line 14, column 33
   = try: volec edit patch playlist.vl:14 --old '&list' --new 'list'
   = try: volec fix --suggested playlist.vl
 ```
@@ -434,14 +434,14 @@ twice:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn append_all(to: inout Vec<Song>, from: inout Vec<Song>) {
+fn append_all(to: inout Vec<Song, Gpa>, from: inout Vec<Song, Gpa>) {
     while let Some(s) = from.pop() {
         to.push(s);
     }
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     append_all(&list, &list);
 }
@@ -474,17 +474,17 @@ done reading by then, is fine:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add_copies(list: inout Vec<Song>, n: usize) {
+fn add_copies(list: inout Vec<Song, Gpa>, n: usize) {
     for i in 0..n {
         list.push(Song { title: "Encore", seconds: 60 + i as i64 });
     }
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     add_copies(&list, list.len());
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -504,17 +504,17 @@ push onto the list while it reads the songs to add from that same list:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add_all(list: inout Vec<Song>, more: [Song]) {
+fn add_all(list: inout Vec<Song, Gpa>, more: [Song]) {
     for s in more {
         list.push(s);
     }
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     add_all(&list, list[..]);
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -546,7 +546,7 @@ fn main() {
     bump(&middle);
     bump(&middle);
     middle += 10;
-    println(f"{plays[1]}");
+    println("{}", plays[1]);
 }
 ```
 
@@ -567,16 +567,16 @@ playlists on a shelf:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn archive(shelf: inout Vec<Vec<Song>>, list: sink Vec<Song>) {
+fn archive(shelf: inout Vec<Vec<Song, Gpa>, Gpa>, list: sink Vec<Song, Gpa>) {
     shelf.push(list);
 }
 
 fn main(gpa: Gpa) {
-    var shelf: Vec<Vec<Song>> = Vec::new_in(gpa);
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var shelf: Vec<Vec<Song, Gpa>, Gpa> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     archive(&shelf, list);
-    println(f"{shelf.len()} playlist, {shelf[0].len()} song");
+    println("{} playlist, {} song", shelf.len(), shelf[0].len());
 }
 ```
 
@@ -602,16 +602,16 @@ encore to it, and hands it back:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn with_encore(list: sink Vec<Song>, encore: Song) -> Vec<Song> {
+fn with_encore(list: sink Vec<Song, Gpa>, encore: Song) -> Vec<Song, Gpa> {
     list.push(encore);
     list
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     let concert = with_encore(list, Song { title: "Summertime", seconds: 210 });
-    println(f"{concert.len()} songs");
+    println("{} songs", concert.len());
 }
 ```
 
@@ -644,10 +644,10 @@ convention too, written before `self`:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-struct Playlist { name: str, songs: Vec<Song> }
+struct Playlist<A: Allocator> { name: str, songs: Vec<Song, A> }
 
-impl Playlist {
-    fn new(name: str, gpa: Gpa) -> Playlist {
+impl Playlist<Gpa> {
+    fn new(name: str, gpa: Gpa) -> Playlist<Gpa> {
         Playlist { name: name, songs: Vec::new_in(gpa) }
     }
 
@@ -659,8 +659,8 @@ impl Playlist {
         self.songs.push(song);
     }
 
-    fn finish(sink self) -> Vec<Song> {
-        println(f"closing {self.name}");
+    fn finish(sink self) -> Vec<Song, Gpa> {
+        println("closing {}", self.name);
         self.songs
     }
 }
@@ -669,9 +669,9 @@ fn main(gpa: Gpa) {
     var mix = Playlist::new("Sunday", gpa);
     mix.add(Song { title: "Blue Moon", seconds: 185 });
     mix.add(Song { title: "Summertime", seconds: 210 });
-    println(f"{mix.name} has {mix.len()} songs");
+    println("{} has {} songs", mix.name, mix.len());
     let songs = mix.finish();
-    println(f"{songs.len()} songs kept");
+    println("{} songs kept", songs.len());
 }
 ```
 
@@ -705,8 +705,8 @@ end, because the value has a new owner.
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn sampler(gpa: Gpa) -> Vec<Song> {
-    var list: Vec<Song> = Vec::new_in(gpa);
+fn sampler(gpa: Gpa) -> Vec<Song, Gpa> {
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     list.push(Song { title: "Summertime", seconds: 210 });
     list
@@ -714,7 +714,7 @@ fn sampler(gpa: Gpa) -> Vec<Song> {
 
 fn main(gpa: Gpa) {
     let list = sampler(gpa);
-    println(f"{list.len()} songs");
+    println("{} songs", list.len());
 }
 ```
 
@@ -738,17 +738,17 @@ gives you the first two songs of a playlist, without copying them:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn opening(list: Vec<Song>) -> [Song] {
+fn opening(list: Vec<Song, Gpa>) -> [Song] {
     list[0..2]
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     list.push(Song { title: "Blue Moon", seconds: 185 });
     list.push(Song { title: "Summertime", seconds: 210 });
     list.push(Song { title: "Cheek to Cheek", seconds: 300 });
     let start = opening(list);
-    println(f"{start.len()} songs, starting with {start[0].title}");
+    println("{} songs, starting with {}", start.len(), start[0].title);
 }
 ```
 
@@ -789,16 +789,16 @@ In vole, it's a compile error:
 ```vole playlist.vl
 struct Song { title: str, seconds: i64 }
 
-fn add(list: inout Vec<Song>, song: Song) {
+fn add(list: inout Vec<Song, Gpa>, song: Song) {
     list.push(song);
 }
 
-fn opening(list: Vec<Song>) -> [Song] {
+fn opening(list: Vec<Song, Gpa>) -> [Song] {
     list[0..2]
 }
 
 fn main(gpa: Gpa) {
-    var list: Vec<Song> = Vec::new_in(gpa);
+    var list: Vec<Song, Gpa> = Vec::new_in(gpa);
     add(&list, Song { title: "Blue Moon", seconds: 185 });
     add(&list, Song { title: "Summertime", seconds: 210 });
     let start = opening(list);
@@ -845,7 +845,7 @@ returns, and the view would point at nothing. The fix is to return the
 owner instead, moving it out to the caller, as the help says:
 
 ```vole shout.vl
-fn shout(title: str, gpa: Gpa) -> String {
+fn shout(title: str, gpa: Gpa) -> String<Gpa> {
     title.to_uppercase_in(gpa)
 }
 

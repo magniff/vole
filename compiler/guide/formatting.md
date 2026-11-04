@@ -7,7 +7,7 @@ family, and `#[derive]`.
 
 (0.26.2) Rust's `format!` family without the `!`: a plain literal that is
 the first argument of `print`, `println`, `eprint`, `eprintln` (stderr),
-`format_in(.., gpa)` (a new `Buf`, the allocator last), `format_args`,
+`format_in(.., gpa)` (a new `String<A>` on allocator `gpa`, the allocator last), `format_args`,
 `b.push_fmt(..)` (appends to a `Buf` or a `String`), `f.write(..)`
 (inside a Display impl), `panic`, `assert`'s message or a contract's
 `else` is a format string, its arguments after it:
@@ -37,10 +37,12 @@ Rust's std::fmt, byte for byte (`guide formatting#the-spec`).
 - `panic("bad {x}")` formats into 256 bytes on the stack (a piece that
   does not fit is left out), so a `#[no_alloc]` function may panic with
   one.
-- f-strings, `f"{p.x + 1}"`, the form before 0.26.2, are still read (a
-  hole holds any expression); `volec fix --only fstring` rewrites them as
-  format strings, once (it also doubles the braces of a plain literal
-  that 0.26.1 printed as it is).
+- f-strings, `f"{p.x + 1}"` (0.15 to 0.26.2), are removed: error
+  `syntax.fstring` (0.26.3), once per file. `volec fix --only fstring
+  --keep-braces FILE` rewrites them as format strings, once: a name hole
+  stays, an expression becomes `{}` and an argument. (Without
+  `--keep-braces` it also doubles the braces of a plain literal, for
+  code from before 0.26.2, which printed them as they are.)
 
 ### The spec
 
@@ -76,7 +78,7 @@ fn main(gpa: Gpa) -> i32 {
     println("{name} has {n} and {x}");
     println("[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
     println("[{name:>9}] [{x:.3}] [{:c}] {{braces}} {}", 'A', n * 2 + 1);
-    let s = format_in("{n}-{}", n + 1, gpa); // a Buf, dropped at the end
+    let s = format_in("{n}-{}", n + 1, gpa); // a String, dropped at the end
     eprintln("to stderr: {}", s.as_slice());
     0
 }
@@ -160,11 +162,11 @@ trait Debug { fn fmt_debug(self, f: inout Fmt); }
 
 Write `impl Display for T` (no derive: the text is yours) with the
 methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
-(any Display value, an f-string too), `f.display(x)`, `f.debug(x)`.
+(any Display value, `format_args(..)` too), `f.display(x)`, `f.debug(x)`.
 `self` is read (let), `f` is changed (inout); there is no result to
 return. Display is in std for the numbers, `[u8]` and the
 error enums; Debug for those (a `[u8]` quoted and
-escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
+escaped: `"a\n"`), `Vec<T, A>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `Some(5)`, `{1: 2}`). `{s:?}` of a slice `[T]` whose T has Debug
 writes it as a Vec's, `[1, 2]` (0.25.3); the slice has no Debug impl of
 its own (it would clash with `[u8]`'s), so a Debug impl writes one with
@@ -190,7 +192,7 @@ fn main(gpa: Gpa) -> i32 {
     println("{p} {q:?}");
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
     for s in shapes { println("{s:?}"); }
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     println("{v:?} {:?} {:?}", v.last(), "hi");
@@ -233,7 +235,7 @@ struct Key { group: i64, id: i64 }
 fn main(gpa: Gpa) -> i32 {
     var keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
     sort(&keys[..]);                         // by group, then id
-    var m: HashMap<Key, i64> = HashMap::new_in(gpa);
+    var m: HashMap<Key, i64, Gpa> = HashMap::new_in(gpa);
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
     println("{:?} {:?}", keys[0], m.get(wanted));

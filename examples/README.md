@@ -27,7 +27,7 @@ the topics).
 
 Allocation is explicit (0.16): a program that allocates takes the
 allocator as `fn main(gpa: Gpa)` and passes it on (`Vec::new_in(gpa)`,
-`format_in(f"...", gpa)`, `read_stdin_in(gpa)`); `volec guide
+`format_in("...", gpa)`, `read_stdin_in(gpa)`); `volec guide
 allocators` says why, and `volec fix --only alloc016` rewrites a 0.15
 program that way.
 

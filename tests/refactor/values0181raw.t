@@ -27,14 +27,16 @@ note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take 
 33:fn pair(a: *u8, b: *u8) -> [*u8; 2] { [a, b] }
 37:fn add(s: inout Stats, x: i64) { s.count += 1; s.sum += x; }
 38:fn mean(s: Stats) -> i64 { if s.count == 0 { 0 } else { s.sum / s.count } }
-39:fn npreds(v: *Vec<i64>) -> i64 { v.len() as i64 }
-40:fn show(t: [u8], gpa: Gpa) -> Buf {
-46:fn main(gpa: Gpa) {
-48:    add(&st, 4);
-49:    add(&st, 6);
+39:fn npreds(v: *Vec<i64, Gpa>) -> i64 { v.len() as i64 }
+41:fn show(t: [u8], gpa: Gpa) -> Buf<Gpa> {
+47:fn main(gpa: Gpa) {
+49:    add(&st, 4);
+50:    add(&st, 6);
 $ fix --only unsafe
 fixed 1 unsafe block	main.vl	+1 -1 lines
 $ main.vl -o prog
+main.vl:41:31: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:42:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built prog
 % ./prog
 true true 122 true true 5 1 <bc>

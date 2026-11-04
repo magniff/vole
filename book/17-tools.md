@@ -50,8 +50,8 @@ use std::fs;
 use std::io;
 
 fn run(gpa: Gpa) -> io::Result<()> {
-    let args: Vec<str> = env::args().collect_in(gpa);
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for path in args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&counts, text, gpa);
@@ -69,7 +69,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"wc: {e}");
+            eprintln("wc: {e}");
             1
         }
     }
@@ -103,7 +103,7 @@ fn trim_punct(word: str) -> str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -123,8 +123,9 @@ pub enum Order {
     Alphabetical,
 }
 
-pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+    String<Gpa>, i64), Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -137,13 +138,13 @@ pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Ve
 }
 
 // The most common first; words as common as each other, alphabetically.
-fn by_count(a: (String, i64), b: (String, i64)) -> i64 {
+fn by_count(a: (String<Gpa>, i64), b: (String<Gpa>, i64)) -> i64 {
     if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) }
 }
 
-pub fn print_table(rows: [(String, i64)]) {
+pub fn print_table(rows: [(String<Gpa>, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -175,9 +176,10 @@ it? `volec query context` answers all three at once:
 
 ```console
 $ volec query context report::top
-// crate::report::top	report.vl:9-20	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+// crate::report::top	report.vl:9-21	effects: alloc(Gpa) panic diverge
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+    String<Gpa>, i64), Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -189,9 +191,22 @@ pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Ve
     pairs
 }
 // calls (9)
-...
+<std::string::String as Clone>::clone	<std>:L:C	method	fn clone(self) -> String<A>
+crate::report::by_count	report.vl:24:4	fn	fn by_count(a: (String<Gpa>, i64), b: (String<Gpa>, i64)) -> i64
+std::Vec::sort_by	<std>:L:C	method	pub fn sort_by<F: FnMut(let T, let T) -> i64>(inout self, f: F)
+<std::string::String as Ord>::cmp	<std>:L:C	method	fn cmp(self, other: String<A>) -> i64
+std::collections::hash_map::HashMap::iter	<std>:L:C	method	pub fn iter(self) -> HashMapIter<K, V>
+<std::iter::HashMapIter as Iterator>::next	<std>:L:C	method	fn next(inout self) -> Option<(K, V)>
+std::Vec::truncate	<std>:L:C	method	pub fn truncate(inout self, n: usize)
+std::Vec::new_in	<std>:L:C	method	pub fn new_in(a: sink A) -> Vec<T, A>
+std::Vec::push	<std>:L:C	method	pub fn push(inout self, x: sink T)
 // types (6)
-...
+crate::report::Order	report.vl:4:10	enum	pub enum Order { ByCount, Alphabetical, }
+std::collections::hash_map::HashMap	<std>:L:C	struct	pub struct HashMap<K: Hash + Eq, V, A: Allocator> { table: RawTable<(K, V), A>, }
+std::Gpa	<std>:L:C	struct	pub struct Gpa { _private: () }
+std::string::String	<std>:L:C	struct	pub struct String<A: Allocator> { pub bytes: Vec<u8, A> }
+std::Option	<std>:L:C	enum	pub enum Option<T> { None, Some(T) }
+std::Vec	<std>:L:C	struct	pub struct Vec<T, A: Allocator> { ptr: *T, len: i64, cap: i64, alloc: A }
 // callers (1)
 run	main.vl:20:23	let top = report::top(counts, n, report::Order::ByCount, gpa);
 ```
@@ -234,9 +249,9 @@ of use and the function it's in:
 $ volec query refs Order
 # report.vl
 4:10	def	pub enum Order {
-9:59	type	report::top	pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
-15:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
-16:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
+9:69	type	report::top	pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+16:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
+17:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
 # main.vl
 20:46	type	run	let top = report::top(counts, n, report::Order::ByCount, gpa);
 $ volec query callers add_words
@@ -281,9 +296,9 @@ widen the table's count column. Suppose we misremember what the format
 says:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>4}' --new '{row.1:>6}'
-error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 29: println(f"{row.0:<12}{row.1:>5}");
-try: volec edit patch print_table --old '{row.1:>5}' --new '{row.1:>6}'
+$ volec edit patch print_table --old '{:>4}' --new '{:>6}'
+error patch.no-match: OLD 1 is not in crate::report::print_table; nearest, line 30: println("{:<12}{:>5}", row.0, row.1);
+try: volec edit patch print_table --old '{:>5}' --new '{:>6}'
 ```
 
 Nothing was changed. The problem is one line with a stable code
@@ -292,7 +307,7 @@ Nothing was changed. The problem is one line with a stable code
 vole tool reports a problem in this shape. Running the `try:` line:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>5}' --new '{row.1:>6}'
+$ volec edit patch print_table --old '{:>5}' --new '{:>6}'
 patched crate::report::print_table	report.vl	+1 -1 lines
 ```
 
@@ -308,11 +323,11 @@ error, it writes nothing. Let's try to print a variable that doesn't
 exist:
 
 ```console
-$ volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}'
-report.vl:29:42: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:29:42: undefined variable 'share'
+$ volec edit patch print_table --old '{:>6}' --new '{:>6} {share}'
+report.vl:30:31: error[type error] undefined variable 'share'  [edited: crate::report::print_table]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:30:31: undefined variable 'share'
 note edit.together: several steps are one call, checked at its end: `edit patch NAME --old A --new B --old C --new D` (`--in OTHER` before another item's pairs), `edit apply FILE`; or this step alone with --no-check
-try: volec edit patch print_table --old '{row.1:>6}' --new '{row.1:>6} {share}' --no-check
+try: volec edit patch print_table --old '{:>6}' --new '{:>6} {share}' --no-check
 ```
 
 The error says what would go wrong, tagged `[edited: ...]` to show it
@@ -345,7 +360,7 @@ $ volec refactor rename count::add_words count_words
 renamed crate::count::add_words to count_words	2 files	+2 -2 lines
 $ volec query refs count_words
 # count.vl
-27:8	def	pub fn count_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+27:8	def	pub fn count_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
 # main.vl
 14:16	call	run	count::count_words(&counts, text, gpa);
 ```
@@ -367,7 +382,7 @@ each of them:
 
 ```console
 $ volec refactor signature count::count_words --add 'min_len: usize = 1' --fill-calls
-added parameter min_len: usize to crate::count::count_words, 1 call	2 files	+2 -2 lines
+added parameter min_len: usize to crate::count::count_words, 1 call	2 files	+3 -2 lines
 $ volec query callers count_words
 # main.vl
 14:16	call	run	count::count_words(&counts, text, gpa, 1);
@@ -382,7 +397,7 @@ definition and at every call:
 
 ```console
 $ volec refactor signature count::count_words --reorder counts,text,min_len,gpa
-reordered the parameters of crate::count::count_words, 1 call	2 files	+2 -2 lines
+reordered the parameters of crate::count::count_words, 1 call	2 files	+3 -3 lines
 $ volec query callers count_words
 # main.vl
 14:16	call	run	count::count_words(&counts, text, 1, gpa);
@@ -397,9 +412,10 @@ same):
 $ volec edit patch count_words --old 'if w.is_empty() {' --new 'if w.len() < min_len {'
 patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
-// crate::count::count_words	count.vl:26-35	effects: alloc(Gpa) panic diverge
+// crate::count::count_words	count.vl:26-36	effects: alloc(Gpa) panic diverge
 // Adds the words of text to counts, lowercased.
-pub fn count_words(counts: inout HashMap<String, i64>, text: str, min_len: usize, gpa: Gpa) {
+pub fn count_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, min_len: usize,
+    gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.len() < min_len {
@@ -425,9 +441,10 @@ variant and an arm to each match, with the expression you give:
 $ volec refactor variant report::Order --add 'Longest' --arm 'pairs.sort_by(|a, b| b.0.len().cmp(a.0.len()))'
 added variant Longest to crate::report::Order, an arm in 1 match	report.vl	+2 -0 lines
 $ volec query show report::top
-// crate::report::top	report.vl:10-22	effects: alloc(Gpa) panic diverge
-pub fn top(counts: HashMap<String, i64>, n: usize, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+// crate::report::top	report.vl:10-23	effects: alloc(Gpa) panic diverge
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, order: Order, gpa: Gpa) -> Vec<(
+    String<Gpa>, i64), Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }

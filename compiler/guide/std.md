@@ -14,9 +14,9 @@ Vec::new_in(gpa) -> Vec<T>       var v: Vec<i64> = Vec::new_in(gpa);
 v.len() -> i64                   Vec, Buf, HashMap, slices
 v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
-Buf::new_in(gpa) -> Buf          text you build (there is no String)
+String::new_in(gpa) -> String   text you build (Buf: bytes)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
-read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
+read_stdin_in(gpa) -> Result<Vec<u8, Gpa>, IoError> all of stdin
 print(x), println(x)             any Display; println("{x} {:?}", v)
 b.push_int(v: i64)
 v.set(i: usize, x: T)            checked, as v[i] = x
@@ -37,7 +37,7 @@ parse_int(s: [u8]) -> Result<i64, ParseIntError>
 m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: usize, x: T)
 std::print_int(v: i64)           std::is_digit(b: u8) -> bool
 trim(s: [u8]) -> [u8]
-read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
+read_line(&s) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
 v.swap(i: usize, j: usize)       m.contains_key(k: K) -> bool
@@ -87,11 +87,11 @@ its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's,
 `Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
-- `Vec<T>`, `Buf` and `HashMap<K, V>` own their memory: `let w = v;`
-  moves it, `.clone()` copies. A function that reads one takes it let
-  (`v: Vec<T>`, called `f(v)`: borrowed, nothing moves), one that
-  changes it `v: inout Vec<T>` (called `f(&v)`), one that keeps it `v:
-  sink Vec<T>` (`f(v)` moves it).
+- `Vec<T, A>`, `Buf` and `HashMap<K, V, A>` own their memory: `let w = v;`
+  moves it, `.clone()` copies. A function that reads one takes it
+  let (`v: Vec<T, A>`, called `f(v)`: borrowed), one that changes it
+  `v: inout Vec<T, A>` (called `f(&v)`), one that keeps it `v: sink
+  Vec<T, A>` (`f(v)` moves it).
 - A slice from `as_slice()` views the container: the checker rejects its
   use after the next push, `free` or drop (`volec guide views`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
@@ -122,7 +122,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var counts: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     let words = ["a", "b", "a", "c", "a"];
     for w in words {
         counts.get_or_insert(w, 0)[0] += 1;
@@ -161,23 +161,23 @@ MinHeap: `volec guide --find dijkstra`.
 ## Input
 
 `read_line(&buf)` reads stdin a line at a time: the line goes into the
-`Buf` without its `'\n'`, and the result is `Ok(false)` at the end of
+`String` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
-`Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left
-(a `Result<Buf, IoError>`); the two share a buffer, so they mix, but not with
-C's `getchar` or `scanf`. A `Scanner` reads a text's tokens
+`Err(IoError::Read)`). `read_stdin_in(gpa)` returns the rest of stdin (a
+`Result<Vec<u8, Gpa>, IoError>`); the two share a buffer: they mix, but
+not with C's `getchar`. A `Scanner` reads a text's tokens
 (`next_token`; `next_int`, a `Result<i64, ScanError>`) and lines
 (`next_line`); `parse_int` (a `Result<i64, ParseIntError>`),
 `split_in`, `split_whitespace_in` and `trim` work on any `[u8]`. An Option
 means absence (the end, nothing found), a Result a failure: `.ok()`
 turns one into the other, `.unwrap_or(x)` gives a default. What they
-return are views of the text: keep the `Buf` until done with them. The
+return are views of the text: keep the line until done with them. The
 next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var line = Buf::new_in(gpa);
+    var line = String::new_in(gpa);
     read_line(&line).unwrap();            // the header: "n m"
     let header = split_whitespace_in(line.as_slice(), gpa);
     let n = parse_int(header.get(0)).unwrap();

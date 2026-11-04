@@ -37,16 +37,16 @@ cp -R "$ROOT/compiler/std" "$WORK/std"
 cat >>"$WORK/std/cli.vl" <<'EOF'
 
 // probes of tests/std/moves.sh
-fn zz_probe_keep(v: Vec<String>) -> String {
+fn zz_probe_keep(v: Vec<String<Gpa>, Gpa>) -> String<Gpa> {
     let x = v[0];
     x
 }
 
-fn zz_probe_some(v: Vec<String>) -> Option<String> {
+fn zz_probe_some(v: Vec<String<Gpa>, Gpa>) -> Option<String<Gpa>> {
     Some(v[0])
 }
 
-fn zz_probe_read(v: Vec<String>) -> usize {
+fn zz_probe_read(v: Vec<String<Gpa>, Gpa>) -> usize {
     let x = v[0];
     x.len()
 }
@@ -55,11 +55,11 @@ EOF
 cat >>"$WORK/std/collections/mod.vl" <<'EOF'
 
 // probes of tests/std/moves.sh
-fn zz_probe_bits(v: Vec<String>) -> Option<String> {
+fn zz_probe_bits(v: Vec<String<Gpa>, Gpa>) -> Option<String<Gpa>> {
     Some(v[0])
 }
 EOF
-printf 'fn main(gpa: Gpa) {\n    let v: Vec<i64> = Vec::new_in(gpa);\n}\n' >"$WORK/main.vl"
+printf 'fn main(gpa: Gpa) {\n    let v: Vec<i64, Gpa> = Vec::new_in(gpa);\n}\n' >"$WORK/main.vl"
 VOLE_OK=0 "$COMPILER" check --std-tree "$WORK/std" "$WORK/main.vl" >"$WORK/out" 2>&1
 sed -n 's|^.*/std/\([^:]*\):\([0-9]*\):[0-9]*: error\[\([^]]*\)\] \([^|]*\).*|\1:\2 \3 \4|p' \
     "$WORK/out" >"$WORK/errors"
@@ -76,8 +76,8 @@ want() { # <file> <line> <code> <words>: an error there, with those words
 }
 cli_keep=$(line cli.vl '    x')
 cli_some=$(line cli.vl '    Some(v\[0\])')
-want cli.vl "$cli_keep" own.move_out "cannot move 'x' (String) out of a reference"
-want cli.vl "$cli_some" own.move_out "cannot move 'v\[0\]' (String) out of an index"
+want cli.vl "$cli_keep" own.move_out "cannot move 'x' (String<Gpa>) out of a reference"
+want cli.vl "$cli_some" own.move_out "cannot move 'v\[0\]' (String<Gpa>) out of an index"
 # (nothing else: the read borrows, collections moves its bits, the rest of
 # std is clean)
 others=$(grep -v "^cli.vl:\($cli_keep\|$cli_some\) " "$WORK/errors")

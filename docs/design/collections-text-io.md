@@ -281,7 +281,7 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
 #### 2.5.4 Unicode properties, graphemes, display width (A5)
 
 - **Unicode version.** The newest Unicode release when A5 starts (17.0 or later). Its version and the SHA-256 of each UCD file it reads are pinned in tools/unicode/ucd.lock. `std::unicode::UNICODE_VERSION` names it.
-- **The generator is tools/unicode/gen.vl, a vole program.** It dogfoods the language and reads files through `import "stdio.h"` until A7's layer exists.
+- **The generator is tools/unicode/gen.vl, a vole program** (removed in 0.26.3, when it had not compiled since 0.20's spellings; v0.26.2 has it). It dogfoods the language and reads files through `import "stdio.h"` until A7's layer exists.
   - **Input:** UnicodeData.txt, DerivedCoreProperties.txt, PropList.txt, EastAsianWidth.txt, emoji-data.txt, GraphemeBreakProperty.txt, SpecialCasing.txt and CaseFolding.txt, downloaded into a cache outside the tree by tools/unicode/fetch.sh and checked against the lock.
   - **Output:** compiler/std/unicode/tables.vl, checked in and marked generated.
   - **Check:** `gen.vl --check` regenerates the tables and compares them, and the gate runs it when the cache is present.

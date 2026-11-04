@@ -4,7 +4,7 @@ Most programs spend their time on lists of things, tables of things,
 and text. This chapter covers the containers you'll use every day:
 `Vec`, a list that grows; `HashMap` and `HashSet`, for looking things up;
 and `BTreeMap`, when order matters. Then text: `str` and `String`, bytes,
-and f-strings in full.
+and format strings in full.
 
 By the end of the chapter you'll have written a word counter: it reads
 text, counts every word in it, and prints the most common ones as a
@@ -19,12 +19,12 @@ Start a new file, `scores.vl`:
 
 ```vole scores.vl
 fn main(gpa: Gpa) {
-    var scores: Vec<i64> = Vec::new_in(gpa);
+    var scores: Vec<i64, Gpa> = Vec::new_in(gpa);
     scores.push(72);
     scores.push(95);
     scores.push(88);
-    println(f"{scores.len()} scores, the first is {scores[0]}");
-    println(f"{scores:?}");
+    println("{} scores, the first is {}", scores.len(), scores[0]);
+    println("{scores:?}");
 }
 ```
 
@@ -53,15 +53,15 @@ an `Option`: `Some(value)`, or `None` when there was nothing to take.
 
 ```vole
 fn main(gpa: Gpa) {
-    var stack: Vec<str> = Vec::new_in(gpa);
+    var stack: Vec<str, Gpa> = Vec::new_in(gpa);
     stack.push("first");
     stack.push("second");
     stack.push("third");
-    println(f"{stack.last():?}");
+    println("{:?}", stack.last());
     while let Some(top) = stack.pop() {
         println(top);
     }
-    println(f"{stack.pop():?} {stack.is_empty()}");
+    println("{:?} {}", stack.pop(), stack.is_empty());
 }
 ```
 
@@ -82,14 +82,14 @@ What happens if you ask for an element that isn't there?
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
-    println(f"{v[3]}");
+    println("{}", v[3]);
 }
 ```
 
 ```out exit=101
-main.vl:4:16: index out of bounds: index 3, length 1
+main.vl:4:19: index out of bounds: index 3, length 1
 ```
 
 Every index is checked when the program runs. A bad one is a panic:
@@ -103,7 +103,7 @@ over the indexes, and assign through `v[i]`:
 
 ```vole
 fn main(gpa: Gpa) {
-    var prices: Vec<i64> = Vec::new_in(gpa);
+    var prices: Vec<i64, Gpa> = Vec::new_in(gpa);
     prices.push(10);
     prices.push(25);
     prices.push(40);
@@ -114,7 +114,7 @@ fn main(gpa: Gpa) {
     for p in prices {
         total += p;
     }
-    println(f"{prices:?} total {total}");
+    println("{prices:?} total {total}");
 }
 ```
 
@@ -130,21 +130,21 @@ them; the index loop is how you do it.
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for x in [31, 4, 15, 9, 26] {
         v.push(x);
     }
     v.sort();
-    println(f"{v:?} {v.contains(9)} {v.contains(10)}");
+    println("{v:?} {} {}", v.contains(9), v.contains(10));
     v.retain(|x| x % 2 == 1);
-    println(f"{v:?}");
+    println("{v:?}");
 
-    var fruit: Vec<str> = Vec::new_in(gpa);
+    var fruit: Vec<str, Gpa> = Vec::new_in(gpa);
     fruit.push("pear");
     fruit.push("fig");
     fruit.push("banana");
     fruit.sort_by_key(|s| s.len());
-    println(f"{fruit:?}");
+    println("{fruit:?}");
 }
 ```
 
@@ -170,13 +170,13 @@ copy of each element while we loop over it:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     for x in v {
         v.push(x);
     }
-    println(f"{v:?}");
+    println("{v:?}");
 }
 ```
 
@@ -196,14 +196,14 @@ elements that were there and stops:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     for i in 0..v.len() {
         let x = v[i];
         v.push(x);
     }
-    println(f"{v:?}");
+    println("{v:?}");
 }
 ```
 
@@ -218,7 +218,7 @@ A Vec is an owned value, so the conventions from
 it, or takes it, and its signature says which.
 
 ```vole
-fn total(v: Vec<i64>) -> i64 {
+fn total(v: Vec<i64, Gpa>) -> i64 {
     var t = 0;
     for x in v {
         t += x;
@@ -226,18 +226,18 @@ fn total(v: Vec<i64>) -> i64 {
     t
 }
 
-fn add_bonus(v: inout Vec<i64>, bonus: i64) {
+fn add_bonus(v: inout Vec<i64, Gpa>, bonus: i64) {
     for i in 0..v.len() {
         v[i] += bonus;
     }
 }
 
 fn main(gpa: Gpa) {
-    var points: Vec<i64> = Vec::new_in(gpa);
+    var points: Vec<i64, Gpa> = Vec::new_in(gpa);
     points.push(3);
     points.push(4);
     add_bonus(&points, 10);
-    println(f"{points:?} {total(points)}");
+    println("{points:?} {}", total(points));
 }
 ```
 
@@ -275,7 +275,7 @@ fn largest(xs: [i64]) -> i64 {
 
 fn main(gpa: Gpa) {
     let days: [i64; 4] = [12, 19, 7, 15];
-    var temps: Vec<i64> = Vec::new_in(gpa);
+    var temps: Vec<i64, Gpa> = Vec::new_in(gpa);
     temps.push(3);
     temps.push(-2);
     println(largest(days));
@@ -330,7 +330,7 @@ a `str` only where the code asks for one. With nothing to say which,
 ```vole
 fn main() {
     let line: str = "  hello  ";
-    println(f"[{line.trim()}]");
+    println("[{}]", line.trim());
 }
 ```
 
@@ -352,15 +352,15 @@ fn main() {
     let line: str = "  width = 80  ";
     let (key, value) = line.split_once('=').unwrap();
     let n = value.trim().parse::<i64>().unwrap();
-    println(f"[{key.trim()}] is {n}");
-    println(f"{line.find("80"):?} {line.contains("width")}");
-    println(f"{line.trim().starts_with("width")} {line.trim().strip_prefix("width"):?}");
+    println("[{}] is {n}", key.trim());
+    println("{:?} {}", line.find("80"), line.contains("width"));
+    println("{} {:?}", line.trim().starts_with("width"), line.trim().strip_prefix("width"));
     for part in "a,b,,c".split(',') {
-        print(f"[{part}]");
+        print("[{part}]");
     }
     println("");
     for word in "the quick\n  brown fox".split_whitespace() {
-        print(f"<{word}>");
+        print("<{word}>");
     }
     println("");
 }
@@ -399,11 +399,11 @@ fn main(gpa: Gpa) {
     var s = String::new_in(gpa);
     s.push_str("vole");
     s.push_str(" is ");
-    s.push_fmt(f"{2 + 2} letters");
+    s.push_fmt("{} letters", 2 + 2);
     println(s);
 
     let name = String::from_in("Ada", gpa);
-    println(f"{name} has {name.len()} letters");
+    println("{name} has {} letters", name.len());
 }
 ```
 
@@ -414,14 +414,14 @@ Ada has 3 letters
 
 `String::new_in(gpa)` makes an empty one, and `String::from_in("...",
 gpa)` one with some text already in it. `push_str` appends text, and
-`push_fmt` appends an f-string. A `String` has every method a `str` has
+`push_fmt` appends formatted text, a format string and its arguments. A `String` has every method a `str` has
 (`name.len()`, `name.trim()`).
 
 A function that only reads text takes a `str`, and you can give it a
 `String` or a literal:
 
 ```vole
-fn shout(s: str, gpa: Gpa) -> String {
+fn shout(s: str, gpa: Gpa) -> String<Gpa> {
     s.to_uppercase_in(gpa)
 }
 
@@ -455,10 +455,10 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[type error]: allocation is explicit: pass an allocator (try: to_uppercase_in(gpa))
+error[alloc.no_in]: 'to_uppercase' allocates from nothing: pass the allocator, last, to 'to_uppercase_in'
  --> main.vl: line 3, column 16
   = help: this function's `gpa` is the allocator to pass
-  = try: volec fix --only alloc016 main.vl
+  = try: volec fix --only alloc main.vl
   = try: volec fix --suggested main.vl
 ```
 
@@ -471,15 +471,15 @@ are `String`s, so looking one up needs a `String` too:
 
 ```vole
 fn main(gpa: Gpa) {
-    var ages: HashMap<String, i64> = HashMap::new_in(gpa);
+    var ages: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     ages.insert(String::from_in("ada", gpa), 36);
-    println(f"{ages.get("ada"):?}");
+    println("{:?}", ages.get("ada"));
 }
 ```
 
 ```err
-error[type error]: expected 'String', got '[u8]'
- --> main.vl: line 4, column 25
+error[type error]: expected 'String<Gpa>', got '[u8]'
+ --> main.vl: line 4, column 30
   = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)
   = try: String::from_in("ada", gpa)
 ```
@@ -500,16 +500,16 @@ the numbers Unicode gives each character:
 ```vole
 fn main(gpa: Gpa) {
     let word: str = "café";
-    println(f"{word.len()} bytes, {word.chars().count()} code points");
+    println("{} bytes, {} code points", word.len(), word.chars().count());
     for c in word.chars() {
-        print(f"{c} ");
+        print("{c} ");
     }
     println("");
     var s = String::new_in(gpa);
     s.push(0x263A);
-    println(f"{s} is {s.len()} bytes");
+    println("{s} is {} bytes", s.len());
     let b = 'c';
-    println(f"{b} {b:c} {word[0] == b}");
+    println("{b} {b:c} {}", word[0] == b);
 }
 ```
 
@@ -526,27 +526,27 @@ character in single quotes, `'c'`, is a byte (`u8`), and `{b:c}` prints
 a byte as the character it stands for. `word[0]` is the first byte of
 the text.
 
-## Bytes: [u8] and Buf
+## Bytes: [u8] and Vec<u8, A>
 
 Not all data is text. A file might be an image, and a network packet
-is just bytes. For those, vole has `[u8]`, a slice of bytes, and `Buf`,
-a growable buffer of them, the bytes' `String`:
+is just bytes. For those, vole has `[u8]`, a slice of bytes, and
+`Vec<u8, A>`, a growable buffer of them, the bytes' `String`:
 
 ```vole
 fn show(bytes: [u8]) {
     match str::from_utf8(bytes) {
-        Ok(text) => println(f"text: {text}"),
-        Err(e) => println(f"not text: {e}"),
+        Ok(text) => println("text: {text}"),
+        Err(e) => println("not text: {e}"),
     }
 }
 
 fn main(gpa: Gpa) {
-    var b = Buf::new_in(gpa);
-    b.push_str("hi");
+    var b: Vec<u8, Gpa> = Vec::new_in(gpa);
+    b.extend_from_slice("hi");
     b.push(0x21);
     show(b.as_slice());
 
-    var raw = Buf::new_in(gpa);
+    var raw: Vec<u8, Gpa> = Vec::new_in(gpa);
     raw.push(0xff);
     raw.push(0x41);
     show(raw.as_slice());
@@ -558,12 +558,12 @@ text: hi!
 not text: invalid utf-8 sequence of 1 bytes from index 0
 ```
 
-`b.as_slice()` is a view of the `Buf`'s bytes. `str::from_utf8` checks
+`b.as_slice()` is a view of the `Vec`'s bytes. `str::from_utf8` checks
 that bytes are valid UTF-8 and, if they are, gives you a `str` of the
 same bytes, without copying them. Bytes that aren't UTF-8 are an `Err`.
 
-Use `str` and `String` for text, and `[u8]` and `Buf` when the topic is
-bytes. A `str` goes where a `[u8]` is wanted for free; the other way
+Use `str` and `String` for text, and `[u8]` and `Vec<u8, A>` when the topic
+is bytes. A `str` goes where a `[u8]` is wanted for free; the other way
 round goes through `str::from_utf8`, because not every byte sequence is
 text.
 
@@ -580,7 +580,7 @@ fn main(gpa: Gpa) {
     for word in text.split_whitespace() {
         words += 1;
     }
-    println(f"{text.lines().count()} lines, {words} words, {text.len()} bytes");
+    println("{} lines, {words} words, {} bytes", text.lines().count(), text.len());
 }
 ```
 
@@ -613,13 +613,13 @@ key quickly, however many there are:
 
 ```vole
 fn main(gpa: Gpa) {
-    var ages: HashMap<str, i64> = HashMap::new_in(gpa);
+    var ages: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     ages.insert("ada", 36);
     ages.insert("alan", 41);
     let old = ages.insert("ada", 37);
-    println(f"{old:?} {ages.get("ada"):?} {ages.get("bob"):?}");
-    println(f"{ages.contains_key("alan")} {ages.len()}");
-    println(f"{ages.remove("alan"):?} {ages.len()}");
+    println("{old:?} {:?} {:?}", ages.get("ada"), ages.get("bob"));
+    println("{} {}", ages.contains_key("alan"), ages.len());
+    println("{:?} {}", ages.remove("alan"), ages.len());
 }
 ```
 
@@ -641,11 +641,11 @@ of its own:
 
 ```vole
 fn main(gpa: Gpa) {
-    var counts: HashMap<str, i64> = HashMap::new_in(gpa);
+    var counts: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     for w in "a b a c a b".split(' ') {
         counts.get_or_insert(w, 0)[0] += 1;
     }
-    println(f"{counts.get("a"):?} {counts.get("b"):?} {counts.get("z"):?}");
+    println("{:?} {:?} {:?}", counts.get("a"), counts.get("b"), counts.get("z"));
 }
 ```
 
@@ -671,7 +671,7 @@ You can loop over a map's pairs, but in no particular order:
 
 ```vole skip
     for (word, n) in counts.iter() {
-        println(f"{word} {n}");
+        println("{word} {n}");
     }
 ```
 
@@ -697,19 +697,19 @@ use std::BTreeMap;
 use std::HashSet;
 
 fn main(gpa: Gpa) {
-    var seen: HashSet<i64> = HashSet::new_in(gpa);
-    println(f"{seen.insert(3)} {seen.insert(3)} {seen.contains(3)}");
+    var seen: HashSet<i64, Gpa> = HashSet::new_in(gpa);
+    println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(3));
 
-    var grades: BTreeMap<i64, str> = BTreeMap::new_in(gpa);
+    var grades: BTreeMap<i64, str, Gpa> = BTreeMap::new_in(gpa);
     grades.insert(90, "A");
     grades.insert(70, "C");
     grades.insert(80, "B");
     for (score, grade) in grades.iter() {
-        print(f"{score}:{grade} ");
+        print("{score}:{grade} ");
     }
     println("");
     for (score, grade) in grades.range(75, 95) {
-        print(f"{score}:{grade} ");
+        print("{score}:{grade} ");
     }
     println("");
 }
@@ -759,8 +759,8 @@ fn trim_punct(word: str) -> str {
     word[start..end]
 }
 
-fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+fn count_words(text: str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -776,7 +776,7 @@ fn main(gpa: Gpa) {
     let text = str::from_utf8(input.as_slice()).unwrap();
     let counts = count_words(text, gpa);
     let the = String::from_in("the", gpa);
-    println(f"{counts.len()} different words, 'the' {counts.get(the):?} times");
+    println("{} different words, 'the' {:?} times", counts.len(), counts.get(the));
 }
 ```
 
@@ -799,21 +799,24 @@ the map is `HashMap<String, i64>` and not `HashMap<str, i64>`: a
 lowercased word is new text, not a view of the input. The map takes
 the `String`, and drops it with the map at the end of the program.
 
-## Formatting with f-strings
+## Formatting with format strings
 
-The last step is printing a table, so let's look at f-strings in full.
-After the expression in a hole, a colon starts a *format spec*:
+The last step is printing a table, so let's look at format strings in
+full. A hole is `{name}`, a variable's value, or `{}`, the next argument
+after the string; an expression is always an argument (`{}` and then
+`n * 2`), never inside the braces. After the name, or right after `{`, a
+colon starts a *format spec*:
 
 ```vole
 fn main() {
     let n = 42;
     let pi = 3.14159;
     let word: str = "vole";
-    println(f"[{n:>6}] [{n:<6}] [{n:06}]");
-    println(f"[{n:x}] [{n:X}] [{n:b}]");
-    println(f"[{pi:.2}] [{pi:8.3}]");
-    println(f"[{word:>8}] [{word:<8}] [{word:?}]");
-    println(f"{{n}} is {n}, and twice that is {n * 2}");
+    println("[{n:>6}] [{n:<6}] [{n:06}]");
+    println("[{n:x}] [{n:X}] [{n:b}]");
+    println("[{pi:.2}] [{pi:8.3}]");
+    println("[{word:>8}] [{word:<8}] [{word:?}]");
+    println("{{n}} is {n}, and twice that is {}", n * 2);
 }
 ```
 
@@ -844,15 +847,15 @@ one to a user. For your own types, `#[derive(Debug)]` writes the Debug
 form for you (chapter 5), and chapter 9 shows how to write a Display
 form.
 
-An f-string can also become text you keep, instead of being printed:
+Formatted text can also become text you keep, instead of being printed:
 
 ```vole
 fn main(gpa: Gpa) {
-    let label = to_string_in(f"{3}-{"vole"}", gpa);
-    println(f"{label} has {label.len()} bytes");
+    let label = to_string_in(format_args("{}-{}", 3, "vole"), gpa);
+    println("{label} has {} bytes", label.len());
     var report = String::new_in(gpa);
     for i in 1..4 {
-        report.push_fmt(f"{i * i} ");
+        report.push_fmt("{} ", i * i);
     }
     println(report.trim());
 }
@@ -863,8 +866,8 @@ fn main(gpa: Gpa) {
 1 4 9
 ```
 
-`to_string_in(f"...", gpa)` makes a `String`; `push_fmt` appends to one
-you have. (`format_in(f"...", gpa)` does the same into a `Buf`.)
+`to_string_in(format_args("..."), gpa)` makes a `String`; `push_fmt` appends to one
+you have. (`format_in("...", gpa)` does the same into a `Buf`.)
 
 ## The word counter
 
@@ -898,8 +901,8 @@ fn trim_punct(word: str) -> str {
     word[start..end]
 }
 
-fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+fn count_words(text: str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -912,8 +915,8 @@ fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
 
 // The pairs, most common first; words with the same count in
 // alphabetical order.
-fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
-    var rows: Vec<(String, i64)> = Vec::new_in(gpa);
+fn sorted_counts(counts: HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+    var rows: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, n) in counts.iter() {
         rows.push((word.clone(), n));
     }
@@ -921,12 +924,12 @@ fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
     rows
 }
 
-fn print_table(rows: [(String, i64)], top: usize) {
+fn print_table(rows: [(String<Gpa>, i64)], top: usize) {
     let shown = if rows.len() < top { rows.len() } else { top };
-    println(f"{"word":<12} {"count":>5}");
-    println(f"{"----":<12} {"-----":>5}");
+    println("{:<12} {:>5}", "word", "count");
+    println("{:<12} {:>5}", "----", "-----");
     for (word, n) in rows[0..shown] {
-        println(f"{word:<12} {n:>5}");
+        println("{word:<12} {n:>5}");
     }
 }
 
@@ -936,7 +939,7 @@ fn main(gpa: Gpa) {
     let counts = count_words(text, gpa);
     let rows = sorted_counts(counts, gpa);
     print_table(rows, 5);
-    println(f"{counts.len()} different words");
+    println("{} different words", counts.len());
 }
 ```
 
@@ -1003,7 +1006,7 @@ volec words.vl -o words
   `str` where a `str` goes. View methods (`trim`, `split`, `lines`) copy
   nothing; methods that make text take an allocator and end in `_in`.
 - `[u8]` and `Buf` hold bytes; `str::from_utf8` checks them into text.
-- f-string specs: width and alignment, zero padding, precision, hex,
+- format specs: width and alignment, zero padding, precision, hex,
   Debug.
 
 The word counter called `gpa` a lot. The next chapter is about where

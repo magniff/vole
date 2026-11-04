@@ -50,23 +50,24 @@ use crate::front::types::{
     REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_compound,
     is_integer, is_void, type_elem, variant_field,
 };
+use crate::middle::opt::OVERFLOW_CHECKS;
 use crate::places::front::{
-    ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_param_count, fn_ret, static_ty,
-    struct_field_name, type_glue, variant_discr,
+    ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_module, fn_param_count, fn_ret,
+    static_ty, struct_field_name, type_glue, variant_discr,
 };
 use crate::places::ir::{
     AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
     BK_SHARED, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GE, BO_GT, BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR,
-    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, B_PARAMS, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC,
-    IK_VECTOR, LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST,
-    OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST,
-    PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_OPS, P_STMTS, RV_AGG,
-    RV_BINARY, RV_CAST, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT,
-    SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN,
-    TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT, block_count, block_len, block_start,
-    body_begin, emit, enter_block, has_flag, is_union_type, local_count, new_block, new_local, op_a,
-    op_b, op_kind, ops_mark, proj, proj_kind, proj_parent, proj_val, push_op, reachable,
-    struct_closure, terminate, undistinct,
+    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, B_FN, B_PARAMS, DS_UNDECIDED, IK_ARCH, IK_CONTRACT,
+    IK_PANIC, IK_VECTOR, LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER,
+    OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT,
+    PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_OPS, P_STMTS,
+    RV_AGG, RV_BINARY, RV_CAST, RV_CHECKED, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY,
+    RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION,
+    TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT, block_count,
+    block_len, block_start, body_begin, emit, enter_block, has_flag, is_union_type, local_count,
+    new_block, new_local, op_a, op_b, op_kind, ops_mark, proj, proj_kind, proj_parent, proj_val,
+    push_op, reachable, struct_closure, terminate, undistinct,
 };
 
 // ---- State ----
@@ -973,7 +974,10 @@ fn lower_unary(e: i64, dl: i64, dp: i64) {
     let at = ops_mark();
     push_now();
     let uo = if op == Tok::Minus { UO_NEG } else if op == Tok::Bang { UO_NOT } else { UO_BITNOT };
-    emit(SK_ASSIGN, dl, dp, RV_UNARY, uo, e, at, 1, e);
+    // (0.26.3) a checked negation, but of a literal (`-128i8`, `-5`)
+    let checked = uo == UO_NEG && checks_here() && is_integer(ty)
+        && NODES[NODES[e].b].kind != NodeKind::Int;
+    emit(SK_ASSIGN, dl, dp, if checked { RV_CHECKED } else { RV_UNARY }, uo, e, at, 1, e);
 }
 
 fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64) {
@@ -1025,7 +1029,7 @@ fn lower_binary(e: i64, dl: i64, dp: i64) {
     let at = ops_mark();
     push_op(k1, a1, b1);
     push_now();
-    emit(SK_ASSIGN, dl, dp, RV_BINARY, bo_of(op), e, at, 2, e);
+    emit(SK_ASSIGN, dl, dp, binary_rv(bo_of(op), NODES[NODES[e].b].ty), bo_of(op), e, at, 2, e);
 }
 
 // The IR's binary operator of token op (an operator or a compound
@@ -1050,6 +1054,25 @@ fn bo_of(op: Tok) -> i64 {
         Tok::GtEq => BO_GE,
         _ => 0,
     }
+}
+
+// (0.26.3) The rvalue of binary operator bo on operands of type ty:
+// RV_CHECKED for an integer `+`, `-`, `*`, `<<` or `>>` when the overflow
+// checks are on (middle::opt::OVERFLOW_CHECKS), but in std::num::wrapping
+// (front/modules std_wraps), else RV_BINARY.
+fn binary_rv(bo: i64, ty: i64) -> i64 {
+    if checks_here() && (bo == BO_ADD || bo == BO_SUB || bo == BO_MUL || bo == BO_SHL
+        || bo == BO_SHR) && is_integer(undistinct(ty)) {
+        RV_CHECKED
+    } else {
+        RV_BINARY
+    }
+}
+
+// (0.26.3) Whether the body built checks its arithmetic's overflow: the
+// checks are on and it is not std::num::wrapping's (nor a shim's).
+fn checks_here() -> bool {
+    OVERFLOW_CHECKS && B_FN >= 0 && !crate::front::modules::std_wraps(fn_module(B_FN))
 }
 
 // A switch on bool operand `at` (in P_OPS): false to `f`, true to `t`.
@@ -1409,7 +1432,7 @@ fn lower_assign(n: i64) {
     push_now();
     set_op(vk, va, vb);
     push_now();
-    emit(SK_ASSIGN, PL_L, PL_P, RV_BINARY, bo_of(op), n, at, 2, n);
+    emit(SK_ASSIGN, PL_L, PL_P, binary_rv(bo_of(op), NODES[target].ty), bo_of(op), n, at, 2, n);
 }
 
 // (0.26.2) An assignment: `p = v` on an owned place drops p's old value
@@ -2141,10 +2164,10 @@ fn lower_let_pattern(pat: i64, init: i64, s: i64) {
     let l = PL_L;
     let p = PL_P;
     let ty = NODES[init].ty;
-    let targets = crate::places::ir::P_TARGETS.len() as i64;
+    let targets = crate::places::ir::P_TARGETS.len();
     let fail = new_block();
     test_pattern(pat, l, p, ty, fail);
-    if crate::places::ir::P_TARGETS.len() as i64 != targets && reachable() {
+    if crate::places::ir::P_TARGETS.len() != targets && reachable() {
         let ok = new_block();
         goto(ok);
         enter_block(fail);
@@ -2232,7 +2255,7 @@ fn desugared_block(b: i64) -> bool {
         let pat = NODES[s].a;
         if pat != 0 && NODES[pat].kind == NodeKind::PatBind {
             let text = SYMS[NODES[pat].a].text;
-            if text.len as i64 > 0 && text[0] == '=' {
+            if text.len > 0 && text[0] == '=' {
                 return true;
             }
         }
@@ -2376,7 +2399,7 @@ fn let_borrows(pat: i64, init: i64) -> bool {
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
     // an operator's operand: a borrowed copy, as the own pass's let_drops)
     let text = SYMS[name].text;
-    text.len as i64 > 0 && text[0] == '='
+    text.len > 0 && text[0] == '='
 }
 
 // ---- The body ----
@@ -2545,7 +2568,7 @@ fn live_writes() {
         return;
     }
     var any = false;
-    for s in 0..P_STMTS.len() as i64 {
+    for s in 0..P_STMTS.len() {
         if moved_capture_flag(P_STMTS[s]) >= 0 {
             any = true;
             break;
@@ -2555,7 +2578,7 @@ fn live_writes() {
         return;
     }
     OLD_STMTS.clear();
-    for s in 0..P_STMTS.len() as i64 {
+    for s in 0..P_STMTS.len() {
         OLD_STMTS.push(P_STMTS[s]);
     }
     let n = block_count();

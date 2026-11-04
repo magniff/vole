@@ -1,9 +1,13 @@
 ## The tools' fixes of 0.17 (tests/refactor/tools017/).
 $ check
+main.vl:7:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:14:1: warning[unsafe.unjustified] extern block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
 main.vl:22:5: warning[unsafe.unjustified] unsafe block without `// UNSAFE:` and `// SAFETY:` comments | help: say right above it why it cannot be safe (`// UNSAFE: ...`) and why it is sound (`// SAFETY: ...`); the try: line lists the file's sites and what each does | try: volec query unsafe main.vl
+main.vl:27:16: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 calc.vl:4:17: warning[use.unused] unused import 'area': nothing in this file names it | help: remove it (`volec fix` removes every unused import) | try: volec fix --only unused main.vl
-ok: 0 errors, 3 warnings in main.vl
+calc.vl:5:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+calc.vl:24:45: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+ok: 0 errors, 7 warnings in main.vl
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines
@@ -122,9 +126,13 @@ $ refactor inline percent --dry-run
 @@ -8,0 +8,2 @@
 +use calc::{empties, twice};
 +
-@@ -21 +22 @@
--    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
-+    println(f"{TITLE}: share {if b == 0 { 0 } else { a * 100 / b }}%, twice {twice(a)}");
+@@ -21 +22,5 @@
+-    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
++    println("{TITLE}: share {}%, twice {}", if b == 0 {
++        0
++    } else {
++        a * 100 / b
++    }, twice(a));
 --- a/calc.vl
 +++ b/calc.vl
 @@ -7,8 +6,0 @@
@@ -146,11 +154,11 @@ $ rewrite 'twice($x)' '$x + $x' --in main --dry-run
 +use calc::{empties, percent};
 +
 @@ -21 +22 @@
--    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
-+    println(f"{TITLE}: share {percent(a, b)}%, twice {a + a}");
+-    println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
++    println("{TITLE}: share {}%, twice {}", percent(a, b), a + a);
 @@ -25 +26 @@
--    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::header()}");
-+    println(f"{geo::area(2)} {A + B} {b + b} {calc::header()}");
+-    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::header());
++    println("{} {} {} {}", geo::area(2), A + B, b + b, calc::header());
 note rewrite.imports: removed 1 import the rewrite left unused
 $ rewrite 'twice($x)' '$x + $x' --in main --in crate::nowhere
 error rewrite.bad-in: no file, module or item 'crate::nowhere' in the program
@@ -165,11 +173,11 @@ $ undo
 undid rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
-calc.vl:29:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::calc::empties]
-error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'Buf'
-note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'
+calc.vl:29:8: error[type error] no method 'is_empty' on type 'Buf<Gpa>' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::calc::empties]
+error edit.breaks: 1 new error; nothing written; the error: calc.vl:29:8: no method 'is_empty' on type 'Buf<Gpa>'
+note rewrite.where: $v has 2 types at the sites: Vec<[u8],Gpa> (1 site), Buf<Gpa> (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8],Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf<Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ## refactor rename: a path mention must name the item's module.
@@ -177,8 +185,8 @@ $ refactor rename crate::calc::header top --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -25 +25 @@
--    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::header()}");
-+    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::top()}");
+-    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::header());
++    println("{} {} {} {}", geo::area(2), A + B, twice(b), calc::top());
 --- a/calc.vl
 +++ b/calc.vl
 @@ -1 +1 @@
@@ -192,7 +200,7 @@ $ query refs GREETING TITLE
 # main.vl
 9:7	def	->GREETING	const GREETING: *u8 = c"hello";
 10:7	def	->TITLE	const TITLE: [u8] = "totals";
-21:16	read	main	->TITLE	println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
+21:15	read	main	->TITLE	println("{TITLE}: share {}%, twice {}", percent(a, b), twice(a));
 23:14	read	main	->GREETING	puts(GREETING);
 ## query grep --comments: a doc comment is its item's.
 $ query grep 'area of a square' --comments

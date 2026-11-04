@@ -74,7 +74,158 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.0 | `v0.26.0` | 0.25.5 | aarch64-macos | the first step to Rust's surface: the places IR (places, moves, drop flags) at `check` behind `--places`; struct fields private unless `pub` (`field.private`, `fix --only pub`; `#[sealed]` retired); shaders as `embed wgsl` blocks, checked at `check` and in the LSP |
 | 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
 | 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
+| 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.26.3
+
+Allocation as a capability; compiler/src on 0.26.2's language (format
+literals, `usize`); f-strings removed; std's text on `String<A>`;
+`wrapping_*` and Rust's overflow checks. Built and tested on
+aarch64-macos only.
+
+- tools/unicode, the generator of std's Unicode tables, is removed: it
+  had not compiled since 0.20's spellings and nothing built it. The
+  tables stay as generated (Unicode 18.0.0); v0.26.2 has the generator.
+
+f-strings removed (fstr263):
+
+- `f"..."` is `error syntax.fstring` (`explain syntax.fstring`): once
+  per file, at its first f-string, with how many the file has, and
+  `try: volec fix --only fstring --keep-braces FILE`, which still reads
+  them and rewrites every one as a format literal (a name hole stays, an
+  expression becomes `{}` and an argument after the literal) or, away
+  from a format function, `format_args(..)`. The rest of the file is
+  checked as before. Use `--keep-braces` for code written for 0.26.2;
+  without it the fix also doubles the braces of plain literals at format
+  positions, as code from before 0.26.2 needs.
+- The tree has none left: compiler/src (444, the release's first
+  migration), std's comments, tools/ and the generators' output, bench/,
+  examples/, tests/, tests/agent-eval (with `fix --only usize`), the
+  Book, the guide's examples and docs/' examples. What remains is `fix --only fstring`'s own
+  cases and the error's.
+- The messages that named an f-string name the value of `format_args`:
+  `a format_args value is a 'std::Interp' (a value that prints), not
+  '[u8]'`; a contract message's holes (`contract.message`).
+
+compiler/src on `usize` (usize263):
+
+- `volec fix --only casts` removes a usize's `as i64` (`s.len as i64`,
+  `v.len() as i64`) where the value means the same as a usize: an index;
+  a slicing's end (`a[i..a.len as i64]` becomes `a[i..]`); a comparison
+  with a usize, a literal or another removed cast; the bound of a `for`
+  whose counter is used only in those ways; a `let` used only in those
+  ways. It never touches a value that reaches `-` or other arithmetic,
+  an i64 (a field, an argument, a comparison with an i64 counter), a sign
+  test, a closure, or a generic instance's copy. `note fix.casts` counts
+  every cast by class, and `--only casts-list` is a dry run that lists
+  them.
+
+Arithmetic, Rust's (arith263, decision 6):
+
+- **Breaking: integer overflow panics at -O0.** `+ - *`, unary `-` and
+  the shifts are checked when the overflow checks are on, -O0's default
+  (rustc's debug builds): `attempt to add with overflow` at the
+  expression, exit 101. At -O1 and -O2 they wrap, as before.
+  `--overflow-checks=on|off` overrides the level (hashed by the code
+  cache); std is built with the program's setting. A program that relies
+  on wrapping writes `wrapping_*` or `Wrapping<T>`, or builds with
+  `--overflow-checks=off`.
+- **Breaking: `/` and `%` by zero, and `MIN / -1`, panic at every level**
+  (`attempt to divide by zero`, `attempt to divide with overflow`), where
+  `x / 0` was 0 and `x % 0` was x.
+- **Shifts**: by the type's bits or more, a panic with the checks on; off,
+  the amount is taken modulo the type's bits, as Rust's, also for 8- and
+  16-bit operands (`1u8 << 9` is 2, was 0).
+- **Constants** follow the same rule: with the checks on, a constant
+  expression that overflows is the error `arith.overflow` (`volec explain
+  arith.overflow`); a constant `MIN / -1` is one at every level.
+- std's integer API, Rust's names and results, for every integer type, as
+  methods with no `use`: `wrapping_{add,sub,mul,neg,shl,shr,div,rem,pow}`,
+  `checked_*` (an `Option`), `overflowing_*`, `saturating_*`, and the
+  signed types' `*_abs`; `std::num::Wrapping<T>` with `+ - * /` and unary
+  `-` (`Wrapping(x)`, `.value`). tests/run/num_int_ops_rust.vl checks them
+  against rustc's results (tools/intops/twin.py). std's own wrap sites
+  (its hashes, PRNGs, SWAR parsing, bit counts) are written `wrapping_*`.
+- compiler/src still relies on wrapping in 46 places (feedbacks/arith263.md
+  lists them) and may not call `wrapping_*` until 0.26.4: the bootstrap's
+  -O0 builds of it (chain-diverse's B2 and A2O0) pass
+  `--overflow-checks=off` until then.
+
+Text (text263; grammar.md, "Items"):
+
+- Rust's `#[deprecated]`, `#[deprecated = "note"]` and
+  `#[deprecated(since = "..", note = "..")]` on any item, a method or a
+  struct's field: each use (a call, a name, a type, a path, a `use`, a
+  field read, a struct literal) is `warning item.deprecated` with the
+  note, and the help says where the item is marked. A use inside a
+  deprecated item, and std's own uses, are not reported.
+- `volec fix --only buf` turns each std `Buf` binding (a local, a
+  parameter, a field, a result, with the bindings its value flows
+  between) into `String<A>` when every write is text (a `push_str` of a
+  `str`, a format write, a constant byte below 0x80) and into
+  `Vec<u8, A>` when every write is bytes (a byte that is not a constant,
+  a constant at or above 0x80, a `push_str` of a `[u8]`). Mixed writes,
+  no write, a binding passed to a std function that takes a `Buf`, and a
+  method with no form on the side decided are refused, each named
+  (`note fix.buf-refused`). It never guesses. The method table it maps
+  through is printed with every run (`note fix.buf-table`).
+- std's text is a `String<A>` (breaking): `format_in` returns one (as
+  Rust's `format!`), `read_line` fills one (a line that is not UTF-8 is
+  `Err(IoError::Read)`, the line left empty), and so do `Command::help_in`
+  and `render_in` (std::cli), `take_capture`, `objc::push_ns_string`,
+  `Window::clipboard_get_in`, `gpu::Adapter::name_in`, the messages of
+  `gpu::Error::Shader` and `Pipeline`, `ShaderEntry`'s names and
+  `wgsl::target_error`. std's ambient `format(x)` is gone: write
+  `format_in(x, gpa)`. A program written for the `Buf` these returned:
+  `volec fix --only buf`.
+- std's byte buffers are `Vec<u8, A>` (breaking): `read_stdin_in`
+  (and the ambient `read_stdin`) return one, as Rust's `read_to_end`
+  fills, and so does `gen_buf`; std's snapshot, fuzz, window
+  and SPIR-V buffers moved too. std::gpu::wgsl keeps `Buf` inside for
+  0.26.3 (its names are `[u8]` slices of the WGSL source, and they
+  become `str` in 0.27), but none of its public functions takes or
+  returns one: `translate` gives a `Vec<u8, Gpa>` (SPIR-V is bytes),
+  and its messages and dumps a `String<A>`.
+- **std's `Buf` is `#[deprecated]`**: each use outside std is `warning
+  item.deprecated`, naming `String<A>` for text and `Vec<u8, A>` for
+  bytes. `fix --only buf` takes a format write (`push_fmt`, `push_int`)
+  as weak evidence of text, so a binding with only format writes and
+  byte uses becomes a `Vec<u8, A>` (the write
+  `extend_from_slice(format_in(.., v.allocator()).as_bytes())`).
+  `String::free` is new (as `Vec::free`: the memory given back).
+- The tree is off `Buf`: examples/, tests/, bench/, tools/, the guide
+  and the Book by `fix --only buf` and by hand where it refused (Buf
+  mentions 1048 before, a few cases whose point is `Buf` itself after,
+  each with a `WARNING` directive), and compiler/src (its two scratch
+  buffers are `String<Comp>`; no `std::Buf` left in it).
+
+Allocation as a capability (capab263; grammar.md, "Allocators"):
+
+- No default allocator type: `Vec<u8>`, `Buf`, `HashMap<K, V>` are
+  `alloc.default` (breaking); a type names its allocator, `Vec<u8,
+  Gpa>` or a generic `A`, so a signature says what a function may
+  allocate from. `alloc.no_in` replaces 0.16's "allocation is explicit"
+  message for `Vec::new()` and the other forms without an allocator.
+- `alloc.field`: a struct or enum holding an allocator names it in its
+  parameters (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as
+  `P<Gpa>`); a struct literal infers the allocator from its fields.
+  `alloc.static`: a static's type holds none, checked through the new
+  auto trait `AllocFree` (std), which looks through pointers.
+  `alloc.last`: an `_in` function takes its allocator last.
+- `unsafe trait` and `unsafe impl`, Rust's: `Allocator` is an unsafe
+  trait, and every impl of it is `unsafe impl` with its SAFETY comment
+  (`alloc.safe_impl`). std's Gpa, Arena, ScopedArena and FixedBuf are.
+- std's types that hold an allocator say so: std::gpu's `Device<A>`,
+  `Error<A>` and the other handles, std::window's, mpsc's, `Command`'s,
+  std::test's `Gen<A>`.
+- `volec fix --only alloc` makes the exact fixes in rounds (`Gpa` where
+  the default was, the `_in` call with the allocator in scope, a struct
+  made generic and then its uses). 0.16's `fix --only alloc016` is gone.
+- The tree is moved over with it: tests/, examples/, bench/, the guide.
+  compiler/src keeps one exemption until 0.26.4 (its allocator
+  `base::comp::Comp` and the static `WGSL_ARENA`), in one table in
+  front/check/alloc_rules.vl; its unused allocator `Ast` is gone.
 
 ### What's new in 0.26.2
 

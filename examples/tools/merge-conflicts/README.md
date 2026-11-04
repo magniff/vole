@@ -60,11 +60,11 @@ use convert::{c_to_f, f_to_c, kg_to_lb, km_to_mi, lb_to_kg};
 // ours (HEAD), lines 25-27:
     println("miles  km");
     for mi in [1, 26, 100] {
-        println(f"{mi:>5}  {mi_to_km(mi):>3}");
+        println("{mi:>5}  {:>3}", mi_to_km(mi));
 // theirs (rounding), lines 29-31:
     println("pounds  kg");
     for lb in [1, 100, 150] {
-        println(f"{lb:>6}  {lb_to_kg(lb):>2}");
+        println("{lb:>6}  {:>2}", lb_to_kg(lb));
 ```
 
 ## 2. Resolve by name
@@ -88,21 +88,21 @@ be given on stdin instead:
 $ volec edit resolve main --show <<'EOF'
 >     println("miles  km");
 >     for mi in [1, 26, 100] {
->         println(f"{mi:>5}  {mi_to_km(mi):>3}");
+>         println("{mi:>5}  {:>3}", mi_to_km(mi));
 >     }
 >     println("pounds  kg");
 >     for lb in [1, 100, 150] {
->         println(f"{lb:>6}  {lb_to_kg(lb):>2}");
+>         println("{lb:>6}  {:>2}", lb_to_kg(lb));
 > EOF
 resolved main.vl:20-28 (text)	main.vl	+1 -3 lines
 // main.vl:20-26
 20	    println("miles  km");
 21	    for mi in [1, 26, 100] {
-22	        println(f"{mi:>5}  {mi_to_km(mi):>3}");
+22	        println("{mi:>5}  {:>3}", mi_to_km(mi));
 23	    }
 24	    println("pounds  kg");
 25	    for lb in [1, 100, 150] {
-26	        println(f"{lb:>6}  {lb_to_kg(lb):>2}");
+26	        println("{lb:>6}  {:>2}", lb_to_kg(lb));
 note conflict.left: 1 conflict region left in 1 file
 try: volec query conflicts
 ```
@@ -114,7 +114,7 @@ has the rounding. Take ours:
 ```console
 $ volec edit resolve mi_to_km --ours
 resolved convert.vl:22-31 (ours)	convert.vl	+0 -4 lines
-main.vl:26:29: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;` | try: volec fix --suggested main.vl
+main.vl:26:35: error[type error] undefined variable 'lb_to_kg' | help: add `use crate::convert::lb_to_kg;` | try: volec fix --suggested main.vl
 warning conflict.check: the resolved program has errors (written; the merge may need more than one side)
 try: volec check
 ```

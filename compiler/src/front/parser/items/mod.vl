@@ -15,9 +15,9 @@ use crate::base::diag::{
     report_error_tries,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_EFFECT_DECL, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT, REPR_PACKED,
-    REPR_UNION, REPR_WGSL, SCRATCH, STRUCT_SCOPED, STRUCT_SEALED, child, list_begin, list_end,
-    list_push, new_node,
+    FN_BODY_FAILED, FN_EFFECT_DECL, FN_UNSAFE, ITEM_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT,
+    REPR_PACKED, REPR_UNION, REPR_WGSL, SCRATCH, STRUCT_SCOPED, STRUCT_SEALED, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::name_error;
 use crate::front::features::take_feature_attrs;
@@ -41,8 +41,8 @@ use crate::front::parser::foreign::{
     at_link_attribute, link_block, parse_extern, parse_link_attributes,
 };
 use crate::front::parser::items::attrs::{
-    INTRINSIC_PENDING, check_fn_attributes, parse_fn_attribute, parse_fn_attributes,
-    take_effect_decls,
+    INTRINSIC_PENDING, check_fn_attributes, parse_deprecated_attribute, parse_fn_attribute,
+    parse_fn_attributes, restore_deprecated, save_deprecated, take_deprecated, take_effect_decls,
 };
 use crate::front::parser::items::params::{
     WHERE_OUTER, begin_impl_params, end_impl_params, parse_params, parse_where,
@@ -58,11 +58,21 @@ pub fn parse_top_item() {
     unsafe {
         crate::front::modules::vis::VIS_TOK = -1;
         let public = parse_vis();
+        // (0.26.3: `unsafe impl Allocator for T`, `unsafe trait`)
+        var unsafe_at = -1;
+        if at(Unsafe) && (tok_kind(1) == Impl || tok_kind(1) == Trait) {
+            unsafe_at = cur_start();
+            advance();
+        }
         if at(Impl) {
             // The functions of an impl block are items of the program.
-            parse_impl(false);
+            parse_impl(false, unsafe_at);
         } else if at(Trait) {
             let item = parse_trait();
+            if unsafe_at >= 0 {
+                NODES[item].p |= ITEM_UNSAFE;
+                NODES[item].start = unsafe_at;
+            }
             mark_public(item, public);
             list_push(item);
         } else if at(Extern) {
@@ -174,9 +184,9 @@ fn parse_item() -> i64 {
 // `impl T { fn ... }`, `impl<T> Vec<T> { ... }` or `impl Vec<i64> { ... }`:
 // each function is pushed as an item, marked with the type's name (d) and
 // the type (h); the impl's type parameters come first in its own (g).
-fn parse_impl(public: bool) {
+fn parse_impl(public: bool, unsafe_at: i64) {
     unsafe {
-        let impl_start = cur_start();
+        let impl_start = if unsafe_at >= 0 { unsafe_at } else { cur_start() };
         expect(Impl);
         let params = parse_generic_params(false);
         var self_type = parse_type();
@@ -192,6 +202,10 @@ fn parse_impl(public: bool) {
             && !(NODES[self_type].kind == NodeKind::TySlice && params != 0) {
             error_at(NODES[self_type].start,
                 c"impl blocks are for named types (structs and enums)");
+        }
+        if unsafe_at >= 0 && trait_name == 0 {
+            error_at(unsafe_at,
+                c"an inherent impl is not unsafe: `unsafe impl` is an unsafe trait's impl (`unsafe impl Allocator for T`)");
         }
         parse_where(params, 0);
         let saved_outer = WHERE_OUTER;
@@ -242,6 +256,9 @@ fn parse_impl(public: bool) {
             NODES[n].b = self_type;
             NODES[n].g = params;
             NODES[n].c = assoc;
+            if unsafe_at >= 0 {
+                NODES[n].p |= ITEM_UNSAFE;
+            }
             let end = SCRATCH.count;
             let mark = list_begin();
             for i in fns..end {
@@ -648,10 +665,10 @@ fn parse_use(public: bool) {
             let t = SYMS[NODES[last].a].text;
             if t == "std" {
                 err_help_fmt(
-                    f"std is in scope by its name already, with no `use`: `std::f()`; its items by name: `use std::{{f}};`");
+                    format_args("std is in scope by its name already, with no `use`: `std::f()`; its items by name: `use std::{{f}};`"));
             } else {
                 err_help_fmt(
-                    f"a module of the crate is in scope by its name already, with no `use`: `{t}::f()`; its items by name: `use crate::{t}::{{f}};`");
+                    format_args("a module of the crate is in scope by its name already, with no `use`: `{t}::f()`; its items by name: `use crate::{t}::{{f}};`"));
             }
         }
         err_end();
@@ -705,12 +722,19 @@ fn parse_attributed_item(public: bool) -> i64 {
         var struct_flags = 0;
         // (0.21: #[thread_local])
         var thread_local = false;
+        var deprecated = false;
         take_effect_decls(0);
         while at(Hash) {
             let attr_pos = cur_start();
             advance();
             expect(LBracket);
             let name = expect_ident();
+            // (0.26.3: #[deprecated], on any item)
+            if parse_deprecated_attribute(name, attr_pos) {
+                deprecated = true;
+                expect(RBracket);
+                continue;
+            }
             // (0.18: #[test], #[property], #[fuzz], #[cfg(test)])
             if test_attribute(name) {
                 fn_flags |= FN_TEST_ATTR;
@@ -810,6 +834,9 @@ fn parse_attributed_item(public: bool) -> i64 {
             expect(RParen);
             expect(RBracket);
         }
+        // (0.26.3: the #[deprecated], kept while the item is parsed: a
+        // struct's fields, a trait's functions have their own)
+        let dep = save_deprecated();
         if derives != 0 {
             list_end(derives, derive_mark);
             if NODES[derives].count == 0 {
@@ -830,6 +857,8 @@ fn parse_attributed_item(public: bool) -> i64 {
                 error_at(at_start, c"#[thread_local] goes before a `static mut`");
             }
             NODES[item].p |= STATIC_THREAD_LOCAL;
+            restore_deprecated(dep, at_start);
+            take_deprecated(item);
             mark_public(item, item_public);
             return item;
         }
@@ -848,10 +877,19 @@ fn parse_attributed_item(public: bool) -> i64 {
             check_fn_attributes(fn_flags, at_start);
             let f = parse_function();
             NODES[f].p |= fn_flags;
+            restore_deprecated(dep, at_start);
             take_effect_decls(f);
             take_test_attrs(f);
             mark_public(f, item_public);
             return f;
+        }
+        if deprecated && !repr && derives == 0 && struct_flags == 0 {
+            // (0.26.3: #[deprecated] alone, before any item or a trait)
+            let item = if at(Trait) { parse_trait() } else { parse_item() };
+            restore_deprecated(dep, at_start);
+            take_deprecated(item);
+            mark_public(item, item_public);
+            return item;
         }
         if struct_flags != 0 && !at(Struct) {
             error_at(at_start, c"#[sealed] and #[scoped] go before a struct");
@@ -885,6 +923,8 @@ fn parse_attributed_item(public: bool) -> i64 {
             NODES[item].d = if pack != 0 { pack } else { align };
         }
         NODES[item].c = NODES[item].c | flags;
+        restore_deprecated(dep, at_start);
+        take_deprecated(item);
         mark_public(item, item_public);
         item
     }
@@ -937,6 +977,19 @@ fn parse_struct() -> i64 {
     expect(LBrace);
     let mark = list_begin();
     while !at(RBrace) && !at(Eof) {
+        // (0.26.3: `#[deprecated]` before a field, its only attribute)
+        take_deprecated(0);
+        while at(Hash) {
+            let attr_pos = cur_start();
+            advance();
+            expect(LBracket);
+            let name = expect_ident();
+            if !parse_deprecated_attribute(name, attr_pos) {
+                name_error(attr_pos, c"unknown attribute '", name,
+                    c"' before a field (expected deprecated)");
+            }
+            expect(RBracket);
+        }
         let field_start = cur_start();
         // `pub` (0.5) is allowed: a field is visible wherever its struct is
         // (0.16: of a #[sealed] struct, only the `pub` ones outside its module).
@@ -949,6 +1002,7 @@ fn parse_struct() -> i64 {
         expect(Colon);
         NODES[field].b = parse_type();
         NODES[field].end = prev_end();
+        take_deprecated(field);
         list_push(field);
         if !eat(Comma) {
             break;

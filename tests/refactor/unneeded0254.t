@@ -61,9 +61,9 @@ fixed 9 unneeded unsafe blocks, 2 left as they are (query unsafe lists them)	mai
 +    COUNT
 @@ -57,3 +51 @@
 -    unsafe {
--        println(f"{s} {COUNT}");
+-        println("{s} {COUNT}");
 -    }
-+    println(f"{s} {COUNT}");
++    println("{s} {COUNT}");
 $ fix --only unneeded-unsafe
 fixed 1 unneeded unsafe block, 1 left as it is (query unsafe lists it)	main.vl	+1 -3 lines
 $ fix --only unneeded-unsafe

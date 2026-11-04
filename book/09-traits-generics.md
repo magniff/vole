@@ -68,12 +68,12 @@ Structs and enums can take type parameters too. `Option<T>` and
 `Vec<T>` are written this way in std. Here is a stack of anything:
 
 ```vole
-struct Stack<T> {
-    items: Vec<T>,
+struct Stack<T, A: Allocator> {
+    items: Vec<T, A>,
 }
 
-impl<T> Stack<T> {
-    fn new(gpa: Gpa) -> Stack<T> {
+impl<T, A: Allocator> Stack<T, A> {
+    fn new(gpa: Gpa) -> Stack<T, A> {
         Stack { items: Vec::new_in(gpa) }
     }
 
@@ -90,7 +90,7 @@ impl<T> Stack<T> {
     }
 }
 
-impl Stack<i64> {
+impl Stack<i64, Gpa> {
     fn sum(self) -> i64 {
         var t = 0;
         for x in self.items {
@@ -101,14 +101,14 @@ impl Stack<i64> {
 }
 
 fn main(gpa: Gpa) {
-    var numbers: Stack<i64> = Stack::new(gpa);
+    var numbers: Stack<i64, Gpa> = Stack::new(gpa);
     numbers.push(4);
     numbers.push(9);
-    println(f"{numbers.len()} {numbers.sum()} {numbers.pop():?}");
+    println("{} {} {:?}", numbers.len(), numbers.sum(), numbers.pop());
 
-    var names: Stack<str> = Stack::new(gpa);
+    var names: Stack<str, Gpa> = Stack::new(gpa);
     names.push("ada");
-    println(f"{names.len()} {names.pop():?}");
+    println("{} {:?}", names.len(), names.pop());
 }
 ```
 
@@ -170,8 +170,8 @@ impl Shape for Rect {
 fn main() {
     let c = Circle { radius: 2.0 };
     let r = Rect { width: 3.0, height: 4.0 };
-    println(f"{c.name()} {c.area():.2}");
-    println(f"{r.name()} {r.area():.2} {Rect::area(r)}");
+    println("{} {:.2}", c.name(), c.area());
+    println("{} {:.2} {}", r.name(), r.area(), Rect::area(r));
 }
 ```
 
@@ -246,7 +246,7 @@ impl Describe for i64 {
 }
 
 fn main() {
-    println(f"{(-5).describe()} {7.describe()}");
+    println("{} {}", (-5).describe(), 7.describe());
 }
 ```
 
@@ -373,7 +373,7 @@ impl Add for Vec2 {
 
 impl Display for Vec2 {
     fn fmt(self, f: inout Fmt) {
-        f.write(f"({self.x}, {self.y})");
+        f.write("({}, {})", self.x, self.y);
     }
 }
 
@@ -387,7 +387,7 @@ fn main() {
     let a = Vec2 { x: 1.0, y: 2.0 };
     let b = Vec2::from((0.5, 0.5));
     let c: Vec2 = (10.0, 0.0).into();
-    println(f"{a + b} {a + b + c}");
+    println("{} {}", a + b, a + b + c);
 }
 ```
 
@@ -398,7 +398,7 @@ fn main() {
 - **Operators.** `a + b` calls `Add`'s `add`. The other arithmetic
   operators work the same way: `Sub` for `-`, `Mul` for `*`, `Div` for
   `/`, and `Neg` for a minus in front, `-a`.
-- **Display** is the plain `{x}` in an f-string. Its `fmt` gets the
+- **Display** is the plain `{x}` in a format string. Its `fmt` gets the
   value and an `f: inout Fmt` to write the text to, with `f.write(...)`.
   There is nothing to return.
 - **From and Into** convert between types. `impl From<(f64, f64)> for
@@ -431,7 +431,7 @@ impl Ord for Version {
 fn main() {
     let old = Version { major: 1, minor: 9 };
     let new = Version { major: 1, minor: 10 };
-    println(f"{old < new} {old == new} {old.cmp(new)}");
+    println("{} {} {}", old < new, old == new, old.cmp(new));
 }
 ```
 
@@ -442,7 +442,7 @@ true false -1
 `cmp` returns an `i64`: negative if `self` comes first, zero if they're
 equal, positive if `o` comes first. Subtracting the fields is a short
 way to write it, fine for numbers like these; for numbers near the ends
-of the `i64` range the subtraction would wrap (chapter 3), and
+of the `i64` range the subtraction would overflow (chapter 3), and
 `self.major.cmp(o.major)` is the safe way. With `Ord`, `Version`s can be compared with `<`, sorted
 with `sort()`, and given to `largest`.
 
@@ -459,17 +459,17 @@ struct Version {
 }
 
 fn main(gpa: Gpa) {
-    var versions: Vec<Version> = Vec::new_in(gpa);
+    var versions: Vec<Version, Gpa> = Vec::new_in(gpa);
     versions.push(Version { major: 1, minor: 10 });
     versions.push(Version { major: 0, minor: 9 });
     versions.push(Version { major: 1, minor: 2 });
     versions.sort();
-    println(f"{versions:?}");
+    println("{versions:?}");
 
-    var notes: HashMap<Version, str> = HashMap::new_in(gpa);
+    var notes: HashMap<Version, str, Gpa> = HashMap::new_in(gpa);
     let current = Version { major: 1, minor: 10 };
     notes.insert(current, "current");
-    println(f"{notes.get(current):?}");
+    println("{:?}", notes.get(current));
 }
 ```
 
@@ -506,7 +506,7 @@ struct Point {
 
 fn main() {
     let p = Point { x: 1, y: 2 };
-    println(f"{p:?}");
+    println("{p:?}");
 }
 ```
 
@@ -515,7 +515,7 @@ error[type error]: cannot derive 'Debg' (derivable: Eq, Ord, Hash, Debug, Clone)
  --> main.vl: line 1, column 10
   = help: did you mean 'Debug'?
 error[type error]: 'Point' does not implement Debug, which '{x:?}' needs
- --> main.vl: line 9, column 16
+ --> main.vl: line 9, column 15
   = help: derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for Point { fn fmt_debug(self, f: inout std::Fmt) { f.write("..", args); } }'
 ```
 
@@ -583,7 +583,7 @@ impl Add for Vec2 {
 
 impl Display for Vec2 {
     fn fmt(self, f: inout Fmt) {
-        f.write(f"({self.x}, {self.y})");
+        f.write("({}, {})", self.x, self.y);
     }
 }
 
@@ -627,7 +627,7 @@ impl Shape for Rect {
 
 impl Display for Circle {
     fn fmt(self, f: inout Fmt) {
-        f.write(f"a circle at {self.center} with radius {self.radius}");
+        f.write("a circle at {} with radius {}", self.center, self.radius);
     }
 }
 
@@ -661,7 +661,7 @@ fn total_area<T: Shape>(items: [T]) -> f64 {
 }
 
 fn describe<T: Shape + Display>(s: T) {
-    println(f"{s}: area {s.area():.2}");
+    println("{s}: area {:.2}", s.area());
 }
 
 fn main(gpa: Gpa) {
@@ -669,14 +669,14 @@ fn main(gpa: Gpa) {
     let c = Circle { center: origin + Vec2 { x: 1.0, y: 1.0 }, radius: 2.0 };
     describe(c);
 
-    var shapes: Vec<AnyShape> = Vec::new_in(gpa);
+    var shapes: Vec<AnyShape, Gpa> = Vec::new_in(gpa);
     shapes.push(AnyShape::Circle(c));
     shapes.push(AnyShape::Rect(Rect { corner: origin, size: Vec2 { x: 3.0, y: 4.0 } }));
     shapes.push(AnyShape::Circle(Circle { center: origin, radius: 0.5 }));
     for s in shapes {
-        println(f"{s.name():<10} {s.area():>6.2}");
+        println("{:<10} {:>6.2}", s.name(), s.area());
     }
-    println(f"{"total":<10} {total_area(shapes.as_slice()):>6.2}");
+    println("{:<10} {:>6.2}", "total", total_area(shapes.as_slice()));
 }
 ```
 
@@ -737,7 +737,7 @@ fn first_of<I: Inventory>(inv: I) -> Option<I::Item> {
 
 fn main() {
     let s = Shelf { books: ["Dune", "Emma"] };
-    println(f"{first_of(s):?}");
+    println("{:?}", first_of(s));
 }
 ```
 

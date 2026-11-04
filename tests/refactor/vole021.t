@@ -11,7 +11,7 @@ $ query refs area
 2:8	def	pub fn area(w: i64, h: i64) -> i64 { shapes::rect(w, h) }
 # main.vl
 3:17	use	crate	use crate::geo::area;
-5:16	call	main	println(f"{area(3, 4)} {crate::util::twice(5)}");
+5:22	call	main	println("{} {}", area(3, 4), crate::util::twice(5));
 $ query show geo/mod.vl:2
 // crate::geo::area	geo/mod.vl:2-2	effects: none
 pub fn area(w: i64, h: i64) -> i64 { shapes::rect(w, h) }

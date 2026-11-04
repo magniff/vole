@@ -8,7 +8,7 @@ at once, when the request is answered:
 
 ```tach
 let used = arena_scope(gpa, |scratch| {
-    var out = Buf::new_in(scratch);
+    var out = String::new_in(scratch);
     answer(&store, line, scratch, &out);
     println("{line:<24} -> {}", out.as_slice());
     scratch.used()
@@ -36,7 +36,7 @@ GET plums                -> plums is not set
 SUM apples pears plums   -> sum = 12 (not set: plums)
 ADD pears lots           -> not a number: lots
 FLY away                 -> unknown request: FLY away
-8 requests, 2 keys; scratch per request at most 104 bytes
+8 requests, 2 keys; scratch per request at most 110 bytes
 the keys' arena holds 11 bytes
 ok: built store
 ```
@@ -59,19 +59,19 @@ when `f` returns; it returns what `f` returns. Allocating from it is
 bumping a pointer, and freeing a block inside it is nothing (but for
 the last one, which the pointer gives back): the scope's end frees
 everything. An 8 KB chunk is enough for every request here: the busiest
-one used 104 bytes.
+one used 110 bytes.
 
 `answer` does not know or care what kind of allocator it is given:
 
 ```tach
-fn answer<A: Allocator>(store: inout Store, line: [u8], scratch: sink A, out: inout Buf<A>)
+fn answer<A: Allocator>(store: inout Store, line: [u8], scratch: sink A, out: inout String<A>)
 ```
 
 Inside, every temporary is made on `scratch`:
 `split_whitespace_in(line, scratch)`, `lower_in(w[1], scratch)` (a
-lowercased copy), a `Buf` listing the missing keys of a `SUM`. Each is
+lowercased copy), a `Vec<u8, A>` listing the missing keys of a `SUM`. Each is
 dropped at the end of its scope, which on an arena frees nothing: the
-scope's end frees it all. The response is written into `out`, a `Buf`
+scope's end frees it all. The response is written into `out`, a `String`
 on the same arena.
 
 A known key's value changes in place, through `get_mut`. A new key must

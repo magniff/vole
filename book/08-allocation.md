@@ -35,8 +35,8 @@ fn longest(words: [str]) -> usize {
 }
 
 // Builds a new Vec: needs an allocator.
-fn lengths(words: [str], gpa: Gpa) -> Vec<usize> {
-    var out: Vec<usize> = Vec::new_in(gpa);
+fn lengths(words: [str], gpa: Gpa) -> Vec<usize, Gpa> {
+    var out: Vec<usize, Gpa> = Vec::new_in(gpa);
     for w in words {
         out.push(w.len());
     }
@@ -45,7 +45,7 @@ fn lengths(words: [str], gpa: Gpa) -> Vec<usize> {
 
 fn main(gpa: Gpa) {
     let words: [str; 3] = ["vole", "mouse", "shrew"];
-    println(f"{longest(words)} {lengths(words, gpa):?}");
+    println("{} {:?}", longest(words), lengths(words, gpa));
 }
 ```
 
@@ -100,8 +100,8 @@ handler splits the path into its parts and answers. Start
 `requests.vl`:
 
 ```vole requests.vl
-fn split_path(path: str, gpa: Gpa) -> Vec<str> {
-    var parts: Vec<str> = Vec::new_in(gpa);
+fn split_path(path: str, gpa: Gpa) -> Vec<str, Gpa> {
+    var parts: Vec<str, Gpa> = Vec::new_in(gpa);
     for p in path.split('/') {
         if !p.is_empty() {
             parts.push(p);
@@ -110,7 +110,7 @@ fn split_path(path: str, gpa: Gpa) -> Vec<str> {
     parts
 }
 
-fn handle(line: str, gpa: Gpa) -> String {
+fn handle(line: str, gpa: Gpa) -> String<Gpa> {
     var out = String::new_in(gpa);
     let (method, path) = match line.split_once(' ') {
         Some(pair) => pair,
@@ -121,9 +121,9 @@ fn handle(line: str, gpa: Gpa) -> String {
     };
     let parts = split_path(path, gpa);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -133,7 +133,7 @@ fn main(gpa: Gpa) {
     let text = str::from_utf8(input.as_slice()).unwrap();
     for line in text.lines() {
         let reply = handle(line, gpa);
-        println(f"{line:<24} -> {reply}");
+        println("{line:<24} -> {reply}");
     }
 }
 ```
@@ -169,8 +169,8 @@ If a function uses `gpa` without having one, the compiler can't find
 it:
 
 ```vole
-fn split_path(path: str) -> Vec<str> {
-    var parts: Vec<str> = Vec::new_in(gpa);
+fn split_path(path: str) -> Vec<str, Gpa> {
+    var parts: Vec<str, Gpa> = Vec::new_in(gpa);
     for p in path.split('/') {
         parts.push(p);
     }
@@ -179,25 +179,25 @@ fn split_path(path: str) -> Vec<str> {
 
 fn main(gpa: Gpa) {
     let parts = split_path("/users/ada");
-    println(f"{parts:?}");
+    println("{parts:?}");
 }
 ```
 
 ```err
 error[type error]: undefined variable 'gpa'
- --> main.vl: line 2, column 39
+ --> main.vl: line 2, column 44
   = help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'split_path' and pass it down
 ```
 
 `gpa` is just a parameter name, and `split_path` has no parameter by
 that name. The fix is to add one, `gpa: Gpa`, at the end of
 `split_path`'s parameters, and pass `gpa` at the call. When a whole
-chain of functions needs it, `volec fix --only alloc016 main.vl` adds
+chain of functions needs it, `volec fix --only alloc main.vl` adds
 the parameter to every function from `main` down to the allocation,
 and passes it at every call.
 
 If you forget it the other way, writing `Vec::new()` the way other
-languages do, you get the error from chapter 2, whose `try:` line
+languages do, you get the error from chapter 2, `alloc.no_in`, which
 names the `_in` form.
 
 ## Drops free memory
@@ -207,7 +207,7 @@ Where does the memory go back? Look at the loop in `main` again:
 ```vole skip
     for line in text.lines() {
         let reply = handle(line, gpa);
-        println(f"{line:<24} -> {reply}");
+        println("{line:<24} -> {reply}");
     }
 ```
 
@@ -244,7 +244,7 @@ instructions, and giving it all back costs one.
 closure returns. Let's try it on a small program first:
 
 ```vole
-fn shout(s: str, gpa: Gpa) -> String {
+fn shout(s: str, gpa: Gpa) -> String<Gpa> {
     s.to_uppercase_in(gpa)
 }
 
@@ -296,8 +296,11 @@ allocator, and `a: A` is the allocator it's given. The result is a
 
 That type explains something you've been writing all along. A
 container's allocator is part of its type: `Vec<i64, ScopedArena>` is
-a Vec on an arena. The allocator parameter has a default, `Gpa`, so
-`Vec<i64>` means `Vec<i64, Gpa>` and `String` means `String<Gpa>`.
+a Vec on an arena, `Vec<i64, Gpa>` one on `Gpa`. The allocator is
+always written: a bare `Vec<i64>` is `alloc.default`, and a struct that
+holds a Vec names the allocator in its own parameters, `struct
+Log<A: Allocator> { lines: Vec<String<A>, A> }`, used as `Log<Gpa>`
+(`alloc.field`). `volec fix --only alloc` writes both.
 
 The compiler makes a separate copy of `shout` for each allocator type
 it's used with, so the generic version costs nothing extra at run time.
@@ -324,14 +327,14 @@ fn fill<A: Allocator>(v: inout Vec<i64, A>, n: i64) {
 }
 
 fn main(gpa: Gpa) {
-    var on_heap: Vec<i64> = Vec::new_in(gpa);
+    var on_heap: Vec<i64, Gpa> = Vec::new_in(gpa);
     fill(&on_heap, 3);
     let from_arena = arena_scope(gpa, |a| {
         var scratch: Vec<i64, ScopedArena> = Vec::new_in(a);
         fill(&scratch, 4);
         total(scratch)
     });
-    println(f"{total(on_heap)} {from_arena}");
+    println("{} {from_arena}", total(on_heap));
 }
 ```
 
@@ -370,9 +373,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -384,14 +387,14 @@ fn main(gpa: Gpa) {
     for line in text.lines() {
         let used = arena_scope(gpa, |a| {
             let reply = handle(line, a);
-            println(f"{line:<24} -> {reply}");
+            println("{line:<24} -> {reply}");
             a.used()
         });
         if used > most {
             most = used;
         }
     }
-    println(f"at most {most} bytes per request");
+    println("at most {most} bytes per request");
 }
 ```
 
@@ -491,9 +494,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -509,7 +512,7 @@ fn main() {
     for line in requests {
         let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
-        println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
+        println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
@@ -580,9 +583,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
         }
     };
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -598,7 +601,7 @@ fn main() {
     for line in requests {
         let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
-        println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
+        println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
@@ -634,7 +637,7 @@ That's allowed in safe code, but it's rarely what you want:
 fn main(gpa: Gpa) {
     var log = String::new_in(gpa);
     log.push_str("a reply nobody frees");
-    println(f"{log}");
+    println("{log}");
     std::forget(log);
 }
 ```
@@ -656,7 +659,7 @@ A use after free in unsafe code is stopped where it happens:
 
 ```vole uaf.vl
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(7);
     let p = v.as_slice().ptr;
     drop(v);

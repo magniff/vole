@@ -28,25 +28,34 @@ fieldless enums to integers and back). An unsuffixed literal takes the
 type the context needs (`let b: u8 = 7;`, `x + 1` with `x: u32`), and
 must fit: `let b: u8 = 300;` is an error.
 
-Every operation is defined, the same at every optimization level:
+Every operation is defined. Overflow is Rust's (0.26.3): `max + 1`
+panics at -O0 (`attempt to add with overflow`, at the expression) and
+wraps at -O1 and -O2; `--overflow-checks=on|off` chooses for any level.
+`x / 0` and `MIN / -1` panic at every level, and so does a shift by the
+type's bits or more at -O0 (at -O2 the amount is taken modulo the bits).
+Where wrapping (or a check) is what you mean, say so, at every level:
+`x.wrapping_add(y)` (`_sub _mul _neg _shl _shr _div _rem _pow _abs`),
+`checked_*` (an `Option`), `overflowing_*` (the value and a bool),
+`saturating_*`, and `std::num::Wrapping<T>` (`Wrapping(x) + Wrapping(y)`,
+its `.value`). Hashes and PRNGs write `wrapping_*`.
 
 ```vole
 let max: i64 = 9223372036854775807;
 let b: u8 = 250;
 let s: u32 = 1;
-std::print_int(max + 1); print(" ");                // wraps
-std::print_int((b + 10) as i64); print(" ");        // u8 wraps: 4
-std::print_int(10 / 0); print(" ");                 // 0
-std::print_int(10 % 0); print(" ");                 // 10
-std::print_int(-7 % 3); print(" ");                 // the sign of the dividend
-std::print_int((s << 33) as i64); print(" ");       // the amount mod 32 for narrow types
-std::print_int(1e30 as i64 - max); print(" ");      // float to int saturates
-std::print_int(-1.9 as i64); print(" ");            // truncates
-std::print_int((0.0 / 0.0) as i64);                 // NaN becomes 0
+std::print_int(max.wrapping_add(1)); print(" ");                // wraps at every level
+std::print_int(b.wrapping_add(10) as i64); print(" ");          // u8 wraps: 4
+std::print_int(max.checked_add(1).unwrap_or(-1)); print(" ");   // None: it overflowed
+std::print_int(b.saturating_add(10) as i64); print(" ");        // 255
+std::print_int(-7 % 3); print(" ");                             // the sign of the dividend
+std::print_int(s.wrapping_shl(33) as i64); print(" ");          // the amount mod the bits
+std::print_int(1e30 as i64 - max); print(" ");                  // float to int saturates
+std::print_int(-1.9 as i64); print(" ");                        // truncates
+std::print_int((0.0 / 0.0) as i64);                             // NaN becomes 0
 println("");
 ```
 ```out
--9223372036854775808 4 0 10 -1 2 0 -1 0
+-9223372036854775808 4 -1 255 -1 2 0 -1 0
 ```
 
 Floats are IEEE 754 without fast-math; `1.0 / 0.0` is infinity, and
@@ -124,7 +133,7 @@ the one implicit conversion. T's operators work between two values of
 the type, or one and a literal (`a + 1`, `m / 2.0`, `a < b` is a bool);
 mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
 (`volec fix --suggested` writes them all). It has T's Eq, Ord, Hash,
-Debug, Display and Clone (`Vec<NodeId>` sorts, prints, is a HashMap key)
+Debug, Display and Clone (`Vec<NodeId, Gpa>` sorts, prints, is a HashMap key)
 and T's literal patterns, but none of T's methods (`distinct.method`):
 `impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
 `Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw

@@ -69,13 +69,13 @@ loop over the rows: in range); `each`'s instance has the closure's
 
 ```console
 $ volec edit patch main --old '|v| v + bonus' --new '|v| {
->         println(f"{v}");
+>         println("{v}");
 >         v + bonus
 >     }'
-main.vl:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:17:5: the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only
+main.vl:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:17:5: the closure for 'F' of 'table::map_values' does io ('println("{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only
 try: volec edit patch main --old '|v| v + bonus' --new '|v| {
-        println(f"{v}");
+        println("{v}");
         v + bonus
     }' --no-check
 [exit 1]

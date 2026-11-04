@@ -202,7 +202,7 @@ impl Display for BigUint {
 }
 ```
 
-and any `f"{x}"` then works, `format` included. The digit sum is an
+and any `{x}` hole then works, `format_in` included. The digit sum is an
 iterator over the limbs with a closure that sums each limb's digits;
 the trailing zeros of 1000! are a `fold` over the decimal text that
 restarts its count at every nonzero digit:
@@ -281,7 +281,7 @@ another 10%.
 | operator traits `Add`, `Sub`, `Mul` (operands `let`); `Ord` by hand gives `<` | `impl ... for BigUint` | `volec guide traits` |
 | `let` parameters (the default), `inout [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `volec guide memory`, `guide views` |
 | `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `volec guide formatting` |
-| `impl Display`, `f.write(f"...")`, `{x:09}` | `Display for BigUint` | `volec guide formatting` |
+| `impl Display`, `f.write("...")`, `{x:09}` | `Display for BigUint` | `volec guide formatting` |
 | a `Vec` carries its allocator: `self.limbs.allocator()` | `BigUint::times` | `volec guide allocators` |
 | widening: `u32` limbs into `u64` arithmetic | the kernels | `volec guide conversions` |
 | slices as views, sub-slices `a[..m]`, written through | the kernels | `volec guide types`, `guide memory` |

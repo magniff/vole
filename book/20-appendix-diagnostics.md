@@ -12,7 +12,7 @@ Here is a program with a typo:
 ```vole
 fn main() {
     let total = 1;
-    println(f"{totl}");
+    println("{totl}");
 }
 ```
 
@@ -21,7 +21,7 @@ lines:
 
 ```err
 error[type error]: undefined variable 'totl'
- --> main.vl: line 3, column 16
+ --> main.vl: line 3, column 15
   = help: did you mean 'total'?
   = try: volec fix --suggested main.vl
 ```
@@ -38,7 +38,7 @@ editor, a script), prints the same error in its *short form*, one line:
 
 ```console
 $ volec check main.vl
-main.vl:3:16: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
+main.vl:3:15: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 ```
 
 It has the same parts, in the same order, separated by ` | `, with the
@@ -179,12 +179,12 @@ errors that are left. Here's one:
 fn main(gpa: Gpa) {
     var s = String::new_in(gpa);
     s.push_string("hi");
-    println(f"{s}");
+    println("{s}");
 }
 ```
 
 ```err
-error[type error]: no method 'push_string' on type 'String'
+error[type error]: no method 'push_string' on type 'String<Gpa>'
  --> main.vl: line 3, column 5
   = help: did you mean 'push_str'?
   = try: volec query items String main.vl
@@ -238,7 +238,7 @@ far:
 fn main() {
     let v = [1, 2];
     for i in 0..3 {
-        println(f"{v[i]}");
+        println("{}", v[i]);
     }
 }
 ```
@@ -246,7 +246,7 @@ fn main() {
 ```out exit=101
 1
 2
-main.vl:4:20: index out of bounds: index 2, length 2
+main.vl:4:23: index out of bounds: index 2, length 2
 ```
 
 The line is `FILE:LINE:COLUMN: message`, and the position is the
@@ -280,7 +280,7 @@ fn pick(v: [i64], i: i64) -> i64 {
 
 fn main() {
     let v = [10, 20, 30];
-    println(f"{pick(v, 3)}");
+    println("{}", pick(v, 3));
 }
 ```
 

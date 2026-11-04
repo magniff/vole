@@ -42,7 +42,7 @@ class Gen:
         self.items.append(items)
         self.calls.append(
             f"    c = {call};\n"
-            f"    if c != {expect} {{ println(f\"bad {name}: {{c}} (want {expect})\"); bad += 1; }}\n")
+            f"    if c != {expect} {{ println(\"bad {name}: {{c}} (want {expect})\"); bad += 1; }}\n")
 
     def st(self, t, n, start, inline):
         # an array in a struct, filled through an inout parameter
@@ -143,7 +143,7 @@ class Gen:
             f.write("\nfn main(gpa: Gpa) -> i32 {\n    let zero = parse_int(\"0\").unwrap_or(0);\n"
                     "    var bad = 0;\n    var c: i64 = 0;\n")
             f.write("".join(self.calls))
-            f.write(f"    println(f\"{self.n} cases, {{bad}} bad\");\n    0\n}}\n")
+            f.write(f"    println(\"{self.n} cases, {{bad}} bad\");\n    0\n}}\n")
 
 
 BIG = [488, 504, 510, 1000]

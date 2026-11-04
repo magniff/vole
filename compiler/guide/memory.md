@@ -27,27 +27,27 @@ A parameter's convention says what the function does with the argument:
 
 | convention | written | the callee | the caller writes |
 |---|---|---|---|
-| let (the default) | `v: Vec<i64>` | reads it; cannot change or keep it | `total(v)`: lent for the call, or a temporary |
-| inout | `v: inout Vec<i64>` | may change it; the change reaches the caller | `fill(&v)`: `&` marks it |
-| sink | `v: sink Vec<i64>` | owns it (may change it, keeps or drops it) | `keep(v)`: v moves (a plain value is copied) |
+| let (the default) | `v: Vec<i64, Gpa>` | reads it; cannot change or keep it | `total(v)`: lent for the call, or a temporary |
+| inout | `v: inout Vec<i64, Gpa>` | may change it; the change reaches the caller | `fill(&v)`: `&` marks it |
+| sink | `v: sink Vec<i64, Gpa>` | owns it (may change it, keeps or drops it) | `keep(v)`: v moves (a plain value is copied) |
 
 ```vole
-fn total(v: Vec<i64>) -> i64 {           // let: reads, no copy
+fn total(v: Vec<i64, Gpa>) -> i64 { // let: reads, no copy
     var s = 0;
     for x in v { s += x; }
     s
 }
 
-fn fill(v: inout Vec<i64>, n: i64) {     // inout: changes the caller's Vec
+fn fill(v: inout Vec<i64, Gpa>, n: i64) { // inout: changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
 
-fn keep(all: inout Vec<Vec<i64>>, v: sink Vec<i64>) {   // sink: takes it
+fn keep(all: inout Vec<Vec<i64, Gpa>, Gpa>, v: sink Vec<i64, Gpa>) { // sink: takes it
     all.push(v);
 }
 
-fn make(n: i64, gpa: Gpa) -> Vec<i64> {  // the caller owns the result
-    var v: Vec<i64> = Vec::new_in(gpa);
+fn make(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // the caller owns the result
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     fill(&v, n);
     v                                    // moved out: not dropped here
 }
@@ -56,7 +56,7 @@ fn main(gpa: Gpa) {
     let v = make(4, gpa);
     let w = v.clone();                   // a copy; `let w = v;` moves v
     println("{} {} {}", total(v), total(w), w.len());
-    var all: Vec<Vec<i64>> = Vec::new_in(gpa);
+    var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
     keep(&all, w);                       // w is dead from here
     println(all.len());
 }                                        // all (and w in it), then v, dropped (freed)
@@ -151,7 +151,7 @@ returned out of the function that owns its memory (`own.escape`), or a
 behaviour. Take the view again after the change, or keep an index:
 
 ```vole
-var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
 v.push(1);
 let s = v.as_slice();
     print("{} ", s[0]); // used before the pushes
@@ -192,7 +192,7 @@ fn main() {
     hit(c);
     let arr = [Cell::new(1), Cell::new(2)];
     for x in arr { x.set(x.get() * 10); }
-    println(f"{c.hits.get()} {arr[1].get()}");
+    println("{} {}", c.hits.get(), arr[1].get());
 }
 ```
 ```out

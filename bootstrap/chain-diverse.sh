@@ -91,9 +91,13 @@ build "$PREV" A1 -O2
 build "$W/A1" A2 -O2
 build "$W/A2" A3 -O2
 build "$PREV" B1 -O0
-build "$W/B1" B2 -O0
+# (0.26.3) HEAD at -O0 checks overflow (decision 6), and the compilers
+# built so are run: --overflow-checks=off until compiler/src's wrap sites
+# use wrapping_*, which 0.26.4 does and then removes these flags. B1 is
+# PREVIOUS's build, which knows no such flag.
+build "$W/B1" B2 -O0 --overflow-checks=off
 build "$W/B2" B3 -O2
-build "$W/A2" A2O0 -O0
+build "$W/A2" A2O0 -O0 --overflow-checks=off
 build "$PREV" J1 -O2 -j1
 build "$W/J1" J2 -O2 -j1
 same A2 A3 "the normal fixpoint"

@@ -10,22 +10,22 @@ so a function's signature says whether it allocates.
 ## Gpa, from main
 
 ```vole
-fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
-    var v: Vec<i64> = Vec::with_capacity_in(n as usize, gpa);
+fn squares(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // allocates: takes the allocator
+    var v: Vec<i64, Gpa> = Vec::with_capacity_in(n as usize, gpa);
     for i in 0..n { v.push(i * i); }
     v
 }
 
-fn total(v: Vec<i64>) -> i64 {               // grows nothing: no allocator
+fn total(v: Vec<i64, Gpa>) -> i64 { // grows nothing: no allocator
     v.iter().sum()
 }
 
 fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
     var v = squares(4, gpa);
     v.push(100);                              // the Vec's own allocator
-    var b = Buf::new_in(gpa);
-    b.push_int(total(v));
-    let words: Vec<i64> = (1..4).map(|x| x * 10).collect_in(gpa);
+    var b = String::new_in(gpa);
+    b.push_fmt(total(v));
+    let words: Vec<i64, Gpa> = (1..4).map(|x| x * 10).collect_in(gpa);
     println("{} {words:?}", b.as_slice());
     0
 }                                             // words, b, v dropped: freed
@@ -39,37 +39,34 @@ let parameter (`gpa: Gpa`, no convention to write), and every container
 made from it shares it. Only `main` gets one (std's
 types have private fields: no `Gpa {}` outside std). Each 0.15 form that
 allocated has an `_in` form taking the allocator last: `Vec::new_in(a)`,
-`with_capacity_in(n, a)`, `filled_in(n, x, a)`, `Buf::new_in(a)`,
+`with_capacity_in(n, a)`, `filled_in(n, x, a)`, `String::new_in(a)`,
 `HashMap::new_in(a)`, `it.collect_in(a)`, `format_in(x, a)`,
 `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s, a)`,
 `sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`, `v.clone_in(b)`,
 `BinaryHeap::new_in(a)`. The allocator is always the last argument, as
 in Rust's allocator API (`Vec::with_capacity_in(cap, alloc)`), except
 before a closure that is given it: `arena_scope(gpa, |a| ..)`.
-The 0.15 forms are errors that name the `_in` form:
+There is no form without `_in` (0.26.3): `Vec::new()`, `collect()`,
+`format(x)` are errors that name the `_in` form, and `volec fix --only
+alloc` passes the one allocator in scope:
 
 ```vole
-let v: Vec<i64> = Vec::new();
+fn main(gpa: Gpa) {
+    let v: Vec<i64, Gpa> = Vec::new();
+}
 ```
 ```err
-error[type error] allocation is explicit: pass an allocator (try: Vec::new_in(gpa))
+error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in'
 ```
-
-`volec fix --only alloc016` moves a 0.15 program over: each call
-becomes its `_in` form, and `gpa: Gpa` is added to every function from
-`main` down to the calls (and passed at each call). A function it cannot
-change (an impl of std's `Display`, a function used as a value, a
-parameter's default) is an error naming where it allocates: keep a
-`gpa: Gpa` in the value it works on, or allocate in the caller.
 
 ## Containers and their allocator
 
-`Vec<T, A: Allocator = Gpa>`, `Buf<A = Gpa>`, `HashMap<K, V, A = Gpa>`:
-the allocator is a type parameter with a default, so `Vec<i64>` is
-`Vec<i64, Gpa>` (and `Vec<i64>` costs what it did: `Gpa` takes no
-bytes). Code generic over the allocator names it, and changes the
-container through an `inout` parameter (called with `&v`); code that
-only reads takes a slice:
+`Vec<T, A: Allocator>`, `String<A>`, `HashMap<K, V, A>`: the allocator is a
+type parameter, always written (0.26.3: no default, `alloc.default`), so
+`Vec<i64, Gpa>` says it may grow from `Gpa`, which takes no bytes. Code
+generic over the allocator names it, and changes the container through
+an `inout` parameter (called with `&v`); code that only reads takes a
+slice:
 
 ```vole
 fn fill<A: Allocator>(v: inout Vec<i64, A>, n: i64) {
@@ -81,7 +78,7 @@ fn sum(s: [i64]) -> i64 {                     // any Vec's as_slice()
 }
 
 fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     fill(&v, 5);
     println(sum(v.as_slice()));
     0
@@ -91,9 +88,53 @@ fn main(gpa: Gpa) -> i32 {
 10
 ```
 
-An impl block writes every type argument, the defaulted ones too:
-`impl<T, A: Allocator> Tr for Vec<T, A>`. A static cannot hold a `Gpa`:
-keep containers in `main` and pass them (or views of them) down.
+An impl block writes every type argument: `impl<T, A: Allocator> Tr for
+Vec<T, A>`.
+
+## Allocation is a capability (0.26.3)
+
+A function can allocate only through an allocator reachable from its
+parameters, so its signature says whether it may:
+
+- **No default allocator type** (`alloc.default`): `Vec<u8>` is an
+  error; write `Vec<u8, Gpa>`, or a generic `A`.
+- **No static holds an allocator** (`alloc.static`): a static's type is
+  `AllocFree`, looked through fields, payloads and pointers. Keep
+  containers in `main` and pass them (or views of them) down. A bound
+  `T: AllocFree` (`use std::AllocFree;`) keeps a generic function from
+  allocating through what it is given.
+- **A type that holds an allocator names it** (`alloc.field`): a field
+  `Vec<i64, Gpa>` needs `struct Parser<A: Allocator> { toks: Vec<i64, A>
+  }`, used as `Parser<Gpa>`; a literal infers `A` from its fields.
+- **An allocator's impl is unsafe** (`alloc.safe_impl`): `Allocator` is
+  an `unsafe trait`, and `unsafe impl Allocator for T` says, under
+  `// SAFETY:`, where its memory comes from. An `_in` function takes its
+  allocator last (`alloc.last`).
+
+```vole
+struct Parser<A: Allocator> {
+    toks: Vec<i64, A>,
+}
+
+fn parse_in<A: Allocator>(s: [u8], a: A) -> Parser<A> {
+    var p = Parser { toks: Vec::new_in(a) };
+    for c in s { p.toks.push(c as i64); }
+    p
+}
+
+fn main(gpa: Gpa) {
+    let p = parse_in("ab", gpa);
+    println("{}", p.toks.len());
+}
+```
+```out
+2
+```
+
+`volec fix --only alloc` writes what it can: `Gpa` where an allocator is
+missing, the `_in` form with the allocator in scope, a type made generic
+over what it holds, then its uses; `volec explain alloc.field` (and each
+code) tells the rule.
 
 ## Arenas
 

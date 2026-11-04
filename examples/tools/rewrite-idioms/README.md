@@ -36,6 +36,18 @@ word lengths:
    8 ##
 longest line: 3 (37 bytes): And sings the tune without the words,
 --
+main.vl:9:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:29:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+compat.vl:4:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+compat.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+compat.vl:12:29: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:8:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:14:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:30:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:44:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:58:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:69:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built wordstat
 ```
 
@@ -116,11 +128,11 @@ the hole has two types at the sites, and each gets a command:
 
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
-report.vl:69:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
-error edit.breaks: 1 new error; nothing written; the error: report.vl:69:8: no method 'is_empty' on type 'Buf'
-note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'
+report.vl:69:8: error[type error] no method 'is_empty' on type 'Buf<Gpa>' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
+error edit.breaks: 1 new error; nothing written; the error: report.vl:69:8: no method 'is_empty' on type 'Buf<Gpa>'
+note rewrite.where: $v has 2 types at the sites: Vec<[u8],Gpa> (1 site), Buf<Gpa> (1 site); --where takes the ones the replacement fits
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8],Gpa>'
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf<Gpa>'
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
@@ -130,11 +142,9 @@ it skipped is reported with its type, and a command for it:
 
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --show
-rewrote 1 site in 1 file	main.vl	+1 -1 lines
-// main.vl:17
-17	    if ws.is_empty() {
-note rewrite.types: 1 site matches but for --where; first: $v is Buf at report.vl:69:8
-try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf' --dry-run
+note rewrite.none: nothing matches '$v.len() == 0'
+note rewrite.types: 2 sites match but for --where; first: $v is Vec<[u8], Gpa> at main.vl:17:8
+try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8], Gpa>' --dry-run
 ```
 
 ## 4. Index loops become `for x in v`
@@ -185,15 +195,33 @@ pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
 ```console
 $ volec check && volec main.vl -o wordstat && ./wordstat < poem.txt | diff before.txt - && echo same output
 same output
-ok: 0 errors in main.vl
+main.vl:8:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:28:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:7:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:13:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:29:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:43:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:57:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:68:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+ok: 0 errors, 9 warnings in main.vl
+main.vl:8:11: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:28:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:3:10: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:7:17: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:13:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:29:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:43:27: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:57:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+report.vl:68:24: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built wordstat
 $ git diff HEAD --stat
  compat.vl | 19 -----------------
- main.vl   |  3 +--
+ main.vl   |  1 -
  report.vl | 71 +++++++++++++++++++++++++++++++--------------------------------
  stats.vl  | 15 +++++---------
  text.vl   |  3 +--
- 5 files changed, 42 insertions(+), 69 deletions(-)
+ 5 files changed, 41 insertions(+), 68 deletions(-)
 ```
 
 ## Why not by hand

@@ -31,10 +31,11 @@ use crate::front::features::fn_needs;
 use crate::front::lexer::Tok;
 use crate::front::types::{
     ENUMS, FNS, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, VARIANTS, field_offset, fn_param,
-    is_compound, is_signed, is_slice, is_vector, is_void, tuple_offset, type_size,
-    variant_field_offset,
+    int_bits, is_compound, is_integer, is_signed, is_slice, is_vector, is_void, tuple_offset,
+    type_size, variant_field_offset,
 };
 use crate::gen0::gen::expr::panic_kind;
+use crate::gen0::target::arith_panic_kind;
 use crate::middle::ctx::FnCtx;
 use crate::middle::entryfacts::lower_entry_facts;
 use crate::middle::ir::{
@@ -47,7 +48,8 @@ use crate::middle::lower::{
     bind_local, is_dead_block, lower_branch, lower_jump, lower_return, new_slot_for,
 };
 use crate::middle::lower::calls::{
-    call_conv, emit_call_of, lower_call, lower_check, lower_panic, push_call_arg, static_address,
+    arith_check, call_conv, emit_call_of, lower_call, lower_check, lower_panic, overflow_branch,
+    push_call_arg, static_address,
 };
 use crate::middle::lower::expr::{
     BOUND_NODES, BOUND_VALUES, lower_cast, lower_operator, lower_unop, need_value, slice_of_values,
@@ -66,11 +68,11 @@ use crate::places::ir::{
     DS_KEPT, DS_OPEN, DS_REMOVED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR, LF_BORROWED, LF_STATIC,
     LF_TEMP, OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR,
     OK_UNIT, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, P_LOCALS, P_STMTS,
-    P_TARGETS, RV_AGG, RV_BINARY, RV_CAST, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY,
-    RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION,
-    SK_NOP, TK_GOTO, TK_RETURN, TK_SWITCH, UO_NEG, UO_NOT, block_count, block_len, block_start,
-    block_term, full_place_type, has_flag, local_count, op_a, op_b, op_kind, proj_kind, proj_parent,
-    proj_val,
+    P_TARGETS, RV_AGG, RV_BINARY, RV_CAST, RV_CHECKED, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT,
+    RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
+    SK_LIVE, SK_MENTION, SK_NOP, TK_GOTO, TK_RETURN, TK_SWITCH, UO_NEG, UO_NOT, block_count,
+    block_len, block_start, block_term, full_place_type, has_flag, local_count, op_a, op_b, op_kind,
+    proj_kind, proj_parent, proj_val,
 };
 use crate::places::keep::{free_body, load_body};
 use crate::places::shim::drop_shim_fn;
@@ -387,7 +389,7 @@ fn lower_blocks(cx: sink *FnCtx) {
         FWD.push(b);
     }
     // (an empty block that jumps on is its target's: no block of its own)
-    for i in 0..RPO.len() as i64 {
+    for i in 0..RPO.len() {
         let b = RPO[i];
         var t = b;
         var steps = 0;
@@ -399,7 +401,7 @@ fn lower_blocks(cx: sink *FnCtx) {
             FWD[b] = t;
         }
     }
-    for i in 0..RPO.len() as i64 {
+    for i in 0..RPO.len() {
         let b = RPO[i];
         if FWD[b] != b {
             continue;
@@ -413,7 +415,7 @@ fn lower_blocks(cx: sink *FnCtx) {
     B_LEFT[first] += 1;
     lower_jump(cx, mid(cx, first));
     done_edge(cx, first);
-    for i in 0..RPO.len() as i64 {
+    for i in 0..RPO.len() {
         let b = RPO[i];
         if FWD[b] != b {
             continue;
@@ -778,7 +780,12 @@ fn lower_assign(cx: sink *FnCtx, s: PStmt) {
         }
         let a = operand(cx, s.ops, 0);
         let b = operand(cx, s.ops, 1);
+        if s.d == BO_DIV || s.d == BO_REM {
+            lower_division_checks(cx, s, ot, a, b);
+        }
         write_place(cx, dl, dp, lower_operator(cx, token_of(s.d), ot, dt, a, b));
+    } else if rv == RV_CHECKED {
+        write_place(cx, dl, dp, lower_checked(cx, s, dt));
     } else if rv == RV_UNARY {
         if is_vector(dt) {
             bind(cx, NODES[s.e].b, s.ops, 0);
@@ -808,6 +815,61 @@ fn lower_assign(cx: sink *FnCtx, s: PStmt) {
         lower_repeat(cx, s, dt);
     } else if rv == RV_SLICE {
         write_place(cx, dl, dp, lower_slice(cx, s));
+    }
+}
+
+// (0.26.3, decision 6) A checked rvalue (RV_CHECKED): the operation and
+// the branch to Rust's panic at its node when it overflows (a shift's
+// amount is checked first).
+fn lower_checked(cx: sink *FnCtx, s: PStmt, dt: i64) -> i64 {
+    let site = site_of(s.e, 0);
+    let ot = op_type(s.ops, 0);
+    let x = operand(cx, s.ops, 0);
+    if s.nops == 1 {
+        let v = lower_unop(cx, Tok::Minus, dt, x);
+        let kind = arith_panic_kind(UO_NEG, true, false);
+        if is_signed(dt) {
+            overflow_branch(cx, Op::Neg, dt, x, 0, kind, site);
+        } else {
+            arith_check(cx, ir_cmp(cx, Cond::Eq, ir_type(dt), x, ir_const(cx, 0, dt)), kind, site);
+        }
+        return v;
+    }
+    let y = operand(cx, s.ops, 1);
+    if s.d == BO_SHL || s.d == BO_SHR {
+        let ok = ir_cmp(cx, Cond::Lt, TY_U64, y, ir_const(cx, int_bits(ot), TY_U64));
+        arith_check(cx, ok, arith_panic_kind(s.d, false, false), site);
+        return lower_operator(cx, token_of(s.d), ot, dt, x, y);
+    }
+    let r = lower_operator(cx, token_of(s.d), ot, dt, x, y);
+    let op = if s.d == BO_ADD { Op::Add } else if s.d == BO_SUB { Op::Sub } else { Op::Mul };
+    overflow_branch(cx, op, ot, x, y, arith_panic_kind(s.d, false, false), site);
+    r
+}
+
+// (0.26.3, decision 6) The checks of an integer `a / b` or `a % b`
+// (RV_BINARY), at every level: b is not 0, and (signed) not a MIN / -1,
+// each a branch to Rust's panic at its node. A constant divisor needs
+// neither, or only the second when it is -1.
+fn lower_division_checks(cx: sink *FnCtx, s: PStmt, ot: i64, a: i64, b: i64) {
+    if !is_integer(ot) {
+        return;
+    }
+    let site = site_of(s.e, 0);
+    let k = op_kind(s.ops, 1);
+    let known = k == OK_INT || k == OK_CONST;
+    let value = if k == OK_INT { wrap_int(op_a(s.ops, 1), erase_type(op_b(s.ops, 1))) }
+        else if k == OK_CONST { const_value(op_a(s.ops, 1)) } else { 0 };
+    if !known || value == 0 {
+        arith_check(cx, ir_cmp(cx, Cond::Ne, ir_type(ot), b, ir_const(cx, 0, ot)),
+            arith_panic_kind(s.d, false, true), site);
+    }
+    if is_signed(ot) && (!known || value == -1) {
+        let min = (0 - 1) << (int_bits(ot) - 1) as u64;
+        let not_min = ir_cmp(cx, Cond::Ne, ir_type(ot), a, ir_const(cx, min, ot));
+        let not_minus_one = ir_cmp(cx, Cond::Ne, ir_type(ot), b, ir_const(cx, 0 - 1, ot));
+        arith_check(cx, ir_binary(cx, Op::Or, TY_BOOL, not_min, not_minus_one),
+            arith_panic_kind(s.d, false, false), site);
     }
 }
 
@@ -1280,7 +1342,7 @@ fn scan_body(types_only: bool) -> i64 {
         PJ_TY.push(0);
         PJ_ROOT.push(-1);
     }
-    for i in 0..RPO.len() as i64 {
+    for i in 0..RPO.len() {
         let b = RPO[i];
         let start = block_start(b);
         for j in 0..block_len(b) + 1 {

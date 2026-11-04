@@ -419,7 +419,7 @@ pub fn buf_hex(b: i64, value: u64, digits: i64) {
 }
 
 // (0.16) Appends x's Display, an f-string above all:
-// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in one std::Buf
+// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in one std String
 // kept for it (fmt_scratch), then copied (fmt_end): a Display that calls
 // buf_fmt itself would clobber it (none of the compiler's do). Through
 // push_fmt, which 0.15's std and 0.16's both have (0.16 has no
@@ -429,25 +429,25 @@ pub fn buf_fmt<T: std::Display>(b: i64, x: sink T) {
     fmt_end(b);
 }
 
-// The scratch Buf, emptied.
-pub fn fmt_scratch() -> *std::Buf {
+// The scratch String, emptied.
+pub fn fmt_scratch() -> *std::string::String<Comp> {
     unsafe {
-        if FMT_SCRATCH == 0 as *std::Buf {
-            // Zeroed: an empty Buf (no bytes, no capacity), in 0.15 as in
-            // 0.16 (std::Buf::new allocates nothing, but it is not 0.16's).
-            FMT_SCRATCH = alloc_zeroed(size_of(std::Buf)) as *std::Buf;
+        if FMT_SCRATCH == 0 as *std::string::String<Comp> {
+            // Zeroed: an empty String (no bytes, no capacity; 0.26.3: off
+            // std::Buf, which is deprecated).
+            FMT_SCRATCH = alloc_zeroed(size_of(std::string::String<Comp>)) as *std::string::String<Comp>;
         }
         (*FMT_SCRATCH).clear();
         FMT_SCRATCH
     }
 }
 
-// The scratch Buf's text, appended to buffer b.
+// The scratch String's text, appended to buffer b.
 pub fn fmt_end(b: i64) {
     unsafe { buf_bytes(b, (*FMT_SCRATCH).as_slice()); }
 }
 
-static var FMT_SCRATCH: *std::Buf = 0 as *std::Buf;
+static var FMT_SCRATCH: *std::string::String<Comp> = 0 as *std::string::String<Comp>;
 
 // A C string's bytes, up to its NUL: `{cstr(s)}` in an f-string.
 pub fn cstr(s: *u8) -> [u8] {
@@ -519,10 +519,18 @@ pub static var SYMS: Vec<Sym, Comp> = Vec::new_in(Comp {});
 // Open addressing: symbol + 1 per slot, 0 when empty.
 static var SYM_TABLE: *i64 = 0 as *i64;
 static var SYM_TABLE_SIZE: i64 = 0;
+// (0.26.3) True while middle::parallel's tasks run (set by
+// middle::threads around a phase, on one thread or many): a task may look
+// a symbol up but not make one, since the other threads read SYMS and
+// SYM_TABLE meanwhile (a push or a rehash under them is a data race).
+// intern dies instead; a symbol a task needs is made first (parallel's
+// prepare_tasks). Written by the main thread only, before a phase hands
+// its tasks over and after all are done (ordered by the pool's mutex).
+pub static var SYMS_FROZEN: bool = false;
 
 fn hash_bytes(bytes: [u8]) -> u64 {
     var h: u64 = 14695981039346656037;
-    for i in 0..bytes.len as i64 {
+    for i in 0..bytes.len {
         h ^= bytes[i];
         h *= 1099511628211;
     }
@@ -559,13 +567,13 @@ pub fn find_sym(bytes: [u8]) -> i64 {
         if SYM_TABLE_SIZE == 0 {
             return -1;
         }
-        let n = bytes.len as i64;
+        let n = bytes.len;
         let hash = hash_bytes(bytes);
         let mask = (SYM_TABLE_SIZE - 1) as u64;
         var slot = hash & mask;
         while SYM_TABLE[slot] != 0 {
             let sym = SYM_TABLE[slot] - 1;
-            if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+            if SYMS[sym].hash == hash && SYMS[sym].text.len == n
                 && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
                 return sym;
             }
@@ -578,7 +586,8 @@ pub fn find_sym(bytes: [u8]) -> i64 {
 pub fn intern(bytes: [u8]) -> i64 {
     unsafe {
         let n = bytes.len as i64;
-        if (SYMS.len() as i64 + 1) * 2 > SYM_TABLE_SIZE {
+        // (frozen: no rehash, the table has room for the lookup)
+        if !SYMS_FROZEN && (SYMS.len() as i64 + 1) * 2 > SYM_TABLE_SIZE {
             sym_table_rehash();
         }
         let hash = hash_bytes(bytes);
@@ -591,6 +600,19 @@ pub fn intern(bytes: [u8]) -> i64 {
                 return sym;
             }
             slot = (slot + 1) & mask;
+        }
+        if SYMS_FROZEN {
+            // (one write: the other threads may die the same way)
+            let head = c"error: internal: symbol `";
+            let rest = c"` made while the code generator's tasks run (make it first: middle::parallel's prepare_tasks)\n";
+            let h = strlen(head) as i64;
+            let r = strlen(rest) as i64;
+            let line = alloc_zeroed(h + n + r);
+            memcpy(line, head, h as u64);
+            memcpy(&line[h], bytes.ptr, n as u64);
+            memcpy(&line[h + n], rest, r as u64);
+            write(STDERR, line, (h + n + r) as u64);
+            exit(1);
         }
         let sym = SYMS.len() as i64;
         // Symbols keep their own NUL-terminated copy, usable as a C string.
@@ -794,7 +816,7 @@ pub fn root_dir() -> *u8 {
     unsafe {
         if ROOT_DIR == 0 as *u8 {
             ROOT_DIR = c"";
-            if FILES.len() as i64 > 0 {
+            if FILES.len() > 0 {
                 let abs = realpath(FILES[0].path, 0 as *u8);
                 if abs != 0 as *u8 {
                     var cut = strlen(abs) as i64;
@@ -987,10 +1009,10 @@ pub fn streq(a: *u8, b: *u8) -> bool {
 // (0.21) A source file's extension: `.vl`, or `.vl` (vole, the name of
 // 0.24): its length in s, 0 when s names no source file.
 pub fn source_ext_len(s: [u8]) -> i64 {
-    if s.len as i64 > 5 && s[s.len as i64 - 5..s.len as i64] == ".vl" {
+    if s.len > 5 && s[s.len as i64 - 5..] == ".vl" {
         return 5;
     }
-    if s.len as i64 > 3 && s[s.len as i64 - 3..s.len as i64] == ".vl" {
+    if s.len > 3 && s[s.len as i64 - 3..] == ".vl" {
         return 3;
     }
     0
@@ -1008,11 +1030,11 @@ extern "C" {
 
 // (0.21) The environment variables the compiler reads, VOLE_ + these
 // (tests/run.sh checks that every VOLE_ name in compiler/src is here).
-const ENV_NAMES: [*u8; 26] = [
+const ENV_NAMES: [*u8; 25] = [
     c"CACHE", c"CACHE_CHECK", c"CACHE_LIMIT", c"CACHE_STATS", c"CACHE_SYNC", c"CACHE_TRACE",
     c"CACHE_WHY", c"CC", c"CODE_CACHE", c"COUNTERS", c"FRESH_CONTEXTS", c"LINKER", c"LINK_CACHE",
-    c"LOWER", c"LSP_TIME", c"OK", c"OWN_STD",
-    c"PHASE_TIMES", c"PLANT_MISCOMPILE", c"PROTO_OVF", c"PROTO_OVF_SKIP", c"QUERY_FULL",
+    c"LOWER", c"LSP_TIME", c"OK", c"OVF_CENSUS", c"OWN_STD",
+    c"PHASE_TIMES", c"PLANT_MISCOMPILE", c"QUERY_FULL",
     c"QUERY_STD", c"ROOT", c"STRESS_GROW", c"SYNTAX"];
 
 // (0.21, for 0.24's name) At start (main): each VOLE_X in the environment
@@ -1020,7 +1042,7 @@ const ENV_NAMES: [*u8; 26] = [
 // the children inherit both.
 pub fn env_aliases() {
     unsafe {
-        for k in 0..26 {
+        for k in 0..25 {
             let n = ENV_NAMES[k];
             let vole = buf_new();
             buf_str(vole, c"VOLE_");

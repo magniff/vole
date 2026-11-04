@@ -1362,8 +1362,9 @@ class Print(S_):
         self.holes = holes
 
     def emit(self, out, ind):
-        hs = ''.join(' {%s}' % h.code() for h in self.holes)
-        out.append('%sprintln(f"o%d%s");' % (ind, self.n, hs))
+        hs = ' {}' * len(self.holes)
+        args = ''.join(', %s' % h.code() for h in self.holes)
+        out.append('%sprintln("o%d%s"%s);' % (ind, self.n, hs, args))
 
     def run(self, it, fr):
         vals = []
@@ -1676,16 +1677,16 @@ class InoutBlock(S_):
 
 class CloBlock(S_):
     """A block with a closure and its calls:
-    'let'  { let f = || obs(x) + k; println(f"oN {f()} {f()}"); }
-    'var'  { var f = || { x.v += k; x.v }; println(f"oN {f()} {f()}"); }
-    'sink' { let f = sink || x.v + k; println(f"oN {f()}"); }   x moves in
+    'let'  { let f = || obs(x) + k; println("oN {} {}", f(), f()); }
+    'var'  { var f = || { x.v += k; x.v }; println("oN {} {}", f(), f()); }
+    'sink' { let f = sink || x.v + k; println("oN {}", f()); }   x moves in
     'twice' twice(|a: i64| { x.v += a * k; });
     (0.25.3, --closure-params: x moves in, as the closure's argument)
-    'param' { let f = |t: sink T| obs(t) + k; println(f"oN {f(x)}"); }
-    'pass'  { let f = |t: sink T| t; let y = f(x); println(f"oN {obs(y)}"); }
+    'param' { let f = |t: sink T| obs(t) + k; println("oN {}", f(x)); }
+    'pass'  { let f = |t: sink T| t; let y = f(x); println("oN {}", obs(y)); }
     'cond'  { let f = |t: sink T| if t.v > k { eat(t) } else { obs(t) + k }; .. }
-    'bound' { let r = feed(|t| obs(t) + k, x); println(f"oN {r}"); }
-    'map'   { let r = Some(x).map(|t| t.v + k).unwrap_or(0); println(f"oN {r}"); }"""
+    'bound' { let r = feed(|t| obs(t) + k, x); println("oN {r}"); }
+    'map'   { let r = Some(x).map(|t| t.v + k).unwrap_or(0); println("oN {r}"); }"""
     def __init__(self, kind, p, k, n, fname):
         self.kind = kind
         self.p = p
@@ -1697,21 +1698,21 @@ class CloBlock(S_):
         x = self.p.code()
         f = self.f
         if self.kind == 'let':
-            out.append('%s{ let %s = || obs(%s) + %d; println(f"o%d {%s()} {%s()}"); }' % (ind, f, x, self.k, self.n, f, f))
+            out.append('%s{ let %s = || obs(%s) + %d; println("o%d {} {}", %s(), %s()); }' % (ind, f, x, self.k, self.n, f, f))
         elif self.kind == 'var':
-            out.append('%s{ var %s = || { %s.v += %d; %s.v }; println(f"o%d {%s()} {%s()}"); }' % (ind, f, x, self.k, x, self.n, f, f))
+            out.append('%s{ var %s = || { %s.v += %d; %s.v }; println("o%d {} {}", %s(), %s()); }' % (ind, f, x, self.k, x, self.n, f, f))
         elif self.kind == 'sink':
-            out.append('%s{ let %s = sink || %s.v + %d; println(f"o%d {%s()}"); }' % (ind, f, x, self.k, self.n, f))
+            out.append('%s{ let %s = sink || %s.v + %d; println("o%d {}", %s()); }' % (ind, f, x, self.k, self.n, f))
         elif self.kind == 'param':
-            out.append('%s{ let %s = |t: sink T| obs(t) + %d; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.n, f, x))
+            out.append('%s{ let %s = |t: sink T| obs(t) + %d; println("o%d {}", %s(%s)); }' % (ind, f, self.k, self.n, f, x))
         elif self.kind == 'pass':
-            out.append('%s{ let %s = |t: sink T| t; let %s_y = %s(%s); println(f"o%d {obs(%s_y)}"); }' % (ind, f, f, f, x, self.n, f))
+            out.append('%s{ let %s = |t: sink T| t; let %s_y = %s(%s); println("o%d {}", obs(%s_y)); }' % (ind, f, f, f, x, self.n, f))
         elif self.kind == 'cond':
-            out.append('%s{ let %s = |t: sink T| if t.v > %d { eat(t) } else { obs(t) + %d }; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.k, self.n, f, x))
+            out.append('%s{ let %s = |t: sink T| if t.v > %d { eat(t) } else { obs(t) + %d }; println("o%d {}", %s(%s)); }' % (ind, f, self.k, self.k, self.n, f, x))
         elif self.kind == 'bound':
-            out.append('%s{ let %s = feed(|t| obs(t) + %d, %s); println(f"o%d {%s}"); }' % (ind, f, self.k, x, self.n, f))
+            out.append('%s{ let %s = feed(|t| obs(t) + %d, %s); println("o%d {}", %s); }' % (ind, f, self.k, x, self.n, f))
         elif self.kind == 'map':
-            out.append('%s{ let %s = Some(%s).map(|t| t.v + %d).unwrap_or(0); println(f"o%d {%s}"); }' % (ind, f, x, self.k, self.n, f))
+            out.append('%s{ let %s = Some(%s).map(|t| t.v + %d).unwrap_or(0); println("o%d {}", %s); }' % (ind, f, x, self.k, self.n, f))
         else:
             out.append('%stwice(|a: i64| { %s.v += a * %d; });' % (ind, x, self.k))
 
@@ -1746,7 +1747,7 @@ class CloBlock(S_):
 
 
 class ForEachObs(S_):
-    """`for x in w { print(f" {x.id}:{x.v}"); }` and a newline: a loop
+    """`for x in w { print(" {}:{}", x.id, x.v); }` and a newline: a loop
     over the borrowed elements."""
     def __init__(self, p, n):
         self.p = p
@@ -1754,7 +1755,7 @@ class ForEachObs(S_):
 
     def emit(self, out, ind):
         out.append('%sprint("o%d");' % (ind, self.n))
-        out.append('%sfor x in %s { print(f" {x.id}:{x.v}"); }' % (ind, self.p.code()))
+        out.append('%sfor x in %s { print(" {}:{}", x.id, x.v); }' % (ind, self.p.code()))
         out.append('%sprintln("");' % ind)
 
     def run(self, it, fr):
@@ -1780,9 +1781,9 @@ class GenFn:
         out.append('')
 
 
-TYNAME = {'T': 'T', 'V': 'Vec<T>', 'S': 'S', 'E': 'E', 'O': 'Option<T>',
-          'P': 'Pt', 'Str': 'String', 'i': 'i64', 'G': 'G', 'VS': 'Vec<S>'}
-RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T>', 'OI': 'Option<i64>',
+TYNAME = {'T': 'T', 'V': 'Vec<T, Gpa>', 'S': 'S<Gpa>', 'E': 'E', 'O': 'Option<T>',
+          'P': 'Pt', 'Str': 'String<Gpa>', 'i': 'i64', 'G': 'G', 'VS': 'Vec<S<Gpa>, Gpa>'}
+RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T, Gpa>', 'OI': 'Option<i64>',
            'RI': 'Result<i64, i64>'}
 
 
@@ -1822,7 +1823,7 @@ fn mk(v: i64) -> T {
 impl Drop for T {
     fn drop(inout self) {
         LIVE -= 1;
-        println(f"d{self.id}");
+        println("d{}", self.id);
     }
 }
 
@@ -1837,9 +1838,9 @@ impl T {
 }
 
 #[derive(Clone)]
-struct S { t: T, w: Vec<T>, n: i64 }
+struct S<A: Allocator> { t: T, w: Vec<T, A>, n: i64 }
 
-impl S {
+impl S<Gpa> {
     fn tv(self) -> i64 { self.t.v + self.n }
     fn grow(inout self, k: i64) {
         self.w.push(mk(k));
@@ -1854,14 +1855,14 @@ enum E { One(T), Two(T, T), Nada }
 struct G { t: T, k: i64 }
 
 impl Drop for G {
-    fn drop(inout self) { println(f"dg{self.k} {self.t.id}"); }
+    fn drop(inout self) { println("dg{} {}", self.k, self.t.id); }
 }
 
 struct Pt { x: i64, y: i64 }
 
 trait Score { fn score(self) -> i64; }
 impl Score for T { fn score(self) -> i64 { self.v * 2 + 1 } }
-impl Score for S { fn score(self) -> i64 { self.t.v + self.w.len() as i64 + self.n } }
+impl Score for S<Gpa> { fn score(self) -> i64 { self.t.v + self.w.len() as i64 + self.n } }
 
 fn total<X: Score>(x: X) -> i64 { x.score() }
 fn gid<X>(x: sink X) -> X { x }
@@ -1874,18 +1875,18 @@ fn pick(a: sink T, b: sink T, c: bool) -> T {
     if c { return a; }
     b
 }
-fn vsig(w: Vec<T>) -> i64 {
+fn vsig(w: Vec<T, Gpa>) -> i64 {
     var h = 7;
     for x in w { h = h * 31 + x.id * 100 + x.v; }
     h
 }
-fn vbump(w: inout Vec<T>, k: i64) {
+fn vbump(w: inout Vec<T, Gpa>, k: i64) {
     for i in 0..w.len() { w[i].v += k; }
 }
-fn veat(w: sink Vec<T>) -> i64 { w.len() as i64 }
-fn keep(w: inout Vec<T>, t: sink T) { w.push(t); }
-fn ssig(s: S) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
-fn vssig(ws: Vec<S>) -> i64 {
+fn veat(w: sink Vec<T, Gpa>) -> i64 { w.len() as i64 }
+fn keep(w: inout Vec<T, Gpa>, t: sink T) { w.push(t); }
+fn ssig(s: S<Gpa>) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
+fn vssig(ws: Vec<S<Gpa>, Gpa>) -> i64 {
     var h = 3;
     for s in ws { h = h * 17 + ssig(s); }
     h
@@ -1919,7 +1920,7 @@ fn psink(p: sink Pt) -> i64 {
     p.x += 1;
     p.x * 10 + p.y
 }
-fn seat(s: sink String) -> i64 { s.len() as i64 }
+fn seat(s: sink String<Gpa>) -> i64 { s.len() as i64 }
 fn apply<F: Fn(i64) -> i64>(f: F, a: i64) -> i64 { f(a) }
 fn twice<F: FnMut(i64)>(f: sink F) { f(1); f(2); }
 fn callf<F: Fn() -> i64>(f: sink F) -> i64 { f() }
@@ -1928,7 +1929,7 @@ fn feed<F: FnMut(sink T) -> i64>(f: sink F, t: sink T) -> i64 { f(t) }
 
 MAIN = '''fn main(gpa: Gpa) -> i32 {
     run(gpa);
-    println(f"live {LIVE}");
+    println("live {LIVE}");
     0
 }
 '''
@@ -2570,7 +2571,7 @@ class Gen:
             n = self.name('w')
             x = self.vexpr(c)
             self.declare(c, n, 'V', True)
-            return Decl(n, True, 'Vec<T>', x)
+            return Decl(n, True, 'Vec<T, Gpa>', x)
         if r < 0.85:
             n = self.name('o')
             x = NewO(self.texpr(c)) if self.chance(0.7) else NewO(None)
@@ -2693,7 +2694,7 @@ class Gen:
         if not vp:
             n = self.name('w')
             self.declare(c, n, 'V', True)
-            return Decl(n, True, 'Vec<T>', NewVec())
+            return Decl(n, True, 'Vec<T, Gpa>', NewVec())
         p = self.r.choice(vp)
         used = {p.root()}
         r = self.r.random()
@@ -3191,7 +3192,7 @@ class Gen:
         if not vss or self.chance(0.3):
             n = self.name('q')
             self.declare(c, n, 'VS', True)
-            return Decl(n, True, 'Vec<S>', NewVec())
+            return Decl(n, True, 'Vec<S<Gpa>, Gpa>', NewVec())
         v = self.r.choice(vss)
         p = PVar(v.name)
         r = self.r.random()
@@ -3346,12 +3347,16 @@ def compare(events, lines):
     return None
 
 
+# (0.26.3, decision 6: the programs' arithmetic wraps, as the model's
+# wrap() does, at every level, with the overflow checks off; -O0 would
+# check it. tests/run's ovf_ cases test the checks.)
+OVF = '--overflow-checks=off'
 CONFIGS = [
-    ('O0', ['-O0', '-j1', '--check-alloc']),
-    ('O1', ['-O1', '-j1', '--check-alloc']),
-    ('O2', ['-O2', '-j1', '--check-alloc']),
-    ('O2j8', ['-O2', '-j8', '--check-alloc']),
-    ('O2plain', ['-O2', '-j8']),
+    ('O0', ['-O0', '-j1', '--check-alloc', OVF]),
+    ('O1', ['-O1', '-j1', '--check-alloc', OVF]),
+    ('O2', ['-O2', '-j1', '--check-alloc', OVF]),
+    ('O2j8', ['-O2', '-j8', '--check-alloc', OVF]),
+    ('O2plain', ['-O2', '-j8', OVF]),
 ]
 
 

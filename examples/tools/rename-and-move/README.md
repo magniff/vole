@@ -118,7 +118,7 @@ plain `book_index(cat, id)` inside `catalog.vl`, and the qualified
 $ volec refactor rename crate::catalog::find book_index --show
 renamed crate::catalog::find to book_index	catalog.vl	+3 -3 lines
 // catalog.vl:31
-31	pub fn book_index(cat: Catalog, id: i64) -> Option<i64> {
+31	pub fn book_index(cat: Catalog<Gpa>, id: i64) -> Option<i64> {
 // catalog.vl:37
 37	    match book_index(cat, id) {
 // catalog.vl:51
@@ -130,7 +130,7 @@ renamed crate::members::find to member_index	2 files	+3 -3 lines
 // loans.vl:63
 63	            if let Some(i) = crate::members::member_index(ms, member) {
 // members.vl:30
-30	pub fn member_index(ms: Members, id: i64) -> Option<i64> {
+30	pub fn member_index(ms: Members<Gpa>, id: i64) -> Option<i64> {
 ```
 
 ## 3. A local and a parameter
@@ -210,8 +210,8 @@ $ volec query diff
 -pub struct Member {
 +pub struct Patron {
 @@ -14 +14 @@
--    pub list: Vec<Member>,
-+    pub list: Vec<Patron>,
+-    pub list: Vec<Member, A>,
++    pub list: Vec<Patron, A>,
 @@ -24 +24 @@
 -        self.list.push(Member { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });
 +        self.list.push(Patron { id: id as i64, name: name, count: 0, limit: limit, owed: 0 });

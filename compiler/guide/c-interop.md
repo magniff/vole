@@ -173,14 +173,14 @@ needs nothing but libSystem; `--linker=system` runs `ld` instead.
 
 Reading stdin: std has `read_line` and `read_stdin` (`volec guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
-`unistd.h`, into a `Buf` or an array (not mixed with std's, which
+`unistd.h`, into a `Vec<u8, A>` or an array (not mixed with std's, which
 buffers):
 
 ```vole
 import "stdio.h" as c;
 
 fn main(gpa: Gpa) -> i32 {
-    var line = Buf::new_in(gpa);                  // dropped (freed) at the end
+    var line: Vec<u8, Gpa> = Vec::new_in(gpa);    // dropped (freed) at the end
     loop {
         let ch = unsafe { c::getchar() };
         if ch < 0 || ch == '\n' as i32 { break; }

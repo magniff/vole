@@ -13,7 +13,6 @@
 // One thread before 0.21: the event loop polls the controller
 // (`wait_readable`, or its window's watched fds) and calls `read`.
 
-use std::Buf;
 use std::sys::{
     SYS_EAGAIN, SYS_EINTR, SYS_EIO, SYS_POLLERR, SYS_POLLHUP, SYS_POLLIN, SYS_POLLOUT, SYS_SIGHUP,
     SysPollFd, SysWinsize, sys_close, sys_env_at, sys_env_count, sys_exit_code, sys_fork_exec_pty,
@@ -24,16 +23,16 @@ use std::sys::{
 use crate::term::Term;
 use crate::vt::Parser;
 
-pub struct Pty {
+pub struct Pty<A: Allocator> {
     // The controller's descriptor.
     pub fd: i32,
     pub pid: i32,
     // Bytes for the child not written yet.
-    queue: Buf,
+    queue: Vec<u8, A>,
     // The child's exit code, once it exited (-1 before; 128 + signal).
     pub status: i32,
     pub closed: bool,
-    gpa: Gpa,
+    gpa: A,
 }
 
 pub enum PtyError {
@@ -51,8 +50,8 @@ fn winsize(lines: i64, cols: i64, pw: i64, ph: i64) -> SysWinsize {
 
 // The program's full path: as given when it has a `/`, else the first
 // entry of $PATH holding it.
-pub fn find_program(name: [u8], gpa: Gpa) -> Option<Buf> {
-    var b = Buf::new_in(gpa);
+pub fn find_program(name: [u8], gpa: Gpa) -> Option<Vec<u8, Gpa>> {
+    var b = Vec::<u8, Gpa>::new_in(gpa);
     var has_slash = false;
     for c in name {
         if c == '/' {
@@ -60,7 +59,7 @@ pub fn find_program(name: [u8], gpa: Gpa) -> Option<Buf> {
         }
     }
     if has_slash {
-        b.push_str(name);
+        b.extend_from_slice(name);
         return Some(b);
     }
     let path = sys_getenv("PATH").unwrap_or("/usr/bin:/bin");
@@ -71,9 +70,9 @@ pub fn find_program(name: [u8], gpa: Gpa) -> Option<Buf> {
             end += 1;
         }
         b.clear();
-        b.push_str(if end > at { path[at..end] } else { "." });
+        b.extend_from_slice(if end > at { path[at..end] } else { "." });
         b.push('/');
-        b.push_str(name);
+        b.extend_from_slice(name);
         if let Ok(st) = sys_stat(b.as_slice()) {
             if st.is_file() {
                 return Some(b);
@@ -85,16 +84,16 @@ pub fn find_program(name: [u8], gpa: Gpa) -> Option<Buf> {
 }
 
 // The user's shell: $SHELL, else /bin/sh.
-pub fn shell(gpa: Gpa) -> Buf {
-    var b = Buf::new_in(gpa);
-    b.push_str(sys_getenv("SHELL").unwrap_or("/bin/sh"));
+pub fn shell(gpa: Gpa) -> Vec<u8, Gpa> {
+    var b = Vec::<u8, Gpa>::new_in(gpa);
+    b.extend_from_slice(sys_getenv("SHELL").unwrap_or("/bin/sh"));
     b
 }
 
-impl Pty {
+impl Pty<Gpa> {
     // `argv` (argv[0] the program, found on $PATH) on a new pty of the
     // given size.
-    pub fn spawn(argv: [[u8]], lines: i64, cols: i64, gpa: Gpa) -> Result<Pty, PtyError> {
+    pub fn spawn(argv: [[u8]], lines: i64, cols: i64, gpa: Gpa) -> Result<Pty<Gpa>, PtyError> {
         if argv.len == 0 {
             return Err(PtyError::NotFound);
         }
@@ -104,13 +103,13 @@ impl Pty {
         };
         // Every string NUL-ended in one buffer, then the pointers: all made
         // before the fork.
-        var strings = Buf::new_in(gpa);
-        var starts: Vec<i64> = Vec::new_in(gpa);
-        strings.push_str(path.as_slice());
+        var strings = Vec::<u8, Gpa>::new_in(gpa);
+        var starts: Vec<i64, Gpa> = Vec::new_in(gpa);
+        strings.extend_from_slice(path.as_slice());
         strings.push(0);
         for a in argv {
             starts.push(strings.len() as i64);
-            strings.push_str(a);
+            strings.extend_from_slice(a);
             strings.push(0);
         }
         let nargs = starts.len();
@@ -120,18 +119,18 @@ impl Pty {
                 continue;
             }
             starts.push(strings.len() as i64);
-            strings.push_str(e);
+            strings.extend_from_slice(e);
             strings.push(0);
         }
         starts.push(strings.len() as i64);
-        strings.push_str("TERM=xterm-256color");
+        strings.extend_from_slice("TERM=xterm-256color");
         strings.push(0);
         starts.push(strings.len() as i64);
-        strings.push_str("COLORTERM=truecolor");
+        strings.extend_from_slice("COLORTERM=truecolor");
         strings.push(0);
         let base = strings.as_slice().ptr;
-        var av: Vec<*u8> = Vec::new_in(gpa);
-        var ev: Vec<*u8> = Vec::new_in(gpa);
+        var av: Vec<*u8, Gpa> = Vec::new_in(gpa);
+        var ev: Vec<*u8, Gpa> = Vec::new_in(gpa);
         for k in 0..starts.len() {
             // SAFETY: an address inside `strings`, which does not change again
             // before the child's execve; only C reads through it.
@@ -157,7 +156,8 @@ impl Pty {
             Ok(pid) => {
                 let _ = sys_set_nonblocking(m, true);
                 Ok(Pty {
-                    fd: m, pid: pid, queue: Buf::new_in(gpa), status: -1, closed: false, gpa: gpa,
+                    fd: m, pid: pid, queue: Vec::<u8, Gpa>::new_in(gpa), status: -1, closed: false,
+                    gpa: gpa,
                 })
             }
             Err(e) => {
@@ -168,7 +168,7 @@ impl Pty {
     }
 
     // The user's shell as a login shell.
-    pub fn spawn_shell(lines: i64, cols: i64, gpa: Gpa) -> Result<Pty, PtyError> {
+    pub fn spawn_shell(lines: i64, cols: i64, gpa: Gpa) -> Result<Pty<Gpa>, PtyError> {
         let sh = shell(gpa);
         let argv = [sh.as_slice(), "-l"];
         Pty::spawn(argv[..], lines, cols, gpa)
@@ -207,7 +207,7 @@ impl Pty {
 
     // Queues `bytes` for the child and writes what it takes now.
     pub fn write(inout self, bytes: [u8]) {
-        self.queue.push_str(bytes);
+        self.queue.extend_from_slice(bytes);
         self.flush();
     }
 
@@ -236,8 +236,8 @@ impl Pty {
             }
         }
         if done > 0 {
-            var rest = Buf::new_in(self.gpa);
-            rest.push_str(self.queue.as_slice()[done..n]);
+            var rest = Vec::<u8, Gpa>::new_in(self.gpa);
+            rest.extend_from_slice(self.queue.as_slice()[done..n]);
             self.queue = rest;
         }
     }
@@ -309,7 +309,7 @@ impl Pty {
     }
 }
 
-impl Drop for Pty {
+impl Drop for Pty<Gpa> {
     fn drop(inout self) {
         let _ = sys_close(self.fd);
         if self.status < 0 {
@@ -337,7 +337,7 @@ pub fn run_headless(lines: i64, cols: i64, cmd: [[u8]], send: [u8], gpa: Gpa) ->
     };
     var term = Term::new_in(lines, cols, 1000, gpa);
     var parser = Parser::new_in(1048576, gpa);
-    var buf: Vec<u8> = Vec::filled_in(65536, 0, gpa);
+    var buf: Vec<u8, Gpa> = Vec::filled_in(65536, 0, gpa);
     var sent = false;
     let (t0, _) = std::sys::sys_clock_gettime(0);
     loop {
@@ -371,7 +371,7 @@ pub fn run_headless(lines: i64, cols: i64, cmd: [[u8]], send: [u8], gpa: Gpa) ->
         }
     }
     pty.wait();
-    var out = Buf::new_in(gpa);
+    var out = Vec::<u8, Gpa>::new_in(gpa);
     term.stop_sync(&parser);
     term.dump(&out);
     print(out.as_slice());

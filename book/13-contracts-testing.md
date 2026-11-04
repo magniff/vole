@@ -20,14 +20,14 @@ Save this as `ring.vl`:
 ```vole ring.vl
 // ring: a queue of at most `cap` numbers, in memory allocated once.
 
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa>
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
@@ -59,8 +59,8 @@ fn main(gpa: Gpa) {
     var r = Ring::new(3, gpa);
     r.push(10);
     r.push(20);
-    println(f"{r.pop()} {r.pop()}");
-    println(f"{r.pop()}");
+    println("{} {}", r.pop(), r.pop());
+    println("{}", r.pop());
 }
 ```
 
@@ -75,7 +75,7 @@ numbers and pops three:
 
 ```out exit=101
 10 20
-ring.vl:43:16: requires failed: 'self.len > 0' of 'Ring::pop' (ring.vl:29:9): self.len = 0
+ring.vl:43:19: requires failed: 'self.len > 0' of 'Ring<Gpa>::pop' (ring.vl:29:9): self.len = 0
 ```
 
 The program stops with a panic, as a failed `unwrap` does, and exit
@@ -91,8 +91,9 @@ status 101. Read the line from the left:
 
 `new` and `push` have an `else` after their condition. That replaces
 the generic "requires failed" text with a message of your own; the
-values are still printed after it. The message can be an f-string,
-which is only formatted if the check fails.
+values are still printed after it. The message can be a format string
+with integer arguments (`else "len {}", v.len()`), which is only
+formatted if the check fails.
 
 Without a contract, the third `pop` would have read `items[0]` and
 returned whatever stale number was there, and made `len` negative. The
@@ -107,14 +108,14 @@ Here `push` promises to add one item, and has a bug, a forgotten
 `self.len += 1`:
 
 ```vole
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring {
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa> {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
     }
 
@@ -135,7 +136,7 @@ fn main(gpa: Gpa) {
 ```
 
 ```out exit=101
-main.vl:14:9: ensures failed: 'self.len == old(self.len) + 1' of 'Ring::push': self.len = 0
+main.vl:14:9: ensures failed: 'self.len == old(self.len) + 1' of 'Ring<Gpa>::push': self.len = 0
 ```
 
 This time the position is the clause in `push`: a broken promise is
@@ -156,7 +157,7 @@ fn wrap(i: i64, cap: i64) -> i64
 }
 
 fn main() {
-    println(f"{wrap(4, 3)} {wrap(2, 3)}");
+    println("{} {}", wrap(4, 3), wrap(2, 3));
 }
 ```
 
@@ -172,7 +173,7 @@ a check that passes must not change what the program does.
 
 ```vole
 fn checked(v: [i64]) -> bool {
-    println(f"checking {v.len()} items");
+    println("checking {} items", v.len());
     v.len() > 0
 }
 
@@ -184,7 +185,7 @@ fn first(v: [i64]) -> i64
 
 fn main() {
     let v = [1, 2, 3];
-    println(f"{first(v)}");
+    println("{}", first(v));
 }
 ```
 
@@ -221,24 +222,24 @@ it implies. Save this as `checks.vl`:
 use std::env;
 
 #[inline(never)]
-fn at(v: Vec<i64>, i: usize) -> i64 {
+fn at(v: Vec<i64, Gpa>, i: usize) -> i64 {
     v[i]
 }
 
 #[inline(never)]
-fn at_checked(v: Vec<i64>, i: usize) -> i64
+fn at_checked(v: Vec<i64, Gpa>, i: usize) -> i64
     requires i < v.len()
 {
     v[i]
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..10 {
         v.push(i * i);
     }
     let i = env::args().count();
-    println(f"{at(v, i)} {at_checked(v, i)}");
+    println("{} {}", at(v, i), at_checked(v, i));
 }
 ```
 
@@ -262,9 +263,9 @@ caller, where the same reasoning applies; `#[inline(never)]` keeps it
 separate so we can see it.)
 
 Nothing is assumed: a fact comes only from a check that ran. And
-integers wrap around in vole, so a condition may not mean what it looks
-like. `i + 1 < v.len()` is true for an `i` that is the largest `usize`,
-where `i + 1` wraps to 0, so it doesn't prove that
+integers wrap around in an optimized build, so a condition may not mean
+what it looks like. `i + 1 < v.len()` is true for an `i` that is the
+largest `usize`, where `i + 1` wraps to 0 at `-O2`, so it doesn't prove that
 `v[i + 1]` is in range, and that check stays. Write the condition about
 the index you use.
 
@@ -306,7 +307,7 @@ fn contains(v: [i64], x: i64) -> bool
 fn main() {
     let sorted = [1, 3, 5, 7];
     let shuffled = [7, 1, 5, 3];
-    println(f"{contains(sorted, 7)} {contains(shuffled, 7)}");
+    println("{} {}", contains(sorted, 7), contains(shuffled, 7));
 }
 ```
 
@@ -322,7 +323,7 @@ true false
 $ volec search.vl -o search --debug-contracts
 ok: built search
 $ ./search
-search.vl:32:38: contains needs a sorted slice
+search.vl:32:43: contains needs a sorted slice
 ```
 
 `debug ensures` works the same way.
@@ -337,8 +338,8 @@ three tests. There's a bug in `wrap`. Can you see it?
 ```vole ring.vl
 // ring: a queue of at most `cap` numbers, in memory allocated once.
 
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
@@ -348,8 +349,8 @@ fn wrap(i: usize, cap: usize) -> usize {
     if i > cap { i - cap } else { i }
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa>
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
@@ -383,7 +384,7 @@ impl Ring {
     }
 
     fn get(self, i: usize) -> i64
-        requires i < self.len else f"no item {i} in a ring of {self.len}"
+        requires i < self.len else "no item {i} in a ring of {}", self.len
     {
         self.items[wrap(self.start + i, self.cap())]
     }
@@ -410,7 +411,7 @@ fn wraps_around(gpa: Gpa) {
 }
 
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
+fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap as usize, gpa);
         var next = 0;
@@ -429,9 +430,9 @@ fn main(gpa: Gpa) {
     for x in [10, 20, 30] {
         r.push(x);
     }
-    println(f"{r.pop()} {r.get(0)} {r.get(1)}");
+    println("{} {} {}", r.pop(), r.get(0), r.get(1));
     r.push(40);
-    println(f"{r.get(0)} {r.get(1)} {r.get(2)}");
+    println("{} {} {}", r.get(0), r.get(1), r.get(2));
 }
 ```
 
@@ -449,9 +450,9 @@ The third function is a *property*, which we'll come to in a moment.
 $ volec test ring.vl
 test ring.vl: 1 passed, 2 failed (2 #[test], 1 #[property]; -O0 and -O2 agree)
 FAIL wraps_around: ring.vl:34:9: index out of bounds: index 2, length 2
-  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:70 wraps_around
+  trace: ring.vl:34 Ring<Gpa>::push$body < ring.vl:29 Ring<Gpa>::push < ring.vl:70 wraps_around
 FAIL pop_gives_back_what_push_put (property, case 5 of 100, shrunk in 226 steps): ring.vl:34:9: index out of bounds: index 1, length 1
-  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:85 pop_gives_back_what_push_put
+  trace: ring.vl:34 Ring<Gpa>::push$body < ring.vl:29 Ring<Gpa>::push < ring.vl:85 pop_gives_back_what_push_put
   input: xs = [0, 0]
   try: volec test pop_gives_back_what_push_put --seed 0xd098fbd5a16acb77 ring.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
@@ -495,7 +496,7 @@ Look at the property again:
 
 ```vole skip
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
+fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap as usize, gpa);
         var next = 0;
@@ -616,7 +617,7 @@ fn parse_never_crashes(data: [u8]) {
 
 fn main() {
     match parse_command("push 42") {
-        Some(Command::Push(n)) => println(f"push {n}"),
+        Some(Command::Push(n)) => println("push {n}"),
         _ => println("something else"),
     }
 }
@@ -666,7 +667,7 @@ fn doubles(x: i64) {
 }
 
 fn main() {
-    println(f"{double(21)}");
+    println("{}", double(21));
 }
 ```
 

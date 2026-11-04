@@ -267,7 +267,7 @@ END {
     print "        let x0 = v16u8::load(src, " rnd(off + SRCLEN - 15) ");"
     print "        let x2 = v8u8::load(src, " rnd(off + SRCLEN - 7) ");"
     print "        let h = kernel(src[" off ".." (off + SRCLEN) "], dst, x0, x2, s0, j);"
-    print "        println(f\"{h}\");"
+    print "        println(\"{h}\");"
     print "        s0 = s0 ^ (h >> 3);"
     print "        src[j] = src[j] ^ (h as u8);"
     print "    }"
@@ -296,7 +296,7 @@ END {
     }
     print "    var d: u64 = 0;"
     print "    for i in 0.." DSTLEN " { d = d * 31 + (dst[i] as u64); }"
-    print "    println(f\"dst {d}\");"
+    print "    println(\"dst {d}\");"
     print "    0"
     print "}"
 }

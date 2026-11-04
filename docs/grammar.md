@@ -133,12 +133,15 @@ link_name    = "#" "[" "link_name" "=" string_lit "]" ;   (* (0.4) the C symbol,
 
 attributes   = { "#" "[" attribute "]" } ;
 attribute    = "repr" "(" repr { "," repr } ")"        (* (0.3) structs, unions, enums *)
-             | "inline" [ "(" "never" ")" ] | "cold" ;  (* (0.6) functions *)
+             | "inline" [ "(" "never" ")" ] | "cold"    (* (0.6) functions *)
+             | "deprecated" [ "=" string_lit           (* (0.26.3) any item, a method, a field *)
+                            | "(" dep_opt { "," dep_opt } ")" ] ;
+dep_opt      = ( "since" | "note" ) "=" string_lit ;
 repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
 struct_decl  = "struct" ident [ generics ] [ where ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
-field        = [ vis ] ident ":" type ;                (* (0.26) private to the struct's module unless pub *)
+field        = [ "#" "[" "deprecated" ... "]" ] [ vis ] ident ":" type ;   (* (0.26) private to the struct's module unless pub *)
 enum_decl    = "enum" ident [ generics ] [ where ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
@@ -170,7 +173,11 @@ with those bounds, after the written ones: messages name it by its text,
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
 binary operators, casts, enum variants, and array/tuple/struct literals of
-those. Constant arithmetic wraps like run-time arithmetic.
+those. Constant arithmetic is run-time arithmetic (0.26.3, "Defined"
+below): with the overflow checks on, a constant expression whose `+ - *`,
+unary `-` or shift overflows its type is the error `arith.overflow`; with
+them off it wraps. A constant `MIN / -1` or `MIN % -1` is that error at
+every level, and `/ 0` a type error.
 
 **Enums** *(0.3)*. A fieldless enum's variants have discriminants (0, 1, ...
 unless given with `= expr`); such an enum is a scalar, compared with `==`
@@ -199,7 +206,13 @@ layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
 `#[repr(u8)]` (any integer type) sets the tag type of an enum. Functions
 take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). A `static var`
 takes `#[thread_local]` (0.21): each thread has its own copy, made from
-the initializer (`guide threads`). Any other attribute is an error.
+the initializer (`guide threads`). *(0.26.3)* Any item (a function, a
+method, a struct, an enum, a trait, a type alias, a constant, a static)
+and a struct's field take Rust's `#[deprecated]`, `#[deprecated =
+"note"]` or `#[deprecated(since = "..", note = "..")]`: each use of it (a
+call, a name, a type, a path, a `use`, a field read, a struct literal) is
+`warning item.deprecated` with the note, except inside a deprecated item
+and in std's own code. Any other attribute is an error.
 
 ## Types
 
@@ -382,15 +395,31 @@ in unsafe code, `unsafe { ... }` and `unsafe fn`.
 **Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
 run time and in constant folding, which agree):
 
-- Integer overflow of `+`, `-`, `*` and unary `-` wraps at the type's
-  width (two's complement): `i32::MAX + 1 == i32::MIN`,
-  `-i64::MIN == i64::MIN`.
-- Division and remainder by zero: `x / 0 == 0`, `x % 0 == x`.
-  `MIN / -1 == MIN` and `MIN % -1 == 0`.
-- Shifts: the amount is taken modulo 64 for 64-bit operands, and modulo
-  32 for narrower ones, which are shifted as 32-bit values and then
-  truncated (`1u8 << 9 == 0`, `1u8 << 33 == 2`); a negative amount is a
-  large one (`1 << -1 == 1 << 63`). `>>` is arithmetic on signed types,
+- Integer overflow (0.26.3, Rust's arithmetic, decision 6): `+`, `-`,
+  `*`, unary `-` and the shifts are checked when the overflow checks are
+  on, -O0's default; an overflow panics with Rust's message at the
+  expression (`main.vl:4:13: attempt to add with overflow`, exit 101).
+  With them off, -O1's and -O2's default, they wrap at the type's width
+  (two's complement): `i32::MAX + 1 == i32::MIN`, `-i64::MIN ==
+  i64::MIN`. `--overflow-checks=on|off` overrides the level (rustc's
+  `-C overflow-checks`), and std is built with the program's setting.
+  std's integer API never checks: `x.wrapping_add(y)` (`_sub _mul _neg
+  _shl _shr _div _rem _pow _abs`), `checked_*` (an `Option`),
+  `overflowing_*` (the wrapped value and whether it overflowed),
+  `saturating_*`, for every integer type, and `std::num::Wrapping<T>`,
+  whose `+ - * /` and unary `-` wrap (`Wrapping(x)`, its `.value`). Before
+  0.26.3 arithmetic wrapped at every level.
+- Division and remainder by zero panic at every level (`attempt to divide
+  by zero`, `attempt to calculate the remainder with a divisor of zero`),
+  and so do `MIN / -1` and `MIN % -1` (`attempt to divide with
+  overflow`, `attempt to calculate the remainder with overflow`). Before 0.26.3, `x / 0 == 0`, `x % 0 == x` and `MIN / -1 ==
+  MIN`.
+- Shifts: with the overflow checks on, an amount of at least the type's
+  bits panics (`attempt to shift left with overflow`; a negative amount
+  is a large one). With them off, the amount is taken modulo the type's
+  bits, as Rust's release arithmetic (`1u8 << 9 == 2`, `1 << 65 == 2`,
+  `1 << -1 == 1 << 63`; before 0.26.3 an 8- or 16-bit operand took it
+  modulo 32, `1u8 << 9 == 0`). `>>` is arithmetic on signed types,
   logical on unsigned ones.
 - Float to integer conversion (`as`), as Rust's: the value truncated
   toward zero, NaN becomes 0, and every target saturates at its own
@@ -746,7 +775,7 @@ A struct with no fields has its literal anywhere; enum variants' fields
 are public. std's modules are modules like any: a child sees its
 parent's private fields, a sibling does not. What the compiler writes
 itself (main's `Gpa {}`, structural `==`, a derive, a closure's
-captures, an f-string) is let through. On a field of your own program
+captures, a format literal's writes) is let through. On a field of your own program
 the error's help is the declaration with `pub` and where it is, which
 `volec fix --only pub` writes; on a field with a method of its name
 (`v.len`), the call. (Until 0.26 a field was as visible as its struct,
@@ -1427,7 +1456,7 @@ formatting`.
 
 ```ebnf
 postfix    += expr "?"                                   (* as tight as . ( [ *)
-primary    += fstring
+primary    += fstring                                  (* error syntax.fstring, 0.26.3 *)
 fstring     = 'f"' { text | "{{" | "}}" | "{" expr [ ":" spec ] "}" } '"'
 spec        = [ "<" | ">" ] [ "0" ] [ digits ] [ "." digits ] [ "?" | "x" | "X" | "b" | "c" ]
 args        = [ arg { "," arg } [ "," ] ]
@@ -1511,7 +1540,7 @@ block, `r"..."`) that is the first argument of a format function: Rust's
 | format function | the format arguments |
 |---|---|
 | `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
-| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)` |
+| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)`, a `String<A>` on it (0.26.3; a `Buf` before) |
 | `panic`, the message of `assert` and `debug_assert` | after the literal |
 | the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
 | a contract's `else` | `requires c else "len {}", v.len()` |
@@ -1559,8 +1588,12 @@ Until 0.26.1 a plain literal at a format position was printed as it is,
 braces and all; `volec fix --only fstring` doubles such a literal's
 braces, so that its output stays the same.
 
-**f-strings** (`f"..."`, until 0.28) stay accepted: an f-string is an
-expression of the same `std::Interp` type. Its text takes the escapes of
+**f-strings** (`f"..."`, 0.15 to 0.26.2) are removed (0.26.3): an
+f-string is `error syntax.fstring`, once per file, at its first, with
+how many the file has; its `try:` line is `volec fix --only fstring
+--keep-braces FILE`. The lexer and the parser still read the form, so
+that the rest of the file is checked and the fix rewrites it, as
+below. An f-string was an expression of the same `std::Interp` type. Its text takes the escapes of
 a string literal; `{{` and `}}` are braces; `{expr}` is a hole holding
 any expression, `{expr:spec}` one with a spec (the same specs). The lexer
 reads it as pieces: `f"text{` (FHead), the hole's tokens, `:spec}text{`
@@ -1643,24 +1676,25 @@ is the empty set. Several declarations intersect. `volec
 ### Default type parameters
 
 A struct's or an enum's type parameters may end with defaults: `struct
-Vec<T, A: Allocator = Gpa>`. A type leaves out trailing arguments that
-have defaults (`Vec<i64>` is `Vec<i64, Gpa>`; `Buf` is `Buf<Gpa>`); in
-an expression the omitted arguments are inferred, the default when
-nothing binds them (`Vec::new()`). Messages and symbols leave out the
-trailing arguments equal to their defaults. An impl block writes every
-argument: `impl<T, A: Allocator> Vec<T, A>`.
+Pair<T, U = i64>`. A type leaves out trailing arguments that have
+defaults (`Pair<u8>` is `Pair<u8, i64>`); in an expression the omitted
+arguments are inferred, the default when nothing binds them. Messages
+and symbols leave out the trailing arguments equal to their defaults. An
+impl block writes every argument: `impl<T, U> Pair<T, U>`. (0.16 to
+0.26.2, std's allocator parameters had the default `Gpa`, `Vec<T, A:
+Allocator = Gpa>`; from 0.26.3 an allocator parameter has none, and a
+type names its allocator: Allocators, below.)
 
 ### Allocators
 
 std's containers take their memory from an allocator, a type parameter:
-`Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. Allocation
-is explicit: nothing allocates without being given an allocator
-(`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x, a)`,
-`Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`, `format_in(x,
-a)`, `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s,
-a)`, `sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`,
-`v.clone_in(b)`); 0.15's forms (`Vec::new()`, `collect()`,
-`format(x)`...) are errors naming the `_in` form. A program's `Gpa` (C's
+`Vec<T, A: Allocator>`, `Buf<A>`, `String<A>`, `HashMap<K, V, A>`.
+Allocation is explicit: nothing allocates without being given an
+allocator (`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x,
+a)`, `Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`,
+`format_in(x, a)`, `read_stdin_in(a)`, `split_in(s, sep, a)`,
+`split_whitespace_in(s, a)`, `sort_stable_in(s, a)`,
+`sort_stable_by_in(s, f, a)`, `v.clone_in(b)`). A program's `Gpa` (C's
 malloc) is its main's parameter, passed down:
 
 ```ebnf
@@ -1669,10 +1703,44 @@ main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" type ] block
 ```
 
 (any parameter names; the `Gpa` parameter is last). `Allocator`, `Gpa`,
-`Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the prelude
-(arenas: to come). `volec fix --only alloc016` moves a 0.15 program
-over: the calls become their `_in` forms and `gpa: Gpa` is threaded
-from `main` to them ([refactor.md](refactor.md)).
+`Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the
+prelude.
+
+**Allocation as a capability** (0.26.3). An allocator is a value a
+function was given, and the types say which: what a function may
+allocate from is in its signature. The rules, each an error with its
+`explain` text:
+
+- `alloc.default`: a type names its allocator, `Vec<u8, Gpa>`, `Buf<A>`
+  (no allocator parameter has a default; `A: Allocator = Gpa` is the
+  error too).
+- `alloc.no_in`: an allocating call passes the allocator, last, to the
+  `_in` form; 0.15's forms (`Vec::new()`, `collect()`, `s.to_string()`)
+  are this error naming it.
+- `alloc.field`: a struct or enum that holds an allocator names it in
+  its parameters, `struct P<A: Allocator> { v: Vec<u8, A> }`, used as
+  `P<Gpa>`; a literal infers it from its fields.
+- `alloc.static`: a static's type holds no allocator (it is `AllocFree`,
+  an auto trait like `Copy`, which looks through structs, enums, tuples,
+  arrays and pointers): an allocator inside a function came in through a
+  parameter.
+- `alloc.safe_impl`: `Allocator` is an `unsafe trait`; its impls are
+  `unsafe impl Allocator for T`, under `// UNSAFE:` and `// SAFETY:`
+  comments. `unsafe trait` and `unsafe impl` are Rust's: any unsafe
+  trait's impl is `unsafe impl`, and `unsafe impl` of a safe trait is an
+  error.
+- `alloc.last`: a function named `..._in` takes its allocator last.
+
+`volec fix --only alloc` makes the exact fixes, in rounds: `Gpa` written
+where the default was (except in an item generic over an allocator,
+where the choice is the author's), the `_in` form with the one allocator
+in scope, and a struct holding one made generic over it, then its uses
+`P<Gpa>`. `alloc.static`, `alloc.safe_impl` and `alloc.last` have no
+fix: the value moves into main, the SAFETY comment is the author's,
+`volec refactor signature` moves a parameter. (The compiler's own
+sources keep one exemption until 0.26.4: the allocator `base::comp::Comp`,
+which its statics may hold and whose impl stays safe, and the static
+`WGSL_ARENA`.)
 
 ### sealed, scoped
 
@@ -1822,10 +1890,10 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
   In an `ensures`, `result` is the returned value and `old(e)` is `e` at
   the function's entry (T1).
 - A clause's condition is an expression in which `{` ends it, as in an
-  `if`'s condition. The message after `else` is a string or an f-string;
+  `if`'s condition. The message after `else` is a string;
   (0.26.2) a plain literal is a format literal, its arguments after it:
   `requires v.len() > 0 else "empty: {} items", v.len()` (at most three
-  holes, as an f-string's).
+  holes, integers).
 - `#[cfg(test)]` marks the item after it (all of a module's items);
   `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
   compiles them as ordinary items (T2 leaves them out of builds that are

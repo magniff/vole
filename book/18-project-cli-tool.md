@@ -62,8 +62,8 @@ mod report;
 use std::{env, fs, io};
 use std::cli::{Arg, Command, Matches};
 
-fn run(m: Matches, n: usize, gpa: Gpa) -> io::Result<()> {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+fn run(m: Matches<Gpa>, n: usize, gpa: Gpa) -> io::Result<()> {
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&counts, text, gpa);
@@ -86,7 +86,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(m, n, gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"tally: {e}");
+            eprintln("tally: {e}");
             1
         }
     }
@@ -122,7 +122,7 @@ fn trim_punct(word: str) -> str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -136,8 +136,9 @@ pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+    Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -146,9 +147,9 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
     pairs
 }
 
-pub fn print_table(rows: [(String, i64)]) {
+pub fn print_table(rows: [(String<Gpa>, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -330,7 +331,7 @@ fn counts_lines_words_bytes() {
 
 #[test]
 fn trims_punctuation(gpa: Gpa) {
-    var freq: HashMap<str, i64> = HashMap::new_in(gpa);
+    var freq: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     add_words(&freq, "(the) end. The end!");
     assert_eq(freq.get("end"), Some(2));
     assert_eq(freq.get("the"), Some(1));
@@ -339,13 +340,13 @@ fn trims_punctuation(gpa: Gpa) {
 
 // Every word is counted once: the counts add up to the number of words.
 #[property]
-fn counts_add_up(bytes: Vec<u8>, gpa: Gpa) {
+fn counts_add_up(bytes: Vec<u8, Gpa>, gpa: Gpa) {
     let pieces: [str; 4] = ["a", "b", " ", "\n"];
     var text = String::new_in(gpa);
     for b in bytes {
         text.push_str(pieces[(b % 4) as i64]);
     }
-    var freq: HashMap<str, i64> = HashMap::new_in(gpa);
+    var freq: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     add_words(&freq, text);
     var total = 0;
     for (_, k) in freq.iter() {
@@ -393,15 +394,16 @@ use crate::count::Counts;
 // One line of counts, as wc prints them.
 pub fn print_counts(c: Counts, name: str, words_only: bool) {
     if words_only {
-        println(f"{c.words:>8} {name}");
+        println("{:>8} {name}", c.words);
     } else {
-        println(f"{c.lines:>8} {c.words:>8} {c.bytes:>8} {name}");
+        println("{:>8} {:>8} {:>8} {name}", c.lines, c.words, c.bytes);
     }
 }
 
 // The n most common words, most common first; as common, alphabetically.
-pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+    Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -411,7 +413,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
 }
 
 // The width of the word column: the widest word, and at least 4.
-fn word_width(rows: [(String, i64)]) -> i64 {
+fn word_width(rows: [(String<Gpa>, i64)]) -> i64 {
     var w = 4;
     for row in rows {
         if row.0.width() > w {
@@ -429,14 +431,14 @@ fn padding(word: str, w: i64) -> i64
 }
 
 // The rows as a table, the counts lined up however wide the words are.
-pub fn print_table(rows: [(String, i64)]) {
+pub fn print_table(rows: [(String<Gpa>, i64)]) {
     let w = word_width(rows);
     for row in rows {
-        print(f"{row.0}");
+        print("{}", row.0);
         for _ in 0..padding(row.0, w) {
             print(" ");
         }
-        println(f"{row.1:>6}");
+        println("{:>6}", row.1);
     }
 }
 ```
@@ -476,32 +478,32 @@ use std::str::Utf8Error;
 use crate::count::Counts;
 
 // What can go wrong.
-enum TallyError {
+enum TallyError<A: Allocator> {
     // a file can't be read
-    File(String, io::Error),
+    File(String<A>, io::Error),
     // stdin can't be read
     Stdin(IoError),
     // stdin isn't UTF-8 text
     NotText,
 }
 
-impl From<IoError> for TallyError {
-    fn from(e: IoError) -> TallyError {
+impl From<IoError> for TallyError<Gpa> {
+    fn from(e: IoError) -> TallyError<Gpa> {
         TallyError::Stdin(e)
     }
 }
 
-impl From<Utf8Error> for TallyError {
-    fn from(_: Utf8Error) -> TallyError {
+impl From<Utf8Error> for TallyError<Gpa> {
+    fn from(_: Utf8Error) -> TallyError<Gpa> {
         TallyError::NotText
     }
 }
 
-impl Display for TallyError {
+impl Display for TallyError<Gpa> {
     fn fmt(self, f: inout std::Fmt) {
         match self {
-            TallyError::File(path, e) => f.write(f"{path}: {e}"),
-            TallyError::Stdin(e) => f.write(f"stdin: {e}"),
+            TallyError::File(path, e) => f.write("{path}: {e}"),
+            TallyError::Stdin(e) => f.write("stdin: {e}"),
             TallyError::NotText => f.write("the input is not UTF-8 text"),
         }
     }
@@ -509,7 +511,7 @@ impl Display for TallyError {
 
 // Counts one text, and adds its words to totals. The text's own word
 // counts live in an arena, freed all at once when the text is done.
-fn tally(text: str, fold: bool, totals: inout HashMap<String, i64>, gpa: Gpa) -> Counts {
+fn tally(text: str, fold: bool, totals: inout HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Counts {
     arena_scope(gpa, |a| {
         // the words, lowercased if asked: in the arena
         let words = if fold {
@@ -526,13 +528,13 @@ fn tally(text: str, fold: bool, totals: inout HashMap<String, i64>, gpa: Gpa) ->
     count::count(text)
 }
 
-fn run(m: Matches, top: usize, gpa: Gpa) -> Result<(), TallyError> {
+fn run(m: Matches<Gpa>, top: usize, gpa: Gpa) -> Result<(), TallyError<Gpa>> {
     let fold = m.flag("ignore-case");
     let words_only = m.flag("words");
-    var totals: HashMap<String, i64> = HashMap::new_in(gpa);
+    var totals: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     let files = m.values("file");
     if files.len() == 0 {
-        let text = String::from_buf(io::read_stdin_in(gpa)?)?;
+        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
         report::print_counts(tally(text, fold, &totals, gpa), "", words_only);
     }
     var all = Counts { lines: 0, words: 0, bytes: 0 };
@@ -575,7 +577,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(m, top, gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"tally: {e}");
+            eprintln("tally: {e}");
             1
         }
     }
@@ -620,10 +622,10 @@ The two `From` impls let `?` convert errors (chapter 6). In `run`, the
 line that reads standard input uses `?` twice:
 
 ```vole skip
-        let text = String::from_buf(io::read_stdin_in(gpa)?)?;
+        let text = String::from_utf8(io::read_stdin_in(gpa)?)?;
 ```
 
-`read_stdin_in` can fail with an `IoError`, and `String::from_buf`,
+`read_stdin_in` can fail with an `IoError`, and `String::from_utf8`,
 which checks that the bytes are UTF-8 text, with a `Utf8Error`. `?`
 turns each into a `TallyError` through its `From` impl and returns it.
 (The two kinds of I/O error, `IoError` from reading stdin and
@@ -682,7 +684,7 @@ $ echo $?
 ```
 
 `\377` is a byte that can't appear in UTF-8 text, so the input isn't
-text, and `String::from_buf` said so.
+text, and `String::from_utf8` said so.
 
 ## Step 3: tests
 

@@ -657,7 +657,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     queue.submit(enc.finish());
 
     let bytes = out.map_read(&dev)?;          // a view of `out`: waits for the submission
-    println(f"{as_f32s(bytes)[3]}");
+    println("{}", as_f32s(bytes)[3]);
     Ok(())                                     // everything dropped, in reverse order
 }
 ```
