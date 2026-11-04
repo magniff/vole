@@ -65,11 +65,11 @@ fn main(gpa: Gpa) -> i32 {
             Some(Cmd::Show) => {
                 // Rust: writeln!(out, "{} items, first {:?}", items.len(), items[0]);
                 if items.len() > 0 {
-                    out.push_fmt(f"{items.len()} items, first {items.get(0):?}\n");
+                    out.push_fmt("{} items, first {:?}\n", items.len(), items.get(0));
                 }
             }
             // Rust: None => eprintln!("bad line: {}", line),
-            None => eprintln(f"bad line: {line}"),
+            None => eprintln("bad line: {line}"),
         }
     }
     // Rust: items[0].bump();  (an element in place)
@@ -80,9 +80,9 @@ fn main(gpa: Gpa) -> i32 {
     var qs: Vec<i64> = items.iter().map(|it| it.qty).collect_in(gpa);
     sort(qs.as_mut_slice());
     // Rust: if let Some(n) = counts.get("a") { ... }
-    if let Some(n) = counts.get("a") { out.push_fmt(f"a: {n}\n"); }
+    if let Some(n) = counts.get("a") { out.push_fmt("a: {n}\n"); }
     // Rust: println!("{}", total); (formatted with {:>5})
-    out.push_fmt(f"total {total:>5}, smallest {qs.get(0)}\n");
+    out.push_fmt("total {total:>5}, smallest {}\n", qs.get(0));
     print(out.as_slice());
     0
 }
@@ -136,22 +136,22 @@ fn main(gpa: Gpa) -> i32 {
     apply(&st, Op::Push(5)).unwrap();
     apply(&st, Op::Neg).unwrap();
     // Rust: if let Err(e) = apply(...) { eprintln!("{}", e); }
-    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
-    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
+    if let Err(e) = apply(&st, Op::Pop) { println("error: {e}"); }
+    if let Err(e) = apply(&st, Op::Pop) { println("error: {e}"); }
     // Rust: let n: i64 = " 42 ".trim().parse().unwrap();
     let n = parse_int(trim(" 42 ")).unwrap();
     // Rust: let a = (-7i32).abs();  (no methods on numbers: C's, or write it)
     let a = unsafe { abs(-7) };
     // Rust: let s = format!("{}-{}", n, a);
-    let s = format_in(f"{n}-{a}", gpa);
+    let s = format_in("{n}-{a}", gpa);
     // Rust: s.len(), &s[0..2], s.as_bytes()[0] == b'4'
-    println(f"{s.as_slice()} {s.len()} {s.as_slice()[0..2]} {s.as_slice()[0] == '4'}");
+    println("{} {} {} {}", s.as_slice(), s.len(), s.as_slice()[0..2], s.as_slice()[0] == '4');
     println(first_word("hello world"));
     // Rust: let x: u8 = 250u8.wrapping_add(10);  (vole integers always wrap)
     let x: u8 = 250 + 10;
     // Rust: let q = 7 / 0;  panics; here 0, and 7 % 0 == 7
     let z = 0;
-    println(f"{x} {7 / z} {7 % z} {~0}");
+    println("{x} {} {} {}", 7 / z, 7 % z, ~0);
     0
 }
 ```
@@ -174,8 +174,8 @@ More pairs, one line each:
   (taken) -> `x: sink T`; `let mut` -> `var`; `*r = v` -> `r = v` (no
   `*` on an access); nothing returns a reference: return an index or the
   owner; `&v[..]` to an `inout [T]` / `v.as_mut_slice()` to write a slice.
-- `impl Display` / `{:?}` -> `#[derive(Debug)]` and `f"{x:?}"`; `println!`
-  -> `println(f"...")`; `format!` -> `format_in(f"...", gpa)` (a `Buf`).
+- `impl Display` / `{:?}` -> `#[derive(Debug)]` and `"{x:?}"`; `println!`
+  -> `println("...")`, the same format string; `format!` -> `format_in("...", gpa)` (a `Buf`).
 - `panic!("m")` -> `unsafe { std::panic(c"m") }`; `process::exit(n)` ->
   `return n;` from `main`.
 - `(0..n).rev()` -> `while i > 0 { i -= 1; ... }`; `match s { "a" => .. }`

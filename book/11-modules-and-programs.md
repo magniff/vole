@@ -90,7 +90,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
 
 pub fn print_table(rows: [(String, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -165,7 +165,7 @@ mod units {
 }
 
 fn main() {
-    println(f"{units::kib(4)} bytes");
+    println("{} bytes", units::kib(4));
 }
 ```
 
@@ -194,7 +194,7 @@ mod count;
 fn main(gpa: Gpa) {
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     count::add_words(&counts, "the cat and the hat", gpa);
-    println(f"{counts.len()} different words");
+    println("{} different words", counts.len());
 }
 ```
 
@@ -257,7 +257,7 @@ mod report {
     }
 
     pub fn print_table(n: i64) {
-        println(f"table of {n}");
+        println("table of {n}");
     }
 
     pub mod style {
@@ -300,7 +300,7 @@ mod count {
 use count::*;
 
 fn main() {
-    println(f"{add_words(3)}");
+    println("{}", add_words(3));
 }
 ```
 
@@ -330,13 +330,13 @@ mod count {
 }
 
 fn main() {
-    println(f"{add_words(3)}");
+    println("{}", add_words(3));
 }
 ```
 
 ```err
 error[type error]: undefined variable 'add_words'
- --> main.vl: line 8, column 16
+ --> main.vl: line 8, column 19
   = help: add `use crate::count::add_words;`
   = try: volec fix --suggested main.vl
 ```
@@ -400,7 +400,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"wc: {e}");
+            eprintln("wc: {e}");
             1
         }
     }
@@ -460,7 +460,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
 
 pub fn print_table(rows: [(String, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -559,7 +559,7 @@ use std::io;
 
 fn main(gpa: Gpa) -> io::Result<()> {
     let text = fs::read_to_string_in("no-such-file.txt", gpa)?;
-    println(f"{text.len()} bytes");
+    println("{} bytes", text.len());
     Ok(())
 }
 ```
@@ -590,13 +590,13 @@ fn main(gpa: Gpa) -> io::Result<()> {
     {
         var w = BufWriter::new(File::create("squares.txt")?);
         for i in 1..4 {
-            writeln(&w, f"{i} squared is {i * i}")?;
+            writeln(&w, format_args("{i} squared is {}", i * i))?;
         }
     }
     var r = BufReader::new(File::open("squares.txt")?);
     for line in r.lines_in(gpa) {
         let line = line?;
-        println(f"read: {line}");
+        println("read: {line}");
     }
     let notes = fs::read_to_string_in("notes.txt", gpa)?;
     print(notes);
@@ -640,7 +640,7 @@ fn main(gpa: Gpa) -> io::Result<()> {
     }
     names.sort();
     for n in names {
-        println(f"{n}");
+        println("{n}");
     }
     Ok(())
 }
@@ -673,13 +673,13 @@ fn main(gpa: Gpa) {
     c.arg("hello");
     c.arg("from echo");
     let out = c.output_in(gpa).unwrap();
-    println(f"echo exited with {out.status.code():?}");
+    println("echo exited with {:?}", out.status.code());
     let text = String::from_utf8(out.stdout).unwrap();
-    print(f"it printed: {text}");
+    print("it printed: {text}");
 
     var f = Command::new("false");
     let st = f.status().unwrap();
-    println(f"false succeeded: {st.success()}");
+    println("false succeeded: {}", st.success());
 }
 ```
 

@@ -13,7 +13,7 @@ fn f17(x: i64) -> i64 {
 fn main() -> i32 {
     var total = 0;
     total += f17(total % 1000);
-    println(f"{total}");
+    println("{total}");
     0
 }
 % wc -l < main.min.vl | tr -d ' '
@@ -27,7 +27,7 @@ fn last(v: [i64]) -> i64 {
 
 fn main() -> i32 {
     let b = [4, 5];
-    println(f"{last(b[..])}");
+    println("{}", last(b[..]));
     0
 }
 ## nothing to keep

@@ -35,9 +35,9 @@ would rewrite 7 matches in 3 files
 -// The tachyon demo: main.tach and geo/shapes.tach.
 +// The vole demo: main.tach and geo/shapes.tach.
 @@ -5,2 +5,2 @@
--    println(f"{geo::area(3, 4)} tachyon");
+-    println("{} tachyon", geo::area(3, 4));
 -    println("main.tach says Tachyon");
-+    println(f"{geo::area(3, 4)} vole");
++    println("{} vole", geo::area(3, 4));
 +    println("main.tach says Vole");
 note rewrite.excluded: 1 match left in 1 excluded file
 note rewrite.kept: 1 match left in 1 file: in kept lines (the exclusions), or in other places than --comments, --strings, --code ask

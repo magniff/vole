@@ -97,7 +97,8 @@ Within that:
   `a | b`, `a || b` after an operand stay operators, spaced.
   (0.15) An f-string's text is never touched; its holes are laid out as
   expressions, with no space inside the braces or before a spec
-  (`f"{a + b:>8} {p:?}"`). `x?` is tight; a named argument and a field
+  (`f"{a + b:>8} {p:?}"`; f-strings are removed in 0.26.3, a format
+  literal is a string, never touched). `x?` is tight; a named argument and a field
   are `name: value`, a default `x: i64 = 1`; `#[derive(Eq, Ord)]` as a
   call's arguments; closers of nested type arguments stay together
   (`Conv<Vec<i64>>>`).

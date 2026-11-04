@@ -248,7 +248,7 @@ Consequences:
 - **Traits.** Trait methods declare receivers as `&Self`, `&mut Self` or `Self`. A `#[views(...)]` on a trait's method binds every impl, as an effect declaration does. Derived `Clone` (0.15) becomes the deep copy. `Eq`/`Ord`/`Hash` take `&Self`, as they already take `*Self`.
 - **`?`.** It desugars to a `return` (0.15), so pending drops run. Moving the error into `From` is a move.
 - **`defer`.** Defers and drops share one exit list. A `defer` body that uses a local is checked at every exit, against the join of the exit states.
-- **f-strings.** The holes are shared borrows, never moves (`{v:?}` too; the prototype's two remaining false positives were holes lowered as moves): the `Interp` closure is a view. `println(f"{v}")` is free. `let m = f"{v}"; v.push(1); println(m)` is an error with "format(...) it to a Buf, or build it after the push".
+- **f-strings.** The holes are shared borrows, never moves (`{v:?}` too; the prototype's two remaining false positives were holes lowered as moves): the `Interp` closure is a view. `println("{v}")` is free. `let m = format_args("{v}"); v.push(1); println(m)` is an error with "format(...) it to a Buf, or build it after the push".
 - **`match`.** Matching an owned place moves the bindings out (a partial move). Matching `&x`, or a place reached through a reference (`match *self`, `match self.kind`), binds `&T` for owned parts and copies for plain ones, as Rust's default binding modes do (the prototype's other remaining false positive, 4 sites). Today's "bindings are copies" stays true for plain types.
 - **`main -> Result`.** Its body closure drops before the error is printed.
 
@@ -334,7 +334,7 @@ table.vl:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '
 ```tach
 let first = v.as_slice();
 v.push(4);
-println(f"{first[0]}");
+println("{}", first[0]);
 ```
 ```text
 main.vl:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
@@ -366,7 +366,7 @@ main.vl:7:30: error[own.conflict] 'v.push' may move v's elements while the 'for'
 
 ```tach
 fn greet(name: [u8]) -> [u8] {
-    let b = format(f"hello {name}");
+    let b = format(format_args("hello {name}"));
     b.as_slice()
 }
 ```
@@ -404,7 +404,7 @@ struct Lexer { src: Buf, pos: i64 }
 fn word(self: &mut Lexer) -> [u8] { ...; self.src.as_slice()[a..b] }
 let a = lx.word();
 let b = lx.word();
-println(f"{a} {b}");
+println("{a} {b}");
 ```
 ```text
 main.vl:12:13: error[own.conflict] 'lx.word()' borrows 'lx' mutably while 'a' (11:13) views it; 'a' is used at 13:16
@@ -479,7 +479,7 @@ impl Inventory {
 let mut inv = Inventory { items: Vec::new() };
 let snap = inv.clone();  // explicit deep copy; 'let snap = inv;' would move inv
 inv.add("nut", 10);
-println(f"{snap.total()} {inv.total()}");
+println("{} {}", snap.total(), inv.total());
 ```
 
 **3. Iterator invalidation and unnamed views (G1–G3).**
@@ -492,7 +492,7 @@ for x in v { if x % 2 == 0 { v.push(x / 2); } }
 take(v.as_slice(), grow(&mut v));
 // e.vl:5:20: error[own.conflict] 'grow(&mut v)' changes v while the view 'v.as_slice()' (5:6) waits for 'take'
 //   try: volec edit patch e.vl:5 --old 'take(v.as_slice(), grow(&mut v));' --new 'let k = grow(&mut v); take(v.as_slice(), k);'
-fn bad(xs: &mut Vec<i64>, first: &i64) { xs.push(1); println(f"{*first}"); }
+fn bad(xs: &mut Vec<i64>, first: &i64) { xs.push(1); println("{}", *first); }
 bad(&mut v, &v[0]);
 // e.vl:9:13: error[own.conflict] 'v' is borrowed mutably by argument 1 and read by argument 2
 //   help: copy the plain value out first

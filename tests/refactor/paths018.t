@@ -28,7 +28,7 @@ identical
 6
 exit 101
 ok: built ../prog
-main.vl:18:16: requires failed: 's.len() > 0' of 'median' (main.vl:6:5): s.len() = 0
+main.vl:18:19: requires failed: 's.len() > 0' of 'median' (main.vl:6:5): s.len() = 0
 % cd elsewhere && ../prog x y; echo "exit $?"
 6
 3

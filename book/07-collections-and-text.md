@@ -4,7 +4,7 @@ Most programs spend their time on lists of things, tables of things,
 and text. This chapter covers the containers you'll use every day:
 `Vec`, a list that grows; `HashMap` and `HashSet`, for looking things up;
 and `BTreeMap`, when order matters. Then text: `str` and `String`, bytes,
-and f-strings in full.
+and format strings in full.
 
 By the end of the chapter you'll have written a word counter: it reads
 text, counts every word in it, and prints the most common ones as a
@@ -23,8 +23,8 @@ fn main(gpa: Gpa) {
     scores.push(72);
     scores.push(95);
     scores.push(88);
-    println(f"{scores.len()} scores, the first is {scores[0]}");
-    println(f"{scores:?}");
+    println("{} scores, the first is {}", scores.len(), scores[0]);
+    println("{scores:?}");
 }
 ```
 
@@ -57,11 +57,11 @@ fn main(gpa: Gpa) {
     stack.push("first");
     stack.push("second");
     stack.push("third");
-    println(f"{stack.last():?}");
+    println("{:?}", stack.last());
     while let Some(top) = stack.pop() {
         println(top);
     }
-    println(f"{stack.pop():?} {stack.is_empty()}");
+    println("{:?} {}", stack.pop(), stack.is_empty());
 }
 ```
 
@@ -84,12 +84,12 @@ What happens if you ask for an element that isn't there?
 fn main(gpa: Gpa) {
     var v: Vec<i64> = Vec::new_in(gpa);
     v.push(1);
-    println(f"{v[3]}");
+    println("{}", v[3]);
 }
 ```
 
 ```out exit=101
-main.vl:4:16: index out of bounds: index 3, length 1
+main.vl:4:19: index out of bounds: index 3, length 1
 ```
 
 Every index is checked when the program runs. A bad one is a panic:
@@ -114,7 +114,7 @@ fn main(gpa: Gpa) {
     for p in prices {
         total += p;
     }
-    println(f"{prices:?} total {total}");
+    println("{prices:?} total {total}");
 }
 ```
 
@@ -135,16 +135,16 @@ fn main(gpa: Gpa) {
         v.push(x);
     }
     v.sort();
-    println(f"{v:?} {v.contains(9)} {v.contains(10)}");
+    println("{v:?} {} {}", v.contains(9), v.contains(10));
     v.retain(|x| x % 2 == 1);
-    println(f"{v:?}");
+    println("{v:?}");
 
     var fruit: Vec<str> = Vec::new_in(gpa);
     fruit.push("pear");
     fruit.push("fig");
     fruit.push("banana");
     fruit.sort_by_key(|s| s.len());
-    println(f"{fruit:?}");
+    println("{fruit:?}");
 }
 ```
 
@@ -176,7 +176,7 @@ fn main(gpa: Gpa) {
     for x in v {
         v.push(x);
     }
-    println(f"{v:?}");
+    println("{v:?}");
 }
 ```
 
@@ -203,7 +203,7 @@ fn main(gpa: Gpa) {
         let x = v[i];
         v.push(x);
     }
-    println(f"{v:?}");
+    println("{v:?}");
 }
 ```
 
@@ -237,7 +237,7 @@ fn main(gpa: Gpa) {
     points.push(3);
     points.push(4);
     add_bonus(&points, 10);
-    println(f"{points:?} {total(points)}");
+    println("{points:?} {}", total(points));
 }
 ```
 
@@ -330,7 +330,7 @@ a `str` only where the code asks for one. With nothing to say which,
 ```vole
 fn main() {
     let line: str = "  hello  ";
-    println(f"[{line.trim()}]");
+    println("[{}]", line.trim());
 }
 ```
 
@@ -352,15 +352,15 @@ fn main() {
     let line: str = "  width = 80  ";
     let (key, value) = line.split_once('=').unwrap();
     let n = value.trim().parse::<i64>().unwrap();
-    println(f"[{key.trim()}] is {n}");
-    println(f"{line.find("80"):?} {line.contains("width")}");
-    println(f"{line.trim().starts_with("width")} {line.trim().strip_prefix("width"):?}");
+    println("[{}] is {n}", key.trim());
+    println("{:?} {}", line.find("80"), line.contains("width"));
+    println("{} {:?}", line.trim().starts_with("width"), line.trim().strip_prefix("width"));
     for part in "a,b,,c".split(',') {
-        print(f"[{part}]");
+        print("[{part}]");
     }
     println("");
     for word in "the quick\n  brown fox".split_whitespace() {
-        print(f"<{word}>");
+        print("<{word}>");
     }
     println("");
 }
@@ -399,11 +399,11 @@ fn main(gpa: Gpa) {
     var s = String::new_in(gpa);
     s.push_str("vole");
     s.push_str(" is ");
-    s.push_fmt(f"{2 + 2} letters");
+    s.push_fmt("{} letters", 2 + 2);
     println(s);
 
     let name = String::from_in("Ada", gpa);
-    println(f"{name} has {name.len()} letters");
+    println("{name} has {} letters", name.len());
 }
 ```
 
@@ -414,7 +414,7 @@ Ada has 3 letters
 
 `String::new_in(gpa)` makes an empty one, and `String::from_in("...",
 gpa)` one with some text already in it. `push_str` appends text, and
-`push_fmt` appends an f-string. A `String` has every method a `str` has
+`push_fmt` appends formatted text, a format string and its arguments. A `String` has every method a `str` has
 (`name.len()`, `name.trim()`).
 
 A function that only reads text takes a `str`, and you can give it a
@@ -473,13 +473,13 @@ are `String`s, so looking one up needs a `String` too:
 fn main(gpa: Gpa) {
     var ages: HashMap<String, i64> = HashMap::new_in(gpa);
     ages.insert(String::from_in("ada", gpa), 36);
-    println(f"{ages.get("ada"):?}");
+    println("{:?}", ages.get("ada"));
 }
 ```
 
 ```err
 error[type error]: expected 'String', got '[u8]'
- --> main.vl: line 4, column 25
+ --> main.vl: line 4, column 30
   = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)
   = try: String::from_in("ada", gpa)
 ```
@@ -500,16 +500,16 @@ the numbers Unicode gives each character:
 ```vole
 fn main(gpa: Gpa) {
     let word: str = "café";
-    println(f"{word.len()} bytes, {word.chars().count()} code points");
+    println("{} bytes, {} code points", word.len(), word.chars().count());
     for c in word.chars() {
-        print(f"{c} ");
+        print("{c} ");
     }
     println("");
     var s = String::new_in(gpa);
     s.push(0x263A);
-    println(f"{s} is {s.len()} bytes");
+    println("{s} is {} bytes", s.len());
     let b = 'c';
-    println(f"{b} {b:c} {word[0] == b}");
+    println("{b} {b:c} {}", word[0] == b);
 }
 ```
 
@@ -535,8 +535,8 @@ a growable buffer of them, the bytes' `String`:
 ```vole
 fn show(bytes: [u8]) {
     match str::from_utf8(bytes) {
-        Ok(text) => println(f"text: {text}"),
-        Err(e) => println(f"not text: {e}"),
+        Ok(text) => println("text: {text}"),
+        Err(e) => println("not text: {e}"),
     }
 }
 
@@ -580,7 +580,7 @@ fn main(gpa: Gpa) {
     for word in text.split_whitespace() {
         words += 1;
     }
-    println(f"{text.lines().count()} lines, {words} words, {text.len()} bytes");
+    println("{} lines, {words} words, {} bytes", text.lines().count(), text.len());
 }
 ```
 
@@ -617,9 +617,9 @@ fn main(gpa: Gpa) {
     ages.insert("ada", 36);
     ages.insert("alan", 41);
     let old = ages.insert("ada", 37);
-    println(f"{old:?} {ages.get("ada"):?} {ages.get("bob"):?}");
-    println(f"{ages.contains_key("alan")} {ages.len()}");
-    println(f"{ages.remove("alan"):?} {ages.len()}");
+    println("{old:?} {:?} {:?}", ages.get("ada"), ages.get("bob"));
+    println("{} {}", ages.contains_key("alan"), ages.len());
+    println("{:?} {}", ages.remove("alan"), ages.len());
 }
 ```
 
@@ -645,7 +645,7 @@ fn main(gpa: Gpa) {
     for w in "a b a c a b".split(' ') {
         counts.get_or_insert(w, 0)[0] += 1;
     }
-    println(f"{counts.get("a"):?} {counts.get("b"):?} {counts.get("z"):?}");
+    println("{:?} {:?} {:?}", counts.get("a"), counts.get("b"), counts.get("z"));
 }
 ```
 
@@ -671,7 +671,7 @@ You can loop over a map's pairs, but in no particular order:
 
 ```vole skip
     for (word, n) in counts.iter() {
-        println(f"{word} {n}");
+        println("{word} {n}");
     }
 ```
 
@@ -698,18 +698,18 @@ use std::HashSet;
 
 fn main(gpa: Gpa) {
     var seen: HashSet<i64> = HashSet::new_in(gpa);
-    println(f"{seen.insert(3)} {seen.insert(3)} {seen.contains(3)}");
+    println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(3));
 
     var grades: BTreeMap<i64, str> = BTreeMap::new_in(gpa);
     grades.insert(90, "A");
     grades.insert(70, "C");
     grades.insert(80, "B");
     for (score, grade) in grades.iter() {
-        print(f"{score}:{grade} ");
+        print("{score}:{grade} ");
     }
     println("");
     for (score, grade) in grades.range(75, 95) {
-        print(f"{score}:{grade} ");
+        print("{score}:{grade} ");
     }
     println("");
 }
@@ -776,7 +776,7 @@ fn main(gpa: Gpa) {
     let text = str::from_utf8(input.as_slice()).unwrap();
     let counts = count_words(text, gpa);
     let the = String::from_in("the", gpa);
-    println(f"{counts.len()} different words, 'the' {counts.get(the):?} times");
+    println("{} different words, 'the' {:?} times", counts.len(), counts.get(the));
 }
 ```
 
@@ -799,21 +799,24 @@ the map is `HashMap<String, i64>` and not `HashMap<str, i64>`: a
 lowercased word is new text, not a view of the input. The map takes
 the `String`, and drops it with the map at the end of the program.
 
-## Formatting with f-strings
+## Formatting with format strings
 
-The last step is printing a table, so let's look at f-strings in full.
-After the expression in a hole, a colon starts a *format spec*:
+The last step is printing a table, so let's look at format strings in
+full. A hole is `{name}`, a variable's value, or `{}`, the next argument
+after the string; an expression is always an argument (`{}` and then
+`n * 2`), never inside the braces. After the name, or right after `{`, a
+colon starts a *format spec*:
 
 ```vole
 fn main() {
     let n = 42;
     let pi = 3.14159;
     let word: str = "vole";
-    println(f"[{n:>6}] [{n:<6}] [{n:06}]");
-    println(f"[{n:x}] [{n:X}] [{n:b}]");
-    println(f"[{pi:.2}] [{pi:8.3}]");
-    println(f"[{word:>8}] [{word:<8}] [{word:?}]");
-    println(f"{{n}} is {n}, and twice that is {n * 2}");
+    println("[{n:>6}] [{n:<6}] [{n:06}]");
+    println("[{n:x}] [{n:X}] [{n:b}]");
+    println("[{pi:.2}] [{pi:8.3}]");
+    println("[{word:>8}] [{word:<8}] [{word:?}]");
+    println("{{n}} is {n}, and twice that is {}", n * 2);
 }
 ```
 
@@ -844,15 +847,15 @@ one to a user. For your own types, `#[derive(Debug)]` writes the Debug
 form for you (chapter 5), and chapter 9 shows how to write a Display
 form.
 
-An f-string can also become text you keep, instead of being printed:
+Formatted text can also become text you keep, instead of being printed:
 
 ```vole
 fn main(gpa: Gpa) {
-    let label = to_string_in(f"{3}-{"vole"}", gpa);
-    println(f"{label} has {label.len()} bytes");
+    let label = to_string_in(format_args("{}-{}", 3, "vole"), gpa);
+    println("{label} has {} bytes", label.len());
     var report = String::new_in(gpa);
     for i in 1..4 {
-        report.push_fmt(f"{i * i} ");
+        report.push_fmt("{} ", i * i);
     }
     println(report.trim());
 }
@@ -863,8 +866,8 @@ fn main(gpa: Gpa) {
 1 4 9
 ```
 
-`to_string_in(f"...", gpa)` makes a `String`; `push_fmt` appends to one
-you have. (`format_in(f"...", gpa)` does the same into a `Buf`.)
+`to_string_in(format_args("..."), gpa)` makes a `String`; `push_fmt` appends to one
+you have. (`format_in("...", gpa)` does the same into a `Buf`.)
 
 ## The word counter
 
@@ -923,10 +926,10 @@ fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
 
 fn print_table(rows: [(String, i64)], top: usize) {
     let shown = if rows.len() < top { rows.len() } else { top };
-    println(f"{"word":<12} {"count":>5}");
-    println(f"{"----":<12} {"-----":>5}");
+    println("{:<12} {:>5}", "word", "count");
+    println("{:<12} {:>5}", "----", "-----");
     for (word, n) in rows[0..shown] {
-        println(f"{word:<12} {n:>5}");
+        println("{word:<12} {n:>5}");
     }
 }
 
@@ -936,7 +939,7 @@ fn main(gpa: Gpa) {
     let counts = count_words(text, gpa);
     let rows = sorted_counts(counts, gpa);
     print_table(rows, 5);
-    println(f"{counts.len()} different words");
+    println("{} different words", counts.len());
 }
 ```
 
@@ -1003,7 +1006,7 @@ volec words.vl -o words
   `str` where a `str` goes. View methods (`trim`, `split`, `lines`) copy
   nothing; methods that make text take an allocator and end in `_in`.
 - `[u8]` and `Buf` hold bytes; `str::from_utf8` checks them into text.
-- f-string specs: width and alignment, zero padding, precision, hex,
+- format specs: width and alignment, zero padding, precision, hex,
   Debug.
 
 The word counter called `gpa` a lot. The next chapter is about where
