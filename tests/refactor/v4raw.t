@@ -51,7 +51,7 @@ fn main(gpa: Gpa) {
     sort_by(v.as_mut_slice(), |x: i64, y: i64| x - y);
     let k = Key { k: 1 };
     let j = Key { k: 2 };
-    println(f"{mean(a)} {v[0]} {k < j} {first_byte(c"hi")}");
+    println("{} {} {} {}", mean(a), v[0], k < j, first_byte(c"hi"));
 }
 $ main.vl -o prog
 ok: built prog

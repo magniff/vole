@@ -132,18 +132,18 @@
 < {"jsonrpc":"2.0","id":59,"result":{"contents":{"kind":"markdown","value":"```vole\nfn add(self, o: V2) -> V2\neffects: none (inferred)\nfeatures: none\n```\n\n`<crate::V2 as Add>::add` (method)\n"},"range":{"start":{"line":71,"character":30},"end":{"line":71,"character":31}}}}
 > {"jsonrpc":"2.0","id":60,"method":"textDocument/references","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":13,"character":7},"context":{"includeDeclaration":true}}}
 < {"jsonrpc":"2.0","id":60,"result":[{"uri":"file://@DIR@/main.vl","range":{"start":{"line":13,"character":7},"end":{"line":13,"character":10}}},{"uri":"file://@DIR@/main.vl","range":{"start":{"line":71,"character":30},"end":{"line":71,"character":31}}}]}
-## names in an f-string
-> {"jsonrpc":"2.0","id":61,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":15}}}
+## names in a format literal's hole and in its arguments
+> {"jsonrpc":"2.0","id":61,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":42}}}
 < {"jsonrpc":"2.0","id":61,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":64,"character":8},"end":{"line":64,"character":9}}}}
-> {"jsonrpc":"2.0","id":62,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":15}}}
-< {"jsonrpc":"2.0","id":62,"result":{"contents":{"kind":"markdown","value":"```vole\nv: Vec<i64>\n```\n"},"range":{"start":{"line":80,"character":15},"end":{"line":80,"character":16}}}}
-> {"jsonrpc":"2.0","id":63,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":17}}}
+> {"jsonrpc":"2.0","id":62,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":42}}}
+< {"jsonrpc":"2.0","id":62,"result":{"contents":{"kind":"markdown","value":"```vole\nv: Vec<i64>\n```\n"},"range":{"start":{"line":80,"character":42},"end":{"line":80,"character":43}}}}
+> {"jsonrpc":"2.0","id":63,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":44}}}
 < {"jsonrpc":"2.0","id":63,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/std.vl","range":{"start":{"line":214,"character":11},"end":{"line":214,"character":14}}}}
-> {"jsonrpc":"2.0","id":64,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":39}}}
+> {"jsonrpc":"2.0","id":64,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":24}}}
 < {"jsonrpc":"2.0","id":64,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":74,"character":8},"end":{"line":74,"character":13}}}}
-> {"jsonrpc":"2.0","id":65,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":39}}}
-< {"jsonrpc":"2.0","id":65,"result":{"contents":{"kind":"markdown","value":"```vole\ntotal: i64\n```\n"},"range":{"start":{"line":80,"character":39},"end":{"line":80,"character":44}}}}
-> {"jsonrpc":"2.0","id":66,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":47}}}
+> {"jsonrpc":"2.0","id":65,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":24}}}
+< {"jsonrpc":"2.0","id":65,"result":{"contents":{"kind":"markdown","value":"```vole\ni64\n```\n"},"range":{"start":{"line":80,"character":24},"end":{"line":80,"character":29}}}}
+> {"jsonrpc":"2.0","id":66,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":60}}}
 < {"jsonrpc":"2.0","id":66,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":36,"character":3},"end":{"line":36,"character":7}}}}
 ## contracts: their words, and the names in them
 > {"jsonrpc":"2.0","id":67,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":37,"character":4}}}
