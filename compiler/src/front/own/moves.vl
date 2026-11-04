@@ -23,17 +23,17 @@ use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
 use crate::front::own::byref::{BYREF, MATCH_BYREF, copies_owned_items};
+use crate::front::own::ctx::OwnCx;
 use crate::front::own::diag::{
     OWN_DROP_CALL, OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes,
     own_end, own_help, own_help_bytes, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::kinds::{has_drop_impl, is_owned_type, owned_base_type};
 use crate::front::own::state::{
-    DEREF_FIELD, NW, PL_COUNT, PL_FIELD, PL_MASK, PL_MOVED_BY, PL_PARENT, PL_RID, PL_RKIND,
-    RK_LOCAL, RK_STATIC, TUPLE_FIELD, any_and, dmoved_bits, field_number, get_bit, is_below,
-    moved_bits, root_of, set_bit,
+    DEREF_FIELD, RK_LOCAL, RK_STATIC, TUPLE_FIELD, any_and, dmoved_bits, field_number, get_bit,
+    is_below, moved_bits, root_of, set_bit,
 };
-use crate::front::own::walk::{CUR_F, MO_DEREF, MO_INDEX, MO_STATIC, PO_RAW};
+use crate::front::own::walk::{MO_DEREF, MO_INDEX, MO_STATIC};
 use crate::front::types::{FNS, STRUCTS, TLISTS, TYPES, TyKind, buf_type};
 use crate::middle::lower::ssa::HMap;
 
@@ -56,18 +56,18 @@ pub fn on_fn(f: i64) {
 
 // Place p is read, or borrowed, at node n: a use of a moved value is
 // own.moved.
-pub fn on_read(p: i64, n: i64) {
-    check_moved(p, n);
+pub fn on_read(p: i64, n: i64, ocx: inout OwnCx) {
+    check_moved(p, n, &ocx);
 }
 
 // Owned place p is moved at node n; how (walk::MO_*) says how it left its
 // place: out of an index, a pointer or reference, or a static is
 // own.move_out.
-pub fn on_move(p: i64, n: i64, how: i64) {
+pub fn on_move(p: i64, n: i64, how: i64, ocx: inout OwnCx) {
     unsafe {
         if (NODES[n].p & MATCH_BYREF) != 0 {
             // (a match through a reference: its bindings borrow)
-            check_moved(p, n);
+            check_moved(p, n, &ocx);
             return;
         }
         let cap = captured_use(n);
@@ -75,38 +75,38 @@ pub fn on_move(p: i64, n: i64, how: i64) {
             // (0.20: a closure's capture, reached through its env. A sink
             // closure's own one moves out under its flag; any other is
             // still its owner's, or the closure may run again)
-            if cap != n || !sink_capture_move(n) {
-                move_out(p, n, MO_CAPTURED);
+            if cap != n || !sink_capture_move(n, ocx) {
+                move_out(p, n, MO_CAPTURED, ocx);
             }
             return;
         }
-        if how == crate::front::own::walk::MO_DEREF && !PO_RAW && let_param_view(n) {
+        if how == crate::front::own::walk::MO_DEREF && !ocx.po_raw && let_param_view(n) {
             // (0.25) a move-only view a let parameter lends (a closure that
             // changes a capture: `var g = f;` to call it): the callee takes
             // it over for the rest of the call, the caller's waits; the
             // parameter is moved from here
-            check_moved(p, n);
-            set_bit(moved_bits(), p);
-            PL_MOVED_BY[p] = n;
+            check_moved(p, n, &ocx);
+            set_bit(moved_bits(&ocx), p);
+            ocx.pl_moved_by[p] = n;
             return;
         }
         if how != 0 {
-            if PO_RAW {
+            if ocx.po_raw {
                 return;
             }
-            move_out(p, n, how);
+            move_out(p, n, how, ocx);
             return;
         }
-        let root = root_of(p);
-        if PL_RKIND[root] == RK_LOCAL && BYREF.get(PL_RID[root] + 1) != 0 {
-            move_out(p, n, -1);
+        let root = root_of(p, ocx);
+        if ocx.pl_rkind[root] == RK_LOCAL && BYREF.get(ocx.pl_rid[root] + 1) != 0 {
+            move_out(p, n, -1, ocx);
             return;
         }
-        partial(n);
-        check_moved(p, n);
-        set_bit(moved_bits(), p);
-        set_bit(dmoved_bits(), p);
-        PL_MOVED_BY[p] = n;
+        partial(n, ocx);
+        check_moved(p, n, &ocx);
+        set_bit(moved_bits(&ocx), p);
+        set_bit(dmoved_bits(&ocx), p);
+        ocx.pl_moved_by[p] = n;
     }
 }
 
@@ -158,14 +158,14 @@ fn captured_use(n: i64) -> i64 {
 // it is a sink closure's own capture with a flag (closures::finish_closure),
 // the move is allowed (the places IR clears the flag, and stops the
 // program at a second move: build.vl live_writes).
-fn sink_capture_move(n: i64) -> bool {
+fn sink_capture_move(n: i64, ocx: OwnCx) -> bool {
     unsafe {
         if NODES[n].kind != NodeKind::FieldAccess {
             return false;
         }
         var id = -1;
         for i in 0..CLOSURE_COUNT {
-            if CLOSURES[i].f == CUR_F {
+            if CLOSURES[i].f == ocx.cur_f {
                 id = i;
             }
         }
@@ -185,10 +185,10 @@ fn sink_capture_move(n: i64) -> bool {
 // captures: a capture of a borrow of an owned value (a `let` or `inout`
 // parameter, a `let self`, a loop's borrowed element) cannot be taken, as
 // its owner keeps it: own.move_out. (A view, `[T]`, is captured as it is.)
-pub fn sink_borrowed_captures(n: i64) {
+pub fn sink_borrowed_captures(n: i64, ocx: OwnCx) {
     unsafe {
         let id = NODES[n].x - 1;
-        if id < 0 || crate::front::modules::std_moves_bits(FNS[CUR_F].module) {
+        if id < 0 || crate::front::modules::std_moves_bits(FNS[ocx.cur_f].module) {
             return;
         }
         for j in 0..CLOSURES[id].capture_count {
@@ -217,12 +217,12 @@ pub fn sink_borrowed_captures(n: i64) {
 }
 
 // Place p is (re)initialized: it and its parts are no longer moved.
-pub fn on_init(p: i64) {
+pub fn on_init(p: i64, ocx: inout OwnCx) {
     unsafe {
-        let moved = moved_bits();
-        let dmoved = dmoved_bits();
-        for q in p..PL_COUNT {
-            if q == p || is_below(q, p) {
+        let moved = moved_bits(&ocx);
+        let dmoved = dmoved_bits(&ocx);
+        for q in p..ocx.pl_count {
+            if q == p || is_below(q, p, ocx) {
                 let w = q >> 6;
                 let bit = 1 << (q & 63);
                 moved[w] = moved[w] & ~bit;
@@ -237,14 +237,14 @@ pub fn on_init(p: i64) {
 
 // A use of place p at node n: own.moved when a place overlapping it has
 // moved (once per local).
-fn check_moved(p: i64, n: i64) {
+fn check_moved(p: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
-        let moved = moved_bits();
-        if !any_and(moved, &PL_MASK[p * NW]) {
+        let moved = moved_bits(&ocx);
+        if !any_and(moved, &ocx.pl_mask[p * ocx.nw], ocx) {
             return;
         }
-        let root = root_of(p);
-        let key = PL_RID[root] * 4 + PL_RKIND[root] + 1;
+        let root = root_of(p, ocx);
+        let key = ocx.pl_rid[root] * 4 + ocx.pl_rkind[root] + 1;
         if REPORTED.get(key) != 0 {
             return;
         }
@@ -252,18 +252,18 @@ fn check_moved(p: i64, n: i64) {
         REPORTED_KEYS.push(key);
         // (the moved place: the last one found that overlaps p)
         var q = -1;
-        for i in 0..PL_COUNT {
-            if get_bit(moved, i) && get_bit(&PL_MASK[p * NW], i) {
+        for i in 0..ocx.pl_count {
+            if get_bit(moved, i) && get_bit(&ocx.pl_mask[p * ocx.nw], i) {
                 q = i;
             }
         }
-        let definite = any_and(dmoved_bits(), &PL_MASK[p * NW]);
-        let by = if q >= 0 { PL_MOVED_BY[q] } else { 0 };
+        let definite = any_and(dmoved_bits(&ocx), &ocx.pl_mask[p * ocx.nw], ocx);
+        let by = if q >= 0 { ocx.pl_moved_by[q] } else { 0 };
         own_begin(n, OWN_MOVED);
-        place_name(p);
+        place_name(p, ocx);
         if q >= 0 && q != p {
             own_str(c" is used here after ");
-            place_name(q);
+            place_name(q, ocx);
             own_str(if definite { c" moved" } else { c" may have moved" });
         } else {
             own_str(if definite { c" is used here after it moved" }
@@ -331,7 +331,7 @@ fn check_moved(p: i64, n: i64) {
         // (0.25: not a pattern's binding, walk::bind_parts: `.clone()` there
         // does not parse)
         if by > 0 && copy && !closure && NODES[by].kind != NodeKind::PatBind {
-            try_wrap(by, c"", c".clone()");
+            try_wrap(by, c"", c".clone()", ocx);
         }
         own_end();
     }
@@ -591,9 +591,9 @@ fn gpu_handle_help(t: i64) {
 
 // own.move_out: place p moved at node n out of an index, a reference, a
 // static (how: MO_*), or a binding that borrows (-1).
-fn move_out(p: i64, n: i64, how: i64) {
+fn move_out(p: i64, n: i64, how: i64, ocx: OwnCx) {
     unsafe {
-        if crate::front::modules::std_moves_bits(FNS[CUR_F].module) {
+        if crate::front::modules::std_moves_bits(FNS[ocx.cur_f].module) {
             // (std's containers and iterators copy elements as unsafe
             // code does, for the callers that borrow them
             // (drops::borrowed_call); a copy that would be owned twice is
@@ -616,8 +616,8 @@ fn move_out(p: i64, n: i64, how: i64) {
         } else if how == MO_CAPTURED {
             own_str(c"out of the closure that captures it: the closure may be called again, and its drop, or its owner's, drops it");
         } else {
-            let root = root_of(p);
-            var at = BYREF.get(PL_RID[root] + 1) - 1;
+            let root = root_of(p, ocx);
+            var at = BYREF.get(ocx.pl_rid[root] + 1) - 1;
             // (0.18: a requires check's block, through to its call)
             let wrapped = crate::front::contracts::expand::requires_tail(at);
             if wrapped > 0 {
@@ -629,11 +629,11 @@ fn move_out(p: i64, n: i64, how: i64) {
             }
             if at > 0 && NODES[at].kind == NodeKind::Index {
                 own_str(c"out of ");
-                own_sym(LOCALS[PL_RID[root]].name);
+                own_sym(LOCALS[ocx.pl_rid[root]].name);
                 own_str(c": it is a loop's element, which the loop reads in place");
             } else if at > 0 && NODES[at].kind == NodeKind::Call {
                 own_str(c"out of ");
-                own_sym(LOCALS[PL_RID[root]].name);
+                own_sym(LOCALS[ocx.pl_rid[root]].name);
                 own_str(c": it is a copy of an element ");
                 src_quoted(at);
                 own_str(c" (");
@@ -644,15 +644,15 @@ fn move_out(p: i64, n: i64, how: i64) {
                 && NODES[NODES[at].b].kind == NodeKind::Closure) {
                 // (a closure lent to a let parameter, `&|v| ..`, too)
                 own_str(c"out of ");
-                own_sym(LOCALS[PL_RID[root]].name);
+                own_sym(LOCALS[ocx.pl_rid[root]].name);
                 own_str(c": the closure is given an iterator's item, a copy of an element the container keeps");
             } else if at > 0 && NODES[at].kind == NodeKind::Param {
                 own_str(c"out of ");
-                own_sym(LOCALS[PL_RID[root]].name);
+                own_sym(LOCALS[ocx.pl_rid[root]].name);
                 own_str(c": a contract's condition reads the parameters in place");
             } else if at > 0 {
                 own_str(c"out of ");
-                own_sym(LOCALS[PL_RID[root]].name);
+                own_sym(LOCALS[ocx.pl_rid[root]].name);
                 own_str(c": the match on ");
                 src_quoted(at);
                 own_str(c" (");
@@ -694,7 +694,7 @@ fn move_out(p: i64, n: i64, how: i64) {
                 } else {
                     c"read it in place ('let x = v[i];'), take it out with 'v.remove(i)' or 'std::take(&v[i])', or copy it ('.clone()')"
                 });
-                try_wrap(n, c"", c".clone()");
+                try_wrap(n, c"", c".clone()", ocx);
             } else {
                 own_help(if !strict {
                     c"take it out with 'v.remove(i)' or 'std::take(&mut v[i])', or keep the index and use 'v[i]' where it is needed"
@@ -706,7 +706,7 @@ fn move_out(p: i64, n: i64, how: i64) {
         } else if how == -1 {
             if cl {
                 own_help(c"copy it ('.clone()'), or match (or loop over) a value the code owns");
-                try_wrap(n, c"", c".clone()");
+                try_wrap(n, c"", c".clone()", ocx);
             } else {
                 own_help(c"match (or loop over) a value the code owns, or keep an index and read the element in place");
                 no_clone_help(buf_slice(tn));
@@ -714,17 +714,17 @@ fn move_out(p: i64, n: i64, how: i64) {
         } else if how == MO_CAPTURED {
             if cl {
                 own_help(c"use a copy inside the closure ('.clone()'), or move the value out where the closure is made, not in its body");
-                try_wrap(n, c"", c".clone()");
+                try_wrap(n, c"", c".clone()", ocx);
             } else {
                 own_help(c"move the value out where the closure is made, not in its body, or use it in place in the closure");
                 no_clone_help(buf_slice(tn));
             }
-        } else if read_only_root(p) {
+        } else if read_only_root(p, ocx) {
             // (0.24: through a let access, `fn add(self, ..) -> N { self }`:
             // nothing can be taken out of it)
             if cl {
                 own_help(c"it is a let access, read-only: copy it ('.clone()'), or take the parameter 'sink' to own it ('sink self', 'x: sink T')");
-                try_wrap(n, c"", c".clone()");
+                try_wrap(n, c"", c".clone()", ocx);
             } else {
                 own_help(c"it is a let access, read-only: take the parameter 'sink' to own it and store it ('sink self', 'x: sink T'), move it into its one owner and reach it through that owner, or keep an index to it");
                 no_clone_help(buf_slice(tn));
@@ -756,12 +756,12 @@ fn move_out(p: i64, n: i64, how: i64) {
             }
             if owned_base_type(NODES[n].ty) {
                 // (a container keeps its allocator: T4's `take`)
-                try_wrap(n, c"", c".take()");
+                try_wrap(n, c"", c".take()", ocx);
             } else if dflt {
                 try_wrap(n,
-                    c"std::take(&", c")");
+                    c"std::take(&", c")", ocx);
             }
-            if cl { try_wrap(n, c"", c".clone()"); }
+            if cl { try_wrap(n, c"", c".clone()", ocx); }
         }
         gpu_handle_help(NODES[n].ty);
         own_end();
@@ -846,16 +846,16 @@ fn no_clone_help(name: [u8]) {
 
 // Whether place p is reached through a let access (a let parameter or
 // binding that borrows: read-only).
-fn read_only_root(p: i64) -> bool {
+fn read_only_root(p: i64, ocx: OwnCx) -> bool {
     unsafe {
         if p < 0 {
             return false;
         }
-        let root = root_of(p);
-        if PL_RKIND[root] != RK_LOCAL {
+        let root = root_of(p, ocx);
+        if ocx.pl_rkind[root] != RK_LOCAL {
             return false;
         }
-        let l = PL_RID[root];
+        let l = ocx.pl_rid[root];
         let t = LOCALS[l].ty;
         LOCALS[l].access && t > 0 && TYPES[t].kind == TyKind::Ptr
             && TYPES[t].b == crate::front::types::REF_SHARED
@@ -864,10 +864,10 @@ fn read_only_root(p: i64) -> bool {
 
 // own.move_out of value n, no place (`v[i]` of a Vec, a call's `*r`): out
 // of an index or a reference (how: MO_INDEX, MO_DEREF).
-pub fn move_out_value(n: i64, how: i64) {
+pub fn move_out_value(n: i64, how: i64, ocx: OwnCx) {
     // (std's accessors make the copies callers borrow:
     // drops::borrowed_call)
-    move_out(-1, n, how);
+    move_out(-1, n, how, ocx);
 }
 
 // (0.18.1) own.readonly: a `&mut` loan at node n of owned place p (of type
@@ -875,17 +875,17 @@ pub fn move_out_value(n: i64, how: i64) {
 // reference, a `for` loop's element, a copy `v.get(i)` reads): the binding
 // is a bitwise copy, and a change to it (a push that moves the elements,
 // a free) would leave the original pointing at memory that is gone.
-pub fn byref_change(p: i64, n: i64, t: i64) {
+pub fn byref_change(p: i64, n: i64, t: i64, ocx: OwnCx) {
     unsafe {
-        if p < 0 || crate::front::modules::std_moves_bits(FNS[CUR_F].module) || PO_RAW
+        if p < 0 || crate::front::modules::std_moves_bits(FNS[ocx.cur_f].module) || ocx.po_raw
             || !is_owned_type(t) {
             return;
         }
-        let root = root_of(p);
-        if PL_RKIND[root] != RK_LOCAL {
+        let root = root_of(p, ocx);
+        if ocx.pl_rkind[root] != RK_LOCAL {
             return;
         }
-        let l = PL_RID[root];
+        let l = ocx.pl_rid[root];
         let at = BYREF.get(l + 1) - 1;
         if at <= 0 {
             return;
@@ -920,7 +920,7 @@ pub fn byref_change(p: i64, n: i64, t: i64) {
 
 // own.move_out: the value of call n, a copy of an element a collection
 // keeps (drops::borrowed_call), moved at once: passed by value.
-pub fn borrowed_move(n: i64) {
+pub fn borrowed_move(n: i64, ocx: OwnCx) {
     own_begin(n, OWN_MOVE_OUT);
     own_str(c"cannot move ");
     src_quoted(n);
@@ -928,7 +928,7 @@ pub fn borrowed_move(n: i64) {
     own_type(NODES[n].ty);
     own_str(c"): it is a copy of an element the collection keeps");
     own_help(c"copy it ('.clone()'), or pass the element by reference ('&v[i]')");
-    if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
+    if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()", ocx); }
     own_end();
 }
 
@@ -1028,7 +1028,7 @@ fn fn_word(d: [u8]) -> [u8] {
 
 // own.partial: moving node n (a field) out of a value whose type has a
 // Drop impl (its drop needs all of it).
-pub fn partial(n: i64) {
+pub fn partial(n: i64, ocx: OwnCx) {
     var e = n;
     while NODES[e].kind == NodeKind::FieldAccess || NODES[e].kind == NodeKind::TupleField {
         if NODES[e].kind == NodeKind::FieldAccess && NODES[e].y == 1 {
@@ -1045,7 +1045,7 @@ pub fn partial(n: i64) {
             own_type(NODES[base].ty);
             own_str(c"' implements Drop, which needs all of it");
             own_help(c"take the field out and leave a value in its place ('std::take(&x.f)', 'std::replace(&x.f, v)'), or copy it ('.clone()')");
-            try_wrap(n, c"std::take(&", c")");
+            try_wrap(n, c"std::take(&", c")", ocx);
             own_end();
             return;
         }
@@ -1058,14 +1058,14 @@ pub fn partial(n: i64) {
 // its drop needs all of it, so a part alone cannot make it whole again
 // (Rust's E0382, "assign to part of moved value"). With the value there,
 // assigning a part is a write like any other.
-pub fn partial_assign(p: i64, n: i64) {
+pub fn partial_assign(p: i64, n: i64, ocx: inout OwnCx) {
     // UNSAFE: the own pass's place tables (PL_MASK, PL_PARENT, PL_MOVED_BY)
     // and its moved sets are raw arrays (*i64).
     // SAFETY: p and every place read (its parents, i < PL_COUNT) are places
     // the walk made, below PL_COUNT; each set and mask is NW words.
     unsafe {
-        let moved = moved_bits();
-        if !any_and(moved, &PL_MASK[p * NW]) {
+        let moved = moved_bits(&ocx);
+        if !any_and(moved, &ocx.pl_mask[p * ocx.nw], ocx) {
             return;
         }
         var e = NODES[n].b;
@@ -1075,29 +1075,29 @@ pub fn partial_assign(p: i64, n: i64) {
                 return;
             }
             let base = NODES[e].a;
-            let qb = PL_PARENT[q];
+            let qb = ocx.pl_parent[q];
             if qb < 0 {
                 return;
             }
             if has_drop_impl(NODES[base].ty) {
                 // (the whole, or a value it is part of, moved)
                 var by = -1;
-                for i in 0..PL_COUNT {
-                    if get_bit(moved, i) && (i == qb || is_below(qb, i)) {
+                for i in 0..ocx.pl_count {
+                    if get_bit(moved, i) && (i == qb || is_below(qb, i, ocx)) {
                         by = i;
                     }
                 }
                 if by >= 0 {
-                    let definite = get_bit(dmoved_bits(), by);
+                    let definite = get_bit(dmoved_bits(&ocx), by);
                     own_begin(NODES[n].b, OWN_PARTIAL);
                     own_str(c"cannot assign to ");
                     src_quoted(NODES[n].b);
                     own_str(c": ");
                     src_quoted(base);
                     own_str(if definite { c" moved" } else { c" may have moved" });
-                    if PL_MOVED_BY[by] > 0 {
+                    if ocx.pl_moved_by[by] > 0 {
                         own_str(c" at ");
-                        line_col(NODES[PL_MOVED_BY[by]].start);
+                        line_col(NODES[ocx.pl_moved_by[by]].start);
                     }
                     own_str(c", and '");
                     own_type(NODES[base].ty);
@@ -1117,9 +1117,9 @@ pub fn partial_assign(p: i64, n: i64) {
 // (0.25) own.partial: pattern pat, of a match by value, takes owned parts
 // out of a value of type t, which implements Drop (its drop needs all of
 // it).
-pub fn partial_pattern(pat: i64, t: i64) {
+pub fn partial_pattern(pat: i64, t: i64, ocx: OwnCx) {
     unsafe {
-        if crate::front::modules::std_moves_bits(FNS[CUR_F].module) {
+        if crate::front::modules::std_moves_bits(FNS[ocx.cur_f].module) {
             return;
         }
         own_begin(pat, OWN_PARTIAL);
@@ -1136,9 +1136,9 @@ pub fn partial_pattern(pat: i64, t: i64) {
 // (0.25) own.drop_call: call n is `x.drop()` of a type's Drop impl,
 // written by hand (the glue's own calls are not walked): x would be
 // dropped again where its owner's scope ends.
-pub fn drop_call(n: i64) {
+pub fn drop_call(n: i64, ocx: OwnCx) {
     unsafe {
-        if crate::front::modules::std_moves_bits(FNS[CUR_F].module)
+        if crate::front::modules::std_moves_bits(FNS[ocx.cur_f].module)
             || NODES[n].kind != NodeKind::Call || NODES[n].count == 0 {
             return;
         }
@@ -1159,7 +1159,7 @@ pub fn drop_call(n: i64) {
         if NODES[r].start < NODES[r].end && NODES[r].end <= NODES[n].end {
             SKIP_FROM = NODES[r].end;
             SKIP_TO = NODES[n].end;
-            try_wrap(r, c"drop(", c")");
+            try_wrap(r, c"drop(", c")", ocx);
             SKIP_FROM = 0;
             SKIP_TO = 0;
         }
@@ -1259,9 +1259,9 @@ fn quote_bytes(out: i64, s: [u8]) {
 
 // The item (a function) that holds the code walked: a closure's enclosing
 // function.
-fn item_node() -> i64 {
+fn item_node(ocx: OwnCx) -> i64 {
     unsafe {
-        var f = CUR_F;
+        var f = ocx.cur_f;
         var guard = 0;
         while f >= 0 && (NODES[FNS[f].node].p & FN_CLOSURE) != 0 && guard < 64 {
             var outer = -1;
@@ -1281,7 +1281,7 @@ fn item_node() -> i64 {
 // `volec edit patch FILE:LINE --old 'LINE' --new 'LINE'`, the line's
 // text without its indentation (with --nth when the item has it more than
 // once). None in std, or for a node over several lines.
-fn try_wrap(n: i64, pre: *u8, post: *u8) {
+fn try_wrap(n: i64, pre: *u8, post: *u8, ocx: OwnCx) {
     unsafe {
         let start = NODES[n].start;
         let end = NODES[n].end;
@@ -1321,7 +1321,7 @@ fn try_wrap(n: i64, pre: *u8, post: *u8) {
         buf_str(args, c" --new ");
         shell_quoted(args, ls, le, pre_b, start, end, post_b);
         // (the line's text more than once in its item: which one)
-        let item = item_node();
+        let item = item_node(ocx);
         if item != 0 {
             let len = le - ls;
             var seen = 0;
@@ -1356,19 +1356,19 @@ fn try_wrap(n: i64, pre: *u8, post: *u8) {
 }
 
 // The name of place p, quoted: 'v', 'p.a', 't.0'.
-fn place_name(p: i64) {
+fn place_name(p: i64, ocx: OwnCx) {
     let b = buf_new();
     buf_byte(b, '\'');
-    place_text(b, p);
+    place_text(b, p, ocx);
     buf_byte(b, '\'');
     crate::front::own::diag::own_bytes(buf_slice(b));
 }
 
-fn place_text(b: i64, p: i64) {
+fn place_text(b: i64, p: i64, ocx: OwnCx) {
     unsafe {
-        if PL_PARENT[p] >= 0 {
-            place_text(b, PL_PARENT[p]);
-            let f = PL_FIELD[p];
+        if ocx.pl_parent[p] >= 0 {
+            place_text(b, ocx.pl_parent[p], ocx);
+            let f = ocx.pl_field[p];
             if f == DEREF_FIELD {
                 return;
             }
@@ -1380,10 +1380,10 @@ fn place_text(b: i64, p: i64) {
             }
             return;
         }
-        if PL_RKIND[p] == RK_STATIC {
-            buf_bytes(b, SYMS[NODES[crate::front::types::STATICS[PL_RID[p]].node].a].text);
+        if ocx.pl_rkind[p] == RK_STATIC {
+            buf_bytes(b, SYMS[NODES[crate::front::types::STATICS[ocx.pl_rid[p]].node].a].text);
         } else {
-            buf_bytes(b, SYMS[LOCALS[PL_RID[p]].name].text);
+            buf_bytes(b, SYMS[LOCALS[ocx.pl_rid[p]].name].text);
         }
     }
 }

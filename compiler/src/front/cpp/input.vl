@@ -4,7 +4,8 @@
 
 use crate::base::{BUFS, IntVec, buf_byte, buf_new, cstr, intern, read_file};
 use crate::base::comp::Comp;
-use crate::front::cpp::{CINTS, CTOKS, CTOK_COUNT, C_EOF, S_HASH, c_error2, ctok_is, ctok_new};
+use crate::front::cimport::ctx::CImportCx;
+use crate::front::cpp::{CINTS, CTOKS, CTOK_COUNT, C_EOF, c_error2, ctok_is, ctok_new};
 use crate::front::cpp::CK::{Char, Ident, Num, Punct, Str};
 use crate::front::cpp::directives::directive;
 use crate::front::lexer::{is_alpha, is_digit, is_ident_byte};
@@ -44,7 +45,7 @@ fn c_punct_len(p: *u8, n: i64) -> i64 {
 
 // Lexes `n` bytes at `p` (lines already spliced) into tokens of file `f`;
 // returns the first token's index (the tokens end at CTOK_COUNT).
-pub fn c_lex(p: *u8, n: i64, f: i64, first_line: i64) -> i64 {
+pub fn c_lex(p: *u8, n: i64, f: i64, first_line: i64, ccx: inout CImportCx<Comp>) -> i64 {
     unsafe {
         let first = CTOK_COUNT;
         var i = 0;
@@ -132,7 +133,7 @@ pub fn c_lex(p: *u8, n: i64, f: i64, first_line: i64) -> i64 {
             } else {
                 i += c_punct_len(&p[i], n - i);
             }
-            ctok_new(kind, intern(p[start..i]), f, line, space, bol);
+            ctok_new(kind, intern(p[start..i]), f, line, space, bol, &ccx);
             bol = false;
             space = false;
         }
@@ -141,7 +142,7 @@ pub fn c_lex(p: *u8, n: i64, f: i64, first_line: i64) -> i64 {
 }
 
 // Reads a file and lexes it; returns its CFILES index.
-pub fn c_load_file(path: *u8, dir: i64) -> i64 {
+pub fn c_load_file(path: *u8, dir: i64, ccx: inout CImportCx<Comp>) -> i64 {
     unsafe {
         let raw = buf_new();
         read_file(path, raw);
@@ -174,7 +175,7 @@ pub fn c_load_file(path: *u8, dir: i64) -> i64 {
         }
         buf_byte(text, '\n');
         let f = CFILES.len() as i64;
-        let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1);
+        let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1, &ccx);
         CFILES.push(CFile { path, dir, first, end: CTOK_COUNT });
         f
     }
@@ -191,101 +192,87 @@ pub fn cfile_path(f: i64) -> [u8] {
 
 // ---- The input: include frames, and tokens pushed back ----
 
-pub static var FRAME_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var FRAME_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var FRAME_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Tokens to read before the file's: the next one last.
-pub static var CPP_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Expanding a list on its own (macro arguments, #if lines): the end of
-// CPP_PENDING is the end of the input.
-pub static var CPP_LIST_MODE: bool = false;
-
-// Conditional inclusion: per open #if, COND_TAKEN (in the branch being
-// read), COND_SEARCH (no branch taken yet), COND_DONE (a branch was taken).
-pub static var CPP_CONDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn cur_frame() -> i64 {
-    FRAME_FILE.count - 1
+pub fn cur_frame(ccx: CImportCx<Comp>) -> i64 {
+    ccx.frame_file.count - 1
 }
 
-pub fn push_frame(f: i64) {
-    if FRAME_FILE.count > 200 {
+pub fn push_frame(f: i64, ccx: inout CImportCx<Comp>) {
+    if ccx.frame_file.count > 200 {
         c_error2(0, c"#include nested too deeply: ", CFILES[f].path);
     }
-    FRAME_FILE.push(f);
-    FRAME_POS.push(CFILES[f].first);
-    FRAME_COND.push(CPP_CONDS.count);
+    ccx.frame_file.push(f);
+    ccx.frame_pos.push(CFILES[f].first);
+    ccx.frame_cond.push(ccx.cpp_conds.count);
 }
 
 // The next token of the current file, or -1 at its end (no frames: EOF).
-pub fn file_tok() -> i64 {
+pub fn file_tok(ccx: inout CImportCx<Comp>) -> i64 {
     unsafe {
-        let fr = cur_frame();
-        let pos = FRAME_POS.data[fr];
-        if pos >= CFILES[FRAME_FILE.data[fr]].end {
+        let fr = cur_frame(ccx);
+        let pos = ccx.frame_pos.data[fr];
+        if pos >= CFILES[ccx.frame_file.data[fr]].end {
             return -1;
         }
-        FRAME_POS.data[fr] = pos + 1;
+        ccx.frame_pos.data[fr] = pos + 1;
         pos
     }
 }
 
-pub fn file_peek() -> i64 {
+pub fn file_peek(ccx: CImportCx<Comp>) -> i64 {
     unsafe {
-        let fr = cur_frame();
-        let pos = FRAME_POS.data[fr];
-        if pos >= CFILES[FRAME_FILE.data[fr]].end { -1 } else { pos }
+        let fr = cur_frame(ccx);
+        let pos = ccx.frame_pos.data[fr];
+        if pos >= CFILES[ccx.frame_file.data[fr]].end { -1 } else { pos }
     }
 }
 
 // The rest of the directive's line, as a list in CINTS (start, count).
-pub fn line_tokens() -> (i64, i64) {
+pub fn line_tokens(ccx: inout CImportCx<Comp>) -> (i64, i64) {
     let start = CINTS.count;
     loop {
-        let t = file_peek();
+        let t = file_peek(ccx);
         if unsafe { t < 0 || CTOKS[t].bol } {
             break;
         }
-        file_tok();
+        file_tok(&ccx);
         CINTS.push(t);
     }
     (start, CINTS.count - start)
 }
 
-pub fn skip_line() {
+pub fn skip_line(ccx: inout CImportCx<Comp>) {
     loop {
-        let t = file_peek();
+        let t = file_peek(ccx);
         if unsafe { t < 0 || CTOKS[t].bol } {
             return;
         }
-        file_tok();
+        file_tok(&ccx);
     }
 }
 
 // The next token before macro expansion; directives are carried out.
-pub fn raw_next() -> i64 {
+pub fn raw_next(ccx: inout CImportCx<Comp>) -> i64 {
     unsafe {
         loop {
-            if CPP_PENDING.count > 0 {
-                return CPP_PENDING.pop();
+            if ccx.cpp_pending.count > 0 {
+                return ccx.cpp_pending.pop();
             }
-            if CPP_LIST_MODE || FRAME_FILE.count == 0 {
+            if ccx.cpp_list_mode || ccx.frame_file.count == 0 {
                 return C_EOF;
             }
-            let t = file_tok();
+            let t = file_tok(&ccx);
             if t < 0 {
-                if CPP_CONDS.count != FRAME_COND.data[cur_frame()] {
-                    c_error2(0, c"unterminated #if in ", CFILES[FRAME_FILE.data[cur_frame()]].path);
+                if ccx.cpp_conds.count != ccx.frame_cond.data[cur_frame(ccx)] {
+                    c_error2(0, c"unterminated #if in ",
+                        CFILES[ccx.frame_file.data[cur_frame(ccx)]].path);
                 }
-                FRAME_FILE.pop();
-                FRAME_POS.pop();
-                FRAME_COND.pop();
+                ccx.frame_file.pop();
+                ccx.frame_pos.pop();
+                ccx.frame_cond.pop();
                 continue;
             }
-            if CTOKS[t].bol && ctok_is(t, S_HASH) && CTOKS[t].kind == Punct {
-                directive(t);
+            if CTOKS[t].bol && ctok_is(t, ccx.s_hash) && CTOKS[t].kind == Punct {
+                directive(t, &ccx);
                 continue;
             }
             return t;
@@ -293,23 +280,23 @@ pub fn raw_next() -> i64 {
     }
 }
 
-pub fn push_back(t: i64) {
-    CPP_PENDING.push(t);
+pub fn push_back(t: i64, ccx: inout CImportCx<Comp>) {
+    ccx.cpp_pending.push(t);
 }
 
 // Pushes the tokens of a list (in CINTS or scratch) to be read next.
-pub fn push_list(v: IntVec) {
+pub fn push_list(v: IntVec, ccx: inout CImportCx<Comp>) {
     var i = v.count - 1;
     while i >= 0 {
-        unsafe { CPP_PENDING.push(v.data[i]); }
+        unsafe { ccx.cpp_pending.push(v.data[i]); }
         i -= 1;
     }
 }
 
-pub fn c_load_text(path: *u8, text: i64) -> i64 {
+pub fn c_load_text(path: *u8, text: i64, ccx: inout CImportCx<Comp>) -> i64 {
     unsafe {
         let f = CFILES.len() as i64;
-        let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1);
+        let first = c_lex(BUFS[text].data, BUFS[text].len, f, 1, &ccx);
         CFILES.push(CFile { path, dir: -1, first, end: CTOK_COUNT });
         f
     }

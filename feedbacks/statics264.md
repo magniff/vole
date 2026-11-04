@@ -2,7 +2,12 @@
 
 ## Verdict
 
-In progress: P1 and P2 are done. The tool, `volec fix --only statics
+0.26.4's part is done: P1, P2 and P3. 2,151 statics are down to
+1,234, and checking compiler/src costs 6.1% more with one compiler
+(0.89x 0.26.3's with each its own). P3 moved 244 of front's statics into
+six pass contexts. Its groups came from following the dry run's `via`s
+(fix list 12), and its by-hand work was named arguments, owned
+contexts and `pub` records (10, 11). Earlier: The tool, `volec fix --only statics
 --group FILE`, moved the places IR's body and its control-flow graph
 (19 statics) into `places::ir::Body`, passed down as `pbody` to 288
 functions (105 inout, 183 let) from four owners. Nothing was changed by
@@ -10,8 +15,8 @@ hand except the struct. P2 moved 673 of the tools' 760 statics into
 `tools::ctx::Tcx`, passed as `tcx` to 1,228 functions (765 inout) from
 `main` and `cli::run::run`. By hand: the struct, one format hole, seven
 calls passing a field inout beside `tcx`, and two statics the group
-missed. The tool's own 32 statics are among those moved. P3 (front's
-pass state) follows in 0.26.4; P4 to P6 move to 0.26.5.
+missed. The tool's own 32 statics are among those moved. P4 to P6 move
+to 0.26.5.
 
 ## What worked
 
@@ -52,11 +57,18 @@ pass state) follows in 0.26.4; P4 to P6 move to 0.26.5.
    lends it anything (`own.escape` in `edit patch`'s option loop). They
    were taken out of the group and stay statics. The first run had to be
    undone.
-5. `volec check` stops at 50 errors, so `fix --only imports` after the
+5. P3's groups. A pass's statics are mostly reached from outside it:
+   the checker calls the own pass's fast path, places and gen0 read its
+   summaries, and `query own` walks one function. Strictly per module,
+   the checker's, the effects', the patterns' and the modules' statics
+   all drop out. What stayed is state that a pass makes and drops
+   itself. The own pass needed a split by lifetime, done by hand from
+   the module names.
+6. `volec check` stops at 50 errors, so `fix --only imports` after the
    rewrite needed seven rounds, one per 50 missing `use` lines.
-6. Deleting 671 statics with `edit delete`, one process each, took about
+7. Deleting 671 statics with `edit delete`, one process each, took about
    15 minutes.
-7. The sandbox refused shell loops, `$VAR` commands and `xargs git`, so
+8. The sandbox refused shell loops, `$VAR` commands and `xargs git`, so
    each multi-step run went into a script file.
 
 ## Never used
@@ -77,6 +89,14 @@ closure is the tool's), `probe`, `reduce`.
 4. [tool] Done in P2: the tool's own 32 statics are now `tcx` fields.
 5. [tool] Refuse a view-typed static (a slice, a `str`) in a group, and
    say why: as a field, it makes the context a holder of views.
+   [lang, 0.27] The class itself: a static slice that views memory
+   nothing names (an arena's copy, a raw buffer), which no context can
+   hold today because the own pass then ties the context to its callers'
+   locals. 0.27's references give it a lifetime the context can name.
+   P2 left seven: tools::fmt::pieces::FT and BAD_MESSAGE,
+   tools::lsp::complete::TX and PREFIX, tools::reduce::program::WANT,
+   tools::textual::places::LINES_TEXT, and
+   tools::refactor_shape::table::X_TEXT.
 6. [tool] A static named in a format literal's hole (`"{DOC_SEQ}"`)
    becomes `{tcx.doc_seq}`, which is `format.expr-hole`. Write `{}` and
    pass the argument instead.
@@ -89,3 +109,21 @@ closure is the tool's), `probe`, `reduce`.
    so the two statics the group missed were moved by hand.
 9. [tool] `fix --only imports` is bounded by check's 50 errors. It could
    collect every missing `use` in one run.
+10. [tool] A call with named arguments (`ctok_new(.., bol: false)`) got
+    the context before them, positionally, where it fills the named
+    parameter's slot. When the context is the last parameter, it should
+    go after them, named (`ccx: &ccx`). P3 moved 25 by hand.
+11. [tool] A plain context (no owned field) is copied into each let
+    parameter (a memcpy per call: 1.5 KB for OwnCx). The tool should
+    say so. P3 gave each plain context an empty Drop, which makes it
+    owned and therefore lent. [lang] A way to say "lend, don't copy"
+    for a plain struct, without a Drop that does nothing.
+12. [tool] Finding a pass's group is a loop: dry-run the list, follow
+    each member outside the pass down its `via`s to the field it uses,
+    drop that field, and repeat (up to 80 rounds of about 3 s; one field
+    per round at the end). A `--only statics-list --prune PREFIX` that
+    did the loop itself would save that.
+13. [tool] A group with two owners (`check_program` and `own_state_at`)
+    is only right when neither needs what the other's run left. The
+    tool cannot tell, so P3 kept the own pass's walk state (reset by each
+    walk) and left the rest.

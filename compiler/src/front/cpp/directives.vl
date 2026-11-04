@@ -7,27 +7,24 @@ use crate::base::{
     BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_fmt, buf_int, buf_new, buf_slice, cstr, grow,
     intern, intern_c, overlay_of, streq, strlen,
 };
+use crate::base::comp::Comp;
+use crate::front::cimport::ctx::CImportCx;
 use crate::front::cpp::{
-    CINTS, CTOKS, C_IMPORT_FILE, C_IMPORT_PATHS, DEFINING_BUILTINS, MACROS, MACRO_CAP, MACRO_COUNT,
-    MACRO_OF, Macro, ORIGIN_MACRO, S_COMMA, S_COUNTER, S_DEFINED, S_ELLIPSIS, S_FILE, S_GT, S_HASH,
-    S_HAS_INCLUDE, S_HAS_INCLUDE_NEXT, S_LINE, S_LPAREN, S_LT, S_ONE, S_RPAREN, S_VA_ARGS, S_ZERO,
-    c_error, c_error2, ctok_copy, ctok_is, ctok_line, ctok_place, ctok_text, is_query_builtin,
-    macro_of, origin_note, strtoull,
+    CINTS, CTOKS, C_IMPORT_FILE, C_IMPORT_PATHS, MACROS, MACRO_COUNT, Macro, ORIGIN_MACRO, S_LPAREN,
+    S_RPAREN, c_error, c_error2, ctok_copy, ctok_is, ctok_line, ctok_place, ctok_text,
+    is_query_builtin, macro_of, origin_note, strtoull,
 };
 use crate::front::cpp::CK::{Ident, Num, Str};
 use crate::front::cpp::eval::eval_tokens;
 use crate::front::cpp::expand::expand_list;
 use crate::front::cpp::input::{
-    CFILES, CPP_CONDS, FRAME_COND, FRAME_FILE, c_load_file, cur_frame, file_peek, file_tok,
-    line_tokens, push_back, push_frame, skip_line,
+    CFILES, c_load_file, cur_frame, file_peek, file_tok, line_tokens, push_back, push_frame,
+    skip_line,
 };
-use crate::middle::lower::ssa::HMap;
 
 const COND_TAKEN: i64 = 0;
 const COND_SEARCH: i64 = 1;
 const COND_DONE: i64 = 2;
-
-static var CPP_ONCE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Include search: CDIRS holds directory paths (C strings); the first
 // CDIR_USER are from -I.
@@ -35,53 +32,53 @@ pub static var CDIRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // ---- Directives ----
 
-pub fn directive(hash: i64) {
+pub fn directive(hash: i64, ccx: inout CImportCx<Comp>) {
     unsafe {
-        let t = file_peek();
+        let t = file_peek(ccx);
         if t < 0 || CTOKS[t].bol {
             return;
         }
-        file_tok();
+        file_tok(&ccx);
         let name = ctok_text(t);
         if streq(name, c"define") {
-            define_macro();
+            define_macro(&ccx);
         } else if streq(name, c"undef") {
-            let (start, count) = line_tokens();
+            let (start, count) = line_tokens(&ccx);
             if count > 0 {
-                MACRO_OF.put(CTOKS[CINTS.data[start]].text + 1, 0);
+                ccx.macro_of.put(CTOKS[CINTS.data[start]].text + 1, 0);
             }
         }
         else if streq(name, c"include") || streq(name, c"include_next") || streq(name, c"import") {
-            include(t, streq(name, c"include_next"));
+            include(t, streq(name, c"include_next"), &ccx);
         } else if streq(name, c"if") {
-            let (start, count) = line_tokens();
-            begin_cond(eval_if(t, start, count));
+            let (start, count) = line_tokens(&ccx);
+            begin_cond(eval_if(t, start, count, &ccx), &ccx);
         } else if streq(name, c"ifdef") || streq(name, c"ifndef") {
-            let (start, count) = line_tokens();
+            let (start, count) = line_tokens(&ccx);
             if count == 0 {
                 c_error(t, c"#ifdef without a name");
             }
-            let defined = is_defined(CTOKS[CINTS.data[start]].text);
-            begin_cond(defined == streq(name, c"ifdef"));
+            let defined = is_defined(CTOKS[CINTS.data[start]].text, ccx);
+            begin_cond(defined == streq(name, c"ifdef"), &ccx);
         }
         else if streq(name, c"elif") || streq(name, c"elifdef") || streq(name, c"elifndef")
             || streq(name, c"else") {
             // Reached in a taken branch: the rest of the #if is skipped.
-            if CPP_CONDS.count == FRAME_COND.data[cur_frame()] {
+            if ccx.cpp_conds.count == ccx.frame_cond.data[cur_frame(ccx)] {
                 c_error(t, c"#else or #elif without #if");
             }
-            skip_line();
-            CPP_CONDS.data[CPP_CONDS.count - 1] = COND_DONE;
-            skip_branches();
+            skip_line(&ccx);
+            ccx.cpp_conds.data[ccx.cpp_conds.count - 1] = COND_DONE;
+            skip_branches(&ccx);
         } else if streq(name, c"endif") {
-            if CPP_CONDS.count == FRAME_COND.data[cur_frame()] {
+            if ccx.cpp_conds.count == ccx.frame_cond.data[cur_frame(ccx)] {
                 c_error(t, c"#endif without #if");
             }
-            CPP_CONDS.pop();
-            skip_line();
+            ccx.cpp_conds.pop();
+            skip_line(&ccx);
         } else if streq(name, c"error") {
             let b = buf_new();
-            let (start, count) = line_tokens();
+            let (start, count) = line_tokens(&ccx);
             for k in 0..count {
                 if k > 0 {
                     buf_byte(b, ' ');
@@ -91,28 +88,21 @@ pub fn directive(hash: i64) {
             buf_byte(b, 0);
             c_error2(hash, c"#error ", BUFS[b].data);
         } else if streq(name, c"pragma") {
-            let (start, count) = line_tokens();
+            let (start, count) = line_tokens(&ccx);
             if count > 0 && streq(ctok_text(CINTS.data[start]), c"once") {
-                CPP_ONCE.put(intern_c(CFILES[CTOKS[hash].file].path) + 1, 1);
+                ccx.cpp_once.put(intern_c(CFILES[CTOKS[hash].file].path) + 1, 1);
             }
             if count > 0 && streq(ctok_text(CINTS.data[start]), c"pack") {
-                pragma_pack(hash, start + 1, count - 1);
+                pragma_pack(hash, start + 1, count - 1, &ccx);
             }
         } else {
             // #line, #ident, #warning, #sccs, #assert, ...: ignored.
-            skip_line();
+            skip_line(&ccx);
         }
     }
 }
 
-// #pragma pack: (n), (), (push), (push, n), (pop), (push, name, n). The
-// packing in force is passed to the declarations as the tokens
-// `__vole_pack <n>` (0: none).
-static var PACK_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var PACK_NOW: i64 = 0;
-
-fn pragma_pack(at: i64, start: i64, count: i64) {
+fn pragma_pack(at: i64, start: i64, count: i64, ccx: inout CImportCx<Comp>) {
     unsafe {
         var values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var push = false;
@@ -129,75 +119,76 @@ fn pragma_pack(at: i64, start: i64, count: i64) {
             }
         }
         if push {
-            PACK_STACK.push(PACK_NOW);
+            ccx.pack_stack.push(ccx.pack_now);
         }
         if pop {
-            PACK_NOW = if PACK_STACK.count > 0 { PACK_STACK.pop() } else { 0 };
+            ccx.pack_now = if ccx.pack_stack.count > 0 { ccx.pack_stack.pop() } else { 0 };
         }
         if values.count > 0 {
-            PACK_NOW = values.data[values.count - 1];
+            ccx.pack_now = values.data[values.count - 1];
         } else if !push && !pop {
-            PACK_NOW = 0;
+            ccx.pack_now = 0;
         }
-        let marker = ctok_copy(at);
+        let marker = ctok_copy(at, &ccx);
         CTOKS[marker].kind = Ident;
         CTOKS[marker].text = intern_c(c"__vole_pack");
-        let value = ctok_copy(at);
+        let value = ctok_copy(at, &ccx);
         CTOKS[value].kind = Num;
         let b = buf_new();
-        buf_int(b, PACK_NOW);
+        buf_int(b, ccx.pack_now);
         CTOKS[value].text = intern(buf_slice(b));
-        push_back(value);
-        push_back(marker);
+        push_back(value, &ccx);
+        push_back(marker, &ccx);
     }
 }
 
-pub fn is_defined(sym: i64) -> bool {
-    macro_of(sym) >= 0 || sym == S_LINE || sym == S_FILE || sym == S_COUNTER
-        || sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT || is_query_builtin(sym)
+pub fn is_defined(sym: i64, ccx: CImportCx<Comp>) -> bool {
+    macro_of(sym, ccx) >= 0 || sym == ccx.s_line || sym == ccx.s_file || sym == ccx.s_counter
+        || sym == ccx.s_has_include || sym == ccx.s_has_include_next || is_query_builtin(sym)
 }
 
-fn define_macro() {
+fn define_macro(ccx: inout CImportCx<Comp>) {
     unsafe {
-        let name_tok = file_tok();
+        let name_tok = file_tok(&ccx);
         if name_tok < 0 || CTOKS[name_tok].bol || CTOKS[name_tok].kind != Ident {
             c_error(name_tok, c"#define needs a macro name");
         }
-        MACROS = grow(MACROS, MACRO_COUNT, &MACRO_CAP);
+        MACROS = grow(MACROS, MACRO_COUNT, &ccx.macro_cap);
         let m = MACRO_COUNT;
         MACROS[m] = Macro {
-            name: CTOKS[name_tok].text, func: false, variadic: false, builtin: DEFINING_BUILTINS,
+            name: CTOKS[name_tok].text, func: false, variadic: false,
+            builtin: ccx.defining_builtins,
             params: 0, param_count: 0, body: 0, body_count: 0,
         };
-        if !DEFINING_BUILTINS {
+        if !ccx.defining_builtins {
             origin_note(ORIGIN_MACRO, m, name_tok, ctok_line(name_tok), ctok_line(name_tok),
-                replace: true);
+                replace: true, ccx: &ccx);
         }
-        let open = file_peek();
+        let open = file_peek(ccx);
         if open >= 0 && !CTOKS[open].bol && !CTOKS[open].space && ctok_is(open, S_LPAREN) {
-            file_tok();
+            file_tok(&ccx);
             MACROS[m].func = true;
             var params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             loop {
-                let p = file_tok();
+                let p = file_tok(&ccx);
                 if p < 0 || CTOKS[p].bol {
                     c_error(name_tok, c"unterminated macro parameter list");
                 }
                 if ctok_is(p, S_RPAREN) {
                     break;
                 }
-                if ctok_is(p, S_COMMA) {
+                if ctok_is(p, ccx.s_comma) {
                     continue;
                 }
-                if ctok_is(p, S_ELLIPSIS) {
+                if ctok_is(p, ccx.s_ellipsis) {
                     MACROS[m].variadic = true;
-                    params.push(S_VA_ARGS);
+                    params.push(ccx.s_va_args);
                     continue;
                 }
                 // GNU named variadic parameter: `args...`.
-                let after = file_peek();
-                if after >= 0 && ctok_is(after, S_ELLIPSIS) {
-                    file_tok();
+                let after = file_peek(ccx);
+                if after >= 0 && ctok_is(after, ccx.s_ellipsis) {
+                    file_tok(&ccx);
                     MACROS[m].variadic = true;
                 }
                 params.push(CTOKS[p].text);
@@ -208,37 +199,38 @@ fn define_macro() {
             }
             MACROS[m].param_count = params.count;
         }
-        let (start, count) = line_tokens();
+        let (start, count) = line_tokens(&ccx);
         MACROS[m].body = start;
         MACROS[m].body_count = count;
         MACRO_COUNT += 1;
-        MACRO_OF.put(MACROS[m].name + 1, m + 1);
+        ccx.macro_of.put(MACROS[m].name + 1, m + 1);
     }
 }
 
-fn begin_cond(taken: bool) {
+fn begin_cond(taken: bool, ccx: inout CImportCx<Comp>) {
     if taken {
-        CPP_CONDS.push(COND_TAKEN);
+        ccx.cpp_conds.push(COND_TAKEN);
     } else {
-        CPP_CONDS.push(COND_SEARCH);
-        skip_branches();
+        ccx.cpp_conds.push(COND_SEARCH);
+        skip_branches(&ccx);
     }
 }
 
 // Skips the tokens of branches not taken, up to the branch to read (an
 // #elif that holds or an #else, in state COND_SEARCH) or the #endif.
-fn skip_branches() {
+fn skip_branches(ccx: inout CImportCx<Comp>) {
     unsafe {
         var depth = 0;
         loop {
-            let t = file_tok();
+            let t = file_tok(&ccx);
             if t < 0 {
-                c_error2(0, c"unterminated #if in ", CFILES[FRAME_FILE.data[cur_frame()]].path);
+                c_error2(0, c"unterminated #if in ",
+                    CFILES[ccx.frame_file.data[cur_frame(ccx)]].path);
             }
-            if !(CTOKS[t].bol && ctok_is(t, S_HASH)) {
+            if !(CTOKS[t].bol && ctok_is(t, ccx.s_hash)) {
                 continue;
             }
-            let d = file_peek();
+            let d = file_peek(ccx);
             if d < 0 || CTOKS[d].bol {
                 continue;
             }
@@ -252,33 +244,33 @@ fn skip_branches() {
                     depth -= 1;
                     continue;
                 }
-                file_tok();
-                skip_line();
-                CPP_CONDS.pop();
+                file_tok(&ccx);
+                skip_line(&ccx);
+                ccx.cpp_conds.pop();
                 return;
             }
-            if depth > 0 || CPP_CONDS.data[CPP_CONDS.count - 1] != COND_SEARCH {
+            if depth > 0 || ccx.cpp_conds.data[ccx.cpp_conds.count - 1] != COND_SEARCH {
                 continue;
             }
             if streq(name, c"else") {
-                file_tok();
-                skip_line();
-                CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+                file_tok(&ccx);
+                skip_line(&ccx);
+                ccx.cpp_conds.data[ccx.cpp_conds.count - 1] = COND_TAKEN;
                 return;
             }
             if streq(name, c"elif") {
-                file_tok();
-                let (start, count) = line_tokens();
-                if eval_if(d, start, count) {
-                    CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+                file_tok(&ccx);
+                let (start, count) = line_tokens(&ccx);
+                if eval_if(d, start, count, &ccx) {
+                    ccx.cpp_conds.data[ccx.cpp_conds.count - 1] = COND_TAKEN;
                     return;
                 }
             } else if streq(name, c"elifdef") || streq(name, c"elifndef") {
-                file_tok();
-                let (start, count) = line_tokens();
+                file_tok(&ccx);
+                let (start, count) = line_tokens(&ccx);
                 if count > 0
-                    && is_defined(CTOKS[CINTS.data[start]].text) == streq(name, c"elifdef") {
-                    CPP_CONDS.data[CPP_CONDS.count - 1] = COND_TAKEN;
+                    && is_defined(CTOKS[CINTS.data[start]].text, ccx) == streq(name, c"elifdef") {
+                    ccx.cpp_conds.data[ccx.cpp_conds.count - 1] = COND_TAKEN;
                     return;
                 }
             }
@@ -347,7 +339,7 @@ fn find_include(name: *u8, quoted: bool, next: bool, from_file: i64) -> (*u8, i6
 
 // The header named by tokens (start, count): `"name"` or `<name>`; also
 // whether it was quoted. 0 when the tokens name none.
-fn header_name(start: i64, count: i64) -> (*u8, bool) {
+fn header_name(start: i64, count: i64, ccx: CImportCx<Comp>) -> (*u8, bool) {
     unsafe {
         if count == 0 {
             return (0 as *u8, false);
@@ -360,12 +352,12 @@ fn header_name(start: i64, count: i64) -> (*u8, bool) {
             buf_byte(b, 0);
             return (BUFS[b].data, true);
         }
-        if !ctok_is(first, S_LT) {
+        if !ctok_is(first, ccx.s_lt) {
             return (0 as *u8, false);
         }
         for k in 1..count {
             let t = CINTS.data[start + k];
-            if ctok_is(t, S_GT) {
+            if ctok_is(t, ccx.s_gt) {
                 buf_byte(b, 0);
                 return (BUFS[b].data, false);
             }
@@ -378,17 +370,17 @@ fn header_name(start: i64, count: i64) -> (*u8, bool) {
     }
 }
 
-fn include(at: i64, next: bool) {
+fn include(at: i64, next: bool, ccx: inout CImportCx<Comp>) {
     unsafe {
-        let (start, count) = line_tokens();
-        let (var name, var quoted) = header_name(start, count);
+        let (start, count) = line_tokens(&ccx);
+        let (var name, var quoted) = header_name(start, count, ccx);
         if name == 0 as *u8 {
-            let expanded = expand_list(start, count);
+            let expanded = expand_list(start, count, &ccx);
             let s = CINTS.count;
             for k in 0..expanded.count {
                 CINTS.push(expanded.data[k]);
             }
-            let (n2, q2) = header_name(s, expanded.count);
+            let (n2, q2) = header_name(s, expanded.count, ccx);
             name = n2;
             quoted = q2;
         }
@@ -405,21 +397,21 @@ fn include(at: i64, next: bool) {
             C_IMPORT_PATHS.push(ctok_line(at) - 1);
             C_IMPORT_PATHS.push(intern_c(path));
         }
-        open_header(path, dir);
+        open_header(path, dir, &ccx);
     }
 }
 
-fn open_header(path: *u8, dir: i64) {
-    if CPP_ONCE.get(intern_c(path) + 1) != 0 {
+fn open_header(path: *u8, dir: i64, ccx: inout CImportCx<Comp>) {
+    if ccx.cpp_once.get(intern_c(path) + 1) != 0 {
         return;
     }
-    let f = c_load_file(path, dir);
-    push_frame(f);
+    let f = c_load_file(path, dir, &ccx);
+    push_frame(f, &ccx);
 }
 
 // ---- #if ----
 
-fn eval_if(at: i64, start: i64, count: i64) -> bool {
+fn eval_if(at: i64, start: i64, count: i64, ccx: inout CImportCx<Comp>) -> bool {
     unsafe {
         // `defined X` and __has_include(...) are answered before expansion.
         var line = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -427,7 +419,7 @@ fn eval_if(at: i64, start: i64, count: i64) -> bool {
         while k < count {
             let t = CINTS.data[start + k];
             let sym = CTOKS[t].text;
-            if CTOKS[t].kind == Ident && sym == S_DEFINED {
+            if CTOKS[t].kind == Ident && sym == ccx.s_defined {
                 var j = k + 1;
                 let paren = j < count && ctok_is(CINTS.data[start + j], S_LPAREN);
                 if paren {
@@ -436,30 +428,31 @@ fn eval_if(at: i64, start: i64, count: i64) -> bool {
                 if j >= count {
                     c_error(t, c"'defined' without a name");
                 }
-                let value = is_defined(CTOKS[CINTS.data[start + j]].text);
+                let value = is_defined(CTOKS[CINTS.data[start + j]].text, ccx);
                 j += 1;
                 if paren {
                     j += 1;
                 }
-                line.push(number_tok(t, value));
+                line.push(number_tok(t, value, &ccx));
                 k = j;
                 continue;
             }
-            if CTOKS[t].kind == Ident && (sym == S_HAS_INCLUDE || sym == S_HAS_INCLUDE_NEXT) {
+            if CTOKS[t].kind == Ident
+                && (sym == ccx.s_has_include || sym == ccx.s_has_include_next) {
                 var j = k + 2;
                 let name_start = start + j;
                 while j < count && !ctok_is(CINTS.data[start + j], S_RPAREN) {
                     j += 1;
                 }
                 // `<a/b.h>` and `"a.h"` are not macro-expanded here.
-                let (name, quoted) = header_name(name_start, start + j - name_start);
+                let (name, quoted) = header_name(name_start, start + j - name_start, ccx);
                 var found = false;
                 if name != 0 as *u8 {
-                    let (path, _) = find_include(name, quoted, sym == S_HAS_INCLUDE_NEXT,
+                    let (path, _) = find_include(name, quoted, sym == ccx.s_has_include_next,
                         CTOKS[t].file);
                     found = path != 0 as *u8;
                 }
-                line.push(number_tok(t, found));
+                line.push(number_tok(t, found, &ccx));
                 k = j + 1;
                 continue;
             }
@@ -470,17 +463,17 @@ fn eval_if(at: i64, start: i64, count: i64) -> bool {
         for i in 0..line.count {
             CINTS.push(line.data[i]);
         }
-        let expanded = expand_list(s, line.count);
-        let (value, _) = eval_tokens(expanded, at, decl: false);
+        let expanded = expand_list(s, line.count, &ccx);
+        let (value, _) = eval_tokens(expanded, at, decl: false, ccx: &ccx);
         value != 0
     }
 }
 
-fn number_tok(at: i64, value: bool) -> i64 {
-    let n = ctok_copy(at);
+fn number_tok(at: i64, value: bool, ccx: inout CImportCx<Comp>) -> i64 {
+    let n = ctok_copy(at, &ccx);
     unsafe {
         CTOKS[n].kind = Num;
-        CTOKS[n].text = if value { S_ONE } else { S_ZERO };
+        CTOKS[n].text = if value { ccx.s_one } else { ccx.s_zero };
     }
     n
 }

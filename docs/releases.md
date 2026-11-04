@@ -166,6 +166,19 @@ The statics into context structs (statics264):
   1,478. `check` of compiler/src: 1.00x the base's, 0.90x 0.26.3's; the
   source itself costs 4.9% more to check (the parameters and arguments
   added).
+- compiler/src, phase 3: 244 of front's 843 statics are fields of six
+  pass contexts, each made where its pass starts: the own pass's walk
+  state (`front::own::ctx::OwnCx`, 83, made by check_program and by
+  `query own`'s walk), the C import's (`CImportCx`, 85, made by
+  import_c_headers), the embedded WGSL's check (`EmbedCx`, 40), the
+  thread-safety pass's (`ThreadsCx`, 18), the contracts' expansion
+  (`ContractsCx`, 9) and the target features' check (`FeaturesCx`, 9).
+  What lives across functions or past its pass (the own pass's
+  summaries, the effects, the checker's tables) is phase 4's. Statics
+  in compiler/src: 1,478 to 1,234. `check` of compiler/src: 0.89x
+  0.26.3's. With one compiler, checking the source itself costs 6.1%
+  more than before phase 1 (phase 1 +0.9%, phase 2 +4.3%, phase 3
+  +0.8%).
 
 ### What's new in 0.26.3
 
