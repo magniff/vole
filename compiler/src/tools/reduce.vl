@@ -17,17 +17,13 @@ use crate::base::{
     IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_MISSING, EV_WORD, Leaf, is_opt, option, table};
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{buf_cstr, read_file_if, remove_file, scratch_dir, write_file_if};
 use crate::tools::query::{c_slice, parse_count};
-use crate::tools::query::diagnostics::{PROG, TOOL, diag, write_diags};
+use crate::tools::query::diagnostics::{PROG, diag, write_diags};
 use crate::tools::reduce::program::{program_mode, program_option, program_opts, reduce_program};
-
-static var RUNS: i64 = 0;
-static var MAX_RUNS: i64 = 500;
-// Seconds a run of CMD may take (--timeout), and the runs stopped.
-static var TIMEOUT: i64 = 5;
-static var TIMED_OUT: i64 = 0;
 
 extern "C" {
     fn fork() -> i32;
@@ -42,14 +38,14 @@ extern "C" {
     fn _exit(code: i32) -> !;
 }
 
-pub fn run_reduce(c: Call<Gpa>) -> i64 {
-    let status = reduce_inner(c);
-    write_diags();
+pub fn run_reduce(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = reduce_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(why: *u8, word: *u8) -> i64 {
-    let d = diag(c"error", c"reduce.usage");
+fn usage(why: *u8, word: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"reduce.usage", &tcx);
     buf_str(d, why);
     if word != 0 as *u8 {
         buf_str(d, c" '");
@@ -97,7 +93,7 @@ fn command_for(cmd: *u8, path: *u8) -> *u8 {
 
 // Runs `sh -c cmd` (its output dropped) in a process group of its own,
 // killed with it after TIMEOUT seconds: whether it exited with 0.
-fn run_limited(cmd: *u8) -> bool {
+fn run_limited(cmd: *u8, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let pid = fork();
         if pid < 0 {
@@ -126,10 +122,10 @@ fn run_limited(cmd: *u8) -> bool {
             if r == pid {
                 break;
             }
-            if r < 0 || waited >= TIMEOUT * 100 {
+            if r < 0 || waited >= tcx.reduce_timeout * 100 {
                 kill(0 - pid, 9);
                 waitpid(pid, &status, 0);
-                TIMED_OUT += 1;
+                tcx.timed_out += 1;
                 return false;
             }
             usleep(10000);
@@ -144,7 +140,7 @@ fn run_limited(cmd: *u8) -> bool {
 
 // Whether CMD holds (exits 0) on the lines `keep` of `lines` (each a
 // slice's start and end in text), written to path.
-fn holds(text: [u8], lines: IntVec, keep: IntVec, path: *u8, cmd: *u8) -> bool {
+fn holds(text: [u8], lines: IntVec, keep: IntVec, path: *u8, cmd: *u8, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let b = buf_new();
         for i in 0..keep.count {
@@ -152,8 +148,8 @@ fn holds(text: [u8], lines: IntVec, keep: IntVec, path: *u8, cmd: *u8) -> bool {
             buf_bytes(b, text[lines.data[2 * l]..lines.data[2 * l + 1]]);
         }
         write_file_if(path, buf_slice(b));
-        RUNS += 1;
-        run_limited(cmd)
+        tcx.reduce_runs += 1;
+        run_limited(cmd, &tcx)
     }
 }
 
@@ -170,55 +166,56 @@ pub fn reduce_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "file")
 }
 
-fn reduce_inner(c: Call<Gpa>) -> i64 {
+fn reduce_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
-    TOOL = 0 as *u8;
+    tcx.tool = 0 as *u8;
     var file = 0 as *u8;
     var until = 0 as *u8;
     var out = 0 as *u8;
     for ev in c.evs.iter() {
         let a = ev.value;
-        if program_option(ev) {
+        if program_option(ev, &tcx) {
             continue;
         }
         if ev.kind == EV_MISSING && ev.name != "input" {
-            return usage(c"a value is needed after", a);
+            return usage(c"a value is needed after", a, &tcx);
         }
         if is_opt(ev, "until") {
             until = a;
         } else if is_opt(ev, "out") {
             out = a;
         } else if is_opt(ev, "timeout") {
-            TIMEOUT = parse_count(a);
-            if TIMEOUT <= 0 {
-                return usage(c"--timeout takes a number of seconds, not", a);
+            tcx.reduce_timeout = parse_count(a);
+            if tcx.reduce_timeout <= 0 {
+                return usage(c"--timeout takes a number of seconds, not", a, &tcx);
             }
         } else if is_opt(ev, "max-runs") {
-            MAX_RUNS = parse_count(a);
-            if MAX_RUNS <= 0 {
-                return usage(c"--max-runs takes a number, not", a);
+            tcx.reduce_max_runs = parse_count(a);
+            if tcx.reduce_max_runs <= 0 {
+                return usage(c"--max-runs takes a number, not", a, &tcx);
             }
         } else if ev.kind != EV_WORD || (ev.text.starts_with("-") && ev.text.len() > 1) {
-            return usage(c"unknown option", a);
+            return usage(c"unknown option", a, &tcx);
         } else if file != 0 as *u8 {
-            return usage(c"one FILE at most; a second", a);
+            return usage(c"one FILE at most; a second", a, &tcx);
         } else {
             file = a;
         }
     }
     unsafe {
-        if program_mode() {
+        if program_mode(tcx) {
             if file == 0 as *u8 {
-                return usage(c"the program's root file is needed", 0 as *u8);
+                return usage(c"the program's root file is needed", 0 as *u8, &tcx);
             }
-            return reduce_program(file, out, if MAX_RUNS != 500 { MAX_RUNS } else { 0 });
+            return reduce_program(file, out,
+                if tcx.reduce_max_runs != 500 { tcx.reduce_max_runs } else { 0 }, &tcx);
         }
         if file == 0 as *u8 || until == 0 as *u8 {
-            return usage(c"FILE and --until 'CMD' are needed", 0 as *u8);
+            return usage(c"FILE and --until 'CMD' are needed", 0 as *u8, &tcx);
         }
         let original = buf_new();
         if !read_file_if(file, original) {
-            let d = diag(c"error", c"reduce.no-file");
+            let d = diag(c"error", c"reduce.no-file", &tcx);
             buf_str(d, c"cannot read '");
             buf_str(d, file);
             buf_str(d, c"'\n");
@@ -246,9 +243,9 @@ fn reduce_inner(c: Call<Gpa>) -> i64 {
         }
         let path = candidate_path(file);
         let cmd = command_for(until, path);
-        if !holds(text, lines, keep, path, cmd) {
+        if !holds(text, lines, keep, path, cmd, &tcx) {
             remove_file(path);
-            let d = diag(c"error", c"reduce.not-failing");
+            let d = diag(c"error", c"reduce.not-failing", &tcx);
             buf_str(d, c"the command does not hold (exit 0) on ");
             buf_str(d, file);
             buf_str(d, c" as it is: ");
@@ -258,18 +255,18 @@ fn reduce_inner(c: Call<Gpa>) -> i64 {
         }
         // Delta debugging: chunks of the lines left out.
         var parts = 2;
-        while keep.count >= 2 && RUNS < MAX_RUNS {
+        while keep.count >= 2 && tcx.reduce_runs < tcx.reduce_max_runs {
             let size = (keep.count + parts - 1) / parts;
             var gone = false;
             var start = 0;
-            while start < keep.count && RUNS < MAX_RUNS {
+            while start < keep.count && tcx.reduce_runs < tcx.reduce_max_runs {
                 var rest = IntVec { data: 0 as *i64, count: 0, cap: 0 };
                 for k in 0..keep.count {
                     if k < start || k >= start + size {
                         rest.push(keep.data[k]);
                     }
                 }
-                if rest.count > 0 && holds(text, lines, rest, path, cmd) {
+                if rest.count > 0 && holds(text, lines, rest, path, cmd, &tcx) {
                     keep = rest;
                     gone = true;
                     // (the same chunk position holds new lines now)
@@ -308,14 +305,14 @@ fn reduce_inner(c: Call<Gpa>) -> i64 {
         buf_bytes(o, " lines to ");
         buf_int(o, keep.count);
         buf_bytes(o, " in ");
-        buf_int(o, RUNS);
+        buf_int(o, tcx.reduce_runs);
         buf_bytes(o, " runs");
-        if RUNS >= MAX_RUNS {
+        if tcx.reduce_runs >= tcx.reduce_max_runs {
             buf_bytes(o, " (--max-runs reached: not minimal)");
         }
-        if TIMED_OUT > 0 {
+        if tcx.timed_out > 0 {
             buf_bytes(o, " (");
-            buf_int(o, TIMED_OUT);
+            buf_int(o, tcx.timed_out);
             buf_bytes(o, " stopped after --timeout S: taken as not failing)");
         }
         buf_bytes(o, "; written to ");

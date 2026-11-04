@@ -14,34 +14,20 @@
 // was made is.
 
 use crate::base::{IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::base::comp::Comp;
 use crate::front::ast::{NODES, NodeKind};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::query::{QF_CALL, QF_DEF, QF_USE, QF_WRITE};
 use crate::tools::query::defs::{DEFS, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, trait_of};
 use crate::tools::query::diagnostics::{diag, sym_less};
 use crate::tools::query::positions::{enclosing, find_name, line_of, line_start, token_at};
-use crate::tools::query::refs::{
-    GROUP, OPT_ALL, OPT_COUNT, OPT_LIMIT, R_DEF, R_FLAGS, R_GROUP, R_POS, TARGETS, collect_refs,
-    file_text, put_line, put_short, ref_in, try_refs,
-};
-
-// --transitive, --writes TABLE (a C string, or null).
-pub static var OPT_TRANSITIVE: bool = false;
-pub static var OPT_WRITES: *u8 = 0 as *u8;
+use crate::tools::query::refs::{collect_refs, file_text, put_line, put_short, ref_in, try_refs};
 
 // The lines printed before the rest is cut (--limit N, --all).
 const CALLEES_BUDGET: i64 = 100;
-
-// The call graph: per edge, its caller, callee, and whether it is a call
-// (else the callee is named as a value); per definition + 1, its first
-// edge + 1, and per edge its next + 1.
-static var E_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var E_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var E_CALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var E_NEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var E_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Whether definition d is a function (with or without a body).
 fn is_fn_def(d: i64) -> bool {
@@ -49,7 +35,7 @@ fn is_fn_def(d: i64) -> bool {
     k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
 }
 
-fn add_edge(from: i64, to: i64, call: bool, seen: inout HMap) {
+fn add_edge(from: i64, to: i64, call: bool, seen: inout HMap, tcx: inout Tcx<Comp>) {
     unsafe {
         // (once per caller and callee: a generic function's instances
         // repeat its calls; a call wins over a mention)
@@ -57,51 +43,51 @@ fn add_edge(from: i64, to: i64, call: bool, seen: inout HMap) {
         let e0 = seen.get(key) - 1;
         if e0 >= 0 {
             if call {
-                E_CALL.data[e0] = 1;
+                tcx.e_call.data[e0] = 1;
             }
             return;
         }
-        seen.put(key, E_FROM.count + 1);
-        E_FROM.push(from);
-        E_TO.push(to);
-        E_CALL.push(if call { 1 } else { 0 });
-        E_NEXT.push(E_HEAD.get(from + 1));
-        E_HEAD.put(from + 1, E_FROM.count);
+        seen.put(key, tcx.callees_e_from.count + 1);
+        tcx.callees_e_from.push(from);
+        tcx.callees_e_to.push(to);
+        tcx.e_call.push(if call { 1 } else { 0 });
+        tcx.e_next.push(tcx.e_head.get(from + 1));
+        tcx.e_head.put(from + 1, tcx.callees_e_from.count);
     }
 }
 
 // Every reference of the program, then the edges of the call graph.
-fn build_graph() {
+fn build_graph(tcx: inout Tcx<Comp>) {
     unsafe {
-        TARGETS.count = 0;
-        R_POS.count = 0;
-        R_DEF.count = 0;
-        R_GROUP.count = 0;
-        R_FLAGS.count = 0;
-        GROUP = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        tcx.refs_targets.count = 0;
+        tcx.r_pos.count = 0;
+        tcx.r_def.count = 0;
+        tcx.r_group.count = 0;
+        tcx.r_flags.count = 0;
+        tcx.refs_group = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for d in 0..DEFS.len() as i64 {
-            GROUP.put(d + 1, 1);
+            tcx.refs_group.put(d + 1, 1);
         }
-        collect_refs();
+        collect_refs(&tcx);
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        for r in 0..R_POS.count {
-            let fl = R_FLAGS.data[r];
-            let to = R_DEF.data[r];
+        for r in 0..tcx.r_pos.count {
+            let fl = tcx.r_flags.data[r];
+            let to = tcx.r_def.data[r];
             if (fl & (QF_DEF | QF_USE)) != 0 || !is_fn_def(to) {
                 continue;
             }
-            let from = enclosing(R_POS.data[r]);
+            let from = enclosing(tcx.r_pos.data[r], tcx);
             if from < 0 {
                 continue;
             }
             let call = (fl & QF_CALL) != 0;
-            add_edge(from, to, call, &seen);
+            add_edge(from, to, call, &seen, &tcx);
             // (a trait's function: the functions implementing it too)
             if DEFS[to].kind == K_TRAIT_FN {
                 for d in 0..DEFS.len() as i64 {
                     if DEFS[d].kind == K_IMPL_METHOD && DEFS[d].name == DEFS[to].name
-                        && trait_of(d) == DEFS[to].parent {
-                        add_edge(from, d, call, &seen);
+                        && trait_of(d, tcx) == DEFS[to].parent {
+                        add_edge(from, d, call, &seen, &tcx);
                     }
                 }
             }
@@ -140,9 +126,9 @@ fn put_chain(out: i64, d: i64, via: HMap) {
 // `query callees`: the functions the definitions `matches` call (all of
 // them reachable, with --transitive), or with --writes the places in them
 // that change TABLE (`table`: its definitions). The status.
-pub fn query_callees(matches: IntVec, name: [u8], table: IntVec) -> i64 {
+pub fn query_callees(matches: IntVec, name: [u8], table: IntVec, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        build_graph();
+        build_graph(&tcx);
         // Breadth first from the functions asked about: per definition + 1,
         // its depth + 1 and the caller it was reached from + 1.
         var depth = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -156,7 +142,7 @@ pub fn query_callees(matches: IntVec, name: [u8], table: IntVec) -> i64 {
                 order.push(d);
             }
         }
-        let all = OPT_TRANSITIVE || OPT_WRITES != 0 as *u8;
+        let all = tcx.opt_transitive || tcx.opt_writes != 0 as *u8;
         var k = 0;
         while k < order.count {
             let d = order.data[k];
@@ -165,20 +151,20 @@ pub fn query_callees(matches: IntVec, name: [u8], table: IntVec) -> i64 {
             if dd > 1 && !all {
                 continue;
             }
-            var e = E_HEAD.get(d + 1) - 1;
+            var e = tcx.e_head.get(d + 1) - 1;
             while e >= 0 {
-                let to = E_TO.data[e];
+                let to = tcx.callees_e_to.data[e];
                 if depth.get(to + 1) == 0 {
                     depth.put(to + 1, dd + 1);
                     via.put(to + 1, d + 1);
-                    how.put(to + 1, E_CALL.data[e] + 1);
+                    how.put(to + 1, tcx.e_call.data[e] + 1);
                     order.push(to);
                 }
-                e = E_NEXT.data[e] - 1;
+                e = tcx.e_next.data[e] - 1;
             }
         }
-        if OPT_WRITES != 0 as *u8 {
-            return writes_of(order, via, table, name);
+        if tcx.opt_writes != 0 as *u8 {
+            return writes_of(order, via, table, name, &tcx);
         }
         let first = matches.count;
         let total = order.count - first;
@@ -196,19 +182,20 @@ pub fn query_callees(matches: IntVec, name: [u8], table: IntVec) -> i64 {
             }
         }
         let out = buf_new();
-        if OPT_COUNT {
+        if tcx.opt_count {
             buf_int(out, total);
             buf_byte(out, '\n');
             buf_write_fd(out, STDOUT);
             return 0;
         }
         if total == 0 {
-            let d = diag(c"note", c"query.empty");
+            let d = diag(c"note", c"query.empty", &tcx);
             buf_str(d, c"0 callees\n");
             return 0;
         }
-        let shown = if OPT_ALL { total } else if OPT_LIMIT >= 0 && OPT_LIMIT < total { OPT_LIMIT }
-            else if OPT_LIMIT < 0 && total > CALLEES_BUDGET { CALLEES_BUDGET } else { total };
+        let shown = if tcx.opt_all { total }
+            else if tcx.opt_limit >= 0 && tcx.opt_limit < total { tcx.opt_limit }
+            else if tcx.opt_limit < 0 && total > CALLEES_BUDGET { CALLEES_BUDGET } else { total };
         for i in 0..shown {
             let d = order.data[first + i];
             buf_int(out, depth.get(d + 1) - 1);
@@ -226,14 +213,15 @@ pub fn query_callees(matches: IntVec, name: [u8], table: IntVec) -> i64 {
         }
         buf_write_fd(out, STDOUT);
         if shown < total {
-            let d = diag(c"note", c"query.truncated");
+            let d = diag(c"note", c"query.truncated", &tcx);
             buf_str(d, c"showing ");
             buf_int(d, shown);
             buf_str(d, c" of ");
             buf_int(d, total);
             buf_str(d, c" callees\n");
             try_refs(c"callees", name,
-                if OPT_TRANSITIVE { c"--transitive --all" } else { c"--all" }, name[0..0]);
+                if tcx.opt_transitive { c"--transitive --all" } else { c"--all" }, name[0..0],
+                &tcx);
         }
         0
     }
@@ -288,7 +276,7 @@ pub fn changed_places(out: inout HMap) {
 
 // --writes: the references to TABLE in the functions reached (`order`)
 // that change it. The status.
-fn writes_of(order: IntVec, via: HMap, table: IntVec, name: [u8]) -> i64 {
+fn writes_of(order: IntVec, via: HMap, table: IntVec, name: [u8], tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var changed = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         changed_places(&changed);
@@ -303,18 +291,19 @@ fn writes_of(order: IntVec, via: HMap, table: IntVec, name: [u8]) -> i64 {
         var sites = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var kinds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        for r in 0..R_POS.count {
-            let pos = R_POS.data[r];
-            if wanted.get(R_DEF.data[r] + 1) == 0 || (R_FLAGS.data[r] & (QF_DEF | QF_USE)) != 0
+        for r in 0..tcx.r_pos.count {
+            let pos = tcx.r_pos.data[r];
+            if wanted.get(tcx.r_def.data[r] + 1) == 0
+                || (tcx.r_flags.data[r] & (QF_DEF | QF_USE)) != 0
                 || seen.get(pos + 1) != 0 || !ref_in(pos) {
                 continue;
             }
-            let e = enclosing(pos);
+            let e = enclosing(pos, tcx);
             if e < 0 || reached.get(e + 1) == 0 {
                 continue;
             }
             var how = changed.get(pos + 1);
-            if (R_FLAGS.data[r] & QF_WRITE) != 0 {
+            if (tcx.r_flags.data[r] & QF_WRITE) != 0 {
                 how = 1;
             }
             if how == 0 {
@@ -340,14 +329,14 @@ fn writes_of(order: IntVec, via: HMap, table: IntVec, name: [u8]) -> i64 {
             }
         }
         let out = buf_new();
-        if OPT_COUNT {
+        if tcx.opt_count {
             buf_int(out, sites.count);
             buf_byte(out, '\n');
             buf_write_fd(out, STDOUT);
             return 0;
         }
         if sites.count == 0 {
-            let d = diag(c"note", c"query.empty");
+            let d = diag(c"note", c"query.empty", &tcx);
             buf_bytes(d, name);
             buf_str(d, c" reaches no write or borrow of ");
             put_short(d, DEFS[table.data[0]].fqn);
@@ -373,7 +362,7 @@ fn writes_of(order: IntVec, via: HMap, table: IntVec, name: [u8]) -> i64 {
             buf_byte(out, '\t');
             buf_str(out, if kinds.data[i] == 1 { c"write" } else { c"borrow" });
             buf_byte(out, '\t');
-            put_chain(out, enclosing(pos), via);
+            put_chain(out, enclosing(pos, tcx), via);
             buf_byte(out, '\t');
             put_line(out, pos);
             buf_byte(out, '\n');

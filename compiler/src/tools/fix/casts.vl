@@ -26,14 +26,15 @@
 // rules above, over the whole program; the edited program is then checked
 // (a fix whose result does not check is refused, as every fix's).
 
-use crate::base::{FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_str};
+use crate::base::{FILES, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_str};
+use crate::base::comp::Comp;
 use crate::front::ast::{CONV_NEW, NODES, NODE_IMPLICIT, NodeKind, child};
 use crate::front::check::Res;
 use crate::front::generics::instantiate::{node_field_a, node_field_b, node_field_c};
 use crate::front::lexer::Tok;
 use crate::front::modules::file_of_pos;
 use crate::front::types::{TY_I64, TY_USIZE};
-use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::query::diagnostics::diag;
 use crate::tools::query::refs::ref_in;
@@ -70,27 +71,9 @@ pub const CK_NOOP: i64 = 12;
 pub const CK_NOT_USIZE: i64 = 13;
 const CK_N: i64 = 14;
 
-pub static var CAST_COUNTS: [i64; 14] = [0; 14];
-// (`--only casts-list`, a dry run) each usize cast on stdout: FILE:LINE,
-// what was decided, where its value goes first, its text
-pub static var CAST_LIST: bool = false;
-
-// The parent of each node (+1; MULTI: more than one).
-static var PARENT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 const MULTI: i64 = -1;
-// The uses of each local: USE_HEAD (local+1 -> first Ident+1), USE_NEXT
-// (Ident+1 -> next Ident+1).
-static var USE_HEAD: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var USE_NEXT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// The candidates: a cast node, or a local (its binding PatBind node), with
-// its state (+1): 1 kept so far, 2 refused.
-static var STATE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 const ST_OK: i64 = 1;
 const ST_NO: i64 = 2;
-static var CASTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var LOCAL_UNITS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Spans of written casts seen, start+1 -> how many nodes
-static var SPANS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // Whether pos is in a file of the program (std's paths start with `<`).
 fn user_pos(pos: i64) -> bool {
@@ -99,20 +82,20 @@ fn user_pos(pos: i64) -> bool {
     unsafe { FILES[file_of_pos(pos)].path[0] != '<' }
 }
 
-fn parent(n: i64) -> i64 {
-    let p = PARENT.get(n + 1);
+fn parent(n: i64, tcx: Tcx<Comp>) -> i64 {
+    let p = tcx.casts_parent.get(n + 1);
     if p <= 0 { -1 } else { p - 1 }
 }
 
-fn set_parent(c: i64, n: i64) {
+fn set_parent(c: i64, n: i64, tcx: inout Tcx<Comp>) {
     if c <= 0 {
         return;
     }
-    let old = PARENT.get(c + 1);
+    let old = tcx.casts_parent.get(c + 1);
     if old == 0 {
-        PARENT.put(c + 1, n + 1);
+        tcx.casts_parent.put(c + 1, n + 1);
     } else if old != n + 1 {
-        PARENT.put(c + 1, MULTI);
+        tcx.casts_parent.put(c + 1, MULTI);
     }
 }
 
@@ -153,37 +136,34 @@ fn plain_literal(n: i64) -> bool {
 
 // The candidate expression n stands for: a cast candidate, or a use of a
 // local candidate (its PatBind); -1.
-fn unit_of(n: i64) -> i64 {
+fn unit_of(n: i64, tcx: Tcx<Comp>) -> i64 {
     if n <= 0 {
         return -1;
     }
-    if NODES[n].kind == NodeKind::Cast && STATE.get(n + 1) != 0 {
+    if NODES[n].kind == NodeKind::Cast && tcx.state.get(n + 1) != 0 {
         return n;
     }
     if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
-        let b = LOCAL_BIND.get(NODES[n].y + 1);
-        if b > 0 && STATE.get(b) != 0 {
+        let b = tcx.local_bind.get(NODES[n].y + 1);
+        if b > 0 && tcx.state.get(b) != 0 {
             return b - 1;
         }
     }
     -1
 }
 
-// The PatBind of each local candidate (local+1 -> PatBind+1).
-static var LOCAL_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-fn ok(u: i64) -> bool {
-    STATE.get(u + 1) == ST_OK
+fn ok(u: i64, tcx: Tcx<Comp>) -> bool {
+    tcx.state.get(u + 1) == ST_OK
 }
 
 // Whether partner o of a comparison or a range is a usize as it is, or
 // will be: a literal, a usize, a candidate kept so far.
-fn usize_partner(o: i64) -> bool {
+fn usize_partner(o: i64, tcx: Tcx<Comp>) -> bool {
     if plain_literal(o) || o > 0 && NODES[o].ty == TY_USIZE {
         return true;
     }
-    let u = unit_of(o);
-    u >= 0 && ok(u)
+    let u = unit_of(o, tcx);
+    u >= 0 && ok(u, tcx)
 }
 
 fn is_compare(op: Tok) -> bool {
@@ -194,15 +174,15 @@ fn is_compare(op: Tok) -> bool {
 // A local candidate for the binding of `let` (or the counter of `for`) p:
 // its PatBind, when it may become one (not `var`, no type, no closure),
 // else -1.
-fn local_unit(pat: i64) -> i64 {
+fn local_unit(pat: i64, tcx: inout Tcx<Comp>) -> i64 {
     if pat <= 0 || NODES[pat].kind != NodeKind::PatBind || NODES[pat].b != 0
         || NODES[pat].x < 0 || NODES[pat].count != 0 {
         return -1;
     }
-    if STATE.get(pat + 1) == 0 {
-        STATE.put(pat + 1, ST_OK);
-        LOCAL_BIND.put(NODES[pat].x + 1, pat + 1);
-        LOCAL_UNITS.push(pat);
+    if tcx.state.get(pat + 1) == 0 {
+        tcx.state.put(pat + 1, ST_OK);
+        tcx.local_bind.put(NODES[pat].x + 1, pat + 1);
+        tcx.local_units.push(pat);
     }
     pat
 }
@@ -210,9 +190,9 @@ fn local_unit(pat: i64) -> i64 {
 // Where the value of expression e goes (CK_*), for a candidate e (a cast,
 // or a use of a local candidate); with what it needs kept in *needs (a
 // candidate, or -1) and whether the rule holds now in *holds.
-fn context(e: i64, holds: inout bool) -> i64 {
+fn context(e: i64, holds: inout bool, tcx: inout Tcx<Comp>) -> i64 {
     holds = false;
-    let p = parent(e);
+    let p = parent(e, tcx);
     if p < 0 {
         return CK_COPIED;
     }
@@ -226,8 +206,8 @@ fn context(e: i64, holds: inout bool) -> i64 {
     }
     if k == NodeKind::Range {
         let other = if NODES[p].a == e { NODES[p].b } else { NODES[p].a };
-        let other_ok = other <= 0 || usize_partner(other);
-        let q = parent(p);
+        let other_ok = other <= 0 || usize_partner(other, tcx);
+        let q = parent(p, tcx);
         if q >= 0 && NODES[q].kind == NodeKind::Index && NODES[q].b == p {
             if !other_ok && NODES[p].b == e && NODES[p].c == 0 && own_end(NODES[q].a, e) {
                 holds = true;
@@ -237,8 +217,8 @@ fn context(e: i64, holds: inout bool) -> i64 {
             return CK_INDEX;
         }
         if q >= 0 && NODES[q].kind == NodeKind::For && NODES[q].c == p && NODES[p].b == e {
-            let l = local_unit(NODES[q].b);
-            holds = other_ok && other > 0 && l >= 0 && ok(l);
+            let l = local_unit(NODES[q].b, &tcx);
+            holds = other_ok && other > 0 && l >= 0 && ok(l, tcx);
             return CK_LOOP;
         }
         return CK_OTHER;
@@ -254,7 +234,7 @@ fn context(e: i64, holds: inout bool) -> i64 {
                 || !left && (op == Tok::Gt || op == Tok::LtEq)) {
                 return CK_CMP_I64;
             }
-            if usize_partner(other) {
+            if usize_partner(other, tcx) {
                 holds = true;
                 return CK_COMPARE;
             }
@@ -269,11 +249,11 @@ fn context(e: i64, holds: inout bool) -> i64 {
         if NODES[p].b != 0 || (NODES[p].p & CONV_NEW) != 0 {
             return CK_STORED;
         }
-        let l = local_unit(NODES[p].a);
+        let l = local_unit(NODES[p].a, &tcx);
         if l < 0 {
             return CK_STORED;
         }
-        holds = ok(l);
+        holds = ok(l, tcx);
         return CK_LET;
     }
     if k == NodeKind::Cast && NODES[p].a == e && NODES[e].kind == NodeKind::Ident {
@@ -290,9 +270,6 @@ fn context(e: i64, holds: inout bool) -> i64 {
     }
     CK_OTHER
 }
-
-// The closures' spans, start and end in pairs.
-static var CLOSURES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Whether n's text is a name or a name's fields (`a`, `self.b.c`).
 fn pure_path(n: i64) -> bool {
@@ -338,11 +315,11 @@ fn dots_end(e: i64) -> i64 {
 }
 
 // Whether node n is in a closure (by its position).
-fn in_closure(n: i64) -> bool {
+fn in_closure(n: i64, tcx: Tcx<Comp>) -> bool {
     let pos = NODES[n].start;
     var i = 0;
-    while i + 1 < CLOSURES.count {
-        if pos >= CLOSURES.get(i) && pos < CLOSURES.get(i + 1) {
+    while i + 1 < tcx.closures.count {
+        if pos >= tcx.closures.get(i) && pos < tcx.closures.get(i + 1) {
             return true;
         }
         i += 2;
@@ -352,36 +329,36 @@ fn in_closure(n: i64) -> bool {
 
 // Whether candidate u holds now: a cast by its context, a local by all its
 // uses.
-fn holds_now(u: i64) -> bool {
+fn holds_now(u: i64, tcx: inout Tcx<Comp>) -> bool {
     if NODES[u].kind == NodeKind::Cast {
-        if SPANS.get(NODES[u].start + 1) > 1 || in_closure(u) {
+        if tcx.casts_spans.get(NODES[u].start + 1) > 1 || in_closure(u, tcx) {
             return false;
         }
         var h = false;
-        context(u, &h);
+        context(u, &h, &tcx);
         return h;
     }
     // a local: every use
-    var x = USE_HEAD.get(NODES[u].x + 1);
+    var x = tcx.use_head.get(NODES[u].x + 1);
     while x > 0 {
         let id = x - 1;
-        if in_closure(id) {
+        if in_closure(id, tcx) {
             return false;
         }
         var h = false;
-        context(id, &h);
+        context(id, &h, &tcx);
         if !h {
             return false;
         }
-        x = USE_NEXT.get(x);
+        x = tcx.use_next.get(x);
     }
     true
 }
 
 // The edits; their number.
-pub fn cast_edits() -> i64 {
+pub fn cast_edits(tcx: inout Tcx<Comp>) -> i64 {
     for i in 0..CK_N {
-        CAST_COUNTS[i] = 0;
+        tcx.cast_counts[i] = 0;
     }
     let total = NODES.len() as i64;
     // parents, uses, candidates
@@ -391,70 +368,70 @@ pub fn cast_edits() -> i64 {
             continue;
         }
         if node_field_a(kind) {
-            set_parent(NODES[n].a, n);
+            set_parent(NODES[n].a, n, &tcx);
         }
         if node_field_b(kind) {
-            set_parent(NODES[n].b, n);
+            set_parent(NODES[n].b, n, &tcx);
         }
         if node_field_c(kind) {
-            set_parent(NODES[n].c, n);
+            set_parent(NODES[n].c, n, &tcx);
         }
         if kind == NodeKind::For || kind == NodeKind::Param {
-            set_parent(NODES[n].d, n);
+            set_parent(NODES[n].d, n, &tcx);
         }
         if kind == NodeKind::Fn {
-            set_parent(NODES[n].c, n);
+            set_parent(NODES[n].c, n, &tcx);
         }
         for i in 0..NODES[n].count {
-            set_parent(child(n, i), n);
+            set_parent(child(n, i), n, &tcx);
         }
         if kind == NodeKind::Closure && user_pos(NODES[n].start) {
-            CLOSURES.push(NODES[n].start);
-            CLOSURES.push(NODES[n].end);
+            tcx.closures.push(NODES[n].start);
+            tcx.closures.push(NODES[n].end);
         }
         if kind == NodeKind::Ident && NODES[n].res == Res::Local && NODES[n].y >= 0 {
-            let head = USE_HEAD.get(NODES[n].y + 1);
+            let head = tcx.use_head.get(NODES[n].y + 1);
             if head > 0 {
-                USE_NEXT.put(n + 1, head);
+                tcx.use_next.put(n + 1, head);
             }
-            USE_HEAD.put(NODES[n].y + 1, n + 1);
+            tcx.use_head.put(NODES[n].y + 1, n + 1);
         }
         if kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) == 0
             && NODES[n].ty == TY_I64 && user_pos(NODES[n].start) && ref_in(NODES[n].start)
             && as_start(n) >= 0 {
-            SPANS.put(NODES[n].start + 1, SPANS.get(NODES[n].start + 1) + 1);
+            tcx.casts_spans.put(NODES[n].start + 1, tcx.casts_spans.get(NODES[n].start + 1) + 1);
             let from = NODES[NODES[n].a].ty;
             if from == TY_USIZE {
-                STATE.put(n + 1, ST_OK);
-                CASTS.push(n);
+                tcx.state.put(n + 1, ST_OK);
+                tcx.casts.push(n);
             } else if from == TY_I64 {
-                CAST_COUNTS[CK_NOOP] += 1;
+                tcx.cast_counts[CK_NOOP] += 1;
             } else {
-                CAST_COUNTS[CK_NOT_USIZE] += 1;
+                tcx.cast_counts[CK_NOT_USIZE] += 1;
             }
         }
     }
     // the contexts, once, to make the local candidates
-    for i in 0..CASTS.count {
+    for i in 0..tcx.casts.count {
         var h = false;
-        context(CASTS.get(i), &h);
+        context(tcx.casts.get(i), &h, &tcx);
     }
     // the fixed point: refuse what does not hold, until nothing changes
     var changed = true;
     while changed {
         changed = false;
-        for i in 0..CASTS.count {
-            let u = CASTS.get(i);
-            if ok(u) && !holds_now(u) {
-                STATE.put(u + 1, ST_NO);
+        for i in 0..tcx.casts.count {
+            let u = tcx.casts.get(i);
+            if ok(u, tcx) && !holds_now(u, &tcx) {
+                tcx.state.put(u + 1, ST_NO);
                 changed = true;
             }
         }
         var j = 0;
-        while j < LOCAL_UNITS.count {
-            let u = LOCAL_UNITS.get(j);
-            if ok(u) && !holds_now(u) {
-                STATE.put(u + 1, ST_NO);
+        while j < tcx.local_units.count {
+            let u = tcx.local_units.get(j);
+            if ok(u, tcx) && !holds_now(u, &tcx) {
+                tcx.state.put(u + 1, ST_NO);
                 changed = true;
             }
             j += 1;
@@ -463,30 +440,32 @@ pub fn cast_edits() -> i64 {
     // the edits, and the census
     var fixes = 0;
     let list = buf_new();
-    for i in 0..CASTS.count {
-        let u = CASTS.get(i);
+    for i in 0..tcx.casts.count {
+        let u = tcx.casts.get(i);
         var h = false;
-        let first = context(u, &h);
+        let first = context(u, &h, &tcx);
         var class = first;
-        if SPANS.get(NODES[u].start + 1) > 1 || in_closure(u) {
+        if tcx.casts_spans.get(NODES[u].start + 1) > 1 || in_closure(u, tcx) {
             class = CK_COPIED;
-        } else if !ok(u) && (class <= CK_LET || class == CK_SLICE_END) {
+        } else if !ok(u, tcx) && (class <= CK_LET || class == CK_SLICE_END) {
             class = CK_REFUSED;
         }
-        CAST_COUNTS[class] += 1;
-        if CAST_LIST {
+        tcx.cast_counts[class] += 1;
+        if tcx.cast_list {
             put_site(list, u, class, first);
         }
-        if ok(u) && class == CK_SLICE_END {
+        if ok(u, tcx) && class == CK_SLICE_END {
             let d = dots_end(u);
             if d > 0 && edit_replace(d, NODES[u].end, buf_new()) {
                 fixes += 1;
             }
-        } else if ok(u) && class <= CK_LET && edit_replace(as_start(u), NODES[u].end, buf_new()) {
+        }
+        else if ok(u, tcx) && class <= CK_LET
+            && edit_replace(as_start(u), NODES[u].end, buf_new()) {
             fixes += 1;
         }
     }
-    if CAST_LIST {
+    if tcx.cast_list {
         crate::base::buf_write_fd(list, crate::base::STDOUT);
     }
     fixes
@@ -537,8 +516,8 @@ pub fn class_name(c: i64) -> *u8 {
 }
 
 // The census after a run: `note fix.casts: ...`.
-pub fn cast_report() {
-    let d = diag(c"note", c"fix.casts");
+pub fn cast_report(tcx: inout Tcx<Comp>) {
+    let d = diag(c"note", c"fix.casts", &tcx);
     buf_str(d, c"usize to i64 casts: removed");
     let order = [CK_INDEX, CK_SLICE_END, CK_COMPARE, CK_LOOP, CK_LET, CK_SUB, CK_ARITH,
         CK_CMP_I64, CK_STORED, CK_OTHER, CK_REFUSED, CK_COPIED, CK_NOOP, CK_NOT_USIZE];
@@ -553,7 +532,7 @@ pub fn cast_report() {
         buf_byte(d, ' ');
         buf_str(d, class_name(c));
         buf_byte(d, ' ');
-        buf_int(d, CAST_COUNTS[c]);
+        buf_int(d, tcx.cast_counts[c]);
     }
     buf_byte(d, '\n');
 }

@@ -11,10 +11,12 @@
 use crate::base::{
     FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, strlen,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_WORD, Leaf, flag, option};
 use crate::front::ast::{NODES, NodeKind};
 use crate::front::modules::file_of_pos;
-use crate::tools::edit::{TARGET, edit_replace};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::apply_edit;
 use crate::tools::edit::cli::{ambiguous, edit_opts, source_only, take_edit_event};
 use crate::tools::edit::items::{after_line, item_tail};
@@ -22,7 +24,7 @@ use crate::tools::edit::stdedit::{rerun_in_std_tree, std_rerun};
 use crate::tools::query::{c_slice, resolve_name, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::DEFS;
-use crate::tools::query::diagnostics::{ROOT_GIVEN, diag, program_errors, try_begin, try_end};
+use crate::tools::query::diagnostics::{diag, program_errors, try_begin, try_end};
 use crate::tools::query::positions::{LINES, line_end, line_index, line_of, line_start};
 use crate::tools::query::show::text_start;
 
@@ -36,7 +38,7 @@ pub fn wrap_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(table, "name")
 }
 
-pub fn run_wrap(c: Call<Gpa>) -> i64 {
+pub fn run_wrap(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     var root = 0 as *u8;
     var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var head = 0 as *u8;
@@ -45,7 +47,7 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
     for e in c.evs.iter() {
         var ev = e;
         if ev.kind == EV_MISSING && (ev.name == "in" || ev.name == "lines") {
-            return usage(ev.value, c" needs a value");
+            return usage(ev.value, c" needs a value", &tcx);
         }
         if ev.kind == EV_OPTION && ev.name == "in" {
             head = ev.value;
@@ -53,9 +55,9 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
             lines = ev.value;
         } else if ev.kind == EV_FLAG && ev.name == "body" {
             body = true;
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
         } else if ev.kind != EV_WORD {
-            return usage(ev.value, c": an unknown option");
+            return usage(ev.value, c": an unknown option", &tcx);
         } else {
             names.push(ev.value as i64);
         }
@@ -68,37 +70,39 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
         }
         if names.count != 1 {
             return usage(c"wrap",
-                if names.count == 0 { c": a TARGET is needed" } else { c": one TARGET at a time" });
+                if names.count == 0 { c": a TARGET is needed" } else { c": one TARGET at a time" },
+                &tcx);
         }
         if head == 0 as *u8 {
             return usage(c"wrap",
-                c": --in HEAD is needed (unsafe, loop, 'if c'; '' for a bare block)");
+                c": --in HEAD is needed (unsafe, loop, 'if c'; '' for a bare block)", &tcx);
         }
         if body && lines != 0 as *u8 {
-            return usage(c"wrap", c": --body or --lines A-B, not both");
+            return usage(c"wrap", c": --body or --lines A-B, not both", &tcx);
         }
         var la = 0;
         var lb = 0;
         if lines != 0 as *u8 && !line_range(c_slice(lines), &la, &lb) {
-            return usage(lines, c": --lines takes A-B, the first and last line (or one line, A)");
+            return usage(lines, c": --lines takes A-B, the first and last line (or one line, A)",
+                &tcx);
         }
         let name = c_slice(names.data[0] as *u8);
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, c"wrap", name, true);
+        tcx.root_given = root;
+        root = root_or_diag(root, c"wrap", name, true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
-        if !load_program(root, TARGET) {
-            program_errors(c"error", root, true);
+        if !load_program(root, tcx.target, &tcx) {
+            program_errors(c"error", root, true, &tcx);
             return 1;
         }
         var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !resolve_name(c"wrap", name, &matches) {
+        if !resolve_name(c"wrap", name, &matches, &tcx) {
             return 1;
         }
         source_only(&matches);
         if matches.count > 1 {
-            ambiguous(c"wrap", name, matches);
+            ambiguous(c"wrap", name, matches, &tcx);
             return 1;
         }
         let d = matches.data[0];
@@ -106,10 +110,10 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
         let fqn = SYMS[DEFS[d].fqn].text;
         if FILES[f].path[0] == '<' {
             // (0.17: std, in the repository: in its files; stdedit.vl)
-            if std_rerun(f) {
-                return rerun_in_std_tree(c.line);
+            if std_rerun(f, &tcx) {
+                return rerun_in_std_tree(c.line, &tcx);
             }
-            let e = diag(c"error", c"edit.not-source");
+            let e = diag(c"error", c"edit.not-source", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, c" is in ");
             buf_str(e, FILES[f].path);
@@ -122,10 +126,10 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
         if lines == 0 as *u8 {
             let n = DEFS[d].node;
             if n <= 0 || NODES[n].kind != NodeKind::Fn || NODES[n].c <= 0 {
-                let e = diag(c"error", c"edit.wrap");
+                let e = diag(c"error", c"edit.wrap", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" is not a function with a body; wrap lines of it with --lines A-B\n");
-                try_end(try_begin(c"show", fqn, true));
+                try_end(try_begin(c"show", fqn, true, &tcx));
                 return 1;
             }
             let b = NODES[n].c;
@@ -134,21 +138,21 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
             if SRC[s] != '{' || SRC[e - 1] != '}' || line_of(s) == line_of(e - 1)
                 || !blank(s + 1, line_end(s))
                 || !blank(line_start(e - 1), e - 1) {
-                let x = diag(c"error", c"edit.layout");
+                let x = diag(c"error", c"edit.layout", &tcx);
                 buf_str(x, c"the braces of ");
                 buf_bytes(x, fqn);
                 buf_str(x,
                     c"'s body share their lines with code; wrap lines of it with --lines A-B\n");
-                try_end(try_begin(c"show", fqn, true));
+                try_end(try_begin(c"show", fqn, true, &tcx));
                 return 1;
             }
             first = after_line(s);
             last = line_start(e - 1);
         } else {
             let top = line_of(line_start(text_start(d)));
-            let bottom = line_of(item_tail(d) - 1);
+            let bottom = line_of(item_tail(d, tcx) - 1);
             if la < top || lb > bottom {
-                let x = diag(c"error", c"edit.wrap");
+                let x = diag(c"error", c"edit.wrap", &tcx);
                 buf_str(x, c"lines ");
                 put_range(x, la, lb);
                 buf_str(x, c" are not all in ");
@@ -156,7 +160,7 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
                 buf_str(x, c" (lines ");
                 put_range(x, top, bottom);
                 buf_str(x, c")\n");
-                try_end(try_begin(c"show", fqn, true));
+                try_end(try_begin(c"show", fqn, true, &tcx));
                 return 1;
             }
             let base = line_index(FILES[f].start);
@@ -178,7 +182,7 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
             p = e + 1;
         }
         if least < 0 {
-            let x = diag(c"error", c"edit.wrap");
+            let x = diag(c"error", c"edit.wrap", &tcx);
             buf_str(x, c"the lines to wrap are blank\n");
             return 1;
         }
@@ -214,16 +218,16 @@ pub fn run_wrap(c: Call<Gpa>) -> i64 {
         buf_bytes(what, fqn);
         buf_str(what, c" in ");
         buf_str(what, if strlen(head) > 0 { head } else { c"a block" });
-        apply_edit(buf_slice(what), root)
+        apply_edit(buf_slice(what), root, &tcx)
     }
 }
 
-fn usage(what: *u8, message: *u8) -> i64 {
-    let d = diag(c"error", c"edit.usage");
+fn usage(what: *u8, message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"edit.usage", &tcx);
     buf_str(d, what);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = try_begin(c"wrap NAME --in unsafe --lines 12-20", c_slice(c""), false);
+    let out = try_begin(c"wrap NAME --in unsafe --lines 12-20", c_slice(c""), false, &tcx);
     try_end(out);
     2
 }

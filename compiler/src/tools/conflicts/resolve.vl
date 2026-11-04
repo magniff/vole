@@ -7,16 +7,16 @@
 use crate::base::{
     BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{
     Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, Leaf, Line, flag, option,
 };
 use crate::front::cpp::directives::file_exists;
 use crate::tools::conflicts::{
-    F_PATH, F_TEXT, R_BASE, R_END, R_FILE, R_SEP, R_START, blank, conflicted_files, default_dir,
-    file_target, indent, line, line_pos, marker, names_item, ours_end, path_of, read_dir,
-    read_source, try_start,
+    blank, conflicted_files, default_dir, file_target, indent, line, line_pos, marker, names_item,
+    ours_end, path_of, read_dir, read_source, try_start,
 };
-use crate::tools::edit::{DRY_RUN, SHOW};
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::apply::copy_path;
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::edit::diff::diff_texts;
@@ -25,32 +25,30 @@ use crate::tools::proc::{
     read_file_if, read_stdin, remove_file, rename_file, run_capture, same_bytes, write_file_if,
 };
 use crate::tools::query::{c_slice, find_root};
-use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, diag, put_cword, put_root, put_word, try_end,
-};
+use crate::tools::query::diagnostics::{PROG, diag, put_cword, put_root, put_word, try_end};
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"edit.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"edit.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = try_start();
+    let out = try_start(&tcx);
     buf_str(out, c" edit resolve FILE:LINE --ours");
-    put_root(out);
+    put_root(out, tcx);
     try_end(out);
     2
 }
 
 // The command as it was run, with TARGET (word t) replaced by region r's
 // first line.
-fn try_region(line: Line, t: i64, r: i64, stdin: bool) {
+fn try_region(line: Line, t: i64, r: i64, stdin: bool, tcx: inout Tcx<Comp>) {
     unsafe {
-        let out = try_start();
+        let out = try_start(&tcx);
         for i in 1..line.len() {
             if i == t {
                 let w = buf_new();
-                buf_bytes(w, path_of(R_FILE.data[r]));
+                buf_bytes(w, path_of(tcx.r_file.data[r], tcx));
                 buf_byte(w, ':');
-                buf_int(w, R_START.data[r]);
+                buf_int(w, tcx.conflicts_r_start.data[r]);
                 put_word(out, buf_slice(w));
             } else if line.word(i) != "--all" {
                 put_word(out, line.word(i).as_bytes());
@@ -65,11 +63,11 @@ fn try_region(line: Line, t: i64, r: i64, stdin: bool) {
 
 // Region r's replacement (side: 'o' ours, 't' theirs, 'b' both, 'a' the
 // base, 'x' the text), appended to out; its number of lines.
-fn put_resolved(out: i64, r: i64, side: u8, text: i64) -> i64 {
+fn put_resolved(out: i64, r: i64, side: u8, text: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        let f = R_FILE.data[r];
-        let t = buf_slice(F_TEXT.data[f]);
-        let s = R_START.data[r];
+        let f = tcx.r_file.data[r];
+        let t = buf_slice(tcx.f_text.data[f]);
+        let s = tcx.conflicts_r_start.data[r];
         let before = BUFS[out].len;
         if side == 'x' {
             let x = buf_slice(text);
@@ -79,21 +77,26 @@ fn put_resolved(out: i64, r: i64, side: u8, text: i64) -> i64 {
             }
         } else {
             if side == 'o' || side == 'b' {
-                buf_bytes(out, t[line_pos(f, s + 1)..line_pos(f, ours_end(r))]);
+                buf_bytes(out, t[line_pos(f, s + 1, tcx)..line_pos(f, ours_end(r, tcx), tcx)]);
             }
             if side == 'a' {
-                buf_bytes(out, t[line_pos(f, R_BASE.data[r] + 1)..line_pos(f, R_SEP.data[r])]);
+                buf_bytes(out,
+                    t[line_pos(f, tcx.r_base.data[r] + 1, tcx)..line_pos(f, tcx.r_sep.data[r],
+                        tcx)]);
             }
             // (both: an item at the top level after another, a blank line apart)
-            let ours = ours_end(r) - s - 1;
-            let theirs = R_END.data[r] - R_SEP.data[r] - 1;
+            let ours = ours_end(r, tcx) - s - 1;
+            let theirs = tcx.conflicts_r_end.data[r] - tcx.r_sep.data[r] - 1;
             if side == 'b' && ours > 0 && theirs > 0
-                && same_bytes(line(f, ours_end(r) - 1), c_slice(c"}"))
-                && !blank(line(f, R_SEP.data[r] + 1)) && indent(line(f, R_SEP.data[r] + 1)) == 0 {
+                && same_bytes(line(f, ours_end(r, tcx) - 1, tcx), c_slice(c"}"))
+                && !blank(line(f, tcx.r_sep.data[r] + 1, tcx))
+                && indent(line(f, tcx.r_sep.data[r] + 1, tcx)) == 0 {
                 buf_byte(out, '\n');
             }
             if side == 't' || side == 'b' {
-                buf_bytes(out, t[line_pos(f, R_SEP.data[r] + 1)..line_pos(f, R_END.data[r])]);
+                buf_bytes(out,
+                    t[line_pos(f, tcx.r_sep.data[r] + 1, tcx)..line_pos(f,
+                        tcx.conflicts_r_end.data[r], tcx)]);
             }
         }
         var n = 0;
@@ -112,10 +115,10 @@ fn side_name(side: u8) -> *u8 {
 }
 
 // The marker lines left in the files under the root's directory.
-fn regions_left(files: inout i64) -> i64 {
+fn regions_left(files: inout i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        conflicted_files(default_dir(), &paths);
+        conflicted_files(default_dir(tcx), &paths);
         files = paths.count;
         var n = 0;
         for k in 0..paths.count {
@@ -155,7 +158,7 @@ pub fn resolve_leaf(gpa: Gpa) -> Leaf<Gpa> {
 // `volec edit resolve TARGET --ours|--theirs|--both|--base [--all]
 // [--in FILE]` (or `< TEXT`): the exit status (the diagnostics are
 // written by run_edit).
-pub fn run_resolve(c: Call<Gpa>) -> i64 {
+pub fn run_resolve(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     var side = 'x';
     var all = false;
     var in_file = 0 as *u8;
@@ -174,68 +177,69 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
         }
         if s != 'x' {
             if side != 'x' {
-                return usage(c"one of --ours, --theirs, --both, --base (or the text on stdin)");
+                return usage(c"one of --ours, --theirs, --both, --base (or the text on stdin)",
+                    &tcx);
             }
             side = s;
         } else if f && ev.name == "all" {
             all = true;
         } else if ev.kind == EV_OPTION && ev.name == "in" {
             in_file = a;
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
         } else if ev.kind != EV_WORD {
-            let d = diag(c"error", c"edit.usage");
+            let d = diag(c"error", c"edit.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
             buf_str(d, c"' of edit resolve\n");
             return usage(
-                c"edit resolve TARGET --ours|--theirs|--both|--base [--all] [--in FILE]");
+                c"edit resolve TARGET --ours|--theirs|--both|--base [--all] [--in FILE]", &tcx);
         } else if target == 0 as *u8 {
             target = a;
             target_at = ev.at;
         } else {
-            return usage(c"one TARGET at a time (FILE:LINE, FILE or an item's NAME)");
+            return usage(c"one TARGET at a time (FILE:LINE, FILE or an item's NAME)", &tcx);
         }
     }
     unsafe {
         if target == 0 as *u8 {
-            return usage(c"a TARGET is needed (FILE:LINE, FILE or an item's NAME)");
+            return usage(c"a TARGET is needed (FILE:LINE, FILE or an item's NAME)", &tcx);
         }
-        ROOT_GIVEN = root;
+        tcx.root_given = root;
         let text = buf_new();
-        if side == 'x' && (!read_stdin(text) || BUFS[text].len == 0) {
-            let d = diag(c"error", c"edit.no-text");
+        if side == 'x' && (!read_stdin(text, &tcx) || BUFS[text].len == 0) {
+            let d = diag(c"error", c"edit.no-text", &tcx);
             buf_str(d, c"no side (--ours, --theirs, --both, --base), and no text on stdin\n");
-            let out = try_start();
+            let out = try_start(&tcx);
             buf_str(out, c" edit resolve");
             put_cword(out, target);
             buf_str(out, c" --ours");
-            put_root(out);
+            put_root(out, tcx);
             try_end(out);
             return 2;
         }
         // The regions.
         var sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let t = file_target(target, &sel);
+        let t = file_target(target, &sel, &tcx);
         if t == 2 {
             return 1;
         }
         let by_name = t == 1;
         if by_name {
             if in_file != 0 as *u8 {
-                if read_source(in_file) < 0 {
+                if read_source(in_file, &tcx) < 0 {
                     return 1;
                 }
-            } else if !read_dir(default_dir()) {
+            } else if !read_dir(default_dir(tcx), &tcx) {
                 return 1;
             }
-            for r in 0..R_FILE.count {
-                if names_item(r, c_slice(target)) {
+            for r in 0..tcx.r_file.count {
+                if names_item(r, c_slice(target), tcx) {
                     sel.push(r);
                 }
             }
         }
         if sel.count == 0 {
-            let d = diag(c"error", c"conflict.none");
+            let d = diag(c"error", c"conflict.none", &tcx);
             if by_name {
                 buf_str(d, c"no conflict region in an item '");
             } else {
@@ -243,14 +247,14 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
             }
             buf_str(d, target);
             buf_str(d, c"'\n");
-            let out = try_start();
+            let out = try_start(&tcx);
             buf_str(out, c" query conflicts");
-            put_root(out);
+            put_root(out, tcx);
             try_end(out);
             return 1;
         }
         if sel.count > 1 && !all {
-            let d = diag(c"error", c"conflict.ambiguous");
+            let d = diag(c"error", c"conflict.ambiguous", &tcx);
             buf_int(d, sel.count);
             buf_str(d, c" conflict regions match '");
             buf_str(d, target);
@@ -260,14 +264,14 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
                 if k > 0 {
                     buf_str(d, c", ");
                 }
-                buf_bytes(d, path_of(R_FILE.data[r]));
+                buf_bytes(d, path_of(tcx.r_file.data[r], tcx));
                 buf_byte(d, ':');
-                buf_int(d, R_START.data[r]);
+                buf_int(d, tcx.conflicts_r_start.data[r]);
             }
             buf_str(d, c"; give FILE:LINE, or --all for every one\n");
             var k = 0;
             while k < sel.count && k < 3 {
-                try_region(c.line, target_at, sel.data[k], side == 'x');
+                try_region(c.line, target_at, sel.data[k], side == 'x', &tcx);
                 k += 1;
             }
             return 1;
@@ -275,19 +279,19 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
         if side == 'a' {
             for k in 0..sel.count {
                 let r = sel.data[k];
-                if R_BASE.data[r] < 0 {
-                    let d = diag(c"error", c"conflict.no-base");
-                    buf_bytes(d, path_of(R_FILE.data[r]));
+                if tcx.r_base.data[r] < 0 {
+                    let d = diag(c"error", c"conflict.no-base", &tcx);
+                    buf_bytes(d, path_of(tcx.r_file.data[r], tcx));
                     buf_byte(d, ':');
-                    buf_int(d, R_START.data[r]);
+                    buf_int(d, tcx.conflicts_r_start.data[r]);
                     buf_str(d,
                         c" has no base side (git writes it with merge.conflictStyle diff3)\n");
-                    let out = try_start();
+                    let out = try_start(&tcx);
                     buf_str(out, c" query conflicts");
                     let w = buf_new();
-                    buf_bytes(w, path_of(R_FILE.data[r]));
+                    buf_bytes(w, path_of(tcx.r_file.data[r], tcx));
                     buf_byte(w, ':');
-                    buf_int(w, R_START.data[r]);
+                    buf_int(w, tcx.conflicts_r_start.data[r]);
                     put_word(out, buf_slice(w));
                     buf_str(out, c" --show");
                     try_end(out);
@@ -314,19 +318,19 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
         let diff = buf_new();
         var k = 0;
         while k < sel.count {
-            let f = R_FILE.data[sel.data[k]];
-            let old = buf_slice(F_TEXT.data[f]);
+            let f = tcx.r_file.data[sel.data[k]];
+            let old = buf_slice(tcx.f_text.data[f]);
             let new = buf_new();
             var cur = 0;
             var delta = 0;
-            while k < sel.count && R_FILE.data[sel.data[k]] == f {
+            while k < sel.count && tcx.r_file.data[sel.data[k]] == f {
                 let r = sel.data[k];
-                let s = R_START.data[r];
-                buf_bytes(new, old[cur..line_pos(f, s)]);
+                let s = tcx.conflicts_r_start.data[r];
+                buf_bytes(new, old[cur..line_pos(f, s, tcx)]);
                 let at = BUFS[new].len;
-                let n = put_resolved(new, r, side, text);
+                let n = put_resolved(new, r, side, text, tcx);
                 buf_str(shown, c"// ");
-                buf_bytes(shown, path_of(f));
+                buf_bytes(shown, path_of(f, tcx));
                 buf_byte(shown, ':');
                 buf_int(shown, s + delta);
                 if n == 0 {
@@ -353,14 +357,14 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
                         p = e + 1;
                     }
                 }
-                delta += n - (R_END.data[r] - s + 1);
-                cur = line_pos(f, R_END.data[r] + 1);
+                delta += n - (tcx.conflicts_r_end.data[r] - s + 1);
+                cur = line_pos(f, tcx.conflicts_r_end.data[r] + 1, tcx);
                 k += 1;
             }
             buf_bytes(new, old[cur..]);
-            diff_texts(diff, path_of(f), old, buf_slice(new));
-            paths.push(F_PATH.data[f]);
-            befores.push(F_TEXT.data[f]);
+            diff_texts(diff, path_of(f, tcx), old, buf_slice(new), &tcx);
+            paths.push(tcx.f_path.data[f]);
+            befores.push(tcx.f_text.data[f]);
             afters.push(new);
         }
         // Lines added and removed, from the diff.
@@ -381,7 +385,7 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
             }
             p = e + 1;
         }
-        if DRY_RUN {
+        if tcx.dry_run {
             buf_write_fd(diff, STDOUT);
             return 0;
         }
@@ -392,7 +396,7 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
                 for x in 0..j + 1 {
                     remove_file(copy_path(paths.data[x] as *u8));
                 }
-                let e = diag(c"error", c"edit.write");
+                let e = diag(c"error", c"edit.write", &tcx);
                 buf_str(e, c"cannot write '");
                 buf_str(e, path);
                 buf_str(e, c"'\n");
@@ -403,11 +407,11 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
         buf_str(summary, c"resolved ");
         if sel.count == 1 {
             let r = sel.data[0];
-            buf_bytes(summary, path_of(R_FILE.data[r]));
+            buf_bytes(summary, path_of(tcx.r_file.data[r], tcx));
             buf_byte(summary, ':');
-            buf_int(summary, R_START.data[r]);
+            buf_int(summary, tcx.conflicts_r_start.data[r]);
             buf_byte(summary, '-');
-            buf_int(summary, R_END.data[r]);
+            buf_int(summary, tcx.conflicts_r_end.data[r]);
         } else {
             buf_int(summary, sel.count);
             buf_str(summary, c" conflicts");
@@ -426,39 +430,39 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
         buf_str(summary, c" -");
         buf_int(summary, removed);
         buf_str(summary, c" lines");
-        let root_path = find_root(ROOT_GIVEN);
+        let root_path = find_root(tcx.root_given);
         journal_texts(if root_path != 0 as *u8 { root_path } else { paths.data[0] as *u8 }, paths,
-            befores, afters, buf_slice(summary));
+            befores, afters, buf_slice(summary), &tcx);
         var ok = true;
         for j in 0..paths.count {
             let path = paths.data[j] as *u8;
             if !rename_file(copy_path(path), path) {
                 ok = false;
-                let e = diag(c"error", c"edit.write");
+                let e = diag(c"error", c"edit.write", &tcx);
                 buf_str(e, c"cannot write '");
                 buf_str(e, path);
                 buf_str(e, c"'\n");
             }
         }
         buf_byte(summary, '\n');
-        if SHOW {
+        if tcx.show {
             buf_bytes(summary, buf_slice(shown));
         }
         buf_write_fd(summary, STDOUT);
         // What is left: other regions, else the program's errors.
         var files = 0;
-        let left = regions_left(&files);
+        let left = regions_left(&files, tcx);
         if left > 0 {
-            let n = diag(c"note", c"conflict.left");
+            let n = diag(c"note", c"conflict.left", &tcx);
             buf_int(n, left);
             buf_str(n,
                 if left == 1 { c" conflict region left in " }
                 else { c" conflict regions left in " });
             buf_int(n, files);
             buf_str(n, if files == 1 { c" file\n" } else { c" files\n" });
-            let out = try_start();
+            let out = try_start(&tcx);
             buf_str(out, c" query conflicts");
-            put_root(out);
+            put_root(out, tcx);
             try_end(out);
         } else if root_path != 0 as *u8 && file_exists(root_path) {
             var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -471,11 +475,11 @@ pub fn run_resolve(c: Call<Gpa>) -> i64 {
             let status = run_capture(args.data as **u8, out);
             if status != 0 {
                 buf_write_fd(out, STDOUT);
-                let w = diag(c"warning", c"conflict.check");
+                let w = diag(c"warning", c"conflict.check", &tcx);
                 buf_str(w, c"the resolved program has errors (written; the merge may need more than one side)\n");
-                let tr = try_start();
+                let tr = try_start(&tcx);
                 buf_str(tr, c" check");
-                put_root(tr);
+                put_root(tr, tcx);
                 try_end(tr);
             }
         }

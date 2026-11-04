@@ -23,11 +23,13 @@ pub mod mentions;
 use crate::base::{
     FILES, IntVec, SOURCE_VOLE, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
 };
+use crate::base::comp::Comp;
 use crate::front::ast::{NODES, child};
 use crate::front::cpp::directives::{file_exists, path_dir};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{MODULES, STD_MODULE, file_of_pos, module_at, module_count, module_of};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::{edit_move_file, edit_new_file, edit_replace};
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::proc::{buf_cstr, same_bytes};
@@ -38,24 +40,15 @@ use crate::tools::query::defs::{
 };
 use crate::tools::query::diagnostics::{diag, try_begin, try_end};
 use crate::tools::query::positions::{line_end, line_start, shorthand_at, shorthand_text, token_at};
-use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS, collect_refs, set_targets, sorted_refs};
+use crate::tools::query::refs::{collect_refs, set_targets, sorted_refs};
 use crate::tools::query::show::text_start;
-use crate::tools::refactor_mod::cli::{EDIT_FAILED, inline_module, is_name_use, user_pos};
+use crate::tools::refactor_mod::cli::{inline_module, is_name_use, user_pos};
 
 // ---- The program's references ----
 
-// Every reference the checker resolved (every definition is a target),
-// in order, each once: indices into query's R_* vectors.
-pub static var REFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // What the name a `use` imports at a position is (position + 1 ->
 // definition + 1), and its Ident node (position + 1 -> node).
 static var USE_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var USE_ID: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// The Use node of a name's Ident node (node -> Use node).
-static var USE_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// The names of the modules: (module, name) -> definition + 1, for the
-// items (and `mod` declarations), and for the imports.
-static var ITEM_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 static var USE_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 fn bind_key(m: i64, name: i64) -> i64 {
@@ -64,23 +57,25 @@ fn bind_key(m: i64, name: i64) -> i64 {
 
 // Collects the references of the whole program, and the names of its
 // modules.
-pub fn load_refs() {
+pub fn load_refs(tcx: inout Tcx<Comp>) {
     unsafe {
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for d in 0..DEFS.len() as i64 {
             all.push(d);
             let k = DEFS[d].kind;
             if DEFS[d].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD {
-                ITEM_BIND.put(bind_key(DEFS[d].module, DEFS[d].name), d + 1);
+                tcx.item_bind.put(bind_key(DEFS[d].module, DEFS[d].name), d + 1);
             }
         }
-        set_targets(all);
-        collect_refs();
-        sorted_refs(&REFS);
-        for k in 0..REFS.count {
-            let r = REFS.data[k];
-            if (R_FLAGS.data[r] & QF_USE) != 0 {
-                USE_AT.put(R_POS.data[r] + 1, R_DEF.data[r] + 1);
+        set_targets(all, &tcx);
+        collect_refs(&tcx);
+        var refs = tcx.refs;
+        sorted_refs(&refs, &tcx);
+        tcx.refs = refs;
+        for k in 0..tcx.refs.count {
+            let r = tcx.refs.data[k];
+            if (tcx.r_flags.data[r] & QF_USE) != 0 {
+                USE_AT.put(tcx.r_pos.data[r] + 1, tcx.r_def.data[r] + 1);
             }
         }
         for u in 1..NODES.len() as i64 {
@@ -90,8 +85,8 @@ pub fn load_refs() {
             let m = module_of(u);
             for k in 0..NODES[u].count {
                 let id = child(u, k);
-                USE_ID.put(NODES[id].start + 1, id);
-                USE_OF.put(id, u);
+                tcx.use_id.put(NODES[id].start + 1, id);
+                tcx.use_of.put(id, u);
                 if USE_AT.get(NODES[id].start + 1) > 0 {
                     USE_BIND.put(bind_key(m, use_local(id)), id);
                 }
@@ -106,12 +101,12 @@ pub fn use_local(id: i64) -> i64 {
 }
 
 // The Ident node of the `use` name at pos (0: none), and its Use node.
-pub fn use_id_at(pos: i64) -> i64 {
-    USE_ID.get(pos + 1)
+pub fn use_id_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.use_id.get(pos + 1)
 }
 
-pub fn use_node_of(id: i64) -> i64 {
-    USE_OF.get(id)
+pub fn use_node_of(id: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.use_of.get(id)
 }
 
 // What the `use` name of Ident node id imports (its definition; -1:
@@ -122,8 +117,8 @@ pub fn use_def(id: i64) -> i64 {
 
 // What name `name` is in module m: an item (or a module declared there),
 // an import; -1 for none.
-pub fn item_binding(m: i64, name: i64) -> i64 {
-    ITEM_BIND.get(bind_key(m, name)) - 1
+pub fn item_binding(m: i64, name: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.item_bind.get(bind_key(m, name)) - 1
 }
 
 pub fn use_binding(m: i64, name: i64) -> i64 {
@@ -136,8 +131,8 @@ pub fn use_binding_id(m: i64, name: i64) -> i64 {
     USE_BIND.get(bind_key(m, name))
 }
 
-pub fn binding_of(m: i64, name: i64) -> i64 {
-    let d = item_binding(m, name);
+pub fn binding_of(m: i64, name: i64, tcx: Tcx<Comp>) -> i64 {
+    let d = item_binding(m, name, tcx);
     if d >= 0 { d } else { use_binding(m, name) }
 }
 
@@ -198,76 +193,69 @@ pub fn path_start(pos: i64) -> i64 {
 // its text: the `mod` lines of the modules made in it, its imports, the
 // items moved into it.
 
-pub static var NM_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_PUB: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NM_BODY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// (0.12) its header comment (split: --header, or a banner).
-pub static var NM_HEAD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn new_region(parent: i64, name: i64, path: *u8) -> i64 {
-    NM_NAME.push(name);
-    NM_PARENT.push(parent);
-    NM_PATH.push(path as i64);
-    NM_PUB.push(0);
-    NM_MODS.push(buf_new());
-    NM_USES.push(buf_new());
-    NM_BODY.push(buf_new());
-    NM_HEAD.push(buf_new());
-    module_count() + NM_NAME.count - 1
+pub fn new_region(parent: i64, name: i64, path: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    tcx.nm_name.push(name);
+    tcx.nm_parent.push(parent);
+    tcx.nm_path.push(path as i64);
+    tcx.nm_pub.push(0);
+    tcx.nm_mods.push(buf_new());
+    tcx.nm_uses.push(buf_new());
+    tcx.nm_body.push(buf_new());
+    tcx.nm_head.push(buf_new());
+    module_count() + tcx.nm_name.count - 1
 }
 
 pub fn is_new(r: i64) -> bool {
     r >= module_count()
 }
 
-pub fn region_parent(r: i64) -> i64 {
+pub fn region_parent(r: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         if r < 0 {
             return -1;
         }
-        if r < module_count() { MODULES[r].parent } else { NM_PARENT.data[r - module_count()] }
+        if r < module_count() { MODULES[r].parent } else { tcx.nm_parent.data[r - module_count()] }
     }
 }
 
-pub fn region_name(r: i64) -> i64 {
-    unsafe { if r < module_count() { MODULES[r].name } else { NM_NAME.data[r - module_count()] } }
+pub fn region_name(r: i64, tcx: Tcx<Comp>) -> i64 {
+    unsafe {
+        if r < module_count() { MODULES[r].name } else { tcx.nm_name.data[r - module_count()] }
+    }
 }
 
 // Whether region `inner` is `outer` or inside it.
-pub fn within(inner: i64, outer: i64) -> bool {
+pub fn within(inner: i64, outer: i64, tcx: Tcx<Comp>) -> bool {
     var m = inner;
     while m >= 0 {
         if m == outer {
             return true;
         }
-        m = region_parent(m);
+        m = region_parent(m, tcx);
     }
     false
 }
 
-pub fn region_public(r: i64) -> bool {
+pub fn region_public(r: i64, tcx: Tcx<Comp>) -> bool {
     unsafe {
         if r == 0 {
             return true;
         }
-        if r < module_count() { MODULES[r].public } else { NM_PUB.data[r - module_count()] != 0 }
+        if r < module_count() { MODULES[r].public }
+        else { tcx.nm_pub.data[r - module_count()] != 0 }
     }
 }
 
 // The path of region r: `crate`, `crate::a::b`.
-pub fn put_region_path(out: i64, r: i64) {
+pub fn put_region_path(out: i64, r: i64, tcx: inout Tcx<Comp>) {
     unsafe {
         if r < module_count() {
-            buf_bytes(out, mod_fqn_text(r));
+            buf_bytes(out, mod_fqn_text(r, &tcx));
             return;
         }
-        put_region_path(out, region_parent(r));
+        put_region_path(out, region_parent(r, tcx), &tcx);
         buf_str(out, c"::");
-        buf_bytes(out, SYMS[NM_NAME.data[r - module_count()]].text);
+        buf_bytes(out, SYMS[tcx.nm_name.data[r - module_count()]].text);
     }
 }
 
@@ -342,7 +330,7 @@ pub fn dir_form(path: *u8) -> *u8 {
 // The file module m's text will be in after the edit, and moves it to its
 // dir form (`a.vl` -> `a/mod.vl`) when it gains a child: the path its
 // children are found from. 0 for an inline module.
-pub fn parent_file_path(m: i64, converts: inout HMap) -> *u8 {
+pub fn parent_file_path(m: i64, converts: inout HMap, tcx: inout Tcx<Comp>) -> *u8 {
     unsafe {
         let f = own_file(m);
         if f < 0 {
@@ -354,7 +342,7 @@ pub fn parent_file_path(m: i64, converts: inout HMap) -> *u8 {
         let p = dir_form(FILES[f].path);
         if converts.get(f + 1) == 0 {
             converts.put(f + 1, p as i64);
-            edit_move_file(f, p);
+            edit_move_file(f, p, &tcx);
         }
         converts.get(f + 1) as *u8
     }
@@ -362,7 +350,7 @@ pub fn parent_file_path(m: i64, converts: inout HMap) -> *u8 {
 
 // Moves the files of module m (its file, and its children's) so that its
 // file is `path`.
-pub fn move_tree(m: i64, path: *u8) {
+pub fn move_tree(m: i64, path: *u8, tcx: inout Tcx<Comp>) {
     let f = own_file(m);
     let p = c_slice(FILES[f].path);
     let np = c_slice(path);
@@ -379,7 +367,7 @@ pub fn move_tree(m: i64, path: *u8) {
         buf_byte(old, '/');
         buf_bytes(new, np[0..np.len as i64 - ne]);
         buf_byte(new, '/');
-        edit_move_file(f, path);
+        edit_move_file(f, path, &tcx);
     }
     let o = buf_slice(old);
     for g in 0..FILES.len() as i64 {
@@ -388,14 +376,14 @@ pub fn move_tree(m: i64, path: *u8) {
             let b = buf_new();
             buf_bytes(b, buf_slice(new));
             buf_bytes(b, q[o.len..q.len]);
-            edit_move_file(g, buf_cstr(b));
+            edit_move_file(g, buf_cstr(b), &tcx);
         }
     }
 }
 
 // Adds line `text` (`mod NAME;`) to file f: after its last `mod NAME;`
 // line, else before its first item (after the comment at its top).
-pub fn add_mod_line(f: i64, text: [u8]) {
+pub fn add_mod_line(f: i64, text: [u8], tcx: inout Tcx<Comp>) {
     var last = -1;
     for d in 0..DEFS.len() as i64 {
         if DEFS[d].kind == K_MOD && file_of_pos(DEFS[d].start) == f
@@ -409,7 +397,7 @@ pub fn add_mod_line(f: i64, text: [u8]) {
         buf_byte(b, '\n');
         buf_bytes(b, text);
         let at = line_end(DEFS[last].end - 1);
-        put_edit(at, at, b);
+        put_edit(at, at, b, &tcx);
         return;
     }
     let at = first_item_line(f);
@@ -418,7 +406,7 @@ pub fn add_mod_line(f: i64, text: [u8]) {
     if at < FILES[f].end {
         buf_byte(b, '\n');
     }
-    put_edit(at, at, b);
+    put_edit(at, at, b, &tcx);
 }
 
 // The start of the line where file f's first item (or `use`) starts, with
@@ -453,9 +441,9 @@ pub fn comment_line(pos: i64) -> bool {
 
 // ---- Edits ----
 
-pub fn put_edit(a: i64, b: i64, text: i64) {
+pub fn put_edit(a: i64, b: i64, text: i64, tcx: inout Tcx<Comp>) {
     if !edit_replace(a, b, text) {
-        EDIT_FAILED = true;
+        tcx.cli_edit_failed = true;
     }
 }
 
@@ -469,12 +457,12 @@ pub fn text_of(s: [u8]) -> i64 {
 
 // `name` would be two things in region r: d is the other (a definition,
 // or what an import of that name brings).
-pub fn collision(name: [u8], r: i64, d: i64, imported: bool) -> i64 {
-    let e = diag(c"error", c"refactor.collision");
+pub fn collision(name: [u8], r: i64, d: i64, imported: bool, tcx: inout Tcx<Comp>) -> i64 {
+    let e = diag(c"error", c"refactor.collision", &tcx);
     buf_byte(e, '\'');
     buf_bytes(e, name);
     buf_str(e, c"' is already a name in ");
-    put_region_path(e, r);
+    put_region_path(e, r, &tcx);
     if d >= 0 {
         buf_str(e, if imported { c" (an import of " } else { c" (" });
         buf_str(e, kind_name(DEFS[d].kind));
@@ -485,10 +473,10 @@ pub fn collision(name: [u8], r: i64, d: i64, imported: bool) -> i64 {
     buf_str(e, c"; nothing written\n");
     if d >= 0 {
         let out = try_begin(if imported { c"refs" } else { c"def" }, SYMS[DEFS[d].fqn].text,
-            true);
+            true, &tcx);
         if imported && r < module_count() {
             buf_str(out, c" --in ");
-            buf_bytes(out, mod_fqn_text(r));
+            buf_bytes(out, mod_fqn_text(r, &tcx));
         }
         try_end(out);
     }
@@ -498,7 +486,7 @@ pub fn collision(name: [u8], r: i64, d: i64, imported: bool) -> i64 {
 // ---- rename ----
 
 // Every reference to the definitions of group, written `old`, becomes new.
-fn rename_refs(group: IntVec, old: i64, new: [u8]) {
+fn rename_refs(group: IntVec, old: i64, new: [u8], tcx: inout Tcx<Comp>) {
     unsafe {
         var in_group = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for i in 0..group.count {
@@ -506,30 +494,30 @@ fn rename_refs(group: IntVec, old: i64, new: [u8]) {
         }
         var done = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         let n = SYMS[old].text.len as i64;
-        for k in 0..REFS.count {
-            let r = REFS.data[k];
-            let p = R_POS.data[r];
-            if in_group.get(R_DEF.data[r] + 1) == 0 || !user_pos(p) || done.get(p + 1) != 0
+        for k in 0..tcx.refs.count {
+            let r = tcx.refs.data[k];
+            let p = tcx.r_pos.data[r];
+            if in_group.get(tcx.r_def.data[r] + 1) == 0 || !user_pos(p) || done.get(p + 1) != 0
                 || !ref_named(p, old) && !hole_named(p, old) {
                 continue;
             }
             done.put(p + 1, 1);
-            if shorthand_at(p) {
+            if shorthand_at(p, &tcx) {
                 // (0.15: `S { x }`: the field renamed, `y: x`; the value, `x: y`)
                 let o = SYMS[old].text;
-                let field = DEFS[R_DEF.data[r]].kind == K_FIELD;
+                let field = DEFS[tcx.r_def.data[r]].kind == K_FIELD;
                 put_edit(p, p + n,
-                    if field { shorthand_text(new, o) } else { shorthand_text(o, new) });
+                    if field { shorthand_text(new, o) } else { shorthand_text(o, new) }, &tcx);
                 continue;
             }
-            put_edit(p, p + n, text_of(new));
+            put_edit(p, p + n, text_of(new), &tcx);
         }
     }
 }
 
 // Whether the new name is taken where the definitions of group are named
 // (diagnosed).
-fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
+fn rename_collides(d: i64, group: IntVec, new: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let k = DEFS[d].kind;
         let text = SYMS[new].text;
@@ -537,7 +525,7 @@ fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
         if k == K_FIELD || k == K_VARIANT || k == K_TRAIT_FN {
             for e in 0..DEFS.len() as i64 {
                 if DEFS[e].parent == DEFS[d].parent && DEFS[e].name == new {
-                    collision(text, m, e, false);
+                    collision(text, m, e, false, &tcx);
                     return true;
                 }
             }
@@ -549,7 +537,7 @@ fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
                     if (DEFS[e].kind == K_METHOD || DEFS[e].kind == K_IMPL_METHOD)
                         && DEFS[e].owner == DEFS[g].owner
                         && DEFS[e].name == new && (k == K_METHOD || DEFS[g].kind == K_IMPL_METHOD) {
-                        collision(text, m, e, false);
+                        collision(text, m, e, false, &tcx);
                         return true;
                     }
                 }
@@ -559,24 +547,24 @@ fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
             return false;
         }
         // An item: its module's names, and those of the modules importing it.
-        let b = binding_of(m, new);
+        let b = binding_of(m, new, tcx);
         if b >= 0 {
-            collision(text, m, b, item_binding(m, new) < 0);
+            collision(text, m, b, item_binding(m, new, tcx) < 0, &tcx);
             return true;
         }
-        for x in 0..REFS.count {
-            let r = REFS.data[x];
-            if R_DEF.data[r] != d || (R_FLAGS.data[r] & QF_USE) == 0 {
+        for x in 0..tcx.refs.count {
+            let r = tcx.refs.data[x];
+            if tcx.r_def.data[r] != d || (tcx.r_flags.data[r] & QF_USE) == 0 {
                 continue;
             }
-            let id = use_id_at(R_POS.data[r]);
+            let id = use_id_at(tcx.r_pos.data[r], tcx);
             if id == 0 || NODES[id].b != 0 {
                 continue;
             }
-            let u = module_at(R_POS.data[r]);
-            let c = binding_of(u, new);
+            let u = module_at(tcx.r_pos.data[r]);
+            let c = binding_of(u, new, tcx);
             if c >= 0 {
-                collision(text, u, c, item_binding(u, new) < 0);
+                collision(text, u, c, item_binding(u, new, tcx) < 0, &tcx);
                 return true;
             }
         }
@@ -588,37 +576,37 @@ fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
 
 // Makes module `name` in region parent (its `mod` line goes there when the
 // edit is emitted): its region, or -1 after a diagnostic.
-pub fn make_module(parent: i64, name: i64, dir: bool, converts: inout HMap) -> i64 {
+pub fn make_module(parent: i64, name: i64, dir: bool, converts: inout HMap, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var ppath = 0 as *u8;
         var proot = false;
         if is_new(parent) {
-            ppath = NM_PATH.data[parent - module_count()] as *u8;
+            ppath = tcx.nm_path.data[parent - module_count()] as *u8;
         } else {
-            let b = binding_of(parent, name);
+            let b = binding_of(parent, name, tcx);
             if b >= 0 {
-                collision(SYMS[name].text, parent, b, item_binding(parent, name) < 0);
+                collision(SYMS[name].text, parent, b, item_binding(parent, name, tcx) < 0, &tcx);
                 return -1;
             }
-            ppath = parent_file_path(parent, &converts);
+            ppath = parent_file_path(parent, &converts, &tcx);
             proot = root_like(parent);
             if ppath == 0 as *u8 {
-                return inline_module(parent);
+                return inline_module(parent, &tcx);
             }
         }
         let path = child_path(ppath, proot, SYMS[name].text, dir);
         let other = child_path(ppath, proot, SYMS[name].text, !dir);
         if file_exists(path) || file_exists(other) {
-            let d = diag(c"error", c"refactor.exists");
+            let d = diag(c"error", c"refactor.exists", &tcx);
             buf_str(d, c"'");
             buf_str(d, if file_exists(path) { path } else { other });
             buf_str(d, c"' exists already; nothing written\n");
             return -1;
         }
-        let r = new_region(parent, name, path);
+        let r = new_region(parent, name, path, &tcx);
         // (0.20) std's modules are its interface: `pub mod`
-        if STD_MODULE >= 0 && within(parent, STD_MODULE) {
-            NM_PUB.data[r - module_count()] = 1;
+        if STD_MODULE >= 0 && within(parent, STD_MODULE, tcx) {
+            tcx.nm_pub.data[r - module_count()] = 1;
         }
         r
     }
@@ -626,21 +614,21 @@ pub fn make_module(parent: i64, name: i64, dir: bool, converts: inout HMap) -> i
 
 // The texts of the modules the edit makes: their files, and their `mod`
 // lines in the modules of the program.
-pub fn emit_regions() {
+pub fn emit_regions(tcx: inout Tcx<Comp>) {
     unsafe {
         let mc = module_count();
         // (the lines for one module of the program together)
         var lines = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         var parents = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for k in 0..NM_NAME.count {
+        for k in 0..tcx.nm_name.count {
             let line = buf_new();
-            if NM_PUB.data[k] != 0 {
+            if tcx.nm_pub.data[k] != 0 {
                 buf_str(line, c"pub ");
             }
             buf_str(line, c"mod ");
-            buf_bytes(line, SYMS[NM_NAME.data[k]].text);
+            buf_bytes(line, SYMS[tcx.nm_name.data[k]].text);
             buf_byte(line, ';');
-            let parent = NM_PARENT.data[k];
+            let parent = tcx.nm_parent.data[k];
             if parent < mc {
                 var b = lines.get(parent + 1);
                 if b == 0 {
@@ -652,16 +640,18 @@ pub fn emit_regions() {
                 }
                 buf_bytes(b, buf_slice(line));
             } else {
-                buf_bytes(NM_MODS.data[parent - mc], buf_slice(line));
-                buf_byte(NM_MODS.data[parent - mc], '\n');
+                buf_bytes(tcx.nm_mods.data[parent - mc], buf_slice(line));
+                buf_byte(tcx.nm_mods.data[parent - mc], '\n');
             }
         }
         for i in 0..parents.count {
-            add_mod_line(own_file(parents.data[i]), buf_slice(lines.get(parents.data[i] + 1)));
+            add_mod_line(own_file(parents.data[i]), buf_slice(lines.get(parents.data[i] + 1)),
+                &tcx);
         }
-        for k in 0..NM_NAME.count {
+        for k in 0..tcx.nm_name.count {
             let text = buf_new();
-            let parts = [NM_HEAD.data[k], NM_MODS.data[k], NM_USES.data[k], NM_BODY.data[k]];
+            let parts = [tcx.nm_head.data[k], tcx.nm_mods.data[k], tcx.nm_uses.data[k],
+                tcx.nm_body.data[k]];
             for j in 0..4 {
                 if crate::base::BUFS[parts[j]].len == 0 {
                     continue;
@@ -671,7 +661,7 @@ pub fn emit_regions() {
                 }
                 buf_bytes(text, buf_slice(parts[j]));
             }
-            edit_new_file(NM_PATH.data[k] as *u8, text);
+            edit_new_file(tcx.nm_path.data[k] as *u8, text, &tcx);
         }
     }
 }
@@ -681,7 +671,7 @@ pub fn emit_regions() {
 // The edits making module m (of its own file) module `name` of region
 // parent: its files, its `mod` line, the references to it. -1 when they
 // are made, else the exit status (after a diagnostic).
-fn relocate_module(m: i64, parent: i64, name: i64) -> i64 {
+fn relocate_module(m: i64, parent: i64, name: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let dm = MOD_DEF.data[m];
         let same = parent == MODULES[m].parent;
@@ -689,83 +679,85 @@ fn relocate_module(m: i64, parent: i64, name: i64) -> i64 {
         // Its new file.
         var ppath = 0 as *u8;
         if is_new(parent) {
-            ppath = NM_PATH.data[parent - module_count()] as *u8;
+            ppath = tcx.nm_path.data[parent - module_count()] as *u8;
         } else {
-            let b = binding_of(parent, name);
+            let b = binding_of(parent, name, tcx);
             if b >= 0 {
-                return collision(SYMS[name].text, parent, b, item_binding(parent, name) < 0);
+                return collision(SYMS[name].text, parent, b, item_binding(parent, name, tcx) < 0,
+                    &tcx);
             }
             ppath = if same { FILES[own_file(parent)].path }
-                else { parent_file_path(parent, &converts) };
+                else { parent_file_path(parent, &converts, &tcx) };
             if ppath == 0 as *u8 {
-                return inline_module(parent);
+                return inline_module(parent, &tcx);
             }
         }
         let dir = is_mod_file(FILES[own_file(m)].path);
         let path = child_path(ppath, root_like(parent), SYMS[name].text, dir);
         let other = child_path(ppath, root_like(parent), SYMS[name].text, !dir);
         if file_exists(path) || file_exists(other) {
-            let d = diag(c"error", c"refactor.collision");
+            let d = diag(c"error", c"refactor.collision", &tcx);
             buf_str(d, c"'");
             buf_str(d, if file_exists(path) { path } else { other });
             buf_str(d, c"' exists already; nothing written\n");
             return 1;
         }
-        move_tree(m, path);
+        move_tree(m, path, &tcx);
         // The references.
         let newpath = buf_new();
-        put_region_path(newpath, parent);
+        put_region_path(newpath, parent, &tcx);
         buf_str(newpath, c"::");
         buf_bytes(newpath, SYMS[name].text);
         let old = MODULES[m].name;
         var at = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         var public = MODULES[m].public;
-        for k in 0..REFS.count {
-            let r = REFS.data[k];
-            if R_DEF.data[r] == dm && user_pos(R_POS.data[r]) {
-                at.put(R_POS.data[r] + 1, 1);
+        for k in 0..tcx.refs.count {
+            let r = tcx.refs.data[k];
+            if tcx.r_def.data[r] == dm && user_pos(tcx.r_pos.data[r]) {
+                at.put(tcx.r_pos.data[r] + 1, 1);
             }
         }
-        for k in 0..REFS.count {
-            let r = REFS.data[k];
-            let p = R_POS.data[r];
-            if R_DEF.data[r] != dm || !user_pos(p) || !ref_named(p, old) {
+        for k in 0..tcx.refs.count {
+            let r = tcx.refs.data[k];
+            let p = tcx.r_pos.data[r];
+            if tcx.r_def.data[r] != dm || !user_pos(p) || !ref_named(p, old) {
                 continue;
             }
-            let flags = R_FLAGS.data[r];
+            let flags = tcx.r_flags.data[r];
             if same {
                 // (a rename: the name, where it is written)
-                put_edit(p, p + SYMS[old].text.len as i64, text_of(SYMS[name].text));
+                put_edit(p, p + SYMS[old].text.len as i64, text_of(SYMS[name].text), &tcx);
                 continue;
             }
             if (flags & QF_DEF) != 0 {
                 continue;
             }
             let from = module_at(p);
-            if !within(from, parent) {
+            if !within(from, parent, tcx) {
                 public = true;
             }
-            chain_public(from, parent);
+            chain_public(from, parent, &tcx);
             if (flags & QF_USE) != 0 {
-                use_of_module(p, buf_slice(newpath), old, name);
+                use_of_module(p, buf_slice(newpath), old, name, &tcx);
             } else if qualified(p) {
-                put_edit(path_start(p), p + SYMS[old].text.len as i64, text_of(buf_slice(newpath)));
+                put_edit(path_start(p), p + SYMS[old].text.len as i64, text_of(buf_slice(newpath)),
+                    &tcx);
             } else if use_binding(from, old) != dm {
                 // (a path from its old parent: `a::f`)
-                put_edit(p, p + SYMS[old].text.len as i64, text_of(buf_slice(newpath)));
+                put_edit(p, p + SYMS[old].text.len as i64, text_of(buf_slice(newpath)), &tcx);
             }
         }
         if same {
             if public && !MODULES[m].public {
-                put_edit(DEFS[dm].start, DEFS[dm].start, text_of(c_slice(c"pub ")));
+                put_edit(DEFS[dm].start, DEFS[dm].start, text_of(c_slice(c"pub ")), &tcx);
             }
             return -1;
         }
         // The `super::` paths of its files that lead out of it.
         for f in 0..FILES.len() as i64 {
             if FILES[f].path[0] != '<' && FILES[f].kind == SOURCE_VOLE
-                && within(FILES[f].module, m) {
-                escaping_supers(f, m, at);
+                && within(FILES[f].module, m, tcx) {
+                escaping_supers(f, m, at, &tcx);
             }
         }
         // Its `mod` line, from its old parent to its new one.
@@ -781,10 +773,10 @@ fn relocate_module(m: i64, parent: i64, name: i64) -> i64 {
         buf_byte(line, ';');
         delete_lines(ts, DEFS[dm].end);
         if is_new(parent) {
-            buf_bytes(NM_MODS.data[parent - module_count()], buf_slice(line));
-            buf_byte(NM_MODS.data[parent - module_count()], '\n');
+            buf_bytes(tcx.nm_mods.data[parent - module_count()], buf_slice(line));
+            buf_byte(tcx.nm_mods.data[parent - module_count()], '\n');
         } else {
-            add_mod_line(own_file(parent), buf_slice(line));
+            add_mod_line(own_file(parent), buf_slice(line), &tcx);
         }
         -1
     }
@@ -792,18 +784,18 @@ fn relocate_module(m: i64, parent: i64, name: i64) -> i64 {
 
 // The modules of the path of region r that the code of region from cannot
 // see while they are private: made `pub`.
-pub fn chain_public(from: i64, r: i64) {
+pub fn chain_public(from: i64, r: i64, tcx: inout Tcx<Comp>) {
     unsafe {
         var x = r;
         while x > 0 {
-            let p = region_parent(x);
-            if !region_public(x) && !within(from, p) {
+            let p = region_parent(x, tcx);
+            if !region_public(x, tcx) && !within(from, p, tcx) {
                 if is_new(x) {
-                    NM_PUB.data[x - module_count()] = 1;
+                    tcx.nm_pub.data[x - module_count()] = 1;
                 } else if MOD_DEF.data[x] >= 0 && !MODULES[x].public {
                     let dx = MOD_DEF.data[x];
                     MODULES[x].public = true;
-                    put_edit(DEFS[dx].start, DEFS[dx].start, text_of(c_slice(c"pub ")));
+                    put_edit(DEFS[dx].start, DEFS[dx].start, text_of(c_slice(c"pub ")), &tcx);
                 }
             }
             x = p;
@@ -814,9 +806,9 @@ pub fn chain_public(from: i64, r: i64) {
 // The import of the module (`use a::m;`) at pos: its path becomes newpath
 // (`as old` when its name changes); in a list, the name leaves it for a
 // `use` line of its own.
-fn use_of_module(pos: i64, newpath: [u8], old: i64, name: i64) {
-    let id = use_id_at(pos);
-    let u = use_node_of(id);
+fn use_of_module(pos: i64, newpath: [u8], old: i64, name: i64, tcx: inout Tcx<Comp>) {
+    let id = use_id_at(pos, tcx);
+    let u = use_node_of(id, tcx);
     if id == 0 || u == 0 {
         return;
     }
@@ -827,10 +819,10 @@ fn use_of_module(pos: i64, newpath: [u8], old: i64, name: i64) {
         buf_bytes(text, SYMS[old].text);
     }
     if NODES[u].count == 1 && !braced(u) {
-        put_edit(NODES[NODES[u].c].start, NODES[id].start + SYMS[old].text.len as i64, text);
+        put_edit(NODES[NODES[u].c].start, NODES[id].start + SYMS[old].text.len as i64, text, &tcx);
         return;
     }
-    crate::tools::refactor_move::imports::remove_use_names(u, id);
+    crate::tools::refactor_move::imports::remove_use_names(u, id, &tcx);
     let line = buf_new();
     buf_str(line, c"\nuse ");
     buf_bytes(line, buf_slice(text));
@@ -840,7 +832,7 @@ fn use_of_module(pos: i64, newpath: [u8], old: i64, name: i64) {
     }
     buf_byte(line, ';');
     let at = line_end(NODES[u].end - 1);
-    put_edit(at, at, line);
+    put_edit(at, at, line, &tcx);
 }
 
 // Whether Use node u lists its names between braces.
@@ -856,7 +848,7 @@ pub fn braced(u: i64) -> bool {
 // The paths of file f (of module m or one of its children) that start
 // with `super::` and lead out of m: written from `crate`. A path that
 // goes on to name m itself is left to the reference's rewriting.
-fn escaping_supers(f: i64, m: i64, refs_at: HMap) {
+fn escaping_supers(f: i64, m: i64, refs_at: HMap, tcx: inout Tcx<Comp>) {
     unsafe {
         let q = FILES[f].module;
         var depth = 0;
@@ -902,9 +894,9 @@ fn escaping_supers(f: i64, m: i64, refs_at: HMap) {
                 continue;
             }
             let text = buf_new();
-            buf_bytes(text, mod_fqn_text(target));
+            buf_bytes(text, mod_fqn_text(target, &tcx));
             buf_str(text, c"::");
-            put_edit(TOKS[first].start, TOKS[i].start, text);
+            put_edit(TOKS[first].start, TOKS[i].start, text, &tcx);
         }
     }
 }

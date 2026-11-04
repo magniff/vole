@@ -3,23 +3,24 @@
 // and renames refactor variant shares.
 
 use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::comp::Comp;
 use crate::cli::line::Call;
 use crate::front::ast::{NODES, NodeKind, REPR_C};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::types::{STRUCTS, TYPES, TyKind};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::query::{QF_DEF, c_slice, root_or_diag};
 use crate::tools::query::defs::{DEFS, K_STRUCT};
-use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN, TOOL, diag, write_diags};
+use crate::tools::query::diagnostics::{PROG, diag, write_diags};
 use crate::tools::query::positions::{put_loc, shorthand_at, shorthand_text, token_at};
-use crate::tools::query::refs::{R_FLAGS, R_POS};
 use crate::tools::refactor_mod::mentions::doc_mentions;
 use crate::tools::refactor_shape::{
-    SUB, find_byte, leading_name, list_insert, list_of_node, list_remove, load_and_find, opt,
-    orig_of, put_count, refs_of, replace_name, shape_options, split_default, sym_text, take_args,
-    text_buf, try_query_name, usage_error,
+    find_byte, leading_name, list_insert, list_of_node, list_remove, load_and_find, opt, orig_of,
+    put_count, refs_of, replace_name, shape_options, split_default, sym_text, take_args, text_buf,
+    try_query_name, usage_error,
 };
 use crate::tools::refactor_shape::signature::with_argument;
 use crate::tools::rewrite::sort_by_start;
@@ -27,9 +28,9 @@ use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart
 
 // ---- refactor field ----
 
-pub fn run_field(c: Call<Gpa>) -> i64 {
-    let status = field_inner(c);
-    write_diags();
+pub fn run_field(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = field_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -49,13 +50,13 @@ fn struct_node_of(t0: i64) -> i64 {
 }
 
 // The literals of struct node s, as written, each once.
-fn literals_of(s: i64, out: inout IntVec) {
+fn literals_of(s: i64, out: inout IntVec, tcx: Tcx<Comp>) {
     var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for n in 1..NODES.len() as i64 {
         if NODES[n].kind != NodeKind::StructLit || struct_node_of(NODES[n].ty) != s {
             continue;
         }
-        let o = orig_of(n, NodeKind::StructLit);
+        let o = orig_of(n, NodeKind::StructLit, tcx);
         if o < 0 || seen.get(o + 1) != 0 {
             continue;
         }
@@ -84,8 +85,8 @@ fn put_fields(out: i64, s: i64) {
     buf_str(out, c" }");
 }
 
-pub fn no_member(d: i64, s: i64, name: *u8, what: *u8) -> i64 {
-    let e = diag(c"error", c"refactor.no-member");
+pub fn no_member(d: i64, s: i64, name: *u8, what: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let e = diag(c"error", c"refactor.no-member", &tcx);
     buf_bytes(e, sym_text(DEFS[d].fqn));
     buf_str(e, c" has no ");
     buf_str(e, what);
@@ -94,7 +95,7 @@ pub fn no_member(d: i64, s: i64, name: *u8, what: *u8) -> i64 {
     buf_str(e, c"': ");
     put_fields(e, s);
     buf_byte(e, '\n');
-    try_query_name(c"show", sym_text(DEFS[d].fqn));
+    try_query_name(c"show", sym_text(DEFS[d].fqn), &tcx);
     1
 }
 
@@ -109,12 +110,12 @@ pub fn member_def(d: i64, name: i64) -> i64 {
 }
 
 // Renames each reference (R_POS) to `old` as `new`.
-pub fn rename_refs(old: i64, new: i64) -> i64 {
+pub fn rename_refs(old: i64, new: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var n = 0;
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        for r in 0..R_POS.count {
-            let pos = R_POS.data[r];
+        for r in 0..tcx.r_pos.count {
+            let pos = tcx.r_pos.data[r];
             let t = token_at(pos);
             if seen.get(pos + 1) != 0 || t >= TOK_COUNT || TOKS[t].start != pos
                 || TOKS[t].kind != Tok::Ident
@@ -122,7 +123,7 @@ pub fn rename_refs(old: i64, new: i64) -> i64 {
                 continue;
             }
             seen.put(pos + 1, 1);
-            if shorthand_at(pos) {
+            if shorthand_at(pos, &tcx) {
                 // (0.15: `S { x }` becomes `S { y: x }`)
                 edit_replace(pos, pos + sym_text(old).len as i64,
                     shorthand_text(sym_text(new), sym_text(old)));
@@ -136,22 +137,22 @@ pub fn rename_refs(old: i64, new: i64) -> i64 {
     }
 }
 
-fn field_inner(c: Call<Gpa>) -> i64 {
+fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        set_command(c.line);
+        set_command(c.line, &tcx);
         PROG = c.prog();
-        TOOL = c"refactor";
-        SUB = c"field";
+        tcx.tool = c"refactor";
+        tcx.sub = c"field";
         var root = 0 as *u8;
         var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"STRUCT --add 'g: i64 = 0' --dry-run";
-        if !take_args(c, shape_options("field"), &root, &words, &opts) {
+        if !take_args(c, shape_options("field"), &root, &words, &opts, &tcx) {
             return 2;
         }
         if words.count != 1 {
             return usage_error(if words.count == 0 { c"a STRUCT is needed" }
-                else { c"one STRUCT at a time" }, example);
+                else { c"one STRUCT at a time" }, example, &tcx);
         }
         let add = opt(opts, c"--add", false);
         let remove = opt(opts, c"--remove", false);
@@ -160,28 +161,28 @@ fn field_inner(c: Call<Gpa>) -> i64 {
         let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64
             + (retype != 0 as *u8) as i64;
         if actions != 1 {
-            return usage_error(c"one of --add, --remove, --rename, --type", example);
+            return usage_error(c"one of --add, --remove, --rename, --type", example, &tcx);
         }
         let default = opt(opts, c"--default", false);
         if default != 0 as *u8 && retype == 0 as *u8 {
             return usage_error(c"--default goes with --type (the literals' new value)",
-                c"STRUCT --type f T --default EXPR");
+                c"STRUCT --type f T --default EXPR", &tcx);
         }
         let name = c_slice(words.data[0] as *u8);
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, SUB, name, true);
+        tcx.root_given = root;
+        root = root_or_diag(root, tcx.sub, name, true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
         var status = 0;
-        let d = load_and_find(root, name, 1 << K_STRUCT, c"struct", &status);
+        let d = load_and_find(root, name, 1 << K_STRUCT, c"struct", &status, &tcx);
         if d < 0 {
             return status;
         }
         let s = DEFS[d].node;
         let fqn = sym_text(DEFS[d].fqn);
         var lits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        literals_of(s, &lits);
+        literals_of(s, &lits, tcx);
         let what = buf_new();
         let layout = (pc(s) & REPR_C) != 0 && rename == 0 as *u8;
         if add != 0 as *u8 {
@@ -192,10 +193,10 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             let fname = leading_name(decl);
             if fname < 0 || find_byte(decl, ':') < 0 {
                 return usage_error(c"--add takes 'NAME: TYPE = VALUE' (VALUE: the literals' value)",
-                    example);
+                    example, &tcx);
             }
             if field_index(s, fname) >= 0 {
-                let e = diag(c"error", c"refactor.clash");
+                let e = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" has a field '");
                 buf_bytes(e, sym_text(fname));
@@ -203,7 +204,7 @@ fn field_inner(c: Call<Gpa>) -> i64 {
                 return 1;
             }
             if vstart < 0 && lits.count > 0 {
-                let e = diag(c"error", c"refactor.no-default");
+                let e = diag(c"error", c"refactor.no-default", &tcx);
                 buf_str(e, c"the literals of ");
                 buf_bytes(e, fqn);
                 buf_str(e, c" need a value for ");
@@ -211,8 +212,8 @@ fn field_inner(c: Call<Gpa>) -> i64 {
                 buf_str(e, c": --add 'NAME: TYPE = VALUE'\n");
                 return 2;
             }
-            list_of_node(s);
-            list_insert(pcount(s), decl);
+            list_of_node(s, &tcx);
+            list_insert(pcount(s), decl, tcx);
             let init = buf_new();
             buf_bytes(init, sym_text(fname));
             buf_str(init, c": ");
@@ -220,8 +221,8 @@ fn field_inner(c: Call<Gpa>) -> i64 {
                 buf_bytes(init, text[vstart..]);
             }
             for i in 0..lits.count {
-                list_of_node(lits.data[i]);
-                list_insert(pcount(lits.data[i]), buf_slice(init));
+                list_of_node(lits.data[i], &tcx);
+                list_insert(pcount(lits.data[i]), buf_slice(init), tcx);
             }
             buf_str(what, c"added field ");
             buf_bytes(what, decl);
@@ -233,14 +234,14 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             let fname = intern(c_slice(remove));
             let k = field_index(s, fname);
             if k < 0 {
-                return no_member(d, s, remove, c"field");
+                return no_member(d, s, remove, c"field", &tcx);
             }
             // Its uses: the references but its definition and the
             // literals' fields.
             let fd = member_def(d, fname);
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             targets.push(fd);
-            refs_of(targets);
+            refs_of(targets, &tcx);
             var inits = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
             for i in 0..lits.count {
                 for j in 0..pcount(lits.data[i]) {
@@ -249,34 +250,34 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             }
             var used = 0;
             var first = -1;
-            for r in 0..R_POS.count {
-                if (R_FLAGS.data[r] & QF_DEF) != 0 || inits.get(R_POS.data[r] + 1) != 0 {
+            for r in 0..tcx.r_pos.count {
+                if (tcx.r_flags.data[r] & QF_DEF) != 0 || inits.get(tcx.r_pos.data[r] + 1) != 0 {
                     continue;
                 }
                 if first < 0 {
-                    first = R_POS.data[r];
+                    first = tcx.r_pos.data[r];
                 }
                 used += 1;
             }
             if used > 0 {
-                let e = diag(c"error", c"refactor.used");
+                let e = diag(c"error", c"refactor.used", &tcx);
                 buf_bytes(e, sym_text(DEFS[fd].fqn));
                 buf_str(e, c" is used: ");
                 put_count(e, used, c"reference", c"references");
                 buf_str(e, c" (first: ");
                 put_loc(e, first);
                 buf_str(e, c")\n");
-                try_query_name(c"refs", sym_text(DEFS[fd].fqn));
+                try_query_name(c"refs", sym_text(DEFS[fd].fqn), &tcx);
                 return 1;
             }
-            list_of_node(s);
-            list_remove(k);
+            list_of_node(s, &tcx);
+            list_remove(k, tcx);
             for i in 0..lits.count {
                 let l = lits.data[i];
-                list_of_node(l);
+                list_of_node(l, &tcx);
                 for j in 0..pcount(l) {
                     if pa(pchild(l, j)) == fname {
-                        list_remove(j);
+                        list_remove(j, tcx);
                     }
                 }
             }
@@ -290,10 +291,10 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             let old = intern(c_slice(rename));
             let new = intern(c_slice(opt(opts, c"--rename", true)));
             if field_index(s, old) < 0 {
-                return no_member(d, s, rename, c"field");
+                return no_member(d, s, rename, c"field", &tcx);
             }
             if field_index(s, new) >= 0 {
-                let e = diag(c"error", c"refactor.clash");
+                let e = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" has a field '");
                 buf_bytes(e, sym_text(new));
@@ -302,9 +303,9 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             }
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             targets.push(member_def(d, old));
-            refs_of(targets);
-            let n = rename_refs(old, new);
-            doc_mentions(targets, old, sym_text(new));
+            refs_of(targets, &tcx);
+            let n = rename_refs(old, new, &tcx);
+            doc_mentions(targets, old, sym_text(new), &tcx);
             buf_str(what, c"renamed field ");
             buf_bytes(what, sym_text(old));
             buf_str(what, c" to ");
@@ -317,7 +318,7 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             let fname = intern(c_slice(retype));
             let k = field_index(s, fname);
             if k < 0 {
-                return no_member(d, s, retype, c"field");
+                return no_member(d, s, retype, c"field", &tcx);
             }
             let ty = c_slice(opt(opts, c"--type", true));
             let t = pb(pchild(s, k));
@@ -357,10 +358,10 @@ fn field_inner(c: Call<Gpa>) -> i64 {
             }
         }
         if layout {
-            let e = diag(c"warning", c"refactor.layout");
+            let e = diag(c"warning", c"refactor.layout", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, c" is #[repr(C)]: its layout changes (C code sharing it must change too)\n");
         }
-        apply_edit(buf_slice(what), root)
+        apply_edit(buf_slice(what), root, &tcx)
     }
 }

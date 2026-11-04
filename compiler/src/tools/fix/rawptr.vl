@@ -30,6 +30,7 @@
 use crate::base::{
     FILES, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd, intern,
 };
+use crate::base::comp::Comp;
 use crate::front::ast::{BLOCK_UNSAFE, FN_UNSAFE, NODES, NODE_REF_MUT, NodeKind, child};
 use crate::front::check::Res;
 use crate::front::conv::{CONV_IN_OUT, copyable, param_conv};
@@ -39,6 +40,7 @@ use crate::front::modules::file_of_pos;
 use crate::front::traits::{IMPLS, impl_of_fn};
 use crate::front::types::{FNS, FN_COUNT, REF_MUT, TYPES, TY_U8, TyKind, fn_param, type_size};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::query::defs::{DEFS, K_TRAIT_FN, def_of_node};
 use crate::tools::query::diagnostics::diag;
@@ -70,7 +72,6 @@ const C_NULL: i64 = 4096;
 const C_THROUGH: i64 = 8192;
 const C_OTHER: i64 = 16384;
 const C_ALL: i64 = 30720;
-static var GIVEN_CHANGED: bool = false;
 
 // The classes.
 pub const RP_READ: i64 = 0;
@@ -106,39 +107,6 @@ const CX_RET: i64 = 2;
 const PH_MARK: i64 = 0;
 const PH_CALLS: i64 = 1;
 const PH_EDIT: i64 = 2;
-
-// (`--only rawptr-list`) each parameter on stdout
-pub static var RAWPTR_LIST: bool = false;
-// The census: [program, std] x the classes; reasons; kinds of the read.
-pub static var RAWPTR_COUNTS: [i64; 10] = [0; 10];
-static var REASONS: [i64; 17] = [0; 17];
-static var FIXED_WHY: [i64; 10] = [0; 10];
-static var SELF_SYM: i64 = -1;
-static var READ_KINDS: [i64; 4] = [0; 4];
-static var WRITE_KINDS: [i64; 4] = [0; 4];
-// (the call sites that give a parameter no place)
-static var CALLER_SITES: i64 = 0;
-
-static var FLAGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// (the listing) the function a parameter was first passed on to raw, or
-// the first that gave it no place (+ 1)
-static var WHO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var CHANGED: bool = false;
-static var PHASE: i64 = 0;
-static var FIRST: bool = true;
-static var CUR_F: i64 = 0;
-static var CUR_NODE: i64 = 0;
-static var IN_HOLE: i64 = 0;
-static var IN_UNSAFE: i64 = 0;
-// Positions edited (+ 1: 1): a generic function's instances share them.
-static var EDITED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// The edits' census: parameters to inout, to let; arguments given `&`,
-// `&` taken away, `*p` to `p`, boundaries `&*q` (`*q`), of which in a new
-// unsafe block.
-pub static var RAWPTR_EDITS: [i64; 7] = [0; 7];
-// Function nodes used as a value (+ 1: 1); the closures f-strings make.
-static var AS_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var FSTRING_CLOSURES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // ---- functions ----
 
@@ -211,7 +179,7 @@ fn in_std(pos: i64) -> bool {
 }
 
 // Why f's signature cannot change (X_NONE: it can).
-fn fixed_why(f: i64) -> i64 {
+fn fixed_why(f: i64, tcx: Tcx<Comp>) -> i64 {
     if f_unsafe(f) {
         return X_UNSAFE;
     }
@@ -219,14 +187,14 @@ fn fixed_why(f: i64) -> i64 {
         return X_EXPORT;
     }
     let node = base_node(f);
-    if AS_VALUE.get(node + 1) != 0 {
+    if tcx.rawptr_as_value.get(node + 1) != 0 {
         return X_VALUE;
     }
     let name = SYMS[NODES[node].a].text;
     if name == "main" && f_self_ty(f) == 0 {
         return X_MAIN;
     }
-    let d = def_of_node(node);
+    let d = def_of_node(node, tcx);
     if d < 0 {
         return X_CLOSURE;
     }
@@ -245,7 +213,7 @@ fn fixed_why(f: i64) -> i64 {
 // Whether parameter i of f is a raw `*T` (by its type): 0 no, 1 one this
 // fix may decide, or the X_* reason it cannot (a pointer to a pointer, a
 // slice or a function; an `inout *T`).
-fn ptr_param(f: i64, i: i64) -> i64 {
+fn ptr_param(f: i64, i: i64, tcx: Tcx<Comp>) -> i64 {
     if i >= f_params(f) || i >= 63 {
         return 0;
     }
@@ -261,7 +229,7 @@ fn ptr_param(f: i64, i: i64) -> i64 {
     if param_conv(pn) == CONV_IN_OUT {
         return X_INOUT;
     }
-    if NODES[pn].a == SELF_SYM {
+    if NODES[pn].a == tcx.self_sym {
         return X_SELF;
     }
     let a = TYPES[t].a;
@@ -276,34 +244,34 @@ fn key(f: i64, i: i64) -> i64 {
     base_node(f) * 64 + i + 1
 }
 
-fn flags(f: i64, i: i64) -> i64 {
-    FLAGS.get(key(f, i))
+fn flags(f: i64, i: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.rawptr_flags.get(key(f, i))
 }
 
-fn mark(f: i64, i: i64, bits: i64) {
-    let old = FLAGS.get(key(f, i));
+fn mark(f: i64, i: i64, bits: i64, tcx: inout Tcx<Comp>) {
+    let old = tcx.rawptr_flags.get(key(f, i));
     if (old | bits) != old {
-        FLAGS.put(key(f, i), old | bits);
-        CHANGED = true;
+        tcx.rawptr_flags.put(key(f, i), old | bits);
+        tcx.rawptr_changed = true;
     }
 }
 
-fn mark_cur(p: i64, bits: i64) {
-    if PHASE == PH_MARK && p >= 0 {
-        mark(CUR_F, p, bits);
+fn mark_cur(p: i64, bits: i64, tcx: inout Tcx<Comp>) {
+    if tcx.rawptr_phase == PH_MARK && p >= 0 {
+        mark(tcx.rawptr_cur_f, p, bits, &tcx);
     }
 }
 
 // Whether parameter i of f may be decided (read, write or caller).
-fn decidable(f: i64, i: i64) -> bool {
-    has_body(f) && !in_std(NODES[f_node(f)].start) && fixed_why(f) == X_NONE && ptr_param(f, i) == 1
-        && (flags(f, i) & R_ALL) == 0
+fn decidable(f: i64, i: i64, tcx: Tcx<Comp>) -> bool {
+    has_body(f) && !in_std(NODES[f_node(f)].start) && fixed_why(f, tcx) == X_NONE
+        && ptr_param(f, i, tcx) == 1 && (flags(f, i, tcx) & R_ALL) == 0
 }
 
 // Whether parameter i of f stays a raw pointer for its callers: C's, std's,
 // a fixed signature, or one that escapes.
-fn callee_raw(f: i64, i: i64) -> bool {
-    !decidable(f, i)
+fn callee_raw(f: i64, i: i64, tcx: Tcx<Comp>) -> bool {
+    !decidable(f, i, tcx)
 }
 
 // Whether raw parameter i of f is used as an address, not as one T: C's,
@@ -311,26 +279,26 @@ fn callee_raw(f: i64, i: i64) -> bool {
 // walked (assigned) or passed on to such a parameter. A decided parameter
 // passed to it escapes; passed to another raw one, it is given as `&p`,
 // the address of the place it designates (and is inout).
-fn callee_array(f: i64, i: i64) -> bool {
-    if !has_body(f) || in_std(NODES[f_node(f)].start) || fixed_why(f) != X_NONE
-        || ptr_param(f, i) != 1 || TYPES[fn_param(f, i)].a == TY_U8 {
+fn callee_array(f: i64, i: i64, tcx: Tcx<Comp>) -> bool {
+    if !has_body(f) || in_std(NODES[f_node(f)].start) || fixed_why(f, tcx) != X_NONE
+        || ptr_param(f, i, tcx) != 1 || TYPES[fn_param(f, i)].a == TY_U8 {
         return true;
     }
-    (flags(f, i) & (R_INDEX | R_CAST | R_COMPARE | R_ASSIGN | R_RAWCALL)) != 0
+    (flags(f, i, tcx) & (R_INDEX | R_CAST | R_COMPARE | R_ASSIGN | R_RAWCALL)) != 0
 }
 
-fn callee_writes(f: i64, i: i64) -> bool {
-    (flags(f, i) & F_WRITE) != 0
+fn callee_writes(f: i64, i: i64, tcx: Tcx<Comp>) -> bool {
+    (flags(f, i, tcx) & F_WRITE) != 0
 }
 
 // ---- the walk ----
 
 // The parameter index of local l of the function walked, or -1.
-fn param_of_local(l: i64) -> i64 {
+fn param_of_local(l: i64, tcx: Tcx<Comp>) -> i64 {
     if l < 0 {
         return -1;
     }
-    let item = CUR_NODE;
+    let item = tcx.cur_node;
     for i in 0..NODES[item].count {
         if NODES[child(item, i)].x == l {
             return i;
@@ -340,12 +308,12 @@ fn param_of_local(l: i64) -> i64 {
 }
 
 // The raw-pointer parameter expression n is (a bare name), or -1.
-fn param_ident(n: i64) -> i64 {
+fn param_ident(n: i64, tcx: Tcx<Comp>) -> i64 {
     if n <= 0 || NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
         return -1;
     }
-    let p = param_of_local(NODES[n].y);
-    if p >= 0 && ptr_param(CUR_F, p) != 0 { p } else { -1 }
+    let p = param_of_local(NODES[n].y, tcx);
+    if p >= 0 && ptr_param(tcx.rawptr_cur_f, p, tcx) != 0 { p } else { -1 }
 }
 
 // The root of place n (through fields, indexes, derefs).
@@ -383,25 +351,25 @@ fn write_root(n: i64) -> i64 {
 // The expressions inside place n that are evaluated (indexes, a root that
 // is no name); an index of a parameter (`p[i]`, pointer arithmetic) is
 // an escape.
-fn place_parts(n: i64) {
+fn place_parts(n: i64, tcx: inout Tcx<Comp>) {
     var e = n;
     while e > 0 {
         let k = NODES[e].kind;
         if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
             e = NODES[e].a;
         } else if k == NodeKind::Index {
-            scan(NODES[e].b, CX_READ);
-            let q = param_ident(NODES[e].a);
+            scan(NODES[e].b, CX_READ, &tcx);
+            let q = param_ident(NODES[e].a, tcx);
             if q >= 0 {
-                mark_cur(q, R_INDEX);
+                mark_cur(q, R_INDEX, &tcx);
             }
             e = NODES[e].a;
         } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
-            deref_edit(e);
+            deref_edit(e, &tcx);
             e = NODES[e].b;
         } else {
             if k != NodeKind::Ident {
-                scan(e, CX_READ);
+                scan(e, CX_READ, &tcx);
             }
             return;
         }
@@ -409,196 +377,196 @@ fn place_parts(n: i64) {
 }
 
 // A use of the pointer itself, in context ctx.
-fn bare_use(p: i64, ctx: i64) {
-    if IN_HOLE > 0 {
-        mark_cur(p, R_OTHER);
+fn bare_use(p: i64, ctx: i64, tcx: inout Tcx<Comp>) {
+    if tcx.rawptr_in_hole > 0 {
+        mark_cur(p, R_OTHER, &tcx);
     } else if ctx == CX_BIND {
-        mark_cur(p, R_BIND);
+        mark_cur(p, R_BIND, &tcx);
     } else if ctx == CX_RET {
-        mark_cur(p, R_RETURN);
+        mark_cur(p, R_RETURN, &tcx);
     } else {
-        mark_cur(p, R_OTHER);
+        mark_cur(p, R_OTHER, &tcx);
     }
 }
 
 // Every parameter named inside closure n escapes (a capture).
-fn mark_closure(n: i64) {
-    if n <= 0 || PHASE != PH_MARK || !FIRST {
+fn mark_closure(n: i64, tcx: inout Tcx<Comp>) {
+    if n <= 0 || tcx.rawptr_phase != PH_MARK || !tcx.first {
         return;
     }
     let s = NODES[n].start;
     let e = NODES[n].end;
     for m in 1..NODES.len() as i64 {
         if NODES[m].start >= s && NODES[m].end <= e && NODES[m].kind == NodeKind::Ident {
-            let p = param_ident(m);
+            let p = param_ident(m, tcx);
             if p >= 0 {
-                mark_cur(p, R_CLOSURE);
+                mark_cur(p, R_CLOSURE, &tcx);
             }
         }
     }
 }
 
-fn scan_list(n: i64, ctx: i64) {
+fn scan_list(n: i64, ctx: i64, tcx: inout Tcx<Comp>) {
     for i in 0..NODES[n].count {
-        scan(child(n, i), ctx);
+        scan(child(n, i), ctx, &tcx);
     }
 }
 
 // Walks expression n of the current function.
-fn scan(n: i64, ctx: i64) {
+fn scan(n: i64, ctx: i64, tcx: inout Tcx<Comp>) {
     if n <= 0 {
         return;
     }
     match NODES[n].kind {
         NodeKind::Ident => {
-            let p = param_ident(n);
+            let p = param_ident(n, tcx);
             if p >= 0 {
-                bare_use(p, ctx);
+                bare_use(p, ctx, &tcx);
             }
         }
-        NodeKind::FieldAccess | NodeKind::TupleField | NodeKind::Index => place_parts(n),
+        NodeKind::FieldAccess | NodeKind::TupleField | NodeKind::Index => place_parts(n, &tcx),
         NodeKind::Unary => {
             let op = NODES[n].op;
             if op == Tok::Star {
-                deref_edit(n);
-                place_parts(n);
+                deref_edit(n, &tcx);
+                place_parts(n, &tcx);
             } else if op == Tok::Amp {
-                borrow(n, -1, -1);
+                borrow(n, -1, -1, &tcx);
             } else {
-                scan(NODES[n].b, CX_READ);
+                scan(NODES[n].b, CX_READ, &tcx);
             }
         }
         NodeKind::Cast => {
-            let p = param_ident(NODES[n].a);
+            let p = param_ident(NODES[n].a, tcx);
             if p >= 0 {
-                mark_cur(p, R_CAST);
+                mark_cur(p, R_CAST, &tcx);
             } else {
-                scan(NODES[n].a, CX_READ);
+                scan(NODES[n].a, CX_READ, &tcx);
             }
         }
         NodeKind::Binary => {
             for side in [NODES[n].b, NODES[n].c] {
-                let p = param_ident(side);
+                let p = param_ident(side, tcx);
                 if p >= 0 {
-                    mark_cur(p, R_COMPARE);
+                    mark_cur(p, R_COMPARE, &tcx);
                 } else {
-                    scan(side, CX_READ);
+                    scan(side, CX_READ, &tcx);
                 }
             }
         }
         NodeKind::Assign => {
             let target = NODES[n].b;
-            scan(NODES[n].c, if NODES[n].op == Tok::Eq { CX_BIND } else { CX_READ });
-            let p = param_ident(target);
+            scan(NODES[n].c, if NODES[n].op == Tok::Eq { CX_BIND } else { CX_READ }, &tcx);
+            let p = param_ident(target, tcx);
             if p >= 0 {
-                mark_cur(p, R_ASSIGN);
+                mark_cur(p, R_ASSIGN, &tcx);
                 return;
             }
-            place_parts(target);
-            let w = param_ident(write_root(target));
+            place_parts(target, &tcx);
+            let w = param_ident(write_root(target), tcx);
             if w >= 0 {
-                mark_cur(w, F_WRITE);
+                mark_cur(w, F_WRITE, &tcx);
             }
         }
-        NodeKind::Call => scan_call(n),
+        NodeKind::Call => scan_call(n, &tcx),
         NodeKind::MethodCall => {
             // (not resolved by the checker: its receiver is used as it is)
-            scan(NODES[n].a, CX_BIND);
-            scan_list(n, CX_BIND);
+            scan(NODES[n].a, CX_BIND, &tcx);
+            scan_list(n, CX_BIND, &tcx);
         }
         NodeKind::Block => {
             let unsafe_block = (NODES[n].p & BLOCK_UNSAFE) != 0;
             if unsafe_block {
-                IN_UNSAFE += 1;
+                tcx.in_unsafe += 1;
             }
             for i in 0..NODES[n].count {
                 let s = child(n, i);
                 let k = NODES[s].kind;
                 if k == NodeKind::Let {
-                    scan(NODES[s].c, CX_BIND);
+                    scan(NODES[s].c, CX_BIND, &tcx);
                 } else if k == NodeKind::Defer || k == NodeKind::ExprStmt {
-                    scan(NODES[s].a, CX_READ);
+                    scan(NODES[s].a, CX_READ, &tcx);
                 } else {
-                    scan(s, CX_READ);
+                    scan(s, CX_READ, &tcx);
                 }
             }
-            scan(NODES[n].a, ctx);
+            scan(NODES[n].a, ctx, &tcx);
             if unsafe_block {
-                IN_UNSAFE -= 1;
+                tcx.in_unsafe -= 1;
             }
         }
         NodeKind::If => {
-            scan(NODES[n].a, CX_READ);
-            scan(NODES[n].b, ctx);
-            scan(NODES[n].c, ctx);
+            scan(NODES[n].a, CX_READ, &tcx);
+            scan(NODES[n].b, ctx, &tcx);
+            scan(NODES[n].c, ctx, &tcx);
         }
         NodeKind::Match => {
-            scan(NODES[n].a, CX_READ);
+            scan(NODES[n].a, CX_READ, &tcx);
             for i in 0..NODES[n].count {
                 let arm = child(n, i);
-                scan(NODES[arm].b, CX_READ);
-                scan(NODES[arm].c, ctx);
+                scan(NODES[arm].b, CX_READ, &tcx);
+                scan(NODES[arm].c, ctx, &tcx);
             }
         }
-        NodeKind::Loop => scan(NODES[n].b, CX_READ),
+        NodeKind::Loop => scan(NODES[n].b, CX_READ, &tcx),
         NodeKind::While => {
-            scan(NODES[n].b, CX_READ);
-            scan(NODES[n].c, CX_READ);
+            scan(NODES[n].b, CX_READ, &tcx);
+            scan(NODES[n].c, CX_READ, &tcx);
         }
         NodeKind::For => {
-            scan(NODES[n].c, CX_READ);
-            scan(NODES[n].d, CX_READ);
+            scan(NODES[n].c, CX_READ, &tcx);
+            scan(NODES[n].d, CX_READ, &tcx);
         }
-        NodeKind::Break => scan(NODES[n].b, CX_BIND),
-        NodeKind::Return => scan(NODES[n].a, CX_RET),
+        NodeKind::Break => scan(NODES[n].b, CX_BIND, &tcx),
+        NodeKind::Return => scan(NODES[n].a, CX_RET, &tcx),
         NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
-            scan_list(n, CX_BIND);
+            scan_list(n, CX_BIND, &tcx);
         }
-        NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b, ctx),
-        NodeKind::Repeat => scan(NODES[n].a, CX_BIND),
+        NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b, ctx, &tcx),
+        NodeKind::Repeat => scan(NODES[n].a, CX_BIND, &tcx),
         NodeKind::Range => {
-            scan(NODES[n].a, CX_READ);
-            scan(NODES[n].b, CX_READ);
+            scan(NODES[n].a, CX_READ, &tcx);
+            scan(NODES[n].b, CX_READ, &tcx);
         }
         NodeKind::Closure => {
             // (an f-string's closure displays the locals its holes were
             // bound to, which the walk reads: no capture)
-            if FSTRING_CLOSURES.get(n + 1) == 0 {
-                mark_closure(n);
+            if tcx.rawptr_fstring_closures.get(n + 1) == 0 {
+                mark_closure(n, &tcx);
             }
         }
-        NodeKind::Try => scan(NODES[n].y, ctx),
+        NodeKind::Try => scan(NODES[n].y, ctx, &tcx),
         NodeKind::Interp => {
-            IN_HOLE += 1;
-            scan(NODES[n].y, ctx);
-            IN_HOLE -= 1;
+            tcx.rawptr_in_hole += 1;
+            scan(NODES[n].y, ctx, &tcx);
+            tcx.rawptr_in_hole -= 1;
         }
-        NodeKind::EnumPanic => scan(NODES[n].a, CX_READ),
+        NodeKind::EnumPanic => scan(NODES[n].a, CX_READ, &tcx),
         NodeKind::VecOp => {
-            scan(NODES[n].a, CX_READ);
-            scan_list(n, CX_READ);
+            scan(NODES[n].a, CX_READ, &tcx);
+            scan_list(n, CX_READ, &tcx);
         }
         _ => {}
     }
 }
 
 // `&place` (node n), argument i of a call of f (i: -1, not an argument).
-fn borrow(n: i64, f: i64, i: i64) {
+fn borrow(n: i64, f: i64, i: i64, tcx: inout Tcx<Comp>) {
     let operand = NODES[n].b;
-    place_parts(operand);
-    let p = param_ident(place_root(operand));
+    place_parts(operand, &tcx);
+    let p = param_ident(place_root(operand), tcx);
     if p < 0 {
         return;
     }
-    if place_root(operand) == operand || IN_HOLE > 0 {
+    if place_root(operand) == operand || tcx.rawptr_in_hole > 0 {
         // (`&p`: the address of the pointer itself)
-        mark_cur(p, R_OTHER);
+        mark_cur(p, R_OTHER, &tcx);
         return;
     }
     // (a pointer into *p kept, or given to a parameter that may write
     // through it or keep it: p is passed by address, inout)
     if (NODES[n].p & NODE_REF_MUT) != 0 || f < 0 || i < 0 || i >= f_params(f) {
-        mark_cur(p, F_WRITE);
+        mark_cur(p, F_WRITE, &tcx);
         return;
     }
     let t = fn_param(f, i);
@@ -606,28 +574,28 @@ fn borrow(n: i64, f: i64, i: i64) {
         // (lent to a let parameter: read)
         return;
     }
-    if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 && !callee_raw(f, i)
-        && !callee_writes(f, i) {
+    if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 && !callee_raw(f, i, tcx)
+        && !callee_writes(f, i, tcx) {
         return;
     }
-    mark_cur(p, F_WRITE);
+    mark_cur(p, F_WRITE, &tcx);
 }
 
 // Call n: each argument by what its parameter does with it.
-fn scan_call(n: i64) {
+fn scan_call(n: i64, tcx: inout Tcx<Comp>) {
     let f = NODES[n].x - 1;
     if f < 0 {
-        scan(NODES[n].a, CX_READ);
+        scan(NODES[n].a, CX_READ, &tcx);
     }
-    if PHASE == PH_MARK {
-        nested_calls(n);
+    if tcx.rawptr_phase == PH_MARK {
+        nested_calls(n, &tcx);
     }
     for i in 0..NODES[n].count {
         var arg = child(n, i);
         if NODES[arg].kind == NodeKind::NamedArg {
             arg = NODES[arg].b;
         }
-        argument(f, i, arg, n);
+        argument(f, i, arg, n, &tcx);
     }
 }
 
@@ -677,7 +645,7 @@ fn arg_bare(arg: i64) -> bool {
 // another argument that borrows a part of it (`f(&cx, &cx.cap)`), or a
 // call that cannot keep it raw, keeps f's raw. (By local, not by raw
 // parameter: the rewritten program is decided again the same way.)
-fn nested_calls(n: i64) {
+fn nested_calls(n: i64, tcx: inout Tcx<Comp>) {
     let f = NODES[n].x - 1;
     for i in 0..NODES[n].count {
         let p = arg_local(child(n, i));
@@ -686,14 +654,14 @@ fn nested_calls(n: i64) {
         }
         var clash = false;
         for j in 0..NODES[n].count {
-            if j != i && nested_in(child(n, j), p, true) {
+            if j != i && nested_in(child(n, j), p, true, &tcx) {
                 clash = true;
             }
         }
         let receiver = i == 0 && NODES[child(n, 0)].start == NODES[n].start;
         if clash && !receiver && arg_bare(child(n, i)) && f >= 0 && f < FN_COUNT
-            && decidable(f, i) {
-            mark(f, i, R_NESTED);
+            && decidable(f, i, tcx) {
+            mark(f, i, R_NESTED, &tcx);
         }
     }
 }
@@ -701,7 +669,7 @@ fn nested_calls(n: i64) {
 // The calls inside expression e (an argument when top) given parameter p,
 // not into closures, marked; whether e borrows a part of p (`&p.f`) or a
 // call that cannot be marked is given it.
-fn nested_in(e: i64, p: i64, top: bool) -> bool {
+fn nested_in(e: i64, p: i64, top: bool, tcx: inout Tcx<Comp>) -> bool {
     if e <= 0 {
         return false;
     }
@@ -717,9 +685,9 @@ fn nested_in(e: i64, p: i64, top: bool) -> bool {
         let g = NODES[e].x - 1;
         for j in 0..NODES[e].count {
             if arg_local(child(e, j)) == p {
-                if g >= 0 && g < FN_COUNT && decidable(g, j) {
-                    mark(g, j, R_NESTED);
-                } else if !arg_bare(child(e, j)) || g < 0 || ptr_param(g, j) == 0 {
+                if g >= 0 && g < FN_COUNT && decidable(g, j, tcx) {
+                    mark(g, j, R_NESTED, &tcx);
+                } else if !arg_bare(child(e, j)) || g < 0 || ptr_param(g, j, tcx) == 0 {
                     // (a part of p, `&p.f`; a reference or an inout
                     // parameter's, std's)
                     clash = true;
@@ -727,17 +695,17 @@ fn nested_in(e: i64, p: i64, top: bool) -> bool {
             }
         }
     }
-    if node_field_a(k) && nested_in(NODES[e].a, p, false) {
+    if node_field_a(k) && nested_in(NODES[e].a, p, false, &tcx) {
         clash = true;
     }
-    if node_field_b(k) && nested_in(NODES[e].b, p, false) {
+    if node_field_b(k) && nested_in(NODES[e].b, p, false, &tcx) {
         clash = true;
     }
-    if node_field_c(k) && nested_in(NODES[e].c, p, false) {
+    if node_field_c(k) && nested_in(NODES[e].c, p, false, &tcx) {
         clash = true;
     }
     for j in 0..NODES[e].count {
-        if nested_in(child(e, j), p, false) {
+        if nested_in(child(e, j), p, false, &tcx) {
             clash = true;
         }
     }
@@ -745,59 +713,59 @@ fn nested_in(e: i64, p: i64, top: bool) -> bool {
 }
 
 // Argument arg of a call of f (-1: a function value's), at parameter i.
-fn argument(f: i64, i: i64, arg: i64, call: i64) {
+fn argument(f: i64, i: i64, arg: i64, call: i64, tcx: inout Tcx<Comp>) {
     let receiver = i == 0 && NODES[arg].start == NODES[call].start;
-    if PHASE != PH_MARK && f >= 0 && f < FN_COUNT && decidable(f, i) && !receiver
+    if tcx.rawptr_phase != PH_MARK && f >= 0 && f < FN_COUNT && decidable(f, i, tcx) && !receiver
         && !in_std(NODES[arg].start) {
-        caller_arg(f, i, arg);
+        caller_arg(f, i, arg, &tcx);
     }
     let k = NODES[arg].kind;
     if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
-        borrow(arg, f, i);
+        borrow(arg, f, i, &tcx);
         return;
     }
-    let p = param_ident(arg);
+    let p = param_ident(arg, tcx);
     if p < 0 {
-        scan(arg, CX_READ);
+        scan(arg, CX_READ, &tcx);
         return;
     }
-    if IN_HOLE > 0 {
-        mark_cur(p, R_OTHER);
+    if tcx.rawptr_in_hole > 0 {
+        mark_cur(p, R_OTHER, &tcx);
         return;
     }
     if f < 0 || i >= f_params(f) {
-        mark_cur(p, R_VALUE);
+        mark_cur(p, R_VALUE, &tcx);
         return;
     }
     let t = fn_param(f, i);
     if t <= 0 || TYPES[t].kind != TyKind::Ptr {
         // (a pointer given as a value of another type: a generic T)
-        mark_cur(p, R_BIND);
+        mark_cur(p, R_BIND, &tcx);
     } else if TYPES[t].b == REF_MUT {
-        mark_cur(p, F_WRITE);
+        mark_cur(p, F_WRITE, &tcx);
         if !receiver {
-            mark_arg(arg, p);
+            mark_arg(arg, p, &tcx);
         }
     } else if TYPES[t].b != 0 {
         // (a let receiver of an owned T, lent)
-    } else if callee_raw(f, i) && callee_array(f, i) {
-        if PHASE == PH_MARK && WHO.get(key(CUR_F, p)) == 0 {
-            WHO.put(key(CUR_F, p), f + 1);
+    } else if callee_raw(f, i, tcx) && callee_array(f, i, tcx) {
+        if tcx.rawptr_phase == PH_MARK && tcx.who.get(key(tcx.rawptr_cur_f, p)) == 0 {
+            tcx.who.put(key(tcx.rawptr_cur_f, p), f + 1);
         }
-        mark_cur(p, R_RAWCALL);
-    } else if callee_raw(f, i) {
-        mark_cur(p, F_WRITE);
+        mark_cur(p, R_RAWCALL, &tcx);
+    } else if callee_raw(f, i, tcx) {
+        mark_cur(p, F_WRITE, &tcx);
         if !receiver {
-            mark_arg(arg, p);
+            mark_arg(arg, p, &tcx);
         }
-    } else if callee_writes(f, i) {
-        mark_cur(p, F_WRITE);
+    } else if callee_writes(f, i, tcx) {
+        mark_cur(p, F_WRITE, &tcx);
     }
 }
 
 // Whether place n is reached through a raw pointer that stays one: a
 // field, an index or a deref of a `*T` (`&q.f`, `&TABLE[i]`).
-fn through_raw(n: i64) -> bool {
+fn through_raw(n: i64, tcx: Tcx<Comp>) -> bool {
     var e = n;
     while e > 0 {
         let k = NODES[e].kind;
@@ -811,8 +779,8 @@ fn through_raw(n: i64) -> bool {
         }
         let t = NODES[base].ty;
         if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
-            let p = param_ident(base);
-            if p < 0 || !decidable(CUR_F, p) {
+            let p = param_ident(base, tcx);
+            if p < 0 || !decidable(tcx.rawptr_cur_f, p, tcx) {
                 return true;
             }
         }
@@ -824,21 +792,21 @@ fn through_raw(n: i64) -> bool {
 // What a call gives decidable parameter i of f: the address of a place, a
 // parameter that is decided too, or else (C_*: the parameter's class is
 // caller, and the call needs `*q` / `&*q` in unsafe code).
-fn caller_arg(f: i64, i: i64, arg: i64) {
+fn caller_arg(f: i64, i: i64, arg: i64, tcx: inout Tcx<Comp>) {
     let k = NODES[arg].kind;
-    if PHASE == PH_EDIT {
-        edit_arg(f, i, arg);
+    if tcx.rawptr_phase == PH_EDIT {
+        edit_arg(f, i, arg, &tcx);
         return;
     }
     var bits = 0;
     if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
-        if through_raw(NODES[arg].b) {
+        if through_raw(NODES[arg].b, tcx) {
             bits = C_THROUGH;
         }
     } else {
-        let p = param_ident(arg);
+        let p = param_ident(arg, tcx);
         if p >= 0 {
-            if !decidable(CUR_F, p) {
+            if !decidable(tcx.rawptr_cur_f, p, tcx) {
                 bits = C_RAW;
             }
         } else if k == NodeKind::CStr || k == NodeKind::Cast {
@@ -850,42 +818,42 @@ fn caller_arg(f: i64, i: i64, arg: i64) {
     }
     if (bits & (C_NULL | C_THROUGH)) != 0 {
         bits = bits | R_GIVEN;
-        GIVEN_CHANGED = true;
+        tcx.given_changed = true;
     }
     if bits != 0 {
-        FLAGS.put(key(f, i), flags(f, i) | bits);
-        if WHO.get(key(f, i)) == 0 {
-            WHO.put(key(f, i), CUR_F + 1);
+        tcx.rawptr_flags.put(key(f, i), flags(f, i, tcx) | bits);
+        if tcx.who.get(key(f, i)) == 0 {
+            tcx.who.put(key(f, i), tcx.rawptr_cur_f + 1);
         }
-        CALLER_SITES += 1;
+        tcx.caller_sites += 1;
     }
 }
 
 // Walks every function with a body in phase ph (std's too: its writes
 // count).
-fn walk_all(ph: i64) {
-    PHASE = ph;
+fn walk_all(ph: i64, tcx: inout Tcx<Comp>) {
+    tcx.rawptr_phase = ph;
     for f in 0..FN_COUNT {
         if !has_body(f) || f_generic(f) > 0 && f_tmpl(f) == 0 {
             continue;
         }
-        CUR_F = f;
-        CUR_NODE = f_node(f);
-        IN_HOLE = 0;
-        IN_UNSAFE = 0;
+        tcx.rawptr_cur_f = f;
+        tcx.cur_node = f_node(f);
+        tcx.rawptr_in_hole = 0;
+        tcx.in_unsafe = 0;
         if ph == PH_EDIT {
-            if in_std(NODES[CUR_NODE].start) {
+            if in_std(NODES[tcx.cur_node].start) {
                 continue;
             }
-            edit_params(f);
+            edit_params(f, &tcx);
         }
-        scan(NODES[CUR_NODE].c, CX_RET);
+        scan(NODES[tcx.cur_node].c, CX_RET, &tcx);
     }
 }
 
 // The functions used as values (an Ident or Path naming one that is not a
 // call's callee), and the f-strings' closures.
-fn find_values() {
+fn find_values(tcx: inout Tcx<Comp>) {
     var callees = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
     for n in 1..NODES.len() {
         if NODES[n].kind == NodeKind::Call && NODES[n].a > 0 {
@@ -896,7 +864,7 @@ fn find_values() {
         let k = NODES[n].kind;
         if (k == NodeKind::Ident || k == NodeKind::Path) && NODES[n].res == Res::Fn
             && NODES[n].y >= 0 && callees.get(n + 1) == 0 {
-            AS_VALUE.put(base_node(NODES[n].y) + 1, 1);
+            tcx.rawptr_as_value.put(base_node(NODES[n].y) + 1, 1);
         }
     }
     for n in 1..NODES.len() {
@@ -906,7 +874,7 @@ fn find_values() {
             if lit > 0 && NODES[lit].kind == NodeKind::StructLit && NODES[lit].count > 0 {
                 let c = NODES[child(lit, 0)].b;
                 if c > 0 && NODES[c].kind == NodeKind::Closure {
-                    FSTRING_CLOSURES.put(c + 1, 1);
+                    tcx.rawptr_fstring_closures.put(c + 1, 1);
                 }
             }
         }
@@ -917,24 +885,24 @@ fn find_values() {
 
 // Whether decided parameter i of f becomes inout: written through, or a
 // value a let parameter would copy whole (a plain T over 16 bytes).
-fn to_inout(f: i64, i: i64) -> bool {
-    (flags(f, i) & F_WRITE) != 0 || kind_of(f, i) == T_BIG
+fn to_inout(f: i64, i: i64, tcx: Tcx<Comp>) -> bool {
+    (flags(f, i, tcx) & F_WRITE) != 0 || kind_of(f, i) == T_BIG
 }
 
 // Whether parameter p of the function walked is decided, and its own
 // edits are made (PH_EDIT).
-fn editing(p: i64) -> bool {
-    PHASE == PH_EDIT && p >= 0 && decidable(CUR_F, p)
+fn editing(p: i64, tcx: Tcx<Comp>) -> bool {
+    tcx.rawptr_phase == PH_EDIT && p >= 0 && decidable(tcx.rawptr_cur_f, p, tcx)
 }
 
-fn replace_text(a: i64, b: i64, text: *u8) -> bool {
-    if EDITED.get(a + 1) != 0 {
+fn replace_text(a: i64, b: i64, text: *u8, tcx: inout Tcx<Comp>) -> bool {
+    if tcx.rawptr_edited.get(a + 1) != 0 {
         return false;
     }
     let t = buf_new();
     buf_str(t, text);
     if edit_replace(a, b, t) {
-        EDITED.put(a + 1, 1);
+        tcx.rawptr_edited.put(a + 1, 1);
         return true;
     }
     false
@@ -942,55 +910,55 @@ fn replace_text(a: i64, b: i64, text: *u8) -> bool {
 
 // `*p` of a decided parameter: `p` (`(*p).f`: `p.f`; the node of a
 // parenthesized `(*p)` spans its parentheses).
-fn deref_edit(n: i64) {
-    let p = param_ident(NODES[n].b);
+fn deref_edit(n: i64, tcx: inout Tcx<Comp>) {
+    let p = param_ident(NODES[n].b, tcx);
     let s = NODES[n].start;
-    if !editing(p) || SRC[s] != '*' && SRC[s] != '(' {
+    if !editing(p, tcx) || SRC[s] != '*' && SRC[s] != '(' {
         return;
     }
     let name = NODES[n].b;
     let e = NODES[n].end;
     if SRC[s] == '(' {
-        if SRC[e - 1] == ')' && replace_text(s, NODES[name].start, c"")
-            && replace_text(NODES[name].end, e, c"") {
-            RAWPTR_EDITS[4] += 1;
+        if SRC[e - 1] == ')' && replace_text(s, NODES[name].start, c"", &tcx)
+            && replace_text(NODES[name].end, e, c"", &tcx) {
+            tcx.rawptr_edits[4] += 1;
         }
-    } else if replace_text(s, NODES[name].start, c"") {
-        RAWPTR_EDITS[4] += 1;
+    } else if replace_text(s, NODES[name].start, c"", &tcx) {
+        tcx.rawptr_edits[4] += 1;
     }
 }
 
 // A decided parameter p passed on as `p` where an inout access or a raw
 // pointer to its place goes: `&p`.
-fn mark_arg(arg: i64, p: i64) {
-    if editing(p) && to_inout(CUR_F, p)
-        && replace_text(NODES[arg].start, NODES[arg].start, c"&") {
-        RAWPTR_EDITS[2] += 1;
+fn mark_arg(arg: i64, p: i64, tcx: inout Tcx<Comp>) {
+    if editing(p, tcx) && to_inout(tcx.rawptr_cur_f, p, tcx)
+        && replace_text(NODES[arg].start, NODES[arg].start, c"&", &tcx) {
+        tcx.rawptr_edits[2] += 1;
     }
 }
 
 // Argument arg of a call of f at decided parameter i.
-fn edit_arg(f: i64, i: i64, arg: i64) {
+fn edit_arg(f: i64, i: i64, arg: i64, tcx: inout Tcx<Comp>) {
     let k = NODES[arg].kind;
-    let inout_ = to_inout(f, i);
+    let inout_ = to_inout(f, i, tcx);
     let s = NODES[arg].start;
     if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
-        if !inout_ && replace_text(s, NODES[NODES[arg].b].start, c"") {
-            RAWPTR_EDITS[3] += 1;
+        if !inout_ && replace_text(s, NODES[NODES[arg].b].start, c"", &tcx) {
+            tcx.rawptr_edits[3] += 1;
         }
         return;
     }
-    let p = param_ident(arg);
-    if p >= 0 && decidable(CUR_F, p) {
-        if inout_ && replace_text(s, s, c"&") {
-            RAWPTR_EDITS[2] += 1;
+    let p = param_ident(arg, tcx);
+    if p >= 0 && decidable(tcx.rawptr_cur_f, p, tcx) {
+        if inout_ && replace_text(s, s, c"&", &tcx) {
+            tcx.rawptr_edits[2] += 1;
         }
         return;
     }
     // (a raw pointer given: the place it points to, in unsafe code)
     let plain = k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::Call
         || k == NodeKind::Index || k == NodeKind::TupleField;
-    let wrap = IN_UNSAFE == 0;
+    let wrap = tcx.in_unsafe == 0;
     let t = buf_new();
     if wrap {
         buf_str(t, c"unsafe { ");
@@ -1006,19 +974,19 @@ fn edit_arg(f: i64, i: i64, arg: i64) {
     if wrap {
         buf_str(t, c" }");
     }
-    if EDITED.get(s + 1) == 0 && edit_replace(s, NODES[arg].end, t) {
-        EDITED.put(s + 1, 1);
-        RAWPTR_EDITS[5] += 1;
+    if tcx.rawptr_edited.get(s + 1) == 0 && edit_replace(s, NODES[arg].end, t) {
+        tcx.rawptr_edited.put(s + 1, 1);
+        tcx.rawptr_edits[5] += 1;
         if wrap {
-            RAWPTR_EDITS[6] += 1;
-            justify(s);
+            tcx.rawptr_edits[6] += 1;
+            justify(s, &tcx);
         }
     }
 }
 
 // The UNSAFE:/SAFETY: comments of a new `unsafe { &*q }` at position s,
 // above its line (once a line).
-fn justify(s: i64) {
+fn justify(s: i64, tcx: inout Tcx<Comp>) {
     var ls = s;
     while ls > 0 && SRC[ls - 1] != '\n' {
         ls -= 1;
@@ -1027,7 +995,7 @@ fn justify(s: i64) {
     while SRC[ie] == ' ' {
         ie += 1;
     }
-    if EDITED.get(ie + 1) != 0 {
+    if tcx.rawptr_edited.get(ie + 1) != 0 {
         return;
     }
     let t = buf_new();
@@ -1039,16 +1007,16 @@ fn justify(s: i64) {
     buf_byte(t, '\n');
     buf_bytes(t, SRC[ls..ie]);
     if edit_replace(ie, ie, t) {
-        EDITED.put(ie + 1, 1);
+        tcx.rawptr_edited.put(ie + 1, 1);
     }
 }
 
 // The decided parameters' types of f: `p: *T` and `p: sink *T` to `p:
 // inout T` or `p: T`.
-fn edit_params(f: i64) {
+fn edit_params(f: i64, tcx: inout Tcx<Comp>) {
     let item = f_node(f);
     for i in 0..f_params(f) {
-        if !decidable(f, i) {
+        if !decidable(f, i, tcx) {
             continue;
         }
         let tn = NODES[child(item, i)].b;
@@ -1066,9 +1034,9 @@ fn edit_params(f: i64) {
             && (SRC[k - 4] == ' ' || SRC[k - 4] == ':') {
             a = k - 3;
         }
-        let inout_ = to_inout(f, i);
-        if replace_text(a, s + 1, if inout_ { c"inout " } else { c"" }) {
-            RAWPTR_EDITS[if inout_ { 0 } else { 1 }] += 1;
+        let inout_ = to_inout(f, i, tcx);
+        if replace_text(a, s + 1, if inout_ { c"inout " } else { c"" }, &tcx) {
+            tcx.rawptr_edits[if inout_ { 0 } else { 1 }] += 1;
         }
     }
 }
@@ -1139,14 +1107,14 @@ fn kind_name(k: i64) -> *u8 {
 }
 
 // The class of parameter i of f, and the reason (bits or X_*) in why.
-fn classify(f: i64, i: i64, why: inout i64) -> i64 {
-    let pp = ptr_param(f, i);
-    let x = fixed_why(f);
+fn classify(f: i64, i: i64, why: inout i64, tcx: Tcx<Comp>) -> i64 {
+    let pp = ptr_param(f, i, tcx);
+    let x = fixed_why(f, tcx);
     if pp != 1 || x != X_NONE {
         why = if pp != 1 { pp } else { x };
         return RP_FIXED;
     }
-    let fl = flags(f, i);
+    let fl = flags(f, i, tcx);
     why = fl;
     if (fl & R_ALL) != 0 {
         return RP_ESCAPE;
@@ -1157,7 +1125,7 @@ fn classify(f: i64, i: i64, why: inout i64) -> i64 {
     if (fl & F_WRITE) != 0 { RP_WRITE } else { RP_READ }
 }
 
-fn put_line(out: i64, f: i64, i: i64, class: i64, why: i64) {
+fn put_line(out: i64, f: i64, i: i64, class: i64, why: i64, tcx: Tcx<Comp>) {
     let item = f_node(f);
     let pn = child(item, i);
     let pos = NODES[pn].start;
@@ -1182,7 +1150,7 @@ fn put_line(out: i64, f: i64, i: i64, class: i64, why: i64) {
     buf_byte(out, '\t');
     buf_str(out,
         if class == RP_FIXED && why == X_NESTED { c"-" } else { kind_name(kind_of(f, i)) });
-    let who = WHO.get(key(f, i));
+    let who = tcx.who.get(key(f, i));
     if who > 0 && class != RP_FIXED {
         buf_byte(out, '\t');
         buf_bytes(out, SYMS[NODES[f_node(who - 1)].a].text);
@@ -1192,139 +1160,139 @@ fn put_line(out: i64, f: i64, i: i64, class: i64, why: i64) {
 
 // The census (and, later, the edits) of `fix --only rawptr`; the number of
 // parameters decided.
-pub fn rawptr_edits() -> i64 {
-    SELF_SYM = intern("self");
-    find_values();
+pub fn rawptr_edits(tcx: inout Tcx<Comp>) -> i64 {
+    tcx.self_sym = intern("self");
+    find_values(&tcx);
     // (the flags to a fixed point; then the calls, and again while one
     // keeps a parameter raw)
     var rounds = 0;
-    GIVEN_CHANGED = true;
-    while GIVEN_CHANGED && rounds < 64 {
-        CHANGED = true;
-        while CHANGED {
-            CHANGED = false;
-            walk_all(PH_MARK);
-            FIRST = false;
+    tcx.given_changed = true;
+    while tcx.given_changed && rounds < 64 {
+        tcx.rawptr_changed = true;
+        while tcx.rawptr_changed {
+            tcx.rawptr_changed = false;
+            walk_all(PH_MARK, &tcx);
+            tcx.first = false;
         }
-        GIVEN_CHANGED = false;
-        CALLER_SITES = 0;
-        walk_all(PH_CALLS);
+        tcx.given_changed = false;
+        tcx.caller_sites = 0;
+        walk_all(PH_CALLS, &tcx);
         rounds += 1;
     }
-    walk_all(PH_EDIT);
+    walk_all(PH_EDIT, &tcx);
     let out = buf_new();
     var decided = 0;
     for f in 0..FN_COUNT {
         // (a closure's parameters, the format literals' too, are its
         // caller's to choose)
         if !has_body(f) || f_tmpl(f) > 0 || !ref_in(NODES[f_node(f)].start)
-            || fixed_why(f) == X_CLOSURE {
+            || fixed_why(f, tcx) == X_CLOSURE {
             continue;
         }
         let std = in_std(NODES[f_node(f)].start);
         for i in 0..f_params(f) {
-            if ptr_param(f, i) == 0 {
+            if ptr_param(f, i, tcx) == 0 {
                 continue;
             }
             var why = 0;
-            let c = classify(f, i, &why);
-            RAWPTR_COUNTS[(if std { 5 } else { 0 }) + c] += 1;
+            let c = classify(f, i, &why, tcx);
+            tcx.rawptr_counts[(if std { 5 } else { 0 }) + c] += 1;
             if std {
                 continue;
             }
             if c == RP_FIXED {
-                FIXED_WHY[why] += 1;
+                tcx.fixed_why[why] += 1;
             } else {
                 for b in 0..17 {
                     if (why & (1 << b)) != 0 {
-                        REASONS[b] += 1;
+                        tcx.reasons[b] += 1;
                     }
                 }
             }
             if c == RP_READ {
-                READ_KINDS[kind_of(f, i)] += 1;
+                tcx.read_kinds[kind_of(f, i)] += 1;
                 decided += 1;
             } else if c == RP_WRITE {
-                WRITE_KINDS[kind_of(f, i)] += 1;
+                tcx.write_kinds[kind_of(f, i)] += 1;
                 decided += 1;
             } else if c == RP_CALLER {
                 decided += 1;
             }
-            if RAWPTR_LIST {
-                put_line(out, f, i, c, why);
+            if tcx.rawptr_list {
+                put_line(out, f, i, c, why, tcx);
             }
         }
     }
-    if RAWPTR_LIST {
+    if tcx.rawptr_list {
         buf_write_fd(out, STDOUT);
     }
     decided
 }
 
 // The census after a run: `note fix.rawptr: ...`.
-pub fn rawptr_report() {
-    let d = diag(c"note", c"fix.rawptr");
+pub fn rawptr_report(tcx: inout Tcx<Comp>) {
+    let d = diag(c"note", c"fix.rawptr", &tcx);
     buf_str(d, c"raw pointer parameters:");
     for c in 0..5 {
         buf_byte(d, ' ');
         buf_str(d, class_name(c));
         buf_byte(d, ' ');
-        buf_int(d, RAWPTR_COUNTS[c]);
+        buf_int(d, tcx.rawptr_counts[c]);
     }
     buf_str(d, c"; read by kind");
     for k in 0..4 {
         buf_byte(d, ' ');
         buf_str(d, kind_name(k));
         buf_byte(d, ' ');
-        buf_int(d, READ_KINDS[k]);
+        buf_int(d, tcx.read_kinds[k]);
     }
     buf_str(d, c"; write by kind");
     for k in 0..4 {
         buf_byte(d, ' ');
         buf_str(d, kind_name(k));
         buf_byte(d, ' ');
-        buf_int(d, WRITE_KINDS[k]);
+        buf_int(d, tcx.write_kinds[k]);
     }
     buf_str(d, c"; reasons");
     for b in 1..17 {
         buf_byte(d, ' ');
         buf_str(d, reason_name(1 << b));
         buf_byte(d, ' ');
-        buf_int(d, REASONS[b]);
+        buf_int(d, tcx.reasons[b]);
     }
     buf_str(d, c"; fixed");
     for x in 1..10 {
         buf_byte(d, ' ');
         buf_str(d, fixed_name(x));
         buf_byte(d, ' ');
-        buf_int(d, FIXED_WHY[x]);
+        buf_int(d, tcx.fixed_why[x]);
     }
     buf_str(d, c"; calls giving no place ");
-    buf_int(d, CALLER_SITES);
+    buf_int(d, tcx.caller_sites);
     buf_str(d, c"; edits: to inout ");
-    buf_int(d, RAWPTR_EDITS[0]);
+    buf_int(d, tcx.rawptr_edits[0]);
     buf_str(d, c", to let ");
-    buf_int(d, RAWPTR_EDITS[1]);
+    buf_int(d, tcx.rawptr_edits[1]);
     buf_str(d, c", `&p` ");
-    buf_int(d, RAWPTR_EDITS[2]);
+    buf_int(d, tcx.rawptr_edits[2]);
     buf_str(d, c", `&x` to `x` ");
-    buf_int(d, RAWPTR_EDITS[3]);
+    buf_int(d, tcx.rawptr_edits[3]);
     buf_str(d, c", `*p` to `p` ");
-    buf_int(d, RAWPTR_EDITS[4]);
+    buf_int(d, tcx.rawptr_edits[4]);
     buf_str(d, c", `&*q` ");
-    buf_int(d, RAWPTR_EDITS[5]);
+    buf_int(d, tcx.rawptr_edits[5]);
     buf_str(d, c" (in a new unsafe block ");
-    buf_int(d, RAWPTR_EDITS[6]);
+    buf_int(d, tcx.rawptr_edits[6]);
     buf_byte(d, ')');
     // (std's, with `--in std`: never edited)
-    if crate::tools::query::refs::OPT_IN != 0 as *u8 && RAWPTR_COUNTS[5] + RAWPTR_COUNTS[6]
-        + RAWPTR_COUNTS[7] + RAWPTR_COUNTS[8] + RAWPTR_COUNTS[9] > 0 {
+    if crate::tools::query::refs::OPT_IN != 0 as *u8 && tcx.rawptr_counts[5] + tcx.rawptr_counts[6]
+        + tcx.rawptr_counts[7] + tcx.rawptr_counts[8] + tcx.rawptr_counts[9] > 0 {
         buf_str(d, c"; std:");
         for c in 0..5 {
             buf_byte(d, ' ');
             buf_str(d, class_name(c));
             buf_byte(d, ' ');
-            buf_int(d, RAWPTR_COUNTS[5 + c]);
+            buf_int(d, tcx.rawptr_counts[5 + c]);
         }
     }
     buf_byte(d, '\n');

@@ -27,6 +27,7 @@ use crate::base::{
     FILES, IntVec, SOURCE_VOLE, SRC, STDERR, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
     buf_fmt, buf_int, buf_new, buf_slice, buf_str, cstr, sym_text,
 };
+use crate::base::comp::Comp;
 use crate::base::diag::{DIAG_SHORT, diag_records, short_diagnostic};
 use crate::base::json::buf_json_str;
 use crate::front::ast::{NODES, NODE_CAPTURE, NodeKind, child};
@@ -47,10 +48,11 @@ use crate::front::lexer::{TOKS, TOK_COUNT, Tok, is_ident_byte};
 use crate::front::modules::{MODULES, file_of_pos};
 use crate::front::types::{FNS, FN_COUNT, buf_type};
 use crate::middle::lower::ssa::HMap;
-use crate::tools::lsp::{C_SOURCES, TIMING, cwd_dir, now_us, write_all};
+use crate::tools::ctx::Tcx;
+use crate::tools::lsp::{cwd_dir, now_us, write_all};
 use crate::tools::lsp::json::{at_path, str_into};
 use crate::tools::lsp::stdfiles::{
-    STD_F, put_segment_path, segment_by_path, segment_from, segment_name, segment_of, segment_to,
+    put_segment_path, segment_by_path, segment_from, segment_name, segment_of, segment_to,
     std_files_ready,
 };
 use crate::tools::lsp::words::{attribute_text, bound_text, keyword_text, primitive_text};
@@ -61,7 +63,7 @@ use crate::tools::query::defs::{
     DEFS, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STATIC,
     K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, def_of_node, kind_name, last_segment,
 };
-use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN};
+use crate::tools::query::diagnostics::PROG;
 use crate::tools::query::effects::{def_effect_lines, def_effects_text};
 use crate::tools::query::features::put_def_features;
 use crate::tools::query::positions::{line_start, sort_by_position, token_at};
@@ -69,35 +71,6 @@ use crate::tools::query::refs::collect_all_refs;
 use crate::tools::query::show::{put_signature, text_start};
 use crate::tools::query::typeat::{TypedIndex, typed_index, typed_nodes_in};
 use crate::tools::refactor_mod::local::decl_name_pos;
-
-// The worker's state: how positions are counted, the line starts of every
-// file, every reference.
-static var UTF8: bool = false;
-static var OUT_FD: i32 = -1;
-static var LOADED: bool = false;
-static var LS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var FIRST_LINE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var ALL_REFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var REFS_READY: bool = false;
-
-// query type's index (made at the first hover)
-static var TYPED: *TypedIndex = 0 as *TypedIndex;
-
-// (0.25) Where each local is named: position + 1 -> its declaration + 1.
-static var LOCAL_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var LOCALS_READY: bool = false;
-
-// Each local's declaration: local + 1 -> the position of its name + 1
-// (refactor_mod/local's DECL_POS without a C function's or a bodiless
-// trait function's parameters, which declare no local of their own).
-static var LOCAL_DECL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// (0.25) The request's std file (a segment of std's text), -1: none.
-static var ASK_SEG: i64 = -1;
-// The operators that call a function (`a + b` of a type with Add): the
-// operator's position, its definition, the call's start.
-static var OP_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var OP_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var OP_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // What a hover shows of the effects' reasons, at most.
 const WHY_MAX: i64 = 6;
@@ -115,20 +88,20 @@ extern "C" {
 
 // Reads the program of root and answers on `output` the requests of
 // `input` until it is closed; never returns.
-pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
+pub fn serve(root: *u8, input: i32, output: i32, utf8: bool, tcx: inout Tcx<Comp>) -> ! {
     unsafe {
-        UTF8 = utf8;
-        OUT_FD = output;
+        tcx.answer_utf8 = utf8;
+        tcx.out_fd = output;
         PROG = c"volec";
-        ROOT_GIVEN = root;
+        tcx.root_given = root;
         // (0.25.2) where the declarations imported from C are
         C_KEEP_ORIGINS = true;
         let t0 = now_us();
-        LOADED = load_program(root, 0);
-        lap("load", t0);
+        tcx.loaded = load_program(root, 0, &tcx);
+        lap("load", t0, tcx);
         let t1 = now_us();
-        index_lines();
-        if LOADED {
+        index_lines(&tcx);
+        if tcx.loaded {
             // (0.25.2) the program's files, for the server's notes on the
             // documents it has none of
             let files = buf_new();
@@ -138,26 +111,26 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
                     buf_byte(files, '\n');
                 }
             }
-            send('f', buf_slice(files));
+            send('f', buf_slice(files), tcx);
         }
-        publish_diagnostics();
-        lap("diagnostics", t1);
+        publish_diagnostics(tcx);
+        lap("diagnostics", t1, tcx);
         // (what the requests look up, made before the first comes)
-        if LOADED {
+        if tcx.loaded {
             let t3 = now_us();
-            std_files_ready();
-            lap("std files", t3);
+            std_files_ready(&tcx);
+            lap("std files", t3, tcx);
             let t2 = now_us();
-            ensure_refs();
-            local_named_at(0);
-            TYPED = alloc_array::<TypedIndex>(1);
-            TYPED[0] = typed_index();
-            crate::tools::lsp::complete::index_locals(LOCAL_DECL);
-            lap("index", t2);
+            ensure_refs(&tcx);
+            local_named_at(0, &tcx);
+            tcx.typed = alloc_array::<TypedIndex>(1);
+            tcx.typed[0] = typed_index();
+            crate::tools::lsp::complete::index_locals(tcx.local_decl, &tcx);
+            lap("index", t2, tcx);
         }
         // (0.25.1) ready: the server may keep this worker for completion
         // after the program changes (`l`; `b`: the program was not read)
-        send(if LOADED { 'l' } else { 'b' }, "");
+        send(if tcx.loaded { 'l' } else { 'b' }, "", tcx);
         let pending = buf_new();
         let chunk = alloc_zeroed(65536);
         var from = 0;
@@ -177,7 +150,7 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
                     more = parse_digits(field(line, 4));
                 }
                 if nl + 1 + more <= s.len as i64 {
-                    answer_line(line, s[nl + 1..nl + 1 + more]);
+                    answer_line(line, s[nl + 1..nl + 1 + more], &tcx);
                     from = nl + 1 + more;
                     continue;
                 }
@@ -192,14 +165,14 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
 }
 
 // Writes a frame: kind, the body's length, the body.
-fn send(kind: u8, body: [u8]) {
+fn send(kind: u8, body: [u8], tcx: Tcx<Comp>) {
     let head = buf_new();
     buf_byte(head, kind);
     buf_byte(head, ' ');
     buf_int(head, body.len as i64);
     buf_byte(head, '\n');
-    write_all(OUT_FD, buf_slice(head));
-    write_all(OUT_FD, body);
+    write_all(tcx.out_fd, buf_slice(head));
+    write_all(tcx.out_fd, body);
 }
 
 // The fields of a request line, split at its TABs (the last one, the id,
@@ -221,7 +194,7 @@ fn field(line: [u8], k: i64) -> [u8] {
     if n == k { line[start..] } else { line[0..0] }
 }
 
-fn answer_line(line: [u8], payload: [u8]) {
+fn answer_line(line: [u8], payload: [u8], tcx: inout Tcx<Comp>) {
     let t0 = now_us();
     let method = field(line, 0);
     let path = field(line, 1);
@@ -233,61 +206,62 @@ fn answer_line(line: [u8], payload: [u8]) {
     buf_str(out, c"{\"jsonrpc\":\"2.0\",\"id\":");
     buf_bytes(out, id);
     buf_str(out, c",\"result\":");
-    let f = if LOADED { file_by_path(path) } else { -1 };
-    let pos = if f >= 0 { pos_at(f, ln, ch) } else { -1 };
+    let f = if tcx.loaded { file_by_path(path, &tcx) } else { -1 };
+    let pos = if f >= 0 { pos_at(f, ln, ch, tcx) } else { -1 };
     if method == "definition" {
-        if pos >= 0 { put_definition(out, pos); } else { buf_str(out, c"null"); }
+        if pos >= 0 { put_definition(out, pos, &tcx); } else { buf_str(out, c"null"); }
     } else if method == "references" {
-        if pos >= 0 { put_references(out, pos, flag); } else { buf_str(out, c"[]"); }
+        if pos >= 0 { put_references(out, pos, flag, &tcx); } else { buf_str(out, c"[]"); }
     } else if method == "hover" {
-        if pos >= 0 { put_hover(out, pos); } else { buf_str(out, c"null"); }
+        if pos >= 0 { put_hover(out, pos, &tcx); } else { buf_str(out, c"null"); }
     } else if method == "documentSymbol" {
-        if f >= 0 && f == STD_F && ASK_SEG >= 0 {
-            put_symbols(out, segment_from(ASK_SEG), segment_to(ASK_SEG));
+        if f >= 0 && f == tcx.std_f && tcx.ask_seg >= 0 {
+            put_symbols(out, segment_from(tcx.ask_seg, tcx), segment_to(tcx.ask_seg, tcx), tcx);
         } else if f >= 0 {
-            put_symbols(out, FILES[f].start, FILES[f].end);
+            put_symbols(out, FILES[f].start, FILES[f].end, tcx);
         } else {
             buf_str(out, c"[]");
         }
     } else if method == "workspaceSymbol" {
-        if LOADED { put_workspace_symbols(out, path); } else { buf_str(out, c"[]"); }
+        if tcx.loaded { put_workspace_symbols(out, path, tcx); } else { buf_str(out, c"[]"); }
     } else if method == "completion" || method == "completion+s" {
         // (0.25.1) the editor's text in the payload; f: its file, if the
         // program has it
-        crate::tools::lsp::complete::put_completion(out, f, payload, ln, ch, UTF8, LOADED,
-            method == "completion+s");
+        crate::tools::lsp::complete::put_completion(out, f, payload, ln, ch, tcx.answer_utf8,
+            tcx.loaded, method == "completion+s", &tcx);
     } else if method == "completionResolve" {
-        put_resolve(out, payload);
+        put_resolve(out, payload, &tcx);
     } else if method == "signatureHelp" {
-        crate::tools::lsp::complete::put_signature_help(out, f, payload, ln, ch, UTF8, LOADED);
+        crate::tools::lsp::complete::put_signature_help(out, f, payload, ln, ch, tcx.answer_utf8,
+            tcx.loaded, &tcx);
     } else {
         buf_str(out, c"null");
     }
     buf_byte(out, '}');
-    send('r', buf_slice(out));
-    lap(method, t0);
+    send('r', buf_slice(out), tcx);
+    lap(method, t0, tcx);
 }
 
 // completionItem/resolve (0.25.1): the item (JSON) with the hover of the
 // definition its data names as its documentation.
-fn put_resolve(out: i64, item: [u8]) {
+fn put_resolve(out: i64, item: [u8], tcx: inout Tcx<Comp>) {
     let path = buf_new();
     str_into(item, at_path(item, 0, "data.p"), path);
-    let d = if LOADED && buf_slice(path).len > 0 {
-        crate::tools::lsp::complete::def_by_path(buf_slice(path))
+    let d = if tcx.loaded && buf_slice(path).len > 0 {
+        crate::tools::lsp::complete::def_by_path(buf_slice(path), &tcx)
     } else {
         -1
     };
     let md = buf_new();
     if d >= 0 {
-        hover_def(md, d, -1);
+        hover_def(md, d, -1, &tcx);
     }
     crate::tools::lsp::complete::put_resolved(out, item, d, buf_slice(md));
 }
 
 // With $VOLE_LSP_TIME, `lsp worker: WHAT N ms` (since t0) on stderr.
-fn lap(what: [u8], t0: i64) {
-    if !TIMING {
+fn lap(what: [u8], t0: i64, tcx: Tcx<Comp>) {
+    if !tcx.timing {
         return;
     }
     let us = now_us() - t0;
@@ -301,46 +275,46 @@ fn lap(what: [u8], t0: i64) {
 // ---- positions
 
 // The line starts of every file (also of a program that did not parse).
-fn index_lines() {
+fn index_lines(tcx: inout Tcx<Comp>) {
     for f in 0..FILES.len() {
-        FIRST_LINE.push(LS.count);
-        LS.push(FILES[f].start);
+        tcx.first_line.push(tcx.answer_ls.count);
+        tcx.answer_ls.push(FILES[f].start);
         for p in FILES[f].start..FILES[f].end {
             if SRC[p] == '\n' && p + 1 < FILES[f].end {
-                LS.push(p + 1);
+                tcx.answer_ls.push(p + 1);
             }
         }
     }
-    FIRST_LINE.push(LS.count);
+    tcx.first_line.push(tcx.answer_ls.count);
 }
 
 // The file of the program at path (as the front end read it), or -1; a
 // file of std's (stdfiles.vl): std's text, ASK_SEG its segment. (0.26.2)
 // An embedded block's .wgsl is -1: no vole answers there.
-fn file_by_path(path: [u8]) -> i64 {
-    ASK_SEG = -1;
+fn file_by_path(path: [u8], tcx: inout Tcx<Comp>) -> i64 {
+    tcx.ask_seg = -1;
     for f in 0..FILES.len() as i64 {
         if cstr(FILES[f].path) == path {
             return if FILES[f].kind == SOURCE_VOLE { f } else { -1 };
         }
     }
-    let k = segment_by_path(path);
+    let k = segment_by_path(path, tcx);
     if k >= 0 {
-        ASK_SEG = k;
-        return STD_F;
+        tcx.ask_seg = k;
+        return tcx.std_f;
     }
     -1
 }
 
 // The index in LS of the line holding pos.
-fn line_index(pos: i64) -> i64 {
+fn line_index(pos: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         let f = file_of_pos(pos);
-        var lo = FIRST_LINE.data[f];
-        var hi = FIRST_LINE.data[f + 1];
+        var lo = tcx.first_line.data[f];
+        var hi = tcx.first_line.data[f + 1];
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
-            if LS.data[mid] <= pos { lo = mid; } else { hi = mid; }
+            if tcx.answer_ls.data[mid] <= pos { lo = mid; } else { hi = mid; }
         }
         lo
     }
@@ -348,11 +322,11 @@ fn line_index(pos: i64) -> i64 {
 
 // The segment of std's text position pos is shown in, or -1 (a position
 // in a file of its own).
-fn seg_at(pos: i64) -> i64 {
-    if STD_F < 0 || pos < FILES[STD_F].start || pos >= FILES[STD_F].end {
+fn seg_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
+    if tcx.std_f < 0 || pos < FILES[tcx.std_f].start || pos >= FILES[tcx.std_f].end {
         return -1;
     }
-    segment_of(pos)
+    segment_of(pos, tcx)
 }
 
 // The bytes of the UTF-8 sequence starting with c.
@@ -363,27 +337,27 @@ fn seq_len(c: u8) -> i64 {
 // The position of (line, character) in file f (from 0, the character in
 // the position encoding), or -1; the end of the line when the character
 // is past it.
-fn pos_at(f: i64, line: i64, ch: i64) -> i64 {
+fn pos_at(f: i64, line: i64, ch: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        var first = FIRST_LINE.data[f];
-        var last = FIRST_LINE.data[f + 1];
+        var first = tcx.first_line.data[f];
+        var last = tcx.first_line.data[f + 1];
         var end = FILES[f].end;
-        if f == STD_F && ASK_SEG >= 0 {
+        if f == tcx.std_f && tcx.ask_seg >= 0 {
             // (a file of std's: its segment's lines)
-            first = line_index(segment_from(ASK_SEG));
-            end = segment_to(ASK_SEG);
+            first = line_index(segment_from(tcx.ask_seg, tcx), tcx);
+            end = segment_to(tcx.ask_seg, tcx);
             if end < FILES[f].end {
-                last = line_index(end);
+                last = line_index(end, tcx);
             }
         }
         if line < 0 || first + line >= last {
             return -1;
         }
-        var p = LS.data[first + line];
+        var p = tcx.answer_ls.data[first + line];
         var units = 0;
         while p < end && SRC[p] != '\n' && units < ch {
             let n = seq_len(SRC[p]);
-            units += if UTF8 { n } else if n == 4 { 2 } else { 1 };
+            units += if tcx.answer_utf8 { n } else if n == 4 { 2 } else { 1 };
             p += n;
         }
         if p > end { end } else { p }
@@ -392,15 +366,15 @@ fn pos_at(f: i64, line: i64, ch: i64) -> i64 {
 
 // `{"line":L,"character":C}` of position pos, its line counted from the
 // line `first` (an index in LS).
-fn put_position(out: i64, pos: i64, first: i64) {
+fn put_position(out: i64, pos: i64, first: i64, tcx: Tcx<Comp>) {
     unsafe {
-        let lo = line_index(pos);
-        let ls = LS.data[lo];
+        let lo = line_index(pos, tcx);
+        let ls = tcx.answer_ls.data[lo];
         var units = 0;
         var p = ls;
         while p < pos {
             let n = seq_len(SRC[p]);
-            units += if UTF8 { n } else if n == 4 { 2 } else { 1 };
+            units += if tcx.answer_utf8 { n } else if n == 4 { 2 } else { 1 };
             p += n;
         }
         buf_fmt(out, format_args("{{\"line\":{},\"character\":{units}}}", lo - first));
@@ -408,27 +382,27 @@ fn put_position(out: i64, pos: i64, first: i64) {
 }
 
 // The range from..to; in std's text, in from's segment (its file).
-fn put_range(out: i64, from: i64, to: i64) {
+fn put_range(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
     unsafe {
         var a = from;
         var b = to;
         var first = 0;
-        let k = seg_at(from);
+        let k = seg_at(from, tcx);
         if k >= 0 {
-            let s = segment_from(k);
-            let e = segment_to(k) - 1;
+            let s = segment_from(k, tcx);
+            let e = segment_to(k, tcx) - 1;
             if a < s { a = s; }
             if a > e { a = e; }
             if b > e { b = e; }
             if b < a { b = a; }
-            first = line_index(s);
+            first = line_index(s, tcx);
         } else {
-            first = FIRST_LINE.data[file_of_pos(from)];
+            first = tcx.first_line.data[file_of_pos(from)];
         }
         buf_str(out, c"{\"start\":");
-        put_position(out, a, first);
+        put_position(out, a, first, tcx);
         buf_str(out, c",\"end\":");
-        put_position(out, b, first);
+        put_position(out, b, first, tcx);
         buf_byte(out, '}');
     }
 }
@@ -452,11 +426,11 @@ pub fn put_uri(out: i64, path: [u8]) {
 }
 
 // The file:// URI of position pos's file (in std's text: its segment's).
-fn put_pos_uri(out: i64, pos: i64) {
-    let k = seg_at(pos);
+fn put_pos_uri(out: i64, pos: i64, tcx: Tcx<Comp>) {
+    let k = seg_at(pos, tcx);
     if k >= 0 {
         let p = buf_new();
-        put_segment_path(p, k);
+        put_segment_path(p, k, tcx);
         put_uri(out, buf_slice(p));
     } else {
         put_uri(out, cstr(FILES[file_of_pos(pos)].path));
@@ -476,14 +450,14 @@ fn in_file(pos: i64) -> bool {
 
 // Whether position pos has a location: in a file, or in std's text (one
 // of its files).
-fn located(pos: i64) -> bool {
-    pos >= 0 && (in_file(pos) || seg_at(pos) >= 0)
+fn located(pos: i64, tcx: Tcx<Comp>) -> bool {
+    pos >= 0 && (in_file(pos) || seg_at(pos, tcx) >= 0)
 }
 
 // Whether a reference at pos is shown: in the program's files, and in
 // std's when the request is about a file of std's.
-fn shown(pos: i64) -> bool {
-    in_file(pos) || ASK_SEG >= 0 && seg_at(pos) >= 0
+fn shown(pos: i64, tcx: Tcx<Comp>) -> bool {
+    in_file(pos) || tcx.ask_seg >= 0 && seg_at(pos, tcx) >= 0
 }
 
 // The end of the token at pos (pos + 1 when none starts there).
@@ -499,11 +473,11 @@ fn token_end(pos: i64) -> i64 {
 }
 
 // `{"uri":..,"range":..}` of the token at pos.
-fn put_location(out: i64, pos: i64) {
+fn put_location(out: i64, pos: i64, tcx: Tcx<Comp>) {
     buf_str(out, c"{\"uri\":\"");
-    put_pos_uri(out, pos);
+    put_pos_uri(out, pos, tcx);
     buf_str(out, c"\",\"range\":");
-    put_range(out, pos, token_end(pos));
+    put_range(out, pos, token_end(pos), tcx);
     buf_byte(out, '}');
 }
 
@@ -523,18 +497,20 @@ fn token_start(pos: i64) -> i64 {
     }
 }
 
-fn ensure_refs() {
-    if !REFS_READY {
+fn ensure_refs(tcx: inout Tcx<Comp>) {
+    if !tcx.refs_ready {
         let t0 = now_us();
-        collect_all_refs(&ALL_REFS);
-        lap("references collected", t0);
+        var all = tcx.all_refs;
+        collect_all_refs(&all, &tcx);
+        tcx.all_refs = all;
+        lap("references collected", t0, tcx);
         // (0.25: the program's names, std's and operators' calls)
         let t1 = now_us();
-        find_operators();
-        clean_refs();
-        add_unwritten();
-        lap("references resolved", t1);
-        REFS_READY = true;
+        find_operators(&tcx);
+        clean_refs(&tcx);
+        add_unwritten(&tcx);
+        lap("references resolved", t1, tcx);
+        tcx.refs_ready = true;
     }
 }
 
@@ -573,7 +549,7 @@ fn is_keyword(k: i64) -> bool {
 // checker made `{ let =+l = a; let =+r = b; =+l.add(=+r) }`
 // (traits.vl: operator_call, negation_call), its call at the operator's
 // start: the operator is the token between the operands.
-fn find_operators() {
+fn find_operators(tcx: inout Tcx<Comp>) {
     unsafe {
         for n in 1..NODES.len() as i64 {
             if NODES[n].kind != NodeKind::Block || NODES[n].count < 1 || NODES[n].count > 2 {
@@ -597,7 +573,7 @@ fn find_operators() {
                 continue;
             }
             let fnode = FNS[NODES[c].x - 1].node;
-            var d = def_of_node(fnode);
+            var d = def_of_node(fnode, tcx);
             if d < 0 {
                 // (a #[derive]'s `eq`, `cmp`: std's trait function)
                 d = trait_fn_named(NODES[fnode].a);
@@ -623,20 +599,20 @@ fn find_operators() {
                 }
             }
             if at >= 0 {
-                OP_AT.push(at);
-                OP_DEF.push(d);
-                OP_START.push(NODES[c].start);
+                tcx.op_at.push(at);
+                tcx.op_def.push(d);
+                tcx.op_start.push(NODES[c].start);
             }
         }
     }
 }
 
 // The definition the operator at pos calls, or -1.
-fn operator_def(pos: i64) -> i64 {
+fn operator_def(pos: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        for i in 0..OP_AT.count {
-            if OP_AT.data[i] == pos {
-                return OP_DEF.data[i];
+        for i in 0..tcx.op_at.count {
+            if tcx.op_at.data[i] == pos {
+                return tcx.op_def.data[i];
             }
         }
         -1
@@ -669,7 +645,7 @@ fn trait_fn_named(sym: i64) -> i64 {
 // (`Token` of `use Token::{Num, Plus};`: the program's type, trait or
 // module of that name, else std's). (The candidates' positions in a map,
 // then one pass over the references.)
-fn add_unwritten() {
+fn add_unwritten(tcx: inout Tcx<Comp>) {
     unsafe {
         // (position, token, call node or 0 for a path's head)
         var cand = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -707,9 +683,9 @@ fn add_unwritten() {
             c += 3;
         }
         var i = 0;
-        while i < ALL_REFS.count {
-            if at.get(ALL_REFS.data[i] + 1) == 1 {
-                at.put(ALL_REFS.data[i] + 1, 2);
+        while i < tcx.all_refs.count {
+            if at.get(tcx.all_refs.data[i] + 1) == 1 {
+                at.put(tcx.all_refs.data[i] + 1, 2);
             }
             i += 3;
         }
@@ -727,11 +703,11 @@ fn add_unwritten() {
             var d = -1;
             if n != 0 {
                 let fnode = FNS[NODES[n].x - 1].node;
-                d = def_of_node(fnode);
+                d = def_of_node(fnode, tcx);
                 if d < 0 {
                     d = trait_fn_named(TOKS[t].value as i64);
                 }
-            } else if local_named_at(p) < 0 {
+            } else if local_named_at(p, &tcx) < 0 {
                 if !named_ready {
                     for e in 0..DEFS.len() as i64 {
                         let k = DEFS[e].kind;
@@ -749,9 +725,9 @@ fn add_unwritten() {
                 d = named.get(TOKS[t].value as i64 + 1) - 1;
             }
             if d >= 0 {
-                ALL_REFS.push(p);
-                ALL_REFS.push(d);
-                ALL_REFS.push(if n != 0 { QF_CALL } else { QF_USE });
+                tcx.all_refs.push(p);
+                tcx.all_refs.push(d);
+                tcx.all_refs.push(if n != 0 { QF_CALL } else { QF_USE });
                 at.put(p + 1, 2);
             }
         }
@@ -766,17 +742,17 @@ fn add_unwritten() {
 // moved to the operator. (A map of the few positions with such a
 // reference, not of every reference: the compiler's source has a
 // million.)
-fn clean_refs() {
+fn clean_refs(tcx: inout Tcx<Comp>) {
     unsafe {
-        let n = ALL_REFS.count / 3;
+        let n = tcx.all_refs.count / 3;
         // each reference's token when it is not written as its name, else -1
         var odd = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var suspect = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for r in 0..n {
-            let p = ALL_REFS.data[3 * r];
-            let d = ALL_REFS.data[3 * r + 1];
+            let p = tcx.all_refs.data[3 * r];
+            let d = tcx.all_refs.data[3 * r + 1];
             let t = token_starting(p);
-            if t >= 0 && (ALL_REFS.data[3 * r + 2] & QF_DEF) == 0
+            if t >= 0 && (tcx.all_refs.data[3 * r + 2] & QF_DEF) == 0
                 && !(TOKS[t].kind == Tok::Ident && TOKS[t].value as i64 == DEFS[d].name) {
                 odd.push(t);
                 suspect.put(p + 1, 1);
@@ -786,22 +762,22 @@ fn clean_refs() {
         }
         // (2: a name written as what it names, or a definition, is there)
         for r in 0..n {
-            let p = ALL_REFS.data[3 * r];
+            let p = tcx.all_refs.data[3 * r];
             if odd.data[r] < 0 && suspect.get(p + 1) != 0 {
                 suspect.put(p + 1, 2);
             }
         }
         var ops_at = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         var used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for k in 0..OP_START.count {
-            ops_at.put(OP_START.data[k] + 1, 1);
+        for k in 0..tcx.op_start.count {
+            ops_at.put(tcx.op_start.data[k] + 1, 1);
             used.push(0);
         }
         var w = 0;
         for r in 0..n {
-            let p = ALL_REFS.data[3 * r];
-            let d = ALL_REFS.data[3 * r + 1];
-            let flags = ALL_REFS.data[3 * r + 2];
+            let p = tcx.all_refs.data[3 * r];
+            let d = tcx.all_refs.data[3 * r + 1];
+            let flags = tcx.all_refs.data[3 * r + 2];
             let t = odd.data[r];
             var keep = true;
             var at = p;
@@ -809,11 +785,11 @@ fn clean_refs() {
                 let text = tok_text(t);
                 keep = false;
                 if ops_at.get(p + 1) != 0 {
-                    for k in 0..OP_START.count {
-                        if !keep && used.data[k] == 0 && OP_START.data[k] == p
-                            && OP_DEF.data[k] == d {
+                    for k in 0..tcx.op_start.count {
+                        if !keep && used.data[k] == 0 && tcx.op_start.data[k] == p
+                            && tcx.op_def.data[k] == d {
                             used.data[k] = 1;
-                            at = OP_AT.data[k];
+                            at = tcx.op_at.data[k];
                             keep = true;
                         }
                     }
@@ -821,38 +797,39 @@ fn clean_refs() {
                 if !keep && TOKS[t].kind == Tok::Ident {
                     // (`self`, `Self`; an import's other name: `use a::{b as c}`)
                     keep = text == "self" || text == "Self"
-                        || suspect.get(p + 1) != 2 && local_named_at(p) < 0 && !is_primitive(t)
-                        && text != "result" && text != "requires" && text != "ensures";
+                        || suspect.get(p + 1) != 2 && local_named_at(p, &tcx) < 0
+                        && !is_primitive(t) && text != "result" && text != "requires"
+                        && text != "ensures";
                 }
             }
             if keep {
-                ALL_REFS.data[w] = at;
-                ALL_REFS.data[w + 1] = d;
-                ALL_REFS.data[w + 2] = flags;
+                tcx.all_refs.data[w] = at;
+                tcx.all_refs.data[w + 1] = d;
+                tcx.all_refs.data[w + 2] = flags;
                 w += 3;
             }
         }
-        ALL_REFS.count = w;
+        tcx.all_refs.count = w;
     }
 }
 
 // The definition named at position start (a reference, or a definition's
 // name; one written as its name first; an operator's function), or -1.
-fn def_named_at(start: i64) -> i64 {
+fn def_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         if start < 0 {
             return -1;
         }
-        ensure_refs();
+        ensure_refs(&tcx);
         let t = token_starting(start);
         if t >= 0 && is_keyword(TOKS[t].kind as i64) {
             return -1;
         }
         var other = -1;
         var i = 0;
-        while i < ALL_REFS.count {
-            if ALL_REFS.data[i] == start {
-                let d = ALL_REFS.data[i + 1];
+        while i < tcx.all_refs.count {
+            if tcx.all_refs.data[i] == start {
+                let d = tcx.all_refs.data[i + 1];
                 if t < 0 || TOKS[t].value as i64 == DEFS[d].name && TOKS[t].kind == Tok::Ident {
                     return d;
                 }
@@ -863,7 +840,7 @@ fn def_named_at(start: i64) -> i64 {
             i += 3;
         }
         if other < 0 {
-            other = operator_def(start);
+            other = operator_def(start, tcx);
         }
         if other < 0 && t >= 0 && TOKS[t].kind == Tok::Ident && tok_text(t) == "Self" {
             // (in a trait: the trait)
@@ -876,7 +853,7 @@ fn def_named_at(start: i64) -> i64 {
                 }
             }
             if best != 0 {
-                other = def_of_node(best);
+                other = def_of_node(best, tcx);
             }
         }
         other
@@ -938,11 +915,11 @@ fn same_name_in(t: i64, from: i64, to: i64, out: inout IntVec) {
 
 // What a path's first segment at start names: 1 `std`, 2 `crate`, 3
 // `super`, 4 `self`, else 0.
-fn root_named_at(start: i64) -> i64 {
+fn root_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let t = token_starting(start);
         if t < 0 || t + 1 >= TOK_COUNT || TOKS[t].kind != Tok::Ident
-            || TOKS[t + 1].kind != Tok::ColonColon || local_named_at(start) >= 0 {
+            || TOKS[t + 1].kind != Tok::ColonColon || local_named_at(start, &tcx) >= 0 {
             return 0;
         }
         let w = tok_text(t);
@@ -956,10 +933,11 @@ fn root_named_at(start: i64) -> i64 {
 // (its name), else at's file; `super`: the module around that one, or
 // the file `mod x { }` is in; -1 when it has no place (`super` of a
 // file: its parent's `mod x;` is not looked for).
-fn root_start(which: i64, at: i64) -> i64 {
+fn root_start(which: i64, at: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         if which == 1 {
-            return if STD_F >= 0 && seg_at(FILES[STD_F].start) >= 0 { FILES[STD_F].start }
+            return if tcx.std_f >= 0
+                && seg_at(FILES[tcx.std_f].start, tcx) >= 0 { FILES[tcx.std_f].start }
                 else { -1 };
         }
         if which >= 3 {
@@ -992,7 +970,7 @@ fn root_start(which: i64, at: i64) -> i64 {
             return if inner < 0 { -1 } else if outer >= 0 { outer } else { FILES[f].start };
         }
         for f in 0..FILES.len() {
-            if cstr(FILES[f].path) == cstr(ROOT_GIVEN) {
+            if cstr(FILES[f].path) == cstr(tcx.root_given) {
                 return FILES[f].start;
             }
         }
@@ -1001,11 +979,11 @@ fn root_start(which: i64, at: i64) -> i64 {
 }
 
 // The positions of every `std::` (`crate::`) in the shown files, into out.
-fn root_uses(which: i64, out: inout IntVec) {
+fn root_uses(which: i64, out: inout IntVec, tcx: inout Tcx<Comp>) {
     unsafe {
         for t in 0..TOK_COUNT - 1 {
             if TOKS[t].kind == Tok::Ident && TOKS[t + 1].kind == Tok::ColonColon
-                && shown(TOKS[t].start) && root_named_at(TOKS[t].start) == which {
+                && shown(TOKS[t].start, tcx) && root_named_at(TOKS[t].start, &tcx) == which {
                 out.push(TOKS[t].start);
             }
         }
@@ -1048,7 +1026,7 @@ fn name_in_node(n: i64, sym: i64) -> i64 {
 // or `type Output;` of a trait (itself), `T::Output`, `Self::Item` or a
 // bound's `Item = i64` (the trait's `type Item;`): its AssocType node, or
 // 0; *decl: where the name is declared.
-fn assoc_at(start: i64, decl: inout i64) -> i64 {
+fn assoc_at(start: i64, decl: inout i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         let t = token_starting(start);
         if t < 1 || TOKS[t].kind != Tok::Ident {
@@ -1067,7 +1045,7 @@ fn assoc_at(start: i64, decl: inout i64) -> i64 {
             if p == start {
                 here = n;
             }
-            if NODES[n].b == 0 && in_trait == 0 && located(p) {
+            if NODES[n].b == 0 && in_trait == 0 && located(p, tcx) {
                 in_trait = n;
             }
         }
@@ -1085,11 +1063,11 @@ fn assoc_at(start: i64, decl: inout i64) -> i64 {
 
 // The uses of the associated type's name of token t in the shown files
 // (its declarations, `X::Name`, `Name = T`), into out.
-fn assoc_uses(t: i64, out: inout IntVec) {
+fn assoc_uses(t: i64, out: inout IntVec, tcx: Tcx<Comp>) {
     unsafe {
         for u in 1..TOK_COUNT - 1 {
             if TOKS[u].kind != Tok::Ident || TOKS[u].value != TOKS[t].value
-                || !shown(TOKS[u].start) {
+                || !shown(TOKS[u].start, tcx) {
                 continue;
             }
             let k = TOKS[u - 1].kind;
@@ -1169,34 +1147,34 @@ fn put_collapsed(md: i64, from: i64, to: i64) {
 
 // The declaration of the local named at start, or -1 (local_at's answer,
 // from a table of every position made once: 0.25).
-fn local_named_at(start: i64) -> i64 {
+fn local_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
     if start < 0 {
         return -1;
     }
-    if !LOCALS_READY {
-        load_local_decls();
+    if !tcx.locals_ready {
+        load_local_decls(&tcx);
         for n in 1..NODES.len() as i64 {
             let p = decl_name_pos(n);
-            if p >= NODES[n].start && p < NODES[n].end && LOCAL_AT.get(p + 1) == 0
-                && LOCAL_DECL.get(NODES[n].x + 1) == p + 1 {
-                LOCAL_AT.put(p + 1, p + 1);
+            if p >= NODES[n].start && p < NODES[n].end && tcx.local_at.get(p + 1) == 0
+                && tcx.local_decl.get(NODES[n].x + 1) == p + 1 {
+                tcx.local_at.put(p + 1, p + 1);
             }
             let s = NODES[n].start;
             if s >= 0 && NODES[n].end > s {
-                let d = decl_of_use(n);
-                if d >= 0 && LOCAL_AT.get(s + 1) == 0 {
-                    LOCAL_AT.put(s + 1, d + 1);
+                let d = decl_of_use(n, tcx);
+                if d >= 0 && tcx.local_at.get(s + 1) == 0 {
+                    tcx.local_at.put(s + 1, d + 1);
                 }
             }
         }
-        LOCALS_READY = true;
+        tcx.locals_ready = true;
     }
-    LOCAL_AT.get(start + 1) - 1
+    tcx.local_at.get(start + 1) - 1
 }
 
 // LOCAL_DECL, made once.
-fn load_local_decls() {
-    if LOCAL_DECL.count > 0 {
+fn load_local_decls(tcx: inout Tcx<Comp>) {
+    if tcx.local_decl.count > 0 {
         return;
     }
     var skip = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -1213,18 +1191,18 @@ fn load_local_decls() {
             continue;
         }
         let p = decl_name_pos(n);
-        if p >= 0 && LOCAL_DECL.get(NODES[n].x + 1) == 0 {
-            LOCAL_DECL.put(NODES[n].x + 1, p + 1);
+        if p >= 0 && tcx.local_decl.get(NODES[n].x + 1) == 0 {
+            tcx.local_decl.put(NODES[n].x + 1, p + 1);
         }
     }
 }
 
 // The position of the declaration of the local node n names, or -1
 // (refactor_mod/local's use_decl, on LOCAL_DECL).
-fn decl_of_use(n: i64) -> i64 {
+fn decl_of_use(n: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         if (NODES[n].p & NODE_CAPTURE) != 0 && NODES[n].d > 0 {
-            return LOCAL_DECL.get(NODES[n].d) - 1;
+            return tcx.local_decl.get(NODES[n].d) - 1;
         }
         if NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
             return -1;
@@ -1233,31 +1211,28 @@ fn decl_of_use(n: i64) -> i64 {
         if l < 0 || l >= LOCAL_COUNT || LOCALS[l].name != NODES[n].a {
             return -1;
         }
-        LOCAL_DECL.get(l + 1) - 1
+        tcx.local_decl.get(l + 1) - 1
     }
 }
 
 // ---- C imports (0.25.2)
 
-// The header read last (its path and text, buffers; -1: none).
-static var HDR_PATH: i64 = -1;
-static var HDR_TEXT: i64 = -1;
 // The most lines of a C declaration a hover shows.
 const C_LINES_MAX: i64 = 12;
 
 // The text of the header at path (empty when it cannot be read), the
 // last one kept.
-fn header_text(path: [u8]) -> [u8] {
-    if HDR_PATH >= 0 && buf_slice(HDR_PATH) == path {
-        return buf_slice(HDR_TEXT);
+fn header_text(path: [u8], tcx: inout Tcx<Comp>) -> [u8] {
+    if tcx.hdr_path >= 0 && buf_slice(tcx.hdr_path) == path {
+        return buf_slice(tcx.hdr_text);
     }
-    HDR_PATH = buf_new();
-    buf_bytes(HDR_PATH, path);
-    HDR_TEXT = buf_new();
+    tcx.hdr_path = buf_new();
+    buf_bytes(tcx.hdr_path, path);
+    tcx.hdr_text = buf_new();
     let p = buf_new();
     buf_bytes(p, path);
-    read_file_if(buf_cstr(p), HDR_TEXT);
-    buf_slice(HDR_TEXT)
+    read_file_if(buf_cstr(p), tcx.hdr_text);
+    buf_slice(tcx.hdr_text)
 }
 
 // The start of line `line` (from 1) in text, or -1.
@@ -1359,13 +1334,13 @@ fn c_place(o: i64) -> ([u8], i64, [u8]) {
 }
 
 // `{"uri":..,"range":..}` of place o: its name on its line of its header.
-fn put_c_location(out: i64, o: i64) -> bool {
+fn put_c_location(out: i64, o: i64, tcx: inout Tcx<Comp>) -> bool {
     let (path, line, name) = c_place(o);
     if path.len == 0 {
         return false;
     }
     // its column: the name as a word on its line
-    let text = header_text(path);
+    let text = header_text(path, &tcx);
     let ls = text_line(text, line);
     var col = 0;
     var len = 0;
@@ -1394,9 +1369,9 @@ fn put_c_location(out: i64, o: i64) -> bool {
 // buffers of their paths, into out): vole.cSources (C_SOURCES), and the
 // C file beside each header the program imports by a relative path
 // (`import "./ring.h"`: ./ring.c, when there is one).
-fn c_source_files(out: inout IntVec) {
-    for i in 0..C_SOURCES.count {
-        out.push(C_SOURCES.get(i));
+fn c_source_files(out: inout IntVec, tcx: Tcx<Comp>) {
+    for i in 0..tcx.c_sources.count {
+        out.push(tcx.c_sources.get(i));
     }
     var i = 0;
     while i + 1 < C_IMPORT_PATHS.count {
@@ -1518,13 +1493,13 @@ fn c_body_at(text: [u8], name: [u8]) -> i64 {
 
 // `,{"uri":..,"range":..}` of each body of C function `name` in the C
 // files the program is built with, onto out; how many.
-fn put_c_bodies(out: i64, name: [u8]) -> i64 {
+fn put_c_bodies(out: i64, name: [u8], tcx: inout Tcx<Comp>) -> i64 {
     var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    c_source_files(&files);
+    c_source_files(&files, tcx);
     var found = 0;
     for f in 0..files.count {
         let path = buf_slice(files.get(f));
-        let text = header_text(path);
+        let text = header_text(path, &tcx);
         let at = c_body_at(text, name);
         if at < 0 {
             continue;
@@ -1619,7 +1594,7 @@ fn tok_word(t: i64) -> [u8] {
 
 // The C declaration of place o, as its header writes it (at most
 // C_LINES_MAX lines; a macro with its continued lines), then where it is.
-fn put_c_decl(md: i64, o: i64) {
+fn put_c_decl(md: i64, o: i64, tcx: inout Tcx<Comp>) {
     let (path, name_line, _) = c_place(o);
     if path.len == 0 {
         return;
@@ -1630,7 +1605,7 @@ fn put_c_decl(md: i64, o: i64) {
         first = name_line;
         last = first;
     }
-    let text = header_text(path);
+    let text = header_text(path, &tcx);
     var at = text_line(text, first);
     if at < 0 {
         return;
@@ -1673,7 +1648,7 @@ fn put_c_decl(md: i64, o: i64) {
 // whose name is at name_pos (-1: none; is_fn: a function): where its
 // header has it, a function's bodies in the program's C files first.
 // False when start is neither.
-fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool) -> bool {
+fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool, tcx: inout Tcx<Comp>) -> bool {
     let header = if start >= 0 { import_header_at(start) } else { "" };
     if header.len > 0 {
         buf_str(out, c"{\"uri\":\"");
@@ -1683,12 +1658,12 @@ fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool) -> bool {
     }
     let o = if name_pos >= 0 { c_origin_at(name_pos) } else { -1 };
     let loc = buf_new();
-    if o < 0 || !put_c_location(loc, o) {
+    if o < 0 || !put_c_location(loc, o, &tcx) {
         return false;
     }
     let (_, _, name) = c_place(o);
     let bodies = buf_new();
-    let n = if is_fn { put_c_bodies(bodies, name) } else { 0 };
+    let n = if is_fn { put_c_bodies(bodies, name, &tcx) } else { 0 };
     if n == 0 {
         buf_bytes(out, buf_slice(loc));
     } else {
@@ -1712,8 +1687,8 @@ fn name_start(pos: i64) -> i64 {
 
 // def_named_at(start), but at a name in a format literal's hole only a
 // definition of that name (not the Display call the hole's write makes).
-fn def_named_here(start: i64) -> i64 {
-    let d = def_named_at(start);
+fn def_named_here(start: i64, tcx: inout Tcx<Comp>) -> i64 {
+    let d = def_named_at(start, &tcx);
     if d < 0 || start < 0 || token_starting(start) >= 0 {
         return d;
     }
@@ -1722,9 +1697,9 @@ fn def_named_here(start: i64) -> i64 {
         end += 1;
     }
     var i = 0;
-    while i + 1 < ALL_REFS.count {
-        let at = ALL_REFS.get(i + 1);
-        if ALL_REFS.get(i) == start && SYMS[DEFS[at].name].text == SRC[start..end] {
+    while i + 1 < tcx.all_refs.count {
+        let at = tcx.all_refs.get(i + 1);
+        if tcx.all_refs.get(i) == start && SYMS[DEFS[at].name].text == SRC[start..end] {
             return at;
         }
         i += 3;
@@ -1732,12 +1707,12 @@ fn def_named_here(start: i64) -> i64 {
     -1
 }
 
-fn put_definition(out: i64, pos: i64) {
+fn put_definition(out: i64, pos: i64, tcx: inout Tcx<Comp>) {
     let start = name_start(pos);
-    let d = def_named_here(start);
+    let d = def_named_here(start, &tcx);
     // (0.25.2) at a C import: the header, the declaration in it
     let name_pos = if d >= 0 { DEFS[d].name_pos } else { -1 };
-    if put_c_definition(out, start, name_pos, d >= 0 && DEFS[d].kind == K_FN) {
+    if put_c_definition(out, start, name_pos, d >= 0 && DEFS[d].kind == K_FN, &tcx) {
         return;
     }
     // (0.25.3) at include_str("path") or include_bytes: the file
@@ -1749,48 +1724,48 @@ fn put_definition(out: i64, pos: i64) {
         return;
     }
     if d >= 0 {
-        if located(DEFS[d].name_pos) {
-            put_location(out, DEFS[d].name_pos);
+        if located(DEFS[d].name_pos, tcx) {
+            put_location(out, DEFS[d].name_pos, tcx);
         } else {
             buf_str(out, c"null");
         }
         return;
     }
-    let l = local_named_at(start);
-    if l >= 0 && located(l) {
-        put_location(out, l);
+    let l = local_named_at(start, &tcx);
+    if l >= 0 && located(l, tcx) {
+        put_location(out, l, tcx);
         return;
     }
     var item = 0;
     let tp = type_param_at(start, &item);
-    if tp >= 0 && located(tp) {
-        put_location(out, tp);
+    if tp >= 0 && located(tp, tcx) {
+        put_location(out, tp, tcx);
         return;
     }
-    let root = root_named_at(start);
-    if root > 0 && root_start(root, start) >= 0 {
-        put_location(out, root_start(root, start));
+    let root = root_named_at(start, &tcx);
+    if root > 0 && root_start(root, start, tcx) >= 0 {
+        put_location(out, root_start(root, start, tcx), tcx);
         return;
     }
     var decl = -1;
-    if assoc_at(start, &decl) != 0 && located(decl) {
-        put_location(out, decl);
+    if assoc_at(start, &decl, tcx) != 0 && located(decl, tcx) {
+        put_location(out, decl, tcx);
         return;
     }
-    if param_at(start) != 0 && located(start) {
-        put_location(out, start);
+    if param_at(start) != 0 && located(start, tcx) {
+        put_location(out, start, tcx);
         return;
     }
     buf_str(out, c"null");
 }
 
 // The positions of a local's declaration and uses, in order, into out.
-fn local_uses(decl: i64, out: inout IntVec) {
+fn local_uses(decl: i64, out: inout IntVec, tcx: Tcx<Comp>) {
     unsafe {
         out.push(decl);
         let dt = token_at(decl);
         for n in 1..NODES.len() as i64 {
-            if decl_of_use(n) != decl {
+            if decl_of_use(n, tcx) != decl {
                 continue;
             }
             let p = NODES[n].start;
@@ -1827,27 +1802,27 @@ fn sort_positions(v: inout IntVec) {
     }
 }
 
-fn put_references(out: i64, pos: i64, with_decl: bool) {
+fn put_references(out: i64, pos: i64, with_decl: bool, tcx: inout Tcx<Comp>) {
     unsafe {
         let start = name_start(pos);
-        let d = def_named_here(start);
+        let d = def_named_here(start, &tcx);
         var at = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var item = 0;
-        let l = if d >= 0 { -1 } else { local_named_at(start) };
+        let l = if d >= 0 { -1 } else { local_named_at(start, &tcx) };
         let tp = if d >= 0 || l >= 0 { -1 } else { type_param_at(start, &item) };
-        let root = if d >= 0 || l >= 0 || tp >= 0 { 0 } else { root_named_at(start) };
+        let root = if d >= 0 || l >= 0 || tp >= 0 { 0 } else { root_named_at(start, &tcx) };
         let t = token_starting(start);
         var adecl = -1;
         let none = d < 0 && l < 0 && tp < 0 && root == 0;
-        let assoc = if none { assoc_at(start, &adecl) } else { 0 };
+        let assoc = if none { assoc_at(start, &adecl, tcx) } else { 0 };
         let param = if none && assoc == 0 { param_at(start) } else { 0 };
         if d >= 0 {
             var i = 0;
-            while i < ALL_REFS.count {
-                let p = ALL_REFS.data[i];
-                let def = (ALL_REFS.data[i + 2] & QF_DEF) != 0;
-                if ALL_REFS.data[i + 1] == d && (with_decl || !def)
-                    && (if def { located(p) } else { shown(p) }) {
+            while i < tcx.all_refs.count {
+                let p = tcx.all_refs.data[i];
+                let def = (tcx.all_refs.data[i + 2] & QF_DEF) != 0;
+                if tcx.all_refs.data[i + 1] == d && (with_decl || !def)
+                    && (if def { located(p, tcx) } else { shown(p, tcx) }) {
                     at.push(p);
                 }
                 i += 3;
@@ -1855,9 +1830,9 @@ fn put_references(out: i64, pos: i64, with_decl: bool) {
             sort_positions(&at);
         } else if l >= 0 {
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            local_uses(l, &uses);
+            local_uses(l, &uses, tcx);
             for k in 0..uses.count {
-                if (with_decl || uses.data[k] != l) && located(uses.data[k]) {
+                if (with_decl || uses.data[k] != l) && located(uses.data[k], tcx) {
                     at.push(uses.data[k]);
                 }
             }
@@ -1866,14 +1841,14 @@ fn put_references(out: i64, pos: i64, with_decl: bool) {
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             same_name_in(t, NODES[item].start, NODES[item].end, &uses);
             for k in 0..uses.count {
-                if (with_decl || uses.data[k] != tp) && located(uses.data[k]) {
+                if (with_decl || uses.data[k] != tp) && located(uses.data[k], tcx) {
                     at.push(uses.data[k]);
                 }
             }
         } else if root > 0 {
-            root_uses(root, &at);
+            root_uses(root, &at, &tcx);
         } else if assoc != 0 {
-            assoc_uses(t, &at);
+            assoc_uses(t, &at, tcx);
         } else if param != 0 {
             if with_decl {
                 at.push(start);
@@ -1882,7 +1857,7 @@ fn put_references(out: i64, pos: i64, with_decl: bool) {
             // (a primitive type: its name in the shown files)
             for u in 0..TOK_COUNT {
                 if TOKS[u].kind == Tok::Ident && TOKS[u].value == TOKS[t].value
-                    && shown(TOKS[u].start) {
+                    && shown(TOKS[u].start, tcx) {
                     at.push(TOKS[u].start);
                 }
             }
@@ -1900,7 +1875,7 @@ fn put_references(out: i64, pos: i64, with_decl: bool) {
                 buf_byte(out, ',');
             }
             first = false;
-            put_location(out, at.data[k]);
+            put_location(out, at.data[k], tcx);
         }
         buf_byte(out, ']');
     }
@@ -1985,8 +1960,8 @@ fn put_cut(out: i64, s: [u8], max: i64) {
 }
 
 // Appends text with the root's directory dropped from the paths in it.
-fn put_relative(out: i64, text: [u8]) {
-    let root = cstr(ROOT_GIVEN);
+fn put_relative(out: i64, text: [u8], tcx: Tcx<Comp>) {
+    let root = cstr(tcx.root_given);
     var d = root.len as i64;
     while d > 0 && root[d - 1] != '/' {
         d -= 1;
@@ -2005,12 +1980,12 @@ fn put_relative(out: i64, text: [u8]) {
 
 // Appends text with each `<std>:LINE:COL` in it written as the place in
 // std's file (`std.vl:286:37`), when std's files are written.
-fn put_std_places(out: i64, text: [u8]) {
+fn put_std_places(out: i64, text: [u8], tcx: Tcx<Comp>) {
     unsafe {
         let tag = "<std>:";
         var i = 0;
         while i < text.len as i64 {
-            if STD_F >= 0 && i + tag.len as i64 < text.len as i64
+            if tcx.std_f >= 0 && i + tag.len as i64 < text.len as i64
                 && text[i..i + tag.len as i64] == tag {
                 var j = i + tag.len as i64;
                 var line = 0;
@@ -2018,13 +1993,14 @@ fn put_std_places(out: i64, text: [u8]) {
                     line = line * 10 + (text[j] - '0') as i64;
                     j += 1;
                 }
-                let first = FIRST_LINE.data[STD_F];
-                if line > 0 && first + line - 1 < FIRST_LINE.data[STD_F + 1] {
-                    let k = seg_at(LS.data[first + line - 1]);
+                let first = tcx.first_line.data[tcx.std_f];
+                if line > 0 && first + line - 1 < tcx.first_line.data[tcx.std_f + 1] {
+                    let k = seg_at(tcx.answer_ls.data[first + line - 1], tcx);
                     if k >= 0 {
-                        buf_bytes(out, segment_name(k));
+                        buf_bytes(out, segment_name(k, tcx));
                         buf_fmt(out,
-                            format_args(":{}", first + line - 1 - line_index(segment_from(k)) + 1));
+                            format_args(":{}",
+                                first + line - 1 - line_index(segment_from(k, tcx), tcx) + 1));
                         i = j;
                         continue;
                     }
@@ -2038,7 +2014,7 @@ fn put_std_places(out: i64, text: [u8]) {
 
 // The reasons of f's effects, one line each (the first step of `query
 // effects --why`), at most WHY_MAX.
-fn put_why_lines(md: i64, f: i64) {
+fn put_why_lines(md: i64, f: i64, tcx: Tcx<Comp>) {
     unsafe {
         let e = fn_effects(f);
         var bits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -2065,8 +2041,8 @@ fn put_why_lines(md: i64, f: i64) {
             let step = buf_new();
             step_text(step, f, bits.data[k], allocs.data[k], true);
             let places = buf_new();
-            put_std_places(places, buf_slice(step));
-            put_relative(line, buf_slice(places));
+            put_std_places(places, buf_slice(step), tcx);
+            put_relative(line, buf_slice(places), tcx);
             buf_str(md, c"- ");
             put_cut(md, buf_slice(line), WHY_LINE_MAX);
             buf_byte(md, '\n');
@@ -2082,16 +2058,16 @@ fn put_why_lines(md: i64, f: i64) {
 // The hover of definition d: its signature, a function's effects (declared
 // or inferred, with their reasons) and features, its path. At a call of a
 // generic function (inst: the instance called, else -1), the instance's.
-pub fn hover_def(md: i64, d: i64, inst: i64) {
+pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
     unsafe {
         buf_str(md, c"```vole\n");
-        put_signature(md, d);
+        put_signature(md, d, tcx);
         buf_byte(md, '\n');
         let f = fn_of(d);
         var why = -1;
         if f >= 0 {
             let eff = buf_new();
-            def_effects_text(eff, d);
+            def_effects_text(eff, d, tcx);
             if buf_slice(eff).len > 0 {
                 buf_str(md, c"effects: ");
                 buf_bytes(md, buf_slice(eff));
@@ -2106,7 +2082,7 @@ pub fn hover_def(md: i64, d: i64, inst: i64) {
             } else if FNS[f].generic != 0 {
                 // (a generic function: its instances' sets)
                 let lines = buf_new();
-                def_effect_lines(lines, d);
+                def_effect_lines(lines, d, tcx);
                 let t = buf_slice(lines);
                 var n = 0;
                 var i = 0;
@@ -2120,7 +2096,7 @@ pub fn hover_def(md: i64, d: i64, inst: i64) {
                     while tab < j && t[tab] != '\t' {
                         tab += 1;
                     }
-                    put_std_places(md, t[i..tab]);
+                    put_std_places(md, t[i..tab], tcx);
                     if tab < j {
                         buf_str(md, c": ");
                         buf_bytes(md, t[tab + 1..j]);
@@ -2134,7 +2110,7 @@ pub fn hover_def(md: i64, d: i64, inst: i64) {
                 }
             }
             let feat = buf_new();
-            if put_def_features(feat, d, c"\n") {
+            if put_def_features(feat, d, c"\n", tcx) {
                 buf_bytes(md, buf_slice(feat)[1..buf_slice(feat).len]);
                 buf_byte(md, '\n');
             } else {
@@ -2146,11 +2122,11 @@ pub fn hover_def(md: i64, d: i64, inst: i64) {
         // effects have no reasons in the program)
         let o = c_origin_at(DEFS[d].name_pos);
         if o >= 0 {
-            put_c_decl(md, o);
+            put_c_decl(md, o, &tcx);
         }
         if why >= 0 && o < 0
             && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
-            put_why_lines(md, why);
+            put_why_lines(md, why, tcx);
         }
         if o < 0 {
             // (an import's comment is volec's, not the header's)
@@ -2267,23 +2243,23 @@ fn hover_type_param(md: i64, decl: i64, item: i64) {
 
 // The hover of a local or an expression: its type (one per instance of a
 // generic function).
-fn hover_type(md: i64, pos: i64, start: i64) -> bool {
+fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var at = pos;
-        let l = local_named_at(start);
+        let l = local_named_at(start, &tcx);
         if l >= 0 && l == start {
             // (a declaration: the type of its first use)
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            local_uses(l, &uses);
+            local_uses(l, &uses, tcx);
             if uses.count > 1 {
                 at = uses.data[1];
             }
         }
-        if TYPED == 0 as *TypedIndex {
-            TYPED = alloc_array::<TypedIndex>(1);
-            TYPED[0] = typed_index();
+        if tcx.typed == 0 as *TypedIndex {
+            tcx.typed = alloc_array::<TypedIndex>(1);
+            tcx.typed[0] = typed_index();
         }
-        var found = typed_nodes_in(*TYPED, 1, at, 0);
+        var found = typed_nodes_in(*tcx.typed, 1, at, 0);
         if l >= 0 {
             // (0.25: a local named there, not what the checker made at it,
             // a drop at its `let`, when it is one)
@@ -2300,7 +2276,7 @@ fn hover_type(md: i64, pos: i64, start: i64) -> bool {
                 found = named;
             }
         }
-        let widened = &TYPED[0].widened;
+        let widened = &tcx.typed[0].widened;
         if found.count == 0 {
             return false;
         }
@@ -2348,7 +2324,7 @@ fn hover_type(md: i64, pos: i64, start: i64) -> bool {
 // attribute, a keyword, a definition (an operator's function), a type
 // parameter, `std` or `crate`, a primitive type, a local's or an
 // expression's type (`self` and `result` explained after theirs).
-fn hover_at(md: i64, pos: i64, start: i64) -> bool {
+fn hover_at(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         if start < 0 {
             return false;
@@ -2383,19 +2359,19 @@ fn hover_at(md: i64, pos: i64, start: i64) -> bool {
             buf_str(md, c"` (the header this import reads)\n");
             return true;
         }
-        let d = def_named_at(start);
+        let d = def_named_at(start, &tcx);
         if d >= 0 {
-            hover_def(md, d, call_at(start));
+            hover_def(md, d, call_at(start), &tcx);
             return true;
         }
-        if kind == Tok::Ident as i64 && local_named_at(start) < 0 {
+        if kind == Tok::Ident as i64 && local_named_at(start, &tcx) < 0 {
             var item = 0;
             let tp = type_param_at(start, &item);
             if tp >= 0 {
                 hover_type_param(md, tp, item);
                 return true;
             }
-            let root = root_named_at(start);
+            let root = root_named_at(start, &tcx);
             if root == 1 {
                 hover_word(md, "mod std",
                     "The standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)");
@@ -2412,7 +2388,7 @@ fn hover_at(md: i64, pos: i64, start: i64) -> bool {
                 return true;
             }
             var adecl = -1;
-            let an = assoc_at(start, &adecl);
+            let an = assoc_at(start, &adecl, tcx);
             if an != 0 {
                 buf_str(md, c"```vole\n");
                 let s = NODES[an].start;
@@ -2466,7 +2442,7 @@ fn hover_at(md: i64, pos: i64, start: i64) -> bool {
             // (an f-string's text: no name)
             return false;
         }
-        let typed = hover_type(md, pos, start);
+        let typed = hover_type(md, pos, start, &tcx);
         if kind == Tok::Ident as i64 && (text == "self" || text == "Self" || text == "result") {
             if !typed {
                 buf_str(md, c"```vole\n");
@@ -2510,10 +2486,10 @@ fn hole_word(start: i64, pos: i64) -> i64 {
     if k <= start || SRC[k] != '{' || SRC[k - 1] == '{' { -1 } else { a }
 }
 
-fn put_hover(out: i64, pos: i64) {
+fn put_hover(out: i64, pos: i64, tcx: inout Tcx<Comp>) {
     let start = token_start(pos);
     let md = buf_new();
-    if !hover_at(md, pos, start) {
+    if !hover_at(md, pos, start, &tcx) {
         buf_str(out, c"null");
         return;
     }
@@ -2527,10 +2503,10 @@ fn put_hover(out: i64, pos: i64) {
             end += 1;
         }
         buf_str(out, c",\"range\":");
-        put_range(out, word, end);
+        put_range(out, word, end, tcx);
     } else if start >= 0 {
         buf_str(out, c",\"range\":");
-        put_range(out, start, token_end(start));
+        put_range(out, start, token_end(start), tcx);
     }
     buf_byte(out, '}');
 }
@@ -2545,7 +2521,7 @@ fn symbol_kind(k: i64) -> i64 {
     else if k == K_STATIC { 13 } else if k == K_ALIAS { 26 } else { 2 }
 }
 
-fn put_symbol(out: i64, d: i64, children: IntVec) {
+fn put_symbol(out: i64, d: i64, children: IntVec, tcx: Tcx<Comp>) {
     unsafe {
         buf_str(out, c"{\"name\":");
         let name = buf_new();
@@ -2559,16 +2535,16 @@ fn put_symbol(out: i64, d: i64, children: IntVec) {
         buf_json_str(out, buf_slice(name));
         buf_str(out, c",\"detail\":");
         let sig = buf_new();
-        put_signature(sig, d);
+        put_signature(sig, d, tcx);
         let s = buf_slice(sig);
         buf_json_str(out, s[0..if s.len > 200 { 200 } else { s.len as i64 }]);
         buf_fmt(out, format_args(",\"kind\":{},\"range\":", symbol_kind(k)));
         let from = if DEFS[d].start < DEFS[d].name_pos { DEFS[d].start } else { DEFS[d].name_pos };
         let to = if DEFS[d].end > DEFS[d].name_pos { DEFS[d].end }
             else { token_end(DEFS[d].name_pos) };
-        put_range(out, from, to);
+        put_range(out, from, to, tcx);
         buf_str(out, c",\"selectionRange\":");
-        put_range(out, DEFS[d].name_pos, token_end(DEFS[d].name_pos));
+        put_range(out, DEFS[d].name_pos, token_end(DEFS[d].name_pos), tcx);
         if children.count > 0 {
             buf_str(out, c",\"children\":[");
             let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -2576,7 +2552,7 @@ fn put_symbol(out: i64, d: i64, children: IntVec) {
                 if i > 0 {
                     buf_byte(out, ',');
                 }
-                put_symbol(out, children.data[i], none);
+                put_symbol(out, children.data[i], none, tcx);
             }
             buf_byte(out, ']');
         }
@@ -2586,7 +2562,7 @@ fn put_symbol(out: i64, d: i64, children: IntVec) {
 
 // The symbols of the definitions named in from..to (a file, or a file of
 // std's text).
-fn put_symbols(out: i64, from: i64, to: i64) {
+fn put_symbols(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
     unsafe {
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for d in 0..DEFS.len() as i64 {
@@ -2595,7 +2571,7 @@ fn put_symbols(out: i64, from: i64, to: i64) {
                 all.push(d);
             }
         }
-        sort_by_position(all);
+        sort_by_position(all, tcx);
         buf_byte(out, '[');
         var first = true;
         for i in 0..all.count {
@@ -2614,7 +2590,7 @@ fn put_symbols(out: i64, from: i64, to: i64) {
                 buf_byte(out, ',');
             }
             first = false;
-            put_symbol(out, d, children);
+            put_symbol(out, d, children, tcx);
         }
         buf_byte(out, ']');
     }
@@ -2662,7 +2638,7 @@ fn contains_ci(name: [u8], query: [u8]) -> bool {
 // program's first (its letters in order), then std's (holding it; not
 // for an empty query), WS_MAX at most:
 // `[{"name":..,"kind":..,"location":..,"containerName":..}]`.
-fn put_workspace_symbols(out: i64, query: [u8]) {
+fn put_workspace_symbols(out: i64, query: [u8], tcx: Tcx<Comp>) {
     buf_byte(out, '[');
     var n = 0;
     for pass in 0..2 {
@@ -2675,7 +2651,7 @@ fn put_workspace_symbols(out: i64, query: [u8]) {
             }
             let p = DEFS[d].name_pos;
             let mine = in_file(p);
-            if (pass == 0) != mine || pass == 1 && seg_at(p) < 0
+            if (pass == 0) != mine || pass == 1 && seg_at(p, tcx) < 0
                 || !(if mine { fuzzy_match(query, SYMS[DEFS[d].name].text) }
                     else { contains_ci(SYMS[DEFS[d].name].text, query) }) {
                 continue;
@@ -2687,7 +2663,7 @@ fn put_workspace_symbols(out: i64, query: [u8]) {
             buf_str(out, c"{\"name\":");
             buf_json_str(out, SYMS[DEFS[d].name].text);
             buf_fmt(out, format_args(",\"kind\":{},\"location\":", symbol_kind(DEFS[d].kind)));
-            put_location(out, p);
+            put_location(out, p, tcx);
             let fqn = SYMS[DEFS[d].fqn].text;
             var e = fqn.len as i64;
             while e > 1 && !(fqn[e - 1] == ':' && fqn[e - 2] == ':') {
@@ -2709,7 +2685,7 @@ fn put_workspace_symbols(out: i64, query: [u8]) {
 // `{"range":..,"severity":..,"code":..,"source":"volec","message":..,
 // "relatedInformation":[the try: lines]}`, into out; false when it has
 // no position in a file.
-fn put_diagnostic(out: i64, pos: i64, text: [u8]) -> bool {
+fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>) -> bool {
     unsafe {
         if !in_file(pos) {
             return false;
@@ -2758,7 +2734,7 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8]) -> bool {
             }
         }
         buf_str(out, c"{\"range\":");
-        put_range(out, pos, token_end(pos));
+        put_range(out, pos, token_end(pos), tcx);
         buf_fmt(out,
             format_args(",\"severity\":{},\"code\":",
                 if severity == "warning" { 2 } else if severity == "note" { 3 } else { 1 }));
@@ -2773,7 +2749,7 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8]) -> bool {
                     buf_byte(out, ',');
                 }
                 buf_str(out, c"{\"location\":");
-                put_location(out, pos);
+                put_location(out, pos, tcx);
                 buf_str(out, c",\"message\":");
                 buf_json_str(out, s[tries.data[t]..tries.data[t + 1]]);
                 buf_byte(out, '}');
@@ -2788,7 +2764,7 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8]) -> bool {
 
 // publishDiagnostics for every file with an error or a warning, then the
 // end frame.
-fn publish_diagnostics() {
+fn publish_diagnostics(tcx: Tcx<Comp>) {
     unsafe {
         DIAG_SHORT = true;
         var errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -2816,7 +2792,7 @@ fn publish_diagnostics() {
                 let pos = recs.data[r];
                 if pos >= FILES[f].start && pos <= FILES[f].end && file_of_pos(pos) == f {
                     let one = buf_new();
-                    if put_diagnostic(one, pos, buf_slice(recs.data[r + 1])) {
+                    if put_diagnostic(one, pos, buf_slice(recs.data[r + 1]), tcx) {
                         if n > 0 {
                             buf_byte(items, ',');
                         }
@@ -2835,8 +2811,8 @@ fn publish_diagnostics() {
             buf_str(msg, c"\",\"diagnostics\":[");
             buf_bytes(msg, buf_slice(items));
             buf_str(msg, c"]}}");
-            send('n', buf_slice(msg));
+            send('n', buf_slice(msg), tcx);
         }
-        send('e', "");
+        send('e', "", tcx);
     }
 }

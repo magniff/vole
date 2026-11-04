@@ -9,20 +9,19 @@
 // FILE:LINE:COL, and a cached `FN::local` is asked again (ask_in_full).
 
 use crate::base::{IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd};
+use crate::base::comp::Comp;
 use crate::front::ast::NODES;
 use crate::front::modules::{file_of_pos, module_at};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::query::trailing_number;
-use crate::tools::query::cache::RESTORED;
 use crate::tools::query::callees::changed_places;
 use crate::tools::query::defs::{
     DEFS, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN, find_defs, mod_fqn,
 };
 use crate::tools::query::diagnostics::diag;
 use crate::tools::query::positions::{enclosing, line_of, line_start, token_at};
-use crate::tools::query::refs::{
-    OPT_COUNT, OPT_KIND, file_text, kind_listed, put_line, put_short, ref_in,
-};
+use crate::tools::query::refs::{file_text, kind_listed, put_line, put_short, ref_in};
 use crate::tools::refactor_mod::local::{
     ident_at_column, load_decls, local_at, locals_named, use_decl,
 };
@@ -32,10 +31,6 @@ extern "C" {
     fn setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
     fn execvp(file: *u8, args: **u8) -> i32;
 }
-
-// Whether a query is being run (run_query), for ask_in_full: its command
-// line is roots::command_words.
-pub static var QUERY_RUNNING: bool = false;
 
 // Whether text ends in `:LINE:COL` (a FILE:LINE:COL).
 pub fn has_column(text: [u8]) -> bool {
@@ -58,20 +53,20 @@ pub fn full_requested() -> bool {
 
 // Runs this command again, reading the program in full (never returns
 // when it can run).
-fn ask_in_full() {
+fn ask_in_full(tcx: Tcx<Comp>) {
     unsafe {
-        if !QUERY_RUNNING || full_requested() {
+        if !tcx.query_running || full_requested() {
             return;
         }
         setenv(c"VOLE_QUERY_FULL", c"1", 1);
-        let words = crate::tools::query::roots::command_words();
+        let words = crate::tools::query::roots::command_words(tcx);
         execvp(words.get(0) as *u8, crate::tools::proc::exec_words(words));
     }
 }
 
 // Whether `FN::x` could name a local: no definition has that path, and
 // its first segments name a function.
-fn may_be_local(name: [u8]) -> bool {
+fn may_be_local(name: [u8], tcx: Tcx<Comp>) -> bool {
     unsafe {
         var i = name.len as i64;
         while i >= 2 && !(name[i - 1] == ':' && name[i - 2] == ':') {
@@ -81,12 +76,12 @@ fn may_be_local(name: [u8]) -> bool {
             return false;
         }
         var whole = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_defs(name, false, &whole);
+        find_defs(name, false, &whole, tcx);
         if whole.count > 0 {
             return false;
         }
         var fns = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_defs(name[0..i - 2], false, &fns);
+        find_defs(name[0..i - 2], false, &fns, tcx);
         for k in 0..fns.count {
             let kind = DEFS[fns.data[k]].kind;
             if kind == K_FN || kind == K_METHOD || kind == K_IMPL_METHOD || kind == K_TRAIT_FN {
@@ -99,11 +94,11 @@ fn may_be_local(name: [u8]) -> bool {
 
 // `query refs NAME` when NAME is a local: the status; -1 when it is not
 // one (refs goes on with the definitions).
-pub fn local_refs(name: [u8]) -> i64 {
+pub fn local_refs(name: [u8], tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        if RESTORED {
-            if may_be_local(name) {
-                ask_in_full();
+        if tcx.restored {
+            if may_be_local(name, tcx) {
+                ask_in_full(tcx);
             }
             return -1;
         }
@@ -116,7 +111,7 @@ pub fn local_refs(name: [u8]) -> i64 {
                 return -1;
             }
             decls.push(d);
-        } else if !locals_named(name, &decls) || decls.count == 0 {
+        } else if !locals_named(name, &decls, tcx) || decls.count == 0 {
             return -1;
         }
         var written = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -174,7 +169,7 @@ pub fn local_refs(name: [u8]) -> i64 {
         for i in 0..pos.count {
             let k = if kind.data[i] == 0 { c"def" } else if kind.data[i] == 1 { c"read" }
                 else { c"write" };
-            if OPT_KIND != 0 as *u8 && !kind_listed(k, OPT_KIND) {
+            if tcx.opt_kind != 0 as *u8 && !kind_listed(k, tcx.opt_kind) {
                 continue;
             }
             if !ref_in(pos.data[i]) {
@@ -183,14 +178,14 @@ pub fn local_refs(name: [u8]) -> i64 {
             sel.push(i);
         }
         let out = buf_new();
-        if OPT_COUNT {
+        if tcx.opt_count {
             buf_int(out, sel.count);
             buf_byte(out, '\n');
             buf_write_fd(out, STDOUT);
             return 0;
         }
         if sel.count == 0 {
-            let d = diag(c"note", c"query.empty");
+            let d = diag(c"note", c"query.empty", &tcx);
             buf_str(d, c"0 refs\n");
             return 0;
         }
@@ -213,8 +208,8 @@ pub fn local_refs(name: [u8]) -> i64 {
                 else { c"write" });
             if kind.data[i] != 0 {
                 buf_byte(out, '\t');
-                let e = enclosing(p);
-                put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(p)) });
+                let e = enclosing(p, tcx);
+                put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(p), &tcx) });
             }
             buf_byte(out, '\t');
             put_line(out, p);

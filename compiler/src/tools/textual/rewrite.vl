@@ -16,9 +16,11 @@
 use crate::base::{
     FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_opt, option, table};
-use crate::tools::edit::{DRY_RUN, TARGET, gone_path};
-use crate::tools::edit::apply::{STEP_REPORT, cannot_write, copy_path, error_lines, not_generated};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::gone_path;
+use crate::tools::edit::apply::{cannot_write, copy_path, error_lines, not_generated};
 use crate::tools::edit::diff::diff_texts;
 use crate::tools::proc::{
     buf_cstr, read_file_if, remove_file, run_capture, same_bytes, write_file_if,
@@ -30,17 +32,16 @@ use crate::tools::query::diagnostics::{
 };
 use crate::tools::query::grep::{G_CODE, G_COMMENT, G_STRING};
 use crate::tools::textual::{
-    MIXED_CASE, M_FROM, M_TO, T_CASE, T_PLACES, T_REGEX, T_WORD, W_AFTER, W_BEFORE, W_PATH,
     add_exclusion, excluded, find_matches, flush, glob_match, is_text, kept_ranges, put_file_line,
     put_replacement, read_exclusions, tracked_files, write_edit,
 };
 use crate::tools::textual::places::{match_in, read_lines, read_places};
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"rewrite.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"rewrite.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = diags();
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
     buf_str(out, c" rewrite --text vole vole --word --case --files '*.md' --dry-run");
@@ -52,21 +53,21 @@ fn usage(message: *u8) -> i64 {
 // the number of matches replaced, the new text in `after`; `left` counts
 // the matches not taken (kept lines, other places); `kept` the lines kept.
 pub fn rewrite_text(p: [u8], t: [u8], old: [u8], new: [u8], after: inout i64, left: inout i64,
-    kept: inout i64) -> i64 {
+    kept: inout i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_matches(t, 0, t.len as i64, old, &starts, &ends);
+        find_matches(t, 0, t.len as i64, old, &starts, &ends, tcx);
         if starts.count == 0 {
             return 0;
         }
         var keep = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        kept = kept_ranges(p, t, &keep);
+        kept = kept_ranges(p, t, &keep, tcx);
         let source = crate::base::source_ext_len(p) > 0;
-        var placed = T_PLACES != 0 && source && read_places(t);
-        if T_PLACES != 0 && source && !placed {
+        var placed = tcx.t_places != 0 && source && read_places(t, &tcx);
+        if tcx.t_places != 0 && source && !placed {
             // (it does not lex: its `//` lines are its comments)
-            read_lines(t);
+            read_lines(t, &tcx);
             placed = true;
         }
         let out = buf_new();
@@ -80,13 +81,13 @@ pub fn rewrite_text(p: [u8], t: [u8], old: [u8], new: [u8], after: inout i64, le
                 r += 2;
             }
             let in_kept = r < keep.count && keep.data[r] < e;
-            let in_place = T_PLACES == 0 || (placed && match_in(s, e, T_PLACES));
+            let in_place = tcx.t_places == 0 || (placed && match_in(s, e, tcx.t_places, tcx));
             if in_kept || !in_place {
                 left += 1;
                 continue;
             }
             buf_bytes(out, t[at..s]);
-            put_replacement(out, new, t[s..e]);
+            put_replacement(out, new, t[s..e], &tcx);
             at = e;
             n += 1;
         }
@@ -98,11 +99,11 @@ pub fn rewrite_text(p: [u8], t: [u8], old: [u8], new: [u8], after: inout i64, le
 
 // The path p with OLD replaced (--move-paths), or an empty slice when it
 // has none.
-fn moved_path(p: [u8], old: [u8], new: [u8]) -> [u8] {
+fn moved_path(p: [u8], old: [u8], new: [u8], tcx: inout Tcx<Comp>) -> [u8] {
     unsafe {
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_matches(p, 0, p.len as i64, old, &starts, &ends);
+        find_matches(p, 0, p.len as i64, old, &starts, &ends, tcx);
         if starts.count == 0 {
             return p[0..0];
         }
@@ -110,7 +111,7 @@ fn moved_path(p: [u8], old: [u8], new: [u8]) -> [u8] {
         var at = 0;
         for k in 0..starts.count {
             buf_bytes(out, p[at..starts.data[k]]);
-            put_replacement(out, new, p[starts.data[k]..ends.data[k]]);
+            put_replacement(out, new, p[starts.data[k]..ends.data[k]], &tcx);
             at = ends.data[k];
         }
         buf_bytes(out, p[at..]);
@@ -121,22 +122,22 @@ fn moved_path(p: [u8], old: [u8], new: [u8]) -> [u8] {
 // `PROG check --diagnostics=short [--overlay FILE COPY]... ROOT`, the
 // edit's texts read in place of the files when `edited`: its output into
 // out; its status.
-pub fn check_root(root: *u8, edited: bool, out: i64) -> i64 {
+pub fn check_root(root: *u8, edited: bool, out: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         args.push(PROG as i64);
         args.push(c"check" as i64);
         args.push(c"--diagnostics=short" as i64);
         if edited {
-            for k in 0..W_PATH.count {
-                let p = W_PATH.data[k] as *u8;
-                overlay(&args, p, copy_path(original_path(p)));
+            for k in 0..tcx.w_path.count {
+                let p = tcx.w_path.data[k] as *u8;
+                overlay(&args, p, copy_path(original_path(p, tcx)));
             }
-            for k in 0..M_FROM.count {
-                let a = M_FROM.data[k] as *u8;
+            for k in 0..tcx.m_from.count {
+                let a = tcx.m_from.data[k] as *u8;
                 overlay(&args, a, gone_path(a));
-                if !changed(M_TO.data[k] as *u8) {
-                    overlay(&args, M_TO.data[k] as *u8, a);
+                if !changed(tcx.m_to.data[k] as *u8, tcx) {
+                    overlay(&args, tcx.m_to.data[k] as *u8, a);
                 }
             }
         }
@@ -165,21 +166,21 @@ fn overlay(args: inout IntVec, p: *u8, copy: *u8) {
 }
 
 // The path file p (as it is after the moves) has now.
-fn original_path(p: *u8) -> *u8 {
+fn original_path(p: *u8, tcx: Tcx<Comp>) -> *u8 {
     unsafe {
-        for k in 0..M_TO.count {
-            if streq(M_TO.data[k] as *u8, p) {
-                return M_FROM.data[k] as *u8;
+        for k in 0..tcx.m_to.count {
+            if streq(tcx.m_to.data[k] as *u8, p) {
+                return tcx.m_from.data[k] as *u8;
             }
         }
         p
     }
 }
 
-fn changed(p: *u8) -> bool {
+fn changed(p: *u8, tcx: Tcx<Comp>) -> bool {
     unsafe {
-        for k in 0..W_PATH.count {
-            if streq(W_PATH.data[k] as *u8, p) {
+        for k in 0..tcx.w_path.count {
+            if streq(tcx.w_path.data[k] as *u8, p) {
                 return true;
             }
         }
@@ -189,19 +190,19 @@ fn changed(p: *u8) -> bool {
 
 // The --check of each root: the new errors' lines into `added`; false when
 // a check could not run.
-pub fn check_roots(roots: IntVec, added: inout IntVec) -> bool {
+pub fn check_roots(roots: IntVec, added: inout IntVec, tcx: Tcx<Comp>) -> bool {
     unsafe {
-        for k in 0..W_PATH.count {
-            let orig = original_path(W_PATH.data[k] as *u8);
-            write_file_if(copy_path(orig), buf_slice(W_AFTER.data[k]));
+        for k in 0..tcx.w_path.count {
+            let orig = original_path(tcx.w_path.data[k] as *u8, tcx);
+            write_file_if(copy_path(orig), buf_slice(tcx.w_after.data[k]));
         }
         var ran = true;
         for r in 0..roots.count {
             let root = roots.data[r] as *u8;
             let before = buf_new();
             let after = buf_new();
-            let s1 = check_root(root, false, before);
-            let s2 = check_root(root, true, after);
+            let s1 = check_root(root, false, before, tcx);
+            let s2 = check_root(root, true, after, tcx);
             if (s1 != 0 && s1 != 1) || (s2 != 0 && s2 != 1) {
                 ran = false;
                 continue;
@@ -232,8 +233,8 @@ pub fn check_roots(roots: IntVec, added: inout IntVec) -> bool {
                 i += 2;
             }
         }
-        for k in 0..W_PATH.count {
-            remove_file(copy_path(original_path(W_PATH.data[k] as *u8)));
+        for k in 0..tcx.w_path.count {
+            remove_file(copy_path(original_path(tcx.w_path.data[k] as *u8, tcx)));
         }
         ran
     }
@@ -242,25 +243,25 @@ pub fn check_roots(roots: IntVec, added: inout IntVec) -> bool {
 // (0.25.5) A step of `refactor --script` (script.vl): the rewritten texts
 // written as the files' copies, unchecked, and listed in the step's report
 // (`file PATH`); then the lines and the totals. The exit status.
-fn step_write(out: i64) -> i64 {
-    for k in 0..W_PATH.count {
-        if !not_generated(c_slice(w_path(k)), buf_slice(W_BEFORE.get(k))) {
+fn step_write(out: i64, tcx: inout Tcx<Comp>) -> i64 {
+    for k in 0..tcx.w_path.count {
+        if !not_generated(c_slice(w_path(k, tcx)), buf_slice(tcx.w_before.get(k)), &tcx) {
             return 1;
         }
     }
     let report = buf_new();
-    for k in 0..W_PATH.count {
-        let p = w_path(k);
-        if !write_file_if(copy_path(p), buf_slice(W_AFTER.get(k))) {
-            cannot_write(p);
+    for k in 0..tcx.w_path.count {
+        let p = w_path(k, tcx);
+        if !write_file_if(copy_path(p), buf_slice(tcx.w_after.get(k))) {
+            cannot_write(p, &tcx);
             return 1;
         }
         buf_str(report, c"file\t");
         buf_str(report, p);
         buf_byte(report, '\n');
     }
-    if !write_file_if(STEP_REPORT, buf_slice(report)) {
-        cannot_write(STEP_REPORT);
+    if !write_file_if(tcx.step_report, buf_slice(report)) {
+        cannot_write(tcx.step_report, &tcx);
         return 1;
     }
     flush(out);
@@ -268,15 +269,15 @@ fn step_write(out: i64) -> i64 {
 }
 
 // The path of rewritten file k (W_PATH keeps C strings as integers).
-fn w_path(k: i64) -> *u8 {
+fn w_path(k: i64, tcx: Tcx<Comp>) -> *u8 {
     // UNSAFE: W_PATH keeps C strings as integers; one made a pointer again is a cast.
     // SAFETY: each entry is a path the rewrite made (FILES' or buf_cstr's), never freed; k < W_PATH.count.
-    unsafe { W_PATH.get(k) as *u8 }
+    unsafe { tcx.w_path.get(k) as *u8 }
 }
 
-pub fn run_text_rewrite(c: Call<Gpa>) -> i64 {
-    let status = run_inner(c);
-    write_diags();
+pub fn run_text_rewrite(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -305,7 +306,7 @@ pub fn text_rewrite_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "words")
 }
 
-fn run_inner(c: Call<Gpa>) -> i64 {
+fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
     var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var globs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -318,23 +319,23 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         let a = ev.value;
         if is_flag(ev, "text") {
         } else if is_flag(ev, "word") {
-            T_WORD = true;
+            tcx.t_word = true;
         } else if is_flag(ev, "case") {
-            T_CASE = true;
+            tcx.t_case = true;
         } else if is_flag(ev, "regex") {
-            T_REGEX = true;
+            tcx.t_regex = true;
         } else if is_flag(ev, "comments") {
-            T_PLACES |= G_COMMENT;
+            tcx.t_places |= G_COMMENT;
         } else if is_flag(ev, "strings") {
-            T_PLACES |= G_STRING;
+            tcx.t_places |= G_STRING;
         } else if is_flag(ev, "code") {
-            T_PLACES |= G_CODE;
+            tcx.t_places |= G_CODE;
         } else if is_flag(ev, "move-paths") {
             move_paths = true;
         } else if is_flag(ev, "no-sources") {
             no_sources = true;
         } else if is_flag(ev, "dry-run") {
-            DRY_RUN = true;
+            tcx.dry_run = true;
         } else if is_flag(ev, "diff") {
             show_diff = true;
         } else if is_opt(ev, "files") {
@@ -342,20 +343,20 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         } else if is_opt(ev, "check") {
             roots.push(a as i64);
         } else if is_opt(ev, "exclude") {
-            if !add_exclusion(c_slice(a)) {
+            if !add_exclusion(c_slice(a), &tcx) {
                 return 2;
             }
         } else if is_opt(ev, "exclude-from") {
-            if !read_exclusions(a) {
+            if !read_exclusions(a, &tcx) {
                 return 2;
             }
         } else if is_flag(ev, "force") {
-            crate::tools::edit::FORCE = true;
+            tcx.force = true;
         } else if is_opt(ev, "root") {
             step_root = a;
         } else if is_opt(ev, "target") {
         } else if ev.kind != EV_WORD || ev.text.starts_with("--") {
-            let d = diag(c"error", c"rewrite.usage");
+            let d = diag(c"error", c"rewrite.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, a);
             buf_str(d,
@@ -367,36 +368,36 @@ fn run_inner(c: Call<Gpa>) -> i64 {
     }
     unsafe {
         if words.count != 2 {
-            return usage(c"--text takes OLD and NEW");
+            return usage(c"--text takes OLD and NEW", &tcx);
         }
         let old = c_slice(words.data[0] as *u8);
         let new = c_slice(words.data[1] as *u8);
         if old.len == 0 {
-            return usage(c"OLD is empty");
+            return usage(c"OLD is empty", &tcx);
         }
-        if T_REGEX && T_CASE {
-            return usage(c"--case is for a literal OLD, not with --regex");
+        if tcx.t_regex && tcx.t_case {
+            return usage(c"--case is for a literal OLD, not with --regex", &tcx);
         }
-        if T_REGEX && !crate::tools::rewrite::regex::re_valid(old) {
-            return usage(c"OLD is no regular expression (^ $ . * + ? [a-z] \\d \\w)");
+        if tcx.t_regex && !crate::tools::rewrite::regex::re_valid(old) {
+            return usage(c"OLD is no regular expression (^ $ . * + ? [a-z] \\d \\w)", &tcx);
         }
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         // (0.25.5, feedbacks/mod254.md #3) A step of `refactor --script`:
         // the program's files, as the steps before left them (their copies,
         // read in place of the files), rewritten as copies too, checked
         // with the others at the script's end
-        let step = STEP_REPORT != 0 as *u8;
+        let step = tcx.step_report != 0 as *u8;
         var file_index = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if step_root != 0 as *u8 && !step {
             return usage(
-                c"--root is for a step of refactor --script; --text rewrites the files git tracks");
+                c"--root is for a step of refactor --script; --text rewrites the files git tracks", &tcx);
         }
         if step && (move_paths || roots.count > 0) {
-            return usage(c"in a refactor --script, --text rewrites the program's files: no --move-paths, no --check (the script checks)");
+            return usage(c"in a refactor --script, --text rewrites the program's files: no --move-paths, no --check (the script checks)", &tcx);
         }
         if step {
-            if step_root == 0 as *u8 || !load_program(step_root, TARGET) {
-                program_errors(c"error", step_root, true);
+            if step_root == 0 as *u8 || !load_program(step_root, tcx.target, &tcx) {
+                program_errors(c"error", step_root, true, &tcx);
                 return 1;
             }
             for g in 0..FILES.len() as i64 {
@@ -406,7 +407,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                 }
             }
         } else if !tracked_files(&files) {
-            let d = diag(c"error", c"rewrite.no-git");
+            let d = diag(c"error", c"rewrite.no-git", &tcx);
             buf_str(d, c"--text edits the files git tracks: this is no git checkout\n");
             return 2;
         }
@@ -435,7 +436,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                 }
             }
             let source = crate::base::source_ext_len(p) > 0;
-            if (T_PLACES != 0 && !source) || (no_sources && source) {
+            if (tcx.t_places != 0 && !source) || (no_sources && source) {
                 continue;
             }
             let text = buf_new();
@@ -449,10 +450,10 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                 continue;
             }
             let t = buf_slice(text);
-            if excluded(p) {
+            if excluded(p, tcx) {
                 var s = IntVec { data: 0 as *i64, count: 0, cap: 0 };
                 var e = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-                find_matches(t, 0, t.len as i64, old, &s, &e);
+                find_matches(t, 0, t.len as i64, old, &s, &e, tcx);
                 if s.count > 0 {
                     left_excluded += s.count;
                     excluded_files += 1;
@@ -462,11 +463,11 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             // (a file without a match: nothing to read further, unless it moves)
             var ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             var me = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            find_matches(t, 0, t.len as i64, old, &ms, &me);
+            find_matches(t, 0, t.len as i64, old, &ms, &me, tcx);
             if ms.count == 0 && !move_paths {
                 continue;
             }
-            if ms.count > 0 && T_PLACES != 0 && !read_places(t) {
+            if ms.count > 0 && tcx.t_places != 0 && !read_places(t, &tcx) {
                 if not_lexed < 3 {
                     buf_str(unlexed, if not_lexed == 0 { c" (" } else { c", " });
                     buf_bytes(unlexed, p);
@@ -476,12 +477,12 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             var after = -1;
             var left = 0;
             var kept = 0;
-            let n = rewrite_text(p, t, old, new, &after, &left, &kept);
+            let n = rewrite_text(p, t, old, new, &after, &left, &kept, &tcx);
             if left > 0 {
                 left_kept += left;
                 kept_files += 1;
             }
-            let to = if move_paths { moved_path(p, old, new) } else { p[0..0] };
+            let to = if move_paths { moved_path(p, old, new, &tcx) } else { p[0..0] };
             if n == 0 && to.len == 0 {
                 continue;
             }
@@ -490,15 +491,15 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                 let b = buf_new();
                 buf_bytes(b, to);
                 final_path = buf_cstr(b);
-                M_FROM.push(path as i64);
-                M_TO.push(final_path as i64);
+                tcx.m_from.push(path as i64);
+                tcx.m_to.push(final_path as i64);
             }
             if n > 0 {
-                W_PATH.push(final_path as i64);
-                W_BEFORE.push(text);
-                W_AFTER.push(after);
+                tcx.w_path.push(final_path as i64);
+                tcx.w_before.push(text);
+                tcx.w_after.push(after);
                 if show_diff {
-                    diff_texts(diff, c_slice(final_path), t, buf_slice(after));
+                    diff_texts(diff, c_slice(final_path), t, buf_slice(after), &tcx);
                 }
             }
             put_file_line(out, c_slice(final_path), if to.len > 0 { p } else { p[0..0] }, n,
@@ -507,14 +508,14 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             changed_files += 1;
         }
         // The totals.
-        buf_str(out, if DRY_RUN { c"would rewrite " } else { c"rewrote " });
+        buf_str(out, if tcx.dry_run { c"would rewrite " } else { c"rewrote " });
         buf_int(out, total);
         buf_str(out, if total == 1 { c" match in " } else { c" matches in " });
         buf_int(out, changed_files);
         buf_str(out, if changed_files == 1 { c" file" } else { c" files" });
-        if M_FROM.count > 0 {
+        if tcx.m_from.count > 0 {
             buf_str(out, c", ");
-            buf_int(out, M_FROM.count);
+            buf_int(out, tcx.m_from.count);
             buf_str(out, c" moved");
         }
         buf_byte(out, '\n');
@@ -523,7 +524,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         }
         // What is left, and why.
         if left_excluded > 0 {
-            let d = diag(c"note", c"rewrite.excluded");
+            let d = diag(c"note", c"rewrite.excluded", &tcx);
             buf_int(d, left_excluded);
             buf_str(d, if left_excluded == 1 { c" match left in " } else { c" matches left in " });
             buf_int(d, excluded_files);
@@ -531,7 +532,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                 if excluded_files == 1 { c" excluded file\n" } else { c" excluded files\n" });
         }
         if left_kept > 0 {
-            let d = diag(c"note", c"rewrite.kept");
+            let d = diag(c"note", c"rewrite.kept", &tcx);
             buf_int(d, left_kept);
             buf_str(d, if left_kept == 1 { c" match left in " } else { c" matches left in " });
             buf_int(d, kept_files);
@@ -539,7 +540,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_str(d, c": in kept lines (the exclusions), or in other places than --comments, --strings, --code ask\n");
         }
         if not_lexed > 0 {
-            let d = diag(c"warning", c"rewrite.not-lexed");
+            let d = diag(c"warning", c"rewrite.not-lexed", &tcx);
             buf_int(d, not_lexed);
             buf_str(d,
                 if not_lexed == 1 { c" vole source with a match does" }
@@ -549,45 +550,45 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_bytes(d, buf_slice(unlexed));
             buf_str(d, if not_lexed > 3 { c", ...)\n" } else { c")\n" });
         }
-        if MIXED_CASE > 0 {
-            let d = diag(c"note", c"rewrite.mixed-case");
-            buf_int(d, MIXED_CASE);
+        if tcx.mixed_case > 0 {
+            let d = diag(c"note", c"rewrite.mixed-case", &tcx);
+            buf_int(d, tcx.mixed_case);
             buf_str(d, c" matches in a mixed case took NEW as it is\n");
         }
-        if total == 0 && M_FROM.count == 0 {
+        if total == 0 && tcx.m_from.count == 0 {
             flush(out);
             return 0;
         }
         if step {
-            return step_write(out);
+            return step_write(out, &tcx);
         }
         // The check, then the edit.
         if roots.count > 0 {
             var added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            if !check_roots(roots, &added) {
-                let d = diag(c"error", c"rewrite.check");
+            if !check_roots(roots, &added, tcx) {
+                let d = diag(c"error", c"rewrite.check", &tcx);
                 buf_str(d, c"--check could not run the check; nothing written\n");
                 return 1;
             }
             if added.count > 0 {
-                let e = diags();
+                let e = diags(&tcx);
                 for k in 0..added.count {
                     if k < 10 {
                         buf_bytes(e, buf_slice(added.data[k]));
                         buf_byte(e, '\n');
                     }
                 }
-                let d = diag(c"error", c"rewrite.breaks");
+                let d = diag(c"error", c"rewrite.breaks", &tcx);
                 buf_int(d, added.count);
                 buf_str(d, if added.count == 1 { c" new error" } else { c" new errors" });
                 buf_str(d, c" in the --check programs; nothing written\n");
-                let t = diags();
+                let t = diags(&tcx);
                 buf_str(t, c"try:");
                 put_cword(t, PROG);
                 for k in 1..c.line.len() {
                     put_word(t, c.word(k).as_bytes());
                 }
-                if !DRY_RUN {
+                if !tcx.dry_run {
                     buf_str(t, c" --dry-run");
                 }
                 if !show_diff {
@@ -598,7 +599,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
         }
         flush(out);
-        if DRY_RUN {
+        if tcx.dry_run {
             return 0;
         }
         let summary = buf_new();
@@ -610,6 +611,6 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         buf_str(summary, c" files\t");
         buf_int(summary, total);
         buf_str(summary, c" matches");
-        if write_edit(buf_slice(summary), c".") { 0 } else { 1 }
+        if write_edit(buf_slice(summary), c".", &tcx) { 0 } else { 1 }
     }
 }

@@ -30,21 +30,21 @@ use crate::base::{
     FILES, IntVec, SOURCE_VOLE, SRC, STDOUT, buf_byte, buf_bytes, buf_clear, buf_int, buf_new,
     buf_slice, buf_str, buf_write_fd, load_sources,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_FLAG, EV_WORD, Leaf, flag, is_opt, option};
 use crate::front::lexer::init_lexer;
-use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::apply::{SKIP_CHECK, apply_edit, set_command};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
-use crate::tools::fmt::layout::{COMMAS_CHANGED, RANGED, keep_embedded, lay_out, write_layout};
-use crate::tools::fmt::pieces::{
-    BAD_AT, BAD_MESSAGE, FT, P_END, P_KIND, P_START, line_of, read_pieces, same_pieces,
-};
+use crate::tools::fmt::layout::{keep_embedded, lay_out, write_layout};
+use crate::tools::fmt::pieces::{BAD_MESSAGE, FT, line_of, read_pieces, same_pieces};
 use crate::tools::fmt::uses::tidy_uses;
 use crate::tools::proc::{buf_cstr, run_capture, same_bytes};
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, try_begin, try_end, write_diags,
+    PROG, diag, program_errors, put_word, try_begin, try_end, write_diags,
 };
 use crate::tools::query::refs::{OPT_IN, file_text, put_bad_in, ref_in, resolve_in};
 
@@ -52,10 +52,6 @@ extern "C" {
     fn opendir(path: *u8) -> *u8;
     fn closedir(dir: *u8) -> i32;
 }
-
-// Whether the edit engine formats the lines an edit writes (not for
-// fmt itself, which formats whole files).
-pub static var FORMAT_EDITS: bool = true;
 
 // The offset of a merge conflict's marker line in text (`<<<<<<<`,
 // `=======`, `>>>>>>>` at a line's start), or -1: such a text is left as
@@ -85,15 +81,15 @@ fn conflict_marker(text: [u8]) -> i64 {
 // cannot be (pieces::BAD_MESSAGE, BAD_AT say why). With ranges (pairs of
 // byte offsets of text), only the lines they touch are laid out, and the
 // `use` runs they touch tidied.
-pub fn format_text(text: [u8], ranges: *IntVec, out: i64) -> bool {
+pub fn format_text(text: [u8], ranges: *IntVec, out: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let marker = conflict_marker(text);
         if marker >= 0 {
             BAD_MESSAGE = "merge conflict markers";
-            BAD_AT = marker;
+            tcx.bad_at = marker;
             return false;
         }
-        if !read_pieces(text) {
+        if !read_pieces(text, &tcx) {
             return false;
         }
         let whole = ranges == 0 as *IntVec || (*ranges).count == 0;
@@ -102,57 +98,58 @@ pub fn format_text(text: [u8], ranges: *IntVec, out: i64) -> bool {
         // the ranges moved to the tidied text)
         var mapped = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var lines = ranges;
-        let tidy = tidy_uses(if whole { 0 as *IntVec } else { ranges }, &mapped);
+        let tidy = tidy_uses(if whole { 0 as *IntVec } else { ranges }, &mapped, &tcx);
         if tidy >= 0 {
             src = buf_slice(tidy);
             if !whole {
                 lines = &mapped;
             }
-            if !read_pieces(src) {
+            if !read_pieces(src, &tcx) {
                 return false;
             }
         }
         // (0.20: the receivers' short form; with --syntax=0.20, no written
         // let in a parameter list: fmt/conv.vl; a whole file only)
         if whole {
-            let respelled = crate::tools::fmt::conv::respell_conventions(src);
+            let respelled = crate::tools::fmt::conv::respell_conventions(src, tcx);
             if respelled >= 0 {
                 src = buf_slice(respelled);
-                if !read_pieces(src) {
+                if !read_pieces(src, &tcx) {
                     return false;
                 }
             }
         }
-        RANGED.count = 0;
-        for i in 0..P_KIND.count {
-            RANGED.push(if whole || touched(src, P_START.data[i], P_END.data[i], *lines) { 1 }
+        tcx.ranged.count = 0;
+        for i in 0..tcx.p_kind.count {
+            tcx.ranged.push(if whole
+                || touched(src, tcx.p_start.data[i], tcx.p_end.data[i], *lines) { 1 }
                 else { 0 });
         }
-        keep_embedded();
-        lay_out();
-        write_layout(out);
+        keep_embedded(&tcx);
+        lay_out(&tcx);
+        write_layout(out, tcx);
         // (0.25.1: trailing commas written or dropped change the lines'
         // lengths: a whole file is laid out again, to its fixpoint)
         var pass = 0;
-        while whole && COMMAS_CHANGED && pass < 3 {
+        while whole && tcx.commas_changed && pass < 3 {
             let again = buf_new();
             buf_bytes(again, buf_slice(out));
-            if !read_pieces(buf_slice(again)) {
+            if !read_pieces(buf_slice(again), &tcx) {
                 return false;
             }
-            RANGED.count = 0;
-            for i in 0..P_KIND.count {
-                RANGED.push(1);
+            tcx.ranged.count = 0;
+            for i in 0..tcx.p_kind.count {
+                tcx.ranged.push(1);
             }
-            keep_embedded();
-            lay_out();
+            keep_embedded(&tcx);
+            lay_out(&tcx);
             buf_clear(out);
-            write_layout(out);
+            write_layout(out, tcx);
             pass += 1;
         }
-        if !same_pieces(src, buf_slice(out)) {
+        if !same_pieces(src, buf_slice(out), &tcx) {
             BAD_MESSAGE = "formatting would change its tokens (a bug of fmt)";
-            BAD_AT = 0;
+            tcx.bad_at = 0;
             return false;
         }
         true
@@ -203,11 +200,11 @@ pub fn generated(text: [u8]) -> bool {
 // The new text of an edited file (`text`, of which `ranges` are the
 // edited parts) with those lines formatted; -1 when it cannot be or
 // nothing changes.
-pub fn format_ranges(text: [u8], ranges: *IntVec) -> i64 {
+pub fn format_ranges(text: [u8], ranges: *IntVec, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let saved = FT;
         let out = buf_new();
-        let ok = (*ranges).count > 0 && !generated(text) && format_text(text, ranges, out);
+        let ok = (*ranges).count > 0 && !generated(text) && format_text(text, ranges, out, &tcx);
         FT = saved;
         if !ok || same_bytes(buf_slice(out), text) {
             return -1;
@@ -221,10 +218,10 @@ pub fn format_ranges(text: [u8], ranges: *IntVec) -> i64 {
 // text, or -1 when the text is formatted already, is generated, or
 // cannot be formatted (does not lex, unbalanced brackets; BAD_MESSAGE,
 // BAD_AT say why). The caller's FT is kept.
-pub fn format_source(text: [u8]) -> i64 {
+pub fn format_source(text: [u8], tcx: inout Tcx<Comp>) -> i64 {
     let saved = FT;
     let out = buf_new();
-    let ok = !generated(text) && format_text(text, 0 as *IntVec, out);
+    let ok = !generated(text) && format_text(text, 0 as *IntVec, out, &tcx);
     FT = saved;
     if !ok || same_bytes(buf_slice(out), text) {
         return -1;
@@ -232,14 +229,14 @@ pub fn format_source(text: [u8]) -> i64 {
     out
 }
 
-pub fn run_fmt(c: Call<Gpa>) -> i64 {
-    let status = run_fmt_inner(c);
-    write_diags();
+pub fn run_fmt(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_fmt_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(message: *u8, arg: *u8) -> i64 {
-    let d = diag(c"error", c"fmt.usage");
+fn usage(message: *u8, arg: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"fmt.usage", &tcx);
     buf_str(d, message);
     if arg != 0 as *u8 {
         buf_str(d, c" '");
@@ -247,7 +244,7 @@ fn usage(message: *u8, arg: *u8) -> i64 {
         buf_byte(d, '\'');
     }
     buf_byte(d, '\n');
-    try_end(try_begin(c"fmt --check --all", c_slice(c""), false));
+    try_end(try_begin(c"fmt --check --all", c_slice(c""), false, &tcx));
     2
 }
 
@@ -324,10 +321,6 @@ fn tach_files(dir: *u8, out: inout IntVec) -> bool {
     }
 }
 
-// `--all`: the tree, but the programs of the tools' transcript tests
-// (tests/query/, tests/refactor/), whose text is what they test.
-static var ALL: bool = false;
-
 fn fixture(path: *u8) -> bool {
     unsafe {
         let a = c"tests/query/";
@@ -349,7 +342,7 @@ fn fixture(path: *u8) -> bool {
 
 // `fmt PATH...`: the files and the files under the directories, sorted,
 // read into SRC; false after the diagnostic.
-fn read_paths(paths: IntVec) -> bool {
+fn read_paths(paths: IntVec, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..paths.count {
@@ -363,7 +356,7 @@ fn read_paths(paths: IntVec) -> bool {
                 tach_files(p, &files);
                 var kept = before;
                 for j in before..files.count {
-                    if !(ALL && fixture(files.data[j] as *u8)) {
+                    if !(tcx.fmt_all && fixture(files.data[j] as *u8)) {
                         files.data[kept] = files.data[j];
                         kept += 1;
                     }
@@ -371,7 +364,7 @@ fn read_paths(paths: IntVec) -> bool {
                 files.count = kept;
             }
             if files.count == before {
-                let d = diag(c"error", c"fmt.no-file");
+                let d = diag(c"error", c"fmt.no-file", &tcx);
                 buf_str(d, c"no .vl file at '");
                 buf_str(d, p);
                 buf_str(d, c"'\n");
@@ -394,16 +387,16 @@ fn read_paths(paths: IntVec) -> bool {
 }
 
 // Where formatting file f failed: `FILE:LINE: why`.
-fn put_failure(d: i64, f: i64) {
+fn put_failure(d: i64, f: i64, tcx: Tcx<Comp>) {
     buf_bytes(d, file_text(f));
     buf_byte(d, ':');
-    buf_int(d, line_of(SRC[FILES[f].start..FILES[f].end], BAD_AT));
+    buf_int(d, line_of(SRC[FILES[f].start..FILES[f].end], tcx.bad_at));
     buf_str(d, c": ");
     buf_bytes(d, BAD_MESSAGE);
 }
 
-fn try_fmt(option: *u8, f: i64) {
-    let o = try_begin(c"fmt", c_slice(c""), false);
+fn try_fmt(option: *u8, f: i64, tcx: inout Tcx<Comp>) {
+    let o = try_begin(c"fmt", c_slice(c""), false, &tcx);
     if option != 0 as *u8 {
         buf_byte(o, ' ');
         buf_str(o, option);
@@ -419,11 +412,11 @@ fn try_fmt(option: *u8, f: i64) {
 // would find untidy elsewhere. Paths relative to the current directory,
 // into paths, the transcript tests' programs left out (as by --all);
 // false after the diagnostic when git cannot tell.
-fn changed_vl_files(rev: *u8, paths: inout IntVec) -> bool {
+fn changed_vl_files(rev: *u8, paths: inout IntVec, tcx: inout Tcx<Comp>) -> bool {
     let listing = buf_new();
     let others = buf_new();
     if git_paths(rev, listing) != 0 || git_paths(0 as *u8, others) != 0 {
-        let d = diag(c"error", c"fmt.no-git");
+        let d = diag(c"error", c"fmt.no-git", &tcx);
         buf_str(d, c"git cannot tell which files changed since ");
         buf_str(d, rev);
         buf_str(d, c": no checkout here, or no such revision\n");
@@ -486,11 +479,11 @@ pub fn fmt_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(table, "path")
 }
 
-fn run_fmt_inner(c: Call<Gpa>) -> i64 {
-    set_command(c.line);
+fn run_fmt_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    set_command(c.line, &tcx);
     PROG = c.prog();
-    TOOL = 0 as *u8;
-    FORMAT_EDITS = false;
+    tcx.tool = 0 as *u8;
+    tcx.format_edits = false;
     var root = 0 as *u8;
     var check = false;
     var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -501,7 +494,7 @@ fn run_fmt_inner(c: Call<Gpa>) -> i64 {
         if ev.kind == EV_FLAG && ev.name == "check" {
             check = true;
         } else if ev.kind == EV_FLAG && ev.name == "all" {
-            ALL = true;
+            tcx.fmt_all = true;
             let dirs = [c"compiler", c"tests", c"examples", c"bench", c"tools"];
             for k in 0..5 {
                 if is_dir(dirs[k]) {
@@ -511,58 +504,58 @@ fn run_fmt_inner(c: Call<Gpa>) -> i64 {
         } else if (ev.kind == EV_FLAG && ev.name == "changed") || is_opt(ev, "since") {
             // (0.25.2) what git says changed, since HEAD or REV
             let rev = if ev.kind == EV_FLAG { c"HEAD" } else { a };
-            if !changed_vl_files(rev, &paths) {
+            if !changed_vl_files(rev, &paths, &tcx) {
                 return 1;
             }
             if paths.count == 0 {
-                let d = diag(c"note", c"fmt.none");
+                let d = diag(c"note", c"fmt.none", &tcx);
                 buf_str(d, c"no .vl file changed since ");
                 buf_str(d, rev);
                 buf_byte(d, '\n');
                 return 0;
             }
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
             // (--dry-run, --show, --root ROOT)
         } else if ev.kind != EV_WORD || ev.text.starts_with("-") {
-            return usage(c"unknown option", ev.value);
+            return usage(c"unknown option", ev.value, &tcx);
         } else if crate::base::is_source_path(a) || is_dir(a) || has_slash(a) {
             paths.push(a as i64);
         } else if module == 0 as *u8 {
             module = a;
         } else {
-            return usage(c"one MODULE (or FILEs and DIRs), not also", a);
+            return usage(c"one MODULE (or FILEs and DIRs), not also", a, &tcx);
         }
     }
     unsafe {
         if paths.count > 0 && module != 0 as *u8 {
             return usage(
                 c"FILEs and DIRs, or a MODULE of the program, not both: no file or directory",
-                module);
+                module, &tcx);
         }
         var chosen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if paths.count > 0 {
-            if !read_paths(paths) {
+            if !read_paths(paths, &tcx) {
                 return 1;
             }
             for f in 0..FILES.len() as i64 {
                 chosen.push(f);
             }
         } else {
-            ROOT_GIVEN = root;
-            root = root_or_diag(root, c"fmt", c_slice(c""), false);
+            tcx.root_given = root;
+            root = root_or_diag(root, c"fmt", c_slice(c""), false, &tcx);
             if root == 0 as *u8 {
                 return 2;
             }
-            if !load_program(root, TARGET) {
-                program_errors(c"error", root, true);
+            if !load_program(root, tcx.target, &tcx) {
+                program_errors(c"error", root, true, &tcx);
                 return 1;
             }
             if module != 0 as *u8 {
                 OPT_IN = module;
-                if !resolve_in(c_slice(module)) {
-                    let d = diag(c"error", c"fmt.bad-in");
-                    put_bad_in(d, module);
-                    try_end(try_begin(c"fmt", c_slice(c""), false));
+                if !resolve_in(c_slice(module), &tcx) {
+                    let d = diag(c"error", c"fmt.bad-in", &tcx);
+                    put_bad_in(d, module, tcx);
+                    try_end(try_begin(c"fmt", c_slice(c""), false, &tcx));
                     return 1;
                 }
             }
@@ -573,12 +566,12 @@ fn run_fmt_inner(c: Call<Gpa>) -> i64 {
                 }
             }
         }
-        return format_files(chosen, check);
+        return format_files(chosen, check, &tcx);
     }
 }
 
 // Formats the chosen files (or, `check`, lists those that are not).
-fn format_files(chosen: IntVec, check: bool) -> i64 {
+fn format_files(chosen: IntVec, check: bool, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var changed = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var failed = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -590,9 +583,9 @@ fn format_files(chosen: IntVec, check: bool) -> i64 {
                 continue;
             }
             let out = buf_new();
-            if !format_text(text, 0 as *IntVec, out) {
+            if !format_text(text, 0 as *IntVec, out, &tcx) {
                 if failed.count == 0 {
-                    put_failure(first_bad, f);
+                    put_failure(first_bad, f, tcx);
                 }
                 failed.push(f);
                 continue;
@@ -606,13 +599,13 @@ fn format_files(chosen: IntVec, check: bool) -> i64 {
         }
         let n = chosen.count;
         if failed.count > 0 && n == 1 {
-            let d = diag(c"error", c"fmt.unreadable");
+            let d = diag(c"error", c"fmt.unreadable", &tcx);
             buf_bytes(d, buf_slice(first_bad));
             buf_str(d, c"; left as it is\n");
             return 1;
         }
         if failed.count > 0 {
-            let d = diag(c"note", c"fmt.skipped");
+            let d = diag(c"note", c"fmt.skipped", &tcx);
             buf_int(d, failed.count);
             buf_str(d, if failed.count == 1 { c" file" } else { c" files" });
             buf_str(d, c" left as they are (not lexed, or unbalanced brackets); first: ");
@@ -629,25 +622,25 @@ fn format_files(chosen: IntVec, check: bool) -> i64 {
             if changed.count == 0 {
                 return 0;
             }
-            let d = diag(c"error", c"fmt.unformatted");
+            let d = diag(c"error", c"fmt.unformatted", &tcx);
             buf_int(d, changed.count);
             buf_str(d, c" of ");
             buf_int(d, n);
             buf_str(d,
                 if n == 1 { c" file is not formatted\n" } else { c" files are not formatted\n" });
-            try_fmt(c"--dry-run", changed.data[0]);
-            try_fmt(0 as *u8, changed.data[0]);
+            try_fmt(c"--dry-run", changed.data[0], &tcx);
+            try_fmt(0 as *u8, changed.data[0], &tcx);
             return 1;
         }
         if changed.count == 0 {
-            let d = diag(c"note", c"fmt.none");
+            let d = diag(c"note", c"fmt.none", &tcx);
             buf_int(d, n - failed.count);
             buf_str(d,
                 if n - failed.count == 1 { c" file formatted already\n" }
                 else { c" files formatted already\n" });
             return 0;
         }
-        SKIP_CHECK = true;
-        apply_edit(c_slice(c"formatted"), FILES[changed.data[0]].path)
+        tcx.skip_check = true;
+        apply_edit(c_slice(c"formatted"), FILES[changed.data[0]].path, &tcx)
     }
 }
