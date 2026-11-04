@@ -14,7 +14,7 @@ Vec::new_in(gpa) -> Vec<T>       var v: Vec<i64> = Vec::new_in(gpa);
 v.len() -> i64                   Vec, Buf, HashMap, slices
 v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
-Buf::new_in(gpa) -> Buf          text you build (there is no String)
+String::new_in(gpa) -> String   text you build (Buf: bytes)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
 print(x), println(x)             any Display; println("{x} {:?}", v)
@@ -37,7 +37,7 @@ parse_int(s: [u8]) -> Result<i64, ParseIntError>
 m.insert(k: K, x: V) -> Option<V>     Vec: v.insert(i: usize, x: T)
 std::print_int(v: i64)           std::is_digit(b: u8) -> bool
 trim(s: [u8]) -> [u8]
-read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
+read_line(&s) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
 v.swap(i: usize, j: usize)       m.contains_key(k: K) -> bool
@@ -161,7 +161,7 @@ MinHeap: `volec guide --find dijkstra`.
 ## Input
 
 `read_line(&buf)` reads stdin a line at a time: the line goes into the
-`Buf` without its `'\n'`, and the result is `Ok(false)` at the end of
+`String` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
 `Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left
 (a `Result<Buf, IoError>`); the two share a buffer, so they mix, but not with
@@ -171,13 +171,13 @@ C's `getchar` or `scanf`. A `Scanner` reads a text's tokens
 `split_in`, `split_whitespace_in` and `trim` work on any `[u8]`. An Option
 means absence (the end, nothing found), a Result a failure: `.ok()`
 turns one into the other, `.unwrap_or(x)` gives a default. What they
-return are views of the text: keep the `Buf` until done with them. The
+return are views of the text: keep the line until done with them. The
 next `read_line` overwrites the line, so to keep a part of it (a map's
 key), read all of stdin and take lines with `Scanner::next_line`.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var line = Buf::new_in(gpa);
+    var line = String::new_in(gpa);
     read_line(&line).unwrap();            // the header: "n m"
     let header = split_whitespace_in(line.as_slice(), gpa);
     let n = parse_int(header.get(0)).unwrap();

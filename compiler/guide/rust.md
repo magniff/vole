@@ -10,7 +10,7 @@ more often than to something else, and each error names the fix.
 | Rust | vole |
 |---|---|
 | `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
-| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `std::Buf` for bytes, `format_in("..", args, gpa)` (a Buf) |
+| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt("..", args)`; `to_string_in(format_args("..", args), gpa)`; `Vec<u8, A>` for bytes, `format_in("..", args, gpa)` (a `String<A>`, as `format!` makes) |
 | `&[u8]` | `[u8]`: bytes; `str::from_utf8(b)?` makes a `str` of them (checked); `"abc"` is a `[u8]` where no `str` goes |
 | `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |

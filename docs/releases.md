@@ -151,6 +151,34 @@ Arithmetic, Rust's (arith263, decision 6):
   -O0 builds of it (chain-diverse's B2 and A2O0) pass
   `--overflow-checks=off` until then.
 
+Text (text263; grammar.md, "Items"):
+
+- Rust's `#[deprecated]`, `#[deprecated = "note"]` and
+  `#[deprecated(since = "..", note = "..")]` on any item, a method or a
+  struct's field: each use (a call, a name, a type, a path, a `use`, a
+  field read, a struct literal) is `warning item.deprecated` with the
+  note, and the help says where the item is marked. A use inside a
+  deprecated item, and std's own uses, are not reported.
+- `volec fix --only buf` turns each std `Buf` binding (a local, a
+  parameter, a field, a result, with the bindings its value flows
+  between) into `String<A>` when every write is text (a `push_str` of a
+  `str`, a format write, a constant byte below 0x80) and into
+  `Vec<u8, A>` when every write is bytes (a byte that is not a constant,
+  a constant at or above 0x80, a `push_str` of a `[u8]`). Mixed writes,
+  no write, a binding passed to a std function that takes a `Buf`, and a
+  method with no form on the side decided are refused, each named
+  (`note fix.buf-refused`). It never guesses. The method table it maps
+  through is printed with every run (`note fix.buf-table`).
+- std's text is a `String<A>` (breaking): `format_in` returns one (as
+  Rust's `format!`), `read_line` fills one (a line that is not UTF-8 is
+  `Err(IoError::Read)`, the line left empty), and so do `Command::help_in`
+  and `render_in` (std::cli), `take_capture`, `objc::push_ns_string`,
+  `Window::clipboard_get_in`, `gpu::Adapter::name_in`, the messages of
+  `gpu::Error::Shader` and `Pipeline`, `ShaderEntry`'s names and
+  `wgsl::target_error`. std's ambient `format(x)` is gone: write
+  `format_in(x, gpa)`. A program written for the `Buf` these returned:
+  `volec fix --only buf`.
+
 ### What's new in 0.26.2
 
 `usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.

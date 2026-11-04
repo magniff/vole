@@ -135,7 +135,7 @@ fn main(gpa: Gpa) -> i32 {
         Some(q) => println("pen={q} total={total}"),
         None => println("no pen"),
     }
-    let text = format_in("{} {}", items.len(), seen.len(), gpa); // a Buf
+    let text = format_in("{} {}", items.len(), seen.len(), gpa); // a String
     println(text.as_slice());                  // text, seen, items, input: dropped at the end
     0
 }
@@ -148,7 +148,7 @@ fn main(gpa: Gpa) -> i32 {
 3 3
 ```
 
-Lines one at a time: `var b = Buf::new_in(gpa); while
+Lines one at a time: `var b = String::new_in(gpa); while
 read_line(&b).unwrap() { ... }` (without the `'\n'`). An owned value
 (`Vec`, `Buf`, `HashMap`, a struct holding one) moves into a `sink`
 parameter, a `let w = v;`, a struct field or a `return`: `v` is dead

@@ -118,7 +118,10 @@ takes it; an owned argument moves). Receivers: `self`, `inout self`,
 `sink self`. Attributes:
 `#[repr(C)]`, `#[repr(C, packed)]`, `#[repr(C, align(16))]`,
 `#[repr(u8)]` (an enum's tag), `#[inline]`, `#[inline(never)]`,
-`#[cold]`; any other is an error.
+`#[cold]`, and (0.26.3) Rust's `#[deprecated(note = "use g")]` on any
+item, method or field: each use of it is `warning item.deprecated` with
+the note (`#[deprecated]` and `#[deprecated = "use g"]` too); any other
+is an error.
 
 ## Statements and blocks
 

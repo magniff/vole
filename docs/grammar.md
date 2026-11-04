@@ -133,12 +133,15 @@ link_name    = "#" "[" "link_name" "=" string_lit "]" ;   (* (0.4) the C symbol,
 
 attributes   = { "#" "[" attribute "]" } ;
 attribute    = "repr" "(" repr { "," repr } ")"        (* (0.3) structs, unions, enums *)
-             | "inline" [ "(" "never" ")" ] | "cold" ;  (* (0.6) functions *)
+             | "inline" [ "(" "never" ")" ] | "cold"    (* (0.6) functions *)
+             | "deprecated" [ "=" string_lit           (* (0.26.3) any item, a method, a field *)
+                            | "(" dep_opt { "," dep_opt } ")" ] ;
+dep_opt      = ( "since" | "note" ) "=" string_lit ;
 repr         = "C" | "packed" [ "(" int_lit ")" ] | "align" "(" int_lit ")" | int_type ;   (* packed(N): (0.4) *)
 
 struct_decl  = "struct" ident [ generics ] [ where ] "{" [ field { "," field } [ "," ] ] "}" ;
 union_decl   = "union" ident "{" [ field { "," field } [ "," ] ] "}" ;   (* (0.3) #[repr(C)] only *)
-field        = [ vis ] ident ":" type ;                (* (0.26) private to the struct's module unless pub *)
+field        = [ "#" "[" "deprecated" ... "]" ] [ vis ] ident ":" type ;   (* (0.26) private to the struct's module unless pub *)
 enum_decl    = "enum" ident [ generics ] [ where ] "{" [ variant { "," variant } [ "," ] ] "}" ;   (* (0.3) *)
 variant      = ident [ "(" type { "," type } [ "," ] ")"   (* "=": fieldless enums only *)
                      | "{" [ ident ":" type { "," ident ":" type } [ "," ] ] "}" ] [ "=" expr ] ;   (* struct-like (0.17) *)
@@ -203,7 +206,13 @@ layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
 `#[repr(u8)]` (any integer type) sets the tag type of an enum. Functions
 take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). A `static var`
 takes `#[thread_local]` (0.21): each thread has its own copy, made from
-the initializer (`guide threads`). Any other attribute is an error.
+the initializer (`guide threads`). *(0.26.3)* Any item (a function, a
+method, a struct, an enum, a trait, a type alias, a constant, a static)
+and a struct's field take Rust's `#[deprecated]`, `#[deprecated =
+"note"]` or `#[deprecated(since = "..", note = "..")]`: each use of it (a
+call, a name, a type, a path, a `use`, a field read, a struct literal) is
+`warning item.deprecated` with the note, except inside a deprecated item
+and in std's own code. Any other attribute is an error.
 
 ## Types
 
@@ -1531,7 +1540,7 @@ block, `r"..."`) that is the first argument of a format function: Rust's
 | format function | the format arguments |
 |---|---|
 | `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
-| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)` |
+| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)`, a `String<A>` on it (0.26.3; a `Buf` before) |
 | `panic`, the message of `assert` and `debug_assert` | after the literal |
 | the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
 | a contract's `else` | `requires c else "len {}", v.len()` |
