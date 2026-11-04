@@ -74,6 +74,7 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.0 | `v0.26.0` | 0.25.5 | aarch64-macos | the first step to Rust's surface: the places IR (places, moves, drop flags) at `check` behind `--places`; struct fields private unless `pub` (`field.private`, `fix --only pub`; `#[sealed]` retired); shaders as `embed wgsl` blocks, checked at `check` and in the LSP |
 | 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
 | 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
+| 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.26.3
@@ -181,9 +182,23 @@ Text (text263; grammar.md, "Items"):
 - std's byte buffers are `Vec<u8, A>` (breaking): `read_stdin_in`
   (and the ambient `read_stdin`) return one, as Rust's `read_to_end`
   fills, and so does `gen_buf`; std's snapshot, fuzz, window
-  and SPIR-V buffers moved too. std::gpu::wgsl's text buffers stay `Buf`
-  for 0.26.3: its names are `[u8]` slices of the WGSL source, and they
-  become `str` in 0.27.
+  and SPIR-V buffers moved too. std::gpu::wgsl keeps `Buf` inside for
+  0.26.3 (its names are `[u8]` slices of the WGSL source, and they
+  become `str` in 0.27), but none of its public functions takes or
+  returns one: `translate` gives a `Vec<u8, Gpa>` (SPIR-V is bytes),
+  and its messages and dumps a `String<A>`.
+- **std's `Buf` is `#[deprecated]`**: each use outside std is `warning
+  item.deprecated`, naming `String<A>` for text and `Vec<u8, A>` for
+  bytes. `fix --only buf` takes a format write (`push_fmt`, `push_int`)
+  as weak evidence of text, so a binding with only format writes and
+  byte uses becomes a `Vec<u8, A>` (the write
+  `extend_from_slice(format_in(.., v.allocator()).as_bytes())`).
+  `String::free` is new (as `Vec::free`: the memory given back).
+- The tree is off `Buf`: examples/, tests/, bench/, tools/, the guide
+  and the Book by `fix --only buf` and by hand where it refused (Buf
+  mentions 1048 before, a few cases whose point is `Buf` itself after,
+  each with a `WARNING` directive), and compiler/src (its two scratch
+  buffers are `String<Comp>`; no `std::Buf` left in it).
 
 Allocation as a capability (capab263; grammar.md, "Allocators"):
 
