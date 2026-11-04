@@ -2,26 +2,26 @@
 // compound assignments (`+=` and the others, on numbers and vectors), and
 // the mutability a write to a place needs.
 
-use crate::base::{IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, ERR_KIND, err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_sym, err_str,
-    err_sym, err_try_fmt,
+    err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_sym, err_str, err_sym,
+    err_try_fmt,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::ast::NodeKind::{FieldAccess, Ident, Index, Range, TupleField, Unary};
-use crate::front::check::{
-    CUR_FN, LOCALS, Res, lookup_local, name_error, type_error, type_error_got,
-};
+use crate::front::check::{LOCALS, Res, lookup_local, name_error, type_error, type_error_got};
 use crate::front::check::check_mode::{check_expr, check_shift_amount};
-use crate::front::check::synth_mode::{MUT_PLACE, synth_expr};
+use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::mark_no_read;
 use crate::front::check::vectors::vector_operator_ok;
 use crate::front::closures::note_local_write;
 use crate::front::distinct::strip_distinct;
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    CONSTS, FNS, REF_MUT, REF_SHARED, STATICS, SYM_STATIC, TYPES, TyKind, buf_type, is_integer,
-    is_numeric, is_pointer, is_slice, is_vector,
+    FNS, REF_MUT, REF_SHARED, STATICS, SYM_STATIC, TYPES, TyKind, buf_type, is_integer, is_numeric,
+    is_pointer, is_slice, is_vector,
 };
 
 fn arith_token_of_assign(op: Tok) -> Tok {
@@ -38,34 +38,30 @@ fn arith_token_of_assign(op: Tok) -> Tok {
 
 // ---- Places and assignment ----
 
-pub fn is_place(n: i64) -> bool {
+pub fn is_place(n: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         match NODES[n].kind {
             Ident => {
                 let name = NODES[n].a;
-                lookup_local(name).is_some() || SYM_STATIC[name] != 0
+                lookup_local(name, pcx).is_some() || SYM_STATIC[name] != 0
             }
             Unary => NODES[n].op == Tok::Star,
             // Through a pointer.
             FieldAccess if NODES[n].y == 1 => true,
-            FieldAccess | TupleField => is_place(NODES[n].a),
+            FieldAccess | TupleField => is_place(NODES[n].a, pcx),
             Index => {
                 let base = NODES[n].a;
                 if NODES[NODES[n].b].kind == Range {
                     return false;
                 }
-                is_pointer(NODES[base].ty) || is_slice(NODES[base].ty) || is_place(base)
+                is_pointer(NODES[base].ty) || is_slice(NODES[base].ty) || is_place(base, pcx)
             }
             _ => false,
         }
     }
 }
 
-// (0.17) The assignment whose target is being checked (0 outside one):
-// `p[0] = x`'s error names the statement written through the pointer.
-pub static var ASSIGNING: i64 = 0;
-
-pub fn check_assign(n: i64) {
+pub fn check_assign(n: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         let op = NODES[n].op;
         let target = NODES[n].b;
@@ -74,60 +70,60 @@ pub fn check_assign(n: i64) {
             // Writing a union's field reads nothing.
             mark_no_read(target);
         }
-        let outer = ASSIGNING;
-        ASSIGNING = n;
-        let outer_place = MUT_PLACE;
-        MUT_PLACE = target;
-        let target_ty = synth_expr(target);
-        MUT_PLACE = outer_place;
-        ASSIGNING = outer;
-        if !is_place(target) {
+        let outer = pcx.assigning;
+        pcx.assigning = n;
+        let outer_place = pcx.mut_place;
+        pcx.mut_place = target;
+        let target_ty = synth_expr(target, &pcx);
+        pcx.mut_place = outer_place;
+        pcx.assigning = outer;
+        if !is_place(target, pcx) {
             let name = NODES[target].a;
             if NODES[target].kind == Ident && NODES[target].res == Res::Const {
                 name_error(NODES[target].start, c"cannot assign to constant '",
-                    NODES[CONSTS[NODES[target].y].node].a, c"'");
+                    NODES[pcx.consts[NODES[target].y].node].a, c"'", &pcx);
             }
             if NODES[target].kind == Ident && NODES[target].res == Res::Fn {
-                name_error(NODES[target].start, c"cannot assign to function '", name, c"'");
+                name_error(NODES[target].start, c"cannot assign to function '", name, c"'", &pcx);
             }
-            type_error(target, c"invalid assignment target");
+            type_error(target, c"invalid assignment target", &pcx);
         }
-        check_mutable_place(target);
+        check_mutable_place(target, &pcx);
         if op == Tok::Eq {
-            check_expr(value, target_ty);
+            check_expr(value, target_ty, &pcx);
             return;
         }
         if op == Tok::ShlEq || op == Tok::ShrEq {
             // (0.18: a distinct type as its underlying type)
             if !is_integer(strip_distinct(target_ty)) {
-                type_error_got(n, c"shift assignment requires integer type", target_ty);
+                type_error_got(n, c"shift assignment requires integer type", target_ty, &pcx);
             }
-            check_shift_amount(value);
+            check_shift_amount(value, &pcx);
             return;
         }
         if is_vector(target_ty) {
             // (0.10: lanewise, as the operator)
-            vector_operator_ok(n, arith_token_of_assign(op), target_ty);
-            check_expr(value, target_ty);
+            vector_operator_ok(n, arith_token_of_assign(op), target_ty, &pcx);
+            check_expr(value, target_ty, &pcx);
             return;
         }
         if op == Tok::AmpEq || op == Tok::PipeEq || op == Tok::CaretEq {
             if !is_integer(strip_distinct(target_ty)) {
-                type_error_got(n, c"bitwise assignment requires integer type", target_ty);
+                type_error_got(n, c"bitwise assignment requires integer type", target_ty, &pcx);
             }
         } else if !is_numeric(strip_distinct(target_ty)) {
-            type_error_got(n, c"compound assignment requires numeric type", target_ty);
+            type_error_got(n, c"compound assignment requires numeric type", target_ty, &pcx);
         }
-        check_expr(value, target_ty);
+        check_expr(value, target_ty, &pcx);
     }
 }
 
-pub fn check_mutable_place(target: i64) {
+pub fn check_mutable_place(target: i64, pcx: inout Ctx<Comp>) {
     let root = place_root(target);
     if root > 0 {
-        check_mutable_name(root, target);
+        check_mutable_name(root, target, &pcx);
     } else {
-        note_write_through(target);
+        note_write_through(target, &pcx);
     }
 }
 
@@ -135,7 +131,7 @@ pub fn check_mutable_place(target: i64) {
 // `struct C { n: inout i64 }`, `self.q.push(x)` through an inout field): a
 // closure that does it changes that local, which it then captures inout
 // (closures::note_local_write; the closure is move-only).
-pub fn note_write_through(target: i64) {
+pub fn note_write_through(target: i64, pcx: inout Ctx<Comp>) {
     var e = target;
     for _ in 0..64 {
         unsafe {
@@ -160,7 +156,7 @@ pub fn note_write_through(target: i64) {
                 Ident => {
                     if NODES[e].res == Res::Local && NODES[e].y >= 0
                         && (LOCALS[NODES[e].y].mutable || LOCALS[NODES[e].y].access) {
-                        note_local_write(NODES[e].y);
+                        note_local_write(NODES[e].y, &pcx);
                     }
                     return;
                 }
@@ -201,10 +197,10 @@ pub fn place_root(target: i64) -> i64 {
 // `&place` given where a raw `*T` is wanted is its address, not an
 // access (unsafe code answers for writes through it): its check waits for
 // the function's end (flush_inout_places), when the node's type says.
-pub fn check_inout_place(target: i64, at: i64) {
-    let kind = inout_root_kind(target);
+pub fn check_inout_place(target: i64, at: i64, pcx: inout Ctx<Comp>) {
+    let kind = inout_root_kind(target, &pcx);
     if kind != 0 {
-        inout_place_error(at, kind, NODES[INOUT_ROOT].a, INOUT_ROOT_TY);
+        inout_place_error(at, kind, NODES[pcx.inout_root].a, pcx.inout_root_ty, &pcx);
     }
 }
 
@@ -212,7 +208,7 @@ pub fn check_inout_place(target: i64, at: i64) {
 // place `callee`: the rule of an inout access (check_inout_place), and a let
 // access (a let parameter of a generic's instance, `f: F`) is read-only
 // too: own.readonly.
-pub fn check_closure_call_place(callee: i64, at: i64) {
+pub fn check_closure_call_place(callee: i64, at: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if NODES[callee].kind == Ident && NODES[callee].res == Res::Local && NODES[callee].y >= 0 {
             let l = NODES[callee].y;
@@ -220,94 +216,81 @@ pub fn check_closure_call_place(callee: i64, at: i64) {
             if LOCALS[l].access && t > 0 && TYPES[t].kind == TyKind::Ptr
                 && TYPES[t].b == REF_SHARED {
                 inout_place_error(at, if LOCALS[l].is_param { 2 } else { 1 }, NODES[callee].a,
-                    TYPES[t].a);
+                    TYPES[t].a, &pcx);
                 return;
             }
         }
-        check_inout_place(callee, at);
+        check_inout_place(callee, at, &pcx);
     }
 }
 
 // The same for `&place` (synth_unary): reported at the function's end
 // unless the `&` became a raw pointer.
-pub fn defer_inout_place(target: i64, at: i64) {
-    let kind = inout_root_kind(target);
+pub fn defer_inout_place(target: i64, at: i64, pcx: inout Ctx<Comp>) {
+    let kind = inout_root_kind(target, &pcx);
     if kind != 0 {
-        INOUT_PENDING.push(at);
-        INOUT_PENDING.push(kind);
-        INOUT_PENDING.push(NODES[INOUT_ROOT].a);
-        INOUT_PENDING.push(INOUT_ROOT_TY);
+        pcx.inout_pending.push(at);
+        pcx.inout_pending.push(kind);
+        pcx.inout_pending.push(NODES[pcx.inout_root].a);
+        pcx.inout_pending.push(pcx.inout_root_ty);
     }
 }
 
 // (0.25) `&value` of a temporary (check/temps.vl made its local): conv.place
 // at the function's end if it was lent inout.
-pub fn defer_conv_place(at: i64) {
-    INOUT_PENDING.push(at);
-    INOUT_PENDING.push(5);
-    INOUT_PENDING.push(0);
-    INOUT_PENDING.push(0);
+pub fn defer_conv_place(at: i64, pcx: inout Ctx<Comp>) {
+    pcx.inout_pending.push(at);
+    pcx.inout_pending.push(5);
+    pcx.inout_pending.push(0);
+    pcx.inout_pending.push(0);
 }
 
-// (`&x as *T`: the `&` nodes cast to a raw pointer, for flush_inout_places)
-pub static var RAW_ADDRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// (the `&` inits of `let`/`inout` bindings, for flush_inout_places)
-pub static var LET_AMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// (the pending `&place` errors: the node, the kind, the name, the type)
-pub static var INOUT_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// While the checker checks code it made that may change a let binding (a
-// drop at the end of its life): no inout check.
-pub static var INOUT_FREE: i64 = 0;
-static var INOUT_ROOT: i64 = 0;
-static var INOUT_ROOT_TY: i64 = 0;
-
-pub fn clear_inout_places() {
-    INOUT_PENDING.count = 0;
-    RAW_ADDRS.count = 0;
-    LET_AMPS.count = 0;
+pub fn clear_inout_places(pcx: inout Ctx<Comp>) {
+    pcx.inout_pending.count = 0;
+    pcx.raw_addrs.count = 0;
+    pcx.let_amps.count = 0;
 }
 
-pub fn flush_inout_places() {
+pub fn flush_inout_places(pcx: inout Ctx<Comp>) {
     unsafe {
         var i = 0;
-        while i + 3 < INOUT_PENDING.count {
-            let at = INOUT_PENDING.data[i];
+        while i + 3 < pcx.inout_pending.count {
+            let at = pcx.inout_pending.data[i];
             let t0 = NODES[at].ty;
             let t = if t0 > 0 { strip_distinct(t0) } else { t0 };
             // (only an exclusive access is checked: `&x` that became a raw
             // pointer, a let `[T]` or `str`, or a let view is none)
             var raw = !(t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
                 && TYPES[t].b == REF_MUT);
-            for j in 0..RAW_ADDRS.count {
-                if RAW_ADDRS.data[j] == at {
+            for j in 0..pcx.raw_addrs.count {
+                if pcx.raw_addrs.data[j] == at {
                     raw = true;
                 }
             }
-            if INOUT_PENDING.data[i + 1] == 5 {
+            if pcx.inout_pending.data[i + 1] == 5 {
                 // (conv.place: only where the access is inout)
                 // (`inout r = &make()` binds the temporary: no lending)
                 var bound = false;
-                for j in 0..LET_AMPS.count {
-                    if LET_AMPS.data[j] == at {
+                for j in 0..pcx.let_amps.count {
+                    if pcx.let_amps.data[j] == at {
                         bound = true;
                     }
                 }
                 if !raw && !bound {
-                    conv_place_error(at);
+                    conv_place_error(at, &pcx);
                 }
             } else if !raw {
-                inout_place_error(at, INOUT_PENDING.data[i + 1], INOUT_PENDING.data[i + 2],
-                    INOUT_PENDING.data[i + 3]);
+                inout_place_error(at, pcx.inout_pending.data[i + 1], pcx.inout_pending.data[i + 2],
+                    pcx.inout_pending.data[i + 3], &pcx);
             }
             i += 4;
         }
-        clear_inout_places();
+        clear_inout_places(&pcx);
     }
 }
 
 // conv.place: `&make()` lent inout, a temporary whose change is lost.
-fn conv_place_error(at: i64) {
+fn conv_place_error(at: i64, pcx: inout Ctx<Comp>) {
     let text = SRC[NODES[at].start..NODES[at].end];
     let value = if text.len > 1 && text[0] == '&' { text[1..text.len] } else { text };
     let m = buf_new();
@@ -316,34 +299,34 @@ fn conv_place_error(at: i64) {
     buf_str(m, c"' is a temporary, whose change would be lost");
     crate::front::conv::conv_error(crate::front::conv::CODE_PLACE, NODES[at].start,
         NODES[at].end, buf_slice(m), "name it first, then lend it: 'var t = VALUE;' and '&t'",
-        "");
+        "", &pcx);
 }
 
 // What the root of place `target` is when an inout access of it breaks the
 // rule (0: nothing wrong): 1 a let binding, 2 a let parameter, 3 a let
 // receiver, 4 an immutable static; INOUT_ROOT is the Ident, INOUT_ROOT_TY
 // its type.
-fn inout_root_kind(target: i64) -> i64 {
+fn inout_root_kind(target: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if INOUT_FREE > 0 {
+        if pcx.inout_free > 0 {
             return 0;
         }
         let root = place_root(target);
         if root <= 0 {
-            note_write_through(target);
+            note_write_through(target, &pcx);
             return 0;
         }
-        INOUT_ROOT = root;
+        pcx.inout_root = root;
         if NODES[root].res == Res::Local {
             let local = NODES[root].y;
             if local < 0 {
                 return 0;
             }
             let t = LOCALS[local].ty;
-            INOUT_ROOT_TY = t;
+            pcx.inout_root_ty = t;
             if LOCALS[local].mutable {
                 // (a closure that changes it this way writes it)
-                note_local_write(local);
+                note_local_write(local, &pcx);
             }
             // (an access, a reference: through it; a slice is a view,
             // whose writes the own pass checks: views::on_mut_loan)
@@ -358,68 +341,68 @@ fn inout_root_kind(target: i64) -> i64 {
             return if LOCALS[local].is_param { 2 } else { 1 };
         }
         if NODES[root].res == Res::Static && !STATICS[NODES[root].y].mutable {
-            INOUT_ROOT_TY = STATICS[NODES[root].y].ty;
+            pcx.inout_root_ty = STATICS[NODES[root].y].ty;
             return 4;
         }
         0
     }
 }
 
-fn inout_place_error(at: i64, kind: i64, name: i64, t: i64) {
+fn inout_place_error(at: i64, kind: i64, name: i64, t: i64, pcx: inout Ctx<Comp>) {
     let text = SRC[NODES[at].start..NODES[at].end];
-    let saved = ERR_KIND;
-    ERR_KIND = c"own.readonly";
-    err_begin(NODES[at].start);
-    err_fmt(format_args("'{text}' changes '"));
-    err_sym(name);
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"own.readonly";
+    err_begin(NODES[at].start, &pcx);
+    err_fmt(format_args("'{text}' changes '"), pcx);
+    err_sym(name, pcx);
     let b = buf_new();
     if kind == 4 {
-        err_str(c"', an immutable static: it is read-only (in read-only memory)");
-        err_help(c"declare it `static var` to change it");
+        err_str(c"', an immutable static: it is read-only (in read-only memory)", pcx);
+        err_help(c"declare it `static var` to change it", pcx);
         buf_str(b, c"static var ");
         buf_bytes(b, SYMS[name].text);
     } else if kind == 3 {
-        err_str(c"', a let receiver: it is read-only");
-        err_help(c"take the receiver inout to change it");
+        err_str(c"', a let receiver: it is read-only", pcx);
+        err_help(c"take the receiver inout to change it", pcx);
         buf_str(b, c"inout self");
     } else if kind == 2 {
-        err_str(c"', a let parameter: it is read-only");
+        err_str(c"', a let parameter: it is read-only", pcx);
         err_help(
-            c"take it inout to change the caller's value, or `sink` for a copy of its own");
+            c"take it inout to change the caller's value, or `sink` for a copy of its own", pcx);
         buf_bytes(b, SYMS[name].text);
         buf_str(b, c": inout ");
         // (the type as written, `F` in a generic, else the type)
-        let written = written_param_type(name);
+        let written = written_param_type(name, pcx);
         if written.len > 0 {
             buf_bytes(b, written);
         } else {
             buf_type(b, t);
         }
     } else {
-        err_str(c"', a let binding: it is read-only");
-        err_help(c"declare it `var` to change it");
+        err_str(c"', a let binding: it is read-only", pcx);
+        err_help(c"declare it `var` to change it", pcx);
         buf_str(b, c"var ");
         buf_bytes(b, SYMS[name].text);
         buf_str(b, c" = ...");
     }
-    err_try_fmt(buf_slice(b));
-    err_end_soft();
-    ERR_KIND = saved;
+    err_try_fmt(buf_slice(b), pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // The type of the current function's parameter `name` as written (empty: none
 // written, or no such parameter).
-fn written_param_type(name: i64) -> [u8] {
+fn written_param_type(name: i64, pcx: Ctx<Comp>) -> [u8] {
     unsafe {
-        if CUR_FN < 0 {
+        if pcx.cur_fn < 0 {
             return "";
         }
-        let fnode = FNS[CUR_FN].node;
+        let fnode = FNS[pcx.cur_fn].node;
         if fnode <= 0 {
             return "";
         }
         for i in 0..NODES[fnode].count {
-            let p = child(fnode, i);
+            let p = child(fnode, i, pcx);
             if NODES[p].kind == NodeKind::Param && NODES[p].a == name && NODES[p].b > 0 {
                 let tn = NODES[p].b;
                 return SRC[NODES[tn].start..NODES[tn].end];
@@ -429,62 +412,63 @@ fn written_param_type(name: i64) -> [u8] {
     }
 }
 
-fn check_mutable_name(ident: i64, target: i64) {
+fn check_mutable_name(ident: i64, target: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         let name = NODES[ident].a;
         let local = if NODES[ident].res == Res::Local { NODES[ident].y } else { -1 };
         if local >= 0 {
-            note_local_write(local);
+            note_local_write(local, &pcx);
             if LOCALS[local].mutable {
                 return;
             }
-            err_begin(NODES[target].start);
-            err_str(c"cannot assign to immutable variable '");
-            err_sym(name);
-            err_str(c"'");
+            err_begin(NODES[target].start, &pcx);
+            err_str(c"cannot assign to immutable variable '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
             // (mixed files keep the 0.19 words until Phase M)
-            let legacy = !crate::front::conv::strict_at(NODES[target].start);
+            let legacy = !crate::front::conv::strict_at(NODES[target].start, &pcx);
             if LOCALS[local].is_param && !legacy {
                 // (0.20, conventions.md §2.1: a let parameter is read-only)
-                err_help(c"a parameter is read-only (let); to change the caller's value take it `");
-                err_help_sym(name);
-                err_help(c": inout ");
-                buf_type(ERR_HELP, LOCALS[local].ty);
-                err_help(c"` (called with `&x`); for a copy of its own, `");
-                err_help_sym(name);
-                err_help(c": sink ");
-                buf_type(ERR_HELP, LOCALS[local].ty);
-                err_help(c"`");
+                err_help(c"a parameter is read-only (let); to change the caller's value take it `",
+                    pcx);
+                err_help_sym(name, pcx);
+                err_help(c": inout ", pcx);
+                buf_type(pcx.err_help, LOCALS[local].ty);
+                err_help(c"` (called with `&x`); for a copy of its own, `", pcx);
+                err_help_sym(name, pcx);
+                err_help(c": sink ", pcx);
+                buf_type(pcx.err_help, LOCALS[local].ty);
+                err_help(c"`", pcx);
             } else if !legacy {
-                err_help(c"make it mutable: `var ");
-                err_help_sym(name);
-                err_help(c"`");
+                err_help(c"make it mutable: `var ", pcx);
+                err_help_sym(name, pcx);
+                err_help(c"`", pcx);
             } else if LOCALS[local].is_param {
-                err_help(c"make the parameter mutable: `mut ");
-                err_help_sym(name);
-                err_help(c": ");
-                buf_type(ERR_HELP, LOCALS[local].ty);
-                err_help(c"`");
+                err_help(c"make the parameter mutable: `mut ", pcx);
+                err_help_sym(name, pcx);
+                err_help(c": ", pcx);
+                buf_type(pcx.err_help, LOCALS[local].ty);
+                err_help(c"`", pcx);
             } else {
-                err_help(c"make it mutable: `let mut ");
-                err_help_sym(name);
-                err_help(c"`");
+                err_help(c"make it mutable: `let mut ", pcx);
+                err_help_sym(name, pcx);
+                err_help(c"`", pcx);
             }
-            err_end();
+            err_end(&pcx);
         }
         if NODES[ident].res == Res::Static && !STATICS[NODES[ident].y].mutable {
-            err_begin(NODES[target].start);
-            err_str(c"cannot assign to immutable static '");
-            err_sym(name);
-            err_str(c"'");
+            err_begin(NODES[target].start, &pcx);
+            err_str(c"cannot assign to immutable static '", pcx);
+            err_sym(name, pcx);
+            err_str(c"'", pcx);
             err_help(
-                if !crate::front::conv::strict_at(NODES[target].start) {
+                if !crate::front::conv::strict_at(NODES[target].start, &pcx) {
                     c"declare it `static var "
                 }
-                else { c"declare it `static var " });
-            err_help_sym(name);
-            err_help(c"`");
-            err_end();
+                else { c"declare it `static var " }, pcx);
+            err_help_sym(name, pcx);
+            err_help(c"`", pcx);
+            err_end(&pcx);
         }
     }
 }

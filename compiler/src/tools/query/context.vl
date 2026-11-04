@@ -12,14 +12,15 @@ use crate::base::{
     buf_slice, buf_str, buf_write_fd,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::modules::{MODULES, file_of_pos, module_count};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::query::{QF_DEF, QF_USE};
 use crate::tools::query::budget::BYTES_PER_TOKEN;
 use crate::tools::query::defs::{
-    DEFS, K_ALIAS, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT,
-    K_TRAIT_FN, K_VARIANT, MOD_DEF, find_defs, kind_name, mod_fqn,
+    K_ALIAS, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, K_TRAIT_FN,
+    K_VARIANT, find_defs, kind_name, mod_fqn,
 };
 use crate::tools::query::diagnostics::{diag, try_begin, try_end};
 use crate::tools::query::effects::put_def_effects;
@@ -49,15 +50,15 @@ fn budget_bytes(tcx: Tcx<Comp>) -> i64 {
 
 // Every reference, once (collect_all_refs; what it leaves behind is
 // dropped, so refs can be collected again).
-fn load_refs(tcx: inout Tcx<Comp>) {
+fn load_refs(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         if tcx.context_all.count > 0 {
             return;
         }
         var all = tcx.context_all;
-        collect_all_refs(&all, &tcx);
+        collect_all_refs(&all, &tcx, pcx);
         tcx.context_all = all;
-        tcx.ref_n = alloc_array::<i64>(DEFS.len() as i64 + 1);
+        tcx.ref_n = alloc_array::<i64>(pcx.defs.len() as i64 + 1);
         var i = 0;
         while i < tcx.context_all.count {
             tcx.ref_n[tcx.context_all.data[i + 1]] += 1;
@@ -73,44 +74,44 @@ fn load_refs(tcx: inout Tcx<Comp>) {
 }
 
 // `query context` for the NAMEs of args: the exit status.
-pub fn query_context(text: [u8], matches: IntVec, tcx: inout Tcx<Comp>) -> i64 {
+pub fn query_context(text: [u8], matches: IntVec, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         if matches.count > 5 {
-            return query_show(matches, text, &tcx);
+            return query_show(matches, text, &tcx, &pcx);
         }
-        load_refs(&tcx);
+        load_refs(&tcx, pcx);
         let n = matches.count;
         let per = budget_bytes(tcx) / (if n > 0 { n } else { 1 });
         for i in 0..n {
             let d = matches.data[i];
-            if DEFS[d].kind == K_MOD {
-                let m = module_of_def(d);
+            if pcx.defs[d].kind == K_MOD {
+                let m = module_of_def(d, pcx);
                 if m >= 0 {
-                    module_context(m, per, &tcx);
+                    module_context(m, per, &tcx, &pcx);
                     continue;
                 }
             }
-            item_context(d, per, &tcx);
+            item_context(d, per, &tcx, &pcx);
         }
-        put_cut_note(text, &tcx);
+        put_cut_note(text, &tcx, pcx);
         0
     }
 }
 
 // The module NAME names when it is a module and no other item (`query
 // context crate::tools::query`, `context query`), or -1.
-pub fn context_module(name0: [u8], tcx: inout Tcx<Comp>) -> i64 {
+pub fn context_module(name0: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let name = canonical_name(name0);
         var mods = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_modules(name, false, &mods, &tcx);
+        find_modules(name, false, &mods, &tcx, pcx);
         if mods.count != 1 {
             return -1;
         }
         var defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_defs(name, false, &defs, tcx);
+        find_defs(name, false, &defs, tcx, pcx);
         for i in 0..defs.count {
-            if DEFS[defs.data[i]].kind != K_MOD {
+            if pcx.defs[defs.data[i]].kind != K_MOD {
                 return -1;
             }
         }
@@ -119,17 +120,17 @@ pub fn context_module(name0: [u8], tcx: inout Tcx<Comp>) -> i64 {
 }
 
 // `query context MODULE`: the exit status.
-pub fn query_context_module(m: i64, text: [u8], tcx: inout Tcx<Comp>) -> i64 {
-    load_refs(&tcx);
-    module_context(m, budget_bytes(tcx), &tcx);
-    put_cut_note(text, &tcx);
+pub fn query_context_module(m: i64, text: [u8], tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    load_refs(&tcx, pcx);
+    module_context(m, budget_bytes(tcx), &tcx, &pcx);
+    put_cut_note(text, &tcx, pcx);
     0
 }
 
-fn module_of_def(d: i64) -> i64 {
+fn module_of_def(d: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        for m in 0..module_count() {
-            if m < MOD_DEF.count && MOD_DEF.data[m] == d {
+        for m in 0..module_count(pcx) {
+            if m < pcx.mod_def.count && pcx.mod_def.data[m] == d {
                 return m;
             }
         }
@@ -146,16 +147,16 @@ fn is_type_kind(k: i64) -> bool {
 }
 
 // Whether definition e is inside definition d (a local item, d's fields).
-fn inside(e: i64, d: i64) -> bool {
-    e == d || DEFS[e].parent == d
-        || (DEFS[e].start >= DEFS[d].start && DEFS[e].start < DEFS[d].end)
+fn inside(e: i64, d: i64, pcx: Ctx<Comp>) -> bool {
+    e == d || pcx.defs[e].parent == d
+        || (pcx.defs[e].start >= pcx.defs[d].start && pcx.defs[e].start < pcx.defs[d].end)
 }
 
 // The section banner above position pos in module m, or -1.
-fn section_of(m: i64, pos: i64, tcx: inout Tcx<Comp>) -> i64 {
+fn section_of(m: i64, pos: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var banners = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        banners_of_module(m, &banners, &tcx);
+        banners_of_module(m, &banners, &tcx, &pcx);
         var best = -1;
         for i in 0..banners.count {
             let b = banners.data[i];
@@ -170,27 +171,27 @@ fn section_of(m: i64, pos: i64, tcx: inout Tcx<Comp>) -> i64 {
 
 // `PATH<TAB>FILE:LINE:COL<TAB>KIND<TAB>SIGNATURE` of e (a short struct or
 // enum whole).
-fn put_def_line(out: i64, e: i64, tcx: Tcx<Comp>) {
-    buf_bytes(out, SYMS[DEFS[e].fqn].text);
+fn put_def_line(out: i64, e: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    buf_bytes(out, SYMS[pcx.defs[e].fqn].text);
     buf_byte(out, '\t');
-    put_loc(out, DEFS[e].name_pos);
+    put_loc(out, pcx.defs[e].name_pos, &pcx);
     buf_byte(out, '\t');
-    buf_str(out, kind_name(DEFS[e].kind));
+    buf_str(out, kind_name(pcx.defs[e].kind));
     buf_byte(out, '\t');
-    let k = DEFS[e].kind;
+    let k = pcx.defs[e].kind;
     if k == K_STRUCT || k == K_ENUM {
         let whole = buf_new();
-        if DEFS[e].public {
+        if pcx.defs[e].public {
             buf_str(whole, c"pub ");
         }
-        crate::tools::query::positions::collapse(whole, DEFS[e].start, DEFS[e].end);
+        crate::tools::query::positions::collapse(whole, pcx.defs[e].start, pcx.defs[e].end);
         if buf_slice(whole).len as i64 <= TYPE_WHOLE {
             buf_bytes(out, buf_slice(whole));
             buf_byte(out, '\n');
             return;
         }
     }
-    put_signature(out, e, tcx);
+    put_signature(out, e, tcx, pcx);
     buf_byte(out, '\n');
 }
 
@@ -218,47 +219,47 @@ fn fit_lines(out: i64, from: i64, room: inout i64) -> i64 {
 }
 
 // The context of definition d, in about `budget` bytes.
-fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>) {
+fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         let head = buf_new();
-        let first = text_start(d);
-        let last = line_end(if DEFS[d].end > DEFS[d].start { DEFS[d].end - 1 }
-            else { DEFS[d].start });
+        let first = text_start(d, pcx);
+        let last = line_end(if pcx.defs[d].end > pcx.defs[d].start { pcx.defs[d].end - 1 }
+            else { pcx.defs[d].start }, pcx);
         buf_str(head, c"// ");
-        buf_bytes(head, SYMS[DEFS[d].fqn].text);
+        buf_bytes(head, SYMS[pcx.defs[d].fqn].text);
         buf_byte(head, '\t');
         put_path(head, file_of_pos(first));
         buf_byte(head, ':');
-        buf_int(head, line_of(first));
+        buf_int(head, line_of(first, pcx));
         buf_byte(head, '-');
-        buf_int(head, line_of(last));
-        let sec = section_of(DEFS[d].module, first, &tcx);
+        buf_int(head, line_of(last, pcx));
+        let sec = section_of(pcx.defs[d].module, first, &tcx, &pcx);
         if sec >= 0 {
             buf_str(head, c"\tsection: ");
             put_title(head, sec, tcx);
         }
-        put_def_effects(head, d, c"\t", tcx);
-        put_def_views(head, d, c"\t", tcx);
-        put_def_features(head, d, c"\t", tcx);
+        put_def_effects(head, d, c"\t", tcx, pcx);
+        put_def_views(head, d, c"\t", tcx, &pcx);
+        put_def_features(head, d, c"\t", tcx, pcx);
         // (0.26.0) a field's visibility
-        if DEFS[d].kind == K_FIELD {
-            let written = crate::front::modules::vis::written_restriction(DEFS[d].start);
-            if DEFS[d].public && written.len > 0 {
+        if pcx.defs[d].kind == K_FIELD {
+            let written = crate::front::modules::vis::written_restriction(pcx.defs[d].start);
+            if pcx.defs[d].public && written.len > 0 {
                 // (0.26.2: `pub(crate) field`)
                 buf_byte(head, '\t');
                 buf_bytes(head, written);
                 buf_str(head, c" field");
-            } else if DEFS[d].public {
+            } else if pcx.defs[d].public {
                 buf_str(head, c"\tpub field");
-            } else if DEFS[d].module > 0 && MODULES[DEFS[d].module].key >= 0 {
+            } else if pcx.defs[d].module > 0 && MODULES[pcx.defs[d].module].key >= 0 {
                 // (the root's are the whole program's)
                 buf_str(head, c"\tprivate to module ");
-                buf_bytes(head, SYMS[MODULES[DEFS[d].module].key].text);
+                buf_bytes(head, SYMS[MODULES[pcx.defs[d].module].key].text);
             }
         }
         buf_byte(head, '\n');
-        put_intrinsic_notes(head, d, tcx);
-        put_std_use(head, d, tcx);
+        put_intrinsic_notes(head, d, tcx, pcx);
+        put_std_use(head, d, tcx, &pcx);
         let src = buf_new();
         buf_bytes(src, SRC[first..last]);
         buf_byte(src, '\n');
@@ -275,11 +276,12 @@ fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>) {
             if (fl & QF_DEF) != 0 {
                 continue;
             }
-            if pos >= DEFS[d].start && pos < DEFS[d].end {
-                if (DEFS[e].kind == K_FIELD || DEFS[e].kind == K_VARIANT) && DEFS[e].parent >= 0 {
-                    e = DEFS[e].parent;
+            if pos >= pcx.defs[d].start && pos < pcx.defs[d].end {
+                if (pcx.defs[e].kind == K_FIELD || pcx.defs[e].kind == K_VARIANT)
+                    && pcx.defs[e].parent >= 0 {
+                    e = pcx.defs[e].parent;
                 }
-                if inside(e, d) || DEFS[e].kind == K_MOD || seen.get(e + 1) != 0 {
+                if inside(e, d, pcx) || pcx.defs[e].kind == K_MOD || seen.get(e + 1) != 0 {
                     continue;
                 }
                 seen.put(e + 1, 1);
@@ -288,8 +290,8 @@ fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>) {
                 callers.push(pos);
             }
         }
-        sort_positions(&used, true, tcx);
-        sort_positions(&callers, false, tcx);
+        sort_positions(&used, true, tcx, pcx);
+        sort_positions(&callers, false, tcx, pcx);
         let calls = buf_new();
         let types = buf_new();
         let others = buf_new();
@@ -298,27 +300,28 @@ fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>) {
         var n_others = 0;
         for j in 0..used.count {
             let e = used.data[j];
-            let k = DEFS[e].kind;
+            let k = pcx.defs[e].kind;
             if is_fn_kind(k) {
-                put_def_line(calls, e, tcx);
+                put_def_line(calls, e, tcx, &pcx);
                 n_calls += 1;
             } else if is_type_kind(k) {
-                put_def_line(types, e, tcx);
+                put_def_line(types, e, tcx, &pcx);
                 n_types += 1;
             } else {
-                put_def_line(others, e, tcx);
+                put_def_line(others, e, tcx, &pcx);
                 n_others += 1;
             }
         }
         let who = buf_new();
         for j in 0..callers.count {
             let pos = callers.data[j];
-            let enc = enclosing(pos, tcx);
-            put_short(who, if enc >= 0 { DEFS[enc].fqn } else { mod_fqn(DEFS[d].module, &tcx) });
+            let enc = enclosing(pos, tcx, pcx);
+            put_short(who,
+                if enc >= 0 { pcx.defs[enc].fqn } else { mod_fqn(pcx.defs[d].module, &tcx, pcx) });
             buf_byte(who, '\t');
-            put_loc(who, pos);
+            put_loc(who, pos, &pcx);
             buf_byte(who, '\t');
-            put_line(who, pos);
+            put_line(who, pos, pcx);
             buf_byte(who, '\n');
         }
         // Fitting: the header always; the source up to what the lists
@@ -341,8 +344,8 @@ fn item_context(d: i64, budget: i64, tcx: inout Tcx<Comp>) {
         put_list(out, c"calls", n_calls, calls, &room, 0, &tcx);
         put_list(out, c"types", n_types, types, &room, 1, &tcx);
         put_list(out, c"uses", n_others, others, &room, 1, &tcx);
-        put_list(out, if is_fn_kind(DEFS[d].kind) { c"callers" } else { c"used by" }, callers.count,
-            who, &room, 2, &tcx);
+        put_list(out, if is_fn_kind(pcx.defs[d].kind) { c"callers" } else { c"used by" },
+            callers.count, who, &room, 2, &tcx);
         buf_write_fd(out, STDOUT);
     }
 }
@@ -382,7 +385,7 @@ fn put_list(out: i64, title: *u8, n: i64, from: i64, room: inout i64, which: i64
 }
 
 // Sorts positions (or, `defs`, definitions by their positions).
-fn sort_positions(v: inout IntVec, defs: bool, tcx: Tcx<Comp>) {
+fn sort_positions(v: inout IntVec, defs: bool, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         let n = v.count;
         let k1 = alloc_array::<i64>(n + 1);
@@ -390,7 +393,7 @@ fn sort_positions(v: inout IntVec, defs: bool, tcx: Tcx<Comp>) {
         var idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..n {
             idx.push(i);
-            let pos = if defs { DEFS[v.data[i]].name_pos } else { v.data[i] };
+            let pos = if defs { pcx.defs[v.data[i]].name_pos } else { v.data[i] };
             k1[i] = rank_of(pos, tcx);
             k2[i] = pos;
         }
@@ -421,7 +424,7 @@ fn sort_positions(v: inout IntVec, defs: bool, tcx: Tcx<Comp>) {
 
 // The context of module m, in about `budget` bytes: `items --comments`,
 // then the bodies of its items that the module's own code uses most.
-fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>) {
+fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         let saved = STDOUT_CAPTURE;
         let items = buf_new();
@@ -430,25 +433,25 @@ fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>) {
         tcx.opt_banners = true;
         var ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         ms.push(m);
-        query_items(ms, &tcx);
+        query_items(ms, &tcx, &pcx);
         tcx.opt_banners = banners;
         STDOUT_CAPTURE = saved;
         let out = buf_new();
         var room = budget;
         tcx.cut_items += fit_lines(out, items, &room);
         // Uses of each item from inside the module.
-        let uses = alloc_array::<i64>(DEFS.len() as i64 + 1);
-        let outside = alloc_array::<i64>(DEFS.len() as i64 + 1);
-        let rank = alloc_array::<i64>(DEFS.len() as i64 + 1);
+        let uses = alloc_array::<i64>(pcx.defs.len() as i64 + 1);
+        let outside = alloc_array::<i64>(pcx.defs.len() as i64 + 1);
+        let rank = alloc_array::<i64>(pcx.defs.len() as i64 + 1);
         var i = 0;
         while i < tcx.context_all.count {
             let pos = tcx.context_all.data[i];
             let e = tcx.context_all.data[i + 1];
             let fl = tcx.context_all.data[i + 2];
             i += 3;
-            if (fl & QF_DEF) == 0 && DEFS[e].module == m && is_fn_kind(DEFS[e].kind) {
-                let enc = enclosing(pos, tcx);
-                if enc >= 0 && enc != e && DEFS[enc].module == m {
+            if (fl & QF_DEF) == 0 && pcx.defs[e].module == m && is_fn_kind(pcx.defs[e].kind) {
+                let enc = enclosing(pos, tcx, pcx);
+                if enc >= 0 && enc != e && pcx.defs[enc].module == m {
                     uses[e] += 1;
                 } else if enc != e && (fl & QF_USE) == 0 {
                     outside[e] += 1;
@@ -458,8 +461,9 @@ fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>) {
         // (what the module uses most first, then what is used from
         // outside it most)
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for e in 0..DEFS.len() as i64 {
-            if DEFS[e].module == m && is_fn_kind(DEFS[e].kind) && DEFS[e].kind != K_TRAIT_FN {
+        for e in 0..pcx.defs.len() as i64 {
+            if pcx.defs[e].module == m && is_fn_kind(pcx.defs[e].kind)
+                && pcx.defs[e].kind != K_TRAIT_FN {
                 order.push(e);
                 rank[e] = uses[e] * 1000000 + outside[e];
             }
@@ -477,17 +481,17 @@ fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>) {
         var shown = 0;
         for j in 0..order.count {
             let d = order.data[j];
-            let first = text_start(d);
-            let last = line_end(DEFS[d].end - 1);
+            let first = text_start(d, pcx);
+            let last = line_end(pcx.defs[d].end - 1, pcx);
             let body = buf_new();
             buf_str(body, c"// ");
-            buf_bytes(body, SYMS[DEFS[d].fqn].text);
+            buf_bytes(body, SYMS[pcx.defs[d].fqn].text);
             buf_byte(body, '\t');
             put_path(body, file_of_pos(first));
             buf_byte(body, ':');
-            buf_int(body, line_of(first));
+            buf_int(body, line_of(first, pcx));
             buf_byte(body, '-');
-            buf_int(body, line_of(last));
+            buf_int(body, line_of(last, pcx));
             buf_str(body, c"\tused ");
             buf_int(body, uses[d]);
             buf_str(body, c" times in the module, ");
@@ -508,7 +512,7 @@ fn module_context(m: i64, budget: i64, tcx: inout Tcx<Comp>) {
 
 // The note saying what the budget left out, and the commands that print
 // it.
-fn put_cut_note(name: [u8], tcx: inout Tcx<Comp>) {
+fn put_cut_note(name: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     if tcx.cut_lines + tcx.cut_calls + tcx.cut_types + tcx.cut_callers + tcx.cut_items == 0 {
         return;
     }
@@ -523,12 +527,12 @@ fn put_cut_note(name: [u8], tcx: inout Tcx<Comp>) {
     put_count(d, tcx.cut_callers, c"callers");
     buf_byte(d, '\n');
     if tcx.cut_lines > 0 {
-        try_end(try_begin(c"show", name, true, &tcx));
+        try_end(try_begin(c"show", name, true, &tcx, pcx));
     }
     if tcx.cut_callers > 0 {
-        try_end(try_begin(c"callers", name, true, &tcx));
+        try_end(try_begin(c"callers", name, true, &tcx, pcx));
     }
-    let t = try_begin(c"context", name, true, &tcx);
+    let t = try_begin(c"context", name, true, &tcx, pcx);
     buf_str(t, c" --budget ");
     buf_int(t, budget_bytes(tcx) / BYTES_PER_TOKEN * 3);
     try_end(t);

@@ -8,20 +8,20 @@
 // structural `==` compares, an f-string's `std::Interp` literal) are let
 // through, and so are closure environments and C's structs.
 use crate::base::{SRC, buf_bytes, intern_c, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, ERR_KIND, buf_position, err_begin, err_end_soft, err_fix, err_fixable, err_help,
-    err_help_sym, err_str, err_sym,
+    buf_position, err_begin, err_end_soft, err_fix, err_fixable, err_help, err_help_sym, err_str,
+    err_sym,
 };
 use crate::front::ast::{NODES, NODE_IMPLICIT, child};
-use crate::front::check::SELF_SYM;
 use crate::front::check::collect::find_generic_method;
 use crate::front::check::unsafety::NODE_NO_READ;
-use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, is_within, module_of, within_std};
+use crate::front::modules::{MODULES, STD_MODULE, is_within, module_of, within_std};
 use crate::front::modules::vis::{admits, restriction_span, vis_end_of, vis_where};
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{
-    FNS, METHODS, METHOD_COUNT, MethodInfo, STRUCTS, StructInfo, find_field, find_method,
-    struct_type,
+    FNS, MethodInfo, STRUCTS, StructInfo, find_field, find_method, struct_type,
 };
 use crate::tools::fix::note_private_field;
 
@@ -45,10 +45,10 @@ fn module_key(m: i64) -> i64 {
 }
 
 // Method i's record, copied.
-fn method(i: i64) -> MethodInfo {
+fn method(i: i64, pcx: Ctx<Comp>) -> MethodInfo {
     // UNSAFE: METHODS is the table of methods, a raw pointer (front/types).
     // SAFETY: the caller's i is below METHOD_COUNT, the table's length.
-    unsafe { METHODS[i] }
+    unsafe { pcx.methods[i] }
 }
 
 // Function f's node, display name and return type.
@@ -78,49 +78,49 @@ fn template_of(s: i64) -> i64 {
 }
 
 // The declaration (a Field node) of field `field` of struct s, or 0.
-fn field_node(s: i64, field: i64) -> i64 {
+fn field_node(s: i64, field: i64, pcx: Ctx<Comp>) -> i64 {
     let t = info(template_of(s));
     if field < 0 || t.closure != 0 || t.node <= 0 || field >= NODES[t.node].count {
         return 0;
     }
-    child(t.node, field)
+    child(t.node, field, pcx)
 }
 
 // Whether field `field` of struct s is private where node n is.
-fn field_hidden(n: i64, s: i64, field: i64) -> bool {
-    let f = field_node(s, field);
+fn field_hidden(n: i64, s: i64, field: i64, pcx: inout Ctx<Comp>) -> bool {
+    let f = field_node(s, field, pcx);
     if f == 0 || (NODES[n].p & NODE_IMPLICIT) != 0 {
         return false;
     }
     // (0.26.2: `pub(crate)`, `pub(super)`, `pub(in path)`: up to a module)
     if (NODES[f].p & ITEM_PUBLIC) != 0 {
-        return !admits(f, module_of(n));
+        return !admits(f, module_of(n, &pcx), &pcx);
     }
     let home = info(template_of(s)).module;
-    if home < 0 || home == C_MODULE {
+    if home < 0 || home == pcx.c_module {
         return false;
     }
-    !is_within(module_of(n), home)
+    !is_within(module_of(n, &pcx), home)
 }
 
 // " module 'geometry'", for an error.
-fn err_module(s: i64) {
-    err_str(c" module '");
-    err_sym(module_key(info(template_of(s)).module));
-    err_str(c"'");
+fn err_module(s: i64, pcx: Ctx<Comp>) {
+    err_str(c" module '", pcx);
+    err_sym(module_key(info(template_of(s)).module), pcx);
+    err_str(c"'", pcx);
 }
 
 // "' is private to module 'geometry'" for field node f of struct s, or
 // (0.26.2) "' is visible only in crate 'std'" for a restricted one.
-fn err_privacy(f: i64, s: i64) {
-    let end = vis_end_of(f);
+fn err_privacy(f: i64, s: i64, pcx: inout Ctx<Comp>) {
+    let end = vis_end_of(f, &pcx);
     if (NODES[f].p & ITEM_PUBLIC) != 0 && end >= 0 {
-        err_str(c"' is visible only in ");
-        buf_bytes(crate::base::diag::ERR, vis_where(end));
+        err_str(c"' is visible only in ", pcx);
+        buf_bytes(pcx.err, vis_where(end));
         return;
     }
-    err_str(c"' is private to");
-    err_module(s);
+    err_str(c"' is private to", pcx);
+    err_module(s, pcx);
 }
 
 // Whether struct s is std's.
@@ -142,175 +142,179 @@ fn container(s: i64) -> bool {
 // declaration with `pub`, where it is: `make it public: 'pub len: i64' at
 // FILE:L:C`, which `volec fix --only pub` writes. (0.26.2) A restricted
 // one (`pub(super)`) is widened to its crate: `pub(crate) len: i64`.
-fn help_field_public(f: i64) {
+fn help_field_public(f: i64, pcx: inout Ctx<Comp>) {
     let start = NODES[f].start;
-    let (rs, re) = restriction_span(f);
+    let (rs, re) = restriction_span(f, pcx);
     if rs >= 0 {
-        err_help(c"make it visible in its crate: 'pub(crate)");
-        buf_bytes(ERR_HELP, SRC[re..NODES[f].end]);
+        err_help(c"make it visible in its crate: 'pub(crate)", pcx);
+        buf_bytes(pcx.err_help, SRC[re..NODES[f].end]);
     } else {
-        err_help(c"make it public: 'pub ");
-        buf_bytes(ERR_HELP, SRC[start..NODES[f].end]);
+        err_help(c"make it public: 'pub ", pcx);
+        buf_bytes(pcx.err_help, SRC[start..NODES[f].end]);
     }
-    err_help(c"' at ");
-    buf_position(ERR_HELP, start);
-    err_fixable();
+    err_help(c"' at ", pcx);
+    buf_position(pcx.err_help, start, &pcx);
+    err_fixable(&pcx);
 }
 
 // Ends the error being made with code `code`.
-fn end_with(code: *u8) {
-    let saved = ERR_KIND;
-    ERR_KIND = code;
-    err_end_soft();
-    ERR_KIND = saved;
+fn end_with(code: *u8, pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = code;
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // Whether struct s has a method `name` (an instance: its template's too).
-fn has_method(s: i64, name: i64) -> bool {
-    find_method(struct_type(s), name) >= 0
-        || (info(s).tmpl != 0 && find_generic_method(info(s).tmpl, name) >= 0)
+fn has_method(s: i64, name: i64, pcx: Ctx<Comp>) -> bool {
+    find_method(struct_type(s), name, pcx) >= 0
+        || (info(s).tmpl != 0 && find_generic_method(info(s).tmpl, name, pcx) >= 0)
 }
 
 // Field access n (a FieldAccess, x = the field) of struct s.
-pub fn check_field(n: i64, s: i64) {
+pub fn check_field(n: i64, s: i64, pcx: inout Ctx<Comp>) {
     let field = NODES[n].x;
-    if !field_hidden(n, s, field) {
+    if !field_hidden(n, s, field, &pcx) {
         return;
     }
     let name = NODES[n].b;
     // (`volec fix --only pub` writes `pub` where the field is written)
-    note_private_field(field_node(s, field));
-    err_begin(NODES[n].start);
-    err_str(c"field '");
-    err_sym(name);
-    err_str(c"' of '");
-    err_sym(info(s).name);
-    err_privacy(field_node(s, field), s);
+    note_private_field(field_node(s, field, pcx), &pcx);
+    err_begin(NODES[n].start, &pcx);
+    err_str(c"field '", pcx);
+    err_sym(name, pcx);
+    err_str(c"' of '", pcx);
+    err_sym(info(s).name, pcx);
+    err_privacy(field_node(s, field, pcx), s, &pcx);
     // (a read of a method's name; a write, `v.len = n`, `&v.len`, has no
     // method to call)
-    if (NODES[n].p & NODE_NO_READ) == 0 && has_method(s, name) {
-        err_help(c"call its method: '.");
-        err_help_sym(name);
-        err_help(c"()'");
+    if (NODES[n].p & NODE_NO_READ) == 0 && has_method(s, name, pcx) {
+        err_help(c"call its method: '.", pcx);
+        err_help_sym(name, pcx);
+        err_help(c"()'", pcx);
         // (0.18) the fix: the call's `()`
         if NODES[n].end > NODES[n].start && SRC[NODES[n].end - 1] != ')' {
-            err_fix(NODES[n].end, NODES[n].end, "()");
+            err_fix(NODES[n].end, NODES[n].end, "()", &pcx);
         }
     } else if std_struct(s) {
-        err_help(c"use the methods of '");
-        err_help_sym(info(template_of(s)).name);
+        err_help(c"use the methods of '", pcx);
+        err_help_sym(info(template_of(s)).name, pcx);
         if container(s) {
-            err_help(c"' (its fields change only through them: `.len()`, `.as_slice()`, ...)");
+            err_help(c"' (its fields change only through them: `.len()`, `.as_slice()`, ...)", pcx);
         } else {
-            err_help(c"'");
+            err_help(c"'", pcx);
         }
     } else {
-        help_field_public(field_node(s, field));
+        help_field_public(field_node(s, field, pcx), &pcx);
     }
-    end_with(FIELD_PRIVATE);
+    end_with(FIELD_PRIVATE, &pcx);
 }
 
 // (0.17) Whether `x.len` on std's struct s, at node n, reads as `x.len()`:
 // s has a `len` method and no `len` field n can see (Vec's is private, a
 // Buf has none), so both spellings mean the length.
-pub fn len_reads_as_method(n: i64, s: i64) -> bool {
+pub fn len_reads_as_method(n: i64, s: i64, pcx: inout Ctx<Comp>) -> bool {
     if STD_MODULE < 0 || !within_std(info(template_of(s)).module) {
         return false;
     }
     let name = intern_c(c"len");
     let field = find_field(s, name);
-    if field >= 0 && !field_hidden(n, s, field) {
+    if field >= 0 && !field_hidden(n, s, field, &pcx) {
         return false;
     }
-    has_method(s, name)
+    has_method(s, name, pcx)
 }
 
 // The help of a literal of program struct s: its module's functions that
 // return one (`Rect::new`, at most three), else a function of its module.
-fn help_constructors(s: i64) {
+fn help_constructors(s: i64, pcx: Ctx<Comp>) {
     let t = struct_type(s);
     var named = 0;
     if info(s).generic == 0 && info(s).tmpl == 0 {
-        for i in 0..METHOD_COUNT {
-            let m = method(i);
+        for i in 0..pcx.methods.len() as i64 {
+            let m = method(i, pcx);
             if m.ty == t && m.f >= 0 && fn_ret(m.f) == t && named < 3 {
                 let d = fn_node(m.f);
-                let takes_self = d > 0 && NODES[d].count > 0 && NODES[child(d, 0)].a == SELF_SYM;
+                let takes_self = d > 0 && NODES[d].count > 0
+                    && NODES[child(d, 0, pcx)].a == pcx.self_sym;
                 if !takes_self {
-                    err_help(if named == 0 { c"make one with its constructor: '" } else { c", '" });
-                    err_help_sym(info(s).name);
-                    err_help(c"::");
-                    err_help_sym(m.name);
-                    err_help(c"'");
+                    err_help(if named == 0 { c"make one with its constructor: '" } else { c", '" },
+                        pcx);
+                    err_help_sym(info(s).name, pcx);
+                    err_help(c"::", pcx);
+                    err_help_sym(m.name, pcx);
+                    err_help(c"'", pcx);
                     named += 1;
                 }
             }
         }
     }
-    if named == 0 && info(s).tmpl != 0 && find_generic_method(info(s).tmpl, intern_c(c"new")) >= 0 {
+    if named == 0 && info(s).tmpl != 0
+        && find_generic_method(info(s).tmpl, intern_c(c"new"), pcx) >= 0 {
         // (a generic struct's: its `new`)
-        err_help(c"make one with its constructor: '");
-        err_help_sym(info(template_of(s)).name);
-        err_help(c"::new'");
+        err_help(c"make one with its constructor: '", pcx);
+        err_help_sym(info(template_of(s)).name, pcx);
+        err_help(c"::new'", pcx);
         named = 1;
     }
     if named == 0 {
-        err_help(c"use a function of");
-        buf_bytes(ERR_HELP, " module '");
-        err_help_sym(module_key(info(template_of(s)).module));
-        err_help(c"' that returns a '");
-        err_help_sym(info(template_of(s)).name);
-        err_help(c"'");
+        err_help(c"use a function of", pcx);
+        buf_bytes(pcx.err_help, " module '");
+        err_help_sym(module_key(info(template_of(s)).module), pcx);
+        err_help(c"' that returns a '", pcx);
+        err_help_sym(info(template_of(s)).name, pcx);
+        err_help(c"'", pcx);
     }
 }
 
 // Struct literal n of struct s: whether it may be made here, every field
 // visible (its fields are checked then).
-pub fn check_literal(n: i64, s: i64) -> bool {
+pub fn check_literal(n: i64, s: i64, pcx: inout Ctx<Comp>) -> bool {
     var hidden = -1;
     for f in 0..info(s).field_count {
-        if field_hidden(n, s, f) {
+        if field_hidden(n, s, f, &pcx) {
             if hidden < 0 {
                 hidden = f;
             }
             // (`volec fix --only pub`: every field the literal names)
-            note_private_field(field_node(s, f));
+            note_private_field(field_node(s, f, pcx), &pcx);
         }
     }
     if hidden < 0 {
         return true;
     }
     let name = info(template_of(s)).name;
-    err_begin(NODES[n].start);
-    err_str(c"cannot make a '");
-    err_sym(info(s).name);
-    err_str(c"' here: its field '");
-    err_sym(NODES[field_node(s, hidden)].a);
-    err_privacy(field_node(s, hidden), s);
-    let cur = crate::front::check::CUR_FN;
+    err_begin(NODES[n].start, &pcx);
+    err_str(c"cannot make a '", pcx);
+    err_sym(info(s).name, pcx);
+    err_str(c"' here: its field '", pcx);
+    err_sym(NODES[field_node(s, hidden, pcx)].a, pcx);
+    err_privacy(field_node(s, hidden, pcx), s, &pcx);
+    let cur = pcx.cur_fn;
     let in_std = std_struct(s);
     if in_std && name == intern_c(c"Gpa")
         && crate::front::ambient::test_gpa_help(if cur >= 0 { fn_node(cur) } else { -1 },
-            if cur >= 0 { sym_text(fn_display(cur)) } else { "" }) {
+            if cur >= 0 { sym_text(fn_display(cur)) } else { "" }, pcx) {
         // (0.25.2.1: in a test, its parameter)
     } else if in_std && name == intern_c(c"Gpa") {
-        err_help(c"a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter");
+        err_help(c"a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter",
+            pcx);
     } else if in_std && name == intern_c(c"ScopedArena") {
-        err_help(c"a scope's arena comes from 'arena_scope(gpa, |s: ScopedArena| ...)' or 'a.scope(|s: ScopedArena| ...)'");
+        err_help(c"a scope's arena comes from 'arena_scope(gpa, |s: ScopedArena| ...)' or 'a.scope(|s: ScopedArena| ...)'", pcx);
     } else if in_std && name == intern_c(c"Arena") {
         err_help(
-            c"make one with its constructor: 'Arena::new_in(gpa)'");
+            c"make one with its constructor: 'Arena::new_in(gpa)'", pcx);
     } else if in_std && name == intern_c(c"FixedBuf") {
-        err_help(c"make one with its constructor: 'FixedBuf::new(mem)'");
+        err_help(c"make one with its constructor: 'FixedBuf::new(mem)'", pcx);
     } else if in_std && (name == intern_c(c"Vec") || name == intern_c(c"Buf")
         || name == intern_c(c"HashMap")) {
-        err_help(c"make one with its constructor: '");
-        err_help_sym(name);
+        err_help(c"make one with its constructor: '", pcx);
+        err_help_sym(name, pcx);
         // (0.26.3: no static holds one, alloc.static)
-        err_help(c"::new_in(gpa)'");
+        err_help(c"::new_in(gpa)'", pcx);
     } else {
-        help_constructors(s);
+        help_constructors(s, pcx);
     }
-    end_with(FIELD_LITERAL_PRIVATE);
+    end_with(FIELD_LITERAL_PRIVATE, &pcx);
     false
 }

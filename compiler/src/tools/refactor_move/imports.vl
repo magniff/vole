@@ -6,15 +6,16 @@ use crate::base::{
     BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::lexer::Tok;
 use crate::front::modules::{module_at, module_of, within_std};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::edit::items::node_head;
 use crate::tools::query::{QF_DEF, QF_USE, c_slice};
-use crate::tools::query::defs::{DEFS, K_IMPL_METHOD, K_METHOD, K_VARIANT, bytes_eq};
+use crate::tools::query::defs::{K_IMPL_METHOD, K_METHOD, K_VARIANT, bytes_eq};
 use crate::tools::query::diagnostics::sym_less;
 use crate::tools::query::positions::{line_end, line_start, token_at};
 use crate::tools::refactor_mod::{
@@ -42,7 +43,7 @@ fn reexport(d: i64, tcx: inout Tcx<Comp>) {
 // line per part, each ending with a newline): what code outside uses of
 // its parts, and what it imports of them itself (those imports are the
 // re-exports).
-pub fn reexport_lines(tcx: inout Tcx<Comp>) -> i64 {
+pub fn reexport_lines(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let out = buf_new();
         if tcx.split_from < 0 {
@@ -51,8 +52,8 @@ pub fn reexport_lines(tcx: inout Tcx<Comp>) -> i64 {
         for i in 0..tcx.im_region.count {
             let d = tcx.im_def.data[i];
             // (0.20: an item that was private is imported, not re-exported)
-            if tcx.im_region.data[i] == tcx.split_from && tcx.im_name.data[i] == DEFS[d].name
-                && home(d, tcx) != tcx.split_from && DEFS[d].public {
+            if tcx.im_region.data[i] == tcx.split_from && tcx.im_name.data[i] == pcx.defs[d].name
+                && home(d, tcx, &pcx) != tcx.split_from && pcx.defs[d].public {
                 reexport(d, &tcx);
                 tcx.im_region.data[i] = -1;
             }
@@ -61,14 +62,14 @@ pub fn reexport_lines(tcx: inout Tcx<Comp>) -> i64 {
         // std's with --reexport keeps every `pub` item it moves at its path.
         if within_std(tcx.split_from) {
             for i in 0..tcx.mv_def.count {
-                if DEFS[tcx.mv_def.data[i]].public {
+                if pcx.defs[tcx.mv_def.data[i]].public {
                     reexport(tcx.mv_def.data[i], &tcx);
                 }
             }
         }
         var parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..tcx.reex.count {
-            let h = home(tcx.reex.data[i], tcx);
+            let h = home(tcx.reex.data[i], tcx, &pcx);
             var seen = false;
             for j in 0..parts.count {
                 if parts.data[j] == h {
@@ -84,15 +85,15 @@ pub fn reexport_lines(tcx: inout Tcx<Comp>) -> i64 {
             var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for i in 0..tcx.reex.count {
-                if home(tcx.reex.data[i], tcx) == p {
-                    names.push(DEFS[tcx.reex.data[i]].name);
+                if home(tcx.reex.data[i], tcx, &pcx) == p {
+                    names.push(pcx.defs[tcx.reex.data[i]].name);
                 }
             }
             let path = buf_new();
-            if crate::tools::refactor_mod::region_parent(p, tcx) == tcx.split_from {
-                buf_bytes(path, SYMS[crate::tools::refactor_mod::region_name(p, tcx)].text);
+            if crate::tools::refactor_mod::region_parent(p, tcx, pcx) == tcx.split_from {
+                buf_bytes(path, SYMS[crate::tools::refactor_mod::region_name(p, tcx, pcx)].text);
             } else {
-                put_region_path(path, p, &tcx);
+                put_region_path(path, p, &tcx, pcx);
             }
             put_use_text(out, SRC[0..0], true, buf_slice(path), &names, &none);
             buf_byte(out, '\n');
@@ -122,82 +123,83 @@ pub fn remove_use_names(u: i64, id: i64, tcx: inout Tcx<Comp>) {
 
 // The path definition d is imported from once the edit is made (its
 // module's, or for a variant its enum's): `crate::a::b`.
-fn import_path(out: i64, d: i64, tcx: inout Tcx<Comp>) {
-    let it = if DEFS[d].kind == K_VARIANT { DEFS[d].parent } else { d };
-    let h = home(it, tcx);
-    put_region_path(out, h, &tcx);
+fn import_path(out: i64, d: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    let it = if pcx.defs[d].kind == K_VARIANT { pcx.defs[d].parent } else { d };
+    let h = home(it, tcx, &pcx);
+    put_region_path(out, h, &tcx, pcx);
     if it != d {
         buf_str(out, c"::");
-        buf_bytes(out, SYMS[DEFS[it].name].text);
+        buf_bytes(out, SYMS[pcx.defs[it].name].text);
     }
 }
 
 // (0.14) import_path as region r writes it: relative to r (`a::b`, not
 // `crate::m::a::b`) when the module is inside r and r writes the paths of
 // its child modules so (tidyimports::relative_style).
-fn import_path_in(out: i64, d: i64, r: i64, tcx: inout Tcx<Comp>) {
+fn import_path_in(out: i64, d: i64, r: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        let it = if DEFS[d].kind == K_VARIANT { DEFS[d].parent } else { d };
-        let h = home(it, tcx);
-        if r >= 0 && !is_new(r) && h != r && within(h, r, tcx) && relative_style(r, &tcx) {
+        let it = if pcx.defs[d].kind == K_VARIANT { pcx.defs[d].parent } else { d };
+        let h = home(it, tcx, &pcx);
+        if r >= 0 && !is_new(r, pcx) && h != r && within(h, r, tcx, pcx)
+            && relative_style(r, &tcx, &pcx) {
             let full = buf_new();
-            put_region_path(full, h, &tcx);
+            put_region_path(full, h, &tcx, pcx);
             let own = buf_new();
-            put_region_path(own, r, &tcx);
+            put_region_path(own, r, &tcx, pcx);
             let t = buf_slice(full);
             buf_bytes(out, t[BUFS[own].len + 2..]);
             if it != d {
                 buf_str(out, c"::");
-                buf_bytes(out, SYMS[DEFS[it].name].text);
+                buf_bytes(out, SYMS[pcx.defs[it].name].text);
             }
             return;
         }
-        import_path(out, d, &tcx);
+        import_path(out, d, &tcx, &pcx);
     }
 }
 
 // The region an item is in after the edit.
-fn home(d: i64, tcx: Tcx<Comp>) -> i64 {
-    if !user_pos(DEFS[d].start) {
-        return module_at(DEFS[d].start);
+fn home(d: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if !user_pos(pcx.defs[d].start) {
+        return module_at(pcx.defs[d].start, &pcx);
     }
-    region_at(DEFS[d].start, tcx)
+    region_at(pcx.defs[d].start, tcx, &pcx)
 }
 
 // Region r needs definition d under name `name` (`again`: its import
 // there is removed).
-fn need_import(r: i64, d: i64, name: i64, tcx: inout Tcx<Comp>) {
-    add_import(r, d, name, false, &tcx);
+fn need_import(r: i64, d: i64, name: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    add_import(r, d, name, false, &tcx, &pcx);
 }
 
-fn add_import(r: i64, d: i64, name: i64, again: bool, tcx: inout Tcx<Comp>) {
+fn add_import(r: i64, d: i64, name: i64, again: bool, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         for i in 0..tcx.im_region.count {
             if tcx.im_region.data[i] == r && tcx.im_name.data[i] == name {
                 if tcx.im_def.data[i] != d && !tcx.refused {
                     tcx.refused = true;
-                    collision(SYMS[name].text, r, tcx.im_def.data[i], true, &tcx);
+                    collision(SYMS[name].text, r, tcx.im_def.data[i], true, &tcx, pcx);
                 }
                 return;
             }
         }
-        if !is_new(r) {
+        if !is_new(r, pcx) {
             // What the name is there now: d (nothing to do), something
             // else that stays (a collision), or what leaves.
             let ib = item_binding(r, name, tcx);
-            let uid = crate::tools::refactor_mod::use_binding_id(r, name);
-            let ub = use_binding(r, name);
-            if ib >= 0 && home(ib, tcx) == r {
+            let uid = crate::tools::refactor_mod::use_binding_id(r, name, pcx);
+            let ub = use_binding(r, name, pcx);
+            if ib >= 0 && home(ib, tcx, &pcx) == r {
                 if ib != d && !tcx.refused {
                     tcx.refused = true;
-                    collision(SYMS[name].text, r, ib, false, &tcx);
+                    collision(SYMS[name].text, r, ib, false, &tcx, pcx);
                 }
                 return;
             }
             if ib < 0 && uid != 0 && tcx.imports_dropped.get(uid) == 0 {
                 if ub != d && !tcx.refused {
                     tcx.refused = true;
-                    collision(SYMS[name].text, r, ub, true, &tcx);
+                    collision(SYMS[name].text, r, ub, true, &tcx, pcx);
                 }
                 if ub != d || !again {
                     return;
@@ -207,9 +209,9 @@ fn add_import(r: i64, d: i64, name: i64, again: bool, tcx: inout Tcx<Comp>) {
         // (an item moved there with that name)
         for i in 0..tcx.mv_def.count {
             let x = tcx.mv_def.data[i];
-            if tcx.mv_dest.data[i] == r && DEFS[x].name == name && x != d && !tcx.refused {
+            if tcx.mv_dest.data[i] == r && pcx.defs[x].name == name && x != d && !tcx.refused {
                 tcx.refused = true;
-                collision(SYMS[name].text, r, x, false, &tcx);
+                collision(SYMS[name].text, r, x, false, &tcx, pcx);
                 return;
             }
         }
@@ -222,17 +224,17 @@ fn add_import(r: i64, d: i64, name: i64, again: bool, tcx: inout Tcx<Comp>) {
 // The `use` line text of the imports of region r with path p (a buffer):
 // `use p::a;`, `use p::{a, b};` (wrapped at 100 columns), and a line of
 // its own for each name imported under another name.
-fn put_use_lines(out: i64, p: [u8], names: IntVec, defs: IntVec) {
+fn put_use_lines(out: i64, p: [u8], names: IntVec, defs: IntVec, pcx: Ctx<Comp>) {
     unsafe {
         var plain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..names.count {
             let n = names.data[i];
             let d = defs.data[i];
-            if n != DEFS[d].name {
+            if n != pcx.defs[d].name {
                 buf_str(out, c"use ");
                 buf_bytes(out, p);
                 buf_str(out, c"::");
-                buf_bytes(out, SYMS[DEFS[d].name].text);
+                buf_bytes(out, SYMS[pcx.defs[d].name].text);
                 buf_str(out, c" as ");
                 buf_bytes(out, SYMS[n].text);
                 buf_str(out, c";\n");
@@ -290,7 +292,7 @@ fn put_use_lines(out: i64, p: [u8], names: IntVec, defs: IntVec) {
 }
 
 // The import lines of region r (sorted by path, then name).
-pub fn region_uses(r: i64, tcx: inout Tcx<Comp>) -> i64 {
+pub fn region_uses(r: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var idx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -298,7 +300,7 @@ pub fn region_uses(r: i64, tcx: inout Tcx<Comp>) -> i64 {
             if tcx.im_region.data[i] == r {
                 idx.push(i);
                 let b = buf_new();
-                import_path_in(b, tcx.im_def.data[i], r, &tcx);
+                import_path_in(b, tcx.im_def.data[i], r, &tcx, &pcx);
                 paths.push(intern(buf_slice(b)));
             }
         }
@@ -328,7 +330,7 @@ pub fn region_uses(r: i64, tcx: inout Tcx<Comp>) -> i64 {
                 defs.push(tcx.im_def.data[idx.data[j]]);
                 j += 1;
             }
-            put_use_lines(out, SYMS[paths.data[i]].text, names, defs);
+            put_use_lines(out, SYMS[paths.data[i]].text, names, defs, pcx);
             i = j;
         }
         out
@@ -337,7 +339,7 @@ pub fn region_uses(r: i64, tcx: inout Tcx<Comp>) -> i64 {
 
 // The references of the program, in turn: what each needs once the moves
 // are made. False after a diagnostic.
-pub fn analyze(tcx: inout Tcx<Comp>) -> bool {
+pub fn analyze(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var pubbed = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for k in 0..tcx.refs.count {
@@ -348,46 +350,49 @@ pub fn analyze(tcx: inout Tcx<Comp>) -> bool {
             if (flags & QF_DEF) != 0 || !user_pos(p) {
                 continue;
             }
-            let kd = DEFS[d].kind;
+            let kd = pcx.defs[d].kind;
             var it = d;
             if kd == K_VARIANT {
-                it = DEFS[d].parent;
-            } else if DEFS[d].parent >= 0 || kd == K_METHOD || kd == K_IMPL_METHOD {
+                it = pcx.defs[d].parent;
+            } else if pcx.defs[d].parent >= 0 || kd == K_METHOD || kd == K_IMPL_METHOD {
                 continue;
             }
-            let old_home = module_at(DEFS[it].start);
-            let new_home = home(it, tcx);
-            let old_reg = module_at(p);
-            let new_reg = region_at(p, tcx);
+            let old_home = module_at(pcx.defs[it].start, &pcx);
+            let new_home = home(it, tcx, &pcx);
+            let old_reg = module_at(p, &pcx);
+            let new_reg = region_at(p, tcx, &pcx);
             let moved_item = old_home != new_home;
             let moved_code = old_reg != new_reg;
             if !moved_item && !moved_code {
                 continue;
             }
-            if tcx.split_from >= 0 && moved_item && !within(old_reg, tcx.split_from, tcx) {
+            if tcx.split_from >= 0 && moved_item && !within(old_reg, tcx.split_from, tcx, pcx) {
                 // (split --reexport: code outside the module is left as it
                 // is, the module re-exports the item)
-                if user_pos(DEFS[it].start) && !DEFS[it].public && pubbed.get(it + 1) == 0 {
+                if user_pos(pcx.defs[it].start) && !pcx.defs[it].public && pubbed.get(it + 1) == 0 {
                     pubbed.put(it + 1, 1);
-                    later_edit(DEFS[it].start, DEFS[it].start, text_of(c_slice(c"pub ")), &tcx);
+                    later_edit(pcx.defs[it].start, pcx.defs[it].start, text_of(c_slice(c"pub ")),
+                        &tcx);
                 }
                 reexport(it, &tcx);
                 continue;
             }
-            let ti = token_at(p);
-            if ti >= TOK_COUNT || TOKS[ti].start != p || TOKS[ti].kind != Tok::Ident {
+            let ti = token_at(p, pcx);
+            if ti >= pcx.toks.len() as i64 || pcx.toks[ti].start != p
+                || pcx.toks[ti].kind != Tok::Ident {
                 continue;
             }
-            let name = TOKS[ti].value as i64;
+            let name = pcx.toks[ti].value as i64;
             let use_ref = (flags & QF_USE) != 0;
             // Visible from where it is used.
             let from = if use_ref { old_reg } else { new_reg };
-            if user_pos(DEFS[it].start) && !DEFS[it].public && !within(from, new_home, tcx)
+            if user_pos(pcx.defs[it].start) && !pcx.defs[it].public
+                && !within(from, new_home, tcx, pcx)
                 && pubbed.get(it + 1) == 0 {
                 pubbed.put(it + 1, 1);
-                later_edit(DEFS[it].start, DEFS[it].start, text_of(c_slice(c"pub ")), &tcx);
+                later_edit(pcx.defs[it].start, pcx.defs[it].start, text_of(c_slice(c"pub ")), &tcx);
             }
-            chain_public(from, new_home, &tcx);
+            chain_public(from, new_home, &tcx, &pcx);
             if use_ref {
                 if moved_item {
                     let id = use_id_at(p, tcx);
@@ -398,35 +403,36 @@ pub fn analyze(tcx: inout Tcx<Comp>) -> bool {
                             tcx.mu_id.push(id);
                             tcx.mu_def.push(d);
                             let b = buf_new();
-                            import_path_in(b, d, module_of(use_node_of(id, tcx)), &tcx);
+                            import_path_in(b, d, module_of(use_node_of(id, tcx), &pcx), &tcx, &pcx);
                             tcx.mu_path.push(b);
                         }
                     }
                 }
                 continue;
             }
-            if qualified(p) {
+            if qualified(p, pcx) {
                 if moved_item && d == it {
                     let b = buf_new();
-                    put_region_path(b, new_home, &tcx);
+                    put_region_path(b, new_home, &tcx, pcx);
                     buf_str(b, c"::");
-                    later_edit(path_start(p), p, b, &tcx);
+                    later_edit(path_start(p, pcx), p, b, &tcx);
                 }
                 continue;
             }
-            let via_import = use_binding(old_reg, name) == d;
-            let was_local = old_home == old_reg && d == it && name == DEFS[d].name && !via_import;
+            let via_import = use_binding(old_reg, name, pcx) == d;
+            let was_local = old_home == old_reg && d == it && name == pcx.defs[d].name
+                && !via_import;
             if new_home == new_reg && d == it {
                 continue;
             }
             if !moved_code {
                 if was_local {
-                    need_import(new_reg, d, name, &tcx);
+                    need_import(new_reg, d, name, &tcx, &pcx);
                 }
                 continue;
             }
             if via_import || was_local {
-                need_import(new_reg, d, name, &tcx);
+                need_import(new_reg, d, name, &tcx, &pcx);
             }
         }
         !tcx.refused
@@ -436,7 +442,7 @@ pub fn analyze(tcx: inout Tcx<Comp>) -> bool {
 // The imports of moved items: a `use` whose names all move to one module
 // gets that module's path; else the names leave it for `use` lines of
 // their own.
-pub fn rewrite_imports(tcx: inout Tcx<Comp>) {
+pub fn rewrite_imports(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         for i in 0..tcx.mu_id.count {
             let id = tcx.mu_id.data[i];
@@ -447,7 +453,7 @@ pub fn rewrite_imports(tcx: inout Tcx<Comp>) {
             // Every name of u moves, to one place?
             var all = true;
             for k in 0..NODES[u].count {
-                let c = child(u, k);
+                let c = child(u, k, pcx);
                 var found = false;
                 for j in 0..tcx.mu_id.count {
                     if tcx.mu_id.data[j] == c
@@ -471,8 +477,8 @@ pub fn rewrite_imports(tcx: inout Tcx<Comp>) {
                 continue;
             }
             remove_use_names(u, id, &tcx);
-            add_import(module_of(u), tcx.mu_def.data[i], crate::tools::refactor_mod::use_local(id),
-                true, &tcx);
+            add_import(module_of(u, &pcx), tcx.mu_def.data[i],
+                crate::tools::refactor_mod::use_local(id), true, &tcx, &pcx);
         }
     }
 }
@@ -483,15 +489,15 @@ fn same_bytes_buf(a: i64, b: i64) -> bool {
 
 // Whether only blanks are before pos on its line, and after end (or a
 // comment).
-fn alone_on_lines(pos: i64, end: i64) -> bool {
-    var p = line_start(pos);
+fn alone_on_lines(pos: i64, end: i64, pcx: Ctx<Comp>) -> bool {
+    var p = line_start(pos, pcx);
     while p < pos && (SRC[p] == ' ' || SRC[p] == '\t') {
         p += 1;
     }
     if p != pos {
         return false;
     }
-    let e = line_end(end);
+    let e = line_end(end, pcx);
     var q = end;
     while q < e && (SRC[q] == ' ' || SRC[q] == '\t' || SRC[q] == '\r') {
         q += 1;
@@ -500,23 +506,23 @@ fn alone_on_lines(pos: i64, end: i64) -> bool {
 }
 
 // The edits of the `use` items: the names removed, the paths rewritten.
-pub fn emit_use_edits(tcx: inout Tcx<Comp>) {
+pub fn emit_use_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         for i in 0..tcx.drop_uses.count {
             let u = tcx.drop_uses.data[i];
             let n = NODES[u].count;
             var gone = 0;
             for k in 0..n {
-                if tcx.imports_dropped.get(child(u, k)) != 0 {
+                if tcx.imports_dropped.get(child(u, k, pcx)) != 0 {
                     gone += 1;
                 }
             }
             if gone == n {
-                let head = node_head(NODES[u].start);
-                if alone_on_lines(head, NODES[u].end) {
-                    delete_lines(line_start(head), NODES[u].end);
+                let head = node_head(NODES[u].start, pcx);
+                if alone_on_lines(head, NODES[u].end, pcx) {
+                    delete_lines(line_start(head, pcx), NODES[u].end, &pcx);
                 } else {
-                    put_edit(head, NODES[u].end, buf_new(), &tcx);
+                    put_edit(head, NODES[u].end, buf_new(), &tcx, &pcx);
                 }
                 continue;
             }
@@ -524,12 +530,12 @@ pub fn emit_use_edits(tcx: inout Tcx<Comp>) {
             // from the end of the one before)
             var last_kept = -1;
             for k in 0..n {
-                if tcx.imports_dropped.get(child(u, k)) == 0 {
+                if tcx.imports_dropped.get(child(u, k, pcx)) == 0 {
                     last_kept = k;
                 }
             }
             if n - gone == 1 && crate::tools::refactor_mod::braced(u)
-                && line_start(NODES[u].start) == line_start(NODES[u].end) {
+                && line_start(NODES[u].start, pcx) == line_start(NODES[u].end, pcx) {
                 // (one name left: `use p::{a};` is `use p::a;`)
                 var open = NODES[NODES[u].c].end;
                 while SRC[open] != '{' {
@@ -539,20 +545,21 @@ pub fn emit_use_edits(tcx: inout Tcx<Comp>) {
                 while SRC[close] != '}' {
                     close -= 1;
                 }
-                let kept = child(u, last_kept);
-                put_edit(open, close + 1, text_of(SRC[NODES[kept].start..NODES[kept].end]), &tcx);
+                let kept = child(u, last_kept, pcx);
+                put_edit(open, close + 1, text_of(SRC[NODES[kept].start..NODES[kept].end]), &tcx,
+                    &pcx);
                 continue;
             }
             for k in 0..n {
-                if tcx.imports_dropped.get(child(u, k)) == 0 {
+                if tcx.imports_dropped.get(child(u, k, pcx)) == 0 {
                     continue;
                 }
                 if k < last_kept {
-                    put_edit(NODES[child(u, k)].start, NODES[child(u, k + 1)].start, buf_new(),
-                        &tcx);
+                    put_edit(NODES[child(u, k, pcx)].start, NODES[child(u, k + 1, pcx)].start,
+                        buf_new(), &tcx, &pcx);
                 } else {
-                    put_edit(NODES[child(u, last_kept)].end, NODES[child(u, n - 1)].end, buf_new(),
-                        &tcx);
+                    put_edit(NODES[child(u, last_kept, pcx)].end, NODES[child(u, n - 1, pcx)].end,
+                        buf_new(), &tcx, &pcx);
                     break;
                 }
             }
@@ -562,7 +569,8 @@ pub fn emit_use_edits(tcx: inout Tcx<Comp>) {
             if t != 0 && NODES[u].kind == NodeKind::Use {
                 // (the path's segments: its node goes on to the names)
                 let c = NODES[u].c;
-                put_edit(NODES[c].start, NODES[child(c, NODES[c].count - 1)].end, t, &tcx);
+                put_edit(NODES[c].start, NODES[child(c, NODES[c].count - 1, pcx)].end, t, &tcx,
+                    &pcx);
             }
         }
     }

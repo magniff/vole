@@ -37,7 +37,7 @@ fixed	2 files	+23 -21 lines
 note fix.statics: statics 2; functions using them 4, given the parameter 4 (inout 2), owners 1; edits: uses 7, calls 6, parameters 4, statements given their arguments as lets 0; declarations deleted 2, imports taken out 2, use lines added 3; format arguments for holes 1; lent beside the context: taken into locals 1, left 0
 % git diff
 diff --git a/main.vl b/main.vl
-index d944ad2..c71ccb1 100644
+index 14bcb6e..a133c82 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -5,13 +5,14 @@
@@ -71,8 +71,8 @@ index d944ad2..c71ccb1 100644
  }
  
  // (lent a static of the group beside the context)
--fn add_to(x: inout i64, n: i64) {
-+fn add_to(x: inout i64, n: i64, cx: inout Cx) {
+-fn add_to(n: i64, x: inout i64) {
++fn add_to(n: i64, x: inout i64, cx: inout Cx) {
      x += n;
 -    bump();
 +    bump(&cx);
@@ -84,7 +84,7 @@ index d944ad2..c71ccb1 100644
  // (the owner)
  fn run() -> i64 {
 -    bump();
--    add_to(&TOTAL, 5);
+-    add_to(5, &TOTAL);
 -    let a = put(1, k: 2);
 -    let b = put(1, k: 2, by: 3);
 -    let s = show();
@@ -92,7 +92,7 @@ index d944ad2..c71ccb1 100644
 +    var cx = cx_new();
 +    bump(&cx);
 +    var cx_total = cx.total;
-+    add_to(&cx_total, 5, &cx);
++    add_to(5, &cx_total, &cx);
 +    cx.total = cx_total;
 +    let a = put(1, k: 2, cx: cx);
 +    let b = put(1, k: 2, cx: cx, by: 3);
@@ -141,7 +141,7 @@ fixed	2 files	+7 -10 lines
 note fix.statics: statics 1; functions using them 2, given the parameter 1 (inout 0), owners 0; edits: uses 2, calls 2, parameters 2, statements given their arguments as lets 0; declarations deleted 1, imports taken out 1, use lines added 0
 % git diff -- main.vl tab.vl | tail -n +1
 diff --git a/main.vl b/main.vl
-index d944ad2..30ece30 100644
+index 14bcb6e..07bafba 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -5,28 +5,29 @@
@@ -177,8 +177,8 @@ index d944ad2..30ece30 100644
  }
  
  // (lent a static of the group beside the context)
--fn add_to(x: inout i64, n: i64) {
-+fn add_to(x: inout i64, n: i64, cx: inout Cx) {
+-fn add_to(n: i64, x: inout i64) {
++fn add_to(n: i64, x: inout i64, cx: inout Cx) {
      x += n;
 -    bump();
 +    bump(&cx);
@@ -190,7 +190,7 @@ index d944ad2..30ece30 100644
  // (the owner)
  fn run() -> i64 {
 -    bump();
--    add_to(&TOTAL, 5);
+-    add_to(5, &TOTAL);
 -    let a = put(1, k: 2);
 -    let b = put(1, k: 2, by: 3);
 -    let s = show();
@@ -198,7 +198,7 @@ index d944ad2..30ece30 100644
 +    var cx = cx_new();
 +    bump(&cx);
 +    var cx_total = cx.total;
-+    add_to(&cx_total, 5, &cx);
++    add_to(5, &cx_total, &cx);
 +    cx.total = cx_total;
 +    let a = put(1, k: 2, cx: cx);
 +    let b = put(1, k: 2, cx: cx, by: 3);

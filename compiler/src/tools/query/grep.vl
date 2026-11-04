@@ -16,17 +16,16 @@ use crate::base::{
     buf_str, buf_write_fd, strlen,
 };
 use crate::base::comp::Comp;
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok, is_ident_byte};
+use crate::base::ctx::Ctx;
+use crate::front::lexer::{Tok, is_ident_byte};
 use crate::front::modules::{file_of_pos, module_at};
 use crate::tools::ctx::Tcx;
-use crate::tools::query::defs::{DEFS, mod_fqn};
+use crate::tools::query::defs::mod_fqn;
 use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
 use crate::tools::query::positions::{
     enclosing, line_of, line_start, rank_of, sort_by_keys, token_at,
 };
-use crate::tools::query::refs::{
-    IN_FILE, IN_MODULE, OPT_IN, REFS_BUDGET, file_text, put_line, put_short, ref_in,
-};
+use crate::tools::query::refs::{REFS_BUDGET, file_text, put_line, put_short, ref_in};
 use crate::tools::query::show::text_start;
 
 // The options of grep: which places (G_CODE | G_COMMENT | G_STRING; 0:
@@ -37,34 +36,32 @@ pub const G_STRING: i64 = 4;
 
 // Where the byte at pos is: G_CODE, G_COMMENT or G_STRING (between the
 // tokens is a comment, or space).
-fn place_of(pos: i64) -> i64 {
-    unsafe {
-        // (0.26.2: an embedded block's file, SOURCE_WGSL: by WGSL's rules)
-        let file = FILES[file_of_pos(pos)];
-        if file.kind == SOURCE_WGSL {
-            let text = crate::base::SRC[file.start..file.end];
-            return if crate::front::lexer::embedded::in_embedded_comment(text, pos - file.start) {
-                G_COMMENT } else { G_CODE };
-        }
-        var t = token_at(pos);
-        if t >= TOK_COUNT || TOKS[t].start != pos {
-            t -= 1;
-        }
-        if t < 0 || TOKS[t].kind == Tok::Eof || pos >= TOKS[t].end
-            || file_of_pos(TOKS[t].start) != file_of_pos(pos) {
-            return G_COMMENT;
-        }
-        let k = TOKS[t].kind;
-        // (0.26.0: an embedded block's text by its language's rules)
-        if k == Tok::Embedded {
-            let text = crate::base::SRC[TOKS[t].start..TOKS[t].end];
-            return if crate::front::lexer::embedded::in_embedded_comment(text, pos - TOKS[t].start) {
-                G_COMMENT } else { G_CODE };
-        }
-        // (0.21: an f-string's text pieces are its literal too)
-        if k == Tok::Str || k == Tok::CStr || k == Tok::Char || k == Tok::FHead || k == Tok::FMid
-            || k == Tok::FTail { G_STRING } else { G_CODE }
+fn place_of(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    // (0.26.2: an embedded block's file, SOURCE_WGSL: by WGSL's rules)
+    let file = FILES[file_of_pos(pos)];
+    if file.kind == SOURCE_WGSL {
+        let text = crate::base::SRC[file.start..file.end];
+        return if crate::front::lexer::embedded::in_embedded_comment(text, pos - file.start) {
+            G_COMMENT } else { G_CODE };
     }
+    var t = token_at(pos, pcx);
+    if t >= pcx.toks.len() as i64 || pcx.toks[t].start != pos {
+        t -= 1;
+    }
+    if t < 0 || pcx.toks[t].kind == Tok::Eof || pos >= pcx.toks[t].end
+        || file_of_pos(pcx.toks[t].start) != file_of_pos(pos) {
+        return G_COMMENT;
+    }
+    let k = pcx.toks[t].kind;
+    // (0.26.0: an embedded block's text by its language's rules)
+    if k == Tok::Embedded {
+        let text = crate::base::SRC[pcx.toks[t].start..pcx.toks[t].end];
+        return if crate::front::lexer::embedded::in_embedded_comment(text, pos - pcx.toks[t].start) {
+            G_COMMENT } else { G_CODE };
+    }
+    // (0.21: an f-string's text pieces are its literal too)
+    if k == Tok::Str || k == Tok::CStr || k == Tok::Char || k == Tok::FHead || k == Tok::FMid
+        || k == Tok::FTail { G_STRING } else { G_CODE }
 }
 
 fn place_name(p: i64) -> *u8 {
@@ -73,15 +70,15 @@ fn place_name(p: i64) -> *u8 {
 
 // (0.17) The item a comment at pos documents: the definition whose
 // comment lines (text_start) reach down from pos to it, or -1.
-fn documented(pos: i64) -> i64 {
+fn documented(pos: i64, pcx: Ctx<Comp>) -> i64 {
     let f = file_of_pos(pos);
     var best = -1;
-    for d in 0..DEFS.len() as i64 {
-        let s = DEFS[d].start;
-        if s <= pos || s >= FILES[f].end || (best >= 0 && s >= DEFS[best].start) {
+    for d in 0..pcx.defs.len() as i64 {
+        let s = pcx.defs[d].start;
+        if s <= pos || s >= FILES[f].end || (best >= 0 && s >= pcx.defs[best].start) {
             continue;
         }
-        if text_start(d) <= pos {
+        if text_start(d, pcx) <= pos {
             best = d;
         }
     }
@@ -116,14 +113,15 @@ pub fn lower(c: u8) -> u8 {
 
 // The hits of the patterns (C strings in pats), in order, each position
 // once, into out.
-fn find_hits(pats: IntVec, out: inout IntVec, tcx: Tcx<Comp>) {
+fn find_hits(pats: IntVec, out: inout IntVec, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for f in 0..FILES.len() as i64 {
             let generated = FILES[f].path[0] == '<';
             let m = FILES[f].module;
-            let asked = OPT_IN != 0 as *u8 && ((IN_FILE.count > f && IN_FILE.data[f] != 0)
-                || (m >= 0 && IN_MODULE.count > m && IN_MODULE.data[m] != 0));
+            let asked = pcx.opt_in != 0 as *u8
+                && ((pcx.in_file.count > f && pcx.in_file.data[f] != 0)
+                    || (m >= 0 && pcx.in_module.count > m && pcx.in_module.data[m] != 0));
             if generated && !asked {
                 continue;
             }
@@ -139,8 +137,8 @@ fn find_hits(pats: IntVec, out: inout IntVec, tcx: Tcx<Comp>) {
                 var pos = start;
                 while pos + pat.len as i64 <= end {
                     if (SRC[pos] == first || (tcx.opt_nocase && lower(SRC[pos]) == lower(first)))
-                        && hit_at(pos, end, pat, start, tcx) && ref_in(pos)
-                        && (tcx.opt_where == 0 || (tcx.opt_where & place_of(pos)) != 0) {
+                        && hit_at(pos, end, pat, start, tcx) && ref_in(pos, &pcx)
+                        && (tcx.opt_where == 0 || (tcx.opt_where & place_of(pos, pcx)) != 0) {
                         all.push(pos);
                     }
                     pos += 1;
@@ -167,15 +165,15 @@ fn find_hits(pats: IntVec, out: inout IntVec, tcx: Tcx<Comp>) {
 }
 
 // A `try:` line: the same grep with one more option (and its value).
-fn try_grep(pats: IntVec, option: *u8, value: [u8], tcx: inout Tcx<Comp>) {
+fn try_grep(pats: IntVec, option: *u8, value: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
-        let out = try_begin(c"grep", value[0..0], false, &tcx);
+        let out = try_begin(c"grep", value[0..0], false, &tcx, pcx);
         for k in 0..pats.count {
             put_cword(out, pats.data[k] as *u8);
         }
-        if OPT_IN != 0 as *u8 && !crate::base::streq(option, c"--in") {
+        if pcx.opt_in != 0 as *u8 && !crate::base::streq(option, c"--in") {
             buf_str(out, c" --in");
-            put_cword(out, OPT_IN);
+            put_cword(out, pcx.opt_in);
         }
         if (tcx.opt_where & G_CODE) != 0 {
             buf_str(out, c" --code");
@@ -202,10 +200,10 @@ fn try_grep(pats: IntVec, option: *u8, value: [u8], tcx: inout Tcx<Comp>) {
 }
 
 // `query grep PATTERN...`: the exit status (0, also for no hit).
-pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>) -> i64 {
+pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var hits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_hits(pats, &hits, tcx);
+        find_hits(pats, &hits, tcx, &pcx);
         let out = buf_new();
         let total = hits.count;
         if tcx.opt_count {
@@ -217,9 +215,9 @@ pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>) -> i64 {
         if total == 0 {
             let d = diag(c"note", c"query.empty", &tcx);
             buf_str(d, c"0 hits");
-            if OPT_IN != 0 as *u8 {
+            if pcx.opt_in != 0 as *u8 {
                 buf_str(d, c" in ");
-                buf_str(d, OPT_IN);
+                buf_str(d, pcx.opt_in);
             }
             buf_byte(d, '\n');
             return 0;
@@ -255,10 +253,10 @@ pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>) -> i64 {
             buf_int(d, files.count);
             buf_str(d, if files.count == 1 { c" file\n" } else { c" files\n" });
             if files.count > 1 {
-                try_grep(pats, c"--in", file_text(biggest), &tcx);
+                try_grep(pats, c"--in", file_text(biggest), &tcx, pcx);
             }
-            try_grep(pats, c"--limit 60", file_text(biggest)[0..0], &tcx);
-            try_grep(pats, c"--all", file_text(biggest)[0..0], &tcx);
+            try_grep(pats, c"--limit 60", file_text(biggest)[0..0], &tcx, pcx);
+            try_grep(pats, c"--all", file_text(biggest)[0..0], &tcx, pcx);
             return 0;
         }
         let shown = if tcx.opt_limit >= 0 && tcx.opt_limit < total { tcx.opt_limit } else { total };
@@ -272,23 +270,24 @@ pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>) -> i64 {
                 buf_byte(out, '\n');
                 cur = f;
             }
-            buf_int(out, line_of(pos));
+            buf_int(out, line_of(pos, pcx));
             buf_byte(out, ':');
-            buf_int(out, pos - line_start(pos) + 1);
+            buf_int(out, pos - line_start(pos, pcx) + 1);
             buf_byte(out, '\t');
-            buf_str(out, place_name(place_of(pos)));
+            buf_str(out, place_name(place_of(pos, pcx)));
             buf_byte(out, '\t');
-            var e = enclosing(pos, tcx);
-            if place_of(pos) == G_COMMENT {
+            var e = enclosing(pos, tcx, pcx);
+            if place_of(pos, pcx) == G_COMMENT {
                 // (a doc comment: the item below it, 0.17)
-                let doc = documented(pos);
-                if doc >= 0 && (e < 0 || DEFS[e].start < DEFS[doc].start) {
+                let doc = documented(pos, pcx);
+                if doc >= 0 && (e < 0 || pcx.defs[e].start < pcx.defs[doc].start) {
                     e = doc;
                 }
             }
-            put_short(out, if e >= 0 { DEFS[e].fqn } else { mod_fqn(module_at(pos), &tcx) });
+            put_short(out,
+                if e >= 0 { pcx.defs[e].fqn } else { mod_fqn(module_at(pos, &pcx), &tcx, pcx) });
             buf_byte(out, '\t');
-            put_line(out, pos);
+            put_line(out, pos, pcx);
             buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
@@ -300,9 +299,9 @@ pub fn query_grep(pats: IntVec, tcx: inout Tcx<Comp>) -> i64 {
             buf_int(d, total);
             buf_str(d, c" hits\n");
             if files.count > 1 {
-                try_grep(pats, c"--in", file_text(biggest), &tcx);
+                try_grep(pats, c"--in", file_text(biggest), &tcx, pcx);
             }
-            try_grep(pats, c"--all", file_text(biggest)[0..0], &tcx);
+            try_grep(pats, c"--all", file_text(biggest)[0..0], &tcx, pcx);
         }
         0
     }

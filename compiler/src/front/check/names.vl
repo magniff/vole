@@ -9,15 +9,16 @@ use crate::base::{
     BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free, intern,
     sym_text,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_fix, err_fix_word,
-    err_fixable, err_help, err_help_fmt, err_help_sym, err_pos, err_str, err_sym, err_try,
-    err_try_fmt,
+    edit_distance, err_begin, err_end, err_failed_name, err_fix, err_fix_word, err_fixable,
+    err_help, err_help_fmt, err_help_sym, err_pos, err_str, err_sym, err_try, err_try_fmt,
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{CONV_NEW, FN_UNSAFE, NODES, NodeKind, new_node};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
-use crate::front::check::{CHECK_UNCHECKED, CUR_FN, LOCALS, Res, lookup_local, name_error};
+use crate::front::check::{LOCALS, Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_FN_VALUE, unsafe_op};
 use crate::front::cimport::c_import_skip_reason;
@@ -26,9 +27,7 @@ use crate::front::distinct::is_view_distinct;
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
 use crate::front::generics::instantiate::{fn_instance, push_written_targs};
 use crate::front::lexer::Tok;
-use crate::front::modules::{
-    CUR_MOD, C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count, within_std,
-};
+use crate::front::modules::{MODULES, STD_MODULE, item_key_if_known, module_count, within_std};
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
     binding_value, help_std_path, is_prelude_name, lookup_item, lookup_name, lookup_quiet,
@@ -38,43 +37,43 @@ use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::stdsrc::std_source;
 use crate::front::threadlocal::note_static_use;
 use crate::front::types::{
-    CONSTS, ENUMS, FNS, STATICS, SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_PRIMITIVE, SYM_STATIC,
-    SYM_STRUCT, TSCRATCH, TY_ERROR, TY_STRING, TyKind, VARIANTS, buf_type, enum_type, err_type,
-    fn_param, is_pointer, item_node_of, make_type,
+    ENUMS, FNS, STATICS, SYM_STATIC, TSCRATCH, TY_ERROR, TyKind, VARIANTS, buf_type, enum_type,
+    err_type, fn_param, is_pointer, item_node_of, make_type,
 };
 use crate::tools::fix::note_missing_use;
 
-pub fn synth_name(n: i64) -> i64 {
+pub fn synth_name(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let name = NODES[n].a;
         let resolved = (NODES[n].p & NODE_RESOLVED) != 0;
         if !resolved {
-            match lookup_local(name) {
+            match lookup_local(name, pcx) {
                 Option::Some(local) => {
                     if NODES[n].g != 0 {
                         name_error(NODES[n].start, c"'", name,
-                            c"' is a variable, not a generic function");
+                            c"' is a variable, not a generic function", &pcx);
                     }
                     NODES[n].res = Res::Local;
                     NODES[n].y = local;
-                    note_local_use(n, local);
+                    note_local_use(n, local, &pcx);
                     if LOCALS[local].access && (NODES[n].p & CONV_NEW) == 0 {
                         // (0.20) an access is used as the value it designates:
                         // `x` is `*x` (`&x`: `&*x`, a reborrow), conventions.md D12
-                        return access_use(n);
+                        return access_use(n, &pcx);
                     }
                     return LOCALS[local].ty;
                 }
                 Option::None => {}
             }
         }
-        let b = if resolved { binding(B_ITEM, name) } else { lookup_item(CUR_MOD, name, CUR_MOD) };
+        let b = if resolved { binding(B_ITEM, name) }
+            else { lookup_item(pcx.cur_mod, name, pcx.cur_mod, &pcx) };
         if !resolved {
-            note_c_use(NODES[n].start, name, b);
+            note_c_use(NODES[n].start, name, b, &pcx);
         }
         let kind = binding_kind(b);
         if kind == B_PRIVATE {
-            access_error(b, NODES[n].start, name);
+            access_error(b, NODES[n].start, name, &pcx);
         }
         if kind == B_VARIANT {
             // A variant brought into scope by `use E::...;`: `E::V`.
@@ -83,7 +82,7 @@ pub fn synth_name(n: i64) -> i64 {
             NODES[n].a = VARIANTS[v].name;
             NODES[n].b = VARIANTS[v].name;
             NODES[n].y = enum_type(VARIANTS[v].enum_id);
-            return synth_expr(n);
+            return synth_expr(n, &pcx);
         }
         if kind == B_TVARIANT {
             // A variant of a generic enum (0.6): its type arguments inferred
@@ -91,46 +90,46 @@ pub fn synth_name(n: i64) -> i64 {
             NODES[n].kind = Path;
             NODES[n].b = name;
             NODES[n].y = -binding_value(b) - 1;
-            return synth_expr(n);
+            return synth_expr(n, &pcx);
         }
         if kind == B_MODULE {
-            name_error(NODES[n].start, c"'", name, c"' is a module, not a value");
+            name_error(NODES[n].start, c"'", name, c"' is a module, not a value", &pcx);
         }
         if kind != B_ITEM {
             // (0.26.3: `format(x)`: `format_in(x, gpa)`)
-            if !CHECK_UNCHECKED && binding_kind(lookup_item(CUR_MOD,
-                crate::front::check::alloc_rules::in_name(name), CUR_MOD)) == B_ITEM {
-                crate::front::check::alloc_rules::no_in_error(n, name, SYMS[name].text);
+            if !pcx.check_unchecked && binding_kind(lookup_item(pcx.cur_mod,
+                crate::front::check::alloc_rules::in_name(name), pcx.cur_mod, &pcx)) == B_ITEM {
+                crate::front::check::alloc_rules::no_in_error(n, name, SYMS[name].text, &pcx);
             }
-            if CHECK_UNCHECKED {
+            if pcx.check_unchecked {
                 // (a binding of what was not parsed: the rest goes on)
                 return TY_ERROR;
             }
-            unknown_name_error(NODES[n].start, c"undefined variable '", name);
+            unknown_name_error(NODES[n].start, c"undefined variable '", name, &pcx);
         }
         let key = binding_value(b);
-        if SYM_CONST[key] != 0 {
-            let c = SYM_CONST[key] - 1;
-            let init = NODES[CONSTS[c].node].c;
-            if NODES[init].kind == CStr && is_pointer(CONSTS[c].ty) {
+        if pcx.sym_const[key] != 0 {
+            let c = pcx.sym_const[key] - 1;
+            let init = NODES[pcx.consts[c].node].c;
+            if NODES[init].kind == CStr && is_pointer(pcx.consts[c].ty) {
                 // A C string constant: the literal itself.
                 NODES[n].kind = CStr;
                 NODES[n].a = NODES[init].a;
-                return CONSTS[c].ty;
+                return pcx.consts[c].ty;
             }
             if NODES[init].kind == Str
-                && (CONSTS[c].ty == TY_STRING || is_view_distinct(CONSTS[c].ty)) {
+                && (pcx.consts[c].ty == pcx.ty_string || is_view_distinct(pcx.consts[c].ty)) {
                 // A string constant (0.14; a `str` one, 0.25.4): the literal
                 // itself. (A `str` constant read as a `Res::Const` was lowered
                 // as an integer, `ir_const(0)`: a null slice, a crash.)
                 NODES[n].kind = Str;
                 NODES[n].a = NODES[init].a;
                 NODES[n].b = NODES[init].b;
-                return CONSTS[c].ty;
+                return pcx.consts[c].ty;
             }
             NODES[n].res = Res::Const;
             NODES[n].y = c;
-            return CONSTS[NODES[n].y].ty;
+            return pcx.consts[NODES[n].y].ty;
         }
         if SYM_STATIC[key] != 0 {
             NODES[n].res = Res::Static;
@@ -138,51 +137,52 @@ pub fn synth_name(n: i64) -> i64 {
             // The code generators find statics by their symbol.
             NODES[n].a = NODES[STATICS[NODES[n].y].node].a;
             // (0.21: a thread-local brings std's __tls_addr)
-            note_static_use(NODES[n].y, n);
+            note_static_use(NODES[n].y, n, &pcx);
             return STATICS[NODES[n].y].ty;
         }
-        if SYM_FN[key] != 0 {
-            var f = SYM_FN[key] - 1;
+        if pcx.sym_fn[key] != 0 {
+            var f = pcx.sym_fn[key] - 1;
             if FNS[f].variadic {
                 name_error(NODES[n].start, c"variadic function '", name,
-                    c"' cannot be used as a value");
+                    c"' cannot be used as a value", &pcx);
             }
             if FNS[f].generic > 0 {
                 // `max::<i64>` as a value: the arguments must be written.
                 if NODES[n].g == 0 {
                     name_error(NODES[n].start, c"generic function '", name,
-                        c"' needs its type arguments to be used as a value ('f::<T>')");
+                        c"' needs its type arguments to be used as a value ('f::<T>')", &pcx);
                 }
                 if NODES[NODES[n].g].count != FNS[f].generic {
                     targ_count_error(NODES[n].start, c"function", FNS[f].display, FNS[f].generic,
-                        NODES[NODES[n].g].count);
+                        NODES[NODES[n].g].count, &pcx);
                 }
                 let mark = TSCRATCH.count;
-                push_written_targs(NODES[n].g);
-                f = fn_instance(f, mark, n);
+                push_written_targs(NODES[n].g, &pcx);
+                f = fn_instance(f, mark, n, &pcx);
             } else if NODES[n].g != 0 {
-                name_error(NODES[n].start, c"function '", name, c"' is not generic");
+                name_error(NODES[n].start, c"function '", name, c"' is not generic", &pcx);
             }
             NODES[n].res = Res::Fn;
             NODES[n].y = f;
-            ensure_checked(f, n);
+            ensure_checked(f, n, &pcx);
             if (FNS[f].attrs & FN_UNSAFE) != 0 {
                 unsafe_op(n, U_FN_VALUE,
-                    c"using an `unsafe fn` as a value is unsafe (its callers are not checked)");
+                    c"using an `unsafe fn` as a value is unsafe (its callers are not checked)",
+                    &pcx);
             }
             return fn_value_type(f);
         }
-        if SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0 {
-            name_error(NODES[n].start, c"'", name, c"' is a type, not a value");
+        if pcx.sym_struct[key] != 0 || pcx.sym_enum[key] != 0 || pcx.sym_alias[key] != 0 {
+            name_error(NODES[n].start, c"'", name, c"' is a type, not a value", &pcx);
         }
-        unknown_name_error(NODES[n].start, c"undefined variable '", name)
+        unknown_name_error(NODES[n].start, c"undefined variable '", name, &pcx)
     }
 }
 
 // (0.20) Ident n, a use of an access local (front/check: Local.access),
 // becomes `*n`: the place it designates. (The Ident inside is flagged
 // CONV_NEW, so that it is the reference.)
-fn access_use(n: i64) -> i64 {
+fn access_use(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let inner = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
     NODES[inner] = NODES[n];
     NODES[inner].p |= CONV_NEW;
@@ -193,7 +193,7 @@ fn access_use(n: i64) -> i64 {
     NODES[n].count = 0;
     NODES[n].list = 0;
     NODES[n].p = NODES[n].p & NODE_RESOLVED;
-    synth_expr(n)
+    synth_expr(n, &pcx)
 }
 
 // An Ident whose `a` is already a key (a path resolved to an item).
@@ -202,9 +202,9 @@ pub const NODE_RESOLVED: i64 = 2;
 // The enum type of the variant `name` in scope, in a pattern (p) against
 // a value of type `ty`, or 0 when `name` is no variant: a generic enum's
 // variant (0.6) takes the instance `ty`.
-pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
+pub fn used_variant_enum(name: i64, ty: i64, p: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
+        let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, &pcx);
         if binding_kind(b) == B_VARIANT {
             return enum_type(VARIANTS[binding_value(b)].enum_id);
         }
@@ -213,14 +213,14 @@ pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
         }
         let e = binding_value(b);
         if !instance_of(ty, -e - 1) {
-            err_begin(NODES[p].start);
-            err_str(c"expected '");
-            err_type(ty);
-            err_str(c"', got a pattern of '");
-            err_sym(ENUMS[e].name);
-            err_str(c"'");
-            pattern_enum_help(ty, SYMS[ENUMS[e].name].text);
-            err_end();
+            err_begin(NODES[p].start, &pcx);
+            err_str(c"expected '", pcx);
+            err_type(ty, pcx);
+            err_str(c"', got a pattern of '", pcx);
+            err_sym(ENUMS[e].name, pcx);
+            err_str(c"'", pcx);
+            pattern_enum_help(ty, SYMS[ENUMS[e].name].text, pcx);
+            err_end(&pcx);
         }
         ty
     }
@@ -229,53 +229,49 @@ pub fn used_variant_enum(name: i64, ty: i64, p: i64) -> i64 {
 // (0.25.2.2, eval 0.25.2.1: windtunnel) The help of a pattern of Option
 // against a Result (`match parse_int(s) { Some(n) => .. }`), or of Result
 // against an Option: the patterns of the value's own enum.
-pub fn pattern_enum_help(ty: i64, pat: [u8]) {
+pub fn pattern_enum_help(ty: i64, pat: [u8], pcx: Ctx<Comp>) {
     let b = buf_new();
     buf_type(b, ty);
     let v = buf_slice(b);
     if v.len > 7 && v[0..7] == "Result<" && pat == "Option" {
         err_help(
-            c"the value is a Result: its patterns are `Ok(x)` and `Err(e)`; `.ok()` makes it an Option (`match r.ok() { Some(x) => ..., None => ... }`), `.unwrap_or(d)` gives the value or d");
+            c"the value is a Result: its patterns are `Ok(x)` and `Err(e)`; `.ok()` makes it an Option (`match r.ok() { Some(x) => ..., None => ... }`), `.unwrap_or(d)` gives the value or d", pcx);
     } else if v.len > 7 && v[0..7] == "Option<" && pat == "Result" {
         err_help(
-            c"the value is an Option: its patterns are `Some(x)` and `None`; `.ok_or(e)` makes it a Result");
+            c"the value is an Option: its patterns are `Some(x)` and `None`; `.ok_or(e)` makes it a Result", pcx);
     }
 }
 
 // Whether `name` is a constant in the current scope (its index + 1, or 0).
-pub fn scope_const(name: i64) -> i64 {
-    let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
-    if binding_kind(b) == B_ITEM { unsafe { SYM_CONST[binding_value(b)] } } else { 0 }
+pub fn scope_const(name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, &pcx);
+    if binding_kind(b) == B_ITEM { unsafe { pcx.sym_const[binding_value(b)] } } else { 0 }
 }
 
-// The position of the callee being checked, when it is a name (0.14): an
-// unknown one with no near name points to std's API.
-pub static var CALLEE_POS: i64 = -1;
-
 // An unknown name; when a C header left it out, why.
-pub fn unknown_name_error(pos: i64, before: *u8, name: i64) -> ! {
+pub fn unknown_name_error(pos: i64, before: *u8, name: i64, pcx: inout Ctx<Comp>) -> ! {
     unsafe {
-        err_begin(pos);
-        err_str(before);
-        err_sym(name);
-        err_str(c"'");
-        err_failed_name(name);
-        let reason = c_import_skip_reason(name);
+        err_begin(pos, &pcx);
+        err_str(before, pcx);
+        err_sym(name, pcx);
+        err_str(c"'", pcx);
+        err_failed_name(name, pcx);
+        let reason = c_import_skip_reason(name, pcx);
         if reason != 0 as *u8 {
-            err_help(c"'");
-            err_help_sym(name);
-            err_help(c"' was not imported from the C headers: ");
-            err_help(reason);
+            err_help(c"'", pcx);
+            err_help_sym(name, pcx);
+            err_help(c"' was not imported from the C headers: ", pcx);
+            err_help(reason, pcx);
         } else if before[0] == 'u' && before[2] == 'd' && SYMS[name].text == "gpa" {
             // (0.25.2.1: the allocator is a parameter, a test's too)
-            let cur = CUR_FN;
+            let cur = pcx.cur_fn;
             crate::front::ambient::gpa_param_help(if cur >= 0 { FNS[cur].node } else { -1 },
-                if cur >= 0 { sym_text(FNS[cur].display) } else { "" });
+                if cur >= 0 { sym_text(FNS[cur].display) } else { "" }, pcx);
         } else if before[0] == 'u' && before[1] == 'n' && (before[2] == 'd' || before[2] == 'k') {
             // (`undefined variable '`, `unknown type '`, `unknown struct '`)
-            suggest_name(name, before[2] == 'd', pos == CALLEE_POS || before[2] == 'k');
+            suggest_name(name, before[2] == 'd', pos == pcx.callee_pos || before[2] == 'k', &pcx);
         }
-        err_end()
+        err_end(&pcx)
     }
 }
 
@@ -308,12 +304,12 @@ pub fn std_synonym_help(name: [u8]) -> [u8] {
 // a `use` item's; seen from module `from`, std being `std_module`;
 // `has_help`: the error has a help already. Whether there was a help.
 pub fn help_std_elsewhere(target: i64, name: i64, in_use: bool, std_module: i64, from: i64,
-    has_help: bool) -> bool {
+    has_help: bool, pcx: inout Ctx<Comp>) -> bool {
     if !within_std(target) || has_help {
         return false;
     }
     let t = sym_text(name);
-    if is_prelude_name(name) {
+    if is_prelude_name(name, &pcx) {
         let w = buf_new();
         buf_bytes(w, t);
         if t.len > 0 && t[0] >= 'a' && t[0] <= 'z' && t != "str" {
@@ -322,37 +318,38 @@ pub fn help_std_elsewhere(target: i64, name: i64, in_use: bool, std_module: i64,
         let written = buf_slice(w);
         if in_use {
             err_help_fmt(
-                format_args("'{t}' is in the prelude: every module has it without a `use` or a path; delete this line and write `{written}`"));
+                format_args("'{t}' is in the prelude: every module has it without a `use` or a path; delete this line and write `{written}`"), pcx);
         } else {
-            err_help_fmt(format_args("'{t}' is in the prelude: write `{written}`, with no path"));
+            err_help_fmt(format_args("'{t}' is in the prelude: write `{written}`, with no path"),
+                pcx);
         }
-        err_try_fmt(written);
+        err_try_fmt(written, pcx);
         return true;
     }
     if target != std_module && std_module >= 0
-        && binding_kind(lookup_quiet(std_module, name, from)) == B_ITEM {
-        err_help_fmt(format_args("'{t}' is std's own item: `std::{t}`"));
+        && binding_kind(lookup_quiet(std_module, name, from, &pcx)) == B_ITEM {
+        err_help_fmt(format_args("'{t}' is std's own item: `std::{t}`"), pcx);
         if in_use {
-            err_try_fmt(format_args("use std::{t};"));
+            err_try_fmt(format_args("use std::{t};"), pcx);
         } else {
-            err_try_fmt(format_args("std::{t}"));
+            err_try_fmt(format_args("std::{t}"), pcx);
         }
         return true;
     }
-    let at0 = import_path_for(name, true);
-    let at = if at0 != 0 { at0 } else { import_path_for(name, false) };
+    let at0 = import_path_for(name, true, &pcx);
+    let at = if at0 != 0 { at0 } else { import_path_for(name, false, &pcx) };
     if at != 0 {
-        err_help_fmt(format_args("'{t}' is in {}", buf_slice(at)));
+        err_help_fmt(format_args("'{t}' is in {}", buf_slice(at)), pcx);
         if in_use {
-            err_try_fmt(format_args("use {}::{t};", buf_slice(at)));
+            err_try_fmt(format_args("use {}::{t};", buf_slice(at)), pcx);
         } else {
-            err_try_fmt(format_args("{}::{t}", buf_slice(at)));
+            err_try_fmt(format_args("{}::{t}", buf_slice(at)), pcx);
         }
         return true;
     }
     if has_part(t, "gpa") || has_part(t, "alloc") || has_part(t, "heap") {
         err_help(
-            c"std has no global allocator: main takes one, `fn main(gpa: Gpa)`, and passes it down as a parameter (a #[test] fn takes one too: `#[test] fn t(gpa: Gpa)`)");
+            c"std has no global allocator: main takes one, `fn main(gpa: Gpa)`, and passes it down as a parameter (a #[test] fn takes one too: `#[test] fn t(gpa: Gpa)`)", pcx);
         return true;
     }
     false
@@ -376,101 +373,96 @@ fn has_part(t: [u8], part: [u8]) -> bool {
 // read (0.14), what replaces a Rust type, else the nearest name in scope or
 // in std (`did you mean 'x'?`), what std reads input with, or where std's
 // API is listed.
-fn suggest_name(name: i64, value: bool, hint_std: bool) {
+fn suggest_name(name: i64, value: bool, hint_std: bool, pcx: inout Ctx<Comp>) {
     unsafe {
         // (0.18.1: and `Reverse(x)`, a value, as a type)
-        if (!value || SYMS[name].text == "Reverse") && rust_type_help(name) {
+        if (!value || SYMS[name].text == "Reverse") && rust_type_help(name, &pcx) {
             return;
         }
         // (0.25.2.1: a function std has under another name)
         let syn = std_synonym_help(SYMS[name].text);
         if value && syn.len > 0 {
-            err_help_fmt(syn);
+            err_help_fmt(syn, pcx);
             return;
         }
-        var path = import_path_for(name, value);
-        if path == 0 && IMPORT_PATHS != 0 {
+        var path = import_path_for(name, value, &pcx);
+        if path == 0 && pcx.import_paths != 0 {
             // (0.25.3) several modules have it, none named in the file: each
-            err_help(c"'");
-            err_help_sym(name);
-            err_help(c"' is in several modules: add ");
-            buf_bytes(ERR_HELP, buf_slice(IMPORT_PATHS));
+            err_help(c"'", pcx);
+            err_help_sym(name, pcx);
+            err_help(c"' is in several modules: add ", pcx);
+            buf_bytes(pcx.err_help, buf_slice(pcx.import_paths));
             return;
         }
-        if path == 0 && STD_MODULE < 0 && std_has(name, value) {
+        if path == 0 && STD_MODULE < 0 && std_has(name, value, &pcx) {
             path = buf_new();
             buf_str(path, c"std");
         }
         if path != 0 {
-            note_missing_use(CUR_MOD, intern(buf_slice(path)), name);
-            err_help(c"add `use ");
-            buf_bytes(ERR_HELP, buf_slice(path));
-            err_help(c"::");
-            err_help_sym(name);
-            err_help(c";`");
+            note_missing_use(pcx.cur_mod, intern(buf_slice(path)), name, &pcx);
+            err_help(c"add `use ", pcx);
+            buf_bytes(pcx.err_help, buf_slice(path));
+            err_help(c"::", pcx);
+            err_help_sym(name, pcx);
+            err_help(c";`", pcx);
             // (0.18: `fix --suggested` adds it, as `fix --only imports`)
-            err_fixable();
+            err_fixable(&pcx);
             return;
         }
         var tie = false;
-        let near = nearest_name(name, value, &tie);
+        let near = nearest_name(name, value, &tie, &pcx);
         if near >= 0 {
-            err_help(c"did you mean '");
-            err_help_sym(near);
-            err_help(c"'?");
+            err_help(c"did you mean '", pcx);
+            err_help_sym(near, pcx);
+            err_help(c"'?", pcx);
             if !tie {
-                err_fix_word(err_pos(), SYMS[name].text, SYMS[near].text);
+                err_fix_word(err_pos(pcx), SYMS[name].text, SYMS[near].text, &pcx);
             }
             return;
         }
-        if value && rust_input_help(name) {
+        if value && rust_input_help(name, pcx) {
             return;
         }
         var in_std = near_to(name);
-        std_names();
-        for i in 0..STD_NAMES.count / 2 {
-            if (STD_NAMES.data[2 * i + 1] != 0) == value {
-                in_std.offer(STD_NAMES.data[2 * i]);
+        std_names(&pcx);
+        for i in 0..pcx.std_names.count / 2 {
+            if (pcx.std_names.data[2 * i + 1] != 0) == value {
+                in_std.offer(pcx.std_names.data[2 * i], &pcx);
             }
         }
-        if in_std.best >= 0 && is_prelude_name(in_std.best) {
+        if in_std.best >= 0 && is_prelude_name(in_std.best, &pcx) {
             // (0.17) a name of the prelude: no `use`
-            err_help(c"did you mean '");
-            err_help_sym(in_std.best);
-            err_help(c"'?");
+            err_help(c"did you mean '", pcx);
+            err_help_sym(in_std.best, pcx);
+            err_help(c"'?", pcx);
             if !in_std.tie {
-                err_fix_word(err_pos(), SYMS[name].text, SYMS[in_std.best].text);
+                err_fix_word(err_pos(pcx), SYMS[name].text, SYMS[in_std.best].text, &pcx);
             }
             return;
         }
         if in_std.best >= 0 {
-            err_help(c"did you mean 'std::");
-            err_help_sym(in_std.best);
-            err_help(c"'? (`use std::");
-            err_help_sym(in_std.best);
-            err_help(c";`)");
+            err_help(c"did you mean 'std::", pcx);
+            err_help_sym(in_std.best, pcx);
+            err_help(c"'? (`use std::", pcx);
+            err_help_sym(in_std.best, pcx);
+            err_help(c";`)", pcx);
             if !in_std.tie {
                 let b = buf_new();
                 buf_str(b, c"std::");
                 buf_bytes(b, SYMS[in_std.best].text);
-                err_fix_word(err_pos(), SYMS[name].text, buf_slice(b));
+                err_fix_word(err_pos(pcx), SYMS[name].text, buf_slice(b), &pcx);
             }
             return;
         }
-        if hint_std && !crate::front::modules::within_std(CUR_MOD)
+        if hint_std && !crate::front::modules::within_std(pcx.cur_mod)
             && SYMS[name].text.len > 2 {
-            err_help(c"std's names: `volec guide std`");
+            err_help(c"std's names: `volec guide std`", pcx);
         }
     }
 }
 
-// std's public items (0.14), read from its source once an unknown name asks
-// for them (std is read only when a program names it): pairs (name, 1 for a
-// value: fn, const, static; 0 for a type: struct, enum, trait, type).
-static var STD_NAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn std_names() {
-    if STD_NAMES.count > 0 {
+fn std_names(pcx: inout Ctx<Comp>) {
+    if pcx.std_names.count > 0 {
         return;
     }
     let src = buf_new();
@@ -518,8 +510,8 @@ fn std_names() {
             n += 1;
         }
         if n > 0 {
-            STD_NAMES.push(intern(rest[0..n]));
-            STD_NAMES.push(value);
+            pcx.std_names.push(intern(rest[0..n]));
+            pcx.std_names.push(value);
         }
     }
 }
@@ -529,11 +521,11 @@ fn is_ident_byte(x: u8) -> bool {
 }
 
 // Whether std has a public value (or type) `name`.
-pub fn std_has(name: i64, value: bool) -> bool {
+pub fn std_has(name: i64, value: bool, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        std_names();
-        for i in 0..STD_NAMES.count / 2 {
-            if STD_NAMES.data[2 * i] == name && (STD_NAMES.data[2 * i + 1] != 0) == value {
+        std_names(&pcx);
+        for i in 0..pcx.std_names.count / 2 {
+            if pcx.std_names.data[2 * i] == name && (pcx.std_names.data[2 * i + 1] != 0) == value {
                 return true;
             }
         }
@@ -543,16 +535,16 @@ pub fn std_has(name: i64, value: bool) -> bool {
 
 // The help of an unknown function a Rust or Python programmer reads input
 // or parses numbers with (0.14).
-fn rust_input_help(name: i64) -> bool {
+fn rust_input_help(name: i64, pcx: Ctx<Comp>) -> bool {
     let t = SYMS[name].text;
     if t == "read_to_string" || t == "read_all" || t == "stdin" || t == "input"
         || t == "read_input" || t == "read" || t == "lines" || t == "read_lines"
         || t == "getline" || t == "gets" || t == "scanf" {
-        err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Vec<u8>), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)");
+        err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Vec<u8>), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)", pcx);
     } else if t == "parse" || t == "atoi" || t == "parse_i64" || t == "to_int"
         || t == "int" || t == "from_str" {
         err_help(
-            c"`parse_int(s)` (a Result<i64, ParseIntError>); `split_whitespace_in(s, gpa)`, `trim(s)`");
+            c"`parse_int(s)` (a Result<i64, ParseIntError>); `split_whitespace_in(s, gpa)`, `trim(s)`", pcx);
     } else {
         return false;
     }
@@ -563,39 +555,39 @@ fn rust_input_help(name: i64) -> bool {
 // vole has instead, exactly (0.17: the type to write as the try: line
 // when there is one); whether there was one. (0.18.1) `Reverse`, a value
 // too (`Reverse(x)`).
-fn rust_type_help(name: i64) -> bool {
+fn rust_type_help(name: i64, pcx: inout Ctx<Comp>) -> bool {
     let text = SYMS[name].text;
     if text == "String" {
-        err_help(c"text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`)");
-        err_try(c"[u8]");
-        rust_type_fix(text, "[u8]");
+        err_help(c"text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`)", pcx);
+        err_try(c"[u8]", pcx);
+        rust_type_fix(text, "[u8]", &pcx);
     } else if text == "str" {
-        err_help(c"`&str` and `str` are `[u8]`: a slice of bytes, as string literals are");
-        err_try(c"[u8]");
-        rust_type_fix(text, "[u8]");
+        err_help(c"`&str` and `str` are `[u8]`: a slice of bytes, as string literals are", pcx);
+        err_try(c"[u8]", pcx);
+        rust_type_fix(text, "[u8]", &pcx);
     } else if text == "char" {
-        err_help(c"`u8`: text is bytes, and 'a' is a u8");
-        err_try(c"u8");
-        rust_type_fix(text, "u8");
+        err_help(c"`u8`: text is bytes, and 'a' is a u8", pcx);
+        err_try(c"u8", pcx);
+        rust_type_fix(text, "u8", &pcx);
     } else if text == "usize" || text == "isize" {
-        err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)");
-        err_try(c"i64");
-        rust_type_fix(text, "i64");
+        err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)", pcx);
+        err_try(c"i64", pcx);
+        rust_type_fix(text, "i64", &pcx);
     } else if text == "Reverse" {
         // (0.18.1) Rust's min-heap, `BinaryHeap<Reverse<T>>`, and its
         // `Reverse(x)`: no tuple structs here
-        err_help(c"a min-heap is `MinHeap<T>` (prelude): `h.push(x)`, `h.pop()` gives the smallest first, no wrapper; `BinaryHeap<T>` pops the largest");
-        err_try(c"MinHeap<T>");
+        err_help(c"a min-heap is `MinHeap<T>` (prelude): `h.push(x)`, `h.pop()` gives the smallest first, no wrapper; `BinaryHeap<T>` pops the largest", pcx);
+        err_try(c"MinHeap<T>", pcx);
     } else if text == "VecDeque" || text == "LinkedList" {
-        err_help(c"a `Vec<T>` (with a start index for a queue)");
-        err_try(c"Vec<T>");
+        err_help(c"a `Vec<T>` (with a start index for a queue)", pcx);
+        err_try(c"Vec<T>", pcx);
     } else if text == "Box" || text == "Rc" || text == "Arc" {
-        err_help(c"`*T` points to a value (`&x`; a parameter `p: *T` is a borrow); a value owned on the heap is a `Vec<T>` of one");
-        err_try(c"*T");
+        err_help(c"`*T` points to a value (`&x`; a parameter `p: *T` is a borrow); a value owned on the heap is a `Vec<T>` of one", pcx);
+        err_try(c"*T", pcx);
     } else if text == "RefCell" || text == "Cell" || text == "Mutex" {
-        err_help(c"no interior mutability types: a `*T` writes through (`p.x = 1`), a `var` changes in place");
-        err_try(c"*T");
-    } else if STD_MODULE >= 0 && help_std_path(name, 0, CUR_MOD, false) {
+        err_help(c"no interior mutability types: a `*T` writes through (`p.x = 1`), a `var` changes in place", pcx);
+        err_try(c"*T", pcx);
+    } else if STD_MODULE >= 0 && help_std_path(name, 0, pcx.cur_mod, false, &pcx) {
         // (`std::cmp::max`: a Rust module of std read as a type)
     } else {
         return false;
@@ -605,49 +597,49 @@ fn rust_type_help(name: i64) -> bool {
 
 // (0.18) The fix of a Rust type that has one vole spelling: the name at
 // the error respelled, with the `&` before it (`&str`, `&String`: `[u8]`).
-fn rust_type_fix(old: [u8], new: [u8]) {
-    let pos = err_pos();
+fn rust_type_fix(old: [u8], new: [u8], pcx: inout Ctx<Comp>) {
+    let pos = err_pos(pcx);
     if pos > 0 && SRC[pos - 1] == '&' && SRC[pos..pos + old.len as i64] == old {
-        err_fix(pos - 1, pos + old.len as i64, new);
+        err_fix(pos - 1, pos + old.len as i64, new, &pcx);
     } else {
-        err_fix_word(pos, old, new);
+        err_fix_word(pos, old, new, &pcx);
     }
 }
 
 // Whether key `key` (an item's) is a value (a function, constant or
 // static) or, for !value, a type.
-fn key_is(key: i64, value: bool) -> bool {
+fn key_is(key: i64, value: bool, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if value {
-            SYM_FN[key] != 0 || SYM_CONST[key] != 0 || SYM_STATIC[key] != 0
+            pcx.sym_fn[key] != 0 || pcx.sym_const[key] != 0 || SYM_STATIC[key] != 0
         } else {
-            SYM_STRUCT[key] != 0 || SYM_ENUM[key] != 0 || SYM_ALIAS[key] != 0
-                || template_of_key(key) != TPL_NONE
+            pcx.sym_struct[key] != 0 || pcx.sym_enum[key] != 0 || pcx.sym_alias[key] != 0
+                || template_of_key(key, pcx) != TPL_NONE
         }
     }
 }
 
 // Whether `name` is a value (or a type) where the checker is.
-fn name_in_scope(name: i64, value: bool) -> bool {
+fn name_in_scope(name: i64, value: bool, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if value {
-            match lookup_local(name) {
+            match lookup_local(name, pcx) {
                 Option::Some(_) => { return true; }
                 Option::None => {}
             }
-        } else if env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0 {
+        } else if env_lookup(name, pcx) != 0 || pcx.sym_primitive[name] != 0 {
             return true;
         }
-        let b = lookup_quiet(CUR_MOD, name, CUR_MOD);
-        binding_kind(b) == B_ITEM && key_is(binding_value(b), value)
+        let b = lookup_quiet(pcx.cur_mod, name, pcx.cur_mod, &pcx);
+        binding_kind(b) == B_ITEM && key_is(binding_value(b), value, pcx)
     }
 }
 
 // The name in scope nearest to `name` (see name_distance), or -1.
-fn nearest_name(name: i64, value: bool, tie: inout bool) -> i64 {
+fn nearest_name(name: i64, value: bool, tie: inout bool, pcx: inout Ctx<Comp>) -> i64 {
     var near = near_to(name);
     for s in 0..SYMS.len() as i64 {
-        if near.close(s) && name_in_scope(s, value) {
+        if near.close(s) && name_in_scope(s, value, &pcx) {
             near.take(s);
         }
     }
@@ -657,17 +649,17 @@ fn nearest_name(name: i64, value: bool, tie: inout bool) -> i64 {
 
 // The help of an unknown item `name` of module m: the nearest name the
 // current module can use there (an item, a module, a variant).
-pub fn help_near_item(m: i64, name: i64) {
+pub fn help_near_item(m: i64, name: i64, pcx: inout Ctx<Comp>) {
     var near = near_to(name);
     for s in 0..SYMS.len() as i64 {
         if near.close(s) {
-            let kind = binding_kind(lookup_quiet(m, s, CUR_MOD));
+            let kind = binding_kind(lookup_quiet(m, s, pcx.cur_mod, &pcx));
             if kind == B_ITEM || kind == B_MODULE || kind == B_VARIANT || kind == B_TVARIANT {
                 near.take(s);
             }
         }
     }
-    near.help();
+    near.help(&pcx);
 }
 
 // ---- Near names (0.14) ----
@@ -685,21 +677,16 @@ pub fn near_to(want: i64) -> Near {
     Near { want: want, best: -1, d: NEAR_NONE, tie: false }
 }
 
-// (0.17) While NEAR_COLLECT: every candidate offered, near or not (an
-// unknown method's: the closest methods of its type, by closest_names).
-pub static var NEAR_ALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var NEAR_COLLECT: bool = false;
-
 // (0.17) The `max` names of NEAR_ALL closest to `want`, into the help as
 // `'a', 'b'`: those related to it (a common prefix of 3, a shared
 // `_` word, one inside the other, or an edit distance of at most half its
 // length), closest first; how many.
-pub fn help_closest_names(want: i64, max: i64) -> i64 {
+pub fn help_closest_names(want: i64, max: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let w = SYMS[want].text;
         var score = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..NEAR_ALL.count {
-            let c = SYMS[NEAR_ALL.data[i]].text;
+        for i in 0..pcx.near_all.count {
+            let c = SYMS[pcx.near_all.data[i]].text;
             let d = edit_distance(w, c);
             var p = 0;
             while p < w.len as i64 && p < c.len as i64 && w[p] == c[p] {
@@ -718,11 +705,11 @@ pub fn help_closest_names(want: i64, max: i64) -> i64 {
         var shown = 0;
         while shown < max {
             var best = -1;
-            for i in 0..NEAR_ALL.count {
+            for i in 0..pcx.near_all.count {
                 if score.data[i] != i64::MAX && (best < 0 || score.data[i] < score.data[best]
                     || score.data[i] == score.data[best]
-                    && SYMS[NEAR_ALL.data[i]].text.len
-                    < SYMS[NEAR_ALL.data[best]].text.len) {
+                    && SYMS[pcx.near_all.data[i]].text.len
+                    < SYMS[pcx.near_all.data[best]].text.len) {
                     best = i;
                 }
             }
@@ -730,11 +717,11 @@ pub fn help_closest_names(want: i64, max: i64) -> i64 {
                 break;
             }
             if shown > 0 {
-                err_help(c", ");
+                err_help(c", ", pcx);
             }
-            err_help(c"'");
-            err_help_sym(NEAR_ALL.data[best]);
-            err_help(c"'");
+            err_help(c"'", pcx);
+            err_help_sym(pcx.near_all.data[best], pcx);
+            err_help(c"'", pcx);
             score.data[best] = i64::MAX;
             shown += 1;
         }
@@ -745,12 +732,12 @@ pub fn help_closest_names(want: i64, max: i64) -> i64 {
 
 // (0.17) `prefix` and the names of NEAR_ALL nearest to `want` as the help
 // (help_closest_names); no help when none is near.
-pub fn help_nearest(prefix: *u8, want: i64) {
+pub fn help_nearest(prefix: *u8, want: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let mark = BUFS[ERR_HELP].len;
-        err_help(prefix);
-        if help_closest_names(want, 4) == 0 {
-            BUFS[ERR_HELP].len = mark;
+        let mark = BUFS[pcx.err_help].len;
+        err_help(prefix, pcx);
+        if help_closest_names(want, 4, pcx) == 0 {
+            BUFS[pcx.err_help].len = mark;
         }
     }
 }
@@ -808,17 +795,17 @@ impl Near {
     }
 
     // Offers candidate `cand`.
-    pub fn offer(inout self, cand: i64) {
-        if NEAR_COLLECT && cand >= 0 && cand != self.want {
+    pub fn offer(inout self, cand: i64, pcx: inout Ctx<Comp>) {
+        if pcx.near_collect && cand >= 0 && cand != self.want {
             unsafe {
                 var seen = false;
-                for i in 0..NEAR_ALL.count {
-                    if NEAR_ALL.data[i] == cand {
+                for i in 0..pcx.near_all.count {
+                    if pcx.near_all.data[i] == cand {
                         seen = true;
                     }
                 }
                 if !seen {
-                    NEAR_ALL.push(cand);
+                    pcx.near_all.push(cand);
                 }
             }
         }
@@ -829,15 +816,15 @@ impl Near {
 
     // The error's help, `did you mean 'x'?`, when there is a candidate and
     // no other help.
-    pub fn help(self) {
+    pub fn help(self, pcx: inout Ctx<Comp>) {
         unsafe {
-            if self.best >= 0 && BUFS[ERR_HELP].len == 0 {
-                err_help(c"did you mean '");
-                err_help_sym(self.best);
-                err_help(c"'?");
+            if self.best >= 0 && BUFS[pcx.err_help].len == 0 {
+                err_help(c"did you mean '", pcx);
+                err_help_sym(self.best, pcx);
+                err_help(c"'?", pcx);
                 // (0.18) the only name that near: the fix renames it
                 if !self.tie {
-                    err_fix_word(err_pos(), SYMS[self.want].text, SYMS[self.best].text);
+                    err_fix_word(err_pos(pcx), SYMS[self.want].text, SYMS[self.best].text, &pcx);
                 }
             }
         }
@@ -917,28 +904,28 @@ fn lower(c: u8) -> u8 {
 // whole source: a module the program does not name is not loaded), the
 // one whose path the file already names (`use std::cli::{Arg, ..}`); else
 // none, and IMPORT_PATHS lists them all.
-pub fn import_path_for(name: i64, value: bool) -> i64 {
-    IMPORT_PATHS = 0;
+pub fn import_path_for(name: i64, value: bool, pcx: inout Ctx<Comp>) -> i64 {
+    pcx.import_paths = 0;
     let paths = buf_new();
     var in_std = false;
     var std_first = 0;
-    for m in 0..module_count() {
-        if m == CUR_MOD || m == C_MODULE {
+    for m in 0..module_count(pcx) {
+        if m == pcx.cur_mod || m == pcx.c_module {
             continue;
         }
-        let key = item_key_if_known(m, name);
+        let key = item_key_if_known(m, name, &pcx);
         if key < 0 {
             continue;
         }
-        let item = item_node_of(key);
-        if item == 0 || (NODES[item].p & ITEM_PUBLIC) == 0 || !key_is(key, value) {
+        let item = item_node_of(key, pcx);
+        if item == 0 || (NODES[item].p & ITEM_PUBLIC) == 0 || !key_is(key, value, pcx) {
             continue;
         }
         let out = buf_new();
         // (0.20) std's modules: `std` when its root re-exports the item
         // (`use std::HashSet;`, not `std::collections::hash_set`)
         if m != STD_MODULE && within_std(m)
-            && binding_kind(lookup_name(STD_MODULE, name, CUR_MOD)) == B_ITEM {
+            && binding_kind(lookup_name(STD_MODULE, name, pcx.cur_mod, &pcx)) == B_ITEM {
             buf_str(out, c"std");
             return out;
         }
@@ -957,7 +944,7 @@ pub fn import_path_for(name: i64, value: bool) -> i64 {
         std_item_paths(paths, name, value);
     }
     let all = buf_slice(paths);
-    let f = crate::front::modules::file_of_pos(err_pos());
+    let f = crate::front::modules::file_of_pos(err_pos(pcx));
     let file = if f >= 0 { SRC[crate::base::FILES[f].start..crate::base::FILES[f].end] }
         else { SRC[0..0] };
     var count = 0;
@@ -999,16 +986,12 @@ pub fn import_path_for(name: i64, value: bool) -> i64 {
         return out;
     }
     if count > 1 {
-        IMPORT_PATHS = list;
+        pcx.import_paths = list;
         return 0;
     }
     // (std's source not read as the scan reads it: the module found)
     std_first
 }
-
-// (0.25.3) The `use` lines of the modules import_path_for found when it
-// could not choose one (a buffer), else 0.
-pub static var IMPORT_PATHS: i64 = 0;
 
 // Path p as a line of paths (a buffer), unless it has it.
 fn add_path(paths: i64, p: [u8]) {

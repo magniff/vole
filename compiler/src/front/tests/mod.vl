@@ -13,36 +13,28 @@ use crate::base::{
     FILES, IntVec, SRC, add_source, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     intern_c, out_path, sym_text,
 };
-use crate::base::diag::{ERR_KIND, err_begin, err_end_soft, pos_line};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, pos_line};
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push};
-use crate::front::contracts::{
-    TEST_CFG, TEST_FN, TEST_FUZZ, TEST_ITEM, TEST_KIND, TEST_PROPERTY, test_kind,
-};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
+use crate::front::contracts::{TEST_CFG, TEST_FN, TEST_FUZZ, TEST_PROPERTY, test_kind};
+use crate::front::lexer::{Tok, lex_range};
 use crate::front::modules::{MODULES, file_of_pos, module_at, module_of, within_std};
-
-// `--test-build` (front/contracts/flags.vl): the program's tests, with
-// a test main in place of its own.
-pub static var TEST_BUILD: bool = false;
-
-// (0.25) `volec check`: the tests' signatures checked as a test build
-// checks them (test.signature, test.generate), their code not made.
-pub static var CHECK_TESTS: bool = false;
 
 // ---- A test module's view ----
 
 // Whether module m is a `#[cfg(test)]` module, which sees its parent's
 // items (private ones too) without an import, as a nested scope sees its
 // parent's names (design §2.6; `use super::*` is not allowed).
-pub fn is_test_module(m: i64) -> bool {
+pub fn is_test_module(m: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if TEST_ITEM.count == 0 || m <= 0 {
+        if pcx.test_item.count == 0 || m <= 0 {
             return false;
         }
-        for i in 0..TEST_ITEM.count {
-            let n = TEST_ITEM.data[i];
-            if TEST_KIND.data[i] == TEST_CFG && NODES[n].kind == NodeKind::Mod
-                && NODES[n].a == MODULES[m].name && module_of(n) == MODULES[m].parent {
+        for i in 0..pcx.test_item.count {
+            let n = pcx.test_item.data[i];
+            if pcx.test_kind.data[i] == TEST_CFG && NODES[n].kind == NodeKind::Mod
+                && NODES[n].a == MODULES[m].name && module_of(n, &pcx) == MODULES[m].parent {
                 return true;
             }
         }
@@ -52,14 +44,14 @@ pub fn is_test_module(m: i64) -> bool {
 
 // Whether item n is for tests only: `#[test]`, `#[property]`, `#[fuzz]`,
 // under `#[cfg(test)]`, or in a `#[cfg(test)]` module.
-fn test_only(n: i64) -> bool {
+fn test_only(n: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if test_kind(n) != 0 {
+        if test_kind(n, pcx) != 0 {
             return true;
         }
-        var m = module_of(n);
+        var m = module_of(n, &pcx);
         while m > 0 {
-            if is_test_module(m) {
+            if is_test_module(m, &pcx) {
                 return true;
             }
             m = MODULES[m].parent;
@@ -71,64 +63,60 @@ fn test_only(n: i64) -> bool {
 // After parsing, in a build (compile_program; not `check` or a query,
 // which check the tests too): a build that is not for tests leaves the
 // test items out.
-pub fn drop_test_items(program: i64) {
+pub fn drop_test_items(program: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if TEST_BUILD || TEST_ITEM.count == 0 {
+        if pcx.test_build || pcx.test_item.count == 0 {
             return;
         }
         var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..NODES[program].count {
-            let item = child(program, i);
-            if !test_only(item) {
+            let item = child(program, i, pcx);
+            if !test_only(item, &pcx) {
                 kept.push(item);
             }
         }
         if kept.count == NODES[program].count {
             return;
         }
-        let mark = list_begin();
+        let mark = list_begin(pcx);
         for i in 0..kept.count {
-            list_push(kept.data[i]);
+            list_push(kept.data[i], &pcx);
         }
-        list_end(program, mark);
+        list_end(program, mark, &pcx);
     }
 }
 
 // ---- The tokens of a test build ----
 
-fn kind(i: i64) -> Tok {
-    unsafe {
-        if i < 0 || i >= TOK_COUNT {
-            return Tok::Eof;
-        }
-        TOKS[i].kind
+fn kind(i: i64, pcx: Ctx<Comp>) -> Tok {
+    if i < 0 || i >= pcx.toks.len() as i64 {
+        return Tok::Eof;
     }
+    pcx.toks[i].kind
 }
 
-fn is_ident(i: i64, word: [u8]) -> bool {
-    unsafe { kind(i) == Tok::Ident && sym_text(TOKS[i].value as i64) == word }
+fn is_ident(i: i64, word: [u8], pcx: Ctx<Comp>) -> bool {
+    kind(i, pcx) == Tok::Ident && sym_text(pcx.toks[i].value as i64) == word
 }
 
-fn tok_text(i: i64) -> [u8] {
-    unsafe { SRC[TOKS[i].start..TOKS[i].end] }
+fn tok_text(i: i64, pcx: Ctx<Comp>) -> [u8] {
+    SRC[pcx.toks[i].start..pcx.toks[i].end]
 }
 
 // The source text of tokens a..b (b excluded).
-fn text_of(a: i64, b: i64) -> [u8] {
-    unsafe {
-        if b <= a {
-            return "";
-        }
-        SRC[TOKS[a].start..TOKS[b - 1].end]
+fn text_of(a: i64, b: i64, pcx: Ctx<Comp>) -> [u8] {
+    if b <= a {
+        return "";
     }
+    SRC[pcx.toks[a].start..pcx.toks[b - 1].end]
 }
 
 // The token after the bracket at i that closes it (kinds open/close).
-fn after_close(i: i64, open: Tok, close: Tok) -> i64 {
+fn after_close(i: i64, open: Tok, close: Tok, pcx: Ctx<Comp>) -> i64 {
     var depth = 0;
     var j = i;
-    while j < (TOK_COUNT) {
-        let k = kind(j);
+    while j < pcx.toks.len() as i64 {
+        let k = kind(j, pcx);
         if k == open {
             depth += 1;
         } else if k == close {
@@ -146,9 +134,9 @@ fn after_close(i: i64, open: Tok, close: Tok) -> i64 {
 
 // Whether token i is in the program's own files (not std's, nor a made
 // runtime's).
-fn in_program(i: i64) -> bool {
+fn in_program(i: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let f = file_of_pos(TOKS[i].start);
+        let f = file_of_pos(pcx.toks[i].start);
         let m = FILES[f].module;
         FILES[f].path[0] != '<' && !within_std(m)
     }
@@ -156,11 +144,11 @@ fn in_program(i: i64) -> bool {
 
 // The end of a type's tokens from a: at a `,` or a closing bracket of the
 // level it starts at, or `{`, `;`, `=` there.
-fn type_end(a: i64) -> i64 {
+fn type_end(a: i64, pcx: Ctx<Comp>) -> i64 {
     var depth = 0;
     var j = a;
     loop {
-        let k = kind(j);
+        let k = kind(j, pcx);
         if k == Tok::Eof {
             return j;
         }
@@ -184,45 +172,42 @@ fn type_end(a: i64) -> i64 {
 }
 
 // A test found in the tokens.
-struct Found {
+pub struct Found {
     kind: i64, module: i64, name: i64, pos: i64, params: i64, close: i64,
     returns: i64, ret_end: i64, gpa: bool, label: i64,
 }
-
-static var FOUND: *Found = 0 as *Found;
-static var FOUND_COUNT: i64 = 0;
-static var FOUND_CAP: i64 = 0;
 
 // The kinds of a contract, tested as a property (a function with an
 // `ensures`).
 const TEST_CONTRACT: i64 = 5;
 
-fn add_found(f: Found) {
+fn add_found(f: Found, pcx: inout Ctx<Comp>) {
     unsafe {
-        if FOUND_COUNT == FOUND_CAP {
-            let cap = if FOUND_CAP == 0 { 16 } else { FOUND_CAP * 2 };
+        if pcx.found_count == pcx.found_cap {
+            let cap = if pcx.found_cap == 0 { 16 } else { pcx.found_cap * 2 };
             let bigger = crate::base::alloc_array::<Found>(cap);
-            for i in 0..FOUND_COUNT {
-                bigger[i] = FOUND[i];
+            for i in 0..pcx.found_count {
+                bigger[i] = pcx.found[i];
             }
-            FOUND = bigger;
-            FOUND_CAP = cap;
+            pcx.found = bigger;
+            pcx.found_cap = cap;
         }
-        FOUND[FOUND_COUNT] = f;
-        FOUND_COUNT += 1;
+        pcx.found[pcx.found_count] = f;
+        pcx.found_count += 1;
     }
 }
 
 // The attribute `#[word]` at i (test, property, fuzz): its kind, else 0.
-fn test_attribute_at(i: i64) -> i64 {
-    if kind(i) != Tok::Hash || kind(i + 1) != Tok::LBracket || kind(i + 3) != Tok::RBracket {
+fn test_attribute_at(i: i64, pcx: Ctx<Comp>) -> i64 {
+    if kind(i, pcx) != Tok::Hash || kind(i + 1, pcx) != Tok::LBracket
+        || kind(i + 3, pcx) != Tok::RBracket {
         return 0;
     }
-    if is_ident(i + 2, "test") {
+    if is_ident(i + 2, "test", pcx) {
         TEST_FN
-    } else if is_ident(i + 2, "property") {
+    } else if is_ident(i + 2, "property", pcx) {
         TEST_PROPERTY
-    } else if is_ident(i + 2, "fuzz") {
+    } else if is_ident(i + 2, "fuzz", pcx) {
         TEST_FUZZ
     } else {
         0
@@ -231,76 +216,75 @@ fn test_attribute_at(i: i64) -> i64 {
 
 // The function after attribute tokens at i (more attributes, `pub`,
 // `unsafe`): the index of its `fn`, else -1.
-fn fn_after(i: i64) -> i64 {
+fn fn_after(i: i64, pcx: Ctx<Comp>) -> i64 {
     var j = i;
     loop {
-        if kind(j) == Tok::Hash && kind(j + 1) == Tok::LBracket {
-            j = after_close(j + 1, Tok::LBracket, Tok::RBracket);
-        } else if kind(j) == Tok::Pub || kind(j) == Tok::Unsafe {
+        if kind(j, pcx) == Tok::Hash && kind(j + 1, pcx) == Tok::LBracket {
+            j = after_close(j + 1, Tok::LBracket, Tok::RBracket, pcx);
+        } else if kind(j, pcx) == Tok::Pub || kind(j, pcx) == Tok::Unsafe {
             j += 1;
         } else {
             break;
         }
     }
-    if kind(j) == Tok::Fn && kind(j + 1) == Tok::Ident { j } else { -1 }
+    if kind(j, pcx) == Tok::Fn && kind(j + 1, pcx) == Tok::Ident { j } else { -1 }
 }
 
 // The function at `fn` token f: its parameters' `(`, its result's tokens
 // (-1: none) and where its signature ends (the body's `{`, or the first
 // clause word).
-fn read_signature(f: i64, kind_of: i64) -> Found {
+fn read_signature(f: i64, kind_of: i64, pcx: inout Ctx<Comp>) -> Found {
     var open = f + 2;
-    if kind(open) == Tok::Lt {
+    if kind(open, pcx) == Tok::Lt {
         open = -1;
     }
-    let close = if open >= 0 { after_close(open, Tok::LParen, Tok::RParen) - 1 } else { -1 };
+    let close = if open >= 0 { after_close(open, Tok::LParen, Tok::RParen, pcx) - 1 } else { -1 };
     var returns = -1;
     var ret_end = -1;
-    if close >= 0 && kind(close + 1) == Tok::Arrow {
+    if close >= 0 && kind(close + 1, pcx) == Tok::Arrow {
         returns = close + 2;
         ret_end = returns;
-        while kind(ret_end) != Tok::LBrace && kind(ret_end) != Tok::Semi
-            && kind(ret_end) != Tok::Eof && !is_ident(ret_end, "requires")
-            && !is_ident(ret_end, "ensures")
-            && !is_ident(ret_end, "debug") {
+        while kind(ret_end, pcx) != Tok::LBrace && kind(ret_end, pcx) != Tok::Semi
+            && kind(ret_end, pcx) != Tok::Eof && !is_ident(ret_end, "requires", pcx)
+            && !is_ident(ret_end, "ensures", pcx)
+            && !is_ident(ret_end, "debug", pcx) {
             ret_end += 1;
         }
     }
-    unsafe {
-        Found {
-            kind: kind_of, module: module_at(TOKS[f].start), name: TOKS[f + 1].value as i64,
-            pos: TOKS[f + 1].start, params: open, close, returns, ret_end, gpa: false,
-            label: TOKS[f + 1].value as i64,
-        }
+    Found {
+        kind: kind_of, module: module_at(pcx.toks[f].start, &pcx),
+        name: pcx.toks[f + 1].value as i64,
+        pos: pcx.toks[f + 1].start, params: open, close, returns, ret_end, gpa: false,
+        label: pcx.toks[f + 1].value as i64,
     }
 }
 
 // The parameters of a found function: (name token, type start, type end)
 // triples in `out`; false when one is not `name: T`.
-fn params_of(t: Found, out: inout IntVec) -> bool {
+fn params_of(t: Found, out: inout IntVec, pcx: Ctx<Comp>) -> bool {
     out.count = 0;
     if t.params < 0 {
         return false;
     }
     var j = t.params + 1;
     while j < t.close {
-        if kind(j) == Tok::Mut {
+        if kind(j, pcx) == Tok::Mut {
             j += 1;
         }
-        if kind(j) != Tok::Ident || kind(j + 1) != Tok::Colon {
+        if kind(j, pcx) != Tok::Ident || kind(j + 1, pcx) != Tok::Colon {
             return false;
         }
         var a = j + 2;
         // (0.20: a convention is not the type: `v: sink Vec<i64>`)
-        if kind(a) == Tok::Sink || kind(a) == Tok::Inout || kind(a) == Tok::Let {
+        if kind(a, pcx) == Tok::Sink || kind(a, pcx) == Tok::Inout || kind(a, pcx) == Tok::Let {
             a += 1;
         }
-        let b = type_end(a);
+        let b = type_end(a, pcx);
         out.push(j);
         out.push(a);
         out.push(b);
         j = b;
-        if kind(j) == Tok::Comma {
+        if kind(j, pcx) == Tok::Comma {
             j += 1;
         } else if j != t.close {
             return false;
@@ -311,18 +295,14 @@ fn params_of(t: Found, out: inout IntVec) -> bool {
 
 // ---- Generators, from the parameters' types ----
 
-// The user types properties need generated (a struct or enum's name
-// symbol), and the ones with an `impl Arbitrary` of their own.
-static var WANTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn want_type(name: i64) {
+fn want_type(name: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..WANTED.count {
-            if WANTED.data[i] == name {
+        for i in 0..pcx.wanted.count {
+            if pcx.wanted.data[i] == name {
                 return;
             }
         }
-        WANTED.push(name);
+        pcx.wanted.push(name);
     }
 }
 
@@ -334,207 +314,197 @@ fn int_type(s: [u8]) -> bool {
 // The expression that generates a value of the type at tokens a..b into
 // out (`g` is the generator); false, with the reason in `why`, when it is
 // not generable.
-fn gen_expr(out: i64, a: i64, b: i64, why: i64) -> bool {
-    unsafe {
-        let k = kind(a);
-        if k == Tok::Star || k == Tok::Fn || k == Tok::Amp || k == Tok::AmpAmp {
-            buf_bytes(why, if k == Tok::Fn { "a function" } else { "a pointer" });
-            return false;
-        }
-        if k == Tok::LParen {
-            // a tuple: its elements in order
-            buf_byte(out, '(');
-            var j = a + 1;
-            var n = 0;
-            while j < b - 1 {
-                let e = type_end(j);
-                if n > 0 {
-                    buf_bytes(out, ", ");
-                }
-                if !gen_expr(out, j, e, why) {
-                    return false;
-                }
-                n += 1;
-                j = if kind(e) == Tok::Comma { e + 1 } else { e };
-            }
-            if n == 1 {
-                buf_byte(out, ',');
-            }
-            buf_byte(out, ')');
-            return true;
-        }
-        if k == Tok::LBracket {
-            let e = type_end(a + 1);
-            if kind(e) == Tok::Semi {
-                buf_bytes(why, "an array");
-                return false;
-            }
-            // a slice: an owned Vec, lent (gen_param)
-            if e == a + 2 && is_ident(a + 1, "u8") {
-                buf_bytes(out, "std::gen_text(g)");
-                return true;
-            }
-            buf_bytes(out, "std::gen_vec(g, |g: &mut std::Gen<Gpa>| ");
-            if !gen_expr(out, a + 1, e, why) {
-                return false;
-            }
-            buf_byte(out, ')');
-            return true;
-        }
-        if k != Tok::Ident {
-            buf_bytes(why, "this type");
-            return false;
-        }
-        // a path: its last name, and its arguments
-        var last = a;
-        var j = a;
-        while j + 2 < b && kind(j + 1) == Tok::ColonColon && kind(j + 2) == Tok::Ident {
-            j += 2;
-            last = j;
-        }
-        let name = tok_text(last);
-        let args = if kind(last + 1) == Tok::Lt { last + 2 } else { -1 };
-        if args < 0 && int_type(name) {
-            buf_bytes(out, "std::arbitrary_of::<");
-            buf_bytes(out, name);
-            buf_bytes(out, ">(g)");
-            return true;
-        }
-        if args < 0 && (name == "usize" || name == "isize" || name == "f32") {
-            buf_bytes(out, if name == "f32" { "(std::gen_f64(g) as f32)" } else { "(g.int() as " });
-            if name != "f32" {
-                buf_bytes(out, name);
-                buf_byte(out, ')');
-            }
-            return true;
-        }
-        // (0.26.3: `Buf<Gpa>`, `Vec<T, Gpa>`: std's generators make them on Gpa)
-        let on_gpa = args >= 0 && tok_text(args) == "Gpa" && type_end(args) == args + 1;
-        if (args < 0 || on_gpa) && name == "Buf" {
-            buf_bytes(out, "std::gen_buf(g)");
-            return true;
-        }
-        if args >= 0 && (name == "Vec" || name == "Option" || name == "Result") {
-            let e1 = type_end(args);
-            if name == "Vec" && kind(e1) == Tok::Comma
-                && !(tok_text(e1 + 1) == "Gpa" && type_end(e1 + 1) == e1 + 2) {
-                buf_bytes(why, "a Vec on another allocator than Gpa");
-                return false;
-            }
-            buf_bytes(out, if name == "Vec" { "std::gen_vec(g, |g: &mut std::Gen<Gpa>| " }
-                else if name == "Option" { "std::gen_option(g, |g: &mut std::Gen<Gpa>| " }
-                else { "std::gen_result(g, |g: &mut std::Gen<Gpa>| " });
-            if !gen_expr(out, args, e1, why) {
-                return false;
-            }
-            if name == "Result" {
-                buf_bytes(out, ", |g: &mut std::Gen<Gpa>| ");
-                if kind(e1) != Tok::Comma || !gen_expr(out, e1 + 1, type_end(e1 + 1), why) {
-                    return false;
-                }
-            }
-            buf_byte(out, ')');
-            return true;
-        }
-        if name == "HashMap" || name == "Arena" || name == "Gpa" || name == "ScopedArena" {
-            buf_bytes(why, "a ");
-            buf_bytes(why, name);
-            return false;
-        }
-        // any other type: its impl Arbitrary (std's, the program's, or one
-        // made here for a struct or enum)
-        if args < 0 && name.len == 1 && name[0] >= 'A' && name[0] <= 'Z' {
-            // (a type parameter of a made impl: bound by Arbitrary)
-        } else {
-            want_type(TOKS[last].value as i64);
-        }
-        buf_bytes(out, "std::arbitrary_of::<");
-        buf_bytes(out, text_of(a, b));
-        buf_bytes(out, ">(g)");
-        true
+fn gen_expr(out: i64, a: i64, b: i64, why: i64, pcx: inout Ctx<Comp>) -> bool {
+    let k = kind(a, pcx);
+    if k == Tok::Star || k == Tok::Fn || k == Tok::Amp || k == Tok::AmpAmp {
+        buf_bytes(why, if k == Tok::Fn { "a function" } else { "a pointer" });
+        return false;
     }
+    if k == Tok::LParen {
+        // a tuple: its elements in order
+        buf_byte(out, '(');
+        var j = a + 1;
+        var n = 0;
+        while j < b - 1 {
+            let e = type_end(j, pcx);
+            if n > 0 {
+                buf_bytes(out, ", ");
+            }
+            if !gen_expr(out, j, e, why, &pcx) {
+                return false;
+            }
+            n += 1;
+            j = if kind(e, pcx) == Tok::Comma { e + 1 } else { e };
+        }
+        if n == 1 {
+            buf_byte(out, ',');
+        }
+        buf_byte(out, ')');
+        return true;
+    }
+    if k == Tok::LBracket {
+        let e = type_end(a + 1, pcx);
+        if kind(e, pcx) == Tok::Semi {
+            buf_bytes(why, "an array");
+            return false;
+        }
+        // a slice: an owned Vec, lent (gen_param)
+        if e == a + 2 && is_ident(a + 1, "u8", pcx) {
+            buf_bytes(out, "std::gen_text(g)");
+            return true;
+        }
+        buf_bytes(out, "std::gen_vec(g, |g: &mut std::Gen<Gpa>| ");
+        if !gen_expr(out, a + 1, e, why, &pcx) {
+            return false;
+        }
+        buf_byte(out, ')');
+        return true;
+    }
+    if k != Tok::Ident {
+        buf_bytes(why, "this type");
+        return false;
+    }
+    // a path: its last name, and its arguments
+    var last = a;
+    var j = a;
+    while j + 2 < b && kind(j + 1, pcx) == Tok::ColonColon && kind(j + 2, pcx) == Tok::Ident {
+        j += 2;
+        last = j;
+    }
+    let name = tok_text(last, pcx);
+    let args = if kind(last + 1, pcx) == Tok::Lt { last + 2 } else { -1 };
+    if args < 0 && int_type(name) {
+        buf_bytes(out, "std::arbitrary_of::<");
+        buf_bytes(out, name);
+        buf_bytes(out, ">(g)");
+        return true;
+    }
+    if args < 0 && (name == "usize" || name == "isize" || name == "f32") {
+        buf_bytes(out, if name == "f32" { "(std::gen_f64(g) as f32)" } else { "(g.int() as " });
+        if name != "f32" {
+            buf_bytes(out, name);
+            buf_byte(out, ')');
+        }
+        return true;
+    }
+    // (0.26.3: `Buf<Gpa>`, `Vec<T, Gpa>`: std's generators make them on Gpa)
+    let on_gpa = args >= 0 && tok_text(args, pcx) == "Gpa" && type_end(args, pcx) == args + 1;
+    if (args < 0 || on_gpa) && name == "Buf" {
+        buf_bytes(out, "std::gen_buf(g)");
+        return true;
+    }
+    if args >= 0 && (name == "Vec" || name == "Option" || name == "Result") {
+        let e1 = type_end(args, pcx);
+        if name == "Vec" && kind(e1, pcx) == Tok::Comma
+            && !(tok_text(e1 + 1, pcx) == "Gpa" && type_end(e1 + 1, pcx) == e1 + 2) {
+            buf_bytes(why, "a Vec on another allocator than Gpa");
+            return false;
+        }
+        buf_bytes(out, if name == "Vec" { "std::gen_vec(g, |g: &mut std::Gen<Gpa>| " }
+            else if name == "Option" { "std::gen_option(g, |g: &mut std::Gen<Gpa>| " }
+            else { "std::gen_result(g, |g: &mut std::Gen<Gpa>| " });
+        if !gen_expr(out, args, e1, why, &pcx) {
+            return false;
+        }
+        if name == "Result" {
+            buf_bytes(out, ", |g: &mut std::Gen<Gpa>| ");
+            if kind(e1, pcx) != Tok::Comma
+                || !gen_expr(out, e1 + 1, type_end(e1 + 1, pcx), why, &pcx) {
+                return false;
+            }
+        }
+        buf_byte(out, ')');
+        return true;
+    }
+    if name == "HashMap" || name == "Arena" || name == "Gpa" || name == "ScopedArena" {
+        buf_bytes(why, "a ");
+        buf_bytes(why, name);
+        return false;
+    }
+    // any other type: its impl Arbitrary (std's, the program's, or one
+    // made here for a struct or enum)
+    if args < 0 && name.len == 1 && name[0] >= 'A' && name[0] <= 'Z' {
+        // (a type parameter of a made impl: bound by Arbitrary)
+    } else {
+        want_type(pcx.toks[last].value as i64, &pcx);
+    }
+    buf_bytes(out, "std::arbitrary_of::<");
+    buf_bytes(out, text_of(a, b, pcx));
+    buf_bytes(out, ">(g)");
+    true
 }
 
 // Whether the type at a..b is printed with `{:?}`: a struct or enum only
 // when it derives or implements Debug.
-fn debug_type(a: i64, b: i64) -> bool {
-    unsafe {
-        for j in a..b {
-            if kind(j) == Tok::LParen {
+fn debug_type(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+    for j in a..b {
+        if kind(j, pcx) == Tok::LParen {
+            return false;
+        }
+        if kind(j, pcx) == Tok::Ident {
+            let s = tok_text(j, pcx);
+            if !int_type(s) && s != "Vec" && s != "Option" && s != "Result" && s != "Buf"
+                && s != "usize" && s != "isize" && s != "f32" && s != "std"
+                // (0.26.3: `Vec<i64, Gpa>`: an allocator argument, which
+                // a container's Debug asks nothing of)
+                && s != "Gpa"
+                && !has_debug(pcx.toks[j].value as i64, pcx) {
                 return false;
             }
-            if kind(j) == Tok::Ident {
-                let s = tok_text(j);
-                if !int_type(s) && s != "Vec" && s != "Option" && s != "Result" && s != "Buf"
-                    && s != "usize" && s != "isize" && s != "f32" && s != "std"
-                    // (0.26.3: `Vec<i64, Gpa>`: an allocator argument, which
-                    // a container's Debug asks nothing of)
-                    && s != "Gpa"
-                    && !has_debug(TOKS[j].value as i64) {
-                    return false;
-                }
-            }
         }
-        true
     }
+    true
 }
 
 // Whether the program's type `name` derives or implements Debug.
-fn has_debug(name: i64) -> bool {
-    unsafe {
-        for i in 0..TOK_COUNT {
-            if kind(i) == Tok::Ident && TOKS[i].value as i64 == name && i > 0 && in_program(i) {
-                let before = kind(i - 1);
-                if before == Tok::Struct || before == Tok::Enum {
-                    // `#[derive(..., Debug, ...)]` above it
-                    var j = i - 2;
-                    while j >= 0 && kind(j) != Tok::Semi && kind(j) != Tok::RBrace
-                        && kind(j) != Tok::LBrace {
-                        if is_ident(j, "Debug") {
-                            return true;
-                        }
-                        j -= 1;
+fn has_debug(name: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 0..pcx.toks.len() as i64 {
+        if kind(i, pcx) == Tok::Ident && pcx.toks[i].value as i64 == name && i > 0
+            && in_program(i, pcx) {
+            let before = kind(i - 1, pcx);
+            if before == Tok::Struct || before == Tok::Enum {
+                // `#[derive(..., Debug, ...)]` above it
+                var j = i - 2;
+                while j >= 0 && kind(j, pcx) != Tok::Semi && kind(j, pcx) != Tok::RBrace
+                    && kind(j, pcx) != Tok::LBrace {
+                    if is_ident(j, "Debug", pcx) {
+                        return true;
                     }
-                }
-                if before == Tok::For && i >= 3 && (is_ident(i - 2, "Debug")) {
-                    return true;
+                    j -= 1;
                 }
             }
-        }
-        false
-    }
-}
-
-// Whether the program has `impl Arbitrary for name` (or std::Arbitrary).
-fn has_arbitrary(name: i64) -> bool {
-    unsafe {
-        for i in 2..TOK_COUNT {
-            if kind(i) == Tok::Ident && TOKS[i].value as i64 == name && kind(i - 1) == Tok::For
-                && is_ident(i - 2, "Arbitrary") {
+            if before == Tok::For && i >= 3 && (is_ident(i - 2, "Debug", pcx)) {
                 return true;
             }
         }
-        false
     }
+    false
+}
+
+// Whether the program has `impl Arbitrary for name` (or std::Arbitrary).
+fn has_arbitrary(name: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 2..pcx.toks.len() as i64 {
+        if kind(i, pcx) == Tok::Ident && pcx.toks[i].value as i64 == name
+            && kind(i - 1, pcx) == Tok::For
+            && is_ident(i - 2, "Arbitrary", pcx) {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- The code of a test build ----
 
-// Per module: the made source (a buffer, -1: none yet).
-static var MODULE_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Per module: whether it runs tests (its own or its children's).
-static var RUNS_TESTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn text_for(m: i64) -> i64 {
+fn text_for(m: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        while MODULE_TEXT.count <= m {
-            MODULE_TEXT.push(-1);
-            RUNS_TESTS.push(0);
+        while pcx.module_text.count <= m {
+            pcx.module_text.push(-1);
+            pcx.runs_tests.push(0);
         }
-        if MODULE_TEXT.data[m] < 0 {
-            MODULE_TEXT.data[m] = buf_new();
+        if pcx.module_text.data[m] < 0 {
+            pcx.module_text.data[m] = buf_new();
         }
-        MODULE_TEXT.data[m]
+        pcx.module_text.data[m]
     }
 }
 
@@ -552,21 +522,21 @@ fn module_path(out: i64, m: i64) {
     }
 }
 
-fn test_error(pos: i64, code: *u8, message: [u8], help: [u8]) {
-    let kind_was = ERR_KIND;
-    ERR_KIND = code;
-    err_begin(pos);
-    buf_bytes(crate::base::diag::ERR, message);
+fn test_error(pos: i64, code: *u8, message: [u8], help: [u8], pcx: inout Ctx<Comp>) {
+    let kind_was = pcx.err_kind;
+    pcx.err_kind = code;
+    err_begin(pos, &pcx);
+    buf_bytes(pcx.err, message);
     if help.len > 0 {
-        crate::base::diag::err_help_fmt(help);
+        crate::base::diag::err_help_fmt(help, pcx);
     }
-    err_end_soft();
-    ERR_KIND = kind_was;
+    err_end_soft(&pcx);
+    pcx.err_kind = kind_was;
 }
 
 // The lines of a test's call: `NAME(args)` for a #[test] (with gpa), a
 // property's closure for the others.
-fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
+fn put_test_case(out: i64, t: Found, ps: IntVec, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         let name = sym_text(t.name);
         if t.kind == TEST_FN {
@@ -576,8 +546,8 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
             var ok = true;
             var k = 0;
             while k < ps.count {
-                let p = tok_text(ps.data[k]);
-                let ty = text_of(ps.data[k + 1], ps.data[k + 2]);
+                let p = tok_text(ps.data[k], pcx);
+                let ty = text_of(ps.data[k + 1], ps.data[k + 2], pcx);
                 if ty != "Gpa" || k > 0 {
                     ok = false;
                 }
@@ -593,10 +563,10 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
                 buf_bytes(m,
                     "' is a #[test] with parameters: a #[test] takes nothing or `gpa: Gpa`");
                 test_error(t.pos, c"test.signature", buf_slice(m),
-                    "a function of generated arguments is a #[property]");
+                    "a function of generated arguments is a #[property]", &pcx);
                 return false;
             }
-            let returns = if t.returns >= 0 { text_of(t.returns, t.ret_end) } else { "" };
+            let returns = if t.returns >= 0 { text_of(t.returns, t.ret_end, pcx) } else { "" };
             if returns.len > 0 && returns != "()" {
                 buf_bytes(out, "        match ");
                 buf_bytes(out, buf_slice(call));
@@ -615,7 +585,7 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
         }
         // a property, a fuzz target or a contract: the values, then the call
         if t.kind == TEST_FUZZ {
-            put_fuzz_words(out);
+            put_fuzz_words(out, pcx);
         }
         buf_bytes(out, if t.kind == TEST_FUZZ { "        std::run_fuzz_target(gpa, \"" }
             else { "        std::run_property(gpa, \"" });
@@ -626,10 +596,10 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
         buf_byte(call, '(');
         var k = 0;
         while k < ps.count {
-            let p = tok_text(ps.data[k]);
+            let p = tok_text(ps.data[k], pcx);
             let a = ps.data[k + 1];
             let b = ps.data[k + 2];
-            if b == a + 1 && is_ident(a, "Gpa") {
+            if b == a + 1 && is_ident(a, "Gpa", pcx) {
                 // (0.25) an allocator parameter: the test's own, not generated
                 buf_bytes(out, "            let ");
                 buf_bytes(out, p);
@@ -643,15 +613,15 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
             }
             let why = buf_new();
             let gen = buf_new();
-            let bytes = t.kind == TEST_FUZZ && b == a + 3 && kind(a) == Tok::LBracket
-                && is_ident(a + 1, "u8");
+            let bytes = t.kind == TEST_FUZZ && b == a + 3 && kind(a, pcx) == Tok::LBracket
+                && is_ident(a + 1, "u8", pcx);
             if bytes {
                 // (a fuzz target's input, its bytes: std/fuzz.vl)
                 buf_bytes(gen, "std::gen_bytes(g)");
-            } else if !gen_expr(gen, a, b, why) {
+            } else if !gen_expr(gen, a, b, why, &pcx) {
                 let m = buf_new();
                 buf_bytes(m, "no generator for '");
-                buf_bytes(m, text_of(a, b));
+                buf_bytes(m, text_of(a, b, pcx));
                 buf_bytes(m, "' (");
                 buf_bytes(m, buf_slice(why));
                 buf_bytes(m, "), parameter '");
@@ -659,13 +629,13 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
                 buf_bytes(m, "' of '");
                 buf_bytes(m, name);
                 buf_bytes(m, "'");
-                test_error(TOKS[ps.data[k]].start, c"test.generate", buf_slice(m),
-                    "parameters are generated from their types: numbers, bool, text, Vec, Option, Result, tuples, the program's structs and enums, a type with an `impl std::Arbitrary`");
+                test_error(pcx.toks[ps.data[k]].start, c"test.generate", buf_slice(m),
+                    "parameters are generated from their types: numbers, bool, text, Vec, Option, Result, tuples, the program's structs and enums, a type with an `impl std::Arbitrary`", &pcx);
                 return false;
             }
             buf_bytes(out, "            let ");
             buf_bytes(out, p);
-            let slice = kind(a) == Tok::LBracket;
+            let slice = kind(a, pcx) == Tok::LBracket;
             if slice {
                 buf_bytes(out, "_owned");
             }
@@ -688,20 +658,20 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
         buf_byte(call, ')');
         // (a contract's requires: an input that fails it is discarded)
         if t.kind == TEST_CONTRACT {
-            put_requires_filters(out, t);
+            put_requires_filters(out, t, pcx);
         }
         buf_bytes(out, "            if g.showing() {\n");
         k = 0;
         while k < ps.count {
-            let p = tok_text(ps.data[k]);
-            if ps.data[k + 2] == ps.data[k + 1] + 1 && is_ident(ps.data[k + 1], "Gpa") {
+            let p = tok_text(ps.data[k], pcx);
+            if ps.data[k + 2] == ps.data[k + 1] + 1 && is_ident(ps.data[k + 1], "Gpa", pcx) {
                 k += 3;
                 continue;
             }
             buf_bytes(out, "                std::test_input(\"");
             buf_bytes(out, p);
             buf_bytes(out, "\");\n");
-            if debug_type(ps.data[k + 1], ps.data[k + 2]) {
+            if debug_type(ps.data[k + 1], ps.data[k + 2], pcx) {
                 buf_bytes(out, "                print(\"{");
                 buf_bytes(out, p);
                 buf_bytes(out, ":?}\");\n");
@@ -727,34 +697,34 @@ fn put_test_case(out: i64, t: Found, ps: IntVec) -> bool {
 
 // A fuzz target's dictionary: the program's string constants (up to 64,
 // of 32 bytes at most), which mutations put in its inputs.
-fn put_fuzz_words(out: i64) {
-    unsafe {
-        var n = 0;
-        for i in 0..TOK_COUNT {
-            if n < 64 && kind(i) == Tok::Str && in_program(i) && TOKS[i].end - TOKS[i].start <= 34
-                && TOKS[i].end - TOKS[i].start > 2 {
-                buf_bytes(out, "        std::fuzz_word(");
-                buf_bytes(out, tok_text(i));
-                buf_bytes(out, ");\n");
-                n += 1;
-            }
+fn put_fuzz_words(out: i64, pcx: Ctx<Comp>) {
+    var n = 0;
+    for i in 0..pcx.toks.len() as i64 {
+        if n < 64 && kind(i, pcx) == Tok::Str && in_program(i, pcx)
+            && pcx.toks[i].end - pcx.toks[i].start <= 34
+            && pcx.toks[i].end - pcx.toks[i].start > 2 {
+            buf_bytes(out, "        std::fuzz_word(");
+            buf_bytes(out, tok_text(i, pcx));
+            buf_bytes(out, ");\n");
+            n += 1;
         }
     }
 }
 
 // A contract's `requires` clauses, as filters of the generated values
 // (bound to the parameters' names).
-fn put_requires_filters(out: i64, t: Found) {
+fn put_requires_filters(out: i64, t: Found, pcx: Ctx<Comp>) {
     var j = t.close + 1;
-    while kind(j) != Tok::LBrace && kind(j) != Tok::Eof && kind(j) != Tok::Semi {
-        if is_ident(j, "requires") {
+    while kind(j, pcx) != Tok::LBrace && kind(j, pcx) != Tok::Eof && kind(j, pcx) != Tok::Semi {
+        if is_ident(j, "requires", pcx) {
             let a = j + 1;
             var e = a;
             var depth = 0;
             loop {
-                let k = kind(e);
+                let k = kind(e, pcx);
                 if k == Tok::Eof || depth == 0 && (k == Tok::LBrace || k == Tok::Else
-                    || is_ident(e, "requires") || is_ident(e, "ensures") || is_ident(e, "debug")) {
+                    || is_ident(e, "requires", pcx) || is_ident(e, "ensures", pcx)
+                    || is_ident(e, "debug", pcx)) {
                     break;
                 }
                 if k == Tok::LParen || k == Tok::LBracket {
@@ -765,7 +735,7 @@ fn put_requires_filters(out: i64, t: Found) {
                 e += 1;
             }
             buf_bytes(out, "            if !(");
-            buf_bytes(out, text_of(a, e));
+            buf_bytes(out, text_of(a, e, pcx));
             buf_bytes(out, ") { std::test_discard(); }\n");
             j = e;
         } else {
@@ -776,14 +746,15 @@ fn put_requires_filters(out: i64, t: Found) {
 
 // The function at `fn` token f has an `ensures` (a contract tested as a
 // property): a free function, not generic, without `self`.
-fn contract_at(f: i64) -> bool {
-    if kind(f + 2) != Tok::LParen || is_ident(f + 3, "self") {
+fn contract_at(f: i64, pcx: Ctx<Comp>) -> bool {
+    if kind(f + 2, pcx) != Tok::LParen || is_ident(f + 3, "self", pcx) {
         return false;
     }
-    let close = after_close(f + 2, Tok::LParen, Tok::RParen);
+    let close = after_close(f + 2, Tok::LParen, Tok::RParen, pcx);
     var j = close;
-    while kind(j) != Tok::LBrace && kind(j) != Tok::Semi && kind(j) != Tok::Eof {
-        if is_ident(j, "ensures") && !(kind(j - 1) == Tok::Ident && is_ident(j - 1, "debug")) {
+    while kind(j, pcx) != Tok::LBrace && kind(j, pcx) != Tok::Semi && kind(j, pcx) != Tok::Eof {
+        if is_ident(j, "ensures", pcx)
+            && !(kind(j - 1, pcx) == Tok::Ident && is_ident(j - 1, "debug", pcx)) {
             return true;
         }
         j += 1;
@@ -792,23 +763,23 @@ fn contract_at(f: i64) -> bool {
 }
 
 // Whether the `fn` at token f is inside an impl or trait block (a method).
-fn in_impl(f: i64) -> bool {
+fn in_impl(f: i64, pcx: Ctx<Comp>) -> bool {
     var depth = 0;
     var j = f - 1;
     while j >= 0 {
-        let k = kind(j);
+        let k = kind(j, pcx);
         if k == Tok::RBrace {
             depth += 1;
         } else if k == Tok::LBrace {
             if depth == 0 {
                 // the block's head: `impl ... {` or `trait ... {`
                 var h = j - 1;
-                while h >= 0 && kind(h) != Tok::RBrace && kind(h) != Tok::LBrace
-                    && kind(h) != Tok::Semi {
-                    if kind(h) == Tok::Impl || kind(h) == Tok::Trait {
+                while h >= 0 && kind(h, pcx) != Tok::RBrace && kind(h, pcx) != Tok::LBrace
+                    && kind(h, pcx) != Tok::Semi {
+                    if kind(h, pcx) == Tok::Impl || kind(h, pcx) == Tok::Trait {
                         return true;
                     }
-                    if kind(h) == Tok::Mod {
+                    if kind(h, pcx) == Tok::Mod {
                         return false;
                     }
                     h -= 1;
@@ -824,12 +795,13 @@ fn in_impl(f: i64) -> bool {
 
 // A struct or enum's generator, an `impl std::Arbitrary`, into its
 // module's text (structurally: its fields, or a variant then its fields).
-fn put_arbitrary(name: i64) -> bool {
+fn put_arbitrary(name: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var at = -1;
-        for i in 1..TOK_COUNT {
-            if kind(i) == Tok::Ident && TOKS[i].value as i64 == name
-                && (kind(i - 1) == Tok::Struct || kind(i - 1) == Tok::Enum) && in_program(i) {
+        for i in 1..pcx.toks.len() as i64 {
+            if kind(i, pcx) == Tok::Ident && pcx.toks[i].value as i64 == name
+                && (kind(i - 1, pcx) == Tok::Struct || kind(i - 1, pcx) == Tok::Enum)
+                && in_program(i, pcx) {
                 at = i;
                 break;
             }
@@ -837,25 +809,26 @@ fn put_arbitrary(name: i64) -> bool {
         if at < 0 {
             return true;
         }
-        let is_enum = kind(at - 1) == Tok::Enum;
-        let out = text_for(module_at(TOKS[at].start));
+        let is_enum = kind(at - 1, pcx) == Tok::Enum;
+        let out = text_for(module_at(pcx.toks[at].start, &pcx), &pcx);
         // generics: `<T, U>` (names only)
         let params = buf_new();
         let bounds = buf_new();
         var j = at + 1;
-        if kind(j) == Tok::Lt {
+        if kind(j, pcx) == Tok::Lt {
             j += 1;
             buf_byte(params, '<');
             buf_byte(bounds, '<');
             var n = 0;
-            while kind(j) != Tok::Gt && kind(j) != Tok::Eof {
-                if kind(j) == Tok::Ident && (kind(j - 1) == Tok::Lt || kind(j - 1) == Tok::Comma) {
+            while kind(j, pcx) != Tok::Gt && kind(j, pcx) != Tok::Eof {
+                if kind(j, pcx) == Tok::Ident
+                    && (kind(j - 1, pcx) == Tok::Lt || kind(j - 1, pcx) == Tok::Comma) {
                     if n > 0 {
                         buf_bytes(params, ", ");
                         buf_bytes(bounds, ", ");
                     }
-                    buf_bytes(params, tok_text(j));
-                    buf_bytes(bounds, tok_text(j));
+                    buf_bytes(params, tok_text(j, pcx));
+                    buf_bytes(bounds, tok_text(j, pcx));
                     buf_bytes(bounds, ": std::Arbitrary");
                     n += 1;
                 }
@@ -880,8 +853,8 @@ fn put_arbitrary(name: i64) -> bool {
             buf_bytes(out, "        ");
             buf_bytes(out, sym_text(name));
             buf_bytes(out, " {");
-            if kind(j) == Tok::LBrace {
-                if !put_fields(out, j, why) {
+            if kind(j, pcx) == Tok::LBrace {
+                if !put_fields(out, j, why, &pcx) {
                     return false;
                 }
             }
@@ -890,50 +863,50 @@ fn put_arbitrary(name: i64) -> bool {
             // the variants
             var count = 0;
             var k = j + 1;
-            let end = after_close(j, Tok::LBrace, Tok::RBrace) - 1;
+            let end = after_close(j, Tok::LBrace, Tok::RBrace, pcx) - 1;
             var arm_list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             while k < end {
-                if kind(k) == Tok::Ident {
+                if kind(k, pcx) == Tok::Ident {
                     let arms = buf_new();
                     arm_list.push(arms);
                     buf_bytes(arms, sym_text(name));
                     buf_bytes(arms, "::");
-                    buf_bytes(arms, tok_text(k));
+                    buf_bytes(arms, tok_text(k, pcx));
                     k += 1;
-                    if kind(k) == Tok::LParen {
+                    if kind(k, pcx) == Tok::LParen {
                         buf_byte(arms, '(');
                         var e = k + 1;
                         var n = 0;
-                        while kind(e) != Tok::RParen && e < end {
-                            let te = type_end(e);
+                        while kind(e, pcx) != Tok::RParen && e < end {
+                            let te = type_end(e, pcx);
                             if n > 0 {
                                 buf_bytes(arms, ", ");
                             }
-                            if !gen_expr(arms, e, te, why) {
+                            if !gen_expr(arms, e, te, why, &pcx) {
                                 return false;
                             }
                             n += 1;
-                            e = if kind(te) == Tok::Comma { te + 1 } else { te };
+                            e = if kind(te, pcx) == Tok::Comma { te + 1 } else { te };
                         }
                         buf_byte(arms, ')');
                         k = e + 1;
-                    } else if kind(k) == Tok::LBrace {
+                    } else if kind(k, pcx) == Tok::LBrace {
                         buf_bytes(arms, " {");
-                        if !put_fields(arms, k, why) {
+                        if !put_fields(arms, k, why, &pcx) {
                             return false;
                         }
                         buf_byte(arms, '}');
-                        k = after_close(k, Tok::LBrace, Tok::RBrace);
+                        k = after_close(k, Tok::LBrace, Tok::RBrace, pcx);
                     }
-                    if kind(k) == Tok::Eq {
+                    if kind(k, pcx) == Tok::Eq {
                         // (`A = 3`: the discriminant)
                         k += 2;
                     }
                     count += 1;
                 }
-                if kind(k) == Tok::Comma {
+                if kind(k, pcx) == Tok::Comma {
                     k += 1;
-                } else if kind(k) != Tok::Ident {
+                } else if kind(k, pcx) != Tok::Ident {
                     k += 1;
                 }
             }
@@ -959,31 +932,31 @@ fn put_arbitrary(name: i64) -> bool {
 }
 
 // The fields `{ a: T, b: U }` at the `{` token at j, generated.
-fn put_fields(out: i64, j: i64, why: i64) -> bool {
-    let end = after_close(j, Tok::LBrace, Tok::RBrace) - 1;
+fn put_fields(out: i64, j: i64, why: i64, pcx: inout Ctx<Comp>) -> bool {
+    let end = after_close(j, Tok::LBrace, Tok::RBrace, pcx) - 1;
     var k = j + 1;
     var n = 0;
     while k < end {
-        if kind(k) == Tok::Pub {
+        if kind(k, pcx) == Tok::Pub {
             k += 1;
         }
-        if kind(k) != Tok::Ident || kind(k + 1) != Tok::Colon {
+        if kind(k, pcx) != Tok::Ident || kind(k + 1, pcx) != Tok::Colon {
             k += 1;
             continue;
         }
         let a = k + 2;
-        let b = type_end(a);
+        let b = type_end(a, pcx);
         if n > 0 {
             buf_byte(out, ',');
         }
         buf_byte(out, ' ');
-        buf_bytes(out, tok_text(k));
+        buf_bytes(out, tok_text(k, pcx));
         buf_bytes(out, ": ");
-        if !gen_expr(out, a, b, why) {
+        if !gen_expr(out, a, b, why, &pcx) {
             return false;
         }
         n += 1;
-        k = if kind(b) == Tok::Comma { b + 1 } else { b };
+        k = if kind(b, pcx) == Tok::Comma { b + 1 } else { b };
     }
     if n > 0 {
         buf_byte(out, ' ');
@@ -994,85 +967,86 @@ fn put_fields(out: i64, j: i64, why: i64) -> bool {
 // After the modules' files are read (load_modules), in a test build: the
 // tests found in the tokens, their code made and lexed into their
 // modules, the program's own `main` renamed.
-pub fn add_test_code() {
+pub fn add_test_code(pcx: inout Ctx<Comp>) {
     unsafe {
-        plant_miscompile();
+        plant_miscompile(&pcx);
         if crate::middle::coverage::COVERAGE {
             // (--coverage counts the IR's blocks: -O1 at least; std's
             // counters in the program)
             if crate::middle::opt::OPT_LEVEL < 1 {
                 crate::middle::opt::OPT_LEVEL = 1;
             }
-            if !TEST_BUILD {
+            if !pcx.test_build {
                 let anchor = buf_new();
                 buf_bytes(anchor,
                     "pub fn __vole_coverage() -> [u8] {\n    std::coverage()\n}\n");
-                let start = add_source(c"<test>", anchor);
-                lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+                let start = add_source(c"<test>", anchor, &pcx);
+                lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
             }
         }
-        if !TEST_BUILD && !CHECK_TESTS {
+        if !pcx.test_build && !pcx.check_tests {
             return;
         }
-        FOUND_COUNT = 0;
-        WANTED.count = 0;
-        MODULE_TEXT.count = 0;
-        RUNS_TESTS.count = 0;
-        let count = TOK_COUNT;
+        pcx.found_count = 0;
+        pcx.wanted.count = 0;
+        pcx.module_text.count = 0;
+        pcx.runs_tests.count = 0;
+        let count = pcx.toks.len() as i64;
         for i in 0..count {
-            let attr = test_attribute_at(i);
-            if attr != 0 && in_program(i) {
-                let f = fn_after(i);
+            let attr = test_attribute_at(i, pcx);
+            if attr != 0 && in_program(i, pcx) {
+                let f = fn_after(i, pcx);
                 if f >= 0 {
-                    add_found(read_signature(f, attr));
+                    add_found(read_signature(f, attr, &pcx), &pcx);
                 }
-            } else if kind(i) == Tok::Fn && kind(i + 1) == Tok::Ident && in_program(i)
-                && contract_at(i) && !in_impl(i) {
-                add_found(read_signature(i, TEST_CONTRACT));
+            }
+            else if kind(i, pcx) == Tok::Fn && kind(i + 1, pcx) == Tok::Ident && in_program(i, pcx)
+                && contract_at(i, pcx) && !in_impl(i, pcx) {
+                add_found(read_signature(i, TEST_CONTRACT, &pcx), &pcx);
             }
         }
         // the program's main: renamed (the test main replaces it)
-        let renamed = if TEST_BUILD { count } else { 0 };
+        let renamed = if pcx.test_build { count } else { 0 };
         for i in 0..renamed {
-            if kind(i) == Tok::Fn && is_ident(i + 1, "main") && in_program(i)
-                && module_at(TOKS[i].start) == 0 {
-                TOKS[i + 1].value = intern_c(c"__vole_program_main") as u64;
+            if kind(i, pcx) == Tok::Fn && is_ident(i + 1, "main", pcx) && in_program(i, pcx)
+                && module_at(pcx.toks[i].start, &pcx) == 0 {
+                pcx.toks[i + 1].value = intern_c(c"__vole_program_main") as u64;
             }
         }
         // names: a test's own, else its path when two have it
-        for t in 0..FOUND_COUNT {
-            for u in 0..FOUND_COUNT {
-                if u != t && FOUND[u].name == FOUND[t].name {
+        for t in 0..pcx.found_count {
+            for u in 0..pcx.found_count {
+                if u != t && pcx.found[u].name == pcx.found[t].name {
                     let b = buf_new();
-                    module_path(b, FOUND[t].module);
+                    module_path(b, pcx.found[t].module);
                     if buf_slice(b).len > 0 {
                         buf_bytes(b, "::");
                     }
-                    buf_bytes(b, sym_text(FOUND[t].name));
-                    FOUND[t].label = crate::base::intern(buf_slice(b));
+                    buf_bytes(b, sym_text(pcx.found[t].name));
+                    pcx.found[t].label = crate::base::intern(buf_slice(b));
                 }
             }
         }
         // each module's cases
         var params = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for t in 0..FOUND_COUNT {
-            let found = FOUND[t];
-            if !params_of(found, &params) && found.params >= 0 {
+        for t in 0..pcx.found_count {
+            let found = pcx.found[t];
+            if !params_of(found, &params, pcx) && found.params >= 0 {
                 test_error(found.pos, c"test.signature", "a test's parameters are `name: Type`",
-                    "");
+                    "", &pcx);
                 continue;
             }
             if found.params < 0 {
-                test_error(found.pos, c"test.signature", "a test is not generic", "");
+                test_error(found.pos, c"test.signature", "a test is not generic", "", &pcx);
                 continue;
             }
             let body = buf_new();
-            if !put_test_case(body, found, params) || !TEST_BUILD {
+            if !put_test_case(body, found, params, &pcx) || !pcx.test_build {
                 continue;
             }
             // (kept in the module's dispatcher, below)
             let label = sym_text(found.label);
-            let d = dispatch_for(found.module);
+            let d = dispatch_for(found.module, &pcx);
             buf_bytes(d, "    if name == \"");
             buf_bytes(d, label);
             buf_bytes(d, "\" {\n        std::test_begin(\"");
@@ -1083,7 +1057,7 @@ pub fn add_test_code() {
             buf_bytes(d, buf_slice(body));
             buf_bytes(d, "        return true;\n    }\n");
             // the list: KIND NAME FILE:LINE
-            let l = list_text();
+            let l = list_text(&pcx);
             buf_bytes(l, "        println(\"vole-test: ");
             buf_bytes(l,
                 if found.kind == TEST_FN { "test " }
@@ -1094,65 +1068,65 @@ pub fn add_test_code() {
             let f = file_of_pos(found.pos);
             put_c(l, out_path(f));
             buf_byte(l, ':');
-            buf_int(l, pos_line(found.pos));
+            buf_int(l, pos_line(found.pos, &pcx));
             buf_bytes(l, "\");\n");
         }
-        if !TEST_BUILD {
+        if !pcx.test_build {
             return;
         }
         // the types the properties generate
         var w = 0;
-        while w < WANTED.count {
-            if !has_arbitrary(WANTED.data[w]) {
-                put_arbitrary(WANTED.data[w]);
+        while w < pcx.wanted.count {
+            if !has_arbitrary(pcx.wanted.data[w], pcx) {
+                put_arbitrary(pcx.wanted.data[w], &pcx);
             }
             w += 1;
         }
         // the dispatchers: a module's children first, then its own tests
-        for m in 0..MODULE_TEXT.count {
-            if m < DISPATCH.count && DISPATCH.data[m] >= 0 {
-                mark_runs(m);
+        for m in 0..pcx.module_text.count {
+            if m < pcx.tests_dispatch.count && pcx.tests_dispatch.data[m] >= 0 {
+                mark_runs(m, &pcx);
             }
         }
-        for m in 0..MODULE_TEXT.count {
-            if RUNS_TESTS.data[m] == 0 {
+        for m in 0..pcx.module_text.count {
+            if pcx.runs_tests.data[m] == 0 {
                 continue;
             }
-            let out = text_for(m);
+            let out = text_for(m, &pcx);
             buf_bytes(out, "pub fn __vole_tests(name: [u8], gpa: Gpa) -> bool {\n");
-            for c in 0..MODULE_TEXT.count {
-                if c > 0 && RUNS_TESTS.data[c] != 0 && MODULES[c].parent == m {
+            for c in 0..pcx.module_text.count {
+                if c > 0 && pcx.runs_tests.data[c] != 0 && MODULES[c].parent == m {
                     buf_bytes(out, "    if ");
                     buf_bytes(out, sym_text(MODULES[c].name));
                     buf_bytes(out, "::__vole_tests(name, gpa) {\n        return true;\n    }\n");
                 }
             }
-            if m < DISPATCH.count && DISPATCH.data[m] >= 0 {
-                buf_bytes(out, buf_slice(DISPATCH.data[m]));
+            if m < pcx.tests_dispatch.count && pcx.tests_dispatch.data[m] >= 0 {
+                buf_bytes(out, buf_slice(pcx.tests_dispatch.data[m]));
             }
             buf_bytes(out, "    false\n}\n\n");
         }
         // the root's: the test main
-        let root = text_for(0);
+        let root = text_for(0, &pcx);
         buf_bytes(root, "fn main(gpa: Gpa) -> i32 {\n");
         buf_bytes(root, "    let name = std::test_args();\n    if name.len == 0 {\n");
-        if LIST >= 0 {
-            buf_bytes(root, buf_slice(LIST));
+        if pcx.list >= 0 {
+            buf_bytes(root, buf_slice(pcx.list));
         }
         buf_bytes(root, "        return 0;\n    }\n");
-        if RUNS_TESTS.data[0] != 0 {
+        if pcx.runs_tests.data[0] != 0 {
             buf_bytes(root, "    if __vole_tests(name, gpa) {\n        return 0;\n    }\n");
         }
         buf_bytes(root, "    std::test_unknown(name)\n}\n");
         // each module's text, lexed into it
-        for m in 0..MODULE_TEXT.count {
-            let b = MODULE_TEXT.data[m];
+        for m in 0..pcx.module_text.count {
+            let b = pcx.module_text.data[m];
             if b < 0 || buf_slice(b).len == 0 {
                 continue;
             }
-            let start = add_source(c"<test>", b);
+            let start = add_source(c"<test>", b, &pcx);
             FILES[FILES.len() as i64 - 1].module = m;
-            lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false);
+            lex_range(start, FILES[FILES.len() as i64 - 1].end, last: false, pcx: &pcx);
         }
     }
 }
@@ -1165,50 +1139,46 @@ extern "C" {
 // build at -O1 or -O2 reads the literal 12345 as 12346, a difference
 // between the levels for `volec test` to catch and `reduce --differs`
 // to narrow down.
-fn plant_miscompile() {
+fn plant_miscompile(pcx: inout Ctx<Comp>) {
     unsafe {
         if crate::middle::opt::OPT_LEVEL < 1 || getenv(c"VOLE_PLANT_MISCOMPILE") == 0 as *u8 {
             return;
         }
-        for i in 0..TOK_COUNT {
-            if TOKS[i].kind == Tok::Int && TOKS[i].value == 12345 && in_program(i) {
-                TOKS[i].value = 12346;
+        for i in 0..pcx.toks.len() as i64 {
+            if pcx.toks[i].kind == Tok::Int && pcx.toks[i].value == 12345 && in_program(i, pcx) {
+                pcx.toks[i].value = 12346;
             }
         }
     }
 }
 
-// Per module: its tests' cases (a buffer, -1: none).
-static var DISPATCH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var LIST: i64 = -1;
-
-fn dispatch_for(m: i64) -> i64 {
+fn dispatch_for(m: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        while DISPATCH.count <= m {
-            DISPATCH.push(-1);
+        while pcx.tests_dispatch.count <= m {
+            pcx.tests_dispatch.push(-1);
         }
-        if DISPATCH.data[m] < 0 {
-            DISPATCH.data[m] = buf_new();
+        if pcx.tests_dispatch.data[m] < 0 {
+            pcx.tests_dispatch.data[m] = buf_new();
         }
-        text_for(m);
-        DISPATCH.data[m]
+        text_for(m, &pcx);
+        pcx.tests_dispatch.data[m]
     }
 }
 
-fn list_text() -> i64 {
-    if LIST < 0 {
-        LIST = buf_new();
+fn list_text(pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.list < 0 {
+        pcx.list = buf_new();
     }
-    LIST
+    pcx.list
 }
 
 // Module m and its ancestors run tests.
-fn mark_runs(m: i64) {
+fn mark_runs(m: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         var k = m;
         while k >= 0 {
-            text_for(k);
-            RUNS_TESTS.data[k] = 1;
+            text_for(k, &pcx);
+            pcx.runs_tests.data[k] = 1;
             if k == 0 {
                 break;
             }

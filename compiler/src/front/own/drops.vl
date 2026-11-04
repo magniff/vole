@@ -23,15 +23,15 @@
 
 use crate::base::{IntVec, SYMS, intern_c};
 use crate::front::ast::{
-    BLOCK_DROPS_DONE, NODES, NODE_CHECKED, NODE_IN_BOUNDS, NODE_RAW, NodeKind, SCRATCH, child,
-    list_begin, list_end, list_push, new_node,
+    BLOCK_DROPS_DONE, NODES, NODE_CHECKED, NODE_IN_BOUNDS, NODE_RAW, NodeKind, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::{LOCALS, Res, define_local};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::temps::NODE_TEMP;
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
-use crate::front::own::byref::{BYREF, MATCH_BYREF, binds, borrowed_call, fresh, push_bindings};
+use crate::front::own::byref::{MATCH_BYREF, binds, borrowed_call, fresh, push_bindings};
 use crate::front::own::diag::{
     MODE_ERROR, OWN_DROP_VIEW, OWN_MODE, own_end, own_help, own_str, own_type,
 };
@@ -39,28 +39,22 @@ use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::{has_drop_impl, is_owned_type, is_view_type};
 use crate::front::own::state::{RK_LOCAL, root_of};
 use crate::front::types::{FNS, REF_SHARED, STRUCTS, TLISTS, TYPES, TY_UNIT, TyKind, struct_field};
-use crate::middle::lower::ssa::HMap;
 
 // Node flags (0.17, T1): on an Arm whose bindings were looked at
 // (arm_drops); on a body whose parameters were (param_drops). (NO_DROP is
 // byref.vl's; named here too for the checker.)
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 pub use crate::front::own::byref::NO_DROP;
 use crate::front::own::ctx::OwnCx;
 pub const ARM_DROPS_DONE: i64 = 1 << 60;
 pub const PARAM_DROPS_DONE: i64 = 1 << 61;
 
-// `impl Drop` of view types (own.drop_view): the method's node, the type.
-static var DROP_VIEWS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var SYM_TMP: i64 = 0;
-static var SYM_NEEDS_DROP: i64 = 0;
-static var SYM_DROP: i64 = 0;
-
-fn syms() {
-    if SYM_TMP == 0 {
-        SYM_TMP = intern_c(c"__own_tmp");
-        SYM_NEEDS_DROP = intern_c(c"needs_drop");
-        SYM_DROP = intern_c(c"drop");
+fn syms(pcx: inout Ctx<Comp>) {
+    if pcx.sym_tmp == 0 {
+        pcx.sym_tmp = intern_c(c"__own_tmp");
+        pcx.sym_needs_drop = intern_c(c"needs_drop");
+        pcx.drops_sym_drop = intern_c(c"drop");
     }
 }
 
@@ -95,9 +89,9 @@ fn is_std_fn(f: i64, name: i64) -> bool {
 // Vec<T>` of a `Vec<[u8]>`, as Rust's `may_dangle`). Fields of a std
 // template are looked at, so a std `struct P<T> { s: [u8], x: T }` with
 // `impl<T> Drop` is still reported.
-fn drop_reads_views(t: i64) -> bool {
+fn drop_reads_views(t: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if !is_view_type(t) {
+        if !is_view_type(t, &pcx) {
             return false;
         }
         if TYPES[t].kind != TyKind::Struct {
@@ -113,7 +107,7 @@ fn drop_reads_views(t: i64) -> bool {
         }
         for i in 0..STRUCTS[tm].field_count {
             let ft = (*struct_field(tm, i)).ty;
-            if ft > 0 && is_view_type(ft) {
+            if ft > 0 && is_view_type(ft, &pcx) {
                 return true;
             }
         }
@@ -124,14 +118,14 @@ fn drop_reads_views(t: i64) -> bool {
 // (0.17; 0.26.2: on its own, the drops it was found with gone)
 // own.drop_view: each `impl Drop` of a type that holds views (param_drops
 // noted them), after the walks.
-pub fn report_drop_views() {
+pub fn report_drop_views(pcx: inout Ctx<Comp>) {
     var i = 0;
-    while i < DROP_VIEWS.count {
-        let item = DROP_VIEWS.get(i);
-        let dt = DROP_VIEWS.get(i + 1);
-        crate::front::own::diag::own_begin(item, OWN_DROP_VIEW);
-        own_str(c"'");
-        own_type(dt);
+    while i < pcx.drop_views.count {
+        let item = pcx.drop_views.get(i);
+        let dt = pcx.drop_views.get(i + 1);
+        crate::front::own::diag::own_begin(item, OWN_DROP_VIEW, &pcx);
+        own_str(c"'", pcx);
+        own_type(dt, pcx);
         // UNSAFE: STRUCTS is the checker's raw table of structs.
         // SAFETY: dt is a struct type (the left side of the `&&`), so
         // TYPES[dt].a is a struct below the table's count; the checker runs
@@ -140,13 +134,13 @@ pub fn report_drop_views() {
             && unsafe { STRUCTS[TYPES[dt].a].tmpl != 0 };
         if instance {
             // (0.25: an instance whose type argument is a view)
-            own_str(c"' holds views (a type argument is one) and cannot implement Drop: its drop could read what it views after that is gone");
-            own_help(c"give it an owned type argument instead of the view (`.to_vec_in(gpa)`, `.to_string_in(gpa)`, a Buf), or remove the impl");
+            own_str(c"' holds views (a type argument is one) and cannot implement Drop: its drop could read what it views after that is gone", pcx);
+            own_help(c"give it an owned type argument instead of the view (`.to_vec_in(gpa)`, `.to_string_in(gpa)`, a Buf), or remove the impl", pcx);
         } else {
-            own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
-            own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone", pcx);
+            own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl", pcx);
         }
-        own_end();
+        own_end(&pcx);
         i += 2;
     }
 }
@@ -154,32 +148,33 @@ pub fn report_drop_views() {
 // check_function, its parameters defined: `needs_drop::<T>()` folded;
 // `impl Drop` of a view type noted (own.drop_view); a requires check's
 // owned parameters borrow the caller's arguments.
-pub fn param_drops(item: i64, f: i64) {
+pub fn param_drops(item: i64, f: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        syms();
+        syms(&pcx);
         let body = NODES[item].c;
-        if FNS[f].tmpl != 0 && is_std_fn(f, SYM_NEEDS_DROP) && body != 0 && NODES[body].a != 0 {
+        if FNS[f].tmpl != 0 && is_std_fn(f, pcx.sym_needs_drop) && body != 0 && NODES[body].a != 0 {
             let t = TLISTS.data[FNS[f].targs];
-            NODES[NODES[body].a].a = if has_glue(t) { 1 } else { 0 };
+            NODES[NODES[body].a].a = if has_glue(t, &pcx) { 1 } else { 0 };
         }
-        if FNS[f].self_ty > 0 && NODES[item].a == SYM_DROP && has_drop_impl(FNS[f].self_ty)
-            && drop_reads_views(FNS[f].self_ty) {
-            DROP_VIEWS.push(item);
-            DROP_VIEWS.push(FNS[f].self_ty);
+        if FNS[f].self_ty > 0 && NODES[item].a == pcx.drops_sym_drop
+            && has_drop_impl(FNS[f].self_ty, &pcx)
+            && drop_reads_views(FNS[f].self_ty, &pcx) {
+            pcx.drop_views.push(item);
+            pcx.drop_views.push(FNS[f].self_ty);
         }
         if !drops_on() || body == 0 || (NODES[body].p & PARAM_DROPS_DONE) != 0 {
             return;
         }
         NODES[body].p |= PARAM_DROPS_DONE;
-        if crate::front::contracts::expand::is_pre_fn(f) {
+        if crate::front::contracts::expand::is_pre_fn(f, pcx) {
             // (0.18: a requires check reads the caller's arguments in place:
             // its owned parameters borrow them, are never dropped, and
             // moving one is own.move_out)
             for i in 0..NODES[item].count {
-                let p = child(item, i);
+                let p = child(item, i, pcx);
                 let l = NODES[p].x;
-                if l >= 0 && is_owned_type(LOCALS[l].ty) {
-                    BYREF.put(l + 1, p + 1);
+                if l >= 0 && is_owned_type(LOCALS[l].ty, &pcx) {
+                    pcx.byref.put(l + 1, p + 1);
                 }
             }
         }
@@ -199,7 +194,7 @@ pub fn block_begin(block: i64) -> bool {
 // check_block, after statement stmt, checked (on: block_begin's): a value
 // it discards bound to a hidden local, a `let`'s bindings that borrow, its
 // temporaries (visit_temps).
-pub fn after_stmt(on: bool, stmt: i64) {
+pub fn after_stmt(on: bool, stmt: i64, pcx: inout Ctx<Comp>) {
     if !on {
         return;
     }
@@ -207,13 +202,13 @@ pub fn after_stmt(on: bool, stmt: i64) {
     if k == NodeKind::Let {
         let init = NODES[stmt].c;
         if NODES[stmt].a != 0 && NODES[NODES[stmt].a].kind == NodeKind::PatWild
-            && is_temp(init) {
+            && is_temp(init, &pcx) {
             // (0.25: `let _ = make();` drops the value at once, as `make();`)
-            NODES[stmt].c = temporary(init);
+            NODES[stmt].c = temporary(init, &pcx);
             return;
         }
         if NODES[stmt].a != 0 && NODES[NODES[stmt].a].kind == NodeKind::PatWild && init != 0
-            && is_owned_type(NODES[init].ty) && is_place(init) {
+            && is_owned_type(NODES[init].ty, &pcx) && is_place(init) {
             // (`let _ = x;` of an owned place moves nothing, as Rust's:
             // it reads x)
             let r = t_node(NodeKind::Unary, init, crate::front::types::ref_to(NODES[init].ty,
@@ -223,34 +218,34 @@ pub fn after_stmt(on: bool, stmt: i64) {
             NODES[stmt].c = r;
             return;
         }
-        let_drops(stmt);
+        let_drops(stmt, &pcx);
         // (0.20: its temporaries, to the end of the statement; to the
         // end of the block when the binding may view them)
-        if init != 0 && is_view_type(NODES[init].ty) {
-            visit_temps(init);
+        if init != 0 && is_view_type(NODES[init].ty, &pcx) {
+            visit_temps(init, &pcx);
         } else {
-            NODES[stmt].c = unit_value(init);
+            NODES[stmt].c = unit_value(init, &pcx);
         }
     } else if k == NodeKind::ExprStmt {
         let e = NODES[stmt].a;
         if e == 0 {
             return;
         }
-        if NODES[stmt].b != 0 && has_glue(NODES[e].ty) && !is_place(e) {
-            NODES[stmt].a = temporary(e);
+        if NODES[stmt].b != 0 && has_glue(NODES[e].ty, &pcx) && !is_place(e) {
+            NODES[stmt].a = temporary(e, &pcx);
         } else {
             // (0.20: its temporaries, to the end of the statement)
-            NODES[stmt].a = unit_value(e);
+            NODES[stmt].a = unit_value(e, &pcx);
         }
     }
 }
 
 // check_block, after its tail (checked; on: block_begin's): its
 // temporaries, to the end of the block (0.20).
-pub fn after_tail(on: bool, block: i64) {
+pub fn after_tail(on: bool, block: i64, pcx: inout Ctx<Comp>) {
     let tail = NODES[block].a;
     if on && tail != 0 {
-        visit_temps(tail);
+        visit_temps(tail, &pcx);
     }
 }
 
@@ -269,42 +264,35 @@ fn is_place(e: i64) -> bool {
 }
 
 // Pattern p's owned bindings borrow what they bind (node at).
-fn mark_byref(p: i64, at: i64) {
+fn mark_byref(p: i64, at: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let mark = list_begin();
-        push_bindings(p);
-        for i in mark..SCRATCH.count {
-            let b = SCRATCH.data[i];
+        let mark = list_begin(pcx);
+        push_bindings(p, &pcx);
+        for i in mark..pcx.scratch.count {
+            let b = pcx.scratch.data[i];
             let l = NODES[b].x;
-            if l >= 0 && is_owned_type(LOCALS[l].ty) {
-                BYREF.put(l + 1, at + 1);
+            if l >= 0 && is_owned_type(LOCALS[l].ty, &pcx) {
+                pcx.byref.put(l + 1, at + 1);
             }
         }
-        SCRATCH.count = mark;
+        pcx.scratch.count = mark;
     }
 }
 
 // (0.25) `e?` (check/try_op.vl), its `let ?try = e;` bound (pattern bind):
 // when e is a borrowed copy (`v.last()?`), ?try borrows it, so the match
 // binds ?v by reference and nothing in the desugaring drops the element.
-pub fn try_let_borrows(bind: i64, operand: i64) {
-    if drops_on() && borrowed_call(operand) {
-        mark_byref(bind, operand);
+pub fn try_let_borrows(bind: i64, operand: i64, pcx: inout Ctx<Comp>) {
+    if drops_on() && borrowed_call(operand, &pcx) {
+        mark_byref(bind, operand, &pcx);
     }
 }
 
-// (0.24, with moves::iter_item_copy) The parameter (its index) of the
-// closure being checked as the argument of `map`, `for_each`,
-// `filter_map` or `fold` on a borrowing iterator's chain that gets its
-// items, which are copies of the container's elements: borrowed (BYREF:
-// not dropped, and moving it is own.move_out); -1: none.
-pub static var ITEM_BORROW: i64 = -1;
-
 // Closure parameter local l (node p) borrows the item it is given.
-pub fn item_borrowed(l: i64, at: i64) {
+pub fn item_borrowed(l: i64, at: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if l >= 0 && is_owned_type(LOCALS[l].ty) {
-            BYREF.put(l + 1, at + 1);
+        if l >= 0 && is_owned_type(LOCALS[l].ty, &pcx) {
+            pcx.byref.put(l + 1, at + 1);
         }
     }
 }
@@ -313,67 +301,67 @@ pub fn item_borrowed(l: i64, at: i64) {
 // (BYREF), when init is a copy of an element a collection keeps
 // (`v.get(i)`), a binding that borrows, destructured, or a `for` loop's
 // element.
-fn let_drops(stmt: i64) {
+fn let_drops(stmt: i64, pcx: inout Ctx<Comp>) {
     let pat = NODES[stmt].a;
     let init = NODES[stmt].c;
     if pat == 0 || init == 0 || (NODES[stmt].p & NO_DROP) != 0 {
         return;
     }
-    if borrowed_call(init) {
+    if borrowed_call(init, &pcx) {
         // (a copy of an element a collection keeps: `v.get(i)`)
-        mark_byref(pat, init);
+        mark_byref(pat, init, &pcx);
         return;
     }
     if NODES[pat].kind != NodeKind::PatBind && NODES[init].kind == NodeKind::Ident
-        && reached_by_ref(init) {
+        && reached_by_ref(init, pcx) {
         // (0.25: a binding that borrows, destructured, `|(i, d)|` of a
         // borrowing iterator's item: its parts borrow, as a match on it)
         NODES[init].p |= MATCH_BYREF;
-        mark_byref(pat, init);
+        mark_byref(pat, init, &pcx);
         return;
     }
     if NODES[init].kind == NodeKind::Index && (NODES[init].p & NODE_IN_BOUNDS) != 0 {
         // (a `for` loop's element: a copy of what the loop borrows)
-        mark_byref(pat, init);
+        mark_byref(pat, init, &pcx);
     }
 }
 
 // `e;` discarding an owned value e (checked): `{ let __own_tmp = e; }`,
 // which drops it at once.
-fn temporary(e: i64) -> i64 {
-    syms();
+fn temporary(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    syms(&pcx);
     let start = NODES[e].start;
     let end = NODES[e].end;
     NODES[e].p |= NODE_CHECKED;
     let pat = new_node(NodeKind::PatBind, start, start);
-    NODES[pat].a = SYM_TMP;
+    NODES[pat].a = pcx.sym_tmp;
     let st = new_node(NodeKind::Let, start, end);
     NODES[st].a = pat;
     NODES[st].c = e;
     let b = new_node(NodeKind::Block, start, end);
-    let mark = list_begin();
-    list_push(st);
-    list_end(b, mark);
-    synth_expr(b);
+    let mark = list_begin(pcx);
+    list_push(st, &pcx);
+    list_end(b, mark, &pcx);
+    synth_expr(b, &pcx);
     b
 }
 
 // Whether match scrutinee e is reached through a reference, an index or a
 // static (or is a binding that borrows): its bindings borrow.
-fn reached_by_ref(e: i64) -> bool {
+fn reached_by_ref(e: i64, pcx: Ctx<Comp>) -> bool {
     let k = NODES[e].kind;
     if k == NodeKind::Ident {
         if NODES[e].res == Res::Static {
             return true;
         }
         return NODES[e].res == Res::Local && NODES[e].y >= 0
-            && BYREF.get(NODES[e].y + 1) != 0;
+            && pcx.byref.get(NODES[e].y + 1) != 0;
     }
     if k == NodeKind::FieldAccess {
-        return NODES[e].y == 1 || reached_by_ref(NODES[e].a);
+        return NODES[e].y == 1 || reached_by_ref(NODES[e].a, pcx);
     }
     if k == NodeKind::TupleField {
-        return reached_by_ref(NODES[e].a);
+        return reached_by_ref(NODES[e].a, pcx);
     }
     if k == NodeKind::Unary {
         return NODES[e].op == Tok::Star;
@@ -384,7 +372,7 @@ fn reached_by_ref(e: i64) -> bool {
 // check_match, arm `arm` of match m, its pattern checked: a match reached
 // through a reference (or a borrowed copy) binds by reference, its owned
 // bindings borrowing (BYREF) and its scrutinee marked (MATCH_BYREF).
-pub fn arm_drops(m: i64, arm: i64) {
+pub fn arm_drops(m: i64, arm: i64, pcx: inout Ctx<Comp>) {
     if !drops_on() || (NODES[arm].p & ARM_DROPS_DONE) != 0 {
         return;
     }
@@ -392,9 +380,9 @@ pub fn arm_drops(m: i64, arm: i64) {
     // (0.25: a `for` loop's `next()`, ARM_FOR_NEXT, as any match: a
     // borrowing iterator's items borrow)
     let scrutinee = NODES[m].a;
-    if scrutinee != 0 && (reached_by_ref(scrutinee) || borrowed_call(scrutinee)) {
+    if scrutinee != 0 && (reached_by_ref(scrutinee, pcx) || borrowed_call(scrutinee, &pcx)) {
         NODES[scrutinee].p |= MATCH_BYREF;
-        mark_byref(NODES[arm].a, scrutinee);
+        mark_byref(NODES[arm].a, scrutinee, &pcx);
     }
 }
 
@@ -451,39 +439,10 @@ fn t_ident(l: i64, at: i64) -> i64 {
 // it end with the statement (or the block), own.escape past that. A `let`
 // keeps its temporaries to the end of the block only when it binds a view.
 
-// ---------------------------------------------------------------------------
-// Statement temporaries (0.20)
-//
-// An owned value made by an expression and used without being moved (a
-// receiver, `f()?.read()`, `make().len()`; a field read out of it,
-// `make().id`; an argument a `let` parameter borrows) lives until its
-// statement ends and is dropped then, after every use: Rust's rule. It
-// becomes `{ var __own_tv = value; &__own_tv }` where it is made, a block
-// that is no scope of its own (NODE_TEMP, own/walk): views of __own_tv end
-// with the statement (or the block), own.escape past that. The places IR
-// reads the block as `&value` and makes and drops the temporary itself
-// (build.vl own_temp_block, value_temp); the own walk's view checks read
-// the hidden `let`. The nodes are made typed: they are not checked again.
-//
-// (0.25, conventions.md §2.2 "Temporaries") So are a value lent to a let
-// parameter (check_mode::LET_ARG), an operator's operands an impl reads, a
-// scrutinee no arm takes a part of, and the rest of a value a part is moved
-// out of (part_move). A `let` keeps its temporaries to the end of the block
-// only when it binds a view; an expression statement's, a `let`'s that
-// binds none and a `while` condition's end with it (unit_value).
-static var SYM_TV: i64 = 0;
-
-// (0.24) Whether the expression visit_temps is visiting is borrowed by its parent (`&e`).
-static var TEMP_BORROW: bool = false;
-
-// The statement temporaries with glue made so far (temp_ptr): unit_value
-// makes its expression a block of its own when it made one.
-static var TEMPS_MADE: i64 = 0;
-
 // Whether e is a temporary to keep to the end of the statement: new,
 // owned, with a drop.
-fn is_temp(e: i64) -> bool {
-    e != 0 && NODES[e].ty > 0 && has_glue(NODES[e].ty) && fresh(e)
+fn is_temp(e: i64, pcx: inout Ctx<Comp>) -> bool {
+    e != 0 && NODES[e].ty > 0 && has_glue(NODES[e].ty, &pcx) && fresh(e, &pcx)
 }
 
 fn t_let(l: i64, init: i64, at: i64) -> i64 {
@@ -500,9 +459,9 @@ fn t_let(l: i64, init: i64, at: i64) -> i64 {
     }
 }
 
-fn t_block(mark: i64, tail: i64, at: i64, ty: i64) -> i64 {
+fn t_block(mark: i64, tail: i64, at: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     let b = t_node(NodeKind::Block, at, ty);
-    list_end(b, mark);
+    list_end(b, mark, &pcx);
     NODES[b].a = tail;
     NODES[b].p |= BLOCK_DROPS_DONE;
     b
@@ -511,27 +470,22 @@ fn t_block(mark: i64, tail: i64, at: i64, ty: i64) -> i64 {
 // Temporary e (checked, with glue), whose address its statement uses
 // (`&value`, a receiver, a let argument, a part read out of it):
 // temp_value's block, of type `&T`.
-fn temp_ptr(e: i64) -> i64 {
-    TEMPS_MADE += 1;
-    temp_value(e)
+fn temp_ptr(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    pcx.temps_made += 1;
+    temp_value(e, &pcx)
 }
 
-// (0.25) The statement temporaries' locals (__own_tv, + 1) and the
-// expressions they hold (+ 1): own.escape names the temporary
-// (temp_source).
-static var TEMP_SRC: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
 // The expression whose statement temporary is place p's root, or 0.
-pub fn temp_source(p: i64, ocx: OwnCx) -> i64 {
+pub fn temp_source(p: i64, ocx: OwnCx, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if p < 0 || TEMP_SRC.count == 0 {
+        if p < 0 || pcx.temp_src.count == 0 {
             return 0;
         }
         let r = root_of(p, ocx);
         if ocx.pl_rkind[r] != RK_LOCAL {
             return 0;
         }
-        let s = TEMP_SRC.get(ocx.pl_rid[r] + 1);
+        let s = pcx.temp_src.get(ocx.pl_rid[r] + 1);
         if s > 0 { s - 1 } else { 0 }
     }
 }
@@ -560,15 +514,15 @@ fn part_count(t: i64) -> i64 {
 // when a later argument may leave the statement (hold_args). Blocks were
 // visited as they were checked (but an operator's, operator_temps);
 // closures' bodies are their own; a `while`'s condition is its own unit.
-fn visit_temps(e: i64) {
+fn visit_temps(e: i64, pcx: inout Ctx<Comp>) {
     if e == 0 {
         return;
     }
     let k = NODES[e].kind;
-    if k == NodeKind::Block && operator_temps(e) {
+    if k == NodeKind::Block && operator_temps(e, &pcx) {
         return;
     }
-    if k == NodeKind::Block && crate::front::contracts::expand::requires_tail(e) > 0 {
+    if k == NodeKind::Block && crate::front::contracts::expand::requires_tail(e, pcx) > 0 {
         // (0.25.2.2: a call of a function with a requires,
         // contracts::desugar::requires_call `{ let ?aI = argI; ..;
         // f$pre(SITE, ?a0, ..); f(?a0, ..) }`, checked by hand, not as a
@@ -576,12 +530,12 @@ fn visit_temps(e: i64) {
         // call's. `dev.compute_pipeline(dev.shader_wgsl(SRC)?, "e")?`
         // lent the shader dropped, a plain temporary leaked)
         for i in 0..NODES[e].count {
-            let s = child(e, i);
+            let s = child(e, i, pcx);
             if NODES[s].kind == NodeKind::Let {
-                visit_temps(NODES[s].c);
+                visit_temps(NODES[s].c, &pcx);
             }
         }
-        hold_args(e);
+        hold_args(e, &pcx);
         return;
     }
     if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
@@ -589,57 +543,58 @@ fn visit_temps(e: i64) {
         return;
     }
     if k == NodeKind::While {
-        NODES[e].b = unit_value(NODES[e].b);
+        NODES[e].b = unit_value(NODES[e].b, &pcx);
         return;
     }
     if k == NodeKind::For {
-        visit_temps(NODES[e].c);
+        visit_temps(NODES[e].c, &pcx);
         return;
     }
     if k == NodeKind::Unary {
         // (`&make().v`: the field is borrowed, not moved)
-        TEMP_BORROW = NODES[e].op == Tok::Amp;
-        visit_temps(NODES[e].b);
-        TEMP_BORROW = false;
-        if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
+        pcx.temp_borrow = NODES[e].op == Tok::Amp;
+        visit_temps(NODES[e].b, &pcx);
+        pcx.temp_borrow = false;
+        if NODES[e].op == Tok::Amp && is_temp(NODES[e].b, &pcx) {
             // (`&value`: a receiver, a let argument; the block gives
             // the address, as `&` did)
             let ty = NODES[e].ty;
-            let b = temp_ptr(NODES[e].b);
+            let b = temp_ptr(NODES[e].b, &pcx);
             NODES[e] = NODES[b];
             NODES[e].ty = ty;
-        } else if NODES[e].op == Tok::Amp && lent_value(NODES[e].b) {
+        } else if NODES[e].op == Tok::Amp && lent_value(NODES[e].b, &pcx) {
             // (0.25: a value without glue lent the same way, `E { .. }.nm()`:
             // a local of the statement, whose views are checked as a
             // local's)
             let ty = NODES[e].ty;
-            let b = temp_value(NODES[e].b);
+            let b = temp_value(NODES[e].b, &pcx);
             NODES[e] = NODES[b];
             NODES[e].ty = ty;
         }
         return;
     }
     if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
-        let borrowed = TEMP_BORROW;
+        let borrowed = pcx.temp_borrow;
         let base = NODES[e].a;
-        TEMP_BORROW = borrowed && (NODES[base].kind == NodeKind::FieldAccess
+        pcx.temp_borrow = borrowed && (NODES[base].kind == NodeKind::FieldAccess
             || NODES[base].kind == NodeKind::TupleField);
         // (0.25: a part moved out of a part, `make().a.b`: the chain is
         // the outermost node's)
-        let moved_out = !borrowed && NODES[e].y != 1 && is_owned_type(NODES[e].ty);
-        if moved_out && part_move(e) {
-            TEMP_BORROW = false;
+        let moved_out = !borrowed && NODES[e].y != 1 && is_owned_type(NODES[e].ty, &pcx);
+        if moved_out && part_move(e, &pcx) {
+            pcx.temp_borrow = false;
             return;
         }
-        visit_temps(base);
-        TEMP_BORROW = false;
+        visit_temps(base, &pcx);
+        pcx.temp_borrow = false;
         // (0.24: an owned field moved out, `let x = make().v;`, is not
         // read through the temporary's address, which would drop it
         // again with the temporary: part_move, or own.partial when
         // a type on the way implements Drop)
-        if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
+        if NODES[e].y != 1 && is_temp(NODES[e].a, &pcx)
+            && (borrowed || !is_owned_type(NODES[e].ty, &pcx)) {
             // (`make().id`: read through the address)
-            NODES[e].a = temp_ptr(NODES[e].a);
+            NODES[e].a = temp_ptr(NODES[e].a, &pcx);
             if k == NodeKind::FieldAccess {
                 NODES[e].y = 1;
                 NODES[e].p |= NODE_RAW;
@@ -653,38 +608,38 @@ fn visit_temps(e: i64) {
     if k == NodeKind::Binary || k == NodeKind::Assign || k == NodeKind::Index
         || k == NodeKind::Range || k == NodeKind::If {
         if k == NodeKind::If {
-            visit_temps(NODES[e].a);
-            visit_temps(NODES[e].b);
-            visit_temps(NODES[e].c);
+            visit_temps(NODES[e].a, &pcx);
+            visit_temps(NODES[e].b, &pcx);
+            visit_temps(NODES[e].c, &pcx);
             return;
         }
-        if k == NodeKind::Index && !TEMP_BORROW && is_owned_type(NODES[e].ty) {
+        if k == NodeKind::Index && !pcx.temp_borrow && is_owned_type(NODES[e].ty, &pcx) {
             // (0.25: an element moved out of an array temporary,
             // `make()[1]`; by a run-time index the others would leak)
-            if part_move(e) {
+            if part_move(e, &pcx) {
                 return;
             }
             let base = NODES[e].a;
-            if is_temp(base) && TYPES[NODES[base].ty].kind == TyKind::Array {
-                temp_element_error(e);
+            if is_temp(base, &pcx) && TYPES[NODES[base].ty].kind == TyKind::Array {
+                temp_element_error(e, &pcx);
             }
         }
         if k == NodeKind::Index || k == NodeKind::Range {
-            visit_temps(NODES[e].a);
-            visit_temps(NODES[e].b);
+            visit_temps(NODES[e].a, &pcx);
+            visit_temps(NODES[e].b, &pcx);
             return;
         }
-        visit_temps(NODES[e].b);
-        visit_temps(NODES[e].c);
+        visit_temps(NODES[e].b, &pcx);
+        visit_temps(NODES[e].c, &pcx);
         return;
     }
     if k == NodeKind::Cast || k == NodeKind::Return || k == NodeKind::Repeat
         || k == NodeKind::EnumPanic {
-        visit_temps(NODES[e].a);
+        visit_temps(NODES[e].a, &pcx);
         return;
     }
     if k == NodeKind::Break || k == NodeKind::FieldInit || k == NodeKind::NamedArg {
-        visit_temps(NODES[e].b);
+        visit_temps(NODES[e].b, &pcx);
         return;
     }
     if k == NodeKind::Try {
@@ -695,19 +650,19 @@ fn visit_temps(e: i64) {
         // dropped under it, a leak without the inner `?`)
         let y = NODES[e].y;
         if y > 0 && NODES[y].kind == NodeKind::Block && NODES[y].count > 0
-            && NODES[child(y, 0)].kind == NodeKind::Let {
-            visit_temps(NODES[child(y, 0)].c);
+            && NODES[child(y, 0, pcx)].kind == NodeKind::Let {
+            visit_temps(NODES[child(y, 0, pcx)].c, &pcx);
             return;
         }
-        visit_temps(y);
+        visit_temps(y, &pcx);
         return;
     }
     if k == NodeKind::Interp {
         // (the holes, then what the f-string became)
         for i in 0..NODES[e].count {
-            let h = child(e, i);
+            let h = child(e, i, pcx);
             if NODES[h].kind == NodeKind::InterpHole {
-                visit_temps(NODES[h].a);
+                visit_temps(NODES[h].a, &pcx);
             }
         }
         let y = NODES[e].y;
@@ -715,50 +670,50 @@ fn visit_temps(e: i64) {
             // (a call written in place, check/interp.vl direct_call:
             // its holes are the values of its `let`s)
             for i in 0..NODES[y].count {
-                let s = child(y, i);
+                let s = child(y, i, pcx);
                 if NODES[s].kind == NodeKind::Let {
-                    visit_temps(NODES[s].c);
+                    visit_temps(NODES[s].c, &pcx);
                 }
             }
         } else {
-            visit_temps(y);
+            visit_temps(y, &pcx);
         }
         return;
     }
     if k == NodeKind::Match {
-        visit_temps(NODES[e].a);
+        visit_temps(NODES[e].a, &pcx);
         for i in 0..NODES[e].count {
-            let arm = child(e, i);
-            visit_temps(NODES[arm].b);
-            visit_temps(NODES[arm].c);
+            let arm = child(e, i, pcx);
+            visit_temps(NODES[arm].b, &pcx);
+            visit_temps(NODES[arm].c, &pcx);
         }
         // (0.25: an owned temporary matched with no binding that takes
         // a part of it, `match make() { E::A(_) => .. }`: matched where
         // it is kept, and dropped with the statement)
         let s = NODES[e].a;
-        if is_temp(s) && !match_binds_owned(e) {
-            NODES[e].a = deref_of(temp_ptr(s));
+        if is_temp(s, &pcx) && !match_binds_owned(e, &pcx) {
+            NODES[e].a = deref_of(temp_ptr(s, &pcx));
         }
         return;
     }
     if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
         if k == NodeKind::MethodCall || k == NodeKind::VecOp || NODES[e].x == 0 {
-            visit_temps(NODES[e].a);
+            visit_temps(NODES[e].a, &pcx);
         }
         for i in 0..NODES[e].count {
-            visit_temps(child(e, i));
+            visit_temps(child(e, i, pcx), &pcx);
         }
-        hold_args(e);
+        hold_args(e, &pcx);
         return;
     }
     if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
         || k == NodeKind::VariantLit {
         for i in 0..NODES[e].count {
-            visit_temps(child(e, i));
+            visit_temps(child(e, i, pcx), &pcx);
         }
         if k == NodeKind::StructLit {
             // (0.25.2.2: a let field given a branch's value, hold_args)
-            hold_args(e);
+            hold_args(e, &pcx);
         }
     }
 }
@@ -774,9 +729,9 @@ fn deref_of(b: i64) -> i64 {
 
 // (0.25) Whether `&v` lends value v as a temporary of no glue (`&E { .. }`,
 // a receiver; a let argument): v is no place, and has storage.
-fn lent_value(v: i64) -> bool {
+fn lent_value(v: i64, pcx: inout Ctx<Comp>) -> bool {
     let t = NODES[v].ty;
-    if t <= 0 || has_glue(t) || is_place(v) {
+    if t <= 0 || has_glue(t, &pcx) || is_place(v) {
         return false;
     }
     let k = NODES[v].kind;
@@ -790,29 +745,29 @@ fn lent_value(v: i64) -> bool {
 // block that is no scope of its own (own/walk), so that __own_tv lives as
 // long as the statement, and views of it are checked as views of a local
 // of it.
-fn temp_value(v: i64) -> i64 {
-    if SYM_TV == 0 {
-        SYM_TV = intern_c(c"__own_tv");
+fn temp_value(v: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.sym_tv == 0 {
+        pcx.sym_tv = intern_c(c"__own_tv");
     }
     let t = NODES[v].ty;
-    let tv = define_local(SYM_TV, t, true, false);
-    TEMP_SRC.put(tv + 1, v + 1);
-    let m = list_begin();
-    list_push(t_let(tv, v, v));
+    let tv = define_local(pcx.sym_tv, t, true, false, &pcx);
+    pcx.temp_src.put(tv + 1, v + 1);
+    let m = list_begin(pcx);
+    list_push(t_let(tv, v, v), &pcx);
     let rt = crate::front::types::ref_to(t, REF_SHARED);
     let addr = t_node(NodeKind::Unary, v, rt);
     NODES[addr].op = Tok::Amp;
     NODES[addr].b = t_ident(tv, v);
-    let b = t_block(m, addr, v, rt);
+    let b = t_block(m, addr, v, rt, &pcx);
     NODES[b].p |= NODE_TEMP;
     NODES[b].end = NODES[v].end;
     b
 }
 
 // (0.25) Whether an arm of match m binds an owned part of what it matches.
-fn match_binds_owned(m: i64) -> bool {
+fn match_binds_owned(m: i64, pcx: inout Ctx<Comp>) -> bool {
     for i in 0..NODES[m].count {
-        if crate::front::own::walk::pattern_binds_owned(NODES[child(m, i)].a) {
+        if crate::front::own::walk::pattern_binds_owned(NODES[child(m, i, pcx)].a, &pcx) {
             return true;
         }
     }
@@ -821,16 +776,16 @@ fn match_binds_owned(m: i64) -> bool {
 
 // (0.25) own.partial: `make()[i]`, an owned element moved out of an array
 // temporary by a run-time index (the other elements have no owner left).
-fn temp_element_error(e: i64) {
-    let saved = crate::base::diag::ERR_KIND;
-    crate::base::diag::ERR_KIND = c"own.partial";
-    crate::base::diag::err_begin(NODES[e].start);
+fn temp_element_error(e: i64, pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"own.partial";
+    crate::base::diag::err_begin(NODES[e].start, &pcx);
     let text = crate::base::SRC[NODES[e].start..NODES[e].end];
-    crate::base::diag::err_fmt(format_args("'{text}'"));
-    crate::base::diag::err_str(c" moves an element out of a temporary array by a run-time index: the other elements would not be dropped");
-    crate::base::diag::err_help(c"index it by a constant, or bind the array first ('let a = VALUE;') and take the element from it");
-    crate::base::diag::err_end_soft();
-    crate::base::diag::ERR_KIND = saved;
+    crate::base::diag::err_fmt(format_args("'{text}'"), pcx);
+    crate::base::diag::err_str(c" moves an element out of a temporary array by a run-time index: the other elements would not be dropped", pcx);
+    crate::base::diag::err_help(c"index it by a constant, or bind the array first ('let a = VALUE;') and take the element from it", pcx);
+    crate::base::diag::err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // (0.25) e, a field, tuple part or array element (by a constant) moved
@@ -839,12 +794,12 @@ fn temp_element_error(e: i64) {
 // of it, the rest dropped with the statement (part_drops); false, nothing
 // done, for another chain, or one through a type with `impl Drop`
 // (own.partial, the own walk).
-fn part_move(e: i64) -> bool {
+fn part_move(e: i64, pcx: inout Ctx<Comp>) -> bool {
     var c = e;
     while is_part_node(c) {
         let base = NODES[c].a;
         let bt = NODES[base].ty;
-        if bt <= 0 || has_drop_impl(bt) || part_count(bt) == 0 {
+        if bt <= 0 || has_drop_impl(bt, &pcx) || part_count(bt) == 0 {
             return false;
         }
         if !is_part_node(base) {
@@ -856,11 +811,11 @@ fn part_move(e: i64) -> bool {
         return false;
     }
     let base = NODES[c].a;
-    if !is_temp(base) {
+    if !is_temp(base, &pcx) {
         return false;
     }
-    visit_temps(base);
-    let b = temp_ptr(base);
+    visit_temps(base, &pcx);
+    let b = temp_ptr(base, &pcx);
     NODES[c].a = deref_of(b);
     NODES[NODES[c].a].p |= NODE_RAW;
     // (the chain reads the temporary's storage, which keeps the part
@@ -903,13 +858,13 @@ fn is_part_node(n: i64) -> bool {
 // argument (a `let` of a block or a binding of an arm on the way to it),
 // which dies before the call, is moved into a temporary of the statement
 // instead (it was lent dropped).
-fn hold_args(e: i64) {
+fn hold_args(e: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         // (0.25.2.2: a requires check's block, `{ let ?aI = argI; ..; f$pre(..);
         // f(?a0, ..) }`: its lets' values, in order, are the arguments)
         var vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..NODES[e].count {
-            let c = child(e, i);
+            let c = child(e, i, pcx);
             if NODES[e].kind != NodeKind::Block {
                 // (a named argument's value; 0.25.2.2: a struct literal's
                 // field's, `Desc { s: make()?, n: 1 }` with s a let field)
@@ -962,7 +917,7 @@ fn hold_args(e: i64) {
                     next.push(0);
                 } else if k == NodeKind::Match {
                     for i in 0..NODES[n].count {
-                        let arm = child(n, i);
+                        let arm = child(n, i, pcx);
                         next.push(NODES[arm].c);
                         next.push(arm);
                     }
@@ -970,26 +925,26 @@ fn hold_args(e: i64) {
                     let b = NODES[n].b;
                     let l = NODES[b].y;
                     if NODES[b].kind != NodeKind::Ident || NODES[b].res != Res::Local || l < 0
-                        || BYREF.get(l + 1) != 0 || !is_owned_type(NODES[b].ty)
-                        || !has_glue(NODES[b].ty) {
+                        || pcx.byref.get(l + 1) != 0 || !is_owned_type(NODES[b].ty, &pcx)
+                        || !has_glue(NODES[b].ty, &pcx) {
                         continue;
                     }
                     var inside = false;
                     for j in 0..scopes.count {
                         let s = scopes.data[j];
                         if NODES[s].kind == NodeKind::Arm {
-                            inside = inside || binds(NODES[s].a, l);
+                            inside = inside || binds(NODES[s].a, l, &pcx);
                             continue;
                         }
                         for m in 0..NODES[s].count {
-                            let st = child(s, m);
+                            let st = child(s, m, pcx);
                             inside = inside || NODES[st].kind == NodeKind::Let && NODES[st].a != 0
-                                && binds(NODES[st].a, l);
+                                && binds(NODES[st].a, l, &pcx);
                         }
                     }
                     if inside {
                         let ty = NODES[n].ty;
-                        let t = temp_ptr(b);
+                        let t = temp_ptr(b, &pcx);
                         NODES[n] = NODES[t];
                         NODES[n].ty = ty;
                     }
@@ -1012,11 +967,11 @@ fn hold_args(e: i64) {
 // that is an owned temporary is kept and dropped with the statement (it
 // was read and never dropped); one it takes (`=+`) moves on. Whether e is
 // one.
-fn operator_temps(e: i64) -> bool {
+fn operator_temps(e: i64, pcx: inout Ctx<Comp>) -> bool {
     if NODES[e].count == 0 {
         return false;
     }
-    let s0 = child(e, 0);
+    let s0 = child(e, 0, pcx);
     if NODES[s0].kind != NodeKind::Let || NODES[s0].a == 0
         || NODES[NODES[s0].a].kind != NodeKind::PatBind {
         return false;
@@ -1026,15 +981,15 @@ fn operator_temps(e: i64) -> bool {
         return false;
     }
     for i in 0..NODES[e].count {
-        let s = child(e, i);
+        let s = child(e, i, pcx);
         if NODES[s].kind != NodeKind::Let || NODES[s].a == 0
             || NODES[NODES[s].a].kind != NodeKind::PatBind {
             continue;
         }
-        visit_temps(NODES[s].c);
+        visit_temps(NODES[s].c, &pcx);
         let name = crate::base::SYMS[NODES[NODES[s].a].a].text;
-        if name.len > 1 && name[1] == '=' && is_temp(NODES[s].c) {
-            NODES[s].c = deref_of(temp_ptr(NODES[s].c));
+        if name.len > 1 && name[1] == '=' && is_temp(NODES[s].c, &pcx) {
+            NODES[s].c = deref_of(temp_ptr(NODES[s].c, &pcx));
         }
     }
     true
@@ -1043,14 +998,14 @@ fn operator_temps(e: i64) -> bool {
 // Expression e (checked), a unit of its own (an expression statement, a
 // `let`'s value that binds no view, a `while` condition): its temporaries
 // end when it is evaluated, `{ e }` when it made one.
-fn unit_value(e: i64) -> i64 {
+fn unit_value(e: i64, pcx: inout Ctx<Comp>) -> i64 {
     if e == 0 || !drops_on() {
         return e;
     }
-    let made = TEMPS_MADE;
-    visit_temps(e);
-    if TEMPS_MADE == made {
+    let made = pcx.temps_made;
+    visit_temps(e, &pcx);
+    if pcx.temps_made == made {
         return e;
     }
-    t_block(list_begin(), e, e, NODES[e].ty)
+    t_block(list_begin(pcx), e, e, NODES[e].ty, &pcx)
 }

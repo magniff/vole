@@ -8,9 +8,10 @@
 
 use crate::base::{FILES, buf_bytes, buf_str, intern_c};
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::collect::find_generic_method;
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, file_of_pos, within_std};
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{STRUCTS, TYPES, TyKind, find_method, struct_type};
@@ -23,21 +24,19 @@ use crate::tools::refactor_shape::{orig_of, sym_text, text_buf, try_show_at};
 use crate::tools::rewrite::parsed::{pa, pend, pstart};
 
 // Whether token k assigns to what is before it (`=`, `+=`, ...).
-fn assigns(k: i64) -> bool {
-    unsafe {
-        if k >= TOK_COUNT {
-            return false;
-        }
-        let t = TOKS[k].kind;
-        t == Tok::Eq || t == Tok::PlusEq || t == Tok::MinusEq || t == Tok::StarEq
-            || t == Tok::SlashEq || t == Tok::PercentEq || t == Tok::AmpEq || t == Tok::PipeEq
-            || t == Tok::CaretEq || t == Tok::ShlEq || t == Tok::ShrEq
+fn assigns(k: i64, pcx: Ctx<Comp>) -> bool {
+    if k >= pcx.toks.len() as i64 {
+        return false;
     }
+    let t = pcx.toks[k].kind;
+    t == Tok::Eq || t == Tok::PlusEq || t == Tok::MinusEq || t == Tok::StarEq
+        || t == Tok::SlashEq || t == Tok::PercentEq || t == Tok::AmpEq || t == Tok::PipeEq
+        || t == Tok::CaretEq || t == Tok::ShlEq || t == Tok::ShrEq
 }
 
 // What a read of field `name` of std's sealed struct s is now: the method
 // call's text (after the dot), or an empty slice when there is none.
-fn method_for(s: i64, name: i64) -> [u8] {
+fn method_for(s: i64, name: i64, pcx: Ctx<Comp>) -> [u8] {
     unsafe {
         let (text, method) = if name == intern_c(c"len") { ("len()", intern_c(c"len")) }
             else if name == intern_c(c"cap") { ("capacity()", intern_c(c"capacity")) }
@@ -46,15 +45,15 @@ fn method_for(s: i64, name: i64) -> [u8] {
         if method == 0 {
             return "";
         }
-        let has = find_method(struct_type(s), method) >= 0
-            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, method) >= 0);
+        let has = find_method(struct_type(s), method, pcx) >= 0
+            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, method, pcx) >= 0);
         if has { text } else { "" }
     }
 }
 
 // The edits of the field reads; their number. The writes and the fields
 // with no method are errors left (alloc016's `left`).
-pub fn sealed_field_edits(tcx: inout Tcx<Comp>) -> i64 {
+pub fn sealed_field_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var fixes = 0;
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -78,20 +77,20 @@ pub fn sealed_field_edits(tcx: inout Tcx<Comp>) -> i64 {
             // (0.26.0: a field std keeps private, not marked `pub`)
             if !within_std(STRUCTS[s0].module) || STD_MODULE < 0 || NODES[n].x < 0
                 || NODES[n].x >= NODES[STRUCTS[s0].node].count
-                || (NODES[child(STRUCTS[s0].node, NODES[n].x)].p & ITEM_PUBLIC) != 0 {
+                || (NODES[child(STRUCTS[s0].node, NODES[n].x, pcx)].p & ITEM_PUBLIC) != 0 {
                 continue;
             }
-            let o = orig_of(n, NodeKind::FieldAccess, tcx);
-            if o < 0 || seen.get(o + 1) != 0 || in_std(pstart(o)) {
+            let o = orig_of(n, NodeKind::FieldAccess, tcx, pcx);
+            if o < 0 || seen.get(o + 1) != 0 || in_std(pstart(o, pcx)) {
                 continue;
             }
             seen.put(o + 1, 1);
             let name = NODES[n].b;
             // (the name: the last such identifier between the base and o's end)
             var k = -1;
-            var i = token_at(pend(pa(o)));
-            while i >= 0 && i < TOK_COUNT && TOKS[i].start < pend(o) {
-                if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name {
+            var i = token_at(pend(pa(o, pcx), pcx), pcx);
+            while i >= 0 && i < pcx.toks.len() as i64 && pcx.toks[i].start < pend(o, pcx) {
+                if pcx.toks[i].kind == Tok::Ident && pcx.toks[i].value as i64 == name {
                     k = i;
                 }
                 i += 1;
@@ -99,24 +98,24 @@ pub fn sealed_field_edits(tcx: inout Tcx<Comp>) -> i64 {
             if k < 0 {
                 continue;
             }
-            let text = method_for(s, name);
-            if assigns(k + 1) || text.len == 0 {
+            let text = method_for(s, name, pcx);
+            if assigns(k + 1, pcx) || text.len == 0 {
                 let e = left(c"fix.alloc016-manual", &tcx);
                 buf_str(e,
                     if text.len == 0 { c"a read of field '" }
                     else { c"a write of field '" });
                 buf_bytes(e, sym_text(name));
                 buf_str(e, c"' at ");
-                put_loc(e, TOKS[k].start);
+                put_loc(e, pcx.toks[k].start, &pcx);
                 buf_str(e, c": std's ");
                 buf_bytes(e, sym_text(STRUCTS[if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 }
                     else { s }].name));
                 buf_str(e,
                     c" keeps its fields private (0.16): they change only through its methods (push, clear, truncate, reserve, ...)\n");
-                try_show_at(TOKS[k].start, &tcx);
+                try_show_at(pcx.toks[k].start, &tcx, &pcx);
                 continue;
             }
-            edit_replace(TOKS[k].start, TOKS[k].end, text_buf(text));
+            edit_replace(pcx.toks[k].start, pcx.toks[k].end, text_buf(text), &pcx);
             fixes += 1;
         }
         fixes

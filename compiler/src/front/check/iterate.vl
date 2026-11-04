@@ -21,7 +21,9 @@
 // by name (Vec, HashMap, user types); `next` only through Iterator.
 
 use crate::base::intern_c;
-use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end, err_help, err_str};
 use crate::front::ast::{
     ARM_SYNTHETIC, NODES, NODE_IN_BOUNDS, list_begin, list_end, list_push, new_node,
 };
@@ -50,13 +52,13 @@ const FOR_VIA_ITER: i64 = 1 << 29;
 // `for` loop n whose sequence (NODES[n].c) is checked (its type is set)
 // and is not a range literal: the loop, rewritten in place as above. Its
 // type.
-pub fn check_for_iter(n: i64) -> i64 {
+pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var seq = NODES[n].c;
         var seq_ty = NODES[seq].ty;
         if seq_ty > 0 && TYPES[seq_ty].kind == TyKind::Array
             && !crate::front::cells::is_freeze(seq_ty)
-            && crate::front::check::assign::is_place(seq) {
+            && crate::front::check::assign::is_place(seq, pcx) {
             // (0.26.1) an array place that is not Freeze is iterated as a
             // view of it, `for p in a[0..N]`: a copy of it would be other
             // cells (front/cells.vl)
@@ -72,7 +74,7 @@ pub fn check_for_iter(n: i64) -> i64 {
             NODES[view].a = seq;
             NODES[view].b = range;
             NODES[view].p |= NODE_IN_BOUNDS;
-            synth_expr(view);
+            synth_expr(view, &pcx);
             NODES[n].c = view;
             seq = view;
             seq_ty = NODES[view].ty;
@@ -84,15 +86,15 @@ pub fn check_for_iter(n: i64) -> i64 {
         }
         let kind = TYPES[t].kind;
         let std_name = std_struct_name(t);
-        let iterator = std_trait(c"Iterator");
-        let is_iterator = seq_ty != TY_ERROR && iterator >= 0 && implements(iterator, t);
-        let iter_f = if seq_ty == TY_ERROR { -1 } else { method_of(t, intern_c(c"iter")) };
+        let iterator = std_trait(c"Iterator", &pcx);
+        let is_iterator = seq_ty != TY_ERROR && iterator >= 0 && implements(iterator, t, &pcx);
+        let iter_f = if seq_ty == TY_ERROR { -1 } else { method_of(t, intern_c(c"iter"), pcx) };
         let is_slice = kind == TyKind::Slice || kind == TyKind::Array;
         let counted = std_name == intern_c(c"Vec") || std_name == intern_c(c"SliceIter")
             || std_name == intern_c(c"Range") || std_name == intern_c(c"RangeInclusive");
         if seq_ty == TY_ERROR || !is_slice && !counted && !is_iterator
             && (iter_f < 0 || (NODES[n].p & FOR_VIA_ITER) != 0) {
-            not_iterable(n, seq, seq_ty, t);
+            not_iterable(n, seq, seq_ty, t, &pcx);
         }
         let start = NODES[n].start;
         let end = NODES[n].end;
@@ -110,11 +112,11 @@ pub fn check_for_iter(n: i64) -> i64 {
         let body = NODES[n].d;
         var rest = 0;
         if is_slice && !through {
-            rest = index_loop(n, seq_ty);
+            rest = index_loop(n, seq_ty, &pcx);
         } else if is_slice {
             rest = for_copy(n, pattern, deref(ident(seq_sym, n)), body);
         } else if std_name == intern_c(c"Vec") || std_name == intern_c(c"SliceIter") {
-            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"as_slice")),
+            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"as_slice"), &pcx),
                 body);
         } else if std_name == intern_c(c"Range") || std_name == intern_c(c"RangeInclusive") {
             let range = new_node(Range, start, end);
@@ -128,15 +130,16 @@ pub fn check_for_iter(n: i64) -> i64 {
                 let not_done = new_node(Unary, start, end);
                 NODES[not_done].op = Tok::Bang;
                 NODES[not_done].b = field(ident(seq_sym, n), intern_c(c"done"));
-                let then = block_of(rest, n);
+                let then = block_of(rest, n, &pcx);
                 rest = new_node(If, start, end);
                 NODES[rest].a = not_done;
                 NODES[rest].b = then;
             }
         } else if is_iterator {
-            rest = next_loop(n, ident(seq_sym, n));
+            rest = next_loop(n, ident(seq_sym, n), &pcx);
         } else {
-            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"iter")), body);
+            rest = for_copy(n, pattern, method_call(ident(seq_sym, n), intern_c(c"iter"), &pcx),
+                body);
             NODES[rest].p |= FOR_VIA_ITER;
         }
         let rest_stmt = new_node(ExprStmt, start, end);
@@ -145,26 +148,26 @@ pub fn check_for_iter(n: i64) -> i64 {
         // The block, in the loop's place, checked: the `let` by hand (e is
         // checked), then the rest.
         let outer = new_node(Block, start, end);
-        let mark = list_begin();
-        list_push(let_stmt);
-        list_push(rest_stmt);
-        list_end(outer, mark);
+        let mark = list_begin(pcx);
+        list_push(let_stmt, &pcx);
+        list_push(rest_stmt, &pcx);
+        list_end(outer, mark, &pcx);
         NODES[n] = NODES[outer];
-        push_scope();
+        push_scope(&pcx);
         // (0.25: as check_block does, the temporaries of the `let`; a
         // sequence that is not a place, `for x in make()`, `for x in
         // v.take()`, an owning iterator, is __for_seq's, which the places
         // IR drops at the loop's end, on every exit; a place, `for x in v`,
         // is borrowed)
         let drops = block_begin(n);
-        check_pattern(bind, seq_ty);
+        check_pattern(bind, seq_ty, &pcx);
         if through && is_borrow(seq) {
             // (`for x in &v`: a borrow, as `&v` passed directly is)
             LOCALS[NODES[bind].x].borrow = true;
         }
-        after_stmt(drops, let_stmt);
-        synth_expr(rest);
-        pop_scope();
+        after_stmt(drops, let_stmt, &pcx);
+        synth_expr(rest, &pcx);
+        pop_scope(&pcx);
         NODES[n].ty = TY_UNIT;
         TY_UNIT
     }
@@ -196,29 +199,29 @@ fn std_struct_name(t: i64) -> i64 {
 }
 
 // (t: the type iterated, seq's or the one it points to)
-fn not_iterable(n: i64, seq: i64, seq_ty: i64, t: i64) -> ! {
-    err_begin(NODES[seq].start);
-    err_str(c"'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got '");
-    err_type(seq_ty);
-    err_str(c"'");
+fn not_iterable(n: i64, seq: i64, seq_ty: i64, t: i64, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(NODES[seq].start, &pcx);
+    err_str(c"'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got '", pcx);
+    err_type(seq_ty, pcx);
+    err_str(c"'", pcx);
     if (NODES[n].p & FOR_VIA_ITER) != 0 {
-        err_help(c"its 'iter()' gives a value that is not an Iterator");
+        err_help(c"its 'iter()' gives a value that is not an Iterator", pcx);
     } else if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
-        if method_of(t, intern_c(c"next")) >= 0 {
+        if method_of(t, intern_c(c"next"), pcx) >= 0 {
             err_help(
-                c"it has a 'next' method but does not implement Iterator: write 'impl Iterator for ");
+                c"it has a 'next' method but does not implement Iterator: write 'impl Iterator for ", pcx);
         } else {
-            err_help(c"implement Iterator for it: 'impl Iterator for ");
+            err_help(c"implement Iterator for it: 'impl Iterator for ", pcx);
         }
-        buf_type(ERR_HELP, t);
-        err_help(c" { type Item = ...; fn next(self: *Self) -> Option<Self::Item> { ... } }', or give it an 'iter' method that returns an iterator");
+        buf_type(pcx.err_help, t);
+        err_help(c" { type Item = ...; fn next(self: *Self) -> Option<Self::Item> { ... } }', or give it an 'iter' method that returns an iterator", pcx);
     }
-    err_end()
+    err_end(&pcx)
 }
 
 // for __for_index in 0..len { let p = __for_seq[__for_index]; body }, for
 // `for` loop n over a slice or an array of type t, bound to __for_seq.
-fn index_loop(n: i64, t: i64) -> i64 {
+fn index_loop(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     let start = NODES[n].start;
     let end = NODES[n].end;
     let seq_sym = intern_c(c"__for_seq");
@@ -246,12 +249,12 @@ fn index_loop(n: i64, t: i64) -> i64 {
     NODES[elem_let].a = NODES[n].b;
     NODES[elem_let].c = elem;
     let body = new_node(Block, start, end);
-    let mark = list_begin();
-    list_push(elem_let);
+    let mark = list_begin(pcx);
+    list_push(elem_let, &pcx);
     let old_body = new_node(ExprStmt, start, end);
     NODES[old_body].a = NODES[n].d;
-    list_push(old_body);
-    list_end(body, mark);
+    list_push(old_body, &pcx);
+    list_end(body, mark, &pcx);
     let index_bind = new_node(PatBind, start, end);
     NODES[index_bind].a = index_sym;
     for_copy(n, index_bind, range, body)
@@ -259,24 +262,24 @@ fn index_loop(n: i64, t: i64) -> i64 {
 
 // label: loop { match it.next() { std::Option::Some(p) => body, _ => break } }
 // for `for` loop n (its label, pattern and body).
-fn next_loop(n: i64, it: i64) -> i64 {
+fn next_loop(n: i64, it: i64, pcx: inout Ctx<Comp>) -> i64 {
     let start = NODES[n].start;
     let end = NODES[n].end;
     let m = new_node(Match, start, end);
-    NODES[m].a = method_call(it, intern_c(c"next"));
+    NODES[m].a = method_call(it, intern_c(c"next"), &pcx);
     let some = new_node(PatVariant, start, end);
     let std_seg = ident(intern_c(c"std"), n);
     let prefix = new_node(Path, start, end);
-    let pmark = list_begin();
-    list_push(std_seg);
-    list_end(prefix, pmark);
+    let pmark = list_begin(pcx);
+    list_push(std_seg, &pcx);
+    list_end(prefix, pmark, &pcx);
     NODES[some].h = prefix;
     NODES[some].a = intern_c(c"Option");
     NODES[some].b = intern_c(c"Some");
     NODES[some].c = 1;
-    let smark = list_begin();
-    list_push(NODES[n].b);
-    list_end(some, smark);
+    let smark = list_begin(pcx);
+    list_push(NODES[n].b, &pcx);
+    list_end(some, smark, &pcx);
     let some_arm = new_node(Arm, start, end);
     NODES[some_arm].a = some;
     NODES[some_arm].c = NODES[n].d;
@@ -286,13 +289,13 @@ fn next_loop(n: i64, it: i64) -> i64 {
     NODES[none_arm].a = wild;
     NODES[none_arm].c = brk;
     NODES[none_arm].p = ARM_SYNTHETIC;
-    let amark = list_begin();
-    list_push(some_arm);
-    list_push(none_arm);
-    list_end(m, amark);
+    let amark = list_begin(pcx);
+    list_push(some_arm, &pcx);
+    list_push(none_arm, &pcx);
+    list_end(m, amark, &pcx);
     let lp = new_node(Loop, start, end);
     NODES[lp].a = NODES[n].a;
-    NODES[lp].b = block_of_tail(m, n);
+    NODES[lp].b = block_of_tail(m, n, &pcx);
     lp
 }
 
@@ -329,32 +332,32 @@ fn deref(e: i64) -> i64 {
 }
 
 // `receiver.name()`.
-fn method_call(receiver: i64, name: i64) -> i64 {
+fn method_call(receiver: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
     let c = new_node(MethodCall, NODES[receiver].start, NODES[receiver].end);
     NODES[c].a = receiver;
     NODES[c].b = name;
-    let mark = list_begin();
-    list_end(c, mark);
+    let mark = list_begin(pcx);
+    list_end(c, mark, &pcx);
     c
 }
 
 // `{ e }` (e: a statement-like expression, for loop n's position).
-fn block_of(e: i64, n: i64) -> i64 {
+fn block_of(e: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let stmt = new_node(ExprStmt, NODES[n].start, NODES[n].end);
     NODES[stmt].a = e;
     NODES[stmt].b = 1;
     let b = new_node(Block, NODES[n].start, NODES[n].end);
-    let mark = list_begin();
-    list_push(stmt);
-    list_end(b, mark);
+    let mark = list_begin(pcx);
+    list_push(stmt, &pcx);
+    list_end(b, mark, &pcx);
     b
 }
 
 // `{ e }` with e as the tail.
-fn block_of_tail(e: i64, n: i64) -> i64 {
+fn block_of_tail(e: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let b = new_node(Block, NODES[n].start, NODES[n].end);
-    let mark = list_begin();
-    list_end(b, mark);
+    let mark = list_begin(pcx);
+    list_end(b, mark, &pcx);
     NODES[b].a = e;
     b
 }
@@ -362,33 +365,33 @@ fn block_of_tail(e: i64, n: i64) -> i64 {
 // Range n (`a..b`, `a..=b`) as a value (`expected`: 0 in synth mode): the
 // struct literal `std::Range { start: a, end: b }` (`std::RangeInclusive
 // { start: a, end: b, done: false }`) in its place. Its type.
-pub fn range_value(n: i64, expected: i64) -> i64 {
+pub fn range_value(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
     let inclusive = NODES[n].c != 0;
     if NODES[n].a == 0 || NODES[n].b == 0 {
-        type_error(n, c"a range used as a value needs both ends: 'a..b'");
+        type_error(n, c"a range used as a value needs both ends: 'a..b'", &pcx);
     }
     if STD_MODULE < 0 {
-        type_error(n, c"a range used as a value is std's Range, and std is not loaded: write 'std::Range { start: a, end: b }'");
+        type_error(n, c"a range used as a value is std's Range, and std is not loaded: write 'std::Range { start: a, end: b }'", &pcx);
     }
     let start = NODES[n].start;
     let end = NODES[n].end;
     let lit = new_node(StructLit, start, end);
     NODES[lit].a = intern_c(if inclusive { c"RangeInclusive" } else { c"Range" });
     let prefix = new_node(Path, start, end);
-    let pmark = list_begin();
-    list_push(ident(intern_c(c"std"), n));
-    list_end(prefix, pmark);
+    let pmark = list_begin(pcx);
+    list_push(ident(intern_c(c"std"), n), &pcx);
+    list_end(prefix, pmark, &pcx);
     NODES[lit].h = prefix;
-    let mark = list_begin();
-    list_push(field_init(intern_c(c"start"), NODES[n].a));
-    list_push(field_init(intern_c(c"end"), NODES[n].b));
+    let mark = list_begin(pcx);
+    list_push(field_init(intern_c(c"start"), NODES[n].a), &pcx);
+    list_push(field_init(intern_c(c"end"), NODES[n].b), &pcx);
     if inclusive {
         let no = new_node(Bool, end, end);
-        list_push(field_init(intern_c(c"done"), no));
+        list_push(field_init(intern_c(c"done"), no), &pcx);
     }
-    list_end(lit, mark);
+    list_end(lit, mark, &pcx);
     NODES[n] = NODES[lit];
-    if expected != 0 { check_expr(n, expected) } else { synth_expr(n) }
+    if expected != 0 { check_expr(n, expected, &pcx) } else { synth_expr(n, &pcx) }
 }
 
 fn field_init(name: i64, value: i64) -> i64 {
