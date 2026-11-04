@@ -3347,12 +3347,16 @@ def compare(events, lines):
     return None
 
 
+# (0.26.3, decision 6: the programs' arithmetic wraps, as the model's
+# wrap() does, at every level, with the overflow checks off; -O0 would
+# check it. tests/run's ovf_ cases test the checks.)
+OVF = '--overflow-checks=off'
 CONFIGS = [
-    ('O0', ['-O0', '-j1', '--check-alloc']),
-    ('O1', ['-O1', '-j1', '--check-alloc']),
-    ('O2', ['-O2', '-j1', '--check-alloc']),
-    ('O2j8', ['-O2', '-j8', '--check-alloc']),
-    ('O2plain', ['-O2', '-j8']),
+    ('O0', ['-O0', '-j1', '--check-alloc', OVF]),
+    ('O1', ['-O1', '-j1', '--check-alloc', OVF]),
+    ('O2', ['-O2', '-j1', '--check-alloc', OVF]),
+    ('O2j8', ['-O2', '-j8', '--check-alloc', OVF]),
+    ('O2plain', ['-O2', '-j8', OVF]),
 ]
 
 
