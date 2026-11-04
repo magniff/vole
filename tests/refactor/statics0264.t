@@ -20,13 +20,13 @@ note fix.statics: statics 3; functions using them 4, given the parameter 9 (inou
 60
 ok: built before
 $ fix --only statics-list --group body.group
-main.vl:36	let	total
-main.vl:45	inout	add	writes at 46 push
-main.vl:52	inout	two
-main.vl:58	inout	again	writes at 59 push
-main.vl:64	let	scaled
-main.vl:69	let	label_len
-main.vl:79	let	Probe::look
+main.vl:36	let	total	uses count
+main.vl:45	inout	add	writes at 46 push	uses table
+main.vl:52	inout	two	via add
+main.vl:58	inout	again	writes at 59 push	uses count
+main.vl:64	let	scaled	via total
+main.vl:69	let	label_len	uses label
+main.vl:79	let	Probe::look	via total
 main.vl:85	owner	run
 --- a/main.vl
 +++ b/main.vl
