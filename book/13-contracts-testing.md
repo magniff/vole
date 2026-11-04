@@ -20,14 +20,14 @@ Save this as `ring.vl`:
 ```vole ring.vl
 // ring: a queue of at most `cap` numbers, in memory allocated once.
 
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa>
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
@@ -75,7 +75,7 @@ numbers and pops three:
 
 ```out exit=101
 10 20
-ring.vl:43:19: requires failed: 'self.len > 0' of 'Ring::pop' (ring.vl:29:9): self.len = 0
+ring.vl:43:19: requires failed: 'self.len > 0' of 'Ring<Gpa>::pop' (ring.vl:29:9): self.len = 0
 ```
 
 The program stops with a panic, as a failed `unwrap` does, and exit
@@ -108,14 +108,14 @@ Here `push` promises to add one item, and has a bug, a forgotten
 `self.len += 1`:
 
 ```vole
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring {
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa> {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
     }
 
@@ -136,7 +136,7 @@ fn main(gpa: Gpa) {
 ```
 
 ```out exit=101
-main.vl:14:9: ensures failed: 'self.len == old(self.len) + 1' of 'Ring::push': self.len = 0
+main.vl:14:9: ensures failed: 'self.len == old(self.len) + 1' of 'Ring<Gpa>::push': self.len = 0
 ```
 
 This time the position is the clause in `push`: a broken promise is
@@ -222,19 +222,19 @@ it implies. Save this as `checks.vl`:
 use std::env;
 
 #[inline(never)]
-fn at(v: Vec<i64>, i: usize) -> i64 {
+fn at(v: Vec<i64, Gpa>, i: usize) -> i64 {
     v[i]
 }
 
 #[inline(never)]
-fn at_checked(v: Vec<i64>, i: usize) -> i64
+fn at_checked(v: Vec<i64, Gpa>, i: usize) -> i64
     requires i < v.len()
 {
     v[i]
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..10 {
         v.push(i * i);
     }
@@ -338,8 +338,8 @@ three tests. There's a bug in `wrap`. Can you see it?
 ```vole ring.vl
 // ring: a queue of at most `cap` numbers, in memory allocated once.
 
-struct Ring {
-    items: Vec<i64>,
+struct Ring<A: Allocator> {
+    items: Vec<i64, A>,
     start: usize,
     len: usize,
 }
@@ -349,8 +349,8 @@ fn wrap(i: usize, cap: usize) -> usize {
     if i > cap { i - cap } else { i }
 }
 
-impl Ring {
-    fn new(cap: usize, gpa: Gpa) -> Ring
+impl Ring<Gpa> {
+    fn new(cap: usize, gpa: Gpa) -> Ring<Gpa>
         requires cap > 0 else "a ring needs room for at least one item"
     {
         Ring { items: Vec::filled_in(cap, 0, gpa), start: 0, len: 0 }
@@ -411,7 +411,7 @@ fn wraps_around(gpa: Gpa) {
 }
 
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
+fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap as usize, gpa);
         var next = 0;
@@ -450,9 +450,9 @@ The third function is a *property*, which we'll come to in a moment.
 $ volec test ring.vl
 test ring.vl: 1 passed, 2 failed (2 #[test], 1 #[property]; -O0 and -O2 agree)
 FAIL wraps_around: ring.vl:34:9: index out of bounds: index 2, length 2
-  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:70 wraps_around
+  trace: ring.vl:34 Ring<Gpa>::push$body < ring.vl:29 Ring<Gpa>::push < ring.vl:70 wraps_around
 FAIL pop_gives_back_what_push_put (property, case 5 of 100, shrunk in 226 steps): ring.vl:34:9: index out of bounds: index 1, length 1
-  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:85 pop_gives_back_what_push_put
+  trace: ring.vl:34 Ring<Gpa>::push$body < ring.vl:29 Ring<Gpa>::push < ring.vl:85 pop_gives_back_what_push_put
   input: xs = [0, 0]
   try: volec test pop_gives_back_what_push_put --seed 0xd098fbd5a16acb77 ring.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
@@ -496,7 +496,7 @@ Look at the property again:
 
 ```vole skip
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
+fn pop_gives_back_what_push_put(xs: Vec<i64, Gpa>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap as usize, gpa);
         var next = 0;

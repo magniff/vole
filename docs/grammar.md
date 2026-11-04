@@ -1676,24 +1676,25 @@ is the empty set. Several declarations intersect. `volec
 ### Default type parameters
 
 A struct's or an enum's type parameters may end with defaults: `struct
-Vec<T, A: Allocator = Gpa>`. A type leaves out trailing arguments that
-have defaults (`Vec<i64>` is `Vec<i64, Gpa>`; `Buf` is `Buf<Gpa>`); in
-an expression the omitted arguments are inferred, the default when
-nothing binds them (`Vec::new()`). Messages and symbols leave out the
-trailing arguments equal to their defaults. An impl block writes every
-argument: `impl<T, A: Allocator> Vec<T, A>`.
+Pair<T, U = i64>`. A type leaves out trailing arguments that have
+defaults (`Pair<u8>` is `Pair<u8, i64>`); in an expression the omitted
+arguments are inferred, the default when nothing binds them. Messages
+and symbols leave out the trailing arguments equal to their defaults. An
+impl block writes every argument: `impl<T, U> Pair<T, U>`. (0.16 to
+0.26.2, std's allocator parameters had the default `Gpa`, `Vec<T, A:
+Allocator = Gpa>`; from 0.26.3 an allocator parameter has none, and a
+type names its allocator: Allocators, below.)
 
 ### Allocators
 
 std's containers take their memory from an allocator, a type parameter:
-`Vec<T, A: Allocator = Gpa>`, `Buf<A>`, `HashMap<K, V, A>`. Allocation
-is explicit: nothing allocates without being given an allocator
-(`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x, a)`,
-`Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`, `format_in(x,
-a)`, `read_stdin_in(a)`, `split_in(s, sep, a)`, `split_whitespace_in(s,
-a)`, `sort_stable_in(s, a)`, `sort_stable_by_in(s, f, a)`,
-`v.clone_in(b)`); 0.15's forms (`Vec::new()`, `collect()`,
-`format(x)`...) are errors naming the `_in` form. A program's `Gpa` (C's
+`Vec<T, A: Allocator>`, `Buf<A>`, `String<A>`, `HashMap<K, V, A>`.
+Allocation is explicit: nothing allocates without being given an
+allocator (`Vec::new_in(a)`, `with_capacity_in(n, a)`, `filled_in(n, x,
+a)`, `Buf::new_in(a)`, `HashMap::new_in(a)`, `collect_in(a)`,
+`format_in(x, a)`, `read_stdin_in(a)`, `split_in(s, sep, a)`,
+`split_whitespace_in(s, a)`, `sort_stable_in(s, a)`,
+`sort_stable_by_in(s, f, a)`, `v.clone_in(b)`). A program's `Gpa` (C's
 malloc) is its main's parameter, passed down:
 
 ```ebnf
@@ -1702,10 +1703,44 @@ main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" type ] block
 ```
 
 (any parameter names; the `Gpa` parameter is last). `Allocator`, `Gpa`,
-`Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the prelude
-(arenas: to come). `volec fix --only alloc016` moves a 0.15 program
-over: the calls become their `_in` forms and `gpa: Gpa` is threaded
-from `main` to them ([refactor.md](refactor.md)).
+`Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the
+prelude.
+
+**Allocation as a capability** (0.26.3). An allocator is a value a
+function was given, and the types say which: what a function may
+allocate from is in its signature. The rules, each an error with its
+`explain` text:
+
+- `alloc.default`: a type names its allocator, `Vec<u8, Gpa>`, `Buf<A>`
+  (no allocator parameter has a default; `A: Allocator = Gpa` is the
+  error too).
+- `alloc.no_in`: an allocating call passes the allocator, last, to the
+  `_in` form; 0.15's forms (`Vec::new()`, `collect()`, `s.to_string()`)
+  are this error naming it.
+- `alloc.field`: a struct or enum that holds an allocator names it in
+  its parameters, `struct P<A: Allocator> { v: Vec<u8, A> }`, used as
+  `P<Gpa>`; a literal infers it from its fields.
+- `alloc.static`: a static's type holds no allocator (it is `AllocFree`,
+  an auto trait like `Copy`, which looks through structs, enums, tuples,
+  arrays and pointers): an allocator inside a function came in through a
+  parameter.
+- `alloc.safe_impl`: `Allocator` is an `unsafe trait`; its impls are
+  `unsafe impl Allocator for T`, under `// UNSAFE:` and `// SAFETY:`
+  comments. `unsafe trait` and `unsafe impl` are Rust's: any unsafe
+  trait's impl is `unsafe impl`, and `unsafe impl` of a safe trait is an
+  error.
+- `alloc.last`: a function named `..._in` takes its allocator last.
+
+`volec fix --only alloc` makes the exact fixes, in rounds: `Gpa` written
+where the default was (except in an item generic over an allocator,
+where the choice is the author's), the `_in` form with the one allocator
+in scope, and a struct holding one made generic over it, then its uses
+`P<Gpa>`. `alloc.static`, `alloc.safe_impl` and `alloc.last` have no
+fix: the value moves into main, the SAFETY comment is the author's,
+`volec refactor signature` moves a parameter. (The compiler's own
+sources keep one exemption until 0.26.4: the allocator `base::comp::Comp`,
+which its statics may hold and whose impl stays safe, and the static
+`WGSL_ARENA`.)
 
 ### sealed, scoped
 

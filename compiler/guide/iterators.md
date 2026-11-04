@@ -18,7 +18,7 @@ same machine code at -O2, vectorized where the loop would be).
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..=6 { v.push(i); }
     std::print_int(v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum());
     print(" ");
@@ -49,8 +49,8 @@ fn main(gpa: Gpa) -> i32 {
 
 | source | items |
 |---|---|
-| `v.iter()` (a `Vec<T>`), `s.iter()` (a slice `[T]`; an array variable too, `a.iter()`) | each element, a copy |
-| `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V>`) | `(K, V)`, `K`, `V`, in slot order |
+| `v.iter()` (a `Vec<T, A>`), `s.iter()` (a slice `[T]`; an array variable too, `a.iter()`) | each element, a copy |
+| `m.iter()`, `m.keys()`, `m.values()` (a `HashMap<K, V, A>`) | `(K, V)`, `K`, `V`, in slot order |
 | `a..b`, `a..=b` as a value: `(0..n).map(...)` | the integers; `0..=255u8` ends without overflow |
 | a type with `impl Iterator` | what its `next` returns |
 
@@ -78,7 +78,7 @@ v[i] *= 2; }`.
   `position` and `find` take it `inout`: they stop at the item that
   decides, and the rest stay in `it`. To call `next` yourself (`inout
   self`), keep the iterator in a `var`.
-- Owned items (a `Vec<D>`'s `pop`, `map(|i| make(i))`) are dropped once:
+- Owned items (a `Vec<D, A>`'s `pop`, `map(|i| make(i))`) are dropped once:
   by `for` at the end of each iteration unless moved, and by an adapter
   or consumer that passes over them (`count`, the ones `filter`
   rejects, `min`'s and `max`'s losers). The items of a borrowing iterator

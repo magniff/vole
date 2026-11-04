@@ -493,7 +493,7 @@ an `Option`, `None` once it's empty, so this empties a list:
 
 ```vole
 fn main(gpa: Gpa) {
-    var path: Vec<i64> = Vec::new_in(gpa);
+    var path: Vec<i64, Gpa> = Vec::new_in(gpa);
     path.push(0);
     path.push(1);
     path.push(2);

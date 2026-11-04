@@ -24,6 +24,7 @@ std::io::buffered	<std>	37
 std::fmt	<std>	95
 std::num	<std>	140
 std::num::tables	<std>	4
+std::num::wrapping	<std>	348
 std::math	<std>	260
 std::convert	<std>	2
 std::clone	<std>	1
@@ -97,7 +98,7 @@ fn apply<F: Fn(i64) -> i64 + effects(panic)>(f: F, x: i64) -> i64 {
 }
 // crate::grow	syntax016/main.vl:37-40	effects: alloc(Gpa) panic
 #[effects(alloc(Gpa), panic)]
-fn grow(v: inout Vec<i64>) {
+fn grow(v: inout Vec<i64, Gpa>) {
     v.push(1);
 }
 $ show crate::Pair

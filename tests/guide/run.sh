@@ -385,7 +385,7 @@ fi
 # index has it, is in its section std#every-item (without `pub`).
 mkdir -p "$WORK/std"
 "$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
-printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.vl"
+printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64, Gpa> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.vl"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.vl) >"$WORK/std/items" 2>&1; then
     # (0.18: the index's signatures leave std's clauses out; 0.25.2.1: a
     # re-export, `pub use NAME = PATH`, is its item's, listed there)
@@ -597,7 +597,7 @@ try_case() { # <name> <expected output> <snippet...>
 }
 try_case int 'i64 = 3' '1 + 2'
 try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
-try_case vec 'Vec<i64> = [4, 5]' 'var v: Vec<i64> = Vec::new_in(gpa); v.push(4); v.push(5); v'
+try_case vec 'Vec<i64, Gpa> = [4, 5]' 'var v: Vec<i64, Gpa> = Vec::new_in(gpa); v.push(4); v.push(5); v'
 try_case output "hi
 [u8] = \"abc\"" 'println("hi"); "abc"'
 try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
@@ -605,8 +605,8 @@ try_case tuple '(i64, bool) = (1, true)' '(1, true)'
 try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
-try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
-exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
+try_case panic 'snippet:1:42: index out of bounds: index 3, length 0
+exit 101' 'let v: Vec<i64, Gpa> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
 try_case file 'i64 = 40' --file "$WORK/snip.vl"
 got=$(printf '7\n' | "$COMPILER" try 'var b = String::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)

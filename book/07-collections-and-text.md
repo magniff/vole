@@ -19,7 +19,7 @@ Start a new file, `scores.vl`:
 
 ```vole scores.vl
 fn main(gpa: Gpa) {
-    var scores: Vec<i64> = Vec::new_in(gpa);
+    var scores: Vec<i64, Gpa> = Vec::new_in(gpa);
     scores.push(72);
     scores.push(95);
     scores.push(88);
@@ -53,7 +53,7 @@ an `Option`: `Some(value)`, or `None` when there was nothing to take.
 
 ```vole
 fn main(gpa: Gpa) {
-    var stack: Vec<str> = Vec::new_in(gpa);
+    var stack: Vec<str, Gpa> = Vec::new_in(gpa);
     stack.push("first");
     stack.push("second");
     stack.push("third");
@@ -82,7 +82,7 @@ What happens if you ask for an element that isn't there?
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     println("{}", v[3]);
 }
@@ -103,7 +103,7 @@ over the indexes, and assign through `v[i]`:
 
 ```vole
 fn main(gpa: Gpa) {
-    var prices: Vec<i64> = Vec::new_in(gpa);
+    var prices: Vec<i64, Gpa> = Vec::new_in(gpa);
     prices.push(10);
     prices.push(25);
     prices.push(40);
@@ -130,7 +130,7 @@ them; the index loop is how you do it.
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for x in [31, 4, 15, 9, 26] {
         v.push(x);
     }
@@ -139,7 +139,7 @@ fn main(gpa: Gpa) {
     v.retain(|x| x % 2 == 1);
     println("{v:?}");
 
-    var fruit: Vec<str> = Vec::new_in(gpa);
+    var fruit: Vec<str, Gpa> = Vec::new_in(gpa);
     fruit.push("pear");
     fruit.push("fig");
     fruit.push("banana");
@@ -170,7 +170,7 @@ copy of each element while we loop over it:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     for x in v {
@@ -196,7 +196,7 @@ elements that were there and stops:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     for i in 0..v.len() {
@@ -218,7 +218,7 @@ A Vec is an owned value, so the conventions from
 it, or takes it, and its signature says which.
 
 ```vole
-fn total(v: Vec<i64>) -> i64 {
+fn total(v: Vec<i64, Gpa>) -> i64 {
     var t = 0;
     for x in v {
         t += x;
@@ -226,14 +226,14 @@ fn total(v: Vec<i64>) -> i64 {
     t
 }
 
-fn add_bonus(v: inout Vec<i64>, bonus: i64) {
+fn add_bonus(v: inout Vec<i64, Gpa>, bonus: i64) {
     for i in 0..v.len() {
         v[i] += bonus;
     }
 }
 
 fn main(gpa: Gpa) {
-    var points: Vec<i64> = Vec::new_in(gpa);
+    var points: Vec<i64, Gpa> = Vec::new_in(gpa);
     points.push(3);
     points.push(4);
     add_bonus(&points, 10);
@@ -275,7 +275,7 @@ fn largest(xs: [i64]) -> i64 {
 
 fn main(gpa: Gpa) {
     let days: [i64; 4] = [12, 19, 7, 15];
-    var temps: Vec<i64> = Vec::new_in(gpa);
+    var temps: Vec<i64, Gpa> = Vec::new_in(gpa);
     temps.push(3);
     temps.push(-2);
     println(largest(days));
@@ -421,7 +421,7 @@ A function that only reads text takes a `str`, and you can give it a
 `String` or a literal:
 
 ```vole
-fn shout(s: str, gpa: Gpa) -> String {
+fn shout(s: str, gpa: Gpa) -> String<Gpa> {
     s.to_uppercase_in(gpa)
 }
 
@@ -455,10 +455,10 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[type error]: allocation is explicit: pass an allocator (try: to_uppercase_in(gpa))
+error[alloc.no_in]: 'to_uppercase' allocates from nothing: pass the allocator, last, to 'to_uppercase_in'
  --> main.vl: line 3, column 16
   = help: this function's `gpa` is the allocator to pass
-  = try: volec fix --only alloc016 main.vl
+  = try: volec fix --only alloc main.vl
   = try: volec fix --suggested main.vl
 ```
 
@@ -471,14 +471,14 @@ are `String`s, so looking one up needs a `String` too:
 
 ```vole
 fn main(gpa: Gpa) {
-    var ages: HashMap<String, i64> = HashMap::new_in(gpa);
+    var ages: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     ages.insert(String::from_in("ada", gpa), 36);
     println("{:?}", ages.get("ada"));
 }
 ```
 
 ```err
-error[type error]: expected 'String', got '[u8]'
+error[type error]: expected 'String<Gpa>', got '[u8]'
  --> main.vl: line 4, column 30
   = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)
   = try: String::from_in("ada", gpa)
@@ -613,7 +613,7 @@ key quickly, however many there are:
 
 ```vole
 fn main(gpa: Gpa) {
-    var ages: HashMap<str, i64> = HashMap::new_in(gpa);
+    var ages: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     ages.insert("ada", 36);
     ages.insert("alan", 41);
     let old = ages.insert("ada", 37);
@@ -641,7 +641,7 @@ of its own:
 
 ```vole
 fn main(gpa: Gpa) {
-    var counts: HashMap<str, i64> = HashMap::new_in(gpa);
+    var counts: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     for w in "a b a c a b".split(' ') {
         counts.get_or_insert(w, 0)[0] += 1;
     }
@@ -697,10 +697,10 @@ use std::BTreeMap;
 use std::HashSet;
 
 fn main(gpa: Gpa) {
-    var seen: HashSet<i64> = HashSet::new_in(gpa);
+    var seen: HashSet<i64, Gpa> = HashSet::new_in(gpa);
     println("{} {} {}", seen.insert(3), seen.insert(3), seen.contains(3));
 
-    var grades: BTreeMap<i64, str> = BTreeMap::new_in(gpa);
+    var grades: BTreeMap<i64, str, Gpa> = BTreeMap::new_in(gpa);
     grades.insert(90, "A");
     grades.insert(70, "C");
     grades.insert(80, "B");
@@ -759,8 +759,8 @@ fn trim_punct(word: str) -> str {
     word[start..end]
 }
 
-fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+fn count_words(text: str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -901,8 +901,8 @@ fn trim_punct(word: str) -> str {
     word[start..end]
 }
 
-fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+fn count_words(text: str, gpa: Gpa) -> HashMap<String<Gpa>, i64, Gpa> {
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -915,8 +915,8 @@ fn count_words(text: str, gpa: Gpa) -> HashMap<String, i64> {
 
 // The pairs, most common first; words with the same count in
 // alphabetical order.
-fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
-    var rows: Vec<(String, i64)> = Vec::new_in(gpa);
+fn sorted_counts(counts: HashMap<String<Gpa>, i64, Gpa>, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+    var rows: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, n) in counts.iter() {
         rows.push((word.clone(), n));
     }
@@ -924,7 +924,7 @@ fn sorted_counts(counts: HashMap<String, i64>, gpa: Gpa) -> Vec<(String, i64)> {
     rows
 }
 
-fn print_table(rows: [(String, i64)], top: usize) {
+fn print_table(rows: [(String<Gpa>, i64)], top: usize) {
     let shown = if rows.len() < top { rows.len() } else { top };
     println("{:<12} {:>5}", "word", "count");
     println("{:<12} {:>5}", "----", "-----");

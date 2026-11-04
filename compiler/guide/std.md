@@ -16,7 +16,7 @@ v.get(i: i64) -> T               checked, as v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
 String::new_in(gpa) -> String   text you build (Buf: bytes)
 o.unwrap() -> T                  Option, Result; o.is_some(), o.is_none()
-read_stdin_in(gpa) -> Result<Vec<u8>, IoError> all of stdin
+read_stdin_in(gpa) -> Result<Vec<u8, Gpa>, IoError> all of stdin
 print(x), println(x)             any Display; println("{x} {:?}", v)
 b.push_int(v: i64)
 v.set(i: usize, x: T)            checked, as v[i] = x
@@ -87,11 +87,11 @@ its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's,
 `Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
-- `Vec<T>`, `Buf` and `HashMap<K, V>` own their memory: `let w = v;`
-  moves it, `.clone()` copies. A function that reads one takes it let
-  (`v: Vec<T>`, called `f(v)`: borrowed, nothing moves), one that
-  changes it `v: inout Vec<T>` (called `f(&v)`), one that keeps it `v:
-  sink Vec<T>` (`f(v)` moves it).
+- `Vec<T, A>`, `Buf` and `HashMap<K, V, A>` own their memory: `let w = v;`
+  moves it, `.clone()` copies. A function that reads one takes it
+  let (`v: Vec<T, A>`, called `f(v)`: borrowed), one that changes it
+  `v: inout Vec<T, A>` (called `f(&v)`), one that keeps it `v: sink
+  Vec<T, A>` (`f(v)` moves it).
 - A slice from `as_slice()` views the container: the checker rejects its
   use after the next push, `free` or drop (`volec guide views`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
@@ -122,7 +122,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var counts: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     let words = ["a", "b", "a", "c", "a"];
     for w in words {
         counts.get_or_insert(w, 0)[0] += 1;
@@ -163,9 +163,9 @@ MinHeap: `volec guide --find dijkstra`.
 `read_line(&buf)` reads stdin a line at a time: the line goes into the
 `String` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
-`Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left
-(a `Result<Vec<u8>, IoError>`); the two share a buffer: they mix, but not with
-C's `getchar` or `scanf`. A `Scanner` reads a text's tokens
+`Err(IoError::Read)`). `read_stdin_in(gpa)` returns the rest of stdin (a
+`Result<Vec<u8, Gpa>, IoError>`); the two share a buffer: they mix, but
+not with C's `getchar`. A `Scanner` reads a text's tokens
 (`next_token`; `next_int`, a `Result<i64, ScanError>`) and lines
 (`next_line`); `parse_int` (a `Result<i64, ParseIntError>`),
 `split_in`, `split_whitespace_in` and `trim` work on any `[u8]`. An Option

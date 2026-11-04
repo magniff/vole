@@ -91,7 +91,7 @@ use std::window::{App, Button, Event, MouseAction, WindowDesc};
 
 const GRID: f64 = 128.0; // the simulation's cells across and down
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     var app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()),
@@ -167,7 +167,8 @@ embed wgsl STEP {
 }
 
 // A frame's GPU work: what the windowed program submits each frame.
-fn frame(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline, group: gpu::BindGroup) {
+fn frame(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
+    group: gpu::BindGroup) {
     var enc = dev.encoder();
     enc.compute_pass(|pass| {
         pass.set_pipeline(pipe);
@@ -177,7 +178,7 @@ fn frame(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline, 
     queue.submit(enc.finish());
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
@@ -220,13 +221,13 @@ use std::gpu::{BufferUsage, Color, Format, PassDesc, RawSurface, TextureView};
 
 // The frame's drawing, shared with the window's Event::Frame: here a
 // clear; in a program its scene passes, then the overlay.
-fn draw(dev: gpu::Device, queue: inout gpu::Queue, view: TextureView) {
+fn draw(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, view: TextureView) {
     var enc = dev.encoder();
     enc.render_pass(PassDesc::color(view, clear: Color::rgba(1.0, 0.5, 0.0, 1.0)), |_| {});
     queue.submit(enc.finish());
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let (w, h) = (64, 32);
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
@@ -278,7 +279,7 @@ use std::gpu::{Color, PassDesc, RawSurface};
 use std::window::{App, Button, Event, MouseAction, WindowDesc};
 use std::window::keys::Logical;
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     var app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()), // no display, no script

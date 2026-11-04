@@ -57,13 +57,21 @@ takes no allocator, so a search for `Gpa` misses it:
 ```console
 $ volec query refs Gpa --in crate::markup
 # markup.vl
-10:26	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8]> {
-16:27	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf {
-55:30	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading> {
-66:31	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf {
+10:26	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8], Gpa> {
+10:44	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8], Gpa> {
+16:27	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf<Gpa> {
+16:39	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf<Gpa> {
+36:38	type	markup::inline	fn inline(text: [u8], out: inout Buf<Gpa>) {
+55:30	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
+55:50	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
+55:56	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading<Gpa>, Gpa> {
+56:25	type	markup::headings	var hs: Vec<Heading<Gpa>, Gpa> = Vec::new_in(gpa);
+56:31	type	markup::headings	var hs: Vec<Heading<Gpa>, Gpa> = Vec::new_in(gpa);
+66:31	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf<Gpa> {
+66:43	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf<Gpa> {
 $ volec query effects markup::inline --why 'alloc(Gpa)' | head -2
 crate::markup::inline	alloc(Gpa) panic
-  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 grows a Buf
+  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 grows a Buf<Gpa>
 ```
 
 `inline` appends to a `Buf` it is given, and a `Buf` grows with the
@@ -88,19 +96,20 @@ $ cat > steps.txt <<'EOF'
 $ volec refactor --script steps.txt --dry-run | grep ': error'
 main.vl:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
 markup.vl:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
-markup.vl:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
-markup.vl:56:40: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.vl:75:25: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:90:28: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:100:23: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.vl:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:31:5: error[type error] expected 'Buf<Gpa>', got 'Buf<Arena>'  [edited: crate::markup::slug]
+markup.vl:56:50: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
+markup.vl:75:25: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:90:28: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:100:23: error[type error] expected 'inout Buf<Gpa>', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:107:5: error[type error] expected 'Buf<Gpa>', got 'Buf<Arena>'  [edited: crate::markup::render]
 warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run); the first in the edited text: markup.vl:11:25: expected 'Gpa', got 'Arena'
 ```
 
-The errors are the rest of the plan: the return types (`Vec<[u8]>`
-from `split_in` on an `Arena` is `Vec<[u8], Arena>`; `Buf` is
-`Buf<Arena>`), the field `Heading.id`, `inline`'s `out`, and the call in
-`main`, which must now pass an arena. The script grows to cover them,
+The errors are the rest of the plan: the types that name `Gpa`
+(`Vec<[u8], Gpa>` from `split_in` on an `Arena` is `Vec<[u8], Arena>`;
+`Buf<Gpa>` is `Buf<Arena>`, `Heading<Gpa>` is `Heading<Arena>`),
+`inline`'s `out`, and the call in `main`, which must now pass an
+arena. The script grows to cover them,
 and renames the parameters to say what they are:
 
 ```console
@@ -110,11 +119,10 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::headings --type gpa Arena
 > refactor signature markup::render --type gpa Arena
 > refactor signature markup::inline --type out 'inout Buf<Arena>'
-> refactor field markup::Heading --type id 'Buf<Arena>'
-> edit patch markup::lines --old '-> Vec<[u8]>' --new '-> Vec<[u8], Arena>'
-> edit patch markup::slug --old '-> Buf' --new '-> Buf<Arena>'
-> edit patch markup::headings --old 'Vec<Heading>' --new 'Vec<Heading, Arena>' --all
-> edit patch markup::render --old '-> Buf' --new '-> Buf<Arena>'
+> edit patch markup::lines --old '-> Vec<[u8], Gpa>' --new '-> Vec<[u8], Arena>'
+> edit patch markup::slug --old '-> Buf<Gpa>' --new '-> Buf<Arena>'
+> edit patch markup::headings --old 'Vec<Heading<Gpa>, Gpa>' --new 'Vec<Heading<Arena>, Arena>' --all
+> edit patch markup::render --old '-> Buf<Gpa>' --new '-> Buf<Arena>'
 > refactor signature markup::lines --rename-param gpa arena
 > refactor signature markup::slug --rename-param gpa arena
 > refactor signature markup::headings --rename-param gpa arena
@@ -146,7 +154,6 @@ changed parameter gpa to Arena in crate::markup::slug	markup.vl	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::headings	markup.vl	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::render	markup.vl	+1 -1 lines
 changed parameter out to inout Buf<Arena> in crate::markup::inline	markup.vl	+1 -1 lines
-changed field id to Buf<Arena> in crate::markup::Heading	markup.vl	+1 -1 lines
 patched crate::markup::lines	markup.vl	+1 -1 lines
 patched crate::markup::slug	markup.vl	+1 -1 lines
 patched crate::markup::headings	markup.vl	+2 -2 lines
@@ -156,11 +163,11 @@ renamed parameter gpa to arena of crate::markup::slug	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::headings	markup.vl	+3 -3 lines
 renamed parameter gpa to arena of crate::markup::render	markup.vl	+4 -4 lines
 replaced crate::main	main.vl	+9 -2 lines
-script steps.txt: 15 commands	2 files	+22 -15 lines
+script steps.txt: 14 commands	2 files	+21 -14 lines
 $ git diff --stat
  main.vl   | 11 +++++++++--
- markup.vl | 26 +++++++++++++-------------
- 2 files changed, 22 insertions(+), 15 deletions(-)
+ markup.vl | 24 ++++++++++++------------
+ 2 files changed, 21 insertions(+), 14 deletions(-)
 ```
 
 `Arena::new_in(gpa)` makes an arena whose chunks come from `gpa`.

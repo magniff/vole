@@ -22,15 +22,15 @@ $ fix --only buf --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -4 +4 @@
--    lines: Buf,
-+    lines: String<Gpa>,
+-    lines: Buf<A>,
++    lines: String<A>,
 @@ -9,2 +9,2 @@
--fn greet(gpa: Gpa) -> Buf {
+-fn greet(gpa: Gpa) -> Buf<Gpa> {
 -    var b = Buf::new_in(gpa);
 +fn greet(gpa: Gpa) -> String<Gpa> {
 +    var b = String::new_in(gpa);
 @@ -16 +16 @@
--fn put(out: inout Buf, x: u8) {
+-fn put(out: inout Buf<Gpa>, x: u8) {
 +fn put(out: inout Vec<u8, Gpa>, x: u8) {
 @@ -22 +22 @@
 -    var t = Buf::new_in(gpa);
@@ -40,17 +40,17 @@ $ fix --only buf --dry-run
 +    var a = String::new_in(gpa);
 @@ -29 +29 @@
 -    var hi = Buf::new_in(gpa);
-+    var hi = Vec::<u8>::new_in(gpa);
++    var hi = Vec::<u8, Gpa>::new_in(gpa);
 @@ -33,2 +33,2 @@
 -    var r = Buf::new_in(gpa);
 -    r.push_str(raw);
-+    var r = Vec::<u8>::new_in(gpa);
++    var r = Vec::<u8, Gpa>::new_in(gpa);
 +    r.extend_from_slice(raw);
 @@ -37 +37 @@
 -    var log = Log { lines: Buf::new_in(gpa), count: 0 };
 +    var log = Log { lines: String::new_in(gpa), count: 0 };
 note fix.buf-refused: 'm' at main.vl:41:9: mixed: text (push_str of a str at main.vl:42:5) and bytes (push of a byte that is not a constant at main.vl:44:5)
-note fix.buf-refused: 'f' at main.vl:46:9: passed to std's 'String::from_buf' at main.vl:48:31, which takes a Buf
+note fix.buf-refused: 'f' at main.vl:46:9: passed to std's 'String<Gpa>::from_buf' at main.vl:48:31, which takes a Buf
 note fix.buf-refused: 'c' at main.vl:50:9: text, but its 'take' at main.vl:51:17 has no String<A> form
 note fix.buf-refused: 'taken' at main.vl:51:9: no write says text or bytes
 note fix.buf-refused: 'e' at main.vl:53:9: no write says text or bytes
@@ -77,7 +77,7 @@ note fix.buf-table: Buf's methods, as String<A> (text) and Vec<u8, A> (bytes); '
 $ fix --only buf
 fixed 10 Buf sites	main.vl	+10 -10 lines
 note fix.buf-refused: 'm' at main.vl:41:9: mixed: text (push_str of a str at main.vl:42:5) and bytes (push of a byte that is not a constant at main.vl:44:5)
-note fix.buf-refused: 'f' at main.vl:46:9: passed to std's 'String::from_buf' at main.vl:48:31, which takes a Buf
+note fix.buf-refused: 'f' at main.vl:46:9: passed to std's 'String<Gpa>::from_buf' at main.vl:48:31, which takes a Buf
 note fix.buf-refused: 'c' at main.vl:50:9: text, but its 'take' at main.vl:51:17 has no String<A> form
 note fix.buf-refused: 'taken' at main.vl:51:9: no write says text or bytes
 note fix.buf-refused: 'e' at main.vl:53:9: no write says text or bytes

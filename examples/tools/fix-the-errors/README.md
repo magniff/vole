@@ -23,9 +23,9 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 $ volec check
 main.vl:8:38: error[item.private] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
 main.vl:9:14: error[type error] unresolved import 'roster::add_score'
-main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
 main.vl:32:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 grades.vl:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
@@ -74,9 +74,9 @@ $ volec fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+4 -2 lines
 $ volec check
 main.vl:11:14: error[type error] unresolved import 'roster::add_score'
-main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
@@ -90,7 +90,7 @@ The item at an error's position is `query show FILE:LINE`:
 $ volec query show roster.vl:26
 // crate::roster::with_scores	roster.vl:21-30
 // How many students have at least `n` scores.
-pub fn with_scores(r: Roster, n: i64) -> i64 {
+pub fn with_scores(r: Roster<Gpa>, n: i64) -> i64 {
     let count = 0;
     for s in r.students.as_slice() {
         if s.scores.len() as i64 >= n {
@@ -137,14 +137,14 @@ two-argument `enrol` and no `add_score`.
 ```console
 $ volec check
 main.vl:11:14: error[type error] unresolved import 'roster::add_score'
-main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
-main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster<Gpa>, name: [u8])` (roster.vl:17)
 [exit 1]
 $ volec query show roster::enrol
 // crate::roster::enrol	roster.vl:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
-pub fn enrol(r: inout Roster, name: [u8]) {
+pub fn enrol(r: inout Roster<Gpa>, name: [u8]) {
     r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
@@ -161,14 +161,14 @@ a valid input.)
 $ volec edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
-> pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
->     var v: Vec<i64> = Vec::new_in(r.students.allocator());
+> pub fn enrol(r: inout Roster<Gpa>, name: [u8], scores: [i64]) {
+>     var v: Vec<i64, Gpa> = Vec::new_in(r.students.allocator());
 >     v.extend_from_slice(scores);
 >     r.students.push(Student { name: name, scores: v });
 > }
 > @@ new after roster::enrol
 > // One more score for the student called `name`; false when there is none.
-> pub fn add_score(r: inout Roster, name: [u8], score: i64) -> bool {
+> pub fn add_score(r: inout Roster<Gpa>, name: [u8], score: i64) -> bool {
 >     for i in 0..r.students.len() {
 >         if r.students[i].name == name {
 >             r.students[i].scores.push(score);
@@ -181,14 +181,14 @@ $ volec edit apply --show <<'EOF'
 applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.vl	+16 -3 lines
 // roster.vl:16-31
 16	// A student and their scores so far.
-17	pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
-18	    var v: Vec<i64> = Vec::new_in(r.students.allocator());
+17	pub fn enrol(r: inout Roster<Gpa>, name: [u8], scores: [i64]) {
+18	    var v: Vec<i64, Gpa> = Vec::new_in(r.students.allocator());
 19	    v.extend_from_slice(scores);
 20	    r.students.push(Student { name: name, scores: v });
 21	}
 22	
 23	// One more score for the student called `name`; false when there is none.
-24	pub fn add_score(r: inout Roster, name: [u8], score: i64) -> bool {
+24	pub fn add_score(r: inout Roster<Gpa>, name: [u8], score: i64) -> bool {
 25	    for i in 0..r.students.len() {
 26	        if r.students[i].name == name {
 27	            r.students[i].scores.push(score);

@@ -20,7 +20,7 @@ use command::{Error, parse};
 use store::Store;
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Vec<u8>
+    let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Vec<u8, Gpa>
     var store = Store::new(gpa);                // it allocates: give it gpa
     var sc = Scanner::new(input.as_slice());
     var line_no = 0;
@@ -38,7 +38,7 @@ fn main(gpa: Gpa) -> i32 {
 }                                               // store, then input, dropped (freed)
 
 // One line: parsed, then applied; `?` passes the first Err up.
-fn run(store: inout Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
+fn run(store: inout Store<Gpa>, line: [u8], gpa: Gpa) -> Result<(), Error> {
     let cmd = parse(line, gpa)?;
     store.apply(cmd)
 }
@@ -131,13 +131,13 @@ fn number(w: [u8]) -> Result<i64, Error> {
 
 use command::{Command, Error, Item};
 
-pub struct Store {
-    items: Vec<Item>,
-    index: HashMap<[u8], i64>,                  // name -> its position in items
+pub struct Store<A: Allocator> {
+    items: Vec<Item, A>,
+    index: HashMap<[u8], i64, A>,               // name -> its position in items
 }
 
-impl Store {
-    pub fn new(gpa: Gpa) -> Store {
+impl Store<Gpa> {
+    pub fn new(gpa: Gpa) -> Store<Gpa> {
         Store { items: Vec::new_in(gpa), index: HashMap::new_in(gpa) }
     }
 

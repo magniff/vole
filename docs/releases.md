@@ -185,6 +185,33 @@ Text (text263; grammar.md, "Items"):
   for 0.26.3: its names are `[u8]` slices of the WGSL source, and they
   become `str` in 0.27.
 
+Allocation as a capability (capab263; grammar.md, "Allocators"):
+
+- No default allocator type: `Vec<u8>`, `Buf`, `HashMap<K, V>` are
+  `alloc.default` (breaking); a type names its allocator, `Vec<u8,
+  Gpa>` or a generic `A`, so a signature says what a function may
+  allocate from. `alloc.no_in` replaces 0.16's "allocation is explicit"
+  message for `Vec::new()` and the other forms without an allocator.
+- `alloc.field`: a struct or enum holding an allocator names it in its
+  parameters (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as
+  `P<Gpa>`); a struct literal infers the allocator from its fields.
+  `alloc.static`: a static's type holds none, checked through the new
+  auto trait `AllocFree` (std), which looks through pointers.
+  `alloc.last`: an `_in` function takes its allocator last.
+- `unsafe trait` and `unsafe impl`, Rust's: `Allocator` is an unsafe
+  trait, and every impl of it is `unsafe impl` with its SAFETY comment
+  (`alloc.safe_impl`). std's Gpa, Arena, ScopedArena and FixedBuf are.
+- std's types that hold an allocator say so: std::gpu's `Device<A>`,
+  `Error<A>` and the other handles, std::window's, mpsc's, `Command`'s,
+  std::test's `Gen<A>`.
+- `volec fix --only alloc` makes the exact fixes in rounds (`Gpa` where
+  the default was, the `_in` call with the allocator in scope, a struct
+  made generic and then its uses). 0.16's `fix --only alloc016` is gone.
+- The tree is moved over with it: tests/, examples/, bench/, the guide.
+  compiler/src keeps one exemption until 0.26.4 (its allocator
+  `base::comp::Comp` and the static `WGSL_ARENA`), in one table in
+  front/check/alloc_rules.vl; its unused allocator `Ast` is gone.
+
 ### What's new in 0.26.2
 
 `usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.

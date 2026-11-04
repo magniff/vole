@@ -33,7 +33,7 @@ fn main(gpa: Gpa) -> i32 {
     let s = sys::SockaddrIn { port: p.x };
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     let sq = Square { side: 2 };
-    var std_vec: Vec<i64> = Vec::new_in(gpa);
+    var std_vec: Vec<i64, Gpa> = Vec::new_in(gpa);
     std_vec.push(s.port);
     var mine = MyVec { n: 0 };
     mine.push(v.len());

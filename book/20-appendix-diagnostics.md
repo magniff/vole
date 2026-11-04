@@ -184,7 +184,7 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[type error]: no method 'push_string' on type 'String'
+error[type error]: no method 'push_string' on type 'String<Gpa>'
  --> main.vl: line 3, column 5
   = help: did you mean 'push_str'?
   = try: volec query items String main.vl

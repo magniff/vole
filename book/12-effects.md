@@ -65,7 +65,7 @@ fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = String::from_utf8(input).unwrap();
-    var xs: Vec<f64> = Vec::new_in(gpa);
+    var xs: Vec<f64, Gpa> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
@@ -197,7 +197,7 @@ fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = String::from_utf8(input).unwrap();
-    var xs: Vec<f64> = Vec::new_in(gpa);
+    var xs: Vec<f64, Gpa> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
@@ -291,7 +291,7 @@ allocate, but pushes onto a `Vec` it was given:
 
 ```vole
 #[no_alloc]
-fn above(xs: [f64], limit: f64, out: inout Vec<f64>) {
+fn above(xs: [f64], limit: f64, out: inout Vec<f64, Gpa>) {
     for x in xs {
         if x > limit {
             out.push(x);
@@ -301,14 +301,14 @@ fn above(xs: [f64], limit: f64, out: inout Vec<f64>) {
 
 fn main(gpa: Gpa) {
     let xs = [1.0, 9.5];
-    var big: Vec<f64> = Vec::new_in(gpa);
+    var big: Vec<f64, Gpa> = Vec::new_in(gpa);
     above(xs, 5.0, &big);
     println("{}", big.len());
 }
 ```
 
 ```err
-error[effect]: 'above' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl: line 5, column 13 grows a Vec<f64>
+error[effect]: 'above' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl: line 5, column 13 grows a Vec<f64, Gpa>
  --> main.vl: line 2, column 1
   = help: allocate in the caller and pass the memory in, or remove #[no_alloc]
   = try: volec query effects above --why alloc(Gpa)

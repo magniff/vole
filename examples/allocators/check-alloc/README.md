@@ -27,10 +27,10 @@ arena's scope.
 
 ```console
 $ cat > old.vl <<'EOF'
-> struct Shelf { name: [u8], counts: Vec<i64> }
+> struct Shelf<A: Allocator> { name: [u8], counts: Vec<i64, A> }
 >
 > fn copied_handle(gpa: Gpa) {
->     var counts: Vec<i64> = Vec::new_in(gpa);
+>     var counts: Vec<i64, Gpa> = Vec::new_in(gpa);
 >     counts.push(3);
 >     let shelf = Shelf { name: "fruit", counts: counts };
 >     counts.free();
@@ -38,14 +38,14 @@ $ cat > old.vl <<'EOF'
 > }
 >
 > fn freed_twice(gpa: Gpa) {
->     var counts: Vec<i64> = Vec::new_in(gpa);
+>     var counts: Vec<i64, Gpa> = Vec::new_in(gpa);
 >     var shelf = Shelf { name: "tools", counts: counts };
 >     counts.free();
 >     shelf.counts.free();
 > }
 >
 > fn slice_after_push(gpa: Gpa) {
->     var v: Vec<i64> = Vec::new_in(gpa);
+>     var v: Vec<i64, Gpa> = Vec::new_in(gpa);
 >     v.push(0);
 >     let first = v.as_slice();
 >     v.push(40);

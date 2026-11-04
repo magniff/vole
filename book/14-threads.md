@@ -43,7 +43,7 @@ the chapter shows each rule, and the error you get when you break it.
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..=100 {
         v.push(i);
     }
@@ -82,7 +82,7 @@ because the data they view stays behind:
 use std::thread;
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..10 {
         v.push(i);
     }
@@ -147,7 +147,7 @@ fn sum(xs: [i64]) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..1000000 {
         v.push(i % 1000);
     }
@@ -164,7 +164,7 @@ fn main(gpa: Gpa) {
     let n = thread::available_parallelism() as usize;
     let chunk = (xs.len() + n - 1) / n;
     let total = thread::scope(|s| {
-        var handles: Vec<ScopedJoinHandle<i64>> = Vec::new_in(gpa);
+        var handles: Vec<ScopedJoinHandle<i64>, Gpa> = Vec::new_in(gpa);
         for k in 0..n {
             let lo = k * chunk;
             let hi = if lo + chunk < xs.len() { lo + chunk } else { xs.len() };
@@ -225,7 +225,7 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
@@ -297,7 +297,7 @@ fn is_prime(n: i64) -> bool {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..100000 {
         v.push(i);
     }
@@ -419,7 +419,7 @@ fn hash(line: str) -> u64 {
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = String::from_utf8(input).unwrap();
-    let all: Vec<str> = text.lines().collect_in(gpa);
+    let all: Vec<str, Gpa> = text.lines().collect_in(gpa);
     let lines = all.as_slice();
     let workers: usize = 3;
 
@@ -436,7 +436,7 @@ fn main(gpa: Gpa) {
             });
         }
         drop(tx);
-        var got: Vec<(usize, u64)> = Vec::new_in(gpa);
+        var got: Vec<(usize, u64), Gpa> = Vec::new_in(gpa);
         for r in rx.iter() {
             got.push(r);
         }

@@ -37,7 +37,7 @@ embed wgsl DRAW {
     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(fract(v[0]), 0.3, 0.5, 1.0); }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     var app = match App::new_in(gpa) {
         Ok(a) => a,
         Err(_) => return Ok(()), // no display (ssh, CI)
@@ -159,18 +159,19 @@ embed wgsl ADD {
 }
 
 // The program's handles, with one owner.
-struct Gpu {
-    dev: gpu::Device,
+struct Gpu<A: Allocator> {
+    dev: gpu::Device<A>,
     queue: gpu::Queue,
     pipe: gpu::ComputePipeline,
-    bufs: Vec<gpu::Buffer>,
+    bufs: Vec<gpu::Buffer, A>,
     groups: [gpu::BindGroup; 2],
 }
 
-impl Gpu {
-    fn new(dev: sink gpu::Device, queue: sink gpu::Queue, gpa: Gpa) -> Result<Gpu, gpu::Error> {
+impl Gpu<Gpa> {
+    fn new(dev: sink gpu::Device<Gpa>, queue: sink gpu::Queue, gpa: Gpa) -> Result<Gpu<Gpa>,
+        gpu::Error<Gpa>> {
         let pipe = dev.compute_pipeline(dev.shader_wgsl(ADD.src)?, ADD.main)?;
-        var bufs: Vec<gpu::Buffer> = Vec::new_in(gpa);
+        var bufs: Vec<gpu::Buffer, Gpa> = Vec::new_in(gpa);
         for _ in 0..2 {
             bufs.push(dev.buffer(64 * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC));
         }
@@ -205,7 +206,7 @@ impl Gpu {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa); // plain
     let (dev, queue) = inst.adapter()?.device()?;
     var g = Gpu::new(dev, queue, gpa)?; // dev and queue moved: g.dev from here
@@ -253,7 +254,7 @@ recorded, or at `queue.submit` when it was recorded before the
 (`own.conflict`) while a view of it is still used: read what you need,
 `unmap`, then copy into it again (the atomics example below). Mapping
 again while mapped is fine. `buf.map_read_copy_in(dev, gpa)` maps,
-copies the bytes into a `Vec<u8>` (`gpu::f32s(v.as_slice())`) and
+copies the bytes into a `Vec<u8, Gpa>` (`gpu::f32s(v.as_slice())`) and
 unmaps: the buffer can be written again at once, and the copy outlives
 it. A view lives no longer than the buffer: a function may return
 `buf.map_read(dev)` when `buf` is its caller's (an `inout` parameter),
@@ -276,7 +277,7 @@ program can also write both by hand, as below.
 use std::gpu;
 use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let code = "kernel void k(device uint* xs [[buffer(0)]], uint i [[thread_position_in_grid]]) { xs[i] = xs[i] * xs[i]; }";
@@ -286,7 +287,7 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
     let src = ShaderSource::msl(code, refl);
     let shader = dev.shader(src)?;
     let pipe = dev.compute_pipeline(shader, "main")?;
-    var xs: Vec<u32> = Vec::new_in(gpa);
+    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
     let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
         BufferUsage::STORAGE | BufferUsage::COPY_SRC);
@@ -324,12 +325,12 @@ embed wgsl SQUARE {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(SQUARE.src)?;
     let pipe = dev.compute_pipeline(shader, SQUARE.main)?;
-    var xs: Vec<u32> = Vec::new_in(gpa);
+    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..64 { xs.push(i as u32); }
     let buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
         BufferUsage::STORAGE | BufferUsage::COPY_SRC);
@@ -396,7 +397,7 @@ embed wgsl REVERSE {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let fill = dev.compute_pipeline(dev.shader_wgsl(FILL.src)?, FILL.main)?;
@@ -642,7 +643,7 @@ embed wgsl QUAD {
     @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(QUAD.src)?;
@@ -742,7 +743,7 @@ embed wgsl SHADER {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let shader = dev.shader_wgsl(SHADER.src)?;
@@ -842,7 +843,7 @@ several GiB on Apple silicon); beyond it `device(lim)` stops with
 use std::gpu;
 use std::gpu::{BufferUsage, Limits};
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let adapter = inst.adapter()?;
     var lim = Limits::default();
@@ -898,12 +899,12 @@ embed wgsl CLEAR with BINS {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let deposit = dev.compute_pipeline(dev.shader_wgsl(DEPOSIT.src)?, DEPOSIT.main)?;
     let clear = dev.compute_pipeline(dev.shader_wgsl(CLEAR.src)?, CLEAR.main)?;
-    var xs: Vec<u32> = Vec::new_in(gpa);
+    var xs: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..256 { xs.push(i as u32); }
     let xb = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
     let bins = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
@@ -996,11 +997,11 @@ embed wgsl BLUR {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(BLUR.src)?, BLUR.main)?;
-    var start: Vec<u32> = Vec::new_in(gpa);
+    var start: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
     let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
     let bufs = [dev.buffer_init(gpu::bytes_of_u32(start.as_slice()), usage), dev.buffer(N * 4, usage)];
@@ -1086,13 +1087,13 @@ embed wgsl TICK {
     @compute @workgroup_size(1) fn main() { ctl[0] += 1u; }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let step = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
     let tick = dev.compute_pipeline(dev.shader_wgsl(TICK.src)?, TICK.main)?;
-    var start: Vec<u32> = Vec::new_in(gpa);
-    var params: Vec<u32> = Vec::new_in(gpa);
+    var start: Vec<u32, Gpa> = Vec::new_in(gpa);
+    var params: Vec<u32, Gpa> = Vec::new_in(gpa);
     for i in 0..N { start.push((i * i % 97) as u32); }
     for s in 0..STEPS { params.push((s * 7 % 11) as u32); } // any values, one a step
     let usage = BufferUsage::STORAGE | BufferUsage::COPY_SRC;
@@ -1166,7 +1167,7 @@ embed wgsl STEP {
     }
 }
 
-fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+fn main(gpa: Gpa) -> Result<(), gpu::Error<Gpa>> {
     let inst = gpu::Instance::new_in(gpa);
     let (dev, var queue) = inst.adapter()?.device()?;
     let pipe = dev.compute_pipeline(dev.shader_wgsl(STEP.src)?, STEP.main)?;
@@ -1215,8 +1216,8 @@ a frame costs the program; timestamps are what the GPU spends:
 ```vole
 use std::gpu;
 
-fn timed(dev: gpu::Device, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
-    group: gpu::BindGroup, groups: i64) -> Result<f64, gpu::Error> {
+fn timed(dev: gpu::Device<Gpa>, queue: inout gpu::Queue, pipe: gpu::ComputePipeline,
+    group: gpu::BindGroup, groups: i64) -> Result<f64, gpu::Error<Gpa>> {
     let t0 = std::time::monotonic_now();
     var enc = dev.encoder();
     enc.compute_pass(|pass| {

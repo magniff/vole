@@ -135,7 +135,7 @@ inside `unsafe`:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     let i = v.len() + 2;
     unsafe {
@@ -833,7 +833,7 @@ the `Vec` grows:
 
 ```vole stale.vl
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(7);
     let p = v.as_slice().ptr; // a raw pointer to the first element
     for i in 0..100 {

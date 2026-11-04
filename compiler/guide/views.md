@@ -3,17 +3,17 @@
 A *view* points into memory something else owns: a slice `[T]` (a
 string literal, `v.as_slice()`, `a[1..3]`), an access field (`q: inout
 Query`, `cfg: let Config`), a struct holding one (`Scanner`, `struct Tok
-{ text: [u8] }`), a `Vec<[u8]>` of them, a closure that captures by
+{ text: [u8] }`), a `Vec<[u8], Gpa>` of them, a closure that captures by
 access. Views are second-class: the checker keeps each one inside what
 it views, with no lifetimes to write.
 
 ## What a view may do
 
 - Live in locals, parameters, struct fields and containers
-  (`Vec<[u8]>`, `HashMap<[u8], i64>`): a parser keeps tokens that view
+  (`Vec<[u8], Gpa>`, `HashMap<[u8], i64, Gpa>`): a parser keeps tokens that view
   its input.
 - Be returned when it views a parameter: `fn first_word(s: [u8]) ->
-  [u8]`, `fn as_slice(self) -> [T]` on a `Vec<T>`.
+  [u8]`, `fn as_slice(self) -> [T]` on a `Vec<T, A>`.
 - Not outlive its owner: not returned out of the function that owns the
   memory (`own.escape`), not used after its owner changed, moved or was
   dropped (`own.conflict`).
@@ -54,7 +54,7 @@ come to hold) points into.
 | `views(self)` | points into what `self` points to | `Vec::as_slice`; a lexer that owns its text, returning `self.src.as_slice()[a..b]` |
 | `views(*self)` | carries views `self` holds, not into `self` | a parser returning a token's `text` |
 | `views(s)`, `views()` | into parameter `s`; nothing | `first_word(s)`; a function returning a Buf |
-| `stores(word)` | what the `inout` parameters may come to hold | `intern(names: inout Vec<[u8]>, word: [u8])` |
+| `stores(word)` | what the `inout` parameters may come to hold | `intern(names: inout Vec<[u8], Gpa>, word: [u8])` |
 
 `volec query views NAME --why` shows a summary and the line that
 makes each part; `#[views(*self)]` on a function pins it (the body is
@@ -68,9 +68,9 @@ call. This checks clean:
 
 ```vole
 struct Tok { text: [u8], kind: i64 }
-struct Parser { toks: Vec<Tok>, pos: i64 }
+struct Parser<A: Allocator> { toks: Vec<Tok, A>, pos: i64 }
 
-impl Parser {
+impl Parser<Gpa> {
     fn name(inout self) -> [u8] {
         let t = self.toks[self.pos];
         self.pos += 1;

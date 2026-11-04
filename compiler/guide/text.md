@@ -21,14 +21,14 @@ as u32`). What allocates takes an allocator, Rust's name with `_in`:
 `to_uppercase_in(gpa)`, `to_lowercase_in`, `replace_in(a, b, gpa)`,
 `repeat_in(n, gpa)`, `to_string_in(gpa)`, `.collect_in(gpa)`; the Rust
 forms are errors naming them. Bytes become a `str` checked:
-`str::from_utf8(b)?`, `String::from_utf8(v)?` (a `Vec<u8>`),
+`str::from_utf8(b)?`, `String::from_utf8(v)?` (a `Vec<u8, Gpa>`),
 `String::from_buf(b)?`, `String::from_utf8_lossy_in(b, gpa)`; back:
 `s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`. (0.25.5) Bytes (any
 slice whose elements have `==`) have `starts_with(p)` and `ends_with(p)`
 too: `name.ends_with(".vl")` of a `[u8]`.
 
 ```vole
-fn initials(name: str, gpa: Gpa) -> String {
+fn initials(name: str, gpa: Gpa) -> String<Gpa> {
     var out = String::new_in(gpa);
     for w in name.split_whitespace() {
         out.push(w.chars().next().unwrap());
@@ -43,7 +43,7 @@ fn main(gpa: Gpa) -> i32 {
     let up = name.to_uppercase_in(gpa);
     let short = initials(name, gpa);
     println("{up} {short} {} {}", 2026 - born, name.contains('l'));
-    let parts: Vec<str> = "a,b,,c".split(',').collect_in(gpa);
+    let parts: Vec<str, Gpa> = "a,b,,c".split(',').collect_in(gpa);
     println("{parts:?} {}", parts.len());
     0
 }
@@ -70,7 +70,7 @@ What turns one form into another:
 |---|---|---|
 | a `str` (a literal, a static) | `[u8]` | nothing: a `str` goes where a `[u8]` does; `s.as_bytes()` says so |
 | `[u8]` | `str` | `str::from_utf8(b)?`: checked, a `Result` |
-| `Vec<T>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
+| `Vec<T, A>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
 | a format string | its text | `format_in("..", args, gpa)`, a `String<A>` (`.as_str()` views it; 0.26.3: a `Buf` before); `to_string_in(x, gpa)` for one value |
 | a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `Buf` or `String` |
 
@@ -91,7 +91,7 @@ static DAYS: [str; 3] = ["mon", "tue", "wed"];
 fn main(gpa: Gpa) {
     let bytes: [u8] = NAME; // a str goes where [u8] does
     let text: str = str::from_utf8(SHADER).unwrap(); // bytes to str: checked
-    var v: Vec<u8> = Vec::new_in(gpa);
+    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
     v.extend_from_slice(NAME.as_bytes());
     v.extend_from_slice(DAYS[1]);
     let msg = format_in("{NAME}: {} days, {} bytes", DAYS.len(), v.len(), gpa); // a String

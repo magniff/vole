@@ -32,122 +32,122 @@ import os
 import sys
 
 PRELUDE = """\
-struct Sh { names: Vec<i64> }
+struct Sh<A: Allocator> { names: Vec<i64, A> }
 
-struct Dev { gpa: Gpa, on: bool }
+struct Dev<A: Allocator> { gpa: A, on: bool }
 
-fn sh_of(gpa: Gpa, n: i64, k: i64) -> Sh {
-    var v: Vec<i64> = Vec::new_in(gpa);
+fn sh_of(gpa: Gpa, n: i64, k: i64) -> Sh<Gpa> {
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..k { v.push(n + i); }
     Sh { names: v }
 }
-fn str_of(gpa: Gpa, n: i64) -> String {
+fn str_of(gpa: Gpa, n: i64) -> String<Gpa> {
     var s = String::new_in(gpa);
     for _ in 0..n { s.push_str("x"); }
     s
 }
-fn dig(s: Sh) -> i64 { s.names.len() as i64 * 100 + s.names[s.names.len() - 1] }
-fn digs(s: String) -> i64 { s.len() as i64 }
+fn dig(s: Sh<Gpa>) -> i64 { s.names.len() as i64 * 100 + s.names[s.names.len() - 1] }
+fn digs(s: String<Gpa>) -> i64 { s.len() as i64 }
 
-impl Dev {
-    fn make(self, n: i64) -> Result<Sh, i64> {
+impl Dev<Gpa> {
+    fn make(self, n: i64) -> Result<Sh<Gpa>, i64> {
         if n < 0 { return Err(n); }
         Ok(sh_of(self.gpa, n, 2))
     }
-    fn makes(self, n: i64) -> Result<String, i64> {
+    fn makes(self, n: i64) -> Result<String<Gpa>, i64> {
         if n < 0 { return Err(n); }
         Ok(str_of(self.gpa, n))
     }
-    fn opt(self, n: i64) -> Option<Sh> { if n < 0 { None } else { Some(sh_of(self.gpa, n, 2)) } }
-    fn opts(self, n: i64) -> Option<String> { if n < 0 { None } else { Some(str_of(self.gpa, n)) } }
-    fn mk(self, n: i64) -> Sh { sh_of(self.gpa, n, 2) }
-    fn mks(self, n: i64) -> String { str_of(self.gpa, n) }
+    fn opt(self, n: i64) -> Option<Sh<Gpa>> { if n < 0 { None } else { Some(sh_of(self.gpa, n, 2)) } }
+    fn opts(self, n: i64) -> Option<String<Gpa>> { if n < 0 { None } else { Some(str_of(self.gpa, n)) } }
+    fn mk(self, n: i64) -> Sh<Gpa> { sh_of(self.gpa, n, 2) }
+    fn mks(self, n: i64) -> String<Gpa> { str_of(self.gpa, n) }
     fn num(self, n: i64) -> Result<i64, i64> { if n < 0 { Err(n) } else { Ok(n) } }
     // (nested: a value made from the argument, taken let or sink)
-    fn grow(self, s: Sh) -> Result<Sh, i64> {
+    fn grow(self, s: Sh<Gpa>) -> Result<Sh<Gpa>, i64> {
         var v = s.names.clone();
         v.push(s.names[s.names.len() - 1] + 1);
         Ok(Sh { names: v })
     }
-    fn grows(self, s: String) -> Result<String, i64> {
+    fn grows(self, s: String<Gpa>) -> Result<String<Gpa>, i64> {
         var t = s.clone();
         t.push_str("y");
         Ok(t)
     }
-    fn grow_k(self, s: sink Sh) -> Result<Sh, i64> {
+    fn grow_k(self, s: sink Sh<Gpa>) -> Result<Sh<Gpa>, i64> {
         s.names.push(s.names[s.names.len() - 1] + 1);
         Ok(s)
     }
-    fn grows_k(self, s: sink String) -> Result<String, i64> {
+    fn grows_k(self, s: sink String<Gpa>) -> Result<String<Gpa>, i64> {
         s.push_str("y");
         Ok(s)
     }
-    fn c_let(self, s: Sh, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
-    fn cs_let(self, s: String, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
-    fn c_sink(self, s: sink Sh, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
-    fn cs_sink(self, s: sink String, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
-    fn c_inout(self, acc: inout Sh, s: Sh, w: i64) -> Result<i64, i64> {
+    fn c_let(self, s: Sh<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
+    fn cs_let(self, s: String<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
+    fn c_sink(self, s: sink Sh<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
+    fn cs_sink(self, s: sink String<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
+    fn c_inout(self, acc: inout Sh<Gpa>, s: Sh<Gpa>, w: i64) -> Result<i64, i64> {
         acc.names.push(w);
         Ok(dig(s) + w)
     }
-    fn cs_inout(self, acc: inout Sh, s: String, w: i64) -> Result<i64, i64> {
+    fn cs_inout(self, acc: inout Sh<Gpa>, s: String<Gpa>, w: i64) -> Result<i64, i64> {
         acc.names.push(w);
         Ok(digs(s) + w)
     }
 }
 
-fn f_c_let(s: Sh, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
-fn f_cs_let(s: String, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
-fn f_c_sink(s: sink Sh, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
-fn f_cs_sink(s: sink String, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
-fn f_c_inout(acc: inout Sh, s: Sh, w: i64) -> Result<i64, i64> {
+fn f_c_let(s: Sh<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
+fn f_cs_let(s: String<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
+fn f_c_sink(s: sink Sh<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(s) + w) }
+fn f_cs_sink(s: sink String<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(s) + w) }
+fn f_c_inout(acc: inout Sh<Gpa>, s: Sh<Gpa>, w: i64) -> Result<i64, i64> {
     acc.names.push(w);
     Ok(dig(s) + w)
 }
-fn f_cs_inout(acc: inout Sh, s: String, w: i64) -> Result<i64, i64> {
+fn f_cs_inout(acc: inout Sh<Gpa>, s: String<Gpa>, w: i64) -> Result<i64, i64> {
     acc.names.push(w);
     Ok(digs(s) + w)
 }
 
 // (0.25.2.2) the same with a requires clause: a call of one is a block
 // that binds the arguments first (contracts::desugar::requires_call)
-impl Dev {
-    fn grow_r(self, s: Sh) -> Result<Sh, i64> requires s.names.len() > 0 else "empty" {
+impl Dev<Gpa> {
+    fn grow_r(self, s: Sh<Gpa>) -> Result<Sh<Gpa>, i64> requires s.names.len() > 0 else "empty" {
         var v = s.names.clone();
         v.push(s.names[s.names.len() - 1] + 1);
         Ok(Sh { names: v })
     }
-    fn grows_r(self, s: String) -> Result<String, i64> requires s.len() >= 0 else "len" {
+    fn grows_r(self, s: String<Gpa>) -> Result<String<Gpa>, i64> requires s.len() >= 0 else "len" {
         var t = s.clone();
         t.push_str("y");
         Ok(t)
     }
-    fn grow_k_r(self, s: sink Sh) -> Result<Sh, i64> requires self.on else "off" {
+    fn grow_k_r(self, s: sink Sh<Gpa>) -> Result<Sh<Gpa>, i64> requires self.on else "off" {
         s.names.push(s.names[s.names.len() - 1] + 1);
         Ok(s)
     }
-    fn grows_k_r(self, s: sink String) -> Result<String, i64> requires self.on else "off" {
+    fn grows_k_r(self, s: sink String<Gpa>) -> Result<String<Gpa>, i64> requires self.on else "off" {
         s.push_str("y");
         Ok(s)
     }
-    fn c_let_r(self, s: Sh, w: i64) -> Result<i64, i64> requires self.on else "off" {
+    fn c_let_r(self, s: Sh<Gpa>, w: i64) -> Result<i64, i64> requires self.on else "off" {
         Ok(dig(s) + w)
     }
-    fn cs_let_r(self, s: String, w: i64) -> Result<i64, i64> requires self.on else "off" {
+    fn cs_let_r(self, s: String<Gpa>, w: i64) -> Result<i64, i64> requires self.on else "off" {
         Ok(digs(s) + w)
     }
-    fn c_sink_r(self, s: sink Sh, w: i64) -> Result<i64, i64> requires self.on else "off" {
+    fn c_sink_r(self, s: sink Sh<Gpa>, w: i64) -> Result<i64, i64> requires self.on else "off" {
         Ok(dig(s) + w)
     }
-    fn cs_sink_r(self, s: sink String, w: i64) -> Result<i64, i64> requires self.on else "off" {
+    fn cs_sink_r(self, s: sink String<Gpa>, w: i64) -> Result<i64, i64> requires self.on else "off" {
         Ok(digs(s) + w)
     }
-    fn c_inout_r(self, acc: inout Sh, s: Sh, w: i64) -> Result<i64, i64>
+    fn c_inout_r(self, acc: inout Sh<Gpa>, s: Sh<Gpa>, w: i64) -> Result<i64, i64>
         requires self.on else "off" {
         acc.names.push(w);
         Ok(dig(s) + w)
     }
-    fn cs_inout_r(self, acc: inout Sh, s: String, w: i64) -> Result<i64, i64>
+    fn cs_inout_r(self, acc: inout Sh<Gpa>, s: String<Gpa>, w: i64) -> Result<i64, i64>
         requires self.on else "off" {
         acc.names.push(w);
         Ok(digs(s) + w)
@@ -156,38 +156,38 @@ impl Dev {
 
 // (0.25.2.2) a view of the argument, made by a function (as
 // gpu::RenderDesc::new) or written as a struct literal with a let field
-struct Desc { s: let Sh, n: i64 }
-struct DescS { s: let String, n: i64 }
-fn desc_of(s: Sh, n: i64) -> Desc { Desc { s: s, n: n } }
-fn descs_of(s: String, n: i64) -> DescS { DescS { s: s, n: n } }
-impl Dev {
-    fn c_view(self, d: Desc, w: i64) -> Result<i64, i64> { Ok(dig(d.s) + d.n + w) }
-    fn cs_view(self, d: DescS, w: i64) -> Result<i64, i64> { Ok(digs(d.s) + d.n + w) }
-    fn c_view_r(self, d: Desc, w: i64) -> Result<i64, i64> requires d.n >= 0 else "n" {
+struct Desc<A: Allocator> { s: let Sh<A>, n: i64 }
+struct DescS<A: Allocator> { s: let String<A>, n: i64 }
+fn desc_of(s: Sh<Gpa>, n: i64) -> Desc<Gpa> { Desc { s: s, n: n } }
+fn descs_of(s: String<Gpa>, n: i64) -> DescS<Gpa> { DescS { s: s, n: n } }
+impl Dev<Gpa> {
+    fn c_view(self, d: Desc<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(d.s) + d.n + w) }
+    fn cs_view(self, d: DescS<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(d.s) + d.n + w) }
+    fn c_view_r(self, d: Desc<Gpa>, w: i64) -> Result<i64, i64> requires d.n >= 0 else "n" {
         Ok(dig(d.s) + d.n + w)
     }
-    fn cs_view_r(self, d: DescS, w: i64) -> Result<i64, i64> requires d.n >= 0 else "n" {
+    fn cs_view_r(self, d: DescS<Gpa>, w: i64) -> Result<i64, i64> requires d.n >= 0 else "n" {
         Ok(digs(d.s) + d.n + w)
     }
 }
-fn f_c_view(d: Desc, w: i64) -> Result<i64, i64> { Ok(dig(d.s) + d.n + w) }
-fn f_cs_view(d: DescS, w: i64) -> Result<i64, i64> { Ok(digs(d.s) + d.n + w) }
-fn f_c_view_r(d: Desc, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(d.s) + d.n + w) }
-fn f_cs_view_r(d: DescS, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
+fn f_c_view(d: Desc<Gpa>, w: i64) -> Result<i64, i64> { Ok(dig(d.s) + d.n + w) }
+fn f_cs_view(d: DescS<Gpa>, w: i64) -> Result<i64, i64> { Ok(digs(d.s) + d.n + w) }
+fn f_c_view_r(d: Desc<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(d.s) + d.n + w) }
+fn f_cs_view_r(d: DescS<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
     Ok(digs(d.s) + d.n + w)
 }
 
-fn f_c_let_r(s: Sh, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(s) + w) }
-fn f_cs_let_r(s: String, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(digs(s) + w) }
-fn f_c_sink_r(s: sink Sh, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(s) + w) }
-fn f_cs_sink_r(s: sink String, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
+fn f_c_let_r(s: Sh<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(s) + w) }
+fn f_cs_let_r(s: String<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(digs(s) + w) }
+fn f_c_sink_r(s: sink Sh<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" { Ok(dig(s) + w) }
+fn f_cs_sink_r(s: sink String<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
     Ok(digs(s) + w)
 }
-fn f_c_inout_r(acc: inout Sh, s: Sh, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
+fn f_c_inout_r(acc: inout Sh<Gpa>, s: Sh<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
     acc.names.push(w);
     Ok(dig(s) + w)
 }
-fn f_cs_inout_r(acc: inout Sh, s: String, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
+fn f_cs_inout_r(acc: inout Sh<Gpa>, s: String<Gpa>, w: i64) -> Result<i64, i64> requires w >= 0 else "w" {
     acc.names.push(w);
     Ok(digs(s) + w)
 }
@@ -206,10 +206,10 @@ fn via<X, F: FnMut(sink X, i64) -> Result<i64, i64>>(f: sink F, s: sink X, w: i6
 # A value is modelled as its digest: Sh [n, n+1] is 200 + n + 1; a String
 # of n x's is n; grow adds an element (one more, the last plus one) or a "y".
 TYPES = {
-    "sh": dict(ty="Sh", dig_fn="dig", desc="Desc", desc_of="desc_of", make="make", opt="opt", mk="mk", grow="grow", grow_k="grow_k", c="c",
+    "sh": dict(ty="Sh<Gpa>", dig_fn="dig", desc="Desc", desc_of="desc_of", make="make", opt="opt", mk="mk", grow="grow", grow_k="grow_k", c="c",
                val=lambda n: (2, n + 1), dig=lambda v: v[0] * 100 + v[1],
                grown=lambda v: (v[0] + 1, v[1] + 1)),
-    "str": dict(ty="String", dig_fn="digs", desc="DescS", desc_of="descs_of", make="makes", opt="opts", mk="mks", grow="grows", grow_k="grows_k", c="cs",
+    "str": dict(ty="String<Gpa>", dig_fn="digs", desc="DescS", desc_of="descs_of", make="makes", opt="opts", mk="mks", grow="grows", grow_k="grows_k", c="cs",
                 val=lambda n: n, dig=lambda v: v, grown=lambda v: v + 1),
 }
 
@@ -355,7 +355,7 @@ def program(cs, header, extra=""):
     calls = []
     for name, body, _ in cs:
         ind = "\n".join("    " + l for l in body.split("\n"))
-        src += f"\nfn case_{name}(dev: Dev) -> Result<i64, i64> {{\n{ind}\n}}\n"
+        src += f"\nfn case_{name}(dev: Dev<Gpa>) -> Result<i64, i64> {{\n{ind}\n}}\n"
         calls.append(f"    show(\"{name}\", case_{name}(dev));")
     src += """
 fn show(n: str, r: Result<i64, i64>) {

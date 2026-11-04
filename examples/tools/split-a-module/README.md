@@ -142,15 +142,15 @@ $ volec query items shop
 7	mod	pub mod receipts
 8	mod	mod pricing
 16	struct	pub struct Product
-24	struct	pub struct Store
-30	fn	pub fn new_store(gpa: Gpa) -> Store
-34	fn	pub fn add_product(st: inout Store, sku: i64, name: [u8], price: i64, stock: i64)
-39	fn	pub fn find_sku(st: Store, sku: i64) -> Option<i64>
-43	fn	pub fn product(st: Store, sku: i64) -> Option<Product>
-50	fn	pub fn in_stock(st: Store, sku: i64) -> i64
-58	fn	pub fn restock(st: inout Store, sku: i64, n: i64) -> bool
-69	fn	fn take_stock(st: inout Store, sku: i64, n: i64) -> i64
-81	fn	pub fn print_stock(st: Store, gpa: Gpa)
+24	struct	pub struct Store<A: Allocator>
+30	fn	pub fn new_store(gpa: Gpa) -> Store<Gpa>
+34	fn	pub fn add_product(st: inout Store<Gpa>, sku: i64, name: [u8], price: i64, stock: i64)
+39	fn	pub fn find_sku(st: Store<Gpa>, sku: i64) -> Option<i64>
+43	fn	pub fn product(st: Store<Gpa>, sku: i64) -> Option<Product>
+50	fn	pub fn in_stock(st: Store<Gpa>, sku: i64) -> i64
+58	fn	pub fn restock(st: inout Store<Gpa>, sku: i64, n: i64) -> bool
+69	fn	fn take_stock(st: inout Store<Gpa>, sku: i64, n: i64) -> i64
+81	fn	pub fn print_stock(st: Store<Gpa>, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.vl` imports from where
@@ -159,7 +159,7 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index 9c9753d..f3e61fc 100644
+index 2b0dcc9..6f15ead 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -4,7 +4,10 @@ mod shop;
@@ -173,7 +173,7 @@ index 9c9753d..f3e61fc 100644
 +use shop::receipts::money;
  
  fn main(gpa: Gpa) -> i32 {
-     var st: Store = new_store(gpa);
+     var st: Store<Gpa> = new_store(gpa);
 ```
 
 (`--reexport` does the opposite: it leaves the code outside as it is,

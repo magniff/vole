@@ -140,7 +140,7 @@ fn sum(xs: [i32]) -> i32 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i32> = Vec::new_in(gpa); // freed when main ends: no free()
+    var v: Vec<i32, Gpa> = Vec::new_in(gpa); // freed when main ends: no free()
     v.push(2147483647);
     v.push(1);
     println("{} {}", sum(v.as_slice()), v.len());
@@ -205,7 +205,7 @@ fn parse(s: str) -> Result<i64, str> {
 }
 
 fn sum_of_squares(words: [str], gpa: Gpa) -> Result<i64, str> {
-    var nums: Vec<i64> = Vec::new_in(gpa);
+    var nums: Vec<i64, Gpa> = Vec::new_in(gpa);
     for w in words {
         nums.push(parse(w)?); // Go: if err != nil { return 0, err }
     }
@@ -273,7 +273,7 @@ using `a` afterwards is an error:
 
 ```vole
 fn main(gpa: Gpa) {
-    var a: Vec<i64> = Vec::new_in(gpa);
+    var a: Vec<i64, Gpa> = Vec::new_in(gpa);
     a.push(1);
     var b = a;
     b.push(2);
@@ -293,7 +293,7 @@ the two lists are independent:
 
 ```vole
 fn main(gpa: Gpa) {
-    var a: Vec<i64> = Vec::new_in(gpa);
+    var a: Vec<i64, Gpa> = Vec::new_in(gpa);
     a.push(1);
     var b = a.clone();
     b.push(2);

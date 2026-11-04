@@ -25,7 +25,7 @@ fn main(gpa: Gpa) {
 
 - four spaces a level; 100 columns, a longer line broken at its loosest
   point (after `,`, before `else`, `||`, `&&`, a comparison, a chain's `.`);
-- spaces around binary operators and after `,` `:`; `Vec<i64>` tight;
+- spaces around binary operators and after `,` `:`; `Vec<i64, Gpa>` tight;
 - at most one blank line; one around items of several lines; none
   after `{` or before `}`;
 - comments kept as written; lines are never joined, only broken;

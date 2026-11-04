@@ -47,7 +47,7 @@ fn mid(a: i64, b: i64) -> i64 { a + (b - a) / 2 }
 fn sum(s: [i64]) -> i64 { s.iter().sum() }
 
 #[effects(alloc(Gpa), panic)]             // at most these
-fn grow(v: inout Vec<i64>) { v.push(1); }
+fn grow(v: inout Vec<i64, Gpa>) { v.push(1); }
 
 fn apply<F: Fn(i64) -> i64 + effects(panic)>(f: F, x: i64) -> i64 { f(x) }
 

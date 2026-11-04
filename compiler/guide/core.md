@@ -32,26 +32,26 @@ impl P {
     fn get(self) -> i64 { self.x }         // self (let): reads it
 }
 
-fn total(v: Vec<i64>) -> i64 {         // let (the default): read-only, no copy
+fn total(v: Vec<i64, Gpa>) -> i64 { // let (default): read-only, no copy
     v.iter().sum()
 }
 
-fn grow(v: inout Vec<i64>, x: i64) {   // inout: the caller writes grow(&v, x)
+fn grow(v: inout Vec<i64, Gpa>, x: i64) { // inout: the caller writes grow(&v, x)
     v.push(x);
 }
 
-fn keep(all: inout Vec<Vec<i64>>, v: sink Vec<i64>) {   // sink: keep takes v
+fn keep(all: inout Vec<Vec<i64, Gpa>, Gpa>, v: sink Vec<i64, Gpa>) { // sink: keep takes v
     all.push(v);
 }
 
-fn first(s: [u8]) -> u8 { s[0] }       // text is [u8]; 'a' is a u8; no char
+fn first(s: [u8]) -> u8 { s[0] } // text is [u8]; 'a' is a u8; no char
 
-fn odds(n: i64, gpa: Gpa) -> Vec<i64> {     // allocating takes an allocator
+fn odds(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // allocating takes an allocator
     (0..n).filter(|i| i % 2 == 1).collect_in(gpa)
 }
 
-fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit status
-    var v: Vec<i64> = Vec::new_in(gpa);    // var: mutable; let: not
+fn main(gpa: Gpa) -> i32 { // gpa: the program's allocator; 0 = exit status
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // var: mutable; let: not
     v.push(5);
     grow(&v, 2);                       // & marks the argument grow may change
     v[0] += 10;                        // checked (v[1..2] a slice)
@@ -59,7 +59,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     var p = P { x: 1 };
     p.bump();                          // a receiver needs no &; p must be var
     println("{} {v:?} {}", p.get(), total(v)); // f-strings; total(v) only reads
-    var all: Vec<Vec<i64>> = Vec::new_in(gpa);
+    var all: Vec<Vec<i64, Gpa>, Gpa> = Vec::new_in(gpa);
     keep(&all, v);                     // v moved into keep: dead from here
     let s = "hi";
     println(s.len());                  // an i64 (slices, Vec, Buf, HashMap)
@@ -69,7 +69,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     b.push_int(o.len() as i64);
     println(b.as_slice());
     if s == "hi" && !is_digit(first(s)) { println(first(s)); }   // compared, not matched
-    var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var m: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     let z = 0;
     println("{} {} {}", ~0u8, 250u8.wrapping_add(7), m.get("k").unwrap()); // ~x; x / 0 panics
@@ -112,14 +112,14 @@ reaches its sibling `lexer`.
 ```vole
 struct Item { name: [u8], qty: i64 }
 
-fn add(v: inout Vec<Item>, it: Item) { v.push(it); }   // called as add(&items, ..)
+fn add(v: inout Vec<Item, Gpa>, it: Item) { v.push(it); } // called as add(&items, ..)
 
 fn main(gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Vec<u8>, IoError>
+    let input = read_stdin_in(gpa).unwrap();   // all of stdin: Result<Vec<u8, Gpa>, IoError>
     var sc = Scanner::new(input.as_slice());
     let n = sc.next_int().unwrap();            // Result<i64, ScanError>
-    var items: Vec<Item> = Vec::new_in(gpa);
-    var seen: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var items: Vec<Item, Gpa> = Vec::new_in(gpa);
+    var seen: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     for _ in 0..n {
         let name = sc.next_token().unwrap();   // Option<[u8]>: a slice of input
         let qty = sc.next_int().unwrap_or(0);
@@ -175,12 +175,12 @@ one name with its comment: `volec guide --find split_in`.
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `volec fix --only unsafe` adds them |
 | `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
-| `expected 'String', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: str` takes literals and a String's `&s` |
-| `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
+| `expected 'String<Gpa>', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: str` takes literals and a String's `&s` |
+| `'Vec::new' allocates from nothing` | `Vec::new_in(gpa)`: main's `gpa`, passed down |
 
 Every error has a `help:`; `volec guide errors` has more.
 
-Tests and checks (0.18): `#[test] fn` and `#[property] fn p(v: Vec<i64>)`
+Tests and checks (0.18): `#[test] fn` and `#[property] fn p(x: i64)`
 (inputs generated, shrunk) sit next to the code and `volec test` runs
 them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
 are checked at run time, a failure one line `FILE:L:C: message` (`guide

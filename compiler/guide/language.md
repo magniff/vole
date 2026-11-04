@@ -51,7 +51,7 @@ on the command line make one program; `mod name;` loads `name.vl`.
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `volec query effects f` (0.16, `guide effects`) |
-| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
+| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64, Gpa>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, supertraits; `where` (0.26.2) |
@@ -142,9 +142,9 @@ The last expression of a block, without `;`, is its value; `if`, `match`,
 ## Parameters: let, inout, sink
 
 ```vole
-struct Account { balance: i64, log: Vec<i64> }
+struct Account<A: Allocator> { balance: i64, log: Vec<i64, A> }
 
-fn transfer(from: inout Account, to: inout Account, amount: i64) -> bool {
+fn transfer(from: inout Account<Gpa>, to: inout Account<Gpa>, amount: i64) -> bool {
     if from.balance < amount { return false; }
     from.balance -= amount;
     to.balance += amount;
@@ -153,9 +153,9 @@ fn transfer(from: inout Account, to: inout Account, amount: i64) -> bool {
     true
 }
 
-fn report(a: Account, out: inout i64) { out += a.balance; }   // an access is its value
+fn report(a: Account<Gpa>, out: inout i64) { out += a.balance; } // an access is its value
 
-fn keep(all: inout Vec<Account>, a: sink Account) { all.push(a); }
+fn keep(all: inout Vec<Account<Gpa>, Gpa>, a: sink Account<Gpa>) { all.push(a); }
 
 fn main(gpa: Gpa) {
     var a = Account { balance: 100, log: Vec::new_in(gpa) };
@@ -164,7 +164,7 @@ fn main(gpa: Gpa) {
     var sum = 0;
     report(a, &sum);
     report(b, &sum);
-    var all: Vec<Account> = Vec::new_in(gpa);
+    var all: Vec<Account<Gpa>, Gpa> = Vec::new_in(gpa);
     keep(&all, a);                        // a moves: dead from here
     println("{sum} {} {}", all[0].log.len(), b.balance);
 }
@@ -326,12 +326,12 @@ array, a `Vec` or memory. A `[T]` is read-only; `inout [T]`
 ## std: Vec, HashMap, Buf; allocation
 
 ```vole
-fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
+fn evens(n: i64, gpa: Gpa) -> Vec<i64, Gpa> { // it allocates: it takes an allocator
     (0..n).map(|i| i * 2).collect_in(gpa)
 }
 
 fn main(gpa: Gpa) -> i32 {                 // the program's allocator
-    var v: Vec<i64> = Vec::new_in(gpa);      // dropped (freed) when main returns
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // dropped (freed) when main returns
     v.push(30);
     v.push(10);
     v.push(20);
@@ -343,7 +343,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     std::print_int(last.unwrap_or(-1));
     println("");
 
-    var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var m: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     m.insert("a", 1);
     m.insert("b", 2);
     match m.get("a") { Some(x) => std::print_int(x), None => print("none") }
@@ -383,7 +383,7 @@ diverge unsafe`): `volec query effects f --why io` shows where;
 
 `Vec`, `Buf` and `HashMap` own their contents: `let w = v;` or passing
 one to a `sink` parameter moves it (`.clone()` copies). Pass `v` to a
-`v: Vec<T>` (let) parameter to read it, `&v` to a `v: inout Vec<T>` one
+`v: Vec<T, A>` (let) parameter to read it, `&v` to a `v: inout Vec<T, A>` one
 to let a function push. A slice from `as_slice` views the vector: using it after the
 vector grew or was dropped is an error (`guide views`). std's API,
 made from its source in this compiler, a
@@ -400,15 +400,15 @@ with a MinHeap of (distance, node) pairs:
 // Dijkstra: the shortest distances from node 0.
 fn main(gpa: Gpa) -> i32 {
     let n = 5;
-    var adj: Vec<Vec<(i64, i64)>> = Vec::new_in(gpa);       // adj[u]: (to, weight)
+    var adj: Vec<Vec<(i64, i64), Gpa>, Gpa> = Vec::new_in(gpa); // adj[u]: (to, weight)
     for _ in 0..n {
         adj.push(Vec::new_in(gpa));
     }
     for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
         adj[u].push((v, w));
     }
-    var dist: Vec<i64> = Vec::filled_in(n as usize, i64::MAX, gpa);
-    var heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);      // (distance, node)
+    var dist: Vec<i64, Gpa> = Vec::filled_in(n as usize, i64::MAX, gpa);
+    var heap: MinHeap<(i64, i64), Gpa> = MinHeap::new_in(gpa); // (distance, node)
     dist[0] = 0;
     heap.push((0, 0));
     while let Some((d, u)) = heap.pop() {      // the nearest first
@@ -433,7 +433,7 @@ fn main(gpa: Gpa) -> i32 {
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Vec<u8>, IoError>`), `read_line(&buf)` (the next line, without its
+`Result<Vec<u8, Gpa>, IoError>`), `read_line(&buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
@@ -442,7 +442,7 @@ Option means absent, Result failed). Files go through C (`fopen`):
 import "string.h" as c;
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Vec<u8>
+    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Vec<u8, Gpa>
     var sc = Scanner::new(input.as_slice());
     var total = 0;
     while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
@@ -494,7 +494,7 @@ and linking: `guide c-interop`.
 
 | error (short form) | fix |
 |---|---|
-| `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T>` |
+| `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T, A>` |
 | `expected type, got '&'`; `expected identifier, got '&'` | `str` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
 | `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `volec fix --suggested` |
 | `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
@@ -505,7 +505,7 @@ and linking: `guide c-interop`.
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println("{}", x)` |
 | `cannot assign to immutable variable 'x'` | `var x` |
-| `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
+| `cannot index type 'HashMap<K, V, A>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
 | `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc016` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |

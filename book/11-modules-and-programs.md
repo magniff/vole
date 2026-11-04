@@ -26,7 +26,7 @@ mod report;
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = String::from_utf8(input).unwrap();
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     count::add_words(&counts, text, gpa);
     let top = report::top(counts, 5, gpa);
     report::print_table(top);
@@ -62,7 +62,7 @@ fn trim_punct(word: str) -> str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -78,8 +78,9 @@ And `report.vl`, the table:
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64),
+    Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -88,7 +89,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
     pairs
 }
 
-pub fn print_table(rows: [(String, i64)]) {
+pub fn print_table(rows: [(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -192,14 +193,14 @@ off:
 mod count;
 
 fn main(gpa: Gpa) {
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     count::add_words(&counts, "the cat and the hat", gpa);
     println("{} different words", counts.len());
 }
 ```
 
 ```vole count.vl
-fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = word.to_lowercase_in(gpa);
         counts.get_or_insert(w, 0)[0] += 1;
@@ -381,8 +382,8 @@ use std::fs;
 use std::io;
 
 fn run(gpa: Gpa) -> io::Result<()> {
-    let args: Vec<str> = env::args().collect_in(gpa);
-    var counts: HashMap<String, i64> = HashMap::new_in(gpa);
+    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
+    var counts: HashMap<String<Gpa>, i64, Gpa> = HashMap::new_in(gpa);
     for path in args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
         count::add_words(&counts, text, gpa);
@@ -434,7 +435,7 @@ fn trim_punct(word: str) -> str {
 }
 
 // Adds the words of text to counts, lowercased.
-pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+pub fn add_words(counts: inout HashMap<String<Gpa>, i64, Gpa>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
         let w = trim_punct(word);
         if w.is_empty() {
@@ -448,8 +449,8 @@ pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 ```vole report.vl
 // The table of the most common words.
 
-pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64)> {
-    var pairs: Vec<(String, i64)> = Vec::new_in(gpa);
+pub fn top(counts: HashMap<String<Gpa>, i64, Gpa>, n: usize, gpa: Gpa) -> Vec<(String<Gpa>, i64), Gpa> {
+    var pairs: Vec<(String<Gpa>, i64), Gpa> = Vec::new_in(gpa);
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
@@ -458,7 +459,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
     pairs
 }
 
-pub fn print_table(rows: [(String, i64)]) {
+pub fn print_table(rows: [(String<Gpa>, i64)]) {
     for row in rows {
         println("{:<12}{:>5}", row.0, row.1);
     }
@@ -486,7 +487,7 @@ environment.
 ### The command line
 
 ```vole skip
-    let args: Vec<str> = env::args().collect_in(gpa);
+    let args: Vec<str, Gpa> = env::args().collect_in(gpa);
 ```
 
 `std::env` is the module for what a program gets from whoever started
@@ -630,7 +631,7 @@ use std::fs;
 use std::io;
 
 fn main(gpa: Gpa) -> io::Result<()> {
-    var names: Vec<String> = Vec::new_in(gpa);
+    var names: Vec<String<Gpa>, Gpa> = Vec::new_in(gpa);
     for entry in fs::read_dir(".")? {
         let entry = entry?;
         let name = entry.file_name() as str;

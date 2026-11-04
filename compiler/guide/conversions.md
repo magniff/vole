@@ -21,7 +21,7 @@ elements. It is lossless, so it is implicit; nothing else is:
 - it never converts int to float, `bool` to int, signed to unsigned, or
   to a narrower type: write `x as T`;
 - it applies to a value, never inside another type: `*i32`, `[i32]`,
-  `Vec<i32>`, `fn(i32)` stay what they are.
+  `Vec<i32, Gpa>`, `fn(i32)` stay what they are.
 
 Where two integer types meet without an expected type (the operands of
 `+` or `<`, the branches of `if` and `match`, two arguments for one
@@ -187,7 +187,7 @@ with an error enum means failure. std's input (0.15):
 | function | returns | at the end, on failure |
 |---|---|---|
 | `read_line(&buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
-| `read_stdin_in(gpa)` | `Result<Vec<u8>, IoError>` | `Err(IoError::Read)` |
+| `read_stdin_in(gpa)` | `Result<Vec<u8, Gpa>, IoError>` | `Err(IoError::Read)` |
 | `parse_int(s)` | `Result<i64, ParseIntError>` | `Empty`, `InvalidDigit(at)` (the byte's index), `Overflow` |
 | `sc.next_int()` | `Result<i64, ScanError>` | `ScanError::End`, `ScanError::Parse(e)` |
 | `sc.next_token()`, `sc.next_line()` | `Option<[u8]>` | `None` at the end |
@@ -228,6 +228,6 @@ Code written for 0.14's API (Option and bool results) is moved by
 `parse_int(s).ok()`, `sc.next_int()` `sc.next_int().ok()`,
 `read_line(b)` `read_line(b).unwrap_or(false)`, `read_stdin()`
 `read_stdin().unwrap()`. All four mean what they meant, but a read
-error, which `read_stdin().unwrap()` now reports (exit 101). (0.16:
-then `fix --only alloc016` makes allocation explicit: `guide
+error, which `read_stdin().unwrap()` now reports (exit 101). (Allocation
+is explicit since 0.16, and a capability since 0.26.3: `guide
 allocators`.)

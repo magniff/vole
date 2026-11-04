@@ -340,7 +340,7 @@ you a result:
 
 ```vole
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 1..7 {
         v.push(i);
     }
@@ -348,7 +348,7 @@ fn main(gpa: Gpa) {
     let big = v.iter().filter(|x| x > 2).count();
     println("{even_squares} {big} {:?}", v.iter().max());
 
-    let tenfold: Vec<i64> = v.iter().map(|x| x * 10).collect_in(gpa);
+    let tenfold: Vec<i64, Gpa> = v.iter().map(|x| x * 10).collect_in(gpa);
     println("{tenfold:?}");
 }
 ```
@@ -477,7 +477,7 @@ fn parse(line: str) -> Option<Request> {
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = str::from_utf8(input.as_slice()).unwrap();
-    var reqs: Vec<Request> = Vec::new_in(gpa);
+    var reqs: Vec<Request, Gpa> = Vec::new_in(gpa);
     for line in text.lines() {
         match parse(line) {
             Some(r) => reqs.push(r),
@@ -489,11 +489,11 @@ fn main(gpa: Gpa) {
     let failed = reqs.iter().filter(|r| r.status >= 400).count();
     println("{} requests, {failed} failed, {ok_bytes} bytes served", reqs.len());
 
-    var by_status: HashMap<i64, i64> = HashMap::new_in(gpa);
+    var by_status: HashMap<i64, i64, Gpa> = HashMap::new_in(gpa);
     reqs.iter().for_each(|r| {
         by_status.get_or_insert(r.status, 0)[0] += 1;
     });
-    var codes: Vec<i64> = by_status.keys().collect_in(gpa);
+    var codes: Vec<i64, Gpa> = by_status.keys().collect_in(gpa);
     codes.sort();
     for code in codes {
         println("  {code}: {}", by_status.get(code).unwrap());
@@ -504,7 +504,11 @@ fn main(gpa: Gpa) {
         None => println("no requests"),
     }
 
-    var broken: Vec<str> = reqs.iter().filter(|r| r.status >= 400).map(|r| r.path).collect_in(gpa);
+    var broken: Vec<str, Gpa> = reqs
+        .iter()
+        .filter(|r| r.status >= 400)
+        .map(|r| r.path)
+        .collect_in(gpa);
     broken.sort_by(|a, b| a.cmp(b));
     println("failed paths: {broken:?}");
 }
@@ -588,7 +592,7 @@ fn main(gpa: Gpa) {
     println("");
     let even_sum = fibonacci().take(30).filter(|n| n % 2 == 0).sum();
     let first_big = fibonacci().position(|n| n > 1000);
-    let five: Vec<i64> = fibonacci().take(5).collect_in(gpa);
+    let five: Vec<i64, Gpa> = fibonacci().take(5).collect_in(gpa);
     println("{even_sum} {first_big:?} {five:?}");
 }
 ```
@@ -623,7 +627,7 @@ optimizations on, and time it:
 
 ```vole sum_chain.vl
 fn main(gpa: Gpa) {
-    var xs: Vec<i64> = Vec::new_in(gpa);
+    var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..50000000 {
         xs.push(i % 1000);
     }
@@ -645,7 +649,7 @@ And here is the same work written as a loop:
 
 ```vole sum_loop.vl
 fn main(gpa: Gpa) {
-    var xs: Vec<i64> = Vec::new_in(gpa);
+    var xs: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..50000000 {
         xs.push(i % 1000);
     }

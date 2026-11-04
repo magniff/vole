@@ -68,12 +68,12 @@ Structs and enums can take type parameters too. `Option<T>` and
 `Vec<T>` are written this way in std. Here is a stack of anything:
 
 ```vole
-struct Stack<T> {
-    items: Vec<T>,
+struct Stack<T, A: Allocator> {
+    items: Vec<T, A>,
 }
 
-impl<T> Stack<T> {
-    fn new(gpa: Gpa) -> Stack<T> {
+impl<T, A: Allocator> Stack<T, A> {
+    fn new(gpa: Gpa) -> Stack<T, A> {
         Stack { items: Vec::new_in(gpa) }
     }
 
@@ -90,7 +90,7 @@ impl<T> Stack<T> {
     }
 }
 
-impl Stack<i64> {
+impl Stack<i64, Gpa> {
     fn sum(self) -> i64 {
         var t = 0;
         for x in self.items {
@@ -101,12 +101,12 @@ impl Stack<i64> {
 }
 
 fn main(gpa: Gpa) {
-    var numbers: Stack<i64> = Stack::new(gpa);
+    var numbers: Stack<i64, Gpa> = Stack::new(gpa);
     numbers.push(4);
     numbers.push(9);
     println("{} {} {:?}", numbers.len(), numbers.sum(), numbers.pop());
 
-    var names: Stack<str> = Stack::new(gpa);
+    var names: Stack<str, Gpa> = Stack::new(gpa);
     names.push("ada");
     println("{} {:?}", names.len(), names.pop());
 }
@@ -459,14 +459,14 @@ struct Version {
 }
 
 fn main(gpa: Gpa) {
-    var versions: Vec<Version> = Vec::new_in(gpa);
+    var versions: Vec<Version, Gpa> = Vec::new_in(gpa);
     versions.push(Version { major: 1, minor: 10 });
     versions.push(Version { major: 0, minor: 9 });
     versions.push(Version { major: 1, minor: 2 });
     versions.sort();
     println("{versions:?}");
 
-    var notes: HashMap<Version, str> = HashMap::new_in(gpa);
+    var notes: HashMap<Version, str, Gpa> = HashMap::new_in(gpa);
     let current = Version { major: 1, minor: 10 };
     notes.insert(current, "current");
     println("{:?}", notes.get(current));
@@ -669,7 +669,7 @@ fn main(gpa: Gpa) {
     let c = Circle { center: origin + Vec2 { x: 1.0, y: 1.0 }, radius: 2.0 };
     describe(c);
 
-    var shapes: Vec<AnyShape> = Vec::new_in(gpa);
+    var shapes: Vec<AnyShape, Gpa> = Vec::new_in(gpa);
     shapes.push(AnyShape::Circle(c));
     shapes.push(AnyShape::Rect(Rect { corner: origin, size: Vec2 { x: 3.0, y: 4.0 } }));
     shapes.push(AnyShape::Circle(Circle { center: origin, radius: 0.5 }));

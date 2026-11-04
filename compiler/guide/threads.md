@@ -73,7 +73,7 @@ fn sum(s: [i64]) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..1000 { v.push(i); }
     let s = v.as_slice();
     let total = thread::scope(|sc| {
