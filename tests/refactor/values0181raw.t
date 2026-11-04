@@ -35,6 +35,8 @@ note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take 
 $ fix --only unsafe
 fixed 1 unsafe block	main.vl	+1 -1 lines
 $ main.vl -o prog
+main.vl:41:31: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+main.vl:42:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 ok: built prog
 % ./prog
 true true 122 true true 5 1 <bc>

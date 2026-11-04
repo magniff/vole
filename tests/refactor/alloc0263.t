@@ -10,6 +10,7 @@
 ## `Stack<T>` inside it, written with the impl's `A`; a turbofish, `Vec::<i64>`.
 ## Then the codes' explanations (alloc.safe_impl, alloc.static, alloc.field, alloc.last: their tests/run/err_alloc_* cases).
 $ check
+main.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:3:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:7:12: error[alloc.default] 'HashMap' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:7:25: error[alloc.default] 'Buf' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
@@ -63,6 +64,7 @@ main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
 note fix.left: 2 errors left (above)
 $ check
+main.vl:7:25: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: this item is generic over the allocator 'A': write it, or Gpa (what the default meant) | try: volec fix --only alloc main.vl
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
 [exit 1]

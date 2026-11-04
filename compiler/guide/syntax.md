@@ -75,7 +75,7 @@ usage: tool [-v] FILE
 ## Items
 
 ```vole
-use std::Buf;                       // imports first, by convention
+use std::HashMap;                   // imports first, by convention
 import "stdio.h" as c;              // a C header
 
 const LIMIT: i64 = 100;             // a constant expression
@@ -96,7 +96,7 @@ fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(n: sink i64) -> i64 { n += 1; n }  // sink: the callee's own, mutable
 fn twice(v: inout Vec<i64, Gpa>) { v.push(v.len() as i64); } // inout: called as twice(&v)
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
-fn hi(out: inout Buf<Gpa>) { out.push_str("hi"); } // Buf: the `use` above
+fn hi(m: inout HashMap<i64, i64, Gpa>) { m.insert(1, 2); } // the `use` above
 
 impl Point {
     fn len2(self) -> i64 { self.x * self.x + self.y * self.y }   // self: let

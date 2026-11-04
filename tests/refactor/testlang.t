@@ -63,12 +63,14 @@ DIFF gaps: -O0 and -O2 differ at stdout line 1: '5 12345' against '5 12346'. A c
 ## (and wildcard imports are not allowed)
 % printf 'use super::*;\n' > extra.vl && cat checks.vl >> extra.vl && mv extra.vl checks.vl
 $ check
+checks.vl:22:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
 checks.vl:1:1: error[import.wildcard] wildcard imports are not allowed: 'use super::*;' is not needed | help: a #[cfg(test)] module sees its parent's items, private ones too, without an import | try: volec edit patch checks.vl:1 --old 'use super::*;' --new '' main.vl
 [exit 1]
 $ edit patch checks.vl:1 --old 'use super::*;' --new ''
 patched checks.vl:1	checks.vl	+0 -1 lines
 $ check
-ok: 0 errors in main.vl
+checks.vl:21:13: warning[item.deprecated] use of deprecated struct 'Buf': use String<A> for text, Vec<u8, A> for bytes (volec fix --only buf) | help: marked #[deprecated] at <std>:518:5
+ok: 0 errors, 1 warning in main.vl
 ## a #[test] takes nothing or `gpa: Gpa`
 % printf '#[test]\nfn takes(n: i64) {\n}\n' > checks.vl
 $ test
