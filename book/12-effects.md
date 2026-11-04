@@ -64,7 +64,7 @@ fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
 
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_buf(input).unwrap();
+    let text = String::from_utf8(input).unwrap();
     var xs: Vec<f64> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
@@ -196,7 +196,7 @@ fn histogram(xs: [f64], lo: f64, hi: f64, buckets: inout [i64]) {
 
 fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
-    let text = String::from_buf(input).unwrap();
+    let text = String::from_utf8(input).unwrap();
     var xs: Vec<f64> = Vec::new_in(gpa);
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());

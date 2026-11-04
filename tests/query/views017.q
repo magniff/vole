@@ -20,12 +20,12 @@ Vec<JobBuffer, ScopedArena>::get	views(*self) parametric
 Vec<JobTexture, ScopedArena>::get	views(*self) parametric
 Vec<Vec<u32, ScopedArena>, ScopedArena>::get	views(*self) parametric
 Vec<Tok>::as_slice	views(self) declared
+Vec<u8>::as_slice	views(self) declared
 Vec<u64>::as_slice	views(self) declared
 Vec<[i64; 2]>::as_slice	views(self) declared
 Vec<Binding>::as_slice	views(self) declared
 Vec<VertexInput>::as_slice	views(self) declared
 Vec<ShaderEntry>::as_slice	views(self) declared
-Vec<u8>::as_slice	views(self) declared
 Vec<EntryPoint>::as_slice	views(self) declared
 Vec<EntryInfo>::as_slice	views(self) declared
 Vec<BindingInfo>::as_slice	views(self) declared

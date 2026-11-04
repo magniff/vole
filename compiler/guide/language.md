@@ -433,7 +433,7 @@ fn main(gpa: Gpa) -> i32 {
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
+`Result<Vec<u8>, IoError>`), `read_line(&buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
@@ -442,7 +442,7 @@ Option means absent, Result failed). Files go through C (`fopen`):
 import "string.h" as c;
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Buf
+    let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Vec<u8>
     var sc = Scanner::new(input.as_slice());
     var total = 0;
     while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
