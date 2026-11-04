@@ -8,14 +8,14 @@ use crate::base::{
     FILES, IntVec, OVERLAY, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, streq, strlen,
 };
+use crate::base::comp::Comp;
 use crate::base::diag::errors_short;
 use crate::cli::line::{Line, c_word_at, c_words};
 use crate::front::cpp::directives::file_exists;
 use crate::front::stdtree::STD_TREE;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::{
-    ADDED, CH_FILE, CH_TEXT, COMMAND, DEL_FILE, DEL_TO, DRY_RUN, FORCE, NEW_PATH, NEW_TEXT,
-    NO_CHECK, REMOVED, SHOW, TARGET_NAME, edit_new_file, gone_path, move_files, new_texts,
-    remove_empty_dirs, sorted_edits,
+    edit_new_file, gone_path, move_files, new_texts, remove_empty_dirs, sorted_edits,
 };
 use crate::tools::edit::breaks::{on_changed_line, report_breaks};
 use crate::tools::edit::diff::{diff_moved, diff_texts, shown_path};
@@ -94,18 +94,12 @@ pub fn error_lines(text: [u8], out: inout IntVec) {
     }
 }
 
-// (0.26.2) Errors keyed by their file, code and item, not their text:
-// `fix --only fstring` rewords the errors a program has (an f-string a
-// message quotes, a column), and an edit is refused only when a (file,
-// code, item) has more errors than before (edit/breaks.vl: item_key).
-pub static var KEY_BY_ITEM: bool = false;
-
 // The keys of error lines (pairs: key, line) by file, code and item.
-fn rekey(v: inout IntVec, edited: bool) {
+fn rekey(v: inout IntVec, edited: bool, tcx: inout Tcx<Comp>) {
     var j = 0;
     while j + 1 < v.count {
         let k = buf_new();
-        crate::tools::edit::breaks::item_key(buf_slice(v.get(j + 1)), edited, k);
+        crate::tools::edit::breaks::item_key(buf_slice(v.get(j + 1)), edited, k, &tcx);
         v.set(j, k);
         j += 2;
     }
@@ -114,23 +108,23 @@ fn rekey(v: inout IntVec, edited: bool) {
 // The errors of the edited program that the program had not (each old
 // error matches one new error of the same key): their lines, into `added`.
 // Whether the check could run.
-pub fn check_edited(root: *u8, added: inout IntVec) -> bool {
+pub fn check_edited(root: *u8, added: inout IntVec, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let before = buf_new();
         errors_short(before);
         var old = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         error_lines(buf_slice(before), &old);
         let out = buf_new();
-        let status = check_run(root, true, out);
+        let status = check_run(root, true, out, tcx);
         if status != 0 && status != 1 {
             return false;
         }
-        EDITED_ERRORS = out;
+        tcx.edited_errors = out;
         var now = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         error_lines(buf_slice(out), &now);
-        if KEY_BY_ITEM {
-            rekey(&old, false);
-            rekey(&now, true);
+        if tcx.key_by_item {
+            rekey(&old, false, &tcx);
+            rekey(&now, true, &tcx);
         }
         let used = crate::base::alloc_array::<bool>(old.count / 2 + 1);
         var i = 0;
@@ -154,21 +148,17 @@ pub fn check_edited(root: *u8, added: inout IntVec) -> bool {
     }
 }
 
-// (0.20: fix --only conventions) the edited program is checked in 0.20's
-// spelling (`--syntax=0.20`), the program as it was in what it was read in.
-pub static var CHECK_STRICT: bool = false;
-
 // `PROG check --diagnostics=short [--target T] [--overlay FILE COPY...]
 // ROOT` (the overlays: the edited program), its output into out; the
 // status.
-fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
+fn check_run(root: *u8, edited: bool, out: i64, tcx: Tcx<Comp>) -> i64 {
     var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     args.push(PROG as i64);
     args.push(c"check" as i64);
     args.push(c"--diagnostics=short" as i64);
-    if TARGET_NAME != 0 as *u8 {
+    if tcx.target_name != 0 as *u8 {
         args.push(c"--target" as i64);
-        args.push(TARGET_NAME as i64);
+        args.push(tcx.target_name as i64);
     }
     crate::arch::features::push_arch_args(&args);
     if STD_TREE != 0 as *u8 {
@@ -176,12 +166,12 @@ fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
         args.push(STD_TREE as i64);
     }
     if edited {
-        overlay_args(&args);
+        overlay_args(&args, tcx);
     }
     // (a migration's check reads 0.19's spelling too: VOLE_SYNTAX,
     // front/conv::set_mixed; the edited program is checked in 0.20's
     // when CHECK_STRICT)
-    if edited && CHECK_STRICT {
+    if edited && tcx.check_strict {
         args.push(c"--syntax=0.20" as i64);
     }
     args.push(root as i64);
@@ -189,27 +179,15 @@ fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
     run_capture(args.data as **u8, out)
 }
 
-// (0.18) `fix --suggested`: new errors on no line the edit wrote do not
-// refuse it (the fixes let the checker reach them); the edited program's
-// errors are printed after the summary (EDITED_ERRORS: check's output on
-// the edited program, a buffer).
-pub static var LEFT_OK: bool = false;
-
-// (0.25.2.1) `fix --diff`: the diff of what was written, after the summary
-// (the check hook shows each fix it applies so; --dry-run prints it
-// without writing).
-pub static var SHOW_DIFF: bool = false;
-static var EDITED_ERRORS: i64 = -1;
-
 // The errors left in the edited program, one per line, then `note
 // fix.left`; nothing when it checks clean.
-fn errors_left() {
+fn errors_left(tcx: inout Tcx<Comp>) {
     unsafe {
-        if EDITED_ERRORS < 0 {
+        if tcx.edited_errors < 0 {
             return;
         }
         var lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        error_lines(buf_slice(EDITED_ERRORS), &lines);
+        error_lines(buf_slice(tcx.edited_errors), &lines);
         let n = lines.count / 2;
         if n == 0 {
             return;
@@ -220,35 +198,36 @@ fn errors_left() {
             buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
-        let d = diag(c"note", c"fix.left");
+        let d = diag(c"note", c"fix.left", &tcx);
         buf_int(d, n);
         buf_str(d, if n == 1 { c" error left (above)\n" } else { c" errors left (above)\n" });
     }
 }
 
 // The command being run (its line), for the `try:` lines.
-pub fn set_command(line: Line) {
-    COMMAND = c_words(line);
+pub fn set_command(line: Line, tcx: inout Tcx<Comp>) {
+    tcx.command = c_words(line);
 }
 
 // Word i of the command (a C string).
-fn command_word(i: i64) -> *u8 {
-    c_word_at(COMMAND, i)
+fn command_word(i: i64, tcx: Tcx<Comp>) -> *u8 {
+    c_word_at(tcx.command, i)
 }
 
 // (0.25.2.1) Whether the command is `a b` (`edit patch`).
-pub fn command_is(a: [u8], b: [u8]) -> bool {
-    COMMAND.count > 2 && c_slice(command_word(1)) == a && c_slice(command_word(2)) == b
+pub fn command_is(a: [u8], b: [u8], tcx: Tcx<Comp>) -> bool {
+    tcx.command.count > 2 && c_slice(command_word(1, tcx)) == a
+        && c_slice(command_word(2, tcx)) == b
 }
 
 // The command as it was run, with one more option (for a `try:` line).
-pub fn try_again(option: *u8) {
-    let out = diags();
+pub fn try_again(option: *u8, tcx: inout Tcx<Comp>) {
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
-    for i in 1..COMMAND.count {
-        if !std_tree_arg(i) {
-            put_cword(out, command_word(i));
+    for i in 1..tcx.command.count {
+        if !std_tree_arg(i, tcx) {
+            put_cword(out, command_word(i, tcx));
         }
     }
     if option != 0 as *u8 {
@@ -260,44 +239,44 @@ pub fn try_again(option: *u8) {
 
 // (0.17) `try: PROG ARGS...`, the command as it was run, into out (the
 // line not ended: the caller adds to it).
-pub fn put_command(out: i64) {
+pub fn put_command(out: i64, tcx: Tcx<Comp>) {
     buf_str(out, c"try:");
     put_cword(out, PROG);
-    for i in 1..COMMAND.count {
-        if !std_tree_arg(i) {
-            put_cword(out, command_word(i));
+    for i in 1..tcx.command.count {
+        if !std_tree_arg(i, tcx) {
+            put_cword(out, command_word(i, tcx));
         }
     }
 }
 
 // (0.17) Whether word i is `--std-tree` or its value, which a std edit
 // runs again with (stdedit.vl): not in the command a `try:` line shows.
-fn std_tree_arg(i: i64) -> bool {
-    (i + 1 < COMMAND.count && c_slice(command_word(i)) == "--std-tree")
-        || (i > 1 && c_slice(command_word(i - 1)) == "--std-tree")
+fn std_tree_arg(i: i64, tcx: Tcx<Comp>) -> bool {
+    (i + 1 < tcx.command.count && c_slice(command_word(i, tcx)) == "--std-tree")
+        || (i > 1 && c_slice(command_word(i - 1, tcx)) == "--std-tree")
 }
 
 // (0.17) The command as it was run with its words `name` replaced by
 // `new` (for a `try:` line naming one of several definitions): false,
 // writing nothing, when no word of it is `name`.
-pub fn try_replaced(name: [u8], new: [u8]) -> bool {
+pub fn try_replaced(name: [u8], new: [u8], tcx: inout Tcx<Comp>) -> bool {
     var found = false;
-    for i in 1..COMMAND.count {
-        if bytes_eq(c_slice(command_word(i)), name) {
+    for i in 1..tcx.command.count {
+        if bytes_eq(c_slice(command_word(i, tcx)), name) {
             found = true;
         }
     }
     if !found {
         return false;
     }
-    let out = diags();
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
-    for i in 1..COMMAND.count {
-        if bytes_eq(c_slice(command_word(i)), name) {
+    for i in 1..tcx.command.count {
+        if bytes_eq(c_slice(command_word(i, tcx)), name) {
             put_word(out, new);
         } else {
-            put_cword(out, command_word(i));
+            put_cword(out, command_word(i, tcx));
         }
     }
     try_end(out);
@@ -309,58 +288,58 @@ pub fn try_replaced(name: [u8], new: [u8]) -> bool {
 // Applies the edit: checks it, writes it (or with --dry-run prints it),
 // journals it, and prints `what` with the files and the lines changed.
 // The exit status: 0 done, 1 refused (nothing written).
-pub fn apply_edit(what: [u8], root: *u8) -> i64 {
-    let status = prepare_edit();
+pub fn apply_edit(what: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let status = prepare_edit(&tcx);
     if status >= 0 {
         return status;
     }
-    finish_edit(what, root)
+    finish_edit(what, root, &tcx)
 }
 
 // Step 1: the new texts, and their copies. -1 when they are ready, else
 // the exit status (0: nothing to change).
-pub fn prepare_edit() -> i64 {
+pub fn prepare_edit(tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         sorted_edits(&order);
-        new_texts(order);
-        move_files();
-        if CH_FILE.count == 0 && NEW_PATH.count == 0 {
-            let d = diag(c"note", c"edit.unchanged");
+        new_texts(order, &tcx);
+        move_files(&tcx);
+        if tcx.ch_file.count == 0 && tcx.new_path.count == 0 {
+            let d = diag(c"note", c"edit.unchanged", &tcx);
             buf_str(d, c"nothing to change\n");
             return 0;
         }
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
-            if !not_generated(file_text(f), SRC[FILES[f].start..FILES[f].end]) {
+        for i in 0..tcx.ch_file.count {
+            let f = tcx.ch_file.data[i];
+            if !not_generated(file_text(f), SRC[FILES[f].start..FILES[f].end], &tcx) {
                 return 1;
             }
         }
         var ok = true;
-        for i in 0..CH_FILE.count {
-            let path = FILES[CH_FILE.data[i]].path;
-            if !write_file_if(copy_path(path), buf_slice(CH_TEXT.data[i])) {
+        for i in 0..tcx.ch_file.count {
+            let path = FILES[tcx.ch_file.data[i]].path;
+            if !write_file_if(copy_path(path), buf_slice(tcx.ch_text.data[i])) {
                 ok = false;
-                cannot_write(path);
+                cannot_write(path, &tcx);
             }
         }
-        for i in 0..NEW_PATH.count {
-            let path = NEW_PATH.data[i] as *u8;
+        for i in 0..tcx.new_path.count {
+            let path = tcx.new_path.data[i] as *u8;
             if file_exists(path) {
-                let d = diag(c"error", c"edit.exists");
+                let d = diag(c"error", c"edit.exists", &tcx);
                 buf_str(d, c"'");
                 buf_str(d, path);
                 buf_str(d, c"' exists already\n");
                 ok = false;
             }
             else if !make_parent(path)
-                || !write_file_if(copy_path(path), buf_slice(NEW_TEXT.data[i])) {
+                || !write_file_if(copy_path(path), buf_slice(tcx.new_text.data[i])) {
                 ok = false;
-                cannot_write(path);
+                cannot_write(path, &tcx);
             }
         }
         if !ok {
-            remove_copies();
+            remove_copies(tcx);
             return 1;
         }
         -1
@@ -371,16 +350,16 @@ pub fn prepare_edit() -> i64 {
 // of text `text`: not a generated one (its first line `// Generated by
 // SCRIPT ...`, as fmt finds it), whose generator would write it again,
 // unless --force. False after `edit.generated`, naming the script.
-pub fn not_generated(path: [u8], text: [u8]) -> bool {
-    if FORCE || !crate::tools::fmt::generated(text) {
+pub fn not_generated(path: [u8], text: [u8], tcx: inout Tcx<Comp>) -> bool {
+    if tcx.force || !crate::tools::fmt::generated(text) {
         return true;
     }
-    let d = diag(c"error", c"edit.generated");
+    let d = diag(c"error", c"edit.generated", &tcx);
     buf_bytes(d, path);
     buf_str(d, c" is generated by ");
     buf_bytes(d, generator(text));
     buf_str(d, c" (its first line says so): change what the script makes it from and run it; nothing written\n");
-    try_again(c"--force");
+    try_again(c"--force", &tcx);
     false
 }
 
@@ -403,46 +382,46 @@ fn generator(text: [u8]) -> [u8] {
 // that runs on the edited program), and of the files this program was
 // read with in place of others (a step of a script: the edits of the
 // steps before).
-pub fn overlay_args(args: inout IntVec) {
+pub fn overlay_args(args: inout IntVec, tcx: Tcx<Comp>) {
     unsafe {
         var k = 0;
         while k < OVERLAY.count {
             let p = OVERLAY.data[k] as *u8;
-            if !edited_path(p) {
+            if !edited_path(p, tcx) {
                 args.push(c"--overlay" as i64);
                 args.push(p as i64);
                 args.push(OVERLAY.data[k + 1]);
             }
             k += 2;
         }
-        for i in 0..CH_FILE.count {
+        for i in 0..tcx.ch_file.count {
             args.push(c"--overlay" as i64);
-            args.push(FILES[CH_FILE.data[i]].path as i64);
-            args.push(copy_path(FILES[CH_FILE.data[i]].path) as i64);
+            args.push(FILES[tcx.ch_file.data[i]].path as i64);
+            args.push(copy_path(FILES[tcx.ch_file.data[i]].path) as i64);
         }
-        for i in 0..NEW_PATH.count {
+        for i in 0..tcx.new_path.count {
             args.push(c"--overlay" as i64);
-            args.push(NEW_PATH.data[i]);
-            args.push(copy_path(NEW_PATH.data[i] as *u8) as i64);
+            args.push(tcx.new_path.data[i]);
+            args.push(copy_path(tcx.new_path.data[i] as *u8) as i64);
         }
-        for i in 0..DEL_FILE.count {
+        for i in 0..tcx.del_file.count {
             args.push(c"--overlay" as i64);
-            args.push(FILES[DEL_FILE.data[i]].path as i64);
-            args.push(gone_path(FILES[DEL_FILE.data[i]].path) as i64);
+            args.push(FILES[tcx.del_file.data[i]].path as i64);
+            args.push(gone_path(FILES[tcx.del_file.data[i]].path) as i64);
         }
     }
 }
 
 // Whether the edit changes or makes file `path`.
-fn edited_path(path: *u8) -> bool {
+fn edited_path(path: *u8, tcx: Tcx<Comp>) -> bool {
     unsafe {
-        for i in 0..CH_FILE.count {
-            if streq(FILES[CH_FILE.data[i]].path, path) {
+        for i in 0..tcx.ch_file.count {
+            if streq(FILES[tcx.ch_file.data[i]].path, path) {
                 return true;
             }
         }
-        for i in 0..NEW_PATH.count {
-            if streq(NEW_PATH.data[i] as *u8, path) {
+        for i in 0..tcx.new_path.count {
+            if streq(tcx.new_path.data[i] as *u8, path) {
                 return true;
             }
         }
@@ -451,19 +430,19 @@ fn edited_path(path: *u8) -> bool {
 }
 
 // A file the steps of a script made (script.vl): its text is its copy's.
-pub fn copy_made(path: *u8) -> bool {
+pub fn copy_made(path: *u8, tcx: inout Tcx<Comp>) -> bool {
     let text = buf_new();
     if !read_file_if(copy_path(path), text) {
         return false;
     }
-    edit_new_file(path, text);
+    edit_new_file(path, text, &tcx);
     true
 }
 
 // File `path`'s copy was rewritten (by a later round of fix): its new
 // text is the copy's. False when path is no file of the program, nor
 // one the edit makes.
-pub fn copy_rewritten(path: [u8]) -> bool {
+pub fn copy_rewritten(path: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         for f in 0..FILES.len() as i64 {
             if !same_bytes(c_slice(FILES[f].path), path) {
@@ -473,24 +452,24 @@ pub fn copy_rewritten(path: [u8]) -> bool {
             if !read_file_if(copy_path(FILES[f].path), text) {
                 return false;
             }
-            for i in 0..CH_FILE.count {
-                if CH_FILE.data[i] == f {
-                    CH_TEXT.data[i] = text;
+            for i in 0..tcx.ch_file.count {
+                if tcx.ch_file.data[i] == f {
+                    tcx.ch_text.data[i] = text;
                     return true;
                 }
             }
-            CH_FILE.push(f);
-            CH_TEXT.push(text);
+            tcx.ch_file.push(f);
+            tcx.ch_text.push(text);
             return true;
         }
         // (a file the edit makes: refactor split's parts, tidied)
-        for i in 0..NEW_PATH.count {
-            if same_bytes(c_slice(NEW_PATH.data[i] as *u8), path) {
+        for i in 0..tcx.new_path.count {
+            if same_bytes(c_slice(tcx.new_path.data[i] as *u8), path) {
                 let text = buf_new();
-                if !read_file_if(copy_path(NEW_PATH.data[i] as *u8), text) {
+                if !read_file_if(copy_path(tcx.new_path.data[i] as *u8), text) {
                     return false;
                 }
-                NEW_TEXT.data[i] = text;
+                tcx.new_text.data[i] = text;
                 return true;
             }
         }
@@ -501,26 +480,26 @@ pub fn copy_rewritten(path: [u8]) -> bool {
 // The new texts of the edit as copies, without a check (a round of fix
 // run on an edited program: `fix --round`): prints `file<TAB>PATH` per
 // copy written.
-pub fn write_round() -> i64 {
-    if !write_round_copies() {
+pub fn write_round(tcx: inout Tcx<Comp>) -> i64 {
+    if !write_round_copies(&tcx) {
         return 1;
     }
-    print_round_files();
+    print_round_files(tcx);
     0
 }
 
 // (0.25.2.1) write_round's copies, not yet printed (fix --suggested checks
 // its fixes on them first, fix/verify.vl): false when one cannot be
 // written.
-pub fn write_round_copies() -> bool {
+pub fn write_round_copies(tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         sorted_edits(&order);
-        new_texts(order);
-        for i in 0..CH_FILE.count {
-            let path = FILES[CH_FILE.data[i]].path;
-            if !write_file_if(copy_path(path), buf_slice(CH_TEXT.data[i])) {
-                cannot_write(path);
+        new_texts(order, &tcx);
+        for i in 0..tcx.ch_file.count {
+            let path = FILES[tcx.ch_file.data[i]].path;
+            if !write_file_if(copy_path(path), buf_slice(tcx.ch_text.data[i])) {
+                cannot_write(path, &tcx);
                 return false;
             }
         }
@@ -529,14 +508,14 @@ pub fn write_round_copies() -> bool {
 }
 
 // write_round's `file<TAB>PATH` lines.
-pub fn print_round_files() {
+pub fn print_round_files(tcx: Tcx<Comp>) {
     // UNSAFE: FILES is the table of the files read, a raw pointer; CH_FILE a static var (the edit's state).
     // SAFETY: each CH_FILE entry is a file index the edit recorded, 0 <= f < FILE_COUNT; i < CH_FILE.count.
     unsafe {
         let out = buf_new();
-        for i in 0..CH_FILE.count {
+        for i in 0..tcx.ch_file.count {
             buf_str(out, c"file\t");
-            buf_str(out, FILES[CH_FILE.data[i]].path);
+            buf_str(out, FILES[tcx.ch_file.data[i]].path);
             buf_byte(out, '\n');
         }
         buf_write_fd(out, STDOUT);
@@ -547,12 +526,12 @@ pub fn print_round_files() {
 // the edit is made again without some of its replacements: a copy this
 // program was read from (a round's: the rounds before's edit) gets its
 // text back, any other is removed.
-pub fn undo_copies() {
+pub fn undo_copies(tcx: Tcx<Comp>) {
     // UNSAFE: FILES is the table of the files read, a raw pointer; CH_FILE and OVERLAY are static vars (the edit's, base's).
     // SAFETY: f is a file index the edit recorded (0 <= f < FILE_COUNT); OVERLAY holds (index, C string) pairs, read below its count.
     unsafe {
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
+        for i in 0..tcx.ch_file.count {
+            let f = tcx.ch_file.data[i];
             let copy = copy_path(FILES[f].path);
             var read_from = false;
             var k = 0;
@@ -573,32 +552,32 @@ pub fn undo_copies() {
 
 // Steps 2 to 4, once the copies are written (prepare_edit): the check,
 // then the files written (or the diff printed), the journal, the summary.
-pub fn finish_edit(what: [u8], root: *u8) -> i64 {
+pub fn finish_edit(what: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         // (0.14: edit replace, insert and patch, a step of a script: the
         // imports the new text needs; unchecked, as the step is; a round
         // per error the checker reports at a time)
-        if STEP_REPORT != 0 as *u8 && ADD_IMPORTS {
+        if tcx.step_report != 0 as *u8 && tcx.add_imports {
             var rounds = 0;
-            while rounds < MAX_IMPORT_ROUNDS && imports_round(root) {
+            while rounds < MAX_IMPORT_ROUNDS && imports_round(root, &tcx) {
                 rounds += 1;
             }
-            imports_note(rounds);
+            imports_note(rounds, &tcx);
         }
         // The diff (printed with --dry-run; it counts the lines).
-        var diff = edit_diff();
-        if STEP_REPORT != 0 as *u8 {
-            return step_done(what);
+        var diff = edit_diff(&tcx);
+        if tcx.step_report != 0 as *u8 {
+            return step_done(what, &tcx);
         }
         var ok = true;
         // 2, 3. The check.
         var added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let checked = SKIP_CHECK || check_edited(root, &added);
+        let checked = tcx.skip_check || check_edited(root, &added, &tcx);
         // (0.14: edit replace, insert and patch: new errors, maybe names
         // the new text uses from other modules; the imports `fix --only
         // imports` adds, then the check again; not with --no-check, which
         // asks for the errors)
-        if checked && added.count > 0 && ADD_IMPORTS && !SKIP_CHECK && !NO_CHECK {
+        if checked && added.count > 0 && tcx.add_imports && !tcx.skip_check && !tcx.no_check {
             var rounds = 0;
             var tried = false;
             while added.count > 0 && rounds < MAX_IMPORT_ROUNDS {
@@ -606,36 +585,36 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
                 // std::size` for an undefined `size`, is taken back: the
                 // error it hid is the one to report)
                 var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-                keep_texts(&kept);
-                let kept_errors = EDITED_ERRORS;
-                if !imports_round(root) {
+                keep_texts(&kept, tcx);
+                let kept_errors = tcx.edited_errors;
+                if !imports_round(root, &tcx) {
                     break;
                 }
                 tried = true;
                 var now = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-                check_edited(root, &now);
+                check_edited(root, &now, &tcx);
                 if unresolved_imports(now) > unresolved_imports(added) {
-                    restore_texts(kept);
-                    EDITED_ERRORS = kept_errors;
+                    restore_texts(kept, &tcx);
+                    tcx.edited_errors = kept_errors;
                     break;
                 }
                 added = now;
                 rounds += 1;
             }
             if tried {
-                diff = edit_diff();
+                diff = edit_diff(&tcx);
             }
-            imports_note(rounds);
+            imports_note(rounds, &tcx);
         }
         // (0.18: fix --suggested) new errors only on lines the edit did
         // not write: the fixes let the checker reach them
-        if LEFT_OK && checked && added.count > 0 && !NO_CHECK {
+        if tcx.left_ok && checked && added.count > 0 && !tcx.no_check {
             var caused = 0;
             for i in 0..added.count {
-                if on_changed_line(buf_slice(added.data[i]))
+                if on_changed_line(buf_slice(added.data[i]), &tcx)
                     && !(crate::tools::fix::verify::USIZE_LENGTHS
                         && usize_mismatch(buf_slice(added.data[i])))
-                    && !crate::tools::fix::verify::alloc_cascade(buf_slice(added.data[i])) {
+                    && !crate::tools::fix::verify::alloc_cascade(buf_slice(added.data[i]), tcx) {
                     caused += 1;
                 }
             }
@@ -644,61 +623,61 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
             }
         }
         if !checked {
-            let d = diag(c"warning", c"edit.unchecked");
+            let d = diag(c"warning", c"edit.unchecked", &tcx);
             buf_str(d, c"the edited program could not be checked (");
             buf_str(d, PROG);
             buf_str(d, c" check did not run)\n");
         }
-        if DRY_RUN || (added.count > 0 && !NO_CHECK) {
-            remove_copies();
+        if tcx.dry_run || (added.count > 0 && !tcx.no_check) {
+            remove_copies(tcx);
         }
-        if DRY_RUN {
+        if tcx.dry_run {
             buf_write_fd(diff, STDOUT);
         }
         if added.count > 0 {
             // (0.15: tagged with their items, and the refactoring that fits)
-            report_breaks(added, !NO_CHECK && !DRY_RUN);
+            report_breaks(added, !tcx.no_check && !tcx.dry_run, &tcx);
         }
-        if DRY_RUN {
+        if tcx.dry_run {
             return if added.count == 0 { 0 } else { 1 };
         }
-        if added.count > 0 && !NO_CHECK {
+        if added.count > 0 && !tcx.no_check {
             return 1;
         }
         // 4. Journal, then rename.
         let summary = buf_new();
-        put_summary(summary, what);
-        journal(root, buf_slice(summary));
-        for i in 0..CH_FILE.count {
-            let path = FILES[CH_FILE.data[i]].path;
+        put_summary(summary, what, tcx);
+        journal(root, buf_slice(summary), &tcx);
+        for i in 0..tcx.ch_file.count {
+            let path = FILES[tcx.ch_file.data[i]].path;
             if !rename_file(copy_path(path), path) {
-                cannot_write(path);
+                cannot_write(path, &tcx);
                 ok = false;
             }
         }
-        for i in 0..NEW_PATH.count {
-            let path = NEW_PATH.data[i] as *u8;
+        for i in 0..tcx.new_path.count {
+            let path = tcx.new_path.data[i] as *u8;
             if !rename_file(copy_path(path), path) {
-                cannot_write(path);
+                cannot_write(path, &tcx);
                 ok = false;
             }
         }
-        for i in 0..DEL_FILE.count {
-            let path = FILES[DEL_FILE.data[i]].path;
+        for i in 0..tcx.del_file.count {
+            let path = FILES[tcx.del_file.data[i]].path;
             remove_file(path);
             remove_empty_dirs(path);
         }
         buf_byte(summary, '\n');
         buf_write_fd(summary, STDOUT);
-        if SHOW {
+        if tcx.show {
             show_changes(buf_slice(diff));
         }
-        if SHOW_DIFF {
+        if tcx.show_diff {
             // (0.25.2.1: fix --diff, for the check hook to show each fix)
             buf_write_fd(diff, STDOUT);
         }
-        if LEFT_OK && checked {
-            errors_left();
+        if tcx.left_ok && checked {
+            errors_left(&tcx);
         }
         if ok { 0 } else { 1 }
     }
@@ -745,11 +724,6 @@ fn contains_error(line: [u8]) -> bool {
     false
 }
 
-// (0.14) Whether finish_edit adds the imports an edit's new text needs
-// (edit replace, insert): a round of `fix --only imports` on the edited
-// files when the check finds new errors (in a script's step, always).
-pub static var ADD_IMPORTS: bool = false;
-
 // The rounds of imports_round an edit runs at most (the checker reports
 // one unknown name of a function at a time).
 const MAX_IMPORT_ROUNDS: i64 = 4;
@@ -757,34 +731,30 @@ const MAX_IMPORT_ROUNDS: i64 = 4;
 // After `rounds` rounds of imports_round that added imports: the note,
 // once per command (0.16: a script's steps, a rewrite's rounds, say it
 // once).
-fn imports_note(rounds: i64) {
-    if rounds > 0 && !IMPORTS_NOTED {
-        IMPORTS_NOTED = true;
-        let d = diag(c"note", c"edit.imports");
+fn imports_note(rounds: i64, tcx: inout Tcx<Comp>) {
+    if rounds > 0 && !tcx.imports_noted {
+        tcx.imports_noted = true;
+        let d = diag(c"note", c"edit.imports", &tcx);
         buf_str(d, c"added the imports the new text needs (fix --only imports)\n");
     }
 }
 
-// (a script's step tells the script in its report, `imports`, and the
-// steps after it are copies of the script: they say it no more)
-pub static var IMPORTS_NOTED: bool = false;
-
 // The round of `fix --round --only imports --in FILE,...` on the edited
 // program, over the files the edit changed: the copies of the files it
 // fixed have their new texts. Whether it added an import.
-fn imports_round(root: *u8) -> bool {
+fn imports_round(root: *u8, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         // (0.25.5, feedbacks/table254.md #1: one process for all the files,
         // `--in A,B,...`, not one per file: a refactoring of 40 files ran
         // 40 checks a round)
         var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let n = CH_FILE.count;
+        let n = tcx.ch_file.count;
         let files = buf_new();
-        for i in 0..n + NEW_PATH.count {
+        for i in 0..n + tcx.new_path.count {
             // (0.17: the files the edit makes too, edit new-file's; as --in
             // takes them: without `./`)
-            var path = if i < n { FILES[CH_FILE.data[i]].path }
-                else { NEW_PATH.data[i - n] as *u8 };
+            var path = if i < n { FILES[tcx.ch_file.data[i]].path }
+                else { tcx.new_path.data[i - n] as *u8 };
             while path[0] == '.' && path[1] == '/' {
                 path = &path[2];
             }
@@ -797,7 +767,7 @@ fn imports_round(root: *u8) -> bool {
         if paths.count == 0 {
             return false;
         }
-        let all = imports_child(root, buf_cstr(files));
+        let all = imports_child(root, buf_cstr(files), &tcx);
         if all >= 0 || paths.count == 1 {
             return all > 0;
         }
@@ -805,7 +775,7 @@ fn imports_round(root: *u8) -> bool {
         // take: file by file, as before 0.25.5)
         var any = false;
         for i in 0..paths.count {
-            if imports_child(root, paths.data[i] as *u8) > 0 {
+            if imports_child(root, paths.data[i] as *u8, &tcx) > 0 {
                 any = true;
             }
         }
@@ -815,7 +785,7 @@ fn imports_round(root: *u8) -> bool {
 
 // One `fix --round --only imports --in IN` on the edited program: 1 when
 // it rewrote a copy, 0 when it did not, -1 when it failed.
-fn imports_child(root: *u8, files: *u8) -> i64 {
+fn imports_child(root: *u8, files: *u8, tcx: inout Tcx<Comp>) -> i64 {
     var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     args.push(PROG as i64);
     args.push(c"fix" as i64);
@@ -824,11 +794,11 @@ fn imports_child(root: *u8, files: *u8) -> i64 {
     args.push(c"imports" as i64);
     args.push(c"--in" as i64);
     args.push(files as i64);
-    if TARGET_NAME != 0 as *u8 {
+    if tcx.target_name != 0 as *u8 {
         args.push(c"--target" as i64);
-        args.push(TARGET_NAME as i64);
+        args.push(tcx.target_name as i64);
     }
-    overlay_args(&args);
+    overlay_args(&args, tcx);
     args.push(root as i64);
     args.push(0);
     let out = buf_new();
@@ -845,7 +815,7 @@ fn imports_child(root: *u8, files: *u8) -> i64 {
         }
         let line = t[p..e];
         if line.len > 5 && line[0] == 'f' && line[4] == '\t'
-            && copy_rewritten(line[5..line.len]) {
+            && copy_rewritten(line[5..line.len], &tcx) {
             any = 1;
         }
         p = e + 1;
@@ -855,23 +825,23 @@ fn imports_child(root: *u8, files: *u8) -> i64 {
 
 // (0.25.5) The edit's new texts before a round of imports: the number of
 // files it changes, then each one's text (a buffer), then each new file's.
-fn keep_texts(kept: inout IntVec) {
-    kept.push(CH_FILE.count);
-    for i in 0..CH_FILE.count {
-        kept.push(CH_TEXT.get(i));
+fn keep_texts(kept: inout IntVec, tcx: Tcx<Comp>) {
+    kept.push(tcx.ch_file.count);
+    for i in 0..tcx.ch_file.count {
+        kept.push(tcx.ch_text.get(i));
     }
-    for i in 0..NEW_PATH.count {
-        kept.push(NEW_TEXT.get(i));
+    for i in 0..tcx.new_path.count {
+        kept.push(tcx.new_text.get(i));
     }
 }
 
 // The texts keep_texts kept, back, and their copies: a file the round
 // added to the edit gets its copy removed (or, when the program was read
 // from it, a step of a script's, the text it was read with).
-fn restore_texts(kept: IntVec) {
+fn restore_texts(kept: IntVec, tcx: inout Tcx<Comp>) {
     let n = kept.get(0);
-    for i in n..CH_FILE.count {
-        let f = CH_FILE.get(i);
+    for i in n..tcx.ch_file.count {
+        let f = tcx.ch_file.get(i);
         let (path, text) = (FILES[f].path, SRC[FILES[f].start..FILES[f].end]);
         let copy = copy_path(path);
         var read_from = false;
@@ -888,18 +858,18 @@ fn restore_texts(kept: IntVec) {
             remove_file(copy);
         }
     }
-    CH_FILE.count = n;
-    CH_TEXT.count = n;
+    tcx.ch_file.count = n;
+    tcx.ch_text.count = n;
     for i in 0..n {
-        if CH_TEXT.get(i) != kept.get(1 + i) {
-            CH_TEXT.set(i, kept.get(1 + i));
-            write_file_if(copy_path(file_path(CH_FILE.get(i))), buf_slice(CH_TEXT.get(i)));
+        if tcx.ch_text.get(i) != kept.get(1 + i) {
+            tcx.ch_text.set(i, kept.get(1 + i));
+            write_file_if(copy_path(file_path(tcx.ch_file.get(i))), buf_slice(tcx.ch_text.get(i)));
         }
     }
-    for i in 0..NEW_PATH.count {
-        if NEW_TEXT.get(i) != kept.get(1 + n + i) {
-            NEW_TEXT.set(i, kept.get(1 + n + i));
-            write_file_if(copy_path(c_at(NEW_PATH, i)), buf_slice(NEW_TEXT.get(i)));
+    for i in 0..tcx.new_path.count {
+        if tcx.new_text.get(i) != kept.get(1 + n + i) {
+            tcx.new_text.set(i, kept.get(1 + n + i));
+            write_file_if(copy_path(c_at(tcx.new_path, i)), buf_slice(tcx.new_text.get(i)));
         }
     }
 }
@@ -936,36 +906,36 @@ fn unresolved_imports(errors: IntVec) -> i64 {
 
 // The diff of the edit (its new texts against the files), counting the
 // lines added and removed (ADDED, REMOVED): a buffer.
-fn edit_diff() -> i64 {
+fn edit_diff(tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         // (counted again: an edit may be diffed after a round of imports)
-        ADDED = 0;
-        REMOVED = 0;
+        tcx.added = 0;
+        tcx.edit_removed = 0;
         let diff = buf_new();
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
+        for i in 0..tcx.ch_file.count {
+            let f = tcx.ch_file.data[i];
             diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end],
-                buf_slice(CH_TEXT.data[i]));
+                buf_slice(tcx.ch_text.data[i]), &tcx);
         }
-        for i in 0..NEW_PATH.count {
+        for i in 0..tcx.new_path.count {
             var from = -1;
-            for k in 0..DEL_FILE.count {
-                if DEL_TO.data[k] == i {
-                    from = DEL_FILE.data[k];
+            for k in 0..tcx.del_file.count {
+                if tcx.del_to.data[k] == i {
+                    from = tcx.del_file.data[k];
                 }
             }
             if from >= 0 {
-                diff_moved(diff, file_text(from), shown_path(NEW_PATH.data[i] as *u8),
-                    SRC[FILES[from].start..FILES[from].end], buf_slice(NEW_TEXT.data[i]));
+                diff_moved(diff, file_text(from), shown_path(tcx.new_path.data[i] as *u8),
+                    SRC[FILES[from].start..FILES[from].end], buf_slice(tcx.new_text.data[i]), &tcx);
             } else {
-                diff_texts(diff, shown_path(NEW_PATH.data[i] as *u8), SRC[0..0],
-                    buf_slice(NEW_TEXT.data[i]));
+                diff_texts(diff, shown_path(tcx.new_path.data[i] as *u8), SRC[0..0],
+                    buf_slice(tcx.new_text.data[i]), &tcx);
             }
         }
-        for k in 0..DEL_FILE.count {
-            let f = DEL_FILE.data[k];
-            if DEL_TO.data[k] < 0 {
-                diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], SRC[0..0]);
+        for k in 0..tcx.del_file.count {
+            let f = tcx.del_file.data[k];
+            if tcx.del_to.data[k] < 0 {
+                diff_texts(diff, file_text(f), SRC[FILES[f].start..FILES[f].end], SRC[0..0], &tcx);
             }
         }
         diff
@@ -1051,44 +1021,35 @@ fn show_changes(diff: [u8]) {
     buf_write_fd(out, STDOUT);
 }
 
-// A step of a `refactor --script` (0.11, script.vl) is neither
-// checked nor written: its copies stay, for the next steps (which read
-// them, --overlay) and the check at the end; its files are listed in
-// STEP_REPORT (`file PATH`, `new PATH`), and its summary line printed.
-pub static var STEP_REPORT: *u8 = 0 as *u8;
-
-// (fmt: only blanks change, nothing to check)
-pub static var SKIP_CHECK: bool = false;
-
-fn step_done(what: [u8]) -> i64 {
+fn step_done(what: [u8], tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let report = buf_new();
-        for i in 0..CH_FILE.count {
+        for i in 0..tcx.ch_file.count {
             buf_str(report, c"file\t");
-            buf_str(report, FILES[CH_FILE.data[i]].path);
+            buf_str(report, FILES[tcx.ch_file.data[i]].path);
             buf_byte(report, '\n');
         }
-        for i in 0..NEW_PATH.count {
+        for i in 0..tcx.new_path.count {
             buf_str(report, c"new\t");
-            buf_str(report, NEW_PATH.data[i] as *u8);
+            buf_str(report, tcx.new_path.data[i] as *u8);
             buf_byte(report, '\n');
         }
-        if IMPORTS_NOTED {
+        if tcx.imports_noted {
             buf_str(report, c"imports\n");
         }
         // (the files it moved away: `gone PATH`)
-        for i in 0..DEL_FILE.count {
+        for i in 0..tcx.del_file.count {
             buf_str(report, c"gone\t");
-            buf_str(report, FILES[DEL_FILE.data[i]].path);
+            buf_str(report, FILES[tcx.del_file.data[i]].path);
             buf_byte(report, '\n');
         }
-        if !write_file_if(STEP_REPORT, buf_slice(report)) {
-            cannot_write(STEP_REPORT);
-            remove_copies();
+        if !write_file_if(tcx.step_report, buf_slice(report)) {
+            cannot_write(tcx.step_report, &tcx);
+            remove_copies(tcx);
             return 1;
         }
         let summary = buf_new();
-        put_summary(summary, what);
+        put_summary(summary, what, tcx);
         buf_byte(summary, '\n');
         buf_write_fd(summary, STDOUT);
         0
@@ -1096,48 +1057,48 @@ fn step_done(what: [u8]) -> i64 {
 }
 
 // `WHAT<TAB>FILE<TAB>+A -R lines` (or `N files`).
-fn put_summary(out: i64, what: [u8]) {
+fn put_summary(out: i64, what: [u8], tcx: Tcx<Comp>) {
     unsafe {
         buf_bytes(out, what);
         buf_byte(out, '\t');
-        var files = CH_FILE.count + NEW_PATH.count;
-        for k in 0..DEL_FILE.count {
-            if DEL_TO.data[k] < 0 {
+        var files = tcx.ch_file.count + tcx.new_path.count;
+        for k in 0..tcx.del_file.count {
+            if tcx.del_to.data[k] < 0 {
                 files += 1;
             }
         }
         if files == 1 {
-            if CH_FILE.count == 1 {
-                buf_bytes(out, file_text(CH_FILE.data[0]));
+            if tcx.ch_file.count == 1 {
+                buf_bytes(out, file_text(tcx.ch_file.data[0]));
             } else {
-                buf_bytes(out, shown_path(NEW_PATH.data[0] as *u8));
+                buf_bytes(out, shown_path(tcx.new_path.data[0] as *u8));
             }
         } else {
             buf_int(out, files);
             buf_str(out, c" files");
         }
         buf_str(out, c"\t+");
-        buf_int(out, ADDED);
+        buf_int(out, tcx.added);
         buf_str(out, c" -");
-        buf_int(out, REMOVED);
+        buf_int(out, tcx.edit_removed);
         buf_str(out, c" lines");
     }
 }
 
-fn remove_copies() {
+fn remove_copies(tcx: Tcx<Comp>) {
     unsafe {
-        for i in 0..CH_FILE.count {
-            remove_file(copy_path(FILES[CH_FILE.data[i]].path));
+        for i in 0..tcx.ch_file.count {
+            remove_file(copy_path(FILES[tcx.ch_file.data[i]].path));
         }
-        for i in 0..NEW_PATH.count {
-            remove_file(copy_path(NEW_PATH.data[i] as *u8));
-            remove_empty_dirs(NEW_PATH.data[i] as *u8);
+        for i in 0..tcx.new_path.count {
+            remove_file(copy_path(tcx.new_path.data[i] as *u8));
+            remove_empty_dirs(tcx.new_path.data[i] as *u8);
         }
     }
 }
 
-pub fn cannot_write(path: *u8) {
-    let d = diag(c"error", c"edit.write");
+pub fn cannot_write(path: *u8, tcx: inout Tcx<Comp>) {
+    let d = diag(c"error", c"edit.write", &tcx);
     buf_str(d, c"cannot write '");
     buf_str(d, path);
     buf_str(d, c"'\n");

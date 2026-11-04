@@ -2,12 +2,16 @@
 
 ## Verdict
 
-In progress: P1 (the pilot) is done. The tool, `volec fix --only
-statics --group FILE`, moved the places IR's body and its control-flow
-graph (19 statics) into `places::ir::Body`, passed down as `pbody` to 288
+In progress: P1 and P2 are done. The tool, `volec fix --only statics
+--group FILE`, moved the places IR's body and its control-flow graph
+(19 statics) into `places::ir::Body`, passed down as `pbody` to 288
 functions (105 inout, 183 let) from four owners. Nothing was changed by
-hand except the struct and its constructor. P2 (tools' statics) and P3
-(front's pass state) follow in 0.26.4; P4 to P6 move to 0.26.5.
+hand except the struct. P2 moved 673 of the tools' 760 statics into
+`tools::ctx::Tcx`, passed as `tcx` to 1,228 functions (765 inout) from
+`main` and `cli::run::run`. By hand: the struct, one format hole, seven
+calls passing a field inout beside `tcx`, and two statics the group
+missed. The tool's own 32 statics are among those moved. P3 (front's
+pass state) follows in 0.26.4; P4 to P6 move to 0.26.5.
 
 ## What worked
 
@@ -42,7 +46,17 @@ hand except the struct and its constructor. P2 (tools' statics) and P3
    moved into a `let`): the edit list refuses overlaps. The edits are
    recorded first, the statement is rendered with them, then everything
    is written.
-4. The sandbox refused shell loops, `$VAR` commands and `xargs git`, so
+4. P2's view-typed statics (seven `[u8]` slices, such as fmt's text and
+   the completion text). As fields, they make `tcx` a holder of views,
+   and the own pass then ties `tcx` to the locals of every caller that
+   lends it anything (`own.escape` in `edit patch`'s option loop). They
+   were taken out of the group and stay statics. The first run had to be
+   undone.
+5. `volec check` stops at 50 errors, so `fix --only imports` after the
+   rewrite needed seven rounds, one per 50 missing `use` lines.
+6. Deleting 671 statics with `edit delete`, one process each, took about
+   15 minutes.
+7. The sandbox refused shell loops, `$VAR` commands and `xargs git`, so
    each multi-step run went into a script file.
 
 ## Never used
@@ -60,5 +74,18 @@ closure is the tool's), `probe`, `reduce`.
 3. [lang] std's `self` receivers: their checked type says inout for a
    method that only reads (`len`, `get`), so a tool or the own pass
    cannot tell a read from a write by the signature.
-4. [tool] The tool adds about 30 statics of its own (tools/fix/statics.vl);
-   P2 moves them with the rest of tools'.
+4. [tool] Done in P2: the tool's own 32 statics are now `tcx` fields.
+5. [tool] Refuse a view-typed static (a slice, a `str`) in a group, and
+   say why: as a field, it makes the context a holder of views.
+6. [tool] A static named in a format literal's hole (`"{DOC_SEQ}"`)
+   becomes `{tcx.doc_seq}`, which is `format.expr-hole`. Write `{}` and
+   pass the argument instead.
+7. [tool] A static passed inout to a function that also takes the
+   context (`get_ints(&ALIASES, &tcx)`) conflicts. Take the field into a
+   local and put it back when the callee does not touch it through the
+   context; refuse otherwise.
+8. [tool] Adding statics to a context that is already passed down:
+   today a function with a parameter of that name is refused (F_CLASH),
+   so the two statics the group missed were moved by hand.
+9. [tool] `fix --only imports` is bounded by check's 50 errors. It could
+   collect every missing `use` in one run.

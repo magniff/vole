@@ -24,9 +24,11 @@
 use crate::base::{
     BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
 };
+use crate::base::comp::Comp;
 use crate::front::ast::{NODES, NODE_IMPLICIT, NodeKind};
 use crate::front::modules::{file_of_pos, within_std};
 use crate::front::types::{FNS, FN_COUNT, buf_type, fn_param, is_numeric};
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::{drop_replaces, replace_at, replace_count};
 use crate::tools::edit::apply::{check_edited, prepare_edit, undo_copies, write_round_copies};
 use crate::tools::edit::breaks::{changed_index, hunks};
@@ -36,18 +38,13 @@ use crate::tools::query::diagnostics::diag;
 use crate::tools::query::positions::{line_of, line_start};
 use crate::tools::query::refs::file_text;
 
-// The replacements of the edit a fix made: the replacement's index, the
-// index in fix's counts it adds to, the number of fixes it is (0: one
-// more place of the same), the position of its error (-1: none), in fours.
-static var FIX_EDITS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // The fix just added as replacement `edit` (edit_replace) is `n` fixes of
 // kind `cat` (fix's counts), for the error at `pos`.
-pub fn note_fix(edit: i64, cat: i64, n: i64, pos: i64) {
-    FIX_EDITS.push(edit);
-    FIX_EDITS.push(cat);
-    FIX_EDITS.push(n);
-    FIX_EDITS.push(pos);
+pub fn note_fix(edit: i64, cat: i64, n: i64, pos: i64, tcx: inout Tcx<Comp>) {
+    tcx.fix_edits.push(edit);
+    tcx.fix_edits.push(cat);
+    tcx.fix_edits.push(n);
+    tcx.fix_edits.push(pos);
 }
 
 // The index of the last replacement made (after an edit_replace that
@@ -225,16 +222,10 @@ pub fn refusal_of(start: i64, end: i64, text: i64) -> [u8] {
 // lengths it is (an allocation is below 2^63 bytes).
 pub static var USIZE_LENGTHS: bool = false;
 
-// (0.26.3: fix --only alloc) A new allocator-rule error is the rounds'
-// cascade, not the fix's fault: `Vec<u8, Gpa>` written in a field makes
-// its struct's alloc.field, whose fix (the struct generic over `A`) makes
-// its uses' alloc.default, the next round's.
-pub static var ALLOC_ROUNDS: bool = false;
-
 // Whether error line `line` is such a cascade (ALLOC_ROUNDS).
-pub fn alloc_cascade(line: [u8]) -> bool {
+pub fn alloc_cascade(line: [u8], tcx: Tcx<Comp>) -> bool {
     let t = "error[alloc.";
-    if !ALLOC_ROUNDS {
+    if !tcx.alloc_rounds {
         return false;
     }
     var i = 0;
@@ -300,8 +291,8 @@ fn int_bits(t: [u8]) -> i64 {
 
 // `note fix.refused: PLACE: not applied: `TEXT`: WHY`, PLACE the fix's
 // error (else where it is).
-pub fn note_refused(pos: i64, text: [u8], why: [u8]) {
-    let d = diag(c"note", c"fix.refused");
+pub fn note_refused(pos: i64, text: [u8], why: [u8], tcx: inout Tcx<Comp>) {
+    let d = diag(c"note", c"fix.refused", &tcx);
     put_place(d, pos);
     buf_str(d, c": not applied: `");
     put_trimmed(d, text);
@@ -340,17 +331,17 @@ fn put_trimmed(out: i64, t: [u8]) {
 // write_round_copies in a round) and takes out each fix it finds wrong
 // (see the head), writing the copies again; at most 4 times. counts:
 // fix's, less the fixes taken out. Whether a replacement is left.
-pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
+pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool, tcx: inout Tcx<Comp>) -> bool {
     // UNSAFE: FIX_EDITS and LINES are static vars (this module's, positions'); replace_at reads the edit's.
     // SAFETY: the indices are below their vectors' counts; the line table is made from SRC before any use.
     unsafe {
         // (the line table: a program the lexer stopped in has none yet)
         if crate::tools::query::positions::LINES.count == 0 {
-            crate::tools::query::positions::init_positions();
+            crate::tools::query::positions::init_positions(&tcx);
         }
         for _ in 0..4 {
             var added = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            if !check_edited(root, &added) || added.count == 0 {
+            if !check_edited(root, &added, &tcx) || added.count == 0 {
                 return true;
             }
             var bad = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -359,11 +350,11 @@ pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
                 let line = buf_slice(added.data[i]);
                 var l = 0;
                 var c = 0;
-                let f = place_in(line, &l, &c);
+                let f = place_in(line, &l, &c, tcx);
                 // (fix --only usize) a cascade: the next run converts it
                 if f >= 0 && !(USIZE_LENGTHS && crate::tools::edit::apply::usize_mismatch(line))
-                    && !alloc_cascade(line) {
-                    blame(f, l, c, added.data[i], &bad, &why);
+                    && !alloc_cascade(line, tcx) {
+                    blame(f, l, c, added.data[i], &bad, &why, &tcx);
                 }
             }
             if bad.count == 0 {
@@ -375,12 +366,12 @@ pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
                 let (s, _, text) = replace_at(e);
                 var pos = s;
                 var j = 0;
-                while j < FIX_EDITS.count {
-                    if FIX_EDITS.data[j] == e {
-                        if FIX_EDITS.data[j + 3] >= 0 && pos == s {
-                            pos = FIX_EDITS.data[j + 3];
+                while j < tcx.fix_edits.count {
+                    if tcx.fix_edits.data[j] == e {
+                        if tcx.fix_edits.data[j + 3] >= 0 && pos == s {
+                            pos = tcx.fix_edits.data[j + 3];
                         }
-                        counts[FIX_EDITS.data[j + 1]] -= FIX_EDITS.data[j + 2];
+                        counts[tcx.fix_edits.data[j + 1]] -= tcx.fix_edits.data[j + 2];
                     }
                     j += 4;
                 }
@@ -394,19 +385,19 @@ pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
                     cut += 1;
                 }
                 buf_bytes(w, y[0..cut]);
-                note_refused(pos, buf_slice(text), buf_slice(w));
+                note_refused(pos, buf_slice(text), buf_slice(w), &tcx);
             }
-            renumber(bad);
-            undo_copies();
-            drop_replaces(bad);
+            renumber(bad, &tcx);
+            undo_copies(tcx);
+            drop_replaces(bad, &tcx);
             if replace_count() == 0 {
                 return false;
             }
             if round {
-                if !write_round_copies() {
+                if !write_round_copies(&tcx) {
                     return false;
                 }
-            } else if prepare_edit() >= 0 {
+            } else if prepare_edit(&tcx) >= 0 {
                 return false;
             }
         }
@@ -415,7 +406,7 @@ pub fn verify_fixes(root: *u8, counts: inout [i64; 11], round: bool) -> bool {
 }
 
 // The file, line and column of a short diagnostic line (`PATH:L:C: error[`).
-fn place_in(line: [u8], l: inout i64, c: inout i64) -> i64 {
+fn place_in(line: [u8], l: inout i64, c: inout i64, tcx: Tcx<Comp>) -> i64 {
     var at = -1;
     var i = 0;
     while i + 8 <= line.len as i64 {
@@ -445,7 +436,7 @@ fn place_in(line: [u8], l: inout i64, c: inout i64) -> i64 {
     if l <= 0 || c <= 0 {
         return -1;
     }
-    file_by_path(line[0..c1])
+    file_by_path(line[0..c1], tcx)
 }
 
 fn digits(s: [u8]) -> i64 {
@@ -467,14 +458,15 @@ fn digits(s: [u8]) -> i64 {
 // there, or what its import brought, is not what the place takes).
 // Another new error on a line a fix wrote (a second error of the line
 // the checker reaches now) blames nothing: a later round fixes it.
-fn blame(f: i64, l: i64, c: i64, line: i64, bad: inout IntVec, why: inout IntVec) {
+fn blame(f: i64, l: i64, c: i64, line: i64, bad: inout IntVec, why: inout IntVec,
+    tcx: inout Tcx<Comp>) {
     // UNSAFE: BUFS (the buffers) and FIX_EDITS are static vars, IntVec data raw pointers.
     // SAFETY: e < replace_count(); FIX_EDITS is read in fours below its count; h's hunks in fours below h.count.
     unsafe {
-        let ci = changed_index(f);
+        let ci = changed_index(f, tcx);
         var h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if ci >= 0 {
-            hunks(ci, &h);
+            hunks(ci, &h, &tcx);
         }
         for e in 0..replace_count() {
             let (s, en, text) = replace_at(e);
@@ -512,9 +504,9 @@ fn blame(f: i64, l: i64, c: i64, line: i64, bad: inout IntVec, why: inout IntVec
                 }
             }
             var j = 0;
-            while !hit && j < FIX_EDITS.count {
-                let p = FIX_EDITS.data[j + 3];
-                if FIX_EDITS.data[j] == e && p >= 0 && file_of_pos(p) == f {
+            while !hit && j < tcx.fix_edits.count {
+                let p = tcx.fix_edits.data[j + 3];
+                if tcx.fix_edits.data[j] == e && p >= 0 && file_of_pos(p) == f {
                     var pc = 0;
                     let pl = new_place(h, f, p, -1, &pc);
                     hit = pl > 0 && pl == l && pc == c;
@@ -610,14 +602,14 @@ fn sort_pairs(bad: inout IntVec, why: inout IntVec) {
 
 // FIX_EDITS after the replacements `gone` (sorted) are taken out: theirs
 // dropped, the others' indices moved down.
-fn renumber(gone: IntVec) {
+fn renumber(gone: IntVec, tcx: inout Tcx<Comp>) {
     // UNSAFE: FIX_EDITS is a static var, its data a raw pointer.
     // SAFETY: j < FIX_EDITS.count; gone is read below its count.
     unsafe {
         var k = 0;
         var j = 0;
-        while j < FIX_EDITS.count {
-            let e = FIX_EDITS.data[j];
+        while j < tcx.fix_edits.count {
+            let e = tcx.fix_edits.data[j];
             var out = false;
             var below = 0;
             for g in 0..gone.count {
@@ -629,14 +621,14 @@ fn renumber(gone: IntVec) {
                 }
             }
             if !out {
-                FIX_EDITS.data[k] = e - below;
-                FIX_EDITS.data[k + 1] = FIX_EDITS.data[j + 1];
-                FIX_EDITS.data[k + 2] = FIX_EDITS.data[j + 2];
-                FIX_EDITS.data[k + 3] = FIX_EDITS.data[j + 3];
+                tcx.fix_edits.data[k] = e - below;
+                tcx.fix_edits.data[k + 1] = tcx.fix_edits.data[j + 1];
+                tcx.fix_edits.data[k + 2] = tcx.fix_edits.data[j + 2];
+                tcx.fix_edits.data[k + 3] = tcx.fix_edits.data[j + 3];
                 k += 4;
             }
             j += 4;
         }
-        FIX_EDITS.count = k;
+        tcx.fix_edits.count = k;
     }
 }

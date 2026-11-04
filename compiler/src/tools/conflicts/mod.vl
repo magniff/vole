@@ -25,87 +25,69 @@ use crate::base::{
     BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
     streq,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_opt, option, table};
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{buf_cstr, read_file_if, run_capture, same_bytes};
 use crate::tools::query::{c_slice, file_line, find_root};
-use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_word, try_end,
-};
+use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, put_word, try_end};
 
 // ---- Files and regions ----
 
-// The files read: path (a C string, without `./`), text (a buffer), the
-// index in LS of the start of their first line, their number of lines,
-// whether their regions were read.
-static var F_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var F_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var F_L0: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var F_NL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var F_SCANNED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var LS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The regions: file, the lines (from 1) of their markers (R_BASE -1 when
-// there is no base side), their items (a buffer, `a, b`).
-static var R_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_BASE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_SEP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // File `path` read, its regions found: its index, or -1 after the
 // diagnostic.
-fn read_source(path0: *u8) -> i64 {
+fn read_source(path0: *u8, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         var path = path0;
         while path[0] == '.' && path[1] == '/' {
             path = &path[2];
         }
-        for f in 0..F_PATH.count {
-            if streq(F_PATH.data[f] as *u8, path) {
+        for f in 0..tcx.f_path.count {
+            if streq(tcx.f_path.data[f] as *u8, path) {
                 return f;
             }
         }
         let text = buf_new();
         if !read_file_if(path, text) {
-            let d = diag(c"error", c"query.no-file");
+            let d = diag(c"error", c"query.no-file", &tcx);
             buf_str(d, c"cannot read '");
             buf_str(d, path);
             buf_str(d, c"'\n");
             return -1;
         }
-        F_PATH.push(path as i64);
-        F_TEXT.push(text);
-        F_L0.push(LS.count);
+        tcx.f_path.push(path as i64);
+        tcx.f_text.push(text);
+        tcx.f_l0.push(tcx.conflicts_ls.count);
         let t = buf_slice(text);
         var n = 0;
         var i = 0;
         while i < t.len as i64 {
-            LS.push(i);
+            tcx.conflicts_ls.push(i);
             n += 1;
             while i < t.len as i64 && t[i] != '\n' {
                 i += 1;
             }
             i += 1;
         }
-        F_NL.push(n);
-        F_SCANNED.push(0);
-        let f = F_PATH.count - 1;
-        if !scan(f) {
+        tcx.f_nl.push(n);
+        tcx.f_scanned.push(0);
+        let f = tcx.f_path.count - 1;
+        if !scan(f, &tcx) {
             return -1;
         }
         f
     }
 }
 
-fn path_of(f: i64) -> [u8] {
-    unsafe { c_slice(F_PATH.data[f] as *u8) }
+fn path_of(f: i64, tcx: Tcx<Comp>) -> [u8] {
+    unsafe { c_slice(tcx.f_path.data[f] as *u8) }
 }
 
 // Line n (from 1) of file f, without its newline.
-fn line(f: i64, n: i64) -> [u8] {
+fn line(f: i64, n: i64, tcx: Tcx<Comp>) -> [u8] {
     unsafe {
-        let t = buf_slice(F_TEXT.data[f]);
-        let s = LS.data[F_L0.data[f] + n - 1];
+        let t = buf_slice(tcx.f_text.data[f]);
+        let s = tcx.conflicts_ls.data[tcx.f_l0.data[f] + n - 1];
         var e = s;
         while e < t.len as i64 && t[e] != '\n' {
             e += 1;
@@ -118,12 +100,12 @@ fn line(f: i64, n: i64) -> [u8] {
 }
 
 // Where line n of file f starts (one past its last line: its end).
-fn line_pos(f: i64, n: i64) -> i64 {
+fn line_pos(f: i64, n: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        if n > F_NL.data[f] {
-            return BUFS[F_TEXT.data[f]].len;
+        if n > tcx.f_nl.data[f] {
+            return BUFS[tcx.f_text.data[f]].len;
         }
-        LS.data[F_L0.data[f] + n - 1]
+        tcx.conflicts_ls.data[tcx.f_l0.data[f] + n - 1]
     }
 }
 
@@ -158,21 +140,22 @@ fn label(l: [u8]) -> [u8] {
 }
 
 // The regions of file f. False after the diagnostic.
-fn scan(f: i64) -> bool {
+fn scan(f: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        if F_SCANNED.data[f] != 0 {
+        if tcx.f_scanned.data[f] != 0 {
             return true;
         }
-        F_SCANNED.data[f] = 1;
+        tcx.f_scanned.data[f] = 1;
         var state = 0;
         var start = 0;
         var base = -1;
         var sep = 0;
-        for n in 1..F_NL.data[f] + 1 {
-            let l = line(f, n);
+        for n in 1..tcx.f_nl.data[f] + 1 {
+            let l = line(f, n, tcx);
             if marker(l, '<') {
                 if state != 0 {
-                    return format_error(f, n, c"a <<<<<<< line inside the region of line ", start);
+                    return format_error(f, n, c"a <<<<<<< line inside the region of line ", start,
+                        &tcx);
                 }
                 state = 1;
                 start = n;
@@ -186,27 +169,27 @@ fn scan(f: i64) -> bool {
             } else if marker(l, '>') {
                 if state != 3 {
                     return format_error(f, n,
-                        c"a >>>>>>> line without its <<<<<<< and ======= lines", -1);
+                        c"a >>>>>>> line without its <<<<<<< and ======= lines", -1, &tcx);
                 }
-                R_FILE.push(f);
-                R_START.push(start);
-                R_BASE.push(base);
-                R_SEP.push(sep);
-                R_END.push(n);
-                R_ITEMS.push(region_items(R_FILE.count - 1));
+                tcx.r_file.push(f);
+                tcx.conflicts_r_start.push(start);
+                tcx.r_base.push(base);
+                tcx.r_sep.push(sep);
+                tcx.conflicts_r_end.push(n);
+                tcx.r_items.push(region_items(tcx.r_file.count - 1, tcx));
                 state = 0;
             }
         }
         if state != 0 {
-            return format_error(f, start, c"a region without its >>>>>>> line", -1);
+            return format_error(f, start, c"a region without its >>>>>>> line", -1, &tcx);
         }
         true
     }
 }
 
-fn format_error(f: i64, n: i64, message: *u8, other: i64) -> bool {
-    let d = diag(c"error", c"conflict.format");
-    buf_bytes(d, path_of(f));
+fn format_error(f: i64, n: i64, message: *u8, other: i64, tcx: inout Tcx<Comp>) -> bool {
+    let d = diag(c"error", c"conflict.format", &tcx);
+    buf_bytes(d, path_of(f, tcx));
     buf_byte(d, ':');
     buf_int(d, n);
     buf_str(d, c": ");
@@ -215,10 +198,10 @@ fn format_error(f: i64, n: i64, message: *u8, other: i64) -> bool {
         buf_int(d, other);
     }
     buf_str(d, c"; fix the markers by hand\n");
-    let out = try_start();
+    let out = try_start(&tcx);
     buf_str(out, c" query text");
     let w = buf_new();
-    buf_bytes(w, path_of(f));
+    buf_bytes(w, path_of(f, tcx));
     buf_byte(w, ':');
     buf_int(w, if n > 5 { n - 5 } else { 1 });
     buf_byte(w, '-');
@@ -229,8 +212,8 @@ fn format_error(f: i64, n: i64, message: *u8, other: i64) -> bool {
 }
 
 // `try: PROG`; the words follow, then try_end.
-fn try_start() -> i64 {
-    let out = diags();
+fn try_start(tcx: inout Tcx<Comp>) -> i64 {
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
     out
@@ -393,12 +376,12 @@ fn header(l: [u8], out: i64) -> i64 {
 // The name of the item whose header is line n of file f (its name in
 // `name`), into out: `T::m` for a method (an impl or trait header less
 // indented above it).
-fn qualified(f: i64, n: i64, name: i64, out: i64) {
-    let ind = indent(line(f, n));
+fn qualified(f: i64, n: i64, name: i64, out: i64, tcx: Tcx<Comp>) {
+    let ind = indent(line(f, n, tcx));
     if ind > 0 {
         var m = n - 1;
         while m >= 1 {
-            let l = line(f, m);
+            let l = line(f, m, tcx);
             if !blank(l) && !comment(l) && !any_marker(l) && indent(l) < ind {
                 let b = buf_new();
                 if header(l, b) == 2 {
@@ -434,16 +417,16 @@ fn add_name(out: i64, q: [u8]) {
 }
 
 // The items of region r (a buffer, `a, b`; `-` when none is found).
-fn region_items(r: i64) -> i64 {
+fn region_items(r: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        let f = R_FILE.data[r];
-        let start = R_START.data[r];
-        let end = R_END.data[r];
+        let f = tcx.r_file.data[r];
+        let start = tcx.conflicts_r_start.data[r];
+        let end = tcx.conflicts_r_end.data[r];
         let out = buf_new();
         var first = -1;
         var notes = true;
         for n in start + 1..end {
-            let l = line(f, n);
+            let l = line(f, n, tcx);
             if any_marker(l) || blank(l) {
                 continue;
             }
@@ -456,7 +439,7 @@ fn region_items(r: i64) -> i64 {
             let b = buf_new();
             if header(l, b) != 0 {
                 let q = buf_new();
-                qualified(f, n, b, q);
+                qualified(f, n, b, q, tcx);
                 add_name(out, buf_slice(q));
             }
         }
@@ -468,11 +451,11 @@ fn region_items(r: i64) -> i64 {
             var ind = first;
             var m = start - 1;
             while m >= 1 {
-                let l = line(f, m);
+                let l = line(f, m, tcx);
                 if !blank(l) && !comment(l) && !any_marker(l) && indent(l) < ind {
                     let b = buf_new();
                     if header(l, b) != 0 {
-                        qualified(f, m, b, out);
+                        qualified(f, m, b, out, tcx);
                         return out;
                     }
                     ind = indent(l);
@@ -485,12 +468,12 @@ fn region_items(r: i64) -> i64 {
         } else if notes {
             // (comments at the top level: the item after them)
             var m = end + 1;
-            while m <= F_NL.data[f] {
-                let l = line(f, m);
+            while m <= tcx.f_nl.data[f] {
+                let l = line(f, m, tcx);
                 if !blank(l) && !comment(l) {
                     let b = buf_new();
                     if indent(l) == 0 && header(l, b) != 0 {
-                        qualified(f, m, b, out);
+                        qualified(f, m, b, out, tcx);
                         return out;
                     }
                     break;
@@ -505,9 +488,9 @@ fn region_items(r: i64) -> i64 {
 
 // Whether NAME names one of region r's items: the same, or one ends the
 // other after `::`.
-fn names_item(r: i64, name: [u8]) -> bool {
+fn names_item(r: i64, name: [u8], tcx: Tcx<Comp>) -> bool {
     unsafe {
-        let t = buf_slice(R_ITEMS.data[r]);
+        let t = buf_slice(tcx.r_items.data[r]);
         var i = 0;
         while i < t.len as i64 {
             var e = i;
@@ -590,8 +573,8 @@ fn less(a: [u8], b: [u8]) -> bool {
 }
 
 // The directory searched without a FILE: the root's (`.` without one).
-fn default_dir() -> *u8 {
-    let root = find_root(ROOT_GIVEN);
+fn default_dir(tcx: Tcx<Comp>) -> *u8 {
+    let root = find_root(tcx.root_given);
     if root == 0 as *u8 {
         return c".";
     }
@@ -609,11 +592,11 @@ fn default_dir() -> *u8 {
 }
 
 // The files under dir, read. False after a diagnostic.
-fn read_dir(dir: *u8) -> bool {
+fn read_dir(dir: *u8, tcx: inout Tcx<Comp>) -> bool {
     var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     conflicted_files(dir, &files);
     for k in 0..files.count {
-        if unsafe { read_source(files.data[k] as *u8) < 0 } {
+        if unsafe { read_source(files.data[k] as *u8, &tcx) < 0 } {
             return false;
         }
     }
@@ -623,7 +606,7 @@ fn read_dir(dir: *u8) -> bool {
 // TARGET `FILE` or `FILE:LINE` (a .vl file): its regions (with a line,
 // the one holding it) into sel. 1 when it is no file, 2 after a
 // diagnostic, 0 done.
-fn file_target(arg: *u8, sel: inout IntVec) -> i64 {
+fn file_target(arg: *u8, sel: inout IntVec, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let a = c_slice(arg);
         var ln = -1;
@@ -637,27 +620,29 @@ fn file_target(arg: *u8, sel: inout IntVec) -> i64 {
         }
         let p = buf_new();
         buf_bytes(p, a[0..n]);
-        let f = read_source(buf_cstr(p));
+        let f = read_source(buf_cstr(p), &tcx);
         if f < 0 {
             return 2;
         }
         var found = false;
-        for r in 0..R_FILE.count {
-            if R_FILE.data[r] == f && (ln < 0 || (R_START.data[r] <= ln && ln <= R_END.data[r])) {
+        for r in 0..tcx.r_file.count {
+            if tcx.r_file.data[r] == f
+                && (ln < 0
+                    || (tcx.conflicts_r_start.data[r] <= ln && ln <= tcx.conflicts_r_end.data[r])) {
                 add_region(&sel, r);
                 found = true;
             }
         }
         if !found && ln >= 0 {
-            let d = diag(c"error", c"conflict.none");
+            let d = diag(c"error", c"conflict.none", &tcx);
             buf_str(d, c"no conflict region holds ");
-            buf_bytes(d, path_of(f));
+            buf_bytes(d, path_of(f, tcx));
             buf_byte(d, ':');
             buf_int(d, ln);
             buf_byte(d, '\n');
-            let out = try_start();
+            let out = try_start(&tcx);
             buf_str(out, c" query conflicts");
-            put_word(out, path_of(f));
+            put_word(out, path_of(f, tcx));
             try_end(out);
             return 2;
         }
@@ -681,11 +666,11 @@ fn put_lines(out: i64, n: i64) {
     buf_str(out, if n == 1 { c" line" } else { c" lines" });
 }
 
-fn put_side(out: i64, f: i64, side: *u8, marker_line: i64, n: i64) {
+fn put_side(out: i64, f: i64, side: *u8, marker_line: i64, n: i64, tcx: Tcx<Comp>) {
     buf_str(out, side);
     buf_byte(out, ' ');
     put_lines(out, n);
-    let lab = label(line(f, marker_line));
+    let lab = label(line(f, marker_line, tcx));
     if lab.len > 0 {
         buf_str(out, c" (");
         buf_bytes(out, lab);
@@ -694,39 +679,41 @@ fn put_side(out: i64, f: i64, side: *u8, marker_line: i64, n: i64) {
 }
 
 // The lines of the sides of region r: ours [a, b], base, theirs.
-fn ours_end(r: i64) -> i64 {
-    unsafe { if R_BASE.data[r] >= 0 { R_BASE.data[r] } else { R_SEP.data[r] } }
+fn ours_end(r: i64, tcx: Tcx<Comp>) -> i64 {
+    unsafe { if tcx.r_base.data[r] >= 0 { tcx.r_base.data[r] } else { tcx.r_sep.data[r] } }
 }
 
 // `FILE:A-B<TAB>ITEMS<TAB>ours N lines (LABEL)[<TAB>base ...]<TAB>theirs ...`
-fn put_region(out: i64, r: i64) {
+fn put_region(out: i64, r: i64, tcx: Tcx<Comp>) {
     unsafe {
-        let f = R_FILE.data[r];
-        let s = R_START.data[r];
-        buf_bytes(out, path_of(f));
+        let f = tcx.r_file.data[r];
+        let s = tcx.conflicts_r_start.data[r];
+        buf_bytes(out, path_of(f, tcx));
         buf_byte(out, ':');
         buf_int(out, s);
         buf_byte(out, '-');
-        buf_int(out, R_END.data[r]);
+        buf_int(out, tcx.conflicts_r_end.data[r]);
         buf_byte(out, '\t');
-        buf_bytes(out, buf_slice(R_ITEMS.data[r]));
+        buf_bytes(out, buf_slice(tcx.r_items.data[r]));
         buf_byte(out, '\t');
-        put_side(out, f, c"ours", s, ours_end(r) - s - 1);
-        if R_BASE.data[r] >= 0 {
+        put_side(out, f, c"ours", s, ours_end(r, tcx) - s - 1, tcx);
+        if tcx.r_base.data[r] >= 0 {
             buf_byte(out, '\t');
-            put_side(out, f, c"base", R_BASE.data[r], R_SEP.data[r] - R_BASE.data[r] - 1);
+            put_side(out, f, c"base", tcx.r_base.data[r],
+                tcx.r_sep.data[r] - tcx.r_base.data[r] - 1, tcx);
         }
         buf_byte(out, '\t');
-        put_side(out, f, c"theirs", R_END.data[r], R_END.data[r] - R_SEP.data[r] - 1);
+        put_side(out, f, c"theirs", tcx.conflicts_r_end.data[r],
+            tcx.conflicts_r_end.data[r] - tcx.r_sep.data[r] - 1, tcx);
         buf_byte(out, '\n');
     }
 }
 
 // One side's lines a..b (excluded) of file f, under `// SIDE (LABEL), lines A-B:`.
-fn show_side(out: i64, f: i64, side: *u8, marker_line: i64, a: i64, b: i64) {
+fn show_side(out: i64, f: i64, side: *u8, marker_line: i64, a: i64, b: i64, tcx: Tcx<Comp>) {
     buf_str(out, c"// ");
     buf_str(out, side);
-    let lab = label(line(f, marker_line));
+    let lab = label(line(f, marker_line, tcx));
     if lab.len > 0 {
         buf_str(out, c" (");
         buf_bytes(out, lab);
@@ -744,29 +731,31 @@ fn show_side(out: i64, f: i64, side: *u8, marker_line: i64, a: i64, b: i64) {
     }
     buf_str(out, c":\n");
     for n in a..b {
-        buf_bytes(out, line(f, n));
+        buf_bytes(out, line(f, n, tcx));
         buf_byte(out, '\n');
     }
 }
 
-fn show_region(out: i64, r: i64) {
+fn show_region(out: i64, r: i64, tcx: Tcx<Comp>) {
     unsafe {
-        let f = R_FILE.data[r];
-        let s = R_START.data[r];
+        let f = tcx.r_file.data[r];
+        let s = tcx.conflicts_r_start.data[r];
         buf_str(out, c"// ");
-        buf_bytes(out, path_of(f));
+        buf_bytes(out, path_of(f, tcx));
         buf_byte(out, ':');
         buf_int(out, s);
         buf_byte(out, '-');
-        buf_int(out, R_END.data[r]);
+        buf_int(out, tcx.conflicts_r_end.data[r]);
         buf_byte(out, '\t');
-        buf_bytes(out, buf_slice(R_ITEMS.data[r]));
+        buf_bytes(out, buf_slice(tcx.r_items.data[r]));
         buf_byte(out, '\n');
-        show_side(out, f, c"ours", s, s + 1, ours_end(r));
-        if R_BASE.data[r] >= 0 {
-            show_side(out, f, c"base", R_BASE.data[r], R_BASE.data[r] + 1, R_SEP.data[r]);
+        show_side(out, f, c"ours", s, s + 1, ours_end(r, tcx), tcx);
+        if tcx.r_base.data[r] >= 0 {
+            show_side(out, f, c"base", tcx.r_base.data[r], tcx.r_base.data[r] + 1,
+                tcx.r_sep.data[r], tcx);
         }
-        show_side(out, f, c"theirs", R_END.data[r], R_SEP.data[r] + 1, R_END.data[r]);
+        show_side(out, f, c"theirs", tcx.conflicts_r_end.data[r], tcx.r_sep.data[r] + 1,
+            tcx.conflicts_r_end.data[r], tcx);
     }
 }
 
@@ -780,8 +769,8 @@ pub fn conflicts_leaf(gpa: Gpa) -> Leaf<Gpa> {
 
 // `volec query conflicts [FILE|DIR|FILE:LINE...] [--show] [--root R]`:
 // the exit status (the diagnostics are written by run_query).
-pub fn run_conflicts(c: Call<Gpa>) -> i64 {
-    TOOL = 0 as *u8;
+pub fn run_conflicts(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    tcx.tool = 0 as *u8;
     var show = false;
     var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     for ev in c.evs.iter() {
@@ -789,13 +778,13 @@ pub fn run_conflicts(c: Call<Gpa>) -> i64 {
         if is_flag(ev, "show") {
             show = true;
         } else if is_opt(ev, "root") {
-            ROOT_GIVEN = a;
+            tcx.root_given = a;
         } else if ev.kind != EV_WORD || ev.text.starts_with("--") {
-            let d = diag(c"error", c"query.usage");
+            let d = diag(c"error", c"query.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, a);
             buf_str(d, c"' of query conflicts (--show, --root)\n");
-            let out = try_start();
+            let out = try_start(&tcx);
             buf_str(out, c" query conflicts --show");
             try_end(out);
             return 2;
@@ -806,35 +795,35 @@ pub fn run_conflicts(c: Call<Gpa>) -> i64 {
     unsafe {
         var sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if args.count == 0 {
-            if !read_dir(default_dir()) {
+            if !read_dir(default_dir(tcx), &tcx) {
                 return 1;
             }
-            for r in 0..R_FILE.count {
+            for r in 0..tcx.r_file.count {
                 sel.push(r);
             }
         }
         for k in 0..args.count {
             let a = args.data[k] as *u8;
-            let t = file_target(a, &sel);
+            let t = file_target(a, &sel, &tcx);
             if t == 2 {
                 return 1;
             }
             if t == 1 {
-                let before = R_FILE.count;
-                if !read_dir(a) {
+                let before = tcx.r_file.count;
+                if !read_dir(a, &tcx) {
                     return 1;
                 }
-                for r in before..R_FILE.count {
+                for r in before..tcx.r_file.count {
                     add_region(&sel, r);
                 }
             }
         }
         if sel.count == 0 {
-            let d = diag(c"note", c"conflict.none");
+            let d = diag(c"note", c"conflict.none", &tcx);
             buf_str(d, c"no conflict markers in ");
             if args.count == 0 {
                 buf_str(d, c"the .vl files under ");
-                buf_str(d, default_dir());
+                buf_str(d, default_dir(tcx));
             } else {
                 for k in 0..args.count {
                     if k > 0 {
@@ -849,9 +838,9 @@ pub fn run_conflicts(c: Call<Gpa>) -> i64 {
         let out = buf_new();
         for k in 0..sel.count {
             if show {
-                show_region(out, sel.data[k]);
+                show_region(out, sel.data[k], tcx);
             } else {
-                put_region(out, sel.data[k]);
+                put_region(out, sel.data[k], tcx);
             }
         }
         buf_write_fd(out, STDOUT);

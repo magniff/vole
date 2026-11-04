@@ -8,47 +8,37 @@
 // against its original: the same pieces, byte for byte.
 
 use crate::base::{IntVec, SRC, _setjmp, buf_slice};
+use crate::base::comp::Comp;
 use crate::base::diag::{
     ERR, ERR_KIND, RECOVER_DEPTH, errors_forget, errors_mark, recover_enter, recover_leave,
 };
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
+use crate::tools::ctx::Tcx;
 
 pub const LINE_COMMENT: i64 = -1;
 pub const BLOCK_COMMENT: i64 = -2;
 
 // The text being formatted, and its pieces.
 pub static var FT: [u8] = "";
-pub static var P_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var P_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var P_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var P_NL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The other bracket of each bracket piece (-1 for the others).
-pub static var MATCH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// (0.15) Whether each piece is inside an f-string: in a hole, or its
-// middle or tail text (1), or not (0); its head is not. fmt breaks no
-// line there.
-pub static var IN_F: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Why the text could not be read: the message and its byte offset.
 pub static var BAD_MESSAGE: [u8] = "";
-pub static var BAD_AT: i64 = 0;
 
 fn clear(v: inout IntVec) {
     v.count = 0;
 }
 
-fn push_piece(start: i64, end: i64, kind: i64, nl: i64) {
-    P_START.push(start);
-    P_END.push(end);
-    P_KIND.push(kind);
-    P_NL.push(nl);
+fn push_piece(start: i64, end: i64, kind: i64, nl: i64, tcx: inout Tcx<Comp>) {
+    tcx.p_start.push(start);
+    tcx.p_end.push(end);
+    tcx.p_kind.push(kind);
+    tcx.p_nl.push(nl);
 }
 
 // The comments in text[from..to) (blanks and comments only), as pieces;
 // `nl` counts the line breaks before the first. Returns the line breaks
 // after the last.
-fn gap_pieces(from: i64, to: i64, nl: i64) -> i64 {
+fn gap_pieces(from: i64, to: i64, nl: i64, tcx: inout Tcx<Comp>) -> i64 {
     let t = FT;
     var breaks = nl;
     var i = from;
@@ -63,7 +53,7 @@ fn gap_pieces(from: i64, to: i64, nl: i64) -> i64 {
                 i += 1;
             }
             // (as written, trailing blanks too: a test directive may end with one)
-            push_piece(s, i, LINE_COMMENT, breaks);
+            push_piece(s, i, LINE_COMMENT, breaks, &tcx);
             breaks = 0;
         } else if c == '/' && i + 1 < to && t[i + 1] == '*' {
             let s = i;
@@ -82,7 +72,7 @@ fn gap_pieces(from: i64, to: i64, nl: i64) -> i64 {
                     i += 1;
                 }
             }
-            push_piece(s, i, BLOCK_COMMENT, breaks);
+            push_piece(s, i, BLOCK_COMMENT, breaks, &tcx);
             breaks = 0;
         } else {
             i += 1;
@@ -93,17 +83,17 @@ fn gap_pieces(from: i64, to: i64, nl: i64) -> i64 {
 
 // Reads `text` into pieces (FT, P_*); false when it does not lex
 // (BAD_MESSAGE, BAD_AT say why).
-pub fn read_pieces(text: [u8]) -> bool {
+pub fn read_pieces(text: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         // (0.25: a static holds only views of static data; the text
         // outlives every use of FT, the caller's)
         let p = text.ptr;
         FT = p[0..text.len];
-        clear(&P_START);
-        clear(&P_END);
-        clear(&P_KIND);
-        clear(&P_NL);
-        clear(&MATCH);
+        clear(&tcx.p_start);
+        clear(&tcx.p_end);
+        clear(&tcx.p_kind);
+        clear(&tcx.p_nl);
+        clear(&tcx.match_);
         let first = TOK_COUNT;
         let saved = SRC;
         let mark = errors_mark();
@@ -125,7 +115,7 @@ pub fn read_pieces(text: [u8]) -> bool {
         ERR_KIND = error_kind;
         if !ok {
             BAD_MESSAGE = buf_slice(ERR);
-            BAD_AT = if TOK_COUNT > first { TOKS[TOK_COUNT - 1].end } else { 0 };
+            tcx.bad_at = if TOK_COUNT > first { TOKS[TOK_COUNT - 1].end } else { 0 };
             errors_forget(mark);
             TOK_COUNT = first;
             return false;
@@ -133,30 +123,30 @@ pub fn read_pieces(text: [u8]) -> bool {
         var at = 0;
         var nl = 1;
         for k in first..TOK_COUNT {
-            nl = gap_pieces(at, TOKS[k].start, nl);
-            push_piece(TOKS[k].start, TOKS[k].end, TOKS[k].kind as i64, nl);
+            nl = gap_pieces(at, TOKS[k].start, nl, &tcx);
+            push_piece(TOKS[k].start, TOKS[k].end, TOKS[k].kind as i64, nl, &tcx);
             nl = 0;
             at = TOKS[k].end;
         }
-        gap_pieces(at, text.len as i64, nl);
+        gap_pieces(at, text.len as i64, nl, &tcx);
         TOK_COUNT = first;
-        match_brackets()
+        match_brackets(&tcx)
     }
 }
 
 // MATCH; false when the brackets do not balance (BAD_MESSAGE, BAD_AT).
-fn match_brackets() -> bool {
+fn match_brackets(tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        clear(&IN_F);
+        clear(&tcx.in_f);
         var in_f = 0;
-        for i in 0..P_KIND.count {
-            MATCH.push(-1);
-            let k = P_KIND.data[i];
+        for i in 0..tcx.p_kind.count {
+            tcx.match_.push(-1);
+            let k = tcx.p_kind.data[i];
             // (0.15: an f-string's holes, up to its tail)
-            IN_F.push(in_f);
-            if k == Tok::FHead as i64 && P_END.data[i] > P_START.data[i]
-                && FT[P_END.data[i] - 1] == '{' {
+            tcx.in_f.push(in_f);
+            if k == Tok::FHead as i64 && tcx.p_end.data[i] > tcx.p_start.data[i]
+                && FT[tcx.p_end.data[i] - 1] == '{' {
                 in_f = 1;
             } else if k == Tok::FTail as i64 {
                 in_f = 0;
@@ -164,19 +154,19 @@ fn match_brackets() -> bool {
             if is_open(k) {
                 stack.push(i);
             } else if is_close(k) {
-                if stack.count == 0 || P_KIND.data[stack.data[stack.count - 1]] != k - 1 {
+                if stack.count == 0 || tcx.p_kind.data[stack.data[stack.count - 1]] != k - 1 {
                     BAD_MESSAGE = "unbalanced brackets";
-                    BAD_AT = P_START.data[i];
+                    tcx.bad_at = tcx.p_start.data[i];
                     return false;
                 }
                 let o = stack.pop();
-                MATCH.data[o] = i;
-                MATCH.data[i] = o;
+                tcx.match_.data[o] = i;
+                tcx.match_.data[i] = o;
             }
         }
         if stack.count > 0 {
             BAD_MESSAGE = "unclosed bracket";
-            BAD_AT = P_START.data[stack.data[stack.count - 1]];
+            tcx.bad_at = tcx.p_start.data[stack.data[stack.count - 1]];
             return false;
         }
         true
@@ -196,41 +186,41 @@ pub fn is_comment(k: i64) -> bool {
 }
 
 // The text of piece i.
-pub fn piece(i: i64) -> [u8] {
-    unsafe { FT[P_START.data[i]..P_END.data[i]] }
+pub fn piece(i: i64, tcx: Tcx<Comp>) -> [u8] {
+    unsafe { FT[tcx.p_start.data[i]..tcx.p_end.data[i]] }
 }
 
-pub fn kind(i: i64) -> i64 {
-    unsafe { P_KIND.data[i] }
+pub fn kind(i: i64, tcx: Tcx<Comp>) -> i64 {
+    unsafe { tcx.p_kind.data[i] }
 }
 
 // Whether two texts have the same pieces (the formatter's check: only
 // blanks changed, and 0.25.1, trailing commas: a `,` before a closing
 // bracket). Reads both; the pieces left are `after`'s.
-pub fn same_pieces(before: [u8], after: [u8]) -> bool {
+pub fn same_pieces(before: [u8], after: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        if !read_pieces(before) {
+        if !read_pieces(before, &tcx) {
             return false;
         }
-        let n = P_KIND.count;
-        let starts = P_START;
-        let ends = P_END;
-        let kinds = P_KIND;
-        P_START = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        P_END = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        P_KIND = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !read_pieces(after) {
+        let n = tcx.p_kind.count;
+        let starts = tcx.p_start;
+        let ends = tcx.p_end;
+        let kinds = tcx.p_kind;
+        tcx.p_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        tcx.p_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        tcx.p_kind = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !read_pieces(after, &tcx) {
             return false;
         }
-        let m = P_KIND.count;
+        let m = tcx.p_kind.count;
         var i = 0;
         var j = 0;
         while i < n || j < m {
-            if i < n && trailing_comma(kinds, i) && !(j < m && trailing_comma(P_KIND, j)) {
+            if i < n && trailing_comma(kinds, i) && !(j < m && trailing_comma(tcx.p_kind, j)) {
                 i += 1;
                 continue;
             }
-            if j < m && trailing_comma(P_KIND, j) && !(i < n && trailing_comma(kinds, i)) {
+            if j < m && trailing_comma(tcx.p_kind, j) && !(i < n && trailing_comma(kinds, i)) {
                 j += 1;
                 continue;
             }
@@ -238,8 +228,8 @@ pub fn same_pieces(before: [u8], after: [u8]) -> bool {
                 return false;
             }
             let a = before[starts.data[i]..ends.data[i]];
-            let b = piece(j);
-            if kinds.data[i] != P_KIND.data[j] || a.len != b.len {
+            let b = piece(j, tcx);
+            if kinds.data[i] != tcx.p_kind.data[j] || a.len != b.len {
                 return false;
             }
             for x in 0..a.len {

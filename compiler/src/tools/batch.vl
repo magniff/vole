@@ -21,14 +21,16 @@
 use crate::base::{
     IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_WORD, Leaf, Line, flag, is_flag, is_opt, option, table, word_of};
 use crate::tools::commands::run_command;
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{
     buf_cstr, fork_worker, read_file_if, read_stdin, remove_file, wait_any, worker_exit,
     write_file_if,
 };
 use crate::tools::query::c_slice;
-use crate::tools::query::diagnostics::{PROG, TOOL, diag, put_cword, put_word, write_diags};
+use crate::tools::query::diagnostics::{PROG, diag, put_cword, put_word, write_diags};
 use crate::tools::script::read_commands;
 
 extern "C" {
@@ -40,14 +42,14 @@ extern "C" {
     fn setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
 }
 
-pub fn run_batch(c: Call<Gpa>) -> i64 {
-    let status = batch_inner(c);
-    write_diags();
+pub fn run_batch(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = batch_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"batch.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"batch.usage", &tcx);
     buf_str(d, message);
     buf_str(d, c"; usage: volec batch [FILE] [--root R] [--stop], one command per line\n");
     2
@@ -61,10 +63,10 @@ pub fn batch_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "file")
 }
 
-fn batch_inner(c: Call<Gpa>) -> i64 {
+fn batch_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     let gpa = c.gpa;
     PROG = c.prog();
-    TOOL = c"batch";
+    tcx.tool = c"batch";
     var root = 0 as *u8;
     var file = 0 as *u8;
     var stop = false;
@@ -75,7 +77,7 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
         } else if is_opt(ev, "root") {
             root = a;
         } else if ev.kind != EV_WORD || ev.text.starts_with("--") {
-            let d = diag(c"error", c"batch.usage");
+            let d = diag(c"error", c"batch.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, a);
             buf_str(d, c"' (--root R, --stop)\n");
@@ -83,21 +85,21 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
         } else if file == 0 as *u8 {
             file = a;
         } else {
-            return usage(c"one FILE of commands");
+            return usage(c"one FILE of commands", &tcx);
         }
     }
     unsafe {
         let text = buf_new();
         if file != 0 as *u8 {
             if !read_file_if(file, text) {
-                let d = diag(c"error", c"batch.usage");
+                let d = diag(c"error", c"batch.usage", &tcx);
                 buf_str(d, c"cannot read '");
                 buf_str(d, file);
                 buf_str(d, c"'\n");
                 return 2;
             }
-        } else if !read_stdin(text) {
-            return usage(c"no commands: give a FILE or pipe them in");
+        } else if !read_stdin(text, &tcx) {
+            return usage(c"no commands: give a FILE or pipe them in", &tcx);
         }
         let name = if file != 0 as *u8 { file } else { c"stdin" };
         var steps = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -105,11 +107,11 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
         var bodies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var numbers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !read_commands(buf_slice(text), name, c"batch.format", &steps, &inputs,
-            &bodies, &numbers) {
+            &bodies, &numbers, &tcx) {
             return 2;
         }
         if steps.count == 0 {
-            let d = diag(c"note", c"batch.usage");
+            let d = diag(c"note", c"batch.usage", &tcx);
             buf_str(d, c"no commands in ");
             buf_str(d, name);
             buf_byte(d, '\n');
@@ -137,7 +139,7 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
                 buf_str(head, c" <<");
                 buf_str(head, input);
                 if !write_file_if(stdin_path, buf_slice(bodies.data[k])) {
-                    let d = diag(c"error", c"batch.usage");
+                    let d = diag(c"error", c"batch.usage", &tcx);
                     buf_str(d, c"cannot write '");
                     buf_str(d, stdin_path);
                     buf_str(d, c"'\n");
@@ -150,8 +152,8 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
             }
             buf_byte(head, '\n');
             buf_write_fd(head, STDOUT);
-            write_diags();
-            let status = run_one(*w, input, root, gpa);
+            write_diags(tcx);
+            let status = run_one(*w, input, root, gpa, &tcx);
             if bodies.data[k] >= 0 {
                 remove_file(stdin_path);
             }
@@ -175,11 +177,11 @@ fn batch_inner(c: Call<Gpa>) -> i64 {
 
 // Runs command `words` (stdin from file `input`, else none) in a copy of
 // this process, its stderr on its stdout: its exit status.
-fn run_one(words: IntVec, input: *u8, root: *u8, gpa: Gpa) -> i64 {
+fn run_one(words: IntVec, input: *u8, root: *u8, gpa: Gpa, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let pid = fork_worker();
         if pid < 0 {
-            let d = diag(c"error", c"batch.usage");
+            let d = diag(c"error", c"batch.usage", &tcx);
             buf_str(d, c"cannot start a command (fork failed)\n");
             return 1;
         }
@@ -187,11 +189,11 @@ fn run_one(words: IntVec, input: *u8, root: *u8, gpa: Gpa) -> i64 {
             dup2(1, 2);
             let fd = open(if input != 0 as *u8 { input } else { c"/dev/null" }, 0);
             if fd < 0 {
-                let d = diag(c"error", c"batch.usage");
+                let d = diag(c"error", c"batch.usage", &tcx);
                 buf_str(d, c"cannot read '");
                 buf_str(d, input);
                 buf_str(d, c"'\n");
-                write_diags();
+                write_diags(tcx);
                 worker_exit(2);
             }
             dup2(fd, 0);
@@ -205,14 +207,14 @@ fn run_one(words: IntVec, input: *u8, root: *u8, gpa: Gpa) -> i64 {
             for i in 0..n {
                 w.push(word_of(words.get(i) as *u8));
             }
-            var status = run_command(Line { words: w.as_slice() }, false, gpa);
+            var status = run_command(Line { words: w.as_slice() }, false, gpa, &tcx);
             if status < 0 {
-                let d = diag(c"error", c"batch.usage");
+                let d = diag(c"error", c"batch.usage", &tcx);
                 buf_str(d, c"'");
                 buf_bytes(d, w[1].as_bytes());
                 buf_str(d,
                     c"' is not a command batch runs (query, edit, undo, check, fix, fmt, refactor, rewrite, explain, guide, lint)\n");
-                write_diags();
+                write_diags(tcx);
                 status = 2;
             }
             worker_exit(status);

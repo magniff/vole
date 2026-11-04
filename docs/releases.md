@@ -155,6 +155,17 @@ The statics into context structs (statics264):
   generator's task. Statics in compiler/src: 2,138 to 2,149 (the tool
   adds 30 of its own, which phase 2 moves with tools'). `check` of
   compiler/src: 1.00x the base's, 0.95x 0.26.3's.
+- compiler/src, phase 2: 673 of the tools' 760 statics are fields of
+  `tools::ctx::Tcx` (tools/ctx.vl), made once per process by `main` and
+  `cli::run::run` and passed as `tcx` to 1,228 functions (765 inout), so
+  a batch's or the language server's later commands still see what the
+  earlier ones left. The tool's own 32 are among them. 87 stay statics:
+  59 whose users front, base or places reach through a hook (phase 4),
+  7 slices viewing memory the context cannot name, 5 that code outside
+  tools uses, and 16 never written. Statics in compiler/src: 2,151 to
+  1,478. `check` of compiler/src: 1.00x the base's, 0.90x 0.26.3's; the
+  source itself costs 4.9% more to check (the parameters and arguments
+  added).
 
 ### What's new in 0.26.3
 

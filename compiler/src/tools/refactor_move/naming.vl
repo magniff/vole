@@ -16,45 +16,31 @@
 use crate::base::{
     BUFS, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
 };
+use crate::base::comp::Comp;
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::modules::{child_module, module_at, module_count};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::items::after_line;
-use crate::tools::query::{OPT_MAX_LINES, c_slice};
+use crate::tools::query::c_slice;
 use crate::tools::query::defs::{DEFS, K_ENUM, K_FN, K_STRUCT, K_TRAIT, mod_fqn_text};
 use crate::tools::query::diagnostics::{diag, try_begin, try_end};
-use crate::tools::query::refs::{R_DEF, R_POS};
-use crate::tools::refactor_mod::{REFS, comment_line, item_binding, region_name, use_binding};
-use crate::tools::refactor_mod::cli::{OPT_NAMES, is_ident};
-use crate::tools::refactor_move::units::{UN_BANNER, UN_DEF, UN_FILE};
+use crate::tools::refactor_mod::{comment_line, item_binding, region_name, use_binding};
+use crate::tools::refactor_mod::cli::is_ident;
 
 const C_BANNER: i64 = 1;
 const C_TYPE: i64 = 2;
 const C_PREFIX: i64 = 3;
 const C_SUFFIX: i64 = 4;
 
-// The candidates of the part being named: kind, name, what it comes from
-// (a banner's start, a type's or a word's symbol), lines and items covered.
-static var C_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var C_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var C_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var C_LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var C_ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var C_TOTAL: i64 = 0;
-static var C_COUNT: i64 = 0;
-
-// The types general_type has looked at (name + 1 -> 1, or 2: general).
-static var GENERAL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
 // A name for part g of module m (the k-th part), the reason into buffer
 // why: items holds the units of the module's items, lines their lines
 // (with their impl blocks), group the part of each.
 pub fn part_name(m: i64, g: i64, group: *i64, items: IntVec, lines: *i64, n: i64, taken: IntVec,
-    k: i64, why: i64) -> i64 {
+    k: i64, why: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        collect(g, group, items, lines, n);
-        let best = best_candidate(m, taken);
+        collect(g, group, items, lines, n, &tcx);
+        let best = best_candidate(m, taken, tcx);
         if best < 0 {
             let b = buf_new();
             buf_str(b, c"part");
@@ -62,8 +48,8 @@ pub fn part_name(m: i64, g: i64, group: *i64, items: IntVec, lines: *i64, n: i64
             buf_str(why, c"no banner, type, prefix or suffix shared by a third of its lines");
             return intern(buf_slice(b));
         }
-        let kind = C_KIND.data[best];
-        let from = C_FROM.data[best];
+        let kind = tcx.c_kind.data[best];
+        let from = tcx.c_from.data[best];
         if kind == C_BANNER {
             buf_str(why, c"banner '");
             buf_bytes(why, banner_line(from));
@@ -80,68 +66,69 @@ pub fn part_name(m: i64, g: i64, group: *i64, items: IntVec, lines: *i64, n: i64
             buf_bytes(why, SYMS[from].text);
         }
         buf_str(why, c": ");
-        buf_int(why, C_ITEMS.data[best]);
+        buf_int(why, tcx.c_items.data[best]);
         buf_str(why, c" of ");
-        buf_int(why, C_COUNT);
-        buf_str(why, if C_COUNT == 1 { c" item, " } else { c" items, " });
-        buf_int(why, C_LINES.data[best]);
+        buf_int(why, tcx.c_count);
+        buf_str(why, if tcx.c_count == 1 { c" item, " } else { c" items, " });
+        buf_int(why, tcx.c_lines.data[best]);
         buf_str(why, c" of ");
-        buf_int(why, C_TOTAL);
+        buf_int(why, tcx.c_total);
         buf_str(why, c" lines");
-        C_NAME.data[best]
+        tcx.c_name.data[best]
     }
 }
 
 // How well part g can be named (per mille of its lines its best name
 // covers, names taken or not): the parts are named best first, so that a
 // part does not take the name another fits better.
-pub fn part_score(m: i64, g: i64, group: *i64, items: IntVec, lines: *i64, n: i64) -> i64 {
+pub fn part_score(m: i64, g: i64, group: *i64, items: IntVec, lines: *i64, n: i64,
+    tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        collect(g, group, items, lines, n);
+        collect(g, group, items, lines, n, &tcx);
         let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let best = best_candidate(m, none);
-        if best < 0 || C_TOTAL == 0 { 0 } else { C_LINES.data[best] * 1000 / C_TOTAL }
+        let best = best_candidate(m, none, tcx);
+        if best < 0 || tcx.c_total == 0 { 0 } else { tcx.c_lines.data[best] * 1000 / tcx.c_total }
     }
 }
 
 // The candidates of part g, with its lines (C_TOTAL) and items (C_COUNT).
-fn collect(g: i64, group: *i64, items: IntVec, lines: *i64, n: i64) {
+fn collect(g: i64, group: *i64, items: IntVec, lines: *i64, n: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        C_KIND.count = 0;
-        C_NAME.count = 0;
-        C_FROM.count = 0;
-        C_LINES.count = 0;
-        C_ITEMS.count = 0;
-        C_TOTAL = 0;
-        C_COUNT = 0;
+        tcx.c_kind.count = 0;
+        tcx.c_name.count = 0;
+        tcx.c_from.count = 0;
+        tcx.c_lines.count = 0;
+        tcx.c_items.count = 0;
+        tcx.c_total = 0;
+        tcx.c_count = 0;
         for i in 0..n {
             if group[i] != g {
                 continue;
             }
             let u = items.data[i];
-            let d = UN_DEF.data[u];
+            let d = tcx.un_def.data[u];
             let l = lines[i];
-            C_TOTAL += l;
-            C_COUNT += 1;
-            let b = group_banner(u);
+            tcx.c_total += l;
+            tcx.c_count += 1;
+            let b = group_banner(u, tcx);
             if b >= 0 {
                 let name = banner_name(b);
                 if name >= 0 {
-                    add_candidate(C_BANNER, name, b, l);
+                    add_candidate(C_BANNER, name, b, l, &tcx);
                 }
             }
-            let t = operand_type(d);
+            let t = operand_type(d, &tcx);
             if t >= 0 {
-                add_candidate(C_TYPE, snake(SYMS[t].text), t, l);
+                add_candidate(C_TYPE, snake(SYMS[t].text), t, l, &tcx);
             }
             let s = SYMS[DEFS[d].name].text;
             let first = word_at(s, true);
             if first >= 0 {
-                add_candidate(C_PREFIX, first, first, l);
+                add_candidate(C_PREFIX, first, first, l, &tcx);
             }
             let last = word_at(s, false);
             if last >= 0 && last != first {
-                add_candidate(C_SUFFIX, last, last, l);
+                add_candidate(C_SUFFIX, last, last, l, &tcx);
             }
         }
     }
@@ -150,18 +137,21 @@ fn collect(g: i64, group: *i64, items: IntVec, lines: *i64, n: i64) {
 // The best candidate whose name is free: the most lines (at least a third
 // of the part's), then the kind's order; a prefix or suffix of two items
 // or more. -1 for none.
-fn best_candidate(m: i64, taken: IntVec) -> i64 {
+fn best_candidate(m: i64, taken: IntVec, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         var best = -1;
-        for c in 0..C_KIND.count {
-            if C_LINES.data[c] * 3 < C_TOTAL || !free_name(m, C_NAME.data[c], taken) {
+        for c in 0..tcx.c_kind.count {
+            if tcx.c_lines.data[c] * 3 < tcx.c_total
+                || !free_name(m, tcx.c_name.data[c], taken, tcx) {
                 continue;
             }
-            if (C_KIND.data[c] == C_PREFIX || C_KIND.data[c] == C_SUFFIX) && C_ITEMS.data[c] < 2 {
+            if (tcx.c_kind.data[c] == C_PREFIX || tcx.c_kind.data[c] == C_SUFFIX)
+                && tcx.c_items.data[c] < 2 {
                 continue;
             }
-            if best < 0 || C_LINES.data[c] > C_LINES.data[best]
-                || (C_LINES.data[c] == C_LINES.data[best] && C_KIND.data[c] < C_KIND.data[best]) {
+            if best < 0 || tcx.c_lines.data[c] > tcx.c_lines.data[best]
+                || (tcx.c_lines.data[c] == tcx.c_lines.data[best]
+                    && tcx.c_kind.data[c] < tcx.c_kind.data[best]) {
                 best = c;
             }
         }
@@ -172,8 +162,8 @@ fn best_candidate(m: i64, taken: IntVec) -> i64 {
 // The names of --names (a,b,c) into out, for the `parts` parts that
 // leave m, in order (fewer: the others are found); false after a
 // diagnostic.
-pub fn names_given(m: i64, out: inout IntVec, parts: i64) -> bool {
-    let s = c_slice(OPT_NAMES);
+pub fn names_given(m: i64, out: inout IntVec, parts: i64, tcx: inout Tcx<Comp>) -> bool {
+    let s = c_slice(tcx.cli_opt_names);
     var i = 0;
     while i < s.len as i64 {
         var e = i;
@@ -186,27 +176,27 @@ pub fn names_given(m: i64, out: inout IntVec, parts: i64) -> bool {
             continue;
         }
         let name = intern(w);
-        if !free_name(m, name, out) {
-            let d = diag(c"error", c"refactor.collision");
+        if !free_name(m, name, out, tcx) {
+            let d = diag(c"error", c"refactor.collision", &tcx);
             buf_str(d, c"--names: '");
             buf_bytes(d, w);
             buf_str(d, c"' is not an identifier, or a name ");
-            buf_bytes(d, mod_fqn_text(m));
+            buf_bytes(d, mod_fqn_text(m, &tcx));
             buf_str(d, c" or another part has\n");
             return false;
         }
         out.push(name);
     }
     if out.count > parts {
-        let d = diag(c"error", c"refactor.usage");
+        let d = diag(c"error", c"refactor.usage", &tcx);
         buf_str(d, c"--names gives ");
         buf_int(d, out.count);
         buf_str(d, c" names for ");
         buf_int(d, parts);
         buf_str(d, if parts == 1 { c" part\n" } else { c" parts\n" });
-        let t = try_begin(c"split", mod_fqn_text(m), true);
+        let t = try_begin(c"split", mod_fqn_text(m, &tcx), true, &tcx);
         buf_str(t, c" --plan --max-lines ");
-        buf_int(t, OPT_MAX_LINES);
+        buf_int(t, tcx.opt_max_lines);
         try_end(t);
         return false;
     }
@@ -215,10 +205,11 @@ pub fn names_given(m: i64, out: inout IntVec, parts: i64) -> bool {
 
 // Whether `name` can name a new child of m: an identifier, not a name m
 // has (nor m's own: `gen::gen`), nor one a part before took.
-pub fn free_name(m: i64, name: i64, taken: IntVec) -> bool {
+pub fn free_name(m: i64, name: i64, taken: IntVec, tcx: Tcx<Comp>) -> bool {
     unsafe {
-        if !is_ident(SYMS[name].text) || item_binding(m, name) >= 0 || use_binding(m, name) >= 0
-            || child_module(m, name) >= 0 || name == region_name(m) {
+        if !is_ident(SYMS[name].text) || item_binding(m, name, tcx) >= 0
+            || use_binding(m, name) >= 0
+            || child_module(m, name) >= 0 || name == region_name(m, tcx) {
             return false;
         }
         for j in 0..taken.count {
@@ -231,31 +222,31 @@ pub fn free_name(m: i64, name: i64, taken: IntVec) -> bool {
 }
 
 // Adds l lines of an item to candidate (kind, name).
-fn add_candidate(kind: i64, name: i64, from: i64, l: i64) {
+fn add_candidate(kind: i64, name: i64, from: i64, l: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        for c in 0..C_KIND.count {
-            if C_KIND.data[c] == kind && C_FROM.data[c] == from {
-                C_LINES.data[c] += l;
-                C_ITEMS.data[c] += 1;
+        for c in 0..tcx.c_kind.count {
+            if tcx.c_kind.data[c] == kind && tcx.c_from.data[c] == from {
+                tcx.c_lines.data[c] += l;
+                tcx.c_items.data[c] += 1;
                 return;
             }
         }
-        C_KIND.push(kind);
-        C_NAME.push(name);
-        C_FROM.push(from);
-        C_LINES.push(l);
-        C_ITEMS.push(1);
+        tcx.c_kind.push(kind);
+        tcx.c_name.push(name);
+        tcx.c_from.push(from);
+        tcx.c_lines.push(l);
+        tcx.c_items.push(1);
     }
 }
 
 // The banner heading the group of unit u: its start, or -1.
-fn group_banner(u: i64) -> i64 {
+fn group_banner(u: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        let f = UN_FILE.data[u];
+        let f = tcx.un_file.data[u];
         var v = u;
-        while v >= 0 && UN_FILE.data[v] == f {
-            if UN_BANNER.data[v] >= 0 {
-                return UN_BANNER.data[v];
+        while v >= 0 && tcx.un_file.data[v] == f {
+            if tcx.un_banner.data[v] >= 0 {
+                return tcx.un_banner.data[v];
             }
             v -= 1;
         }
@@ -331,7 +322,7 @@ fn banner_name(b: i64) -> i64 {
 // The type item d operates on: a struct, enum or trait itself, or the
 // named type of a function's first parameter (behind pointers, slices
 // and arrays) that is not a primitive nor a one-letter generic; -1.
-fn operand_type(d: i64) -> i64 {
+fn operand_type(d: i64, tcx: inout Tcx<Comp>) -> i64 {
     let k = DEFS[d].kind;
     if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
         return DEFS[d].name;
@@ -354,7 +345,7 @@ fn operand_type(d: i64) -> i64 {
     }
     let name = NODES[t].a;
     let s = SYMS[name].text;
-    if s.len < 2 || primitive(s) || general_type(name) {
+    if s.len < 2 || primitive(s) || general_type(name, &tcx) {
         return -1;
     }
     name
@@ -363,29 +354,29 @@ fn operand_type(d: i64) -> i64 {
 // Whether the type named `name` is a general one (a vector, a map: used
 // in more than a quarter of the program's modules, and in five or more),
 // which names no part: what the items have in common is elsewhere.
-fn general_type(name: i64) -> bool {
+fn general_type(name: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        let known = GENERAL.get(name + 1);
+        let known = tcx.general.get(name + 1);
         if known != 0 {
             return known == 2;
         }
         var modules = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         var count = 0;
-        for k in 0..REFS.count {
-            let r = REFS.data[k];
-            let d = R_DEF.data[r];
+        for k in 0..tcx.refs.count {
+            let r = tcx.refs.data[k];
+            let d = tcx.r_def.data[r];
             let kind = DEFS[d].kind;
             if DEFS[d].name != name || (kind != K_STRUCT && kind != K_ENUM && kind != K_TRAIT) {
                 continue;
             }
-            let m = module_at(R_POS.data[r]);
+            let m = module_at(tcx.r_pos.data[r]);
             if modules.get(m + 1) == 0 {
                 modules.put(m + 1, 1);
                 count += 1;
             }
         }
         let general = count >= 5 && count * 4 > module_count();
-        GENERAL.put(name + 1, if general { 2 } else { 1 });
+        tcx.general.put(name + 1, if general { 2 } else { 1 });
         general
     }
 }
