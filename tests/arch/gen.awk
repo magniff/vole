@@ -456,7 +456,7 @@ function intrinsic(    i, j, p, np, ps, nt, pn, pt, m, mlist, cm, e, call, ninpu
     code = code ind "for q in 0.." nq " {\n" ind "    bad += run_" sfx "(q, " run_args() "bad);\n" ind "    cases += 1;\n" ind "}\n"
     if (MEMK != "") code = code "        }\n"
     code = code "    }\n    bad += fold_" sfx "(bad);\n"
-    code = code "    println(f\"" NAME ": {cases} run-time cases, " nlit " constant ones\");\n    bad\n}\n\n"
+    code = code "    println(\"" NAME ": {cases} run-time cases, " nlit " constant ones\");\n    bad\n}\n\n"
     BODY = BODY code
     return 1
 }
@@ -610,10 +610,10 @@ function same(lt, want, got) {
 function fail_lines(k, got, want,    p, s) {
     s = "            if nbad < 10 {\n                let fail_got = " got ";\n                let fail_want = " want ";\n                print(\"FAIL " NAME "\");\n"
     for (p = 1; p <= NP; p++) {
-        if (P_kind[p] == "const" || P_kind[p] == "index") s = s "                print(f\" " P_name[p] "={" pv(p) "}\");\n"
+        if (P_kind[p] == "const" || P_kind[p] == "index") s = s "                print(\" " P_name[p] "={" pv(p) "}\");\n"
         else s = s "                print(\" " P_name[p] "=\");\n                show(" pv(p) ");\n"
     }
-    s = s "                println(f\": " (CAST ? "byte" : R_kind == "none" ? "element" : R_kind == "scalar" ? "result" : "lane") " {" k "}: got {fail_got}, want {fail_want}\");\n            }\n"
+    s = s "                println(\": " (CAST ? "byte" : R_kind == "none" ? "element" : R_kind == "scalar" ? "result" : "lane") " {}: got {fail_got}, want {fail_want}\", " k ");\n            }\n"
     return s
 }
 
@@ -647,7 +647,7 @@ function flush(    f, i, r, u, ot) {
     printf "%s", BODY >f
     print "fn main() -> i32 {\n    var bad: i64 = 0;" >f
     for (i = 0; i < NTESTS; i++) print MAINS[i] >f
-    print "    if bad != 0 {\n        println(f\"" PREFIX "_" FAMILY ": {bad} failing\");\n        return 1;\n    }\n    0\n}" >f
+    print "    if bad != 0 {\n        println(\"" PREFIX "_" FAMILY ": {bad} failing\");\n        return 1;\n    }\n    0\n}" >f
     close(f)
     print "program " f
     NTESTS = 0; BODY = ""; split("", USED)
@@ -677,7 +677,7 @@ BEGIN {
         "fn min<T>(a: T, b: T) -> T { if a < b { a } else { b } }\n" \
         "fn abs(a: i64) -> i64 { if a < 0 { -a } else { a } }\n" \
         "fn clamp(a: i64, lo: i64, hi: i64) -> i64 { if a < lo { lo } else if a > hi { hi } else { a } }\n\n" \
-        "fn show<T>(xs: [T]) {\n    print(\"[\");\n    for k in 0..xs.len as i64 {\n        if k > 0 { print(\" \"); }\n        print(f\"{xs[k]}\");\n    }\n    print(\"]\");\n}\n\n" \
+        "fn show<T>(xs: [T]) {\n    print(\"[\");\n    for k in 0..xs.len as i64 {\n        if k > 0 { print(\" \"); }\n        print(\"{}\", xs[k]);\n    }\n    print(\"]\");\n}\n\n" \
         "// The integer edges: 0, 1, 2, MAX, MIN, MIN + 1, -2, -1, 0x55.., 0x33..\n" \
         "fn edge_bits(e: i64, bits: i64) -> u64 {\n    let ones: u64 = if bits == 64 { 0xffffffffffffffffu64 } else { (1u64 << bits) - 1 };\n    let top: u64 = 1u64 << (bits - 1);\n" \
         "    if e == 0 { return 0; }\n    if e == 1 { return 1; }\n    if e == 2 { return 2; }\n    if e == 3 { return top - 1; }\n    if e == 4 { return top; }\n    if e == 5 { return top + 1; }\n    if e == 6 { return ones - 1; }\n    if e == 7 { return ones; }\n    if e == 8 { return ones / 3; }\n    ones / 5\n}\n\n" \
