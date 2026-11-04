@@ -77,6 +77,10 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.26.4
+
+The compiler on Rust's overflow checks, its raw-pointer parameters decided, and its statics in context structs. Built and tested on aarch64-macos only.
+
 ### What's new in 0.26.3
 
 Allocation as a capability; compiler/src on 0.26.2's language (format
