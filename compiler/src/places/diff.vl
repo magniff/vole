@@ -16,13 +16,12 @@ use crate::base::comp::Comp;
 use crate::front::ast::NODES;
 use crate::front::own::diag::{OWN_MOVE_OUT, own_begin, own_end, own_flush, own_str};
 use crate::front::types::{TYPES, TyKind};
-use crate::places::cfg::RPO_INDEX;
 use crate::places::front::ast_local_name;
 use crate::places::ir::{
-    B_FN, DS_FLAG, DS_KEPT, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF, PJ_INDEX, PStmt,
-    P_LOCALS, P_STMTS, RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC, SK_LIVE,
-    block_count, block_len, block_start, has_flag, op_a, op_b, op_is_place, op_kind, place_type,
-    proj_kind, proj_parent, succ, succ_count, undistinct,
+    Body, DS_FLAG, DS_KEPT, LF_BORROWED, LF_STATIC, OK_INT, OK_MOVE, PJ_DEREF, PJ_INDEX, PStmt,
+    RV_REF, RV_USE, SK_ASSIGN, SK_CALL, SK_DROP, SK_INTRINSIC, SK_LIVE, block_count, block_len,
+    block_start, has_flag, op_a, op_b, op_is_place, op_kind, place_type, proj_kind, proj_parent,
+    succ, succ_count, undistinct,
 };
 use crate::places::print::{buf_fn_name, buf_pos};
 
@@ -46,36 +45,36 @@ pub fn diff_begin() {
 // The body held, elaborated: its drops checked (--places-diff, when
 // `diff`), its moves out of places the own pass forbids; the statements of
 // blocks never reached left out.
-pub fn record_body(diff: bool) {
+pub fn record_body(diff: bool, pbody: Body<Comp>) {
     if diff {
-        check_drops();
+        check_drops(pbody);
     }
     // (std's containers and iterators copy elements as unsafe code does,
     // as the own pass's move_out: no backstop there)
     let moves = crate::places::build::MOVES_SUSPECT
-        && !crate::front::modules::std_moves_bits(crate::places::front::fn_module(B_FN));
+        && !crate::front::modules::std_moves_bits(crate::places::front::fn_module(pbody.fn_));
     if !moves {
         return;
     }
-    for b in 0..block_count() {
-        let start = block_start(b);
-        if start < 0 || !reached(b) {
+    for b in 0..block_count(pbody) {
+        let start = block_start(b, pbody);
+        if start < 0 || !reached(b, pbody) {
             continue;
         }
-        for s in start..start + block_len(b) {
-            record_moves(P_STMTS[s]);
+        for s in start..start + block_len(b, pbody) {
+            record_moves(pbody.stmts[s], pbody);
         }
     }
 }
 
-fn record_moves(st: PStmt) {
+fn record_moves(st: PStmt, pbody: Body<Comp>) {
     for i in 0..st.nops {
-        if op_kind(st.ops, i) == OK_MOVE {
-            let what = forbidden_move(op_a(st.ops, i), op_b(st.ops, i));
+        if op_kind(st.ops, i, pbody) == OK_MOVE {
+            let what = forbidden_move(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), pbody);
             if what != 0 {
                 MOVES.push(st.node);
                 MOVES.push(what);
-                MOVES.push(B_FN);
+                MOVES.push(pbody.fn_);
             }
         }
     }
@@ -83,38 +82,38 @@ fn record_moves(st: PStmt) {
 
 // Whether block b is reached from bb0 (elaboration's order, when it made
 // one for this body; a block it added is).
-fn reached(b: i64) -> bool {
-    !crate::places::elab::RPO_FRESH || b >= RPO_INDEX.len() as i64 || RPO_INDEX[b] >= 0
+fn reached(b: i64, pbody: Body<Comp>) -> bool {
+    !crate::places::elab::RPO_FRESH || b >= pbody.rpo_index.len() as i64 || pbody.rpo_index[b] >= 0
 }
 
 // Whether a move of place (l, p) is one the own pass forbids: out of an
 // index, through a reference, out of a static or a BORROWED local (W_*;
 // 0: none).
-fn forbidden_move(l: i64, p: i64) -> i64 {
-    if has_flag(l, LF_STATIC) {
+fn forbidden_move(l: i64, p: i64, pbody: Body<Comp>) -> i64 {
+    if has_flag(l, LF_STATIC, pbody) {
         return W_STATIC;
     }
-    if has_flag(l, LF_BORROWED) {
+    if has_flag(l, LF_BORROWED, pbody) {
         return W_BORROWED;
     }
     var q = p;
     while q > 0 {
-        let k = proj_kind(q);
+        let k = proj_kind(q, pbody);
         if k == PJ_INDEX {
             // (an array's or a slice's element; a raw pointer's, `p[i]`, is
             // unsafe code's read)
-            let t = undistinct(place_type(l, proj_parent(q)));
+            let t = undistinct(place_type(l, proj_parent(q, pbody), pbody));
             if t > 0 && (TYPES[t].kind == TyKind::Array || TYPES[t].kind == TyKind::Slice) {
                 return W_INDEX;
             }
         }
         if k == PJ_DEREF {
-            let t = place_type(l, proj_parent(q));
+            let t = place_type(l, proj_parent(q, pbody), pbody);
             if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 {
                 return W_REF;
             }
         }
-        q = proj_parent(q);
+        q = proj_parent(q, pbody);
     }
     0
 }
@@ -174,41 +173,41 @@ static var ALIASES: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // Whether projection a is b or one of b's parents (0, the whole, is every
 // projection's).
-fn proj_within(a: i64, b: i64) -> bool {
+fn proj_within(a: i64, b: i64, pbody: Body<Comp>) -> bool {
     var q = b;
     while q > 0 {
         if q == a {
             return true;
         }
-        q = proj_parent(q);
+        q = proj_parent(q, pbody);
     }
     a == q
 }
 
-fn overlaps(a: i64, b: i64) -> bool {
-    proj_within(a, b) || proj_within(b, a)
+fn overlaps(a: i64, b: i64, pbody: Body<Comp>) -> bool {
+    proj_within(a, b, pbody) || proj_within(b, a, pbody)
 }
 
-fn find_aliases() {
+fn find_aliases(pbody: Body<Comp>) {
     ALIASES.clear();
-    for b in 0..block_count() {
-        let start = block_start(b);
+    for b in 0..block_count(pbody) {
+        let start = block_start(b, pbody);
         if start < 0 {
             continue;
         }
-        for s in start..start + block_len(b) {
-            let st = P_STMTS[s];
+        for s in start..start + block_len(b, pbody) {
+            let st = pbody.stmts[s];
             if st.kind != SK_ASSIGN || st.b != 0 || st.a < 0 {
                 continue;
             }
-            if st.c != RV_REF && !(st.c == RV_USE && has_flag(st.a, LF_BORROWED)) {
+            if st.c != RV_REF && !(st.c == RV_USE && has_flag(st.a, LF_BORROWED, pbody)) {
                 continue;
             }
             for i in 0..st.nops {
-                if op_is_place(op_kind(st.ops, i)) && op_a(st.ops, i) != st.a {
+                if op_is_place(op_kind(st.ops, i, pbody)) && op_a(st.ops, i, pbody) != st.a {
                     ALIASES.push(st.a);
-                    ALIASES.push(op_a(st.ops, i));
-                    ALIASES.push(op_b(st.ops, i));
+                    ALIASES.push(op_a(st.ops, i, pbody));
+                    ALIASES.push(op_b(st.ops, i, pbody));
                 }
             }
         }
@@ -216,24 +215,24 @@ fn find_aliases() {
 }
 
 // Whether statement st reads place (l, p), or an alias of it.
-fn reads(st: PStmt, l: i64, p: i64) -> bool {
+fn reads(st: PStmt, l: i64, p: i64, pbody: Body<Comp>) -> bool {
     for i in 0..st.nops {
-        if !op_is_place(op_kind(st.ops, i)) {
+        if !op_is_place(op_kind(st.ops, i, pbody)) {
             continue;
         }
-        let a = op_a(st.ops, i);
-        if a == l && overlaps(p, op_b(st.ops, i)) {
+        let a = op_a(st.ops, i, pbody);
+        if a == l && overlaps(p, op_b(st.ops, i, pbody), pbody) {
             return true;
         }
         var k = 0;
         while k < ALIASES.len() as i64 {
-            if ALIASES[k] == a && ALIASES[k + 1] == l && overlaps(p, ALIASES[k + 2]) {
+            if ALIASES[k] == a && ALIASES[k + 1] == l && overlaps(p, ALIASES[k + 2], pbody) {
                 return true;
             }
             k += 3;
         }
     }
-    if st.kind == SK_DROP && st.a == l && overlaps(p, st.b)
+    if st.kind == SK_DROP && st.a == l && overlaps(p, st.b, pbody)
         && (st.c == DS_KEPT || st.c == DS_FLAG) {
         return true;
     }
@@ -241,60 +240,60 @@ fn reads(st: PStmt, l: i64, p: i64) -> bool {
 }
 
 // Whether statement st makes place (l, p) again (all of it).
-fn remakes(st: PStmt, l: i64, p: i64) -> bool {
+fn remakes(st: PStmt, l: i64, p: i64, pbody: Body<Comp>) -> bool {
     if st.kind == SK_LIVE && st.a == l {
         return true;
     }
     (st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC) && st.a == l
-        && proj_within(st.b, p)
+        && proj_within(st.b, p, pbody)
 }
 
 // From statement s + 1 of block b: the first statement that reads place
 // (l, p) before it is made again, or -1.
-fn use_after(b: i64, s: i64, l: i64, p: i64) -> i64 {
+fn use_after(b: i64, s: i64, l: i64, p: i64, pbody: Body<Comp>) -> i64 {
     SEEN.clear();
     WORK.clear();
-    for _ in 0..block_count() {
+    for _ in 0..block_count(pbody) {
         SEEN.push(0);
     }
-    let end = block_start(b) + block_len(b);
+    let end = block_start(b, pbody) + block_len(b, pbody);
     for t in s + 1..end {
-        let st = P_STMTS[t];
-        if reads(st, l, p) {
+        let st = pbody.stmts[t];
+        if reads(st, l, p, pbody) {
             return t;
         }
-        if remakes(st, l, p) {
+        if remakes(st, l, p, pbody) {
             return -1;
         }
     }
-    let term = P_STMTS[end];
-    if reads(term, l, p) {
+    let term = pbody.stmts[end];
+    if reads(term, l, p, pbody) {
         return end;
     }
-    for i in 0..succ_count(b) {
-        WORK.push(succ(b, i));
+    for i in 0..succ_count(b, pbody) {
+        WORK.push(succ(b, i, pbody));
     }
     while WORK.len() > 0 {
         let c = WORK.pop().unwrap();
-        if c < 0 || SEEN[c] != 0 || block_start(c) < 0 || !reached(c) {
+        if c < 0 || SEEN[c] != 0 || block_start(c, pbody) < 0 || !reached(c, pbody) {
             continue;
         }
         SEEN[c] = 1;
-        let start = block_start(c);
+        let start = block_start(c, pbody);
         var made = false;
-        for t in start..start + block_len(c) + 1 {
-            let st = P_STMTS[t];
-            if reads(st, l, p) {
+        for t in start..start + block_len(c, pbody) + 1 {
+            let st = pbody.stmts[t];
+            if reads(st, l, p, pbody) {
                 return t;
             }
-            if remakes(st, l, p) {
+            if remakes(st, l, p, pbody) {
                 made = true;
                 break;
             }
         }
         if !made {
-            for i in 0..succ_count(c) {
-                WORK.push(succ(c, i));
+            for i in 0..succ_count(c, pbody) {
+                WORK.push(succ(c, i, pbody));
             }
         }
     }
@@ -303,34 +302,34 @@ fn use_after(b: i64, s: i64, l: i64, p: i64) -> i64 {
 
 // Whether flag f is written on every path from the entry to statement s
 // of block b.
-fn flag_written(f: i64, b: i64, s: i64) -> bool {
+fn flag_written(f: i64, b: i64, s: i64, pbody: Body<Comp>) -> bool {
     SEEN.clear();
     WORK.clear();
-    for _ in 0..block_count() {
+    for _ in 0..block_count(pbody) {
         SEEN.push(0);
     }
     WORK.push(0);
     while WORK.len() > 0 {
         let c = WORK.pop().unwrap();
-        if c < 0 || SEEN[c] != 0 || block_start(c) < 0 {
+        if c < 0 || SEEN[c] != 0 || block_start(c, pbody) < 0 {
             continue;
         }
         SEEN[c] = 1;
-        let start = block_start(c);
+        let start = block_start(c, pbody);
         var written = false;
-        for t in start..start + block_len(c) {
+        for t in start..start + block_len(c, pbody) {
             if c == b && t == s {
                 return false;
             }
-            let st = P_STMTS[t];
+            let st = pbody.stmts[t];
             if st.kind == SK_ASSIGN && st.a == f && st.b == 0 {
                 written = true;
                 break;
             }
         }
         if !written {
-            for i in 0..succ_count(c) {
-                WORK.push(succ(c, i));
+            for i in 0..succ_count(c, pbody) {
+                WORK.push(succ(c, i, pbody));
             }
         }
     }
@@ -338,11 +337,11 @@ fn flag_written(f: i64, b: i64, s: i64) -> bool {
 }
 
 // Whether some statement sets flag f true.
-fn flag_ever_set(f: i64) -> bool {
-    for s in 0..P_STMTS.len() {
-        let st = P_STMTS[s];
+fn flag_ever_set(f: i64, pbody: Body<Comp>) -> bool {
+    for s in 0..pbody.stmts.len() {
+        let st = pbody.stmts[s];
         if st.kind == SK_ASSIGN && st.a == f && st.b == 0 && st.nops == 1
-            && (op_kind(st.ops, 0) != OK_INT || op_a(st.ops, 0) != 0) {
+            && (op_kind(st.ops, 0, pbody) != OK_INT || op_a(st.ops, 0, pbody) != 0) {
             return true;
         }
     }
@@ -350,43 +349,44 @@ fn flag_ever_set(f: i64) -> bool {
 }
 
 // The body held: its drops' places and flags checked.
-fn check_drops() {
-    find_aliases();
-    for b in 0..block_count() {
-        let start = block_start(b);
-        if start < 0 || !reached(b) {
+fn check_drops(pbody: Body<Comp>) {
+    find_aliases(pbody);
+    for b in 0..block_count(pbody) {
+        let start = block_start(b, pbody);
+        if start < 0 || !reached(b, pbody) {
             continue;
         }
-        for s in start..start + block_len(b) {
-            let st = P_STMTS[s];
+        for s in start..start + block_len(b, pbody) {
+            let st = pbody.stmts[s];
             if st.kind != SK_DROP || st.c != DS_KEPT && st.c != DS_FLAG {
                 continue;
             }
             COMPARED += 1;
-            let u = use_after(b, s, st.a, st.b);
+            let u = use_after(b, s, st.a, st.b, pbody);
             if u >= 0 {
-                place_line(st.a, P_STMTS[u].node, c"used after its drop");
+                place_line(st.a, pbody.stmts[u].node, c"used after its drop", pbody);
             }
-            if st.c == DS_FLAG && st.d >= 0 && (!flag_written(st.d, b, s) || !flag_ever_set(st.d)) {
-                place_line(st.a, st.node, c"under a flag never set");
+            if st.c == DS_FLAG && st.d >= 0
+                && (!flag_written(st.d, b, s, pbody) || !flag_ever_set(st.d, pbody)) {
+                place_line(st.a, st.node, c"under a flag never set", pbody);
             }
         }
     }
 }
 
 // `places.diff: FN: FILE:LINE:COL: 'NAME' WHAT`, for IR local l.
-fn place_line(l: i64, node: i64, what: *u8) {
+fn place_line(l: i64, node: i64, what: *u8, pbody: Body<Comp>) {
     DIFFS += 1;
     let out = buf_new();
     buf_str(out, c"places.diff: ");
-    buf_fn_name(out, B_FN);
+    buf_fn_name(out, pbody.fn_);
     buf_str(out, c": ");
     if node > 0 {
         buf_pos(out, NODES[node].start);
         buf_str(out, c": ");
     }
     buf_str(out, c"'");
-    let a = P_LOCALS[l].src;
+    let a = pbody.locals[l].src;
     let name = if a >= 0 { ast_local_name(a) } else { 0 };
     if name > 0 {
         buf_bytes(out, SYMS[name].text);

@@ -1,0 +1,1068 @@
+// `volec fix --only statics --group FILE` (0.26.4, the plan's item f): a
+// group of statics moved into a context struct passed down. The group
+// file names the statics, the context's field each becomes, the
+// parameter's name and type, and its owners (the functions that make the
+// context as a local and pass it on):
+//
+//   param body                          the parameter's name
+//   type Body<Comp>                     its type, as written
+//   init body_new()                     an owner's `var body = INIT;`
+//   owner crate::places::run_places     (one line each)
+//   static crate::places::ir::P_STMTS stmts
+//
+// A function that names one of the statics uses the context; so does a
+// function calling one that does, up to the owners. Each of those takes the
+// parameter last (before parameters with a default): `body: inout T` when
+// it, or one it calls, writes the context (an assignment to it, `&X`, a
+// method of it whose receiver is not a let), `body: T` otherwise. Each
+// static's use becomes `body.field`, each call gives `&body` (inout) or
+// `body`, and each owner begins with `var body = INIT;`. A second run
+// changes nothing: the statics are no longer used.
+//
+// Refused, and listed: a function needing the context that no owner
+// reaches (`main`, a C entry, a function used as a value, a trait's
+// method), or one with a local of the parameter's name: the group needs
+// another owner. `--only statics-list` (a dry run) lists each function:
+// FILE:LINE, inout, let, owner or the refusal, its name, and an inout
+// one's first write (`writes at LINE push`).
+//
+// The context passed last lets a call inside another call's arguments take
+// it too (`two(add(1, &body), 2, &body)`); left to the checker: a method on
+// one of the context's fields whose argument changes the context.
+
+use crate::base::{
+    FILES, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, intern, read_file,
+};
+use crate::front::ast::{FN_CLOSURE, FN_DERIVED, NODES, NODE_IMPLICIT, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::generics::instantiate::{node_field_a, node_field_b, node_field_c};
+use crate::front::lexer::Tok;
+use crate::front::modules::file_of_pos;
+use crate::front::types::{
+    FNS, FN_COUNT, REF_SHARED, STATICS, STATIC_COUNT, TYPES, TyKind, fn_param,
+};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::defs::{DEFS, def_of_node};
+use crate::tools::query::diagnostics::diag;
+
+// The group file (--group), and the dry run (--only statics-list).
+pub static var GROUP_FILE: *u8 = 0 as *u8;
+pub static var STATICS_LIST: bool = false;
+// Whether the group was refused (a user no owner reaches).
+pub static var STATICS_REFUSED: bool = false;
+
+// The group: the parameter's name, its type, an owner's initial value (as
+// symbols); the owners' paths and the statics' (path, field) (symbols).
+static var G_PARAM: i64 = -1;
+static var G_TYPE: i64 = -1;
+static var G_INIT: i64 = -1;
+static var G_OWNERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var G_PATHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var G_FIELDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Static id + 1 -> its field's index in G_FIELDS + 1.
+static var FIELD_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Per function, keyed by its item's start + 1: an item node of it; set
+// when it uses a static of the group (F_USES), writes one (F_WRITES), is
+// an owner, takes the parameter, takes it inout, is called, is used as a
+// value, is a trait's.
+const F_USES: i64 = 1;
+const F_WRITES: i64 = 2;
+const F_OWNER: i64 = 4;
+const F_MEMBER: i64 = 8;
+const F_INOUT: i64 = 16;
+const F_CALLED: i64 = 32;
+const F_VALUE: i64 = 64;
+const F_TRAIT: i64 = 128;
+const F_ENTRY: i64 = 256;
+const F_CLASH: i64 = 512;
+static var FLAGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var ITEM: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The calls between the program's functions: (caller, callee, call node),
+// the functions by their items' starts.
+static var E_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var E_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var E_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The uses: (Ident node, its field).
+static var U_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_FIELD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Callee nodes of the calls (node + 1), not a use as a value.
+static var CALLEES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The function being walked (its item's start).
+static var CUR: i64 = 0;
+
+// The counts: statics, uses, users, members, inout, owners, calls edited,
+// refused; the edits.
+pub static var STATICS_COUNTS: [i64; 10] = [0; 10];
+static var DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn flags(pos: i64) -> i64 {
+    FLAGS.get(pos + 1)
+}
+
+fn set(pos: i64, bits: i64) {
+    FLAGS.put(pos + 1, flags(pos) | bits);
+}
+
+fn has(pos: i64, bits: i64) -> bool {
+    (flags(pos) & bits) != 0
+}
+
+// "crate::a::b" and "a::b" are the same path.
+fn trimmed(s: [u8]) -> [u8] {
+    if s.len() >= 7 && s[0..7] == "crate::" { s[7..] } else { s }
+}
+
+fn path_is(sym: i64, want: i64) -> bool {
+    sym >= 0 && trimmed(SYMS[sym].text) == trimmed(SYMS[want].text)
+}
+
+fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// ---- The group file ----
+
+// Reads GROUP_FILE; false (with an error) when it is not a group.
+fn read_group() -> bool {
+    let b = buf_new();
+    read_file(GROUP_FILE, b);
+    let s = buf_slice(b);
+    var k: usize = 0;
+    var ok = true;
+    while k < s.len() {
+        var e: usize = k;
+        while e < s.len() && s[e] != '\n' {
+            e += 1;
+        }
+        let line = s[k..e];
+        k = e + 1;
+        var a: usize = 0;
+        while a < line.len() && is_space(line[a]) {
+            a += 1;
+        }
+        if a == line.len() || line[a] == '#' {
+            continue;
+        }
+        var w: usize = a;
+        while w < line.len() && !is_space(line[w]) {
+            w += 1;
+        }
+        let word = line[a..w];
+        var r: usize = w;
+        while r < line.len() && is_space(line[r]) {
+            r += 1;
+        }
+        var z: usize = line.len();
+        while z > r && is_space(line[z - 1]) {
+            z -= 1;
+        }
+        let rest = line[r..z];
+        if word == "param" {
+            G_PARAM = intern(rest);
+        } else if word == "type" {
+            G_TYPE = intern(rest);
+        } else if word == "init" {
+            G_INIT = intern(rest);
+        } else if word == "owner" {
+            G_OWNERS.push(intern(rest));
+        } else if word == "static" {
+            var m: usize = 0;
+            while m < rest.len() && !is_space(rest[m]) {
+                m += 1;
+            }
+            var f: usize = m;
+            while f < rest.len() && is_space(rest[f]) {
+                f += 1;
+            }
+            if f == rest.len() {
+                ok = false;
+            } else {
+                G_PATHS.push(intern(rest[0..m]));
+                G_FIELDS.push(intern(rest[f..]));
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if !ok || G_PARAM < 0 || G_TYPE < 0 || G_INIT < 0 || G_PATHS.count == 0 {
+        let d = diag(c"error", c"fix.statics");
+        buf_str(d, c"--group takes a file of `param NAME`, `type TYPE`, `init EXPR`, `owner PATH` and `static PATH FIELD` lines\n");
+        return false;
+    }
+    true
+}
+
+// The group's statics, by their ids; the owners, by their items.
+fn resolve_group() {
+    // UNSAFE: STATICS is the checker's table of statics, a raw pointer (front::types).
+    // SAFETY: s is below STATIC_COUNT, the table's length.
+    unsafe {
+        for s in 0..STATIC_COUNT {
+            let d = def_of_node(STATICS[s].node);
+            if d < 0 {
+                continue;
+            }
+            for i in 0..G_PATHS.count {
+                if path_is(DEFS[d].fqn, G_PATHS.get(i)) {
+                    FIELD_OF.put(s + 1, i + 1);
+                    STATICS_COUNTS[0] += 1;
+                }
+            }
+        }
+    }
+}
+
+// ---- The walk ----
+
+fn f_node(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer (front::types).
+    // SAFETY: f is below FN_COUNT, the table's length, wherever this is called.
+    unsafe { FNS[f].node }
+}
+
+fn f_extern(f: i64) -> bool {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].is_extern }
+}
+
+// Whether f is a function of the program with a body to edit (not std's,
+// not a closure's or a derived one).
+fn editable(f: i64) -> bool {
+    if f < 0 || f >= FN_COUNT || f_extern(f) {
+        return false;
+    }
+    let item = f_node(f);
+    if item <= 0 || NODES[item].kind != NodeKind::Fn || NODES[item].c == 0 {
+        return false;
+    }
+    if (NODES[item].p & (FN_CLOSURE | FN_DERIVED)) != 0 {
+        return false;
+    }
+    // UNSAFE: a file's path is a C string, a raw pointer (base::SourceFile).
+    // SAFETY: file_of_pos gives the index of a loaded file, and every path is NUL-terminated.
+    unsafe { FILES[file_of_pos(NODES[item].start)].path[0] != '<' }
+}
+
+// The root of a place: through fields, indexes, tuple fields and `&` (a
+// receiver's, the checker's own).
+fn place_root(n: i64) -> i64 {
+    var t = n;
+    while t > 0 {
+        let k = NODES[t].kind;
+        if k == NodeKind::FieldAccess || k == NodeKind::Index || k == NodeKind::TupleField {
+            t = NODES[t].a;
+        } else if k == NodeKind::Unary && NODES[t].op == Tok::Amp {
+            t = NODES[t].b;
+        } else {
+            break;
+        }
+    }
+    t
+}
+
+// The static of the group a place is rooted at (through fields, indexes
+// and tuple fields): its Ident node, or 0.
+fn group_root(n: i64) -> i64 {
+    let t = place_root(n);
+    if t > 0 && NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Static
+        && FIELD_OF.get(NODES[t].y + 1) != 0 {
+        return t;
+    }
+    0
+}
+
+// Whether method g changes its receiver: the program's, by its checked
+// type (an inout one or a raw pointer); std's, whose `self` is a
+// reference in std's spelling whatever the method does, by its name (the
+// ones that only read: `len`, `get`, `iter`, ...).
+fn receiver_writes(g: i64) -> bool {
+    if in_std(g) {
+        let name = SYMS[NODES[f_node(g)].a].text;
+        return !(name == "len" || name == "is_empty" || name == "get" || name == "as_slice"
+            || name == "iter" || name == "contains" || name == "first" || name == "last"
+            || name == "capacity" || name == "as_ptr" || name == "clone" || name == "starts_with"
+            || name == "ends_with" || name == "to_vec" || name == "eq" || name == "slice"
+            || name == "as_bytes" || name == "as_str" || name == "index" || name == "ne"
+            || name == "fmt" || name == "hash");
+    }
+    let t = fn_param(g, 0);
+    if t <= 0 {
+        return true;
+    }
+    TYPES[t].kind == TyKind::Ptr && TYPES[t].b != REF_SHARED
+}
+
+// Whether function g is std's.
+fn in_std(g: i64) -> bool {
+    // UNSAFE: a file's path is a C string, a raw pointer (base::SourceFile).
+    // SAFETY: file_of_pos gives the index of a loaded file, and every path is NUL-terminated.
+    unsafe { FILES[file_of_pos(NODES[f_node(g)].start)].path[0] == '<' }
+}
+
+// The first write of the context in each function (its item's start + 1
+// -> node + 1), for the list's `writes at LINE`.
+static var WRITE_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Node n writes the context in the function walked.
+fn wrote(n: i64) {
+    set(CUR, F_WRITES);
+    if WRITE_AT.get(CUR + 1) == 0 {
+        WRITE_AT.put(CUR + 1, n + 1);
+    }
+}
+
+fn walk(n: i64) {
+    if n <= 0 {
+        return;
+    }
+    let kind = NODES[n].kind;
+    if kind == NodeKind::ExprStmt || kind == NodeKind::Let {
+        note_statement(n);
+    }
+    // (a name the parameter would shadow or be shadowed by)
+    if (kind == NodeKind::PatBind || kind == NodeKind::Param) && NODES[n].a == G_PARAM {
+        set(CUR, F_CLASH);
+    }
+    if kind == NodeKind::Ident {
+        let y = NODES[n].y;
+        if NODES[n].res == Res::Static && FIELD_OF.get(y + 1) != 0 {
+            U_NODE.push(n);
+            U_FIELD.push(FIELD_OF.get(y + 1) - 1);
+            set(CUR, F_USES);
+        } else if NODES[n].res == Res::Fn && CALLEES.get(n + 1) == 0 && editable(y) {
+            set(NODES[f_node(y)].start, F_VALUE);
+        }
+    } else if kind == NodeKind::Assign {
+        if group_root(NODES[n].b) != 0 {
+            wrote(n);
+        }
+    } else if kind == NodeKind::Unary && NODES[n].op == Tok::Amp && SRC[NODES[n].start] == '&' {
+        // (a `&` written: the checker's own, a receiver's, are not)
+        if group_root(NODES[n].b) != 0 {
+            wrote(n);
+        }
+    } else if kind == NodeKind::Call {
+        let g = NODES[n].x - 1;
+        if NODES[n].a != 0 {
+            CALLEES.put(NODES[n].a + 1, 1);
+        } else if NODES[n].count > 0 && group_root(child(n, 0)) != 0 {
+            // (a method of the context's field: a write unless its receiver is a let)
+            if receiver_writes(g) {
+                wrote(n);
+            }
+        }
+        if editable(g) {
+            E_FROM.push(CUR);
+            E_TO.push(NODES[f_node(g)].start);
+            E_NODE.push(n);
+        }
+    }
+    if node_field_a(kind) {
+        walk(NODES[n].a);
+    }
+    if node_field_b(kind) {
+        walk(NODES[n].b);
+    }
+    if node_field_c(kind) {
+        walk(NODES[n].c);
+    }
+    if kind == NodeKind::For || kind == NodeKind::Param {
+        walk(NODES[n].d);
+    }
+    // (a format literal's and a `?`'s checked form: the calls in it are
+    // resolved there)
+    if kind == NodeKind::Interp || kind == NodeKind::Try {
+        walk(NODES[n].y);
+    }
+    for i in 0..NODES[n].count {
+        walk(child(n, i));
+    }
+}
+
+// Every function of the program (each instance of a generic one: its
+// checked copy), walked.
+fn walk_all() {
+    for f in 0..FN_COUNT {
+        if !editable(f) {
+            continue;
+        }
+        let item = f_node(f);
+        let pos = NODES[item].start;
+        if ITEM.get(pos + 1) == 0 {
+            ITEM.put(pos + 1, item);
+            ITEMS.push(pos);
+            let d = def_of_node(item);
+            if d >= 0 {
+                for i in 0..G_OWNERS.count {
+                    if path_is(DEFS[d].fqn, G_OWNERS.get(i)) {
+                        set(pos, F_OWNER);
+                    }
+                }
+                if DEFS[d].tr >= 0 {
+                    set(pos, F_TRAIT);
+                }
+                if trimmed(SYMS[DEFS[d].fqn].text) == "main" || NODES[item].y == 1 {
+                    set(pos, F_ENTRY);
+                }
+            }
+        }
+        CUR = pos;
+        for j in 0..NODES[item].count {
+            walk(child(item, j));
+        }
+        walk(NODES[item].c);
+    }
+}
+
+// The functions that take the parameter: the users and, up the calls,
+// their callers, the owners left out; then which take it inout.
+fn close() {
+    for i in 0..ITEMS.count {
+        let p = ITEMS.get(i);
+        if has(p, F_USES) && !has(p, F_OWNER) {
+            set(p, F_MEMBER);
+        }
+        if has(p, F_WRITES) {
+            set(p, F_INOUT);
+        }
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for e in 0..E_FROM.count {
+            let c = E_FROM.get(e);
+            let g = E_TO.get(e);
+            if !has(g, F_MEMBER) {
+                continue;
+            }
+            set(g, F_CALLED);
+            if !has(c, F_MEMBER) && !has(c, F_OWNER) {
+                set(c, F_MEMBER);
+                changed = true;
+            }
+            if has(g, F_INOUT) && !has(c, F_INOUT) {
+                set(c, F_INOUT);
+                changed = true;
+            }
+        }
+    }
+}
+
+// Whether member p is refused: nothing calls it, or it is a value or a
+// trait's method.
+fn refused(p: i64) -> bool {
+    has(p, F_MEMBER) && (has(p, F_ENTRY) || has(p, F_VALUE) || has(p, F_TRAIT) || has(p, F_CLASH))
+}
+
+// ---- The edits ----
+
+// The index the parameter takes in function item's parameters: before the
+// first with a default, else last; and the Param nodes' count.
+fn param_index(item: i64, count: inout i64) -> i64 {
+    var k = -1;
+    count = 0;
+    for j in 0..NODES[item].count {
+        let p = child(item, j);
+        if NODES[p].kind != NodeKind::Param {
+            continue;
+        }
+        if NODES[p].h != 0 && k < 0 {
+            k = count;
+        }
+        count += 1;
+    }
+    if k < 0 { count } else { k }
+}
+
+fn param_at(item: i64, i: i64) -> i64 {
+    var k = 0;
+    for j in 0..NODES[item].count {
+        let p = child(item, j);
+        if NODES[p].kind == NodeKind::Param {
+            if k == i {
+                return p;
+            }
+            k += 1;
+        }
+    }
+    0
+}
+
+// The position after the first `(` at or after pos.
+fn after_paren(pos: i64) -> i64 {
+    var k = pos;
+    while k < SRC.len() as i64 && SRC[k] != '(' {
+        k += 1;
+    }
+    k + 1
+}
+
+// The edits, recorded (start, end, text buffer; -1 once taken into a
+// statement's): made at the end, after the statements whose arguments
+// become lets are written whole.
+static var X_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var X_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var X_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn put_edit(a: i64, b: i64, text: i64) {
+    X_START.push(a);
+    X_END.push(b);
+    X_TEXT.push(text);
+}
+
+fn insert(pos: i64, text: i64) {
+    put_edit(pos, pos, text);
+}
+
+// SRC[a..b] with the recorded edits inside it made (in position order,
+// insertions at one position in their order), into out; those edits are
+// taken.
+fn render(out: i64, a: i64, b: i64) {
+    var at = a;
+    loop {
+        // (the next edit at or after `at`: the first recorded among those
+        // starting first)
+        var best = -1;
+        for i in 0..X_START.count {
+            let s = X_START.get(i);
+            if X_TEXT.get(i) < 0 || s < at || X_END.get(i) > b || s > b {
+                continue;
+            }
+            if best < 0 || s < X_START.get(best) {
+                best = i;
+            }
+        }
+        if best < 0 {
+            break;
+        }
+        let s = X_START.get(best);
+        buf_bytes(out, SRC[at..s]);
+        buf_bytes(out, buf_slice(X_TEXT.get(best)));
+        at = X_END.get(best);
+        X_TEXT.set(best, -1);
+    }
+    buf_bytes(out, SRC[at..b]);
+}
+
+fn flush_edits() {
+    for i in 0..X_START.count {
+        if X_TEXT.get(i) >= 0 {
+            edit_replace(X_START.get(i), X_END.get(i), X_TEXT.get(i));
+        }
+    }
+}
+
+// The parameter's text: `NAME: inout TYPE` or `NAME: TYPE`.
+fn param_text(b: i64, inout_: bool) {
+    buf_bytes(b, SYMS[G_PARAM].text);
+    buf_str(b, if inout_ { c": inout " } else { c": " });
+    buf_bytes(b, SYMS[G_TYPE].text);
+}
+
+fn edit_params(pos: i64) {
+    let item = ITEM.get(pos + 1);
+    var count = 0;
+    let k = param_index(item, &count);
+    let b = buf_new();
+    let inout_ = has(pos, F_INOUT);
+    if k < count {
+        param_text(b, inout_);
+        buf_str(b, c", ");
+        insert(NODES[param_at(item, k)].start, b);
+    } else if count > 0 {
+        buf_str(b, c", ");
+        param_text(b, inout_);
+        insert(NODES[param_at(item, count - 1)].end, b);
+    } else {
+        param_text(b, inout_);
+        // (the `(` after the name)
+        let name = SYMS[NODES[item].a].text;
+        var at = NODES[item].start;
+        while at + name.len() as i64 <= SRC.len() as i64
+            && SRC[at..at + name.len() as i64] != name {
+            at += 1;
+        }
+        insert(after_paren(at + name.len() as i64), b);
+    }
+    STATICS_COUNTS[7] += 1;
+}
+
+// The argument a call of g gives in function c: `&NAME` or `NAME`.
+fn arg_text(b: i64, g: i64) {
+    if has(g, F_INOUT) {
+        buf_byte(b, '&');
+    }
+    buf_bytes(b, SYMS[G_PARAM].text);
+}
+
+// The arguments as written (the checked call has its defaults and its
+// named arguments in the parameters' order): the segments between the
+// call's parentheses at depth 0, trimmed.
+static var SEG_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SEG_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Past a string or character literal starting at k (its quote).
+fn skip_literal(k: i64) -> i64 {
+    let q = SRC[k];
+    var i = k + 1;
+    while i < SRC.len() as i64 && SRC[i] != q {
+        if SRC[i] == '\\' {
+            i += 1;
+        }
+        i += 1;
+    }
+    i + 1
+}
+
+fn push_segment(a: i64, b: i64) {
+    var s = a;
+    var e = b;
+    while s < e && is_space(SRC[s]) {
+        s += 1;
+    }
+    while e > s && is_space(SRC[e - 1]) {
+        e -= 1;
+    }
+    if s < e {
+        SEG_START.push(s);
+        SEG_END.push(e);
+    }
+}
+
+// The segments of the argument list opening at open (after its `(`); the
+// position of its `)`, or -1.
+fn split_args(open: i64) -> i64 {
+    SEG_START.count = 0;
+    SEG_END.count = 0;
+    var depth = 0;
+    var seg = open;
+    var k = open;
+    while k < SRC.len() as i64 {
+        let c = SRC[k];
+        if c == '"' || (c == '\'' && k + 2 < SRC.len() as i64
+            && (SRC[k + 2] == '\'' || SRC[k + 1] == '\\')) {
+            k = skip_literal(k);
+            continue;
+        }
+        if c == '/' && k + 1 < SRC.len() as i64 && SRC[k + 1] == '/' {
+            while k < SRC.len() as i64 && SRC[k] != '\n' {
+                k += 1;
+            }
+            continue;
+        }
+        if c == '(' || c == '[' || c == '{' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '}' {
+            if depth == 0 {
+                push_segment(seg, k);
+                return k;
+            }
+            depth -= 1;
+        } else if c == ',' && depth == 0 {
+            push_segment(seg, k);
+            seg = k + 1;
+        }
+        k += 1;
+    }
+    -1
+}
+
+// Whether the segment at s is a named argument (`name: value`).
+fn named_at(s: i64) -> bool {
+    var k = s;
+    while k < SRC.len() as i64 && (SRC[k] == '_' || (SRC[k] >= 'a' && SRC[k] <= 'z')
+        || (SRC[k] >= 'A' && SRC[k] <= 'Z') || (SRC[k] >= '0' && SRC[k] <= '9')) {
+        k += 1;
+    }
+    if k == s {
+        return false;
+    }
+    while k < SRC.len() as i64 && SRC[k] == ' ' {
+        k += 1;
+    }
+    k + 1 < SRC.len() as i64 && SRC[k] == ':' && SRC[k + 1] != ':'
+}
+
+fn edit_call(n: i64, g: i64) {
+    let key = NODES[n].start * 4096 + (NODES[n].end - NODES[n].start) % 4096;
+    if DONE.get(key + 1) != 0 {
+        return;
+    }
+    DONE.put(key + 1, 1);
+    var count = 0;
+    let k = param_index(ITEM.get(g + 1), &count);
+    let method = NODES[n].a == 0;
+    let from = if method { NODES[child(n, 0)].end } else { NODES[NODES[n].a].end };
+    let open = after_paren(from);
+    if split_args(open) < 0 {
+        STATICS_COUNTS[8] += 1;
+        return;
+    }
+    // (the index among the arguments written in the parentheses)
+    let at = if method { k - 1 } else { k };
+    let segs = SEG_START.count;
+    var positional = 0;
+    while positional < segs && !named_at(SEG_START.get(positional)) {
+        positional += 1;
+    }
+    let b = buf_new();
+    if segs == 0 {
+        arg_text(b, g);
+        insert(open, b);
+    } else if at < positional {
+        arg_text(b, g);
+        buf_str(b, c", ");
+        insert(SEG_START.get(at), b);
+    } else if positional < segs {
+        arg_text(b, g);
+        buf_str(b, c", ");
+        insert(SEG_START.get(positional), b);
+    } else {
+        buf_str(b, c", ");
+        arg_text(b, g);
+        insert(SEG_END.get(segs - 1), b);
+    }
+    STATICS_COUNTS[6] += 1;
+}
+
+fn edit_use(n: i64, field: i64) {
+    let key = NODES[n].start;
+    if DONE.get(-(key + 1)) != 0 {
+        return;
+    }
+    DONE.put(-(key + 1), 1);
+    let b = buf_new();
+    buf_bytes(b, SYMS[G_PARAM].text);
+    buf_byte(b, '.');
+    buf_bytes(b, SYMS[G_FIELDS.get(field)].text);
+    put_edit(NODES[n].start, NODES[n].end, b);
+    STATICS_COUNTS[1] += 1;
+}
+
+// An owner's local, at the start of its body.
+fn edit_owner(pos: i64) {
+    let item = ITEM.get(pos + 1);
+    let body = NODES[item].c;
+    let b = buf_new();
+    buf_str(b, c"\n    var ");
+    buf_bytes(b, SYMS[G_PARAM].text);
+    buf_str(b, c" = ");
+    buf_bytes(b, SYMS[G_INIT].text);
+    buf_byte(b, ';');
+    insert(NODES[body].start + 1, b);
+    STATICS_COUNTS[5] += 1;
+}
+
+// ---- The list ----
+
+fn put_fn(out: i64, pos: i64, what: *u8) {
+    let file = file_of_pos(pos);
+    buf_str(out, FILES[file].path);
+    buf_byte(out, ':');
+    buf_int(out, line_of(pos));
+    buf_byte(out, '\t');
+    buf_str(out, what);
+    buf_byte(out, '\t');
+    put_name(out, pos);
+    // (why it is inout: the first write in it)
+    let w = WRITE_AT.get(pos + 1);
+    if w > 0 {
+        buf_str(out, c"\twrites at ");
+        buf_int(out, line_of(NODES[w - 1].start));
+        buf_byte(out, ' ');
+        let wn = w - 1;
+        if NODES[wn].kind == NodeKind::Call && NODES[wn].x > 0 {
+            buf_bytes(out, SYMS[NODES[f_node(NODES[wn].x - 1)].a].text);
+        } else {
+            buf_bytes(out, SRC[NODES[wn].start..NODES[wn].end]);
+        }
+    }
+    buf_byte(out, '\n');
+}
+
+// The line of position pos in its file.
+fn line_of(pos: i64) -> i64 {
+    let file = file_of_pos(pos);
+    var line = 1;
+    for k in FILES[file].start..pos {
+        if SRC[k] == '\n' {
+            line += 1;
+        }
+    }
+    line
+}
+
+fn put_name(out: i64, pos: i64) {
+    let d = def_of_node(ITEM.get(pos + 1));
+    if d >= 0 {
+        buf_bytes(out, trimmed(SYMS[DEFS[d].fqn].text));
+    }
+}
+
+fn what_of(p: i64) -> *u8 {
+    if has(p, F_OWNER) {
+        c"owner"
+    } else if has(p, F_TRAIT) {
+        c"refused-trait"
+    } else if has(p, F_VALUE) {
+        c"refused-value"
+    } else if has(p, F_CLASH) {
+        c"refused-name"
+    } else if has(p, F_ENTRY) {
+        c"refused-entry"
+    } else if has(p, F_INOUT) {
+        c"inout"
+    } else {
+        c"let"
+    }
+}
+
+// `fix --only statics`: the group moved; the number of functions given
+// the parameter (0 when the group is refused).
+pub fn statics_edits() -> i64 {
+    if GROUP_FILE == 0 as *u8 {
+        let d = diag(c"error", c"fix.statics");
+        buf_str(d, c"--only statics takes --group FILE (the statics, their fields, the parameter and its owners)\n");
+        return 0;
+    }
+    if !read_group() {
+        return 0;
+    }
+    resolve_group();
+    walk_all();
+    close();
+    var any_refused = false;
+    let out = buf_new();
+    for i in 0..ITEMS.count {
+        let p = ITEMS.get(i);
+        let member = has(p, F_MEMBER);
+        if has(p, F_USES) {
+            STATICS_COUNTS[2] += 1;
+        }
+        if member {
+            STATICS_COUNTS[3] += 1;
+            if has(p, F_INOUT) {
+                STATICS_COUNTS[4] += 1;
+            }
+        }
+        if refused(p) {
+            if !any_refused {
+                let d = diag(c"error", c"fix.statics");
+                buf_str(d, c"'");
+                put_name(d, p);
+                buf_str(d, c"' needs the group's context, and no owner gives it (");
+                buf_str(d, what_of(p));
+                buf_str(d, c"): nothing is changed\n  help: name an owner above it in the group file\n  try: volec fix --only statics-list --group ");
+                buf_str(d, GROUP_FILE);
+                buf_byte(d, '\n');
+            }
+            any_refused = true;
+        }
+        if STATICS_LIST && (member || has(p, F_OWNER)) {
+            put_fn(out, p, what_of(p));
+        }
+    }
+    if STATICS_LIST {
+        buf_write_fd(out, STDOUT);
+    }
+    STATICS_REFUSED = any_refused;
+    if any_refused {
+        return 0;
+    }
+    for i in 0..ITEMS.count {
+        let p = ITEMS.get(i);
+        if has(p, F_MEMBER) {
+            edit_params(p);
+        } else if has(p, F_OWNER) && STATICS_COUNTS[0] > 0 {
+            var used = has(p, F_USES);
+            for e in 0..E_FROM.count {
+                if E_FROM.get(e) == p && has(E_TO.get(e), F_MEMBER) {
+                    used = true;
+                }
+            }
+            if used {
+                edit_owner(p);
+            }
+        }
+    }
+    for e in 0..E_FROM.count {
+        let c = E_FROM.get(e);
+        let g = E_TO.get(e);
+        if has(g, F_MEMBER) && (has(c, F_MEMBER) || has(c, F_OWNER))
+            && (NODES[E_NODE.get(e)].p & NODE_IMPLICIT) == 0 {
+            edit_call(E_NODE.get(e), g);
+        }
+    }
+    for i in 0..U_NODE.count {
+        edit_use(U_NODE.get(i), U_FIELD.get(i));
+    }
+    hoist_all();
+    flush_edits();
+    STATICS_COUNTS[3]
+}
+
+// ---- The arguments taken out ----
+
+// The statements whose expression (an ExprStmt's, a Let's value) is a
+// method call: (statement, call).
+static var H_STMT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var H_CALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn note_statement(n: i64) {
+    let kind = NODES[n].kind;
+    let e = if kind == NodeKind::ExprStmt { NODES[n].a }
+        else if kind == NodeKind::Let { NODES[n].c } else { 0 };
+    if e > 0 && NODES[e].kind == NodeKind::Call && NODES[e].a == 0 && NODES[e].count > 1 {
+        H_STMT.push(n);
+        H_CALL.push(e);
+    }
+}
+
+// Whether SRC[a..b] holds `&NAME` (NAME the parameter, a whole word).
+fn lends_param(a: i64, b: i64) -> bool {
+    let name = SYMS[G_PARAM].text;
+    let n = name.len() as i64;
+    var k = a;
+    while k + n < b {
+        if SRC[k] == '&' && SRC[k + 1..k + 1 + n] == name {
+            let after = if k + 1 + n < SRC.len() as i64 { SRC[k + 1 + n] } else { ' ' };
+            if !(after == '_' || (after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z')
+                || (after >= '0' && after <= '9')) {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    false
+}
+
+// Whether SRC[a..b] holds a call that will take the context inout (a
+// call edited to give `&NAME`).
+fn lends_context(a: i64, b: i64) -> bool {
+    for e in 0..E_FROM.count {
+        let n = E_NODE.get(e);
+        let g = E_TO.get(e);
+        if NODES[n].start >= a && NODES[n].end <= b && has(g, F_MEMBER) && has(g, F_INOUT)
+            && (has(E_FROM.get(e), F_MEMBER) || has(E_FROM.get(e), F_OWNER)) {
+            return true;
+        }
+    }
+    false
+}
+
+// `P_TARGETS.push(new_block());`: the receiver, a part of the context, is
+// lent after the arguments, and an argument changes the context
+// (own.conflict, once it is `pbody.targets.push(new_block(&pbody))`): the
+// arguments up to the last that changes it become `let`s before the
+// statement, in order (`let pbody_arg = new_block(&pbody);`). The
+// statement is written whole, with the other edits inside it.
+fn hoist_all() {
+    let name = SYMS[G_PARAM].text;
+    for i in 0..H_STMT.count {
+        let stmt = H_STMT.get(i);
+        let call = H_CALL.get(i);
+        var recv = child(call, 0);
+        while NODES[recv].kind == NodeKind::Unary && NODES[recv].op == Tok::Amp {
+            recv = NODES[recv].b;
+        }
+        let root = place_root(recv);
+        if root <= 0 || NODES[root].kind != NodeKind::Ident {
+            continue;
+        }
+        let static_ = NODES[root].res == Res::Static && FIELD_OF.get(NODES[root].y + 1) != 0;
+        let local = root != recv && NODES[root].res == Res::Local
+            && SYMS[NODES[root].a].text == name;
+        if !static_ && !local {
+            continue;
+        }
+        // (the arguments as written: within the call)
+        var last = 0;
+        for k in 1..NODES[call].count {
+            let arg = child(call, k);
+            if NODES[arg].start < NODES[recv].end || NODES[arg].end > NODES[call].end {
+                continue;
+            }
+            let a = NODES[arg].start;
+            let b = NODES[arg].end;
+            if (static_ && lends_context(a, b)) || (local && lends_param(a, b)) {
+                last = k;
+            }
+        }
+        if last == 0 {
+            continue;
+        }
+        let key = NODES[stmt].start + (1 << 40);
+        if DONE.get(-(key + 1)) != 0 {
+            continue;
+        }
+        DONE.put(-(key + 1), 1);
+        // (the statement's indentation)
+        var line = NODES[stmt].start;
+        while line > 0 && SRC[line - 1] == ' ' {
+            line -= 1;
+        }
+        let text = buf_new();
+        var at = NODES[stmt].start;
+        let rest = buf_new();
+        for k in 1..last + 1 {
+            let arg = child(call, k);
+            if NODES[arg].start < NODES[recv].end || NODES[arg].end > NODES[call].end {
+                continue;
+            }
+            let temp = buf_new();
+            buf_bytes(temp, name);
+            buf_str(temp, c"_arg");
+            if k > 1 {
+                buf_int(temp, k - 1);
+            }
+            buf_str(text, c"let ");
+            buf_bytes(text, buf_slice(temp));
+            buf_str(text, c" = ");
+            render(text, NODES[arg].start, NODES[arg].end);
+            buf_str(text, c";\n");
+            buf_bytes(text, SRC[line..NODES[stmt].start]);
+            render(rest, at, NODES[arg].start);
+            buf_bytes(rest, buf_slice(temp));
+            at = NODES[arg].end;
+        }
+        render(rest, at, NODES[stmt].end);
+        buf_bytes(text, buf_slice(rest));
+        put_edit(NODES[stmt].start, NODES[stmt].end, text);
+        STATICS_COUNTS[9] += 1;
+    }
+}
+
+// The census after a run: `note fix.statics: ...`.
+pub fn statics_report() {
+    let d = diag(c"note", c"fix.statics");
+    buf_str(d, c"statics ");
+    buf_int(d, STATICS_COUNTS[0]);
+    buf_str(d, c"; functions using them ");
+    buf_int(d, STATICS_COUNTS[2]);
+    buf_str(d, c", given the parameter ");
+    buf_int(d, STATICS_COUNTS[3]);
+    buf_str(d, c" (inout ");
+    buf_int(d, STATICS_COUNTS[4]);
+    buf_str(d, c"), owners ");
+    buf_int(d, STATICS_COUNTS[5]);
+    buf_str(d, c"; edits: uses ");
+    buf_int(d, STATICS_COUNTS[1]);
+    buf_str(d, c", calls ");
+    buf_int(d, STATICS_COUNTS[6]);
+    buf_str(d, c", parameters ");
+    buf_int(d, STATICS_COUNTS[7]);
+    buf_str(d, c", statements given their arguments as lets ");
+    buf_int(d, STATICS_COUNTS[9]);
+    if STATICS_COUNTS[8] > 0 {
+        buf_str(d, c"; calls left (no argument list found) ");
+        buf_int(d, STATICS_COUNTS[8]);
+    }
+    buf_byte(d, '\n');
+}

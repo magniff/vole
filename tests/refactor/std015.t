@@ -26,5 +26,5 @@
 % "$COMPILER" fix --only std015 --dry-run --in mine.vl
 note fix.none: nothing to fix
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts, casts-list, alloc, buf, rawptr or rawptr-list, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts, casts-list, alloc, buf, rawptr, rawptr-list, statics or statics-list, not 'nonsense'
 [exit 2]

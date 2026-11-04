@@ -131,6 +131,31 @@ The raw-pointer parameters (rawptr264):
   access (kinds::holds_inout walked every field of an inout context at
   every call): `check` of compiler/src 0.95x 0.26.3's.
 
+The statics into context structs (statics264):
+
+- `volec fix --only statics --group FILE` (`explain fix.statics`)
+  moves a group of statics into a context passed down. The group file
+  names the statics, the field each becomes, the parameter's name and
+  type, and the owners that make the context as a local. Each function
+  naming one of the statics, and its callers up to the owners, takes the
+  context **last** (before a parameter with a default), so a call nested
+  in another's arguments can take it too (`two(add(1, &cx), 2, &cx)`).
+  It is inout where the function or a callee writes the context, let
+  otherwise. Uses become `cx.field`, calls give `&cx` or `cx`. A method
+  of the context's field whose argument changes the context gets that
+  argument as a `let` before the statement. A function no owner reaches
+  (`main`, a C entry, a function value, a trait's method) refuses the
+  group, and nothing changes. `--only statics-list` is the dry run. A
+  second run changes nothing.
+- compiler/src, phase 1: the places IR's body and its control-flow graph
+  (19 statics: places/ir.vl's `B_*`, `P_*` and `CUR_BLOCK`, places/cfg.vl's
+  tables) are `places::ir::Body`, passed as `pbody` to 288 functions (105
+  inout, 183 let) from four owners: check_program, lower_program, gen0's
+  compile_program and `query drops`. None of them runs in a code
+  generator's task. Statics in compiler/src: 2,138 to 2,149 (the tool
+  adds 30 of its own, which phase 2 moves with tools'). `check` of
+  compiler/src: 1.00x the base's, 0.95x 0.26.3's.
+
 ### What's new in 0.26.3
 
 Allocation as a capability; compiler/src on 0.26.2's language (format
