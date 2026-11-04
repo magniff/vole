@@ -62,9 +62,12 @@ special values: `(0.0).atan2(-1.0)` is pi, `pow(x,
 
 The integer types (`i8` to `i64`, `u8` to `u64`) have Float's `abs`,
 `signum`, `min(y)`, `max(y)`, `clamp(lo, hi)`, and `pow(exp: u32)`, as
-methods with no `use` (std::num's trait `Int`, 0.25.2.2). They wrap as
-integers do: `i64::MIN.abs()` is `i64::MIN`, a `pow` past the type's
-range wraps; `clamp` never panics (`lo > hi`: hi). std's functions
+methods with no `use` (std::num's trait `Int`, 0.25.2.2). They overflow
+as the operators do (0.26.3): `i64::MIN.abs()` and a `pow` past the
+type's range panic with the overflow checks on (-O0) and wrap with them
+off; `wrapping_abs`, `checked_pow`, `saturating_pow` and the rest
+(`guide types#numbers`) choose at every level. `clamp` never panics
+(`lo > hi`: hi). std's functions
 `std::min(a, b)`, `std::max`, `std::clamp(x, lo, hi)` (any `Ord`
 type) and `std::abs(x)` (an i64) do the same.
 

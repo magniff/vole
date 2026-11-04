@@ -106,13 +106,15 @@ build() {
     p=$1 o=$2 t=$3
     b="$OUT/$(basename "$p" .vl).O$o${t:+.$t}"
     if [ -n "$t" ]; then
-        "$COMPILER" "-O$o" --target "$t" -c "$p" -o "$b.o" >"$b.log" 2>&1 \
+        # (0.26.3: the programs' arithmetic wraps, as it did at every level:
+        # the overflow checks off, decision 6)
+        "$COMPILER" "-O$o" --overflow-checks=off --target "$t" -c "$p" -o "$b.o" >"$b.log" 2>&1 \
             || { echo "FAIL $(basename "$p") -O$o --target $t: $(grep -v '^ok' "$b.log" | head -3)"; return; }
         rm -f "$b.o"
         echo "ok $(basename "$p") -O$o --target $t"
         return
     fi
-    "$COMPILER" "-O$o" "$p" -o "$b" >"$b.log" 2>&1 \
+    "$COMPILER" "-O$o" --overflow-checks=off "$p" -o "$b" >"$b.log" 2>&1 \
         || { echo "FAIL $(basename "$p") -O$o: $(grep -v '^ok' "$b.log" | head -3)"; return; }
     "$b" >"$b.out" 2>&1
     rc=$?

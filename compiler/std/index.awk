@@ -116,6 +116,27 @@ BEGIN {
     LAZY["std::cell"] = 1
     LAZY["Cells: UnsafeCell (0.26.1)"] = 1
     LAZY["Cells: Cell (0.26.1)"] = 1
+    # (0.26.3) std::num::wrapping: lazy, the integer types' wrapping,
+    # checked, overflowing and saturating methods (names of no item), and
+    # Wrapping, read by a program (or a section of std) that names one.
+    # The wrapping + - *, unary - and shifts are a section of their own,
+    # needing nothing: std's hashes and PRNGs call them, and the rest
+    # (Wrapping derives Clone, Eq and Hash) would pull in HashMap.
+    WRAPOPS = "IntWrapping"
+    n = split("add sub mul neg shl shr", lz, " ")
+    for (i = 1; i <= n; i++) WRAPOPS = WRAPOPS " wrapping_" lz[i]
+    LAZY["Integer arithmetic: wrapping (0.26.3)"] = 1
+    TRIGGERS["Integer arithmetic: wrapping (0.26.3)"] = WRAPOPS
+    NEEDS["Integer arithmetic: wrapping (0.26.3)"] = WRAPOPS
+    INTOPS = "IntOverflow SignedOverflow Wrapping wrapping_div wrapping_rem wrapping_pow wrapping_abs"
+    n = split("add sub mul neg shl shr div rem pow abs", lz, " ")
+    for (i = 1; i <= n; i++) INTOPS = INTOPS " checked_" lz[i] " overflowing_" lz[i] " saturating_" lz[i]
+    n = split("Numbers: Wrapping (0.26.3)|Integer arithmetic: the traits (0.26.3)|Integer arithmetic: i8 (0.26.3)|Integer arithmetic: i16 (0.26.3)|Integer arithmetic: i32 (0.26.3)|Integer arithmetic: i64 (0.26.3)|Integer arithmetic: isize (0.26.3)|Integer arithmetic: u8 (0.26.3)|Integer arithmetic: u16 (0.26.3)|Integer arithmetic: u32 (0.26.3)|Integer arithmetic: u64 (0.26.3)|Integer arithmetic: usize (0.26.3)", lz, "|")
+    for (i = 1; i <= n; i++) {
+        LAZY[lz[i]] = 1
+        TRIGGERS[lz[i]] = INTOPS
+        NEEDS[lz[i]] = INTOPS
+    }
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)

@@ -127,7 +127,9 @@ function expr(t, depth,    k, v, u, op, ops) {
     if (k <= 3) {
         split("+ - * / % & | ^", ops, " ")
         op = ops[1 + rnd(8)]
-        if (nonzero && (op == "/" || op == "%"))
+        # (0.26.3: a positive divisor always: / and % by 0 and MIN / -1
+        # panic at every level, decision 6, and would end most programs)
+        if (op == "/" || op == "%")
             return "(" expr(t, depth - 1) " " op " " divisor(t, depth - 1) ")"
         return "(" expr(t, depth - 1) " " op " " expr(t, depth - 1) ")"
     }

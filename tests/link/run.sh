@@ -96,7 +96,7 @@ fn main() {
         sum += ZEROS[i] as i64;
     }
     ZEROS[99999] = 2;
-    println(f"{sum} {NAMES[3]} {DATA[19999]} {ZEROS[99999]}");
+    println("{sum} {} {} {}", NAMES[3], DATA[19999], ZEROS[99999]);
 }
 EOF
 cat >missing.vl <<'EOF'
@@ -106,7 +106,7 @@ extern "C" {
 
 fn main() {
     let x = unsafe { vole_link_test_missing() };
-    println(f"{x}");
+    println("{x}");
 }
 EOF
 
@@ -198,7 +198,7 @@ extern "C" {
 }
 
 fn main() {
-    println(f"{unsafe { ilogb(8.0) }}");
+    println("{}", unsafe { ilogb(8.0) });
 }
 EOF
 cat >badkey.vl <<'EOF'
