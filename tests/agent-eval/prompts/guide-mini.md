@@ -26,9 +26,9 @@ fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocato
     m.get_or_insert(s, 0)[0] += 1;            // Rust: *m.entry(k).or_insert(0) += 1
     var b = Buf::new_in(gpa);                 // Rust: String::new()
     b.push_str(s);
-    var p = P { x: s.len() + v.len() };       // .len() on slices, Vec, Buf, HashMap
+    var p = P { x: (s.len() + v.len()) as i64 }; // .len(), a usize: slices, Vec, Buf, HashMap
     p.bump();                                 // lends p inout
-    println(f"{b.as_slice()} {v:?} {p.x} {total(v)}");
+    println("{} {v:?} {} {}", b.as_slice(), p.x, total(v)); // Rust: println!
     0
 }
 ```

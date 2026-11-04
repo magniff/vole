@@ -62,7 +62,7 @@ fn main(gpa: Gpa) {
     set_via(&px, 9);
     let n2 = Node { value: 2, next: 0 as *Node };
     let n1 = Node { value: 1, next: &n2 };
-    println(f"{m} {t} {c} {s} {f} {st.get()} {list[0].sum} {x} {walk(&n1)}");
+    println("{m} {t} {c} {s} {f} {} {} {x} {}", st.get(), list[0].sum, walk(&n1));
 }
 
 // Kept: a raw walk (the copy would be a reference), a pointer to a
