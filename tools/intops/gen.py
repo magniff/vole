@@ -16,7 +16,7 @@ HEADER = """// std::num::wrapping (0.26.3): made by tools/intops/gen.py.
 
 use std::num::mul_hi;
 
-// ---- Integer arithmetic: the traits (0.26.3) ----
+// ---- Integer arithmetic: wrapping (0.26.3) ----
 
 // (decision 6) Rust's integer arithmetic that does not check, as each
 // integer type's methods: `x.wrapping_add(y)`, `x.checked_mul(y)` (an
@@ -27,12 +27,24 @@ use std::num::mul_hi;
 // and `%` by zero panic here too, as Rust's wrapping_div does. Edit the
 // generator, not this file.
 //
-// Every integer type's: `+ - *`, unary `-`, the shifts (by a u32 amount),
-// `/`, `%` and pow, wrapping, checked (None when Rust's operator would
+// The wrapping `+ - *`, unary `-` and shifts (by a u32 amount): a section
+// of their own, small and needing nothing, since std's hashes and PRNGs
+// call them (index.awk: the rest is lazy).
+pub trait IntWrapping {
+"""
+
+TRAITS = """
+// ---- Integer arithmetic: the traits (0.26.3) ----
+
+// Every integer type's `/`, `%` and pow wrapping, and its `+ - *`, unary
+// `-`, shifts, `/`, `%` and pow checked (None when Rust's operator would
 // panic), overflowing (the wrapped value, and whether it overflowed) and
 // saturating (at the type's bounds).
 pub trait IntOverflow {
 """
+
+WRAP = ["wrapping_add", "wrapping_sub", "wrapping_mul", "wrapping_neg", "wrapping_shl",
+        "wrapping_shr"]
 
 COMMON = [
     ("wrapping_add", "rhs: Self", "Self"), ("wrapping_sub", "rhs: Self", "Self"),
@@ -187,9 +199,29 @@ def indent(text, n):
     return "\n".join(pad + l if l else l for l in text.split("\n"))
 
 
+def methods(out, names, t, bits, signed):
+    first = True
+    for name, params, ret in names:
+        if not first:
+            out.append("\n")
+        first = False
+        out.append(f"    {sig(name, params, ret, t)} {{\n")
+        out.append(indent(body(name, t, bits, signed), 8) + "\n    }\n")
+
+
 def main():
+    wrap = [m for m in COMMON if m[0] in WRAP]
+    rest = [m for m in COMMON if m[0] not in WRAP]
     out = [HEADER]
-    for name, params, ret in COMMON:
+    for name, params, ret in wrap:
+        out.append(f"    {sig(name, params, ret)};\n")
+    out.append("}\n")
+    for t, bits, signed in TYPES:
+        out.append(f"\nimpl IntWrapping for {t} {{\n")
+        methods(out, wrap, t, bits, signed)
+        out.append("}\n")
+    out.append(TRAITS)
+    for name, params, ret in rest:
         out.append(f"    {sig(name, params, ret)};\n")
     out.append("}\n\n// The signed types' too: |x| and -x wrapping, checked, overflowing or\n"
                "// saturating.\npub trait SignedOverflow {\n")
@@ -199,23 +231,11 @@ def main():
     for t, bits, signed in TYPES:
         out.append(f"\n// ---- Integer arithmetic: {t} (0.26.3) ----\n\n")
         out.append(f"impl IntOverflow for {t} {{\n")
-        first = True
-        for name, params, ret in COMMON:
-            if not first:
-                out.append("\n")
-            first = False
-            out.append(f"    {sig(name, params, ret, t)} {{\n")
-            out.append(indent(body(name, t, bits, signed), 8) + "\n    }\n")
+        methods(out, rest, t, bits, signed)
         out.append("}\n")
         if signed:
             out.append(f"\nimpl SignedOverflow for {t} {{\n")
-            first = True
-            for name, params, ret in SIGNED:
-                if not first:
-                    out.append("\n")
-                first = False
-                out.append(f"    {sig(name, params, ret, t)} {{\n")
-                out.append(indent(body(name, t, bits, signed), 8) + "\n    }\n")
+            methods(out, SIGNED, t, bits, signed)
             out.append("}\n")
     print("".join(out), end="")
 

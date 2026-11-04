@@ -442,7 +442,7 @@ true false -1
 `cmp` returns an `i64`: negative if `self` comes first, zero if they're
 equal, positive if `o` comes first. Subtracting the fields is a short
 way to write it, fine for numbers like these; for numbers near the ends
-of the `i64` range the subtraction would wrap (chapter 3), and
+of the `i64` range the subtraction would overflow (chapter 3), and
 `self.major.cmp(o.major)` is the safe way. With `Ord`, `Version`s can be compared with `<`, sorted
 with `sort()`, and given to `largest`.
 

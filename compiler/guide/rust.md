@@ -216,11 +216,11 @@ fn main() -> i32 {
 | `usize` for lengths and indices | the same (0.26.2: `v.len()`, `s.len()`, `s.len`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
-| overflow: panic in debug, wrap in release | always wraps (two's complement) |
-| `x / 0` panics | `x / 0 == 0`, `x % 0 == x` |
+| overflow: panic in debug, wrap in release | the same (0.26.3): checked at -O0, wrapping at -O1 and -O2, `--overflow-checks=on\|off`; `wrapping_*`, `checked_*`, `overflowing_*`, `saturating_*`, `Wrapping<T>` (`.value` for `.0`) |
+| `x / 0` panics | the same (0.26.3), and `MIN / -1`, at every level |
 | `!x` (bitwise not) | `~x` |
 | `f.sqrt()`, `f.sin()`, `f.powi(n)`, `f64::consts::PI`, `f64::EPSILON` | the same (0.25.2.1, `guide math`), in vole: no C, no `unsafe` |
-| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they wrap, as `*` does |
+| `x.pow(n)`, `x.abs()`, `a.min(b)`, `x.clamp(lo, hi)`, `x.signum()` on integers | the same (0.25.2.2, `guide math#integers`); they overflow as `*` does |
 | `char`, a non-ASCII `char` literal | `u8`, ASCII literals only; `"\u{e9}"` in strings is UTF-8 bytes |
 | `()` | `()` |
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |

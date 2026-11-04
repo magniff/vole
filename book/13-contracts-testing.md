@@ -262,9 +262,9 @@ caller, where the same reasoning applies; `#[inline(never)]` keeps it
 separate so we can see it.)
 
 Nothing is assumed: a fact comes only from a check that ran. And
-integers wrap around in vole, so a condition may not mean what it looks
-like. `i + 1 < v.len()` is true for an `i` that is the largest `usize`,
-where `i + 1` wraps to 0, so it doesn't prove that
+integers wrap around in an optimized build, so a condition may not mean
+what it looks like. `i + 1 < v.len()` is true for an `i` that is the
+largest `usize`, where `i + 1` wraps to 0 at `-O2`, so it doesn't prove that
 `v[i + 1]` is in range, and that check stays. Write the condition about
 the index you use.
 

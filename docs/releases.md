@@ -100,6 +100,37 @@ compiler/src on `usize` (usize263):
   every cast by class, and `--only casts-list` is a dry run that lists
   them.
 
+Arithmetic, Rust's (arith263, decision 6):
+
+- **Breaking: integer overflow panics at -O0.** `+ - *`, unary `-` and
+  the shifts are checked when the overflow checks are on, -O0's default
+  (rustc's debug builds): `attempt to add with overflow` at the
+  expression, exit 101. At -O1 and -O2 they wrap, as before.
+  `--overflow-checks=on|off` overrides the level (hashed by the code
+  cache); std is built with the program's setting. A program that relies
+  on wrapping writes `wrapping_*` or `Wrapping<T>`, or builds with
+  `--overflow-checks=off`.
+- **Breaking: `/` and `%` by zero, and `MIN / -1`, panic at every level**
+  (`attempt to divide by zero`, `attempt to divide with overflow`), where
+  `x / 0` was 0 and `x % 0` was x.
+- **Shifts**: by the type's bits or more, a panic with the checks on; off,
+  the amount is taken modulo the type's bits, as Rust's, also for 8- and
+  16-bit operands (`1u8 << 9` is 2, was 0).
+- **Constants** follow the same rule: with the checks on, a constant
+  expression that overflows is the error `arith.overflow` (`volec explain
+  arith.overflow`); a constant `MIN / -1` is one at every level.
+- std's integer API, Rust's names and results, for every integer type, as
+  methods with no `use`: `wrapping_{add,sub,mul,neg,shl,shr,div,rem,pow}`,
+  `checked_*` (an `Option`), `overflowing_*`, `saturating_*`, and the
+  signed types' `*_abs`; `std::num::Wrapping<T>` with `+ - * /` and unary
+  `-` (`Wrapping(x)`, `.value`). tests/run/num_int_ops_rust.vl checks them
+  against rustc's results (tools/intops/twin.py). std's own wrap sites
+  (its hashes, PRNGs, SWAR parsing, bit counts) are written `wrapping_*`.
+- compiler/src still relies on wrapping in 46 places (feedbacks/arith263.md
+  lists them) and may not call `wrapping_*` until 0.26.4: the bootstrap's
+  -O0 builds of it (chain-diverse's B2 and A2O0) pass
+  `--overflow-checks=off` until then.
+
 ### What's new in 0.26.2
 
 `usize` and Rust's float casts, with std's lengths and indices in `usize`; Rust's format strings, `where`, `impl Trait` arguments and `pub(crate)`; `defer` removed; shader parts and the rest of `embed wgsl`; the places IR places every drop and the AST lowerings are gone. Built and tested on aarch64-macos only.

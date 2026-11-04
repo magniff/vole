@@ -170,7 +170,11 @@ with those bounds, after the written ones: messages name it by its text,
 Items may refer to each other in any order. Constants and statics are
 initialized by constant expressions: literals, other constants, unary and
 binary operators, casts, enum variants, and array/tuple/struct literals of
-those. Constant arithmetic wraps like run-time arithmetic.
+those. Constant arithmetic is run-time arithmetic (0.26.3, "Defined"
+below): with the overflow checks on, a constant expression whose `+ - *`,
+unary `-` or shift overflows its type is the error `arith.overflow`; with
+them off it wraps. A constant `MIN / -1` or `MIN % -1` is that error at
+every level, and `/ 0` a type error.
 
 **Enums** *(0.3)*. A fieldless enum's variants have discriminants (0, 1, ...
 unless given with `= expr`); such an enum is a scalar, compared with `==`
@@ -382,15 +386,31 @@ in unsafe code, `unsafe { ... }` and `unsafe fn`.
 **Defined** (each case checked at -O0 and -O2, on AArch64 and x86-64, at
 run time and in constant folding, which agree):
 
-- Integer overflow of `+`, `-`, `*` and unary `-` wraps at the type's
-  width (two's complement): `i32::MAX + 1 == i32::MIN`,
-  `-i64::MIN == i64::MIN`.
-- Division and remainder by zero: `x / 0 == 0`, `x % 0 == x`.
-  `MIN / -1 == MIN` and `MIN % -1 == 0`.
-- Shifts: the amount is taken modulo 64 for 64-bit operands, and modulo
-  32 for narrower ones, which are shifted as 32-bit values and then
-  truncated (`1u8 << 9 == 0`, `1u8 << 33 == 2`); a negative amount is a
-  large one (`1 << -1 == 1 << 63`). `>>` is arithmetic on signed types,
+- Integer overflow (0.26.3, Rust's arithmetic, decision 6): `+`, `-`,
+  `*`, unary `-` and the shifts are checked when the overflow checks are
+  on, -O0's default; an overflow panics with Rust's message at the
+  expression (`main.vl:4:13: attempt to add with overflow`, exit 101).
+  With them off, -O1's and -O2's default, they wrap at the type's width
+  (two's complement): `i32::MAX + 1 == i32::MIN`, `-i64::MIN ==
+  i64::MIN`. `--overflow-checks=on|off` overrides the level (rustc's
+  `-C overflow-checks`), and std is built with the program's setting.
+  std's integer API never checks: `x.wrapping_add(y)` (`_sub _mul _neg
+  _shl _shr _div _rem _pow _abs`), `checked_*` (an `Option`),
+  `overflowing_*` (the wrapped value and whether it overflowed),
+  `saturating_*`, for every integer type, and `std::num::Wrapping<T>`,
+  whose `+ - * /` and unary `-` wrap (`Wrapping(x)`, its `.value`). Before
+  0.26.3 arithmetic wrapped at every level.
+- Division and remainder by zero panic at every level (`attempt to divide
+  by zero`, `attempt to calculate the remainder with a divisor of zero`),
+  and so do `MIN / -1` and `MIN % -1` (`attempt to divide with
+  overflow`, `attempt to calculate the remainder with overflow`). Before 0.26.3, `x / 0 == 0`, `x % 0 == x` and `MIN / -1 ==
+  MIN`.
+- Shifts: with the overflow checks on, an amount of at least the type's
+  bits panics (`attempt to shift left with overflow`; a negative amount
+  is a large one). With them off, the amount is taken modulo the type's
+  bits, as Rust's release arithmetic (`1u8 << 9 == 2`, `1 << 65 == 2`,
+  `1 << -1 == 1 << 63`; before 0.26.3 an 8- or 16-bit operand took it
+  modulo 32, `1u8 << 9 == 0`). `>>` is arithmetic on signed types,
   logical on unsigned ones.
 - Float to integer conversion (`as`), as Rust's: the value truncated
   toward zero, NaN becomes 0, and every target saturates at its own
