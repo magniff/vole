@@ -1,0 +1,1321 @@
+// `volec fix --only rawptr` (0.26.4, the plan's item e): the legacy raw
+// pointer parameters, `p: *T` and `p: sink *T` of the program's own safe
+// functions, decided by what the function does with them:
+//
+//   read     only read through (`p.f`, `*p`, a let receiver): `p: T`, a
+//            let parameter, the calls' `&x` becoming `x`;
+//   write    written through (`p.f = v`, `*p = v`, an inout receiver,
+//            passed on to a parameter that is written): `p: inout T`, the
+//            calls' `&x` kept;
+//   escape   the pointer itself is used: stored (a `let`, a field, an
+//            aggregate), returned, cast, compared, indexed or offset
+//            (`p[i]`, `&p[i]`), assigned, captured by a closure, passed to
+//            C, to an `unsafe fn`, to a function value or on to a raw
+//            parameter: it stays `*T`;
+//   caller   read or written, but a call gives it something other than the
+//            address of a place: a raw pointer value (a local, a field, a
+//            call's result), null or a C string, or a place reached through
+//            a raw pointer;
+//   fixed    its signature cannot change here: an `unsafe fn`, an exported
+//            or C function, one used as a value, `main`, a closure's, a
+//            trait's or its impls', a `**T` / `*[T]`, an `inout *T`.
+//
+// The classes are a fixed point over the whole program, callees first: a
+// parameter passed on to one that is written is written, to one that stays
+// raw escapes. `--only rawptr-list` (a dry run) prints each parameter:
+// FILE:LINE, its class, the first reason, the function, the parameter, the
+// kind of T (u8, copy: a plain value of at most 16 bytes, big: a larger
+// plain value, which a let parameter copies, owned: lent by a let).
+
+use crate::base::{
+    FILES, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd, intern,
+};
+use crate::front::ast::{BLOCK_UNSAFE, FN_UNSAFE, NODES, NODE_REF_MUT, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::conv::{CONV_IN_OUT, copyable, param_conv};
+use crate::front::generics::instantiate::{node_field_a, node_field_b, node_field_c};
+use crate::front::lexer::Tok;
+use crate::front::modules::file_of_pos;
+use crate::front::traits::{IMPLS, impl_of_fn};
+use crate::front::types::{FNS, FN_COUNT, REF_MUT, TYPES, TY_U8, TyKind, fn_param, type_size};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::defs::{DEFS, K_TRAIT_FN, def_of_node};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::refs::ref_in;
+
+// The flags of a parameter (per function node and index): written through;
+// a reason it escapes (R_*); a reason a call gives it no place (C_*).
+const F_WRITE: i64 = 1;
+const R_BIND: i64 = 2;
+const R_RETURN: i64 = 4;
+const R_CAST: i64 = 8;
+const R_COMPARE: i64 = 16;
+const R_INDEX: i64 = 32;
+const R_RAWCALL: i64 = 64;
+const R_VALUE: i64 = 128;
+const R_CLOSURE: i64 = 256;
+const R_ASSIGN: i64 = 512;
+const R_OTHER: i64 = 1024;
+// (a call gives it null, a C string or the address of a place reached
+// through a raw pointer, `&q.f`, `&TABLE[i]`: no access can be)
+const R_GIVEN: i64 = 32768;
+// (given to a call inside the arguments of another call that takes the
+// same parameter, `f(&cx, g(&cx))`: two inout accesses would conflict,
+// own.conflict; a raw one is no loan)
+const R_NESTED: i64 = 65536;
+const R_ALL: i64 = 2046 | R_GIVEN | R_NESTED;
+const C_RAW: i64 = 2048;
+const C_NULL: i64 = 4096;
+const C_THROUGH: i64 = 8192;
+const C_OTHER: i64 = 16384;
+const C_ALL: i64 = 30720;
+static var GIVEN_CHANGED: bool = false;
+
+// The classes.
+pub const RP_READ: i64 = 0;
+pub const RP_WRITE: i64 = 1;
+pub const RP_ESCAPE: i64 = 2;
+pub const RP_CALLER: i64 = 3;
+pub const RP_FIXED: i64 = 4;
+
+// Why a signature is fixed (fixed_why).
+const X_NONE: i64 = 0;
+const X_UNSAFE: i64 = 1;
+const X_EXPORT: i64 = 2;
+const X_VALUE: i64 = 3;
+const X_MAIN: i64 = 4;
+const X_CLOSURE: i64 = 5;
+const X_TRAIT: i64 = 6;
+const X_NESTED: i64 = 7;
+const X_INOUT: i64 = 8;
+const X_SELF: i64 = 9;
+
+// The kinds of T.
+const T_U8: i64 = 0;
+const T_COPY: i64 = 1;
+const T_BIG: i64 = 2;
+const T_OWNED: i64 = 3;
+
+// Contexts of a use of a value.
+const CX_READ: i64 = 0;
+const CX_BIND: i64 = 1;
+const CX_RET: i64 = 2;
+
+// The phases: marking the flags, then the calls' arguments.
+const PH_MARK: i64 = 0;
+const PH_CALLS: i64 = 1;
+const PH_EDIT: i64 = 2;
+
+// (`--only rawptr-list`) each parameter on stdout
+pub static var RAWPTR_LIST: bool = false;
+// The census: [program, std] x the classes; reasons; kinds of the read.
+pub static var RAWPTR_COUNTS: [i64; 10] = [0; 10];
+static var REASONS: [i64; 17] = [0; 17];
+static var FIXED_WHY: [i64; 10] = [0; 10];
+static var SELF_SYM: i64 = -1;
+static var READ_KINDS: [i64; 4] = [0; 4];
+static var WRITE_KINDS: [i64; 4] = [0; 4];
+// (the call sites that give a parameter no place)
+static var CALLER_SITES: i64 = 0;
+
+static var FLAGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// (the listing) the function a parameter was first passed on to raw, or
+// the first that gave it no place (+ 1)
+static var WHO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var CHANGED: bool = false;
+static var PHASE: i64 = 0;
+static var FIRST: bool = true;
+static var CUR_F: i64 = 0;
+static var CUR_NODE: i64 = 0;
+static var IN_HOLE: i64 = 0;
+static var IN_UNSAFE: i64 = 0;
+// Positions edited (+ 1: 1): a generic function's instances share them.
+static var EDITED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The edits' census: parameters to inout, to let; arguments given `&`,
+// `&` taken away, `*p` to `p`, boundaries `&*q` (`*q`), of which in a new
+// unsafe block.
+pub static var RAWPTR_EDITS: [i64; 7] = [0; 7];
+// Function nodes used as a value (+ 1: 1); the closures f-strings make.
+static var AS_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var FSTRING_CLOSURES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// ---- functions ----
+
+fn f_node(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer (front::types).
+    // SAFETY: f is below FN_COUNT, the table's length, wherever these are called.
+    unsafe { FNS[f].node }
+}
+
+fn f_tmpl(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].tmpl }
+}
+
+fn f_params(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].param_count }
+}
+
+fn f_generic(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].generic }
+}
+
+fn f_extern(f: i64) -> bool {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].is_extern }
+}
+
+fn f_export(f: i64) -> bool {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].export }
+}
+
+fn f_unsafe(f: i64) -> bool {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { (FNS[f].attrs & FN_UNSAFE) != 0 }
+}
+
+fn f_self_ty(f: i64) -> i64 {
+    // UNSAFE: FNS is the checker's table of functions, a raw pointer.
+    // SAFETY: f is below FN_COUNT, the table's length.
+    unsafe { FNS[f].self_ty }
+}
+
+// The template's node of f (an instance's flags are its template's).
+fn base_node(f: i64) -> i64 {
+    let t = f_tmpl(f);
+    if t > 0 { f_node(t - 1) } else { f_node(f) }
+}
+
+fn has_body(f: i64) -> bool {
+    if f < 0 || f >= FN_COUNT || f_extern(f) {
+        return false;
+    }
+    let item = f_node(f);
+    item > 0 && NODES[item].kind == NodeKind::Fn && NODES[item].c != 0
+}
+
+fn in_std(pos: i64) -> bool {
+    // UNSAFE: a file's path is a C string, a raw pointer (base::SourceFile).
+    // SAFETY: file_of_pos gives the index of a loaded file, and every path is NUL-terminated.
+    unsafe { FILES[file_of_pos(pos)].path[0] == '<' }
+}
+
+// Why f's signature cannot change (X_NONE: it can).
+fn fixed_why(f: i64) -> i64 {
+    if f_unsafe(f) {
+        return X_UNSAFE;
+    }
+    if f_export(f) {
+        return X_EXPORT;
+    }
+    let node = base_node(f);
+    if AS_VALUE.get(node + 1) != 0 {
+        return X_VALUE;
+    }
+    let name = SYMS[NODES[node].a].text;
+    if name == "main" && f_self_ty(f) == 0 {
+        return X_MAIN;
+    }
+    let d = def_of_node(node);
+    if d < 0 {
+        return X_CLOSURE;
+    }
+    if DEFS[d].kind == K_TRAIT_FN {
+        return X_TRAIT;
+    }
+    let im = impl_of_fn(f);
+    // UNSAFE: IMPLS is the checker's table of impl blocks, a raw pointer (front::traits).
+    // SAFETY: impl_of_fn gives an index into it, or -1, tested first.
+    if im >= 0 && unsafe { IMPLS[im].tr } >= 0 {
+        return X_TRAIT;
+    }
+    X_NONE
+}
+
+// Whether parameter i of f is a raw `*T` (by its type): 0 no, 1 one this
+// fix may decide, or the X_* reason it cannot (a pointer to a pointer, a
+// slice or a function; an `inout *T`).
+fn ptr_param(f: i64, i: i64) -> i64 {
+    if i >= f_params(f) || i >= 63 {
+        return 0;
+    }
+    let item = f_node(f);
+    if item <= 0 || i >= NODES[item].count {
+        return 0;
+    }
+    let t = fn_param(f, i);
+    if t <= 0 || TYPES[t].kind != TyKind::Ptr || TYPES[t].b != 0 {
+        return 0;
+    }
+    let pn = child(item, i);
+    if param_conv(pn) == CONV_IN_OUT {
+        return X_INOUT;
+    }
+    if NODES[pn].a == SELF_SYM {
+        return X_SELF;
+    }
+    let a = TYPES[t].a;
+    if a <= 0 || TYPES[a].kind == TyKind::Ptr || TYPES[a].kind == TyKind::Slice
+        || TYPES[a].kind == TyKind::Fn {
+        return X_NESTED;
+    }
+    1
+}
+
+fn key(f: i64, i: i64) -> i64 {
+    base_node(f) * 64 + i + 1
+}
+
+fn flags(f: i64, i: i64) -> i64 {
+    FLAGS.get(key(f, i))
+}
+
+fn mark(f: i64, i: i64, bits: i64) {
+    let old = FLAGS.get(key(f, i));
+    if (old | bits) != old {
+        FLAGS.put(key(f, i), old | bits);
+        CHANGED = true;
+    }
+}
+
+fn mark_cur(p: i64, bits: i64) {
+    if PHASE == PH_MARK && p >= 0 {
+        mark(CUR_F, p, bits);
+    }
+}
+
+// Whether parameter i of f may be decided (read, write or caller).
+fn decidable(f: i64, i: i64) -> bool {
+    has_body(f) && !in_std(NODES[f_node(f)].start) && fixed_why(f) == X_NONE && ptr_param(f, i) == 1
+        && (flags(f, i) & R_ALL) == 0
+}
+
+// Whether parameter i of f stays a raw pointer for its callers: C's, std's,
+// a fixed signature, or one that escapes.
+fn callee_raw(f: i64, i: i64) -> bool {
+    !decidable(f, i)
+}
+
+// Whether raw parameter i of f is used as an address, not as one T: C's,
+// std's, a fixed signature's, a `*u8`, or one indexed, cast, compared,
+// walked (assigned) or passed on to such a parameter. A decided parameter
+// passed to it escapes; passed to another raw one, it is given as `&p`,
+// the address of the place it designates (and is inout).
+fn callee_array(f: i64, i: i64) -> bool {
+    if !has_body(f) || in_std(NODES[f_node(f)].start) || fixed_why(f) != X_NONE
+        || ptr_param(f, i) != 1 || TYPES[fn_param(f, i)].a == TY_U8 {
+        return true;
+    }
+    (flags(f, i) & (R_INDEX | R_CAST | R_COMPARE | R_ASSIGN | R_RAWCALL)) != 0
+}
+
+fn callee_writes(f: i64, i: i64) -> bool {
+    (flags(f, i) & F_WRITE) != 0
+}
+
+// ---- the walk ----
+
+// The parameter index of local l of the function walked, or -1.
+fn param_of_local(l: i64) -> i64 {
+    if l < 0 {
+        return -1;
+    }
+    let item = CUR_NODE;
+    for i in 0..NODES[item].count {
+        if NODES[child(item, i)].x == l {
+            return i;
+        }
+    }
+    -1
+}
+
+// The raw-pointer parameter expression n is (a bare name), or -1.
+fn param_ident(n: i64) -> i64 {
+    if n <= 0 || NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+        return -1;
+    }
+    let p = param_of_local(NODES[n].y);
+    if p >= 0 && ptr_param(CUR_F, p) != 0 { p } else { -1 }
+}
+
+// The root of place n (through fields, indexes, derefs).
+fn place_root(n: i64) -> i64 {
+    var e = n;
+    while e > 0 {
+        let k = NODES[e].kind;
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+            e = NODES[e].a;
+        } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            e = NODES[e].b;
+        } else {
+            return e;
+        }
+    }
+    e
+}
+
+// The root a write to place n writes: through a method's receiver when the
+// place is its result (`v.get_mut(k)[0] = x`).
+fn write_root(n: i64) -> i64 {
+    var r = place_root(n);
+    var steps = 0;
+    while r > 0 && NODES[r].kind == NodeKind::Call && NODES[r].count > 0 && steps < 8 {
+        var a = child(r, 0);
+        if NODES[a].kind == NodeKind::Unary && NODES[a].op == Tok::Amp {
+            a = NODES[a].b;
+        }
+        r = place_root(a);
+        steps += 1;
+    }
+    r
+}
+
+// The expressions inside place n that are evaluated (indexes, a root that
+// is no name); an index of a parameter (`p[i]`, pointer arithmetic) is
+// an escape.
+fn place_parts(n: i64) {
+    var e = n;
+    while e > 0 {
+        let k = NODES[e].kind;
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            e = NODES[e].a;
+        } else if k == NodeKind::Index {
+            scan(NODES[e].b, CX_READ);
+            let q = param_ident(NODES[e].a);
+            if q >= 0 {
+                mark_cur(q, R_INDEX);
+            }
+            e = NODES[e].a;
+        } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            deref_edit(e);
+            e = NODES[e].b;
+        } else {
+            if k != NodeKind::Ident {
+                scan(e, CX_READ);
+            }
+            return;
+        }
+    }
+}
+
+// A use of the pointer itself, in context ctx.
+fn bare_use(p: i64, ctx: i64) {
+    if IN_HOLE > 0 {
+        mark_cur(p, R_OTHER);
+    } else if ctx == CX_BIND {
+        mark_cur(p, R_BIND);
+    } else if ctx == CX_RET {
+        mark_cur(p, R_RETURN);
+    } else {
+        mark_cur(p, R_OTHER);
+    }
+}
+
+// Every parameter named inside closure n escapes (a capture).
+fn mark_closure(n: i64) {
+    if n <= 0 || PHASE != PH_MARK || !FIRST {
+        return;
+    }
+    let s = NODES[n].start;
+    let e = NODES[n].end;
+    for m in 1..NODES.len() as i64 {
+        if NODES[m].start >= s && NODES[m].end <= e && NODES[m].kind == NodeKind::Ident {
+            let p = param_ident(m);
+            if p >= 0 {
+                mark_cur(p, R_CLOSURE);
+            }
+        }
+    }
+}
+
+fn scan_list(n: i64, ctx: i64) {
+    for i in 0..NODES[n].count {
+        scan(child(n, i), ctx);
+    }
+}
+
+// Walks expression n of the current function.
+fn scan(n: i64, ctx: i64) {
+    if n <= 0 {
+        return;
+    }
+    match NODES[n].kind {
+        NodeKind::Ident => {
+            let p = param_ident(n);
+            if p >= 0 {
+                bare_use(p, ctx);
+            }
+        }
+        NodeKind::FieldAccess | NodeKind::TupleField | NodeKind::Index => place_parts(n),
+        NodeKind::Unary => {
+            let op = NODES[n].op;
+            if op == Tok::Star {
+                deref_edit(n);
+                place_parts(n);
+            } else if op == Tok::Amp {
+                borrow(n, -1, -1);
+            } else {
+                scan(NODES[n].b, CX_READ);
+            }
+        }
+        NodeKind::Cast => {
+            let p = param_ident(NODES[n].a);
+            if p >= 0 {
+                mark_cur(p, R_CAST);
+            } else {
+                scan(NODES[n].a, CX_READ);
+            }
+        }
+        NodeKind::Binary => {
+            for side in [NODES[n].b, NODES[n].c] {
+                let p = param_ident(side);
+                if p >= 0 {
+                    mark_cur(p, R_COMPARE);
+                } else {
+                    scan(side, CX_READ);
+                }
+            }
+        }
+        NodeKind::Assign => {
+            let target = NODES[n].b;
+            scan(NODES[n].c, if NODES[n].op == Tok::Eq { CX_BIND } else { CX_READ });
+            let p = param_ident(target);
+            if p >= 0 {
+                mark_cur(p, R_ASSIGN);
+                return;
+            }
+            place_parts(target);
+            let w = param_ident(write_root(target));
+            if w >= 0 {
+                mark_cur(w, F_WRITE);
+            }
+        }
+        NodeKind::Call => scan_call(n),
+        NodeKind::MethodCall => {
+            // (not resolved by the checker: its receiver is used as it is)
+            scan(NODES[n].a, CX_BIND);
+            scan_list(n, CX_BIND);
+        }
+        NodeKind::Block => {
+            let unsafe_block = (NODES[n].p & BLOCK_UNSAFE) != 0;
+            if unsafe_block {
+                IN_UNSAFE += 1;
+            }
+            for i in 0..NODES[n].count {
+                let s = child(n, i);
+                let k = NODES[s].kind;
+                if k == NodeKind::Let {
+                    scan(NODES[s].c, CX_BIND);
+                } else if k == NodeKind::Defer || k == NodeKind::ExprStmt {
+                    scan(NODES[s].a, CX_READ);
+                } else {
+                    scan(s, CX_READ);
+                }
+            }
+            scan(NODES[n].a, ctx);
+            if unsafe_block {
+                IN_UNSAFE -= 1;
+            }
+        }
+        NodeKind::If => {
+            scan(NODES[n].a, CX_READ);
+            scan(NODES[n].b, ctx);
+            scan(NODES[n].c, ctx);
+        }
+        NodeKind::Match => {
+            scan(NODES[n].a, CX_READ);
+            for i in 0..NODES[n].count {
+                let arm = child(n, i);
+                scan(NODES[arm].b, CX_READ);
+                scan(NODES[arm].c, ctx);
+            }
+        }
+        NodeKind::Loop => scan(NODES[n].b, CX_READ),
+        NodeKind::While => {
+            scan(NODES[n].b, CX_READ);
+            scan(NODES[n].c, CX_READ);
+        }
+        NodeKind::For => {
+            scan(NODES[n].c, CX_READ);
+            scan(NODES[n].d, CX_READ);
+        }
+        NodeKind::Break => scan(NODES[n].b, CX_BIND),
+        NodeKind::Return => scan(NODES[n].a, CX_RET),
+        NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
+            scan_list(n, CX_BIND);
+        }
+        NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b, ctx),
+        NodeKind::Repeat => scan(NODES[n].a, CX_BIND),
+        NodeKind::Range => {
+            scan(NODES[n].a, CX_READ);
+            scan(NODES[n].b, CX_READ);
+        }
+        NodeKind::Closure => {
+            // (an f-string's closure displays the locals its holes were
+            // bound to, which the walk reads: no capture)
+            if FSTRING_CLOSURES.get(n + 1) == 0 {
+                mark_closure(n);
+            }
+        }
+        NodeKind::Try => scan(NODES[n].y, ctx),
+        NodeKind::Interp => {
+            IN_HOLE += 1;
+            scan(NODES[n].y, ctx);
+            IN_HOLE -= 1;
+        }
+        NodeKind::EnumPanic => scan(NODES[n].a, CX_READ),
+        NodeKind::VecOp => {
+            scan(NODES[n].a, CX_READ);
+            scan_list(n, CX_READ);
+        }
+        _ => {}
+    }
+}
+
+// `&place` (node n), argument i of a call of f (i: -1, not an argument).
+fn borrow(n: i64, f: i64, i: i64) {
+    let operand = NODES[n].b;
+    place_parts(operand);
+    let p = param_ident(place_root(operand));
+    if p < 0 {
+        return;
+    }
+    if place_root(operand) == operand || IN_HOLE > 0 {
+        // (`&p`: the address of the pointer itself)
+        mark_cur(p, R_OTHER);
+        return;
+    }
+    // (a pointer into *p kept, or given to a parameter that may write
+    // through it or keep it: p is passed by address, inout)
+    if (NODES[n].p & NODE_REF_MUT) != 0 || f < 0 || i < 0 || i >= f_params(f) {
+        mark_cur(p, F_WRITE);
+        return;
+    }
+    let t = fn_param(f, i);
+    if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 && TYPES[t].b != REF_MUT {
+        // (lent to a let parameter: read)
+        return;
+    }
+    if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 && !callee_raw(f, i)
+        && !callee_writes(f, i) {
+        return;
+    }
+    mark_cur(p, F_WRITE);
+}
+
+// Call n: each argument by what its parameter does with it.
+fn scan_call(n: i64) {
+    let f = NODES[n].x - 1;
+    if f < 0 {
+        scan(NODES[n].a, CX_READ);
+    }
+    if PHASE == PH_MARK {
+        nested_calls(n);
+    }
+    for i in 0..NODES[n].count {
+        var arg = child(n, i);
+        if NODES[arg].kind == NodeKind::NamedArg {
+            arg = NODES[arg].b;
+        }
+        argument(f, i, arg, n);
+    }
+}
+
+// The argument arg of a call, without its `name:`, a cast and its `&`.
+fn arg_core(arg: i64) -> i64 {
+    var a = arg;
+    if NODES[a].kind == NodeKind::NamedArg {
+        a = NODES[a].b;
+    }
+    if NODES[a].kind == NodeKind::Cast {
+        a = NODES[a].a;
+    }
+    if NODES[a].kind == NodeKind::Unary && NODES[a].op == Tok::Amp {
+        a = NODES[a].b;
+    }
+    a
+}
+
+// The local (+ 1) argument arg names at its root (`p`, `&p.f`), or -1: a
+// parameter, raw or an access, or a local.
+fn arg_local(arg: i64) -> i64 {
+    let r = place_root(arg_core(arg));
+    if r <= 0 || NODES[r].kind != NodeKind::Ident || NODES[r].res != Res::Local
+        || NODES[r].y < 0 {
+        return -1;
+    }
+    NODES[r].y + 1
+}
+
+// Whether argument arg is the local itself (`p`, `&p`), not a part of it.
+fn arg_bare(arg: i64) -> bool {
+    NODES[arg_core(arg)].kind == NodeKind::Ident
+}
+
+// Call n of f: a call inside one of its arguments that is given a local n
+// is given too (`f(&cx, g(&cx))`) keeps g's parameter raw (R_NESTED);
+// another argument that borrows a part of it (`f(&cx, &cx.cap)`), or a
+// call that cannot keep it raw, keeps f's raw. (By local, not by raw
+// parameter: the rewritten program is decided again the same way.)
+fn nested_calls(n: i64) {
+    let f = NODES[n].x - 1;
+    for i in 0..NODES[n].count {
+        let p = arg_local(child(n, i));
+        if p < 0 {
+            continue;
+        }
+        var clash = false;
+        for j in 0..NODES[n].count {
+            if j != i && nested_in(child(n, j), p, true) {
+                clash = true;
+            }
+        }
+        let receiver = i == 0 && NODES[child(n, 0)].start == NODES[n].start;
+        if clash && !receiver && arg_bare(child(n, i)) && f >= 0 && f < FN_COUNT
+            && decidable(f, i) {
+            mark(f, i, R_NESTED);
+        }
+    }
+}
+
+// The calls inside expression e (an argument when top) given parameter p,
+// not into closures, marked; whether e borrows a part of p (`&p.f`) or a
+// call that cannot be marked is given it.
+fn nested_in(e: i64, p: i64, top: bool) -> bool {
+    if e <= 0 {
+        return false;
+    }
+    let k = NODES[e].kind;
+    if k == NodeKind::Closure {
+        return false;
+    }
+    if top && k == NodeKind::Unary && NODES[e].op == Tok::Amp && arg_local(e) == p {
+        return true;
+    }
+    var clash = false;
+    if k == NodeKind::Call {
+        let g = NODES[e].x - 1;
+        for j in 0..NODES[e].count {
+            if arg_local(child(e, j)) == p {
+                if g >= 0 && g < FN_COUNT && decidable(g, j) {
+                    mark(g, j, R_NESTED);
+                } else if !arg_bare(child(e, j)) || g < 0 || ptr_param(g, j) == 0 {
+                    // (a part of p, `&p.f`; a reference or an inout
+                    // parameter's, std's)
+                    clash = true;
+                }
+            }
+        }
+    }
+    if node_field_a(k) && nested_in(NODES[e].a, p, false) {
+        clash = true;
+    }
+    if node_field_b(k) && nested_in(NODES[e].b, p, false) {
+        clash = true;
+    }
+    if node_field_c(k) && nested_in(NODES[e].c, p, false) {
+        clash = true;
+    }
+    for j in 0..NODES[e].count {
+        if nested_in(child(e, j), p, false) {
+            clash = true;
+        }
+    }
+    clash
+}
+
+// Argument arg of a call of f (-1: a function value's), at parameter i.
+fn argument(f: i64, i: i64, arg: i64, call: i64) {
+    let receiver = i == 0 && NODES[arg].start == NODES[call].start;
+    if PHASE != PH_MARK && f >= 0 && f < FN_COUNT && decidable(f, i) && !receiver
+        && !in_std(NODES[arg].start) {
+        caller_arg(f, i, arg);
+    }
+    let k = NODES[arg].kind;
+    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+        borrow(arg, f, i);
+        return;
+    }
+    let p = param_ident(arg);
+    if p < 0 {
+        scan(arg, CX_READ);
+        return;
+    }
+    if IN_HOLE > 0 {
+        mark_cur(p, R_OTHER);
+        return;
+    }
+    if f < 0 || i >= f_params(f) {
+        mark_cur(p, R_VALUE);
+        return;
+    }
+    let t = fn_param(f, i);
+    if t <= 0 || TYPES[t].kind != TyKind::Ptr {
+        // (a pointer given as a value of another type: a generic T)
+        mark_cur(p, R_BIND);
+    } else if TYPES[t].b == REF_MUT {
+        mark_cur(p, F_WRITE);
+        if !receiver {
+            mark_arg(arg, p);
+        }
+    } else if TYPES[t].b != 0 {
+        // (a let receiver of an owned T, lent)
+    } else if callee_raw(f, i) && callee_array(f, i) {
+        if PHASE == PH_MARK && WHO.get(key(CUR_F, p)) == 0 {
+            WHO.put(key(CUR_F, p), f + 1);
+        }
+        mark_cur(p, R_RAWCALL);
+    } else if callee_raw(f, i) {
+        mark_cur(p, F_WRITE);
+        if !receiver {
+            mark_arg(arg, p);
+        }
+    } else if callee_writes(f, i) {
+        mark_cur(p, F_WRITE);
+    }
+}
+
+// Whether place n is reached through a raw pointer that stays one: a
+// field, an index or a deref of a `*T` (`&q.f`, `&TABLE[i]`).
+fn through_raw(n: i64) -> bool {
+    var e = n;
+    while e > 0 {
+        let k = NODES[e].kind;
+        var base = 0;
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+            base = NODES[e].a;
+        } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            base = NODES[e].b;
+        } else {
+            return false;
+        }
+        let t = NODES[base].ty;
+        if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
+            let p = param_ident(base);
+            if p < 0 || !decidable(CUR_F, p) {
+                return true;
+            }
+        }
+        e = base;
+    }
+    false
+}
+
+// What a call gives decidable parameter i of f: the address of a place, a
+// parameter that is decided too, or else (C_*: the parameter's class is
+// caller, and the call needs `*q` / `&*q` in unsafe code).
+fn caller_arg(f: i64, i: i64, arg: i64) {
+    let k = NODES[arg].kind;
+    if PHASE == PH_EDIT {
+        edit_arg(f, i, arg);
+        return;
+    }
+    var bits = 0;
+    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+        if through_raw(NODES[arg].b) {
+            bits = C_THROUGH;
+        }
+    } else {
+        let p = param_ident(arg);
+        if p >= 0 {
+            if !decidable(CUR_F, p) {
+                bits = C_RAW;
+            }
+        } else if k == NodeKind::CStr || k == NodeKind::Cast {
+            bits = C_NULL;
+        } else {
+            let t = NODES[arg].ty;
+            bits = if t > 0 && TYPES[t].kind == TyKind::Ptr { C_RAW } else { C_OTHER };
+        }
+    }
+    if (bits & (C_NULL | C_THROUGH)) != 0 {
+        bits = bits | R_GIVEN;
+        GIVEN_CHANGED = true;
+    }
+    if bits != 0 {
+        FLAGS.put(key(f, i), flags(f, i) | bits);
+        if WHO.get(key(f, i)) == 0 {
+            WHO.put(key(f, i), CUR_F + 1);
+        }
+        CALLER_SITES += 1;
+    }
+}
+
+// Walks every function with a body in phase ph (std's too: its writes
+// count).
+fn walk_all(ph: i64) {
+    PHASE = ph;
+    for f in 0..FN_COUNT {
+        if !has_body(f) || f_generic(f) > 0 && f_tmpl(f) == 0 {
+            continue;
+        }
+        CUR_F = f;
+        CUR_NODE = f_node(f);
+        IN_HOLE = 0;
+        IN_UNSAFE = 0;
+        if ph == PH_EDIT {
+            if in_std(NODES[CUR_NODE].start) {
+                continue;
+            }
+            edit_params(f);
+        }
+        scan(NODES[CUR_NODE].c, CX_RET);
+    }
+}
+
+// The functions used as values (an Ident or Path naming one that is not a
+// call's callee), and the f-strings' closures.
+fn find_values() {
+    var callees = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    for n in 1..NODES.len() {
+        if NODES[n].kind == NodeKind::Call && NODES[n].a > 0 {
+            callees.put(NODES[n].a + 1, 1);
+        }
+    }
+    for n in 1..NODES.len() as i64 {
+        let k = NODES[n].kind;
+        if (k == NodeKind::Ident || k == NodeKind::Path) && NODES[n].res == Res::Fn
+            && NODES[n].y >= 0 && callees.get(n + 1) == 0 {
+            AS_VALUE.put(base_node(NODES[n].y) + 1, 1);
+        }
+    }
+    for n in 1..NODES.len() {
+        let y = NODES[n].y;
+        if NODES[n].kind == NodeKind::Interp && y > 0 && NODES[y].kind == NodeKind::Block {
+            let lit = NODES[y].a;
+            if lit > 0 && NODES[lit].kind == NodeKind::StructLit && NODES[lit].count > 0 {
+                let c = NODES[child(lit, 0)].b;
+                if c > 0 && NODES[c].kind == NodeKind::Closure {
+                    FSTRING_CLOSURES.put(c + 1, 1);
+                }
+            }
+        }
+    }
+}
+
+// ---- the edits ----
+
+// Whether decided parameter i of f becomes inout: written through, or a
+// value a let parameter would copy whole (a plain T over 16 bytes).
+fn to_inout(f: i64, i: i64) -> bool {
+    (flags(f, i) & F_WRITE) != 0 || kind_of(f, i) == T_BIG
+}
+
+// Whether parameter p of the function walked is decided, and its own
+// edits are made (PH_EDIT).
+fn editing(p: i64) -> bool {
+    PHASE == PH_EDIT && p >= 0 && decidable(CUR_F, p)
+}
+
+fn replace_text(a: i64, b: i64, text: *u8) -> bool {
+    if EDITED.get(a + 1) != 0 {
+        return false;
+    }
+    let t = buf_new();
+    buf_str(t, text);
+    if edit_replace(a, b, t) {
+        EDITED.put(a + 1, 1);
+        return true;
+    }
+    false
+}
+
+// `*p` of a decided parameter: `p` (`(*p).f`: `p.f`; the node of a
+// parenthesized `(*p)` spans its parentheses).
+fn deref_edit(n: i64) {
+    let p = param_ident(NODES[n].b);
+    let s = NODES[n].start;
+    if !editing(p) || SRC[s] != '*' && SRC[s] != '(' {
+        return;
+    }
+    let name = NODES[n].b;
+    let e = NODES[n].end;
+    if SRC[s] == '(' {
+        if SRC[e - 1] == ')' && replace_text(s, NODES[name].start, c"")
+            && replace_text(NODES[name].end, e, c"") {
+            RAWPTR_EDITS[4] += 1;
+        }
+    } else if replace_text(s, NODES[name].start, c"") {
+        RAWPTR_EDITS[4] += 1;
+    }
+}
+
+// A decided parameter p passed on as `p` where an inout access or a raw
+// pointer to its place goes: `&p`.
+fn mark_arg(arg: i64, p: i64) {
+    if editing(p) && to_inout(CUR_F, p)
+        && replace_text(NODES[arg].start, NODES[arg].start, c"&") {
+        RAWPTR_EDITS[2] += 1;
+    }
+}
+
+// Argument arg of a call of f at decided parameter i.
+fn edit_arg(f: i64, i: i64, arg: i64) {
+    let k = NODES[arg].kind;
+    let inout_ = to_inout(f, i);
+    let s = NODES[arg].start;
+    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+        if !inout_ && replace_text(s, NODES[NODES[arg].b].start, c"") {
+            RAWPTR_EDITS[3] += 1;
+        }
+        return;
+    }
+    let p = param_ident(arg);
+    if p >= 0 && decidable(CUR_F, p) {
+        if inout_ && replace_text(s, s, c"&") {
+            RAWPTR_EDITS[2] += 1;
+        }
+        return;
+    }
+    // (a raw pointer given: the place it points to, in unsafe code)
+    let plain = k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::Call
+        || k == NodeKind::Index || k == NodeKind::TupleField;
+    let wrap = IN_UNSAFE == 0;
+    let t = buf_new();
+    if wrap {
+        buf_str(t, c"unsafe { ");
+    }
+    buf_str(t, if inout_ { c"&*" } else { c"*" });
+    if !plain {
+        buf_byte(t, '(');
+    }
+    buf_bytes(t, SRC[s..NODES[arg].end]);
+    if !plain {
+        buf_byte(t, ')');
+    }
+    if wrap {
+        buf_str(t, c" }");
+    }
+    if EDITED.get(s + 1) == 0 && edit_replace(s, NODES[arg].end, t) {
+        EDITED.put(s + 1, 1);
+        RAWPTR_EDITS[5] += 1;
+        if wrap {
+            RAWPTR_EDITS[6] += 1;
+            justify(s);
+        }
+    }
+}
+
+// The UNSAFE:/SAFETY: comments of a new `unsafe { &*q }` at position s,
+// above its line (once a line).
+fn justify(s: i64) {
+    var ls = s;
+    while ls > 0 && SRC[ls - 1] != '\n' {
+        ls -= 1;
+    }
+    var ie = ls;
+    while SRC[ie] == ' ' {
+        ie += 1;
+    }
+    if EDITED.get(ie + 1) != 0 {
+        return;
+    }
+    let t = buf_new();
+    buf_str(t, c"// UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).");
+    buf_byte(t, '\n');
+    buf_bytes(t, SRC[ls..ie]);
+    buf_str(t,
+        c"// SAFETY: it points to one live value for the whole call, as the raw parameter took it.");
+    buf_byte(t, '\n');
+    buf_bytes(t, SRC[ls..ie]);
+    if edit_replace(ie, ie, t) {
+        EDITED.put(ie + 1, 1);
+    }
+}
+
+// The decided parameters' types of f: `p: *T` and `p: sink *T` to `p:
+// inout T` or `p: T`.
+fn edit_params(f: i64) {
+    let item = f_node(f);
+    for i in 0..f_params(f) {
+        if !decidable(f, i) {
+            continue;
+        }
+        let tn = NODES[child(item, i)].b;
+        let s = NODES[tn].start;
+        if SRC[s] != '*' {
+            continue;
+        }
+        // (back over `sink `)
+        var a = s;
+        var k = s - 1;
+        while k > 0 && SRC[k] == ' ' {
+            k -= 1;
+        }
+        if k >= 4 && SRC[k - 3] == 's' && SRC[k - 2] == 'i' && SRC[k - 1] == 'n' && SRC[k] == 'k'
+            && (SRC[k - 4] == ' ' || SRC[k - 4] == ':') {
+            a = k - 3;
+        }
+        let inout_ = to_inout(f, i);
+        if replace_text(a, s + 1, if inout_ { c"inout " } else { c"" }) {
+            RAWPTR_EDITS[if inout_ { 0 } else { 1 }] += 1;
+        }
+    }
+}
+
+// ---- the census ----
+
+pub fn class_name(c: i64) -> *u8 {
+    if c == RP_READ { c"read" }
+    else if c == RP_WRITE { c"write" }
+    else if c == RP_ESCAPE { c"escape" }
+    else if c == RP_CALLER { c"caller" }
+    else { c"fixed" }
+}
+
+fn reason_name(bits: i64) -> *u8 {
+    if (bits & R_INDEX) != 0 { c"indexed" }
+    else if (bits & R_BIND) != 0 { c"stored" }
+    else if (bits & R_RETURN) != 0 { c"returned" }
+    else if (bits & R_CAST) != 0 { c"cast" }
+    else if (bits & R_COMPARE) != 0 { c"compared" }
+    else if (bits & R_INDEX) != 0 { c"indexed" }
+    else if (bits & R_RAWCALL) != 0 { c"to-raw" }
+    else if (bits & R_VALUE) != 0 { c"to-fn-value" }
+    else if (bits & R_CLOSURE) != 0 { c"captured" }
+    else if (bits & R_ASSIGN) != 0 { c"assigned" }
+    else if (bits & R_OTHER) != 0 { c"other" }
+    else if (bits & R_GIVEN) != 0 { c"given-raw" }
+    else if (bits & R_NESTED) != 0 { c"nested-call" }
+    else if (bits & C_RAW) != 0 { c"raw-arg" }
+    else if (bits & C_NULL) != 0 { c"null-arg" }
+    else if (bits & C_THROUGH) != 0 { c"through-raw-arg" }
+    else if (bits & C_OTHER) != 0 { c"other-arg" }
+    else { c"-" }
+}
+
+fn fixed_name(x: i64) -> *u8 {
+    if x == X_UNSAFE { c"unsafe-fn" }
+    else if x == X_EXPORT { c"exported" }
+    else if x == X_VALUE { c"fn-value" }
+    else if x == X_MAIN { c"main" }
+    else if x == X_CLOSURE { c"closure" }
+    else if x == X_TRAIT { c"trait" }
+    else if x == X_NESTED { c"nested" }
+    else if x == X_SELF { c"receiver" }
+    else { c"inout-ptr" }
+}
+
+fn kind_of(f: i64, i: i64) -> i64 {
+    let a = TYPES[fn_param(f, i)].a;
+    if a <= 0 {
+        return T_COPY;
+    }
+    if a == TY_U8 {
+        return T_U8;
+    }
+    if !copyable(a) {
+        return T_OWNED;
+    }
+    if f_generic(f) > 0 || f_tmpl(f) > 0 {
+        return T_COPY;
+    }
+    if type_size(a) <= 16 { T_COPY } else { T_BIG }
+}
+
+fn kind_name(k: i64) -> *u8 {
+    if k == T_U8 { c"u8" } else if k == T_COPY { c"copy" } else if k == T_BIG { c"big" }
+    else { c"owned" }
+}
+
+// The class of parameter i of f, and the reason (bits or X_*) in why.
+fn classify(f: i64, i: i64, why: inout i64) -> i64 {
+    let pp = ptr_param(f, i);
+    let x = fixed_why(f);
+    if pp != 1 || x != X_NONE {
+        why = if pp != 1 { pp } else { x };
+        return RP_FIXED;
+    }
+    let fl = flags(f, i);
+    why = fl;
+    if (fl & R_ALL) != 0 {
+        return RP_ESCAPE;
+    }
+    if (fl & C_ALL) != 0 {
+        return RP_CALLER;
+    }
+    if (fl & F_WRITE) != 0 { RP_WRITE } else { RP_READ }
+}
+
+fn put_line(out: i64, f: i64, i: i64, class: i64, why: i64) {
+    let item = f_node(f);
+    let pn = child(item, i);
+    let pos = NODES[pn].start;
+    let file = file_of_pos(pos);
+    buf_str(out, FILES[file].path);
+    buf_byte(out, ':');
+    var line = 1;
+    for k in FILES[file].start..pos {
+        if SRC[k] == '\n' {
+            line += 1;
+        }
+    }
+    buf_int(out, line);
+    buf_byte(out, '\t');
+    buf_str(out, class_name(class));
+    buf_byte(out, '\t');
+    buf_str(out, if class == RP_FIXED { fixed_name(why) } else { reason_name(why) });
+    buf_byte(out, '\t');
+    buf_bytes(out, SYMS[NODES[item].a].text);
+    buf_byte(out, '\t');
+    buf_bytes(out, SRC[NODES[pn].start..NODES[pn].end]);
+    buf_byte(out, '\t');
+    buf_str(out,
+        if class == RP_FIXED && why == X_NESTED { c"-" } else { kind_name(kind_of(f, i)) });
+    let who = WHO.get(key(f, i));
+    if who > 0 && class != RP_FIXED {
+        buf_byte(out, '\t');
+        buf_bytes(out, SYMS[NODES[f_node(who - 1)].a].text);
+    }
+    buf_byte(out, '\n');
+}
+
+// The census (and, later, the edits) of `fix --only rawptr`; the number of
+// parameters decided.
+pub fn rawptr_edits() -> i64 {
+    SELF_SYM = intern("self");
+    find_values();
+    // (the flags to a fixed point; then the calls, and again while one
+    // keeps a parameter raw)
+    var rounds = 0;
+    GIVEN_CHANGED = true;
+    while GIVEN_CHANGED && rounds < 64 {
+        CHANGED = true;
+        while CHANGED {
+            CHANGED = false;
+            walk_all(PH_MARK);
+            FIRST = false;
+        }
+        GIVEN_CHANGED = false;
+        CALLER_SITES = 0;
+        walk_all(PH_CALLS);
+        rounds += 1;
+    }
+    walk_all(PH_EDIT);
+    let out = buf_new();
+    var decided = 0;
+    for f in 0..FN_COUNT {
+        // (a closure's parameters, the format literals' too, are its
+        // caller's to choose)
+        if !has_body(f) || f_tmpl(f) > 0 || !ref_in(NODES[f_node(f)].start)
+            || fixed_why(f) == X_CLOSURE {
+            continue;
+        }
+        let std = in_std(NODES[f_node(f)].start);
+        for i in 0..f_params(f) {
+            if ptr_param(f, i) == 0 {
+                continue;
+            }
+            var why = 0;
+            let c = classify(f, i, &why);
+            RAWPTR_COUNTS[(if std { 5 } else { 0 }) + c] += 1;
+            if std {
+                continue;
+            }
+            if c == RP_FIXED {
+                FIXED_WHY[why] += 1;
+            } else {
+                for b in 0..17 {
+                    if (why & (1 << b)) != 0 {
+                        REASONS[b] += 1;
+                    }
+                }
+            }
+            if c == RP_READ {
+                READ_KINDS[kind_of(f, i)] += 1;
+                decided += 1;
+            } else if c == RP_WRITE {
+                WRITE_KINDS[kind_of(f, i)] += 1;
+                decided += 1;
+            } else if c == RP_CALLER {
+                decided += 1;
+            }
+            if RAWPTR_LIST {
+                put_line(out, f, i, c, why);
+            }
+        }
+    }
+    if RAWPTR_LIST {
+        buf_write_fd(out, STDOUT);
+    }
+    decided
+}
+
+// The census after a run: `note fix.rawptr: ...`.
+pub fn rawptr_report() {
+    let d = diag(c"note", c"fix.rawptr");
+    buf_str(d, c"raw pointer parameters:");
+    for c in 0..5 {
+        buf_byte(d, ' ');
+        buf_str(d, class_name(c));
+        buf_byte(d, ' ');
+        buf_int(d, RAWPTR_COUNTS[c]);
+    }
+    buf_str(d, c"; read by kind");
+    for k in 0..4 {
+        buf_byte(d, ' ');
+        buf_str(d, kind_name(k));
+        buf_byte(d, ' ');
+        buf_int(d, READ_KINDS[k]);
+    }
+    buf_str(d, c"; write by kind");
+    for k in 0..4 {
+        buf_byte(d, ' ');
+        buf_str(d, kind_name(k));
+        buf_byte(d, ' ');
+        buf_int(d, WRITE_KINDS[k]);
+    }
+    buf_str(d, c"; reasons");
+    for b in 1..17 {
+        buf_byte(d, ' ');
+        buf_str(d, reason_name(1 << b));
+        buf_byte(d, ' ');
+        buf_int(d, REASONS[b]);
+    }
+    buf_str(d, c"; fixed");
+    for x in 1..10 {
+        buf_byte(d, ' ');
+        buf_str(d, fixed_name(x));
+        buf_byte(d, ' ');
+        buf_int(d, FIXED_WHY[x]);
+    }
+    buf_str(d, c"; calls giving no place ");
+    buf_int(d, CALLER_SITES);
+    buf_str(d, c"; edits: to inout ");
+    buf_int(d, RAWPTR_EDITS[0]);
+    buf_str(d, c", to let ");
+    buf_int(d, RAWPTR_EDITS[1]);
+    buf_str(d, c", `&p` ");
+    buf_int(d, RAWPTR_EDITS[2]);
+    buf_str(d, c", `&x` to `x` ");
+    buf_int(d, RAWPTR_EDITS[3]);
+    buf_str(d, c", `*p` to `p` ");
+    buf_int(d, RAWPTR_EDITS[4]);
+    buf_str(d, c", `&*q` ");
+    buf_int(d, RAWPTR_EDITS[5]);
+    buf_str(d, c" (in a new unsafe block ");
+    buf_int(d, RAWPTR_EDITS[6]);
+    buf_byte(d, ')');
+    // (std's, with `--in std`: never edited)
+    if crate::tools::query::refs::OPT_IN != 0 as *u8 && RAWPTR_COUNTS[5] + RAWPTR_COUNTS[6]
+        + RAWPTR_COUNTS[7] + RAWPTR_COUNTS[8] + RAWPTR_COUNTS[9] > 0 {
+        buf_str(d, c"; std:");
+        for c in 0..5 {
+            buf_byte(d, ' ');
+            buf_str(d, class_name(c));
+            buf_byte(d, ' ');
+            buf_int(d, RAWPTR_COUNTS[5 + c]);
+        }
+    }
+    buf_byte(d, '\n');
+}
