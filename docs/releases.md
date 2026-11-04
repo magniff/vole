@@ -108,6 +108,16 @@ Text (text263; grammar.md, "Items"):
   field read, a struct literal) is `warning item.deprecated` with the
   note, and the help says where the item is marked. A use inside a
   deprecated item, and std's own uses, are not reported.
+- `volec fix --only buf` turns each std `Buf` binding (a local, a
+  parameter, a field, a result, with the bindings its value flows
+  between) into `String<A>` when every write is text (a `push_str` of a
+  `str`, a format write, a constant byte below 0x80) and into
+  `Vec<u8, A>` when every write is bytes (a byte that is not a constant,
+  a constant at or above 0x80, a `push_str` of a `[u8]`). Mixed writes,
+  no write, a binding passed to a std function that takes a `Buf`, and a
+  method with no form on the side decided are refused, each named
+  (`note fix.buf-refused`). It never guesses. The method table it maps
+  through is printed with every run (`note fix.buf-table`).
 
 ### What's new in 0.26.2
 
