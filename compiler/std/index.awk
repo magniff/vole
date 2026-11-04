@@ -108,6 +108,9 @@ BEGIN {
     # (front/check/format.vl: std_fn), read by a program that names them
     LAZY["Format literals (0.26.2)"] = 1
     TRIGGERS["Format literals (0.26.2)"] = "panic assert debug_assert"
+    # (0.26.3) format_in, which makes a String: read by a program that
+    # names it
+    LAZY["format_in (0.26.3)"] = 1
     # (0.26.1) std::cell: lazy, no gate (std::sync and std::fmt reach
     # UnsafeCell; Cell, with its trait impls, only a program that names it)
     LAZY["std::cell"] = 1
