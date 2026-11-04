@@ -20,18 +20,18 @@ import sys
 OUT = sys.argv[1]
 
 PRELUDE = """\
-struct Leaf { opts: Vec<i64> }
+struct Leaf<A: Allocator> { opts: Vec<i64, A> }
 
-impl Leaf {
+impl Leaf<Gpa> {
     fn count(self) -> i64 { self.opts.len() as i64 }
 }
 
-struct Tree { sizes: Vec<i64> }
+struct Tree<A: Allocator> { sizes: Vec<i64, A> }
 
-impl Tree {
-    fn add_s(sink self, n: i64) -> Tree { self.sizes.push(n); self }
-    fn add_i(inout self, n: i64) -> Tree { self.sizes.push(n); Tree { sizes: self.sizes.clone() } }
-    fn add_l(self, n: i64) -> Tree { var v = self.sizes.clone(); v.push(n); Tree { sizes: v } }
+impl Tree<Gpa> {
+    fn add_s(sink self, n: i64) -> Tree<Gpa> { self.sizes.push(n); self }
+    fn add_i(inout self, n: i64) -> Tree<Gpa> { self.sizes.push(n); Tree { sizes: self.sizes.clone() } }
+    fn add_l(self, n: i64) -> Tree<Gpa> { var v = self.sizes.clone(); v.push(n); Tree { sizes: v } }
     fn sum(self) -> i64 {
         var s = 0;
         var i = 0;
@@ -41,29 +41,29 @@ impl Tree {
     fn show(self) { println("{} {}", self.sum(), self.sizes.len()); }
 }
 
-struct Holder { t: Tree, tag: i64 }
+struct Holder<A: Allocator> { t: Tree<A>, tag: i64 }
 
-fn fadd_s(t: sink Tree, n: i64) -> Tree { t.sizes.push(n); t }
-fn fadd_i(t: inout Tree, n: i64) -> Tree { t.sizes.push(n); Tree { sizes: t.sizes.clone() } }
-fn fadd_l(t: Tree, n: i64) -> Tree { var v = t.sizes.clone(); v.push(n); Tree { sizes: v } }
+fn fadd_s(t: sink Tree<Gpa>, n: i64) -> Tree<Gpa> { t.sizes.push(n); t }
+fn fadd_i(t: inout Tree<Gpa>, n: i64) -> Tree<Gpa> { t.sizes.push(n); Tree { sizes: t.sizes.clone() } }
+fn fadd_l(t: Tree<Gpa>, n: i64) -> Tree<Gpa> { var v = t.sizes.clone(); v.push(n); Tree { sizes: v } }
 
-fn vec_of(gpa: Gpa, k: i64) -> Vec<i64> {
-    var v: Vec<i64> = Vec::new_in(gpa);
+fn vec_of(gpa: Gpa, k: i64) -> Vec<i64, Gpa> {
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     for i in 0..k { v.push(i); }
     v
 }
-fn leaf_of(gpa: Gpa, k: i64) -> Leaf { Leaf { opts: vec_of(gpa, k) } }
-fn size(leaf: Leaf) -> i64 { leaf.opts.len() as i64 }
-fn grow(l: Leaf, gpa: Gpa) -> Leaf { var v = l.opts.clone(); v.push(9); Leaf { opts: v } }
-fn name_of(gpa: Gpa, k: i64) -> String {
+fn leaf_of(gpa: Gpa, k: i64) -> Leaf<Gpa> { Leaf { opts: vec_of(gpa, k) } }
+fn size(leaf: Leaf<Gpa>) -> i64 { leaf.opts.len() as i64 }
+fn grow(l: Leaf<Gpa>, gpa: Gpa) -> Leaf<Gpa> { var v = l.opts.clone(); v.push(9); Leaf { opts: v } }
+fn name_of(gpa: Gpa, k: i64) -> String<Gpa> {
     var s = String::new_in(gpa);
     for _ in 0..k { s.push_str("x"); }
     s
 }
-fn slen(s: String) -> i64 { s.len() as i64 }
-fn glen<T>(v: Vec<T>) -> i64 { v.len() as i64 }
+fn slen(s: String<Gpa>) -> i64 { s.len() as i64 }
+fn glen<T>(v: Vec<T, Gpa>) -> i64 { v.len() as i64 }
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }
-fn tree_of(gpa: Gpa) -> Tree { Tree { sizes: vec_of(gpa, 1) } }
+fn tree_of(gpa: Gpa) -> Tree<Gpa> { Tree { sizes: vec_of(gpa, 1) } }
 """
 
 # (text, value) of an argument holding owned temporaries; B: a second one
@@ -120,7 +120,7 @@ def stmts(mode, call):
             out.append((f"field{ai}", body, [result([av]), "5"]))
         # ts[0] = ts[0].m(A)
         if mode != "sink":
-            body = (f"var ts: Vec<Tree> = Vec::new_in(gpa);\nts.push(tree_of(gpa));\n"
+            body = (f"var ts: Vec<Tree<Gpa>, Gpa> = Vec::new_in(gpa);\nts.push(tree_of(gpa));\n"
                     f"ts.push(tree_of(gpa));\nts[1] = {c('ts[1]', a)};\nts[1].show();\nts[0].show();")
             out.append((f"elem{ai}", body, [result([av]), result([])]))
         # a block's tail: `if k > 0 { t = t.m(A) }`
@@ -168,21 +168,21 @@ for mode in ("sink", "inout", "let"):
 
 # generic receivers: Bag<T>, the argument the value moved in or lent
 GEN_ITEMS = """
-struct Bag<T> { items: Vec<T>, n: i64 }
+struct Bag<T, A: Allocator> { items: Vec<T, A>, n: i64 }
 
-impl<T> Bag<T> {
-    fn put_s(sink self, x: sink T, w: i64) -> Bag<T> { self.items.push(x); self.n += w; self }
+impl<T, A: Allocator> Bag<T, A> {
+    fn put_s(sink self, x: sink T, w: i64) -> Bag<T, A> { self.items.push(x); self.n += w; self }
     fn put_i(inout self, x: sink T, w: i64) -> i64 { self.items.push(x); self.n += w; self.n }
     fn show(self) { println("{} {}", self.items.len(), self.n); }
 }
 
-fn bag_put<T>(b: sink Bag<T>, x: sink T, w: i64) -> Bag<T> { b.items.push(x); b.n += w; b }
+fn bag_put<T>(b: sink Bag<T, Gpa>, x: sink T, w: i64) -> Bag<T, Gpa> { b.items.push(x); b.n += w; b }
 """
 GEN = [
-    ("Vec::<i64>::new_in(gpa)", "size(leaf_of(gpa, 2))", "size(leaf_of(gpa, 3))", 0),
-    ("Vec::<String>::new_in(gpa)", "name_of(gpa, 2)", "slen(name_of(gpa, 3))", 0),
-    ("Vec::<Leaf>::new_in(gpa)", "grow(leaf_of(gpa, 1), gpa)", "leaf_of(gpa, 3).count()", 0),
-    ("Vec::<String>::new_in(gpa)", 'to_string_in(format_args("{}", size(leaf_of(gpa, 2))), gpa)',
+    ("Vec::<i64, Gpa>::new_in(gpa)", "size(leaf_of(gpa, 2))", "size(leaf_of(gpa, 3))", 0),
+    ("Vec::<String<Gpa>, Gpa>::new_in(gpa)", "name_of(gpa, 2)", "slen(name_of(gpa, 3))", 0),
+    ("Vec::<Leaf<Gpa>, Gpa>::new_in(gpa)", "grow(leaf_of(gpa, 1), gpa)", "leaf_of(gpa, 3).count()", 0),
+    ("Vec::<String<Gpa>, Gpa>::new_in(gpa)", 'to_string_in(format_args("{}", size(leaf_of(gpa, 2))), gpa)',
      "apply(|x: i64| x + slen(name_of(gpa, 1)), 2)", 0),
 ]
 gcases = []

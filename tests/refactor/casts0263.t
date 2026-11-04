@@ -123,7 +123,7 @@ fn before_last(s: [u8]) -> i64 {
 }
 
 // (kept) other arithmetic, a stored i64, an argument
-fn widths(v: Vec<[u8]>) -> i64 {
+fn widths(v: Vec<[u8], Gpa>) -> i64 {
     var total = 0;
     for k in 0..v.len() {
         total += v[k].len as i64;
@@ -157,12 +157,12 @@ fn refused(s: [u8]) -> i64 {
 }
 
 // (kept) a value a closure reaches
-fn shorter(v: Vec<[u8]>, s: [u8]) -> i64 {
+fn shorter(v: Vec<[u8], Gpa>, s: [u8]) -> i64 {
     v.iter().filter(|w| w.len as i64 < s.len as i64).count() as i64
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<[u8]> = Vec::new_in(gpa);
+    var v: Vec<[u8], Gpa> = Vec::new_in(gpa);
     v.push("ab");
     v.push("vole");
     println("{} {} {}", index("abcdef", "abc"), slice("abcdef", 2), compare("abc", "xyz"));

@@ -14,7 +14,7 @@ fixed 2 f-strings and format literals	main.vl	+2 -2 lines
 // `fix --only fstring` on a program with an error (tests/refactor/
 // fstringerr0262.t): the edit rewords it (its message quotes the f-string)
 // and adds none, so it is written.
-fn sum(v: sink Vec<i64>) -> i64 {
+fn sum(v: sink Vec<i64, Gpa>) -> i64 {
     var t = 0;
     for x in v.as_slice() {
         t += x;
@@ -23,7 +23,7 @@ fn sum(v: sink Vec<i64>) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     let copy = v;
     println("first {}", sum(copy));

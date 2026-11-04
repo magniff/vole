@@ -224,8 +224,8 @@ $ refactor rename crate::total sum --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -8 +8 @@
--fn total(points: Vec<Point>) -> i64 {
-+fn sum(points: Vec<Point>) -> i64 {
+-fn total(points: Vec<Point, Gpa>) -> i64 {
++fn sum(points: Vec<Point, Gpa>) -> i64 {
 @@ -28 +28 @@
 -    let x = total(v);
 +    let x = sum(v);

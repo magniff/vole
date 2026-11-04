@@ -49,7 +49,7 @@ note fix.refused: main.vl:13:5: not applied: `std::is_digit(d)`: std's `is_digit
 note fix.refused: main.vl:34:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
 note fix.refused: casts.vl:7:16: not applied: `(m[k] as f32) as f64`: it converts what a cast gives: the cast's type, or the type of the place it goes to, is what to change
 note fix.refused: casts.vl:13:17: not applied: `t as u8`: the integer type it goes to does not hold every value: it wraps
-note fix.refused: main.vl:23:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:25:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
+note fix.refused: main.vl:23:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:25:8: error[type error] expected 'bool', got 'fn(let Front<ScopedArena>) -> ()'
 ## --codes: only the errors with these codes, the classes the check hook
 ## makes itself; --diff: the diff of what was written.
 $ fix --suggested --codes conv.marker,conv.rust --diff
@@ -103,7 +103,7 @@ note fix.refused: main.vl:13:5: not applied: `std::is_digit(d)`: std's `is_digit
 note fix.refused: main.vl:34:5: not applied: `read_back`: the name it puts there is the function the call is in: the call would call itself
 note fix.refused: casts.vl:7:16: not applied: `(m[k] as f32) as f64`: it converts what a cast gives: the cast's type, or the type of the place it goes to, is what to change
 note fix.refused: casts.vl:13:17: not applied: `t as u8`: the integer type it goes to does not hold every value: it wraps
-note fix.refused: main.vl:23:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:25:8: error[type error] expected 'bool', got 'fn(let Front) -> ()'
+note fix.refused: main.vl:23:8: not applied: `use std::gpu::wgsl::uniformity::check;`: the edited program has a new error with it: main.vl:25:8: error[type error] expected 'bool', got 'fn(let Front<ScopedArena>) -> ()'
 note fix.left: 4 errors left (above)
 % cat glyphs.vl
 // sdftext: the use line's name is misspelled; its fix imports sqrt, so
