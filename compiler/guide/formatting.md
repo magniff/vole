@@ -164,7 +164,7 @@ methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
 `self` is read (let), `f` is changed (inout); there is no result to
 return. Display is in std for the numbers, `[u8]` and the
 error enums; Debug for those (a `[u8]` quoted and
-escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
+escaped: `"a\n"`), `Vec<T, A>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `Some(5)`, `{1: 2}`). `{s:?}` of a slice `[T]` whose T has Debug
 writes it as a Vec's, `[1, 2]` (0.25.3); the slice has no Debug impl of
 its own (it would clash with `[u8]`'s), so a Debug impl writes one with
@@ -190,7 +190,7 @@ fn main(gpa: Gpa) -> i32 {
     println("{p} {q:?}");
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
     for s in shapes { println("{s:?}"); }
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     println("{v:?} {:?} {:?}", v.last(), "hi");
@@ -233,7 +233,7 @@ struct Key { group: i64, id: i64 }
 fn main(gpa: Gpa) -> i32 {
     var keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
     sort(&keys[..]);                         // by group, then id
-    var m: HashMap<Key, i64> = HashMap::new_in(gpa);
+    var m: HashMap<Key, i64, Gpa> = HashMap::new_in(gpa);
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
     println("{:?} {:?}", keys[0], m.get(wanted));

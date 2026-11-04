@@ -87,11 +87,11 @@ its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is Rust's,
 `Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
-- `Vec<T>`, `Buf` and `HashMap<K, V>` own their memory: `let w = v;`
-  moves it, `.clone()` copies. A function that reads one takes it let
-  (`v: Vec<T>`, called `f(v)`: borrowed, nothing moves), one that
-  changes it `v: inout Vec<T>` (called `f(&v)`), one that keeps it `v:
-  sink Vec<T>` (`f(v)` moves it).
+- `Vec<T, A>`, `Buf` and `HashMap<K, V, A>` own their memory: `let w = v;`
+  moves it, `.clone()` copies. A function that reads one takes it
+  let (`v: Vec<T, A>`, called `f(v)`: borrowed), one that changes it
+  `v: inout Vec<T, A>` (called `f(&v)`), one that keeps it `v: sink
+  Vec<T, A>` (`f(v)` moves it).
 - A slice from `as_slice()` views the container: the checker rejects its
   use after the next push, `free` or drop (`volec guide views`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
@@ -122,7 +122,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
 
 ```vole
 fn main(gpa: Gpa) -> i32 {
-    var counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var counts: HashMap<[u8], i64, Gpa> = HashMap::new_in(gpa);
     let words = ["a", "b", "a", "c", "a"];
     for w in words {
         counts.get_or_insert(w, 0)[0] += 1;

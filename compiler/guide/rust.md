@@ -70,7 +70,7 @@ value itself.
 | `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
 | lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
 | the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`volec explain own.conflict`) |
-| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, an index, or `malloc` in `unsafe` |
+| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T, A>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` |
 | `&mut v[i]`, `m.get_mut(&k)` | `&v[i]` to an inout parameter, `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
@@ -85,18 +85,18 @@ whole program). Pass a container to a function that changes it as
 one by value (the caller owns it):
 
 ```vole
-fn fill(v: inout Vec<i64>, n: i64) {     // v.push changes the caller's Vec
+fn fill(v: inout Vec<i64, Gpa>, n: i64) { // v.push changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
 
-fn sum(v: Vec<i64>) -> i64 {             // let: reads it in place
+fn sum(v: Vec<i64, Gpa>) -> i64 { // let: reads it in place
     var s = 0;
     for x in v { s += x; }
     s
 }
 
 fn main(gpa: Gpa) -> i32 {
-    var v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa);
     fill(&v, 4);
     inout r = &v;                        // an inout access in a local: passed on twice
     fill(&r, 1);
@@ -246,7 +246,7 @@ fn main() -> i32 {
 | `fn` inside a `fn` | items only at module level |
 | `macro_rules!`, `println!`, `vec!` | none: `println("{}", x)`, a format string (0.26.2) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
-| `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
+| `impl<T, A: Allocator> Trait for Vec<T, A>` | the same (one impl per trait and type) |
 | `impl Trait` in argument position | the same (0.26.2): `fn f(x: impl Display)`; `-> impl Trait` comes with the rust edition |
 | `dyn Trait` | generics: `fn f<T: Trait>(x: T)` |
 | `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |

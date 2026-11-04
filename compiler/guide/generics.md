@@ -6,15 +6,15 @@ arguments makes a separate copy (monomorphization), checked and
 optimized as if written by hand. No boxing, no dynamic dispatch.
 
 ```vole
-struct Stack<T> { items: Vec<T> }
+struct Stack<T, A: Allocator> { items: Vec<T, A> }
 
-impl<T> Stack<T> {
-    fn new(gpa: Gpa) -> Stack<T> { Stack { items: Vec::new_in(gpa) } }
+impl<T, A: Allocator> Stack<T, A> {
+    fn new(a: A) -> Stack<T, A> { Stack { items: Vec::new_in(a) } }
     fn push(inout self, x: sink T) { self.items.push(x); }
     fn pop(inout self) -> Option<T> { self.items.pop() }
 }                                          // no free: a Stack drops its Vec
 
-impl Stack<i64> {                          // methods of one instance only
+impl Stack<i64, Gpa> { // methods of one instance only
     fn sum(self) -> i64 {
         var t = 0;
         for x in self.items.as_slice() { t += x; }
@@ -35,7 +35,7 @@ type Pair<T> = (T, T);
 fn sum_pair(p: Pair<i64>) -> i64 { p.0 + p.1 }
 
 fn main(gpa: Gpa) -> i32 {
-    var s: Stack<i64> = Stack::new(gpa);
+    var s: Stack<i64, Gpa> = Stack::new(gpa);
     s.push(4);
     s.push(9);
     std::print_int(s.sum());
@@ -57,13 +57,13 @@ fn main(gpa: Gpa) -> i32 {
 13 8 118 one 14
 ```
 
-- Type arguments: after a type's name (`Vec<i64>`, `Option<*u8>`), and in
-  expressions after `::` (`Vec::<u8>::new_in(gpa)`, `max::<i64>(a, b)`,
+- Type arguments: after a type's name (`Vec<i64, Gpa>`, `Option<*u8>`), and in
+  expressions after `::` (`Vec::<u8, Gpa>::new_in(gpa)`, `max::<i64>(a, b)`,
   `Pair::<i64> { a: 1, b: 2 }`, a method's own: `x.m::<u8>()`). They are inferred
-  from arguments and from the expected type (`let v: Vec<i64> =
+  from arguments and from the expected type (`let v: Vec<i64, Gpa> =
   Vec::new_in(gpa);`); unsuffixed literals are looked at last. A `[T]`
   parameter (let, `inout` or `sink`) infers T from what lends it the
-  slice: `sort(&v)` of a `Vec<i64>`, `&xs[a..b]`, an array, a Buf, a
+  slice: `sort(&v)` of a `Vec<i64, Gpa>`, `&xs[a..b]`, an array, a Buf, a
   String's bytes (to read), `&xs` of an `inout [T]` parameter (0.25.1).
 - A generic function used as a value needs its arguments:
   `let f = largest::<i64>;`.
@@ -78,7 +78,7 @@ fn main(gpa: Gpa) -> i32 {
 - `size_of(T)` and `align_of(T)` work on type parameters.
 - `where` (0.26.2) writes the bounds after the signature, Rust's way:
   `fn f<T>(x: T) where T: Display + Copy`, on a struct, an enum, a trait
-  and an impl too (`impl<T> Stack<T> where T: Ord {`). Its left side is a
+  and an impl too (`impl<T, A: Allocator> Stack<T, A> where T: Ord {`). Its left side is a
   parameter of the item: `where I::Item: Display` is
   `where.unsupported`, write `I: Iterator<Item = X>, X: Display`.
 - `x: impl Display` (0.26.2) is a type parameter without a name, as in

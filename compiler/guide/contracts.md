@@ -8,9 +8,9 @@ release switch; `debug` clauses are the ones only test builds check.
 ## requires and ensures
 
 ```vole
-struct Stack { items: Vec<i64> }
+struct Stack<A: Allocator> { items: Vec<i64, A> }
 
-impl Stack {
+impl Stack<Gpa> {
     fn top(self, i: i64) -> i64
         requires 0 <= i && i < self.items.len() as i64 else "no item {i}"
         ensures result == self.items.get(i as usize)

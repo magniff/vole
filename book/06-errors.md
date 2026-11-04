@@ -30,7 +30,7 @@ fn main(gpa: Gpa) {
     let line: str = "port = 8080";
     println("{:?} {:?}", line.find("="), line.find("#"));
 
-    var defaults: HashMap<str, i64> = HashMap::new_in(gpa);
+    var defaults: HashMap<str, i64, Gpa> = HashMap::new_in(gpa);
     defaults.insert("port", 80);
     defaults.insert("workers", 4);
     let port = defaults.get("port").unwrap_or(0);

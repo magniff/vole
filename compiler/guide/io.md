@@ -6,7 +6,7 @@ Rust's names; a path is any `[u8]`: a literal, a `str`, a `Path`, `&p`
 of a PathBuf. `File::open(p)?`, `File::create(p)?`,
 `OpenOptions::new().append(true).create(true).open(p)?`;
 `fs::read_to_string_in(p, gpa)?` (a String), `fs::read_in(p, gpa)?` (a
-`Vec<u8>`), `fs::write(p, data)?`, `fs::append(p, data)?`,
+`Vec<u8, Gpa>`), `fs::write(p, data)?`, `fs::append(p, data)?`,
 `fs::metadata(p)?` (`len()`, `is_dir()`), `fs::create_dir_all(p)?`,
 `fs::remove_file`, `fs::remove_dir_all`, `fs::rename(a, b)`,
 `fs::read_dir(p)?` (entries: `let e = e?; e.file_name()`, a view of the entry; `e.path_in(dir, gpa)`),

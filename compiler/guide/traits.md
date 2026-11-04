@@ -2,7 +2,7 @@
 
 A trait declares functions; `Self` stands for the implementing type; a
 function may have a default body. `impl Trait for Type` defines them for
-any type (`i64`, `[u8]`, `Vec<T>`, a struct). Its functions become the
+any type (`i64`, `[u8]`, `Vec<T, A>`, a struct). Its functions become the
 type's methods. Dispatch is static: a trait is not a type.
 
 ```vole
@@ -59,7 +59,7 @@ fn main(gpa: Gpa) -> i32 {
     report(r);
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { std::print_int(v.x * 10 + v.y); }
-    var seen: HashMap<V2, bool> = HashMap::new_in(gpa);       // a struct key: Hash + Eq
+    var seen: HashMap<V2, bool, Gpa> = HashMap::new_in(gpa); // a struct key: Hash + Eq
     seen.insert(v, true);
     if seen.contains(V2 { x: 4, y: 6 }) { print(" found "); }
     std::print_int(21.double());

@@ -133,7 +133,7 @@ the one implicit conversion. T's operators work between two values of
 the type, or one and a literal (`a + 1`, `m / 2.0`, `a < b` is a bool);
 mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
 (`volec fix --suggested` writes them all). It has T's Eq, Ord, Hash,
-Debug, Display and Clone (`Vec<NodeId>` sorts, prints, is a HashMap key)
+Debug, Display and Clone (`Vec<NodeId, Gpa>` sorts, prints, is a HashMap key)
 and T's literal patterns, but none of T's methods (`distinct.method`):
 `impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
 `Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw

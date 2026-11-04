@@ -92,9 +92,9 @@ pub fn add(a: i64, b: i64) -> i64 { a + b }
 fn first<T>(s: [T]) -> T { s[0] }
 fn ignore(_: i64) {}                 // `_` ignores an argument
 fn bump(n: sink i64) -> i64 { n += 1; n }  // sink: the callee's own, mutable
-fn twice(v: inout Vec<i64>) { v.push(v.len() as i64); }   // inout: called as twice(&v)
+fn twice(v: inout Vec<i64, Gpa>) { v.push(v.len() as i64); } // inout: called as twice(&v)
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
-fn hi(out: inout Buf) { out.push_str("hi"); }   // Buf: the `use` above
+fn hi(out: inout Buf<Gpa>) { out.push_str("hi"); } // Buf: the `use` above
 
 impl Point {
     fn len2(self) -> i64 { self.x * self.x + self.y * self.y }   // self: let
@@ -203,7 +203,7 @@ fn main(gpa: Gpa) -> i32 {
     }
     let o: Option<i64> = Some(3);
     if let Some(x) = o { i += x; } else if n > 0 { i -= 1; }
-    var stack: Vec<i64> = Vec::new_in(gpa);
+    var stack: Vec<i64, Gpa> = Vec::new_in(gpa);
     stack.push(1);
     while let Some(top) = stack.pop() { i += top; }
     std::print_int(v);

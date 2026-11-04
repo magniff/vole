@@ -186,7 +186,7 @@ fn clamp_stays_in(x: i64, lo: i64, hi: i64) {
 struct Small { n: i64 }
 
 impl std::Arbitrary for Small {
-    fn arbitrary(g: inout std::Gen) -> Small {
+    fn arbitrary(g: inout std::Gen<Gpa>) -> Small {
         Small { n: g.int_in(0, 9) }
     }
 }
@@ -205,7 +205,7 @@ fn main() -> i32 {
 9
 ```
 
-- Numbers, bool, `Vec<T>`, `[T]`, `Buf`, `Option`, `Result`, tuples
+- Numbers, bool, `Vec<T, A>`, `[T]`, `Buf`, `Option`, `Result`, tuples
   and the program's structs and enums are generated from their types;
   `impl std::Arbitrary` gives a type its own (`g.int_in(lo, hi)`,
   `g.choose(n)`, `g.bool()`, `g.size()`).

@@ -49,8 +49,8 @@ Here's our starting point. Save it as `lines.vl`:
 use std::{env, time};
 
 // n bytes of made-up text: letters, spaces, and a newline now and then.
-fn make_text(n: usize, gpa: Gpa) -> Vec<u8> {
-    var v: Vec<u8> = Vec::with_capacity_in(n, gpa);
+fn make_text(n: usize, gpa: Gpa) -> Vec<u8, Gpa> {
+    var v: Vec<u8, Gpa> = Vec::with_capacity_in(n, gpa);
     var x: u64 = 0x9e3779b97f4a7c15;
     for _ in 0..n {
         x ^= x << 13;
@@ -240,7 +240,7 @@ and it removes the check. Here's a function where it can't. Save it as `window.v
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64 {
+fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64 {
     var n = 0;
     for i in lo..hi {
         if v[i] == b {
@@ -251,7 +251,7 @@ fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64 {
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<u8> = Vec::new_in(gpa);
+    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
     for c in "one\ntwo\nthree\nfour\n" {
         v.push(c);
     }
@@ -284,7 +284,7 @@ a window that's inside `v`. Chapter 13 showed how to say that, with a
 ```vole window.vl
 // How many times b occurs in v[lo..hi].
 #[inline(never)]
-fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64
+fn count_window(v: Vec<u8, Gpa>, lo: usize, hi: usize, b: u8) -> i64
     requires lo <= hi && hi <= v.len()
 {
     var n = 0;
@@ -297,7 +297,7 @@ fn count_window(v: Vec<u8>, lo: usize, hi: usize, b: u8) -> i64
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<u8> = Vec::new_in(gpa);
+    var v: Vec<u8, Gpa> = Vec::new_in(gpa);
     for c in "one\ntwo\nthree\nfour\n" {
         v.push(c);
     }
