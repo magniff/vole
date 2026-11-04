@@ -15,15 +15,6 @@
 @@ -11 +11 @@
 -    match parse_int(s) {
 +    match parse_int(s).ok() {
-@@ -18 +18 @@
--    let input = read_stdin();
-+    let input = read_stdin().unwrap();
-@@ -21 +21 @@
--    while let Some(v) = sc.next_int() {
-+    while let Some(v) = sc.next_int().ok() {
-@@ -25 +25 @@
--    while read_line(&line) {
-+    while read_line(&line).unwrap_or(false) {
 @@ -29 +29 @@
 -    let b = parse_int("x").is_none();
 +    let b = parse_int("x").ok().is_none();
@@ -35,5 +26,5 @@
 % "$COMPILER" fix --only std015 --dry-run --in mine.vl
 note fix.none: nothing to fix
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts or casts-list, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts, casts-list or alloc, not 'nonsense'
 [exit 2]
