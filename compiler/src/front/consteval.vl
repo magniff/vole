@@ -4,7 +4,7 @@
 // an f64 (rounded to f32 first for f32), bools as 0 or 1.
 
 use crate::base::{BUFS, IntVec, buf_reserve, memcpy, memset};
-use crate::base::diag::{err_begin, err_end, err_help, err_str};
+use crate::base::diag::{ERR_KIND, err_begin, err_end, err_help, err_str};
 use crate::front::ast::{BLOCK_UNSAFE, NODES, NodeKind, VK_NEW, VK_SPLAT, child};
 use crate::front::check::{
     CONST_CONTEXT, RETURN_TYPE, Res, Try, attempt, name_error, type_error, type_error_got,
@@ -21,9 +21,13 @@ use crate::front::lexer::Tok::{
 use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::types::{
     CONSTS, ENUMS, FNS, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_I64, TY_U64, TY_UNIT, VARIANTS,
-    field_offset, int_bits, is_compound, is_float, is_integer, is_pointer, is_signed, scalar_type,
-    struct_field, tuple_offset, type_elem, type_size, variant_field, variant_field_offset,
+    err_type, field_offset, int_bits, is_compound, is_float, is_integer, is_pointer, is_signed,
+    scalar_type, struct_field, tuple_offset, type_elem, type_size, variant_field,
+    variant_field_offset,
 };
+use crate::middle::fold::fold_overflow;
+use crate::middle::ir::Op;
+use crate::middle::opt::OVERFLOW_CHECKS;
 
 pub fn f64_of_bits(bits: i64) -> f64 {
     let copy = bits;
@@ -192,6 +196,10 @@ fn const_unary(n: i64, ty: i64) -> i64 {
         Minus => if is_float(ty) {
             float_const(-f64_of_bits(value), ty)
         } else {
+            // (0.26.3: a literal, -128 as an i8, is no negation of 128)
+            if NODES[NODES[n].b].kind != NodeKind::Int {
+                const_overflow(n, Op::Neg, value, 0, ty);
+            }
             wrap_int(0 - value, ty)
         },
         Bang => 1 - value,
@@ -246,18 +254,76 @@ pub fn const_less(a: i64, b: i64, ty: i64) -> bool {
     if is_signed(ty) { a < b } else { (a as u64) < (b as u64) }
 }
 
+// (0.26.3, decision 6) A constant's `a <op> b` (`-a` for Op::Neg) of
+// integer type ty, with the overflow checks on (-O0's default, or
+// --overflow-checks=on): an overflow is an error, as the program's own
+// arithmetic would panic. With them off, it wraps.
+fn const_overflow(n: i64, op: Op, a: i64, b: i64, ty: i64) {
+    if !OVERFLOW_CHECKS || !is_integer(ty) || is_pointer(ty) {
+        return;
+    }
+    if fold_overflow(op as i64 | ty << 8, a, b) {
+        let what = match op {
+            Op::Add => c"add",
+            Op::Sub => c"subtract",
+            Op::Mul => c"multiply",
+            _ => c"negate",
+        };
+        overflow_error(n, what, ty, false);
+    }
+}
+
+// The error of a constant expression of type ty whose `what` (Rust's
+// words: add, subtract, shift left, divide) overflows; `always` for
+// MIN / -1 and MIN % -1, an error whatever the checks.
+fn overflow_error(n: i64, what: *u8, ty: i64, always: bool) -> ! {
+    ERR_KIND = c"arith.overflow";
+    err_begin(NODES[n].start);
+    err_str(c"this constant expression overflows '");
+    err_type(ty);
+    err_str(c"': attempt to ");
+    err_str(what);
+    err_str(c" with overflow");
+    err_help(if always {
+        c"MIN / -1 and MIN % -1 overflow at every level, as they panic at run time: write the value"
+    } else {
+        c"with the overflow checks on (-O0, or --overflow-checks=on) a constant's arithmetic is checked as the program's: write a value that fits, or wrap it with --overflow-checks=off"
+    });
+    err_end()
+}
+
+// The least value of the signed integer type ty.
+fn min_of(ty: i64) -> i64 {
+    let bits = int_bits(ty);
+    if bits == 64 { 0 - 9223372036854775807 - 1 } else { 0 - (1 << (bits - 1) as u64) }
+}
+
 fn const_int_binary(n: i64, op: Tok, a: i64, b: i64, operand_ty: i64, ty: i64) -> i64 {
     match op {
-        Plus => wrap_int(a + b, ty),
-        Minus => wrap_int(a - b, ty),
-        Star => wrap_int(a * b, ty),
+        Plus => {
+            const_overflow(n, Op::Add, a, b, ty);
+            wrap_int(a + b, ty)
+        }
+        Minus => {
+            const_overflow(n, Op::Sub, a, b, ty);
+            wrap_int(a - b, ty)
+        }
+        Star => {
+            const_overflow(n, Op::Mul, a, b, ty);
+            wrap_int(a * b, ty)
+        }
         Slash | Percent => {
             if b == 0 {
                 type_error(n, c"division by zero in constant expression");
             }
             if is_signed(operand_ty) {
-                // -MIN / -1 overflows; computed by negation, which wraps.
+                // (0.26.3) MIN / -1 and MIN % -1 overflow, an error at
+                // every level, as they panic at run time (decision 6).
                 if b == -1 {
+                    if a == min_of(operand_ty) {
+                        let what = if op == Slash { c"divide" } else { c"calculate the remainder" };
+                        overflow_error(n, what, ty, true);
+                    }
                     return if op == Slash { wrap_int(0 - a, ty) } else { 0 };
                 }
                 return wrap_int(if op == Slash { a / b } else { a % b }, ty);
@@ -270,6 +336,11 @@ fn const_int_binary(n: i64, op: Tok, a: i64, b: i64, operand_ty: i64, ty: i64) -
         Pipe => wrap_int(a | b, ty),
         Caret => wrap_int(a ^ b, ty),
         Shl | Shr => {
+            // (0.26.3: an amount past the bits is an overflow, checked)
+            if OVERFLOW_CHECKS && (b as u64) >= int_bits(operand_ty) as u64 {
+                let what = if op == Shl { c"shift left" } else { c"shift right" };
+                overflow_error(n, what, operand_ty, false);
+            }
             let amount = (b as u64 & 0xffffffff) % int_bits(operand_ty) as u64;
             if op == Shl {
                 wrap_int(a << amount, ty)

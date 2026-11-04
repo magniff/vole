@@ -687,7 +687,7 @@ try:
         # (0.25.4) A new file the agent wrote (a Write whose result is a
         # `create`) is formatted by the hook, its changes named; an
         # existing one (`update`) gets the note only, as before.
-        newer = "fn main() {\n    let   z  =  3;\n    println(f\"{z}\");\n}\n"
+        newer = "fn main() {\n    let   z  =  3;\n    println(\"{z}\");\n}\n"
         write(os.path.join(prog, "main.vl"), newer)
         wev = {"hook_event_name": "PostToolUse", "tool_name": "Write", "cwd": prog,
                "tool_input": {"file_path": os.path.join(prog, "main.vl"), "content": newer},
@@ -713,7 +713,7 @@ try:
         # (0.25.3) The hook's rewrites are its fixes' changes, each named:
         # the file differs from what was written by those lines alone (an
         # unformatted line stays as it was; the hook formats nothing).
-        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(f\"{y}\");\n}\n"
+        before = "fn main() {\n    let   z  =  3;\n    let mut y = z + 1;\n    println(\"{y}\");\n}\n"
         write(os.path.join(prog, "main.vl"), before)
         got = ctx_of(run(ev2, real, tempfile.mkdtemp(dir=tmp))[1])
         with open(os.path.join(prog, "main.vl")) as fh:
@@ -725,7 +725,7 @@ try:
              (["main.vl:3: let mut y = z + 1; -> var y = z + 1;"], ["main.vl:3: let mut y = z + 1; -> var y = z + 1;"]))
         # (0.25.3) An agent's own `volec fmt`: its summary counts lines, the
         # hook names them (from the journal, `volec query diff`); no check.
-        write(os.path.join(prog, "main.vl"), "fn main() {\n    let   z  =  3;\n    let y = z+1;\n    println(f\"{y}\");\n}\n")
+        write(os.path.join(prog, "main.vl"), "fn main() {\n    let   z  =  3;\n    let y = z+1;\n    println(\"{y}\");\n}\n")
         r = subprocess.run([real, "fmt", "main.vl"], cwd=prog, capture_output=True, text=True)
         bash = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "cwd": prog,
                 "tool_input": {"command": "volec fmt main.vl"}, "tool_response": {"stdout": r.stdout}}
@@ -747,7 +747,7 @@ try:
             with open(os.path.join(nrepo, "compiler", "std", "str.vl"), "a") as fh:
                 fh.write("pub fn zz_hook_probe2() -> i64 { 8 }\n")
             write(os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl"),
-                  "fn main() {\n    let x = std::zz_hook_probe() + std::str::zz_hook_probe2();\n    println(f\"{x}\");\n}\n")
+                  "fn main() {\n    let x = std::zz_hook_probe() + std::str::zz_hook_probe2();\n    println(\"{x}\");\n}\n")
             nev = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": os.path.join(nrepo, "ex", "a", "deep", "er"),
                    "tool_input": {"file_path": os.path.join(nrepo, "ex", "a", "deep", "er", "main.vl")}}
             case("real: a std item added in the tree, its system file too", run(nev, real), (0, ""))

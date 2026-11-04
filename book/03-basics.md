@@ -4,7 +4,7 @@ The guessing game in chapter 2 used a little of everything. This
 chapter slows down and goes through the building blocks one at a time:
 variables, numbers and the other simple types, functions, blocks, and
 loops. None of it is exotic, and much of it will look familiar from
-other languages, but vole has a few habits of its own (wrapping
+other languages, but vole has a few habits of its own (Rust's checked
 integers, `as` for conversions, labels without quotes), and it's worth
 meeting them early.
 
@@ -205,15 +205,14 @@ What is `i64::MAX + 1`? What is `7 / 0`? In many languages the answer is
 "it depends": a crash, an exception, or (in C) *undefined behaviour*,
 where the program may do anything at all, and may do something
 different when you turn on optimizations. Vole gives every operation a
-defined answer:
+defined answer, Rust's:
 
 ```vole
 fn main() {
     let big = i64::MAX;
     let small: u8 = 250;
-    println("{}", big + 1);
-    println("{}", small + 10);
-    println("{} {}", 7 / 0, 7 % 0);
+    println("{}", big.wrapping_add(1));
+    println("{} {}", small.wrapping_add(10), small.saturating_add(10));
     println("{} {}", -7 / 2, -7 % 2);
     println("{} {}", 1e30 as i64, -1.5 as i64);
 }
@@ -221,31 +220,35 @@ fn main() {
 
 ```out
 -9223372036854775808
-4
-0 7
+4 255
 -3 -1
 9223372036854775807 -1
 ```
 
 Line by line:
 
-- Integers *wrap*: one past the largest `i64` is the smallest one, and
-  a `u8` that goes past 255 starts again at 0. This is how the hardware
-  works, and it's what you want for hashes and checksums.
-- Dividing by zero gives 0, and the remainder by zero is the number
-  itself.
+- `big + 1` overflows. In a debug build (`-O0`, and every `volec test`)
+  the program stops there, with `main.vl:4:20: attempt to add with
+  overflow` and exit status 101; in an optimized build (`-O1`, `-O2`)
+  it wraps, as the hardware does. `--overflow-checks=on` or `off`
+  chooses for any level. When wrapping is what you mean, as in hashes
+  and checksums, say so: `wrapping_add` wraps at every level, and
+  `saturating_add` stops at the largest value. `checked_add` gives
+  `None` instead of overflowing.
+- Dividing by zero stops the program at every level: `attempt to divide
+  by zero`. So does `i64::MIN / -1`, whose answer doesn't fit.
 - Integer division rounds towards zero, and the remainder takes the
   sign of the number divided.
 - A float too big for an integer *saturates*: it becomes the largest
   value the type holds.
 
-Why not stop the program on overflow, as some languages do? Because
-then every `+` would be a possible stop, and the compiler couldn't
-treat arithmetic as ordinary arithmetic. Instead, every operation means
-one thing, the same at every optimization level, and a program never
-has undefined behaviour from its numbers. When overflow would be a bug
-in your program, check for it, or state it as a requirement (chapter 6
-shows a first `requires`).
+Why stop the program on overflow only in debug builds? It's Rust's
+choice: a debug build catches the bug where it happens, and an
+optimized one doesn't pay for a check on every `+`. Either way every
+operation means one thing, and a program never has undefined behaviour
+from its numbers. When overflow would be a bug in your program in every
+build, check for it (`checked_add`), or state it as a requirement
+(chapter 6 shows a first `requires`).
 
 `i64::MAX`, `i64::MIN`, `u8::MAX` and so on are constants, one pair for
 each integer type. Numbers have few methods, though: `x.abs()` and

@@ -31,7 +31,7 @@ called `conv.rust` with the vole spelling on its `try:` line.
 | `Vec::new()`, `String::new()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `to_string_in(format_args(".."), gpa)`: allocation is explicit | 8 |
 | `println!`, `vec!`, `assert!`, macros | `println("{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
 | `dyn Trait`, `impl Trait` arguments, `where` | generics: `fn f<T: Trait>(x: T)` | 9 |
-| overflow panics in debug builds | integers always wrap; `x / 0` is 0 | 3 |
+| overflow panics in debug builds | the same: checked at `-O0`, wrapping at `-O2`; `wrapping_add` and the rest; `x / 0` panics | 3 |
 | `char`, `'a'` | no `char` yet: `'a'` is a `u8`; a code point is a `u32` | 7 |
 | `a.cmp(&b)` returns `Ordering` | `a.cmp(b)` returns an `i64`: negative, zero or positive | 9 |
 | `'outer: loop { break 'outer; }` | `outer: loop { break :outer; }` | 3 |
@@ -101,7 +101,7 @@ is designed so that ordinary code can't have undefined behaviour.
 
 | C or C++ | vole | chapter |
 |---|---|---|
-| undefined behaviour: signed overflow, a bad index, an uninitialized variable | none in safe code: integers wrap, every index is checked, every variable is set | 3, 15 |
+| undefined behaviour: signed overflow, a bad index, an uninitialized variable | none in safe code: overflow stops a debug build and wraps in an optimized one, every index is checked, every variable is set | 3, 15 |
 | `malloc` and `free`, `new` and `delete` | allocators passed as parameters; values are freed when they go out of scope | 8 |
 | destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
 | a pointer and a length, passed separately | a slice, `[T]`, which carries its length | 7 |
@@ -120,9 +120,10 @@ Two of these surprise C programmers most. First, indexing is checked:
 101, rather than reading some other memory. The compiler removes the
 check wherever it can prove `i` is in range, as it can in a simple
 counted loop, and `volec query checks` shows the ones left (chapter
-16). Second, division by zero isn't a crash: `x / 0` is 0 and
-`x % 0` is `x`. Both are defined, so the optimizer has nothing to
-assume.
+16). Second, division by zero isn't undefined: `x / 0` stops the
+program with a message, at every level, and signed overflow stops a
+debug build and wraps in an optimized one. All of it is defined, so the
+optimizer has nothing to assume.
 
 The C-like parts of vole are still there: raw pointers, `malloc`,
 unions, calling any C function. They're allowed inside `unsafe`, which
@@ -133,7 +134,7 @@ marks the few lines where C's rules apply (chapter 15).
 fn sum(xs: [i32]) -> i32 {
     var total: i32 = 0;
     for x in xs {
-        total += x; // wraps on overflow: defined, unlike C's int
+        total = total.wrapping_add(x); // wraps: defined, unlike C's int
     }
     total
 }
@@ -143,15 +144,15 @@ fn main(gpa: Gpa) {
     v.push(2147483647);
     v.push(1);
     println("{} {}", sum(v.as_slice()), v.len());
-    let zero = v.len() - 2;
-    println("{} {}", 7 / zero, 7 % zero);
+    let two = v.len();
+    println("{} {}", 7 / two, 7 % two);
     println("{}", v[2]);
 }
 ```
 
 ```out exit=101
 -2147483648 2
-0 7
+3 1
 c.vl:17:19: index out of bounds: index 2, length 2
 ```
 

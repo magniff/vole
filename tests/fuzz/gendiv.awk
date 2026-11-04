@@ -8,7 +8,9 @@
 # stays a division instruction, and goes into a checksum; quotients and
 # remainders alone go into it too. At -O1 and -O2 a division by a constant
 # is a multiplication (isel.vl), at -O0 a division instruction: every
-# level must print the same checksum, and no FAIL line.
+# level must print the same checksum, and no FAIL line. (0.26.3, decision
+# 6: no divisor 0, and no MIN / -1, which panic at every level; run.sh
+# builds the programs with the overflow checks off, for the checksums.)
 #
 # usage: awk -v seed=N [-v count=K] [-v iterations=M] [-v curated=1] -f gendiv.awk
 #   count        constants per type (default 6)
@@ -49,7 +51,7 @@ function divisor(t,    b, k, kind, neg, v, small, n) {
     b = bits(t)
     kind = rnd(12)
     neg = signed(t) && rnd(3) == 0
-    if (kind == 0) return lit(t, rnd(4) == 0 ? "0" : "1", neg)
+    if (kind == 0) return lit(t, "1", neg)
     if (kind <= 3) {
         n = split("3 5 6 7 9 10 11 12 13 14 15 17 19 24 25 26 31 60 100 125 255 641 1000 7919 10000 65521 1000000 6700417", small, " ")
         v = small[1 + rnd(n)]
@@ -101,16 +103,16 @@ function lit(t, v, neg) {
 
 # Curated divisors per type: each way of isel.vl's lowering (narrow and
 # 64-bit, the add fix-up of 65-bit magic numbers, the corrections of signed
-# ones, powers of two, 0, 1, -1, the extremes).
+# ones, powers of two, 1, -1, the extremes; 0.26.3: not 0, which panics).
 function curated_list(t) {
-    if (t == "u8") return "0 1 2 3 5 7 10 13 26 100 127 128 129 254 255"
-    if (t == "u16") return "0 1 3 7 10 26 641 1000 32767 32768 32769 65534 65535"
-    if (t == "u32") return "0 1 3 5 6 7 10 25 26 100 641 1000 1000000 6700417 2147483647 2147483648 2147483649 4294967294 4294967295"
-    if (t == "u64") return "0 1 3 5 6 7 10 26 100 641 1000 274177 6700417 1000000007 0x5555555555555555 0xd486c8a807eeb4 0x7fffffffffffffff 0x8000000000000000 0x8000000000000001 0xfffffffffffffffe 0xffffffffffffffff"
-    if (t == "i8") return "0 1 -1 2 -2 3 -3 5 7 -7 10 26 -26 100 127 -127 MIN"
-    if (t == "i16") return "0 1 -1 3 -3 7 -7 10 26 641 -641 1000 16384 -16384 32767 -32767 MIN"
-    if (t == "i32") return "0 1 -1 3 -3 5 6 7 -7 10 26 -26 100 641 1000 1000000 -1000000 1073741824 -4 2147483647 -2147483647 MIN"
-    return "0 1 -1 3 -3 5 7 -7 10 26 100 641 274177 -6700417 1000000007 0x5555555555555555 0x4000000000000000 -8 0x7fffffffffffffff -0x7fffffffffffffff MIN"
+    if (t == "u8") return "1 2 3 5 7 10 13 26 100 127 128 129 254 255"
+    if (t == "u16") return "1 3 7 10 26 641 1000 32767 32768 32769 65534 65535"
+    if (t == "u32") return "1 3 5 6 7 10 25 26 100 641 1000 1000000 6700417 2147483647 2147483648 2147483649 4294967294 4294967295"
+    if (t == "u64") return "1 3 5 6 7 10 26 100 641 1000 274177 6700417 1000000007 0x5555555555555555 0xd486c8a807eeb4 0x7fffffffffffffff 0x8000000000000000 0x8000000000000001 0xfffffffffffffffe 0xffffffffffffffff"
+    if (t == "i8") return "1 -1 2 -2 3 -3 5 7 -7 10 26 -26 100 127 -127 MIN"
+    if (t == "i16") return "1 -1 3 -3 7 -7 10 26 641 -641 1000 16384 -16384 32767 -32767 MIN"
+    if (t == "i32") return "1 -1 3 -3 5 6 7 -7 10 26 -26 100 641 1000 1000000 -1000000 1073741824 -4 2147483647 -2147483647 MIN"
+    return "1 -1 3 -3 5 7 -7 10 26 100 641 274177 -6700417 1000000007 0x5555555555555555 0x4000000000000000 -8 0x7fffffffffffffff -0x7fffffffffffffff MIN"
 }
 
 function curated_lit(t, v) {
@@ -149,7 +151,10 @@ BEGIN {
             fty[nf] = t
             nf++
             print "// " t " by " c
+            # (0.26.3) MIN / -1 panics: a divisor -1 skips the MIN dividend
+            guard = (signed(t) && c == lit(t, "1", 1)) ? "    if x == " min_lit(t) " {\n        return 0u64;\n    }" : ""
             print "fn " f "_one(x: " t ", rt: " t ") -> u64 {"
+            if (guard != "") print guard
             print "    let q = x / " c ";"
             print "    let r = x % " c ";"
             print "    if q != x / rt || r != x % rt {"
@@ -159,6 +164,7 @@ BEGIN {
             print "}"
             print ""
             print "fn " f "(x: " t ", z: " t ") -> u64 {"
+            if (guard != "") print guard
             print "    let rt = " c " + z;"
             print "    let m = x / rt * rt;"
             print "    var sum = " f "_one(x, rt);"
@@ -170,11 +176,13 @@ BEGIN {
             print ""
             print "#[inline(never)]"
             print "fn " f "_q(x: " t ") -> " t " {"
+            if (guard != "") print "    if x == " min_lit(t) " {\n        return x;\n    }"
             print "    x / " c
             print "}"
             print ""
             print "#[inline(never)]"
             print "fn " f "_r(x: " t ") -> " t " {"
+            if (guard != "") print "    if x == " min_lit(t) " {\n        return 0" t ";\n    }"
             print "    x % " c
             print "}"
             print ""

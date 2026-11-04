@@ -72,7 +72,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     m.get_or_insert("k", 0)[0] += 1;   // a one-element view: [0] is the value
     let z = 0;
-    println("{} {} {}", ~0u8, 7 / z, m.get("k").unwrap()); // ~x; x / 0 == 0
+    println("{} {} {}", ~0u8, 250u8.wrapping_add(7), m.get("k").unwrap()); // ~x; x / 0 panics
     unsafe { c::puts(c"from C"); }     // C calls need unsafe; c"..": a NUL-terminated *u8
     if z != 0 { panic("z"); }          // exit 101; unreachable()
     0
@@ -83,12 +83,12 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
 2
 n=3
 104
-255 0 1
+255 1 1
 from C
 ```
 
 Also: lengths and indices are `usize` (0.26.2; a counter from a literal
-says `var i: usize = 0`); integers wrap; `a as i32`
+says `var i: usize = 0`); overflow panics at -O0, wraps at -O2 (`wrapping_add`: always); `a as i32`
 narrows, widening is implicit; `x?`, closures (`|x| x + k`, `sink ||`
 to take what it captures), `impl Trait for T`, `T: Trait`,
 `#[derive(Eq, Debug)]`, `where T: Ord` and `x: impl Display` (0.26.2); no `dyn`, `Box`. A let or inout
