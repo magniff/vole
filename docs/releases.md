@@ -78,6 +78,27 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
+### What's new in 0.26.5
+
+The statics into context structs, phases 4-6 (statics265):
+
+- `volec fix --only statics` does in the same run what the 0.26.4 phases
+  did by hand: the group file's `use PATH` lines are added where a
+  function takes the context, its `owner-use PATH` lines where an owner
+  makes it; the statics are taken out of the `use` lines and their
+  declarations deleted. A static in a format literal's hole becomes
+  `{field}` and the named argument `field = cx.field`; among named
+  arguments the context goes named, in its parameter's place; a static
+  lent beside the context (`f(&X, &cx)`) is taken into a local and put
+  back after the statement when `f` does not use it through the context.
+  A function given the context before keeps it (made inout where it now
+  changes the context), so a second group can join a context already
+  passed down. Functions in a generated file are refused like `main`.
+- `fix --only statics-list --group FILE --prune PREFIX,...` prints the
+  group without the statics that make a refused function, or one outside
+  the prefixes, take the context, in rounds (`--prune crate`: refusals
+  only): what 0.26.4's phase 3 did in up to 80 runs by hand.
+
 ### What's new in 0.26.4
 
 The compiler on Rust's overflow checks, its raw-pointer parameters decided, and its statics in context structs. Built and tested on aarch64-macos only.
