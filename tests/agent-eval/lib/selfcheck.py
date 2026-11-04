@@ -52,7 +52,7 @@ fn main(gpa: Gpa) -> i32 {
     while let Ok(n) = sc.next_int() {
         t += n;
     }
-    println(f"{t}");
+    println("{t}");
     0
 }
 """
