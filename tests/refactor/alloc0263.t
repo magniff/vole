@@ -5,7 +5,9 @@
 ## out. alloc.no_in: a constructor without `_in` (`Vec::new()`, `collect()`);
 ## the fix passes the allocator in scope, and leaves `empty`, which has none.
 ## alloc.field: `Bag` holds a Gpa; the fix makes it `Bag<A: Allocator>`, and
-## its use `Bag<Gpa>` (the next round).
+## its use `Bag<Gpa>` (the next round). `Stack<T>`'s field, then its impl's
+## header (alloc.default: `impl<T, A: Allocator> Stack<T, A>`), then its own
+## `Stack<T>` inside it, written with the impl's `A`; a turbofish, `Vec::<i64>`.
 ## Then the codes' explanations (alloc.safe_impl, alloc.static, alloc.field, alloc.last: their tests/run/err_alloc_* cases).
 $ check
 main.vl:3:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
@@ -16,6 +18,7 @@ main.vl:15:13: error[alloc.default] the allocator parameter 'A' has a default: a
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
 main.vl:24:28: error[alloc.no_in] 'collect' allocates from nothing: pass the allocator, last, to 'collect_in' | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:32:12: error[alloc.field] the struct 'Bag' holds an allocator its parameters do not name: 'Gpa', in field 'items' | help: a type that holds an allocator says so in its parameters: make it generic over it (`struct P<A: Allocator> { v: Vec<u8, A> }`, used as `P<Gpa>`) | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
+main.vl:55:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 [exit 1]
 $ fix --only alloc --dry-run
 --- a/main.vl
@@ -40,8 +43,22 @@ $ fix --only alloc --dry-run
 @@ -35 +35 @@
 -fn bag_len(b: Bag) -> usize {
 +fn bag_len(b: Bag<Gpa>) -> usize {
+@@ -39,2 +39,2 @@
+-struct Stack<T> {
+-    items: Vec<T>,
++struct Stack<T, A: Allocator> {
++    items: Vec<T, A>,
+@@ -43 +43 @@
+-impl<T> Stack<T> {
++impl<T, A: Allocator> Stack<T, A> {
+@@ -49 +49 @@
+-    fn me(sink self) -> Stack<T> {
++    fn me(sink self) -> Stack<T, A> {
+@@ -55 +55 @@
+-    let u = Vec::<i64>::new_in(gpa);
++    let u = Vec::<i64, Gpa>::new_in(gpa);
 $ fix --only alloc
-fixed 7 suggested fixes	main.vl	+7 -7 lines
+fixed 12 suggested fixes	main.vl	+12 -12 lines
 main.vl:11:48: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: this item is generic over the allocator 'A': write it, or Gpa (what the default meant) | try: volec fix --only alloc main.vl
 main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'empty' and pass it down | try: volec fix --only alloc main.vl
 note fix.left: 2 errors left (above)
@@ -52,7 +69,7 @@ main.vl:20:5: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the all
 $ explain alloc.default
 alloc.default: error
 (0.26.3) A container of std written without its allocator type, `Vec<u8>`, `Buf`, `HashMap<K, V>`: std's types have no default allocator (until 0.26.3 the default was Gpa), so the allocator a value may grow from is in its type, and a signature says what a function may allocate from. Also a type parameter bounded by Allocator declared with a default (`A: Allocator = Gpa`).
-fix: Write the allocator: `Vec<u8, Gpa>` (main's, what the default meant), or the allocator parameter of a generic item (`fn fill<A: Allocator>(v: &mut Vec<u8, A>)`); a function that only reads takes a slice, `[u8]`. `volec fix --only alloc` writes Gpa, except in an item generic over an allocator, where it is yours to choose.
+fix: Write the allocator: `Vec<u8, Gpa>` (main's, what the default meant), or the allocator parameter of a generic item (`fn fill<A: Allocator>(v: &mut Vec<u8, A>)`); a function that only reads takes a slice, `[u8]`. `volec fix --only alloc` writes Gpa, except in an item generic over an allocator, where it is yours to choose (in its own generic impl, the program's type gets the impl's `A`; an impl block without the allocator gets the parameter).
 example:
     fn total(v: Vec<i64>) -> i64 { v.iter().sum() }
     

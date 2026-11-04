@@ -9,10 +9,13 @@
 //
 // Its exact fix (`fix --only alloc`) writes `Gpa`, what the 0.26.2
 // default meant; it is refused inside an item generic over an allocator
-// (`A` may be what was meant).
+// (`A` may be what was meant), but for the program's own type in its own
+// generic impl, `Bag<T>` in `impl<T, A: Allocator> Bag<T, A>`, where it
+// writes the impl's `A`. An impl block leaving out its type's allocator,
+// `impl<T> Bag<T>`, is alloc.default too: its fix adds the parameter.
 
 use crate::base::{
-    SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, intern_c, sym_text,
+    IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, intern_c, sym_text,
 };
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump, err_str,
@@ -160,9 +163,19 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
             err_help_fmt(format_args(
                 "this item is generic over the allocator '{}': write it, or Gpa (what the default meant)",
                 SYMS[inside].text));
+            // (a type of the program's own whose allocator parameter has the
+            // name of the one in scope, `Bag<T>` in `impl<T, A: Allocator>
+            // Bag<T, A>`: that one, as the impl's fix wrote it; std's
+            // containers, whose parameter is `A` too, are left)
+            if missing == 1 && NODES[child(params, generic - 1)].a == inside
+                && !within_std(module_of(params)) {
+                default_fix(pos, name, count, missing, SYMS[inside].text);
+            }
         } else {
             err_help(c"the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator`");
-            default_fix(pos, name, count, missing);
+            let own = impl_allocator_at(pos, name);
+            default_fix(pos, name, count, missing,
+                if own != 0 && missing == 1 { SYMS[own].text } else { "Gpa" });
         }
         err_try_tool("fix --only alloc", true);
         err_end_soft();
@@ -175,8 +188,9 @@ pub fn missing_allocator(params: i64, generic: i64, mark: i64, name: i64, pos: i
 }
 
 // The fix of a type written at pos, `name` or `name<..count..>`: `Gpa`
-// for each of the `missing` allocators, as the last type arguments.
-fn default_fix(pos: i64, name: i64, count: i64, missing: i64) {
+// for each of the `missing` allocators (`what`: Gpa, or the name of an
+// allocator parameter), as the last type arguments.
+fn default_fix(pos: i64, name: i64, count: i64, missing: i64, what: [u8]) {
     // The name as written: a path, its last part `name`.
     var i = pos;
     var last = pos;
@@ -186,11 +200,23 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64) {
         }
         i += 1;
     }
-    let end = i;
+    var end = i;
+    var j = end;
+    // (a path's turbofish, `Vec::<i64>::new_in(gpa)`: the name before `::<`)
+    if end - pos >= 2 && SRC[end - 1] == ':' && SRC[end - 2] == ':' && end < SRC.len() as i64
+        && SRC[end] == '<' {
+        j = end;
+        end -= 2;
+        last = pos;
+        for q in pos..end {
+            if SRC[q] == ':' {
+                last = q + 1;
+            }
+        }
+    }
     if SRC[last..end] != SYMS[name].text {
         return;
     }
-    var j = end;
     while j < SRC.len() as i64 && SRC[j] == ' ' {
         j += 1;
     }
@@ -222,16 +248,170 @@ fn default_fix(pos: i64, name: i64, count: i64, missing: i64) {
             return;
         }
         for _ in 0..missing {
-            buf_str(text, c", Gpa");
+            buf_str(text, c", ");
+            buf_bytes(text, what);
         }
         err_fix(k, k, buf_slice(text));
     } else if count == 0 {
-        buf_str(text, c"<Gpa");
+        buf_str(text, c"<");
+        buf_bytes(text, what);
         for _ in 1..missing {
-            buf_str(text, c", Gpa");
+            buf_str(text, c", ");
+            buf_bytes(text, what);
         }
         buf_str(text, c">");
         err_fix(end, end, buf_slice(text));
+    }
+}
+
+// The impls impl_missing_allocator reported: (start, end, the type's
+// name, its allocator parameter's) for each.
+static var IMPL_ALLOC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A generic impl's block for template `tpl` (its type's arguments `args`):
+// when the type's last parameter is an allocator, the impl is noted as
+// impl_missing_allocator notes one, so that `Bag<T>` inside `impl<T, A:
+// Allocator> Bag<T, A>` gets the impl's `A` (where it is checked without
+// an instance, the scope names no allocator).
+pub fn note_generic_impl(item: i64, tpl: i64, args: i64) {
+    // UNSAFE: NODES, STRUCTS and ENUMS are the checker's raw tables.
+    // SAFETY: tpl is a struct (1 + index) or an enum (-1 - index) template; args the impl's type's arguments.
+    unsafe {
+        if tpl == 0 || tpl >= crate::front::generics::TPL_SLICE || args == 0
+            || within_std(module_of(item)) {
+            return;
+        }
+        let node = if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node };
+        let tparams = NODES[node].g;
+        if tparams == 0 || NODES[tparams].count != NODES[args].count {
+            return;
+        }
+        let last = NODES[tparams].count - 1;
+        if !is_allocator_param(child(tparams, last)) {
+            return;
+        }
+        IMPL_ALLOC.push(NODES[item].start);
+        IMPL_ALLOC.push(NODES[item].end);
+        IMPL_ALLOC.push(crate::front::generics::template_name(tpl));
+        IMPL_ALLOC.push(NODES[child(args, last)].a);
+    }
+}
+
+// The allocator parameter an impl being given one names `name`'s by, when
+// pos is inside it (impl_missing_allocator); 0 when none.
+fn impl_allocator_at(pos: i64, name: i64) -> i64 {
+    var i = 0;
+    while i + 3 < IMPL_ALLOC.count {
+        // UNSAFE: IMPL_ALLOC is an IntVec, read by index.
+        // SAFETY: i + 3 < count: the four values of one impl.
+        unsafe {
+            let d = IMPL_ALLOC.data;
+            if d[i] <= pos && pos < d[i + 1] && d[i + 2] == name {
+                return d[i + 3];
+            }
+        }
+        i += 4;
+    }
+    0
+}
+
+// (0.26.3) An impl block for a type whose left-out parameters are its
+// allocators, `impl<T> Bag<T>` for `struct Bag<T, A: Allocator>` (the
+// impl's parameters `iparams`, the type's `tparams`): alloc.default,
+// whose fix writes them as the impl's parameters and the type's
+// arguments, `impl<T, A: Allocator> Bag<T, A>` (help: the whole header).
+// False, nothing reported, when one left out is not an allocator; else
+// the error, which ends the check.
+pub fn impl_missing_allocator(item: i64, self_node: i64, tparams: i64, iparams: i64, name: i64,
+    help: i64)
+    -> bool {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: tparams and iparams are Generics nodes, self_node the impl's type.
+    unsafe {
+        let generic = NODES[tparams].count;
+        let written = NODES[iparams].count;
+        if written >= generic {
+            return false;
+        }
+        for k in written..generic {
+            if !is_allocator_param(child(tparams, k)) {
+                return false;
+            }
+        }
+        // (the impl's other uses of the type, `-> Bag<T>`, checked after
+        // this error: its parameter, in the same round)
+        IMPL_ALLOC.push(NODES[item].start);
+        IMPL_ALLOC.push(NODES[item].end);
+        IMPL_ALLOC.push(name);
+        IMPL_ALLOC.push(NODES[child(tparams, generic - 1)].a);
+        ERR_KIND = c"alloc.default";
+        err_begin(NODES[self_node].start);
+        err_str(c"'");
+        err_sym(name);
+        err_str(c"' names no allocator: its '");
+        err_sym(NODES[child(tparams, generic - 1)].a);
+        err_str(c"' is the impl's parameter too (no default allocator type since 0.26.3)");
+        err_help(c"an impl block writes every type argument: '");
+        crate::base::diag::err_help_sym(help);
+        err_help(c"'");
+        impl_fix(self_node, tparams, iparams);
+        err_try_tool("fix --only alloc", true);
+        crate::base::diag::err_end()
+    }
+}
+
+// The fix of impl_missing_allocator: `, A: Allocator` before the `>` of
+// the impl's parameters, `, A` before the type's; none when the impl
+// already has a parameter of that name.
+fn impl_fix(self_node: i64, tparams: i64, iparams: i64) {
+    // UNSAFE: NODES is the checker's raw table of nodes.
+    // SAFETY: tparams and iparams are Generics nodes, self_node the impl's type.
+    unsafe {
+        let start = NODES[self_node].start;
+        var g = start - 1;
+        while g > 0 && SRC[g] == ' ' {
+            g -= 1;
+        }
+        if g <= 0 || SRC[g] != '>' {
+            return;
+        }
+        var k = start;
+        var depth = 0;
+        while k < SRC.len() as i64 {
+            let c = SRC[k];
+            if c == '<' {
+                depth += 1;
+            } else if c == '>' && SRC[k - 1] != '-' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if c == '{' || c == ';' {
+                return;
+            }
+            k += 1;
+        }
+        if k >= SRC.len() as i64 || depth != 0 {
+            return;
+        }
+        let text = buf_new();
+        let args = buf_new();
+        for i in NODES[iparams].count..NODES[tparams].count {
+            let p = NODES[child(tparams, i)].a;
+            for j in 0..NODES[iparams].count {
+                if NODES[child(iparams, j)].a == p {
+                    return;
+                }
+            }
+            buf_str(text, c", ");
+            buf_bytes(text, SYMS[p].text);
+            buf_str(text, c": Allocator");
+            buf_str(args, c", ");
+            buf_bytes(args, SYMS[p].text);
+        }
+        buf_bytes(text, SRC[g..k]);
+        buf_bytes(text, buf_slice(args));
+        err_fix(g, k, buf_slice(text));
     }
 }
 
