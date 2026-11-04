@@ -106,7 +106,12 @@ The rule for later, after the statics work:
    deprecated` for every scratch program, which is noise.
 4. `sample` cannot attach to a 0.5 s run, and there is no xctrace, so
    there was no profiler. The generated benchmark took its place.
-5. The commit hook flags lines with an existing unsafe that a rewrite
+5. Idempotency on compiler/src, not only on the test program. The
+   first rerun after the rewrite decided 29 more parameters. Its
+   nested-call rule had missed an inout `&cx`, which the checker reads
+   through `*cx`, and its own `unsafe { &*q }` (fixed in c0923213). Rerun
+   the fix on the rewritten tree before calling it done.
+6. The commit hook flags lines with an existing unsafe that a rewrite
    only touched, as if the unsafe were new. The tool now writes comments
    for the blocks it adds; three touched lines needed hand comments.
 
