@@ -58,7 +58,7 @@ reordered the parameters of crate::ledger::transfer, 3 calls	2 files	+4 -4 lines
 // main.vl:44
 44	    transfer(&l, 2, 1, 1000);
 // ledger.vl:40
-40	pub fn transfer(l: inout Ledger, from: i64, to: i64, amount: i64) -> bool {
+40	pub fn transfer(l: inout Ledger<Gpa>, from: i64, to: i64, amount: i64) -> bool {
 // ledger.vl:66
 66	        Event::Transfer(to, n) => transfer(&l, who, to, n),
 // ledger.vl:72
@@ -83,7 +83,7 @@ removed parameter day of crate::ledger::apply, 1 call	2 files	+2 -2 lines
 // main.vl:35
 35	                let ok = apply(&l, who, e);
 // ledger.vl:56
-56	pub fn apply(l: inout Ledger, who: i64, e: Event) -> bool {
+56	pub fn apply(l: inout Ledger<Gpa>, who: i64, e: Event) -> bool {
 ```
 
 ### Add, with a default
@@ -213,7 +213,7 @@ $ volec edit insert --in main --after '(1, "withdraw 99999"),' <<'EOF'
 inserted in crate::main	main.vl	+2 -0 lines
 $ volec edit insert --after ledger::transfer <<'EOF'
 > // A fee from account `who` to the house, counted in its fees_paid.
-> fn charge(l: inout Ledger, who: i64, n: i64) -> bool {
+> fn charge(l: inout Ledger<Gpa>, who: i64, n: i64) -> bool {
 >     if !transfer(&l, who, 0, n) {
 >         return false;
 >     }

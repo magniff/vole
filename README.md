@@ -49,7 +49,7 @@ fn partition<T: Ord>(xs: inout [T]) -> usize
 }
 
 fn main(gpa: Gpa) {
-    var v: Vec<i64> = Vec::new_in(gpa); // the allocator is explicit
+    var v: Vec<i64, Gpa> = Vec::new_in(gpa); // the allocator is explicit
     for x in [5, 3, 9, 1, 4, 8, 2, 7, 6] { v.push(x); }
     quicksort(&v); // & marks what the callee may change
     println("{v:?}"); // [1, 2, 3, 4, 5, 6, 7, 8, 9]

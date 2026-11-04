@@ -111,8 +111,8 @@ allocated (here, an array on the stack). `outliers` would not:
 ```console
 $ volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 > fn outliers'
-main.vl:89:1: error[effect] 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64> | help: allocate in the caller and pass the memory in, or remove #[no_alloc] | try: volec query effects outliers --why alloc(Gpa)  [edited: crate::outliers]
-error edit.breaks: 1 new error; nothing written; the error: main.vl:89:1: 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64>
+main.vl:89:1: error[effect] 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64, Gpa> | help: allocate in the caller and pass the memory in, or remove #[no_alloc] | try: volec query effects outliers --why alloc(Gpa)  [edited: crate::outliers]
+error edit.breaks: 1 new error; nothing written; the error: main.vl:89:1: 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64, Gpa>
 try: volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 fn outliers' --no-check
 [exit 1]
