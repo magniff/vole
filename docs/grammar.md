@@ -1520,7 +1520,7 @@ block, `r"..."`) that is the first argument of a format function: Rust's
 | format function | the format arguments |
 |---|---|
 | `print`, `println`, `eprint`, `eprintln`, `format_args` | after the literal |
-| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)` |
+| `format_in` | after the literal; the allocator stays last: `format_in("{} {x}", a.b, gpa)`, a `String<A>` on it (0.26.3; a `Buf` before) |
 | `panic`, the message of `assert` and `debug_assert` | after the literal |
 | the methods `String::push_fmt`, `Buf::push_fmt`, `Fmt::write` | after the literal |
 | a contract's `else` | `requires c else "len {}", v.len()` |

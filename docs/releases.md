@@ -118,6 +118,15 @@ Text (text263; grammar.md, "Items"):
   method with no form on the side decided are refused, each named
   (`note fix.buf-refused`). It never guesses. The method table it maps
   through is printed with every run (`note fix.buf-table`).
+- std's text is a `String<A>` (breaking): `format_in` returns one (as
+  Rust's `format!`), `read_line` fills one (a line that is not UTF-8 is
+  `Err(IoError::Read)`, the line left empty), and so do `Command::help_in`
+  and `render_in` (std::cli), `take_capture`, `objc::push_ns_string`,
+  `Window::clipboard_get_in`, `gpu::Adapter::name_in`, the messages of
+  `gpu::Error::Shader` and `Pipeline`, `ShaderEntry`'s names and
+  `wgsl::target_error`. std's ambient `format(x)` is gone: write
+  `format_in(x, gpa)`. A program written for the `Buf` these returned:
+  `volec fix --only buf`.
 
 ### What's new in 0.26.2
 

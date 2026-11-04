@@ -71,7 +71,7 @@ What turns one form into another:
 | a `str` (a literal, a static) | `[u8]` | nothing: a `str` goes where a `[u8]` does; `s.as_bytes()` says so |
 | `[u8]` | `str` | `str::from_utf8(b)?`: checked, a `Result` |
 | `Vec<T>`, `Buf` | `[T]`, `[u8]` | `v.as_slice()`, a view, no copy; a `String`: `s.as_str()` |
-| a format string | its text | `format_in("..", args, gpa)`, a `Buf` (`.as_slice()` views it); `to_string_in(format_args("..", args), gpa)`, a `String` |
+| a format string | its text | `format_in("..", args, gpa)`, a `String<A>` (`.as_str()` views it; 0.26.3: a `Buf` before); `to_string_in(x, gpa)` for one value |
 | a slice | appended | `v.extend_from_slice(s)` to a `Vec`; `push_str(s)` to a `Buf` or `String` |
 
 `print`, `println` and `eprintln` take any `T: Display`: a number, a
@@ -94,7 +94,7 @@ fn main(gpa: Gpa) {
     var v: Vec<u8> = Vec::new_in(gpa);
     v.extend_from_slice(NAME.as_bytes());
     v.extend_from_slice(DAYS[1]);
-    let msg = format_in("{NAME}: {} days, {} bytes", DAYS.len(), v.len(), gpa); // a Buf
+    let msg = format_in("{NAME}: {} days, {} bytes", DAYS.len(), v.len(), gpa); // a String
     println(msg.as_slice());
     println("{} {} {}", bytes.len, text.lines().count(), DAYS[..].len());
     if v.len() != 7 {
@@ -109,7 +109,7 @@ vole: 3 days, 7 bytes
 
 ## Numbers as text without an allocator
 
-`format_in("{v:.2}", gpa)` allocates a `Buf`; a loop that writes a
+`format_in("{v:.2}", gpa)` allocates a `String`; a loop that writes a
 number every frame (a UI's label) writes it into a stack array instead.
 `std::num::fmt_f64(v, decimals, &out)` (0.25.4) writes `{v:.N}`'s text
 byte for byte at the end of a `[u8; 32]` and returns where it starts:
