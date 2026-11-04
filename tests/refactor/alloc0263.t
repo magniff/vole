@@ -4,7 +4,7 @@
 ## allocator (`grow`'s `w`, left with its reason); a declared default is taken
 ## out. alloc.no_in: a constructor without `_in` (`Vec::new()`, `collect()`);
 ## the fix passes the allocator in scope, and leaves `empty`, which has none.
-## Then the codes' explanations.
+## Then the codes' explanations (alloc.safe_impl: tests/run/err_alloc_safe_impl).
 $ check
 main.vl:3:13: error[alloc.default] 'Vec' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
 main.vl:7:12: error[alloc.default] 'HashMap' names no allocator: its 'A' is written (no default allocator type since 0.26.3) | help: the allocator is part of the type: `Gpa` (main's, what the default meant), or a generic `A: Allocator` | try: volec fix --only alloc main.vl | try: volec fix --suggested main.vl
@@ -54,3 +54,11 @@ example:
     let v: Vec<i64, Gpa> = Vec::new();
     
     main.vl:2:28: error[alloc.no_in] 'Vec::new' allocates from nothing: pass the allocator, last, to 'Vec::new_in' | help: this function's `gpa` is the allocator to pass
+$ explain alloc.safe_impl
+alloc.safe_impl: error
+(0.26.3) An impl of std's Allocator written `impl Allocator for T`: Allocator is an `unsafe trait`, as in Rust. Containers' unsafe code relies on an allocator's blocks, and a type made from nothing over malloc is a global allocator, so its impl says so. (Any `unsafe trait`'s impl is `unsafe impl`; `unsafe impl` of a safe trait, or of a type alone, is an error.)
+fix: Write `unsafe impl Allocator for T`, under `// UNSAFE:` (why it cannot be safe) and `// SAFETY:` (where its memory comes from, why its blocks are sound). No tool writes it: the comments are the author's.
+example:
+    impl Allocator for Heap { .. }
+    
+    main.vl:1:1: error[alloc.safe_impl] the trait 'Allocator' is unsafe: its impl is `unsafe impl` | help: an allocator says where its memory comes from: `unsafe impl Allocator for T`, under `// UNSAFE:` (why it cannot be safe) and `// SAFETY:` (where its memory comes from, why it is sound)
