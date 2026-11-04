@@ -40,7 +40,8 @@ pub fn show(n: i64) {
     println(f"n = {n}");
 }
 $ check
-ok: 0 errors in main.vl
+lib.vl:7:13: error[syntax.fstring] f-strings are removed (0.26.3): a format string takes the values as arguments | help: a name stays in its hole and an expression goes after the literal: `println("{n} {}", v.len())`; elsewhere `format_args("..", args)` | try: volec fix --only fstring --keep-braces main.vl
+[exit 1]
 % printf 'pub fn three()->i64{3}\n' >> shared/lib.vl
 $ fmt lib.vl
 formatted	lib.vl	+2 -1 lines

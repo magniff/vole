@@ -1362,8 +1362,9 @@ class Print(S_):
         self.holes = holes
 
     def emit(self, out, ind):
-        hs = ''.join(' {%s}' % h.code() for h in self.holes)
-        out.append('%sprintln(f"o%d%s");' % (ind, self.n, hs))
+        hs = ' {}' * len(self.holes)
+        args = ''.join(', %s' % h.code() for h in self.holes)
+        out.append('%sprintln("o%d%s"%s);' % (ind, self.n, hs, args))
 
     def run(self, it, fr):
         vals = []
@@ -1676,16 +1677,16 @@ class InoutBlock(S_):
 
 class CloBlock(S_):
     """A block with a closure and its calls:
-    'let'  { let f = || obs(x) + k; println(f"oN {f()} {f()}"); }
-    'var'  { var f = || { x.v += k; x.v }; println(f"oN {f()} {f()}"); }
-    'sink' { let f = sink || x.v + k; println(f"oN {f()}"); }   x moves in
+    'let'  { let f = || obs(x) + k; println("oN {} {}", f(), f()); }
+    'var'  { var f = || { x.v += k; x.v }; println("oN {} {}", f(), f()); }
+    'sink' { let f = sink || x.v + k; println("oN {}", f()); }   x moves in
     'twice' twice(|a: i64| { x.v += a * k; });
     (0.25.3, --closure-params: x moves in, as the closure's argument)
-    'param' { let f = |t: sink T| obs(t) + k; println(f"oN {f(x)}"); }
-    'pass'  { let f = |t: sink T| t; let y = f(x); println(f"oN {obs(y)}"); }
+    'param' { let f = |t: sink T| obs(t) + k; println("oN {}", f(x)); }
+    'pass'  { let f = |t: sink T| t; let y = f(x); println("oN {}", obs(y)); }
     'cond'  { let f = |t: sink T| if t.v > k { eat(t) } else { obs(t) + k }; .. }
-    'bound' { let r = feed(|t| obs(t) + k, x); println(f"oN {r}"); }
-    'map'   { let r = Some(x).map(|t| t.v + k).unwrap_or(0); println(f"oN {r}"); }"""
+    'bound' { let r = feed(|t| obs(t) + k, x); println("oN {r}"); }
+    'map'   { let r = Some(x).map(|t| t.v + k).unwrap_or(0); println("oN {r}"); }"""
     def __init__(self, kind, p, k, n, fname):
         self.kind = kind
         self.p = p
@@ -1697,21 +1698,21 @@ class CloBlock(S_):
         x = self.p.code()
         f = self.f
         if self.kind == 'let':
-            out.append('%s{ let %s = || obs(%s) + %d; println(f"o%d {%s()} {%s()}"); }' % (ind, f, x, self.k, self.n, f, f))
+            out.append('%s{ let %s = || obs(%s) + %d; println("o%d {} {}", %s(), %s()); }' % (ind, f, x, self.k, self.n, f, f))
         elif self.kind == 'var':
-            out.append('%s{ var %s = || { %s.v += %d; %s.v }; println(f"o%d {%s()} {%s()}"); }' % (ind, f, x, self.k, x, self.n, f, f))
+            out.append('%s{ var %s = || { %s.v += %d; %s.v }; println("o%d {} {}", %s(), %s()); }' % (ind, f, x, self.k, x, self.n, f, f))
         elif self.kind == 'sink':
-            out.append('%s{ let %s = sink || %s.v + %d; println(f"o%d {%s()}"); }' % (ind, f, x, self.k, self.n, f))
+            out.append('%s{ let %s = sink || %s.v + %d; println("o%d {}", %s()); }' % (ind, f, x, self.k, self.n, f))
         elif self.kind == 'param':
-            out.append('%s{ let %s = |t: sink T| obs(t) + %d; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.n, f, x))
+            out.append('%s{ let %s = |t: sink T| obs(t) + %d; println("o%d {}", %s(%s)); }' % (ind, f, self.k, self.n, f, x))
         elif self.kind == 'pass':
-            out.append('%s{ let %s = |t: sink T| t; let %s_y = %s(%s); println(f"o%d {obs(%s_y)}"); }' % (ind, f, f, f, x, self.n, f))
+            out.append('%s{ let %s = |t: sink T| t; let %s_y = %s(%s); println("o%d {}", obs(%s_y)); }' % (ind, f, f, f, x, self.n, f))
         elif self.kind == 'cond':
-            out.append('%s{ let %s = |t: sink T| if t.v > %d { eat(t) } else { obs(t) + %d }; println(f"o%d {%s(%s)}"); }' % (ind, f, self.k, self.k, self.n, f, x))
+            out.append('%s{ let %s = |t: sink T| if t.v > %d { eat(t) } else { obs(t) + %d }; println("o%d {}", %s(%s)); }' % (ind, f, self.k, self.k, self.n, f, x))
         elif self.kind == 'bound':
-            out.append('%s{ let %s = feed(|t| obs(t) + %d, %s); println(f"o%d {%s}"); }' % (ind, f, self.k, x, self.n, f))
+            out.append('%s{ let %s = feed(|t| obs(t) + %d, %s); println("o%d {}", %s); }' % (ind, f, self.k, x, self.n, f))
         elif self.kind == 'map':
-            out.append('%s{ let %s = Some(%s).map(|t| t.v + %d).unwrap_or(0); println(f"o%d {%s}"); }' % (ind, f, x, self.k, self.n, f))
+            out.append('%s{ let %s = Some(%s).map(|t| t.v + %d).unwrap_or(0); println("o%d {}", %s); }' % (ind, f, x, self.k, self.n, f))
         else:
             out.append('%stwice(|a: i64| { %s.v += a * %d; });' % (ind, x, self.k))
 
@@ -1746,7 +1747,7 @@ class CloBlock(S_):
 
 
 class ForEachObs(S_):
-    """`for x in w { print(f" {x.id}:{x.v}"); }` and a newline: a loop
+    """`for x in w { print(" {}:{}", x.id, x.v); }` and a newline: a loop
     over the borrowed elements."""
     def __init__(self, p, n):
         self.p = p
@@ -1754,7 +1755,7 @@ class ForEachObs(S_):
 
     def emit(self, out, ind):
         out.append('%sprint("o%d");' % (ind, self.n))
-        out.append('%sfor x in %s { print(f" {x.id}:{x.v}"); }' % (ind, self.p.code()))
+        out.append('%sfor x in %s { print(" {}:{}", x.id, x.v); }' % (ind, self.p.code()))
         out.append('%sprintln("");' % ind)
 
     def run(self, it, fr):
@@ -1854,7 +1855,7 @@ enum E { One(T), Two(T, T), Nada }
 struct G { t: T, k: i64 }
 
 impl Drop for G {
-    fn drop(inout self) { println(f"dg{self.k} {self.t.id}"); }
+    fn drop(inout self) { println("dg{} {}", self.k, self.t.id); }
 }
 
 struct Pt { x: i64, y: i64 }

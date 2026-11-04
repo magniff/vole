@@ -28,8 +28,8 @@ called `conv.rust` with the vole spelling on its `try:` line.
 | `*r += 1` through a `&mut` | `r += 1`: an `inout` is used as the value; `*` is only for raw pointers | 4, 15 |
 | lifetimes, `'a` | none: the compiler infers what each function's result views | 4 |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: values, a `Vec` and indices, or raw memory in `unsafe` | 8 |
-| `Vec::new()`, `String::new()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `to_string_in(f"..", gpa)`: allocation is explicit | 8 |
-| `println!`, `vec!`, `assert!`, macros | `println(f"{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
+| `Vec::new()`, `String::new()`, `format!` | `Vec::new_in(gpa)`, `String::new_in(gpa)`, `to_string_in(format_args(".."), gpa)`: allocation is explicit | 8 |
+| `println!`, `vec!`, `assert!`, macros | `println("{x}")`, `assert(c)`, `assert_eq(a, b)`; there are no macros | 1, 13 |
 | `dyn Trait`, `impl Trait` arguments, `where` | generics: `fn f<T: Trait>(x: T)` | 9 |
 | overflow panics in debug builds | integers always wrap; `x / 0` is 0 | 3 |
 | `char`, `'a'` | no `char` yet: `'a'` is a `u8`; a code point is a `u32` | 7 |
@@ -61,7 +61,7 @@ fn bump(n: &mut i64) {
 fn main() {
     let mut x = 1;
     bump(&mut x);
-    println(f"{x}");
+    println("{x}");
 }
 ```
 
@@ -69,7 +69,7 @@ Every Rust spelling in it is an error, and every error has an exact fix.
 `volec fix --only conventions` makes them all at once:
 
 ```console
-$ printf '%s\n' 'fn bump(n: &mut i64) {' '    *n += 1;' '}' '' 'fn main() {' '    let mut x = 1;' '    bump(&mut x);' '    println(f"{x}");' '}' > bump.vl
+$ printf '%s\n' 'fn bump(n: &mut i64) {' '    *n += 1;' '}' '' 'fn main() {' '    let mut x = 1;' '    bump(&mut x);' '    println("{x}");' '}' > bump.vl
 $ volec fix --only conventions bump.vl
 fixed 1 parameter to inout, 1 '&mut e' to '&e', 1 '*r' of an access, 1 'let mut' / 'mut x' to var	bump.vl	+4 -4 lines
 $ cat bump.vl
@@ -80,7 +80,7 @@ fn bump(n: inout i64) {
 fn main() {
     var x = 1;
     bump(&x);
-    println(f"{x}");
+    println("{x}");
 }
 $ volec bump.vl -o bump
 ok: built bump
@@ -142,17 +142,17 @@ fn main(gpa: Gpa) {
     var v: Vec<i32> = Vec::new_in(gpa); // freed when main ends: no free()
     v.push(2147483647);
     v.push(1);
-    println(f"{sum(v.as_slice())} {v.len()}");
+    println("{} {}", sum(v.as_slice()), v.len());
     let zero = v.len() - 2;
-    println(f"{7 / zero} {7 % zero}");
-    println(f"{v[2]}");
+    println("{} {}", 7 / zero, 7 % zero);
+    println("{}", v[2]);
 }
 ```
 
 ```out exit=101
 -2147483648 2
 0 7
-c.vl:17:16: index out of bounds: index 2, length 2
+c.vl:17:19: index out of bounds: index 2, length 2
 ```
 
 > **If you know C++:** there are no constructors, no inheritance, no
@@ -230,8 +230,8 @@ fn sum_of_squares(words: [str], gpa: Gpa) -> Result<i64, str> {
 fn main(gpa: Gpa) {
     let good: [str; 3] = ["1", "2", "3"];
     let bad: [str; 2] = ["1", "two"];
-    println(f"{sum_of_squares(good, gpa):?}");
-    println(f"{sum_of_squares(bad, gpa):?}");
+    println("{:?}", sum_of_squares(good, gpa));
+    println("{:?}", sum_of_squares(bad, gpa));
 }
 ```
 
@@ -276,13 +276,13 @@ fn main(gpa: Gpa) {
     a.push(1);
     var b = a;
     b.push(2);
-    println(f"{a.len()} {b.len()}");
+    println("{} {}", a.len(), b.len());
 }
 ```
 
 ```err
 error[own.moved]: 'a' is used here after it moved at 4:13
- --> main.vl: line 6, column 16
+ --> main.vl: line 6, column 22
   = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'
   = try: volec edit patch main.vl:4 --old 'var b = a;' --new 'var b = a.clone();'
 ```
@@ -296,7 +296,7 @@ fn main(gpa: Gpa) {
     a.push(1);
     var b = a.clone();
     b.push(2);
-    println(f"{a.len()} {b.len()}");
+    println("{} {}", a.len(), b.len());
 }
 ```
 

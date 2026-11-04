@@ -192,7 +192,7 @@ fn main() {
     hit(c);
     let arr = [Cell::new(1), Cell::new(2)];
     for x in arr { x.set(x.get() * 10); }
-    println(f"{c.hits.get()} {arr[1].get()}");
+    println("{} {}", c.hits.get(), arr[1].get());
 }
 ```
 ```out

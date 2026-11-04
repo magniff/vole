@@ -524,12 +524,12 @@ var v: Vec<i64> = Vec::new_in(gpa);
 var add = |x: i64| v.push(x);
 add(1);
 add(2);                    // fine: only add touches v
-println(f"{v.len()}");     // fine: add's last use is above
+println("{}", v.len());     // fine: add's last use is above
 
 var n = 0;
 var f = || { n += 10; };
 f();
-println(f"{n}");           // own.conflict: 'n' is read while 'f' holds
+println("{n}");           // own.conflict: 'n' is read while 'f' holds
 f();                       // it inout; 'f' is used here
 ```
 
@@ -1011,15 +1011,15 @@ fn main(gpa: Gpa) -> i32 {
         seen.insert(name, qty);
     }
     items.sort_by(|a, b| b.qty - a.qty);       // a, b: &Item
-    for (i, it) in items.iter().enumerate() { print(f"{i}:{it.name} "); }
+    for (i, it) in items.iter().enumerate() { print("{i}:{} ", it.name); }
     let line = trim(sc.next_line().unwrap());
     let total = split_in(line, ',', gpa).iter()
         .map(|w| parse_int(trim(w)).unwrap_or(0)).sum();
     match seen.get("pen") {
-        Some(q) => println(f"pen={q} total={total}"),
+        Some(q) => println("pen={q} total={total}"),
         None => println("no pen"),
     }
-    let text = format_in(f"{items.len()} {seen.len()}", gpa);
+    let text = format_in("{} {}", items.len(), seen.len(), gpa);
     println(text.as_slice());
     0
 }
@@ -1045,15 +1045,15 @@ fn main(gpa: Gpa) -> i32 {
         seen.insert(name, qty);
     }
     items.sort_by(|a, b| b.qty - a.qty);       // a, b: let Item
-    for (i, it) in items.iter().enumerate() { print(f"{i}:{it.name} "); }
+    for (i, it) in items.iter().enumerate() { print("{i}:{} ", it.name); }
     let line = trim(sc.next_line().unwrap());
     let total = split_in(line, ',', gpa).iter()
         .map(|w| parse_int(trim(w)).unwrap_or(0)).sum();
     match seen.get("pen") {
-        Some(q) => println(f"pen={q} total={total}"),
+        Some(q) => println("pen={q} total={total}"),
         None => println("no pen"),
     }
-    let text = format_in(f"{items.len()} {seen.len()}", gpa);
+    let text = format_in("{} {}", items.len(), seen.len(), gpa);
     println(text.as_slice());
     0
 }
@@ -1099,7 +1099,7 @@ fn main(gpa: Gpa) {
     parse(toks[..], &mut q);
     let r = &mut q;
     r.names.push("y");
-    println(f"{count(&q)}");
+    println("{}", count(&q));
 }
 ```
 
@@ -1136,7 +1136,7 @@ fn main(gpa: Gpa) {
     parse(toks[..], &q);
     inout r = &q;
     r.names.push("y");
-    println(f"{count(q)}");
+    println("{}", count(q));
 }
 ```
 
@@ -1169,7 +1169,7 @@ fn main(gpa: Gpa) {
     let mut sum = 0;
     report(&a, &mut sum);
     report(&b, &mut sum);
-    println(f"{sum} {a.log.len()}");
+    println("{sum} {}", a.log.len());
 }
 ```
 
@@ -1196,7 +1196,7 @@ fn main(gpa: Gpa) {
     var sum = 0;
     report(a, &sum);
     report(b, &sum);
-    println(f"{sum} {a.log.len()}");
+    println("{sum} {}", a.log.len());
 }
 ```
 

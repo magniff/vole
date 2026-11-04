@@ -38,7 +38,7 @@ impl Tree {
         while i < self.sizes.len() as i64 { s += self.sizes[i]; i += 1; }
         s
     }
-    fn show(self) { println(f"{self.sum()} {self.sizes.len()}"); }
+    fn show(self) { println("{} {}", self.sum(), self.sizes.len()); }
 }
 
 struct Holder { t: Tree, tag: i64 }
@@ -74,7 +74,7 @@ ARGS = [
     ("size(leaf_of(gpa, 1)) + slen(name_of(gpa, 2))", 3),
     ("leaf_of(gpa, 4).count()", 4),
     ("glen(vec_of(gpa, 5))", 5),
-    ('slen(to_string_in(f"ab{size(leaf_of(gpa, 2))}", gpa))', 3),
+    ('slen(to_string_in(format_args("ab{}", size(leaf_of(gpa, 2))), gpa))', 3),
     ("apply(|x: i64| x + size(leaf_of(gpa, 2)), 4)", 6),
     ("Leaf { opts: vec_of(gpa, 2) }.count()", 2),
     ("slen(name_of(gpa, size(leaf_of(gpa, 2))))", 2),
@@ -116,7 +116,7 @@ def stmts(mode, call):
         # h.t = h.t.m(A)
         if mode != "sink":
             body = (f"var h = Holder {{ t: tree_of(gpa), tag: 5 }};\nh.t = {c('h.t', a)};\n"
-                    f"h.t.show();\nprintln(f\"{{h.tag}}\");")
+                    f"h.t.show();\nprintln(\"{{}}\", h.tag);")
             out.append((f"field{ai}", body, [result([av]), "5"]))
         # ts[0] = ts[0].m(A)
         if mode != "sink":
@@ -173,7 +173,7 @@ struct Bag<T> { items: Vec<T>, n: i64 }
 impl<T> Bag<T> {
     fn put_s(sink self, x: sink T, w: i64) -> Bag<T> { self.items.push(x); self.n += w; self }
     fn put_i(inout self, x: sink T, w: i64) -> i64 { self.items.push(x); self.n += w; self.n }
-    fn show(self) { println(f"{self.items.len()} {self.n}"); }
+    fn show(self) { println("{} {}", self.items.len(), self.n); }
 }
 
 fn bag_put<T>(b: sink Bag<T>, x: sink T, w: i64) -> Bag<T> { b.items.push(x); b.n += w; b }
@@ -182,7 +182,7 @@ GEN = [
     ("Vec::<i64>::new_in(gpa)", "size(leaf_of(gpa, 2))", "size(leaf_of(gpa, 3))", 0),
     ("Vec::<String>::new_in(gpa)", "name_of(gpa, 2)", "slen(name_of(gpa, 3))", 0),
     ("Vec::<Leaf>::new_in(gpa)", "grow(leaf_of(gpa, 1), gpa)", "leaf_of(gpa, 3).count()", 0),
-    ("Vec::<String>::new_in(gpa)", 'to_string_in(f"{size(leaf_of(gpa, 2))}", gpa)',
+    ("Vec::<String>::new_in(gpa)", 'to_string_in(format_args("{}", size(leaf_of(gpa, 2))), gpa)',
      "apply(|x: i64| x + slen(name_of(gpa, 1)), 2)", 0),
 ]
 gcases = []
@@ -197,7 +197,7 @@ for gi, (new, x, w, _) in enumerate(GEN):
     gcases.append((f"chain{gi}", f"{mk}\nb = b.put_s({x}, {w}).put_s({x}, size(leaf_of(gpa, 1)));\nb.show();",
                    [f"2 {wv + 1}"]))
     gcases.append((f"let{gi}", f"{mk}\nlet c = b.put_s({x}, {w});\nc.show();", [f"1 {wv}"]))
-    gcases.append((f"io{gi}", f"{mk}\nlet k = b.put_i({x}, {w});\nprintln(f\"{{k}}\");\nb.show();",
+    gcases.append((f"io{gi}", f"{mk}\nlet k = b.put_i({x}, {w});\nprintln(\"{{k}}\");\nb.show();",
                    [f"{wv}", f"1 {wv}"]))
     gcases.append((f"other{gi}", f"{mk}\nvar c = Bag {{ items: {new}, n: 9 }};\nc = b.put_s({x}, {w});\nc.show();",
                    [f"1 {wv}"]))
