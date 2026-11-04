@@ -25,30 +25,27 @@
 // until T3's inferred summaries replace the fallback. Findings inside
 // std's own functions are not reported (std is trusted code; T4).
 
-use crate::base::{IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::diag::{buf_position, buf_tool_command};
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
+use crate::front::own::ctx::OwnCx;
 use crate::front::own::diag::{
     OWN_CONFLICT, OWN_ESCAPE, OWN_READONLY, OWN_STATIC, own_begin, own_bytes, own_end, own_help,
     own_pos, own_soft, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::kinds::{P_MUT, is_owned_type, is_view_type, param_mode};
 use crate::front::own::state::{
-    CUR, DEREF_FIELD, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY,
-    PE_INVALID, PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID,
-    PL_RKIND, POOL, POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT,
-    TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place,
-    is_empty, l1, l2, local_place, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner,
-    ov_or, root_of, root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+    DEREF_FIELD, F_INVALID, F_SCOPE, F_STATIC, PE, PE_BY, PE_INVALID, PE_KIND, PE_OV, PK_NONE,
+    PK_RAW, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, TUPLE_FIELD, any_and, at, child_place, clear_bit,
+    field_number, get_bit, is_deref_place, is_empty, l1, l2, local_place, mark_place, new_ov,
+    or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of, root_place, set_bit, slot_for,
+    slot_of_local, slot_of_place, slot_off,
 };
 use crate::front::own::summary::{closure_param, env_param};
-use crate::front::own::walk::{
-    BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
-    W_MUT_BORROW,
-};
+use crate::front::own::walk::{W_DROP, W_MOVE, W_MUT_BORROW};
 use crate::front::types::{FNS, REF_MUT, REF_SHARED, STATICS, TYPES, TyKind};
 
 // ---------------------------------------------------------------------------
@@ -72,60 +69,39 @@ pub const H_GLOBAL: i64 = 7;
 pub const H_SCOPE: i64 = 8;
 pub const H_PARENT: i64 = 9;
 
-// The nodes reported in this walk (one finding per node), whether any
-// slot holds a `&mut` loan, a reference, or a parent; whether findings
-// are reported (not in std's own functions).
-static var REPORTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var ANY_MUT: bool = false;
-static var ANY_REF: bool = false;
-static var ANY_CHILD: bool = false;
-pub static var QUIET: bool = false;
-// Per slot (this walk, not per state): the pattern that last bound it, the
-// expression it was bound to (0: none).
-static var SLOT_BIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var SLOT_INIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var SYM_FOR_SEQ: i64 = 0;
-
-// Per local: 1 bound by the checker, 2 by the program (note_binding).
-static var GEN: *u8 = 0 as *u8;
-static var GEN_CAP: i64 = 0;
-// The last read (on_read): the place, the node.
-static var LAST_READ_NODE: i64 = 0;
-static var LAST_READ_PLACE: i64 = -1;
-
-fn slot_note(s: i64, bind: i64, init: i64) {
+fn slot_note(s: i64, bind: i64, init: i64, ocx: inout OwnCx) {
     unsafe {
-        while SLOT_BIND.count <= s {
-            SLOT_BIND.push(0);
-            SLOT_INIT.push(0);
+        while ocx.slot_bind.count <= s {
+            ocx.slot_bind.push(0);
+            ocx.slot_init.push(0);
         }
         if bind >= 0 {
-            SLOT_BIND.data[s] = bind;
+            ocx.slot_bind.data[s] = bind;
         }
         if init >= 0 {
-            SLOT_INIT.data[s] = init;
+            ocx.slot_init.data[s] = init;
         }
     }
 }
 
-fn slot_bind(s: i64) -> i64 {
-    unsafe { if s < SLOT_BIND.count { SLOT_BIND.data[s] } else { 0 } }
+fn slot_bind(s: i64, ocx: OwnCx) -> i64 {
+    unsafe { if s < ocx.slot_bind.count { ocx.slot_bind.data[s] } else { 0 } }
 }
 
-fn slot_init(s: i64) -> i64 {
-    unsafe { if s < SLOT_INIT.count { SLOT_INIT.data[s] } else { 0 } }
+fn slot_init(s: i64, ocx: OwnCx) -> i64 {
+    unsafe { if s < ocx.slot_init.count { ocx.slot_init.data[s] } else { 0 } }
 }
 
 // Whether node n was reported in this walk; marks it.
-pub fn seen(n: i64) -> bool {
+pub fn seen(n: i64, ocx: inout OwnCx) -> bool {
     unsafe {
         let key = NODES[n].start * 16 + 1;
-        for i in 0..REPORTED.count {
-            if REPORTED.data[i] == key {
+        for i in 0..ocx.views_reported.count {
+            if ocx.views_reported.data[i] == key {
                 return true;
             }
         }
-        REPORTED.push(key);
+        ocx.views_reported.push(key);
         false
     }
 }
@@ -138,19 +114,30 @@ fn is_ptr(t: i64) -> bool {
 }
 
 // Whether a value of type t holds an exclusive loan (kinds::holds_inout).
-pub fn holds_mut(t: i64, depth: i64) -> bool {
-    depth <= 3 && crate::front::own::kinds::holds_inout(t)
+pub fn holds_mut(t: i64, depth: i64, ocx: inout OwnCx) -> bool {
+    if depth > 3 || t <= 0 {
+        return false;
+    }
+    let k = t & 63;
+    if ocx.hm_gen[k] == ocx.hm_now && ocx.hm_type[k] == t {
+        return ocx.hm_val[k];
+    }
+    let v = crate::front::own::kinds::holds_inout(t);
+    ocx.hm_type[k] = t;
+    ocx.hm_gen[k] = ocx.hm_now;
+    ocx.hm_val[k] = v;
+    v
 }
 
 // The flags a slot of local l starts with.
-fn start_flags(l: i64) -> i64 {
+fn start_flags(l: i64, ocx: inout OwnCx) -> i64 {
     unsafe {
         let t = LOCALS[l].ty;
         if is_ptr(t) {
-            ANY_REF = true;
+            ocx.any_ref = true;
         }
-        if holds_mut(t, 0) {
-            ANY_MUT = true;
+        if holds_mut(t, 0, &ocx) {
+            ocx.any_mut = true;
             return F_MUTLOAN;
         }
         0
@@ -159,15 +146,15 @@ fn start_flags(l: i64) -> i64 {
 
 // Whether slot local l is a reference (its places are paths into what it
 // points to).
-fn is_ref_slot(s: i64) -> bool {
-    unsafe { is_ptr(LOCALS[SLOT_LOCAL.data[s]].ty) }
+fn is_ref_slot(s: i64, ocx: OwnCx) -> bool {
+    unsafe { is_ptr(LOCALS[ocx.slot_local.data[s]].ty) }
 }
 
 // ---------------------------------------------------------------------------
 // Invalidation
 
 // Whether slot a is s or an ancestor of s (by reborrow).
-fn is_slot_ancestor(a: i64, s: i64) -> bool {
+fn is_slot_ancestor(a: i64, s: i64, ocx: OwnCx) -> bool {
     unsafe {
         if s < 0 {
             return false;
@@ -178,7 +165,7 @@ fn is_slot_ancestor(a: i64, s: i64) -> bool {
             if p == a {
                 return true;
             }
-            p = SLOT_PARENT.data[p];
+            p = ocx.slot_parent.data[p];
             steps += 1;
         }
         false
@@ -188,29 +175,29 @@ fn is_slot_ancestor(a: i64, s: i64) -> bool {
 // Mask m (NW words, already expanded) also covers the paths under every
 // reference whose referent it reaches: a write to x reaches `r.f` for
 // `let r = &mut x`.
-pub fn close_mask(m: *i64) {
+pub fn close_mask(m: *i64, ocx: inout OwnCx) {
     unsafe {
-        if !ANY_REF {
+        if !ocx.any_ref {
             return;
         }
         var round = 0;
         var grew = true;
         while grew && round < 4 {
             grew = false;
-            for s in 0..NSLOT {
-                if !is_ref_slot(s) {
+            for s in 0..ocx.nslot {
+                if !is_ref_slot(s, ocx) {
                     continue;
                 }
-                let l = SLOT_LOCAL.data[s];
-                if l >= LOC_CAP || LOC_PL[l] == 0 {
+                let l = ocx.slot_local.data[s];
+                if l >= ocx.loc_cap || ocx.loc_pl[l] == 0 {
                     continue;
                 }
-                let lp = LOC_PL[l] - 1;
+                let lp = ocx.loc_pl[l] - 1;
                 if get_bit(m, lp) {
                     continue;
                 }
-                if any_and(l1(slot_off(CUR, s)), m) {
-                    or_into(m, &PL_MASK[lp * NW]);
+                if any_and(l1(slot_off(ocx.cur, s, ocx), &ocx), m, ocx) {
+                    or_into(m, &ocx.pl_mask[lp * ocx.nw], ocx);
                     grew = true;
                 }
             }
@@ -222,41 +209,41 @@ pub fn close_mask(m: *i64) {
 // Invalidates the slots viewing a place of mask m (how: H_*, reason: the
 // node, or -(l + 1) for local l's scope end), except slot `except` and
 // its ancestors; and the pending arguments PEND[..pend_end] viewing one.
-pub fn invalidate(m: *i64, reason: i64, how: i64, except: i64, pend_end: i64) {
+pub fn invalidate(m: *i64, reason: i64, how: i64, except: i64, pend_end: i64, ocx: inout OwnCx) {
     unsafe {
-        for s in 0..NSLOT {
-            if except >= 0 && is_slot_ancestor(s, except) {
+        for s in 0..ocx.nslot {
+            if except >= 0 && is_slot_ancestor(s, except, ocx) {
                 continue;
             }
-            let off = slot_off(CUR, s);
-            if !ov_hits(off, m) {
+            let off = slot_off(ocx.cur, s, ocx);
+            if !ov_hits(off, m, &ocx) {
                 continue;
             }
-            let fl = off + OV;
-            if (POOL[fl] & F_INVALID) == 0 {
-                POOL[fl + 1] = reason;
-                POOL[fl] = (POOL[fl] & ~(15 << HOW_SHIFT) & ~(1023 << HIT_SHIFT))
+            let fl = off + ocx.ov;
+            if (ocx.pool[fl] & F_INVALID) == 0 {
+                ocx.pool[fl + 1] = reason;
+                ocx.pool[fl] = (ocx.pool[fl] & ~(15 << HOW_SHIFT) & ~(1023 << HIT_SHIFT))
                     | (how << HOW_SHIFT) | F_INVALID;
-                let hit = first_place(off, m);
+                let hit = first_place(off, m, &ocx);
                 if hit >= 0 && hit < 1023 {
-                    POOL[fl] |= (hit + 1) << HIT_SHIFT;
+                    ocx.pool[fl] |= (hit + 1) << HIT_SHIFT;
                 }
                 if how == H_GLOBAL {
-                    POOL[fl] |= F_STATIC;
+                    ocx.pool[fl] |= F_STATIC;
                 }
                 if how == H_SCOPE || how == H_DROP {
-                    POOL[fl] |= F_SCOPE;
+                    ocx.pool[fl] |= F_SCOPE;
                 }
             }
         }
         var e = 0;
         while e < pend_end {
-            let k = PEND.data[e + PE_KIND];
-            let o = PEND.data[e + PE_OV];
-            if k != PK_NONE && k != PK_RAW && o >= 0 && PEND.data[e + PE_INVALID] == 0
-                && ov_hits(o, m) {
-                PEND.data[e + PE_INVALID] = how;
-                PEND.data[e + PE_BY] = reason;
+            let k = ocx.pend.data[e + PE_KIND];
+            let o = ocx.pend.data[e + PE_OV];
+            if k != PK_NONE && k != PK_RAW && o >= 0 && ocx.pend.data[e + PE_INVALID] == 0
+                && ov_hits(o, m, &ocx) {
+                ocx.pend.data[e + PE_INVALID] = how;
+                ocx.pend.data[e + PE_BY] = reason;
             }
             e += PE;
         }
@@ -264,17 +251,18 @@ pub fn invalidate(m: *i64, reason: i64, how: i64, except: i64, pend_end: i64) {
 }
 
 // Invalidates what a write to place p reaches.
-fn write_place(p: i64, n: i64, how: i64, except: i64) {
+fn write_place(p: i64, n: i64, how: i64, except: i64, ocx: inout OwnCx) {
     unsafe {
-        let m = new_ov();
-        or_into(at(m), &PL_MASK[p * NW]);
-        close_mask(at(m));
+        let m = new_ov(&ocx);
+        or_into(at(m, &ocx), &ocx.pl_mask[p * ocx.nw], ocx);
+        close_mask(at(m, &ocx), &ocx);
         // (a drop is never one of a call's own arguments changing what an
         // earlier one borrows: the locals a scope drops inside an argument
         // were declared there, after the pending ones; a jump out of the
         // argument, `?` or `return`, drops the older ones but skips the call)
-        invalidate(at(m), n, how, except, if how == H_DROP { 0 } else { PEND.count });
-        POOL_TOP = m;
+        invalidate(at(m, &ocx), n, how, except, if how == H_DROP { 0 } else { ocx.pend.count },
+            &ocx);
+        ocx.pool_top = m;
     }
 }
 
@@ -283,52 +271,52 @@ fn write_place(p: i64, n: i64, how: i64, except: i64) {
 
 // (0.25) The statement ends: the temporaries made in it since
 // walk::TEMPS[mark..] die; a later use of a view of one is own.escape.
-pub fn kill_temps(mark: i64) {
+pub fn kill_temps(mark: i64, ocx: inout OwnCx) {
     unsafe {
-        let n = crate::front::own::walk::TEMPS.count;
+        let n = ocx.temps.count;
         if n <= mark {
             return;
         }
-        let m = new_ov();
+        let m = new_ov(&ocx);
         for i in mark..n {
-            or_into(at(m), &PL_MASK[crate::front::own::walk::TEMPS.data[i] * NW]);
+            or_into(at(m, &ocx), &ocx.pl_mask[ocx.temps.data[i] * ocx.nw], ocx);
         }
-        close_mask(at(m));
-        let first = crate::front::own::walk::TEMPS.data[mark];
-        invalidate(at(m), PL_RID[first], H_DROP, -1, 0);
-        POOL_TOP = m;
-        crate::front::own::walk::TEMPS.count = mark;
+        close_mask(at(m, &ocx), &ocx);
+        let first = ocx.temps.data[mark];
+        invalidate(at(m, &ocx), ocx.pl_rid[first], H_DROP, -1, 0, &ocx);
+        ocx.pool_top = m;
+        ocx.temps.count = mark;
     }
 }
 
 // (0.25) Slot s's value now holds what origin v views: at both levels
 // (where in it is not known), minus loans on s's own local.
-pub fn store_deep(s: i64, v: i64) {
+pub fn store_deep(s: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
         if s < 0 || v < 0 {
             return;
         }
-        let m = new_ov();
-        crate::front::own::calls::deep_into(m, v);
-        let own = local_place(SLOT_LOCAL.data[s]);
-        for q in 0..PL_COUNT {
-            if own >= 0 && root_of(q) == own {
-                clear_bit(l1(m), q);
-                clear_bit(l2(m), q);
+        let m = new_ov(&ocx);
+        crate::front::own::calls::deep_into(m, v, &ocx);
+        let own = local_place(ocx.slot_local.data[s], &ocx);
+        for q in 0..ocx.pl_count {
+            if own >= 0 && root_of(q, ocx) == own {
+                clear_bit(l1(m, &ocx), q);
+                clear_bit(l2(m, &ocx), q);
             }
         }
-        let so = slot_off(CUR, s);
-        let lt = LOCALS[SLOT_LOCAL.data[s]].ty;
+        let so = slot_off(ocx.cur, s, ocx);
+        let lt = LOCALS[ocx.slot_local.data[s]].ty;
         if is_ptr(lt) || lt > 0 && TYPES[lt].kind == TyKind::Slice {
             // (a reference, a slice: its level 1 is what it points to, and
             // a write through it writes that; what is stored is held there)
-            or_into(l2(so), l1(m));
-            or_into(l2(so), l2(m));
+            or_into(l2(so, &ocx), l1(m, &ocx), ocx);
+            or_into(l2(so, &ocx), l2(m, &ocx), ocx);
         } else {
-            or_into(l1(so), l1(m));
-            or_into(l2(so), l2(m));
+            or_into(l1(so, &ocx), l1(m, &ocx), ocx);
+            or_into(l2(so, &ocx), l2(m, &ocx), ocx);
         }
-        POOL_TOP = m;
+        ocx.pool_top = m;
     }
 }
 
@@ -336,7 +324,7 @@ pub fn store_deep(s: i64, v: i64) {
 // on (the locals at its level 1: `r = &mut v; r.push(w)`, a match's `&`
 // binding, `m = v.as_mut_slice(); m[0] = w`): each holds v too, at both
 // levels; through references to references, a few deep.
-pub fn store_through_loans(s: i64, v: i64, depth: i64) {
+pub fn store_through_loans(s: i64, v: i64, depth: i64, ocx: inout OwnCx) {
     unsafe {
         if s < 0 || v < 0 || depth > 4 {
             return;
@@ -344,25 +332,25 @@ pub fn store_through_loans(s: i64, v: i64, depth: i64) {
         // (only a reference or a slice points to what it stores into: the
         // level 1 of an owned container, a Vec<[u8]>, is what its elements
         // view, not where a store into it goes)
-        let lt = LOCALS[SLOT_LOCAL.data[s]].ty;
+        let lt = LOCALS[ocx.slot_local.data[s]].ty;
         if !(is_ptr(lt) || lt > 0 && TYPES[lt].kind == TyKind::Slice) {
             return;
         }
-        let so = slot_off(CUR, s);
-        for p in 0..PL_COUNT {
-            if !get_bit(l1(so), p) {
+        let so = slot_off(ocx.cur, s, ocx);
+        for p in 0..ocx.pl_count {
+            if !get_bit(l1(so, &ocx), p) {
                 continue;
             }
-            let r = root_of(p);
-            if PL_RKIND[r] != RK_LOCAL {
+            let r = root_of(p, ocx);
+            if ocx.pl_rkind[r] != RK_LOCAL {
                 continue;
             }
-            let t = slot_of_local(PL_RID[r]);
+            let t = slot_of_local(ocx.pl_rid[r], ocx);
             if t < 0 || t == s {
                 continue;
             }
-            store_deep(t, v);
-            store_through_loans(t, v, depth + 1);
+            store_deep(t, v, &ocx);
+            store_through_loans(t, v, depth + 1, &ocx);
         }
     }
 }
@@ -371,17 +359,17 @@ pub fn store_through_loans(s: i64, v: i64, depth: i64) {
 // origin o, which has no place of its own (`v[i] = w`, `v.as_mut_slice()
 // [i]`): the places at o's level 1 are written, and (v >= 0: a store of
 // origin v) the locals they belong to hold v.
-pub fn write_through_value(o: i64, n: i64, v: i64) {
+pub fn write_through_value(o: i64, n: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
         if o < 0 {
             return;
         }
-        for p in 0..PL_COUNT {
-            if !get_bit(l1(o), p) {
+        for p in 0..ocx.pl_count {
+            if !get_bit(l1(o, &ocx), p) {
                 continue;
             }
-            let r = root_of(p);
-            if PL_RKIND[r] != RK_LOCAL {
+            let r = root_of(p, ocx);
+            if ocx.pl_rkind[r] != RK_LOCAL {
                 // (the loans are the places written: a parameter's root at
                 // level 1 is what the container's own views point into, an
                 // arena a Vec<T, ScopedArena> is in, not its elements)
@@ -389,12 +377,12 @@ pub fn write_through_value(o: i64, n: i64, v: i64) {
             }
             // (written through r: a reference r, `self.v[i] = x`, stays
             // valid, as a write through it does, on_assign)
-            write_place(p, n, H_WRITE, slot_of_place(r));
+            write_place(p, n, H_WRITE, slot_of_place(r, ocx), &ocx);
             if v >= 0 {
-                let t = slot_of_local(PL_RID[r]);
+                let t = slot_of_local(ocx.pl_rid[r], ocx);
                 if t >= 0 {
-                    store_deep(t, v);
-                    store_through_loans(t, v, 1);
+                    store_deep(t, v, &ocx);
+                    store_through_loans(t, v, 1, &ocx);
                 }
             }
         }
@@ -428,17 +416,17 @@ pub fn own_src(n: i64) {
 }
 
 // The name of place p: its root (a local, a static, `*p`), then its fields.
-pub fn own_place(p: i64) {
+pub fn own_place(p: i64, ocx: OwnCx) {
     own_str(c"'");
-    put_place(p);
+    put_place(p, ocx);
     own_str(c"'");
 }
 
-fn put_place(p: i64) {
+fn put_place(p: i64, ocx: OwnCx) {
     unsafe {
-        if PL_PARENT[p] >= 0 {
-            put_place(PL_PARENT[p]);
-            let f = PL_FIELD[p];
+        if ocx.pl_parent[p] >= 0 {
+            put_place(ocx.pl_parent[p], ocx);
+            let f = ocx.pl_field[p];
             if f == DEREF_FIELD {
                 return;
             }
@@ -452,34 +440,34 @@ fn put_place(p: i64) {
             }
             return;
         }
-        let k = PL_RKIND[p];
+        let k = ocx.pl_rkind[p];
         if k == RK_LOCAL {
-            own_bytes(SYMS[LOCALS[PL_RID[p]].name].text);
+            own_bytes(SYMS[LOCALS[ocx.pl_rid[p]].name].text);
         } else if k == RK_STATIC {
-            own_bytes(SYMS[NODES[STATICS[PL_RID[p]].node].a].text);
+            own_bytes(SYMS[NODES[STATICS[ocx.pl_rid[p]].node].a].text);
         } else if k == RK_MARK {
             own_str(c"?");
         } else if k == crate::front::own::state::RK_TEMP {
             own_str(c"the temporary ");
-            own_src(PL_RID[p]);
+            own_src(ocx.pl_rid[p]);
         } else {
-            if PL_FIELD[p] == 1 {
+            if ocx.pl_field[p] == 1 {
                 own_str(c"*");
             }
-            own_bytes(SYMS[LOCALS[PL_RID[p]].name].text);
+            own_bytes(SYMS[LOCALS[ocx.pl_rid[p]].name].text);
         }
     }
 }
 
 // The first place of origin o (level 1, else 2) that is a local's, a
 // static's or a parameter's; -1.
-pub fn first_place(o: i64, m: *i64) -> i64 {
+pub fn first_place(o: i64, m: *i64, ocx: inout OwnCx) -> i64 {
     unsafe {
-        for q in 0..PL_COUNT {
-            if PL_RKIND[root_of(q)] == RK_MARK {
+        for q in 0..ocx.pl_count {
+            if ocx.pl_rkind[root_of(q, ocx)] == RK_MARK {
                 continue;
             }
-            let hit = get_bit(l1(o), q) || get_bit(l2(o), q);
+            let hit = get_bit(l1(o, &ocx), q) || get_bit(l2(o, &ocx), q);
             if hit && (m == 0 as *i64 || get_bit(m, q)) {
                 return q;
             }
@@ -525,11 +513,11 @@ fn try_query_own(n: i64) {
 }
 
 // `try: volec edit patch FN --old OLD --new NEW` in function CUR_F.
-fn try_patch(old: [u8], new: [u8]) {
+fn try_patch(old: [u8], new: [u8], ocx: OwnCx) {
     unsafe {
         let a = buf_new();
         buf_str(a, c"edit patch ");
-        buf_bytes(a, SYMS[FNS[CUR_F].display].text);
+        buf_bytes(a, SYMS[FNS[ocx.cur_f].display].text);
         buf_str(a, c" --old '");
         buf_bytes(a, old);
         buf_str(a, c"' --new '");
@@ -572,22 +560,20 @@ fn verb(how: i64) -> *u8 {
 
 // Whether the walk reports findings (not in std's own functions, nor in a
 // round the driver throws away).
-fn reporting(n: i64) -> bool {
-    !QUIET && !seen(n)
+fn reporting(n: i64, ocx: inout OwnCx) -> bool {
+    !ocx.quiet && !seen(n, &ocx)
 }
-
-static var OWN_STD: i64 = -1;
 
 // (0.22) Whether std's own functions are reported too: VOLE_OWN_STD=1
 // (tests/std_own.sh, which runs the own pass over std and fails on any
 // finding).
-fn own_std() -> bool {
+fn own_std(ocx: inout OwnCx) -> bool {
     unsafe {
-        if OWN_STD < 0 {
+        if ocx.own_std < 0 {
             let v = crate::base::getenv(c"VOLE_OWN_STD");
-            OWN_STD = if v != 0 as *u8 && v[0] == '1' { 1 } else { 0 };
+            ocx.own_std = if v != 0 as *u8 && v[0] == '1' { 1 } else { 0 };
         }
-        OWN_STD == 1
+        ocx.own_std == 1
     }
 }
 
@@ -599,27 +585,29 @@ fn own_std() -> bool {
 // user's sequence and stays. What decides is where the local was bound
 // (note_binding), never its name alone: a program's own `let __out` is
 // checked like any local.
-pub fn hidden_local(l: i64) -> bool {
-    unsafe { l >= 0 && l < GEN_CAP && GEN[l] == 1 && LOCALS[l].name != SYM_FOR_SEQ }
+pub fn hidden_local(l: i64, ocx: OwnCx) -> bool {
+    unsafe {
+        l >= 0 && l < ocx.gen_cap && ocx.gen[l] == 1 && LOCALS[l].name != ocx.views_sym_for_seq
+    }
 }
 
 // Local l is bound by node n (a pattern, a parameter): it is the
 // checker's when its name is one a program cannot write there: `=f0`, or
 // a `__` name that is not the text at n's position (the checker made the
 // binding: an f-string's block, a derived impl's text, a `for` loop).
-fn note_binding(l: i64, n: i64) {
+fn note_binding(l: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
         if l < 0 || n <= 0 {
             return;
         }
-        if l >= GEN_CAP {
+        if l >= ocx.gen_cap {
             let c = l * 2 + 1024;
             let a = crate::base::alloc_array::<u8>(c);
-            for i in 0..GEN_CAP {
-                a[i] = GEN[i];
+            for i in 0..ocx.gen_cap {
+                a[i] = ocx.gen[i];
             }
-            GEN = a;
-            GEN_CAP = c;
+            ocx.gen = a;
+            ocx.gen_cap = c;
         }
         let name = SYMS[LOCALS[l].name].text;
         var gen = false;
@@ -644,42 +632,45 @@ fn note_binding(l: i64, n: i64) {
                 i += 1;
             }
         }
-        GEN[l] = if gen { 1 } else { 2 };
+        ocx.gen[l] = if gen { 1 } else { 2 };
     }
 }
 
 // Whether place p's root is a hidden local (or one of its roots).
-pub fn hidden_place(p: i64) -> bool {
+pub fn hidden_place(p: i64, ocx: OwnCx) -> bool {
     unsafe {
         if p < 0 {
             return false;
         }
-        let r = root_of(p);
-        (PL_RKIND[r] == RK_LOCAL || PL_RKIND[r] == RK_ROOT) && hidden_local(PL_RID[r])
+        let r = root_of(p, ocx);
+        (ocx.pl_rkind[r] == RK_LOCAL || ocx.pl_rkind[r] == RK_ROOT)
+            && hidden_local(ocx.pl_rid[r], ocx)
     }
 }
 
 // Slot s, invalidated, is used at node n: the finding.
-fn report_invalid(s: i64, n: i64) {
+fn report_invalid(s: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
-        let off = slot_off(CUR, s);
-        let flags = POOL[off + OV];
-        let reason = POOL[off + OV + 1];
+        let off = slot_off(ocx.cur, s, ocx);
+        let flags = ocx.pool[off + ocx.ov];
+        let reason = ocx.pool[off + ocx.ov + 1];
         let how = (flags >> HOW_SHIFT) & 15;
-        let l = SLOT_LOCAL.data[s];
+        let l = ocx.slot_local.data[s];
         let at_node = if reason > 0 { reason } else { n };
         let hit = (flags >> HIT_SHIFT) & 1023;
-        let what = if hit > 0 { hit - 1 } else { first_place(off, 0 as *i64) };
+        let what = if hit > 0 { hit - 1 } else { first_place(off, 0 as *i64, &ocx) };
         // (0.25: a view of a statement temporary, own/drops temp_make, is
         // reported naming it)
         let temp = if how == H_SCOPE
-            || how == H_DROP { crate::front::own::drops::temp_source(what) }
+            || how == H_DROP { crate::front::own::drops::temp_source(what, ocx) }
             else { 0 };
-        if hidden_local(l) || hidden_place(what) && temp == 0 || !reporting(at_node) {
+        if hidden_local(l, ocx) || hidden_place(what, ocx) && temp == 0
+            || !reporting(at_node, &ocx) {
             return;
         }
-        let assumed = (any_and(l1(off), at_mark()) || any_and(l2(off), at_mark()));
-        if LOCALS[l].name == SYM_FOR_SEQ && reason > 0 && how != H_GLOBAL {
+        let assumed = (any_and(l1(off, &ocx), at_mark(&ocx), ocx)
+            || any_and(l2(off, &ocx), at_mark(&ocx), ocx));
+        if LOCALS[l].name == ocx.views_sym_for_seq && reason > 0 && how != H_GLOBAL {
             // (a `for` loop's sequence: §2.9 situation 4)
             own_begin(at_node, OWN_CONFLICT);
             own_src(reason);
@@ -687,7 +678,7 @@ fn report_invalid(s: i64, n: i64) {
             own_str(verb(how));
             own_str(c" the elements of ");
             if what >= 0 {
-                own_place(what);
+                own_place(what, ocx);
             } else {
                 own_str(c"the sequence");
             }
@@ -695,16 +686,16 @@ fn report_invalid(s: i64, n: i64) {
             own_pos(n);
             own_str(c" iterates over them");
             own_help(c"loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop");
-            try_for_index(n);
+            try_for_index(n, ocx);
         } else if (flags & F_STATIC) != 0 && how == H_GLOBAL {
             own_begin(at_node, OWN_STATIC);
             own_src(reason);
             own_str(c" writes statics (its effects include global) while ");
             own_sym(LOCALS[l].name);
-            put_bound_at(s);
+            put_bound_at(s, ocx);
             own_str(c" views ");
             if what >= 0 {
-                own_place(what);
+                own_place(what, ocx);
             } else {
                 own_str(c"a static");
             }
@@ -737,7 +728,7 @@ fn report_invalid(s: i64, n: i64) {
             if reason < 0 {
                 own_sym(LOCALS[0 - reason - 1].name);
             } else if what >= 0 {
-                own_place(what);
+                own_place(what, ocx);
             } else {
                 own_str(c"what it views");
             }
@@ -758,7 +749,7 @@ fn report_invalid(s: i64, n: i64) {
                 own_str(c" ");
             }
             if what >= 0 {
-                own_place(what);
+                own_place(what, ocx);
             } else {
                 own_str(c"what it views");
             }
@@ -767,7 +758,7 @@ fn report_invalid(s: i64, n: i64) {
             }
             own_str(c" while ");
             own_sym(LOCALS[l].name);
-            put_bound_at(s);
+            put_bound_at(s, ocx);
             own_str(if (flags & F_MUTLOAN) != 0 { c" has an inout access to it; " }
                 else { c" views it; " });
             own_sym(LOCALS[l].name);
@@ -782,13 +773,13 @@ fn report_invalid(s: i64, n: i64) {
             } else {
                 own_help(c"use the view before the change, keep an index instead of a view, or keep a copy");
             }
-            let init = slot_init(s);
+            let init = slot_init(s, ocx);
             if init > 0 && ends_with(src_of(init), c".as_slice()") {
                 let old = src_of(init);
                 let b = buf_new();
                 buf_bytes(b, old[0..old.len as i64 - 11]);
                 buf_str(b, c".clone()");
-                try_patch(old, buf_slice(b));
+                try_patch(old, buf_slice(b), ocx);
             }
             try_query_own(n);
         }
@@ -800,8 +791,8 @@ fn report_invalid(s: i64, n: i64) {
 }
 
 // ` (L:C)`: where slot s was bound.
-fn put_bound_at(s: i64) {
-    let b = slot_bind(s);
+fn put_bound_at(s: i64, ocx: OwnCx) {
+    let b = slot_bind(s, ocx);
     if b > 0 {
         own_str(c" (");
         own_pos(b);
@@ -810,7 +801,7 @@ fn put_bound_at(s: i64) {
 }
 
 // The `try:` of §2.9 situation 4: `for x in v {` becomes an index loop.
-fn try_for_index(n: i64) {
+fn try_for_index(n: i64, ocx: OwnCx) {
     let s = NODES[n].start;
     var e = s;
     while e < NODES[n].end && SRC[e] != '{' && SRC[e] != '\n' {
@@ -846,20 +837,18 @@ fn try_for_index(n: i64) {
     buf_str(b, c" = ");
     buf_bytes(b, seq);
     buf_str(b, c"[i];");
-    try_patch(head, buf_slice(b));
+    try_patch(head, buf_slice(b), ocx);
 }
 
-static var MARK_WORDS: i64 = -1;
-
 // A mask holding only the mark place (empty when it has none yet).
-fn at_mark() -> *i64 {
-    let m = new_ov();
-    let p = mark_place();
+fn at_mark(ocx: inout OwnCx) -> *i64 {
+    let m = new_ov(&ocx);
+    let p = mark_place(&ocx);
     if p >= 0 {
-        set_bit(at(m), p);
+        set_bit(at(m, &ocx), p);
     }
-    POOL_TOP = m;
-    at(m)
+    ocx.pool_top = m;
+    at(m, &ocx)
 }
 
 // ---------------------------------------------------------------------------
@@ -868,21 +857,21 @@ fn at_mark() -> *i64 {
 // Slot s is used at node n: an invalidated slot is the finding; a `&mut`
 // child of s ends, if it borrows what mask m covers (null: all; the place
 // read through s: a field read leaves a view of another field alive).
-pub fn use_slot(s: i64, n: i64, m: *i64) {
+pub fn use_slot(s: i64, n: i64, m: *i64, ocx: inout OwnCx) {
     unsafe {
-        let fl = slot_off(CUR, s) + OV;
-        if (POOL[fl] & F_INVALID) != 0 {
-            report_invalid(s, n);
-            POOL[fl] = POOL[fl] & ~F_INVALID;
+        let fl = slot_off(ocx.cur, s, ocx) + ocx.ov;
+        if (ocx.pool[fl] & F_INVALID) != 0 {
+            report_invalid(s, n, &ocx);
+            ocx.pool[fl] = ocx.pool[fl] & ~F_INVALID;
         }
-        if ANY_CHILD && ANY_MUT {
-            for q in 0..NSLOT {
-                if q != s && is_slot_ancestor(s, q)
-                    && (m == 0 as *i64 || any_and(l1(slot_off(CUR, q)), m)) {
-                    let qf = slot_off(CUR, q) + OV;
-                    if (POOL[qf] & F_MUTLOAN) != 0 && (POOL[qf] & F_INVALID) == 0 {
-                        POOL[qf + 1] = n;
-                        POOL[qf] = (POOL[qf] & ~(15 << HOW_SHIFT)) | (H_PARENT << HOW_SHIFT)
+        if ocx.any_child && ocx.any_mut {
+            for q in 0..ocx.nslot {
+                if q != s && is_slot_ancestor(s, q, ocx)
+                    && (m == 0 as *i64 || any_and(l1(slot_off(ocx.cur, q, ocx), &ocx), m, ocx)) {
+                    let qf = slot_off(ocx.cur, q, ocx) + ocx.ov;
+                    if (ocx.pool[qf] & F_MUTLOAN) != 0 && (ocx.pool[qf] & F_INVALID) == 0 {
+                        ocx.pool[qf + 1] = n;
+                        ocx.pool[qf] = (ocx.pool[qf] & ~(15 << HOW_SHIFT)) | (H_PARENT << HOW_SHIFT)
                             | F_INVALID;
                     }
                 }
@@ -893,92 +882,87 @@ pub fn use_slot(s: i64, n: i64, m: *i64) {
 
 // The walk starts function f, its parameters bound (walk::PARAM_LOCALS):
 // a parameter's slot views its roots (`p` at level 1, `*p` at level 2).
-pub fn on_enter(f: i64) {
+pub fn on_enter(f: i64, ocx: inout OwnCx) {
     unsafe {
-        if SYM_FOR_SEQ == 0 {
-            SYM_FOR_SEQ = crate::base::intern_c(c"__for_seq");
+        if ocx.views_sym_for_seq == 0 {
+            ocx.views_sym_for_seq = crate::base::intern_c(c"__for_seq");
         }
-        REPORTED.count = 0;
-        SLOT_BIND.count = 0;
-        SLOT_INIT.count = 0;
-        ANY_MUT = false;
-        ANY_REF = false;
-        ANY_CHILD = false;
-        CAPTURES_STORED = 0;
-        LAST_READ_NODE = 0;
-        QUIET = within_std(FNS[f].module) && !own_std();
-        for i in 0..PARAM_LOCALS.count {
-            let l = PARAM_LOCALS.data[i];
+        ocx.views_reported.count = 0;
+        ocx.slot_bind.count = 0;
+        ocx.slot_init.count = 0;
+        ocx.any_mut = false;
+        ocx.any_ref = false;
+        ocx.any_child = false;
+        ocx.captures_stored = 0;
+        ocx.last_read_node = 0;
+        ocx.quiet = within_std(FNS[f].module) && !own_std(&ocx);
+        for i in 0..ocx.param_locals.count {
+            let l = ocx.param_locals.data[i];
             if l < 0 {
                 continue;
             }
-            note_binding(l, crate::front::ast::child(FNS[f].node, i));
+            note_binding(l, crate::front::ast::child(FNS[f].node, i), &ocx);
             let t = LOCALS[l].ty;
-            var s = slot_of_local(l);
+            var s = slot_of_local(l, ocx);
             let env = env_param(f, i);
             if s < 0 && is_ptr(t) && (param_mode(f, i) == P_MUT || env)
                 && is_view_type(TYPES[t].a) {
                 // (a legacy `*T` parameter to what holds views, or a
                 // closure's env: its referent's views are tracked, for the
                 // stores)
-                s = slot_for(l, true);
+                s = slot_for(l, true, &ocx);
             }
             if s < 0 {
                 continue;
             }
-            let off = slot_off(CUR, s);
-            let a = root_place(l, false);
-            let b = root_place(l, true);
+            let off = slot_off(ocx.cur, s, ocx);
+            let a = root_place(l, false, &ocx);
+            let b = root_place(l, true, &ocx);
             if a >= 0 {
-                set_bit(l1(off), a);
+                set_bit(l1(off, &ocx), a);
             }
             if b >= 0 {
-                set_bit(l2(off), b);
+                set_bit(l2(off, &ocx), b);
             }
-            POOL[off + OV] = start_flags(l);
+            ocx.pool[off + ocx.ov] = start_flags(l, &ocx);
             if is_ptr(t) && LOCALS[l].ty > 0 && TYPES[t].b == 0 {
-                ANY_REF = true;
+                ocx.any_ref = true;
                 if param_mode(f, i) == P_MUT || env {
-                    ANY_MUT = true;
-                    POOL[off + OV] |= F_MUTLOAN;
+                    ocx.any_mut = true;
+                    ocx.pool[off + ocx.ov] |= F_MUTLOAN;
                 }
             }
         }
     }
 }
 
-// The parameters (bits) holding a closure that the walk stores views into:
-// the walked closure's env (it stores into what it captures), a closure
-// given to the walked function. Their summary's stores then name their own
-// roots too (infer::col_result), as one capture may now view another.
-pub static var CAPTURES_STORED: i64 = 0;
-
 // Slot s gains the views of origin v by a store or an assignment through
 // it: when s is a closure's (the walked closure's env, or a parameter
 // holding a closure), CAPTURES_STORED notes it.
-pub fn note_env_store(s: i64, v: i64) {
+pub fn note_env_store(s: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
-        if v < 0 || SLOT_LOCAL.data[s] < 0 || is_empty(l1(v)) && is_empty(l2(v)) {
+        if v < 0 || ocx.slot_local.data[s] < 0
+            || is_empty(l1(v, &ocx), ocx) && is_empty(l2(v, &ocx), ocx) {
             return;
         }
-        let l = SLOT_LOCAL.data[s];
-        for i in 0..PARAM_LOCALS.count {
-            if PARAM_LOCALS.data[i] == l && i < 63 && i < FNS[CUR_F].param_count
-                && (env_param(CUR_F, i) || closure_param(CUR_F, i)) {
-                CAPTURES_STORED |= 1 << i;
-                crate::front::own::infer::col_stored(v);
+        let l = ocx.slot_local.data[s];
+        for i in 0..ocx.param_locals.count {
+            if ocx.param_locals.data[i] == l && i < 63 && i < FNS[ocx.cur_f].param_count
+                && (env_param(ocx.cur_f, i) || closure_param(ocx.cur_f, i)) {
+                ocx.captures_stored |= 1 << i;
+                crate::front::own::infer::col_stored(v, ocx);
             }
         }
     }
 }
 
 // The walked closure's env slot (summary::env_param), or -1.
-pub fn env_slot() -> i64 {
+pub fn env_slot(ocx: OwnCx) -> i64 {
     unsafe {
-        if PARAM_LOCALS.count == 0 || PARAM_LOCALS.data[0] < 0 || !env_param(CUR_F, 0) {
+        if ocx.param_locals.count == 0 || ocx.param_locals.data[0] < 0 || !env_param(ocx.cur_f, 0) {
             return -1;
         }
-        slot_of_local(PARAM_LOCALS.data[0])
+        slot_of_local(ocx.param_locals.data[0], ocx)
     }
 }
 
@@ -987,30 +971,31 @@ pub fn env_slot() -> i64 {
 // argument is two-phase, as a receiver is: a plain read of its place in a
 // later argument is fine, `f(&mut v, v.len())`; a later argument that
 // keeps a view of it overlaps it at the call, calls.vl.)
-pub fn on_read(p: i64, n: i64) {
+pub fn on_read(p: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
-        crate::front::own::observe::at(n);
-        LAST_READ_NODE = n;
-        LAST_READ_PLACE = p;
-        if NSLOT == 0 {
+        crate::front::own::observe::at(n, &ocx);
+        ocx.last_read_node = n;
+        ocx.last_read_place = p;
+        if ocx.nslot == 0 {
             return;
         }
-        let s = slot_of_place(p);
+        let s = slot_of_place(p, ocx);
         if s >= 0 {
-            use_slot(s, n, &PL_MASK[p * NW]);
+            use_slot(s, n, &ocx.pl_mask[p * ocx.nw], &ocx);
         }
-        if ANY_MUT {
-            let m = &PL_MASK[p * NW];
-            for q in 0..NSLOT {
-                if q == s || is_slot_ancestor(q, s) || is_slot_ancestor(s, q) {
+        if ocx.any_mut {
+            let m = &ocx.pl_mask[p * ocx.nw];
+            for q in 0..ocx.nslot {
+                if q == s || is_slot_ancestor(q, s, ocx) || is_slot_ancestor(s, q, ocx) {
                     continue;
                 }
-                let off = slot_off(CUR, q);
-                let fl = off + OV;
-                if (POOL[fl] & F_MUTLOAN) != 0 && (POOL[fl] & F_INVALID) == 0
-                    && any_and(l1(off), m) {
-                    POOL[fl + 1] = n;
-                    POOL[fl] = (POOL[fl] & ~(15 << HOW_SHIFT)) | (H_READ << HOW_SHIFT) | F_INVALID;
+                let off = slot_off(ocx.cur, q, ocx);
+                let fl = off + ocx.ov;
+                if (ocx.pool[fl] & F_MUTLOAN) != 0 && (ocx.pool[fl] & F_INVALID) == 0
+                    && any_and(l1(off, &ocx), m, ocx) {
+                    ocx.pool[fl + 1] = n;
+                    ocx.pool[fl] = (ocx.pool[fl] & ~(15 << HOW_SHIFT)) | (H_READ << HOW_SHIFT)
+                        | F_INVALID;
                 }
             }
         }
@@ -1019,20 +1004,20 @@ pub fn on_read(p: i64, n: i64) {
 
 // Place p is written, moved, dropped or mutably borrowed at node n (how:
 // walk::W_*): the views of it are invalid from here.
-pub fn on_write(p: i64, n: i64, how: i64) {
-    crate::front::own::observe::at(n);
+pub fn on_write(p: i64, n: i64, how: i64, ocx: inout OwnCx) {
+    crate::front::own::observe::at(n, &ocx);
     // (p < 0: no place, a local past the bitsets' room, PL_OVERFLOW; the
     // walk is redone wider. A local with no place was never borrowed in
     // this walk: no slot views it, so there is nothing to invalidate)
-    if p < 0 || NSLOT == 0 && PEND.count == 0 {
+    if p < 0 || ocx.nslot == 0 && ocx.pend.count == 0 {
         return;
     }
     let h = if how == W_MOVE { H_MOVE } else if how == W_DROP { H_DROP }
         else if how == W_MUT_BORROW { H_MUT } else { H_WRITE };
-    let except = if how == W_MUT_BORROW { slot_of_place(p) } else { -1 };
+    let except = if how == W_MUT_BORROW { slot_of_place(p, ocx) } else { -1 };
     // (a `&mut` of a slot's own place, or a path through a reference:
     // the slot itself stays valid)
-    write_place(p, n, h, if PO_DEREF { except } else { -1 });
+    write_place(p, n, h, if ocx.po_deref { except } else { -1 }, &ocx);
 }
 
 // `&p` (kind REF_SHARED) or `&mut p` (REF_MUT) at node n; raw: reached
@@ -1040,20 +1025,20 @@ pub fn on_write(p: i64, n: i64, how: i64) {
 // what p holds. An Ident n is a reference local passed on to a call (an
 // implicit reborrow): dst gets what it views, and its own place (the
 // paths through it).
-pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
+pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64, ocx: inout OwnCx) {
     unsafe {
-        crate::front::own::observe::at(n);
+        crate::front::own::observe::at(n, &ocx);
         if raw || dst < 0 || p < 0 {
             return;
         }
         if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
-            let s = slot_of_local(NODES[n].y);
+            let s = slot_of_local(NODES[n].y, ocx);
             if s >= 0 {
-                ov_or(dst, slot_off(CUR, s));
+                ov_or(dst, slot_off(ocx.cur, s, ocx), &ocx);
             }
             // (0.18.1: what it points to, DEREF_FIELD, not its own storage)
-            let d = child_place(p, DEREF_FIELD);
-            set_bit(l1(dst), if d >= 0 { d } else { p });
+            let d = child_place(p, DEREF_FIELD, &ocx);
+            set_bit(l1(dst, &ocx), if d >= 0 { d } else { p });
             return;
         }
         // (0.20) `&*r` or `*r` of an access r (a use of it, names::
@@ -1067,39 +1052,39 @@ pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
             let r = NODES[id].b;
             if NODES[r].kind == NodeKind::Ident && NODES[r].res == Res::Local && NODES[r].y >= 0
                 && LOCALS[NODES[r].y].access {
-                let s = slot_of_local(NODES[r].y);
+                let s = slot_of_local(NODES[r].y, ocx);
                 if s >= 0 && !LOCALS[NODES[r].y].is_param {
                     // (a parameter's place lives for the call: `*r` stays a
                     // place of its own, below)
-                    ov_or(dst, slot_off(CUR, s));
+                    ov_or(dst, slot_off(ocx.cur, s, ocx), &ocx);
                     return;
                 }
             }
         }
-        set_bit(l1(dst), p);
-        let s = slot_of_place(p);
+        set_bit(l1(dst, &ocx), p);
+        let s = slot_of_place(p, ocx);
         if s >= 0 {
-            let so = slot_off(CUR, s);
-            if PO_INNER || PO_DEREF {
+            let so = slot_off(ocx.cur, s, ocx);
+            if ocx.po_inner || ocx.po_deref {
                 // (inside what the slot points to)
-                if PO_INNER {
-                    or_into(l1(dst), l1(so));
+                if ocx.po_inner {
+                    or_into(l1(dst, &ocx), l1(so, &ocx), ocx);
                 }
-                or_into(l2(dst), l2(so));
+                or_into(l2(dst, &ocx), l2(so, &ocx), ocx);
             } else {
-                or_into(l2(dst), l1(so));
-                or_into(l2(dst), l2(so));
+                or_into(l2(dst, &ocx), l1(so, &ocx), ocx);
+                or_into(l2(dst, &ocx), l2(so, &ocx), ocx);
             }
             return;
         }
-        let r = root_of(p);
-        if PL_RKIND[r] == RK_LOCAL && LOCALS[PL_RID[r]].is_param && PO_DEREF {
+        let r = root_of(p, ocx);
+        if ocx.pl_rkind[r] == RK_LOCAL && LOCALS[ocx.pl_rid[r]].is_param && ocx.po_deref {
             let t = NODES[n].ty;
             if t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
                 && is_view_type(TYPES[t].a) {
-                let q = root_place(PL_RID[r], true);
+                let q = root_place(ocx.pl_rid[r], true, &ocx);
                 if q >= 0 {
-                    set_bit(l2(dst), q);
+                    set_bit(l2(dst, &ocx), q);
                 }
             }
         }
@@ -1108,112 +1093,109 @@ pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
 
 // The value read out of place p at node n, of type ty: dst gets the views
 // it holds (walk::PO_* say how p was reached).
-pub fn on_value(p: i64, n: i64, ty: i64, dst: i64) {
+pub fn on_value(p: i64, n: i64, ty: i64, dst: i64, ocx: inout OwnCx) {
     unsafe {
-        if PO_RAW {
+        if ocx.po_raw {
             return;
         }
-        let r0 = root_of(p);
-        if PO_DEREF && ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == 0
-            && PL_RKIND[r0] == RK_LOCAL && LOCALS[PL_RID[r0]].is_param {
+        let r0 = root_of(p, ocx);
+        if ocx.po_deref && ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == 0
+            && ocx.pl_rkind[r0] == RK_LOCAL && LOCALS[ocx.pl_rid[r0]].is_param {
             // (a raw pointer read out of what a parameter points to: into
             // storage that referent owns, `p`: how std's `as_slice` views
             // `self`)
-            set_bit(l1(dst), p);
-            let q = root_place(PL_RID[r0], true);
+            set_bit(l1(dst, &ocx), p);
+            let q = root_place(ocx.pl_rid[r0], true, &ocx);
             if q >= 0 {
-                set_bit(l2(dst), q);
+                set_bit(l2(dst, &ocx), q);
             }
             return;
         }
-        let s = slot_of_place(p);
+        let s = slot_of_place(p, ocx);
         if s >= 0 {
-            let so = slot_off(CUR, s);
-            if PO_INNER || PO_DEREF {
-                ov_inner(dst, so);
+            let so = slot_off(ocx.cur, s, ocx);
+            if ocx.po_inner || ocx.po_deref {
+                ov_inner(dst, so, &ocx);
             } else {
-                ov_or(dst, so);
+                ov_or(dst, so, &ocx);
             }
             return;
         }
-        let r = root_of(p);
-        if PL_RKIND[r] == RK_LOCAL && PO_DEREF && LOCALS[PL_RID[r]].is_param {
-            let q = root_place(PL_RID[r], true);
+        let r = root_of(p, ocx);
+        if ocx.pl_rkind[r] == RK_LOCAL && ocx.po_deref && LOCALS[ocx.pl_rid[r]].is_param {
+            let q = root_place(ocx.pl_rid[r], true, &ocx);
             if q >= 0 {
-                set_bit(l1(dst), q);
-                set_bit(l2(dst), q);
+                set_bit(l1(dst, &ocx), q);
+                set_bit(l2(dst, &ocx), q);
             }
         }
     }
 }
 
-// The expression a pattern binds out of (walk::eval_match), or 0.
-pub static var BIND_FROM: i64 = 0;
-
 // Local l bound at node n (a pattern) to a value of origin v (-1: none).
-pub fn on_bind(l: i64, n: i64, v: i64) {
+pub fn on_bind(l: i64, n: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
-        crate::front::own::observe::at(n);
-        note_binding(l, n);
-        let s = slot_of_local(l);
+        crate::front::own::observe::at(n, &ocx);
+        note_binding(l, n, &ocx);
+        let s = slot_of_local(l, ocx);
         if s < 0 {
             return;
         }
-        let off = slot_off(CUR, s);
-        for w in 0..OV + 2 {
-            POOL[off + w] = 0;
+        let off = slot_off(ocx.cur, s, ocx);
+        for w in 0..ocx.ov + 2 {
+            ocx.pool[off + w] = 0;
         }
         if v >= 0 {
-            ov_or(off, v);
+            ov_or(off, v, &ocx);
         }
-        POOL[off + OV] = start_flags(l);
-        SLOT_PARENT.data[s] = -1;
-        if BIND_FROM != 0 {
-            let ps = root_slot(BIND_FROM);
+        ocx.pool[off + ocx.ov] = start_flags(l, &ocx);
+        ocx.slot_parent.data[s] = -1;
+        if ocx.bind_from != 0 {
+            let ps = root_slot(ocx.bind_from, ocx);
             if ps >= 0 && ps != s {
-                SLOT_PARENT.data[s] = ps;
-                ANY_CHILD = true;
+                ocx.slot_parent.data[s] = ps;
+                ocx.any_child = true;
             }
         }
-        slot_note(s, n, 0);
+        slot_note(s, n, 0, &ocx);
     }
 }
 
 // The slot an expression's value comes from (a slot local, an element or
 // a field of one, a reference to one), or -1.
-fn root_slot(e: i64) -> i64 {
+fn root_slot(e: i64, ocx: OwnCx) -> i64 {
     let k = NODES[e].kind;
     if k == NodeKind::Ident && NODES[e].res == Res::Local {
-        return slot_of_local(NODES[e].y);
+        return slot_of_local(NODES[e].y, ocx);
     }
     if k == NodeKind::Index || k == NodeKind::Cast || k == NodeKind::FieldAccess
         || k == NodeKind::TupleField {
-        return root_slot(NODES[e].a);
+        return root_slot(NODES[e].a, ocx);
     }
     if k == NodeKind::Unary {
-        return root_slot(NODES[e].b);
+        return root_slot(NODES[e].b, ocx);
     }
     if k == NodeKind::Call && NODES[e].count > 0 && is_view_type(NODES[e].ty) {
         // (a view a method makes of its receiver, `v.as_mut_slice()`
         // of a reference `v`: a reborrow of it)
-        return root_slot(child(e, 0));
+        return root_slot(child(e, 0), ocx);
     }
     -1
 }
 
 // `let l = init;` after the binding: a view taken from a view local is a
 // reborrow of it (SLOT_PARENT).
-pub fn on_let(l: i64, init: i64) {
+pub fn on_let(l: i64, init: i64, ocx: inout OwnCx) {
     unsafe {
-        let s = slot_of_local(l);
+        let s = slot_of_local(l, ocx);
         if s < 0 {
             return;
         }
-        slot_note(s, -1, init);
-        let ps = root_slot(init);
+        slot_note(s, -1, init, &ocx);
+        let ps = root_slot(init, ocx);
         if ps >= 0 && ps != s {
-            SLOT_PARENT.data[s] = ps;
-            ANY_CHILD = true;
+            ocx.slot_parent.data[s] = ps;
+            ocx.any_child = true;
         }
     }
 }
@@ -1225,74 +1207,74 @@ pub fn on_for_alias(l: i64, p: i64, init: i64) {}
 
 // Assignment n to place p, its value's origin v (walk::PO_* as the target
 // left them: PO_VIEWSLOT, a write through a view).
-pub fn on_assign(p: i64, n: i64, v: i64) {
+pub fn on_assign(p: i64, n: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
-        crate::front::own::observe::at(n);
-        let vs = PO_VIEWSLOT;
-        let inner = PO_INNER;
-        let deref = PO_DEREF;
-        if PO_RAW {
+        crate::front::own::observe::at(n, &ocx);
+        let vs = ocx.po_viewslot;
+        let inner = ocx.po_inner;
+        let deref = ocx.po_deref;
+        if ocx.po_raw {
             return;
         }
         if vs >= 0 {
             // A write through a slice: an exclusive use of what it views.
-            let t = LOCALS[SLOT_LOCAL.data[vs]].ty;
+            let t = LOCALS[ocx.slot_local.data[vs]].ty;
             if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT {
-                readonly(n, SLOT_LOCAL.data[vs], t);
+                readonly(n, ocx.slot_local.data[vs], t, &ocx);
             }
-            use_slot(vs, n, 0 as *i64);
-            let so = slot_off(CUR, vs);
-            let m = new_ov();
-            or_expanded(at(m), l1(so));
-            close_mask(at(m));
-            invalidate(at(m), n, H_WRITE, vs, PEND.count);
-            POOL_TOP = m;
+            use_slot(vs, n, 0 as *i64, &ocx);
+            let so = slot_off(ocx.cur, vs, ocx);
+            let m = new_ov(&ocx);
+            or_expanded(at(m, &ocx), l1(so, &ocx), &ocx);
+            close_mask(at(m, &ocx), &ocx);
+            invalidate(at(m, &ocx), n, H_WRITE, vs, ocx.pend.count, &ocx);
+            ocx.pool_top = m;
             if v >= 0 {
-                or_into(l2(slot_off(CUR, vs)), l1(v));
-                or_into(l2(slot_off(CUR, vs)), l2(v));
-                store_through_loans(vs, v, 0);
+                or_into(l2(slot_off(ocx.cur, vs, ocx), &ocx), l1(v, &ocx), ocx);
+                or_into(l2(slot_off(ocx.cur, vs, ocx), &ocx), l2(v, &ocx), ocx);
+                store_through_loans(vs, v, 0, &ocx);
             }
             return;
         }
-        let s = slot_of_place(p);
+        let s = slot_of_place(p, ocx);
         if deref && s >= 0 {
             // Through a reference: `r.f = v`, `*r = v`.
-            let l = SLOT_LOCAL.data[s];
+            let l = ocx.slot_local.data[s];
             let t = LOCALS[l].ty;
             if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED {
-                readonly(n, l, t);
+                readonly(n, l, t, &ocx);
             }
             // (a `&mut` child viewing another field stays: write_place
             // invalidates what views p)
-            use_slot(s, n, &PL_MASK[p * NW]);
-            write_place(p, n, H_WRITE, s);
-            note_env_store(s, v);
+            use_slot(s, n, &ocx.pl_mask[p * ocx.nw], &ocx);
+            write_place(p, n, H_WRITE, s, &ocx);
+            note_env_store(s, v, &ocx);
             if v >= 0 {
-                or_into(l2(slot_off(CUR, s)), l1(v));
-                or_into(l2(slot_off(CUR, s)), l2(v));
-                store_through_loans(s, v, 0);
+                or_into(l2(slot_off(ocx.cur, s, ocx), &ocx), l1(v, &ocx), ocx);
+                or_into(l2(slot_off(ocx.cur, s, ocx), &ocx), l2(v, &ocx), ocx);
+                store_through_loans(s, v, 0, &ocx);
             }
             return;
         }
-        write_place(p, n, H_WRITE, -1);
-        let r = root_of(p);
-        if PL_RKIND[r] == RK_STATIC && v >= 0 && !deref {
-            static_store(p, n, v);
+        write_place(p, n, H_WRITE, -1, &ocx);
+        let r = root_of(p, ocx);
+        if ocx.pl_rkind[r] == RK_STATIC && v >= 0 && !deref {
+            static_store(p, n, v, &ocx);
         }
         if s >= 0 && !deref {
-            let off = slot_off(CUR, s);
-            if PL_PARENT[p] < 0 && NODES[n].op == crate::front::lexer::Tok::Eq && !inner {
-                for w in 0..OV + 2 {
-                    POOL[off + w] = 0;
+            let off = slot_off(ocx.cur, s, ocx);
+            if ocx.pl_parent[p] < 0 && NODES[n].op == crate::front::lexer::Tok::Eq && !inner {
+                for w in 0..ocx.ov + 2 {
+                    ocx.pool[off + w] = 0;
                 }
-                POOL[off + OV] = start_flags(SLOT_LOCAL.data[s]);
-                SLOT_PARENT.data[s] = -1;
-                slot_note(s, n, NODES[n].c);
+                ocx.pool[off + ocx.ov] = start_flags(ocx.slot_local.data[s], &ocx);
+                ocx.slot_parent.data[s] = -1;
+                slot_note(s, n, NODES[n].c, &ocx);
                 if v >= 0 {
-                    ov_or(off, v);
+                    ov_or(off, v, &ocx);
                 }
             } else if v >= 0 {
-                ov_or(off, v);
+                ov_or(off, v, &ocx);
             }
         }
     }
@@ -1302,38 +1284,38 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
 // receiver, `&mut x` to a `&mut T` parameter), as for an assignment: p
 // reached through a `&T` or a read-only `[T]` (walk::PO_* as the place
 // left them).
-pub fn on_mut_loan(p: i64, n: i64) {
+pub fn on_mut_loan(p: i64, n: i64, ocx: inout OwnCx) {
     unsafe {
-        if PO_RAW {
+        if ocx.po_raw {
             return;
         }
         let nt = NODES[n].ty;
         if nt > 0 && TYPES[nt].kind == TyKind::Ptr {
-            crate::front::own::moves::byref_change(p, n, TYPES[nt].a);
+            crate::front::own::moves::byref_change(p, n, TYPES[nt].a, ocx);
         }
-        let vs = PO_VIEWSLOT;
+        let vs = ocx.po_viewslot;
         if vs >= 0 {
-            let t = LOCALS[SLOT_LOCAL.data[vs]].ty;
+            let t = LOCALS[ocx.slot_local.data[vs]].ty;
             if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT {
-                readonly(n, SLOT_LOCAL.data[vs], t);
+                readonly(n, ocx.slot_local.data[vs], t, &ocx);
             }
             return;
         }
-        let s = slot_of_place(p);
-        if PO_DEREF && s >= 0 {
-            let l = SLOT_LOCAL.data[s];
+        let s = slot_of_place(p, ocx);
+        if ocx.po_deref && s >= 0 {
+            let l = ocx.slot_local.data[s];
             let t = LOCALS[l].ty;
             if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED {
-                readonly(n, l, t);
+                readonly(n, l, t, &ocx);
             }
         }
     }
 }
 
 // own.readonly: assignment n writes through local l of type t (`&T`, `[T]`).
-fn readonly(n: i64, l: i64, t: i64) {
+fn readonly(n: i64, l: i64, t: i64, ocx: inout OwnCx) {
     unsafe {
-        if hidden_local(l) || !reporting(n) {
+        if hidden_local(l, ocx) || !reporting(n, &ocx) {
             return;
         }
         own_begin(n, OWN_READONLY);
@@ -1359,7 +1341,7 @@ fn readonly(n: i64, l: i64, t: i64) {
             // (the parameter retyped, with every call)
             let a = buf_new();
             buf_str(a, c"refactor signature ");
-            buf_bytes(a, SYMS[FNS[CUR_F].display].text);
+            buf_bytes(a, SYMS[FNS[ocx.cur_f].display].text);
             buf_str(a, c" --type ");
             buf_bytes(a, SYMS[LOCALS[l].name].text);
             buf_str(a, c" 'inout ");
@@ -1381,20 +1363,20 @@ fn readonly(n: i64, l: i64, t: i64) {
 
 // Static place p is assigned a value of origin v at node n: statics hold
 // only views of static data (∅).
-fn static_store(p: i64, n: i64, v: i64) {
-    let q = first_place(v, 0 as *i64);
+fn static_store(p: i64, n: i64, v: i64, ocx: inout OwnCx) {
+    let q = first_place(v, 0 as *i64, &ocx);
     // (0.25: a raw pointer is unsafe code's, which vouches for it)
     let vt = if NODES[n].kind == NodeKind::Assign { NODES[NODES[n].c].ty } else { 0 };
     if vt > 0 && !is_view_type(vt) {
         return;
     }
-    if q < 0 || hidden_place(q) || !reporting(n) {
+    if q < 0 || hidden_place(q, ocx) || !reporting(n, &ocx) {
         return;
     }
     own_begin(n, OWN_ESCAPE);
-    own_place(root_of(p));
+    own_place(root_of(p, ocx), ocx);
     own_str(c" would hold a view of ");
-    own_place(q);
+    own_place(q, ocx);
     own_str(c": statics hold only views of static data (literals)");
     own_help(c"store an owned copy (a Buf or a Vec), or an index");
     own_end();
@@ -1403,46 +1385,46 @@ fn static_store(p: i64, n: i64, v: i64) {
 // A scope ends: the locals walk::BOUND[mark..] die. v is the origin of its
 // value (-1: none), tail that value's node (0: none): a value viewing a
 // dying local escapes.
-pub fn on_scope_end(mark: i64, v: i64, tail: i64) {
+pub fn on_scope_end(mark: i64, v: i64, tail: i64, ocx: inout OwnCx) {
     unsafe {
-        if NSLOT == 0 && v < 0 {
+        if ocx.nslot == 0 && v < 0 {
             return;
         }
-        let m = new_ov();
+        let m = new_ov(&ocx);
         var first = -1;
-        for i in mark..BOUND.count {
-            let l = BOUND.data[i];
-            if l < LOC_CAP && LOC_PL[l] != 0 {
-                set_bit(at(m), LOC_PL[l] - 1);
+        for i in mark..ocx.bound.count {
+            let l = ocx.bound.data[i];
+            if l < ocx.loc_cap && ocx.loc_pl[l] != 0 {
+                set_bit(at(m, &ocx), ocx.loc_pl[l] - 1);
                 if first < 0 {
                     first = l;
                 }
             }
         }
         if first < 0 {
-            POOL_TOP = m;
+            ocx.pool_top = m;
             return;
         }
-        let mask = new_ov();
-        or_expanded(at(mask), at(m));
-        close_mask(at(mask));
+        let mask = new_ov(&ocx);
+        or_expanded(at(mask, &ocx), at(m, &ocx), &ocx);
+        close_mask(at(mask, &ocx), &ocx);
         // (0.18.1) what a dying reference points to lives on: the views
         // through it, DEREF_FIELD, also hold what it views
-        for q in 0..PL_COUNT {
-            if is_deref_place(q) && get_bit(at(m), PL_PARENT[q]) {
-                clear_bit(at(mask), q);
+        for q in 0..ocx.pl_count {
+            if is_deref_place(q, ocx) && get_bit(at(m, &ocx), ocx.pl_parent[q]) {
+                clear_bit(at(mask, &ocx), q);
             }
         }
         // (the pending arguments outlive the scope, write_place)
-        invalidate(at(mask), 0 - first - 1, H_SCOPE, -1, 0);
-        let body = NODES[FNS[CUR_F].node].c;
-        if v >= 0 && tail != 0 && tail != NODES[body].a && ov_hits(v, at(mask))
-            && !hidden_place(first_place(v, at(mask))) && reporting(tail) {
-            let q = first_place(v, at(mask));
+        invalidate(at(mask, &ocx), 0 - first - 1, H_SCOPE, -1, 0, &ocx);
+        let body = NODES[FNS[ocx.cur_f].node].c;
+        if v >= 0 && tail != 0 && tail != NODES[body].a && ov_hits(v, at(mask, &ocx), &ocx)
+            && !hidden_place(first_place(v, at(mask, &ocx), &ocx), ocx) && reporting(tail, &ocx) {
+            let q = first_place(v, at(mask, &ocx), &ocx);
             own_begin(tail, OWN_ESCAPE);
             own_str(c"the block's value views ");
             if q >= 0 {
-                own_place(q);
+                own_place(q, ocx);
             } else {
                 own_str(c"a local");
             }
@@ -1450,18 +1432,18 @@ pub fn on_scope_end(mark: i64, v: i64, tail: i64) {
             own_help(c"declare the owner before the block, or make the value an owned copy");
             own_end();
         }
-        POOL_TOP = m;
+        ocx.pool_top = m;
     }
 }
 
 // The function's result at node e, origin v (-1: none): views of locals
 // or of owned by-value parameters escape (own.escape); so do views of
 // them stored into what a `&mut` parameter points to.
-pub fn on_result(e: i64, v: i64) {
+pub fn on_result(e: i64, v: i64, ocx: inout OwnCx) {
     unsafe {
-        let f = CUR_F;
+        let f = ocx.cur_f;
         let rt = FNS[f].ret;
-        if is_ptr(rt) && TYPES[rt].b != 0 && reporting(FNS[f].node) {
+        if is_ptr(rt) && TYPES[rt].b != 0 && reporting(FNS[f].node, &ocx) {
             own_begin(FNS[f].node, OWN_ESCAPE);
             own_sym(FNS[f].display);
             own_str(c" returns a reference ('");
@@ -1471,20 +1453,20 @@ pub fn on_result(e: i64, v: i64) {
             own_end();
         }
         if v >= 0 {
-            let q = escaping(v, 0 as *i64);
-            if q >= 0 && !hidden_place(q) && reporting(e) {
-                let l = PL_RID[root_of(q)];
+            let q = escaping(v, 0 as *i64, &ocx);
+            if q >= 0 && !hidden_place(q, ocx) && reporting(e, &ocx) {
+                let l = ocx.pl_rid[root_of(q, ocx)];
                 own_begin(e, OWN_ESCAPE);
                 let main_body = is_main_closure(f);
                 if main_body {
                     // (0.25: main returning a Result: its body is a closure)
                     own_str(c"'main' returns an error that views ");
-                    own_place(q);
+                    own_place(q, ocx);
                     own_str(c", which is dropped when 'main' returns");
                 } else {
                     own_sym(FNS[f].display);
                     own_str(c" returns a view of ");
-                    own_place(q);
+                    own_place(q, ocx);
                     own_str(c", which is dropped when ");
                     own_sym(FNS[f].display);
                     own_str(c" returns");
@@ -1522,20 +1504,20 @@ pub fn on_result(e: i64, v: i64) {
                 } else {
                     own_help(c"return an owned copy, or take the storage as a parameter and return a view of it");
                 }
-                if any_and(l1(v), at_mark()) {
+                if any_and(l1(v, &ocx), at_mark(&ocx), ocx) {
                     own_soft();
                 }
                 own_end();
             }
         }
         // What the `&mut` parameters' referents now hold.
-        for i in 0..PARAM_LOCALS.count {
-            let l = PARAM_LOCALS.data[i];
+        for i in 0..ocx.param_locals.count {
+            let l = ocx.param_locals.data[i];
             if l < 0 {
                 continue;
             }
-            let s = slot_of_local(l);
-            if s < 0 || (POOL[slot_off(CUR, s) + OV] & F_MUTLOAN) == 0 {
+            let s = slot_of_local(l, ocx);
+            if s < 0 || (ocx.pool[slot_off(ocx.cur, s, ocx) + ocx.ov] & F_MUTLOAN) == 0 {
                 continue;
             }
             // (0.25) what it holds reaches the caller here: a view stored
@@ -1544,48 +1526,48 @@ pub fn on_result(e: i64, v: i64) {
             // (a write of the parameter's own referent, through an access
             // it lent, `p.item()` of `Parser { out: &out }`, leaves what is
             // stored in it valid: no stored view is lost)
-            let fl = POOL[slot_off(CUR, s) + OV];
+            let fl = ocx.pool[slot_off(ocx.cur, s, ocx) + ocx.ov];
             let how = (fl >> HOW_SHIFT) & 15;
             let hit = ((fl >> HIT_SHIFT) & 1023) - 1;
-            let hr = if hit >= 0 { root_of(hit) } else { -1 };
-            let own = hr >= 0 && (PL_RKIND[hr] == RK_LOCAL || PL_RKIND[hr] == RK_ROOT)
-                && PL_RID[hr] == l;
+            let hr = if hit >= 0 { root_of(hit, ocx) } else { -1 };
+            let own = hr >= 0 && (ocx.pl_rkind[hr] == RK_LOCAL || ocx.pl_rkind[hr] == RK_ROOT)
+                && ocx.pl_rid[hr] == l;
             if how != H_SCOPE && how != H_DROP && !own {
-                use_slot(s, e, 0 as *i64);
+                use_slot(s, e, 0 as *i64, &ocx);
             }
-            let off = slot_off(CUR, s);
-            let m = new_ov();
-            or_into(at(m), l2(off));
-            let q = escaping(m, 0 as *i64);
-            if q >= 0 && !hidden_place(q) && !hidden_local(l) && reporting(e) {
+            let off = slot_off(ocx.cur, s, ocx);
+            let m = new_ov(&ocx);
+            or_into(at(m, &ocx), l2(off, &ocx), ocx);
+            let q = escaping(m, 0 as *i64, &ocx);
+            if q >= 0 && !hidden_place(q, ocx) && !hidden_local(l, ocx) && reporting(e, &ocx) {
                 own_begin(e, OWN_ESCAPE);
                 if env_param(f, i) {
                     // (0.25: a closure storing into what it captures)
                     own_str(c"the closure stores a view of ");
-                    own_place(q);
+                    own_place(q, ocx);
                     own_str(c" into a variable it captures, and ");
-                    own_place(root_of(q));
+                    own_place(root_of(q, ocx), ocx);
                     own_str(c" is dropped when the closure returns");
                 } else {
                     own_sym(FNS[f].display);
                     own_str(c" stores a view of ");
-                    own_place(q);
+                    own_place(q, ocx);
                     own_str(c" into what ");
                     own_sym(LOCALS[l].name);
                     own_str(c" points to, and ");
-                    own_place(root_of(q));
+                    own_place(root_of(q, ocx), ocx);
                     own_str(c" is dropped when ");
                     own_sym(FNS[f].display);
                     own_str(c" returns");
                 }
                 own_help(
                     c"store an owned copy (a Buf, '.to_vec()'), or keep the owner in the caller");
-                if any_and(l2(off), at_mark()) {
+                if any_and(l2(off, &ocx), at_mark(&ocx), ocx) {
                     own_soft();
                 }
                 own_end();
             }
-            POOL_TOP = m;
+            ocx.pool_top = m;
         }
     }
 }
@@ -1611,21 +1593,21 @@ fn is_main_closure(f: i64) -> bool {
 
 // The first place of origin o (both levels) that dies when the function
 // returns: a local's, or a by-value parameter's own place; -1.
-fn escaping(o: i64, m: *i64) -> i64 {
+fn escaping(o: i64, m: *i64, ocx: inout OwnCx) -> i64 {
     unsafe {
-        for q in 0..PL_COUNT {
-            if !get_bit(l1(o), q) && !get_bit(l2(o), q) || is_deref_place(q) {
+        for q in 0..ocx.pl_count {
+            if !get_bit(l1(o, &ocx), q) && !get_bit(l2(o, &ocx), q) || is_deref_place(q, ocx) {
                 continue;
             }
-            let r = root_of(q);
-            if PL_RKIND[r] == crate::front::own::state::RK_TEMP {
+            let r = root_of(q, ocx);
+            if ocx.pl_rkind[r] == crate::front::own::state::RK_TEMP {
                 // (0.25: a temporary dies at its statement's end)
                 return q;
             }
-            if PL_RKIND[r] != RK_LOCAL {
+            if ocx.pl_rkind[r] != RK_LOCAL {
                 continue;
             }
-            let l = PL_RID[r];
+            let l = ocx.pl_rid[r];
             if !LOCALS[l].is_param {
                 return q;
             }

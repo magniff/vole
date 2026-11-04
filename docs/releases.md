@@ -75,7 +75,111 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.1 | `v0.26.1` | 0.26.0 | aarch64-macos | the places IR the one source of drops: kept bodies, drop shims, both code generators read it at every level (`VOLE_LOWER=ast`, `--no-places`: the escape); `own.move_out`; `Cell`, `UnsafeCell`, `Freeze` and the `interior` effect |
 | 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
 | 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
+| 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.26.4
+
+The compiler on Rust's overflow checks, its raw-pointer parameters decided, and its statics in context structs. Built and tested on aarch64-macos only.
+
+The compiler on Rust's overflow checks (wrap264):
+
+- compiler/src writes every place it relies on wrapping with
+  `wrapping_*`: its hashes, the division magic numbers, the constant
+  folders, negations of MIN, the C preprocessor's `#if` arithmetic. The
+  census (the compiler built with `--overflow-checks=on` and
+  `VOLE_OVF_CENSUS`, run over the suite and itself) finds none left.
+- The bootstrap's -O0 compilers (chain-diverse's B2 and A2O0) are built
+  and run with the overflow checks on: `--overflow-checks=off` is gone
+  from bootstrap/.
+- A C header's `#if` with `MIN / -1` no longer stops the compiler with a
+  division overflow: the preprocessor's words wrap, as C's do.
+- A program that names nothing else of std has std's integer methods
+  (`wrapping_*`, `checked_*`, `overflowing_*`, `saturating_*`); before,
+  `no method 'wrapping_mul' on type 'i64'`.
+- Of tests/run's 60 cases built with `--overflow-checks=off`, 11 write
+  their PRNGs and checksums with `wrapping_*` and lose the flag; the
+  other 49 keep it, each with a one-line reason (they test wrapping, or
+  the optimizer on wrapping operators).
+- `base::comp::Comp`'s impl is `unsafe impl Allocator`, with its SAFETY
+  comment; the alloc exemption keeps only Comp in statics and fields and
+  the static `WGSL_ARENA`, until the statics work moves them into
+  context structs.
+
+The raw-pointer parameters (rawptr264):
+
+- `volec fix --only rawptr` (`explain fix.rawptr`) decides each `p: *T`
+  and `p: sink *T` parameter of a program's own safe functions by what
+  its function does with it, over the whole program: one only read or
+  written through becomes `p: inout T` (a let `p: T` when T is small or
+  owned: a let parameter copies a larger plain value and reads it as a
+  snapshot), its calls give `&x`, a parameter passed on `&p`, a raw
+  pointer `&*q` (in a new unsafe block, with its comments, outside
+  unsafe code), and `*p` becomes `p`. A pointer used as one (stored,
+  returned, cast, compared, indexed, assigned, captured, given null or a
+  C string, passed on to a parameter used as an address) stays `*T`, and
+  so does one given to a call nested in the arguments of another call
+  that takes the same place (`f(&cx, g(&cx))`: two inout accesses would
+  be own.conflict). `--only rawptr-list` is the dry run, each parameter
+  with its class and reason. A second run changes nothing.
+- compiler/src on it: of its 2,583 `*T` parameters, 1,416 are `inout T`
+  now (1,399 of them `FnCtx`: 580 only read, 731 written, 105 given a
+  raw pointer by a thread or task root), 1,139 stay raw (813 C strings,
+  141 nested calls, 211 indexed) and 28 cannot change (unsafe fns,
+  receivers, `**T`). 104 unsafe blocks left with nothing unsafe are
+  gone: unjustified unsafe sites 3,329 to 3,224 (docs/unsafe-baseline.md).
+- The own pass memoizes, per function, whether a type holds an inout
+  access (kinds::holds_inout walked every field of an inout context at
+  every call): `check` of compiler/src 0.95x 0.26.3's.
+
+The statics into context structs (statics264):
+
+- `volec fix --only statics --group FILE` (`explain fix.statics`)
+  moves a group of statics into a context passed down. The group file
+  names the statics, the field each becomes, the parameter's name and
+  type, and the owners that make the context as a local. Each function
+  naming one of the statics, and its callers up to the owners, takes the
+  context **last** (before a parameter with a default), so a call nested
+  in another's arguments can take it too (`two(add(1, &cx), 2, &cx)`).
+  It is inout where the function or a callee writes the context, let
+  otherwise. Uses become `cx.field`, calls give `&cx` or `cx`. A method
+  of the context's field whose argument changes the context gets that
+  argument as a `let` before the statement. A function no owner reaches
+  (`main`, a C entry, a function value, a trait's method) refuses the
+  group, and nothing changes. `--only statics-list` is the dry run. A
+  second run changes nothing.
+- compiler/src, phase 1: the places IR's body and its control-flow graph
+  (19 statics: places/ir.vl's `B_*`, `P_*` and `CUR_BLOCK`, places/cfg.vl's
+  tables) are `places::ir::Body`, passed as `pbody` to 288 functions (105
+  inout, 183 let) from four owners: check_program, lower_program, gen0's
+  compile_program and `query drops`. None of them runs in a code
+  generator's task. Statics in compiler/src: 2,138 to 2,149 (the tool
+  adds 30 of its own, which phase 2 moves with tools'). `check` of
+  compiler/src: 1.00x the base's, 0.95x 0.26.3's.
+- compiler/src, phase 2: 673 of the tools' 760 statics are fields of
+  `tools::ctx::Tcx` (tools/ctx.vl), made once per process by `main` and
+  `cli::run::run` and passed as `tcx` to 1,228 functions (765 inout), so
+  a batch's or the language server's later commands still see what the
+  earlier ones left. The tool's own 32 are among them. 87 stay statics:
+  59 whose users front, base or places reach through a hook (phase 4),
+  7 slices viewing memory the context cannot name, 5 that code outside
+  tools uses, and 16 never written. Statics in compiler/src: 2,151 to
+  1,478. `check` of compiler/src: 1.00x the base's, 0.90x 0.26.3's; the
+  source itself costs 4.9% more to check (the parameters and arguments
+  added).
+- compiler/src, phase 3: 244 of front's 843 statics are fields of six
+  pass contexts, each made where its pass starts: the own pass's walk
+  state (`front::own::ctx::OwnCx`, 83, made by check_program and by
+  `query own`'s walk), the C import's (`CImportCx`, 85, made by
+  import_c_headers), the embedded WGSL's check (`EmbedCx`, 40), the
+  thread-safety pass's (`ThreadsCx`, 18), the contracts' expansion
+  (`ContractsCx`, 9) and the target features' check (`FeaturesCx`, 9).
+  What lives across functions or past its pass (the own pass's
+  summaries, the effects, the checker's tables) is phase 4's. Statics
+  in compiler/src: 1,478 to 1,234. `check` of compiler/src: 0.89x
+  0.26.3's. With one compiler, checking the source itself costs 6.1%
+  more than before phase 1 (phase 1 +0.9%, phase 2 +4.3%, phase 3
+  +0.8%).
 
 ### What's new in 0.26.3
 

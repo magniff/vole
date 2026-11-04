@@ -378,11 +378,12 @@ if [ -f "$SRC/main.vl" ]; then
         line=$(grep -n '^pub fn run_lsp' "$F" | cut -d: -f1)
         frame "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((line - 1)),\"character\":8},\"context\":{\"includeDeclaration\":true}}}"
         frame "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((line - 1)),\"character\":8}}}"
-        # (0.25.1) completion of `buf_` in run_lsp (`IN = buf_new();`), a
-        # call's signature there, the file formatted
-        cl=$(grep -n '^        IN = buf_new();' "$F" | cut -d: -f1)
-        frame "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":17}}}"
-        frame "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/signatureHelp\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":21}}}"
+        # (0.25.1) completion of `buf_` in run_lsp (`tcx.in_ = buf_new();`
+        # since 0.26.4's tools context), a call's signature there, the file
+        # formatted
+        cl=$(grep -n '^        tcx.in_ = buf_new();' "$F" | cut -d: -f1)
+        frame "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":22}}}"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/signatureHelp\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":26}}}"
         frame "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"options\":{\"tabSize\":4,\"insertSpaces\":true}}}"
         frame '{"jsonrpc":"2.0","id":8,"method":"shutdown"}'
         frame '{"jsonrpc":"2.0","method":"exit"}'

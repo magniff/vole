@@ -5,6 +5,7 @@
 // a text re-indented.
 
 use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice};
+use crate::base::comp::Comp;
 use crate::front::ast::{
     BLOCK_UNSAFE, CLOSURE_MOVE, FN_UNSAFE, NODES, NODE_CAPTURE, NodeKind, child,
 };
@@ -12,16 +13,10 @@ use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
 use crate::front::types::{ENUMS, STRUCTS, TLISTS, TYPES, TyKind, is_pointer, type_elem};
 use crate::middle::lower::ssa::HMap;
-use crate::tools::edit::TARGET_NAME;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::apply::{copy_rewritten, overlay_args};
 use crate::tools::proc::run_capture;
 use crate::tools::query::diagnostics::PROG;
-
-// The parent of each node of the body being looked at (node + 1 ->
-// parent + 1), and the declaration of each local there (local + 1 ->
-// PatBind or Param node + 1).
-static var PARENT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var DECL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // How a use of a local uses it (use_kind).
 pub const USE_VALUE: i64 = 0;
@@ -113,14 +108,14 @@ fn list(n: i64, out: inout IntVec) {
 
 // Walks the body of function node f: the parents of its nodes, the
 // declarations of its locals (its parameters' too).
-pub fn load_body(f: i64) {
+pub fn load_body(f: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        PARENT = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        DECL = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        tcx.body_parent = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        tcx.decl = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for i in 0..NODES[f].count {
             let p = child(f, i);
             if NODES[p].kind == NodeKind::Param {
-                DECL.put(NODES[p].x + 1, p + 1);
+                tcx.decl.put(NODES[p].x + 1, p + 1);
             }
         }
         var todo = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -132,14 +127,14 @@ pub fn load_body(f: i64) {
             // (0.14: a closure's parameter with a plain name declares it)
             if NODES[n].kind == NodeKind::PatBind
                 || (NODES[n].kind == NodeKind::Param && NODES[n].d == 0) {
-                DECL.put(NODES[n].x + 1, n + 1);
+                tcx.decl.put(NODES[n].x + 1, n + 1);
             }
             var ks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             kids(n, &ks);
             for i in 0..ks.count {
                 let c = ks.data[i];
-                if c > 0 && c < NODES.len() as i64 && PARENT.get(c + 1) == 0 {
-                    PARENT.put(c + 1, n + 1);
+                if c > 0 && c < NODES.len() as i64 && tcx.body_parent.get(c + 1) == 0 {
+                    tcx.body_parent.put(c + 1, n + 1);
                     todo.push(c);
                 }
             }
@@ -147,18 +142,18 @@ pub fn load_body(f: i64) {
     }
 }
 
-pub fn parent(n: i64) -> i64 {
-    PARENT.get(n + 1) - 1
+pub fn parent(n: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.body_parent.get(n + 1) - 1
 }
 
 // The PatBind or Param node declaring local l, -1.
-pub fn decl_of(l: i64) -> i64 {
-    DECL.get(l + 1) - 1
+pub fn decl_of(l: i64, tcx: Tcx<Comp>) -> i64 {
+    tcx.decl.get(l + 1) - 1
 }
 
 // Whether node n is in the body loaded (or is it).
-pub fn in_body(n: i64) -> bool {
-    PARENT.get(n + 1) != 0
+pub fn in_body(n: i64, tcx: Tcx<Comp>) -> bool {
+    tcx.body_parent.get(n + 1) != 0
 }
 
 // The local Ident node n names, or -1 (0.14: also a use of a local a
@@ -175,24 +170,24 @@ pub fn local_of(n: i64) -> i64 {
 }
 
 // The innermost closure around node n of the body loaded (0.14), or -1.
-pub fn closure_around(n: i64) -> i64 {
-    var q = parent(n);
+pub fn closure_around(n: i64, tcx: Tcx<Comp>) -> i64 {
+    var q = parent(n, tcx);
     while q >= 0 {
         if NODES[q].kind == NodeKind::Closure {
             return q;
         }
-        q = parent(q);
+        q = parent(q, tcx);
     }
     -1
 }
 
 // Whether node n is a use of a local captured by a `move` closure (0.14):
 // its closure's own copy, the local itself unchanged.
-pub fn captured_by_move(n: i64) -> bool {
+pub fn captured_by_move(n: i64, tcx: Tcx<Comp>) -> bool {
     if (NODES[n].p & NODE_CAPTURE) == 0 {
         return false;
     }
-    let c = closure_around(n);
+    let c = closure_around(n, tcx);
     c >= 0 && (NODES[c].c & CLOSURE_MOVE) != 0
 }
 
@@ -241,8 +236,8 @@ pub fn has_closure(t: i64, depth: i64) -> bool {
 // its address taken (`&x`; the receiver of a method taking `self: *T`),
 // a field or element of it written or its address taken (`x.f = `, `&x.f`,
 // `x.a[i] = `), read (`x.f`), or its value.
-pub fn use_kind(n: i64) -> i64 {
-    let p = parent(n);
+pub fn use_kind(n: i64, tcx: Tcx<Comp>) -> i64 {
+    let p = parent(n, tcx);
     if p < 0 {
         return USE_VALUE;
     }
@@ -267,7 +262,7 @@ pub fn use_kind(n: i64) -> i64 {
             return if q == n { USE_VALUE } else { USE_FIELD_READ };
         }
         q = up;
-        up = parent(up);
+        up = parent(up, tcx);
     }
     if q == n {
         return USE_VALUE;
@@ -285,31 +280,31 @@ fn is_array(t: i64) -> bool {
 
 // Whether node n is inside unsafe code of function f: an `unsafe { }`
 // block around it, or f an `unsafe fn`.
-pub fn in_unsafe(f: i64, n: i64) -> bool {
+pub fn in_unsafe(f: i64, n: i64, tcx: Tcx<Comp>) -> bool {
     if (NODES[f].p & FN_UNSAFE) != 0 {
         return true;
     }
-    var q = parent(n);
+    var q = parent(n, tcx);
     while q >= 0 {
         if NODES[q].kind == NodeKind::Block && (NODES[q].p & BLOCK_UNSAFE) != 0 {
             return true;
         }
-        q = parent(q);
+        q = parent(q, tcx);
     }
     false
 }
 
 // The type of local l as written where it is declared (a parameter's, a
 // `let x: T`), else as the checker has it; into out.
-pub fn put_local_type(out: i64, l: i64) {
+pub fn put_local_type(out: i64, l: i64, tcx: Tcx<Comp>) {
     unsafe {
-        let dn = decl_of(l);
+        let dn = decl_of(l, tcx);
         if dn >= 0 {
             var t = 0;
             if NODES[dn].kind == NodeKind::Param {
                 t = NODES[dn].b;
             } else {
-                let p = parent(dn);
+                let p = parent(dn, tcx);
                 if p >= 0 && NODES[p].kind == NodeKind::Let && NODES[p].a == dn {
                     t = NODES[p].b;
                 }
@@ -320,7 +315,7 @@ pub fn put_local_type(out: i64, l: i64) {
             }
         }
         // (0.20: in the crate's spelling, fixconv::put_type_conv)
-        crate::tools::fixconv::put_type_conv(out, LOCALS[l].ty, true);
+        crate::tools::fixconv::put_type_conv(out, LOCALS[l].ty, true, tcx);
     }
 }
 
@@ -402,7 +397,7 @@ pub fn text_with(a: i64, b: i64, starts: IntVec, ends: IntVec, texts: IntVec) ->
 // as overlays), up to eight while they fix something (the checker stops
 // at a statement's first unknown name): the imports and
 // `pub` that code moved to another module needs.
-pub fn fix_round(root: *u8, only: *u8) {
+pub fn fix_round(root: *u8, only: *u8, tcx: inout Tcx<Comp>) {
     for _ in 0..8 {
         var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         args.push(PROG as i64);
@@ -410,11 +405,11 @@ pub fn fix_round(root: *u8, only: *u8) {
         args.push(c"--round" as i64);
         args.push(c"--only" as i64);
         args.push(only as i64);
-        if TARGET_NAME != 0 as *u8 {
+        if tcx.target_name != 0 as *u8 {
             args.push(c"--target" as i64);
-            args.push(TARGET_NAME as i64);
+            args.push(tcx.target_name as i64);
         }
-        overlay_args(&args);
+        overlay_args(&args, tcx);
         args.push(root as i64);
         args.push(0);
         let out = buf_new();
@@ -431,7 +426,7 @@ pub fn fix_round(root: *u8, only: *u8) {
             }
             let line = t[i..e];
             if line.len > 5 && line[0] == 'f' && line[4] == '\t'
-                && copy_rewritten(line[5..line.len]) {
+                && copy_rewritten(line[5..line.len], &tcx) {
                 any = true;
             }
             i = e + 1;

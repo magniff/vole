@@ -32,10 +32,12 @@ use crate::base::{
     BUFS, FILES, IntVec, SOURCE_VOLE, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, streq,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_WORD, Leaf, flag, option};
 use crate::front::modules::file_of_pos;
-use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::apply_edit;
 use crate::tools::edit::cli::{ambiguous, edit_opts, source_only, take_edit_event};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
 use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted, std_file_rerun, std_rerun};
@@ -44,7 +46,7 @@ use crate::tools::query::{c_slice, def_at_line, file_line, file_named, resolve_n
 use crate::tools::query::cache::cache_restore;
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{DEFS, K_FIELD, K_MOD, K_VARIANT, bytes_eq, mod_fqn_text};
-use crate::tools::query::diagnostics::{ROOT_GIVEN, diag, program_errors, try_begin, try_end};
+use crate::tools::query::diagnostics::{diag, program_errors, try_begin, try_end};
 use crate::tools::query::positions::{LINES, line_end, line_index, line_of, line_start};
 use crate::tools::query::refs::file_text;
 use crate::tools::query::show::text_start;
@@ -53,72 +55,40 @@ use crate::tools::query_text::region_target;
 use indent::{indents, reindented, trimmed_lines};
 use mismatch::{no_match, nth_past, put_sh, several};
 
-// The pairs: OLD and NEW texts (buffers), in order.
-static var OLDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var NEWS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var FROM_STDIN: bool = false;
-static var LOOSE: bool = false;
-// (0.16) Which match of each OLD is replaced when it occurs several
-// times: 0 (the default) only a unique one, N > 0 the Nth, -1 (`--all`)
-// every one.
-static var NTH: i64 = 0;
-static var INSERT_AFTER: bool = false;
-// What the command is (`patch`, `insert --in`), and TARGET as given.
-static var WHAT: *u8 = 0 as *u8;
-static var TARGET_ARG: *u8 = 0 as *u8;
-// TARGET's text: [SCOPE_START, SCOPE_END) of SRC; its name (a buffer).
-static var SCOPE_START: i64 = 0;
-static var SCOPE_END: i64 = 0;
-static var SCOPE_NAME: i64 = -1;
-
-// `--pairs FILE` (0.13): the pairs' file, read in place of stdin.
-pub static var PAIRS_FILE: *u8 = 0 as *u8;
-// The program's root (for the journal's directory, where the pairs of a
-// `try:` line are written).
-pub static var ROOT_PATH: *u8 = 0 as *u8;
-
-// (0.15) The targets of the pairs, as named (C strings), in order; per
-// pair, its target's index (-1 while it is the command line's TARGET,
-// before own_targets); the target of the pairs that follow (`--in NAME`,
-// `@@ NAME`).
-pub static var TARGETS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var PAIR_TARGET: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var CUR_TARGET: i64 = -1;
-
 // The index of target `name` in TARGETS (added when new).
-fn target_index(name: [u8]) -> i64 {
+fn target_index(name: [u8], tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        for t in 0..TARGETS.count {
-            if bytes_eq(c_slice(TARGETS.data[t] as *u8), name) {
+        for t in 0..tcx.patch_targets.count {
+            if bytes_eq(c_slice(tcx.patch_targets.data[t] as *u8), name) {
                 return t;
             }
         }
         let b = buf_new();
         buf_bytes(b, name);
-        TARGETS.push(buf_cstr(b) as i64);
-        TARGETS.count - 1
+        tcx.patch_targets.push(buf_cstr(b) as i64);
+        tcx.patch_targets.count - 1
     }
 }
 
 // Every pair given its target: those named by none get the command line's
 // (`first`, -1 when there is none). False after the diagnostic.
-fn own_targets(first: i64) -> bool {
+fn own_targets(first: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        if TARGETS.count == 0 {
-            usage(c"a TARGET is needed");
+        if tcx.patch_targets.count == 0 {
+            usage(c"a TARGET is needed", &tcx);
             return false;
         }
-        for k in 0..OLDS.count {
-            if PAIR_TARGET.data[k] < 0 {
+        for k in 0..tcx.olds.count {
+            if tcx.pair_target.data[k] < 0 {
                 if first < 0 {
-                    let d = diag(c"error", c"edit.usage");
+                    let d = diag(c"error", c"edit.usage", &tcx);
                     buf_str(d, c"pair ");
                     buf_int(d, k + 1);
                     buf_str(d, c" has no TARGET: name one before the pairs, or put `@@ NAME` above its block\n");
-                    usage_try();
+                    usage_try(&tcx);
                     return false;
                 }
-                PAIR_TARGET.data[k] = first;
+                tcx.pair_target.data[k] = first;
             }
         }
         true
@@ -147,9 +117,9 @@ pub fn patch_leaf(insert: bool, gpa: Gpa) -> Leaf<Gpa> {
 
 // `edit patch ...`, and `edit insert --in ...`: the exit status (the
 // diagnostics are written by run_edit).
-pub fn run_patch(c: Call<Gpa>) -> i64 {
+pub fn run_patch(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     let insert = c.word(2) == "insert";
-    WHAT = if insert { c"insert --in" } else { c"patch" };
+    tcx.what = if insert { c"insert --in" } else { c"patch" };
     var root = 0 as *u8;
     var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var anchor = 0 as *u8;
@@ -161,26 +131,26 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
             || ev.name == "before" || ev.name == "old" || ev.name == "new"
             || ev.name == "pairs";
         if ev.kind == EV_MISSING && valued {
-            let d = diag(c"error", c"edit.usage");
+            let d = diag(c"error", c"edit.usage", &tcx);
             buf_str(d, a);
             buf_str(d, c" needs a value\n");
-            return usage_try();
+            return usage_try(&tcx);
         }
         if ev.kind == EV_OPTION && valued {
             let v = ev.value;
             if ev.name == "old" {
-                if OLDS.count != NEWS.count {
-                    return usage(c"each --old needs its --new");
+                if tcx.olds.count != tcx.news.count {
+                    return usage(c"each --old needs its --new", &tcx);
                 }
-                OLDS.push(text_buffer(c_slice(v)));
-                PAIR_TARGET.push(CUR_TARGET);
+                tcx.olds.push(text_buffer(c_slice(v)));
+                tcx.pair_target.push(tcx.cur_target);
             } else if ev.name == "new" {
-                if NEWS.count + 1 != OLDS.count {
-                    return usage(c"each --new follows its --old");
+                if tcx.news.count + 1 != tcx.olds.count {
+                    return usage(c"each --new follows its --old", &tcx);
                 }
-                NEWS.push(text_buffer(c_slice(v)));
+                tcx.news.push(text_buffer(c_slice(v)));
             } else if ev.name == "pairs" {
-                PAIRS_FILE = v;
+                tcx.pairs_file = v;
             } else if ev.name == "nth" {
                 let vb = ev.text.as_bytes();
                 var n = 0;
@@ -190,23 +160,23 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
                     j += 1;
                 }
                 if j == 0 || j < vb.len as i64 || n == 0 {
-                    return usage(c"--nth N needs a number from 1");
+                    return usage(c"--nth N needs a number from 1", &tcx);
                 }
-                if NTH != 0 {
-                    return usage(c"one of --nth N and --all");
+                if tcx.nth != 0 {
+                    return usage(c"one of --nth N and --all", &tcx);
                 }
-                NTH = n;
+                tcx.nth = n;
             } else if ev.name == "in" && !insert {
                 // (0.15: the pairs after it are NAME's)
-                if OLDS.count != NEWS.count {
-                    return usage(c"each --old needs its --new");
+                if tcx.olds.count != tcx.news.count {
+                    return usage(c"each --old needs its --new", &tcx);
                 }
-                CUR_TARGET = target_index(c_slice(v));
+                tcx.cur_target = target_index(c_slice(v), &tcx);
             } else if ev.name == "in" {
                 names.push(v as i64);
             } else {
                 if anchor != 0 as *u8 {
-                    return usage(c"one --after or --before ANCHOR");
+                    return usage(c"one --after or --before ANCHOR", &tcx);
                 }
                 anchor = v;
                 after = ev.name == "after";
@@ -214,23 +184,23 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
             continue;
         }
         if ev.kind == EV_FLAG && ev.name == "loose" {
-            LOOSE = true;
+            tcx.loose = true;
         } else if ev.kind == EV_FLAG && ev.name == "all" {
-            if NTH != 0 {
-                return usage(c"one of --nth N and --all");
+            if tcx.nth != 0 {
+                return usage(c"one of --nth N and --all", &tcx);
             }
-            NTH = -1;
-        } else if take_edit_event(&ev, &root) {
+            tcx.nth = -1;
+        } else if take_edit_event(&ev, &root, &tcx) {
         } else if ev.kind != EV_WORD {
-            let d = diag(c"error", c"edit.usage");
+            let d = diag(c"error", c"edit.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
             buf_str(d, c"'\n");
-            return usage_try();
+            return usage_try(&tcx);
         } else if insert && root == 0 as *u8 && crate::base::is_source_path(ev.value) {
             root = ev.value;
         } else if insert {
-            return usage(c"insert --in NAME --after|--before ANCHOR < TEXT");
+            return usage(c"insert --in NAME --after|--before ANCHOR < TEXT", &tcx);
         } else {
             names.push(ev.value as i64);
         }
@@ -241,134 +211,135 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
             root = names.data[1] as *u8;
             names.count = 1;
         }
-        if insert && NTH < 0 {
-            return usage(c"--all is for patch; insert --in takes --nth N");
+        if insert && tcx.nth < 0 {
+            return usage(c"--all is for patch; insert --in takes --nth N", &tcx);
         }
         if insert && names.count != 1 {
             return usage(if names.count == 0 { c"--in NAME is needed" }
-                else { c"one TARGET at a time" });
+                else { c"one TARGET at a time" }, &tcx);
         }
         if names.count > 1 {
-            return usage(c"one TARGET on the command line; the pairs of others follow --in NAME (or `@@ NAME` in --pairs FILE)");
+            return usage(c"one TARGET on the command line; the pairs of others follow --in NAME (or `@@ NAME` in --pairs FILE)", &tcx);
         }
         // (0.15) The command line's TARGET: the pairs before any --in or
         // `@@ NAME` are its.
         var first_target = -1;
         if !insert && names.count == 1 {
-            first_target = target_index(c_slice(names.data[0] as *u8));
+            first_target = target_index(c_slice(names.data[0] as *u8), &tcx);
         }
-        if OLDS.count != NEWS.count {
-            return usage(c"each --old needs its --new");
+        if tcx.olds.count != tcx.news.count {
+            return usage(c"each --old needs its --new", &tcx);
         }
         if insert && anchor == 0 as *u8 {
-            return usage(c"insert --in needs --after ANCHOR or --before ANCHOR");
+            return usage(c"insert --in needs --after ANCHOR or --before ANCHOR", &tcx);
         }
-        TARGET_ARG = if names.count == 1 { names.data[0] as *u8 }
-            else if TARGETS.count > 0 { TARGETS.data[0] as *u8 } else { c"" };
-        ROOT_GIVEN = root;
+        tcx.target_arg = if names.count == 1 { names.data[0] as *u8 }
+            else if tcx.patch_targets.count > 0 { tcx.patch_targets.data[0] as *u8 } else { c"" };
+        tcx.root_given = root;
         // The texts first: nothing is read when there are none.
         let input = buf_new();
-        if PAIRS_FILE != 0 as *u8 {
-            if !read_file_if(PAIRS_FILE, input) {
-                let d = diag(c"error", c"edit.no-text");
+        if tcx.pairs_file != 0 as *u8 {
+            if !read_file_if(tcx.pairs_file, input) {
+                let d = diag(c"error", c"edit.no-text", &tcx);
                 buf_str(d, c"cannot read --pairs ");
-                buf_str(d, PAIRS_FILE);
+                buf_str(d, tcx.pairs_file);
                 buf_byte(d, '\n');
                 return 2;
             }
-            FROM_STDIN = true;
+            tcx.from_stdin = true;
             // (0.25.5: after the --old/--new pairs, if any; its blocks
             // before an `@@` line are the command line's TARGET's)
-            CUR_TARGET = -1;
-            if !read_pairs(buf_slice(input)) {
+            tcx.cur_target = -1;
+            if !read_pairs(buf_slice(input), &tcx) {
                 return 2;
             }
-        } else if insert || OLDS.count == 0 {
-            if !read_stdin(input) || BUFS[input].len == 0 {
-                let d = diag(c"error", c"edit.no-text");
+        } else if insert || tcx.olds.count == 0 {
+            if !read_stdin(input, &tcx) || BUFS[input].len == 0 {
+                let d = diag(c"error", c"edit.no-text", &tcx);
                 if insert {
                     buf_str(d, c"the text to insert is read from stdin; none was given\n");
-                    let out = try_begin(WHAT, target(), true);
+                    let out = try_begin(tcx.what, target(tcx), true, &tcx);
                     buf_str(out, if after { c" --after" } else { c" --before" });
                     put_sh(out, c_slice(anchor));
                     buf_str(out, c" < text.vl");
                     try_end(out);
                 } else {
                     buf_str(d, c"no --old/--new pairs, and none on stdin\n");
-                    let out = try_begin(WHAT, target(), true);
+                    let out = try_begin(tcx.what, target(tcx), true, &tcx);
                     buf_str(out, c" --old OLD --new NEW");
                     try_end(out);
                 }
                 return 2;
             }
             if !insert {
-                FROM_STDIN = true;
-                if !read_pairs(buf_slice(input)) {
+                tcx.from_stdin = true;
+                if !read_pairs(buf_slice(input), &tcx) {
                     return 2;
                 }
             }
         }
-        if !insert && !own_targets(first_target) {
+        if !insert && !own_targets(first_target, &tcx) {
             return 2;
         }
-        for k in 0..OLDS.count {
+        for k in 0..tcx.olds.count {
             // (0.25.5: an empty OLD inserts NEW above its target's line, a
             // FILE:LINE; insert_above)
-            let above = BUFS[OLDS.data[k]].len == 0 && !insert && BUFS[NEWS.data[k]].len > 0
-                && line_target(c_slice(TARGETS.data[PAIR_TARGET.data[k]] as *u8));
-            if !above && (BUFS[OLDS.data[k]].len == 0
-                || (LOOSE && trimmed(buf_slice(OLDS.data[k])).len == 0)) {
-                let d = diag(c"error", c"edit.usage");
+            let above = BUFS[tcx.olds.data[k]].len == 0 && !insert && BUFS[tcx.news.data[k]].len > 0
+                && line_target(c_slice(tcx.patch_targets.data[tcx.pair_target.data[k]] as *u8));
+            if !above && (BUFS[tcx.olds.data[k]].len == 0
+                || (tcx.loose && trimmed(buf_slice(tcx.olds.data[k])).len == 0)) {
+                let d = diag(c"error", c"edit.usage", &tcx);
                 buf_str(d, c"OLD ");
                 buf_int(d, k + 1);
                 buf_str(d,
                     c" is empty; an empty OLD inserts NEW above the line of a FILE:LINE target\n");
-                let out = try_begin(c"patch FILE:LINE --old '' --new TEXT", c_slice(c""), false);
+                let out = try_begin(c"patch FILE:LINE --old '' --new TEXT", c_slice(c""), false,
+                    &tcx);
                 try_end(out);
                 return 2;
             }
         }
-        root = root_or_diag(root, WHAT, target(), true);
+        root = root_or_diag(root, tcx.what, target(tcx), true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
-        ROOT_PATH = root;
-        if !cache_restore(root, TARGET, false) && !load_program(root, TARGET) {
-            program_errors(c"error", root, true);
+        tcx.root_path = root;
+        if !cache_restore(root, tcx.target, false, &tcx) && !load_program(root, tcx.target, &tcx) {
+            program_errors(c"error", root, true, &tcx);
             return 1;
         }
         let summary = buf_new();
         if insert {
-            if !find_scope() {
-                return if rerun_wanted() { rerun_in_std_tree(c.line) } else { 1 };
+            if !find_scope(&tcx) {
+                return if rerun_wanted(tcx) { rerun_in_std_tree(c.line, &tcx) } else { 1 };
             }
-            if !insert_at(c_slice(anchor), after, buf_slice(input)) {
+            if !insert_at(c_slice(anchor), after, buf_slice(input), &tcx) {
                 return 1;
             }
             buf_str(summary, c"inserted in ");
-            buf_bytes(summary, buf_slice(SCOPE_NAME));
+            buf_bytes(summary, buf_slice(tcx.scope_name));
         } else {
             // (0.15) Target by target, in the order they were named; every
             // OLD is found in the text as it was before the edit.
             buf_str(summary, c"patched ");
             var done = 0;
             var named = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            for t in 0..TARGETS.count {
+            for t in 0..tcx.patch_targets.count {
                 var any = false;
-                for k in 0..OLDS.count {
-                    if PAIR_TARGET.data[k] == t {
+                for k in 0..tcx.olds.count {
+                    if tcx.pair_target.data[k] == t {
                         any = true;
                     }
                 }
                 if !any {
                     continue;
                 }
-                TARGET_ARG = TARGETS.data[t] as *u8;
-                if !find_scope() {
-                    return if rerun_wanted() { rerun_in_std_tree(c.line) } else { 1 };
+                tcx.target_arg = tcx.patch_targets.data[t] as *u8;
+                if !find_scope(&tcx) {
+                    return if rerun_wanted(tcx) { rerun_in_std_tree(c.line, &tcx) } else { 1 };
                 }
-                for k in 0..OLDS.count {
-                    if PAIR_TARGET.data[k] == t && !patch_pair(k) {
+                for k in 0..tcx.olds.count {
+                    if tcx.pair_target.data[k] == t && !patch_pair(k, &tcx) {
                         return 1;
                     }
                 }
@@ -376,7 +347,7 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
                 // name it)
                 var seen = false;
                 for x in 0..named.count {
-                    if bytes_eq(buf_slice(named.get(x)), buf_slice(SCOPE_NAME)) {
+                    if bytes_eq(buf_slice(named.get(x)), buf_slice(tcx.scope_name)) {
                         seen = true;
                     }
                 }
@@ -384,34 +355,34 @@ pub fn run_patch(c: Call<Gpa>) -> i64 {
                     if done > 0 {
                         buf_str(summary, c", ");
                     }
-                    buf_bytes(summary, buf_slice(SCOPE_NAME));
-                    named.push(SCOPE_NAME);
+                    buf_bytes(summary, buf_slice(tcx.scope_name));
+                    named.push(tcx.scope_name);
                     done += 1;
                 }
             }
         }
         // (0.14: the imports the new text needs, when it has new errors)
-        ADD_IMPORTS = true;
-        apply_edit(buf_slice(summary), root)
+        tcx.add_imports = true;
+        apply_edit(buf_slice(summary), root, &tcx)
     }
 }
 
 // TARGET as given.
-fn target() -> [u8] {
-    c_slice(TARGET_ARG)
+fn target(tcx: Tcx<Comp>) -> [u8] {
+    c_slice(tcx.target_arg)
 }
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"edit.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"edit.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    usage_try()
+    usage_try(&tcx)
 }
 
-fn usage_try() -> i64 {
-    let insert = streq(WHAT, c"insert --in");
+fn usage_try(tcx: inout Tcx<Comp>) -> i64 {
+    let insert = streq(tcx.what, c"insert --in");
     let out = try_begin(if insert { c"insert --in NAME --after ANCHOR < text.vl" }
-        else { c"patch NAME --old OLD --new NEW" }, c_slice(c""), false);
+        else { c"patch NAME --old OLD --new NEW" }, c_slice(c""), false, &tcx);
     try_end(out);
     2
 }
@@ -457,8 +428,8 @@ fn is_marker(line: [u8], marker: *u8) -> bool {
 
 // The pairs of stdin: `<<<<<<< OLD`, its lines, `=======`, NEW's lines,
 // `>>>>>>> NEW`; blank lines between blocks. False after the diagnostic.
-fn read_pairs(input: [u8]) -> bool {
-    let before = OLDS.count;
+fn read_pairs(input: [u8], tcx: inout Tcx<Comp>) -> bool {
+    let before = tcx.olds.count;
     var state = 0;
     var text = -1;
     var lines = 0;
@@ -480,25 +451,25 @@ fn read_pairs(input: [u8]) -> bool {
                 // (0.15) `@@ TARGET`: the blocks after it are TARGET's
                 let name = trimmed(line[2..line.len]);
                 if name.len == 0 {
-                    return format_error(n, c"@@ needs a TARGET (`@@ NAME`)");
+                    return format_error(n, c"@@ needs a TARGET (`@@ NAME`)", &tcx);
                 }
-                CUR_TARGET = target_index(name);
+                tcx.cur_target = target_index(name, &tcx);
             } else if trimmed(line).len > 0 {
-                return format_error(n, c"text outside a block");
+                return format_error(n, c"text outside a block", &tcx);
             }
         } else if state == 1 && is_marker(line, c"=======") {
-            OLDS.push(text);
-            PAIR_TARGET.push(CUR_TARGET);
+            tcx.olds.push(text);
+            tcx.pair_target.push(tcx.cur_target);
             state = 2;
             text = buf_new();
             lines = 0;
         } else if state == 2 && is_marker(line, c">>>>>>>") {
-            NEWS.push(text);
+            tcx.news.push(text);
             state = 0;
         }
         else if is_marker(line, c"<<<<<<<") || is_marker(line, c"=======")
             || is_marker(line, c">>>>>>>") {
-            return format_error(n, c"a marker out of place");
+            return format_error(n, c"a marker out of place", &tcx);
         } else {
             if lines > 0 {
                 buf_byte(text, '\n');
@@ -513,18 +484,18 @@ fn read_pairs(input: [u8]) -> bool {
         i = e + 1;
     }
     if state != 0 {
-        return format_error(n, c"a block without its end");
+        return format_error(n, c"a block without its end", &tcx);
     }
-    if OLDS.count == before {
-        return format_error(n, c"no block");
+    if tcx.olds.count == before {
+        return format_error(n, c"no block", &tcx);
     }
     true
 }
 
-fn format_error(line: i64, message: *u8) -> bool {
-    let d = diag(c"error", c"patch.format");
-    if PAIRS_FILE != 0 as *u8 {
-        buf_str(d, PAIRS_FILE);
+fn format_error(line: i64, message: *u8, tcx: inout Tcx<Comp>) -> bool {
+    let d = diag(c"error", c"patch.format", &tcx);
+    if tcx.pairs_file != 0 as *u8 {
+        buf_str(d, tcx.pairs_file);
         buf_str(d, c" line ");
     } else {
         buf_str(d, c"stdin line ");
@@ -533,44 +504,44 @@ fn format_error(line: i64, message: *u8) -> bool {
     buf_str(d, c": ");
     buf_str(d, message);
     buf_str(d, c"; pairs are blocks of lines: <<<<<<< OLD, the old lines, =======, the new lines, >>>>>>> NEW\n");
-    let out = try_begin(c"patch NAME --old OLD --new NEW", c_slice(c""), false);
+    let out = try_begin(c"patch NAME --old OLD --new NEW", c_slice(c""), false, &tcx);
     try_end(out);
     false
 }
 
 // TARGET's text, its name. False after the diagnostic.
-fn find_scope() -> bool {
+fn find_scope(tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        SCOPE_NAME = buf_new();
-        let name = target();
+        tcx.scope_name = buf_new();
+        let name = target(tcx);
         // A module's use lines or header comment (0.12): from its first
         // region's first line to its last region's last line.
         var rf = 0;
         var rk = 0;
         var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let r = region_target(name, WHAT, &rf, &rk, &spans);
+        let r = region_target(name, tcx.what, &rf, &rk, &spans, &tcx);
         if r == 1 {
             return false;
         }
         if r == 0 {
             if spans.count == 0 {
-                let d = diag(c"error", c"patch.no-region");
+                let d = diag(c"error", c"patch.no-region", &tcx);
                 buf_str(d,
                     if rk == 1 { c"no use lines in " } else if rk == 2 { c"no header comment in " }
                     else { c"no extern block in " });
-                buf_bytes(d, mod_fqn_text(FILES[rf].module));
+                buf_bytes(d, mod_fqn_text(FILES[rf].module, &tcx));
                 buf_str(d,
                     if rk == 3 { c"; edit replace adds one\n" }
                     else { c"; edit replace adds them\n" });
-                let out = try_begin(c"replace", name, true);
+                let out = try_begin(c"replace", name, true, &tcx);
                 buf_str(out, if rk == 1 { c" < uses.vl" } else if rk == 2 { c" < header.txt" }
                     else { c" < extern.vl" });
                 try_end(out);
                 return false;
             }
-            SCOPE_START = spans.data[0];
-            SCOPE_END = spans.data[spans.count - 1];
-            buf_bytes(SCOPE_NAME, name);
+            tcx.scope_start = spans.data[0];
+            tcx.scope_end = spans.data[spans.count - 1];
+            buf_bytes(tcx.scope_name, name);
             return true;
         }
         // A file of the program: all of it.
@@ -581,35 +552,35 @@ fn find_scope() -> bool {
                     && (bytes_eq(p, name) || (p.len > name.len
                         && bytes_eq(p[p.len as i64 - name.len as i64..], name)
                         && p[p.len as i64 - name.len as i64 - 1] == '/')) {
-                    SCOPE_START = FILES[g].start;
-                    SCOPE_END = FILES[g].end;
-                    buf_bytes(SCOPE_NAME, mod_fqn_text(FILES[g].module));
+                    tcx.scope_start = FILES[g].start;
+                    tcx.scope_end = FILES[g].end;
+                    buf_bytes(tcx.scope_name, mod_fqn_text(FILES[g].module, &tcx));
                     return true;
                 }
             }
             // (0.25.5: one of std's files, named by `@@ FILE` in --pairs:
             // the command runs again in std's files, as for a FILE argument)
-            if std_file_rerun(name) {
+            if std_file_rerun(name, &tcx) {
                 return false;
             }
-            let d = diag(c"error", c"query.no-match");
+            let d = diag(c"error", c"query.no-match", &tcx);
             buf_str(d, c"no file '");
             buf_bytes(d, name);
             buf_str(d, c"' in the program\n");
-            try_end(try_begin(c"items", name[0..0], false));
+            try_end(try_begin(c"items", name[0..0], false, &tcx));
             return false;
         }
         // (0.14) FILE:LINE on a line no item holds
-        if gap_scope(name) {
+        if gap_scope(name, &tcx) {
             return true;
         }
         var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !resolve_name(WHAT, target(), &matches) {
+        if !resolve_name(tcx.what, target(tcx), &matches, &tcx) {
             return false;
         }
         source_only(&matches);
         if matches.count > 1 {
-            ambiguous(WHAT, target(), matches);
+            ambiguous(tcx.what, target(tcx), matches, &tcx);
             return false;
         }
         let d = matches.data[0];
@@ -617,17 +588,17 @@ fn find_scope() -> bool {
         if FILES[f].path[0] == '<' {
             // (0.17: std, in the repository: run_patch runs again in its
             // files; stdedit.vl)
-            if std_rerun(f) {
+            if std_rerun(f, &tcx) {
                 return false;
             }
-            let e = diag(c"error", c"edit.not-source");
+            let e = diag(c"error", c"edit.not-source", &tcx);
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
             buf_str(e, c" is in ");
             buf_str(e, FILES[f].path);
             buf_str(e, c", not in a file of the program\n");
             return false;
         }
-        buf_bytes(SCOPE_NAME, SYMS[DEFS[d].fqn].text);
+        buf_bytes(tcx.scope_name, SYMS[DEFS[d].fqn].text);
         // A module of a file of its own (`mod m;`): that file; but its
         // `mod m;` line when named by FILE:LINE (0.17).
         var at_line = 0;
@@ -635,22 +606,22 @@ fn find_scope() -> bool {
             for g in 0..FILES.len() {
                 if FILES[g].path[0] != '<' && FILES[g].kind == SOURCE_VOLE
                     && (FILES[g].start < DEFS[d].start || FILES[g].start >= DEFS[d].end)
-                    && bytes_eq(mod_fqn_text(FILES[g].module), SYMS[DEFS[d].fqn].text) {
-                    SCOPE_START = FILES[g].start;
-                    SCOPE_END = FILES[g].end;
+                    && bytes_eq(mod_fqn_text(FILES[g].module, &tcx), SYMS[DEFS[d].fqn].text) {
+                    tcx.scope_start = FILES[g].start;
+                    tcx.scope_end = FILES[g].end;
                     return true;
                 }
             }
         }
-        SCOPE_START = line_start(text_start(d));
-        SCOPE_END = after_line(item_tail(d) - 1);
+        tcx.scope_start = line_start(text_start(d));
+        tcx.scope_end = after_line(item_tail(d, tcx) - 1);
         // (0.25.5, feedbacks/headless254.md #4) A module of no file of its
         // own, `pub mod m { ... }`: its text to its closing brace (its
         // definition ends at the brace that opens it)
         if DEFS[d].kind == K_MOD {
             let close = closing_brace(DEFS[d].end);
-            if close > SCOPE_END {
-                SCOPE_END = after_line(close - 1);
+            if close > tcx.scope_end {
+                tcx.scope_end = after_line(close - 1);
             }
         }
         true
@@ -662,7 +633,7 @@ fn find_scope() -> bool {
 // the header or the use lines. Then the scope is the lines between the
 // items around it: from the end of the item before (or the file's start)
 // to the text of the item after (its comments; or the file's end).
-fn gap_scope(name: [u8]) -> bool {
+fn gap_scope(name: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var line = 0;
         let n = file_line(name, &line);
@@ -687,7 +658,7 @@ fn gap_scope(name: [u8]) -> bool {
                 continue;
             }
             let s = line_start(text_start(d));
-            let e = after_line(item_tail(d) - 1);
+            let e = after_line(item_tail(d, tcx) - 1);
             if e <= pos && e > from {
                 from = e;
             }
@@ -695,19 +666,19 @@ fn gap_scope(name: [u8]) -> bool {
                 to = s;
             }
         }
-        SCOPE_START = from;
-        SCOPE_END = to;
-        buf_bytes(SCOPE_NAME, name);
+        tcx.scope_start = from;
+        tcx.scope_end = to;
+        buf_bytes(tcx.scope_name, name);
         true
     }
 }
 
 // Where OLD ends when it matches at p (with --loose, blanks match any
 // blanks), or -1.
-fn match_at(p: i64, old: [u8]) -> i64 {
+fn match_at(p: i64, old: [u8], tcx: Tcx<Comp>) -> i64 {
     var q = p;
-    if !LOOSE {
-        if p + old.len as i64 > SCOPE_END {
+    if !tcx.loose {
+        if p + old.len as i64 > tcx.scope_end {
             return -1;
         }
         for i in 0..old.len as i64 {
@@ -727,14 +698,14 @@ fn match_at(p: i64, old: [u8]) -> i64 {
             while i < t.len as i64 && is_blank(t[i]) {
                 i += 1;
             }
-            if q >= SCOPE_END || !is_blank(SRC[q]) {
+            if q >= tcx.scope_end || !is_blank(SRC[q]) {
                 return -1;
             }
-            while q < SCOPE_END && is_blank(SRC[q]) {
+            while q < tcx.scope_end && is_blank(SRC[q]) {
                 q += 1;
             }
         } else {
-            if q >= SCOPE_END || SRC[q] != t[i] {
+            if q >= tcx.scope_end || SRC[q] != t[i] {
                 return -1;
             }
             i += 1;
@@ -749,11 +720,11 @@ fn match_at(p: i64, old: [u8]) -> i64 {
 // (from a line's start or its indentation to a line's end), only those
 // count, so that `total` names the line `total` rather than a part of
 // `total += i;`.
-fn find_all(old: [u8], starts: inout IntVec, ends: inout IntVec) {
+fn find_all(old: [u8], starts: inout IntVec, ends: inout IntVec, tcx: Tcx<Comp>) {
     unsafe {
         var whole = 0;
-        for p in SCOPE_START..SCOPE_END {
-            let e = match_at(p, old);
+        for p in tcx.scope_start..tcx.scope_end {
+            let e = match_at(p, old, tcx);
             if e >= 0 {
                 starts.push(p);
                 ends.push(e);
@@ -784,13 +755,13 @@ fn whole_match(p: i64, e: i64) -> bool {
     spaces_only(line_start(p), p) && (SRC[e - 1] == '\n' || spaces_only(e, line_end(e)))
 }
 
-fn count_in_scope(text: [u8]) -> i64 {
+fn count_in_scope(text: [u8], tcx: Tcx<Comp>) -> i64 {
     var n = 0;
     if text.len == 0 {
         return 0;
     }
-    var p = SCOPE_START;
-    while p + text.len as i64 <= SCOPE_END {
+    var p = tcx.scope_start;
+    while p + text.len as i64 <= tcx.scope_end {
         var ok = true;
         for i in 0..text.len as i64 {
             if SRC[p + i] != text[i] {
@@ -818,39 +789,39 @@ fn spaces_only(from: i64, to: i64) -> bool {
 
 // Pair k: its one match replaced (0.16: with --nth N its Nth, with --all
 // every one). False after the diagnostic.
-fn patch_pair(k: i64) -> bool {
+fn patch_pair(k: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        let old = buf_slice(OLDS.data[k]);
+        let old = buf_slice(tcx.olds.data[k]);
         if old.len == 0 {
-            return insert_above(k);
+            return insert_above(k, &tcx);
         }
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_all(old, &starts, &ends);
-        let was_loose = LOOSE;
-        if starts.count == 0 && !loose_once(k, old, &starts, &ends) {
-            no_match(k);
+        find_all(old, &starts, &ends, tcx);
+        let was_loose = tcx.loose;
+        if starts.count == 0 && !loose_once(k, old, &starts, &ends, &tcx) {
+            no_match(k, &tcx);
             return false;
         }
-        if starts.count > 1 && NTH == 0 {
-            several(k, starts, ends);
+        if starts.count > 1 && tcx.nth == 0 {
+            several(k, starts, ends, &tcx);
             return false;
         }
-        if NTH > starts.count {
-            nth_past(k, starts.count);
+        if tcx.nth > starts.count {
+            nth_past(k, starts.count, &tcx);
             return false;
         }
         var lo = 0;
         var hi = starts.count;
-        if NTH > 0 {
-            lo = NTH - 1;
-            hi = NTH;
+        if tcx.nth > 0 {
+            lo = tcx.nth - 1;
+            hi = tcx.nth;
         }
-        let new = buf_slice(NEWS.data[k]);
+        let new = buf_slice(tcx.news.data[k]);
         for m in lo..hi {
             var s = starts.data[m];
             var e = ends.data[m];
-            let text = if LOOSE { reindented(new, s, old) } else { text_buffer(new) };
+            let text = if tcx.loose { reindented(new, s, old) } else { text_buffer(new) };
             // (whole lines replaced by nothing: the lines go)
             if BUFS[text].len == 0 && spaces_only(line_start(s), s) {
                 if SRC[e - 1] == '\n' {
@@ -867,52 +838,46 @@ fn patch_pair(k: i64) -> bool {
                     e = after_line(e);
                 }
             }
-            if !replaced(k, s, e, text) {
+            if !replaced(k, s, e, text, &tcx) {
                 return false;
             }
         }
-        LOOSE = was_loose;
+        tcx.loose = was_loose;
         true
     }
 }
 
-// (0.25.5) The replacements made so far: their ranges in SRC and their
-// pairs, to name the one a later pair overlaps.
-static var R_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var R_PAIR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // SRC[s..e) replaced by buffer text for pair k: false after `patch.overlap`,
 // naming both pairs, when it overlaps the range of an earlier one (ranges
 // that only touch, one ending where the next begins, do not overlap).
-fn replaced(k: i64, s: i64, e: i64, text: i64) -> bool {
+fn replaced(k: i64, s: i64, e: i64, text: i64, tcx: inout Tcx<Comp>) -> bool {
     if edit_replace(s, e, text) {
-        R_START.push(s);
-        R_END.push(e);
-        R_PAIR.push(k);
+        tcx.patch_r_start.push(s);
+        tcx.patch_r_end.push(e);
+        tcx.r_pair.push(k);
         return true;
     }
     var other = -1;
-    for i in 0..R_START.count {
-        let a = R_START.get(i);
-        let b = R_END.get(i);
+    for i in 0..tcx.patch_r_start.count {
+        let a = tcx.patch_r_start.get(i);
+        let b = tcx.patch_r_end.get(i);
         if (s < b && a < e) || (s == e && a < s && s < b) || (a == b && s < a && a < e) {
             other = i;
             break;
         }
     }
-    let d = diag(c"error", c"patch.overlap");
+    let d = diag(c"error", c"patch.overlap", &tcx);
     buf_str(d, c"OLD ");
     buf_int(d, k + 1);
     put_lines(d, s, e);
-    if other >= 0 && R_PAIR.get(other) != k {
+    if other >= 0 && tcx.r_pair.get(other) != k {
         buf_str(d, c" overlaps OLD ");
-        buf_int(d, R_PAIR.get(other) + 1);
-        put_lines(d, R_START.get(other), R_END.get(other));
+        buf_int(d, tcx.r_pair.get(other) + 1);
+        put_lines(d, tcx.patch_r_start.get(other), tcx.patch_r_end.get(other));
         buf_str(d, c"; make them one pair (OLDs that only touch are fine)\n");
     } else if other >= 0 {
         buf_str(d, c" overlaps another match of itself");
-        put_lines(d, R_START.get(other), R_END.get(other));
+        put_lines(d, tcx.patch_r_start.get(other), tcx.patch_r_end.get(other));
         buf_str(d, c"; give more of the text around it, or --nth N\n");
     } else {
         buf_str(d, c" overlaps an edit before it; make them one pair\n");
@@ -990,8 +955,8 @@ fn line_target(name: [u8]) -> bool {
 // of its target, a FILE:LINE (the line as the file was before the edit),
 // indented like that line; several at one line keep their order. False
 // after the diagnostic.
-fn insert_above(k: i64) -> bool {
-    let name = target();
+fn insert_above(k: i64, tcx: inout Tcx<Comp>) -> bool {
+    let name = target(tcx);
     var line = 0;
     let n = file_line(name, &line);
     let f = if n > 0 { file_named(name[0..n]) } else { -1 };
@@ -1003,19 +968,19 @@ fn insert_above(k: i64) -> bool {
     }
     let idx = if f >= 0 && line > 0 { line_index(start) + line - 1 } else { -1 };
     if idx < 0 || idx >= LINES.count || LINES.get(idx) >= end {
-        let d = diag(c"error", c"edit.usage");
+        let d = diag(c"error", c"edit.usage", &tcx);
         buf_str(d, c"OLD ");
         buf_int(d, k + 1);
         buf_str(d, c" is empty, and ");
         buf_bytes(d, name);
         buf_str(d, c" is no line of a file of the program: an empty OLD inserts NEW above the line of a FILE:LINE target\n");
-        try_end(try_begin(c"query text", name, false));
+        try_end(try_begin(c"query text", name, false, &tcx));
         return false;
     }
     let pos = LINES.get(idx);
     let out = buf_new();
-    indented_block(out, indent_of(pos), buf_slice(NEWS.get(k)));
-    replaced(k, pos, pos, out)
+    indented_block(out, indent_of(pos), buf_slice(tcx.news.get(k)));
+    replaced(k, pos, pos, out, &tcx)
 }
 
 // The lines of input into out, each ended, the least indented ones with
@@ -1052,21 +1017,21 @@ fn indented_block(out: i64, indent: [u8], input: [u8]) {
 // another depth): matched so, as --loose does (NEW re-indented like the
 // lines it replaces), with a note saying so. True then, its one match in
 // starts and ends; LOOSE stays set for the pair (patch_pair restores it).
-fn loose_once(k: i64, old: [u8], starts: inout IntVec, ends: inout IntVec) -> bool {
-    if LOOSE || !old_has_lines(old) {
+fn loose_once(k: i64, old: [u8], starts: inout IntVec, ends: inout IntVec, tcx: inout Tcx<Comp>) -> bool {
+    if tcx.loose || !old_has_lines(old) {
         return false;
     }
-    LOOSE = true;
-    find_all(old, &starts, &ends);
+    tcx.loose = true;
+    find_all(old, &starts, &ends, tcx);
     if starts.count != 1 {
-        LOOSE = false;
+        tcx.loose = false;
         starts.count = 0;
         ends.count = 0;
         return false;
     }
     let s = starts.pop();
     starts.push(s);
-    let d = diag(c"note", c"patch.loose");
+    let d = diag(c"note", c"patch.loose", &tcx);
     buf_str(d, c"OLD ");
     buf_int(d, k + 1);
     buf_str(d, c" matched with other indentation at line ");
@@ -1101,29 +1066,29 @@ fn old_has_lines(old: [u8]) -> bool {
 // where it starts, indented like that line (one level more after a line
 // ending with `{`, or before one starting with `}`). False after the
 // diagnostic.
-fn insert_at(anchor: [u8], after: bool, input: [u8]) -> bool {
+fn insert_at(anchor: [u8], after: bool, input: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        INSERT_AFTER = after;
-        OLDS.count = 0;
-        NEWS.count = 0;
-        OLDS.push(text_buffer(anchor));
-        NEWS.push(text_buffer(anchor));
+        tcx.insert_after = after;
+        tcx.olds.count = 0;
+        tcx.news.count = 0;
+        tcx.olds.push(text_buffer(anchor));
+        tcx.news.push(text_buffer(anchor));
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_all(anchor, &starts, &ends);
+        find_all(anchor, &starts, &ends, tcx);
         if starts.count == 0 {
-            no_match(0);
+            no_match(0, &tcx);
             return false;
         }
-        if starts.count > 1 && NTH <= 0 {
-            several(0, starts, ends);
+        if starts.count > 1 && tcx.nth <= 0 {
+            several(0, starts, ends, &tcx);
             return false;
         }
-        if NTH > starts.count {
-            nth_past(0, starts.count);
+        if tcx.nth > starts.count {
+            nth_past(0, starts.count, &tcx);
             return false;
         }
-        let m = if NTH > 0 { NTH - 1 } else { 0 };
+        let m = if tcx.nth > 0 { tcx.nth - 1 } else { 0 };
         let s = starts.data[m];
         let e = ends.data[m];
         let at = if after { if e > s { e - 1 } else { e } } else { s };

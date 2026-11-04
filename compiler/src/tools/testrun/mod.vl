@@ -35,18 +35,18 @@ use crate::base::{
     IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_hex, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, streq, strlen,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{
     Call, EV_MISSING, EV_WORD, Leaf, flag, is_flag, is_opt, long_of, option, short_option, table,
 };
 use crate::front::cpp::directives::file_exists;
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{
     absolute_path, buf_cstr, make_dirs, read_file_if, read_stdin, run_capture, write_file_if,
 };
 use crate::tools::query::{c_slice, parse_count};
-use crate::tools::query::diagnostics::{
-    PROG, TOOL, diag, put_cword, try_begin, try_end, write_diags,
-};
-use crate::tools::testrun::program::{ACCEPT, CASES, NO_CHECK_ALLOC, NO_CONTRACTS, SEED, run_all};
+use crate::tools::query::diagnostics::{PROG, diag, put_cword, try_begin, try_end, write_diags};
+use crate::tools::testrun::program::run_all;
 use crate::tools::testrun::repo::run_repo;
 use crate::tools::v018::not_yet;
 
@@ -65,61 +65,40 @@ extern "C" {
     fn gettimeofday(tv: *i64, tz: *u8) -> i32;
 }
 
-// The options.
-static var BUDGET: i64 = 4000;
-static var BUDGET_GIVEN: bool = false;
-static var FULL: bool = false;
-static var TIMEOUT: i64 = 10;
-static var OPT: *u8 = 0 as *u8;
-static var INPUT: *u8 = 0 as *u8;
-static var DIR: *u8 = 0 as *u8;
-// (0.17) Programs are built with --trace (not at -O0, nor with --no-trace):
-// a failed check prints the calls that led to it, a time limit where it ran.
-static var TRACED: bool = true;
-// (0.17) In the vole tree: the compiler failures are run again with
-// (`--against C`; "none": not run again; 0: target/tools/volec).
-pub static var AGAINST: *u8 = 0 as *u8;
-static var FILTERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The arguments as typed but --budget and --full, for the `--full` hint.
-static var ARGS: i64 = -1;
-// (0.25.3) --show-output (Rust's --nocapture too): each test's stdout and
-// stderr, under its name.
-pub static var SHOW_OUTPUT: bool = false;
-
 // Lines of difference (or stderr) shown per failing case, and columns.
-fn detail_lines() -> i64 {
-    if FULL { 40 } else { 4 }
+fn detail_lines(tcx: Tcx<Comp>) -> i64 {
+    if tcx.full { 40 } else { 4 }
 }
 
 // Lines of stderr shown for a case that failed or ran out of time: its
 // message and (0.17) the trace after it.
-fn stderr_lines() -> i64 {
-    if FULL { 40 } else { 12 }
+fn stderr_lines(tcx: Tcx<Comp>) -> i64 {
+    if tcx.full { 40 } else { 12 }
 }
 
 // Whether the program is built with --trace.
-fn traced() -> bool {
-    TRACED && !(OPT != 0 as *u8 && streq(OPT, c"-O0"))
+fn traced(tcx: Tcx<Comp>) -> bool {
+    tcx.traced && !(tcx.testrun_opt != 0 as *u8 && streq(tcx.testrun_opt, c"-O0"))
 }
 
-fn columns() -> i64 {
-    if FULL { 400 } else { 160 }
+fn columns(tcx: Tcx<Comp>) -> i64 {
+    if tcx.full { 400 } else { 160 }
 }
 
 // (0.25.3) Lines of a test's own output shown per stream: under its
 // failure, and with --show-output under its name.
-fn output_lines() -> i64 {
-    if FULL { 400 } else if SHOW_OUTPUT { 50 } else { 8 }
+fn output_lines(tcx: Tcx<Comp>) -> i64 {
+    if tcx.full { 400 } else if tcx.show_output { 50 } else { 8 }
 }
 
-pub fn run_test(c: Call<Gpa>) -> i64 {
-    let status = test_inner(c);
-    write_diags();
+pub fn run_test(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = test_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(why: *u8, word: *u8) -> i64 {
-    let d = diag(c"error", c"test.usage");
+fn usage(why: *u8, word: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"test.usage", &tcx);
     buf_str(d, why);
     if word != 0 as *u8 {
         buf_str(d, c" '");
@@ -160,10 +139,10 @@ pub fn test_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "filter")
 }
 
-fn test_inner(c: Call<Gpa>) -> i64 {
+fn test_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
-    TOOL = 0 as *u8;
-    ARGS = buf_new();
+    tcx.tool = 0 as *u8;
+    tcx.testrun_args = buf_new();
     // (0.25.5) $VOLE_TEST_CASE_TIMEOUT: the time limit's default, in
     // seconds (--timeout overrides it): a runner gives the tests more time
     // on a loaded machine, as its other time budgets get (tests/book)
@@ -173,7 +152,7 @@ fn test_inner(c: Call<Gpa>) -> i64 {
             buf_bytes(b, v.as_bytes());
             let n = parse_count(buf_cstr(b));
             if n > 0 {
-                TIMEOUT = n;
+                tcx.testrun_timeout = n;
             }
         }
         Err(_) => {}
@@ -186,112 +165,112 @@ fn test_inner(c: Call<Gpa>) -> i64 {
         // the option, for ARGS (`--cases` of `--cases 5`)
         let spelled = long_of(ev);
         if ev.kind == EV_MISSING {
-            return usage(c"a value is needed after", a);
+            return usage(c"a value is needed after", a, &tcx);
         }
         if is_flag(ev, "accept") || is_flag(ev, "no-contracts")
             || is_flag(ev, "no-check-alloc") {
             if ev.name == "accept" {
-                ACCEPT = true;
+                tcx.accept = true;
             } else if ev.name == "no-contracts" {
-                NO_CONTRACTS = true;
+                tcx.no_contracts = true;
             } else {
-                NO_CHECK_ALLOC = true;
+                tcx.no_check_alloc = true;
             }
-            put_cword(ARGS, a);
+            put_cword(tcx.testrun_args, a);
         } else if is_opt(ev, "cases") || is_opt(ev, "seed") {
             if ev.name == "cases" {
                 let n = parse_count(a);
                 if n <= 0 {
-                    return usage(c"--cases takes a number, not", a);
+                    return usage(c"--cases takes a number, not", a, &tcx);
                 }
-                CASES = n;
+                tcx.cases = n;
             } else {
-                SEED = a;
+                tcx.seed = a;
             }
-            put_cword(ARGS, spelled);
-            put_cword(ARGS, a);
+            put_cword(tcx.testrun_args, spelled);
+            put_cword(tcx.testrun_args, a);
         } else if is_flag(ev, "fuzz") || is_flag(ev, "gen") {
-            return not_yet(c"test.not-yet", a, if ev.name == "fuzz" { c"T3" } else { c"T2" });
+            return not_yet(c"test.not-yet", a, if ev.name == "fuzz" { c"T3" } else { c"T2" }, &tcx);
         } else if is_flag(ev, "full") {
-            FULL = true;
+            tcx.full = true;
         } else if is_flag(ev, "show-output") || is_flag(ev, "nocapture") {
-            SHOW_OUTPUT = true;
-            put_cword(ARGS, a);
+            tcx.show_output = true;
+            put_cword(tcx.testrun_args, a);
         } else if is_opt(ev, "against") {
-            AGAINST = a;
+            tcx.against = a;
         } else if is_flag(ev, "no-trace") {
-            TRACED = false;
-            put_cword(ARGS, a);
+            tcx.traced = false;
+            put_cword(tcx.testrun_args, a);
         } else if is_opt(ev, "budget") {
             let n = parse_count(a);
             if n <= 0 {
-                return usage(c"--budget takes a number of tokens, not", a);
+                return usage(c"--budget takes a number of tokens, not", a, &tcx);
             }
-            BUDGET = n * 4;
-            BUDGET_GIVEN = true;
+            tcx.budget = n * 4;
+            tcx.budget_given = true;
         } else if is_opt(ev, "timeout") {
             let n = parse_count(a);
             if n <= 0 {
-                return usage(c"--timeout takes a number of seconds, not", a);
+                return usage(c"--timeout takes a number of seconds, not", a, &tcx);
             }
-            TIMEOUT = n;
-            put_cword(ARGS, spelled);
-            put_cword(ARGS, a);
+            tcx.testrun_timeout = n;
+            put_cword(tcx.testrun_args, spelled);
+            put_cword(tcx.testrun_args, a);
         } else if is_opt(ev, "dir") || is_opt(ev, "input") || is_opt(ev, "root") {
             if ev.name == "dir" {
-                DIR = a;
+                tcx.testrun_dir = a;
             } else if ev.name == "input" {
-                INPUT = a;
+                tcx.testrun_input = a;
             } else {
                 root = a;
             }
-            put_cword(ARGS, spelled);
-            put_cword(ARGS, a);
+            put_cword(tcx.testrun_args, spelled);
+            put_cword(tcx.testrun_args, a);
         } else if is_opt(ev, "O") {
             let level = ev.text.as_bytes();
             if !(level.len == 1 && level[0] >= '0' && level[0] <= '2') {
-                return usage(c"-O takes 0, 1 or 2, not", a);
+                return usage(c"-O takes 0, 1 or 2, not", a, &tcx);
             }
             let b = buf_new();
             buf_str(b, c"-O");
             buf_str(b, a);
-            OPT = buf_cstr(b);
-            put_cword(ARGS, OPT);
+            tcx.testrun_opt = buf_cstr(b);
+            put_cword(tcx.testrun_args, tcx.testrun_opt);
         } else if ev.kind != EV_WORD || (ev.text.starts_with("-") && ev.text.len() > 1) {
-            return usage(c"unknown option", a);
+            return usage(c"unknown option", a, &tcx);
         } else if crate::base::is_source_path(a) {
             if root != 0 as *u8 {
                 // (0.25.2.2, eval 0.25.2.1: terrain) `volec test a.vl b.vl`:
                 // the root pulls in the rest
-                let d = diag(c"error", c"test.usage");
+                let d = diag(c"error", c"test.usage", &tcx);
                 buf_str(d, c"one ROOT at most; a second '");
                 buf_str(d, a);
                 buf_str(d,
                     c"': test takes the program's root, whose `mod` lines pull in its other files and their #[test] fns\n");
                 let named = crate::tools::query::roots::root_named(root);
-                let t = try_begin(c"test", c_slice(named), true);
+                let t = try_begin(c"test", c_slice(named), true, &tcx);
                 try_end(t);
                 return 2;
             }
             root = a;
-            put_cword(ARGS, a);
+            put_cword(tcx.testrun_args, a);
         } else {
-            FILTERS.push(a as i64);
-            put_cword(ARGS, a);
+            tcx.filters.push(a as i64);
+            put_cword(tcx.testrun_args, a);
         }
     }
-    if FULL && !BUDGET_GIVEN {
-        BUDGET = 1 << 40;
+    if tcx.full && !tcx.budget_given {
+        tcx.budget = 1 << 40;
     }
     if root == 0 as *u8 && file_exists(c"compiler/src/main.vl")
         && file_exists(c"tests/run.sh") {
-        return run_repo();
+        return run_repo(tcx);
     }
     if root == 0 as *u8 {
         if !file_exists(c"main.vl") {
-            let d = diag(c"error", c"test.no-root");
+            let d = diag(c"error", c"test.no-root", &tcx);
             buf_str(d, c"no main.vl here: name the program's root\n");
-            let t = try_begin(c"test path/to/main.vl", c_slice(c""), false);
+            let t = try_begin(c"test path/to/main.vl", c_slice(c""), false, &tcx);
             try_end(t);
             return 2;
         }
@@ -300,13 +279,13 @@ fn test_inner(c: Call<Gpa>) -> i64 {
     // (0.25.2: a directory, or a module file: its program's main.vl)
     root = crate::tools::query::roots::root_named(root);
     if !file_exists(root) {
-        let d = diag(c"error", c"test.no-root");
+        let d = diag(c"error", c"test.no-root", &tcx);
         buf_str(d, c"no file '");
         buf_str(d, root);
         buf_str(d, c"'\n");
         return 2;
     }
-    run_program(root)
+    run_program(root, &tcx)
 }
 
 // ---- Helpers ----
@@ -395,20 +374,20 @@ fn starts(s: [u8], p: [u8]) -> bool {
 fn fnv(h0: u64, s: [u8]) -> u64 {
     var h = h0;
     for i in 0..s.len {
-        h = (h ^ s[i] as u64) * 1099511628211;
+        h = (h ^ s[i] as u64).wrapping_mul(1099511628211);
     }
     h
 }
 
 // Whether a name passes the filters (any of them is part of it; none:
 // every name).
-fn selected(name: [u8]) -> bool {
+fn selected(name: [u8], tcx: Tcx<Comp>) -> bool {
     unsafe {
-        if FILTERS.count == 0 {
+        if tcx.filters.count == 0 {
             return true;
         }
-        for k in 0..FILTERS.count {
-            if contains(name, c_slice(FILTERS.data[k] as *u8)) {
+        for k in 0..tcx.filters.count {
+            if contains(name, c_slice(tcx.filters.data[k] as *u8)) {
                 return true;
             }
         }
@@ -456,9 +435,9 @@ fn newer_tach(dir1: *u8, dir2: *u8, file: *u8) -> bool {
 }
 
 // Appends line (cut at the column limit) after prefix, and a newline.
-fn put_cut(out: i64, prefix: [u8], line: [u8]) {
+fn put_cut(out: i64, prefix: [u8], line: [u8], tcx: Tcx<Comp>) {
     buf_bytes(out, prefix);
-    let max = columns();
+    let max = columns(tcx);
     if line.len as i64 > max {
         buf_bytes(out, line[0..max]);
         buf_bytes(out, "...");
@@ -497,14 +476,14 @@ fn put_lines_count(out: i64, n: i64) {
 }
 
 // Up to max lines of s from line index `from`, each after prefix.
-fn put_lines(out: i64, s: [u8], from: i64, max: i64, prefix: [u8]) -> i64 {
+fn put_lines(out: i64, s: [u8], from: i64, max: i64, prefix: [u8], tcx: Tcx<Comp>) -> i64 {
     var i = 0;
     var ln = 0;
     var shown = 0;
     while i < s.len as i64 && shown < max {
         let e = line_end(s, i);
         if ln >= from {
-            put_cut(out, prefix, s[i..e]);
+            put_cut(out, prefix, s[i..e], tcx);
             shown += 1;
         }
         ln += 1;
@@ -534,12 +513,12 @@ fn normal(s: [u8]) -> [u8] {
 
 // The failures, as many as the budget holds (one at least), then the
 // names of the rest and the command that prints them.
-fn put_failures(out: i64, blocks: IntVec, names: IntVec) {
+fn put_failures(out: i64, blocks: IntVec, names: IntVec, tcx: Tcx<Comp>) {
     unsafe {
         var shown = 0;
         while shown < blocks.count {
             let b = buf_slice(blocks.data[shown]);
-            if shown > 0 && buf_slice(out).len as i64 + b.len as i64 > BUDGET {
+            if shown > 0 && buf_slice(out).len as i64 + b.len as i64 > tcx.budget {
                 break;
             }
             buf_bytes(out, b);
@@ -563,7 +542,7 @@ fn put_failures(out: i64, blocks: IntVec, names: IntVec) {
             buf_bytes(out, "; all of them:");
             put_cword(out, PROG);
             buf_bytes(out, " test");
-            buf_bytes(out, buf_slice(ARGS));
+            buf_bytes(out, buf_slice(tcx.testrun_args));
             buf_bytes(out, " --full)\n");
         }
     }
@@ -598,13 +577,13 @@ fn work_dir(root_abs: *u8, src_dir: *u8) -> *u8 {
 
 // What the build was made with (the options, the compiler's bytes), kept
 // next to it: another compiler or level builds anew.
-fn build_key() -> [u8] {
+fn build_key(tcx: Tcx<Comp>) -> [u8] {
     unsafe {
         var h = fnv(14695981039346656037, "volec test");
-        if OPT != 0 as *u8 {
-            h = fnv(h, c_slice(OPT));
+        if tcx.testrun_opt != 0 as *u8 {
+            h = fnv(h, c_slice(tcx.testrun_opt));
         }
-        if traced() {
+        if traced(tcx) {
             h = fnv(h, "--trace");
         }
         var slash = false;
@@ -625,29 +604,29 @@ fn build_key() -> [u8] {
 }
 
 // (0.18) build_key at another level than OPT.
-fn build_key_for(level: *u8) -> [u8] {
-    let was = OPT;
-    OPT = level;
-    let key = build_key();
-    OPT = was;
+fn build_key_for(level: *u8, tcx: inout Tcx<Comp>) -> [u8] {
+    let was = tcx.testrun_opt;
+    tcx.testrun_opt = level;
+    let key = build_key(tcx);
+    tcx.testrun_opt = was;
     key
 }
 
 // Builds the program into prog when a source is newer (or there is none):
 // false, with its errors printed, when it does not build.
-fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64) -> bool {
+fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64, tcx: Tcx<Comp>) -> bool {
     let key_file = join(work, "key");
-    let key = build_key();
+    let key = build_key(tcx);
     if program::up_to_date(prog, key_file, key, src_dir) {
         return true;
     }
     let built = join(work, "build");
     let log = buf_new();
-    let trace = if traced() { c"--trace" } else { 0 as *u8 };
-    let rc = if OPT == 0 as *u8 {
+    let trace = if traced(tcx) { c"--trace" } else { 0 as *u8 };
+    let rc = if tcx.testrun_opt == 0 as *u8 {
         run_words(PROG, root, c"-o", built, c"--diagnostics=short", trace, 0 as *u8, log)
     } else {
-        run_words(PROG, root, c"-o", built, c"--diagnostics=short", OPT, trace, log)
+        run_words(PROG, root, c"-o", built, c"--diagnostics=short", tcx.testrun_opt, trace, log)
     };
     if rc != 0 {
         let l = buf_slice(log);
@@ -673,7 +652,7 @@ fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64) -> boo
         while i < l.len as i64 {
             let e = line_end(l, i);
             if e > i {
-                if buf_slice(out).len as i64 + (e - i) > BUDGET {
+                if buf_slice(out).len as i64 + (e - i) > tcx.budget {
                     buf_bytes(out, "(more: ");
                     buf_str(out, PROG);
                     buf_bytes(out, " check ");
@@ -681,7 +660,7 @@ fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64) -> boo
                     buf_bytes(out, ")\n");
                     break;
                 }
-                put_cut(out, "", l[i..e]);
+                put_cut(out, "", l[i..e], tcx);
             }
             i = e + 1;
         }
@@ -693,7 +672,7 @@ fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64) -> boo
 
 // Runs prog with stdin from input (0: none), stdout and stderr into the
 // files: its exit status, 128 + a signal, -1 past the time limit.
-fn run_case(prog: *u8, input: *u8, out_path: *u8, err_path: *u8) -> i64 {
+fn run_case(prog: *u8, input: *u8, out_path: *u8, err_path: *u8, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         let argv = alloc_array::<*u8>(2);
         argv[0] = prog;
@@ -719,7 +698,7 @@ fn run_case(prog: *u8, input: *u8, out_path: *u8, err_path: *u8) -> i64 {
                 dup2(e, 2);
                 close(e);
             }
-            alarm(TIMEOUT as u32);
+            alarm(tcx.testrun_timeout as u32);
             execvp(prog, argv);
             _exit(127);
         }
@@ -735,7 +714,7 @@ fn run_case(prog: *u8, input: *u8, out_path: *u8, err_path: *u8) -> i64 {
 
 // The names of the cases in dir: each NAME with a NAME.out or NAME.in,
 // once, as the filters select them; false when dir cannot be listed.
-fn list_cases(dir: *u8, names: inout IntVec) -> bool {
+fn list_cases(dir: *u8, names: inout IntVec, tcx: Tcx<Comp>) -> bool {
     unsafe {
         let listing = buf_new();
         if run_words(c"ls", c"-1", dir, 0 as *u8, 0 as *u8, 0 as *u8, 0 as *u8, listing) != 0 {
@@ -753,7 +732,7 @@ fn list_cases(dir: *u8, names: inout IntVec) -> bool {
             } else if f.len > 3 && f[f.len as i64 - 3..] == ".in" {
                 n = f.len as i64 - 3;
             }
-            if n <= 0 || !selected(f[0..n]) {
+            if n <= 0 || !selected(f[0..n], tcx) {
                 continue;
             }
             var seen = false;
@@ -795,7 +774,7 @@ fn expected_exit(path: *u8) -> i64 {
 
 // Why the output differs, into block: from the first line that differs,
 // a few expected lines (`-`) and the lines it printed (`+`).
-fn put_difference(block: i64, want: [u8], got: [u8]) {
+fn put_difference(block: i64, want: [u8], got: [u8], tcx: Tcx<Comp>) {
     var i = 0;
     var j = 0;
     var ln = 0;
@@ -816,61 +795,62 @@ fn put_difference(block: i64, want: [u8], got: [u8]) {
     buf_bytes(block, " expected, ");
     buf_int(block, line_count(got));
     buf_bytes(block, " printed)\n");
-    let half = (detail_lines() + 1) / 2;
-    if put_lines(block, want, ln, half, "  - ") == 0 {
+    let half = (detail_lines(tcx) + 1) / 2;
+    if put_lines(block, want, ln, half, "  - ", tcx) == 0 {
         buf_bytes(block, "  - (end of output)\n");
     }
-    if put_lines(block, got, ln, half, "  + ") == 0 {
+    if put_lines(block, got, ln, half, "  + ", tcx) == 0 {
         buf_bytes(block, "  + (end of output)\n");
     }
 }
 
 // The program at root: its cases and tests (0.18: tools/testrun/program.vl),
 // or one run on --input.
-fn run_program(root: *u8) -> i64 {
+fn run_program(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
     let out = buf_new();
     let root_abs = absolute_path(root);
     let src_dir = dir_of(root_abs);
-    let dir_shown = if DIR != 0 as *u8 { DIR } else { join(dir_of(root), "tests") };
+    let dir_shown = if tcx.testrun_dir != 0 as *u8 { tcx.testrun_dir }
+        else { join(dir_of(root), "tests") };
     let shown = if streq(dir_shown, c"./tests") { c"tests" } else { dir_shown };
     let tests = absolute_path(dir_shown);
     let work = work_dir(root_abs, src_dir);
     if !file_exists(work) {
-        let d = diag(c"error", c"test.no-root");
+        let d = diag(c"error", c"test.no-root", &tcx);
         buf_str(d, c"cannot make the build directory '");
         buf_str(d, work);
         buf_str(d, c"' (set TMPDIR)\n");
         return 2;
     }
-    if INPUT != 0 as *u8 {
+    if tcx.testrun_input != 0 as *u8 {
         let prog = join(work, "prog");
-        if !build_program(root, src_dir, work, prog, out) {
+        if !build_program(root, src_dir, work, prog, out, tcx) {
             buf_write_fd(out, STDOUT);
             return 1;
         }
-        return run_on_input(root, prog, work, out);
+        return run_on_input(root, prog, work, out, &tcx);
     }
-    run_all(root, src_dir, tests, shown, work, out)
+    run_all(root, src_dir, tests, shown, work, out, &tcx)
 }
 
 // `--input FILE`: one run, its output and exit status.
-fn run_on_input(root: *u8, prog: *u8, work: *u8, out: i64) -> i64 {
-    var input = INPUT;
-    if streq(INPUT, c"-") {
+fn run_on_input(root: *u8, prog: *u8, work: *u8, out: i64, tcx: inout Tcx<Comp>) -> i64 {
+    var input = tcx.testrun_input;
+    if streq(tcx.testrun_input, c"-") {
         let b = buf_new();
-        read_stdin(b);
+        read_stdin(b, &tcx);
         input = join(work, "stdin.in");
         write_file_if(input, buf_slice(b));
-    } else if !file_exists(INPUT) {
-        let d = diag(c"error", c"test.usage");
+    } else if !file_exists(tcx.testrun_input) {
+        let d = diag(c"error", c"test.usage", &tcx);
         buf_str(d, c"no file '");
-        buf_str(d, INPUT);
+        buf_str(d, tcx.testrun_input);
         buf_str(d, c"' (--input FILE)\n");
         return 2;
     }
     let got_path = join(work, "input.got");
     let err_path = join(work, "input.err");
-    let status = run_case(prog, input, got_path, err_path);
+    let status = run_case(prog, input, got_path, err_path, tcx);
     let got_b = buf_new();
     read_file_if(got_path, got_b);
     let got = normal(buf_slice(got_b));
@@ -880,11 +860,11 @@ fn run_on_input(root: *u8, prog: *u8, work: *u8, out: i64) -> i64 {
     buf_bytes(out, "test ");
     buf_str(out, root);
     buf_bytes(out, ": ran on ");
-    buf_str(out, INPUT);
+    buf_str(out, tcx.testrun_input);
     buf_bytes(out, ": ");
     if status == -1 {
         buf_bytes(out, "no exit after ");
-        buf_int(out, TIMEOUT);
+        buf_int(out, tcx.testrun_timeout);
         buf_bytes(out, " s");
     } else {
         buf_bytes(out, "exit ");
@@ -896,16 +876,16 @@ fn run_on_input(root: *u8, prog: *u8, work: *u8, out: i64) -> i64 {
     var i = 0;
     while i < got.len as i64 {
         let e = line_end(got, i);
-        if buf_slice(out).len as i64 + (e - i) > BUDGET {
+        if buf_slice(out).len as i64 + (e - i) > tcx.budget {
             buf_bytes(out, "(the rest: ");
             buf_str(out, got_path);
             buf_bytes(out, ")\n");
             break;
         }
-        put_cut(out, "", got[i..e]);
+        put_cut(out, "", got[i..e], tcx);
         i = e + 1;
     }
-    put_lines(out, err, 0, stderr_lines(), "stderr: ");
+    put_lines(out, err, 0, stderr_lines(tcx), "stderr: ", tcx);
     buf_write_fd(out, STDOUT);
     if status == 0 { 0 } else { 1 }
 }

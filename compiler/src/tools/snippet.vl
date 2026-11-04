@@ -19,14 +19,16 @@ use crate::base::{
     BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
     intern, strlen,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{Call, EV_WORD, Leaf, flag, is_flag, is_missing, is_opt, option, table};
 use crate::front::modules::lookup::is_prelude_name;
 use crate::front::stdsrc::std_source;
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{
     buf_cstr, make_dirs, read_file_if, read_stdin, remove_dir, remove_file, run_capture,
     write_file_if,
 };
-use crate::tools::query::diagnostics::{PROG, TOOL, diag, put_word, try_begin, try_end, write_diags};
+use crate::tools::query::diagnostics::{PROG, diag, put_word, try_begin, try_end, write_diags};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -339,9 +341,6 @@ fn put_line(prog: i64, lines: inout IntVec, text: [u8]) {
 
 // ---- Printing the value ----
 
-static var DEPTH: i64 = 0;
-static var NEEDS_C: bool = false;
-
 fn is_int(t: [u8]) -> bool {
     t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32"
         || t == "u64" || t == "isize" || t == "usize"
@@ -380,14 +379,14 @@ fn trim(t: [u8]) -> [u8] {
     t[a..b]
 }
 
-fn put_name(out: i64, base: *u8) {
+fn put_name(out: i64, base: *u8, tcx: Tcx<Comp>) {
     buf_str(out, base);
-    buf_int(out, DEPTH);
+    buf_int(out, tcx.depth);
 }
 
 // Statements that print the value `expr` of type t into out; false when
 // t has no printer.
-fn printer(out: i64, expr: [u8], t: [u8]) -> bool {
+fn printer(out: i64, expr: [u8], t: [u8], tcx: inout Tcx<Comp>) -> bool {
     if is_int(t) {
         buf_str(out, c"std::print_int((");
         buf_bytes(out, expr);
@@ -401,7 +400,7 @@ fn printer(out: i64, expr: [u8], t: [u8]) -> bool {
         return true;
     }
     if t == "f64" || t == "f32" {
-        NEEDS_C = true;
+        tcx.needs_c = true;
         buf_str(out, c"unsafe { try_c::printf(c\"%g\", (");
         buf_bytes(out, expr);
         buf_str(out, c") as f64); } ");
@@ -413,18 +412,18 @@ fn printer(out: i64, expr: [u8], t: [u8]) -> bool {
         buf_str(out, c"); print(\"\\\"\"); ");
         return true;
     }
-    DEPTH += 1;
+    tcx.depth += 1;
     let v = buf_new();
-    put_name(v, c"_try_v");
+    put_name(v, c"_try_v", tcx);
     let i = buf_new();
-    put_name(i, c"_try_i");
-    let ok = compound(out, expr, t, buf_slice(v), buf_slice(i));
-    DEPTH -= 1;
+    put_name(i, c"_try_i", tcx);
+    let ok = compound(out, expr, t, buf_slice(v), buf_slice(i), &tcx);
+    tcx.depth -= 1;
     ok
 }
 
 // Arrays, slices, Vec, Option and tuples (v, i: this level's names).
-fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
+fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8], tcx: inout Tcx<Comp>) -> bool {
     // [T; N], [T]
     if t.len > 2 && t[0] == '[' && t[t.len as i64 - 1] == ']' {
         let e = type_end(t, 1);
@@ -435,7 +434,7 @@ fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
         buf_byte(at, '[');
         buf_bytes(at, i);
         buf_byte(at, ']');
-        if !printer(body, buf_slice(at), elem) {
+        if !printer(body, buf_slice(at), elem, &tcx) {
             return false;
         }
         put_seq(out, expr, if e < t.len as i64 - 1 { "[..]" } else { "" }, ".len", v, i,
@@ -451,7 +450,7 @@ fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
         buf_bytes(at, ".get(");
         buf_bytes(at, i);
         buf_byte(at, ')');
-        if !printer(body, buf_slice(at), elem) {
+        if !printer(body, buf_slice(at), elem, &tcx) {
             return false;
         }
         put_seq(out, expr, "", ".len()", v, i, buf_slice(body));
@@ -460,7 +459,7 @@ fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
     if starts(t, "Option<") && t[t.len as i64 - 1] == '>' {
         let elem = trim(t[7..t.len as i64 - 1]);
         let body = buf_new();
-        if !printer(body, v, elem) {
+        if !printer(body, v, elem, &tcx) {
             return false;
         }
         buf_bytes(out, "match ");
@@ -485,7 +484,7 @@ fn compound(out: i64, expr: [u8], t: [u8], v: [u8], i: [u8]) -> bool {
             if n > 0 {
                 buf_bytes(body, "print(\", \"); ");
             }
-            if !printer(body, buf_slice(field), trim(t[k..e])) {
+            if !printer(body, buf_slice(field), trim(t[k..e]), &tcx) {
                 return false;
             }
             n += 1;
@@ -614,11 +613,11 @@ fn put_mapped(out: i64, text: [u8], file: [u8], name: [u8], lines: IntVec) {
     }
 }
 
-fn usage(why: *u8) -> i64 {
-    let d = diag(c"error", c"try.usage");
+fn usage(why: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"try.usage", &tcx);
     buf_str(d, why);
     buf_byte(d, '\n');
-    let t = try_begin(c"try", "", false);
+    let t = try_begin(c"try", "", false, &tcx);
     put_word(t, "let v = [3, 1, 2]; v[..].len");
     try_end(t);
     2
@@ -719,11 +718,11 @@ fn into_slot(bin: *u8, slot: *u8) -> bool {
 
 // `volec try ...`: the exit status (the program's, 1 when the snippet
 // does not compile, 2 for a usage error).
-pub fn run_try(c: Call<Gpa>) -> i64 {
+pub fn run_try(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
-    TOOL = 0 as *u8;
-    let status = try_inner(c);
-    write_diags();
+    tcx.tool = 0 as *u8;
+    let status = try_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -737,7 +736,7 @@ pub fn try_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "statements")
 }
 
-fn try_inner(c: Call<Gpa>) -> i64 {
+fn try_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     let sb = buf_new();
     var file = 0 as *u8;
     var keep = false;
@@ -748,16 +747,16 @@ fn try_inner(c: Call<Gpa>) -> i64 {
             continue;
         }
         if is_missing(ev, "file") {
-            return usage(c"--file needs a FILE");
+            return usage(c"--file needs a FILE", &tcx);
         }
         if is_flag(ev, "keep") {
             keep = true;
         } else if ev.kind == EV_WORD && ev.text == "-" {
-            if !read_stdin(sb) {
-                return usage(c"- reads the snippet from stdin, and nothing was piped in");
+            if !read_stdin(sb, &tcx) {
+                return usage(c"- reads the snippet from stdin, and nothing was piped in", &tcx);
             }
         } else if ev.kind != EV_WORD {
-            let d = diag(c"error", c"try.usage");
+            let d = diag(c"error", c"try.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, a);
             buf_str(d, c"' (--file FILE, --keep, -)\n");
@@ -771,7 +770,7 @@ fn try_inner(c: Call<Gpa>) -> i64 {
     }
     unsafe {
         if file != 0 as *u8 && !read_file_if(file, sb) {
-            let d = diag(c"error", c"try.no-file");
+            let d = diag(c"error", c"try.no-file", &tcx);
             buf_str(d, c"cannot read '");
             buf_str(d, file);
             buf_str(d, c"'\n");
@@ -785,7 +784,7 @@ fn try_inner(c: Call<Gpa>) -> i64 {
             }
         }
         if blank {
-            return usage(c"a snippet is needed: STATEMENTS, --file FILE, or - (stdin)");
+            return usage(c"a snippet is needed: STATEMENTS, --file FILE, or - (stdin)", &tcx);
         }
         let name = if file != 0 as *u8 { c_slice(file) } else { "snippet" };
         // The program: imports, the items, main around the statements.
@@ -827,9 +826,9 @@ fn try_inner(c: Call<Gpa>) -> i64 {
         let dir = scratch_dir();
         let src = path_in(dir, c"snippet.vl");
         let bin = path_in(dir, c"snippet");
-        let status = check_and_run(head, lines, whole, value_line, src, bin, name);
+        let status = check_and_run(head, lines, whole, value_line, src, bin, name, &tcx);
         if keep {
-            let d = diag(c"note", c"try.kept");
+            let d = diag(c"note", c"try.kept", &tcx);
             buf_str(d, c"the program and its binary: ");
             buf_str(d, src);
             buf_byte(d, '\n');
@@ -846,7 +845,7 @@ fn try_inner(c: Call<Gpa>) -> i64 {
 // type, builds it with the value printed, runs it, prints what it did:
 // the exit status.
 fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *u8, bin: *u8,
-    name: [u8]) -> i64 {
+    name: [u8], tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let a = buf_new();
         buf_bytes(a, buf_slice(head));
@@ -854,7 +853,7 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *u
             buf_bytes(a, "}\n");
         }
         if !write_file_if(src, buf_slice(a)) {
-            let d = diag(c"error", c"try.no-file");
+            let d = diag(c"error", c"try.no-file", &tcx);
             buf_str(d, c"cannot write '");
             buf_str(d, src);
             buf_str(d, c"'\n");
@@ -902,8 +901,8 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *u
         let b = buf_new();
         buf_bytes(b, buf_slice(head));
         let print = buf_new();
-        NEEDS_C = false;
-        let printed = shows && printer(print, "_try_value", t);
+        tcx.needs_c = false;
+        let printed = shows && printer(print, "_try_value", t, &tcx);
         if shows {
             buf_bytes(b, "    print(\"");
             buf_bytes(b, mark());
@@ -917,7 +916,7 @@ fn check_and_run(head: i64, lines: IntVec, whole: bool, value_line: i64, src: *u
         if !whole {
             buf_bytes(b, "}\n");
         }
-        if NEEDS_C && printed {
+        if tcx.needs_c && printed {
             buf_bytes(b, "import \"stdio.h\" as try_c;\n");
         }
         write_file_if(src, buf_slice(b));

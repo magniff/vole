@@ -21,7 +21,9 @@ pub mod samebuild;
 use crate::base::{
     BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::front::cpp::directives::file_exists;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::remove_empty_dirs;
 use crate::tools::edit::apply::{cannot_write, copy_path, make_parent};
 use crate::tools::edit::undo::journal_moves;
@@ -34,21 +36,6 @@ use crate::tools::query::diagnostics::diag;
 use crate::tools::rewrite::regex::{re_find, re_search, re_valid};
 
 // ---- The options of a match ----
-
-// --word: OLD is not part of a longer word of letters and digits (`_`,
-// `.`, `-` end a word: VOLE_ROOT has the word VOLE).
-pub static var T_WORD: bool = false;
-// --case: OLD matches in any case, and NEW takes the case of the match
-// (all lower, all upper, or a capital first).
-pub static var T_CASE: bool = false;
-// --regex: OLD is a regular expression (rewrite's: ^ $ . * + ? [a-z] \d
-// \w), matched within a line.
-pub static var T_REGEX: bool = false;
-// The places of a vole source a match may be in: G_CODE | G_COMMENT |
-// G_STRING (query grep's); 0: anywhere.
-pub static var T_PLACES: i64 = 0;
-// Matches whose case NEW could not follow (--case: `vole`).
-pub static var MIXED_CASE: i64 = 0;
 
 fn is_alnum(c: u8) -> bool {
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
@@ -63,13 +50,13 @@ fn upper(c: u8) -> u8 {
 }
 
 // Whether text[s..e) is a match of literal old.
-fn literal_at(text: [u8], s: i64, old: [u8]) -> bool {
+fn literal_at(text: [u8], s: i64, old: [u8], tcx: Tcx<Comp>) -> bool {
     if s + old.len as i64 > text.len as i64 {
         return false;
     }
     for j in 0..old.len as i64 {
         let a = text[s + j];
-        if a != old[j] && !(T_CASE && lower(a) == lower(old[j])) {
+        if a != old[j] && !(tcx.t_case && lower(a) == lower(old[j])) {
             return false;
         }
     }
@@ -78,8 +65,8 @@ fn literal_at(text: [u8], s: i64, old: [u8]) -> bool {
 
 // --word: whether the match text[s..e) has a word boundary where its own
 // ends are letters or digits.
-fn word_ok(text: [u8], s: i64, e: i64) -> bool {
-    if !T_WORD || e <= s {
+fn word_ok(text: [u8], s: i64, e: i64, tcx: Tcx<Comp>) -> bool {
+    if !tcx.t_word || e <= s {
         return true;
     }
     // (an escape before it ends a word too: `\nvole` in a literal)
@@ -96,11 +83,11 @@ fn word_ok(text: [u8], s: i64, e: i64) -> bool {
 // The matches of old in text[from..to), in order and apart: their starts
 // and ends.
 pub fn find_matches(text: [u8], from: i64, to: i64, old: [u8], starts: inout IntVec,
-    ends: inout IntVec) {
+    ends: inout IntVec, tcx: Tcx<Comp>) {
     if old.len == 0 {
         return;
     }
-    if T_REGEX {
+    if tcx.t_regex {
         // (line by line)
         var a = from;
         while a < to {
@@ -116,7 +103,7 @@ pub fn find_matches(text: [u8], from: i64, to: i64, old: [u8], starts: inout Int
                 if s < 0 {
                     break;
                 }
-                if end > s && word_ok(text, a + s, a + end) {
+                if end > s && word_ok(text, a + s, a + end, tcx) {
                     starts.push(a + s);
                     ends.push(a + end);
                     at = end;
@@ -130,7 +117,7 @@ pub fn find_matches(text: [u8], from: i64, to: i64, old: [u8], starts: inout Int
     }
     var i = from;
     while i + old.len as i64 <= to {
-        if literal_at(text, i, old) && word_ok(text, i, i + old.len as i64) {
+        if literal_at(text, i, old, tcx) && word_ok(text, i, i + old.len as i64, tcx) {
             starts.push(i);
             ends.push(i + old.len as i64);
             i += old.len as i64;
@@ -142,8 +129,8 @@ pub fn find_matches(text: [u8], from: i64, to: i64, old: [u8], starts: inout Int
 
 // The replacement of match m by new, into buffer out: with --case, in the
 // case of m.
-pub fn put_replacement(out: i64, new: [u8], m: [u8]) {
-    if !T_CASE {
+pub fn put_replacement(out: i64, new: [u8], m: [u8], tcx: inout Tcx<Comp>) {
+    if !tcx.t_case {
         buf_bytes(out, new);
         return;
     }
@@ -168,7 +155,7 @@ pub fn put_replacement(out: i64, new: [u8], m: [u8]) {
         }
     } else {
         if uppers > 0 {
-            MIXED_CASE += 1;
+            tcx.mixed_case += 1;
         }
         buf_bytes(out, new);
     }
@@ -181,10 +168,6 @@ pub fn put_replacement(out: i64, new: [u8], m: [u8]) {
 // before the next one B matches, or to the end). In a GLOB, `*` is any
 // bytes (`/` too) and `?` one; a GLOB ending in `/` is everything under
 // it. `\/` is a `/` in a RE.
-
-static var X_GLOB: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var X_A: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var X_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Whether glob g matches path p.
 pub fn glob_match(g: [u8], p: [u8]) -> bool {
@@ -235,7 +218,7 @@ fn take_re(s: [u8], i: i64, out: inout i64) -> i64 {
 }
 
 // Adds exclusion spec s; false (and the diagnostic) when it is malformed.
-pub fn add_exclusion(s: [u8]) -> bool {
+pub fn add_exclusion(s: [u8], tcx: inout Tcx<Comp>) -> bool {
     var colon = -1;
     for k in 0..s.len as i64 {
         if s[k] == ':' && k + 1 < s.len as i64 && s[k + 1] == '/' {
@@ -257,7 +240,7 @@ pub fn add_exclusion(s: [u8]) -> bool {
             }
         }
         if at != s.len as i64 {
-            let d = diag(c"error", c"rewrite.exclude");
+            let d = diag(c"error", c"rewrite.exclude", &tcx);
             buf_str(d, c"'");
             buf_bytes(d, s);
             buf_str(d,
@@ -265,18 +248,18 @@ pub fn add_exclusion(s: [u8]) -> bool {
             return false;
         }
     }
-    X_GLOB.push(g);
-    X_A.push(a);
-    X_B.push(b);
+    tcx.x_glob.push(g);
+    tcx.x_a.push(a);
+    tcx.x_b.push(b);
     true
 }
 
 // Adds the specs of file path, one a line (`#` starts a comment line);
 // false after the diagnostic.
-pub fn read_exclusions(path: *u8) -> bool {
+pub fn read_exclusions(path: *u8, tcx: inout Tcx<Comp>) -> bool {
     let text = buf_new();
     if !read_file_if(path, text) {
-        let d = diag(c"error", c"rewrite.exclude");
+        let d = diag(c"error", c"rewrite.exclude", &tcx);
         buf_str(d, c"cannot read '");
         buf_str(d, path);
         buf_str(d, c"'\n");
@@ -297,7 +280,7 @@ pub fn read_exclusions(path: *u8) -> bool {
         while z > a && (t[z - 1] == ' ' || t[z - 1] == '\t' || t[z - 1] == '\r') {
             z -= 1;
         }
-        if z > a && t[a] != '#' && !add_exclusion(t[a..z]) {
+        if z > a && t[a] != '#' && !add_exclusion(t[a..z], &tcx) {
             return false;
         }
         i = e + 1;
@@ -306,10 +289,10 @@ pub fn read_exclusions(path: *u8) -> bool {
 }
 
 // Whether file p is excluded whole.
-pub fn excluded(p: [u8]) -> bool {
+pub fn excluded(p: [u8], tcx: Tcx<Comp>) -> bool {
     unsafe {
-        for k in 0..X_GLOB.count {
-            if X_A.data[k] < 0 && glob_match(buf_slice(X_GLOB.data[k]), p) {
+        for k in 0..tcx.x_glob.count {
+            if tcx.x_a.data[k] < 0 && glob_match(buf_slice(tcx.x_glob.data[k]), p) {
                 return true;
             }
         }
@@ -319,11 +302,11 @@ pub fn excluded(p: [u8]) -> bool {
 
 // The kept lines of file p with text t: byte ranges (start, end pairs,
 // in order, apart) into out; the number of lines kept.
-pub fn kept_ranges(p: [u8], t: [u8], out: inout IntVec) -> i64 {
+pub fn kept_ranges(p: [u8], t: [u8], out: inout IntVec, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         var specs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for k in 0..X_GLOB.count {
-            if X_A.data[k] >= 0 && glob_match(buf_slice(X_GLOB.data[k]), p) {
+        for k in 0..tcx.x_glob.count {
+            if tcx.x_a.data[k] >= 0 && glob_match(buf_slice(tcx.x_glob.data[k]), p) {
                 specs.push(k);
             }
         }
@@ -346,11 +329,11 @@ pub fn kept_ranges(p: [u8], t: [u8], out: inout IntVec) -> i64 {
             var keep = false;
             for k in 0..specs.count {
                 let x = specs.data[k];
-                if open[k] && X_B.data[x] >= 0 && re_search(buf_slice(X_B.data[x]), line) {
+                if open[k] && tcx.x_b.data[x] >= 0 && re_search(buf_slice(tcx.x_b.data[x]), line) {
                     open[k] = false;
                 }
-                if !open[k] && re_search(buf_slice(X_A.data[x]), line) {
-                    if X_B.data[x] >= 0 {
+                if !open[k] && re_search(buf_slice(tcx.x_a.data[x]), line) {
+                    if tcx.x_b.data[x] >= 0 {
                         open[k] = true;
                     }
                     keep = true;
@@ -425,12 +408,6 @@ pub fn is_text(t: [u8]) -> bool {
 // The files changed: path (as it is after the moves), text before and
 // after (buffers); the files moved: from, to (C strings).
 
-pub static var W_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var W_BEFORE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var W_AFTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var M_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var M_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // (0.24) The target a link moved from a to b points at after the move: its
 // extension a's replaced by b's when it has a's; 0 when it keeps its own.
 fn relinked_target(t: [u8], a: [u8], b: [u8]) -> *u8 {
@@ -451,7 +428,7 @@ fn relinked_target(t: [u8], a: [u8], b: [u8]) -> *u8 {
 // tracked file moves (one `git update-index --index-info`), then the file
 // (and the directories left empty go). False after the diagnostic; what
 // was moved stays moved.
-pub fn move_files(from: IntVec, to: IntVec) -> bool {
+pub fn move_files(from: IntVec, to: IntVec, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         // (git names them from here: the journal's absolute paths too)
         let here = crate::tools::proc::absolute_path(c".");
@@ -510,7 +487,7 @@ pub fn move_files(from: IntVec, to: IntVec) -> bool {
             let a = from.data[k] as *u8;
             let b = to.data[k] as *u8;
             if file_exists(b) {
-                let d = diag(c"error", c"rewrite.exists");
+                let d = diag(c"error", c"rewrite.exists", &tcx);
                 buf_str(d, c"'");
                 buf_str(d, b);
                 buf_str(d, c"' exists already; nothing moved\n");
@@ -525,7 +502,7 @@ pub fn move_files(from: IntVec, to: IntVec) -> bool {
             u[3] = c"--index-info";
             u[4] = 0 as *u8;
             if run_with_stdin(u, info) != 0 {
-                let d = diag(c"error", c"rewrite.git");
+                let d = diag(c"error", c"rewrite.git", &tcx);
                 buf_str(d, c"git update-index could not move the index's entries; nothing moved\n");
                 return false;
             }
@@ -540,7 +517,7 @@ pub fn move_files(from: IntVec, to: IntVec) -> bool {
             let b = to.data[k] as *u8;
             let target = crate::tools::proc::link_target(a);
             if !make_parent(b) || !rename_file(a, b) {
-                cannot_write(b);
+                cannot_write(b, &tcx);
                 ok = false;
                 continue;
             }
@@ -550,7 +527,7 @@ pub fn move_files(from: IntVec, to: IntVec) -> bool {
                 if re != 0 as *u8 {
                     remove_file(b);
                     if !crate::tools::proc::make_link(re, b) {
-                        cannot_write(b);
+                        cannot_write(b, &tcx);
                         ok = false;
                     }
                     relinked.push(b as i64);
@@ -588,38 +565,39 @@ fn relative(here: *u8, p: *u8) -> [u8] {
 // Writes the edit (W_*, M_*): the moves, then each file's new text (a
 // copy, renamed onto it), journaled as one edit with `summary`, from the
 // checkout around `from`. False after the diagnostics.
-pub fn write_edit(summary: [u8], from: *u8) -> bool {
+pub fn write_edit(summary: [u8], from: *u8, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         // (0.25.5: not a generated file, unless --force)
-        for k in 0..W_PATH.count {
-            if !crate::tools::edit::apply::not_generated(c_slice(W_PATH.data[k] as *u8),
-                buf_slice(W_BEFORE.data[k])) {
+        for k in 0..tcx.w_path.count {
+            if !crate::tools::edit::apply::not_generated(c_slice(tcx.w_path.data[k] as *u8),
+                buf_slice(tcx.w_before.data[k]), &tcx) {
                 return false;
             }
         }
-        if M_FROM.count > 0 && !move_files(M_FROM, M_TO) {
+        if tcx.m_from.count > 0 && !move_files(tcx.m_from, tcx.m_to, &tcx) {
             return false;
         }
-        for k in 0..W_PATH.count {
-            let p = W_PATH.data[k] as *u8;
-            let written = write_file_if(copy_path(p), buf_slice(W_AFTER.data[k]));
+        for k in 0..tcx.w_path.count {
+            let p = tcx.w_path.data[k] as *u8;
+            let written = write_file_if(copy_path(p), buf_slice(tcx.w_after.data[k]));
             if written {
                 crate::tools::proc::keep_mode(p, copy_path(p));
             }
             if !written {
                 for x in 0..k + 1 {
-                    remove_file(copy_path(W_PATH.data[x] as *u8));
+                    remove_file(copy_path(tcx.w_path.data[x] as *u8));
                 }
-                cannot_write(p);
+                cannot_write(p, &tcx);
                 return false;
             }
         }
-        journal_moves(from, W_PATH, W_BEFORE, W_AFTER, M_FROM, M_TO, summary);
+        journal_moves(from, tcx.w_path, tcx.w_before, tcx.w_after, tcx.m_from, tcx.m_to, summary,
+            &tcx);
         var ok = true;
-        for k in 0..W_PATH.count {
-            let p = W_PATH.data[k] as *u8;
+        for k in 0..tcx.w_path.count {
+            let p = tcx.w_path.data[k] as *u8;
             if !rename_file(copy_path(p), p) {
-                cannot_write(p);
+                cannot_write(p, &tcx);
                 ok = false;
             }
         }

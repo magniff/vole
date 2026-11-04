@@ -2839,3 +2839,16 @@ row, stress-grow, cachediff 1446 lines (425 from the cache),
 unsafe-audit 3329 unjustified (baseline 3425) and 0 in std,
 chain-diverse, chain-fresh 37 releases. compile-cost against v0.26.2: a
 hello world 1.03x, std 1.05x, check of the compiler 1.02x.
+
+### 0.26.4
+
+The release gate (`gate.sh --release --no-linux`, 62:37 wall), macOS
+only, on the release commit. Every row passed, the first try: the suite
+4682 at -O0, -O1 and -O2 (69 XFAIL; SKIPPED: no spirv-val), threads
+8875, incremental 172 series, objcheck 5848 (and 256 for x86_64-macos),
+compiler-memcheck 727, examples-checkalloc 183, every fuzz and ABI row
+(fuzz-sem 300 programs), stress-grow, cachediff 1453 lines (425 from
+the cache), unsafe-audit 3217 unjustified (baseline 3217, from 3329)
+and 0 in std, chain-diverse, chain-fresh 38 releases. compile-cost
+against v0.26.3: a hello world 0.99x, std 1.00x, check of the compiler
+0.88x. The compiler is the first built without `--overflow-checks=off`.

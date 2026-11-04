@@ -26,6 +26,7 @@ use crate::base::{
     BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_reserve, buf_slice, buf_str,
     fclose, fopen, fwrite, memcpy, memset, restore_sources, restore_sym, strlen, sym_hash,
 };
+use crate::base::comp::Comp;
 use crate::base::diag::{DIAG_PROG, diag_records, diag_restore};
 use crate::base::timer::{TIME_PASSES, T_CACHE, timer_add, timer_now};
 use crate::front::cimport::IMPORTED_START;
@@ -37,23 +38,23 @@ use crate::front::modules::{
 };
 use crate::front::modules::lookup::{restore_std_keys, std_item_keys};
 use crate::front::own::diag::OWN_MODE;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::items::{item_head, item_tail, keyword_head};
 use crate::tools::proc::{
     fork_worker, make_dirs, read_file_if, remove_file, rename_file, worker_exit, write_file_if,
 };
 use crate::tools::query::QF_USE;
-use crate::tools::query::command_line::{NOTES, PARSED};
+use crate::tools::query::command_line::NOTES;
 use crate::tools::query::defs::{
-    ALIASES, C_ALIAS, C_ALIAS_MODULE, DEFS, Def, K_IMPL_METHOD, K_METHOD, MOD_DEF, def_of_node,
-    restore_def, trait_of,
+    DEFS, Def, K_IMPL_METHOD, K_METHOD, MOD_DEF, def_of_node, restore_def, trait_of,
 };
 use crate::tools::query::diagnostics::PROG;
-use crate::tools::query::effects::{C_EFF_BUF, C_EFF_TEXT, cache_texts};
-use crate::tools::query::positions::{CONTAINERS, FILE_RANK, LINES};
-use crate::tools::query::refs::{GROUP, R_DEF, R_FLAGS, R_GROUP, R_POS, collect_all_refs};
+use crate::tools::query::effects::cache_texts;
+use crate::tools::query::positions::LINES;
+use crate::tools::query::refs::collect_all_refs;
 use crate::tools::query::sections::code_start;
 use crate::tools::query::show::{impl_block, impl_header_span, signature_end};
-use crate::tools::query::values::{C_OWN_BUF, C_OWN_TEXT, own_cache_texts};
+use crate::tools::query::values::own_cache_texts;
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -73,24 +74,6 @@ const MAGIC: i64 = 8174034211981648244;
 // (6, 0.17: the kinds and view summaries; 7, 0.19: the features; 9,
 // 0.25.3: std_item_key's answers; 10, 0.26.2: a file's kind)
 const VERSION: i64 = 10;
-
-// The program came from the cache: the answers take what the nodes and
-// tokens would give from the C_* tables (per definition).
-pub static var RESTORED: bool = false;
-pub static var C_SIG_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_TRAIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_HDR_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_HDR_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// (the edits: an item's head, tail and keyword, edit/items.vl)
-pub static var C_HEAD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_TAIL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var C_KEYWORD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Per file, where its code starts (its first token; sections.vl).
-pub static var C_CODE_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Every reference: (position << 32) | (definition << 6) | flags.
-static var C_REFS: *i64 = 0 as *i64;
-static var C_REF_COUNT: i64 = 0;
 
 // ---- Words ----
 
@@ -125,53 +108,48 @@ fn put_cstr(b: i64, s: *u8) {
     unsafe { put_str(b, s[0..strlen(s) as i64]); }
 }
 
-static var RD: *i64 = 0 as *i64;
-static var RD_AT: i64 = 0;
-static var RD_N: i64 = 0;
-static var RD_BAD: bool = false;
-
-fn read_words(b: i64) {
+fn read_words(b: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        RD = BUFS[b].data as *i64;
-        RD_AT = 0;
-        RD_N = BUFS[b].len / 8;
-        RD_BAD = BUFS[b].len % 8 != 0;
+        tcx.rd = BUFS[b].data as *i64;
+        tcx.rd_at = 0;
+        tcx.rd_n = BUFS[b].len / 8;
+        tcx.rd_bad = BUFS[b].len % 8 != 0;
     }
 }
 
-fn get() -> i64 {
+fn get(tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        if RD_AT >= RD_N {
-            RD_BAD = true;
+        if tcx.rd_at >= tcx.rd_n {
+            tcx.rd_bad = true;
             return 0;
         }
-        let v = RD[RD_AT];
-        RD_AT += 1;
+        let v = tcx.rd[tcx.rd_at];
+        tcx.rd_at += 1;
         v
     }
 }
 
 // A count of at most `per`-word records that fit in what is left.
-fn get_count(per: i64) -> i64 {
-    let n = get();
-    if n < 0 || n * per > RD_N - RD_AT {
-        RD_BAD = true;
+fn get_count(per: i64, tcx: inout Tcx<Comp>) -> i64 {
+    let n = get(&tcx);
+    if n < 0 || n * per > tcx.rd_n - tcx.rd_at {
+        tcx.rd_bad = true;
         return 0;
     }
     n
 }
 
-fn get_str() -> [u8] {
+fn get_str(tcx: inout Tcx<Comp>) -> [u8] {
     unsafe {
-        let n = get();
+        let n = get(&tcx);
         let words = (n + 8) / 8;
-        if n < 0 || words > RD_N - RD_AT {
-            RD_BAD = true;
+        if n < 0 || words > tcx.rd_n - tcx.rd_at {
+            tcx.rd_bad = true;
             let none = c"";
             return none[0..0];
         }
-        let p = (&RD[RD_AT]) as *u8;
-        RD_AT += words;
+        let p = (&tcx.rd[tcx.rd_at]) as *u8;
+        tcx.rd_at += words;
         p[0..n]
     }
 }
@@ -191,7 +169,7 @@ fn same(a: [u8], b: [u8]) -> bool {
 // ---- Hashes ----
 
 fn mix(h: u64, x: u64) -> u64 {
-    let v = (h ^ x) * 11400714819323198485;
+    let v = (h ^ x).wrapping_mul(11400714819323198485);
     v ^ (v >> 29)
 }
 
@@ -387,13 +365,13 @@ fn read_exact(path: *u8, dst: *u8, n: i64) -> bool {
 // The cache is q-KEY.bin, or else q-KEY.next.bin: what the check of an
 // edit (`check --overlay`) made of the edited program, which holds once
 // the edit is written (it is then renamed the cache), and else is removed.
-pub fn cache_restore(root: *u8, target: i64, refs: bool) -> bool {
+pub fn cache_restore(root: *u8, target: i64, refs: bool, tcx: inout Tcx<Comp>) -> bool {
     let t = timer_now();
-    var ok = restore(root, target, refs, false);
+    var ok = restore(root, target, refs, false, &tcx);
     if !ok && usable() {
         let next_bin = cache_file(root, target, c".next.bin");
         let next_refs = cache_file(root, target, c".next.refs");
-        ok = restore(root, target, refs, true);
+        ok = restore(root, target, refs, true, &tcx);
         if ok {
             rename_file(next_refs, cache_file(root, target, c".refs"));
             rename_file(next_bin, cache_file(root, target, c".bin"));
@@ -426,7 +404,7 @@ fn trace(word: *u8) {
     }
 }
 
-fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
+fn restore(root: *u8, target: i64, refs: bool, next: bool, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         if !usable() || SYMS.len() != 0 || crate::base::OVERLAY.count > 0
             || crate::front::stdtree::STD_TREE != 0 as *u8 {
@@ -436,18 +414,19 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
         if !read_file_if(cache_file(root, target, if next { c".next.bin" } else { c".bin" }), b) {
             return false;
         }
-        read_words(b);
-        if get() != MAGIC || get() != VERSION || get() != ident() || get() != RD_N
-            || get() != body_hash(b, 5) {
+        read_words(b, &tcx);
+        if get(&tcx) != MAGIC || get(&tcx) != VERSION || get(&tcx) != ident()
+            || get(&tcx) != tcx.rd_n
+            || get(&tcx) != body_hash(b, 5) {
             return false;
         }
-        if !same(get_str(), root[0..strlen(root) as i64]) || get() != target {
+        if !same(get_str(&tcx), root[0..strlen(root) as i64]) || get(&tcx) != target {
             return false;
         }
-        let stamp = get();
-        let src_len = get();
-        let n_files = get_count(7);
-        if RD_BAD || src_len < 0 || src_len > 1 << 40 {
+        let stamp = get(&tcx);
+        let src_len = get(&tcx);
+        let n_files = get_count(7, &tcx);
+        if tcx.rd_bad || src_len < 0 || src_len > 1 << 40 {
             return false;
         }
         // The files, read again where they were.
@@ -456,19 +435,19 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var at = 0;
         for _ in 0..n_files {
-            let path = get_str();
-            let start = get();
-            let end = get();
-            let module = get();
-            let kind = get();
-            let made = get();
-            if RD_BAD || start != at || end < start || end >= src_len {
+            let path = get_str(&tcx);
+            let start = get(&tcx);
+            let end = get(&tcx);
+            let module = get(&tcx);
+            let kind = get(&tcx);
+            let made = get(&tcx);
+            if tcx.rd_bad || start != at || end < start || end >= src_len {
                 return false;
             }
             let dst = &BUFS[all].data[start];
             if made != 0 {
-                let text = get_str();
-                if RD_BAD || text.len as i64 != end - start {
+                let text = get_str(&tcx);
+                if tcx.rd_bad || text.len as i64 != end - start {
                     return false;
                 }
                 memcpy(dst, text.ptr, text.len as u64);
@@ -491,17 +470,17 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
         if (hash_region(BUFS[all].data, src_len) >> 1) as i64 != stamp {
             return false;
         }
-        let n_probes = get_count(1);
+        let n_probes = get_count(1, &tcx);
         for _ in 0..n_probes {
-            let path = get_str();
-            if RD_BAD || access(path.ptr, 0) == 0 {
+            let path = get_str(&tcx);
+            if tcx.rd_bad || access(path.ptr, 0) == 0 {
                 return false;
             }
         }
-        let n_embeds = get_count(2);
+        let n_embeds = get_count(2, &tcx);
         for _ in 0..n_embeds {
-            let path = get_str();
-            if RD_BAD || get() != embedded_hash(path) {
+            let path = get_str(&tcx);
+            if tcx.rd_bad || get(&tcx) != embedded_hash(path) {
                 return false;
             }
         }
@@ -521,121 +500,139 @@ fn restore(root: *u8, target: i64, refs: bool, next: bool) -> bool {
                 return false;
             }
         }
-        if RD_BAD {
+        if tcx.rd_bad {
             return false;
         }
         // It holds: the tables, as the front end left them.
         restore_sources(all, files);
-        restore_tables();
+        restore_tables(&tcx);
         // (the lexer as the front end left it: its keywords, for what
         // lexes a text again, the layout of an edit)
         init_lexer();
-        if RD_BAD {
+        if tcx.rd_bad {
             crate::base::die(c"the tools' cache is damaged; remove target/volec-cache");
         }
         if refs {
-            C_REFS = &words[5];
-            C_REF_COUNT = n_refs;
+            tcx.c_refs = &words[5];
+            tcx.c_ref_count = n_refs;
         }
-        PARSED = true;
-        RESTORED = true;
+        tcx.parsed = true;
+        tcx.restored = true;
         true
     }
 }
 
-fn get_ints(v: inout IntVec) {
-    let n = get_count(1);
+fn get_ints(v: inout IntVec, tcx: inout Tcx<Comp>) {
+    let n = get_count(1, &tcx);
     for _ in 0..n {
-        v.push(get());
+        v.push(get(&tcx));
     }
 }
 
-fn restore_tables() {
+fn restore_tables(tcx: inout Tcx<Comp>) {
     unsafe {
-        let n_syms = get_count(2);
+        let n_syms = get_count(2, &tcx);
         for _ in 0..n_syms {
-            let h = get() as u64;
-            restore_sym(get_str(), h);
+            let h = get(&tcx) as u64;
+            restore_sym(get_str(&tcx), h);
         }
-        let n_modules = get_count(4);
+        let n_modules = get_count(4, &tcx);
         init_modules();
         for m in 0..n_modules {
-            let name = get();
-            let parent = get();
-            let public = get() != 0;
-            let is_c = get() != 0;
+            let name = get(&tcx);
+            let parent = get(&tcx);
+            let public = get(&tcx) != 0;
+            let is_c = get(&tcx) != 0;
             if m > 0 {
                 add_module(name, parent, public);
             }
             MODULES[m].is_c = is_c;
         }
-        STD_MODULE = get();
-        C_MODULE = get();
-        get_ints(&INLINE_MODS);
-        let n_defs = get_count(26);
-        C_EFF_BUF = buf_new();
-        C_OWN_BUF = buf_new();
+        STD_MODULE = get(&tcx);
+        C_MODULE = get(&tcx);
+        get_ints(&INLINE_MODS, &tcx);
+        let n_defs = get_count(26, &tcx);
+        tcx.c_eff_buf = buf_new();
+        tcx.c_own_buf = buf_new();
         for _ in 0..n_defs {
             let def = Def {
-                node: get(), kind: get(), name: get(), module: get(), parent: get(), start: get(),
-                end: get(), name_pos: get(), public: get() != 0, impl_node: get(), fqn: get(),
-                path: get(), owner: get(), tr: get(),
+                node: get(&tcx), kind: get(&tcx), name: get(&tcx), module: get(&tcx),
+                parent: get(&tcx), start: get(&tcx),
+                end: get(&tcx), name_pos: get(&tcx), public: get(&tcx) != 0, impl_node: get(&tcx),
+                fqn: get(&tcx),
+                path: get(&tcx), owner: get(&tcx), tr: get(&tcx),
             };
             restore_def(def);
-            C_SIG_END.push(get());
-            C_TRAIT.push(get());
-            C_BLOCK.push(get());
-            C_HDR_FROM.push(get());
-            C_HDR_TO.push(get());
-            C_HEAD.push(get());
-            C_TAIL.push(get());
-            C_KEYWORD.push(get());
+            let tcx_arg = get(&tcx);
+            tcx.c_sig_end.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_trait.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_block.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_hdr_from.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_hdr_to.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_head.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_tail.push(tcx_arg);
+            let tcx_arg = get(&tcx);
+            tcx.c_keyword.push(tcx_arg);
             for _ in 0..3 {
-                let text = get_str();
-                C_EFF_TEXT.push(buf_slice(C_EFF_BUF).len as i64);
-                buf_bytes(C_EFF_BUF, text);
-                C_EFF_TEXT.push(buf_slice(C_EFF_BUF).len as i64);
+                let text = get_str(&tcx);
+                tcx.c_eff_text.push(buf_slice(tcx.c_eff_buf).len as i64);
+                buf_bytes(tcx.c_eff_buf, text);
+                tcx.c_eff_text.push(buf_slice(tcx.c_eff_buf).len as i64);
             }
             for _ in 0..2 {
-                let text = get_str();
-                C_OWN_TEXT.push(buf_slice(C_OWN_BUF).len as i64);
-                buf_bytes(C_OWN_BUF, text);
-                C_OWN_TEXT.push(buf_slice(C_OWN_BUF).len as i64);
+                let text = get_str(&tcx);
+                tcx.c_own_text.push(buf_slice(tcx.c_own_buf).len as i64);
+                buf_bytes(tcx.c_own_buf, text);
+                tcx.c_own_text.push(buf_slice(tcx.c_own_buf).len as i64);
             }
         }
-        get_ints(&MOD_DEF);
-        get_ints(&ALIASES);
-        C_ALIAS = get();
-        C_ALIAS_MODULE = get();
-        get_ints(&NOTES);
-        get_ints(&LINES);
-        get_ints(&FILE_RANK);
-        get_ints(&CONTAINERS);
-        get_ints(&C_CODE_START);
-        let error_count = get();
+        get_ints(&MOD_DEF, &tcx);
+        var aliases = tcx.aliases;
+        get_ints(&aliases, &tcx);
+        tcx.aliases = aliases;
+        tcx.c_alias = get(&tcx);
+        tcx.c_alias_module = get(&tcx);
+        get_ints(&NOTES, &tcx);
+        get_ints(&LINES, &tcx);
+        var file_rank = tcx.file_rank;
+        get_ints(&file_rank, &tcx);
+        tcx.file_rank = file_rank;
+        var containers = tcx.containers;
+        get_ints(&containers, &tcx);
+        tcx.containers = containers;
+        var c_code_start = tcx.c_code_start;
+        get_ints(&c_code_start, &tcx);
+        tcx.c_code_start = c_code_start;
+        let error_count = get(&tcx);
         var errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var warnings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let n_errors = get_count(2);
+        let n_errors = get_count(2, &tcx);
         for _ in 0..n_errors {
-            errors.push(get());
-            errors.push(text_buf(get_str()));
+            errors.push(get(&tcx));
+            errors.push(text_buf(get_str(&tcx)));
         }
-        let n_warnings = get_count(3);
+        let n_warnings = get_count(3, &tcx);
         for _ in 0..n_warnings {
-            warnings.push(get());
-            warnings.push(text_buf(get_str()));
-            warnings.push(get());
+            warnings.push(get(&tcx));
+            warnings.push(text_buf(get_str(&tcx)));
+            warnings.push(get(&tcx));
         }
         diag_restore(&errors, &warnings, error_count);
         // (0.25.3) std_item_key's answers, symbols both (a pair naming no item
         // is none)
         var std_keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let n_std = get_count(2);
+        let n_std = get_count(2, &tcx);
         for _ in 0..n_std {
-            let s = get();
-            let k = get();
+            let s = get(&tcx);
+            let k = get(&tcx);
             if s < 0 || s >= n_syms || k >= n_syms {
-                RD_BAD = true;
+                tcx.rd_bad = true;
             } else if k >= 0 {
                 std_keys.push(s);
                 std_keys.push(k);
@@ -653,22 +650,22 @@ fn text_buf(s: [u8]) -> i64 {
 
 // The references of collect_refs, from the cache: those to the
 // definitions of GROUP.
-pub fn cached_refs() {
+pub fn cached_refs(tcx: inout Tcx<Comp>) {
     unsafe {
         let group = crate::base::alloc_array::<i64>(DEFS.len() as i64 + 1);
         for d in 0..DEFS.len() as i64 {
-            group[d] = GROUP.get(d + 1) - 1;
+            group[d] = tcx.refs_group.get(d + 1) - 1;
         }
-        for i in 0..C_REF_COUNT {
-            let w = C_REFS[i];
+        for i in 0..tcx.c_ref_count {
+            let w = tcx.c_refs[i];
             let d = (w & 4294967295) >> 6;
             if d >= DEFS.len() as i64 || group[d] < 0 {
                 continue;
             }
-            R_POS.push(w >> 32);
-            R_DEF.push(d);
-            R_GROUP.push(group[d]);
-            R_FLAGS.push(w & 63);
+            tcx.r_pos.push(w >> 32);
+            tcx.r_def.push(d);
+            tcx.r_group.push(group[d]);
+            tcx.r_flags.push(w & 63);
         }
     }
 }
@@ -683,9 +680,9 @@ pub fn cached_refs() {
 // while this one ends, its output to /dev/null. Here instead with
 // --time-passes and $VOLE_CACHE_TRACE (the tests: the next command
 // must find it).
-pub fn cache_save(root: *u8, target: i64) {
+pub fn cache_save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        if RESTORED || !PARSED || IMPORTED_START >= 0 || !usable() {
+        if tcx.restored || !tcx.parsed || IMPORTED_START >= 0 || !usable() {
             return;
         }
         if !TIME_PASSES && getenv(c"VOLE_CACHE_TRACE") == 0 as *u8 {
@@ -701,12 +698,12 @@ pub fn cache_save(root: *u8, target: i64) {
                     dup2(null, 1);
                     dup2(null, 2);
                 }
-                save(root, target);
+                save(root, target, &tcx);
                 worker_exit(0);
             }
         }
         let t = timer_now();
-        save(root, target);
+        save(root, target, &tcx);
         timer_add(T_CACHE, t);
     }
 }
@@ -736,7 +733,7 @@ fn write_atomic(b: i64, path: *u8) -> bool {
     }
 }
 
-fn save(root: *u8, target: i64) {
+fn save(root: *u8, target: i64, tcx: inout Tcx<Comp>) {
     unsafe {
         if FILES.len() == 0 || crate::front::stdtree::STD_TREE != 0 as *u8
             || !make_dirs(cache_dir()) {
@@ -748,7 +745,7 @@ fn save(root: *u8, target: i64) {
         let stamp = (hash_region(SRC.ptr, src_len) >> 1) as i64;
         // The references, apart (only refs and callers read them).
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        collect_all_refs(&all);
+        collect_all_refs(&all, &tcx);
         let r = buf_new();
         put(r, MAGIC);
         put(r, ident());
@@ -800,7 +797,7 @@ fn save(root: *u8, target: i64) {
             put_str(b, path);
             put(b, embedded_hash(path));
         }
-        save_tables(b);
+        save_tables(b, tcx);
         // (the number of words, in the header)
         let header = BUFS[b].data as *i64;
         header[3] = BUFS[b].len / 8;
@@ -811,7 +808,7 @@ fn save(root: *u8, target: i64) {
     }
 }
 
-fn save_tables(b: i64) {
+fn save_tables(b: i64, tcx: Tcx<Comp>) {
     unsafe {
         let n_syms = SYMS.len() as i64;
         put(b, n_syms);
@@ -846,45 +843,45 @@ fn save_tables(b: i64) {
             put(b, x.path);
             put(b, x.owner);
             put(b, x.tr);
-            put(b, signature_end(d));
-            put(b, trait_of(d));
+            put(b, signature_end(d, tcx));
+            put(b, trait_of(d, tcx));
             let method = x.kind == K_METHOD || x.kind == K_IMPL_METHOD;
-            put(b, if method { impl_block(d) } else { 0 });
+            put(b, if method { impl_block(d, tcx) } else { 0 });
             var to = 0;
-            let from = if method { impl_header_span(d, &to) } else { 0 };
+            let from = if method { impl_header_span(d, &to, tcx) } else { 0 };
             put(b, from);
             put(b, to);
-            put(b, item_head(d));
-            put(b, item_tail(d));
-            put(b, keyword_head(d));
+            put(b, item_head(d, tcx));
+            put(b, item_tail(d, tcx));
+            put(b, keyword_head(d, tcx));
             // (0.16: the effects def, show and `query effects` print)
             let set = buf_new();
             let lines = buf_new();
-            cache_texts(d, set, lines);
+            cache_texts(d, set, lines, tcx);
             put_str(b, buf_slice(set));
             put_str(b, buf_slice(lines));
             // (0.19: what it needs beyond the build's features)
             let feats = buf_new();
-            crate::tools::query::features::def_features_text(feats, d);
+            crate::tools::query::features::def_features_text(feats, d, tcx);
             put_str(b, buf_slice(feats));
             // (0.17: the kind and the view summary, tools/query/values)
             let kind = buf_new();
             let views = buf_new();
-            own_cache_texts(d, kind, views);
+            own_cache_texts(d, kind, views, tcx);
             put_str(b, buf_slice(kind));
             put_str(b, buf_slice(views));
         }
         put_ints(b, MOD_DEF);
-        put_ints(b, ALIASES);
-        put(b, C_ALIAS);
-        put(b, C_ALIAS_MODULE);
+        put_ints(b, tcx.aliases);
+        put(b, tcx.c_alias);
+        put(b, tcx.c_alias_module);
         // The notes of the imports that give another name (query.alias):
         // the definition + 1 in place of its node (def_of_node).
         var notes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var k = 0;
         while k < NOTES.count {
-            if (NOTES.data[k + 3] & QF_USE) != 0 && is_alias_at(NOTES.data[k]) {
-                let d = def_of_node(NOTES.data[k + 2]);
+            if (NOTES.data[k + 3] & QF_USE) != 0 && is_alias_at(NOTES.data[k], tcx) {
+                let d = def_of_node(NOTES.data[k + 2], tcx);
                 if d >= 0 {
                     notes.push(NOTES.data[k]);
                     notes.push(NOTES.data[k + 1]);
@@ -896,11 +893,11 @@ fn save_tables(b: i64) {
         }
         put_ints(b, notes);
         put_ints(b, LINES);
-        put_ints(b, FILE_RANK);
-        put_ints(b, CONTAINERS);
+        put_ints(b, tcx.file_rank);
+        put_ints(b, tcx.containers);
         put(b, FILES.len() as i64);
         for f in 0..FILES.len() as i64 {
-            put(b, code_start(f));
+            put(b, code_start(f, tcx));
         }
         var errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var warnings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -936,11 +933,11 @@ fn save_tables(b: i64) {
     }
 }
 
-fn is_alias_at(pos: i64) -> bool {
+fn is_alias_at(pos: i64, tcx: Tcx<Comp>) -> bool {
     unsafe {
         var i = 0;
-        while i < ALIASES.count {
-            if ALIASES.data[i + 1] == pos {
+        while i < tcx.aliases.count {
+            if tcx.aliases.data[i + 1] == pos {
                 return true;
             }
             i += 2;

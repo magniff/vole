@@ -6,6 +6,7 @@ use crate::base::{
     BUFS, IntVec, OVERLAY, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, intern,
 };
+use crate::base::comp::Comp;
 use crate::base::diag::{FIX_AT_FILE, FIX_AT_LINE, SUGGESTED};
 use crate::cli::line::{
     Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, Leaf, flag, option, pair,
@@ -20,37 +21,36 @@ use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::{
     SYM_ALIAS, SYM_CONST, SYM_ENUM, SYM_FN, SYM_STATIC, SYM_STRUCT, item_node_of,
 };
-use crate::tools::edit::{NO_CHECK, TARGET, TARGET_NAME, edit_count};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_count;
 use crate::tools::edit::apply::{
-    CHECK_STRICT, LEFT_OK, SHOW_DIFF, copy_rewritten, finish_edit, overlay_args, prepare_edit,
-    print_round_files, set_command, write_round_copies,
+    copy_rewritten, finish_edit, overlay_args, prepare_edit, print_round_files, set_command,
+    write_round_copies,
 };
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::fix::{
-    CODES, missing_use_edits, obsolete_attr_edits, pub_edits, suggested_edits, unused_import_edits,
+    missing_use_edits, obsolete_attr_edits, pub_edits, suggested_edits, unused_import_edits,
 };
-use crate::tools::fix::unneeded::{UNNEEDED_JUSTIFIED, UNNEEDED_LEFT, unneeded_unsafe_edits};
+use crate::tools::fix::unneeded::unneeded_unsafe_edits;
 use crate::tools::fix::verify::verify_fixes;
 use crate::tools::fixconv::{
     CC_DEREF, CC_INOUT_LOCAL, CC_MARKER, CC_PARAM_INOUT, CC_PARAM_LET, CC_PARAM_SINK, CC_RECEIVER,
-    CC_SINK_CLOSURE, CC_STATIC, CC_TYPE, CC_UNMARKED, CC_VAR, CONV_COUNTS, CONV_LIST_LEFT,
-    CONV_SPELLING, conventions_edits, conventions_report,
+    CC_SINK_CLOSURE, CC_STATIC, CC_TYPE, CC_UNMARKED, CC_VAR, conventions_edits, conventions_report,
 };
 use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
 use crate::tools::fixstd015::std015_edits;
-use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
-use crate::tools::fixvalues::{VALUES_COUNTS, values_edits};
+use crate::tools::fixunsafe::{FIX_UNSAFE, fix_unsafe_edits};
+use crate::tools::fixvalues::values_edits;
 use crate::tools::proc::buf_cstr;
 use crate::tools::query::{c_slice, file_line, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{mod_fqn, mod_fqn_text};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, program_errors, put_word, try_begin, try_end, write_diags,
+    PROG, diag, program_errors, put_word, try_begin, try_end, write_diags,
 };
 use crate::tools::query::refs::{OPT_IN, put_bad_in, resolve_in};
 use crate::tools::reexports::reexport_edits;
-use crate::tools::refactor_shape::sealed016::SHAPE_LEFT;
-use crate::tools::tidyimports::{TIDY_EDITED, tidy_import_edits};
+use crate::tools::tidyimports::tidy_import_edits;
 
 const F_IMPORTS: i64 = 1;
 const F_UNUSED: i64 = 2;
@@ -92,22 +92,19 @@ const F_CASTS: i64 = 131072;
 const F_ALLOC: i64 = 262144;
 // (0.26.3: `--only buf`) std's Buf to String<A> or Vec<u8, A> (fix/buf.vl)
 const F_BUF: i64 = 1048576;
+// (0.26.4: `--only rawptr`) the raw pointer parameters decided into let,
+// inout or raw (fix/rawptr.vl); `rawptr-list` also lists each
+const F_RAWPTR: i64 = 2097152;
+// (0.26.4: `--only statics --group FILE`) a group of statics into a context
+// passed down (fix/statics.vl); `statics-list` also lists each function
+const F_STATICS: i64 = 4194304;
 const F_SUGGESTS: i64 = F_IMPORTS | F_PUB | F_SUGGESTED;
 const F_ALL: i64 = 15;
 
 // ---- Which module a missing import comes from (0.16) ----
 
-// `--use PATH::NAME`: the module to import NAME from when several have
-// it (fix.ambiguous's `try:` lines), as symbols: path, name, in pairs.
-static var CHOSEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Whether a name was left for fix.ambiguous (the exit status is 1).
-static var AMBIGUOUS: bool = false;
-
-// (0.25.2.1) `--codes`'s value as given, for the rounds' command lines.
-static var CODES_ARG: *u8 = 0 as *u8;
-
 // `--use PATH::NAME` into CHOSEN. False when it has no `::`.
-fn take_use(v: [u8]) -> bool {
+fn take_use(v: [u8], tcx: inout Tcx<Comp>) -> bool {
     var cut = -1;
     for i in 1..v.len as i64 {
         if v[i] == ':' && v[i - 1] == ':' {
@@ -117,16 +114,16 @@ fn take_use(v: [u8]) -> bool {
     if cut <= 0 || cut + 2 >= v.len as i64 {
         return false;
     }
-    CHOSEN.push(intern(v[0..cut]));
-    CHOSEN.push(intern(v[cut + 2..]));
+    tcx.chosen.push(intern(v[0..cut]));
+    tcx.chosen.push(intern(v[cut + 2..]));
     true
 }
 
 // The module whose path is symbol p (`crate::a::b`, `std`), or -1 (std's
 // path when std is not read).
-fn module_of_path(p: i64) -> i64 {
+fn module_of_path(p: i64, tcx: inout Tcx<Comp>) -> i64 {
     for m in 0..module_count() {
-        if m != C_MODULE && mod_fqn(m) == p {
+        if m != C_MODULE && mod_fqn(m, &tcx) == p {
             return m;
         }
     }
@@ -227,9 +224,9 @@ fn nearer(a: i64, b: i64, m: i64) -> bool {
 // item `name` of the same kind, the one --use names, else the nearest
 // (the innermost module holding both, then the fewest segments) when no
 // other is as near; else -1, after fix.ambiguous.
-pub fn choose_path(m: i64, name: i64, p: i64) -> i64 {
+pub fn choose_path(m: i64, name: i64, p: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        let pm = module_of_path(p);
+        let pm = module_of_path(p, &tcx);
         if pm < 0 {
             return p;
         }
@@ -264,13 +261,13 @@ pub fn choose_path(m: i64, name: i64, p: i64) -> i64 {
         if cands.count <= 1 {
             return p;
         }
-        for i in 0..CHOSEN.count / 2 {
-            if CHOSEN.data[2 * i + 1] != name {
+        for i in 0..tcx.chosen.count / 2 {
+            if tcx.chosen.data[2 * i + 1] != name {
                 continue;
             }
             for k in 0..cands.count {
-                if mod_fqn(cands.data[k]) == CHOSEN.data[2 * i] {
-                    return CHOSEN.data[2 * i];
+                if mod_fqn(cands.data[k], &tcx) == tcx.chosen.data[2 * i] {
+                    return tcx.chosen.data[2 * i];
                 }
             }
         }
@@ -290,11 +287,11 @@ pub fn choose_path(m: i64, name: i64, p: i64) -> i64 {
             }
         }
         if tied.count == 1 {
-            return mod_fqn(cands.data[best]);
+            return mod_fqn(cands.data[best], &tcx);
         }
-        AMBIGUOUS = true;
-        let d = diag(c"error", c"fix.ambiguous");
-        buf_bytes(d, mod_fqn_text(m));
+        tcx.ambiguous = true;
+        let d = diag(c"error", c"fix.ambiguous", &tcx);
+        buf_bytes(d, mod_fqn_text(m, &tcx));
         buf_str(d, c" uses '");
         buf_bytes(d, SYMS[name].text);
         buf_str(d, c"', which ");
@@ -304,17 +301,17 @@ pub fn choose_path(m: i64, name: i64, p: i64) -> i64 {
             if k > 0 {
                 buf_str(d, c", ");
             }
-            buf_bytes(d, mod_fqn_text(tied.data[k]));
+            buf_bytes(d, mod_fqn_text(tied.data[k], &tcx));
         }
         buf_str(d, c"; nothing is imported for it: name one with --use\n");
         for k in 0..tied.count {
             if k == 5 {
                 break;
             }
-            let out = try_begin(c"fix", c_slice(c""), false);
+            let out = try_begin(c"fix", c_slice(c""), false, &tcx);
             buf_str(out, c" --only imports --use");
             let path = buf_new();
-            buf_bytes(path, mod_fqn_text(tied.data[k]));
+            buf_bytes(path, mod_fqn_text(tied.data[k], &tcx));
             buf_str(path, c"::");
             buf_bytes(path, SYMS[name].text);
             put_word(out, buf_slice(path));
@@ -363,30 +360,31 @@ pub fn fix_leaf(gpa: Gpa) -> Leaf<Gpa> {
     table.push(flag("diff", "the diff of what is written, after the summary"));
     table.push(flag("keep-braces", "--only fstring: plain literals left as they are"));
     table.push(option("in", "FILE|MODULE", "only there"));
+    table.push(option("group", "FILE", "--only statics: the statics, their context, its owners"));
     table.push(option("use", "PATH::NAME", "the module to import NAME from"));
     table.push(option("only", "KINDS", "imports,unused,pub,unsafe,suggested,..."));
     table.push(pair("overlay", "PATH COPY", "PATH read from COPY"));
     Leaf::new(table, "file")
 }
 
-pub fn run_fix(c: Call<Gpa>) -> i64 {
-    let status = run_fix_inner(c, 0);
-    write_diags();
+pub fn run_fix(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_fix_inner(c, 0, &tcx);
+    write_diags(tcx);
     status
 }
 
 // `volec --fix-imports ROOT`, `--fix-unsafe ROOT` (`only`: F_IMPORTS,
 // F_UNSAFE): fix, quiet when there is nothing to do.
-pub fn run_fix_alias(c: Call<Gpa>, only: i64) -> i64 {
-    let status = run_fix_inner(c, only);
-    write_diags();
+pub fn run_fix_alias(c: Call<Gpa>, only: i64, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_fix_inner(c, only, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
-    set_command(c.line);
+fn run_fix_inner(c: Call<Gpa>, alias: i64, tcx: inout Tcx<Comp>) -> i64 {
+    set_command(c.line, &tcx);
     PROG = c.prog();
-    TOOL = 0 as *u8;
+    tcx.tool = 0 as *u8;
     var only = if alias != 0 { alias } else { F_ALL };
     var only_arg = if alias == F_IMPORTS { c"imports" }
         else if alias == F_UNSAFE { c"unsafe" } else { 0 as *u8 };
@@ -420,7 +418,7 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
             var line_no = 0;
             let n = file_line(s, &line_no);
             if n <= 0 || line_no <= 0 {
-                let d = diag(c"error", c"fix.usage");
+                let d = diag(c"error", c"fix.usage", &tcx);
                 buf_str(d, c"--at takes FILE:LINE, the line of an error\n");
                 return 2;
             }
@@ -435,28 +433,31 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
             buf_byte(b, ',');
             buf_str(b, a);
             buf_byte(b, ',');
-            CODES = b;
-            CODES_ARG = a;
+            tcx.codes = b;
+            tcx.codes_arg = a;
             suggested = true;
             continue;
         } else if flag_is && ev.name == "diff" {
-            SHOW_DIFF = true;
+            tcx.show_diff = true;
             continue;
         } else if flag_is && ev.name == "keep-braces" {
-            crate::tools::fix::fstring::KEEP_BRACES = true;
+            tcx.keep_braces = true;
             continue;
         } else if flag_is && ev.name == "list-left" {
-            CONV_LIST_LEFT = true;
+            tcx.conv_list_left = true;
             continue;
         } else if flag_is && ev.name == "tidy-edited" {
-            TIDY_EDITED = true;
+            tcx.tidy_edited = true;
+            continue;
+        } else if opt_is && ev.name == "group" {
+            tcx.group_file = a;
             continue;
         } else if opt_is && ev.name == "in" {
             OPT_IN = a;
             continue;
         } else if opt_is && ev.name == "use" {
-            if !take_use(c_slice(a)) {
-                let d = diag(c"error", c"fix.usage");
+            if !take_use(c_slice(a), &tcx) {
+                let d = diag(c"error", c"fix.usage", &tcx);
                 buf_str(d, c"--use takes the path of an item, 'crate::a::b::name'\n");
                 return 2;
             }
@@ -502,22 +503,36 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
                     else if word_is(w, c"casts") { F_CASTS }
                     else if word_is(w, c"casts-list") {
                         // (a dry run: the sites, the diff)
-                        crate::tools::fix::casts::CAST_LIST = true;
-                        crate::tools::edit::DRY_RUN = true;
+                        tcx.cast_list = true;
+                        tcx.dry_run = true;
                         F_CASTS
                     }
                     else if word_is(w, c"alloc") { F_ALLOC }
                     else if word_is(w, c"buf") { F_BUF }
+                    else if word_is(w, c"rawptr") { F_RAWPTR }
+                    else if word_is(w, c"rawptr-list") {
+                        // (a dry run: the parameters, the diff)
+                        tcx.rawptr_list = true;
+                        tcx.dry_run = true;
+                        F_RAWPTR
+                    }
+                    else if word_is(w, c"statics") { F_STATICS }
+                    else if word_is(w, c"statics-list") {
+                        // (a dry run: the functions, the diff)
+                        tcx.statics_list = true;
+                        tcx.dry_run = true;
+                        F_STATICS
+                    }
                     else if word_is(w, c"suggested") { F_SUGGESTS } else { 0 };
                 if bit == 0 {
-                    let d = diag(c"error", c"fix.usage");
-                    buf_str(d, c"--only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts, casts-list, alloc or buf, not '");
+                    let d = diag(c"error", c"fix.usage", &tcx);
+                    buf_str(d, c"--only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, values, conventions, conventions-spelling, unneeded-unsafe, unneeded-justified, obsolete-attr, usize, fstring, casts, casts-list, alloc, buf, rawptr, rawptr-list, statics or statics-list, not '");
                     buf_bytes(d, w);
                     buf_str(d, c"'\n");
                     return 2;
                 }
                 if bit == F_UNNEEDED_J {
-                    UNNEEDED_JUSTIFIED = true;
+                    tcx.unneeded_justified = true;
                     only |= F_UNNEEDED;
                 } else {
                     only |= bit;
@@ -526,23 +541,23 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
             }
             continue;
         } else if ev.kind == EV_MISSING && (ev.name == "at" || ev.name == "in"
-            || ev.name == "use" || ev.name == "only" || ev.name == "overlay"
+            || ev.name == "use" || ev.name == "only" || ev.name == "group" || ev.name == "overlay"
             || ev.name == "codes") {
             ev.kind = EV_UNKNOWN;
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
             continue;
         }
         if ev.kind != EV_WORD || ev.text.starts_with("-") {
-            let d = diag(c"error", c"fix.usage");
+            let d = diag(c"error", c"fix.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
             buf_str(d, c"'\n");
-            let out = try_begin(c"fix", c_slice(c""), false);
+            let out = try_begin(c"fix", c_slice(c""), false, &tcx);
             try_end(out);
             return 2;
         }
         if root != 0 as *u8 {
-            let d = diag(c"error", c"fix.usage");
+            let d = diag(c"error", c"fix.usage", &tcx);
             buf_str(d, c"one ROOT (the program's root file), not '");
             buf_str(d, a);
             buf_str(d, c"'\n");
@@ -559,11 +574,11 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
     }
     if (only & F_ALLOC) != 0 {
         // (the allocator rules' exact fixes, by their codes)
-        CODES = crate::tools::fix::alloc::alloc_codes();
-        crate::tools::fix::verify::ALLOC_ROUNDS = true;
+        tcx.codes = crate::tools::fix::alloc::alloc_codes();
+        tcx.alloc_rounds = true;
         only = F_SUGGESTED;
     }
-    if CODES >= 0 {
+    if tcx.codes >= 0 {
         // (0.25.2.1: --codes: those errors' exact fixes alone, no
         // import, no pub)
         only = F_SUGGESTED;
@@ -574,19 +589,19 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
         crate::front::conv::set_mixed();
     }
     if (only & (F_STD015 | F_VALUES)) != 0 {
-        crate::tools::fixconv::WRITE_019 = true;
+        tcx.write_019 = true;
     }
     if (only & F_SUGGESTED) != 0 {
-        LEFT_OK = true;
+        tcx.left_ok = true;
     } else if at != 0 as *u8 {
-        let d = diag(c"error", c"fix.usage");
+        let d = diag(c"error", c"fix.usage", &tcx);
         buf_str(d, c"--at is for --suggested: the fixes of the errors at a line\n");
         return 2;
     }
-    ROOT_GIVEN = root;
+    tcx.root_given = root;
     // (0.25.2: std's files edited: fixed with them, as check reads them)
-    crate::tools::edit::cli::std_tree_if_edited();
-    root = root_or_diag(root, c"fix", c_slice(c""), false);
+    crate::tools::edit::cli::std_tree_if_edited(&tcx);
+    root = root_or_diag(root, c"fix", c_slice(c""), false, &tcx);
     if root == 0 as *u8 {
         return 2;
     }
@@ -600,8 +615,8 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
     // edited one is checked in 0.20's spelling, but by
     // conventions-spelling's, which keeps 0.19's meaning)
     if (only & (F_CONV | F_CONV_SPELLING)) != 0 {
-        CONV_SPELLING = (only & F_CONV) == 0;
-        CHECK_STRICT = !CONV_SPELLING;
+        tcx.conv_spelling = (only & F_CONV) == 0;
+        tcx.check_strict = !tcx.conv_spelling;
         crate::front::conv::set_mixed();
     }
     // (0.25.4: unneeded-unsafe asks the checker which unsafe blocks hold
@@ -617,64 +632,74 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
     crate::tools::fix::buf::RECORD = (only & F_BUF) != 0;
     // (and its edits are checked by the errors' codes and items: it rewords
     // the errors a program has, edit/apply.vl KEY_BY_ITEM)
-    crate::tools::edit::apply::KEY_BY_ITEM = (only & (F_FSTRING | F_BUF)) != 0;
-    if !load_program(root, TARGET) {
+    tcx.key_by_item = (only & (F_FSTRING | F_BUF)) != 0;
+    if !load_program(root, tcx.target, &tcx) {
         // (0.18) a program that does not parse: its errors' exact
         // fixes alone (a Rust label respelled)
         if (only & F_SUGGESTED) == 0 || SUGGESTED.count == 0 || OPT_IN != 0 as *u8 {
-            program_errors(c"error", root, true);
+            program_errors(c"error", root, true, &tcx);
             return 1;
         }
         only = F_SUGGESTED;
     }
-    if OPT_IN != 0 as *u8 && !resolve_in_list(c_slice(OPT_IN)) {
-        let d = diag(c"error", c"fix.bad-in");
-        put_bad_in(d, OPT_IN);
+    if OPT_IN != 0 as *u8 && !resolve_in_list(c_slice(OPT_IN), &tcx) {
+        let d = diag(c"error", c"fix.bad-in", &tcx);
+        put_bad_in(d, OPT_IN, tcx);
         return 1;
     }
     // The fixes (an edit overlapping one made before is left for the
     // next run).
     let wild = if (only & F_IMPORTS) != 0 && LEGACY_IMPORTS { fix_imports_edits() } else { 0 };
-    let imports = if (only & F_IMPORTS) != 0 { missing_use_edits() } else { 0 };
+    let imports = if (only & F_IMPORTS) != 0 { missing_use_edits(&tcx) } else { 0 };
     let unused = if (only & F_UNUSED) != 0 { unused_import_edits(0 as *IntVec) } else { 0 };
-    let public = if (only & F_PUB) != 0 { pub_edits() } else { 0 };
-    WHOLE_BODIES = alias == 0;
-    let wrapped = if (only & F_UNSAFE) != 0 { fix_unsafe_edits() } else { 0 };
+    let public = if (only & F_PUB) != 0 { pub_edits(&tcx) } else { 0 };
+    tcx.whole_bodies = alias == 0;
+    let wrapped = if (only & F_UNSAFE) != 0 { fix_unsafe_edits(tcx) } else { 0 };
     var dropped = 0;
-    let through = if (only & F_REEXPORTS) != 0 { reexport_edits(&dropped) } else { 0 };
-    let tidied = if (only & F_TIDY) != 0 { tidy_import_edits() } else { 0 };
-    let migrated = if (only & F_STD015) != 0 { std015_edits() } else { 0 };
+    let through = if (only & F_REEXPORTS) != 0 { reexport_edits(&dropped, &tcx) } else { 0 };
+    let tidied = if (only & F_TIDY) != 0 { tidy_import_edits(&tcx) } else { 0 };
+    let migrated = if (only & F_STD015) != 0 { std015_edits(tcx) } else { 0 };
     // (0.16's alloc016, removed in 0.26.3 with std's ambient functions: fix --only alloc)
     let explicit = 0;
-    let exact = if (only & F_SUGGESTED) != 0 { suggested_edits() } else { 0 };
-    let valued = if (only & F_VALUES) != 0 { values_edits() } else { 0 };
-    let conv = if (only & (F_CONV | F_CONV_SPELLING)) != 0 { conventions_edits() } else { 0 };
-    let unneeded = if (only & F_UNNEEDED) != 0 { unneeded_unsafe_edits() } else { 0 };
+    let exact = if (only & F_SUGGESTED) != 0 { suggested_edits(&tcx) } else { 0 };
+    let valued = if (only & F_VALUES) != 0 { values_edits(&tcx) } else { 0 };
+    let conv = if (only & (F_CONV | F_CONV_SPELLING)) != 0 { conventions_edits(&tcx) } else { 0 };
+    let unneeded = if (only & F_UNNEEDED) != 0 { unneeded_unsafe_edits(&tcx) } else { 0 };
     let obsolete = if (only & F_OBSOLETE) != 0 { obsolete_attr_edits() } else { 0 };
-    let formats = if (only & F_FSTRING) != 0 { crate::tools::fix::fstring::fstring_edits() }
+    let formats = if (only & F_FSTRING) != 0 { crate::tools::fix::fstring::fstring_edits(tcx) }
         else { 0 };
-    let casts = if (only & F_CASTS) != 0 { crate::tools::fix::casts::cast_edits() } else { 0 };
+    let casts = if (only & F_CASTS) != 0 { crate::tools::fix::casts::cast_edits(&tcx) } else { 0 };
     if (only & F_CASTS) != 0 && !round {
-        crate::tools::fix::casts::cast_report();
+        crate::tools::fix::casts::cast_report(&tcx);
     }
-    let bufs = if (only & F_BUF) != 0 { crate::tools::fix::buf::buf_edits() } else { 0 };
+    let bufs = if (only & F_BUF) != 0 { crate::tools::fix::buf::buf_edits(&tcx) } else { 0 };
+    let rawptrs = if (only & F_RAWPTR) != 0 { crate::tools::fix::rawptr::rawptr_edits(&tcx) }
+        else { 0 };
+    if (only & F_RAWPTR) != 0 && !round {
+        crate::tools::fix::rawptr::rawptr_report(&tcx);
+    }
+    let moved = if (only & F_STATICS) != 0 { crate::tools::fix::statics::statics_edits(&tcx) }
+        else { 0 };
+    if (only & F_STATICS) != 0 && !round {
+        crate::tools::fix::statics::statics_report(&tcx);
+    }
     if (only & (F_CONV | F_CONV_SPELLING)) != 0 {
-        conventions_report();
+        conventions_report(&tcx);
     }
     var counts = [imports, wild, unused, public, wrapped, through, dropped, tidied,
         migrated, explicit, exact];
     if round {
         // (a later round, on the edited program: what it fixed, the
         // copies it rewrote)
-        if edit_count() == 0 {
+        if edit_count(tcx) == 0 {
             return 0;
         }
         // (0.25.2.1: the round's fixes checked on its copies first,
         // fix/verify.vl)
-        if !write_round_copies() {
+        if !write_round_copies(&tcx) {
             return 1;
         }
-        if (only & F_SUGGESTED) != 0 && !NO_CHECK && !verify_fixes(root, &counts, true) {
+        if (only & F_SUGGESTED) != 0 && !tcx.no_check && !verify_fixes(root, &counts, true, &tcx) {
             return 0;
         }
         let out = buf_new();
@@ -685,27 +710,28 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
         }
         buf_byte(out, '\n');
         buf_write_fd(out, STDOUT);
-        print_round_files();
+        print_round_files(tcx);
         return 0;
     }
-    if edit_count() == 0 {
-        if AMBIGUOUS || SHAPE_LEFT > 0 || crate::tools::fix::buf::BUF_REFUSED > 0 {
+    if edit_count(tcx) == 0 {
+        if tcx.ambiguous || tcx.shape_left > 0 || crate::tools::fix::buf::BUF_REFUSED > 0
+            || tcx.statics_refused {
             return 1;
         }
         if alias == 0 {
-            let d = diag(c"note", c"fix.none");
+            let d = diag(c"note", c"fix.none", &tcx);
             buf_str(d, c"nothing to fix\n");
         }
         return 0;
     }
-    let status = prepare_edit();
+    let status = prepare_edit(&tcx);
     if status >= 0 {
         return status;
     }
     // (0.25.2.1) The fixes checked on the edited program: a wrong one
     // is taken out (fix/verify.vl)
-    if (only & F_SUGGESTED) != 0 && !NO_CHECK && !verify_fixes(root, &counts, false) {
-        let d = diag(c"note", c"fix.none");
+    if (only & F_SUGGESTED) != 0 && !tcx.no_check && !verify_fixes(root, &counts, false, &tcx) {
+        let d = diag(c"note", c"fix.none", &tcx);
         buf_str(d, c"nothing to fix: every fix was refused (above)\n");
         return 1;
     }
@@ -714,9 +740,10 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
     // own fixed point, one round)
     let one_round = only == F_VALUES || only == F_CONV || only == F_CONV_SPELLING
         || only == F_UNNEEDED || only == F_OBSOLETE || (only & F_FSTRING) != 0
-        || (only & F_CASTS) != 0 || (only & F_BUF) != 0;
+        || (only & F_CASTS) != 0 || (only & F_BUF) != 0 || (only & F_RAWPTR) != 0
+        || (only & F_STATICS) != 0;
     for _ in 0..if one_round { 0 } else { 4 } {
-        if !more_round(root, only_arg, suggested, at, &counts) {
+        if !more_round(root, only_arg, suggested, at, &counts, &tcx) {
             break;
         }
     }
@@ -724,7 +751,7 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
         // (0.19.1) then a read-only `[T]` given to a `&mut [T]`
         // parameter (own.readonly) made exclusive, `&mut a[..]`,
         // `v.as_mut_slice()`, `v.sort()`: the errors' exact fixes
-        more_round(root, c"suggested", true, at, &counts);
+        more_round(root, c"suggested", true, at, &counts, &tcx);
     }
     let what = buf_new();
     buf_str(what, c"fixed");
@@ -744,46 +771,48 @@ fn run_fix_inner(c: Call<Gpa>, alias: i64) -> i64 {
     put_count(what, formats, c"f-string or format literal", c"f-strings and format literals");
     put_count(what, casts, c"usize cast", c"usize casts");
     put_count(what, bufs, c"Buf site", c"Buf sites");
-    put_count(what, UNNEEDED_LEFT, c"left as it is (query unsafe lists it)",
+    put_count(what, rawptrs, c"raw pointer parameter", c"raw pointer parameters");
+    put_count(what, tcx.unneeded_left, c"left as it is (query unsafe lists it)",
         c"left as they are (query unsafe lists them)");
     if valued > 0 {
-        put_count(what, VALUES_COUNTS[0], c"parameter to &mut T", c"parameters to &mut T");
-        put_count(what, VALUES_COUNTS[1], c"parameter to &T", c"parameters to &T");
-        put_count(what, VALUES_COUNTS[2], c"slice parameter to &mut [T]",
+        put_count(what, tcx.values_counts[0], c"parameter to &mut T", c"parameters to &mut T");
+        put_count(what, tcx.values_counts[1], c"parameter to &T", c"parameters to &T");
+        put_count(what, tcx.values_counts[2], c"slice parameter to &mut [T]",
             c"slice parameters to &mut [T]");
-        put_count(what, VALUES_COUNTS[3], c"owned parameter to &T (only read)",
+        put_count(what, tcx.values_counts[3], c"owned parameter to &T (only read)",
             c"owned parameters to &T (only read)");
-        put_count(what, VALUES_COUNTS[4], c"argument", c"arguments");
+        put_count(what, tcx.values_counts[4], c"argument", c"arguments");
     }
     if conv > 0 {
-        put_count(what, CONV_COUNTS[CC_PARAM_LET], c"parameter to let", c"parameters to let");
-        put_count(what, CONV_COUNTS[CC_PARAM_INOUT], c"parameter to inout",
+        put_count(what, tcx.conv_counts[CC_PARAM_LET], c"parameter to let", c"parameters to let");
+        put_count(what, tcx.conv_counts[CC_PARAM_INOUT], c"parameter to inout",
             c"parameters to inout");
-        put_count(what, CONV_COUNTS[CC_PARAM_SINK], c"parameter to sink",
+        put_count(what, tcx.conv_counts[CC_PARAM_SINK], c"parameter to sink",
             c"parameters to sink");
-        put_count(what, CONV_COUNTS[CC_RECEIVER], c"receiver", c"receivers");
-        put_count(what, CONV_COUNTS[CC_MARKER], c"'&mut e' to '&e'", c"'&mut e's to '&e'");
-        put_count(what, CONV_COUNTS[CC_UNMARKED], c"'&e' to a let", c"'&e's to a let");
-        put_count(what, CONV_COUNTS[CC_DEREF], c"'*r' of an access", c"'*r's of accesses");
-        put_count(what, CONV_COUNTS[CC_VAR], c"'let mut' / 'mut x' to var",
+        put_count(what, tcx.conv_counts[CC_RECEIVER], c"receiver", c"receivers");
+        put_count(what, tcx.conv_counts[CC_MARKER], c"'&mut e' to '&e'", c"'&mut e's to '&e'");
+        put_count(what, tcx.conv_counts[CC_UNMARKED], c"'&e' to a let", c"'&e's to a let");
+        put_count(what, tcx.conv_counts[CC_DEREF], c"'*r' of an access", c"'*r's of accesses");
+        put_count(what, tcx.conv_counts[CC_VAR], c"'let mut' / 'mut x' to var",
             c"'let mut's / 'mut x's to var");
-        put_count(what, CONV_COUNTS[CC_INOUT_LOCAL], c"inout local", c"inout locals");
-        put_count(what, CONV_COUNTS[CC_STATIC], c"static var", c"static vars");
-        put_count(what, CONV_COUNTS[CC_SINK_CLOSURE], c"sink closure", c"sink closures");
-        put_count(what, CONV_COUNTS[CC_TYPE], c"access type", c"access types");
+        put_count(what, tcx.conv_counts[CC_INOUT_LOCAL], c"inout local", c"inout locals");
+        put_count(what, tcx.conv_counts[CC_STATIC], c"static var", c"static vars");
+        put_count(what, tcx.conv_counts[CC_SINK_CLOSURE], c"sink closure", c"sink closures");
+        put_count(what, tcx.conv_counts[CC_TYPE], c"access type", c"access types");
     }
-    let status = finish_edit(buf_slice(what), root);
-    if AMBIGUOUS || SHAPE_LEFT > 0 || crate::tools::fix::buf::BUF_REFUSED > 0 { 1 }
+    let status = finish_edit(buf_slice(what), root, &tcx);
+    if tcx.ambiguous || tcx.shape_left > 0 || crate::tools::fix::buf::BUF_REFUSED > 0
+        || tcx.statics_refused { 1 }
     else { status }
 }
 
 // (0.20) --in A,B,...: each resolved (query's --in, the matches adding up);
 // whether each matched.
-fn resolve_in_list(x: [u8]) -> bool {
+fn resolve_in_list(x: [u8], tcx: inout Tcx<Comp>) -> bool {
     var start = 0;
     for i in 0..x.len as i64 + 1 {
         if i == x.len as i64 || x[i] == ',' {
-            if i > start && !resolve_in(x[start..i]) {
+            if i > start && !resolve_in(x[start..i], &tcx) {
                 return false;
             }
             start = i + 1;
@@ -795,7 +824,8 @@ fn resolve_in_list(x: [u8]) -> bool {
 // A round of fix on the edited program (`PROG fix --round ... --overlay
 // FILE COPY... ROOT`): adds what it fixed to counts. Whether it fixed
 // anything.
-fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: inout [i64; 11]) -> bool {
+fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: inout [i64; 11],
+    tcx: inout Tcx<Comp>) -> bool {
     var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     args.push(PROG as i64);
     args.push(c"fix" as i64);
@@ -811,22 +841,22 @@ fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: inout 
     if suggested {
         args.push(c"--suggested" as i64);
     }
-    if CODES_ARG != 0 as *u8 {
+    if tcx.codes_arg != 0 as *u8 {
         args.push(c"--codes" as i64);
-        args.push(CODES_ARG as i64);
+        args.push(tcx.codes_arg as i64);
     }
     if at != 0 as *u8 {
         args.push(c"--at" as i64);
         args.push(at as i64);
     }
-    if TIDY_EDITED {
+    if tcx.tidy_edited {
         args.push(c"--tidy-edited" as i64);
     }
-    if TARGET_NAME != 0 as *u8 {
+    if tcx.target_name != 0 as *u8 {
         args.push(c"--target" as i64);
-        args.push(TARGET_NAME as i64);
+        args.push(tcx.target_name as i64);
     }
-    overlay_args(&args);
+    overlay_args(&args, tcx);
     args.push(root as i64);
     args.push(0);
     let out = buf_new();
@@ -843,7 +873,7 @@ fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: inout 
         }
         let line = t[i..e];
         if line.len > 5 && line[0] == 'f' && line[4] == '\t' {
-            if copy_rewritten(line[5..line.len]) {
+            if copy_rewritten(line[5..line.len], &tcx) {
                 any = true;
             }
         } else if line.len > 6 && line[0] == 'c' && line[5] == '\t' {

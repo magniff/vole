@@ -12,15 +12,17 @@ use crate::base::{
     IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, getenv, streq,
 };
+use crate::base::comp::Comp;
 use crate::base::target::{T_AARCH64_MACOS, T_X86_64_MACOS};
 use crate::front::cpp::directives::file_exists;
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{buf_cstr, read_file_if, rename_file, write_file_if};
 use crate::tools::query::c_slice;
 use crate::tools::query::diagnostics::{PROG, diag, put_cword, try_begin, try_end};
 use crate::tools::testrun::{
-    BUDGET, FILTERS, OPT, SHOW_OUTPUT, TIMEOUT, build_key_for, case_file, contains, expected_exit,
-    join, line_count, line_end, list_cases, normal, output_lines, put_cut, put_difference,
-    put_failures, put_lines, put_lines_count, selected, shown_path, starts, traced,
+    build_key_for, case_file, contains, expected_exit, join, line_count, line_end, list_cases,
+    normal, output_lines, put_cut, put_difference, put_failures, put_lines, put_lines_count,
+    selected, shown_path, starts, traced,
 };
 
 extern "C" {
@@ -36,14 +38,6 @@ extern "C" {
     fn chmod(path: *u8, mode: i32) -> i32;
     fn getenv(name: *u8) -> *u8;
 }
-
-// (0.18) The options of the language's tests (tools/testrun/mod.vl reads
-// them): --cases N, --seed S, --accept, --no-contracts, --no-check-alloc.
-pub static var CASES: i64 = 0;
-pub static var SEED: *u8 = 0 as *u8;
-pub static var ACCEPT: bool = false;
-pub static var NO_CONTRACTS: bool = false;
-pub static var NO_CHECK_ALLOC: bool = false;
 
 // What an item is.
 const CASE: i64 = 0;
@@ -63,30 +57,26 @@ pub struct Job {
     argv: **u8, input: *u8, pub out: *u8, pub err: *u8, pid: i32, pub status: i64, reruns: i64,
 }
 
-pub static var JOBS: *Job = 0 as *Job;
-static var JOB_COUNT: i64 = 0;
-static var JOB_CAP: i64 = 0;
-
-pub fn add_job(argv: **u8, input: *u8, out: *u8, err: *u8) -> i64 {
+pub fn add_job(argv: **u8, input: *u8, out: *u8, err: *u8, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        if JOB_COUNT == JOB_CAP {
-            let cap = if JOB_CAP == 0 { 64 } else { JOB_CAP * 2 };
+        if tcx.job_count == tcx.job_cap {
+            let cap = if tcx.job_cap == 0 { 64 } else { tcx.job_cap * 2 };
             let bigger = alloc_array::<Job>(cap);
-            for i in 0..JOB_COUNT {
-                bigger[i] = JOBS[i];
+            for i in 0..tcx.job_count {
+                bigger[i] = tcx.jobs[i];
             }
-            JOBS = bigger;
-            JOB_CAP = cap;
+            tcx.jobs = bigger;
+            tcx.job_cap = cap;
         }
-        JOBS[JOB_COUNT] = Job { argv, input, out, err, pid: 0, status: 0, reruns: 0 };
-        JOB_COUNT += 1;
-        JOB_COUNT - 1
+        tcx.jobs[tcx.job_count] = Job { argv, input, out, err, pid: 0, status: 0, reruns: 0 };
+        tcx.job_count += 1;
+        tcx.job_count - 1
     }
 }
 
-fn start_job(j: i64) {
+fn start_job(j: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        let job = JOBS[j];
+        let job = tcx.jobs[j];
         let pid = fork();
         if pid == 0 {
             let fd = open(if job.input != 0 as *u8 { job.input } else { c"/dev/null" }, 0);
@@ -104,13 +94,13 @@ fn start_job(j: i64) {
                 dup2(e, 2);
                 close(e);
             }
-            alarm(TIMEOUT as u32);
+            alarm(tcx.testrun_timeout as u32);
             execvp(job.argv[0], job.argv);
             _exit(127);
         }
-        JOBS[j].pid = pid;
+        tcx.jobs[j].pid = pid;
         if pid < 0 {
-            JOBS[j].status = 127;
+            tcx.jobs[j].status = 127;
         }
     }
 }
@@ -121,7 +111,7 @@ fn start_job(j: i64) {
 // not running: other processes had the processors (a loaded machine), or
 // it was stalled behind a disk or swap. It is run again, at most twice, and judged by its
 // last run; a program that loops is stopped once, as before.
-pub fn run_jobs(from: i64) {
+pub fn run_jobs(from: i64, tcx: inout Tcx<Comp>) {
     let host = crate::host_target();
     let most = crate::middle::threads::processors(host == T_AARCH64_MACOS
         || host == T_X86_64_MACOS);
@@ -131,10 +121,10 @@ pub fn run_jobs(from: i64) {
     unsafe {
         var next = from;
         var running = 0;
-        while next < JOB_COUNT || running > 0 {
-            while next < JOB_COUNT && running < most {
-                start_job(next);
-                if JOBS[next].pid > 0 {
+        while next < tcx.job_count || running > 0 {
+            while next < tcx.job_count && running < most {
+                start_job(next, &tcx);
+                if tcx.jobs[next].pid > 0 {
                     running += 1;
                 }
                 next += 1;
@@ -151,19 +141,19 @@ pub fn run_jobs(from: i64) {
                 break;
             }
             for j in from..next {
-                if JOBS[j].pid == pid {
+                if tcx.jobs[j].pid == pid {
                     let s = status as i64;
-                    JOBS[j].status = if (s & 127) == 14 { -1 }
+                    tcx.jobs[j].status = if (s & 127) == 14 { -1 }
                         else if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) };
-                    JOBS[j].pid = 0;
+                    tcx.jobs[j].pid = 0;
                     running -= 1;
                     let ran_us = (usage[0] + usage[2]) * 1000000 + (usage[1] & 0xffffffff) + (
                         usage[3] & 0xffffffff);
-                    if JOBS[j].status == -1 && JOBS[j].reruns < 2
-                        && ran_us * 2 < TIMEOUT * 1000000 {
-                        JOBS[j].reruns += 1;
-                        start_job(j);
-                        if JOBS[j].pid > 0 {
+                    if tcx.jobs[j].status == -1 && tcx.jobs[j].reruns < 2
+                        && ran_us * 2 < tcx.testrun_timeout * 1000000 {
+                        tcx.jobs[j].reruns += 1;
+                        start_job(j, &tcx);
+                        if tcx.jobs[j].pid > 0 {
                             running += 1;
                         }
                     }
@@ -258,10 +248,10 @@ fn own_stderr(kind: i64, job: Job) -> [u8] {
 
 // (0.25.3) Lines of output s, each after label (`  stdout: `), at most
 // output_lines() of them, then how many more and the file they are in.
-fn put_output(block: i64, label: [u8], s: [u8], path: *u8) {
+fn put_output(block: i64, label: [u8], s: [u8], path: *u8, tcx: Tcx<Comp>) {
     let n = line_count(s);
-    let max = output_lines();
-    put_lines(block, s, 0, max, label);
+    let max = output_lines(tcx);
+    put_lines(block, s, 0, max, label, tcx);
     if n > max {
         buf_bytes(block, label);
         buf_byte(block, '(');
@@ -277,17 +267,18 @@ fn put_output(block: i64, label: [u8], s: [u8], path: *u8) {
 // two_levels) when it printed something else there, each block then named
 // with its level.
 fn put_shown_output(out: i64, kind: i64, name: [u8], a: Job, b: Job, two_levels: bool, la: *u8,
-    lb: *u8) {
+    lb: *u8, tcx: Tcx<Comp>) {
     let o = own_stdout(kind, a);
     let e = own_stderr(kind, a);
     let differs = two_levels && (own_stdout(kind, b) != o || own_stderr(kind, b) != e);
-    put_output_block(out, kind, name, if differs { la } else { 0 as *u8 }, a, o, e);
+    put_output_block(out, kind, name, if differs { la } else { 0 as *u8 }, a, o, e, tcx);
     if differs {
-        put_output_block(out, kind, name, lb, b, own_stdout(kind, b), own_stderr(kind, b));
+        put_output_block(out, kind, name, lb, b, own_stdout(kind, b), own_stderr(kind, b), tcx);
     }
 }
 
-fn put_output_block(out: i64, kind: i64, name: [u8], level: *u8, job: Job, o: [u8], e: [u8]) {
+fn put_output_block(out: i64, kind: i64, name: [u8], level: *u8, job: Job, o: [u8], e: [u8],
+    tcx: Tcx<Comp>) {
     buf_bytes(out, "OUTPUT ");
     buf_bytes(out, name);
     if level != 0 as *u8 {
@@ -305,8 +296,8 @@ fn put_output_block(out: i64, kind: i64, name: [u8], level: *u8, job: Job, o: [u
         return;
     }
     buf_byte(out, '\n');
-    put_output(out, "  stdout: ", o, job.out);
-    put_output(out, "  stderr: ", e, job.err);
+    put_output(out, "  stdout: ", o, job.out, tcx);
+    put_output(out, "  stderr: ", e, job.err, tcx);
 }
 
 // The rest of the `vole-test: WORD ` line of s, or "".
@@ -376,16 +367,16 @@ pub fn install(built: *u8, prog: *u8, key_path: *u8, key: [u8]) {
 // newer than the sources and was built the same way; false, with the
 // errors in out, when it does not build.
 pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: bool, out: i64,
-    coverage: bool = false) -> bool {
+    tcx: inout Tcx<Comp>, coverage: bool = false) -> bool {
     unsafe {
         let key_file = buf_new();
         buf_str(key_file, prog);
         buf_bytes(key_file, ".key");
         let key_path = buf_cstr(key_file);
         let k = buf_new();
-        buf_bytes(k, build_key_for(level));
+        buf_bytes(k, build_key_for(level, &tcx));
         if test {
-            buf_bytes(k, if NO_CHECK_ALLOC || coverage { "test" } else { "test check-alloc" });
+            buf_bytes(k, if tcx.no_check_alloc || coverage { "test" } else { "test check-alloc" });
         }
         if coverage {
             buf_bytes(k, " coverage");
@@ -414,7 +405,7 @@ pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: boo
         w.push(c"--diagnostics=short" as i64);
         w.push(level as i64);
         w.push(c"--overflow-checks=on" as i64);
-        if !streq(level, c"-O0") && traced() {
+        if !streq(level, c"-O0") && traced(tcx) {
             w.push(c"--trace" as i64);
         }
         if test {
@@ -422,7 +413,7 @@ pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: boo
             if coverage {
                 // (volec fuzz: the counters, and the speed of -O1)
                 w.push(c"--coverage" as i64);
-            } else if !NO_CHECK_ALLOC {
+            } else if !tcx.no_check_alloc {
                 w.push(c"--check-alloc" as i64);
             }
         }
@@ -452,7 +443,7 @@ pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: boo
             while i < l.len as i64 {
                 let e = line_end(l, i);
                 if e > i {
-                    if buf_slice(out).len as i64 + (e - i) > BUDGET {
+                    if buf_slice(out).len as i64 + (e - i) > tcx.budget {
                         buf_bytes(out, "(more: ");
                         buf_str(out, PROG);
                         buf_bytes(out, " check ");
@@ -460,7 +451,7 @@ pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: boo
                         buf_bytes(out, ")\n");
                         break;
                     }
-                    put_cut(out, "", l[i..e]);
+                    put_cut(out, "", l[i..e], tcx);
                 }
                 i = e + 1;
             }
@@ -473,7 +464,8 @@ pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: boo
 
 // The items of a test binary (`--vole-list`): kinds, names (buffers)
 // and positions (buffers).
-pub fn list_tests(tbin: *u8, kinds: inout IntVec, names: inout IntVec, positions: inout IntVec) {
+pub fn list_tests(tbin: *u8, kinds: inout IntVec, names: inout IntVec, positions: inout IntVec,
+    tcx: Tcx<Comp>) {
     let words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var w = words;
     w.push(tbin as i64);
@@ -499,7 +491,7 @@ pub fn list_tests(tbin: *u8, kinds: inout IntVec, names: inout IntVec, positions
         let kind = if word == "test" { TEST } else if word == "property" { PROPERTY }
             else if word == "fuzz" { FUZZ } else { CONTRACT };
         let name = rest[sp1 + 1..sp2];
-        if !selected(name) || kind == CONTRACT && NO_CONTRACTS {
+        if !selected(name, tcx) || kind == CONTRACT && tcx.no_contracts {
             continue;
         }
         kinds.push(kind);
@@ -529,7 +521,7 @@ pub fn level_dir(work: *u8, level: *u8) -> *u8 {
 // A fuzz target's saved inputs, as `--replay FILE` words: tests/fuzz/NAME/
 // and the crashes `volec fuzz` saved (--accept copies those into
 // tests/fuzz/NAME/).
-fn put_replays(words: inout IntVec, src_dir: *u8, tests: *u8, name: [u8]) {
+fn put_replays(words: inout IntVec, src_dir: *u8, tests: *u8, name: [u8], tcx: Tcx<Comp>) {
     unsafe {
         var crashes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         crate::tools::testrun::fuzz::files_in(crate::tools::testrun::fuzz::fuzz_dir(src_dir, name),
@@ -538,7 +530,7 @@ fn put_replays(words: inout IntVec, src_dir: *u8, tests: *u8, name: [u8]) {
         buf_bytes(b, "fuzz/");
         buf_bytes(b, name);
         let kept = join(tests, buf_slice(b));
-        if ACCEPT && crashes.count > 0 {
+        if tcx.accept && crashes.count > 0 {
             crate::tools::proc::make_dirs(kept);
             for k in 0..crashes.count {
                 let path = crashes.data[k] as *u8;
@@ -566,19 +558,20 @@ fn put_replays(words: inout IntVec, src_dir: *u8, tests: *u8, name: [u8]) {
 
 // `volec test` on the program at root: the summary, then the failures
 // (at most BUDGET bytes); exit 1 when one failed.
-pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: i64) -> i64 {
+pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: i64,
+    tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let levels = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var lv = levels;
-        if OPT != 0 as *u8 {
-            lv.push(OPT as i64);
+        if tcx.testrun_opt != 0 as *u8 {
+            lv.push(tcx.testrun_opt as i64);
         } else {
             // (-O2 first: it writes the new snapshots -O0 then compares)
             lv.push(c"-O2" as i64);
             lv.push(c"-O0" as i64);
         }
         var cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let listed = list_cases(tests, &cases);
+        let listed = list_cases(tests, &cases, tcx);
         let with_tests = has_tests(src_dir);
         // the builds
         let progs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -593,11 +586,11 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             pv.push(prog as i64);
             tv.push(tbin as i64);
             if (cases.count > 0 || !with_tests)
-                && !build(root, src_dir, *work, prog, level, false, out) {
+                && !build(root, src_dir, *work, prog, level, false, out, &tcx) {
                 buf_write_fd(out, STDOUT);
                 return 1;
             }
-            if with_tests && !build(root, src_dir, *work, tbin, level, true, out) {
+            if with_tests && !build(root, src_dir, *work, tbin, level, true, out, &tcx) {
                 buf_write_fd(out, STDOUT);
                 return 1;
             }
@@ -612,16 +605,16 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             positions.push(buf_new());
         }
         if with_tests {
-            list_tests(tv.data[0] as *u8, &kinds, &names, &positions);
+            list_tests(tv.data[0] as *u8, &kinds, &names, &positions, tcx);
         }
         if kinds.count == 0 {
-            if FILTERS.count > 0 && (listed || with_tests) {
-                let d = diag(c"error", c"test.no-root");
+            if tcx.filters.count > 0 && (listed || with_tests) {
+                let d = diag(c"error", c"test.no-root", &tcx);
                 buf_bytes(d, "no case in ");
                 buf_str(d, shown);
                 buf_bytes(d, if with_tests { "/ and no test match the filters\n" }
                     else { "/ matches the filters\n" });
-                let t = try_begin(c"test", c_slice(c""), false);
+                let t = try_begin(c"test", c_slice(c""), false, &tcx);
                 put_cword(t, root);
                 try_end(t);
                 return 2;
@@ -635,12 +628,12 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             return 0;
         }
         // the runs: each level's, all at once (one level after the other)
-        let first_job = JOB_COUNT;
+        let first_job = tcx.job_count;
         let n = kinds.count;
         for l in 0..lv.count {
             let level = lv.data[l] as *u8;
             let dir = level_dir(work, level);
-            let from = JOB_COUNT;
+            let from = tcx.job_count;
             for k in 0..n {
                 let name = buf_slice(names.data[k]);
                 let w = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -659,22 +652,23 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
                     words.push(c"--snapshots" as i64);
                     words.push(tests as i64);
                     let quick = lv.count > 1 && streq(level, c"-O0");
-                    if quick || CASES > 0 {
+                    if quick || tcx.cases > 0 {
                         let b = buf_new();
-                        buf_int(b, if quick && (CASES == 0 || CASES > LEVEL_CASES) { LEVEL_CASES }
-                            else { CASES });
+                        buf_int(b,
+                            if quick && (tcx.cases == 0 || tcx.cases > LEVEL_CASES) { LEVEL_CASES }
+                            else { tcx.cases });
                         words.push(c"--cases" as i64);
                         words.push(buf_cstr(b) as i64);
                     }
-                    if SEED != 0 as *u8 {
+                    if tcx.seed != 0 as *u8 {
                         words.push(c"--seed" as i64);
-                        words.push(SEED as i64);
+                        words.push(tcx.seed as i64);
                     }
-                    if ACCEPT {
+                    if tcx.accept {
                         words.push(c"--accept" as i64);
                     }
                     if kinds.data[k] == FUZZ {
-                        put_replays(&words, src_dir, tests, name);
+                        put_replays(&words, src_dir, tests, name, tcx);
                     }
                 }
                 let base = buf_new();
@@ -682,9 +676,9 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
                 buf_bytes(base, name);
                 let b = buf_slice(base);
                 add_job(argv_of(words), input, case_file(dir, b, ".got"),
-                    case_file(dir, b, ".err"));
+                    case_file(dir, b, ".err"), &tcx);
             }
-            run_jobs(from);
+            run_jobs(from, &tcx);
         }
         // the results
         var blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -699,10 +693,10 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             let main_job = first_job + k;
             let block = buf_new();
             let ok = judge(block, kinds.data[k], buf_slice(names.data[k]), main_job, tests, shown,
-                root);
+                root, tcx);
             passed_first.push(if ok { 1 } else { 0 });
             // the snapshots made new (at the first level)
-            let got = file_text(JOBS[main_job].out);
+            let got = file_text(tcx.jobs[main_job].out);
             var s = 0;
             while runtime_line(got, "snapshot", s).len > 0 {
                 if starts(runtime_line(got, "snapshot", s), "new ") {
@@ -714,7 +708,7 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             if lv.count > 1 {
                 let other = first_job + n + k;
                 agree = put_level_difference(block, kinds.data[k], buf_slice(names.data[k]),
-                    main_job, other, lv.data[0] as *u8, lv.data[1] as *u8, root, tests, shown);
+                    main_job, other, lv.data[0] as *u8, lv.data[1] as *u8, root, tests, shown, tcx);
                 if !agree {
                     diffs += 1;
                 }
@@ -773,18 +767,18 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
             buf_bytes(out, " only)\n");
         }
         if blocks.count > 0 {
-            put_failures(out, blocks, failed);
+            put_failures(out, blocks, failed, tcx);
         }
         // (0.25.3) --show-output: what each item printed (a failed one's
         // is under its failure)
-        if SHOW_OUTPUT {
+        if tcx.show_output {
             let two = lv.count > 1;
             for k in 0..n {
                 if passed_first.data[k] != 0 {
                     let other = if two { first_job + n + k } else { first_job + k };
                     put_shown_output(out, kinds.data[k], buf_slice(names.data[k]),
-                        JOBS[first_job + k], JOBS[other], two, lv.data[0] as *u8,
-                        if two { lv.data[1] as *u8 } else { 0 as *u8 });
+                        tcx.jobs[first_job + k], tcx.jobs[other], two, lv.data[0] as *u8,
+                        if two { lv.data[1] as *u8 } else { 0 as *u8 }, tcx);
                 }
             }
         }
@@ -799,7 +793,7 @@ pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: 
 }
 
 // The stderr lines after the first: a --trace's frames, on one line.
-fn put_trace(block: i64, err: [u8]) {
+fn put_trace(block: i64, err: [u8], tcx: Tcx<Comp>) {
     let first = line_end(err, 0);
     if first >= err.len as i64 {
         return;
@@ -838,16 +832,17 @@ fn put_trace(block: i64, err: [u8]) {
         frames += 1;
     }
     if frames > 0 {
-        put_cut(block, "  trace: ", buf_slice(t));
+        put_cut(block, "  trace: ", buf_slice(t), tcx);
     }
 }
 
 // Whether item k passed at its first level (job j); else why, into block.
 // (0.25.3) Under a failure, what the item printed (its own lines; the
 // runtime's report of the failure is the reason): stdout, then stderr.
-fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root: *u8) -> bool {
+fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root: *u8,
+    tcx: Tcx<Comp>) -> bool {
     unsafe {
-        let job = JOBS[j];
+        let job = tcx.jobs[j];
         let status = job.status;
         let got = file_text(job.out);
         let err = normal(file_text(job.err));
@@ -860,7 +855,7 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
             if status == want_exit && has_want && g == want {
                 return true;
             }
-            if ACCEPT && status != -1 {
+            if tcx.accept && status != -1 {
                 // (--accept: the case's .out, and .exit, as it ran)
                 let b = buf_new();
                 buf_bytes(b, g);
@@ -885,7 +880,7 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                 let report = if cut < err.len as i64 { err[cut..] } else { err };
                 if status == -1 {
                     buf_bytes(block, "no exit after ");
-                    buf_int(block, TIMEOUT);
+                    buf_int(block, tcx.testrun_timeout);
                     buf_bytes(block, " s (--timeout S)");
                 } else {
                     buf_bytes(block, "exit ");
@@ -899,10 +894,10 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                     buf_bytes(block, first_line(report));
                 }
                 buf_byte(block, '\n');
-                put_trace(block, report);
-                put_output(block, "  stdout: ", g, job.out);
+                put_trace(block, report, tcx);
+                put_output(block, "  stdout: ", g, job.out, tcx);
                 if cut < err.len as i64 {
-                    put_output(block, "  stderr: ", normal(err[0..cut]), job.err);
+                    put_output(block, "  stderr: ", normal(err[0..cut]), job.err, tcx);
                 }
             } else if !has_want {
                 buf_bytes(block, "no ");
@@ -912,11 +907,11 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                 buf_bytes(block, ".out to compare with; it printed ");
                 put_lines_count(block, line_count(g));
                 buf_bytes(block, " (--accept writes it)\n");
-                put_lines(block, g, 0, 4, "  + ");
-                put_output(block, "  stderr: ", err, job.err);
+                put_lines(block, g, 0, 4, "  + ", tcx);
+                put_output(block, "  stderr: ", err, job.err, tcx);
             } else {
-                put_difference(block, want, g);
-                put_output(block, "  stderr: ", err, job.err);
+                put_difference(block, want, g, tcx);
+                put_output(block, "  stderr: ", err, job.err, tcx);
             }
             return false;
         }
@@ -942,7 +937,7 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
         buf_bytes(block, ": ");
         if status == -1 {
             buf_bytes(block, "no exit after ");
-            buf_int(block, TIMEOUT);
+            buf_int(block, tcx.testrun_timeout);
             buf_bytes(block, " s (--timeout S)\n");
         } else if report.len == 0 {
             buf_bytes(block, "exit ");
@@ -963,8 +958,8 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
             }
             buf_byte(block, '\n');
         } else {
-            put_cut(block, "", first_line(report));
-            put_trace(block, report);
+            put_cut(block, "", first_line(report), tcx);
+            put_trace(block, report, tcx);
             if starts(report, "snapshot differs: ") {
                 buf_bytes(tries, "  try: ");
                 buf_str(tries, PROG);
@@ -977,7 +972,7 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
         }
         var k = 0;
         while runtime_line(got, "input", k).len > 0 {
-            put_cut(block, "  input: ", runtime_line(got, "input", k));
+            put_cut(block, "  input: ", runtime_line(got, "input", k), tcx);
             k += 1;
         }
         if kind != TEST && prop.len > 0 {
@@ -994,8 +989,8 @@ fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root
                 buf_byte(tries, '\n');
             }
         }
-        put_output(block, "  stdout: ", program_lines(got), job.out);
-        put_output(block, "  stderr: ", normal(err[0..cut]), job.err);
+        put_output(block, "  stdout: ", program_lines(got), job.out, tcx);
+        put_output(block, "  stderr: ", normal(err[0..cut]), job.err, tcx);
         buf_bytes(block, buf_slice(tries));
         false
     }
@@ -1028,14 +1023,14 @@ fn quoted(block: i64, s: [u8]) {
 // property's cases agree when both ran them (lb runs the first 20).
 // Else a DIFF line into block.
 fn put_level_difference(block: i64, kind: i64, name: [u8], a: i64, b: i64, la: *u8, lb: *u8,
-    root: *u8, tests: *u8, shown: *u8) -> bool {
+    root: *u8, tests: *u8, shown: *u8, tcx: Tcx<Comp>) -> bool {
     unsafe {
-        let ga = file_text(JOBS[a].out);
-        let gb = file_text(JOBS[b].out);
-        let ea = first_line(normal(file_text(JOBS[a].err)));
-        let eb = first_line(normal(file_text(JOBS[b].err)));
-        let sa = JOBS[a].status;
-        let sb = JOBS[b].status;
+        let ga = file_text(tcx.jobs[a].out);
+        let gb = file_text(tcx.jobs[b].out);
+        let ea = first_line(normal(file_text(tcx.jobs[a].err)));
+        let eb = first_line(normal(file_text(tcx.jobs[b].err)));
+        let sa = tcx.jobs[a].status;
+        let sb = tcx.jobs[b].status;
         if sa == -1 || sb == -1 {
             // (a time limit: the levels need not stop at the same place)
             return true;

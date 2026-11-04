@@ -6,12 +6,14 @@ use crate::base::{
     FILES, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, intern, streq,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::Call;
 use crate::front::ast::{ARM_SYNTHETIC, NODES, NodeKind};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
 use crate::front::types::{ENUMS, TYPES, TyKind, VARIANTS};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::items::{after_line, indent_of};
@@ -19,16 +21,16 @@ use crate::tools::fix::remove_use_name;
 use crate::tools::query::{QF_DEF, c_slice, file_line, file_named, resolve_name, root_or_diag};
 use crate::tools::query::defs::{DEFS, K_ENUM};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
+    PROG, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
 use crate::tools::query::positions::{enclosing, line_of, line_start, put_loc, put_path, token_at};
-use crate::tools::query::refs::{R_FLAGS, R_POS, put_short};
+use crate::tools::query::refs::put_short;
 use crate::tools::refactor_mod::mentions::doc_mentions;
 use crate::tools::refactor_shape::{
-    PROGRAM_END, SUB, comment_head, find_byte, leading_name, list_insert, list_of_node, list_remove,
-    load_and_find, newline_in, opt, option_values, orig_of, put_count, refs_of, rest_blank,
-    shape_options, starts_line, sym_text, take_args, text_buf, try_query_name, try_refactor,
-    try_show_at, usage_error,
+    comment_head, find_byte, leading_name, list_insert, list_of_node, list_remove, load_and_find,
+    newline_in, opt, option_values, orig_of, put_count, refs_of, rest_blank, shape_options,
+    starts_line, sym_text, take_args, text_buf, try_query_name, try_refactor, try_show_at,
+    usage_error,
 };
 use crate::tools::refactor_shape::field::{member_def, no_member, rename_refs};
 use crate::tools::rewrite::sort_by_start;
@@ -36,9 +38,9 @@ use crate::tools::rewrite::parsed::{pa, pb, pchild, pcount, pend, pflags, pk, ps
 
 // ---- refactor variant ----
 
-pub fn run_variant(c: Call<Gpa>) -> i64 {
-    let status = variant_inner(c);
-    write_diags();
+pub fn run_variant(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = variant_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -96,14 +98,14 @@ fn names_enum(p: i64, e: i64) -> bool {
 }
 
 // The matches on enum node e, as written: each once.
-fn matches_on(e: i64, out: inout IntVec) {
+fn matches_on(e: i64, out: inout IntVec, tcx: Tcx<Comp>) {
     unsafe {
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for n in 1..NODES.len() as i64 {
             if NODES[n].kind != NodeKind::Match {
                 continue;
             }
-            let o = orig_of(n, NodeKind::Match);
+            let o = orig_of(n, NodeKind::Match, tcx);
             if o < 0 || seen.get(o + 1) != 0 || FILES[file_of_pos(pstart(o))].path[0] == '<' {
                 continue;
             }
@@ -155,22 +157,22 @@ fn variant_prefix(m: i64) -> i64 {
     }
 }
 
-fn variant_inner(c: Call<Gpa>) -> i64 {
+fn variant_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        set_command(c.line);
+        set_command(c.line, &tcx);
         PROG = c.prog();
-        TOOL = c"refactor";
-        SUB = c"variant";
+        tcx.tool = c"refactor";
+        tcx.sub = c"variant";
         var root = 0 as *u8;
         var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"ENUM --add 'X(i64)' --arm 'EXPR' --dry-run";
-        if !take_args(c, shape_options("variant"), &root, &words, &opts) {
+        if !take_args(c, shape_options("variant"), &root, &words, &opts, &tcx) {
             return 2;
         }
         if words.count != 1 {
             return usage_error(if words.count == 0 { c"an ENUM is needed" }
-                else { c"one ENUM at a time" }, example);
+                else { c"one ENUM at a time" }, example, &tcx);
         }
         let add = opt(opts, c"--add", false);
         let arm = opt(opts, c"--arm", false);
@@ -178,19 +180,19 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
         let rename = opt(opts, c"--rename", false);
         let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64;
         if actions != 1 {
-            return usage_error(c"one of --add, --remove, --rename", example);
+            return usage_error(c"one of --add, --remove, --rename", example, &tcx);
         }
         if (arm != 0 as *u8 || opt(opts, c"--arm-in", false) != 0 as *u8) && add == 0 as *u8 {
-            return usage_error(c"--arm and --arm-in go with --add", example);
+            return usage_error(c"--arm and --arm-in go with --add", example, &tcx);
         }
         let name = c_slice(words.data[0] as *u8);
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, SUB, name, true);
+        tcx.root_given = root;
+        root = root_or_diag(root, tcx.sub, name, true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
         var status = 0;
-        let d = load_and_find(root, name, 1 << K_ENUM, c"enum", &status);
+        let d = load_and_find(root, name, 1 << K_ENUM, c"enum", &status, &tcx);
         if d < 0 {
             return status;
         }
@@ -202,10 +204,10 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             let vname = leading_name(text);
             if vname < 0 {
                 return usage_error(c"--add takes the variant: 'X', 'X(T, ...)', 'X { a: T, ... }'",
-                    example);
+                    example, &tcx);
             }
             if variant_named(e, vname) {
-                let x = diag(c"error", c"refactor.clash");
+                let x = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(x, fqn);
                 buf_str(x, c" has a variant '");
                 buf_bytes(x, sym_text(vname));
@@ -233,7 +235,7 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
                 }
             }
             var ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            matches_on(e, &ms);
+            matches_on(e, &ms, tcx);
             var open_ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for i in 0..ms.count {
                 let m = ms.data[i];
@@ -254,7 +256,7 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             for i in 0..open_ms.count {
                 arms.push(0);
             }
-            if !site_arms(opts, open_ms, &arms, fqn) {
+            if !site_arms(opts, open_ms, &arms, fqn, &tcx) {
                 return 1;
             }
             var missing = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -267,17 +269,17 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
                 }
             }
             if missing.count > 0 {
-                let x = diag(c"error", c"refactor.non-exhaustive");
+                let x = diag(c"error", c"refactor.non-exhaustive", &tcx);
                 put_count(x, missing.count, c"match", c"matches");
                 buf_str(x, c" on ");
                 buf_bytes(x, fqn);
                 buf_str(x, c" would not cover ");
                 buf_bytes(x, sym_text(vname));
                 buf_str(x, c"; nothing written\n");
-                return non_exhaustive(fqn, text, missing, opts);
+                return non_exhaustive(fqn, text, missing, opts, &tcx);
             }
-            list_of_node(e);
-            list_insert(pcount(e), text);
+            list_of_node(e, &tcx);
+            list_insert(pcount(e), text, tcx);
             for i in 0..open_ms.count {
                 let m = open_ms.data[i];
                 let pat = buf_new();
@@ -319,19 +321,19 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
                 }
             }
             if k < 0 {
-                return no_member(d, e, remove, c"variant");
+                return no_member(d, e, remove, c"variant", &tcx);
             }
             let vnode = pchild(e, k);
             let vd = member_def(d, vname);
             // Constructed: refused.
             for n in 1..NODES.len() {
                 if NODES[n].kind == NodeKind::VariantLit && VARIANTS[NODES[n].a].node == vnode {
-                    let x = diag(c"error", c"refactor.constructed");
+                    let x = diag(c"error", c"refactor.constructed", &tcx);
                     buf_bytes(x, sym_text(DEFS[vd].fqn));
                     buf_str(x, c" is constructed at ");
                     put_loc(x, NODES[n].start);
                     buf_str(x, c"; change those first\n");
-                    try_query_name(c"refs", sym_text(DEFS[vd].fqn));
+                    try_query_name(c"refs", sym_text(DEFS[vd].fqn), &tcx);
                     return 1;
                 }
             }
@@ -343,25 +345,25 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
                     || VARIANTS[NODES[n].x].node != vnode {
                     continue;
                 }
-                var p = orig_of(n, NodeKind::PatVariant);
+                var p = orig_of(n, NodeKind::PatVariant, tcx);
                 if p < 0 {
-                    p = orig_of(n, NodeKind::PatBind);
+                    p = orig_of(n, NodeKind::PatBind, tcx);
                 }
                 if p < 0 || seen.get(p + 1) != 0 {
                     continue;
                 }
                 seen.put(p + 1, 1);
-                let r = remove_pattern(p);
+                let r = remove_pattern(p, tcx);
                 if r != 0 {
                     let x = diag(c"error",
-                        if r == 1 { c"refactor.nested" } else { c"refactor.if-let" });
+                        if r == 1 { c"refactor.nested" } else { c"refactor.if-let" }, &tcx);
                     buf_bytes(x, sym_text(DEFS[vd].fqn));
                     buf_str(x,
                         if r == 1 { c" is matched inside another pattern at " }
                         else { c" is matched by an `if let` or `while let` at " });
                     put_loc(x, pstart(p));
                     buf_str(x, c"; change it first\n");
-                    try_show_at(pstart(p));
+                    try_show_at(pstart(p), &tcx);
                     return 1;
                 }
                 arms += 1;
@@ -369,17 +371,17 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             // Imported: the name goes from its `use`.
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             targets.push(vd);
-            refs_of(targets);
-            for r in 0..R_POS.count {
-                if (R_FLAGS.data[r] & QF_DEF) != 0 || enclosing(R_POS.data[r]) >= 0 {
+            refs_of(targets, &tcx);
+            for r in 0..tcx.r_pos.count {
+                if (tcx.r_flags.data[r] & QF_DEF) != 0 || enclosing(tcx.r_pos.data[r], tcx) >= 0 {
                     continue;
                 }
-                remove_import(R_POS.data[r]);
+                remove_import(tcx.r_pos.data[r], tcx);
             }
-            list_of_node(e);
-            list_remove(k);
+            list_of_node(e, &tcx);
+            list_remove(k, tcx);
             if pcount(e) > k + 1 && fieldless_cast(e) {
-                let x = diag(c"warning", c"refactor.discriminant");
+                let x = diag(c"warning", c"refactor.discriminant", &tcx);
                 buf_bytes(x, fqn);
                 buf_str(x, c" is cast to an integer somewhere: the variants after ");
                 buf_bytes(x, sym_text(vname));
@@ -395,10 +397,10 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             let old = intern(c_slice(rename));
             let new = intern(c_slice(opt(opts, c"--rename", true)));
             if !variant_named(e, old) {
-                return no_member(d, e, rename, c"variant");
+                return no_member(d, e, rename, c"variant", &tcx);
             }
             if variant_named(e, new) {
-                let x = diag(c"error", c"refactor.clash");
+                let x = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(x, fqn);
                 buf_str(x, c" has a variant '");
                 buf_bytes(x, sym_text(new));
@@ -407,9 +409,9 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             }
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             targets.push(member_def(d, old));
-            refs_of(targets);
-            let n = rename_refs(old, new);
-            doc_mentions(targets, old, sym_text(new));
+            refs_of(targets, &tcx);
+            let n = rename_refs(old, new, &tcx);
+            doc_mentions(targets, old, sym_text(new), &tcx);
             buf_str(what, c"renamed variant ");
             buf_bytes(what, sym_text(old));
             buf_str(what, c" to ");
@@ -419,7 +421,7 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
             buf_str(what, c", ");
             put_count(what, n - 1, c"use", c"uses");
         }
-        apply_edit(buf_slice(what), root)
+        apply_edit(buf_slice(what), root, &tcx)
     }
 }
 
@@ -427,7 +429,7 @@ fn variant_inner(c: Call<Gpa>) -> i64 {
 // SITE names (the function, or any item, it is in; or `FILE:LINE` of a
 // line of it) gets EXPR in arms (the first that names it). False after a
 // diagnostic: SITE names nothing, or no match of ms.
-fn site_arms(opts: IntVec, ms: IntVec, arms: inout IntVec, fqn: [u8]) -> bool {
+fn site_arms(opts: IntVec, ms: IntVec, arms: inout IntVec, fqn: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var i = 0;
         while i < opts.count {
@@ -446,7 +448,7 @@ fn site_arms(opts: IntVec, ms: IntVec, arms: inout IntVec, fqn: [u8]) -> bool {
             var defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             if fl >= 0 {
                 file = file_named(site[0..fl]);
-            } else if !resolve_name(SUB, site, &defs) {
+            } else if !resolve_name(tcx.sub, site, &defs, &tcx) {
                 return false;
             }
             var hit = false;
@@ -471,13 +473,13 @@ fn site_arms(opts: IntVec, ms: IntVec, arms: inout IntVec, fqn: [u8]) -> bool {
                 }
             }
             if !hit {
-                let x = diag(c"error", c"refactor.no-site");
+                let x = diag(c"error", c"refactor.no-site", &tcx);
                 buf_str(x, c"--arm-in ");
                 buf_bytes(x, site);
                 buf_str(x, c" names no match on ");
                 buf_bytes(x, fqn);
                 buf_str(x, c" that needs an arm; nothing written\n");
-                put_sites(ms);
+                put_sites(ms, tcx);
                 return false;
             }
         }
@@ -486,14 +488,14 @@ fn site_arms(opts: IntVec, ms: IntVec, arms: inout IntVec, fqn: [u8]) -> bool {
 }
 
 // The matches of ms, one per line on stdout: `FILE:LINE:COL<TAB>ITEM`.
-fn put_sites(ms: IntVec) {
+fn put_sites(ms: IntVec, tcx: Tcx<Comp>) {
     unsafe {
         let out = buf_new();
         for i in 0..ms.count {
             let m = ms.data[i];
             put_loc(out, pstart(m));
             buf_byte(out, '\t');
-            let x = enclosing(pstart(m));
+            let x = enclosing(pstart(m), tcx);
             if x >= 0 {
                 put_short(out, DEFS[x].fqn);
             }
@@ -506,13 +508,13 @@ fn put_sites(ms: IntVec) {
 // The site of match m for `--arm-in`: the item it is in (as `query refs`
 // writes it) when that holds no other match of ms and is a plain path,
 // else `FILE:LINE`.
-fn put_site(out: i64, m: i64, ms: IntVec) {
+fn put_site(out: i64, m: i64, ms: IntVec, tcx: Tcx<Comp>) {
     unsafe {
-        let x = enclosing(pstart(m));
+        let x = enclosing(pstart(m), tcx);
         var alone = x >= 0;
         for i in 0..ms.count {
             let o = ms.data[i];
-            if o != m && enclosing(pstart(o)) == x {
+            if o != m && enclosing(pstart(o), tcx) == x {
                 alone = false;
             }
         }
@@ -537,11 +539,11 @@ fn put_site(out: i64, m: i64, ms: IntVec) {
 // stdout), and the commands that give them one: `--arm` (when no
 // `--arm-in` was given), and the command given with an `--arm-in` for
 // each. The exit status.
-fn non_exhaustive(fqn: [u8], text: [u8], missing: IntVec, opts: IntVec) -> i64 {
+fn non_exhaustive(fqn: [u8], text: [u8], missing: IntVec, opts: IntVec, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        put_sites(missing);
+        put_sites(missing, tcx);
         // (0.17: one query showing them all)
-        let shows = diags();
+        let shows = diags(&tcx);
         buf_str(shows, c"try:");
         put_cword(shows, PROG);
         buf_str(shows, c" query show");
@@ -556,18 +558,18 @@ fn non_exhaustive(fqn: [u8], text: [u8], missing: IntVec, opts: IntVec) -> i64 {
             buf_byte(shows, ' ');
             buf_bytes(shows, s[0..e - 1]);
         }
-        put_root(shows);
+        put_root(shows, tcx);
         try_end(shows);
         let given = opt(opts, c"--arm-in", false) != 0 as *u8;
         if !given {
-            let out = try_refactor(fqn);
+            let out = try_refactor(fqn, &tcx);
             buf_str(out, c" --add");
             put_word(out, text);
             buf_str(out, c" --arm 'EXPR' --dry-run");
-            put_root(out);
+            put_root(out, tcx);
             try_end(out);
         }
-        let out = try_refactor(fqn);
+        let out = try_refactor(fqn, &tcx);
         buf_str(out, c" --add");
         put_word(out, text);
         var i = 0;
@@ -583,11 +585,11 @@ fn non_exhaustive(fqn: [u8], text: [u8], missing: IntVec, opts: IntVec) -> i64 {
         }
         for i in 0..missing.count {
             buf_str(out, c" --arm-in");
-            put_site(out, missing.data[i], missing);
+            put_site(out, missing.data[i], missing, tcx);
             buf_str(out, c" 'EXPR'");
         }
         buf_str(out, c" --dry-run");
-        put_root(out);
+        put_root(out, tcx);
         try_end(out);
         1
     }
@@ -626,8 +628,8 @@ fn insert_arm(m: i64, text: [u8]) {
 // Removes pattern p (as written) from its arm: the arm, or the
 // alternative of an or. 0 done, 1 p is inside another pattern, 2 the
 // match is an `if let`'s.
-fn remove_pattern(p: i64) -> i64 {
-    for m in 1..PROGRAM_END {
+fn remove_pattern(p: i64, tcx: Tcx<Comp>) -> i64 {
+    for m in 1..tcx.program_end {
         if pk(m) != NodeKind::Match {
             continue;
         }
@@ -679,8 +681,8 @@ fn remove_pattern(p: i64) -> i64 {
 }
 
 // Removes the import at pos (a name of a `use`).
-fn remove_import(pos: i64) {
-    for u in 1..PROGRAM_END {
+fn remove_import(pos: i64, tcx: Tcx<Comp>) {
+    for u in 1..tcx.program_end {
         if pk(u) != NodeKind::Use || pos < pstart(u) || pos >= pend(u) {
             continue;
         }

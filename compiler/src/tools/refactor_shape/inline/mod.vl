@@ -26,11 +26,13 @@ mod text;
 use crate::base::{
     BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::Call;
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{file_of_pos, module_at};
 use crate::front::types::FNS;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{finish_edit, prepare_edit, set_command};
 use crate::tools::edit::cli::delete_lines;
@@ -39,17 +41,16 @@ use crate::tools::fix::remove_use_name;
 use crate::tools::query::{QF_DEF, QF_USE, c_slice, root_or_diag};
 use crate::tools::query::defs::{DEFS, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, def_of_node};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
+    PROG, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
 use crate::tools::query::positions::{
     enclosing, line_of, line_start, put_path, shorthand_at, shorthand_text, token_at,
 };
-use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS};
 use crate::tools::query::show::text_start;
 use crate::tools::refactor_mod::{item_binding, load_refs, own_file, use_binding_id, use_node_of};
 use crate::tools::refactor_shape::{
-    PROGRAM_END, SUB, load_and_find, opt, orig_of, refs_of, shape_options, sym_text, take_args,
-    try_query_name, usage_error,
+    load_and_find, opt, orig_of, refs_of, shape_options, sym_text, take_args, try_query_name,
+    usage_error,
 };
 use crate::tools::refactor_shape::body::{
     USE_FIELD_READ, USE_VALUE, closure_around, fix_round, in_body, load_body, local_of, reindent,
@@ -64,49 +65,28 @@ use crate::tools::rewrite::parsed::{
 };
 use crate::tools::tidyimports::tidy_round;
 
-// The parameters of FN: their locals, names, the uses of each in its body
-// (Ident nodes), whether the body changes them.
-static var P_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var P_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var P_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var P_CHANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The uses of the parameters in the body: position, end, parameter.
-static var U_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var U_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var U_PARAM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The names the body declares, and the ones it names that are not its
-// locals (functions, constants, statics).
-static var BODY_LOCALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var BODY_FREE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// The items the body names (load_free_defs), and the ones made pub.
-static var FREE_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var PUBBED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var COPIED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn run_inline(c: Call<Gpa>) -> i64 {
-    let status = inline_inner(c);
-    write_diags();
+pub fn run_inline(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = inline_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn inline_inner(c: Call<Gpa>) -> i64 {
+fn inline_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        set_command(c.line);
+        set_command(c.line, &tcx);
         PROG = c.prog();
-        TOOL = c"refactor";
-        SUB = c"inline";
+        tcx.tool = c"refactor";
+        tcx.sub = c"inline";
         var root = 0 as *u8;
         var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"FN [--at FILE:LINE] --dry-run";
-        if !take_args(c, shape_options("inline"), &root, &words, &opts) {
+        if !take_args(c, shape_options("inline"), &root, &words, &opts, &tcx) {
             return 2;
         }
         if words.count != 1 {
             return usage_error(if words.count == 0 { c"a function FN is needed" }
-                else { c"one FN at a time" }, example);
+                else { c"one FN at a time" }, example, &tcx);
         }
         let at = opt(opts, c"--at", false);
         var keep = at != 0 as *u8;
@@ -118,16 +98,17 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
         var at_file = 0 as *u8;
         var at_line = 0;
         if at != 0 as *u8 && !file_line(c_slice(at), &at_file, &at_line) {
-            return usage_error(c"--at takes FILE:LINE, the line of a call", example);
+            return usage_error(c"--at takes FILE:LINE, the line of a call", example, &tcx);
         }
         let name = c_slice(words.data[0] as *u8);
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, SUB, name, true);
+        tcx.root_given = root;
+        root = root_or_diag(root, tcx.sub, name, true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
         var status = 0;
-        let d = load_and_find(root, name, (1 << K_FN) | (1 << K_METHOD), c"function", &status);
+        let d = load_and_find(root, name, (1 << K_FN) | (1 << K_METHOD), c"function", &status,
+            &tcx);
         if d < 0 {
             return status;
         }
@@ -135,20 +116,20 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
         let body = NODES[f].c;
         let fqn = sym_text(DEFS[d].fqn);
         if NODES[f].y == 1 {
-            let e = diag(c"error", c"refactor.extern");
+            let e = diag(c"error", c"refactor.extern", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, c" is an extern \"C\" function: C code may call it\n");
             return 1;
         }
         if body <= 0 || NODES[f].g != 0 || (NODES[f].h != 0 && NODES[NODES[f].h].g != 0) {
-            let e = diag(c"error", c"refactor.generic");
+            let e = diag(c"error", c"refactor.generic", &tcx);
             buf_bytes(e, fqn);
             buf_str(e,
                 if body <= 0 { c" has no body\n" }
                 else { c" is generic: its body is checked once per instance\n" });
             return 1;
         }
-        if !load_callee(d, f, fqn) {
+        if !load_callee(d, f, fqn, &tcx) {
             return 1;
         }
         // The calls (as written), each once; with --at, the one on that line.
@@ -156,12 +137,12 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
         var checked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for n in 1..NODES.len() as i64 {
             if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0
-                || def_of_node(FNS[NODES[n].x - 1].node) != d {
+                || def_of_node(FNS[NODES[n].x - 1].node, tcx) != d {
                 continue;
             }
-            var o = orig_of(n, NodeKind::Call);
+            var o = orig_of(n, NodeKind::Call, tcx);
             if o < 0 {
-                o = orig_of(n, NodeKind::MethodCall);
+                o = orig_of(n, NodeKind::MethodCall, tcx);
             }
             if o < 0 || contains(calls, o) {
                 continue;
@@ -175,18 +156,18 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
             checked.push(n);
         }
         if calls.count == 0 {
-            let e = diag(c"error", c"refactor.no-call");
+            let e = diag(c"error", c"refactor.no-call", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, if at != 0 as *u8 { c" is not called on " } else { c" is not called\n" });
             if at != 0 as *u8 {
                 buf_str(e, at);
                 buf_byte(e, '\n');
             }
-            try_query_name(c"refs", fqn);
+            try_query_name(c"refs", fqn, &tcx);
             return 1;
         }
         if at != 0 as *u8 && calls.count > 1 {
-            let e = diag(c"error", c"refactor.ambiguous");
+            let e = diag(c"error", c"refactor.ambiguous", &tcx);
             buf_str(e, at);
             buf_str(e, c" has ");
             buf_int(e, calls.count);
@@ -212,7 +193,7 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
                 nested += 1;
                 continue;
             }
-            if !inline_call(d, o, checked.data[i], fqn) {
+            if !inline_call(d, o, checked.data[i], fqn, &tcx) {
                 return 1;
             }
             done.push(o);
@@ -220,14 +201,14 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
         // FN, when nothing else uses it: deleted, with its imports.
         var deleted = false;
         if !keep && nested == 0 {
-            deleted = delete_unused(d, done);
+            deleted = delete_unused(d, done, &tcx);
         }
-        let status = prepare_edit();
+        let status = prepare_edit(&tcx);
         if status >= 0 {
             return status;
         }
-        fix_round(root, c"imports,pub");
-        tidy_round(root);
+        fix_round(root, c"imports,pub", &tcx);
+        tidy_round(root, &tcx);
         let what = buf_new();
         buf_str(what, c"inlined ");
         buf_bytes(what, fqn);
@@ -238,41 +219,42 @@ fn inline_inner(c: Call<Gpa>) -> i64 {
             buf_str(what, c", deleted it");
         }
         if nested > 0 {
-            let e = diag(c"note", c"refactor.nested");
+            let e = diag(c"note", c"refactor.nested", &tcx);
             buf_int(e, nested);
             buf_str(e, if nested == 1 { c" call is" } else { c" calls are" });
             buf_str(e, c" in the arguments of another: inline again for them\n");
         }
-        finish_edit(buf_slice(what), root)
+        finish_edit(buf_slice(what), root, &tcx)
     }
 }
 
 // What inlining needs of FN's body (node f): its parameters and their
 // uses, its locals' names, the other names it uses. False after a
 // diagnostic (a `return`, a call of itself).
-fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
+fn load_callee(d: i64, f: i64, fqn: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
-        load_free_defs(NODES[f].c);
-        load_body(f);
+        load_free_defs(NODES[f].c, &tcx);
+        load_body(f, &tcx);
         for n in 1..NODES.len() as i64 {
-            if !in_body(n) {
+            if !in_body(n, tcx) {
                 continue;
             }
             let k = NODES[n].kind;
             // (0.14: a closure's `return` leaves the closure)
             // (0.15: `e?` may return, as a `return` does)
-            if (k == NodeKind::Return || k == NodeKind::Try) && closure_around(n) < 0 {
-                let e = diag(c"error", c"refactor.escapes");
+            if (k == NodeKind::Return || k == NodeKind::Try) && closure_around(n, tcx) < 0 {
+                let e = diag(c"error", c"refactor.escapes", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, if k == NodeKind::Try { c" may return early (`?`), on line " }
                     else { c" returns early, on line " });
                 buf_int(e, line_of(NODES[n].start));
                 buf_str(e, c": inline takes a function that ends with its value\n");
-                try_at(NODES[n].start);
+                try_at(NODES[n].start, &tcx);
                 return false;
             }
-            if k == NodeKind::Call && NODES[n].x > 0 && def_of_node(FNS[NODES[n].x - 1].node) == d {
-                let e = diag(c"error", c"refactor.recursive");
+            if k == NodeKind::Call && NODES[n].x > 0
+                && def_of_node(FNS[NODES[n].x - 1].node, tcx) == d {
+                let e = diag(c"error", c"refactor.recursive", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" calls itself, on line ");
                 buf_int(e, line_of(NODES[n].start));
@@ -280,35 +262,35 @@ fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
                 return false;
             }
             if k == NodeKind::PatBind || (k == NodeKind::Param && NODES[n].a != 0) {
-                BODY_LOCALS.push(NODES[n].a);
+                tcx.body_locals.push(NODES[n].a);
             }
             if k == NodeKind::Ident && local_of(n) < 0 {
-                BODY_FREE.push(NODES[n].a);
+                tcx.body_free.push(NODES[n].a);
             }
         }
         for i in 0..NODES[f].count {
             let p = child(f, i);
-            P_LOCAL.push(NODES[p].x);
-            P_NAME.push(NODES[p].a);
-            P_USES.push(0);
-            P_CHANGED.push(0);
+            tcx.p_local.push(NODES[p].x);
+            tcx.p_name.push(NODES[p].a);
+            tcx.p_uses.push(0);
+            tcx.p_changed.push(0);
         }
         for n in 1..NODES.len() as i64 {
             let l = local_of(n);
-            if l < 0 || !in_body(n) {
+            if l < 0 || !in_body(n, tcx) {
                 continue;
             }
-            for j in 0..P_LOCAL.count {
-                if P_LOCAL.data[j] != l {
+            for j in 0..tcx.p_local.count {
+                if tcx.p_local.data[j] != l {
                     continue;
                 }
-                U_START.push(NODES[n].start);
-                U_END.push(NODES[n].end);
-                U_PARAM.push(j);
-                P_USES.data[j] += 1;
-                let k = use_kind(n);
+                tcx.u_start.push(NODES[n].start);
+                tcx.u_end.push(NODES[n].end);
+                tcx.u_param.push(j);
+                tcx.p_uses.data[j] += 1;
+                let k = use_kind(n, tcx);
                 if k != USE_VALUE && k != USE_FIELD_READ {
-                    P_CHANGED.data[j] = 1;
+                    tcx.p_changed.data[j] = 1;
                 }
             }
         }
@@ -319,17 +301,18 @@ fn load_callee(d: i64, f: i64, fqn: [u8]) -> bool {
 // The items FN's body (node body) names (FREE_DEF: functions, types,
 // constants, statics; not a variant, a field, a method): from every
 // reference the checker resolved (load_refs, which copy_imports needs too).
-fn load_free_defs(body: i64) {
+fn load_free_defs(body: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        load_refs();
-        for r in 0..R_POS.count {
-            let pos = R_POS.data[r];
-            let x = R_DEF.data[r];
+        load_refs(&tcx);
+        for r in 0..tcx.r_pos.count {
+            let pos = tcx.r_pos.data[r];
+            let x = tcx.r_def.data[r];
             let k = DEFS[x].kind;
-            if (R_FLAGS.data[r] & QF_DEF) == 0 && pos >= NODES[body].start && pos < NODES[body].end
-                && DEFS[x].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD && k != K_MOD
-                && !contains(FREE_DEF, x) {
-                FREE_DEF.push(x);
+            if (tcx.r_flags.data[r] & QF_DEF) == 0 && pos >= NODES[body].start
+                && pos < NODES[body].end && DEFS[x].parent < 0 && k != K_METHOD
+                && k != K_IMPL_METHOD && k != K_MOD
+                && !contains(tcx.free_def, x) {
+                tcx.free_def.push(x);
             }
         }
     }
@@ -338,16 +321,16 @@ fn load_free_defs(body: i64) {
 // The items the body names that are private in another module than the
 // caller's (module m): made `pub` (once each), so that the imports the
 // fix round adds reach them.
-fn publish_free_defs(m: i64) {
+fn publish_free_defs(m: i64, tcx: inout Tcx<Comp>) {
     unsafe {
-        for i in 0..FREE_DEF.count {
-            let x = FREE_DEF.data[i];
-            if DEFS[x].module == m || DEFS[x].public || contains(PUBBED, x)
+        for i in 0..tcx.free_def.count {
+            let x = tcx.free_def.data[i];
+            if DEFS[x].module == m || DEFS[x].public || contains(tcx.pubbed, x)
                 || FILES[file_of_pos(DEFS[x].start)].path[0] == '<' {
                 continue;
             }
-            PUBBED.push(x);
-            let at = item_head(x);
+            tcx.pubbed.push(x);
+            let at = item_head(x, tcx);
             edit_replace(at, at, text_of_c(c"pub "));
         }
     }
@@ -356,7 +339,7 @@ fn publish_free_defs(m: i64) {
 // The imports of FN's module (m) its body names that the caller's
 // module (cm) lacks, added there: `use PATH::NAME;` after its last `use`
 // (a variant, `use crate::ir::Op::Const`, which fix cannot find).
-fn copy_imports(m: i64, cm: i64, body: i64) {
+fn copy_imports(m: i64, cm: i64, body: i64, tcx: inout Tcx<Comp>) {
     unsafe {
         if m == cm {
             return;
@@ -370,18 +353,18 @@ fn copy_imports(m: i64, cm: i64, body: i64) {
             let s = TOKS[t].value as i64;
             let after_dot = t > 0
                 && (TOKS[t - 1].kind == Tok::Dot || TOKS[t - 1].kind == Tok::ColonColon);
-            if TOKS[t].kind != Tok::Ident || after_dot || contains(BODY_LOCALS, s)
-                || contains(P_NAME, s)
-                || contains(COPIED, cm * 1000003 + s) {
+            if TOKS[t].kind != Tok::Ident || after_dot || contains(tcx.body_locals, s)
+                || contains(tcx.p_name, s)
+                || contains(tcx.copied, cm * 1000003 + s) {
                 t += 1;
                 continue;
             }
             let id = use_binding_id(m, s);
-            if id == 0 || item_binding(cm, s) >= 0 || use_binding_id(cm, s) != 0 {
+            if id == 0 || item_binding(cm, s, tcx) >= 0 || use_binding_id(cm, s) != 0 {
                 t += 1;
                 continue;
             }
-            let u = use_node_of(id);
+            let u = use_node_of(id, tcx);
             var path = SRC[NODES[NODES[u].c].start..NODES[NODES[u].c].end];
             if path.len > 2 && path[path.len as i64 - 1] == ':' {
                 path = path[0..path.len as i64 - 2];
@@ -391,7 +374,7 @@ fn copy_imports(m: i64, cm: i64, body: i64) {
                 t += 1;
                 continue;
             }
-            COPIED.push(cm * 1000003 + s);
+            tcx.copied.push(cm * 1000003 + s);
             let line = buf_new();
             buf_str(line, c"use ");
             buf_bytes(line, path);
@@ -429,7 +412,7 @@ fn text_of_c(s: *u8) -> i64 {
 
 // The call o (as written; n, as checked) of FN replaced by its body:
 // false after a diagnostic.
-fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
+fn inline_call(d: i64, o: i64, n: i64, fqn: [u8], tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let f = DEFS[d].node;
         let body = NODES[f].c;
@@ -443,10 +426,10 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
         }
         // (0.15: by the parameters' order: a labelled argument's value,
         // and a parameter's default where the call leaves it out)
-        if args.count <= P_LOCAL.count {
+        if args.count <= tcx.p_local.count {
             let first = args.count - pcount(o);
             var by_param = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            for j in 0..P_LOCAL.count {
+            for j in 0..tcx.p_local.count {
                 by_param.push(if j < first { args.data[j] } else { 0 });
             }
             var ok = true;
@@ -455,8 +438,8 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
                 var j = first + i;
                 if pk(a) == NodeKind::NamedArg {
                     j = -1;
-                    for k in 0..P_NAME.count {
-                        if P_NAME.data[k] == pa(a) {
+                    for k in 0..tcx.p_name.count {
+                        if tcx.p_name.data[k] == pa(a) {
                             j = k;
                         }
                     }
@@ -480,20 +463,20 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
                 args = by_param;
             }
         }
-        if args.count != P_LOCAL.count {
-            let e = diag(c"error", c"refactor.internal");
+        if args.count != tcx.p_local.count {
+            let e = diag(c"error", c"refactor.internal", &tcx);
             buf_str(e, c"the call on line ");
             buf_int(e, line_of(pstart(o)));
             buf_str(e, c" has an argument per parameter of its own; nothing written\n");
             return false;
         }
         // The names the caller's locals hide.
-        let c = enclosing(pstart(o));
+        let c = enclosing(pstart(o), tcx);
         let cf = if c >= 0 { DEFS[c].node } else { -1 };
-        for i in 0..BODY_FREE.count {
-            let name = BODY_FREE.data[i];
+        for i in 0..tcx.body_free.count {
+            let name = tcx.body_free.data[i];
             if cf > 0 && local_named(cf, name) {
-                let e = diag(c"error", c"refactor.clash");
+                let e = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" names ");
                 buf_bytes(e, SYMS[name].text);
@@ -502,17 +485,17 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
                 buf_str(e, c" where it is called (line ");
                 buf_int(e, line_of(pstart(o)));
                 buf_str(e, c"): rename the local first\n");
-                try_at(pstart(o));
+                try_at(pstart(o), &tcx);
                 return false;
             }
         }
-        publish_free_defs(module_at(pstart(o)));
-        copy_imports(DEFS[d].module, module_at(pstart(o)), body);
+        publish_free_defs(module_at(pstart(o)), &tcx);
+        copy_imports(DEFS[d].module, module_at(pstart(o)), body, &tcx);
         // Each parameter: the argument put in for it, or bound first.
         let single = NODES[body].count == 0 && NODES[body].a > 0;
         var complex = 0;
         for j in 0..args.count {
-            if !simple_arg(args.data[j]) {
+            if !simple_arg(args.data[j], tcx) {
                 complex += 1;
             }
         }
@@ -526,21 +509,23 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             if j == 0 && pk(o) == NodeKind::MethodCall && autoref(n) {
                 // (the receiver, a place the method took the address of)
                 if !self_as_base(f) || !place_path(text) {
-                    let e = diag(c"error", c"refactor.receiver");
+                    let e = diag(c"error", c"refactor.receiver", &tcx);
                     buf_str(e, c"the receiver on line ");
                     buf_int(e, line_of(pstart(o)));
                     buf_str(e, c" is borrowed, and ");
                     buf_bytes(e, fqn);
                     buf_str(e, c" uses self other than as self.f or self.m(...): bind it to a local first\n");
-                    try_at(pstart(o));
+                    try_at(pstart(o), &tcx);
                     return false;
                 }
                 buf_bytes(t, text);
                 sub.push(1);
-            } else if P_CHANGED.data[j] == 0 && P_USES.data[j] > 0 && simple_arg(a) {
+            } else if tcx.p_changed.data[j] == 0 && tcx.p_uses.data[j] > 0 && simple_arg(a, tcx) {
                 buf_bytes(t, text);
                 sub.push(1);
-            } else if P_CHANGED.data[j] == 0 && P_USES.data[j] == 1 && single && complex == 1 {
+            }
+            else if tcx.p_changed.data[j] == 0 && tcx.p_uses.data[j] == 1 && single
+                && complex == 1 {
                 if binding_level(a) < 99 {
                     buf_byte(t, '(');
                     buf_bytes(t, text);
@@ -552,13 +537,13 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             } else {
                 // `let [mut] NAME = ARG;`, NAME renamed when an argument
                 // has it
-                var name = SYMS[P_NAME.data[j]].text;
+                var name = SYMS[tcx.p_name.data[j]].text;
                 if bytes_is(name, c"self") || named_in_args(args, name) {
-                    name = fresh_name(name, args);
+                    name = fresh_name(name, args, tcx);
                 }
                 buf_bytes(t, name);
                 buf_str(binds, c"let ");
-                if P_CHANGED.data[j] != 0 {
+                if tcx.p_changed.data[j] != 0 {
                     buf_str(binds, c"mut ");
                 }
                 buf_bytes(binds, name);
@@ -573,21 +558,21 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
         var rs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var re = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var rt = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..U_START.count {
-            let j = U_PARAM.data[i];
-            rs.push(U_START.data[i]);
-            re.push(U_END.data[i]);
-            if shorthand_at(U_START.data[i]) {
+        for i in 0..tcx.u_start.count {
+            let j = tcx.u_param.data[i];
+            rs.push(tcx.u_start.data[i]);
+            re.push(tcx.u_end.data[i]);
+            if shorthand_at(tcx.u_start.data[i], &tcx) {
                 // (0.15: `S { x }` becomes `S { x: ARG }`)
-                rt.push(shorthand_text(SYMS[P_NAME.data[j]].text, buf_slice(u_text.data[j])));
+                rt.push(shorthand_text(SYMS[tcx.p_name.data[j]].text, buf_slice(u_text.data[j])));
             } else {
                 rt.push(u_text.data[j]);
             }
         }
         let call_indent = indent_of(pstart(o));
         let out = buf_new();
-        let stmt = statement_of(o);
-        if stmt >= 0 && BUFS[binds].len == 0 && BODY_LOCALS.count == 0 {
+        let stmt = statement_of(o, tcx);
+        if stmt >= 0 && BUFS[binds].len == 0 && tcx.body_locals.count == 0 {
             // A statement of its own (`f(x);`), with no local to keep
             // apart: the body's statements in its place.
             let text = text_with(NODES[body].start + 1, NODES[body].end - 1, rs, re, rt);
@@ -607,7 +592,7 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             // looser than the call's place.
             let tail = NODES[body].a;
             let text = text_with(NODES[tail].start, NODES[tail].end, rs, re, rt);
-            let parens = expr_level(tail) < slot_level(o);
+            let parens = expr_level(tail) < slot_level(o, tcx);
             if parens {
                 buf_byte(out, '(');
             }
@@ -627,15 +612,15 @@ fn inline_call(d: i64, o: i64, n: i64, fqn: [u8]) -> bool {
             buf_bytes(out, call_indent);
             buf_byte(out, '}');
         }
-        edit_replace(pstart(o), pend(o), if in_fstring(o) { one_line(out) } else { out });
+        edit_replace(pstart(o), pend(o), if in_fstring(o, tcx) { one_line(out) } else { out });
         true
     }
 }
 
 // The statement call o is the whole of (`f(x);`, as written; not a
 // block's value), or -1.
-fn statement_of(o: i64) -> i64 {
-    for p in 1..PROGRAM_END {
+fn statement_of(o: i64, tcx: Tcx<Comp>) -> i64 {
+    for p in 1..tcx.program_end {
         if pk(p) == NodeKind::ExprStmt && pa(p) == o {
             // (with its `;`)
             var e = pend(o);
@@ -650,8 +635,8 @@ fn statement_of(o: i64) -> i64 {
 
 // (0.17) Whether call o is inside an f-string's hole: its text there is
 // written on one line.
-fn in_fstring(o: i64) -> bool {
-    for p in 1..PROGRAM_END {
+fn in_fstring(o: i64, tcx: Tcx<Comp>) -> bool {
+    for p in 1..tcx.program_end {
         if pk(p) == NodeKind::Interp && pstart(p) <= pstart(o) && pend(o) <= pend(p) {
             return true;
         }
@@ -710,15 +695,15 @@ fn block_like(n: i64) -> bool {
 
 // FN deleted when nothing but the calls inlined (calls) uses it: its
 // text, and the names of the `use` lines importing it. Whether it is.
-fn delete_unused(d: i64, calls: IntVec) -> bool {
+fn delete_unused(d: i64, calls: IntVec, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         targets.push(d);
-        refs_of(targets);
+        refs_of(targets, &tcx);
         var imports = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for r in 0..R_POS.count {
-            let pos = R_POS.data[r];
-            if R_DEF.data[r] != d || (R_FLAGS.data[r] & QF_DEF) != 0 {
+        for r in 0..tcx.r_pos.count {
+            let pos = tcx.r_pos.data[r];
+            if tcx.r_def.data[r] != d || (tcx.r_flags.data[r] & QF_DEF) != 0 {
                 continue;
             }
             var inlined = false;
@@ -731,12 +716,12 @@ fn delete_unused(d: i64, calls: IntVec) -> bool {
             if inlined {
                 continue;
             }
-            if (R_FLAGS.data[r] & QF_USE) == 0 {
+            if (tcx.r_flags.data[r] & QF_USE) == 0 {
                 return false;
             }
             imports.push(pos);
         }
-        delete_lines(line_start(text_start(d)), item_tail(d));
+        delete_lines(line_start(text_start(d)), item_tail(d, tcx));
         for i in 0..imports.count {
             let pos = imports.data[i];
             for u in 1..NODES.len() as i64 {
@@ -775,12 +760,12 @@ fn local_named(cf: i64, name: i64) -> bool {
 
 // An argument put in as it is: a name (not one the body declares), a
 // literal.
-fn simple_arg(a: i64) -> bool {
+fn simple_arg(a: i64, tcx: Tcx<Comp>) -> bool {
     unsafe {
         let k = pk(a);
         if k == NodeKind::Ident {
-            for i in 0..BODY_LOCALS.count {
-                if BODY_LOCALS.data[i] == pa(a) {
+            for i in 0..tcx.body_locals.count {
+                if tcx.body_locals.data[i] == pa(a) {
                     return false;
                 }
             }
@@ -833,11 +818,11 @@ fn expr_level(n: i64) -> i64 {
 
 // The binding level the place of call o needs (0: an argument, a
 // statement, a `let`'s value).
-fn slot_level(o: i64) -> i64 {
+fn slot_level(o: i64, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         var best = -1;
         var level = 0;
-        for p in 1..PROGRAM_END {
+        for p in 1..tcx.program_end {
             if p == o || pstart(p) > pstart(o) || pend(p) < pend(o) {
                 continue;
             }
@@ -859,8 +844,8 @@ fn slot_level(o: i64) -> i64 {
 }
 
 // `try: PROG query show FILE:LINE` of pos.
-fn try_at(pos: i64) {
-    let out = diags();
+fn try_at(pos: i64, tcx: inout Tcx<Comp>) {
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
     buf_str(out, c" query show");
@@ -869,6 +854,6 @@ fn try_at(pos: i64) {
     buf_byte(b, ':');
     buf_int(b, line_of(pos));
     put_word(out, buf_slice(b));
-    put_root(out);
+    put_root(out, tcx);
     try_end(out);
 }

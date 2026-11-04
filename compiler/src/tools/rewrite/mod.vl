@@ -35,20 +35,21 @@ use crate::base::{
     BUFS, FILES, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::cli::line::{
     Call, EV_FLAG, EV_MISSING, EV_OPTION, EV_UNKNOWN, EV_WORD, Leaf, flag, is_opt, option, pair,
 };
 use crate::front::ast::{KEEP_PARSED, NodeKind, PARSED_COUNT};
 use crate::front::modules::file_of_pos;
 use crate::front::types::buf_type;
-use crate::tools::edit::{TARGET, edit_replace};
-use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::edit_replace;
+use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, diags, program_errors, put_cword, put_root, put_word, try_end,
-    write_diags,
+    PROG, diag, diags, program_errors, put_cword, put_root, put_word, try_end, write_diags,
 };
 use crate::tools::query::positions::{line_of, put_loc, put_path};
 use crate::tools::query::refs::{OPT_IN, put_bad_in, ref_in, resolve_in};
@@ -56,44 +57,41 @@ use crate::tools::query::refs::{OPT_IN, put_bad_in, ref_in, resolve_in};
 use after::{drop_unused_imports, note_site_types, where_hints};
 use parsed::{pa, parenthesized, pb, pchild, pcount, pend, pk, pstart, slot_levels};
 use pattern::{
-    B_END, B_LIST, B_NODE, B_START, DROPPED, DROP_HOLE, DROP_USE, FRESH_OK, H_FRESH, H_NAME,
-    H_NAMEONLY, H_RE, H_REST, H_SYM, H_TYPE, MISS_HOLE, MISS_NODE, MISS_TYPE, PAT_HOLES, P_LEVELS,
-    R_END, R_HOLES, R_HOLE_SPAN, R_KEPT, R_LEVELS, R_ROOT, R_START, SITE_MULTI, SITE_START, STMTS,
-    TYPE_MISSES, UNTYPED, dropped_use, has_newline, hole_named, hole_of, holes_to_idents,
-    is_name_byte, match_node, note_base_indent, note_breaks, note_clones, parse_text,
-    replacement_level, replacement_text, rest_hole_of, seq_at, seq_len, types_match,
+    dropped_use, has_newline, hole_named, hole_of, holes_to_idents, is_name_byte, match_node,
+    note_base_indent, note_breaks, note_clones, parse_text, replacement_level, replacement_text,
+    rest_hole_of, seq_at, seq_len, types_match,
 };
 use regex::re_valid;
-use subst::{S_LOCAL, S_PAT, S_REP, choose_fresh, find_substs, note_subst_holes, put_site};
+use subst::{choose_fresh, find_substs, note_subst_holes, put_site};
 
 // ---- The command ----
 
-pub fn run_rewrite(c: Call<Gpa>) -> i64 {
+pub fn run_rewrite(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     // (0.21: --text, a text edit of the tree's files, textual/rewrite;
     // its leaf is text_rewrite_leaf, cli/tree.vl)
     if c.line.has("--text") {
-        return crate::tools::textual::rewrite::run_text_rewrite(c);
+        return crate::tools::textual::rewrite::run_text_rewrite(c, &tcx);
     }
-    let status = run_rewrite_inner(c);
-    write_diags();
+    let status = run_rewrite_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"rewrite.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"rewrite.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = try_rewrite(c"grow($v, $n)", c"$v.reserve($n)");
+    let out = try_rewrite(c"grow($v, $n)", c"$v.reserve($n)", &tcx);
     buf_str(out, c" --where '$v: IntVec' --dry-run");
-    put_root(out);
+    put_root(out, tcx);
     try_end(out);
     2
 }
 
 // Starts a `try:` line `PROG rewrite PATTERN REPLACEMENT`; options and
 // put_root follow.
-fn try_rewrite(pattern: *u8, replacement: *u8) -> i64 {
-    let out = diags();
+fn try_rewrite(pattern: *u8, replacement: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
     buf_str(out, c" rewrite");
@@ -122,7 +120,7 @@ fn is_statement(text: *u8) -> bool {
 
 // --where `$x: T` (several: `$x: T, $y: U`): the holes' types. False
 // after the diagnostic.
-fn take_where(w: *u8) -> bool {
+fn take_where(w: *u8, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let s = c_slice(w);
         var i = 0;
@@ -134,7 +132,7 @@ fn take_where(w: *u8) -> bool {
                 break;
             }
             if s[i] != '$' {
-                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')");
+                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')", &tcx);
                 return false;
             }
             var e = i + 1;
@@ -147,10 +145,10 @@ fn take_where(w: *u8) -> bool {
                 c += 1;
             }
             if c >= s.len as i64 || s[c] != ':' {
-                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')");
+                usage(c"--where takes '$x: TYPE' (several: '$x: T, $y: U')", &tcx);
                 return false;
             }
-            let h = hole_named(name, false);
+            let h = hole_named(name, false, tcx);
             // (0.16: `name`, `name ~ RE`: a name hole)
             var q = c + 1;
             while q < s.len as i64 && s[q] == ' ' {
@@ -163,7 +161,7 @@ fn take_where(w: *u8) -> bool {
                 while q < s.len as i64 && s[q] == ' ' {
                     q += 1;
                 }
-                H_NAMEONLY.data[h] = 1;
+                tcx.h_nameonly.data[h] = 1;
                 if q < s.len as i64 && s[q] == '~' {
                     q += 1;
                     while q < s.len as i64 && s[q] == ' ' {
@@ -178,10 +176,10 @@ fn take_where(w: *u8) -> bool {
                         BUFS[re].len -= 1;
                     }
                     if !re_valid(buf_slice(re)) {
-                        usage(c"--where '$x: name ~ RE' takes a regular expression (^ $ . * + ? [a-z] \\d \\w)");
+                        usage(c"--where '$x: name ~ RE' takes a regular expression (^ $ . * + ? [a-z] \\d \\w)", &tcx);
                         return false;
                     }
-                    H_RE.data[h] = re;
+                    tcx.h_re.data[h] = re;
                 }
                 i = q;
                 continue;
@@ -196,7 +194,7 @@ fn take_where(w: *u8) -> bool {
                 t += 1;
             }
             if h < 0 {
-                let d = diag(c"error", c"rewrite.usage");
+                let d = diag(c"error", c"rewrite.usage", &tcx);
                 buf_str(d, c"--where names ");
                 buf_bytes(d, name);
                 buf_str(d, c", which the pattern has not (or has as '");
@@ -204,7 +202,7 @@ fn take_where(w: *u8) -> bool {
                 buf_str(d, c"...')\n");
                 return false;
             }
-            H_TYPE.data[h] = ty;
+            tcx.h_type.data[h] = ty;
             i = t;
         }
         true
@@ -229,10 +227,10 @@ pub fn rewrite_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(table, "word")
 }
 
-fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
-    set_command(c.line);
+fn run_rewrite_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    set_command(c.line, &tcx);
     PROG = c.prog();
-    TOOL = 0 as *u8;
+    tcx.tool = 0 as *u8;
     var root = 0 as *u8;
     var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var wheres = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -252,7 +250,7 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
         }
         if ev.name == "subst" && (ev.kind == EV_MISSING || ev.kind == EV_OPTION) {
             if ev.kind == EV_MISSING || k >= line.len() as i64 || !is_opt(line[k], "subst") {
-                return usage(c"--subst takes a PATTERN and its REPLACEMENT");
+                return usage(c"--subst takes a PATTERN and its REPLACEMENT", &tcx);
             }
             substs.push(a as i64);
             substs.push(line[k].value as i64);
@@ -271,11 +269,11 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
         }
         if ev.kind == EV_MISSING && (ev.name == "where" || ev.name == "in") {
             ev.kind = EV_UNKNOWN;
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
             continue;
         }
         if ev.kind != EV_WORD {
-            let d = diag(c"error", c"rewrite.usage");
+            let d = diag(c"error", c"rewrite.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
             buf_str(d, c"' (--where, --subst, --list, --in, --dry-run, --no-check, --root)\n");
@@ -293,47 +291,47 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
         if words.count != 2 && !(list && words.count == 1) {
             return usage(if words.count
                 < 2 { c"a PATTERN and a REPLACEMENT are needed (--list: a PATTERN)" }
-                else { c"one PATTERN and one REPLACEMENT" });
+                else { c"one PATTERN and one REPLACEMENT" }, &tcx);
         }
         if substs.count > 0 && words.count < 2 {
-            return usage(c"--subst changes what the REPLACEMENT keeps: give one");
+            return usage(c"--subst changes what the REPLACEMENT keeps: give one", &tcx);
         }
         let pattern = words.data[0] as *u8;
         let replacement = if words.count == 2 { words.data[1] as *u8 } else { 0 as *u8 };
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, c"rewrite", c_slice(pattern), true);
+        tcx.root_given = root;
+        root = root_or_diag(root, c"rewrite", c_slice(pattern), true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
         KEEP_PARSED = true;
         // (0.15: the imports names of the replacement need, as edit
         // replace adds them)
-        ADD_IMPORTS = true;
-        if !load_program(root, TARGET) {
-            program_errors(c"error", root, true);
+        tcx.add_imports = true;
+        if !load_program(root, tcx.target, &tcx) {
+            program_errors(c"error", root, true, &tcx);
             return 1;
         }
         for k in 0..ins.count {
-            if !resolve_in(c_slice(ins.data[k] as *u8)) {
-                let d = diag(c"error", c"rewrite.bad-in");
-                put_bad_in(d, ins.data[k] as *u8);
+            if !resolve_in(c_slice(ins.data[k] as *u8), &tcx) {
+                let d = diag(c"error", c"rewrite.bad-in", &tcx);
+                put_bad_in(d, ins.data[k] as *u8, tcx);
                 return 1;
             }
         }
         let program_end = PARSED_COUNT;
-        note_clones(program_end, crate::front::ast::NODES.len() as i64);
+        note_clones(program_end, crate::front::ast::NODES.len() as i64, &tcx);
         // The pattern, then the replacement.
-        STMTS = is_statement(pattern);
+        tcx.stmts = is_statement(pattern);
         let ptext = buf_new();
-        if !holes_to_idents(pattern, ptext, true) {
+        if !holes_to_idents(pattern, ptext, true, &tcx) {
             return 2;
         }
-        S_LOCAL = H_SYM.count;
+        tcx.s_local = tcx.h_sym.count;
         var stexts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var k = 0;
         while k < substs.count {
             let t = buf_new();
-            if !holes_to_idents(substs.data[k] as *u8, t, true) {
+            if !holes_to_idents(substs.data[k] as *u8, t, true, &tcx) {
                 return 2;
             }
             stexts.push(t);
@@ -341,34 +339,34 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
         }
         let rtext = buf_new();
         // (0.16: a hole the pattern lacks is a new name)
-        FRESH_OK = true;
-        if replacement != 0 as *u8 && !holes_to_idents(replacement, rtext, false) {
+        tcx.fresh_ok = true;
+        if replacement != 0 as *u8 && !holes_to_idents(replacement, rtext, false, &tcx) {
             return 2;
         }
-        FRESH_OK = false;
+        tcx.fresh_ok = false;
         k = 1;
         while k < substs.count {
             let t = buf_new();
-            if !holes_to_idents(substs.data[k] as *u8, t, false) {
+            if !holes_to_idents(substs.data[k] as *u8, t, false, &tcx) {
                 return 2;
             }
             stexts.push(t);
             k += 2;
         }
         for w in 0..wheres.count {
-            if !take_where(wheres.data[w] as *u8) {
+            if !take_where(wheres.data[w] as *u8, &tcx) {
                 return 2;
             }
         }
         let pfirst = PARSED_COUNT;
-        var proot = parse_text(ptext, STMTS, c"pattern");
+        var proot = parse_text(ptext, tcx.stmts, c"pattern", &tcx);
         if proot == 0 {
             return 2;
         }
-        if STMTS {
+        if tcx.stmts {
             // (one statement)
             if pcount(proot) != 1 {
-                let d = diag(c"error", c"rewrite.pattern");
+                let d = diag(c"error", c"rewrite.pattern", &tcx);
                 buf_str(d, c"the pattern is one statement, or an expression\n");
                 return 2;
             }
@@ -376,117 +374,120 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
         }
         let plast = PARSED_COUNT;
         for n in pfirst..plast {
-            if hole_of(n) >= 0 {
-                PAT_HOLES.push(n);
+            if hole_of(n, tcx) >= 0 {
+                tcx.pat_holes.push(n);
             }
         }
-        if hole_of(proot) >= 0 {
-            let d = diag(c"error", c"rewrite.pattern");
+        if hole_of(proot, tcx) >= 0 {
+            let d = diag(c"error", c"rewrite.pattern", &tcx);
             buf_str(d, c"the pattern is a hole alone: it would match every expression\n");
             return 2;
         }
-        if !rest_holes_in_lists(pfirst, plast) {
+        if !rest_holes_in_lists(pfirst, plast, &tcx) {
             return 2;
         }
         // (0.16: the --subst patterns, expressions)
         let nsubst = substs.count / 2;
         for s in 0..nsubst {
             let first = PARSED_COUNT;
-            let sp = parse_text(stexts.data[s], false, c"--subst pattern");
+            let sp = parse_text(stexts.data[s], false, c"--subst pattern", &tcx);
             if sp == 0 {
                 return 2;
             }
             for n in first..PARSED_COUNT {
-                if hole_of(n) >= 0 {
-                    PAT_HOLES.push(n);
+                if hole_of(n, tcx) >= 0 {
+                    tcx.pat_holes.push(n);
                 }
             }
-            if hole_of(sp) >= 0 {
-                let d = diag(c"error", c"rewrite.pattern");
+            if hole_of(sp, tcx) >= 0 {
+                let d = diag(c"error", c"rewrite.pattern", &tcx);
                 buf_str(d, c"a --subst pattern is a hole alone: it would match every expression\n");
                 return 2;
             }
-            if !rest_holes_in_lists(first, PARSED_COUNT) {
+            if !rest_holes_in_lists(first, PARSED_COUNT, &tcx) {
                 return 2;
             }
-            S_PAT.push(sp);
+            tcx.s_pat.push(sp);
         }
         if replacement == 0 as *u8 {
-            return list_sites(proot, program_end, pattern);
+            return list_sites(proot, program_end, pattern, &tcx);
         }
         let rfirst = PARSED_COUNT;
-        R_ROOT = parse_text(rtext, STMTS, c"replacement");
-        if R_ROOT == 0 {
+        tcx.r_root = parse_text(rtext, tcx.stmts, c"replacement", &tcx);
+        if tcx.r_root == 0 {
             return 2;
         }
         let rlast = PARSED_COUNT;
-        if !rest_holes_in_lists(rfirst, rlast) {
+        if !rest_holes_in_lists(rfirst, rlast, &tcx) {
             return 2;
         }
         // (a new name is bound by the replacement)
-        for h in 0..H_SYM.count {
-            if H_FRESH.data[h] == 0 {
+        for h in 0..tcx.h_sym.count {
+            if tcx.h_fresh.data[h] == 0 {
                 continue;
             }
             var bound = false;
             for n in rfirst..rlast {
-                if pk(n) == NodeKind::PatBind && hole_of(n) == h {
+                if pk(n) == NodeKind::PatBind && hole_of(n, tcx) == h {
                     bound = true;
                 }
             }
             if !bound {
-                let d = diag(c"error", c"rewrite.unbound");
+                let d = diag(c"error", c"rewrite.unbound", &tcx);
                 buf_str(d, c"the replacement's ");
-                buf_bytes(d, buf_slice(H_NAME.data[h]));
+                buf_bytes(d, buf_slice(tcx.h_name.data[h]));
                 buf_str(d, c" is not in the pattern, and the replacement binds no name with it (`for $x in`, `let $x =`)\n");
                 return 2;
             }
         }
         for s in 0..nsubst {
             let first = PARSED_COUNT;
-            let sr = parse_text(stexts.data[nsubst + s], false, c"--subst replacement");
+            let sr = parse_text(stexts.data[nsubst + s], false, c"--subst replacement", &tcx);
             if sr == 0 {
                 return 2;
             }
-            S_REP.push(sr);
-            note_subst_holes(s, first, PARSED_COUNT);
+            tcx.s_rep.push(sr);
+            note_subst_holes(s, first, PARSED_COUNT, &tcx);
         }
         // (the replacement's text: its source, trimmed)
-        R_START = pstart(R_ROOT);
-        R_END = pend(R_ROOT);
-        if STMTS {
-            R_START = if pcount(R_ROOT) > 0 { pstart(pchild(R_ROOT, 0)) } else { R_END };
+        tcx.pattern_r_start = pstart(tcx.r_root);
+        tcx.pattern_r_end = pend(tcx.r_root);
+        if tcx.stmts {
+            tcx.pattern_r_start = if pcount(tcx.r_root) > 0 { pstart(pchild(tcx.r_root, 0)) }
+                else { tcx.pattern_r_end };
         }
         for n in rfirst..rlast {
-            if hole_of(n) >= 0 && pstart(n) >= R_START && pend(n) <= R_END {
-                R_HOLES.push(n);
+            if hole_of(n, tcx) >= 0 && pstart(n) >= tcx.pattern_r_start
+                && pend(n) <= tcx.pattern_r_end {
+                tcx.r_holes.push(n);
             }
         }
-        sort_by_start(R_HOLES);
-        for _ in 0..H_SYM.count {
-            R_KEPT.push(0);
+        sort_by_start(tcx.r_holes);
+        for _ in 0..tcx.h_sym.count {
+            tcx.r_kept.push(0);
         }
-        for i in 0..R_HOLES.count {
-            let q = R_HOLES.data[i];
-            R_KEPT.data[hole_of(q)] = 1;
+        for i in 0..tcx.r_holes.count {
+            let q = tcx.r_holes.data[i];
+            tcx.r_kept.data[hole_of(q, tcx)] = 1;
             // (`$s...;`: the statement is what its text replaces)
             var at = q;
             for n in rfirst..rlast {
-                if pk(n) == NodeKind::ExprStmt && pa(n) == q && pb(n) == 1 && rest_hole_of(n) >= 0 {
+                if pk(n) == NodeKind::ExprStmt && pa(n) == q && pb(n) == 1
+                    && rest_hole_of(n, tcx) >= 0 {
                     at = n;
                 }
             }
-            R_HOLE_SPAN.push(at);
+            tcx.r_hole_span.push(at);
         }
-        note_breaks(rfirst, rlast);
-        note_base_indent();
-        R_LEVELS = slot_levels(rfirst, PARSED_COUNT);
-        P_LEVELS = slot_levels(1, program_end);
-        for _ in 0..H_SYM.count {
-            B_NODE.push(-1);
-            B_START.push(-1);
-            B_END.push(-1);
-            B_LIST.push(0);
+        note_breaks(rfirst, rlast, &tcx);
+        note_base_indent(&tcx);
+        tcx.r_levels = slot_levels(rfirst, PARSED_COUNT);
+        tcx.p_levels = slot_levels(1, program_end);
+        for _ in 0..tcx.h_sym.count {
+            tcx.b_node.push(-1);
+            tcx.pattern_b_start.push(-1);
+            tcx.b_end.push(-1);
+            tcx.b_list.push(0);
         }
         // The sites: start, end and replacement of each.
         var s_start = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -501,44 +502,44 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
             if FILES[f].path[0] == '<' || !ref_in(pstart(n)) {
                 continue;
             }
-            for h in 0..H_SYM.count {
-                B_NODE.data[h] = -1;
+            for h in 0..tcx.h_sym.count {
+                tcx.b_node.data[h] = -1;
             }
-            if !match_node(proot, n) || !types_match() {
+            if !match_node(proot, n, &tcx) || !types_match(&tcx) {
                 continue;
             }
             // (0.16: the site's new names and substitutions)
-            SITE_START = pstart(n);
-            SITE_MULTI = has_newline(pstart(n), pend(n));
-            choose_fresh(pstart(n), pend(n));
-            find_substs(program_end);
+            tcx.site_start = pstart(n);
+            tcx.site_multi = has_newline(pstart(n), pend(n));
+            choose_fresh(pstart(n), pend(n), &tcx);
+            find_substs(program_end, &tcx);
             var dropped = 0;
-            let used = dropped_use(program_end, &dropped);
+            let used = dropped_use(program_end, &dropped, tcx);
             if used > 0 {
-                if DROPPED == 0 {
-                    DROP_USE = used;
-                    DROP_HOLE = dropped;
+                if tcx.pattern_dropped == 0 {
+                    tcx.drop_use = used;
+                    tcx.drop_hole = dropped;
                 }
-                DROPPED += 1;
+                tcx.pattern_dropped += 1;
                 continue;
             }
             if list {
                 let line = buf_new();
-                put_site(line, pstart(n));
+                put_site(line, pstart(n), tcx);
                 s_start.push(pstart(n));
                 s_end.push(pstart(n));
                 s_text.push(line);
                 continue;
             }
-            note_site_types();
-            var text = replacement_text();
+            note_site_types(&tcx);
+            var text = replacement_text(&tcx);
             var from = pstart(n);
             var to = pend(n);
-            if !STMTS {
+            if !tcx.stmts {
                 if parenthesized(n) {
                     from += 1;
                     to -= 1;
-                } else if replacement_level() < P_LEVELS[n] {
+                } else if replacement_level(tcx) < tcx.p_levels[n] {
                     let wrapped = buf_new();
                     buf_byte(wrapped, '(');
                     buf_bytes(wrapped, buf_slice(text));
@@ -551,7 +552,7 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
             s_text.push(text);
         }
         if list {
-            return print_sites(s_start, s_text, pattern, replacement);
+            return print_sites(s_start, s_text, pattern, replacement, &tcx);
         }
         // Outermost first; a site inside another is left.
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -597,52 +598,52 @@ fn run_rewrite_inner(c: Call<Gpa>) -> i64 {
             }
         }
         if sites == 0 {
-            let d = diag(c"note", c"rewrite.none");
+            let d = diag(c"note", c"rewrite.none", &tcx);
             buf_str(d, c"nothing matches '");
             buf_str(d, pattern);
             buf_str(d, c"'\n");
-            notes(pattern, replacement);
+            notes(pattern, replacement, &tcx);
             return 0;
         }
         if nested > 0 {
-            let d = diag(c"note", c"rewrite.nested");
+            let d = diag(c"note", c"rewrite.nested", &tcx);
             buf_int(d, nested);
             buf_str(d,
                 if nested == 1 { c" site inside a rewritten one is" }
                 else { c" sites inside rewritten ones are" });
             buf_str(d, c" left; run the rewrite again\n");
         }
-        notes(pattern, replacement);
+        notes(pattern, replacement, &tcx);
         // (0.17: the imports it leaves unused go)
         let dropped = drop_unused_imports(done_start, done_end, done_text);
         if dropped > 0 {
-            let d = diag(c"note", c"rewrite.imports");
+            let d = diag(c"note", c"rewrite.imports", &tcx);
             buf_str(d, c"removed ");
             buf_int(d, dropped);
             buf_str(d, if dropped == 1 { c" import" } else { c" imports" });
             buf_str(d, c" the rewrite left unused\n");
         }
-        where_hints();
+        where_hints(&tcx);
         let what = buf_new();
         buf_str(what, c"rewrote ");
         buf_int(what, sites);
         buf_str(what, if sites == 1 { c" site in " } else { c" sites in " });
         buf_int(what, files);
         buf_str(what, if files == 1 { c" file" } else { c" files" });
-        apply_edit(buf_slice(what), root)
+        apply_edit(buf_slice(what), root, &tcx)
     }
 }
 
 // `--list` without a REPLACEMENT (0.16): the sites PATTERN (proot)
 // matches with their --where types and names, a line each.
-fn list_sites(proot: i64, program_end: i64, pattern: *u8) -> i64 {
+fn list_sites(proot: i64, program_end: i64, pattern: *u8, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        for _ in 0..H_SYM.count {
-            B_NODE.push(-1);
-            B_START.push(-1);
-            B_END.push(-1);
-            B_LIST.push(0);
-            R_KEPT.push(0);
+        for _ in 0..tcx.h_sym.count {
+            tcx.b_node.push(-1);
+            tcx.pattern_b_start.push(-1);
+            tcx.b_end.push(-1);
+            tcx.b_list.push(0);
+            tcx.r_kept.push(0);
         }
         var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -655,24 +656,24 @@ fn list_sites(proot: i64, program_end: i64, pattern: *u8) -> i64 {
             if FILES[f].path[0] == '<' || !ref_in(pstart(n)) {
                 continue;
             }
-            for h in 0..H_SYM.count {
-                B_NODE.data[h] = -1;
+            for h in 0..tcx.h_sym.count {
+                tcx.b_node.data[h] = -1;
             }
-            if !match_node(proot, n) || !types_match() {
+            if !match_node(proot, n, &tcx) || !types_match(&tcx) {
                 continue;
             }
             let line = buf_new();
-            put_site(line, pstart(n));
+            put_site(line, pstart(n), tcx);
             starts.push(pstart(n));
             lines.push(line);
         }
-        print_sites(starts, lines, pattern, 0 as *u8)
+        print_sites(starts, lines, pattern, 0 as *u8, &tcx)
     }
 }
 
 // --list: the sites' lines (`lines`, buffers), by position (`starts`),
 // then the notes. The status.
-fn print_sites(starts: IntVec, lines: IntVec, pattern: *u8, replacement: *u8) -> i64 {
+fn print_sites(starts: IntVec, lines: IntVec, pattern: *u8, replacement: *u8, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let v = starts.data;
         let w = lines.data;
@@ -694,47 +695,47 @@ fn print_sites(starts: IntVec, lines: IntVec, pattern: *u8, replacement: *u8) ->
         }
         buf_write_fd(out, STDOUT);
         if lines.count == 0 {
-            let d = diag(c"note", c"rewrite.none");
+            let d = diag(c"note", c"rewrite.none", &tcx);
             buf_str(d, c"nothing matches '");
             buf_str(d, pattern);
             buf_str(d, c"'\n");
         }
-        notes(pattern, replacement);
+        notes(pattern, replacement, &tcx);
         0
     }
 }
 
 // The notes on sites left out: for their types (with the command that
 // takes the first one's type), for code the checker did not see.
-fn notes(pattern: *u8, replacement: *u8) {
+fn notes(pattern: *u8, replacement: *u8, tcx: inout Tcx<Comp>) {
     unsafe {
-        if TYPE_MISSES > 0 {
-            let d = diag(c"note", c"rewrite.types");
-            buf_int(d, TYPE_MISSES);
-            buf_str(d, if TYPE_MISSES == 1 { c" site matches" } else { c" sites match" });
+        if tcx.type_misses > 0 {
+            let d = diag(c"note", c"rewrite.types", &tcx);
+            buf_int(d, tcx.type_misses);
+            buf_str(d, if tcx.type_misses == 1 { c" site matches" } else { c" sites match" });
             buf_str(d, c" but for --where; first: ");
-            buf_bytes(d, buf_slice(H_NAME.data[MISS_HOLE]));
+            buf_bytes(d, buf_slice(tcx.h_name.data[tcx.miss_hole]));
             buf_str(d, c" is ");
-            buf_type(d, MISS_TYPE);
+            buf_type(d, tcx.miss_type);
             buf_str(d, c" at ");
-            put_loc(d, pstart(MISS_NODE));
+            put_loc(d, pstart(tcx.miss_node));
             buf_byte(d, '\n');
-            let out = try_rewrite(pattern, replacement);
+            let out = try_rewrite(pattern, replacement, &tcx);
             // (the --where of that type)
             let w = buf_new();
-            for h in 0..H_SYM.count {
-                if H_TYPE.data[h] < 0 {
+            for h in 0..tcx.h_sym.count {
+                if tcx.h_type.data[h] < 0 {
                     continue;
                 }
                 if BUFS[w].len > 0 {
                     buf_str(w, c", ");
                 }
-                buf_bytes(w, buf_slice(H_NAME.data[h]));
+                buf_bytes(w, buf_slice(tcx.h_name.data[h]));
                 buf_str(w, c": ");
-                if h == MISS_HOLE {
-                    buf_type(w, MISS_TYPE);
+                if h == tcx.miss_hole {
+                    buf_type(w, tcx.miss_type);
                 } else {
-                    buf_bytes(w, buf_slice(H_TYPE.data[h]));
+                    buf_bytes(w, buf_slice(tcx.h_type.data[h]));
                 }
             }
             buf_str(out, c" --where");
@@ -744,33 +745,33 @@ fn notes(pattern: *u8, replacement: *u8) {
                 put_word(out, c_slice(OPT_IN));
             }
             buf_str(out, if replacement == 0 as *u8 { c" --list" } else { c" --dry-run" });
-            put_root(out);
+            put_root(out, tcx);
             try_end(out);
         }
-        if DROPPED > 0 {
+        if tcx.pattern_dropped > 0 {
             // (0.15)
-            let d = diag(c"note", c"rewrite.dropped");
-            buf_int(d, DROPPED);
-            buf_str(d, if DROPPED == 1 { c" site is" } else { c" sites are" });
+            let d = diag(c"note", c"rewrite.dropped", &tcx);
+            buf_int(d, tcx.pattern_dropped);
+            buf_str(d, if tcx.pattern_dropped == 1 { c" site is" } else { c" sites are" });
             buf_str(d, c" left: the replacement drops ");
-            buf_bytes(d, buf_slice(H_NAME.data[DROP_HOLE]));
+            buf_bytes(d, buf_slice(tcx.h_name.data[tcx.drop_hole]));
             buf_str(d, c", which the code it keeps uses; first: ");
-            put_loc(d, pstart(DROP_USE));
+            put_loc(d, pstart(tcx.drop_use));
             buf_byte(d, '\n');
-            let out = diags();
+            let out = diags(&tcx);
             buf_str(out, c"try:");
             put_cword(out, PROG);
             buf_str(out, c" query show ");
-            put_path(out, file_of_pos(pstart(DROP_USE)));
+            put_path(out, file_of_pos(pstart(tcx.drop_use)));
             buf_byte(out, ':');
-            buf_int(out, line_of(pstart(DROP_USE)));
-            put_root(out);
+            buf_int(out, line_of(pstart(tcx.drop_use)));
+            put_root(out, tcx);
             try_end(out);
         }
-        if UNTYPED > 0 {
-            let d = diag(c"note", c"rewrite.untyped");
-            buf_int(d, UNTYPED);
-            buf_str(d, if UNTYPED == 1 { c" site is" } else { c" sites are" });
+        if tcx.untyped > 0 {
+            let d = diag(c"note", c"rewrite.untyped", &tcx);
+            buf_int(d, tcx.untyped);
+            buf_str(d, if tcx.untyped == 1 { c" site is" } else { c" sites are" });
             buf_str(d,
                 c" left: the checker gave no type there (a generic function never instantiated)\n");
         }
@@ -780,13 +781,13 @@ fn notes(pattern: *u8, replacement: *u8) {
 // Each `$x...` of nodes first..last is an element of a list (the
 // arguments of a call, a tuple, an array; 0.15: the statements of a
 // block), one per list. False after the diagnostic.
-fn rest_holes_in_lists(first: i64, last: i64) -> bool {
+fn rest_holes_in_lists(first: i64, last: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         var rests = 0;
         var listed = 0;
         for n in first..last {
-            let h = hole_of(n);
-            if h >= 0 && H_REST.data[h] != 0 {
+            let h = hole_of(n, tcx);
+            if h >= 0 && tcx.h_rest.data[h] != 0 {
                 rests += 1;
             }
             let k = pk(n);
@@ -796,19 +797,19 @@ fn rest_holes_in_lists(first: i64, last: i64) -> bool {
             }
             var here = 0;
             for i in 0..seq_len(n) {
-                if rest_hole_of(seq_at(n, i)) >= 0 {
+                if rest_hole_of(seq_at(n, i), tcx) >= 0 {
                     here += 1;
                 }
             }
             if here > 1 {
-                let d = diag(c"error", c"rewrite.pattern");
+                let d = diag(c"error", c"rewrite.pattern", &tcx);
                 buf_str(d, c"one $x... per list of arguments or block\n");
                 return false;
             }
             listed += here;
         }
         if rests != listed {
-            let d = diag(c"error", c"rewrite.pattern");
+            let d = diag(c"error", c"rewrite.pattern", &tcx);
             buf_str(d,
                 c"$x... stands for arguments or statements: write it in the arguments of a call, a tuple or an array, or among a block's statements\n");
             return false;

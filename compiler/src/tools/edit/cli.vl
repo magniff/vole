@@ -9,6 +9,7 @@ use crate::base::{
     BUFS, FILES, IntVec, OVERLAY, SOURCE_VOLE, SRC, SYMS, _setjmp, alloc_zeroed, buf_byte,
     buf_bytes, buf_fmt, buf_int, buf_new, buf_slice, buf_str,
 };
+use crate::base::comp::Comp;
 use crate::base::diag::{
     DENY_WARNINGS, DIAG_SHORT, ERR_BAIL, RECOVER_DEPTH, WARNINGS_SHOWN, error_count, flush_warnings,
     print_ok, warning_count, write_errors,
@@ -24,10 +25,9 @@ use crate::front::modules::file_of_pos;
 use crate::front::own::diag::OWN_REPORT_PRINT;
 use crate::front::stdtree::{STD_TREE, find_std_tree, std_files_differ};
 use crate::tools::conflicts::resolve::run_resolve;
-use crate::tools::edit::{
-    DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
-};
-use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command, try_replaced};
+use crate::tools::ctx::Tcx;
+use crate::tools::edit::{edit_remove_file, edit_replace};
+use crate::tools::edit::apply::{apply_edit, set_command, try_replaced};
 use crate::tools::edit::applyfile::run_apply;
 use crate::tools::edit::items::{
     after_line, blank_line, indent_of, item_head, item_tail, item_text, keyword_head, leading,
@@ -41,15 +41,11 @@ use crate::tools::patch::run_patch;
 use crate::tools::proc::read_stdin;
 use crate::tools::query::{c_slice, file_named, resolve_name, root_or_diag};
 use crate::tools::query::cache::{cache_on, cache_restore, cache_save};
-use crate::tools::query::command_line::{
-    C_INCLUDE_DIRS, PARSED, QUERY, front_end, index_program, load_program,
-};
+use crate::tools::query::command_line::{QUERY, front_end, index_program, load_program};
 use crate::tools::query::defs::{
     DEFS, K_CONST, K_FIELD, K_MOD, K_STATIC, K_VARIANT, bytes_eq, mod_fqn_text,
 };
-use crate::tools::query::diagnostics::{
-    OPT_EXACT, PROG, ROOT_GIVEN, TOOL, diag, program_errors, try_begin, try_end, write_diags,
-};
+use crate::tools::query::diagnostics::{PROG, diag, program_errors, try_begin, try_end, write_diags};
 use crate::tools::query::positions::{line_end, line_of, line_start};
 use crate::tools::query::refs::file_text;
 use crate::tools::query::show::text_start;
@@ -57,18 +53,18 @@ use crate::tools::query_text::{region_spans, region_target};
 
 // ---- The commands ----
 
-pub fn run_edit(c: Call<Gpa>) -> i64 {
-    let status = run_edit_inner(c);
-    write_diags();
+pub fn run_edit(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_edit_inner(c, &tcx);
+    write_diags(tcx);
     timer_report();
     status
 }
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"edit.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"edit.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = try_begin(c"replace NAME < new.vl", c_slice(c""), false);
+    let out = try_begin(c"replace NAME < new.vl", c_slice(c""), false, &tcx);
     try_end(out);
     2
 }
@@ -98,7 +94,7 @@ pub fn edit_opts(gpa: Gpa) -> Vec<Opt, Gpa> {
 // Takes ev when it is one of edit_opts' (as take_edit_option): whether it
 // was. Their missing values are unknown options, as before (and `-C`
 // without a valid value is a word).
-pub fn take_edit_event(ev: inout Ev, root: inout *u8) -> bool {
+pub fn take_edit_event(ev: inout Ev, root: inout *u8, tcx: inout Tcx<Comp>) -> bool {
     if ev.kind == EV_MISSING {
         if ev.name == "C" {
             ev.kind = EV_WORD;
@@ -109,17 +105,17 @@ pub fn take_edit_event(ev: inout Ev, root: inout *u8) -> bool {
     }
     if ev.kind == EV_FLAG {
         if ev.name == "dry-run" {
-            DRY_RUN = true;
+            tcx.dry_run = true;
         } else if ev.name == "show" {
-            SHOW = true;
+            tcx.show = true;
         } else if ev.name == "time-passes" {
             TIME_PASSES = true;
         } else if ev.name == "no-check" {
-            NO_CHECK = true;
+            tcx.no_check = true;
         } else if ev.name == "exact" {
-            OPT_EXACT = true;
+            tcx.opt_exact = true;
         } else if ev.name == "force" {
-            crate::tools::edit::FORCE = true;
+            tcx.force = true;
         } else {
             return false;
         }
@@ -145,8 +141,8 @@ pub fn take_edit_event(ev: inout Ev, root: inout *u8) -> bool {
         // (0.17: std from its files, stdtree.vl; stdedit.vl)
         STD_TREE = ev.value;
     } else if ev.name == "target" {
-        TARGET_NAME = ev.value;
-        TARGET = target_of_name(TARGET_NAME);
+        tcx.target_name = ev.value;
+        tcx.target = target_of_name(tcx.target_name);
     } else {
         return false;
     }
@@ -154,41 +150,41 @@ pub fn take_edit_event(ev: inout Ev, root: inout *u8) -> bool {
 }
 
 // `edit replace|insert|delete ...` (`patch`, `insert --in`: patch.vl).
-fn run_edit_inner(c: Call<Gpa>) -> i64 {
+fn run_edit_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
-    TOOL = c"edit";
-    set_command(c.line);
+    tcx.tool = c"edit";
+    set_command(c.line, &tcx);
     if c.line.len() < 3 {
-        return usage(c"no command (patch, apply, replace, insert, delete)");
+        return usage(c"no command (patch, apply, replace, insert, delete)", &tcx);
     }
     let cmd = c.line.c(2);
     let word = c.word(2);
     // (0.17: a std file named, `edit patch compiler/std/io.vl:102`:
     // the edit runs on std's files; stdedit.vl)
     if names_std_file(c.line) {
-        return rerun_in_std_tree(c.line);
+        return rerun_in_std_tree(c.line, &tcx);
     }
     // (the leaf of `edit insert --in` is patch's: cli/tree.vl)
     if word == "patch" || (word == "insert" && c.line.has("--in")) {
-        return run_patch(c);
+        return run_patch(c, &tcx);
     }
     if word == "resolve" {
-        return run_resolve(c);
+        return run_resolve(c, &tcx);
     }
     if word == "wrap" {
-        return run_wrap(c);
+        return run_wrap(c, &tcx);
     }
     if word == "new-file" {
-        return run_new_file(c);
+        return run_new_file(c, &tcx);
     }
     if word == "apply" {
-        return run_apply(c);
+        return run_apply(c, &tcx);
     }
     let replace = word == "replace";
     let insert = word == "insert";
     let delete = word == "delete";
     if !replace && !insert && !delete {
-        let d = diag(c"error", c"edit.usage");
+        let d = diag(c"error", c"edit.usage", &tcx);
         buf_str(d, c"unknown command '");
         buf_str(d, cmd);
         buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
@@ -204,11 +200,11 @@ fn run_edit_inner(c: Call<Gpa>) -> i64 {
             after = true;
         } else if ev.kind == EV_FLAG && ev.name == "before" {
             before = true;
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
         } else if ev.kind == EV_WORD {
             names.push(ev.value as i64);
         } else {
-            let d = diag(c"error", c"edit.usage");
+            let d = diag(c"error", c"edit.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, ev.value);
             buf_str(d, c"'\n");
@@ -223,44 +219,44 @@ fn run_edit_inner(c: Call<Gpa>) -> i64 {
         }
         if names.count != 1 {
             return usage(if names.count == 0 { c"a NAME is needed" }
-                else { c"one NAME at a time" });
+                else { c"one NAME at a time" }, &tcx);
         }
         if insert && after == before {
-            return usage(c"insert needs --after or --before");
+            return usage(c"insert needs --after or --before", &tcx);
         }
         let name = c_slice(names.data[0] as *u8);
         let what = if insert { if after { c"insert --after" } else { c"insert --before" } }
             else { cmd };
-        ROOT_GIVEN = root;
+        tcx.root_given = root;
         // The new text, first: nothing is read when there is none.
         let input = buf_new();
-        if !delete && (!read_stdin(input) || BUFS[input].len == 0) {
-            let d = diag(c"error", c"edit.no-text");
+        if !delete && (!read_stdin(input, &tcx) || BUFS[input].len == 0) {
+            let d = diag(c"error", c"edit.no-text", &tcx);
             buf_str(d, c"the new text is read from stdin; none was given\n");
-            let out = try_begin(what, name, true);
+            let out = try_begin(what, name, true, &tcx);
             buf_str(out, c" < new.vl");
             try_end(out);
             return 2;
         }
-        root = root_or_diag(root, what, name, true);
+        root = root_or_diag(root, what, name, true, &tcx);
         if root == 0 as *u8 {
             return 2;
         }
-        if !cache_restore(root, TARGET, false) && !load_program(root, TARGET) {
-            program_errors(c"error", root, true);
+        if !cache_restore(root, tcx.target, false, &tcx) && !load_program(root, tcx.target, &tcx) {
+            program_errors(c"error", root, true, &tcx);
             return 1;
         }
         // A module's use lines or header comment (0.12).
         var rf = 0;
         var rk = 0;
         var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let r = region_target(name, what, &rf, &rk, &spans);
+        let r = region_target(name, what, &rf, &rk, &spans, &tcx);
         if r == 1 {
             return 1;
         }
         let how = if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' };
         if r == 0 {
-            return edit_region(rf, rk, spans, how, input, root);
+            return edit_region(rf, rk, spans, how, input, root, &tcx);
         }
         // (0.17) `edit replace FILE.vl < text`: the whole file.
         if replace && crate::base::is_source_path(names.data[0] as *u8) {
@@ -275,26 +271,26 @@ fn run_edit_inner(c: Call<Gpa>) -> i64 {
                 let summary = buf_new();
                 buf_str(summary, c"replaced ");
                 buf_bytes(summary, file_text(f));
-                return apply_edit(buf_slice(summary), root);
+                return apply_edit(buf_slice(summary), root, &tcx);
             }
         }
         var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !resolve_name(what, name, &matches) {
+        if !resolve_name(what, name, &matches, &tcx) {
             return 1;
         }
         source_only(&matches);
         if matches.count > 1 {
-            ambiguous(what, name, matches);
+            ambiguous(what, name, matches, &tcx);
             return 1;
         }
         let d = matches.data[0];
         let f = file_of_pos(DEFS[d].start);
         if FILES[f].path[0] == '<' {
             // (0.17: std, in the repository: in its files; stdedit.vl)
-            if std_rerun(f) {
-                return rerun_in_std_tree(c.line);
+            if std_rerun(f, &tcx) {
+                return rerun_in_std_tree(c.line, &tcx);
             }
-            let e = diag(c"error", c"edit.not-source");
+            let e = diag(c"error", c"edit.not-source", &tcx);
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
             buf_str(e, c" is in ");
             buf_str(e, FILES[f].path);
@@ -303,11 +299,11 @@ fn run_edit_inner(c: Call<Gpa>) -> i64 {
         }
         let summary = buf_new();
         // (0.14: the imports the new text needs, when it has new errors)
-        ADD_IMPORTS = !delete;
-        if !item_edit(how, d, input, summary) {
+        tcx.add_imports = !delete;
+        if !item_edit(how, d, input, summary, &tcx) {
             return 1;
         }
-        apply_edit(buf_slice(summary), root)
+        apply_edit(buf_slice(summary), root, &tcx)
     }
 }
 
@@ -315,10 +311,10 @@ fn run_edit_inner(c: Call<Gpa>) -> i64 {
 // the text of buffer input, 'a' or 'b' insert that text after or before
 // it, 'd' delete it (see Items as text); its words in summary (`replaced
 // crate::f`). False after the diagnostic.
-pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
-    let whole = whole_lines(d);
-    let head = item_head(d);
-    let tail = item_tail(d);
+pub fn item_edit(how: u8, d: i64, input: i64, summary: i64, tcx: inout Tcx<Comp>) -> bool {
+    let whole = whole_lines(d, tcx);
+    let head = item_head(d, tcx);
+    let tail = item_tail(d, tcx);
     let member = DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT;
     var added = true;
     if how == 'r' {
@@ -327,7 +323,7 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
             // (what the text has, it replaces: comments, attributes)
             let lead = leading(buf_slice(text));
             let from = if lead == '/' { line_start(text_start(d)) }
-                else if lead == '#' { line_start(head) } else { line_start(keyword_head(d)) };
+                else if lead == '#' { line_start(head) } else { line_start(keyword_head(d, tcx)) };
             added = edit_replace(from, line_end(tail - 1), text);
         } else {
             added = edit_replace(head, tail, text);
@@ -335,7 +331,7 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
         buf_str(summary, c"replaced ");
     } else if how == 'a' || how == 'b' {
         if !whole {
-            let e = diag(c"error", c"edit.layout");
+            let e = diag(c"error", c"edit.layout", &tcx);
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
             buf_str(e,
                 c" shares its line with other code; insert needs an item on lines of its own\n");
@@ -368,12 +364,12 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
             buf_str(summary, c"inserted before ");
         }
     } else {
-        added = delete_item(d, whole, head, tail);
+        added = delete_item(d, whole, head, tail, &tcx);
         buf_str(summary, c"deleted ");
     }
     buf_bytes(summary, SYMS[DEFS[d].fqn].text);
     if !added {
-        let e = diag(c"error", c"edit.overlap");
+        let e = diag(c"error", c"edit.overlap", &tcx);
         buf_bytes(e, SYMS[DEFS[d].fqn].text);
         buf_str(e, c" is changed twice in one edit; give each item one block\n");
         return false;
@@ -396,7 +392,7 @@ fn const_or_static(t: [u8]) -> bool {
 }
 
 // The edit deleting definition d (its text, see Items as text).
-fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
+fn delete_item(d: i64, whole: bool, head: i64, tail: i64, tcx: inout Tcx<Comp>) -> bool {
     unsafe {
         let f = file_of_pos(head);
         if !whole {
@@ -433,13 +429,13 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
         if DEFS[d].kind == K_MOD {
             let m = SYMS[DEFS[d].fqn].text;
             for g in 0..FILES.len() {
-                let t = mod_fqn_text(FILES[g].module);
+                let t = mod_fqn_text(FILES[g].module, &tcx);
                 if FILES[g].path[0] != '<' && FILES[g].kind == SOURCE_VOLE
                     && (FILES[g].start < DEFS[d].start || FILES[g].start >= DEFS[d].end)
                     && (bytes_eq(t, m)
                         || (t.len as i64 > m.len as i64 + 2 && bytes_eq(t[0..m.len], m)
                             && t[m.len] == ':' && t[m.len as i64 + 1] == ':')) {
-                    edit_remove_file(c_slice(FILES[g].path));
+                    edit_remove_file(c_slice(FILES[g].path), &tcx);
                 }
             }
         }
@@ -452,31 +448,33 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
 // replace (the first region becomes TEXT, the others go; with none, TEXT
 // goes at the top of the file, after its header for use lines), 'a' or
 // 'b' insert (after the last use line, before the first), 'd' delete.
-fn edit_region(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, root: *u8) -> i64 {
+fn edit_region(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, root: *u8,
+    tcx: inout Tcx<Comp>) -> i64 {
     let summary = buf_new();
-    let status = region_edit(f, kind, spans, how, input, summary);
+    let status = region_edit(f, kind, spans, how, input, summary, &tcx);
     if status >= 0 {
         return status;
     }
-    apply_edit(buf_slice(summary), root)
+    apply_edit(buf_slice(summary), root, &tcx)
 }
 
 // The edit of edit_region, its words in summary (`replaced crate::m::use`):
 // -1 when it is made, else the exit status (after the diagnostic).
-pub fn region_edit(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, summary: i64) -> i64 {
+pub fn region_edit(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, summary: i64,
+    tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
         let n = spans.count;
         let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
         if (how == 'a' || how == 'b') && kind == 2 {
-            let e = diag(c"error", c"edit.layout");
+            let e = diag(c"error", c"edit.layout", &tcx);
             buf_str(e, c"a header comment is replaced, not inserted next to\n");
-            let out = try_begin(c"replace", mod_fqn_text(FILES[f].module), true);
+            let out = try_begin(c"replace", mod_fqn_text(FILES[f].module, &tcx), true, &tcx);
             buf_str(out, c"::header < header.txt");
             try_end(out);
             return 1;
         }
         if how == 'd' && n == 0 {
-            let e = diag(c"note", c"edit.unchanged");
+            let e = diag(c"note", c"edit.unchanged", &tcx);
             buf_str(e, c"nothing to delete\n");
             return 0;
         }
@@ -537,7 +535,7 @@ pub fn region_edit(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, summar
                 buf_str(summary, c"inserted before ");
             }
         }
-        buf_bytes(summary, mod_fqn_text(FILES[f].module));
+        buf_bytes(summary, mod_fqn_text(FILES[f].module, &tcx));
         buf_str(summary, if kind == 1 { c"::use" } else if kind == 2 { c"::header" }
             else { c"::extern" });
         -1
@@ -610,10 +608,10 @@ pub fn source_only(matches: inout IntVec) {
 
 // NAME matches several definitions: refused, with the first three paths
 // (and the query listing them all, when there are more).
-pub fn ambiguous(what: *u8, name: [u8], matches: IntVec) {
+pub fn ambiguous(what: *u8, name: [u8], matches: IntVec, tcx: inout Tcx<Comp>) {
     unsafe {
         let n = matches.count;
-        let d = diag(c"error", c"query.ambiguous");
+        let d = diag(c"error", c"query.ambiguous", &tcx);
         buf_int(d, n);
         buf_str(d, c" definitions match '");
         buf_bytes(d, name);
@@ -624,12 +622,12 @@ pub fn ambiguous(what: *u8, name: [u8], matches: IntVec) {
             }
             // (0.17: the command as run, the name replaced)
             let fqn = SYMS[DEFS[matches.data[i]].fqn].text;
-            if !try_replaced(name, fqn) {
-                try_end(try_begin(what, fqn, true));
+            if !try_replaced(name, fqn, &tcx) {
+                try_end(try_begin(what, fqn, true, &tcx));
             }
         }
         if n > 3 {
-            let out = try_begin(c"def", name, true);
+            let out = try_begin(c"def", name, true, &tcx);
             try_end(out);
         }
     }
@@ -652,7 +650,7 @@ pub fn undo_leaf(gpa: Gpa) -> Leaf<Gpa> {
 }
 
 // `volec undo [--force] [ROOT]`.
-pub fn run_undo_command(c: Call<Gpa>) -> i64 {
+pub fn run_undo_command(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
     var force = false;
     var from = 0 as *u8;
@@ -663,8 +661,8 @@ pub fn run_undo_command(c: Call<Gpa>) -> i64 {
             from = ev.value;
         }
     }
-    let status = run_undo(force, from);
-    write_diags();
+    let status = run_undo(force, from, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -686,14 +684,14 @@ pub fn check_leaf(gpa: Gpa) -> Leaf<Gpa> {
 // read them, with a note; not for an edit's check (--overlay). (0.25.2:
 // `fix` too, so that `fix --suggested` makes the fixes of the errors
 // `check` shows in std's files.)
-pub fn std_tree_if_edited() {
+pub fn std_tree_if_edited(tcx: inout Tcx<Comp>) {
     if STD_TREE != 0 as *u8 || OVERLAY.count != 0 {
         return;
     }
     let tree = find_std_tree();
     if tree != 0 as *u8 && std_files_differ(tree) {
         STD_TREE = tree;
-        let d = diag(c"note", c"check.std-files");
+        let d = diag(c"note", c"check.std-files", &tcx);
         buf_str(d, c"std's files differ from this compiler's std: checked with ");
         buf_str(d, tree);
         buf_str(d, c" (bootstrap/bootstrap.sh --dev builds them in)\n");
@@ -704,7 +702,7 @@ pub fn std_tree_if_edited() {
 // end (parse, resolve, check, unsafe check), every error, one per line;
 // exit 1 when there is one. (`--overlay FILE COPY` reads COPY for FILE:
 // how an edit is checked before it is written.)
-pub fn run_check(c: Call<Gpa>) -> i64 {
+pub fn run_check(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
     // (0.25.3: on a terminal, base::term's form)
     DIAG_SHORT = !RICH;
@@ -716,7 +714,7 @@ pub fn run_check(c: Call<Gpa>) -> i64 {
         var ev = e;
         let token = c.word(ev.at);
         if is_opt(ev, "I") {
-            C_INCLUDE_DIRS.push(ev.value as i64);
+            tcx.c_include_dirs.push(ev.value as i64);
         } else if ev.kind == EV_OPTION && ev.name == "overlay" && path == 0 as *u8 {
             path = ev.value;
         } else if ev.kind == EV_OPTION && ev.name == "overlay" {
@@ -732,28 +730,28 @@ pub fn run_check(c: Call<Gpa>) -> i64 {
             } else {
                 bad = if token.starts_with("-") { c.line.c(ev.at) } else { c.line.c(ev.at - 1) };
             }
-        } else if take_edit_event(&ev, &root) {
+        } else if take_edit_event(&ev, &root, &tcx) {
         } else if ev.kind == EV_WORD && !ev.text.starts_with("-") {
             root = ev.value;
         } else {
             bad = ev.value;
         }
         if bad != 0 as *u8 {
-            let d = diag(c"error", c"check.usage");
+            let d = diag(c"error", c"check.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, bad);
             buf_str(d, c"'\n");
-            write_diags();
+            write_diags(tcx);
             return 2;
         }
     }
     unsafe {
         // (0.17: std's files edited: checked with them, front/stdtree.vl)
-        std_tree_if_edited();
-        ROOT_GIVEN = root;
-        root = root_or_diag(root, c"check", c_slice(c""), false);
+        std_tree_if_edited(&tcx);
+        tcx.root_given = root;
+        root = root_or_diag(root, c"check", c_slice(c""), false, &tcx);
         if root == 0 as *u8 {
-            write_diags();
+            write_diags(tcx);
             return 2;
         }
         // (0.13: the errors from the tools' cache, when it holds for the
@@ -761,33 +759,33 @@ pub fn run_check(c: Call<Gpa>) -> i64 {
         // for the cache)
         // (0.17: --values=report prints what the walk finds: no cache)
         // (0.25.2: -I: the cache knows no include directories)
-        let dirs = C_INCLUDE_DIRS.count > 0;
+        let dirs = tcx.c_include_dirs.count > 0;
         // (0.25.3: --deny-warnings: the warnings recorded as errors, not
         // cached)
         var lexed = false;
         if OWN_REPORT_PRINT || arch_options_given() || dirs || DENY_WARNINGS
-            || !cache_restore(root, TARGET, false) {
+            || !cache_restore(root, tcx.target, false, &tcx) {
             lexed = true;
             let cached = cache_on() && !arch_options_given() && !dirs && !DENY_WARNINGS;
             QUERY = cached;
             ERR_BAIL = alloc_zeroed(512);
             if _setjmp(ERR_BAIL) == 0 {
-                front_end(root, TARGET);
+                front_end(root, tcx.target, &tcx);
             }
             RECOVER_DEPTH = 0;
             ERR_BAIL = 0 as *u8;
             QUERY = false;
-            if cached && PARSED {
-                index_program();
-                cache_save(root, TARGET);
+            if cached && tcx.parsed {
+                index_program(&tcx);
+                cache_save(root, tcx.target, &tcx);
             }
         }
         // (0.25.3) the unsafe sites without their justification
         // (tools/query/unsafe_audit.vl): after the cache, which keeps
         // what every command shares
         // (not with errors: they come first)
-        if PARSED && error_count() == 0 {
-            crate::tools::query::unsafe_audit::report_unjustified(lexed);
+        if tcx.parsed && error_count() == 0 {
+            crate::tools::query::unsafe_audit::report_unjustified(lexed, &tcx);
         }
         if error_count() > 0 {
             write_errors();

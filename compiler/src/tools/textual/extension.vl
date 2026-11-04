@@ -23,11 +23,12 @@
 // exit status, the renamed paths aside, or the edit is taken back.
 
 use crate::base::{FILES, IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq};
+use crate::base::comp::Comp;
 use crate::cli::line::{
     Call, EV_WORD, Leaf, flag, is_flag, is_missing, is_opt, option, short_option, table,
 };
 use crate::front::cpp::directives::file_exists;
-use crate::tools::edit::DRY_RUN;
+use crate::tools::ctx::Tcx;
 use crate::tools::edit::diff::diff_texts;
 use crate::tools::edit::undo::run_undo;
 use crate::tools::proc::{absolute_path, buf_cstr, read_file_if, same_bytes};
@@ -38,17 +39,17 @@ use crate::tools::query::diagnostics::{
 };
 use crate::tools::query::grep::{G_COMMENT, G_STRING};
 use crate::tools::textual::{
-    M_FROM, M_TO, W_AFTER, W_BEFORE, W_PATH, add_exclusion, excluded, flush, is_text, kept_ranges,
-    read_exclusions, tracked_files, write_edit,
+    add_exclusion, excluded, flush, is_text, kept_ranges, read_exclusions, tracked_files,
+    write_edit,
 };
 use crate::tools::textual::places::{match_in, read_lines, read_places};
 use crate::tools::textual::samebuild::{clean, compare_one, compile_all, has_mod_lines, processors};
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"extension.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"extension.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let out = diags();
+    let out = diags(&tcx);
     buf_str(out, c"try:");
     put_cword(out, PROG);
     buf_str(out, c" refactor extension .vl .vl --all --dry-run");
@@ -131,14 +132,10 @@ fn dir_of(p: [u8]) -> [u8] {
     if i < 0 { p[0..0] } else { p[0..i] }
 }
 
-// The files with OLD git tracks (all; C strings) and which are renamed.
-static var OLD_FILES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var RENAMED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn index_of(p: [u8]) -> i64 {
+fn index_of(p: [u8], tcx: Tcx<Comp>) -> i64 {
     unsafe {
-        for k in 0..OLD_FILES.count {
-            if same_bytes(c_slice(OLD_FILES.data[k] as *u8), p) {
+        for k in 0..tcx.old_files.count {
+            if same_bytes(c_slice(tcx.old_files.data[k] as *u8), p) {
                 return k;
             }
         }
@@ -148,7 +145,7 @@ fn index_of(p: [u8]) -> i64 {
 
 // The file a mention `tok` in file `from` names: an index into OLD_FILES;
 // -1 none, -2 several (the end of a path that is several files').
-fn resolve(tok: [u8], from: [u8]) -> i64 {
+fn resolve(tok: [u8], from: [u8], tcx: Tcx<Comp>) -> i64 {
     unsafe {
         let d = dir_of(from);
         if d.len > 0 {
@@ -156,12 +153,12 @@ fn resolve(tok: [u8], from: [u8]) -> i64 {
             buf_bytes(b, d);
             buf_byte(b, '/');
             buf_bytes(b, tok);
-            let k = index_of(normalized(buf_slice(b)));
+            let k = index_of(normalized(buf_slice(b)), tcx);
             if k >= 0 {
                 return k;
             }
         }
-        let k = index_of(normalized(tok));
+        let k = index_of(normalized(tok), tcx);
         if k >= 0 {
             return k;
         }
@@ -171,8 +168,8 @@ fn resolve(tok: [u8], from: [u8]) -> i64 {
             let end = tok[s..];
             var found = -1;
             var count = 0;
-            for j in 0..OLD_FILES.count {
-                let q = c_slice(OLD_FILES.data[j] as *u8);
+            for j in 0..tcx.old_files.count {
+                let q = c_slice(tcx.old_files.data[j] as *u8);
                 if same_bytes(q, end)
                     || (q.len > end.len && q[q.len as i64 - end.len as i64 - 1] == '/'
                         && same_bytes(q[q.len as i64 - end.len as i64..], end)) {
@@ -251,9 +248,9 @@ fn here_relative(p: *u8) -> [u8] {
     normalized(s)
 }
 
-pub fn run_extension(c: Call<Gpa>) -> i64 {
-    let status = run_inner(c);
-    write_diags();
+pub fn run_extension(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
@@ -272,7 +269,7 @@ pub fn extension_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "word")
 }
 
-fn run_inner(c: Call<Gpa>) -> i64 {
+fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
     var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var all = false;
@@ -284,7 +281,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         if is_flag(ev, "all") {
             all = true;
         } else if is_flag(ev, "dry-run") {
-            DRY_RUN = true;
+            tcx.dry_run = true;
         } else if is_flag(ev, "diff") {
             show_diff = true;
         } else if is_flag(ev, "no-check") {
@@ -292,15 +289,15 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         } else if is_opt(ev, "j") {
             jobs = crate::tools::query::parse_count(a);
         } else if is_opt(ev, "exclude") {
-            if !add_exclusion(c_slice(a)) {
+            if !add_exclusion(c_slice(a), &tcx) {
                 return 2;
             }
         } else if is_opt(ev, "exclude-from") {
-            if !read_exclusions(a) {
+            if !read_exclusions(a, &tcx) {
                 return 2;
             }
         } else if (ev.kind != EV_WORD && !is_missing(ev, "j")) || ev.text.starts_with("--") {
-            let d = diag(c"error", c"extension.usage");
+            let d = diag(c"error", c"extension.usage", &tcx);
             buf_str(d, c"unknown option '");
             buf_str(d, a);
             buf_str(d,
@@ -312,32 +309,32 @@ fn run_inner(c: Call<Gpa>) -> i64 {
     }
     unsafe {
         if words.count < 2 {
-            return usage(c"extension takes OLD and NEW (.vl .vl), then ROOT, DIR or --all");
+            return usage(c"extension takes OLD and NEW (.vl .vl), then ROOT, DIR or --all", &tcx);
         }
         let old = dotted(words.data[0] as *u8);
         let new = dotted(words.data[1] as *u8);
         if old.len < 2 || new.len < 2 || same_bytes(old, new) {
-            return usage(c"OLD and NEW are two extensions");
+            return usage(c"OLD and NEW are two extensions", &tcx);
         }
         if jobs <= 0 {
             jobs = processors();
         }
         var tracked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !tracked_files(&tracked) {
-            let d = diag(c"error", c"extension.no-git");
+            let d = diag(c"error", c"extension.no-git", &tcx);
             buf_str(d,
                 c"refactor extension renames the files git tracks: this is no git checkout\n");
             return 2;
         }
         for k in 0..tracked.count {
             if ends_with(c_slice(tracked.data[k] as *u8), old) {
-                OLD_FILES.push(tracked.data[k]);
+                tcx.old_files.push(tracked.data[k]);
             }
         }
         // The renamed files (indexes into OLD_FILES; -1 untracked, in
         // `untracked`), the roots to compile.
-        let picked = crate::base::alloc_array::<bool>(OLD_FILES.count + 1);
-        for k in 0..OLD_FILES.count + 1 {
+        let picked = crate::base::alloc_array::<bool>(tcx.old_files.count + 1);
+        for k in 0..tcx.old_files.count + 1 {
             picked[k] = false;
         }
         var untracked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -345,7 +342,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         var excluded_count = 0;
         let targets = words.count - 2;
         if all {
-            for k in 0..OLD_FILES.count {
+            for k in 0..tcx.old_files.count {
                 picked[k] = true;
             }
         }
@@ -354,13 +351,13 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             let arg = if t < words.count { words.data[t] as *u8 } else { find_root(0 as *u8) };
             t += 1;
             if arg == 0 as *u8 {
-                return usage(c"no program here: name a ROOT, a DIR, or --all");
+                return usage(c"no program here: name a ROOT, a DIR, or --all", &tcx);
             }
             let a = here_relative(arg);
             if ends_with(a, old) {
                 // A program: its files.
-                if !load_program(arg, 0) {
-                    let d = diag(c"error", c"extension.no-program");
+                if !load_program(arg, 0, &tcx) {
+                    let d = diag(c"error", c"extension.no-program", &tcx);
                     buf_str(d, c"cannot read the program of '");
                     buf_str(d, arg);
                     buf_str(d, c"'\n");
@@ -378,7 +375,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                     if !ends_with(p, old) {
                         continue;
                     }
-                    let k = index_of(p);
+                    let k = index_of(p, tcx);
                     if k >= 0 {
                         picked[k] = true;
                     } else {
@@ -390,8 +387,8 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             } else {
                 // A directory: the files under it.
                 var any = false;
-                for k in 0..OLD_FILES.count {
-                    let q = c_slice(OLD_FILES.data[k] as *u8);
+                for k in 0..tcx.old_files.count {
+                    let q = c_slice(tcx.old_files.data[k] as *u8);
                     if a.len == 0
                         || (q.len > a.len && q[a.len] == '/'
                             && same_bytes(q[0..a.len], a)) {
@@ -400,7 +397,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                     }
                 }
                 if !any {
-                    let d = diag(c"error", c"extension.no-files");
+                    let d = diag(c"error", c"extension.no-files", &tcx);
                     buf_str(d, c"no file of git's ends with ");
                     buf_bytes(d, old);
                     buf_str(d, c" under '");
@@ -411,44 +408,44 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
         }
         let by_program = roots.count > 0;
-        for k in 0..OLD_FILES.count {
+        for k in 0..tcx.old_files.count {
             if !picked[k] {
                 continue;
             }
-            let p = c_slice(OLD_FILES.data[k] as *u8);
-            if excluded(p) {
+            let p = c_slice(tcx.old_files.data[k] as *u8);
+            if excluded(p, tcx) {
                 picked[k] = false;
                 excluded_count += 1;
                 continue;
             }
-            RENAMED.push(k);
+            tcx.renamed.push(k);
         }
-        if RENAMED.count == 0 && untracked.count == 0 {
-            let d = diag(c"note", c"extension.no-files");
+        if tcx.renamed.count == 0 && untracked.count == 0 {
+            let d = diag(c"note", c"extension.no-files", &tcx);
             buf_str(d, c"no file to rename\n");
             return 0;
         }
         // The moves.
-        for r in 0..RENAMED.count {
-            let p = c_slice(OLD_FILES.data[RENAMED.data[r]] as *u8);
-            M_FROM.push(OLD_FILES.data[RENAMED.data[r]]);
-            M_TO.push(renamed(p, old, new) as i64);
+        for r in 0..tcx.renamed.count {
+            let p = c_slice(tcx.old_files.data[tcx.renamed.data[r]] as *u8);
+            tcx.m_from.push(tcx.old_files.data[tcx.renamed.data[r]]);
+            tcx.m_to.push(renamed(p, old, new) as i64);
             if !by_program && is_root(p, old) {
-                roots.push(OLD_FILES.data[RENAMED.data[r]]);
+                roots.push(tcx.old_files.data[tcx.renamed.data[r]]);
             }
         }
         for u in 0..untracked.count {
             let p = c_slice(untracked.data[u] as *u8);
-            M_FROM.push(untracked.data[u]);
-            M_TO.push(renamed(p, old, new) as i64);
+            tcx.m_from.push(untracked.data[u]);
+            tcx.m_to.push(renamed(p, old, new) as i64);
         }
-        for m in 0..M_TO.count {
-            if file_exists(M_TO.data[m] as *u8) {
-                let d = diag(c"error", c"extension.exists");
+        for m in 0..tcx.m_to.count {
+            if file_exists(tcx.m_to.data[m] as *u8) {
+                let d = diag(c"error", c"extension.exists", &tcx);
                 buf_str(d, c"'");
-                buf_str(d, M_TO.data[m] as *u8);
+                buf_str(d, tcx.m_to.data[m] as *u8);
                 buf_str(d, c"' exists already: '");
-                buf_str(d, M_FROM.data[m] as *u8);
+                buf_str(d, tcx.m_from.data[m] as *u8);
                 buf_str(d, c"' cannot take its name; nothing renamed\n");
                 return 1;
             }
@@ -490,17 +487,17 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             if starts.count == 0 {
                 continue;
             }
-            if excluded(p) {
+            if excluded(p, tcx) {
                 left_excluded += starts.count;
                 continue;
             }
             var keep = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            kept_ranges(p, tx, &keep);
+            kept_ranges(p, tx, &keep, tcx);
             let source = crate::base::source_ext_len(p) > 0 || ends_with(p, old);
-            var placed = source && read_places(tx);
+            var placed = source && read_places(tx, &tcx);
             if source && !placed {
                 // (it does not lex: its `//` lines are its comments)
-                read_lines(tx);
+                read_lines(tx, &tcx);
                 placed = true;
             }
             let after = buf_new();
@@ -519,11 +516,11 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                     continue;
                 }
                 if source {
-                    if placed && match_in(s, e, G_STRING) {
+                    if placed && match_in(s, e, G_STRING, tcx) {
                         strings_here += 1;
                         continue;
                     }
-                    if !placed || !match_in(s, e, G_COMMENT) {
+                    if !placed || !match_in(s, e, G_COMMENT, tcx) {
                         continue;
                     }
                 }
@@ -533,7 +530,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
                         b -= 1;
                     }
                     let tok = tx[b..e];
-                    let res = resolve(tok, p);
+                    let res = resolve(tok, p, tcx);
                     if res == -1 {
                         unresolved += 1;
                         if buf_len(example) == 0 {
@@ -566,20 +563,20 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_bytes(after, tx[at..]);
             // (a renamed file's path after the move)
             var final_path = path;
-            for m in 0..M_FROM.count {
-                if streq(M_FROM.data[m] as *u8, path) {
-                    final_path = M_TO.data[m] as *u8;
+            for m in 0..tcx.m_from.count {
+                if streq(tcx.m_from.data[m] as *u8, path) {
+                    final_path = tcx.m_to.data[m] as *u8;
                 }
             }
-            W_PATH.push(final_path as i64);
-            W_BEFORE.push(text);
-            W_AFTER.push(after);
+            tcx.w_path.push(final_path as i64);
+            tcx.w_before.push(text);
+            tcx.w_after.push(after);
             buf_bytes(out, c_slice(final_path));
             buf_byte(out, '\t');
             buf_int(out, n);
             buf_str(out, if n == 1 { c" mention\n" } else { c" mentions\n" });
             if show_diff {
-                diff_texts(diff, c_slice(final_path), tx, buf_slice(after));
+                diff_texts(diff, c_slice(final_path), tx, buf_slice(after), &tcx);
             }
             mentions += n;
             mention_files += 1;
@@ -587,11 +584,11 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         // The renames, a line per directory (in the order first seen).
         var dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var counts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for m in 0..M_FROM.count {
-            let dir = dir_of(c_slice(M_FROM.data[m] as *u8));
+        for m in 0..tcx.m_from.count {
+            let dir = dir_of(c_slice(tcx.m_from.data[m] as *u8));
             var found = -1;
             for k in 0..dirs.count {
-                if same_bytes(dir_of(c_slice(M_FROM.data[dirs.data[k]] as *u8)), dir) {
+                if same_bytes(dir_of(c_slice(tcx.m_from.data[dirs.data[k]] as *u8)), dir) {
                     found = k;
                     break;
                 }
@@ -604,7 +601,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
         }
         for k in 0..dirs.count {
-            let dir = dir_of(c_slice(M_FROM.data[dirs.data[k]] as *u8));
+            let dir = dir_of(c_slice(tcx.m_from.data[dirs.data[k]] as *u8));
             if dir.len > 0 {
                 buf_bytes(out, dir);
                 buf_byte(out, '/');
@@ -617,9 +614,9 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_int(out, counts.data[k]);
             buf_str(out, if counts.data[k] == 1 { c" file\n" } else { c" files\n" });
         }
-        buf_str(out, if DRY_RUN { c"would rename " } else { c"renamed " });
-        buf_int(out, M_FROM.count);
-        buf_str(out, if M_FROM.count == 1 { c" file (" } else { c" files (" });
+        buf_str(out, if tcx.dry_run { c"would rename " } else { c"renamed " });
+        buf_int(out, tcx.m_from.count);
+        buf_str(out, if tcx.m_from.count == 1 { c" file (" } else { c" files (" });
         buf_bytes(out, old);
         buf_str(out, c" -> ");
         buf_bytes(out, new);
@@ -633,7 +630,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         }
         // What is left.
         if in_strings > 0 {
-            let d = diag(c"note", c"extension.strings");
+            let d = diag(c"note", c"extension.strings", &tcx);
             buf_int(d, in_strings);
             buf_str(d,
                 if in_strings == 1 { c" mention in string literals of " }
@@ -641,7 +638,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_int(d, string_files);
             buf_str(d, if string_files == 1 { c" source" } else { c" sources" });
             buf_str(d, c" left: changing them changes what the program does\n");
-            let tr = diags();
+            let tr = diags(&tcx);
             buf_str(tr, c"try:");
             put_cword(tr, PROG);
             buf_str(tr, c" rewrite --text");
@@ -651,7 +648,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             try_end(tr);
         }
         if excluded_count > 0 || left_excluded > 0 || left_kept > 0 {
-            let d = diag(c"note", c"extension.excluded");
+            let d = diag(c"note", c"extension.excluded", &tcx);
             let left = left_excluded + left_kept;
             buf_int(d, excluded_count);
             buf_str(d,
@@ -663,13 +660,13 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_str(d, c" left in excluded files and lines\n");
         }
         if untracked.count > 0 {
-            let d = diag(c"note", c"extension.untracked");
+            let d = diag(c"note", c"extension.untracked", &tcx);
             buf_int(d, untracked.count);
             buf_str(d, if untracked.count == 1 { c" file" } else { c" files" });
             buf_str(d, c" of the program git does not track: renamed without it\n");
         }
         if unresolved > 0 || ambiguous > 0 {
-            let d = diag(c"note", c"extension.unresolved");
+            let d = diag(c"note", c"extension.unresolved", &tcx);
             buf_int(d, unresolved);
             buf_str(d, c" mentions name no file, ");
             buf_int(d, ambiguous);
@@ -681,10 +678,10 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
             buf_byte(d, '\n');
         }
-        if DRY_RUN {
+        if tcx.dry_run {
             flush(out);
             if !no_check && roots.count > 0 {
-                let d = diag(c"note", c"extension.check");
+                let d = diag(c"note", c"extension.check", &tcx);
                 buf_int(d, roots.count);
                 buf_str(d, if roots.count == 1 { c" program" } else { c" programs" });
                 buf_str(d, c" would be compiled before and after the rename, and compared\n");
@@ -695,13 +692,13 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         let before = c"target/extension-check/before";
         let after = c"target/extension-check/after";
         if !no_check && roots.count > 0 && !compile_all(roots, before, jobs) {
-            let d = diag(c"error", c"extension.check");
+            let d = diag(c"error", c"extension.check", &tcx);
             buf_str(d, c"cannot make target/extension-check; nothing renamed\n");
             return 1;
         }
         let summary = buf_new();
         buf_str(summary, c"renamed ");
-        buf_int(summary, M_FROM.count);
+        buf_int(summary, tcx.m_from.count);
         buf_str(summary, c" files ");
         buf_bytes(summary, old);
         buf_str(summary, c" -> ");
@@ -711,7 +708,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         buf_str(summary, c" mentions in ");
         buf_int(summary, mention_files);
         buf_str(summary, c" files");
-        if !write_edit(buf_slice(summary), c".") {
+        if !write_edit(buf_slice(summary), c".", &tcx) {
             return 1;
         }
         flush(out);
@@ -739,7 +736,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
         }
         if differ > 0 {
-            let d = diag(c"error", c"extension.differs");
+            let d = diag(c"error", c"extension.differs", &tcx);
             buf_int(d, differ);
             buf_str(d, c" of ");
             buf_int(d, roots.count);
@@ -748,7 +745,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             buf_str(d, c": ");
             buf_bytes(d, buf_slice(why));
             buf_str(d, c"); the rename is undone, the outputs are in target/extension-check\n");
-            run_undo(false, c".");
+            run_undo(false, c".", &tcx);
             return 1;
         }
         clean(before, roots.count);

@@ -17,25 +17,17 @@ use crate::base::{
     BUFS, IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd,
 };
+use crate::base::comp::Comp;
 use crate::base::target::{target_name, target_of_name};
 use crate::cli::line::{Call, EV_WORD, Leaf, is_opt, option, short_option, table};
 use crate::front::cpp::directives::file_exists;
+use crate::tools::ctx::Tcx;
 use crate::tools::proc::{
     buf_cstr, fork_worker, make_dirs, read_file_if, remove_dir, remove_file, run_capture,
     same_bytes, spawn_to_file, wait_any, worker_exit,
 };
 use crate::tools::query::c_slice;
 use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, try_end, write_diags};
-
-// The compilations: program (C string), target, level; and the outcome
-// (0 same, 1 different, 2 could not run).
-static var J_PROG: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var J_TARGET: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var J_LEVEL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var J_RESULT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var WORK: *u8 = 0 as *u8;
-static var OLD: *u8 = 0 as *u8;
 
 // `DIR/NAME`.
 fn join_path(dir: *u8, name: [u8]) -> *u8 {
@@ -156,9 +148,9 @@ fn has_target(cc: *u8, t: i64) -> bool {
 }
 
 // The directory of compilation j: `WORK/j`.
-fn job_dir(j: i64) -> *u8 {
+fn job_dir(j: i64, tcx: Tcx<Comp>) -> *u8 {
     let b = buf_new();
-    buf_str(b, WORK);
+    buf_str(b, tcx.work);
     buf_byte(b, '/');
     buf_int(b, j);
     buf_cstr(b)
@@ -170,7 +162,7 @@ fn level_flag(level: i64) -> *u8 {
 
 // Compiler `cc` on compilation j, its output in DIR/WHO.s and what it
 // printed in DIR/WHO.out; its exit status.
-fn compile_one(cc: *u8, j: i64, dir: *u8, who: *u8) -> i64 {
+fn compile_one(cc: *u8, j: i64, dir: *u8, who: *u8, tcx: Tcx<Comp>) -> i64 {
     unsafe {
         let asm = buf_new();
         buf_str(asm, dir);
@@ -190,9 +182,9 @@ fn compile_one(cc: *u8, j: i64, dir: *u8, who: *u8) -> i64 {
         let args = alloc_array::<*u8>(9);
         args[0] = cc;
         args[1] = c"--target";
-        args[2] = target_name(J_TARGET.data[j]);
-        args[3] = level_flag(J_LEVEL.data[j]);
-        args[4] = J_PROG.data[j] as *u8;
+        args[2] = target_name(tcx.j_target.data[j]);
+        args[3] = level_flag(tcx.j_level.data[j]);
+        args[4] = tcx.j_prog.data[j] as *u8;
         args[5] = c"-o";
         args[6] = buf_cstr(asm);
         // (0.15: one form of the errors, whatever the default of each:
@@ -212,13 +204,13 @@ fn compile_one(cc: *u8, j: i64, dir: *u8, who: *u8) -> i64 {
 
 // In a worker: compilation j by both compilers, compared. Exit 0: the
 // same, 1: different (the outputs stay in WORK/j), 2: not run.
-fn run_job(j: i64) -> ! {
-    let dir = job_dir(j);
+fn run_job(j: i64, tcx: Tcx<Comp>) -> ! {
+    let dir = job_dir(j, tcx);
     make_dirs(dir);
-    let a = compile_one(OLD, j, dir, c"old");
-    let b = compile_one(PROG, j, dir, c"new");
+    let a = compile_one(tcx.old, j, dir, c"old", tcx);
+    let b = compile_one(PROG, j, dir, c"new", tcx);
     let same = a == b && same_file(dir, c"old/out.s", c"new/out.s")
-        && same_printed(dir);
+        && same_printed(dir, tcx);
     if same {
         remove_file(join_path(dir, c_slice(c"old/out.s")));
         remove_file(join_path(dir, c_slice(c"new/out.s")));
@@ -252,7 +244,7 @@ fn same_file(dir: *u8, a: *u8, b: *u8) -> bool {
 // same, each one's own path (in a `try:` line, `try: OLD edit patch ...`)
 // taken as the other's: DIR/old.out with OLD's path written as this
 // compiler's is DIR/new.out.
-fn same_printed(dir: *u8) -> bool {
+fn same_printed(dir: *u8, tcx: Tcx<Comp>) -> bool {
     let x = buf_new();
     let y = buf_new();
     let hx = read_file_if(join_path(dir, c_slice(c"old.out")), x);
@@ -260,7 +252,7 @@ fn same_printed(dir: *u8) -> bool {
     if hx != hy {
         return false;
     }
-    let old = c_slice(OLD);
+    let old = c_slice(tcx.old);
     let new = c_slice(PROG);
     let t = buf_slice(x);
     if old.len == 0 || same_bytes(old, new) {
@@ -280,17 +272,17 @@ fn same_printed(dir: *u8) -> bool {
     same_bytes(buf_slice(z), buf_slice(y))
 }
 
-pub fn run_same_output(c: Call<Gpa>) -> i64 {
-    let status = run_inner(c);
-    write_diags();
+pub fn run_same_output(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+    let status = run_inner(c, &tcx);
+    write_diags(tcx);
     status
 }
 
-fn usage(message: *u8) -> i64 {
-    let d = diag(c"error", c"same-output.usage");
+fn usage(message: *u8, tcx: inout Tcx<Comp>) -> i64 {
+    let d = diag(c"error", c"same-output.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
-    let o = diags();
+    let o = diags(&tcx);
     buf_str(o, c"try:");
     put_cword(o, PROG);
     buf_str(o, c" same-output path/to/old/volec");
@@ -326,11 +318,11 @@ pub fn same_output_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "old")
 }
 
-fn run_inner(c: Call<Gpa>) -> i64 {
+fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
     PROG = c.prog();
     var corpus = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     var jobs = 0;
-    WORK = c"target/same-output";
+    tcx.work = c"target/same-output";
     for ev in c.evs.iter() {
         let a = ev.value;
         if is_opt(ev, "corpus") {
@@ -338,23 +330,23 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         } else if is_opt(ev, "j") {
             jobs = crate::tools::query::parse_count(a);
         } else if is_opt(ev, "work") {
-            WORK = a;
+            tcx.work = a;
         } else if ev.kind != EV_WORD || ev.text.starts_with("-") {
-            return usage(c"unknown option");
-        } else if OLD != 0 as *u8 {
-            return usage(c"one OLD compiler");
+            return usage(c"unknown option", &tcx);
+        } else if tcx.old != 0 as *u8 {
+            return usage(c"one OLD compiler", &tcx);
         } else {
-            OLD = find_compiler(a);
+            tcx.old = find_compiler(a);
         }
     }
     unsafe {
-        if OLD == 0 as *u8 {
-            return usage(c"same-output needs the OLD compiler to compare with");
+        if tcx.old == 0 as *u8 {
+            return usage(c"same-output needs the OLD compiler to compare with", &tcx);
         }
-        if !file_exists(OLD) {
-            let d = diag(c"error", c"same-output.no-compiler");
+        if !file_exists(tcx.old) {
+            let d = diag(c"error", c"same-output.no-compiler", &tcx);
             buf_str(d, c"cannot run '");
-            buf_str(d, OLD);
+            buf_str(d, tcx.old);
             buf_str(d, c"'\n");
             return 2;
         }
@@ -369,7 +361,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
         for k in 0..corpus.count {
             let e = corpus.data[k] as *u8;
             if !add_programs(e, &programs) && explicit {
-                let d = diag(c"error", c"same-output.no-corpus");
+                let d = diag(c"error", c"same-output.no-corpus", &tcx);
                 buf_str(d, c"cannot read '");
                 buf_str(d, e);
                 buf_str(d, c"'\n");
@@ -377,7 +369,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
         }
         if programs.count == 0 {
-            let d = diag(c"error", c"same-output.no-corpus");
+            let d = diag(c"error", c"same-output.no-corpus", &tcx);
             buf_str(d,
                 c"no programs (tests/run, examples, bench, compiler/src; or --corpus DIR)\n");
             return 2;
@@ -388,36 +380,36 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             if target_of_name(target_name(t)) != t {
                 continue;
             }
-            if has_target(OLD, t) {
+            if has_target(tcx.old, t) {
                 targets.push(t);
             } else {
-                let d = diag(c"note", c"same-output.target");
-                buf_str(d, OLD);
+                let d = diag(c"note", c"same-output.target", &tcx);
+                buf_str(d, tcx.old);
                 buf_str(d, c" has no target ");
                 buf_str(d, target_name(t));
                 buf_str(d, c"; not compared\n");
             }
         }
         if targets.count == 0 {
-            let d = diag(c"error", c"same-output.no-compiler");
-            buf_str(d, OLD);
+            let d = diag(c"error", c"same-output.no-compiler", &tcx);
+            buf_str(d, tcx.old);
             buf_str(d, c" compiles for none of this compiler's targets\n");
             return 2;
         }
         for p in 0..programs.count {
             for t in 0..targets.count {
                 for level in 0..3 {
-                    J_PROG.push(programs.data[p]);
-                    J_TARGET.push(targets.data[t]);
-                    J_LEVEL.push(level);
-                    J_RESULT.push(-1);
+                    tcx.j_prog.push(programs.data[p]);
+                    tcx.j_target.push(targets.data[t]);
+                    tcx.j_level.push(level);
+                    tcx.j_result.push(-1);
                 }
             }
         }
-        if !make_dirs(WORK) {
-            let d = diag(c"error", c"same-output.work");
+        if !make_dirs(tcx.work) {
+            let d = diag(c"error", c"same-output.work", &tcx);
             buf_str(d, c"cannot make '");
-            buf_str(d, WORK);
+            buf_str(d, tcx.work);
             buf_str(d, c"'\n");
             return 2;
         }
@@ -425,7 +417,7 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             jobs = processors();
         }
         // The workers: up to `jobs` at once.
-        let total = J_PROG.count;
+        let total = tcx.j_prog.count;
         let pids = alloc_array::<i64>(total + 1);
         var next = 0;
         var running = 0;
@@ -433,10 +425,10 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             while next < total && running < jobs {
                 let pid = fork_worker();
                 if pid == 0 {
-                    run_job(next);
+                    run_job(next, tcx);
                 }
                 if pid < 0 {
-                    J_RESULT.data[next] = 2;
+                    tcx.j_result.data[next] = 2;
                 } else {
                     pids[next] = pid;
                     running += 1;
@@ -450,29 +442,29 @@ fn run_inner(c: Call<Gpa>) -> i64 {
             }
             running -= 1;
             for j in 0..next {
-                if pids[j] == pid && J_RESULT.data[j] < 0 {
-                    J_RESULT.data[j] = status;
+                if pids[j] == pid && tcx.j_result.data[j] < 0 {
+                    tcx.j_result.data[j] = status;
                     break;
                 }
             }
         }
-        report(programs.count, targets.count)
+        report(programs.count, targets.count, &tcx)
     }
 }
 
 // The summary: `identical<TAB>N compilations...`, or the differences (each
 // `PROGRAM<TAB>TARGET<TAB>-ON<TAB>WHAT`, at most 10), the first one's
 // first differing line, and the error.
-fn report(programs: i64, targets: i64) -> i64 {
+fn report(programs: i64, targets: i64, tcx: inout Tcx<Comp>) -> i64 {
     unsafe {
-        let total = J_PROG.count;
+        let total = tcx.j_prog.count;
         let out = buf_new();
         var differ = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var failed = 0;
         for j in 0..total {
-            if J_RESULT.data[j] == 1 {
+            if tcx.j_result.data[j] == 1 {
                 differ.push(j);
-            } else if J_RESULT.data[j] != 0 {
+            } else if tcx.j_result.data[j] != 0 {
                 failed += 1;
             }
         }
@@ -493,17 +485,17 @@ fn report(programs: i64, targets: i64) -> i64 {
                 break;
             }
             let j = differ.data[k];
-            buf_str(out, J_PROG.data[j] as *u8);
+            buf_str(out, tcx.j_prog.data[j] as *u8);
             buf_byte(out, '\t');
-            buf_str(out, target_name(J_TARGET.data[j]));
+            buf_str(out, target_name(tcx.j_target.data[j]));
             buf_byte(out, '\t');
-            buf_str(out, level_flag(J_LEVEL.data[j]));
+            buf_str(out, level_flag(tcx.j_level.data[j]));
             buf_byte(out, '\t');
-            put_difference(out, j, k == 0);
+            put_difference(out, j, k == 0, tcx);
         }
         buf_write_fd(out, STDOUT);
         if failed > 0 {
-            let d = diag(c"warning", c"same-output.not-run");
+            let d = diag(c"warning", c"same-output.not-run", &tcx);
             buf_int(d, failed);
             buf_str(d, c" compilations could not be run\n");
         }
@@ -511,28 +503,28 @@ fn report(programs: i64, targets: i64) -> i64 {
             return 1;
         }
         let first = differ.data[0];
-        let d = diag(c"error", c"same-output.differs");
+        let d = diag(c"error", c"same-output.differs", &tcx);
         buf_int(d, differ.count);
         buf_str(d, c" of ");
         buf_int(d, total);
         buf_str(d, c" compilations differ (kept in ");
-        buf_str(d, WORK);
+        buf_str(d, tcx.work);
         buf_str(d, c")\n");
-        let dir = job_dir(first);
-        let o = diags();
+        let dir = job_dir(first, tcx);
+        let o = diags(&tcx);
         let asm_differs = !same_file(dir, c"old/out.s", c"new/out.s");
         buf_str(o, c"try: diff");
         put_cword(o, join_path(dir, c_slice(if asm_differs { c"old/out.s" } else { c"old.out" })));
         put_cword(o, join_path(dir, c_slice(if asm_differs { c"new/out.s" } else { c"new.out" })));
         try_end(o);
-        let o2 = diags();
+        let o2 = diags(&tcx);
         buf_str(o2, c"try:");
         put_cword(o2, PROG);
         buf_str(o2, c" --target ");
-        buf_str(o2, target_name(J_TARGET.data[first]));
+        buf_str(o2, target_name(tcx.j_target.data[first]));
         buf_byte(o2, ' ');
-        buf_str(o2, level_flag(J_LEVEL.data[first]));
-        put_cword(o2, J_PROG.data[first] as *u8);
+        buf_str(o2, level_flag(tcx.j_level.data[first]));
+        put_cword(o2, tcx.j_prog.data[first] as *u8);
         buf_str(o2, c" -o new.s");
         try_end(o2);
         1
@@ -541,8 +533,8 @@ fn report(programs: i64, targets: i64) -> i64 {
 
 // What differs in compilation j (`exit A B`, `output`, `asm line N`), and
 // for the first one the two lines (`-<TAB>old`, `+<TAB>new`).
-fn put_difference(out: i64, j: i64, lines: bool) {
-    let dir = job_dir(j);
+fn put_difference(out: i64, j: i64, lines: bool, tcx: Tcx<Comp>) {
+    let dir = job_dir(j, tcx);
     let st = buf_new();
     read_file_if(join_path(dir, c_slice(c"status")), st);
     let s = buf_slice(st);
