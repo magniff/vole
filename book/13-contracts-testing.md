@@ -59,8 +59,8 @@ fn main(gpa: Gpa) {
     var r = Ring::new(3, gpa);
     r.push(10);
     r.push(20);
-    println(f"{r.pop()} {r.pop()}");
-    println(f"{r.pop()}");
+    println("{} {}", r.pop(), r.pop());
+    println("{}", r.pop());
 }
 ```
 
@@ -75,7 +75,7 @@ numbers and pops three:
 
 ```out exit=101
 10 20
-ring.vl:43:16: requires failed: 'self.len > 0' of 'Ring::pop' (ring.vl:29:9): self.len = 0
+ring.vl:43:19: requires failed: 'self.len > 0' of 'Ring::pop' (ring.vl:29:9): self.len = 0
 ```
 
 The program stops with a panic, as a failed `unwrap` does, and exit
@@ -91,8 +91,9 @@ status 101. Read the line from the left:
 
 `new` and `push` have an `else` after their condition. That replaces
 the generic "requires failed" text with a message of your own; the
-values are still printed after it. The message can be an f-string,
-which is only formatted if the check fails.
+values are still printed after it. The message can be a format string
+with integer arguments (`else "len {}", v.len()`), which is only
+formatted if the check fails.
 
 Without a contract, the third `pop` would have read `items[0]` and
 returned whatever stale number was there, and made `len` negative. The
@@ -156,7 +157,7 @@ fn wrap(i: i64, cap: i64) -> i64
 }
 
 fn main() {
-    println(f"{wrap(4, 3)} {wrap(2, 3)}");
+    println("{} {}", wrap(4, 3), wrap(2, 3));
 }
 ```
 
@@ -172,7 +173,7 @@ a check that passes must not change what the program does.
 
 ```vole
 fn checked(v: [i64]) -> bool {
-    println(f"checking {v.len()} items");
+    println("checking {} items", v.len());
     v.len() > 0
 }
 
@@ -184,7 +185,7 @@ fn first(v: [i64]) -> i64
 
 fn main() {
     let v = [1, 2, 3];
-    println(f"{first(v)}");
+    println("{}", first(v));
 }
 ```
 
@@ -238,7 +239,7 @@ fn main(gpa: Gpa) {
         v.push(i * i);
     }
     let i = env::args().count();
-    println(f"{at(v, i)} {at_checked(v, i)}");
+    println("{} {}", at(v, i), at_checked(v, i));
 }
 ```
 
@@ -306,7 +307,7 @@ fn contains(v: [i64], x: i64) -> bool
 fn main() {
     let sorted = [1, 3, 5, 7];
     let shuffled = [7, 1, 5, 3];
-    println(f"{contains(sorted, 7)} {contains(shuffled, 7)}");
+    println("{} {}", contains(sorted, 7), contains(shuffled, 7));
 }
 ```
 
@@ -322,7 +323,7 @@ true false
 $ volec search.vl -o search --debug-contracts
 ok: built search
 $ ./search
-search.vl:32:38: contains needs a sorted slice
+search.vl:32:43: contains needs a sorted slice
 ```
 
 `debug ensures` works the same way.
@@ -383,7 +384,7 @@ impl Ring {
     }
 
     fn get(self, i: usize) -> i64
-        requires i < self.len else f"no item {i} in a ring of {self.len}"
+        requires i < self.len else "no item {i} in a ring of {}", self.len
     {
         self.items[wrap(self.start + i, self.cap())]
     }
@@ -429,9 +430,9 @@ fn main(gpa: Gpa) {
     for x in [10, 20, 30] {
         r.push(x);
     }
-    println(f"{r.pop()} {r.get(0)} {r.get(1)}");
+    println("{} {} {}", r.pop(), r.get(0), r.get(1));
     r.push(40);
-    println(f"{r.get(0)} {r.get(1)} {r.get(2)}");
+    println("{} {} {}", r.get(0), r.get(1), r.get(2));
 }
 ```
 
@@ -616,7 +617,7 @@ fn parse_never_crashes(data: [u8]) {
 
 fn main() {
     match parse_command("push 42") {
-        Some(Command::Push(n)) => println(f"push {n}"),
+        Some(Command::Push(n)) => println("push {n}"),
         _ => println("something else"),
     }
 }
@@ -666,7 +667,7 @@ fn doubles(x: i64) {
 }
 
 fn main() {
-    println(f"{double(21)}");
+    println("{}", double(21));
 }
 ```
 

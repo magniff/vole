@@ -86,7 +86,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(m, n, gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"tally: {e}");
+            eprintln("tally: {e}");
             1
         }
     }
@@ -148,7 +148,7 @@ pub fn top(counts: HashMap<String, i64>, n: usize, gpa: Gpa) -> Vec<(String, i64
 
 pub fn print_table(rows: [(String, i64)]) {
     for row in rows {
-        println(f"{row.0:<12}{row.1:>5}");
+        println("{:<12}{:>5}", row.0, row.1);
     }
 }
 ```
@@ -393,9 +393,9 @@ use crate::count::Counts;
 // One line of counts, as wc prints them.
 pub fn print_counts(c: Counts, name: str, words_only: bool) {
     if words_only {
-        println(f"{c.words:>8} {name}");
+        println("{:>8} {name}", c.words);
     } else {
-        println(f"{c.lines:>8} {c.words:>8} {c.bytes:>8} {name}");
+        println("{:>8} {:>8} {:>8} {name}", c.lines, c.words, c.bytes);
     }
 }
 
@@ -432,11 +432,11 @@ fn padding(word: str, w: i64) -> i64
 pub fn print_table(rows: [(String, i64)]) {
     let w = word_width(rows);
     for row in rows {
-        print(f"{row.0}");
+        print("{}", row.0);
         for _ in 0..padding(row.0, w) {
             print(" ");
         }
-        println(f"{row.1:>6}");
+        println("{:>6}", row.1);
     }
 }
 ```
@@ -500,8 +500,8 @@ impl From<Utf8Error> for TallyError {
 impl Display for TallyError {
     fn fmt(self, f: inout std::Fmt) {
         match self {
-            TallyError::File(path, e) => f.write(f"{path}: {e}"),
-            TallyError::Stdin(e) => f.write(f"stdin: {e}"),
+            TallyError::File(path, e) => f.write("{path}: {e}"),
+            TallyError::Stdin(e) => f.write("stdin: {e}"),
             TallyError::NotText => f.write("the input is not UTF-8 text"),
         }
     }
@@ -575,7 +575,7 @@ fn main(gpa: Gpa) -> i32 {
     match run(m, top, gpa) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln(f"tally: {e}");
+            eprintln("tally: {e}");
             1
         }
     }

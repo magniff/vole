@@ -69,11 +69,11 @@ fn main(gpa: Gpa) {
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
-    println(f"mean: {mean(xs):.2}");
+    println("mean: {:.2}", mean(xs));
     var buckets = [0; 5];
     histogram(xs, 0.0, 10.0, &buckets);
     for i in 0..5 {
-        println(f"{i * 2:>2} to {i * 2 + 2:>2}: {buckets[i]}");
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
     }
 }
 ```
@@ -201,11 +201,11 @@ fn main(gpa: Gpa) {
     for word in text.split_whitespace() {
         xs.push(word.parse::<f64>().unwrap());
     }
-    println(f"mean: {mean(xs):.2}");
+    println("mean: {:.2}", mean(xs));
     var buckets = [0; 5];
     histogram(xs, 0.0, 10.0, &buckets);
     for i in 0..5 {
-        println(f"{i * 2:>2} to {i * 2 + 2:>2}: {buckets[i]}");
+        println("{:>2} to {:>2}: {}", i * 2, i * 2 + 2, buckets[i]);
     }
 }
 ```
@@ -252,7 +252,7 @@ print to `bucket`. Here is the core with that change:
 
 ```vole
 fn bucket(x: f64, lo: f64, hi: f64, n: usize) -> usize {
-    println(f"bucket of {x}");
+    println("bucket of {x}");
     let i = ((x - lo) / (hi - lo) * n as f64) as i64;
     if i < 0 { 0 } else if i >= n as i64 { n - 1 } else { i as usize }
 }
@@ -269,7 +269,7 @@ fn main() {
     let xs = [1.0, 9.5];
     var buckets = [0; 5];
     histogram(xs, 0.0, 10.0, &buckets);
-    println(f"{buckets[0]} {buckets[4]}");
+    println("{} {}", buckets[0], buckets[4]);
 }
 ```
 
@@ -303,7 +303,7 @@ fn main(gpa: Gpa) {
     let xs = [1.0, 9.5];
     var big: Vec<f64> = Vec::new_in(gpa);
     above(xs, 5.0, &big);
-    println(f"{big.len()}");
+    println("{}", big.len());
 }
 ```
 
@@ -336,15 +336,15 @@ fn main() {
     var xs = [1.0, 2.0, 3.0];
     rescale(&xs, |x| x * 10.0);
     rescale(&xs, |x| {
-        println(f"scaling {x}");
+        println("scaling {x}");
         x / 2.0
     });
-    println(f"{xs[0]} {xs[2]}");
+    println("{} {}", xs[0], xs[2]);
 }
 ```
 
 ```err
-error[effect]: the closure for 'F' of 'rescale' does io ('println(f"scaling {x}")' at main.vl: line 11, column 9 calls 'std::fmt::println'); 'F: Fn(f64) -> f64 + effects(panic)' allows panic only
+error[effect]: the closure for 'F' of 'rescale' does io ('println("scaling {x}")' at main.vl: line 11, column 9 calls 'std::fmt::println'); 'F: Fn(f64) -> f64 + effects(panic)' allows panic only
  --> main.vl: line 10, column 5
   = help: do only what the bound allows in the closure, or allow 'io' in the bound
 ```
@@ -375,7 +375,7 @@ impl Eq for Word {
 
 fn main() {
     let a = Word { text: "vole" };
-    println(f"{a == Word { text: "vole" }}");
+    println("{}", a == Word { text: "vole" });
 }
 ```
 

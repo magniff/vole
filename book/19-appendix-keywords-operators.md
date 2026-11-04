@@ -137,17 +137,17 @@ Here's a program that exercises the table:
 fn main() {
     let a = 6;
     let b = 4;
-    println(f"{a + b * 2} {(a + b) * 2} {a - b - 1} {a / b} {a % b}");
-    println(f"{a & b} {a | b} {a ^ b} {~a} {1 << 4} {-16 >> 2}");
-    println(f"{a | b == 6} {a + 1 << 1} {-a as f64 / 4.0}");
-    println(f"{a > b && b > 0 || false} {!(a == b)} {a != b}");
+    println("{} {} {} {} {}", a + b * 2, (a + b) * 2, a - b - 1, a / b, a % b);
+    println("{} {} {} {} {} {}", a & b, a | b, a ^ b, ~a, 1 << 4, -16 >> 2);
+    println("{} {} {}", a | b == 6, a + 1 << 1, -a as f64 / 4.0);
+    println("{} {} {}", a > b && b > 0 || false, !(a == b), a != b);
     var x = 1;
     x += 2;
     x *= 5;
     x -= 1;
     x <<= 1;
     x %= 10;
-    println(f"{x}");
+    println("{x}");
 }
 ```
 
@@ -171,7 +171,7 @@ true true true
 | byte | `u8` | `'a'`, `'\n'`, `'\x41'`, `'\''` |
 | string | `str` where one is wanted, else `[u8]` | `"hello\n"` |
 | C string | `*u8`, NUL-terminated | `c"for C"` |
-| f-string | formatted text | `f"{name} is {age:>3}"` |
+| format string | a string literal, the first argument of `println`, `format_in`, `panic` | `"{name} is {age:>3}"` |
 | unit | `()` | `()` |
 
 Strings take the escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`,
@@ -184,8 +184,9 @@ A plain string literal is bytes, `[u8]`, unless it's used where a
 Then it's a `str`, which has the text methods (`trim`, `split`,
 `find`, ...). Chapter 7 explains the difference.
 
-In an f-string, `{expr}` is replaced by the value's text, and a *spec*
-after a colon shapes it: `{x:>8}` (right-aligned in 8 columns), `{x:<8}`
+In a format string, `{name}` is replaced by a variable's text and `{}`
+by the next argument's (an expression is an argument after the string,
+never inside the braces), and a *spec* after a colon shapes it: `{x:>8}` (right-aligned in 8 columns), `{x:<8}`
 (left), `{x:08}` (zero-padded), `{x:.2}` (2 decimals), `{x:x}` (hex),
 `{x:b}` (binary), `{b:c}` (a byte as a character), `{v:?}` (the Debug
 form). `{{` and `}}` are literal braces. Chapter 7 has more.

@@ -165,7 +165,7 @@ fn work() -> i64 {
 
 fn main() {
     work();
-    println(f"{work()}");
+    println("{}", work());
 }
 ```
 ```out

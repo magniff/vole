@@ -38,8 +38,8 @@ $ fix --suggested --dry-run
 -    if n {
 +    if n != 0 {
 @@ -29 +33 @@
--    let w = format(f"{t}");
-+    let w = format_in(f"{t}", gpa);
+-    let w = format(format_args("{t}"));
++    let w = format_in(format_args("{t}"), gpa);
 @@ -32 +36 @@
 -    let r = table::make(3);
 +    let r = table::make(3, gpa);
@@ -91,7 +91,7 @@ fixed 2 missing imports, 1 pub, 12 suggested fixes	2 files	+14 -10 lines
 // main.vl:29
 29	    if n != 0 {
 // main.vl:33
-33	    let w = format_in(f"{t}", gpa);
+33	    let w = format_in(format_args("{t}"), gpa);
 // main.vl:36
 36	    let r = table::make(3, gpa);
 // main.vl:38

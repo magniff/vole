@@ -135,8 +135,8 @@ about indentation, but `volec fmt` (which you'll meet later) lays code
 out this way, and every example in this book follows it.
 
 > **If you know Rust:** there are no macros in vole, so it's
-> `println(...)`, not `println!(...)`. Formatting values into text is
-> done with f-strings, which you'll see in the next chapter.
+> `println(...)`, not `println!(...)`, with the same format strings
+> (`println("{x} and {}", y)`), which you'll see in the next chapter.
 
 ## When things go wrong
 

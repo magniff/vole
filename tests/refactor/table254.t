@@ -18,9 +18,10 @@ $ refactor table ITEMS --dry-run
 @@ -11 +11 @@
 -use crate::items::{ITEM_COUNT, add_item, add_pair, drop_last, drop_some, reset_items, total};
 +use crate::items::{ITEMS, add_item, add_pair, drop_last, drop_some, reset_items, total};
-@@ -30 +30 @@
--    println(f"{ITEM_COUNT} {total()} {crate::items::PLACES} {crate::count::count()}");
-+    println(f"{ITEMS.len() as i64} {total()} {crate::items::PLACES} {crate::count::count()}");
+@@ -30 +30,2 @@
+-    println("{} {} {} {}", ITEM_COUNT, total(), crate::items::PLACES, crate::count::count());
++    println("{} {} {} {}", ITEMS.len() as i64, total(), crate::items::PLACES,
++        crate::count::count());
 --- a/count.vl
 +++ b/count.vl
 @@ -2 +1,0 @@
@@ -90,8 +91,8 @@ $ refactor table MARKS --dry-run
 --- a/main.vl
 +++ b/main.vl
 @@ -31 +31 @@
--    println(f"{crate::marks::MARK_COUNT} {last()} {crate::marks::seen(1)}");
-+    println(f"{crate::marks::MARKS.len() as i64} {last()} {crate::marks::seen(1)}");
+-    println("{} {} {}", crate::marks::MARK_COUNT, last(), crate::marks::seen(1));
++    println("{} {} {}", crate::marks::MARKS.len() as i64, last(), crate::marks::seen(1));
 --- a/marks.vl
 +++ b/marks.vl
 @@ -2 +1,0 @@
@@ -129,10 +130,10 @@ $ refactor table TOKS --dry-run
 -use crate::tokens::{TOK_COUNT, add_tok, reserve_toks};
 +use crate::tokens::{TOKS, add_tok, reserve_toks};
 @@ -32,2 +32,2 @@
--    println(f"{TOK_COUNT} {crate::tokens::tok(99)} {crate::report::report()}");
--    println(f"{crate::tokens::try_toks(5)} {TOK_COUNT}");
-+    println(f"{TOKS.len() as i64} {crate::tokens::tok(99)} {crate::report::report()}");
-+    println(f"{crate::tokens::try_toks(5)} {TOKS.len() as i64}");
+-    println("{} {} {}", TOK_COUNT, crate::tokens::tok(99), crate::report::report());
+-    println("{} {}", crate::tokens::try_toks(5), TOK_COUNT);
++    println("{} {} {}", TOKS.len() as i64, crate::tokens::tok(99), crate::report::report());
++    println("{} {}", crate::tokens::try_toks(5), TOKS.len() as i64);
 --- a/tokens.vl
 +++ b/tokens.vl
 @@ -2 +1,0 @@
@@ -209,7 +210,7 @@ try: volec query def Item
 [exit 1]
 ## The rewrites, written: the program prints what it printed.
 $ refactor table ITEMS
-made crate::items::ITEMS a Vec<Item, Comp>: 2 pushes, 10 len()s, 1 clear(), 2 truncate()s	4 files	+20 -24 lines
+made crate::items::ITEMS a Vec<Item, Comp>: 2 pushes, 10 len()s, 1 clear(), 2 truncate()s	4 files	+21 -24 lines
 note edit.imports: added the imports the new text needs (fix --only imports)
 note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
 try: volec fix --only unneeded-unsafe

@@ -27,7 +27,7 @@ fn main() {
         }
         x % 2 == 0
     };
-    println(f"{check(-2)} {check(4)} {check(3)}");
+    println("{} {} {}", check(-2), check(4), check(3));
 }
 ```
 
@@ -92,9 +92,9 @@ yours again.
 fn main() {
     var limit = 10;
     let over = |x: i64| x > limit;
-    println(f"{limit} {over(5)} {over(15)}");
+    println("{limit} {} {}", over(5), over(15));
     limit = 3;
-    println(f"{limit}");
+    println("{limit}");
 }
 ```
 
@@ -192,7 +192,7 @@ fn main() {
     var n = 1;
     let snapshot = sink || n;
     n += 100;
-    println(f"{snapshot()} {n}");
+    println("{} {n}", snapshot());
 }
 ```
 
@@ -346,10 +346,10 @@ fn main(gpa: Gpa) {
     }
     let even_squares = v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum();
     let big = v.iter().filter(|x| x > 2).count();
-    println(f"{even_squares} {big} {v.iter().max():?}");
+    println("{even_squares} {big} {:?}", v.iter().max());
 
     let tenfold: Vec<i64> = v.iter().map(|x| x * 10).collect_in(gpa);
-    println(f"{tenfold:?}");
+    println("{tenfold:?}");
 }
 ```
 
@@ -371,12 +371,12 @@ something asks for values:
 ```vole
 fn main() {
     let tens = (1..4).map(|x| {
-        println(f"  making {x * 10}");
+        println("  making {}", x * 10);
         x * 10
     });
     println("nothing made yet");
     for t in tens {
-        println(f"got {t}");
+        println("got {t}");
     }
 }
 ```
@@ -403,17 +403,17 @@ Here are the ones std has, by example:
 fn main() {
     let words: [str; 3] = ["ant", "bee", "cat"];
     for (i, w) in words.iter().enumerate() {
-        print(f"{i}:{w} ");
+        print("{i}:{w} ");
     }
     println("");
 
     let dot = (1..4).zip(10..13).map(|(a, b)| a * b).sum();
     let product = (1..6).fold(1, |acc, x| acc * x);
     let first_three: i64 = (1..100).take(3).sum();
-    println(f"{dot} {product} {first_three}");
+    println("{dot} {product} {first_three}");
 
-    println(f"{(1..20).find(|x| x * x > 50):?} {(1..20).position(|x| x == 5):?}");
-    println(f"{(1..5).any(|x| x > 3)} {(1..5).all(|x| x > 3)} {(1..5).min():?}");
+    println("{:?} {:?}", (1..20).find(|x| x * x > 50), (1..20).position(|x| x == 5));
+    println("{} {} {:?}", (1..5).any(|x| x > 3), (1..5).all(|x| x > 3), (1..5).min());
 }
 ```
 
@@ -481,13 +481,13 @@ fn main(gpa: Gpa) {
     for line in text.lines() {
         match parse(line) {
             Some(r) => reqs.push(r),
-            None => println(f"skipped: {line}"),
+            None => println("skipped: {line}"),
         }
     }
 
     let ok_bytes = reqs.iter().filter(|r| r.status < 400).map(|r| r.bytes).sum();
     let failed = reqs.iter().filter(|r| r.status >= 400).count();
-    println(f"{reqs.len()} requests, {failed} failed, {ok_bytes} bytes served");
+    println("{} requests, {failed} failed, {ok_bytes} bytes served", reqs.len());
 
     var by_status: HashMap<i64, i64> = HashMap::new_in(gpa);
     reqs.iter().for_each(|r| {
@@ -496,17 +496,17 @@ fn main(gpa: Gpa) {
     var codes: Vec<i64> = by_status.keys().collect_in(gpa);
     codes.sort();
     for code in codes {
-        println(f"  {code}: {by_status.get(code).unwrap()}");
+        println("  {code}: {}", by_status.get(code).unwrap());
     }
 
     match reqs.iter().map(|r| (r.ms, r.path)).max() {
-        Some((ms, path)) => println(f"slowest: {path} ({ms} ms)"),
+        Some((ms, path)) => println("slowest: {path} ({ms} ms)"),
         None => println("no requests"),
     }
 
     var broken: Vec<str> = reqs.iter().filter(|r| r.status >= 400).map(|r| r.path).collect_in(gpa);
     broken.sort_by(|a, b| a.cmp(b));
-    println(f"failed paths: {broken:?}");
+    println("failed paths: {broken:?}");
 }
 ```
 
@@ -583,13 +583,13 @@ fn fibonacci() -> Fibonacci {
 
 fn main(gpa: Gpa) {
     for n in fibonacci().take(10) {
-        print(f"{n} ");
+        print("{n} ");
     }
     println("");
     let even_sum = fibonacci().take(30).filter(|n| n % 2 == 0).sum();
     let first_big = fibonacci().position(|n| n > 1000);
     let five: Vec<i64> = fibonacci().take(5).collect_in(gpa);
-    println(f"{even_sum} {first_big:?} {five:?}");
+    println("{even_sum} {first_big:?} {five:?}");
 }
 ```
 

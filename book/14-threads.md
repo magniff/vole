@@ -56,7 +56,7 @@ fn main(gpa: Gpa) {
     });
     println("started a thread");
     let total = h.join();
-    println(f"the thread says: {total}");
+    println("the thread says: {total}");
 }
 ```
 
@@ -88,7 +88,7 @@ fn main(gpa: Gpa) {
     }
     let xs = v.as_slice();
     let h = thread::spawn(sink || xs.len());
-    println(f"{h.join()}");
+    println("{}", h.join());
 }
 ```
 
@@ -114,7 +114,7 @@ fn main() {
         let i = 3;
         v[i]
     });
-    println(f"{h.join()}");
+    println("{}", h.join());
     println("not reached");
 }
 ```
@@ -159,7 +159,7 @@ fn main(gpa: Gpa) {
         let b = s.spawn(|| sum(xs[half..]));
         a.join() + b.join()
     });
-    println(f"two threads: {total}");
+    println("two threads: {total}");
 
     let n = thread::available_parallelism() as usize;
     let chunk = (xs.len() + n - 1) / n;
@@ -176,7 +176,7 @@ fn main(gpa: Gpa) {
         }
         t
     });
-    println(f"one thread per core: {total}");
+    println("one thread per core: {total}");
 }
 ```
 
@@ -248,7 +248,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes: {primes}");
+    println("primes: {primes}");
 }
 ```
 
@@ -321,7 +321,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes (mutex): {primes.with(|n| n)}");
+    println("primes (mutex): {}", primes.with(|n| n));
 
     let count = AtomicI64::new(0);
     thread::scope(|s| {
@@ -340,7 +340,7 @@ fn main(gpa: Gpa) {
             }
         });
     });
-    println(f"primes (atomic): {count.load(Ordering::Relaxed)}");
+    println("primes (atomic): {}", count.load(Ordering::Relaxed));
 }
 ```
 
@@ -444,7 +444,7 @@ fn main(gpa: Gpa) {
     });
     results.sort();
     for (i, h) in results {
-        println(f"{lines[i]:<8} {h:016x}");
+        println("{:<8} {h:016x}", lines[i]);
     }
 }
 ```
@@ -515,7 +515,7 @@ fn main() {
         0
     });
     bump();
-    println(f"{h.join()} {COUNT}");
+    println("{} {COUNT}", h.join());
 }
 ```
 
@@ -550,7 +550,7 @@ fn work() -> i64 {
 fn main() {
     let h = thread::spawn(sink || work());
     CALLS = 100;
-    println(f"the thread counted {h.join()}, main has {CALLS}");
+    println("the thread counted {}, main has {CALLS}", h.join());
 }
 ```
 
@@ -593,7 +593,7 @@ fn main() {
     var x = 5;
     let p: *i64 = &x;
     let h = thread::spawn(sink || unsafe { *p });
-    println(f"{h.join()}");
+    println("{}", h.join());
 }
 ```
 

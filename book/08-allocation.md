@@ -45,7 +45,7 @@ fn lengths(words: [str], gpa: Gpa) -> Vec<usize> {
 
 fn main(gpa: Gpa) {
     let words: [str; 3] = ["vole", "mouse", "shrew"];
-    println(f"{longest(words)} {lengths(words, gpa):?}");
+    println("{} {:?}", longest(words), lengths(words, gpa));
 }
 ```
 
@@ -121,9 +121,9 @@ fn handle(line: str, gpa: Gpa) -> String {
     };
     let parts = split_path(path, gpa);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -133,7 +133,7 @@ fn main(gpa: Gpa) {
     let text = str::from_utf8(input.as_slice()).unwrap();
     for line in text.lines() {
         let reply = handle(line, gpa);
-        println(f"{line:<24} -> {reply}");
+        println("{line:<24} -> {reply}");
     }
 }
 ```
@@ -179,7 +179,7 @@ fn split_path(path: str) -> Vec<str> {
 
 fn main(gpa: Gpa) {
     let parts = split_path("/users/ada");
-    println(f"{parts:?}");
+    println("{parts:?}");
 }
 ```
 
@@ -207,7 +207,7 @@ Where does the memory go back? Look at the loop in `main` again:
 ```vole skip
     for line in text.lines() {
         let reply = handle(line, gpa);
-        println(f"{line:<24} -> {reply}");
+        println("{line:<24} -> {reply}");
     }
 ```
 
@@ -331,7 +331,7 @@ fn main(gpa: Gpa) {
         fill(&scratch, 4);
         total(scratch)
     });
-    println(f"{total(on_heap)} {from_arena}");
+    println("{} {from_arena}", total(on_heap));
 }
 ```
 
@@ -370,9 +370,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -384,14 +384,14 @@ fn main(gpa: Gpa) {
     for line in text.lines() {
         let used = arena_scope(gpa, |a| {
             let reply = handle(line, a);
-            println(f"{line:<24} -> {reply}");
+            println("{line:<24} -> {reply}");
             a.used()
         });
         if used > most {
             most = used;
         }
     }
-    println(f"at most {most} bytes per request");
+    println("at most {most} bytes per request");
 }
 ```
 
@@ -491,9 +491,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
     };
     let parts = split_path(path, a);
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -509,7 +509,7 @@ fn main() {
     for line in requests {
         let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
-        println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
+        println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
@@ -580,9 +580,9 @@ fn handle<A: Allocator>(line: str, a: A) -> String<A> {
         }
     };
     if method == "GET" && parts.len() == 2 && parts[0] == "users" {
-        out.push_fmt(f"200 user {parts[1]}");
+        out.push_fmt("200 user {}", parts[1]);
     } else {
-        out.push_fmt(f"404 no page {path}");
+        out.push_fmt("404 no page {path}");
     }
     out
 }
@@ -598,7 +598,7 @@ fn main() {
     for line in requests {
         let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
-        println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
+        println("{line:<24} -> {reply} ({} bytes)", fb.used());
     }
 }
 ```
@@ -634,7 +634,7 @@ That's allowed in safe code, but it's rarely what you want:
 fn main(gpa: Gpa) {
     var log = String::new_in(gpa);
     log.push_str("a reply nobody frees");
-    println(f"{log}");
+    println("{log}");
     std::forget(log);
 }
 ```

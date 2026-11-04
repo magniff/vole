@@ -9,7 +9,7 @@ i64	half(v)?
 $ type types015/main.vl:15:18 types015/main.vl:16:9
 i32 (widened to i64)	n
 i32 (widened to i64)	n
-$ type types015/main.vl:23:20 types015/main.vl:23:37 types015/main.vl:23:53
+$ type types015/main.vl:23:19 types015/main.vl:23:52 types015/main.vl:23:43
 P	p
 i64	p.x + q.y
 i32	n

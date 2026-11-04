@@ -42,7 +42,7 @@ are the way they are. It is not a specification. For precise rules, see
 6. [Errors: Option, Result and panics](06-errors.md): error types, the
    `?` operator, `main` returning a `Result`, panics, a first `requires`
 7. [Collections and text](07-collections-and-text.md): `Vec`, slices,
-   `HashMap` and friends, `str` and `String`, bytes, f-strings, and a
+   `HashMap` and friends, `str` and `String`, bytes, format strings, and a
    word counter
 8. [Allocation: where memory comes from](08-allocation.md): explicit
    allocators, arenas, `FixedBuf`, `--check-alloc`

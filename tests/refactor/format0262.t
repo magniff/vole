@@ -36,7 +36,7 @@ example:
     error[format.args] this argument is never used: no hole of the format string takes it | help: write a hole for it, '{}', or remove it
 $ explain format.expr-hole
 format.expr-hole: error
-(0.26.2) A hole of a format literal holding an expression, `{p.a}`, `{x + 1}`, `{v.len()}`: a hole names a local, a parameter, a `const` or a `static` (Rust 2021's inline captures), or takes the next argument. (An f-string's hole, `f"{p.a}"`, holds any expression, until f-strings go in 0.28.)
+(0.26.2) A hole of a format literal holding an expression, `{p.a}`, `{x + 1}`, `{v.len()}`: a hole names a local, a parameter, a `const` or a `static` (Rust 2021's inline captures), or takes the next argument. (An f-string's hole, `f"{p.a}"`, held any expression; f-strings are removed in 0.26.3, `syntax.fstring`.)
 fix: Write `{}` and pass the expression after the literal: `println("{}", p.a)` (`volec fix --suggested` moves it).
 example:
     error[format.expr-hole] '{p.a}': a hole of a format string holds a name, not an expression | help: write '{}' and pass the expression after the format string, as Rust does: 'println("{} {x}", a.b)'
