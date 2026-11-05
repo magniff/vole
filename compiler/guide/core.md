@@ -203,7 +203,7 @@ or `volec guide TOPIC#SECTION` prints the lines on it; `volec
 try 'CODE'` runs a snippet. For an unfamiliar item, ask
 `volec query context NAME` first: its source, what it calls and its
 callers in one call (`query context parse_args`). Edits, refactorings
-and the other queries: `volec guide tools`.
+and other queries: `volec guide tools`.
 
 Topics (`volec guide TOPIC`, `TOPIC#` lists its sections):
 @TOPIC-NAMES@

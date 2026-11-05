@@ -1,0 +1,245 @@
+// (0.27.0) The rust edition in the type checker (front/rust): what Rust's
+// references add to the checker's 0.19 meanings, which are Rust's already
+// (a `&T` is a value, `*r` explicit, receivers and fields reached through
+// references). Here: std's Deref and DerefMut (`*x`, a field, a method
+// through a type that implements them), Index and IndexMut on a type the
+// checker does not index itself (`c[i]` is `*c.index(i)`, `*c.index_mut(i)`
+// where it is written). Each rewrites the node in place, as the checker's
+// other desugarings do, and the caller checks it again.
+
+use crate::base::intern_c;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::check::calls::method_of;
+use crate::front::lexer::Tok;
+use crate::front::types::{REF_MUT, TYPES, TyKind, fn_param};
+
+// Whether node n is read in the rust edition.
+pub fn rust_node(n: i64, pcx: inout Ctx<Comp>) -> bool {
+    pcx.edition != 0 && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx)
+}
+
+// Whether node n is on the path of the place being written or lent
+// exclusively (MUT_PLACE: an assignment's target, `&mut e`'s e), through
+// fields, indexes and derefs.
+fn on_mut_path(n: i64, pcx: Ctx<Comp>) -> bool {
+    var p = pcx.mut_place;
+    for _ in 0..1000 {
+        if p == 0 {
+            return false;
+        }
+        if p == n {
+            return true;
+        }
+        let k = pcx.nodes[p].kind;
+        if k == NodeKind::Unary && pcx.nodes[p].op == Tok::Star {
+            p = pcx.nodes[p].b;
+        } else if k == NodeKind::Index || k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            p = pcx.nodes[p].a;
+        } else {
+            return false;
+        }
+    }
+    false
+}
+
+// Whether a value of type t has method `name` (its impls', a trait's
+// impl's among them).
+fn has_method(t: i64, name: *u8, pcx: inout Ctx<Comp>) -> bool {
+    t > 0 && (method_of(t, intern_c(name), pcx) >= 0
+        || crate::front::convert::has_generic_trait_fn(t, intern_c(name), &pcx))
+}
+
+// `e.name(args)`: a MethodCall node at e's span (args: a list made with
+// list_begin's mark, or -1 for none).
+fn method_call(e: i64, name: *u8, arg: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let call = new_node(NodeKind::MethodCall, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[call].a = e;
+    pcx.nodes[call].b = intern_c(name);
+    let mark = list_begin(pcx);
+    if arg != 0 {
+        list_push(arg, &pcx);
+    }
+    list_end(call, mark, &pcx);
+    call
+}
+
+// `*e` of a type t that is not a pointer (synth_unary): through Deref,
+// `*e.deref()` (`*e.deref_mut()` in a place written); true when the
+// operand of n was so rewritten.
+pub fn deref_operand(n: i64, e: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    if !has_method(t, c"deref", &pcx) {
+        return false;
+    }
+    let name = if on_mut_path(n, pcx) && has_method(t, c"deref_mut", &pcx) { c"deref_mut" }
+        else { c"deref" };
+    pcx.nodes[n].b = method_call(e, name, 0, &pcx);
+    true
+}
+
+// A field `f` that type t (not a pointer, a struct without that field)
+// does not have, at field access n of base e: through Deref, `(*e.deref()).f`
+// (deref_mut when written); true when the base was so rewritten.
+pub fn deref_field_base(n: i64, e: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    if !has_method(t, c"deref", &pcx) {
+        return false;
+    }
+    let name = if on_mut_path(n, pcx) && has_method(t, c"deref_mut", &pcx) { c"deref_mut" }
+        else { c"deref" };
+    let call = method_call(e, name, 0, &pcx);
+    let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[u].op = Tok::Star;
+    pcx.nodes[u].b = call;
+    pcx.nodes[n].a = u;
+    true
+}
+
+// A method `name` that the receiver's type t does not have, at method call
+// n: through Deref when the target type has it, the receiver
+// `*e.deref()` (deref_mut when the method takes `&mut self`); true when
+// rewritten.
+pub fn deref_receiver(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    if !has_method(t, c"deref", &pcx) {
+        return false;
+    }
+    let target = deref_target(t, pcx);
+    if target <= 0 || method_of(target, name, pcx) < 0 && !has_method(target, c"deref", &pcx) {
+        return false;
+    }
+    let m = method_of(target, name, pcx);
+    let mutable = m >= 0 && pcx.fn_count > m && fn_param_count(m, pcx) > 0
+        && TYPES[fn_param(m, 0, pcx)].kind == TyKind::Ptr
+        && TYPES[fn_param(m, 0, pcx)].b == REF_MUT;
+    let e = pcx.nodes[n].a;
+    let call = method_call(e, if mutable && has_method(t, c"deref_mut", &pcx) { c"deref_mut" }
+        else { c"deref" }, 0, &pcx);
+    let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[u].op = Tok::Star;
+    pcx.nodes[u].b = call;
+    pcx.nodes[n].a = u;
+    true
+}
+
+// The number of parameters of function f.
+fn fn_param_count(f: i64, pcx: Ctx<Comp>) -> i64 {
+    // UNSAFE: FNS is the checker's raw table of functions
+    // SAFETY: f is a function of the table (0 <= f < fn_count, checked by
+    // the callers)
+    unsafe { pcx.fns[f].param_count }
+}
+
+// The type `deref` of t returns a reference to (0: none known).
+fn deref_target(t: i64, pcx: Ctx<Comp>) -> i64 {
+    let f = method_of(t, intern_c(c"deref"), pcx);
+    if f < 0 || f >= pcx.fn_count {
+        return 0;
+    }
+    // UNSAFE: FNS is the checker's raw table of functions
+    // SAFETY: 0 <= f < fn_count, checked above
+    let r = unsafe { pcx.fns[f].ret };
+    if r > 0 && TYPES[r].kind == TyKind::Ptr {
+        return TYPES[r].a;
+    }
+    0
+}
+
+// `c[i]` (index node n) on a type t the checker does not index: through
+// Index, `*c.index(i)` (`*c.index_mut(i)` in a place written); n becomes
+// that Unary. True when rewritten.
+pub fn index_through_trait(n: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    if TYPES[t].kind != TyKind::Struct && TYPES[t].kind != TyKind::Enum
+        || !has_method(t, c"index", &pcx) {
+        return false;
+    }
+    let name = if on_mut_path(n, pcx) && has_method(t, c"index_mut", &pcx) { c"index_mut" }
+        else { c"index" };
+    let call = method_call(pcx.nodes[n].a, name, pcx.nodes[n].b, &pcx);
+    pcx.nodes[n].kind = NodeKind::Unary;
+    pcx.nodes[n].op = Tok::Star;
+    pcx.nodes[n].b = call;
+    pcx.nodes[n].a = 0;
+    true
+}
+
+// (0.27.0) `*e` of a value that is no reference and has no Deref, in the
+// rust edition: edition.std_copy. The rust edition runs on MVS std in
+// 0.27.0, whose iterators and getters (`iter()`, `get`, `last`, `next`)
+// give copies where Rust's give `&T`: the value is used as it is.
+pub fn std_copy_error(n: i64, e: i64, t: i64, pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"edition.std_copy";
+    crate::base::diag::err_begin(pcx.nodes[n].start, &pcx);
+    crate::base::diag::err_str(c"'", pcx);
+    let text = crate::base::SRC[pcx.nodes[e].start..pcx.nodes[e].end];
+    crate::base::diag::err_fmt(format_args("{text}' is a '"), pcx);
+    crate::front::types::err_type(t, pcx);
+    crate::base::diag::err_str(c"', not a reference: `*` takes a reference or a raw pointer",
+        pcx);
+    crate::base::diag::err_help(c"in 0.27.0 the rust edition runs on MVS std, whose iterators and getters (`iter()`, `get`, `last`, `next`) give copies where Rust's give `&T` (0.27.2's std gives references): use the value as it is", pcx);
+    crate::base::diag::err_try_fmt(format_args("{text}"), pcx);
+    crate::base::diag::err_fix(pcx.nodes[n].start, pcx.nodes[n].end, text, &pcx);
+    crate::base::diag::err_end_soft(&pcx);
+    pcx.err_kind = saved;
+}
+
+// (0.27.0) Local l, declared with type node t: kept when t is `*const T`
+// (front/parser/rust.vl: its TyPtr's c is 1), for const_write.
+pub fn note_const_ptr(l: i64, t: i64, pcx: inout Ctx<Comp>) {
+    if l >= 0 && t > 0 && pcx.nodes[t].kind == NodeKind::TyPtr && pcx.nodes[t].c == 1
+        && (pcx.nodes[t].p & crate::front::ast::NODE_REF) == 0 {
+        pcx.const_ptrs.push(l);
+    }
+}
+
+// (0.27.0) An assignment's target: `*p` (also `(*p).f`, `p[i]`) where p
+// is a local declared `*const T` is edition.later (const_ptr_write,
+// 0.27.1): both raw pointers are `*T` in 0.27.0, so the write is not
+// refused yet; it is counted.
+pub fn const_write(target: i64, pcx: inout Ctx<Comp>) {
+    var e = target;
+    for _ in 0..100 {
+        let k = pcx.nodes[e].kind;
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+            e = pcx.nodes[e].a;
+        } else {
+            break;
+        }
+    }
+    if pcx.nodes[e].kind != NodeKind::Unary || pcx.nodes[e].op != Tok::Star {
+        return;
+    }
+    let p = pcx.nodes[e].b;
+    if pcx.nodes[p].kind != NodeKind::Ident || pcx.nodes[p].res != crate::front::check::Res::Local {
+        return;
+    }
+    for i in 0..pcx.const_ptrs.count {
+        if pcx.const_ptrs.get(i) == pcx.nodes[p].y {
+            crate::front::rust::later(pcx.nodes[target].start, pcx.nodes[target].end,
+                "const_ptr_write", "0.27.1", &pcx);
+            return;
+        }
+    }
+}
+
+// (0.27.0) `&x` given where a value of type t goes, in the rust edition:
+// edition.std_by_value. MVS std takes some arguments by value (`sink`:
+// `v.contains(x)`, `m.insert(k, v)`) where Rust's takes `&T`; 0.27.2's std
+// takes references.
+pub fn std_by_value_error(n: i64, t: i64, pcx: inout Ctx<Comp>) -> ! {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"edition.std_by_value";
+    crate::base::diag::err_begin(pcx.nodes[n].start, &pcx);
+    crate::base::diag::err_str(c"a reference where a '", pcx);
+    crate::front::types::err_type(t, pcx);
+    crate::base::diag::err_str(c"' goes: the parameter takes the value", pcx);
+    crate::base::diag::err_help(c"pass the value: `*x` of a copyable value, `x.clone()`, or `x` to move it; in 0.27.0 the rust edition runs on MVS std, which takes some arguments by value (`v.contains(x)`, `m.insert(k, v)`) where Rust's takes `&T` (0.27.2's std takes references)", pcx);
+    if pcx.nodes[n].kind == NodeKind::Unary && pcx.nodes[n].b > 0 {
+        let e = pcx.nodes[n].b;
+        let text = crate::base::SRC[pcx.nodes[e].start..pcx.nodes[e].end];
+        crate::base::diag::err_try_fmt(format_args("{text}.clone()"), pcx);
+    }
+    crate::base::diag::err_end_soft(&pcx);
+    pcx.err_kind = saved;
+    crate::base::diag::err_jump(&pcx)
+}
