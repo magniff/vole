@@ -2874,3 +2874,15 @@ stress-grow, cachediff 1461 lines (425 from the cache), unsafe-audit
 3057 unjustified (baseline 3057, from 3217) and 0 in std, chain-diverse,
 chain-fresh 39 releases. compile-cost against v0.26.4: a hello world
 1.00x, std 1.01x, check of the compiler 0.95x.
+
+### 0.27.0
+
+The release gate (`gate.sh --release --no-linux`), macOS only: every
+row passed on the first run (54:09 wall). The suite 4767 at -O0, -O1
+and -O2 (69 XFAIL; SKIPPED: no spirv-val), threads 9100, incremental
+172 series, objcheck 6136 (and 256 for x86_64-macos), compiler-memcheck
+727, examples-checkalloc 183, every fuzz and ABI row (fuzz-sem 300
+programs), stress-grow, cachediff 1471 lines (425 from the cache),
+unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
+chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
+hello world 1.00x, std 0.99x, check of the compiler 1.01x.
