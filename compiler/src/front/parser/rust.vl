@@ -1,0 +1,239 @@
+// (0.27.0) The rust edition's syntax, the parts the MVS parser has no
+// form for: lifetimes (`'a` in generics, type arguments, `&'a T`, bounds
+// and `where`), the receivers `&self`, `&mut self`, `&'a self`, `mut
+// self`, and the raw pointers `*const T` / `*mut T`. The rest of Rust's
+// spelling (`&T`, `&mut x`, `let mut`, `mut x: T`, `static mut`, `move ||`,
+// `*r`) is what the parser reads in a file that is not strict
+// (conv::strict_at is false in the rust edition), with 0.19's meanings,
+// which are Rust's.
+//
+// Lifetimes are erased from the types (front/types interns no region);
+// the parser keeps them for the region maps (front/rust/regions): a
+// lifetime is a TyName node (a = its symbol; a parameter's `'a: 'b`
+// bounds, lifetimes too, in h), the lifetimes of one list in a Generics
+// holder, and pcx.lt_items the pairs (node, holder): an item's for its
+// generics, a TyName's for its type arguments. A reference's lifetime is
+// the c of its TyPtr (0: none written).
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{
+    NODE_REF, NODE_REF_MUT, NodeKind, list_begin, list_end, list_push, new_node,
+};
+use crate::front::lexer::Tok;
+use crate::front::parser::{advance, at, cur_start, eat, prev_end, tok_kind};
+
+// Whether the parser is at a token of a rust-edition file.
+pub fn rust_here(pcx: inout Ctx<Comp>) -> bool {
+    pcx.edition != 0 && crate::front::rust::rust_at(cur_start(pcx), &pcx)
+}
+
+// The token at the parser is a lifetime: its symbol (0: it is not one).
+pub fn lifetime_sym(pcx: Ctx<Comp>) -> i64 {
+    if !at(Tok::Lifetime, pcx) {
+        return 0;
+    }
+    // UNSAFE: TOKS is the lexer's raw token array (no safe view of it in the parser)
+    // SAFETY: P is a token of the array: the parser stops at its Eof, which is last
+    unsafe { pcx.toks[pcx.p].value as i64 }
+}
+
+// Before a list that may hold lifetimes: the mark lifetimes_end takes.
+pub fn lifetimes_begin(pcx: Ctx<Comp>) -> i64 {
+    pcx.lt_scratch.count
+}
+
+// At a lifetime in a list (a generic parameter when `param`, with its
+// bounds `'a: 'b + 'c`; else a type argument): its node is kept for
+// lifetimes_end, and the token taken; false at anything else.
+pub fn take_lifetime(param: bool, pcx: inout Ctx<Comp>) -> bool {
+    let sym = lifetime_sym(pcx);
+    if sym == 0 {
+        return false;
+    }
+    let n = new_node(NodeKind::TyName, cur_start(pcx), 0, &pcx);
+    pcx.nodes[n].a = sym;
+    advance(&pcx);
+    if param && eat(Tok::Colon, &pcx) {
+        let bounds = new_node(NodeKind::Generics, cur_start(pcx), 0, &pcx);
+        let mark = list_begin(pcx);
+        loop {
+            let b = lifetime_sym(pcx);
+            if b == 0 {
+                break;
+            }
+            let bn = new_node(NodeKind::TyName, cur_start(pcx), 0, &pcx);
+            pcx.nodes[bn].a = b;
+            advance(&pcx);
+            pcx.nodes[bn].end = prev_end(pcx);
+            list_push(bn, &pcx);
+            if !eat(Tok::Plus, &pcx) {
+                break;
+            }
+        }
+        list_end(bounds, mark, &pcx);
+        pcx.nodes[bounds].end = prev_end(pcx);
+        pcx.nodes[n].h = bounds;
+    }
+    pcx.nodes[n].end = prev_end(pcx);
+    pcx.lt_scratch.push(n);
+    true
+}
+
+// After the list: the lifetimes taken since mark, as a Generics holder in
+// pcx.lt_last (0 when there were none), for bind_lifetimes.
+pub fn lifetimes_end(mark: i64, pcx: inout Ctx<Comp>) {
+    pcx.lt_last = 0;
+    if pcx.lt_scratch.count == mark {
+        return;
+    }
+    let first = pcx.lt_scratch.get(mark);
+    let holder = new_node(NodeKind::Generics, pcx.nodes[first].start, prev_end(pcx), &pcx);
+    let lmark = list_begin(pcx);
+    for i in mark..pcx.lt_scratch.count {
+        list_push(pcx.lt_scratch.get(i), &pcx);
+    }
+    list_end(holder, lmark, &pcx);
+    pcx.lt_scratch.count = mark;
+    pcx.lt_last = holder;
+}
+
+// The lifetimes of the list just parsed (lifetimes_end) are node n's.
+pub fn bind_lifetimes(n: i64, pcx: inout Ctx<Comp>) {
+    if pcx.lt_last == 0 {
+        return;
+    }
+    pcx.lt_items.push(n);
+    pcx.lt_items.push(pcx.lt_last);
+    pcx.lt_last = 0;
+}
+
+// The lifetimes holder bound to node n (0: none).
+pub fn lifetimes_of(n: i64, pcx: Ctx<Comp>) -> i64 {
+    var i = 0;
+    while i + 1 < pcx.lt_items.count {
+        if pcx.lt_items.get(i) == n {
+            return pcx.lt_items.get(i + 1);
+        }
+        i += 2;
+    }
+    0
+}
+
+// At a lifetime bound in a list of bounds (`T: 'a + Clone`): taken
+// (0.27.1's outlives facts read it from the source), true.
+pub fn skip_lifetime_bound(pcx: inout Ctx<Comp>) -> bool {
+    if !at(Tok::Lifetime, pcx) {
+        return false;
+    }
+    advance(&pcx);
+    true
+}
+
+// At a `where` predicate on a lifetime, `'a: 'b + 'c`: taken, true.
+pub fn skip_lifetime_predicate(pcx: inout Ctx<Comp>) -> bool {
+    if !at(Tok::Lifetime, pcx) || tok_kind(1, pcx) != Tok::Colon {
+        return false;
+    }
+    advance(&pcx);
+    advance(&pcx);
+    while at(Tok::Lifetime, pcx) {
+        advance(&pcx);
+        if !eat(Tok::Plus, &pcx) {
+            break;
+        }
+    }
+    true
+}
+
+// After `&` in a type: its lifetime, taken (0: none written).
+pub fn ref_lifetime(pcx: inout Ctx<Comp>) -> i64 {
+    let sym = lifetime_sym(pcx);
+    if sym != 0 {
+        advance(&pcx);
+    }
+    sym
+}
+
+// Whether the token i ahead is the identifier `self`.
+fn self_at(i: i64, pcx: Ctx<Comp>) -> bool {
+    // UNSAFE: TOKS is the lexer's raw token array (no safe view of it in the parser)
+    // SAFETY: tok_kind says the token is an identifier, so P + i is a token
+    // of the array (the parser stops at its Eof, which is last)
+    unsafe {
+        tok_kind(i, pcx) == Tok::Ident
+            && crate::base::SYMS[pcx.toks[pcx.p + i].value as i64].text == "self"
+    }
+}
+
+// Whether token i ahead ends a parameter.
+fn param_end_at(i: i64, pcx: Ctx<Comp>) -> bool {
+    tok_kind(i, pcx) == Tok::Comma || tok_kind(i, pcx) == Tok::RParen
+}
+
+// At a receiver of the rust edition (`self`, `mut self`, `&self`, `&mut
+// self`, `&'a self`, `&'a mut self`): its Param node, the 0.19 shape
+// (`self: Self`, `self: &Self`, `self: &mut Self`, by type: no
+// convention flags); 0 at any other parameter (nothing taken).
+pub fn receiver(start: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var k = 0;
+    var by_ref = false;
+    var mutable = false;
+    if at(Tok::Amp, pcx) {
+        by_ref = true;
+        k = 1;
+        if tok_kind(k, pcx) == Tok::Lifetime {
+            k += 1;
+        }
+    }
+    if tok_kind(k, pcx) == Tok::Mut {
+        mutable = true;
+        k += 1;
+    }
+    if !self_at(k, pcx) || !param_end_at(k + 1, pcx) {
+        return 0;
+    }
+    var lt = 0;
+    if by_ref {
+        advance(&pcx);
+        lt = ref_lifetime(&pcx);
+    }
+    if mutable {
+        advance(&pcx);
+    }
+    let n = new_node(NodeKind::Param, start, 0, &pcx);
+    let name_start = cur_start(pcx);
+    // UNSAFE: TOKS is the lexer's raw token array (no safe view of it in the parser)
+    // SAFETY: self_at said the token at P is the identifier `self`
+    pcx.nodes[n].a = unsafe { pcx.toks[pcx.p].value as i64 };
+    advance(&pcx);
+    let name = new_node(NodeKind::TyName, name_start, prev_end(pcx), &pcx);
+    pcx.nodes[name].a = crate::base::intern_c(c"Self");
+    if by_ref {
+        let t = new_node(NodeKind::TyPtr, start, prev_end(pcx), &pcx);
+        pcx.nodes[t].a = name;
+        pcx.nodes[t].c = lt;
+        pcx.nodes[t].p |= if mutable { NODE_REF | NODE_REF_MUT } else { NODE_REF };
+        pcx.nodes[n].b = t;
+    } else {
+        pcx.nodes[n].b = name;
+        pcx.nodes[n].c = mutable as i64;
+    }
+    pcx.nodes[n].end = prev_end(pcx);
+    n
+}
+
+// After `*` in a type of the rust edition: `const` or `mut`, taken (a raw
+// pointer: both are vole's `*T` in 0.27.0, the write through a `*const`
+// is edition.later); its node's c is 1 for `*const`, 2 for `*mut`.
+pub fn raw_pointer_kind(pcx: inout Ctx<Comp>) -> i64 {
+    if eat(Tok::Const, &pcx) {
+        return 1;
+    }
+    if eat(Tok::Mut, &pcx) {
+        return 2;
+    }
+    crate::base::diag::error_at(cur_start(pcx),
+        c"a raw pointer is '*const T' or '*mut T' in the rust edition", &pcx);
+    0
+}
