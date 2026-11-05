@@ -117,8 +117,14 @@ The borrow checker (bc271):
   the optimizer's reference-parameter facts only with a clean verdict
   (0.27.0 miscompiled `f(&mut x, &mut x)` at -O2 with them on).
 - Known holes, each counted: closure bodies through the raw env
-  (`borrowck.unchecked`, 0.27.2), MVS std's hidden views (0.27.2 with
-  std2), the guard's fake borrows (with ir271's `BK_FAKE`).
+  (`warning borrowck.unchecked`, one per closure body: 106 in 32 of the
+  284 rust_ cases, every one a closure body; the runner's
+  `--allow=borrowck.unchecked` for rust-edition cases stays until 0.27.2
+  types the environment), MVS std's hidden views (0.27.2 with std2), a
+  by-`&` capture of a shared view copied until Z9 (R12). The budget:
+  borrowck 4.4 ms against typeck 339.4 ms over the corpus (0.013, the
+  bound 0.25; the largest case 0.065); compiler/src (MVS) gets no
+  `borrowck` row.
 
 The borrow checker's corpus and its rustc twin (corpus271):
 
