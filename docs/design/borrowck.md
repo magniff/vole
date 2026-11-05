@@ -747,7 +747,12 @@ unless named, at the access's statement.
   an `SK_MENTION` of `Q` at `p` with `path(Q) = m` requires `DefInit(m',
   2·loc(p))` for `m` and every descendant `m'` (deep); when `Q` has no
   path (through `*`, an index, a union), it requires `DefInit` of
-  `base(Q)`; with no base, no check.
+  `base(Q)`; with no base, no check. A discriminant read (`RV_DISCR`)
+  is not checked: elaboration's opened drops read the tag of a
+  partially moved enum, and a `match` on a moved enum is caught at its
+  payload's read; a length read (`RV_LEN`) requires `DefInit(m)` of
+  the path alone (shallow, as D2.2 says). A place reached through a raw
+  pointer (a deferred closure body's env, D10.4) is not checked (R1).
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
   L.π`, `π ≠ ∅`: requires `DefInit` of every strict-prefix path of `Q`;
   a prefix that was initialized and then moved (`MaybeUninit` by a move,

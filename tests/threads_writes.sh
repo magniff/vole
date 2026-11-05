@@ -222,6 +222,7 @@ front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
 front::lexer::STR_CAP	IR: the same (no string is made in a task)
 front::lexer::STR_COUNT	IR: the same
 base::ctx::Ctx.own_mode	key: options_hash
+base::ctx::Ctx.edition	key: options_hash (0.27.1: a rust body gets no parameter alias facts, gvn noalias_active)
 front::types::ENUMS	key: types_hash
 front::types::FIELDS	key: types_hash
 base::ctx::Ctx.fns	IR: a function by fn_canon
