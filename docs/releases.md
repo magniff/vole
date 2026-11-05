@@ -151,6 +151,12 @@ The statics into context structs, phases 4-6 (statics265):
   so `FMT_SCRATCH` and `FnCtx.fmt` are gone; the format checker's
   `Parsed` is `Parsed<A>`. Statics in compiler/src: 190 to 188;
   unjustified unsafe 3,063 to 3,057.
+- A static lent beside the context as an element's address (`f(&X[0],
+  &cx)`, `X` an array a raw pointer reaches past the element) is taken
+  into a local whole now, not as that one element: phase 4 had made
+  `front::own::infer::col_stored`'s two masks one, and the callee's write
+  to the second went to the stack (a compiler built at -O0 crashed in the
+  own pass; tests/refactor/statics0265.t, `&PAIR[0]`).
 
 ### What's new in 0.26.4
 
