@@ -39,11 +39,18 @@ use crate::front::modules::within_std;
 use crate::front::own::drops::{after_stmt, block_begin};
 use crate::front::patterns::check_pattern;
 use crate::front::traits::{implements, std_trait};
-use crate::front::types::{TY_UNIT, TyKind, buf_type, err_type, is_pointer};
+use crate::front::types::{REF_MUT, REF_SHARED, TY_UNIT, TyKind, buf_type, err_type, is_pointer};
 
 // On a `for` made by the `iter` form: its sequence is the result of
 // `iter()`, which must not need another `iter()`.
 const FOR_VIA_ITER: i64 = 1 << 29;
+// (0.27.0) On a `for` of the rust edition over a reference to elements
+// (`&[T]`, `&Vec<T, A>`, `&[T; N]`, their `&mut`): its items are `&T`
+// (`&mut T`), Rust's, not copies; kept on the `for` it is rewritten to.
+const FOR_REFS: i64 = 1 << 56;
+const FOR_REFS_MUT: i64 = 1 << 57;
+// (0.27.0) ... and its items are values (`for x in v` of a Vec, an array).
+const FOR_VALUES: i64 = 1 << 58;
 
 // `for` loop n whose sequence (NODES[n].c) is checked (its type is set)
 // and is not a range literal: the loop, rewritten in place as above. Its
@@ -80,6 +87,17 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     if through {
         t = pcx.types[t].a;
     }
+    // (0.27.0: the rust edition's items by reference)
+    var refs = pcx.nodes[n].p & (FOR_REFS | FOR_REFS_MUT | FOR_VALUES);
+    if refs == 0 && pcx.edition != 0 && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx)
+        && seq_ty > 0 {
+        let k = pcx.types[seq_ty].b;
+        let by_ref = through || pcx.types[seq_ty].kind == TyKind::Slice;
+        refs = if by_ref && k == REF_MUT { FOR_REFS | FOR_REFS_MUT }
+            else if by_ref && (k == REF_SHARED || pcx.types[seq_ty].kind == TyKind::Slice)
+            || !through && std_struct_name(t, pcx) == intern_c(c"SliceIter", &pcx) { FOR_REFS }
+            else { FOR_VALUES };
+    }
     let kind = pcx.types[t].kind;
     let std_name = std_struct_name(t, pcx);
     let iterator = std_trait(c"Iterator", &pcx);
@@ -110,13 +128,19 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let body = pcx.nodes[n].d;
     var rest = 0;
     if is_slice && !through {
-        rest = index_loop(n, seq_ty, &pcx);
+        rest = index_loop(n, seq_ty, refs & (FOR_REFS | FOR_REFS_MUT), &pcx);
+    } else if is_slice && (refs & FOR_REFS) != 0 && kind == TyKind::Array {
+        // (the rust edition: `&a` of an array, its elements by reference)
+        rest = for_copy(n, pattern, full_slice(deref(ident(seq_sym, n, &pcx), &pcx), &pcx),
+            body, &pcx);
     } else if is_slice {
         rest = for_copy(n, pattern, deref(ident(seq_sym, n, &pcx), &pcx), body, &pcx);
     } else if std_name == intern_c(c"Vec", &pcx) || std_name == intern_c(c"SliceIter", &pcx) {
+        let slice = if (refs & FOR_REFS_MUT) != 0 && std_name == intern_c(c"Vec", &pcx) {
+            c"as_mut_slice"
+        } else { c"as_slice" };
         rest = for_copy(n, pattern,
-            method_call(ident(seq_sym, n, &pcx), intern_c(c"as_slice", &pcx), &pcx), body,
-            &pcx);
+            method_call(ident(seq_sym, n, &pcx), intern_c(slice, &pcx), &pcx), body, &pcx);
     }
     else if std_name == intern_c(c"Range", &pcx)
         || std_name == intern_c(c"RangeInclusive", &pcx) {
@@ -143,6 +167,9 @@ pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         rest = for_copy(n, pattern,
             method_call(ident(seq_sym, n, &pcx), intern_c(c"iter", &pcx), &pcx), body, &pcx);
         pcx.nodes[rest].p |= FOR_VIA_ITER;
+    }
+    if refs != 0 && pcx.nodes[rest].kind == For {
+        pcx.nodes[rest].p |= refs;
     }
     let rest_stmt = new_node(ExprStmt, start, end, &pcx);
     pcx.nodes[rest_stmt].a = rest;
@@ -220,7 +247,7 @@ fn not_iterable(n: i64, seq: i64, seq_ty: i64, t: i64, pcx: inout Ctx<Comp>) -> 
 
 // for __for_index in 0..len { let p = __for_seq[__for_index]; body }, for
 // `for` loop n over a slice or an array of type t, bound to __for_seq.
-fn index_loop(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+fn index_loop(n: i64, t: i64, refs: i64, pcx: inout Ctx<Comp>) -> i64 {
     let start = pcx.nodes[n].start;
     let end = pcx.nodes[n].end;
     let seq_sym = intern_c(c"__for_seq", &pcx);
@@ -247,6 +274,16 @@ fn index_loop(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     let elem_let = new_node(Let, start, end, &pcx);
     pcx.nodes[elem_let].a = pcx.nodes[n].b;
     pcx.nodes[elem_let].c = elem;
+    if refs != 0 {
+        // (0.27.0) `let p = &__for_seq[__for_index];` (`&mut`), Rust's items
+        let r = new_node(Unary, start, end, &pcx);
+        pcx.nodes[r].op = Tok::Amp;
+        pcx.nodes[r].b = elem;
+        pcx.nodes[r].p |= if (refs & FOR_REFS_MUT) != 0 {
+            crate::front::ast::NODE_REF | crate::front::ast::NODE_REF_MUT
+        } else { crate::front::ast::NODE_REF };
+        pcx.nodes[elem_let].c = r;
+    }
     let body = new_node(Block, start, end, &pcx);
     let mark = list_begin(pcx);
     list_push(elem_let, &pcx);
@@ -328,6 +365,15 @@ fn deref(e: i64, pcx: inout Ctx<Comp>) -> i64 {
     pcx.nodes[u].op = Tok::Star;
     pcx.nodes[u].b = e;
     u
+}
+
+// `e[..]`: the whole of array e, a slice.
+fn full_slice(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let range = new_node(Range, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    let s = new_node(Index, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[s].a = e;
+    pcx.nodes[s].b = range;
+    s
 }
 
 // `receiver.name()`.

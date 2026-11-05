@@ -279,6 +279,26 @@ A borrow's place may contain `*`: `&(*_1).f` reborrows through the
 reference `_1`. NLL's supporting-prefixes rule applies to it in 0.27: a
 reborrow through a `&mut` does not end the outer loan's region.
 
+**Regions, the side tables (0.27.0's interface, checked from 0.27.1).**
+In the rust edition a borrow's region word names a region variable of
+the body's P_REGIONS table, each with an origin: a loan (the borrow
+itself), a local's type (one variable per reference in it, PLocal's run),
+a universal (a parameter's named or elided region, early- or late-bound)
+or a call's instantiation of its callee's regions. 0.27.0 fills the
+tables and checks nothing (`borrowck.unchecked`); 0.27.1's NLL solves
+them. Two facts std2 relies on are to be checked there, not assumed:
+
+- the elided regions of an `Fn` bound are late-bound, as Rust's are, so
+  the bound is higher-ranked in effect: `thread::scope<'env, F, T>(f: F)
+  where F: FnOnce(&Scope<'_, 'env>) -> T` gives `f` a `'scope` it cannot
+  name, a fresh universal per call of the closure, not a region of the
+  caller's choosing;
+- `Scope::spawn` takes `&self`, not `&'scope self`; its soundness rests on
+  `F: 'scope` and on `Scope` being invariant in `'scope` (std2's doc on
+  the item). The variance of a struct's region is computed from its
+  fields, so the invariance is a fact of the table, and the outlives
+  bound a constraint of the call.
+
 | rvalue | meaning |
 |---|---|
 | `use op` | the operand |

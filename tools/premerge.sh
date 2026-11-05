@@ -7,7 +7,8 @@
 #   base     the branch contains BASE's tip (else: merge BASE first)
 #   unsafe   no new unsafe without // UNSAFE: and // SAFETY: (tools/unsafe-diff-check.py)
 #   fmt      every changed .vl outside tests/ is in the standard style
-#            (0.27.0: but a rust-edition file, first line `// EDITION: rust`)
+#            (by the branch's own target/volec when the last tested build
+#            cannot read it: 0.27.0, a rust-edition file)
 #   check    every program the change touches checks with no error and no warning
 #            (but one whose main.vl says `// premerge: broken on purpose`)
 #            (but unsafe.unjustified: legacy sites are the baseline's, and new
@@ -83,9 +84,8 @@ if [ -z "$VOLEC" ]; then
 else
     : > "$TMP/fmt"
     for f in $(printf '%s\n' "$CHANGED" | grep '\.vl$' | grep -v -e '^tests/' -e '^evals/' | grep -v 'front/stdsrc\.vl$'); do
-        # (0.27.0) not a rust-edition file (compiler/std2): fmt reads only MVS yet
-        head -n 1 "$f" | grep -q '^// EDITION: rust' && continue
-        "$VOLEC" fmt --check "$f" > /dev/null 2>&1 || echo "  $f: not formatted (try: volec fmt $f)" >> "$TMP/fmt"
+        "$VOLEC" fmt --check "$f" > /dev/null 2>&1 \
+            || { [ -x target/volec ] && target/volec fmt --check "$f" > /dev/null 2>&1; } || echo "  $f: not formatted (try: volec fmt $f)" >> "$TMP/fmt"
     done
     if [ -s "$TMP/fmt" ]; then row fmt FAIL "$(wc -l < "$TMP/fmt" | tr -d ' ') file(s)"; else row fmt PASS "changed .vl files formatted"; fi
 fi
