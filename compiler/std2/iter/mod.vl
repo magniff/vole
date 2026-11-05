@@ -1,0 +1,733 @@
+// EDITION: rust
+// std::iter: Iterator, the traits around it, the adapters and the
+// sources. Rust's shape: an adapter takes self by value and returns a
+// named struct (no `impl Trait` in return position), a closure that only
+// looks takes `&Self::Item` (filter, find, position's FnMut(Self::Item)),
+// and what collects names its allocator: `collect_in(a)` over
+// FromIteratorIn, the result's type given by the context (`let v:
+// Vec<_, Gpa> = it.collect_in(gpa);`) or a turbofish.
+
+mod adapters;
+mod sources;
+
+pub use adapters::{
+    Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, FlatMap, Flatten, Fuse, Inspect, Map, MapWhile,
+    Peekable, Rev, Scan, Skip, SkipWhile, StepBy, Take, TakeWhile, Zip,
+};
+pub use sources::{empty, from_fn, once, repeat, repeat_n, successors, zip, Empty, FromFn, Once, Repeat, RepeatN, Successors};
+
+use crate::alloc::Allocator;
+use crate::cmp::{Ord, Ordering, PartialEq, PartialOrd};
+use crate::default::DefaultIn;
+use crate::ops::{Add, Mul, Range, RangeFrom, RangeInclusive};
+use crate::option::Option;
+
+// A sequence of Items, one per `next` until None.
+pub trait Iterator {
+    type Item;
+
+    fn next(&mut self) -> Option<Self::Item>;
+
+    // (at least, at most) items left; (0, None) when it cannot say.
+    // mvs: Iterator::exact_len
+    // std2: changed: Rust's size_hint (MVS: an exact length or -1)
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Option::None)
+    }
+
+    // The items left, counted by consuming them.
+    fn count(self) -> usize
+    where
+        Self: Sized,
+    {
+        self.fold(0, |n, _| n + 1)
+    }
+
+    fn last(self) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        self.fold(Option::None, |_, x| Option::Some(x))
+    }
+
+    // Item n (from 0), the ones before it consumed.
+    // mvs: Iterator::at
+    // std2: changed: Rust's nth, an Option (MVS: at(k), the item or a panic)
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let mut n = n;
+        while n > 0 {
+            self.next()?;
+            n -= 1;
+        }
+        self.next()
+    }
+
+    // Every step-th item, the first included; step > 0.
+    fn step_by(self, step: usize) -> StepBy<Self>
+    where
+        Self: Sized,
+    {
+        StepBy::new(self, step)
+    }
+
+    // Its items, then other's.
+    fn chain<U: IntoIterator<Item = Self::Item>>(self, other: U) -> Chain<Self, U::IntoIter>
+    where
+        Self: Sized,
+    {
+        Chain::new(self, other.into_iter())
+    }
+
+    // Pairs of its items and other's, until either ends.
+    // std2: changed: takes any IntoIterator (MVS: an Iterator)
+    fn zip<U: IntoIterator>(self, other: U) -> Zip<Self, U::IntoIter>
+    where
+        Self: Sized,
+    {
+        Zip::new(self, other.into_iter())
+    }
+
+    // f of each item.
+    // std2: changed: Rust's FnMut(Self::Item) (MVS: a sink Item)
+    fn map<B, F: FnMut(Self::Item) -> B>(self, f: F) -> Map<Self, F>
+    where
+        Self: Sized,
+    {
+        Map::new(self, f)
+    }
+
+    // Calls f on each item, in order.
+    fn for_each<F: FnMut(Self::Item)>(self, f: F)
+    where
+        Self: Sized,
+    {
+        let mut f = f;
+        self.fold((), |_, x| f(x));
+    }
+
+    // The items predicate says true of.
+    // std2: changed: the predicate takes &Self::Item
+    fn filter<P: FnMut(&Self::Item) -> bool>(self, predicate: P) -> Filter<Self, P>
+    where
+        Self: Sized,
+    {
+        Filter::new(self, predicate)
+    }
+
+    // The Some values f gives.
+    fn filter_map<B, F: FnMut(Self::Item) -> Option<B>>(self, f: F) -> FilterMap<Self, F>
+    where
+        Self: Sized,
+    {
+        FilterMap::new(self, f)
+    }
+
+    // (index, item) pairs, from 0.
+    fn enumerate(self) -> Enumerate<Self>
+    where
+        Self: Sized,
+    {
+        Enumerate::new(self)
+    }
+
+    // An iterator that can look at its next item without taking it.
+    fn peekable(self) -> Peekable<Self>
+    where
+        Self: Sized,
+    {
+        Peekable::new(self)
+    }
+
+    fn skip_while<P: FnMut(&Self::Item) -> bool>(self, predicate: P) -> SkipWhile<Self, P>
+    where
+        Self: Sized,
+    {
+        SkipWhile::new(self, predicate)
+    }
+
+    fn take_while<P: FnMut(&Self::Item) -> bool>(self, predicate: P) -> TakeWhile<Self, P>
+    where
+        Self: Sized,
+    {
+        TakeWhile::new(self, predicate)
+    }
+
+    // f's values until it gives None.
+    fn map_while<B, P: FnMut(Self::Item) -> Option<B>>(self, predicate: P) -> MapWhile<Self, P>
+    where
+        Self: Sized,
+    {
+        MapWhile::new(self, predicate)
+    }
+
+    fn skip(self, n: usize) -> Skip<Self>
+    where
+        Self: Sized,
+    {
+        Skip::new(self, n)
+    }
+
+    // The first n items.
+    fn take(self, n: usize) -> Take<Self>
+    where
+        Self: Sized,
+    {
+        Take::new(self, n)
+    }
+
+    // f's values, f keeping a state across items; None from f ends it.
+    fn scan<St, B, F: FnMut(&mut St, Self::Item) -> Option<B>>(self, initial_state: St, f: F) -> Scan<Self, St, F>
+    where
+        Self: Sized,
+    {
+        Scan::new(self, initial_state, f)
+    }
+
+    // The items of each f(item), in order.
+    fn flat_map<U: IntoIterator, F: FnMut(Self::Item) -> U>(self, f: F) -> FlatMap<Self, U, F>
+    where
+        Self: Sized,
+    {
+        FlatMap::new(self, f)
+    }
+
+    // The items of each item (an iterator of iterators, of Options, of Vecs).
+    fn flatten(self) -> Flatten<Self>
+    where
+        Self: Sized,
+        Self::Item: IntoIterator,
+    {
+        Flatten::new(self)
+    }
+
+    // None for ever once it has given None.
+    fn fuse(self) -> Fuse<Self>
+    where
+        Self: Sized,
+    {
+        Fuse::new(self)
+    }
+
+    // Calls f on a reference to each item as it passes.
+    fn inspect<F: FnMut(&Self::Item)>(self, f: F) -> Inspect<Self, F>
+    where
+        Self: Sized,
+    {
+        Inspect::new(self, f)
+    }
+
+    // The iterator borrowed: adapters on it leave it usable after.
+    fn by_ref(&mut self) -> &mut Self
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    // The items, collected into a B on a (`collect_in::<Vec<_, _>>(gpa)`,
+    // or the result's type from the context).
+    // std2: changed: generic in its result B (MVS: always a Vec)
+    // later: return_inference
+    fn collect_in<B: FromIteratorIn<Self::Item, A>, A: Allocator>(self, a: A) -> B
+    where
+        Self: Sized,
+    {
+        B::from_iter_in(self, a)
+    }
+
+    // (the items f says true of, the others), each a B on a clone of a.
+    // later: return_inference
+    fn partition_in<B, F: FnMut(&Self::Item) -> bool, A: Allocator + Clone>(self, f: F, a: A) -> (B, B)
+    where
+        Self: Sized,
+        B: DefaultIn<A> + Extend<Self::Item>,
+    {
+        crate::panic::todo()
+    }
+
+    // The items' pairs split into two collections on a clone of a.
+    // later: return_inference
+    fn unzip_in<X, Y, FromX, FromY, A: Allocator + Clone>(self, a: A) -> (FromX, FromY)
+    where
+        FromX: DefaultIn<A> + Extend<X>,
+        FromY: DefaultIn<A> + Extend<Y>,
+        Self: Sized + Iterator<Item = (X, Y)>,
+    {
+        crate::panic::todo()
+    }
+
+    // f(f(f(init, a), b), c), for items a, b, c.
+    fn fold<B, F: FnMut(B, Self::Item) -> B>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+    {
+        let mut it = self;
+        let mut f = f;
+        let mut acc = init;
+        while let Option::Some(x) = it.next() {
+            acc = f(acc, x);
+        }
+        acc
+    }
+
+    // fold, starting from the first item; None when there is none.
+    fn reduce<F: FnMut(Self::Item, Self::Item) -> Self::Item>(self, f: F) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        let mut it = self;
+        let first = it.next()?;
+        Option::Some(it.fold(first, f))
+    }
+
+    // Whether f is true of every item (true when there is none); stops at
+    // the first false.
+    fn all<F: FnMut(Self::Item) -> bool>(&mut self, f: F) -> bool {
+        let mut f = f;
+        while let Option::Some(x) = self.next() {
+            if !f(x) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // Whether f is true of an item; stops at the first true.
+    fn any<F: FnMut(Self::Item) -> bool>(&mut self, f: F) -> bool {
+        let mut f = f;
+        while let Option::Some(x) = self.next() {
+            if f(x) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // The first item predicate says true of.
+    // std2: changed: the predicate takes &Self::Item
+    fn find<P: FnMut(&Self::Item) -> bool>(&mut self, predicate: P) -> Option<Self::Item> {
+        let mut p = predicate;
+        while let Option::Some(x) = self.next() {
+            if p(&x) {
+                return Option::Some(x);
+            }
+        }
+        Option::None
+    }
+
+    // The first Some that f gives.
+    fn find_map<B, F: FnMut(Self::Item) -> Option<B>>(&mut self, f: F) -> Option<B> {
+        let mut f = f;
+        while let Option::Some(x) = self.next() {
+            if let Option::Some(y) = f(x) {
+                return Option::Some(y);
+            }
+        }
+        Option::None
+    }
+
+    // The index of the first item predicate says true of.
+    fn position<P: FnMut(Self::Item) -> bool>(&mut self, predicate: P) -> Option<usize> {
+        let mut p = predicate;
+        let mut i = 0;
+        while let Option::Some(x) = self.next() {
+            if p(x) {
+                return Option::Some(i);
+            }
+            i += 1;
+        }
+        Option::None
+    }
+
+    // The index of the last item predicate says true of, from the end.
+    fn rposition<P: FnMut(Self::Item) -> bool>(&mut self, predicate: P) -> Option<usize>
+    where
+        Self: Sized + ExactSizeIterator + DoubleEndedIterator,
+    {
+        crate::panic::todo()
+    }
+
+    // The largest item; the last of equal ones.
+    // std2: changed: Item: Ord, Rust's
+    fn max(self) -> Option<Self::Item>
+    where
+        Self: Sized,
+        Self::Item: Ord,
+    {
+        self.max_by(|a, b| a.cmp(b))
+    }
+
+    // The smallest item; the first of equal ones.
+    // std2: changed: Item: Ord, Rust's
+    fn min(self) -> Option<Self::Item>
+    where
+        Self: Sized,
+        Self::Item: Ord,
+    {
+        self.min_by(|a, b| a.cmp(b))
+    }
+
+    fn max_by_key<B: Ord, F: FnMut(&Self::Item) -> B>(self, f: F) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        let mut f = f;
+        self.max_by(|a, b| f(a).cmp(&f(b)))
+    }
+
+    fn max_by<F: FnMut(&Self::Item, &Self::Item) -> Ordering>(self, compare: F) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        let mut c = compare;
+        self.reduce(|a, b| if c(&a, &b).is_gt() { a } else { b })
+    }
+
+    fn min_by_key<B: Ord, F: FnMut(&Self::Item) -> B>(self, f: F) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        let mut f = f;
+        self.min_by(|a, b| f(a).cmp(&f(b)))
+    }
+
+    fn min_by<F: FnMut(&Self::Item, &Self::Item) -> Ordering>(self, compare: F) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        let mut c = compare;
+        self.reduce(|a, b| if c(&b, &a).is_lt() { b } else { a })
+    }
+
+    // Its items from the end.
+    fn rev(self) -> Rev<Self>
+    where
+        Self: Sized + DoubleEndedIterator,
+    {
+        Rev::new(self)
+    }
+
+    // Copies of the items of an iterator of &T (`v.iter().copied()`).
+    fn copied<'a, T: Copy + 'a>(self) -> Copied<Self>
+    where
+        Self: Sized + Iterator<Item = &'a T>,
+    {
+        Copied::new(self)
+    }
+
+    fn cloned<'a, T: Clone + 'a>(self) -> Cloned<Self>
+    where
+        Self: Sized + Iterator<Item = &'a T>,
+    {
+        Cloned::new(self)
+    }
+
+    // Its items again and again (it must be Clone).
+    fn cycle(self) -> Cycle<Self>
+    where
+        Self: Sized + Clone,
+    {
+        Cycle::new(self)
+    }
+
+    // The items' sum (`let s: i64 = v.iter().sum();`).
+    // std2: changed: S: Sum<Self::Item> (MVS: the Item itself)
+    // later: return_inference
+    fn sum<S: Sum<Self::Item>>(self) -> S
+    where
+        Self: Sized,
+    {
+        S::sum(self)
+    }
+
+    // later: return_inference
+    fn product<P: Product<Self::Item>>(self) -> P
+    where
+        Self: Sized,
+    {
+        P::product(self)
+    }
+
+    // Lexicographic, item by item.
+    fn cmp<I: IntoIterator<Item = Self::Item>>(self, other: I) -> Ordering
+    where
+        Self::Item: Ord,
+        Self: Sized,
+    {
+        crate::panic::todo()
+    }
+
+    fn partial_cmp<I: IntoIterator>(self, other: I) -> Option<Ordering>
+    where
+        Self::Item: PartialOrd<I::Item>,
+        Self: Sized,
+    {
+        crate::panic::todo()
+    }
+
+    // Whether the two have equal items, in order.
+    fn eq<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialEq<I::Item>,
+        Self: Sized,
+    {
+        crate::panic::todo()
+    }
+
+    fn ne<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialEq<I::Item>,
+        Self: Sized,
+    {
+        !self.eq(other)
+    }
+
+    fn lt<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialOrd<I::Item>,
+        Self: Sized,
+    {
+        self.partial_cmp(other) == Option::Some(Ordering::Less)
+    }
+
+    fn le<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialOrd<I::Item>,
+        Self: Sized,
+    {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Less) | Option::Some(Ordering::Equal) => true,
+            _ => false,
+        }
+    }
+
+    fn gt<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialOrd<I::Item>,
+        Self: Sized,
+    {
+        self.partial_cmp(other) == Option::Some(Ordering::Greater)
+    }
+
+    fn ge<I: IntoIterator>(self, other: I) -> bool
+    where
+        Self::Item: PartialOrd<I::Item>,
+        Self: Sized,
+    {
+        match self.partial_cmp(other) {
+            Option::Some(Ordering::Greater) | Option::Some(Ordering::Equal) => true,
+            _ => false,
+        }
+    }
+
+    // Whether each item is <= the next.
+    fn is_sorted(self) -> bool
+    where
+        Self: Sized,
+        Self::Item: PartialOrd,
+    {
+        crate::panic::todo()
+    }
+}
+
+// A mutable borrow of an iterator is one (`it.by_ref().take(3)`).
+impl<I: Iterator + ?Sized> Iterator for &mut I {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        (**self).next()
+    }
+}
+
+// An iterator that can also give its items from the end.
+pub trait DoubleEndedIterator: Iterator {
+    fn next_back(&mut self) -> Option<Self::Item>;
+
+    // Item n from the end.
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        let mut n = n;
+        while n > 0 {
+            self.next_back()?;
+            n -= 1;
+        }
+        self.next_back()
+    }
+
+    // fold, from the end.
+    fn rfold<B, F: FnMut(B, Self::Item) -> B>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+    {
+        let mut it = self;
+        let mut f = f;
+        let mut acc = init;
+        while let Option::Some(x) = it.next_back() {
+            acc = f(acc, x);
+        }
+        acc
+    }
+
+    // find, from the end.
+    fn rfind<P: FnMut(&Self::Item) -> bool>(&mut self, predicate: P) -> Option<Self::Item> {
+        let mut p = predicate;
+        while let Option::Some(x) = self.next_back() {
+            if p(&x) {
+                return Option::Some(x);
+            }
+        }
+        Option::None
+    }
+}
+
+// An iterator that knows how many items are left: size_hint is exact.
+pub trait ExactSizeIterator: Iterator {
+    fn len(&self) -> usize {
+        self.size_hint().0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// An iterator that gives None for ever after its first None.
+pub trait FusedIterator: Iterator {}
+
+// What a `for` loop iterates: an iterator itself, a collection by value
+// (its items), by & (references) or by &mut.
+pub trait IntoIterator {
+    type Item;
+    type IntoIter: Iterator<Item = Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter;
+}
+
+// Every iterator is one.
+// later: blanket_impl
+impl<I: Iterator> IntoIterator for I {
+    type Item = I::Item;
+    type IntoIter = I;
+
+    fn into_iter(self) -> I {
+        self
+    }
+}
+
+// Rust's FromIterator, with the allocator named: what `collect_in(a)`
+// makes (Vec, String, HashMap, HashSet).
+// mvs: Iterator::collect_in
+pub trait FromIteratorIn<T, A>: Sized {
+    fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, a: A) -> Self;
+}
+
+// A collection that items can be added to (`v.extend(it)`); it grows
+// from its own allocator.
+pub trait Extend<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I);
+}
+
+// What `sum` adds up to: numbers from numbers or from references to them.
+pub trait Sum<A = Self>: Sized {
+    fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
+}
+
+// What `product` multiplies up to.
+pub trait Product<A = Self>: Sized {
+    fn product<I: Iterator<Item = A>>(iter: I) -> Self;
+}
+
+// What ranges iterate over: the integers and char. Sealed: std's impls
+// only (built in for each integer type; char's waits for char).
+pub trait Step: Clone + PartialOrd + Sized {
+    // How many steps from start to end; None when end < start or too many.
+    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>);
+    // start + count, None on overflow.
+    fn forward_checked(start: Self, count: usize) -> Option<Self>;
+    // start - count, None on overflow.
+    fn backward_checked(start: Self, count: usize) -> Option<Self>;
+}
+
+// `for i in 0..n`.
+// mvs: Range::impl Iterator
+impl<A: Step> Iterator for Range<A> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        if self.start < self.end {
+            let n = Step::forward_checked(self.start.clone(), 1)?;
+            Option::Some(crate::mem::replace(&mut self.start, n))
+        } else {
+            Option::None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        Step::steps_between(&self.start, &self.end)
+    }
+}
+
+// `(0..n).rev()`.
+impl<A: Step> DoubleEndedIterator for Range<A> {
+    fn next_back(&mut self) -> Option<A> {
+        if self.start < self.end {
+            self.end = Step::backward_checked(self.end.clone(), 1)?;
+            Option::Some(self.end.clone())
+        } else {
+            Option::None
+        }
+    }
+}
+
+impl<A: Step> ExactSizeIterator for Range<A> {}
+
+// `for i in 0..=n`, `(0..=n).rev()`.
+// mvs: RangeInclusive::impl Iterator
+impl<A: Step> Iterator for RangeInclusive<A> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        crate::panic::todo()
+    }
+}
+
+impl<A: Step> DoubleEndedIterator for RangeInclusive<A> {
+    fn next_back(&mut self) -> Option<A> {
+        crate::panic::todo()
+    }
+}
+
+// `for i in 0..`: for ever (overflow panics in a debug build).
+impl<A: Step> Iterator for RangeFrom<A> {
+    type Item = A;
+
+    fn next(&mut self) -> Option<A> {
+        let n = Step::forward_checked(self.start.clone(), 1).expect("RangeFrom overflowed");
+        Option::Some(crate::mem::replace(&mut self.start, n))
+    }
+}
+
+// The numbers' Sum and Product, of values and of references: built in
+// for each integer and float type; these are i64's, the pattern of all.
+impl Sum for i64 {
+    fn sum<I: Iterator<Item = i64>>(iter: I) -> i64 {
+        iter.fold(0, |a, b| a + b)
+    }
+}
+
+impl<'a> Sum<&'a i64> for i64 {
+    fn sum<I: Iterator<Item = &'a i64>>(iter: I) -> i64 {
+        iter.fold(0, |a, b| a + *b)
+    }
+}
+
+impl Product for i64 {
+    fn product<I: Iterator<Item = i64>>(iter: I) -> i64 {
+        iter.fold(1, |a, b| a * b)
+    }
+}
+
+impl<'a> Product<&'a i64> for i64 {
+    fn product<I: Iterator<Item = &'a i64>>(iter: I) -> i64 {
+        iter.fold(1, |a, b| a * *b)
+    }
+}
