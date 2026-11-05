@@ -19,8 +19,10 @@ use crate::back::regalloc::prepare::{
 };
 use crate::back::regalloc::scan::{is_allocatable, is_callee_saved_reg};
 use crate::base::{IntVec, SYMS, alloc_array, die, free, grow};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::X86;
-use crate::front::types::{FNS, in_fregs, is_compound, max_i64};
+use crate::front::types::{in_fregs, is_compound, max_i64};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{IRFUNCS, Op, Term, ir_arg, ir_operand, ir_operand_count};
 use crate::middle::ir::Op::{
@@ -169,12 +171,12 @@ fn sym_is(name: i64, s: [u8]) -> bool {
     SYMS[name].text == s
 }
 
-pub fn is_returns_twice_call(cx: inout FnCtx, v: i64) -> bool {
+pub fn is_returns_twice_call(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let op = cx.insts[v].op;
         var name = 0;
         if op == Call {
-            name = FNS[cx.insts[v].imm].name;
+            name = pcx.fns[cx.insts[v].imm].name;
         } else if op == CallC {
             name = cx.insts[v].imm;
         } else {
@@ -186,13 +188,13 @@ pub fn is_returns_twice_call(cx: inout FnCtx, v: i64) -> bool {
     }
 }
 
-pub fn calls_returns_twice(cx: inout FnCtx, fi: i64) -> bool {
+pub fn calls_returns_twice(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
             if cx.blocks[b].removed == 0 {
                 var v = cx.blocks[b].first;
                 while v != 0 {
-                    if is_returns_twice_call(&cx, v) {
+                    if is_returns_twice_call(&cx, v, pcx) {
                         return true;
                     }
                     v = cx.insts[v].next;
@@ -204,15 +206,15 @@ pub fn calls_returns_twice(cx: inout FnCtx, fi: i64) -> bool {
 }
 
 // Registers clobbered by the instruction at p (besides its result).
-fn add_clobbers(cx: inout FnCtx, v: i64, p: i64) {
+fn add_clobbers(cx: inout FnCtx, v: i64, p: i64, pcx: Ctx<Comp>) {
     unsafe {
         let op = cx.insts[v].op;
         if op.is_call() {
             // (0.17: the registers from a list made once per function,
             // CLOBBERED, not from tests of all 64 per call)
-            if is_returns_twice_call(&cx, v) {
+            if is_returns_twice_call(&cx, v, pcx) {
                 for r in 0..64 {
-                    if is_allocatable(r) {
+                    if is_allocatable(r, pcx) {
                         add_fixed(&cx, r, p + 1, p + 2);
                     }
                 }
@@ -228,10 +230,10 @@ fn add_clobbers(cx: inout FnCtx, v: i64, p: i64) {
             // cmpxchg): mc_arm64/atomic.vl, mc_x86_64/atomic.vl.
             let kind = cx.insts[v].imm & 255;
             if X86 {
-                if atomic_needs_rax(kind) && is_allocatable(0) {
+                if atomic_needs_rax(kind) && is_allocatable(0, pcx) {
                     add_fixed(&cx, 0, p, p + 3);
                 }
-            } else if atomic_needs_scratch(kind) && is_allocatable(ATOMIC_SCRATCH) {
+            } else if atomic_needs_scratch(kind, pcx) && is_allocatable(ATOMIC_SCRATCH, pcx) {
                 add_fixed(&cx, ATOMIC_SCRATCH, p, p + 3);
             }
             return;
@@ -241,12 +243,12 @@ fn add_clobbers(cx: inout FnCtx, v: i64, p: i64) {
             // the reading of the operands to the writing of the result.
             if (op == Div || op == Rem || op == MulH
                 || op == Op::Ovf && ovf_uses_rdx(cx.insts[v].imm))
-                && is_allocatable(0) {
+                && is_allocatable(0, pcx) {
                 add_fixed(&cx, 0, p, p + 3);
                 add_fixed(&cx, 2, p, p + 3);
             }
             if (op == Shl || op == Shr) && cx.insts[cx.insts[v].b].op != Const
-                && is_allocatable(1) {
+                && is_allocatable(1, pcx) {
                 add_fixed(&cx, 1, p, p + 3);
             }
         }
@@ -255,11 +257,11 @@ fn add_clobbers(cx: inout FnCtx, v: i64, p: i64) {
 
 // The pieces of call v's aggregate result (PIECE instructions after it in
 // its block): defined by the call, in its result registers (as hints).
-fn add_piece_defs(cx: inout FnCtx, v: i64, start: i64, p: i64, live: *u64) {
+fn add_piece_defs(cx: inout FnCtx, v: i64, start: i64, p: i64, live: *u64, pcx: Ctx<Comp>) {
     unsafe {
         // (0.17: only a call returning an aggregate has pieces; the scan of
         // the rest of the block for every call was quadratic in its calls)
-        if !is_compound(callee_result(&cx, v)) {
+        if !is_compound(callee_result(&cx, v, pcx)) {
             return;
         }
         var w = cx.insts[v].next;
@@ -267,14 +269,14 @@ fn add_piece_defs(cx: inout FnCtx, v: i64, start: i64, p: i64, live: *u64) {
         while w != 0 {
             if cx.insts[w].op == Piece && cx.insts[w].a == v {
                 if !classified {
-                    conv_classify(&cx, call_uses_c(&cx, v), callee_result(&cx, v));
+                    conv_classify(&cx, call_uses_c(&cx, v, pcx), callee_result(&cx, v, pcx), pcx);
                     classified = true;
                 }
                 let t = tracked(&cx, w);
                 if t >= 0 {
                     add_def(&cx, t, start, p + 2, USE_REG, live);
                     if cx.rv_hreg[t] < 0 {
-                        cx.rv_hreg[t] = conv_return_piece_reg(&cx, call_uses_c(&cx, v),
+                        cx.rv_hreg[t] = conv_return_piece_reg(&cx, call_uses_c(&cx, v, pcx),
                             cx.insts[w].imm);
                     }
                 }
@@ -285,7 +287,7 @@ fn add_piece_defs(cx: inout FnCtx, v: i64, start: i64, p: i64, live: *u64) {
 }
 
 // The hints of instruction v (at p): its result's register, its operands'.
-fn add_hints(cx: inout FnCtx, v: i64) {
+fn add_hints(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) {
     unsafe {
         let op = cx.insts[v].op;
         let t = tracked(&cx, v);
@@ -296,7 +298,7 @@ fn add_hints(cx: inout FnCtx, v: i64) {
             var locations: [i64; 64] = [0; 64];
             var copies: [i64; 64] = [0; 64];
             var float_regs = 0;
-            call_locations(&cx, v, &locations as *i64, &copies as *i64, &float_regs);
+            call_locations(&cx, v, &locations as *i64, &copies as *i64, &float_regs, pcx);
             for i in 0..cx.insts[v].nargs {
                 let a = tracked(&cx, ir_arg(&cx, v, i));
                 if a >= 0 && !xl_is_stack(locations[i]) && cx.rv_hreg[a] < 0
@@ -319,7 +321,7 @@ fn add_hints(cx: inout FnCtx, v: i64) {
         // (0.19) An intrinsic whose instruction overwrites an operand: its
         // result in that operand's register (no move first).
         if op == Op::Intr {
-            let k = intr_tied_operand(cx.insts[v].imm);
+            let k = intr_tied_operand(cx.insts[v].imm, pcx);
             if k >= 0 {
                 let a = tracked(&cx, ir_operand(&cx, v, k));
                 if a >= 0 && cx.rv_hint[t] < 0 {
@@ -349,12 +351,12 @@ fn add_hints(cx: inout FnCtx, v: i64) {
     }
 }
 
-pub fn build_intervals(cx: inout FnCtx) {
+pub fn build_intervals(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         iv_reset(&cx);
         cx.clobbered.count = 0;
         for r in 0..64 {
-            if is_allocatable(r) && !is_callee_saved_reg(r) {
+            if is_allocatable(r, pcx) && !is_callee_saved_reg(r) {
                 cx.clobbered.push(r);
             }
         }
@@ -383,7 +385,7 @@ pub fn build_intervals(cx: inout FnCtx) {
                     rev_add_range(&cx.ivs[cx.rv_first[t]].ranges, start, end + 2);
                 }
             }
-            let count = term_uses(&cx, b, &out as *i64);
+            let count = term_uses(&cx, b, &out as *i64, pcx);
             for i in 0..count {
                 let t = tracked(&cx, out[2 * i]);
                 if t >= 0 && is_live_use(&cx, out[2 * i], out[2 * i + 1]) {
@@ -392,17 +394,17 @@ pub fn build_intervals(cx: inout FnCtx) {
             }
             if cx.blocks[b].term == Term::Ret && count > 0 {
                 let t = tracked(&cx, out[0]);
-                if t >= 0 && cx.rv_hreg[t] < 0 && !is_compound(FNS[IRFUNCS[cx.irf].f].ret) {
+                if t >= 0 && cx.rv_hreg[t] < 0 && !is_compound(pcx.fns[IRFUNCS[cx.irf].f].ret) {
                     cx.rv_hreg[t] = reg_ret(in_fregs(cx.insts[out[0]].ty));
                 }
                 let pack = cx.blocks[b].cond;
                 if cx.insts[pack].op == Pack {
                     let f = IRFUNCS[cx.irf].f;
-                    conv_classify(&cx, fn_uses_c(f), FNS[f].ret);
+                    conv_classify(&cx, fn_uses_c(f, pcx), pcx.fns[f].ret, pcx);
                     for i in 0..count {
                         let a = tracked(&cx, out[2 * i]);
                         if a >= 0 && cx.rv_hreg[a] < 0 {
-                            cx.rv_hreg[a] = conv_return_piece_reg(&cx, fn_uses_c(f), i);
+                            cx.rv_hreg[a] = conv_return_piece_reg(&cx, fn_uses_c(f, pcx), i);
                         }
                     }
                 }
@@ -419,19 +421,19 @@ pub fn build_intervals(cx: inout FnCtx) {
                             if op.is_remat() { USE_NONE } else { USE_REG }, &*live);
                     }
                     if op.is_call() {
-                        add_piece_defs(&cx, v, start, p, &*live);
+                        add_piece_defs(&cx, v, start, p, &*live, pcx);
                     }
-                    add_clobbers(&cx, v, p);
-                    add_hints(&cx, v);
+                    add_clobbers(&cx, v, p, pcx);
+                    add_hints(&cx, v, pcx);
                     for i in 0..ir_operand_count(&cx, v) {
                         let operand = ir_operand(&cx, v, i);
-                        let kind = use_kind(&cx, v, i);
+                        let kind = use_kind(&cx, v, i, pcx);
                         let a = tracked(&cx, operand);
                         if a >= 0 && is_live_use(&cx, operand, kind) {
                             // An aggregate result in registers is stored through
                             // its address after the call.
                             let at = if op.is_call() && i == 2
-                                && !call_returns_through_pointer(&cx, v) { p + 2 } else { p };
+                                && !call_returns_through_pointer(&cx, v, pcx) { p + 2 } else { p };
                             ra_add_use(&cx, a, start, at, kind, &*live);
                         }
                     }
@@ -461,7 +463,7 @@ pub fn build_intervals(cx: inout FnCtx) {
             reverse_pairs(&cx.fixed[r]);
         }
         phi_hints(&cx);
-        param_hints(&cx);
+        param_hints(&cx, pcx);
     }
 }
 
@@ -536,15 +538,15 @@ fn phi_hints(cx: inout FnCtx) {
 }
 
 // Parameters would like the register they arrive in.
-fn param_hints(cx: inout FnCtx) {
+fn param_hints(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         let f = IRFUNCS[cx.irf].f;
         var locations: [i64; 64] = [0; 64];
         var pieces: [i64; 256] = [0; 256];
-        if FNS[f].param_count > 64 {
+        if pcx.fns[f].param_count > 64 {
             return;
         }
-        param_locations(&cx, f, &locations as *i64, &pieces as *i64);
+        param_locations(&cx, f, &locations as *i64, &pieces as *i64, pcx);
         var v = cx.blocks[IRFUNCS[cx.irf].entry].first;
         while v != 0 {
             let t = tracked(&cx, v);

@@ -13,6 +13,8 @@
 // ? x : 0)`), and the loop has no branch to mispredict. A condition the
 // same in every iteration is left to unswitching.
 use crate::base::{IntVec, free};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::types::{TY_BOOL, is_float, is_integer};
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::combine_select;
@@ -31,11 +33,9 @@ use crate::middle::tags::merge_phi_block;
 // The instructions both arms may hold together (constants free).
 const IFCONV_COST: i64 = 4;
 
-pub static var IFCONV: bool = true;
-
 // The cost of arm block b (its instructions that are not constants), or -1
 // when it holds one that may not run unconditionally.
-fn arm_cost(cx: inout FnCtx, b: i64) -> i64 {
+fn arm_cost(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var cost = 0;
         var v = cx.blocks[b].first;
@@ -48,7 +48,7 @@ fn arm_cost(cx: inout FnCtx, b: i64) -> i64 {
             if !(op.is_pure() || op == Op::Sel) || op == Op::Div || op == Op::Rem
                 || is_float(cx.insts[v].ty) || (op == Op::Conv && is_float(cx.insts[v].imm2))
                 || (op == Op::Cmp && is_float(cx.insts[v].imm2))
-                || crate::middle::licm::op_guarded(&cx, v) {
+                || crate::middle::licm::op_guarded(&cx, v, pcx) {
                 return -1;
             }
             cost += 1;
@@ -136,7 +136,7 @@ fn only_branched_on(cx: inout FnCtx, l: i64, phi: i64, join: i64) -> bool {
 }
 
 // If-converts the branch ending block h of loop l; returns whether it did.
-fn convert(cx: inout FnCtx, l: i64, h: i64) -> bool {
+fn convert(cx: inout FnCtx, l: i64, h: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let t = cx.blocks[h].s0;
         let e = cx.blocks[h].s1;
@@ -163,8 +163,8 @@ fn convert(cx: inout FnCtx, l: i64, h: i64) -> bool {
             || (join == t && arm_t != 0) || (join == e && arm_e != 0) {
             return false;
         }
-        let cost_t = if arm_t != 0 { arm_cost(&cx, arm_t) } else { 0 };
-        let cost_e = if arm_e != 0 { arm_cost(&cx, arm_e) } else { 0 };
+        let cost_t = if arm_t != 0 { arm_cost(&cx, arm_t, pcx) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(&cx, arm_e, pcx) } else { 0 };
         if cost_t < 0 || cost_e < 0 || cost_t + cost_e > IFCONV_COST {
             return false;
         }
@@ -206,12 +206,12 @@ fn convert(cx: inout FnCtx, l: i64, h: i64) -> bool {
             let value_e = ir_val(&cx, ir_arg(&cx, phi, index_e));
             var picked = value_t;
             if value_t != value_e {
-                picked = ir_make(&cx, Op::Sel, cx.insts[phi].ty, cond, value_t, 0);
+                picked = ir_make(&cx, Op::Sel, cx.insts[phi].ty, cond, value_t, 0, pcx);
                 cx.insts[picked].c = value_e;
                 ir_append(&cx, h, picked);
                 // (k ? t + x : t is t + (k ? x : 0) at once: a reduction the
                 // vectorizer takes)
-                combine_select(&cx, picked);
+                combine_select(&cx, picked, pcx);
             }
             ir_set_arg(&cx, phi, index_t, picked);
             ir_set_arg(&cx, phi, index_e, picked);
@@ -246,7 +246,7 @@ fn convert(cx: inout FnCtx, l: i64, h: i64) -> bool {
 // comparator's `<` and `<=` (lexicographic over fields) and the chains of
 // `&&` and `||` are one branch then, which mispredicts at most once. T's
 // phis must take the same value from h and B. Returns whether it merged.
-fn fold_branch_chain(cx: inout FnCtx, l: i64, h: i64) -> bool {
+fn fold_branch_chain(cx: inout FnCtx, l: i64, h: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         for side in 0..2 {
             let b = if side == 0 { cx.blocks[h].s0 } else { cx.blocks[h].s1 };
@@ -264,7 +264,7 @@ fn fold_branch_chain(cx: inout FnCtx, l: i64, h: i64) -> bool {
             if f == t || f == h || f == b || pred_index(&cx, f, h) >= 0 {
                 continue;
             }
-            let cost = arm_cost(&cx, b);
+            let cost = arm_cost(&cx, b, pcx);
             if cost < 0 || cost > 2 * IFCONV_COST {
                 continue;
             }
@@ -284,16 +284,16 @@ fn fold_branch_chain(cx: inout FnCtx, l: i64, h: i64) -> bool {
             // h's condition for T, B's for T, then their or.
             var c1 = ir_val(&cx, cx.blocks[h].cond);
             if side == 0 {
-                c1 = ir_make(&cx, Op::Not, TY_BOOL, c1, 0, 0);
+                c1 = ir_make(&cx, Op::Not, TY_BOOL, c1, 0, 0, pcx);
                 ir_append(&cx, h, c1);
             }
             move_up(&cx, b, h);
             var c2 = ir_val(&cx, cx.blocks[b].cond);
             if !b_to_t {
-                c2 = ir_make(&cx, Op::Not, TY_BOOL, c2, 0, 0);
+                c2 = ir_make(&cx, Op::Not, TY_BOOL, c2, 0, 0, pcx);
                 ir_append(&cx, h, c2);
             }
-            let c = ir_make(&cx, Op::Or, TY_BOOL, c1, c2, 0);
+            let c = ir_make(&cx, Op::Or, TY_BOOL, c1, c2, 0, pcx);
             ir_append(&cx, h, c);
             cx.blocks[h].cond = c;
             cx.blocks[h].s0 = t;
@@ -324,12 +324,12 @@ fn only_phis(cx: inout FnCtx, b: i64) -> bool {
 
 // If-converts the small branches of fi's innermost loops; returns whether
 // any was.
-pub fn if_convert_loops(cx: inout FnCtx, fi: i64) -> bool {
+pub fn if_convert_loops(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if !IFCONV || !has_arm(&cx, fi) {
+        if !pcx.ifconv || !has_arm(&cx, fi) {
             return false;
         }
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         analyze_loops(&cx, fi);
         var heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var owner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -373,7 +373,8 @@ pub fn if_convert_loops(cx: inout FnCtx, fi: i64) -> bool {
         for i in 0..heads.count {
             let b = heads.data[i];
             if cx.blocks[b].removed == 0 && cx.blocks[b].term == Term::Branch
-                && (convert(&cx, owner.data[i], b) || fold_branch_chain(&cx, owner.data[i], b)) {
+                && (convert(&cx, owner.data[i], b, pcx)
+                    || fold_branch_chain(&cx, owner.data[i], b, pcx)) {
                 changed = true;
             }
         }

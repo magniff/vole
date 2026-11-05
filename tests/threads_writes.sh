@@ -61,7 +61,7 @@ back::codecache::OUT_SCALAR	the task'"'"'s own function'"'"'s entry, read after 
 back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup'"'"'s, then its scalar pipeline'"'"'s, a phase after)
 back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is written
 back::codecache::pack::USED	the entry of the task'"'"'s own key (a key is one task'"'"'s), read when the pack is written
-back::codecache::pack::PACK	read only: an entry'"'"'s body is read through its address
+base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
 middle::gvn::MEMCPY_SYM	made by prepare_tasks; the lazy branch never runs in a task
 middle::ipo::MALLOC_SYM	made by prepare_tasks
 middle::ipo::CALLOC_SYM	made by prepare_tasks
@@ -158,27 +158,27 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
 READ='base::SYMS_FROZEN	own: set by pool_run around every phase, the same in every task (no new symbol)
-base::timer::TIME_INSTRUCTIONS	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
-base::timer::PERF_FD	off: the same; opened by counters_open on the main thread before the tasks, read-only after
-base::timer::COUNTERS_OFF	off: the same (counters_open)
-middle::vectorize::VEC_STATS_FN	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
-gen0::gen::STATIC_NAMED	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
-middle::vecfacts::VEC_TMPL	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
-middle::vecfacts::WRAPS	key: the same (std'"'"'s Vec wrappers)
-back::mc_arm64::atomic::A64_LSE_FLAG	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
-arch::ARCH_USED	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
-back::isel::arch::ARCH_WORD_SYM	IR: set before the tasks (arch_after_lowering); a function reaches instruction selection with a CPUFEAT, which ir_hash covers, only in a program whose main fills std::ARCH_FEATURES, and the symbol is the same in every build
-arch::INTRS	key: the intrinsic tables are part of the compiler (its identity), parsed by the front end before the tasks, read-only after
-arch::INTR_COUNT	key: the same
-arch::TABLE_BUF	key: the same
-arch::table::FIELDS	key: the same
-arch::table::PARAMS	key: the same
-arch::features::BUILD_FEATURES	key: the build'"'"'s features, made by main before the tasks (build_features), are in the options hash
-front::features::infer::NEEDS	IR: made by the front end before the tasks; read by LICM (intr_guarded) for the features of an INTR it may hoist, which follow from the function'"'"'s guards and calls: a guard or a declared set changes the IR (has/detect folded), an unguarded call'"'"'s needs are inferred whatever the declaration, an inlined callee'"'"'s INTRs are in the IR
-front::features::infer::NEEDS_COUNT	IR: the same
-back::codecache::CC_ON	own
-back::codecache::CHECK	own (testing)
-back::codecache::ENV	own: the key'"'"'s program hash
+base::ctx::Ctx.time_instructions	off: --time-passes turns the cache off (cc_wanted), set by the options before the tasks
+base::ctx::Ctx.perf_fd	off: the same; opened by counters_open on the main thread before the tasks, read-only after
+base::ctx::Ctx.counters_off	off: the same (counters_open)
+base::ctx::Ctx.vec_stats_fn	off: --vec-stats=FN is an option the cache does not know (ARGS_UNKNOWN), set by the options before the tasks
+base::ctx::Ctx.static_named	output: none; the emission (materialize) reads it only to stop on an internal error, made by statics_named_by_ir before the tasks
+base::ctx::Ctx.vec_tmpl	key: std'"'"'s Vec template, found in the program'"'"'s types (types_hash) by init_vec_facts before the tasks, read-only after
+base::ctx::Ctx.wraps	key: the same (std'"'"'s Vec wrappers)
+base::ctx::Ctx.a64_lse_flag	key: --atomics= is in the options hash (codecache::arg_kind), set by main before the tasks
+base::ctx::Ctx.arch_used	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
+base::ctx::Ctx.arch_word_sym	IR: set before the tasks (arch_after_lowering); a function reaches instruction selection with a CPUFEAT, which ir_hash covers, only in a program whose main fills std::ARCH_FEATURES, and the symbol is the same in every build
+base::ctx::Ctx.intrs	key: the intrinsic tables are part of the compiler (its identity), parsed by the front end before the tasks, read-only after
+base::ctx::Ctx.intr_count	key: the same
+base::ctx::Ctx.table_buf	key: the same
+base::ctx::Ctx.table_fields	key: the same
+base::ctx::Ctx.params	key: the same
+base::ctx::Ctx.build_features	key: the build'"'"'s features, made by main before the tasks (build_features), are in the options hash
+base::ctx::Ctx.needs	IR: made by the front end before the tasks; read by LICM (intr_guarded) for the features of an INTR it may hoist, which follow from the function'"'"'s guards and calls: a guard or a declared set changes the IR (has/detect folded), an unguarded call'"'"'s needs are inferred whatever the declaration, an inlined callee'"'"'s INTRs are in the IR
+base::ctx::Ctx.needs_count	IR: the same
+base::ctx::Ctx.cc_on	own
+base::ctx::Ctx.check	own (testing)
+base::ctx::Ctx.codecache_env	own: the key'"'"'s program hash
 back::codecache::FN_IRH	own: read R_IR
 back::codecache::FN_IRH_OK	own
 back::codecache::FN_STRS	own: the strings of a read IR
@@ -186,40 +186,40 @@ back::codecache::OUT_COMP	own
 back::codecache::OUT_EMIT	own
 back::codecache::OUT_SCALAR	own
 back::codecache::SCALAR_REC	own: a function'"'"'s recording, from its cleanup to its scalar pipeline
-back::codecache::WHY	own (testing)
-back::codecache::hash::FN_AMBIG	own
-back::codecache::hash::FN_CANON	own: what IR names a function by
-back::codecache::hash::FN_MOVES	own: MOVE_COPIES, in the IR hash
-back::codecache::hash::FN_NAMEH	own
-back::codecache::hash::NAME_FN	own
-back::codecache::hash::NAME_IR	own
-back::codecache::hash::STR_H	own: a string'"'"'s bytes
-back::codecache::hash::STR_H_COUNT	own
-back::codecache::pack::ENTRY_AT	own
-back::codecache::pack::INDEX	own
-back::codecache::pack::INDEX_SIZE	own
+base::ctx::Ctx.why	own (testing)
+base::ctx::Ctx.fn_ambig	own
+base::ctx::Ctx.fn_canon	own: what IR names a function by
+base::ctx::Ctx.fn_moves	own: MOVE_COPIES, in the IR hash
+base::ctx::Ctx.fn_nameh	own
+base::ctx::Ctx.name_fn	own
+base::ctx::Ctx.name_ir	own
+base::ctx::Ctx.str_h	own: a string'"'"'s bytes
+base::ctx::Ctx.str_h_count	own
+base::ctx::Ctx.entry_at	own
+base::ctx::Ctx.index	own
+base::ctx::Ctx.index_size	own
 back::codecache::pack::NEW	own
-back::codecache::pack::NEW_SLOTS	own
-back::codecache::pack::PACK	own
+base::ctx::Ctx.new_slots	own
+base::ctx::Ctx.pack	own
 back::codecache::pack::USED	own
 back::dwarf::DBG_FNS	off: -g
 back::dwarf::DBG_POS	off: -g
 back::dwarf::DBG_PREFIX	off: -g
-back::dwarf::DEBUG_INFO	off: -g
+base::ctx::Ctx.debug_info	off: -g
 back::dwarf::FILES_USED	off: -g
 back::dwarf::FILE_NUMBERS	off: -g
 back::dwarf::LINE_STARTS	off: -g
 back::dwarf::SRC_END	off: -g
-back::emit::stats::STATS	off: --stats
+base::ctx::Ctx.stats	off: --stats
 back::emit::stats::ST_ALL	off: --stats
-back::regalloc::PRINT_REGALLOC	off: --print-regalloc
-back::regalloc::VERIFY_REGALLOC	off: --verify-regalloc
-back::regalloc::scan::X86_ALLOC_ACD	key: options_hash
+base::ctx::Ctx.print_regalloc	off: --print-regalloc
+base::ctx::Ctx.verify_regalloc	off: --verify-regalloc
+base::ctx::Ctx.x86_alloc_acd	key: options_hash
 base::BUFS	own: the context'"'"'s buffers
 base::BUF_CAP	own: buf_new on internal errors and printers
 base::BUF_COUNT	own: the same
 base::CWD	off: -g (out_path)
-base::FILES	off: -g (dbg_loc, out_path)
+base::ctx::Ctx.files	off: -g (dbg_loc, out_path)
 base::FMT_SCRATCH	off: printers and -g
 base::OUT_PATHS	off: -g
 base::ROOT_DIR	off: -g
@@ -235,56 +235,56 @@ base::SYM_TABLES_CAP	IR: the same
 base::SYM_TABLE_SIZE	IR: the same
 base::diag::ERR_POISONED	off: the IR printers
 base::json::DIAG_JSON	own: messages
-base::target::APPLE_A64	key: options_hash
+base::ctx::Ctx.apple_a64	key: options_hash
 base::target::ELF	key: options_hash
 base::target::X86	key: options_hash
-base::timer::TIME_PASSES	off: --time-passes
+base::ctx::Ctx.time_passes	off: --time-passes
 base::timer::T_TOTALS	off: --time-passes
-front::ast::NODES	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
-front::check::LOCALS	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s
-front::check::LOCAL_COUNT	own: the same; a variable'"'"'s number is never output
-front::distinct::ANY_DISTINCT	key: options_hash
+base::ctx::Ctx.nodes	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
+base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s
+base::ctx::Ctx.local_count	own: the same; a variable'"'"'s number is never output
+base::ctx::Ctx.any_distinct	key: options_hash
 front::distinct::NICHE	key: types_hash (enum_niche)
-front::distinct::NICHE_ALIASES	key: types_hash
+base::ctx::Ctx.niche_aliases	key: types_hash
 front::cells::FREEZE_MEMO	key: types_hash (each type'"'"'s is_freeze)
 front::cells::SYM_UNSAFE_CELL	key: the same
-front::modules::MODULES	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
-front::modules::STD_MODULE	key: the same (within_std)
-front::effects::FN_EFFECTS	IR: a function'"'"'s effects (fn_canon)
-front::effects::FN_EFFECTS_COUNT	IR: the same
+base::ctx::Ctx.modules	key: the same (is_within, only from is_freeze: whether a struct is std'"'"'s UnsafeCell)
+base::ctx::Ctx.std_module	key: the same (within_std)
+base::ctx::Ctx.fn_effects	IR: a function'"'"'s effects (fn_canon)
+base::ctx::Ctx.fn_effects_count	IR: the same
 front::effects::builtin::TABLE	IR: by a symbol'"'"'s text; the same in every build of a compiler
 front::lexer::STRS	IR: a string'"'"'s bytes (STR_H)
 front::lexer::STR_CAP	IR: the same (no string is made in a task)
 front::lexer::STR_COUNT	IR: the same
-front::own::diag::OWN_MODE	key: options_hash
+base::ctx::Ctx.own_mode	key: options_hash
 front::types::ENUMS	key: types_hash
 front::types::FIELDS	key: types_hash
-front::types::FNS	IR: a function by fn_canon
-front::types::FN_COUNT	IR: the same
-front::types::STATICS	IR: a static by static_canon
-front::types::STRUCTS	key: types_hash
-front::types::SYM_STATIC	IR: the same
+base::ctx::Ctx.fns	IR: a function by fn_canon
+base::ctx::Ctx.fn_count	IR: the same
+base::ctx::Ctx.statics	IR: a static by static_canon
+base::ctx::Ctx.structs	key: types_hash
+base::ctx::Ctx.sym_static	IR: the same
 front::types::TLISTS	key: types_hash
 front::types::TSCRATCH	key: types_hash (no type is made in a task)
 front::types::TYPES	key: types_hash
 front::types::TYPE_HASH	key: types_hash
 front::types::TYPE_HASH_SIZE	key: types_hash
 front::types::TYPE_HASH_USED	key: types_hash
-front::types::TY_ERROR	key: types_hash (a fixed id)
-front::types::TY_V16I8	key: types_hash (a fixed id)
-front::types::TY_V2F64	key: types_hash (a fixed id)
-front::types::TY_V2I64	key: types_hash (a fixed id)
-front::types::TY_V4F32	key: types_hash (a fixed id)
-front::types::TY_V4I32	key: types_hash (a fixed id)
-front::types::TY_V8I16	key: types_hash (a fixed id)
-front::types::VARIANTS	key: types_hash
-gen0::gen::MAIN_SYM	IR: a symbol by its text
-gen0::target::LINK_NAMES	IR: fn_canon
+base::ctx::Ctx.ty_error	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v16i8	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v2f64	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v2i64	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v4f32	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v4i32	key: types_hash (a fixed id)
+base::ctx::Ctx.ty_v8i16	key: types_hash (a fixed id)
+base::ctx::Ctx.variants	key: types_hash
+base::ctx::Ctx.main_sym	IR: a symbol by its text
+base::ctx::Ctx.link_names	IR: fn_canon
 gen0::target::RT_PANIC_SYM	IR: a symbol by its text
 gen0::target::RT_NOTE_SYM	IR: a symbol by its text
 gen0::target::STR_ALIGN	IR: a string'"'"'s alignment (STR_H)
-middle::copies::MOVE_COPIES	IR: FN_MOVES
-middle::egraph::EGRAPH	key: options_hash
+base::ctx::Ctx.move_copies	IR: FN_MOVES
+base::ctx::Ctx.egraph	key: options_hash
 middle::egraph::PP	own: the rules, the same in every build of a compiler
 middle::egraph::PT	own: the same
 middle::egraph::PVARS	own: the same
@@ -303,57 +303,57 @@ middle::egraph::R_RHS	own: the same
 middle::egraph::R_VARS	own: the same
 middle::egraph::R_VARS_NOW	own: the same
 middle::gvn::MEMCPY_SYM	IR: a symbol by its text
-middle::gvn::NOALIAS_OFF	key: options_hash
-middle::ifconv::IFCONV	key: options_hash
-middle::inline::FN_ADDRESS	read: R_STATIC (facts_fixed); the key (own_fp)
-middle::inline::FN_CALLS	read: R_CALLS, whether one is left
+base::ctx::Ctx.noalias_off	key: options_hash
+base::ctx::Ctx.ifconv	key: options_hash
+base::ctx::Ctx.fn_address	read: R_STATIC (facts_fixed); the key (own_fp)
+base::ctx::Ctx.fn_calls	read: R_CALLS, whether one is left
 middle::inline::FN_DECIDERS	read: R_DEC
 middle::inline::FN_DECIDERS_START	read: R_DEC
-middle::inline::FN_LIVE	read: R_STATIC; the key
+base::ctx::Ctx.fn_live	read: R_STATIC; the key
 middle::inline::FN_RT	read: R_RT
-middle::inline::FN_SCC	read: R_STATIC, whether in the task'"'"'s SCC
+base::ctx::Ctx.fn_scc	read: R_STATIC, whether in the task'"'"'s SCC
 middle::inline::FN_SIZE	read: R_SIZE; the key
-middle::inline::LEAF_DONE	read: R_STATIC; the key
-middle::inline::LEAF_KEEP	read: R_STATIC; the key
-middle::inline::LEAF_SMALL	read: R_STATIC; the key
-middle::inline::PROGRAM_BUDGET	read: R_BUDGET, whether within
-middle::inline::PROGRAM_SIZE	read: R_BUDGET
-middle::inline::SCC_ORDER	key: the component'"'"'s functions
-middle::ipo::ATTRS_READY	key: cc_phase
+base::ctx::Ctx.leaf_done	read: R_STATIC; the key
+base::ctx::Ctx.leaf_keep	read: R_STATIC; the key
+base::ctx::Ctx.leaf_small	read: R_STATIC; the key
+base::ctx::Ctx.program_budget	read: R_BUDGET, whether within
+base::ctx::Ctx.program_size	read: R_BUDGET
+base::ctx::Ctx.scc_order	key: the component'"'"'s functions
+base::ctx::Ctx.attrs_ready	key: cc_phase
 middle::ipo::CALLOC_SYM	IR: a symbol by its text
 middle::ipo::FN_ATTRS	read: R_ATTRS; the key
 middle::ipo::FN_ATTRS_DONE	read: R_ATTRS, R_STATIC (ready); the key
 middle::ipo::FN_NOCAPTURE	read: R_ATTRS; the key
 middle::ipo::FREE_SYM	IR: a symbol by its text
 middle::ipo::MALLOC_SYM	IR: a symbol by its text
-middle::ir::FN_IR	IR: fn_canon (whether it has IR)
+base::ctx::Ctx.fn_ir	IR: fn_canon (whether it has IR)
 middle::ir::IRFUNCS	IR: the task'"'"'s own; read: R_IR, another'"'"'s
-middle::ir::FN_RTIDS	IR: an RTID value by its function and place, its class (the number is the join'"'"'s)
-middle::ir::IRFUNC_COUNT	own
-middle::ir::IR_CALL_LOCS	off: --trace
-middle::ir::IR_EXPR_LOC	off: -g and --trace (IR_LOCS)
-middle::ir::IR_LOC	off: the same
-middle::ir::IR_LOCS	off: the same
-middle::ir::verify::PRINT_AFTER_ALL	off: --print-after-all
-middle::ir::verify::VERIFY_IR	off: --verify-ir
+base::ctx::Ctx.fn_rtids	IR: an RTID value by its function and place, its class (the number is the join'"'"'s)
+base::ctx::Ctx.irfunc_count	own
+base::ctx::Ctx.ir_call_locs	off: --trace
+base::ctx::Ctx.ir_expr_loc	off: -g and --trace (IR_LOCS)
+base::ctx::Ctx.ir_loc	off: the same
+base::ctx::Ctx.ir_locs	off: the same
+base::ctx::Ctx.print_after_all	off: --print-after-all
+base::ctx::Ctx.verify_ir	off: --verify-ir
 middle::opt::DEFERRED	the key (own_fp)
-middle::opt::OPT_LEVEL	key: options_hash
-middle::opt::PER_FUNCTION	key: options_hash
-middle::parallel::COMP_END	key: the component'"'"'s functions
+base::ctx::Ctx.opt_level	key: options_hash
+base::ctx::Ctx.per_function	key: options_hash
+base::ctx::Ctx.comp_end	key: the component'"'"'s functions
 middle::parallel::COMP_GROWTH	own: an output
 middle::parallel::COMP_INLINED	own: an output
-middle::parallel::COMP_LEVEL	read: R_STATIC (ready)
-middle::parallel::COMP_OF	read: R_STATIC (ready)
-middle::parallel::COMP_START	key: the component'"'"'s functions
+base::ctx::Ctx.comp_level	read: R_STATIC (ready)
+base::ctx::Ctx.comp_of	read: R_STATIC (ready)
+base::ctx::Ctx.comp_start	key: the component'"'"'s functions
 middle::parallel::FN_CONSTS	IR: constant data by owner, place and bytes (const_canon); outputs
 middle::parallel::FN_TEXT	own: an output
-middle::parallel::FRESH_CONTEXTS	key: options_hash (cc_args: $VOLE_FRESH_CONTEXTS)
-middle::parallel::ITEMS	own: the task'"'"'s function
-middle::profile::PROFILE_MAX	off: --profile-use (and options_hash)
-middle::slp::SLP	key: options_hash
-middle::vectorize::VECTORIZE	key: options_hash
-middle::vectorize::unroll::UNROLL_RUNTIME	key: options_hash
-tools::query::checks::PRINT_CHECKS	off: --print-checks
+base::ctx::Ctx.fresh_contexts	key: options_hash (cc_args: $VOLE_FRESH_CONTEXTS)
+base::ctx::Ctx.parallel_items	own: the task'"'"'s function
+base::ctx::Ctx.profile_max	off: --profile-use (and options_hash)
+base::ctx::Ctx.slp	key: options_hash
+base::ctx::Ctx.vectorize	key: options_hash
+base::ctx::Ctx.unroll_runtime	key: options_hash
+base::ctx::Ctx.print_checks	off: --print-checks
 tools::query::checks::REMOVED	off: --print-checks'
 
 cd "$ROOT" || exit 1
@@ -375,16 +375,22 @@ grep -rn --exclude-dir=.volec '^ *\(pub \)\{0,1\}static \(mut\|var\) [A-Za-z_0-9
     sub(/^ *(pub )?static (mut|var) /, "", line); sub(/ *:.*/, "", line)
     print (file == "main" ? "crate" : "crate::" file) "::" line
 }' >"$WORK/statics"
+# (0.26.5) And every field of the compilation context, base::ctx::Ctx,
+# which a task is lent let (middle::threads::run_pooled): its statics
+# moved there keep their entries below, as base::ctx::Ctx.FIELD.
+awk '/^pub struct Ctx</ { on = 1; next } on && /^}/ { on = 0 }
+    on && /^    pub [a-z_0-9]+:/ { f = $2; sub(/:.*/, "", f); print "crate::base::ctx::Ctx." f }' \
+    compiler/src/base/ctx.vl >>"$WORK/statics"
 sed 's/^/query refs /; s/$/ --all/' "$WORK/statics" | "$COMPILER" batch >"$WORK/refs" 2>&1
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
-    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); sub(/.*\./, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         # (a method that changes it, through an element too; an address
         # taken, &X or &X[i], which a write may go through)
         if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
-        if ($2 == "read" && match($4, "&(mut )?" n "([^A-Za-z_0-9]|$)")) w = 1
+        if ($2 == "read" && match($4, "&(mut )?([A-Za-z_0-9]+\\.)*" n "([^A-Za-z_0-9]|$)")) w = 1
         if (w && ($3 in in_task)) print s
     }' "$WORK/refs" | sort -u >"$WORK/written"
 printf '%s\n' "$ALLOWED" | cut -f1 | sort -u >"$WORK/allowed"
@@ -402,13 +408,13 @@ awk -F'\t' -v joined="$WORK/joined" -v reached="$WORK/reached" '
         while ((getline f < joined) > 0) in_join[f] = 1
         while ((getline f < reached) > 0) in_task[f] = 1
     }
-    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); sub(/.*\./, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
-        if ($2 == "read" && match($4, "&(mut )?" n "([^A-Za-z_0-9]|$)")) w = 1
+        if ($2 == "read" && match($4, "&(mut )?([A-Za-z_0-9]+\\.)*" n "([^A-Za-z_0-9]|$)")) w = 1
         if (w && ($3 in in_join)) join_writes[s] = 1
-        if ($2 != "use" && $2 != "def" && ($3 in in_task)) task_touches[s] = 1
+        if ($2 != "use" && $2 != "def" && $2 != "init" && ($3 in in_task)) task_touches[s] = 1
     }
     END { for (s in join_writes) if (s in task_touches) print s }' "$WORK/refs" | sort -u >"$WORK/join-written"
 printf '%s\n' "$JOINED" | cut -f1 | sort -u >"$WORK/join-allowed"
@@ -438,12 +444,12 @@ awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
         while ((getline f < A) > 0) in_asm[f] = 1
         while ((getline f < M) > 0) in_main[f] = 1
     }
-    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); sub(/.*\./, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
-        if ($2 == "read" && match($4, "&(mut )?" n "([^A-Za-z_0-9]|$)")) w = 1
-        t = ($2 != "use" && $2 != "def")
+        if ($2 == "read" && match($4, "&(mut )?([A-Za-z_0-9]+\\.)*" n "([^A-Za-z_0-9]|$)")) w = 1
+        t = ($2 != "use" && $2 != "def" && $2 != "init")
         if ($3 in in_asm) { if (w) aw[s] = 1; if (t) at[s] = 1 }
         if ($3 in in_main) { if (w) mw[s] = 1; if (t) mt[s] = 1 }
     }
@@ -457,7 +463,7 @@ done
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
     /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); next }
-    NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ { if ($2 != "use" && $2 != "def" && ($3 in in_task)) print s }' "$WORK/refs" \
+    NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ { if ($2 != "use" && $2 != "def" && $2 != "init" && ($3 in in_task)) print s }' "$WORK/refs" \
     | sort -u >"$WORK/touched"
 printf '%s\n' "$READ" | cut -f1 | sort -u >"$WORK/read-allowed"
 newr=$(comm -23 "$WORK/touched" "$WORK/read-allowed")

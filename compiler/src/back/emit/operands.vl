@@ -10,7 +10,9 @@ use crate::back::regalloc::{LOC_NONE, LOC_REMAT};
 use crate::back::regalloc::locations::{stored_at_def, vloc};
 use crate::back::regalloc::prepare::tracked;
 use crate::base::{buf_byte, die};
-use crate::front::types::{FNS, STATICS, SYM_STATIC, TY_F64, in_fregs, is_float, is_vector};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::{TY_F64, in_fregs, is_float, is_vector};
 use crate::gen0::gen::{fn_symbol_prefix, static_symbol_prefix};
 use crate::gen0::target::{oi, on};
 use crate::middle::ctx::FnCtx;
@@ -20,33 +22,33 @@ use crate::middle::ir::Op::{Const, GAddr, SAddr, Slot};
 // ---- Operands and results ----
 
 // Rematerializes value `v` (is_remat_op) into register `r`.
-pub fn materialize(cx: inout FnCtx, v: i64, r: i64) {
+pub fn materialize(cx: inout FnCtx, v: i64, r: i64, pcx: Ctx<Comp>) {
     unsafe {
         let op = cx.insts[v].op;
         let imm = cx.insts[v].imm;
         if op == Const {
             if is_float(cx.insts[v].ty) {
-                m_load_fimm(&cx, r, imm, cx.insts[v].ty);
+                m_load_fimm(&cx, r, imm, cx.insts[v].ty, pcx);
             } else if is_vector(cx.insts[v].ty) {
                 // (0.19) a 64-bit vector of constant lanes, its bits in imm
                 // (a load of a constant 8-byte array): a vector register's
                 // low half, as an f64's bits
-                m_load_fimm(&cx, r, imm, TY_F64);
+                m_load_fimm(&cx, r, imm, TY_F64, pcx);
             } else {
                 m_load_imm(&cx, r, imm as u64);
             }
         } else if op == Slot {
             m_lea(&cx, r, reg_sp(), cx.slots[imm].offset);
         } else if op == GAddr {
-            let st = SYM_STATIC[imm] - 1;
+            let st = pcx.sym_static[imm] - 1;
             // (0.25.5) gen_data writes only the statics the lowered IR named
-            if STATICS[st].linkage == 0 && !crate::gen0::gen::is_static_named(st) {
+            if pcx.statics[st].linkage == 0 && !crate::gen0::gen::is_static_named(st, pcx) {
                 crate::base::die(c"internal error: code names a static the IR as lowered did not (gen0::gen::statics_named_by_ir)");
             }
-            if STATICS[st].linkage == 1 {
-                m_extern_addr(&cx, r, imm);
+            if pcx.statics[st].linkage == 1 {
+                m_extern_addr(&cx, r, imm, pcx);
             } else {
-                m_symbol_addr(&cx, r, static_symbol_prefix(st), imm);
+                m_symbol_addr(&cx, r, static_symbol_prefix(st, pcx), imm, pcx);
             }
         } else if op == SAddr {
             m_string_addr(&cx, r, imm);
@@ -65,10 +67,10 @@ pub fn materialize(cx: inout FnCtx, v: i64, r: i64) {
             buf_byte(cx.code, ',');
             oi(&cx, i);
             on(&cx);
-        } else if FNS[imm].is_extern {
-            m_extern_addr(&cx, r, FNS[imm].name);
+        } else if pcx.fns[imm].is_extern {
+            m_extern_addr(&cx, r, pcx.fns[imm].name, pcx);
         } else {
-            m_symbol_addr(&cx, r, fn_symbol_prefix(imm), FNS[imm].name);
+            m_symbol_addr(&cx, r, fn_symbol_prefix(imm, pcx), pcx.fns[imm].name, pcx);
         }
     }
 }
@@ -85,10 +87,10 @@ fn use_reg(cx: inout FnCtx, v: i64) -> i64 {
 
 // Value `v`, used at `pos` where it may be anywhere, in a register: its
 // own, or `scratch` after loading or rematerializing it there.
-pub fn use_any(cx: inout FnCtx, v: i64, pos: i64, scratch: i64) -> i64 {
+pub fn use_any(cx: inout FnCtx, v: i64, pos: i64, scratch: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.insts[v].op.is_remat() {
-            materialize(&cx, v, scratch);
+            materialize(&cx, v, scratch, pcx);
             return scratch;
         }
         let loc = vloc(&cx, v, pos);
@@ -98,17 +100,17 @@ pub fn use_any(cx: inout FnCtx, v: i64, pos: i64, scratch: i64) -> i64 {
         if loc >= 0 {
             return loc;
         }
-        m_load(&cx, spill_type(cx.insts[v].ty), scratch, reg_sp(), spill_offset(&cx, loc));
+        m_load(&cx, spill_type(cx.insts[v].ty), scratch, reg_sp(), spill_offset(&cx, loc), pcx);
         scratch
     }
 }
 
 // Value `v` (used at `pos`) in register `r` exactly.
-pub fn use_into(cx: sink *FnCtx, v: i64, pos: i64, r: i64) {
+pub fn use_into(cx: sink *FnCtx, v: i64, pos: i64, r: i64, pcx: Ctx<Comp>) {
     // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
     // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-    let got = use_any(unsafe { &*cx }, v, pos, r);
-    unsafe { m_mov(&*cx, r, got, cx.insts[v].ty); }
+    let got = use_any(unsafe { &*cx }, v, pos, r, pcx);
+    unsafe { m_mov(&*cx, r, got, cx.insts[v].ty, pcx); }
 }
 
 pub fn int_operand(cx: inout FnCtx, v: i64) -> i64 {
@@ -135,12 +137,12 @@ pub fn result_reg(cx: sink *FnCtx, v: i64) -> i64 {
 }
 
 // Stores the result into its spill slot when it goes to the stack.
-pub fn result_done(cx: inout FnCtx, v: i64, r: i64) {
+pub fn result_done(cx: inout FnCtx, v: i64, r: i64, pcx: Ctx<Comp>) {
     let t = tracked(&cx, v);
     if t >= 0 && stored_at_def(&cx, t) {
         unsafe {
             m_store(&cx, spill_type(cx.insts[v].ty), r, reg_sp(),
-                spill_offset(&cx, 0 - (1 + cx.rv_slot[t])));
+                spill_offset(&cx, 0 - (1 + cx.rv_slot[t])), pcx);
         }
     }
 }
@@ -200,21 +202,21 @@ pub fn pm_value(cx: inout FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIE
 pub fn pm_result(cx: inout FnCtx, i: i64) -> i64 { unsafe { cx.pm.data[i * PM_FIELDS + 6] } }
 
 // Moves location `src` to location `dst` (a value of type `ty`).
-fn move_loc(cx: inout FnCtx, dst: i64, src: i64, ty: i64) {
+fn move_loc(cx: inout FnCtx, dst: i64, src: i64, ty: i64, pcx: Ctx<Comp>) {
     if dst == src {
         return;
     }
     let st = spill_type(ty);
     if dst >= 0 && src >= 0 {
-        m_mov(&cx, dst, src, ty);
+        m_mov(&cx, dst, src, ty, pcx);
     } else if dst >= 0 {
-        m_load(&cx, st, dst, reg_sp(), spill_offset(&cx, src));
+        m_load(&cx, st, dst, reg_sp(), spill_offset(&cx, src), pcx);
     } else if src >= 0 {
-        m_store(&cx, st, src, reg_sp(), spill_offset(&cx, dst));
+        m_store(&cx, st, src, reg_sp(), spill_offset(&cx, dst), pcx);
     } else {
         let temp = reg_move_temp(in_fregs(ty));
-        m_load(&cx, st, temp, reg_sp(), spill_offset(&cx, src));
-        m_store(&cx, st, temp, reg_sp(), spill_offset(&cx, dst));
+        m_load(&cx, st, temp, reg_sp(), spill_offset(&cx, src), pcx);
+        m_store(&cx, st, temp, reg_sp(), spill_offset(&cx, dst), pcx);
     }
 }
 
@@ -231,7 +233,7 @@ fn pm_is_source(cx: inout FnCtx, loc: i64, except: i64) -> bool {
 }
 
 // Emits every pending move, then clears them.
-pub fn pm_resolve(cx: inout FnCtx) {
+pub fn pm_resolve(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
         let n = cx.pm.count / PM_FIELDS;
         for i in 0..n {
@@ -248,7 +250,7 @@ pub fn pm_resolve(cx: inout FnCtx) {
                 }
                 pending = true;
                 if !pm_is_source(&cx, pm_dst(&cx, i), i) {
-                    move_loc(&cx, pm_dst(&cx, i), pm_src(&cx, i), pm_ty(&cx, i));
+                    move_loc(&cx, pm_dst(&cx, i), pm_src(&cx, i), pm_ty(&cx, i), pcx);
                     cx.pm.data[i * PM_FIELDS + 4] = 1;
                     progress = true;
                 }
@@ -270,7 +272,7 @@ pub fn pm_resolve(cx: inout FnCtx) {
             if pm_is_source(&cx, temp, -1) {
                 die(c"internal error: parallel move cycle register in use");
             }
-            move_loc(&cx, temp, d, pm_ty(&cx, i));
+            move_loc(&cx, temp, d, pm_ty(&cx, i), pcx);
             for j in 0..n {
                 if !pm_done(&cx, j) && pm_kind(&cx, j) == PM_LOC && pm_src(&cx, j) == d {
                     cx.pm.data[j * PM_FIELDS + 2] = temp;
@@ -285,14 +287,14 @@ pub fn pm_resolve(cx: inout FnCtx) {
             let ty = pm_ty(&cx, i);
             let r = if dst >= 0 { dst } else { reg_move_temp(in_fregs(ty)) };
             if pm_kind(&cx, i) == PM_REMAT {
-                materialize(&cx, pm_src(&cx, i), r);
+                materialize(&cx, pm_src(&cx, i), r, pcx);
             } else if pm_kind(&cx, i) == PM_ADDR {
                 m_lea(&cx, r, reg_fp(), pm_src(&cx, i));
             } else {
-                m_load(&cx, ty, r, reg_fp(), pm_src(&cx, i));
+                m_load(&cx, ty, r, reg_fp(), pm_src(&cx, i), pcx);
             }
             if dst < 0 {
-                m_store(&cx, spill_type(ty), r, reg_sp(), spill_offset(&cx, dst));
+                m_store(&cx, spill_type(ty), r, reg_sp(), spill_offset(&cx, dst), pcx);
             }
         }
         cx.pm.count = 0;
