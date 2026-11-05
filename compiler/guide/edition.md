@@ -82,11 +82,11 @@ each with its own code; 0.27.2's std removes both:
 A generic `let` parameter of std's is `&T` or `T` per instance (a copy
 for a plain T); a `&x` given to one is lent, as Rust's `v.contains(&3)`.
 
-The edition is lenient where MVS's 0.19 meanings are (`edition.lenient`,
-closed in 0.27.1): a `&T` of a plain value (a number, a struct of
-numbers) is read where the value goes, and a place is lent where `&T`
-goes. A program Rust accepts means the same; some that Rust rejects
-compile.
+0.27.0 was lenient where MVS's 0.19 meanings are; 0.27.1 closes it
+(`edition.lenient`): a `&T` given where its value goes, or a place where
+`&T` goes, to a rust-edition function or a `let`'s written type, is an
+error whose `try:` is Rust's spelling (`*r`, `&x`). MVS std's
+parameters keep 0.19's meanings until 0.27.2's std.
 
 ## Regions, not solved yet
 
