@@ -109,11 +109,16 @@ The rust edition's std, its API as a spec tree (std270):
 - `compiler/std2/checklist.tsv` (tools/std2-checklist.py) lists every item
   against MVS's std: 1,376 items, of which 297 kept, 15 renamed, 162
   changed and 902 new, and 70 MVS items gone, each with its replacement;
-  every MVS item of the modules in scope is accounted for. Each item names
-  the rust-front features it waits for (`edition.later: NAME`, from
-  `features.tsv`): 245 wait for 0.27.2 (derives in Rust's shape, char,
-  FnOnce, SliceIndex, impls for references, ...), and the gate-1 test that
-  will cover it.
+  every MVS item of the modules in scope is accounted for. Each item says
+  what the real check makes of it (`typecheck.txt`, the front's 440
+  errors on the tree, mapped to their items): 1,012 typecheck, 142 have
+  only `edition.later` errors and 222 a plain one. It names the features
+  it waits for, the `edition.later` codes (where_bound, char, FnOnce,
+  supertraits, impls for references, ...: 0.27.2) and, for a plain error,
+  the front gap it shows (an impl parameter fixed only by the trait, std2
+  checked beside MVS's std, a trait parameter's default in an impl
+  header, ...: in `features.tsv`, no release yet), and the gate-1 test
+  that will cover it.
 - `compiler/std2/rewrite.tsv` is the std part of `fix --edition rust`'s
   table (0.27.3): 248 rows for 233 MVS items, each call, type name or
   impl shape that changes, chosen by type (`v.get(i)` is `v[i]` for a
