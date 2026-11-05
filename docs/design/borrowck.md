@@ -991,6 +991,13 @@ outside the holes named below.
 - R10 Fake borrows (D2.6) conflict only with `WA`, `WB` and `WD` (as
   rustc); a move of the scrutinee in a guard is not theirs: it is the
   move dataflow's at the next arm's test, which is L8.
+- R12 A by-`&` capture of a variable whose type is a shared view (`[T]`,
+  `str`: MVS's `&[T]`, which `&&[T]` collapses to) is a copy of the
+  view into the closure, not a loan of the variable, until Z9 (ir271):
+  sound, since a shared view is `Copy` and immutable, and the view's own
+  region is carried by the copy; a reassignment of the variable while
+  the closure is live is then not a conflict (rustc: it is). Reason:
+  the `&&'a str` front gap (§13); ends with it.
 - R11 An MVS std type is `Copy` in the rust edition when it has no drop
   glue and `Copy` type arguments (`places::regions::rust_copy`), so
   `Range<i64>` is `Copy` here and a range used twice is a copy, not a
