@@ -73,7 +73,7 @@ pub fn type_elem(t: i64, i: i64) -> i64 {
 pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64) -> i64 {
     unsafe {
         let count = TSCRATCH.count - mark;
-        let found = type_hash_find(kind, a, b, mark, count);
+        let found = type_hash_find(kind, a, b, &TSCRATCH.data[mark], count);
         if found >= 0 {
             TSCRATCH.count = mark;
             return found;
@@ -83,8 +83,34 @@ pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64) -> i64 {
             TLISTS.push(TSCRATCH.data[i]);
         }
         TSCRATCH.count = mark;
-        add_type(kind, a, b, list, count)
+        let t = add_type(kind, a, b, list, count);
+        // (0.27.0) A 256-bit vector's 128-bit half is made with it: lowering
+        // and the tasks' ABI find it (made_vector_half; a task makes no type).
+        if kind == Vector && b * lane_bytes(a) == 32 {
+            make_type(Vector, a, b / 2, TSCRATCH.count);
+        }
+        t
     }
+}
+
+// The size of a vector's lane type t (a scalar).
+fn lane_bytes(t: i64) -> i64 {
+    if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
+        1
+    } else if t == TY_I16 || t == TY_U16 {
+        2
+    } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
+        4
+    } else {
+        8
+    }
+}
+
+// (0.27.0) The type with these fields and no elements if it is made, or
+// -1: make_type's lookup alone, which writes nothing (a task's, where the
+// types are only read: middle::parallel).
+pub fn find_type(kind: TyKind, a: i64, b: i64) -> i64 {
+    type_hash_find(kind, a, b, 0 as *i64, 0)
 }
 
 // The number of types made so far (ids are below it).
@@ -92,10 +118,10 @@ pub fn type_count() -> i64 {
     TYPES.len() as i64
 }
 
-fn same_elems(t: i64, mark: i64) -> bool {
+fn same_elems(t: i64, elems: *i64) -> bool {
     unsafe {
         for i in 0..TYPES[t].count {
-            if type_elem(t, i) != TSCRATCH.data[mark + i] {
+            if type_elem(t, i) != elems[i] {
                 return false;
             }
         }
@@ -126,19 +152,19 @@ fn type_hash(kind: TyKind, a: i64, b: i64, elems: *i64, count: i64) -> i64 {
 }
 
 // The lowest id of a constructed type with these fields and the elements
-// TSCRATCH[mark..mark + count], or -1.
-fn type_hash_find(kind: TyKind, a: i64, b: i64, mark: i64, count: i64) -> i64 {
+// elems[0..count], or -1 (it writes nothing).
+fn type_hash_find(kind: TyKind, a: i64, b: i64, elems: *i64, count: i64) -> i64 {
     unsafe {
         if TYPE_HASH_SIZE == 0 {
             return -1;
         }
         let mask = TYPE_HASH_SIZE - 1;
-        var slot = type_hash(kind, a, b, &TSCRATCH.data[mark], count) & mask;
+        var slot = type_hash(kind, a, b, elems, count) & mask;
         var found = -1;
         while TYPE_HASH[slot] != 0 {
             let t = TYPE_HASH[slot] - 1;
             if TYPES[t].kind == kind && TYPES[t].a == a && TYPES[t].b == b
-                && TYPES[t].count == count && same_elems(t, mark) && (found < 0 || t < found) {
+                && TYPES[t].count == count && same_elems(t, elems) && (found < 0 || t < found) {
                 found = t;
             }
             slot = (slot + 1) & mask;
@@ -260,6 +286,7 @@ pub fn init_types(pcx: inout Ctx<Comp>) {
     pcx.ty_v4i32 = make_type(Vector, TY_I32, 4, TSCRATCH.count);
     pcx.ty_v8i16 = make_type(Vector, TY_I16, 8, TSCRATCH.count);
     pcx.ty_v16i8 = make_type(Vector, TY_I8, 16, TSCRATCH.count);
+    crate::front::cells::find_cell_sym();
 }
 
 // ---- Vector types (0.10) ----
@@ -316,6 +343,17 @@ pub fn vec_mask_type(t: i64, pcx: Ctx<Comp>) -> i64 {
 // as many (lowering legalizes a 256-bit vector into two of them).
 pub fn vector_half(t: i64) -> i64 {
     make_type(Vector, vec_elem(t), vec_lanes(t) / 2, TSCRATCH.count)
+}
+
+// (0.27.0) vector_half's type, found (a task's: the types only read):
+// middle::parallel's prepare_layouts makes the half of every 256-bit
+// vector type before the tasks run.
+pub fn made_vector_half(t: i64) -> i64 {
+    let half = find_type(Vector, vec_elem(t), vec_lanes(t) / 2);
+    if half < 0 {
+        crate::base::die(c"internal: a 256-bit vector type's half was not made before the tasks (middle::parallel's prepare_layouts)");
+    }
+    half
 }
 
 // (0.19) The vector types beyond 0.10's six: unsigned, 64-bit and 256-bit
@@ -752,8 +790,12 @@ pub fn variant_field_offset(v: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
             return 0;
         }
         if (ENUMS[e].repr & REPR_C) != 0 {
-            compute_layout(enum_type(e), pcx);
-            return ENUMS[e].payload + tuple_offset(pcx.variants[v].shape, i, pcx);
+            // (0.27.0: the payload kept with the enum's layout, or laid out
+            // here as type_size does)
+            let t = find_type(Enum, e, 0);
+            let payload = if t >= 0 && TYPES[t].size >= 0 { ENUMS[e].payload }
+                else { enum_layout(e, pcx).payload };
+            return payload + tuple_offset(pcx.variants[v].shape, i, pcx);
         }
         tuple_offset(pcx.variants[v].shape, i + 1, pcx)
     }
@@ -775,135 +817,237 @@ pub fn align_to(offset: i64, align: i64) -> i64 {
     (offset + align - 1) & ~(align - 1)
 }
 
+// (0.27.0) A type's layout is read here and made by compute_layout, on
+// the main thread: every type's after checking (lay_out_types) and before
+// each phase of the code generator's tasks (middle::parallel's
+// prepare_layouts), which only read it. A type not laid out yet (the
+// front end's, or one made since) is laid out here and not kept.
 pub fn type_size(t: i64, pcx: Ctx<Comp>) -> i64 {
-    compute_layout(t, pcx);
-    TYPES[t].size
+    if TYPES[t].size >= 0 {
+        return TYPES[t].size;
+    }
+    layout_of(t, 0 as *i64, pcx).size
 }
 
 pub fn type_align(t: i64, pcx: Ctx<Comp>) -> i64 {
-    compute_layout(t, pcx);
-    TYPES[t].align
+    if TYPES[t].size >= 0 {
+        return TYPES[t].align;
+    }
+    layout_of(t, 0 as *i64, pcx).align
 }
 
+// Makes type t's layout and keeps it, the layouts of the types it holds
+// first, with a struct's fields' offsets and a #[repr(C)] enum's payload.
 pub fn compute_layout(t: i64, pcx: Ctx<Comp>) {
     unsafe {
         if TYPES[t].size >= 0 {
             return;
         }
         let kind = TYPES[t].kind;
-        var size = 0;
-        var align = 1;
-        if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
-            size = 1;
-        } else if t == TY_I16 || t == TY_U16 {
-            size = 2;
-        } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
-            size = 4;
-        } else if t == TY_I64 || t == TY_U64 || t == TY_USIZE || t == TY_ISIZE || t == TY_F64
-            || kind == Ptr || kind == Fn {
-            size = 8;
-        } else if kind == Slice {
-            size = 16;
-            align = 8;
-        } else if kind == Vector {
-            // (0.19: 8, 16 or 32 bytes, aligned to their size)
-            size = TYPES[t].b * type_size(TYPES[t].a, pcx);
-            align = size;
-        } else if kind == TyKind::Distinct {
-            size = type_size(TYPES[t].a, pcx);
-            align = type_align(TYPES[t].a, pcx);
-        } else if kind == Enum && crate::front::distinct::enum_niche(TYPES[t].a, pcx) {
-            // (0.18: the null niche, one pointer: front/distinct.vl)
-            size = 8;
-            align = 8;
-        } else if kind == Enum {
+        if kind == Vector || kind == TyKind::Distinct || kind == Array {
+            compute_layout(TYPES[t].a, pcx);
+        } else if kind == Tuple {
+            for i in 0..TYPES[t].count {
+                compute_layout(type_elem(t, i), pcx);
+            }
+        } else if kind == Struct {
+            let s = TYPES[t].a;
+            for i in 0..pcx.structs[s].field_count {
+                compute_layout((*struct_field(s, i, pcx)).ty, pcx);
+            }
+        } else if kind == Enum && !crate::front::distinct::enum_niche(TYPES[t].a, pcx) {
             let e = TYPES[t].a;
-            size = type_size(ENUMS[e].tag, pcx);
-            align = size;
-            var largest = 0;
-            var widest = 1;
+            compute_layout(ENUMS[e].tag, pcx);
             for i in 0..ENUMS[e].variant_count {
                 let shape = pcx.variants[enum_variant(e, i)].shape;
                 if shape != 0 {
-                    largest = max_i64(largest, type_size(shape, pcx));
-                    widest = max_i64(widest, type_align(shape, pcx));
+                    compute_layout(shape, pcx);
                 }
             }
-            if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
-                ENUMS[e].payload = align_to(size, widest);
-                size = ENUMS[e].payload + largest;
-            } else {
-                size = max_i64(size, largest);
-            }
-            align = max_i64(align, widest);
-            size = align_to(size, align);
-        } else if kind == Array {
-            size = type_size(TYPES[t].a, pcx) * TYPES[t].b;
-            align = type_align(TYPES[t].a, pcx);
-        } else if kind == Tuple {
-            var offset = 0;
-            for i in 0..TYPES[t].count {
-                let elem = type_elem(t, i);
-                align = max_i64(align, type_align(elem, pcx));
-                offset = align_to(offset, type_align(elem, pcx)) + type_size(elem, pcx);
-            }
-            size = align_to(offset, align);
-        } else if kind == Struct {
+        }
+        var offsets = 0 as *i64;
+        if kind == Struct {
+            offsets = alloc_array::<i64>(pcx.structs[TYPES[t].a].field_count + 1);
+        }
+        let l = layout_of(t, offsets, pcx);
+        if kind == Struct {
             let s = TYPES[t].a;
-            let repr = pcx.structs[s].repr;
-            let n = pcx.structs[s].field_count;
-            // The order of the fields in memory: as declared for C (and
-            // 0.26.2, WGSL), by alignment (largest first, which leaves the
-            // least padding) otherwise.
-            let wgsl = (repr & REPR_WGSL) != 0;
-            let order = alloc_array::<i64>(n + 1);
-            for i in 0..n {
-                order[i] = i;
+            for i in 0..pcx.structs[s].field_count {
+                (*struct_field(s, i, pcx)).offset = offsets[i];
             }
-            if (repr & REPR_C) == 0 && !wgsl {
-                for i in 1..n {
-                    var j = i;
-                    while j > 0
-                        && type_align((*struct_field(s, order[j - 1], pcx)).ty, pcx)
-                        < type_align((*struct_field(s, order[j], pcx)).ty, pcx) {
-                        let swap = order[j];
-                        order[j] = order[j - 1];
-                        order[j - 1] = swap;
-                        j -= 1;
-                    }
+            free(offsets as *u8);
+        } else if kind == Enum && l.payload >= 0 {
+            ENUMS[TYPES[t].a].payload = l.payload;
+        }
+        TYPES[t].size = l.size;
+        TYPES[t].align = l.align;
+    }
+}
+
+// (0.27.0) A layout: the size, the alignment and, for a #[repr(C)] enum
+// with fields, the offset of the fields after its tag (-1 otherwise).
+struct Layout { size: i64, align: i64, payload: i64 }
+
+// The layout of type t from its parts' (type_size and type_align), kept
+// nowhere; a struct's fields' offsets go to offsets[i] when offsets is not
+// null.
+fn layout_of(t: i64, offsets: *i64, pcx: Ctx<Comp>) -> Layout {
+    let kind = TYPES[t].kind;
+    var size = 0;
+    var align = 1;
+    var payload = -1;
+    if t == TY_I8 || t == TY_U8 || t == TY_BOOL {
+        size = 1;
+    } else if t == TY_I16 || t == TY_U16 {
+        size = 2;
+    } else if t == TY_I32 || t == TY_U32 || t == TY_F32 {
+        size = 4;
+    } else if t == TY_I64 || t == TY_U64 || t == TY_USIZE || t == TY_ISIZE || t == TY_F64
+        || kind == Ptr || kind == Fn {
+        size = 8;
+    } else if kind == Slice {
+        size = 16;
+        align = 8;
+    } else if kind == Vector {
+        // (0.19: 8, 16 or 32 bytes, aligned to their size)
+        size = TYPES[t].b * type_size(TYPES[t].a, pcx);
+        align = size;
+    } else if kind == TyKind::Distinct {
+        size = type_size(TYPES[t].a, pcx);
+        align = type_align(TYPES[t].a, pcx);
+    } else if kind == Enum && crate::front::distinct::enum_niche(TYPES[t].a, pcx) {
+        // (0.18: the null niche, one pointer: front/distinct.vl)
+        size = 8;
+        align = 8;
+    } else if kind == Enum {
+        let l = enum_layout(TYPES[t].a, pcx);
+        size = l.size;
+        align = l.align;
+        payload = l.payload;
+    } else if kind == Array {
+        size = type_size(TYPES[t].a, pcx) * TYPES[t].b;
+        align = type_align(TYPES[t].a, pcx);
+    } else if kind == Tuple {
+        var offset = 0;
+        for i in 0..TYPES[t].count {
+            let elem = type_elem(t, i);
+            align = max_i64(align, type_align(elem, pcx));
+            offset = align_to(offset, type_align(elem, pcx)) + type_size(elem, pcx);
+        }
+        size = align_to(offset, align);
+    } else if kind == Struct {
+        let l = struct_layout(TYPES[t].a, offsets, pcx);
+        size = l.size;
+        align = l.align;
+    }
+    if size > 0 && kind != Array && kind != Tuple && kind != Struct && kind != Enum
+        && kind != Slice && kind != TyKind::Distinct {
+        align = size;
+    }
+    Layout { size, align, payload }
+}
+
+// The layout of enum e without a niche: its tag, then the largest variant.
+fn enum_layout(e: i64, pcx: Ctx<Comp>) -> Layout {
+    // UNSAFE: ENUMS is the checker's raw table of enums (*EnumInfo).
+    // SAFETY: e is an enum id below ENUM_COUNT (an enum type's TYPES[t].a or
+    // a variant's enum_id); its variants' ids are below VARIANT_COUNT.
+    unsafe {
+        var size = type_size(ENUMS[e].tag, pcx);
+        var align = size;
+        var payload = -1;
+        var largest = 0;
+        var widest = 1;
+        for i in 0..ENUMS[e].variant_count {
+            let shape = pcx.variants[enum_variant(e, i)].shape;
+            if shape != 0 {
+                largest = max_i64(largest, type_size(shape, pcx));
+                widest = max_i64(widest, type_align(shape, pcx));
+            }
+        }
+        if (ENUMS[e].repr & REPR_C) != 0 && ENUMS[e].has_fields {
+            payload = align_to(size, widest);
+            size = payload + largest;
+        } else {
+            size = max_i64(size, largest);
+        }
+        align = max_i64(align, widest);
+        size = align_to(size, align);
+        Layout { size, align, payload }
+    }
+}
+
+// The layout of struct s, its fields' offsets in offsets[i] when offsets
+// is not null.
+fn struct_layout(s: i64, offsets: *i64, pcx: Ctx<Comp>) -> Layout {
+    // UNSAFE: the fields are the checker's raw table (struct_field), and
+    // order and offsets raw arrays.
+    // SAFETY: s is a struct id below STRUCT_COUNT, i and order[k] below its
+    // field_count; order has n + 1 elements, offsets (the caller's) at
+    // least n.
+    unsafe {
+        var align = 1;
+        let repr = pcx.structs[s].repr;
+        let n = pcx.structs[s].field_count;
+        // The order of the fields in memory: as declared for C (and
+        // 0.26.2, WGSL), by alignment (largest first, which leaves the
+        // least padding) otherwise.
+        let wgsl = (repr & REPR_WGSL) != 0;
+        let order = alloc_array::<i64>(n + 1);
+        for i in 0..n {
+            order[i] = i;
+        }
+        if (repr & REPR_C) == 0 && !wgsl {
+            for i in 1..n {
+                var j = i;
+                while j > 0
+                    && type_align((*struct_field(s, order[j - 1], pcx)).ty, pcx)
+                    < type_align((*struct_field(s, order[j], pcx)).ty, pcx) {
+                    let swap = order[j];
+                    order[j] = order[j - 1];
+                    order[j - 1] = swap;
+                    j -= 1;
                 }
             }
-            var offset = 0;
-            for k in 0..n {
-                let field = struct_field(s, order[k], pcx);
-                let field_ty = (*field).ty;
-                // Packed: aligned to at most the packing (`align` holds it).
-                let natural = if wgsl { wgsl_align(field_ty, pcx) }
-                    else { type_align(field_ty, pcx) };
-                let field_align = if (repr & REPR_PACKED) != 0
-                    && natural > pcx.structs[s].align { pcx.structs[s].align } else { natural };
-                align = max_i64(align, field_align);
-                if (repr & REPR_UNION) != 0 {
-                    (*field).offset = 0;
-                    offset = max_i64(offset, type_size(field_ty, pcx));
-                } else {
-                    offset = align_to(offset, field_align);
-                    (*field).offset = offset;
-                    offset += type_size(field_ty, pcx);
+        }
+        var offset = 0;
+        for k in 0..n {
+            let field_ty = (*struct_field(s, order[k], pcx)).ty;
+            // Packed: aligned to at most the packing (`align` holds it).
+            let natural = if wgsl { wgsl_align(field_ty, pcx) } else { type_align(field_ty, pcx) };
+            let field_align = if (repr & REPR_PACKED) != 0 && natural > pcx.structs[s].align {
+                pcx.structs[s].align
+            } else {
+                natural
+            };
+            align = max_i64(align, field_align);
+            if (repr & REPR_UNION) != 0 {
+                if offsets != 0 as *i64 {
+                    offsets[order[k]] = 0;
                 }
+                offset = max_i64(offset, type_size(field_ty, pcx));
+            } else {
+                offset = align_to(offset, field_align);
+                if offsets != 0 as *i64 {
+                    offsets[order[k]] = offset;
+                }
+                offset += type_size(field_ty, pcx);
             }
-            free(order as *u8);
-            if (repr & REPR_PACKED) == 0 {
-                align = max_i64(align, pcx.structs[s].align);
-            }
-            size = align_to(offset, align);
         }
-        if size > 0 && kind != Array && kind != Tuple && kind != Struct && kind != Enum
-            && kind != Slice && kind != TyKind::Distinct {
-            align = size;
+        free(order as *u8);
+        if (repr & REPR_PACKED) == 0 {
+            align = max_i64(align, pcx.structs[s].align);
         }
-        TYPES[t].size = size;
-        TYPES[t].align = align;
+        Layout { size: align_to(offset, align), align, payload: -1 }
+    }
+}
+
+// (0.27.0) Lays out every type made so far: the main thread's, after
+// checking (gen0::gen::compile_program), so that lowering and the code
+// generators read the layouts kept.
+pub fn lay_out_types(pcx: Ctx<Comp>) {
+    for t in 0..TYPES.len() as i64 {
+        compute_layout(t, pcx);
     }
 }
 
@@ -949,10 +1093,24 @@ pub fn tuple_offset(t: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
     offset
 }
 
-// The offset of field `i` of struct `s`.
+// The offset of field `i` of struct `s` (read: kept with the struct's
+// layout, or laid out here as type_size does).
 pub fn field_offset(s: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
-    compute_layout(struct_type(s), pcx);
-    unsafe { (*struct_field(s, i, pcx)).offset }
+    // UNSAFE: the fields are the checker's raw table (struct_field), and
+    // offsets a raw array.
+    // SAFETY: s is a struct id below STRUCT_COUNT and i below its
+    // field_count; offsets has field_count + 1 elements.
+    unsafe {
+        let t = find_type(Struct, s, 0);
+        if t >= 0 && TYPES[t].size >= 0 {
+            return (*struct_field(s, i, pcx)).offset;
+        }
+        let offsets = alloc_array::<i64>(pcx.structs[s].field_count + 1);
+        struct_layout(s, offsets, pcx);
+        let offset = offsets[i];
+        free(offsets as *u8);
+        offset
+    }
 }
 
 // ---- C interoperability ----
