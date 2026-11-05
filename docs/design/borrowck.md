@@ -651,19 +651,21 @@ project's rule: every error of a compilation), deduped by §14.3.
    `drop` of `root(P)`, or the implicit exit access of a parameter: a
    by-value parameter returned by reference is caught only by that
    rule). Such a conflict exists whenever D6.2.2 applies and `ℓ` is not
-   killed, by the lemma: **(premise) every frame-owned root has a `WD`
-   access on every exit path** — an explicit `StorageDead` or `drop`
-   for every non-parameter local (the builder's `all_storage`, verified
-   on `return` inside `for`, on `?`'s `None` path and on the normal
-   path) and the implicit exit access of D2.2 for a parameter — and
-   `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u) ⊇ Pts`, so `ℓ` is in scope
-   at every point reachable from its creation, including that `WD`; if
-   `ℓ` is killed on a path, the reference was overwritten there and
-   nothing escapes on that path. The premise is a checked invariant:
-   `--verify-places` on a rust-edition body reports a non-parameter
-   local (other than `_0`) with a path from its `StorageLive` to a
-   `return` that has no `StorageDead` of it (bc271 M2 adds the check;
-   its count on the corpus is 0). A loan that is
+   killed, by the lemma: **(premise) the frame-owned root of a loan in
+   scope at an exit has a `WD` access on the path to it** — an explicit
+   `StorageDead` or `drop` for a non-parameter local (the builder's
+   `all_storage`; a temporary made live before a `?` and left by its
+   early return has none there, but is uninitialized and unborrowed
+   there, so no loan of it is in scope) and the implicit exit access of
+   D2.2 for a parameter — and `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u)
+   ⊇ Pts`, so `ℓ` is in scope at every point reachable from its
+   creation, including that `WD`; if `ℓ` is killed on a path, the
+   reference was overwritten there and nothing escapes on that path.
+   The premise is a checked invariant: `--verify-places` on a
+   rust-edition body reports a loan in scope at a `return` whose root
+   is a non-parameter local with its storage still live there (no
+   `StorageDead` on the path; `access.vl` `verify_exits`; its count on
+   the corpus is 0). A loan that is
    not frame-owned (`&*x`, `&x.f`, `&s[i]` through `x: &'a T`, `s:
    &'a [T]`) carries `'a : 'ℓ` (supporting prefix), so `fn f(x: &T) ->
    &T { &*x }` yields `'a : 'ℓ : '0 : 'ret = 'a`: no `end` beyond

@@ -88,14 +88,35 @@ for a plain T); a `&x` given to one is lent, as Rust's `v.contains(&3)`.
 error whose `try:` is Rust's spelling (`*r`, `&x`). MVS std's
 parameters keep 0.19's meanings until 0.27.2's std.
 
-## Regions, not solved yet
+## The borrow checker (0.27.1)
 
-0.27.0 builds each rust-edition function's region variables (a loan per
-`&x`, one per reference in a parameter's or a local's type, one per call
-whose result holds a reference: `volec check --emit-places` prints them,
-`&'r3 _1`), and solves none yet: every such function is one warning,
-`borrowck.unchecked` (`--allow=borrowck.unchecked` leaves it out).
-0.27.1's NLL solves them.
+Every rust-edition function is borrow-checked on the places IR, as
+rustc's NLL checks it (docs/design/borrowck.md is the rule book; each
+message's code names its rule): a reference lives as long as its region
+is used; a place is not written, moved, dropped or borrowed mutably
+while a borrow of it is live, nor read while a mutable borrow is; a
+receiver's `&mut` is two-phase (`v.push(v.len())` is fine); a
+reference to a local does not leave its function; a signature's
+lifetimes are what the body must respect (`'a: 'b`, elision as Rust's);
+a moved value is not used again (a field moved, the whole is partly
+moved; in a loop, "in a previous iteration"); a value cannot be moved
+out of a reference, an index or a `static`; a value with `impl Drop`
+keeps what it references alive until its drop, the std containers
+(`Vec`, `String`, `HashMap`, ...) only their elements'. The codes:
+`borrowck.mut_twice`, `conflict`, `use_borrowed`, `assign_borrowed`,
+`move_borrowed`, `dropped_borrowed`, `return_local`, `outlives`,
+`elision`, `unused_param`, `use_moved`, `assign_moved_part`,
+`move_out`, `move_from_drop`, `guard_write`, `static_mut_ref`
+(`volec explain borrowck.X` for each, with its rustc code). `volec
+check --emit-places=regions` prints each body's liveness, constraints,
+region values and loans.
+
+What is not checked in 0.27.1 (each a named divergence in the rule
+book): the inside of a closure body reaches its captures through a raw
+environment (`warning borrowck.unchecked` names the closure;
+`--allow=borrowck.unchecked` leaves it out); MVS std's types holding
+hidden views; a `&raw` pointer's uses (unsafe's); rvalue promotion
+(`&5` is a temporary, not `'static`).
 
 ## What comes later: edition.later
 

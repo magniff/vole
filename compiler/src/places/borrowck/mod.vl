@@ -124,6 +124,10 @@ pub struct Bck<A: Allocator> {
     pub fmap: Vec<i64, A>,
     pub sig: Sig<A>,
     pub outlives: Vec<i64, A>,
+    // The instances' dedupe keys (D4.4(b)), with each one's verdict;
+    // whether the last body reused one (the dump prints that alone).
+    pub keys: Vec<i64, A>,
+    pub last_reused: bool,
     // A place walk's results (constraints.vl walk_place): the projection
     // list root-first, the slot range reached, the type there, and the
     // deref-like steps passed (a region and a mode each, root-first), then
@@ -193,6 +197,8 @@ pub fn state_new() -> Bck<Comp> {
         fmap: Vec::new_in(Comp {}),
         sig: sig_new(),
         outlives: Vec::new_in(Comp {}),
+        keys: Vec::new_in(Comp {}),
+        last_reused: false,
         pscratch: Vec::new_in(Comp {}),
         vscratch: Vec::new_in(Comp {}),
         steps: Vec::new_in(Comp {}),
@@ -205,8 +211,18 @@ pub fn state_new() -> Bck<Comp> {
 // The body held, a rust-edition function's with its regions assigned:
 // its liveness, constraints and solution computed (M1: no error yet).
 // Timed apart from the places build, as `borrowck`.
-pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let t = timer_now(pcx);
+    // RULE: D4.4 (an instance whose key was seen reuses the verdict: its
+    // errors were reported at the template's position by the first)
+    let key = instance_key(f, &bck, &pcx);
+    bck.last_reused = key >= 0 && bck.keys[key] != 0;
+    if bck.last_reused {
+        bck.reused += 1;
+        timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
+        return bck.keys[key];
+    }
+    let e0 = crate::base::diag::error_count(pcx);
     // (the graph: elaboration's fast path leaves the last body's)
     crate::places::cfg::compute_preds(&pbody);
     crate::places::cfg::compute_rpo(&pbody);
@@ -221,7 +237,53 @@ pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: in
     }
     bck.bodies += 1;
     timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
-    let _ = f;
+    let node = crate::places::front::fn_node(f, pcx);
+    let closure = node > 0 && pcx.nodes[node].kind == crate::front::ast::NodeKind::Closure;
+    let verdict = if crate::base::diag::error_count(pcx) > e0 { VERDICT_ERRORS }
+        else if closure { VERDICT_DEFERRED } else { VERDICT_CLEAN };
+    if key >= 0 {
+        bck.keys[key] = verdict;
+    }
+    verdict
+}
+
+// The dedupe key of instance f (D4.4(b)): its template and, per type
+// argument, its slots' count and whether it has drop glue; the index of
+// its verdict word in keys (0: not solved yet), or -1 for a function
+// that is not an instance.
+fn instance_key(f: i64, bck: inout Bck<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let n = pcx.fns[f].targ_count;
+    if n <= 0 || pcx.fns[f].tmpl < 0 {
+        return -1;
+    }
+    bck.vscratch.clear();
+    bck.vscratch.push(pcx.fns[f].tmpl);
+    bck.vscratch.push(n);
+    for i in 0..n {
+        let t = crate::places::front::tlist_at(pcx.fns[f].targs + i, pcx);
+        bck.vscratch.push(crate::places::regions::slot_count(t, pcx));
+        bck.vscratch.push(if crate::front::own::glue::has_glue(t, &pcx) { 1 } else { 0 });
+    }
+    let w = bck.vscratch.len() as i64;
+    // (entries: the key's words, then the verdict word)
+    var i = 0;
+    while i + w < bck.keys.len() as i64 {
+        var same = true;
+        for j in 0..w {
+            if bck.keys[i + j] != bck.vscratch[j] {
+                same = false;
+            }
+        }
+        if same {
+            return i + w;
+        }
+        i += bck.keys[i + 1] * 2 + 3;
+    }
+    for j in 0..w {
+        bck.keys.push(bck.vscratch[j]);
+    }
+    bck.keys.push(0);
+    bck.keys.len() as i64 - 1
 }
 
 // The sizes and the region tables of the body held, from regions.vl's
@@ -279,6 +341,26 @@ fn begin_body(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
             bck.first[l] = slot_var(l, 0, pbody);
         }
     }
+}
+
+// The verdict per function (D17.7): 0 not checked, 1 clean, 2 errors, 3
+// deferred (a closure body: its captured places are reached through the
+// raw env, D10.4).
+pub const VERDICT_CLEAN: i64 = 1;
+pub const VERDICT_ERRORS: i64 = 2;
+pub const VERDICT_DEFERRED: i64 = 3;
+
+// RULE: D17.7
+pub fn set_verdict(f: i64, verdict: i64, pcx: inout Ctx<Comp>) {
+    while pcx.borrowck_verdict.len() as i64 <= f {
+        pcx.borrowck_verdict.push(0);
+    }
+    pcx.borrowck_verdict[f] = verdict;
+}
+
+// Whether function f's body was checked and found clean (D17.7).
+pub fn borrowck_clean(f: i64, pcx: Ctx<Comp>) -> bool {
+    f >= 0 && f < pcx.borrowck_verdict.len() as i64 && pcx.borrowck_verdict[f] == VERDICT_CLEAN
 }
 
 // A region variable the checker adds (RO_REBORROW of statement s): its
