@@ -159,6 +159,8 @@ Closures in full (clos272):
   moved by the call and dropped after it (D19.5). `borrowck.outlives`
   names its two lifetimes in the right order ("'b must outlive 'a").
 - 42 `rust_b_clos_` cases, all agreeing with rustc but one marked R3.
+- `--print-effects` leaves out the drop shims, which it printed as
+  `(unknown)` (K-I7: nothing targets them, so nothing was masked).
 
 ### What's new in 0.27.1
 
