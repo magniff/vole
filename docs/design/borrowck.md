@@ -221,9 +221,12 @@ own access (D2.2), excluding the loan being created; (3) the
 destination's `(Shallow, WA, (a,b))`; (4) the kills of D2.3 for the
 destination; (5) the gen: a created loan enters `scope(2·loc+1)`. A
 terminator's accesses are checked against `scope(2·loc)` in the order
-D2.2 lists. A two-phase activation (D7.1) is performed at step (1),
-immediately before the access of the operand that mentions the
-reservation's temporary. Consequences: `x = &mut *x` (`x: &'x mut T`):
+D2.2 lists. A two-phase activation (D7.1) is performed after step (1),
+once every operand's own access is done: a call's arguments are read
+before the call activates its receiver (`s.add(s.x)` reads `s.x` while
+the reservation is still shared; the IR has `copy _1.0` as an operand
+of the call, not a statement before it). Consequences: `x = &mut *x`
+(`x: &'x mut T`):
 (2) borrows `*x` with the supporting-prefix constraint `'x : 'new`; (3)
 the shallow write to `x` meets other loans of `*x…` as `Extends` through
 a deref at depth `Shallow` → no conflict; (4) kills every in-scope loan
@@ -690,8 +693,9 @@ loan is never activated and stays class `S`. The builder guarantees
 `loc₀` dominates `loc_a` within one block (`lower_arg`). Its access
 `(Deep, Activate ℓ, P)` is performed at `loc_a` as D2.4a says.
 
-**D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p <
-2·loc_a`, `ℓ` has class `S` in D2.5. Allowed in the window: `Read` of
+**D7.2 (the reservation window).** For points `p` with `2·loc₀+1 ≤ p ≤
+2·loc_a` (through the start point of the activation's location: its
+operands are read in the window, D2.4a), `ℓ` has class `S` in D2.5. Allowed in the window: `Read` of
 overlapping places, `BK_SHARED` borrows and `Reserve` of them
 (`v.push(v.len())`), and reads through them; forbidden: `WA`, `WM`,
 `WB`, `WD` of an overlapping place (`assign_borrowed`, `move_borrowed`,
@@ -703,9 +707,9 @@ an overlapping place (`v.push(v.pop().unwrap())`'s inner activation →
 checked against every `ℓ' ≠ ℓ` in `scope(2·loc_a)`: an overlapping
 shared or reserved loan conflicts (`v.push(v.last().unwrap())` when
 `last` returns `&T` whose loan is still live: it is, since the
-argument's region reaches the call); from `2·loc_a` on, `ℓ` has class
-`M`. The loan's region starts at `loc₀` (it is in scope from its
-creation), as rustc's.
+argument's region reaches the call); from `2·loc_a+1` on (the mid point
+of the activation's location), `ℓ` has class `M`. The loan's region
+starts at `loc₀` (it is in scope from its creation), as rustc's.
 
 **D7.4 (which borrows are two-phase).** Autoref'd receivers
 (`lower_arg`: `i == 0 && arg.start == operand.start`), the `IndexMut`
