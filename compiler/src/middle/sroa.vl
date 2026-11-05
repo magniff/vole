@@ -12,6 +12,8 @@
 use crate::back::abi::abi_leaves;
 use crate::back::regalloc::prepare::layout_order;
 use crate::base::{BUFS, IntVec, alloc_array, buf_clear, buf_reserve, free, memset};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::consteval::{bits_of, wrap_int, write_scalar};
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_U64, int_bits, is_integer, is_void, type_size,
@@ -44,7 +46,7 @@ fn leaf_type(cx: sink *FnCtx, s: i64, i: i64) -> i64 {
 }
 
 // The leaves of slot s from its type; false when they cannot be variables.
-fn slot_leaves(cx: inout FnCtx, s: i64) -> bool {
+fn slot_leaves(cx: inout FnCtx, s: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let ty = cx.slots[s].ty;
         if ty == 0 || is_void(ty) {
@@ -54,7 +56,7 @@ fn slot_leaves(cx: inout FnCtx, s: i64) -> bool {
         cx.leaves_whole_vectors = true;
         // (0.26.2: more than SROA_MAX_LEAVES * 4 are refused below)
         cx.leaves_cap = SROA_MAX_LEAVES * 4;
-        abi_leaves(&cx, ty, 0);
+        abi_leaves(&cx, ty, 0, pcx);
         cx.leaves_whole_vectors = false;
         cx.leaves_cap = 0;
         let n = cx.abi_leaves.count / 2;
@@ -102,7 +104,7 @@ fn slot_leaves(cx: inout FnCtx, s: i64) -> bool {
         }
         // No two leaves overlap.
         for i in 1..count {
-            if leaf_offset(&cx, s, i - 1) + type_size(leaf_type(&cx, s, i - 1))
+            if leaf_offset(&cx, s, i - 1) + type_size(leaf_type(&cx, s, i - 1), pcx)
                 > leaf_offset(&cx, s, i) {
                 return false;
             }
@@ -143,23 +145,23 @@ fn find_access_leaf(cx: inout FnCtx, s: i64, offset: i64, ty: i64) -> i64 {
 
 // v as type ty: v, or a conversion before instruction `at` between 64-bit
 // integer types (which changes no bits).
-fn as_leaf_type(cx: sink *FnCtx, v: i64, ty: i64, at: i64) -> i64 {
+fn as_leaf_type(cx: sink *FnCtx, v: i64, ty: i64, at: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.insts[v].ty == ty {
             return v;
         }
-        let c = op_before(cx, at, Conv, ty, v, 0);
+        let c = op_before(cx, at, Conv, ty, v, 0, pcx);
         cx.insts[c].imm2 = cx.insts[v].ty;
         c
     }
 }
 
 // Whether [offset, + size) holds whole leaves of slot s only.
-fn whole_leaves(cx: inout FnCtx, s: i64, offset: i64, size: i64) -> bool {
+fn whole_leaves(cx: inout FnCtx, s: i64, offset: i64, size: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         for i in 0..cx.sr_count[s] {
             let start = leaf_offset(&cx, s, i);
-            let end = start + type_size(leaf_type(&cx, s, i));
+            let end = start + type_size(leaf_type(&cx, s, i), pcx);
             if start < offset + size && end > offset && (start < offset || end > offset + size) {
                 return false;
             }
@@ -205,7 +207,7 @@ fn leaves_match(cx: inout FnCtx, d: i64, d_off: i64, s: i64, s_off: i64, size: i
 }
 
 // Rules out the slots used other than as plain memory.
-fn sroa_scan(cx: inout FnCtx, fi: i64) {
+fn sroa_scan(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
@@ -233,7 +235,7 @@ fn sroa_scan(cx: inout FnCtx, fi: i64) {
                         ok = find_access_leaf(&cx, s, offset + cx.insts[v].imm, cx.insts[v].imm2)
                             >= 0;
                     } else if op == Copy && k <= 1 {
-                        ok = whole_leaves(&cx, s, offset, cx.insts[v].imm);
+                        ok = whole_leaves(&cx, s, offset, cx.insts[v].imm, pcx);
                     }
                     else if op == Add && k == 0 && cx.insts[v].ty == TY_U64
                         && is_const(&cx, cx.insts[v].b) {
@@ -292,7 +294,7 @@ fn sroa_scan(cx: inout FnCtx, fi: i64) {
 }
 
 // The replacement of the slots: loads, stores and copies in block b.
-fn sroa_block(cx: inout FnCtx, b: i64) {
+fn sroa_block(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
     unsafe {
         var v = cx.blocks[b].first;
         while v != 0 {
@@ -303,26 +305,27 @@ fn sroa_block(cx: inout FnCtx, b: i64) {
                 let s = sroa_slot(&cx, cx.insts[v].a, &offset);
                 if s != 0 {
                     let leaf = find_access_leaf(&cx, s, offset + cx.insts[v].imm, cx.insts[v].ty);
-                    let value = ssa_read(&cx, cx.sr_var[s] + leaf, b);
-                    ir_replace(&cx, v, as_leaf_type(&cx, value, cx.insts[v].ty, v));
+                    let value = ssa_read(&cx, cx.sr_var[s] + leaf, b, pcx);
+                    ir_replace(&cx, v, as_leaf_type(&cx, value, cx.insts[v].ty, v, pcx));
                 }
             } else if op == Store {
                 let s = sroa_slot(&cx, cx.insts[v].a, &offset);
                 if s != 0 {
                     let leaf = find_access_leaf(&cx, s, offset + cx.insts[v].imm, cx.insts[v].imm2);
                     ssa_write(&cx, cx.sr_var[s] + leaf, b,
-                        as_leaf_type(&cx, ir_val(&cx, cx.insts[v].b), leaf_type(&cx, s, leaf), v));
+                        as_leaf_type(&cx, ir_val(&cx, cx.insts[v].b), leaf_type(&cx, s, leaf), v,
+                            pcx));
                     ir_unlink(&cx, v);
                 }
             } else if op == Copy {
-                sroa_copy(&cx, b, v);
+                sroa_copy(&cx, b, v, pcx);
             }
             v = next;
         }
     }
 }
 
-fn sroa_copy(cx: inout FnCtx, b: i64, v: i64) {
+fn sroa_copy(cx: inout FnCtx, b: i64, v: i64, pcx: Ctx<Comp>) {
     unsafe {
         let size = cx.insts[v].imm;
         var d_off = 0;
@@ -340,7 +343,7 @@ fn sroa_copy(cx: inout FnCtx, b: i64, v: i64) {
                 if o >= s_off && o < s_off + size {
                     cx.sr_values.push(o - s_off);
                     cx.sr_values.push(leaf_type(&cx, s, i));
-                    cx.sr_values.push(ssa_read(&cx, cx.sr_var[s] + i, b));
+                    cx.sr_values.push(ssa_read(&cx, cx.sr_var[s] + i, b, pcx));
                 }
             }
         } else {
@@ -348,7 +351,7 @@ fn sroa_copy(cx: inout FnCtx, b: i64, v: i64) {
                 let o = leaf_offset(&cx, d, i);
                 if o >= d_off && o < d_off + size {
                     let load = ir_make(&cx, Load, leaf_type(&cx, d, i), cx.insts[v].b, 0,
-                        o - d_off);
+                        o - d_off, pcx);
                     ir_insert_before(&cx, v, load);
                     cx.sr_values.push(o - d_off);
                     cx.sr_values.push(leaf_type(&cx, d, i));
@@ -364,7 +367,7 @@ fn sroa_copy(cx: inout FnCtx, b: i64, v: i64) {
             if d != 0 {
                 ssa_write(&cx, cx.sr_var[d] + find_leaf(&cx, d, d_off + at, ty), b, value);
             } else {
-                let store = ir_make(&cx, Store, 0, cx.insts[v].a, value, at);
+                let store = ir_make(&cx, Store, 0, cx.insts[v].a, value, at, pcx);
                 cx.insts[store].imm2 = ty;
                 ir_insert_before(&cx, v, store);
             }
@@ -377,12 +380,12 @@ fn sroa_copy(cx: inout FnCtx, b: i64, v: i64) {
 // Scalar replacement, to a fixpoint: again while a slot replaced held the
 // address of another (at most SROA_ROUNDS times). Returns whether any slot
 // was replaced.
-pub fn run_sroa(cx: inout FnCtx, fi: i64) -> bool {
+pub fn run_sroa(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var any = false;
         for _ in 0..SROA_ROUNDS {
             cx.sr_held.count = 0;
-            if !sroa_once(&cx, fi) {
+            if !sroa_once(&cx, fi, pcx) {
                 break;
             }
             any = true;
@@ -400,9 +403,9 @@ pub fn run_sroa(cx: inout FnCtx, fi: i64) -> bool {
     }
 }
 
-fn sroa_once(cx: inout FnCtx, fi: i64) -> bool {
+fn sroa_once(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         resolve_all(&cx, fi);
         let n = cx.slot_count + 1;
         free(cx.sr_state as *u8);
@@ -417,7 +420,7 @@ fn sroa_once(cx: inout FnCtx, fi: i64) -> bool {
         var any = false;
         for i in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[i];
-            if slot_leaves(&cx, s) {
+            if slot_leaves(&cx, s, pcx) {
                 cx.sr_state[s] = 1;
                 any = true;
             }
@@ -425,15 +428,15 @@ fn sroa_once(cx: inout FnCtx, fi: i64) -> bool {
         if !any {
             return false;
         }
-        sroa_scan(&cx, fi);
+        sroa_scan(&cx, fi, pcx);
         any = false;
         for i in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[i];
             if cx.sr_state[s] != 0 {
                 any = true;
-                cx.sr_var[s] = new_synth_var(&cx, leaf_type(&cx, s, 0));
+                cx.sr_var[s] = new_synth_var(&cx, leaf_type(&cx, s, 0), pcx);
                 for k in 1..cx.sr_count[s] {
-                    new_synth_var(&cx, leaf_type(&cx, s, k));
+                    new_synth_var(&cx, leaf_type(&cx, s, k), pcx);
                 }
             }
         }
@@ -457,26 +460,26 @@ fn sroa_once(cx: inout FnCtx, fi: i64) -> bool {
         for k in 0..order.count {
             let b = order.data[k];
             if cx.blocks[b].mark == cx.blocks[b].preds.count {
-                ir_seal(&cx, b);
+                ir_seal(&cx, b, pcx);
             }
-            sroa_block(&cx, b);
+            sroa_block(&cx, b, pcx);
             for i in 0..succ_count(&cx, b) {
                 let s = succ(&cx, b, i);
                 cx.blocks[s].mark += 1;
                 if cx.blocks[s].sealed == 0 && cx.blocks[s].order <= k
                     && cx.blocks[s].mark == cx.blocks[s].preds.count {
-                    ir_seal(&cx, s);
+                    ir_seal(&cx, s, pcx);
                 }
             }
         }
         for k in 0..order.count {
             if cx.blocks[order.data[k]].sealed == 0 {
-                ir_seal(&cx, order.data[k]);
+                ir_seal(&cx, order.data[k], pcx);
             }
         }
         free(order.data as *u8);
         resolve_all(&cx, fi);
-        remove_trivial_phis(&cx, fi);
+        remove_trivial_phis(&cx, fi, pcx);
         true
     }
 }
@@ -487,9 +490,9 @@ fn sroa_once(cx: inout FnCtx, fi: i64) -> bool {
 // in one block that comes before every read of it (in that block, or in
 // blocks it dominates), always holds the same bytes: it becomes read-only
 // data (a local table, like md5's shift amounts).
-pub fn promote_constant_slots(cx: inout FnCtx, fi: i64) -> bool {
+pub fn promote_constant_slots(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         resolve_all(&cx, fi);
         find_escaping_slots(&cx, fi);
         compute_dominators(&cx, fi);
@@ -584,14 +587,14 @@ pub fn promote_constant_slots(cx: inout FnCtx, fi: i64) -> bool {
                         var offset = 0;
                         address_base(&cx, cx.insts[v].a, &offset);
                         write_scalar(scratch, offset + cx.insts[v].imm, cx.insts[cx.insts[v].b].imm,
-                            cx.insts[v].imm2);
+                            cx.insts[v].imm2, pcx);
                         ir_unlink(&cx, v);
                     }
                 }
                 v = next;
             }
             let id = const_data(&cx, fi, BUFS[scratch].data[0..size], cx.slots[s].align);
-            let data = ir_make(&cx, SAddr, TY_U64, 0, 0, id);
+            let data = ir_make(&cx, SAddr, TY_U64, 0, 0, id, pcx);
             ir_prepend(&cx, IRFUNCS[fi].entry, data);
             for i in 0..cx.order.count {
                 var w = cx.blocks[cx.order.data[i]].first;
@@ -618,9 +621,9 @@ pub fn promote_constant_slots(cx: inout FnCtx, fi: i64) -> bool {
 
 // The value of a load of type `ty` from constant data `id` at `offset`
 // (canonical), when it lies within the data; sets *ok.
-pub fn constant_load(id: i64, offset: i64, ty: i64, ok: inout bool) -> i64 {
+pub fn constant_load(id: i64, offset: i64, ty: i64, ok: inout bool, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let size = type_size(ty);
+        let size = type_size(ty, pcx);
         ok = false;
         // (A vector, 0.10, is no constant.)
         let bytes = const_data_bytes(id);

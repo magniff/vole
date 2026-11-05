@@ -14,21 +14,18 @@
 // (`crate`, `self`, `super`, child modules, a module imported by name);
 // what the path names is the checker's (the program's references).
 
-use crate::base::{FILES, IntVec, SRC, SYMS, alloc_zeroed, buf_bytes, buf_new, buf_str, intern_c};
+use crate::base::{IntVec, SRC, SYMS, alloc_zeroed, buf_bytes, buf_new, buf_str, intern_c};
 use crate::base::comp::Comp;
-use crate::front::ast::{NODES, child};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::modules::{MODULES, child_module, file_of_pos, module_at, module_count, module_of};
-use crate::front::modules::lookup::{SYM_CRATE, SYM_SUPER};
+use crate::base::ctx::Ctx;
+use crate::front::ast::child;
+use crate::front::lexer::Tok;
+use crate::front::modules::{child_module, file_of_pos, module_at, module_count, module_of};
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::cli::delete_lines;
 use crate::tools::edit::items::node_head;
 use crate::tools::query::{QF_DEF, QF_USE};
-use crate::tools::query::defs::{
-    DEFS, K_IMPL_METHOD, K_METHOD, K_MOD, K_VARIANT, MOD_DEF, mod_fqn, mod_fqn_text,
-};
+use crate::tools::query::defs::{K_IMPL_METHOD, K_METHOD, K_MOD, K_VARIANT, mod_fqn, mod_fqn_text};
 use crate::tools::query::positions::{line_start, token_at};
 use crate::tools::query::refs::ref_in;
 use crate::tools::refactor_mod::{
@@ -38,37 +35,35 @@ use crate::tools::refactor_mod::{
 use crate::tools::refactor_mod::cli::is_name_use;
 use crate::tools::tidyimports::{put_use_text, use_path_sym};
 
-static var SYM_SELF: i64 = -1;
-
 // The module that segment `name` of a path leads to from module `cur`
 // (the first segment: from module `from`, the path's own); -1 when it is
 // no module (an item, an enum, std's).
-fn step(cur: i64, name: i64, first: bool, from: i64) -> i64 {
+fn step(cur: i64, name: i64, first: bool, from: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if SYM_SELF < 0 {
-            SYM_SELF = intern_c(c"self");
+        if pcx.sym_self < 0 {
+            pcx.sym_self = intern_c(c"self");
         }
         if cur < 0 {
             return -1;
         }
-        if first && name == SYM_CRATE {
+        if first && name == pcx.sym_crate {
             return 0;
         }
-        if first && name == SYM_SELF {
+        if first && name == pcx.sym_self {
             return from;
         }
-        if name == SYM_SUPER {
-            return if cur > 0 { MODULES[cur].parent } else { -1 };
+        if name == pcx.sym_super {
+            return if cur > 0 { pcx.modules[cur].parent } else { -1 };
         }
-        let c = child_module(cur, name);
+        let c = child_module(cur, name, pcx);
         if c >= 0 || !first {
             return c;
         }
         // (a module imported by name: `use crate::a::b;` then `b::f`)
-        let d = use_binding(from, name);
-        if d >= 0 && DEFS[d].kind == K_MOD {
-            for m in 1..module_count() {
-                if MOD_DEF.data[m] == d {
+        let d = use_binding(from, name, pcx);
+        if d >= 0 && pcx.defs[d].kind == K_MOD {
+            for m in 1..module_count(pcx) {
+                if pcx.mod_def.data[m] == d {
                     return m;
                 }
             }
@@ -78,50 +73,48 @@ fn step(cur: i64, name: i64, first: bool, from: i64) -> i64 {
 }
 
 // The module the path of Use item u leads to (-1: none).
-fn use_via(u: i64) -> i64 {
-    let path = NODES[u].c;
-    let from = module_of(u);
+fn use_via(u: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let path = pcx.nodes[u].c;
+    let from = module_of(u, &pcx);
     var cur = from;
-    for i in 0..NODES[path].count {
-        cur = step(cur, NODES[child(path, i)].a, i == 0, from);
+    for i in 0..pcx.nodes[path].count {
+        cur = step(cur, pcx.nodes[child(path, i, pcx)].a, i == 0, from, &pcx);
     }
-    if NODES[path].count == 0 { -1 } else { cur }
+    if pcx.nodes[path].count == 0 { -1 } else { cur }
 }
 
 // The module the path before the name at pos leads to (`a::b::NAME`), or
 // -1.
-fn path_via(pos: i64) -> i64 {
-    unsafe {
-        let from = module_at(pos);
-        var i = token_at(path_start(pos));
-        let end = token_at(pos);
-        var cur = from;
-        var first = true;
-        while i < end {
-            if TOKS[i].kind == Tok::Ident {
-                cur = step(cur, TOKS[i].value as i64, first, from);
-                first = false;
-            }
-            i += 1;
+fn path_via(pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let from = module_at(pos, &pcx);
+    var i = token_at(path_start(pos, pcx), pcx);
+    let end = token_at(pos, pcx);
+    var cur = from;
+    var first = true;
+    while i < end {
+        if pcx.toks[i].kind == Tok::Ident {
+            cur = step(cur, pcx.toks[i].value as i64, first, from, &pcx);
+            first = false;
         }
-        cur
+        i += 1;
     }
+    cur
 }
 
 // Whether definition d is an item imports and paths name (not a module, a
 // method, a variant, a field).
-fn plain_item(d: i64) -> bool {
-    let k = DEFS[d].kind;
-    DEFS[d].parent < 0 && k != K_MOD && k != K_METHOD && k != K_IMPL_METHOD && k != K_VARIANT
+fn plain_item(d: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.defs[d].kind;
+    pcx.defs[d].parent < 0 && k != K_MOD && k != K_METHOD && k != K_IMPL_METHOD && k != K_VARIANT
 }
 
 // Whether Use item u is marked as the module's interface: a comment line
 // `// api: ...` in the comment lines right above it.
-fn api_marked(u: i64) -> bool {
-    let f = file_of_pos(NODES[u].start);
-    var ls = line_start(node_head(NODES[u].start));
-    while ls > FILES[f].start {
-        let prev = line_start(ls - 1);
+fn api_marked(u: i64, pcx: Ctx<Comp>) -> bool {
+    let f = file_of_pos(pcx.nodes[u].start, pcx);
+    var ls = line_start(node_head(pcx.nodes[u].start, pcx), pcx);
+    while ls > pcx.files[f].start {
+        let prev = line_start(ls - 1, pcx);
         var p = prev;
         while SRC[p] == ' ' || SRC[p] == '\t' {
             p += 1;
@@ -142,18 +135,16 @@ fn api_marked(u: i64) -> bool {
 }
 
 // Whether identifier `name` is written in file f outside SRC[a..b).
-fn named_in_file(name: i64, f: i64, a: i64, b: i64) -> bool {
-    unsafe {
-        var i = token_at(FILES[f].start);
-        while i < TOK_COUNT && TOKS[i].start < FILES[f].end {
-            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
-                && (TOKS[i].start < a || TOKS[i].start >= b) {
-                return true;
-            }
-            i += 1;
+fn named_in_file(name: i64, f: i64, a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+    var i = token_at(pcx.files[f].start, pcx);
+    while i < pcx.toks.len() as i64 && pcx.toks[i].start < pcx.files[f].end {
+        if pcx.toks[i].kind == Tok::Ident && pcx.toks[i].value as i64 == name
+            && (pcx.toks[i].start < a || pcx.toks[i].start >= b) {
+            return true;
         }
-        false
+        i += 1;
     }
+    false
 }
 
 // Whether something goes through the import (or re-export) of `name` in
@@ -161,37 +152,39 @@ fn named_in_file(name: i64, f: i64, a: i64, b: i64) -> bool {
 // (`use crate::m::name`, `m::name(...)`, `m::name::Variant`), that the
 // fix does not rewrite. So it is not unused although its own file does
 // not name it (`fix --only unused`, `query unused`).
-pub fn reached_through(m: i64, name: i64) -> bool {
+pub fn reached_through(m: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        for u in 1..NODES.len() as i64 {
-            if !is_name_use(u) || module_of(u) == m {
+        for u in 1..pcx.nodes.len() as i64 {
+            if !is_name_use(u, pcx) || module_of(u, &pcx) == m {
                 continue;
             }
-            let path = NODES[u].c;
-            let from = module_of(u);
+            let path = pcx.nodes[u].c;
+            let from = module_of(u, &pcx);
             var cur = from;
-            for i in 0..NODES[path].count {
-                let a = NODES[child(path, i)].a;
+            for i in 0..pcx.nodes[path].count {
+                let a = pcx.nodes[child(path, i, pcx)].a;
                 if i > 0 && cur == m && a == name {
                     return true;
                 }
-                cur = step(cur, a, i == 0, from);
+                cur = step(cur, a, i == 0, from, &pcx);
             }
             if cur != m {
                 continue;
             }
-            for k in 0..NODES[u].count {
-                let c = child(u, k);
-                if NODES[c].a == name && NEW_HOME.get(c) == 0 {
+            for k in 0..pcx.nodes[u].count {
+                let c = child(u, k, pcx);
+                if pcx.nodes[c].a == name && pcx.new_home.get(c) == 0 {
                     return true;
                 }
             }
         }
-        for i in 2..TOK_COUNT {
-            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name
-                && TOKS[i - 1].kind == Tok::ColonColon && REWRITTEN.get(TOKS[i].start + 1) == 0
-                && module_at(TOKS[i].start) != m && FILES[file_of_pos(TOKS[i].start)].path[0] != '<'
-                && path_via(TOKS[i].start) == m {
+        for i in 2..pcx.toks.len() as i64 {
+            if pcx.toks[i].kind == Tok::Ident && pcx.toks[i].value as i64 == name
+                && pcx.toks[i - 1].kind == Tok::ColonColon
+                && pcx.rewritten.get(pcx.toks[i].start + 1) == 0
+                && module_at(pcx.toks[i].start, &pcx) != m
+                && pcx.files[file_of_pos(pcx.toks[i].start, pcx)].path[0] != '<'
+                && path_via(pcx.toks[i].start, &pcx) == m {
                 return true;
             }
         }
@@ -199,18 +192,12 @@ pub fn reached_through(m: i64, name: i64) -> bool {
     }
 }
 
-// What the fix does to the name (Ident node) of a `use`: its new module
-// (+1), whether it is dropped or made private; the paths it rewrites
-// (position of the name + 1).
-static var NEW_HOME: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var REWRITTEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
 // The re-export (an Ident node of a `use` of module via) that importing
 // `name` from via goes through, when it is not the interface (`// api:`);
 // 0 for none.
-fn reexport_of(via: i64, name: i64, tcx: Tcx<Comp>) -> i64 {
-    let r = use_binding_id(via, name);
-    if r == 0 || api_marked(use_node_of(r, tcx)) {
+fn reexport_of(via: i64, name: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let r = use_binding_id(via, name, pcx);
+    if r == 0 || api_marked(use_node_of(r, tcx), pcx) {
         return 0;
     }
     r
@@ -218,36 +205,36 @@ fn reexport_of(via: i64, name: i64, tcx: Tcx<Comp>) -> i64 {
 
 // The edits of `fix --only reexports`: how many imports and paths are
 // rewritten; *dropped, how many re-exports go (or become private).
-pub fn reexport_edits(dropped: inout i64, tcx: inout Tcx<Comp>) -> i64 {
+pub fn reexport_edits(dropped: inout i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        load_refs(&tcx);
+        load_refs(&tcx, &pcx);
         var fixes = 0;
         // The imports through a re-export.
         var touched = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for u in 1..NODES.len() as i64 {
-            if !is_name_use(u) {
+        for u in 1..pcx.nodes.len() as i64 {
+            if !is_name_use(u, pcx) {
                 continue;
             }
-            let via = use_via(u);
+            let via = use_via(u, &pcx);
             if via < 0 {
                 continue;
             }
             var any = false;
-            for k in 0..NODES[u].count {
-                let id = child(u, k);
-                let d = use_def(id);
-                if d < 0 || !plain_item(d) || DEFS[d].module == via {
+            for k in 0..pcx.nodes[u].count {
+                let id = child(u, k, pcx);
+                let d = use_def(id, pcx);
+                if d < 0 || !plain_item(d, pcx) || pcx.defs[d].module == via {
                     continue;
                 }
-                let r = reexport_of(via, NODES[id].a, tcx);
+                let r = reexport_of(via, pcx.nodes[id].a, tcx, pcx);
                 if r == 0 {
                     continue;
                 }
-                if !ref_in(NODES[u].start) {
+                if !ref_in(pcx.nodes[u].start, &pcx) {
                     continue;
                 }
-                NEW_HOME.put(id, DEFS[d].module + 1);
-                chain_public(module_of(u), DEFS[d].module, &tcx);
+                pcx.new_home.put(id, pcx.defs[d].module + 1);
+                chain_public(module_of(u, &pcx), pcx.defs[d].module, &tcx, &pcx);
                 any = true;
                 fixes += 1;
             }
@@ -260,45 +247,48 @@ pub fn reexport_edits(dropped: inout i64, tcx: inout Tcx<Comp>) -> i64 {
             let r = tcx.refs.data[k];
             let p = tcx.r_pos.data[r];
             let d = tcx.r_def.data[r];
-            if (tcx.r_flags.data[r] & (QF_DEF | QF_USE)) != 0 || !plain_item(d) || !qualified(p)
-                || FILES[file_of_pos(p)].path[0] == '<' {
+            if (tcx.r_flags.data[r] & (QF_DEF | QF_USE)) != 0 || !plain_item(d, pcx)
+                || !qualified(p, pcx)
+                || pcx.files[file_of_pos(p, pcx)].path[0] == '<' {
                 continue;
             }
-            let ti = token_at(p);
-            if ti >= TOK_COUNT || TOKS[ti].start != p || TOKS[ti].kind != Tok::Ident {
+            let ti = token_at(p, pcx);
+            if ti >= pcx.toks.len() as i64 || pcx.toks[ti].start != p
+                || pcx.toks[ti].kind != Tok::Ident {
                 continue;
             }
-            let via = path_via(p);
-            if via < 0 || via == DEFS[d].module {
+            let via = path_via(p, &pcx);
+            if via < 0 || via == pcx.defs[d].module {
                 continue;
             }
-            if reexport_of(via, TOKS[ti].value as i64, tcx) == 0 || !ref_in(p)
-                || TOKS[token_at(path_start(p)) - 1].kind == Tok::Use {
+            if reexport_of(via, pcx.toks[ti].value as i64, tcx, pcx) == 0 || !ref_in(p, &pcx)
+                || pcx.toks[token_at(path_start(p, pcx), pcx) - 1].kind == Tok::Use {
                 continue;
             }
-            REWRITTEN.put(p + 1, 1);
+            pcx.rewritten.put(p + 1, 1);
             let b = buf_new();
-            buf_bytes(b, mod_fqn_text(DEFS[d].module, &tcx));
+            buf_bytes(b, mod_fqn_text(pcx.defs[d].module, &tcx, pcx));
             buf_str(b, c"::");
-            buf_bytes(b, SYMS[DEFS[d].name].text);
-            put_edit(path_start(p), TOKS[ti].end, b, &tcx);
-            chain_public(module_at(p), DEFS[d].module, &tcx);
+            buf_bytes(b, SYMS[pcx.defs[d].name].text);
+            put_edit(path_start(p, pcx), pcx.toks[ti].end, b, &tcx, &pcx);
+            chain_public(module_at(p, &pcx), pcx.defs[d].module, &tcx, &pcx);
             fixes += 1;
         }
         // The re-exports nothing goes through any more.
-        for u in 1..NODES.len() as i64 {
-            if !is_name_use(u) || (NODES[u].p & ITEM_PUBLIC) == 0 || !ref_in(NODES[u].start)
-                || api_marked(u) {
+        for u in 1..pcx.nodes.len() as i64 {
+            if !is_name_use(u, pcx) || (pcx.nodes[u].p & ITEM_PUBLIC) == 0
+                || !ref_in(pcx.nodes[u].start, &pcx)
+                || api_marked(u, pcx) {
                 continue;
             }
-            let f = file_of_pos(NODES[u].start);
+            let f = file_of_pos(pcx.nodes[u].start, pcx);
             var any = false;
-            for k in 0..NODES[u].count {
-                let id = child(u, k);
-                if reached_through(module_of(u), use_local(id)) {
+            for k in 0..pcx.nodes[u].count {
+                let id = child(u, k, pcx);
+                if reached_through(module_of(u, &pcx), use_local(id, pcx), &pcx) {
                     continue;
                 }
-                if named_in_file(use_local(id), f, NODES[u].start, NODES[u].end) {
+                if named_in_file(use_local(id, pcx), f, pcx.nodes[u].start, pcx.nodes[u].end, pcx) {
                     tcx.demote.put(id, 1);
                 } else {
                     tcx.drop.put(id, 1);
@@ -319,7 +309,7 @@ pub fn reexport_edits(dropped: inout i64, tcx: inout Tcx<Comp>) -> i64 {
             }
         }
         for i in 0..touched.count {
-            rewrite_use(touched.data[i], &tcx);
+            rewrite_use(touched.data[i], &tcx, &pcx);
         }
         fixes
     }
@@ -328,11 +318,11 @@ pub fn reexport_edits(dropped: inout i64, tcx: inout Tcx<Comp>) -> i64 {
 // Use item u's new text: its names under their paths (its own, or their
 // new modules'), `pub` as it was (or not, made private), the dropped ones
 // gone; its lines removed when none is left.
-fn rewrite_use(u: i64, tcx: inout Tcx<Comp>) {
+fn rewrite_use(u: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        let public = (NODES[u].p & ITEM_PUBLIC) != 0;
-        let head = node_head(NODES[u].start);
-        let from = line_start(head);
+        let public = (pcx.nodes[u].p & ITEM_PUBLIC) != 0;
+        let head = node_head(pcx.nodes[u].start, pcx);
+        let from = line_start(head, pcx);
         var blank = true;
         for p in from..head {
             if SRC[p] != ' ' && SRC[p] != '\t' {
@@ -344,16 +334,16 @@ fn rewrite_use(u: i64, tcx: inout Tcx<Comp>) {
         var g_pub = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var g_names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var g_alias = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let own = use_path_sym(u);
+        let own = use_path_sym(u, pcx);
         // (the names that keep its path first, then the others)
-        for x in 0..2 * NODES[u].count {
-            let k = x % NODES[u].count;
-            let id = child(u, k);
-            if tcx.drop.get(id) != 0 || (NEW_HOME.get(id) != 0) != (x >= NODES[u].count) {
+        for x in 0..2 * pcx.nodes[u].count {
+            let k = x % pcx.nodes[u].count;
+            let id = child(u, k, pcx);
+            if tcx.drop.get(id) != 0 || (pcx.new_home.get(id) != 0) != (x >= pcx.nodes[u].count) {
                 continue;
             }
-            let h = NEW_HOME.get(id) - 1;
-            let path = if h >= 0 { mod_fqn(h, &tcx) } else { own };
+            let h = pcx.new_home.get(id) - 1;
+            let path = if h >= 0 { mod_fqn(h, &tcx, pcx) } else { own };
             let pb = public && tcx.demote.get(id) == 0;
             var g = -1;
             for j in 0..g_path.count {
@@ -371,9 +361,9 @@ fn rewrite_use(u: i64, tcx: inout Tcx<Comp>) {
                 g_alias.push(alias);
             }
             // (the name it is defined with, under the name it had here)
-            let d = use_def(id);
-            let real = if h >= 0 && d >= 0 { DEFS[d].name } else { NODES[id].a };
-            let local = use_local(id);
+            let d = use_def(id, pcx);
+            let real = if h >= 0 && d >= 0 { pcx.defs[d].name } else { pcx.nodes[id].a };
+            let local = use_local(id, pcx);
             if real == local {
                 (g_names.data[g] as *IntVec).push(real);
             } else {
@@ -383,9 +373,9 @@ fn rewrite_use(u: i64, tcx: inout Tcx<Comp>) {
         }
         if g_path.count == 0 {
             if blank {
-                delete_lines(from, NODES[u].end);
+                delete_lines(from, pcx.nodes[u].end, &pcx);
             } else {
-                put_edit(head, NODES[u].end, buf_new(), &tcx);
+                put_edit(head, pcx.nodes[u].end, buf_new(), &tcx, &pcx);
             }
             return;
         }
@@ -398,7 +388,7 @@ fn rewrite_use(u: i64, tcx: inout Tcx<Comp>) {
             put_use_text(text, indent, g_pub.data[j] != 0, SYMS[g_path.data[j]].text,
                 g_names.data[j] as *IntVec, g_alias.data[j] as *IntVec);
         }
-        put_edit(if blank { from } else { head }, NODES[u].end, text, &tcx);
+        put_edit(if blank { from } else { head }, pcx.nodes[u].end, text, &tcx, &pcx);
     }
 }
 

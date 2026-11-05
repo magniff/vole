@@ -15,112 +15,97 @@
 // The scan below visits what walk.vl's eval visits; a node kind the walk
 // learns must be added here too.
 
-use crate::base::{IntVec, alloc_array};
-use crate::front::ast::{NODES, NODE_RAW, NodeKind, child};
-use crate::front::check::{LOCALS, Res};
+use crate::base::alloc_array;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NODE_RAW, NodeKind, child};
+use crate::front::check::Res;
 use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::{K_OWNED, K_VIEW, type_kind};
-use crate::front::types::{FNS, TYPES, TyKind};
-
-// Functions skipped (for --values=report's count and the budget).
-pub static var SKIPPED: i64 = 0;
-// Set by `query own` (observe.vl): walk whatever the fast path says.
-pub static var FORCE_WALK: bool = false;
-
-static var NEED: bool = false;
-// The roots borrowed by the pending arguments of the calls being scanned.
-static var ROOTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Pending views of statics (in ROOTS).
-static var STATIC_VIEWS: i64 = 0;
-
-static var MEMO: *u8 = 0 as *u8;
-static var MEMO_CAP: i64 = 0;
-
-static var KNOWN: *u8 = 0 as *u8;
-static var KNOWN_CAP: i64 = 0;
+use crate::front::types::{TYPES, TyKind};
 
 // Whether type t is owned or a view (kinds.vl), memoized here per type
 // id in one byte (the scan asks it of every node): 0 unknown, 1 no, 2
 // owned, 3 a view only.
-fn tracked(t: i64) -> bool {
+fn tracked(t: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if t <= 0 {
             return false;
         }
-        if t < MEMO_CAP {
-            let m = MEMO[t];
+        if t < pcx.memo_cap {
+            let m = pcx.memo[t];
             if m != 0 {
                 return m >= 2;
             }
         } else {
             let n = t * 2 + 1024;
             let a = alloc_array::<u8>(n);
-            for i in 0..MEMO_CAP {
-                a[i] = MEMO[i];
+            for i in 0..pcx.memo_cap {
+                a[i] = pcx.memo[i];
             }
-            MEMO = a;
-            MEMO_CAP = n;
+            pcx.memo = a;
+            pcx.memo_cap = n;
         }
-        let k = type_kind(t);
-        MEMO[t] = if (k & K_OWNED) != 0 { 2 } else if (k & K_VIEW) != 0 { 3 } else { 1 };
-        MEMO[t] >= 2
+        let k = type_kind(t, &pcx);
+        pcx.memo[t] = if (k & K_OWNED) != 0 { 2 } else if (k & K_VIEW) != 0 { 3 } else { 1 };
+        pcx.memo[t] >= 2
     }
 }
 
 // Whether expression e (of a view type) holds only views of static data
 // or of what a raw pointer reaches (origin ∅: the walk gives it none): a
 // string literal, a place reached through a raw pointer (`SYMS[s].text`).
-fn raw_view(e: i64) -> bool {
-    raw_view_of(e, true)
+fn raw_view(e: i64, pcx: inout Ctx<Comp>) -> bool {
+    raw_view_of(e, true, &pcx)
 }
 
 // raw_view; calls: a call given no loans and no views counts (it asks the
 // kinds of its arguments' types: not during type checking).
-fn raw_view_of(e: i64, calls: bool) -> bool {
+fn raw_view_of(e: i64, calls: bool, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let k = NODES[e].kind;
+        let k = pcx.nodes[e].kind;
         if k == NodeKind::Str {
             return true;
         }
         if k == NodeKind::FieldAccess {
-            if NODES[e].y == 1 {
-                return !reference(NODES[e].a);
+            if pcx.nodes[e].y == 1 {
+                return !reference(pcx.nodes[e].a, pcx);
             }
-            return raw_view_of(NODES[e].a, calls);
+            return raw_view_of(pcx.nodes[e].a, calls, &pcx);
         }
         if k == NodeKind::Call && calls {
             // (a call given no loans and no views: its result has none)
-            if NODES[e].x - 1 < 0 {
+            if pcx.nodes[e].x - 1 < 0 {
                 return false;
             }
-            for i in 0..NODES[e].count {
-                let arg = child(e, i);
-                let ak = NODES[arg].kind;
-                if ak == NodeKind::Unary && NODES[arg].op == crate::front::lexer::Tok::Amp
-                    || ak == NodeKind::Ident && NODES[arg].res == Res::Local && NODES[arg].y >= 0
-                    && LOCALS[NODES[arg].y].borrow {
+            for i in 0..pcx.nodes[e].count {
+                let arg = child(e, i, pcx);
+                let ak = pcx.nodes[arg].kind;
+                if ak == NodeKind::Unary && pcx.nodes[arg].op == crate::front::lexer::Tok::Amp
+                    || ak == NodeKind::Ident && pcx.nodes[arg].res == Res::Local
+                    && pcx.nodes[arg].y >= 0
+                    && pcx.locals[pcx.nodes[arg].y].borrow {
                     return false;
                 }
-                let at = NODES[arg].ty;
-                if tracked(at) && !(MEMO[at] == 3 && raw_view(arg)) {
+                let at = pcx.nodes[arg].ty;
+                if tracked(at, &pcx) && !(pcx.memo[at] == 3 && raw_view(arg, &pcx)) {
                     return false;
                 }
             }
             return true;
         }
         if k == NodeKind::TupleField {
-            return raw_view_of(NODES[e].a, calls);
+            return raw_view_of(pcx.nodes[e].a, calls, &pcx);
         }
-        if k == NodeKind::Unary && NODES[e].op == crate::front::lexer::Tok::Star {
-            return !reference(NODES[e].b);
+        if k == NodeKind::Unary && pcx.nodes[e].op == crate::front::lexer::Tok::Star {
+            return !reference(pcx.nodes[e].b, pcx);
         }
-        if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
-            let bt = NODES[NODES[e].a].ty;
+        if k == NodeKind::Index && pcx.nodes[pcx.nodes[e].b].kind != NodeKind::Range {
+            let bt = pcx.nodes[pcx.nodes[e].a].ty;
             if bt > 0 && TYPES[bt].kind == TyKind::Ptr {
-                return (NODES[e].p & NODE_RAW) != 0 || !reference(NODES[e].a);
+                return (pcx.nodes[e].p & NODE_RAW) != 0 || !reference(pcx.nodes[e].a, pcx);
             }
-            return raw_view_of(NODES[e].a, calls);
+            return raw_view_of(pcx.nodes[e].a, calls, &pcx);
         }
         false
     }
@@ -128,14 +113,14 @@ fn raw_view_of(e: i64, calls: bool) -> bool {
 
 // Whether pointer expression e is a reference or a borrow (walk.vl's
 // is_reference).
-fn reference(e: i64) -> bool {
+fn reference(e: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let t = NODES[e].ty;
+        let t = pcx.nodes[e].ty;
         if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 {
             return true;
         }
-        NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && NODES[e].y >= 0
-            && LOCALS[NODES[e].y].borrow
+        pcx.nodes[e].kind == NodeKind::Ident && pcx.nodes[e].res == Res::Local
+            && pcx.nodes[e].y >= 0 && pcx.locals[pcx.nodes[e].y].borrow
     }
 }
 
@@ -143,23 +128,24 @@ fn reference(e: i64) -> bool {
 // walks a recursive component's functions several times). A function the
 // type checker recorded (check_begin) is decided by its record; another
 // (a closure's function, checked inside its parent) by the scan.
-pub fn needs_walk(f: i64) -> bool {
+pub fn needs_walk(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if f < KNOWN_CAP && KNOWN[f] != 0 {
-            return KNOWN[f] == 2;
+        if f < pcx.known_cap && pcx.fast_known[f] != 0 {
+            return pcx.fast_known[f] == 2;
         }
-        if f >= KNOWN_CAP {
+        if f >= pcx.known_cap {
             let n = f * 2 + 1024;
             let a = alloc_array::<u8>(n);
-            for i in 0..KNOWN_CAP {
-                a[i] = KNOWN[i];
+            for i in 0..pcx.known_cap {
+                a[i] = pcx.fast_known[i];
             }
-            KNOWN = a;
-            KNOWN_CAP = n;
+            pcx.fast_known = a;
+            pcx.known_cap = n;
         }
-        let need = if f < REC_CAP && (REC_FLAGS[f] & R_CHECKED) != 0 { record_says(f) }
-            else { scan_fn(f) };
-        KNOWN[f] = if need { 2 } else { 1 };
+        let need = if f < pcx.rec_cap
+            && (pcx.rec_flags[f] & R_CHECKED) != 0 { record_says(f, &pcx) }
+            else { scan_fn(f, &pcx) };
+        pcx.fast_known[f] = if need { 2 } else { 1 };
         need
     }
 }
@@ -174,128 +160,70 @@ pub fn needs_walk(f: i64) -> bool {
 
 const R_CHECKED: u8 = 1;
 const R_LOANS: u8 = 2;
-// (function, type) pairs, in the order the checker meets them.
-static var REC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var REC_FLAGS: *u8 = 0 as *u8;
-static var REC_CAP: i64 = 0;
-// Per type: the function + 1 that recorded it last.
-static var STAMP: *i64 = 0 as *i64;
-static var STAMP_CAP: i64 = 0;
-// The function being checked (front::check::CUR_FN, at check_begin), the
-// node check_expr is checking (its synth is not recorded: check_expr
-// records the type it ends with, after a coercion).
-static var REC_F: i64 = -1;
-static var CHK_NODE: i64 = 0;
-// The pending loans' roots of the calls being checked.
-static var CROOTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-// The calls being checked (their frames in CROOTS).
-static var CDEPTH: i64 = 0;
-
-// The records of the functions whose checks enclose this one: REC_F,
-// CDEPTH, CROOTS.count each.
-static var SAVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// The span of the function being checked: a node met outside it (a
-// default argument's expression, shared with its declaration) or a
-// closure (its type is made after it is checked) leaves the decision to
-// the scan (R_SCAN).
-static var SPAN_A: i64 = 0;
-static var SPAN_B: i64 = 0;
 const R_SCAN: u8 = 4;
-static var CLOSURES_MARKED: bool = false;
-// Per function: its records' range in BY_FN (built once, by_fn).
-static var BY_START: *i64 = 0 as *i64;
-static var BY_FN: *i64 = 0 as *i64;
-static var BY_N: i64 = -1;
-
-// (0.26.1) What a function may drop, as the checker meets it: the types
-// of the values it makes, (function, type) pairs, each once in a row
-// (FSTAMP): a local's (not a parameter's), a call's result, an
-// aggregate's, a closure's. A place read is not one: what it reads is a
-// local's (or a parameter's, or a static's) already. glue_met asks their
-// glue after the checker, by function (FBY_START, FBY: a counting sort,
-// once).
-static var FRESH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var FSTAMP: *i64 = 0 as *i64;
-static var FSTAMP_CAP: i64 = 0;
-static var FBY_START: *i64 = 0 as *i64;
-static var FBY: *i64 = 0 as *i64;
-static var FBY_N: i64 = -1;
-
-// Per node kind: whether an expression of it makes a new value (byref.vl
-// fresh's kinds, but an f-string: its value is printed or passed on,
-// never held by a temporary), one a temporary may hold; filled once
-// (the checker asks it of every node).
-static var MAKES: [bool; 256] = [false; 256];
-static var MAKES_SET: bool = false;
 
 #[inline]
-fn makes_value(k: NodeKind) -> bool {
-    if !MAKES_SET {
-        MAKES_SET = true;
-        MAKES[NodeKind::Call as i64] = true;
-        MAKES[NodeKind::MethodCall as i64] = true;
-        MAKES[NodeKind::StructLit as i64] = true;
-        MAKES[NodeKind::Tuple as i64] = true;
-        MAKES[NodeKind::Array as i64] = true;
-        MAKES[NodeKind::VariantLit as i64] = true;
-        MAKES[NodeKind::Repeat as i64] = true;
-        MAKES[NodeKind::Closure as i64] = true;
+fn makes_value(k: NodeKind, pcx: inout Ctx<Comp>) -> bool {
+    if !pcx.makes_set {
+        pcx.makes_set = true;
+        pcx.makes[NodeKind::Call as i64] = true;
+        pcx.makes[NodeKind::MethodCall as i64] = true;
+        pcx.makes[NodeKind::StructLit as i64] = true;
+        pcx.makes[NodeKind::Tuple as i64] = true;
+        pcx.makes[NodeKind::Array as i64] = true;
+        pcx.makes[NodeKind::VariantLit as i64] = true;
+        pcx.makes[NodeKind::Repeat as i64] = true;
+        pcx.makes[NodeKind::Closure as i64] = true;
     }
-    MAKES[k as i64]
+    pcx.makes[k as i64]
 }
 
-// Whether the values a function makes are recorded (FRESH): only for a
-// check that builds bodies by glue_met, not every body
-// (places::by_glue); asked once a program, the options set by then.
-static var FRESH_STATE: i64 = 0;
-
-fn fresh_on() -> bool {
-    if FRESH_STATE == 0 {
-        FRESH_STATE = if crate::places::by_glue() { 1 } else { 2 };
+fn fresh_on(pcx: inout Ctx<Comp>) -> bool {
+    if pcx.fresh_state == 0 {
+        pcx.fresh_state = if crate::places::by_glue(pcx) { 1 } else { 2 };
     }
-    FRESH_STATE == 1
+    pcx.fresh_state == 1
 }
 
 // Type t of a value the function being checked makes.
-fn note_fresh(t: i64) {
+fn note_fresh(t: i64, pcx: inout Ctx<Comp>) {
     // UNSAFE: FSTAMP is this file's raw array of stamps, grown as STAMP is (alloc_array).
     // SAFETY: t < FSTAMP_CAP before FSTAMP[t]; a grown array copies the old one first.
     unsafe {
-        let f = REC_F;
-        if f < 0 || t <= 0 || t < FSTAMP_CAP && FSTAMP[t] == f + 1 {
+        let f = pcx.rec_f;
+        if f < 0 || t <= 0 || t < pcx.fstamp_cap && pcx.fstamp[t] == f + 1 {
             return;
         }
-        if t >= FSTAMP_CAP {
+        if t >= pcx.fstamp_cap {
             let n = t * 2 + 1024;
             let a = alloc_array::<i64>(n);
-            for i in 0..FSTAMP_CAP {
-                a[i] = FSTAMP[i];
+            for i in 0..pcx.fstamp_cap {
+                a[i] = pcx.fstamp[i];
             }
-            FSTAMP = a;
-            FSTAMP_CAP = n;
+            pcx.fstamp = a;
+            pcx.fstamp_cap = n;
         }
-        FSTAMP[t] = f + 1;
-        FRESH.push(f);
-        FRESH.push(t);
+        pcx.fstamp[t] = f + 1;
+        pcx.fresh.push(f);
+        pcx.fresh.push(t);
     }
 }
 
 // FRESH by function, once (by_fn's counting sort).
-fn fresh_by_fn() {
+fn fresh_by_fn(pcx: inout Ctx<Comp>) {
     // UNSAFE: FRESH's data and the arrays made here are raw (*i64).
     // SAFETY: start has n + 1 entries for f < n; out has one per pair; FRESH.data has
     // FRESH.count entries.
     unsafe {
-        if FBY_N >= 0 {
+        if pcx.fby_n >= 0 {
             return;
         }
-        let n = crate::front::types::FN_COUNT + 1;
+        let n = pcx.fn_count + 1;
         let start = alloc_array::<i64>(n + 1);
-        let pairs = FRESH.count / 2;
+        let pairs = pcx.fresh.count / 2;
         for i in 0..pairs {
-            let f = FRESH.data[2 * i];
+            let f = pcx.fresh.data[2 * i];
             if f < n {
                 start[f + 1] += 1;
             }
@@ -306,119 +234,120 @@ fn fresh_by_fn() {
         let fill = alloc_array::<i64>(n + 1);
         let out = alloc_array::<i64>(pairs + 1);
         for i in 0..pairs {
-            let f = FRESH.data[2 * i];
+            let f = pcx.fresh.data[2 * i];
             if f < n {
-                out[start[f] + fill[f]] = FRESH.data[2 * i + 1];
+                out[start[f] + fill[f]] = pcx.fresh.data[2 * i + 1];
                 fill[f] += 1;
             }
         }
-        FBY_START = start;
-        FBY = out;
-        FBY_N = n;
+        pcx.fby_start = start;
+        pcx.fby = out;
+        pcx.fby_n = n;
     }
 }
 
-fn rec_flags(f: i64) -> *u8 {
+fn rec_flags(f: i64, pcx: inout Ctx<Comp>) -> *u8 {
     unsafe {
-        if f >= REC_CAP {
+        if f >= pcx.rec_cap {
             let n = f * 2 + 1024;
             let a = alloc_array::<u8>(n);
-            for i in 0..REC_CAP {
-                a[i] = REC_FLAGS[i];
+            for i in 0..pcx.rec_cap {
+                a[i] = pcx.rec_flags[i];
             }
-            REC_FLAGS = a;
-            REC_CAP = n;
+            pcx.rec_flags = a;
+            pcx.rec_cap = n;
         }
-        &REC_FLAGS[f]
+        &pcx.rec_flags[f]
     }
 }
 
 // The type checker starts function f (check_function; a function may be
 // checked inside another's call: an instance, a lazy default). The
 // enclosing record is saved, check_end restores it.
-pub fn check_begin(f: i64) {
+pub fn check_begin(f: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        SAVED.push(REC_F);
-        SAVED.push(CDEPTH);
-        SAVED.push(CROOTS.count);
-        REC_F = f;
-        CDEPTH = 0;
-        SPAN_A = if f >= 0 { NODES[FNS[f].node].start } else { 0 };
-        SPAN_B = if f >= 0 { NODES[FNS[f].node].end } else { 0 };
+        pcx.saved.push(pcx.rec_f);
+        pcx.saved.push(pcx.cdepth);
+        pcx.saved.push(pcx.croots.count);
+        pcx.rec_f = f;
+        pcx.cdepth = 0;
+        pcx.span_a = if f >= 0 { pcx.nodes[pcx.fns[f].node].start } else { 0 };
+        pcx.span_b = if f >= 0 { pcx.nodes[pcx.fns[f].node].end } else { 0 };
         if f >= 0 {
-            *rec_flags(f) |= R_CHECKED;
+            *rec_flags(f, &pcx) |= R_CHECKED;
         }
-        BY_N = -1;
-        FBY_N = -1;
+        pcx.by_n = -1;
+        pcx.fby_n = -1;
     }
 }
 
 // The type checker ends the function check_begin started.
-pub fn check_end() {
+pub fn check_end(pcx: inout Ctx<Comp>) {
     unsafe {
-        if SAVED.count < 3 {
-            REC_F = -1;
+        if pcx.saved.count < 3 {
+            pcx.rec_f = -1;
             return;
         }
-        CROOTS.count = SAVED.data[SAVED.count - 1];
-        CDEPTH = SAVED.data[SAVED.count - 2];
-        REC_F = SAVED.data[SAVED.count - 3];
-        SPAN_A = if REC_F >= 0 { NODES[FNS[REC_F].node].start } else { 0 };
-        SPAN_B = if REC_F >= 0 { NODES[FNS[REC_F].node].end } else { 0 };
-        SAVED.count -= 3;
+        pcx.croots.count = pcx.saved.data[pcx.saved.count - 1];
+        pcx.cdepth = pcx.saved.data[pcx.saved.count - 2];
+        pcx.rec_f = pcx.saved.data[pcx.saved.count - 3];
+        pcx.span_a = if pcx.rec_f >= 0 { pcx.nodes[pcx.fns[pcx.rec_f].node].start } else { 0 };
+        pcx.span_b = if pcx.rec_f >= 0 { pcx.nodes[pcx.fns[pcx.rec_f].node].end } else { 0 };
+        pcx.saved.count -= 3;
     }
 }
 
 // Type t is met in the function being checked: a local's, defined now
 // (front::check::define_local).
 #[inline]
-pub fn note_type(t: i64) {
+pub fn note_type(t: i64, pcx: inout Ctx<Comp>) {
     // UNSAFE: LOCALS and STAMP are raw arrays (*Local, *i64).
     // SAFETY: define_local, the one caller, made local LOCAL_COUNT - 1 just before;
     // t < STAMP_CAP before STAMP[t].
     unsafe {
         // (a local, not a parameter: a value the function makes)
-        if REC_F >= 0 && !LOCALS[crate::front::check::LOCAL_COUNT - 1].is_param && fresh_on() {
-            note_fresh(t);
+        if pcx.rec_f >= 0 && !pcx.locals[pcx.local_count - 1].is_param
+            && fresh_on(&pcx) {
+            note_fresh(t, &pcx);
         }
-        let f = REC_F;
-        if f < 0 || t <= 0 || t < STAMP_CAP && STAMP[t] == f + 1 {
+        let f = pcx.rec_f;
+        if f < 0 || t <= 0 || t < pcx.stamp_cap && pcx.stamp[t] == f + 1 {
             return;
         }
-        note_new(f, t);
+        note_new(f, t, &pcx);
     }
 }
 
-fn note_new(f: i64, t: i64) {
+fn note_new(f: i64, t: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if t >= STAMP_CAP {
+        if t >= pcx.stamp_cap {
             let n = t * 2 + 1024;
             let a = alloc_array::<i64>(n);
-            for i in 0..STAMP_CAP {
-                a[i] = STAMP[i];
+            for i in 0..pcx.stamp_cap {
+                a[i] = pcx.stamp[i];
             }
-            STAMP = a;
-            STAMP_CAP = n;
+            pcx.stamp = a;
+            pcx.stamp_cap = n;
         }
-        STAMP[t] = f + 1;
-        REC.push(f);
-        REC.push(t);
+        pcx.stamp[t] = f + 1;
+        pcx.rec.push(f);
+        pcx.rec.push(t);
     }
 }
 
 // check_expr or synth_expr enters node n: a call's frame of loans (its
 // mark, -1 for another node).
 #[inline]
-pub fn expr_enter(n: i64) -> i64 {
+pub fn expr_enter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let k = NODES[n].kind;
+        let k = pcx.nodes[n].kind;
         if k == NodeKind::Call || k == NodeKind::MethodCall {
-            CDEPTH += 1;
-            return CROOTS.count;
+            pcx.cdepth += 1;
+            return pcx.croots.count;
         }
-        if REC_F >= 0 && (k == NodeKind::Closure || NODES[n].start < SPAN_A
-            || NODES[n].start > SPAN_B) {
-            *rec_flags(REC_F) |= R_SCAN;
+        if pcx.rec_f >= 0 && (k == NodeKind::Closure || pcx.nodes[n].start < pcx.span_a
+            || pcx.nodes[n].start > pcx.span_b) {
+            *rec_flags(pcx.rec_f, &pcx) |= R_SCAN;
         }
         -1
     }
@@ -428,61 +357,61 @@ pub fn expr_enter(n: i64) -> i64 {
 // (The checker's hottest path: a type the function has recorded already
 // costs a lookup.)
 #[inline]
-pub fn check_exit(n: i64, t: i64, m: i64) {
+pub fn check_exit(n: i64, t: i64, m: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if m >= 0 {
-            CROOTS.count = m;
-            CDEPTH -= 1;
+            pcx.croots.count = m;
+            pcx.cdepth -= 1;
         }
-        if REC_F < 0 {
+        if pcx.rec_f < 0 {
             return;
         }
-        let k = NODES[n].kind;
-        if makes_value(k) && fresh_on() {
-            note_fresh(t);
+        let k = pcx.nodes[n].kind;
+        if makes_value(k, &pcx) && fresh_on(&pcx) {
+            note_fresh(t, &pcx);
         }
         if (k == NodeKind::Unary || k == NodeKind::Ident
-            || CDEPTH > 0 && (k == NodeKind::FieldAccess || k == NodeKind::Index))
-            && check_loans(n, t, k) {
+            || pcx.cdepth > 0 && (k == NodeKind::FieldAccess || k == NodeKind::Index))
+            && check_loans(n, t, k, &pcx) {
             return;
         }
-        if t <= 0 || t < STAMP_CAP && STAMP[t] == REC_F + 1 {
+        if t <= 0 || t < pcx.stamp_cap && pcx.stamp[t] == pcx.rec_f + 1 {
             return;
         }
-        if k == NodeKind::Str || raw_view_of(n, false) {
+        if k == NodeKind::Str || raw_view_of(n, false, &pcx) {
             return;
         }
-        note_new(REC_F, t);
+        note_new(pcx.rec_f, t, &pcx);
     }
 }
 
 // The loans of check_exit: `&place`, a borrowed pointer passed on, a view
 // read out of a place inside a call (view_arg: then true, its type not
 // recorded; ∅ when reached through a raw pointer).
-fn check_loans(n: i64, t: i64, k: NodeKind) -> bool {
+fn check_loans(n: i64, t: i64, k: NodeKind, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if k == NodeKind::Unary {
-            if NODES[n].op == crate::front::lexer::Tok::Amp {
-                check_loan(place_root(NODES[n].b), true);
+            if pcx.nodes[n].op == crate::front::lexer::Tok::Amp {
+                check_loan(place_root(pcx.nodes[n].b, pcx), true, &pcx);
             }
             return false;
         }
-        if k == NodeKind::Ident && NODES[n].res == Res::Local && NODES[n].y >= 0
-            && LOCALS[NODES[n].y].borrow && t > 0 && TYPES[t].kind == TyKind::Ptr {
-            check_loan(2 * NODES[n].y, true);
+        if k == NodeKind::Ident && pcx.nodes[n].res == Res::Local && pcx.nodes[n].y >= 0
+            && pcx.locals[pcx.nodes[n].y].borrow && t > 0 && TYPES[t].kind == TyKind::Ptr {
+            check_loan(2 * pcx.nodes[n].y, true, &pcx);
             return false;
         }
-        if CDEPTH > 0 && t > 0
+        if pcx.cdepth > 0 && t > 0
             && (TYPES[t].kind == TyKind::Slice || TYPES[t].kind == TyKind::Ptr) {
-            if raw_view_of(n, false) {
+            if raw_view_of(n, false, &pcx) {
                 return true;
             }
-            let r = place_root(n);
+            let r = place_root(n, pcx);
             if r >= 0 {
                 if (r & 1) == 1 {
-                    *rec_flags(REC_F) |= R_LOANS;
+                    *rec_flags(pcx.rec_f, &pcx) |= R_LOANS;
                 }
-                check_loan(r, true);
+                check_loan(r, true, &pcx);
                 return true;
             }
         }
@@ -492,131 +421,132 @@ fn check_loans(n: i64, t: i64, k: NodeKind) -> bool {
 
 // synth_expr leaves node n, of type t, entered with mark m.
 #[inline]
-pub fn synth_exit(n: i64, t: i64, m: i64) {
+pub fn synth_exit(n: i64, t: i64, m: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if m >= 0 {
-            CROOTS.count = m;
-            CDEPTH -= 1;
+            pcx.croots.count = m;
+            pcx.cdepth -= 1;
         }
-        if REC_F < 0 || n == CHK_NODE {
+        if pcx.rec_f < 0 || n == pcx.chk_node {
             return;
         }
-        let k = NODES[n].kind;
-        if makes_value(k) && fresh_on() {
-            note_fresh(t);
+        let k = pcx.nodes[n].kind;
+        if makes_value(k, &pcx) && fresh_on(&pcx) {
+            note_fresh(t, &pcx);
         }
         if k == NodeKind::Assign {
-            check_loan(place_root(NODES[n].b), false);
+            check_loan(place_root(pcx.nodes[n].b, pcx), false, &pcx);
         }
-        if t <= 0 || t < STAMP_CAP && STAMP[t] == REC_F + 1 {
+        if t <= 0 || t < pcx.stamp_cap && pcx.stamp[t] == pcx.rec_f + 1 {
             return;
         }
-        if k == NodeKind::Str || k == NodeKind::FieldAccess && raw_view_of(n, false) {
+        if k == NodeKind::Str || k == NodeKind::FieldAccess && raw_view_of(n, false, &pcx) {
             return;
         }
-        note_new(REC_F, t);
+        note_new(pcx.rec_f, t, &pcx);
     }
 }
 
 // check_expr is checking node n (its own synth is not recorded).
 #[inline]
-pub fn check_node(n: i64) {
-    CHK_NODE = n;
+pub fn check_node(n: i64, pcx: inout Ctx<Comp>) {
+    pcx.chk_node = n;
 }
 
 // The function being checked holds nodes its check does not type (a
 // default argument's, args.vl): the scan decides it.
-pub fn note_scan() {
+pub fn note_scan(pcx: inout Ctx<Comp>) {
     unsafe {
-        if REC_F >= 0 {
-            *rec_flags(REC_F) |= R_SCAN;
+        if pcx.rec_f >= 0 {
+            *rec_flags(pcx.rec_f, &pcx) |= R_SCAN;
         }
     }
 }
 
 // The functions holding closures (a closure is typed when it is
 // finished, not where it is checked): the scan decides them. Once.
-fn mark_closures() {
+fn mark_closures(pcx: inout Ctx<Comp>) {
     unsafe {
-        if CLOSURES_MARKED {
+        if pcx.closures_marked {
             return;
         }
-        CLOSURES_MARKED = true;
-        for i in 0..crate::front::closures::CLOSURE_COUNT {
-            let e = crate::front::closures::CLOSURES[i].encl_fn;
+        pcx.closures_marked = true;
+        for i in 0..pcx.closures.len() as i64 {
+            let e = pcx.closures[i].encl_fn;
             if e >= 0 {
-                *rec_flags(e) |= R_SCAN;
+                *rec_flags(e, &pcx) |= R_SCAN;
             }
         }
     }
 }
 
 // The checker made node u (a method's receiver `&recv`, or `*recv`) typed.
-pub fn note_synthetic(u: i64) {
-    if REC_F < 0 {
+pub fn note_synthetic(u: i64, pcx: inout Ctx<Comp>) {
+    if pcx.rec_f < 0 {
         return;
     }
-    if NODES[u].op == crate::front::lexer::Tok::Amp {
-        check_loan(place_root(NODES[u].b), true);
+    if pcx.nodes[u].op == crate::front::lexer::Tok::Amp {
+        check_loan(place_root(pcx.nodes[u].b, pcx), true, &pcx);
     }
-    let t = NODES[u].ty;
+    let t = pcx.nodes[u].ty;
     // UNSAFE: STAMP is a raw array (*i64).
     // SAFETY: t < STAMP_CAP before STAMP[t].
-    if t > 0 && !(t < STAMP_CAP && unsafe { STAMP[t] } == REC_F + 1) {
-        note_new(REC_F, t);
+    if t > 0 && !(t < pcx.stamp_cap && unsafe { pcx.stamp[t] } == pcx.rec_f + 1) {
+        note_new(pcx.rec_f, t, &pcx);
     }
 }
 
 // A loan of root r (-1: none) in the call being checked: one an enclosing
 // pending argument also holds is a possible conflict; pending: it stays
 // pending for the call's later arguments.
-fn check_loan(r: i64, pending: bool) {
+fn check_loan(r: i64, pending: bool, pcx: inout Ctx<Comp>) {
     unsafe {
-        if r < 0 || CDEPTH <= 0 {
+        if r < 0 || pcx.cdepth <= 0 {
             return;
         }
-        for i in 0..CROOTS.count {
-            if CROOTS.data[i] == r {
-                *rec_flags(REC_F) |= R_LOANS;
+        for i in 0..pcx.croots.count {
+            if pcx.croots.data[i] == r {
+                *rec_flags(pcx.rec_f, &pcx) |= R_LOANS;
                 return;
             }
         }
         if pending {
-            CROOTS.push(r);
+            pcx.croots.push(r);
         }
     }
 }
 
 // What f's record says (needs_walk).
-fn record_says(f: i64) -> bool {
+fn record_says(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        mark_closures();
-        if (REC_FLAGS[f] & R_LOANS) != 0 {
+        mark_closures(&pcx);
+        if (pcx.rec_flags[f] & R_LOANS) != 0 {
             return true;
         }
-        if (REC_FLAGS[f] & R_SCAN) != 0 {
-            return scan_fn(f);
+        if (pcx.rec_flags[f] & R_SCAN) != 0 {
+            return scan_fn(f, &pcx);
         }
-        let item = FNS[f].node;
-        if tracked(FNS[f].ret) {
+        let item = pcx.fns[f].node;
+        if tracked(pcx.fns[f].ret, &pcx) {
             return true;
         }
-        for i in 0..NODES[item].count {
-            let l = NODES[child(item, i)].x;
+        for i in 0..pcx.nodes[item].count {
+            let l = pcx.nodes[child(item, i, pcx)].x;
             if l < 0 {
                 continue;
             }
-            let t = LOCALS[l].ty;
-            if tracked(t) || t > 0 && TYPES[t].kind == TyKind::Ptr && tracked(TYPES[t].a) {
+            let t = pcx.locals[l].ty;
+            if tracked(t, &pcx)
+                || t > 0 && TYPES[t].kind == TyKind::Ptr && tracked(TYPES[t].a, &pcx) {
                 return true;
             }
         }
-        by_fn();
-        if f >= BY_N {
+        by_fn(&pcx);
+        if f >= pcx.by_n {
             return true;
         }
-        for i in BY_START[f]..BY_START[f + 1] {
-            if tracked(BY_FN[i]) {
+        for i in pcx.by_start[f]..pcx.by_start[f + 1] {
+            if tracked(pcx.by_fn[i], &pcx) {
                 return true;
             }
         }
@@ -628,26 +558,27 @@ fn record_says(f: i64) -> bool {
 // parameter it takes by value (`sink`) with glue, or a value it makes
 // (FRESH: a local's, a call's result, an aggregate's, a closure's) with
 // glue.
-fn makes_glue(f: i64) -> bool {
+fn makes_glue(f: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: FBY_START and FBY are raw arrays (*i64), LOCALS too (*Local).
     // SAFETY: f < FBY_N, the length of FBY_START less one, before FBY_START[f + 1], whose
     // range lies in FBY; l is a parameter's local, below LOCAL_COUNT.
     unsafe {
-        let item = FNS[f].node;
-        for i in 0..NODES[item].count {
-            let l = NODES[child(item, i)].x;
-            if l >= 0 && i < FNS[f].param_count
-                && crate::front::own::kinds::param_mode(f, i) == crate::front::own::kinds::P_VALUE
-                && has_glue(LOCALS[l].ty) {
+        let item = pcx.fns[f].node;
+        for i in 0..pcx.nodes[item].count {
+            let l = pcx.nodes[child(item, i, pcx)].x;
+            if l >= 0 && i < pcx.fns[f].param_count
+                && crate::front::own::kinds::param_mode(f, i, pcx)
+                == crate::front::own::kinds::P_VALUE
+                && has_glue(pcx.locals[l].ty, &pcx) {
                 return true;
             }
         }
-        fresh_by_fn();
-        if f >= FBY_N {
+        fresh_by_fn(&pcx);
+        if f >= pcx.fby_n {
             return true;
         }
-        for i in FBY_START[f]..FBY_START[f + 1] {
-            if has_glue(FBY[i]) {
+        for i in pcx.fby_start[f]..pcx.fby_start[f + 1] {
+            if has_glue(pcx.fby[i], &pcx) {
                 return true;
             }
         }
@@ -666,29 +597,30 @@ fn makes_glue(f: i64) -> bool {
 // may. The own pass's drops are not asked: it stays when they go (step
 // 7). Unlike needs_walk it memoizes nothing: it runs before the own pass,
 // whose kinds of views may change meanwhile.
-pub fn glue_met(f: i64) -> bool {
+pub fn glue_met(f: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: REC_FLAGS is a raw array (*u8).
     // SAFETY: f < REC_CAP before REC_FLAGS[f].
     unsafe {
-        mark_closures();
-        if f >= REC_CAP || (REC_FLAGS[f] & R_CHECKED) == 0 || (REC_FLAGS[f] & R_SCAN) != 0 {
+        mark_closures(&pcx);
+        if f >= pcx.rec_cap || (pcx.rec_flags[f] & R_CHECKED) == 0
+            || (pcx.rec_flags[f] & R_SCAN) != 0 {
             return true;
         }
     }
-    makes_glue(f)
+    makes_glue(f, &pcx)
 }
 
 // The records by function (a counting sort of REC), once.
-fn by_fn() {
+fn by_fn(pcx: inout Ctx<Comp>) {
     unsafe {
-        if BY_N >= 0 {
+        if pcx.by_n >= 0 {
             return;
         }
-        let n = crate::front::types::FN_COUNT + 1;
+        let n = pcx.fn_count + 1;
         let start = alloc_array::<i64>(n + 1);
-        let pairs = REC.count / 2;
+        let pairs = pcx.rec.count / 2;
         for i in 0..pairs {
-            let f = REC.data[2 * i];
+            let f = pcx.rec.data[2 * i];
             if f < n {
                 start[f + 1] += 1;
             }
@@ -699,104 +631,105 @@ fn by_fn() {
         let fill = alloc_array::<i64>(n + 1);
         let out = alloc_array::<i64>(pairs + 1);
         for i in 0..pairs {
-            let f = REC.data[2 * i];
+            let f = pcx.rec.data[2 * i];
             if f < n {
-                out[start[f] + fill[f]] = REC.data[2 * i + 1];
+                out[start[f] + fill[f]] = pcx.rec.data[2 * i + 1];
                 fill[f] += 1;
             }
         }
-        BY_START = start;
-        BY_FN = out;
-        BY_N = n;
+        pcx.by_start = start;
+        pcx.by_fn = out;
+        pcx.by_n = n;
     }
 }
 
-fn scan_fn(f: i64) -> bool {
+fn scan_fn(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let item = FNS[f].node;
-        if tracked(FNS[f].ret) {
+        let item = pcx.fns[f].node;
+        if tracked(pcx.fns[f].ret, &pcx) {
             return true;
         }
-        for i in 0..NODES[item].count {
-            let l = NODES[child(item, i)].x;
+        for i in 0..pcx.nodes[item].count {
+            let l = pcx.nodes[child(item, i, pcx)].x;
             if l < 0 {
                 continue;
             }
-            let t = LOCALS[l].ty;
+            let t = pcx.locals[l].ty;
             // (a pointer parameter to what holds views: the stores)
-            if tracked(t) || t > 0 && TYPES[t].kind == TyKind::Ptr && tracked(TYPES[t].a) {
+            if tracked(t, &pcx)
+                || t > 0 && TYPES[t].kind == TyKind::Ptr && tracked(TYPES[t].a, &pcx) {
                 return true;
             }
         }
-        NEED = false;
-        ROOTS.count = 0;
-        STATIC_VIEWS = 0;
-        scan(NODES[item].c);
-        NEED
+        pcx.need = false;
+        pcx.roots.count = 0;
+        pcx.static_views = 0;
+        scan(pcx.nodes[item].c, &pcx);
+        pcx.need
     }
 }
 
 // The root of place expression e: 2 * local, 2 * static + 1; -1: not a
 // place.
-fn place_root(e: i64) -> i64 {
-    let k = NODES[e].kind;
+fn place_root(e: i64, pcx: Ctx<Comp>) -> i64 {
+    let k = pcx.nodes[e].kind;
     if k == NodeKind::Ident {
-        if NODES[e].res == Res::Local && NODES[e].y >= 0 {
-            return 2 * NODES[e].y;
+        if pcx.nodes[e].res == Res::Local && pcx.nodes[e].y >= 0 {
+            return 2 * pcx.nodes[e].y;
         }
-        if NODES[e].res == Res::Static && NODES[e].y >= 0 {
-            return 2 * NODES[e].y + 1;
+        if pcx.nodes[e].res == Res::Static && pcx.nodes[e].y >= 0 {
+            return 2 * pcx.nodes[e].y + 1;
         }
         return -1;
     }
     if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
-        return place_root(NODES[e].a);
+        return place_root(pcx.nodes[e].a, pcx);
     }
-    if k == NodeKind::Unary && NODES[e].op == crate::front::lexer::Tok::Star {
-        return place_root(NODES[e].b);
+    if k == NodeKind::Unary && pcx.nodes[e].op == crate::front::lexer::Tok::Star {
+        return place_root(pcx.nodes[e].b, pcx);
     }
-    if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
-        return place_root(NODES[e].a);
+    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e].b].kind != NodeKind::Range {
+        return place_root(pcx.nodes[e].a, pcx);
     }
     -1
 }
 
 // A loan of root r is taken while the pending ones are ROOTS.
-fn loan(r: i64) {
+fn loan(r: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if r < 0 {
             return;
         }
-        for i in 0..ROOTS.count {
-            if ROOTS.data[i] == r {
-                NEED = true;
+        for i in 0..pcx.roots.count {
+            if pcx.roots.data[i] == r {
+                pcx.need = true;
                 return;
             }
         }
     }
 }
 
-fn scan_list(n: i64) {
-    for i in 0..NODES[n].count {
-        scan(child(n, i));
+fn scan_list(n: i64, pcx: inout Ctx<Comp>) {
+    for i in 0..pcx.nodes[n].count {
+        scan(child(n, i, pcx), &pcx);
     }
 }
 
-fn scan_pattern(p: i64) {
+fn scan_pattern(p: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if p == 0 {
             return;
         }
-        let k = NODES[p].kind;
+        let k = pcx.nodes[p].kind;
         if k == NodeKind::PatBind {
-            if NODES[p].x >= 0 && tracked(LOCALS[NODES[p].x].ty) {
-                NEED = true;
+            if pcx.nodes[p].x >= 0 && tracked(pcx.locals[pcx.nodes[p].x].ty, &pcx) {
+                pcx.need = true;
             }
             return;
         }
         if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
-            for i in 0..NODES[p].count {
-                scan_pattern(child(p, i));
+            for i in 0..pcx.nodes[p].count {
+                scan_pattern(child(p, i, pcx), &pcx);
             }
         }
     }
@@ -805,96 +738,96 @@ fn scan_pattern(p: i64) {
 // Node n: its type, then (not for a leaf: a local, a literal) its parts.
 // Inlined: a leaf costs no call (the scan's hottest path).
 #[inline]
-fn scan(n: i64) {
+fn scan(n: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if n == 0 || NEED {
+        if n == 0 || pcx.need {
             return;
         }
-        let t = NODES[n].ty;
+        let t = pcx.nodes[n].ty;
         if t > 0 {
-            let m = if t < MEMO_CAP { MEMO[t] } else { 0 };
-            if m != 1 && (m >= 2 || tracked(t)) && !(MEMO[t] == 3 && raw_view(n)) {
-                NEED = true;
+            let m = if t < pcx.memo_cap { pcx.memo[t] } else { 0 };
+            if m != 1 && (m >= 2 || tracked(t, &pcx)) && !(pcx.memo[t] == 3 && raw_view(n, &pcx)) {
+                pcx.need = true;
                 return;
             }
         }
-        let k = NODES[n].kind;
+        let k = pcx.nodes[n].kind;
         if k == NodeKind::Ident || k == NodeKind::Int || k == NodeKind::Bool
             || k == NodeKind::Char || k == NodeKind::CStr || k == NodeKind::Str {
             return;
         }
-        scan_node(n);
+        scan_node(n, &pcx);
     }
 }
 
-fn scan_node(n: i64) {
-    match NODES[n].kind {
+fn scan_node(n: i64, pcx: inout Ctx<Comp>) {
+    match pcx.nodes[n].kind {
         NodeKind::FieldAccess | NodeKind::TupleField | NodeKind::Cast
-            | NodeKind::Repeat | NodeKind::EnumPanic => scan(NODES[n].a),
-        NodeKind::Unary => scan(NODES[n].b),
+            | NodeKind::Repeat | NodeKind::EnumPanic => scan(pcx.nodes[n].a, &pcx),
+        NodeKind::Unary => scan(pcx.nodes[n].b, &pcx),
         NodeKind::Index | NodeKind::Range => {
-            scan(NODES[n].b);
-            scan(NODES[n].a);
+            scan(pcx.nodes[n].b, &pcx);
+            scan(pcx.nodes[n].a, &pcx);
         }
         NodeKind::Binary => {
-            scan(NODES[n].b);
-            scan(NODES[n].c);
+            scan(pcx.nodes[n].b, &pcx);
+            scan(pcx.nodes[n].c, &pcx);
         }
         NodeKind::Assign => {
-            scan(NODES[n].c);
-            scan(NODES[n].b);
-            loan(place_root(NODES[n].b));
+            scan(pcx.nodes[n].c, &pcx);
+            scan(pcx.nodes[n].b, &pcx);
+            loan(place_root(pcx.nodes[n].b, pcx), &pcx);
         }
-        NodeKind::Call => scan_call(n),
+        NodeKind::Call => scan_call(n, &pcx),
         NodeKind::Block => {
-            for i in 0..NODES[n].count {
-                let s = child(n, i);
-                let k = NODES[s].kind;
+            for i in 0..pcx.nodes[n].count {
+                let s = child(n, i, pcx);
+                let k = pcx.nodes[s].kind;
                 if k == NodeKind::Let {
-                    scan_pattern(NODES[s].a);
-                    scan(NODES[s].c);
+                    scan_pattern(pcx.nodes[s].a, &pcx);
+                    scan(pcx.nodes[s].c, &pcx);
                 } else if k == NodeKind::Defer || k == NodeKind::ExprStmt {
-                    scan(NODES[s].a);
+                    scan(pcx.nodes[s].a, &pcx);
                 } else {
-                    scan(s);
+                    scan(s, &pcx);
                 }
             }
-            scan(NODES[n].a);
+            scan(pcx.nodes[n].a, &pcx);
         }
         NodeKind::If => {
-            scan(NODES[n].a);
-            scan(NODES[n].b);
-            scan(NODES[n].c);
+            scan(pcx.nodes[n].a, &pcx);
+            scan(pcx.nodes[n].b, &pcx);
+            scan(pcx.nodes[n].c, &pcx);
         }
         NodeKind::Match => {
-            scan(NODES[n].a);
-            for i in 0..NODES[n].count {
-                let arm = child(n, i);
-                scan_pattern(NODES[arm].a);
-                scan(NODES[arm].b);
-                scan(NODES[arm].c);
+            scan(pcx.nodes[n].a, &pcx);
+            for i in 0..pcx.nodes[n].count {
+                let arm = child(n, i, pcx);
+                scan_pattern(pcx.nodes[arm].a, &pcx);
+                scan(pcx.nodes[arm].b, &pcx);
+                scan(pcx.nodes[arm].c, &pcx);
             }
         }
         // (as walk.vl's eval_loop: a loop's other fields are no nodes)
-        NodeKind::Loop => scan(NODES[n].b),
+        NodeKind::Loop => scan(pcx.nodes[n].b, &pcx),
         NodeKind::While => {
-            scan(NODES[n].b);
-            scan(NODES[n].c);
+            scan(pcx.nodes[n].b, &pcx);
+            scan(pcx.nodes[n].c, &pcx);
         }
         NodeKind::For => {
-            scan_pattern(NODES[n].b);
-            scan(NODES[n].c);
-            scan(NODES[n].d);
+            scan_pattern(pcx.nodes[n].b, &pcx);
+            scan(pcx.nodes[n].c, &pcx);
+            scan(pcx.nodes[n].d, &pcx);
         }
-        NodeKind::Break => scan(NODES[n].b),
-        NodeKind::Return => scan(NODES[n].a),
+        NodeKind::Break => scan(pcx.nodes[n].b, &pcx),
+        NodeKind::Return => scan(pcx.nodes[n].a, &pcx),
         NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit
-            | NodeKind::VariantLit => scan_list(n),
-        NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b),
-        NodeKind::Closure | NodeKind::Try | NodeKind::Interp => scan(NODES[n].y),
+            | NodeKind::VariantLit => scan_list(n, &pcx),
+        NodeKind::FieldInit | NodeKind::NamedArg => scan(pcx.nodes[n].b, &pcx),
+        NodeKind::Closure | NodeKind::Try | NodeKind::Interp => scan(pcx.nodes[n].y, &pcx),
         NodeKind::VecOp => {
-            scan(NODES[n].a);
-            scan_list(n);
+            scan(pcx.nodes[n].a, &pcx);
+            scan_list(n, &pcx);
         }
         _ => {}
     }
@@ -904,47 +837,49 @@ fn scan_node(n: i64) {
 // passed on, a view read out of a place: `p.text`) is checked against the
 // pending ones, then pending itself. A view of a static pending while a
 // nested call runs (it may write statics) needs the walk.
-fn scan_call(n: i64) {
+fn scan_call(n: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if STATIC_VIEWS > 0 {
-            NEED = true;
+        if pcx.static_views > 0 {
+            pcx.need = true;
             return;
         }
-        if NODES[n].x - 1 < 0 {
-            scan(NODES[n].a);
+        if pcx.nodes[n].x - 1 < 0 {
+            scan(pcx.nodes[n].a, &pcx);
         }
-        let mark = ROOTS.count;
-        let statics = STATIC_VIEWS;
-        for i in 0..NODES[n].count {
-            let arg = child(n, i);
-            let k = NODES[arg].kind;
+        let mark = pcx.roots.count;
+        let statics = pcx.static_views;
+        for i in 0..pcx.nodes[n].count {
+            let arg = child(n, i, pcx);
+            let k = pcx.nodes[arg].kind;
             var r = -1;
-            if k == NodeKind::Unary && NODES[arg].op == crate::front::lexer::Tok::Amp {
-                scan(NODES[arg].b);
-                r = place_root(NODES[arg].b);
-            } else if k == NodeKind::Ident && NODES[arg].res == Res::Local && NODES[arg].y >= 0
-                && LOCALS[NODES[arg].y].borrow && NODES[arg].ty > 0
-                && TYPES[NODES[arg].ty].kind == TyKind::Ptr {
-                r = 2 * NODES[arg].y;
+            if k == NodeKind::Unary && pcx.nodes[arg].op == crate::front::lexer::Tok::Amp {
+                scan(pcx.nodes[arg].b, &pcx);
+                r = place_root(pcx.nodes[arg].b, pcx);
+            }
+            else if k == NodeKind::Ident && pcx.nodes[arg].res == Res::Local
+                && pcx.nodes[arg].y >= 0 && pcx.locals[pcx.nodes[arg].y].borrow
+                && pcx.nodes[arg].ty > 0
+                && TYPES[pcx.nodes[arg].ty].kind == TyKind::Ptr {
+                r = 2 * pcx.nodes[arg].y;
             } else {
-                r = view_arg(arg);
+                r = view_arg(arg, &pcx);
                 if r == -2 {
-                    scan(arg);
+                    scan(arg, &pcx);
                     r = -1;
                 } else if r >= 0 && (r & 1) == 1 {
-                    STATIC_VIEWS += 1;
+                    pcx.static_views += 1;
                 }
             }
-            if NEED {
+            if pcx.need {
                 break;
             }
             if r >= 0 {
-                loan(r);
-                ROOTS.push(r);
+                loan(r, &pcx);
+                pcx.roots.push(r);
             }
         }
-        ROOTS.count = mark;
-        STATIC_VIEWS = statics;
+        pcx.roots.count = mark;
+        pcx.static_views = statics;
     }
 }
 
@@ -952,21 +887,21 @@ fn scan_call(n: i64) {
 // holds no views of anything (raw_view): its parts scanned, then its root
 // (a loan for the call: the walk's pending view), -1 for none; -2: another
 // kind of argument.
-fn view_arg(arg: i64) -> i64 {
+fn view_arg(arg: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let t = NODES[arg].ty;
-        if t <= 0 || !tracked(t) || MEMO[t] != 3 {
+        let t = pcx.nodes[arg].ty;
+        if t <= 0 || !tracked(t, &pcx) || pcx.memo[t] != 3 {
             return -2;
         }
-        if raw_view(arg) {
-            scan_node(arg);
+        if raw_view(arg, &pcx) {
+            scan_node(arg, &pcx);
             return -1;
         }
-        let r = place_root(arg);
+        let r = place_root(arg, pcx);
         if r < 0 {
             return -2;
         }
-        scan_node(arg);
+        scan_node(arg, &pcx);
         r
     }
 }

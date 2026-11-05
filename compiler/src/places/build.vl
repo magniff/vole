@@ -32,8 +32,9 @@
 
 use crate::base::{IntVec, SYMS, intern_c, len_arg};
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ast::{
-    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODES, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
+    BLOCK_TRANSPARENT, CLOSURE_MOVE, NODE_IN_BOUNDS, NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::check::Res;
 use crate::front::check::temps::NODE_TEMP;
@@ -41,8 +42,8 @@ use crate::front::consteval::wrap_int;
 use crate::front::contracts::expand::is_pre_fn;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::Tok;
-use crate::front::own::byref::{BYREF, MATCH_BYREF, NO_DROP, borrowed_call, indexable_place};
-use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
+use crate::front::own::byref::{MATCH_BYREF, NO_DROP, borrowed_call, indexable_place};
+use crate::front::own::diag::MODE_ERROR;
 use crate::front::own::kinds::{P_MUT, P_RAW, P_VALUE, is_view_type, param_mode};
 use crate::front::patterns::{binding_count, binds_ref, is_irrefutable, pattern_referent};
 use crate::front::patterns::usefulness::int_key;
@@ -50,7 +51,6 @@ use crate::front::types::{
     REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_UNIT, TyKind, fn_param, is_compound,
     is_integer, is_void, type_elem, variant_field,
 };
-use crate::middle::opt::OVERFLOW_CHECKS;
 use crate::places::front::{
     ast_local_mutable, ast_local_ty, enum_tag_ty, fn_is_extern, fn_module, fn_param_count, fn_ret,
     static_ty, struct_field_name, type_glue, variant_discr,
@@ -72,17 +72,6 @@ use crate::places::ir::{
 
 // ---- State ----
 
-// Set when the body uses a construct not built yet: the node.
-pub static var BUILD_FAILED: bool = false;
-pub static var FAIL_NODE: i64 = 0;
-
-// AST local -> IR place (local, projection), valid where MAP_GEN is GEN.
-static var MAP_L: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var MAP_P: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var MAP_GEN: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var GEN: i64 = 0;
-// The statics named so far: (symbol, IR local) pairs.
-static var STATICS_SEEN: Vec<i64, Comp> = Vec::new_in(Comp {});
 // The scope stack: records of SW words (kind, first entry, its node
 // (where its drops run, places/print.vl drop_pos; a loop's: the loop),
 // break block, continue block, the loop's result local and projection,
@@ -94,100 +83,68 @@ const SC_BLOCK: i64 = 2;
 const SC_STMT: i64 = 3;
 const SC_LOOP: i64 = 4;
 const SC_ARM: i64 = 5;
-static var SCOPES: Vec<i64, Comp> = Vec::new_in(Comp {});
 // Their entries: (kind, value) pairs.
 const EN_DROP: i64 = 1;
 const EN_DEAD: i64 = 2;
 const EN_DEFER: i64 = 3;
-static var ENTRIES: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The last operand made (operand) and the last place (as_place).
-static var OPK: i64 = 0;
-static var OPA: i64 = 0;
-static var OPB: i64 = 0;
-static var PL_L: i64 = 0;
-static var PL_P: i64 = 0;
-// The return block, the discard local (`()`, no storage), the function.
-static var RET_BLOCK: i64 = -1;
-static var UNIT_LOCAL: i64 = -1;
-static var CUR_F: i64 = -1;
 
-// The exit whose scopes' entries are being emitted (a `return`, `break`,
-// `continue`, a refused guard, the body's end): the node of their drops
-// (0: a scope's own end, its node's).
-static var EXIT_NODE: i64 = 0;
-// Whether drops are placed (--values=error, as the own pass's).
-static var DROPS: bool = false;
-// Whether the struct literal being lowered is a by-access closure's env
-// (its values borrowed copies).
-static var AGG_BORROW: bool = false;
-// The symbols of the own pass's names the builder reads.
-static var SYM_FOR_SEQ: i64 = 0;
-
-// Counts, for --time-passes and the README.
-pub static var BUILT: i64 = 0;
-pub static var STMTS_MADE: i64 = 0;
-
-// Whether every local gets its storage markers (keeps_storage): set by the
-// driver for --emit-places and --verify-places.
-pub static var ALL_STORAGE: bool = true;
-
-fn syms() {
-    if SYM_FOR_SEQ == 0 {
-        SYM_FOR_SEQ = intern_c(c"__for_seq");
+fn syms(pcx: inout Ctx<Comp>) {
+    if pcx.sym_for_seq == 0 {
+        pcx.sym_for_seq = intern_c(c"__for_seq");
     }
 }
 
-fn unsupported(n: i64) {
-    if !BUILD_FAILED {
-        BUILD_FAILED = true;
-        FAIL_NODE = n;
+fn unsupported(n: i64, pcx: inout Ctx<Comp>) {
+    if !pcx.build_failed {
+        pcx.build_failed = true;
+        pcx.fail_node = n;
     }
 }
 
 // ---- Locals ----
 
-fn map_local(l: i64, ir: i64, p: i64) {
-    while MAP_GEN.len() as i64 <= l {
-        MAP_L.push(0);
-        MAP_P.push(0);
-        MAP_GEN.push(0);
+fn map_local(l: i64, ir: i64, p: i64, pcx: inout Ctx<Comp>) {
+    while pcx.map_gen.len() as i64 <= l {
+        pcx.map_l.push(0);
+        pcx.map_p.push(0);
+        pcx.map_gen.push(0);
     }
-    MAP_L[l] = ir;
-    MAP_P[l] = p;
-    MAP_GEN[l] = GEN;
+    pcx.map_l[l] = ir;
+    pcx.map_p[l] = p;
+    pcx.map_gen[l] = pcx.build_gen;
 }
 
 // The IR place of AST local l (PL_L, PL_P); false when it has none.
-fn mapped(l: i64) -> bool {
-    if l < 0 || l >= MAP_GEN.len() as i64 || MAP_GEN[l] != GEN {
+fn mapped(l: i64, pcx: inout Ctx<Comp>) -> bool {
+    if l < 0 || l >= pcx.map_gen.len() as i64 || pcx.map_gen[l] != pcx.build_gen {
         return false;
     }
-    PL_L = MAP_L[l];
-    PL_P = MAP_P[l];
+    pcx.pl_l = pcx.map_l[l];
+    pcx.pl_p = pcx.map_p[l];
     true
 }
 
 // Whether AST local l is a borrowed copy (byref.vl's BYREF).
-fn ast_borrowed(l: i64) -> bool {
-    l >= 0 && BYREF.get(l + 1) != 0
+fn ast_borrowed(l: i64, pcx: Ctx<Comp>) -> bool {
+    l >= 0 && pcx.byref.get(l + 1) != 0
 }
 
-fn needs_drop(t: i64) -> bool {
-    DROPS && t > 0 && t != TY_NEVER && type_glue(t)
+fn needs_drop(t: i64, pcx: inout Ctx<Comp>) -> bool {
+    pcx.drops && t > 0 && t != TY_NEVER && type_glue(t, &pcx)
 }
 
 // A new IR local for AST local l (bound by a pattern or a `let`).
-fn user_local(l: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>) -> i64 {
-    let ty = ast_local_ty(l);
+fn user_local(l: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let ty = ast_local_ty(l, pcx);
     var flags = LF_USER;
-    if ast_local_mutable(l) {
+    if ast_local_mutable(l, pcx) {
         flags |= LF_MUT;
     }
-    if borrowed || ast_borrowed(l) {
+    if borrowed || ast_borrowed(l, pcx) {
         flags |= LF_BORROWED;
     }
     let ir = new_local(ty, flags, l, node, &pbody);
-    map_local(l, ir, 0);
+    map_local(l, ir, 0, &pcx);
     ir
 }
 
@@ -198,18 +155,18 @@ fn user_local(l: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>) -> i64
 // R5): when that is not the innermost, the temporary has no storage markers
 // (made on some paths of the scope it drops in, an arm's: its storage is
 // the body's).
-fn new_temp(ty: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>) -> i64 {
+fn new_temp(ty: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let l = new_local(ty, LF_TEMP | if borrowed { LF_BORROWED } else { 0 }, -1, node, &pbody);
-    let drop = !borrowed && needs_drop(ty);
-    let h = if drop { temp_home() } else { scope_depth() - 1 };
-    if h == scope_depth() - 1 {
-        live(l, &pbody);
-        schedule(EN_DEAD, l, pbody);
+    let drop = !borrowed && needs_drop(ty, &pcx);
+    let h = if drop { temp_home(pcx) } else { scope_depth(pcx) - 1 };
+    if h == scope_depth(pcx) - 1 {
+        live(l, &pbody, &pcx);
+        schedule(EN_DEAD, l, pbody, &pcx);
         if drop {
-            schedule(EN_DROP, l, pbody);
+            schedule(EN_DROP, l, pbody, &pcx);
         }
     } else {
-        schedule_in(h, EN_DROP, l, pbody);
+        schedule_in(h, EN_DROP, l, pbody, &pcx);
     }
     l
 }
@@ -221,67 +178,58 @@ fn new_temp(ty: i64, node: i64, borrowed: bool, pbody: inout Body<Comp>) -> i64 
 // registered once it holds the value, so that the temporaries e makes drop
 // after it (`r(1).next().show()`: the last made first). Borrowed (no drop)
 // for a copy its result is (copied_call).
-fn value_temp(e: i64, borrowed: bool, h: i64, pbody: inout Body<Comp>) -> i64 {
-    let ty = NODES[e].ty;
+fn value_temp(e: i64, borrowed: bool, h: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let ty = pcx.nodes[e].ty;
     let l = new_local(ty, LF_TEMP | if borrowed { LF_BORROWED } else { 0 }, -1, e, &pbody);
-    let drop = !borrowed && needs_drop(ty);
-    let inner = h == scope_depth() - 1;
+    let drop = !borrowed && needs_drop(ty, &pcx);
+    let inner = h == scope_depth(pcx) - 1;
     if inner {
-        live(l, &pbody);
+        live(l, &pbody, &pcx);
     }
-    expr_into(e, l, 0, &pbody);
+    expr_into(e, l, 0, &pbody, &pcx);
     if inner {
-        schedule(EN_DEAD, l, pbody);
+        schedule(EN_DEAD, l, pbody, &pcx);
         if drop {
-            schedule(EN_DROP, l, pbody);
+            schedule(EN_DROP, l, pbody, &pcx);
         }
     } else if drop {
-        schedule_in(h, EN_DROP, l, pbody);
+        schedule_in(h, EN_DROP, l, pbody, &pcx);
     }
     l
 }
 
 // The scope a temporary of type ty drops in by new_temp's rule.
-fn value_home(ty: i64, borrowed: bool) -> i64 {
-    if !borrowed && needs_drop(ty) { temp_home() } else { scope_depth() - 1 }
+fn value_home(ty: i64, borrowed: bool, pcx: inout Ctx<Comp>) -> i64 {
+    if !borrowed && needs_drop(ty, &pcx) { temp_home(pcx) } else { scope_depth(pcx) - 1 }
 }
 
 // The temporary holding the value of e where a place is needed (value_temp,
 // in its statement's scope).
-fn place_temp(e: i64, pbody: inout Body<Comp>) -> i64 {
-    value_temp(e, copied_call(e), temp_home(), &pbody)
+fn place_temp(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    value_temp(e, copied_call(e, &pcx), temp_home(pcx), &pbody, &pcx)
 }
-
-// (0.26.2, drops.vl hold_args) The statement scope of the call (or struct
-// literal, or requires check) whose argument being lowered is a value lent
-// to a let parameter (or a let field) that is a branch's (lent_branch), -1
-// outside one: a temporary its branches make of a local declared in it
-// (`count(match make() { Ok(s) => s, .. }, 8)` lends `&s`) drops there,
-// with the statement, not with the local's arm. A block's statements are
-// none of its branches (only its tail is).
-static var LENT_HOME: i64 = -1;
 
 // Whether e, an argument, is a branch's value lent to a let parameter: of
 // type `&T`, a match, an if, a block or a `?`.
-fn lent_branch(e: i64) -> bool {
-    let t = NODES[e].ty;
-    let k = NODES[e].kind;
+fn lent_branch(e: i64, pcx: Ctx<Comp>) -> bool {
+    let t = pcx.nodes[e].ty;
+    let k = pcx.nodes[e].kind;
     t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED && (k == NodeKind::Match
         || k == NodeKind::If || k == NodeKind::Try || k == NodeKind::Block
-        && (NODES[e].p & NODE_TEMP) == 0)
+        && (pcx.nodes[e].p & NODE_TEMP) == 0)
 }
 
 // operand(e, moving) for an argument (a call's, a struct literal's field):
 // LENT_HOME set for it.
-fn arg_operand(e: i64, moving: bool, pbody: inout Body<Comp>) {
-    let saved = LENT_HOME;
-    LENT_HOME = if lent_branch(e) { temp_home() } else { -1 };
-    operand(e, moving, &pbody);
-    LENT_HOME = saved;
+fn arg_operand(e: i64, moving: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let saved = pcx.lent_home;
+    pcx.lent_home = if lent_branch(e, pcx) { temp_home(pcx) } else { -1 };
+    operand(e, moving, &pbody, &pcx);
+    pcx.lent_home = saved;
 }
 
-fn live(l: i64, pbody: inout Body<Comp>) {
-    if !keeps_storage(l, pbody) {
+fn live(l: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if !keeps_storage(l, pbody, &pcx) {
         return;
     }
     emit(SK_LIVE, l, 0, 0, 0, 0, 0, 0, 0, &pbody);
@@ -292,30 +240,30 @@ fn live(l: i64, pbody: inout Body<Comp>) {
 // which elaboration reads them for (a StorageLive or StorageDead makes its
 // paths uninitialized). The code generators ignore them in 0.26.1, and
 // most locals are scalars: about half the statements.
-fn keeps_storage(l: i64, pbody: Body<Comp>) -> bool {
-    ALL_STORAGE || type_glue(pbody.locals[l].ty)
+fn keeps_storage(l: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    pcx.all_storage || type_glue(pbody.locals[l].ty, &pcx)
 }
 
 // The local `()` values are discarded into.
-fn unit_local(pbody: inout Body<Comp>) -> i64 {
-    if UNIT_LOCAL < 0 {
-        UNIT_LOCAL = new_local(TY_UNIT, LF_TEMP, -1, 0, &pbody);
+fn unit_local(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.unit_local < 0 {
+        pcx.unit_local = new_local(TY_UNIT, LF_TEMP, -1, 0, &pbody);
     }
-    UNIT_LOCAL
+    pcx.unit_local
 }
 
 // The IR local of static `name` (a symbol).
-fn static_local(name: i64, node: i64, pbody: inout Body<Comp>) -> i64 {
+fn static_local(name: i64, node: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     var i = 0;
-    while i < STATICS_SEEN.len() as i64 {
-        if STATICS_SEEN[i] == name {
-            return STATICS_SEEN[i + 1];
+    while i < pcx.statics_seen.len() as i64 {
+        if pcx.statics_seen[i] == name {
+            return pcx.statics_seen[i + 1];
         }
         i += 2;
     }
-    let l = new_local(static_ty(name), LF_STATIC, name, node, &pbody);
-    STATICS_SEEN.push(name);
-    STATICS_SEEN.push(l);
+    let l = new_local(static_ty(name, pcx), LF_STATIC, name, node, &pbody);
+    pcx.statics_seen.push(name);
+    pcx.statics_seen.push(l);
     l
 }
 
@@ -323,17 +271,17 @@ fn static_local(name: i64, node: i64, pbody: inout Body<Comp>) -> i64 {
 
 // A new innermost scope; `home` when the temporaries made in it (and in the
 // scopes inside it that are none) drop at its end (temp_home).
-fn push_scope(kind: i64, node: i64, home: bool) -> i64 {
-    let at = SCOPES.len() as i64 / SW;
-    SCOPES.push(kind);
-    SCOPES.push(ENTRIES.len() as i64 / 2);
-    SCOPES.push(node);
-    SCOPES.push(-1);
-    SCOPES.push(-1);
-    SCOPES.push(-1);
-    SCOPES.push(0);
-    SCOPES.push(0);
-    SCOPES.push(if home { 1 } else { 0 });
+fn push_scope(kind: i64, node: i64, home: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let at = pcx.build_scopes.len() as i64 / SW;
+    pcx.build_scopes.push(kind);
+    pcx.build_scopes.push(pcx.entries.len() as i64 / 2);
+    pcx.build_scopes.push(node);
+    pcx.build_scopes.push(-1);
+    pcx.build_scopes.push(-1);
+    pcx.build_scopes.push(-1);
+    pcx.build_scopes.push(0);
+    pcx.build_scopes.push(0);
+    pcx.build_scopes.push(if home { 1 } else { 0 });
     at
 }
 
@@ -345,47 +293,43 @@ fn push_scope(kind: i64, node: i64, home: bool) -> i64 {
 // nor a checker's desugaring of an expression (desugared_block: an
 // operator's `{ let ==l = a; .. }`, an f-string's, a `?`'s): a temporary
 // made there is its statement's.
-fn temp_home() -> i64 {
-    var s = scope_depth() - 1;
-    while s > 0 && SCOPES[s * SW + 8] == 0 {
+fn temp_home(pcx: Ctx<Comp>) -> i64 {
+    var s = scope_depth(pcx) - 1;
+    while s > 0 && pcx.build_scopes[s * SW + 8] == 0 {
         s -= 1;
     }
     s
 }
 
-// Whether the statements of the block being lowered are temporaries' homes
-// (false in a desugared_block's).
-static var STMT_HOME: bool = true;
-
-fn scope_depth() -> i64 {
-    SCOPES.len() as i64 / SW
+fn scope_depth(pcx: Ctx<Comp>) -> i64 {
+    pcx.build_scopes.len() as i64 / SW
 }
 
-fn schedule(kind: i64, v: i64, pbody: Body<Comp>) {
-    if kind == EN_DEAD && !keeps_storage(v, pbody) {
+fn schedule(kind: i64, v: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    if kind == EN_DEAD && !keeps_storage(v, pbody, &pcx) {
         return;
     }
-    ENTRIES.push(kind);
-    ENTRIES.push(v);
+    pcx.entries.push(kind);
+    pcx.entries.push(v);
 }
 
 // The entries of scope s, emitted (innermost last registered first).
-fn emit_scope(s: i64, pbody: inout Body<Comp>) {
-    let first = SCOPES[s * SW + 1];
-    let end = if s + 1 < scope_depth() { SCOPES[(s + 1) * SW + 1] }
-        else { ENTRIES.len() as i64 / 2 };
+fn emit_scope(s: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let first = pcx.build_scopes[s * SW + 1];
+    let end = if s + 1 < scope_depth(pcx) { pcx.build_scopes[(s + 1) * SW + 1] }
+        else { pcx.entries.len() as i64 / 2 };
     // (where its drops run: the exit taken, or the scope's own end)
-    let at = if EXIT_NODE > 0 { EXIT_NODE } else { SCOPES[s * SW + 2] };
+    let at = if pcx.exit_node > 0 { pcx.exit_node } else { pcx.build_scopes[s * SW + 2] };
     var e = end - 1;
     while e >= first {
-        let kind = ENTRIES[2 * e];
-        let v = ENTRIES[2 * e + 1];
+        let kind = pcx.entries[2 * e];
+        let v = pcx.entries[2 * e + 1];
         if kind == EN_DROP {
             emit(SK_DROP, v, 0, DS_UNDECIDED, -1, pbody.locals[v].src, 0, 0, at, &pbody);
         } else if kind == EN_DEAD {
             emit(SK_DEAD, v, 0, 0, 0, 0, 0, 0, 0, &pbody);
         } else if kind == EN_DEFER {
-            run_defer(v, &pbody);
+            run_defer(v, &pbody, &pcx);
         }
         e -= 1;
     }
@@ -393,33 +337,33 @@ fn emit_scope(s: i64, pbody: inout Body<Comp>) {
 
 // Leaves scopes down to `depth` (they stay on the stack: an edge out of
 // them, `break`, `return`).
-fn exit_to(depth: i64, node: i64, pbody: inout Body<Comp>) {
-    let saved = EXIT_NODE;
-    EXIT_NODE = node;
-    var s = scope_depth() - 1;
+fn exit_to(depth: i64, node: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let saved = pcx.exit_node;
+    pcx.exit_node = node;
+    var s = scope_depth(pcx) - 1;
     while s >= depth {
-        emit_scope(s, &pbody);
+        emit_scope(s, &pbody, &pcx);
         s -= 1;
     }
-    EXIT_NODE = saved;
+    pcx.exit_node = saved;
 }
 
 // The innermost scope ends: its entries emitted (when the code reaches its
 // end), then it is popped.
-fn pop_scope(pbody: inout Body<Comp>) {
-    let s = scope_depth() - 1;
+fn pop_scope(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let s = scope_depth(pcx) - 1;
     if reachable(pbody) {
-        emit_scope(s, &pbody);
+        emit_scope(s, &pbody, &pcx);
     }
-    ENTRIES.truncate(len_arg(2 * SCOPES[s * SW + 1]));
-    SCOPES.truncate(len_arg(s * SW));
+    pcx.entries.truncate(len_arg(2 * pcx.build_scopes[s * SW + 1]));
+    pcx.build_scopes.truncate(len_arg(s * SW));
 }
 
 // The loop scope of loop node lp, or -1.
-fn loop_scope(lp: i64) -> i64 {
-    var s = scope_depth() - 1;
+fn loop_scope(lp: i64, pcx: Ctx<Comp>) -> i64 {
+    var s = scope_depth(pcx) - 1;
     while s >= 0 {
-        if SCOPES[s * SW] == SC_LOOP && SCOPES[s * SW + 2] == lp {
+        if pcx.build_scopes[s * SW] == SC_LOOP && pcx.build_scopes[s * SW + 2] == lp {
             return s;
         }
         s -= 1;
@@ -428,42 +372,42 @@ fn loop_scope(lp: i64) -> i64 {
 }
 
 // A defer's deferred expression, run on an exit.
-fn run_defer(d: i64, pbody: inout Body<Comp>) {
-    let e = NODES[d].a;
+fn run_defer(d: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let e = pcx.nodes[d].a;
     if e == 0 {
         return;
     }
-    let s = push_scope(SC_STMT, d, true);
-    expr_into(e, -1, 0, &pbody);
-    pop_scope_at(s, &pbody);
+    let s = push_scope(SC_STMT, d, true, &pcx);
+    expr_into(e, -1, 0, &pbody, &pcx);
+    pop_scope_at(s, &pbody, &pcx);
 }
 
-fn pop_scope_at(s: i64, pbody: inout Body<Comp>) {
-    while scope_depth() > s {
-        pop_scope(&pbody);
+fn pop_scope_at(s: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    while scope_depth(pcx) > s {
+        pop_scope(&pbody, &pcx);
     }
 }
 
 // ---- Operands ----
 
-fn set_op(k: i64, a: i64, b: i64) {
-    OPK = k;
-    OPA = a;
-    OPB = b;
+fn set_op(k: i64, a: i64, b: i64, pcx: inout Ctx<Comp>) {
+    pcx.opk = k;
+    pcx.opa = a;
+    pcx.opb = b;
 }
 
 // The current operand written straight to P_OPS: a statement whose
 // operands are all known (nothing is emitted between its ops_mark and its
 // emit), so no staging.
-fn push_now(pbody: inout Body<Comp>) {
-    push_op(OPK, OPA, OPB, &pbody);
+fn push_now(pbody: inout Body<Comp>, pcx: Ctx<Comp>) {
+    push_op(pcx.opk, pcx.opa, pcx.opb, &pbody);
 }
 
 // The current operand added to a statement's operands being written
 // straight to P_OPS from `at` (n there so far), as each is made: when
 // making it emitted statements with operands of their own (after ours),
 // ours are moved to the end first. The new start of the operands.
-fn ops_add(at: i64, n: i64, pbody: inout Body<Comp>) -> i64 {
+fn ops_add(at: i64, n: i64, pbody: inout Body<Comp>, pcx: Ctx<Comp>) -> i64 {
     var start = at;
     if pbody.ops.len() as i64 != at + 3 * n {
         start = pbody.ops.len() as i64;
@@ -472,113 +416,109 @@ fn ops_add(at: i64, n: i64, pbody: inout Body<Comp>) -> i64 {
             pbody.ops.push(w);
         }
     }
-    push_now(&pbody);
+    push_now(&pbody, pcx);
     start
 }
-
-// Whether the body built has a move the backstop (diff.vl record_body)
-// may forbid: out of a projection or a static. None: it is not scanned.
-pub static var MOVES_SUSPECT: bool = false;
 
 // The operand that reads place (l, p) of type ty: a move of a value that
 // needs drop when `moving`, but out of a borrowed copy (a copy of a
 // borrowed copy is one too), else a copy.
-fn place_operand(l: i64, p: i64, ty: i64, moving: bool, pbody: Body<Comp>) {
-    if moving && ty > 0 && type_glue(ty) && !has_flag(l, LF_BORROWED, pbody) {
-        set_op(OK_MOVE, l, p);
+fn place_operand(l: i64, p: i64, ty: i64, moving: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    if moving && ty > 0 && type_glue(ty, &pcx) && !has_flag(l, LF_BORROWED, pbody) {
+        set_op(OK_MOVE, l, p, &pcx);
         // (a move the backstop looks at: through a projection, or out of
         // a static; a whole local's never is one)
-        MOVES_SUSPECT = MOVES_SUSPECT || p != 0 || has_flag(l, LF_STATIC, pbody);
+        pcx.moves_suspect = pcx.moves_suspect || p != 0 || has_flag(l, LF_STATIC, pbody);
     } else {
-        set_op(OK_COPY, l, p);
+        set_op(OK_COPY, l, p, &pcx);
     }
 }
 
 // An operand for the value of expression e (moved when `moving`).
-fn operand(e: i64, moving: bool, pbody: inout Body<Comp>) {
-    let k = NODES[e].kind;
-    let ty = NODES[e].ty;
+fn operand(e: i64, moving: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[e].kind;
+    let ty = pcx.nodes[e].ty;
     if k == NodeKind::Int || k == NodeKind::Char {
-        set_op(OK_INT, crate::front::consteval::wrap_int(NODES[e].a, ty), ty);
+        set_op(OK_INT, crate::front::consteval::wrap_int(pcx.nodes[e].a, ty), ty, &pcx);
         return;
     }
     if k == NodeKind::Bool {
-        set_op(OK_INT, NODES[e].a, TY_BOOL);
+        set_op(OK_INT, pcx.nodes[e].a, TY_BOOL, &pcx);
         return;
     }
     if k == NodeKind::Float {
-        set_op(OK_FLOAT, NODES[e].a, ty);
+        set_op(OK_FLOAT, pcx.nodes[e].a, ty, &pcx);
         return;
     }
     if k == NodeKind::Unit {
-        set_op(OK_UNIT, 0, TY_UNIT);
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
         return;
     }
     if k == NodeKind::Str {
-        set_op(OK_STR, NODES[e].a, ty);
+        set_op(OK_STR, pcx.nodes[e].a, ty, &pcx);
         return;
     }
     if k == NodeKind::CStr {
-        set_op(OK_CSTR, NODES[e].a, ty);
+        set_op(OK_CSTR, pcx.nodes[e].a, ty, &pcx);
         return;
     }
-    if k == NodeKind::Ident && NODES[e].res == Res::Const {
-        set_op(OK_CONST, NODES[e].y, ty);
+    if k == NodeKind::Ident && pcx.nodes[e].res == Res::Const {
+        set_op(OK_CONST, pcx.nodes[e].y, ty, &pcx);
         return;
     }
-    if k == NodeKind::Ident && NODES[e].res == Res::Fn {
-        set_op(OK_FN, NODES[e].y, ty);
+    if k == NodeKind::Ident && pcx.nodes[e].res == Res::Fn {
+        set_op(OK_FN, pcx.nodes[e].y, ty, &pcx);
         return;
     }
-    if is_place_expr(e) {
-        if place_of(e, &pbody) {
-            place_operand(PL_L, PL_P, ty, moving, pbody);
+    if is_place_expr(e, pcx) {
+        if place_of(e, &pbody, &pcx) {
+            place_operand(pcx.pl_l, pcx.pl_p, ty, moving, pbody, &pcx);
             return;
         }
     }
     if is_void(ty) || ty == TY_NEVER {
         // (a `()` value, or none: made, then the unit constant)
-        expr_into(e, -1, 0, &pbody);
-        set_op(OK_UNIT, 0, TY_UNIT);
+        expr_into(e, -1, 0, &pbody, &pcx);
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
         return;
     }
-    let t = value_temp(e, false, value_home(ty, false), &pbody);
-    place_operand(t, 0, ty, true, pbody);
+    let t = value_temp(e, false, value_home(ty, false, &pcx), &pbody, &pcx);
+    place_operand(t, 0, ty, true, pbody, &pcx);
 }
 
 // Whether operand makes e's value without a temporary: a constant, a
 // local, a static, a function, a place.
-fn is_operand_kind(e: i64) -> bool {
-    let k = NODES[e].kind;
+fn is_operand_kind(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
     if k == NodeKind::Int || k == NodeKind::Char || k == NodeKind::Bool
         || k == NodeKind::Float || k == NodeKind::Unit || k == NodeKind::Str
         || k == NodeKind::CStr {
         return true;
     }
     if k == NodeKind::Ident {
-        let r = NODES[e].res;
+        let r = pcx.nodes[e].res;
         return r == Res::Const || r == Res::Fn || r == Res::Local || r == Res::Static;
     }
-    is_place_expr(e)
+    is_place_expr(e, pcx)
 }
 
 // ---- Places ----
 
 // Whether e is written as a place: a local, a static, a field or tuple
 // part of a place (or through a pointer), `*p`, an index.
-fn is_place_expr(e: i64) -> bool {
-    let k = NODES[e].kind;
+fn is_place_expr(e: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
     if k == NodeKind::Ident {
-        return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        return pcx.nodes[e].res == Res::Local || pcx.nodes[e].res == Res::Static;
     }
     if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
         return true;
     }
     if k == NodeKind::Unary {
-        return NODES[e].op == Tok::Star;
+        return pcx.nodes[e].op == Tok::Star;
     }
     if k == NodeKind::Index {
-        return NODES[NODES[e].b].kind != NodeKind::Range;
+        return pcx.nodes[pcx.nodes[e].b].kind != NodeKind::Range;
     }
     false
 }
@@ -586,51 +526,52 @@ fn is_place_expr(e: i64) -> bool {
 // The place of place expression e (PL_L, PL_P): its base evaluated as it
 // must be (a value base into a temporary, a pointer read), the index
 // checked. False when e is not one (or its local is unknown).
-fn place_of(e: i64, pbody: inout Body<Comp>) -> bool {
-    let k = NODES[e].kind;
+fn place_of(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
     if k == NodeKind::Ident {
-        if NODES[e].res == Res::Static {
-            PL_L = static_local(NODES[e].a, e, &pbody);
-            PL_P = 0;
+        if pcx.nodes[e].res == Res::Static {
+            pcx.pl_l = static_local(pcx.nodes[e].a, e, &pbody, &pcx);
+            pcx.pl_p = 0;
             return true;
         }
-        if NODES[e].res != Res::Local {
+        if pcx.nodes[e].res != Res::Local {
             return false;
         }
-        if !mapped(NODES[e].y) {
-            unsupported(e);
-            PL_L = unit_local(&pbody);
-            PL_P = 0;
+        if !mapped(pcx.nodes[e].y, &pcx) {
+            unsupported(e, &pcx);
+            pcx.pl_l = unit_local(&pbody, &pcx);
+            pcx.pl_p = 0;
             return true;
         }
         return true;
     }
-    if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Star {
         // `*p`: p's value read (a place holding a pointer, or a temporary)
-        deref_place(NODES[e].b, &pbody);
+        deref_place(pcx.nodes[e].b, &pbody, &pcx);
         return true;
     }
     if k == NodeKind::FieldAccess {
-        let base = NODES[e].a;
-        let field = NODES[e].x;
-        if NODES[e].y == 1 {
+        let base = pcx.nodes[e].a;
+        let field = pcx.nodes[e].x;
+        if pcx.nodes[e].y == 1 {
             // (through a pointer: `(*p).f`)
-            deref_place(base, &pbody);
-            PL_P = proj(PL_P, PJ_FIELD, field, &pbody);
+            deref_place(base, &pbody, &pcx);
+            pcx.pl_p = proj(pcx.pl_p, PJ_FIELD, field, &pbody);
             return true;
         }
-        as_place(base, &pbody);
-        let bt = NODES[base].ty;
-        PL_P = proj(PL_P, if is_union_type(bt) { PJ_UNION } else { PJ_FIELD }, field, &pbody);
+        as_place(base, &pbody, &pcx);
+        let bt = pcx.nodes[base].ty;
+        pcx.pl_p = proj(pcx.pl_p, if is_union_type(bt, pcx) { PJ_UNION } else { PJ_FIELD }, field,
+            &pbody);
         return true;
     }
     if k == NodeKind::TupleField {
-        as_place(NODES[e].a, &pbody);
-        PL_P = proj(PL_P, PJ_FIELD, NODES[e].b, &pbody);
+        as_place(pcx.nodes[e].a, &pbody, &pcx);
+        pcx.pl_p = proj(pcx.pl_p, PJ_FIELD, pcx.nodes[e].b, &pbody);
         return true;
     }
-    if k == NodeKind::Index && NODES[NODES[e].b].kind != NodeKind::Range {
-        return index_place(e, &pbody);
+    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e].b].kind != NodeKind::Range {
+        return index_place(e, &pbody, &pcx);
     }
     false
 }
@@ -638,73 +579,74 @@ fn place_of(e: i64, pbody: inout Body<Comp>) -> bool {
 // The place pointer expression e points to: `*e`, or, when e takes an
 // address, the place it takes (`*&x` is x; the own pass's statement
 // temporary's block stands for `&e`, so `*{ .. }` is the temporary itself).
-fn deref_place(e: i64, pbody: inout Body<Comp>) {
-    let k = NODES[e].kind;
-    if k == NodeKind::Unary && NODES[e].op == Tok::Amp && is_place_expr(NODES[e].b)
-        && place_of(NODES[e].b, &pbody) {
+fn deref_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Amp && is_place_expr(pcx.nodes[e].b, pcx)
+        && place_of(pcx.nodes[e].b, &pbody, &pcx) {
         return;
     }
-    if k == NodeKind::Block && own_temp_block(e) && own_temp_addr(e) {
-        own_temp_place(e, &pbody);
+    if k == NodeKind::Block && own_temp_block(e, pcx) && own_temp_addr(e, pcx) {
+        own_temp_place(e, &pbody, &pcx);
         return;
     }
-    as_place(e, &pbody);
-    PL_P = proj(PL_P, PJ_DEREF, 0, &pbody);
+    as_place(e, &pbody, &pcx);
+    pcx.pl_p = proj(pcx.pl_p, PJ_DEREF, 0, &pbody);
 }
 
 // `base[i]`: the base's place first (a pointer's location, a slice's or an
 // array's), then the index into a local, then the check.
-fn index_place(e: i64, pbody: inout Body<Comp>) -> bool {
-    let base = NODES[e].a;
-    let idx = NODES[e].b;
-    let bt = undistinct(NODES[base].ty);
-    as_place(base, &pbody);
-    let bl = PL_L;
-    let bp = PL_P;
-    let ik = NODES[idx].kind;
+fn index_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    let base = pcx.nodes[e].a;
+    let idx = pcx.nodes[e].b;
+    let bt = undistinct(pcx.nodes[base].ty);
+    as_place(base, &pbody, &pcx);
+    let bl = pcx.pl_l;
+    let bp = pcx.pl_p;
+    let ik = pcx.nodes[idx].kind;
     if bt > 0 && TYPES[bt].kind == TyKind::Array && ik == NodeKind::Int {
-        let v = NODES[idx].a;
+        let v = pcx.nodes[idx].a;
         if v >= 0 && v < TYPES[bt].b {
-            PL_L = bl;
-            PL_P = proj(bp, PJ_CONST, v, &pbody);
+            pcx.pl_l = bl;
+            pcx.pl_p = proj(bp, PJ_CONST, v, &pbody);
             return true;
         }
     }
     // (the index in a local: one the program names, or a temporary)
     var il = -1;
-    if ik == NodeKind::Ident && NODES[idx].res == Res::Local && mapped(NODES[idx].y) && PL_P == 0 {
-        il = PL_L;
+    if ik == NodeKind::Ident && pcx.nodes[idx].res == Res::Local && mapped(pcx.nodes[idx].y, &pcx)
+        && pcx.pl_p == 0 {
+        il = pcx.pl_l;
     } else {
-        operand(idx, false, &pbody);
-        let it = NODES[idx].ty;
-        il = new_temp(it, idx, false, &pbody);
-        emit_use(il, 0, idx, &pbody);
+        operand(idx, false, &pbody, &pcx);
+        let it = pcx.nodes[idx].ty;
+        il = new_temp(it, idx, false, &pbody, &pcx);
+        emit_use(il, 0, idx, &pbody, pcx);
     }
-    if bt > 0 && (NODES[e].p & NODE_IN_BOUNDS) == 0 {
+    if bt > 0 && (pcx.nodes[e].p & NODE_IN_BOUNDS) == 0 {
         let tk = TYPES[bt].kind;
         if tk == TyKind::Array {
             let at = ops_mark(pbody);
-            set_op(OK_COPY, il, 0);
-            push_now(&pbody);
-            set_op(OK_INT, TYPES[bt].b, TY_I64);
-            push_now(&pbody);
+            set_op(OK_COPY, il, 0, &pcx);
+            push_now(&pbody, pcx);
+            set_op(OK_INT, TYPES[bt].b, TY_I64, &pcx);
+            push_now(&pbody, pcx);
             emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at, 2, e, &pbody);
         } else if tk == TyKind::Slice {
-            let len = new_temp(TY_I64, e, false, &pbody);
+            let len = new_temp(TY_I64, e, false, &pbody, &pcx);
             let at = ops_mark(pbody);
-            set_op(OK_PLACE, bl, bp);
-            push_now(&pbody);
+            set_op(OK_PLACE, bl, bp, &pcx);
+            push_now(&pbody, pcx);
             emit(SK_ASSIGN, len, 0, RV_LEN, 0, 0, at, 1, e, &pbody);
             let at2 = ops_mark(pbody);
-            set_op(OK_COPY, il, 0);
-            push_now(&pbody);
-            set_op(OK_COPY, len, 0);
-            push_now(&pbody);
+            set_op(OK_COPY, il, 0, &pcx);
+            push_now(&pbody, pcx);
+            set_op(OK_COPY, len, 0, &pcx);
+            push_now(&pbody, pcx);
             emit(SK_ASSERT, 0, 0, AK_BOUNDS, e, 0, at2, 2, e, &pbody);
         }
     }
-    PL_L = bl;
-    PL_P = proj(bp, PJ_INDEX, il, &pbody);
+    pcx.pl_l = bl;
+    pcx.pl_p = proj(bp, PJ_INDEX, il, &pbody);
     true
 }
 
@@ -714,25 +656,25 @@ fn index_place(e: i64, pbody: inout Body<Comp>) -> bool {
 // its arguments keep (parametric_copy: `second<T>(p: *T) -> T { p[1] }`,
 // 0.26.1 R8); a block's whose value is one. A call temporary's rule, not
 // a scrutinee's (scrutinee_place).
-fn copied_call(e: i64) -> bool {
-    if borrowed_call(e) {
+fn copied_call(e: i64, pcx: inout Ctx<Comp>) -> bool {
+    if borrowed_call(e, &pcx) {
         return true;
     }
     // (through a block's value, `unsafe { second_cast::<V>(x) }`)
-    if NODES[e].kind == NodeKind::Block && NODES[e].a != 0 {
-        return copied_call(NODES[e].a);
+    if pcx.nodes[e].kind == NodeKind::Block && pcx.nodes[e].a != 0 {
+        return copied_call(pcx.nodes[e].a, &pcx);
     }
-    NODES[e].kind == NodeKind::Call && crate::front::own::byref::parametric_copy(e)
+    pcx.nodes[e].kind == NodeKind::Call && crate::front::own::byref::parametric_copy(e, &pcx)
 }
 
 // The place of e, whatever e is: a place expression's, or a temporary's
 // holding its value.
-fn as_place(e: i64, pbody: inout Body<Comp>) {
-    if is_place_expr(e) && place_of(e, &pbody) {
+fn as_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if is_place_expr(e, pcx) && place_of(e, &pbody, &pcx) {
         return;
     }
-    PL_L = place_temp(e, &pbody);
-    PL_P = 0;
+    pcx.pl_l = place_temp(e, &pbody, &pcx);
+    pcx.pl_p = 0;
 }
 
 // ---- The own pass's statement temporaries, read as what they stand for ----
@@ -745,41 +687,41 @@ fn as_place(e: i64, pbody: inout Body<Comp>) {
 
 // Whether b is one: a block flagged NODE_TEMP whose first statement is a
 // `let` (an Ident flagged NODE_TEMP is the checker's, temps.vl).
-fn own_temp_block(b: i64) -> bool {
-    NODES[b].kind == NodeKind::Block && (NODES[b].p & NODE_TEMP) != 0 && NODES[b].count > 0
-        && NODES[child(b, 0)].kind == NodeKind::Let
+fn own_temp_block(b: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[b].kind == NodeKind::Block && (pcx.nodes[b].p & NODE_TEMP) != 0
+        && pcx.nodes[b].count > 0 && pcx.nodes[child(b, 0, pcx)].kind == NodeKind::Let
 }
 
 // The value of own_temp_block b, e.
-fn own_temp_value(b: i64) -> i64 {
-    NODES[child(b, 0)].c
+fn own_temp_value(b: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.nodes[child(b, 0, pcx)].c
 }
 
 // Whether own_temp_block b gives its temporary's address (`&e`), not its
 // value.
-fn own_temp_addr(b: i64) -> bool {
-    let tail = NODES[b].a;
-    tail != 0 && NODES[tail].kind == NodeKind::Unary && NODES[tail].op == Tok::Amp
+fn own_temp_addr(b: i64, pcx: Ctx<Comp>) -> bool {
+    let tail = pcx.nodes[b].a;
+    tail != 0 && pcx.nodes[tail].kind == NodeKind::Unary && pcx.nodes[tail].op == Tok::Amp
 }
 
 // The temporary holding the value of own_temp_block b (an address block):
 // e moved into it, even when e is a place (hold_args' `&s` of a local
 // declared in the argument: the statement keeps it, not s's scope).
-fn own_temp_place(b: i64, pbody: inout Body<Comp>) {
-    let e = own_temp_value(b);
-    let local = NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local;
-    PL_L = value_temp(e, copied_call(e),
-        if local && LENT_HOME >= 0 { LENT_HOME } else { temp_home() }, &pbody);
-    PL_P = 0;
+fn own_temp_place(b: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let e = own_temp_value(b, pcx);
+    let local = pcx.nodes[e].kind == NodeKind::Ident && pcx.nodes[e].res == Res::Local;
+    pcx.pl_l = value_temp(e, copied_call(e, &pcx),
+        if local && pcx.lent_home >= 0 { pcx.lent_home } else { temp_home(pcx) }, &pbody, &pcx);
+    pcx.pl_p = 0;
 }
 
 // The borrow kind of `&` node e (or a block standing for one) of type ty.
-fn ref_kind(e: i64, ty: i64) -> i64 {
+fn ref_kind(e: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
     let t = undistinct(ty);
     if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == 0 {
         return BK_RAW;
     }
-    if (NODES[e].p & NODE_REF_MUT) != 0 || t > 0 && TYPES[t].kind == TyKind::Ptr
+    if (pcx.nodes[e].p & NODE_REF_MUT) != 0 || t > 0 && TYPES[t].kind == TyKind::Ptr
         && TYPES[t].b == REF_MUT {
         return BK_MUT;
     }
@@ -789,9 +731,9 @@ fn ref_kind(e: i64, ty: i64) -> i64 {
 // ---- Statements of assignment ----
 
 // (l, p) = use of the current operand.
-fn emit_use(l: i64, p: i64, node: i64, pbody: inout Body<Comp>) {
+fn emit_use(l: i64, p: i64, node: i64, pbody: inout Body<Comp>, pcx: Ctx<Comp>) {
     let at = ops_mark(pbody);
-    push_now(&pbody);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, l, p, RV_USE, 0, 0, at, 1, node, &pbody);
 }
 
@@ -799,103 +741,103 @@ fn emit_use(l: i64, p: i64, node: i64, pbody: inout Body<Comp>) {
 
 // Evaluates e and writes its value to (dl, dp); dl = -1: the value is
 // discarded.
-fn expr_into(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
+fn expr_into(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if e == 0 {
         return;
     }
-    STMTS_MADE += 1;
-    let k = NODES[e].kind;
-    let ty = NODES[e].ty;
+    pcx.stmts_made += 1;
+    let k = pcx.nodes[e].kind;
+    let ty = pcx.nodes[e].ty;
     if k == NodeKind::Block {
-        lower_block(e, dl, dp, &pbody);
+        lower_block(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::If {
-        lower_if(e, dl, dp, &pbody);
+        lower_if(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Loop || k == NodeKind::While {
-        lower_loop(e, dl, dp, &pbody);
+        lower_loop(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::For {
-        lower_for(e, &pbody);
+        lower_for(e, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Match {
-        lower_match(e, dl, dp, &pbody);
+        lower_match(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Call {
-        lower_call(e, dl, dp, &pbody);
+        lower_call(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Assign {
-        lower_assign_at(e, &pbody);
+        lower_assign_at(e, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Return {
-        lower_return(e, &pbody);
+        lower_return(e, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Break {
-        lower_break(e, &pbody);
+        lower_break(e, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Continue {
-        lower_continue(e, &pbody);
+        lower_continue(e, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Try || k == NodeKind::Interp {
-        expr_into(NODES[e].y, dl, dp, &pbody);
+        expr_into(pcx.nodes[e].y, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Closure {
         // (its env, the struct literal the checker made of its captures, or
         // its function when it is coerced to a fn type; its body is a
         // function of its own)
-        if NODES[e].y == 0 {
-            unsupported(e);
+        if pcx.nodes[e].y == 0 {
+            unsupported(e, &pcx);
             return;
         }
         // (a closure that is not `move` captures by access: its env's
         // values are borrowed copies, the owner keeps them; an f-string's
         // holes too)
-        let saved = AGG_BORROW;
-        AGG_BORROW = (NODES[e].c & CLOSURE_MOVE) == 0
-            && NODES[NODES[e].y].kind == NodeKind::StructLit;
-        expr_into(NODES[e].y, dl, dp, &pbody);
-        AGG_BORROW = saved;
+        let saved = pcx.agg_borrow;
+        pcx.agg_borrow = (pcx.nodes[e].c & CLOSURE_MOVE) == 0
+            && pcx.nodes[pcx.nodes[e].y].kind == NodeKind::StructLit;
+        expr_into(pcx.nodes[e].y, dl, dp, &pbody, &pcx);
+        pcx.agg_borrow = saved;
         return;
     }
     if k == NodeKind::EnumPanic {
-        operand(NODES[e].a, false, &pbody);
+        operand(pcx.nodes[e].a, false, &pbody, &pcx);
         let at = ops_mark(pbody);
-        push_now(&pbody);
-        emit(SK_INTRINSIC, unit_local(&pbody), 0, IK_PANIC, e, 0, at, 1, e, &pbody);
+        push_now(&pbody, pcx);
+        emit(SK_INTRINSIC, unit_local(&pbody, &pcx), 0, IK_PANIC, e, 0, at, 1, e, &pbody);
         terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, e, &pbody);
         return;
     }
     if k == NodeKind::VecOp {
-        lower_vecop(e, dl, dp, &pbody);
+        lower_vecop(e, dl, dp, &pbody, &pcx);
         return;
     }
     if dl < 0 {
         // (a value discarded: a place is mentioned, a value made)
-        if is_place_expr(e) {
-            if place_of(e, &pbody) {
-                emit(SK_MENTION, PL_L, PL_P, 0, 0, 0, 0, 0, e, &pbody);
+        if is_place_expr(e, pcx) {
+            if place_of(e, &pbody, &pcx) {
+                emit(SK_MENTION, pcx.pl_l, pcx.pl_p, 0, 0, 0, 0, 0, e, &pbody);
             }
             return;
         }
         if k == NodeKind::Unary || k == NodeKind::Binary || k == NodeKind::Cast {
             // (its operands evaluated for what they do)
-            value_temp(e, false, value_home(ty, false), &pbody);
+            value_temp(e, false, value_home(ty, false, &pcx), &pbody, &pcx);
             return;
         }
         if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
             || k == NodeKind::VariantLit || k == NodeKind::Repeat || k == NodeKind::Index {
-            value_temp(e, false, value_home(ty, false), &pbody);
+            value_temp(e, false, value_home(ty, false, &pcx), &pbody, &pcx);
             return;
         }
         if k == NodeKind::Int || k == NodeKind::Bool || k == NodeKind::Unit || k == NodeKind::Char
@@ -903,113 +845,114 @@ fn expr_into(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
             || k == NodeKind::Ident {
             return;
         }
-        unsupported(e);
+        unsupported(e, &pcx);
         return;
     }
     if k == NodeKind::Unary {
-        lower_unary(e, dl, dp, &pbody);
+        lower_unary(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Binary {
-        lower_binary(e, dl, dp, &pbody);
+        lower_binary(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Cast {
-        operand(NODES[e].a, false, &pbody);
+        operand(pcx.nodes[e].a, false, &pbody, &pcx);
         if !reachable(pbody) {
             return;
         }
         let at = ops_mark(pbody);
-        push_now(&pbody);
+        push_now(&pbody, pcx);
         emit(SK_ASSIGN, dl, dp, RV_CAST, ty, 0, at, 1, e, &pbody);
         return;
     }
     if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
         || k == NodeKind::VariantLit {
-        lower_aggregate(e, dl, dp, &pbody);
+        lower_aggregate(e, dl, dp, &pbody, &pcx);
         return;
     }
     if k == NodeKind::Repeat {
-        operand(NODES[e].a, true, &pbody);
+        operand(pcx.nodes[e].a, true, &pbody, &pcx);
         let at = ops_mark(pbody);
-        push_now(&pbody);
+        push_now(&pbody, pcx);
         emit(SK_ASSIGN, dl, dp, RV_REPEAT, TYPES[undistinct(ty)].b, 0, at, 1, e, &pbody);
         return;
     }
-    if k == NodeKind::Index && NODES[NODES[e].b].kind == NodeKind::Range {
-        lower_slicing(e, dl, dp, &pbody);
+    if k == NodeKind::Index && pcx.nodes[pcx.nodes[e].b].kind == NodeKind::Range {
+        lower_slicing(e, dl, dp, &pbody, &pcx);
         return;
     }
     // A plain value: an operand, written.
-    if !is_operand_kind(e) {
-        unsupported(e);
+    if !is_operand_kind(e, pcx) {
+        unsupported(e, &pcx);
         return;
     }
     let moving = !has_flag(dl, LF_BORROWED, pbody);
-    operand(e, moving, &pbody);
+    operand(e, moving, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
-    emit_use(dl, dp, e, &pbody);
+    emit_use(dl, dp, e, &pbody, pcx);
 }
 
-fn lower_unary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let op = NODES[e].op;
-    let ty = undistinct(NODES[e].ty);
+fn lower_unary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let op = pcx.nodes[e].op;
+    let ty = undistinct(pcx.nodes[e].ty);
     if op == Tok::Amp {
-        as_place(NODES[e].b, &pbody);
-        emit_ref(dl, dp, PL_L, PL_P, ref_kind(e, ty), e, &pbody);
+        as_place(pcx.nodes[e].b, &pbody, &pcx);
+        emit_ref(dl, dp, pcx.pl_l, pcx.pl_p, ref_kind(e, ty, pcx), e, &pbody, &pcx);
         return;
     }
     if op == Tok::Star {
         let moving = !has_flag(dl, LF_BORROWED, pbody);
-        operand(e, moving, &pbody);
-        emit_use(dl, dp, e, &pbody);
+        operand(e, moving, &pbody, &pcx);
+        emit_use(dl, dp, e, &pbody, pcx);
         return;
     }
-    operand(NODES[e].b, false, &pbody);
+    operand(pcx.nodes[e].b, false, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
     let at = ops_mark(pbody);
-    push_now(&pbody);
+    push_now(&pbody, pcx);
     let uo = if op == Tok::Minus { UO_NEG } else if op == Tok::Bang { UO_NOT } else { UO_BITNOT };
     // (0.26.3) a checked negation, but of a literal (`-128i8`, `-5`)
-    let checked = uo == UO_NEG && checks_here(pbody) && is_integer(ty)
-        && NODES[NODES[e].b].kind != NodeKind::Int;
+    let checked = uo == UO_NEG && checks_here(pbody, pcx) && is_integer(ty)
+        && pcx.nodes[pcx.nodes[e].b].kind != NodeKind::Int;
     emit(SK_ASSIGN, dl, dp, if checked { RV_CHECKED } else { RV_UNARY }, uo, e, at, 1, e, &pbody);
 }
 
-fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64, pbody: inout Body<Comp>) {
+fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     let at = ops_mark(pbody);
-    set_op(OK_PLACE, l, p);
-    push_now(&pbody);
+    set_op(OK_PLACE, l, p, &pcx);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, dl, dp, RV_REF, kind, 0, at, 1, node, &pbody);
 }
 
-fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let op = NODES[e].op;
+fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let op = pcx.nodes[e].op;
     if op == Tok::AmpAmp || op == Tok::PipePipe {
         // `a && b`: dest = a; if a (or !a) then dest = b, both made in
         // the destination itself (no destination is a place the operands
         // can read: an assignment's value goes to a temporary first,
         // lower_assign)
-        expr_into(NODES[e].b, dl, dp, &pbody);
+        expr_into(pcx.nodes[e].b, dl, dp, &pbody, &pcx);
         if !reachable(pbody) {
             return;
         }
         let rhs = new_block(&pbody);
         let done = new_block(&pbody);
         let at = ops_mark(pbody);
-        set_op(OK_COPY, dl, dp);
-        push_now(&pbody);
+        set_op(OK_COPY, dl, dp, &pcx);
+        push_now(&pbody, pcx);
         if op == Tok::AmpAmp {
             switch_bool(at, done, rhs, e, &pbody);
         } else {
             switch_bool(at, rhs, done, e, &pbody);
         }
         enter_block(rhs, &pbody);
-        expr_into(NODES[e].c, dl, dp, &pbody);
+        expr_into(pcx.nodes[e].c, dl, dp, &pbody, &pcx);
         if reachable(pbody) {
             goto(done, &pbody);
         }
@@ -1018,19 +961,19 @@ fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     }
     // (the left operand held while the right one is made: it may emit
     // statements of its own, with their operands)
-    operand(NODES[e].b, false, &pbody);
-    let k1 = OPK;
-    let a1 = OPA;
-    let b1 = OPB;
-    operand(NODES[e].c, false, &pbody);
+    operand(pcx.nodes[e].b, false, &pbody, &pcx);
+    let k1 = pcx.opk;
+    let a1 = pcx.opa;
+    let b1 = pcx.opb;
+    operand(pcx.nodes[e].c, false, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
     let at = ops_mark(pbody);
     push_op(k1, a1, b1, &pbody);
-    push_now(&pbody);
-    emit(SK_ASSIGN, dl, dp, binary_rv(bo_of(op), NODES[NODES[e].b].ty, pbody), bo_of(op), e, at, 2,
-        e, &pbody);
+    push_now(&pbody, pcx);
+    emit(SK_ASSIGN, dl, dp, binary_rv(bo_of(op), pcx.nodes[pcx.nodes[e].b].ty, pbody, pcx),
+        bo_of(op), e, at, 2, e, &pbody);
 }
 
 // The IR's binary operator of token op (an operator or a compound
@@ -1061,8 +1004,8 @@ fn bo_of(op: Tok) -> i64 {
 // RV_CHECKED for an integer `+`, `-`, `*`, `<<` or `>>` when the overflow
 // checks are on (middle::opt::OVERFLOW_CHECKS), but in std::num::wrapping
 // (front/modules std_wraps), else RV_BINARY.
-fn binary_rv(bo: i64, ty: i64, pbody: Body<Comp>) -> i64 {
-    if checks_here(pbody) && (bo == BO_ADD || bo == BO_SUB || bo == BO_MUL || bo == BO_SHL
+fn binary_rv(bo: i64, ty: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    if checks_here(pbody, pcx) && (bo == BO_ADD || bo == BO_SUB || bo == BO_MUL || bo == BO_SHL
         || bo == BO_SHR) && is_integer(undistinct(ty)) {
         RV_CHECKED
     } else {
@@ -1072,8 +1015,9 @@ fn binary_rv(bo: i64, ty: i64, pbody: Body<Comp>) -> i64 {
 
 // (0.26.3) Whether the body built checks its arithmetic's overflow: the
 // checks are on and it is not std::num::wrapping's (nor a shim's).
-fn checks_here(pbody: Body<Comp>) -> bool {
-    OVERFLOW_CHECKS && pbody.fn_ >= 0 && !crate::front::modules::std_wraps(fn_module(pbody.fn_))
+fn checks_here(pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
+    pcx.overflow_checks && pbody.fn_ >= 0
+        && !crate::front::modules::std_wraps(fn_module(pbody.fn_, pcx), pcx)
 }
 
 // A switch on bool operand `at` (in P_OPS): false to `f`, true to `t`.
@@ -1094,16 +1038,16 @@ fn goto_back(b: i64, pbody: inout Body<Comp>) {
 
 // Struct, tuple, array and variant literals: the parts in the order they
 // are written, then the aggregate in declaration order.
-fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let k = NODES[e].kind;
-    let ty = NODES[e].ty;
-    let n = NODES[e].count;
+fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[e].kind;
+    let ty = pcx.nodes[e].ty;
+    let n = pcx.nodes[e].count;
     // (room for the parts in P_OPS, filled by position: what their values
     // emit goes after it; a union literal names one of its fields, and has
     // a part per field, `()` but the one written)
     let ut = undistinct(ty);
-    let slots = if k == NodeKind::StructLit && is_union_type(ut) {
-        crate::places::ir::struct_field_count(TYPES[ut].a)
+    let slots = if k == NodeKind::StructLit && is_union_type(ut, pcx) {
+        crate::places::ir::struct_field_count(TYPES[ut].a, pcx)
     } else {
         n
     };
@@ -1113,34 +1057,34 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     }
     for j in 0..n {
         var i = j;
-        var value = child(e, j);
+        var value = child(e, j, pcx);
         if k == NodeKind::StructLit {
-            i = NODES[value].x;
-            value = NODES[value].b;
+            i = pcx.nodes[value].x;
+            value = pcx.nodes[value].b;
         } else if k == NodeKind::VariantLit {
-            i = crate::front::ast::field_order(e, j);
-            value = child(e, i);
+            i = crate::front::ast::field_order(e, j, pcx);
+            value = child(e, i, pcx);
         }
-        if AGG_BORROW {
+        if pcx.agg_borrow {
             // (only this literal's parts: not those of what they contain)
-            AGG_BORROW = false;
-            operand(value, true, &pbody);
-            AGG_BORROW = true;
-            if OPK == OK_MOVE {
-                let t = new_temp(NODES[value].ty, value, true, &pbody);
-                set_op(OK_COPY, OPA, OPB);
-                emit_use(t, 0, value, &pbody);
-                set_op(OK_COPY, t, 0);
+            pcx.agg_borrow = false;
+            operand(value, true, &pbody, &pcx);
+            pcx.agg_borrow = true;
+            if pcx.opk == OK_MOVE {
+                let t = new_temp(pcx.nodes[value].ty, value, true, &pbody, &pcx);
+                set_op(OK_COPY, pcx.opa, pcx.opb, &pcx);
+                emit_use(t, 0, value, &pbody, pcx);
+                set_op(OK_COPY, t, 0, &pcx);
             }
         } else if k == NodeKind::StructLit {
-            arg_operand(value, true, &pbody);
+            arg_operand(value, true, &pbody, &pcx);
         } else {
-            operand(value, true, &pbody);
+            operand(value, true, &pbody, &pcx);
         }
         if i >= 0 && i < slots {
-            pbody.ops[at + 3 * i] = OPK;
-            pbody.ops[at + 3 * i + 1] = OPA;
-            pbody.ops[at + 3 * i + 2] = OPB;
+            pbody.ops[at + 3 * i] = pcx.opk;
+            pbody.ops[at + 3 * i + 1] = pcx.opa;
+            pbody.ops[at + 3 * i + 2] = pcx.opb;
         }
     }
     if !reachable(pbody) {
@@ -1151,52 +1095,52 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     if k == NodeKind::Array {
         ak = AK_ARRAY;
     } else if k == NodeKind::StructLit {
-        ak = if struct_closure(ty) { AK_CLOSURE } else { AK_STRUCT };
+        ak = if struct_closure(ty, pcx) { AK_CLOSURE } else { AK_STRUCT };
         info = ty;
     } else if k == NodeKind::VariantLit {
         ak = AK_VARIANT;
-        info = NODES[e].a;
+        info = pcx.nodes[e].a;
     }
     emit(SK_ASSIGN, dl, dp, RV_AGG, ak, info, at, slots, e, &pbody);
 }
 
 // `a[lo..hi]`: the base (a place, or a pointer's value), the bounds, then
 // the slice.
-fn lower_slicing(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let base = NODES[e].a;
-    let range = NODES[e].b;
-    as_place(base, &pbody);
-    set_op(OK_PLACE, PL_L, PL_P);
-    var at = ops_add(ops_mark(pbody), 0, &pbody);
-    if NODES[range].a != 0 {
-        operand(NODES[range].a, false, &pbody);
+fn lower_slicing(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let base = pcx.nodes[e].a;
+    let range = pcx.nodes[e].b;
+    as_place(base, &pbody, &pcx);
+    set_op(OK_PLACE, pcx.pl_l, pcx.pl_p, &pcx);
+    var at = ops_add(ops_mark(pbody), 0, &pbody, pcx);
+    if pcx.nodes[range].a != 0 {
+        operand(pcx.nodes[range].a, false, &pbody, &pcx);
     } else {
-        set_op(OK_UNIT, 0, TY_UNIT);
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
     }
-    at = ops_add(at, 1, &pbody);
-    if NODES[range].b != 0 {
-        operand(NODES[range].b, false, &pbody);
+    at = ops_add(at, 1, &pbody, pcx);
+    if pcx.nodes[range].b != 0 {
+        operand(pcx.nodes[range].b, false, &pbody, &pcx);
     } else {
-        set_op(OK_UNIT, 0, TY_UNIT);
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
     }
-    at = ops_add(at, 2, &pbody);
+    at = ops_add(at, 2, &pbody, pcx);
     if !reachable(pbody) {
         return;
     }
     emit(SK_ASSIGN, dl, dp, RV_SLICE, e, 0, at, 3, e, &pbody);
 }
 
-fn lower_vecop(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
+fn lower_vecop(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     var at = ops_mark(pbody);
     var n = 0;
-    if NODES[e].a != 0 {
-        operand(NODES[e].a, false, &pbody);
-        at = ops_add(at, n, &pbody);
+    if pcx.nodes[e].a != 0 {
+        operand(pcx.nodes[e].a, false, &pbody, &pcx);
+        at = ops_add(at, n, &pbody, pcx);
         n += 1;
     }
-    for i in 0..NODES[e].count {
-        operand(child(e, i), false, &pbody);
-        at = ops_add(at, n, &pbody);
+    for i in 0..pcx.nodes[e].count {
+        operand(child(e, i, pcx), false, &pbody, &pcx);
+        at = ops_add(at, n, &pbody, pcx);
         n += 1;
     }
     if !reachable(pbody) {
@@ -1205,8 +1149,8 @@ fn lower_vecop(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     var l = dl;
     var p = dp;
     if l < 0 {
-        l = if is_void(NODES[e].ty) { unit_local(&pbody) }
-            else { new_temp(NODES[e].ty, e, false, &pbody) };
+        l = if is_void(pcx.nodes[e].ty) { unit_local(&pbody, &pcx) }
+            else { new_temp(pcx.nodes[e].ty, e, false, &pbody, &pcx) };
         p = 0;
     }
     emit(SK_INTRINSIC, l, p, IK_VECTOR, e, 0, at, n, e, &pbody);
@@ -1217,43 +1161,44 @@ fn lower_vecop(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
 // Call n: the callee value (a function value), each argument left to
 // right (a `&place` a borrow of its parameter's kind: a receiver's
 // exclusive borrow two-phase), then the call; a `!` result ends the block.
-fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let f = NODES[n].x - 1;
-    let ty = NODES[n].ty;
+fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let f = pcx.nodes[n].x - 1;
+    let ty = pcx.nodes[n].ty;
     var at = ops_mark(pbody);
     var count = 0;
     if f < 0 {
-        operand(NODES[n].a, false, &pbody);
-        at = ops_add(at, count, &pbody);
+        operand(pcx.nodes[n].a, false, &pbody, &pcx);
+        at = ops_add(at, count, &pbody, pcx);
         count += 1;
     }
-    let c_callee = f >= 0 && fn_is_extern(f);
+    let c_callee = f >= 0 && fn_is_extern(f, pcx);
     var ik = -1;
-    if f >= 0 && f == crate::front::contracts::checks::CHECK_FN {
+    if f >= 0 && f == pcx.check_fn {
         ik = IK_CONTRACT;
-        lower_contract(n, &pbody);
-        if dl >= 0 && dl != unit_local(&pbody) && reachable(pbody)
-            && !is_void_dest(dl, dp, &pbody) {
-            set_op(OK_UNIT, 0, TY_UNIT);
-            emit_use(dl, dp, n, &pbody);
+        lower_contract(n, &pbody, &pcx);
+        if dl >= 0 && dl != unit_local(&pbody, &pcx) && reachable(pbody)
+            && !is_void_dest(dl, dp, &pbody, &pcx) {
+            set_op(OK_UNIT, 0, TY_UNIT, &pcx);
+            emit_use(dl, dp, n, &pbody, pcx);
         }
         return;
-    } else if f >= 0 && crate::arch::intrinsic_of_fn(f) >= 0 {
+    } else if f >= 0 && crate::arch::intrinsic_of_fn(f, pcx) >= 0 {
         ik = IK_ARCH;
     }
     // (a requires clause's `$pre` companion reads its arguments in place:
     // borrowed copies, the call's after it moves them)
-    let pre = f >= 0 && is_pre_fn(f);
-    for i in 0..NODES[n].count {
-        let arg = child(n, i);
-        let mode = if f >= 0 { param_mode(f, i) } else { arg_mode_of(arg) };
-        lower_arg(i, arg, mode, c_callee || pre, &pbody);
-        if pre && OPK == OK_COPY && !has_flag(OPA, LF_BORROWED, pbody) && type_glue(NODES[arg].ty) {
-            let t = new_temp(NODES[arg].ty, arg, true, &pbody);
-            emit_use(t, 0, arg, &pbody);
-            set_op(OK_COPY, t, 0);
+    let pre = f >= 0 && is_pre_fn(f, pcx);
+    for i in 0..pcx.nodes[n].count {
+        let arg = child(n, i, pcx);
+        let mode = if f >= 0 { param_mode(f, i, pcx) } else { arg_mode_of(arg, pcx) };
+        lower_arg(i, arg, mode, c_callee || pre, &pbody, &pcx);
+        if pre && pcx.opk == OK_COPY && !has_flag(pcx.opa, LF_BORROWED, pbody)
+            && type_glue(pcx.nodes[arg].ty, &pcx) {
+            let t = new_temp(pcx.nodes[arg].ty, arg, true, &pbody, &pcx);
+            emit_use(t, 0, arg, &pbody, pcx);
+            set_op(OK_COPY, t, 0, &pcx);
         }
-        at = ops_add(at, count, &pbody);
+        at = ops_add(at, count, &pbody, pcx);
         count += 1;
         if !reachable(pbody) {
             return;
@@ -1262,8 +1207,8 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     var l = dl;
     var p = dp;
     if l < 0 {
-        l = if is_void(ty) || ty == TY_NEVER { unit_local(&pbody) }
-            else { new_temp(ty, n, copied_call(n), &pbody) };
+        l = if is_void(ty) || ty == TY_NEVER { unit_local(&pbody, &pcx) }
+            else { new_temp(ty, n, copied_call(n, &pcx), &pbody, &pcx) };
         p = 0;
     }
     if ik >= 0 {
@@ -1276,11 +1221,6 @@ fn lower_call(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     }
 }
 
-// (0.26.2) The conjuncts and the shown values of the contract checks being
-// lowered (lower_contract), each check's from its mark on.
-static var CONJS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var SHOWN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // (0.26.2) A contract check, call n, `std::contract_check(COND, SITE,
 // CHECK, HOLES..)` (front/contracts): each conjunct of COND (its `&&`
 // chain, checks.vl conjuncts) evaluated and branched on in turn, exactly
@@ -1289,26 +1229,30 @@ static var SHOWN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // condition may change state: `assert(v.pop() == x)`) as for a
 // requires', ensures' or invariant's (the form entry facts read,
 // middle/entryfacts.vl).
-fn lower_contract(n: i64, pbody: inout Body<Comp>) {
-    let cmark = CONJS.count;
-    crate::front::contracts::checks::conjuncts(child(n, 0), &CONJS);
-    let cend = CONJS.count;
+fn lower_contract(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let cmark = pcx.conjs.count;
+    // (the stack taken out while conjuncts, which reads the context, fills it)
+    var conjs = pcx.conjs;
+    pcx.conjs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    crate::front::contracts::checks::conjuncts(child(n, 0, pcx), &conjs, pcx);
+    pcx.conjs = conjs;
+    let cend = pcx.conjs.count;
     for k in cmark..cend {
-        let conj = CONJS.get(k);
-        operand(conj, false, &pbody);
+        let conj = pcx.conjs.get(k);
+        operand(conj, false, &pbody, &pcx);
         if !reachable(pbody) {
             break;
         }
         let pass = new_block(&pbody);
         let fail = new_block(&pbody);
         let at = ops_mark(pbody);
-        push_now(&pbody);
+        push_now(&pbody, pcx);
         switch_bool(at, fail, pass, conj, &pbody);
         enter_block(fail, &pbody);
-        contract_failure(n, conj, &pbody);
+        contract_failure(n, conj, &pbody, &pcx);
         enter_block(pass, &pbody);
     }
-    CONJS.count = cmark;
+    pcx.conjs.count = cmark;
 }
 
 // The failing path of conjunct conj of contract check n, in the block
@@ -1319,44 +1263,44 @@ fn lower_contract(n: i64, pbody: inout Body<Comp>) {
 //     unreachable
 // (the message is check_message's, of n's check and conj; ops[0] is the
 // condition's value, false here, as an assert's was before 0.26.2).
-fn contract_failure(n: i64, conj: i64, pbody: inout Body<Comp>) {
-    let smark = SHOWN.count;
-    crate::front::contracts::checks::check_values(n, conj, &SHOWN);
-    let send = SHOWN.count;
-    let vals = OP_HOLD.len() as i64;
-    OP_HOLD.push(OK_INT);
-    OP_HOLD.push(0);
-    OP_HOLD.push(TY_BOOL);
-    operand(child(n, 1), false, &pbody);
-    OP_HOLD.push(OPK);
-    OP_HOLD.push(OPA);
-    OP_HOLD.push(OPB);
+fn contract_failure(n: i64, conj: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let smark = pcx.shown.count;
+    var pcx_shown = pcx.shown;
+    crate::front::contracts::checks::check_values(n, conj, &pcx_shown, pcx);
+    pcx.shown = pcx_shown;
+    let send = pcx.shown.count;
+    let vals = pcx.op_hold.len() as i64;
+    pcx.op_hold.push(OK_INT);
+    pcx.op_hold.push(0);
+    pcx.op_hold.push(TY_BOOL);
+    operand(child(n, 1, pcx), false, &pbody, &pcx);
+    pcx.op_hold.push(pcx.opk);
+    pcx.op_hold.push(pcx.opa);
+    pcx.op_hold.push(pcx.opb);
     for i in smark..send {
-        operand(SHOWN.get(i), false, &pbody);
-        OP_HOLD.push(OPK);
-        OP_HOLD.push(OPA);
-        OP_HOLD.push(OPB);
+        operand(pcx.shown.get(i), false, &pbody, &pcx);
+        pcx.op_hold.push(pcx.opk);
+        pcx.op_hold.push(pcx.opa);
+        pcx.op_hold.push(pcx.opb);
     }
-    SHOWN.count = smark;
-    let count = (OP_HOLD.len() as i64 - vals) / 3;
+    pcx.shown.count = smark;
+    let count = (pcx.op_hold.len() as i64 - vals) / 3;
     let at = ops_mark(pbody);
     for j in 0..count {
-        push_op(OP_HOLD[vals + 3 * j], OP_HOLD[vals + 3 * j + 1], OP_HOLD[vals + 3 * j + 2],
-            &pbody);
+        push_op(pcx.op_hold[vals + 3 * j], pcx.op_hold[vals + 3 * j + 1],
+            pcx.op_hold[vals + 3 * j + 2], &pbody);
     }
-    OP_HOLD.truncate(len_arg(vals));
+    pcx.op_hold.truncate(len_arg(vals));
     if reachable(pbody) {
-        emit(SK_INTRINSIC, unit_local(&pbody), 0, IK_CONTRACT, n, conj, at, count, conj, &pbody);
+        emit(SK_INTRINSIC, unit_local(&pbody, &pcx), 0, IK_CONTRACT, n, conj, at, count, conj,
+            &pbody);
         terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, conj, &pbody);
     }
 }
 
-// Operands held while the ones after them are made (lower_contract).
-static var OP_HOLD: Vec<i64, Comp> = Vec::new_in(Comp {});
-
 // The mode of an argument of a call through a function value: by its type.
-fn arg_mode_of(arg: i64) -> i64 {
-    let t = undistinct(NODES[arg].ty);
+fn arg_mode_of(arg: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = undistinct(pcx.nodes[arg].ty);
     if t > 0 && TYPES[t].kind == TyKind::Ptr {
         return if TYPES[t].b == REF_SHARED { crate::front::own::kinds::P_SHARED }
             else if TYPES[t].b == REF_MUT { P_MUT } else { P_RAW };
@@ -1365,37 +1309,38 @@ fn arg_mode_of(arg: i64) -> i64 {
 }
 
 // Argument i (node arg) of call n: its operand (OPK..).
-fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp>) {
-    let k = NODES[arg].kind;
-    let temp = k == NodeKind::Block && own_temp_block(arg) && own_temp_addr(arg);
-    if k == NodeKind::Unary && NODES[arg].op == Tok::Amp || temp {
+fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[arg].kind;
+    let temp = k == NodeKind::Block && own_temp_block(arg, pcx) && own_temp_addr(arg, pcx);
+    if k == NodeKind::Unary && pcx.nodes[arg].op == Tok::Amp || temp {
         // (`&value` lent, the own pass's temporary's block: `&e`)
-        let operand_e = if temp { own_temp_value(arg) } else { NODES[arg].b };
-        let at_ty = undistinct(NODES[arg].ty);
+        let operand_e = if temp { own_temp_value(arg, pcx) } else { pcx.nodes[arg].b };
+        let at_ty = undistinct(pcx.nodes[arg].ty);
         if temp {
-            own_temp_place(arg, &pbody);
+            own_temp_place(arg, &pbody, &pcx);
         } else {
-            as_place(operand_e, &pbody);
+            as_place(operand_e, &pbody, &pcx);
         }
-        let pl = PL_L;
-        let pp = PL_P;
+        let pl = pcx.pl_l;
+        let pp = pcx.pl_p;
         var kind = BK_SHARED;
         if c_callee || mode == P_RAW || at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr
             && TYPES[at_ty].b == 0 {
             kind = BK_RAW;
-        } else if mode == P_MUT || (NODES[arg].p & NODE_REF_MUT) != 0 {
-            let receiver = i == 0 && NODES[arg].start == NODES[operand_e].start;
+        } else if mode == P_MUT || (pcx.nodes[arg].p & NODE_REF_MUT) != 0 {
+            let receiver = i == 0 && pcx.nodes[arg].start == pcx.nodes[operand_e].start;
             kind = if receiver { BK_MUT2 } else { BK_MUT };
         }
-        let t = new_temp(at_ty, arg, false, &pbody);
-        emit_ref(t, 0, pl, pp, kind, arg, &pbody);
-        set_op(OK_MOVE, t, 0);
+        let t = new_temp(at_ty, arg, false, &pbody, &pcx);
+        emit_ref(t, 0, pl, pp, kind, arg, &pbody, &pcx);
+        set_op(OK_MOVE, t, 0, &pcx);
         return;
     }
     // (a value: moved into a by-value parameter; read where the callee
     // only reads it: a raw or C parameter, a view)
     let moving = mode == P_VALUE && !c_callee;
-    arg_operand(arg, moving, &pbody);
+    arg_operand(arg, moving, &pbody, &pcx);
 }
 
 // ---- Assignment ----
@@ -1403,41 +1348,41 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
 // `p = v` and `p op= v`: the value first, then the place, then the write
 // (the old value is not dropped: the own pass's desugaring is what drops,
 // lower_own_assign).
-fn lower_assign(n: i64, pbody: inout Body<Comp>) {
-    let op = NODES[n].op;
-    let target = NODES[n].b;
-    let value = NODES[n].c;
+fn lower_assign(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let op = pcx.nodes[n].op;
+    let target = pcx.nodes[n].b;
+    let value = pcx.nodes[n].c;
     if op == Tok::Eq {
-        operand(value, true, &pbody);
+        operand(value, true, &pbody, &pcx);
         if !reachable(pbody) {
             return;
         }
-        let ok = OPK;
-        let oa = OPA;
-        let ob = OPB;
-        if !place_of(target, &pbody) {
-            unsupported(target);
+        let ok = pcx.opk;
+        let oa = pcx.opa;
+        let ob = pcx.opb;
+        if !place_of(target, &pbody, &pcx) {
+            unsupported(target, &pcx);
             return;
         }
-        set_op(ok, oa, ob);
-        emit_use(PL_L, PL_P, n, &pbody);
+        set_op(ok, oa, ob, &pcx);
+        emit_use(pcx.pl_l, pcx.pl_p, n, &pbody, pcx);
         return;
     }
     // `p op= v`: p = p op v, the value first
-    operand(value, false, &pbody);
-    let vk = OPK;
-    let va = OPA;
-    let vb = OPB;
-    if !reachable(pbody) || !place_of(target, &pbody) {
+    operand(value, false, &pbody, &pcx);
+    let vk = pcx.opk;
+    let va = pcx.opa;
+    let vb = pcx.opb;
+    if !reachable(pbody) || !place_of(target, &pbody, &pcx) {
         return;
     }
     let at = ops_mark(pbody);
-    set_op(OK_COPY, PL_L, PL_P);
-    push_now(&pbody);
-    set_op(vk, va, vb);
-    push_now(&pbody);
-    emit(SK_ASSIGN, PL_L, PL_P, binary_rv(bo_of(op), NODES[target].ty, pbody), bo_of(op), n, at, 2,
-        n, &pbody);
+    set_op(OK_COPY, pcx.pl_l, pcx.pl_p, &pcx);
+    push_now(&pbody, pcx);
+    set_op(vk, va, vb, &pcx);
+    push_now(&pbody, pcx);
+    emit(SK_ASSIGN, pcx.pl_l, pcx.pl_p, binary_rv(bo_of(op), pcx.nodes[target].ty, pbody, pcx),
+        bo_of(op), n, at, 2, n, &pbody);
 }
 
 // (0.26.2) An assignment: `p = v` on an owned place drops p's old value
@@ -1448,118 +1393,118 @@ fn lower_assign(n: i64, pbody: inout Body<Comp>) {
 // drop, then the write; the right side's temporaries at the statement's
 // end, ea70255c), elaboration deciding the drop (removed where p is moved,
 // under a flag where it may be); drops_old says which.
-fn lower_assign_at(n: i64, pbody: inout Body<Comp>) {
-    if !drops_old(n) {
-        lower_assign(n, &pbody);
+fn lower_assign_at(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if !drops_old(n, &pcx) {
+        lower_assign(n, &pbody, &pcx);
         return;
     }
-    let target = NODES[n].b;
-    let value = NODES[n].c;
-    let tmp = new_temp(NODES[value].ty, n, false, &pbody);
-    expr_into(value, tmp, 0, &pbody);
+    let target = pcx.nodes[n].b;
+    let value = pcx.nodes[n].c;
+    let tmp = new_temp(pcx.nodes[value].ty, n, false, &pbody, &pcx);
+    expr_into(value, tmp, 0, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
-    if !place_of(target, &pbody) {
-        unsupported(target);
+    if !place_of(target, &pbody, &pcx) {
+        unsupported(target, &pcx);
         return;
     }
-    emit(SK_DROP, PL_L, PL_P, DS_UNDECIDED, -1, -1, 0, 0, n, &pbody);
-    set_op(OK_MOVE, tmp, 0);
-    emit_use(PL_L, PL_P, n, &pbody);
+    emit(SK_DROP, pcx.pl_l, pcx.pl_p, DS_UNDECIDED, -1, -1, 0, 0, n, &pbody);
+    set_op(OK_MOVE, tmp, 0, &pcx);
+    emit_use(pcx.pl_l, pcx.pl_p, n, &pbody, pcx);
 }
 
 // Whether assignment n drops the old value: `=` (not one the checker
 // writes without a drop, NO_DROP) of a value with glue to a place of names,
 // fields, `*` and indexes (not one a call makes, nor a raw access,
 // NODE_RAW), with drops on.
-fn drops_old(n: i64) -> bool {
-    if !DROPS || NODES[n].op != Tok::Eq || (NODES[n].p & NO_DROP) != 0 {
+fn drops_old(n: i64, pcx: inout Ctx<Comp>) -> bool {
+    if !pcx.drops || pcx.nodes[n].op != Tok::Eq || (pcx.nodes[n].p & NO_DROP) != 0 {
         return false;
     }
-    let target = NODES[n].b;
-    target != 0 && NODES[n].c != 0 && NODES[target].ty > 0 && type_glue(NODES[target].ty)
-        && indexable_place(target)
+    let target = pcx.nodes[n].b;
+    target != 0 && pcx.nodes[n].c != 0 && pcx.nodes[target].ty > 0
+        && type_glue(pcx.nodes[target].ty, &pcx) && indexable_place(target, pcx)
 }
 
 // ---- Control flow ----
 
-fn lower_return(n: i64, pbody: inout Body<Comp>) {
-    let v = NODES[n].a;
+fn lower_return(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let v = pcx.nodes[n].a;
     if v != 0 {
-        expr_into(v, 0, 0, &pbody);
+        expr_into(v, 0, 0, &pbody, &pcx);
     }
     if !reachable(pbody) {
         return;
     }
-    exit_to(0, n, &pbody);
-    goto(RET_BLOCK, &pbody);
+    exit_to(0, n, &pbody, &pcx);
+    goto(pcx.ret_block, &pbody);
 }
 
-fn lower_break(n: i64, pbody: inout Body<Comp>) {
-    let s = loop_scope(NODES[n].x);
+fn lower_break(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let s = loop_scope(pcx.nodes[n].x, pcx);
     if s < 0 {
-        unsupported(n);
+        unsupported(n, &pcx);
         return;
     }
-    let v = NODES[n].b;
+    let v = pcx.nodes[n].b;
     if v != 0 {
-        let rl = SCOPES[s * SW + 5];
+        let rl = pcx.build_scopes[s * SW + 5];
         if rl >= 0 {
-            expr_into(v, rl, SCOPES[s * SW + 6], &pbody);
+            expr_into(v, rl, pcx.build_scopes[s * SW + 6], &pbody, &pcx);
         } else {
-            expr_into(v, -1, 0, &pbody);
+            expr_into(v, -1, 0, &pbody, &pcx);
         }
     }
     if !reachable(pbody) {
         return;
     }
-    exit_to(s + 1, n, &pbody);
-    goto(SCOPES[s * SW + 3], &pbody);
+    exit_to(s + 1, n, &pbody, &pcx);
+    goto(pcx.build_scopes[s * SW + 3], &pbody);
 }
 
-fn lower_continue(n: i64, pbody: inout Body<Comp>) {
-    let s = loop_scope(NODES[n].x);
+fn lower_continue(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let s = loop_scope(pcx.nodes[n].x, pcx);
     if s < 0 {
-        unsupported(n);
+        unsupported(n, &pcx);
         return;
     }
-    exit_to(s + 1, n, &pbody);
-    if SCOPES[s * SW + 7] != 0 {
-        goto_back(SCOPES[s * SW + 4], &pbody);
+    exit_to(s + 1, n, &pbody, &pcx);
+    if pcx.build_scopes[s * SW + 7] != 0 {
+        goto_back(pcx.build_scopes[s * SW + 4], &pbody);
     } else {
-        goto(SCOPES[s * SW + 4], &pbody);
+        goto(pcx.build_scopes[s * SW + 4], &pbody);
     }
 }
 
-fn lower_if(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let fixed = crate::front::features::static_condition(NODES[n].a);
+fn lower_if(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let fixed = crate::front::features::static_condition(pcx.nodes[n].a, &pcx);
     if fixed >= 0 {
-        let live = if fixed == 1 { NODES[n].b } else { NODES[n].c };
+        let live = if fixed == 1 { pcx.nodes[n].b } else { pcx.nodes[n].c };
         if live != 0 {
-            expr_into(live, dl, dp, &pbody);
+            expr_into(live, dl, dp, &pbody, &pcx);
         }
         return;
     }
-    operand(NODES[n].a, false, &pbody);
+    operand(pcx.nodes[n].a, false, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
     let then_b = new_block(&pbody);
-    let has_else = NODES[n].c != 0;
+    let has_else = pcx.nodes[n].c != 0;
     let else_b = if has_else { new_block(&pbody) } else { -1 };
     let join = new_block(&pbody);
     let at = ops_mark(pbody);
-    push_now(&pbody);
+    push_now(&pbody, pcx);
     switch_bool(at, if has_else { else_b } else { join }, then_b, n, &pbody);
     enter_block(then_b, &pbody);
-    expr_into(NODES[n].b, dl, dp, &pbody);
+    expr_into(pcx.nodes[n].b, dl, dp, &pbody, &pcx);
     if reachable(pbody) {
         goto(join, &pbody);
     }
     if has_else {
         enter_block(else_b, &pbody);
-        expr_into(NODES[n].c, dl, dp, &pbody);
+        expr_into(pcx.nodes[n].c, dl, dp, &pbody, &pcx);
         if reachable(pbody) {
             goto(join, &pbody);
         }
@@ -1569,63 +1514,63 @@ fn lower_if(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
 
 // `loop` and `while`: a header block; the body's scopes; `break` to the
 // exit, `continue` to the header (a back edge).
-fn lower_loop(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
+fn lower_loop(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     let head = new_block(&pbody);
     let exit = new_block(&pbody);
     goto(head, &pbody);
     enter_block(head, &pbody);
-    let s = push_scope(SC_LOOP, n, false);
-    SCOPES[s * SW + 2] = n;
-    SCOPES[s * SW + 3] = exit;
-    SCOPES[s * SW + 4] = head;
-    SCOPES[s * SW + 5] = dl;
-    SCOPES[s * SW + 6] = dp;
+    let s = push_scope(SC_LOOP, n, false, &pcx);
+    pcx.build_scopes[s * SW + 2] = n;
+    pcx.build_scopes[s * SW + 3] = exit;
+    pcx.build_scopes[s * SW + 4] = head;
+    pcx.build_scopes[s * SW + 5] = dl;
+    pcx.build_scopes[s * SW + 6] = dp;
     // (`continue` takes the back edge of an uncounted loop)
-    SCOPES[s * SW + 7] = 1;
-    if NODES[n].kind == NodeKind::While {
+    pcx.build_scopes[s * SW + 7] = 1;
+    if pcx.nodes[n].kind == NodeKind::While {
         // (the condition is a unit of its own: its temporaries drop when
         // it is evaluated)
-        let c = push_scope(SC_STMT, n, true);
-        operand(NODES[n].b, false, &pbody);
+        let c = push_scope(SC_STMT, n, true, &pcx);
+        operand(pcx.nodes[n].b, false, &pbody, &pcx);
         let at = ops_mark(pbody);
-        push_now(&pbody);
+        push_now(&pbody, pcx);
         let body = new_block(&pbody);
         let out = new_block(&pbody);
         // (the condition's temporaries end on both edges)
         switch_bool(at, out, body, n, &pbody);
         enter_block(out, &pbody);
-        emit_scope(c, &pbody);
+        emit_scope(c, &pbody, &pcx);
         goto(exit, &pbody);
         enter_block(body, &pbody);
-        pop_scope_at(c, &pbody);
-        expr_into(NODES[n].c, -1, 0, &pbody);
+        pop_scope_at(c, &pbody, &pcx);
+        expr_into(pcx.nodes[n].c, -1, 0, &pbody, &pcx);
     } else {
-        expr_into(NODES[n].b, -1, 0, &pbody);
+        expr_into(pcx.nodes[n].b, -1, 0, &pbody, &pcx);
     }
     if reachable(pbody) {
         goto_back(head, &pbody);
     }
-    pop_scope_at(s, &pbody);
+    pop_scope_at(s, &pbody, &pcx);
     enter_block(exit, &pbody);
-    if NODES[n].kind == NodeKind::While && dl >= 0 && dl != unit_local(&pbody) {
+    if pcx.nodes[n].kind == NodeKind::While && dl >= 0 && dl != unit_local(&pbody, &pcx) {
         // (a `while` is `()`)
-        set_op(OK_UNIT, 0, TY_UNIT);
-        emit_use(dl, dp, n, &pbody);
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
+        emit_use(dl, dp, n, &pbody, pcx);
     }
 }
 
 // `for p in a..b` (the counted form the checker leaves): the bounds once,
 // the counter's copy bound each round; `continue` to the increment.
-fn lower_for(n: i64, pbody: inout Body<Comp>) {
-    let range = NODES[n].c;
-    let rt = NODES[range].ty;
-    let inclusive = NODES[range].c != 0;
-    operand(NODES[range].a, false, &pbody);
-    let counter = new_temp(rt, n, false, &pbody);
-    emit_use(counter, 0, n, &pbody);
-    operand(NODES[range].b, false, &pbody);
-    let end = new_temp(rt, n, false, &pbody);
-    emit_use(end, 0, n, &pbody);
+fn lower_for(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let range = pcx.nodes[n].c;
+    let rt = pcx.nodes[range].ty;
+    let inclusive = pcx.nodes[range].c != 0;
+    operand(pcx.nodes[range].a, false, &pbody, &pcx);
+    let counter = new_temp(rt, n, false, &pbody, &pcx);
+    emit_use(counter, 0, n, &pbody, pcx);
+    operand(pcx.nodes[range].b, false, &pbody, &pcx);
+    let end = new_temp(rt, n, false, &pbody, &pcx);
+    emit_use(end, 0, n, &pbody, pcx);
     if !reachable(pbody) {
         return;
     }
@@ -1635,61 +1580,61 @@ fn lower_for(n: i64, pbody: inout Body<Comp>) {
     let exit = new_block(&pbody);
     goto(test, &pbody);
     enter_block(test, &pbody);
-    let cmp = new_temp(TY_BOOL, n, false, &pbody);
+    let cmp = new_temp(TY_BOOL, n, false, &pbody, &pcx);
     let at = ops_mark(pbody);
-    set_op(OK_COPY, counter, 0);
-    push_now(&pbody);
-    set_op(OK_COPY, end, 0);
-    push_now(&pbody);
+    set_op(OK_COPY, counter, 0, &pcx);
+    push_now(&pbody, pcx);
+    set_op(OK_COPY, end, 0, &pcx);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, cmp, 0, RV_BINARY, if inclusive { BO_LE } else { BO_LT }, n, at, 2, n, &pbody);
     let at2 = ops_mark(pbody);
-    set_op(OK_COPY, cmp, 0);
-    push_now(&pbody);
+    set_op(OK_COPY, cmp, 0, &pcx);
+    push_now(&pbody, pcx);
     switch_bool(at2, exit, body, n, &pbody);
     enter_block(body, &pbody);
-    let s = push_scope(SC_LOOP, n, false);
-    SCOPES[s * SW + 2] = n;
-    SCOPES[s * SW + 3] = exit;
-    SCOPES[s * SW + 4] = next;
-    let arm = push_scope(SC_ARM, n, false);
-    let pat = NODES[n].b;
-    if NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
-        let l = user_local(NODES[pat].x, pat, false, &pbody);
-        live(l, &pbody);
-        schedule(EN_DEAD, l, pbody);
-        set_op(OK_COPY, counter, 0);
-        emit_use(l, 0, pat, &pbody);
-    } else if NODES[pat].kind != NodeKind::PatWild {
-        unsupported(pat);
+    let s = push_scope(SC_LOOP, n, false, &pcx);
+    pcx.build_scopes[s * SW + 2] = n;
+    pcx.build_scopes[s * SW + 3] = exit;
+    pcx.build_scopes[s * SW + 4] = next;
+    let arm = push_scope(SC_ARM, n, false, &pcx);
+    let pat = pcx.nodes[n].b;
+    if pcx.nodes[pat].kind == NodeKind::PatBind && pcx.nodes[pat].x >= 0 {
+        let l = user_local(pcx.nodes[pat].x, pat, false, &pbody, &pcx);
+        live(l, &pbody, &pcx);
+        schedule(EN_DEAD, l, pbody, &pcx);
+        set_op(OK_COPY, counter, 0, &pcx);
+        emit_use(l, 0, pat, &pbody, pcx);
+    } else if pcx.nodes[pat].kind != NodeKind::PatWild {
+        unsupported(pat, &pcx);
     }
-    expr_into(NODES[n].d, -1, 0, &pbody);
-    pop_scope_at(arm, &pbody);
+    expr_into(pcx.nodes[n].d, -1, 0, &pbody, &pcx);
+    pop_scope_at(arm, &pbody, &pcx);
     if reachable(pbody) {
         goto(next, &pbody);
     }
-    pop_scope_at(s, &pbody);
+    pop_scope_at(s, &pbody, &pcx);
     enter_block(next, &pbody);
     if inclusive {
         // (the last round: counter == end)
-        let last = new_temp(TY_BOOL, n, false, &pbody);
+        let last = new_temp(TY_BOOL, n, false, &pbody, &pcx);
         let at3 = ops_mark(pbody);
-        set_op(OK_COPY, counter, 0);
-        push_now(&pbody);
-        set_op(OK_COPY, end, 0);
-        push_now(&pbody);
+        set_op(OK_COPY, counter, 0, &pcx);
+        push_now(&pbody, pcx);
+        set_op(OK_COPY, end, 0, &pcx);
+        push_now(&pbody, pcx);
         emit(SK_ASSIGN, last, 0, RV_BINARY, BO_EQ, n, at3, 2, n, &pbody);
         let at4 = ops_mark(pbody);
-        set_op(OK_COPY, last, 0);
-        push_now(&pbody);
+        set_op(OK_COPY, last, 0, &pcx);
+        push_now(&pbody, pcx);
         let inc = new_block(&pbody);
         switch_bool(at4, inc, exit, n, &pbody);
         enter_block(inc, &pbody);
     }
     let at5 = ops_mark(pbody);
-    set_op(OK_COPY, counter, 0);
-    push_now(&pbody);
-    set_op(OK_INT, 1, rt);
-    push_now(&pbody);
+    set_op(OK_COPY, counter, 0, &pcx);
+    push_now(&pbody, pcx);
+    set_op(OK_INT, 1, rt, &pcx);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, counter, 0, RV_BINARY, BO_ADD, n, at5, 2, n, &pbody);
     goto(test, &pbody);
     enter_block(exit, &pbody);
@@ -1702,51 +1647,51 @@ fn lower_for(n: i64, pbody: inout Body<Comp>) {
 // next arm on a mismatch), its guard evaluated with the bindings as
 // borrowed copies, then the bindings made (moved out, unless the own pass
 // made them borrow) and the body; no arm matching is unreachable.
-fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let scrut = NODES[n].a;
-    let st = NODES[scrut].ty;
-    scrutinee_place(scrut, &pbody);
+fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let scrut = pcx.nodes[n].a;
+    let st = pcx.nodes[scrut].ty;
+    scrutinee_place(scrut, &pbody, &pcx);
     if !reachable(pbody) || st == TY_NEVER {
         return;
     }
-    let sl = PL_L;
-    let sp = PL_P;
-    if switch_cases(n, st) {
-        lower_match_switch(n, st, sl, sp, dl, dp, &pbody);
+    let sl = pcx.pl_l;
+    let sp = pcx.pl_p;
+    if switch_cases(n, st, &pcx) {
+        lower_match_switch(n, st, sl, sp, dl, dp, &pbody, &pcx);
         return;
     }
     let join = new_block(&pbody);
-    for i in 0..NODES[n].count {
-        let arm = child(n, i);
-        let pat = NODES[arm].a;
+    for i in 0..pcx.nodes[n].count {
+        let arm = child(n, i, pcx);
+        let pat = pcx.nodes[arm].a;
         let fail = new_block(&pbody);
-        let s = push_scope(SC_ARM, arm, false);
-        test_pattern(pat, sl, sp, st, fail, &pbody);
-        let guard = NODES[arm].b;
+        let s = push_scope(SC_ARM, arm, false, &pcx);
+        test_pattern(pat, sl, sp, st, fail, &pbody, &pcx);
+        let guard = pcx.nodes[arm].b;
         if guard != 0 && reachable(pbody) {
-            phase_begin(-1);
-            bind_pattern(pat, sl, sp, st, true, &pbody);
-            let g = push_scope(SC_STMT, guard, false);
-            operand(guard, false, &pbody);
+            phase_begin(-1, &pcx);
+            bind_pattern(pat, sl, sp, st, true, &pbody, &pcx);
+            let g = push_scope(SC_STMT, guard, false, &pcx);
+            operand(guard, false, &pbody, &pcx);
             if reachable(pbody) {
                 let at = ops_mark(pbody);
-                push_now(&pbody);
+                push_now(&pbody, pcx);
                 let ok = new_block(&pbody);
                 let refused = new_block(&pbody);
                 switch_bool(at, refused, ok, arm, &pbody);
                 enter_block(refused, &pbody);
-                exit_to(s, arm, &pbody);
+                exit_to(s, arm, &pbody, &pcx);
                 goto(fail, &pbody);
                 enter_block(ok, &pbody);
             }
-            pop_scope_at(g, &pbody);
+            pop_scope_at(g, &pbody, &pcx);
         }
         if reachable(pbody) {
-            phase_begin(-1);
-            bind_pattern(pat, sl, sp, st, false, &pbody);
-            expr_into(NODES[arm].c, dl, dp, &pbody);
+            phase_begin(-1, &pcx);
+            bind_pattern(pat, sl, sp, st, false, &pbody, &pcx);
+            expr_into(pcx.nodes[arm].c, dl, dp, &pbody, &pcx);
         }
-        pop_scope_at(s, &pbody);
+        pop_scope_at(s, &pbody, &pcx);
         if reachable(pbody) {
             goto(join, &pbody);
         }
@@ -1756,100 +1701,91 @@ fn lower_match(n: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
     enter_block(join, &pbody);
 }
 
-// (0.26.1, R4) A match lowered as one switch: its (value, arm) pairs, each
-// value once (for the first arm that has it), and the arm that is the
-// default (a wildcard or a binding, the last arm), -1 when none is.
-static var SW_CASES: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var SW_DEFAULT: i64 = -1;
-// The referent type the arms match through (their patterns' PAT_DEREF),
-// 0 when they match the value itself.
-static var SW_INNER: i64 = 0;
-
 // Whether match n on a value of type st is one switch (R4, as
 // middle/lower/matching.vl's switch_cases): no guards; an integer
 // scrutinee matched against literals, ranges and their alternatives, or
 // an enum (not one with the null niche) matched by variant, whose fields
 // only bind; a wildcard or binding, if any, the last arm; at least 6
 // values, or 4 for an enum with fields. Fills SW_CASES and SW_DEFAULT.
-fn switch_cases(n: i64, st: i64) -> bool {
-    let count = NODES[n].count;
-    SW_INNER = -1;
+fn switch_cases(n: i64, st: i64, pcx: inout Ctx<Comp>) -> bool {
+    let count = pcx.nodes[n].count;
+    pcx.sw_inner = -1;
     for i in 0..count {
-        let p = NODES[child(n, i)].a;
-        let kind = NODES[p].kind;
+        let p = pcx.nodes[child(n, i, pcx)].a;
+        let kind = pcx.nodes[p].kind;
         if kind != NodeKind::PatWild && kind != NodeKind::PatBind {
-            let r = pattern_referent(p, st);
-            if SW_INNER >= 0 && r != SW_INNER {
+            let r = pattern_referent(p, st, pcx);
+            if pcx.sw_inner >= 0 && r != pcx.sw_inner {
                 return false;
             }
-            SW_INNER = r;
+            pcx.sw_inner = r;
         }
     }
-    let t = undistinct(if SW_INNER > 0 { SW_INNER } else { st });
+    let t = undistinct(if pcx.sw_inner > 0 { pcx.sw_inner } else { st });
     if t <= 0 {
         return false;
     }
     let integer = is_integer(t);
     let is_enum = TYPES[t].kind == TyKind::Enum;
-    if !integer && !is_enum || is_enum && enum_niche(TYPES[t].a) {
+    if !integer && !is_enum || is_enum && enum_niche(TYPES[t].a, pcx) {
         return false;
     }
-    SW_CASES.clear();
-    SW_DEFAULT = -1;
+    pcx.sw_cases.clear();
+    pcx.sw_default = -1;
     for i in 0..count {
-        let arm = child(n, i);
-        let p = NODES[arm].a;
-        if NODES[arm].b != 0 {
+        let arm = child(n, i, pcx);
+        let p = pcx.nodes[arm].a;
+        if pcx.nodes[arm].b != 0 {
             return false;
         }
-        let kind = NODES[p].kind;
+        let kind = pcx.nodes[p].kind;
         if kind == NodeKind::PatWild || kind == NodeKind::PatBind {
             if i != count - 1 {
                 return false;
             }
-            SW_DEFAULT = i;
-        } else if !add_switch_values(p, i, t, integer) {
+            pcx.sw_default = i;
+        } else if !add_switch_values(p, i, t, integer, &pcx) {
             return false;
         }
     }
-    let cases = SW_CASES.len() as i64 / 2;
+    let cases = pcx.sw_cases.len() as i64 / 2;
     cases >= 6 || is_enum && is_compound(t) && cases >= 4
 }
 
 // Adds the values pattern p matches (for arm `arm`, unless an earlier arm
 // has them) of the integer or enum type t; false when p is not a set of
 // values.
-fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool) -> bool {
-    let kind = NODES[p].kind;
+fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool, pcx: inout Ctx<Comp>) -> bool {
+    let kind = pcx.nodes[p].kind;
     if kind == NodeKind::PatLit && integer {
-        add_switch_value(NODES[p].x, arm);
+        add_switch_value(pcx.nodes[p].x, arm, &pcx);
         return true;
     }
     if kind == NodeKind::PatRange && integer {
-        let lo = int_key(NODES[p].x, t);
-        let hi = int_key(NODES[p].y, t);
+        let lo = int_key(pcx.nodes[p].x, t);
+        let hi = int_key(pcx.nodes[p].y, t);
         // (wrapped, a range past 2^63 values is at most 0: refused)
         let count = if hi < lo { 0 } else { hi.wrapping_sub(lo).wrapping_add(1) };
-        if count < 1 || count > 256 || SW_CASES.len() as i64 + 2 * count > 2048 {
+        if count < 1 || count > 256 || pcx.sw_cases.len() as i64 + 2 * count > 2048 {
             return false;
         }
         for k in 0..count {
-            add_switch_value(wrap_int(NODES[p].x + k, t), arm);
+            add_switch_value(wrap_int(pcx.nodes[p].x + k, t), arm, &pcx);
         }
         return true;
     }
     if kind == NodeKind::PatVariant && !integer {
-        for i in 0..NODES[p].count {
-            if !is_irrefutable(child(p, i)) {
+        for i in 0..pcx.nodes[p].count {
+            if !is_irrefutable(child(p, i, pcx), pcx) {
                 return false;
             }
         }
-        add_switch_value(variant_discr(NODES[p].x), arm);
+        add_switch_value(variant_discr(pcx.nodes[p].x, pcx), arm, &pcx);
         return true;
     }
-    if kind == NodeKind::PatOr && binding_count(p) == 0 {
-        for i in 0..NODES[p].count {
-            if !add_switch_values(child(p, i), arm, t, integer) {
+    if kind == NodeKind::PatOr && binding_count(p, pcx) == 0 {
+        for i in 0..pcx.nodes[p].count {
+            if !add_switch_values(child(p, i, pcx), arm, t, integer, &pcx) {
                 return false;
             }
         }
@@ -1858,16 +1794,16 @@ fn add_switch_values(p: i64, arm: i64, t: i64, integer: bool) -> bool {
     false
 }
 
-fn add_switch_value(value: i64, arm: i64) {
+fn add_switch_value(value: i64, arm: i64, pcx: inout Ctx<Comp>) {
     var i = 0;
-    while i < SW_CASES.len() as i64 {
-        if SW_CASES[i] == value {
+    while i < pcx.sw_cases.len() as i64 {
+        if pcx.sw_cases[i] == value {
             return;
         }
         i += 2;
     }
-    SW_CASES.push(value);
-    SW_CASES.push(arm);
+    pcx.sw_cases.push(value);
+    pcx.sw_cases.push(arm);
 }
 
 // Match n, its scrutinee at (sl, sp) of type st, as one switch (R4; after
@@ -1878,70 +1814,71 @@ fn add_switch_value(value: i64, arm: i64) {
 // with several values is reached through a block per value (a goto to
 // the arm's): elaboration learns the variant of P from the edge of a
 // target with one value.
-fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let inner = SW_INNER;
+fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    let inner = pcx.sw_inner;
     let t = undistinct(if inner > 0 { inner } else { st });
     let pp = if inner > 0 { proj(sp, PJ_DEREF, 0, &pbody) } else { sp };
     let integer = is_integer(t);
     var at = 0;
     if integer {
         at = ops_mark(pbody);
-        set_op(OK_COPY, sl, pp);
-        push_now(&pbody);
+        set_op(OK_COPY, sl, pp, &pcx);
+        push_now(&pbody, pcx);
     } else {
         let d = new_local(enum_tag_ty(t), LF_TEMP, -1, n, &pbody);
         let a0 = ops_mark(pbody);
-        set_op(OK_PLACE, sl, pp);
-        push_now(&pbody);
+        set_op(OK_PLACE, sl, pp, &pcx);
+        push_now(&pbody, pcx);
         emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, a0, 1, n, &pbody);
         at = ops_mark(pbody);
-        set_op(OK_COPY, d, 0);
-        push_now(&pbody);
+        set_op(OK_COPY, d, 0, &pcx);
+        push_now(&pbody, pcx);
     }
     let join = new_block(&pbody);
-    let count = NODES[n].count;
+    let count = pcx.nodes[n].count;
     let first = new_block(&pbody);
     for _ in 1..count {
         new_block(&pbody);
     }
     var default = -1;
-    if SW_DEFAULT >= 0 {
-        default = first + SW_DEFAULT;
+    if pcx.sw_default >= 0 {
+        default = first + pcx.sw_default;
     } else {
         default = new_block(&pbody);
     }
-    let cases = SW_CASES.len() as i64 / 2;
+    let cases = pcx.sw_cases.len() as i64 / 2;
     let ti = pbody.targets.len() as i64;
     for c in 0..cases {
-        let arm = SW_CASES[2 * c + 1];
+        let arm = pcx.sw_cases[2 * c + 1];
         var many = false;
         if !integer {
             for o in 0..cases {
-                many = many || o != c && SW_CASES[2 * o + 1] == arm;
+                many = many || o != c && pcx.sw_cases[2 * o + 1] == arm;
             }
         }
-        pbody.targets.push(SW_CASES[2 * c]);
+        pbody.targets.push(pcx.sw_cases[2 * c]);
         let pbody_arg = if many { new_block(&pbody) } else { first + arm };
         pbody.targets.push(pbody_arg);
     }
     terminate(TK_SWITCH, ti, cases, default, at, 1, n, &pbody);
     for c in 0..cases {
-        let arm = SW_CASES[2 * c + 1];
+        let arm = pcx.sw_cases[2 * c + 1];
         let target = pbody.targets[ti + 2 * c + 1];
         if target != first + arm {
             enter_block(target, &pbody);
             goto(first + arm, &pbody);
         }
     }
-    let catch_all = SW_DEFAULT;
+    let catch_all = pcx.sw_default;
     for i in 0..count {
-        let arm = child(n, i);
+        let arm = child(n, i, pcx);
         enter_block(first + i, &pbody);
-        let s = push_scope(SC_ARM, arm, false);
-        phase_begin(-1);
-        bind_pattern(NODES[arm].a, sl, sp, st, false, &pbody);
-        expr_into(NODES[arm].c, dl, dp, &pbody);
-        pop_scope_at(s, &pbody);
+        let s = push_scope(SC_ARM, arm, false, &pcx);
+        phase_begin(-1, &pcx);
+        bind_pattern(pcx.nodes[arm].a, sl, sp, st, false, &pbody, &pcx);
+        expr_into(pcx.nodes[arm].c, dl, dp, &pbody, &pcx);
+        pop_scope_at(s, &pbody, &pcx);
         if reachable(pbody) {
             goto(join, &pbody);
         }
@@ -1959,80 +1896,81 @@ fn lower_match_switch(n: i64, st: i64, sl: i64, sp: i64, dl: i64, dp: i64, pbody
 // getter's result). Not for a parametric copy (copied_call): the own pass
 // drops the bindings of `let (s, k) = mk::<R>()` (let_drops looks at
 // borrowed_call only), R10.
-fn scrutinee_place(e: i64, pbody: inout Body<Comp>) {
-    if is_place_expr(e) && place_of(e, &pbody) {
+fn scrutinee_place(e: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    if is_place_expr(e, pcx) && place_of(e, &pbody, &pcx) {
         return;
     }
-    let borrowed = borrowed_call(e) || (NODES[e].p & MATCH_BYREF) != 0;
-    PL_L = value_temp(e, borrowed, value_home(NODES[e].ty, borrowed), &pbody);
-    PL_P = 0;
+    let borrowed = borrowed_call(e, &pcx) || (pcx.nodes[e].p & MATCH_BYREF) != 0;
+    pcx.pl_l = value_temp(e, borrowed, value_home(pcx.nodes[e].ty, borrowed, &pcx), &pbody, &pcx);
+    pcx.pl_p = 0;
 }
 
 // Branches to block `fail` unless place (l, p) of type ty matches pattern
 // pat: discriminant switches, comparisons; no binding made.
-fn test_pattern(pat: i64, l: i64, p: i64, ty: i64, fail: i64, pbody: inout Body<Comp>) {
+fn test_pattern(pat: i64, l: i64, p: i64, ty: i64, fail: i64, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     if !reachable(pbody) || ty == TY_NEVER {
         return;
     }
     var pp = p;
     var t = ty;
-    let inner = pattern_referent(pat, t);
+    let inner = pattern_referent(pat, t, pcx);
     if inner != 0 {
         pp = proj(pp, PJ_DEREF, 0, &pbody);
         t = inner;
     }
-    let k = NODES[pat].kind;
+    let k = pcx.nodes[pat].kind;
     if k == NodeKind::PatLit {
-        compare_const(l, pp, t, BO_EQ, NODES[pat].x, fail, pat, &pbody);
+        compare_const(l, pp, t, BO_EQ, pcx.nodes[pat].x, fail, pat, &pbody, &pcx);
     } else if k == NodeKind::PatRange {
-        compare_const(l, pp, t, BO_GE, NODES[pat].x, fail, pat, &pbody);
-        compare_const(l, pp, t, BO_LE, NODES[pat].y, fail, pat, &pbody);
+        compare_const(l, pp, t, BO_GE, pcx.nodes[pat].x, fail, pat, &pbody, &pcx);
+        compare_const(l, pp, t, BO_LE, pcx.nodes[pat].y, fail, pat, &pbody, &pcx);
     } else if k == NodeKind::PatOr {
         let ok = new_block(&pbody);
-        let last = NODES[pat].count - 1;
+        let last = pcx.nodes[pat].count - 1;
         for i in 0..last {
             let next = new_block(&pbody);
-            test_pattern(child(pat, i), l, pp, t, next, &pbody);
+            test_pattern(child(pat, i, pcx), l, pp, t, next, &pbody, &pcx);
             if reachable(pbody) {
                 goto(ok, &pbody);
             }
             enter_block(next, &pbody);
         }
-        test_pattern(child(pat, last), l, pp, t, fail, &pbody);
+        test_pattern(child(pat, last, pcx), l, pp, t, fail, &pbody, &pcx);
         if reachable(pbody) {
             goto(ok, &pbody);
         }
         enter_block(ok, &pbody);
     } else if k == NodeKind::PatTuple {
         let tt = undistinct(t);
-        for i in 0..NODES[pat].count {
-            test_pattern(child(pat, i), l, proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i), fail,
-                &pbody);
+        for i in 0..pcx.nodes[pat].count {
+            test_pattern(child(pat, i, pcx), l, proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i),
+                fail, &pbody, &pcx);
         }
     } else if k == NodeKind::PatVariant {
-        let v = NODES[pat].x;
-        switch_variant(l, pp, t, v, fail, pat, &pbody);
+        let v = pcx.nodes[pat].x;
+        switch_variant(l, pp, t, v, fail, pat, &pbody, &pcx);
         let vp = proj(pp, PJ_VARIANT, v, &pbody);
-        for i in 0..NODES[pat].count {
-            test_pattern(child(pat, i), l, proj(vp, PJ_FIELD, i, &pbody), variant_field(v, i), fail,
-                &pbody);
+        for i in 0..pcx.nodes[pat].count {
+            test_pattern(child(pat, i, pcx), l, proj(vp, PJ_FIELD, i, &pbody),
+                variant_field(v, i, pcx), fail, &pbody, &pcx);
         }
     }
 }
 
 // `_c = copy (l, p) OP const value; switch _c [false: fail]`.
 fn compare_const(l: i64, p: i64, ty: i64, op: i64, value: i64, fail: i64, node: i64,
-    pbody: inout Body<Comp>) {
+    pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     let c = new_local(TY_BOOL, LF_TEMP, -1, node, &pbody);
     let at = ops_mark(pbody);
-    set_op(OK_COPY, l, p);
-    push_now(&pbody);
-    set_op(OK_INT, value, ty);
-    push_now(&pbody);
+    set_op(OK_COPY, l, p, &pcx);
+    push_now(&pbody, pcx);
+    set_op(OK_INT, value, ty, &pcx);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, c, 0, RV_BINARY, op, 0, at, 2, node, &pbody);
     let at2 = ops_mark(pbody);
-    set_op(OK_COPY, c, 0);
-    push_now(&pbody);
+    set_op(OK_COPY, c, 0, &pcx);
+    push_now(&pbody, pcx);
     let next = new_block(&pbody);
     switch_bool(at2, fail, next, node, &pbody);
     enter_block(next, &pbody);
@@ -2040,33 +1978,27 @@ fn compare_const(l: i64, p: i64, ty: i64, op: i64, value: i64, fail: i64, node: 
 
 // `_d = discriminant (l, p); switch _d [discr(v): next, otherwise: fail]`:
 // what makes `(l, p) as v` valid in the blocks it dominates.
-fn switch_variant(l: i64, p: i64, ty: i64, v: i64, fail: i64, node: i64, pbody: inout Body<Comp>) {
+fn switch_variant(l: i64, p: i64, ty: i64, v: i64, fail: i64, node: i64, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     let d = new_local(enum_tag_ty(undistinct(ty)), LF_TEMP, -1, node, &pbody);
     let at = ops_mark(pbody);
-    set_op(OK_PLACE, l, p);
-    push_now(&pbody);
+    set_op(OK_PLACE, l, p, &pcx);
+    push_now(&pbody, pcx);
     emit(SK_ASSIGN, d, 0, RV_DISCR, 0, 0, at, 1, node, &pbody);
     let at2 = ops_mark(pbody);
-    set_op(OK_COPY, d, 0);
-    push_now(&pbody);
+    set_op(OK_COPY, d, 0, &pcx);
+    push_now(&pbody, pcx);
     let next = new_block(&pbody);
     let ti = pbody.targets.len() as i64;
-    pbody.targets.push(variant_discr(v));
+    pbody.targets.push(variant_discr(v, pcx));
     pbody.targets.push(next);
     terminate(TK_SWITCH, ti, 1, fail, at2, 1, node, &pbody);
     enter_block(next, &pbody);
 }
 
-// The AST locals bound in this phase of an arm (a guard's borrowed copies,
-// then the body's bindings) and their IR locals: pairs. An or-pattern's
-// alternatives bind the same locals.
-static var PHASE: Vec<i64, Comp> = Vec::new_in(Comp {});
-// The statement scope a pattern `let` binds out of (-1: none, the arm's).
-static var BIND_SCOPE: i64 = -1;
-
-fn phase_begin(s: i64) {
-    PHASE.clear();
-    BIND_SCOPE = s;
+fn phase_begin(s: i64, pcx: inout Ctx<Comp>) {
+    pcx.phase.clear();
+    pcx.bind_scope = s;
 }
 
 // Binds the variables of pattern pat, known to match place (l, p) of type
@@ -2074,46 +2006,47 @@ fn phase_begin(s: i64) {
 // pass's BYREF, a part of a borrowed copy), or a reference to it (PAT_REF).
 // An or-pattern's alternatives are tested again, in order, to bind the one
 // that matched.
-fn bind_pattern(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Comp>) {
+fn bind_pattern(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     if !reachable(pbody) || ty == TY_NEVER {
         return;
     }
     var pp = p;
     var t = ty;
-    let inner = pattern_referent(pat, t);
+    let inner = pattern_referent(pat, t, pcx);
     if inner != 0 {
         pp = proj(pp, PJ_DEREF, 0, &pbody);
         t = inner;
     }
-    let k = NODES[pat].kind;
+    let k = pcx.nodes[pat].kind;
     if k == NodeKind::PatBind {
-        bind_one(pat, l, pp, t, guard, &pbody);
+        bind_one(pat, l, pp, t, guard, &pbody, &pcx);
     } else if k == NodeKind::PatTuple {
         let tt = undistinct(t);
-        for i in 0..NODES[pat].count {
-            bind_pattern(child(pat, i), l, proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i), guard,
-                &pbody);
+        for i in 0..pcx.nodes[pat].count {
+            bind_pattern(child(pat, i, pcx), l, proj(pp, PJ_FIELD, i, &pbody), type_elem(tt, i),
+                guard, &pbody, &pcx);
         }
     } else if k == NodeKind::PatVariant {
-        let v = NODES[pat].x;
+        let v = pcx.nodes[pat].x;
         let vp = proj(pp, PJ_VARIANT, v, &pbody);
-        for i in 0..NODES[pat].count {
-            bind_pattern(child(pat, i), l, proj(vp, PJ_FIELD, i, &pbody), variant_field(v, i),
-                guard, &pbody);
+        for i in 0..pcx.nodes[pat].count {
+            bind_pattern(child(pat, i, pcx), l, proj(vp, PJ_FIELD, i, &pbody),
+                variant_field(v, i, pcx), guard, &pbody, &pcx);
         }
-    } else if k == NodeKind::PatOr && binding_count(pat) > 0 {
+    } else if k == NodeKind::PatOr && binding_count(pat, pcx) > 0 {
         let ok = new_block(&pbody);
-        let last = NODES[pat].count - 1;
+        let last = pcx.nodes[pat].count - 1;
         for i in 0..last {
             let next = new_block(&pbody);
-            test_pattern(child(pat, i), l, pp, t, next, &pbody);
-            bind_pattern(child(pat, i), l, pp, t, guard, &pbody);
+            test_pattern(child(pat, i, pcx), l, pp, t, next, &pbody, &pcx);
+            bind_pattern(child(pat, i, pcx), l, pp, t, guard, &pbody, &pcx);
             if reachable(pbody) {
                 goto(ok, &pbody);
             }
             enter_block(next, &pbody);
         }
-        bind_pattern(child(pat, last), l, pp, t, guard, &pbody);
+        bind_pattern(child(pat, last, pcx), l, pp, t, guard, &pbody, &pcx);
         if reachable(pbody) {
             goto(ok, &pbody);
         }
@@ -2121,44 +2054,45 @@ fn bind_pattern(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Bod
     }
 }
 
-fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Comp>) {
-    let al = NODES[pat].x;
+fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    let al = pcx.nodes[pat].x;
     if al < 0 {
         return;
     }
-    let by_ref = binds_ref(pat);
-    let borrowed = !by_ref && (guard || ast_borrowed(al) || has_flag(l, LF_BORROWED, pbody));
+    let by_ref = binds_ref(pat, pcx);
+    let borrowed = !by_ref && (guard || ast_borrowed(al, pcx) || has_flag(l, LF_BORROWED, pbody));
     // (the IR local: the phase's when an earlier alternative made it)
     var ir = -1;
     var i = 0;
-    while i < PHASE.len() as i64 {
-        if PHASE[i] == al {
-            ir = PHASE[i + 1];
+    while i < pcx.phase.len() as i64 {
+        if pcx.phase[i] == al {
+            ir = pcx.phase[i + 1];
             break;
         }
         i += 2;
     }
     let first = ir < 0;
     if first {
-        ir = user_local(al, pat, borrowed, &pbody);
-        PHASE.push(al);
-        PHASE.push(ir);
+        ir = user_local(al, pat, borrowed, &pbody, &pcx);
+        pcx.phase.push(al);
+        pcx.phase.push(ir);
     }
-    live(ir, &pbody);
+    live(ir, &pbody, &pcx);
     if first {
-        schedule_outer(BIND_SCOPE, EN_DEAD, ir, pbody);
+        schedule_outer(pcx.bind_scope, EN_DEAD, ir, pbody, &pcx);
     }
     if by_ref {
-        let rt = undistinct(ast_local_ty(al));
+        let rt = undistinct(ast_local_ty(al, pcx));
         let kind = if rt > 0 && TYPES[rt].kind == TyKind::Ptr && TYPES[rt].b == REF_MUT { BK_MUT }
             else { BK_SHARED };
-        emit_ref(ir, 0, l, p, kind, pat, &pbody);
+        emit_ref(ir, 0, l, p, kind, pat, &pbody, &pcx);
     } else {
-        place_operand(l, p, ty, !borrowed, pbody);
-        emit_use(ir, 0, pat, &pbody);
+        place_operand(l, p, ty, !borrowed, pbody, &pcx);
+        emit_use(ir, 0, pat, &pbody, pcx);
     }
-    if first && !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty) {
-        schedule_outer(BIND_SCOPE, EN_DROP, ir, pbody);
+    if first && !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty, &pcx) {
+        schedule_outer(pcx.bind_scope, EN_DROP, ir, pbody, &pcx);
     }
 }
 
@@ -2166,21 +2100,21 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Co
 // place, its pattern tested (an irrefutable one: a mismatch is
 // unreachable), then its parts bound, in the block's scope (s: the
 // statement's scope).
-fn lower_let_pattern(pat: i64, init: i64, s: i64, pbody: inout Body<Comp>) {
+fn lower_let_pattern(pat: i64, init: i64, s: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if init == 0 {
-        unsupported(pat);
+        unsupported(pat, &pcx);
         return;
     }
-    scrutinee_place(init, &pbody);
+    scrutinee_place(init, &pbody, &pcx);
     if !reachable(pbody) {
         return;
     }
-    let l = PL_L;
-    let p = PL_P;
-    let ty = NODES[init].ty;
+    let l = pcx.pl_l;
+    let p = pcx.pl_p;
+    let ty = pcx.nodes[init].ty;
     let targets = pbody.targets.len();
     let fail = new_block(&pbody);
-    test_pattern(pat, l, p, ty, fail, &pbody);
+    test_pattern(pat, l, p, ty, fail, &pbody, &pcx);
     if pbody.targets.len() != targets && reachable(pbody) {
         let ok = new_block(&pbody);
         goto(ok, &pbody);
@@ -2188,88 +2122,89 @@ fn lower_let_pattern(pat: i64, init: i64, s: i64, pbody: inout Body<Comp>) {
         terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, pat, &pbody);
         enter_block(ok, &pbody);
     }
-    phase_begin(s);
-    bind_pattern(pat, l, p, ty, false, &pbody);
-    BIND_SCOPE = -1;
+    phase_begin(s, &pcx);
+    bind_pattern(pat, l, p, ty, false, &pbody, &pcx);
+    pcx.bind_scope = -1;
 }
 
 // ---- Blocks and statements ----
 
-fn lower_block(b: i64, dl: i64, dp: i64, pbody: inout Body<Comp>) {
-    let flags = NODES[b].p;
-    if (flags & NODE_TEMP) != 0 && own_temp_block(b) {
+fn lower_block(b: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let flags = pcx.nodes[b].p;
+    if (flags & NODE_TEMP) != 0 && own_temp_block(b, pcx) {
         // (the own pass's statement temporary: `&e`, or `e`)
-        let e = own_temp_value(b);
-        if !own_temp_addr(b) {
-            expr_into(e, dl, dp, &pbody);
+        let e = own_temp_value(b, pcx);
+        if !own_temp_addr(b, pcx) {
+            expr_into(e, dl, dp, &pbody, &pcx);
             return;
         }
-        own_temp_place(b, &pbody);
+        own_temp_place(b, &pbody, &pcx);
         if dl >= 0 && reachable(pbody) {
-            emit_ref(dl, dp, PL_L, PL_P, ref_kind(NODES[b].a, NODES[b].ty), b, &pbody);
+            emit_ref(dl, dp, pcx.pl_l, pcx.pl_p, ref_kind(pcx.nodes[b].a, pcx.nodes[b].ty, pcx), b,
+                &pbody, &pcx);
         }
         return;
     }
     // (a transparent desugaring: no scope of its own; its statements', and
     // a desugared expression's, are no temporaries' homes)
     let scoped = (flags & (NODE_TEMP | BLOCK_TRANSPARENT)) == 0;
-    let home = scoped && !desugared_block(b);
-    let s = if scoped { push_scope(SC_BLOCK, b, home) } else { -1 };
-    let saved_home = STMT_HOME;
-    let saved_lent = LENT_HOME;
-    STMT_HOME = home;
-    LENT_HOME = -1;
-    for i in 0..NODES[b].count {
+    let home = scoped && !desugared_block(b, pcx);
+    let s = if scoped { push_scope(SC_BLOCK, b, home, &pcx) } else { -1 };
+    let saved_home = pcx.stmt_home;
+    let saved_lent = pcx.lent_home;
+    pcx.stmt_home = home;
+    pcx.lent_home = -1;
+    for i in 0..pcx.nodes[b].count {
         if !reachable(pbody) {
             break;
         }
-        lower_stmt(child(b, i), &pbody);
+        lower_stmt(child(b, i, pcx), &pbody, &pcx);
     }
-    STMT_HOME = saved_home;
-    LENT_HOME = saved_lent;
-    let tail = NODES[b].a;
-    if tail != 0 && NODES[tail].kind == NodeKind::Assign {
+    pcx.stmt_home = saved_home;
+    pcx.lent_home = saved_lent;
+    let tail = pcx.nodes[b].a;
+    if tail != 0 && pcx.nodes[tail].kind == NodeKind::Assign {
         if reachable(pbody) {
-            lower_assign_at(tail, &pbody);
+            lower_assign_at(tail, &pbody, &pcx);
         }
-        if dl >= 0 && dl != unit_local(&pbody) && reachable(pbody)
-            && !is_void_dest(dl, dp, &pbody) {
-            set_op(OK_UNIT, 0, TY_UNIT);
-            emit_use(dl, dp, b, &pbody);
+        if dl >= 0 && dl != unit_local(&pbody, &pcx) && reachable(pbody)
+            && !is_void_dest(dl, dp, &pbody, &pcx) {
+            set_op(OK_UNIT, 0, TY_UNIT, &pcx);
+            emit_use(dl, dp, b, &pbody, pcx);
         }
         if scoped {
-            pop_scope_at(s, &pbody);
+            pop_scope_at(s, &pbody, &pcx);
         }
         return;
     }
     if tail != 0 && reachable(pbody) {
-        expr_into(tail, dl, dp, &pbody);
-    } else if tail == 0 && dl >= 0 && reachable(pbody) && !is_void_dest(dl, dp, &pbody) {
-        set_op(OK_UNIT, 0, TY_UNIT);
-        emit_use(dl, dp, b, &pbody);
+        expr_into(tail, dl, dp, &pbody, &pcx);
+    } else if tail == 0 && dl >= 0 && reachable(pbody) && !is_void_dest(dl, dp, &pbody, &pcx) {
+        set_op(OK_UNIT, 0, TY_UNIT, &pcx);
+        emit_use(dl, dp, b, &pbody, pcx);
     }
     if scoped {
-        pop_scope_at(s, &pbody);
+        pop_scope_at(s, &pbody, &pcx);
     }
 }
 
-fn is_void_dest(dl: i64, dp: i64, pbody: inout Body<Comp>) -> bool {
-    dl == unit_local(&pbody) || dp == 0 && is_void(pbody.locals[dl].ty)
+fn is_void_dest(dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    dl == unit_local(&pbody, &pcx) || dp == 0 && is_void(pbody.locals[dl].ty)
 }
 
 // Whether block b is the checker's desugaring of an expression, whose
 // statements' temporaries are the enclosing statement's (temp_home): its
 // first `let`s bind its hidden names (`==l`, `=+l`, an f-string's `=fN`,
 // `==nn`), which no program can write.
-fn desugared_block(b: i64) -> bool {
-    for i in 0..NODES[b].count {
-        let s = child(b, i);
-        if NODES[s].kind != NodeKind::Let {
+fn desugared_block(b: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 0..pcx.nodes[b].count {
+        let s = child(b, i, pcx);
+        if pcx.nodes[s].kind != NodeKind::Let {
             return false;
         }
-        let pat = NODES[s].a;
-        if pat != 0 && NODES[pat].kind == NodeKind::PatBind {
-            let text = SYMS[NODES[pat].a].text;
+        let pat = pcx.nodes[s].a;
+        if pat != 0 && pcx.nodes[pat].kind == NodeKind::PatBind {
+            let text = SYMS[pcx.nodes[pat].a].text;
             if text.len > 0 && text[0] == '=' {
                 return true;
             }
@@ -2278,137 +2213,138 @@ fn desugared_block(b: i64) -> bool {
     false
 }
 
-fn lower_stmt(st: i64, pbody: inout Body<Comp>) {
-    let k = NODES[st].kind;
+fn lower_stmt(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let k = pcx.nodes[st].kind;
     if k == NodeKind::Defer {
         // (`defer`: error syntax.defer since 0.26.2)
-        schedule(EN_DEFER, st, pbody);
+        schedule(EN_DEFER, st, pbody, &pcx);
         return;
     }
     if k == NodeKind::Let {
-        lower_let(st, &pbody);
+        lower_let(st, &pbody, &pcx);
         return;
     }
     if k == NodeKind::ExprStmt {
-        let e = NODES[st].a;
+        let e = pcx.nodes[st].a;
         if e == 0 {
             return;
         }
-        let s = push_scope(SC_STMT, st, STMT_HOME);
-        if NODES[e].kind == NodeKind::Assign {
-            lower_assign_at(e, &pbody);
+        let s = push_scope(SC_STMT, st, pcx.stmt_home, &pcx);
+        if pcx.nodes[e].kind == NodeKind::Assign {
+            lower_assign_at(e, &pbody, &pcx);
         } else {
-            expr_into(e, -1, 0, &pbody);
+            expr_into(e, -1, 0, &pbody, &pcx);
         }
-        pop_scope_at(s, &pbody);
+        pop_scope_at(s, &pbody, &pcx);
         return;
     }
-    let s = push_scope(SC_STMT, st, STMT_HOME);
-    expr_into(st, -1, 0, &pbody);
-    pop_scope_at(s, &pbody);
+    let s = push_scope(SC_STMT, st, pcx.stmt_home, &pcx);
+    expr_into(st, -1, 0, &pbody, &pcx);
+    pop_scope_at(s, &pbody, &pcx);
 }
 
 // Schedules an entry at the end of scope s, below the scopes inside it.
-fn schedule_in(s: i64, kind: i64, v: i64, pbody: Body<Comp>) {
-    if s + 1 >= scope_depth() {
-        schedule(kind, v, pbody);
+fn schedule_in(s: i64, kind: i64, v: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    if s + 1 >= scope_depth(pcx) {
+        schedule(kind, v, pbody, &pcx);
     } else {
-        schedule_outer(s + 1, kind, v, pbody);
+        schedule_outer(s + 1, kind, v, pbody, &pcx);
     }
 }
 
-fn lower_let(st: i64, pbody: inout Body<Comp>) {
-    let pat = NODES[st].a;
-    let init = NODES[st].c;
+fn lower_let(st: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let pat = pcx.nodes[st].a;
+    let init = pcx.nodes[st].c;
     if pat == 0 {
         return;
     }
-    let pk = NODES[pat].kind;
+    let pk = pcx.nodes[pat].kind;
     // (its temporaries: to the end of the statement, or of the block when
     // it may keep a view of them)
-    let keep = init != 0 && NODES[init].ty > 0 && is_view_type(NODES[init].ty);
-    let s = if keep { -1 } else { push_scope(SC_STMT, st, STMT_HOME) };
+    let keep = init != 0 && pcx.nodes[init].ty > 0 && is_view_type(pcx.nodes[init].ty, &pcx);
+    let s = if keep { -1 } else { push_scope(SC_STMT, st, pcx.stmt_home, &pcx) };
     if pk == NodeKind::PatWild {
         if init != 0 {
-            expr_into(init, -1, 0, &pbody);
+            expr_into(init, -1, 0, &pbody, &pcx);
         }
     } else if pk == NodeKind::PatBind {
-        let l = NODES[pat].x;
+        let l = pcx.nodes[pat].x;
         if l < 0 {
             if init != 0 {
-                expr_into(init, -1, 0, &pbody);
+                expr_into(init, -1, 0, &pbody, &pcx);
             }
         } else {
-            let borrowed = let_borrows(pat, init);
-            let ir = user_local(l, pat, borrowed, &pbody);
+            let borrowed = let_borrows(pat, init, pcx);
+            let ir = user_local(l, pat, borrowed, &pbody, &pcx);
             // (its storage begins first; its drop is registered once it
             // holds its value, in the block's scope)
-            live(ir, &pbody);
-            schedule_outer(s, EN_DEAD, ir, pbody);
+            live(ir, &pbody, &pcx);
+            schedule_outer(s, EN_DEAD, ir, pbody, &pcx);
             if init != 0 {
                 // (a requires check's argument, `let ?aI = argI`: an
                 // argument, arg_operand)
-                let saved = LENT_HOME;
-                LENT_HOME = if !STMT_HOME && lent_branch(init) { temp_home() } else { -1 };
-                expr_into(init, ir, 0, &pbody);
-                LENT_HOME = saved;
+                let saved = pcx.lent_home;
+                pcx.lent_home = if !pcx.stmt_home && lent_branch(init, pcx) { temp_home(pcx) }
+                    else { -1 };
+                expr_into(init, ir, 0, &pbody, &pcx);
+                pcx.lent_home = saved;
             }
-            if !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty) {
-                schedule_outer(s, EN_DROP, ir, pbody);
+            if !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty, &pcx) {
+                schedule_outer(s, EN_DROP, ir, pbody, &pcx);
             }
         }
     } else {
-        lower_let_pattern(pat, init, s, &pbody);
+        lower_let_pattern(pat, init, s, &pbody, &pcx);
     }
     if s >= 0 {
-        pop_scope_at(s, &pbody);
+        pop_scope_at(s, &pbody, &pcx);
     }
 }
 
 // Registers an entry in the scope that encloses statement scope s (the
 // block's), or in the innermost one when s is -1.
-fn schedule_outer(s: i64, kind: i64, v: i64, pbody: Body<Comp>) {
-    if kind == EN_DEAD && !keeps_storage(v, pbody) {
+fn schedule_outer(s: i64, kind: i64, v: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    if kind == EN_DEAD && !keeps_storage(v, pbody, &pcx) {
         return;
     }
     if s < 0 {
-        schedule(kind, v, pbody);
+        schedule(kind, v, pbody, &pcx);
         return;
     }
     // (the statement scope is innermost and holds only its temporaries:
     // the entry goes before them, at the end of the enclosing scope)
-    let at = SCOPES[s * SW + 1];
-    ENTRIES.push(0);
-    ENTRIES.push(0);
-    var e = ENTRIES.len() as i64 / 2 - 1;
+    let at = pcx.build_scopes[s * SW + 1];
+    pcx.entries.push(0);
+    pcx.entries.push(0);
+    var e = pcx.entries.len() as i64 / 2 - 1;
     while e > at {
-        ENTRIES[2 * e] = ENTRIES[2 * e - 2];
-        ENTRIES[2 * e + 1] = ENTRIES[2 * e - 1];
+        pcx.entries[2 * e] = pcx.entries[2 * e - 2];
+        pcx.entries[2 * e + 1] = pcx.entries[2 * e - 1];
         e -= 1;
     }
-    ENTRIES[2 * at] = kind;
-    ENTRIES[2 * at + 1] = v;
+    pcx.entries[2 * at] = kind;
+    pcx.entries[2 * at + 1] = v;
     // (the statement scope's entries now start one later)
     var t = s;
-    while t < scope_depth() {
-        SCOPES[t * SW + 1] += 1;
+    while t < scope_depth(pcx) {
+        pcx.build_scopes[t * SW + 1] += 1;
         t += 1;
     }
 }
 
 // Whether `let pat = init` binds a borrowed copy: byref.vl's BYREF, a
 // `for` loop's sequence when it is a place, an operator's `==` operand.
-fn let_borrows(pat: i64, init: i64) -> bool {
-    let l = NODES[pat].x;
-    if ast_borrowed(l) {
+fn let_borrows(pat: i64, init: i64, pcx: Ctx<Comp>) -> bool {
+    let l = pcx.nodes[pat].x;
+    if ast_borrowed(l, pcx) {
         return true;
     }
-    let name = NODES[pat].a;
-    if name == SYM_FOR_SEQ && init != 0 && is_place_expr(init) {
+    let name = pcx.nodes[pat].a;
+    if name == pcx.sym_for_seq && init != 0 && is_place_expr(init, pcx) {
         return true;
     }
     // (`let x = S;` of a static: it borrows, statics are never dropped)
-    if init != 0 && NODES[init].kind == NodeKind::Ident && NODES[init].res == Res::Static {
+    if init != 0 && pcx.nodes[init].kind == NodeKind::Ident && pcx.nodes[init].res == Res::Static {
         return true;
     }
     // (a hidden binding of the checker's, `=fN` an f-string's hole, `==`
@@ -2421,93 +2357,92 @@ fn let_borrows(pat: i64, init: i64) -> bool {
 
 // Builds function f's body (Fn node item) into the IR tables; false when
 // a construct is not handled (a fallback).
-pub fn build_body(f: i64, item: i64, pbody: inout Body<Comp>) -> bool {
-    syms();
-    BUILD_FAILED = false;
-    FAIL_NODE = 0;
-    GEN += 1;
-    CUR_F = f;
-    DROPS = OWN_MODE == MODE_ERROR;
+pub fn build_body(f: i64, item: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    syms(&pcx);
+    pcx.build_failed = false;
+    pcx.fail_node = 0;
+    pcx.build_gen += 1;
+    pcx.cur_f = f;
+    pcx.drops = pcx.own_mode == MODE_ERROR;
     body_begin(f, item, &pbody);
-    SCOPES.clear();
-    ENTRIES.clear();
-    STATICS_SEEN.clear();
-    MOVES_SUSPECT = false;
-    UNIT_LOCAL = -1;
-    let ret = fn_ret(f);
+    pcx.build_scopes.clear();
+    pcx.entries.clear();
+    pcx.statics_seen.clear();
+    pcx.moves_suspect = false;
+    pcx.unit_local = -1;
+    let ret = fn_ret(f, pcx);
     new_local(ret, LF_RETURN, -1, 0, &pbody);
-    let count = NODES[item].count;
+    let count = pcx.nodes[item].count;
     pbody.params = count;
     let entry = new_block(&pbody);
-    RET_BLOCK = new_block(&pbody);
-    let body_scope = push_scope(SC_BODY, NODES[item].c, true);
+    pcx.ret_block = new_block(&pbody);
+    let body_scope = push_scope(SC_BODY, pcx.nodes[item].c, true, &pcx);
     // the parameters: _1.._n
-    let keep = keep_params(f);
+    let keep = keep_params(f, &pcx);
     for i in 0..count {
-        let p = child(item, i);
-        let l = NODES[p].x;
-        let ty = if i < fn_param_count(f) { fn_param(f, i) } else { 0 };
+        let p = child(item, i, pcx);
+        let l = pcx.nodes[p].x;
+        let ty = if i < fn_param_count(f, pcx) { fn_param(f, i, pcx) } else { 0 };
         var flags = LF_PARAM;
-        if l >= 0 && ast_local_mutable(l) {
+        if l >= 0 && ast_local_mutable(l, pcx) {
             flags |= LF_MUT;
         }
-        if l >= 0 && ast_borrowed(l) {
+        if l >= 0 && ast_borrowed(l, pcx) {
             flags |= LF_BORROWED;
         }
         let ir = new_local(ty, flags, l, p, &pbody);
         if l >= 0 {
-            map_local(l, ir, 0);
+            map_local(l, ir, 0, &pcx);
         }
-        if !keep && (flags & LF_BORROWED) == 0 && needs_drop(ty) {
-            schedule(EN_DROP, ir, pbody);
+        if !keep && (flags & LF_BORROWED) == 0 && needs_drop(ty, &pcx) {
+            schedule(EN_DROP, ir, pbody, &pcx);
         }
     }
     enter_block(entry, &pbody);
-    let body = NODES[item].c;
-    expr_into(body, 0, 0, &pbody);
+    let body = pcx.nodes[item].c;
+    expr_into(body, 0, 0, &pbody, &pcx);
     if reachable(pbody) {
-        exit_to(body_scope, body, &pbody);
-        goto(RET_BLOCK, &pbody);
+        exit_to(body_scope, body, &pbody, &pcx);
+        goto(pcx.ret_block, &pbody);
     }
-    SCOPES.clear();
-    ENTRIES.clear();
-    enter_block(RET_BLOCK, &pbody);
+    pcx.build_scopes.clear();
+    pcx.entries.clear();
+    enter_block(pcx.ret_block, &pbody);
     terminate(TK_RETURN, 0, 0, 0, 0, 0, 0, &pbody);
-    live_writes(&pbody);
-    BUILT += 1;
-    !BUILD_FAILED
+    live_writes(&pbody, &pcx);
+    pcx.built += 1;
+    !pcx.build_failed
 }
 
 // Whether function f keeps its by-value parameters undropped: std's
 // `forget` (whose point that is), and `iter::pass_over::<I>` of a
 // borrowing iterator's item (a copy its container keeps), as the own
 // pass's param_drops.
-fn keep_params(f: i64) -> bool {
+fn keep_params(f: i64, pcx: inout Ctx<Comp>) -> bool {
     // (a `$pre` companion's parameters are its call's arguments, read in
     // place: contracts::expand::is_pre_fn)
-    if is_pre_fn(f) {
+    if is_pre_fn(f, pcx) {
         return true;
     }
-    let t = crate::places::front::fn_template(f);
-    if !crate::front::modules::within_std(crate::places::front::fn_module(t)) {
+    let t = crate::places::front::fn_template(f, pcx);
+    if !crate::front::modules::within_std(crate::places::front::fn_module(t, pcx), pcx) {
         return false;
     }
-    let name = crate::places::front::fn_name_sym(t);
+    let name = crate::places::front::fn_name_sym(t, pcx);
     if name == intern_c(c"forget") {
         return true;
     }
     name == intern_c(c"pass_over")
-        && crate::front::own::byref::copies_owned_items(crate::places::front::fn_targ(f, 0), 0)
+        && crate::front::own::byref::copies_owned_items(crate::places::front::fn_targ(f, 0, pcx), 0,
+            &pcx)
 }
 
 // ---- A sink closure's captures moved (R3) ----
 
-static var OLD_STMTS: Vec<PStmt, Comp> = Vec::new_in(Comp {});
-
 // The flag field index of the capture statement st moves out of the env
 // of the closure body held (`move (*_1).k...`, k a capture with a
 // `__live_` flag), or -1.
-fn moved_capture_flag(st: PStmt, pbody: Body<Comp>) -> i64 {
+fn moved_capture_flag(st: PStmt, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
     for i in 0..st.nops {
         if op_kind(st.ops, i, pbody) != OK_MOVE || op_a(st.ops, i, pbody) != 1 {
             continue;
@@ -2525,17 +2460,17 @@ fn moved_capture_flag(st: PStmt, pbody: Body<Comp>) -> i64 {
         }
         let env = undistinct(pbody.locals[1].ty);
         let pt = if env > 0 && TYPES[env].kind == TyKind::Ptr { TYPES[env].a } else { 0 };
-        if pt <= 0 || !struct_closure(pt) {
+        if pt <= 0 || !struct_closure(pt, pcx) {
             continue;
         }
         let s = TYPES[pt].a;
         let flag = crate::front::own::glue::flag_field(s,
-            struct_field_name(s, proj_val(second, pbody)));
+            struct_field_name(s, proj_val(second, pbody), pcx), pcx);
         if flag == 0 {
             continue;
         }
-        for k in 0..crate::places::ir::struct_field_count(s) {
-            if struct_field_name(s, k) == flag {
+        for k in 0..crate::places::ir::struct_field_count(s, pcx) {
+            if struct_field_name(s, k, pcx) == flag {
                 return k;
             }
         }
@@ -2545,31 +2480,34 @@ fn moved_capture_flag(st: PStmt, pbody: Body<Comp>) -> i64 {
 
 // The checker's node of the stop at a sink closure's second move out of
 // its env (R7): `EnumPanic(0)` with the own pass's message, at node n.
-fn second_move_panic(n: i64) -> i64 {
-    let start = NODES[n].start;
-    let zero = crate::front::ast::new_node(NodeKind::Int, start, start);
-    NODES[zero].ty = TY_I64;
-    NODES[zero].b = crate::front::lexer::SUF_I64;
-    let p = crate::front::ast::new_node(NodeKind::EnumPanic, start, start);
-    NODES[p].ty = TY_NEVER;
-    NODES[p].a = zero;
-    NODES[p].x = crate::gen0::target::message_kind(crate::front::contracts::checks::fixed_message(
-        "a sink closure moved its captured value out a second time: it was called again\n"));
+fn second_move_panic(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let zero = crate::front::ast::new_node(NodeKind::Int, start, start, &pcx);
+    pcx.nodes[zero].ty = TY_I64;
+    pcx.nodes[zero].b = crate::front::lexer::SUF_I64;
+    let p = crate::front::ast::new_node(NodeKind::EnumPanic, start, start, &pcx);
+    pcx.nodes[p].ty = TY_NEVER;
+    pcx.nodes[p].a = zero;
+    pcx.nodes[p].x = crate::gen0::target::message_kind(
+        crate::front::contracts::checks::fixed_message(
+            "a sink closure moved its captured value out a second time: it was called again\n",
+            &pcx),
+        &pcx);
     p
 }
 
 // Whether parameter _1 of the body held is a closure's env with a capture
 // under a `__live_` flag (moved_capture_flag's): else live_writes has
 // nothing to look for.
-fn env_has_flags(pbody: Body<Comp>) -> bool {
+fn env_has_flags(pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
     let env = undistinct(pbody.locals[1].ty);
     let pt = if env > 0 && TYPES[env].kind == TyKind::Ptr { TYPES[env].a } else { 0 };
-    if pt <= 0 || !struct_closure(pt) {
+    if pt <= 0 || !struct_closure(pt, pcx) {
         return false;
     }
     let s = TYPES[pt].a;
-    for k in 0..crate::places::ir::struct_field_count(s) {
-        if crate::front::own::glue::flag_field(s, struct_field_name(s, k)) != 0 {
+    for k in 0..crate::places::ir::struct_field_count(s, pcx) {
+        if crate::front::own::glue::flag_field(s, struct_field_name(s, k, pcx), pcx) != 0 {
             return true;
         }
     }
@@ -2579,14 +2517,14 @@ fn env_has_flags(pbody: Body<Comp>) -> bool {
 // A closure body that moves a capture of a sink closure out of its env:
 // `(*_1).__live_x = const false` after each such move, as the own pass
 // writes it, so that the env's shim drops only what it still holds.
-fn live_writes(pbody: inout Body<Comp>) {
+fn live_writes(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     if pbody.params < 1 || local_count(pbody) < 2 || !has_flag(1, LF_PARAM, pbody)
-        || !env_has_flags(pbody) {
+        || !env_has_flags(pbody, pcx) {
         return;
     }
     var any = false;
     for s in 0..pbody.stmts.len() {
-        if moved_capture_flag(pbody.stmts[s], pbody) >= 0 {
+        if moved_capture_flag(pbody.stmts[s], pbody, pcx) >= 0 {
             any = true;
             break;
         }
@@ -2594,29 +2532,29 @@ fn live_writes(pbody: inout Body<Comp>) {
     if !any {
         return;
     }
-    OLD_STMTS.clear();
+    pcx.old_stmts.clear();
     for s in 0..pbody.stmts.len() {
-        OLD_STMTS.push(pbody.stmts[s]);
+        pcx.old_stmts.push(pbody.stmts[s]);
     }
     let n = block_count(pbody);
     // (the blocks' ranges before: entering a block resets its start)
-    let ranges = TMP_RANGES.len() as i64;
+    let ranges = pcx.tmp_ranges.len() as i64;
     for b in 0..n {
-        TMP_RANGES.push(block_start(b, pbody));
-        TMP_RANGES.push(block_len(b, pbody));
+        pcx.tmp_ranges.push(block_start(b, pbody));
+        pcx.tmp_ranges.push(block_len(b, pbody));
     }
     pbody.stmts.clear();
     let root = proj(0, PJ_DEREF, 0, &pbody);
     for b in 0..n {
-        let start = TMP_RANGES[ranges + 2 * b];
+        let start = pcx.tmp_ranges[ranges + 2 * b];
         if start < 0 {
             continue;
         }
-        let len = TMP_RANGES[ranges + 2 * b + 1];
+        let len = pcx.tmp_ranges[ranges + 2 * b + 1];
         enter_block(b, &pbody);
         for s in start..start + len {
-            let st = OLD_STMTS[s];
-            let k = moved_capture_flag(st, pbody);
+            let st = pcx.old_stmts[s];
+            let k = moved_capture_flag(st, pbody, pcx);
             if k >= 0 {
                 // (R7: moved out already, the closure called again: the
                 // program stops, as the own pass's wrap_capture_move)
@@ -2631,10 +2569,10 @@ fn live_writes(pbody: inout Body<Comp>) {
                 let cont = new_block(&pbody);
                 switch_bool(a1, fail, cont, st.node, &pbody);
                 enter_block(fail, &pbody);
-                let p = second_move_panic(st.node);
+                let p = second_move_panic(st.node, &pcx);
                 let a2 = ops_mark(pbody);
                 push_op(OK_INT, 0, TY_I64, &pbody);
-                emit(SK_INTRINSIC, unit_local(&pbody), 0, IK_PANIC, p, 0, a2, 1, p, &pbody);
+                emit(SK_INTRINSIC, unit_local(&pbody, &pcx), 0, IK_PANIC, p, 0, a2, 1, p, &pbody);
                 terminate(TK_UNREACHABLE, 0, 0, 0, 0, 0, p, &pbody);
                 enter_block(cont, &pbody);
             }
@@ -2646,10 +2584,8 @@ fn live_writes(pbody: inout Body<Comp>) {
                     &pbody);
             }
         }
-        let term = OLD_STMTS[start + len];
+        let term = pcx.old_stmts[start + len];
         terminate(term.kind, term.a, term.b, term.c, term.ops, term.nops, term.node, &pbody);
     }
-    TMP_RANGES.truncate(len_arg(ranges));
+    pcx.tmp_ranges.truncate(len_arg(ranges));
 }
-
-static var TMP_RANGES: Vec<i64, Comp> = Vec::new_in(Comp {});

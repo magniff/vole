@@ -48,16 +48,14 @@ pub mod rawptr;
 pub mod statics;
 
 use crate::base::{
-    FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, sym_text,
+    IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern, sym_text,
 };
 use crate::base::comp::Comp;
-use crate::base::diag::{
-    SUGGESTED, SUGGESTED_KIND, buf_tool_command, err_pos, fix_at_ok, name_failed,
-    report_error_tries,
-};
-use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::modules::{C_MODULE, MODULES, file_of_pos, module_count, module_of, within_std};
+use crate::base::ctx::Ctx;
+use crate::base::diag::{buf_tool_command, err_pos, fix_at_ok, name_failed, report_error_tries};
+use crate::front::ast::{NodeKind, child};
+use crate::front::lexer::Tok;
+use crate::front::modules::{file_of_pos, module_count, module_of, within_std};
 use crate::front::modules::lookup::{B_PRIVATE, binding_kind, binding_value};
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::types::item_node_of;
@@ -69,106 +67,87 @@ use crate::tools::edit::items::{after_line, indent_of, node_head};
 use crate::tools::fix::command::choose_path;
 use crate::tools::fix::verify::{last_replace, note_fix, note_refused, refusal_of};
 use crate::tools::query::c_slice;
-use crate::tools::query::defs::{DEFS, MOD_DEF};
 use crate::tools::query::diagnostics::sym_less;
 use crate::tools::query::positions::{line_end, line_start};
-use crate::tools::query::refs::{IN_FILE, IN_MODULE, OPT_IN, ref_in};
+use crate::tools::query::refs::ref_in;
 use crate::tools::query::show::text_start;
 use crate::tools::reexports::reached_through;
 use crate::tools::tidyimports::{relative_style, styled_path};
 
-// What the checker found to fix: the imports an unknown name asks for
-// (module, path, name: symbols), and the private items used elsewhere
-// (their bindings).
-static var MISSING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var PRIVATE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // The unknown `name` in module m is item `name` of the module with path
 // `path` (its help says `add `use PATH::name;``).
-pub fn note_missing_use(m: i64, path: i64, name: i64) {
+pub fn note_missing_use(m: i64, path: i64, name: i64, pcx: inout Ctx<Comp>) {
     // (0.18: `fix --suggested --at FILE:LINE`, the error at that line)
-    if !fix_at_ok(err_pos()) {
+    if !fix_at_ok(err_pos(pcx), &pcx) {
         return;
     }
     var i = 0;
-    while i < MISSING.count {
+    while i < pcx.missing.count {
         if unsafe {
-            MISSING.data[i] == m && MISSING.data[i + 1] == path && MISSING.data[i + 2] == name
+            pcx.missing.data[i] == m && pcx.missing.data[i + 1] == path
+                && pcx.missing.data[i + 2] == name
         } {
-            MISSING_AT.push(i / 3);
-            MISSING_AT.push(err_pos());
+            pcx.missing_at.push(i / 3);
+            pcx.missing_at.push(err_pos(pcx));
             return;
         }
         i += 3;
     }
-    MISSING_AT.push(MISSING.count / 3);
-    MISSING_AT.push(err_pos());
-    MISSING.push(m);
-    MISSING.push(path);
-    MISSING.push(name);
+    pcx.missing_at.push(pcx.missing.count / 3);
+    pcx.missing_at.push(err_pos(pcx));
+    pcx.missing.push(m);
+    pcx.missing.push(path);
+    pcx.missing.push(name);
 }
 
-// (0.25.2.1) Where each name of MISSING is used unknown: MISSING's entry
-// (its index / 3), the error's position, in pairs (verify_fixes: a new
-// error there after the import blames it).
-static var MISSING_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Binding b (B_PRIVATE) was used where it is private.
-pub fn note_private(b: i64) {
+pub fn note_private(b: i64, pcx: inout Ctx<Comp>) {
     if binding_kind(b) != B_PRIVATE {
         return;
     }
-    for i in 0..PRIVATE.count {
-        if unsafe { PRIVATE.data[i] == b } {
+    for i in 0..pcx.private.count {
+        if unsafe { pcx.private.data[i] == b } {
             return;
         }
     }
-    PRIVATE.push(b);
+    pcx.private.push(b);
 }
 
-// (0.26.0) The fields (their Field nodes) used where they are private:
-// `fix --only pub` writes `pub` before each.
-static var PRIVATE_FIELDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Field f (a Field node) was used where it is private.
-pub fn note_private_field(f: i64) {
+pub fn note_private_field(f: i64, pcx: inout Ctx<Comp>) {
     if f <= 0 {
         return;
     }
-    for i in 0..PRIVATE_FIELDS.count {
-        if PRIVATE_FIELDS.get(i) == f {
+    for i in 0..pcx.private_fields.count {
+        if pcx.private_fields.get(i) == f {
             return;
         }
     }
-    PRIVATE_FIELDS.push(f);
+    pcx.private_fields.push(f);
 }
 
-// (0.26.0) The obsolete attributes written (`#[sealed]`): their start and
-// end, in pairs; `fix --only obsolete-attr` deletes each.
-static var OBSOLETE_ATTRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // The attribute SRC[start..end) is obsolete.
-pub fn note_obsolete_attr(start: i64, end: i64) {
-    OBSOLETE_ATTRS.push(start);
-    OBSOLETE_ATTRS.push(end);
+pub fn note_obsolete_attr(start: i64, end: i64, pcx: inout Ctx<Comp>) {
+    pcx.obsolete_attrs.push(start);
+    pcx.obsolete_attrs.push(end);
 }
 
 // The edits deleting the obsolete attributes: the attribute's line when
 // it is alone on it, else the attribute and the blanks after it; their
 // number.
-pub fn obsolete_attr_edits() -> i64 {
+pub fn obsolete_attr_edits(pcx: inout Ctx<Comp>) -> i64 {
     var fixes = 0;
     var i = 0;
-    while i + 1 < OBSOLETE_ATTRS.count {
-        var start = OBSOLETE_ATTRS.get(i);
-        var end = OBSOLETE_ATTRS.get(i + 1);
+    while i + 1 < pcx.obsolete_attrs.count {
+        var start = pcx.obsolete_attrs.get(i);
+        var end = pcx.obsolete_attrs.get(i + 1);
         i += 2;
-        if !user_pos(start) || !ref_in(start) {
+        if !user_pos(start, pcx) || !ref_in(start, &pcx) {
             continue;
         }
-        let f = file_of_pos(start);
-        let first = FILES[f].start;
-        let last = FILES[f].end;
+        let f = file_of_pos(start, pcx);
+        let first = pcx.files[f].start;
+        let last = pcx.files[f].end;
         var s = start;
         while s > first && (SRC[s - 1] == ' ' || SRC[s - 1] == '\t') {
             s -= 1;
@@ -184,7 +163,7 @@ pub fn obsolete_attr_edits() -> i64 {
         } else {
             end = e;
         }
-        if edit_replace(start, end, buf_new()) {
+        if edit_replace(start, end, buf_new(), &pcx) {
             fixes += 1;
         }
     }
@@ -193,20 +172,20 @@ pub fn obsolete_attr_edits() -> i64 {
 
 // Whether module m passes --in: its file, or it or a module it is in (a
 // child of the module given passes, as for ref_in; 0.13).
-fn module_in(m: i64) -> bool {
+fn module_in(m: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if OPT_IN == 0 as *u8 {
+        if pcx.opt_in == 0 as *u8 {
             return true;
         }
         var a = m;
         while a >= 0 {
-            if IN_MODULE.data[a] != 0 {
+            if pcx.in_module.data[a] != 0 {
                 return true;
             }
-            a = if a > 0 { MODULES[a].parent } else { -1 };
+            a = if a > 0 { pcx.modules[a].parent } else { -1 };
         }
-        for f in 0..crate::base::FILES.len() {
-            if FILES[f].module == m && IN_FILE.data[f] != 0 {
+        for f in 0..pcx.files.len() {
+            if pcx.files[f].module == m && pcx.in_file.data[f] != 0 {
                 return true;
             }
         }
@@ -216,35 +195,35 @@ fn module_in(m: i64) -> bool {
 
 // Whether module m's code is in a file of the program (not std's, the C
 // headers').
-fn user_module(m: i64) -> bool {
-    m >= 0 && !within_std(m) && m != C_MODULE
+fn user_module(m: i64, pcx: Ctx<Comp>) -> bool {
+    m >= 0 && !within_std(m, pcx) && m != pcx.c_module
 }
 
-fn user_pos(pos: i64) -> bool {
-    unsafe { FILES[file_of_pos(pos)].path[0] != '<' }
+fn user_pos(pos: i64, pcx: Ctx<Comp>) -> bool {
+    unsafe { pcx.files[file_of_pos(pos, pcx)].path[0] != '<' }
 }
 
 // ---- Missing imports ----
 
 // The path of Use node u (its segments before the imported names), as a
 // symbol: `crate::a::b`.
-fn use_path(u: i64) -> i64 {
-    let path = NODES[u].c;
+fn use_path(u: i64, pcx: Ctx<Comp>) -> i64 {
+    let path = pcx.nodes[u].c;
     let out = buf_new();
-    for i in 0..NODES[path].count {
+    for i in 0..pcx.nodes[path].count {
         if i > 0 {
             buf_str(out, c"::");
         }
-        buf_bytes(out, SYMS[NODES[child(path, i)].a].text);
+        buf_bytes(out, SYMS[pcx.nodes[child(path, i, pcx)].a].text);
     }
     intern(buf_slice(out))
 }
 
 // Whether Use node u, in module m, imports from the module of path p
 // (`crate::a`; written `a` in the root module).
-fn same_path(u: i64, m: i64, p: i64, tcx: inout Tcx<Comp>) -> bool {
-    let up = use_path(u);
-    if up == p || crate::tools::tidyimports::use_abs_path(u, m, &tcx) == p {
+fn same_path(u: i64, m: i64, p: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    let up = use_path(u, pcx);
+    if up == p || crate::tools::tidyimports::use_abs_path(u, m, &tcx, pcx) == p {
         return true;
     }
     let t = SYMS[p].text;
@@ -254,36 +233,36 @@ fn same_path(u: i64, m: i64, p: i64, tcx: inout Tcx<Comp>) -> bool {
 }
 
 // The Use items (not header imports, not `*`) of module m, by position.
-fn module_uses(m: i64, out: inout IntVec) {
-    for n in 1..NODES.len() as i64 {
-        if NODES[n].kind == NodeKind::Use && NODES[n].d != 2 && module_of(n) == m
-            && user_pos(NODES[n].start) {
+fn module_uses(m: i64, out: inout IntVec, pcx: inout Ctx<Comp>) {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Use && pcx.nodes[n].d != 2 && module_of(n, &pcx) == m
+            && user_pos(pcx.nodes[n].start, pcx) {
             out.push(n);
         }
     }
 }
 
 // The edits adding the missing imports; their number.
-fn missing_use_edits(tcx: inout Tcx<Comp>) -> i64 {
+fn missing_use_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var fixes = 0;
         var done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         // (0.16: the module, among several with the name: choose_path)
         var i = 0;
-        while i < MISSING.count {
-            let m = MISSING.data[i];
-            if user_module(m) && module_in(m) {
-                MISSING.data[i + 1] = choose_path(m, MISSING.data[i + 2], MISSING.data[i + 1],
-                    &tcx);
+        while i < pcx.missing.count {
+            let m = pcx.missing.data[i];
+            if user_module(m, pcx) && module_in(m, pcx) {
+                pcx.missing.data[i + 1] = choose_path(m, pcx.missing.data[i + 2],
+                    pcx.missing.data[i + 1], &tcx, &pcx);
             }
             i += 3;
         }
         i = 0;
-        while i < MISSING.count {
-            let m = MISSING.data[i];
-            let p = MISSING.data[i + 1];
+        while i < pcx.missing.count {
+            let m = pcx.missing.data[i];
+            let p = pcx.missing.data[i + 1];
             i += 3;
-            if p < 0 || !user_module(m) || !module_in(m) {
+            if p < 0 || !user_module(m, pcx) || !module_in(m, pcx) {
                 continue;
             }
             // (once per module and path, with all its names)
@@ -303,12 +282,12 @@ fn missing_use_edits(tcx: inout Tcx<Comp>) -> i64 {
             var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             var entries = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             var j = 0;
-            while j < MISSING.count {
+            while j < pcx.missing.count {
                 // (0.25.2.1: not a name a `use` of m imports already, nor
                 // one a fix of a `use` line of m spells: imported twice)
-                if MISSING.data[j] == m && MISSING.data[j + 1] == p
-                    && !imported_in(m, MISSING.data[j + 2]) {
-                    names.push(MISSING.data[j + 2]);
+                if pcx.missing.data[j] == m && pcx.missing.data[j + 1] == p
+                    && !imported_in(m, pcx.missing.data[j + 2], &pcx) {
+                    names.push(pcx.missing.data[j + 2]);
                     entries.push(j / 3);
                 }
                 j += 3;
@@ -317,16 +296,16 @@ fn missing_use_edits(tcx: inout Tcx<Comp>) -> i64 {
                 continue;
             }
             sort_syms(&names);
-            if add_import(m, p, names, &tcx) {
+            if add_import(m, p, names, &tcx, &pcx) {
                 fixes += names.count;
-                let e = last_replace();
+                let e = last_replace(pcx);
                 for x in 0..entries.count {
                     var at = 0;
                     var first = x == 0;
-                    while at + 1 < MISSING_AT.count {
-                        if MISSING_AT.data[at] == entries.data[x] {
+                    while at + 1 < pcx.missing_at.count {
+                        if pcx.missing_at.data[at] == entries.data[x] {
                             note_fix(e, 0, if first { names.count } else { 0 },
-                                MISSING_AT.data[at + 1], &tcx);
+                                pcx.missing_at.data[at + 1], &tcx);
                             first = false;
                         }
                         at += 2;
@@ -342,25 +321,25 @@ fn missing_use_edits(tcx: inout Tcx<Comp>) -> i64 {
 // not resolve: a wrong path), or a fix of one of its `use` lines writes
 // it (a did-you-mean of the imported name): an import of it would be a
 // second one.
-fn imported_in(m: i64, name: i64) -> bool {
+fn imported_in(m: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: NODES is the parser's table of nodes, a raw pointer (front/ast); SUGGESTED a static var (base/diag).
     // SAFETY: u is a Use node module_uses found and it a child of it (0 <= n < NODE_COUNT); SUGGESTED is read in fours below its count.
     unsafe {
         var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        module_uses(m, &uses);
+        module_uses(m, &uses, &pcx);
         for k in 0..uses.count {
             let u = uses.data[k];
-            for i in 0..NODES[u].count {
-                let it = child(u, i);
-                if (if NODES[it].b != 0 { NODES[it].b } else { NODES[it].a }) == name {
+            for i in 0..pcx.nodes[u].count {
+                let it = child(u, i, pcx);
+                if (if pcx.nodes[it].b != 0 { pcx.nodes[it].b } else { pcx.nodes[it].a }) == name {
                     return true;
                 }
             }
             var s = 0;
-            while s + 3 < SUGGESTED.count {
-                let at = SUGGESTED.data[s + 1];
-                if at >= NODES[u].start && at < NODES[u].end
-                    && crate::tools::proc::same_bytes(buf_slice(SUGGESTED.data[s + 3]),
+            while s + 3 < pcx.suggested.count {
+                let at = pcx.suggested.data[s + 1];
+                if at >= pcx.nodes[u].start && at < pcx.nodes[u].end
+                    && crate::tools::proc::same_bytes(buf_slice(pcx.suggested.data[s + 3]),
                         SYMS[name].text) {
                     return true;
                 }
@@ -388,17 +367,17 @@ fn sort_syms(v: inout IntVec) {
 // The edit importing `names` from the module of path p into module m:
 // into a `use` of that module, else a `use` line after m's last one (or
 // before its first item).
-fn add_import(m: i64, p: i64, names: IntVec, tcx: inout Tcx<Comp>) -> bool {
+fn add_import(m: i64, p: i64, names: IntVec, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        module_uses(m, &uses);
+        module_uses(m, &uses, &pcx);
         for k in 0..uses.count {
             let u = uses.data[k];
-            if NODES[u].b == 1 || !same_path(u, m, p, &tcx) || NODES[u].count == 0 {
+            if pcx.nodes[u].b == 1 || !same_path(u, m, p, &tcx, pcx) || pcx.nodes[u].count == 0 {
                 continue;
             }
-            let last = child(u, NODES[u].count - 1);
-            let braces = brace_after(NODES[NODES[u].c].end, NODES[u].end);
+            let last = child(u, pcx.nodes[u].count - 1, pcx);
+            let braces = brace_after(pcx.nodes[pcx.nodes[u].c].end, pcx.nodes[u].end);
             let text = buf_new();
             if braces {
                 // `use p::{a, b};` -> `use p::{a, b, NAME};`
@@ -406,27 +385,27 @@ fn add_import(m: i64, p: i64, names: IntVec, tcx: inout Tcx<Comp>) -> bool {
                     buf_str(text, c", ");
                     buf_bytes(text, SYMS[names.data[x]].text);
                 }
-                return edit_replace(NODES[last].end, NODES[last].end, text);
+                return edit_replace(pcx.nodes[last].end, pcx.nodes[last].end, text, &pcx);
             }
             // `use p::a;` (or `use p::a as b;`) -> `use p::{a, NAME};`
-            var semi = NODES[u].end;
-            while semi > NODES[last].start && SRC[semi - 1] != ';' {
+            var semi = pcx.nodes[u].end;
+            while semi > pcx.nodes[last].start && SRC[semi - 1] != ';' {
                 semi -= 1;
             }
             buf_byte(text, '{');
-            buf_bytes(text, SRC[NODES[last].start..semi - 1]);
+            buf_bytes(text, SRC[pcx.nodes[last].start..semi - 1]);
             for x in 0..names.count {
                 buf_str(text, c", ");
                 buf_bytes(text, SYMS[names.data[x]].text);
             }
             buf_byte(text, '}');
-            return edit_replace(NODES[last].start, semi - 1, text);
+            return edit_replace(pcx.nodes[last].start, semi - 1, text, &pcx);
         }
         // A new line.
         let line = buf_new();
         buf_str(line, c"use ");
         // (0.14: a child module's path as the module writes them)
-        let styled = styled_path(p, m, relative_style(m, &tcx), &tcx);
+        let styled = styled_path(p, m, relative_style(m, &tcx, &pcx), &tcx, pcx);
         buf_bytes(line, SYMS[styled].text);
         buf_str(line, c"::");
         if names.count > 1 {
@@ -444,30 +423,30 @@ fn add_import(m: i64, p: i64, names: IntVec, tcx: inout Tcx<Comp>) -> bool {
         buf_byte(line, ';');
         if uses.count > 0 {
             let u = uses.data[uses.count - 1];
-            let at = line_end(NODES[u].end - 1);
+            let at = line_end(pcx.nodes[u].end - 1, pcx);
             let text = buf_new();
             buf_byte(text, '\n');
-            buf_bytes(text, indent_of(NODES[u].start));
+            buf_bytes(text, indent_of(pcx.nodes[u].start, pcx));
             buf_bytes(text, buf_slice(line));
-            return edit_replace(at, at, text);
+            return edit_replace(at, at, text, &pcx);
         }
         // Before the module's first item (and its comments).
         var first = -1;
-        for d in 0..DEFS.len() as i64 {
-            if DEFS[d].module == m && DEFS[d].parent < 0 && user_pos(DEFS[d].start)
-                && (first < 0 || DEFS[d].start < DEFS[first].start) {
+        for d in 0..pcx.defs.len() as i64 {
+            if pcx.defs[d].module == m && pcx.defs[d].parent < 0 && user_pos(pcx.defs[d].start, pcx)
+                && (first < 0 || pcx.defs[d].start < pcx.defs[first].start) {
                 first = d;
             }
         }
         if first < 0 {
             return false;
         }
-        let at = line_start(text_start(first));
+        let at = line_start(text_start(first, pcx), pcx);
         let text = buf_new();
-        buf_bytes(text, indent_of(DEFS[first].start));
+        buf_bytes(text, indent_of(pcx.defs[first].start, pcx));
         buf_bytes(text, buf_slice(line));
         buf_str(text, c"\n\n");
-        edit_replace(at, at, text)
+        edit_replace(at, at, text, &pcx)
     }
 }
 
@@ -489,23 +468,23 @@ fn brace_after(from: i64, to: i64) -> bool {
 // each imported name are counted in one pass over the tokens, which are
 // not in position order: std's sections, derived impls and test code are
 // lexed after the files.)
-fn named_in_file(name: i64, f: i64, u: i64) -> bool {
-    if NAMED_TOKENS != TOK_COUNT || NAMED_SYMS < SYMS.len() as i64 {
-        count_imported_names();
+fn named_in_file(name: i64, f: i64, u: i64, pcx: inout Ctx<Comp>) -> bool {
+    if pcx.named_tokens != pcx.toks.len() as i64 || pcx.named_syms < SYMS.len() as i64 {
+        count_imported_names(&pcx);
     }
     // (by module: a module may have several files, std's root its flat/
     // ones, a root given with other files)
-    let total = NAMED.get(named_key(name, file_at_index(f).module));
+    let total = pcx.named.get(named_key(name, file_at_index(f, pcx).module));
     // (the times u itself writes it: its path's words, its names)
     var inside = 0;
-    let path = node_at(node_at(u).c);
+    let path = node_at(node_at(u, pcx).c, pcx);
     for i in 0..path.count {
-        if node_at(child(node_at(u).c, i)).a == name {
+        if node_at(child(node_at(u, pcx).c, i, pcx), pcx).a == name {
             inside += 1;
         }
     }
-    for k in 0..node_at(u).count {
-        let id = node_at(child(u, k));
+    for k in 0..node_at(u, pcx).count {
+        let id = node_at(child(u, k, pcx), pcx);
         if id.a == name {
             inside += 1;
         }
@@ -516,27 +495,21 @@ fn named_in_file(name: i64, f: i64, u: i64) -> bool {
     total > inside
 }
 
-// (file, symbol) -> how often the file writes the symbol, for the names
-// the program's imports bring; made for NAMED_TOKENS tokens.
-static var NAMED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var NAMED_TOKENS: i64 = -1;
-static var NAMED_SYMS: i64 = 0;
-
 fn named_key(name: i64, m: i64) -> i64 {
     name * 1048576 + m + 1
 }
 
-fn count_imported_names() {
-    NAMED = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    NAMED_TOKENS = TOK_COUNT;
-    NAMED_SYMS = SYMS.len() as i64;
+fn count_imported_names(pcx: inout Ctx<Comp>) {
+    pcx.named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+    pcx.named_tokens = pcx.toks.len() as i64;
+    pcx.named_syms = SYMS.len() as i64;
     // (the names imported: the only ones counted)
     var wanted = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    for u in 1..NODES.len() as i64 {
-        let n = node_at(u);
+    for u in 1..pcx.nodes.len() as i64 {
+        let n = node_at(u, pcx);
         if n.kind == NodeKind::Use && n.d != 2 {
             for k in 0..n.count {
-                let id = node_at(child(u, k));
+                let id = node_at(child(u, k, pcx), pcx);
                 wanted.put((if id.b != 0 { id.b } else { id.a }) + 1, 1);
             }
         }
@@ -545,85 +518,88 @@ fn count_imported_names() {
     var module = 0;
     var lo = 0;
     var hi = 0;
-    for i in 0..TOK_COUNT {
-        let t = token_at_index(i);
+    for i in 0..pcx.toks.len() as i64 {
+        let t = token_at_index(i, pcx);
         if t.kind != Tok::Ident || wanted.get(t.value as i64 + 1) == 0 {
             continue;
         }
         if t.start < lo || t.start >= hi {
-            let file = file_at_index(file_of_pos(t.start));
+            let file = file_at_index(file_of_pos(t.start, pcx), pcx);
             module = file.module;
             lo = file.start;
             hi = file.end;
         }
         let key = named_key(t.value as i64, module);
-        NAMED.put(key, NAMED.get(key) + 1);
+        pcx.named.put(key, pcx.named.get(key) + 1);
     }
     // (0.26.2: a name in a format literal's hole, `"{NAME}"`, one of the
     // Ident nodes front/check/format.vl made at its place in the text)
-    for n in 1..NODES.len() as i64 {
-        let interp = node_at(n);
+    for n in 1..pcx.nodes.len() as i64 {
+        let interp = node_at(n, pcx);
         if interp.kind != NodeKind::Interp || SRC[interp.start] == 'f' {
             continue;
         }
         for k in 0..interp.count {
-            let hole = node_at(child(n, k));
+            let hole = node_at(child(n, k, pcx), pcx);
             if hole.kind != NodeKind::InterpHole {
                 continue;
             }
             for x in [hole.a, hole.g, hole.h] {
-                if x <= 0 || node_at(x).kind != NodeKind::Ident || wanted.get(node_at(x).a + 1) == 0
-                    || node_at(x).start <= interp.start || node_at(x).start >= interp.end {
+                if x <= 0 || node_at(x, pcx).kind != NodeKind::Ident
+                    || wanted.get(node_at(x, pcx).a + 1) == 0
+                    || node_at(x, pcx).start <= interp.start
+                    || node_at(x, pcx).start >= interp.end {
                     continue;
                 }
-                let key = named_key(node_at(x).a,
-                    file_at_index(file_of_pos(node_at(x).start)).module);
-                NAMED.put(key, NAMED.get(key) + 1);
+                let key = named_key(node_at(x, pcx).a,
+                    file_at_index(file_of_pos(node_at(x, pcx).start, pcx), pcx).module);
+                pcx.named.put(key, pcx.named.get(key) + 1);
             }
         }
     }
 }
 
 // Node n, token i, file f (copies).
-fn node_at(n: i64) -> crate::front::ast::Node {
-    NODES[n]
+fn node_at(n: i64, pcx: Ctx<Comp>) -> crate::front::ast::Node {
+    pcx.nodes[n]
 }
 
-fn token_at_index(i: i64) -> crate::front::lexer::Token {
+fn token_at_index(i: i64, pcx: Ctx<Comp>) -> crate::front::lexer::Token {
     // UNSAFE: TOKS is the lexer's table of tokens, a raw pointer.
     // SAFETY: 0 <= i < TOK_COUNT (the caller's loop), the tokens lexed.
-    unsafe { TOKS[i] }
+    unsafe { pcx.toks[i] }
 }
 
-fn file_at_index(f: i64) -> crate::base::SourceFile {
-    FILES[f]
+fn file_at_index(f: i64, pcx: Ctx<Comp>) -> crate::base::SourceFile {
+    pcx.files[f]
 }
 
 // The edits removing the imports nothing in their file names (a name
 // written anywhere in the file keeps its import: a local of that name
 // too); their number. `pub use` items are kept (other modules may use
 // what they bring).
-fn unused_import_edits(only_report: *IntVec) -> i64 {
+fn unused_import_edits(only_report: *IntVec, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var fixes = 0;
-        for u in 1..NODES.len() as i64 {
-            if NODES[u].kind != NodeKind::Use || NODES[u].d == 2 || NODES[u].b == 1
-                || (NODES[u].p & ITEM_PUBLIC) != 0 {
+        for u in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[u].kind != NodeKind::Use || pcx.nodes[u].d == 2 || pcx.nodes[u].b == 1
+                || (pcx.nodes[u].p & ITEM_PUBLIC) != 0 {
                 continue;
             }
-            if !user_pos(NODES[u].start) || !user_module(module_of(u)) || !ref_in(NODES[u].start) {
+            if !user_pos(pcx.nodes[u].start, pcx) || !user_module(module_of(u, &pcx), pcx)
+                || !ref_in(pcx.nodes[u].start, &pcx) {
                 continue;
             }
-            let f = file_of_pos(NODES[u].start);
-            let n = NODES[u].count;
+            let f = file_of_pos(pcx.nodes[u].start, pcx);
+            let n = pcx.nodes[u].count;
             var unused = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for k in 0..n {
-                let id = child(u, k);
-                let local = if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a };
+                let id = child(u, k, pcx);
+                let local = if pcx.nodes[id].b != 0 { pcx.nodes[id].b } else { pcx.nodes[id].a };
                 // (an import other modules import or name through is used:
                 // `use crate::name` reaching the root's import, 0.12)
-                if !named_in_file(local, f, u)
-                    && !reached_through(module_of(u), local) {
+                if !named_in_file(local, f, u, &pcx)
+                    && !reached_through(module_of(u, &pcx), local, &pcx) {
                     unused.push(k);
                 }
             }
@@ -632,11 +608,11 @@ fn unused_import_edits(only_report: *IntVec) -> i64 {
             }
             if only_report != 0 as *IntVec {
                 for k in 0..unused.count {
-                    only_report.push(child(u, unused.data[k]));
+                    only_report.push(child(u, unused.data[k], pcx));
                 }
                 continue;
             }
-            fixes += remove_use_names(u, unused);
+            fixes += remove_use_names(u, unused, &pcx);
         }
         fixes
     }
@@ -645,19 +621,19 @@ fn unused_import_edits(only_report: *IntVec) -> i64 {
 // The edits removing names `unused` (their indexes) of Use node u: the
 // whole `use` when it is all of them, `use p::a;` for `use p::{a, b};`
 // when one is left (0.17: also for rewrite). The number removed.
-pub fn remove_use_names(u: i64, unused: IntVec) -> i64 {
+pub fn remove_use_names(u: i64, unused: IntVec, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let n = NODES[u].count;
+        let n = pcx.nodes[u].count;
         if unused.count == n {
-            let head = node_head(NODES[u].start);
-            if blank_before(head) && blank_after(NODES[u].end) {
-                delete_lines(line_start(head), NODES[u].end);
+            let head = node_head(pcx.nodes[u].start, pcx);
+            if blank_before(head, pcx) && blank_after(pcx.nodes[u].end, pcx) {
+                delete_lines(line_start(head, pcx), pcx.nodes[u].end, &pcx);
             } else {
-                edit_replace(head, NODES[u].end, buf_new());
+                edit_replace(head, pcx.nodes[u].end, buf_new(), &pcx);
             }
             return n;
         }
-        if n - unused.count == 1 && one_line_braces(u) {
+        if n - unused.count == 1 && one_line_braces(u, pcx) {
             // (one name left: `use p::{a};` is `use p::a;`)
             var kept = 0;
             for k in 0..n {
@@ -668,24 +644,24 @@ pub fn remove_use_names(u: i64, unused: IntVec) -> i64 {
                     }
                 }
                 if !gone {
-                    kept = child(u, k);
+                    kept = child(u, k, pcx);
                 }
             }
-            var open = NODES[NODES[u].c].end;
+            var open = pcx.nodes[pcx.nodes[u].c].end;
             while SRC[open] != '{' {
                 open += 1;
             }
-            var close = NODES[u].end;
+            var close = pcx.nodes[u].end;
             while SRC[close] != '}' {
                 close -= 1;
             }
             let text = buf_new();
-            buf_bytes(text, SRC[NODES[kept].start..NODES[kept].end]);
-            return if edit_replace(open, close + 1, text) { unused.count } else { 0 };
+            buf_bytes(text, SRC[pcx.nodes[kept].start..pcx.nodes[kept].end]);
+            return if edit_replace(open, close + 1, text, &pcx) { unused.count } else { 0 };
         }
         var fixes = 0;
         for k in 0..unused.count {
-            if remove_use_name(u, unused.data[k]) {
+            if remove_use_name(u, unused.data[k], &pcx) {
                 fixes += 1;
             }
         }
@@ -694,13 +670,14 @@ pub fn remove_use_names(u: i64, unused: IntVec) -> i64 {
 }
 
 // Whether Use node u lists its names between braces, on one line.
-fn one_line_braces(u: i64) -> bool {
-    brace_after(NODES[NODES[u].c].end, NODES[u].end) && same_line(NODES[u].start, NODES[u].end)
+fn one_line_braces(u: i64, pcx: Ctx<Comp>) -> bool {
+    brace_after(pcx.nodes[pcx.nodes[u].c].end, pcx.nodes[u].end)
+        && same_line(pcx.nodes[u].start, pcx.nodes[u].end, pcx)
 }
 
 // Whether only blanks are before pos on its line.
-fn blank_before(pos: i64) -> bool {
-    var p = line_start(pos);
+fn blank_before(pos: i64, pcx: Ctx<Comp>) -> bool {
+    var p = line_start(pos, pcx);
     while p < pos && (SRC[p] == ' ' || SRC[p] == '\t') {
         p += 1;
     }
@@ -708,8 +685,8 @@ fn blank_before(pos: i64) -> bool {
 }
 
 // Whether only blanks (or a comment) are after pos on its line.
-fn blank_after(pos: i64) -> bool {
-    let e = line_end(pos);
+fn blank_after(pos: i64, pcx: Ctx<Comp>) -> bool {
+    let e = line_end(pos, pcx);
     var p = pos;
     while p < e && (SRC[p] == ' ' || SRC[p] == '\t' || SRC[p] == '\r') {
         p += 1;
@@ -720,123 +697,124 @@ fn blank_after(pos: i64) -> bool {
 // The edit removing name k of Use node u (one of several between braces),
 // with its separator: `a, b, c` loses `b, ` (its line, when it is alone
 // on it), the last loses `, c`.
-pub fn remove_use_name(u: i64, k: i64) -> bool {
-    let id = child(u, k);
-    let a = NODES[id].start;
-    let b = NODES[id].end;
-    let n = NODES[u].count;
+pub fn remove_use_name(u: i64, k: i64, pcx: inout Ctx<Comp>) -> bool {
+    let id = child(u, k, pcx);
+    let a = pcx.nodes[id].start;
+    let b = pcx.nodes[id].end;
+    let n = pcx.nodes[u].count;
     if k + 1 < n {
-        let next = NODES[child(u, k + 1)].start;
-        if blank_before(a) && !same_line(b, next) {
+        let next = pcx.nodes[child(u, k + 1, pcx)].start;
+        if blank_before(a, pcx) && !same_line(b, next, pcx) {
             // alone on its line: the line
-            return edit_replace(line_start(a), after_line(b), buf_new());
+            return edit_replace(line_start(a, pcx), after_line(b, pcx), buf_new(), &pcx);
         }
-        if same_line(b, next) {
-            return edit_replace(a, next, buf_new());
+        if same_line(b, next, pcx) {
+            return edit_replace(a, next, buf_new(), &pcx);
         }
         // last on its line: `, NAME` (from the end of the one before)
-        if k > 0 && same_line(NODES[child(u, k - 1)].end, a) {
-            return edit_replace(NODES[child(u, k - 1)].end, b, buf_new());
+        if k > 0 && same_line(pcx.nodes[child(u, k - 1, pcx)].end, a, pcx) {
+            return edit_replace(pcx.nodes[child(u, k - 1, pcx)].end, b, buf_new(), &pcx);
         }
-        return edit_replace(a, next, buf_new());
+        return edit_replace(a, next, buf_new(), &pcx);
     }
     // The last name: from the end of the one before.
-    let prev = NODES[child(u, k - 1)].end;
-    if blank_before(a) && !same_line(prev, a) {
+    let prev = pcx.nodes[child(u, k - 1, pcx)].end;
+    if blank_before(a, pcx) && !same_line(prev, a, pcx) {
         var e = b;
         if SRC[e] == ',' {
             e += 1;
         }
-        if blank_after(e) {
-            return edit_replace(line_start(a), after_line(b), buf_new());
+        if blank_after(e, pcx) {
+            return edit_replace(line_start(a, pcx), after_line(b, pcx), buf_new(), &pcx);
         }
     }
-    edit_replace(prev, b, buf_new())
+    edit_replace(prev, b, buf_new(), &pcx)
 }
 
-fn same_line(a: i64, b: i64) -> bool {
-    line_start(a) == line_start(b)
+fn same_line(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
+    line_start(a, pcx) == line_start(b, pcx)
 }
 
 // ---- pub ----
 
 // The edits making the private items used elsewhere public; their number.
-fn pub_edits(tcx: inout Tcx<Comp>) -> i64 {
+fn pub_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var fixes = 0;
-        for i in 0..PRIVATE.count {
-            let key = binding_value(PRIVATE.data[i]);
-            var node = item_node_of(key);
+        for i in 0..pcx.private.count {
+            let key = binding_value(pcx.private.data[i]);
+            var node = item_node_of(key, pcx);
             if node == 0 {
                 // a module: its `mod` item
-                for m in 1..module_count() {
-                    if MODULES[m].key == key && MOD_DEF.data[m] >= 0 {
-                        node = DEFS[MOD_DEF.data[m]].node;
+                for m in 1..module_count(pcx) {
+                    if pcx.modules[m].key == key && pcx.mod_def.data[m] >= 0 {
+                        node = pcx.defs[pcx.mod_def.data[m]].node;
                     }
                 }
             }
-            if node == 0 || (NODES[node].p & ITEM_PUBLIC) != 0 || !user_pos(NODES[node].start)
-                || !ref_in(NODES[node].start) {
+            if node == 0 || (pcx.nodes[node].p & ITEM_PUBLIC) != 0
+                || !user_pos(pcx.nodes[node].start, pcx)
+                || !ref_in(pcx.nodes[node].start, &pcx) {
                 continue;
             }
             let text = buf_new();
             // (0.26.2: `pub(self) fn` becomes `pub fn`)
-            let (ss, se) = crate::front::modules::vis::self_span(NODES[node].start);
+            let (ss, se) = crate::front::modules::vis::self_span(pcx.nodes[node].start);
             buf_str(text, if ss >= 0 { c"pub" } else { c"pub " });
-            if edit_replace(if ss >= 0 { ss } else { NODES[node].start },
-                if ss >= 0 { se } else { NODES[node].start }, text) {
-                note_fix(last_replace(), 3, 1, -1, &tcx);
+            if edit_replace(if ss >= 0 { ss } else { pcx.nodes[node].start },
+                if ss >= 0 { se } else { pcx.nodes[node].start }, text, &pcx) {
+                note_fix(last_replace(pcx), 3, 1, -1, &tcx);
                 fixes += 1;
             }
         }
         // (0.26.0) the private fields used elsewhere
-        for i in 0..PRIVATE_FIELDS.count {
-            let f = PRIVATE_FIELDS.data[i];
-            if (NODES[f].p & ITEM_PUBLIC) != 0 || !user_pos(NODES[f].start)
-                || !ref_in(NODES[f].start) {
+        for i in 0..pcx.private_fields.count {
+            let f = pcx.private_fields.data[i];
+            if (pcx.nodes[f].p & ITEM_PUBLIC) != 0 || !user_pos(pcx.nodes[f].start, pcx)
+                || !ref_in(pcx.nodes[f].start, &pcx) {
                 continue;
             }
             let text = buf_new();
-            let (ss, se) = crate::front::modules::vis::self_span(NODES[f].start);
+            let (ss, se) = crate::front::modules::vis::self_span(pcx.nodes[f].start);
             buf_str(text, if ss >= 0 { c"pub" } else { c"pub " });
-            if edit_replace(if ss >= 0 { ss } else { NODES[f].start },
-                if ss >= 0 { se } else { NODES[f].start }, text) {
-                note_fix(last_replace(), 3, 1, -1, &tcx);
+            if edit_replace(if ss >= 0 { ss } else { pcx.nodes[f].start },
+                if ss >= 0 { se } else { pcx.nodes[f].start }, text, &pcx) {
+                note_fix(last_replace(pcx), 3, 1, -1, &tcx);
                 fixes += 1;
             }
         }
         // (0.26.2) the restricted ones used outside their restriction
-        fixes += crate::tools::fix::vis::widen_edits(&tcx);
+        fixes += crate::tools::fix::vis::widen_edits(&tcx, &pcx);
         fixes
     }
 }
 
 // The imports nothing names (query unused): their Ident nodes, into out.
-pub fn unused_imports(out: *IntVec) {
-    unused_import_edits(out);
+pub fn unused_imports(out: *IntVec, pcx: inout Ctx<Comp>) {
+    unused_import_edits(out, &pcx);
 }
 
 // (0.25.2) `check` and a build: each import nothing in its file names is
 // a warning, `use.unused` (an error with --deny-warnings), whose try:
 // line removes them all; not std's, not a `pub use`, not one that failed
 // (an error already).
-pub fn report_unused_imports() {
+pub fn report_unused_imports(pcx: inout Ctx<Comp>) {
     var ids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     // (every one: a query's --in, not read yet when the program is
     // checked, is for its own answer)
-    let opt_in = OPT_IN;
-    OPT_IN = 0 as *u8;
-    unused_import_edits(&ids);
-    OPT_IN = opt_in;
+    let opt_in = pcx.opt_in;
+    pcx.opt_in = 0 as *u8;
+    unused_import_edits(&ids, &pcx);
+    pcx.opt_in = opt_in;
     if ids.count == 0 {
         return;
     }
     let tries = buf_new();
-    buf_tool_command(tries, c_slice(c"fix --only unused"), true);
+    buf_tool_command(tries, c_slice(c"fix --only unused"), true, pcx);
     for id in (&ids).items() {
-        let n = node_at(id);
+        let n = node_at(id, pcx);
         let local = if n.b != 0 { n.b } else { n.a };
-        if name_failed(local) {
+        if name_failed(local, pcx) {
             continue;
         }
         let msg = buf_new();
@@ -845,7 +823,7 @@ pub fn report_unused_imports() {
         buf_str(msg, c"': nothing in this file names it");
         buf_byte(msg, 0);
         report_error_tries(n.start, 7001, c"use.unused", buf_slice(msg).ptr,
-            c"remove it (`volec fix` removes every unused import)", buf_slice(tries), true);
+            c"remove it (`volec fix` removes every unused import)", buf_slice(tries), true, &pcx);
     }
 }
 
@@ -857,30 +835,30 @@ pub fn report_unused_imports() {
 // those of errors with a code in CODES when it is set (`--codes`); a
 // conversion that loses the value is not made (verify::refusal_of, a
 // `note fix.refused`); each fix made is noted for verify_fixes.
-pub fn suggested_edits(tcx: inout Tcx<Comp>) -> i64 {
+pub fn suggested_edits(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var fixes = 0;
         var i = 0;
         var k = 0;
-        while i + 3 < SUGGESTED.count {
-            let pos = SUGGESTED.data[i];
-            let start = SUGGESTED.data[i + 1];
-            let end = SUGGESTED.data[i + 2];
-            let text = SUGGESTED.data[i + 3];
-            let kind = if k < SUGGESTED_KIND.count { SUGGESTED_KIND.data[k] } else { -1 };
+        while i + 3 < pcx.suggested.count {
+            let pos = pcx.suggested.data[i];
+            let start = pcx.suggested.data[i + 1];
+            let end = pcx.suggested.data[i + 2];
+            let text = pcx.suggested.data[i + 3];
+            let kind = if k < pcx.suggested_kind.count { pcx.suggested_kind.data[k] } else { -1 };
             i += 4;
             k += 1;
-            if !user_pos(start) || (OPT_IN != 0 as *u8 && !ref_in(start))
+            if !user_pos(start, pcx) || (pcx.opt_in != 0 as *u8 && !ref_in(start, &pcx))
                 || !code_taken(kind, tcx) {
                 continue;
             }
-            let why = refusal_of(start, end, text);
+            let why = refusal_of(start, end, text, pcx);
             if why.len > 0 {
-                note_refused(pos, buf_slice(text), why, &tcx);
+                note_refused(pos, buf_slice(text), why, &tcx, pcx);
                 continue;
             }
-            if edit_replace(start, end, text) {
-                note_fix(last_replace(), 10, 1, pos, &tcx);
+            if edit_replace(start, end, text, &pcx) {
+                note_fix(last_replace(pcx), 10, 1, pos, &tcx);
                 fixes += 1;
             }
         }

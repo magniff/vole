@@ -1,22 +1,24 @@
 // The command line of the module refactorings and rename (made by
 // `refactor split crate::refactor_mod --auto`, then renamed).
 
-use crate::base::{FILES, IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use std::Arena;
+
+use crate::base::{IntVec, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_FLAG, EV_OPTION, EV_WORD, Leaf, flag, option};
-use crate::front::ast::{NODES, NodeKind};
-use crate::front::modules::{MODULES, child_module, file_of_pos};
+use crate::front::ast::NodeKind;
+use crate::front::embed::wgsl::WgslCx;
+use crate::front::modules::{child_module, file_of_pos};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::apply::{apply_edit, finish_edit, prepare_edit, set_command};
 use crate::tools::edit::cli::{edit_opts, take_edit_event};
 use crate::tools::query::{c_slice, parse_count, resolve_name, root_or_diag};
 use crate::tools::query::command_line::load_program;
-use crate::tools::query::defs::{
-    DEFS, K_IMPL_METHOD, K_MOD, K_TRAIT_FN, bytes_eq, mod_fqn_text, trait_of,
-};
+use crate::tools::query::defs::{K_IMPL_METHOD, K_MOD, K_TRAIT_FN, bytes_eq, mod_fqn_text, trait_of};
 use crate::tools::query::diagnostics::{
-    PROG, diag, program_errors, put_word, try_begin, try_end, write_diags,
+    diag, program_errors, put_word, try_begin, try_end, write_diags,
 };
 use crate::tools::query::names::canonical_name;
 use crate::tools::query::show::find_modules;
@@ -31,17 +33,17 @@ use crate::tools::tidyimports::tidy_round;
 
 // Whether node u is a `use` of names (not a `*`, not a C header's import),
 // in a file of the program.
-pub fn is_name_use(u: i64) -> bool {
-    NODES[u].kind == NodeKind::Use && NODES[u].d != 2 && NODES[u].b != 1
-        && user_pos(NODES[u].start)
+pub fn is_name_use(u: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.nodes[u].kind == NodeKind::Use && pcx.nodes[u].d != 2 && pcx.nodes[u].b != 1
+        && user_pos(pcx.nodes[u].start, pcx)
 }
 
-pub fn user_pos(pos: i64) -> bool {
-    unsafe { FILES[file_of_pos(pos)].path[0] != '<' }
+pub fn user_pos(pos: i64, pcx: Ctx<Comp>) -> bool {
+    unsafe { pcx.files[file_of_pos(pos, pcx)].path[0] != '<' }
 }
 
 // The edit, applied: summary `what`; refused when its edits overlap.
-pub fn finish(what: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn finish(what: i64, root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     if tcx.cli_edit_failed {
         let d = diag(c"error", c"refactor.internal", &tcx);
         buf_str(d,
@@ -49,39 +51,39 @@ pub fn finish(what: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         return 1;
     }
     if !tcx.tidy_after || tcx.opt_no_tidy {
-        return apply_edit(buf_slice(what), root, &tcx);
+        return apply_edit(buf_slice(what), root, &tcx, &pcx);
     }
     // (move and split: the imports of the files edited, tidied)
-    let status = prepare_edit(&tcx);
+    let status = prepare_edit(&tcx, &pcx);
     if status >= 0 {
         return status;
     }
-    tidy_round(root, &tcx);
-    finish_edit(buf_slice(what), root, &tcx)
+    tidy_round(root, &tcx, pcx);
+    finish_edit(buf_slice(what), root, &tcx, &pcx)
 }
 
-pub fn usage(message: *u8, example: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn usage(message: *u8, example: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"refactor.usage", &tcx);
     buf_str(d, message);
     buf_byte(d, '\n');
     if example != 0 as *u8 {
-        let out = try_begin(example, c_slice(c""), false, &tcx);
+        let out = try_begin(example, c_slice(c""), false, &tcx, pcx);
         try_end(out);
     }
     2
 }
 
 // A path that names no module.
-pub fn no_module(name: [u8], cmd: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn no_module(name: [u8], cmd: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"refactor.no-module", &tcx);
     buf_str(d, c"no module '");
     buf_bytes(d, name);
     buf_str(d, c"'\n");
     if cmd != 0 as *u8 {
-        let out = try_begin(cmd, name, true, &tcx);
+        let out = try_begin(cmd, name, true, &tcx, pcx);
         try_end(out);
     } else {
-        let out = try_begin(c"items", c_slice(c""), false, &tcx);
+        let out = try_begin(c"items", c_slice(c""), false, &tcx, pcx);
         try_end(out);
     }
     1
@@ -89,12 +91,12 @@ pub fn no_module(name: [u8], cmd: *u8, tcx: inout Tcx<Comp>) -> i64 {
 
 // Keeps the definitions in the program's files (std's and the C headers'
 // aside), unless there are none.
-pub fn keep_source(matches: inout IntVec) {
+pub fn keep_source(matches: inout IntVec, pcx: Ctx<Comp>) {
     unsafe {
         var kept = 0;
         for i in 0..matches.count {
             let d = matches.data[i];
-            if user_pos(DEFS[d].start) {
+            if user_pos(pcx.defs[d].start, pcx) {
                 matches.data[kept] = d;
                 kept += 1;
             }
@@ -106,7 +108,8 @@ pub fn keep_source(matches: inout IntVec) {
 }
 
 // NAME names several definitions: the first ones, as the command to run.
-pub fn ambiguous(cmd: *u8, name: [u8], rest: [u8], matches: IntVec, tcx: inout Tcx<Comp>) {
+pub fn ambiguous(cmd: *u8, name: [u8], rest: [u8], matches: IntVec, tcx: inout Tcx<Comp>,
+    pcx: Ctx<Comp>) {
     unsafe {
         let n = matches.count;
         let d = diag(c"error", c"query.ambiguous", &tcx);
@@ -118,14 +121,14 @@ pub fn ambiguous(cmd: *u8, name: [u8], rest: [u8], matches: IntVec, tcx: inout T
             if i == 3 || (i == 2 && n > 3) {
                 break;
             }
-            let out = try_begin(cmd, SYMS[DEFS[matches.data[i]].fqn].text, true, &tcx);
+            let out = try_begin(cmd, SYMS[pcx.defs[matches.data[i]].fqn].text, true, &tcx, pcx);
             if rest.len > 0 {
                 put_word(out, rest);
             }
             try_end(out);
         }
         if n > 3 {
-            let out = try_begin(c"def", name, true, &tcx);
+            let out = try_begin(c"def", name, true, &tcx, pcx);
             try_end(out);
         }
     }
@@ -137,21 +140,21 @@ fn buf_int_n(out: i64, n: i64) {
 
 // The one definition NAME names in the program's files (for command cmd,
 // `rest` its other words), or -1 after the diagnostic.
-pub fn one_definition(cmd: *u8, name: [u8], rest: [u8], tcx: inout Tcx<Comp>) -> i64 {
+pub fn one_definition(cmd: *u8, name: [u8], rest: [u8], tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !resolve_name(c"def", name, &matches, &tcx) {
+        if !resolve_name(c"def", name, &matches, &tcx, &pcx) {
             return -1;
         }
-        keep_source(&matches);
+        keep_source(&matches, pcx);
         if matches.count > 1 {
-            ambiguous(cmd, name, rest, matches, &tcx);
+            ambiguous(cmd, name, rest, matches, &tcx, pcx);
             return -1;
         }
         let d = matches.data[0];
-        if !user_pos(DEFS[d].start) {
+        if !user_pos(pcx.defs[d].start, pcx) {
             let e = diag(c"error", c"edit.not-source", &tcx);
-            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_bytes(e, SYMS[pcx.defs[d].fqn].text);
             buf_str(e, c" is not in a file of the program\n");
             return -1;
         }
@@ -187,14 +190,14 @@ pub fn is_ident(s: [u8]) -> bool {
 }
 
 // The module a path names (`crate`, `crate::a::b`, or its end), or -1.
-pub fn module_named(name: [u8], tcx: inout Tcx<Comp>) -> i64 {
+pub fn module_named(name: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        find_modules(name, false, &found, &tcx);
+        find_modules(name, false, &found, &tcx, pcx);
         var best = -1;
         for i in 0..found.count {
             let m = found.data[i];
-            if bytes_eq(mod_fqn_text(m, &tcx), name) {
+            if bytes_eq(mod_fqn_text(m, &tcx, pcx), name) {
                 return m;
             }
             best = if best < 0 { m } else { -2 };
@@ -233,8 +236,9 @@ pub fn path_segments(path0: [u8], out: inout IntVec) -> bool {
     true
 }
 
-pub fn run_refactor_mod(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    let status = run_inner(c, &tcx);
+pub fn run_refactor_mod(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>,
+    wgx: inout WgslCx<Arena>) -> i64 {
+    let status = run_inner(c, &tcx, &pcx, &wgx);
     write_diags(tcx);
     status
 }
@@ -261,8 +265,8 @@ pub fn refactor_mod_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(table, "word")
 }
 
-fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    PROG = c.prog();
+fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
+    pcx.prog = c.prog();
     tcx.tool = c"refactor";
     set_command(c.line, &tcx);
     let cmd = c.line.c(2);
@@ -281,7 +285,7 @@ fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         } else if ev.kind == EV_OPTION && ev.name == "max-lines" {
             tcx.opt_max_lines = parse_count(v);
             if tcx.opt_max_lines <= 0 {
-                return usage(c"--max-lines takes a number of lines", 0 as *u8, &tcx);
+                return usage(c"--max-lines takes a number of lines", 0 as *u8, &tcx, pcx);
             }
         } else if ev.kind == EV_FLAG && ev.name == "plan" {
             tcx.opt_plan = true;
@@ -307,7 +311,7 @@ fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             tcx.opt_before = v;
         } else if ev.kind == EV_OPTION && ev.name == "header" {
             tcx.opt_header = v;
-        } else if take_edit_event(&ev, &root, &tcx) {
+        } else if take_edit_event(&ev, &root, &tcx, &pcx) {
         } else if ev.kind != EV_WORD {
             let d = diag(c"error", c"refactor.usage", &tcx);
             buf_str(d, c"unknown option '");
@@ -330,21 +334,23 @@ fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         let w1 = if n > 1 { c_slice(words.data[1] as *u8) } else { c_slice(c"") };
         // The command's words, checked before the program is read.
         if sub == "rename" && n != 2 {
-            return usage(c"rename takes PATH and the NEW name", c"rename crate::m::old new", &tcx);
+            return usage(c"rename takes PATH and the NEW name", c"rename crate::m::old new", &tcx,
+                pcx);
         }
         if sub == "rename" && !is_ident(w1) {
-            return usage(c"the new name must be an identifier (not a keyword)", 0 as *u8, &tcx);
+            return usage(c"the new name must be an identifier (not a keyword)", 0 as *u8, &tcx,
+                pcx);
         }
         if sub == "move" && (n == 0 || (tcx.opt_to == 0 as *u8 && n < 2)) {
             return usage(c"move takes PATH... and the MODULE (`--to MODULE`)",
-                c"move crate::m::item --to crate::other", &tcx);
+                c"move crate::m::item --to crate::other", &tcx, pcx);
         }
         if (sub == "new-module" && n != 1) || (sub == "move-module" && n != 2) {
             return usage(if n == 0
                 || sub == "move-module" { c"a module path is needed (crate::a::b)" }
                 else { c"one module at a time" },
                 if sub == "new-module" { c"new-module crate::a::b" }
-                else { c"move-module crate::a crate::b::a" }, &tcx);
+                else { c"move-module crate::a crate::b::a" }, &tcx, pcx);
         }
         if sub == "split"
             && (n != 1
@@ -352,33 +358,33 @@ fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                     && (tcx.opt_into == 0 as *u8 || tcx.opt_items == 0 as *u8))) {
             return usage(
                 c"split takes MODULE and --into NEWMOD --items a,b,c, or --plan, or --auto",
-                c"split crate::m --plan", &tcx);
+                c"split crate::m --plan", &tcx, pcx);
         }
-        root = root_or_diag(root, cmd, w0, true, &tcx);
+        root = root_or_diag(root, cmd, w0, true, &tcx, pcx);
         if root == 0 as *u8 {
             return 2;
         }
-        if !load_program(root, tcx.target, &tcx) {
-            program_errors(c"error", root, true, &tcx);
+        if !load_program(root, tcx.target, &tcx, &pcx, &wgx) {
+            program_errors(c"error", root, true, &tcx, &pcx);
             return 1;
         }
         if sub == "rename" {
-            return run_rename(w0, w1, root, &tcx);
+            return run_rename(w0, w1, root, &tcx, &pcx);
         }
         if sub == "new-module" {
-            return run_new_module(w0, root, &tcx);
+            return run_new_module(w0, root, &tcx, &pcx);
         }
         if sub == "move-module" {
-            return run_move_module(w0, w1, root, &tcx);
+            return run_move_module(w0, w1, root, &tcx, &pcx);
         }
         if sub == "move" {
             if tcx.opt_to == 0 as *u8 {
                 tcx.opt_to = words.data[n - 1] as *u8;
                 words.count -= 1;
             }
-            return run_move(words, tcx.opt_to, root, &tcx);
+            return run_move(words, tcx.opt_to, root, &tcx, &pcx);
         }
-        run_split(w0, root, &tcx)
+        run_split(w0, root, &tcx, &pcx)
     }
 }
 
@@ -388,43 +394,43 @@ fn run_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
 // trait's: the trait's function and every impl's. At FILE:LINE:COL (0.14):
 // the local there (local.vl), else the definition referred to or
 // defined there. Backquoted mentions in comments: mentions.vl.
-fn run_rename(name: [u8], new: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn run_rename(name: [u8], new: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let local = local_rename(name, new, root, &tcx);
+        let local = local_rename(name, new, root, &tcx, &pcx);
         if local >= 0 {
             return local;
         }
-        load_refs(&tcx);
-        var d = def_at_column(name, &tcx);
+        load_refs(&tcx, &pcx);
+        var d = def_at_column(name, &tcx, pcx);
         if d == -2 {
             return 1;
         }
         if d < 0 {
-            d = one_definition(c"rename", name, new, &tcx);
+            d = one_definition(c"rename", name, new, &tcx, &pcx);
         }
         if d < 0 {
             return 1;
         }
-        if DEFS[d].kind == K_IMPL_METHOD {
-            let t = trait_of(d, tcx);
+        if pcx.defs[d].kind == K_IMPL_METHOD {
+            let t = trait_of(d, tcx, pcx);
             var tf = -1;
             if t >= 0 {
-                for e in 0..DEFS.len() as i64 {
-                    if DEFS[e].parent == t && DEFS[e].name == DEFS[d].name {
+                for e in 0..pcx.defs.len() as i64 {
+                    if pcx.defs[e].parent == t && pcx.defs[e].name == pcx.defs[d].name {
                         tf = e;
                     }
                 }
             }
-            if tf < 0 || !user_pos(DEFS[tf].start) {
+            if tf < 0 || !user_pos(pcx.defs[tf].start, pcx) {
                 let e = diag(c"error", c"edit.not-source", &tcx);
-                buf_bytes(e, SYMS[DEFS[d].fqn].text);
+                buf_bytes(e, SYMS[pcx.defs[d].fqn].text);
                 buf_str(e,
                     c" implements a function of a trait that is not in a file of the program\n");
                 return 1;
             }
             d = tf;
         }
-        let old = DEFS[d].name;
+        let old = pcx.defs[d].name;
         let newsym = intern(new);
         if old == newsym {
             let e = diag(c"note", c"edit.unchanged", &tcx);
@@ -434,39 +440,40 @@ fn run_rename(name: [u8], new: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         // The definitions renamed together: a trait's function and its impls'.
         var group = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         group.push(d);
-        if DEFS[d].kind == K_TRAIT_FN {
-            for e in 0..DEFS.len() as i64 {
-                if DEFS[e].kind == K_IMPL_METHOD && DEFS[e].name == old
-                    && trait_of(e, tcx) == DEFS[d].parent {
+        if pcx.defs[d].kind == K_TRAIT_FN {
+            for e in 0..pcx.defs.len() as i64 {
+                if pcx.defs[e].kind == K_IMPL_METHOD && pcx.defs[e].name == old
+                    && trait_of(e, tcx, pcx) == pcx.defs[d].parent {
                     group.push(e);
                 }
             }
         }
-        if rename_collides(d, group, newsym, &tcx) {
+        if rename_collides(d, group, newsym, &tcx, &pcx) {
             return 1;
         }
-        let m = if DEFS[d].kind == K_MOD { child_module(DEFS[d].module, old) } else { -1 };
-        if m >= 0 && own_file(m) >= 0 {
+        let m = if pcx.defs[d].kind == K_MOD { child_module(pcx.defs[d].module, old, pcx) }
+            else { -1 };
+        if m >= 0 && own_file(m, pcx) >= 0 {
             // (a module of its own file: the file is renamed too)
-            let status = relocate_module(m, MODULES[m].parent, newsym, &tcx);
+            let status = relocate_module(m, pcx.modules[m].parent, newsym, &tcx, &pcx);
             if status >= 0 {
                 return status;
             }
         } else {
-            rename_refs(group, old, new, &tcx);
+            rename_refs(group, old, new, &tcx, &pcx);
         }
-        doc_mentions(group, old, new, &tcx);
-        finish_rename(d, new, root, &tcx)
+        doc_mentions(group, old, new, &tcx, &pcx);
+        finish_rename(d, new, root, &tcx, &pcx)
     }
 }
 
-fn finish_rename(d: i64, new: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn finish_rename(d: i64, new: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let what = buf_new();
     buf_str(what, c"renamed ");
-    buf_bytes(what, SYMS[DEFS[d].fqn].text);
+    buf_bytes(what, SYMS[pcx.defs[d].fqn].text);
     buf_str(what, c" to ");
     buf_bytes(what, new);
-    finish(what, root, &tcx)
+    finish(what, root, &tcx, &pcx)
 }
 
 // `refactor new-module crate::a::b [--file|--dir]`: makes the module's
@@ -474,43 +481,45 @@ fn finish_rename(d: i64, new: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
 // parent, making the modules of the path that do not exist (as dir
 // modules); a file module that gains a child becomes a dir module
 // (`a.vl` -> `a/mod.vl`).
-fn run_new_module(path: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn run_new_module(path: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     var segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     if !path_segments(path, &segs) || segs.count == 0 {
-        return usage(c"a module path is needed (crate::a::b)", c"new-module crate::a::b", &tcx);
+        return usage(c"a module path is needed (crate::a::b)", c"new-module crate::a::b", &tcx,
+            pcx);
     }
-    load_refs(&tcx);
+    load_refs(&tcx, &pcx);
     var converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    let r = make_path(segs, segs.count, tcx.opt_dir, &converts, &tcx);
+    let r = make_path(segs, segs.count, tcx.opt_dir, &converts, &tcx, pcx);
     if r == -2 {
         let d = diag(c"error", c"refactor.exists", &tcx);
         buf_str(d, c"module ");
         buf_bytes(d, path);
         buf_str(d, c" exists\n");
-        let out = try_begin(c"items", path, true, &tcx);
+        let out = try_begin(c"items", path, true, &tcx, pcx);
         try_end(out);
         return 1;
     }
     if r < 0 {
         return 1;
     }
-    emit_regions(&tcx);
+    emit_regions(&tcx, &pcx);
     let what = buf_new();
     buf_str(what, c"made module ");
     buf_bytes(what, path);
-    finish(what, root, &tcx)
+    finish(what, root, &tcx, &pcx)
 }
 
 // The region of the module with path segs[0..n) (after `crate`), made
 // when it does not exist (and the modules before it); the last one a dir
 // module when `dir`. -2 when it exists and `n` is all of segs and none is
 // made, -1 after a diagnostic.
-pub fn make_path(segs: IntVec, n: i64, dir: bool, converts: inout HMap, tcx: inout Tcx<Comp>) -> i64 {
+pub fn make_path(segs: IntVec, n: i64, dir: bool, converts: inout HMap, tcx: inout Tcx<Comp>,
+    pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var m = 0;
         var k = 0;
         while k < n {
-            let c = child_module(m, segs.data[k]);
+            let c = child_module(m, segs.data[k], pcx);
             if c < 0 {
                 break;
             }
@@ -524,7 +533,7 @@ pub fn make_path(segs: IntVec, n: i64, dir: bool, converts: inout HMap, tcx: ino
         while k < n {
             let name = segs.data[k];
             let last = k == n - 1;
-            r = make_module(r, name, if last { dir } else { true }, &converts, &tcx);
+            r = make_module(r, name, if last { dir } else { true }, &converts, &tcx, pcx);
             if r < 0 {
                 return -1;
             }
@@ -534,9 +543,9 @@ pub fn make_path(segs: IntVec, n: i64, dir: bool, converts: inout HMap, tcx: ino
     }
 }
 
-pub fn inline_module(m: i64, tcx: inout Tcx<Comp>) -> i64 {
+pub fn inline_module(m: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let d = diag(c"error", c"refactor.inline", &tcx);
-    buf_bytes(d, mod_fqn_text(m, &tcx));
+    buf_bytes(d, mod_fqn_text(m, &tcx, pcx));
     buf_str(d, c" is an inline module (`mod m { }`); the module refactorings work on modules of their own files\n");
     1
 }
@@ -546,58 +555,58 @@ pub fn inline_module(m: i64, tcx: inout Tcx<Comp>) -> i64 {
 // path that do not exist are made (dir modules), its `mod` line moves to
 // its new parent, every path and `use` naming it is rewritten, and the
 // `super::` paths inside it that lead out of it are written from `crate`.
-fn run_move_module(from: [u8], to: [u8], root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn run_move_module(from: [u8], to: [u8], root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let m = module_named(from, &tcx);
+        let m = module_named(from, &tcx, pcx);
         if m <= 0 {
-            return no_module(from, 0 as *u8, &tcx);
+            return no_module(from, 0 as *u8, &tcx, pcx);
         }
-        if own_file(m) < 0 {
-            return inline_module(m, &tcx);
+        if own_file(m, pcx) < 0 {
+            return inline_module(m, &tcx, pcx);
         }
         var segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if !path_segments(to, &segs) || segs.count == 0 {
             return usage(c"the new path of the module is needed (crate::x::b)",
-                c"move-module crate::a crate::x::a", &tcx);
+                c"move-module crate::a crate::x::a", &tcx, pcx);
         }
-        load_refs(&tcx);
+        load_refs(&tcx, &pcx);
         var converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         // The new parent (made when it does not exist).
         let n = segs.count;
         var parent = 0;
         if n > 1 {
-            parent = make_path(segs, n - 1, true, &converts, &tcx);
+            parent = make_path(segs, n - 1, true, &converts, &tcx, pcx);
             if parent == -2 {
                 // (it exists)
                 parent = 0;
                 for k in 0..n - 1 {
-                    parent = child_module(parent, segs.data[k]);
+                    parent = child_module(parent, segs.data[k], pcx);
                 }
             }
             if parent < 0 {
                 return 1;
             }
         }
-        if within(parent, m, tcx) {
-            return usage(c"a module cannot move into itself", 0 as *u8, &tcx);
+        if within(parent, m, tcx, pcx) {
+            return usage(c"a module cannot move into itself", 0 as *u8, &tcx, pcx);
         }
         let name = segs.data[n - 1];
-        if parent == MODULES[m].parent && name == MODULES[m].name {
+        if parent == pcx.modules[m].parent && name == pcx.modules[m].name {
             let e = diag(c"note", c"edit.unchanged", &tcx);
             buf_str(e, c"nothing to change\n");
             return 0;
         }
-        let status = relocate_module(m, parent, name, &tcx);
+        let status = relocate_module(m, parent, name, &tcx, &pcx);
         if status >= 0 {
             return status;
         }
-        crate::tools::refactor_move::imports::emit_use_edits(&tcx);
-        emit_regions(&tcx);
+        crate::tools::refactor_move::imports::emit_use_edits(&tcx, &pcx);
+        emit_regions(&tcx, &pcx);
         let what = buf_new();
         buf_str(what, c"moved module ");
-        buf_bytes(what, mod_fqn_text(m, &tcx));
+        buf_bytes(what, mod_fqn_text(m, &tcx, pcx));
         buf_str(what, c" to ");
         buf_bytes(what, to);
-        finish(what, root, &tcx)
+        finish(what, root, &tcx, &pcx)
     }
 }

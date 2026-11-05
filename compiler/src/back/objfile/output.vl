@@ -14,16 +14,15 @@
 // compiler links such a program itself (link_macho) when it can: the
 // default; `--linker=system` runs ld.
 
-use crate::back::dwarf::DEBUG_INFO;
 use crate::back::objfile::{ASYMS, ASYM_COUNT};
 use crate::base::{
     BUFS, IntVec, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_fmt, buf_hex, buf_new,
     buf_str, buf_write_fd, cstr, die2, fclose, fopen, fread, fwrite, realpath, streq, strlen,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::{ELF, X86};
-use crate::front::modules::C_MODULE;
 use crate::middle::ctx::FnCtx;
-use crate::middle::opt::OPT_LEVEL;
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -51,9 +50,9 @@ extern "C" {
 // symbols, which no assembler takes. It is spelled `0c_` (as long, and no
 // module's name: a name does not start with a digit) in the text, before
 // it is written (-S) or assembled: the object and `cc` of the text agree.
-pub fn c_module_symbols(cx: inout FnCtx) {
+pub fn c_module_symbols(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        if C_MODULE < 0 {
+        if pcx.c_module < 0 {
             return;
         }
         let text = BUFS[cx.asm].data;
@@ -72,14 +71,6 @@ pub fn c_module_symbols(cx: inout FnCtx) {
 }
 
 // ---- The link ----
-
-// What the command line added for the link, in its order: a kind ('l':
-// `-l NAME`, 'L': `-L DIR`, ' ': an input) then the text, two words each.
-static var LINK_ARGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The -I directories, for the C files.
-static var LINK_INCLUDES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// Whether a C file is among the inputs.
-static var LINK_C: bool = false;
 
 // Whether path ends with suffix.
 unsafe fn ends_with(path: *u8, suffix: *u8) -> bool {
@@ -106,28 +97,20 @@ pub fn is_link_input(path: *u8) -> bool {
 }
 
 // Adds `-l NAME` (kind 'l'), `-L DIR` ('L') or an input (' ') to the link.
-pub fn add_link_arg(kind: u8, text: *u8) {
+pub fn add_link_arg(kind: u8, text: *u8, pcx: inout Ctx<Comp>) {
     unsafe {
-        LINK_ARGS.push(kind as i64);
-        LINK_ARGS.push(text as i64);
+        pcx.link_args.push(kind as i64);
+        pcx.link_args.push(text as i64);
         if kind == ' ' && ends_with(text, c".c") {
-            LINK_C = true;
+            pcx.link_c = true;
         }
     }
 }
 
 // Adds an -I directory (the C headers' search path is the C files' too).
-pub fn add_link_include(dir: *u8) {
-    LINK_INCLUDES.push(dir as i64);
+pub fn add_link_include(dir: *u8, pcx: inout Ctx<Comp>) {
+    pcx.link_includes.push(dir as i64);
 }
-
-// (0.25) What the program links besides: the frameworks and libraries
-// its extern blocks name (`#[link(...)]`, in the modules it reaches,
-// front::parser::foreign) and `-framework NAME`s, each once, in the order
-// first named. A framework is macOS's (Linux leaves it out); a library is
-// linked as `-lNAME`.
-static var LINK_FRAMEWORKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var LINK_LIBS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Adds name (a C string made of it) to v, unless it is there.
 fn add_once(v: inout IntVec, name: [u8]) {
@@ -144,29 +127,23 @@ fn add_once(v: inout IntVec, name: [u8]) {
     }
 }
 
-pub fn add_framework(name: [u8]) {
-    add_once(&LINK_FRAMEWORKS, name);
+pub fn add_framework(name: [u8], pcx: inout Ctx<Comp>) {
+    add_once(&pcx.link_frameworks, name);
 }
-
-// The extern blocks' links (#[link]): a kind ('F', 'l'), the name (a C
-// string), then where its block's symbols start in LINK_DECL_SYMS and how
-// many: four words each.
-static var LINK_DECLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var LINK_DECL_SYMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // A link an extern block declares (front::parser::foreign::link_block),
 // with the C symbols of its functions and statics (C strings).
-pub fn add_link_decl(kind: u8, name: [u8], syms: inout IntVec) {
+pub fn add_link_decl(kind: u8, name: [u8], syms: inout IntVec, pcx: inout Ctx<Comp>) {
     unsafe {
         let b = buf_new();
         buf_bytes(b, name);
         buf_byte(b, 0);
-        LINK_DECLS.push(kind as i64);
-        LINK_DECLS.push(BUFS[b].data as i64);
-        LINK_DECLS.push(LINK_DECL_SYMS.count);
-        LINK_DECLS.push(syms.count);
+        pcx.link_decls.push(kind as i64);
+        pcx.link_decls.push(BUFS[b].data as i64);
+        pcx.link_decls.push(pcx.link_decl_syms.count);
+        pcx.link_decls.push(syms.count);
         for i in 0..syms.count {
-            LINK_DECL_SYMS.push(syms.data[i]);
+            pcx.link_decl_syms.push(syms.data[i]);
         }
     }
 }
@@ -174,12 +151,12 @@ pub fn add_link_decl(kind: u8, name: [u8], syms: inout IntVec) {
 // Adds the declared links the program uses to LINK_FRAMEWORKS and
 // LINK_LIBS: those whose block has a symbol the object refers to and does
 // not define (or no symbol at all).
-fn resolve_declared() {
+fn resolve_declared(pcx: inout Ctx<Comp>) {
     unsafe {
         var d = 0;
-        while d < LINK_DECLS.count {
-            let first = LINK_DECLS.data[d + 2];
-            let n = LINK_DECLS.data[d + 3];
+        while d < pcx.link_decls.count {
+            let first = pcx.link_decls.data[d + 2];
+            let n = pcx.link_decls.data[d + 3];
             var used = n == 0;
             for s in 0..ASYM_COUNT {
                 if used {
@@ -196,49 +173,41 @@ fn resolve_declared() {
                     text = text[1..text.len];
                 }
                 for k in first..first + n {
-                    if cstr(LINK_DECL_SYMS.data[k] as *u8) == text {
+                    if cstr(pcx.link_decl_syms.data[k] as *u8) == text {
                         used = true;
                         break;
                     }
                 }
             }
             if used {
-                let name = cstr(LINK_DECLS.data[d + 1] as *u8);
-                if LINK_DECLS.data[d] == 'F' {
-                    add_once(&LINK_FRAMEWORKS, name);
+                let name = cstr(pcx.link_decls.data[d + 1] as *u8);
+                if pcx.link_decls.data[d] == 'F' {
+                    add_once(&pcx.link_frameworks, name);
                 } else {
-                    add_once(&LINK_LIBS, name);
+                    add_once(&pcx.link_libs, name);
                 }
             }
             d += 4;
         }
         // (0.25.3: kept for a failed link's error, linkfail.vl)
-        for i in 0..LINK_DECLS.count {
-            LINK_DECLS_SEEN.push(LINK_DECLS.data[i]);
+        for i in 0..pcx.link_decls.count {
+            pcx.link_decls_seen.push(pcx.link_decls.data[i]);
         }
-        LINK_DECLS.count = 0;
+        pcx.link_decls.count = 0;
     }
 }
 
 // Whether the program links a framework or a library of its own.
-fn links_declared() -> bool {
-    LINK_LIBS.count > 0 || (!ELF && LINK_FRAMEWORKS.count > 0)
+fn links_declared(pcx: Ctx<Comp>) -> bool {
+    pcx.link_libs.count > 0 || (!ELF && pcx.link_frameworks.count > 0)
 }
 
 // Whether the command line added anything for the link.
-pub fn link_args_given() -> bool {
-    LINK_ARGS.count > 0
+pub fn link_args_given(pcx: Ctx<Comp>) -> bool {
+    pcx.link_args.count > 0
 }
 
 // ---- What a failed link's error names (0.25.3, linkfail.vl) ----
-
-// The extern blocks' links once resolve_declared has read them (LINK_DECLS
-// is emptied there): four words each, as LINK_DECLS.
-static var LINK_DECLS_SEEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The last link through the C driver: its command, and what it printed (a
-// buffer; -1: none).
-pub static var LINK_CMD: *u8 = 0 as *u8;
-pub static var LINK_LOG: i64 = -1;
 
 // Word w of the IntVecs of this file that hold C strings (LINK_ARGS'
 // texts, LINK_DECLS_SEEN's names, LINK_DECL_SYMS) as that C string.
@@ -254,11 +223,11 @@ fn c_word(w: i64) -> *u8 {
 
 // The command line's inputs for the link (objects, archives, shared
 // libraries, C files): how many.
-pub fn link_input_count() -> i64 {
+pub fn link_input_count(pcx: Ctx<Comp>) -> i64 {
     var n = 0;
     var i = 0;
-    while i < LINK_ARGS.count {
-        if LINK_ARGS.get(i) == ' ' {
+    while i < pcx.link_args.count {
+        if pcx.link_args.get(i) == ' ' {
             n += 1;
         }
         i += 2;
@@ -267,13 +236,13 @@ pub fn link_input_count() -> i64 {
 }
 
 // Input k of the link (0 <= k < link_input_count()), a C string.
-pub fn link_input(k: i64) -> *u8 {
+pub fn link_input(k: i64, pcx: Ctx<Comp>) -> *u8 {
     var n = 0;
     var i = 0;
-    while i < LINK_ARGS.count {
-        if LINK_ARGS.get(i) == ' ' {
+    while i < pcx.link_args.count {
+        if pcx.link_args.get(i) == ' ' {
             if n == k {
-                return c_word(LINK_ARGS.get(i + 1));
+                return c_word(pcx.link_args.get(i + 1));
             }
             n += 1;
         }
@@ -283,10 +252,10 @@ pub fn link_input(k: i64) -> *u8 {
 }
 
 // Whether the command line names library `name` (`-l name`).
-pub fn lib_given(name: [u8]) -> bool {
+pub fn lib_given(name: [u8], pcx: Ctx<Comp>) -> bool {
     var i = 0;
-    while i < LINK_ARGS.count {
-        if LINK_ARGS.get(i) == 'l' && cstr(c_word(LINK_ARGS.get(i + 1))) == name {
+    while i < pcx.link_args.count {
+        if pcx.link_args.get(i) == 'l' && cstr(c_word(pcx.link_args.get(i + 1))) == name {
             return true;
         }
         i += 2;
@@ -297,17 +266,17 @@ pub fn lib_given(name: [u8]) -> bool {
 // The #[link] whose extern block declares C symbol `sym` (with kind 0),
 // or that names `sym` as a library ('l') or a framework ('F'): its index,
 // or -1.
-pub fn link_decl_of(kind: u8, sym: [u8]) -> i64 {
+pub fn link_decl_of(kind: u8, sym: [u8], pcx: Ctx<Comp>) -> i64 {
     var d = 0;
-    while d < LINK_DECLS_SEEN.count {
+    while d < pcx.link_decls_seen.count {
         if kind != 0 {
-            if LINK_DECLS_SEEN.get(d) == kind as i64 && cstr(link_decl_name(d)) == sym {
+            if pcx.link_decls_seen.get(d) == kind as i64 && cstr(link_decl_name(d, pcx)) == sym {
                 return d;
             }
         } else {
-            let first = LINK_DECLS_SEEN.get(d + 2);
-            for s in first..first + LINK_DECLS_SEEN.get(d + 3) {
-                if cstr(c_word(LINK_DECL_SYMS.get(s))) == sym {
+            let first = pcx.link_decls_seen.get(d + 2);
+            for s in first..first + pcx.link_decls_seen.get(d + 3) {
+                if cstr(c_word(pcx.link_decl_syms.get(s))) == sym {
                     return d;
                 }
             }
@@ -318,21 +287,21 @@ pub fn link_decl_of(kind: u8, sym: [u8]) -> i64 {
 }
 
 // The library or framework #[link] d names (a C string).
-pub fn link_decl_name(d: i64) -> *u8 {
-    c_word(LINK_DECLS_SEEN.get(d + 1))
+pub fn link_decl_name(d: i64, pcx: Ctx<Comp>) -> *u8 {
+    c_word(pcx.link_decls_seen.get(d + 1))
 }
 
 // Whether #[link] d names a framework.
-pub fn link_decl_framework(d: i64) -> bool {
-    LINK_DECLS_SEEN.get(d) == 'F'
+pub fn link_decl_framework(d: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.link_decls_seen.get(d) == 'F'
 }
 
 // The first C symbol of #[link] d's block (a C string), or 0: none.
-pub fn link_decl_first(d: i64) -> *u8 {
-    if LINK_DECLS_SEEN.get(d + 3) == 0 {
+pub fn link_decl_first(d: i64, pcx: Ctx<Comp>) -> *u8 {
+    if pcx.link_decls_seen.get(d + 3) == 0 {
         return 0 as *u8;
     }
-    c_word(LINK_DECL_SYMS.get(LINK_DECLS_SEEN.get(d + 2)))
+    c_word(pcx.link_decl_syms.get(pcx.link_decls_seen.get(d + 2)))
 }
 
 // s, quoted for the shell.
@@ -411,7 +380,7 @@ fn uses_pthreads() -> bool {
 // (C files compiled at the program's -O level, with its -I directories
 // and -g), then libm on Linux when the program or a C file may call it
 // (Linux links it only when asked; on macOS it is part of libSystem).
-pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
+pub fn link_command(path: *u8, obj_path: *u8, pcx: Ctx<Comp>) -> *u8 {
     unsafe {
         let cmd = buf_new();
         let cc = getenv(c"VOLE_CC");
@@ -419,15 +388,15 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
         if !ELF {
             buf_str(cmd, if X86 { c" -arch x86_64" } else { c" -arch arm64" });
         }
-        if LINK_C {
+        if pcx.link_c {
             buf_str(cmd, c" -O");
-            buf_byte(cmd, ('0' as i64 + OPT_LEVEL) as u8);
-            if DEBUG_INFO {
+            buf_byte(cmd, ('0' as i64 + pcx.opt_level) as u8);
+            if pcx.debug_info {
                 buf_str(cmd, c" -g");
             }
-            for i in 0..LINK_INCLUDES.count {
+            for i in 0..pcx.link_includes.count {
                 buf_str(cmd, c" -I");
-                quoted(cmd, LINK_INCLUDES.data[i] as *u8);
+                quoted(cmd, pcx.link_includes.data[i] as *u8);
             }
         }
         buf_str(cmd, c" -o ");
@@ -435,26 +404,26 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
         buf_byte(cmd, ' ');
         quoted(cmd, obj_path);
         var i = 0;
-        while i < LINK_ARGS.count {
-            let kind = LINK_ARGS.data[i] as u8;
+        while i < pcx.link_args.count {
+            let kind = pcx.link_args.data[i] as u8;
             buf_byte(cmd, ' ');
             if kind != ' ' {
                 buf_fmt(cmd, format_args("-{kind:c}"));
             }
-            quoted(cmd, LINK_ARGS.data[i + 1] as *u8);
+            quoted(cmd, pcx.link_args.data[i + 1] as *u8);
             i += 2;
         }
         if !ELF {
-            for i in 0..LINK_FRAMEWORKS.count {
+            for i in 0..pcx.link_frameworks.count {
                 buf_str(cmd, c" -framework ");
-                quoted(cmd, LINK_FRAMEWORKS.data[i] as *u8);
+                quoted(cmd, pcx.link_frameworks.data[i] as *u8);
             }
         }
-        for i in 0..LINK_LIBS.count {
+        for i in 0..pcx.link_libs.count {
             buf_str(cmd, c" -l");
-            quoted(cmd, LINK_LIBS.data[i] as *u8);
+            quoted(cmd, pcx.link_libs.data[i] as *u8);
         }
-        if ELF && (LINK_C || uses_libm()) {
+        if ELF && (pcx.link_c || uses_libm()) {
             buf_str(cmd, c" -lm");
         }
         if ELF && uses_pthreads() {
@@ -473,8 +442,6 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
 pub const LINKER_SYSTEM: i64 = 0;
 pub const LINKER_CC: i64 = 1;
 pub const LINKER_INTERNAL: i64 = 2;
-// --linker=NAME, or -1: $VOLE_LINKER, else the default.
-static var LINKER: i64 = -1;
 
 // The linker named `name` (system, cc, internal), or -1.
 fn linker_of_name(name: *u8) -> i64 {
@@ -491,16 +458,16 @@ fn linker_of_name(name: *u8) -> i64 {
 }
 
 // `--linker=NAME`: whether NAME is a linker.
-pub fn set_linker(name: *u8) -> bool {
-    LINKER = linker_of_name(name);
-    LINKER >= 0
+pub fn set_linker(name: *u8, pcx: inout Ctx<Comp>) -> bool {
+    pcx.linker = linker_of_name(name);
+    pcx.linker >= 0
 }
 
 // The linker this link uses.
-fn linker() -> i64 {
+fn linker(pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if LINKER >= 0 {
-            return LINKER;
+        if pcx.linker >= 0 {
+            return pcx.linker;
         }
         let env = getenv(c"VOLE_LINKER");
         if env == 0 as *u8 || env[0] == 0 {
@@ -518,27 +485,27 @@ fn linker() -> i64 {
 
 // Links obj_path into the executable path: 0, or the link's exit status
 // (the linker said why).
-pub fn link_program(path: *u8, obj_path: *u8) -> i64 {
+pub fn link_program(path: *u8, obj_path: *u8, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        resolve_declared();
+        resolve_declared(&pcx);
         let cc = getenv(c"VOLE_CC");
         // ($VOLE_CC=cc, as tests/run.sh sets it, is the default driver)
-        let own = !LINK_C && LINK_ARGS.count == 0
+        let own = !pcx.link_c && pcx.link_args.count == 0
             && (cc == 0 as *u8 || cc[0] == 0 || streq(cc, c"cc"));
-        let how = linker();
+        let how = linker(pcx);
         // (--linker=internal: the compiler's own, when it takes the program;
         // else the system's)
-        if own && how == LINKER_INTERNAL && !DEBUG_INFO && !links_declared()
+        if own && how == LINKER_INTERNAL && !pcx.debug_info && !links_declared(pcx)
             && crate::back::objfile::link_macho::link_macho(path, obj_path) {
             return 0;
         }
-        if own && how != LINKER_CC && link_direct(path, obj_path) {
+        if own && how != LINKER_CC && link_direct(path, obj_path, pcx) {
             return 0;
         }
         // (0.25.3) through the C driver, its text kept: a failure is read
         // into one error (linkfail.vl), its warnings printed as they were
-        let cmd = link_command(path, obj_path);
-        LINK_CMD = cmd;
+        let cmd = link_command(path, obj_path, pcx);
+        pcx.link_cmd = cmd;
         let lb = buf_new();
         buf_fmt(lb, format_args("{}.log\0", cstr(obj_path)));
         let log = BUFS[lb].data;
@@ -548,11 +515,11 @@ pub fn link_program(path: *u8, obj_path: *u8) -> i64 {
         argv[2] = cmd;
         argv[3] = 0 as *u8;
         let status = run_logged(argv, log);
-        LINK_LOG = buf_new();
-        read_into(log, LINK_LOG);
+        pcx.link_log = buf_new();
+        read_into(log, pcx.link_log);
         unlink(log);
-        if status == 0 && BUFS[LINK_LOG].len > 0 {
-            buf_write_fd(LINK_LOG, 2);
+        if status == 0 && BUFS[pcx.link_log].len > 0 {
+            buf_write_fd(pcx.link_log, 2);
         }
         status
     }
@@ -619,7 +586,7 @@ pub fn read_into(path: *u8, b: i64) -> bool {
 // template: whether it linked. When it did not, what it printed is not
 // shown and its template is dropped: the caller links through `cc`, which
 // says why.
-fn link_direct(path: *u8, obj_path: *u8) -> bool {
+fn link_direct(path: *u8, obj_path: *u8, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let lb = buf_new();
         buf_fmt(lb, format_args("{}.log\0", cstr(obj_path)));
@@ -639,7 +606,7 @@ fn link_direct(path: *u8, obj_path: *u8) -> bool {
                 template_write(t, file);
             }
         }
-        let status = run_logged(template_argv(t, path, obj_path), log);
+        let status = run_logged(template_argv(t, path, obj_path, pcx), log);
         if status == 0 {
             // (the linker's warnings, as cc shows them)
             let out = buf_new();
@@ -1022,7 +989,7 @@ fn template_make(path: *u8, obj_path: *u8, log: *u8) -> i64 {
 // The link's arguments from template t (ended by 0): the output and the
 // object in place of their markers, with libm and libpthread after the
 // object on Linux when the program calls into them (as link_command).
-fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
+fn template_argv(t: i64, path: *u8, obj_path: *u8, pcx: Ctx<Comp>) -> **u8 {
     unsafe {
         let words = buf_new();
         let n = BUFS[t].len;
@@ -1040,7 +1007,8 @@ fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
                 lines += 1;
             }
         }
-        let argv = alloc_array::<*u8>(lines + 3 + 2 * LINK_FRAMEWORKS.count + LINK_LIBS.count);
+        let argv = alloc_array::<*u8>(
+            lines + 3 + 2 * pcx.link_frameworks.count + pcx.link_libs.count);
         var k = 0;
         var i = 0;
         while i < m {
@@ -1059,15 +1027,15 @@ fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
                 }
                 // (what the program declares it links, as link_command)
                 if !ELF {
-                    for f in 0..LINK_FRAMEWORKS.count {
+                    for f in 0..pcx.link_frameworks.count {
                         argv[k + 1] = c"-framework";
-                        argv[k + 2] = LINK_FRAMEWORKS.data[f] as *u8;
+                        argv[k + 2] = pcx.link_frameworks.data[f] as *u8;
                         k += 2;
                     }
                 }
-                for l in 0..LINK_LIBS.count {
+                for l in 0..pcx.link_libs.count {
                     let b = buf_new();
-                    buf_fmt(b, format_args("-l{}\0", cstr(LINK_LIBS.data[l] as *u8)));
+                    buf_fmt(b, format_args("-l{}\0", cstr(pcx.link_libs.data[l] as *u8)));
                     k += 1;
                     argv[k] = BUFS[b].data;
                 }

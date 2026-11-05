@@ -2,19 +2,23 @@
 // the struct, its literals and its field accesses; and the member lookups
 // and renames refactor variant shares.
 
+use std::Arena;
+
 use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::Call;
-use crate::front::ast::{NODES, NodeKind, REPR_C};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
-use crate::front::types::{STRUCTS, TYPES, TyKind};
+use crate::front::ast::{NodeKind, REPR_C};
+use crate::front::embed::wgsl::WgslCx;
+use crate::front::lexer::Tok;
+use crate::front::types::{TYPES, TyKind};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::query::{QF_DEF, c_slice, root_or_diag};
-use crate::tools::query::defs::{DEFS, K_STRUCT};
-use crate::tools::query::diagnostics::{PROG, diag, write_diags};
+use crate::tools::query::defs::K_STRUCT;
+use crate::tools::query::diagnostics::{diag, write_diags};
 use crate::tools::query::positions::{put_loc, shorthand_at, shorthand_text, token_at};
 use crate::tools::refactor_mod::mentions::doc_mentions;
 use crate::tools::refactor_shape::{
@@ -28,81 +32,81 @@ use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart
 
 // ---- refactor field ----
 
-pub fn run_field(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    let status = field_inner(c, &tcx);
+pub fn run_field(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
+    let status = field_inner(c, &tcx, &pcx, &wgx);
     write_diags(tcx);
     status
 }
 
 // The struct item of checked type t (through a pointer), or 0.
-fn struct_node_of(t0: i64) -> i64 {
+fn struct_node_of(t0: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if t0 <= 0 {
             return 0;
         }
         let t = if TYPES[t0].kind == TyKind::Ptr { TYPES[t0].a } else { t0 };
         // (0.14: a closure's environment is no item)
-        if t <= 0 || TYPES[t].kind != TyKind::Struct || STRUCTS[TYPES[t].a].closure != 0 {
+        if t <= 0 || TYPES[t].kind != TyKind::Struct || pcx.structs[TYPES[t].a].closure != 0 {
             return 0;
         }
-        STRUCTS[TYPES[t].a].node
+        pcx.structs[TYPES[t].a].node
     }
 }
 
 // The literals of struct node s, as written, each once.
-fn literals_of(s: i64, out: inout IntVec, tcx: Tcx<Comp>) {
+fn literals_of(s: i64, out: inout IntVec, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    for n in 1..NODES.len() as i64 {
-        if NODES[n].kind != NodeKind::StructLit || struct_node_of(NODES[n].ty) != s {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::StructLit || struct_node_of(pcx.nodes[n].ty, pcx) != s {
             continue;
         }
-        let o = orig_of(n, NodeKind::StructLit, tcx);
+        let o = orig_of(n, NodeKind::StructLit, tcx, pcx);
         if o < 0 || seen.get(o + 1) != 0 {
             continue;
         }
         seen.put(o + 1, 1);
         out.push(o);
     }
-    sort_by_start(out);
+    sort_by_start(out, pcx);
 }
 
 // The field of struct node s named `name`: its index, or -1.
-fn field_index(s: i64, name: i64) -> i64 {
-    for i in 0..pcount(s) {
-        if pa(pchild(s, i)) == name {
+fn field_index(s: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    for i in 0..pcount(s, pcx) {
+        if pa(pchild(s, i, pcx), pcx) == name {
             return i;
         }
     }
     -1
 }
 
-fn put_fields(out: i64, s: i64) {
+fn put_fields(out: i64, s: i64, pcx: Ctx<Comp>) {
     buf_byte(out, '{');
-    for i in 0..pcount(s) {
+    for i in 0..pcount(s, pcx) {
         buf_str(out, if i > 0 { c", " } else { c" " });
-        buf_bytes(out, sym_text(pa(pchild(s, i))));
+        buf_bytes(out, sym_text(pa(pchild(s, i, pcx), pcx)));
     }
     buf_str(out, c" }");
 }
 
-pub fn no_member(d: i64, s: i64, name: *u8, what: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn no_member(d: i64, s: i64, name: *u8, what: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let e = diag(c"error", c"refactor.no-member", &tcx);
-    buf_bytes(e, sym_text(DEFS[d].fqn));
+    buf_bytes(e, sym_text(pcx.defs[d].fqn));
     buf_str(e, c" has no ");
     buf_str(e, what);
     buf_str(e, c" '");
     buf_str(e, name);
     buf_str(e, c"': ");
-    put_fields(e, s);
+    put_fields(e, s, pcx);
     buf_byte(e, '\n');
-    try_query_name(c"show", sym_text(DEFS[d].fqn), &tcx);
+    try_query_name(c"show", sym_text(pcx.defs[d].fqn), &tcx, pcx);
     1
 }
 
 // The definition of member `name` (a field, a variant) of d.
-pub fn member_def(d: i64, name: i64) -> i64 {
-    for x in 0..DEFS.len() as i64 {
-        if DEFS[x].parent == d && DEFS[x].name == name {
+pub fn member_def(d: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
+    for x in 0..pcx.defs.len() as i64 {
+        if pcx.defs[x].parent == d && pcx.defs[x].name == name {
             return x;
         }
     }
@@ -110,49 +114,49 @@ pub fn member_def(d: i64, name: i64) -> i64 {
 }
 
 // Renames each reference (R_POS) to `old` as `new`.
-pub fn rename_refs(old: i64, new: i64, tcx: inout Tcx<Comp>) -> i64 {
+pub fn rename_refs(old: i64, new: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         var n = 0;
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for r in 0..tcx.r_pos.count {
             let pos = tcx.r_pos.data[r];
-            let t = token_at(pos);
-            if seen.get(pos + 1) != 0 || t >= TOK_COUNT || TOKS[t].start != pos
-                || TOKS[t].kind != Tok::Ident
-                || TOKS[t].value as i64 != old {
+            let t = token_at(pos, pcx);
+            if seen.get(pos + 1) != 0 || t >= pcx.toks.len() as i64 || pcx.toks[t].start != pos
+                || pcx.toks[t].kind != Tok::Ident
+                || pcx.toks[t].value as i64 != old {
                 continue;
             }
             seen.put(pos + 1, 1);
-            if shorthand_at(pos, &tcx) {
+            if shorthand_at(pos, &tcx, pcx) {
                 // (0.15: `S { x }` becomes `S { y: x }`)
                 edit_replace(pos, pos + sym_text(old).len as i64,
-                    shorthand_text(sym_text(new), sym_text(old)));
+                    shorthand_text(sym_text(new), sym_text(old)), &pcx);
                 n += 1;
                 continue;
             }
-            replace_name(pos, old, new);
+            replace_name(pos, old, new, &pcx);
             n += 1;
         }
         n
     }
 }
 
-fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
     unsafe {
         set_command(c.line, &tcx);
-        PROG = c.prog();
+        pcx.prog = c.prog();
         tcx.tool = c"refactor";
         tcx.sub = c"field";
         var root = 0 as *u8;
         var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"STRUCT --add 'g: i64 = 0' --dry-run";
-        if !take_args(c, shape_options("field"), &root, &words, &opts, &tcx) {
+        if !take_args(c, shape_options("field"), &root, &words, &opts, &tcx, &pcx) {
             return 2;
         }
         if words.count != 1 {
             return usage_error(if words.count == 0 { c"a STRUCT is needed" }
-                else { c"one STRUCT at a time" }, example, &tcx);
+                else { c"one STRUCT at a time" }, example, &tcx, pcx);
         }
         let add = opt(opts, c"--add", false);
         let remove = opt(opts, c"--remove", false);
@@ -161,30 +165,30 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64
             + (retype != 0 as *u8) as i64;
         if actions != 1 {
-            return usage_error(c"one of --add, --remove, --rename, --type", example, &tcx);
+            return usage_error(c"one of --add, --remove, --rename, --type", example, &tcx, pcx);
         }
         let default = opt(opts, c"--default", false);
         if default != 0 as *u8 && retype == 0 as *u8 {
             return usage_error(c"--default goes with --type (the literals' new value)",
-                c"STRUCT --type f T --default EXPR", &tcx);
+                c"STRUCT --type f T --default EXPR", &tcx, pcx);
         }
         let name = c_slice(words.data[0] as *u8);
         tcx.root_given = root;
-        root = root_or_diag(root, tcx.sub, name, true, &tcx);
+        root = root_or_diag(root, tcx.sub, name, true, &tcx, pcx);
         if root == 0 as *u8 {
             return 2;
         }
         var status = 0;
-        let d = load_and_find(root, name, 1 << K_STRUCT, c"struct", &status, &tcx);
+        let d = load_and_find(root, name, 1 << K_STRUCT, c"struct", &status, &tcx, &pcx, &wgx);
         if d < 0 {
             return status;
         }
-        let s = DEFS[d].node;
-        let fqn = sym_text(DEFS[d].fqn);
+        let s = pcx.defs[d].node;
+        let fqn = sym_text(pcx.defs[d].fqn);
         var lits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        literals_of(s, &lits, tcx);
+        literals_of(s, &lits, tcx, pcx);
         let what = buf_new();
-        let layout = (pc(s) & REPR_C) != 0 && rename == 0 as *u8;
+        let layout = (pc(s, pcx) & REPR_C) != 0 && rename == 0 as *u8;
         if add != 0 as *u8 {
             let text = c_slice(add);
             var vstart = -1;
@@ -193,9 +197,9 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             let fname = leading_name(decl);
             if fname < 0 || find_byte(decl, ':') < 0 {
                 return usage_error(c"--add takes 'NAME: TYPE = VALUE' (VALUE: the literals' value)",
-                    example, &tcx);
+                    example, &tcx, pcx);
             }
-            if field_index(s, fname) >= 0 {
+            if field_index(s, fname, pcx) >= 0 {
                 let e = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" has a field '");
@@ -212,8 +216,8 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 buf_str(e, c": --add 'NAME: TYPE = VALUE'\n");
                 return 2;
             }
-            list_of_node(s, &tcx);
-            list_insert(pcount(s), decl, tcx);
+            list_of_node(s, &tcx, pcx);
+            list_insert(pcount(s, pcx), decl, tcx, &pcx);
             let init = buf_new();
             buf_bytes(init, sym_text(fname));
             buf_str(init, c": ");
@@ -221,8 +225,8 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 buf_bytes(init, text[vstart..]);
             }
             for i in 0..lits.count {
-                list_of_node(lits.data[i], &tcx);
-                list_insert(pcount(lits.data[i]), buf_slice(init), tcx);
+                list_of_node(lits.data[i], &tcx, pcx);
+                list_insert(pcount(lits.data[i], pcx), buf_slice(init), tcx, &pcx);
             }
             buf_str(what, c"added field ");
             buf_bytes(what, decl);
@@ -232,20 +236,20 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             put_count(what, lits.count, c"literal", c"literals");
         } else if remove != 0 as *u8 {
             let fname = intern(c_slice(remove));
-            let k = field_index(s, fname);
+            let k = field_index(s, fname, pcx);
             if k < 0 {
-                return no_member(d, s, remove, c"field", &tcx);
+                return no_member(d, s, remove, c"field", &tcx, pcx);
             }
             // Its uses: the references but its definition and the
             // literals' fields.
-            let fd = member_def(d, fname);
+            let fd = member_def(d, fname, pcx);
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             targets.push(fd);
-            refs_of(targets, &tcx);
+            refs_of(targets, &tcx, pcx);
             var inits = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
             for i in 0..lits.count {
-                for j in 0..pcount(lits.data[i]) {
-                    inits.put(pstart(pchild(lits.data[i], j)) + 1, 1);
+                for j in 0..pcount(lits.data[i], pcx) {
+                    inits.put(pstart(pchild(lits.data[i], j, pcx), pcx) + 1, 1);
                 }
             }
             var used = 0;
@@ -261,23 +265,23 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             }
             if used > 0 {
                 let e = diag(c"error", c"refactor.used", &tcx);
-                buf_bytes(e, sym_text(DEFS[fd].fqn));
+                buf_bytes(e, sym_text(pcx.defs[fd].fqn));
                 buf_str(e, c" is used: ");
                 put_count(e, used, c"reference", c"references");
                 buf_str(e, c" (first: ");
-                put_loc(e, first);
+                put_loc(e, first, &pcx);
                 buf_str(e, c")\n");
-                try_query_name(c"refs", sym_text(DEFS[fd].fqn), &tcx);
+                try_query_name(c"refs", sym_text(pcx.defs[fd].fqn), &tcx, pcx);
                 return 1;
             }
-            list_of_node(s, &tcx);
-            list_remove(k, tcx);
+            list_of_node(s, &tcx, pcx);
+            list_remove(k, tcx, &pcx);
             for i in 0..lits.count {
                 let l = lits.data[i];
-                list_of_node(l, &tcx);
-                for j in 0..pcount(l) {
-                    if pa(pchild(l, j)) == fname {
-                        list_remove(j, tcx);
+                list_of_node(l, &tcx, pcx);
+                for j in 0..pcount(l, pcx) {
+                    if pa(pchild(l, j, pcx), pcx) == fname {
+                        list_remove(j, tcx, &pcx);
                     }
                 }
             }
@@ -290,10 +294,10 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         } else if rename != 0 as *u8 {
             let old = intern(c_slice(rename));
             let new = intern(c_slice(opt(opts, c"--rename", true)));
-            if field_index(s, old) < 0 {
-                return no_member(d, s, rename, c"field", &tcx);
+            if field_index(s, old, pcx) < 0 {
+                return no_member(d, s, rename, c"field", &tcx, pcx);
             }
-            if field_index(s, new) >= 0 {
+            if field_index(s, new, pcx) >= 0 {
                 let e = diag(c"error", c"refactor.clash", &tcx);
                 buf_bytes(e, fqn);
                 buf_str(e, c" has a field '");
@@ -302,10 +306,10 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 return 1;
             }
             var targets = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            targets.push(member_def(d, old));
-            refs_of(targets, &tcx);
-            let n = rename_refs(old, new, &tcx);
-            doc_mentions(targets, old, sym_text(new), &tcx);
+            targets.push(member_def(d, old, pcx));
+            refs_of(targets, &tcx, pcx);
+            let n = rename_refs(old, new, &tcx, &pcx);
+            doc_mentions(targets, old, sym_text(new), &tcx, &pcx);
             buf_str(what, c"renamed field ");
             buf_bytes(what, sym_text(old));
             buf_str(what, c" to ");
@@ -316,32 +320,32 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             put_count(what, n - 1, c"use", c"uses");
         } else {
             let fname = intern(c_slice(retype));
-            let k = field_index(s, fname);
+            let k = field_index(s, fname, pcx);
             if k < 0 {
-                return no_member(d, s, retype, c"field", &tcx);
+                return no_member(d, s, retype, c"field", &tcx, pcx);
             }
             let ty = c_slice(opt(opts, c"--type", true));
-            let t = pb(pchild(s, k));
-            edit_replace(pstart(t), pend(t), text_buf(ty));
+            let t = pb(pchild(s, k, pcx), pcx);
+            edit_replace(pstart(t, pcx), pend(t, pcx), text_buf(ty), &pcx);
             // (0.17: --default EXPR, each literal's value of the field
             // becomes EXPR, `$NAME` the old value)
             var changed = 0;
             if default != 0 as *u8 {
                 for i in 0..lits.count {
                     let l = lits.data[i];
-                    for j in 0..pcount(l) {
-                        let fi = pchild(l, j);
-                        if pk(fi) != NodeKind::FieldInit || pa(fi) != fname {
+                    for j in 0..pcount(l, pcx) {
+                        let fi = pchild(l, j, pcx);
+                        if pk(fi, pcx) != NodeKind::FieldInit || pa(fi, pcx) != fname {
                             continue;
                         }
-                        let v = pb(fi);
+                        let v = pb(fi, pcx);
                         let value = with_argument(c_slice(default), sym_text(fname),
-                            SRC[pstart(v)..pend(v)]);
+                            SRC[pstart(v, pcx)..pend(v, pcx)]);
                         let init = buf_new();
                         buf_bytes(init, sym_text(fname));
                         buf_str(init, c": ");
                         buf_bytes(init, buf_slice(value));
-                        edit_replace(pstart(fi), pend(fi), init);
+                        edit_replace(pstart(fi, pcx), pend(fi, pcx), init, &pcx);
                         changed += 1;
                     }
                 }
@@ -362,6 +366,6 @@ fn field_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_bytes(e, fqn);
             buf_str(e, c" is #[repr(C)]: its layout changes (C code sharing it must change too)\n");
         }
-        apply_edit(buf_slice(what), root, &tcx)
+        apply_edit(buf_slice(what), root, &tcx, &pcx)
     }
 }

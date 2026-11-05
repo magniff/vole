@@ -13,38 +13,30 @@
 // were removed.
 
 use crate::base::{
-    FILES, IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, strlen,
+    IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+    strlen,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, Leaf, is_opt, option, short_option, table};
-use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
-use crate::front::types::FNS;
+use crate::front::contracts::sites::site_count;
 use crate::gen0::target::{PANIC_RANGE_UNSIGNED, kind_is_enum, rt_panic_sym};
 use crate::middle::ctx::{FnCtx, main_cx};
-use crate::middle::inline::FN_LIVE;
-use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
+use crate::middle::ir::{IRFUNCS, Op, ir_enter};
 use crate::tools::ctx::Tcx;
-
-// `--print-checks` (0: off; "": every function; else the name a function's
-// display must have, or start with followed by `::`).
-pub static var PRINT_CHECKS: *u8 = 0 as *u8;
-
-// The checks the lowering made: (IR function, site, kind) each.
-static var NOTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 extern "C" {
     fn system(command: *u8) -> i32;
 }
 
 // A check made in the IR function being lowered (rt_panic_call).
-pub fn note_check(fi: i64, site: i64, kind: i64) {
-    if PRINT_CHECKS == 0 as *u8 {
+pub fn note_check(fi: i64, site: i64, kind: i64, pcx: inout Ctx<Comp>) {
+    if pcx.print_checks == 0 as *u8 {
         return;
     }
-    NOTED.push(fi);
-    NOTED.push(site);
-    NOTED.push(kind);
+    pcx.checks_noted.push(fi);
+    pcx.checks_noted.push(site);
+    pcx.checks_noted.push(kind);
 }
 
 // The checks the range analysis removed: (IR function, site, kind) each.
@@ -52,7 +44,7 @@ static var REMOVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // Block b, a branch's successor that the range analysis found never taken:
 // the check failing there, if it is one, noted as removed.
-pub fn note_removed(cx: inout FnCtx, b: i64) {
+pub fn note_removed(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
     unsafe {
         var v = cx.blocks[b].first;
         while v != 0 {
@@ -61,8 +53,8 @@ pub fn note_removed(cx: inout FnCtx, b: i64) {
                 let k = cx.args.data[cx.insts[v].args];
                 let s = cx.args.data[cx.insts[v].args + 4];
                 REMOVED.push(cx.irf);
-                REMOVED.push(front_number(&cx, s, 0));
-                REMOVED.push(front_number(&cx, k, -1));
+                REMOVED.push(front_number(&cx, s, 0, pcx));
+                REMOVED.push(front_number(&cx, k, -1, pcx));
                 return;
             }
             v = cx.insts[v].next;
@@ -72,26 +64,26 @@ pub fn note_removed(cx: inout FnCtx, b: i64) {
 
 // The front end's kind or site that value v of a panic call is (a
 // constant, or an RTID value since 0.18.1), or `none`.
-fn front_number(cx: inout FnCtx, v: i64, none: i64) -> i64 {
+fn front_number(cx: inout FnCtx, v: i64, none: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.insts[v].op == Op::Const {
             return cx.insts[v].imm;
         }
         if cx.insts[v].op == Op::RtId {
-            return crate::middle::ir::rtid_value(cx.insts[v].imm);
+            return crate::middle::ir::rtid_value(cx.insts[v].imm, pcx);
         }
         none
     }
 }
 
-fn kind_name(kind: i64) -> *u8 {
+fn kind_name(kind: i64, pcx: Ctx<Comp>) -> *u8 {
     if kind < 0 {
         c"check"
     } else if kind < 2 {
         c"index"
     } else if kind <= PANIC_RANGE_UNSIGNED {
         c"slice"
-    } else if kind_is_enum(kind) {
+    } else if kind_is_enum(kind, pcx) {
         c"enum"
     } else {
         c"contract"
@@ -99,13 +91,13 @@ fn kind_name(kind: i64) -> *u8 {
 }
 
 // Whether function f (a FNS index) is one --print-checks asks for.
-fn wanted(f: i64) -> bool {
+fn wanted(f: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let want = PRINT_CHECKS;
+        let want = pcx.print_checks;
         if want[0] == 0 {
             return true;
         }
-        let name = SYMS[FNS[f].display].text;
+        let name = SYMS[pcx.fns[f].display].text;
         let n = strlen(want) as i64;
         if name.len as i64 < n {
             return false;
@@ -119,36 +111,36 @@ fn wanted(f: i64) -> bool {
     }
 }
 
-fn put_site(out: i64, site: i64) {
+fn put_site(out: i64, site: i64, pcx: Ctx<Comp>) {
     unsafe {
-        if site <= 0 || site >= site_count() {
+        if site <= 0 || site >= site_count(pcx) {
             buf_str(out, c"?");
             return;
         }
-        let path = FILES[SITE_FILE.data[site]].path;
+        let path = pcx.files[pcx.site_file.data[site]].path;
         buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
         buf_byte(out, ':');
-        buf_int(out, SITE_LINE.data[site]);
+        buf_int(out, pcx.site_line.data[site]);
         buf_byte(out, ':');
-        buf_int(out, SITE_COL.data[site]);
+        buf_int(out, pcx.site_col.data[site]);
     }
 }
 
 // The checks of the optimized program's functions, printed (after
 // optimize_program, before the code is emitted).
-pub fn print_checks() {
+pub fn print_checks(pcx: inout Ctx<Comp>) {
     unsafe {
-        let cx = main_cx();
+        let cx = main_cx(&pcx);
         let out = buf_new();
         var left = 0;
         var removed = 0;
         var seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for fi in 0..IRFUNC_COUNT {
+        for fi in 0..pcx.irfunc_count {
             let f = IRFUNCS[fi].f;
-            if FN_LIVE[fi] == 0 || !wanted(f) {
+            if pcx.fn_live[fi] == 0 || !wanted(f, pcx) {
                 continue;
             }
-            ir_enter(&*cx, fi);
+            ir_enter(&*cx, fi, pcx);
             seen.count = 0;
             for i in 0..IRFUNCS[fi].blocks.count {
                 let b = IRFUNCS[fi].blocks.data[i];
@@ -161,10 +153,10 @@ pub fn print_checks() {
                         && cx.insts[v].nargs >= 5 {
                         let k = cx.args.data[cx.insts[v].args];
                         let s = cx.args.data[cx.insts[v].args + 4];
-                        let kind = front_number(&*cx, k, -1);
-                        let site = front_number(&*cx, s, 0);
-                        put_site(out, site);
-                        buf_fmt_fn(out, f, kind_name(kind), c"left");
+                        let kind = front_number(&*cx, k, -1, pcx);
+                        let site = front_number(&*cx, s, 0, pcx);
+                        put_site(out, site, pcx);
+                        buf_fmt_fn(out, f, kind_name(kind, pcx), c"left", pcx);
                         seen.push(site);
                         left += 1;
                     }
@@ -176,19 +168,21 @@ pub fn print_checks() {
             var j = 0;
             while j < REMOVED.count {
                 if REMOVED.data[j] == fi {
-                    put_site(out, REMOVED.data[j + 1]);
-                    buf_fmt_fn(out, f, kind_name(REMOVED.data[j + 2]), c"removed (ranges)");
+                    put_site(out, REMOVED.data[j + 1], pcx);
+                    buf_fmt_fn(out, f, kind_name(REMOVED.data[j + 2], pcx), c"removed (ranges)",
+                        pcx);
                     seen.push(REMOVED.data[j + 1]);
                     removed += 1;
                 }
                 j += 3;
             }
             j = 0;
-            while j < NOTED.count {
-                if NOTED.data[j] == fi && NOTED.data[j + 1] > 0
-                    && !(0..seen.count).any(|q| seen.data[q] == NOTED.data[j + 1]) {
-                    put_site(out, NOTED.data[j + 1]);
-                    buf_fmt_fn(out, f, kind_name(NOTED.data[j + 2]), c"removed");
+            while j < pcx.checks_noted.count {
+                if pcx.checks_noted.data[j] == fi && pcx.checks_noted.data[j + 1] > 0
+                    && !(0..seen.count).any(|q| seen.data[q] == pcx.checks_noted.data[j + 1]) {
+                    put_site(out, pcx.checks_noted.data[j + 1], pcx);
+                    buf_fmt_fn(out, f, kind_name(pcx.checks_noted.data[j + 2], pcx), c"removed",
+                        pcx);
                     removed += 1;
                 }
                 j += 3;
@@ -204,10 +198,10 @@ pub fn print_checks() {
 }
 
 // `\tFN\tKIND\tSTATE\n`
-fn buf_fmt_fn(out: i64, f: i64, kind: *u8, state: *u8) {
+fn buf_fmt_fn(out: i64, f: i64, kind: *u8, state: *u8, pcx: Ctx<Comp>) {
     unsafe {
         buf_byte(out, '\t');
-        buf_bytes(out, SYMS[FNS[f].display].text);
+        buf_bytes(out, SYMS[pcx.fns[f].display].text);
         buf_byte(out, '\t');
         buf_str(out, kind);
         buf_byte(out, '\t');
@@ -228,7 +222,7 @@ pub fn checks_leaf(gpa: Gpa) -> Leaf<Gpa> {
 
 // `volec query checks NAME [-O N] [ROOT]`: the program compiled (not
 // written) with --print-checks=NAME. Its exit status.
-pub fn run_query_checks(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+pub fn run_query_checks(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     let cmd = buf_new();
     var name = 0 as *u8;
     var root = 0 as *u8;
@@ -252,7 +246,7 @@ pub fn run_query_checks(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         }
     }
     unsafe {
-        root = crate::tools::query::roots::program_root(root, &tcx);
+        root = crate::tools::query::roots::program_root(root, &tcx, pcx);
         if name == 0 as *u8 || root == 0 as *u8 {
             buf_str(cmd, c"error query.usage: volec query checks FN|MODULE [-O N] [ROOT]\n");
             buf_write_fd(cmd, 2);

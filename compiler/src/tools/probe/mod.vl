@@ -24,14 +24,17 @@
 mod code;
 mod run;
 
+use std::Arena;
+
 use crate::base::{
-    FILES, IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    streq,
+    IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::{Call, EV_MISSING, EV_WORD, Leaf, is_opt, option, short_option, table};
-use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::ast::{NodeKind, child};
 use crate::front::cpp::directives::file_exists;
+use crate::front::embed::wgsl::WgslCx;
 use crate::tools::ctx::Tcx;
 use crate::tools::probe::code::{copy_with_probes, has};
 use crate::tools::probe::run::{report, run_program};
@@ -40,9 +43,9 @@ use crate::tools::proc::{
 };
 use crate::tools::query::{c_slice, parse_count};
 use crate::tools::query::command_line::load_program;
-use crate::tools::query::diagnostics::{PROG, diag, put_word, try_begin, try_end, write_diags};
+use crate::tools::query::diagnostics::{diag, put_word, try_begin, try_end, write_diags};
 use crate::tools::query::names::path_matches;
-use crate::tools::query::positions::{LINES, line_end, line_index};
+use crate::tools::query::positions::{line_end, line_index};
 use crate::tools::query::refs::file_text;
 
 extern "C" {
@@ -98,8 +101,8 @@ fn probe(k: i64, tcx: Tcx<Comp>) -> *Probe {
     unsafe { tcx.probes.data[k] as *Probe }
 }
 
-pub fn run_probe(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    let status = probe_inner(c, &tcx);
+pub fn run_probe(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
+    let status = probe_inner(c, &tcx, &pcx, &wgx);
     write_diags(tcx);
     status
 }
@@ -164,8 +167,8 @@ pub fn probe_leaf(gpa: Gpa) -> Leaf<Gpa> {
     Leaf::new(opts, "probe").with_last("args")
 }
 
-fn probe_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    PROG = c.prog();
+fn probe_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
+    pcx.prog = c.prog();
     tcx.tool = 0 as *u8;
     var root = 0 as *u8;
     var last = 0 as *Probe;
@@ -244,8 +247,8 @@ fn probe_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         if tcx.probes.count > PROBES_MAX {
             return usage(c"at most 32 probes", 0 as *u8, &tcx);
         }
-        var r = crate::tools::query::roots::program_root(root, &tcx);
-        if r == 0 as *u8 && file_exists(probe(0, tcx).site_file()) {
+        var r = crate::tools::query::roots::program_root(root, &tcx, pcx);
+        if r == 0 as *u8 && file_exists(probe(0, tcx).site_file(), pcx) {
             // (no main.vl: the probed file is the root)
             r = probe(0, tcx).site_file();
         }
@@ -254,20 +257,20 @@ fn probe_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_str(d, c"no main.vl here: name the program's root (--root ROOT)\n");
             return 2;
         }
-        if !load_program(r, 0, &tcx) {
+        if !load_program(r, 0, &tcx, &pcx, &wgx) {
             let d = diag(c"error", c"probe.build", &tcx);
             buf_str(d, c"the program does not parse\n");
-            let t = try_begin(c"check", c_slice(c""), false, &tcx);
+            let t = try_begin(c"check", c_slice(c""), false, &tcx, pcx);
             put_word(t, c_slice(r));
             try_end(t);
             return 1;
         }
         for k in 0..tcx.probes.count {
-            if !locate(&*probe(k, tcx), &tcx) {
+            if !locate(&*probe(k, tcx), &tcx, pcx) {
                 return 1;
             }
         }
-        run_probes(r, &tcx)
+        run_probes(r, &tcx, pcx)
     }
 }
 
@@ -275,7 +278,7 @@ fn probe_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
 
 // The statement beginning probe p's line, or the block that line opens:
 // p.at, p.how, p.what; false (a diagnostic) when there is none.
-fn locate(p: inout Probe, tcx: inout Tcx<Comp>) -> bool {
+fn locate(p: inout Probe, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let s = c_slice(p.site);
         var colon = s.len as i64 - 1;
@@ -284,10 +287,10 @@ fn locate(p: inout Probe, tcx: inout Tcx<Comp>) -> bool {
         }
         let name = s[0..colon];
         var f = -1;
-        for g in 0..crate::base::FILES.len() as i64 {
-            let t = file_text(g);
+        for g in 0..pcx.files.len() as i64 {
+            let t = file_text(g, pcx);
             if f < 0 && t.len > 0 && t[0] != '<'
-                && crate::base::FILES[g].kind == crate::base::SOURCE_VOLE
+                && pcx.files[g].kind == crate::base::SOURCE_VOLE
                 && path_matches(t, name) {
                 f = g;
             }
@@ -297,23 +300,23 @@ fn locate(p: inout Probe, tcx: inout Tcx<Comp>) -> bool {
             buf_str(d, c"no file '");
             buf_bytes(d, name);
             buf_str(d, c"' in the program (a probe goes in a file of it)\n");
-            let t = try_begin(c"items", c_slice(c""), false, &tcx);
+            let t = try_begin(c"items", c_slice(c""), false, &tcx, pcx);
             try_end(t);
             return false;
         }
         p.file = f;
-        let first_line = line_index(FILES[f].start);
+        let first_line = line_index(pcx.files[f].start, pcx);
         let idx = first_line + p.line - 1;
-        if p.line < 1 || idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+        if p.line < 1 || idx >= pcx.lines.count || pcx.lines.data[idx] >= pcx.files[f].end {
             let d = diag(c"error", c"probe.no-line", &tcx);
-            buf_bytes(d, file_text(f));
+            buf_bytes(d, file_text(f, pcx));
             buf_str(d, c" has no line ");
             buf_int(d, p.line);
             buf_byte(d, '\n');
             return false;
         }
-        let ls = LINES.data[idx];
-        let le = line_end(ls);
+        let ls = pcx.lines.data[idx];
+        let le = line_end(ls, pcx);
         var fp = ls;
         while fp < le && (SRC[fp] == ' ' || SRC[fp] == '\t') {
             fp += 1;
@@ -322,67 +325,69 @@ fn locate(p: inout Probe, tcx: inout Tcx<Comp>) -> bool {
         // line: the widest.
         var best = 0;
         var tail = false;
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind != NodeKind::Block || NODES[n].start < FILES[f].start
-                || NODES[n].end > FILES[f].end {
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind != NodeKind::Block || pcx.nodes[n].start < pcx.files[f].start
+                || pcx.nodes[n].end > pcx.files[f].end {
                 continue;
             }
-            for c in 0..NODES[n].count + 1 {
-                let st = if c < NODES[n].count { child(n, c) } else { NODES[n].a };
-                if st <= 0 || NODES[st].start != fp {
+            for c in 0..pcx.nodes[n].count + 1 {
+                let st = if c < pcx.nodes[n].count { child(n, c, pcx) } else { pcx.nodes[n].a };
+                if st <= 0 || pcx.nodes[st].start != fp {
                     continue;
                 }
                 if best == 0
-                    || NODES[st].end - NODES[st].start > NODES[best].end - NODES[best].start {
+                    || pcx.nodes[st].end - pcx.nodes[st].start
+                    > pcx.nodes[best].end - pcx.nodes[best].start {
                     best = st;
-                    tail = c == NODES[n].count;
+                    tail = c == pcx.nodes[n].count;
                 }
             }
         }
         p.what = SRC[fp..le];
         if best != 0 {
-            let k = NODES[best].kind;
-            let e = if k == NodeKind::ExprStmt { NODES[best].a } else if tail { best } else { 0 };
+            let k = pcx.nodes[best].kind;
+            let e = if k == NodeKind::ExprStmt { pcx.nodes[best].a } else if tail { best }
+                else { 0 };
             if k == NodeKind::Let {
                 // After it: its names are visible.
-                var q = NODES[best].end;
+                var q = pcx.nodes[best].end;
                 if SRC[q - 1] != ';' {
-                    while q < FILES[f].end && (SRC[q] == ' ' || SRC[q] == '\t') {
+                    while q < pcx.files[f].end && (SRC[q] == ' ' || SRC[q] == '\t') {
                         q += 1;
                     }
                     if SRC[q] == ';' {
                         q += 1;
                     } else {
-                        q = NODES[best].end;
+                        q = pcx.nodes[best].end;
                     }
                 }
-                p.at = q - FILES[f].start;
+                p.at = q - pcx.files[f].start;
                 p.how = AT_AFTER;
                 return true;
             }
-            if e > 0 && (NODES[e].kind == NodeKind::While || NODES[e].kind == NodeKind::For
-                || NODES[e].kind == NodeKind::Loop) {
+            if e > 0 && (pcx.nodes[e].kind == NodeKind::While || pcx.nodes[e].kind == NodeKind::For
+                || pcx.nodes[e].kind == NodeKind::Loop) {
                 // In the body, each time round: the last block opening on
                 // this line.
-                let body = opening_block(f, ls, le, NODES[e].start, NODES[e].end);
+                let body = opening_block(f, ls, le, pcx.nodes[e].start, pcx.nodes[e].end, pcx);
                 if body > 0 {
-                    p.at = NODES[body].start + 1 - FILES[f].start;
+                    p.at = pcx.nodes[body].start + 1 - pcx.files[f].start;
                     p.how = AT_BODY;
                     return true;
                 }
             }
-            p.at = fp - FILES[f].start;
+            p.at = fp - pcx.files[f].start;
             p.how = AT_BEFORE;
             return true;
         }
-        let b = opening_block(f, ls, le, FILES[f].start, FILES[f].end);
+        let b = opening_block(f, ls, le, pcx.files[f].start, pcx.files[f].end, pcx);
         if b > 0 {
-            p.at = NODES[b].start + 1 - FILES[f].start;
+            p.at = pcx.nodes[b].start + 1 - pcx.files[f].start;
             p.how = AT_BLOCK;
             return true;
         }
         let d = diag(c"error", c"probe.no-statement", &tcx);
-        buf_bytes(d, file_text(f));
+        buf_bytes(d, file_text(f, pcx));
         buf_byte(d, ':');
         buf_int(d, p.line);
         buf_str(d, c" begins no statement and opens no block; a probe goes at a line that does\n");
@@ -393,10 +398,10 @@ fn locate(p: inout Probe, tcx: inout Tcx<Comp>) -> bool {
             let lines: [i64; 2] = [p.line - dist, p.line + dist];
             for j in 0..2 {
                 let l = lines[j];
-                if shown < 2 && l >= 1 && starts_statement(f, l) {
-                    let t = try_begin(c"probe", c_slice(c""), false, &tcx);
+                if shown < 2 && l >= 1 && starts_statement(f, l, pcx) {
+                    let t = try_begin(c"probe", c_slice(c""), false, &tcx, pcx);
                     let w = buf_new();
-                    buf_bytes(w, file_text(f));
+                    buf_bytes(w, file_text(f, pcx));
                     buf_byte(w, ':');
                     buf_int(w, l);
                     put_word(t, buf_slice(w));
@@ -434,13 +439,13 @@ fn put_run_args(t: i64, tcx: inout Tcx<Comp>) {
 
 // The last block of file f whose `{` is on the line [ls, le), within
 // [lo, hi); 0: none.
-fn opening_block(f: i64, ls: i64, le: i64, lo: i64, hi: i64) -> i64 {
+fn opening_block(f: i64, ls: i64, le: i64, lo: i64, hi: i64, pcx: Ctx<Comp>) -> i64 {
     var b = 0;
-    for n in 1..NODES.len() as i64 {
-        let st = NODES[n].start;
-        if NODES[n].kind == NodeKind::Block && st >= ls && st < le && st >= lo && st < hi
-            && SRC[st] == '{' && NODES[n].end <= FILES[f].end
-            && (b == 0 || st > NODES[b].start) {
+    for n in 1..pcx.nodes.len() as i64 {
+        let st = pcx.nodes[n].start;
+        if pcx.nodes[n].kind == NodeKind::Block && st >= ls && st < le && st >= lo && st < hi
+            && SRC[st] == '{' && pcx.nodes[n].end <= pcx.files[f].end
+            && (b == 0 || st > pcx.nodes[b].start) {
             b = n;
         }
     }
@@ -448,22 +453,22 @@ fn opening_block(f: i64, ls: i64, le: i64, lo: i64, hi: i64) -> i64 {
 }
 
 // Whether line l of file f begins a statement (for the try: lines).
-fn starts_statement(f: i64, l: i64) -> bool {
+fn starts_statement(f: i64, l: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let idx = line_index(FILES[f].start) + l - 1;
-        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+        let idx = line_index(pcx.files[f].start, pcx) + l - 1;
+        if idx >= pcx.lines.count || pcx.lines.data[idx] >= pcx.files[f].end {
             return false;
         }
-        let ls = LINES.data[idx];
+        let ls = pcx.lines.data[idx];
         var fp = ls;
-        while fp < line_end(ls) && (SRC[fp] == ' ' || SRC[fp] == '\t') {
+        while fp < line_end(ls, pcx) && (SRC[fp] == ' ' || SRC[fp] == '\t') {
             fp += 1;
         }
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind == NodeKind::Block && NODES[n].start >= FILES[f].start
-                && NODES[n].end <= FILES[f].end {
-                for c in 0..NODES[n].count {
-                    if NODES[child(n, c)].start == fp {
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind == NodeKind::Block && pcx.nodes[n].start >= pcx.files[f].start
+                && pcx.nodes[n].end <= pcx.files[f].end {
+                for c in 0..pcx.nodes[n].count {
+                    if pcx.nodes[child(n, c, pcx)].start == fp {
                         return true;
                     }
                 }
@@ -578,20 +583,20 @@ fn probe_files(files: inout IntVec, tcx: Tcx<Comp>) {
 // `--overlay PATH COPY` for each, appended to args; the copies' texts in
 // copies (buffers, by the order of files).
 fn write_copies(dir: *u8, files: IntVec, typing: bool, args: inout IntVec, copies: inout IntVec,
-    tcx: inout Tcx<Comp>) -> bool {
+    tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     unsafe {
         copies.count = 0;
         for j in 0..files.count {
             let f = files.data[j];
             let original = buf_new();
-            if !read_file_if(FILES[f].path, original) {
+            if !read_file_if(pcx.files[f].path, original) {
                 let d = diag(c"error", c"probe.no-file", &tcx);
                 buf_str(d, c"cannot read '");
-                buf_str(d, FILES[f].path);
+                buf_str(d, pcx.files[f].path);
                 buf_str(d, c"'\n");
                 return false;
             }
-            let copy = copy_with_probes(f, buf_slice(original), typing, tcx);
+            let copy = copy_with_probes(f, buf_slice(original), typing, tcx, pcx);
             let path = buf_new();
             buf_str(path, dir);
             buf_bytes(path, "/copy");
@@ -607,7 +612,7 @@ fn write_copies(dir: *u8, files: IntVec, typing: bool, args: inout IntVec, copie
                 return false;
             }
             args.push(c"--overlay" as i64);
-            args.push(FILES[f].path as i64);
+            args.push(pcx.files[f].path as i64);
             args.push(p as i64);
             copies.push(copy);
         }
@@ -631,7 +636,8 @@ fn run_words(args: IntVec, out: i64) -> i64 {
 // its type (the "expected '()', got 'T'" of the type questions), or (not
 // typing) opaque when a trait is missing. Whether everything is answered
 // (no error but the type questions' and missing traits).
-fn read_errors(log: [u8], files: IntVec, copies: IntVec, typing: bool, tcx: inout Tcx<Comp>) -> bool {
+fn read_errors(log: [u8], files: IntVec, copies: IntVec, typing: bool, tcx: inout Tcx<Comp>,
+    pcx: Ctx<Comp>) -> bool {
     unsafe {
         var ok = true;
         // (each expression one level a round)
@@ -649,7 +655,7 @@ fn read_errors(log: [u8], files: IntVec, copies: IntVec, typing: bool, tcx: inou
             var msg = line[0..0];
             for j in 0..files.count {
                 let f = files.data[j];
-                let at = error_offset(line, c_slice(FILES[f].path), buf_slice(copies.data[j]),
+                let at = error_offset(line, c_slice(pcx.files[f].path), buf_slice(copies.data[j]),
                     &msg);
                 if at >= 0 && found < 0 {
                     found = holder(f, at, tcx);
@@ -717,8 +723,8 @@ fn starts(s: [u8], p: [u8]) -> bool {
 // The directory of the copies and the build: out of the program's
 // source tree (0.25.2, proc::scratch_dir: the checkout's target/, else
 // $TMPDIR), by the root.
-fn work_dir(root: *u8) -> *u8 {
-    scratch_dir(root, "probe")
+fn work_dir(root: *u8, pcx: Ctx<Comp>) -> *u8 {
+    scratch_dir(root, "probe", pcx)
 }
 
 fn path_in(dir: *u8, name: [u8]) -> *u8 {
@@ -731,9 +737,9 @@ fn path_in(dir: *u8, name: [u8]) -> *u8 {
 
 // The probes run (run_probes_in), then their copies of the sources
 // removed: the build and the outputs stay for the report to name.
-fn run_probes(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
-    let status = run_probes_in(root, &tcx);
-    let dir = work_dir(root);
+fn run_probes(root: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let status = run_probes_in(root, &tcx, pcx);
+    let dir = work_dir(root, pcx);
     var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
     probe_files(&files, tcx);
     for j in 0..files.count {
@@ -747,9 +753,9 @@ fn run_probes(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
     status
 }
 
-fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let dir = work_dir(root);
+        let dir = work_dir(root, pcx);
         var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         probe_files(&files, tcx);
         var copies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -767,15 +773,15 @@ fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         }
         if typed {
             var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            args.push(PROG as i64);
+            args.push(pcx.prog as i64);
             args.push(c"check" as i64);
             args.push(root as i64);
-            if !write_copies(dir, files, true, &args, &copies, &tcx) {
+            if !write_copies(dir, files, true, &args, &copies, &tcx, pcx) {
                 return 1;
             }
             let log = buf_new();
             run_words(args, log);
-            if !read_errors(buf_slice(log), files, copies, true, &tcx) {
+            if !read_errors(buf_slice(log), files, copies, true, &tcx, pcx) {
                 return 1;
             }
         }
@@ -785,7 +791,7 @@ fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         var round = 0;
         while !built && round < 3 {
             var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            args.push(PROG as i64);
+            args.push(pcx.prog as i64);
             args.push(root as i64);
             args.push(c"-o" as i64);
             args.push(bin as i64);
@@ -796,7 +802,7 @@ fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
             if tcx.probe_opt != 0 as *u8 {
                 args.push(tcx.probe_opt as i64);
             }
-            if !write_copies(dir, files, false, &args, &copies, &tcx) {
+            if !write_copies(dir, files, false, &args, &copies, &tcx, pcx) {
                 return 1;
             }
             let log = buf_new();
@@ -810,7 +816,7 @@ fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                         opaque_before += probe(k, tcx).opaque.data[x];
                     }
                 }
-                let answered = read_errors(buf_slice(log), files, copies, false, &tcx);
+                let answered = read_errors(buf_slice(log), files, copies, false, &tcx, pcx);
                 var opaque_after = 0;
                 for k in 0..tcx.probes.count {
                     for x in 0..probe(k, tcx).opaque.count {
@@ -834,6 +840,6 @@ fn run_probes_in(root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         let out_path = path_in(dir, "out");
         let err_path = path_in(dir, "err");
         let status = run_program(bin, out_path, err_path, tcx);
-        report(status, out_path, err_path, tcx)
+        report(status, out_path, err_path, tcx, pcx)
     }
 }

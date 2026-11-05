@@ -12,12 +12,14 @@ use crate::base::{
     IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
     sym_name,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::effects::{
     EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
     EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
 };
 use crate::front::effects::builtin::known_c_effects;
-use crate::front::types::{FNS, TLISTS, TYPES, TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
+use crate::front::types::{TLISTS, TYPES, TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
 use crate::gen0::gen::fn_is_global;
 use crate::gen0::target::rt_panic_sym;
 use crate::middle::ctx::FnCtx;
@@ -25,10 +27,10 @@ use crate::middle::fold::is_const;
 use crate::middle::gvn::{
     copy_dst, copy_src, find_escaping_slots, is_copy, is_private_root, root_of,
 };
-use crate::middle::inline::{FN_ADDRESS, FN_LIVE, FN_SCC, SCC_ORDER, ir_callee, param_operand};
+use crate::middle::inline::{ir_callee, param_operand};
 use crate::middle::ir::{
-    FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter, ir_insert_before, ir_make,
-    ir_new_slot, ir_operand, ir_operand_count, ir_replace, ir_set_operand, ir_unlink, ir_val,
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_insert_before, ir_make, ir_new_slot,
+    ir_operand, ir_operand_count, ir_replace, ir_set_operand, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, Call, CallC, CallI, Cmp, Const, Copy, FAddr, Load, Param, SAddr, Store,
@@ -69,36 +71,32 @@ const ATTR_ALL: i64 = 63;
 pub static var FN_ATTRS: *i64 = 0 as *i64;
 pub static var FN_NOCAPTURE: *i64 = 0 as *i64;
 pub static var FN_ATTRS_DONE: *i64 = 0 as *i64;
-pub static var ATTRS_READY: bool = false;
 
-// --print-attrs: print every function's attributes (stderr).
-pub static var PRINT_ATTRS: bool = false;
-
-pub fn init_attrs() {
-    FN_ATTRS = alloc_array::<i64>(IRFUNC_COUNT + 1);
-    FN_NOCAPTURE = alloc_array::<i64>(IRFUNC_COUNT + 1);
-    FN_ATTRS_DONE = alloc_array::<i64>(IRFUNC_COUNT + 1);
-    ATTRS_READY = true;
+pub fn init_attrs(pcx: inout Ctx<Comp>) {
+    FN_ATTRS = alloc_array::<i64>(pcx.irfunc_count + 1);
+    FN_NOCAPTURE = alloc_array::<i64>(pcx.irfunc_count + 1);
+    FN_ATTRS_DONE = alloc_array::<i64>(pcx.irfunc_count + 1);
+    pcx.attrs_ready = true;
 }
 
 // What call v is known to do, as attribute bits (0: nothing known).
-pub fn call_attrs(cx: inout FnCtx, v: i64) -> i64 {
+pub fn call_attrs(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let op = cx.insts[v].op;
         if op == Call {
-            let g = FN_IR[cx.insts[v].imm] - 1;
+            let g = pcx.fn_ir[cx.insts[v].imm] - 1;
             if g < 0 {
                 // A C function (builtin.vl's table, or its declaration).
-                return front_attrs(cx.insts[v].imm);
+                return front_attrs(cx.insts[v].imm, pcx);
             }
             // (0.18.1: in the bottom-up phase, a callee whose component is
             // below this one's: one being done on another thread is not)
-            if ATTRS_READY && fn_facts_ready(&cx, g, FN_ATTRS_DONE[g] != 0) {
+            if pcx.attrs_ready && fn_facts_ready(&cx, g, FN_ATTRS_DONE[g] != 0, pcx) {
                 // (0.18.1: for the code cache, back::codecache)
-                cc_note(&cx, R_ATTRS, g);
-                return FN_ATTRS[g] | front_attrs(cx.insts[v].imm);
+                cc_note(&cx, R_ATTRS, g, pcx);
+                return FN_ATTRS[g] | front_attrs(cx.insts[v].imm, pcx);
             }
-            return front_attrs(cx.insts[v].imm);
+            return front_attrs(cx.insts[v].imm, pcx);
         }
         if op == CallC {
             let name = cx.insts[v].imm;
@@ -119,21 +117,21 @@ pub fn call_attrs(cx: inout FnCtx, v: i64) -> i64 {
 // are all numbers READNONE (and so READONLY). A C function the inference
 // left unknown and that declares nothing has builtin.vl's table
 // (libm: READNONE). 0: nothing known.
-pub fn front_attrs(f: i64) -> i64 {
+pub fn front_attrs(f: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        var e = fn_effects(f);
+        var e = fn_effects(f, pcx);
         // (0.25) A C function of the table (that declares nothing): libm is
         // bounded.
-        let table = FNS[f].is_extern && FNS[f].effect_decl == 0
-            && (known_c_effects(FNS[f].name).bits & EFF_UNKNOWN) == 0;
-        if (e.bits & EFF_UNKNOWN) != 0 && FNS[f].is_extern && FNS[f].effect_decl == 0 {
-            e = known_c_effects(FNS[f].name);
+        let table = pcx.fns[f].is_extern && pcx.fns[f].effect_decl == 0
+            && (known_c_effects(pcx.fns[f].name).bits & EFF_UNKNOWN) == 0;
+        if (e.bits & EFF_UNKNOWN) != 0 && pcx.fns[f].is_extern && pcx.fns[f].effect_decl == 0 {
+            e = known_c_effects(pcx.fns[f].name);
         }
-        var attrs = effects_attrs(e, FNS[f].is_extern && numeric_params(f));
+        var attrs = effects_attrs(e, pcx.fns[f].is_extern && numeric_params(f, pcx));
         if table {
             attrs = c_lib_bounded(attrs);
         }
-        if FNS[f].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
+        if pcx.fns[f].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
             // (A C function that may not return may exit: `exit`, `abort`.)
             attrs = attrs & ~ATTR_NOPANIC;
         }
@@ -166,13 +164,13 @@ fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
 
 // Whether every parameter of function f is a number (an integer, a float,
 // a bool: no pointer, slice or function).
-fn numeric_params(f: i64) -> bool {
+fn numeric_params(f: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if FNS[f].variadic {
+        if pcx.fns[f].variadic {
             return false;
         }
-        for i in 0..FNS[f].param_count {
-            let t = TLISTS.data[FNS[f].params + i];
+        for i in 0..pcx.fns[f].param_count {
+            let t = TLISTS.data[pcx.fns[f].params + i];
             if !is_integer(t) && !is_float(t) && t != TY_BOOL {
                 return false;
             }
@@ -211,27 +209,27 @@ pub fn bounded_cost(attrs: i64) -> i64 {
 }
 
 // Whether call v may write memory other than the caller's private slots.
-pub fn call_writes(cx: inout FnCtx, v: i64) -> bool {
-    call_attrs(&cx, v) & ATTR_READONLY == 0
+pub fn call_writes(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
+    call_attrs(&cx, v, pcx) & ATTR_READONLY == 0
 }
 
 // Whether call v may read memory other than the caller's private slots.
-pub fn call_reads(cx: inout FnCtx, v: i64) -> bool {
-    call_attrs(&cx, v) & ATTR_READNONE == 0
+pub fn call_reads(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
+    call_attrs(&cx, v, pcx) & ATTR_READNONE == 0
 }
 
 // Whether call v may be removed when its result is unused: it reads and
 // writes nothing, always returns and cannot panic.
-pub fn call_removable(cx: inout FnCtx, v: i64) -> bool {
+pub fn call_removable(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
     let needed = ATTR_READNONE | ATTR_WILLRETURN | ATTR_NOPANIC;
-    call_attrs(&cx, v) & needed == needed
+    call_attrs(&cx, v, pcx) & needed == needed
 }
 
 // Whether instruction v must stay even when its value is unused.
-pub fn has_effect(cx: inout FnCtx, v: i64) -> bool {
+pub fn has_effect(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
     let op = unsafe { cx.insts[v].op };
     if op.is_call() {
-        return !call_removable(&cx, v);
+        return !call_removable(&cx, v, pcx);
     }
     op.has_side_effect()
 }
@@ -239,9 +237,9 @@ pub fn has_effect(cx: inout FnCtx, v: i64) -> bool {
 // The attributes of function fi from its instructions, its callees' known
 // attributes, and FN_ATTRS of the functions of its own component (assumed
 // for now: the component is iterated). Also its nocapture bits.
-fn compute_attrs(cx: inout FnCtx, fi: i64) -> i64 {
+fn compute_attrs(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if calls_returns_twice(&cx, fi) {
+        if calls_returns_twice(&cx, fi, pcx) {
             FN_NOCAPTURE[fi] = 0;
             return 0;
         }
@@ -290,11 +288,11 @@ fn compute_attrs(cx: inout FnCtx, fi: i64) -> i64 {
                     // written, other threads synchronized with.
                     attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
                 } else if op.is_call() {
-                    var known = call_attrs(&cx, v);
+                    var known = call_attrs(&cx, v, pcx);
                     if op == Call {
-                        let g = FN_IR[cx.insts[v].imm] - 1;
-                        cc_note(&cx, R_STATIC, g);
-                        if g >= 0 && FN_SCC[g] == FN_SCC[fi] {
+                        let g = pcx.fn_ir[cx.insts[v].imm] - 1;
+                        cc_note(&cx, R_STATIC, g, pcx);
+                        if g >= 0 && pcx.fn_scc[g] == pcx.fn_scc[fi] {
                             // Within the component: what is assumed so far;
                             // recursion may not return.
                             known = FN_ATTRS[g] & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
@@ -338,7 +336,7 @@ fn compute_attrs(cx: inout FnCtx, fi: i64) -> i64 {
                 attrs = attrs | (cost << ATTR_COST_SHIFT);
             }
         }
-        FN_NOCAPTURE[fi] = compute_nocapture(&cx, fi);
+        FN_NOCAPTURE[fi] = compute_nocapture(&cx, fi, pcx);
         attrs
     }
 }
@@ -359,14 +357,14 @@ fn writes_shared(cx: inout FnCtx, a: i64) -> bool {
 // The nocapture bits of function fi: a bit per call operand (see
 // param_operand) of a parameter that is only dereferenced, compared, or
 // passed to a nocapture parameter.
-fn compute_nocapture(cx: inout FnCtx, fi: i64) -> i64 {
+fn compute_nocapture(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var bits = 0;
         let entry = IRFUNCS[fi].entry;
         var p = cx.blocks[entry].first;
         while p != 0 && cx.insts[p].op == Param {
-            let k = param_operand(&cx, fi, p);
-            if k >= 0 && k < 63 && cx.insts[p].ty == TY_U64 && !captured(&cx, fi, p) {
+            let k = param_operand(&cx, fi, p, pcx);
+            if k >= 0 && k < 63 && cx.insts[p].ty == TY_U64 && !captured(&cx, fi, p, pcx) {
                 bits = bits | (1 << k);
             }
             p = cx.insts[p].next;
@@ -375,7 +373,7 @@ fn compute_nocapture(cx: inout FnCtx, fi: i64) -> i64 {
     }
 }
 
-fn captured(cx: inout FnCtx, fi: i64, p: i64) -> bool {
+fn captured(cx: inout FnCtx, fi: i64, p: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         cx.capture_stamp += 1;
         let stamp = cx.capture_stamp;
@@ -410,18 +408,18 @@ fn captured(cx: inout FnCtx, fi: i64, p: i64) -> bool {
                         } else if op == Copy && k <= 1 {
                         } else if op == Cmp {
                         } else if op == Call && k >= 3 {
-                            let g = FN_IR[cx.insts[v].imm] - 1;
+                            let g = pcx.fn_ir[cx.insts[v].imm] - 1;
                             let bit = k - 3;
-                            cc_note(&cx, R_STATIC, g);
-                            if g >= 0 && g != fi && FN_SCC[g] != FN_SCC[fi] {
-                                cc_note(&cx, R_ATTRS, g);
+                            cc_note(&cx, R_STATIC, g, pcx);
+                            if g >= 0 && g != fi && pcx.fn_scc[g] != pcx.fn_scc[fi] {
+                                cc_note(&cx, R_ATTRS, g, pcx);
                             }
-                            if g >= 0 && g != fi && FN_SCC[g] == FN_SCC[fi] {
+                            if g >= 0 && g != fi && pcx.fn_scc[g] == pcx.fn_scc[fi] {
                                 cx.used_component = true;
                             }
                             if g < 0 || bit >= 63 || g == fi
-                                || (FN_SCC[g] != FN_SCC[fi]
-                                    && !fn_facts_ready(&cx, g, FN_ATTRS_DONE[g] != 0))
+                                || (pcx.fn_scc[g] != pcx.fn_scc[fi]
+                                    && !fn_facts_ready(&cx, g, FN_ATTRS_DONE[g] != 0, pcx))
                                 || FN_NOCAPTURE[g] & (1 << bit) == 0 {
                                 result = true;
                             }
@@ -442,10 +440,10 @@ fn captured(cx: inout FnCtx, fi: i64, p: i64) -> bool {
 // component), optimistically: everything is assumed, then taken away
 // until nothing changes. A component whose functions do not call each
 // other (a single function, not recursive) takes one round.
-pub fn infer_component_attrs(cx: inout FnCtx, start: i64, end: i64) {
+pub fn infer_component_attrs(cx: inout FnCtx, start: i64, end: i64, pcx: Ctx<Comp>) {
     unsafe {
         for i in start..end {
-            let fi = SCC_ORDER.data[i];
+            let fi = pcx.scc_order.data[i];
             FN_ATTRS[fi] = ATTR_ALL & ~ATTR_NORETURN;
             FN_NOCAPTURE[fi] = -1;
         }
@@ -456,10 +454,10 @@ pub fn infer_component_attrs(cx: inout FnCtx, start: i64, end: i64) {
             rounds += 1;
             cx.used_component = false;
             for i in start..end {
-                let fi = SCC_ORDER.data[i];
-                ir_enter(&cx, fi);
+                let fi = pcx.scc_order.data[i];
+                ir_enter(&cx, fi, pcx);
                 let nocapture = FN_NOCAPTURE[fi];
-                let attrs = compute_attrs(&cx, fi);
+                let attrs = compute_attrs(&cx, fi, pcx);
                 if attrs != FN_ATTRS[fi] || FN_NOCAPTURE[fi] != nocapture {
                     FN_ATTRS[fi] = attrs;
                     changed = true;
@@ -472,25 +470,25 @@ pub fn infer_component_attrs(cx: inout FnCtx, start: i64, end: i64) {
         if changed {
             // Not settled: nothing is known.
             for i in start..end {
-                FN_ATTRS[SCC_ORDER.data[i]] = 0;
-                FN_NOCAPTURE[SCC_ORDER.data[i]] = 0;
+                FN_ATTRS[pcx.scc_order.data[i]] = 0;
+                FN_NOCAPTURE[pcx.scc_order.data[i]] = 0;
             }
         }
         for i in start..end {
-            FN_ATTRS_DONE[SCC_ORDER.data[i]] = 1;
+            FN_ATTRS_DONE[pcx.scc_order.data[i]] = 1;
         }
     }
 }
 
 // --print-attrs.
-pub fn print_attrs() {
+pub fn print_attrs(pcx: Ctx<Comp>) {
     unsafe {
         let out = buf_new();
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] == 0 || FN_ATTRS_DONE[fi] == 0 {
+        for fi in 0..pcx.irfunc_count {
+            if pcx.fn_live[fi] == 0 || FN_ATTRS_DONE[fi] == 0 {
                 continue;
             }
-            buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
+            buf_str(out, sym_name(pcx.fns[IRFUNCS[fi].f].name));
             buf_str(out, c":");
             let a = FN_ATTRS[fi];
             if a & ATTR_READNONE != 0 {
@@ -528,13 +526,6 @@ pub fn print_attrs() {
 
 // ---- Interprocedural constant propagation ----
 
-// The direct call sites of each IR function: CALL_SITES[CALL_START[g]..
-// CALL_START[g + 1]] (instructions).
-static var CALL_START: *i64 = 0 as *i64;
-static var CALL_SITES: *i64 = 0 as *i64;
-
-static var CALL_FNS: *i64 = 0 as *i64;
-
 // A constant (or function address) passed at a call site, by value: the
 // instruction is the caller's (0.17).
 struct ConstArg { op: Op, ty: i64, imm: i64 }
@@ -542,21 +533,21 @@ struct ConstArg { op: Op, ty: i64, imm: i64 }
 // The direct call sites of every function g: CALL_SITES[CALL_START[g] ..
 // CALL_START[g + 1]], each an instruction of function CALL_FNS[..] (0.17:
 // instruction ids are the caller's own).
-fn collect_call_sites(cx: inout FnCtx) {
+fn collect_call_sites(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
-        let n = IRFUNC_COUNT;
-        free(CALL_START as *u8);
-        free(CALL_SITES as *u8);
-        free(CALL_FNS as *u8);
-        CALL_START = alloc_array::<i64>(n + 2);
+        let n = pcx.irfunc_count;
+        free(pcx.call_start as *u8);
+        free(pcx.call_sites as *u8);
+        free(pcx.call_fns as *u8);
+        pcx.call_start = alloc_array::<i64>(n + 2);
         var total = 0;
         for pass in 0..2 {
             let fill = alloc_array::<i64>(n + 1);
             for fi in 0..n {
-                if FN_LIVE[fi] == 0 {
+                if pcx.fn_live[fi] == 0 {
                     continue;
                 }
-                ir_enter(&cx, fi);
+                ir_enter(&cx, fi, pcx);
                 for i in 0..IRFUNCS[fi].blocks.count {
                     let b = IRFUNCS[fi].blocks.data[i];
                     if cx.blocks[b].removed != 0 {
@@ -564,13 +555,13 @@ fn collect_call_sites(cx: inout FnCtx) {
                     }
                     var v = cx.blocks[b].first;
                     while v != 0 {
-                        let g = ir_callee(&cx, v);
+                        let g = ir_callee(&cx, v, pcx);
                         if g >= 0 {
                             if pass == 0 {
-                                CALL_START[g] += 1;
+                                pcx.call_start[g] += 1;
                             } else {
-                                CALL_SITES[CALL_START[g] + fill[g]] = v;
-                                CALL_FNS[CALL_START[g] + fill[g]] = fi;
+                                pcx.call_sites[pcx.call_start[g] + fill[g]] = v;
+                                pcx.call_fns[pcx.call_start[g] + fill[g]] = fi;
                                 fill[g] += 1;
                             }
                         }
@@ -581,37 +572,37 @@ fn collect_call_sites(cx: inout FnCtx) {
             free(fill as *u8);
             if pass == 0 {
                 for g in 0..n + 1 {
-                    let count = CALL_START[g];
-                    CALL_START[g] = total;
+                    let count = pcx.call_start[g];
+                    pcx.call_start[g] = total;
                     total += count;
                 }
-                CALL_SITES = alloc_array::<i64>(total + 1);
-                CALL_FNS = alloc_array::<i64>(total + 1);
+                pcx.call_sites = alloc_array::<i64>(total + 1);
+                pcx.call_fns = alloc_array::<i64>(total + 1);
             }
         }
     }
 }
 
 // Whether function g is internal: only its direct calls reach it.
-fn is_internal(g: i64) -> bool {
+fn is_internal(g: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        FN_LIVE[g] != 0 && FN_ADDRESS[g] == 0 && !fn_is_global(IRFUNCS[g].f)
-            && !fn_uses_c(IRFUNCS[g].f)
+        pcx.fn_live[g] != 0 && pcx.fn_address[g] == 0 && !fn_is_global(IRFUNCS[g].f, pcx)
+            && !fn_uses_c(IRFUNCS[g].f, pcx)
     }
 }
 
 // The constant every call site passes as operand k (found: false when
 // they do not agree, or one passes no constant).
-fn common_constant_arg(cx: inout FnCtx, g: i64, k: i64, found: inout ConstArg) -> bool {
+fn common_constant_arg(cx: inout FnCtx, g: i64, k: i64, found: inout ConstArg, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let start = CALL_START[g];
-        let end = CALL_START[g + 1];
+        let start = pcx.call_start[g];
+        let end = pcx.call_start[g + 1];
         if end == start {
             return false;
         }
         for i in start..end {
-            let call = CALL_SITES[i];
-            ir_enter(&cx, CALL_FNS[i]);
+            let call = pcx.call_sites[i];
+            ir_enter(&cx, pcx.call_fns[i], pcx);
             if cx.insts[call].block == 0 || k >= cx.insts[call].nargs {
                 return false;
             }
@@ -636,7 +627,7 @@ fn common_constant_arg(cx: inout FnCtx, g: i64, k: i64, found: inout ConstArg) -
 // pointer's convention is the function's): after constant propagation
 // and inlining, a function pointer argument is often a constant. Returns
 // whether any call changed.
-pub fn devirtualize(cx: inout FnCtx, fi: i64) -> bool {
+pub fn devirtualize(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     var changed = false;
     unsafe {
         for i in 0..IRFUNCS[fi].blocks.count {
@@ -651,8 +642,8 @@ pub fn devirtualize(cx: inout FnCtx, fi: i64) -> bool {
                     if cx.insts[callee].op == FAddr {
                         let f = cx.insts[callee].imm;
                         let fn_ty = cx.insts[v].imm;
-                        if fn_type_uses_c(fn_ty) == fn_uses_c(f) && !FNS[f].variadic
-                            && FNS[f].param_count == TYPES[fn_ty].count {
+                        if fn_type_uses_c(fn_ty, pcx) == fn_uses_c(f, pcx) && !pcx.fns[f].variadic
+                            && pcx.fns[f].param_count == TYPES[fn_ty].count {
                             cx.insts[v].op = Call;
                             cx.insts[v].a = 0;
                             cx.insts[v].imm = f;
@@ -719,31 +710,31 @@ fn common_constant_result(cx: inout FnCtx, g: i64) -> i64 {
 // functions, top-down (callers first, so constants reaching a function
 // can flow on to its callees), and constant results out of them. Returns
 // whether anything changed.
-pub fn propagate_constants(cx: inout FnCtx) -> bool {
+pub fn propagate_constants(cx: inout FnCtx, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        collect_call_sites(&cx);
+        collect_call_sites(&cx, &pcx);
         var any = false;
-        var i = SCC_ORDER.count;
+        var i = pcx.scc_order.count;
         while i > 0 {
             i -= 1;
-            let g = SCC_ORDER.data[i];
-            if !is_internal(g) || CALL_START[g + 1] == CALL_START[g] {
+            let g = pcx.scc_order.data[i];
+            if !is_internal(g, pcx) || pcx.call_start[g + 1] == pcx.call_start[g] {
                 continue;
             }
-            ir_enter(&cx, g);
+            ir_enter(&cx, g, pcx);
             resolve_all(&cx, g);
             var changed = false;
             let entry = IRFUNCS[g].entry;
             var p = cx.blocks[entry].first;
             while p != 0 && cx.insts[p].op == Param {
                 let next = cx.insts[p].next;
-                let k = param_operand(&cx, g, p);
+                let k = param_operand(&cx, g, p, pcx);
                 if k >= 0 {
                     var c = ConstArg { op: Const, ty: 0, imm: 0 };
-                    let agree = common_constant_arg(&cx, g, k, &c);
-                    ir_enter(&cx, g);
+                    let agree = common_constant_arg(&cx, g, k, &c, pcx);
+                    ir_enter(&cx, g, pcx);
                     if agree && c.ty == cx.insts[p].ty {
-                        let k2 = ir_make(&cx, c.op, c.ty, 0, 0, c.imm);
+                        let k2 = ir_make(&cx, c.op, c.ty, 0, 0, c.imm, pcx);
                         ir_append_after_params(&cx, entry, k2);
                         replace_uses_keep(&cx, g, p, k2);
                         changed = true;
@@ -753,32 +744,32 @@ pub fn propagate_constants(cx: inout FnCtx) -> bool {
             }
             if changed {
                 any = true;
-                devirtualize(&cx, g);
-                verify_func(&cx, g, c"interprocedural constants (arguments)");
-                simplify_function(&cx, g);
+                devirtualize(&cx, g, pcx);
+                verify_func(&cx, g, c"interprocedural constants (arguments)", pcx);
+                simplify_function(&cx, g, pcx);
             }
         }
         // Constant results.
-        for g in 0..IRFUNC_COUNT {
-            if !is_internal(g) {
+        for g in 0..pcx.irfunc_count {
+            if !is_internal(g, pcx) {
                 continue;
             }
-            ir_enter(&cx, g);
+            ir_enter(&cx, g, pcx);
             let r = common_constant_result(&cx, g);
             if r == 0 {
                 continue;
             }
             let r_ty = cx.insts[r].ty;
             let r_imm = cx.insts[r].imm;
-            for s in CALL_START[g]..CALL_START[g + 1] {
-                let call = CALL_SITES[s];
-                let fi = CALL_FNS[s];
-                ir_enter(&cx, fi);
+            for s in pcx.call_start[g]..pcx.call_start[g + 1] {
+                let call = pcx.call_sites[s];
+                let fi = pcx.call_fns[s];
+                ir_enter(&cx, fi, pcx);
                 if cx.insts[call].block == 0 || cx.insts[call].ty == 0
                     || cx.insts[call].ty != r_ty {
                     continue;
                 }
-                let c = ir_make(&cx, Const, r_ty, 0, 0, r_imm);
+                let c = ir_make(&cx, Const, r_ty, 0, 0, r_imm, pcx);
                 let next = cx.insts[call].next;
                 if next != 0 {
                     ir_insert_before(&cx, next, c);
@@ -803,10 +794,10 @@ static var CALLOC_SYM: i64 = 0;
 static var FREE_SYM: i64 = 0;
 
 // The C function called by v (a symbol), or 0.
-fn c_callee_name(cx: inout FnCtx, v: i64) -> i64 {
+fn c_callee_name(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if cx.insts[v].op == Call && FN_IR[cx.insts[v].imm] == 0 {
-            return FNS[cx.insts[v].imm].name;
+        if cx.insts[v].op == Call && pcx.fn_ir[cx.insts[v].imm] == 0 {
+            return pcx.fns[cx.insts[v].imm].name;
         }
         0
     }
@@ -814,9 +805,9 @@ fn c_callee_name(cx: inout FnCtx, v: i64) -> i64 {
 
 // The constant size of allocation call v (malloc or calloc of constant
 // sizes), or -1.
-fn allocation_size(cx: inout FnCtx, v: i64) -> i64 {
+fn allocation_size(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let name = c_callee_name(&cx, v);
+        let name = c_callee_name(&cx, v, pcx);
         if name == MALLOC_SYM && cx.insts[v].nargs == 1 {
             let n = ir_val(&cx, ir_arg(&cx, v, 0));
             if is_const(&cx, n) && cx.insts[n].imm > 0 && cx.insts[n].imm <= HEAP_TO_STACK_MAX {
@@ -839,7 +830,7 @@ fn allocation_size(cx: inout FnCtx, v: i64) -> i64 {
 // Whether the pointer p made by an allocation in function fi stays in fi:
 // it (and addresses computed from it) is only dereferenced, compared, or
 // passed itself to free; frees of it are listed in `frees`.
-fn allocation_stays(cx: inout FnCtx, fi: i64, p: i64, frees: inout IntVec) -> bool {
+fn allocation_stays(cx: inout FnCtx, fi: i64, p: i64, frees: inout IntVec, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var derived = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         derived.push(p);
@@ -870,7 +861,7 @@ fn allocation_stays(cx: inout FnCtx, fi: i64, p: i64, frees: inout IntVec) -> bo
                         } else if op == Cmp {
                         } else if is_copy(&cx, v) && (k == 3 || k == 4) {
                         } else if x == p && op == Call && k == 3 && cx.insts[v].nargs == 1
-                            && c_callee_name(&cx, v) == FREE_SYM {
+                            && c_callee_name(&cx, v, pcx) == FREE_SYM {
                             frees.push(v);
                         } else {
                             ok = false;
@@ -888,17 +879,17 @@ fn allocation_stays(cx: inout FnCtx, fi: i64, p: i64, frees: inout IntVec) -> bo
 // Turns the small allocations of function fi whose pointers stay in it
 // into frame slots (zeroed for calloc), and drops their frees. Returns
 // whether any was.
-pub fn heap_to_stack(cx: inout FnCtx, fi: i64) -> bool {
+pub fn heap_to_stack(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if MALLOC_SYM == 0 {
             MALLOC_SYM = intern_c(c"malloc");
             CALLOC_SYM = intern_c(c"calloc");
             FREE_SYM = intern_c(c"free");
         }
-        if calls_returns_twice(&cx, fi) {
+        if calls_returns_twice(&cx, fi, pcx) {
             return false;
         }
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         resolve_all(&cx, fi);
         var changed = false;
         var frees = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -910,15 +901,15 @@ pub fn heap_to_stack(cx: inout FnCtx, fi: i64) -> bool {
             var v = cx.blocks[b].first;
             while v != 0 {
                 let next = cx.insts[v].next;
-                let size = allocation_size(&cx, v);
+                let size = allocation_size(&cx, v, pcx);
                 frees.count = 0;
-                if size > 0 && allocation_stays(&cx, fi, v, &frees) {
-                    let zero = c_callee_name(&cx, v) == CALLOC_SYM;
+                if size > 0 && allocation_stays(&cx, fi, v, &frees, pcx) {
+                    let zero = c_callee_name(&cx, v, pcx) == CALLOC_SYM;
                     let s = ir_new_slot(&cx, size, 16);
-                    let addr = ir_make(&cx, Op::Slot, TY_U64, 0, 0, s);
+                    let addr = ir_make(&cx, Op::Slot, TY_U64, 0, 0, s, pcx);
                     ir_insert_before(&cx, v, addr);
                     if zero {
-                        zero_fill(&cx, addr, size, v);
+                        zero_fill(&cx, addr, size, v, pcx);
                     }
                     for k in 0..frees.count {
                         ir_unlink(&cx, frees.data[k]);
@@ -932,7 +923,7 @@ pub fn heap_to_stack(cx: inout FnCtx, fi: i64) -> bool {
         free(frees.data as *u8);
         if changed {
             resolve_all(&cx, fi);
-            verify_func(&cx, fi, c"heap to stack");
+            verify_func(&cx, fi, c"heap to stack", pcx);
         }
         changed
     }
@@ -949,14 +940,14 @@ pub fn init_syms() {
 }
 
 // Stores zeros to [addr, + size) before instruction `at`.
-fn zero_fill(cx: inout FnCtx, addr: i64, size: i64, at: i64) {
+fn zero_fill(cx: inout FnCtx, addr: i64, size: i64, at: i64, pcx: Ctx<Comp>) {
     var offset = 0;
     while offset < size {
         let width = if size - offset >= 8 { 8 } else { 1 };
         let ty = if width == 8 { TY_U64 } else { TY_U8 };
-        let zero = ir_make(&cx, Const, ty, 0, 0, 0);
+        let zero = ir_make(&cx, Const, ty, 0, 0, 0, pcx);
         ir_insert_before(&cx, at, zero);
-        let st = ir_make(&cx, Store, 0, addr, zero, offset);
+        let st = ir_make(&cx, Store, 0, addr, zero, offset, pcx);
         unsafe { cx.insts[st].imm2 = ty; }
         ir_insert_before(&cx, at, st);
         offset += width;

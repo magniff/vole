@@ -11,32 +11,17 @@
 use crate::base::{
     IntVec, buf_byte, buf_fmt, buf_int, buf_new, buf_slice, buf_str, buf_uint, free, sym_text,
 };
-use crate::base::diag::{
-    ERR, err_begin, err_end, err_help, err_help_fmt, err_str, err_try_fmt, pos_line,
-};
-use crate::front::ast::{ARM_SYNTHETIC, NODES, child};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end, err_help, err_help_fmt, err_str, err_try_fmt, pos_line};
+use crate::front::ast::{ARM_SYNTHETIC, child};
 use crate::front::ast::NodeKind::{PatBind, PatOr, PatRange, PatWild};
 use crate::front::check::variant_fields::has_named_fields;
 use crate::front::distinct::strip_distinct;
 use crate::front::types::{
-    ENUMS, TYPES, TY_BOOL, TY_UNIT, TyKind, VARIANTS, buf_type, enum_variant, int_max, is_integer,
-    is_ref, is_signed, type_elem, variant_field,
+    ENUMS, TYPES, TY_BOOL, TY_UNIT, TyKind, buf_type, enum_variant, int_max, is_integer, is_ref,
+    is_signed, type_elem, variant_field,
 };
-
-static var MAT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var MTY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Integer segments (start keys) of the column being split.
-static var CUTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// Witnesses: nodes (kind, value, type, first kid, kid count) in WIT, kids
-// in WKIDS; the witness of the columns being searched is on WSTACK.
-static var WIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var WKIDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var WSTACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 const W_ANY: i64 = 0;
 
@@ -48,8 +33,8 @@ const W_TUPLE: i64 = 3;
 
 const W_INT: i64 = 4;
 
-fn is_wild(p: i64) -> bool {
-    p == 0 || NODES[p].kind == PatWild || NODES[p].kind == PatBind
+fn is_wild(p: i64, pcx: Ctx<Comp>) -> bool {
+    p == 0 || pcx.nodes[p].kind == PatWild || pcx.nodes[p].kind == PatBind
 }
 
 // Integers in an order-preserving signed form: unsigned values with the
@@ -74,15 +59,15 @@ fn max_key(ty: i64) -> i64 {
 }
 
 // The range (keys) of an integer head pattern.
-fn head_low(p: i64, ty: i64) -> i64 {
-    int_key(NODES[p].x, ty)
+fn head_low(p: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
+    int_key(pcx.nodes[p].x, ty)
 }
 
-fn head_high(p: i64, ty: i64) -> i64 {
-    if NODES[p].kind == PatRange {
-        return int_key(NODES[p].y, ty);
+fn head_high(p: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[p].kind == PatRange {
+        return int_key(pcx.nodes[p].y, ty);
     }
-    int_key(NODES[p].x, ty)
+    int_key(pcx.nodes[p].x, ty)
 }
 
 // The kind of the constructors of type ty: 1 enum, 2 bool, 3 tuple, 4
@@ -114,12 +99,13 @@ fn mat_row(m: i64, cols: i64, r: i64) -> i64 {
 // Copies the rows of matrix (m, rows, cols) with or-patterns in the first
 // column expanded into one row per alternative; returns the new start and
 // sets *out_rows.
-fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: inout i64) -> i64 {
-    let start = MAT.count;
+fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: inout i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.mat.count;
     var count = 0;
     for r in 0..rows {
         unsafe {
-            count += push_expanded(mat_row(m, cols, r), cols, MAT.data[mat_row(m, cols, r)]);
+            count += push_expanded(mat_row(m, cols, r), cols, pcx.mat.data[mat_row(m, cols, r)],
+                &pcx);
         }
     }
     out_rows = count;
@@ -128,18 +114,18 @@ fn expand_rows(m: i64, rows: i64, cols: i64, out_rows: inout i64) -> i64 {
 
 // Pushes the row at `row` with head `head` (expanding or-patterns); returns
 // the number of rows pushed.
-fn push_expanded(row: i64, cols: i64, head: i64) -> i64 {
+fn push_expanded(row: i64, cols: i64, head: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if head != 0 && NODES[head].kind == PatOr {
+        if head != 0 && pcx.nodes[head].kind == PatOr {
             var count = 0;
-            for i in 0..NODES[head].count {
-                count += push_expanded(row, cols, child(head, i));
+            for i in 0..pcx.nodes[head].count {
+                count += push_expanded(row, cols, child(head, i, pcx), &pcx);
             }
             return count;
         }
-        MAT.push(head);
+        pcx.mat.push(head);
         for c in 1..cols {
-            MAT.push(MAT.data[row + c]);
+            pcx.mat.push(pcx.mat.data[row + c]);
         }
         1
     }
@@ -147,19 +133,19 @@ fn push_expanded(row: i64, cols: i64, head: i64) -> i64 {
 
 // The arity and field types of constructor `c` of type ty (pushed on
 // MTY); returns the arity.
-fn push_ctor_types(ty: i64, c: i64) -> i64 {
+fn push_ctor_types(ty: i64, c: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let kind = ctor_kind(ty);
         if kind == 1 {
             let v = enum_variant(TYPES[ty].a, c);
-            for i in 0..VARIANTS[v].field_count {
-                MTY.push(column_type(variant_field(v, i)));
+            for i in 0..pcx.variants[v].field_count {
+                pcx.mty.push(column_type(variant_field(v, i, pcx)));
             }
-            return VARIANTS[v].field_count;
+            return pcx.variants[v].field_count;
         }
         if kind == 3 && ty != TY_UNIT {
             for i in 0..TYPES[ty].count {
-                MTY.push(column_type(type_elem(ty, i)));
+                pcx.mty.push(column_type(type_elem(ty, i)));
             }
             return TYPES[ty].count;
         }
@@ -169,40 +155,41 @@ fn push_ctor_types(ty: i64, c: i64) -> i64 {
 
 // Whether head pattern p (not a wildcard) is constructor c of type ty (for
 // integers, c is a segment start key, the segment ending at `c_end`).
-fn head_is(p: i64, ty: i64, c: i64, c_end: i64) -> bool {
+fn head_is(p: i64, ty: i64, c: i64, c_end: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let kind = ctor_kind(ty);
         if kind == 1 {
-            return NODES[p].x - ENUMS[TYPES[ty].a].variants == c;
+            return pcx.nodes[p].x - ENUMS[TYPES[ty].a].variants == c;
         }
         if kind == 2 {
-            return NODES[p].x == c;
+            return pcx.nodes[p].x == c;
         }
         if kind == 3 {
             return true;
         }
-        head_low(p, ty) <= c && c_end <= head_high(p, ty)
+        head_low(p, ty, pcx) <= c && c_end <= head_high(p, ty, pcx)
     }
 }
 
 // Pushes the specialization of the row at `row` (head of type ty) by
 // constructor c of the given arity; returns whether the row was kept.
-fn push_specialized(row: i64, cols: i64, ty: i64, c: i64, c_end: i64, arity: i64) -> bool {
+fn push_specialized(row: i64, cols: i64, ty: i64, c: i64, c_end: i64, arity: i64,
+    pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let head = MAT.data[row];
-        if is_wild(head) {
+        let head = pcx.mat.data[row];
+        if is_wild(head, pcx) {
             for _ in 0..arity {
-                MAT.push(0);
+                pcx.mat.push(0);
             }
-        } else if head_is(head, ty, c, c_end) {
+        } else if head_is(head, ty, c, c_end, pcx) {
             for i in 0..arity {
-                MAT.push(child(head, i));
+                pcx.mat.push(child(head, i, pcx));
             }
         } else {
             return false;
         }
         for k in 1..cols {
-            MAT.push(MAT.data[row + k]);
+            pcx.mat.push(pcx.mat.data[row + k]);
         }
         true
     }
@@ -211,50 +198,50 @@ fn push_specialized(row: i64, cols: i64, ty: i64, c: i64, c_end: i64, arity: i64
 // The integer segments of column 0 of matrix (m, rows, cols), split also
 // at the range of `extra` (a head pattern, or 0): their start keys in CUTS
 // (sorted, unique); the last segment ends at the type's maximum.
-fn int_segments(m: i64, rows: i64, cols: i64, ty: i64, extra: i64) {
+fn int_segments(m: i64, rows: i64, cols: i64, ty: i64, extra: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        CUTS.count = 0;
-        CUTS.push(min_key(ty));
+        pcx.cuts.count = 0;
+        pcx.cuts.push(min_key(ty));
         let top = max_key(ty);
         for r in 0..rows + 1 {
-            let p = if r < rows { MAT.data[mat_row(m, cols, r)] } else { extra };
-            if is_wild(p) {
+            let p = if r < rows { pcx.mat.data[mat_row(m, cols, r)] } else { extra };
+            if is_wild(p, pcx) {
                 continue;
             }
-            CUTS.push(head_low(p, ty));
-            let high = head_high(p, ty);
+            pcx.cuts.push(head_low(p, ty, pcx));
+            let high = head_high(p, ty, pcx);
             if high < top {
-                CUTS.push(high + 1);
+                pcx.cuts.push(high + 1);
             }
         }
         // Insertion sort, then unique.
-        for i in 1..CUTS.count {
+        for i in 1..pcx.cuts.count {
             var j = i;
-            while j > 0 && CUTS.data[j - 1] > CUTS.data[j] {
-                let t = CUTS.data[j];
-                CUTS.data[j] = CUTS.data[j - 1];
-                CUTS.data[j - 1] = t;
+            while j > 0 && pcx.cuts.data[j - 1] > pcx.cuts.data[j] {
+                let t = pcx.cuts.data[j];
+                pcx.cuts.data[j] = pcx.cuts.data[j - 1];
+                pcx.cuts.data[j - 1] = t;
                 j -= 1;
             }
         }
         var n = 0;
-        for i in 0..CUTS.count {
-            if n == 0 || CUTS.data[n - 1] != CUTS.data[i] {
-                CUTS.data[n] = CUTS.data[i];
+        for i in 0..pcx.cuts.count {
+            if n == 0 || pcx.cuts.data[n - 1] != pcx.cuts.data[i] {
+                pcx.cuts.data[n] = pcx.cuts.data[i];
                 n += 1;
             }
         }
-        CUTS.count = n;
+        pcx.cuts.count = n;
     }
 }
 
-fn segment_end(i: i64, ty: i64) -> i64 {
-    if i + 1 < CUTS.count { unsafe { CUTS.data[i + 1] - 1 } } else { max_key(ty) }
+fn segment_end(i: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
+    if i + 1 < pcx.cuts.count { unsafe { pcx.cuts.data[i + 1] - 1 } } else { max_key(ty) }
 }
 
 // The number of constructors of the column's type to try, and whether the
 // constructors in column 0 cover the type (`complete`).
-fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: inout bool) -> i64 {
+fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: inout bool, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let kind = ctor_kind(ty);
         var total = 0;
@@ -265,16 +252,16 @@ fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: inout bool) -> i6
         } else if kind == 3 {
             total = 1;
         } else if kind == 4 {
-            total = CUTS.count;
+            total = pcx.cuts.count;
         }
         var all = kind != 0;
         for c in 0..total {
             var seen = false;
-            let start = if kind == 4 { CUTS.data[c] } else { c };
-            let end = if kind == 4 { segment_end(c, ty) } else { c };
+            let start = if kind == 4 { pcx.cuts.data[c] } else { c };
+            let end = if kind == 4 { segment_end(c, ty, pcx) } else { c };
             for r in 0..rows {
-                let p = MAT.data[mat_row(m, cols, r)];
-                if !is_wild(p) && head_is(p, ty, start, end) {
+                let p = pcx.mat.data[mat_row(m, cols, r)];
+                if !is_wild(p, pcx) && head_is(p, ty, start, end, pcx) {
                     seen = true;
                     break;
                 }
@@ -291,268 +278,269 @@ fn ctor_count(m: i64, rows: i64, cols: i64, ty: i64, complete: inout bool) -> i6
 // Whether row q (at `q`, `cols` patterns) is useful with respect to the
 // matrix (m, rows, cols) with column types at `types`: whether some value
 // matches q and no row.
-fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64) -> bool {
+fn useful(m: i64, rows: i64, cols: i64, types: i64, q: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if cols == 0 {
             return rows == 0;
         }
-        let mark = MAT.count;
-        let tmark = MTY.count;
-        let head = MAT.data[q];
+        let mark = pcx.mat.count;
+        let tmark = pcx.mty.count;
+        let head = pcx.mat.data[q];
         var result = false;
-        if head != 0 && NODES[head].kind == PatOr {
-            for i in 0..NODES[head].count {
-                let q2 = MAT.count;
-                MAT.push(child(head, i));
+        if head != 0 && pcx.nodes[head].kind == PatOr {
+            for i in 0..pcx.nodes[head].count {
+                let q2 = pcx.mat.count;
+                pcx.mat.push(child(head, i, pcx));
                 for k in 1..cols {
-                    MAT.push(MAT.data[q + k]);
+                    pcx.mat.push(pcx.mat.data[q + k]);
                 }
-                if useful(m, rows, cols, types, q2) {
+                if useful(m, rows, cols, types, q2, &pcx) {
                     result = true;
                     break;
                 }
             }
-            MAT.count = mark;
+            pcx.mat.count = mark;
             return result;
         }
         var erows = 0;
-        let em = expand_rows(m, rows, cols, &erows);
-        let ty = MTY.data[types];
+        let em = expand_rows(m, rows, cols, &erows, &pcx);
+        let ty = pcx.mty.data[types];
         let kind = ctor_kind(ty);
         if kind == 4 {
-            int_segments(em, erows, cols, ty, if is_wild(head) { 0 } else { head });
+            int_segments(em, erows, cols, ty, if is_wild(head, pcx) { 0 } else { head }, &pcx);
         }
-        if !is_wild(head) || kind != 0 {
+        if !is_wild(head, pcx) || kind != 0 {
             var complete = false;
-            let total = ctor_count(em, erows, cols, ty, &complete);
-            if !is_wild(head) || complete {
+            let total = ctor_count(em, erows, cols, ty, &complete, pcx);
+            if !is_wild(head, pcx) || complete {
                 // Saved: the recursion reuses CUTS.
-                let cuts = MAT.count;
+                let cuts = pcx.mat.count;
                 if kind == 4 {
-                    for i in 0..CUTS.count {
-                        MAT.push(CUTS.data[i]);
+                    for i in 0..pcx.cuts.count {
+                        pcx.mat.push(pcx.cuts.data[i]);
                     }
                 }
                 for c in 0..total {
-                    let start = if kind == 4 { MAT.data[cuts + c] } else { c };
+                    let start = if kind == 4 { pcx.mat.data[cuts + c] } else { c };
                     let end = if kind == 4 {
-                        if c + 1 < total { MAT.data[cuts + c + 1] - 1 } else { max_key(ty) }
+                        if c + 1 < total { pcx.mat.data[cuts + c + 1] - 1 } else { max_key(ty) }
                     } else { c };
-                    if !is_wild(head) && !head_is(head, ty, start, end) {
+                    if !is_wild(head, pcx) && !head_is(head, ty, start, end, pcx) {
                         continue;
                     }
-                    if specialized_useful(em, erows, cols, types, q, ty, start, end) {
+                    if specialized_useful(em, erows, cols, types, q, ty, start, end, &pcx) {
                         result = true;
                         break;
                     }
                 }
-                MAT.count = mark;
-                MTY.count = tmark;
+                pcx.mat.count = mark;
+                pcx.mty.count = tmark;
                 return result;
             }
         }
         // The default matrix: the rows with a wildcard head, without it.
-        let d = MAT.count;
+        let d = pcx.mat.count;
         var drows = 0;
         for r in 0..erows {
             let row = mat_row(em, cols, r);
-            if is_wild(MAT.data[row]) {
+            if is_wild(pcx.mat.data[row], pcx) {
                 for k in 1..cols {
-                    MAT.push(MAT.data[row + k]);
+                    pcx.mat.push(pcx.mat.data[row + k]);
                 }
                 drows += 1;
             }
         }
-        result = useful(d, drows, cols - 1, types + 1, q + 1);
-        MAT.count = mark;
-        MTY.count = tmark;
+        result = useful(d, drows, cols - 1, types + 1, q + 1, &pcx);
+        pcx.mat.count = mark;
+        pcx.mty.count = tmark;
         result
     }
 }
 
 fn specialized_useful(m: i64, rows: i64, cols: i64, types: i64, q: i64, ty: i64,
-    c: i64, c_end: i64) -> bool {
-    let mark = MAT.count;
-    let tmark = MTY.count;
-    let arity = push_ctor_types(ty, c);
+    c: i64, c_end: i64, pcx: inout Ctx<Comp>) -> bool {
+    let mark = pcx.mat.count;
+    let tmark = pcx.mty.count;
+    let arity = push_ctor_types(ty, c, &pcx);
     for k in 1..cols {
-        unsafe { MTY.push(MTY.data[types + k]); }
+        unsafe { pcx.mty.push(pcx.mty.data[types + k]); }
     }
     let new_cols = arity + cols - 1;
-    let s = MAT.count;
+    let s = pcx.mat.count;
     var srows = 0;
     for r in 0..rows {
-        if push_specialized(mat_row(m, cols, r), cols, ty, c, c_end, arity) {
+        if push_specialized(mat_row(m, cols, r), cols, ty, c, c_end, arity, &pcx) {
             srows += 1;
         }
     }
-    let sq = MAT.count;
-    push_specialized(q, cols, ty, c, c_end, arity);
-    let result = useful(s, srows, new_cols, tmark, sq);
-    MAT.count = mark;
-    MTY.count = tmark;
+    let sq = pcx.mat.count;
+    push_specialized(q, cols, ty, c, c_end, arity, &pcx);
+    let result = useful(s, srows, new_cols, tmark, sq, &pcx);
+    pcx.mat.count = mark;
+    pcx.mty.count = tmark;
     result
 }
 
 // Whether some value matches no row of the matrix; if so, its witness
 // (one node per column) is pushed on WSTACK.
-fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
+fn find_missing(m: i64, rows: i64, cols: i64, types: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if cols == 0 {
             return rows == 0;
         }
-        let mark = MAT.count;
-        let tmark = MTY.count;
+        let mark = pcx.mat.count;
+        let tmark = pcx.mty.count;
         var erows = 0;
-        let em = expand_rows(m, rows, cols, &erows);
-        let ty = MTY.data[types];
+        let em = expand_rows(m, rows, cols, &erows, &pcx);
+        let ty = pcx.mty.data[types];
         let kind = ctor_kind(ty);
         if kind == 4 {
-            int_segments(em, erows, cols, ty, 0);
+            int_segments(em, erows, cols, ty, 0, &pcx);
         }
         var complete = false;
-        let total = ctor_count(em, erows, cols, ty, &complete);
-        let cuts = MAT.count;
+        let total = ctor_count(em, erows, cols, ty, &complete, pcx);
+        let cuts = pcx.mat.count;
         if kind == 4 {
-            for i in 0..CUTS.count {
-                MAT.push(CUTS.data[i]);
+            for i in 0..pcx.cuts.count {
+                pcx.mat.push(pcx.cuts.data[i]);
             }
         }
         if complete {
             for c in 0..total {
-                let start = if kind == 4 { MAT.data[cuts + c] } else { c };
+                let start = if kind == 4 { pcx.mat.data[cuts + c] } else { c };
                 let end = if kind == 4 {
-                    if c + 1 < total { MAT.data[cuts + c + 1] - 1 } else { max_key(ty) }
+                    if c + 1 < total { pcx.mat.data[cuts + c + 1] - 1 } else { max_key(ty) }
                 } else { c };
-                let arity_mark = MTY.count;
-                let arity = push_ctor_types(ty, start);
+                let arity_mark = pcx.mty.count;
+                let arity = push_ctor_types(ty, start, &pcx);
                 for k in 1..cols {
-                    MTY.push(MTY.data[types + k]);
+                    pcx.mty.push(pcx.mty.data[types + k]);
                 }
-                let s = MAT.count;
+                let s = pcx.mat.count;
                 var srows = 0;
                 for r in 0..erows {
-                    if push_specialized(mat_row(em, cols, r), cols, ty, start, end, arity) {
+                    if push_specialized(mat_row(em, cols, r), cols, ty, start, end, arity, &pcx) {
                         srows += 1;
                     }
                 }
-                if find_missing(s, srows, arity + cols - 1, arity_mark) {
+                if find_missing(s, srows, arity + cols - 1, arity_mark, &pcx) {
                     // The first `arity` witnesses are the constructor's fields:
                     // they become the kids of its node, which takes their place.
                     let found = arity + cols - 1;
-                    let base = WSTACK.count - found;
+                    let base = pcx.wstack.count - found;
                     let node = witness_node(if kind == 1 { W_VARIANT } else if kind == 2 { W_BOOL }
                         else if kind == 3 { W_TUPLE } else { W_INT },
                         if kind == 1 { enum_variant(TYPES[ty].a, start) }
                         else if kind == 4 { key_value(start, ty) } else { start },
-                        ty, base, arity);
+                        ty, base, arity, &pcx);
                     if kind == 4 {
                         // (0.17) an integer witness is its whole segment
-                        WIT.data[node + 3] = key_value(end, ty);
+                        pcx.wit.data[node + 3] = key_value(end, ty);
                     }
                     for k in 0..cols - 1 {
-                        WSTACK.push(WSTACK.data[base + arity + k]);
+                        pcx.wstack.push(pcx.wstack.data[base + arity + k]);
                     }
-                    WSTACK.data[base] = node;
+                    pcx.wstack.data[base] = node;
                     for k in 0..cols - 1 {
-                        WSTACK.data[base + 1 + k] = WSTACK.data[base + found + k];
+                        pcx.wstack.data[base + 1 + k] = pcx.wstack.data[base + found + k];
                     }
-                    WSTACK.count = base + cols;
-                    MAT.count = mark;
-                    MTY.count = tmark;
+                    pcx.wstack.count = base + cols;
+                    pcx.mat.count = mark;
+                    pcx.mty.count = tmark;
                     return true;
                 }
-                MAT.count = s;
-                MTY.count = arity_mark;
+                pcx.mat.count = s;
+                pcx.mty.count = arity_mark;
             }
-            MAT.count = mark;
-            MTY.count = tmark;
+            pcx.mat.count = mark;
+            pcx.mty.count = tmark;
             return false;
         }
-        let d = MAT.count;
+        let d = pcx.mat.count;
         var drows = 0;
         for r in 0..erows {
             let row = mat_row(em, cols, r);
-            if is_wild(MAT.data[row]) {
+            if is_wild(pcx.mat.data[row], pcx) {
                 for k in 1..cols {
-                    MAT.push(MAT.data[row + k]);
+                    pcx.mat.push(pcx.mat.data[row + k]);
                 }
                 drows += 1;
             }
         }
-        let found = find_missing(d, drows, cols - 1, types + 1);
+        let found = find_missing(d, drows, cols - 1, types + 1, &pcx);
         if found {
             // A constructor no row starts with, or `_`.
-            var node = witness_node(W_ANY, 0, ty, 0, 0);
+            var node = witness_node(W_ANY, 0, ty, 0, 0, &pcx);
             for c in 0..total {
-                let start = if kind == 4 { MAT.data[cuts + c] } else { c };
+                let start = if kind == 4 { pcx.mat.data[cuts + c] } else { c };
                 let end = if kind == 4 {
-                    if c + 1 < total { MAT.data[cuts + c + 1] - 1 } else { max_key(ty) }
+                    if c + 1 < total { pcx.mat.data[cuts + c + 1] - 1 } else { max_key(ty) }
                 } else { c };
                 var seen = false;
                 for r in 0..erows {
-                    let p = MAT.data[mat_row(em, cols, r)];
-                    if !is_wild(p) && head_is(p, ty, start, end) {
+                    let p = pcx.mat.data[mat_row(em, cols, r)];
+                    if !is_wild(p, pcx) && head_is(p, ty, start, end, pcx) {
                         seen = true;
                     }
                 }
                 if !seen {
                     if kind == 1 {
                         let v = enum_variant(TYPES[ty].a, c);
-                        let kids = WKIDS.count;
-                        for _ in 0..VARIANTS[v].field_count {
-                            WKIDS.push(witness_node(W_ANY, 0, 0, 0, 0));
+                        let kids = pcx.wkids.count;
+                        for _ in 0..pcx.variants[v].field_count {
+                            let pcx_arg = witness_node(W_ANY, 0, 0, 0, 0, &pcx);
+                            pcx.wkids.push(pcx_arg);
                         }
-                        node = witness_node(W_VARIANT, v, ty, 0, 0);
-                        WIT.data[node + 3] = kids;
-                        WIT.data[node + 4] = VARIANTS[v].field_count;
+                        node = witness_node(W_VARIANT, v, ty, 0, 0, &pcx);
+                        pcx.wit.data[node + 3] = kids;
+                        pcx.wit.data[node + 4] = pcx.variants[v].field_count;
                     } else if kind == 2 {
-                        node = witness_node(W_BOOL, c, ty, 0, 0);
+                        node = witness_node(W_BOOL, c, ty, 0, 0, &pcx);
                     } else if kind == 4 {
-                        node = witness_node(W_INT, key_value(start, ty), ty, 0, 0);
-                        WIT.data[node + 3] = key_value(end, ty);
+                        node = witness_node(W_INT, key_value(start, ty), ty, 0, 0, &pcx);
+                        pcx.wit.data[node + 3] = key_value(end, ty);
                     }
                     break;
                 }
             }
-            let base = WSTACK.count - (cols - 1);
-            WSTACK.push(0);
-            var k = WSTACK.count - 1;
+            let base = pcx.wstack.count - (cols - 1);
+            pcx.wstack.push(0);
+            var k = pcx.wstack.count - 1;
             while k > base {
-                WSTACK.data[k] = WSTACK.data[k - 1];
+                pcx.wstack.data[k] = pcx.wstack.data[k - 1];
                 k -= 1;
             }
-            WSTACK.data[base] = node;
+            pcx.wstack.data[base] = node;
         }
-        MAT.count = mark;
-        MTY.count = tmark;
+        pcx.mat.count = mark;
+        pcx.mty.count = tmark;
         found
     }
 }
 
 // A witness node; `kids` kids from WSTACK[kids_at..] are copied.
-fn witness_node(kind: i64, value: i64, ty: i64, kids_at: i64, kids: i64) -> i64 {
-    let first = WKIDS.count;
+fn witness_node(kind: i64, value: i64, ty: i64, kids_at: i64, kids: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let first = pcx.wkids.count;
     for i in 0..kids {
-        unsafe { WKIDS.push(WSTACK.data[kids_at + i]); }
+        unsafe { pcx.wkids.push(pcx.wstack.data[kids_at + i]); }
     }
-    let node = WIT.count;
-    WIT.push(kind);
-    WIT.push(value);
-    WIT.push(ty);
-    WIT.push(first);
-    WIT.push(kids);
+    let node = pcx.wit.count;
+    pcx.wit.push(kind);
+    pcx.wit.push(value);
+    pcx.wit.push(ty);
+    pcx.wit.push(first);
+    pcx.wit.push(kids);
     node
 }
 
-fn buf_witness(out: i64, node: i64) {
+fn buf_witness(out: i64, node: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let kind = WIT.data[node];
-        let value = WIT.data[node + 1];
-        let ty = WIT.data[node + 2];
-        let first = WIT.data[node + 3];
-        let kids = WIT.data[node + 4];
-        if witness_any(node) {
+        let kind = pcx.wit.data[node];
+        let value = pcx.wit.data[node + 1];
+        let ty = pcx.wit.data[node + 2];
+        let first = pcx.wit.data[node + 3];
+        let kids = pcx.wit.data[node + 4];
+        if witness_any(node, pcx) {
             buf_byte(out, '_');
         } else if kind == W_BOOL {
             buf_str(out, if value != 0 { c"true" } else { c"false" });
@@ -572,18 +560,18 @@ fn buf_witness(out: i64, node: i64) {
                 }
             }
         } else if kind == W_VARIANT {
-            buf_type(out, ty);
-            buf_fmt(out, format_args("::{}", sym_text(VARIANTS[value].name)));
+            buf_type(out, ty, pcx);
+            buf_fmt(out, format_args("::{}", sym_text(pcx.variants[value].name)));
         }
-        if kind == W_VARIANT && kids > 0 && has_named_fields(value) {
+        if kind == W_VARIANT && kids > 0 && has_named_fields(value, pcx) {
             // (0.17) `E::V { a: 1, .. }`: the fields that matter, by name
-            let names = NODES[VARIANTS[value].node].d;
+            let names = pcx.nodes[pcx.variants[value].node].d;
             buf_str(out, c" { ");
             for i in 0..kids {
-                let kid = WKIDS.data[first + i];
-                if !witness_any(kid) {
-                    buf_fmt(out, format_args("{}: ", sym_text(NODES[child(names, i)].a)));
-                    buf_witness(out, kid);
+                let kid = pcx.wkids.data[first + i];
+                if !witness_any(kid, pcx) {
+                    buf_fmt(out, format_args("{}: ", sym_text(pcx.nodes[child(names, i, pcx)].a)));
+                    buf_witness(out, kid, pcx);
                     buf_str(out, c", ");
                 }
             }
@@ -596,7 +584,7 @@ fn buf_witness(out: i64, node: i64) {
                 if i > 0 {
                     buf_str(out, c", ");
                 }
-                buf_witness(out, WKIDS.data[first + i]);
+                buf_witness(out, pcx.wkids.data[first + i], pcx);
             }
             if kind == W_TUPLE && kids == 1 {
                 buf_byte(out, ',');
@@ -607,12 +595,12 @@ fn buf_witness(out: i64, node: i64) {
 }
 
 // Whether witness `node` matches anything: `_`, or every integer.
-fn witness_any(node: i64) -> bool {
+fn witness_any(node: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let kind = WIT.data[node];
-        let ty = WIT.data[node + 2];
-        kind == W_ANY || (kind == W_INT && int_key(WIT.data[node + 1], ty) == min_key(ty)
-            && int_key(WIT.data[node + 3], ty) == max_key(ty))
+        let kind = pcx.wit.data[node];
+        let ty = pcx.wit.data[node + 2];
+        kind == W_ANY || (kind == W_INT && int_key(pcx.wit.data[node + 1], ty) == min_key(ty)
+            && int_key(pcx.wit.data[node + 3], ty) == max_key(ty))
     }
 }
 
@@ -621,49 +609,49 @@ fn witness_any(node: i64) -> bool {
 // integer's missing ranges, adjacent ones joined), as witness nodes into
 // `list`, at most `max`; whether there were more. Other types: nothing
 // (the caller has the first witness).
-fn missing_witnesses(rows: i64, list: inout IntVec, max: i64) -> bool {
+fn missing_witnesses(rows: i64, list: inout IntVec, max: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let ty = MTY.data[0];
+        let ty = pcx.mty.data[0];
         let kind = ctor_kind(ty);
         if kind != 1 && kind != 2 && kind != 4 {
             return false;
         }
-        let mark = MAT.count;
-        let tmark = MTY.count;
+        let mark = pcx.mat.count;
+        let tmark = pcx.mty.count;
         var erows = 0;
-        let em = expand_rows(0, rows, 1, &erows);
+        let em = expand_rows(0, rows, 1, &erows, &pcx);
         if kind == 4 {
-            int_segments(em, erows, 1, ty, 0);
+            int_segments(em, erows, 1, ty, 0, &pcx);
         }
         var complete = false;
-        let total = ctor_count(em, erows, 1, ty, &complete);
-        let cuts = MAT.count;
+        let total = ctor_count(em, erows, 1, ty, &complete, pcx);
+        let cuts = pcx.mat.count;
         if kind == 4 {
-            for i in 0..CUTS.count {
-                MAT.push(CUTS.data[i]);
+            for i in 0..pcx.cuts.count {
+                pcx.mat.push(pcx.cuts.data[i]);
             }
         }
         var last = -1;
         var last_end = 0;
         var more = false;
         for c in 0..total {
-            let start = if kind == 4 { MAT.data[cuts + c] } else { c };
+            let start = if kind == 4 { pcx.mat.data[cuts + c] } else { c };
             let end = if kind == 4 {
-                if c + 1 < total { MAT.data[cuts + c + 1] - 1 } else { max_key(ty) }
+                if c + 1 < total { pcx.mat.data[cuts + c + 1] - 1 } else { max_key(ty) }
             } else { c };
-            let arity_mark = MTY.count;
-            let arity = push_ctor_types(ty, start);
-            let s = MAT.count;
+            let arity_mark = pcx.mty.count;
+            let arity = push_ctor_types(ty, start, &pcx);
+            let s = pcx.mat.count;
             var srows = 0;
             for r in 0..erows {
-                if push_specialized(mat_row(em, 1, r), 1, ty, start, end, arity) {
+                if push_specialized(mat_row(em, 1, r), 1, ty, start, end, arity, &pcx) {
                     srows += 1;
                 }
             }
-            WSTACK.count = 0;
-            if find_missing(s, srows, arity, arity_mark) {
+            pcx.wstack.count = 0;
+            if find_missing(s, srows, arity, arity_mark, &pcx) {
                 if kind == 4 && last >= 0 && last_end + 1 == start {
-                    WIT.data[last + 3] = key_value(end, ty);
+                    pcx.wit.data[last + 3] = key_value(end, ty);
                     last_end = end;
                 } else if list.count >= max {
                     more = true;
@@ -672,9 +660,9 @@ fn missing_witnesses(rows: i64, list: inout IntVec, max: i64) -> bool {
                         else { W_INT },
                         if kind == 1 { enum_variant(TYPES[ty].a, start) }
                         else if kind == 4 { key_value(start, ty) } else { start },
-                        ty, 0, arity);
+                        ty, 0, arity, &pcx);
                     if kind == 4 {
-                        WIT.data[node + 3] = key_value(end, ty);
+                        pcx.wit.data[node + 3] = key_value(end, ty);
                         last = node;
                         last_end = end;
                     }
@@ -683,11 +671,11 @@ fn missing_witnesses(rows: i64, list: inout IntVec, max: i64) -> bool {
             } else {
                 last = -1;
             }
-            MAT.count = s;
-            MTY.count = arity_mark;
+            pcx.mat.count = s;
+            pcx.mty.count = arity_mark;
         }
-        MAT.count = mark;
-        MTY.count = tmark;
+        pcx.mat.count = mark;
+        pcx.mty.count = tmark;
         more
     }
 }
@@ -695,79 +683,80 @@ fn missing_witnesses(rows: i64, list: inout IntVec, max: i64) -> bool {
 // Reachability of every arm, and exhaustiveness, of match n on type st.
 // (0.17) An unreachable arm's help names the arm above that covers it; a
 // non-exhaustive match's `try:` is the missing arms, ready to paste.
-pub fn check_arms(n: i64, st: i64) {
+pub fn check_arms(n: i64, st: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        MAT.count = 0;
-        MTY.count = 0;
+        pcx.mat.count = 0;
+        pcx.mty.count = 0;
         // (0.18: a distinct type's values are its underlying type's)
-        MTY.push(column_type(st));
+        pcx.mty.push(column_type(st));
         // The patterns of the arms without guards so far: one-column rows.
         let rows_start = 0;
         var rows = 0;
         var kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var kept_arms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..NODES[n].count {
-            let arm = child(n, i);
-            let p = NODES[arm].a;
+        for i in 0..pcx.nodes[n].count {
+            let arm = child(n, i, pcx);
+            let p = pcx.nodes[arm].a;
             // The matrix is rebuilt from `kept` for every arm.
-            MAT.count = 0;
+            pcx.mat.count = 0;
             for r in 0..kept.count {
-                MAT.push(kept.data[r]);
+                pcx.mat.push(kept.data[r]);
             }
-            let q = MAT.count;
-            MAT.push(p);
-            if !useful(rows_start, kept.count, 1, 0, q) && (NODES[arm].p & ARM_SYNTHETIC) == 0 {
-                unreachable_arm(p, kept, kept_arms);
+            let q = pcx.mat.count;
+            pcx.mat.push(p);
+            if !useful(rows_start, kept.count, 1, 0, q, &pcx)
+                && (pcx.nodes[arm].p & ARM_SYNTHETIC) == 0 {
+                unreachable_arm(p, kept, kept_arms, &pcx);
             }
-            if NODES[arm].b == 0 {
+            if pcx.nodes[arm].b == 0 {
                 kept.push(p);
                 kept_arms.push(arm);
                 rows += 1;
             }
         }
-        MAT.count = 0;
+        pcx.mat.count = 0;
         for r in 0..kept.count {
-            MAT.push(kept.data[r]);
+            pcx.mat.push(kept.data[r]);
         }
-        WSTACK.count = 0;
-        if find_missing(0, kept.count, 1, 0) {
-            let first = WSTACK.data[0];
-            err_begin(NODES[n].start);
-            err_str(c"non-exhaustive match: '");
-            buf_witness(ERR, first);
-            err_str(c"' is not covered");
+        pcx.wstack.count = 0;
+        if find_missing(0, kept.count, 1, 0, &pcx) {
+            let first = pcx.wstack.data[0];
+            err_begin(pcx.nodes[n].start, &pcx);
+            err_str(c"non-exhaustive match: '", pcx);
+            buf_witness(pcx.err, first, pcx);
+            err_str(c"' is not covered", pcx);
             var list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            MAT.count = 0;
+            pcx.mat.count = 0;
             for r in 0..kept.count {
-                MAT.push(kept.data[r]);
+                pcx.mat.push(kept.data[r]);
             }
-            let more = missing_witnesses(kept.count, &list, 8);
+            let more = missing_witnesses(kept.count, &list, 8, &pcx);
             if list.count == 0 {
                 list.push(first);
             }
-            if rows < NODES[n].count {
-                err_help(c"arms with guards do not count; add an arm without a guard");
+            if rows < pcx.nodes[n].count {
+                err_help(c"arms with guards do not count; add an arm without a guard", pcx);
             } else if list.count > 1 {
                 let plus: [u8] = if more { "+" } else { "" };
                 err_help_fmt(
-                    format_args("{}{plus} patterns are not covered: add the arms (try:), or a wildcard arm '_ =>'", list.count));
+                    format_args("{}{plus} patterns are not covered: add the arms (try:), or a wildcard arm '_ =>'", list.count), pcx);
             } else {
-                err_help(c"add an arm for it (try:), or a wildcard arm '_ =>'");
+                err_help(c"add an arm for it (try:), or a wildcard arm '_ =>'", pcx);
             }
             let t = buf_new();
             for k in 0..list.count {
                 if k > 0 {
                     buf_byte(t, ' ');
                 }
-                buf_witness(t, list.data[k]);
+                buf_witness(t, list.data[k], pcx);
                 buf_str(t, c" => VALUE,");
             }
             if more {
                 buf_str(t, c" _ => VALUE,");
             }
-            err_try_fmt(buf_slice(t));
+            err_try_fmt(buf_slice(t), pcx);
             free(list.data as *u8);
-            err_end();
+            err_end(&pcx);
         }
         free(kept.data as *u8);
         free(kept_arms.data as *u8);
@@ -777,27 +766,27 @@ pub fn check_arms(n: i64, st: i64) {
 // The error of an unreachable arm (pattern p) after the arms `kept` (their
 // patterns; `arms`, the arm nodes): the first arm above that matches all
 // it matches alone, by its line, else the arms above together.
-fn unreachable_arm(p: i64, kept: IntVec, arms: IntVec) -> ! {
+fn unreachable_arm(p: i64, kept: IntVec, arms: IntVec, pcx: inout Ctx<Comp>) -> ! {
     unsafe {
         var cover = -1;
         for j in 0..kept.count {
-            MAT.count = 0;
-            MAT.push(kept.data[j]);
-            let q = MAT.count;
-            MAT.push(p);
-            if !useful(0, 1, 1, 0, q) {
+            pcx.mat.count = 0;
+            pcx.mat.push(kept.data[j]);
+            let q = pcx.mat.count;
+            pcx.mat.push(p);
+            if !useful(0, 1, 1, 0, q, &pcx) {
                 cover = arms.data[j];
                 break;
             }
         }
-        err_begin(NODES[p].start);
-        err_str(c"unreachable match arm: the arms above match every value it matches");
+        err_begin(pcx.nodes[p].start, &pcx);
+        err_str(c"unreachable match arm: the arms above match every value it matches", pcx);
         if cover >= 0 {
             err_help_fmt(
-                format_args("the arm at line {} matches all it matches: delete this arm, or move it above that one", pos_line(NODES[cover].start)));
+                format_args("the arm at line {} matches all it matches: delete this arm, or move it above that one", pos_line(pcx.nodes[cover].start, &pcx)), pcx);
         } else {
-            err_help(c"together, the arms above match all it matches: delete this arm, or move it above them");
+            err_help(c"together, the arms above match all it matches: delete this arm, or move it above them", pcx);
         }
-        err_end()
+        err_end(&pcx)
     }
 }

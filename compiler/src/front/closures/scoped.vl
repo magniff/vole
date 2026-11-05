@@ -6,78 +6,72 @@
 // constants hold no structs at all) (docs/design/effects-allocation.md
 // §2.4).
 use crate::base::intern_c;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end_soft, err_help, err_help_sym, err_str, err_sym};
-use crate::front::ast::{NODES, NodeKind, STRUCT_SCOPED};
-use crate::front::check::LOCALS;
-use crate::front::closures::{CAPTURE_LIST, CLOSURES};
+use crate::front::ast::{NodeKind, STRUCT_SCOPED};
 use crate::front::modules::within_std;
 use crate::front::types::{
-    ENUMS, FNS, STRUCTS, TYPES, TY_ERROR, TyKind, VARIANTS, enum_variant, err_type, fn_param,
-    struct_field, type_elem,
+    ENUMS, TYPES, TyKind, enum_variant, err_type, fn_param, struct_field, type_elem,
 };
-use crate::middle::lower::ssa::HMap;
-
-// type + 1 -> the #[scoped] struct a value of the type holds + 2 (1:
-// none, or being computed); see scoped_in.
-static var SCOPED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 // The #[scoped] struct (a STRUCTS index) a value of type t holds, in a
 // field, an element, a variant or behind a pointer; -1: none. Memoized.
-pub fn scoped_in(t: i64) -> i64 {
+pub fn scoped_in(t: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if t <= 0 || t == TY_ERROR {
+        if t <= 0 || t == pcx.ty_error {
             return -1;
         }
-        let known = SCOPED.get(t + 1);
+        let known = pcx.scoped.get(t + 1);
         if known != 0 {
             return known - 2;
         }
-        SCOPED.put(t + 1, 1);
+        pcx.scoped.put(t + 1, 1);
         var found = -1;
         let kind = TYPES[t].kind;
         if kind == TyKind::Struct {
             let s = TYPES[t].a;
-            if (STRUCTS[s].repr & STRUCT_SCOPED) != 0 {
-                found = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
+            if (pcx.structs[s].repr & STRUCT_SCOPED) != 0 {
+                found = if pcx.structs[s].tmpl != 0 { pcx.structs[s].tmpl - 1 } else { s };
             } else {
-                for i in 0..STRUCTS[s].field_count {
+                for i in 0..pcx.structs[s].field_count {
                     if found < 0 {
-                        found = scoped_in((*struct_field(s, i)).ty);
+                        found = scoped_in((*struct_field(s, i, pcx)).ty, &pcx);
                     }
                 }
             }
         } else if kind == TyKind::Tuple {
             for i in 0..TYPES[t].count {
                 if found < 0 {
-                    found = scoped_in(type_elem(t, i));
+                    found = scoped_in(type_elem(t, i), &pcx);
                 }
             }
         } else if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-            found = scoped_in(TYPES[t].a);
+            found = scoped_in(TYPES[t].a, &pcx);
         } else if kind == TyKind::Enum {
             let e = TYPES[t].a;
             for i in 0..ENUMS[e].variant_count {
                 if found < 0 {
-                    found = scoped_in(VARIANTS[enum_variant(e, i)].shape);
+                    found = scoped_in(pcx.variants[enum_variant(e, i)].shape, &pcx);
                 }
             }
         }
-        SCOPED.put(t + 1, found + 2);
+        pcx.scoped.put(t + 1, found + 2);
         found
     }
 }
 
 // Checks closure c (its id, CLOSURES index) once its signature and
 // captures are known (finish_closure).
-pub fn check_closure(c: i64) {
+pub fn check_closure(c: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let f = CLOSURES[c].f;
-        let captures = CLOSURES[c].capture_count;
+        let f = pcx.closures[c].f;
+        let captures = pcx.closures[c].capture_count;
         // (the env parameter first when it captures)
         let first = if captures > 0 { 1 } else { 0 };
         var takes = false;
-        for i in first..FNS[f].param_count {
-            if scoped_in(fn_param(f, i)) >= 0 {
+        for i in first..pcx.fns[f].param_count {
+            if scoped_in(fn_param(f, i, pcx), &pcx) >= 0 {
                 takes = true;
             }
         }
@@ -85,101 +79,102 @@ pub fn check_closure(c: i64) {
             return;
         }
         // (S2) its value
-        let ret = FNS[f].ret;
-        let s = scoped_in(ret);
+        let ret = pcx.fns[f].ret;
+        let s = scoped_in(ret, &pcx);
         if s >= 0 {
-            err_begin(value_pos(c));
-            err_str(c"this arena scope's value holds '");
-            err_sym(STRUCTS[s].name);
-            err_str(c"' (");
-            err_type(ret);
-            err_str(c"): its memory is gone when the scope ends");
-            err_help(c"copy it out: 'v.clone_in(gpa)', or return what is computed from it");
-            err_end_soft();
+            err_begin(value_pos(c, pcx), &pcx);
+            err_str(c"this arena scope's value holds '", pcx);
+            err_sym(pcx.structs[s].name, pcx);
+            err_str(c"' (", pcx);
+            err_type(ret, pcx);
+            err_str(c"): its memory is gone when the scope ends", pcx);
+            err_help(c"copy it out: 'v.clone_in(gpa)', or return what is computed from it", pcx);
+            err_end_soft(&pcx);
         }
         // (S3) its captures
         for j in 0..captures {
-            let local = CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j];
-            if scoped_in(LOCALS[local].ty) >= 0 {
-                err_begin(NODES[CLOSURES[c].node].start);
-                err_str(c"an arena scope cannot use '");
-                err_sym(LOCALS[local].name);
-                err_str(c"': its type holds another scope's arena");
-                err_help(c"take a view first: 'let s = ");
-                err_help_sym(LOCALS[local].name);
-                err_help(c".as_slice();'");
-                err_end_soft();
+            let local = pcx.capture_list.data[pcx.closures[c].captures + 2 * j];
+            if scoped_in(pcx.locals[local].ty, &pcx) >= 0 {
+                err_begin(pcx.nodes[pcx.closures[c].node].start, &pcx);
+                err_str(c"an arena scope cannot use '", pcx);
+                err_sym(pcx.locals[local].name, pcx);
+                err_str(c"': its type holds another scope's arena", pcx);
+                err_help(c"take a view first: 'let s = ", pcx);
+                err_help_sym(pcx.locals[local].name, pcx);
+                err_help(c".as_slice();'", pcx);
+                err_end_soft(&pcx);
             }
         }
     }
 }
 
 // Where closure c's value is: its body's tail, else the closure.
-fn value_pos(c: i64) -> i64 {
+fn value_pos(c: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let n = CLOSURES[c].node;
-        let body = NODES[FNS[CLOSURES[c].f].node].c;
-        if body > 0 && NODES[body].kind == NodeKind::Block && NODES[body].a > 0 {
-            return NODES[NODES[body].a].start;
+        let n = pcx.closures[c].node;
+        let body = pcx.nodes[pcx.fns[pcx.closures[c].f].node].c;
+        if body > 0 && pcx.nodes[body].kind == NodeKind::Block && pcx.nodes[body].a > 0 {
+            return pcx.nodes[pcx.nodes[body].a].start;
         }
-        if body > 0 && NODES[body].kind != NodeKind::Block {
-            return NODES[body].start;
+        if body > 0 && pcx.nodes[body].kind != NodeKind::Block {
+            return pcx.nodes[body].start;
         }
-        NODES[n].start
+        pcx.nodes[n].start
     }
 }
 
 // Instance f, checked: when it is std's arena_scope or a `scope` method
 // whose body is a function passed by name (not a closure: check_closure
 // has those), its value must not hold a #[scoped] struct either (S2).
-pub fn check_scope_instance(f: i64) {
+pub fn check_scope_instance(f: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if FNS[f].tmpl == 0 || !within_std(FNS[f].module) || FNS[f].param_count == 0 {
+        if pcx.fns[f].tmpl == 0 || !within_std(pcx.fns[f].module, pcx)
+            || pcx.fns[f].param_count == 0 {
             return;
         }
-        let name = NODES[FNS[f].node].a;
+        let name = pcx.nodes[pcx.fns[f].node].a;
         if name != intern_c(c"arena_scope") && name != intern_c(c"scope") {
             return;
         }
-        let body = fn_param(f, FNS[f].param_count - 1);
-        if TYPES[body].kind == TyKind::Struct && STRUCTS[TYPES[body].a].closure != 0 {
+        let body = fn_param(f, pcx.fns[f].param_count - 1, pcx);
+        if TYPES[body].kind == TyKind::Struct && pcx.structs[TYPES[body].a].closure != 0 {
             return;
         }
-        let ret = FNS[f].ret;
-        let s = scoped_in(ret);
-        if s < 0 || FNS[f].origin <= 0 {
+        let ret = pcx.fns[f].ret;
+        let s = scoped_in(ret, &pcx);
+        if s < 0 || pcx.fns[f].origin <= 0 {
             return;
         }
-        err_begin(NODES[FNS[f].origin].start);
-        err_str(c"this arena scope's value holds '");
-        err_sym(STRUCTS[s].name);
-        err_str(c"' (");
-        err_type(ret);
-        err_str(c"): its memory is gone when the scope ends");
-        err_help(c"copy it out: 'v.clone_in(gpa)', or return what is computed from it");
-        err_end_soft();
+        err_begin(pcx.nodes[pcx.fns[f].origin].start, &pcx);
+        err_str(c"this arena scope's value holds '", pcx);
+        err_sym(pcx.structs[s].name, pcx);
+        err_str(c"' (", pcx);
+        err_type(ret, pcx);
+        err_str(c"): its memory is gone when the scope ends", pcx);
+        err_help(c"copy it out: 'v.clone_in(gpa)', or return what is computed from it", pcx);
+        err_end_soft(&pcx);
     }
 }
 
 // Static `name` of type ty (declared at pos): an error if it holds a
 // #[scoped] struct (then false).
-pub fn check_static_type(ty: i64, name: i64, pos: i64) -> bool {
+pub fn check_static_type(ty: i64, name: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let s = scoped_in(ty);
+        let s = scoped_in(ty, &pcx);
         if s < 0 {
             return true;
         }
-        err_begin(pos);
-        err_str(c"static '");
-        err_sym(name);
-        err_str(c"' holds '");
-        err_sym(STRUCTS[s].name);
-        err_str(c"' (");
-        err_type(ty);
-        err_str(c"): a scope's arena lives only while its scope runs");
+        err_begin(pos, &pcx);
+        err_str(c"static '", pcx);
+        err_sym(name, pcx);
+        err_str(c"' holds '", pcx);
+        err_sym(pcx.structs[s].name, pcx);
+        err_str(c"' (", pcx);
+        err_type(ty, pcx);
+        err_str(c"): a scope's arena lives only while its scope runs", pcx);
         // (0.26.3: no static holds an allocator at all, alloc.static)
-        err_help(c"keep it in the scope's locals");
-        err_end_soft();
+        err_help(c"keep it in the scope's locals", pcx);
+        err_end_soft(&pcx);
         false
     }
 }

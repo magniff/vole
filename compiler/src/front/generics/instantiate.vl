@@ -7,21 +7,20 @@
 use std::Option;
 
 use crate::base::{
-    IntVec, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
-    intern,
+    SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free, intern,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym, err_try_fmt};
 use crate::front::assoc::{infer_from_assoc, is_projection_node};
-use crate::front::ast::{
-    NODES, NODE_REF, NodeKind, child, list_begin, list_end, list_push, new_node,
-};
+use crate::front::ast::{NODE_REF, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{
     Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, Defer, EnumPanic, ExprStmt,
     FieldAccess, FieldInit, Fn, For, If, Index, Let, Loop, Match, MethodCall, Param, PatLit,
     PatRange, Range, Repeat, Return, TupleField, TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple,
     Unary, While,
 };
-use crate::front::check::{Res, SELF_TYPE, SELF_TYPE_SYM};
+use crate::front::check::Res;
 use crate::front::check::args::is_default_arg;
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
@@ -30,69 +29,60 @@ use crate::front::check::widen::{join_int, takes_context};
 use crate::front::closures::fn_bounds::{infer_closure_arg, infer_from_fn_bound, is_deferred_arg};
 use crate::front::contracts::is_distinct;
 use crate::front::generics::{
-    CUR_INST, FN_INSTANCES, HINT_NODE, HINT_TY, INST_QUEUE, MAX_INST_DEPTH, SELF_BOUND_POS, SYNTHED,
-    TPL_DISTINCT, TPL_NONE, TPL_SLICE, check_targ_depth, env_enter, env_leave, env_lookup,
-    generic_symbol, hint_for, inst_add, inst_first, inst_hash, inst_id, inst_next, instance_of,
-    instance_targs, is_untyped_literal_expr, mangle_type, mark_synthed, param_default, same_targs,
-    shown_targs, take_targs, targ_count_error, template_instance,
+    MAX_INST_DEPTH, TPL_DISTINCT, TPL_NONE, TPL_SLICE, check_targ_depth, env_enter, env_leave,
+    env_lookup, generic_symbol, hint_for, inst_add, inst_first, inst_hash, inst_id, inst_next,
+    instance_of, instance_targs, is_untyped_literal_expr, mangle_type, mark_synthed, param_default,
+    same_targs, shown_targs, take_targs, targ_count_error, template_instance,
 };
-use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::modules::module_of;
 use crate::front::traits::check_bounds;
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, SYM_ALIAS, TLISTS, TSCRATCH, TYPES, TY_NEVER, TyKind, buf_type,
-    decay_ref, err_type, is_integer, is_mut_slice, type_elem,
+    ENUMS, TLISTS, TSCRATCH, TYPES, TY_NEVER, TyKind, buf_type, decay_ref, err_type, is_integer,
+    is_mut_slice, type_elem,
 };
 
 // ---- Inference ----
 
 // Bindings of the parameters `params` (a Generics node) being inferred:
 // bound[i] is the type of parameter i, 0 while unknown.
-pub fn tparam_index(params: i64, name: i64) -> Option<i64> {
+pub fn tparam_index(params: i64, name: i64, pcx: Ctx<Comp>) -> Option<i64> {
     if params == 0 {
         return Option::None;
     }
-    for i in 0..NODES[params].count {
-        if NODES[child(params, i)].a == name {
+    for i in 0..pcx.nodes[params].count {
+        if pcx.nodes[child(params, i, pcx)].a == name {
             return Option::Some(i);
         }
     }
     Option::None
 }
 
-// The self type (a TyName) of the impl block of the template being
-// inferred, which `Self` stands for in its signature (0: none).
-pub static var UNIFY_SELF: i64 = 0;
-
-// (0.14) When UNIFY_SELF is 0: the type `Self` stands for in the bounds of
-// a generic method of a non-generic impl (`Counter::map`, a trait default
-// copied into `impl Iterator for Counter`): the receiver's type (0: none).
-pub static var UNIFY_SELF_TY: i64 = 0;
-
-fn is_self_name(p: i64) -> bool {
-    UNIFY_SELF != 0 && NODES[p].a == SELF_TYPE_SYM && NODES[p].count == 0 && NODES[p].g == 0
+fn is_self_name(p: i64, pcx: Ctx<Comp>) -> bool {
+    pcx.unify_self != 0 && pcx.nodes[p].a == pcx.self_type_sym && pcx.nodes[p].count == 0
+        && pcx.nodes[p].g == 0
 }
 
 // Whether type node p (of a template) mentions a parameter not yet bound.
-pub fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
+pub fn mentions_unbound(params: i64, bound: *i64, p: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if p == 0 {
             return false;
         }
-        let kind = NODES[p].kind;
+        let kind = pcx.nodes[p].kind;
         if kind == TyName {
-            if is_self_name(p) {
-                return mentions_unbound(params, bound, UNIFY_SELF);
+            if is_self_name(p, pcx) {
+                return mentions_unbound(params, bound, pcx.unify_self, pcx);
             }
-            if NODES[p].count == 0 {
-                match tparam_index(params, NODES[p].a) {
+            if pcx.nodes[p].count == 0 {
+                match tparam_index(params, pcx.nodes[p].a, pcx) {
                     Option::Some(k) => return bound[k] == 0,
                     Option::None => {}
                 }
             }
-            let g = NODES[p].g;
+            let g = pcx.nodes[p].g;
             if g != 0 {
-                for i in 0..NODES[g].count {
-                    if mentions_unbound(params, bound, child(g, i)) {
+                for i in 0..pcx.nodes[g].count {
+                    if mentions_unbound(params, bound, child(g, i, pcx), pcx) {
                         return true;
                     }
                 }
@@ -100,105 +90,95 @@ pub fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
             return false;
         }
         if kind == TyPtr || kind == TySlice || kind == TyArray {
-            return mentions_unbound(params, bound, NODES[p].a);
+            return mentions_unbound(params, bound, pcx.nodes[p].a, pcx);
         }
         if kind == TyTuple || kind == TyFn {
-            for i in 0..NODES[p].count {
-                if mentions_unbound(params, bound, child(p, i)) {
+            for i in 0..pcx.nodes[p].count {
+                if mentions_unbound(params, bound, child(p, i, pcx), pcx) {
                     return true;
                 }
             }
-            return kind == TyFn && mentions_unbound(params, bound, NODES[p].a);
+            return kind == TyFn && mentions_unbound(params, bound, pcx.nodes[p].a, pcx);
         }
         false
     }
 }
 
-// Matches type node p (of a template declared in module `tmod`) against
-// type t, binding parameters; false when a parameter is already bound to
-// another type.
-// Generic aliases met while unifying (0.6): (name, argument node, its
-// module, the frame it is in: lo, hi) for each parameter of the aliases
-// being looked through; ALIAS_LO..ALIAS_HI are the entries in scope.
-static var ALIAS_SUBST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-static var ALIAS_LO: i64 = 0;
-
-static var ALIAS_HI: i64 = 0;
-
 // Unifies the body of the generic alias named by p (`Pair<T>`, its
 // arguments in p's `g`) with t, its parameters standing for those
 // arguments.
-fn unify_alias(params: i64, bound: *i64, tmod: i64, p: i64, alias: i64, t: i64) -> bool {
-    let g = NODES[p].g;
+fn unify_alias(params: i64, bound: *i64, tmod: i64, p: i64, alias: i64, t: i64,
+    pcx: inout Ctx<Comp>) -> bool {
+    let g = pcx.nodes[p].g;
     // (0.18: a generic distinct type: its arguments are t's)
-    if is_distinct(alias) {
+    if is_distinct(alias, pcx) {
         if TYPES[t].kind != TyKind::Distinct || TYPES[t].b != alias
-            || TYPES[t].count != NODES[g].count {
+            || TYPES[t].count != pcx.nodes[g].count {
             return true;
         }
         var ok = true;
-        for i in 0..NODES[g].count {
-            if !unify(params, bound, tmod, child(g, i), type_elem(t, i)) {
+        for i in 0..pcx.nodes[g].count {
+            if !unify(params, bound, tmod, child(g, i, pcx), type_elem(t, i), &pcx) {
                 ok = false;
             }
         }
         return ok;
     }
-    let aparams = NODES[alias].g;
-    if NODES[g].count != NODES[aparams].count {
+    let aparams = pcx.nodes[alias].g;
+    if pcx.nodes[g].count != pcx.nodes[aparams].count {
         return true;
     }
-    let mark = ALIAS_SUBST.count;
-    for i in 0..NODES[g].count {
-        ALIAS_SUBST.push(NODES[child(aparams, i)].a);
-        ALIAS_SUBST.push(child(g, i));
-        ALIAS_SUBST.push(tmod);
-        ALIAS_SUBST.push(ALIAS_LO);
-        ALIAS_SUBST.push(ALIAS_HI);
+    let mark = pcx.alias_subst.count;
+    for i in 0..pcx.nodes[g].count {
+        pcx.alias_subst.push(pcx.nodes[child(aparams, i, pcx)].a);
+        pcx.alias_subst.push(child(g, i, pcx));
+        pcx.alias_subst.push(tmod);
+        pcx.alias_subst.push(pcx.alias_lo);
+        pcx.alias_subst.push(pcx.alias_hi);
     }
-    let (lo, hi) = (ALIAS_LO, ALIAS_HI);
-    ALIAS_LO = mark;
-    ALIAS_HI = ALIAS_SUBST.count;
-    let ok = unify(params, bound, module_of(alias), NODES[alias].b, t);
-    ALIAS_LO = lo;
-    ALIAS_HI = hi;
-    ALIAS_SUBST.count = mark;
+    let (lo, hi) = (pcx.alias_lo, pcx.alias_hi);
+    pcx.alias_lo = mark;
+    pcx.alias_hi = pcx.alias_subst.count;
+    let ok = unify(params, bound, module_of(alias, &pcx), pcx.nodes[alias].b, t, &pcx);
+    pcx.alias_lo = lo;
+    pcx.alias_hi = hi;
+    pcx.alias_subst.count = mark;
     ok
 }
 
-pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
+pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if p == 0 || t == 0 {
             return true;
         }
-        let kind = NODES[p].kind;
+        let kind = pcx.nodes[p].kind;
         let tk = TYPES[t].kind;
         if kind == TyName {
             // (0.14: `I::Item` binds nothing here: infer_from_assoc)
-            if is_projection_node(p) {
+            if is_projection_node(p, pcx) {
                 return true;
             }
-            if is_self_name(p) {
-                return unify(params, bound, module_of(UNIFY_SELF), UNIFY_SELF, t);
+            if is_self_name(p, pcx) {
+                return unify(params, bound, module_of(pcx.unify_self, &pcx), pcx.unify_self, t,
+                    &pcx);
             }
-            if NODES[p].count == 0 && NODES[p].g == 0 {
+            if pcx.nodes[p].count == 0 && pcx.nodes[p].g == 0 {
                 // A parameter of an alias being looked through: its argument.
-                var i = ALIAS_LO;
-                while i < ALIAS_HI {
-                    if ALIAS_SUBST.data[i] == NODES[p].a {
-                        let (lo, hi) = (ALIAS_LO, ALIAS_HI);
-                        ALIAS_LO = ALIAS_SUBST.data[i + 3];
-                        ALIAS_HI = ALIAS_SUBST.data[i + 4];
-                        let ok = unify(params, bound, ALIAS_SUBST.data[i + 2],
-                            ALIAS_SUBST.data[i + 1], t);
-                        ALIAS_LO = lo;
-                        ALIAS_HI = hi;
+                var i = pcx.alias_lo;
+                while i < pcx.alias_hi {
+                    if pcx.alias_subst.data[i] == pcx.nodes[p].a {
+                        let (lo, hi) = (pcx.alias_lo, pcx.alias_hi);
+                        pcx.alias_lo = pcx.alias_subst.data[i + 3];
+                        pcx.alias_hi = pcx.alias_subst.data[i + 4];
+                        let ok = unify(params, bound, pcx.alias_subst.data[i + 2],
+                            pcx.alias_subst.data[i + 1], t, &pcx);
+                        pcx.alias_lo = lo;
+                        pcx.alias_hi = hi;
                         return ok;
                     }
                     i += 5;
                 }
-                match tparam_index(params, NODES[p].a) {
+                match tparam_index(params, pcx.nodes[p].a, pcx) {
                     Option::Some(k) => {
                         // (0.17: a reference binds its raw type: references
                         // are not type arguments until 0.17.1; a `&mut [T]`,
@@ -223,60 +203,60 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
                     Option::None => return true,
                 }
             }
-            let g = NODES[p].g;
+            let g = pcx.nodes[p].g;
             if g == 0 {
                 return true;
             }
-            let saved = CUR_MOD;
-            CUR_MOD = tmod;
-            let key = if NODES[p].count == 0 && env_lookup(NODES[p].a) != 0 { -1 }
-                else { type_name_key(p) };
-            let tpl = template_of_type_node(p);
-            CUR_MOD = saved;
-            if key >= 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
-                return unify_alias(params, bound, tmod, p, SYM_ALIAS[key], t);
+            let saved = pcx.cur_mod;
+            pcx.cur_mod = tmod;
+            let key = if pcx.nodes[p].count == 0 && env_lookup(pcx.nodes[p].a, pcx) != 0 { -1 }
+                else { type_name_key(p, &pcx) };
+            let tpl = template_of_type_node(p, &pcx);
+            pcx.cur_mod = saved;
+            if key >= 0 && pcx.sym_alias[key] != 0 && pcx.nodes[pcx.sym_alias[key]].g != 0 {
+                return unify_alias(params, bound, tmod, p, pcx.sym_alias[key], t, &pcx);
             }
-            if tpl == TPL_NONE || !instance_of(t, tpl) {
+            if tpl == TPL_NONE || !instance_of(t, tpl, pcx) {
                 return true;
             }
-            let targs = instance_targs(t);
+            let targs = instance_targs(t, &pcx);
             var ok = true;
-            for i in 0..NODES[g].count {
-                if !unify(params, bound, tmod, child(g, i), TLISTS.data[targs + i]) {
+            for i in 0..pcx.nodes[g].count {
+                if !unify(params, bound, tmod, child(g, i, pcx), TLISTS.data[targs + i], &pcx) {
                     ok = false;
                 }
             }
             return ok;
         }
-        if kind == TyPtr && (NODES[p].p & NODE_REF) != 0
+        if kind == TyPtr && (pcx.nodes[p].p & NODE_REF) != 0
             && (tk == TyKind::Slice && TYPES[t].b == 0 || tk != TyKind::Slice && tk != TyKind::Ptr) {
             // (0.18.1) `&T` given a value, `x` or `&x.text()` (a slice is
             // its own view): T is its type (check_mode::coerce_ref borrows
             // a place, or says to)
-            return unify(params, bound, tmod, NODES[p].a, t);
+            return unify(params, bound, tmod, pcx.nodes[p].a, t, &pcx);
         }
         if kind == TyPtr && tk == TyKind::Ptr || kind == TySlice && tk == TyKind::Slice
             || kind == TyArray && tk == TyKind::Array {
-            return unify(params, bound, tmod, NODES[p].a, TYPES[t].a);
+            return unify(params, bound, tmod, pcx.nodes[p].a, TYPES[t].a, &pcx);
         }
         if kind == TySlice && tk != TyKind::Slice {
             // (0.25) a Vec, a Buf or an array given to a `[T]` (or an
             // `inout [T]`, as `&v`): T is its element type, the argument
             // then viewed as its slice (check_mode::elements_view)
-            let elem = slice_elem_of(t);
+            let elem = slice_elem_of(t, pcx);
             if elem > 0 {
-                return unify(params, bound, tmod, NODES[p].a, elem);
+                return unify(params, bound, tmod, pcx.nodes[p].a, elem, &pcx);
             }
         }
-        if kind == TyTuple && tk == TyKind::Tuple && NODES[p].count == TYPES[t].count
-            || kind == TyFn && tk == TyKind::Fn && NODES[p].count == TYPES[t].count {
+        if kind == TyTuple && tk == TyKind::Tuple && pcx.nodes[p].count == TYPES[t].count
+            || kind == TyFn && tk == TyKind::Fn && pcx.nodes[p].count == TYPES[t].count {
             var ok = true;
-            for i in 0..NODES[p].count {
-                if !unify(params, bound, tmod, child(p, i), type_elem(t, i)) {
+            for i in 0..pcx.nodes[p].count {
+                if !unify(params, bound, tmod, child(p, i, pcx), type_elem(t, i), &pcx) {
                     ok = false;
                 }
             }
-            if kind == TyFn && !unify(params, bound, tmod, NODES[p].a, TYPES[t].a) {
+            if kind == TyFn && !unify(params, bound, tmod, pcx.nodes[p].a, TYPES[t].a, &pcx) {
                 ok = false;
             }
             return ok;
@@ -290,7 +270,7 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
 // parameter or of a slice, `&v` of a Vec, a Buf, an array: the inout
 // marker), a slice's, a Vec's, a Buf's or an array's element type; a
 // String or a PathBuf: u8 (check_mode::coerce_text views them).
-fn slice_elem_of(t: i64) -> i64 {
+fn slice_elem_of(t: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var base = t;
         if base > 0 && TYPES[base].kind == TyKind::Ptr && TYPES[base].b != 0 {
@@ -302,14 +282,14 @@ fn slice_elem_of(t: i64) -> i64 {
         if TYPES[base].kind == TyKind::Slice {
             return TYPES[base].a;
         }
-        let elem = crate::front::conv::container_elem(decay_ref(base));
+        let elem = crate::front::conv::container_elem(decay_ref(base), pcx);
         if elem > 0 {
             return elem;
         }
         if TYPES[base].kind == TyKind::Struct
-            && crate::front::modules::within_std(STRUCTS[TYPES[base].a].module)
-            && (crate::front::check::is_std_named(base, c"String")
-                || crate::front::check::is_std_named(base, c"PathBuf")) {
+            && crate::front::modules::within_std(pcx.structs[TYPES[base].a].module, pcx)
+            && (crate::front::check::is_std_named(base, c"String", pcx)
+                || crate::front::check::is_std_named(base, c"PathBuf", pcx)) {
             return crate::front::types::TY_U8;
         }
         0
@@ -322,13 +302,13 @@ fn slice_elem_of(t: i64) -> i64 {
 // its Param nodes, whose `b` is the type; `param_nodes` says which), and
 // from the expected type `hint` against `result` (a type node, or 0).
 fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types: i64,
-    first_type: i64, param_nodes: bool, result: i64, hint: i64) {
+    first_type: i64, param_nodes: bool, result: i64, hint: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         // (0.15) Which parameters a value binds (the expected type, or an
         // argument whose type is the parameter itself) are `loose`: two
         // integer types of values join. One bound before (by the receiver,
         // the turbofish) or inside another type (`Vec<T>`) is exact.
-        let count = NODES[params].count;
+        let count = pcx.nodes[params].count;
         let loose = alloc_array::<i64>(count);
         for i in 0..count {
             loose[i] = if bound[i] == 0 { 2 } else { 0 };
@@ -338,7 +318,7 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
             for i in 0..count {
                 trial[i] = bound[i];
             }
-            if unify(params, trial, tmod, result, hint) {
+            if unify(params, trial, tmod, result, hint, &pcx) {
                 for i in 0..count {
                     bound[i] = trial[i];
                 }
@@ -351,70 +331,71 @@ fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types:
         // (0.14: pass 2, the closures, typed from their parameters' bounds;
         // then what the bounds' constraints bind)
         for pass in 0..3 {
-            for i in first..NODES[args].count {
+            for i in first..pcx.nodes[args].count {
                 let k = first_type + i - first;
-                if k >= NODES[types].count {
+                if k >= pcx.nodes[types].count {
                     break;
                 }
-                let p = if param_nodes { NODES[child(types, k)].b } else { child(types, k) };
-                let arg = child(args, i);
-                let joins = joins_later(params, bound, loose, p) && !takes_context(arg);
-                if !joins && !mentions_unbound(params, bound, p) {
+                let p = if param_nodes { pcx.nodes[child(types, k, pcx)].b }
+                    else { child(types, k, pcx) };
+                let arg = child(args, i, pcx);
+                let joins = joins_later(params, bound, loose, p, pcx) && !takes_context(arg, &pcx);
+                if !joins && !mentions_unbound(params, bound, p, pcx) {
                     continue;
                 }
                 // (0.15: a parameter's default is checked against the
                 // instance's type, in the callee's module)
-                if is_default_arg(arg) {
+                if is_default_arg(arg, pcx) {
                     continue;
                 }
-                if is_deferred_arg(arg) {
+                if is_deferred_arg(arg, pcx) {
                     if pass == 2 {
-                        infer_closure_arg(params, bound, tmod, arg, p);
-                        mark_synthed(arg);
+                        infer_closure_arg(params, bound, tmod, arg, p, &pcx);
+                        mark_synthed(arg, &pcx);
                     }
                     continue;
                 }
-                if pass == 0 && is_untyped_literal_expr(arg) || pass == 2 {
+                if pass == 0 && is_untyped_literal_expr(arg, pcx) || pass == 2 {
                     continue;
                 }
-                var t = NODES[arg].ty;
-                if SYNTHED.get(arg + 1) == 0 {
+                var t = pcx.nodes[arg].ty;
+                if pcx.synthed.get(arg + 1) == 0 {
                     if joins {
                         // (the hint check mode would give it)
-                        HINT_NODE = arg;
-                        HINT_TY = bound[bare_param(params, p)];
+                        pcx.hint_node = arg;
+                        pcx.hint_ty = bound[bare_param(params, p, pcx)];
                     }
-                    t = synth_expr(arg);
-                    mark_synthed(arg);
+                    t = synth_expr(arg, &pcx);
+                    mark_synthed(arg, &pcx);
                 }
-                if t != TY_NEVER && join_arg(params, bound, loose, p, t) {
+                if t != TY_NEVER && join_arg(params, bound, loose, p, t, pcx) {
                     continue;
                 }
-                if t != TY_NEVER && !unify(params, bound, tmod, p, t) {
-                    err_begin(NODES[arg].start);
-                    err_str(c"mismatched types: this is '");
-                    err_type(t);
-                    err_str(c"', which does not fit the type parameters inferred so far");
-                    err_end();
+                if t != TY_NEVER && !unify(params, bound, tmod, p, t, &pcx) {
+                    err_begin(pcx.nodes[arg].start, &pcx);
+                    err_str(c"mismatched types: this is '", pcx);
+                    err_type(t, pcx);
+                    err_str(c"', which does not fit the type parameters inferred so far", pcx);
+                    err_end(&pcx);
                 }
             }
         }
         free(loose as *u8);
         for k in 0..count {
-            infer_from_fn_bound(params, bound, tmod, k);
-            infer_from_assoc(params, bound, tmod, k);
+            infer_from_fn_bound(params, bound, tmod, k, &pcx);
+            infer_from_assoc(params, bound, tmod, k, &pcx);
         }
     }
 }
 
 // The parameter of `params` that type node p is itself (`T`, not `*T`),
 // or -1.
-fn bare_param(params: i64, p: i64) -> i64 {
-    if NODES[p].kind != TyName || NODES[p].count != 0 || NODES[p].g != 0
-        || is_projection_node(p) || is_self_name(p) || ALIAS_LO < ALIAS_HI {
+fn bare_param(params: i64, p: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[p].kind != TyName || pcx.nodes[p].count != 0 || pcx.nodes[p].g != 0
+        || is_projection_node(p, pcx) || is_self_name(p, pcx) || pcx.alias_lo < pcx.alias_hi {
         return -1;
     }
-    match tparam_index(params, NODES[p].a) {
+    match tparam_index(params, pcx.nodes[p].a, pcx) {
         Option::Some(k) => k,
         Option::None => -1,
     }
@@ -423,8 +404,8 @@ fn bare_param(params: i64, p: i64) -> i64 {
 // (0.15) Whether an argument of type node p must be synthesized although
 // p's parameters are bound: p is a parameter a value bound (`loose`), so
 // that a wider integer argument joins with it.
-fn joins_later(params: i64, bound: *i64, loose: *i64, p: i64) -> bool {
-    let k = bare_param(params, p);
+fn joins_later(params: i64, bound: *i64, loose: *i64, p: i64, pcx: Ctx<Comp>) -> bool {
+    let k = bare_param(params, p, pcx);
     unsafe { k >= 0 && loose[k] != 0 && is_integer(bound[k]) }
 }
 
@@ -433,8 +414,8 @@ fn joins_later(params: i64, bound: *i64, loose: *i64, p: i64) -> bool {
 // it has: kept when t widens to it (the argument is widened when it is
 // checked), the wider t when it was bound by a value (`loose`). True when
 // done, false for unify to bind or report.
-fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64) -> bool {
-    let k = bare_param(params, p);
+fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64, pcx: Ctx<Comp>) -> bool {
+    let k = bare_param(params, p, pcx);
     if k < 0 {
         return false;
     }
@@ -469,17 +450,17 @@ fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64) -> bool {
 // `outer` parameters are the type's), 1 a variant `member` of enum
 // `what` (3: with fields), 2 a literal of struct `what`.
 fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, outer: i64,
-    member: i64) {
+    member: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..NODES[params].count {
+        for i in 0..pcx.nodes[params].count {
             if bound[i] == 0 {
-                err_begin(pos);
-                err_str(c"cannot infer type parameter '");
-                err_sym(NODES[child(params, i)].a);
-                err_str(c"' of '");
-                err_sym(what);
-                err_str(c"'");
-                err_help(c"nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name)");
+                err_begin(pos, &pcx);
+                err_str(c"cannot infer type parameter '", pcx);
+                err_sym(pcx.nodes[child(params, i, pcx)].a, pcx);
+                err_str(c"' of '", pcx);
+                err_sym(what, pcx);
+                err_str(c"'", pcx);
+                err_help(c"nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name)", pcx);
                 let t = buf_new();
                 let w = SYMS[what].text;
                 if shape == 0 && outer > 0 {
@@ -493,12 +474,12 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, oute
                         k -= 1;
                     }
                     buf_bytes(t, w[0..cut]);
-                    put_targs(t, params, bound, 0, outer);
+                    put_targs(t, params, bound, 0, outer, pcx);
                     buf_bytes(t, w[cut..]);
-                    put_targs(t, params, bound, outer, NODES[params].count);
+                    put_targs(t, params, bound, outer, pcx.nodes[params].count, pcx);
                 } else {
                     buf_bytes(t, w);
-                    put_targs(t, params, bound, 0, NODES[params].count);
+                    put_targs(t, params, bound, 0, pcx.nodes[params].count, pcx);
                 }
                 if shape == 0 {
                     buf_str(t, c"(...)");
@@ -511,8 +492,8 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, oute
                 } else {
                     buf_str(t, c" { ... }");
                 }
-                err_try_fmt(buf_slice(t));
-                err_end();
+                err_try_fmt(buf_slice(t), pcx);
+                err_end(&pcx);
             }
         }
     }
@@ -521,7 +502,7 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, oute
 // `::<A, B>` of parameters from..to: an inferred one's type, else its
 // name; nothing after the last unbound one (its defaults apply), nothing
 // at all when all are bound.
-fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64) {
+fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64, pcx: Ctx<Comp>) {
     unsafe {
         var last = -1;
         for i in from..to {
@@ -538,9 +519,9 @@ fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64) {
                 buf_str(out, c", ");
             }
             if bound[i] != 0 {
-                buf_type(out, bound[i]);
+                buf_type(out, bound[i], pcx);
             } else {
-                buf_bytes(out, SYMS[NODES[child(params, i)].a].text);
+                buf_bytes(out, SYMS[pcx.nodes[child(params, i, pcx)].a].text);
             }
         }
         buf_byte(out, '>');
@@ -551,14 +532,14 @@ fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64) {
 // that stand for parameters of generic struct or enum `node` (declared in
 // `module`) with a default, bound to the default: `Vec::new()` is
 // `Vec::<_, Gpa>::new()` when no argument or expected type says otherwise.
-fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64) {
+fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let params = NODES[node].g;
+        let params = pcx.nodes[node].g;
         for k in 0..count {
-            if k >= NODES[params].count {
+            if k >= pcx.nodes[params].count {
                 return;
             }
-            if bound[first + k] != 0 || NODES[child(params, k)].b == 0 {
+            if bound[first + k] != 0 || pcx.nodes[child(params, k, pcx)].b == 0 {
                 continue;
             }
             let mark = TSCRATCH.count;
@@ -570,7 +551,7 @@ fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64) {
                 TSCRATCH.push(bound[first + i]);
             }
             if known {
-                bound[first + k] = param_default(node, module, k);
+                bound[first + k] = param_default(node, module, k, &pcx);
             }
             TSCRATCH.count = mark;
         }
@@ -580,34 +561,35 @@ fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64) {
 // bind_defaults for the parameters of an impl block's generic type
 // (`impl<T, A: Allocator> Vec<T, A>`): those of function template
 // `template` that come from its impl.
-fn bind_impl_defaults(template: i64, bound: *i64) {
+fn bind_impl_defaults(template: i64, bound: *i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let self_node = NODES[template].h;
-        let params = NODES[template].g;
-        if self_node == 0 || NODES[params].a == 0 {
+        let self_node = pcx.nodes[template].h;
+        let params = pcx.nodes[template].g;
+        if self_node == 0 || pcx.nodes[params].a == 0 {
             return;
         }
-        let saved = CUR_MOD;
-        CUR_MOD = module_of(self_node);
-        let tpl = template_of_type_node(self_node);
-        CUR_MOD = saved;
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = module_of(self_node, &pcx);
+        let tpl = template_of_type_node(self_node, &pcx);
+        pcx.cur_mod = saved;
         if tpl == TPL_NONE || tpl == TPL_SLICE || tpl >= TPL_DISTINCT {
             return;
         }
         if tpl > 0 {
-            bind_defaults(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, bound, 0,
-                NODES[params].a);
+            bind_defaults(pcx.structs[tpl - 1].node, pcx.structs[tpl - 1].module, bound, 0,
+                pcx.nodes[params].a, &pcx);
         } else {
-            bind_defaults(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, bound, 0, NODES[params].a);
+            bind_defaults(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, bound, 0,
+                pcx.nodes[params].a, &pcx);
         }
     }
 }
 
 // The type arguments written in a Generics node (in the current scope),
 // pushed on TSCRATCH.
-pub fn push_written_targs(g: i64) {
-    for i in 0..NODES[g].count {
-        let t = resolve_type(child(g, i));
+pub fn push_written_targs(g: i64, pcx: inout Ctx<Comp>) {
+    for i in 0..pcx.nodes[g].count {
+        let t = resolve_type(child(g, i, pcx), &pcx);
         TSCRATCH.push(t);
     }
 }
@@ -616,75 +598,78 @@ pub fn push_written_targs(g: i64) {
 
 // The instance of function template tf with the type arguments
 // TSCRATCH[mark..] (popped); `origin` is the node using it.
-pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
+pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let count = TSCRATCH.count - mark;
         let h = inst_hash(tf, mark);
         var found = -1;
-        var slot = inst_first(FN_INSTANCES, h);
+        var slot = inst_first(pcx.fn_instances, h);
         while slot >= 0 {
-            let f = inst_id(FN_INSTANCES, slot);
-            if FNS[f].tmpl == tf + 1 && same_targs(FNS[f].targs, FNS[f].targ_count, mark)
+            let f = inst_id(pcx.fn_instances, slot);
+            if pcx.fns[f].tmpl == tf + 1
+                && same_targs(pcx.fns[f].targs, pcx.fns[f].targ_count, mark)
                 && (found < 0 || f < found) {
                 found = f;
             }
-            slot = inst_next(FN_INSTANCES, h, slot);
+            slot = inst_next(pcx.fn_instances, h, slot);
         }
         if found >= 0 {
             TSCRATCH.count = mark;
             return found;
         }
-        check_targ_depth(mark, NODES[origin].start);
-        let depth = if CUR_INST >= 0 { FNS[CUR_INST].depth + 1 } else { 1 };
+        check_targ_depth(mark, pcx.nodes[origin].start, &pcx);
+        let depth = if pcx.cur_inst >= 0 { pcx.fns[pcx.cur_inst].depth + 1 } else { 1 };
         if depth > MAX_INST_DEPTH {
-            err_begin(NODES[origin].start);
-            err_str(c"too many nested instantiations of '");
-            err_sym(FNS[tf].display);
-            err_str(c"' (does a generic function call itself with ever larger type arguments?)");
-            err_end();
+            err_begin(pcx.nodes[origin].start, &pcx);
+            err_str(c"too many nested instantiations of '", pcx);
+            err_sym(pcx.fns[tf].display, pcx);
+            err_str(c"' (does a generic function call itself with ever larger type arguments?)",
+                pcx);
+            err_end(&pcx);
         }
         let targs = take_targs(mark);
-        let template = FNS[tf].node;
-        let item = clone_node(template);
-        NODES[item].g = 0;
-        add_fn(item, instance_symbol(tf, targs, count), 0);
-        let f = FN_COUNT - 1;
-        FNS[f].targs = targs;
-        FNS[f].targ_count = count;
-        FNS[f].origin = origin;
-        FNS[f].parent = CUR_INST + 1;
-        FNS[f].depth = depth;
-        FNS[f].module = FNS[tf].module;
-        FNS[f].is_extern = false;
-        FNS[f].export = false;
-        let saved_mod = CUR_MOD;
-        let saved_self = SELF_TYPE;
-        CUR_MOD = FNS[f].module;
-        let saved = env_enter(NODES[template].g, targs, count);
+        let template = pcx.fns[tf].node;
+        let item = clone_node(template, &pcx);
+        pcx.nodes[item].g = 0;
+        add_fn(item, instance_symbol(tf, targs, count, &pcx), 0, &pcx);
+        let f = pcx.fn_count - 1;
+        pcx.fns[f].targs = targs;
+        pcx.fns[f].targ_count = count;
+        pcx.fns[f].origin = origin;
+        pcx.fns[f].parent = pcx.cur_inst + 1;
+        pcx.fns[f].depth = depth;
+        pcx.fns[f].module = pcx.fns[tf].module;
+        pcx.fns[f].is_extern = false;
+        pcx.fns[f].export = false;
+        let saved_mod = pcx.cur_mod;
+        let saved_self = pcx.self_type;
+        pcx.cur_mod = pcx.fns[f].module;
+        let saved = env_enter(pcx.nodes[template].g, targs, count, &pcx);
         // (the self type in its own module: a trait default's is the impl's)
-        if NODES[template].h != 0 {
-            CUR_MOD = module_of(NODES[template].h);
-            let saved_pos = SELF_BOUND_POS;
-            SELF_BOUND_POS = NODES[origin].start;
-            SELF_TYPE = resolve_type(NODES[template].h);
-            SELF_BOUND_POS = saved_pos;
-            CUR_MOD = FNS[f].module;
+        if pcx.nodes[template].h != 0 {
+            pcx.cur_mod = module_of(pcx.nodes[template].h, &pcx);
+            let saved_pos = pcx.self_bound_pos;
+            pcx.self_bound_pos = pcx.nodes[origin].start;
+            pcx.self_type = resolve_type(pcx.nodes[template].h, &pcx);
+            pcx.self_bound_pos = saved_pos;
+            pcx.cur_mod = pcx.fns[f].module;
         } else {
-            SELF_TYPE = 0;
+            pcx.self_type = 0;
         }
-        FNS[f].self_ty = SELF_TYPE;
+        pcx.fns[f].self_ty = pcx.self_type;
         // (0.14: checked with the parameters and `Self` of the instance in
         // scope, which an `Fn(Self::Item)` bound names)
-        check_bounds(NODES[template].g, targs, count, FNS[tf].display, NODES[origin].start);
-        FNS[f].display = instance_display(f, tf);
-        resolve_signature(f);
+        check_bounds(pcx.nodes[template].g, targs, count, pcx.fns[tf].display,
+            pcx.nodes[origin].start, &pcx);
+        pcx.fns[f].display = instance_display(f, tf, pcx);
+        resolve_signature(f, &pcx);
         // Found from now on (not when its signature failed to resolve).
-        FNS[f].tmpl = tf + 1;
-        inst_add(&FN_INSTANCES, f, h);
-        env_leave(saved);
-        CUR_MOD = saved_mod;
-        SELF_TYPE = saved_self;
-        INST_QUEUE.push(f);
+        pcx.fns[f].tmpl = tf + 1;
+        inst_add(&pcx.fn_instances, f, h);
+        env_leave(saved, &pcx);
+        pcx.cur_mod = saved_mod;
+        pcx.self_type = saved_self;
+        pcx.inst_queue.push(f);
         f
     }
 }
@@ -694,36 +679,37 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
 // a generic type's impl block, the impl's trailing arguments equal to the
 // type's defaults are left out, as in the type's own symbol (0.16:
 // `Vec.push.Gl` is push of `Vec<i64, Gpa>`, as before defaults existed).
-fn instance_symbol(tf: i64, targs: i64, count: i64) -> i64 {
+fn instance_symbol(tf: i64, targs: i64, count: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let template = FNS[tf].node;
-        let self_node = NODES[template].h;
-        let params = NODES[template].g;
-        let impl_count = if self_node != 0 { NODES[params].a } else { 0 };
+        let template = pcx.fns[tf].node;
+        let self_node = pcx.nodes[template].h;
+        let params = pcx.nodes[template].g;
+        let impl_count = if self_node != 0 { pcx.nodes[params].a } else { 0 };
         if impl_count == 0 {
-            return generic_symbol(FNS[tf].name, targs, count);
+            return generic_symbol(pcx.fns[tf].name, targs, count, &pcx);
         }
-        let saved = CUR_MOD;
-        CUR_MOD = module_of(self_node);
-        let tpl = template_of_type_node(self_node);
-        CUR_MOD = saved;
+        let saved = pcx.cur_mod;
+        pcx.cur_mod = module_of(self_node, &pcx);
+        let tpl = template_of_type_node(self_node, &pcx);
+        pcx.cur_mod = saved;
         if tpl == TPL_NONE || tpl == TPL_SLICE || tpl >= TPL_DISTINCT {
-            return generic_symbol(FNS[tf].name, targs, count);
+            return generic_symbol(pcx.fns[tf].name, targs, count, &pcx);
         }
         let shown = if tpl > 0 {
-            shown_targs(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, targs, impl_count)
+            shown_targs(pcx.structs[tpl - 1].node, pcx.structs[tpl - 1].module, targs, impl_count,
+                &pcx)
         } else {
-            shown_targs(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, targs, impl_count)
+            shown_targs(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, targs, impl_count, &pcx)
         };
         if shown == impl_count || shown == 0 && count == impl_count {
-            return generic_symbol(FNS[tf].name, targs, shown + count - impl_count);
+            return generic_symbol(pcx.fns[tf].name, targs, shown + count - impl_count, &pcx);
         }
         let out = buf_new();
-        buf_bytes(out, SYMS[FNS[tf].name].text);
+        buf_bytes(out, SYMS[pcx.fns[tf].name].text);
         buf_str(out, c".G");
         for i in 0..count {
             if i < shown || i >= impl_count {
-                mangle_type(out, TLISTS.data[targs + i]);
+                mangle_type(out, TLISTS.data[targs + i], &pcx);
             }
         }
         intern(buf_slice(out))
@@ -732,24 +718,24 @@ fn instance_symbol(tf: i64, targs: i64, count: i64) -> i64 {
 
 // `max<i64>`, or `Vec<i64>::push` for a method of a generic impl (with
 // its own type arguments after it, if any).
-fn instance_display(f: i64, tf: i64) -> i64 {
+fn instance_display(f: i64, tf: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let template = FNS[tf].node;
+        let template = pcx.fns[tf].node;
         let out = buf_new();
-        let params = NODES[template].g;
-        let impl_count = if NODES[template].h != 0 { NODES[params].a } else { 0 };
-        if NODES[template].h != 0 {
-            buf_type(out, FNS[f].self_ty);
+        let params = pcx.nodes[template].g;
+        let impl_count = if pcx.nodes[template].h != 0 { pcx.nodes[params].a } else { 0 };
+        if pcx.nodes[template].h != 0 {
+            buf_type(out, pcx.fns[f].self_ty, pcx);
             buf_str(out, c"::");
         }
-        buf_bytes(out, SYMS[NODES[template].a].text);
-        if FNS[f].targ_count > impl_count {
+        buf_bytes(out, SYMS[pcx.nodes[template].a].text);
+        if pcx.fns[f].targ_count > impl_count {
             buf_byte(out, '<');
-            for i in impl_count..FNS[f].targ_count {
+            for i in impl_count..pcx.fns[f].targ_count {
                 if i > impl_count {
                     buf_str(out, c", ");
                 }
-                buf_type(out, TLISTS.data[FNS[f].targs + i]);
+                buf_type(out, TLISTS.data[pcx.fns[f].targs + i], pcx);
             }
             buf_byte(out, '>');
         }
@@ -764,45 +750,48 @@ fn instance_display(f: i64, tf: i64) -> i64 {
 // none), the turbofish `written` (a Generics node with the function's own
 // parameters, 0 when none), the arguments (from list index 0, against
 // the parameters from `first_param`) and the expected type.
-pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written: i64) -> i64 {
+pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let template = FNS[tf].node;
-        let params = NODES[template].g;
-        let count = NODES[params].count;
-        let impl_count = if NODES[template].h != 0 { NODES[params].a } else { 0 };
-        let tmod = FNS[tf].module;
+        let template = pcx.fns[tf].node;
+        let params = pcx.nodes[template].g;
+        let count = pcx.nodes[params].count;
+        let impl_count = if pcx.nodes[template].h != 0 { pcx.nodes[params].a } else { 0 };
+        let tmod = pcx.fns[tf].module;
         let bound = alloc_array::<i64>(count);
-        let saved_self = UNIFY_SELF;
-        let saved_self_ty = UNIFY_SELF_TY;
-        UNIFY_SELF = NODES[template].h;
-        UNIFY_SELF_TY = if NODES[template].h == 0 { self_ty } else { 0 };
-        if self_ty != 0 && NODES[template].h != 0 {
-            unify(params, bound, module_of(NODES[template].h), NODES[template].h, self_ty);
+        let saved_self = pcx.unify_self;
+        let saved_self_ty = pcx.unify_self_ty;
+        pcx.unify_self = pcx.nodes[template].h;
+        pcx.unify_self_ty = if pcx.nodes[template].h == 0 { self_ty } else { 0 };
+        if self_ty != 0 && pcx.nodes[template].h != 0 {
+            unify(params, bound, module_of(pcx.nodes[template].h, &pcx), pcx.nodes[template].h,
+                self_ty, &pcx);
         }
         if written != 0 {
             // (0.26.2: the hidden parameters of `impl Trait` are not written)
             let shown = count - impl_count
-                - crate::front::parser::items::params::hidden_param_count(params);
-            if NODES[written].count != shown {
-                targ_count_error(NODES[written].start, c"function", FNS[tf].display, shown,
-                    NODES[written].count);
+                - crate::front::parser::items::params::hidden_param_count(params, pcx);
+            if pcx.nodes[written].count != shown {
+                targ_count_error(pcx.nodes[written].start, c"function", pcx.fns[tf].display, shown,
+                    pcx.nodes[written].count, &pcx);
             }
-            for i in 0..NODES[written].count {
-                bound[impl_count + i] = resolve_type(child(written, i));
+            for i in 0..pcx.nodes[written].count {
+                bound[impl_count + i] = resolve_type(child(written, i, pcx), &pcx);
             }
         }
-        infer_from(params, bound, tmod, n, 0, template, first_param, true, NODES[template].b,
-            hint_for(n));
-        UNIFY_SELF = saved_self;
-        UNIFY_SELF_TY = saved_self_ty;
-        bind_impl_defaults(template, bound);
-        require_bound(params, bound, NODES[n].start, FNS[tf].display, 0, impl_count, 0);
+        infer_from(params, bound, tmod, n, 0, template, first_param, true, pcx.nodes[template].b,
+            hint_for(n, pcx), &pcx);
+        pcx.unify_self = saved_self;
+        pcx.unify_self_ty = saved_self_ty;
+        bind_impl_defaults(template, bound, &pcx);
+        require_bound(params, bound, pcx.nodes[n].start, pcx.fns[tf].display, 0, impl_count, 0,
+            &pcx);
         let mark = TSCRATCH.count;
         for i in 0..count {
             TSCRATCH.push(bound[i]);
         }
         free(bound as *u8);
-        fn_instance(tf, mark, n)
+        fn_instance(tf, mark, n, &pcx)
     }
 }
 
@@ -810,25 +799,25 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
 // constructor makes: from the type arguments written on the path
 // (`written`), the expected type, or the fields (the arguments of call
 // `n`, 0 for a variant without fields).
-pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64) -> i64 {
+pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let e = -tpl - 1;
         let item = ENUMS[e].node;
-        let params = NODES[item].g;
+        let params = pcx.nodes[item].g;
         let mark = TSCRATCH.count;
         if written != 0 {
-            push_written_targs(written);
-            return template_instance(tpl, mark, pos);
+            push_written_targs(written, &pcx);
+            return template_instance(tpl, mark, pos, &pcx);
         }
-        let hint = if n != 0 { hint_for(n) } else { HINT_TY_PATH };
-        if hint != 0 && instance_of(hint, tpl) {
+        let hint = if n != 0 { hint_for(n, pcx) } else { pcx.hint_ty_path };
+        if hint != 0 && instance_of(hint, tpl, pcx) {
             return hint;
         }
-        let bound = alloc_array::<i64>(NODES[params].count);
+        let bound = alloc_array::<i64>(pcx.nodes[params].count);
         var variant = 0;
-        for i in 0..NODES[item].count {
-            if NODES[child(item, i)].a == member {
-                variant = child(item, i);
+        for i in 0..pcx.nodes[item].count {
+            if pcx.nodes[child(item, i, pcx)].a == member {
+                variant = child(item, i, pcx);
             }
         }
         if n != 0 && variant != 0 {
@@ -836,75 +825,73 @@ pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64) -> i64 
             // is its allocator, the enum's allocator parameter; once every
             // parameter is bound, the arguments are checked against the
             // variant's types)
-            for i in 0..NODES[n].count {
-                bind_allocator_arg(params, bound, child(n, i));
+            for i in 0..pcx.nodes[n].count {
+                bind_allocator_arg(params, bound, child(n, i, pcx), &pcx);
             }
             var all = true;
-            for i in 0..NODES[params].count {
+            for i in 0..pcx.nodes[params].count {
                 if bound[i] == 0 {
                     all = false;
                 }
             }
             if !all {
-                infer_from(params, bound, ENUMS[e].module, n, 0, variant, 0, false, 0, 0);
+                infer_from(params, bound, ENUMS[e].module, n, 0, variant, 0, false, 0, 0, &pcx);
             }
         }
-        bind_defaults(item, ENUMS[e].module, bound, 0, NODES[params].count);
-        require_bound(params, bound, pos, ENUMS[e].name, if n != 0 { 3 } else { 1 }, 0, member);
-        for i in 0..NODES[params].count {
+        bind_defaults(item, ENUMS[e].module, bound, 0, pcx.nodes[params].count, &pcx);
+        require_bound(params, bound, pos, ENUMS[e].name, if n != 0 { 3 } else { 1 }, 0, member,
+            &pcx);
+        for i in 0..pcx.nodes[params].count {
             TSCRATCH.push(bound[i]);
         }
         free(bound as *u8);
-        template_instance(tpl, mark, pos)
+        template_instance(tpl, mark, pos, &pcx)
     }
 }
 
-// The type expected of a variant written without arguments (`None`): set
-// by synth_path from the hint of its node.
-pub static var HINT_TY_PATH: i64 = 0;
-
 // The instance of struct template s a literal `n` builds: from its
 // written type arguments, the expected type, or its fields' values.
-pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
+pub fn infer_struct_literal(s: i64, n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let tpl = s + 1;
-        let item = STRUCTS[s].node;
-        let params = NODES[item].g;
+        let item = pcx.structs[s].node;
+        let params = pcx.nodes[item].g;
         let mark = TSCRATCH.count;
-        if NODES[n].g != 0 {
-            push_written_targs(NODES[n].g);
+        if pcx.nodes[n].g != 0 {
+            push_written_targs(pcx.nodes[n].g, &pcx);
             // (the instance first: making it can move TYPES)
-            let t = template_instance(tpl, mark, NODES[n].start);
+            let t = template_instance(tpl, mark, pcx.nodes[n].start, &pcx);
             return TYPES[t].a;
         }
-        if expected != 0 && instance_of(expected, tpl) {
+        if expected != 0 && instance_of(expected, tpl, pcx) {
             return TYPES[expected].a;
         }
-        let bound = alloc_array::<i64>(NODES[params].count);
+        let bound = alloc_array::<i64>(pcx.nodes[params].count);
         for pass in 0..3 {
-            for i in 0..NODES[n].count {
-                let init = child(n, i);
+            for i in 0..pcx.nodes[n].count {
+                let init = child(n, i, pcx);
                 var field = 0;
-                for k in 0..NODES[item].count {
-                    if NODES[child(item, k)].a == NODES[init].a {
-                        field = child(item, k);
+                for k in 0..pcx.nodes[item].count {
+                    if pcx.nodes[child(item, k, pcx)].a == pcx.nodes[init].a {
+                        field = child(item, k, pcx);
                     }
                 }
-                if field == 0 || !mentions_unbound(params, bound, NODES[field].b) {
+                if field == 0 || !mentions_unbound(params, bound, pcx.nodes[field].b, pcx) {
                     continue;
                 }
-                let value = NODES[init].b;
+                let value = pcx.nodes[init].b;
                 // (0.14: a closure, from the field's bound, after the rest)
-                if is_deferred_arg(value) {
+                if is_deferred_arg(value, pcx) {
                     if pass == 2 {
-                        let saved_self = UNIFY_SELF;
-                        let saved_self_ty = UNIFY_SELF_TY;
-                        UNIFY_SELF = 0;
-                        UNIFY_SELF_TY = 0;
-                        infer_closure_arg(params, bound, STRUCTS[s].module, value, NODES[field].b);
-                        UNIFY_SELF = saved_self;
-                        UNIFY_SELF_TY = saved_self_ty;
-                        mark_synthed(value);
+                        let saved_self = pcx.unify_self;
+                        let saved_self_ty = pcx.unify_self_ty;
+                        pcx.unify_self = 0;
+                        pcx.unify_self_ty = 0;
+                        infer_closure_arg(params, bound, pcx.structs[s].module, value,
+                            pcx.nodes[field].b, &pcx);
+                        pcx.unify_self = saved_self;
+                        pcx.unify_self_ty = saved_self_ty;
+                        mark_synthed(value, &pcx);
                     }
                     continue;
                 }
@@ -913,42 +900,44 @@ pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
                 // field's type, as in a struct that is not generic; and a
                 // name, `last: None`, after the fields that bind them)
                 if pass == 0
-                    && (is_untyped_literal_expr(value) || NODES[value].kind == NodeKind::Call
-                        || NODES[value].kind == NodeKind::MethodCall
-                        || NODES[value].kind == NodeKind::Ident
-                        || NODES[value].kind == NodeKind::Path) {
+                    && (is_untyped_literal_expr(value, pcx)
+                        || pcx.nodes[value].kind == NodeKind::Call
+                        || pcx.nodes[value].kind == NodeKind::MethodCall
+                        || pcx.nodes[value].kind == NodeKind::Ident
+                        || pcx.nodes[value].kind == NodeKind::Path) {
                     continue;
                 }
                 // (an untyped literal last: `0..s.len()` is a Range<usize>)
-                if pass == 1 && is_untyped_literal_expr(value) {
+                if pass == 1 && is_untyped_literal_expr(value, pcx) {
                     continue;
                 }
                 // (0.26.3: `Tokens { kinds: Vec::with_capacity_in(n, a), .. }`:
                 // an `_in` call's last argument is its allocator, the struct's
                 // allocator parameter; the field is then checked against
                 // its type)
-                if bind_allocator_arg(params, bound, value)
-                    && !mentions_unbound(params, bound, NODES[field].b) {
+                if bind_allocator_arg(params, bound, value, &pcx)
+                    && !mentions_unbound(params, bound, pcx.nodes[field].b, pcx) {
                     continue;
                 }
-                let t = synth_expr(value);
-                mark_synthed(value);
-                if t != TY_NEVER && !unify(params, bound, STRUCTS[s].module, NODES[field].b, t) {
-                    err_begin(NODES[value].start);
-                    err_str(c"mismatched types: this is '");
-                    err_type(t);
-                    err_str(c"', which does not fit the type parameters inferred so far");
-                    err_end();
+                let t = synth_expr(value, &pcx);
+                mark_synthed(value, &pcx);
+                if t != TY_NEVER
+                    && !unify(params, bound, pcx.structs[s].module, pcx.nodes[field].b, t, &pcx) {
+                    err_begin(pcx.nodes[value].start, &pcx);
+                    err_str(c"mismatched types: this is '", pcx);
+                    err_type(t, pcx);
+                    err_str(c"', which does not fit the type parameters inferred so far", pcx);
+                    err_end(&pcx);
                 }
             }
         }
-        bind_defaults(item, STRUCTS[s].module, bound, 0, NODES[params].count);
-        require_bound(params, bound, NODES[n].start, STRUCTS[s].name, 2, 0, 0);
-        for i in 0..NODES[params].count {
+        bind_defaults(item, pcx.structs[s].module, bound, 0, pcx.nodes[params].count, &pcx);
+        require_bound(params, bound, pcx.nodes[n].start, pcx.structs[s].name, 2, 0, 0, &pcx);
+        for i in 0..pcx.nodes[params].count {
             TSCRATCH.push(bound[i]);
         }
         free(bound as *u8);
-        let t = template_instance(tpl, mark, NODES[n].start);
+        let t = template_instance(tpl, mark, pcx.nodes[n].start, &pcx);
         TYPES[t].a
     }
 }
@@ -957,26 +946,26 @@ pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
 // one parameter still unbound is an allocator parameter, and the call's
 // last argument is an allocator (an `_in` call: `Vec::new_in(a)`), binds
 // it to that argument's type; whether it did.
-fn bind_allocator_arg(params: i64, bound: *i64, value: i64) -> bool {
+fn bind_allocator_arg(params: i64, bound: *i64, value: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: NODES is the checker's raw table of nodes; bound has one
     // entry per parameter.
     // SAFETY: params is a Generics node; value a node of the literal.
     unsafe {
-        let kind = NODES[value].kind;
-        if (kind != NodeKind::Call && kind != NodeKind::MethodCall) || NODES[value].count == 0 {
+        let kind = pcx.nodes[value].kind;
+        if (kind != NodeKind::Call && kind != NodeKind::MethodCall) || pcx.nodes[value].count == 0 {
             return false;
         }
         // (an `_in` call takes its allocator last (alloc.last); another
         // call's last argument only when a name or a field, typed by itself:
         // `f(gpa, Vec::new_in(gpa))`'s is typed by f's parameter, which
         // synthesizing it alone would lose)
-        let last = child(value, NODES[value].count - 1);
-        if !is_in_call(value) && NODES[last].kind != NodeKind::Ident
-            && NODES[last].kind != NodeKind::FieldAccess {
+        let last = child(value, pcx.nodes[value].count - 1, pcx);
+        if !is_in_call(value, pcx) && pcx.nodes[last].kind != NodeKind::Ident
+            && pcx.nodes[last].kind != NodeKind::FieldAccess {
             return false;
         }
         var k = -1;
-        for i in 0..NODES[params].count {
+        for i in 0..pcx.nodes[params].count {
             if bound[i] == 0 {
                 if k >= 0 {
                     return false;
@@ -984,12 +973,13 @@ fn bind_allocator_arg(params: i64, bound: *i64, value: i64) -> bool {
                 k = i;
             }
         }
-        if k < 0 || !crate::front::check::alloc_rules::is_allocator_param(child(params, k)) {
+        if k < 0
+            || !crate::front::check::alloc_rules::is_allocator_param(child(params, k, pcx), &pcx) {
             return false;
         }
-        let t = synth_expr(last);
-        mark_synthed(last);
-        if !crate::front::check::alloc_rules::is_allocator_type(t) {
+        let t = synth_expr(last, &pcx);
+        mark_synthed(last, &pcx);
+        if !crate::front::check::alloc_rules::is_allocator_type(t, &pcx) {
             return false;
         }
         bound[k] = t;
@@ -999,16 +989,16 @@ fn bind_allocator_arg(params: i64, bound: *i64, value: i64) -> bool {
 
 // Whether call node value calls an `_in` function (`Vec::new_in(a)`,
 // `v.clone_in(a)`), which takes its allocator last (alloc.last).
-fn is_in_call(value: i64) -> bool {
+fn is_in_call(value: i64, pcx: Ctx<Comp>) -> bool {
     // UNSAFE: NODES is the checker's raw table of nodes.
     // SAFETY: value is a Call or MethodCall node; its callee a node of it.
     unsafe {
-        var sym = NODES[value].b;
-        if NODES[value].kind == NodeKind::Call {
-            let callee = NODES[value].a;
-            sym = match NODES[callee].kind {
-                NodeKind::Ident => NODES[callee].a,
-                NodeKind::Path => NODES[callee].b,
+        var sym = pcx.nodes[value].b;
+        if pcx.nodes[value].kind == NodeKind::Call {
+            let callee = pcx.nodes[value].a;
+            sym = match pcx.nodes[callee].kind {
+                NodeKind::Ident => pcx.nodes[callee].a,
+                NodeKind::Path => pcx.nodes[callee].b,
                 _ => return false,
             };
         }
@@ -1021,25 +1011,25 @@ fn is_in_call(value: i64) -> bool {
 
 // A deep copy of the tree at n (0 stays 0), with the checker's fields
 // cleared: the body of a function instance.
-pub fn clone_node(n: i64) -> i64 {
+pub fn clone_node(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     if n == 0 {
         return 0;
     }
-    let c = new_node(NODES[n].kind, NODES[n].start, NODES[n].end);
-    NODES[c] = NODES[n];
-    NODES[c].ty = 0;
-    NODES[c].x = 0;
-    NODES[c].y = 0;
+    let c = new_node(pcx.nodes[n].kind, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    pcx.nodes[c] = pcx.nodes[n];
+    pcx.nodes[c].ty = 0;
+    pcx.nodes[c].x = 0;
+    pcx.nodes[c].y = 0;
     // (0.16: a function keeps its effect declarations)
-    if NODES[n].kind != Fn {
-        NODES[c].z = 0;
+    if pcx.nodes[n].kind != Fn {
+        pcx.nodes[c].z = 0;
     }
-    NODES[c].res = Res::None;
-    let kind = NODES[n].kind;
+    pcx.nodes[c].res = Res::None;
+    let kind = pcx.nodes[n].kind;
     match kind {
         Fn => {
-            NODES[c].b = clone_node(NODES[n].b);
-            NODES[c].c = clone_node(NODES[n].c);
+            pcx.nodes[c].b = clone_node(pcx.nodes[n].b, &pcx);
+            pcx.nodes[c].c = clone_node(pcx.nodes[n].c, &pcx);
         }
         Param | Let | Cast | Index | Repeat
             | If | Loop | While | For | Range
@@ -1051,32 +1041,32 @@ pub fn clone_node(n: i64) -> i64 {
             | EnumPanic | Defer | Closure | AssocType
             | NodeKind::Try | NodeKind::InterpHole | NodeKind::NamedArg => {
             if node_field_a(kind) {
-                NODES[c].a = clone_node(NODES[n].a);
+                pcx.nodes[c].a = clone_node(pcx.nodes[n].a, &pcx);
             }
             if node_field_b(kind) {
-                NODES[c].b = clone_node(NODES[n].b);
+                pcx.nodes[c].b = clone_node(pcx.nodes[n].b, &pcx);
             }
             if node_field_c(kind) {
-                NODES[c].c = clone_node(NODES[n].c);
+                pcx.nodes[c].c = clone_node(pcx.nodes[n].c, &pcx);
             }
             // (0.14: a closure parameter's pattern)
             if kind == For || kind == Param {
-                NODES[c].d = clone_node(NODES[n].d);
+                pcx.nodes[c].d = clone_node(pcx.nodes[n].d, &pcx);
             }
         }
         _ => {}
     }
-    NODES[c].g = clone_node(NODES[n].g);
+    pcx.nodes[c].g = clone_node(pcx.nodes[n].g, &pcx);
     if kind != Fn {
-        NODES[c].h = clone_node(NODES[n].h);
+        pcx.nodes[c].h = clone_node(pcx.nodes[n].h, &pcx);
     }
-    if NODES[n].count > 0 {
-        let mark = list_begin();
-        for i in 0..NODES[n].count {
-            let copy = clone_node(child(n, i));
-            list_push(copy);
+    if pcx.nodes[n].count > 0 {
+        let mark = list_begin(pcx);
+        for i in 0..pcx.nodes[n].count {
+            let copy = clone_node(child(n, i, pcx), &pcx);
+            list_push(copy, &pcx);
         }
-        list_end(c, mark);
+        list_end(c, mark, &pcx);
     }
     c
 }
@@ -1117,19 +1107,19 @@ pub fn node_field_c(kind: NodeKind) -> bool {
 
 // Notes after an error in an instance: where each enclosing instance was
 // made.
-pub fn instantiation_notes(out: i64) {
+pub fn instantiation_notes(out: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        var f = CUR_INST;
+        var f = pcx.cur_inst;
         var lines = 0;
         while f >= 0 {
             if lines == 4 {
                 buf_str(out, c"  = note: (and ");
-                buf_int(out, FNS[f].depth);
+                buf_int(out, pcx.fns[f].depth);
                 buf_str(out, c" more instantiations)\n");
                 return;
             }
             buf_str(out, c"  = note: in instantiation of '");
-            let text = SYMS[FNS[f].display].text;
+            let text = SYMS[pcx.fns[f].display].text;
             if text.len > 120 {
                 buf_bytes(out, text[0..100]);
                 buf_str(out, c"...");
@@ -1137,9 +1127,9 @@ pub fn instantiation_notes(out: i64) {
                 buf_bytes(out, text);
             }
             buf_str(out, c"' at ");
-            buf_position(out, NODES[FNS[f].origin].start);
+            buf_position(out, pcx.nodes[pcx.fns[f].origin].start, &pcx);
             buf_byte(out, '\n');
-            f = FNS[f].parent - 1;
+            f = pcx.fns[f].parent - 1;
             lines += 1;
         }
     }

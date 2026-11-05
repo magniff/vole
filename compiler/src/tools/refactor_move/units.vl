@@ -3,12 +3,13 @@
 // --auto`, then renamed).
 
 use crate::base::{
-    FILES, IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    IntVec, SRC, STDOUT, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
     buf_str, buf_write_fd,
 };
 use crate::base::comp::Comp;
-use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, child};
+use crate::front::lexer::Tok;
 use crate::front::modules::{file_of_pos, module_at, module_of};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
@@ -16,9 +17,9 @@ use crate::tools::edit::items::{after_line, blank_line, node_head};
 use crate::tools::plan::deps::cluster;
 use crate::tools::query::QF_DEF;
 use crate::tools::query::defs::{
-    DEFS, K_ENUM, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, mod_fqn_text,
+    K_ENUM, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT, mod_fqn_text,
 };
-use crate::tools::query::diagnostics::{PROG, diag, put_cword, try_begin, try_end};
+use crate::tools::query::diagnostics::{diag, put_cword, try_begin, try_end};
 use crate::tools::query::positions::{line_end, line_start, token_at};
 use crate::tools::refactor_mod::{
     comment_line, emit_regions, is_new, item_binding, make_module, own_file,
@@ -38,120 +39,118 @@ const U_EXTERN: i64 = 3;
 
 pub const U_OTHER: i64 = 4;
 
-pub fn closing(i: i64) -> i64 {
-    unsafe {
-        var depth = 0;
+pub fn closing(i: i64, pcx: Ctx<Comp>) -> i64 {
+    var depth = 0;
+    var j = i;
+    while j < pcx.toks.len() as i64 && pcx.toks[j].kind != Tok::Eof {
+        let k = pcx.toks[j].kind;
+        if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
+            depth += 1;
+        } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
+            depth -= 1;
+            if depth == 0 {
+                return j;
+            }
+        }
+        j += 1;
+    }
+    j - 1
+}
+
+// The units of file f, in order.
+pub fn units_of(f: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    if tcx.units_done.get(f + 1) != 0 {
+        return;
+    }
+    tcx.units_done.put(f + 1, 1);
+    if tcx.def_tok.count == 0 {
+        for d in 0..pcx.defs.len() as i64 {
+            if pcx.defs[d].parent < 0 && pcx.defs[d].kind != K_METHOD
+                && pcx.defs[d].kind != K_IMPL_METHOD {
+                tcx.def_tok.put(token_at(pcx.defs[d].start, pcx) + 1, d + 1);
+            }
+        }
+    }
+    let first_unit = tcx.un_start.count;
+    var i = token_at(pcx.files[f].start, pcx);
+    while i < pcx.toks.len() as i64 && pcx.toks[i].kind != Tok::Eof
+        && pcx.toks[i].start < pcx.files[f].end {
+        let head = i;
+        while pcx.toks[i].kind == Tok::Hash && pcx.toks[i + 1].kind == Tok::LBracket {
+            i = closing(i + 1, pcx) + 1;
+        }
+        if pcx.toks[i].kind == Tok::Pub {
+            i += 1;
+        }
+        let kw = pcx.toks[i].kind;
+        let braced = kw == Tok::Fn || kw == Tok::Struct || kw == Tok::Enum || kw == Tok::Union
+            || kw == Tok::Impl || kw == Tok::Trait || kw == Tok::Extern || kw == Tok::Mod
+            || kw == Tok::Unsafe;
         var j = i;
-        while j < TOK_COUNT && TOKS[j].kind != Tok::Eof {
-            let k = TOKS[j].kind;
+        var depth = 0;
+        loop {
+            let k = pcx.toks[j].kind;
+            if k == Tok::Eof || pcx.toks[j].start >= pcx.files[f].end {
+                j -= 1;
+                break;
+            }
             if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
                 depth += 1;
             } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
                 depth -= 1;
-                if depth == 0 {
-                    return j;
+                if depth == 0 && k == Tok::RBrace && braced {
+                    break;
                 }
+            } else if k == Tok::Semi && depth == 0 {
+                break;
             }
             j += 1;
         }
-        j - 1
+        let u = tcx.un_start.count;
+        tcx.un_start.push(unit_text_start(f, pcx.toks[head].start, pcx));
+        tcx.un_end.push(after_line(pcx.toks[j].end - 1, pcx));
+        tcx.un_first.push(head);
+        tcx.un_last.push(j);
+        tcx.un_file.push(f);
+        tcx.un_banner.push(-1);
+        tcx.un_dest.push(-1);
+        tcx.un_trait.push(-1);
+        let m = module_at(pcx.toks[i].start, &pcx);
+        if kw == Tok::Impl {
+            tcx.un_kind.push(U_IMPL);
+            impl_names(i, m, &tcx, pcx);
+        }
+        else if kw == Tok::Extern && pcx.toks[i + 1].kind == Tok::Str
+            && pcx.toks[i + 2].kind == Tok::LBrace {
+            tcx.un_kind.push(U_EXTERN);
+            tcx.un_def.push(-1);
+        } else if kw == Tok::Use || kw == Tok::Import || kw == Tok::Mod {
+            tcx.un_kind.push(U_OTHER);
+            tcx.un_def.push(-1);
+        } else {
+            var d = -1;
+            var t = i;
+            while t <= j && t <= i + 3 && d < 0 {
+                d = tcx.def_tok.get(t + 1) - 1;
+                t += 1;
+            }
+            tcx.un_kind.push(if d >= 0 { U_ITEM } else { U_OTHER });
+            tcx.un_def.push(d);
+            if d >= 0 {
+                tcx.unit_of.put(d + 1, u + 1);
+            }
+        }
+        i = j + 1;
     }
-}
-
-// The units of file f, in order.
-pub fn units_of(f: i64, tcx: inout Tcx<Comp>) {
-    unsafe {
-        if tcx.units_done.get(f + 1) != 0 {
-            return;
-        }
-        tcx.units_done.put(f + 1, 1);
-        if tcx.def_tok.count == 0 {
-            for d in 0..DEFS.len() as i64 {
-                if DEFS[d].parent < 0 && DEFS[d].kind != K_METHOD && DEFS[d].kind != K_IMPL_METHOD {
-                    tcx.def_tok.put(token_at(DEFS[d].start) + 1, d + 1);
-                }
-            }
-        }
-        let first_unit = tcx.un_start.count;
-        var i = token_at(FILES[f].start);
-        while i < TOK_COUNT && TOKS[i].kind != Tok::Eof && TOKS[i].start < FILES[f].end {
-            let head = i;
-            while TOKS[i].kind == Tok::Hash && TOKS[i + 1].kind == Tok::LBracket {
-                i = closing(i + 1) + 1;
-            }
-            if TOKS[i].kind == Tok::Pub {
-                i += 1;
-            }
-            let kw = TOKS[i].kind;
-            let braced = kw == Tok::Fn || kw == Tok::Struct || kw == Tok::Enum || kw == Tok::Union
-                || kw == Tok::Impl || kw == Tok::Trait || kw == Tok::Extern || kw == Tok::Mod
-                || kw == Tok::Unsafe;
-            var j = i;
-            var depth = 0;
-            loop {
-                let k = TOKS[j].kind;
-                if k == Tok::Eof || TOKS[j].start >= FILES[f].end {
-                    j -= 1;
-                    break;
-                }
-                if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
-                    depth += 1;
-                } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
-                    depth -= 1;
-                    if depth == 0 && k == Tok::RBrace && braced {
-                        break;
-                    }
-                } else if k == Tok::Semi && depth == 0 {
-                    break;
-                }
-                j += 1;
-            }
-            let u = tcx.un_start.count;
-            tcx.un_start.push(unit_text_start(f, TOKS[head].start));
-            tcx.un_end.push(after_line(TOKS[j].end - 1));
-            tcx.un_first.push(head);
-            tcx.un_last.push(j);
-            tcx.un_file.push(f);
-            tcx.un_banner.push(-1);
-            tcx.un_dest.push(-1);
-            tcx.un_trait.push(-1);
-            let m = module_at(TOKS[i].start);
-            if kw == Tok::Impl {
-                tcx.un_kind.push(U_IMPL);
-                impl_names(i, m, &tcx);
-            }
-            else if kw == Tok::Extern && TOKS[i + 1].kind == Tok::Str
-                && TOKS[i + 2].kind == Tok::LBrace {
-                tcx.un_kind.push(U_EXTERN);
-                tcx.un_def.push(-1);
-            } else if kw == Tok::Use || kw == Tok::Import || kw == Tok::Mod {
-                tcx.un_kind.push(U_OTHER);
-                tcx.un_def.push(-1);
-            } else {
-                var d = -1;
-                var t = i;
-                while t <= j && t <= i + 3 && d < 0 {
-                    d = tcx.def_tok.get(t + 1) - 1;
-                    t += 1;
-                }
-                tcx.un_kind.push(if d >= 0 { U_ITEM } else { U_OTHER });
-                tcx.un_def.push(d);
-                if d >= 0 {
-                    tcx.unit_of.put(d + 1, u + 1);
-                }
-            }
-            i = j + 1;
-        }
-        banners(f, first_unit, &tcx);
-    }
+    banners(f, first_unit, &tcx, pcx);
 }
 
 // The start of the text of an item whose first token is at pos: its line,
 // and the comment and attribute lines directly above.
-fn unit_text_start(f: i64, pos: i64) -> i64 {
-    var first = line_start(pos);
-    while first > FILES[f].start {
-        let prev = line_start(first - 1);
+fn unit_text_start(f: i64, pos: i64, pcx: Ctx<Comp>) -> i64 {
+    var first = line_start(pos, pcx);
+    while first > pcx.files[f].start {
+        let prev = line_start(first - 1, pcx);
         var a = prev;
         while a < first - 1 && (SRC[a] == ' ' || SRC[a] == '\t') {
             a += 1;
@@ -168,13 +167,13 @@ fn unit_text_start(f: i64, pos: i64) -> i64 {
 
 // The type and the trait of the impl block at token i (`impl`), when they
 // are items of module m: UN_DEF and UN_TRAIT.
-fn impl_names(i: i64, m: i64, tcx: inout Tcx<Comp>) {
+fn impl_names(i: i64, m: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         var t = i + 1;
-        if TOKS[t].kind == Tok::Lt {
+        if pcx.toks[t].kind == Tok::Lt {
             var depth = 0;
             loop {
-                let k = TOKS[t].kind;
+                let k = pcx.toks[t].kind;
                 if k == Tok::Lt {
                     depth += 1;
                 } else if k == Tok::Gt {
@@ -191,8 +190,8 @@ fn impl_names(i: i64, m: i64, tcx: inout Tcx<Comp>) {
         var angle = 0;
         var last = -1;
         var tr = -1;
-        while TOKS[t].kind != Tok::LBrace && TOKS[t].kind != Tok::Eof {
-            let k = TOKS[t].kind;
+        while pcx.toks[t].kind != Tok::LBrace && pcx.toks[t].kind != Tok::Eof {
+            let k = pcx.toks[t].kind;
             if k == Tok::Lt {
                 angle += 1;
             } else if k == Tok::Gt {
@@ -209,15 +208,15 @@ fn impl_names(i: i64, m: i64, tcx: inout Tcx<Comp>) {
         }
         var ty = -1;
         if last >= 0 {
-            let d = item_binding(m, TOKS[last].value as i64, tcx);
-            if d >= 0 && (DEFS[d].kind == K_STRUCT || DEFS[d].kind == K_ENUM) {
+            let d = item_binding(m, pcx.toks[last].value as i64, tcx);
+            if d >= 0 && (pcx.defs[d].kind == K_STRUCT || pcx.defs[d].kind == K_ENUM) {
                 ty = d;
             }
         }
         tcx.un_def.push(ty);
         if tr >= 0 {
-            let d = item_binding(m, TOKS[tr].value as i64, tcx);
-            if d >= 0 && DEFS[d].kind == K_TRAIT {
+            let d = item_binding(m, pcx.toks[tr].value as i64, tcx);
+            if d >= 0 && pcx.defs[d].kind == K_TRAIT {
                 tcx.un_trait.data[tcx.un_trait.count - 1] = d;
             }
         }
@@ -228,28 +227,28 @@ fn impl_names(i: i64, m: i64, tcx: inout Tcx<Comp>) {
 // comment lines, a blank line after it and one before it (or code), with
 // code somewhere before it in the file (the comment at the top of a file
 // is the file's).
-fn banners(f: i64, first: i64, tcx: inout Tcx<Comp>) {
+fn banners(f: i64, first: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
-        let code_start = if first < tcx.un_start.count { TOKS[tcx.un_first.data[first]].start }
-            else { FILES[f].end };
+        let code_start = if first < tcx.un_start.count { pcx.toks[tcx.un_first.data[first]].start }
+            else { pcx.files[f].end };
         for u in first..tcx.un_start.count {
             let a = tcx.un_start.data[u];
-            if a <= FILES[f].start {
+            if a <= pcx.files[f].start {
                 continue;
             }
-            var q = line_start(a - 1);
-            if !blank_line(q) {
+            var q = line_start(a - 1, pcx);
+            if !blank_line(q, pcx) {
                 continue;
             }
-            while q > FILES[f].start && blank_line(q) {
-                q = line_start(q - 1);
+            while q > pcx.files[f].start && blank_line(q, pcx) {
+                q = line_start(q - 1, pcx);
             }
             if !comment_line(q) {
                 continue;
             }
             var cs = q;
-            while cs > FILES[f].start && comment_line(line_start(cs - 1)) {
-                cs = line_start(cs - 1);
+            while cs > pcx.files[f].start && comment_line(line_start(cs - 1, pcx)) {
+                cs = line_start(cs - 1, pcx);
             }
             if cs < code_start || (u > first && cs < tcx.un_end.data[u - 1]) {
                 continue;
@@ -274,7 +273,7 @@ pub fn unit_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
 // The banner above the unit at pos (0.12: a part's header): the start of
 // the banner of the group holding it, -1 for none; *end, the end of its
 // comment lines.
-pub fn banner_above(pos: i64, end: inout i64, tcx: Tcx<Comp>) -> i64 {
+pub fn banner_above(pos: i64, end: inout i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var u = unit_at(pos, tcx);
         if u < 0 {
@@ -285,8 +284,8 @@ pub fn banner_above(pos: i64, end: inout i64, tcx: Tcx<Comp>) -> i64 {
             let b = tcx.un_banner.data[u];
             if b >= 0 {
                 var e = b;
-                while e < FILES[f].end && comment_line(e) {
-                    e = after_line(e);
+                while e < pcx.files[f].end && comment_line(e) {
+                    e = after_line(e, pcx);
                 }
                 end = e;
                 return b;
@@ -300,23 +299,23 @@ pub fn banner_above(pos: i64, end: inout i64, tcx: Tcx<Comp>) -> i64 {
 // The blocks of the moves: each item's unit (or its line in an extern
 // block), the impl blocks that go with it, the banners. False after a
 // diagnostic.
-pub fn make_blocks(tcx: inout Tcx<Comp>) -> bool {
+pub fn make_blocks(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var seen = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for i in 0..tcx.mv_def.count {
             let d = tcx.mv_def.data[i];
-            let f = file_of_pos(DEFS[d].start);
-            units_of(f, &tcx);
+            let f = file_of_pos(pcx.defs[d].start, pcx);
+            units_of(f, &tcx, &pcx);
             let u = tcx.unit_of.get(d + 1) - 1;
             if u >= 0 {
                 tcx.un_dest.data[u] = tcx.mv_dest.data[i];
                 continue;
             }
             // A function of an extern block.
-            let x = unit_at(DEFS[d].start, tcx);
+            let x = unit_at(pcx.defs[d].start, tcx);
             if x < 0 || tcx.un_kind.data[x] != U_EXTERN {
                 let e = diag(c"error", c"refactor.not-movable", &tcx);
-                buf_bytes(e, SYMS[DEFS[d].fqn].text);
+                buf_bytes(e, SYMS[pcx.defs[d].fqn].text);
                 buf_str(e, c" is not an item of its file that the refactorings know how to move\n");
                 return false;
             }
@@ -330,9 +329,10 @@ pub fn make_blocks(tcx: inout Tcx<Comp>) -> bool {
             }
             var dest = -2;
             var all = true;
-            for d in 0..DEFS.len() as i64 {
-                if DEFS[d].parent >= 0 || DEFS[d].start < TOKS[tcx.un_first.data[x]].start
-                    || DEFS[d].start > TOKS[tcx.un_last.data[x]].start {
+            for d in 0..pcx.defs.len() as i64 {
+                if pcx.defs[d].parent >= 0
+                    || pcx.defs[d].start < pcx.toks[tcx.un_first.data[x]].start
+                    || pcx.defs[d].start > pcx.toks[tcx.un_last.data[x]].start {
                     continue;
                 }
                 let g = seen.get(d + 1) - 1;
@@ -351,14 +351,14 @@ pub fn make_blocks(tcx: inout Tcx<Comp>) -> bool {
                 tcx.un_dest.data[x] = dest;
                 continue;
             }
-            for d in 0..DEFS.len() as i64 {
+            for d in 0..pcx.defs.len() as i64 {
                 let g = seen.get(d + 1) - 1;
-                if g >= 0 && DEFS[d].start >= TOKS[tcx.un_first.data[x]].start
-                    && DEFS[d].start <= TOKS[tcx.un_last.data[x]].start {
+                if g >= 0 && pcx.defs[d].start >= pcx.toks[tcx.un_first.data[x]].start
+                    && pcx.defs[d].start <= pcx.toks[tcx.un_last.data[x]].start {
                     let f = tcx.un_file.data[x];
-                    let tail = TOKS[token_at(DEFS[d].end - 1)].end;
-                    add_block(unit_text_start(f, node_head(DEFS[d].start)), after_line(tail - 1), g,
-                        x, -1, &tcx);
+                    let tail = pcx.toks[token_at(pcx.defs[d].end - 1, pcx)].end;
+                    add_block(unit_text_start(f, node_head(pcx.defs[d].start, pcx), pcx),
+                        after_line(tail - 1, pcx), g, x, -1, &tcx);
                 }
             }
         }
@@ -424,16 +424,16 @@ pub fn make_blocks(tcx: inout Tcx<Comp>) -> bool {
                 }
             }
             let to = dests.data[best];
-            if to < 0 || (dests.count > 1 && !is_new(to)) || !place_ends_group(tcx) {
+            if to < 0 || (dests.count > 1 && !is_new(to, pcx)) || !place_ends_group(tcx, pcx) {
                 continue;
             }
             var e = tcx.un_banner.data[u];
             while comment_line(e) {
-                e = after_line(e);
+                e = after_line(e, pcx);
             }
             if tcx.un_dest.data[u] == to {
                 with_unit.put(u + 1, e + 1);
-            } else if is_new(to) && 2 * units.data[best] > v - u {
+            } else if is_new(to, pcx) && 2 * units.data[best] > v - u {
                 add_block(tcx.un_banner.data[u], e, to, -2, e, &tcx);
             }
         }
@@ -472,41 +472,41 @@ fn group_dest(x: i64, tcx: Tcx<Comp>) -> i64 {
 
 // Where imports go in module m's file: after its last `use` that stays
 // (true), or before its first unit that stays.
-pub fn import_anchor(m: i64, after: inout bool, tcx: inout Tcx<Comp>) -> i64 {
+pub fn import_anchor(m: i64, after: inout bool, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let f = own_file(m);
+        let f = own_file(m, pcx);
         var last = -1;
-        for u in 1..NODES.len() as i64 {
-            if NODES[u].kind != NodeKind::Use || module_of(u) != m
-                || file_of_pos(NODES[u].start) != f {
+        for u in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[u].kind != NodeKind::Use || module_of(u, &pcx) != m
+                || file_of_pos(pcx.nodes[u].start, pcx) != f {
                 continue;
             }
             var gone = 0;
-            for k in 0..NODES[u].count {
-                if tcx.imports_dropped.get(child(u, k)) != 0 {
+            for k in 0..pcx.nodes[u].count {
+                if tcx.imports_dropped.get(child(u, k, pcx)) != 0 {
                     gone += 1;
                 }
             }
-            if NODES[u].count > 0 && gone == NODES[u].count {
+            if pcx.nodes[u].count > 0 && gone == pcx.nodes[u].count {
                 continue;
             }
-            if last < 0 || NODES[u].start > NODES[last].start {
+            if last < 0 || pcx.nodes[u].start > pcx.nodes[last].start {
                 last = u;
             }
         }
         if last >= 0 {
             after = true;
-            return line_end(NODES[last].end - 1);
+            return line_end(pcx.nodes[last].end - 1, pcx);
         }
         after = false;
-        units_of(f, &tcx);
+        units_of(f, &tcx, &pcx);
         for u in 0..tcx.un_start.count {
             if tcx.un_file.data[u] == f && !in_block(tcx.un_start.data[u], tcx) {
                 return if tcx.un_banner.data[u] >= 0 { tcx.un_banner.data[u] }
                     else { tcx.un_start.data[u] };
             }
         }
-        FILES[f].end
+        pcx.files[f].end
     }
 }
 
@@ -523,13 +523,13 @@ pub fn lines_of(a: i64, b: i64) -> i64 {
 
 // The split of module m (file f) into parts: printed as commands
 // (--plan), or made (--auto).
-pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
+pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let total = lines_of(FILES[f].start, FILES[f].end);
+        let total = lines_of(pcx.files[f].start, pcx.files[f].end);
         let max = tcx.opt_max_lines;
         if total <= max {
             let e = diag(c"note", c"refactor.fits", &tcx);
-            buf_bytes(e, mod_fqn_text(m, &tcx));
+            buf_bytes(e, mod_fqn_text(m, &tcx, pcx));
             buf_str(e, c" has ");
             buf_int(e, total);
             buf_str(e, c" lines (at most ");
@@ -544,7 +544,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         for u in 0..tcx.un_start.count {
             owner[u] = -1;
             if tcx.un_file.data[u] == f && tcx.un_kind.data[u] == U_ITEM
-                && DEFS[tcx.un_def.data[u]].kind != K_MOD {
+                && pcx.defs[tcx.un_def.data[u]].kind != K_MOD {
                 owner[u] = items.count;
                 items.push(u);
             }
@@ -579,14 +579,14 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
             if (tcx.r_flags.data[r] & QF_DEF) != 0 {
                 continue;
             }
-            let tu = unit_at(DEFS[tcx.r_def.data[r]].start, tcx);
+            let tu = unit_at(pcx.defs[tcx.r_def.data[r]].start, tcx);
             if tu < 0 || owner[tu] < 0 {
                 continue;
             }
             let t = owner[tu];
             let p = tcx.r_pos.data[r];
-            if file_of_pos(p) != f {
-                if module_at(p) != m {
+            if file_of_pos(p, pcx) != f {
+                if module_at(p, &pcx) != m {
                     outside[t] += 1;
                 }
                 continue;
@@ -635,7 +635,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
         var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var whys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var given = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if tcx.cli_opt_names != 0 as *u8 && !names_given(m, &given, parts.count - 1, &tcx) {
+        if tcx.cli_opt_names != 0 as *u8 && !names_given(m, &given, parts.count - 1, &tcx, pcx) {
             return 2;
         }
         // (the parts --names does not name: the best named first)
@@ -651,7 +651,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                 buf_str(whys.data[k], c"--names");
                 j += 1;
             } else if g != stay {
-                score[k] = part_score(m, g, group, items, lines, n, &tcx);
+                score[k] = part_score(m, g, group, items, lines, n, &tcx, &pcx);
             }
         }
         loop {
@@ -666,12 +666,12 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
             }
             score[next] = -1;
             names.data[next] = part_name(m, parts.data[next], group, items, lines, n, names, next,
-                whys.data[next], &tcx);
+                whys.data[next], &tcx, &pcx);
         }
         if tcx.opt_plan {
             let out = buf_new();
             buf_str(out, c"# ");
-            buf_bytes(out, mod_fqn_text(m, &tcx));
+            buf_bytes(out, mod_fqn_text(m, &tcx, pcx));
             buf_byte(out, '\t');
             buf_int(out, total);
             buf_str(out, c" lines\t");
@@ -683,7 +683,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                 let g = parts.data[k];
                 if g == stay {
                     buf_str(out, c" # stays in ");
-                    buf_bytes(out, mod_fqn_text(m, &tcx));
+                    buf_bytes(out, mod_fqn_text(m, &tcx, pcx));
                     buf_str(out, c": the part most used from other modules\n");
                     continue;
                 }
@@ -692,11 +692,11 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                 buf_str(out, c": ");
                 buf_bytes(out, buf_slice(whys.data[k]));
                 buf_byte(out, '\n');
-                put_cword(out, PROG);
+                put_cword(out, pcx.prog);
                 buf_str(out, c" refactor split ");
-                buf_bytes(out, mod_fqn_text(m, &tcx));
+                buf_bytes(out, mod_fqn_text(m, &tcx, pcx));
                 buf_str(out, c" --into ");
-                buf_bytes(out, mod_fqn_text(m, &tcx));
+                buf_bytes(out, mod_fqn_text(m, &tcx, pcx));
                 buf_str(out, c"::");
                 buf_bytes(out, SYMS[names.data[k]].text);
                 buf_str(out, c" --items ");
@@ -709,7 +709,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                         buf_byte(out, ',');
                     }
                     first = false;
-                    buf_bytes(out, SYMS[DEFS[tcx.un_def.data[items.data[i]]].name].text);
+                    buf_bytes(out, SYMS[pcx.defs[tcx.un_def.data[items.data[i]]].name].text);
                 }
                 if tcx.root_given != 0 as *u8 {
                     crate::tools::query::diagnostics::put_root(out, tcx);
@@ -720,7 +720,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
             buf_write_fd(trim_lines(out), STDOUT);
             let e = diag(c"note", c"refactor.plan", &tcx);
             buf_str(e, c"the same in one edit: --auto (other names: --names a,b)\n");
-            let t = try_begin(c"split", mod_fqn_text(m, &tcx), true, &tcx);
+            let t = try_begin(c"split", mod_fqn_text(m, &tcx, pcx), true, &tcx, pcx);
             buf_str(t, c" --auto --max-lines ");
             buf_int(t, max);
             try_end(t);
@@ -734,7 +734,7 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
             if g == stay {
                 continue;
             }
-            let r = make_module(m, names.data[k], false, &converts, &tcx);
+            let r = make_module(m, names.data[k], false, &converts, &tcx, pcx);
             if r < 0 {
                 return 1;
             }
@@ -746,17 +746,17 @@ pub fn split_plan(m: i64, f: i64, root: *u8, tcx: inout Tcx<Comp>) -> i64 {
                 }
             }
         }
-        if !move_edits(&tcx) {
+        if !move_edits(&tcx, &pcx) {
             return 1;
         }
-        emit_regions(&tcx);
+        emit_regions(&tcx, &pcx);
         let what = buf_new();
         buf_str(what, c"split ");
-        buf_bytes(what, mod_fqn_text(m, &tcx));
+        buf_bytes(what, mod_fqn_text(m, &tcx, pcx));
         buf_str(what, c" into ");
         buf_int(what, made);
         buf_str(what, if made == 1 { c" module" } else { c" modules" });
-        finish(what, root, &tcx)
+        finish(what, root, &tcx, &pcx)
     }
 }
 

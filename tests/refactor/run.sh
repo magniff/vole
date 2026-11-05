@@ -343,7 +343,8 @@ $(cat "$WORK/embedren/main.vl")"
         compiler/src
     grep -rhoE '"wgsl\.[a-z]+"|error wgsl\.[a-z]+' compiler/std/gpu/wgsl | sed -e 's/^"\(.*\)"$/c"\1"/' -e 's/^error \(.*\)$/c"\1"/'
     grep -rhoE 'gpu\.[a-z]+:' compiler/std/gpu | sed -e 's/^\(.*\):$/c"\1"/'
-    grep -rhoE --exclude-dir=.volec 'ERR_KIND = c"[^"]*"' compiler/src
+    # (0.26.5: the static ERR_KIND is the context's field `pcx.err_kind`)
+    grep -rhoE --exclude-dir=.volec '(ERR_KIND|err_kind) = c"[^"]*"' compiler/src
     grep -rhoE --exclude-dir=.volec 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src
     # (0.15: guide's codes, written into its own messages)
     grep -rhoE --exclude-dir=.volec '"(error|note) guide\.[a-z-]+' compiler/src | sed -e 's/^"[a-z]* \(.*\)$/c"\1"/'

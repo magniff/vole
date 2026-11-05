@@ -23,25 +23,25 @@ use crate::arch::features::own_features;
 use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
 use crate::base::{STDERR, buf_int, buf_new, buf_str, buf_write_fd};
 use crate::base::comp::Comp;
-use crate::front::ast::{NODES, NodeKind, child};
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, child};
 use crate::front::consteval::{const_value, f64_of_bits, float_const, wrap_int};
 use crate::front::contracts::sites::site_of;
 use crate::front::distinct::{enum_niche, erase_type};
 use crate::front::features::fn_needs;
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    ENUMS, FNS, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, VARIANTS, field_offset, fn_param,
-    int_bits, is_compound, is_integer, is_signed, is_slice, is_vector, is_void, tuple_offset,
-    type_size, variant_field_offset,
+    ENUMS, TYPES, TY_BOOL, TY_I64, TY_NEVER, TY_U64, TyKind, field_offset, fn_param, int_bits,
+    is_compound, is_integer, is_signed, is_slice, is_vector, is_void, tuple_offset, type_size,
+    variant_field_offset,
 };
 use crate::gen0::gen::expr::panic_kind;
 use crate::gen0::target::arith_panic_kind;
 use crate::middle::ctx::FnCtx;
 use crate::middle::entryfacts::lower_entry_facts;
 use crate::middle::ir::{
-    CUR, Cond, IRFUNCS, IR_CALL_LOCS, IR_EXPR_LOC, IR_LOC, IR_LOCS, Op, Term, emit_ir, ir_binary,
-    ir_cmp, ir_const, ir_enter, ir_load, ir_new_block, ir_new_func, ir_offset, ir_shrink,
-    ir_slot_addr, ir_store, ir_type,
+    Cond, IRFUNCS, Op, Term, emit_ir, ir_binary, ir_cmp, ir_const, ir_enter, ir_load, ir_new_block,
+    ir_new_func, ir_offset, ir_shrink, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::{ir_switch, ir_terminate};
 use crate::middle::lower::{
@@ -52,15 +52,12 @@ use crate::middle::lower::calls::{
     push_call_arg, static_address,
 };
 use crate::middle::lower::expr::{
-    BOUND_NODES, BOUND_VALUES, lower_cast, lower_operator, lower_unop, need_value, slice_of_values,
-    store_value, string_value,
+    lower_cast, lower_operator, lower_unop, need_value, slice_of_values, store_value, string_value,
 };
 use crate::middle::lower::ssa::{ir_seal, new_synth_var, ssa_read, ssa_write};
 use crate::middle::lower::vector::{
     lower_vecop, lower_vector_binary, lower_vector_negate, vector_assign_store, vector_assign_value,
 };
-use crate::middle::opt::OPT_LEVEL;
-use crate::middle::unsafecheck::CHECK_UNSAFE;
 use crate::places::cfg::compute_rpo;
 use crate::places::ir::{
     AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GT,
@@ -76,41 +73,18 @@ use crate::places::ir::{
 use crate::places::keep::{free_body, load_body};
 use crate::places::shim::drop_shim_fn;
 
-// The functions lowered here, and the ones left to the AST walk, by
-// reason: no kept body; a drop that runs (until step 4b); a statement
-// kind not lowered here (by kind, KIND_COUNTS); --check-unsafe (its
-// checks name the AST's raw accesses).
-pub static var PL_LOWERED: i64 = 0;
-pub static var PL_NO_BODY: i64 = 0;
-pub static var PL_DROP: i64 = 0;
-pub static var PL_KIND: i64 = 0;
-static var KIND_COUNTS: Vec<i64, Comp> = Vec::new_in(Comp {});
-
-// Per local of the body held: its type (erased), its SSA variable (-1:
-// none) and the address of its storage (0: none, or a static's, made at
-// each use).
-static var L_TY: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var L_VAR: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var L_ADDR: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Per local: 1 when its storage is borrowed (an RV_REF of it, a slice of
-// it): its slot is not given to a call to build its result in.
-static var L_BORROWED: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Per block: its block in the IR (0: unreachable), and its predecessors
-// not lowered yet.
-static var B_MID: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var B_LEFT: Vec<i64, Comp> = Vec::new_in(Comp {});
-
 // ---- Which functions ----
 
 // Function f (its Fn node: item) lowered from its kept body: false when
 // it has none, or one with something this file does not lower (the AST
 // walk lowers it then).
-pub fn lower_places_function(cx: inout FnCtx, item: i64, f: i64, pbody: inout Body<Comp>) -> bool {
-    if !take_body(f, false, &pbody) {
+pub fn lower_places_function(cx: inout FnCtx, item: i64, f: i64, pbody: inout Body<Comp>,
+    pcx: inout Ctx<Comp>) -> bool {
+    if !take_body(f, false, &pbody, &pcx) {
         return false;
     }
-    lower_body(&cx, item, f, pbody);
-    free_body(f);
+    lower_body(&cx, item, f, pbody, &pcx);
+    free_body(f, &pcx);
     true
 }
 
@@ -121,48 +95,48 @@ pub fn lower_places_function(cx: inout FnCtx, item: i64, f: i64, pbody: inout Bo
 // caller frees a body held (free_body). `types_only`: the scan makes the
 // locals' and places' types only, not what the SSA lowering needs (where
 // each local is used, which are borrowed): gen0's.
-pub fn take_body(f: i64, types_only: bool, pbody: inout Body<Comp>) -> bool {
-    if !load_body(f, &pbody) {
-        PL_NO_BODY += 1;
+pub fn take_body(f: i64, types_only: bool, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    if !load_body(f, &pbody, &pcx) {
+        pcx.pl_no_body += 1;
         return false;
     }
     compute_rpo(&pbody);
-    let reason = scan_body(types_only, pbody);
+    let reason = scan_body(types_only, pbody, &pcx);
     if reason != 0 {
         if reason < 0 {
-            PL_DROP += 1;
+            pcx.pl_drop += 1;
         } else {
-            PL_KIND += 1;
-            while KIND_COUNTS.len() as i64 <= reason {
-                KIND_COUNTS.push(0);
+            pcx.pl_kind += 1;
+            while pcx.kind_counts.len() as i64 <= reason {
+                pcx.kind_counts.push(0);
             }
-            KIND_COUNTS[reason] += 1;
+            pcx.kind_counts[reason] += 1;
         }
-        free_body(f);
+        free_body(f, &pcx);
         return false;
     }
-    PL_LOWERED += 1;
+    pcx.pl_lowered += 1;
     true
 }
 
 // `places lowering: N functions; AST: no body N, drop N, kind K N...` on
 // stderr (--time-passes).
-pub fn lower_stats() {
+pub fn lower_stats(pcx: Ctx<Comp>) {
     let out = buf_new();
     buf_str(out, c"places lowering: ");
-    buf_int(out, PL_LOWERED);
+    buf_int(out, pcx.pl_lowered);
     buf_str(out, c" functions from the IR; from the AST: no body ");
-    buf_int(out, PL_NO_BODY);
+    buf_int(out, pcx.pl_no_body);
     buf_str(out, c", drop ");
-    buf_int(out, PL_DROP);
+    buf_int(out, pcx.pl_drop);
     buf_str(out, c", kind ");
-    buf_int(out, PL_KIND);
-    for k in 0..KIND_COUNTS.len() as i64 {
-        if KIND_COUNTS[k] > 0 {
+    buf_int(out, pcx.pl_kind);
+    for k in 0..pcx.kind_counts.len() as i64 {
+        if pcx.kind_counts[k] > 0 {
             buf_str(out, c" (");
             buf_int(out, k);
             buf_str(out, c": ");
-            buf_int(out, KIND_COUNTS[k]);
+            buf_int(out, pcx.kind_counts[k]);
             buf_str(out, c")");
         }
     }
@@ -173,60 +147,60 @@ pub fn lower_stats() {
 // ---- Types ----
 
 // The type of local l (erased: the code generators see no distinct type).
-pub fn local_type(l: i64) -> i64 {
-    L_TY[l]
+pub fn local_type(l: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.l_ty[l]
 }
 
 // The type of place (l, p): l's through each projection (a PJ_FIELD after
 // a PJ_VARIANT is the variant's field), erased.
-pub fn place_ty(l: i64, p: i64, pbody: Body<Comp>) -> i64 {
+pub fn place_ty(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     if p == 0 {
-        return L_TY[l];
+        return pcx.l_ty[l];
     }
-    if PJ_ROOT[p] == l {
-        return PJ_TY[p];
+    if pcx.pj_root[p] == l {
+        return pcx.pj_ty[p];
     }
     let parent = proj_parent(p, pbody);
     let k = proj_kind(p, pbody);
     let v = proj_val(p, pbody);
     var t = 0;
     if k == PJ_FIELD && parent > 0 && proj_kind(parent, pbody) == PJ_VARIANT {
-        t = erase_type(crate::front::types::variant_field(proj_val(parent, pbody), v));
+        t = erase_type(crate::front::types::variant_field(proj_val(parent, pbody), v, pcx), &pcx);
     } else {
-        t = place_ty(l, parent, pbody);
+        t = place_ty(l, parent, pbody, &pcx);
         if k != PJ_VARIANT {
-            t = erase_type(crate::places::ir::step_type(t, k, v));
+            t = erase_type(crate::places::ir::step_type(t, k, v, pcx), &pcx);
         }
     }
-    PJ_ROOT[p] = l;
-    PJ_TY[p] = t;
+    pcx.pj_root[p] = l;
+    pcx.pj_ty[p] = t;
     t
 }
 
 // The type of operand i at `ops`.
-pub fn op_type(ops: i64, i: i64, pbody: Body<Comp>) -> i64 {
+pub fn op_type(ops: i64, i: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let k = op_kind(ops, i, pbody);
     if k == OK_COPY || k == OK_MOVE || k == OK_PLACE {
-        return place_ty(op_a(ops, i, pbody), op_b(ops, i, pbody), pbody);
+        return place_ty(op_a(ops, i, pbody), op_b(ops, i, pbody), pbody, &pcx);
     }
     if k == OK_UNIT {
         return crate::places::ir::unit_ty();
     }
-    erase_type(op_b(ops, i, pbody))
+    erase_type(op_b(ops, i, pbody), &pcx)
 }
 
 // ---- The body ----
 
-fn lower_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>) {
+fn lower_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     // UNSAFE: cx is the lowering's raw context pointer, NODES, IRFUNCS and the
     // lowering's tables are static mut (lower/mod.vl's lower_function does the same).
     // SAFETY: cx points at lower_program's live FnCtx for the whole call; item is
     // the function's node and f its FNS index, both below their tables' counts;
     // lowering is single-threaded.
     unsafe {
-        IR_LOC = if IR_LOCS { NODES[item].start + 1 } else { 0 };
-        IR_EXPR_LOC = 0;
-        ir_enter(&cx, ir_new_func(&cx, f, item));
+        pcx.ir_loc = if pcx.ir_locs { pcx.nodes[item].start + 1 } else { 0 };
+        pcx.ir_expr_loc = 0;
+        ir_enter(&cx, ir_new_func(&cx, f, item, &pcx), pcx);
         // (an empty map is zero already)
         if cx.defs.count > 0 {
             cx.defs.clear();
@@ -234,40 +208,40 @@ fn lower_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>) {
         let entry = ir_new_block(&cx);
         IRFUNCS[cx.irf].entry = entry;
         cx.blocks[entry].sealed = 1;
-        CUR = entry;
+        pcx.ir_cur = entry;
         let synth_mark = cx.synth_ty.count;
-        let ret = FNS[f].ret;
-        let c = fn_uses_c(f);
-        if conv_returns_through_pointer(&cx, c, ret) {
-            IRFUNCS[cx.irf].result_ptr = emit_ir(&cx, Op::Param, TY_U64, 0, 0, -1);
+        let ret = pcx.fns[f].ret;
+        let c = fn_uses_c(f, pcx);
+        if conv_returns_through_pointer(&cx, c, ret, pcx) {
+            IRFUNCS[cx.irf].result_ptr = emit_ir(&cx, Op::Param, TY_U64, 0, 0, -1, pcx);
         }
-        place_locals(&cx, false, pbody);
+        place_locals(&cx, false, pbody, &pcx);
         // (0.18.1) -O2: its checked requires as facts (middle::entryfacts),
         // which reads the parameters as the AST's locals (bound by lower_param)
-        let facts = OPT_LEVEL >= 2 && crate::front::contracts::desugar::entry_pre(f) >= 0;
-        for i in 0..FNS[f].param_count {
-            let ty = fn_param(f, i);
-            let ast_local = NODES[child(item, i)].x;
+        let facts = pcx.opt_level >= 2 && crate::front::contracts::desugar::entry_pre(f, pcx) >= 0;
+        for i in 0..pcx.fns[f].param_count {
+            let ty = fn_param(f, i, pcx);
+            let ast_local = pcx.nodes[child(item, i, pcx)].x;
             if is_void(ty) || ast_local < 0 {
                 continue;
             }
-            lower_param(&cx, i, i + 1, ast_local, ty, c, facts, pbody);
+            lower_param(&cx, i, i + 1, ast_local, ty, c, facts, pbody, &pcx);
         }
-        place_locals(&cx, true, pbody);
+        place_locals(&cx, true, pbody, &pcx);
         if facts {
-            lower_entry_facts(&cx, item, f);
+            lower_entry_facts(&cx, item, f, &pcx);
         }
-        if (fn_needs(f) & ~own_features()) != 0 {
+        if (fn_needs(f, pcx) & ~own_features()) != 0 {
             // (0.19) never called: no body (as mod.vl's lower_function)
-            ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+            ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
         } else {
-            lower_blocks(&cx, pbody);
+            lower_blocks(&cx, pbody, &pcx);
         }
-        if cx.blocks[CUR].term == Term::None {
-            ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+        if cx.blocks[pcx.ir_cur].term == Term::None {
+            ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
         }
         cx.synth_ty.count = synth_mark;
-        IR_LOC = 0;
+        pcx.ir_loc = 0;
         ir_shrink(&cx);
     }
 }
@@ -280,25 +254,25 @@ fn lower_body(cx: inout FnCtx, item: i64, f: i64, pbody: Body<Comp>) {
 // IR), the slots after them, so that the entry block starts with its
 // parameters, as the AST lowering's did (ipo.vl's propagate_constants
 // reads the leading ones).
-fn place_locals(cx: inout FnCtx, slots: bool, pbody: Body<Comp>) {
+fn place_locals(cx: inout FnCtx, slots: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let n = local_count(pbody);
     if !slots {
-        L_VAR.clear();
-        L_ADDR.clear();
+        pcx.l_var.clear();
+        pcx.l_addr.clear();
         for _ in 0..n {
-            L_VAR.push(-1);
-            L_ADDR.push(0);
+            pcx.l_var.push(-1);
+            pcx.l_addr.push(0);
         }
     }
     for l in 0..n {
-        let ty = L_TY[l];
-        let borrowed = L_BORROWED[l] != 0;
+        let ty = pcx.l_ty[l];
+        let borrowed = pcx.l_borrowed[l] != 0;
         if is_void(ty) || has_flag(l, LF_STATIC, pbody) {
             continue;
         }
         if !borrowed && !is_compound(ty) {
             if !slots {
-                L_VAR[l] = new_synth_var(&cx, ir_type(ty));
+                pcx.l_var[l] = new_synth_var(&cx, ir_type(ty), pcx);
             }
             continue;
         }
@@ -310,10 +284,10 @@ fn place_locals(cx: inout FnCtx, slots: bool, pbody: Body<Comp>) {
         // SAFETY: cx.irf is the function being lowered, made by ir_new_func.
         let rp = unsafe { IRFUNCS[cx.irf].result_ptr };
         if l == 0 && rp != 0 {
-            L_ADDR[0] = rp;
+            pcx.l_addr[0] = rp;
             continue;
         }
-        L_ADDR[l] = ir_slot_addr(&cx, new_slot_for(&cx, ty));
+        pcx.l_addr[l] = ir_slot_addr(&cx, new_slot_for(&cx, ty, pcx), pcx);
     }
 }
 
@@ -334,59 +308,59 @@ pub fn through_deref(p: i64, pbody: Body<Comp>) -> bool {
 // compound one's address, the caller's copy). The AST local is bound too,
 // for lower_entry_facts' call.
 fn lower_param(cx: inout FnCtx, i: i64, l: i64, ast_local: i64, ty: i64, c: bool, facts: bool,
-    pbody: Body<Comp>) {
+    pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     // UNSAFE: cx is the lowering's raw context pointer; its abi_piece and insts
     // arrays are raw (as in mod.vl's lower_function, which this follows).
     // SAFETY: cx points at the live FnCtx; k is below abi_piece_count, set by
     // conv_classify just above, and piece was just emitted into insts.
     unsafe {
-        let kind = conv_classify(&cx, c, ty);
+        let kind = conv_classify(&cx, c, ty, pcx);
         var value = 0;
         if kind == AbiClass::Pieces {
-            let slot = ir_slot_addr(&cx, new_slot_for(&cx, ty));
+            let slot = ir_slot_addr(&cx, new_slot_for(&cx, ty, pcx), pcx);
             for k in 0..cx.abi_piece_count {
-                let piece = emit_ir(&cx, Op::Param, cx.abi_piece_ty[k], 0, 0, i);
+                let piece = emit_ir(&cx, Op::Param, cx.abi_piece_ty[k], 0, 0, i, pcx);
                 cx.insts[piece].imm2 = k + 1;
-                ir_store(&cx, cx.abi_piece_ty[k], slot, piece, cx.abi_piece_offset[k]);
+                ir_store(&cx, cx.abi_piece_ty[k], slot, piece, cx.abi_piece_offset[k], pcx);
             }
             value = slot;
         } else {
-            value = emit_ir(&cx, Op::Param, ir_type(ty), 0, 0, i);
+            value = emit_ir(&cx, Op::Param, ir_type(ty), 0, 0, i, pcx);
             if kind == AbiClass::Stack {
                 cx.insts[value].imm2 = -1;
             }
         }
         if facts {
-            crate::middle::lower::need_promote();
-            bind_local(&cx, ast_local, value, ty, true);
+            crate::middle::lower::need_promote(&pcx);
+            bind_local(&cx, ast_local, value, ty, true, &pcx);
         }
         if l >= local_count(pbody) {
             return;
         }
-        if L_VAR[l] >= 0 {
-            ssa_write(&cx, L_VAR[l], CUR, need_value(&cx, value, ty));
+        if pcx.l_var[l] >= 0 {
+            ssa_write(&cx, pcx.l_var[l], pcx.ir_cur, need_value(&cx, value, ty, pcx));
         } else if is_compound(ty) {
-            L_ADDR[l] = value;
-        } else if L_ADDR[l] == 0 {
+            pcx.l_addr[l] = value;
+        } else if pcx.l_addr[l] == 0 {
             // (a scalar parameter borrowed whole: a slot of its own)
-            let addr = ir_slot_addr(&cx, new_slot_for(&cx, ty));
-            ir_store(&cx, ir_type(ty), addr, value, 0);
-            L_ADDR[l] = addr;
+            let addr = ir_slot_addr(&cx, new_slot_for(&cx, ty, pcx), pcx);
+            ir_store(&cx, ir_type(ty), addr, value, 0, pcx);
+            pcx.l_addr[l] = addr;
         }
     }
 }
 
 // The blocks in reverse postorder: each block's statements, then its
 // terminator; a block is sealed once its last predecessor is lowered.
-fn lower_blocks(cx: inout FnCtx, pbody: Body<Comp>) {
+fn lower_blocks(cx: inout FnCtx, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let nb = block_count(pbody);
-    B_MID.clear();
-    B_LEFT.clear();
-    FWD.clear();
+    pcx.b_mid.clear();
+    pcx.b_left.clear();
+    pcx.lower_fwd.clear();
     for b in 0..nb {
-        B_MID.push(0);
-        B_LEFT.push(0);
-        FWD.push(b);
+        pcx.b_mid.push(0);
+        pcx.b_left.push(0);
+        pcx.lower_fwd.push(b);
     }
     // (an empty block that jumps on is its target's: no block of its own)
     for i in 0..pbody.rpo.len() {
@@ -398,43 +372,39 @@ fn lower_blocks(cx: inout FnCtx, pbody: Body<Comp>) {
             steps += 1;
         }
         if steps < 64 {
-            FWD[b] = t;
+            pcx.lower_fwd[b] = t;
         }
     }
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        if FWD[b] != b {
+        if pcx.lower_fwd[b] != b {
             continue;
         }
         for k in 0..crate::places::ir::succ_count(b, pbody) {
-            B_LEFT[FWD[crate::places::ir::succ(b, k, pbody)]] += 1;
+            pcx.b_left[pcx.lower_fwd[crate::places::ir::succ(b, k, pbody)]] += 1;
         }
     }
     // (the entry's jump to bb0)
-    let first = FWD[pbody.rpo[0]];
-    B_LEFT[first] += 1;
-    lower_jump(&cx, mid(&cx, first));
-    done_edge(&cx, first);
+    let first = pcx.lower_fwd[pbody.rpo[0]];
+    pcx.b_left[first] += 1;
+    lower_jump(&cx, mid(&cx, first, &pcx), pcx);
+    done_edge(&cx, first, &pcx);
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
-        if FWD[b] != b {
+        if pcx.lower_fwd[b] != b {
             continue;
         }
-        CUR = mid(&cx, b);
+        pcx.ir_cur = mid(&cx, b, &pcx);
         let start = block_start(b, pbody);
         for j in 0..block_len(b, pbody) {
-            lower_stmt(&cx, start + j, pbody);
+            lower_stmt(&cx, start + j, pbody, &pcx);
         }
-        lower_term(&cx, block_term(b, pbody), pbody);
+        lower_term(&cx, block_term(b, pbody), pbody, &pcx);
         for k in 0..crate::places::ir::succ_count(b, pbody) {
-            done_edge(&cx, FWD[crate::places::ir::succ(b, k, pbody)]);
+            done_edge(&cx, pcx.lower_fwd[crate::places::ir::succ(b, k, pbody)], &pcx);
         }
     }
 }
-
-// Per block: the block it forwards to (itself, but for an empty block that
-// jumps on).
-static var FWD: Vec<i64, Comp> = Vec::new_in(Comp {});
 
 // Whether block b has no statement that does anything and ends in a jump
 // elsewhere.
@@ -456,29 +426,25 @@ pub fn is_forward(b: i64, pbody: Body<Comp>) -> bool {
 // Block b's block in the IR (forwarded), made on its first use: the IR's
 // blocks are in the order the AST walk makes them (a jump's target after
 // the blocks of the statements before it), as --emit-ir prints them.
-fn mid(cx: sink *FnCtx, b: i64) -> i64 {
-    let t = FWD[b];
-    if B_MID[t] == 0 {
+fn mid(cx: sink *FnCtx, b: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let t = pcx.lower_fwd[b];
+    if pcx.b_mid[t] == 0 {
         // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
         // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-        B_MID[t] = ir_new_block(unsafe { &*cx });
+        pcx.b_mid[t] = ir_new_block(unsafe { &*cx });
     }
-    B_MID[t]
+    pcx.b_mid[t]
 }
 
 // An edge into block b lowered: b is sealed after its last one.
-fn done_edge(cx: inout FnCtx, b: i64) {
-    B_LEFT[b] -= 1;
-    if B_LEFT[b] == 0 {
-        ir_seal(&cx, mid(&cx, b));
+fn done_edge(cx: inout FnCtx, b: i64, pcx: inout Ctx<Comp>) {
+    pcx.b_left[b] -= 1;
+    if pcx.b_left[b] == 0 {
+        ir_seal(&cx, mid(&cx, b, &pcx), pcx);
     }
 }
 
 // ---- Places and operands ----
-
-// (0.26.2) --check-unsafe's position for a raw access: the statement's
-// (lower_stmt, lower_term).
-static var RAW_POS: i64 = 0;
 
 // Whether type t is a raw pointer (not a reference, 0.17).
 fn is_raw_pointer(t: i64) -> bool {
@@ -489,148 +455,148 @@ fn is_raw_pointer(t: i64) -> bool {
 // raw pointer is checked, at the statement's position: a `*` of one, the
 // whole pointee (as the AST lowering's lower_addr checks `*p`), and an
 // element of one (`p[i]`).
-fn place_addr(cx: sink *FnCtx, l: i64, p: i64, pbody: Body<Comp>) -> i64 {
+fn place_addr(cx: sink *FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     if p == 0 {
         if has_flag(l, LF_STATIC, pbody) {
-            return static_address(cx, pbody.locals[l].src);
+            return static_address(cx, pbody.locals[l].src, pcx);
         }
-        return L_ADDR[l];
+        return pcx.l_addr[l];
     }
     let parent = proj_parent(p, pbody);
     let k = proj_kind(p, pbody);
     let v = proj_val(p, pbody);
     if k == PJ_DEREF {
-        let pointer = place_value(cx, l, parent, pbody);
-        if CHECK_UNSAFE {
-            let pointer_ty = place_ty(l, parent, pbody);
+        let pointer = place_value(cx, l, parent, pbody, &pcx);
+        if pcx.check_unsafe {
+            let pointer_ty = place_ty(l, parent, pbody, &pcx);
             if is_raw_pointer(pointer_ty) {
                 // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
                 // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-                crate::middle::lower::calls::raw_check_at(unsafe { &*cx }, RAW_POS, pointer,
-                    ir_const(cx, type_size(TYPES[pointer_ty].a), TY_U64));
+                crate::middle::lower::calls::raw_check_at(unsafe { &*cx }, pcx.raw_pos, pointer,
+                    ir_const(cx, type_size(TYPES[pointer_ty].a, pcx), TY_U64, pcx), &pcx);
             }
         }
         return pointer;
     }
     if k == PJ_VARIANT {
-        return place_addr(cx, l, parent, pbody);
+        return place_addr(cx, l, parent, pbody, &pcx);
     }
-    let pt = place_ty(l, parent, pbody);
+    let pt = place_ty(l, parent, pbody, &pcx);
     if k == PJ_FIELD || k == PJ_UNION {
-        let base = place_addr(cx, l, parent, pbody);
+        let base = place_addr(cx, l, parent, pbody, &pcx);
         if parent > 0 && proj_kind(parent, pbody) == PJ_VARIANT {
-            return ir_offset(cx, base, variant_field_offset(proj_val(parent, pbody), v));
+            return ir_offset(cx, base, variant_field_offset(proj_val(parent, pbody), v, pcx), pcx);
         }
         let tk = TYPES[pt].kind;
         if tk == TyKind::Struct {
-            return ir_offset(cx, base, field_offset(TYPES[pt].a, v));
+            return ir_offset(cx, base, field_offset(TYPES[pt].a, v, pcx), pcx);
         }
         if tk == TyKind::Tuple {
-            return ir_offset(cx, base, tuple_offset(pt, v));
+            return ir_offset(cx, base, tuple_offset(pt, v, pcx), pcx);
         }
         // (a slice's pointer and length)
-        return ir_offset(cx, base, v * 8);
+        return ir_offset(cx, base, v * 8, pcx);
     }
-    let elem_size = type_size(TYPES[pt].a);
+    let elem_size = type_size(TYPES[pt].a, pcx);
     if k == PJ_CONST {
-        return ir_offset(cx, place_addr(cx, l, parent, pbody), v * elem_size);
+        return ir_offset(cx, place_addr(cx, l, parent, pbody, &pcx), v * elem_size, pcx);
     }
     // PJ_INDEX: element v (a local) of an array, a slice's buffer or a
     // pointer's
     var base = 0;
     if TYPES[pt].kind == TyKind::Ptr {
-        base = place_value(cx, l, parent, pbody);
+        base = place_value(cx, l, parent, pbody, &pcx);
     } else if is_slice(pt) {
-        base = ir_load(cx, TY_U64, place_addr(cx, l, parent, pbody), 0);
+        base = ir_load(cx, TY_U64, place_addr(cx, l, parent, pbody, &pcx), 0, pcx);
     } else {
-        base = place_addr(cx, l, parent, pbody);
+        base = place_addr(cx, l, parent, pbody, &pcx);
     }
-    let index = place_value(cx, v, 0, pbody);
+    let index = place_value(cx, v, 0, pbody, &pcx);
     var scaled = index;
     if elem_size != 1 {
-        scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64));
+        scaled = ir_binary(cx, Op::Mul, TY_U64, index, ir_const(cx, elem_size, TY_U64, pcx), pcx);
     }
-    let at = ir_binary(cx, Op::Add, TY_U64, base, scaled);
+    let at = ir_binary(cx, Op::Add, TY_U64, base, scaled, pcx);
     // (a raw pointer's element: checked, as lower_addr's `p[i]`)
-    if CHECK_UNSAFE && is_raw_pointer(pt) {
+    if pcx.check_unsafe && is_raw_pointer(pt) {
         // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
         // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-        crate::middle::lower::calls::raw_check_at(unsafe { &*cx }, RAW_POS, at,
-            ir_const(cx, elem_size, TY_U64));
+        crate::middle::lower::calls::raw_check_at(unsafe { &*cx }, pcx.raw_pos, at,
+            ir_const(cx, elem_size, TY_U64, pcx), &pcx);
     }
     at
 }
 
 // The value of place (l, p): an SSA use, a load, or a compound value's
 // address.
-fn place_value(cx: sink *FnCtx, l: i64, p: i64, pbody: Body<Comp>) -> i64 {
-    let ty = place_ty(l, p, pbody);
+fn place_value(cx: sink *FnCtx, l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let ty = place_ty(l, p, pbody, &pcx);
     if is_void(ty) {
         return 0;
     }
-    if p == 0 && L_VAR[l] >= 0 {
-        if L_BLK[l] >= 0 {
-            return need_value(cx, L_VAL[l], ty);
+    if p == 0 && pcx.l_var[l] >= 0 {
+        if pcx.l_blk[l] >= 0 {
+            return need_value(cx, pcx.l_val[l], ty, pcx);
         }
-        return ssa_read(cx, L_VAR[l], CUR);
+        return ssa_read(cx, pcx.l_var[l], pcx.ir_cur, pcx);
     }
-    let addr = place_addr(cx, l, p, pbody);
+    let addr = place_addr(cx, l, p, pbody, &pcx);
     if is_compound(ty) {
         return addr;
     }
-    ir_load(cx, ir_type(ty), addr, 0)
+    ir_load(cx, ir_type(ty), addr, 0, pcx)
 }
 
 // Place (l, p) = value (of the place's type; a compound one's address,
 // copied).
-fn write_place(cx: inout FnCtx, l: i64, p: i64, value: i64, pbody: Body<Comp>) {
-    let ty = place_ty(l, p, pbody);
+fn write_place(cx: inout FnCtx, l: i64, p: i64, value: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let ty = place_ty(l, p, pbody, &pcx);
     if is_void(ty) || ty == TY_NEVER {
         return;
     }
-    if p == 0 && L_VAR[l] >= 0 {
-        if L_BLK[l] >= 0 {
-            L_VAL[l] = need_value(&cx, value, ty);
+    if p == 0 && pcx.l_var[l] >= 0 {
+        if pcx.l_blk[l] >= 0 {
+            pcx.l_val[l] = need_value(&cx, value, ty, pcx);
             return;
         }
-        ssa_write(&cx, L_VAR[l], CUR, need_value(&cx, value, ty));
+        ssa_write(&cx, pcx.l_var[l], pcx.ir_cur, need_value(&cx, value, ty, pcx));
         return;
     }
-    store_value(&cx, place_addr(&cx, l, p, pbody), 0, value, ty);
+    store_value(&cx, place_addr(&cx, l, p, pbody, &pcx), 0, value, ty, pcx);
 }
 
 // The value of operand i at `ops`.
-fn operand(cx: sink *FnCtx, ops: i64, i: i64, pbody: Body<Comp>) -> i64 {
+fn operand(cx: sink *FnCtx, ops: i64, i: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let k = op_kind(ops, i, pbody);
     let a = op_a(ops, i, pbody);
     let b = op_b(ops, i, pbody);
     if k == OK_COPY || k == OK_MOVE {
-        return place_value(cx, a, b, pbody);
+        return place_value(cx, a, b, pbody, &pcx);
     }
     if k == OK_PLACE {
-        return place_addr(cx, a, b, pbody);
+        return place_addr(cx, a, b, pbody, &pcx);
     }
     if k == OK_INT {
-        let t = erase_type(b);
-        return ir_const(cx, a, ir_type(t));
+        let t = erase_type(b, &pcx);
+        return ir_const(cx, a, ir_type(t), pcx);
     }
     if k == OK_FLOAT {
-        let t = erase_type(b);
-        return ir_const(cx, float_const(f64_of_bits(a), t), t);
+        let t = erase_type(b, &pcx);
+        return ir_const(cx, float_const(f64_of_bits(a), t), t, pcx);
     }
     if k == OK_STR {
         // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
         // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-        return string_value(unsafe { &*cx }, a);
+        return string_value(unsafe { &*cx }, a, pcx);
     }
     if k == OK_CSTR {
-        return emit_ir(cx, Op::SAddr, TY_U64, 0, 0, a);
+        return emit_ir(cx, Op::SAddr, TY_U64, 0, 0, a, pcx);
     }
     if k == OK_FN {
-        return emit_ir(cx, Op::FAddr, TY_U64, 0, 0, a);
+        return emit_ir(cx, Op::FAddr, TY_U64, 0, 0, a, pcx);
     }
     if k == OK_CONST {
-        return ir_const(cx, const_value(a), ir_type(erase_type(b)));
+        return ir_const(cx, const_value(a, &pcx), ir_type(erase_type(b, &pcx)), pcx);
     }
     0
 }
@@ -650,79 +616,82 @@ pub fn op_fresh(ops: i64, i: i64, pbody: Body<Comp>) -> bool {
 // a constant's, or a unit's none (its expression, a call, was evaluated by
 // the statement before: lowering it again would run it twice). A check's
 // site, an RT_SITE value, is left to the AST's constant (lower_expr).
-fn bind(cx: inout FnCtx, e: i64, ops: i64, i: i64, pbody: Body<Comp>) {
+fn bind(cx: inout FnCtx, e: i64, ops: i64, i: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let k = op_kind(ops, i, pbody);
     if k == OK_UNIT {
-        BOUND_NODES.push(e);
-        BOUND_VALUES.push(0);
+        pcx.bound_nodes.push(e);
+        pcx.bound_values.push(0);
         return;
     }
-    if is_site(e) {
+    if is_site(e, pcx) {
         return;
     }
-    BOUND_NODES.push(e);
-    BOUND_VALUES.push(operand(&cx, ops, i, pbody));
+    pcx.bound_nodes.push(e);
+    let pcx_arg = operand(&cx, ops, i, pbody, &pcx);
+    pcx.bound_values.push(pcx_arg);
 }
 
 // Whether AST node e is a check's site (0.18.1: an RT_SITE id).
-pub fn is_site(e: i64) -> bool {
+pub fn is_site(e: i64, pcx: Ctx<Comp>) -> bool {
     // UNSAFE: NODES is the parser's raw table of nodes.
     // SAFETY: e is a node of the function being lowered, below the node count;
     // read only, single-threaded.
     unsafe {
-        NODES[e].kind == NodeKind::Int && (NODES[e].p & crate::front::ast::INT_SITE) != 0
-            && NODES[e].a != 0
+        pcx.nodes[e].kind == NodeKind::Int && (pcx.nodes[e].p & crate::front::ast::INT_SITE) != 0
+            && pcx.nodes[e].a != 0
     }
 }
 
-fn unbind() {
-    BOUND_NODES.clear();
-    BOUND_VALUES.clear();
+fn unbind(pcx: inout Ctx<Comp>) {
+    pcx.bound_nodes.clear();
+    pcx.bound_values.clear();
 }
 
 // ---- Statements ----
 
-fn lower_stmt(cx: inout FnCtx, at: i64, pbody: Body<Comp>) {
+fn lower_stmt(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let s = pbody.stmts[at];
     let k = s.kind;
     if k == SK_LIVE || k == SK_DEAD || k == SK_NOP || k == SK_MENTION {
         return;
     }
-    if IR_LOCS && s.node > 0 {
-        IR_LOC = NODES[s.node].start + 1;
-        IR_EXPR_LOC = 0;
+    if pcx.ir_locs && s.node > 0 {
+        pcx.ir_loc = pcx.nodes[s.node].start + 1;
+        pcx.ir_expr_loc = 0;
     }
     if s.node > 0 {
-        RAW_POS = NODES[s.node].start;
+        pcx.raw_pos = pcx.nodes[s.node].start;
     }
-    if is_dead_block(&cx, CUR) {
+    if is_dead_block(&cx, pcx.ir_cur) {
         return;
     }
     if k == SK_ASSIGN {
-        lower_assign(&cx, s, pbody);
+        lower_assign(&cx, s, pbody, &pcx);
     } else if k == SK_CALL {
-        lower_call_stmt(&cx, s, pbody);
+        lower_call_stmt(&cx, s, pbody, &pcx);
     } else if k == SK_INTRINSIC {
-        lower_intrinsic_stmt(&cx, s, pbody);
+        lower_intrinsic_stmt(&cx, s, pbody, &pcx);
     } else if k == SK_DROP {
-        lower_drop(&cx, s, pbody);
+        lower_drop(&cx, s, pbody, &pcx);
     } else if k == SK_ASSERT {
         // AK_BOUNDS: the index, as unsigned, below the length
-        let idx = operand(&cx, s.ops, 0, pbody);
-        let len = operand(&cx, s.ops, 1, pbody);
-        lower_check(&cx, ir_cmp(&cx, Cond::Lt, TY_U64, idx, len),
-            panic_kind(op_type(s.ops, 0, pbody), false), idx, len, 0, site_of(s.d, 0));
+        let idx = operand(&cx, s.ops, 0, pbody, &pcx);
+        let len = operand(&cx, s.ops, 1, pbody, &pcx);
+        let pcx_site6 = site_of(s.d, 0, &pcx);
+        lower_check(&cx, ir_cmp(&cx, Cond::Lt, TY_U64, idx, len, pcx),
+            panic_kind(op_type(s.ops, 0, pbody, &pcx), false), idx, len, 0, &pcx,
+            pcx_site6);
     }
 }
 
 // `drop(P)` kept: its type's drop shim called with `&mut P`; under a flag
 // (DS_FLAG, flag local d): only when the flag is true. An opened drop
 // does nothing itself (its parts' drops follow it), a removed one is gone.
-fn lower_drop(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
+fn lower_drop(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     if s.c != DS_KEPT && s.c != DS_FLAG {
         return;
     }
-    let f = drop_shim_fn(full_place_type(s.a, s.b, pbody));
+    let f = drop_shim_fn(full_place_type(s.a, s.b, pbody, pcx), &pcx);
     if f < 0 {
         return;
     }
@@ -730,25 +699,26 @@ fn lower_drop(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
     if s.c == DS_FLAG {
         let run = ir_new_block(&cx);
         after = ir_new_block(&cx);
-        lower_branch(&cx, place_value(&cx, s.d, 0, pbody), run, after);
-        ir_seal(&cx, run);
-        CUR = run;
+        lower_branch(&cx, place_value(&cx, s.d, 0, pbody, &pcx), run, after, pcx);
+        ir_seal(&cx, run, pcx);
+        pcx.ir_cur = run;
     }
     if s.node > 0 {
-        crate::middle::checkalloc::site_before_drop(&cx, crate::places::print::drop_pos(s.node));
+        crate::middle::checkalloc::site_before_drop(&cx,
+            crate::places::print::drop_pos(s.node, pcx), &pcx);
     }
-    let addr = place_addr(&cx, s.a, s.b, pbody);
-    let conv = call_conv(f, 0);
+    let addr = place_addr(&cx, s.a, s.b, pbody, &pcx);
+    let conv = call_conv(f, 0, pcx);
     // UNSAFE: cx is the lowering's raw context pointer.
     // SAFETY: cx points at the live FnCtx for the whole lowering.
     let mark = unsafe { cx.ssa_stack.count };
-    push_call_arg(&cx, conv, 0, addr, crate::middle::lower::calls::call_param_ty(conv, 0, TY_U64),
-        false);
-    emit_call_of(&cx, conv, 0, mark, 0);
+    push_call_arg(&cx, conv, 0, addr,
+        crate::middle::lower::calls::call_param_ty(conv, 0, TY_U64, pcx), false, pcx);
+    emit_call_of(&cx, conv, 0, mark, 0, &pcx);
     if after != 0 {
-        lower_jump(&cx, after);
-        ir_seal(&cx, after);
-        CUR = after;
+        lower_jump(&cx, after, pcx);
+        ir_seal(&cx, after, pcx);
+        pcx.ir_cur = after;
     }
 }
 
@@ -763,105 +733,111 @@ pub fn token_of(bo: i64) -> Tok {
     else if bo == BO_GT { Tok::Gt } else { Tok::GtEq }
 }
 
-fn lower_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
+fn lower_assign(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let rv = s.c;
     let dl = s.a;
     let dp = s.b;
-    let dt = place_ty(dl, dp, pbody);
+    let dt = place_ty(dl, dp, pbody, &pcx);
     if rv == RV_USE {
         // UNSAFE: cx is the lowering's raw context pointer.
         // SAFETY: cx points at the live FnCtx for the whole lowering.
         let first = unsafe { cx.inst_count };
-        write_place(&cx, dl, dp, operand(&cx, s.ops, 0, pbody), pbody);
+        write_place(&cx, dl, dp, operand(&cx, s.ops, 0, pbody, &pcx), pbody, &pcx);
         // (0.17: a move of a whole local, COPY_MOVE; copies.vl)
         if op_kind(s.ops, 0, pbody) == OK_MOVE && op_b(s.ops, 0, pbody) == 0 && dp == 0
-            && crate::front::own::diag::OWN_MODE == crate::front::own::diag::MODE_ERROR {
-            crate::middle::copies::note_move_copies(&cx, first);
+            && pcx.own_mode == crate::front::own::diag::MODE_ERROR {
+            crate::middle::copies::note_move_copies(&cx, first, &pcx);
         }
     } else if rv == RV_REF {
-        write_place(&cx, dl, dp, operand(&cx, s.ops, 0, pbody), pbody);
+        write_place(&cx, dl, dp, operand(&cx, s.ops, 0, pbody, &pcx), pbody, &pcx);
     } else if rv == RV_BINARY {
-        let ot = op_type(s.ops, 0, pbody);
+        let ot = op_type(s.ops, 0, pbody, &pcx);
         if is_vector(ot) {
-            lower_vector_assign(&cx, s, dt, pbody);
+            lower_vector_assign(&cx, s, dt, pbody, &pcx);
             return;
         }
-        let a = operand(&cx, s.ops, 0, pbody);
-        let b = operand(&cx, s.ops, 1, pbody);
+        let a = operand(&cx, s.ops, 0, pbody, &pcx);
+        let b = operand(&cx, s.ops, 1, pbody, &pcx);
         if s.d == BO_DIV || s.d == BO_REM {
-            lower_division_checks(&cx, s, ot, a, b, pbody);
+            lower_division_checks(&cx, s, ot, a, b, pbody, &pcx);
         }
-        write_place(&cx, dl, dp, lower_operator(&cx, token_of(s.d), ot, dt, a, b), pbody);
+        write_place(&cx, dl, dp, lower_operator(&cx, token_of(s.d), ot, dt, a, b, pcx), pbody,
+            &pcx);
     } else if rv == RV_CHECKED {
-        write_place(&cx, dl, dp, lower_checked(&cx, s, dt, pbody), pbody);
+        write_place(&cx, dl, dp, lower_checked(&cx, s, dt, pbody, &pcx), pbody, &pcx);
     } else if rv == RV_UNARY {
         if is_vector(dt) {
-            bind(&cx, NODES[s.e].b, s.ops, 0, pbody);
-            let v = lower_vector_negate(&cx, NODES[s.e].b, dt);
-            unbind();
-            write_place(&cx, dl, dp, v, pbody);
+            bind(&cx, pcx.nodes[s.e].b, s.ops, 0, pbody, &pcx);
+            let v = lower_vector_negate(&cx, pcx.nodes[s.e].b, dt, &pcx);
+            unbind(&pcx);
+            write_place(&cx, dl, dp, v, pbody, &pcx);
             return;
         }
         let tok = if s.d == UO_NEG { Tok::Minus } else if s.d == UO_NOT { Tok::Bang }
             else { Tok::Tilde };
-        write_place(&cx, dl, dp, lower_unop(&cx, tok, dt, operand(&cx, s.ops, 0, pbody)), pbody);
+        write_place(&cx, dl, dp, lower_unop(&cx, tok, dt, operand(&cx, s.ops, 0, pbody, &pcx), pcx),
+            pbody, &pcx);
     } else if rv == RV_CAST {
-        let v = operand(&cx, s.ops, 0, pbody);
-        write_place(&cx, dl, dp, lower_cast(&cx, v, op_type(s.ops, 0, pbody), erase_type(s.d)),
-            pbody);
+        let v = operand(&cx, s.ops, 0, pbody, &pcx);
+        write_place(&cx, dl, dp,
+            lower_cast(&cx, v, op_type(s.ops, 0, pbody, &pcx), erase_type(s.d, &pcx), pcx), pbody,
+            &pcx);
     } else if rv == RV_DISCR {
-        write_place(&cx, dl, dp, discriminant(&cx, s.ops, pbody), pbody);
+        write_place(&cx, dl, dp, discriminant(&cx, s.ops, pbody, &pcx), pbody, &pcx);
     } else if rv == RV_LEN {
-        let t = op_type(s.ops, 0, pbody);
+        let t = op_type(s.ops, 0, pbody, &pcx);
         if TYPES[t].kind == TyKind::Array {
-            write_place(&cx, dl, dp, ir_const(&cx, TYPES[t].b, TY_U64), pbody);
+            write_place(&cx, dl, dp, ir_const(&cx, TYPES[t].b, TY_U64, pcx), pbody, &pcx);
         } else {
-            write_place(&cx, dl, dp, ir_load(&cx, TY_U64, operand(&cx, s.ops, 0, pbody), 8), pbody);
+            write_place(&cx, dl, dp,
+                ir_load(&cx, TY_U64, operand(&cx, s.ops, 0, pbody, &pcx), 8, pcx), pbody, &pcx);
         }
     } else if rv == RV_AGG {
-        lower_aggregate(&cx, s, dt, pbody);
+        lower_aggregate(&cx, s, dt, pbody, &pcx);
     } else if rv == RV_REPEAT {
-        lower_repeat(&cx, s, dt, pbody);
+        lower_repeat(&cx, s, dt, pbody, &pcx);
     } else if rv == RV_SLICE {
-        write_place(&cx, dl, dp, lower_slice(&cx, s, pbody), pbody);
+        write_place(&cx, dl, dp, lower_slice(&cx, s, pbody, &pcx), pbody, &pcx);
     }
 }
 
 // (0.26.3, decision 6) A checked rvalue (RV_CHECKED): the operation and
 // the branch to Rust's panic at its node when it overflows (a shift's
 // amount is checked first).
-fn lower_checked(cx: sink *FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) -> i64 {
-    let site = site_of(s.e, 0);
-    let ot = op_type(s.ops, 0, pbody);
-    let x = operand(cx, s.ops, 0, pbody);
+fn lower_checked(cx: sink *FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let site = site_of(s.e, 0, &pcx);
+    let ot = op_type(s.ops, 0, pbody, &pcx);
+    let x = operand(cx, s.ops, 0, pbody, &pcx);
     if s.nops == 1 {
-        let v = lower_unop(cx, Tok::Minus, dt, x);
-        let kind = arith_panic_kind(UO_NEG, true, false);
+        let v = lower_unop(cx, Tok::Minus, dt, x, pcx);
+        let kind = arith_panic_kind(UO_NEG, true, false, &pcx);
         if is_signed(dt) {
             // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
             // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-            overflow_branch(unsafe { &*cx }, Op::Neg, dt, x, 0, kind, site);
+            overflow_branch(unsafe { &*cx }, Op::Neg, dt, x, 0, kind, site, &pcx);
         } else {
             // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
             // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-            arith_check(unsafe { &*cx }, ir_cmp(cx, Cond::Eq, ir_type(dt), x, ir_const(cx, 0, dt)),
-                kind, site);
+            arith_check(unsafe { &*cx },
+                ir_cmp(cx, Cond::Eq, ir_type(dt), x, ir_const(cx, 0, dt, pcx), pcx), kind, site,
+                &pcx);
         }
         return v;
     }
-    let y = operand(cx, s.ops, 1, pbody);
+    let y = operand(cx, s.ops, 1, pbody, &pcx);
     if s.d == BO_SHL || s.d == BO_SHR {
-        let ok = ir_cmp(cx, Cond::Lt, TY_U64, y, ir_const(cx, int_bits(ot), TY_U64));
+        let ok = ir_cmp(cx, Cond::Lt, TY_U64, y, ir_const(cx, int_bits(ot), TY_U64, pcx), pcx);
         // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
         // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-        arith_check(unsafe { &*cx }, ok, arith_panic_kind(s.d, false, false), site);
-        return lower_operator(cx, token_of(s.d), ot, dt, x, y);
+        arith_check(unsafe { &*cx }, ok, arith_panic_kind(s.d, false, false, &pcx), site, &pcx);
+        return lower_operator(cx, token_of(s.d), ot, dt, x, y, pcx);
     }
-    let r = lower_operator(cx, token_of(s.d), ot, dt, x, y);
+    let r = lower_operator(cx, token_of(s.d), ot, dt, x, y, pcx);
     let op = if s.d == BO_ADD { Op::Add } else if s.d == BO_SUB { Op::Sub } else { Op::Mul };
     // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
     // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-    overflow_branch(unsafe { &*cx }, op, ot, x, y, arith_panic_kind(s.d, false, false), site);
+    overflow_branch(unsafe { &*cx }, op, ot, x, y, arith_panic_kind(s.d, false, false, &pcx), site,
+        &pcx);
     r
 }
 
@@ -869,94 +845,98 @@ fn lower_checked(cx: sink *FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) -> i64 {
 // (RV_BINARY), at every level: b is not 0, and (signed) not a MIN / -1,
 // each a branch to Rust's panic at its node. A constant divisor needs
 // neither, or only the second when it is -1.
-fn lower_division_checks(cx: inout FnCtx, s: PStmt, ot: i64, a: i64, b: i64, pbody: Body<Comp>) {
+fn lower_division_checks(cx: inout FnCtx, s: PStmt, ot: i64, a: i64, b: i64, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
     if !is_integer(ot) {
         return;
     }
-    let site = site_of(s.e, 0);
+    let site = site_of(s.e, 0, &pcx);
     let k = op_kind(s.ops, 1, pbody);
     let known = k == OK_INT || k == OK_CONST;
     let value = if k
-        == OK_INT { wrap_int(op_a(s.ops, 1, pbody), erase_type(op_b(s.ops, 1, pbody))) }
-        else if k == OK_CONST { const_value(op_a(s.ops, 1, pbody)) } else { 0 };
+        == OK_INT { wrap_int(op_a(s.ops, 1, pbody), erase_type(op_b(s.ops, 1, pbody), &pcx)) }
+        else if k == OK_CONST { const_value(op_a(s.ops, 1, pbody), &pcx) } else { 0 };
     if !known || value == 0 {
-        arith_check(&cx, ir_cmp(&cx, Cond::Ne, ir_type(ot), b, ir_const(&cx, 0, ot)),
-            arith_panic_kind(s.d, false, true), site);
+        arith_check(&cx, ir_cmp(&cx, Cond::Ne, ir_type(ot), b, ir_const(&cx, 0, ot, pcx), pcx),
+            arith_panic_kind(s.d, false, true, &pcx), site, &pcx);
     }
     if is_signed(ot) && (!known || value == -1) {
         let min = (0 - 1) << (int_bits(ot) - 1) as u64;
-        let not_min = ir_cmp(&cx, Cond::Ne, ir_type(ot), a, ir_const(&cx, min, ot));
-        let not_minus_one = ir_cmp(&cx, Cond::Ne, ir_type(ot), b, ir_const(&cx, 0 - 1, ot));
-        arith_check(&cx, ir_binary(&cx, Op::Or, TY_BOOL, not_min, not_minus_one),
-            arith_panic_kind(s.d, false, false), site);
+        let not_min = ir_cmp(&cx, Cond::Ne, ir_type(ot), a, ir_const(&cx, min, ot, pcx), pcx);
+        let not_minus_one = ir_cmp(&cx, Cond::Ne, ir_type(ot), b, ir_const(&cx, 0 - 1, ot, pcx),
+            pcx);
+        arith_check(&cx, ir_binary(&cx, Op::Or, TY_BOOL, not_min, not_minus_one, pcx),
+            arith_panic_kind(s.d, false, false, &pcx), site, &pcx);
     }
 }
 
 // A binary operation on vectors (its node: the Binary, or the Assign of
 // `v op= x`), by vector.vl's lowering, its operands bound.
-fn lower_vector_assign(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) {
+fn lower_vector_assign(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let n = s.e;
-    if NODES[n].kind == NodeKind::Assign {
-        let value = NODES[n].c;
-        bind(&cx, value, s.ops, 1, pbody);
+    if pcx.nodes[n].kind == NodeKind::Assign {
+        let value = pcx.nodes[n].c;
+        bind(&cx, value, s.ops, 1, pbody, &pcx);
         var hi = 0;
-        let v = vector_assign_value(&cx, value, &hi);
-        unbind();
-        vector_assign_store(&cx, token_of(s.d), dt, place_addr(&cx, s.a, s.b, pbody), v, hi);
+        let v = vector_assign_value(&cx, value, &hi, &pcx);
+        unbind(&pcx);
+        vector_assign_store(&cx, token_of(s.d), dt, place_addr(&cx, s.a, s.b, pbody, &pcx), v, hi,
+            pcx);
         return;
     }
-    bind(&cx, NODES[n].b, s.ops, 0, pbody);
-    bind(&cx, NODES[n].c, s.ops, 1, pbody);
-    let v = lower_vector_binary(&cx, NODES[n].op, NODES[n].b, NODES[n].c, dt);
-    unbind();
-    write_place(&cx, s.a, s.b, v, pbody);
+    bind(&cx, pcx.nodes[n].b, s.ops, 0, pbody, &pcx);
+    bind(&cx, pcx.nodes[n].c, s.ops, 1, pbody, &pcx);
+    let v = lower_vector_binary(&cx, pcx.nodes[n].op, pcx.nodes[n].b, pcx.nodes[n].c, dt, &pcx);
+    unbind(&pcx);
+    write_place(&cx, s.a, s.b, v, pbody, &pcx);
 }
 
 // The discriminant of place ops[0], an enum: a scalar enum's value, the
 // null niche's test, else the tag in memory.
-fn discriminant(cx: sink *FnCtx, ops: i64, pbody: Body<Comp>) -> i64 {
+fn discriminant(cx: sink *FnCtx, ops: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     // UNSAFE: the checker's ENUMS and VARIANTS are static mut, cx is the
     // lowering's raw context pointer.
     // SAFETY: t is the checked enum type of operand 0, so TYPES[t].a is an ENUMS
     // index; v stays below VARIANT_COUNT; set was just emitted into cx.insts.
     unsafe {
-        let t = op_type(ops, 0, pbody);
+        let t = op_type(ops, 0, pbody, &pcx);
         let e = TYPES[t].a;
         let tag = ENUMS[e].tag;
         if !is_compound(t) {
-            return place_value(cx, op_a(ops, 0, pbody), op_b(ops, 0, pbody), pbody);
+            return place_value(cx, op_a(ops, 0, pbody), op_b(ops, 0, pbody), pbody, &pcx);
         }
-        let addr = operand(cx, ops, 0, pbody);
-        if enum_niche(e) {
+        let addr = operand(cx, ops, 0, pbody, &pcx);
+        if enum_niche(e, pcx) {
             // (the variant with the pointer when it is not null)
             var some = 0;
             var none = 0;
-            for v in 0..crate::front::types::VARIANT_COUNT {
-                if VARIANTS[v].enum_id == e {
-                    if VARIANTS[v].field_count == 1 {
-                        some = wrap_int(VARIANTS[v].discr, tag);
+            for v in 0..pcx.variant_count {
+                if pcx.variants[v].enum_id == e {
+                    if pcx.variants[v].field_count == 1 {
+                        some = wrap_int(pcx.variants[v].discr, tag);
                     } else {
-                        none = wrap_int(VARIANTS[v].discr, tag);
+                        none = wrap_int(pcx.variants[v].discr, tag);
                     }
                 }
             }
-            let word = ir_load(cx, TY_U64, addr, 0);
+            let word = ir_load(cx, TY_U64, addr, 0, pcx);
             let set = emit_ir(cx, Op::Conv, ir_type(tag),
-                ir_cmp(cx, Cond::Ne, TY_U64, word, ir_const(cx, 0, TY_U64)), 0, 0);
+                ir_cmp(cx, Cond::Ne, TY_U64, word, ir_const(cx, 0, TY_U64, pcx), pcx), 0, 0, pcx);
             cx.insts[set].imm2 = TY_BOOL;
             if some == 1 && none == 0 {
                 return set;
             }
-            let diff = ir_binary(cx, Op::Mul, ir_type(tag), set, ir_const(cx, some - none, tag));
-            return ir_binary(cx, Op::Add, ir_type(tag), diff, ir_const(cx, none, tag));
+            let diff = ir_binary(cx, Op::Mul, ir_type(tag), set,
+                ir_const(cx, some - none, tag, pcx), pcx);
+            return ir_binary(cx, Op::Add, ir_type(tag), diff, ir_const(cx, none, tag, pcx), pcx);
         }
-        ir_load(cx, ir_type(tag), addr, 0)
+        ir_load(cx, ir_type(tag), addr, 0, pcx)
     }
 }
 
 // An aggregate into its place: built there, or, when an operand reads
 // the place's local (`p = P { x: p.y, .. }`), in a new slot then copied.
-fn lower_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) {
+fn lower_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     // UNSAFE: the checker's ENUMS and VARIANTS are static mut, struct_field
     // returns a raw pointer into the checker's field table.
     // SAFETY: dt is the place's checked type (an enum's for a variant, so
@@ -966,36 +946,37 @@ fn lower_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) {
         let ak = s.d;
         if ak == AK_VARIANT && !is_compound(dt) {
             let v = s.e;
-            write_place(&cx, s.a, s.b, ir_const(&cx, wrap_int(VARIANTS[v].discr,
-                ENUMS[TYPES[dt].a].tag), ir_type(dt)), pbody);
+            write_place(&cx, s.a, s.b, ir_const(&cx, wrap_int(pcx.variants[v].discr,
+                ENUMS[TYPES[dt].a].tag), ir_type(dt), pcx), pbody, &pcx);
             return;
         }
-        var in_place = s.b == 0 && L_VAR[s.a] < 0 && !has_flag(s.a, LF_STATIC, pbody);
+        var in_place = s.b == 0 && pcx.l_var[s.a] < 0 && !has_flag(s.a, LF_STATIC, pbody);
         for i in 0..s.nops {
             let k = op_kind(s.ops, i, pbody);
             if (k == OK_COPY || k == OK_MOVE || k == OK_PLACE) && op_a(s.ops, i, pbody) == s.a {
                 in_place = false;
             }
         }
-        let base = if in_place { place_addr(&cx, s.a, 0, pbody) }
-            else { ir_slot_addr(&cx, new_slot_for(&cx, dt)) };
+        let base = if in_place { place_addr(&cx, s.a, 0, pbody, &pcx) }
+            else { ir_slot_addr(&cx, new_slot_for(&cx, dt, pcx), pcx) };
         if ak == AK_VARIANT {
             let v = s.e;
             let tag = ENUMS[TYPES[dt].a].tag;
-            if enum_niche(TYPES[dt].a) {
+            if enum_niche(TYPES[dt].a, pcx) {
                 if s.nops == 1 {
-                    store_value(&cx, base, 0, operand(&cx, s.ops, 0, pbody),
-                        op_type(s.ops, 0, pbody));
+                    store_value(&cx, base, 0, operand(&cx, s.ops, 0, pbody, &pcx),
+                        op_type(s.ops, 0, pbody, &pcx), pcx);
                 } else {
-                    ir_store(&cx, TY_U64, base, ir_const(&cx, 0, TY_U64), 0);
+                    ir_store(&cx, TY_U64, base, ir_const(&cx, 0, TY_U64, pcx), 0, pcx);
                 }
             } else {
                 for i in 0..s.nops {
-                    store_value(&cx, base, variant_field_offset(v, i),
-                        operand(&cx, s.ops, i, pbody),
-                        erase_type(crate::front::types::variant_field(v, i)));
+                    store_value(&cx, base, variant_field_offset(v, i, pcx),
+                        operand(&cx, s.ops, i, pbody, &pcx),
+                        erase_type(crate::front::types::variant_field(v, i, pcx), &pcx), pcx);
                 }
-                ir_store(&cx, tag, base, ir_const(&cx, wrap_int(VARIANTS[v].discr, tag), tag), 0);
+                ir_store(&cx, tag, base,
+                    ir_const(&cx, wrap_int(pcx.variants[v].discr, tag), tag, pcx), 0, pcx);
             }
         } else {
             for i in 0..s.nops {
@@ -1003,90 +984,92 @@ fn lower_aggregate(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) {
                 var elem_ty = 0;
                 if ak == AK_STRUCT || ak == AK_CLOSURE {
                     let st = TYPES[dt].a;
-                    offset = field_offset(st, i);
-                    elem_ty = erase_type((*crate::front::types::struct_field(st, i)).ty);
+                    offset = field_offset(st, i, pcx);
+                    elem_ty = erase_type((*crate::front::types::struct_field(st, i, pcx)).ty, &pcx);
                 } else if ak == AK_TUPLE {
-                    offset = tuple_offset(dt, i);
-                    elem_ty = erase_type(crate::front::types::type_elem(dt, i));
+                    offset = tuple_offset(dt, i, pcx);
+                    elem_ty = erase_type(crate::front::types::type_elem(dt, i), &pcx);
                 } else {
-                    elem_ty = erase_type(TYPES[dt].a);
-                    offset = i * type_size(elem_ty);
+                    elem_ty = erase_type(TYPES[dt].a, &pcx);
+                    offset = i * type_size(elem_ty, pcx);
                 }
                 // (a union literal's fields not written: `const ()`)
                 if op_kind(s.ops, i, pbody) == OK_UNIT {
                     continue;
                 }
-                store_value(&cx, base, offset, operand(&cx, s.ops, i, pbody), elem_ty);
+                store_value(&cx, base, offset, operand(&cx, s.ops, i, pbody, &pcx), elem_ty, pcx);
             }
         }
         if !in_place {
-            write_place(&cx, s.a, s.b, base, pbody);
+            write_place(&cx, s.a, s.b, base, pbody, &pcx);
         }
     }
 }
 
 // `[x; n]` into its place (as expr.vl's lower_repeat): x stored n times,
 // by a loop past four.
-fn lower_repeat(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>) {
-    let elem_ty = erase_type(TYPES[dt].a);
+fn lower_repeat(cx: inout FnCtx, s: PStmt, dt: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let elem_ty = erase_type(TYPES[dt].a, &pcx);
     let count = TYPES[dt].b;
-    let elem_size = type_size(elem_ty);
-    let value = operand(&cx, s.ops, 0, pbody);
-    let in_place = s.b == 0 && L_VAR[s.a] < 0 && !has_flag(s.a, LF_STATIC, pbody);
-    let base = if in_place { place_addr(&cx, s.a, 0, pbody) }
-        else { ir_slot_addr(&cx, new_slot_for(&cx, dt)) };
+    let elem_size = type_size(elem_ty, pcx);
+    let value = operand(&cx, s.ops, 0, pbody, &pcx);
+    let in_place = s.b == 0 && pcx.l_var[s.a] < 0 && !has_flag(s.a, LF_STATIC, pbody);
+    let base = if in_place { place_addr(&cx, s.a, 0, pbody, &pcx) }
+        else { ir_slot_addr(&cx, new_slot_for(&cx, dt, pcx), pcx) };
     if count > 0 && !is_void(elem_ty) && elem_size > 0 {
         if count <= 4 {
             for i in 0..count {
-                store_value(&cx, base, i * elem_size, value, elem_ty);
+                store_value(&cx, base, i * elem_size, value, elem_ty, pcx);
             }
         } else {
-            let cursor = new_synth_var(&cx, TY_U64);
-            ssa_write(&cx, cursor, CUR, base);
-            let end = ir_offset(&cx, base, count * elem_size);
+            let cursor = new_synth_var(&cx, TY_U64, pcx);
+            ssa_write(&cx, cursor, pcx.ir_cur, base);
+            let end = ir_offset(&cx, base, count * elem_size, pcx);
             let body = ir_new_block(&cx);
             let exit = ir_new_block(&cx);
-            lower_jump(&cx, body);
-            CUR = body;
-            let at = ssa_read(&cx, cursor, body);
-            store_value(&cx, at, 0, value, elem_ty);
-            let next = ir_offset(&cx, at, elem_size);
-            ssa_write(&cx, cursor, CUR, next);
-            lower_branch(&cx, ir_cmp(&cx, Cond::Ne, TY_U64, next, end), body, exit);
-            ir_seal(&cx, body);
-            ir_seal(&cx, exit);
-            CUR = exit;
+            lower_jump(&cx, body, pcx);
+            pcx.ir_cur = body;
+            let at = ssa_read(&cx, cursor, body, pcx);
+            store_value(&cx, at, 0, value, elem_ty, pcx);
+            let next = ir_offset(&cx, at, elem_size, pcx);
+            ssa_write(&cx, cursor, pcx.ir_cur, next);
+            lower_branch(&cx, ir_cmp(&cx, Cond::Ne, TY_U64, next, end, pcx), body, exit, pcx);
+            ir_seal(&cx, body, pcx);
+            ir_seal(&cx, exit, pcx);
+            pcx.ir_cur = exit;
         }
     }
     if !in_place {
-        write_place(&cx, s.a, s.b, base, pbody);
+        write_place(&cx, s.a, s.b, base, pbody, &pcx);
     }
 }
 
 // `base[lo..hi]`: the base (a pointer's value, a slice's or an array's
 // address), the bounds (absent: OK_UNIT), checked (expr.vl's
 // slice_of_values).
-fn lower_slice(cx: sink *FnCtx, s: PStmt, pbody: Body<Comp>) -> i64 {
-    let bt = op_type(s.ops, 0, pbody);
+fn lower_slice(cx: sink *FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let bt = op_type(s.ops, 0, pbody, &pcx);
     let value = if TYPES[bt].kind
-        == TyKind::Ptr { place_value(cx, op_a(s.ops, 0, pbody), op_b(s.ops, 0, pbody), pbody) }
-        else { operand(cx, s.ops, 0, pbody) };
+        == TyKind::Ptr {
+        place_value(cx, op_a(s.ops, 0, pbody), op_b(s.ops, 0, pbody), pbody, &pcx)
+    }
+        else { operand(cx, s.ops, 0, pbody, &pcx) };
     var bound_ty = TY_U64;
     var lo = 0;
     if op_kind(s.ops, 1, pbody) != OK_UNIT {
-        lo = operand(cx, s.ops, 1, pbody);
-        bound_ty = op_type(s.ops, 1, pbody);
+        lo = operand(cx, s.ops, 1, pbody, &pcx);
+        bound_ty = op_type(s.ops, 1, pbody, &pcx);
     } else {
-        lo = ir_const(cx, 0, TY_U64);
+        lo = ir_const(cx, 0, TY_U64, pcx);
     }
     var hi = 0;
     if op_kind(s.ops, 2, pbody) != OK_UNIT {
-        hi = operand(cx, s.ops, 2, pbody);
-        bound_ty = op_type(s.ops, 2, pbody);
+        hi = operand(cx, s.ops, 2, pbody, &pcx);
+        bound_ty = op_type(s.ops, 2, pbody, &pcx);
     }
     // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
     // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
-    slice_of_values(unsafe { &*cx }, s.d, bt, value, lo, hi, bound_ty)
+    slice_of_values(unsafe { &*cx }, s.d, bt, value, lo, hi, bound_ty, &pcx)
 }
 
 // ---- Calls and intrinsics ----
@@ -1094,46 +1077,46 @@ fn lower_slice(cx: sink *FnCtx, s: PStmt, pbody: Body<Comp>) -> i64 {
 // A call: by the AST's lower_call of its node with the operands bound
 // (its intrinsics, bit counts, atomics, contracts and convention), or, for
 // one the builder made, by the convention's helpers.
-fn lower_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
+fn lower_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let n = s.node;
     let f = s.c;
     var value = 0;
-    if IR_CALL_LOCS && n > 0 {
-        IR_EXPR_LOC = NODES[n].start + 1;
+    if pcx.ir_call_locs && n > 0 {
+        pcx.ir_expr_loc = pcx.nodes[n].start + 1;
     }
     let skip = if f < 0 { 1 } else { 0 };
     // (a compound result made in its destination: a whole local whose
     // storage nothing borrows, not a parameter's)
-    let dest = call_dest(s.a, s.b, pbody);
-    crate::middle::lower::calls::RESULT_DEST = dest;
-    if n > 0 && NODES[n].kind == NodeKind::Call && NODES[n].x - 1 == f
-        && NODES[n].count + skip == s.nops {
+    let dest = call_dest(s.a, s.b, pbody, pcx);
+    pcx.result_dest = dest;
+    if n > 0 && pcx.nodes[n].kind == NodeKind::Call && pcx.nodes[n].x - 1 == f
+        && pcx.nodes[n].count + skip == s.nops {
         if f < 0 {
-            bind(&cx, NODES[n].a, s.ops, 0, pbody);
+            bind(&cx, pcx.nodes[n].a, s.ops, 0, pbody, &pcx);
         }
-        for i in 0..NODES[n].count {
-            bind(&cx, child(n, i), s.ops, i + skip, pbody);
+        for i in 0..pcx.nodes[n].count {
+            bind(&cx, child(n, i, pcx), s.ops, i + skip, pbody, &pcx);
         }
-        value = lower_call(&cx, n);
-        unbind();
+        value = lower_call(&cx, n, &pcx);
+        unbind(&pcx);
     } else {
-        let callee_ty = if f < 0 { op_type(s.ops, 0, pbody) } else { 0 };
-        let conv = call_conv(f, callee_ty);
+        let callee_ty = if f < 0 { op_type(s.ops, 0, pbody, &pcx) } else { 0 };
+        let conv = call_conv(f, callee_ty, pcx);
         // UNSAFE: cx is the lowering's raw context pointer.
         // SAFETY: cx points at the live FnCtx for the whole lowering.
         let mark = unsafe { cx.ssa_stack.count };
         for i in skip..s.nops {
             let ty = crate::middle::lower::calls::call_param_ty(conv, i - skip,
-                op_type(s.ops, i, pbody));
-            push_call_arg(&cx, conv, i - skip, operand(&cx, s.ops, i, pbody), ty,
-                op_fresh(s.ops, i, pbody));
+                op_type(s.ops, i, pbody, &pcx), pcx);
+            push_call_arg(&cx, conv, i - skip, operand(&cx, s.ops, i, pbody, &pcx), ty,
+                op_fresh(s.ops, i, pbody), pcx);
         }
-        let callee = if f < 0 { operand(&cx, s.ops, 0, pbody) } else { 0 };
-        value = emit_call_of(&cx, conv, callee, mark, n);
+        let callee = if f < 0 { operand(&cx, s.ops, 0, pbody, &pcx) } else { 0 };
+        value = emit_call_of(&cx, conv, callee, mark, n, &pcx);
     }
-    crate::middle::lower::calls::RESULT_DEST = 0;
+    pcx.result_dest = 0;
     if dest == 0 || value != dest {
-        write_place(&cx, s.a, s.b, value, pbody);
+        write_place(&cx, s.a, s.b, value, pbody, &pcx);
     }
 }
 
@@ -1143,80 +1126,82 @@ fn lower_call_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
 // false, ops[1] the site, ops[2..] the shown values (0 to 3, of any
 // integer width: widened to 64 bits). Only the message's text is the
 // AST's (calls.vl's contract_failure_at).
-fn lower_contract_failure(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
+fn lower_contract_failure(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     // (the site: a `$pre` function's SITE parameter, or the check's own,
     // an RT_SITE value: the AST's constant, as bind leaves it)
     var site = 0;
     let site_kind = op_kind(s.ops, 1, pbody);
     if site_kind == OK_COPY || site_kind == OK_MOVE {
-        let site_ty = op_type(s.ops, 1, pbody);
-        site = need_value(&cx, operand(&cx, s.ops, 1, pbody), site_ty);
+        let site_ty = op_type(s.ops, 1, pbody, &pcx);
+        site = need_value(&cx, operand(&cx, s.ops, 1, pbody, &pcx), site_ty, pcx);
         if site_ty != TY_I64 {
-            site = lower_cast(&cx, site, site_ty, TY_I64);
+            site = lower_cast(&cx, site, site_ty, TY_I64, pcx);
         }
     } else {
-        site = need_value(&cx, crate::middle::lower::expr::lower_expr(&cx, child(s.d, 1)), TY_I64);
+        site = need_value(&cx,
+            crate::middle::lower::expr::lower_expr(&cx, child(s.d, 1, pcx), &pcx), TY_I64, pcx);
     }
     var values: [i64; 3] = [0; 3];
     for i in 0..s.nops - 2 {
-        let ty = op_type(s.ops, i + 2, pbody);
-        var v = need_value(&cx, operand(&cx, s.ops, i + 2, pbody), ty);
+        let ty = op_type(s.ops, i + 2, pbody, &pcx);
+        var v = need_value(&cx, operand(&cx, s.ops, i + 2, pbody, &pcx), ty, pcx);
         let wide = if is_signed(ty) { TY_I64 } else { TY_U64 };
         if ty != wide {
-            v = lower_cast(&cx, v, ty, wide);
+            v = lower_cast(&cx, v, ty, wide, pcx);
         }
         values[i] = v;
     }
     crate::middle::lower::calls::contract_failure_at(&cx, s.d, s.e, site, values[0], values[1],
-        values[2]);
+        values[2], &pcx);
 }
 
-fn lower_intrinsic_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
+fn lower_intrinsic_stmt(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let n = s.d;
     if s.c == IK_PANIC {
-        let value = lower_cast(&cx, operand(&cx, s.ops, 0, pbody), op_type(s.ops, 0, pbody),
-            TY_I64);
-        lower_panic(&cx, NODES[n].x, value, site_of(n, 0));
+        let value = lower_cast(&cx, operand(&cx, s.ops, 0, pbody, &pcx),
+            op_type(s.ops, 0, pbody, &pcx), TY_I64, pcx);
+        let pcx_site7 = site_of(n, 0, &pcx);
+        lower_panic(&cx, pcx.nodes[n].x, value, &pcx, pcx_site7);
         return;
     }
     var value = 0;
     if s.c == IK_CONTRACT {
-        lower_contract_failure(&cx, s, pbody);
+        lower_contract_failure(&cx, s, pbody, &pcx);
         return;
     }
     if s.c == IK_VECTOR {
         var j = 0;
-        if NODES[n].a != 0 {
-            bind(&cx, NODES[n].a, s.ops, 0, pbody);
+        if pcx.nodes[n].a != 0 {
+            bind(&cx, pcx.nodes[n].a, s.ops, 0, pbody, &pcx);
             j = 1;
         }
-        for i in 0..NODES[n].count {
-            bind(&cx, child(n, i), s.ops, i + j, pbody);
+        for i in 0..pcx.nodes[n].count {
+            bind(&cx, child(n, i, pcx), s.ops, i + j, pbody, &pcx);
         }
-        value = lower_vecop(&cx, n);
+        value = lower_vecop(&cx, n, &pcx);
     } else {
         // IK_ARCH: std::arch's intrinsics, by lower_call (which lowers the
         // ones its table has a form for, and calls the others)
-        for i in 0..NODES[n].count {
-            bind(&cx, child(n, i), s.ops, i, pbody);
+        for i in 0..pcx.nodes[n].count {
+            bind(&cx, child(n, i, pcx), s.ops, i, pbody, &pcx);
         }
-        value = lower_call(&cx, n);
+        value = lower_call(&cx, n, &pcx);
     }
-    unbind();
-    write_place(&cx, s.a, s.b, value, pbody);
+    unbind(&pcx);
+    write_place(&cx, s.a, s.b, value, pbody, &pcx);
 }
 
 // ---- Terminators ----
 
-fn lower_term(cx: inout FnCtx, at: i64, pbody: Body<Comp>) {
+fn lower_term(cx: inout FnCtx, at: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     let s = pbody.stmts[at];
     let k = s.kind;
-    if IR_LOCS && s.node > 0 {
-        IR_LOC = NODES[s.node].start + 1;
-        IR_EXPR_LOC = 0;
+    if pcx.ir_locs && s.node > 0 {
+        pcx.ir_loc = pcx.nodes[s.node].start + 1;
+        pcx.ir_expr_loc = 0;
     }
     if s.node > 0 {
-        RAW_POS = NODES[s.node].start;
+        pcx.raw_pos = pcx.nodes[s.node].start;
     }
     if k == TK_GOTO {
         // (a jump to the return block, which has nothing else: the return
@@ -1225,24 +1210,24 @@ fn lower_term(cx: inout FnCtx, at: i64, pbody: Body<Comp>) {
         // block, middle/copies.vl)
         let t = s.a;
         if block_len(t, pbody) == 0 && pbody.stmts[block_term(t, pbody)].kind == TK_RETURN {
-            lower_ret(&cx, pbody);
+            lower_ret(&cx, pbody, &pcx);
             return;
         }
-        lower_jump(&cx, mid(&cx, t));
+        lower_jump(&cx, mid(&cx, t, &pcx), pcx);
     } else if k == TK_SWITCH {
-        lower_switch(&cx, s, pbody);
+        lower_switch(&cx, s, pbody, &pcx);
     } else if k == TK_RETURN {
-        lower_ret(&cx, pbody);
+        lower_ret(&cx, pbody, &pcx);
     } else {
-        ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+        ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
     }
 }
 
 // `return`: _0 is the result (built in place through the result pointer,
 // or returned by mod.vl's lower_return).
-fn lower_ret(cx: inout FnCtx, pbody: Body<Comp>) {
-    if is_dead_block(&cx, CUR) {
-        ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+fn lower_ret(cx: inout FnCtx, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    if is_dead_block(&cx, pcx.ir_cur) {
+        ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
         return;
     }
     // UNSAFE: IRFUNCS is the IR's raw table of functions.
@@ -1252,33 +1237,33 @@ fn lower_ret(cx: inout FnCtx, pbody: Body<Comp>) {
         // UNSAFE: as above.
         // SAFETY: as above.
         let f = unsafe { IRFUNCS[cx.irf].f };
-        let result = if crate::base::target::X86 && fn_uses_c(f) { rp } else { 0 };
-        ir_terminate(&cx, CUR, Term::Ret, result, 0, 0);
+        let result = if crate::base::target::X86 && fn_uses_c(f, pcx) { rp } else { 0 };
+        ir_terminate(&cx, pcx.ir_cur, Term::Ret, result, 0, 0);
         return;
     }
-    lower_return(&cx, place_value(&cx, 0, 0, pbody));
+    lower_return(&cx, place_value(&cx, 0, 0, pbody, &pcx), &pcx);
     // (lower_return leaves a dead block current)
-    ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+    ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
 }
 
 // `switch op [v: b, .., otherwise: c]`: a bool's a branch, else a Switch.
-fn lower_switch(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
-    let ty = op_type(s.ops, 0, pbody);
-    let v = operand(&cx, s.ops, 0, pbody);
-    let otherwise = mid(&cx, s.c);
+fn lower_switch(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let ty = op_type(s.ops, 0, pbody, &pcx);
+    let v = operand(&cx, s.ops, 0, pbody, &pcx);
+    let otherwise = mid(&cx, s.c, &pcx);
     if s.b == 1 && pbody.targets[s.a] == 0 && ty == TY_BOOL {
-        let when_false = mid(&cx, pbody.targets[s.a + 1]);
+        let when_false = mid(&cx, pbody.targets[s.a + 1], &pcx);
         // (both ways forwarded to one block: a jump, no branch to one
         // block twice)
         if when_false == otherwise {
-            lower_jump(&cx, otherwise);
+            lower_jump(&cx, otherwise, pcx);
         } else {
-            lower_branch(&cx, v, otherwise, when_false);
+            lower_branch(&cx, v, otherwise, when_false, pcx);
         }
         return;
     }
-    if is_dead_block(&cx, CUR) {
-        ir_terminate(&cx, CUR, Term::Unreach, 0, 0, 0);
+    if is_dead_block(&cx, pcx.ir_cur) {
+        ir_terminate(&cx, pcx.ir_cur, Term::Unreach, 0, 0, 0);
         return;
     }
     // (one Switch: the (value, block) pairs on the SSA stack)
@@ -1289,50 +1274,40 @@ fn lower_switch(cx: inout FnCtx, s: PStmt, pbody: Body<Comp>) {
         let mark = cx.ssa_stack.count;
         for i in 0..s.b {
             cx.ssa_stack.push(pbody.targets[s.a + 2 * i]);
-            cx.ssa_stack.push(mid(&cx, pbody.targets[s.a + 2 * i + 1]));
+            cx.ssa_stack.push(mid(&cx, pbody.targets[s.a + 2 * i + 1], &pcx));
         }
-        ir_switch(&cx, CUR, v, otherwise, mark);
+        ir_switch(&cx, pcx.ir_cur, v, otherwise, mark);
     }
 }
 
 // The address a call with destination (l, p) builds its compound result
 // in: a whole local's slot when nothing borrows it (the callee cannot see
 // it before it returns), else 0.
-fn call_dest(l: i64, p: i64, pbody: Body<Comp>) -> i64 {
-    let ty = L_TY[l];
-    if p != 0 || !is_compound(ty) || L_VAR[l] >= 0 || L_BORROWED[l] != 0
+fn call_dest(l: i64, p: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let ty = pcx.l_ty[l];
+    if p != 0 || !is_compound(ty) || pcx.l_var[l] >= 0 || pcx.l_borrowed[l] != 0
         || has_flag(l, LF_STATIC, pbody) || l >= 1 && l <= pbody.params {
         return 0;
     }
-    L_ADDR[l]
+    pcx.l_addr[l]
 }
 
-// Per projection list: its type from the root local PJ_ROOT (-1: not
-// computed), place_ty's memo.
-static var PJ_TY: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var PJ_ROOT: Vec<i64, Comp> = Vec::new_in(Comp {});
-// Per local: the block all its uses and writes are in (-1: none yet, -2:
-// several), and for an SSA variable used in one block only, its value
-// there (no definition map: the common statement temporary).
-static var L_BLK: Vec<i64, Comp> = Vec::new_in(Comp {});
-static var L_VAL: Vec<i64, Comp> = Vec::new_in(Comp {});
-
 // Notes a use or write of local l in block b.
-fn seen_in(l: i64, b: i64) {
-    if L_BLK[l] == -1 {
-        L_BLK[l] = b;
-    } else if L_BLK[l] != b {
-        L_BLK[l] = -2;
+fn seen_in(l: i64, b: i64, pcx: inout Ctx<Comp>) {
+    if pcx.l_blk[l] == -1 {
+        pcx.l_blk[l] = b;
+    } else if pcx.l_blk[l] != b {
+        pcx.l_blk[l] = -2;
     }
 }
 
 // Notes the locals place (l, p) names (its index locals too) in block b.
-fn place_seen(l: i64, p: i64, b: i64, pbody: Body<Comp>) {
-    seen_in(l, b);
+fn place_seen(l: i64, p: i64, b: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    seen_in(l, b, &pcx);
     var q = p;
     while q > 0 {
         if proj_kind(q, pbody) == PJ_INDEX {
-            seen_in(proj_val(q, pbody), b);
+            seen_in(proj_val(q, pbody), b, &pcx);
         }
         q = proj_parent(q, pbody);
     }
@@ -1346,27 +1321,28 @@ fn place_seen(l: i64, p: i64, b: i64, pbody: Body<Comp>) {
 // slicing's base is read); and what keeps the body from being lowered
 // here: 0 nothing, -1 a drop that runs, else a code for the statement
 // (kind * 100 + its subkind).
-fn scan_body(types_only: bool, pbody: Body<Comp>) -> i64 {
+fn scan_body(types_only: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     let n = local_count(pbody);
-    L_TY.clear();
-    L_BLK.clear();
-    L_VAL.clear();
-    L_BORROWED.clear();
+    pcx.l_ty.clear();
+    pcx.l_blk.clear();
+    pcx.l_val.clear();
+    pcx.l_borrowed.clear();
     for l in 0..n {
-        L_TY.push(erase_type(pbody.locals[l].ty));
+        let pcx_arg = erase_type(pbody.locals[l].ty, &pcx);
+        pcx.l_ty.push(pcx_arg);
     }
     if !types_only {
         for l in 0..n {
-            L_BLK.push(if l <= pbody.params { -2 } else { -1 });
-            L_VAL.push(0);
-            L_BORROWED.push(0);
+            pcx.l_blk.push(if l <= pbody.params { -2 } else { -1 });
+            pcx.l_val.push(0);
+            pcx.l_borrowed.push(0);
         }
     }
-    PJ_TY.clear();
-    PJ_ROOT.clear();
+    pcx.pj_ty.clear();
+    pcx.pj_root.clear();
     for _ in 0..pbody.projs.len() as i64 {
-        PJ_TY.push(0);
-        PJ_ROOT.push(-1);
+        pcx.pj_ty.push(0);
+        pcx.pj_root.push(-1);
     }
     for i in 0..pbody.rpo.len() {
         let b = pbody.rpo[i];
@@ -1381,15 +1357,15 @@ fn scan_body(types_only: bool, pbody: Body<Comp>) -> i64 {
                 let e = pbody.stmts[at].e;
                 // (a vector operation the builder made has no node)
                 if (c == RV_BINARY || c == RV_UNARY) && e == 0
-                    && is_vector(op_type(ops, 0, pbody)) {
+                    && is_vector(op_type(ops, 0, pbody, &pcx)) {
                     return k * 100 + c;
                 }
                 if !types_only && (c == RV_REF || c == RV_SLICE) {
                     let l = op_a(ops, 0, pbody);
                     let p = op_b(ops, 0, pbody);
                     if !through_deref(p, pbody)
-                        && (c == RV_REF || TYPES[place_ty(l, p, pbody)].kind != TyKind::Ptr) {
-                        L_BORROWED[l] = 1;
+                        && (c == RV_REF || TYPES[place_ty(l, p, pbody, &pcx)].kind != TyKind::Ptr) {
+                        pcx.l_borrowed[l] = 1;
                     }
                 }
             } else if k == SK_DROP {
@@ -1397,12 +1373,12 @@ fn scan_body(types_only: bool, pbody: Body<Comp>) -> i64 {
                 // shim made for its type, places/shim.vl)
                 if c == DS_KEPT || c == DS_FLAG {
                     let t = crate::places::ir::full_place_type(pbody.stmts[at].a, pbody.stmts[at].b,
-                        pbody);
-                    if drop_shim_fn(t) < 0 && crate::front::own::glue::has_glue(t) {
+                        pbody, pcx);
+                    if drop_shim_fn(t, &pcx) < 0 && crate::front::own::glue::has_glue(t, &pcx) {
                         return -1;
                     }
                     if !types_only && !through_deref(pbody.stmts[at].b, pbody) {
-                        L_BORROWED[pbody.stmts[at].a] = 1;
+                        pcx.l_borrowed[pbody.stmts[at].a] = 1;
                     }
                 } else if c != DS_REMOVED && c != DS_OPEN {
                     return -1;
@@ -1421,12 +1397,12 @@ fn scan_body(types_only: bool, pbody: Body<Comp>) -> i64 {
             }
             if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_DROP
                 || k == SK_MENTION {
-                place_seen(pbody.stmts[at].a, pbody.stmts[at].b, b, pbody);
+                place_seen(pbody.stmts[at].a, pbody.stmts[at].b, b, pbody, &pcx);
             }
             for o in 0..nops {
                 let ok = op_kind(ops, o, pbody);
                 if ok == OK_COPY || ok == OK_MOVE || ok == OK_PLACE {
-                    place_seen(op_a(ops, o, pbody), op_b(ops, o, pbody), b, pbody);
+                    place_seen(op_a(ops, o, pbody), op_b(ops, o, pbody), b, pbody, &pcx);
                 }
             }
         }

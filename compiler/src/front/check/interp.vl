@@ -15,28 +15,30 @@
 // bytes are written with `byte`.
 
 use crate::base::{SRC, SYMS, buf_int, buf_new, buf_slice, buf_str, intern, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_try_fmt,
+    err_begin, err_end, err_end_soft, err_help, err_help_sym, err_str, err_try_fmt,
 };
 use crate::front::ast::{
     CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_EXP, FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_ZERO,
-    NODES, NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push,
+    NODE_IMPLICIT, NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push,
     new_node,
 };
-use crate::front::check::{CONST_CONTEXT, LOCALS, mismatch_error, pop_scope, push_scope, type_error};
+use crate::front::check::{mismatch_error, pop_scope, push_scope, type_error};
 use crate::front::check::format::{
     FMT_ALT, FMT_OCT, FMT_PTR, hole_alias, hole_debug, hole_eval_only, hole_fill,
 };
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::is_borrow;
 use crate::front::lexer::{SUF_I64, SUF_U8, Tok, str_at};
-use crate::front::modules::{CUR_MOD, STD_MODULE, within_std};
+use crate::front::modules::within_std;
 use crate::front::own::drops::NO_DROP;
 use crate::front::patterns::check_pattern;
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
-    FNS, TYPES, TY_ERROR, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8, TY_UNIT, TyKind, buf_type,
-    err_type, is_integer, is_pointer, is_signed, primitive_name,
+    TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8, TY_UNIT, TyKind, buf_type, err_type, is_integer,
+    is_pointer, is_signed, primitive_name,
 };
 
 // Texts up to this long are written byte by byte (Fmt::byte is inlined,
@@ -45,29 +47,29 @@ const SHORT_TEXT: i64 = 2;
 
 // The type of f-string n; `expected` is the type it is checked against
 // (0: synthesized).
-pub fn check_interp(n: i64, expected: i64) -> i64 {
-    crate::front::check::format::note_site(n, crate::front::check::format::SITE_CHECKED);
-    if NODES[n].y == 0 {
-        NODES[n].ty = expand(n);
+pub fn check_interp(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    crate::front::check::format::note_site(n, crate::front::check::format::SITE_CHECKED, &pcx);
+    if pcx.nodes[n].y == 0 {
+        pcx.nodes[n].ty = expand(n, &pcx);
     }
-    let t = NODES[n].ty;
-    if expected == 0 || expected == t || expected == TY_ERROR || t == TY_ERROR {
+    let t = pcx.nodes[n].ty;
+    if expected == 0 || expected == t || expected == pcx.ty_error || t == pcx.ty_error {
         return t;
     }
     if TYPES[expected].kind == TyKind::Slice {
-        err_begin(NODES[n].start);
-        err_str(c"a format_args value is a 'std::Interp' (a value that prints), not '");
-        err_type(expected);
-        err_str(c"'");
-        err_help(c"format it: 'format_in(\"...\", gpa)' makes the text, a String ('.as_str()' views it), or pass the value where a 'T: Display' is taken (print, println, String::push_fmt)");
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"a format_args value is a 'std::Interp' (a value that prints), not '", pcx);
+        err_type(expected, pcx);
+        err_str(c"'", pcx);
+        err_help(c"format it: 'format_in(\"...\", gpa)' makes the text, a String ('.as_str()' views it), or pass the value where a 'T: Display' is taken (print, println, String::push_fmt)", pcx);
         // (0.25.2.1: the call to write)
-        if NODES[n].end > NODES[n].start {
+        if pcx.nodes[n].end > pcx.nodes[n].start {
             err_try_fmt(format_args("format_in({}, gpa).as_slice()",
-                SRC[NODES[n].start..NODES[n].end]));
+                SRC[pcx.nodes[n].start..pcx.nodes[n].end]), pcx);
         }
-        err_end();
+        err_end(&pcx);
     }
-    mismatch_error(n, expected, t)
+    mismatch_error(n, expected, t, &pcx)
 }
 
 fn is_alnum(c: u8) -> bool {
@@ -75,69 +77,69 @@ fn is_alnum(c: u8) -> bool {
 }
 
 // Checks f-string n and makes its block (NODES[n].y); its type.
-fn expand(n: i64) -> i64 {
-    let start = NODES[n].start;
-    let end = NODES[n].end;
-    if CONST_CONTEXT {
+fn expand(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    if pcx.const_context {
         type_error(n,
-            c"a format_args value cannot be used in a constant expression: it is made when it runs");
+            c"a format_args value cannot be used in a constant expression: it is made when it runs", &pcx);
     }
-    if !check_holes(n) {
-        NODES[n].y = new_node(NodeKind::Block, start, end);
-        return TY_ERROR;
+    if !check_holes(n, &pcx) {
+        pcx.nodes[n].y = new_node(NodeKind::Block, start, end, &pcx);
+        return pcx.ty_error;
     }
     let out = intern_c(c"__out");
-    let lets = list_begin();
-    push_hole_lets(n);
-    let block = new_node(NodeKind::Block, start, end);
-    list_end(block, lets);
+    let lets = list_begin(pcx);
+    push_hole_lets(n, &pcx);
+    let block = new_node(NodeKind::Block, start, end, &pcx);
+    list_end(block, lets, &pcx);
     // The closure's body.
-    let stmts = list_begin();
-    push_writes(n, out, false);
-    let body = new_node(NodeKind::Block, start, end);
-    list_end(body, stmts);
+    let stmts = list_begin(pcx);
+    push_writes(n, out, false, &pcx);
+    let body = new_node(NodeKind::Block, start, end, &pcx);
+    list_end(body, stmts, &pcx);
     // move |__out: &mut std::Fmt| body (0.18: Display's `f: &mut Fmt`)
-    let fmt_name = new_node(NodeKind::TyName, start, end);
-    NODES[fmt_name].a = intern_c(c"Fmt");
-    let smark = list_begin();
-    list_push(std_ident(n));
-    list_end(fmt_name, smark);
-    let fmt_ptr = new_node(NodeKind::TyPtr, start, end);
-    NODES[fmt_ptr].a = fmt_name;
-    NODES[fmt_ptr].p |= NODE_REF | NODE_REF_MUT;
-    let param = new_node(NodeKind::Param, start, end);
-    NODES[param].a = out;
-    NODES[param].b = fmt_ptr;
-    let closure = new_node(NodeKind::Closure, start, end);
-    NODES[closure].c = CLOSURE_MOVE | CLOSURE_HOLES;
-    NODES[closure].a = body;
-    let pmark = list_begin();
-    list_push(param);
-    list_end(closure, pmark);
+    let fmt_name = new_node(NodeKind::TyName, start, end, &pcx);
+    pcx.nodes[fmt_name].a = intern_c(c"Fmt");
+    let smark = list_begin(pcx);
+    list_push(std_ident(n, &pcx), &pcx);
+    list_end(fmt_name, smark, &pcx);
+    let fmt_ptr = new_node(NodeKind::TyPtr, start, end, &pcx);
+    pcx.nodes[fmt_ptr].a = fmt_name;
+    pcx.nodes[fmt_ptr].p |= NODE_REF | NODE_REF_MUT;
+    let param = new_node(NodeKind::Param, start, end, &pcx);
+    pcx.nodes[param].a = out;
+    pcx.nodes[param].b = fmt_ptr;
+    let closure = new_node(NodeKind::Closure, start, end, &pcx);
+    pcx.nodes[closure].c = CLOSURE_MOVE | CLOSURE_HOLES;
+    pcx.nodes[closure].a = body;
+    let pmark = list_begin(pcx);
+    list_push(param, &pcx);
+    list_end(closure, pmark, &pcx);
     // std::Interp { f: closure }
-    let lit = new_node(NodeKind::StructLit, start, end);
-    NODES[lit].a = intern_c(c"Interp");
+    let lit = new_node(NodeKind::StructLit, start, end, &pcx);
+    pcx.nodes[lit].a = intern_c(c"Interp");
     // (0.26.0: the compiler's, made wherever the f-string is: its field is std::fmt's)
-    NODES[lit].p |= NODE_IMPLICIT;
-    let prefix = new_node(NodeKind::Path, start, end);
-    let prefix_mark = list_begin();
-    list_push(std_ident(n));
-    list_end(prefix, prefix_mark);
-    NODES[lit].h = prefix;
-    let field = new_node(NodeKind::FieldInit, start, end);
-    NODES[field].a = intern_c(c"f");
-    NODES[field].b = closure;
-    let fmark = list_begin();
-    list_push(field);
-    list_end(lit, fmark);
-    NODES[block].a = lit;
+    pcx.nodes[lit].p |= NODE_IMPLICIT;
+    let prefix = new_node(NodeKind::Path, start, end, &pcx);
+    let prefix_mark = list_begin(pcx);
+    list_push(std_ident(n, &pcx), &pcx);
+    list_end(prefix, prefix_mark, &pcx);
+    pcx.nodes[lit].h = prefix;
+    let field = new_node(NodeKind::FieldInit, start, end, &pcx);
+    pcx.nodes[field].a = intern_c(c"f");
+    pcx.nodes[field].b = closure;
+    let fmark = list_begin(pcx);
+    list_push(field, &pcx);
+    list_end(lit, fmark, &pcx);
+    pcx.nodes[block].a = lit;
     // The `let`s by hand (their values are checked), then the literal.
-    push_scope();
-    bind_lets(block);
-    let t = synth_expr(lit);
-    pop_scope();
-    NODES[block].ty = t;
-    NODES[n].y = block;
+    push_scope(&pcx);
+    bind_lets(block, &pcx);
+    let t = synth_expr(lit, &pcx);
+    pop_scope(&pcx);
+    pcx.nodes[block].ty = t;
+    pcx.nodes[n].y = block;
     t
 }
 
@@ -145,25 +147,27 @@ fn expand(n: i64) -> i64 {
 // failed. (0.26.2, a format literal's) A hole that reads an argument's
 // hole (HOLE_ALIAS) has its type; a width or precision named by an
 // argument or a name (g, h) is an integer.
-fn check_holes(n: i64) -> bool {
+fn check_holes(n: i64, pcx: inout Ctx<Comp>) -> bool {
     var failed = false;
     var k = 0;
-    for i in 0..NODES[n].count {
-        let item = child(n, i);
-        if NODES[item].kind != NodeKind::InterpHole {
+    for i in 0..pcx.nodes[n].count {
+        let item = child(n, i, pcx);
+        if pcx.nodes[item].kind != NodeKind::InterpHole {
             continue;
         }
-        let alias = hole_alias(item);
-        let t = if alias >= 0 { hole_type(n, alias) } else { synth_expr(NODES[item].a) };
+        let alias = hole_alias(item, pcx);
+        let t = if alias >= 0 { hole_type(n, alias, pcx) }
+            else { synth_expr(pcx.nodes[item].a, &pcx) };
         if alias >= 0 {
-            NODES[NODES[item].a].ty = t;
+            pcx.nodes[pcx.nodes[item].a].ty = t;
         }
-        NODES[item].ty = t;
-        if t == TY_ERROR {
+        pcx.nodes[item].ty = t;
+        if t == pcx.ty_error {
             failed = true;
-        } else if !hole_eval_only(item) {
-            check_hole(item, t);
-            failed = failed || !count_ok(n, NODES[item].g) || !count_ok(n, NODES[item].h);
+        } else if !hole_eval_only(item, pcx) {
+            check_hole(item, t, &pcx);
+            failed = failed || !count_ok(n, pcx.nodes[item].g, &pcx)
+                || !count_ok(n, pcx.nodes[item].h, &pcx);
         }
         k += 1;
     }
@@ -171,46 +175,46 @@ fn check_holes(n: i64) -> bool {
 }
 
 // The type of hole k (its index among f-string n's holes), checked.
-fn hole_type(n: i64, k: i64) -> i64 {
+fn hole_type(n: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
     var j = 0;
-    for i in 0..NODES[n].count {
-        let item = child(n, i);
-        if NODES[item].kind == NodeKind::InterpHole {
+    for i in 0..pcx.nodes[n].count {
+        let item = child(n, i, pcx);
+        if pcx.nodes[item].kind == NodeKind::InterpHole {
             if j == k {
-                return NODES[item].ty;
+                return pcx.nodes[item].ty;
             }
             j += 1;
         }
     }
-    TY_ERROR
+    pcx.ty_error
 }
 
 // Width or precision c of a hole of n (an Ident, 0: none) is an integer:
 // a name in scope, or (`=fK`) argument hole K's.
-fn count_ok(n: i64, c: i64) -> bool {
+fn count_ok(n: i64, c: i64, pcx: inout Ctx<Comp>) -> bool {
     if c == 0 {
         return true;
     }
-    let text = SYMS[NODES[c].a].text;
-    var t = TY_ERROR;
+    let text = SYMS[pcx.nodes[c].a].text;
+    var t = pcx.ty_error;
     if text.len > 2 && text[0] == '=' && text[1] == 'f' {
         var k = 0;
         for q in 2..text.len {
             k = k * 10 + (text[q] - '0') as i64;
         }
-        t = hole_type(n, k);
+        t = hole_type(n, k, pcx);
     } else {
-        t = synth_expr(c);
+        t = synth_expr(c, &pcx);
     }
-    if t == TY_ERROR {
+    if t == pcx.ty_error {
         return false;
     }
     if !is_integer(t) {
-        err_begin(NODES[c].start);
-        err_str(c"a format width or precision is an integer, got '");
-        err_type(t);
-        err_str(c"'");
-        err_end_soft();
+        err_begin(pcx.nodes[c].start, &pcx);
+        err_str(c"a format width or precision is an integer, got '", pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        err_end_soft(&pcx);
         return false;
     }
     true
@@ -218,13 +222,14 @@ fn count_ok(n: i64, c: i64) -> bool {
 
 // `let __fN = eN;` for each hole of f-string n, into the list being made
 // (0.26.2: not for a hole that reads another's).
-fn push_hole_lets(n: i64) {
+fn push_hole_lets(n: i64, pcx: inout Ctx<Comp>) {
     var holes = 0;
-    for i in 0..NODES[n].count {
-        let item = child(n, i);
-        if NODES[item].kind == NodeKind::InterpHole {
-            if hole_alias(item) < 0 {
-                list_push(let_node(hidden(c"=f", holes), NODES[item].a, item, false));
+    for i in 0..pcx.nodes[n].count {
+        let item = child(n, i, pcx);
+        if pcx.nodes[item].kind == NodeKind::InterpHole {
+            if hole_alias(item, pcx) < 0 {
+                list_push(let_node(hidden(c"=f", holes), pcx.nodes[item].a, item, false, &pcx),
+                    &pcx);
             }
             holes += 1;
         }
@@ -232,29 +237,29 @@ fn push_hole_lets(n: i64) {
 }
 
 // `let [mut] name = value;`, at node at.
-fn let_node(name: i64, value: i64, at: i64, mutable: bool) -> i64 {
-    let bind = new_node(NodeKind::PatBind, NODES[at].start, NODES[at].end);
-    NODES[bind].a = name;
-    NODES[bind].b = if mutable { 1 } else { 0 };
-    let binding = new_node(NodeKind::Let, NODES[at].start, NODES[at].end);
-    NODES[binding].a = bind;
-    NODES[binding].c = value;
+fn let_node(name: i64, value: i64, at: i64, mutable: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let bind = new_node(NodeKind::PatBind, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[bind].a = name;
+    pcx.nodes[bind].b = if mutable { 1 } else { 0 };
+    let binding = new_node(NodeKind::Let, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[binding].a = bind;
+    pcx.nodes[binding].c = value;
     binding
 }
 
 // The `let`s of block b, whose values are checked, bound by hand (in the
 // scope the caller opens).
-fn bind_lets(b: i64) {
+fn bind_lets(b: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..NODES[b].count {
-            let binding = child(b, i);
-            let bind = NODES[binding].a;
-            let value = NODES[binding].c;
-            let t = NODES[value].ty;
-            check_pattern(bind, t);
+        for i in 0..pcx.nodes[b].count {
+            let binding = child(b, i, pcx);
+            let bind = pcx.nodes[binding].a;
+            let value = pcx.nodes[binding].c;
+            let t = pcx.nodes[value].ty;
+            check_pattern(bind, t, &pcx);
             // (`{self}`, `{&p}`: a borrow, as passed directly)
-            if is_pointer(t) && is_borrow(value) {
-                LOCALS[NODES[bind].x].borrow = true;
+            if is_pointer(t) && is_borrow(value, pcx) {
+                pcx.locals[pcx.nodes[bind].x].borrow = true;
             }
         }
     }
@@ -266,107 +271,116 @@ fn bind_lets(b: i64) {
 // that reads another's writes that one's value; an argument only
 // evaluated writes nothing; a width or precision may be a value, a fill
 // byte is in spec's flags, from bit 16: std/fmt.vl's FMT_FILL_SHIFT.)
-fn push_writes(n: i64, out: i64, direct: bool) {
+fn push_writes(n: i64, out: i64, direct: bool, pcx: inout Ctx<Comp>) {
     var holes = 0;
-    for i in 0..NODES[n].count {
-        let item = child(n, i);
-        if NODES[item].kind == NodeKind::Str {
+    for i in 0..pcx.nodes[n].count {
+        let item = child(n, i, pcx);
+        if pcx.nodes[item].kind == NodeKind::Str {
             // (a short text: its bytes, `__out.byte(b'a')`, inlined)
-            let text = str_at(NODES[item].a);
+            let text = str_at(pcx.nodes[item].a);
             if text.len as i64 <= SHORT_TEXT {
                 for k in 0..text.len {
-                    let c = new_node(NodeKind::Char, NODES[item].start, NODES[item].end);
-                    NODES[c].a = text[k] as i64;
-                    list_push(stmt(call1(ident(out, item), c"byte", c)));
+                    let c = new_node(NodeKind::Char, pcx.nodes[item].start, pcx.nodes[item].end,
+                        &pcx);
+                    pcx.nodes[c].a = text[k] as i64;
+                    list_push(stmt(call1(ident(out, item, &pcx), c"byte", c, &pcx), &pcx), &pcx);
                 }
             } else {
-                list_push(stmt(call1(ident(out, item), c"str", item)));
+                list_push(stmt(call1(ident(out, item, &pcx), c"str", item, &pcx), &pcx), &pcx);
             }
             continue;
         }
-        if hole_eval_only(item) {
+        if hole_eval_only(item, pcx) {
             holes += 1;
             continue;
         }
-        let alias = hole_alias(item);
+        let alias = hole_alias(item, pcx);
         let name = hidden(c"=f", if alias >= 0 { alias } else { holes });
-        let debug = hole_debug(item);
-        var flags = NODES[item].p;
-        let ty = NODES[item].ty;
+        let debug = hole_debug(item, pcx);
+        var flags = pcx.nodes[item].p;
+        let ty = pcx.nodes[item].ty;
         // (`__out.display(&__f0)`; through a pointer, `__f0.fmt(__out)`:
         // a pointer value is passed as a receiver)
         var write = 0;
         if (flags & FMT_PTR) != 0 {
             // (0.26.2) `{:p}`: the address, `0x..`
             flags = (flags & ~FMT_PTR) | FMT_HEX | FMT_ALT;
-            write = call1(ident(out, item), c"uint", cast_to(ident(name, item), TY_U64, item));
+            write = call1(ident(out, item, &pcx), c"uint",
+                cast_to(ident(name, item, &pcx), TY_U64, item, &pcx), &pcx);
         } else if (flags & FMT_EXP) != 0 && is_integer(ty) {
             // (0.26.2) `{:e}` of an integer: as the f64 of its value
-            write = call1(ident(out, item), c"display", cast_to(ident(name, item), TY_F64, item));
-        } else if debug && debug_slice(ty) {
-            write = call1(ident(out, item), c"debug_slice", ident(name, item));
-        } else if takes_pointer(item) {
-            let to = if direct { amp_mut(ident(out, item)) } else { ident(out, item) };
-            write = call1(ident(name, item), if debug { c"fmt_debug" } else { c"fmt" }, to);
+            write = call1(ident(out, item, &pcx), c"display",
+                cast_to(ident(name, item, &pcx), TY_F64, item, &pcx), &pcx);
+        } else if debug && debug_slice(ty, &pcx) {
+            write = call1(ident(out, item, &pcx), c"debug_slice", ident(name, item, &pcx), &pcx);
+        } else if takes_pointer(item, &pcx) {
+            let to = if direct { amp_mut(ident(out, item, &pcx), &pcx) }
+                else { ident(out, item, &pcx) };
+            write = call1(ident(name, item, &pcx), if debug { c"fmt_debug" } else { c"fmt" }, to,
+                &pcx);
         } else {
-            write = call1(ident(out, item), if debug { c"debug" } else { c"display" },
-                unary(Tok::Amp, ident(name, item)));
+            write = call1(ident(out, item, &pcx), if debug { c"debug" } else { c"display" },
+                unary(Tok::Amp, ident(name, item, &pcx), &pcx), &pcx);
         }
-        let fill = hole_fill(item);
-        let wv = NODES[item].g;
-        let pv = NODES[item].h;
-        let spec = NODES[item].c > 0 || NODES[item].d >= 0 || flags != 0 || fill != 0 || wv != 0
-            || pv != 0;
+        let fill = hole_fill(item, pcx);
+        let wv = pcx.nodes[item].g;
+        let pv = pcx.nodes[item].h;
+        let spec = pcx.nodes[item].c > 0 || pcx.nodes[item].d >= 0 || flags != 0 || fill != 0
+            || wv != 0 || pv != 0;
         if spec && is_integer(ty) && (flags & ~(FMT_LEFT | FMT_RIGHT | FMT_ZERO)) == 0 && fill == 0
-            && wv == 0 && (NODES[item].p & FMT_PTR) == 0 {
+            && wv == 0 && (pcx.nodes[item].p & FMT_PTR) == 0 {
             // (0.16) A decimal integer with a spec: `__out.int_hole(__fN as
             // i64, w, flags)` (`uint_hole`, `as u64`), what spec, display
             // and end_spec write, in one pass (std's Display of an integer
             // writes only its digits)
             let signed = is_signed(ty);
-            let hole = method_call(ident(out, item),
-                if signed { c"int_hole" } else { c"uint_hole" });
-            let amark = list_begin();
-            list_push(cast_to(ident(name, item), if signed { TY_I64 } else { TY_U64 }, item));
-            list_push(int_node(if NODES[item].c > 0 { NODES[item].c } else { 0 }, item));
-            list_push(int_node(flags, item));
-            list_end(hole, amark);
-            list_push(stmt(hole));
+            let hole = method_call(ident(out, item, &pcx),
+                if signed { c"int_hole" } else { c"uint_hole" }, &pcx);
+            let amark = list_begin(pcx);
+            list_push(cast_to(ident(name, item, &pcx), if signed { TY_I64 } else { TY_U64 }, item,
+                &pcx), &pcx);
+            list_push(int_node(if pcx.nodes[item].c > 0 { pcx.nodes[item].c } else { 0 }, item,
+                &pcx), &pcx);
+            list_push(int_node(flags, item, &pcx), &pcx);
+            list_end(hole, amark, &pcx);
+            list_push(stmt(hole, &pcx), &pcx);
         } else if spec {
             // let __sN = __out.spec(w, p, flags); write; __out.end_spec(__sN);
             let saved = hidden(c"__s", holes);
-            let spec = method_call(ident(out, item), c"spec");
-            let amark = list_begin();
+            let spec = method_call(ident(out, item, &pcx), c"spec", &pcx);
+            let amark = list_begin(pcx);
             if wv != 0 {
-                list_push(cast_to(ident(NODES[wv].a, wv), TY_I64, wv));
+                list_push(cast_to(ident(pcx.nodes[wv].a, wv, &pcx), TY_I64, wv, &pcx), &pcx);
             } else {
-                list_push(int_node(if NODES[item].c > 0 { NODES[item].c } else { 0 }, item));
+                list_push(int_node(if pcx.nodes[item].c > 0 { pcx.nodes[item].c } else { 0 }, item,
+                    &pcx), &pcx);
             }
             if pv != 0 {
-                list_push(cast_to(ident(NODES[pv].a, pv), TY_I64, pv));
+                list_push(cast_to(ident(pcx.nodes[pv].a, pv, &pcx), TY_I64, pv, &pcx), &pcx);
             } else {
-                list_push(int_node(NODES[item].d, item));
+                list_push(int_node(pcx.nodes[item].d, item, &pcx), &pcx);
             }
-            list_push(int_node(flags | fill << 16, item));
-            list_end(spec, amark);
-            list_push(let_node(saved, spec, item, false));
-            list_push(stmt(write));
-            list_push(stmt(call1(ident(out, item), c"end_spec", ident(saved, item))));
+            list_push(int_node(flags | fill << 16, item, &pcx), &pcx);
+            list_end(spec, amark, &pcx);
+            list_push(let_node(saved, spec, item, false, &pcx), &pcx);
+            list_push(stmt(write, &pcx), &pcx);
+            list_push(stmt(call1(ident(out, item, &pcx), c"end_spec", ident(saved, item, &pcx),
+                &pcx), &pcx), &pcx);
         } else {
-            list_push(stmt(write));
+            list_push(stmt(write, &pcx), &pcx);
         }
         holes += 1;
     }
 }
 
 // `e as T`, T a primitive type, at node at.
-fn cast_to(e: i64, t: i64, at: i64) -> i64 {
-    let cast = new_node(NodeKind::Cast, NODES[at].start, NODES[at].end);
-    let tname = new_node(NodeKind::TyName, NODES[at].start, NODES[at].end);
-    NODES[tname].a = intern_c(primitive_name(t));
-    NODES[tname].ty = t;
-    NODES[cast].a = e;
-    NODES[cast].b = tname;
+fn cast_to(e: i64, t: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let cast = new_node(NodeKind::Cast, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    let tname = new_node(NodeKind::TyName, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[tname].a = intern_c(primitive_name(t));
+    pcx.nodes[tname].ty = t;
+    pcx.nodes[cast].a = e;
+    pcx.nodes[cast].b = tname;
     cast
 }
 
@@ -385,21 +399,21 @@ const D_PUSH_FMT: i64 = 6;
 // std's print, println, eprint, eprintln, format_in or (a method)
 // Buf::push_fmt with an f-string as its Display argument, outside std:
 // which one (D_*), else 0.
-pub fn direct_kind(n: i64, f: i64, method: bool) -> i64 {
+pub fn direct_kind(n: i64, f: i64, method: bool, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if STD_MODULE < 0 || !within_std(FNS[f].module) || within_std(CUR_MOD)
-            || CONST_CONTEXT
-            || NODES[n].count == 0 {
+        if pcx.std_module < 0 || !within_std(pcx.fns[f].module, pcx) || within_std(pcx.cur_mod, pcx)
+            || pcx.const_context
+            || pcx.nodes[n].count == 0 {
             return 0;
         }
-        let fs = child(n, 0);
-        if NODES[fs].kind != NodeKind::Interp || NODES[fs].y != 0 {
+        let fs = child(n, 0, pcx);
+        if pcx.nodes[fs].kind != NodeKind::Interp || pcx.nodes[fs].y != 0 {
             return 0;
         }
-        let name = SYMS[NODES[FNS[f].node].a].text;
+        let name = SYMS[pcx.nodes[pcx.fns[f].node].a].text;
         let k = if method {
             // (0.20: Buf's; String's is an ordinary call)
-            if name == "push_fmt" && SYMS[NODES[FNS[f].node].d].text == "Buf" { D_PUSH_FMT }
+            if name == "push_fmt" && SYMS[pcx.nodes[pcx.fns[f].node].d].text == "Buf" { D_PUSH_FMT }
             else { 0 }
         } else if name == "print" {
             D_PRINT
@@ -415,8 +429,8 @@ pub fn direct_kind(n: i64, f: i64, method: bool) -> i64 {
             0
         };
         let count = if k == D_FORMAT_IN { 2 } else { 1 };
-        if k == 0 || NODES[n].count != count
-            || NODES[child(n, count - 1)].kind == NodeKind::NamedArg {
+        if k == 0 || pcx.nodes[n].count != count
+            || pcx.nodes[child(n, count - 1, pcx)].kind == NodeKind::NamedArg {
             return 0;
         }
         k
@@ -437,81 +451,81 @@ pub fn direct_kind(n: i64, f: i64, method: bool) -> i64 {
 // shows its type as an Interp's); n's x is f + 1 (effects: what the
 // writes do is the call's, `println(f"..")` calls 'std::println'). The
 // call's type.
-pub fn direct_call(n: i64, f: i64, k: i64, recv: i64) -> i64 {
+pub fn direct_call(n: i64, f: i64, k: i64, recv: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let start = NODES[n].start;
-        let end = NODES[n].end;
-        let fs = child(n, 0);
-        let orig = new_node(NodeKind::Call, start, end);
-        NODES[orig].a = if recv == 0 { NODES[n].a } else { 0 };
-        NODES[orig].x = f + 1;
-        let omark = list_begin();
+        let start = pcx.nodes[n].start;
+        let end = pcx.nodes[n].end;
+        let fs = child(n, 0, pcx);
+        let orig = new_node(NodeKind::Call, start, end, &pcx);
+        pcx.nodes[orig].a = if recv == 0 { pcx.nodes[n].a } else { 0 };
+        pcx.nodes[orig].x = f + 1;
+        let omark = list_begin(pcx);
         if recv != 0 {
-            list_push(recv);
+            list_push(recv, &pcx);
         }
-        for i in 0..NODES[n].count {
-            list_push(child(n, i));
+        for i in 0..pcx.nodes[n].count {
+            list_push(child(n, i, pcx), &pcx);
         }
-        list_end(orig, omark);
-        var ok = check_holes(fs);
+        list_end(orig, omark, &pcx);
+        var ok = check_holes(fs, &pcx);
         var alloc = 0;
         if k == D_FORMAT_IN {
-            alloc = child(n, 1);
-            let t = synth_expr(alloc);
-            ok = ok && t != TY_ERROR && allocator_ok(t, f, start);
+            alloc = child(n, 1, pcx);
+            let t = synth_expr(alloc, &pcx);
+            ok = ok && t != pcx.ty_error && allocator_ok(t, f, start, &pcx);
         }
-        NODES[fs].y = -1;
-        NODES[fs].ty = TY_UNIT;
-        let block = new_node(NodeKind::Block, start, end);
-        var t = TY_ERROR;
+        pcx.nodes[fs].y = -1;
+        pcx.nodes[fs].ty = TY_UNIT;
+        let block = new_node(NodeKind::Block, start, end, &pcx);
+        var t = pcx.ty_error;
         if ok {
-            let lets = list_begin();
+            let lets = list_begin(pcx);
             if recv != 0 {
-                list_push(let_node(intern_c(c"__r"), recv, n, false));
+                list_push(let_node(intern_c(c"__r"), recv, n, false, &pcx), &pcx);
             }
-            push_hole_lets(fs);
+            push_hole_lets(fs, &pcx);
             if alloc != 0 {
-                list_push(let_node(intern_c(c"__a"), alloc, n, false));
+                list_push(let_node(intern_c(c"__a"), alloc, n, false, &pcx), &pcx);
             }
-            list_end(block, lets);
-            let body = direct_body(fs, k, n);
-            NODES[block].a = body;
-            push_scope();
-            bind_lets(block);
+            list_end(block, lets, &pcx);
+            let body = direct_body(fs, k, n, &pcx);
+            pcx.nodes[block].a = body;
+            push_scope(&pcx);
+            bind_lets(block, &pcx);
             if recv != 0 {
                 // (its safety is the call's, checked)
-                LOCALS[NODES[NODES[child(block, 0)].a].x].borrow = true;
+                pcx.locals[pcx.nodes[pcx.nodes[child(block, 0, pcx)].a].x].borrow = true;
             }
-            t = synth_expr(body);
-            pop_scope();
+            t = synth_expr(body, &pcx);
+            pop_scope(&pcx);
         }
-        NODES[block].ty = t;
-        NODES[orig].ty = t;
-        let lowered = new_node(NodeKind::Interp, start, end);
-        NODES[n] = NODES[lowered];
-        NODES[n].x = f + 1;
-        NODES[n].y = block;
-        NODES[n].ty = t;
+        pcx.nodes[block].ty = t;
+        pcx.nodes[orig].ty = t;
+        let lowered = new_node(NodeKind::Interp, start, end, &pcx);
+        pcx.nodes[n] = pcx.nodes[lowered];
+        pcx.nodes[n].x = f + 1;
+        pcx.nodes[n].y = block;
+        pcx.nodes[n].ty = t;
         t
     }
 }
 
 // (0.17) Whether t, format_in's allocator, is an Allocator; else the error
 // instantiating f (format_in) gives.
-fn allocator_ok(t: i64, f: i64, pos: i64) -> bool {
+fn allocator_ok(t: i64, f: i64, pos: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let tr = std_trait(c"Allocator");
-        if tr < 0 || implements(tr, t) {
+        let tr = std_trait(c"Allocator", &pcx);
+        if tr < 0 || implements(tr, t, &pcx) {
             return true;
         }
-        err_begin(pos);
-        err_str(c"the trait 'Allocator' is not implemented for '");
-        err_type(t);
-        err_str(c"'");
-        err_help(c"required by the bound 'A: Allocator' of '");
-        err_help_sym(FNS[f].display);
-        err_help(c"'");
-        err_end();
+        err_begin(pos, &pcx);
+        err_str(c"the trait 'Allocator' is not implemented for '", pcx);
+        err_type(t, pcx);
+        err_str(c"'", pcx);
+        err_help(c"required by the bound 'A: Allocator' of '", pcx);
+        err_help_sym(pcx.fns[f].display, pcx);
+        err_help(c"'", pcx);
+        err_end(&pcx);
         false
     }
 }
@@ -533,234 +547,237 @@ fn allocator_ok(t: i64, f: i64, pos: i64) -> bool {
 //   (0.26.3: a String, as std's format_in makes; a Buf before)
 //
 // (WRITES: push_writes; std's helpers: compiler/std/fmt.vl.)
-fn direct_body(fs: i64, k: i64, n: i64) -> i64 {
+fn direct_body(fs: i64, k: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let out = intern_c(c"__out");
     let none = 0 as *u8;
-    let stmts = list_begin();
+    let stmts = list_begin(pcx);
     var tail = 0;
     if k == D_FORMAT_IN {
         let b = intern_c(c"__b");
         let t = intern_c(c"__t");
-        let new_in = string_new_in(ident(intern_c(c"__a"), n), n);
+        let new_in = string_new_in(ident(intern_c(c"__a"), n, &pcx), n, &pcx);
         // (0.17: no drop: the block's value, moved out by its tail; the
         // own walk sees the holes as borrows, not this move)
-        let lb = let_node(b, new_in, n, true);
-        NODES[lb].p |= NO_DROP;
-        list_push(lb);
-        let zero = new_node(NodeKind::Int, NODES[n].start, NODES[n].end);
-        NODES[zero].b = SUF_U8;
-        let tmp = new_node(NodeKind::Repeat, NODES[n].start, NODES[n].end);
-        NODES[tmp].a = zero;
-        NODES[tmp].b = int_node(256, n);
-        list_push(let_node(t, tmp, n, true));
-        let fmt = std_call(none, c"__fmt_tmp", amp_mut(ident(t, n)), 0, 0, n);
-        list_push(let_node(out, fmt, n, true));
-        let end = std_call(none, c"__fmt_str_end", amp_mut(ident(b, n)),
-            amp_mut(ident(out, n)), 0, n);
-        list_push(stmt(retry_loop(fs, out, end, n)));
-        tail = ident(b, n);
+        let lb = let_node(b, new_in, n, true, &pcx);
+        pcx.nodes[lb].p |= NO_DROP;
+        list_push(lb, &pcx);
+        let zero = new_node(NodeKind::Int, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[zero].b = SUF_U8;
+        let tmp = new_node(NodeKind::Repeat, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[tmp].a = zero;
+        pcx.nodes[tmp].b = int_node(256, n, &pcx);
+        list_push(let_node(t, tmp, n, true, &pcx), &pcx);
+        let fmt = std_call(none, c"__fmt_tmp", amp_mut(ident(t, n, &pcx), &pcx), 0, 0, n, &pcx);
+        list_push(let_node(out, fmt, n, true, &pcx), &pcx);
+        let end = std_call(none, c"__fmt_str_end", amp_mut(ident(b, n, &pcx), &pcx),
+            amp_mut(ident(out, n, &pcx), &pcx), 0, n, &pcx);
+        list_push(stmt(retry_loop(fs, out, end, n, &pcx), &pcx), &pcx);
+        tail = ident(b, n, &pcx);
     } else if k == D_PUSH_FMT {
         let r = intern_c(c"__r");
         // (`&mut *__r`: the receiver, `&b` or a pointer, as std's `&mut Buf`)
-        let buf = amp_mut(unary(Tok::Star, ident(r, n)));
-        list_push(let_node(out, std_call(none, c"__buf_fmt", buf, 0, 0, n), n, true));
-        let end = std_call(none, c"__buf_fmt_end", amp_mut(unary(Tok::Star, ident(r, n))),
-            amp_mut(ident(out, n)), 0, n);
-        list_push(stmt(retry_loop(fs, out, end, n)));
+        let buf = amp_mut(unary(Tok::Star, ident(r, n, &pcx), &pcx), &pcx);
+        list_push(let_node(out, std_call(none, c"__buf_fmt", buf, 0, 0, n, &pcx), n, true, &pcx),
+            &pcx);
+        let end = std_call(none, c"__buf_fmt_end",
+            amp_mut(unary(Tok::Star, ident(r, n, &pcx), &pcx), &pcx),
+            amp_mut(ident(out, n, &pcx), &pcx), 0, n, &pcx);
+        list_push(stmt(retry_loop(fs, out, end, n, &pcx), &pcx), &pcx);
     } else {
-        let fd = new_node(NodeKind::Int, NODES[n].start, NODES[n].end);
-        NODES[fd].a = if k == D_EPRINT || k == D_EPRINTLN { 2 } else { 1 };
+        let fd = new_node(NodeKind::Int, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[fd].a = if k == D_EPRINT || k == D_EPRINTLN { 2 } else { 1 };
         // (0.21: __print_begin holds std's print lock once threads run)
-        list_push(let_node(out, std_call(none, c"__print_begin", fd, 0, 0, n), n, true));
-        push_writes(fs, out, true);
+        list_push(let_node(out, std_call(none, c"__print_begin", fd, 0, 0, n, &pcx), n, true, &pcx),
+            &pcx);
+        push_writes(fs, out, true, &pcx);
         if k == D_PRINTLN || k == D_EPRINTLN {
-            let c = new_node(NodeKind::Char, NODES[n].start, NODES[n].end);
-            NODES[c].a = '\n' as i64;
-            list_push(stmt(call1(ident(out, n), c"byte", c)));
+            let c = new_node(NodeKind::Char, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+            pcx.nodes[c].a = '\n' as i64;
+            list_push(stmt(call1(ident(out, n, &pcx), c"byte", c, &pcx), &pcx), &pcx);
         }
-        let end = std_call(none, c"__print_end", amp_mut(ident(out, n)), 0, 0, n);
-        list_push(stmt(end));
+        let end = std_call(none, c"__print_end", amp_mut(ident(out, n, &pcx), &pcx), 0, 0, n, &pcx);
+        list_push(stmt(end, &pcx), &pcx);
     }
-    let body = new_node(NodeKind::Block, NODES[n].start, NODES[n].end);
-    list_end(body, stmts);
-    NODES[body].a = tail;
+    let body = new_node(NodeKind::Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    list_end(body, stmts, &pcx);
+    pcx.nodes[body].a = tail;
     body
 }
 
 // `loop { WRITES; if done { break; } }`: f-string fs written to `out`
 // until `done` (a call) says the text is all there.
-fn retry_loop(fs: i64, out: i64, done: i64, n: i64) -> i64 {
-    let start = NODES[n].start;
-    let end = NODES[n].end;
-    let stmts = list_begin();
-    push_writes(fs, out, true);
-    let then = new_node(NodeKind::Block, start, end);
-    let tmark = list_begin();
-    list_push(stmt(new_node(NodeKind::Break, start, end)));
-    list_end(then, tmark);
-    let test = new_node(NodeKind::If, start, end);
-    NODES[test].a = done;
-    NODES[test].b = then;
-    list_push(stmt(test));
-    let body = new_node(NodeKind::Block, start, end);
-    list_end(body, stmts);
-    let repeat = new_node(NodeKind::Loop, start, end);
-    NODES[repeat].b = body;
+fn retry_loop(fs: i64, out: i64, done: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let stmts = list_begin(pcx);
+    push_writes(fs, out, true, &pcx);
+    let then = new_node(NodeKind::Block, start, end, &pcx);
+    let tmark = list_begin(pcx);
+    list_push(stmt(new_node(NodeKind::Break, start, end, &pcx), &pcx), &pcx);
+    list_end(then, tmark, &pcx);
+    let test = new_node(NodeKind::If, start, end, &pcx);
+    pcx.nodes[test].a = done;
+    pcx.nodes[test].b = then;
+    list_push(stmt(test, &pcx), &pcx);
+    let body = new_node(NodeKind::Block, start, end, &pcx);
+    list_end(body, stmts, &pcx);
+    let repeat = new_node(NodeKind::Loop, start, end, &pcx);
+    pcx.nodes[repeat].b = body;
     repeat
 }
 
 // `std::T::name(a0, a1, a2)` (T: none, `std::name(..)`; an argument 0:
 // none, the rest too), at node at. (A path of three segments has them
 // all in its list: front/parser/exprs.vl.)
-fn std_call(t: *u8, name: *u8, a0: i64, a1: i64, a2: i64, at: i64) -> i64 {
-    let path = new_node(NodeKind::Path, NODES[at].start, NODES[at].end);
-    NODES[path].b = intern_c(name);
+fn std_call(t: *u8, name: *u8, a0: i64, a1: i64, a2: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let path = new_node(NodeKind::Path, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[path].b = intern_c(name);
     if t == 0 as *u8 {
-        NODES[path].a = intern_c(c"std");
+        pcx.nodes[path].a = intern_c(c"std");
     } else {
-        NODES[path].a = intern_c(t);
-        let pmark = list_begin();
-        list_push(std_ident(at));
-        list_push(ident(NODES[path].a, at));
-        list_push(ident(NODES[path].b, at));
-        list_end(path, pmark);
+        pcx.nodes[path].a = intern_c(t);
+        let pmark = list_begin(pcx);
+        list_push(std_ident(at, &pcx), &pcx);
+        list_push(ident(pcx.nodes[path].a, at, &pcx), &pcx);
+        list_push(ident(pcx.nodes[path].b, at, &pcx), &pcx);
+        list_end(path, pmark, &pcx);
     }
-    let call = new_node(NodeKind::Call, NODES[at].start, NODES[at].end);
-    NODES[call].a = path;
-    let amark = list_begin();
+    let call = new_node(NodeKind::Call, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[call].a = path;
+    let amark = list_begin(pcx);
     if a0 != 0 {
-        list_push(a0);
+        list_push(a0, &pcx);
         if a1 != 0 {
-            list_push(a1);
+            list_push(a1, &pcx);
             if a2 != 0 {
-                list_push(a2);
+                list_push(a2, &pcx);
             }
         }
     }
-    list_end(call, amark);
+    list_end(call, amark, &pcx);
     call
 }
 
 // (0.26.3) `std::string::String::new_in(a0)`, at node at: format_in's
 // String (std's root does not re-export String; the prelude names it).
-fn string_new_in(a0: i64, at: i64) -> i64 {
-    let path = new_node(NodeKind::Path, NODES[at].start, NODES[at].end);
-    NODES[path].a = intern_c(c"String");
-    NODES[path].b = intern_c(c"new_in");
-    let pmark = list_begin();
-    list_push(std_ident(at));
-    list_push(ident(intern_c(c"string"), at));
-    list_push(ident(NODES[path].a, at));
-    list_push(ident(NODES[path].b, at));
-    list_end(path, pmark);
-    let call = new_node(NodeKind::Call, NODES[at].start, NODES[at].end);
-    NODES[call].a = path;
-    let amark = list_begin();
-    list_push(a0);
-    list_end(call, amark);
+fn string_new_in(a0: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let path = new_node(NodeKind::Path, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[path].a = intern_c(c"String");
+    pcx.nodes[path].b = intern_c(c"new_in");
+    let pmark = list_begin(pcx);
+    list_push(std_ident(at, &pcx), &pcx);
+    list_push(ident(intern_c(c"string"), at, &pcx), &pcx);
+    list_push(ident(pcx.nodes[path].a, at, &pcx), &pcx);
+    list_push(ident(pcx.nodes[path].b, at, &pcx), &pcx);
+    list_end(path, pmark, &pcx);
+    let call = new_node(NodeKind::Call, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[call].a = path;
+    let amark = list_begin(pcx);
+    list_push(a0, &pcx);
+    list_end(call, amark, &pcx);
     call
 }
 
 // Hole h, of type t (not the error type): the trait its spec needs, and
 // the integer its `x`, `X`, `b`, `c` need (`e`, `E`: the float). (0.26.2:
 // `o` an integer, `e` an integer too, `p` a pointer, `x?` any Debug.)
-fn check_hole(h: i64, t: i64) {
-    let debug = hole_debug(h);
-    let flags = NODES[h].p;
+fn check_hole(h: i64, t: i64, pcx: inout Ctx<Comp>) {
+    let debug = hole_debug(h, pcx);
+    let flags = pcx.nodes[h].p;
     if (flags & FMT_PTR) != 0 {
         if !is_pointer(t) {
-            spec_error(h, t, c"'p' writes an address: it needs a pointer, got '");
+            spec_error(h, t, c"'p' writes an address: it needs a pointer, got '", &pcx);
         }
         return;
     }
-    let tr = std_trait(if debug { c"Debug" } else { c"Display" });
+    let tr = std_trait(if debug { c"Debug" } else { c"Display" }, &pcx);
     if tr < 0 {
         return;
     }
-    let shown = if takes_pointer(h) { TYPES[t].a } else { t };
-    if !implements(tr, shown) && !(debug && debug_slice(shown)) {
-        missing_trait(h, shown, debug);
+    let shown = if takes_pointer(h, &pcx) { TYPES[t].a } else { t };
+    if !implements(tr, shown, &pcx) && !(debug && debug_slice(shown, &pcx)) {
+        missing_trait(h, shown, debug, &pcx);
     }
     if (flags & FMT_CHAR) != 0 && shown != TY_U8 {
-        spec_error(h, shown, c"'c' writes a byte: it needs a 'u8', got '");
+        spec_error(h, shown, c"'c' writes a byte: it needs a 'u8', got '", &pcx);
     }
     if (flags & (FMT_HEX | FMT_BIN | FMT_OCT)) != 0 && !debug && !is_integer(shown) {
         spec_error(h, shown,
-            c"'x', 'X', 'o' and 'b' write an integer's digits: they need an integer, got '");
+            c"'x', 'X', 'o' and 'b' write an integer's digits: they need an integer, got '", &pcx);
     }
     if (flags & FMT_EXP) != 0 && shown != TY_F64 && shown != TY_F32 && !is_integer(shown) {
         spec_error(h, shown,
-            c"'e' and 'E' write a number with an exponent: they need an integer or a float, got '");
+            c"'e' and 'E' write a number with an exponent: they need an integer or a float, got '", &pcx);
     }
 }
 
 // Whether hole h (checked) is written through its value: a pointer to a
 // type with the trait, the pointer type having none.
-fn takes_pointer(h: i64) -> bool {
-    let t = NODES[h].ty;
-    if !is_pointer(t) || TYPES[t].a == 0 || (NODES[h].p & FMT_PTR) != 0 {
+fn takes_pointer(h: i64, pcx: inout Ctx<Comp>) -> bool {
+    let t = pcx.nodes[h].ty;
+    if !is_pointer(t) || TYPES[t].a == 0 || (pcx.nodes[h].p & FMT_PTR) != 0 {
         return false;
     }
-    let tr = std_trait(if hole_debug(h) { c"Debug" } else { c"Display" });
-    tr >= 0 && !implements(tr, t) && implements(tr, TYPES[t].a)
+    let tr = std_trait(if hole_debug(h, pcx) { c"Debug" } else { c"Display" }, &pcx);
+    tr >= 0 && !implements(tr, t, &pcx) && implements(tr, TYPES[t].a, &pcx)
 }
 
 // (0.25.3, eval 0.25.2.2) Whether `{x:?}` of a value of type t writes it
 // with Fmt::debug_slice: a slice whose elements have Debug (`[1, 2, 3]`,
 // as a Vec's), the slice having none of its own (`[u8]` has, quoted).
-fn debug_slice(t: i64) -> bool {
+fn debug_slice(t: i64, pcx: inout Ctx<Comp>) -> bool {
     let info = TYPES[t];
     if info.kind != TyKind::Slice {
         return false;
     }
-    let tr = std_trait(c"Debug");
-    tr >= 0 && !implements(tr, t) && implements(tr, info.a)
+    let tr = std_trait(c"Debug", &pcx);
+    tr >= 0 && !implements(tr, t, &pcx) && implements(tr, info.a, &pcx)
 }
 
-fn missing_trait(h: i64, t: i64, debug: bool) -> ! {
-    err_begin(NODES[NODES[h].a].start);
-    err_str(c"'");
-    err_type(t);
+fn missing_trait(h: i64, t: i64, debug: bool, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[pcx.nodes[h].a].start, &pcx);
+    err_str(c"'", pcx);
+    err_type(t, pcx);
     err_str(if debug {
         c"' does not implement Debug, which '{x:?}' needs"
     } else {
         c"' does not implement Display, which '{x}' needs"
-    });
+    }, pcx);
     if TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Enum {
         if debug {
             err_help(
-                c"derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for ");
-            buf_type(ERR_HELP, t);
-            err_help(c" { fn fmt_debug(");
+                c"derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for ", pcx);
+            buf_type(pcx.err_help, t, pcx);
+            err_help(c" { fn fmt_debug(", pcx);
         } else {
-            err_help(c"write 'impl Display for ");
-            buf_type(ERR_HELP, t);
-            err_help(c" { fn fmt(");
+            err_help(c"write 'impl Display for ", pcx);
+            buf_type(pcx.err_help, t, pcx);
+            err_help(c" { fn fmt(", pcx);
         }
-        err_help(c"self");
+        err_help(c"self", pcx);
         err_help(
-            c", f: inout std::Fmt) { f.write(\"..\", args); } }'");
+            c", f: inout std::Fmt) { f.write(\"..\", args); } }'", pcx);
     } else if debug && TYPES[t].kind == TyKind::Slice {
         // (0.25.3) a slice is written with its elements' Debug
-        err_help(c"a slice is written as a list of its elements' Debug, which '");
-        buf_type(ERR_HELP, TYPES[t].a);
+        err_help(c"a slice is written as a list of its elements' Debug, which '", pcx);
+        buf_type(pcx.err_help, TYPES[t].a, pcx);
         err_help(
-            c"' does not have: give it one ('#[derive(Debug)]' before a struct or an enum)");
-    } else if !debug && debug_slice(t) {
+            c"' does not have: give it one ('#[derive(Debug)]' before a struct or an enum)", pcx);
+    } else if !debug && debug_slice(t, &pcx) {
         // (0.25.3) a slice of printable elements: Debug writes it
-        err_help(c"a slice has no Display (no one way to separate its elements): '{x:?}' writes it as a list, '[1, 2, 3]', or format its parts");
+        err_help(c"a slice has no Display (no one way to separate its elements): '{x:?}' writes it as a list, '[1, 2, 3]', or format its parts", pcx);
     } else if !debug {
-        err_help(c"write it with Debug, '{x:?}', or format its parts");
+        err_help(c"write it with Debug, '{x:?}', or format its parts", pcx);
     }
-    err_end()
+    err_end(&pcx)
 }
 
-fn spec_error(h: i64, t: i64, message: *u8) -> ! {
-    err_begin(NODES[NODES[h].a].start);
-    err_str(message);
-    err_type(t);
-    err_str(c"'");
-    err_end()
+fn spec_error(h: i64, t: i64, message: *u8, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[pcx.nodes[h].a].start, &pcx);
+    err_str(message, pcx);
+    err_type(t, pcx);
+    err_str(c"'", pcx);
+    err_end(&pcx)
 }
 
 // `=f3` (0.17: a hole, which the own walk reads, not moves: front/own/walk.vl's eval_let), `__s3`: a hidden local's name.
@@ -771,59 +788,60 @@ fn hidden(prefix: *u8, i: i64) -> i64 {
     intern(buf_slice(out))
 }
 
-fn ident(sym: i64, at: i64) -> i64 {
-    let id = new_node(NodeKind::Ident, NODES[at].start, NODES[at].end);
-    NODES[id].a = sym;
+fn ident(sym: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let id = new_node(NodeKind::Ident, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[id].a = sym;
     id
 }
 
-fn std_ident(at: i64) -> i64 {
-    ident(intern_c(c"std"), at)
+fn std_ident(at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    ident(intern_c(c"std"), at, &pcx)
 }
 
-fn unary(op: Tok, e: i64) -> i64 {
-    let u = new_node(NodeKind::Unary, NODES[e].start, NODES[e].end);
-    NODES[u].op = op;
-    NODES[u].b = e;
+fn unary(op: Tok, e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[u].op = op;
+    pcx.nodes[u].b = e;
     u
 }
 
 // `&mut e` (0.18: what Display's and Fmt's `&mut Fmt` take).
-fn amp_mut(e: i64) -> i64 {
-    let u = unary(Tok::Amp, e);
-    NODES[u].p |= NODE_REF_MUT;
+fn amp_mut(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let u = unary(Tok::Amp, e, &pcx);
+    pcx.nodes[u].p |= NODE_REF_MUT;
     u
 }
 
 // An i64 literal of value v (a negative one as `-v`), at node at.
-fn int_node(v: i64, at: i64) -> i64 {
-    let lit = new_node(NodeKind::Int, NODES[at].start, NODES[at].end);
-    NODES[lit].a = if v < 0 { -v } else { v };
-    NODES[lit].b = SUF_I64;
-    if v < 0 { unary(Tok::Minus, lit) } else { lit }
+fn int_node(v: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let lit = new_node(NodeKind::Int, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[lit].a = if v < 0 { -v } else { v };
+    pcx.nodes[lit].b = SUF_I64;
+    if v < 0 { unary(Tok::Minus, lit, &pcx) } else { lit }
 }
 
 // `receiver.name()`, its arguments to be added.
-fn method_call(receiver: i64, name: *u8) -> i64 {
-    let c = new_node(NodeKind::MethodCall, NODES[receiver].start, NODES[receiver].end);
-    NODES[c].a = receiver;
-    NODES[c].b = intern_c(name);
+fn method_call(receiver: i64, name: *u8, pcx: inout Ctx<Comp>) -> i64 {
+    let c = new_node(NodeKind::MethodCall, pcx.nodes[receiver].start, pcx.nodes[receiver].end,
+        &pcx);
+    pcx.nodes[c].a = receiver;
+    pcx.nodes[c].b = intern_c(name);
     c
 }
 
 // `receiver.name(arg)`.
-fn call1(receiver: i64, name: *u8, arg: i64) -> i64 {
-    let c = method_call(receiver, name);
-    let mark = list_begin();
-    list_push(arg);
-    list_end(c, mark);
+fn call1(receiver: i64, name: *u8, arg: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let c = method_call(receiver, name, &pcx);
+    let mark = list_begin(pcx);
+    list_push(arg, &pcx);
+    list_end(c, mark, &pcx);
     c
 }
 
 // `e;`
-fn stmt(e: i64) -> i64 {
-    let s = new_node(NodeKind::ExprStmt, NODES[e].start, NODES[e].end);
-    NODES[s].a = e;
-    NODES[s].b = 1;
+fn stmt(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let s = new_node(NodeKind::ExprStmt, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[s].a = e;
+    pcx.nodes[s].b = 1;
     s
 }

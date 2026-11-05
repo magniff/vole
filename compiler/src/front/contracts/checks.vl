@@ -14,104 +14,81 @@ use crate::base::{
     IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str, free,
     out_path,
 };
-use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::contracts::flags::NO_POSITIONS;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NodeKind, child};
 use crate::front::contracts::sites::{file_of_pos, line_col};
 use crate::front::lexer::{Tok, str_at};
-use crate::front::types::{FNS, is_float, is_integer, is_signed};
+use crate::front::types::{is_float, is_integer, is_signed};
 
 pub const CHK_REQUIRES: i64 = 1;
 pub const CHK_ENSURES: i64 = 2;
 pub const CHK_INVARIANT: i64 = 3;
 pub const CHK_ASSERT: i64 = 4;
 
-// The checks: the kind, the condition as written (a node; its source text
-// is the report's), the `else` message (a Str node, or 0), the function
-// whose clause it is (a Fn node, or 0), the position of the clause (or
-// the assertion), and a text that replaces the condition's (a buffer, or
-// -1: `assert_eq(a, b)` reports 'a == b').
-pub static var CHECK_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CHECK_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CHECK_MESSAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CHECK_OWNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CHECK_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CHECK_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// std::contract_check (a FNS index), once a call of it is checked; -1
-// before.
-pub static var CHECK_FN: i64 = -1;
-
-static var MSG: i64 = -1;
-
-pub fn add_check(kind: i64, cond: i64, message: i64, owner: i64, pos: i64) -> i64 {
-    CHECK_KIND.push(kind);
-    CHECK_COND.push(cond);
-    CHECK_MESSAGE.push(message);
-    CHECK_OWNER.push(owner);
-    CHECK_POS.push(pos);
-    CHECK_TEXT.push(-1);
-    CHECK_KIND.count - 1
+pub fn add_check(kind: i64, cond: i64, message: i64, owner: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    pcx.check_kind.push(kind);
+    pcx.check_cond.push(cond);
+    pcx.check_message.push(message);
+    pcx.check_owner.push(owner);
+    pcx.check_pos.push(pos);
+    pcx.check_text.push(-1);
+    pcx.check_kind.count - 1
 }
 
 // The conjuncts of condition `cond` (its `&&` chain, left to right),
 // pushed to `out`.
-pub fn conjuncts(cond: i64, out: inout IntVec) {
+pub fn conjuncts(cond: i64, out: inout IntVec, pcx: Ctx<Comp>) {
     var c = cond;
-    while NODES[c].kind == NodeKind::Block && NODES[c].count == 0 && NODES[c].a != 0 {
-        c = NODES[c].a;
+    while pcx.nodes[c].kind == NodeKind::Block && pcx.nodes[c].count == 0 && pcx.nodes[c].a != 0 {
+        c = pcx.nodes[c].a;
     }
-    if NODES[c].kind == NodeKind::Binary && NODES[c].op == Tok::AmpAmp {
-        conjuncts(NODES[c].b, &out);
-        conjuncts(NODES[c].c, &out);
+    if pcx.nodes[c].kind == NodeKind::Binary && pcx.nodes[c].op == Tok::AmpAmp {
+        conjuncts(pcx.nodes[c].b, &out, pcx);
+        conjuncts(pcx.nodes[c].c, &out, pcx);
         return;
     }
     out.push(c);
 }
 
-fn is_literal(n: i64) -> bool {
-    let k = NODES[n].kind;
+fn is_literal(n: i64, pcx: Ctx<Comp>) -> bool {
+    let k = pcx.nodes[n].kind;
     if k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
         || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit {
         return true;
     }
-    k == NodeKind::Unary && NODES[n].op == Tok::Minus && is_literal(NODES[n].b)
+    k == NodeKind::Unary && pcx.nodes[n].op == Tok::Minus && is_literal(pcx.nodes[n].b, pcx)
 }
 
 // Whether the value of n can be shown (an integer; `float`: a float, shown
 // through its companion, below), and is evaluated again without harm on
 // the failing path (it is pure, as a condition is; its tree is a simple
 // read: names, fields, calls of names and fields).
-fn shown(n: i64, float: bool) -> bool {
-    let t = NODES[n].ty;
-    if t <= 0 || is_literal(n) || !(if float { is_float(t) } else { is_integer(t) }) {
+fn shown(n: i64, float: bool, pcx: Ctx<Comp>) -> bool {
+    let t = pcx.nodes[n].ty;
+    if t <= 0 || is_literal(n, pcx) || !(if float { is_float(t) } else { is_integer(t) }) {
         return false;
     }
-    simple(n, 0)
+    simple(n, 0, pcx)
 }
 
-// (0.25.2.1) The float operands shown (nodes) and their companions: the
-// integer the helper prints, `((x as f64) * (1000000 as f64)) as i64`
-// (made and checked with the check, desugar_call), as `NNNe-6`.
-pub static var FLOAT_OPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var FLOAT_COMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-fn simple(n: i64, depth: i64) -> bool {
+fn simple(n: i64, depth: i64, pcx: Ctx<Comp>) -> bool {
     if depth > 4 {
         return false;
     }
-    match NODES[n].kind {
+    match pcx.nodes[n].kind {
         NodeKind::Ident | NodeKind::Int | NodeKind::Float | NodeKind::Bool | NodeKind::Char
             | NodeKind::Path => true,
-        NodeKind::FieldAccess => simple(NODES[n].a, depth + 1),
-        NodeKind::TupleField => simple(NODES[n].a, depth + 1),
-        NodeKind::Unary => simple(NODES[n].b, depth + 1),
-        NodeKind::Cast => simple(NODES[n].a, depth + 1),
+        NodeKind::FieldAccess => simple(pcx.nodes[n].a, depth + 1, pcx),
+        NodeKind::TupleField => simple(pcx.nodes[n].a, depth + 1, pcx),
+        NodeKind::Unary => simple(pcx.nodes[n].b, depth + 1, pcx),
+        NodeKind::Cast => simple(pcx.nodes[n].a, depth + 1, pcx),
         NodeKind::Call => {
-            if NODES[n].x <= 0 {
+            if pcx.nodes[n].x <= 0 {
                 return false;
             }
-            for i in 0..NODES[n].count {
-                if !simple(child(n, i), depth + 1) {
+            for i in 0..pcx.nodes[n].count {
+                if !simple(child(n, i, pcx), depth + 1, pcx) {
                     return false;
                 }
             }
@@ -130,19 +107,19 @@ fn is_comparison(op: Tok) -> bool {
 // three), pushed to `out`: an integer itself, a float its companion
 // (FLOAT_OPS); with `floats`, the float operands instead (to make their
 // companions).
-pub fn operands(conj: i64, out: inout IntVec, floats: bool) {
+pub fn operands(conj: i64, out: inout IntVec, floats: bool, pcx: Ctx<Comp>) {
     unsafe {
         var c = conj;
-        if NODES[c].kind == NodeKind::Unary && NODES[c].op == Tok::Bang {
-            c = NODES[c].b;
+        if pcx.nodes[c].kind == NodeKind::Unary && pcx.nodes[c].op == Tok::Bang {
+            c = pcx.nodes[c].b;
         }
         var cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if NODES[c].kind == NodeKind::Binary && is_comparison(NODES[c].op) {
-            cands.push(NODES[c].b);
-            cands.push(NODES[c].c);
-        } else if NODES[c].kind == NodeKind::Call {
-            for i in 0..NODES[c].count {
-                cands.push(child(c, i));
+        if pcx.nodes[c].kind == NodeKind::Binary && is_comparison(pcx.nodes[c].op) {
+            cands.push(pcx.nodes[c].b);
+            cands.push(pcx.nodes[c].c);
+        } else if pcx.nodes[c].kind == NodeKind::Call {
+            for i in 0..pcx.nodes[c].count {
+                cands.push(child(c, i, pcx));
             }
         }
         for i in 0..cands.count {
@@ -151,15 +128,15 @@ pub fn operands(conj: i64, out: inout IntVec, floats: bool) {
                 break;
             }
             if floats {
-                if shown(x, true) {
+                if shown(x, true, pcx) {
                     out.push(x);
                 }
-            } else if shown(x, false) {
+            } else if shown(x, false, pcx) {
                 out.push(x);
             } else {
-                for j in 0..FLOAT_OPS.count {
-                    if FLOAT_OPS.data[j] == x {
-                        out.push(FLOAT_COMPS.data[j]);
+                for j in 0..pcx.float_ops.count {
+                    if pcx.float_ops.data[j] == x {
+                        out.push(pcx.float_comps.data[j]);
                         break;
                     }
                 }
@@ -172,25 +149,25 @@ pub fn operands(conj: i64, out: inout IntVec, floats: bool) {
 // The values the report of conjunct `conj` of contract check `call` shows,
 // pushed to `out`: the holes of an f-string message (the call's arguments
 // after the third), or the conjunct's operands.
-pub fn check_values(call: i64, conj: i64, out: inout IntVec) {
+pub fn check_values(call: i64, conj: i64, out: inout IntVec, pcx: Ctx<Comp>) {
     unsafe {
-        let check = NODES[child(call, 2)].a;
-        let message = CHECK_MESSAGE.data[check];
-        if message != 0 && NODES[message].kind == NodeKind::Interp {
-            for i in 3..NODES[call].count {
-                out.push(child(call, i));
+        let check = pcx.nodes[child(call, 2, pcx)].a;
+        let message = pcx.check_message.data[check];
+        if message != 0 && pcx.nodes[message].kind == NodeKind::Interp {
+            for i in 3..pcx.nodes[call].count {
+                out.push(child(call, i, pcx));
             }
             return;
         }
-        operands(conj, &out, false);
+        operands(conj, &out, false, pcx);
     }
 }
 
 // The source text of node n, on one line (runs of whitespace one space),
 // '%' doubled for the helper's format, cut at `room` bytes.
-fn put_text(out: i64, n: i64, room: i64) {
-    let start = NODES[n].start;
-    let end = NODES[n].end;
+fn put_text(out: i64, n: i64, room: i64, pcx: Ctx<Comp>) {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
     var space = false;
     var put = 0;
     for i in start..end {
@@ -225,12 +202,12 @@ fn put_escaped(out: i64, s: [u8]) {
 }
 
 // `FILE:LINE:COL` of position pos.
-pub fn put_position(out: i64, pos: i64) {
+pub fn put_position(out: i64, pos: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let file = file_of_pos(pos);
+        let file = file_of_pos(pos, pcx);
         var col = 0;
-        let line = line_col(file, pos, &col);
-        let path = out_path(file);
+        let line = line_col(file, pos, &col, &pcx);
+        let path = out_path(file, pcx);
         var k = 0;
         while path[k] != 0 {
             if path[k] == '%' {
@@ -248,9 +225,9 @@ pub fn put_position(out: i64, pos: i64) {
 
 // The name of function f in reports: its display, without the `$pre`
 // of a requires' companion.
-fn put_owner(out: i64, f: i64) {
+fn put_owner(out: i64, f: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let text = SYMS[FNS[f].display].text;
+        let text = SYMS[pcx.fns[f].display].text;
         var n = text.len as i64;
         for i in 0..n {
             if text[i] == '$' {
@@ -265,50 +242,50 @@ fn put_owner(out: i64, f: i64) {
 // The message (a string id: the helper's format) of conjunct `conj` of
 // check `check`, made in function `f` (a FNS index), with `ops` the
 // operands shown (as `operands` gave them).
-pub fn check_message(check: i64, conj: i64, ops: IntVec, f: i64) -> i64 {
+pub fn check_message(check: i64, conj: i64, ops: IntVec, f: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if MSG < 0 {
-            MSG = buf_new();
+        if pcx.checks_msg < 0 {
+            pcx.checks_msg = buf_new();
         }
-        let out = MSG;
+        let out = pcx.checks_msg;
         buf_clear(out);
-        let kind = CHECK_KIND.data[check];
-        let message = CHECK_MESSAGE.data[check];
-        let interp = message != 0 && NODES[message].kind == NodeKind::Interp;
-        if message != 0 && NODES[message].kind == NodeKind::Str {
-            put_escaped(out, str_at(NODES[message].a));
+        let kind = pcx.check_kind.data[check];
+        let message = pcx.check_message.data[check];
+        let interp = message != 0 && pcx.nodes[message].kind == NodeKind::Interp;
+        if message != 0 && pcx.nodes[message].kind == NodeKind::Str {
+            put_escaped(out, str_at(pcx.nodes[message].a));
         } else if interp {
             // (an f-string: its holes are the values, as the call passes them)
             var holes = 0;
-            for i in 0..NODES[message].count {
-                let piece = child(message, i);
-                if NODES[piece].kind == NodeKind::Str {
-                    put_escaped(out, str_at(NODES[piece].a));
+            for i in 0..pcx.nodes[message].count {
+                let piece = child(message, i, pcx);
+                if pcx.nodes[piece].kind == NodeKind::Str {
+                    put_escaped(out, str_at(pcx.nodes[piece].a));
                 } else if holes < 3 {
                     buf_str(out, c"%lld");
                     holes += 1;
                 }
             }
             buf_byte(out, '\n');
-            return keep_message(out);
+            return keep_message(out, &pcx);
         } else {
             buf_str(out, if kind == CHK_REQUIRES { c"requires failed: '" }
                 else if kind == CHK_ENSURES { c"ensures failed: '" }
                 else if kind == CHK_INVARIANT { c"invariant failed: '" }
                 else { c"assertion failed: '" });
-            if CHECK_TEXT.data[check] >= 0 {
-                put_escaped(out, buf_slice(CHECK_TEXT.data[check]));
+            if pcx.check_text.data[check] >= 0 {
+                put_escaped(out, buf_slice(pcx.check_text.data[check]));
             } else {
-                put_text(out, conj, 120);
+                put_text(out, conj, 120, pcx);
             }
             buf_byte(out, '\'');
             if kind == CHK_REQUIRES || kind == CHK_ENSURES {
                 buf_str(out, c" of '");
-                put_owner(out, f);
+                put_owner(out, f, pcx);
                 buf_byte(out, '\'');
-                if kind == CHK_REQUIRES && !NO_POSITIONS {
+                if kind == CHK_REQUIRES && !pcx.no_positions {
                     buf_str(out, c" (");
-                    put_position(out, CHECK_POS.data[check]);
+                    put_position(out, pcx.check_pos.data[check], &pcx);
                     buf_byte(out, ')');
                 }
             }
@@ -316,50 +293,47 @@ pub fn check_message(check: i64, conj: i64, ops: IntVec, f: i64) -> i64 {
         for i in 0..ops.count {
             buf_str(out, if i == 0 { c": " } else { c", " });
             let op = ops.data[i];
-            put_text(out, op, 40);
-            buf_str(out, if is_signed(NODES[op].ty) { c" = %lld" } else { c" = %llu" });
+            put_text(out, op, 40, pcx);
+            buf_str(out, if is_signed(pcx.nodes[op].ty) { c" = %lld" } else { c" = %llu" });
             // (0.25.2.1: a float's companion, in millionths)
-            for j in 0..FLOAT_COMPS.count {
-                if FLOAT_COMPS.data[j] == op {
+            for j in 0..pcx.float_comps.count {
+                if pcx.float_comps.data[j] == op {
                     buf_str(out, c"e-6");
                     break;
                 }
             }
         }
         buf_byte(out, '\n');
-        keep_message(out)
+        keep_message(out, &pcx)
     }
 }
 
-// The messages made (buffers), each once: check_message's results.
-static var MESSAGES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Message `out` kept (or the same one found): its number.
-fn keep_message(out: i64) -> i64 {
+fn keep_message(out: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let text = buf_slice(out);
-        for i in 0..MESSAGES.count {
-            if buf_slice(MESSAGES.data[i]) == text {
+        for i in 0..pcx.messages.count {
+            if buf_slice(pcx.messages.data[i]) == text {
                 return i;
             }
         }
         let b = buf_new();
         buf_bytes(b, text);
-        MESSAGES.push(b);
-        MESSAGES.count - 1
+        pcx.messages.push(b);
+        pcx.messages.count - 1
     }
 }
 
 // The text of message `m` (check_message's number).
-pub fn message_text(m: i64) -> [u8] {
-    unsafe { buf_slice(MESSAGES.data[m]) }
+pub fn message_text(m: i64, pcx: Ctx<Comp>) -> [u8] {
+    unsafe { buf_slice(pcx.messages.data[m]) }
 }
 
 // (0.18) The number of a fixed message (its text ends in a newline), for a
 // check that is not a clause: `p as NonNull<T>` of a null p
 // (front/check/distinct.vl).
-pub fn fixed_message(text: [u8]) -> i64 {
+pub fn fixed_message(text: [u8], pcx: inout Ctx<Comp>) -> i64 {
     let out = buf_new();
     buf_bytes(out, text);
-    keep_message(out)
+    keep_message(out, &pcx)
 }

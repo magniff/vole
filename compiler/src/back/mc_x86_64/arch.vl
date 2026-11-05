@@ -3,13 +3,15 @@
 // registers; -O0 writes the same with fixed ones (gen0/gen/arch.vl).
 // (Compile-tested: objcheck and the CROSS cases; not run in 0.19.)
 
-use crate::arch::{F_INSN, INTRS, intr_ret_text, intr_text, intr_tied};
+use crate::arch::{F_INSN, intr_ret_text, intr_text, intr_tied};
 use crate::arch::template::{
     SLOT_D, SLOT_T, TP_END, TP_NEXT, TP_SLOT, TP_TEXT, TPiece, template_piece, template_slot,
 };
 use crate::back::mc_x86_64::{mx_mov, mx_rs};
 use crate::base::buf_bytes;
-use crate::front::types::{TY_I64, TY_V16I8};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::TY_I64;
 use crate::gen0::target::{o, oi, on};
 use crate::middle::ctx::FnCtx;
 
@@ -29,7 +31,7 @@ fn mx_reg(cx: inout FnCtx, r: i64, m: u8) {
 }
 
 // d = s, a whole register: a vector one's 256 bits when `wide`.
-fn mx_move(cx: inout FnCtx, d: i64, s: i64, wide: bool) {
+fn mx_move(cx: inout FnCtx, d: i64, s: i64, wide: bool, pcx: Ctx<Comp>) {
     if d >= 32 && wide {
         o(&cx, c"    vmovdqa ");
         mx_rs(&cx, s, 32);
@@ -38,7 +40,7 @@ fn mx_move(cx: inout FnCtx, d: i64, s: i64, wide: bool) {
         on(&cx);
         return;
     }
-    mx_mov(&cx, d, s, if d >= 32 { TY_V16I8 } else { TY_I64 });
+    mx_mov(&cx, d, s, if d >= 32 { pcx.ty_v16i8 } else { TY_I64 }, pcx);
 }
 
 // Intrinsic id into register d (-1: no result) from the registers ops[k]
@@ -46,35 +48,36 @@ fn mx_move(cx: inout FnCtx, d: i64, s: i64, wide: bool) {
 // two-operand forms are tied: the result starts as a copy of the tied
 // parameter, in xmm15 (r11) when d is another operand's (all 256 bits of
 // it when the result is a 256-bit vector: FMA's accumulator).
-pub fn mx_intr(cx: inout FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
+pub fn mx_intr(cx: inout FnCtx, id: i64, d: i64, ops: [i64], imms: [i64], pcx: Ctx<Comp>) {
     unsafe {
-        let text = intr_text(id, F_INSN);
-        let fixed = xmm0_param(id, text);
+        let text = intr_text(id, F_INSN, pcx);
+        let fixed = xmm0_param(id, text, pcx);
         if fixed >= 0 {
-            mx_intr_xmm0(&cx, id, d, ops, imms, fixed);
+            mx_intr_xmm0(&cx, id, d, ops, imms, fixed, pcx);
             return;
         }
-        let tied = intr_tied(id);
-        let wide = intr_ret_text(id).len >= 6 && intr_ret_text(id)[0..6] == "__m256";
+        let tied = intr_tied(id, pcx);
+        let wide = intr_ret_text(id, pcx).len >= 6 && intr_ret_text(id, pcx)[0..6] == "__m256";
         var dd = d;
         if tied >= 0 && ops[tied] != d {
-            for k in 0..INTRS[id].nparams {
+            for k in 0..pcx.intrs[id].nparams {
                 if k != tied && ops[k] == d {
                     dd = if d >= 32 { XTEMP } else { RTEMP };
                 }
             }
-            mx_move(&cx, dd, ops[tied], wide);
+            mx_move(&cx, dd, ops[tied], wide, pcx);
         }
-        mx_template(&cx, id, text, dd, ops, imms);
+        mx_template(&cx, id, text, dd, ops, imms, pcx);
         if dd != d {
-            mx_move(&cx, d, dd, wide);
+            mx_move(&cx, d, dd, wide, pcx);
         }
     }
 }
 
 // The template of intrinsic id with result register dd and the operands'
 // registers ops (immediates imms); `<NAME:0>` is %xmm0.
-fn mx_template(cx: inout FnCtx, id: i64, text: [u8], dd: i64, ops: [i64], imms: [i64]) {
+fn mx_template(cx: inout FnCtx, id: i64, text: [u8], dd: i64, ops: [i64], imms: [i64],
+    pcx: Ctx<Comp>) {
     var p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
     var at = 0;
     o(&cx, c"    ");
@@ -89,7 +92,7 @@ fn mx_template(cx: inout FnCtx, id: i64, text: [u8], dd: i64, ops: [i64], imms: 
             on(&cx);
             o(&cx, c"    ");
         } else if p.kind == TP_SLOT {
-            let s = template_slot(id, p.name);
+            let s = template_slot(id, p.name, pcx);
             if p.modifier == '0' {
                 o(&cx, c"%xmm0");
             } else if s == SLOT_D {
@@ -108,7 +111,7 @@ fn mx_template(cx: inout FnCtx, id: i64, text: [u8], dd: i64, ops: [i64], imms: 
 
 // (0.19 T5) The parameter the instruction reads in xmm0, `<NAME:0>` in
 // its template (SSE4.1's blendv, sha256rnds2), or -1.
-fn xmm0_param(id: i64, text: [u8]) -> i64 {
+fn xmm0_param(id: i64, text: [u8], pcx: Ctx<Comp>) -> i64 {
     var p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
     var at = 0;
     loop {
@@ -117,7 +120,7 @@ fn xmm0_param(id: i64, text: [u8]) -> i64 {
             return -1;
         }
         if p.kind == TP_SLOT && p.modifier == '0' {
-            return template_slot(id, p.name);
+            return template_slot(id, p.name, pcx);
         }
     }
 }
@@ -127,23 +130,24 @@ fn xmm0_param(id: i64, text: [u8]) -> i64 {
 // that were in xmm0 read from the copy, the result made in xmm15 (tied: a
 // copy of the tied parameter first) and moved to d last, so d may be
 // xmm0. Five moves; AVX's forms (vpblendvb ...) take the mask anywhere.
-fn mx_intr_xmm0(cx: inout FnCtx, id: i64, d: i64, ops: [i64], imms: [i64], fixed: i64) {
+fn mx_intr_xmm0(cx: inout FnCtx, id: i64, d: i64, ops: [i64], imms: [i64], fixed: i64,
+    pcx: Ctx<Comp>) {
     unsafe {
         let saved = XTEMP - 1;
         var regs: [i64; 8] = [-1; 8];
-        for k in 0..INTRS[id].nparams {
+        for k in 0..pcx.intrs[id].nparams {
             regs[k] = if ops[k] == 32 { saved } else { ops[k] };
         }
-        mx_move(&cx, saved, 32, false);
-        let tied = intr_tied(id);
+        mx_move(&cx, saved, 32, false, pcx);
+        let tied = intr_tied(id, pcx);
         if tied >= 0 {
-            mx_move(&cx, XTEMP, regs[tied], false);
+            mx_move(&cx, XTEMP, regs[tied], false, pcx);
         }
-        mx_move(&cx, 32, regs[fixed], false);
-        mx_template(&cx, id, intr_text(id, F_INSN), XTEMP, regs[..], imms);
-        mx_move(&cx, 32, saved, false);
+        mx_move(&cx, 32, regs[fixed], false, pcx);
+        mx_template(&cx, id, intr_text(id, F_INSN, pcx), XTEMP, regs[..], imms, pcx);
+        mx_move(&cx, 32, saved, false, pcx);
         if d >= 0 {
-            mx_move(&cx, d, XTEMP, false);
+            mx_move(&cx, d, XTEMP, false, pcx);
         }
     }
 }

@@ -10,16 +10,16 @@
 // distinct_* helpers).
 
 use crate::base::{IntVec, SRC, SYMS, buf_fmt, buf_new, buf_slice, free, intern, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump,
-    err_try_fmt,
+    err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump, err_try_fmt,
 };
-use crate::front::ast::{NODES, NODE_CHECKED, NodeKind, list_begin, list_end, list_push, new_node};
-use crate::front::check::{LOCALS, LOCAL_COUNT, is_std_named};
+use crate::front::ast::{NODE_CHECKED, NodeKind, list_begin, list_end, list_push, new_node};
+use crate::front::check::is_std_named;
 use crate::front::contracts::checks::fixed_message;
 use crate::front::contracts::diag::{DISTINCT_KIND, DISTINCT_METHOD, DISTINCT_MIX};
 use crate::front::distinct::{
-    ANY_DISTINCT, ANY_VIEW_DISTINCT, ERASE_VIEWS_ONLY, NICHE_ALIASES, PATH_TYPE, STR_TYPE,
     distinct_type, enum_niche, erase_list, erase_type, is_distinct_type, is_niche_alias,
     is_view_distinct, reset_erased, strip_distinct,
 };
@@ -28,55 +28,51 @@ use crate::front::modules::{module_of, within_std};
 use crate::front::own::kinds::{is_owned_type, is_plain_type};
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
-    CONSTS, CONST_COUNT, ENUMS, ENUM_COUNT, FIELDS, FIELD_COUNT, FNS, FN_COUNT, STATICS,
-    STATIC_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, VARIANTS, VARIANT_COUNT,
-    buf_type, enum_variant, is_numeric, struct_field, type_count, type_elem, variant_field,
+    ENUMS, FIELDS, TLISTS, TSCRATCH, TYPES, TyKind, buf_type, enum_variant, is_numeric,
+    struct_field, type_count, type_elem, variant_field,
 };
 use crate::gen0::target::message_kind;
 
-// The binary node whose operands are being checked (0: none): the
-// distinct.mix message names the whole operation.
-pub static var BINARY_NODE: i64 = 0;
-
 // The type that `type X = distinct T` (alias node `alias`) names, T being
 // `base`, with the type arguments TSCRATCH[mark..] (popped).
-pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
-    if base == TY_ERROR {
+pub fn distinct_of(alias: i64, base: i64, mark: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if base == pcx.ty_error {
         TSCRATCH.count = mark;
         return base;
     }
     // (0.20) std's `str`, over `[u8]`: a view, checked as one by the
     // own pass (erase_view_distincts)
-    let text = view_text_alias(alias, base);
+    let text = view_text_alias(alias, base, &pcx);
     if text {
-        ANY_VIEW_DISTINCT = true;
+        pcx.any_view_distinct = true;
     }
-    let bad = if text { 0 } else { not_plain(base, 0) };
+    let bad = if text { 0 } else { not_plain(base, 0, pcx) };
     if bad != 0 {
-        let saved = ERR_KIND;
-        ERR_KIND = DISTINCT_KIND;
-        err_begin(NODES[NODES[alias].b].start);
+        let saved = pcx.err_kind;
+        pcx.err_kind = DISTINCT_KIND;
+        err_begin(pcx.nodes[pcx.nodes[alias].b].start, &pcx);
         let b = buf_new();
-        buf_type(b, bad);
+        buf_type(b, bad, pcx);
         let what = if TYPES[bad].kind == TyKind::Slice || TYPES[bad].kind == TyKind::Ptr
             { "views memory" }
             else { "owns memory" };
-        err_fmt(format_args("a distinct type is over a plain type: '{}' {what}", buf_slice(b)));
-        let name = SYMS[NODES[alias].a].text;
-        err_help_fmt(format_args("a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {} }}'", buf_slice(b)));
-        err_end_soft();
-        ERR_KIND = saved;
+        err_fmt(format_args("a distinct type is over a plain type: '{}' {what}", buf_slice(b)),
+            pcx);
+        let name = SYMS[pcx.nodes[alias].a].text;
+        err_help_fmt(format_args("a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {} }}'", buf_slice(b)), pcx);
+        err_end_soft(&pcx);
+        pcx.err_kind = saved;
     }
     // (std's NonNull: the null niche, front/distinct.vl)
-    if within_std(module_of(alias)) && SYMS[NODES[alias].a].text == "NonNull"
-        && !is_niche_alias(alias) {
-        NICHE_ALIASES.push(alias);
+    if within_std(module_of(alias, &pcx), pcx) && SYMS[pcx.nodes[alias].a].text == "NonNull"
+        && !is_niche_alias(alias, pcx) {
+        pcx.niche_aliases.push(alias);
     }
-    let t = distinct_type(alias, base, mark);
-    if text && SYMS[NODES[alias].a].text == "str" {
-        STR_TYPE = t;
+    let t = distinct_type(alias, base, mark, &pcx);
+    if text && SYMS[pcx.nodes[alias].a].text == "str" {
+        pcx.str_type = t;
     } else if text {
-        PATH_TYPE = t;
+        pcx.path_type = t;
     }
     t
 }
@@ -84,17 +80,17 @@ pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
 // (0.20) Whether alias node `alias` over `base` is std's `type str =
 // distinct [u8]` or `type Path = distinct [u8]` (std::path): the distinct
 // types over a view.
-fn view_text_alias(alias: i64, base: i64) -> bool {
+fn view_text_alias(alias: i64, base: i64, pcx: inout Ctx<Comp>) -> bool {
     base > 0 && TYPES[base].kind == TyKind::Slice && TYPES[base].b == 0
-        && within_std(module_of(alias))
-        && (SYMS[NODES[alias].a].text == "str" || SYMS[NODES[alias].a].text == "Path")
+        && within_std(module_of(alias, &pcx), pcx)
+        && (SYMS[pcx.nodes[alias].a].text == "str" || SYMS[pcx.nodes[alias].a].text == "Path")
 }
 
 // A type in t that is not plain (an owned or a view type: a slice, a
 // reference, Vec, Buf, HashMap, or a struct, enum, tuple or array holding
 // one); 0. A type that owns by its Drop impl is found later, when the
 // impls are known (check_distinct_kinds).
-fn not_plain(t: i64, depth: i64) -> i64 {
+fn not_plain(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if t <= 0 || depth > 16 {
             return 0;
@@ -105,12 +101,13 @@ fn not_plain(t: i64, depth: i64) -> i64 {
             return t;
         }
         if kind == TyKind::Struct {
-            if is_std_named(t, c"Vec") || is_std_named(t, c"Buf") || is_std_named(t, c"HashMap") {
+            if is_std_named(t, c"Vec", pcx) || is_std_named(t, c"Buf", pcx)
+                || is_std_named(t, c"HashMap", pcx) {
                 return t;
             }
             let s = TYPES[t].a;
-            for i in 0..STRUCTS[s].field_count {
-                let bad = not_plain((*struct_field(s, i)).ty, depth + 1);
+            for i in 0..pcx.structs[s].field_count {
+                let bad = not_plain((*struct_field(s, i, pcx)).ty, depth + 1, pcx);
                 if bad != 0 {
                     return bad;
                 }
@@ -121,8 +118,8 @@ fn not_plain(t: i64, depth: i64) -> i64 {
             let e = TYPES[t].a;
             for i in 0..ENUMS[e].variant_count {
                 let v = enum_variant(e, i);
-                for k in 0..VARIANTS[v].field_count {
-                    let bad = not_plain(variant_field(v, k), depth + 1);
+                for k in 0..pcx.variants[v].field_count {
+                    let bad = not_plain(variant_field(v, k, pcx), depth + 1, pcx);
                     if bad != 0 {
                         return bad;
                     }
@@ -132,7 +129,7 @@ fn not_plain(t: i64, depth: i64) -> i64 {
         }
         if kind == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                let bad = not_plain(type_elem(t, i), depth + 1);
+                let bad = not_plain(type_elem(t, i), depth + 1, pcx);
                 if bad != 0 {
                     return bad;
                 }
@@ -140,7 +137,7 @@ fn not_plain(t: i64, depth: i64) -> i64 {
             return 0;
         }
         if kind == TyKind::Array || kind == TyKind::Distinct {
-            return not_plain(TYPES[t].a, depth + 1);
+            return not_plain(TYPES[t].a, depth + 1, pcx);
         }
         0
     }
@@ -152,9 +149,9 @@ fn not_plain(t: i64, depth: i64) -> i64 {
 // are), or an instance's type argument. Once per alias; called by
 // check_program before the own pass, which takes every distinct type as
 // plain.
-pub fn check_distinct_kinds() {
+pub fn check_distinct_kinds(pcx: inout Ctx<Comp>) {
     unsafe {
-        if !ANY_DISTINCT {
+        if !pcx.any_distinct {
             return;
         }
         var seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -164,23 +161,24 @@ pub fn check_distinct_kinds() {
             }
             let alias = TYPES[t].b;
             let base = TYPES[t].a;
-            if alias <= 0 || base <= 0 || base == TY_ERROR || not_plain(base, 0) != 0
-                || view_text_alias(alias, base)
-                || is_plain_type(base) || (0..seen.count).any(|j| seen.data[j] == alias) {
+            if alias <= 0 || base <= 0 || base == pcx.ty_error || not_plain(base, 0, pcx) != 0
+                || view_text_alias(alias, base, &pcx)
+                || is_plain_type(base, &pcx) || (0..seen.count).any(|j| seen.data[j] == alias) {
                 continue;
             }
             seen.push(alias);
-            let saved = ERR_KIND;
-            ERR_KIND = DISTINCT_KIND;
-            err_begin(NODES[NODES[alias].b].start);
+            let saved = pcx.err_kind;
+            pcx.err_kind = DISTINCT_KIND;
+            err_begin(pcx.nodes[pcx.nodes[alias].b].start, &pcx);
             let b = buf_new();
-            buf_type(b, base);
-            let what = if is_owned_type(base) { "owns memory" } else { "views memory" };
-            err_fmt(format_args("a distinct type is over a plain type: '{}' {what}", buf_slice(b)));
-            let name = SYMS[NODES[alias].a].text;
-            err_help_fmt(format_args("a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {} }}'", buf_slice(b)));
-            err_end_soft();
-            ERR_KIND = saved;
+            buf_type(b, base, pcx);
+            let what = if is_owned_type(base, &pcx) { "owns memory" } else { "views memory" };
+            err_fmt(format_args("a distinct type is over a plain type: '{}' {what}", buf_slice(b)),
+                pcx);
+            let name = SYMS[pcx.nodes[alias].a].text;
+            err_help_fmt(format_args("a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {} }}'", buf_slice(b)), pcx);
+            err_end_soft(&pcx);
+            pcx.err_kind = saved;
         }
         free(seen.data as *u8);
     }
@@ -191,34 +189,34 @@ pub fn check_distinct_kinds() {
 // Whether literal n, checked against distinct type `expected` over a
 // number, was checked against that number: the one implicit conversion.
 // (0.20) And a string literal where std's `str` goes: a `str`.
-pub fn distinct_literal(n: i64, expected: i64) -> bool {
+pub fn distinct_literal(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
     if !is_distinct_type(expected) {
         return false;
     }
-    if is_view_distinct(expected) && is_string_literal(n)
-        && (expected != STR_TYPE || literal_utf8(n)) {
-        crate::front::check::check_mode::check_expr(n, strip_distinct(expected));
+    if is_view_distinct(expected) && is_string_literal(n, pcx)
+        && (expected != pcx.str_type || literal_utf8(n, pcx)) {
+        crate::front::check::check_mode::check_expr(n, strip_distinct(expected), &pcx);
         return true;
     }
-    if !crate::front::check::synth_mode::is_context_literal(n) {
+    if !crate::front::check::synth_mode::is_context_literal(n, pcx) {
         return false;
     }
     let base = strip_distinct(expected);
     if !is_numeric(base) {
         return false;
     }
-    crate::front::check::check_mode::check_expr(n, base);
+    crate::front::check::check_mode::check_expr(n, base, &pcx);
     true
 }
 
 // (0.20) Whether string literal n (or the block of only it) is UTF-8: a
 // literal with `\x80`..`\xff` escapes that break it stays `[u8]`.
-fn literal_utf8(n: i64) -> bool {
-    if NODES[n].kind == NodeKind::Block {
-        return literal_utf8(NODES[n].a);
+fn literal_utf8(n: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[n].kind == NodeKind::Block {
+        return literal_utf8(pcx.nodes[n].a, pcx);
     }
     // (0.25.3: include_bytes, b=1, is bytes whatever they hold)
-    NODES[n].b == 0 && is_utf8_text(crate::front::lexer::str_at(NODES[n].a))
+    pcx.nodes[n].b == 0 && is_utf8_text(crate::front::lexer::str_at(pcx.nodes[n].a))
 }
 
 // (0.20) Whether s is well-formed UTF-8 (RFC 3629: no overlong forms, no
@@ -260,27 +258,28 @@ pub fn utf8_error_at(s: [u8]) -> i64 {
 
 // (0.20) Whether n is a string literal ("..", not c".."), or a block of
 // only one.
-fn is_string_literal(n: i64) -> bool {
-    if NODES[n].kind == NodeKind::Block {
-        return NODES[n].count == 0 && NODES[n].a != 0 && is_string_literal(NODES[n].a);
+fn is_string_literal(n: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.nodes[n].kind == NodeKind::Block {
+        return pcx.nodes[n].count == 0 && pcx.nodes[n].a != 0
+            && is_string_literal(pcx.nodes[n].a, pcx);
     }
-    NODES[n].kind == NodeKind::Str
+    pcx.nodes[n].kind == NodeKind::Str
 }
 
 // Binary node n (operator op), whose operands are both of distinct type
 // ty: T's operator. Arithmetic and bitwise operators give a `ty`,
 // comparisons a bool.
-pub fn distinct_binary(n: i64, op: Tok, ty: i64) -> i64 {
+pub fn distinct_binary(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     let base = strip_distinct(ty);
-    let lhs = NODES[n].b;
-    let rhs = NODES[n].c;
-    if NODES[lhs].ty == ty {
-        NODES[lhs].ty = base;
+    let lhs = pcx.nodes[n].b;
+    let rhs = pcx.nodes[n].c;
+    if pcx.nodes[lhs].ty == ty {
+        pcx.nodes[lhs].ty = base;
     }
-    if NODES[rhs].ty == ty {
-        NODES[rhs].ty = base;
+    if pcx.nodes[rhs].ty == ty {
+        pcx.nodes[rhs].ty = base;
     }
-    let r = crate::front::check::synth_mode::binary_result(n, op, base);
+    let r = crate::front::check::synth_mode::binary_result(n, op, base, &pcx);
     let compares = op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt
         || op == Tok::LtEq || op == Tok::GtEq;
     if r == base && !compares { ty } else { r }
@@ -290,13 +289,13 @@ pub fn distinct_binary(n: i64, op: Tok, ty: i64) -> i64 {
 // in the function being checked: it returns a Result whose error is std's
 // Utf8Error or converts from one (From). The try: line is printed only
 // then: a suggestion that does not compile costs more than none.
-pub fn from_utf8_try_fits() -> bool {
+pub fn from_utf8_try_fits(pcx: inout Ctx<Comp>) -> bool {
     var rargs = 0;
-    let r = crate::front::check::RETURN_TYPE;
-    if r <= 0 || crate::front::convert::std_enum_name(r, &rargs) != intern_c(c"Result") {
+    let r = pcx.return_type;
+    if r <= 0 || crate::front::convert::std_enum_name(r, &rargs, pcx) != intern_c(c"Result") {
         return false;
     }
-    let from = utf8_error_type();
+    let from = utf8_error_type(&pcx);
     if from <= 0 {
         // (std's str section is not loaded: nothing names Utf8Error, so
         // no error type converts from it)
@@ -306,35 +305,35 @@ pub fn from_utf8_try_fits() -> bool {
     if to == from {
         return true;
     }
-    let tr = crate::front::traits::std_trait(c"From");
+    let tr = crate::front::traits::std_trait(c"From", &pcx);
     tr >= 0 && crate::front::convert::implements_with(tr, to,
-        crate::front::convert::list_of(from))
+        crate::front::convert::list_of(from), &pcx)
 }
 
 // The type of std::str::Utf8Error, 0 when it is not loaded.
-fn utf8_error_type() -> i64 {
-    if crate::front::modules::STD_MODULE < 0 {
+fn utf8_error_type(pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.std_module < 0 {
         return 0;
     }
-    let m = crate::front::modules::child_module(crate::front::modules::STD_MODULE,
-        intern_c(c"str"));
+    let m = crate::front::modules::child_module(pcx.std_module,
+        intern_c(c"str"), pcx);
     if m < 0 {
         return 0;
     }
-    let b = crate::front::modules::lookup::lookup_quiet(m, intern_c(c"Utf8Error"), m);
+    let b = crate::front::modules::lookup::lookup_quiet(m, intern_c(c"Utf8Error"), m, &pcx);
     if crate::front::modules::lookup::binding_kind(b) != crate::front::modules::lookup::B_ITEM {
         return 0;
     }
-    let s = struct_of_key(crate::front::modules::lookup::binding_value(b));
+    let s = struct_of_key(crate::front::modules::lookup::binding_value(b), pcx);
     if s < 0 { 0 } else { crate::front::types::struct_type(s) }
 }
 
-fn struct_of_key(key: i64) -> i64 {
+fn struct_of_key(key: i64, pcx: Ctx<Comp>) -> i64 {
     // UNSAFE: SYM_STRUCT is the checker's table of structs by item key, a
     // raw pointer.
     // SAFETY: key is a binding's item key, below SYM_COUNT, which the table
     // covers.
-    unsafe { crate::front::types::SYM_STRUCT[key] - 1 }
+    unsafe { pcx.sym_struct[key] - 1 }
 }
 
 fn tlist_at(i: i64) -> i64 {
@@ -348,79 +347,79 @@ fn tlist_at(i: i64) -> i64 {
 // over the other's type (or both numbers): distinct.mix, with the
 // conversion (of the operand that is not distinct, in an operation).
 // Returns when it is some other mismatch.
-pub fn distinct_mismatch(n: i64, expected: i64, actual: i64) {
-    if !is_distinct_type(expected) && !is_distinct_type(actual) || expected == TY_ERROR
-        || actual == TY_ERROR || n == 0 || NODES[n].end <= NODES[n].start {
+pub fn distinct_mismatch(n: i64, expected: i64, actual: i64, pcx: inout Ctx<Comp>) {
+    if !is_distinct_type(expected) && !is_distinct_type(actual) || expected == pcx.ty_error
+        || actual == pcx.ty_error || n == 0 || pcx.nodes[n].end <= pcx.nodes[n].start {
         return;
     }
     // (0.20) bytes where std's `str` goes: checked, not converted
-    if expected == STR_TYPE && !is_distinct_type(actual) && actual == TYPES[expected].a {
-        let text = SRC[NODES[n].start..NODES[n].end];
-        let saved = ERR_KIND;
-        ERR_KIND = DISTINCT_MIX;
-        err_begin(NODES[n].start);
-        err_fmt(format_args("'{text}' is '[u8]' where 'str' goes"));
-        err_help(c"a `str` is UTF-8: bytes become one through `str::from_utf8(b)` (a Result, Utf8Error when they are not); a literal with \\x80..\\xff escapes is `[u8]`");
-        if from_utf8_try_fits() {
-            err_try_fmt(format_args("str::from_utf8({text})?"));
+    if expected == pcx.str_type && !is_distinct_type(actual) && actual == TYPES[expected].a {
+        let text = SRC[pcx.nodes[n].start..pcx.nodes[n].end];
+        let saved = pcx.err_kind;
+        pcx.err_kind = DISTINCT_MIX;
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_fmt(format_args("'{text}' is '[u8]' where 'str' goes"), pcx);
+        err_help(c"a `str` is UTF-8: bytes become one through `str::from_utf8(b)` (a Result, Utf8Error when they are not); a literal with \\x80..\\xff escapes is `[u8]`", pcx);
+        if from_utf8_try_fits(&pcx) {
+            err_try_fmt(format_args("str::from_utf8({text})?"), pcx);
         } else {
-            err_help(c"; not with '?' here: the function does not return a Result whose error takes a Utf8Error (match the Result, or make the value a str where it comes from)");
+            err_help(c"; not with '?' here: the function does not return a Result whose error takes a Utf8Error (match the Result, or make the value a str where it comes from)", pcx);
         }
-        err_end_soft();
-        ERR_KIND = saved;
-        err_jump()
+        err_end_soft(&pcx);
+        pcx.err_kind = saved;
+        err_jump(&pcx)
     }
     let be = strip_distinct(expected);
     let ba = strip_distinct(actual);
     if be != ba && !(is_numeric(be) && is_numeric(ba)) {
         return;
     }
-    let saved = ERR_KIND;
-    ERR_KIND = DISTINCT_MIX;
+    let saved = pcx.err_kind;
+    pcx.err_kind = DISTINCT_MIX;
     let te = buf_new();
-    buf_type(te, expected);
+    buf_type(te, expected, pcx);
     let ta = buf_new();
-    buf_type(ta, actual);
-    let b = BINARY_NODE;
-    let in_binary = b != 0 && (NODES[b].b == n || NODES[b].c == n);
+    buf_type(ta, actual, pcx);
+    let b = pcx.binary_node;
+    let in_binary = b != 0 && (pcx.nodes[b].b == n || pcx.nodes[b].c == n);
     // What is converted, to what: in an operation, the operand that is
     // not distinct, to the other's type.
     var target = n;
     var to = te;
     if in_binary && is_distinct_type(actual) && !is_distinct_type(expected) {
-        target = if NODES[b].b == n { NODES[b].c } else { NODES[b].b };
+        target = if pcx.nodes[b].b == n { pcx.nodes[b].c } else { pcx.nodes[b].b };
         to = ta;
     }
-    let conv = conversion(target, buf_slice(to));
-    err_begin(NODES[n].start);
+    let conv = conversion(target, buf_slice(to), pcx);
+    err_begin(pcx.nodes[n].start, &pcx);
     if in_binary {
-        let whole = SRC[NODES[b].start..NODES[b].end];
-        let left = NODES[b].b == n;
+        let whole = SRC[pcx.nodes[b].start..pcx.nodes[b].end];
+        let left = pcx.nodes[b].b == n;
         let lt = if left { buf_slice(ta) } else { buf_slice(te) };
         let rt = if left { buf_slice(te) } else { buf_slice(ta) };
-        err_fmt(format_args("'{whole}' mixes '{lt}' and '{rt}'"));
-        err_help(c"a distinct type's operators take two of it (or one and a literal): convert the other operand with 'as' (free)");
-        let before = SRC[NODES[b].start..NODES[target].start];
-        let after = SRC[NODES[target].end..NODES[b].end];
-        err_try_fmt(format_args("{before}{}{after}", buf_slice(conv)));
+        err_fmt(format_args("'{whole}' mixes '{lt}' and '{rt}'"), pcx);
+        err_help(c"a distinct type's operators take two of it (or one and a literal): convert the other operand with 'as' (free)", pcx);
+        let before = SRC[pcx.nodes[b].start..pcx.nodes[target].start];
+        let after = SRC[pcx.nodes[target].end..pcx.nodes[b].end];
+        err_try_fmt(format_args("{before}{}{after}", buf_slice(conv)), pcx);
     } else {
-        let text = SRC[NODES[n].start..NODES[n].end];
-        err_fmt(format_args("'{text}' is '{}' where '{}' goes", buf_slice(ta), buf_slice(te)));
+        let text = SRC[pcx.nodes[n].start..pcx.nodes[n].end];
+        err_fmt(format_args("'{text}' is '{}' where '{}' goes", buf_slice(ta), buf_slice(te)), pcx);
         err_help(
-            c"a distinct type and its underlying type do not mix: convert with 'as' (free)");
-        err_try_fmt(buf_slice(conv));
+            c"a distinct type and its underlying type do not mix: convert with 'as' (free)", pcx);
+        err_try_fmt(buf_slice(conv), pcx);
     }
-    err_fix(NODES[target].start, NODES[target].end, buf_slice(conv));
-    err_end_soft();
-    ERR_KIND = saved;
-    err_jump()
+    err_fix(pcx.nodes[target].start, pcx.nodes[target].end, buf_slice(conv), &pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
+    err_jump(&pcx)
 }
 
 // `x as T` for expression node n (in parentheses when an operator would
 // bind it), in a new buffer.
-fn conversion(n: i64, to: [u8]) -> i64 {
-    let text = SRC[NODES[n].start..NODES[n].end];
-    let k = NODES[n].kind;
+fn conversion(n: i64, to: [u8], pcx: Ctx<Comp>) -> i64 {
+    let text = SRC[pcx.nodes[n].start..pcx.nodes[n].end];
+    let k = pcx.nodes[n].kind;
     let simple = !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
         || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
         || k == NodeKind::Block || k == NodeKind::Closure);
@@ -436,44 +435,44 @@ fn conversion(n: i64, to: [u8]) -> i64 {
 // `x.name(..)` (call n, receiver node `receiver`) where x is of distinct
 // type t, which has no method `name`: distinct.method when t's underlying
 // type has it. Returns otherwise.
-pub fn distinct_method_error(n: i64, receiver: i64, t: i64, name: i64) {
+pub fn distinct_method_error(n: i64, receiver: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) {
     if !is_distinct_type(t) {
         return;
     }
     let base = strip_distinct(t);
-    if crate::front::check::calls::method_of(base, name) < 0 {
+    if crate::front::check::calls::method_of(base, name, pcx) < 0 {
         return;
     }
-    let saved = ERR_KIND;
-    ERR_KIND = DISTINCT_METHOD;
+    let saved = pcx.err_kind;
+    pcx.err_kind = DISTINCT_METHOD;
     let tt = buf_new();
-    buf_type(tt, t);
+    buf_type(tt, t, pcx);
     let tb = buf_new();
-    buf_type(tb, base);
-    let text = SRC[NODES[receiver].start..NODES[receiver].end];
+    buf_type(tb, base, pcx);
+    let text = SRC[pcx.nodes[receiver].start..pcx.nodes[receiver].end];
     let mname = SYMS[name].text;
-    err_begin(NODES[n].start);
+    err_begin(pcx.nodes[n].start, &pcx);
     err_fmt(format_args("'{mname}' is a method of '{}', not of '{}'", buf_slice(tb),
-        buf_slice(tt)));
-    err_help(c"a distinct type has only the methods its own impl gives it: convert to call the underlying type's");
+        buf_slice(tt)), pcx);
+    err_help(c"a distinct type has only the methods its own impl gives it: convert to call the underlying type's", pcx);
     let conv = buf_new();
     buf_fmt(conv, format_args("({text} as {})", buf_slice(tb)));
-    err_try_fmt(format_args("{}.{mname}(..)", buf_slice(conv)));
-    err_fix(NODES[receiver].start, NODES[receiver].end, buf_slice(conv));
-    err_end_soft();
-    ERR_KIND = saved;
-    err_jump()
+    err_try_fmt(format_args("{}.{mname}(..)", buf_slice(conv)), pcx);
+    err_fix(pcx.nodes[receiver].start, pcx.nodes[receiver].end, buf_slice(conv), &pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
+    err_jump(&pcx)
 }
 
 // ---- The traits ----
 
 // Whether distinct type t has trait tr without an impl: Eq, Ord, Hash,
 // Debug, Display and Clone, when its underlying type has them.
-pub fn distinct_inherits(tr: i64, t: i64) -> bool {
+pub fn distinct_inherits(tr: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
     let names: [*u8; 6] = [c"Eq", c"Ord", c"Hash", c"Debug", c"Display", c"Clone"];
     for i in 0..6 {
-        if tr == std_trait(names[i]) {
-            return implements(tr, TYPES[t].a);
+        if tr == std_trait(names[i], &pcx) {
+            return implements(tr, TYPES[t].a, &pcx);
         }
     }
     false
@@ -483,13 +482,13 @@ pub fn distinct_inherits(tr: i64, t: i64) -> bool {
 // an impl of the method's trait (0: none): distinct_eq, distinct_cmp,
 // distinct_hash, distinct_fmt, distinct_fmt_debug or distinct_clone
 // (std/clone.vl), with t and its underlying type as arguments.
-pub fn distinct_helper(t: i64, name: i64) -> i64 {
+pub fn distinct_helper(t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
     let text = SYMS[name].text;
     let tr = if text == "eq" { c"Eq" } else if text == "cmp" { c"Ord" }
         else if text == "hash" { c"Hash" } else if text == "fmt" { c"Display" }
         else if text == "fmt_debug" { c"Debug" } else if text == "clone" { c"Clone" }
         else { return 0; };
-    if !implements(std_trait(tr), TYPES[t].a) {
+    if !implements(std_trait(tr, &pcx), TYPES[t].a, &pcx) {
         return 0;
     }
     let b = buf_new();
@@ -499,32 +498,32 @@ pub fn distinct_helper(t: i64, name: i64) -> i64 {
 
 // The symbol prefix of the methods of generic distinct template tpl
 // (`impl<T> NonNull<T>`): its alias's symbol.
-pub fn distinct_tpl_symbol(tpl: i64) -> i64 {
+pub fn distinct_tpl_symbol(tpl: i64, pcx: inout Ctx<Comp>) -> i64 {
     let alias = tpl - crate::front::generics::TPL_DISTINCT;
-    crate::front::modules::item_symbol(module_of(alias), NODES[alias].a)
+    crate::front::modules::item_symbol(module_of(alias, &pcx), pcx.nodes[alias].a, &pcx)
 }
 
 // ---- `p.is_null()` ----
 
 // `p.is_null()` (call n, p of raw pointer type, checked): becomes
 // `p as u64 == 0`; its type.
-pub fn null_test(n: i64) -> i64 {
-    let receiver = NODES[n].a;
-    let (start, end) = (NODES[n].start, NODES[n].end);
-    NODES[receiver].p |= NODE_CHECKED;
-    let u64_name = new_node(NodeKind::TyName, start, end);
-    NODES[u64_name].a = intern_c(c"u64");
-    let cast = new_node(NodeKind::Cast, start, end);
-    NODES[cast].a = receiver;
-    NODES[cast].b = u64_name;
-    let zero = new_node(NodeKind::Int, start, end);
-    NODES[zero].b = SUF_NONE;
-    let test = new_node(NodeKind::Binary, start, end);
-    NODES[test].op = Tok::EqEq;
-    NODES[test].b = cast;
-    NODES[test].c = zero;
-    let ty = crate::front::check::synth_mode::synth_expr(test);
-    NODES[n] = NODES[test];
+pub fn null_test(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let receiver = pcx.nodes[n].a;
+    let (start, end) = (pcx.nodes[n].start, pcx.nodes[n].end);
+    pcx.nodes[receiver].p |= NODE_CHECKED;
+    let u64_name = new_node(NodeKind::TyName, start, end, &pcx);
+    pcx.nodes[u64_name].a = intern_c(c"u64");
+    let cast = new_node(NodeKind::Cast, start, end, &pcx);
+    pcx.nodes[cast].a = receiver;
+    pcx.nodes[cast].b = u64_name;
+    let zero = new_node(NodeKind::Int, start, end, &pcx);
+    pcx.nodes[zero].b = SUF_NONE;
+    let test = new_node(NodeKind::Binary, start, end, &pcx);
+    pcx.nodes[test].op = Tok::EqEq;
+    pcx.nodes[test].b = cast;
+    pcx.nodes[test].c = zero;
+    let ty = crate::front::check::synth_mode::synth_expr(test, &pcx);
+    pcx.nodes[n] = pcx.nodes[test];
     ty
 }
 
@@ -534,57 +533,57 @@ pub fn null_test(n: i64) -> i64 {
 // null p is a run-time failure, as `n as E` of a value E lacks is; the
 // niche would read `Some(p)` back as None otherwise. It becomes
 //     { let ==nn = p; if ==nn as u64 == 0 { <panic> } ==nn }
-pub fn nonnull_cast(n: i64, operand: i64, to: i64) -> i64 {
-    let (start, end) = (NODES[n].start, NODES[n].end);
+pub fn nonnull_cast(n: i64, operand: i64, to: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let (start, end) = (pcx.nodes[n].start, pcx.nodes[n].end);
     let name = intern_c(c"==nn");
-    NODES[operand].p |= NODE_CHECKED;
-    let bind = new_node(NodeKind::PatBind, start, end);
-    NODES[bind].a = name;
-    let let_p = new_node(NodeKind::Let, start, end);
-    NODES[let_p].a = bind;
-    NODES[let_p].c = operand;
-    let u64_name = new_node(NodeKind::TyName, start, end);
-    NODES[u64_name].a = intern_c(c"u64");
-    let cast = new_node(NodeKind::Cast, start, end);
-    NODES[cast].a = local_ident(name, n);
-    NODES[cast].b = u64_name;
-    let zero = new_node(NodeKind::Int, start, end);
-    NODES[zero].b = SUF_NONE;
-    let test = new_node(NodeKind::Binary, start, end);
-    NODES[test].op = Tok::EqEq;
-    NODES[test].b = cast;
-    NODES[test].c = zero;
-    let panic = new_node(NodeKind::EnumPanic, start, end);
-    NODES[panic].a = local_ident(name, n);
-    NODES[panic].x = message_kind(fixed_message("null pointer made NonNull\n"));
-    let then = new_node(NodeKind::Block, start, end);
-    let tmark = list_begin();
-    list_push(expr_stmt(panic));
-    list_end(then, tmark);
-    let check = new_node(NodeKind::If, start, end);
-    NODES[check].a = test;
-    NODES[check].b = then;
-    let block = new_node(NodeKind::Block, start, end);
-    let mark = list_begin();
-    list_push(let_p);
-    list_push(expr_stmt(check));
-    list_end(block, mark);
-    NODES[block].a = local_ident(name, n);
-    crate::front::check::synth_mode::synth_expr(block);
-    NODES[n] = NODES[block];
+    pcx.nodes[operand].p |= NODE_CHECKED;
+    let bind = new_node(NodeKind::PatBind, start, end, &pcx);
+    pcx.nodes[bind].a = name;
+    let let_p = new_node(NodeKind::Let, start, end, &pcx);
+    pcx.nodes[let_p].a = bind;
+    pcx.nodes[let_p].c = operand;
+    let u64_name = new_node(NodeKind::TyName, start, end, &pcx);
+    pcx.nodes[u64_name].a = intern_c(c"u64");
+    let cast = new_node(NodeKind::Cast, start, end, &pcx);
+    pcx.nodes[cast].a = local_ident(name, n, &pcx);
+    pcx.nodes[cast].b = u64_name;
+    let zero = new_node(NodeKind::Int, start, end, &pcx);
+    pcx.nodes[zero].b = SUF_NONE;
+    let test = new_node(NodeKind::Binary, start, end, &pcx);
+    pcx.nodes[test].op = Tok::EqEq;
+    pcx.nodes[test].b = cast;
+    pcx.nodes[test].c = zero;
+    let panic = new_node(NodeKind::EnumPanic, start, end, &pcx);
+    pcx.nodes[panic].a = local_ident(name, n, &pcx);
+    pcx.nodes[panic].x = message_kind(fixed_message("null pointer made NonNull\n", &pcx), &pcx);
+    let then = new_node(NodeKind::Block, start, end, &pcx);
+    let tmark = list_begin(pcx);
+    list_push(expr_stmt(panic, &pcx), &pcx);
+    list_end(then, tmark, &pcx);
+    let check = new_node(NodeKind::If, start, end, &pcx);
+    pcx.nodes[check].a = test;
+    pcx.nodes[check].b = then;
+    let block = new_node(NodeKind::Block, start, end, &pcx);
+    let mark = list_begin(pcx);
+    list_push(let_p, &pcx);
+    list_push(expr_stmt(check, &pcx), &pcx);
+    list_end(block, mark, &pcx);
+    pcx.nodes[block].a = local_ident(name, n, &pcx);
+    crate::front::check::synth_mode::synth_expr(block, &pcx);
+    pcx.nodes[n] = pcx.nodes[block];
     to
 }
 
-fn local_ident(name: i64, at: i64) -> i64 {
-    let n = new_node(NodeKind::Ident, NODES[at].start, NODES[at].end);
-    NODES[n].a = name;
+fn local_ident(name: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let n = new_node(NodeKind::Ident, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
+    pcx.nodes[n].a = name;
     n
 }
 
-fn expr_stmt(e: i64) -> i64 {
-    let s = new_node(NodeKind::ExprStmt, NODES[e].start, NODES[e].end);
-    NODES[s].a = e;
-    NODES[s].b = 1;
+fn expr_stmt(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let s = new_node(NodeKind::ExprStmt, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[s].a = e;
+    pcx.nodes[s].b = 1;
     s
 }
 
@@ -593,62 +592,63 @@ fn expr_stmt(e: i64) -> i64 {
 // Once the program checks: every distinct type replaced by its
 // underlying type where the code generators read types
 // (front/distinct.vl).
-pub fn erase_program_types() {
-    if !ANY_DISTINCT {
+pub fn erase_program_types(pcx: inout Ctx<Comp>) {
+    if !pcx.any_distinct {
         return;
     }
     // (the niche is decided while the variants' types are distinct)
-    for e in 0..ENUM_COUNT {
-        enum_niche(e);
+    for e in 0..pcx.enum_count {
+        enum_niche(e, pcx);
     }
-    erase_all_types();
+    erase_all_types(&pcx);
 }
 
 // (0.20) Before the own pass: std's `str` (a distinct type over `[u8]`)
 // replaced by `[u8]` everywhere, so that the own pass checks it as the
 // view it is; other distinct types stay until erase_program_types.
-pub fn erase_view_distincts() {
-    if !ANY_VIEW_DISTINCT {
+pub fn erase_view_distincts(pcx: inout Ctx<Comp>) {
+    if !pcx.any_view_distinct {
         return;
     }
-    ERASE_VIEWS_ONLY = true;
-    reset_erased();
-    erase_all_types();
-    ERASE_VIEWS_ONLY = false;
-    reset_erased();
+    pcx.erase_views_only = true;
+    reset_erased(&pcx);
+    erase_all_types(&pcx);
+    pcx.erase_views_only = false;
+    reset_erased(&pcx);
 }
 
 // The types of every node, field, function, variant, static, constant and
 // local, erased (erase_type, in its mode).
-fn erase_all_types() {
+fn erase_all_types(pcx: inout Ctx<Comp>) {
     unsafe {
         let types = type_count();
-        for n in 0..NODES.len() {
-            let t = NODES[n].ty;
+        for n in 0..pcx.nodes.len() {
+            let t = pcx.nodes[n].ty;
             if t > 0 && t < types {
-                NODES[n].ty = erase_type(t);
+                pcx.nodes[n].ty = erase_type(t, &pcx);
             }
         }
-        for i in 0..FIELD_COUNT {
-            FIELDS[i].ty = erase_type(FIELDS[i].ty);
+        for i in 0..pcx.field_count {
+            FIELDS[i].ty = erase_type(FIELDS[i].ty, &pcx);
         }
-        for f in 0..FN_COUNT {
-            FNS[f].ret = erase_type(FNS[f].ret);
-            FNS[f].self_ty = erase_type(FNS[f].self_ty);
-            FNS[f].params = erase_list(FNS[f].params, FNS[f].param_count);
+        for f in 0..pcx.fn_count {
+            pcx.fns[f].ret = erase_type(pcx.fns[f].ret, &pcx);
+            pcx.fns[f].self_ty = erase_type(pcx.fns[f].self_ty, &pcx);
+            pcx.fns[f].params = erase_list(pcx.fns[f].params, pcx.fns[f].param_count, &pcx);
         }
-        for v in 0..VARIANT_COUNT {
-            VARIANTS[v].fields = erase_list(VARIANTS[v].fields, VARIANTS[v].field_count);
-            VARIANTS[v].shape = erase_type(VARIANTS[v].shape);
+        for v in 0..pcx.variant_count {
+            pcx.variants[v].fields = erase_list(pcx.variants[v].fields, pcx.variants[v].field_count,
+                &pcx);
+            pcx.variants[v].shape = erase_type(pcx.variants[v].shape, &pcx);
         }
-        for i in 0..STATIC_COUNT {
-            STATICS[i].ty = erase_type(STATICS[i].ty);
+        for i in 0..pcx.static_count {
+            pcx.statics[i].ty = erase_type(pcx.statics[i].ty, &pcx);
         }
-        for i in 0..CONST_COUNT {
-            CONSTS[i].ty = erase_type(CONSTS[i].ty);
+        for i in 0..pcx.const_count {
+            pcx.consts[i].ty = erase_type(pcx.consts[i].ty, &pcx);
         }
-        for i in 0..LOCAL_COUNT {
-            LOCALS[i].ty = erase_type(LOCALS[i].ty);
+        for i in 0..pcx.local_count {
+            pcx.locals[i].ty = erase_type(pcx.locals[i].ty, &pcx);
         }
     }
 }

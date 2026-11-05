@@ -24,21 +24,14 @@
 
 use crate::back::dwarf::file_and_line;
 use crate::base::{
-    BUFS, FILES, IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c, out_path,
-    sym_name,
+    BUFS, IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c, out_path, sym_name,
 };
-use crate::front::ast::NODES;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::lexer::add_string;
-use crate::front::types::{FNS, SYM_FN, SYM_STATIC, TY_I64, TY_U64};
-use crate::gen0::gen::MAIN_SYM;
+use crate::front::types::{TY_I64, TY_U64};
 use crate::middle::ctx::FnCtx;
-use crate::middle::inline::FN_LIVE;
-use crate::middle::ir::{
-    FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter, ir_insert_before, ir_make,
-};
-
-pub static var TRACE: bool = false;
-pub static var TRACE_MODULE: i64 = -1;
+use crate::middle::ir::{IRFUNCS, Op, Term, ir_append, ir_enter, ir_insert_before, ir_make};
 
 // The runtime, the module __trace.
 pub fn trace_runtime_source(out: i64) {
@@ -138,26 +131,26 @@ pub fn trace_runtime_source(out: i64) {
 
 // Whether IR function fi keeps a frame: a function of the program's own
 // files (not of a synthesized source: std, the runtimes, C imports).
-fn traced(fi: i64) -> bool {
+fn traced(fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let start = NODES[IRFUNCS[fi].item].start;
-        let file = file_and_line(start) >> 32;
-        FILES[file].path[0] != '<'
+        let start = pcx.nodes[IRFUNCS[fi].item].start;
+        let file = file_and_line(start, pcx) >> 32;
+        pcx.files[file].path[0] != '<'
     }
 }
 
 // The site string "FILE:LINE  NAME" of position pos (0: the function's
 // own position) in function fi.
-fn site(fi: i64, pos: i64) -> i64 {
+fn site(fi: i64, pos: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let at = if pos > 0 { pos } else { NODES[IRFUNCS[fi].item].start };
-        let fl = file_and_line(at);
+        let at = if pos > 0 { pos } else { pcx.nodes[IRFUNCS[fi].item].start };
+        let fl = file_and_line(at, pcx);
         let b = buf_new();
-        buf_str(b, out_path(fl >> 32));
+        buf_str(b, out_path(fl >> 32, pcx));
         buf_byte(b, ':');
         crate::base::buf_int(b, fl & 4294967295);
         buf_bytes(b, "  ");
-        let name = sym_name(FNS[IRFUNCS[fi].f].name);
+        let name = sym_name(pcx.fns[IRFUNCS[fi].f].name);
         var len = 0;
         while name[len] != 0 {
             len += 1;
@@ -258,15 +251,15 @@ fn type_code(s: [u8], k: i64, out: i64) -> i64 {
 
 // The site string of position pos in function fi, one per line: `lines`
 // holds the lines made (file_and_line), `sids` their strings.
-fn site_of(fi: i64, pos: i64, lines: inout IntVec, sids: inout IntVec) -> i64 {
+fn site_of(fi: i64, pos: i64, lines: inout IntVec, sids: inout IntVec, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let line = file_and_line(pos);
+        let line = file_and_line(pos, pcx);
         for j in 0..lines.count {
             if lines.data[j] == line {
                 return sids.data[j];
             }
         }
-        let sid = site(fi, pos);
+        let sid = site(fi, pos, pcx);
         lines.push(line);
         sids.push(sid);
         sid
@@ -299,10 +292,10 @@ fn put_before(cx: inout FnCtx, b: i64, at: i64, list: IntVec) {
 }
 
 // FRAMES[slot] = the string `sid`, before `at` in block b.
-fn store_site(cx: inout FnCtx, b: i64, at: i64, slot: i64, sid: i64) {
+fn store_site(cx: inout FnCtx, b: i64, at: i64, slot: i64, sid: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let s = ir_make(&cx, Op::SAddr, TY_U64, 0, 0, sid);
-        let st = ir_make(&cx, Op::Store, 0, slot, s, 0);
+        let s = ir_make(&cx, Op::SAddr, TY_U64, 0, 0, sid, pcx);
+        let st = ir_make(&cx, Op::Store, 0, slot, s, 0, pcx);
         cx.insts[st].imm2 = TY_U64;
         var list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         list.push(s);
@@ -312,9 +305,9 @@ fn store_site(cx: inout FnCtx, b: i64, at: i64, slot: i64, sid: i64) {
 }
 
 // A call of `callee` (an FNS index) with no arguments, before `at`.
-fn call_before(cx: inout FnCtx, b: i64, at: i64, callee: i64) {
+fn call_before(cx: inout FnCtx, b: i64, at: i64, callee: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let call = ir_make(&cx, Op::Call, 0, 0, 0, callee);
+        let call = ir_make(&cx, Op::Call, 0, 0, 0, callee, pcx);
         cx.insts[call].args = cx.args.count;
         cx.insts[call].nargs = 0;
         var list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -323,34 +316,34 @@ fn call_before(cx: inout FnCtx, b: i64, at: i64, callee: i64) {
     }
 }
 
-fn instrument_function(cx: inout FnCtx, fi: i64, depth_sym: i64, frames_sym: i64) {
+fn instrument_function(cx: inout FnCtx, fi: i64, depth_sym: i64, frames_sym: i64, pcx: Ctx<Comp>) {
     unsafe {
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         let entry = IRFUNCS[fi].entry;
         if cx.blocks[entry].preds.count > 0 {
             // (an entry that is also a loop's header would push each time)
             return;
         }
         let at = body_start(&cx, entry);
-        let g = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, depth_sym);
-        let d = ir_make(&cx, Op::Load, TY_I64, g, 0, 0);
-        let one = ir_make(&cx, Op::Const, TY_I64, 0, 0, 1);
-        let d1 = ir_make(&cx, Op::Add, TY_I64, d, one, 0);
-        let st = ir_make(&cx, Op::Store, 0, g, d1, 0);
+        let g = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, depth_sym, pcx);
+        let d = ir_make(&cx, Op::Load, TY_I64, g, 0, 0, pcx);
+        let one = ir_make(&cx, Op::Const, TY_I64, 0, 0, 1, pcx);
+        let d1 = ir_make(&cx, Op::Add, TY_I64, d, one, 0, pcx);
+        let st = ir_make(&cx, Op::Store, 0, g, d1, 0, pcx);
         cx.insts[st].imm2 = TY_I64;
-        let base = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, frames_sym);
-        let mask = ir_make(&cx, Op::Const, TY_I64, 0, 0, 4095);
-        let m = ir_make(&cx, Op::And, TY_I64, d, mask, 0);
-        let three = ir_make(&cx, Op::Const, TY_I64, 0, 0, 3);
-        let off = ir_make(&cx, Op::Shl, TY_I64, m, three, 0);
-        let slot = ir_make(&cx, Op::Add, TY_U64, base, off, 0);
+        let base = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, frames_sym, pcx);
+        let mask = ir_make(&cx, Op::Const, TY_I64, 0, 0, 4095, pcx);
+        let m = ir_make(&cx, Op::And, TY_I64, d, mask, 0, pcx);
+        let three = ir_make(&cx, Op::Const, TY_I64, 0, 0, 3, pcx);
+        let off = ir_make(&cx, Op::Shl, TY_I64, m, three, 0, pcx);
+        let slot = ir_make(&cx, Op::Add, TY_U64, base, off, 0, pcx);
         var list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let parts: [i64; 11] = [g, d, one, d1, st, base, mask, m, three, off, slot];
         for i in 0..11 {
             list.push(parts[i]);
         }
         put_before(&cx, entry, at, list);
-        store_site(&cx, entry, at, slot, site(fi, 0));
+        store_site(&cx, entry, at, slot, site(fi, 0, pcx), pcx);
         // The sites of the calls (one string per line), the returns.
         var lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var sids = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -377,9 +370,9 @@ fn instrument_function(cx: inout FnCtx, fi: i64, depth_sym: i64, frames_sym: i64
                 }
                 if w != 0 {
                     let pos = cx.inst_loc.data[w] - 1;
-                    last = file_and_line(pos);
+                    last = file_and_line(pos, pcx);
                     store_site(&cx, b, body_start(&cx, b), slot,
-                        site_of(fi, pos, &lines, &sids));
+                        site_of(fi, pos, &lines, &sids, pcx), pcx);
                 }
             }
             var v = cx.blocks[b].first;
@@ -387,17 +380,17 @@ fn instrument_function(cx: inout FnCtx, fi: i64, depth_sym: i64, frames_sym: i64
                 let next = cx.insts[v].next;
                 if cx.insts[v].op.is_call() && cx.inst_loc.data[v] > 0 {
                     let pos = cx.inst_loc.data[v] - 1;
-                    let line = file_and_line(pos);
+                    let line = file_and_line(pos, pcx);
                     if line != last {
-                        store_site(&cx, b, v, slot, site_of(fi, pos, &lines, &sids));
+                        store_site(&cx, b, v, slot, site_of(fi, pos, &lines, &sids, pcx), pcx);
                         last = line;
                     }
                 }
                 v = next;
             }
             if cx.blocks[b].term == Term::Ret {
-                let g2 = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, depth_sym);
-                let restore = ir_make(&cx, Op::Store, 0, g2, d, 0);
+                let g2 = ir_make(&cx, Op::GAddr, TY_U64, 0, 0, depth_sym, pcx);
+                let restore = ir_make(&cx, Op::Store, 0, g2, d, 0, pcx);
                 cx.insts[restore].imm2 = TY_I64;
                 ir_append(&cx, b, g2);
                 ir_append(&cx, b, restore);
@@ -411,28 +404,29 @@ fn instrument_function(cx: inout FnCtx, fi: i64, depth_sym: i64, frames_sym: i64
 
 // --trace: every function's frame; main starts the runtime; std::panic
 // dumps the frames.
-pub fn trace_after_lowering(cx: inout FnCtx) {
+pub fn trace_after_lowering(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        if !TRACE {
+        if !pcx.trace {
             return;
         }
         let depth_sym = intern_c(c"__trace.DEPTH");
         let frames_sym = intern_c(c"__trace.FRAMES");
-        let start = SYM_FN[intern_c(c"__trace::start")] - 1;
-        let dump = SYM_FN[intern_c(c"__trace::__vole_trace_dump")] - 1;
-        if SYM_STATIC[depth_sym] == 0 || SYM_STATIC[frames_sym] == 0 || start < 0 || dump < 0 {
+        let start = pcx.sym_fn[intern_c(c"__trace::start")] - 1;
+        let dump = pcx.sym_fn[intern_c(c"__trace::__vole_trace_dump")] - 1;
+        if pcx.sym_static[depth_sym] == 0 || pcx.sym_static[frames_sym] == 0 || start < 0
+            || dump < 0 {
             return;
         }
-        let note = SYM_FN[intern_c(c"std::panic_note")] - 1;
-        let panic = SYM_FN[intern_c(c"std::panic")] - 1;
-        for fi in 0..IRFUNC_COUNT {
+        let note = pcx.sym_fn[intern_c(c"std::panic_note")] - 1;
+        let panic = pcx.sym_fn[intern_c(c"std::panic")] - 1;
+        for fi in 0..pcx.irfunc_count {
             let f = IRFUNCS[fi].f;
-            if FNS[f].module == TRACE_MODULE {
+            if pcx.fns[f].module == pcx.trace_module {
                 continue;
             }
             if note >= 0 && f == panic {
                 // std::panic's note: the frames instead.
-                ir_enter(&cx, fi);
+                ir_enter(&cx, fi, pcx);
                 let blocks = IRFUNCS[fi].blocks;
                 for k in 0..blocks.count {
                     var v = cx.blocks[blocks.data[k]].first;
@@ -444,13 +438,13 @@ pub fn trace_after_lowering(cx: inout FnCtx) {
                     }
                 }
             }
-            if traced(fi) {
-                instrument_function(&cx, fi, depth_sym, frames_sym);
+            if traced(fi, pcx) {
+                instrument_function(&cx, fi, depth_sym, frames_sym, pcx);
             }
-            if FNS[f].name == MAIN_SYM {
-                ir_enter(&cx, fi);
+            if pcx.fns[f].name == pcx.main_sym {
+                ir_enter(&cx, fi, pcx);
                 let entry = IRFUNCS[fi].entry;
-                call_before(&cx, entry, body_start(&cx, entry), start);
+                call_before(&cx, entry, body_start(&cx, entry), start, pcx);
             }
         }
     }
@@ -458,13 +452,14 @@ pub fn trace_after_lowering(cx: inout FnCtx) {
 
 // The runtime's `dump` (an FNS index) when it is emitted, for rt.panic
 // to call; -1: none (no --trace, or nothing reaches it).
-pub fn trace_dump_fn() -> i64 {
+pub fn trace_dump_fn(pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if !TRACE {
+        if !pcx.trace {
             return -1;
         }
-        let f = SYM_FN[intern_c(c"__trace::__vole_trace_dump")] - 1;
-        if f < 0 || FN_IR[f] == 0 || FN_LIVE == 0 as *i64 || FN_LIVE[FN_IR[f] - 1] == 0 {
+        let f = pcx.sym_fn[intern_c(c"__trace::__vole_trace_dump")] - 1;
+        if f < 0 || pcx.fn_ir[f] == 0 || pcx.fn_live == 0 as *i64
+            || pcx.fn_live[pcx.fn_ir[f] - 1] == 0 {
             return -1;
         }
         f

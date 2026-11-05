@@ -22,24 +22,24 @@
 pub mod intrinsic;
 
 use crate::base::{
-    BUFS, IntVec, SRC, SYMS, _setjmp, add_source, buf_bytes, buf_clear, buf_int, buf_new, buf_str,
-    cstr, intern_c, sym_name, sym_text,
+    BUFS, SRC, SYMS, _setjmp, add_source, buf_bytes, buf_clear, buf_int, buf_new, buf_str, cstr,
+    intern_c, sym_name, sym_text,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, RECOVER_DEPTH, edit_distance, err_begin, err_end_soft, err_fmt, err_help,
-    err_help_fmt, err_str, recover_enter, recover_leave,
+    edit_distance, err_begin, err_end_soft, err_fmt, err_help, err_help_fmt, err_str, recover_enter,
+    recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_DERIVED, NODES, NODE_REF, NodeKind, SCRATCH, child, list_begin, list_end,
-    list_push,
+    FN_BODY_FAILED, FN_DERIVED, NODE_REF, NodeKind, child, list_begin, list_end, list_push,
 };
-use crate::front::check::PROGRAM;
-use crate::front::lexer::{TOK_COUNT, lex_range};
+use crate::front::lexer::lex_range;
 use crate::front::parser::parse_items_fragment;
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
-    ENUMS, ENUM_COUNT, STRUCTS, STRUCT_COUNT, TYPES, TyKind, VARIANTS, buf_type, enum_variant,
-    err_type, is_float, struct_field, type_elem, variant_field,
+    ENUMS, TYPES, TyKind, buf_type, enum_variant, err_type, is_float, struct_field, type_elem,
+    variant_field,
 };
 
 // What a derive names (the D_* codes), by the name written.
@@ -49,103 +49,95 @@ const D_HASH: i64 = 3;
 const D_DEBUG: i64 = 4;
 const D_CLONE: i64 = 5;
 
-// The text of the impls being made, and where its spans change: pairs
-// (offset in GEN, node whose span the code from there on gets).
-static var GEN: i64 = -1;
-static var SPANS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The derives, in the order their impls are written: (item, the derive's
-// TyName, D_* code, the Impl node once parsed; 0 for Eq).
-static var DERIVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // ---- Expansion ----
 
 // The derives of the program's structs and enums, expanded into impls
 // (after the modules are loaded, before collect_names).
-pub fn expand_derives() {
+pub fn expand_derives(pcx: inout Ctx<Comp>) {
     unsafe {
-        if GEN < 0 {
-            GEN = buf_new();
+        if pcx.derive_gen < 0 {
+            pcx.derive_gen = buf_new();
         }
-        buf_clear(GEN);
-        SPANS.count = 0;
-        DERIVED.count = 0;
-        for i in 0..NODES[PROGRAM].count {
-            let item = child(PROGRAM, i);
-            let kind = NODES[item].kind;
-            if (kind == NodeKind::Struct || kind == NodeKind::Enum) && NODES[item].h != 0 {
-                expand_item(item);
+        buf_clear(pcx.derive_gen);
+        pcx.spans.count = 0;
+        pcx.derived.count = 0;
+        for i in 0..pcx.nodes[pcx.program].count {
+            let item = child(pcx.program, i, pcx);
+            let kind = pcx.nodes[item].kind;
+            if (kind == NodeKind::Struct || kind == NodeKind::Enum) && pcx.nodes[item].h != 0 {
+                expand_item(item, &pcx);
             }
         }
-        if BUFS[GEN].len > 0 {
-            parse_derived();
+        if BUFS[pcx.derive_gen].len > 0 {
+            parse_derived(&pcx);
         }
     }
 }
 
 // The derives of struct or enum `item`.
-fn expand_item(item: i64) {
-    let holder = NODES[item].h;
-    for k in 0..NODES[holder].count {
-        let d = child(holder, k);
-        let code = derive_code(d, item);
+fn expand_item(item: i64, pcx: inout Ctx<Comp>) {
+    let holder = pcx.nodes[item].h;
+    for k in 0..pcx.nodes[holder].count {
+        let d = child(holder, k, pcx);
+        let code = derive_code(d, item, &pcx);
         if code == 0 {
             continue;
         }
-        if (0..k).any(|j| derive_code_quiet(child(holder, j)) == code) {
-            err_begin(NODES[d].start);
-            err_fmt(format_args("'{}' is derived twice", sym_text(NODES[d].a)));
-            err_help(c"remove one of them");
-            err_end_soft();
+        if (0..k).any(|j| derive_code_quiet(child(holder, j, pcx), pcx) == code) {
+            err_begin(pcx.nodes[d].start, &pcx);
+            err_fmt(format_args("'{}' is derived twice", sym_text(pcx.nodes[d].a)), pcx);
+            err_help(c"remove one of them", pcx);
+            err_end_soft(&pcx);
             continue;
         }
-        if code == D_CLONE && inout_field(item) > 0 {
+        if code == D_CLONE && inout_field(item, pcx) > 0 {
             // (0.25) a struct holding an inout access is move-only: no
             // copy of it, so no Clone
-            let f = inout_field(item);
-            err_begin(NODES[d].start);
-            err_fmt(format_args("'{}' cannot derive Clone: its field '{}' is an inout access, so the struct is move-only (a copy would be a second exclusive access)", sym_text(NODES[item].a), sym_text(NODES[f].a)));
-            err_help(c"remove Clone; move the value, or build a new one from the place");
-            err_end_soft();
+            let f = inout_field(item, pcx);
+            err_begin(pcx.nodes[d].start, &pcx);
+            err_fmt(format_args("'{}' cannot derive Clone: its field '{}' is an inout access, so the struct is move-only (a copy would be a second exclusive access)", sym_text(pcx.nodes[item].a), sym_text(pcx.nodes[f].a)), pcx);
+            err_help(c"remove Clone; move the value, or build a new one from the place", pcx);
+            err_end_soft(&pcx);
             continue;
         }
-        DERIVED.push(item);
-        DERIVED.push(d);
-        DERIVED.push(code);
-        DERIVED.push(0);
-        write_impl(item, d, code);
+        pcx.derived.push(item);
+        pcx.derived.push(d);
+        pcx.derived.push(code);
+        pcx.derived.push(0);
+        write_impl(item, d, code, &pcx);
     }
 }
 
 // The D_* code of derive `d` (a TyName), or 0 (after an error: not a
 // trait that derives).
-fn derive_code(d: i64, item: i64) -> i64 {
-    let code = derive_code_quiet(d);
+fn derive_code(d: i64, item: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let code = derive_code_quiet(d, pcx);
     if code != 0 {
         return code;
     }
-    let name = NODES[d].a;
-    err_begin(NODES[d].start);
-    if NODES[d].kind != NodeKind::TyName || NODES[d].g != 0 {
-        err_str(c"#[derive] takes trait names: Eq, Ord, Hash, Debug, Clone");
-        err_end_soft();
+    let name = pcx.nodes[d].a;
+    err_begin(pcx.nodes[d].start, &pcx);
+    if pcx.nodes[d].kind != NodeKind::TyName || pcx.nodes[d].g != 0 {
+        err_str(c"#[derive] takes trait names: Eq, Ord, Hash, Debug, Clone", pcx);
+        err_end_soft(&pcx);
         return 0;
     }
     err_fmt(format_args("cannot derive '{}' (derivable: Eq, Ord, Hash, Debug, Clone)",
-        sym_text(name)));
+        sym_text(name)), pcx);
     let text = SYMS[name].text;
     if text == "PartialEq" {
-        err_help(c"vole's Eq is Rust's PartialEq: derive Eq");
+        err_help(c"vole's Eq is Rust's PartialEq: derive Eq", pcx);
     } else if text == "PartialOrd" {
-        err_help(c"vole's Ord is Rust's PartialOrd and Ord: derive Ord");
+        err_help(c"vole's Ord is Rust's PartialOrd and Ord: derive Ord", pcx);
     } else if text == "Copy" {
-        err_help(c"every type copies on assignment: remove Copy");
+        err_help(c"every type copies on assignment: remove Copy", pcx);
     } else if text == "Display" {
         err_help_fmt(
             format_args("Display has no derive: write 'impl Display for {}",
-                sym_text(NODES[item].a)));
-        err_help(c" { fn fmt(self, f: inout std::Fmt) { f.str(\"...\"); } }'");
+                sym_text(pcx.nodes[item].a)), pcx);
+        err_help(c" { fn fmt(self, f: inout std::Fmt) { f.str(\"...\"); } }'", pcx);
     } else if text == "Default" {
-        err_help(c"there is no Default: write a 'fn new() -> T' in an impl");
+        err_help(c"there is no Default: write a 'fn new() -> T' in an impl", pcx);
     } else {
         let names = [c"Eq", c"Ord", c"Hash", c"Debug", c"Clone"];
         var best = -1;
@@ -160,24 +152,24 @@ fn derive_code(d: i64, item: i64) -> i64 {
             }
         }
         if best >= 0 {
-            err_help_fmt(format_args("did you mean '{}'?", cstr(names[best])));
+            err_help_fmt(format_args("did you mean '{}'?", cstr(names[best])), pcx);
         }
     }
-    err_end_soft();
+    err_end_soft(&pcx);
     0
 }
 
 // The D_* code of derive `d`, or 0: Eq, Ord, Hash, Debug, Clone, or one
 // of them as `std::Name`.
-fn derive_code_quiet(d: i64) -> i64 {
-    if NODES[d].kind != NodeKind::TyName || NODES[d].g != 0 {
+fn derive_code_quiet(d: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[d].kind != NodeKind::TyName || pcx.nodes[d].g != 0 {
         return 0;
     }
-    if NODES[d].count > 1
-        || NODES[d].count == 1 && NODES[child(d, 0)].a != intern_c(c"std") {
+    if pcx.nodes[d].count > 1
+        || pcx.nodes[d].count == 1 && pcx.nodes[child(d, 0, pcx)].a != intern_c(c"std") {
         return 0;
     }
-    let text = SYMS[NODES[d].a].text;
+    let text = SYMS[pcx.nodes[d].a].text;
     if text == "Eq" {
         D_EQ
     } else if text == "Ord" {
@@ -195,255 +187,256 @@ fn derive_code_quiet(d: i64) -> i64 {
 
 // ---- Writing the impls ----
 
-fn w(s: *u8) {
-    buf_str(GEN, s);
+fn w(s: *u8, pcx: Ctx<Comp>) {
+    buf_str(pcx.derive_gen, s);
 }
 
-fn w_sym(sym: i64) {
-    buf_str(GEN, sym_name(sym));
+fn w_sym(sym: i64, pcx: Ctx<Comp>) {
+    buf_str(pcx.derive_gen, sym_name(sym));
 }
 
-fn w_int(v: i64) {
-    buf_int(GEN, v);
+fn w_int(v: i64, pcx: Ctx<Comp>) {
+    buf_int(pcx.derive_gen, v);
 }
 
 // The code written from here on has node n's span.
-fn span_from(n: i64) {
+fn span_from(n: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        SPANS.push(BUFS[GEN].len);
-        SPANS.push(n);
+        pcx.spans.push(BUFS[pcx.derive_gen].len);
+        pcx.spans.push(n);
     }
 }
 
 // `Name` or `Name<T, U>`: the type `item` declares.
-fn w_self_type(item: i64) {
-    w_sym(NODES[item].a);
-    w_type_args(item);
+fn w_self_type(item: i64, pcx: Ctx<Comp>) {
+    w_sym(pcx.nodes[item].a, pcx);
+    w_type_args(item, pcx);
 }
 
 // `<T, U>` of a generic item; nothing for another.
-fn w_type_args(item: i64) {
-    let g = NODES[item].g;
+fn w_type_args(item: i64, pcx: Ctx<Comp>) {
+    let g = pcx.nodes[item].g;
     if g == 0 {
         return;
     }
-    w(c"<");
-    for i in 0..NODES[g].count {
+    w(c"<", pcx);
+    for i in 0..pcx.nodes[g].count {
         if i > 0 {
-            w(c", ");
+            w(c", ", pcx);
         }
-        w_sym(NODES[child(g, i)].a);
+        w_sym(pcx.nodes[child(g, i, pcx)].a, pcx);
     }
-    w(c">");
+    w(c">", pcx);
 }
 
 // `impl<T: B + Tr> Tr for Name<T> {`: the item's parameters with their
 // bounds as written, and `trait_path` added to each but an allocator.
-fn w_impl_head(item: i64, trait_path: *u8) {
-    w(c"impl");
-    let g = NODES[item].g;
+fn w_impl_head(item: i64, trait_path: *u8, pcx: Ctx<Comp>) {
+    w(c"impl", pcx);
+    let g = pcx.nodes[item].g;
     if g != 0 {
-        w(c"<");
-        for i in 0..NODES[g].count {
-            let p = child(g, i);
+        w(c"<", pcx);
+        for i in 0..pcx.nodes[g].count {
+            let p = child(g, i, pcx);
             if i > 0 {
-                w(c", ");
+                w(c", ", pcx);
             }
-            w_sym(NODES[p].a);
-            w(c": ");
-            let bounds = NODES[p].h;
+            w_sym(pcx.nodes[p].a, pcx);
+            w(c": ", pcx);
+            let bounds = pcx.nodes[p].h;
             // (0.26.3) an allocator parameter, `A: Allocator`, takes no
             // bound of the trait: the fields hold the allocator inside std
             // containers, whose impls ask nothing of it (Gpa has no Debug)
-            let text = if bounds != 0 { SRC[NODES[bounds].start..NODES[bounds].end] } else { "" };
+            let text = if bounds != 0 { SRC[pcx.nodes[bounds].start..pcx.nodes[bounds].end] }
+                else { "" };
             if text == "Allocator" || text == "std::Allocator" {
-                buf_bytes(GEN, text);
+                buf_bytes(pcx.derive_gen, text);
                 continue;
             }
             if bounds != 0 {
-                buf_bytes(GEN, text);
-                w(c" + ");
+                buf_bytes(pcx.derive_gen, text);
+                w(c" + ", pcx);
             }
-            w(trait_path);
+            w(trait_path, pcx);
         }
-        w(c">");
+        w(c">", pcx);
     }
-    w(c" ");
-    w(trait_path);
-    w(c" for ");
-    w_self_type(item);
-    w(c" {\n");
+    w(c" ", pcx);
+    w(trait_path, pcx);
+    w(c" for ", pcx);
+    w_self_type(item, pcx);
+    w(c" {\n", pcx);
 }
 
 // The impl of derive `d` (D_* `code`) of `item`.
-fn write_impl(item: i64, d: i64, code: i64) {
-    span_from(d);
-    let is_struct = NODES[item].kind == NodeKind::Struct;
+fn write_impl(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) {
+    span_from(d, &pcx);
+    let is_struct = pcx.nodes[item].kind == NodeKind::Struct;
     if code == D_EQ {
-        w_impl_head(item, c"std::Eq");
-        w(c"    #[inline]\n    fn eq(self: &");
-        w_self_type(item);
-        w(c", other: &");
-        w_self_type(item);
-        w(c") -> bool {\n");
-        if is_struct { struct_eq(item, d); } else { enum_eq(item, d); }
+        w_impl_head(item, c"std::Eq", pcx);
+        w(c"    #[inline]\n    fn eq(self: &", pcx);
+        w_self_type(item, pcx);
+        w(c", other: &", pcx);
+        w_self_type(item, pcx);
+        w(c") -> bool {\n", pcx);
+        if is_struct { struct_eq(item, d, &pcx); } else { enum_eq(item, d, &pcx); }
     } else if code == D_ORD {
-        w_impl_head(item, c"std::Ord");
-        w(c"    #[inline]\n    fn cmp(self: &");
-        w_self_type(item);
-        w(c", other: &");
-        w_self_type(item);
-        w(c") -> i64 {\n");
-        if is_struct { struct_cmp(item, d); } else { enum_cmp(item, d); }
+        w_impl_head(item, c"std::Ord", pcx);
+        w(c"    #[inline]\n    fn cmp(self: &", pcx);
+        w_self_type(item, pcx);
+        w(c", other: &", pcx);
+        w_self_type(item, pcx);
+        w(c") -> i64 {\n", pcx);
+        if is_struct { struct_cmp(item, d, &pcx); } else { enum_cmp(item, d, &pcx); }
     } else if code == D_HASH {
-        w_impl_head(item, c"std::Hash");
-        w(c"    #[inline]\n    fn hash(self: &");
-        w_self_type(item);
-        w(c") -> u64 {\n");
-        if is_struct { struct_hash(item, d); } else { enum_hash(item, d); }
+        w_impl_head(item, c"std::Hash", pcx);
+        w(c"    #[inline]\n    fn hash(self: &", pcx);
+        w_self_type(item, pcx);
+        w(c") -> u64 {\n", pcx);
+        if is_struct { struct_hash(item, d, &pcx); } else { enum_hash(item, d, &pcx); }
     } else if code == D_DEBUG {
-        w_impl_head(item, c"std::Debug");
-        w(c"    fn fmt_debug(self: &");
-        w_self_type(item);
-        w(c", __f: &mut std::Fmt) {\n");
-        if is_struct { struct_debug(item, d); } else { enum_debug(item, d); }
+        w_impl_head(item, c"std::Debug", pcx);
+        w(c"    fn fmt_debug(self: &", pcx);
+        w_self_type(item, pcx);
+        w(c", __f: &mut std::Fmt) {\n", pcx);
+        if is_struct { struct_debug(item, d, &pcx); } else { enum_debug(item, d, &pcx); }
     } else {
-        w_impl_head(item, c"std::Clone");
-        w(c"    #[inline]\n    fn clone(self: &");
-        w_self_type(item);
-        w(c") -> ");
-        w_self_type(item);
-        w(c" {\n");
-        if is_struct { struct_clone(item, d); } else { enum_clone(item, d); }
+        w_impl_head(item, c"std::Clone", pcx);
+        w(c"    #[inline]\n    fn clone(self: &", pcx);
+        w_self_type(item, pcx);
+        w(c") -> ", pcx);
+        w_self_type(item, pcx);
+        w(c" {\n", pcx);
+        if is_struct { struct_clone(item, d, &pcx); } else { enum_clone(item, d, &pcx); }
     }
-    w(c"    }\n}\n");
+    w(c"    }\n}\n", pcx);
 }
 
 // Every field ==, through std::eq_of (so a `[u8]` field compares its
 // bytes; `==` on the type itself would call this function).
-fn struct_eq(item: i64, d: i64) {
-    for i in 0..NODES[item].count {
-        let field = child(item, i);
-        span_from(field);
-        w(c"        if !std::eq_of(&self.");
-        w_sym(NODES[field].a);
-        w(c", &other.");
-        w_sym(NODES[field].a);
-        w(c") { return false; }\n");
+fn struct_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        w(c"        if !std::eq_of(&self.", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c", &other.", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c") { return false; }\n", pcx);
     }
-    span_from(d);
-    w(c"        true\n");
+    span_from(d, &pcx);
+    w(c"        true\n", pcx);
 }
 
 // Lexicographic over the fields, in their order.
-fn struct_cmp(item: i64, d: i64) {
-    let count = NODES[item].count;
+fn struct_cmp(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.nodes[item].count;
     for i in 0..count {
-        let field = child(item, i);
-        span_from(field);
-        let name = NODES[field].a;
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        let name = pcx.nodes[field].a;
         if i + 1 < count {
-            w(c"        let __c = std::cmp_of(&self.");
-            w_sym(name);
-            w(c", &other.");
-            w_sym(name);
-            w(c");\n        if __c != 0 { return __c; }\n");
+            w(c"        let __c = std::cmp_of(&self.", pcx);
+            w_sym(name, pcx);
+            w(c", &other.", pcx);
+            w_sym(name, pcx);
+            w(c");\n        if __c != 0 { return __c; }\n", pcx);
         } else {
-            w(c"        std::cmp_of(&self.");
-            w_sym(name);
-            w(c", &other.");
-            w_sym(name);
-            w(c")\n");
+            w(c"        std::cmp_of(&self.", pcx);
+            w_sym(name, pcx);
+            w(c", &other.", pcx);
+            w_sym(name, pcx);
+            w(c")\n", pcx);
         }
     }
-    span_from(d);
+    span_from(d, &pcx);
     if count == 0 {
-        w(c"        0\n");
+        w(c"        0\n", pcx);
     }
 }
 
-fn struct_hash(item: i64, d: i64) {
-    let count = NODES[item].count;
+fn struct_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.nodes[item].count;
     if count == 0 {
-        w(c"        0\n");
+        w(c"        0\n", pcx);
         return;
     }
-    w(c"        let mut __h: u64 = 0;\n");
+    w(c"        let mut __h: u64 = 0;\n", pcx);
     for i in 0..count {
-        let field = child(item, i);
-        span_from(field);
-        w(c"        __h = std::hash_mix(__h, std::hash_of(&self.");
-        w_sym(NODES[field].a);
-        w(c"));\n");
+        let field = child(item, i, pcx);
+        span_from(field, &pcx);
+        w(c"        __h = std::hash_mix(__h, std::hash_of(&self.", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c"));\n", pcx);
     }
-    span_from(d);
-    w(c"        __h\n");
+    span_from(d, &pcx);
+    w(c"        __h\n", pcx);
 }
 
 // Rust's text: `P { x: 1, y: 2 }`, `P` without fields.
-fn struct_debug(item: i64, d: i64) {
-    let count = NODES[item].count;
-    w(c"        __f.str(\"");
-    w_sym(NODES[item].a);
+fn struct_debug(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.nodes[item].count;
+    w(c"        __f.str(\"", pcx);
+    w_sym(pcx.nodes[item].a, pcx);
     if count == 0 {
-        w(c"\");\n");
+        w(c"\");\n", pcx);
         return;
     }
     for i in 0..count {
-        let field = child(item, i);
+        let field = child(item, i, pcx);
         if i > 0 {
-            w(c"        __f.str(\", ");
+            w(c"        __f.str(\", ", pcx);
         } else {
-            w(c" { ");
+            w(c" { ", pcx);
         }
-        w_sym(NODES[field].a);
-        w(c": \");\n");
-        span_from(field);
-        w(c"        __f.debug(&self.");
-        w_sym(NODES[field].a);
-        w(c");\n");
-        span_from(d);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c": \");\n", pcx);
+        span_from(field, &pcx);
+        w(c"        __f.debug(&self.", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
+        w(c");\n", pcx);
+        span_from(d, &pcx);
     }
-    w(c"        __f.str(\" }\");\n");
+    w(c"        __f.str(\" }\");\n", pcx);
 }
 
-fn struct_clone(item: i64, d: i64) {
-    w(c"        ");
-    w_sym(NODES[item].a);
-    if NODES[item].g != 0 {
-        w(c"::");
-        w_type_args(item);
+fn struct_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        ", pcx);
+    w_sym(pcx.nodes[item].a, pcx);
+    if pcx.nodes[item].g != 0 {
+        w(c"::", pcx);
+        w_type_args(item, pcx);
     }
-    w(c" {");
-    for i in 0..NODES[item].count {
-        let field = child(item, i);
+    w(c" {", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
         if i > 0 {
-            w(c",");
+            w(c",", pcx);
         }
-        span_from(field);
-        w(c" ");
-        w_sym(NODES[field].a);
+        span_from(field, &pcx);
+        w(c" ", pcx);
+        w_sym(pcx.nodes[field].a, pcx);
         // (a raw pointer field is copied: `clone_of` of a `*T` would
         // call T's clone through it, 0.20's let copying the pointer)
-        let tn = NODES[field].b;
-        if tn > 0 && NODES[tn].kind == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) == 0
-            && SRC[NODES[tn].start] == '*' {
-            w(c": self.");
-            w_sym(NODES[field].a);
+        let tn = pcx.nodes[field].b;
+        if tn > 0 && pcx.nodes[tn].kind == NodeKind::TyPtr && (pcx.nodes[tn].p & NODE_REF) == 0
+            && SRC[pcx.nodes[tn].start] == '*' {
+            w(c": self.", pcx);
+            w_sym(pcx.nodes[field].a, pcx);
         } else {
-            w(c": std::clone_of(&self.");
-            w_sym(NODES[field].a);
-            w(c")");
+            w(c": std::clone_of(&self.", pcx);
+            w_sym(pcx.nodes[field].a, pcx);
+            w(c")", pcx);
         }
-        span_from(d);
+        span_from(d, &pcx);
     }
-    w(c" }\n");
+    w(c" }\n", pcx);
 }
 
 // Whether enum `item` has a variant with fields.
-fn has_fields(item: i64) -> bool {
-    for i in 0..NODES[item].count {
-        if NODES[child(item, i)].count > 0 {
+fn has_fields(item: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 0..pcx.nodes[item].count {
+        if pcx.nodes[child(item, i, pcx)].count > 0 {
             return true;
         }
     }
@@ -452,14 +445,14 @@ fn has_fields(item: i64) -> bool {
 
 // (0.25) The first field of struct `item` written `inout T` (its Field
 // node), or 0.
-fn inout_field(item: i64) -> i64 {
-    if NODES[item].kind != NodeKind::Struct {
+fn inout_field(item: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[item].kind != NodeKind::Struct {
         return 0;
     }
-    for i in 0..NODES[item].count {
-        let field = child(item, i);
-        let tn = NODES[field].b;
-        if tn > 0 && (NODES[tn].p & crate::front::ast::NODE_REF_MUT) != 0 {
+    for i in 0..pcx.nodes[item].count {
+        let field = child(item, i, pcx);
+        let tn = pcx.nodes[field].b;
+        if tn > 0 && (pcx.nodes[tn].p & crate::front::ast::NODE_REF_MUT) != 0 {
             return field;
         }
     }
@@ -469,267 +462,267 @@ fn inout_field(item: i64) -> i64 {
 // `E::V`, `E::V(_, _)` (`binder` 0), or `E::V(__a0, __a1)` (`binder` the
 // prefix, "__a"); `E::V { .. }`, `E::V { x: __a0, y: __a1 }` for a
 // struct-like variant (0.17).
-fn w_variant_pattern(item: i64, v: i64, binder: *u8) {
-    w_sym(NODES[item].a);
-    w(c"::");
-    w_sym(NODES[v].a);
-    if NODES[v].count == 0 && NODES[v].c == 0 {
+fn w_variant_pattern(item: i64, v: i64, binder: *u8, pcx: Ctx<Comp>) {
+    w_sym(pcx.nodes[item].a, pcx);
+    w(c"::", pcx);
+    w_sym(pcx.nodes[v].a, pcx);
+    if pcx.nodes[v].count == 0 && pcx.nodes[v].c == 0 {
         return;
     }
-    let names = NODES[v].d;
+    let names = pcx.nodes[v].d;
     if names != 0 {
-        if binder == 0 as *u8 || NODES[v].count == 0 {
-            w(c" { .. }");
+        if binder == 0 as *u8 || pcx.nodes[v].count == 0 {
+            w(c" { .. }", pcx);
             return;
         }
-        w(c" { ");
-        for k in 0..NODES[v].count {
+        w(c" { ", pcx);
+        for k in 0..pcx.nodes[v].count {
             if k > 0 {
-                w(c", ");
+                w(c", ", pcx);
             }
-            w_sym(NODES[child(names, k)].a);
-            w(c": ");
-            w(binder);
-            w_int(k);
+            w_sym(pcx.nodes[child(names, k, pcx)].a, pcx);
+            w(c": ", pcx);
+            w(binder, pcx);
+            w_int(k, pcx);
         }
-        w(c" }");
+        w(c" }", pcx);
         return;
     }
-    w(c"(");
-    for k in 0..NODES[v].count {
+    w(c"(", pcx);
+    for k in 0..pcx.nodes[v].count {
         if k > 0 {
-            w(c", ");
+            w(c", ", pcx);
         }
         if binder == 0 as *u8 {
-            w(c"_");
+            w(c"_", pcx);
         } else {
-            w(binder);
-            w_int(k);
+            w(binder, pcx);
+            w_int(k, pcx);
         }
     }
-    w(c")");
+    w(c")", pcx);
 }
 
 // The index of the variant `value` (text: `*self`) holds, as an i64
 // expression: its discriminant when no variant has fields or a written
 // discriminant (they are then 0, 1, ...), else a match.
-fn w_variant_index(item: i64, value: *u8) {
-    let written = (0..NODES[item].count).any(|i| NODES[child(item, i)].b != 0);
-    if !written && !has_fields(item) {
-        w(c"(");
-        w(value);
-        w(c" as i64)");
+fn w_variant_index(item: i64, value: *u8, pcx: Ctx<Comp>) {
+    let written = (0..pcx.nodes[item].count).any(|i| pcx.nodes[child(item, i, pcx)].b != 0);
+    if !written && !has_fields(item, pcx) {
+        w(c"(", pcx);
+        w(value, pcx);
+        w(c" as i64)", pcx);
         return;
     }
-    w(c"match ");
-    w(value);
-    w(c" {");
-    for i in 0..NODES[item].count {
-        w(c" ");
-        w_variant_pattern(item, child(item, i), 0 as *u8);
-        w(c" => ");
-        w_int(i);
-        w(c",");
+    w(c"match ", pcx);
+    w(value, pcx);
+    w(c" {", pcx);
+    for i in 0..pcx.nodes[item].count {
+        w(c" ", pcx);
+        w_variant_pattern(item, child(item, i, pcx), 0 as *u8, pcx);
+        w(c" => ", pcx);
+        w_int(i, pcx);
+        w(c",", pcx);
     }
-    w(c" }");
+    w(c" }", pcx);
 }
 
 // The same variant, and its fields ==.
-fn enum_eq(item: i64, d: i64) {
-    if !has_fields(item) {
-        w(c"        (*self as i64) == (*other as i64)\n");
+fn enum_eq(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if !has_fields(item, pcx) {
+        w(c"        (*self as i64) == (*other as i64)\n", pcx);
         return;
     }
-    w(c"        match (*self, *other) {\n");
-    for i in 0..NODES[item].count {
-        let v = child(item, i);
-        w(c"            (");
-        w_variant_pattern(item, v, c"__a");
-        w(c", ");
-        w_variant_pattern(item, v, c"__b");
-        w(c") => {\n");
-        for k in 0..NODES[v].count {
-            span_from(child(v, k));
-            w(c"                if !std::eq_of(&__a");
-            w_int(k);
-            w(c", &__b");
-            w_int(k);
-            w(c") { return false; }\n");
+    w(c"        match (*self, *other) {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        w(c"            (", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c", ", pcx);
+        w_variant_pattern(item, v, c"__b", pcx);
+        w(c") => {\n", pcx);
+        for k in 0..pcx.nodes[v].count {
+            span_from(child(v, k, pcx), &pcx);
+            w(c"                if !std::eq_of(&__a", pcx);
+            w_int(k, pcx);
+            w(c", &__b", pcx);
+            w_int(k, pcx);
+            w(c") { return false; }\n", pcx);
         }
-        span_from(d);
-        w(c"                true\n            }\n");
+        span_from(d, &pcx);
+        w(c"                true\n            }\n", pcx);
     }
-    if NODES[item].count > 1 {
-        w(c"            _ => false,\n");
+    if pcx.nodes[item].count > 1 {
+        w(c"            _ => false,\n", pcx);
     }
-    w(c"        }\n");
+    w(c"        }\n", pcx);
 }
 
 // Variant order first, then the fields, lexicographic.
-fn enum_cmp(item: i64, d: i64) {
-    w(c"        let __a: i64 = ");
-    w_variant_index(item, c"*self");
-    w(c";\n        let __b: i64 = ");
-    w_variant_index(item, c"*other");
-    w(c";\n        if __a != __b {\n            return if __a < __b { -1 } else { 1 };\n        }\n");
-    if !has_fields(item) {
-        w(c"        0\n");
+fn enum_cmp(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        let __a: i64 = ", pcx);
+    w_variant_index(item, c"*self", pcx);
+    w(c";\n        let __b: i64 = ", pcx);
+    w_variant_index(item, c"*other", pcx);
+    w(c";\n        if __a != __b {\n            return if __a < __b { -1 } else { 1 };\n        }\n", pcx);
+    if !has_fields(item, pcx) {
+        w(c"        0\n", pcx);
         return;
     }
-    w(c"        match (*self, *other) {\n");
-    for i in 0..NODES[item].count {
-        let v = child(item, i);
-        let count = NODES[v].count;
+    w(c"        match (*self, *other) {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        let count = pcx.nodes[v].count;
         if count == 0 {
             continue;
         }
-        w(c"            (");
-        w_variant_pattern(item, v, c"__a");
-        w(c", ");
-        w_variant_pattern(item, v, c"__b");
-        w(c") => {\n");
+        w(c"            (", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c", ", pcx);
+        w_variant_pattern(item, v, c"__b", pcx);
+        w(c") => {\n", pcx);
         for k in 0..count {
-            span_from(child(v, k));
+            span_from(child(v, k, pcx), &pcx);
             if k + 1 < count {
-                w(c"                let __c = std::cmp_of(&__a");
-                w_int(k);
-                w(c", &__b");
-                w_int(k);
-                w(c");\n                if __c != 0 { return __c; }\n");
+                w(c"                let __c = std::cmp_of(&__a", pcx);
+                w_int(k, pcx);
+                w(c", &__b", pcx);
+                w_int(k, pcx);
+                w(c");\n                if __c != 0 { return __c; }\n", pcx);
             } else {
-                w(c"                std::cmp_of(&__a");
-                w_int(k);
-                w(c", &__b");
-                w_int(k);
-                w(c")\n");
+                w(c"                std::cmp_of(&__a", pcx);
+                w_int(k, pcx);
+                w(c", &__b", pcx);
+                w_int(k, pcx);
+                w(c")\n", pcx);
             }
         }
-        span_from(d);
-        w(c"            }\n");
+        span_from(d, &pcx);
+        w(c"            }\n", pcx);
     }
-    if NODES[item].count > 1 {
-        w(c"            _ => 0,\n");
+    if pcx.nodes[item].count > 1 {
+        w(c"            _ => 0,\n", pcx);
     }
-    w(c"        }\n");
+    w(c"        }\n", pcx);
 }
 
 // The variant's index, then its fields.
-fn enum_hash(item: i64, d: i64) {
-    if !has_fields(item) {
-        w(c"        std::hash_mix(0, ");
-        w_variant_index(item, c"*self");
-        w(c" as u64)\n");
+fn enum_hash(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if !has_fields(item, pcx) {
+        w(c"        std::hash_mix(0, ", pcx);
+        w_variant_index(item, c"*self", pcx);
+        w(c" as u64)\n", pcx);
         return;
     }
-    w(c"        match *self {\n");
-    for i in 0..NODES[item].count {
-        let v = child(item, i);
-        w(c"            ");
-        w_variant_pattern(item, v, c"__a");
-        if NODES[v].count == 0 {
-            w(c" => std::hash_mix(0, ");
-            w_int(i);
-            w(c"),\n");
+    w(c"        match *self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        if pcx.nodes[v].count == 0 {
+            w(c" => std::hash_mix(0, ", pcx);
+            w_int(i, pcx);
+            w(c"),\n", pcx);
             continue;
         }
-        w(c" => {\n                let mut __h = std::hash_mix(0, ");
-        w_int(i);
-        w(c");\n");
-        for k in 0..NODES[v].count {
-            span_from(child(v, k));
-            w(c"                __h = std::hash_mix(__h, std::hash_of(&__a");
-            w_int(k);
-            w(c"));\n");
+        w(c" => {\n                let mut __h = std::hash_mix(0, ", pcx);
+        w_int(i, pcx);
+        w(c");\n", pcx);
+        for k in 0..pcx.nodes[v].count {
+            span_from(child(v, k, pcx), &pcx);
+            w(c"                __h = std::hash_mix(__h, std::hash_of(&__a", pcx);
+            w_int(k, pcx);
+            w(c"));\n", pcx);
         }
-        span_from(d);
-        w(c"                __h\n            }\n");
+        span_from(d, &pcx);
+        w(c"                __h\n            }\n", pcx);
     }
-    w(c"        }\n");
+    w(c"        }\n", pcx);
 }
 
 // Rust's text: `V(1, 2)`, `V { x: 1, y: 2 }` (0.17), `V` without fields.
-fn enum_debug(item: i64, d: i64) {
-    w(c"        match *self {\n");
-    for i in 0..NODES[item].count {
-        let v = child(item, i);
-        let names = NODES[v].d;
-        w(c"            ");
-        w_variant_pattern(item, v, c"__a");
-        w(c" => {\n                __f.str(\"");
-        w_sym(NODES[v].a);
-        if NODES[v].count == 0 {
-            w(c"\");\n            }\n");
+fn enum_debug(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    w(c"        match *self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        let names = pcx.nodes[v].d;
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c" => {\n                __f.str(\"", pcx);
+        w_sym(pcx.nodes[v].a, pcx);
+        if pcx.nodes[v].count == 0 {
+            w(c"\");\n            }\n", pcx);
             continue;
         }
         if names != 0 {
-            w(c" { ");
+            w(c" { ", pcx);
         } else {
-            w(c"(");
+            w(c"(", pcx);
         }
-        w(c"\");\n");
-        for k in 0..NODES[v].count {
+        w(c"\");\n", pcx);
+        for k in 0..pcx.nodes[v].count {
             if k > 0 || names != 0 {
-                w(c"                __f.str(\"");
+                w(c"                __f.str(\"", pcx);
                 if k > 0 {
-                    w(c", ");
+                    w(c", ", pcx);
                 }
                 if names != 0 {
-                    w_sym(NODES[child(names, k)].a);
-                    w(c": ");
+                    w_sym(pcx.nodes[child(names, k, pcx)].a, pcx);
+                    w(c": ", pcx);
                 }
-                w(c"\");\n");
+                w(c"\");\n", pcx);
             }
-            span_from(child(v, k));
-            w(c"                __f.debug(&__a");
-            w_int(k);
-            w(c");\n");
-            span_from(d);
+            span_from(child(v, k, pcx), &pcx);
+            w(c"                __f.debug(&__a", pcx);
+            w_int(k, pcx);
+            w(c");\n", pcx);
+            span_from(d, &pcx);
         }
         if names != 0 {
-            w(c"                __f.str(\" }\");\n            }\n");
+            w(c"                __f.str(\" }\");\n            }\n", pcx);
         } else {
-            w(c"                __f.str(\")\");\n            }\n");
+            w(c"                __f.str(\")\");\n            }\n", pcx);
         }
     }
-    w(c"        }\n");
+    w(c"        }\n", pcx);
 }
 
-fn enum_clone(item: i64, d: i64) {
-    if !has_fields(item) {
-        w(c"        *self\n");
+fn enum_clone(item: i64, d: i64, pcx: inout Ctx<Comp>) {
+    if !has_fields(item, pcx) {
+        w(c"        *self\n", pcx);
         return;
     }
-    w(c"        match *self {\n");
-    for i in 0..NODES[item].count {
-        let v = child(item, i);
-        let names = NODES[v].d;
-        w(c"            ");
-        w_variant_pattern(item, v, c"__a");
-        w(c" => ");
-        w_sym(NODES[item].a);
-        w(c"::");
-        w_sym(NODES[v].a);
-        if NODES[v].count > 0 || NODES[v].c != 0 {
-            w(if names != 0 { c" { " } else { c"(" });
-            for k in 0..NODES[v].count {
+    w(c"        match *self {\n", pcx);
+    for i in 0..pcx.nodes[item].count {
+        let v = child(item, i, pcx);
+        let names = pcx.nodes[v].d;
+        w(c"            ", pcx);
+        w_variant_pattern(item, v, c"__a", pcx);
+        w(c" => ", pcx);
+        w_sym(pcx.nodes[item].a, pcx);
+        w(c"::", pcx);
+        w_sym(pcx.nodes[v].a, pcx);
+        if pcx.nodes[v].count > 0 || pcx.nodes[v].c != 0 {
+            w(if names != 0 { c" { " } else { c"(" }, pcx);
+            for k in 0..pcx.nodes[v].count {
                 if k > 0 {
-                    w(c", ");
+                    w(c", ", pcx);
                 }
                 if names != 0 {
-                    w_sym(NODES[child(names, k)].a);
-                    w(c": ");
+                    w_sym(pcx.nodes[child(names, k, pcx)].a, pcx);
+                    w(c": ", pcx);
                 }
-                span_from(child(v, k));
-                w(c"std::clone_of(&__a");
-                w_int(k);
-                w(c")");
-                span_from(d);
+                span_from(child(v, k, pcx), &pcx);
+                w(c"std::clone_of(&__a", pcx);
+                w_int(k, pcx);
+                w(c")", pcx);
+                span_from(d, &pcx);
             }
-            w(if names != 0 { c" }" } else { c")" });
+            w(if names != 0 { c" }" } else { c")" }, pcx);
         }
-        w(c",\n");
+        w(c",\n", pcx);
     }
-    w(c"        }\n");
+    w(c"        }\n", pcx);
 }
 
 // ---- Parsing them ----
@@ -737,65 +730,65 @@ fn enum_clone(item: i64, d: i64) {
 // Parses GEN as a source file `<derive>`, gives its nodes their spans,
 // flags the impls and their functions FN_DERIVED, and appends them to the
 // program.
-fn parse_derived() {
+fn parse_derived(pcx: inout Ctx<Comp>) {
     unsafe {
-        let base = add_source(c"<derive>", GEN);
-        let first = TOK_COUNT;
-        let node_mark = NODES.len() as i64;
-        let mark = list_begin();
-        let depth = RECOVER_DEPTH;
-        if _setjmp(recover_enter()) == 0 {
-            lex_range(base, base + BUFS[GEN].len, last: true);
-            parse_items_fragment(first);
+        let base = add_source(c"<derive>", pcx.derive_gen, &pcx);
+        let first = pcx.toks.len() as i64;
+        let node_mark = pcx.nodes.len() as i64;
+        let mark = list_begin(pcx);
+        let depth = pcx.recover_depth;
+        if _setjmp(recover_enter(&pcx)) == 0 {
+            lex_range(base, base + BUFS[pcx.derive_gen].len, last: true, pcx: &pcx);
+            parse_items_fragment(first, &pcx);
         } else {
             // (a syntax error in the made text: a compiler bug, reported)
-            SCRATCH.count = mark;
+            pcx.scratch.count = mark;
         }
-        recover_leave(depth);
-        for k in node_mark..NODES.len() as i64 {
-            let target = span_at(NODES[k].start - base);
-            NODES[k].start = NODES[target].start;
-            NODES[k].end = NODES[target].end;
+        recover_leave(depth, &pcx);
+        for k in node_mark..pcx.nodes.len() as i64 {
+            let target = span_at(pcx.nodes[k].start - base, pcx);
+            pcx.nodes[k].start = pcx.nodes[target].start;
+            pcx.nodes[k].end = pcx.nodes[target].end;
         }
         // The impls come in the order of DERIVED's.
         var next = 0;
-        for i in mark..SCRATCH.count {
-            let n = SCRATCH.data[i];
-            NODES[n].p |= FN_DERIVED;
-            if NODES[n].kind == NodeKind::Impl {
-                if next < DERIVED.count {
-                    DERIVED.data[next + 3] = n;
+        for i in mark..pcx.scratch.count {
+            let n = pcx.scratch.data[i];
+            pcx.nodes[n].p |= FN_DERIVED;
+            if pcx.nodes[n].kind == NodeKind::Impl {
+                if next < pcx.derived.count {
+                    pcx.derived.data[next + 3] = n;
                     next += 4;
                 }
             }
         }
-        let count = SCRATCH.count - mark;
-        let all = list_begin();
-        for i in 0..NODES[PROGRAM].count {
-            list_push(child(PROGRAM, i));
+        let count = pcx.scratch.count - mark;
+        let all = list_begin(pcx);
+        for i in 0..pcx.nodes[pcx.program].count {
+            list_push(child(pcx.program, i, pcx), &pcx);
         }
         for i in 0..count {
-            list_push(SCRATCH.data[mark + i]);
+            list_push(pcx.scratch.data[mark + i], &pcx);
         }
-        list_end(PROGRAM, all);
-        SCRATCH.count = mark;
+        list_end(pcx.program, all, &pcx);
+        pcx.scratch.count = mark;
     }
 }
 
 // The node whose span the code at `offset` of GEN has.
-fn span_at(offset: i64) -> i64 {
+fn span_at(offset: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var lo = 0;
-        var hi = SPANS.count / 2 - 1;
+        var hi = pcx.spans.count / 2 - 1;
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
-            if SPANS.data[2 * mid] <= offset {
+            if pcx.spans.data[2 * mid] <= offset {
                 lo = mid;
             } else {
                 hi = mid - 1;
             }
         }
-        SPANS.data[2 * lo + 1]
+        pcx.spans.data[2 * lo + 1]
     }
 }
 
@@ -805,46 +798,47 @@ fn span_at(offset: i64) -> i64 {
 // derived non-generic type has the trait (a generic type's fields are
 // checked in its instances). An error leaves the impl's function
 // unchecked.
-pub fn check_derives() {
+pub fn check_derives(pcx: inout Ctx<Comp>) {
     unsafe {
         var i = 0;
-        while i < DERIVED.count {
-            let item = DERIVED.data[i];
-            let d = DERIVED.data[i + 1];
-            let code = DERIVED.data[i + 2];
-            let imp = DERIVED.data[i + 3];
+        while i < pcx.derived.count {
+            let item = pcx.derived.data[i];
+            let d = pcx.derived.data[i + 1];
+            let code = pcx.derived.data[i + 2];
+            let imp = pcx.derived.data[i + 3];
             i += 4;
-            if NODES[item].g != 0 || imp == 0 {
+            if pcx.nodes[item].g != 0 || imp == 0 {
                 continue;
             }
-            let ok = if NODES[item].kind == NodeKind::Struct { check_struct_fields(item, d, code) }
-                else { check_enum_fields(item, d, code) };
+            let ok = if pcx.nodes[item].kind
+                == NodeKind::Struct { check_struct_fields(item, d, code, &pcx) }
+                else { check_enum_fields(item, d, code, &pcx) };
             if !ok {
-                for k in 0..NODES[imp].count {
-                    NODES[child(imp, k)].p |= FN_BODY_FAILED;
+                for k in 0..pcx.nodes[imp].count {
+                    pcx.nodes[child(imp, k, pcx)].p |= FN_BODY_FAILED;
                 }
             }
         }
     }
 }
 
-fn check_struct_fields(item: i64, d: i64, code: i64) -> bool {
+fn check_struct_fields(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var s = -1;
-        for k in 0..STRUCT_COUNT {
-            if STRUCTS[k].node == item && STRUCTS[k].tmpl == 0 {
+        for k in 0..pcx.struct_count {
+            if pcx.structs[k].node == item && pcx.structs[k].tmpl == 0 {
                 s = k;
             }
         }
-        if s < 0 || STRUCTS[s].field_count != NODES[item].count {
+        if s < 0 || pcx.structs[s].field_count != pcx.nodes[item].count {
             return true;
         }
         var ok = true;
-        for k in 0..STRUCTS[s].field_count {
-            let field = child(item, k);
-            let ty = (*struct_field(s, k)).ty;
-            if !field_has(ty, code) {
-                field_error(item, d, code, field, ty, -1, k);
+        for k in 0..pcx.structs[s].field_count {
+            let field = child(item, k, pcx);
+            let ty = (*struct_field(s, k, pcx)).ty;
+            if !field_has(ty, code, &pcx) {
+                field_error(item, d, code, field, ty, -1, k, &pcx);
                 ok = false;
             }
         }
@@ -852,28 +846,28 @@ fn check_struct_fields(item: i64, d: i64, code: i64) -> bool {
     }
 }
 
-fn check_enum_fields(item: i64, d: i64, code: i64) -> bool {
+fn check_enum_fields(item: i64, d: i64, code: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         var e = -1;
-        for k in 0..ENUM_COUNT {
+        for k in 0..pcx.enum_count {
             if ENUMS[k].node == item && ENUMS[k].tmpl == 0 {
                 e = k;
             }
         }
-        if e < 0 || ENUMS[e].variant_count != NODES[item].count {
+        if e < 0 || ENUMS[e].variant_count != pcx.nodes[item].count {
             return true;
         }
         var ok = true;
         for i in 0..ENUMS[e].variant_count {
             let v = enum_variant(e, i);
-            let vn = child(item, i);
-            if VARIANTS[v].field_count != NODES[vn].count {
+            let vn = child(item, i, pcx);
+            if pcx.variants[v].field_count != pcx.nodes[vn].count {
                 continue;
             }
-            for k in 0..VARIANTS[v].field_count {
-                let ty = variant_field(v, k);
-                if !field_has(ty, code) {
-                    field_error(item, d, code, child(vn, k), ty, i, k);
+            for k in 0..pcx.variants[v].field_count {
+                let ty = variant_field(v, k, pcx);
+                if !field_has(ty, code, &pcx) {
+                    field_error(item, d, code, child(vn, k, pcx), ty, i, k, &pcx);
                     ok = false;
                 }
             }
@@ -883,40 +877,41 @@ fn check_enum_fields(item: i64, d: i64, code: i64) -> bool {
 }
 
 // Whether type `ty` has the trait of D_* `code`.
-fn field_has(ty: i64, code: i64) -> bool {
+fn field_has(ty: i64, code: i64, pcx: inout Ctx<Comp>) -> bool {
     let name = if code == D_EQ { c"Eq" } else if code == D_ORD { c"Ord" }
         else if code == D_HASH { c"Hash" } else if code == D_DEBUG { c"Debug" } else { c"Clone" };
-    implements(std_trait(name), ty)
+    implements(std_trait(name, &pcx), ty, &pcx)
 }
 
 // "cannot derive Hash for 'P': field 'x' of type 'f64' has no Hash", at
 // the field (`variant`: its index for field `index` of an enum's variant,
 // else -1).
-fn field_error(item: i64, d: i64, code: i64, field: i64, ty: i64, variant: i64, index: i64) {
-    err_begin(NODES[field].start);
-    err_fmt(format_args("cannot derive {} for '{}': ", sym_text(NODES[d].a),
-        sym_text(NODES[item].a)));
+fn field_error(item: i64, d: i64, code: i64, field: i64, ty: i64, variant: i64, index: i64,
+    pcx: inout Ctx<Comp>) {
+    err_begin(pcx.nodes[field].start, &pcx);
+    err_fmt(format_args("cannot derive {} for '{}': ", sym_text(pcx.nodes[d].a),
+        sym_text(pcx.nodes[item].a)), pcx);
     if variant >= 0 {
-        err_fmt(format_args("field {index} of '{}::", sym_text(NODES[item].a)));
-        err_fmt(format_args("{}'", sym_text(NODES[child(item, variant)].a)));
+        err_fmt(format_args("field {index} of '{}::", sym_text(pcx.nodes[item].a)), pcx);
+        err_fmt(format_args("{}'", sym_text(pcx.nodes[child(item, variant, pcx)].a)), pcx);
     } else {
-        err_fmt(format_args("field '{}'", sym_text(NODES[field].a)));
+        err_fmt(format_args("field '{}'", sym_text(pcx.nodes[field].a)), pcx);
     }
-    err_str(c" of type '");
-    err_type(ty);
-    err_str(c"' has no ");
-    err_str(if code == D_EQ { c"==" } else { sym_name(NODES[d].a) });
+    err_str(c" of type '", pcx);
+    err_type(ty, pcx);
+    err_str(c"' has no ", pcx);
+    err_str(if code == D_EQ { c"==" } else { sym_name(pcx.nodes[d].a) }, pcx);
     if code == D_HASH && (is_float(ty) || has_float(ty)) {
-        err_help(c"floats have no Hash (NaN is not equal to itself): remove Hash from #[derive], or write the impl, hashing the field's bits");
+        err_help(c"floats have no Hash (NaN is not equal to itself): remove Hash from #[derive], or write the impl, hashing the field's bits", pcx);
     } else if code == D_EQ {
-        err_help(c"remove Eq from #[derive], or give the field a type with ==");
+        err_help(c"remove Eq from #[derive], or give the field a type with ==", pcx);
     } else {
         err_help_fmt(format_args("remove {} from #[derive], or implement it for '",
-            sym_text(NODES[d].a)));
-        buf_type(ERR_HELP, ty);
-        err_help(c"'");
+            sym_text(pcx.nodes[d].a)), pcx);
+        buf_type(pcx.err_help, ty, pcx);
+        err_help(c"'", pcx);
     }
-    err_end_soft();
+    err_end_soft(&pcx);
 }
 
 // Whether a tuple or array type `ty` holds a float.
@@ -937,10 +932,10 @@ fn has_float(ty: i64) -> bool {
 
 // The help of a conflict between impl `node` and another impl of its
 // trait for its type: when `node` is a derive's, remove the derive.
-pub fn derive_conflict_help(node: i64) {
-    if (NODES[node].p & FN_DERIVED) == 0 {
+pub fn derive_conflict_help(node: i64, pcx: Ctx<Comp>) {
+    if (pcx.nodes[node].p & FN_DERIVED) == 0 {
         return;
     }
-    err_help_fmt(format_args("remove {}", sym_text(NODES[NODES[node].a].a)));
-    err_help(c" from #[derive], or the impl written by hand");
+    err_help_fmt(format_args("remove {}", sym_text(pcx.nodes[pcx.nodes[node].a].a)), pcx);
+    err_help(c" from #[derive], or the impl written by hand", pcx);
 }

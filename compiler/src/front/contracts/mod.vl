@@ -14,40 +14,24 @@ pub mod diag;
 pub mod flags;
 
 use crate::base::{IntVec, SRC, buf_fmt, buf_new, buf_slice, cstr, free, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_fmt, err_help, err_str, err_try_tool, error_count};
-use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::{LOCALS, Res};
-use crate::front::contracts::checks::{
-    CHECK_FN, CHECK_KIND, CHECK_OWNER, CHK_ENSURES, CHK_INVARIANT, CHK_REQUIRES,
-};
+use crate::front::ast::{NodeKind, child};
+use crate::front::check::Res;
+use crate::front::contracts::checks::{CHK_ENSURES, CHK_INVARIANT, CHK_REQUIRES};
 use crate::front::contracts::diag::{CONTRACT_EFFECT, CONTRACT_OLD, end_with_code};
 use crate::front::contracts::expand::subtree;
-use crate::front::effects::{
-    EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, FN_EFFECTS_COUNT, fn_effects,
-};
+use crate::front::effects::{EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, fn_effects};
 use crate::front::effects::infer::expr_effects;
 use crate::front::own::kinds::{is_owned_type, is_view_type};
-use crate::front::types::{FNS, err_type};
+use crate::front::types::err_type;
 
 // A clause's kind (CLAUSE_KIND), with CLAUSE_DEBUG for `debug requires ...`.
 pub const CLAUSE_REQUIRES: i64 = 1;
 pub const CLAUSE_ENSURES: i64 = 2;
 pub const CLAUSE_INVARIANT: i64 = 3;
 pub const CLAUSE_DEBUG: i64 = 16;
-
-// The clauses, in source order: the item (a Fn, Struct, Enum or TypeAlias
-// node), the kind, the condition (an expression node, not checked in
-// Phase 0), the `else` message (a Str or Interp node, or 0), the position
-// of the clause's first word.
-pub static var CLAUSE_OWNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CLAUSE_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CLAUSE_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CLAUSE_MESSAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var CLAUSE_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// The TypeAlias nodes written `type X = distinct T` (§2.10). Phase 0: a
-// distinct type is checked as a transparent alias (T4 makes it distinct).
-pub static var DISTINCT_ALIASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The test items (§2.6-§2.8): the node and its kind (TEST_FN for
 // `#[test]`, TEST_PROPERTY, TEST_FUZZ, TEST_CFG for an item under
@@ -57,23 +41,21 @@ pub const TEST_FN: i64 = 1;
 pub const TEST_PROPERTY: i64 = 2;
 pub const TEST_FUZZ: i64 = 3;
 pub const TEST_CFG: i64 = 4;
-pub static var TEST_ITEM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var TEST_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
-pub fn add_clause(owner: i64, kind: i64, cond: i64, message: i64, pos: i64) {
-    CLAUSE_OWNER.push(owner);
-    CLAUSE_KIND.push(kind);
-    CLAUSE_COND.push(cond);
-    CLAUSE_MESSAGE.push(message);
-    CLAUSE_POS.push(pos);
+pub fn add_clause(owner: i64, kind: i64, cond: i64, message: i64, pos: i64, pcx: inout Ctx<Comp>) {
+    pcx.clause_owner.push(owner);
+    pcx.clause_kind.push(kind);
+    pcx.clause_cond.push(cond);
+    pcx.clause_message.push(message);
+    pcx.clause_pos.push(pos);
 }
 
 // How many clauses item `owner` has.
-pub fn clause_count(owner: i64) -> i64 {
+pub fn clause_count(owner: i64, pcx: Ctx<Comp>) -> i64 {
     var n = 0;
     unsafe {
-        for i in 0..CLAUSE_OWNER.count {
-            if CLAUSE_OWNER.data[i] == owner {
+        for i in 0..pcx.clause_owner.count {
+            if pcx.clause_owner.data[i] == owner {
                 n += 1;
             }
         }
@@ -81,14 +63,14 @@ pub fn clause_count(owner: i64) -> i64 {
     n
 }
 
-pub fn mark_distinct(alias: i64) {
-    DISTINCT_ALIASES.push(alias);
+pub fn mark_distinct(alias: i64, pcx: inout Ctx<Comp>) {
+    pcx.distinct_aliases.push(alias);
 }
 
-pub fn is_distinct(alias: i64) -> bool {
+pub fn is_distinct(alias: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        for i in 0..DISTINCT_ALIASES.count {
-            if DISTINCT_ALIASES.data[i] == alias {
+        for i in 0..pcx.distinct_aliases.count {
+            if pcx.distinct_aliases.data[i] == alias {
                 return true;
             }
         }
@@ -96,19 +78,19 @@ pub fn is_distinct(alias: i64) -> bool {
     false
 }
 
-pub fn add_test_item(item: i64, kind: i64) {
-    TEST_ITEM.push(item);
-    TEST_KIND.push(kind);
+pub fn add_test_item(item: i64, kind: i64, pcx: inout Ctx<Comp>) {
+    pcx.test_item.push(item);
+    pcx.test_kind.push(kind);
 }
 
 // The test kind of an item (TEST_FN, ...), or 0. An item under
 // `#[cfg(test)]` that is also `#[test]` answers TEST_FN.
-pub fn test_kind(item: i64) -> i64 {
+pub fn test_kind(item: i64, pcx: Ctx<Comp>) -> i64 {
     var kind = 0;
     unsafe {
-        for i in 0..TEST_ITEM.count {
-            if TEST_ITEM.data[i] == item && (kind == 0 || kind == TEST_CFG) {
-                kind = TEST_KIND.data[i];
+        for i in 0..pcx.test_item.count {
+            if pcx.test_item.data[i] == item && (kind == 0 || kind == TEST_CFG) {
+                kind = pcx.test_kind.data[i];
             }
         }
     }
@@ -123,32 +105,33 @@ pub fn test_kind(item: i64) -> i64 {
 // parameter and keeps no view in an old(..) (contract.old). (The
 // conditions' types and names were checked with the functions expand.vl
 // made of them.)
-pub fn check_contracts() {
+pub fn check_contracts(pcx: inout Ctx<Comp>) {
     unsafe {
-        if CHECK_CALLS.count == 0 {
+        if pcx.check_calls.count == 0 {
             return;
         }
         var seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..CHECK_CALLS.count {
-            let call = CHECK_CALLS.data[i];
-            if NODES[call].count < 3 {
+        for i in 0..pcx.check_calls.count {
+            let call = pcx.check_calls.data[i];
+            if pcx.nodes[call].count < 3 {
                 continue;
             }
-            let check = NODES[child(call, 2)].a;
-            if check < 0 || check >= CHECK_KIND.count
+            let check = pcx.nodes[child(call, 2, pcx)].a;
+            if check < 0 || check >= pcx.check_kind.count
                 || (0..seen.count).any(|j| seen.data[j] == check) {
                 continue;
             }
-            let kind = CHECK_KIND.data[check];
+            let kind = pcx.check_kind.data[check];
             if kind != CHK_REQUIRES && kind != CHK_ENSURES && kind != CHK_INVARIANT {
                 continue;
             }
-            if kind == CHK_ENSURES && ensures_values(child(call, 0), check) {
+            if kind == CHK_ENSURES && ensures_values(child(call, 0, pcx), check, &pcx) {
                 seen.push(check);
                 continue;
             }
-            if FN_EFFECTS_COUNT != 0
-                && (impure(child(call, 0), check) || impure_whole(child(call, 0), check)) {
+            if pcx.fn_effects_count != 0
+                && (impure(child(call, 0, pcx), check, &pcx)
+                    || impure_whole(child(call, 0, pcx), check, &pcx)) {
                 seen.push(check);
             }
         }
@@ -161,44 +144,45 @@ pub fn check_contracts() {
 // so a by-value parameter of an owned type is gone (the body took it),
 // and an `old(e)` that views something would see what the body changed.
 // Generic instances are left to the own pass, which rejects both too.
-fn ensures_values(n: i64, check: i64) -> bool {
+fn ensures_values(n: i64, check: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if n <= 0 || NODES[n].kind == NodeKind::Closure {
+        if n <= 0 || pcx.nodes[n].kind == NodeKind::Closure {
             return false;
         }
-        if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
-            let l = NODES[n].y;
-            let name = sym_text(LOCALS[l].name);
-            let ty = LOCALS[l].ty;
-            let owner = sym_text(NODES[CHECK_OWNER.data[check]].a);
-            if name.len > 4 && name[0..4] == "?old" && ty > 0 && is_view_type(ty) {
-                err_begin(NODES[n].start);
+        if pcx.nodes[n].kind == NodeKind::Ident && pcx.nodes[n].res == Res::Local {
+            let l = pcx.nodes[n].y;
+            let name = sym_text(pcx.locals[l].name);
+            let ty = pcx.locals[l].ty;
+            let owner = sym_text(pcx.nodes[pcx.check_owner.data[check]].a);
+            if name.len > 4 && name[0..4] == "?old" && ty > 0 && is_view_type(ty, &pcx) {
+                err_begin(pcx.nodes[n].start, &pcx);
                 err_fmt(
-                    format_args("'{}' keeps a view: the ensures of '{owner}' runs after the body, which may change what it views", SRC[NODES[n].start..NODES[n].end]));
+                    format_args("'{}' keeps a view: the ensures of '{owner}' runs after the body, which may change what it views", SRC[pcx.nodes[n].start..pcx.nodes[n].end]), pcx);
                 err_help(
-                    c"take a plain part at entry (`old(x.len())`), or a copy (`old(x.clone())`)");
-                end_with_code(CONTRACT_OLD);
+                    c"take a plain part at entry (`old(x.len())`), or a copy (`old(x.clone())`)",
+                    pcx);
+                end_with_code(CONTRACT_OLD, &pcx);
                 return true;
             }
-            if LOCALS[l].is_param && ty > 0 && is_owned_type(ty) {
-                err_begin(NODES[n].start);
+            if pcx.locals[l].is_param && ty > 0 && is_owned_type(ty, &pcx) {
+                err_begin(pcx.nodes[n].start, &pcx);
                 err_fmt(
                     format_args(
-                        "the ensures of '{owner}' reads '{name}' after the body took it ('"));
-                err_type(ty);
-                err_str(c"' is owned, passed by value)");
-                err_help(c"read it at entry, `old(x.len())` or `old(x.clone())`, or take it by reference (`x: &T`)");
-                end_with_code(CONTRACT_OLD);
+                        "the ensures of '{owner}' reads '{name}' after the body took it ('"), pcx);
+                err_type(ty, pcx);
+                err_str(c"' is owned, passed by value)", pcx);
+                err_help(c"read it at entry, `old(x.len())` or `old(x.clone())`, or take it by reference (`x: &T`)", pcx);
+                end_with_code(CONTRACT_OLD, &pcx);
                 return true;
             }
         }
         for k in 0..3 {
-            if ensures_values(subtree(n, k), check) {
+            if ensures_values(subtree(n, k, pcx), check, &pcx) {
                 return true;
             }
         }
-        for i in 0..NODES[n].count {
-            if ensures_values(child(n, i), check) {
+        for i in 0..pcx.nodes[n].count {
+            if ensures_values(child(n, i, pcx), check, &pcx) {
                 return true;
             }
         }
@@ -206,27 +190,23 @@ fn ensures_values(n: i64, check: i64) -> bool {
     }
 }
 
-// The calls of std::contract_check made from clauses, once checked
-// (desugar_call), for check_contracts.
-pub static var CHECK_CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Whether the condition at n (of check `check`) does io, allocates or
 // touches a static; reported once.
-fn impure(n: i64, check: i64) -> bool {
+fn impure(n: i64, check: i64, pcx: inout Ctx<Comp>) -> bool {
     if n <= 0 {
         return false;
     }
-    let kind = NODES[n].kind;
+    let kind = pcx.nodes[n].kind;
     if kind == NodeKind::Closure {
         return false;
     }
-    if kind == NodeKind::Ident && NODES[n].res == Res::Static {
-        effect_error(n, check, -1, EFF_GLOBAL);
+    if kind == NodeKind::Ident && pcx.nodes[n].res == Res::Static {
+        effect_error(n, check, -1, EFF_GLOBAL, &pcx);
         return true;
     }
-    if kind == NodeKind::Call && NODES[n].x > 0 {
-        let f = NODES[n].x - 1;
-        let e = fn_effects(f);
+    if kind == NodeKind::Call && pcx.nodes[n].x > 0 {
+        let f = pcx.nodes[n].x - 1;
+        let e = fn_effects(f, pcx);
         // (not inferred: a function that failed, a template checked with
         // errors in a query; not reported)
         // (unknown only after an error: a body or an instance of the
@@ -235,27 +215,27 @@ fn impure(n: i64, check: i64) -> bool {
             return false;
         }
         let bad = impure_bit(e);
-        if bad != 0 && f != CHECK_FN {
-            effect_error(n, check, f, bad);
+        if bad != 0 && f != pcx.check_fn {
+            effect_error(n, check, f, bad, &pcx);
             return true;
         }
     }
     for k in 0..3 {
-        if impure(subtree(n, k), check) {
+        if impure(subtree(n, k, pcx), check, &pcx) {
             return true;
         }
     }
-    for i in 0..NODES[n].count {
-        if impure(child(n, i), check) {
+    for i in 0..pcx.nodes[n].count {
+        if impure(child(n, i, pcx), check, &pcx) {
             return true;
         }
     }
     // (0.25) A call through a fn value: what the functions it may
     // call do.
-    if kind == NodeKind::Call && NODES[n].x <= 0 {
-        let bad = impure_bit(expr_effects(n));
-        if bad != 0 && (bad != -4 || error_count() == 0) {
-            effect_error(n, check, -3, bad);
+    if kind == NodeKind::Call && pcx.nodes[n].x <= 0 {
+        let bad = impure_bit(expr_effects(n, &pcx));
+        if bad != 0 && (bad != -4 || error_count(pcx) == 0) {
+            effect_error(n, check, -3, bad, &pcx);
             return true;
         }
     }
@@ -265,12 +245,12 @@ fn impure(n: i64, check: i64) -> bool {
 // (0.25) Whether condition n does io, allocates or touches a static by any
 // other way than impure finds (all that the effect inference sees of it);
 // reported at the condition.
-fn impure_whole(n: i64, check: i64) -> bool {
-    let bad = impure_bit(expr_effects(n));
+fn impure_whole(n: i64, check: i64, pcx: inout Ctx<Comp>) -> bool {
+    let bad = impure_bit(expr_effects(n, &pcx));
     if bad == 0 || bad == -4 {
         return false;
     }
-    effect_error(n, check, -5, bad);
+    effect_error(n, check, -5, bad, &pcx);
     true
 }
 
@@ -298,39 +278,41 @@ fn impure_bit(e: Effects) -> i64 {
 // contract.effect at node n, a call of f (-1: a static read; -3: a call
 // through a fn value; -5: the condition as a whole) that has effect `bit` (-2: alloc; -4: unknown
 // effects).
-fn effect_error(n: i64, check: i64, f: i64, bit: i64) {
+fn effect_error(n: i64, check: i64, f: i64, bit: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         let what = if bit == -2 { c"allocates" } else if bit == EFF_IO { c"does io" }
             else if bit == -4 { c"has effects that are not known" }
             else if bit == crate::front::effects::EFF_INTERIOR {
                 c"writes through a shared reference (a cell)"
             } else { c"touches a static" };
-        let word = if CHECK_KIND.data[check] == CHK_REQUIRES { c"requires" }
-            else if CHECK_KIND.data[check] == CHK_ENSURES { c"ensures" } else { c"invariant" };
-        let owner = CHECK_OWNER.data[check];
-        err_begin(NODES[n].start);
-        err_fmt(format_args("the '{}' of '{}' ", cstr(word), sym_text(NODES[owner].a)));
+        let word = if pcx.check_kind.data[check] == CHK_REQUIRES { c"requires" }
+            else if pcx.check_kind.data[check] == CHK_ENSURES { c"ensures" } else { c"invariant" };
+        let owner = pcx.check_owner.data[check];
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_fmt(format_args("the '{}' of '{}' ", cstr(word), sym_text(pcx.nodes[owner].a)), pcx);
         if f >= 0 {
-            err_fmt(format_args("calls '{}', which {}", sym_text(FNS[f].display), cstr(what)));
+            err_fmt(format_args("calls '{}', which {}", sym_text(pcx.fns[f].display), cstr(what)),
+                pcx);
         } else if f == -3 {
-            let callee = NODES[n].a;
+            let callee = pcx.nodes[n].a;
             err_fmt(
                 format_args("calls '{}', a fn value that may call a function which {}",
-                    SRC[NODES[callee].start..NODES[callee].end], cstr(what)));
+                    SRC[pcx.nodes[callee].start..pcx.nodes[callee].end], cstr(what)), pcx);
         } else if f == -5 {
-            err_fmt(format_args("{}", cstr(what)));
+            err_fmt(format_args("{}", cstr(what)), pcx);
         } else {
-            err_fmt(format_args("reads the static '{}'", sym_text(NODES[n].a)));
+            err_fmt(format_args("reads the static '{}'", sym_text(pcx.nodes[n].a)), pcx);
         }
-        err_str(c": a condition may not do io, allocate, touch statics or write through a shared reference");
-        err_help(c"a check that passes must not change what the program does: compute the value in the body, or check it with assert there");
+        err_str(c": a condition may not do io, allocate, touch statics or write through a shared reference", pcx);
+        err_help(c"a check that passes must not change what the program does: compute the value in the body, or check it with assert there", pcx);
         if f >= 0 && bit != -4 {
             let effect = if bit == -2 { "alloc" } else if bit == EFF_IO { "io" }
                 else if bit == crate::front::effects::EFF_INTERIOR { "interior" } else { "global" };
             let t = buf_new();
-            buf_fmt(t, format_args("query effects {} --why {effect}", sym_text(FNS[f].display)));
-            err_try_tool(buf_slice(t), true);
+            buf_fmt(t,
+                format_args("query effects {} --why {effect}", sym_text(pcx.fns[f].display)));
+            err_try_tool(buf_slice(t), true, pcx);
         }
-        end_with_code(CONTRACT_EFFECT);
+        end_with_code(CONTRACT_EFFECT, &pcx);
     }
 }

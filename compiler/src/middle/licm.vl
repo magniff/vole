@@ -12,9 +12,10 @@
 
 // Loops: header, then the index of their first body block in LOOP_BODY,
 // and its count (3 per loop).
-use crate::arch::INTRS;
 use crate::arch::features::{FT_AVX, made_build_features};
 use crate::base::{IntVec, alloc_array, free};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::X86;
 use crate::front::features::fn_needs;
 use crate::front::types::{is_vector, type_size};
@@ -87,7 +88,7 @@ fn find_loops(cx: inout FnCtx, fi: i64) {
 // The preheader of the loop with header h (body blocks marked with
 // `stamp`), or 0 when the loop has several entering edges (or when its
 // entering edge would have to be split and `split` is false).
-fn preheader(cx: inout FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
+fn preheader(cx: inout FnCtx, fi: i64, h: i64, stamp: i64, split: bool, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var outside = 0;
         var count = 0;
@@ -109,7 +110,7 @@ fn preheader(cx: inout FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
         }
         // Split the edge: a new block between the predecessor and the header,
         // at the same index in the header's predecessors.
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         let e = ir_new_block(&cx);
         cx.blocks[e].sealed = 1;
         cx.blocks[e].term = Term::Jump;
@@ -125,7 +126,8 @@ fn preheader(cx: inout FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
 // Whether something in the `count` blocks at `blocks` (a loop's) may
 // write [base + offset, + size): a store, a copy, or a call (unless the
 // base is a private slot).
-fn blocks_may_write(cx: sink *FnCtx, blocks: *i64, count: i64, base: i64, offset: i64, size: i64)
+fn blocks_may_write(cx: sink *FnCtx, blocks: *i64, count: i64, base: i64, offset: i64, size: i64,
+    pcx: Ctx<Comp>)
     -> bool {
     // UNSAFE: the IR's tables through the raw *FnCtx, and `blocks`, a raw
     // pointer to a loop's block list.
@@ -141,13 +143,13 @@ fn blocks_may_write(cx: sink *FnCtx, blocks: *i64, count: i64, base: i64, offset
                     let other = address_base(cx,
                         if op == Op::Store { cx.insts[v].a } else { copy_dst(cx, v) },
                         &other_offset);
-                    let other_size = if op == Op::Store { type_size(cx.insts[v].imm2) }
+                    let other_size = if op == Op::Store { type_size(cx.insts[v].imm2, pcx) }
                         else { copy_size(cx, v) };
-                    if may_alias(&*cx, base, offset, size, other, other_offset, other_size) {
+                    if may_alias(&*cx, base, offset, size, other, other_offset, other_size, pcx) {
                         return true;
                     }
-                } else if (op.is_call() && call_writes(&*cx, v) || is_barrier(&*cx, v))
-                    && call_may_write(&*cx, base) {
+                } else if (op.is_call() && call_writes(&*cx, v, pcx) || is_barrier(&*cx, v))
+                    && call_may_write(&*cx, base, pcx) {
                     return true;
                 }
                 v = cx.insts[v].next;
@@ -165,7 +167,7 @@ fn blocks_may_write(cx: sink *FnCtx, blocks: *i64, count: i64, base: i64, offset
 // element's address from being affine in the induction variable alone,
 // and LICM runs after the loop passes. The slots' escapes must be
 // current (find_escaping_slots). Returns whether one moved.
-pub fn hoist_invariant_loads(cx: inout FnCtx, l: i64) -> bool {
+pub fn hoist_invariant_loads(cx: inout FnCtx, l: i64, pcx: Ctx<Comp>) -> bool {
     // UNSAFE: the IR's tables through the raw *FnCtx, and `blocks`, a raw
     // pointer into the loop forest's block list.
     // SAFETY: every index is an instruction or block id of this function;
@@ -186,15 +188,16 @@ pub fn hoist_invariant_loads(cx: inout FnCtx, l: i64) -> bool {
                 if cx.insts[v].op == Op::Load {
                     ir_resolve_operands(&cx, v);
                     let a = cx.insts[v].a;
-                    let size = type_size(cx.insts[v].ty);
+                    let size = type_size(cx.insts[v].ty, pcx);
                     var offset = cx.insts[v].imm;
                     let base = address_base(&cx, a, &offset);
                     // (a static's or a slot's address in the loop goes too)
                     let at_address = !invariant_in(&cx, l, a) && is_address_op(cx.insts[a].op);
-                    if (at_address || invariant_in(&cx, l, a)) && !op_guarded(&cx, v)
-                        && (root_of(&cx, base) != 0 || in_param_vec_header(&cx, base, offset, size))
-                        && in_object_bounds(&cx, a, cx.insts[v].imm, size)
-                        && !blocks_may_write(&cx, blocks, count, base, offset, size) {
+                    if (at_address || invariant_in(&cx, l, a)) && !op_guarded(&cx, v, pcx)
+                        && (root_of(&cx, base) != 0
+                            || in_param_vec_header(&cx, base, offset, size, pcx))
+                        && in_object_bounds(&cx, a, cx.insts[v].imm, size, pcx)
+                        && !blocks_may_write(&cx, blocks, count, base, offset, size, pcx) {
                         if at_address {
                             ir_unlink(&cx, a);
                             ir_append(&cx, pre, a);
@@ -220,7 +223,7 @@ fn defined_outside(cx: inout FnCtx, v: i64, stamp: i64) -> bool {
     unsafe { v == 0 || cx.blocks[cx.insts[v].block].mark != stamp }
 }
 
-fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let op = cx.insts[v].op;
         // (0.19) An operation the function may run without (it needs a
@@ -228,7 +231,7 @@ fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
         // 256-bit value's load on x86-64) is never run before its guard:
         // hoisted only when it runs in every iteration anyway (as a load
         // that may trap).
-        if op_guarded(&cx, v) && !runs_first(&cx, v, stamp, start, count) {
+        if op_guarded(&cx, v, pcx) && !runs_first(&cx, v, stamp, start, count, pcx) {
             return false;
         }
         if op == Op::Load {
@@ -241,10 +244,10 @@ fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
             }
             var offset = cx.insts[v].imm;
             let base = address_base(&cx, cx.insts[v].a, &offset);
-            let size = type_size(cx.insts[v].ty);
+            let size = type_size(cx.insts[v].ty, pcx);
             // (0.25.4: or a Vec's header in a reference parameter's
             // referent: middle::vecfacts)
-            if root_of(&cx, base) == 0 && !in_param_vec_header(&cx, base, offset, size) {
+            if root_of(&cx, base) == 0 && !in_param_vec_header(&cx, base, offset, size, pcx) {
                 return false;
             }
             // (0.25) Run in the preheader, it runs where the loop may not
@@ -252,14 +255,15 @@ fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
             // static's field, not an element at a variable index, valid
             // only under its bounds check), or one that runs in the first
             // iteration anyway.
-            if !in_object_bounds(&cx, cx.insts[v].a, cx.insts[v].imm, size)
-                && !runs_first(&cx, v, stamp, start, count) {
+            if !in_object_bounds(&cx, cx.insts[v].a, cx.insts[v].imm, size, pcx)
+                && !runs_first(&cx, v, stamp, start, count, pcx) {
                 return false;
             }
-            return !blocks_may_write(&cx, &cx.loop_body.data[start], count, base, offset, size);
+            return !blocks_may_write(&cx, &cx.loop_body.data[start], count, base, offset, size,
+                pcx);
         }
         if op.is_call() {
-            return call_invariant(&cx, v, stamp, start, count);
+            return call_invariant(&cx, v, stamp, start, count, pcx);
         }
         if !op.is_pure() && !op.is_vector() && op != Op::Sel {
             return false;
@@ -274,16 +278,16 @@ fn is_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
 // only a ymm register holds (its load and store are vmovdqu, its move
 // vmovdqa, its constant a ymm load). AArch64 has no such operation: its
 // 256-bit vectors are legalized into halves, NEON is the baseline.
-pub fn op_features(cx: inout FnCtx, v: i64) -> i64 {
+pub fn op_features(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let op = cx.insts[v].op;
         var need = 0;
         if op == Op::Intr {
-            need = INTRS[cx.insts[v].imm].features;
+            need = pcx.intrs[cx.insts[v].imm].features;
         }
         if X86 {
             let ty = if op == Op::Store { cx.insts[v].imm2 } else { cx.insts[v].ty };
-            if ty > 0 && is_vector(ty) && type_size(ty) == 32 {
+            if ty > 0 && is_vector(ty) && type_size(ty, pcx) == 32 {
                 need = need | (1 << FT_AVX);
             }
         }
@@ -298,14 +302,14 @@ pub fn op_features(cx: inout FnCtx, v: i64) -> i64 {
 // the guard has not been tested (docs/design/arch.md §5.2, the
 // no-speculation line): not hoisted by LICM unless it runs in every
 // iteration, not speculated into a select by if-conversion or isel.
-pub fn op_guarded(cx: inout FnCtx, v: i64) -> bool {
+pub fn op_guarded(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let need = op_features(&cx, v);
+        let need = op_features(&cx, v, pcx);
         if need == 0 {
             return false;
         }
         let f = IRFUNCS[cx.ir_cur].f;
-        let known = made_build_features() | fn_needs(f);
+        let known = made_build_features(pcx) | fn_needs(f, pcx);
         (need & ~known) != 0
     }
 }
@@ -318,13 +322,13 @@ pub fn op_guarded(cx: inout FnCtx, v: i64) -> bool {
 // loop ends), or certain to run in the
 // loop's first iteration before anything a panic or a stop would make
 // visible (then it runs once, earlier, with the same arguments).
-fn call_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn call_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let op = cx.insts[v].op;
         if op != Op::Call && op != Op::CallC || cx.insts[v].ty == 0 || cx.insts[v].c != 0 {
             return false;
         }
-        let attrs = call_attrs(&cx, v);
+        let attrs = call_attrs(&cx, v, pcx);
         if (attrs & ATTR_READNONE) == 0 {
             return false;
         }
@@ -337,7 +341,7 @@ fn call_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -
         if (attrs & speculable) == speculable {
             return true;
         }
-        runs_first(&cx, v, stamp, start, count)
+        runs_first(&cx, v, stamp, start, count, pcx)
     }
 }
 
@@ -346,7 +350,7 @@ fn call_invariant(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -
 // that leaves it or goes back to its header, and the instructions that
 // may run before it in an iteration are not calls that may panic, stop,
 // loop forever or write (I/O included).
-fn runs_first(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+fn runs_first(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let b = cx.insts[v].block;
         let quiet = ATTR_WILLRETURN | ATTR_NOPANIC | ATTR_READONLY;
@@ -375,7 +379,7 @@ fn runs_first(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bo
             // Before v (all of x, or b up to v).
             var w = cx.blocks[x].first;
             while w != 0 && w != v {
-                if cx.insts[w].op.is_call() && (call_attrs(&cx, w) & quiet) != quiet {
+                if cx.insts[w].op.is_call() && (call_attrs(&cx, w, pcx) & quiet) != quiet {
                     return false;
                 }
                 w = cx.insts[w].next;
@@ -385,7 +389,7 @@ fn runs_first(cx: inout FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bo
     }
 }
 
-pub fn run_licm(cx: inout FnCtx, fi: i64) -> bool {
+pub fn run_licm(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         // First give every loop a preheader (splitting edges changes the
         // blocks, so the loops are found again until no split is needed).
@@ -397,8 +401,8 @@ pub fn run_licm(cx: inout FnCtx, fi: i64) -> bool {
             for l in 0..cx.loops.count / 3 {
                 let stamp = mark_loop(&cx, fi, l);
                 let h = cx.loops.data[3 * l];
-                if preheader(&cx, fi, h, stamp, false) == 0
-                    && preheader(&cx, fi, h, stamp, true) != 0 {
+                if preheader(&cx, fi, h, stamp, false, pcx) == 0
+                    && preheader(&cx, fi, h, stamp, true, pcx) != 0 {
                     split = true;
                 }
             }
@@ -428,7 +432,7 @@ pub fn run_licm(cx: inout FnCtx, fi: i64) -> bool {
                 }
             }
             done[best] = 1;
-            if hoist_loop(&cx, fi, best) {
+            if hoist_loop(&cx, fi, best, pcx) {
                 changed = true;
             }
         }
@@ -460,13 +464,13 @@ fn mark_loop(cx: inout FnCtx, fi: i64, l: i64) -> i64 {
     }
 }
 
-fn hoist_loop(cx: inout FnCtx, fi: i64, l: i64) -> bool {
+fn hoist_loop(cx: inout FnCtx, fi: i64, l: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let h = cx.loops.data[3 * l];
         let start = cx.loops.data[3 * l + 1];
         let count = cx.loops.data[3 * l + 2];
         let stamp = mark_loop(&cx, fi, l);
-        let pre = preheader(&cx, fi, h, stamp, false);
+        let pre = preheader(&cx, fi, h, stamp, false, pcx);
         if pre == 0 {
             return false;
         }
@@ -484,7 +488,7 @@ fn hoist_loop(cx: inout FnCtx, fi: i64, l: i64) -> bool {
                 while v != 0 {
                     let next = cx.insts[v].next;
                     ir_resolve_operands(&cx, v);
-                    if is_invariant(&cx, v, stamp, start, count) {
+                    if is_invariant(&cx, v, stamp, start, count, pcx) {
                         // (a load's address made in the loop: is_invariant)
                         let a = cx.insts[v].a;
                         if cx.insts[v].op == Op::Load && !defined_outside(&cx, a, stamp) {

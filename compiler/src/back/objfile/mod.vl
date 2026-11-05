@@ -38,7 +38,6 @@ pub mod output;
 pub mod linkfail;
 mod link_macho;
 
-use crate::back::dwarf::DEBUG_INFO;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
@@ -53,6 +52,8 @@ use macho::macho_write;
 use resolve::{build_sections, layout, resolve_fixups};
 
 // The assembler's text helpers, used by the instruction encoders.
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::{ELF, X86};
 use crate::base::term::build_linking;
 use crate::base::timer::{T_CODEGEN, T_OUTPUT, timer_now, timer_sub};
@@ -84,10 +85,6 @@ const SEC_COUNT: i64 = 9;
 pub static var CUR_SEC: i64 = 0;
 static var SEC_ALIGN: [i64; 9] = [0; 9];
 static var SEC_USED: [bool; 9] = [false; 9];
-// Section contents after layout, and their sizes and addresses in the
-// object (Mach-O lays sections out one after the other).
-static var SEC_BUF: [i64; 9] = [-1; 9];
-static var SEC_ADDR: [i64; 9] = [0; 9];
 
 // ---- Fragments ----
 
@@ -501,36 +498,36 @@ pub fn emit_relaxable(tail: i64, cond: i64, sym: i64) {
 // `rtype`, against symbol `sym` (an ASYMS index, or -1 - section for a
 // section of ELF), with `addend` (ELF) and, for Mach-O, pc-relativity and
 // the field's length (log2 bytes).
-struct Reloc { sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64 }
+pub struct Reloc {
+    sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64,
+}
 
-static var RELOCS: *Reloc = 0 as *Reloc;
-static var RELOC_COUNT: i64 = 0;
-static var RELOC_CAP: i64 = 0;
-
-fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64) {
+fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64,
+    pcx: inout Ctx<Comp>) {
     unsafe {
-        RELOCS = grow(RELOCS, RELOC_COUNT, &RELOC_CAP);
-        RELOCS[RELOC_COUNT] = Reloc { sec, offset, rtype, sym, addend, pcrel, length };
+        pcx.relocs = grow(pcx.relocs, pcx.reloc_count, &pcx.reloc_cap);
+        pcx.relocs[pcx.reloc_count] = Reloc { sec, offset, rtype, sym, addend, pcrel, length };
     }
-    RELOC_COUNT += 1;
+    pcx.reloc_count += 1;
 }
 
 // A relocation against symbol s itself (a GOT entry's).
-fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool) {
+fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool, pcx: inout Ctx<Comp>) {
     unsafe { ASYMS[s].in_table = true; }
-    reloc(sec, offset, rtype, s, 0, pcrel, 2);
+    reloc(sec, offset, rtype, s, 0, pcrel, 2, &pcx);
 }
 
 // A relocation against symbol s plus `extra`: on ELF a temporary label
 // becomes its section's symbol plus the label's offset.
-fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64) {
+fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64,
+    pcx: inout Ctx<Comp>) {
     unsafe {
         if ELF && ASYMS[s].defined && is_temp(s) {
-            reloc(sec, offset, rtype, -1 - ASYMS[s].sec, extra + sym_addr(s), pcrel, length);
+            reloc(sec, offset, rtype, -1 - ASYMS[s].sec, extra + sym_addr(s), pcrel, length, &pcx);
             return;
         }
         ASYMS[s].in_table = true;
-        reloc(sec, offset, rtype, s, extra, pcrel, length);
+        reloc(sec, offset, rtype, s, extra, pcrel, length, &pcx);
     }
 }
 
@@ -599,30 +596,30 @@ pub fn is_debug(sec: i64) -> bool {
 
 // Assembles ASM into an object file at `path` (what asm_flush has not
 // assembled yet).
-pub fn write_object(cx: inout FnCtx, path: *u8) {
+pub fn write_object(cx: inout FnCtx, path: *u8, pcx: inout Ctx<Comp>) {
     unsafe {
-        if !ASM_STREAM {
+        if !pcx.asm_stream {
             assembler_begin();
         }
         assemble_text(&cx);
-        if ASM_STREAM {
+        if pcx.asm_stream {
             BUFS[cx.asm].len = 0;
         }
         new_frag(CUR_SEC);
         layout();
-        resolve_fixups(&cx);
-        build_sections();
+        resolve_fixups(&cx, &pcx);
+        build_sections(&pcx);
         if ROWS.count > 0 {
-            line_program();
+            line_program(&pcx);
         }
         if CFI_FNS.count > 0 {
-            compact_unwind();
+            compact_unwind(&pcx);
         }
         if ELF {
             SEC_ALIGN[SEC_NOTE] = 0;
-            elf_write(path);
+            elf_write(path, &pcx);
         } else {
-            macho_write(path);
+            macho_write(path, &pcx);
         }
     }
 }
@@ -664,49 +661,41 @@ pub fn assemble_bytes(cx: inout FnCtx, text: *u8, n: i64) {
     }
 }
 
-// (0.17) Whether the assembly is assembled as it is written (asm_flush
-// after each function): when the output is an object (or a program) and
-// there is no debug information, whose sections are made from the whole
-// text. The text in memory is then one function's, not the program's
-// (30 MB at -O0 for the compiler), and it is read while it is in the
-// cache.
-pub static var ASM_STREAM: bool = false;
-
 // (0.18.1) The text being assembled (assemble_text's): the assembler
 // reads it here, not from a buffer of BUFS, which code generation may
 // grow while the assembler runs on a thread of its own.
 pub static var ATEXT: *u8 = 0 as *u8;
 
 // From the first function on (after the file's header): see ASM_STREAM.
-pub fn asm_stream_begin() {
-    if OUTPUT_MODE != OUT_ASM && !DEBUG_INFO {
-        ASM_STREAM = true;
+pub fn asm_stream_begin(pcx: inout Ctx<Comp>) {
+    if pcx.output_mode != OUT_ASM && !pcx.debug_info {
+        pcx.asm_stream = true;
         assembler_begin();
     }
 }
 
 // Assembles the text written so far (whole lines: a function's), when
 // streaming.
-pub fn asm_flush(cx: inout FnCtx) {
+pub fn asm_flush(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        if ASM_STREAM {
+        if pcx.asm_stream {
             // (its time is the output's, as when the text is assembled at
             // the end, not the code generation's that runs it)
-            let t = timer_now();
-            c_module_symbols(&cx);
+            let t = timer_now(pcx);
+            c_module_symbols(&cx, pcx);
             assemble_text(&cx);
             BUFS[cx.asm].len = 0;
-            timer_sub(T_CODEGEN, T_OUTPUT, t);
+            timer_sub(T_CODEGEN, T_OUTPUT, t, pcx);
         }
     }
 }
 
 // (0.18.1) asm_flush on the assembler's thread (middle::threads): the text
 // so far, copied, is handed to it.
-pub fn asm_hand_over(cx: inout FnCtx) {
+pub fn asm_hand_over(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        if ASM_STREAM {
-            c_module_symbols(&cx);
+        if pcx.asm_stream {
+            c_module_symbols(&cx, pcx);
             let n = BUFS[cx.asm].len;
             let copy = alloc_zeroed(n + 1);
             memcpy(copy, BUFS[cx.asm].data, n as u64);
@@ -731,7 +720,6 @@ extern "C" {
 pub const OUT_ASM: i64 = 0;
 pub const OUT_OBJECT: i64 = 1;
 pub const OUT_EXECUTABLE: i64 = 2;
-pub static var OUTPUT_MODE: i64 = -1;
 
 // The output mode for `path` when no option chose one.
 pub fn output_mode_of(path: *u8) -> i64 {
@@ -748,30 +736,30 @@ pub fn output_mode_of(path: *u8) -> i64 {
 }
 
 // Writes the program (ASM) to `path` as the output mode says.
-pub fn write_output(cx: inout FnCtx, path: *u8) {
+pub fn write_output(cx: inout FnCtx, path: *u8, pcx: inout Ctx<Comp>) {
     unsafe {
-        c_module_symbols(&cx);
-        if OUTPUT_MODE == OUT_ASM {
+        c_module_symbols(&cx, pcx);
+        if pcx.output_mode == OUT_ASM {
             buf_write_file(cx.asm, path);
             return;
         }
-        if OUTPUT_MODE == OUT_OBJECT {
-            write_object(&cx, path);
+        if pcx.output_mode == OUT_OBJECT {
+            write_object(&cx, path, &pcx);
             return;
         }
         let obj = buf_new();
         buf_fmt(obj, format_args("{}.vole.o\0", cstr(path)));
         let obj_path = BUFS[obj].data;
-        write_object(&cx, obj_path);
+        write_object(&cx, obj_path, &pcx);
         // (0.25.3: the link's inputs first, its failure one error)
-        check_link_inputs();
-        build_linking(path);
-        var status = link_program(path, obj_path) as i32;
+        check_link_inputs(&pcx);
+        build_linking(path, pcx);
+        var status = link_program(path, obj_path, &pcx) as i32;
         if status != 0 {
             unlink(obj_path);
-            link_failed(status as i64, path);
+            link_failed(status as i64, path, &pcx);
         }
-        if status == 0 && DEBUG_INFO && !ELF {
+        if status == 0 && pcx.debug_info && !ELF {
             // (-g) On macOS the debug information stays in the object, which
             // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
             let dsym = buf_new();

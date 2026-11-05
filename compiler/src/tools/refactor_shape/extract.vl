@@ -19,13 +19,16 @@
 // it cannot give back (refactor.results), a generic function
 // (refactor.generic).
 
+use std::Arena;
+
 use crate::base::{
-    BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
+    BUFS, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
 };
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::cli::line::Call;
-use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::LOCALS;
+use crate::front::ast::{NodeKind, child};
+use crate::front::embed::wgsl::WgslCx;
 use crate::front::modules::file_of_pos;
 use crate::front::types::{REF_MUT, TYPES, TY_NEVER, TY_UNIT, TyKind, is_pointer};
 use crate::tools::ctx::Tcx;
@@ -34,11 +37,11 @@ use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::items::{after_line, indent_of};
 use crate::tools::fixconv::{new_spelling, put_type_conv};
 use crate::tools::query::{c_slice, root_or_diag};
-use crate::tools::query::defs::{DEFS, K_FN, K_IMPL_METHOD, K_METHOD};
+use crate::tools::query::defs::{K_FN, K_IMPL_METHOD, K_METHOD};
 use crate::tools::query::diagnostics::{
-    PROG, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
+    diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
-use crate::tools::query::positions::{LINES, line_index, line_of, put_path};
+use crate::tools::query::positions::{line_index, line_of, put_path};
 use crate::tools::refactor_mod::cli::is_ident;
 use crate::tools::refactor_shape::{
     load_and_find, opt, shape_options, sym_text, take_args, usage_error,
@@ -54,98 +57,102 @@ const BY_VALUE: i64 = 0;
 const BY_POINTER: i64 = 1;
 const GIVEN_BACK: i64 = 2;
 
-pub fn run_extract(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
-    let status = extract_inner(c, &tcx);
+pub fn run_extract(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>,
+    wgx: inout WgslCx<Arena>) -> i64 {
+    let status = extract_inner(c, &tcx, &pcx, &wgx);
     write_diags(tcx);
     status
 }
 
-fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
+fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> i64 {
     unsafe {
         set_command(c.line, &tcx);
-        PROG = c.prog();
+        pcx.prog = c.prog();
         tcx.tool = c"refactor";
         tcx.sub = c"extract-function";
         var root = 0 as *u8;
         var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"FN --lines 12-18 --to NEW --dry-run";
-        if !take_args(c, shape_options("extract-function"), &root, &words, &opts, &tcx) {
+        if !take_args(c, shape_options("extract-function"), &root, &words, &opts, &tcx, &pcx) {
             return 2;
         }
         if words.count != 1 {
             return usage_error(if words.count == 0 { c"a function FN is needed" }
-                else { c"one FN at a time" }, example, &tcx);
+                else { c"one FN at a time" }, example, &tcx, pcx);
         }
         let lines = opt(opts, c"--lines", false);
         let to = opt(opts, c"--to", false);
         if lines == 0 as *u8 || to == 0 as *u8 {
             return usage_error(c"--lines A-B (lines of FN's file) and --to NEW are needed",
-                example, &tcx);
+                example, &tcx, pcx);
         }
         var la = 0;
         var lb = 0;
         if !line_range(c_slice(lines), &la, &lb) {
             return usage_error(c"--lines takes A-B, line numbers of FN's file (A-A: one line)",
-                example, &tcx);
+                example, &tcx, pcx);
         }
         let new_name = c_slice(to);
         if !is_ident(new_name) {
-            return usage_error(c"NEW must be an identifier (not a keyword)", example, &tcx);
+            return usage_error(c"NEW must be an identifier (not a keyword)", example, &tcx, pcx);
         }
         let name = c_slice(words.data[0] as *u8);
         tcx.root_given = root;
-        root = root_or_diag(root, tcx.sub, name, true, &tcx);
+        root = root_or_diag(root, tcx.sub, name, true, &tcx, pcx);
         if root == 0 as *u8 {
             return 2;
         }
         var status = 0;
         let d = load_and_find(root, name, (1 << K_FN) | (1 << K_METHOD) | (1 << K_IMPL_METHOD),
-            c"function", &status, &tcx);
+            c"function", &status, &tcx, &pcx, &wgx);
         if d < 0 {
             return status;
         }
-        let f = DEFS[d].node;
-        let body = NODES[f].c;
-        let fqn = sym_text(DEFS[d].fqn);
+        let f = pcx.defs[d].node;
+        let body = pcx.nodes[f].c;
+        let fqn = sym_text(pcx.defs[d].fqn);
         if body <= 0 {
             let e = diag(c"error", c"refactor.kind", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, c" has no body\n");
             return 1;
         }
-        if NODES[f].g != 0 || NODES[f].h != 0 && NODES[NODES[f].h].g != 0 {
+        if pcx.nodes[f].g != 0 || pcx.nodes[f].h != 0 && pcx.nodes[pcx.nodes[f].h].g != 0 {
             let e = diag(c"error", c"refactor.generic", &tcx);
             buf_bytes(e, fqn);
             buf_str(e, c" is generic: its body is checked once per instance; extract by hand\n");
             return 1;
         }
-        let file = file_of_pos(DEFS[d].start);
-        let first_line = line_index(FILES[file].start);
-        let file_lines = line_index(FILES[file].end - 1) - first_line + 1;
+        let file = file_of_pos(pcx.defs[d].start, pcx);
+        let first_line = line_index(pcx.files[file].start, pcx);
+        let file_lines = line_index(pcx.files[file].end - 1, pcx) - first_line + 1;
         // (0.17: past the file's end, the body's lines are the help)
         let past = lb > file_lines;
-        let ra = if past { 0 } else { LINES.data[first_line + la - 1] };
-        let rb = if past { 0 } else { after_line(LINES.data[first_line + lb - 1]) };
-        if past || ra <= NODES[body].start || rb > NODES[body].end {
+        let ra = if past { 0 } else { pcx.lines.data[first_line + la - 1] };
+        let rb = if past { 0 } else { after_line(pcx.lines.data[first_line + lb - 1], pcx) };
+        if past || ra <= pcx.nodes[body].start || rb > pcx.nodes[body].end {
             let e = diag(c"error", c"refactor.range", &tcx);
             buf_str(e, c"lines ");
             put_range(e, la, lb);
             buf_str(e, c" are not inside the body of ");
             buf_bytes(e, fqn);
             buf_str(e, c" (lines ");
-            put_range(e, line_of(NODES[body].start), line_of(NODES[body].end - 1));
+            put_range(e, line_of(pcx.nodes[body].start, pcx),
+                line_of(pcx.nodes[body].end - 1, pcx));
             buf_str(e, c")\n");
-            try_show(fqn, &tcx);
+            try_show(fqn, &tcx, pcx);
             return 1;
         }
-        load_body(f, &tcx);
+        load_body(f, &tcx, pcx);
         // The innermost block around the lines, and its statements in them.
         var blk = -1;
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind == NodeKind::Block && in_body(n, tcx) && NODES[n].start < ra
-                && NODES[n].end >= rb
-                && (blk < 0 || NODES[n].end - NODES[n].start < NODES[blk].end - NODES[blk].start) {
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind == NodeKind::Block && in_body(n, tcx) && pcx.nodes[n].start < ra
+                && pcx.nodes[n].end >= rb
+                && (blk < 0
+                    || pcx.nodes[n].end - pcx.nodes[n].start
+                    < pcx.nodes[blk].end - pcx.nodes[blk].start) {
                 blk = n;
             }
         }
@@ -154,17 +161,17 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         }
         var stmts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var tail = -1;
-        let nst = NODES[blk].count;
+        let nst = pcx.nodes[blk].count;
         for i in 0..nst + 1 {
-            let s = if i < nst { child(blk, i) } else { NODES[blk].a };
-            if s <= 0 || NODES[s].end <= ra || NODES[s].start >= rb {
+            let s = if i < nst { child(blk, i, pcx) } else { pcx.nodes[blk].a };
+            if s <= 0 || pcx.nodes[s].end <= ra || pcx.nodes[s].start >= rb {
                 continue;
             }
-            if NODES[s].start < ra || NODES[s].end > rb {
-                return cut_statement(fqn, name, new_name, la, lb, s, &tcx);
+            if pcx.nodes[s].start < ra || pcx.nodes[s].end > rb {
+                return cut_statement(fqn, name, new_name, la, lb, s, &tcx, pcx);
             }
             // (a value of type () ending the block is a statement here)
-            if i < nst || NODES[s].ty == TY_UNIT || NODES[s].ty == TY_NEVER {
+            if i < nst || pcx.nodes[s].ty == TY_UNIT || pcx.nodes[s].ty == TY_NEVER {
                 stmts.push(s);
             } else {
                 tail = s;
@@ -177,11 +184,13 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_str(e, c" is in lines ");
             put_range(e, la, lb);
             buf_byte(e, '\n');
-            try_show(fqn, &tcx);
+            try_show(fqn, &tcx, pcx);
             return 1;
         }
-        let sa = if stmts.count > 0 { NODES[stmts.data[0]].start } else { NODES[tail].start };
-        let sb = if tail >= 0 { NODES[tail].end } else { NODES[stmts.data[stmts.count - 1]].end };
+        let sa = if stmts.count > 0 { pcx.nodes[stmts.data[0]].start }
+            else { pcx.nodes[tail].start };
+        let sb = if tail >= 0 { pcx.nodes[tail].end }
+            else { pcx.nodes[stmts.data[stmts.count - 1]].end };
         // (code of the lines outside the statements: a brace of the block)
         var p = ra;
         while p < rb {
@@ -189,29 +198,29 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             if (p < sa || p >= sb) && c != ' ' && c != '\t' && c != '\n' && c != '\r'
                 && !(c == ';' && p == sb) {
                 if c == '/' && SRC[p + 1] == '/' {
-                    p = after_line(p);
+                    p = after_line(p, pcx);
                     continue;
                 }
                 let e = diag(c"error", c"refactor.range", &tcx);
                 buf_str(e, c"line ");
-                buf_int(e, line_of(p));
+                buf_int(e, line_of(p, pcx));
                 buf_str(e, c" has code outside the statements of lines ");
-                put_range(e, line_of(sa), line_of(sb - 1));
+                put_range(e, line_of(sa, pcx), line_of(sb - 1, pcx));
                 buf_byte(e, '\n');
-                try_extract(name, new_name, line_of(sa), line_of(sb - 1), &tcx);
+                try_extract(name, new_name, line_of(sa, pcx), line_of(sb - 1, pcx), &tcx, pcx);
                 return 1;
             }
             p += 1;
         }
         // Control flow leaving the lines.
-        for n in 1..NODES.len() as i64 {
-            if !in_body(n, tcx) || NODES[n].start < sa || NODES[n].end > sb {
+        for n in 1..pcx.nodes.len() as i64 {
+            if !in_body(n, tcx) || pcx.nodes[n].start < sa || pcx.nodes[n].end > sb {
                 continue;
             }
-            let k = NODES[n].kind;
+            let k = pcx.nodes[n].kind;
             // (0.14: control flow inside a closure of the lines stays in it)
-            let c = closure_around(n, tcx);
-            if c >= 0 && NODES[c].start >= sa {
+            let c = closure_around(n, tcx, pcx);
+            if c >= 0 && pcx.nodes[c].start >= sa {
                 continue;
             }
             var what = 0 as *u8;
@@ -222,25 +231,25 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 what = c"may return (`?`) from ";
             }
             else if (k == NodeKind::Break || k == NodeKind::Continue)
-                && !loop_inside(n, sa, sb, tcx) {
+                && !loop_inside(n, sa, sb, tcx, pcx) {
                 what = if k == NodeKind::Break { c"breaks out of a loop of " }
                     else { c"continues a loop of " };
             }
             if what != 0 as *u8 {
                 let e = diag(c"error", c"refactor.escapes", &tcx);
                 buf_str(e, c"line ");
-                buf_int(e, line_of(NODES[n].start));
+                buf_int(e, line_of(pcx.nodes[n].start, pcx));
                 buf_byte(e, ' ');
                 buf_str(e, what);
                 buf_bytes(e, fqn);
                 buf_str(e, c": out of lines ");
                 put_range(e, la, lb);
                 buf_str(e, c", which NEW cannot do for its caller\n");
-                let before = statements_before(stmts, NODES[n].start);
+                let before = statements_before(stmts, pcx.nodes[n].start, pcx);
                 if before >= la {
-                    try_extract(name, new_name, la, before, &tcx);
+                    try_extract(name, new_name, la, before, &tcx, pcx);
                 } else {
-                    try_show_at(file, line_of(NODES[n].start), &tcx);
+                    try_show_at(file, line_of(pcx.nodes[n].start, pcx), &tcx, pcx);
                 }
                 return 1;
             }
@@ -254,16 +263,16 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         var amp_s = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var amp_e = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var amp_t = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for n in 1..NODES.len() as i64 {
-            let l = local_of(n);
-            if l < 0 || !in_body(n, tcx) || NODES[n].start < sa || NODES[n].end > sb {
+        for n in 1..pcx.nodes.len() as i64 {
+            let l = local_of(n, pcx);
+            if l < 0 || !in_body(n, tcx) || pcx.nodes[n].start < sa || pcx.nodes[n].end > sb {
                 continue;
             }
             let dn = decl_of(l, tcx);
-            if dn >= 0 && NODES[dn].start >= sa && NODES[dn].start < sb {
+            if dn >= 0 && pcx.nodes[dn].start >= sa && pcx.nodes[dn].start < sb {
                 continue;
             }
-            if bytes_is(local_name(l), c"self") {
+            if bytes_is(local_name(l, pcx), c"self") {
                 self_local = l;
                 continue;
             }
@@ -271,32 +280,32 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 continue;
             }
             params.push(l);
-            modes.push(mode_of(l, sa, sb, tcx));
+            modes.push(mode_of(l, sa, sb, tcx, pcx));
         }
         // (the locals declared in the lines and used after them, in order)
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind == NodeKind::PatBind && in_body(n, tcx) && NODES[n].start >= sa
-                && NODES[n].end <= sb
-                && used_after(NODES[n].x, sb, tcx) && !contains(results, NODES[n].x) {
-                results.push(NODES[n].x);
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind == NodeKind::PatBind && in_body(n, tcx) && pcx.nodes[n].start >= sa
+                && pcx.nodes[n].end <= sb
+                && used_after(pcx.nodes[n].x, sb, tcx, pcx) && !contains(results, pcx.nodes[n].x) {
+                results.push(pcx.nodes[n].x);
             }
         }
         // (in the order of first use: they were found in node order)
-        sort_by_first_use(&params, &modes, sa, sb, tcx);
+        sort_by_first_use(&params, &modes, sa, sb, tcx, pcx);
         // (0.14: a closure's type has no name: NEW cannot take or give one)
         for i in 0..params.count + results.count + 1 {
             var l = -1;
             var t = 0;
             if i < params.count {
                 l = params.data[i];
-                t = LOCALS[l].ty;
+                t = pcx.locals[l].ty;
             } else if i < params.count + results.count {
                 l = results.data[i - params.count];
-                t = LOCALS[l].ty;
+                t = pcx.locals[l].ty;
             } else if tail >= 0 {
-                t = NODES[tail].ty;
+                t = pcx.nodes[tail].ty;
             }
-            if !has_closure(t, 0) {
+            if !has_closure(t, 0, pcx) {
                 continue;
             }
             let e = diag(c"error", c"refactor.closure", &tcx);
@@ -304,11 +313,11 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             put_range(e, la, lb);
             if i < params.count {
                 buf_str(e, c" use '");
-                buf_bytes(e, local_name(l));
+                buf_bytes(e, local_name(l, pcx));
                 buf_str(e, c"', a closure made before them");
             } else if l >= 0 {
                 buf_str(e, c" make '");
-                buf_bytes(e, local_name(l));
+                buf_bytes(e, local_name(l, pcx));
                 buf_str(e, c"', a closure used after them");
             } else {
                 buf_str(e, c" end the block with a closure");
@@ -317,9 +326,9 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             let dn = if i < params.count { decl_of(l, tcx) } else { -1 };
             // (made by a `let` of the same block: extract from there)
             if dn >= 0 && parent(dn, tcx) >= 0 && parent(parent(dn, tcx), tcx) == blk {
-                try_extract(name, new_name, line_of(NODES[dn].start), lb, &tcx);
+                try_extract(name, new_name, line_of(pcx.nodes[dn].start, pcx), lb, &tcx, pcx);
             } else {
-                try_show_at(file, la, &tcx);
+                try_show_at(file, la, &tcx, pcx);
             }
             return 1;
         }
@@ -331,13 +340,13 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             }
             if modes.data[i] == BY_POINTER {
                 // (`&x` in the lines is `x`, a pointer there)
-                for n in 1..NODES.len() as i64 {
-                    if local_of(n) == params.data[i] && in_body(n, tcx) && NODES[n].start >= sa
-                        && NODES[n].end <= sb
-                        && use_kind(n, tcx) == USE_ADDR {
+                for n in 1..pcx.nodes.len() as i64 {
+                    if local_of(n, pcx) == params.data[i] && in_body(n, tcx)
+                        && pcx.nodes[n].start >= sa && pcx.nodes[n].end <= sb
+                        && use_kind(n, tcx, pcx) == USE_ADDR {
                         let u = parent(n, tcx);
-                        amp_s.push(NODES[u].start);
-                        amp_e.push(NODES[n].start);
+                        amp_s.push(pcx.nodes[u].start);
+                        amp_e.push(pcx.nodes[n].start);
                         amp_t.push(buf_new());
                     }
                 }
@@ -351,14 +360,14 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 if tail >= 0 { c" end the block with its value and set " } else { c" set " });
             for i in 0..results.count {
                 buf_str(e, if i == 0 { c"" } else { c", " });
-                buf_bytes(e, local_name(results.data[i]));
+                buf_bytes(e, local_name(results.data[i], pcx));
             }
             buf_str(e,
                 c", used after them; NEW gives back one local it assigns, or the ones it declares\n");
-            try_show_at(file, la, &tcx);
+            try_show_at(file, la, &tcx, pcx);
             return 1;
         }
-        let kind = DEFS[d].kind;
+        let kind = pcx.defs[d].kind;
         if self_local >= 0 && kind != K_METHOD {
             let e = diag(c"error", c"refactor.self", &tcx);
             buf_str(e, c"lines ");
@@ -366,18 +375,19 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_str(e, c" use self in a trait impl's function: NEW cannot be a method there\n");
             return 1;
         }
-        if taken_name(d, intern(new_name), self_local >= 0) {
+        if taken_name(d, intern(new_name), self_local >= 0, pcx) {
             let e = diag(c"error", c"refactor.collision", &tcx);
             buf_str(e, c"'");
             buf_bytes(e, new_name);
             buf_str(e, c"' is already a name there\n");
-            try_query(c"def", new_name, &tcx);
+            try_query(c"def", new_name, &tcx, pcx);
             return 1;
         }
         // NEW's text, after FN (a method: in its impl, else after it).
         let method = self_local >= 0;
-        let outer = if kind == K_FN || method { f } else { DEFS[d].impl_node };
-        let base = if method { indent_of(NODES[f].start) } else { indent_of(NODES[outer].start) };
+        let outer = if kind == K_FN || method { f } else { pcx.defs[d].impl_node };
+        let base = if method { indent_of(pcx.nodes[f].start, pcx) }
+            else { indent_of(pcx.nodes[outer].start, pcx) };
         let text = buf_new();
         buf_byte(text, '\n');
         buf_bytes(text, base);
@@ -386,12 +396,13 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         buf_byte(text, '(');
         if method {
             let sp = decl_of(self_local, tcx);
-            if (NODES[sp].p & crate::front::ast::CONV_NEW) != 0 {
+            if (pcx.nodes[sp].p & crate::front::ast::CONV_NEW) != 0 {
                 // (0.20: the receiver as written, `self`, `inout self`)
-                buf_bytes(text, SRC[NODES[sp].start..NODES[sp].end]);
+                buf_bytes(text, SRC[pcx.nodes[sp].start..pcx.nodes[sp].end]);
             } else {
                 buf_str(text, c"self: ");
-                buf_bytes(text, SRC[NODES[NODES[sp].b].start..NODES[NODES[sp].b].end]);
+                buf_bytes(text,
+                    SRC[pcx.nodes[pcx.nodes[sp].b].start..pcx.nodes[pcx.nodes[sp].b].end]);
             }
         }
         for i in 0..params.count {
@@ -404,7 +415,7 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             if modes.data[i] == GIVEN_BACK && !new {
                 buf_str(text, c"mut ");
             }
-            buf_bytes(text, local_name(params.data[i]));
+            buf_bytes(text, local_name(params.data[i], pcx));
             buf_str(text, c": ");
             if modes.data[i] == GIVEN_BACK && new {
                 buf_str(text, c"sink ");
@@ -413,23 +424,23 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
                 // (0.18.1: a reference; a `*T` is raw)
                 buf_str(text, if new { c"inout " } else { c"&mut " });
             }
-            put_local_type(text, params.data[i], tcx);
+            put_local_type(text, params.data[i], tcx, pcx);
         }
         buf_byte(text, ')');
         let result_type = buf_new();
         if results.count == 1 {
-            put_local_type(result_type, results.data[0], tcx);
+            put_local_type(result_type, results.data[0], tcx, pcx);
         } else if results.count > 1 {
             buf_byte(result_type, '(');
             for i in 0..results.count {
                 buf_str(result_type, if i == 0 { c"" } else { c", " });
-                put_local_type(result_type, results.data[i], tcx);
+                put_local_type(result_type, results.data[i], tcx, pcx);
             }
             buf_byte(result_type, ')');
         }
-        else if tail >= 0 && NODES[tail].ty != TY_UNIT && NODES[tail].ty != TY_NEVER
-            && NODES[tail].ty != 0 {
-            put_type_conv(result_type, NODES[tail].ty, false, tcx);
+        else if tail >= 0 && pcx.nodes[tail].ty != TY_UNIT && pcx.nodes[tail].ty != TY_NEVER
+            && pcx.nodes[tail].ty != 0 {
+            put_type_conv(result_type, pcx.nodes[tail].ty, false, tcx, pcx);
         }
         if BUFS[result_type].len > 0 {
             buf_str(text, c" -> ");
@@ -439,7 +450,8 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         let inner = buf_new();
         buf_bytes(inner, base);
         buf_str(inner, c"    ");
-        let unsafe_wrap = in_unsafe(f, if stmts.count > 0 { stmts.data[0] } else { tail }, tcx);
+        let unsafe_wrap = in_unsafe(f, if stmts.count > 0 { stmts.data[0] } else { tail }, tcx,
+            pcx);
         if unsafe_wrap {
             buf_bytes(text, buf_slice(inner));
             buf_str(text, c"unsafe {\n");
@@ -449,7 +461,7 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         reindent(text, buf_slice(lines_text), buf_slice(inner));
         if results.count > 0 {
             buf_bytes(text, buf_slice(inner));
-            put_results(text, results, false, 0, tcx);
+            put_results(text, results, false, 0, tcx, pcx);
             buf_byte(text, '\n');
         }
         if unsafe_wrap {
@@ -460,13 +472,13 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         buf_str(text, c"}\n");
         // The call, where the lines were.
         let call = buf_new();
-        buf_bytes(call, indent_of(sa));
+        buf_bytes(call, indent_of(sa, pcx));
         if results.count == 1 && back == 1 {
-            buf_bytes(call, local_name(results.data[0]));
+            buf_bytes(call, local_name(results.data[0], pcx));
             buf_str(call, c" = ");
         } else if results.count > 0 {
             let pat = buf_new();
-            put_results(pat, results, true, sb, tcx);
+            put_results(pat, results, true, sb, tcx, pcx);
             let ps = buf_slice(pat);
             if new_spelling(tcx) && ps.len > 4 && ps[0] == 'm' && ps[1] == 'u' && ps[2] == 't'
                 && ps[3] == ' ' {
@@ -488,23 +500,23 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
             buf_str(call, if i == 0 { c"" } else { c", " });
             if modes.data[i] == BY_POINTER {
                 buf_str(call, if new_spelling(tcx) { c"&" } else { c"&mut " });
-            } else if new_spelling(tcx) && LOCALS[params.data[i]].ty > 0
-                && TYPES[LOCALS[params.data[i]].ty].kind == TyKind::Ptr
-                && TYPES[LOCALS[params.data[i]].ty].b == REF_MUT
-                && access_local(params.data[i], tcx) {
+            } else if new_spelling(tcx) && pcx.locals[params.data[i]].ty > 0
+                && TYPES[pcx.locals[params.data[i]].ty].kind == TyKind::Ptr
+                && TYPES[pcx.locals[params.data[i]].ty].b == REF_MUT
+                && access_local(params.data[i], tcx, &pcx) {
                 // (an inout binding or parameter passed on is lent again)
                 buf_str(call, c"&");
             }
-            buf_bytes(call, local_name(params.data[i]));
+            buf_bytes(call, local_name(params.data[i], pcx));
         }
         buf_byte(call, ')');
         if tail < 0 {
             buf_byte(call, ';');
         }
         buf_byte(call, '\n');
-        edit_replace(ra, rb, call);
-        let at = after_line(NODES[outer].end - 1);
-        edit_replace(at, at, text);
+        edit_replace(ra, rb, call, &pcx);
+        let at = after_line(pcx.nodes[outer].end - 1, pcx);
+        edit_replace(at, at, text, &pcx);
         let what = buf_new();
         buf_str(what, c"extracted lines ");
         put_range(what, la, lb);
@@ -515,14 +527,14 @@ fn extract_inner(c: Call<Gpa>, tcx: inout Tcx<Comp>) -> i64 {
         buf_byte(what, '(');
         for i in 0..params.count {
             buf_str(what, if i == 0 { c"" } else { c", " });
-            buf_bytes(what, local_name(params.data[i]));
+            buf_bytes(what, local_name(params.data[i], pcx));
         }
         buf_byte(what, ')');
         if BUFS[result_type].len > 0 {
             buf_str(what, c" -> ");
             buf_bytes(what, buf_slice(result_type));
         }
-        apply_edit(buf_slice(what), root, &tcx)
+        apply_edit(buf_slice(what), root, &tcx, &pcx)
     }
 }
 
@@ -562,23 +574,24 @@ fn put_range(out: i64, a: i64, b: i64) {
 // when they assign it (or use its value and take its address), by
 // pointer when they only take its address or write its fields, else by
 // value.
-fn mode_of(l: i64, sa: i64, sb: i64, tcx: Tcx<Comp>) -> i64 {
+fn mode_of(l: i64, sa: i64, sb: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     var assign = false;
     var address = false;
     var value = false;
     // (an array indexed: by pointer, `a[i]` would index the pointer)
     var indexed = false;
-    for n in 1..NODES.len() as i64 {
-        if local_of(n) != l || !in_body(n, tcx) || NODES[n].start < sa || NODES[n].end > sb {
+    for n in 1..pcx.nodes.len() as i64 {
+        if local_of(n, pcx) != l || !in_body(n, tcx) || pcx.nodes[n].start < sa
+            || pcx.nodes[n].end > sb {
             continue;
         }
         let p = parent(n, tcx);
-        if p >= 0 && NODES[p].kind == NodeKind::Index && NODES[p].a == n
-            && !is_pointer(NODES[n].ty) {
+        if p >= 0 && pcx.nodes[p].kind == NodeKind::Index && pcx.nodes[p].a == n
+            && !is_pointer(pcx.nodes[n].ty) {
             indexed = true;
         }
         // (0.14: a `move` closure changes its own copy)
-        let k = if captured_by_move(n, tcx) { USE_VALUE } else { use_kind(n, tcx) };
+        let k = if captured_by_move(n, tcx, pcx) { USE_VALUE } else { use_kind(n, tcx, pcx) };
         if k == USE_ASSIGN {
             assign = true;
         } else if k == USE_ADDR || k == USE_AUTOREF || k == USE_FIELD_WRITE {
@@ -597,9 +610,9 @@ fn mode_of(l: i64, sa: i64, sb: i64, tcx: Tcx<Comp>) -> i64 {
 }
 
 // Whether local l is used at or after position pos.
-fn used_after(l: i64, pos: i64, tcx: Tcx<Comp>) -> bool {
-    for n in 1..NODES.len() as i64 {
-        if local_of(n) == l && in_body(n, tcx) && NODES[n].start >= pos {
+fn used_after(l: i64, pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    for n in 1..pcx.nodes.len() as i64 {
+        if local_of(n, pcx) == l && in_body(n, tcx) && pcx.nodes[n].start >= pos {
             return true;
         }
     }
@@ -607,14 +620,14 @@ fn used_after(l: i64, pos: i64, tcx: Tcx<Comp>) -> bool {
 }
 
 // Whether the loop break or continue n leaves is inside [sa, sb).
-fn loop_inside(n: i64, sa: i64, sb: i64, tcx: Tcx<Comp>) -> bool {
-    let label = NODES[n].a;
+fn loop_inside(n: i64, sa: i64, sb: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    let label = pcx.nodes[n].a;
     var q = parent(n, tcx);
     while q >= 0 {
-        let k = NODES[q].kind;
+        let k = pcx.nodes[q].kind;
         if (k == NodeKind::Loop || k == NodeKind::While || k == NodeKind::For)
-            && (label == 0 || NODES[q].a == label) {
-            return NODES[q].start >= sa && NODES[q].end <= sb;
+            && (label == 0 || pcx.nodes[q].a == label) {
+            return pcx.nodes[q].start >= sa && pcx.nodes[q].end <= sb;
         }
         q = parent(q, tcx);
     }
@@ -623,13 +636,13 @@ fn loop_inside(n: i64, sa: i64, sb: i64, tcx: Tcx<Comp>) -> bool {
 
 // The last line of the statements of stmts before the one holding pos;
 // -1 when that is the first.
-fn statements_before(stmts: IntVec, pos: i64) -> i64 {
+fn statements_before(stmts: IntVec, pos: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var last = -1;
         for i in 0..stmts.count {
             let s = stmts.data[i];
-            if NODES[s].end <= pos && !(NODES[s].start <= pos && pos < NODES[s].end) {
-                last = line_of(NODES[s].end - 1);
+            if pcx.nodes[s].end <= pos && !(pcx.nodes[s].start <= pos && pos < pcx.nodes[s].end) {
+                last = line_of(pcx.nodes[s].end - 1, pcx);
             }
         }
         last
@@ -661,24 +674,26 @@ fn bytes_is(s: [u8], c: *u8) -> bool {
 }
 
 // The first use in [sa, sb) of local l.
-fn first_use(l: i64, sa: i64, sb: i64, tcx: Tcx<Comp>) -> i64 {
+fn first_use(l: i64, sa: i64, sb: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     var first = sb;
-    for n in 1..NODES.len() as i64 {
-        if local_of(n) == l && in_body(n, tcx) && NODES[n].start >= sa && NODES[n].start < first {
-            first = NODES[n].start;
+    for n in 1..pcx.nodes.len() as i64 {
+        if local_of(n, pcx) == l && in_body(n, tcx) && pcx.nodes[n].start >= sa
+            && pcx.nodes[n].start < first {
+            first = pcx.nodes[n].start;
         }
     }
     first
 }
 
-fn sort_by_first_use(params: inout IntVec, modes: inout IntVec, sa: i64, sb: i64, tcx: Tcx<Comp>) {
+fn sort_by_first_use(params: inout IntVec, modes: inout IntVec, sa: i64, sb: i64, tcx: Tcx<Comp>,
+    pcx: Ctx<Comp>) {
     unsafe {
         let n = params.count;
         for i in 1..n {
             var j = i;
             while j > 0
-                && first_use(params.data[j], sa, sb, tcx)
-                < first_use(params.data[j - 1], sa, sb, tcx) {
+                && first_use(params.data[j], sa, sb, tcx, pcx)
+                < first_use(params.data[j - 1], sa, sb, tcx, pcx) {
                 let t = params.data[j];
                 params.data[j] = params.data[j - 1];
                 params.data[j - 1] = t;
@@ -693,17 +708,18 @@ fn sort_by_first_use(params: inout IntVec, modes: inout IntVec, sa: i64, sb: i64
 
 // Whether `name` is taken where NEW goes: an item of FN's module, or a
 // method of its type (method).
-fn taken_name(d: i64, name: i64, method: bool) -> bool {
-    for x in 0..DEFS.len() {
-        if DEFS[x].name != name {
+fn taken_name(d: i64, name: i64, method: bool, pcx: Ctx<Comp>) -> bool {
+    for x in 0..pcx.defs.len() {
+        if pcx.defs[x].name != name {
             continue;
         }
-        let k = DEFS[x].kind;
-        if method && k == K_METHOD && DEFS[x].owner == DEFS[d].owner {
+        let k = pcx.defs[x].kind;
+        if method && k == K_METHOD && pcx.defs[x].owner == pcx.defs[d].owner {
             return true;
         }
-        if !method && DEFS[x].module == DEFS[d].module && k != K_METHOD && k != K_IMPL_METHOD
-            && DEFS[x].parent < 0 {
+        if !method && pcx.defs[x].module == pcx.defs[d].module && k != K_METHOD
+            && k != K_IMPL_METHOD
+            && pcx.defs[x].parent < 0 {
             return true;
         }
     }
@@ -712,7 +728,7 @@ fn taken_name(d: i64, name: i64, method: bool) -> bool {
 
 // The results: `x`, or `(a, b)`; as a pattern, with `mut` where they
 // were declared so and are changed at or after `after`.
-fn put_results(out: i64, results: IntVec, pattern: bool, after: i64, tcx: Tcx<Comp>) {
+fn put_results(out: i64, results: IntVec, pattern: bool, after: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         let n = results.count;
         if n > 1 {
@@ -721,10 +737,10 @@ fn put_results(out: i64, results: IntVec, pattern: bool, after: i64, tcx: Tcx<Co
         for i in 0..n {
             let l = results.data[i];
             buf_str(out, if i == 0 { c"" } else { c", " });
-            if pattern && local_mut(l) && changed_after(l, after, tcx) {
+            if pattern && local_mut(l, pcx) && changed_after(l, after, tcx, pcx) {
                 buf_str(out, if new_spelling(tcx) && n > 1 { c"var " } else { c"mut " });
             }
-            buf_bytes(out, local_name(l));
+            buf_bytes(out, local_name(l, pcx));
         }
         if n > 1 {
             buf_byte(out, ')');
@@ -736,29 +752,29 @@ fn put_results(out: i64, results: IntVec, pattern: bool, after: i64, tcx: Tcx<Co
 // inout T`, `inout r = &v`; any in a file read in it), used as its place:
 // passed on, it is lent again (`&r`). A 0.19 `&mut T` is a reference
 // value, passed as it is.
-fn access_local(l: i64, tcx: Tcx<Comp>) -> bool {
+fn access_local(l: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
     let dn = decl_of(l, tcx);
     if dn < 0 {
         return false;
     }
-    if crate::front::conv::strict_at(NODES[dn].start) {
+    if crate::front::conv::strict_at(pcx.nodes[dn].start, &pcx) {
         return true;
     }
-    if NODES[dn].kind == NodeKind::Param {
-        return (NODES[dn].p & crate::front::ast::CONV_NEW) != 0;
+    if pcx.nodes[dn].kind == NodeKind::Param {
+        return (pcx.nodes[dn].p & crate::front::ast::CONV_NEW) != 0;
     }
     let p = parent(dn, tcx);
-    p >= 0 && NODES[p].kind == NodeKind::Let
-        && (NODES[p].p & crate::front::ast::CONV_INOUT) != 0
+    p >= 0 && pcx.nodes[p].kind == NodeKind::Let
+        && (pcx.nodes[p].p & crate::front::ast::CONV_INOUT) != 0
 }
 
 // Whether local l is assigned (or its address taken, a field of it
 // written) at or after position pos.
-fn changed_after(l: i64, pos: i64, tcx: Tcx<Comp>) -> bool {
-    for n in 1..NODES.len() as i64 {
-        if local_of(n) == l && in_body(n, tcx) && NODES[n].start >= pos
-            && use_kind(n, tcx) != USE_VALUE
-            && use_kind(n, tcx) != USE_FIELD_READ {
+fn changed_after(l: i64, pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    for n in 1..pcx.nodes.len() as i64 {
+        if local_of(n, pcx) == l && in_body(n, tcx) && pcx.nodes[n].start >= pos
+            && use_kind(n, tcx, pcx) != USE_VALUE
+            && use_kind(n, tcx, pcx) != USE_FIELD_READ {
             return true;
         }
     }
@@ -767,9 +783,9 @@ fn changed_after(l: i64, pos: i64, tcx: Tcx<Comp>) -> bool {
 
 // The lines A-B cut statement s: the range of whole statements, to try.
 fn cut_statement(fqn: [u8], name: [u8], new_name: [u8], la: i64, lb: i64, s: i64,
-    tcx: inout Tcx<Comp>) -> i64 {
-    let sa = line_of(NODES[s].start);
-    let sb = line_of(NODES[s].end - 1);
+    tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let sa = line_of(pcx.nodes[s].start, pcx);
+    let sb = line_of(pcx.nodes[s].end - 1, pcx);
     let e = diag(c"error", c"refactor.range", &tcx);
     buf_str(e, c"lines ");
     put_range(e, la, lb);
@@ -778,14 +794,15 @@ fn cut_statement(fqn: [u8], name: [u8], new_name: [u8], la: i64, lb: i64, s: i64
     buf_str(e, c" (lines ");
     put_range(e, sa, sb);
     buf_str(e, c"); NEW takes whole statements of one block\n");
-    try_extract(name, new_name, if sa < la { sa } else { la }, if sb > lb { sb } else { lb }, &tcx);
+    try_extract(name, new_name, if sa < la { sa } else { la }, if sb > lb { sb } else { lb }, &tcx,
+        pcx);
     1
 }
 
-fn try_extract(name: [u8], new_name: [u8], a: i64, b: i64, tcx: inout Tcx<Comp>) {
+fn try_extract(name: [u8], new_name: [u8], a: i64, b: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let out = diags(&tcx);
     buf_str(out, c"try:");
-    put_cword(out, PROG);
+    put_cword(out, pcx.prog);
     buf_str(out, c" refactor extract-function");
     put_word(out, name);
     buf_str(out, c" --lines ");
@@ -796,10 +813,10 @@ fn try_extract(name: [u8], new_name: [u8], a: i64, b: i64, tcx: inout Tcx<Comp>)
     try_end(out);
 }
 
-fn try_query(cmd: *u8, what: [u8], tcx: inout Tcx<Comp>) {
+fn try_query(cmd: *u8, what: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let out = diags(&tcx);
     buf_str(out, c"try:");
-    put_cword(out, PROG);
+    put_cword(out, pcx.prog);
     buf_str(out, c" query ");
     buf_str(out, cmd);
     put_word(out, what);
@@ -807,14 +824,14 @@ fn try_query(cmd: *u8, what: [u8], tcx: inout Tcx<Comp>) {
     try_end(out);
 }
 
-fn try_show(fqn: [u8], tcx: inout Tcx<Comp>) {
-    try_query(c"show", fqn, &tcx);
+fn try_show(fqn: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
+    try_query(c"show", fqn, &tcx, pcx);
 }
 
-fn try_show_at(file: i64, line: i64, tcx: inout Tcx<Comp>) {
+fn try_show_at(file: i64, line: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     let b = buf_new();
-    put_path(b, file);
+    put_path(b, file, pcx);
     buf_byte(b, ':');
     buf_int(b, line);
-    try_query(c"show", buf_slice(b), &tcx);
+    try_query(c"show", buf_slice(b), &tcx, pcx);
 }

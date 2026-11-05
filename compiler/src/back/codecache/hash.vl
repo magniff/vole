@@ -13,19 +13,17 @@
 // reads before writing.
 
 use crate::base::{IntVec, SYMS, alloc_array, free, getenv};
-use crate::front::ast::{FN_CLOSURE, NODES};
-use crate::front::distinct::{NICHE_ALIASES, enum_niche};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::FN_CLOSURE;
+use crate::front::distinct::enum_niche;
 use crate::front::effects::fn_effects;
 use crate::front::lexer::{STR_COUNT, str_at};
-use crate::front::modules::{MODULES, module_count};
-use crate::front::types::{
-    ENUMS, ENUM_COUNT, FIELDS, FNS, FN_COUNT, STATICS, STRUCTS, SYM_STATIC, TLISTS, TYPES, TyKind,
-    VARIANTS,
-};
-use crate::gen0::target::{LINK_NAMES, str_align};
+use crate::front::modules::module_count;
+use crate::front::types::{ENUMS, FIELDS, TLISTS, TYPES, TyKind};
+use crate::gen0::target::str_align;
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::{FN_IR, IRFUNCS, IRFUNC_COUNT, Op, rtid_class};
-use crate::middle::lower::ssa::HMap;
+use crate::middle::ir::{IRFUNCS, Op, rtid_class};
 use crate::middle::parallel::{OWNER_SHIFT, const_data_align, const_data_bytes};
 
 // ---- Words ----
@@ -85,23 +83,6 @@ pub fn sym_h(s: i64) -> u64 {
 
 // ---- The program's names, hashed once ----
 
-// Per function (FNS index): its symbol's hash, and its canonical hash
-// (fn_canon); whether another function has the same symbol.
-pub static var FN_NAMEH: *i64 = 0 as *i64;
-pub static var FN_CANON: *i64 = 0 as *i64;
-pub static var FN_AMBIG: *bool = 0 as *bool;
-static var CANON_COUNT: i64 = 0;
-// A function's symbol hash: its FNS index + 1 (-1: several); its IR
-// function + 1 (-1: several).
-static var NAME_FN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var NAME_IR: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-// Per IR function: the hash of its MOVE_COPIES notes (middle::copies).
-static var FN_MOVES: *i64 = 0 as *i64;
-// Per string id below STR_H_COUNT: the hash of its bytes and alignment.
-pub static var STR_H: *i64 = 0 as *i64;
-pub static var STR_H_COUNT: i64 = 0;
-static var STR_H_CAP: i64 = 0;
-
 // A map key from a symbol hash (never 0).
 fn name_key(h: i64) -> i64 {
     if h == 0 { 1 } else { h }
@@ -110,103 +91,104 @@ fn name_key(h: i64) -> i64 {
 // What names function f (FNS) across builds: its symbol's hash, and its
 // module's path (a C function declared in several modules has a
 // declaration in each; the root module has none, -1).
-pub fn fn_nameh(f: i64) -> i64 {
+pub fn fn_nameh(f: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let m = FNS[f].module;
-        var h = sym_h(FNS[f].name);
-        if m >= 0 && m < module_count() && MODULES[m].key >= 0 {
-            h = mix(h, sym_h(MODULES[m].key));
+        let m = pcx.fns[f].module;
+        var h = sym_h(pcx.fns[f].name);
+        if m >= 0 && m < module_count(pcx) && pcx.modules[m].key >= 0 {
+            h = mix(h, sym_h(pcx.modules[m].key));
         }
         h as i64
     }
 }
 
 // The symbol hash of IR function g.
-pub fn ir_nameh(g: i64) -> i64 {
-    unsafe { FN_NAMEH[IRFUNCS[g].f] }
+pub fn ir_nameh(g: i64, pcx: Ctx<Comp>) -> i64 {
+    unsafe { pcx.fn_nameh[IRFUNCS[g].f] }
 }
 
 // The FNS index of the function with symbol hash h, or -1 (none, or
 // several).
-pub fn fn_of_name(h: i64) -> i64 {
-    let v = NAME_FN.get(name_key(h));
+pub fn fn_of_name(h: i64, pcx: Ctx<Comp>) -> i64 {
+    let v = pcx.name_fn.get(name_key(h));
     if v > 0 { v - 1 } else { -1 }
 }
 
 // The IR function with symbol hash h, or -1 (none, or several).
-pub fn ir_of_name(h: i64) -> i64 {
-    let v = NAME_IR.get(name_key(h));
+pub fn ir_of_name(h: i64, pcx: Ctx<Comp>) -> i64 {
+    let v = pcx.name_ir.get(name_key(h));
     if v > 0 { v - 1 } else { -1 }
 }
 
 // The tables above, for the program as lowered (main thread, once).
-pub fn names_begin(moves: IntVec) {
+pub fn names_begin(moves: IntVec, pcx: inout Ctx<Comp>) {
     unsafe {
-        CANON_COUNT = FN_COUNT;
-        FN_NAMEH = alloc_array::<i64>(FN_COUNT + 1);
-        FN_CANON = alloc_array::<i64>(FN_COUNT + 1);
-        FN_AMBIG = alloc_array::<bool>(FN_COUNT + 1);
-        for f in 0..FN_COUNT {
-            FN_NAMEH[f] = fn_nameh(f);
-            let k = name_key(FN_NAMEH[f]);
-            let was = NAME_FN.get(k);
+        pcx.canon_count = pcx.fn_count;
+        pcx.fn_nameh = alloc_array::<i64>(pcx.fn_count + 1);
+        pcx.fn_canon = alloc_array::<i64>(pcx.fn_count + 1);
+        pcx.fn_ambig = alloc_array::<bool>(pcx.fn_count + 1);
+        for f in 0..pcx.fn_count {
+            pcx.fn_nameh[f] = fn_nameh(f, pcx);
+            let k = name_key(pcx.fn_nameh[f]);
+            let was = pcx.name_fn.get(k);
             if was == 0 {
-                NAME_FN.put(k, f + 1);
+                pcx.name_fn.put(k, f + 1);
             } else {
-                NAME_FN.put(k, -1);
+                pcx.name_fn.put(k, -1);
                 if was > 0 {
-                    FN_AMBIG[was - 1] = true;
+                    pcx.fn_ambig[was - 1] = true;
                 }
-                FN_AMBIG[f] = true;
+                pcx.fn_ambig[f] = true;
             }
         }
-        for f in 0..FN_COUNT {
-            FN_CANON[f] = fn_canon(f) as i64;
-            if FN_AMBIG[f] && getenv(c"VOLE_CACHE_CHECK") != 0 as *u8 {
+        for f in 0..pcx.fn_count {
+            pcx.fn_canon[f] = fn_canon(f, pcx) as i64;
+            if pcx.fn_ambig[f] && getenv(c"VOLE_CACHE_CHECK") != 0 as *u8 {
                 eprintln(
                     "code cache check: two functions are {} ({f})",
-                    crate::base::cstr(crate::base::sym_name(FNS[f].name)));
+                    crate::base::cstr(crate::base::sym_name(pcx.fns[f].name)));
             }
         }
-        for g in 0..IRFUNC_COUNT {
-            let k = name_key(FN_NAMEH[IRFUNCS[g].f]);
-            let v = if NAME_IR.get(k) == 0 { g + 1 } else { -1 };
-            NAME_IR.put(k, v);
+        for g in 0..pcx.irfunc_count {
+            let k = name_key(pcx.fn_nameh[IRFUNCS[g].f]);
+            let v = if pcx.name_ir.get(k) == 0 { g + 1 } else { -1 };
+            pcx.name_ir.put(k, v);
         }
-        FN_MOVES = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        pcx.fn_moves = alloc_array::<i64>(pcx.irfunc_count + 1);
         var i = 0;
         while i + 1 < moves.count {
             let fi = moves.data[i];
-            if fi >= 0 && fi < IRFUNC_COUNT {
-                FN_MOVES[fi] = mix(mix(FN_MOVES[fi] as u64, 0x6d6f7665),
+            if fi >= 0 && fi < pcx.irfunc_count {
+                pcx.fn_moves[fi] = mix(mix(pcx.fn_moves[fi] as u64, 0x6d6f7665),
                     moves.data[i + 1] as u64)
                     as i64;
             }
             i += 2;
         }
-        strings_begin();
+        strings_begin(&pcx);
     }
 }
 
 // STR_H for every string made so far (main thread, between phases: the
 // strings grow only then).
-pub fn strings_begin() {
+pub fn strings_begin(pcx: inout Ctx<Comp>) {
     unsafe {
-        if STR_COUNT > STR_H_CAP {
+        if STR_COUNT > pcx.str_h_cap {
             let cap = STR_COUNT + STR_COUNT / 2 + 64;
             let n = alloc_array::<i64>(cap);
-            for i in 0..STR_H_COUNT {
-                n[i] = STR_H[i];
+            for i in 0..pcx.str_h_count {
+                n[i] = pcx.str_h[i];
             }
-            free(STR_H as *u8);
-            STR_H = n;
-            STR_H_CAP = cap;
+            free(pcx.str_h as *u8);
+            pcx.str_h = n;
+            pcx.str_h_cap = cap;
         }
-        while STR_H_COUNT < STR_COUNT {
-            let s = str_at(STR_H_COUNT);
-            STR_H[STR_H_COUNT] = mix(hash_bytes(s.ptr, s.len as i64), str_align(STR_H_COUNT) as u64)
+        while pcx.str_h_count < STR_COUNT {
+            let s = str_at(pcx.str_h_count);
+            pcx.str_h[pcx.str_h_count] = mix(hash_bytes(s.ptr, s.len as i64),
+                str_align(pcx.str_h_count) as u64)
                 as i64;
-            STR_H_COUNT += 1;
+            pcx.str_h_count += 1;
         }
     }
 }
@@ -214,16 +196,16 @@ pub fn strings_begin() {
 // What the tasks read of function f's declaration (FNS index), hashed: its
 // symbol, linkage, signature, attributes, effects, whether it is a
 // closure's, a C library name the program links, and whether it has IR.
-pub fn fn_canon(f: i64) -> u64 {
+pub fn fn_canon(f: i64, pcx: Ctx<Comp>) -> u64 {
     unsafe {
-        let fnf = FNS[f];
-        var h: u64 = mix(0x666e, fn_nameh(f) as u64);
+        let fnf = pcx.fns[f];
+        var h: u64 = mix(0x666e, fn_nameh(f, pcx) as u64);
         let flags = (if fnf.is_extern { 1 } else { 0 }) | (if fnf.export { 2 } else { 0 })
             | (if fnf.variadic { 4 } else { 0 }) | (if fnf.effect_decl != 0 { 8 } else { 0 })
             | (if fnf.views_decl != 0 { 16 } else { 0 })
-            | (if fnf.node != 0 && (NODES[fnf.node].p & FN_CLOSURE) != 0 { 32 } else { 0 })
-            | (if LINK_NAMES.get(fnf.name + 1) > 0 { 64 } else { 0 })
-            | (if FN_IR != 0 as *i64 && FN_IR[f] != 0 { 128 } else { 0 });
+            | (if fnf.node != 0 && (pcx.nodes[fnf.node].p & FN_CLOSURE) != 0 { 32 } else { 0 })
+            | (if pcx.link_names.get(fnf.name + 1) > 0 { 64 } else { 0 })
+            | (if pcx.fn_ir != 0 as *i64 && pcx.fn_ir[f] != 0 { 128 } else { 0 });
         h = mix(h, flags as u64);
         h = mix(h, fnf.ret as u64);
         h = mix(h, fnf.self_ty as u64);
@@ -232,7 +214,7 @@ pub fn fn_canon(f: i64) -> u64 {
         for i in 0..fnf.param_count {
             h = mix(h, TLISTS.data[fnf.params + i] as u64);
         }
-        let e = fn_effects(f);
+        let e = fn_effects(f, pcx);
         h = mix(h, e.bits as u64);
         mix(h, e.allocs as u64)
     }
@@ -243,7 +225,7 @@ pub fn fn_canon(f: i64) -> u64 {
 // Every type's description (its ids as they are, a struct or enum by its
 // fields and variants, not its name; a distinct type by its name) and
 // layout, and whether it is Freeze.
-pub fn types_hash() -> u64 {
+pub fn types_hash(pcx: Ctx<Comp>) -> u64 {
     unsafe {
         var h: u64 = mix(0x7479706573, TYPES.len() as u64);
         for t in 0..TYPES.len() as i64 {
@@ -251,14 +233,14 @@ pub fn types_hash() -> u64 {
             let kind = ty.kind;
             h = mix(h, kind as i64 as u64);
             if kind == TyKind::Struct {
-                h = mix(h, struct_hash(ty.a));
+                h = mix(h, struct_hash(ty.a, pcx));
                 h = mix(h, ty.b as u64);
             } else if kind == TyKind::Enum {
-                h = mix(h, enum_hash(ty.a));
+                h = mix(h, enum_hash(ty.a, pcx));
                 h = mix(h, ty.b as u64);
             } else if kind == TyKind::Distinct {
                 h = mix(h, ty.a as u64);
-                h = mix(h, if ty.b > 0 { sym_h(NODES[ty.b].a) } else { 0 });
+                h = mix(h, if ty.b > 0 { sym_h(pcx.nodes[ty.b].a) } else { 0 });
             } else {
                 h = mix(h, ty.a as u64);
                 h = mix(h, ty.b as u64);
@@ -274,22 +256,22 @@ pub fn types_hash() -> u64 {
             // (0.26.1) GVN keeps facts through a reference only to a Freeze
             // type, and a struct is hashed by its fields, not by whether it
             // is std's UnsafeCell.
-            h = mix(h, if crate::front::cells::is_freeze(t) { 1 } else { 0 });
+            h = mix(h, if crate::front::cells::is_freeze(t, pcx) { 1 } else { 0 });
         }
-        for i in 0..NICHE_ALIASES.count {
-            h = mix(h, NICHE_ALIASES.data[i] as u64);
+        for i in 0..pcx.niche_aliases.count {
+            h = mix(h, pcx.niche_aliases.data[i] as u64);
         }
         h
     }
 }
 
-fn struct_hash(s: i64) -> u64 {
+fn struct_hash(s: i64, pcx: Ctx<Comp>) -> u64 {
     unsafe {
         // (not its name nor its symbol prefix: a closure's struct, and an
         // instance whose type arguments name a closure, are named by where
         // the closure is, which a line added above changes; the methods'
         // symbols are the functions')
-        let st = STRUCTS[s];
+        let st = pcx.structs[s];
         var h: u64 = 0x737472;
         h = mix(h, st.field_count as u64);
         for i in 0..st.field_count {
@@ -311,13 +293,13 @@ fn struct_hash(s: i64) -> u64 {
     }
 }
 
-fn enum_hash(e: i64) -> u64 {
+fn enum_hash(e: i64, pcx: Ctx<Comp>) -> u64 {
     unsafe {
         let en = ENUMS[e];
         var h: u64 = 0x656e756d;
         h = mix(h, en.variant_count as u64);
         for i in 0..en.variant_count {
-            let v = VARIANTS[en.variants + i];
+            let v = pcx.variants[en.variants + i];
             h = mix(h, sym_h(v.name));
             h = mix(h, v.discr as u64);
             h = mix(h, v.field_count as u64);
@@ -337,7 +319,7 @@ fn enum_hash(e: i64) -> u64 {
         for i in 0..en.targ_count {
             h = mix(h, TLISTS.data[en.targs + i] as u64);
         }
-        mix(h, if e < ENUM_COUNT && enum_niche(e) { 2 } else { 1 })
+        mix(h, if e < pcx.enum_count && enum_niche(e, pcx) { 2 } else { 1 })
     }
 }
 
@@ -345,14 +327,14 @@ fn enum_hash(e: i64) -> u64 {
 
 // What a static's symbol names, for GADDR: its text, and the static's
 // type and linkage.
-pub fn static_canon(sym: i64) -> u64 {
+pub fn static_canon(sym: i64, pcx: Ctx<Comp>) -> u64 {
     unsafe {
         var h: u64 = mix(0x737461, sym_h(sym));
-        let st = SYM_STATIC[sym] - 1;
+        let st = pcx.sym_static[sym] - 1;
         if st >= 0 {
-            h = mix(h, STATICS[st].ty as u64);
-            h = mix(h, STATICS[st].linkage as u64);
-            h = mix(h, if STATICS[st].mutable { 1 } else { 0 });
+            h = mix(h, pcx.statics[st].ty as u64);
+            h = mix(h, pcx.statics[st].linkage as u64);
+            h = mix(h, if pcx.statics[st].mutable { 1 } else { 0 });
         }
         h
     }
@@ -360,12 +342,12 @@ pub fn static_canon(sym: i64) -> u64 {
 
 // Constant data a task made (a placeholder id < 0): its owner's symbol,
 // its place, its bytes and alignment.
-pub fn const_canon(id: i64) -> u64 {
+pub fn const_canon(id: i64, pcx: Ctx<Comp>) -> u64 {
     let m = -id - 1;
     let owner = m >> OWNER_SHIFT;
     let k = m & ((1 << OWNER_SHIFT) - 1);
     let bytes = const_data_bytes(id);
-    var h: u64 = mix(0x636f6e, ir_nameh(owner) as u64);
+    var h: u64 = mix(0x636f6e, ir_nameh(owner, pcx) as u64);
     h = mix(h, k as u64);
     h = mix(h, hash_bytes(bytes.ptr, bytes.len as i64));
     mix(h, const_data_align(id) as u64)
@@ -373,10 +355,10 @@ pub fn const_canon(id: i64) -> u64 {
 
 // What function f (FNS) is, for a CALL or FADDR: its canonical hash, and
 // its index when another function has its symbol.
-fn fn_ref(h: inout H2, f: i64) {
+fn fn_ref(h: inout H2, f: i64, pcx: Ctx<Comp>) {
     unsafe {
-        h2_puti(&h, FN_CANON[f]);
-        if FN_AMBIG[f] {
+        h2_puti(&h, pcx.fn_canon[f]);
+        if pcx.fn_ambig[f] {
             h2_puti(&h, f);
         }
     }
@@ -386,11 +368,11 @@ fn fn_ref(h: inout H2, f: i64) {
 // with `extra` mixed in first. Its strings (the distinct ids of its
 // SADDRs of strings, in instruction order) are appended to `strs`; a
 // string made after the last strings_begin poisons (false).
-pub fn ir_hash(cx: inout FnCtx, fi: i64, extra: u64, strs: *IntVec, out: inout H2) -> bool {
+pub fn ir_hash(cx: inout FnCtx, fi: i64, extra: u64, strs: *IntVec, out: inout H2, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var ok = true;
         var h = h2_new(extra);
-        let stamp = str_stamp(&cx);
+        let stamp = str_stamp(&cx, pcx);
         let first = (*strs).count;
         let irf = IRFUNCS[fi];
         h2_puti(&h, irf.entry);
@@ -414,7 +396,7 @@ pub fn ir_hash(cx: inout FnCtx, fi: i64, extra: u64, strs: *IntVec, out: inout H
             h2_puti(&h, v.c);
             if op == Op::SAddr {
                 if v.imm >= 0 {
-                    if v.imm >= STR_H_COUNT {
+                    if v.imm >= pcx.str_h_count {
                         ok = false;
                     } else {
                         let cc = cx.cc;
@@ -424,23 +406,23 @@ pub fn ir_hash(cx: inout FnCtx, fi: i64, extra: u64, strs: *IntVec, out: inout H
                             (*strs).push(v.imm);
                         }
                         h2_puti(&h, (*cc).str_k[v.imm]);
-                        h2_puti(&h, STR_H[v.imm]);
+                        h2_puti(&h, pcx.str_h[v.imm]);
                     }
                 } else {
-                    h2_put(&h, const_canon(v.imm));
+                    h2_put(&h, const_canon(v.imm, pcx));
                 }
             } else if op == Op::GAddr {
-                h2_put(&h, static_canon(v.imm));
+                h2_put(&h, static_canon(v.imm, pcx));
             } else if op == Op::CallC {
                 h2_put(&h, sym_h(v.imm));
             } else if op == Op::Call || op == Op::FAddr {
-                fn_ref(&h, v.imm);
+                fn_ref(&h, v.imm, pcx);
             } else if op == Op::RtId {
                 // (a check's site or kind: its function and place, not the
                 // front end's number, which the join replaces)
-                h2_puti(&h, ir_nameh(v.imm >> 20));
+                h2_puti(&h, ir_nameh(v.imm >> 20, pcx));
                 h2_puti(&h, v.imm & 1048575);
-                h2_puti(&h, rtid_class(v.imm));
+                h2_puti(&h, rtid_class(v.imm, pcx));
             } else {
                 h2_puti(&h, v.imm);
             }
@@ -490,7 +472,7 @@ pub fn ir_hash(cx: inout FnCtx, fi: i64, extra: u64, strs: *IntVec, out: inout H
         hash_ints(&h, &cx.argty);
         hash_ints(&h, &cx.swcases);
         hash_ints(&h, &cx.inst_loc);
-        h2_puti(&h, FN_MOVES[fi]);
+        h2_puti(&h, pcx.fn_moves[fi]);
         out.a = h.a;
         out.b = h.b;
         ok
@@ -507,13 +489,13 @@ fn hash_ints(h: inout H2, v: inout IntVec) {
 }
 
 // A new stamp for cx's string marks (sized to the strings).
-fn str_stamp(cx: inout FnCtx) -> i64 {
+fn str_stamp(cx: inout FnCtx, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let cc = crate::back::codecache::cc_of(&cx);
-        if (*cc).str_cap < STR_H_COUNT {
+        if (*cc).str_cap < pcx.str_h_count {
             free((*cc).str_seen as *u8);
             free((*cc).str_k as *u8);
-            (*cc).str_cap = STR_H_COUNT + STR_H_COUNT / 2 + 64;
+            (*cc).str_cap = pcx.str_h_count + pcx.str_h_count / 2 + 64;
             (*cc).str_seen = alloc_array::<i64>((*cc).str_cap);
             (*cc).str_k = alloc_array::<i64>((*cc).str_cap);
         }

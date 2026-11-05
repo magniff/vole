@@ -31,13 +31,12 @@
 // exit (a `return`, the tail) whose value brought it; `query views --why`
 // prints them, and a callee's summary when the value is a call.
 
-use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::{SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, put_short_positions};
-use crate::front::ast::{FN_CLOSURE, NODES, NodeKind, child};
-use crate::front::check::LOCALS;
-use crate::front::effects::infer::{
-    ADDRESS_TAKEN, COMPONENT, EDGES, EDGE_START, GRAPH_FNS, GRAPH_SIZE, body_walked, infer_effects,
-};
+use crate::front::ast::{FN_CLOSURE, NodeKind, child};
+use crate::front::effects::infer::{body_walked, infer_effects};
 use crate::front::modules::within_std;
 use crate::front::own::ctx::OwnCx;
 use crate::front::own::diag::{
@@ -53,16 +52,11 @@ use crate::front::own::summary::{
 };
 use crate::front::own::walk::walk_fn;
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TYPES, TyKind, VARIANTS, enum_variant, fn_param,
-    struct_field, type_elem,
+    ENUMS, TLISTS, TYPES, TyKind, enum_variant, fn_param, struct_field, type_elem,
 };
-use crate::middle::lower::ssa::HMap;
 
 // ---------------------------------------------------------------------------
 // The type filter
-
-static var HOLDS_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-static var DEEP_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
 fn pair_key(t: i64, e: i64) -> i64 {
     t * 16777216 + e + 1
@@ -87,7 +81,7 @@ fn same_elem(a0: i64, b0: i64) -> bool {
 // Whether the storage of a value of type t (its fields, elements, a
 // container's buffer; through raw pointers, not through views) can hold
 // a value of type e.
-pub fn holds(t: i64, e: i64) -> bool {
+pub fn holds(t: i64, e: i64, pcx: inout Ctx<Comp>) -> bool {
     if t <= 0 || e <= 0 {
         return t > 0 && e < 0;
     }
@@ -95,64 +89,62 @@ pub fn holds(t: i64, e: i64) -> bool {
         return true;
     }
     let key = pair_key(t, e);
-    let known = HOLDS_MEMO.get(key);
+    let known = pcx.holds_memo.get(key);
     if known != 0 {
         return known == 2;
     }
     // (a recursive type: the outer walk sees its other parts)
-    HOLDS_MEMO.put(key, 1);
-    let r = holds_of(t, e);
-    HOLDS_MEMO.put(key, if r { 2 } else { 1 });
+    pcx.holds_memo.put(key, 1);
+    let r = holds_of(t, e, &pcx);
+    pcx.holds_memo.put(key, if r { 2 } else { 1 });
     r
 }
 
-static var SYM_VEC_T: i64 = 0;
-static var SYM_MAP_T: i64 = 0;
-
-fn holds_of(t: i64, e: i64) -> bool {
+fn holds_of(t: i64, e: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         let k = TYPES[t].kind;
         if k == TyKind::Distinct {
             // (0.25) its base's storage
-            return holds(TYPES[t].a, e);
+            return holds(TYPES[t].a, e, &pcx);
         }
         if k == TyKind::Ptr {
             // (raw: it may own what it points to; a reference does not)
-            return TYPES[t].b == 0 && holds(TYPES[t].a, e);
+            return TYPES[t].b == 0 && holds(TYPES[t].a, e, &pcx);
         }
         if k == TyKind::Struct {
             let s = TYPES[t].a;
             // (0.25: a closure holds its captures, its env's fields: by
             // reference, nothing of its own; by value, what they hold)
-            if owned_base_type(t) {
-                let tpl = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
-                if SYM_VEC_T == 0 {
-                    SYM_VEC_T = intern_c(c"Vec");
-                    SYM_MAP_T = intern_c(c"HashMap");
+            if owned_base_type(t, &pcx) {
+                let tpl = if pcx.structs[s].tmpl != 0 { pcx.structs[s].tmpl - 1 } else { s };
+                if pcx.sym_vec_t == 0 {
+                    pcx.sym_vec_t = intern_c(c"Vec");
+                    pcx.sym_map_t = intern_c(c"HashMap");
                 }
-                if STRUCTS[tpl].name != SYM_VEC_T && STRUCTS[tpl].name != SYM_MAP_T {
+                if pcx.structs[tpl].name != pcx.sym_vec_t
+                    && pcx.structs[tpl].name != pcx.sym_map_t {
                     // (Buf holds bytes; Arena anything)
                     return true;
                 }
-                for i in 0..STRUCTS[s].targ_count {
-                    if holds(TLISTS.data[STRUCTS[s].targs + i], e) {
+                for i in 0..pcx.structs[s].targ_count {
+                    if holds(TLISTS.data[pcx.structs[s].targs + i], e, &pcx) {
                         return true;
                     }
                 }
-                for i in 0..STRUCTS[s].field_count {
+                for i in 0..pcx.structs[s].field_count {
                     // (0.25) a field itself: `-> let RawTable` of a HashMap
                     // (raw_table) is a view of its table
-                    if same_elem((*struct_field(s, i)).ty, e) {
+                    if same_elem((*struct_field(s, i, pcx)).ty, e) {
                         return true;
                     }
                 }
-                if STRUCTS[tpl].name == SYM_MAP_T {
+                if pcx.structs[tpl].name == pcx.sym_map_t {
                     // (0.25) a HashMap's table: its buckets, (K, V) pairs
                     let x = crate::front::distinct::strip_distinct(e);
                     if TYPES[x].kind == TyKind::Tuple {
                         var all = true;
                         for i in 0..TYPES[x].count {
-                            if !holds(t, type_elem(x, i)) {
+                            if !holds(t, type_elem(x, i), &pcx) {
                                 all = false;
                             }
                         }
@@ -161,8 +153,8 @@ fn holds_of(t: i64, e: i64) -> bool {
                 }
                 return false;
             }
-            for i in 0..STRUCTS[s].field_count {
-                if holds((*struct_field(s, i)).ty, e) {
+            for i in 0..pcx.structs[s].field_count {
+                if holds((*struct_field(s, i, pcx)).ty, e, &pcx) {
                     return true;
                 }
             }
@@ -170,19 +162,19 @@ fn holds_of(t: i64, e: i64) -> bool {
         }
         if k == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                if holds(type_elem(t, i), e) {
+                if holds(type_elem(t, i), e, &pcx) {
                     return true;
                 }
             }
             return false;
         }
         if k == TyKind::Array {
-            return holds(TYPES[t].a, e);
+            return holds(TYPES[t].a, e, &pcx);
         }
         if k == TyKind::Enum {
             let en = TYPES[t].a;
             for i in 0..ENUMS[en].variant_count {
-                if holds(VARIANTS[enum_variant(en, i)].shape, e) {
+                if holds(pcx.variants[enum_variant(en, i)].shape, e, &pcx) {
                     return true;
                 }
             }
@@ -193,41 +185,37 @@ fn holds_of(t: i64, e: i64) -> bool {
 
 // Whether what the views of a value of type t point to (at any depth)
 // can hold an e.
-pub fn deep(t: i64, e: i64) -> bool {
+pub fn deep(t: i64, e: i64, pcx: inout Ctx<Comp>) -> bool {
     if t <= 0 || e <= 0 {
         return t > 0 && e < 0;
     }
-    if !is_view_type(t) && TYPES[t].kind != TyKind::Ptr {
+    if !is_view_type(t, &pcx) && TYPES[t].kind != TyKind::Ptr {
         return false;
     }
     let key = pair_key(t, e);
-    let known = DEEP_MEMO.get(key);
+    let known = pcx.deep_memo.get(key);
     if known != 0 {
         return known == 2;
     }
-    DEEP_MEMO.put(key, 1);
-    let r = targets(t, e, true);
-    DEEP_MEMO.put(key, if r { 2 } else { 1 });
+    pcx.deep_memo.put(key, 1);
+    let r = targets(t, e, true, &pcx);
+    pcx.deep_memo.put(key, if r { 2 } else { 1 });
     r
 }
-
-// (the nesting of targets: a recursive type, `struct Node { text: [u8],
-// kids: Vec<Node> }`, is cut at a depth, conservatively)
-static var TARGETS_DEPTH: i64 = 0;
 
 // Whether the views in the parts of a value of type t point to storage
 // that can hold an e (with far: to storage whose views do, at any depth).
-fn targets(t: i64, e: i64, far: bool) -> bool {
-    if TARGETS_DEPTH > 16 {
+fn targets(t: i64, e: i64, far: bool, pcx: inout Ctx<Comp>) -> bool {
+    if pcx.targets_depth > 16 {
         return true;
     }
-    TARGETS_DEPTH += 1;
-    let r = targets_of(t, e, far);
-    TARGETS_DEPTH -= 1;
+    pcx.targets_depth += 1;
+    let r = targets_of(t, e, far, &pcx);
+    pcx.targets_depth -= 1;
     r
 }
 
-fn targets_of(t: i64, e: i64, far: bool) -> bool {
+fn targets_of(t: i64, e: i64, far: bool, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if t <= 0 {
             return false;
@@ -235,26 +223,26 @@ fn targets_of(t: i64, e: i64, far: bool) -> bool {
         let k = TYPES[t].kind;
         if k == TyKind::Slice || k == TyKind::Ptr {
             let y = TYPES[t].a;
-            return holds(y, e) || far && deep(y, e);
+            return holds(y, e, &pcx) || far && deep(y, e, &pcx);
         }
-        if !is_view_type(t) {
+        if !is_view_type(t, &pcx) {
             return false;
         }
         if k == TyKind::Struct {
             let s = TYPES[t].a;
-            if STRUCTS[s].closure != 0 {
+            if pcx.structs[s].closure != 0 {
                 return true;
             }
-            if owned_base_type(t) {
-                for i in 0..STRUCTS[s].targ_count {
-                    if targets(TLISTS.data[STRUCTS[s].targs + i], e, far) {
+            if owned_base_type(t, &pcx) {
+                for i in 0..pcx.structs[s].targ_count {
+                    if targets(TLISTS.data[pcx.structs[s].targs + i], e, far, &pcx) {
                         return true;
                     }
                 }
                 return false;
             }
-            for i in 0..STRUCTS[s].field_count {
-                if targets((*struct_field(s, i)).ty, e, far) {
+            for i in 0..pcx.structs[s].field_count {
+                if targets((*struct_field(s, i, pcx)).ty, e, far, &pcx) {
                     return true;
                 }
             }
@@ -262,19 +250,19 @@ fn targets_of(t: i64, e: i64, far: bool) -> bool {
         }
         if k == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                if targets(type_elem(t, i), e, far) {
+                if targets(type_elem(t, i), e, far, &pcx) {
                     return true;
                 }
             }
             return false;
         }
         if k == TyKind::Array {
-            return targets(TYPES[t].a, e, far);
+            return targets(TYPES[t].a, e, far, &pcx);
         }
         if k == TyKind::Enum {
             let en = TYPES[t].a;
             for i in 0..ENUMS[en].variant_count {
-                if targets(VARIANTS[enum_variant(en, i)].shape, e, far) {
+                if targets(pcx.variants[enum_variant(en, i)].shape, e, far, &pcx) {
                     return true;
                 }
             }
@@ -287,14 +275,14 @@ fn targets_of(t: i64, e: i64, far: bool) -> bool {
 
 // Whether a parameter of type t can carry views or loans at all: a view,
 // or a pointer (a reference, a legacy `*T` borrow).
-pub fn param_carries(t: i64) -> bool {
-    t > 0 && (is_view_type(t) || TYPES[t].kind == TyKind::Ptr)
+pub fn param_carries(t: i64, pcx: inout Ctx<Comp>) -> bool {
+    t > 0 && (is_view_type(t, &pcx) || TYPES[t].kind == TyKind::Ptr)
 }
 
 // Whether parameter type t's `p` (star false) or `*p` (star true) can hold
 // views of element type e.
-fn root_can(t: i64, e: i64, star: bool) -> bool {
-    if !param_carries(t) {
+fn root_can(t: i64, e: i64, star: bool, pcx: inout Ctx<Comp>) -> bool {
+    if !param_carries(t, &pcx) {
         return false;
     }
     if e < 0 {
@@ -302,40 +290,40 @@ fn root_can(t: i64, e: i64, star: bool) -> bool {
     }
     if TYPES[t].kind == TyKind::Ptr {
         let x = TYPES[t].a;
-        return if star { deep(x, e) } else { holds(x, e) };
+        return if star { deep(x, e, &pcx) } else { holds(x, e, &pcx) };
     }
     if star {
         // (by value: what its views point to holds views of e)
-        return targets_far_only(t, e);
+        return targets_far_only(t, e, &pcx);
     }
-    targets(t, e, false)
+    targets(t, e, false, &pcx)
 }
 
 // The views in t's parts point to storage whose own views reach an e.
-fn targets_far_only(t: i64, e: i64) -> bool {
+fn targets_far_only(t: i64, e: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         let k = TYPES[t].kind;
         if k == TyKind::Slice || k == TyKind::Ptr {
-            return deep(TYPES[t].a, e);
+            return deep(TYPES[t].a, e, &pcx);
         }
-        if !is_view_type(t) {
+        if !is_view_type(t, &pcx) {
             return false;
         }
         if k == TyKind::Struct {
             let s = TYPES[t].a;
-            if STRUCTS[s].closure != 0 {
+            if pcx.structs[s].closure != 0 {
                 return true;
             }
-            if owned_base_type(t) {
-                for i in 0..STRUCTS[s].targ_count {
-                    if targets_far_only(TLISTS.data[STRUCTS[s].targs + i], e) {
+            if owned_base_type(t, &pcx) {
+                for i in 0..pcx.structs[s].targ_count {
+                    if targets_far_only(TLISTS.data[pcx.structs[s].targs + i], e, &pcx) {
                         return true;
                     }
                 }
                 return false;
             }
-            for i in 0..STRUCTS[s].field_count {
-                if targets_far_only((*struct_field(s, i)).ty, e) {
+            for i in 0..pcx.structs[s].field_count {
+                if targets_far_only((*struct_field(s, i, pcx)).ty, e, &pcx) {
                     return true;
                 }
             }
@@ -343,19 +331,19 @@ fn targets_far_only(t: i64, e: i64) -> bool {
         }
         if k == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                if targets_far_only(type_elem(t, i), e) {
+                if targets_far_only(type_elem(t, i), e, &pcx) {
                     return true;
                 }
             }
             return false;
         }
         if k == TyKind::Array {
-            return targets_far_only(TYPES[t].a, e);
+            return targets_far_only(TYPES[t].a, e, &pcx);
         }
         if k == TyKind::Enum {
             let en = TYPES[t].a;
             for i in 0..ENUMS[en].variant_count {
-                if targets_far_only(VARIANTS[enum_variant(en, i)].shape, e) {
+                if targets_far_only(pcx.variants[enum_variant(en, i)].shape, e, &pcx) {
                     return true;
                 }
             }
@@ -365,104 +353,101 @@ fn targets_far_only(t: i64, e: i64) -> bool {
     }
 }
 
-// Per function: the masks the filter keeps (result level 1 from `p`, from
-// `*p`; whether level 2 can be non-empty), computed once.
-static var FILT: *i64 = 0 as *i64;
-static var FILT_N: i64 = 0;
-
-fn filter_masks(f: i64) -> i64 {
+fn filter_masks(f: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if FILT_N <= f {
-            let n = FN_COUNT + 64;
+        if pcx.filt_n <= f {
+            let n = pcx.fn_count + 64;
             let a = crate::base::alloc_array::<i64>(n * 7);
-            for i in 0..FILT_N * 7 {
-                a[i] = FILT[i];
+            for i in 0..pcx.filt_n * 7 {
+                a[i] = pcx.filt[i];
             }
-            FILT = a;
-            FILT_N = n;
+            pcx.filt = a;
+            pcx.filt_n = n;
         }
         let o = f * 7;
-        if FILT[o + 4] != 0 {
+        if pcx.filt[o + 4] != 0 {
             return o;
         }
-        let r = FNS[f].ret;
-        let e = view_elem(r);
+        let r = pcx.fns[f].ret;
+        let e = view_elem(r, &pcx);
         var p = 0;
         var s = 0;
-        if FNS[f].param_count > 63 || e == 0 {
+        if pcx.fns[f].param_count > 63 || e == 0 {
             p = -1;
             s = -1;
         } else {
-            for i in 0..FNS[f].param_count {
-                let t = fn_param(f, i);
-                if root_can(t, e, false) {
+            for i in 0..pcx.fns[f].param_count {
+                let t = fn_param(f, i, pcx);
+                if root_can(t, e, false, &pcx) {
                     p |= 1 << i;
                 }
-                if root_can(t, e, true) {
+                if root_can(t, e, true, &pcx) {
                     s |= 1 << i;
                 }
             }
         }
-        FILT[o] = p;
-        FILT[o + 1] = s;
-        FILT[o + 2] = if (type_kind(r) & K_LEVEL2) != 0 { -1 } else { 0 };
+        pcx.filt[o] = p;
+        pcx.filt[o + 1] = s;
+        pcx.filt[o + 2] = if (type_kind(r, &pcx) & K_LEVEL2) != 0 { -1 } else { 0 };
         // (level 2, when the result has exactly two levels: views of E2,
         // the element of the views an E holds)
-        FILT[o + 5] = FILT[o + 2];
-        FILT[o + 6] = FILT[o + 2];
-        let e2 = if e > 0 { view_elem(e) } else { 0 };
-        if FILT[o + 2] != 0 && e2 > 0 && !is_view_type(e2) && FNS[f].param_count <= 63 {
+        pcx.filt[o + 5] = pcx.filt[o + 2];
+        pcx.filt[o + 6] = pcx.filt[o + 2];
+        let e2 = if e > 0 { view_elem(e, &pcx) } else { 0 };
+        if pcx.filt[o + 2] != 0 && e2 > 0 && !is_view_type(e2, &pcx)
+            && pcx.fns[f].param_count <= 63 {
             var p2 = 0;
             var s2 = 0;
-            for i in 0..FNS[f].param_count {
-                let t = fn_param(f, i);
-                if root_can(t, e2, false) {
+            for i in 0..pcx.fns[f].param_count {
+                let t = fn_param(f, i, pcx);
+                if root_can(t, e2, false, &pcx) {
                     p2 |= 1 << i;
                 }
-                if root_can(t, e2, true) {
+                if root_can(t, e2, true, &pcx) {
                     s2 |= 1 << i;
                 }
             }
-            FILT[o + 5] = p2;
-            FILT[o + 6] = s2;
+            pcx.filt[o + 5] = p2;
+            pcx.filt[o + 6] = s2;
         }
         // (the stores: a referent never gains what it holds already, so
         // with one `&mut` parameter its own bits go)
         var targets = 0;
         var only = -1;
-        for i in 0..FNS[f].param_count {
-            if store_param(f, i) {
+        for i in 0..pcx.fns[f].param_count {
+            if store_param(f, i, &pcx) {
                 targets += 1;
                 only = i;
             }
         }
         // (a closure's env, or a closure given: its own bits stay, as one
         // capture may come to view another)
-        FILT[o + 3] = if targets == 1 && only < 63 && !env_param(f, only) && !closure_param(f, only)
+        pcx.filt[o + 3] = if targets == 1 && only < 63 && !env_param(f, only, &pcx)
+            && !closure_param(f, only, &pcx)
             { ~(1 << only) } else { -1 };
-        FILT[o + 4] = 1;
+        pcx.filt[o + 4] = 1;
         o
     }
 }
 
 // Summary s of f narrowed by the type filter (summary_of's last step).
-pub fn filter_summary(f: i64, s: ViewSummary) -> ViewSummary {
+pub fn filter_summary(f: i64, s: ViewSummary, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
         var r = s;
-        let o = filter_masks(f);
-        if !is_view_type(FNS[f].ret) {
+        let o = filter_masks(f, &pcx);
+        if !is_view_type(pcx.fns[f].ret, &pcx) {
             for k in 0..4 {
                 r.ret[k] = 0;
             }
         } else {
-            r.ret[S_L1_P] &= FILT[o];
-            r.ret[S_L1_STAR] &= FILT[o + 1];
-            r.ret[S_L2_P] &= FILT[o + 5];
-            r.ret[S_L2_STAR] &= FILT[o + 6];
+            r.ret[S_L1_P] &= pcx.filt[o];
+            r.ret[S_L1_STAR] &= pcx.filt[o + 1];
+            r.ret[S_L2_P] &= pcx.filt[o + 5];
+            r.ret[S_L2_STAR] &= pcx.filt[o + 6];
         }
         for k in 0..4 {
-            r.sto[k] &= FILT[o + 3];
-            if !has_mut_ref_param(f) {
+            r.sto[k] &= pcx.filt[o + 3];
+            if !has_mut_ref_param(f, &pcx) {
                 r.sto[k] = 0;
             }
         }
@@ -476,13 +461,13 @@ pub fn filter_summary(f: i64, s: ViewSummary) -> ViewSummary {
 // The summary of a call through a value of fn type t: the join of the
 // summaries of the functions of that type whose address is taken (none:
 // views()).
-pub fn indirect_summary(t: i64) -> ViewSummary {
+pub fn indirect_summary(t: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
         var s = empty_summary();
         var i = 0;
-        while i < ADDRESS_TAKEN.count {
-            if ADDRESS_TAKEN.data[i] == t {
-                s = join_summary(s, summary_of(ADDRESS_TAKEN.data[i + 1]));
+        while i < pcx.address_taken.count {
+            if pcx.address_taken.data[i] == t {
+                s = join_summary(s, summary_of(pcx.address_taken.data[i + 1], &pcx));
             }
             i += 2;
         }
@@ -493,51 +478,36 @@ pub fn indirect_summary(t: i64) -> ViewSummary {
 
 // The summary call n uses: of f, or (f < 0) of every function its fn
 // value may be (indirect_summary of the callee's type).
-pub fn summary_at_call(n: i64, f: i64) -> ViewSummary {
+pub fn summary_at_call(n: i64, f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     if f >= 0 {
-        return summary_of(f);
+        return summary_of(f, &pcx);
     }
-    let callee = NODES[n].a;
-    if callee == 0 || NODES[callee].ty <= 0 || TYPES[NODES[callee].ty].kind != TyKind::Fn {
+    let callee = pcx.nodes[n].a;
+    if callee == 0 || pcx.nodes[callee].ty <= 0 || TYPES[pcx.nodes[callee].ty].kind != TyKind::Fn {
         return top_summary();
     }
-    indirect_summary(NODES[callee].ty)
+    indirect_summary(pcx.nodes[callee].ty, &pcx)
 }
 
 // ---------------------------------------------------------------------------
 // Collection (summary.vl's collect_*, called by the walk)
 
-static var COL_F: i64 = -1;
-static var COL_ON: bool = false;
-static var COL_REPORTED: bool = false;
-static var COL_RET: [i64; 4] = [0, 0, 0, 0];
-static var COL_STO: [i64; 4] = [0, 0, 0, 0];
-static var COL_DECL: ViewSummary = ViewSummary {
-    ret: [0, 0, 0, 0], sto: [0, 0, 0, 0], top: false, declared: false,
-};
-static var COL_DECLARED: bool = false;
-// (the why of this walk: (mask, parameter, node, target) quadruples)
-static var COL_WHY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-// (the parameters a callable's result views in this walk: col_call)
-static var COL_CALL: i64 = 0;
-
-pub fn col_begin(f: i64, round: i64) {
-    COL_F = f;
-    COL_ON = f >= 0 && view_fn(f);
-    COL_REPORTED = false;
-    COL_WHY.count = 0;
-    COL_CALL = 0;
-    COL_CAST = 0;
-    COL_STORED[0] = 0;
-    COL_STORED[1] = 0;
+pub fn col_begin(f: i64, round: i64, pcx: inout Ctx<Comp>) {
+    pcx.col_f = f;
+    pcx.col_on = f >= 0 && view_fn(f, &pcx);
+    pcx.col_reported = false;
+    pcx.col_why.count = 0;
+    pcx.col_call = 0;
+    pcx.col_cast = 0;
+    pcx.col_stored[0] = 0;
+    pcx.col_stored[1] = 0;
     for k in 0..4 {
-        COL_RET[k] = 0;
-        COL_STO[k] = 0;
+        pcx.col_ret[k] = 0;
+        pcx.col_sto[k] = 0;
     }
-    COL_DECLARED = COL_ON && decl_of(f) != 0;
-    if COL_DECLARED {
-        COL_DECL = declared_summary(f);
+    pcx.col_declared = pcx.col_on && decl_of(f, &pcx) != 0;
+    if pcx.col_declared {
+        pcx.col_decl = declared_summary(f, &pcx);
     }
 }
 
@@ -556,14 +526,14 @@ fn param_index(l: i64, ocx: OwnCx) -> i64 {
 // The parameter root place q comes from: parameter * 2 (+ 1 for `*p`), or
 // -1 (a local, a static, a by-value parameter's own storage, or local
 // skip's own roots).
-fn root_param(q: i64, skip: i64, ocx: OwnCx) -> i64 {
+fn root_param(q: i64, skip: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let r = root_of(q, ocx);
         if ocx.pl_rkind[r] == RK_STATIC {
             return -1;
         }
         let l = ocx.pl_rid[r];
-        if l < 0 || l == skip || !LOCALS[l].is_param {
+        if l < 0 || l == skip || !pcx.locals[l].is_param {
             return -1;
         }
         let i = param_index(l, ocx);
@@ -574,16 +544,16 @@ fn root_param(q: i64, skip: i64, ocx: OwnCx) -> i64 {
             return i * 2 + ocx.pl_field[r];
         }
         // (a place reached through a reference parameter: its referent)
-        let t = LOCALS[l].ty;
+        let t = pcx.locals[l].ty;
         if ocx.pl_rkind[r] == RK_LOCAL && t > 0 && TYPES[t].kind == TyKind::Ptr {
-            if q != r && env_param(COL_F, i) {
+            if q != r && env_param(pcx.col_f, i, &pcx) {
                 // (a closure's capture by reference: the captured variable,
                 // what the env's views point into)
                 var a = q;
                 while ocx.pl_parent[a] != r {
                     a = ocx.pl_parent[a];
                 }
-                if env_ref_field(COL_F, ocx.pl_field[a]) {
+                if env_ref_field(pcx.col_f, ocx.pl_field[a], &pcx) {
                     return i * 2 + 1;
                 }
             }
@@ -595,13 +565,13 @@ fn root_param(q: i64, skip: i64, ocx: OwnCx) -> i64 {
 
 // Masks m[lv] (p) and m[lv + 1] (`*p`) get the parameter roots of bitset
 // words POOL[w..w + NW].
-fn add_roots(w: i64, skip: i64, m: *i64, lv: i64, ocx: OwnCx) {
+fn add_roots(w: i64, skip: i64, m: *i64, lv: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
     unsafe {
         for q in 0..ocx.pl_count {
             if (ocx.pool[w + (q >> 6)] & (1 << (q & 63))) == 0 {
                 continue;
             }
-            let pr = root_param(q, skip, ocx);
+            let pr = root_param(q, skip, ocx, &pcx);
             if pr < 0 {
                 continue;
             }
@@ -615,22 +585,22 @@ fn add_roots(w: i64, skip: i64, m: *i64, lv: i64, ocx: OwnCx) {
 // The function's result at node e (origin v, -1: none): an exit. Its
 // levels' parameter roots go to the result's masks; the `&mut`
 // parameters' slots at this exit, to the stores'.
-pub fn col_result(e: i64, v: i64, ocx: OwnCx) {
+pub fn col_result(e: i64, v: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
     unsafe {
-        if !COL_ON {
+        if !pcx.col_on {
             return;
         }
-        let f = COL_F;
+        let f = pcx.col_f;
         var ret: [i64; 4] = [0, 0, 0, 0];
         var sto: [i64; 4] = [0, 0, 0, 0];
-        if v >= 0 && is_view_type(FNS[f].ret) {
-            add_roots(v, -1, &ret[0], S_L1_P, ocx);
-            add_roots(v + ocx.nw, -1, &ret[0], S_L2_P, ocx);
+        if v >= 0 && is_view_type(pcx.fns[f].ret, &pcx) {
+            add_roots(v, -1, &ret[0], S_L1_P, ocx, &pcx);
+            add_roots(v + ocx.nw, -1, &ret[0], S_L2_P, ocx, &pcx);
         }
         var target: [i64; 4] = [-1, -1, -1, -1];
         for i in 0..ocx.param_locals.count {
             let l = ocx.param_locals.data[i];
-            if l < 0 || i >= FNS[f].param_count || !store_param(f, i) {
+            if l < 0 || i >= pcx.fns[f].param_count || !store_param(f, i, &pcx) {
                 continue;
             }
             let s = slot_of_local(l, ocx);
@@ -639,13 +609,13 @@ pub fn col_result(e: i64, v: i64, ocx: OwnCx) {
             }
             let off = slot_off(ocx.cur, s, ocx);
             var m: [i64; 2] = [0, 0];
-            add_roots(off, l, &m[0], 0, ocx);
-            add_roots(off + ocx.nw, l, &m[0], 0, ocx);
+            add_roots(off, l, &m[0], 0, ocx, &pcx);
+            add_roots(off + ocx.nw, l, &m[0], 0, ocx, &pcx);
             if i < 63 && (ocx.captures_stored & (1 << i)) != 0 {
                 // (a closure stored into: one capture may now view another,
                 // its own roots among what was stored, col_stored)
-                m[0] |= COL_STORED[0];
-                m[1] |= COL_STORED[1];
+                m[0] |= pcx.col_stored[0];
+                m[1] |= pcx.col_stored[1];
             }
             for k in 0..4 {
                 let add = if k == S_L1_P || k == S_L2_P { m[0] } else { m[1] };
@@ -655,14 +625,14 @@ pub fn col_result(e: i64, v: i64, ocx: OwnCx) {
                 sto[k] |= add;
             }
         }
-        note_why(ret, COL_RET, 0, e, -1);
-        note_why_sto(sto, e, target);
+        note_why(ret, pcx.col_ret, 0, e, -1, &pcx);
+        note_why_sto(sto, e, target, &pcx);
         for k in 0..4 {
-            COL_RET[k] |= ret[k];
-            COL_STO[k] |= sto[k];
+            pcx.col_ret[k] |= ret[k];
+            pcx.col_sto[k] |= sto[k];
         }
-        if COL_DECLARED && !COL_REPORTED {
-            check_declared(f, e, ret, sto, target);
+        if pcx.col_declared && !pcx.col_reported {
+            check_declared(f, e, ret, sto, target, &pcx);
         }
     }
 }
@@ -672,57 +642,50 @@ pub fn col_result(e: i64, v: i64, ocx: OwnCx) {
 // a type parameter's bound lets the body call) whose result's views the
 // parametric floor does not cover: a generic body that calls its `F`
 // makes a result that may view anything the callable views (col_end).
-pub fn col_callable(f: i64) -> bool {
+pub fn col_callable(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if !COL_ON || FNS[COL_F].tmpl == 0 || ret_parametric(COL_F) == 0 {
+        if !pcx.col_on || pcx.fns[pcx.col_f].tmpl == 0 || ret_parametric(pcx.col_f, &pcx) == 0 {
             return false;
         }
-        f < 0 || !within_std(FNS[f].module) || FNS[f].node > 0
-            && (NODES[FNS[f].node].p & FN_CLOSURE) != 0
+        f < 0 || !within_std(pcx.fns[f].module, pcx) || pcx.fns[f].node > 0
+            && (pcx.nodes[pcx.fns[f].node].p & FN_CLOSURE) != 0
     }
 }
 
 // The origin v of a callable's result (col_callable): the parameters it
 // views, at any level.
-pub fn col_call(v: i64, ocx: OwnCx) {
+pub fn col_call(v: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
     var m: [i64; 4] = [0, 0, 0, 0];
-    add_roots(v, -1, &m[0], S_L1_P, ocx);
-    add_roots(v + ocx.nw, -1, &m[0], S_L2_P, ocx);
-    COL_CALL |= m[0] | m[1] | m[2] | m[3];
+    add_roots(v, -1, &m[0], S_L1_P, ocx, &pcx);
+    add_roots(v + ocx.nw, -1, &m[0], S_L2_P, ocx, &pcx);
+    pcx.col_call |= m[0] | m[1] | m[2] | m[3];
 }
 
-// (0.25.3) The parameters whose loans the walked function passed through
-// a cast (summary::cast_mask: a call whose result views an argument as
-// another element type) to a view: col_end keeps them with the summary,
-// so that the type filter does not drop them from it.
-static var COL_CAST: i64 = 0;
-
 // The origin v of a cast's argument (calls::on_call).
-pub fn col_cast(v: i64, ocx: OwnCx) {
-    if !COL_ON {
+pub fn col_cast(v: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
+    if !pcx.col_on {
         return;
     }
     var m: [i64; 2] = [0, 0];
-    add_roots(v, -1, &m[0], 0, ocx);
-    COL_CAST |= m[0] | m[1];
+    add_roots(v, -1, &m[0], 0, ocx, &pcx);
+    pcx.col_cast |= m[0] | m[1];
 }
 
-// The parameters (`p`, `*p` masks) whose views the walk stored into a
-// closure (views::note_env_store): its own captures among them, which
-// col_result otherwise leaves out of a target's stores.
-static var COL_STORED: [i64; 2] = [0, 0];
-
-pub fn col_stored(v: i64, ocx: OwnCx) {
-    if !COL_ON {
+pub fn col_stored(v: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
+    if !pcx.col_on {
         return;
     }
-    add_roots(v, -1, &COL_STORED[0], 0, ocx);
-    add_roots(v + ocx.nw, -1, &COL_STORED[0], 0, ocx);
+    // (both masks taken out: add_roots writes m[0] and m[1] through the
+    // pointer to the first)
+    var stored = pcx.col_stored;
+    add_roots(v, -1, &stored[0], 0, ocx, &pcx);
+    add_roots(v + ocx.nw, -1, &stored[0], 0, ocx, &pcx);
+    pcx.col_stored = stored;
 }
 
 // The why of the bits of m that are new (not in old): (mask base + k,
 // parameter, node e, target).
-fn note_why(m: [i64; 4], old: [i64; 4], base: i64, e: i64, target: i64) {
+fn note_why(m: [i64; 4], old: [i64; 4], base: i64, e: i64, target: i64, pcx: inout Ctx<Comp>) {
     for k in 0..4 {
         let new = m[k] & ~old[k];
         if new == 0 {
@@ -730,49 +693,49 @@ fn note_why(m: [i64; 4], old: [i64; 4], base: i64, e: i64, target: i64) {
         }
         for i in 0..63 {
             if (new & (1 << i)) != 0 {
-                COL_WHY.push(base + k);
-                COL_WHY.push(i);
-                COL_WHY.push(e);
-                COL_WHY.push(target);
+                pcx.col_why.push(base + k);
+                pcx.col_why.push(i);
+                pcx.col_why.push(e);
+                pcx.col_why.push(target);
             }
         }
     }
 }
 
-fn note_why_sto(sto: [i64; 4], e: i64, target: [i64; 4]) {
+fn note_why_sto(sto: [i64; 4], e: i64, target: [i64; 4], pcx: inout Ctx<Comp>) {
     for k in 0..4 {
         var one: [i64; 4] = [0, 0, 0, 0];
         one[k] = sto[k];
-        note_why(one, COL_STO, 4, e, target[k]);
+        note_why(one, pcx.col_sto, 4, e, target[k], &pcx);
     }
 }
 
 // The walk of f ended: the summary its body makes (a parametric result
 // takes its floor's masks, by its type; the floor's stores are joined).
 // Its why is kept for query views.
-pub fn col_end(f: i64) -> ViewSummary {
+pub fn col_end(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
         var s = empty_summary();
-        if !COL_ON {
+        if !pcx.col_on {
             return s;
         }
         for k in 0..4 {
-            s.ret[k] = COL_RET[k];
-            s.sto[k] = COL_STO[k];
+            s.ret[k] = pcx.col_ret[k];
+            s.sto[k] = pcx.col_sto[k];
         }
-        if FNS[f].tmpl != 0 {
-            let floor = floor_summary(f);
+        if pcx.fns[f].tmpl != 0 {
+            let floor = floor_summary(f, &pcx);
             for k in 0..4 {
-                if ret_parametric(f) != 0 {
+                if ret_parametric(f, &pcx) != 0 {
                     // (and what its callables' results view, as the body
                     // passes them on: col_call)
-                    s.ret[k] = floor.ret[k] | COL_RET[k] & COL_CALL;
+                    s.ret[k] = floor.ret[k] | pcx.col_ret[k] & pcx.col_call;
                 }
                 s.sto[k] |= floor.sto[k];
             }
         }
-        summary_store_casts(f, COL_CAST);
-        keep_why(f);
+        summary_store_casts(f, pcx.col_cast, &pcx);
+        keep_why(f, &pcx);
         s
     }
 }
@@ -780,8 +743,8 @@ pub fn col_end(f: i64) -> ViewSummary {
 // ---------------------------------------------------------------------------
 // #[views] checked against the body (own.views)
 
-fn sym_text(f: i64, i: i64) -> [u8] {
-    unsafe { SYMS[NODES[child(FNS[f].node, i)].a].text }
+fn sym_text(f: i64, i: i64, pcx: Ctx<Comp>) -> [u8] {
+    unsafe { SYMS[pcx.nodes[child(pcx.fns[f].node, i, pcx)].a].text }
 }
 
 // The first parameter bit of m beyond d: parameter * 2 (+ 1 for `*p`),
@@ -803,45 +766,45 @@ fn first_excess(m: [i64; 4], d: [i64; 4]) -> i64 {
     -1
 }
 
-fn put_decl(f: i64, stores: bool) {
+fn put_decl(f: i64, stores: bool, pcx: Ctx<Comp>) {
     let b = buf_new();
     if stores {
         buf_str(b, c"#[stores(");
-        put_params(b, f, COL_DECL.sto);
+        put_params(b, f, pcx.col_decl.sto, pcx);
     } else {
         buf_str(b, c"#[views(");
-        put_params(b, f, COL_DECL.ret);
+        put_params(b, f, pcx.col_decl.ret, pcx);
     }
     buf_str(b, c")]");
-    own_bytes(buf_slice(b));
+    own_bytes(buf_slice(b), pcx);
 }
 
-fn put_root(f: i64, x: i64) {
+fn put_root(f: i64, x: i64, pcx: Ctx<Comp>) {
     unsafe {
         let i = x >> 1;
-        if i >= FNS[f].param_count {
-            own_str(c"its parameters");
+        if i >= pcx.fns[f].param_count {
+            own_str(c"its parameters", pcx);
             return;
         }
         if (x & 1) != 0 {
-            own_str(c"what '");
-            own_bytes(sym_text(f, i));
-            own_str(c"' holds ('*");
-            own_bytes(sym_text(f, i));
-            own_str(c"')");
+            own_str(c"what '", pcx);
+            own_bytes(sym_text(f, i, pcx), pcx);
+            own_str(c"' holds ('*", pcx);
+            own_bytes(sym_text(f, i, pcx), pcx);
+            own_str(c"')", pcx);
         } else {
-            own_str(c"'");
-            own_bytes(sym_text(f, i));
-            own_str(c"'");
+            own_str(c"'", pcx);
+            own_bytes(sym_text(f, i, pcx), pcx);
+            own_str(c"'", pcx);
         }
     }
 }
 
 // Appends the source text of node n (its first line, shortened).
-pub fn buf_node_source(out: i64, n: i64) {
-    let start = NODES[n].start;
+pub fn buf_node_source(out: i64, n: i64, pcx: Ctx<Comp>) {
+    let start = pcx.nodes[n].start;
     var end = start;
-    while end < NODES[n].end && SRC[end] != '\n' {
+    while end < pcx.nodes[n].end && SRC[end] != '\n' {
         end += 1;
     }
     if end - start > 48 {
@@ -850,113 +813,111 @@ pub fn buf_node_source(out: i64, n: i64) {
         return;
     }
     buf_bytes(out, SRC[start..end]);
-    if end < NODES[n].end {
+    if end < pcx.nodes[n].end {
         buf_str(out, c" ..");
     }
 }
 
-fn check_declared(f: i64, e: i64, ret: [i64; 4], sto: [i64; 4], target: [i64; 4]) {
+fn check_declared(f: i64, e: i64, ret: [i64; 4], sto: [i64; 4], target: [i64; 4],
+    pcx: inout Ctx<Comp>) {
     unsafe {
-        let name = SYMS[FNS[f].display].text;
-        let rx = first_excess(ret, COL_DECL.ret);
-        let sx = first_excess(sto, COL_DECL.sto);
+        let name = SYMS[pcx.fns[f].display].text;
+        let rx = first_excess(ret, pcx.col_decl.ret);
+        let sx = first_excess(sto, pcx.col_decl.sto);
         if rx < 0 && sx < 0 {
             return;
         }
-        COL_REPORTED = true;
-        own_begin(e, OWN_VIEWS);
-        own_str(c"'");
-        own_bytes(name);
-        own_str(c"' is ");
+        pcx.col_reported = true;
+        own_begin(e, OWN_VIEWS, &pcx);
+        own_str(c"'", pcx);
+        own_bytes(name, pcx);
+        own_str(c"' is ", pcx);
         var inferred = buf_new();
         if rx >= 0 {
-            put_decl(f, false);
-            own_str(c" but returns a view of ");
-            put_root(f, rx);
-            own_str(c": '");
+            put_decl(f, false, pcx);
+            own_str(c" but returns a view of ", pcx);
+            put_root(f, rx, pcx);
+            own_str(c": '", pcx);
             let src = buf_new();
-            buf_node_source(src, e);
-            own_bytes(buf_slice(src));
-            own_str(c"'");
+            buf_node_source(src, e, pcx);
+            own_bytes(buf_slice(src), pcx);
+            own_str(c"'", pcx);
             buf_str(inferred, c"views(");
-            var all = COL_DECL.ret;
+            var all = pcx.col_decl.ret;
             for k in 0..4 {
-                all[k] |= ret[k] | COL_RET[k];
+                all[k] |= ret[k] | pcx.col_ret[k];
             }
-            put_params(inferred, f, all);
+            put_params(inferred, f, all, pcx);
             buf_str(inferred, c")");
         } else {
-            put_decl(f, true);
-            own_str(c" but ");
+            put_decl(f, true, pcx);
+            own_str(c" but ", pcx);
             var t = -1;
             for k in 0..4 {
-                if t < 0 && (sto[k] & ~COL_DECL.sto[k]) != 0 {
+                if t < 0 && (sto[k] & ~pcx.col_decl.sto[k]) != 0 {
                     t = target[k];
                 }
             }
-            if t >= 0 && t < FNS[f].param_count {
-                own_str(c"'");
-                own_bytes(sym_text(f, t));
-                own_str(c"'");
+            if t >= 0 && t < pcx.fns[f].param_count {
+                own_str(c"'", pcx);
+                own_bytes(sym_text(f, t, pcx), pcx);
+                own_str(c"'", pcx);
             } else {
-                own_str(c"an `inout` parameter");
+                own_str(c"an `inout` parameter", pcx);
             }
-            own_str(c" may hold a view of ");
-            put_root(f, sx);
-            own_str(c" when it returns");
+            own_str(c" may hold a view of ", pcx);
+            put_root(f, sx, pcx);
+            own_str(c" when it returns", pcx);
             buf_str(inferred, c"stores(");
-            var all = COL_DECL.sto;
+            var all = pcx.col_decl.sto;
             for k in 0..4 {
-                all[k] |= sto[k] | COL_STO[k];
+                all[k] |= sto[k] | pcx.col_sto[k];
             }
-            put_params(inferred, f, all);
+            put_params(inferred, f, all, pcx);
             buf_str(inferred, c")");
         }
-        own_help(c"callers rely on the declaration: change the body to keep to it, or declare what it does: #[");
-        crate::front::own::diag::own_help_bytes(buf_slice(inferred));
-        own_help(c"]");
+        own_help(c"callers rely on the declaration: change the body to keep to it, or declare what it does: #[", pcx);
+        crate::front::own::diag::own_help_bytes(buf_slice(inferred), pcx);
+        own_help(c"]", pcx);
         let cmd = buf_new();
         buf_str(cmd, c"volec query views ");
         buf_bytes(cmd, name);
         buf_str(cmd, c" --why");
-        own_try(buf_slice(cmd));
-        own_end();
+        own_try(buf_slice(cmd), pcx);
+        own_end(&pcx);
     }
 }
 
 // ---------------------------------------------------------------------------
 // The why-chains
 
-static var WHY_ALL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var WHY_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
-fn keep_why(f: i64) {
+fn keep_why(f: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let start = WHY_ALL.count;
-        for i in 0..COL_WHY.count {
-            WHY_ALL.push(COL_WHY.data[i]);
+        let start = pcx.why_all.count;
+        for i in 0..pcx.col_why.count {
+            pcx.why_all.push(pcx.col_why.data[i]);
         }
-        WHY_AT.put(f + 1, start * 65536 + COL_WHY.count / 4 + 1);
+        pcx.why_at.put(f + 1, start * 65536 + pcx.col_why.count / 4 + 1);
     }
 }
 
 // The call a result expression e makes its value with (through `Ok(..)`,
 // `Some(..)`, a block's tail, `?`), or 0.
-fn result_call(e: i64) -> i64 {
+fn result_call(e: i64, pcx: Ctx<Comp>) -> i64 {
     var n = e;
     var steps = 0;
     while n != 0 && steps < 8 {
         steps += 1;
-        let k = NODES[n].kind;
+        let k = pcx.nodes[n].kind;
         if k == NodeKind::Call {
             return n;
         }
-        if k == NodeKind::VariantLit && NODES[n].count == 1 {
-            n = child(n, 0);
+        if k == NodeKind::VariantLit && pcx.nodes[n].count == 1 {
+            n = child(n, 0, pcx);
         } else if k == NodeKind::Block {
-            n = NODES[n].a;
+            n = pcx.nodes[n].a;
         } else if k == NodeKind::Try {
-            n = NODES[n].y;
+            n = pcx.nodes[n].y;
         } else {
             return 0;
         }
@@ -964,15 +925,15 @@ fn result_call(e: i64) -> i64 {
     0
 }
 
-fn put_short_pos(out: i64, pos: i64) {
+fn put_short_pos(out: i64, pos: i64, pcx: inout Ctx<Comp>) {
     let tmp = buf_new();
-    buf_position(tmp, pos);
+    buf_position(tmp, pos, &pcx);
     put_short_positions(out, buf_slice(tmp));
 }
 
 // The why of a parametric result (by its type, whatever the body does).
-fn put_parametric_why(out: i64, f: i64) {
-    let p = ret_parametric(f);
+fn put_parametric_why(out: i64, f: i64, pcx: inout Ctx<Comp>) {
+    let p = ret_parametric(f, &pcx);
     if p == 1 {
         buf_str(out, c"  why: a generic result made of its type parameters: the T values its arguments hold (by its type)\n");
     } else if p == 2 {
@@ -982,17 +943,17 @@ fn put_parametric_why(out: i64, f: i64) {
 
 // The why of f's summary into out: a line for each source (`  why:
 // FILE:L:C 'SOURCE' ...`), indented. Nothing when f was not walked.
-pub fn views_why(out: i64, f: i64) {
+pub fn views_why(out: i64, f: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let at = WHY_AT.get(f + 1);
-        if decl_of(f) != 0 {
+        let at = pcx.why_at.get(f + 1);
+        if decl_of(f, &pcx) != 0 {
             buf_str(out, c"  why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it\n");
             return;
         }
         if at == 0 {
-            if !summary_inferred(f) && view_fn(f) {
-                if ret_parametric(f) != 0 {
-                    put_parametric_why(out, f);
+            if !summary_inferred(f, pcx) && view_fn(f, &pcx) {
+                if ret_parametric(f, &pcx) != 0 {
+                    put_parametric_why(out, f, &pcx);
                 } else {
                     buf_str(out, c"  why: its body was not walked (it did not check): every parameter assumed\n");
                 }
@@ -1001,8 +962,8 @@ pub fn views_why(out: i64, f: i64) {
         }
         let start = (at - 1) / 65536;
         let n = (at - 1) % 65536;
-        put_parametric_why(out, f);
-        let fin = summary_of(f);
+        put_parametric_why(out, f, &pcx);
+        let fin = summary_of(f, &pcx);
         let fin_p = fin.ret[S_L1_P] | fin.ret[S_L2_P];
         let sto_p = fin.sto[S_L1_P] | fin.sto[S_L2_P];
         // (a line per parameter as the text rounds it: shown[group * 2 +
@@ -1010,16 +971,16 @@ pub fn views_why(out: i64, f: i64) {
         var shown: [i64; 4] = [0, 0, 0, 0];
         for j in 0..n {
             let o = start + j * 4;
-            let k = WHY_ALL.data[o];
-            let i = WHY_ALL.data[o + 1];
-            let e = WHY_ALL.data[o + 2];
-            let target = WHY_ALL.data[o + 3];
-            if i >= FNS[f].param_count {
+            let k = pcx.why_all.data[o];
+            let i = pcx.why_all.data[o + 1];
+            let e = pcx.why_all.data[o + 2];
+            let target = pcx.why_all.data[o + 3];
+            if i >= pcx.fns[f].param_count {
                 continue;
             }
             // (only the bits the summary keeps after the filter)
             let m = if k < 4 { fin.ret[k] } else { fin.sto[k - 4] };
-            if (m & (1 << i)) == 0 || k >= 4 && ret_parametric(f) != 0 {
+            if (m & (1 << i)) == 0 || k >= 4 && ret_parametric(f, &pcx) != 0 {
                 continue;
             }
             let star = k == S_L1_STAR || k == S_L2_STAR || k == 4 + S_L1_STAR
@@ -1033,20 +994,20 @@ pub fn views_why(out: i64, f: i64) {
             }
             shown[g] |= 1 << i;
             buf_str(out, c"  why: ");
-            put_short_pos(out, NODES[e].start);
-            if e == NODES[FNS[f].node].c || k >= 4 {
+            put_short_pos(out, pcx.nodes[e].start, &pcx);
+            if e == pcx.nodes[pcx.fns[f].node].c || k >= 4 {
                 buf_str(out, c" (when '");
-                buf_bytes(out, SYMS[FNS[f].display].text);
+                buf_bytes(out, SYMS[pcx.fns[f].display].text);
                 buf_str(out, c"' returns)");
             } else {
                 buf_str(out, c" '");
-                buf_node_source(out, e);
+                buf_node_source(out, e, pcx);
                 buf_str(out, c"'");
             }
             if k >= 4 {
                 buf_str(out, c": '");
-                if target >= 0 && target < FNS[f].param_count {
-                    buf_bytes(out, sym_text(f, target));
+                if target >= 0 && target < pcx.fns[f].param_count {
+                    buf_bytes(out, sym_text(f, target, pcx));
                 } else {
                     buf_str(out, c"an `inout` parameter");
                 }
@@ -1058,20 +1019,20 @@ pub fn views_why(out: i64, f: i64) {
             }
             if star {
                 buf_str(out, c"what '");
-                buf_bytes(out, sym_text(f, i));
+                buf_bytes(out, sym_text(f, i, pcx));
                 buf_str(out, c"' holds");
             } else {
                 buf_str(out, c"'");
-                buf_bytes(out, sym_text(f, i));
+                buf_bytes(out, sym_text(f, i, pcx));
                 buf_str(out, c"'");
             }
-            let call = if k < 4 { result_call(e) } else { 0 };
-            if call != 0 && NODES[call].x > 0 {
-                let g = NODES[call].x - 1;
+            let call = if k < 4 { result_call(e, pcx) } else { 0 };
+            if call != 0 && pcx.nodes[call].x > 0 {
+                let g = pcx.nodes[call].x - 1;
                 buf_str(out, c", through '");
-                buf_bytes(out, SYMS[FNS[g].display].text);
+                buf_bytes(out, SYMS[pcx.fns[g].display].text);
                 buf_str(out, c"' (");
-                summary_text(out, g, summary_of(g));
+                summary_text(out, g, summary_of(g, &pcx), &pcx);
                 buf_str(out, c")");
             }
             buf_byte(out, '\n');
@@ -1084,14 +1045,14 @@ pub fn views_why(out: i64, f: i64) {
 
 // Whether function f is walked: it has a checked body (not C's, not a
 // template).
-pub fn walkable(f: i64) -> bool {
-    unsafe { f >= 0 && f < FN_COUNT && !FNS[f].is_extern && body_walked(f) }
+pub fn walkable(f: i64, pcx: Ctx<Comp>) -> bool {
+    unsafe { f >= 0 && f < pcx.fn_count && !pcx.fns[f].is_extern && body_walked(f, pcx) }
 }
 
-fn self_edge(v: i64) -> bool {
+fn self_edge(v: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        for e in EDGE_START.data[v]..EDGE_START.data[v + 1] {
-            if (EDGES.data[e] >> 2) == v {
+        for e in pcx.edge_start.data[v]..pcx.edge_start.data[v + 1] {
+            if (pcx.edges.data[e] >> 2) == v {
                 return true;
             }
         }
@@ -1101,12 +1062,12 @@ fn self_edge(v: i64) -> bool {
 
 // Where a recursive component's member starts: its floor's stores, and
 // its result's when it is parametric; else views().
-fn start_summary(f: i64) -> ViewSummary {
+fn start_summary(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
-        if FNS[f].tmpl == 0 {
+        if pcx.fns[f].tmpl == 0 {
             return empty_summary();
         }
-        var s = floor_summary(f);
+        var s = floor_summary(f, &pcx);
         if s.top {
             for k in 0..4 {
                 s.ret[k] = 0;
@@ -1122,40 +1083,35 @@ fn start_summary(f: i64) -> ViewSummary {
 const MAX_ROUNDS: i64 = 24;
 
 // Walks f once, its findings kept; its summary stored.
-fn walk_kept(f: i64, all: bool, ocx: inout OwnCx) {
-    if !all && !view_fn(f) {
+fn walk_kept(f: i64, all: bool, ocx: inout OwnCx, pcx: inout Ctx<Comp>) {
+    if !all && !view_fn(f, &pcx) {
         return;
     }
-    let s = walk_fn(f, 0, &ocx);
-    own_flush();
-    if view_fn(f) && decl_of(f) == 0 {
-        summary_store(f, s);
+    let s = walk_fn(f, 0, &ocx, &pcx);
+    own_flush(&pcx);
+    if view_fn(f, &pcx) && decl_of(f, &pcx) == 0 {
+        summary_store(f, s, &pcx);
     }
 }
 
-// Every walkable function walked, callees first (all false: only those
-// with view-carrying summaries, for the summaries alone: `query`,
-// --print-views without --values). Rounds of recursive components.
-pub static var SCC_ROUNDS: i64 = 0;
-
-pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
+pub fn infer_summaries(all: bool, ocx: inout OwnCx, pcx: inout Ctx<Comp>) {
     unsafe {
-        if COMPONENT == 0 as *i64 || GRAPH_FNS > FN_COUNT {
-            infer_effects();
+        if pcx.component == 0 as *i64 || pcx.graph_fns > pcx.fn_count {
+            infer_effects(&pcx);
         }
-        let size = GRAPH_SIZE;
-        let n = GRAPH_FNS;
+        let size = pcx.graph_size;
+        let n = pcx.graph_fns;
         // (the nodes by component, components in completion order:
         // counting sort)
         var ncomp = 0;
         for v in 0..size {
-            if COMPONENT[v] > ncomp {
-                ncomp = COMPONENT[v];
+            if pcx.component[v] > ncomp {
+                ncomp = pcx.component[v];
             }
         }
         let start = crate::base::alloc_array::<i64>(ncomp + 2);
         for v in 0..size {
-            start[COMPONENT[v] + 1] += 1;
+            start[pcx.component[v] + 1] += 1;
         }
         for c in 0..ncomp + 1 {
             start[c + 1] += start[c];
@@ -1163,7 +1119,7 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
         let order = crate::base::alloc_array::<i64>(size + 1);
         let fill = crate::base::alloc_array::<i64>(ncomp + 2);
         for v in 0..size {
-            let c = COMPONENT[v];
+            let c = pcx.component[v];
             order[start[c] + fill[c]] = v;
             fill[c] += 1;
         }
@@ -1178,16 +1134,16 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
             var iterate = false;
             for k in a..b {
                 let f = order[k];
-                if f < n && decl_of(f) == 0 && walkable(f) && view_fn(f)
-                    && (b - a > 1 || self_edge(f)) {
+                if f < n && decl_of(f, &pcx) == 0 && walkable(f, pcx) && view_fn(f, &pcx)
+                    && (b - a > 1 || self_edge(f, pcx)) {
                     iterate = true;
                 }
             }
             if !iterate {
                 for k in a..b {
                     let f = order[k];
-                    if f < n && walkable(f) {
-                        walk_kept(f, all, &ocx);
+                    if f < n && walkable(f, pcx) {
+                        walk_kept(f, all, &ocx, &pcx);
                     }
                 }
                 continue;
@@ -1195,8 +1151,8 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
             // (a recursive component: from the floor, until nothing grows)
             for k in a..b {
                 let f = order[k];
-                if f < n && walkable(f) && view_fn(f) && decl_of(f) == 0 {
-                    summary_store(f, start_summary(f));
+                if f < n && walkable(f, pcx) && view_fn(f, &pcx) && decl_of(f, &pcx) == 0 {
+                    summary_store(f, start_summary(f, &pcx), &pcx);
                 }
             }
             var round = 0;
@@ -1204,30 +1160,30 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
                 var changed = false;
                 for k in a..b {
                     let f = order[k];
-                    if f >= n || !walkable(f) || !view_fn(f) {
+                    if f >= n || !walkable(f, pcx) || !view_fn(f, &pcx) {
                         continue;
                     }
-                    let s = walk_fn(f, round, &ocx);
-                    own_discard();
-                    if decl_of(f) == 0 {
-                        let old = crate::front::own::summary::summary_stored(f);
+                    let s = walk_fn(f, round, &ocx, &pcx);
+                    own_discard(&pcx);
+                    if decl_of(f, &pcx) == 0 {
+                        let old = crate::front::own::summary::summary_stored(f, pcx);
                         let j = join_summary(old, s);
                         if !same_summary(j, old) {
-                            summary_store(f, j);
+                            summary_store(f, j, &pcx);
                             changed = true;
                         }
                     }
                 }
                 round += 1;
-                SCC_ROUNDS += 1;
+                pcx.scc_rounds += 1;
                 if !changed {
                     break;
                 }
                 if round >= MAX_ROUNDS {
                     for k in a..b {
                         let f = order[k];
-                        if f < n && walkable(f) && view_fn(f) && decl_of(f) == 0 {
-                            summary_store(f, top_summary());
+                        if f < n && walkable(f, pcx) && view_fn(f, &pcx) && decl_of(f, &pcx) == 0 {
+                            summary_store(f, top_summary(), &pcx);
                         }
                     }
                     break;
@@ -1237,17 +1193,17 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
             // of the last round)
             for k in a..b {
                 let f = order[k];
-                if f >= n || !walkable(f) || !all && !view_fn(f) {
+                if f >= n || !walkable(f, pcx) || !all && !view_fn(f, &pcx) {
                     continue;
                 }
-                walk_fn(f, round, &ocx);
-                own_flush();
+                walk_fn(f, round, &ocx, &pcx);
+                own_flush(&pcx);
             }
         }
         // (functions made after the effects' graph: none, usually)
-        for f in n..FN_COUNT {
-            if walkable(f) {
-                walk_kept(f, all, &ocx);
+        for f in n..pcx.fn_count {
+            if walkable(f, pcx) {
+                walk_kept(f, all, &ocx, &pcx);
             }
         }
     }
@@ -1256,24 +1212,22 @@ pub fn infer_summaries(all: bool, ocx: inout OwnCx) {
 // ---------------------------------------------------------------------------
 // --print-views
 
-pub static var PRINT_VIEWS: bool = false;
-
 // Every function's summary, a line each (`name: views(...)`), in FNS
 // order: the program's functions, instances and closures (not templates,
 // not std's own); like --print-effects.
-pub fn print_views(out: i64) {
+pub fn print_views(out: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        for f in 0..FN_COUNT {
-            if FNS[f].generic > 0 || FNS[f].node == 0
-                || FNS[f].module == crate::front::modules::STD_MODULE {
+        for f in 0..pcx.fn_count {
+            if pcx.fns[f].generic > 0 || pcx.fns[f].node == 0
+                || pcx.fns[f].module == pcx.std_module {
                 continue;
             }
-            if NODES[FNS[f].node].kind != NodeKind::Fn {
+            if pcx.nodes[pcx.fns[f].node].kind != NodeKind::Fn {
                 continue;
             }
-            buf_bytes(out, SYMS[FNS[f].display].text);
+            buf_bytes(out, SYMS[pcx.fns[f].display].text);
             buf_str(out, c": ");
-            summary_text(out, f, summary_of(f));
+            summary_text(out, f, summary_of(f, &pcx), &pcx);
             buf_str(out, c"\n");
         }
     }

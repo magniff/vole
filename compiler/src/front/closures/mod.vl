@@ -27,33 +27,31 @@ pub mod escape;
 pub mod scoped;
 
 use crate::base::{
-    FILES, IntVec, SRC, SYMS, alloc_array, buf_byte, buf_bytes, buf_fmt, buf_int, buf_new,
-    buf_slice, buf_str, free, grow, intern, intern_c,
+    SRC, SYMS, alloc_array, buf_byte, buf_bytes, buf_fmt, buf_int, buf_new, buf_slice, buf_str,
+    free, grow, intern, intern_c,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_sym, err_int, err_str,
-    err_sym, err_try_fmt, file_line_col,
+    err_begin, err_end, err_end_soft, err_fix, err_help, err_help_sym, err_int, err_str, err_sym,
+    err_try_fmt, file_line_col,
 };
 use crate::front::ast::{
-    CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
+    CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
     list_push, new_node,
 };
 use crate::front::check::{
-    CONST_CONTEXT, CUR_FN, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE, Res,
-    check_block, define_local, mismatch_error, pop_scope, push_scope, type_error,
+    Res, check_block, define_local, mismatch_error, pop_scope, push_scope, type_error,
 };
 use crate::front::check::collect::{add_fn, new_struct};
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::unsafety::{U_FN_VALUE, unsafe_op};
-use crate::front::closures::escape::{ANY_BORROW, check_scope_exit, type_borrow};
+use crate::front::closures::escape::{check_scope_exit, type_borrow};
 use crate::front::closures::fn_bounds::legacy_ref_param;
 use crate::front::lexer::Tok;
-use crate::front::modules::CUR_MOD;
-use crate::front::parser::UNDERSCORE;
 use crate::front::types::{
-    FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, REF_MUT, STRUCTS, TLISTS, TSCRATCH,
-    TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, is_ref,
-    make_type, ptr_to, struct_type, type_elem, type_size,
+    FIELDS, FieldInfo, REF_MUT, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind,
+    buf_type, err_type, is_pointer, is_ref, make_type, ptr_to, struct_type, type_elem, type_size,
 };
 
 // A closure: its Closure node, its function (FNS index), its env struct
@@ -75,103 +73,79 @@ pub struct ClosureInfo {
     sig: i64,
 }
 
-pub static var CLOSURES: *ClosureInfo = 0 as *ClosureInfo;
-pub static var CLOSURE_COUNT: i64 = 0;
-
-// (0.25) The closure main's body became (main_result_wrapper), or 0: the
-// own pass names it 'main'.
-pub static var MAIN_CLOSURE: i64 = 0;
-static var CLOSURE_CAP: i64 = 0;
-// The Fn nodes of the closures' functions, in check order: finish_program
-// appends them to the program after the instances.
-pub static var CLOSURE_FNS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The closures whose bodies are being checked, innermost last (restored
-// with the checker's state after an error).
-pub static var CLOSURE_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// (node, local) pairs: the uses of captured variables in the bodies being
-// checked; (local, by_ref) pairs: their captures.
-static var USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var CAPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The captures of the closures checked, (local, by_ref) pairs.
-pub static var CAPTURE_LIST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The name of the env parameter, which no source can write.
-static var ENV_SYM: i64 = 0;
-
 // What 0.14 parses but does not check yet: `error ... (check.unimplemented)`.
-pub fn unimplemented(pos: i64, what: *u8) -> ! {
-    err_begin(pos);
-    err_str(what);
-    err_str(c" are not implemented yet (check.unimplemented)");
-    err_end()
+pub fn unimplemented(pos: i64, what: *u8, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pos, &pcx);
+    err_str(what, pcx);
+    err_str(c" are not implemented yet (check.unimplemented)", pcx);
+    err_end(&pcx)
 }
 
 // ---- Checking a closure ----
 
 // Closure node n (in synth mode, expected = 0): its type, or `expected`
 // when it is a fn type the closure coerces to.
-pub fn check_closure(n: i64, expected: i64) -> i64 {
-    unsafe {
-        if NODES[n].x == 0 {
-            if CONST_CONTEXT {
-                type_error(n, c"a closure cannot be used in a constant expression");
-            }
-            let mark = TSCRATCH.count;
-            let count = NODES[n].count;
-            var ret = 0;
-            var sig = 0;
-            if expected != 0 && TYPES[expected].kind == TyKind::Fn && TYPES[expected].b == 0 {
-                sig = expected;
-            } else if expected != 0 && closure_of_type(expected) != 0 {
-                sig = CLOSURES[closure_of_type(expected) - 1].sig;
-            }
-            if sig != 0 && TYPES[sig].count != count {
-                err_begin(NODES[n].start);
-                err_str(c"this closure takes ");
-                err_int(count);
-                err_str(if count == 1 { c" parameter, but '" } else { c" parameters, but '" });
-                err_type(expected);
-                err_str(c"' takes ");
-                err_int(TYPES[sig].count);
-                err_end();
-            }
-            for i in 0..count {
-                TSCRATCH.push(if sig != 0 { type_elem(sig, i) } else { 0 });
-            }
-            if sig != 0 {
-                ret = TYPES[sig].a;
-            }
-            check_closure_sig(n, mark, ret);
+pub fn check_closure(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.nodes[n].x == 0 {
+        if pcx.const_context {
+            type_error(n, c"a closure cannot be used in a constant expression", &pcx);
         }
-        let t = CLOSURES[NODES[n].x - 1].ty;
-        if expected == 0 || expected == t || expected == TY_ERROR {
-            return t;
+        let mark = TSCRATCH.count;
+        let count = pcx.nodes[n].count;
+        var ret = 0;
+        var sig = 0;
+        if expected != 0 && TYPES[expected].kind == TyKind::Fn && TYPES[expected].b == 0 {
+            sig = expected;
+        } else if expected != 0 && closure_of_type(expected, pcx) != 0 {
+            sig = pcx.closures[closure_of_type(expected, pcx) - 1].sig;
         }
-        if coerce_closure(n, expected) {
-            return expected;
+        if sig != 0 && TYPES[sig].count != count {
+            err_begin(pcx.nodes[n].start, &pcx);
+            err_str(c"this closure takes ", pcx);
+            err_int(count, pcx);
+            err_str(if count == 1 { c" parameter, but '" } else { c" parameters, but '" }, pcx);
+            err_type(expected, pcx);
+            err_str(c"' takes ", pcx);
+            err_int(TYPES[sig].count, pcx);
+            err_end(&pcx);
         }
-        mismatch_error(n, expected, t)
+        for i in 0..count {
+            TSCRATCH.push(if sig != 0 { type_elem(sig, i) } else { 0 });
+        }
+        if sig != 0 {
+            ret = TYPES[sig].a;
+        }
+        check_closure_sig(n, mark, ret, &pcx);
     }
+    let t = pcx.closures[pcx.nodes[n].x - 1].ty;
+    if expected == 0 || expected == t || expected == pcx.ty_error {
+        return t;
+    }
+    if coerce_closure(n, expected, &pcx) {
+        return expected;
+    }
+    mismatch_error(n, expected, t, &pcx)
 }
 
 // The signature of closure node n: its parameters' types pushed to
 // TSCRATCH from `mark` (popped; 0: unknown, from the parameter's type
 // written), its result `ret` (0: from the body); its fn type. The body is
 // checked here, once.
-pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
+pub fn check_closure_sig(n: i64, mark: i64, ret: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if ENV_SYM == 0 {
-            ENV_SYM = intern_c(c"{env}");
+        if pcx.env_sym == 0 {
+            pcx.env_sym = intern_c(c"{env}");
         }
-        let count = NODES[n].count;
+        let count = pcx.nodes[n].count;
         // (0.24: this closure's item parameter borrows, drops::ITEM_BORROW;
         // not a closure inside it)
-        let item_at = crate::front::own::drops::ITEM_BORROW;
-        crate::front::own::drops::ITEM_BORROW = -1;
+        let item_at = pcx.item_borrow;
+        pcx.item_borrow = -1;
         // (0.25.4: the Fn bound its parameters are given by, for this
         // closure only, not one in its body)
-        let bound = crate::front::closures::fn_bounds::CLOSURE_BOUND;
-        let bound_name = crate::front::closures::fn_bounds::CLOSURE_BOUND_NAME;
-        crate::front::closures::fn_bounds::CLOSURE_BOUND = 0;
+        let bound = pcx.closure_bound;
+        let bound_name = pcx.closure_bound_name;
+        pcx.closure_bound = 0;
         let tys = alloc_array::<i64>(count + 1);
         // (0.20, §9.3) a 0.19 closure's `&T` parameter where 0.20's bound
         // gives the T itself (a let parameter of a copyable T): the closure
@@ -182,268 +156,270 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
             shim[i] = 0;
         }
         for i in 0..count {
-            let param = child(n, i);
+            let param = child(n, i, pcx);
             let wanted = if mark + i < TSCRATCH.count { TSCRATCH.data[mark + i] } else { 0 };
             var t = wanted;
-            if NODES[param].b != 0 {
-                t = resolve_type(NODES[param].b);
+            if pcx.nodes[param].b != 0 {
+                t = resolve_type(pcx.nodes[param].b, &pcx);
                 // (0.20) a closure's parameter written `a: T` in a 0.20 file,
                 // or `a: let T`: let, a copy or a reference by T
-                t = crate::front::conv::closure_param_type(param, t);
+                t = crate::front::conv::closure_param_type(param, t, &pcx);
                 if wanted > 0 && t > 0 && wanted != t && TYPES[t].kind == TyKind::Ptr
                     && TYPES[t].a == wanted && TYPES[wanted].kind != TyKind::Ptr
-                    && !crate::front::conv::strict_at(NODES[param].start) {
+                    && !crate::front::conv::strict_at(pcx.nodes[param].start, &pcx) {
                     if TYPES[t].b == 0 {
                         // (`*T`: the V4 error, its try: `&T`)
-                        raw_closure_param(NODES[param].b, t, t);
+                        raw_closure_param(pcx.nodes[param].b, t, t, &pcx);
                     }
                     shim[i] = 1;
                     t = wanted;
                 }
                 if legacy_ref_param(wanted, t) {
-                    raw_closure_param(NODES[param].b, wanted, t);
+                    raw_closure_param(pcx.nodes[param].b, wanted, t, &pcx);
                     t = wanted;
                 }
-                if bound != 0 && crate::front::closures::fn_bounds::same_but_convention(wanted, t) {
+                if bound != 0
+                    && crate::front::closures::fn_bounds::same_but_convention(wanted, t, pcx) {
                     crate::front::closures::fn_bounds::closure_param_conv_error(bound, bound_name,
-                        param, i, wanted);
+                        param, i, wanted, &pcx);
                 }
-                if wanted != 0 && wanted != t && wanted != TY_ERROR && t != TY_ERROR {
-                    mismatch_error(NODES[param].b, wanted, t);
+                if wanted != 0 && wanted != t && wanted != pcx.ty_error && t != pcx.ty_error {
+                    mismatch_error(pcx.nodes[param].b, wanted, t, &pcx);
                 }
             } else if wanted == 0 {
-                infer_param_error(param);
+                infer_param_error(param, &pcx);
             }
             tys[i] = t;
         }
         TSCRATCH.count = mark;
         var result = ret;
-        if NODES[n].b != 0 {
-            let written = resolve_type(NODES[n].b);
-            if ret != 0 && ret != written && ret != TY_ERROR && written != TY_ERROR {
-                mismatch_error(NODES[n].b, ret, written);
+        if pcx.nodes[n].b != 0 {
+            let written = resolve_type(pcx.nodes[n].b, &pcx);
+            if ret != 0 && ret != written && ret != pcx.ty_error && written != pcx.ty_error {
+                mismatch_error(pcx.nodes[n].b, ret, written, &pcx);
             }
             result = written;
         }
-        let body = NODES[n].a;
+        let body = pcx.nodes[n].a;
         if result == 0 {
-            let r = find_return(body);
+            let r = find_return(body, &pcx);
             if r != 0 {
-                err_begin(NODES[r].start);
-                let by_try = NODES[r].kind == NodeKind::Try;
+                err_begin(pcx.nodes[r].start, &pcx);
+                let by_try = pcx.nodes[r].kind == NodeKind::Try;
                 err_str(if by_try { c"a closure with '?' needs its result type written" }
-                    else { c"a closure with 'return' needs its result type written" });
-                err_help(c"write it: '|...| -> T { ... }'");
-                err_end();
+                    else { c"a closure with 'return' needs its result type written" }, pcx);
+                err_help(c"write it: '|...| -> T { ... }'", pcx);
+                err_end(&pcx);
             }
         }
-        let id = new_closure(n);
-        let f = CLOSURES[id].f;
+        let id = new_closure(n, &pcx);
+        let f = pcx.closures[id].f;
         // The body, as the closure's function: its own result type, and no
         // loop or deferred statement around it to leave.
-        CLOSURE_STACK.push(id);
-        let saved_ret = RETURN_TYPE;
-        let saved_base = LOOP_BASE;
-        RETURN_TYPE = if result != 0 { result } else { TY_UNIT };
-        LOOP_BASE = LOOP_STACK.count;
-        push_scope();
-        let env = define_local(ENV_SYM, 0, false, true);
-        LOCALS[env].borrow = true;
-        CLOSURES[id].mark = env;
-        CLOSURES[id].uses = USES.count;
-        CLOSURES[id].caps = CAPS.count;
+        pcx.closure_stack.push(id);
+        let saved_ret = pcx.return_type;
+        let saved_base = pcx.loop_base;
+        pcx.return_type = if result != 0 { result } else { TY_UNIT };
+        pcx.loop_base = pcx.loop_stack.count;
+        push_scope(&pcx);
+        let env = define_local(pcx.env_sym, 0, false, true, &pcx);
+        pcx.locals[env].borrow = true;
+        pcx.closures[id].mark = env;
+        pcx.closures[id].uses = pcx.uses.count;
+        pcx.closures[id].caps = pcx.caps.count;
         // The function's parameters: the closure's, a pattern bound by a
         // `let` at the start of the body from a hidden parameter.
         let params = alloc_array::<i64>(count + 1);
-        let lets = list_begin();
+        let lets = list_begin(pcx);
         var has_lets = false;
         for i in 0..count {
-            let param = child(n, i);
-            if NODES[param].d == 0 && shim[i] == 0 {
+            let param = child(n, i, pcx);
+            if pcx.nodes[param].d == 0 && shim[i] == 0 {
                 params[i] = param;
-                if NODES[param].a == UNDERSCORE {
-                    NODES[param].x = -1;
-                    if i != item_at && tys[i] > 0 && crate::front::own::glue::has_glue(tys[i]) {
+                if pcx.nodes[param].a == pcx.underscore {
+                    pcx.nodes[param].x = -1;
+                    if i != item_at && tys[i] > 0
+                        && crate::front::own::glue::has_glue(tys[i], &pcx) {
                         // (0.25.3: `|_|` given an owned value: a hidden
                         // local, dropped at the body's end, closure_param_drops)
                         let out = buf_new();
                         buf_str(out, c"{param");
                         buf_int(out, i);
                         buf_byte(out, '}');
-                        let hidden = new_node(NodeKind::Param, NODES[param].start,
-                            NODES[param].end);
-                        NODES[hidden].a = intern(buf_slice(out));
-                        NODES[hidden].x = define_local(NODES[hidden].a, tys[i], false, true);
+                        let hidden = new_node(NodeKind::Param, pcx.nodes[param].start,
+                            pcx.nodes[param].end, &pcx);
+                        pcx.nodes[hidden].a = intern(buf_slice(out));
+                        pcx.nodes[hidden].x = define_local(pcx.nodes[hidden].a, tys[i], false, true,
+                            &pcx);
                         params[i] = hidden;
                     }
                     continue;
                 }
-                let mutable = NODES[param].c != 0;
-                NODES[param].x = define_local(NODES[param].a, tys[i], mutable, true);
+                let mutable = pcx.nodes[param].c != 0;
+                pcx.nodes[param].x = define_local(pcx.nodes[param].a, tys[i], mutable, true, &pcx);
                 // (0.20) `|s: inout Sum|`: an access
-                let tn = NODES[param].b;
+                let tn = pcx.nodes[param].b;
                 // (Phase M: in a 0.20 file, an unwritten one whose bound
                 // lends it, `Fn(let T)` or `FnMut(inout T)`, and `|a: T|` of
                 // a T that borrows (closure_param_type), too)
                 if i == item_at {
-                    crate::front::own::drops::item_borrowed(NODES[param].x, n);
+                    crate::front::own::drops::item_borrowed(pcx.nodes[param].x, n, &pcx);
                 }
-                LOCALS[NODES[param].x].access = tys[i] > 0 && is_ref(tys[i])
-                    && (tn > 0 && (NODES[tn].p & CONV_NEW) != 0
-                        || crate::front::conv::strict_at(NODES[param].start));
+                pcx.locals[pcx.nodes[param].x].access = tys[i] > 0 && is_ref(tys[i])
+                    && (tn > 0 && (pcx.nodes[tn].p & CONV_NEW) != 0
+                        || crate::front::conv::strict_at(pcx.nodes[param].start, &pcx));
                 continue;
             }
-            let start = NODES[param].start;
-            let end = NODES[param].end;
+            let start = pcx.nodes[param].start;
+            let end = pcx.nodes[param].end;
             let out = buf_new();
             buf_str(out, c"{param");
             buf_int(out, i);
             buf_byte(out, '}');
             let name = intern(buf_slice(out));
-            let hidden = new_node(NodeKind::Param, start, end);
-            NODES[hidden].a = name;
-            NODES[hidden].x = define_local(name, tys[i], false, true);
+            let hidden = new_node(NodeKind::Param, start, end, &pcx);
+            pcx.nodes[hidden].a = name;
+            pcx.nodes[hidden].x = define_local(name, tys[i], false, true, &pcx);
             if i == item_at {
                 // (0.24: a pattern's item, `|(i, v)|`: its hidden parameter
                 // borrows, so its bindings do)
-                crate::front::own::drops::item_borrowed(NODES[hidden].x, n);
+                crate::front::own::drops::item_borrowed(pcx.nodes[hidden].x, n, &pcx);
             }
             params[i] = hidden;
-            var init = new_node(NodeKind::Ident, start, end);
-            NODES[init].a = name;
-            var pattern = NODES[param].d;
+            var init = new_node(NodeKind::Ident, start, end, &pcx);
+            pcx.nodes[init].a = name;
+            var pattern = pcx.nodes[param].d;
             if shim[i] != 0 {
                 // (`let x = &{param};`)
-                let amp = new_node(NodeKind::Unary, start, end);
-                NODES[amp].op = Tok::Amp;
-                NODES[amp].b = init;
+                let amp = new_node(NodeKind::Unary, start, end, &pcx);
+                pcx.nodes[amp].op = Tok::Amp;
+                pcx.nodes[amp].b = init;
                 init = amp;
-                pattern = new_node(NodeKind::PatBind, start, end);
-                NODES[pattern].a = NODES[param].a;
+                pattern = new_node(NodeKind::PatBind, start, end, &pcx);
+                pcx.nodes[pattern].a = pcx.nodes[param].a;
             }
-            let binding = new_node(NodeKind::Let, start, end);
-            NODES[binding].a = pattern;
-            NODES[binding].c = init;
-            list_push(binding);
+            let binding = new_node(NodeKind::Let, start, end, &pcx);
+            pcx.nodes[binding].a = pattern;
+            pcx.nodes[binding].c = init;
+            list_push(binding, &pcx);
             has_lets = true;
         }
         var fn_body = body;
-        if has_lets || NODES[body].kind != NodeKind::Block {
-            fn_body = new_node(NodeKind::Block, NODES[body].start, NODES[body].end);
-            NODES[fn_body].a = body;
-            list_end(fn_body, lets);
+        if has_lets || pcx.nodes[body].kind != NodeKind::Block {
+            fn_body = new_node(NodeKind::Block, pcx.nodes[body].start, pcx.nodes[body].end, &pcx);
+            pcx.nodes[fn_body].a = body;
+            list_end(fn_body, lets, &pcx);
         }
-        let body_ty = check_block(fn_body, result);
+        let body_ty = check_block(fn_body, result, &pcx);
         if result == 0 {
             result = if body_ty == TY_NEVER { TY_UNIT } else { body_ty };
-        } else if body_ty != result && body_ty != TY_NEVER && body_ty != TY_ERROR
-            && result != TY_ERROR {
-            err_begin(NODES[body].start);
-            err_str(c"the closure's body has type '");
-            err_type(body_ty);
-            err_str(c"', expected '");
-            err_type(result);
-            err_str(c"'");
-            err_end();
+        } else if body_ty != result && body_ty != TY_NEVER && body_ty != pcx.ty_error
+            && result != pcx.ty_error {
+            err_begin(pcx.nodes[body].start, &pcx);
+            err_str(c"the closure's body has type '", pcx);
+            err_type(body_ty, pcx);
+            err_str(c"', expected '", pcx);
+            err_type(result, pcx);
+            err_str(c"'", pcx);
+            err_end(&pcx);
         }
-        pop_scope();
-        RETURN_TYPE = saved_ret;
-        LOOP_BASE = saved_base;
-        CLOSURE_STACK.count -= 1;
+        pop_scope(&pcx);
+        pcx.return_type = saved_ret;
+        pcx.loop_base = saved_base;
+        pcx.closure_stack.count -= 1;
         // (what it returns may not borrow its own locals)
-        check_scope_exit(result, env, NODES[body].start);
-        finish_closure(id, fn_body, params, tys, result);
+        check_scope_exit(result, env, pcx.nodes[body].start, &pcx);
+        finish_closure(id, fn_body, params, tys, result, &pcx);
         free(params as *u8);
         free(tys as *u8);
         free(shim as *u8);
-        CLOSURES[id].sig
+        pcx.closures[id].sig
     }
 }
 
 // (0.18.1, V4) A closure's parameter written `*T` (type node `ty`) where
 // the bound wants `&T` or `&mut T`: until 0.18.1 the reference, now a raw
 // pointer. The try: is the annotation as a reference (`fix --suggested`).
-fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
-    err_begin(NODES[ty].start);
-    err_str(c"closure parameter of type '");
-    err_type(t);
-    err_str(c"' where '");
+fn raw_closure_param(ty: i64, wanted: i64, t: i64, pcx: inout Ctx<Comp>) {
+    err_begin(pcx.nodes[ty].start, &pcx);
+    err_str(c"closure parameter of type '", pcx);
+    err_type(t, pcx);
+    err_str(c"' where '", pcx);
     // (wanted == t: the bound gives the value, which `&T` reads, 0.20)
-    err_type(if wanted == t { TYPES[t].a } else { wanted });
-    err_str(c"' is wanted");
-    err_help(c"a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's");
-    let rest = SRC[NODES[ty].start + 1..NODES[ty].end];
+    err_type(if wanted == t { TYPES[t].a } else { wanted }, pcx);
+    err_str(c"' is wanted", pcx);
+    err_help(c"a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's", pcx);
+    let rest = SRC[pcx.nodes[ty].start + 1..pcx.nodes[ty].end];
     let text = buf_new();
     if TYPES[wanted].b == REF_MUT {
         buf_fmt(text, format_args("&mut {rest}"));
     } else {
         buf_fmt(text, format_args("&{rest}"));
     }
-    err_try_fmt(format_args("{}", buf_slice(text)));
-    err_fix(NODES[ty].start, NODES[ty].end, buf_slice(text));
+    err_try_fmt(format_args("{}", buf_slice(text)), pcx);
+    err_fix(pcx.nodes[ty].start, pcx.nodes[ty].end, buf_slice(text), &pcx);
     // (soft: every parameter of the closure gets its fix in one run)
-    err_end_soft();
+    err_end_soft(&pcx);
 }
 
-fn infer_param_error(param: i64) -> ! {
-    err_begin(NODES[param].start);
-    if NODES[param].d == 0 {
-        err_str(c"cannot infer the type of closure parameter '");
-        err_sym(NODES[param].a);
-        err_str(c"'");
-        err_help(c"write its type: '|");
-        err_help_sym(NODES[param].a);
-        err_help(c": i64| ...'");
+fn infer_param_error(param: i64, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[param].start, &pcx);
+    if pcx.nodes[param].d == 0 {
+        err_str(c"cannot infer the type of closure parameter '", pcx);
+        err_sym(pcx.nodes[param].a, pcx);
+        err_str(c"'", pcx);
+        err_help(c"write its type: '|", pcx);
+        err_help_sym(pcx.nodes[param].a, pcx);
+        err_help(c": i64| ...'", pcx);
     } else {
-        err_str(c"cannot infer the type of this closure parameter");
-        if NODES[NODES[param].d].kind == NodeKind::PatWild {
-            err_help(c"write its type: '|_: i64| ...'");
+        err_str(c"cannot infer the type of this closure parameter", pcx);
+        if pcx.nodes[pcx.nodes[param].d].kind == NodeKind::PatWild {
+            err_help(c"write its type: '|_: i64| ...'", pcx);
         } else {
-            err_help(c"write its type: '|(a, b): (i64, i64)| ...'");
+            err_help(c"write its type: '|(a, b): (i64, i64)| ...'", pcx);
         }
     }
-    err_end()
+    err_end(&pcx)
 }
 
 // A new closure for node n, with its function (its signature is set by
 // finish_closure).
-fn new_closure(n: i64) -> i64 {
+fn new_closure(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        CLOSURES = grow(CLOSURES, CLOSURE_COUNT, &CLOSURE_CAP);
-        let id = CLOSURE_COUNT;
-        CLOSURE_COUNT += 1;
-        let encl = if CLOSURE_STACK.count > 0 {
-            CLOSURES[CLOSURE_STACK.data[CLOSURE_STACK.count - 1]].f
+        let id = pcx.closures.len() as i64;
+        let encl = if pcx.closure_stack.count > 0 {
+            pcx.closures[pcx.closure_stack.data[pcx.closure_stack.count - 1]].f
         } else {
-            CUR_FN
+            pcx.cur_fn
         };
         // Its symbol: closure k of the function with symbol S is `S.k`.
         var k = 0;
         for i in 0..id {
-            if CLOSURES[i].encl_fn == encl {
+            if pcx.closures[i].encl_fn == encl {
                 k += 1;
             }
         }
         let out = buf_new();
         if encl >= 0 {
-            buf_bytes(out, SYMS[FNS[encl].name].text);
+            buf_bytes(out, SYMS[pcx.fns[encl].name].text);
         } else {
             buf_str(out, c"closure");
         }
         buf_byte(out, '.');
         buf_int(out, k);
         let sym = intern(buf_slice(out));
-        let item = new_node(NodeKind::Fn, NODES[n].start, NODES[n].end);
-        NODES[item].a = sym;
-        NODES[item].p = FN_CLOSURE;
-        add_fn(item, sym, sym);
-        let f = FN_COUNT - 1;
-        FNS[f].module = CUR_MOD;
-        CLOSURES[id] = ClosureInfo {
+        let item = new_node(NodeKind::Fn, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[item].a = sym;
+        pcx.nodes[item].p = FN_CLOSURE;
+        add_fn(item, sym, sym, &pcx);
+        let f = pcx.fn_count - 1;
+        pcx.fns[f].module = pcx.cur_mod;
+        pcx.closures.push(ClosureInfo {
             node: n, f: f, env_struct: -1, encl_fn: encl, captures: 0, capture_count: 0,
-            writes: false, borrow_depth: -1, write_local: -1, mark: LOCAL_COUNT, uses: USES.count,
-            caps: CAPS.count, ty: 0, sig: 0,
-        };
+            writes: false, borrow_depth: -1, write_local: -1, mark: pcx.local_count,
+            uses: pcx.uses.count,
+            caps: pcx.caps.count, ty: 0, sig: 0,
+        });
         id
     }
 }
@@ -451,47 +427,49 @@ fn new_closure(n: i64) -> i64 {
 // After the body of closure `id`: its captures and their modes, its env
 // struct and type, the uses rewritten, the env literal its node lowers
 // to, and its function's signature.
-fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
+fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let n = CLOSURES[id].node;
-        let f = CLOSURES[id].f;
-        let env = CLOSURES[id].mark;
-        let is_move = (NODES[n].c & CLOSURE_MOVE) != 0;
+        let n = pcx.closures[id].node;
+        let f = pcx.closures[id].f;
+        let env = pcx.closures[id].mark;
+        let is_move = (pcx.nodes[n].c & CLOSURE_MOVE) != 0;
         if !is_move {
-            upgrade_captures(id, fn_body);
+            upgrade_captures(id, fn_body, &pcx);
         }
         // The signature.
-        let count = NODES[n].count;
+        let count = pcx.nodes[n].count;
         let sig_mark = TSCRATCH.count;
         for i in 0..count {
             TSCRATCH.push(tys[i]);
         }
         let sig = make_type(TyKind::Fn, result, 0, sig_mark);
-        CLOSURES[id].sig = sig;
+        pcx.closures[id].sig = sig;
         // The captures, kept; the env struct.
-        let caps = CLOSURES[id].caps;
-        let capture_count = (CAPS.count - caps) / 2;
-        CLOSURES[id].captures = CAPTURE_LIST.count;
-        CLOSURES[id].capture_count = capture_count;
-        for i in caps..CAPS.count {
-            CAPTURE_LIST.push(CAPS.data[i]);
+        let caps = pcx.closures[id].caps;
+        let capture_count = (pcx.caps.count - caps) / 2;
+        pcx.closures[id].captures = pcx.capture_list.count;
+        pcx.closures[id].capture_count = capture_count;
+        for i in caps..pcx.caps.count {
+            pcx.capture_list.push(pcx.caps.data[i]);
         }
-        let s = new_struct(n, closure_name(n, sig), FNS[f].name, CUR_MOD);
-        STRUCTS[s].repr = 0;
-        STRUCTS[s].align = 0;
-        STRUCTS[s].closure = id + 1;
-        STRUCTS[s].fields = FIELD_COUNT;
-        STRUCTS[s].field_count = capture_count;
+        let s = new_struct(n, closure_name(n, sig, &pcx), pcx.fns[f].name, pcx.cur_mod, &pcx);
+        pcx.structs[s].repr = 0;
+        pcx.structs[s].align = 0;
+        pcx.structs[s].closure = id + 1;
+        pcx.structs[s].fields = pcx.field_count;
+        pcx.structs[s].field_count = capture_count;
         var borrow = -1;
         for j in 0..capture_count {
-            let local = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j];
-            let by_ref = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] != 0;
-            let local_ty = LOCALS[local].ty;
+            let local = pcx.capture_list.data[pcx.closures[id].captures + 2 * j];
+            let by_ref = pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] != 0;
+            let local_ty = pcx.locals[local].ty;
             let field_ty = if by_ref { ptr_to(local_ty) } else { local_ty };
-            FIELDS = grow(FIELDS, FIELD_COUNT, &FIELD_CAP);
-            FIELDS[FIELD_COUNT] = FieldInfo { name: LOCALS[local].name, ty: field_ty, offset: 0 };
-            FIELD_COUNT += 1;
-            let b = if by_ref { local } else { type_borrow(local_ty) };
+            FIELDS = grow(FIELDS, pcx.field_count, &pcx.field_cap);
+            FIELDS[pcx.field_count] = FieldInfo {
+                name: pcx.locals[local].name, ty: field_ty, offset: 0,
+            };
+            pcx.field_count += 1;
+            let b = if by_ref { local } else { type_borrow(local_ty, &pcx) };
             if b > borrow {
                 borrow = b;
             }
@@ -501,147 +479,148 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
         // skips it, and a second move is a run-time failure), front/own.
         if is_move {
             for j in 0..capture_count {
-                let local = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j];
-                if CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] == 0
-                    && crate::front::own::glue::has_glue(LOCALS[local].ty) {
-                    FIELDS = grow(FIELDS, FIELD_COUNT, &FIELD_CAP);
-                    FIELDS[FIELD_COUNT] = FieldInfo {
-                        name: crate::front::own::glue::live_flag(LOCALS[local].name), ty: TY_BOOL,
+                let local = pcx.capture_list.data[pcx.closures[id].captures + 2 * j];
+                if pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] == 0
+                    && crate::front::own::glue::has_glue(pcx.locals[local].ty, &pcx) {
+                    FIELDS = grow(FIELDS, pcx.field_count, &pcx.field_cap);
+                    FIELDS[pcx.field_count] = FieldInfo {
+                        name: crate::front::own::glue::live_flag(pcx.locals[local].name),
+                        ty: TY_BOOL,
                         offset: 0,
                     };
-                    FIELD_COUNT += 1;
-                    STRUCTS[s].field_count += 1;
+                    pcx.field_count += 1;
+                    pcx.structs[s].field_count += 1;
                 }
             }
         }
         let ty = struct_type(s);
-        CLOSURES[id].env_struct = s;
-        CLOSURES[id].ty = ty;
-        CLOSURES[id].borrow_depth = borrow;
+        pcx.closures[id].env_struct = s;
+        pcx.closures[id].ty = ty;
+        pcx.closures[id].borrow_depth = borrow;
         if borrow >= 0 {
-            ANY_BORROW = true;
+            pcx.any_borrow = true;
         }
         let env_ty = ptr_to(ty);
-        LOCALS[env].ty = env_ty;
+        pcx.locals[env].ty = env_ty;
         // The uses, rewritten to the env's fields.
-        var u = CLOSURES[id].uses;
-        while u < USES.count {
-            rewrite_use(id, USES.data[u], USES.data[u + 1], env, env_ty);
+        var u = pcx.closures[id].uses;
+        while u < pcx.uses.count {
+            rewrite_use(id, pcx.uses.data[u], pcx.uses.data[u + 1], env, env_ty, &pcx);
             u += 2;
         }
         // Done with the body: what is left on the stacks is the enclosing
         // closure's.
-        USES.count = CLOSURES[id].uses;
-        CAPS.count = caps;
+        pcx.uses.count = pcx.closures[id].uses;
+        pcx.caps.count = caps;
         // The env literal, whose uses are the enclosing closure's.
-        let start = NODES[n].start;
-        let end = NODES[n].end;
-        let lit = new_node(NodeKind::StructLit, start, end);
-        let inits = list_begin();
+        let start = pcx.nodes[n].start;
+        let end = pcx.nodes[n].end;
+        let lit = new_node(NodeKind::StructLit, start, end, &pcx);
+        let inits = list_begin(pcx);
         for j in 0..capture_count {
-            let local = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j];
-            let by_ref = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] != 0;
-            let ident = new_node(NodeKind::Ident, start, end);
-            NODES[ident].a = LOCALS[local].name;
-            NODES[ident].res = Res::Local;
-            NODES[ident].y = local;
-            NODES[ident].ty = LOCALS[local].ty;
+            let local = pcx.capture_list.data[pcx.closures[id].captures + 2 * j];
+            let by_ref = pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] != 0;
+            let ident = new_node(NodeKind::Ident, start, end, &pcx);
+            pcx.nodes[ident].a = pcx.locals[local].name;
+            pcx.nodes[ident].res = Res::Local;
+            pcx.nodes[ident].y = local;
+            pcx.nodes[ident].ty = pcx.locals[local].ty;
             var value = ident;
             if by_ref {
-                value = new_node(NodeKind::Unary, start, end);
-                NODES[value].op = Tok::Amp;
-                NODES[value].b = ident;
-                NODES[value].ty = ptr_to(LOCALS[local].ty);
+                value = new_node(NodeKind::Unary, start, end, &pcx);
+                pcx.nodes[value].op = Tok::Amp;
+                pcx.nodes[value].b = ident;
+                pcx.nodes[value].ty = ptr_to(pcx.locals[local].ty);
                 // (0.25) a capture it writes: an inout access, held while the
                 // closure lives (conventions.md §5.4)
-                if CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] == 2 {
-                    NODES[value].p |= crate::front::ast::NODE_REF_MUT;
+                if pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] == 2 {
+                    pcx.nodes[value].p |= crate::front::ast::NODE_REF_MUT;
                 }
             }
-            let init = new_node(NodeKind::FieldInit, start, end);
-            NODES[init].a = LOCALS[local].name;
-            NODES[init].b = value;
-            NODES[init].x = j;
-            NODES[init].ty = (*struct_field_of(s, j)).ty;
-            list_push(init);
-            note_local_use(ident, local);
+            let init = new_node(NodeKind::FieldInit, start, end, &pcx);
+            pcx.nodes[init].a = pcx.locals[local].name;
+            pcx.nodes[init].b = value;
+            pcx.nodes[init].x = j;
+            pcx.nodes[init].ty = (*struct_field_of(s, j, pcx)).ty;
+            list_push(init, &pcx);
+            note_local_use(ident, local, &pcx);
         }
-        for j in capture_count..STRUCTS[s].field_count {
+        for j in capture_count..pcx.structs[s].field_count {
             // (the flags: true)
-            let flag = new_node(NodeKind::Bool, start, end);
-            NODES[flag].a = 1;
-            NODES[flag].ty = TY_BOOL;
-            let init = new_node(NodeKind::FieldInit, start, end);
-            NODES[init].a = (*struct_field_of(s, j)).name;
-            NODES[init].b = flag;
-            NODES[init].x = j;
-            NODES[init].ty = TY_BOOL;
-            list_push(init);
+            let flag = new_node(NodeKind::Bool, start, end, &pcx);
+            pcx.nodes[flag].a = 1;
+            pcx.nodes[flag].ty = TY_BOOL;
+            let init = new_node(NodeKind::FieldInit, start, end, &pcx);
+            pcx.nodes[init].a = (*struct_field_of(s, j, pcx)).name;
+            pcx.nodes[init].b = flag;
+            pcx.nodes[init].x = j;
+            pcx.nodes[init].ty = TY_BOOL;
+            list_push(init, &pcx);
         }
-        list_end(lit, inits);
-        NODES[lit].ty = ty;
-        NODES[n].x = id + 1;
-        NODES[n].y = lit;
-        NODES[n].ty = ty;
+        list_end(lit, inits, &pcx);
+        pcx.nodes[lit].ty = ty;
+        pcx.nodes[n].x = id + 1;
+        pcx.nodes[n].y = lit;
+        pcx.nodes[n].ty = ty;
         // The function: [env: *Env] when it captures, then the parameters.
-        let item = FNS[f].node;
-        let mark = list_begin();
+        let item = pcx.fns[f].node;
+        let mark = list_begin(pcx);
         let types = TSCRATCH.count;
         if capture_count > 0 {
-            let env_param = new_node(NodeKind::Param, start, end);
-            NODES[env_param].a = ENV_SYM;
-            NODES[env_param].x = env;
-            list_push(env_param);
+            let env_param = new_node(NodeKind::Param, start, end, &pcx);
+            pcx.nodes[env_param].a = pcx.env_sym;
+            pcx.nodes[env_param].x = env;
+            list_push(env_param, &pcx);
             TSCRATCH.push(env_ty);
         }
         for i in 0..count {
-            list_push(params[i]);
+            list_push(params[i], &pcx);
             TSCRATCH.push(tys[i]);
         }
-        list_end(item, mark);
-        FNS[f].params = TLISTS.count;
-        FNS[f].param_count = TSCRATCH.count - types;
+        list_end(item, mark, &pcx);
+        pcx.fns[f].params = TLISTS.count;
+        pcx.fns[f].param_count = TSCRATCH.count - types;
         for i in types..TSCRATCH.count {
             TLISTS.push(TSCRATCH.data[i]);
         }
         TSCRATCH.count = types;
-        FNS[f].ret = result;
-        FNS[f].display = STRUCTS[s].name;
-        NODES[item].c = fn_body;
-        CLOSURE_FNS.push(item);
+        pcx.fns[f].ret = result;
+        pcx.fns[f].display = pcx.structs[s].name;
+        pcx.nodes[item].c = fn_body;
+        pcx.closure_fns.push(item);
         // (0.16: the #[scoped] rules)
-        scoped::check_closure(id);
+        scoped::check_closure(id, &pcx);
     }
 }
 
-fn struct_field_of(s: i64, i: i64) -> *FieldInfo {
-    unsafe { &FIELDS[STRUCTS[s].fields + i] }
+fn struct_field_of(s: i64, i: i64, pcx: Ctx<Comp>) -> *FieldInfo {
+    unsafe { &FIELDS[pcx.structs[s].fields + i] }
 }
 
 // `closure(i64) -> i64 at f.vl:4:15`: the name of a closure's type.
-fn closure_name(n: i64, sig: i64) -> i64 {
+fn closure_name(n: i64, sig: i64, pcx: inout Ctx<Comp>) -> i64 {
     let out = buf_new();
     buf_str(out, c"closure(");
     for i in 0..TYPES[sig].count {
         if i > 0 {
             buf_str(out, c", ");
         }
-        buf_type(out, type_elem(sig, i));
+        buf_type(out, type_elem(sig, i), pcx);
     }
     buf_str(out, c") -> ");
-    buf_type(out, TYPES[sig].a);
+    buf_type(out, TYPES[sig].a, pcx);
     buf_str(out, c" at ");
-    let pos = NODES[n].start;
+    let pos = pcx.nodes[n].start;
     var file = 0;
-    while file + 1 < FILES.len() as i64 && pos >= FILES[file + 1].start {
+    while file + 1 < pcx.files.len() as i64 && pos >= pcx.files[file + 1].start {
         file += 1;
     }
     // (0.16: the line from the file's line starts, by halves; it was
     // counted from the file's start for each closure. 0.25: diag's
     // line index, shared)
     var col = 1;
-    let line = file_line_col(file, pos, &col);
-    buf_str(out, FILES[file].path);
+    let line = file_line_col(file, pos, &col, &pcx);
+    buf_str(out, pcx.files[file].path);
     buf_byte(out, ':');
     buf_int(out, line);
     buf_byte(out, ':');
@@ -651,7 +630,7 @@ fn closure_name(n: i64, sig: i64) -> i64 {
 
 // A use of a captured local, Ident node `node`, becomes `(*env).x` (by
 // value) or `*(*env).x` (by reference).
-fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64) {
+fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         // (0.20: the checker may have wrapped the Ident since, its content
         // moved to a node under it: `&x` for a let argument that borrows
@@ -659,58 +638,58 @@ fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64) {
         // `x[..]` for a container given as a slice)
         var node = used;
         var depth = 0;
-        while depth < 4 && NODES[node].kind != NodeKind::Ident {
-            let k = NODES[node].kind;
-            if k == NodeKind::Unary && NODES[node].b > 0 {
-                node = NODES[node].b;
-            } else if (k == NodeKind::Index || k == NodeKind::MethodCall) && NODES[node].a > 0 {
+        while depth < 4 && pcx.nodes[node].kind != NodeKind::Ident {
+            let k = pcx.nodes[node].kind;
+            if k == NodeKind::Unary && pcx.nodes[node].b > 0 {
+                node = pcx.nodes[node].b;
+            } else if (k == NodeKind::Index || k == NodeKind::MethodCall) && pcx.nodes[node].a > 0 {
                 // (0.25: a container given as a slice or as text, `first(v)`,
                 // is `v.as_slice()`: check_mode::coerce_text)
-                node = NODES[node].a;
-            } else if k == NodeKind::Call && NODES[node].count > 0 {
+                node = pcx.nodes[node].a;
+            } else if k == NodeKind::Call && pcx.nodes[node].count > 0 {
                 // (0.25: `v[..]` of a Vec is std's `as_slice(&v)` once checked)
-                node = child(node, 0);
+                node = child(node, 0, pcx);
             } else {
                 break;
             }
             depth += 1;
         }
-        if NODES[node].kind != NodeKind::Ident || NODES[node].res != Res::Local
-            || NODES[node].y != local {
+        if pcx.nodes[node].kind != NodeKind::Ident || pcx.nodes[node].res != Res::Local
+            || pcx.nodes[node].y != local {
             return;
         }
         var j = 0;
-        while j < CLOSURES[id].capture_count
-            && CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j] != local {
+        while j < pcx.closures[id].capture_count
+            && pcx.capture_list.data[pcx.closures[id].captures + 2 * j] != local {
             j += 1;
         }
-        let by_ref = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] != 0;
-        let start = NODES[node].start;
-        let end = NODES[node].end;
-        let base = new_node(NodeKind::Ident, start, end);
-        NODES[base].a = ENV_SYM;
-        NODES[base].res = Res::Local;
-        NODES[base].y = env;
-        NODES[base].ty = env_ty;
-        let name = LOCALS[local].name;
+        let by_ref = pcx.capture_list.data[pcx.closures[id].captures + 2 * j + 1] != 0;
+        let start = pcx.nodes[node].start;
+        let end = pcx.nodes[node].end;
+        let base = new_node(NodeKind::Ident, start, end, &pcx);
+        pcx.nodes[base].a = pcx.env_sym;
+        pcx.nodes[base].res = Res::Local;
+        pcx.nodes[base].y = env;
+        pcx.nodes[base].ty = env_ty;
+        let name = pcx.locals[local].name;
         var field = node;
         if by_ref {
-            field = new_node(NodeKind::FieldAccess, start, end);
-            NODES[field].ty = ptr_to(LOCALS[local].ty);
-            NODES[node].kind = NodeKind::Unary;
-            NODES[node].op = Tok::Star;
-            NODES[node].a = 0;
-            NODES[node].b = field;
+            field = new_node(NodeKind::FieldAccess, start, end, &pcx);
+            pcx.nodes[field].ty = ptr_to(pcx.locals[local].ty);
+            pcx.nodes[node].kind = NodeKind::Unary;
+            pcx.nodes[node].op = Tok::Star;
+            pcx.nodes[node].a = 0;
+            pcx.nodes[node].b = field;
         } else {
-            NODES[node].kind = NodeKind::FieldAccess;
+            pcx.nodes[node].kind = NodeKind::FieldAccess;
         }
-        NODES[field].a = base;
-        NODES[field].b = name;
-        NODES[field].x = j;
-        NODES[field].y = 1;
-        NODES[node].res = Res::None;
-        NODES[node].p |= NODE_CAPTURE;
-        NODES[node].d = local + 1;
+        pcx.nodes[field].a = base;
+        pcx.nodes[field].b = name;
+        pcx.nodes[field].x = j;
+        pcx.nodes[field].y = 1;
+        pcx.nodes[node].res = Res::None;
+        pcx.nodes[node].p |= NODE_CAPTURE;
+        pcx.nodes[node].d = local + 1;
     }
 }
 
@@ -718,76 +697,76 @@ fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64) {
 
 // A use of local `local` by Ident n (synth_name): a capture when it is
 // declared outside the closure being checked.
-pub fn note_local_use(n: i64, local: i64) {
+pub fn note_local_use(n: i64, local: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if CLOSURE_STACK.count == 0 {
+        if pcx.closure_stack.count == 0 {
             return;
         }
-        let id = CLOSURE_STACK.data[CLOSURE_STACK.count - 1];
-        if local >= CLOSURES[id].mark {
+        let id = pcx.closure_stack.data[pcx.closure_stack.count - 1];
+        if local >= pcx.closures[id].mark {
             return;
         }
-        USES.push(n);
-        USES.push(local);
-        var i = CLOSURES[id].caps;
-        while i < CAPS.count {
-            if CAPS.data[i] == local {
+        pcx.uses.push(n);
+        pcx.uses.push(local);
+        var i = pcx.closures[id].caps;
+        while i < pcx.caps.count {
+            if pcx.caps.data[i] == local {
                 return;
             }
             i += 2;
         }
-        CAPS.push(local);
-        CAPS.push(if captured_by_ref(id, local) { 1 } else { 0 });
+        pcx.caps.push(local);
+        pcx.caps.push(if captured_by_ref(id, local, pcx) { 1 } else { 0 });
     }
 }
 
 // The mode of a capture, per variable: see the header.
-fn captured_by_ref(id: i64, local: i64) -> bool {
+fn captured_by_ref(id: i64, local: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) != 0 {
+        if (pcx.nodes[pcx.closures[id].node].c & CLOSURE_MOVE) != 0 {
             return false;
         }
         // (0.20: a sink parameter is mutable, but captured as a let is, by
         // value, until the closure writes it: note_local_write, and
         // upgrade_captures for one whose address it takes)
-        if LOCALS[local].mutable && !LOCALS[local].is_sink {
+        if pcx.locals[local].mutable && !pcx.locals[local].is_sink {
             return true;
         }
-        let t = LOCALS[local].ty;
-        t != 0 && t != TY_ERROR && type_size(t) > 32
+        let t = pcx.locals[local].ty;
+        t != 0 && t != pcx.ty_error && type_size(t, pcx) > 32
     }
 }
 
 // An assignment to local `local` or to a part of it (check_assign): the
 // closures that capture it write it.
-pub fn note_local_write(local: i64) {
+pub fn note_local_write(local: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..CLOSURE_STACK.count {
-            let id = CLOSURE_STACK.data[i];
-            if local < CLOSURES[id].mark {
-                CLOSURES[id].writes = true;
+        for i in 0..pcx.closure_stack.count {
+            let id = pcx.closure_stack.data[i];
+            if local < pcx.closures[id].mark {
+                pcx.closures[id].writes = true;
                 // (0.25) a capture by reference it writes: 2, its env holds
                 // an inout access (finish_closure)
-                var w = CLOSURES[id].caps;
-                while w < CAPS.count {
-                    if CAPS.data[w] == local && CAPS.data[w + 1] == 1 {
-                        CAPS.data[w + 1] = 2;
+                var w = pcx.closures[id].caps;
+                while w < pcx.caps.count {
+                    if pcx.caps.data[w] == local && pcx.caps.data[w + 1] == 1 {
+                        pcx.caps.data[w + 1] = 2;
                     }
                     w += 2;
                 }
-                if LOCALS[local].is_sink {
+                if pcx.locals[local].is_sink {
                     // (0.20: a sink parameter written: by reference)
-                    var k = CLOSURES[id].caps;
-                    while k < CAPS.count {
-                        if CAPS.data[k] == local
-                            && (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) == 0 {
-                            CAPS.data[k + 1] = 2;
+                    var k = pcx.closures[id].caps;
+                    while k < pcx.caps.count {
+                        if pcx.caps.data[k] == local
+                            && (pcx.nodes[pcx.closures[id].node].c & CLOSURE_MOVE) == 0 {
+                            pcx.caps.data[k + 1] = 2;
                         }
                         k += 2;
                     }
                 }
-                if CLOSURES[id].write_local < 0 {
-                    CLOSURES[id].write_local = local;
+                if pcx.closures[id].write_local < 0 {
+                    pcx.closures[id].write_local = local;
                 }
             }
         }
@@ -797,32 +776,32 @@ pub fn note_local_write(local: i64) {
 // An immutable variable the closure takes the address of (`&x`, `&x.f`,
 // the receiver of a `self: *T` method) may be changed through it: it is
 // captured by reference, so that the change is the variable's.
-fn upgrade_captures(id: i64, n: i64) {
+fn upgrade_captures(id: i64, n: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         if n == 0 {
             return;
         }
-        let kind = NODES[n].kind;
+        let kind = pcx.nodes[n].kind;
         // (not the `&f` of a call of a captured closure f that keeps no
         // state of its own: a copy is called the same)
-        let operand = if kind == NodeKind::Unary { NODES[n].b } else { 0 };
-        let callee = if operand != 0 { closure_of_type(NODES[operand].ty) } else { 0 };
-        if kind == NodeKind::Unary && NODES[n].op == Tok::Amp
-            && (callee == 0 || CLOSURES[callee - 1].writes) {
+        let operand = if kind == NodeKind::Unary { pcx.nodes[n].b } else { 0 };
+        let callee = if operand != 0 { closure_of_type(pcx.nodes[operand].ty, pcx) } else { 0 };
+        if kind == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp
+            && (callee == 0 || pcx.closures[callee - 1].writes) {
             var place = operand;
-            while NODES[place].kind == NodeKind::FieldAccess && NODES[place].y == 0
-                || NODES[place].kind == NodeKind::TupleField
-                || NODES[place].kind == NodeKind::Index && NODES[NODES[place].a].ty != 0
-                && TYPES[NODES[NODES[place].a].ty].kind == TyKind::Array {
-                place = NODES[place].a;
+            while pcx.nodes[place].kind == NodeKind::FieldAccess && pcx.nodes[place].y == 0
+                || pcx.nodes[place].kind == NodeKind::TupleField
+                || pcx.nodes[place].kind == NodeKind::Index && pcx.nodes[pcx.nodes[place].a].ty != 0
+                && TYPES[pcx.nodes[pcx.nodes[place].a].ty].kind == TyKind::Array {
+                place = pcx.nodes[place].a;
             }
-            if NODES[place].kind == NodeKind::Ident && NODES[place].res == Res::Local {
-                let local = NODES[place].y;
-                var i = CLOSURES[id].caps;
-                while i < CAPS.count {
+            if pcx.nodes[place].kind == NodeKind::Ident && pcx.nodes[place].res == Res::Local {
+                let local = pcx.nodes[place].y;
+                var i = pcx.closures[id].caps;
+                while i < pcx.caps.count {
                     // (2, a capture it writes, stays)
-                    if CAPS.data[i] == local && CAPS.data[i + 1] == 0 {
-                        CAPS.data[i + 1] = 1;
+                    if pcx.caps.data[i] == local && pcx.caps.data[i + 1] == 0 {
+                        pcx.caps.data[i + 1] = 1;
                     }
                     i += 2;
                 }
@@ -830,73 +809,73 @@ fn upgrade_captures(id: i64, n: i64) {
         }
         if kind == NodeKind::Closure {
             // (its env literal: what it borrows, this closure must too)
-            upgrade_captures(id, NODES[n].y);
+            upgrade_captures(id, pcx.nodes[n].y, &pcx);
             return;
         }
-        walk_kids(n, id, false);
+        walk_kids(n, id, false, &pcx);
     }
 }
 
 // The first `return` in expression n, not inside a nested closure (0:
 // none).
-fn find_return(n: i64) -> i64 {
-    if n == 0 || NODES[n].kind == NodeKind::Closure {
+fn find_return(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if n == 0 || pcx.nodes[n].kind == NodeKind::Closure {
         return 0;
     }
     // (0.15: `e?` returns too)
-    if NODES[n].kind == NodeKind::Return || NODES[n].kind == NodeKind::Try {
+    if pcx.nodes[n].kind == NodeKind::Return || pcx.nodes[n].kind == NodeKind::Try {
         return n;
     }
-    walk_kids(n, 0, true)
+    walk_kids(n, 0, true, &pcx)
 }
 
 // The expressions and statements under n (not its patterns or types):
 // find_return for each (the first found), or upgrade_captures of closure
 // `id`.
-fn walk_kids(n: i64, id: i64, returns: bool) -> i64 {
-    let kind = NODES[n].kind;
+fn walk_kids(n: i64, id: i64, returns: bool, pcx: inout Ctx<Comp>) -> i64 {
+    let kind = pcx.nodes[n].kind;
     var kids: [i64; 4] = [0; 4];
     match kind {
         NodeKind::Cast | NodeKind::Return | NodeKind::ExprStmt
             | NodeKind::Call | NodeKind::Match | NodeKind::MethodCall | NodeKind::FieldAccess
             | NodeKind::TupleField | NodeKind::Block | NodeKind::EnumPanic | NodeKind::Defer
-            | NodeKind::VecOp => kids[0] = NODES[n].a,
+            | NodeKind::VecOp => kids[0] = pcx.nodes[n].a,
         NodeKind::Index | NodeKind::Repeat | NodeKind::Range => {
-            kids[0] = NODES[n].a;
-            kids[1] = NODES[n].b;
+            kids[0] = pcx.nodes[n].a;
+            kids[1] = pcx.nodes[n].b;
         }
         NodeKind::If => {
-            kids[0] = NODES[n].a;
-            kids[1] = NODES[n].b;
-            kids[2] = NODES[n].c;
+            kids[0] = pcx.nodes[n].a;
+            kids[1] = pcx.nodes[n].b;
+            kids[2] = pcx.nodes[n].c;
         }
         NodeKind::Loop | NodeKind::Break | NodeKind::Unary | NodeKind::FieldInit => {
-            kids[0] = NODES[n].b;
+            kids[0] = pcx.nodes[n].b;
         }
         NodeKind::While | NodeKind::Assign | NodeKind::Binary => {
-            kids[0] = NODES[n].b;
-            kids[1] = NODES[n].c;
+            kids[0] = pcx.nodes[n].b;
+            kids[1] = pcx.nodes[n].c;
         }
-        NodeKind::Let => kids[0] = NODES[n].c,
+        NodeKind::Let => kids[0] = pcx.nodes[n].c,
         NodeKind::Arm => {
-            kids[0] = NODES[n].b;
-            kids[1] = NODES[n].c;
+            kids[0] = pcx.nodes[n].b;
+            kids[1] = pcx.nodes[n].c;
         }
         NodeKind::For => {
-            kids[0] = NODES[n].c;
-            kids[1] = NODES[n].d;
+            kids[0] = pcx.nodes[n].c;
+            kids[1] = pcx.nodes[n].d;
         }
         _ => {}
     }
     for k in 0..4 {
         if kids[k] != 0 {
             if returns {
-                let r = find_return(kids[k]);
+                let r = find_return(kids[k], &pcx);
                 if r != 0 {
                     return r;
                 }
             } else {
-                upgrade_captures(id, kids[k]);
+                upgrade_captures(id, kids[k], &pcx);
             }
         }
     }
@@ -904,14 +883,14 @@ fn walk_kids(n: i64, id: i64, returns: bool) -> i64 {
         NodeKind::Call | NodeKind::MethodCall | NodeKind::Block | NodeKind::Match
             | NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit
             | NodeKind::VecOp => {
-            for i in 0..NODES[n].count {
+            for i in 0..pcx.nodes[n].count {
                 if returns {
-                    let r = find_return(child(n, i));
+                    let r = find_return(child(n, i, pcx), &pcx);
                     if r != 0 {
                         return r;
                     }
                 } else {
-                    upgrade_captures(id, child(n, i));
+                    upgrade_captures(id, child(n, i, pcx), &pcx);
                 }
             }
         }
@@ -923,26 +902,26 @@ fn walk_kids(n: i64, id: i64, returns: bool) -> i64 {
 // ---- Types and calls ----
 
 // The closure (its id + 1) whose type t is, or 0.
-pub fn closure_of_type(t: i64) -> i64 {
+pub fn closure_of_type(t: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if t <= 0 || TYPES[t].kind != TyKind::Struct {
             return 0;
         }
-        STRUCTS[TYPES[t].a].closure
+        pcx.structs[TYPES[t].a].closure
     }
 }
 
 // (0.25) Whether closure type t holds an inout access: a capture by
 // reference it writes (conventions.md §5.4: held from the closure's
 // creation to its last use; the closure is a move-only view).
-pub fn closure_holds_inout(t: i64) -> bool {
+pub fn closure_holds_inout(t: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let c = closure_of_type(t) - 1;
+        let c = closure_of_type(t, pcx) - 1;
         if c < 0 {
             return false;
         }
-        for j in 0..CLOSURES[c].capture_count {
-            if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] == 2 {
+        for j in 0..pcx.closures[c].capture_count {
+            if pcx.capture_list.data[pcx.closures[c].captures + 2 * j + 1] == 2 {
                 return true;
             }
         }
@@ -952,125 +931,124 @@ pub fn closure_holds_inout(t: i64) -> bool {
 
 // The fn type of closure c (its id): `fn(params) -> result`, without the
 // env.
-pub fn closure_sig(c: i64) -> i64 {
-    unsafe { CLOSURES[c].sig }
+pub fn closure_sig(c: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.closures[c].sig
 }
 
 // Call n of a value of closure type `ty` (synth_call): a direct call of
 // the closure's function, with `&callee` first when it captures; its
 // result type.
-pub fn closure_call(n: i64, ty: i64) -> i64 {
-    unsafe {
-        let c = closure_of_type(ty) - 1;
-        let sig = CLOSURES[c].sig;
-        let f = CLOSURES[c].f;
-        let count = NODES[n].count;
-        if count != TYPES[sig].count {
-            err_begin(NODES[n].start);
-            err_str(c"this closure takes ");
-            err_int(TYPES[sig].count);
-            err_str(c" arguments, got ");
-            err_int(count);
-            err_end();
-        }
-        let callee = NODES[n].a;
-        if (NODES[CLOSURES[c].node].c & CLOSURE_MOVE) != 0 && CLOSURES[c].writes {
-            // (0.25) a sink closure that changes what it owns (FnMut): a
-            // call changes the closure, which must be mutable: a var, an
-            // inout or sink parameter, not a let binding or a let access
-            crate::front::check::assign::check_closure_call_place(callee, n);
-        }
-        let mark = list_begin();
-        if CLOSURES[c].capture_count > 0 {
-            let env = new_node(NodeKind::Unary, NODES[callee].start, NODES[callee].end);
-            NODES[env].op = Tok::Amp;
-            NODES[env].b = callee;
-            NODES[env].ty = ptr_to(ty);
-            list_push(env);
-        }
-        let node = CLOSURES[c].node;
-        for i in 0..count {
-            let arg = child(n, i);
-            let param_ty = type_elem(sig, i);
-            // (0.25.4) a `let` parameter lends a value with no place as a
-            // temporary of the statement, as a function's does
-            let p = child(node, i);
-            let lets = crate::front::conv::closure_param_lets(p);
-            crate::front::generics::check_param_arg(arg, param_ty, lets);
-            list_push(arg);
-        }
-        list_end(n, mark);
-        NODES[n].a = 0;
-        NODES[n].x = f + 1;
-        TYPES[sig].a
+pub fn closure_call(n: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let c = closure_of_type(ty, pcx) - 1;
+    let sig = pcx.closures[c].sig;
+    let f = pcx.closures[c].f;
+    let count = pcx.nodes[n].count;
+    if count != TYPES[sig].count {
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"this closure takes ", pcx);
+        err_int(TYPES[sig].count, pcx);
+        err_str(c" arguments, got ", pcx);
+        err_int(count, pcx);
+        err_end(&pcx);
     }
+    let callee = pcx.nodes[n].a;
+    if (pcx.nodes[pcx.closures[c].node].c & CLOSURE_MOVE) != 0 && pcx.closures[c].writes {
+        // (0.25) a sink closure that changes what it owns (FnMut): a
+        // call changes the closure, which must be mutable: a var, an
+        // inout or sink parameter, not a let binding or a let access
+        crate::front::check::assign::check_closure_call_place(callee, n, &pcx);
+    }
+    let mark = list_begin(pcx);
+    if pcx.closures[c].capture_count > 0 {
+        let env = new_node(NodeKind::Unary, pcx.nodes[callee].start, pcx.nodes[callee].end, &pcx);
+        pcx.nodes[env].op = Tok::Amp;
+        pcx.nodes[env].b = callee;
+        pcx.nodes[env].ty = ptr_to(ty);
+        list_push(env, &pcx);
+    }
+    let node = pcx.closures[c].node;
+    for i in 0..count {
+        let arg = child(n, i, pcx);
+        let param_ty = type_elem(sig, i);
+        // (0.25.4) a `let` parameter lends a value with no place as a
+        // temporary of the statement, as a function's does
+        let p = child(node, i, pcx);
+        let lets = crate::front::conv::closure_param_lets(p, &pcx);
+        crate::front::generics::check_param_arg(arg, param_ty, lets, &pcx);
+        list_push(arg, &pcx);
+    }
+    list_end(n, mark, &pcx);
+    pcx.nodes[n].a = 0;
+    pcx.nodes[n].x = f + 1;
+    TYPES[sig].a
 }
 
 // Expression n, of a closure type, where fn type `expected` is wanted:
 // whether it coerces (a non-capturing closure becomes its function). A
 // capturing closure is an error.
-pub fn coerce_closure(n: i64, expected: i64) -> bool {
+pub fn coerce_closure(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
         if expected <= 0 || TYPES[expected].kind != TyKind::Fn || TYPES[expected].b != 0 {
             return false;
         }
-        let c = closure_of_type(NODES[n].ty) - 1;
-        if c < 0 || CLOSURES[c].sig != expected {
+        let c = closure_of_type(pcx.nodes[n].ty, pcx) - 1;
+        if c < 0 || pcx.closures[c].sig != expected {
             return false;
         }
-        if CLOSURES[c].capture_count > 0 {
-            err_begin(NODES[n].start);
-            err_str(c"a closure that captures variables cannot be a '");
-            err_type(expected);
-            err_str(c"' (it captures '");
-            err_sym(LOCALS[CAPTURE_LIST.data[CLOSURES[c].captures]].name);
-            err_str(c"')");
-            err_help(c"make the parameter generic: `fn apply<F: Fn(");
+        if pcx.closures[c].capture_count > 0 {
+            err_begin(pcx.nodes[n].start, &pcx);
+            err_str(c"a closure that captures variables cannot be a '", pcx);
+            err_type(expected, pcx);
+            err_str(c"' (it captures '", pcx);
+            err_sym(pcx.locals[pcx.capture_list.data[pcx.closures[c].captures]].name, pcx);
+            err_str(c"')", pcx);
+            err_help(c"make the parameter generic: `fn apply<F: Fn(", pcx);
             for i in 0..TYPES[expected].count {
                 if i > 0 {
-                    err_help(c", ");
+                    err_help(c", ", pcx);
                 }
-                buf_type(ERR_HELP, type_elem(expected, i));
+                buf_type(pcx.err_help, type_elem(expected, i), pcx);
             }
-            err_help(c") -> ");
-            buf_type(ERR_HELP, TYPES[expected].a);
-            err_help(c">(f: F)`");
-            err_end();
+            err_help(c") -> ", pcx);
+            buf_type(pcx.err_help, TYPES[expected].a, pcx);
+            err_help(c">(f: F)`", pcx);
+            err_end(&pcx);
         }
-        let f = CLOSURES[c].f;
-        let node = CLOSURES[c].node;
-        for i in 0..NODES[node].count {
-            let param = child(node, i);
-            if is_pointer(type_elem(expected, i)) && NODES[param].d == 0 && NODES[param].c == 0 {
-                unsafe_op(n, U_FN_VALUE, c"using a closure with pointer parameters as a 'fn' value is unsafe (its callers are not checked)");
+        let f = pcx.closures[c].f;
+        let node = pcx.closures[c].node;
+        for i in 0..pcx.nodes[node].count {
+            let param = child(node, i, pcx);
+            if is_pointer(type_elem(expected, i)) && pcx.nodes[param].d == 0
+                && pcx.nodes[param].c == 0 {
+                unsafe_op(n, U_FN_VALUE, c"using a closure with pointer parameters as a 'fn' value is unsafe (its callers are not checked)", &pcx);
                 break;
             }
         }
-        let value = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
-        NODES[value].a = FNS[f].name;
-        NODES[value].res = Res::Fn;
-        NODES[value].y = f;
-        NODES[value].ty = expected;
-        let kind = NODES[n].kind;
+        let value = new_node(NodeKind::Ident, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+        pcx.nodes[value].a = pcx.fns[f].name;
+        pcx.nodes[value].res = Res::Fn;
+        pcx.nodes[value].y = f;
+        pcx.nodes[value].ty = expected;
+        let kind = pcx.nodes[n].kind;
         if kind == NodeKind::Closure {
-            NODES[n].y = value;
+            pcx.nodes[n].y = value;
         } else if kind == NodeKind::Ident {
             // (a variable holding the closure: nothing to evaluate)
-            NODES[n] = NODES[value];
+            pcx.nodes[n] = pcx.nodes[value];
         } else {
             // `{ n; f }`
-            let copy = new_node(kind, NODES[n].start, NODES[n].end);
-            NODES[copy] = NODES[n];
-            let stmt = new_node(NodeKind::ExprStmt, NODES[n].start, NODES[n].end);
-            NODES[stmt].a = copy;
-            NODES[stmt].b = 1;
-            let block = new_node(NodeKind::Block, NODES[n].start, NODES[n].end);
-            let mark = list_begin();
-            list_push(stmt);
-            list_end(block, mark);
-            NODES[block].a = value;
-            NODES[block].ty = expected;
-            NODES[n] = NODES[block];
+            let copy = new_node(kind, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+            pcx.nodes[copy] = pcx.nodes[n];
+            let stmt = new_node(NodeKind::ExprStmt, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+            pcx.nodes[stmt].a = copy;
+            pcx.nodes[stmt].b = 1;
+            let block = new_node(NodeKind::Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+            let mark = list_begin(pcx);
+            list_push(stmt, &pcx);
+            list_end(block, mark, &pcx);
+            pcx.nodes[block].a = value;
+            pcx.nodes[block].ty = expected;
+            pcx.nodes[n] = pcx.nodes[block];
         }
         true
     }

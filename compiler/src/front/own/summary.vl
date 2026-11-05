@@ -24,20 +24,18 @@
 // type E comes only from parameters that can hold an E there (casts
 // excepted, 0.25.3: cast_mask, declared or inferred).
 
-use crate::base::{
-    IntVec, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern_c,
-};
+use crate::base::{SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::report_error_once;
-use crate::front::ast::{FN_CLOSURE, NODES, NodeKind, child};
-use crate::front::check::LOCALS;
-use crate::front::closures::{CAPTURE_LIST, CLOSURES, CLOSURE_COUNT};
+use crate::front::ast::{FN_CLOSURE, NodeKind, child};
 use crate::front::effects::infer::template_of;
 use crate::front::own::ctx::OwnCx;
 use crate::front::own::infer::{filter_summary, param_carries};
 use crate::front::own::kinds::{P_MUT, P_MUT_VIEW, is_view_type, param_mode};
 use crate::front::parser::items::attrs::{STORES_FORM, views_of};
-use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
-use crate::front::types::{FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TYPES, TyKind, fn_param};
+use crate::front::traits::{impl_of_fn, trait_fn};
+use crate::front::types::{REF_MUT, REF_SHARED, TYPES, TyKind, fn_param};
 
 pub const S_L1_P: i64 = 0;
 pub const S_L1_STAR: i64 = 1;
@@ -87,122 +85,112 @@ pub fn summary_within(a: ViewSummary, b: ViewSummary) -> bool {
     true
 }
 
-// Inferred summaries (infer.vl): per function, 8 masks and a state (0:
-// none, 1: inferred).
-static var STORED: *i64 = 0 as *i64;
-static var STORED_N: i64 = 0;
-
 // Records f's inferred summary (infer.vl's driver).
-pub fn summary_store(f: i64, s: ViewSummary) {
+pub fn summary_store(f: i64, s: ViewSummary, pcx: inout Ctx<Comp>) {
     unsafe {
         if f < 0 {
             return;
         }
-        if STORED_N <= f {
-            let n = FN_COUNT + 64;
+        if pcx.stored_n <= f {
+            let n = pcx.fn_count + 64;
             let a = crate::base::alloc_array::<i64>(n * 9);
-            for i in 0..STORED_N * 9 {
-                a[i] = STORED[i];
+            for i in 0..pcx.stored_n * 9 {
+                a[i] = pcx.stored[i];
             }
-            STORED = a;
-            STORED_N = n;
+            pcx.stored = a;
+            pcx.stored_n = n;
         }
         let o = f * 9;
         for k in 0..4 {
-            STORED[o + k] = s.ret[k];
-            STORED[o + 4 + k] = s.sto[k];
+            pcx.stored[o + k] = s.ret[k];
+            pcx.stored[o + 4 + k] = s.sto[k];
         }
-        STORED[o + 8] = if s.top { 2 } else { 1 };
+        pcx.stored[o + 8] = if s.top { 2 } else { 1 };
     }
 }
 
 // Whether f has an inferred summary.
-pub fn summary_inferred(f: i64) -> bool {
-    unsafe { f >= 0 && f < STORED_N && STORED[f * 9 + 8] != 0 }
+pub fn summary_inferred(f: i64, pcx: Ctx<Comp>) -> bool {
+    unsafe { f >= 0 && f < pcx.stored_n && pcx.stored[f * 9 + 8] != 0 }
 }
 
 // f's inferred summary as stored (no filter), empty when there is none.
-pub fn summary_stored(f: i64) -> ViewSummary {
+pub fn summary_stored(f: i64, pcx: Ctx<Comp>) -> ViewSummary {
     unsafe {
-        if !summary_inferred(f) {
+        if !summary_inferred(f, pcx) {
             return empty_summary();
         }
         let o = f * 9;
         ViewSummary {
-            ret: [STORED[o], STORED[o + 1], STORED[o + 2], STORED[o + 3]],
-            sto: [STORED[o + 4], STORED[o + 5], STORED[o + 6], STORED[o + 7]],
-            top: STORED[o + 8] == 2, declared: false,
+            ret: [pcx.stored[o], pcx.stored[o + 1], pcx.stored[o + 2], pcx.stored[o + 3]],
+            sto: [pcx.stored[o + 4], pcx.stored[o + 5], pcx.stored[o + 6], pcx.stored[o + 7]],
+            top: pcx.stored[o + 8] == 2, declared: false,
         }
     }
 }
 
 // Forgets the inferred summaries (a program checked again: `query`'s
 // second reading).
-pub fn summary_reset() {
+pub fn summary_reset(pcx: inout Ctx<Comp>) {
     unsafe {
-        for i in 0..STORED_N * 9 {
-            STORED[i] = 0;
+        for i in 0..pcx.stored_n * 9 {
+            pcx.stored[i] = 0;
         }
-        CASTS.count = 0;
+        pcx.casts.count = 0;
     }
 }
 
-// (0.25.3) Per function, the parameters (bit i) whose loans its body
-// passed through a cast to a view (infer::col_cast), joined over its
-// walks: cast_mask keeps them past the type filter.
-static var CASTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
-pub fn summary_store_casts(f: i64, m: i64) {
+pub fn summary_store_casts(f: i64, m: i64, pcx: inout Ctx<Comp>) {
     if f < 0 || m == 0 {
         return;
     }
-    while CASTS.count <= f {
-        CASTS.push(0);
+    while pcx.casts.count <= f {
+        pcx.casts.push(0);
     }
-    CASTS.set(f, CASTS.get(f) | m);
+    pcx.casts.set(f, pcx.casts.get(f) | m);
 }
 
 // f's cast parameters (summary_store_casts), 0: none.
-fn casts_of(f: i64) -> i64 {
-    if f >= 0 && f < CASTS.count { CASTS.get(f) } else { 0 }
+fn casts_of(f: i64, pcx: Ctx<Comp>) -> i64 {
+    if f >= 0 && f < pcx.casts.count { pcx.casts.get(f) } else { 0 }
 }
 
 // The summary callers of f use: its declaration, else what infer.vl
 // inferred, else the parametric floor of a generic result, else top; each
 // narrowed by the type filter.
-pub fn summary_of(f: i64) -> ViewSummary {
+pub fn summary_of(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
-        if f < 0 || f >= FN_COUNT {
+        if f < 0 || f >= pcx.fn_count {
             return top_summary();
         }
         // (a result that holds no views, and no `&mut` parameter to store
         // into: views() by its type)
-        if !view_fn(f) {
+        if !view_fn(f, &pcx) {
             return empty_summary();
         }
-        if decl_of(f) != 0 {
+        if decl_of(f, &pcx) != 0 {
             // (0.25.3) with its casts: parameters it names that the type
             // filter drops (cast_mask)
-            var s = filter_summary(f, declared_summary(f));
-            s.ret[S_L1_P] |= cast_mask(f, FNS[f].ret);
+            var s = filter_summary(f, declared_summary(f, &pcx), &pcx);
+            s.ret[S_L1_P] |= cast_mask(f, pcx.fns[f].ret, &pcx);
             return s;
         }
-        if f < STORED_N && STORED[f * 9 + 8] != 0 {
+        if f < pcx.stored_n && pcx.stored[f * 9 + 8] != 0 {
             let o = f * 9;
             var s = filter_summary(f, ViewSummary {
-                ret: [STORED[o], STORED[o + 1], STORED[o + 2], STORED[o + 3]],
-                sto: [STORED[o + 4], STORED[o + 5], STORED[o + 6], STORED[o + 7]],
-                top: STORED[o + 8] == 2, declared: false,
-            });
+                ret: [pcx.stored[o], pcx.stored[o + 1], pcx.stored[o + 2], pcx.stored[o + 3]],
+                sto: [pcx.stored[o + 4], pcx.stored[o + 5], pcx.stored[o + 6], pcx.stored[o + 7]],
+                top: pcx.stored[o + 8] == 2, declared: false,
+            }, &pcx);
             // (0.25.3) with the casts its body passes on (cast_mask)
-            s.ret[S_L1_P] |= cast_mask(f, FNS[f].ret);
+            s.ret[S_L1_P] |= cast_mask(f, pcx.fns[f].ret, &pcx);
             return s;
         }
-        if FNS[f].is_extern {
+        if pcx.fns[f].is_extern {
             // (C returns raw pointers: no loans)
             return empty_summary();
         }
-        filter_summary(f, floor_summary(f))
+        filter_summary(f, floor_summary(f, &pcx), &pcx)
     }
 }
 
@@ -217,52 +205,51 @@ pub fn summary_of(f: i64) -> ViewSummary {
 // gpu::f32s(buf.map_read(dev)) }` views `buf`. Their level 1 is kept, by
 // summary_of and by a call (calls::on_call adds their loans past the
 // per-place filter, and passes them on: infer::col_cast); 0: none.
-pub fn cast_mask(f: i64, ret: i64) -> i64 {
-    if f < 0 || f >= FN_COUNT || !is_view_type(ret) {
+pub fn cast_mask(f: i64, ret: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if f < 0 || f >= pcx.fn_count || !is_view_type(ret, &pcx) {
         return 0;
     }
-    if decl_of(f) != 0 {
-        let d = declared_summary(f);
-        let s = filter_summary(f, d);
+    if decl_of(f, &pcx) != 0 {
+        let d = declared_summary(f, &pcx);
+        let s = filter_summary(f, d, &pcx);
         return d.ret[S_L1_P] & ~(s.ret[S_L1_P] | s.ret[S_L1_STAR]);
     }
-    let c = casts_of(f);
+    let c = casts_of(f, pcx);
     if c == 0 {
         return 0;
     }
-    let st = summary_stored(f);
-    let s = filter_summary(f, st);
+    let st = summary_stored(f, pcx);
+    let s = filter_summary(f, st, &pcx);
     (st.ret[S_L1_P] | st.ret[S_L1_STAR]) & c & ~(s.ret[S_L1_P] | s.ret[S_L1_STAR])
 }
 
 // Whether f's summary can be other than views(): its result holds views,
 // or it has a `&mut` parameter whose referent can hold some (memoized:
 // summary_of asks it at every call).
-pub fn view_fn(f: i64) -> bool {
+pub fn view_fn(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if f >= VIEW_FN_N {
-            let n = FN_COUNT + 64;
+        if f >= pcx.view_fn_n {
+            let n = pcx.fn_count + 64;
             let a = crate::base::alloc_array::<i64>(n);
-            for i in 0..VIEW_FN_N {
-                a[i] = VIEW_FN[i];
+            for i in 0..pcx.view_fn_n {
+                a[i] = pcx.view_fn[i];
             }
-            VIEW_FN = a;
-            VIEW_FN_N = n;
+            pcx.view_fn = a;
+            pcx.view_fn_n = n;
         }
-        if VIEW_FN[f] == 0 {
-            VIEW_FN[f] = if is_view_type(FNS[f].ret) || has_mut_ref_param(f) { 2 } else { 1 };
+        if pcx.view_fn[f] == 0 {
+            pcx.view_fn[f] = if is_view_type(pcx.fns[f].ret, &pcx)
+                || has_mut_ref_param(f, &pcx) { 2 }
+                else { 1 };
         }
-        VIEW_FN[f] == 2
+        pcx.view_fn[f] == 2
     }
 }
 
-static var VIEW_FN: *i64 = 0 as *i64;
-static var VIEW_FN_N: i64 = 0;
-
-pub fn has_mut_ref_param(f: i64) -> bool {
+pub fn has_mut_ref_param(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        for i in 0..FNS[f].param_count {
-            if store_param(f, i) {
+        for i in 0..pcx.fns[f].param_count {
+            if store_param(f, i, &pcx) {
                 return true;
             }
         }
@@ -272,14 +259,14 @@ pub fn has_mut_ref_param(f: i64) -> bool {
 
 // Whether parameter type t is a pointer to something that holds views, or
 // a `&mut [T]` of view elements: a referent stores can go into.
-pub fn is_mut_ref(t: i64) -> bool {
+pub fn is_mut_ref(t: i64, pcx: inout Ctx<Comp>) -> bool {
     if t <= 0 {
         return false;
     }
     if TYPES[t].kind == TyKind::Ptr {
-        return TYPES[t].b != REF_SHARED && is_view_type(TYPES[t].a);
+        return TYPES[t].b != REF_SHARED && is_view_type(TYPES[t].a, &pcx);
     }
-    TYPES[t].kind == TyKind::Slice && TYPES[t].b == REF_MUT && is_view_type(TYPES[t].a)
+    TYPES[t].kind == TyKind::Slice && TYPES[t].b == REF_MUT && is_view_type(TYPES[t].a, &pcx)
 }
 
 // Whether parameter mode m writes what the argument points into: a
@@ -293,68 +280,61 @@ pub fn is_mut_mode(m: i64) -> bool {
 // hold or borrow views: the body reads and changes the captured
 // variables through it, so the walk takes it as an `inout` parameter
 // (its stores are checked, own.escape, and summarized).
-pub fn env_param(f: i64, i: i64) -> bool {
+pub fn env_param(f: i64, i: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        if i != 0 || f < 0 || FNS[f].param_count == 0 || FNS[f].node <= 0
-            || (NODES[FNS[f].node].p & FN_CLOSURE) == 0 {
+        if i != 0 || f < 0 || pcx.fns[f].param_count == 0 || pcx.fns[f].node <= 0
+            || (pcx.nodes[pcx.fns[f].node].p & FN_CLOSURE) == 0 {
             return false;
         }
-        let t = fn_param(f, 0);
+        let t = fn_param(f, 0, pcx);
         if t <= 0 || TYPES[t].kind != TyKind::Ptr {
             return false;
         }
         let e = TYPES[t].a;
-        e > 0 && TYPES[e].kind == TyKind::Struct && STRUCTS[TYPES[e].a].closure != 0
-            && is_view_type(e)
+        e > 0 && TYPES[e].kind == TyKind::Struct && pcx.structs[TYPES[e].a].closure != 0
+            && is_view_type(e, &pcx)
     }
 }
 
 // Whether parameter i of f holds a closure by value whose captures hold or
 // borrow views (an `F` of a generic function's instance): calling it may
 // store into what it captures, so stores go into it (store_param).
-pub fn closure_param(f: i64, i: i64) -> bool {
+pub fn closure_param(f: i64, i: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let t = fn_param(f, i);
-        t > 0 && TYPES[t].kind == TyKind::Struct && STRUCTS[TYPES[t].a].closure != 0
-            && is_view_type(t)
+        let t = fn_param(f, i, pcx);
+        t > 0 && TYPES[t].kind == TyKind::Struct && pcx.structs[TYPES[t].a].closure != 0
+            && is_view_type(t, &pcx)
     }
 }
 
-// The closure (a CLOSURES index) whose function f is, or -1 (memoized:
-// the last one asked).
-static var CLOSURE_OF_F: i64 = -1;
-static var CLOSURE_OF_C: i64 = -1;
-
-pub fn closure_of_fn(f: i64) -> i64 {
-    unsafe {
-        if f == CLOSURE_OF_F {
-            return CLOSURE_OF_C;
-        }
-        var c = -1;
-        for i in 0..CLOSURE_COUNT {
-            if CLOSURES[i].f == f {
-                c = i;
-            }
-        }
-        CLOSURE_OF_F = f;
-        CLOSURE_OF_C = c;
-        c
+pub fn closure_of_fn(f: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if f == pcx.closure_of_f {
+        return pcx.closure_of_c;
     }
+    var c = -1;
+    for i in 0..pcx.closures.len() as i64 {
+        if pcx.closures[i].f == f {
+            c = i;
+        }
+    }
+    pcx.closure_of_f = f;
+    pcx.closure_of_c = c;
+    c
 }
 
 // Whether field sym of closure function f's env holds a capture by
 // reference (a pointer to the captured variable, `*(*env).x`): what the
 // env's views point into, `*env`, not the env itself.
-pub fn env_ref_field(f: i64, sym: i64) -> bool {
+pub fn env_ref_field(f: i64, sym: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let c = closure_of_fn(f);
+        let c = closure_of_fn(f, &pcx);
         if c < 0 {
             return false;
         }
-        for j in 0..CLOSURES[c].capture_count {
-            let l = CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j];
-            if LOCALS[l].name == sym {
-                return CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] != 0;
+        for j in 0..pcx.closures[c].capture_count {
+            let l = pcx.capture_list.data[pcx.closures[c].captures + 2 * j];
+            if pcx.locals[l].name == sym {
+                return pcx.capture_list.data[pcx.closures[c].captures + 2 * j + 1] != 0;
             }
         }
         false
@@ -362,15 +342,15 @@ pub fn env_ref_field(f: i64, sym: i64) -> bool {
 }
 
 // Whether closure function f captures local l by reference.
-pub fn captures_by_ref(f: i64, l: i64) -> bool {
+pub fn captures_by_ref(f: i64, l: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        let c = closure_of_fn(f);
+        let c = closure_of_fn(f, &pcx);
         if c < 0 {
             return false;
         }
-        for j in 0..CLOSURES[c].capture_count {
-            if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j] == l {
-                return CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] != 0;
+        for j in 0..pcx.closures[c].capture_count {
+            if pcx.capture_list.data[pcx.closures[c].captures + 2 * j] == l {
+                return pcx.capture_list.data[pcx.closures[c].captures + 2 * j + 1] != 0;
             }
         }
         false
@@ -379,17 +359,18 @@ pub fn captures_by_ref(f: i64, l: i64) -> bool {
 
 // Whether parameter i of f is one stores go into: a `&mut` one (a legacy
 // `*T` too) to what holds views, or a closure's env (env_param).
-pub fn store_param(f: i64, i: i64) -> bool {
-    is_mut_ref(fn_param(f, i)) && (is_mut_mode(param_mode(f, i)) || env_param(f, i))
-        || closure_param(f, i)
+pub fn store_param(f: i64, i: i64, pcx: inout Ctx<Comp>) -> bool {
+    is_mut_ref(fn_param(f, i, pcx), &pcx)
+        && (is_mut_mode(param_mode(f, i, pcx)) || env_param(f, i, &pcx))
+        || closure_param(f, i, &pcx)
 }
 
 // Whether f has a `&mut` parameter (a legacy `*T` too) to what holds
 // views: not counting closures' (env_param, closure_param).
-pub fn inout_target(f: i64) -> bool {
+pub fn inout_target(f: i64, pcx: inout Ctx<Comp>) -> bool {
     unsafe {
-        for i in 0..FNS[f].param_count {
-            if is_mut_ref(fn_param(f, i)) && is_mut_mode(param_mode(f, i)) {
+        for i in 0..pcx.fns[f].param_count {
+            if is_mut_ref(fn_param(f, i, pcx), &pcx) && is_mut_mode(param_mode(f, i, pcx)) {
                 return true;
             }
         }
@@ -407,21 +388,21 @@ pub fn inout_target(f: i64) -> bool {
 // never loans its body makes; any other result is top. Its `&mut`
 // parameters may come to hold the T values of every argument. `top` when
 // f is not an instance.
-pub fn floor_summary(f: i64) -> ViewSummary {
+pub fn floor_summary(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     unsafe {
-        if f < 0 || FNS[f].tmpl == 0 {
+        if f < 0 || pcx.fns[f].tmpl == 0 {
             return top_summary();
         }
-        let p = ret_parametric(f);
+        let p = ret_parametric(f, &pcx);
         var s = empty_summary();
-        for i in 0..FNS[f].param_count {
-            let t = fn_param(f, i);
-            if !param_carries(t) {
+        for i in 0..pcx.fns[f].param_count {
+            let t = fn_param(f, i, pcx);
+            if !param_carries(t, &pcx) {
                 continue;
             }
             let bit = if i >= 63 { -1 } else { 1 << i };
             let by_ref = t > 0 && TYPES[t].kind == TyKind::Ptr;
-            if !by_ref || p == 2 && param_can_name_param(f, i) {
+            if !by_ref || p == 2 && param_can_name_param(f, i, pcx) {
                 // (a by-value argument holds its T values at its own level;
                 // a view of T storage points into any argument's that can
                 // hold a T: a by-reference one whose type can name one, 0.25.2)
@@ -436,7 +417,7 @@ pub fn floor_summary(f: i64) -> ViewSummary {
             s.sto[S_L1_STAR] |= bit;
             s.sto[S_L2_STAR] |= bit;
         }
-        if p == 0 && is_view_type(FNS[f].ret) {
+        if p == 0 && is_view_type(pcx.fns[f].ret, &pcx) {
             for k in 0..4 {
                 s.ret[k] = -1;
             }
@@ -453,33 +434,33 @@ pub fn floor_summary(f: i64) -> ViewSummary {
 // leaves out (0.25.2: a let parameter `a: Arg` passed by reference, its
 // type holding an array, is not viewed by `Command<CA>::arg`'s result).
 // 0 (`self`) and what is not read here: it can.
-fn type_can_name_param(t: i64, gens: i64) -> bool {
+fn type_can_name_param(t: i64, gens: i64, pcx: Ctx<Comp>) -> bool {
     if t <= 0 {
         return true;
     }
-    let n = type_node(t);
+    let n = type_node(t, pcx);
     let k = n.kind;
     if k == NodeKind::TyName {
         if n.g == 0 {
-            return n.a == self_type_sym() || is_generic_name(n.a, gens);
+            return n.a == self_type_sym() || is_generic_name(n.a, gens, pcx);
         }
-        for i in 0..type_node(n.g).count {
-            if type_can_name_param(child(n.g, i), gens) {
+        for i in 0..type_node(n.g, pcx).count {
+            if type_can_name_param(child(n.g, i, pcx), gens, pcx) {
                 return true;
             }
         }
-        return n.a == self_type_sym() || is_generic_name(n.a, gens);
+        return n.a == self_type_sym() || is_generic_name(n.a, gens, pcx);
     }
     if k == NodeKind::TyTuple {
         for i in 0..n.count {
-            if type_can_name_param(child(t, i), gens) {
+            if type_can_name_param(child(t, i, pcx), gens, pcx) {
                 return true;
             }
         }
         return false;
     }
     if k == NodeKind::TySlice || k == NodeKind::TyPtr || k == NodeKind::TyArray {
-        return type_can_name_param(n.a, gens);
+        return type_can_name_param(n.a, gens, pcx);
     }
     !(k == NodeKind::TyUnit || k == NodeKind::TyNever)
 }
@@ -490,51 +471,46 @@ fn self_type_sym() -> i64 {
 
 // Parameter i of generic instance f: whether its declared type can name
 // a type parameter (type_can_name_param).
-fn param_can_name_param(f: i64, i: i64) -> bool {
-    let tn = type_node_of_template(f);
-    if tn <= 0 || i >= type_node(tn).count {
+fn param_can_name_param(f: i64, i: i64, pcx: Ctx<Comp>) -> bool {
+    let tn = type_node_of_template(f, pcx);
+    if tn <= 0 || i >= type_node(tn, pcx).count {
         return true;
     }
-    type_can_name_param(type_node(child(tn, i)).b, type_node(tn).g)
+    type_can_name_param(type_node(child(tn, i, pcx), pcx).b, type_node(tn, pcx).g, pcx)
 }
 
-fn type_node_of_template(f: i64) -> i64 {
+fn type_node_of_template(f: i64, pcx: Ctx<Comp>) -> i64 {
     // UNSAFE: FNS is the checker's table of functions, a raw pointer.
     // SAFETY: f is an instance (FNS[f].tmpl != 0, floor_summary's test), so
     // both f and its template (tmpl - 1) are below FN_COUNT.
-    unsafe { FNS[FNS[f].tmpl - 1].node }
+    unsafe { pcx.fns[pcx.fns[f].tmpl - 1].node }
 }
 
 // Node n of a signature (a copy).
-fn type_node(n: i64) -> crate::front::ast::Node {
-    NODES[n]
+fn type_node(n: i64, pcx: Ctx<Comp>) -> crate::front::ast::Node {
+    pcx.nodes[n]
 }
 
 // Whether generic function instance f's result type is made of its type
 // parameters only (§2.4, parametric results): 0: not; 1: T values (`T`,
 // `Option<T>`, `Result<T, E>`, `(K, V)`, an owned `Vec<T>`); 2: views of
 // T storage (`[T]`, `*T`, another generic type such as `SliceIter<T>`).
-pub fn ret_parametric(f: i64) -> i64 {
+pub fn ret_parametric(f: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        if f < 0 || FNS[f].tmpl == 0 {
+        if f < 0 || pcx.fns[f].tmpl == 0 {
             return 0;
         }
-        let tn = FNS[FNS[f].tmpl - 1].node;
-        if tn == 0 || NODES[tn].g == 0 || NODES[tn].b == 0 {
+        let tn = pcx.fns[pcx.fns[f].tmpl - 1].node;
+        if tn == 0 || pcx.nodes[tn].g == 0 || pcx.nodes[tn].b == 0 {
             return 0;
         }
-        params_only(NODES[tn].b, NODES[tn].g)
+        params_only(pcx.nodes[tn].b, pcx.nodes[tn].g, &pcx)
     }
 }
 
-static var SYM_OPTION: i64 = 0;
-static var SYM_RESULT: i64 = 0;
-static var SYM_VEC: i64 = 0;
-static var SYM_HASHMAP: i64 = 0;
-
-fn is_generic_name(sym: i64, gens: i64) -> bool {
-    for i in 0..NODES[gens].count {
-        if NODES[child(gens, i)].a == sym {
+fn is_generic_name(sym: i64, gens: i64, pcx: Ctx<Comp>) -> bool {
+    for i in 0..pcx.nodes[gens].count {
+        if pcx.nodes[child(gens, i, pcx)].a == sym {
             return true;
         }
     }
@@ -561,28 +537,28 @@ fn is_primitive_name(sym: i64) -> bool {
     }
 }
 
-fn params_only(t: i64, gens: i64) -> i64 {
-    if SYM_OPTION == 0 {
-        SYM_OPTION = intern_c(c"Option");
-        SYM_RESULT = intern_c(c"Result");
-        SYM_VEC = intern_c(c"Vec");
-        SYM_HASHMAP = intern_c(c"HashMap");
+fn params_only(t: i64, gens: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if pcx.sym_option == 0 {
+        pcx.sym_option = intern_c(c"Option");
+        pcx.sym_result = intern_c(c"Result");
+        pcx.summary_sym_vec = intern_c(c"Vec");
+        pcx.summary_sym_hashmap = intern_c(c"HashMap");
     }
-    let k = NODES[t].kind;
+    let k = pcx.nodes[t].kind;
     var r = 1;
     if k == NodeKind::TyName {
-        let args = NODES[t].g;
-        let name = NODES[t].a;
+        let args = pcx.nodes[t].g;
+        let name = pcx.nodes[t].a;
         if args == 0 {
-            if is_generic_name(name, gens) || is_primitive_name(name) {
+            if is_generic_name(name, gens, pcx) || is_primitive_name(name) {
                 return 1;
             }
             // (a type of its own, which may view anything: not made
             // of the parameters)
             return 0;
         }
-        for i in 0..NODES[args].count {
-            let a = params_only(child(args, i), gens);
+        for i in 0..pcx.nodes[args].count {
+            let a = params_only(child(args, i, pcx), gens, &pcx);
             if a == 0 {
                 return 0;
             }
@@ -590,15 +566,16 @@ fn params_only(t: i64, gens: i64) -> i64 {
                 r = a;
             }
         }
-        if name == SYM_OPTION || name == SYM_RESULT || name == SYM_VEC || name == SYM_HASHMAP {
+        if name == pcx.sym_option || name == pcx.sym_result || name == pcx.summary_sym_vec
+            || name == pcx.summary_sym_hashmap {
             return r;
         }
         // (another generic type: it may view its arguments' storage)
         return 2;
     }
     if k == NodeKind::TyTuple {
-        for i in 0..NODES[t].count {
-            let a = params_only(child(t, i), gens);
+        for i in 0..pcx.nodes[t].count {
+            let a = params_only(child(t, i, pcx), gens, &pcx);
             if a == 0 {
                 return 0;
             }
@@ -609,7 +586,7 @@ fn params_only(t: i64, gens: i64) -> i64 {
         return r;
     }
     if k == NodeKind::TySlice || k == NodeKind::TyPtr {
-        if params_only(NODES[t].a, gens) == 0 {
+        if params_only(pcx.nodes[t].a, gens, &pcx) == 0 {
             return 0;
         }
         return 2;
@@ -621,11 +598,11 @@ fn params_only(t: i64, gens: i64) -> i64 {
 // Declarations
 
 // The parameter of f named sym, -1.
-pub fn param_named(f: i64, sym: i64) -> i64 {
+pub fn param_named(f: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let item = FNS[f].node;
-        for i in 0..NODES[item].count {
-            if NODES[child(item, i)].a == sym {
+        let item = pcx.fns[f].node;
+        for i in 0..pcx.nodes[item].count {
+            if pcx.nodes[child(item, i, pcx)].a == sym {
                 return i;
             }
         }
@@ -637,74 +614,70 @@ pub fn param_named(f: i64, sym: i64) -> i64 {
 // none): f's own, else its trait method's (§2.4: a declaration on a
 // trait's method binds every impl). DECL_NAMES gets the Fn node whose
 // parameter names it uses (memoized per function).
-pub fn decl_of(f: i64) -> i64 {
+pub fn decl_of(f: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         if f < 0 {
             return 0;
         }
-        if f >= DECL_N {
-            let n = FN_COUNT + 64;
+        if f >= pcx.decl_n {
+            let n = pcx.fn_count + 64;
             let a = crate::base::alloc_array::<i64>(n * 2);
-            for i in 0..DECL_N * 2 {
-                a[i] = DECL_MEMO[i];
+            for i in 0..pcx.decl_n * 2 {
+                a[i] = pcx.decl_memo[i];
             }
-            DECL_MEMO = a;
-            DECL_N = n;
+            pcx.decl_memo = a;
+            pcx.decl_n = n;
         }
-        if DECL_MEMO[f * 2] == 0 {
-            var d = FNS[f].views_decl;
-            var names = FNS[f].node;
-            if d == 0 && FNS[f].tmpl != 0 {
+        if pcx.decl_memo[f * 2] == 0 {
+            var d = pcx.fns[f].views_decl;
+            var names = pcx.fns[f].node;
+            if d == 0 && pcx.fns[f].tmpl != 0 {
                 // (an instance: its template's declaration, `#[views]` on
                 // std's generic functions)
-                let t = template_of(f);
-                d = FNS[t].views_decl;
+                let t = template_of(f, pcx);
+                d = pcx.fns[t].views_decl;
                 if d != 0 {
-                    names = FNS[t].node;
+                    names = pcx.fns[t].node;
                 }
             }
-            if d == 0 && FNS[f].node != 0 {
-                let i = impl_of_fn(template_of(f));
-                if i >= 0 && IMPLS[i].tr >= 0 {
-                    let tf = trait_fn(IMPLS[i].tr, NODES[FNS[f].node].a);
-                    if tf != 0 && views_of(tf) != 0 {
-                        d = views_of(tf);
+            if d == 0 && pcx.fns[f].node != 0 {
+                let i = impl_of_fn(template_of(f, pcx), pcx);
+                if i >= 0 && pcx.traits_impls[i].tr >= 0 {
+                    let tf = trait_fn(pcx.traits_impls[i].tr, pcx.nodes[pcx.fns[f].node].a, pcx);
+                    if tf != 0 && views_of(tf, pcx) != 0 {
+                        d = views_of(tf, pcx);
                         names = tf;
                     }
                 }
             }
-            DECL_MEMO[f * 2] = d + 1;
-            DECL_MEMO[f * 2 + 1] = names;
+            pcx.decl_memo[f * 2] = d + 1;
+            pcx.decl_memo[f * 2 + 1] = names;
         }
-        DECL_NAMES = DECL_MEMO[f * 2 + 1];
-        DECL_MEMO[f * 2] - 1
+        pcx.decl_names = pcx.decl_memo[f * 2 + 1];
+        pcx.decl_memo[f * 2] - 1
     }
 }
-
-static var DECL_MEMO: *i64 = 0 as *i64;
-static var DECL_N: i64 = 0;
-pub static var DECL_NAMES: i64 = 0;
 
 // f's declared summary: `#[views(a, *b)]` puts a at every level (S_L1_P,
 // S_L1_STAR, S_L2_P, S_L2_STAR), b at S_L1_STAR and S_L2_STAR; `#[stores(..)]`
 // the same for the stores. Names that are no parameter count for nothing
 // (validate_views_decls reports them). A declaration without
 // `#[stores]` stores nothing; one without `#[views]` returns no views.
-pub fn declared_summary(f: i64) -> ViewSummary {
+pub fn declared_summary(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
     var s = empty_summary();
     s.declared = true;
-    var d = decl_of(f);
-    let names = DECL_NAMES;
+    var d = decl_of(f, &pcx);
+    let names = pcx.decl_names;
     while d != 0 {
-        let stores = NODES[d].c == STORES_FORM;
-        for k in 0..NODES[d].count {
-            let item = child(d, k);
-            let i = node_param_named(names, NODES[item].a);
+        let stores = pcx.nodes[d].c == STORES_FORM;
+        for k in 0..pcx.nodes[d].count {
+            let item = child(d, k, pcx);
+            let i = node_param_named(names, pcx.nodes[item].a, pcx);
             if i < 0 {
                 continue;
             }
             let bit = if i >= 63 { -1 } else { 1 << i };
-            let star = NODES[item].b != 0;
+            let star = pcx.nodes[item].b != 0;
             for lv in 0..4 {
                 if star && (lv == S_L1_P || lv == S_L2_P) {
                     continue;
@@ -716,15 +689,15 @@ pub fn declared_summary(f: i64) -> ViewSummary {
                 }
             }
         }
-        d = NODES[d].b;
+        d = pcx.nodes[d].b;
     }
     s
 }
 
 // The parameter of Fn node item named sym, -1.
-fn node_param_named(item: i64, sym: i64) -> i64 {
-    for i in 0..NODES[item].count {
-        if NODES[child(item, i)].a == sym {
+fn node_param_named(item: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+    for i in 0..pcx.nodes[item].count {
+        if pcx.nodes[child(item, i, pcx)].a == sym {
             return i;
         }
     }
@@ -733,41 +706,40 @@ fn node_param_named(item: i64, sym: i64) -> i64 {
 
 // Whether f's declaration has a `#[views]` part (else: views()), a
 // `#[stores]` part (else: stores()).
-pub fn declares(f: i64, stores: bool) -> bool {
-    var d = decl_of(f);
+pub fn declares(f: i64, stores: bool, pcx: inout Ctx<Comp>) -> bool {
+    var d = decl_of(f, &pcx);
     while d != 0 {
-        if (NODES[d].c == STORES_FORM) == stores {
+        if (pcx.nodes[d].c == STORES_FORM) == stores {
             return true;
         }
-        d = NODES[d].b;
+        d = pcx.nodes[d].b;
     }
     false
 }
 
 // The declaration of #[views]/#[stores] of every function, against its
 // parameter names (check_own, in every mode).
-pub fn validate_views_decls() {
+pub fn validate_views_decls(pcx: inout Ctx<Comp>) {
     unsafe {
         let views = intern_c(c"views");
-        for f in 0..FN_COUNT {
-            if FNS[f].tmpl != 0 {
+        for f in 0..pcx.fn_count {
+            if pcx.fns[f].tmpl != 0 {
                 continue;
             }
-            var d = FNS[f].views_decl;
+            var d = pcx.fns[f].views_decl;
             while d != 0 {
-                for k in 0..NODES[d].count {
-                    let item = child(d, k);
-                    if param_named(f, NODES[item].a) < 0 {
+                for k in 0..pcx.nodes[d].count {
+                    let item = child(d, k, pcx);
+                    if param_named(f, pcx.nodes[item].a, pcx) < 0 {
                         let m = buf_new();
                         buf_fmt(m,
-                            format_args("'{}' has no parameter '{}'", SYMS[FNS[f].display].text,
-                                SYMS[NODES[item].a].text));
+                            format_args("'{}' has no parameter '{}'", SYMS[pcx.fns[f].display].text,
+                                SYMS[pcx.nodes[item].a].text));
                         buf_byte(m, 0);
-                        report_error_once(NODES[item].start, views, c"own.views", buf_slice(m).ptr,
-                            c"#[views(...)] and #[stores(...)] name parameters (`self`, `p`) or what their views point into (`*p`)", "");
+                        report_error_once(pcx.nodes[item].start, views, c"own.views", buf_slice(m).ptr, c"#[views(...)] and #[stores(...)] name parameters (`self`, `p`) or what their views point into (`*p`)", "", &pcx);
                     }
                 }
-                d = NODES[d].b;
+                d = pcx.nodes[d].b;
             }
         }
     }
@@ -778,15 +750,15 @@ pub fn validate_views_decls() {
 
 // The parameters of masks m (the four of one summary part), rounded up:
 // `p` when any of p's bits is set, `*p` when only its `*p` bits are.
-pub fn put_params(out: i64, f: i64, m: [i64; 4]) -> bool {
+pub fn put_params(out: i64, f: i64, m: [i64; 4], pcx: Ctx<Comp>) -> bool {
     unsafe {
-        let item = FNS[f].node;
+        let item = pcx.fns[f].node;
         let p_mask = m[S_L1_P] | m[S_L2_P];
         let star_mask = m[S_L1_STAR] | m[S_L2_STAR];
         var first = true;
-        for i in 0..NODES[item].count {
+        for i in 0..pcx.nodes[item].count {
             let bit = if i >= 63 { -1 } else { 1 << i };
-            let name = NODES[child(item, i)].a;
+            let name = pcx.nodes[child(item, i, pcx)].a;
             if (p_mask & bit) == 0 && (star_mask & bit) == 0 {
                 continue;
             }
@@ -806,13 +778,13 @@ pub fn put_params(out: i64, f: i64, m: [i64; 4]) -> bool {
 // Summary s of function f as text: `views(self)`, `views(*self)`,
 // `views(s, *t) stores(word)`, `views()`; then ` declared` for a
 // declaration, ` assumed` for top.
-pub fn summary_text(out: i64, f: i64, s: ViewSummary) {
+pub fn summary_text(out: i64, f: i64, s: ViewSummary, pcx: inout Ctx<Comp>) {
     buf_str(out, c"views(");
-    put_params(out, f, s.ret);
+    put_params(out, f, s.ret, pcx);
     buf_str(out, c")");
-    if (s.sto[0] | s.sto[1] | s.sto[2] | s.sto[3]) != 0 && has_mut_ref_param(f) {
+    if (s.sto[0] | s.sto[1] | s.sto[2] | s.sto[3]) != 0 && has_mut_ref_param(f, &pcx) {
         buf_str(out, c" stores(");
-        put_params(out, f, s.sto);
+        put_params(out, f, s.sto, pcx);
         buf_str(out, c")");
     }
     if s.declared {
@@ -824,8 +796,8 @@ pub fn summary_text(out: i64, f: i64, s: ViewSummary) {
 
 // The declaration of f parsed into a summary (Phase 0's name in the
 // design: parse_views_attr).
-pub fn parse_views_attr(f: i64) -> ViewSummary {
-    declared_summary(f)
+pub fn parse_views_attr(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
+    declared_summary(f, &pcx)
 }
 
 // ---------------------------------------------------------------------------
@@ -833,16 +805,16 @@ pub fn parse_views_attr(f: i64) -> ViewSummary {
 // make the summary walk_fn returns (infer.vl does the work).
 
 // The walk of f (round `round` of its SCC) begins.
-pub fn collect_begin(f: i64, round: i64) {
-    crate::front::own::infer::col_begin(f, round);
+pub fn collect_begin(f: i64, round: i64, pcx: inout Ctx<Comp>) {
+    crate::front::own::infer::col_begin(f, round, &pcx);
 }
 
 // The function's result at node e, its origin v (-1: none): an exit.
-pub fn collect_result(e: i64, v: i64, ocx: OwnCx) {
-    crate::front::own::infer::col_result(e, v, ocx);
+pub fn collect_result(e: i64, v: i64, ocx: OwnCx, pcx: inout Ctx<Comp>) {
+    crate::front::own::infer::col_result(e, v, ocx, &pcx);
 }
 
 // The walk of f ended: the summary its body makes.
-pub fn collect_end(f: i64) -> ViewSummary {
-    crate::front::own::infer::col_end(f)
+pub fn collect_end(f: i64, pcx: inout Ctx<Comp>) -> ViewSummary {
+    crate::front::own::infer::col_end(f, &pcx)
 }

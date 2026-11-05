@@ -9,24 +9,25 @@
 // drops.vl.
 
 use crate::base::SYMS;
-use crate::front::ast::{NODES, NODE_RAW, NodeKind, SCRATCH, child, list_begin, list_push};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::ast::{NODE_RAW, NodeKind, child, list_begin, list_push};
 use crate::front::check::Res;
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
 use crate::front::own::glue::has_glue;
 use crate::front::own::kinds::is_owned_type;
-use crate::front::types::{FNS, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TyKind, fn_param};
-use crate::middle::lower::ssa::HMap;
+use crate::front::types::{REF_MUT, REF_SHARED, TLISTS, TYPES, TyKind, fn_param};
 
 // Whether a value of type t is an iterator (or an adapter of one, to depth
 // 4) that copies a borrowed container's non-copyable elements.
-pub fn copies_owned_items(t: i64, depth: i64) -> bool {
-    copies_items(t, depth, false)
+pub fn copies_owned_items(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    copies_items(t, depth, false, &pcx)
 }
 
 // copies_owned_items, or (interior) whether the items it copies are not
 // Freeze (0.26.1: each copy is another cell, own.interior_copy).
-pub fn copies_items(t: i64, depth: i64, interior: bool) -> bool {
+pub fn copies_items(t: i64, depth: i64, interior: bool, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: STRUCTS and TLISTS' data are the checker's raw tables (*StructInfo, *i64).
     // SAFETY: t > 0 is a struct type, so TYPES[t].a < STRUCT_COUNT; its targs are
     // targ_count entries of TLISTS.
@@ -35,32 +36,33 @@ pub fn copies_items(t: i64, depth: i64, interior: bool) -> bool {
             return false;
         }
         let s = TYPES[t].a;
-        if !within_std(STRUCTS[s].module) || STRUCTS[s].targ_count == 0 {
+        if !within_std(pcx.structs[s].module, pcx) || pcx.structs[s].targ_count == 0 {
             return false;
         }
-        let a0 = TLISTS.data[STRUCTS[s].targs];
-        let a1 = if STRUCTS[s].targ_count > 1 { TLISTS.data[STRUCTS[s].targs + 1] } else { 0 };
+        let a0 = TLISTS.data[pcx.structs[s].targs];
+        let a1 = if pcx.structs[s].targ_count > 1 { TLISTS.data[pcx.structs[s].targs + 1] }
+            else { 0 };
         // (0.25: a set's iter, HashSetIter and BTreeSetIter, too)
-        if crate::front::check::is_std_named(t, c"SliceIter")
-            || crate::front::check::is_std_named(t, c"Keys")
-            || crate::front::check::is_std_named(t, c"HashSetIter")
-            || crate::front::check::is_std_named(t, c"BTreeSetIter") {
-            return copied(a0, interior);
+        if crate::front::check::is_std_named(t, c"SliceIter", pcx)
+            || crate::front::check::is_std_named(t, c"Keys", pcx)
+            || crate::front::check::is_std_named(t, c"HashSetIter", pcx)
+            || crate::front::check::is_std_named(t, c"BTreeSetIter", pcx) {
+            return copied(a0, interior, &pcx);
         }
-        if crate::front::check::is_std_named(t, c"Values") {
-            return copied(a1, interior);
+        if crate::front::check::is_std_named(t, c"Values", pcx) {
+            return copied(a1, interior, &pcx);
         }
-        if crate::front::check::is_std_named(t, c"HashMapIter")
-            || crate::front::check::is_std_named(t, c"BTreeIter") {
-            return copied(a0, interior) || copied(a1, interior);
+        if crate::front::check::is_std_named(t, c"HashMapIter", pcx)
+            || crate::front::check::is_std_named(t, c"BTreeIter", pcx) {
+            return copied(a0, interior, &pcx) || copied(a1, interior, &pcx);
         }
         // (a map's items are its closure's results, made from borrowed ones)
-        if crate::front::check::is_std_named(t, c"Map")
-            || crate::front::check::is_std_named(t, c"FilterMap") {
+        if crate::front::check::is_std_named(t, c"Map", pcx)
+            || crate::front::check::is_std_named(t, c"FilterMap", pcx) {
             return false;
         }
-        for i in 0..STRUCTS[s].targ_count {
-            if copies_items(TLISTS.data[STRUCTS[s].targs + i], depth + 1, interior) {
+        for i in 0..pcx.structs[s].targ_count {
+            if copies_items(TLISTS.data[pcx.structs[s].targs + i], depth + 1, interior, &pcx) {
                 return true;
             }
         }
@@ -70,35 +72,32 @@ pub fn copies_items(t: i64, depth: i64, interior: bool) -> bool {
 
 // Whether an item of type t is a copy that matters: one with drop glue
 // (owned twice), or (interior) one that is not Freeze (another cell).
-fn copied(t: i64, interior: bool) -> bool {
-    if interior { !crate::front::cells::is_freeze(t) } else { has_glue(t) }
+fn copied(t: i64, interior: bool, pcx: inout Ctx<Comp>) -> bool {
+    if interior { !crate::front::cells::is_freeze(t, pcx) } else { has_glue(t, &pcx) }
 }
 
 pub const MATCH_BYREF: i64 = 1 << 58;
 
-// Locals bound by reference (local + 1 -> the node they borrow + 1).
-pub static var BYREF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-
 // The bindings of pattern p (PatBind nodes) onto SCRATCH.
-pub fn push_bindings(p: i64) {
+pub fn push_bindings(p: i64, pcx: inout Ctx<Comp>) {
     if p == 0 {
         return;
     }
-    let k = NODES[p].kind;
+    let k = pcx.nodes[p].kind;
     if k == NodeKind::PatBind {
-        list_push(p);
+        list_push(p, &pcx);
         return;
     }
     if k == NodeKind::PatOr {
         // (every alternative binds the same names)
-        if NODES[p].count > 0 {
-            push_bindings(child(p, 0));
+        if pcx.nodes[p].count > 0 {
+            push_bindings(child(p, 0, pcx), &pcx);
         }
         return;
     }
     if k == NodeKind::PatTuple || k == NodeKind::PatVariant {
-        for i in 0..NODES[p].count {
-            push_bindings(child(p, i));
+        for i in 0..pcx.nodes[p].count {
+            push_bindings(child(p, i, pcx), &pcx);
         }
     }
 }
@@ -120,45 +119,46 @@ pub fn method_word(d: [u8]) -> [u8] {
 // own.move_out (it would be dropped twice). (0.26.1) A copy of a value
 // that is not Freeze, with or without a drop, is another cell: a write
 // through it would be lost, own.interior_copy (front/cells.vl).
-pub fn borrowed_call(e: i64) -> bool {
-    let r = borrowed_copy(e, false);
-    if e > 0 && !crate::front::cells::is_freeze(NODES[e].ty) && (r || borrowed_copy(e, true)) {
-        crate::front::cells::interior_copy(e);
+pub fn borrowed_call(e: i64, pcx: inout Ctx<Comp>) -> bool {
+    let r = borrowed_copy(e, false, &pcx);
+    if e > 0 && !crate::front::cells::is_freeze(pcx.nodes[e].ty, pcx)
+        && (r || borrowed_copy(e, true, &pcx)) {
+        crate::front::cells::interior_copy(e, &pcx);
     }
     r
 }
 
 // borrowed_call's shapes; interior: of a value that is not Freeze, glue or
 // not, instead of one with glue.
-fn borrowed_copy(e: i64, interior: bool) -> bool {
+fn borrowed_copy(e: i64, interior: bool, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: FNS is the checker's raw table of functions (*FnInfo).
     // SAFETY: f = NODES[e].x - 1 >= 0 is the call's resolved function, below FN_COUNT.
     unsafe {
         // (0.18: through a requires check's block to its call)
-        let wrapped = crate::front::contracts::expand::requires_tail(e);
+        let wrapped = crate::front::contracts::expand::requires_tail(e, pcx);
         if wrapped > 0 {
-            return borrowed_copy(wrapped, interior);
+            return borrowed_copy(wrapped, interior, &pcx);
         }
         // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
-        if e > 0 && NODES[e].kind == NodeKind::Try {
-            return borrowed_copy(NODES[e].a, interior);
+        if e > 0 && pcx.nodes[e].kind == NodeKind::Try {
+            return borrowed_copy(pcx.nodes[e].a, interior, &pcx);
         }
         // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
-        if e > 0 && NODES[e].kind == NodeKind::Match && NODES[e].count == 2
-            && (NODES[child(e, 1)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
-            return borrowed_copy(NODES[e].a, interior);
+        if e > 0 && pcx.nodes[e].kind == NodeKind::Match && pcx.nodes[e].count == 2
+            && (pcx.nodes[child(e, 1, pcx)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
+            return borrowed_copy(pcx.nodes[e].a, interior, &pcx);
         }
-        if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
+        if e <= 0 || pcx.nodes[e].kind != NodeKind::Call || pcx.nodes[e].count == 0 {
             return false;
         }
-        let f = NODES[e].x - 1;
-        if f < 0 || !within_std(FNS[f].module)
-            || (if interior { crate::front::cells::is_freeze(NODES[e].ty) }
-                else { !has_glue(NODES[e].ty) }) {
+        let f = pcx.nodes[e].x - 1;
+        if f < 0 || !within_std(pcx.fns[f].module, pcx)
+            || (if interior { crate::front::cells::is_freeze(pcx.nodes[e].ty, pcx) }
+                else { !has_glue(pcx.nodes[e].ty, &pcx) }) {
             return false;
         }
-        let name = method_word(SYMS[FNS[f].display].text);
-        let p0 = fn_param(f, 0);
+        let name = method_word(SYMS[pcx.fns[f].display].text);
+        let p0 = fn_param(f, 0, pcx);
         if p0 <= 0 {
             return false;
         }
@@ -175,80 +175,83 @@ fn borrowed_copy(e: i64, interior: bool) -> bool {
         if (name == "next" || name == "next_back" || name == "at" || name == "find"
             || name == "last" || name == "nth" || name == "min" || name == "max")
             && copies_items(if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0,
-                interior) {
+                interior, &pcx) {
             return true;
         }
         if name == "unwrap" || name == "expect" || name == "unwrap_or" {
-            return borrowed_copy(crate::front::contracts::desugar::requires_arg(child(e, 0)),
-                interior);
+            return borrowed_copy(crate::front::contracts::desugar::requires_arg(child(e, 0, pcx),
+                pcx),
+                interior, &pcx);
         }
         false
     }
 }
 
 // Whether pattern p binds local l.
-pub fn binds(p: i64, l: i64) -> bool {
+pub fn binds(p: i64, l: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: SCRATCH.data is IntVec's raw buffer, read by index.
     // SAFETY: mark <= i < SCRATCH.count, the entries push_bindings pushed.
     unsafe {
-        let mark = list_begin();
-        push_bindings(p);
+        let mark = list_begin(pcx);
+        push_bindings(p, &pcx);
         var found = false;
-        for i in mark..SCRATCH.count {
-            if NODES[SCRATCH.data[i]].x == l {
+        for i in mark..pcx.scratch.count {
+            if pcx.nodes[pcx.scratch.data[i]].x == l {
                 found = true;
             }
         }
-        SCRATCH.count = mark;
+        pcx.scratch.count = mark;
         found
     }
 }
 
 // Whether value expression e (a branch's, an arm's: pat its pattern, or
 // 0) is new: made by e, or a local that dies with it.
-fn fresh_value(e: i64, pat: i64) -> bool {
+fn fresh_value(e: i64, pat: i64, pcx: inout Ctx<Comp>) -> bool {
     if e == 0 {
         return false;
     }
-    let k = NODES[e].kind;
+    let k = pcx.nodes[e].kind;
     // (0.25.2.1: a `return`, `break` or `continue`, as `Err(e) =>
     // return Err(e)`, makes no value: its type is not always never)
-    if NODES[e].ty == crate::front::types::TY_NEVER || k == NodeKind::Return
+    if pcx.nodes[e].ty == crate::front::types::TY_NEVER || k == NodeKind::Return
         || k == NodeKind::Break || k == NodeKind::Continue {
         return true;
     }
     if k == NodeKind::Block {
-        let t = NODES[e].a;
+        let t = pcx.nodes[e].a;
         if t == 0 {
             return false;
         }
-        if fresh_value(t, pat) {
+        if fresh_value(t, pat, &pcx) {
             return true;
         }
-        if NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && NODES[t].y >= 0 {
-            let l = NODES[t].y;
-            for i in 0..NODES[e].count {
-                let s = child(e, i);
-                if NODES[s].kind == NodeKind::Let && NODES[s].a != 0 && binds(NODES[s].a, l) {
-                    return BYREF.get(l + 1) == 0;
+        if pcx.nodes[t].kind == NodeKind::Ident && pcx.nodes[t].res == Res::Local
+            && pcx.nodes[t].y >= 0 {
+            let l = pcx.nodes[t].y;
+            for i in 0..pcx.nodes[e].count {
+                let s = child(e, i, pcx);
+                if pcx.nodes[s].kind == NodeKind::Let && pcx.nodes[s].a != 0
+                    && binds(pcx.nodes[s].a, l, &pcx) {
+                    return pcx.byref.get(l + 1) == 0;
                 }
             }
         }
         return false;
     }
     if k == NodeKind::Ident {
-        return pat != 0 && NODES[e].res == Res::Local && NODES[e].y >= 0
-            && binds(pat, NODES[e].y) && BYREF.get(NODES[e].y + 1) == 0;
+        return pat != 0 && pcx.nodes[e].res == Res::Local && pcx.nodes[e].y >= 0
+            && binds(pat, pcx.nodes[e].y, &pcx) && pcx.byref.get(pcx.nodes[e].y + 1) == 0;
     }
-    fresh(e)
+    fresh(e, &pcx)
 }
 
 // Whether expression e makes a new owned value (not a place's, not a copy
 // a collection keeps: borrowed_call).
-pub fn fresh(e: i64) -> bool {
-    let k = NODES[e].kind;
-    if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e) {
-        return !borrowed_call(e) && !parametric_copy(e);
+pub fn fresh(e: i64, pcx: inout Ctx<Comp>) -> bool {
+    let k = pcx.nodes[e].kind;
+    if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e, &pcx) {
+        return !borrowed_call(e, &pcx) && !parametric_copy(e, &pcx);
     }
     if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
         || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat
@@ -256,18 +259,19 @@ pub fn fresh(e: i64) -> bool {
         return true;
     }
     if k == NodeKind::Block {
-        return fresh_value(e, 0);
+        return fresh_value(e, 0, &pcx);
     }
     if k == NodeKind::If {
-        return NODES[e].c != 0 && fresh_value(NODES[e].b, 0) && fresh_value(NODES[e].c, 0);
+        return pcx.nodes[e].c != 0 && fresh_value(pcx.nodes[e].b, 0, &pcx)
+            && fresh_value(pcx.nodes[e].c, 0, &pcx);
     }
     if k == NodeKind::Match {
-        if NODES[e].count == 0 {
+        if pcx.nodes[e].count == 0 {
             return false;
         }
-        for i in 0..NODES[e].count {
-            let arm = child(e, i);
-            if !fresh_value(NODES[arm].c, NODES[arm].a) {
+        for i in 0..pcx.nodes[e].count {
+            let arm = child(e, i, pcx);
+            if !fresh_value(pcx.nodes[arm].c, pcx.nodes[arm].a, &pcx) {
                 return false;
             }
         }
@@ -282,38 +286,38 @@ pub fn fresh(e: i64) -> bool {
 // -> T { p[1] }` reads one through a raw pointer; `unwrap(sink self)`,
 // std's `pop(inout self)` give one up; outside std a function that
 // changes an argument may still return a copy through a raw pointer).
-pub fn parametric_copy(e: i64) -> bool {
+pub fn parametric_copy(e: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: FNS and TLISTS' data are the checker's raw tables (*FnInfo, *i64).
     // SAFETY: f >= 0 is the call's resolved function, below FN_COUNT; its targs are
     // targ_count entries of TLISTS.
     unsafe {
-        let f = NODES[e].x - 1;
-        if f < 0 || crate::front::own::summary::ret_parametric(f) == 0 {
+        let f = pcx.nodes[e].x - 1;
+        if f < 0 || crate::front::own::summary::ret_parametric(f, &pcx) == 0 {
             return false;
         }
         // (0.25: `clone` makes a new value, `v.clone().len()`; a result
         // whose type arguments have no glue holds no copy that matters,
         // `String::from_in("x", gpa)`)
-        if method_word(SYMS[FNS[f].display].text) == "clone" {
+        if method_word(SYMS[pcx.fns[f].display].text) == "clone" {
             return false;
         }
         var glue_arg = false;
-        for i in 0..FNS[f].targ_count {
-            if has_glue(TLISTS.data[FNS[f].targs + i]) {
+        for i in 0..pcx.fns[f].targ_count {
+            if has_glue(TLISTS.data[pcx.fns[f].targs + i], &pcx) {
                 glue_arg = true;
             }
         }
         if !glue_arg {
             return false;
         }
-        for i in 0..FNS[f].param_count {
-            let m = crate::front::own::kinds::param_mode(f, i);
-            let t = fn_param(f, i);
+        for i in 0..pcx.fns[f].param_count {
+            let m = crate::front::own::kinds::param_mode(f, i, pcx);
+            let t = fn_param(f, i, pcx);
             // (an owned argument consumed, or one changed in place)
-            if m == crate::front::own::kinds::P_VALUE && is_owned_type(t)
-                || within_std(FNS[f].module) && m == crate::front::own::kinds::P_MUT && t > 0
-                && TYPES[t].b == REF_MUT
-                && is_owned_type(TYPES[t].a) {
+            if m == crate::front::own::kinds::P_VALUE && is_owned_type(t, &pcx)
+                || within_std(pcx.fns[f].module, pcx) && m == crate::front::own::kinds::P_MUT
+                && t > 0 && TYPES[t].b == REF_MUT
+                && is_owned_type(TYPES[t].a, &pcx) {
                 return false;
             }
         }
@@ -329,53 +333,53 @@ pub const NO_DROP: i64 = 1 << 59;
 // (0.25) The receiver of `v.as_mut_slice()` that the checker made of a
 // Vec's or a Buf's `v[i]` written (check/synth_mode.vl: synth_index), when
 // it is call e; else 0.
-pub fn slice_receiver(e: i64) -> i64 {
-    if NODES[e].kind == NodeKind::MethodCall {
-        let name = SYMS[NODES[e].b].text;
-        return if name == "as_mut_slice" { NODES[e].a } else { 0 };
+pub fn slice_receiver(e: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[e].kind == NodeKind::MethodCall {
+        let name = SYMS[pcx.nodes[e].b].text;
+        return if name == "as_mut_slice" { pcx.nodes[e].a } else { 0 };
     }
-    if NODES[e].kind != NodeKind::Call || NODES[e].count != 1 {
+    if pcx.nodes[e].kind != NodeKind::Call || pcx.nodes[e].count != 1 {
         return 0;
     }
-    let f = NODES[e].x - 1;
+    let f = pcx.nodes[e].x - 1;
     if f < 0 {
         return 0;
     }
     // UNSAFE: FNS is the checker's raw table of functions.
     // SAFETY: f is the function the checker resolved call e to (its x),
     // below FN_COUNT.
-    let (module, display) = unsafe { (FNS[f].module, FNS[f].display) };
-    if !within_std(module) || method_word(SYMS[display].text) != "as_mut_slice" {
+    let (module, display) = unsafe { (pcx.fns[f].module, pcx.fns[f].display) };
+    if !within_std(module, pcx) || method_word(SYMS[display].text) != "as_mut_slice" {
         return 0;
     }
-    var r = child(e, 0);
-    if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
-        r = NODES[r].b;
+    var r = child(e, 0, pcx);
+    if pcx.nodes[r].kind == NodeKind::Unary && pcx.nodes[r].op == Tok::Amp {
+        r = pcx.nodes[r].b;
     }
     r
 }
 
 // (0.25) Whether place e (an assignment's target) is one copy_place copies
 // once its indexes are names: names, fields, `*` and indexes, no call.
-pub fn indexable_place(e: i64) -> bool {
-    if e == 0 || (NODES[e].p & NODE_RAW) != 0 {
+pub fn indexable_place(e: i64, pcx: Ctx<Comp>) -> bool {
+    if e == 0 || (pcx.nodes[e].p & NODE_RAW) != 0 {
         return false;
     }
-    let k = NODES[e].kind;
+    let k = pcx.nodes[e].kind;
     if k == NodeKind::Ident {
-        return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        return pcx.nodes[e].res == Res::Local || pcx.nodes[e].res == Res::Static;
     }
     if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
-        return indexable_place(NODES[e].a);
+        return indexable_place(pcx.nodes[e].a, pcx);
     }
-    if k == NodeKind::Unary && NODES[e].op == Tok::Star {
-        return indexable_place(NODES[e].b);
+    if k == NodeKind::Unary && pcx.nodes[e].op == Tok::Star {
+        return indexable_place(pcx.nodes[e].b, pcx);
     }
     if k == NodeKind::Index {
-        let i = NODES[e].b;
-        let r = slice_receiver(NODES[e].a);
-        return i != 0 && NODES[i].kind != NodeKind::Range
-            && indexable_place(if r != 0 { r } else { NODES[e].a });
+        let i = pcx.nodes[e].b;
+        let r = slice_receiver(pcx.nodes[e].a, pcx);
+        return i != 0 && pcx.nodes[i].kind != NodeKind::Range
+            && indexable_place(if r != 0 { r } else { pcx.nodes[e].a }, pcx);
     }
     false
 }

@@ -76,7 +76,90 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.2 | `v0.26.2` | 0.26.1 | aarch64-macos | `usize` and `isize` their own types, `TryFrom`, saturating float casts, std's lengths `usize`; Rust's format strings, `format_args`, `fix --only fstring`; `where`, `impl Trait` arguments, `pub(crate)`; `defer` removed (breaking); shader parts and `#[repr(wgsl)]`; the IR places every drop, the AST lowerings gone |
 | 0.26.3 | `v0.26.3` | 0.26.2 | aarch64-macos | allocation as a capability (no default allocator type: `alloc.default`, `alloc.field`, `alloc.static`, `alloc.last`; `unsafe trait`/`unsafe impl`, `AllocFree`; `fix --only alloc`); f-strings removed; `wrapping_*`, `checked_*`, `Wrapping<T>` and overflow checks at -O0 (`--overflow-checks`), shifts and `/ 0` as Rust's; std's text on `String<A>`, its bytes on `Vec<u8, A>`, `#[deprecated]` and `Buf` deprecated (`fix --only buf`); compiler/src on format literals and `usize` |
 | 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
+| 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.26.5
+
+The compiler's statics in context structs, the rest: 1,234 statics to 188, the tables code generation's threads read included, and the alloc exemption down to two statics. Built and tested on aarch64-macos only.
+
+The statics into context structs, phases 4-6 (statics265):
+
+- `volec fix --only statics` does in the same run what the 0.26.4 phases
+  did by hand: the group file's `use PATH` lines are added where a
+  function takes the context, its `owner-use PATH` lines where an owner
+  makes it; the statics are taken out of the `use` lines and their
+  declarations deleted. A static in a format literal's hole becomes
+  `{field}` and the named argument `field = cx.field`; among named
+  arguments the context goes named, in its parameter's place; a static
+  lent beside the context (`f(&X, &cx)`) is taken into a local and put
+  back after the statement when `f` does not use it through the context.
+  A function given the context before keeps it (made inout where it now
+  changes the context), so a second group can join a context already
+  passed down. Functions in a generated file are refused like `main`.
+- `fix --only statics-list --group FILE --prune PREFIX,...` prints the
+  group without the statics that make a refused function, or one outside
+  the prefixes, take the context, in rounds (`--prune crate`: refusals
+  only): what 0.26.4's phase 3 did in up to 80 runs by hand.
+- compiler/src, phase 4: 772 statics of base, front, places, the tools,
+  guide and cli are fields of `base::ctx::Ctx<Comp>` (base/ctx.vl), made
+  once per process by `main` and passed as `pcx` to 3,441 functions (2,153
+  inout), from `tools/statics/p4-ctx.group`; the tool added the 437 use
+  lines and deleted the declarations, and ten arguments after the context
+  were taken into lets by hand. Left for phase 5: the 70 tables code
+  generation's tasks read (the AST, types, functions, symbols, buffers,
+  files), which need the tasks' let view. Before it, six front tables
+  became `Vec`s (`refactor table`) and 154 unsafe blocks went. Statics in
+  compiler/src: 1,234 to 451; unjustified unsafe 3,217 to 3,063. `check`
+  of compiler/src: 1.03x 0.26.4's; with one compiler, checking the source
+  itself costs 11% more (the own pass +29%, over the `&pcx` arguments).
+- The own pass asked whether a context type holds an inout access at
+  every use, walking its hundreds of fields each time; it keeps the answer
+  per type now (`Ctx.inout_memo`, `OwnCx.holds_memo`), and checking
+  compiler/src costs 6.7% fewer instructions.
+- Phase 5a: the 153 statics of middle, back, gen0 and arch that no code
+  generation task reaches joined `pcx` (`tools/statics/p5a-ctx.group`);
+  the tool gave the functions that had `pcx` already the new fields in
+  place. front::cpp::eval's three statics went into the C import's
+  `CImportCx`. Statics in compiler/src: 450 to 294.
+- `fix --only statics` takes `view PATH EXPR` lines: a function that gives
+  its calls the context as EXPR, let (a thread's task loop, which reaches
+  it through a pointer). A view whose callees change the context is
+  refused (refused-view), and `--prune` leaves out, in one round, what
+  each of them writes.
+- Phase 5b, the tasks' view: code generation's tasks are lent the
+  context let. `middle::threads::run_pooled` gives a task
+  `*(POOL_PCX as *Ctx<Comp>)`, the context of the `pool_run` or
+  `pool_run_joined` that started the phase, set before the tasks start
+  and cleared after the last is done; its `UNSAFE:`/`SAFETY:` comments
+  say why no task reads a field while it changes (the main thread changes
+  the context only in `join_task`, whose writes `tests/threads_writes.sh`
+  checks). 105 tables the tasks read (the AST, functions, structs,
+  modules, files, the IR's tables, the inliner's and the code cache's) are
+  fields now (`tools/statics/p5b-ctx.group`, pruned from 253: what a
+  task's code may write stays static, each with its reason in
+  threads_writes.sh). `tests/threads_writes.sh` checks the context's
+  fields as it does statics, `base::ctx::Ctx.FIELD` in its lists. A let
+  `Ctx` is lent by address, never copied. Statics in compiler/src: 294 to
+  190 (16 constants, 1 C-facing).
+- Phase 6, the alloc exemption narrowed: no struct of compiler/src holds
+  `Comp` unnamed and no static holds an allocator, but for `base::SYMS`
+  and `front::types::TYPES`, the two the exemption still names
+  (front/check/alloc_rules.vl, each with its reason: code generation's
+  tasks reach `intern` and `make_type`, which add to them, so they wait
+  for 0.27's split of a read-only lookup from the writing code). The
+  WGSL checks' arena is `WgslCx<Arena>`, made by main and passed to
+  `check_block` as `wgx` (`tools/statics/wgsl-ctx.group`, 71 functions);
+  `buf_fmt` and the tasks' `cx_fmt` format into a String of their own,
+  so `FMT_SCRATCH` and `FnCtx.fmt` are gone; the format checker's
+  `Parsed` is `Parsed<A>`. Statics in compiler/src: 190 to 188;
+  unjustified unsafe 3,063 to 3,057.
+- A static lent beside the context as an element's address (`f(&X[0],
+  &cx)`, `X` an array a raw pointer reaches past the element) is taken
+  into a local whole now, not as that one element: phase 4 had made
+  `front::own::infer::col_stored`'s two masks one, and the callee's write
+  to the second went to the stack (a compiler built at -O0 crashed in the
+  own pass; tests/refactor/statics0265.t, `&PAIR[0]`).
 
 ### What's new in 0.26.4
 

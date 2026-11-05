@@ -2,9 +2,11 @@
 // each pass (terminators, predecessor lists, phis, operands dominating
 // their uses) and stops with the function printed when it is broken.
 
-use crate::arch::{INTRS, intr_param_is_const, intrinsic_count};
+use crate::arch::{intr_param_is_const, intrinsic_count};
 use crate::base::{STDERR, buf_byte, buf_new, buf_str, buf_write_fd, exit, sym_name};
-use crate::front::types::{FNS, TY_BOOL};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::TY_BOOL;
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{IRFUNCS, Op, Term, ir_arg, ir_operand, ir_operand_count};
 use crate::middle::ir::Op::Phi;
@@ -12,18 +14,13 @@ use crate::middle::ir::cfg::{case_target, case_value, is_succ, pred_index, succ,
 use crate::middle::ir::print::{buf_block, buf_value, print_ir_func};
 use crate::middle::opt::{compute_dominators, dominates};
 
-pub static var VERIFY_IR: bool = false;
-
-// --print-after-all: the IR of each function after each pass, on stderr.
-pub static var PRINT_AFTER_ALL: bool = false;
-
-fn ir_fail(cx: inout FnCtx, fi: i64, b: i64, v: i64, message: *u8) -> ! {
+fn ir_fail(cx: inout FnCtx, fi: i64, b: i64, v: i64, message: *u8, pcx: Ctx<Comp>) -> ! {
     unsafe {
         let out = buf_new();
         buf_str(out, c"internal error: invalid IR after ");
         buf_str(out, cx.verify_pass);
         buf_str(out, c" in fn ");
-        buf_str(out, sym_name(FNS[IRFUNCS[fi].f].name));
+        buf_str(out, sym_name(pcx.fns[IRFUNCS[fi].f].name));
         buf_str(out, c", ");
         buf_block(out, b);
         if v != 0 {
@@ -33,7 +30,7 @@ fn ir_fail(cx: inout FnCtx, fi: i64, b: i64, v: i64, message: *u8) -> ! {
         buf_str(out, c": ");
         buf_str(out, message);
         buf_byte(out, '\n');
-        print_ir_func(&cx, out, fi);
+        print_ir_func(&cx, out, fi, pcx);
         buf_write_fd(out, STDERR);
         exit(101)
     }
@@ -42,61 +39,61 @@ fn ir_fail(cx: inout FnCtx, fi: i64, b: i64, v: i64, message: *u8) -> ! {
 // Checks the structure of function `fi`: terminators, predecessor lists,
 // phis, and that every operand is a live instruction that dominates its
 // use (dominators must be up to date: see compute_dominators).
-pub fn verify_func(cx: inout FnCtx, fi: i64, pass: *u8) {
+pub fn verify_func(cx: inout FnCtx, fi: i64, pass: *u8, pcx: Ctx<Comp>) {
     unsafe {
-        if PRINT_AFTER_ALL {
+        if pcx.print_after_all {
             let out = buf_new();
             buf_str(out, c"; after ");
             buf_str(out, pass);
             buf_byte(out, '\n');
-            print_ir_func(&cx, out, fi);
+            print_ir_func(&cx, out, fi, pcx);
             buf_write_fd(out, STDERR);
         }
-        if !VERIFY_IR {
+        if !pcx.verify_ir {
             return;
         }
         cx.verify_pass = pass;
         // (0.17: ids are each function's; a pass reading another
         // function's tables than its own would read the wrong IR)
         if cx.ir_cur != fi {
-            ir_fail(&cx, fi, 0, 0, c"the function's tables are not the current ones");
+            ir_fail(&cx, fi, 0, 0, c"the function's tables are not the current ones", pcx);
         }
         compute_dominators(&cx, fi);
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
             if cx.blocks[b].removed == 0 {
-                verify_block(&cx, fi, b);
+                verify_block(&cx, fi, b, pcx);
             }
         }
     }
 }
 
-fn verify_block(cx: inout FnCtx, fi: i64, b: i64) {
+fn verify_block(cx: inout FnCtx, fi: i64, b: i64, pcx: Ctx<Comp>) {
     unsafe {
         let term = cx.blocks[b].term;
         if term == Term::None {
-            ir_fail(&cx, fi, b, 0, c"no terminator");
+            ir_fail(&cx, fi, b, 0, c"no terminator", pcx);
         }
         for i in 0..succ_count(&cx, b) {
             let s = succ(&cx, b, i);
             if cx.blocks[s].removed != 0 {
-                ir_fail(&cx, fi, b, 0, c"successor removed");
+                ir_fail(&cx, fi, b, 0, c"successor removed", pcx);
             }
             if pred_index(&cx, s, b) < 0 {
-                ir_fail(&cx, fi, b, 0, c"not a predecessor of its successor");
+                ir_fail(&cx, fi, b, 0, c"not a predecessor of its successor", pcx);
             }
         }
         for i in 0..cx.blocks[b].preds.count {
             let p = cx.blocks[b].preds.data[i];
             if cx.blocks[p].removed != 0 {
-                ir_fail(&cx, fi, b, 0, c"predecessor removed");
+                ir_fail(&cx, fi, b, 0, c"predecessor removed", pcx);
             }
             if !is_succ(&cx, p, b) {
-                ir_fail(&cx, fi, b, 0, c"predecessor does not branch here");
+                ir_fail(&cx, fi, b, 0, c"predecessor does not branch here", pcx);
             }
             for j in 0..i {
                 if cx.blocks[b].preds.data[j] == p && cx.blocks[p].term == Term::Switch {
-                    ir_fail(&cx, fi, b, 0, c"a switch is a predecessor twice");
+                    ir_fail(&cx, fi, b, 0, c"a switch is a predecessor twice", pcx);
                 }
             }
         }
@@ -105,32 +102,33 @@ fn verify_block(cx: inout FnCtx, fi: i64, b: i64) {
         var past_phis = false;
         while v != 0 {
             if cx.insts[v].block != b {
-                ir_fail(&cx, fi, b, v, c"instruction list broken");
+                ir_fail(&cx, fi, b, v, c"instruction list broken", pcx);
             }
             if cx.insts[v].repl != 0 {
-                ir_fail(&cx, fi, b, v, c"replaced instruction still in a block");
+                ir_fail(&cx, fi, b, v, c"replaced instruction still in a block", pcx);
             }
             let op = cx.insts[v].op;
             if op == Op::Intr || op == Op::CpuFeat {
-                verify_arch(&cx, fi, b, v);
+                verify_arch(&cx, fi, b, v, pcx);
             }
             if op == Phi {
                 if past_phis {
-                    ir_fail(&cx, fi, b, v, c"phi after a non-phi instruction");
+                    ir_fail(&cx, fi, b, v, c"phi after a non-phi instruction", pcx);
                 }
                 if cx.insts[v].nargs != cx.blocks[b].preds.count {
-                    ir_fail(&cx, fi, b, v, c"phi operand count differs from the predecessor count");
+                    ir_fail(&cx, fi, b, v, c"phi operand count differs from the predecessor count",
+                        pcx);
                 }
                 for k in 0..cx.insts[v].nargs {
                     verify_operand(&cx, fi, b, v, ir_arg(&cx, v, k), cx.blocks[b].preds.data[k],
-                        reachable);
+                        reachable, pcx);
                 }
             } else {
                 past_phis = true;
                 for k in 0..ir_operand_count(&cx, v) {
                     let operand = ir_operand(&cx, v, k);
                     if operand != 0 {
-                        verify_operand(&cx, fi, b, v, operand, b, reachable);
+                        verify_operand(&cx, fi, b, v, operand, b, reachable, pcx);
                     }
                 }
             }
@@ -138,22 +136,22 @@ fn verify_block(cx: inout FnCtx, fi: i64, b: i64) {
         }
         if (term == Term::Branch || term == Term::Ret || term == Term::Switch)
             && cx.blocks[b].cond != 0 {
-            verify_operand(&cx, fi, b, 0, cx.blocks[b].cond, b, reachable);
+            verify_operand(&cx, fi, b, 0, cx.blocks[b].cond, b, reachable, pcx);
         }
         if (term == Term::Branch || term == Term::Switch) && cx.blocks[b].cond == 0 {
-            ir_fail(&cx, fi, b, 0, c"branch without a condition");
+            ir_fail(&cx, fi, b, 0, c"branch without a condition", pcx);
         }
         if term == Term::Switch {
             if !is_succ(&cx, b, cx.blocks[b].s0) {
-                ir_fail(&cx, fi, b, 0, c"switch default not among its successors");
+                ir_fail(&cx, fi, b, 0, c"switch default not among its successors", pcx);
             }
             for i in 0..cx.blocks[b].ncases {
                 if !is_succ(&cx, b, case_target(&cx, b, i)) {
-                    ir_fail(&cx, fi, b, 0, c"switch case not among its successors");
+                    ir_fail(&cx, fi, b, 0, c"switch case not among its successors", pcx);
                 }
                 for j in 0..i {
                     if case_value(&cx, b, j) == case_value(&cx, b, i) {
-                        ir_fail(&cx, fi, b, 0, c"switch case value repeated");
+                        ir_fail(&cx, fi, b, 0, c"switch case value repeated", pcx);
                     }
                 }
             }
@@ -164,17 +162,17 @@ fn verify_block(cx: inout FnCtx, fi: i64, b: i64) {
 // (0.19) The intrinsics' operations: an INTR names an intrinsic of the
 // tables and has one operand per register parameter; a CPUFEAT is a bool
 // of a feature's bit.
-fn verify_arch(cx: inout FnCtx, fi: i64, b: i64, v: i64) {
+fn verify_arch(cx: inout FnCtx, fi: i64, b: i64, v: i64, pcx: Ctx<Comp>) {
     unsafe {
         let op = cx.insts[v].op;
         if op == Op::Intr {
             let id = cx.insts[v].imm;
-            if id < 0 || id >= intrinsic_count() {
-                ir_fail(&cx, fi, b, v, c"intr of no intrinsic");
+            if id < 0 || id >= intrinsic_count(pcx) {
+                ir_fail(&cx, fi, b, v, c"intr of no intrinsic", pcx);
             }
             var want = 0;
-            for k in 0..INTRS[id].nparams {
-                if !intr_param_is_const(id, k) {
+            for k in 0..pcx.intrs[id].nparams {
+                if !intr_param_is_const(id, k, pcx) {
                     want += 1;
                 }
             }
@@ -185,11 +183,12 @@ fn verify_arch(cx: inout FnCtx, fi: i64, b: i64, v: i64) {
                 }
             }
             if have != want {
-                ir_fail(&cx, fi, b, v, c"intr operand count differs from its register parameters");
+                ir_fail(&cx, fi, b, v, c"intr operand count differs from its register parameters",
+                    pcx);
             }
         } else if op == Op::CpuFeat {
             if cx.insts[v].ty != TY_BOOL || cx.insts[v].imm < 0 || cx.insts[v].imm > 62 {
-                ir_fail(&cx, fi, b, v, c"cpufeat not a bool of a feature bit");
+                ir_fail(&cx, fi, b, v, c"cpufeat not a bool of a feature bit", pcx);
             }
         }
     }
@@ -198,20 +197,20 @@ fn verify_arch(cx: inout FnCtx, fi: i64, b: i64, v: i64) {
 // `operand` of `user` (0: the terminator), used at the end of block `at`
 // for phis or in block `at` otherwise.
 fn verify_operand(cx: inout FnCtx, fi: i64, b: i64, user: i64, operand: i64, at: i64,
-    reachable: bool) {
+    reachable: bool, pcx: Ctx<Comp>) {
     unsafe {
         if operand <= 0 || operand >= cx.inst_count {
-            ir_fail(&cx, fi, b, user, c"operand out of range");
+            ir_fail(&cx, fi, b, user, c"operand out of range", pcx);
         }
         if cx.insts[operand].repl != 0 {
-            ir_fail(&cx, fi, b, user, c"operand was replaced (not resolved)");
+            ir_fail(&cx, fi, b, user, c"operand was replaced (not resolved)", pcx);
         }
         let def_block = cx.insts[operand].block;
         if def_block == 0 {
-            ir_fail(&cx, fi, b, user, c"operand not in any block");
+            ir_fail(&cx, fi, b, user, c"operand not in any block", pcx);
         }
         if cx.blocks[def_block].func != fi {
-            ir_fail(&cx, fi, b, user, c"operand from another function");
+            ir_fail(&cx, fi, b, user, c"operand from another function", pcx);
         }
         if !reachable || cx.blocks[at].order < 0 {
             return;
@@ -223,12 +222,12 @@ fn verify_operand(cx: inout FnCtx, fi: i64, b: i64, user: i64, operand: i64, at:
                 w = cx.insts[w].prev;
             }
             if w == 0 {
-                ir_fail(&cx, fi, b, user, c"operand defined after its use");
+                ir_fail(&cx, fi, b, user, c"operand defined after its use", pcx);
             }
             return;
         }
         if !dominates(&cx, def_block, at) {
-            ir_fail(&cx, fi, b, user, c"operand does not dominate its use");
+            ir_fail(&cx, fi, b, user, c"operand does not dominate its use", pcx);
         }
     }
 }

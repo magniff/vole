@@ -4,6 +4,7 @@
 // main.vl.
 
 use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 
 pub mod timer;
 pub mod diag;
@@ -13,6 +14,7 @@ pub mod target;
 pub mod json;
 // (0.18) the compilation's allocators, Comp and Ast (T6)
 pub mod comp;
+pub mod ctx;
 
 // ---- C library ----
 
@@ -419,35 +421,15 @@ pub fn buf_hex(b: i64, value: u64, digits: i64) {
 }
 
 // (0.16) Appends x's Display, an f-string above all:
-// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in one std String
-// kept for it (fmt_scratch), then copied (fmt_end): a Display that calls
-// buf_fmt itself would clobber it (none of the compiler's do). Through
-// push_fmt, which 0.15's std and 0.16's both have (0.16 has no
-// Fmt::to_buf).
+// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in a std String
+// of its own (0.26.5: no longer one kept in a static, which two threads
+// would share), then copied. Through push_fmt, which 0.15's std and
+// 0.16's both have (0.16 has no Fmt::to_buf).
 pub fn buf_fmt<T: std::Display>(b: i64, x: sink T) {
-    unsafe { (*fmt_scratch()).push_fmt(x); }
-    fmt_end(b);
+    var s: std::string::String<Comp> = std::string::String::new_in(Comp {});
+    s.push_fmt(x);
+    buf_bytes(b, s.as_slice());
 }
-
-// The scratch String, emptied.
-pub fn fmt_scratch() -> *std::string::String<Comp> {
-    unsafe {
-        if FMT_SCRATCH == 0 as *std::string::String<Comp> {
-            // Zeroed: an empty String (no bytes, no capacity; 0.26.3: off
-            // std::Buf, which is deprecated).
-            FMT_SCRATCH = alloc_zeroed(size_of(std::string::String<Comp>)) as *std::string::String<Comp>;
-        }
-        (*FMT_SCRATCH).clear();
-        FMT_SCRATCH
-    }
-}
-
-// The scratch String's text, appended to buffer b.
-pub fn fmt_end(b: i64) {
-    unsafe { buf_bytes(b, (*FMT_SCRATCH).as_slice()); }
-}
-
-static var FMT_SCRATCH: *std::string::String<Comp> = 0 as *std::string::String<Comp>;
 
 // A C string's bytes, up to its NUL: `{cstr(s)}` in an f-string.
 pub fn cstr(s: *u8) -> [u8] {
@@ -718,22 +700,16 @@ pub const SOURCE_WGSL: i64 = 1;
 // (0.25.5) a view of SRC_BUF's bytes, the texts and a 0 after them: read
 // with checks (the lexer's loops take its ptr)
 pub static var SRC: [u8] = "";
-static var SRC_LEN: i64 = 0;
-pub static var FILES: Vec<SourceFile, Comp> = Vec::new_in(Comp {});
-
-// Files read from elsewhere (0.11: the edited copies an edit checks
-// before it writes them, see edit.vl): (path, copy) pairs of C strings.
-pub static var OVERLAY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The file to read for `path`: its copy in OVERLAY, or itself.
-pub fn overlay_of(path: *u8) -> *u8 {
+pub fn overlay_of(path: *u8, pcx: Ctx<Comp>) -> *u8 {
     unsafe {
         var i = 0;
-        while i < OVERLAY.count {
-            let p = OVERLAY.data[i] as *u8;
+        while i < pcx.overlay.count {
+            let p = pcx.overlay.data[i] as *u8;
             let n = strlen(p);
             if n == strlen(path) && memcmp(p, path, n) == 0 {
-                return OVERLAY.data[i + 1] as *u8;
+                return pcx.overlay.data[i + 1] as *u8;
             }
             i += 2;
         }
@@ -741,9 +717,9 @@ pub fn overlay_of(path: *u8) -> *u8 {
     }
 }
 
-pub fn read_file(path: *u8, out: i64) {
+pub fn read_file(path: *u8, out: i64, pcx: Ctx<Comp>) {
     unsafe {
-        let file = fopen(overlay_of(path), c"rb");
+        let file = fopen(overlay_of(path, pcx), c"rb");
         if file == 0 as *u8 {
             die2(c"cannot read ", path);
         }
@@ -761,40 +737,38 @@ pub fn read_file(path: *u8, out: i64) {
 
 // Reads all source files into SRC; each file is followed by a newline so
 // that tokens never span files.
-pub fn load_sources(paths: **u8, count: i64) {
+pub fn load_sources(paths: **u8, count: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         let all = buf_new();
         for i in 0..count {
             let start = BUFS[all].len;
-            read_file(paths[i], all);
-            FILES.push(SourceFile {
+            read_file(paths[i], all, pcx);
+            pcx.files.push(SourceFile {
                 path: paths[i], start, end: BUFS[all].len, module: 0, kind: 0,
             });
             buf_byte(all, '\n');
         }
         buf_byte(all, 0);
         SRC = buf_slice(all);
-        SRC_LEN = BUFS[all].len - 1;
-        SRC_BUF = all;
+        pcx.src_len = BUFS[all].len - 1;
+        pcx.src_buf = all;
     }
 }
-
-pub static var SRC_BUF: i64 = 0;
 
 // Adds a source file made by the compiler (the declarations of `import`ed
 // C headers) after the others, of `kind` (SOURCE_WGSL: an embedded
 // block's file, 0.26.2); returns its start in SRC.
-pub fn add_source(path: *u8, text: i64, kind: i64 = 0) -> i64 {
+pub fn add_source(path: *u8, text: i64, pcx: inout Ctx<Comp>, kind: i64 = 0) -> i64 {
     unsafe {
-        let all = SRC_BUF;
+        let all = pcx.src_buf;
         BUFS[all].len -= 1;
         let start = BUFS[all].len;
         buf_bytes(all, buf_slice(text));
-        FILES.push(SourceFile { path, start, end: BUFS[all].len, module: 0, kind });
+        pcx.files.push(SourceFile { path, start, end: BUFS[all].len, module: 0, kind });
         buf_byte(all, '\n');
         buf_byte(all, 0);
         SRC = buf_slice(all);
-        SRC_LEN = BUFS[all].len - 1;
+        pcx.src_len = BUFS[all].len - 1;
         start
     }
 }
@@ -812,12 +786,12 @@ static var ROOT_DIR: *u8 = 0 as *u8;
 
 // The absolute directory of the root file (FILES[0]), resolved once; the
 // empty string when it cannot be.
-pub fn root_dir() -> *u8 {
+pub fn root_dir(pcx: Ctx<Comp>) -> *u8 {
     unsafe {
         if ROOT_DIR == 0 as *u8 {
             ROOT_DIR = c"";
-            if FILES.len() > 0 {
-                let abs = realpath(FILES[0].path, 0 as *u8);
+            if pcx.files.len() > 0 {
+                let abs = realpath(pcx.files[0].path, 0 as *u8);
                 if abs != 0 as *u8 {
                     var cut = strlen(abs) as i64;
                     while cut > 0 && abs[cut - 1] != '/' {
@@ -908,9 +882,9 @@ fn normal_path(path: *u8, absolute: bool) -> *u8 {
 // OUT_PATHS). Both are made normal by their text (normal_path): no
 // call of realpath or getcwd per file, which walk the directories above
 // the current one on some systems.
-pub fn out_path(file: i64) -> *u8 {
+pub fn out_path(file: i64, pcx: Ctx<Comp>) -> *u8 {
     unsafe {
-        let path = FILES[file].path;
+        let path = pcx.files[file].path;
         if path[0] == '<' {
             return path;
         }
@@ -922,12 +896,12 @@ pub fn out_path(file: i64) -> *u8 {
         }
         // Both relative (the usual case: the modules' paths are made from
         // the root's) need no current directory; else both absolute.
-        let absolute = FILES[0].path[0] == '/' || path[0] == '/';
+        let absolute = pcx.files[0].path[0] == '/' || path[0] == '/';
         if ROOT_LEX == 0 as *u8 || ROOT_LEX_ABS != absolute {
             // the root's directory: its normal path up to the last '/'
             // ("/" for a root at the top, "" for one in the current
             // directory)
-            let r = normal_path(FILES[0].path, absolute);
+            let r = normal_path(pcx.files[0].path, absolute);
             var cut = strlen(r) as i64;
             while cut > 0 && r[cut] != '/' {
                 cut -= 1;
@@ -979,11 +953,11 @@ pub fn out_path(file: i64) -> *u8 {
 // the files as load_sources and add_source lay them out (each followed by
 // a newline, then a NUL); `files` their paths, starts, ends, modules and
 // kinds, in fives.
-pub fn restore_sources(all: i64, files: IntVec) {
+pub fn restore_sources(all: i64, files: IntVec, pcx: inout Ctx<Comp>) {
     unsafe {
         var i = 0;
         while i < files.count {
-            FILES.push(SourceFile {
+            pcx.files.push(SourceFile {
                 path: files.data[i] as *u8, start: files.data[i + 1],
                 end: files.data[i + 2],
                 module: files.data[i + 3],
@@ -992,8 +966,8 @@ pub fn restore_sources(all: i64, files: IntVec) {
             i += 5;
         }
         SRC = buf_slice(all);
-        SRC_LEN = BUFS[all].len - 1;
-        SRC_BUF = all;
+        pcx.src_len = BUFS[all].len - 1;
+        pcx.src_buf = all;
     }
 }
 

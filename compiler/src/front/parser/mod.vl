@@ -16,17 +16,19 @@ pub mod items;
 // (0.18: requires/ensures, invariant, distinct, test attributes)
 pub mod clauses;
 
-use crate::base::{FILES, IntVec, SRC, SYMS, _setjmp, buf_bytes, intern_c};
+use crate::base::{IntVec, SRC, SYMS, _setjmp, buf_bytes, intern_c};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR, ERR_HELP, RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, err_try, error_at,
-    fail_name, recover_enter, recover_leave,
+    err_begin, err_end, err_help, err_str, err_sym, err_try, error_at, fail_name, recover_enter,
+    recover_leave,
 };
 use crate::front::ast::{
-    CONV_NEW, NODES, NodeKind, SCRATCH, list_begin, list_end, list_push, new_node, reserve_nodes,
+    CONV_NEW, NodeKind, list_begin, list_end, list_push, new_node, reserve_nodes,
 };
 use crate::front::check::arch::{detect_macro_error, is_detect_macro};
 use crate::front::conv::{rust_spelling, strict_at};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::lexer::Tok;
 use crate::front::lexer::Tok::{
     Bang, CStr, Char, Const, Else, Enum, Eof, Float, Fn, Hash, Ident, Impl, Import, Int, LBrace,
     LBracket, LParen, Mod, Mut, Pub, RBrace, RBracket, RParen, Reserved, Semi, Static, Str, Struct,
@@ -37,41 +39,37 @@ use crate::front::parser::exprs::parse_expr;
 use crate::front::parser::items::parse_top_item;
 use crate::front::parser::stmts::{is_item_start, parse_stmt};
 
-static var P: i64 = 0;
-// In `if`/`while` conditions and `for` ranges, `Name {` starts the body.
-static var NO_STRUCT: bool = false;
-
-fn tok_kind(offset: i64) -> Tok {
-    let i = P + offset;
-    if i >= TOK_COUNT { Eof } else { unsafe { TOKS[i].kind } }
+fn tok_kind(offset: i64, pcx: Ctx<Comp>) -> Tok {
+    let i = pcx.p + offset;
+    if i >= pcx.toks.len() as i64 { Eof } else { pcx.toks[i].kind }
 }
 
-fn cur() -> Tok {
-    unsafe { TOKS[P].kind }
+fn cur(pcx: Ctx<Comp>) -> Tok {
+    pcx.toks[pcx.p].kind
 }
 
-fn at(kind: Tok) -> bool {
-    unsafe { TOKS[P].kind == kind }
+fn at(kind: Tok, pcx: Ctx<Comp>) -> bool {
+    pcx.toks[pcx.p].kind == kind
 }
 
-fn cur_start() -> i64 {
-    unsafe { TOKS[P].start }
+fn cur_start(pcx: Ctx<Comp>) -> i64 {
+    pcx.toks[pcx.p].start
 }
 
 // The end of the previous token.
-fn prev_end() -> i64 {
-    if P == 0 { 0 } else { unsafe { TOKS[P - 1].end } }
+fn prev_end(pcx: Ctx<Comp>) -> i64 {
+    if pcx.p == 0 { 0 } else { pcx.toks[pcx.p - 1].end }
 }
 
-fn advance() {
-    if unsafe { TOKS[P].kind != Eof } {
-        P += 1;
+fn advance(pcx: inout Ctx<Comp>) {
+    if pcx.toks[pcx.p].kind != Eof {
+        pcx.p += 1;
     }
 }
 
-fn eat(kind: Tok) -> bool {
-    if at(kind) {
-        advance();
+fn eat(kind: Tok, pcx: inout Ctx<Comp>) -> bool {
+    if at(kind, pcx) {
+        advance(&pcx);
         return true;
     }
     false
@@ -80,216 +78,201 @@ fn eat(kind: Tok) -> bool {
 // (0.20) After `static`: `mut` (0.19's spelling; conv.rust in 0.20's) or
 // `var` (0.20's, conventions.md D14; CONV_NEW on static n): whether the
 // static is mutable.
-fn eat_static_mut(n: i64) -> bool {
-    unsafe {
-        let start = cur_start();
-        if at(Mut) {
-            if strict_at(start) {
-                rust_spelling(TOKS[P - 1].start, TOKS[P].end, "a mutable static is 'static var'",
-                    "static var");
-            }
-            advance();
-            return true;
+fn eat_static_mut(n: i64, pcx: inout Ctx<Comp>) -> bool {
+    let start = cur_start(pcx);
+    if at(Mut, pcx) {
+        if strict_at(start, &pcx) {
+            rust_spelling(pcx.toks[pcx.p - 1].start, pcx.toks[pcx.p].end,
+                "a mutable static is 'static var'", "static var", &pcx);
         }
-        if at(Tok::Var) {
-            advance();
-            NODES[n].p |= CONV_NEW;
-            return true;
-        }
-        false
+        advance(&pcx);
+        return true;
     }
+    if at(Tok::Var, pcx) {
+        advance(&pcx);
+        pcx.nodes[n].p |= CONV_NEW;
+        return true;
+    }
+    false
 }
 
-fn err_token(i: i64) {
-    unsafe {
-        let kind = TOKS[i].kind;
-        if kind == Ident || kind == Reserved || kind.is_keyword() {
-            err_sym(TOKS[i].value as i64);
-        } else if kind == Int || kind == Float || kind == Char {
-            buf_bytes(ERR, SRC[TOKS[i].start..TOKS[i].end]);
-        } else if kind == Str || kind == CStr {
-            err_str(c"string literal");
-        } else {
-            err_str(kind.text());
-        }
+fn err_token(i: i64, pcx: Ctx<Comp>) {
+    let kind = pcx.toks[i].kind;
+    if kind == Ident || kind == Reserved || kind.is_keyword() {
+        err_sym(pcx.toks[i].value as i64, pcx);
+    } else if kind == Int || kind == Float || kind == Char {
+        buf_bytes(pcx.err, SRC[pcx.toks[i].start..pcx.toks[i].end]);
+    } else if kind == Str || kind == CStr {
+        err_str(c"string literal", pcx);
+    } else {
+        err_str(kind.text(), pcx);
     }
 }
-
-// The first token of the top-level item parse_program is parsing; -1
-// outside it (an expression parsed alone: a rewrite's pattern).
-static var ITEM_START: i64 = -1;
 
 // (0.16) A syntax error at a token of another file than the item's: the
 // item's file ended inside a bracket, and the parser went on into the
 // next file (std's text, another module's). Reported at that bracket, the
 // last one the item leaves open in its file, instead of in the next file.
-fn unclosed_bracket() {
-    unsafe {
-        if ITEM_START < 0 || P <= ITEM_START {
-            return;
-        }
-        let f = file_of_pos(TOKS[ITEM_START].start);
-        if file_of_pos(TOKS[P].start) == f {
-            return;
-        }
-        let end = FILES[f].end;
-        var k = P - 1;
-        while k > ITEM_START && TOKS[k].start >= end {
-            k -= 1;
-        }
-        var depth = 0;
-        var open = ITEM_START;
-        while k >= ITEM_START {
-            let kind = TOKS[k].kind;
-            if kind == RBrace || kind == RParen || kind == RBracket {
-                depth += 1;
-            } else if kind == LBrace || kind == LParen || kind == LBracket {
-                if depth == 0 {
-                    open = k;
-                    break;
-                }
-                depth -= 1;
+fn unclosed_bracket(pcx: inout Ctx<Comp>) {
+    if pcx.item_start < 0 || pcx.p <= pcx.item_start {
+        return;
+    }
+    let f = file_of_pos(pcx.toks[pcx.item_start].start, pcx);
+    if file_of_pos(pcx.toks[pcx.p].start, pcx) == f {
+        return;
+    }
+    let end = pcx.files[f].end;
+    var k = pcx.p - 1;
+    while k > pcx.item_start && pcx.toks[k].start >= end {
+        k -= 1;
+    }
+    var depth = 0;
+    var open = pcx.item_start;
+    while k >= pcx.item_start {
+        let kind = pcx.toks[k].kind;
+        if kind == RBrace || kind == RParen || kind == RBracket {
+            depth += 1;
+        } else if kind == LBrace || kind == LParen || kind == LBracket {
+            if depth == 0 {
+                open = k;
+                break;
             }
-            k -= 1;
+            depth -= 1;
         }
-        let kind = TOKS[open].kind;
-        let close = if kind == LParen { c")" } else if kind == LBracket { c"]" } else { c"}" };
-        err_begin(TOKS[open].start);
-        err_str(c"unclosed '");
-        err_str(kind.text());
-        err_str(c"': the file ends before its '");
-        err_str(close);
-        err_str(c"'");
-        err_end();
+        k -= 1;
     }
+    let kind = pcx.toks[open].kind;
+    let close = if kind == LParen { c")" } else if kind == LBracket { c"]" } else { c"}" };
+    err_begin(pcx.toks[open].start, &pcx);
+    err_str(c"unclosed '", pcx);
+    err_str(kind.text(), pcx);
+    err_str(c"': the file ends before its '", pcx);
+    err_str(close, pcx);
+    err_str(c"'", pcx);
+    err_end(&pcx);
 }
 
-fn syntax_error(message: *u8) -> ! {
-    unclosed_bracket();
-    err_begin(cur_start());
-    err_str(message);
-    err_str(c", got '");
-    err_token(P);
-    err_str(c"'");
-    err_end()
+fn syntax_error(message: *u8, pcx: inout Ctx<Comp>) -> ! {
+    unclosed_bracket(&pcx);
+    err_begin(cur_start(pcx), &pcx);
+    err_str(message, pcx);
+    err_str(c", got '", pcx);
+    err_token(pcx.p, pcx);
+    err_str(c"'", pcx);
+    err_end(&pcx)
 }
 
-fn expect(kind: Tok) {
-    if !at(kind) {
-        unclosed_bracket();
-        err_begin(cur_start());
-        err_str(c"expected '");
-        err_str(kind.text());
-        err_str(c"', got '");
-        err_token(P);
-        err_str(c"'");
-        if kind == Tok::FatArrow && at(Tok::LBrace) {
+fn expect(kind: Tok, pcx: inout Ctx<Comp>) {
+    if !at(kind, pcx) {
+        unclosed_bracket(&pcx);
+        err_begin(cur_start(pcx), &pcx);
+        err_str(c"expected '", pcx);
+        err_str(kind.text(), pcx);
+        err_str(c"', got '", pcx);
+        err_token(pcx.p, pcx);
+        err_str(c"'", pcx);
+        if kind == Tok::FatArrow && at(Tok::LBrace, pcx) {
             // (0.17) an arm's block without its arrow, or a guard's
-            err_help(c"a match arm is `PATTERN => VALUE,` (a guard: `PATTERN if COND => VALUE,`); a block is the value: `PATTERN => { ... }`");
-            err_try(c"=> {");
+            err_help(c"a match arm is `PATTERN => VALUE,` (a guard: `PATTERN if COND => VALUE,`); a block is the value: `PATTERN => { ... }`", pcx);
+            err_try(c"=> {", pcx);
         }
-        err_end();
+        err_end(&pcx);
     }
-    advance();
+    advance(&pcx);
 }
 
-fn reserved_error() -> ! {
-    err_begin(cur_start());
-    err_str(c"'");
-    err_token(P);
-    if at(Reserved) {
-        err_str(c"' is a reserved keyword (reserved for future use)");
+fn reserved_error(pcx: inout Ctx<Comp>) -> ! {
+    err_begin(cur_start(pcx), &pcx);
+    err_str(c"'", pcx);
+    err_token(pcx.p, pcx);
+    if at(Reserved, pcx) {
+        err_str(c"' is a reserved keyword (reserved for future use)", pcx);
     } else {
-        err_str(c"' is reserved for future use");
+        err_str(c"' is reserved for future use", pcx);
     }
-    err_end()
+    err_end(&pcx)
 }
 
 // (0.21) `var`, `inout` or `sink` where a name goes: keywords (D27), no
 // longer identifiers as in 0.20.
-fn convention_word_error() -> ! {
-    err_begin(cur_start());
-    err_str(c"'");
-    err_token(P);
+fn convention_word_error(pcx: inout Ctx<Comp>) -> ! {
+    err_begin(cur_start(pcx), &pcx);
+    err_str(c"'", pcx);
+    err_token(pcx.p, pcx);
     err_str(
-        c"' is a keyword (`var x = ..`, `x: inout T`, `x: sink T`): a name cannot be spelled so");
-    err_help(c"rename it (`var_`, `sink_`, ...); volec 0.20, which reads it as a name, renames it with every use: volec refactor rename FILE:LINE:COL NEW");
-    err_end()
+        c"' is a keyword (`var x = ..`, `x: inout T`, `x: sink T`): a name cannot be spelled so",
+        pcx);
+    err_help(c"rename it (`var_`, `sink_`, ...); volec 0.20, which reads it as a name, renames it with every use: volec refactor rename FILE:LINE:COL NEW", pcx);
+    err_end(&pcx)
 }
 
-pub static var UNDERSCORE: i64 = -1;
-
-fn expect_ident() -> i64 {
-    unsafe {
-        if at(Reserved) {
-            reserved_error();
-        }
-        if at(Tok::Var) || at(Tok::Inout) || at(Tok::Sink) {
-            convention_word_error();
-        }
-        if !at(Ident) {
-            syntax_error(c"expected identifier");
-        }
-        let sym = TOKS[P].value as i64;
-        advance();
-        sym
+fn expect_ident(pcx: inout Ctx<Comp>) -> i64 {
+    if at(Reserved, pcx) {
+        reserved_error(&pcx);
     }
+    if at(Tok::Var, pcx) || at(Tok::Inout, pcx) || at(Tok::Sink, pcx) {
+        convention_word_error(&pcx);
+    }
+    if !at(Ident, pcx) {
+        syntax_error(c"expected identifier", &pcx);
+    }
+    let sym = pcx.toks[pcx.p].value as i64;
+    advance(&pcx);
+    sym
 }
 
 // ---- Rust habits the parser sees (0.14) ----
 
 // Whether the tokens at the cursor are a Rust macro call: `name!(`,
 // `name![`, `name!{`.
-pub fn at_macro_call() -> bool {
-    unsafe {
-        if !at(Ident) || TOKS[P + 1].kind != Bang {
-            return false;
-        }
-        let next = TOKS[P + 2].kind;
-        next == LParen || next == LBracket || next == LBrace
+pub fn at_macro_call(pcx: Ctx<Comp>) -> bool {
+    if !at(Ident, pcx) || pcx.toks[pcx.p + 1].kind != Bang {
+        return false;
     }
+    let next = pcx.toks[pcx.p + 2].kind;
+    next == LParen || next == LBracket || next == LBrace
 }
 
 // The error for a macro call: vole has none; the help names what
 // replaces the common ones.
-pub fn macro_error() -> ! {
-    unsafe {
-        let name = TOKS[P].value as i64;
-        if is_detect_macro(name) {
-            // (0.19: `is_x86_feature_detected!("avx2")`)
-            detect_macro_error(P);
-        }
-        err_begin(cur_start());
-        err_str(c"'");
-        err_sym(name);
-        err_str(c"!' is a macro call: vole has no macros");
-        let text = SYMS[name].text;
-        if text == "println" || text == "print" || text == "eprintln" || text == "eprint"
-            || text == "format" || text == "write" || text == "writeln" {
-            // (0.15: f-strings; 0.26.2: a format literal)
-            if !macro_fstring_help(text) {
-                err_help(c"the call without its `!` takes a format string: `println(\"x = {x}, v = {:?}\", v)`, `format_in(\"..\", args, gpa)`, in a Display impl `f.write(\"..\", args)`");
-            }
-        } else if text == "vec" {
-            err_help(
-                c"an array `[1, 2, 3]`, or `var v: Vec<i64> = Vec::new_in(gpa); v.push(1);`");
-        }
-        else if text == "assert" || text == "assert_eq" || text == "assert_ne"
-            || text == "debug_assert" || text == "panic" || text == "unreachable" || text == "todo"
-            || text == "unimplemented" {
-            // (0.17: the prelude's panic and unreachable)
-            if text == "panic" || text == "todo" || text == "unimplemented" {
-                err_help(c"call the prelude's `panic(\"message\")`: it prints the message and exits with 101");
-            } else if text == "unreachable" {
-                err_help(c"call the prelude's `unreachable()` (or `panic(\"message\")`): it exits with 101");
-            } else {
-                err_help(c"`if !(a == b) { panic(\"message\"); }`: the prelude's panic prints the message and exits with 101");
-            }
-        } else {
-            err_help(c"call a function instead");
-        }
-        err_end()
+pub fn macro_error(pcx: inout Ctx<Comp>) -> ! {
+    let name = pcx.toks[pcx.p].value as i64;
+    if is_detect_macro(name) {
+        // (0.19: `is_x86_feature_detected!("avx2")`)
+        detect_macro_error(pcx.p, &pcx);
     }
+    err_begin(cur_start(pcx), &pcx);
+    err_str(c"'", pcx);
+    err_sym(name, pcx);
+    err_str(c"!' is a macro call: vole has no macros", pcx);
+    let text = SYMS[name].text;
+    if text == "println" || text == "print" || text == "eprintln" || text == "eprint"
+        || text == "format" || text == "write" || text == "writeln" {
+        // (0.15: f-strings; 0.26.2: a format literal)
+        if !macro_fstring_help(text, pcx) {
+            err_help(c"the call without its `!` takes a format string: `println(\"x = {x}, v = {:?}\", v)`, `format_in(\"..\", args, gpa)`, in a Display impl `f.write(\"..\", args)`", pcx);
+        }
+    } else if text == "vec" {
+        err_help(
+            c"an array `[1, 2, 3]`, or `var v: Vec<i64> = Vec::new_in(gpa); v.push(1);`", pcx);
+    }
+    else if text == "assert" || text == "assert_eq" || text == "assert_ne"
+        || text == "debug_assert" || text == "panic" || text == "unreachable" || text == "todo"
+        || text == "unimplemented" {
+        // (0.17: the prelude's panic and unreachable)
+        if text == "panic" || text == "todo" || text == "unimplemented" {
+            err_help(
+                c"call the prelude's `panic(\"message\")`: it prints the message and exits with 101", pcx);
+        } else if text == "unreachable" {
+            err_help(
+                c"call the prelude's `unreachable()` (or `panic(\"message\")`): it exits with 101", pcx);
+        } else {
+            err_help(c"`if !(a == b) { panic(\"message\"); }`: the prelude's panic prints the message and exits with 101", pcx);
+        }
+    } else {
+        err_help(c"call a function instead", pcx);
+    }
+    err_end(&pcx)
 }
 
 // (0.15; 0.26.2: a format literal) The help of a print or format macro at
@@ -298,203 +281,194 @@ pub fn macro_error() -> ! {
 // `format!` is `format_in(.., gpa)`, `write!(f, ..)` `f.write(..)`); false,
 // writing nothing, when its arguments are not a string literal then
 // expressions.
-fn macro_fstring_help(text: [u8]) -> bool {
-    unsafe {
-        let writes = text == "write" || text == "writeln";
-        var i = P + 2;
-        if i >= TOK_COUNT || TOKS[P + 1].kind != Bang || TOKS[i].kind != LParen {
+fn macro_fstring_help(text: [u8], pcx: Ctx<Comp>) -> bool {
+    let writes = text == "write" || text == "writeln";
+    var i = pcx.p + 2;
+    if i >= pcx.toks.len() as i64 || pcx.toks[pcx.p + 1].kind != Bang
+        || pcx.toks[i].kind != LParen {
+        return false;
+    }
+    i += 1;
+    // (write!'s formatter: its first argument)
+    let receiver = i;
+    if writes {
+        while i < pcx.toks.len() as i64 && pcx.toks[i].kind != Tok::Comma
+            && pcx.toks[i].kind != RParen {
+            i += 1;
+        }
+        if i >= pcx.toks.len() as i64 || pcx.toks[i].kind != Tok::Comma {
             return false;
         }
         i += 1;
-        // (write!'s formatter: its first argument)
-        let receiver = i;
-        if writes {
-            while i < TOK_COUNT && TOKS[i].kind != Tok::Comma && TOKS[i].kind != RParen {
-                i += 1;
-            }
-            if i >= TOK_COUNT || TOKS[i].kind != Tok::Comma {
-                return false;
-            }
-            i += 1;
-        }
-        if i >= TOK_COUNT || TOKS[i].kind != Str {
-            return false;
-        }
-        let literal = i;
-        let lit = SRC[TOKS[literal].start..TOKS[literal].end];
-        if lit.len < 2 || lit[0] != '"' {
-            return false;
-        }
-        // The call's closing parenthesis.
-        var depth = 0;
-        while i < TOK_COUNT && TOKS[i].kind != Eof {
-            let k = TOKS[i].kind;
-            if k == LParen || k == LBracket || k == LBrace {
-                depth += 1;
-            } else if k == RParen || k == RBracket || k == RBrace {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            i += 1;
-        }
-        if i >= TOK_COUNT || TOKS[i].kind != RParen {
-            return false;
-        }
-        err_help(c"write `");
-        if writes {
-            buf_bytes(ERR_HELP, SRC[TOKS[receiver].start..TOKS[receiver].end]);
-            err_help(c".write(");
-        } else if text == "format" {
-            err_help(c"format_in(");
-        } else {
-            buf_bytes(ERR_HELP, text);
-            err_help(c"(");
-        }
-        // The literal as written but for Rust's `{:#?}`, Debug over several
-        // lines (not in this release: `{:?}`), and writeln!'s newline.
-        var k = 0;
-        while k < lit.len as i64 {
-            if k + 3 < lit.len as i64 && lit[k] == ':' && lit[k + 1] == '#' && lit[k + 2] == '?'
-                && lit[k + 3] == '}' {
-                err_help(c":?}");
-                k += 4;
-                continue;
-            }
-            if k == lit.len as i64 - 1 && text == "writeln" {
-                err_help(c"\\n");
-            }
-            buf_bytes(ERR_HELP, lit[k..k + 1]);
-            k += 1;
-        }
-        // The arguments as written.
-        buf_bytes(ERR_HELP, SRC[TOKS[literal].end..TOKS[i].start]);
-        if text == "format" {
-            err_help(c", gpa");
-        }
-        err_help(c")`");
-        if text == "format" {
-            err_help(c" (a std::Buf: `.as_slice()` views it, `.free()` frees it)");
-        }
-        true
     }
+    if i >= pcx.toks.len() as i64 || pcx.toks[i].kind != Str {
+        return false;
+    }
+    let literal = i;
+    let lit = SRC[pcx.toks[literal].start..pcx.toks[literal].end];
+    if lit.len < 2 || lit[0] != '"' {
+        return false;
+    }
+    // The call's closing parenthesis.
+    var depth = 0;
+    while i < pcx.toks.len() as i64 && pcx.toks[i].kind != Eof {
+        let k = pcx.toks[i].kind;
+        if k == LParen || k == LBracket || k == LBrace {
+            depth += 1;
+        } else if k == RParen || k == RBracket || k == RBrace {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        i += 1;
+    }
+    if i >= pcx.toks.len() as i64 || pcx.toks[i].kind != RParen {
+        return false;
+    }
+    err_help(c"write `", pcx);
+    if writes {
+        buf_bytes(pcx.err_help, SRC[pcx.toks[receiver].start..pcx.toks[receiver].end]);
+        err_help(c".write(", pcx);
+    } else if text == "format" {
+        err_help(c"format_in(", pcx);
+    } else {
+        buf_bytes(pcx.err_help, text);
+        err_help(c"(", pcx);
+    }
+    // The literal as written but for Rust's `{:#?}`, Debug over several
+    // lines (not in this release: `{:?}`), and writeln!'s newline.
+    var k = 0;
+    while k < lit.len as i64 {
+        if k + 3 < lit.len as i64 && lit[k] == ':' && lit[k + 1] == '#' && lit[k + 2] == '?'
+            && lit[k + 3] == '}' {
+            err_help(c":?}", pcx);
+            k += 4;
+            continue;
+        }
+        if k == lit.len as i64 - 1 && text == "writeln" {
+            err_help(c"\\n", pcx);
+        }
+        buf_bytes(pcx.err_help, lit[k..k + 1]);
+        k += 1;
+    }
+    // The arguments as written.
+    buf_bytes(pcx.err_help, SRC[pcx.toks[literal].end..pcx.toks[i].start]);
+    if text == "format" {
+        err_help(c", gpa", pcx);
+    }
+    err_help(c")`", pcx);
+    if text == "format" {
+        err_help(c" (a std::Buf: `.as_slice()` views it, `.free()` frees it)", pcx);
+    }
+    true
 }
 
 // A name being declared: an identifier other than `_`.
-fn expect_binding_name() -> i64 {
-    unsafe {
-        if at(Ident) && TOKS[P].value as i64 == UNDERSCORE {
-            error_at(cur_start(), c"'_' cannot be used as a name here");
-        }
-        expect_ident()
+fn expect_binding_name(pcx: inout Ctx<Comp>) -> i64 {
+    if at(Ident, pcx) && pcx.toks[pcx.p].value as i64 == pcx.underscore {
+        error_at(cur_start(pcx), c"'_' cannot be used as a name here", &pcx);
     }
+    expect_ident(&pcx)
 }
 
-fn with_no_struct(value: bool) -> bool {
-    let saved = NO_STRUCT;
-    NO_STRUCT = value;
+fn with_no_struct(value: bool, pcx: inout Ctx<Comp>) -> bool {
+    let saved = pcx.no_struct;
+    pcx.no_struct = value;
     saved
 }
 
 // ---- The program, and going on after errors ----
 
-pub fn parse_program() -> i64 {
+pub fn parse_program(pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        UNDERSCORE = intern_c(c"_");
+        pcx.underscore = intern_c(c"_");
         // (0.20) the spelling the files are read in (front/conv)
-        crate::front::conv::conv_setup();
-        reserve_nodes(TOK_COUNT + TOK_COUNT / 4);
-        let program = new_node(NodeKind::None, 0, 0);
-        let mark = list_begin();
-        while !at(Eof) {
+        crate::front::conv::conv_setup(&pcx);
+        reserve_nodes(pcx.toks.len() as i64 + pcx.toks.len() as i64 / 4, &pcx);
+        let program = new_node(NodeKind::None, 0, 0, &pcx);
+        let mark = list_begin(pcx);
+        while !at(Eof, pcx) {
             // A recovery point (see err_end): after an error, the parser goes
             // on at the next item.
-            let depth = RECOVER_DEPTH;
-            let items = SCRATCH.count;
-            let start = P;
-            ITEM_START = P;
-            BODY_FAILED = false;
-            if _setjmp(recover_enter()) == 0 {
-                parse_top_item();
-                if BODY_FAILED {
+            let depth = pcx.recover_depth;
+            let items = pcx.scratch.count;
+            let start = pcx.p;
+            pcx.item_start = pcx.p;
+            pcx.body_failed = false;
+            if _setjmp(recover_enter(&pcx)) == 0 {
+                parse_top_item(&pcx);
+                if pcx.body_failed {
                     // A syntax error in a block outside a function's body (a
                     // constant's initializer...): the item is left out.
-                    for i in items..SCRATCH.count {
-                        let kind = NODES[SCRATCH.data[i]].kind;
+                    for i in items..pcx.scratch.count {
+                        let kind = pcx.nodes[pcx.scratch.data[i]].kind;
                         if kind != NodeKind::Impl && kind != NodeKind::Use {
-                            fail_name(NODES[SCRATCH.data[i]].a);
+                            fail_name(pcx.nodes[pcx.scratch.data[i]].a, &pcx);
                         }
                     }
-                    SCRATCH.count = items;
+                    pcx.scratch.count = items;
                 }
             } else {
-                SCRATCH.count = items;
-                NO_STRUCT = false;
-                crate::front::parser::items::params::reset_item_state();
-                skip_to_item(start);
-                fail_names(start, P);
+                pcx.scratch.count = items;
+                pcx.no_struct = false;
+                crate::front::parser::items::params::reset_item_state(&pcx);
+                skip_to_item(start, &pcx);
+                fail_names(start, pcx.p, &pcx);
             }
-            recover_leave(depth);
+            recover_leave(depth, &pcx);
         }
-        list_end(program, mark);
-        ITEM_START = -1;
+        list_end(program, mark, &pcx);
+        pcx.item_start = -1;
         program
     }
 }
 
-// Whether a statement of the block being parsed had a syntax error (and
-// was left out).
-static var BODY_FAILED: bool = false;
-
 // After an error in the item starting at token `start`: on to the next
 // token after it that starts an item at the beginning of a line.
-fn skip_to_item(start: i64) {
-    unsafe {
-        P = start + 1;
-        while !at(Eof) {
-            let pos = TOKS[P].start;
-            let line_start = pos == 0 || SRC[pos - 1] == '\n';
-            if line_start && (is_item_start(cur()) || at(Pub) || at(Use) || at(Mod)
-                || at(Import) || at(Hash) || at(Impl) || at(Unsafe) || at(Trait)) {
-                return;
-            }
-            advance();
+fn skip_to_item(start: i64, pcx: inout Ctx<Comp>) {
+    pcx.p = start + 1;
+    while !at(Eof, pcx) {
+        let pos = pcx.toks[pcx.p].start;
+        let line_start = pos == 0 || SRC[pos - 1] == '\n';
+        if line_start && (is_item_start(cur(pcx)) || at(Pub, pcx) || at(Use, pcx) || at(Mod, pcx)
+            || at(Import, pcx) || at(Hash, pcx) || at(Impl, pcx) || at(Unsafe, pcx)
+            || at(Trait, pcx)) {
+            return;
         }
+        advance(&pcx);
     }
 }
 
 // The names the items in tokens start..end (skipped after an error)
 // declare, and those a `use` among them imports, are failed names: the
 // errors saying they are unknown are not reported (see err_failed_name).
-fn fail_names(start: i64, end: i64) {
-    unsafe {
-        var in_use = false;
-        for i in start..end {
-            let kind = TOKS[i].kind;
-            if kind == Use || kind == Import {
-                in_use = true;
-            } else if kind == Semi {
-                in_use = false;
-            }
-            if i + 1 < end && TOKS[i + 1].kind == Ident && (in_use || kind == Fn || kind == Struct
-                || kind == Union || kind == Enum || kind == Const || kind == Static || kind == Type
-                || kind == Trait || kind == Mod) {
-                fail_name(TOKS[i + 1].value as i64);
-            }
+fn fail_names(start: i64, end: i64, pcx: inout Ctx<Comp>) {
+    var in_use = false;
+    for i in start..end {
+        let kind = pcx.toks[i].kind;
+        if kind == Use || kind == Import {
+            in_use = true;
+        } else if kind == Semi {
+            in_use = false;
+        }
+        if i + 1 < end && pcx.toks[i + 1].kind == Ident && (in_use || kind == Fn || kind == Struct
+            || kind == Union || kind == Enum || kind == Const || kind == Static || kind == Type
+            || kind == Trait || kind == Mod) {
+            fail_name(pcx.toks[i + 1].value as i64, &pcx);
         }
     }
 }
 
 // After an error in the statement starting at token `start`: past its `;`,
 // or up to the `}` closing its block.
-fn skip_statement(start: i64) {
-    P = start;
+fn skip_statement(start: i64, pcx: inout Ctx<Comp>) {
+    pcx.p = start;
     // The brackets open in the statement (a `}` also closes the `(` and
     // `[` left open inside its `{`).
     var open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    while !at(Eof) {
-        let kind = cur();
+    while !at(Eof, pcx) {
+        let kind = cur(pcx);
         if kind == LBrace || kind == LParen || kind == LBracket {
             open.push(kind as i64);
         } else if kind == RBrace || kind == RParen || kind == RBracket {
@@ -508,25 +482,25 @@ fn skip_statement(start: i64) {
                     return;
                 }
                 // (a stray `)` or `]` is part of the statement that failed)
-                advance();
+                advance(&pcx);
                 continue;
             }
             open.count -= 1;
             let depth = open.count;
-            if depth == 0 && kind == RBrace && P > start {
+            if depth == 0 && kind == RBrace && pcx.p > start {
                 // A statement ending with a block (`if`, `while`, ...),
                 // unless an `else` follows.
-                advance();
-                if !at(Else) {
+                advance(&pcx);
+                if !at(Else, pcx) {
                     return;
                 }
                 continue;
             }
         } else if kind == Semi && open.count == 0 {
-            advance();
+            advance(&pcx);
             return;
         }
-        advance();
+        advance(&pcx);
     }
 }
 
@@ -535,36 +509,36 @@ fn skip_statement(start: i64) {
 // The expression (`stmts`: the statements, in a Block) of the tokens
 // from `first` to the next Eof (0.11: the patterns of `volec
 // rewrite`, parsed after the program).
-pub fn parse_fragment(first: i64, stmts: bool) -> i64 {
-    P = first;
-    NO_STRUCT = false;
+pub fn parse_fragment(first: i64, stmts: bool, pcx: inout Ctx<Comp>) -> i64 {
+    pcx.p = first;
+    pcx.no_struct = false;
     if !stmts {
-        let n = parse_expr();
-        if !at(Eof) {
-            syntax_error(c"expected the end of the expression");
+        let n = parse_expr(&pcx);
+        if !at(Eof, pcx) {
+            syntax_error(c"expected the end of the expression", &pcx);
         }
         return n;
     }
-    let block = new_node(NodeKind::Block, cur_start(), 0);
-    let mark = list_begin();
-    while !at(Eof) {
-        if eat(Semi) {
+    let block = new_node(NodeKind::Block, cur_start(pcx), 0, &pcx);
+    let mark = list_begin(pcx);
+    while !at(Eof, pcx) {
+        if eat(Semi, &pcx) {
             continue;
         }
-        list_push(parse_stmt());
+        list_push(parse_stmt(&pcx), &pcx);
     }
-    list_end(block, mark);
-    NODES[block].end = prev_end();
+    list_end(block, mark, &pcx);
+    pcx.nodes[block].end = prev_end(pcx);
     block
 }
 
 // The items of the tokens from `first` to the next Eof, pushed to SCRATCH
 // as parse_program pushes them (0.15: the impls `#[derive]` makes, parsed
 // while checking; front/derive.vl).
-pub fn parse_items_fragment(first: i64) {
-    P = first;
-    NO_STRUCT = false;
-    while !at(Eof) {
-        parse_top_item();
+pub fn parse_items_fragment(first: i64, pcx: inout Ctx<Comp>) {
+    pcx.p = first;
+    pcx.no_struct = false;
+    while !at(Eof, pcx) {
+        parse_top_item(&pcx);
     }
 }

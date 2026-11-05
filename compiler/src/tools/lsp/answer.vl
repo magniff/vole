@@ -23,30 +23,31 @@
 // diagnostics; (0.25.2) `f` the program's files, one path a line, before
 // them.
 
+use std::Arena;
+
 use crate::base::{
-    FILES, IntVec, SOURCE_VOLE, SRC, STDERR, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
-    buf_fmt, buf_int, buf_new, buf_slice, buf_str, cstr, sym_text,
+    IntVec, SOURCE_VOLE, SRC, STDERR, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_fmt,
+    buf_int, buf_new, buf_slice, buf_str, cstr, sym_text,
 };
 use crate::base::comp::Comp;
-use crate::base::diag::{DIAG_SHORT, diag_records, short_diagnostic};
+use crate::base::ctx::Ctx;
+use crate::base::diag::{diag_records, short_diagnostic};
 use crate::base::json::buf_json_str;
-use crate::front::ast::{NODES, NODE_CAPTURE, NodeKind, child};
-use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
-use crate::front::cimport::IMPORTED_START;
-use crate::front::cpp::{
-    C_EMIT_AT, C_IMPORT_PATHS, C_IMPORT_POS, C_KEEP_ORIGINS, C_ORIGINS, ctok_place,
-};
+use crate::front::ast::{NODE_CAPTURE, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::cpp::ctok_place;
 use crate::front::cpp::input::cfile_path;
 use crate::front::effects::{
-    ALLOCATORS, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_UNKNOWN,
-    EFF_UNSAFE, EFF_VISIBLE, effects_text, fn_effects,
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_UNKNOWN, EFF_UNSAFE,
+    EFF_VISIBLE, effects_text, fn_effects,
 };
 use crate::front::effects::check::buf_decl;
 use crate::front::effects::why::{effect_name, step_text};
 use crate::front::embed::{buf_path, embed_path};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok, is_ident_byte};
-use crate::front::modules::{MODULES, file_of_pos};
-use crate::front::types::{FNS, FN_COUNT, buf_type};
+use crate::front::embed::wgsl::WgslCx;
+use crate::front::lexer::{Tok, is_ident_byte};
+use crate::front::modules::file_of_pos;
+use crate::front::types::buf_type;
 use crate::middle::lower::ssa::HMap;
 use crate::tools::ctx::Tcx;
 use crate::tools::lsp::{cwd_dir, now_us, write_all};
@@ -60,10 +61,9 @@ use crate::tools::proc::{buf_cstr, read_file_if};
 use crate::tools::query::{QF_CALL, QF_DEF, QF_USE, parse_digits};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{
-    DEFS, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STATIC,
-    K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, def_of_node, kind_name, last_segment,
+    K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STATIC, K_STRUCT,
+    K_TRAIT, K_TRAIT_FN, K_VARIANT, def_of_node, kind_name, last_segment,
 };
-use crate::tools::query::diagnostics::PROG;
 use crate::tools::query::effects::{def_effect_lines, def_effects_text};
 use crate::tools::query::features::put_def_features;
 use crate::tools::query::positions::{line_start, sort_by_position, token_at};
@@ -88,45 +88,46 @@ extern "C" {
 
 // Reads the program of root and answers on `output` the requests of
 // `input` until it is closed; never returns.
-pub fn serve(root: *u8, input: i32, output: i32, utf8: bool, tcx: inout Tcx<Comp>) -> ! {
+pub fn serve(root: *u8, input: i32, output: i32, utf8: bool, tcx: inout Tcx<Comp>,
+    pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) -> ! {
     unsafe {
         tcx.answer_utf8 = utf8;
         tcx.out_fd = output;
-        PROG = c"volec";
+        pcx.prog = c"volec";
         tcx.root_given = root;
         // (0.25.2) where the declarations imported from C are
-        C_KEEP_ORIGINS = true;
-        let t0 = now_us();
-        tcx.loaded = load_program(root, 0, &tcx);
-        lap("load", t0, tcx);
-        let t1 = now_us();
-        index_lines(&tcx);
+        pcx.c_keep_origins = true;
+        let t0 = now_us(&pcx);
+        tcx.loaded = load_program(root, 0, &tcx, &pcx, &wgx);
+        lap("load", t0, tcx, &pcx);
+        let t1 = now_us(&pcx);
+        index_lines(&tcx, pcx);
         if tcx.loaded {
             // (0.25.2) the program's files, for the server's notes on the
             // documents it has none of
             let files = buf_new();
-            for f in 0..FILES.len() {
-                if FILES[f].path[0] != '<' {
-                    buf_str(files, FILES[f].path);
+            for f in 0..pcx.files.len() {
+                if pcx.files[f].path[0] != '<' {
+                    buf_str(files, pcx.files[f].path);
                     buf_byte(files, '\n');
                 }
             }
             send('f', buf_slice(files), tcx);
         }
-        publish_diagnostics(tcx);
-        lap("diagnostics", t1, tcx);
+        publish_diagnostics(tcx, &pcx);
+        lap("diagnostics", t1, tcx, &pcx);
         // (what the requests look up, made before the first comes)
         if tcx.loaded {
-            let t3 = now_us();
-            std_files_ready(&tcx);
-            lap("std files", t3, tcx);
-            let t2 = now_us();
-            ensure_refs(&tcx);
-            local_named_at(0, &tcx);
+            let t3 = now_us(&pcx);
+            std_files_ready(&tcx, pcx);
+            lap("std files", t3, tcx, &pcx);
+            let t2 = now_us(&pcx);
+            ensure_refs(&tcx, &pcx);
+            local_named_at(0, &tcx, pcx);
             tcx.typed = alloc_array::<TypedIndex>(1);
-            tcx.typed[0] = typed_index();
-            crate::tools::lsp::complete::index_locals(tcx.local_decl, &tcx);
-            lap("index", t2, tcx);
+            tcx.typed[0] = typed_index(pcx);
+            crate::tools::lsp::complete::index_locals(tcx.local_decl, &tcx, pcx);
+            lap("index", t2, tcx, &pcx);
         }
         // (0.25.1) ready: the server may keep this worker for completion
         // after the program changes (`l`; `b`: the program was not read)
@@ -150,7 +151,7 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool, tcx: inout Tcx<Comp
                     more = parse_digits(field(line, 4));
                 }
                 if nl + 1 + more <= s.len as i64 {
-                    answer_line(line, s[nl + 1..nl + 1 + more], &tcx);
+                    answer_line(line, s[nl + 1..nl + 1 + more], &tcx, &pcx);
                     from = nl + 1 + more;
                     continue;
                 }
@@ -194,8 +195,8 @@ fn field(line: [u8], k: i64) -> [u8] {
     if n == k { line[start..] } else { line[0..0] }
 }
 
-fn answer_line(line: [u8], payload: [u8], tcx: inout Tcx<Comp>) {
-    let t0 = now_us();
+fn answer_line(line: [u8], payload: [u8], tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    let t0 = now_us(&pcx);
     let method = field(line, 0);
     let path = field(line, 1);
     let ln = parse_digits(field(line, 2));
@@ -206,65 +207,66 @@ fn answer_line(line: [u8], payload: [u8], tcx: inout Tcx<Comp>) {
     buf_str(out, c"{\"jsonrpc\":\"2.0\",\"id\":");
     buf_bytes(out, id);
     buf_str(out, c",\"result\":");
-    let f = if tcx.loaded { file_by_path(path, &tcx) } else { -1 };
-    let pos = if f >= 0 { pos_at(f, ln, ch, tcx) } else { -1 };
+    let f = if tcx.loaded { file_by_path(path, &tcx, pcx) } else { -1 };
+    let pos = if f >= 0 { pos_at(f, ln, ch, tcx, pcx) } else { -1 };
     if method == "definition" {
-        if pos >= 0 { put_definition(out, pos, &tcx); } else { buf_str(out, c"null"); }
+        if pos >= 0 { put_definition(out, pos, &tcx, &pcx); } else { buf_str(out, c"null"); }
     } else if method == "references" {
-        if pos >= 0 { put_references(out, pos, flag, &tcx); } else { buf_str(out, c"[]"); }
+        if pos >= 0 { put_references(out, pos, flag, &tcx, &pcx); } else { buf_str(out, c"[]"); }
     } else if method == "hover" {
-        if pos >= 0 { put_hover(out, pos, &tcx); } else { buf_str(out, c"null"); }
+        if pos >= 0 { put_hover(out, pos, &tcx, &pcx); } else { buf_str(out, c"null"); }
     } else if method == "documentSymbol" {
         if f >= 0 && f == tcx.std_f && tcx.ask_seg >= 0 {
-            put_symbols(out, segment_from(tcx.ask_seg, tcx), segment_to(tcx.ask_seg, tcx), tcx);
+            put_symbols(out, segment_from(tcx.ask_seg, tcx), segment_to(tcx.ask_seg, tcx), tcx,
+                pcx);
         } else if f >= 0 {
-            put_symbols(out, FILES[f].start, FILES[f].end, tcx);
+            put_symbols(out, pcx.files[f].start, pcx.files[f].end, tcx, pcx);
         } else {
             buf_str(out, c"[]");
         }
     } else if method == "workspaceSymbol" {
-        if tcx.loaded { put_workspace_symbols(out, path, tcx); } else { buf_str(out, c"[]"); }
+        if tcx.loaded { put_workspace_symbols(out, path, tcx, pcx); } else { buf_str(out, c"[]"); }
     } else if method == "completion" || method == "completion+s" {
         // (0.25.1) the editor's text in the payload; f: its file, if the
         // program has it
         crate::tools::lsp::complete::put_completion(out, f, payload, ln, ch, tcx.answer_utf8,
-            tcx.loaded, method == "completion+s", &tcx);
+            tcx.loaded, method == "completion+s", &tcx, &pcx);
     } else if method == "completionResolve" {
-        put_resolve(out, payload, &tcx);
+        put_resolve(out, payload, &tcx, &pcx);
     } else if method == "signatureHelp" {
         crate::tools::lsp::complete::put_signature_help(out, f, payload, ln, ch, tcx.answer_utf8,
-            tcx.loaded, &tcx);
+            tcx.loaded, &tcx, &pcx);
     } else {
         buf_str(out, c"null");
     }
     buf_byte(out, '}');
     send('r', buf_slice(out), tcx);
-    lap(method, t0, tcx);
+    lap(method, t0, tcx, &pcx);
 }
 
 // completionItem/resolve (0.25.1): the item (JSON) with the hover of the
 // definition its data names as its documentation.
-fn put_resolve(out: i64, item: [u8], tcx: inout Tcx<Comp>) {
+fn put_resolve(out: i64, item: [u8], tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     let path = buf_new();
     str_into(item, at_path(item, 0, "data.p"), path);
     let d = if tcx.loaded && buf_slice(path).len > 0 {
-        crate::tools::lsp::complete::def_by_path(buf_slice(path), &tcx)
+        crate::tools::lsp::complete::def_by_path(buf_slice(path), &tcx, pcx)
     } else {
         -1
     };
     let md = buf_new();
     if d >= 0 {
-        hover_def(md, d, -1, &tcx);
+        hover_def(md, d, -1, &tcx, &pcx);
     }
     crate::tools::lsp::complete::put_resolved(out, item, d, buf_slice(md));
 }
 
 // With $VOLE_LSP_TIME, `lsp worker: WHAT N ms` (since t0) on stderr.
-fn lap(what: [u8], t0: i64, tcx: Tcx<Comp>) {
+fn lap(what: [u8], t0: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     if !tcx.timing {
         return;
     }
-    let us = now_us() - t0;
+    let us = now_us(&pcx) - t0;
     let line = buf_new();
     buf_str(line, c"lsp worker: ");
     buf_bytes(line, what);
@@ -275,12 +277,12 @@ fn lap(what: [u8], t0: i64, tcx: Tcx<Comp>) {
 // ---- positions
 
 // The line starts of every file (also of a program that did not parse).
-fn index_lines(tcx: inout Tcx<Comp>) {
-    for f in 0..FILES.len() {
+fn index_lines(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
+    for f in 0..pcx.files.len() {
         tcx.first_line.push(tcx.answer_ls.count);
-        tcx.answer_ls.push(FILES[f].start);
-        for p in FILES[f].start..FILES[f].end {
-            if SRC[p] == '\n' && p + 1 < FILES[f].end {
+        tcx.answer_ls.push(pcx.files[f].start);
+        for p in pcx.files[f].start..pcx.files[f].end {
+            if SRC[p] == '\n' && p + 1 < pcx.files[f].end {
                 tcx.answer_ls.push(p + 1);
             }
         }
@@ -291,11 +293,11 @@ fn index_lines(tcx: inout Tcx<Comp>) {
 // The file of the program at path (as the front end read it), or -1; a
 // file of std's (stdfiles.vl): std's text, ASK_SEG its segment. (0.26.2)
 // An embedded block's .wgsl is -1: no vole answers there.
-fn file_by_path(path: [u8], tcx: inout Tcx<Comp>) -> i64 {
+fn file_by_path(path: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     tcx.ask_seg = -1;
-    for f in 0..FILES.len() as i64 {
-        if cstr(FILES[f].path) == path {
-            return if FILES[f].kind == SOURCE_VOLE { f } else { -1 };
+    for f in 0..pcx.files.len() as i64 {
+        if cstr(pcx.files[f].path) == path {
+            return if pcx.files[f].kind == SOURCE_VOLE { f } else { -1 };
         }
     }
     let k = segment_by_path(path, tcx);
@@ -307,9 +309,9 @@ fn file_by_path(path: [u8], tcx: inout Tcx<Comp>) -> i64 {
 }
 
 // The index in LS of the line holding pos.
-fn line_index(pos: i64, tcx: Tcx<Comp>) -> i64 {
+fn line_index(pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        let f = file_of_pos(pos);
+        let f = file_of_pos(pos, pcx);
         var lo = tcx.first_line.data[f];
         var hi = tcx.first_line.data[f + 1];
         while hi - lo > 1 {
@@ -322,11 +324,11 @@ fn line_index(pos: i64, tcx: Tcx<Comp>) -> i64 {
 
 // The segment of std's text position pos is shown in, or -1 (a position
 // in a file of its own).
-fn seg_at(pos: i64, tcx: Tcx<Comp>) -> i64 {
-    if tcx.std_f < 0 || pos < FILES[tcx.std_f].start || pos >= FILES[tcx.std_f].end {
+fn seg_at(pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    if tcx.std_f < 0 || pos < pcx.files[tcx.std_f].start || pos >= pcx.files[tcx.std_f].end {
         return -1;
     }
-    segment_of(pos, tcx)
+    segment_of(pos, tcx, pcx)
 }
 
 // The bytes of the UTF-8 sequence starting with c.
@@ -337,17 +339,17 @@ fn seq_len(c: u8) -> i64 {
 // The position of (line, character) in file f (from 0, the character in
 // the position encoding), or -1; the end of the line when the character
 // is past it.
-fn pos_at(f: i64, line: i64, ch: i64, tcx: Tcx<Comp>) -> i64 {
+fn pos_at(f: i64, line: i64, ch: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         var first = tcx.first_line.data[f];
         var last = tcx.first_line.data[f + 1];
-        var end = FILES[f].end;
+        var end = pcx.files[f].end;
         if f == tcx.std_f && tcx.ask_seg >= 0 {
             // (a file of std's: its segment's lines)
-            first = line_index(segment_from(tcx.ask_seg, tcx), tcx);
+            first = line_index(segment_from(tcx.ask_seg, tcx), tcx, pcx);
             end = segment_to(tcx.ask_seg, tcx);
-            if end < FILES[f].end {
-                last = line_index(end, tcx);
+            if end < pcx.files[f].end {
+                last = line_index(end, tcx, pcx);
             }
         }
         if line < 0 || first + line >= last {
@@ -366,9 +368,9 @@ fn pos_at(f: i64, line: i64, ch: i64, tcx: Tcx<Comp>) -> i64 {
 
 // `{"line":L,"character":C}` of position pos, its line counted from the
 // line `first` (an index in LS).
-fn put_position(out: i64, pos: i64, first: i64, tcx: Tcx<Comp>) {
+fn put_position(out: i64, pos: i64, first: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
-        let lo = line_index(pos, tcx);
+        let lo = line_index(pos, tcx, pcx);
         let ls = tcx.answer_ls.data[lo];
         var units = 0;
         var p = ls;
@@ -382,12 +384,12 @@ fn put_position(out: i64, pos: i64, first: i64, tcx: Tcx<Comp>) {
 }
 
 // The range from..to; in std's text, in from's segment (its file).
-fn put_range(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
+fn put_range(out: i64, from: i64, to: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         var a = from;
         var b = to;
         var first = 0;
-        let k = seg_at(from, tcx);
+        let k = seg_at(from, tcx, pcx);
         if k >= 0 {
             let s = segment_from(k, tcx);
             let e = segment_to(k, tcx) - 1;
@@ -395,14 +397,14 @@ fn put_range(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
             if a > e { a = e; }
             if b > e { b = e; }
             if b < a { b = a; }
-            first = line_index(s, tcx);
+            first = line_index(s, tcx, pcx);
         } else {
-            first = tcx.first_line.data[file_of_pos(from)];
+            first = tcx.first_line.data[file_of_pos(from, pcx)];
         }
         buf_str(out, c"{\"start\":");
-        put_position(out, a, first, tcx);
+        put_position(out, a, first, tcx, pcx);
         buf_str(out, c",\"end\":");
-        put_position(out, b, first, tcx);
+        put_position(out, b, first, tcx, pcx);
         buf_byte(out, '}');
     }
 }
@@ -426,116 +428,110 @@ pub fn put_uri(out: i64, path: [u8]) {
 }
 
 // The file:// URI of position pos's file (in std's text: its segment's).
-fn put_pos_uri(out: i64, pos: i64, tcx: Tcx<Comp>) {
-    let k = seg_at(pos, tcx);
+fn put_pos_uri(out: i64, pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
+    let k = seg_at(pos, tcx, pcx);
     if k >= 0 {
         let p = buf_new();
         put_segment_path(p, k, tcx);
         put_uri(out, buf_slice(p));
     } else {
-        put_uri(out, cstr(FILES[file_of_pos(pos)].path));
+        put_uri(out, cstr(pcx.files[file_of_pos(pos, pcx)].path));
     }
 }
 
 // Whether position pos is in a file of its own (not std's text).
-fn in_file(pos: i64) -> bool {
+fn in_file(pos: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if pos < 0 {
             return false;
         }
-        let f = file_of_pos(pos);
-        f >= 0 && FILES[f].path[0] != '<'
+        let f = file_of_pos(pos, pcx);
+        f >= 0 && pcx.files[f].path[0] != '<'
     }
 }
 
 // Whether position pos has a location: in a file, or in std's text (one
 // of its files).
-fn located(pos: i64, tcx: Tcx<Comp>) -> bool {
-    pos >= 0 && (in_file(pos) || seg_at(pos, tcx) >= 0)
+fn located(pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    pos >= 0 && (in_file(pos, pcx) || seg_at(pos, tcx, pcx) >= 0)
 }
 
 // Whether a reference at pos is shown: in the program's files, and in
 // std's when the request is about a file of std's.
-fn shown(pos: i64, tcx: Tcx<Comp>) -> bool {
-    in_file(pos) || tcx.ask_seg >= 0 && seg_at(pos, tcx) >= 0
+fn shown(pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    in_file(pos, pcx) || tcx.ask_seg >= 0 && seg_at(pos, tcx, pcx) >= 0
 }
 
 // The end of the token at pos (pos + 1 when none starts there).
-fn token_end(pos: i64) -> i64 {
-    unsafe {
-        let t = token_at(pos);
-        if t < TOK_COUNT && TOKS[t].start == pos && TOKS[t].end > pos {
-            return TOKS[t].end;
-        }
-        let f = file_of_pos(pos);
-        if pos < FILES[f].end && SRC[pos] != '\n' { pos + 1 } else { pos }
+fn token_end(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_at(pos, pcx);
+    if t < pcx.toks.len() as i64 && pcx.toks[t].start == pos && pcx.toks[t].end > pos {
+        return pcx.toks[t].end;
     }
+    let f = file_of_pos(pos, pcx);
+    if pos < pcx.files[f].end && SRC[pos] != '\n' { pos + 1 } else { pos }
 }
 
 // `{"uri":..,"range":..}` of the token at pos.
-fn put_location(out: i64, pos: i64, tcx: Tcx<Comp>) {
+fn put_location(out: i64, pos: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     buf_str(out, c"{\"uri\":\"");
-    put_pos_uri(out, pos, tcx);
+    put_pos_uri(out, pos, tcx, pcx);
     buf_str(out, c"\",\"range\":");
-    put_range(out, pos, token_end(pos), tcx);
+    put_range(out, pos, token_end(pos, pcx), tcx, pcx);
     buf_byte(out, '}');
 }
 
 // ---- what is at a position
 
 // The start of the token holding pos (or ending at it), or -1.
-fn token_start(pos: i64) -> i64 {
-    unsafe {
-        let t = token_at(pos);
-        if t < TOK_COUNT && TOKS[t].start == pos {
-            return pos;
-        }
-        if t > 0 && TOKS[t - 1].start <= pos && pos <= TOKS[t - 1].end {
-            return TOKS[t - 1].start;
-        }
-        -1
+fn token_start(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_at(pos, pcx);
+    if t < pcx.toks.len() as i64 && pcx.toks[t].start == pos {
+        return pos;
     }
+    if t > 0 && pcx.toks[t - 1].start <= pos && pos <= pcx.toks[t - 1].end {
+        return pcx.toks[t - 1].start;
+    }
+    -1
 }
 
-fn ensure_refs(tcx: inout Tcx<Comp>) {
+fn ensure_refs(tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     if !tcx.refs_ready {
-        let t0 = now_us();
+        let t0 = now_us(&pcx);
         var all = tcx.all_refs;
-        collect_all_refs(&all, &tcx);
+        collect_all_refs(&all, &tcx, pcx);
         tcx.all_refs = all;
-        lap("references collected", t0, tcx);
+        lap("references collected", t0, tcx, &pcx);
         // (0.25: the program's names, std's and operators' calls)
-        let t1 = now_us();
-        find_operators(&tcx);
-        clean_refs(&tcx);
-        add_unwritten(&tcx);
-        lap("references resolved", t1, tcx);
+        let t1 = now_us(&pcx);
+        find_operators(&tcx, pcx);
+        clean_refs(&tcx, pcx);
+        add_unwritten(&tcx, pcx);
+        lap("references resolved", t1, tcx, &pcx);
         tcx.refs_ready = true;
     }
 }
 
 // The token starting at pos, or -1.
-fn token_starting(pos: i64) -> i64 {
-    unsafe {
-        let t = token_at(pos);
-        if t < TOK_COUNT && TOKS[t].start == pos { t } else { -1 }
-    }
+fn token_starting(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_at(pos, pcx);
+    if t < pcx.toks.len() as i64 && pcx.toks[t].start == pos { t } else { -1 }
 }
 
 // The text of token t.
-fn tok_text(t: i64) -> [u8] {
-    unsafe { SRC[TOKS[t].start..TOKS[t].end] }
+fn tok_text(t: i64, pcx: Ctx<Comp>) -> [u8] {
+    SRC[pcx.toks[t].start..pcx.toks[t].end]
 }
 
 // The kind of token t (Eof past the tokens).
-fn tok_kind(t: i64) -> Tok {
-    if t < 0 || t >= TOK_COUNT {
+fn tok_kind(t: i64, pcx: Ctx<Comp>) -> Tok {
+    if t < 0 || t >= pcx.toks.len() as i64 {
         return Tok::Eof;
     }
     // UNSAFE: the tokens are in TOKS, the lexer's raw array.
     // SAFETY: 0 <= t < TOK_COUNT (checked above): a token the lexer wrote;
     // the worker lexes nothing after it read the program, so TOKS stays.
-    unsafe { TOKS[t].kind }
+    unsafe { pcx.toks[t].kind }
 }
 
 // Whether token kind k is a keyword (`fn`, `let`, `var`, `inout`...; not
@@ -549,59 +545,61 @@ fn is_keyword(k: i64) -> bool {
 // checker made `{ let =+l = a; let =+r = b; =+l.add(=+r) }`
 // (traits.vl: operator_call, negation_call), its call at the operator's
 // start: the operator is the token between the operands.
-fn find_operators(tcx: inout Tcx<Comp>) {
+fn find_operators(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind != NodeKind::Block || NODES[n].count < 1 || NODES[n].count > 2 {
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind != NodeKind::Block || pcx.nodes[n].count < 1
+                || pcx.nodes[n].count > 2 {
                 continue;
             }
-            let first = child(n, 0);
-            if NODES[first].kind != NodeKind::Let
-                || NODES[NODES[first].a].kind != NodeKind::PatBind {
+            let first = child(n, 0, pcx);
+            if pcx.nodes[first].kind != NodeKind::Let
+                || pcx.nodes[pcx.nodes[first].a].kind != NodeKind::PatBind {
                 continue;
             }
-            let name = SYMS[NODES[NODES[first].a].a].text;
+            let name = SYMS[pcx.nodes[pcx.nodes[first].a].a].text;
             if name.len != 3 || name[0] != '=' || name[2] != 'l' {
                 continue;
             }
             // (`!=` negates the call, `<` compares its result)
-            var c = NODES[n].a;
-            if c != 0 && (NODES[c].kind == NodeKind::Unary || NODES[c].kind == NodeKind::Binary) {
-                c = NODES[c].b;
+            var c = pcx.nodes[n].a;
+            if c != 0
+                && (pcx.nodes[c].kind == NodeKind::Unary || pcx.nodes[c].kind == NodeKind::Binary) {
+                c = pcx.nodes[c].b;
             }
-            if c == 0 || NODES[c].kind != NodeKind::Call || NODES[c].x <= 0 {
+            if c == 0 || pcx.nodes[c].kind != NodeKind::Call || pcx.nodes[c].x <= 0 {
                 continue;
             }
-            let fnode = FNS[NODES[c].x - 1].node;
-            var d = def_of_node(fnode, tcx);
+            let fnode = pcx.fns[pcx.nodes[c].x - 1].node;
+            var d = def_of_node(fnode, tcx, pcx);
             if d < 0 {
                 // (a #[derive]'s `eq`, `cmp`: std's trait function)
-                d = trait_fn_named(NODES[fnode].a);
+                d = trait_fn_named(pcx.nodes[fnode].a, pcx);
             }
             if d < 0 {
                 continue;
             }
             var at = -1;
-            if NODES[n].count == 2 {
-                let lhs = NODES[first].c;
-                let rhs = NODES[child(n, 1)].c;
-                var t = token_at(NODES[lhs].end);
-                while t < TOK_COUNT && TOKS[t].kind == Tok::RParen {
+            if pcx.nodes[n].count == 2 {
+                let lhs = pcx.nodes[first].c;
+                let rhs = pcx.nodes[child(n, 1, pcx)].c;
+                var t = token_at(pcx.nodes[lhs].end, pcx);
+                while t < pcx.toks.len() as i64 && pcx.toks[t].kind == Tok::RParen {
                     t += 1;
                 }
-                if t < TOK_COUNT && TOKS[t].start < NODES[rhs].start {
-                    at = TOKS[t].start;
+                if t < pcx.toks.len() as i64 && pcx.toks[t].start < pcx.nodes[rhs].start {
+                    at = pcx.toks[t].start;
                 }
             } else {
-                let t = token_starting(NODES[n].start);
-                if t >= 0 && TOKS[t].kind == Tok::Minus {
-                    at = NODES[n].start;
+                let t = token_starting(pcx.nodes[n].start, pcx);
+                if t >= 0 && pcx.toks[t].kind == Tok::Minus {
+                    at = pcx.nodes[n].start;
                 }
             }
             if at >= 0 {
                 tcx.op_at.push(at);
                 tcx.op_def.push(d);
-                tcx.op_start.push(NODES[c].start);
+                tcx.op_start.push(pcx.nodes[c].start);
             }
         }
     }
@@ -622,11 +620,11 @@ fn operator_def(pos: i64, tcx: Tcx<Comp>) -> i64 {
 // std's trait function named sym (`clone` of Clone, `eq` of Eq): what a
 // call of a function #[derive] wrote names (that function has no item);
 // -1.
-fn trait_fn_named(sym: i64) -> i64 {
+fn trait_fn_named(sym: i64, pcx: Ctx<Comp>) -> i64 {
     var any = -1;
-    for d in 0..DEFS.len() as i64 {
-        if DEFS[d].kind == K_TRAIT_FN && DEFS[d].name == sym {
-            let fqn = SYMS[DEFS[d].fqn].text;
+    for d in 0..pcx.defs.len() as i64 {
+        if pcx.defs[d].kind == K_TRAIT_FN && pcx.defs[d].name == sym {
+            let fqn = SYMS[pcx.defs[d].fqn].text;
             if fqn.len > 5 && fqn[0..5] == "std::" {
                 return d;
             }
@@ -645,33 +643,35 @@ fn trait_fn_named(sym: i64) -> i64 {
 // (`Token` of `use Token::{Num, Plus};`: the program's type, trait or
 // module of that name, else std's). (The candidates' positions in a map,
 // then one pass over the references.)
-fn add_unwritten(tcx: inout Tcx<Comp>) {
+fn add_unwritten(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         // (position, token, call node or 0 for a path's head)
         var cand = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || NODES[n].count == 0 {
+        for n in 1..pcx.nodes.len() as i64 {
+            if pcx.nodes[n].kind != NodeKind::Call || pcx.nodes[n].x <= 0
+                || pcx.nodes[n].count == 0 {
                 continue;
             }
-            let recv = child(n, 0);
-            if NODES[recv].end <= NODES[recv].start {
+            let recv = child(n, 0, pcx);
+            if pcx.nodes[recv].end <= pcx.nodes[recv].start {
                 continue;
             }
-            var t = token_at(NODES[recv].end);
-            while t < TOK_COUNT && TOKS[t].kind == Tok::RParen {
+            var t = token_at(pcx.nodes[recv].end, pcx);
+            while t < pcx.toks.len() as i64 && pcx.toks[t].kind == Tok::RParen {
                 t += 1;
             }
-            if t + 1 < TOK_COUNT && TOKS[t].kind == Tok::Dot && TOKS[t + 1].kind == Tok::Ident
-                && TOKS[t + 1].start < NODES[n].end {
-                cand.push(TOKS[t + 1].start);
+            if t + 1 < pcx.toks.len() as i64 && pcx.toks[t].kind == Tok::Dot
+                && pcx.toks[t + 1].kind == Tok::Ident
+                && pcx.toks[t + 1].start < pcx.nodes[n].end {
+                cand.push(pcx.toks[t + 1].start);
                 cand.push(t + 1);
                 cand.push(n);
             }
         }
-        for t in 0..TOK_COUNT - 1 {
-            if TOKS[t].kind == Tok::Ident && TOKS[t + 1].kind == Tok::ColonColon
-                && in_file(TOKS[t].start) {
-                cand.push(TOKS[t].start);
+        for t in 0..pcx.toks.len() as i64 - 1 {
+            if pcx.toks[t].kind == Tok::Ident && pcx.toks[t + 1].kind == Tok::ColonColon
+                && in_file(pcx.toks[t].start, pcx) {
+                cand.push(pcx.toks[t].start);
                 cand.push(t);
                 cand.push(0);
             }
@@ -702,27 +702,29 @@ fn add_unwritten(tcx: inout Tcx<Comp>) {
             }
             var d = -1;
             if n != 0 {
-                let fnode = FNS[NODES[n].x - 1].node;
-                d = def_of_node(fnode, tcx);
+                let fnode = pcx.fns[pcx.nodes[n].x - 1].node;
+                d = def_of_node(fnode, tcx, pcx);
                 if d < 0 {
-                    d = trait_fn_named(TOKS[t].value as i64);
+                    d = trait_fn_named(pcx.toks[t].value as i64, pcx);
                 }
-            } else if local_named_at(p, &tcx) < 0 {
+            } else if local_named_at(p, &tcx, pcx) < 0 {
                 if !named_ready {
-                    for e in 0..DEFS.len() as i64 {
-                        let k = DEFS[e].kind;
+                    for e in 0..pcx.defs.len() as i64 {
+                        let k = pcx.defs[e].kind;
                         if k != K_STRUCT && k != K_ENUM && k != K_TRAIT && k != K_ALIAS
                             && k != K_MOD {
                             continue;
                         }
-                        let have = named.get(DEFS[e].name + 1) - 1;
-                        if have < 0 || !in_file(DEFS[have].name_pos) && in_file(DEFS[e].name_pos) {
-                            named.put(DEFS[e].name + 1, e + 1);
+                        let have = named.get(pcx.defs[e].name + 1) - 1;
+                        if have < 0
+                            || !in_file(pcx.defs[have].name_pos, pcx)
+                            && in_file(pcx.defs[e].name_pos, pcx) {
+                            named.put(pcx.defs[e].name + 1, e + 1);
                         }
                     }
                     named_ready = true;
                 }
-                d = named.get(TOKS[t].value as i64 + 1) - 1;
+                d = named.get(pcx.toks[t].value as i64 + 1) - 1;
             }
             if d >= 0 {
                 tcx.all_refs.push(p);
@@ -742,7 +744,7 @@ fn add_unwritten(tcx: inout Tcx<Comp>) {
 // moved to the operator. (A map of the few positions with such a
 // reference, not of every reference: the compiler's source has a
 // million.)
-fn clean_refs(tcx: inout Tcx<Comp>) {
+fn clean_refs(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         let n = tcx.all_refs.count / 3;
         // each reference's token when it is not written as its name, else -1
@@ -751,9 +753,9 @@ fn clean_refs(tcx: inout Tcx<Comp>) {
         for r in 0..n {
             let p = tcx.all_refs.data[3 * r];
             let d = tcx.all_refs.data[3 * r + 1];
-            let t = token_starting(p);
+            let t = token_starting(p, pcx);
             if t >= 0 && (tcx.all_refs.data[3 * r + 2] & QF_DEF) == 0
-                && !(TOKS[t].kind == Tok::Ident && TOKS[t].value as i64 == DEFS[d].name) {
+                && !(pcx.toks[t].kind == Tok::Ident && pcx.toks[t].value as i64 == pcx.defs[d].name) {
                 odd.push(t);
                 suspect.put(p + 1, 1);
             } else {
@@ -782,7 +784,7 @@ fn clean_refs(tcx: inout Tcx<Comp>) {
             var keep = true;
             var at = p;
             if t >= 0 {
-                let text = tok_text(t);
+                let text = tok_text(t, pcx);
                 keep = false;
                 if ops_at.get(p + 1) != 0 {
                     for k in 0..tcx.op_start.count {
@@ -794,11 +796,11 @@ fn clean_refs(tcx: inout Tcx<Comp>) {
                         }
                     }
                 }
-                if !keep && TOKS[t].kind == Tok::Ident {
+                if !keep && pcx.toks[t].kind == Tok::Ident {
                     // (`self`, `Self`; an import's other name: `use a::{b as c}`)
                     keep = text == "self" || text == "Self"
-                        || suspect.get(p + 1) != 2 && local_named_at(p, &tcx) < 0
-                        && !is_primitive(t) && text != "result" && text != "requires"
+                        || suspect.get(p + 1) != 2 && local_named_at(p, &tcx, pcx) < 0
+                        && !is_primitive(t, pcx) && text != "result" && text != "requires"
                         && text != "ensures";
                 }
             }
@@ -815,14 +817,14 @@ fn clean_refs(tcx: inout Tcx<Comp>) {
 
 // The definition named at position start (a reference, or a definition's
 // name; one written as its name first; an operator's function), or -1.
-fn def_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
+fn def_named_at(start: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         if start < 0 {
             return -1;
         }
-        ensure_refs(&tcx);
-        let t = token_starting(start);
-        if t >= 0 && is_keyword(TOKS[t].kind as i64) {
+        ensure_refs(&tcx, &pcx);
+        let t = token_starting(start, pcx);
+        if t >= 0 && is_keyword(pcx.toks[t].kind as i64) {
             return -1;
         }
         var other = -1;
@@ -830,7 +832,9 @@ fn def_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
         while i < tcx.all_refs.count {
             if tcx.all_refs.data[i] == start {
                 let d = tcx.all_refs.data[i + 1];
-                if t < 0 || TOKS[t].value as i64 == DEFS[d].name && TOKS[t].kind == Tok::Ident {
+                if t < 0
+                    || pcx.toks[t].value as i64 == pcx.defs[d].name
+                    && pcx.toks[t].kind == Tok::Ident {
                     return d;
                 }
                 if other < 0 {
@@ -842,18 +846,18 @@ fn def_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
         if other < 0 {
             other = operator_def(start, tcx);
         }
-        if other < 0 && t >= 0 && TOKS[t].kind == Tok::Ident && tok_text(t) == "Self" {
+        if other < 0 && t >= 0 && pcx.toks[t].kind == Tok::Ident && tok_text(t, pcx) == "Self" {
             // (in a trait: the trait)
             var best = 0;
-            for n in 1..NODES.len() as i64 {
-                if NODES[n].kind == NodeKind::Trait && NODES[n].start <= start
-                    && start < NODES[n].end
-                    && (best == 0 || NODES[n].start > NODES[best].start) {
+            for n in 1..pcx.nodes.len() as i64 {
+                if pcx.nodes[n].kind == NodeKind::Trait && pcx.nodes[n].start <= start
+                    && start < pcx.nodes[n].end
+                    && (best == 0 || pcx.nodes[n].start > pcx.nodes[best].start) {
                     best = n;
                 }
             }
             if best != 0 {
-                other = def_of_node(best, tcx);
+                other = def_of_node(best, tcx, pcx);
             }
         }
         other
@@ -865,67 +869,61 @@ fn def_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
 // The declaration of the type parameter named at start (`T` of `fn f<T>`,
 // of the impl, struct, enum or trait around it), or -1; *item: the item
 // declaring it.
-fn type_param_at(start: i64, item: inout i64) -> i64 {
-    unsafe {
-        let t = token_starting(start);
-        if t < 0 || TOKS[t].kind != Tok::Ident {
-            return -1;
-        }
-        let sym = TOKS[t].value as i64;
-        var best = -1;
-        var best_start = -1;
-        for n in 1..NODES.len() as i64 {
-            let k = NODES[n].kind;
-            if k != NodeKind::Fn && k != NodeKind::Struct && k != NodeKind::Enum
-                && k != NodeKind::Trait && k != NodeKind::Impl && k != NodeKind::TypeAlias {
-                continue;
-            }
-            let g = NODES[n].g;
-            if g == 0 || NODES[n].start > start || NODES[n].end <= start
-                || NODES[n].start <= best_start {
-                continue;
-            }
-            for i in 0..NODES[g].count {
-                let p = child(g, i);
-                if NODES[p].kind == NodeKind::TyName && NODES[p].a == sym {
-                    best = NODES[p].start;
-                    best_start = NODES[n].start;
-                    item = n;
-                }
-            }
-        }
-        best
+fn type_param_at(start: i64, item: inout i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_starting(start, pcx);
+    if t < 0 || pcx.toks[t].kind != Tok::Ident {
+        return -1;
     }
+    let sym = pcx.toks[t].value as i64;
+    var best = -1;
+    var best_start = -1;
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if k != NodeKind::Fn && k != NodeKind::Struct && k != NodeKind::Enum
+            && k != NodeKind::Trait && k != NodeKind::Impl && k != NodeKind::TypeAlias {
+            continue;
+        }
+        let g = pcx.nodes[n].g;
+        if g == 0 || pcx.nodes[n].start > start || pcx.nodes[n].end <= start
+            || pcx.nodes[n].start <= best_start {
+            continue;
+        }
+        for i in 0..pcx.nodes[g].count {
+            let p = child(g, i, pcx);
+            if pcx.nodes[p].kind == NodeKind::TyName && pcx.nodes[p].a == sym {
+                best = pcx.nodes[p].start;
+                best_start = pcx.nodes[n].start;
+                item = n;
+            }
+        }
+    }
+    best
 }
 
 // The uses of the name of token t in from..to, into out (in order).
-fn same_name_in(t: i64, from: i64, to: i64, out: inout IntVec) {
-    unsafe {
-        let a = token_at(from);
-        for u in a..TOK_COUNT {
-            if TOKS[u].start >= to {
-                break;
-            }
-            if TOKS[u].kind == TOKS[t].kind && TOKS[u].value == TOKS[t].value {
-                out.push(TOKS[u].start);
-            }
+fn same_name_in(t: i64, from: i64, to: i64, out: inout IntVec, pcx: Ctx<Comp>) {
+    let a = token_at(from, pcx);
+    for u in a..pcx.toks.len() as i64 {
+        if pcx.toks[u].start >= to {
+            break;
+        }
+        if pcx.toks[u].kind == pcx.toks[t].kind && pcx.toks[u].value == pcx.toks[t].value {
+            out.push(pcx.toks[u].start);
         }
     }
 }
 
 // What a path's first segment at start names: 1 `std`, 2 `crate`, 3
 // `super`, 4 `self`, else 0.
-fn root_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
-    unsafe {
-        let t = token_starting(start);
-        if t < 0 || t + 1 >= TOK_COUNT || TOKS[t].kind != Tok::Ident
-            || TOKS[t + 1].kind != Tok::ColonColon || local_named_at(start, &tcx) >= 0 {
-            return 0;
-        }
-        let w = tok_text(t);
-        if w == "std" { 1 } else if w == "crate" { 2 } else if w == "super" { 3 }
-        else if w == "self" { 4 } else { 0 }
+fn root_named_at(start: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let t = token_starting(start, pcx);
+    if t < 0 || t + 1 >= pcx.toks.len() as i64 || pcx.toks[t].kind != Tok::Ident
+        || pcx.toks[t + 1].kind != Tok::ColonColon || local_named_at(start, &tcx, pcx) >= 0 {
+        return 0;
     }
+    let w = tok_text(t, pcx);
+    if w == "std" { 1 } else if w == "crate" { 2 } else if w == "super" { 3 }
+    else if w == "self" { 4 } else { 0 }
 }
 
 // Where the root named by `which` at position at starts: std's first
@@ -933,25 +931,25 @@ fn root_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
 // (its name), else at's file; `super`: the module around that one, or
 // the file `mod x { }` is in; -1 when it has no place (`super` of a
 // file: its parent's `mod x;` is not looked for).
-fn root_start(which: i64, at: i64, tcx: Tcx<Comp>) -> i64 {
+fn root_start(which: i64, at: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if which == 1 {
             return if tcx.std_f >= 0
-                && seg_at(FILES[tcx.std_f].start, tcx) >= 0 { FILES[tcx.std_f].start }
+                && seg_at(pcx.files[tcx.std_f].start, tcx, pcx) >= 0 { pcx.files[tcx.std_f].start }
                 else { -1 };
         }
         if which >= 3 {
             // (the braces open before at: a `mod x {` one is its module's,
             // its name's position on the stack, else -1)
-            let f = file_of_pos(at);
+            let f = file_of_pos(at, pcx);
             var open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            var t = token_at(FILES[f].start);
-            while t < TOK_COUNT && TOKS[t].start < at {
-                if TOKS[t].kind == Tok::LBrace {
-                    let m = t >= 2 && TOKS[t - 2].kind == Tok::Mod
-                        && TOKS[t - 1].kind == Tok::Ident;
-                    open.push(if m { TOKS[t - 1].start } else { -1 });
-                } else if TOKS[t].kind == Tok::RBrace && open.count > 0 {
+            var t = token_at(pcx.files[f].start, pcx);
+            while t < pcx.toks.len() as i64 && pcx.toks[t].start < at {
+                if pcx.toks[t].kind == Tok::LBrace {
+                    let m = t >= 2 && pcx.toks[t - 2].kind == Tok::Mod
+                        && pcx.toks[t - 1].kind == Tok::Ident;
+                    open.push(if m { pcx.toks[t - 1].start } else { -1 });
+                } else if pcx.toks[t].kind == Tok::RBrace && open.count > 0 {
                     open.count -= 1;
                 }
                 t += 1;
@@ -965,13 +963,13 @@ fn root_start(which: i64, at: i64, tcx: Tcx<Comp>) -> i64 {
                 }
             }
             if which == 4 {
-                return if inner >= 0 { inner } else { FILES[f].start };
+                return if inner >= 0 { inner } else { pcx.files[f].start };
             }
-            return if inner < 0 { -1 } else if outer >= 0 { outer } else { FILES[f].start };
+            return if inner < 0 { -1 } else if outer >= 0 { outer } else { pcx.files[f].start };
         }
-        for f in 0..FILES.len() {
-            if cstr(FILES[f].path) == cstr(tcx.root_given) {
-                return FILES[f].start;
+        for f in 0..pcx.files.len() {
+            if cstr(pcx.files[f].path) == cstr(tcx.root_given) {
+                return pcx.files[f].start;
             }
         }
         -1
@@ -979,148 +977,135 @@ fn root_start(which: i64, at: i64, tcx: Tcx<Comp>) -> i64 {
 }
 
 // The positions of every `std::` (`crate::`) in the shown files, into out.
-fn root_uses(which: i64, out: inout IntVec, tcx: inout Tcx<Comp>) {
-    unsafe {
-        for t in 0..TOK_COUNT - 1 {
-            if TOKS[t].kind == Tok::Ident && TOKS[t + 1].kind == Tok::ColonColon
-                && shown(TOKS[t].start, tcx) && root_named_at(TOKS[t].start, &tcx) == which {
-                out.push(TOKS[t].start);
-            }
+fn root_uses(which: i64, out: inout IntVec, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
+    for t in 0..pcx.toks.len() as i64 - 1 {
+        if pcx.toks[t].kind == Tok::Ident && pcx.toks[t + 1].kind == Tok::ColonColon
+            && shown(pcx.toks[t].start, tcx, pcx)
+            && root_named_at(pcx.toks[t].start, &tcx, pcx) == which {
+            out.push(pcx.toks[t].start);
         }
     }
 }
 
 // Whether token t is a primitive type's name (`i64`, `u8`, `bool`...).
-fn is_primitive(t: i64) -> bool {
-    unsafe { t >= 0 && TOKS[t].kind == Tok::Ident && primitive_text(tok_text(t)).len > 0 }
+fn is_primitive(t: i64, pcx: Ctx<Comp>) -> bool {
+    t >= 0 && pcx.toks[t].kind == Tok::Ident && primitive_text(tok_text(t, pcx)).len > 0
 }
 
 // The attribute named at start (`derive` of `#[derive(..)]`): its token,
 // or -1.
-fn attribute_at(start: i64) -> i64 {
-    unsafe {
-        let t = token_starting(start);
-        if t < 2 || TOKS[t].kind != Tok::Ident || TOKS[t - 1].kind != Tok::LBracket
-            || TOKS[t - 2].kind != Tok::Hash {
-            return -1;
-        }
-        t
+fn attribute_at(start: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_starting(start, pcx);
+    if t < 2 || pcx.toks[t].kind != Tok::Ident || pcx.toks[t - 1].kind != Tok::LBracket
+        || pcx.toks[t - 2].kind != Tok::Hash {
+        return -1;
     }
+    t
 }
 
 // The position of the name sym in node n's tokens (its start when none).
-fn name_in_node(n: i64, sym: i64) -> i64 {
-    unsafe {
-        var u = token_at(NODES[n].start);
-        while u < TOK_COUNT && TOKS[u].start < NODES[n].end {
-            if TOKS[u].kind == Tok::Ident && TOKS[u].value as i64 == sym {
-                return TOKS[u].start;
-            }
-            u += 1;
+fn name_in_node(n: i64, sym: i64, pcx: Ctx<Comp>) -> i64 {
+    var u = token_at(pcx.nodes[n].start, pcx);
+    while u < pcx.toks.len() as i64 && pcx.toks[u].start < pcx.nodes[n].end {
+        if pcx.toks[u].kind == Tok::Ident && pcx.toks[u].value as i64 == sym {
+            return pcx.toks[u].start;
         }
-        NODES[n].start
+        u += 1;
     }
+    pcx.nodes[n].start
 }
 
 // The associated type named at start: `type Output = Meters;` of an impl
 // or `type Output;` of a trait (itself), `T::Output`, `Self::Item` or a
 // bound's `Item = i64` (the trait's `type Item;`): its AssocType node, or
 // 0; *decl: where the name is declared.
-fn assoc_at(start: i64, decl: inout i64, tcx: Tcx<Comp>) -> i64 {
-    unsafe {
-        let t = token_starting(start);
-        if t < 1 || TOKS[t].kind != Tok::Ident {
-            return 0;
-        }
-        let sym = TOKS[t].value as i64;
-        let item = TOKS[t - 1].kind == Tok::Type;
-        let path = TOKS[t - 1].kind == Tok::ColonColon;
-        var in_trait = 0;
-        var here = 0;
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind != NodeKind::AssocType || NODES[n].a != sym {
-                continue;
-            }
-            let p = name_in_node(n, sym);
-            if p == start {
-                here = n;
-            }
-            if NODES[n].b == 0 && in_trait == 0 && located(p, tcx) {
-                in_trait = n;
-            }
-        }
-        if here != 0 && (item || in_trait == 0) {
-            decl = start;
-            return here;
-        }
-        if (path || here != 0) && in_trait != 0 {
-            decl = name_in_node(in_trait, sym);
-            return in_trait;
-        }
-        0
+fn assoc_at(start: i64, decl: inout i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
+    let t = token_starting(start, pcx);
+    if t < 1 || pcx.toks[t].kind != Tok::Ident {
+        return 0;
     }
+    let sym = pcx.toks[t].value as i64;
+    let item = pcx.toks[t - 1].kind == Tok::Type;
+    let path = pcx.toks[t - 1].kind == Tok::ColonColon;
+    var in_trait = 0;
+    var here = 0;
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::AssocType || pcx.nodes[n].a != sym {
+            continue;
+        }
+        let p = name_in_node(n, sym, pcx);
+        if p == start {
+            here = n;
+        }
+        if pcx.nodes[n].b == 0 && in_trait == 0 && located(p, tcx, pcx) {
+            in_trait = n;
+        }
+    }
+    if here != 0 && (item || in_trait == 0) {
+        decl = start;
+        return here;
+    }
+    if (path || here != 0) && in_trait != 0 {
+        decl = name_in_node(in_trait, sym, pcx);
+        return in_trait;
+    }
+    0
 }
 
 // The uses of the associated type's name of token t in the shown files
 // (its declarations, `X::Name`, `Name = T`), into out.
-fn assoc_uses(t: i64, out: inout IntVec, tcx: Tcx<Comp>) {
-    unsafe {
-        for u in 1..TOK_COUNT - 1 {
-            if TOKS[u].kind != Tok::Ident || TOKS[u].value != TOKS[t].value
-                || !shown(TOKS[u].start, tcx) {
-                continue;
-            }
-            let k = TOKS[u - 1].kind;
-            if k == Tok::Type || k == Tok::ColonColon || TOKS[u + 1].kind == Tok::Eq
-                && (k == Tok::Lt || k == Tok::Comma) {
-                out.push(TOKS[u].start);
-            }
+fn assoc_uses(t: i64, out: inout IntVec, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
+    for u in 1..pcx.toks.len() as i64 - 1 {
+        if pcx.toks[u].kind != Tok::Ident || pcx.toks[u].value != pcx.toks[t].value
+            || !shown(pcx.toks[u].start, tcx, pcx) {
+            continue;
+        }
+        let k = pcx.toks[u - 1].kind;
+        if k == Tok::Type || k == Tok::ColonColon || pcx.toks[u + 1].kind == Tok::Eq
+            && (k == Tok::Lt || k == Tok::Comma) {
+            out.push(pcx.toks[u].start);
         }
     }
 }
 
 // The parameter named at start that is no local (of a C function, of a
 // trait's function without a body): its Param node, or 0.
-fn param_at(start: i64) -> i64 {
-    unsafe {
-        let t = token_starting(start);
-        if t < 0 || TOKS[t].kind != Tok::Ident {
-            return 0;
-        }
-        for n in 1..NODES.len() as i64 {
-            if NODES[n].kind == NodeKind::Param && NODES[n].a == TOKS[t].value as i64
-                && NODES[n].start <= start && start < NODES[n].end
-                && name_in_node(n, NODES[n].a) == start {
-                return n;
-            }
-        }
-        0
+fn param_at(start: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_starting(start, pcx);
+    if t < 0 || pcx.toks[t].kind != Tok::Ident {
+        return 0;
     }
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind == NodeKind::Param && pcx.nodes[n].a == pcx.toks[t].value as i64
+            && pcx.nodes[n].start <= start && start < pcx.nodes[n].end
+            && name_in_node(n, pcx.nodes[n].a, pcx) == start {
+            return n;
+        }
+    }
+    0
 }
 
 // The attribute token t is in (`C` of `#[repr(C)]`): its name's token, or
 // -1.
-fn enclosing_attribute(t: i64) -> i64 {
-    unsafe {
-        var depth = 0;
-        var u = t - 1;
-        while u > 0 && u > t - 64 {
-            let k = TOKS[u].kind;
-            if k == Tok::Semi || k == Tok::LBrace || k == Tok::RBrace {
-                return -1;
-            }
-            if k == Tok::RBracket {
-                depth += 1;
-            } else if k == Tok::LBracket {
-                if depth == 0 {
-                    return if TOKS[u - 1].kind == Tok::Hash && u + 1 < t { u + 1 } else { -1 };
-                }
-                depth -= 1;
-            }
-            u -= 1;
+fn enclosing_attribute(t: i64, pcx: Ctx<Comp>) -> i64 {
+    var depth = 0;
+    var u = t - 1;
+    while u > 0 && u > t - 64 {
+        let k = pcx.toks[u].kind;
+        if k == Tok::Semi || k == Tok::LBrace || k == Tok::RBrace {
+            return -1;
         }
-        -1
+        if k == Tok::RBracket {
+            depth += 1;
+        } else if k == Tok::LBracket {
+            if depth == 0 {
+                return if pcx.toks[u - 1].kind == Tok::Hash && u + 1 < t { u + 1 } else { -1 };
+            }
+            depth -= 1;
+        }
+        u -= 1;
     }
+    -1
 }
 
 // The source text from..to on one line (runs of blanks as one), without
@@ -1147,21 +1132,21 @@ fn put_collapsed(md: i64, from: i64, to: i64) {
 
 // The declaration of the local named at start, or -1 (local_at's answer,
 // from a table of every position made once: 0.25).
-fn local_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
+fn local_named_at(start: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     if start < 0 {
         return -1;
     }
     if !tcx.locals_ready {
-        load_local_decls(&tcx);
-        for n in 1..NODES.len() as i64 {
-            let p = decl_name_pos(n);
-            if p >= NODES[n].start && p < NODES[n].end && tcx.local_at.get(p + 1) == 0
-                && tcx.local_decl.get(NODES[n].x + 1) == p + 1 {
+        load_local_decls(&tcx, pcx);
+        for n in 1..pcx.nodes.len() as i64 {
+            let p = decl_name_pos(n, pcx);
+            if p >= pcx.nodes[n].start && p < pcx.nodes[n].end && tcx.local_at.get(p + 1) == 0
+                && tcx.local_decl.get(pcx.nodes[n].x + 1) == p + 1 {
                 tcx.local_at.put(p + 1, p + 1);
             }
-            let s = NODES[n].start;
-            if s >= 0 && NODES[n].end > s {
-                let d = decl_of_use(n, tcx);
+            let s = pcx.nodes[n].start;
+            if s >= 0 && pcx.nodes[n].end > s {
+                let d = decl_of_use(n, tcx, pcx);
                 if d >= 0 && tcx.local_at.get(s + 1) == 0 {
                     tcx.local_at.put(s + 1, d + 1);
                 }
@@ -1173,42 +1158,42 @@ fn local_named_at(start: i64, tcx: inout Tcx<Comp>) -> i64 {
 }
 
 // LOCAL_DECL, made once.
-fn load_local_decls(tcx: inout Tcx<Comp>) {
+fn load_local_decls(tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
     if tcx.local_decl.count > 0 {
         return;
     }
     var skip = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-    for n in 1..NODES.len() as i64 {
-        let k = NODES[n].kind;
-        if k == NodeKind::ExternFn || k == NodeKind::Fn && NODES[n].c == 0 {
-            for i in 0..NODES[n].count {
-                skip.put(child(n, i) + 1, 1);
+    for n in 1..pcx.nodes.len() as i64 {
+        let k = pcx.nodes[n].kind;
+        if k == NodeKind::ExternFn || k == NodeKind::Fn && pcx.nodes[n].c == 0 {
+            for i in 0..pcx.nodes[n].count {
+                skip.put(child(n, i, pcx) + 1, 1);
             }
         }
     }
-    for n in 1..NODES.len() as i64 {
+    for n in 1..pcx.nodes.len() as i64 {
         if skip.get(n + 1) != 0 {
             continue;
         }
-        let p = decl_name_pos(n);
-        if p >= 0 && tcx.local_decl.get(NODES[n].x + 1) == 0 {
-            tcx.local_decl.put(NODES[n].x + 1, p + 1);
+        let p = decl_name_pos(n, pcx);
+        if p >= 0 && tcx.local_decl.get(pcx.nodes[n].x + 1) == 0 {
+            tcx.local_decl.put(pcx.nodes[n].x + 1, p + 1);
         }
     }
 }
 
 // The position of the declaration of the local node n names, or -1
 // (refactor_mod/local's use_decl, on LOCAL_DECL).
-fn decl_of_use(n: i64, tcx: Tcx<Comp>) -> i64 {
+fn decl_of_use(n: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if (NODES[n].p & NODE_CAPTURE) != 0 && NODES[n].d > 0 {
-            return tcx.local_decl.get(NODES[n].d) - 1;
+        if (pcx.nodes[n].p & NODE_CAPTURE) != 0 && pcx.nodes[n].d > 0 {
+            return tcx.local_decl.get(pcx.nodes[n].d) - 1;
         }
-        if NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+        if pcx.nodes[n].kind != NodeKind::Ident || pcx.nodes[n].res != Res::Local {
             return -1;
         }
-        let l = NODES[n].y;
-        if l < 0 || l >= LOCAL_COUNT || LOCALS[l].name != NODES[n].a {
+        let l = pcx.nodes[n].y;
+        if l < 0 || l >= pcx.local_count || pcx.locals[l].name != pcx.nodes[n].a {
             return -1;
         }
         tcx.local_decl.get(l + 1) - 1
@@ -1303,14 +1288,14 @@ fn header_path(p: [u8]) -> i64 {
 
 // The place (C_ORIGINS) of the declaration imported from C whose vole
 // text holds position pos, or -1.
-fn c_origin_at(pos: i64) -> i64 {
-    let n = C_EMIT_AT.count / 2;
-    if IMPORTED_START < 0 || pos < IMPORTED_START || n == 0
-        || file_of_pos(pos) != file_of_pos(IMPORTED_START) {
+fn c_origin_at(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let n = pcx.c_emit_at.count / 2;
+    if pcx.imported_start < 0 || pos < pcx.imported_start || n == 0
+        || file_of_pos(pos, pcx) != file_of_pos(pcx.imported_start, pcx) {
         return -1;
     }
-    let off = pos - IMPORTED_START;
-    if C_EMIT_AT.get(0) > off {
+    let off = pos - pcx.imported_start;
+    if pcx.c_emit_at.get(0) > off {
         return -1;
     }
     // (the last mark at or before off)
@@ -1318,24 +1303,24 @@ fn c_origin_at(pos: i64) -> i64 {
     var hi = n;
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        if C_EMIT_AT.get(mid * 2) <= off { lo = mid; } else { hi = mid; }
+        if pcx.c_emit_at.get(mid * 2) <= off { lo = mid; } else { hi = mid; }
     }
-    C_EMIT_AT.get(lo * 2 + 1)
+    pcx.c_emit_at.get(lo * 2 + 1)
 }
 
 // Where place o's name is: its header's path, its line (from 1), its
 // name; an empty path when it has none.
-fn c_place(o: i64) -> ([u8], i64, [u8]) {
-    let (file, line, text, _) = ctok_place(C_ORIGINS.get(o * 3));
+fn c_place(o: i64, pcx: Ctx<Comp>) -> ([u8], i64, [u8]) {
+    let (file, line, text, _) = ctok_place(pcx.c_origins.get(o * 3), pcx);
     if file < 0 {
         return ("", 0, "");
     }
-    (cfile_path(file), line, sym_text(text))
+    (cfile_path(file, pcx), line, sym_text(text))
 }
 
 // `{"uri":..,"range":..}` of place o: its name on its line of its header.
-fn put_c_location(out: i64, o: i64, tcx: inout Tcx<Comp>) -> bool {
-    let (path, line, name) = c_place(o);
+fn put_c_location(out: i64, o: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
+    let (path, line, name) = c_place(o, pcx);
     if path.len == 0 {
         return false;
     }
@@ -1369,20 +1354,20 @@ fn put_c_location(out: i64, o: i64, tcx: inout Tcx<Comp>) -> bool {
 // buffers of their paths, into out): vole.cSources (C_SOURCES), and the
 // C file beside each header the program imports by a relative path
 // (`import "./ring.h"`: ./ring.c, when there is one).
-fn c_source_files(out: inout IntVec, tcx: Tcx<Comp>) {
+fn c_source_files(out: inout IntVec, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     for i in 0..tcx.c_sources.count {
         out.push(tcx.c_sources.get(i));
     }
     var i = 0;
-    while i + 1 < C_IMPORT_PATHS.count {
-        let k = C_IMPORT_PATHS.get(i);
-        let p = sym_text(C_IMPORT_PATHS.get(i + 1));
+    while i + 1 < pcx.c_import_paths.count {
+        let k = pcx.c_import_paths.get(i);
+        let p = sym_text(pcx.c_import_paths.get(i + 1));
         i += 2;
-        let t = token_starting(C_IMPORT_POS.get(k));
+        let t = token_starting(pcx.c_import_pos.get(k), pcx);
         if t < 0 {
             continue;
         }
-        let s = tok_text(t);
+        let s = tok_text(t, pcx);
         if s.len < 4 || s[1] != '.' || p.len < 2
             || p[p.len as i64 - 2..] != ".h" {
             continue;
@@ -1493,9 +1478,9 @@ fn c_body_at(text: [u8], name: [u8]) -> i64 {
 
 // `,{"uri":..,"range":..}` of each body of C function `name` in the C
 // files the program is built with, onto out; how many.
-fn put_c_bodies(out: i64, name: [u8], tcx: inout Tcx<Comp>) -> i64 {
+fn put_c_bodies(out: i64, name: [u8], tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> i64 {
     var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    c_source_files(&files, tcx);
+    c_source_files(&files, tcx, pcx);
     var found = 0;
     for f in 0..files.count {
         let path = buf_slice(files.get(f));
@@ -1523,17 +1508,17 @@ fn put_c_bodies(out: i64, name: [u8], tcx: inout Tcx<Comp>) -> i64 {
 
 // The `import` whose header's string starts at start: the header's path,
 // else empty.
-fn import_header_at(start: i64) -> [u8] {
-    let t = token_starting(start);
-    if t <= 0 || tok_kind(t) != Tok::Str || tok_kind(t - 1) != Tok::Import {
+fn import_header_at(start: i64, pcx: Ctx<Comp>) -> [u8] {
+    let t = token_starting(start, pcx);
+    if t <= 0 || tok_kind(t, pcx) != Tok::Str || tok_kind(t - 1, pcx) != Tok::Import {
         return "";
     }
-    for k in 0..C_IMPORT_POS.count {
-        if C_IMPORT_POS.get(k) == start {
+    for k in 0..pcx.c_import_pos.count {
+        if pcx.c_import_pos.get(k) == start {
             var i = 0;
-            while i + 1 < C_IMPORT_PATHS.count {
-                if C_IMPORT_PATHS.get(i) == k {
-                    return sym_text(C_IMPORT_PATHS.get(i + 1));
+            while i + 1 < pcx.c_import_paths.count {
+                if pcx.c_import_paths.get(i) == k {
+                    return sym_text(pcx.c_import_paths.get(i + 1));
                 }
                 i += 2;
             }
@@ -1544,63 +1529,65 @@ fn import_header_at(start: i64) -> [u8] {
 
 // (0.25.3) The file of the include_str or include_bytes whose name or
 // path string starts at start, else empty.
-fn embedded_file_at(start: i64) -> [u8] {
-    var t = token_starting(start);
+fn embedded_file_at(start: i64, pcx: Ctx<Comp>) -> [u8] {
+    var t = token_starting(start, pcx);
     if t <= 0 {
         return "";
     }
     // (0.26.0) `embed wgsl K from "x.wgsl";`: the string, or `from`
-    let s = if tok_kind(t) == Tok::Str { t } else { t + 1 };
-    if s >= 4 && tok_kind(s) == Tok::Str && tok_word(s - 1) == "from"
-        && tok_word(s - 4) == "embed" {
+    let s = if tok_kind(t, pcx) == Tok::Str { t } else { t + 1 };
+    if s >= 4 && tok_kind(s, pcx) == Tok::Str && tok_word(s - 1, pcx) == "from"
+        && tok_word(s - 4, pcx) == "embed" {
         // UNSAFE: the tokens are in TOKS, the lexer's raw array.
         // SAFETY: tok_kind(s) is Str, not Eof, so 0 <= s < TOK_COUNT.
-        let (at, path) = unsafe { (TOKS[s].start, TOKS[s].value as i64) };
-        return buf_path(embed_path(at, crate::front::lexer::str_at(path)));
+        let (at, path) = unsafe { (pcx.toks[s].start, pcx.toks[s].value as i64) };
+        return buf_path(embed_path(at, crate::front::lexer::str_at(path), pcx));
     }
-    if tok_kind(t) == Tok::Ident {
-        t += if tok_kind(t + 1) == Tok::Bang { 3 } else { 2 };
+    if tok_kind(t, pcx) == Tok::Ident {
+        t += if tok_kind(t + 1, pcx) == Tok::Bang { 3 } else { 2 };
     }
-    if tok_kind(t) != Tok::Str || tok_kind(t - 1) != Tok::LParen {
+    if tok_kind(t, pcx) != Tok::Str || tok_kind(t - 1, pcx) != Tok::LParen {
         return "";
     }
     var name = t - 2;
-    if tok_kind(name) == Tok::Bang {
+    if tok_kind(name, pcx) == Tok::Bang {
         name -= 1;
     }
-    if tok_kind(name) != Tok::Ident {
+    if tok_kind(name, pcx) != Tok::Ident {
         return "";
     }
     // UNSAFE: the tokens are in TOKS, the lexer's raw array.
     // SAFETY: tok_kind(name) and tok_kind(t) are not Eof, so 0 <= name < t
     // < TOK_COUNT: tokens the lexer wrote, which stay (as tok_kind's).
-    let (sym, at, path) = unsafe { (TOKS[name].value as i64, TOKS[t].start, TOKS[t].value as i64) };
+    let (sym, at, path) = unsafe {
+        (pcx.toks[name].value as i64, pcx.toks[t].start, pcx.toks[t].value as i64)
+    };
     let word = sym_text(sym);
     if word != "include_str" && word != "include_bytes" {
         return "";
     }
-    buf_path(embed_path(at, crate::front::lexer::str_at(path)))
+    buf_path(embed_path(at, crate::front::lexer::str_at(path), pcx))
 }
 
 // The word of identifier token t, or "" for another token.
-fn tok_word(t: i64) -> [u8] {
-    if tok_kind(t) != Tok::Ident {
+fn tok_word(t: i64, pcx: Ctx<Comp>) -> [u8] {
+    if tok_kind(t, pcx) != Tok::Ident {
         return "";
     }
     // UNSAFE: the tokens are in TOKS, the lexer's raw array.
     // SAFETY: tok_kind(t) is Ident, not Eof, so 0 <= t < TOK_COUNT.
-    sym_text(unsafe { TOKS[t].value } as i64)
+    sym_text(unsafe { pcx.toks[t].value } as i64)
 }
 
 // The C declaration of place o, as its header writes it (at most
 // C_LINES_MAX lines; a macro with its continued lines), then where it is.
-fn put_c_decl(md: i64, o: i64, tcx: inout Tcx<Comp>) {
-    let (path, name_line, _) = c_place(o);
+fn put_c_decl(md: i64, o: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) {
+    let (path, name_line, _) = c_place(o, pcx);
     if path.len == 0 {
         return;
     }
-    var first = C_ORIGINS.get(o * 3 + 1);
-    var last = C_ORIGINS.get(o * 3 + 2);
+    var first = pcx.c_origins.get(o * 3 + 1);
+    var last = pcx.c_origins.get(o * 3 + 2);
     if first <= 0 {
         first = name_line;
         last = first;
@@ -1648,22 +1635,23 @@ fn put_c_decl(md: i64, o: i64, tcx: inout Tcx<Comp>) {
 // whose name is at name_pos (-1: none; is_fn: a function): where its
 // header has it, a function's bodies in the program's C files first.
 // False when start is neither.
-fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool, tcx: inout Tcx<Comp>) -> bool {
-    let header = if start >= 0 { import_header_at(start) } else { "" };
+fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool, tcx: inout Tcx<Comp>,
+    pcx: Ctx<Comp>) -> bool {
+    let header = if start >= 0 { import_header_at(start, pcx) } else { "" };
     if header.len > 0 {
         buf_str(out, c"{\"uri\":\"");
         put_uri(out, buf_slice(header_path(header)));
         buf_str(out, c"\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}");
         return true;
     }
-    let o = if name_pos >= 0 { c_origin_at(name_pos) } else { -1 };
+    let o = if name_pos >= 0 { c_origin_at(name_pos, pcx) } else { -1 };
     let loc = buf_new();
-    if o < 0 || !put_c_location(loc, o, &tcx) {
+    if o < 0 || !put_c_location(loc, o, &tcx, pcx) {
         return false;
     }
-    let (_, _, name) = c_place(o);
+    let (_, _, name) = c_place(o, pcx);
     let bodies = buf_new();
-    let n = if is_fn { put_c_bodies(bodies, name, &tcx) } else { 0 };
+    let n = if is_fn { put_c_bodies(bodies, name, &tcx, pcx) } else { 0 };
     if n == 0 {
         buf_bytes(out, buf_slice(loc));
     } else {
@@ -1679,17 +1667,17 @@ fn put_c_definition(out: i64, start: i64, name_pos: i64, is_fn: bool, tcx: inout
 // (0.26.3) The start of the name at pos: its token's, or in a format
 // literal's hole (`{n}`) the name's own, which the checker's references
 // carry (what an f-string's hole was, a token of its own, until 0.26.3).
-fn name_start(pos: i64) -> i64 {
-    let start = token_start(pos);
-    let word = if start >= 0 { hole_word(start, pos) } else { -1 };
+fn name_start(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let start = token_start(pos, pcx);
+    let word = if start >= 0 { hole_word(start, pos, pcx) } else { -1 };
     if word >= 0 { word } else { start }
 }
 
 // def_named_at(start), but at a name in a format literal's hole only a
 // definition of that name (not the Display call the hole's write makes).
-fn def_named_here(start: i64, tcx: inout Tcx<Comp>) -> i64 {
-    let d = def_named_at(start, &tcx);
-    if d < 0 || start < 0 || token_starting(start) >= 0 {
+fn def_named_here(start: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    let d = def_named_at(start, &tcx, &pcx);
+    if d < 0 || start < 0 || token_starting(start, pcx) >= 0 {
         return d;
     }
     var end = start;
@@ -1699,7 +1687,7 @@ fn def_named_here(start: i64, tcx: inout Tcx<Comp>) -> i64 {
     var i = 0;
     while i + 1 < tcx.all_refs.count {
         let at = tcx.all_refs.get(i + 1);
-        if tcx.all_refs.get(i) == start && SYMS[DEFS[at].name].text == SRC[start..end] {
+        if tcx.all_refs.get(i) == start && SYMS[pcx.defs[at].name].text == SRC[start..end] {
             return at;
         }
         i += 3;
@@ -1707,16 +1695,16 @@ fn def_named_here(start: i64, tcx: inout Tcx<Comp>) -> i64 {
     -1
 }
 
-fn put_definition(out: i64, pos: i64, tcx: inout Tcx<Comp>) {
-    let start = name_start(pos);
-    let d = def_named_here(start, &tcx);
+fn put_definition(out: i64, pos: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    let start = name_start(pos, pcx);
+    let d = def_named_here(start, &tcx, &pcx);
     // (0.25.2) at a C import: the header, the declaration in it
-    let name_pos = if d >= 0 { DEFS[d].name_pos } else { -1 };
-    if put_c_definition(out, start, name_pos, d >= 0 && DEFS[d].kind == K_FN, &tcx) {
+    let name_pos = if d >= 0 { pcx.defs[d].name_pos } else { -1 };
+    if put_c_definition(out, start, name_pos, d >= 0 && pcx.defs[d].kind == K_FN, &tcx, pcx) {
         return;
     }
     // (0.25.3) at include_str("path") or include_bytes: the file
-    let embedded = embedded_file_at(start);
+    let embedded = embedded_file_at(start, pcx);
     if embedded.len > 0 {
         buf_str(out, c"{\"uri\":\"");
         put_uri(out, buf_slice(header_path(embedded)));
@@ -1724,53 +1712,53 @@ fn put_definition(out: i64, pos: i64, tcx: inout Tcx<Comp>) {
         return;
     }
     if d >= 0 {
-        if located(DEFS[d].name_pos, tcx) {
-            put_location(out, DEFS[d].name_pos, tcx);
+        if located(pcx.defs[d].name_pos, tcx, pcx) {
+            put_location(out, pcx.defs[d].name_pos, tcx, pcx);
         } else {
             buf_str(out, c"null");
         }
         return;
     }
-    let l = local_named_at(start, &tcx);
-    if l >= 0 && located(l, tcx) {
-        put_location(out, l, tcx);
+    let l = local_named_at(start, &tcx, pcx);
+    if l >= 0 && located(l, tcx, pcx) {
+        put_location(out, l, tcx, pcx);
         return;
     }
     var item = 0;
-    let tp = type_param_at(start, &item);
-    if tp >= 0 && located(tp, tcx) {
-        put_location(out, tp, tcx);
+    let tp = type_param_at(start, &item, pcx);
+    if tp >= 0 && located(tp, tcx, pcx) {
+        put_location(out, tp, tcx, pcx);
         return;
     }
-    let root = root_named_at(start, &tcx);
-    if root > 0 && root_start(root, start, tcx) >= 0 {
-        put_location(out, root_start(root, start, tcx), tcx);
+    let root = root_named_at(start, &tcx, pcx);
+    if root > 0 && root_start(root, start, tcx, pcx) >= 0 {
+        put_location(out, root_start(root, start, tcx, pcx), tcx, pcx);
         return;
     }
     var decl = -1;
-    if assoc_at(start, &decl, tcx) != 0 && located(decl, tcx) {
-        put_location(out, decl, tcx);
+    if assoc_at(start, &decl, tcx, pcx) != 0 && located(decl, tcx, pcx) {
+        put_location(out, decl, tcx, pcx);
         return;
     }
-    if param_at(start) != 0 && located(start, tcx) {
-        put_location(out, start, tcx);
+    if param_at(start, pcx) != 0 && located(start, tcx, pcx) {
+        put_location(out, start, tcx, pcx);
         return;
     }
     buf_str(out, c"null");
 }
 
 // The positions of a local's declaration and uses, in order, into out.
-fn local_uses(decl: i64, out: inout IntVec, tcx: Tcx<Comp>) {
+fn local_uses(decl: i64, out: inout IntVec, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         out.push(decl);
-        let dt = token_at(decl);
-        for n in 1..NODES.len() as i64 {
-            if decl_of_use(n, tcx) != decl {
+        let dt = token_at(decl, pcx);
+        for n in 1..pcx.nodes.len() as i64 {
+            if decl_of_use(n, tcx, pcx) != decl {
                 continue;
             }
-            let p = NODES[n].start;
-            let t = token_at(p);
-            if TOKS[t].start != p || TOKS[t].value != TOKS[dt].value {
+            let p = pcx.nodes[n].start;
+            let t = token_at(p, pcx);
+            if pcx.toks[t].start != p || pcx.toks[t].value != pcx.toks[dt].value {
                 continue;
             }
             var seen = false;
@@ -1802,27 +1790,27 @@ fn sort_positions(v: inout IntVec) {
     }
 }
 
-fn put_references(out: i64, pos: i64, with_decl: bool, tcx: inout Tcx<Comp>) {
+fn put_references(out: i64, pos: i64, with_decl: bool, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        let start = name_start(pos);
-        let d = def_named_here(start, &tcx);
+        let start = name_start(pos, pcx);
+        let d = def_named_here(start, &tcx, &pcx);
         var at = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var item = 0;
-        let l = if d >= 0 { -1 } else { local_named_at(start, &tcx) };
-        let tp = if d >= 0 || l >= 0 { -1 } else { type_param_at(start, &item) };
-        let root = if d >= 0 || l >= 0 || tp >= 0 { 0 } else { root_named_at(start, &tcx) };
-        let t = token_starting(start);
+        let l = if d >= 0 { -1 } else { local_named_at(start, &tcx, pcx) };
+        let tp = if d >= 0 || l >= 0 { -1 } else { type_param_at(start, &item, pcx) };
+        let root = if d >= 0 || l >= 0 || tp >= 0 { 0 } else { root_named_at(start, &tcx, pcx) };
+        let t = token_starting(start, pcx);
         var adecl = -1;
         let none = d < 0 && l < 0 && tp < 0 && root == 0;
-        let assoc = if none { assoc_at(start, &adecl, tcx) } else { 0 };
-        let param = if none && assoc == 0 { param_at(start) } else { 0 };
+        let assoc = if none { assoc_at(start, &adecl, tcx, pcx) } else { 0 };
+        let param = if none && assoc == 0 { param_at(start, pcx) } else { 0 };
         if d >= 0 {
             var i = 0;
             while i < tcx.all_refs.count {
                 let p = tcx.all_refs.data[i];
                 let def = (tcx.all_refs.data[i + 2] & QF_DEF) != 0;
                 if tcx.all_refs.data[i + 1] == d && (with_decl || !def)
-                    && (if def { located(p, tcx) } else { shown(p, tcx) }) {
+                    && (if def { located(p, tcx, pcx) } else { shown(p, tcx, pcx) }) {
                     at.push(p);
                 }
                 i += 3;
@@ -1830,35 +1818,35 @@ fn put_references(out: i64, pos: i64, with_decl: bool, tcx: inout Tcx<Comp>) {
             sort_positions(&at);
         } else if l >= 0 {
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            local_uses(l, &uses, tcx);
+            local_uses(l, &uses, tcx, pcx);
             for k in 0..uses.count {
-                if (with_decl || uses.data[k] != l) && located(uses.data[k], tcx) {
+                if (with_decl || uses.data[k] != l) && located(uses.data[k], tcx, pcx) {
                     at.push(uses.data[k]);
                 }
             }
         } else if tp >= 0 {
             // (a type parameter: its name in the item declaring it)
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            same_name_in(t, NODES[item].start, NODES[item].end, &uses);
+            same_name_in(t, pcx.nodes[item].start, pcx.nodes[item].end, &uses, pcx);
             for k in 0..uses.count {
-                if (with_decl || uses.data[k] != tp) && located(uses.data[k], tcx) {
+                if (with_decl || uses.data[k] != tp) && located(uses.data[k], tcx, pcx) {
                     at.push(uses.data[k]);
                 }
             }
         } else if root > 0 {
-            root_uses(root, &at, &tcx);
+            root_uses(root, &at, &tcx, pcx);
         } else if assoc != 0 {
-            assoc_uses(t, &at, tcx);
+            assoc_uses(t, &at, tcx, pcx);
         } else if param != 0 {
             if with_decl {
                 at.push(start);
             }
-        } else if is_primitive(t) && !is_keyword(TOKS[t].kind as i64) {
+        } else if is_primitive(t, pcx) && !is_keyword(pcx.toks[t].kind as i64) {
             // (a primitive type: its name in the shown files)
-            for u in 0..TOK_COUNT {
-                if TOKS[u].kind == Tok::Ident && TOKS[u].value == TOKS[t].value
-                    && shown(TOKS[u].start, tcx) {
-                    at.push(TOKS[u].start);
+            for u in 0..pcx.toks.len() as i64 {
+                if pcx.toks[u].kind == Tok::Ident && pcx.toks[u].value == pcx.toks[t].value
+                    && shown(pcx.toks[u].start, tcx, pcx) {
+                    at.push(pcx.toks[u].start);
                 }
             }
             sort_positions(&at);
@@ -1875,7 +1863,7 @@ fn put_references(out: i64, pos: i64, with_decl: bool, tcx: inout Tcx<Comp>) {
                 buf_byte(out, ',');
             }
             first = false;
-            put_location(out, at.data[k], tcx);
+            put_location(out, at.data[k], tcx, pcx);
         }
         buf_byte(out, ']');
     }
@@ -1888,27 +1876,27 @@ fn is_fn_kind(k: i64) -> bool {
 }
 
 // The function of definition d (its FNS index), or -1.
-fn fn_of(d: i64) -> i64 {
-    if !is_fn_kind(DEFS[d].kind) {
+fn fn_of(d: i64, pcx: Ctx<Comp>) -> i64 {
+    if !is_fn_kind(pcx.defs[d].kind) {
         return -1;
     }
-    let f = NODES[DEFS[d].node].x - 1;
-    if f < 0 || f >= FN_COUNT { -1 } else { f }
+    let f = pcx.nodes[pcx.defs[d].node].x - 1;
+    if f < 0 || f >= pcx.fn_count { -1 } else { f }
 }
 
 // ` (declared #[pure])` or ` (inferred)` after function f's effects, the
 // instance named when there is one (`, of Vec<i64>::push`), then the line's
 // end.
-fn put_decl_note(md: i64, f: i64, instance: [u8]) {
+fn put_decl_note(md: i64, f: i64, instance: [u8], pcx: Ctx<Comp>) {
     unsafe {
-        let decl = FNS[f].effect_decl;
+        let decl = pcx.fns[f].effect_decl;
         if decl != 0 {
             buf_str(md, c" (declared");
             var s = decl;
             while s != 0 {
                 buf_byte(md, ' ');
-                buf_decl(md, s);
-                s = NODES[s].b;
+                buf_decl(md, s, pcx);
+                s = pcx.nodes[s].b;
             }
         } else {
             buf_str(md, c" (inferred");
@@ -1923,23 +1911,23 @@ fn put_decl_note(md: i64, f: i64, instance: [u8]) {
 
 // The function a call names at position start (the instance, for a
 // generic function), or -1.
-fn call_at(start: i64) -> i64 {
+fn call_at(start: i64, pcx: Ctx<Comp>) -> i64 {
     if start < 0 {
         return -1;
     }
-    for n in 1..NODES.len() as i64 {
-        if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || NODES[n].start > start
-            || NODES[n].end <= start {
+    for n in 1..pcx.nodes.len() as i64 {
+        if pcx.nodes[n].kind != NodeKind::Call || pcx.nodes[n].x <= 0 || pcx.nodes[n].start > start
+            || pcx.nodes[n].end <= start {
             continue;
         }
-        let callee = NODES[n].a;
+        let callee = pcx.nodes[n].a;
         if callee != 0 {
-            if NODES[callee].start <= start && start < NODES[callee].end
-                && token_start(NODES[callee].end - 1) == start {
-                return NODES[n].x - 1;
+            if pcx.nodes[callee].start <= start && start < pcx.nodes[callee].end
+                && token_start(pcx.nodes[callee].end - 1, pcx) == start {
+                return pcx.nodes[n].x - 1;
             }
-        } else if NODES[n].count > 0 && NODES[child(n, 0)].end <= start {
-            return NODES[n].x - 1;
+        } else if pcx.nodes[n].count > 0 && pcx.nodes[child(n, 0, pcx)].end <= start {
+            return pcx.nodes[n].x - 1;
         }
     }
     -1
@@ -1980,7 +1968,7 @@ fn put_relative(out: i64, text: [u8], tcx: Tcx<Comp>) {
 
 // Appends text with each `<std>:LINE:COL` in it written as the place in
 // std's file (`std.vl:286:37`), when std's files are written.
-fn put_std_places(out: i64, text: [u8], tcx: Tcx<Comp>) {
+fn put_std_places(out: i64, text: [u8], tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         let tag = "<std>:";
         var i = 0;
@@ -1995,12 +1983,12 @@ fn put_std_places(out: i64, text: [u8], tcx: Tcx<Comp>) {
                 }
                 let first = tcx.first_line.data[tcx.std_f];
                 if line > 0 && first + line - 1 < tcx.first_line.data[tcx.std_f + 1] {
-                    let k = seg_at(tcx.answer_ls.data[first + line - 1], tcx);
+                    let k = seg_at(tcx.answer_ls.data[first + line - 1], tcx, pcx);
                     if k >= 0 {
                         buf_bytes(out, segment_name(k, tcx));
                         buf_fmt(out,
                             format_args(":{}",
-                                first + line - 1 - line_index(segment_from(k, tcx), tcx) + 1));
+                                first + line - 1 - line_index(segment_from(k, tcx), tcx, pcx) + 1));
                         i = j;
                         continue;
                     }
@@ -2014,12 +2002,12 @@ fn put_std_places(out: i64, text: [u8], tcx: Tcx<Comp>) {
 
 // The reasons of f's effects, one line each (the first step of `query
 // effects --why`), at most WHY_MAX.
-fn put_why_lines(md: i64, f: i64, tcx: Tcx<Comp>) {
+fn put_why_lines(md: i64, f: i64, tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        let e = fn_effects(f);
+        let e = fn_effects(f, pcx);
         var bits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var allocs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..ALLOCATORS.count {
+        for i in 0..pcx.allocators.count {
             if (e.allocs & (1 << i)) != 0 {
                 bits.push(0);
                 allocs.push(1 << i);
@@ -2036,12 +2024,12 @@ fn put_why_lines(md: i64, f: i64, tcx: Tcx<Comp>) {
         let shown = if bits.count < WHY_MAX { bits.count } else { WHY_MAX };
         for k in 0..shown {
             let line = buf_new();
-            effect_name(line, bits.data[k], allocs.data[k]);
+            effect_name(line, bits.data[k], allocs.data[k], pcx);
             buf_str(line, c" ← ");
             let step = buf_new();
-            step_text(step, f, bits.data[k], allocs.data[k], true);
+            step_text(step, f, bits.data[k], allocs.data[k], true, &pcx);
             let places = buf_new();
-            put_std_places(places, buf_slice(step), tcx);
+            put_std_places(places, buf_slice(step), tcx, pcx);
             put_relative(line, buf_slice(places), tcx);
             buf_str(md, c"- ");
             put_cut(md, buf_slice(line), WHY_LINE_MAX);
@@ -2058,31 +2046,31 @@ fn put_why_lines(md: i64, f: i64, tcx: Tcx<Comp>) {
 // The hover of definition d: its signature, a function's effects (declared
 // or inferred, with their reasons) and features, its path. At a call of a
 // generic function (inst: the instance called, else -1), the instance's.
-pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
+pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
         buf_str(md, c"```vole\n");
-        put_signature(md, d, tcx);
+        put_signature(md, d, tcx, pcx);
         buf_byte(md, '\n');
-        let f = fn_of(d);
+        let f = fn_of(d, pcx);
         var why = -1;
         if f >= 0 {
             let eff = buf_new();
-            def_effects_text(eff, d, tcx);
+            def_effects_text(eff, d, tcx, pcx);
             if buf_slice(eff).len > 0 {
                 buf_str(md, c"effects: ");
                 buf_bytes(md, buf_slice(eff));
-                put_decl_note(md, f, "");
+                put_decl_note(md, f, "", pcx);
                 why = f;
-            } else if FNS[f].generic != 0 && inst >= 0 && FNS[inst].tmpl == f + 1
-                && (fn_effects(inst).bits & EFF_UNKNOWN) == 0 {
+            } else if pcx.fns[f].generic != 0 && inst >= 0 && pcx.fns[inst].tmpl == f + 1
+                && (fn_effects(inst, pcx).bits & EFF_UNKNOWN) == 0 {
                 buf_str(md, c"effects: ");
-                effects_text(md, fn_effects(inst));
-                put_decl_note(md, f, SYMS[FNS[inst].display].text);
+                effects_text(md, fn_effects(inst, pcx), pcx);
+                put_decl_note(md, f, SYMS[pcx.fns[inst].display].text, pcx);
                 why = inst;
-            } else if FNS[f].generic != 0 {
+            } else if pcx.fns[f].generic != 0 {
                 // (a generic function: its instances' sets)
                 let lines = buf_new();
-                def_effect_lines(lines, d, tcx);
+                def_effect_lines(lines, d, tcx, pcx);
                 let t = buf_slice(lines);
                 var n = 0;
                 var i = 0;
@@ -2096,7 +2084,7 @@ pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
                     while tab < j && t[tab] != '\t' {
                         tab += 1;
                     }
-                    put_std_places(md, t[i..tab], tcx);
+                    put_std_places(md, t[i..tab], tcx, pcx);
                     if tab < j {
                         buf_str(md, c": ");
                         buf_bytes(md, t[tab + 1..j]);
@@ -2110,7 +2098,7 @@ pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
                 }
             }
             let feat = buf_new();
-            if put_def_features(feat, d, c"\n", tcx) {
+            if put_def_features(feat, d, c"\n", tcx, pcx) {
                 buf_bytes(md, buf_slice(feat)[1..buf_slice(feat).len]);
                 buf_byte(md, '\n');
             } else {
@@ -2120,32 +2108,32 @@ pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
         buf_str(md, c"```\n");
         // (0.25.2) imported from C: the declaration in its header (its
         // effects have no reasons in the program)
-        let o = c_origin_at(DEFS[d].name_pos);
+        let o = c_origin_at(pcx.defs[d].name_pos, pcx);
         if o >= 0 {
-            put_c_decl(md, o, &tcx);
+            put_c_decl(md, o, &tcx, pcx);
         }
         if why >= 0 && o < 0
-            && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
-            put_why_lines(md, why, tcx);
+            && ((fn_effects(why, pcx).bits & EFF_VISIBLE) != 0 || fn_effects(why, pcx).allocs != 0) {
+            put_why_lines(md, why, tcx, &pcx);
         }
         if o < 0 {
             // (an import's comment is volec's, not the header's)
-            put_doc(md, d);
+            put_doc(md, d, pcx);
         }
         buf_str(md, c"\n`");
-        buf_bytes(md, SYMS[DEFS[d].fqn].text);
+        buf_bytes(md, SYMS[pcx.defs[d].fqn].text);
         buf_str(md, c"` (");
-        buf_str(md, kind_name(DEFS[d].kind));
+        buf_str(md, kind_name(pcx.defs[d].kind));
         // (0.26.0: a field not marked `pub` is its module's)
         // (the root's are the whole program's)
-        if DEFS[d].kind == K_FIELD && !DEFS[d].public && DEFS[d].module > 0
-            && MODULES[DEFS[d].module].key >= 0 {
+        if pcx.defs[d].kind == K_FIELD && !pcx.defs[d].public && pcx.defs[d].module > 0
+            && pcx.modules[pcx.defs[d].module].key >= 0 {
             buf_str(md, c", private to module ");
-            buf_bytes(md, SYMS[MODULES[DEFS[d].module].key].text);
+            buf_bytes(md, SYMS[pcx.modules[pcx.defs[d].module].key].text);
         }
         // (0.26.2: `pub(crate)`, `pub(super)`, `pub(in a)`)
-        let written = crate::front::modules::vis::written_restriction(DEFS[d].start);
-        if DEFS[d].public && written.len > 0 {
+        let written = crate::front::modules::vis::written_restriction(pcx.defs[d].start);
+        if pcx.defs[d].public && written.len > 0 {
             buf_str(md, c", ");
             buf_bytes(md, written);
         }
@@ -2155,14 +2143,15 @@ pub fn hover_def(md: i64, d: i64, inst: i64, tcx: inout Tcx<Comp>) {
 
 // The comment right above definition d (its `//` lines, without the
 // slashes; attribute lines left out), as a paragraph after an empty line.
-pub fn put_doc(md: i64, d: i64) {
-    let parent = DEFS[d].parent;
-    if parent >= 0 && line_start(DEFS[d].start) == line_start(DEFS[parent].start) {
+pub fn put_doc(md: i64, d: i64, pcx: Ctx<Comp>) {
+    let parent = pcx.defs[d].parent;
+    if parent >= 0
+        && line_start(pcx.defs[d].start, pcx) == line_start(pcx.defs[parent].start, pcx) {
         // (a field on its struct's line: the comment is the struct's)
         return;
     }
-    let from = text_start(d);
-    let to = line_start(DEFS[d].start);
+    let from = text_start(d, pcx);
+    let to = line_start(pcx.defs[d].start, pcx);
     var p = from;
     var first = true;
     while p < to {
@@ -2201,73 +2190,71 @@ fn hover_word(md: i64, word: [u8], text: [u8]) {
 
 // The hover of a type parameter declared at decl by item: its
 // declaration (`T: Ord + Copy`) and the item's name.
-fn hover_type_param(md: i64, decl: i64, item: i64) {
-    unsafe {
-        buf_str(md, c"```vole\n");
-        // (its tokens, to the `,` or `>` that ends it)
-        var t = token_starting(decl);
-        var depth = 0;
-        var first = true;
-        while t >= 0 && t < TOK_COUNT {
-            let k = TOKS[t].kind;
-            if depth == 0 && (k == Tok::Comma || k == Tok::Gt) {
-                break;
-            }
-            if k == Tok::Lt || k == Tok::LParen {
-                depth += 1;
-            } else if k == Tok::Gt || k == Tok::RParen {
-                depth -= 1;
-            }
-            if !first && k != Tok::Comma && k != Tok::Colon && k != Tok::Gt && k != Tok::Lt
-                && k != Tok::RParen && TOKS[t - 1].kind != Tok::Lt
-                && TOKS[t - 1].kind != Tok::LParen {
-                buf_byte(md, ' ');
-            }
-            buf_bytes(md, tok_text(t));
-            first = false;
-            t += 1;
+fn hover_type_param(md: i64, decl: i64, item: i64, pcx: Ctx<Comp>) {
+    buf_str(md, c"```vole\n");
+    // (its tokens, to the `,` or `>` that ends it)
+    var t = token_starting(decl, pcx);
+    var depth = 0;
+    var first = true;
+    while t >= 0 && t < pcx.toks.len() as i64 {
+        let k = pcx.toks[t].kind;
+        if depth == 0 && (k == Tok::Comma || k == Tok::Gt) {
+            break;
         }
-        buf_str(md, c"\n```\na type parameter");
-        let name = NODES[item].a;
-        let k = NODES[item].kind;
-        if name > 0 && k != NodeKind::Impl {
-            buf_str(md, c" of `");
-            buf_bytes(md, SYMS[name].text);
-            buf_byte(md, '`');
-        } else if k == NodeKind::Impl {
-            buf_str(md, c" of the impl block");
+        if k == Tok::Lt || k == Tok::LParen {
+            depth += 1;
+        } else if k == Tok::Gt || k == Tok::RParen {
+            depth -= 1;
         }
-        buf_byte(md, '\n');
+        if !first && k != Tok::Comma && k != Tok::Colon && k != Tok::Gt && k != Tok::Lt
+            && k != Tok::RParen && pcx.toks[t - 1].kind != Tok::Lt
+            && pcx.toks[t - 1].kind != Tok::LParen {
+            buf_byte(md, ' ');
+        }
+        buf_bytes(md, tok_text(t, pcx));
+        first = false;
+        t += 1;
     }
+    buf_str(md, c"\n```\na type parameter");
+    let name = pcx.nodes[item].a;
+    let k = pcx.nodes[item].kind;
+    if name > 0 && k != NodeKind::Impl {
+        buf_str(md, c" of `");
+        buf_bytes(md, SYMS[name].text);
+        buf_byte(md, '`');
+    } else if k == NodeKind::Impl {
+        buf_str(md, c" of the impl block");
+    }
+    buf_byte(md, '\n');
 }
 
 // The hover of a local or an expression: its type (one per instance of a
 // generic function).
-fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
+fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var at = pos;
-        let l = local_named_at(start, &tcx);
+        let l = local_named_at(start, &tcx, pcx);
         if l >= 0 && l == start {
             // (a declaration: the type of its first use)
             var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-            local_uses(l, &uses, tcx);
+            local_uses(l, &uses, tcx, pcx);
             if uses.count > 1 {
                 at = uses.data[1];
             }
         }
         if tcx.typed == 0 as *TypedIndex {
             tcx.typed = alloc_array::<TypedIndex>(1);
-            tcx.typed[0] = typed_index();
+            tcx.typed[0] = typed_index(pcx);
         }
-        var found = typed_nodes_in(*tcx.typed, 1, at, 0);
+        var found = typed_nodes_in(*tcx.typed, 1, at, 0, pcx);
         if l >= 0 {
             // (0.25: a local named there, not what the checker made at it,
             // a drop at its `let`, when it is one)
             var named = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for i in 0..found.count {
                 let n = found.data[i];
-                let k = NODES[n].kind;
-                if NODES[n].start == at
+                let k = pcx.nodes[n].kind;
+                if pcx.nodes[n].start == at
                     && (k == NodeKind::PatBind || k == NodeKind::Ident || k == NodeKind::Param) {
                     named.push(n);
                 }
@@ -2282,13 +2269,13 @@ fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
         }
         buf_str(md, c"```vole\n");
         if l >= 0 {
-            buf_bytes(md, SRC[l..token_end(l)]);
+            buf_bytes(md, SRC[l..token_end(l, pcx)]);
             buf_str(md, c": ");
         }
         var types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..found.count {
             let n = found.data[i];
-            let t = NODES[n].ty;
+            let t = pcx.nodes[n].ty;
             var seen = false;
             for j in 0..types.count {
                 if types.data[j] == t {
@@ -2307,11 +2294,11 @@ fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
                 buf_str(md, c" | ");
             }
             types.push(t);
-            buf_type(md, t);
+            buf_type(md, t, pcx);
             let to = widened.get(n + 1);
             if to > 0 {
                 buf_str(md, c" (widened to ");
-                buf_type(md, to);
+                buf_type(md, to, pcx);
                 buf_byte(md, ')');
             }
         }
@@ -2324,150 +2311,149 @@ fn hover_type(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
 // attribute, a keyword, a definition (an operator's function), a type
 // parameter, `std` or `crate`, a primitive type, a local's or an
 // expression's type (`self` and `result` explained after theirs).
-fn hover_at(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>) -> bool {
-    unsafe {
-        if start < 0 {
-            return false;
-        }
-        let t = token_starting(start);
-        let text = if t >= 0 { tok_text(t) } else { SRC[start..start] };
-        let kind = if t >= 0 { TOKS[t].kind as i64 } else { -1 };
-        if attribute_at(start) >= 0 && attribute_text(text).len > 0 {
-            hover_word(md, text, attribute_text(text));
-            return true;
-        }
-        let contract_word = text == "requires" || text == "ensures";
-        if (is_keyword(kind) || contract_word) && keyword_text(text).len > 0 {
-            hover_word(md, text, keyword_text(text));
-            return true;
-        }
-        if is_keyword(kind) {
-            return false;
-        }
-        let header = import_header_at(start);
-        if header.len > 0 {
-            // (0.25.2) the string of `import "h.h" as c;`: the header
-            let name = text[1..text.len as i64 - 1];
-            let relative = name.len > 1 && name[0] == '.'
-                && (name[1] == '/' || name[1] == '.');
-            buf_str(md, c"```c\n#include ");
-            buf_byte(md, if relative { '"' } else { '<' });
-            buf_bytes(md, name);
-            buf_byte(md, if relative { '"' } else { '>' });
-            buf_str(md, c"\n```\n`");
-            buf_bytes(md, buf_slice(header_path(header)));
-            buf_str(md, c"` (the header this import reads)\n");
-            return true;
-        }
-        let d = def_named_at(start, &tcx);
-        if d >= 0 {
-            hover_def(md, d, call_at(start), &tcx);
-            return true;
-        }
-        if kind == Tok::Ident as i64 && local_named_at(start, &tcx) < 0 {
-            var item = 0;
-            let tp = type_param_at(start, &item);
-            if tp >= 0 {
-                hover_type_param(md, tp, item);
-                return true;
-            }
-            let root = root_named_at(start, &tcx);
-            if root == 1 {
-                hover_word(md, "mod std",
-                    "The standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)");
-                return true;
-            } else if root == 2 {
-                hover_word(md, "mod crate",
-                    "The program's root module: its `main.vl`. (`volec guide modules`)");
-                return true;
-            } else if root == 3 {
-                hover_word(md, "super", "The module this one is in: `use super::name;` names its sibling's or its parent's item. (`volec guide modules`)");
-                return true;
-            } else if root == 4 {
-                hover_word(md, "self", "This module: `use self::name;`. (`volec guide modules`)");
-                return true;
-            }
-            var adecl = -1;
-            let an = assoc_at(start, &adecl, tcx);
-            if an != 0 {
-                buf_str(md, c"```vole\n");
-                let s = NODES[an].start;
-                if !(s + 5 <= NODES[an].end && SRC[s..s + 5] == "type ") {
-                    buf_str(md, c"type ");
-                }
-                put_collapsed(md, s, NODES[an].end);
-                buf_str(md, c"\n```\nan associated type (`volec guide traits`)\n");
-                return true;
-            }
-            let pn = param_at(start);
-            if pn != 0 {
-                buf_str(md, c"```vole\n");
-                put_collapsed(md, NODES[pn].start, NODES[pn].end);
-                buf_str(md, c"\n```\na parameter\n");
-                return true;
-            }
-            if bound_text(text).len > 0 {
-                hover_word(md, text, bound_text(text));
-                return true;
-            }
-            if text == "size_of" || text == "align_of" {
-                hover_word(md, if text == "size_of" { "fn size_of(T) -> i64" } else { "fn align_of(T) -> i64" }, "The size (the alignment) of type T in bytes: a constant (built in; `volec guide c-interop`).");
-                return true;
-            }
-            if t > 0 && TOKS[t - 1].kind == Tok::Dot && (text == "len" || text == "ptr") {
-                // (a slice's or an array's own, no item)
-                if text == "len" {
-                    hover_word(md, "fn len(self) -> usize",
-                        "The length of a slice or an array, a `usize` (built in).");
-                } else {
-                    hover_word(md, "ptr: *T", "The address of a slice's first element, for C (built in; `guide c-interop`).");
-                }
-                return true;
-            }
-            if primitive_text(text).len > 0 {
-                hover_word(md, text, primitive_text(text));
-                return true;
-            }
-            let attr = enclosing_attribute(t);
-            if attr >= 0 && attribute_text(tok_text(attr)).len > 0 {
-                // (an attribute's argument: `C` of `#[repr(C)]`)
-                hover_word(md, tok_text(attr), attribute_text(tok_text(attr)));
-                return true;
-            }
-            if text != "self" && text != "Self" && text != "result" {
-                return false;
-            }
-        }
-        if kind == Tok::FHead as i64 || kind == Tok::FMid as i64 || kind == Tok::FTail as i64 {
-            // (an f-string's text: no name)
-            return false;
-        }
-        let typed = hover_type(md, pos, start, &tcx);
-        if kind == Tok::Ident as i64 && (text == "self" || text == "Self" || text == "result") {
-            if !typed {
-                buf_str(md, c"```vole\n");
-                buf_bytes(md, text);
-                buf_str(md, c"\n```\n");
-            }
-            buf_bytes(md, keyword_text(text));
-            buf_byte(md, '\n');
-            return true;
-        }
-        typed
+fn hover_at(md: i64, pos: i64, start: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    if start < 0 {
+        return false;
     }
+    let t = token_starting(start, pcx);
+    let text = if t >= 0 { tok_text(t, pcx) } else { SRC[start..start] };
+    let kind = if t >= 0 { pcx.toks[t].kind as i64 } else { -1 };
+    if attribute_at(start, pcx) >= 0 && attribute_text(text).len > 0 {
+        hover_word(md, text, attribute_text(text));
+        return true;
+    }
+    let contract_word = text == "requires" || text == "ensures";
+    if (is_keyword(kind) || contract_word) && keyword_text(text).len > 0 {
+        hover_word(md, text, keyword_text(text));
+        return true;
+    }
+    if is_keyword(kind) {
+        return false;
+    }
+    let header = import_header_at(start, pcx);
+    if header.len > 0 {
+        // (0.25.2) the string of `import "h.h" as c;`: the header
+        let name = text[1..text.len as i64 - 1];
+        let relative = name.len > 1 && name[0] == '.'
+            && (name[1] == '/' || name[1] == '.');
+        buf_str(md, c"```c\n#include ");
+        buf_byte(md, if relative { '"' } else { '<' });
+        buf_bytes(md, name);
+        buf_byte(md, if relative { '"' } else { '>' });
+        buf_str(md, c"\n```\n`");
+        buf_bytes(md, buf_slice(header_path(header)));
+        buf_str(md, c"` (the header this import reads)\n");
+        return true;
+    }
+    let d = def_named_at(start, &tcx, &pcx);
+    if d >= 0 {
+        hover_def(md, d, call_at(start, pcx), &tcx, &pcx);
+        return true;
+    }
+    if kind == Tok::Ident as i64 && local_named_at(start, &tcx, pcx) < 0 {
+        var item = 0;
+        let tp = type_param_at(start, &item, pcx);
+        if tp >= 0 {
+            hover_type_param(md, tp, item, pcx);
+            return true;
+        }
+        let root = root_named_at(start, &tcx, pcx);
+        if root == 1 {
+            hover_word(md, "mod std",
+                "The standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)");
+            return true;
+        } else if root == 2 {
+            hover_word(md, "mod crate",
+                "The program's root module: its `main.vl`. (`volec guide modules`)");
+            return true;
+        } else if root == 3 {
+            hover_word(md, "super", "The module this one is in: `use super::name;` names its sibling's or its parent's item. (`volec guide modules`)");
+            return true;
+        } else if root == 4 {
+            hover_word(md, "self", "This module: `use self::name;`. (`volec guide modules`)");
+            return true;
+        }
+        var adecl = -1;
+        let an = assoc_at(start, &adecl, tcx, pcx);
+        if an != 0 {
+            buf_str(md, c"```vole\n");
+            let s = pcx.nodes[an].start;
+            if !(s + 5 <= pcx.nodes[an].end && SRC[s..s + 5] == "type ") {
+                buf_str(md, c"type ");
+            }
+            put_collapsed(md, s, pcx.nodes[an].end);
+            buf_str(md, c"\n```\nan associated type (`volec guide traits`)\n");
+            return true;
+        }
+        let pn = param_at(start, pcx);
+        if pn != 0 {
+            buf_str(md, c"```vole\n");
+            put_collapsed(md, pcx.nodes[pn].start, pcx.nodes[pn].end);
+            buf_str(md, c"\n```\na parameter\n");
+            return true;
+        }
+        if bound_text(text).len > 0 {
+            hover_word(md, text, bound_text(text));
+            return true;
+        }
+        if text == "size_of" || text == "align_of" {
+            hover_word(md, if text == "size_of" { "fn size_of(T) -> i64" } else { "fn align_of(T) -> i64" }, "The size (the alignment) of type T in bytes: a constant (built in; `volec guide c-interop`).");
+            return true;
+        }
+        if t > 0 && pcx.toks[t - 1].kind == Tok::Dot && (text == "len" || text == "ptr") {
+            // (a slice's or an array's own, no item)
+            if text == "len" {
+                hover_word(md, "fn len(self) -> usize",
+                    "The length of a slice or an array, a `usize` (built in).");
+            } else {
+                hover_word(md, "ptr: *T",
+                    "The address of a slice's first element, for C (built in; `guide c-interop`).");
+            }
+            return true;
+        }
+        if primitive_text(text).len > 0 {
+            hover_word(md, text, primitive_text(text));
+            return true;
+        }
+        let attr = enclosing_attribute(t, pcx);
+        if attr >= 0 && attribute_text(tok_text(attr, pcx)).len > 0 {
+            // (an attribute's argument: `C` of `#[repr(C)]`)
+            hover_word(md, tok_text(attr, pcx), attribute_text(tok_text(attr, pcx)));
+            return true;
+        }
+        if text != "self" && text != "Self" && text != "result" {
+            return false;
+        }
+    }
+    if kind == Tok::FHead as i64 || kind == Tok::FMid as i64 || kind == Tok::FTail as i64 {
+        // (an f-string's text: no name)
+        return false;
+    }
+    let typed = hover_type(md, pos, start, &tcx, pcx);
+    if kind == Tok::Ident as i64 && (text == "self" || text == "Self" || text == "result") {
+        if !typed {
+            buf_str(md, c"```vole\n");
+            buf_bytes(md, text);
+            buf_str(md, c"\n```\n");
+        }
+        buf_bytes(md, keyword_text(text));
+        buf_byte(md, '\n');
+        return true;
+    }
+    typed
 }
 
 // (0.26.2) The start of the name at pos in a format literal's hole (`{n}`,
 // `{:w$}`), the literal's token starting at start; -1 when pos is not on
 // one (the literal's text, or no literal).
-fn hole_word(start: i64, pos: i64) -> i64 {
-    let t = token_at(start);
-    if t >= TOK_COUNT {
+fn hole_word(start: i64, pos: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = token_at(start, pcx);
+    if t >= pcx.toks.len() as i64 {
         return -1;
     }
     // UNSAFE: TOKS is the lexer's token table, a raw pointer (front/lexer).
     // SAFETY: t is token_at's answer, below TOK_COUNT (checked above).
-    let tok = unsafe { TOKS[t] };
+    let tok = unsafe { pcx.toks[t] };
     if tok.kind != Tok::Str || tok.start != start {
         return -1;
     }
@@ -2486,27 +2472,27 @@ fn hole_word(start: i64, pos: i64) -> i64 {
     if k <= start || SRC[k] != '{' || SRC[k - 1] == '{' { -1 } else { a }
 }
 
-fn put_hover(out: i64, pos: i64, tcx: inout Tcx<Comp>) {
-    let start = token_start(pos);
+fn put_hover(out: i64, pos: i64, tcx: inout Tcx<Comp>, pcx: inout Ctx<Comp>) {
+    let start = token_start(pos, pcx);
     let md = buf_new();
-    if !hover_at(md, pos, start, &tcx) {
+    if !hover_at(md, pos, start, &tcx, &pcx) {
         buf_str(out, c"null");
         return;
     }
     buf_str(out, c"{\"contents\":{\"kind\":\"markdown\",\"value\":");
     buf_json_str(out, buf_slice(md));
     buf_byte(out, '}');
-    let word = if start >= 0 { hole_word(start, pos) } else { -1 };
+    let word = if start >= 0 { hole_word(start, pos, pcx) } else { -1 };
     if word >= 0 {
         var end = word;
         while is_ident_byte(SRC[end]) {
             end += 1;
         }
         buf_str(out, c",\"range\":");
-        put_range(out, word, end, tcx);
+        put_range(out, word, end, tcx, pcx);
     } else if start >= 0 {
         buf_str(out, c",\"range\":");
-        put_range(out, start, token_end(start), tcx);
+        put_range(out, start, token_end(start, pcx), tcx, pcx);
     }
     buf_byte(out, '}');
 }
@@ -2521,30 +2507,31 @@ fn symbol_kind(k: i64) -> i64 {
     else if k == K_STATIC { 13 } else if k == K_ALIAS { 26 } else { 2 }
 }
 
-fn put_symbol(out: i64, d: i64, children: IntVec, tcx: Tcx<Comp>) {
+fn put_symbol(out: i64, d: i64, children: IntVec, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         buf_str(out, c"{\"name\":");
         let name = buf_new();
-        let k = DEFS[d].kind;
-        if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner > 0 {
+        let k = pcx.defs[d].kind;
+        if (k == K_METHOD || k == K_IMPL_METHOD) && pcx.defs[d].owner > 0 {
             // (a function of an impl block: Type::f)
-            buf_bytes(name, last_segment(SYMS[DEFS[d].owner].text));
+            buf_bytes(name, last_segment(SYMS[pcx.defs[d].owner].text));
             buf_str(name, c"::");
         }
-        buf_bytes(name, SYMS[DEFS[d].name].text);
+        buf_bytes(name, SYMS[pcx.defs[d].name].text);
         buf_json_str(out, buf_slice(name));
         buf_str(out, c",\"detail\":");
         let sig = buf_new();
-        put_signature(sig, d, tcx);
+        put_signature(sig, d, tcx, pcx);
         let s = buf_slice(sig);
         buf_json_str(out, s[0..if s.len > 200 { 200 } else { s.len as i64 }]);
         buf_fmt(out, format_args(",\"kind\":{},\"range\":", symbol_kind(k)));
-        let from = if DEFS[d].start < DEFS[d].name_pos { DEFS[d].start } else { DEFS[d].name_pos };
-        let to = if DEFS[d].end > DEFS[d].name_pos { DEFS[d].end }
-            else { token_end(DEFS[d].name_pos) };
-        put_range(out, from, to, tcx);
+        let from = if pcx.defs[d].start < pcx.defs[d].name_pos { pcx.defs[d].start }
+            else { pcx.defs[d].name_pos };
+        let to = if pcx.defs[d].end > pcx.defs[d].name_pos { pcx.defs[d].end }
+            else { token_end(pcx.defs[d].name_pos, pcx) };
+        put_range(out, from, to, tcx, pcx);
         buf_str(out, c",\"selectionRange\":");
-        put_range(out, DEFS[d].name_pos, token_end(DEFS[d].name_pos), tcx);
+        put_range(out, pcx.defs[d].name_pos, token_end(pcx.defs[d].name_pos, pcx), tcx, pcx);
         if children.count > 0 {
             buf_str(out, c",\"children\":[");
             let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -2552,7 +2539,7 @@ fn put_symbol(out: i64, d: i64, children: IntVec, tcx: Tcx<Comp>) {
                 if i > 0 {
                     buf_byte(out, ',');
                 }
-                put_symbol(out, children.data[i], none, tcx);
+                put_symbol(out, children.data[i], none, tcx, pcx);
             }
             buf_byte(out, ']');
         }
@@ -2562,27 +2549,27 @@ fn put_symbol(out: i64, d: i64, children: IntVec, tcx: Tcx<Comp>) {
 
 // The symbols of the definitions named in from..to (a file, or a file of
 // std's text).
-fn put_symbols(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
+fn put_symbols(out: i64, from: i64, to: i64, tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     unsafe {
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for d in 0..DEFS.len() as i64 {
-            let p = DEFS[d].name_pos;
+        for d in 0..pcx.defs.len() as i64 {
+            let p = pcx.defs[d].name_pos;
             if p >= from && p < to {
                 all.push(d);
             }
         }
-        sort_by_position(all, tcx);
+        sort_by_position(all, tcx, pcx);
         buf_byte(out, '[');
         var first = true;
         for i in 0..all.count {
             let d = all.data[i];
-            let parent = DEFS[d].parent;
-            if parent >= 0 && DEFS[parent].name_pos >= from && DEFS[parent].name_pos < to {
+            let parent = pcx.defs[d].parent;
+            if parent >= 0 && pcx.defs[parent].name_pos >= from && pcx.defs[parent].name_pos < to {
                 continue;
             }
             var children = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             for j in 0..all.count {
-                if DEFS[all.data[j]].parent == d {
+                if pcx.defs[all.data[j]].parent == d {
                     children.push(all.data[j]);
                 }
             }
@@ -2590,7 +2577,7 @@ fn put_symbols(out: i64, from: i64, to: i64, tcx: Tcx<Comp>) {
                 buf_byte(out, ',');
             }
             first = false;
-            put_symbol(out, d, children, tcx);
+            put_symbol(out, d, children, tcx, pcx);
         }
         buf_byte(out, ']');
     }
@@ -2638,22 +2625,22 @@ fn contains_ci(name: [u8], query: [u8]) -> bool {
 // program's first (its letters in order), then std's (holding it; not
 // for an empty query), WS_MAX at most:
 // `[{"name":..,"kind":..,"location":..,"containerName":..}]`.
-fn put_workspace_symbols(out: i64, query: [u8], tcx: Tcx<Comp>) {
+fn put_workspace_symbols(out: i64, query: [u8], tcx: Tcx<Comp>, pcx: Ctx<Comp>) {
     buf_byte(out, '[');
     var n = 0;
     for pass in 0..2 {
         if pass == 1 && query.len == 0 {
             break;
         }
-        for d in 0..DEFS.len() {
+        for d in 0..pcx.defs.len() {
             if n >= WS_MAX {
                 break;
             }
-            let p = DEFS[d].name_pos;
-            let mine = in_file(p);
-            if (pass == 0) != mine || pass == 1 && seg_at(p, tcx) < 0
-                || !(if mine { fuzzy_match(query, SYMS[DEFS[d].name].text) }
-                    else { contains_ci(SYMS[DEFS[d].name].text, query) }) {
+            let p = pcx.defs[d].name_pos;
+            let mine = in_file(p, pcx);
+            if (pass == 0) != mine || pass == 1 && seg_at(p, tcx, pcx) < 0
+                || !(if mine { fuzzy_match(query, SYMS[pcx.defs[d].name].text) }
+                    else { contains_ci(SYMS[pcx.defs[d].name].text, query) }) {
                 continue;
             }
             if n > 0 {
@@ -2661,10 +2648,10 @@ fn put_workspace_symbols(out: i64, query: [u8], tcx: Tcx<Comp>) {
             }
             n += 1;
             buf_str(out, c"{\"name\":");
-            buf_json_str(out, SYMS[DEFS[d].name].text);
-            buf_fmt(out, format_args(",\"kind\":{},\"location\":", symbol_kind(DEFS[d].kind)));
-            put_location(out, p, tcx);
-            let fqn = SYMS[DEFS[d].fqn].text;
+            buf_json_str(out, SYMS[pcx.defs[d].name].text);
+            buf_fmt(out, format_args(",\"kind\":{},\"location\":", symbol_kind(pcx.defs[d].kind)));
+            put_location(out, p, tcx, pcx);
+            let fqn = SYMS[pcx.defs[d].fqn].text;
             var e = fqn.len as i64;
             while e > 1 && !(fqn[e - 1] == ':' && fqn[e - 2] == ':') {
                 e -= 1;
@@ -2685,9 +2672,9 @@ fn put_workspace_symbols(out: i64, query: [u8], tcx: Tcx<Comp>) {
 // `{"range":..,"severity":..,"code":..,"source":"volec","message":..,
 // "relatedInformation":[the try: lines]}`, into out; false when it has
 // no position in a file.
-fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>) -> bool {
+fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if !in_file(pos) {
+        if !in_file(pos, pcx) {
             return false;
         }
         let short = buf_new();
@@ -2734,7 +2721,7 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>) -> bool {
             }
         }
         buf_str(out, c"{\"range\":");
-        put_range(out, pos, token_end(pos), tcx);
+        put_range(out, pos, token_end(pos, pcx), tcx, pcx);
         buf_fmt(out,
             format_args(",\"severity\":{},\"code\":",
                 if severity == "warning" { 2 } else if severity == "note" { 3 } else { 1 }));
@@ -2749,7 +2736,7 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>) -> bool {
                     buf_byte(out, ',');
                 }
                 buf_str(out, c"{\"location\":");
-                put_location(out, pos, tcx);
+                put_location(out, pos, tcx, pcx);
                 buf_str(out, c",\"message\":");
                 buf_json_str(out, s[tries.data[t]..tries.data[t + 1]]);
                 buf_byte(out, '}');
@@ -2764,12 +2751,12 @@ fn put_diagnostic(out: i64, pos: i64, text: [u8], tcx: Tcx<Comp>) -> bool {
 
 // publishDiagnostics for every file with an error or a warning, then the
 // end frame.
-fn publish_diagnostics(tcx: Tcx<Comp>) {
+fn publish_diagnostics(tcx: Tcx<Comp>, pcx: inout Ctx<Comp>) {
     unsafe {
-        DIAG_SHORT = true;
+        pcx.diag_short = true;
         var errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var warnings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        diag_records(&errors, &warnings);
+        diag_records(&errors, &warnings, &pcx);
         // (position, text) pairs, errors then warnings
         var recs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var i = 0;
@@ -2784,15 +2771,16 @@ fn publish_diagnostics(tcx: Tcx<Comp>) {
             recs.push(warnings.data[i + 1]);
             i += 3;
         }
-        for f in 0..FILES.len() as i64 {
+        for f in 0..pcx.files.len() as i64 {
             let items = buf_new();
             var n = 0;
             var r = 0;
             while r < recs.count {
                 let pos = recs.data[r];
-                if pos >= FILES[f].start && pos <= FILES[f].end && file_of_pos(pos) == f {
+                if pos >= pcx.files[f].start && pos <= pcx.files[f].end
+                    && file_of_pos(pos, pcx) == f {
                     let one = buf_new();
-                    if put_diagnostic(one, pos, buf_slice(recs.data[r + 1]), tcx) {
+                    if put_diagnostic(one, pos, buf_slice(recs.data[r + 1]), tcx, pcx) {
                         if n > 0 {
                             buf_byte(items, ',');
                         }
@@ -2807,7 +2795,7 @@ fn publish_diagnostics(tcx: Tcx<Comp>) {
             }
             let msg = buf_new();
             buf_str(msg, c"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"");
-            put_uri(msg, cstr(FILES[f].path));
+            put_uri(msg, cstr(pcx.files[f].path));
             buf_str(msg, c"\",\"diagnostics\":[");
             buf_bytes(msg, buf_slice(items));
             buf_str(msg, c"]}}");

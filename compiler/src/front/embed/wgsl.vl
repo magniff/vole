@@ -17,17 +17,18 @@ use crate::base::{
     IntVec, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, intern, intern_c, sym_name,
     sym_text,
 };
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::diag::{
-    ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_str, err_sym,
+    buf_file_line, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_str, err_sym,
 };
-use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
-use crate::front::check::PROGRAM;
+use crate::front::ast::{NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::check::names::near_to;
 use crate::front::embed::append_block_file;
 use crate::front::embed::ctx::EmbedCx;
 use crate::front::embed::made::write_made;
 use crate::front::embed::parts::{
-    BLOCKS, file_line_text, is_part, module_items, module_order, resolve_parts, users_of,
+    file_line_text, is_part, module_items, module_order, resolve_parts, users_of,
 };
 use crate::front::lexer::{Tok, add_string, keyword_of_sym, str_at};
 use crate::front::lexer::embedded::comment_end;
@@ -38,26 +39,17 @@ pub const STAGE_COMPUTE: i64 = 1;
 pub const STAGE_VERTEX: i64 = 2;
 pub const STAGE_FRAGMENT: i64 = 3;
 
-// For each block: its Embed node, the struct node made for it, and its
-// first entry point (an index of the ENTRY_ lists) and their count.
-pub static var BLOCK_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var BLOCK_STRUCT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var BLOCK_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The entry points: the name (a symbol), its stage, its position in SRC.
-pub static var ENTRY_SYM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var ENTRY_STAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // The program's blocks made into their structs and statics, appended to
 // the program (before collect_phase, next to expand_derives). (0.26.2)
 // First the parts (parts.vl) and the files of the file form (each a
 // SOURCE_WGSL file of the program), so that every block's text has its
 // place in SRC before any module is put together.
-pub fn expand_embeds(wcx: inout EmbedCx) {
-    BLOCK_NODE.count = 0;
-    BLOCK_STRUCT.count = 0;
-    BLOCK_FIRST.count = 0;
-    ENTRY_SYM.count = 0;
-    ENTRY_STAGE.count = 0;
+pub fn expand_embeds(wcx: inout EmbedCx, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) {
+    pcx.block_node.count = 0;
+    pcx.block_struct.count = 0;
+    pcx.block_first.count = 0;
+    pcx.entry_sym.count = 0;
+    pcx.entry_stage.count = 0;
     wcx.entry_pos.count = 0;
     wcx.reported.count = 0;
     wcx.bind_block.count = 0;
@@ -66,139 +58,141 @@ pub fn expand_embeds(wcx: inout EmbedCx) {
     wcx.bind_kind.count = 0;
     wcx.bind_name.count = 0;
     wcx.bind_pos.count = 0;
-    resolve_parts(&wcx);
-    if BLOCKS.count == 0 {
+    resolve_parts(&wcx, &pcx);
+    if pcx.blocks.count == 0 {
         return;
     }
-    for b in 0..BLOCKS.count {
-        let e = BLOCKS.get(b);
-        if NODES[e].d < 0 {
-            NODES[e].g = append_block_file(NODES[e].h, str_at(NODES[e].x));
+    for b in 0..pcx.blocks.count {
+        let e = pcx.blocks.get(b);
+        if pcx.nodes[e].d < 0 {
+            pcx.nodes[e].g = append_block_file(pcx.nodes[e].h, str_at(pcx.nodes[e].x), &pcx);
         }
     }
     var made = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for b in 0..BLOCKS.count {
-        make_items(b, &made, &wcx);
+    for b in 0..pcx.blocks.count {
+        make_items(b, &made, &wcx, &pcx, &wgx);
     }
-    let all = list_begin();
-    for i in 0..NODES[PROGRAM].count {
-        list_push(child(PROGRAM, i));
+    let all = list_begin(pcx);
+    for i in 0..pcx.nodes[pcx.program].count {
+        list_push(child(pcx.program, i, pcx), &pcx);
     }
     for i in 0..made.count {
-        list_push(made.get(i));
+        list_push(made.get(i), &pcx);
     }
-    list_end(PROGRAM, all);
+    list_end(pcx.program, all, &pcx);
 }
 
 // Block b's struct and static, into `made`. A block that is no part gets
 // its module (its parts' texts, then its own: module_order), scanned for
 // entry points and checked; a part only its own text's entry points.
-fn make_items(b: i64, made: inout IntVec, wcx: inout EmbedCx) {
-    let e = BLOCKS.get(b);
-    let first = ENTRY_SYM.count;
-    var src_id = NODES[e].c;
+fn make_items(b: i64, made: inout IntVec, wcx: inout EmbedCx, pcx: inout Ctx<Comp>,
+    wgx: inout WgslCx<Arena>) {
+    let e = pcx.blocks.get(b);
+    let first = pcx.entry_sym.count;
+    var src_id = pcx.nodes[e].c;
     wcx.piece_mod.count = 0;
     wcx.piece_src.count = 0;
     wcx.piece_len.count = 0;
     wcx.piece_node.count = 0;
-    if is_part(b) {
-        scan_block(e, first, &wcx);
+    if is_part(b, pcx) {
+        scan_block(e, first, &wcx, &pcx);
     } else {
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        module_order(b, &order);
+        module_order(b, &order, pcx);
         var items = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let shared_ok = module_items(order, &items, wcx);
+        let shared_ok = module_items(order, &items, wcx, &pcx);
         let bfirst = wcx.bind_block.count;
         if order.count == 1 && items.count == 0 {
-            add_piece(0, e, &wcx);
-            scan_block(e, first, &wcx);
-            scan_bindings(e, b, &wcx);
-            if !duplicate_bindings(b, bfirst, wcx) {
-                check_block(e, str_at(NODES[e].c), &wcx);
+            add_piece(0, e, &wcx, pcx);
+            scan_block(e, first, &wcx, &pcx);
+            scan_bindings(e, b, &wcx, pcx);
+            if !duplicate_bindings(b, bfirst, wcx, &pcx) {
+                check_block(e, str_at(pcx.nodes[e].c), &wcx, &pcx, &wgx);
             }
         } else {
             let m = buf_new();
             // (0.26.2) the WGSL of the consts and structs it names, first
             for i in 0..items.count {
                 let at = buf_slice(m).len as i64;
-                write_made(items.get(i), m, wcx);
+                write_made(items.get(i), m, wcx, &pcx);
                 wcx.piece_mod.push(at);
                 wcx.piece_src.push(-1);
                 wcx.piece_len.push(buf_slice(m).len as i64 - at);
                 wcx.piece_node.push(items.get(i));
             }
             for i in 0..order.count {
-                let p = BLOCKS.get(order.get(i));
-                add_piece(buf_slice(m).len as i64, p, &wcx);
-                buf_bytes(m, str_at(NODES[p].c));
+                let p = pcx.blocks.get(order.get(i));
+                add_piece(buf_slice(m).len as i64, p, &wcx, pcx);
+                buf_bytes(m, str_at(pcx.nodes[p].c));
                 buf_byte(m, '\n');
-                scan_block(p, first, &wcx);
-                scan_bindings(p, b, &wcx);
+                scan_block(p, first, &wcx, &pcx);
+                scan_bindings(p, b, &wcx, pcx);
             }
             src_id = add_string(buf_slice(m));
-            if shared_ok && !duplicate_bindings(b, bfirst, wcx) {
-                check_block(e, buf_slice(m), &wcx);
+            if shared_ok && !duplicate_bindings(b, bfirst, wcx, &pcx) {
+                check_block(e, buf_slice(m), &wcx, &pcx, &wgx);
             }
         }
     }
-    let open = if NODES[e].d >= 0 { NODES[e].d - 1 } else { NODES[e].h };
-    let name = NODES[e].a;
-    let at = NODES[e].y;
-    let public = (NODES[e].p & ITEM_PUBLIC) != 0;
+    let open = if pcx.nodes[e].d >= 0 { pcx.nodes[e].d - 1 } else { pcx.nodes[e].h };
+    let name = pcx.nodes[e].a;
+    let at = pcx.nodes[e].y;
+    let public = (pcx.nodes[e].p & ITEM_PUBLIC) != 0;
     let ty_sym = intern(embed_type_name(name));
     // the struct: `src`, then the entry points
-    let s = new_node(NodeKind::Struct, at, NODES[e].end);
-    NODES[s].a = ty_sym;
-    let mark = list_begin();
-    list_push(field(intern_c(c"src"), open));
-    for k in first..ENTRY_SYM.count {
-        list_push(field(ENTRY_SYM.get(k), wcx.entry_pos.get(k)));
+    let s = new_node(NodeKind::Struct, at, pcx.nodes[e].end, &pcx);
+    pcx.nodes[s].a = ty_sym;
+    let mark = list_begin(pcx);
+    list_push(field(intern_c(c"src"), open, &pcx), &pcx);
+    for k in first..pcx.entry_sym.count {
+        list_push(field(pcx.entry_sym.get(k), wcx.entry_pos.get(k), &pcx), &pcx);
     }
-    list_end(s, mark);
+    list_end(s, mark, &pcx);
     // the static: `static K: embed wgsl K = embed wgsl K { src: "..", main: "main" }`
-    let st = new_node(NodeKind::Static, at, NODES[e].end);
-    NODES[st].a = name;
-    NODES[st].b = ty_name(ty_sym, at);
-    let lit = new_node(NodeKind::StructLit, at, NODES[e].end);
-    NODES[lit].a = ty_sym;
-    let inits = list_begin();
-    list_push(init(intern_c(c"src"), src_id, open));
-    for k in first..ENTRY_SYM.count {
-        let id = add_string(sym_text(ENTRY_SYM.get(k)));
-        list_push(init(ENTRY_SYM.get(k), id, wcx.entry_pos.get(k)));
+    let st = new_node(NodeKind::Static, at, pcx.nodes[e].end, &pcx);
+    pcx.nodes[st].a = name;
+    pcx.nodes[st].b = ty_name(ty_sym, at, &pcx);
+    let lit = new_node(NodeKind::StructLit, at, pcx.nodes[e].end, &pcx);
+    pcx.nodes[lit].a = ty_sym;
+    let inits = list_begin(pcx);
+    list_push(init(intern_c(c"src"), src_id, open, &pcx), &pcx);
+    for k in first..pcx.entry_sym.count {
+        let id = add_string(sym_text(pcx.entry_sym.get(k)));
+        list_push(init(pcx.entry_sym.get(k), id, wcx.entry_pos.get(k), &pcx), &pcx);
     }
-    list_end(lit, inits);
-    NODES[st].c = lit;
+    list_end(lit, inits, &pcx);
+    pcx.nodes[st].c = lit;
     if public {
-        NODES[s].p |= ITEM_PUBLIC;
-        NODES[st].p |= ITEM_PUBLIC;
+        pcx.nodes[s].p |= ITEM_PUBLIC;
+        pcx.nodes[st].p |= ITEM_PUBLIC;
     }
-    BLOCK_NODE.push(e);
-    BLOCK_STRUCT.push(s);
-    BLOCK_FIRST.push(first);
+    pcx.block_node.push(e);
+    pcx.block_struct.push(s);
+    pcx.block_first.push(first);
     made.push(s);
     made.push(st);
 }
 
 // The start in SRC of block e's text: the block's own, or its file's (-1:
 // the file could not be read).
-fn text_start(e: i64) -> i64 {
-    if NODES[e].d >= 0 { NODES[e].d } else { NODES[e].g }
+fn text_start(e: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.nodes[e].d >= 0 { pcx.nodes[e].d } else { pcx.nodes[e].g }
 }
 
 // Block e's text at module offset `at`, a piece of the module.
-fn add_piece(at: i64, e: i64, wcx: inout EmbedCx) {
+fn add_piece(at: i64, e: i64, wcx: inout EmbedCx, pcx: Ctx<Comp>) {
     wcx.piece_mod.push(at);
-    wcx.piece_src.push(text_start(e));
-    wcx.piece_len.push(str_at(NODES[e].c).len as i64);
+    wcx.piece_src.push(text_start(e, pcx));
+    wcx.piece_len.push(str_at(pcx.nodes[e].c).len as i64);
     wcx.piece_node.push(e);
 }
 
 // The entry points of block e's text, into the ENTRY_ lists of the block
 // whose first is `first`.
-fn scan_block(e: i64, first: i64, wcx: inout EmbedCx) {
-    let at = text_start(e);
-    scan_entries(str_at(NODES[e].c), at, if at >= 0 { at } else { NODES[e].h }, first, &wcx);
+fn scan_block(e: i64, first: i64, wcx: inout EmbedCx, pcx: inout Ctx<Comp>) {
+    let at = text_start(e, pcx);
+    scan_entries(str_at(pcx.nodes[e].c), at, if at >= 0 { at } else { pcx.nodes[e].h }, first, &wcx,
+        &pcx);
 }
 
 // The made type's name, `embed wgsl K`.
@@ -210,29 +204,29 @@ pub fn embed_type_name(name: i64) -> [u8] {
 }
 
 // A `pub` field `name: [u8]` at pos.
-fn field(name: i64, pos: i64) -> i64 {
-    let f = new_node(NodeKind::Field, pos, pos + sym_text(name).len as i64);
-    NODES[f].a = name;
-    NODES[f].p |= ITEM_PUBLIC;
-    let t = new_node(NodeKind::TySlice, pos, pos);
-    NODES[t].a = ty_name(intern_c(c"u8"), pos);
-    NODES[f].b = t;
+fn field(name: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let f = new_node(NodeKind::Field, pos, pos + sym_text(name).len as i64, &pcx);
+    pcx.nodes[f].a = name;
+    pcx.nodes[f].p |= ITEM_PUBLIC;
+    let t = new_node(NodeKind::TySlice, pos, pos, &pcx);
+    pcx.nodes[t].a = ty_name(intern_c(c"u8"), pos, &pcx);
+    pcx.nodes[f].b = t;
     f
 }
 
-fn ty_name(sym: i64, pos: i64) -> i64 {
-    let t = new_node(NodeKind::TyName, pos, pos);
-    NODES[t].a = sym;
+fn ty_name(sym: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let t = new_node(NodeKind::TyName, pos, pos, &pcx);
+    pcx.nodes[t].a = sym;
     t
 }
 
 // `name: "<string id>"`, a field's initializer at pos.
-fn init(name: i64, id: i64, pos: i64) -> i64 {
-    let v = new_node(NodeKind::Str, pos, pos);
-    NODES[v].a = id;
-    let f = new_node(NodeKind::FieldInit, pos, pos);
-    NODES[f].a = name;
-    NODES[f].b = v;
+fn init(name: i64, id: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let v = new_node(NodeKind::Str, pos, pos, &pcx);
+    pcx.nodes[v].a = id;
+    let f = new_node(NodeKind::FieldInit, pos, pos, &pcx);
+    pcx.nodes[f].a = name;
+    pcx.nodes[f].b = v;
     f
 }
 
@@ -242,7 +236,8 @@ fn init(name: i64, id: i64, pos: i64) -> i64 {
 // (the file form: the `from` string's). An entry named `src` (the text's
 // field) or a vole keyword is embed.name, and makes no field; one named
 // twice makes one (WGSL's check reports it).
-fn scan_entries(text: [u8], at: i64, base: i64, first: i64, wcx: inout EmbedCx) {
+fn scan_entries(text: [u8], at: i64, base: i64, first: i64, wcx: inout EmbedCx,
+    pcx: inout Ctx<Comp>) {
     let compute = intern_c(c"compute");
     let vertex = intern_c(c"vertex");
     let fragment = intern_c(c"fragment");
@@ -274,7 +269,7 @@ fn scan_entries(text: [u8], at: i64, base: i64, first: i64, wcx: inout EmbedCx) 
                 }
             } else if after_fn {
                 if stage != 0 {
-                    add_entry(sym, stage, if at >= 0 { at + p } else { base }, first, &wcx);
+                    add_entry(sym, stage, if at >= 0 { at + p } else { base }, first, &wcx, &pcx);
                 }
                 stage = 0;
                 after_fn = false;
@@ -327,9 +322,9 @@ pub const BK_STORAGE_TEXTURE: i64 = 6;
 
 // The bindings of block e's text (at `at` in SRC; -1: none), into the
 // BIND_ lists for module b.
-fn scan_bindings(e: i64, b: i64, wcx: inout EmbedCx) {
-    let text = str_at(NODES[e].c);
-    let at = if NODES[e].d >= 0 { NODES[e].d } else { NODES[e].g };
+fn scan_bindings(e: i64, b: i64, wcx: inout EmbedCx, pcx: Ctx<Comp>) {
+    let text = str_at(pcx.nodes[e].c);
+    let at = if pcx.nodes[e].d >= 0 { pcx.nodes[e].d } else { pcx.nodes[e].g };
     if at < 0 {
         return;
     }
@@ -442,11 +437,11 @@ fn skip_space(text: [u8], p0: i64) -> i64 {
 // (wgsl.binding across parts) Two bindings of module b at one group and
 // binding, from `first` of the BIND_ lists: reported at the second, naming
 // the first's block and line; true when there was one.
-fn duplicate_bindings(b: i64, first: i64, wcx: EmbedCx) -> bool {
+fn duplicate_bindings(b: i64, first: i64, wcx: EmbedCx, pcx: inout Ctx<Comp>) -> bool {
     for j in first..wcx.bind_block.count {
         for i in first..j {
             if wcx.bind_g.get(i) == wcx.bind_g.get(j) && wcx.bind_b.get(i) == wcx.bind_b.get(j) {
-                duplicate_error(b, i, j, wcx);
+                duplicate_error(b, i, j, wcx, &pcx);
                 return true;
             }
         }
@@ -454,12 +449,12 @@ fn duplicate_bindings(b: i64, first: i64, wcx: EmbedCx) -> bool {
     false
 }
 
-fn duplicate_error(b: i64, i: i64, j: i64, wcx: EmbedCx) {
+fn duplicate_error(b: i64, i: i64, j: i64, wcx: EmbedCx, pcx: inout Ctx<Comp>) {
     // the block whose text holds the first
     let holder = piece_node_at(wcx.bind_pos.get(i), wcx);
-    let saved = ERR_KIND;
-    ERR_KIND = c"wgsl.binding";
-    err_begin(wcx.bind_pos.get(j));
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"wgsl.binding";
+    err_begin(wcx.bind_pos.get(j), &pcx);
     let m = buf_new();
     buf_bytes(m, "@group(");
     buf_int(m, wcx.bind_g.get(j));
@@ -469,20 +464,20 @@ fn duplicate_error(b: i64, i: i64, j: i64, wcx: EmbedCx) {
     buf_bytes(m, sym_text(wcx.bind_name.get(i)));
     buf_bytes(m, "' (");
     if holder > 0 {
-        buf_bytes(m, sym_text(NODES[holder].a));
+        buf_bytes(m, sym_text(pcx.nodes[holder].a));
         buf_bytes(m, ", ");
     }
-    buf_file_line(m, wcx.bind_pos.get(i));
+    buf_file_line(m, wcx.bind_pos.get(i), &pcx);
     buf_bytes(m, ")");
-    err_fmt(buf_slice(m));
+    err_fmt(buf_slice(m), pcx);
     let h = buf_new();
     buf_bytes(h, "two resources of one module at one group and binding: give each its own, or put them in different modules; the module of '");
-    buf_bytes(h, sym_text(NODES[BLOCKS.get(b)].a));
+    buf_bytes(h, sym_text(pcx.nodes[pcx.blocks.get(b)].a));
     buf_bytes(h, "' is the text of its parts (`with`) and its own");
     buf_byte(h, 0);
-    err_help(buf_slice(h).ptr);
-    err_end_soft();
-    ERR_KIND = saved;
+    err_help(buf_slice(h).ptr, pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // The block whose piece of the module being made holds SRC position pos
@@ -499,30 +494,30 @@ fn piece_node_at(pos: i64, wcx: EmbedCx) -> i64 {
 
 // Entry `sym` at pos (stage), unless it is no field's name (embed.name)
 // or the block has it already (from `first`).
-fn add_entry(sym: i64, stage: i64, pos: i64, first: i64, wcx: inout EmbedCx) {
-    for k in first..ENTRY_SYM.count {
-        if ENTRY_SYM.get(k) == sym {
+fn add_entry(sym: i64, stage: i64, pos: i64, first: i64, wcx: inout EmbedCx, pcx: inout Ctx<Comp>) {
+    for k in first..pcx.entry_sym.count {
+        if pcx.entry_sym.get(k) == sym {
             return;
         }
     }
-    if sym == intern_c(c"src") || keyword_of_sym(sym) != Tok::Eof {
-        let saved = ERR_KIND;
-        ERR_KIND = c"embed.name";
-        err_begin(pos);
-        err_str(c"the entry point '");
-        err_sym(sym);
+    if sym == intern_c(c"src") || keyword_of_sym(sym, pcx) != Tok::Eof {
+        let saved = pcx.err_kind;
+        pcx.err_kind = c"embed.name";
+        err_begin(pos, &pcx);
+        err_str(c"the entry point '", pcx);
+        err_sym(sym, pcx);
         if sym == intern_c(c"src") {
-            err_str(c"' would be the block's field 'src', its text");
+            err_str(c"' would be the block's field 'src', its text", pcx);
         } else {
-            err_str(c"' is a keyword of vole: no field can have its name");
+            err_str(c"' is a keyword of vole: no field can have its name", pcx);
         }
-        err_help(c"an embedded block's fields are 'src' and one per entry point, named as it is: rename the entry point");
-        err_end_soft();
-        ERR_KIND = saved;
+        err_help(c"an embedded block's fields are 'src' and one per entry point, named as it is: rename the entry point", pcx);
+        err_end_soft(&pcx);
+        pcx.err_kind = saved;
         return;
     }
-    ENTRY_SYM.push(sym);
-    ENTRY_STAGE.push(stage);
+    pcx.entry_sym.push(sym);
+    pcx.entry_stage.push(stage);
     wcx.entry_pos.push(pos);
 }
 
@@ -537,22 +532,28 @@ fn add_entry(sym: i64, stage: i64, pos: i64, first: i64, wcx: inout EmbedCx) {
 // block's text (the block form), or at the `from` string with the file's
 // `x.wgsl:L:C:` first (the file form).
 
-// The arena the checks allocate from (main's gpa: wgsl_init).
-static var WGSL_ARENA: Arena = Arena::none();
+// (0.26.5) The checks' context: their arena, made by main from its gpa
+// (wgsl_init) and passed down as `wgx` to check_block
+// (tools/statics/wgsl-ctx.group). Generic over the arena's type, which a
+// struct that holds an allocator names in its parameters.
+pub struct WgslCx<W: Allocator> {
+    pub arena: W,
+}
 
 // (main) The checks' arena, from gpa.
-pub fn wgsl_init(gpa: Gpa) {
-    WGSL_ARENA = Arena::with_capacity_in(0, gpa);
+pub fn wgsl_init(gpa: Gpa, wgx: inout WgslCx<Arena>) {
+    wgx.arena = Arena::with_capacity_in(0, gpa);
 }
 
 // Block e's text checked: its first error reported.
-fn check_block(e: i64, text: [u8], wcx: inout EmbedCx) {
+fn check_block(e: i64, text: [u8], wcx: inout EmbedCx, pcx: inout Ctx<Comp>,
+    wgx: inout WgslCx<Arena>) {
     if wcx.fail_code < 0 {
         wcx.fail_code = buf_new();
         wcx.fail_msg = buf_new();
         wcx.fail_help = buf_new();
     }
-    let failed = WGSL_ARENA.scope(|a| -> bool {
+    let failed = wgx.arena.scope(|a| -> bool {
         var fr = new_front(text, a);
         fr.module();
         if !fr.failed {
@@ -570,17 +571,17 @@ fn check_block(e: i64, text: [u8], wcx: inout EmbedCx) {
         fr.failed
     });
     if failed {
-        report(e, text, &wcx);
+        report(e, text, &wcx, &pcx);
     }
 }
 
 // The error FAIL_ holds, of block e's module (text): at its position in
 // the piece it is in (0.26.2: a part's text, the block's own, or its
 // file's, a file of the program: `x.wgsl:L:C`), once.
-fn report(e: i64, text: [u8], wcx: inout EmbedCx) {
+fn report(e: i64, text: [u8], wcx: inout EmbedCx, pcx: inout Ctx<Comp>) {
     let pos = if wcx.fail_pos < 0 { 0 } else if wcx.fail_pos > text.len as i64 { text.len as i64 }
         else { wcx.fail_pos };
-    var at = NODES[e].h;
+    var at = pcx.nodes[e].h;
     var made = -1;
     if wcx.piece_mod.count > 0 {
         var k = 0;
@@ -592,12 +593,12 @@ fn report(e: i64, text: [u8], wcx: inout EmbedCx) {
         let node = wcx.piece_node.get(k);
         if wcx.piece_src.get(k) >= 0 {
             at = wcx.piece_src.get(k) + (if off > len { len } else { off });
-        } else if NODES[node].kind == NodeKind::Embed {
-            at = NODES[node].h;
+        } else if pcx.nodes[node].kind == NodeKind::Embed {
+            at = pcx.nodes[node].h;
         } else {
             // (0.26.2: the WGSL written for a const or a struct: at its
             // declaration)
-            at = NODES[node].start;
+            at = pcx.nodes[node].start;
             made = node;
         }
     }
@@ -607,21 +608,21 @@ fn report(e: i64, text: [u8], wcx: inout EmbedCx) {
         }
     }
     wcx.reported.push(at);
-    let saved = ERR_KIND;
-    ERR_KIND = sym_name(intern(buf_slice(wcx.fail_code)));
-    err_begin(at);
-    err_fmt(buf_slice(wcx.fail_msg));
+    let saved = pcx.err_kind;
+    pcx.err_kind = sym_name(intern(buf_slice(wcx.fail_code)));
+    err_begin(at, &pcx);
+    err_fmt(buf_slice(wcx.fail_msg), pcx);
     if made >= 0 {
-        err_fmt(format_args(" (in the WGSL made for '{}')", sym_text(NODES[made].a)));
+        err_fmt(format_args(" (in the WGSL made for '{}')", sym_text(pcx.nodes[made].a)), pcx);
     }
     if buf_slice(wcx.fail_help).len > 0 {
         let h = buf_new();
         buf_bytes(h, buf_slice(wcx.fail_help));
         buf_byte(h, 0);
-        err_help(buf_slice(h).ptr);
+        err_help(buf_slice(h).ptr, pcx);
     }
-    err_end_soft();
-    ERR_KIND = saved;
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // ---- gpu.entry: a block's entry point that is not there ----
@@ -629,47 +630,48 @@ fn report(e: i64, text: [u8], wcx: inout EmbedCx) {
 // (synth_field) Field `name` of a struct (its node `node`) that has none,
 // at node n: when the struct is a block's type, gpu.entry, naming the block's entry points (the
 // nearest as the fix), and true; else false (the struct's own error).
-pub fn entry_error(n: i64, node: i64, name: i64) -> bool {
+pub fn entry_error(n: i64, node: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     var b = -1;
-    for i in 0..BLOCK_STRUCT.count {
-        if BLOCK_STRUCT.get(i) == node {
+    for i in 0..pcx.block_struct.count {
+        if pcx.block_struct.get(i) == node {
             b = i;
         }
     }
     if b < 0 {
         return false;
     }
-    let e = BLOCK_NODE.get(b);
-    let first = BLOCK_FIRST.get(b);
-    let end = if b + 1 < BLOCK_FIRST.count { BLOCK_FIRST.get(b + 1) } else { ENTRY_SYM.count };
-    let saved = ERR_KIND;
-    ERR_KIND = c"gpu.entry";
-    err_begin(NODES[n].start);
-    err_str(c"the block '");
-    err_sym(NODES[e].a);
-    err_str(c"' has no entry point '");
-    err_sym(name);
+    let e = pcx.block_node.get(b);
+    let first = pcx.block_first.get(b);
+    let end = if b + 1 < pcx.block_first.count { pcx.block_first.get(b + 1) }
+        else { pcx.entry_sym.count };
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"gpu.entry";
+    err_begin(pcx.nodes[n].start, &pcx);
+    err_str(c"the block '", pcx);
+    err_sym(pcx.nodes[e].a, pcx);
+    err_str(c"' has no entry point '", pcx);
+    err_sym(name, pcx);
     if end == first {
-        err_str(c"'; it has no entry points (`@compute`, `@vertex` or `@fragment fn`)");
+        err_str(c"'; it has no entry points (`@compute`, `@vertex` or `@fragment fn`)", pcx);
     } else {
-        err_str(c"'; its entry points: ");
+        err_str(c"'; its entry points: ", pcx);
         for k in first..end {
             if k > first {
-                err_str(c", ");
+                err_str(c", ", pcx);
             }
-            err_sym(ENTRY_SYM.get(k));
-            let stage = ENTRY_STAGE.get(k);
+            err_sym(pcx.entry_sym.get(k), pcx);
+            let stage = pcx.entry_stage.get(k);
             err_str(if stage == STAGE_COMPUTE { c" (compute)" } else if stage == STAGE_VERTEX {
-                c" (vertex)" } else { c" (fragment)" });
+                c" (vertex)" } else { c" (fragment)" }, pcx);
         }
     }
     var near = near_to(name);
     for k in first..end {
-        near.offer(ENTRY_SYM.get(k));
+        near.offer(pcx.entry_sym.get(k), &pcx);
     }
-    near.help();
-    err_end_soft();
-    ERR_KIND = saved;
+    near.help(&pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
     true
 }
 
@@ -678,25 +680,25 @@ pub fn entry_error(n: i64, node: i64, name: i64) -> bool {
 // (synth_field) Field `name` of a struct (its node `node`) at node n: when
 // the struct is a part's type, embed.part_use, naming the fields of the
 // blocks that include it (the first as the fix), and true; else false.
-pub fn part_use_error(n: i64, node: i64, name: i64) -> bool {
+pub fn part_use_error(n: i64, node: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     var b = -1;
-    for i in 0..BLOCK_STRUCT.count {
-        if BLOCK_STRUCT.get(i) == node {
+    for i in 0..pcx.block_struct.count {
+        if pcx.block_struct.get(i) == node {
             b = i;
         }
     }
-    if !is_part(b) {
+    if !is_part(b, pcx) {
         return false;
     }
-    let e = BLOCK_NODE.get(b);
+    let e = pcx.block_node.get(b);
     var users = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    let named_at = users_of(b, &users);
-    let part = sym_text(NODES[e].a);
-    let saved = ERR_KIND;
-    ERR_KIND = c"embed.part_use";
-    err_begin(NODES[n].start);
+    let named_at = users_of(b, &users, pcx);
+    let part = sym_text(pcx.nodes[e].a);
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"embed.part_use";
+    err_begin(pcx.nodes[n].start, &pcx);
     err_fmt(
-        format_args("'{part}' is a part (named in 'with' at {}): it has no module of its own, so '{part}.{}' is no value", file_line_text(named_at), sym_text(name)));
+        format_args("'{part}' is a part (named in 'with' at {}): it has no module of its own, so '{part}.{}' is no value", file_line_text(named_at, &pcx), sym_text(name)), pcx);
     let h = buf_new();
     if users.count == 0 {
         buf_bytes(h, "no block that is no part includes it");
@@ -706,20 +708,21 @@ pub fn part_use_error(n: i64, node: i64, name: i64) -> bool {
             if i > 0 {
                 buf_bytes(h, ", ");
             }
-            buf_bytes(h, sym_text(NODES[BLOCKS.get(users.get(i))].a));
+            buf_bytes(h, sym_text(pcx.nodes[pcx.blocks.get(users.get(i))].a));
             buf_byte(h, '.');
             buf_bytes(h, sym_text(name));
         }
     }
     buf_byte(h, 0);
-    err_help(buf_slice(h).ptr);
+    err_help(buf_slice(h).ptr, pcx);
     // the fix: the first user's field, when the part is named by its name
-    let base = NODES[n].a;
-    if users.count > 0 && NODES[base].kind == NodeKind::Ident && NODES[base].a == NODES[e].a {
-        err_fix(NODES[base].start, NODES[base].end,
-            sym_text(NODES[BLOCKS.get(users.get(0))].a));
+    let base = pcx.nodes[n].a;
+    if users.count > 0 && pcx.nodes[base].kind == NodeKind::Ident
+        && pcx.nodes[base].a == pcx.nodes[e].a {
+        err_fix(pcx.nodes[base].start, pcx.nodes[base].end,
+            sym_text(pcx.nodes[pcx.blocks.get(users.get(0))].a), &pcx);
     }
-    err_end_soft();
-    ERR_KIND = saved;
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
     true
 }

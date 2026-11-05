@@ -23,6 +23,8 @@
 
 use crate::back::objfile::assemble_bytes;
 use crate::base::{IntVec, SYMS_FROZEN, alloc_zeroed, die, free};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::middle::ctx::{FnCtx, fnctx_new};
 use crate::middle::parallel::{join_task, run_task};
 
@@ -47,14 +49,15 @@ const PTHREAD_ROOM: i64 = 256;
 // recurse over dominator trees and expressions).
 const STACK_SIZE: i64 = 64 * 1024 * 1024;
 
-// The threads in all, the main thread with them (1: none made).
-pub static var POOL_THREADS: i64 = 1;
 // Each thread's context, by index (0: the main thread's tasks').
 pub static var POOL_CTX: **FnCtx = 0 as **FnCtx;
+// (0.26.5) The compilation context the pool's tasks read, as C's void *
+// (a static holds no pointer to a type with an allocator): run_pooled
+// lends it to a task let (a view, tools/statics/p5b-ctx.group). pool_run
+// and pool_run_joined set it to their own context before the tasks start
+// and clear it after the last is done; 0 otherwise.
+static var POOL_PCX: *u8 = 0 as *u8;
 
-// The contexts made (POOL_THREADS until the pool stops).
-pub static var POOL_CONTEXTS: i64 = 0;
-static var THREADS: *u64 = 0 as *u64;
 static var MUTEX: *u8 = 0 as *u8;
 // Broadcast when tasks become ready, when a phase ends and at the stop.
 static var WAKE: *u8 = 0 as *u8;
@@ -76,10 +79,10 @@ pub fn processors(macos: bool) -> i64 {
 
 // Makes the contexts of `threads` threads and starts the workers (none
 // for 1). Main thread only, before the first phase.
-pub fn pool_start(threads: i64) {
+pub fn pool_start(threads: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        POOL_THREADS = threads;
-        POOL_CONTEXTS = threads;
+        pcx.pool_threads = threads;
+        pcx.pool_contexts = threads;
         STOP = false;
         POOL_CTX = alloc_zeroed(threads * 8) as **FnCtx;
         for i in 0..threads {
@@ -95,9 +98,9 @@ pub fn pool_start(threads: i64) {
         let attr = alloc_zeroed(PTHREAD_ROOM);
         pthread_attr_init(attr);
         pthread_attr_setstacksize(attr, STACK_SIZE as u64);
-        THREADS = alloc_zeroed(threads * 8) as *u64;
+        pcx.threads = alloc_zeroed(threads * 8) as *u64;
         for i in 1..threads {
-            if pthread_create(&THREADS[i], attr, worker_main, i as *u8) != 0 {
+            if pthread_create(&pcx.threads[i], attr, worker_main, i as *u8) != 0 {
                 die(c"cannot start a code generation thread (try -j1)");
             }
         }
@@ -105,34 +108,38 @@ pub fn pool_start(threads: i64) {
 }
 
 // Stops the workers and waits for them. Main thread only, between phases.
-pub fn pool_stop() {
+pub fn pool_stop(pcx: inout Ctx<Comp>) {
     unsafe {
-        if POOL_THREADS <= 1 {
+        if pcx.pool_threads <= 1 {
             return;
         }
         pthread_mutex_lock(MUTEX);
         STOP = true;
         pthread_cond_broadcast(WAKE);
         pthread_mutex_unlock(MUTEX);
-        for i in 1..POOL_THREADS {
-            pthread_join(THREADS[i], 0 as *u8);
+        for i in 1..pcx.pool_threads {
+            pthread_join(pcx.threads[i], 0 as *u8);
         }
-        POOL_THREADS = 1;
+        pcx.pool_threads = 1;
     }
 }
 
 // Runs a phase's tasks (all can start), the last of `tasks` first;
 // returns when all are done. With one thread the main thread runs them.
-pub fn pool_run(kind: i64, tasks: IntVec) {
+pub fn pool_run(kind: i64, tasks: IntVec, pcx: Ctx<Comp>) {
     unsafe {
         SYMS_FROZEN = true;
-        if POOL_THREADS == 1 {
+        // (the tasks' view of the context, run_pooled's: cleared below,
+        // when they are all done)
+        POOL_PCX = &pcx as *Ctx<Comp> as *u8;
+        if pcx.pool_threads == 1 {
             var i = tasks.count;
             while i > 0 {
                 i -= 1;
-                run_task(POOL_CTX[0], kind, tasks.data[i]);
+                run_task(POOL_CTX[0], kind, tasks.data[i], pcx);
             }
             SYMS_FROZEN = false;
+            POOL_PCX = 0 as *u8;
             return;
         }
         pthread_mutex_lock(MUTEX);
@@ -146,6 +153,7 @@ pub fn pool_run(kind: i64, tasks: IntVec) {
         take_tasks(0);
         pthread_mutex_unlock(MUTEX);
         SYMS_FROZEN = false;
+        POOL_PCX = 0 as *u8;
     }
 }
 
@@ -157,9 +165,12 @@ pub fn pool_run(kind: i64, tasks: IntVec) {
 // itself, if one is left. Returns the first task not joined: join_task
 // may refuse one (it must wait for the phase's end), and the rest are the
 // caller's to join after.
-pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64) -> i64 {
+pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         SYMS_FROZEN = true;
+        // (the tasks' view of the context, run_pooled's: cleared below,
+        // when they are all done)
+        POOL_PCX = &pcx as *Ctx<Comp> as *u8;
         pthread_mutex_lock(MUTEX);
         PHASE_KIND = kind;
         READY.count = 0;
@@ -175,7 +186,7 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64) -> i64 {
             if JOINED[next] {
                 // (its task wrote its results before it took MUTEX to mark it)
                 pthread_mutex_unlock(MUTEX);
-                joining = join_task(next);
+                joining = join_task(next, &pcx);
                 pthread_mutex_lock(MUTEX);
                 if joining {
                     next += 1;
@@ -183,7 +194,7 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64) -> i64 {
             } else if READY.count > 0 {
                 let task = READY.pop();
                 pthread_mutex_unlock(MUTEX);
-                run_task(POOL_CTX[0], kind, task);
+                run_task(POOL_CTX[0], kind, task, pcx);
                 pthread_mutex_lock(MUTEX);
                 REMAINING -= 1;
                 JOINED[task] = true;
@@ -201,7 +212,7 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64) -> i64 {
             }
             let task = READY.pop();
             pthread_mutex_unlock(MUTEX);
-            run_task(POOL_CTX[0], kind, task);
+            run_task(POOL_CTX[0], kind, task, pcx);
             pthread_mutex_lock(MUTEX);
             REMAINING -= 1;
             JOINED[task] = true;
@@ -215,7 +226,28 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64) -> i64 {
         JOINED = 0 as *bool;
         pthread_mutex_unlock(MUTEX);
         SYMS_FROZEN = false;
+        POOL_PCX = 0 as *u8;
         next
+    }
+}
+
+// Task `task` of a phase of kind `kind`, on the pool's thread context
+// cx, given the pool's view of the compilation context.
+fn run_pooled(cx: *FnCtx, kind: i64, task: i64) {
+    // UNSAFE: a worker thread has no parameter to be lent the compilation
+    // context through: pthread_create passes only a void *, and the pool's
+    // threads outlive one phase, so the context of the phase that runs is
+    // reached through POOL_PCX.
+    // SAFETY: POOL_PCX is set while a phase's tasks run, to the context of
+    // the pool_run or pool_run_joined that started them, which waits for
+    // all of them before it clears it and returns: it points to a live
+    // Ctx<Comp>. The task takes it let and writes nothing through it; the
+    // main thread does not change it while the tasks run either: pool_run
+    // holds it let, and pool_run_joined changes it only in join_task, whose
+    // writes are of fields no running task touches (tests/threads_writes.sh,
+    // JOINED). So no task reads a field while it changes.
+    unsafe {
+        run_task(cx, kind, task, *(POOL_PCX as *Ctx<Comp>));
     }
 }
 
@@ -235,7 +267,7 @@ fn take_tasks(index: i64) {
             let task = READY.pop();
             let kind = PHASE_KIND;
             pthread_mutex_unlock(MUTEX);
-            run_task(cx, kind, task);
+            run_pooled(cx, kind, task);
             pthread_mutex_lock(MUTEX);
             REMAINING -= 1;
             if JOINED != 0 as *bool {
@@ -260,15 +292,6 @@ extern "C" fn worker_main(arg: *u8) -> *u8 {
 
 // ---- The assembler's thread ----
 
-// (0.18.1) -O0 generates each function's text on the main thread (from
-// the syntax tree, with the checker); the streaming assembler takes the
-// texts, in order, on a thread of its own (asm_thread_start), with a
-// context of its own (A_CTX). It reads only its texts (copies, handed
-// over through A_QUEUE with A_MUTEX held) and the tables it made before
-// the thread started (its mnemonics), and writes only its own state
-// (back::objfile, back::enc_*); the main thread does not assemble while
-// it runs (asm_thread_finish joins it first).
-static var A_THREAD: u64 = 0;
 static var A_MUTEX: *u8 = 0 as *u8;
 static var A_WAKE: *u8 = 0 as *u8;
 static var A_QUEUE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -276,7 +299,7 @@ static var A_HEAD: i64 = 0;
 static var A_STOP: bool = false;
 static var A_CTX: *FnCtx = 0 as *FnCtx;
 
-pub fn asm_thread_start() {
+pub fn asm_thread_start(pcx: inout Ctx<Comp>) {
     unsafe {
         A_CTX = fnctx_new();
         // (the growth mode, read once, before the thread reads it)
@@ -291,7 +314,7 @@ pub fn asm_thread_start() {
         let attr = alloc_zeroed(PTHREAD_ROOM);
         pthread_attr_init(attr);
         pthread_attr_setstacksize(attr, STACK_SIZE as u64);
-        if pthread_create(&A_THREAD, attr, asm_thread_main, 0 as *u8) != 0 {
+        if pthread_create(&pcx.a_thread, attr, asm_thread_main, 0 as *u8) != 0 {
             die(c"cannot start the assembler's thread (try -j1)");
         }
     }
@@ -309,13 +332,13 @@ pub fn asm_thread_push(text: *u8, n: i64) {
 }
 
 // Waits until the assembler has taken every text, and stops it.
-pub fn asm_thread_finish() {
+pub fn asm_thread_finish(pcx: Ctx<Comp>) {
     unsafe {
         pthread_mutex_lock(A_MUTEX);
         A_STOP = true;
         pthread_cond_broadcast(A_WAKE);
         pthread_mutex_unlock(A_MUTEX);
-        pthread_join(A_THREAD, 0 as *u8);
+        pthread_join(pcx.a_thread, 0 as *u8);
     }
 }
 

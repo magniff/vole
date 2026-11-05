@@ -51,16 +51,16 @@ pub mod alloc_rules;
 use std::Option;
 
 use crate::base::{
-    BUFS, IntVec, SRC, _setjmp, alloc_zeroed, buf_bytes, buf_fmt, buf_new, buf_slice, cstr, free,
-    grow, intern_c,
+    BUFS, SRC, _setjmp, alloc_zeroed, buf_bytes, buf_fmt, buf_new, buf_slice, cstr, free, grow,
+    intern_c,
 };
 use crate::base::diag::{
-    RECOVER_DEPTH, err_begin, err_end, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at,
-    error_count, errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
+    err_begin, err_end, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at, error_count,
+    errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_INTRINSIC, FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, SCRATCH,
-    child, list_begin, list_end, list_push,
+    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_INTRINSIC, FN_LAZY, FN_SIG_FAILED, NodeKind, child,
+    list_begin, list_end, list_push,
 };
 use crate::front::ast::NodeKind::{
     Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
@@ -74,42 +74,39 @@ use crate::front::check::resolve::{
     check_static, check_static_calls, check_struct_cycles, collect_functions, collect_statics,
     evaluate_consts, resolve_type, static_call_value,
 };
-use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped};
+use crate::front::check::unsafety::check_wrapped;
 use crate::front::consteval::const_value_of;
-use crate::front::generics::{CUR_INST, INST_QUEUE, SELF_BOUND_POS, TP_BASE, TP_NAMES, TP_TYPES};
-use crate::front::generics::instantiate::{
-    UNIFY_SELF, UNIFY_SELF_TY, fn_instance, node_field_a, node_field_b, node_field_c,
-};
-use crate::front::modules::{CUR_MOD, init_modules, module_of, within_std};
+use crate::front::generics::instantiate::{fn_instance, node_field_a, node_field_b, node_field_c};
+use crate::front::modules::{init_modules, module_of, within_std};
 use crate::front::modules::lookup::{collect_uses, resolve_all_uses, resolve_use_of};
-use crate::front::patterns::OR_MODE;
 use crate::front::traits::{
     bound_trait, check_impl_signatures, check_later_bounds, collect_impl, collect_impls, implements,
     init_traits, trait_named,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR,
-    TY_I64, TY_U8, TyKind, buf_type, err_type, is_integer, is_numeric, is_ref, is_vector, type_elem,
-    type_size,
+    ENUMS, REF_MUT, REF_SHARED, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_I64, TY_U8, TyKind, buf_type,
+    err_type, is_integer, is_numeric, is_ref, is_vector, type_elem, type_size,
 };
 use crate::tools::fiximports::report_legacy_imports;
-use crate::tools::query::command_line::QUERY;
 
 // What other modules use of the parts.
+use std::Arena;
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::ambient::main_gpa;
 use crate::front::assoc::{ensure_checked, lazy_std};
 pub use crate::front::check::body::check_block;
 use crate::front::check::distinct::{distinct_mismatch, erase_program_types};
-use crate::front::closures::{CLOSURE_FNS, CLOSURE_STACK};
 use crate::front::contracts::check_contracts;
 use crate::front::contracts::ctx::contracts_cx_new;
 use crate::front::convert::main_result_wrapper;
 use crate::front::derive::{check_derives, expand_derives};
 use crate::front::distinct::is_view_distinct;
-use crate::front::effects::EFFECTS_WANTED;
 use crate::front::effects::check::{check_effects, effects_declared};
 use crate::front::effects::infer::{infer_effects, note_body_failed};
 use crate::front::embed::ctx::embed_cx_new;
+use crate::front::embed::wgsl::WgslCx;
 use crate::front::features::ctx::features_cx_new;
 use crate::front::lexer::Tok;
 use crate::front::own::check_own;
@@ -128,7 +125,7 @@ pub enum Res { None, Local, Const, Static, Fn }
 // `init` (0.17): v, for a local `let p = &v;` (not `mut`); 0.
 // `twritten` (0.17): its type as written names a type parameter P: 1 for
 // `*P`, 2 for `[P]` (written_param); 0.
-struct Local {
+pub struct Local {
     pub name: i64, pub ty: i64, pub mutable: bool, pub is_param: bool, pub offset: i64,
     pub borrow: bool, tparam: i64,
     init: i64,
@@ -137,80 +134,58 @@ struct Local {
     pub is_sink: bool,
 }
 
-pub static var LOCALS: *Local = 0 as *Local;
-pub static var LOCAL_COUNT: i64 = 0;
-static var LOCAL_CAP: i64 = 0;
-// Locals in scope (innermost last), and where each scope starts in it.
-pub static var ENV: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var SCOPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var LOOP_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// While checking the body of a closure (0.14): the LOOP_STACK depth at it
-// (the loops below it are not its to leave); 0 elsewhere.
-pub static var LOOP_BASE: i64 = 0;
-// The function whose body is being checked (FNS index; -1: none), for the
-// closures in it (0.14).
-pub static var CUR_FN: i64 = -1;
-pub static var RETURN_TYPE: i64 = 0;
-// In constant expressions no locals are visible.
-pub static var CONST_CONTEXT: bool = false;
-pub static var PROGRAM: i64 = 0;
-// The type `Self` names (in an impl block), or 0; the symbols `Self` and
-// `self`.
-pub static var SELF_TYPE: i64 = 0;
-pub static var SELF_TYPE_SYM: i64 = 0;
-pub static var SELF_SYM: i64 = 0;
-
 // ---- Errors ----
 
-pub fn type_error(n: i64, message: *u8) -> ! {
-    error_at(NODES[n].start, message)
+pub fn type_error(n: i64, message: *u8, pcx: inout Ctx<Comp>) -> ! {
+    error_at(pcx.nodes[n].start, message, &pcx)
 }
 
 // A value of type `actual` where `expected` goes (0.17: the conversion to
 // write, as the try: line, when there is one: `x as i32`, `a[..]`,
 // `b.as_slice()`, `v.as_slice()`, `&x`).
-pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
+pub fn mismatch_error(n: i64, expected: i64, actual: i64, pcx: inout Ctx<Comp>) -> ! {
     // (0.25.4: a contract message's hole, which the failure prints as an
     // integer: contract.message)
-    if crate::front::contracts::expand::is_message_hole(n) {
-        crate::front::contracts::expand::message_hole_error(n, actual);
+    if crate::front::contracts::expand::is_message_hole(n, pcx) {
+        crate::front::contracts::expand::message_hole_error(n, actual, &pcx);
     }
     // (0.18: a distinct type and its underlying type: distinct.mix)
-    distinct_mismatch(n, expected, actual);
+    distinct_mismatch(n, expected, actual, &pcx);
     // (0.20) a place where an exclusive reference is wanted: an inout
     // argument without its marker (conv.marker)
     if TYPES[expected].kind == TyKind::Ptr && TYPES[expected].b == REF_MUT
-        && TYPES[expected].a == actual && NODES[n].start > 0
-        && crate::front::conv::strict_at(NODES[n].start) {
-        crate::front::conv::marker_error(n);
-        crate::base::diag::err_jump();
+        && TYPES[expected].a == actual && pcx.nodes[n].start > 0
+        && crate::front::conv::strict_at(pcx.nodes[n].start, &pcx) {
+        crate::front::conv::marker_error(n, &pcx);
+        crate::base::diag::err_jump(&pcx);
     }
     // (0.25.2: a literal's default type as the cause, reported once)
-    let literal = crate::front::check::literals::literal_let(n, expected, actual);
+    let literal = crate::front::check::literals::literal_let(n, expected, actual, &pcx);
     if literal == 2 {
-        crate::base::diag::err_jump();
+        crate::base::diag::err_jump(&pcx);
     }
-    err_begin(NODES[n].start);
-    err_str(c"expected '");
-    err_type(expected);
-    err_str(c"', got '");
-    err_type(actual);
-    err_str(c"'");
-    mismatch_help(n, expected, actual);
+    err_begin(pcx.nodes[n].start, &pcx);
+    err_str(c"expected '", pcx);
+    err_type(expected, pcx);
+    err_str(c"', got '", pcx);
+    err_type(actual, pcx);
+    err_str(c"'", pcx);
+    mismatch_help(n, expected, actual, &pcx);
     if literal == 1 {
-        crate::front::check::literals::literal_help(NODES[n].start);
+        crate::front::check::literals::literal_help(pcx.nodes[n].start, &pcx);
     }
-    err_end()
+    err_end(&pcx)
 }
 
-fn mismatch_help(n: i64, expected: i64, actual: i64) {
+fn mismatch_help(n: i64, expected: i64, actual: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        if n == 0 || NODES[n].end <= NODES[n].start || expected == TY_ERROR || actual == TY_ERROR {
+        if n == 0 || pcx.nodes[n].end <= pcx.nodes[n].start || expected == pcx.ty_error
+            || actual == pcx.ty_error {
             return;
         }
-        let text = SRC[NODES[n].start..NODES[n].end];
+        let text = SRC[pcx.nodes[n].start..pcx.nodes[n].end];
         // (an operator's operand: what binds looser than `as` and `!=`)
-        let k = NODES[n].kind;
+        let k = pcx.nodes[n].kind;
         let simple = !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
             || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
             || k == NodeKind::Block || k == NodeKind::Closure);
@@ -220,109 +195,113 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
         let ak = TYPES[actual].kind;
         // (0.20) text: a String from a `str` or bytes, a `str` from a String
         let bytes = ak == TyKind::Slice && TYPES[actual].a == TY_U8;
-        if ek == TyKind::Struct && is_std_named(expected, c"String")
+        if ek == TyKind::Struct && is_std_named(expected, c"String", pcx)
             && (bytes || is_view_distinct(actual)) {
-            err_help(c"a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)");
-            err_try_fmt(format_args("String::from_in({text}, gpa)"));
+            err_help(c"a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)", pcx);
+            err_try_fmt(format_args("String::from_in({text}, gpa)"), pcx);
             return;
         }
-        if ak == TyKind::Struct && is_std_named(actual, c"String")
+        if ak == TyKind::Struct && is_std_named(actual, c"String", pcx)
             && (is_view_distinct(expected) || ek == TyKind::Slice && TYPES[expected].a == TY_U8) {
             err_help(
-                c"a String goes where a `str` does as itself, `s` (Rust's `&s`), or `s.as_str()`");
-            err_try_fmt(format_args("({text}).as_str()"));
+                c"a String goes where a `str` does as itself, `s` (Rust's `&s`), or `s.as_str()`", pcx);
+            err_try_fmt(format_args("({text}).as_str()"), pcx);
             return;
         }
         // The conversion, written in place of the value (0.18: the fix
         // `volec fix --suggested` makes; `&x` of a simple value only).
         let t = buf_new();
         var exact = true;
-        let bn = crate::front::check::distinct::BINARY_NODE;
+        let bn = pcx.binary_node;
         if ek == TyKind::Ptr && TYPES[expected].b != 0 && TYPES[expected].a == actual
             && (is_numeric(actual) || actual == TY_BOOL) && bn > 0
-            && NODES[bn].kind == NodeKind::Binary && (NODES[bn].b == n || NODES[bn].c == n) {
+            && pcx.nodes[bn].kind == NodeKind::Binary
+            && (pcx.nodes[bn].b == n || pcx.nodes[bn].c == n) {
             // (0.18.1) `n + 1` with `n: &i64` (a pattern's binding on a
             // reference, a closure's parameter): the other operand is the
             // reference, read through it
-            let other = if NODES[bn].b == n { NODES[bn].c } else { NODES[bn].b };
-            let ok = NODES[other].kind;
+            let other = if pcx.nodes[bn].b == n { pcx.nodes[bn].c } else { pcx.nodes[bn].b };
+            let ok = pcx.nodes[other].kind;
             let plain = ok == NodeKind::Ident || ok == NodeKind::FieldAccess
                 || ok == NodeKind::TupleField || ok == NodeKind::Call || ok == NodeKind::Index;
-            err_help(c"the other operand is a reference: read through it with '*'");
-            buf_bytes(t, SRC[NODES[bn].start..NODES[other].start]);
+            err_help(c"the other operand is a reference: read through it with '*'", pcx);
+            buf_bytes(t, SRC[pcx.nodes[bn].start..pcx.nodes[other].start]);
             buf_bytes(t, if plain { "*" } else { "*(" });
-            buf_bytes(t, SRC[NODES[other].start..NODES[other].end]);
+            buf_bytes(t, SRC[pcx.nodes[other].start..pcx.nodes[other].end]);
             buf_bytes(t, if plain { "" } else { ")" });
-            buf_bytes(t, SRC[NODES[other].end..NODES[bn].end]);
-            err_try_fmt(buf_slice(t));
-            err_fix(NODES[bn].start, NODES[bn].end, buf_slice(t));
+            buf_bytes(t, SRC[pcx.nodes[other].end..pcx.nodes[bn].end]);
+            err_try_fmt(buf_slice(t), pcx);
+            err_fix(pcx.nodes[bn].start, pcx.nodes[bn].end, buf_slice(t), &pcx);
             return;
         }
-        if ak == TyKind::Slice && (is_std_named(expected, c"Vec") || is_std_named(expected, c"Buf"))
-            && bn > 0 && NODES[bn].kind == NodeKind::Binary
-            && (NODES[bn].b == n || NODES[bn].c == n) {
+        if ak == TyKind::Slice
+            && (is_std_named(expected, c"Vec", pcx) || is_std_named(expected, c"Buf", pcx))
+            && bn > 0 && pcx.nodes[bn].kind == NodeKind::Binary
+            && (pcx.nodes[bn].b == n || pcx.nodes[bn].c == n) {
             // (0.25.3, eval 0.25.2.2: qwen35) `v == s`, a Vec (or a Buf) and
             // a slice: compared as slices, the Vec's `.as_slice()`
-            let other = if NODES[bn].b == n { NODES[bn].c } else { NODES[bn].b };
-            let plain = plain_operand_text(SRC[NODES[other].start..NODES[other].end]);
-            err_help(c"a Vec and a slice are compared as slices: the Vec's is '.as_slice()'");
-            buf_bytes(t, SRC[NODES[bn].start..NODES[other].start]);
+            let other = if pcx.nodes[bn].b == n { pcx.nodes[bn].c } else { pcx.nodes[bn].b };
+            let plain = plain_operand_text(SRC[pcx.nodes[other].start..pcx.nodes[other].end]);
+            err_help(c"a Vec and a slice are compared as slices: the Vec's is '.as_slice()'", pcx);
+            buf_bytes(t, SRC[pcx.nodes[bn].start..pcx.nodes[other].start]);
             buf_bytes(t, if plain { "" } else { "(" });
-            buf_bytes(t, SRC[NODES[other].start..NODES[other].end]);
+            buf_bytes(t, SRC[pcx.nodes[other].start..pcx.nodes[other].end]);
             buf_bytes(t, if plain { ".as_slice()" } else { ").as_slice()" });
-            buf_bytes(t, SRC[NODES[other].end..NODES[bn].end]);
-            err_try_fmt(buf_slice(t));
-            err_fix(NODES[bn].start, NODES[bn].end, buf_slice(t));
+            buf_bytes(t, SRC[pcx.nodes[other].end..pcx.nodes[bn].end]);
+            err_try_fmt(buf_slice(t), pcx);
+            err_fix(pcx.nodes[bn].start, pcx.nodes[bn].end, buf_slice(t), &pcx);
             return;
         }
         if ak == TyKind::Ptr && TYPES[actual].b != 0 && TYPES[actual].a == expected
-            && !(NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp) {
+            && !(pcx.nodes[n].kind == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp) {
             // (0.18.1) `n` with `n: &i64` where an i64 is wanted (not
             // `&k` itself: the value was meant, below)
-            err_help(c"it is a reference: read through it with '*'");
+            err_help(c"it is a reference: read through it with '*'", pcx);
             buf_fmt(t, format_args("*{open}{text}{close}"));
-            err_try_fmt(buf_slice(t));
-            err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            err_try_fmt(buf_slice(t), pcx);
+            err_fix(pcx.nodes[n].start, pcx.nodes[n].end, buf_slice(t), &pcx);
             return;
         }
-        let p = if is_numeric(expected) && is_numeric(actual) { cast_parent(WRAP_NODE, n) }
+        let p = if is_numeric(expected) && is_numeric(actual) { cast_parent(pcx.wrap_node, n, pcx) }
             else { 0 };
         if p != 0 {
             // (0.18.1) `cr - 1 as i32`: the whole operation, converted
-            let c = NODES[p].c;
-            let ae = NODES[NODES[c].a].end;
-            err_help(c"'as' binds tighter than the operator ('a - (1 as T)'): convert the whole operation");
-            buf_fmt(t, format_args("({}){}", SRC[NODES[p].start..ae], SRC[ae..NODES[c].end]));
-            err_try_fmt(buf_slice(t));
-            err_fix(NODES[p].start, NODES[c].end, buf_slice(t));
+            let c = pcx.nodes[p].c;
+            let ae = pcx.nodes[pcx.nodes[c].a].end;
+            err_help(c"'as' binds tighter than the operator ('a - (1 as T)'): convert the whole operation", pcx);
+            buf_fmt(t,
+                format_args("({}){}", SRC[pcx.nodes[p].start..ae], SRC[ae..pcx.nodes[c].end]));
+            err_try_fmt(buf_slice(t), pcx);
+            err_fix(pcx.nodes[p].start, pcx.nodes[c].end, buf_slice(t), &pcx);
             return;
         }
         if is_numeric(expected) && is_numeric(actual) {
-            err_help(c"only widening is implicit: convert explicitly");
+            err_help(c"only widening is implicit: convert explicitly", pcx);
             buf_fmt(t, format_args("{open}{text}{close} as "));
-            buf_type(t, expected);
+            buf_type(t, expected, pcx);
         } else if expected == TY_BOOL && is_integer(actual) {
-            err_help(c"a condition is a bool: compare (`x != 0`); bitwise not is `~x`");
+            err_help(c"a condition is a bool: compare (`x != 0`); bitwise not is `~x`", pcx);
             buf_fmt(t, format_args("{open}{text}{close} != 0"));
         } else if ek == TyKind::Slice && ak == TyKind::Array {
-            err_help(c"an array is not a slice: take one of all of it");
+            err_help(c"an array is not a slice: take one of all of it", pcx);
             buf_fmt(t, format_args("{open}{text}{close}[..]"));
         }
-        else if ek == TyKind::Slice && TYPES[expected].a == TY_U8 && is_std_named(actual, c"Buf") {
-            err_help(c"a Buf's text is its slice");
+        else if ek == TyKind::Slice && TYPES[expected].a == TY_U8
+            && is_std_named(actual, c"Buf", pcx) {
+            err_help(c"a Buf's text is its slice", pcx);
             buf_fmt(t, format_args("{open}{text}{close}.as_slice()"));
-        } else if ek == TyKind::Slice && is_std_named(actual, c"Vec") {
-            err_help(c"a Vec's elements are its slice");
+        } else if ek == TyKind::Slice && is_std_named(actual, c"Vec", pcx) {
+            err_help(c"a Vec's elements are its slice", pcx);
             buf_fmt(t, format_args("{open}{text}{close}.as_slice()"));
         } else if ek == TyKind::Ptr && (k == NodeKind::PatVariant || k == NodeKind::PatTuple
             || k == NodeKind::PatLit || k == NodeKind::PatRange || k == NodeKind::PatOr) {
             // (0.18.1: a pattern on `&T` matches the T; a pattern is no
             // place for `&`)
-            err_help(c"a pattern matches what one reference points to ('match e' on 'e: &E'); a raw pointer's value is 'match *p', in unsafe code");
+            err_help(c"a pattern matches what one reference points to ('match e' on 'e: &E'); a raw pointer's value is 'match *p', in unsafe code", pcx);
         } else if ek == TyKind::Ptr && TYPES[expected].a == actual && ak == TyKind::Slice
-            && NODES[n].start > 0 && SRC[NODES[n].start - 1] == '&' {
+            && pcx.nodes[n].start > 0 && SRC[pcx.nodes[n].start - 1] == '&' {
             // (0.18.1: `&x.text()` here was the slice itself)
-            err_help(c"'&' of a slice value is the slice; for a '&[T]', name it first: 'let t = VALUE;' before the statement, then '&t'");
+            err_help(c"'&' of a slice value is the slice; for a '&[T]', name it first: 'let t = VALUE;' before the statement, then '&t'", pcx);
             exact = false;
         }
         else if ek == TyKind::Ptr && TYPES[expected].a == actual
@@ -330,48 +309,49 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
             // (0.20: a let parameter that borrows, given a value that is no
             // place, a closure or a call's result: `&` would be the inout
             // marker)
-            err_help(c"a let parameter of this type borrows its argument, and this value has no place: name it first, 'let x = VALUE;' before the statement, then pass 'x' (or take the parameter 'sink')");
+            err_help(c"a let parameter of this type borrows its argument, and this value has no place: name it first, 'let x = VALUE;' before the statement, then pass 'x' (or take the parameter 'sink')", pcx);
             exact = false;
         } else if ek == TyKind::Ptr && TYPES[expected].a == actual {
             if TYPES[expected].b == REF_MUT {
-                err_help(c"an inout argument: marked '&x'");
+                err_help(c"an inout argument: marked '&x'", pcx);
                 buf_fmt(t, format_args("&{text}"));
             } else {
-                err_help(c"a pointer to it: its address");
+                err_help(c"a pointer to it: its address", pcx);
                 buf_fmt(t, format_args("&{text}"));
             }
             exact = simple;
         } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
             && TYPES[expected].b == REF_MUT && TYPES[actual].b == REF_SHARED && k == NodeKind::Unary
-            && NODES[n].op == Tok::Amp {
+            && pcx.nodes[n].op == Tok::Amp {
             // (0.17) `&x` where `&mut T` is expected
-            err_help(c"the parameter is inout: the callee may change it; mark the argument '&x'");
-            let operand = NODES[n].b;
-            buf_fmt(t, format_args("&{}", SRC[NODES[operand].start..NODES[operand].end]));
+            err_help(c"the parameter is inout: the callee may change it; mark the argument '&x'",
+                pcx);
+            let operand = pcx.nodes[n].b;
+            buf_fmt(t, format_args("&{}", SRC[pcx.nodes[operand].start..pcx.nodes[operand].end]));
         } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
             && TYPES[expected].b != 0 && TYPES[actual].b == 0 {
             // (0.17) a raw pointer where a reference is expected
-            err_help(c"a raw pointer is not a reference: nothing checks what it points to; pass `&place`, or, in unsafe code, `&*p`");
+            err_help(c"a raw pointer is not a reference: nothing checks what it points to; pass `&place`, or, in unsafe code, `&*p`", pcx);
         } else if ak == TyKind::Ptr && TYPES[actual].a == expected && TYPES[actual].b == REF_SHARED
-            && k == NodeKind::Unary && NODES[n].op == Tok::Amp {
+            && k == NodeKind::Unary && pcx.nodes[n].op == Tok::Amp {
             // (0.18.1) `m.get(&k)`, `v.contains(&x)`: Rust's borrowed key
-            err_help(c"the parameter takes the value, not a reference: std's lookups (`m.get(k)`, `v.contains(x)`) take keys by value");
-            let operand = NODES[n].b;
-            buf_bytes(t, SRC[NODES[operand].start..NODES[operand].end]);
+            err_help(c"the parameter takes the value, not a reference: std's lookups (`m.get(k)`, `v.contains(x)`) take keys by value", pcx);
+            let operand = pcx.nodes[n].b;
+            buf_bytes(t, SRC[pcx.nodes[operand].start..pcx.nodes[operand].end]);
         } else if is_vector(expected) && is_vector(actual)
-            && type_size(expected) == type_size(actual) {
+            && type_size(expected, pcx) == type_size(actual, pcx) {
             // (0.19: `vaddq_u8(a, b)` with a: v16i8; __m128i and the lanes)
-            err_help(c"vectors of the same size convert by their bits, with no instruction");
-            buf_type(t, expected);
+            err_help(c"vectors of the same size convert by their bits, with no instruction", pcx);
+            buf_type(t, expected, pcx);
             buf_fmt(t, format_args("::from_bits({text})"));
-        } else if is_std_allocator(actual) && !is_std_allocator(expected) {
+        } else if is_std_allocator(actual, pcx) && !is_std_allocator(expected, pcx) {
             // (0.18.1) `Vec::filled_in(gpa, n, x)`: the order of new_in(gpa)
-            err_help(c"an allocator goes last in std's `_in` forms, as in Rust's allocator API: `Vec::filled_in(n, x, gpa)`, `with_capacity_in(n, gpa)`");
+            err_help(c"an allocator goes last in std's `_in` forms, as in Rust's allocator API: `Vec::filled_in(n, x, gpa)`, `with_capacity_in(n, gpa)`", pcx);
         }
         if BUFS[t].len > 0 {
-            err_try_fmt(buf_slice(t));
+            err_try_fmt(buf_slice(t), pcx);
             if exact {
-                err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+                err_fix(pcx.nodes[n].start, pcx.nodes[n].end, buf_slice(t), &pcx);
             }
         }
     }
@@ -396,23 +376,23 @@ pub fn plain_operand_text(t: [u8]) -> bool {
 
 // (0.18.1) Whether t is one of std's allocators (Gpa, Arena, ScopedArena,
 // FixedBuf).
-fn is_std_allocator(t: i64) -> bool {
-    is_std_named(t, c"Gpa") || is_std_named(t, c"Arena") || is_std_named(t, c"ScopedArena")
-        || is_std_named(t, c"FixedBuf")
+fn is_std_allocator(t: i64, pcx: Ctx<Comp>) -> bool {
+    is_std_named(t, c"Gpa", pcx) || is_std_named(t, c"Arena", pcx)
+        || is_std_named(t, c"ScopedArena", pcx) || is_std_named(t, c"FixedBuf", pcx)
 }
 
 // (0.18.1) The binary operation in `root` whose left operand is n and
 // whose right one is a cast ending it, `cr - 1 as i32` (`as` binds
 // tighter: `cr - (1 as i32)`); 0 when there is none.
-fn cast_parent(root: i64, n: i64) -> i64 {
+fn cast_parent(root: i64, n: i64, pcx: Ctx<Comp>) -> i64 {
     if root <= 0 {
         return 0;
     }
-    let k = NODES[root].kind;
-    if k == NodeKind::Binary && NODES[root].b == n {
-        let c = NODES[root].c;
-        let op = NODES[root].op;
-        if c > 0 && NODES[c].kind == NodeKind::Cast && NODES[c].end == NODES[root].end
+    let k = pcx.nodes[root].kind;
+    if k == NodeKind::Binary && pcx.nodes[root].b == n {
+        let c = pcx.nodes[root].c;
+        let op = pcx.nodes[root].op;
+        if c > 0 && pcx.nodes[c].kind == NodeKind::Cast && pcx.nodes[c].end == pcx.nodes[root].end
             && (op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
                 || op == Tok::Percent || op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret
                 || op == Tok::Shl || op == Tok::Shr) {
@@ -420,25 +400,25 @@ fn cast_parent(root: i64, n: i64) -> i64 {
         }
     }
     if node_field_a(k) {
-        let r = cast_parent(NODES[root].a, n);
+        let r = cast_parent(pcx.nodes[root].a, n, pcx);
         if r != 0 {
             return r;
         }
     }
     if node_field_b(k) {
-        let r = cast_parent(NODES[root].b, n);
+        let r = cast_parent(pcx.nodes[root].b, n, pcx);
         if r != 0 {
             return r;
         }
     }
     if node_field_c(k) {
-        let r = cast_parent(NODES[root].c, n);
+        let r = cast_parent(pcx.nodes[root].c, n, pcx);
         if r != 0 {
             return r;
         }
     }
-    for i in 0..NODES[root].count {
-        let r = cast_parent(child(root, i), n);
+    for i in 0..pcx.nodes[root].count {
+        let r = cast_parent(child(root, i, pcx), n, pcx);
         if r != 0 {
             return r;
         }
@@ -447,12 +427,12 @@ fn cast_parent(root: i64, n: i64) -> i64 {
 }
 
 // Whether type t is std's struct `name` (an instance of it).
-pub fn is_std_named(t: i64, name: *u8) -> bool {
+pub fn is_std_named(t: i64, name: *u8, pcx: Ctx<Comp>) -> bool {
     if TYPES[t].kind != TyKind::Struct {
         return false;
     }
     let b = buf_new();
-    buf_type(b, t);
+    buf_type(b, t, pcx);
     let s = buf_slice(b);
     let w = cstr(name);
     s.len >= w.len && s[0..w.len] == w
@@ -460,38 +440,38 @@ pub fn is_std_named(t: i64, name: *u8) -> bool {
 }
 
 // `message` followed by `, got '<type>'`.
-pub fn type_error_got(n: i64, message: *u8, t: i64) -> ! {
-    err_begin(NODES[n].start);
-    err_str(message);
-    err_str(c", got '");
-    err_type(t);
-    err_str(c"'");
-    err_end()
+pub fn type_error_got(n: i64, message: *u8, t: i64, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[n].start, &pcx);
+    err_str(message, pcx);
+    err_str(c", got '", pcx);
+    err_type(t, pcx);
+    err_str(c"'", pcx);
+    err_end(&pcx)
 }
 
-pub fn name_error(pos: i64, before: *u8, name: i64, after: *u8) -> ! {
-    err_begin(pos);
-    err_str(before);
-    err_sym(name);
-    err_str(after);
-    err_end()
+pub fn name_error(pos: i64, before: *u8, name: i64, after: *u8, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pos, &pcx);
+    err_str(before, pcx);
+    err_sym(name, pcx);
+    err_str(after, pcx);
+    err_end(&pcx)
 }
 
 // ---- Scopes ----
 
-pub fn push_scope() {
-    SCOPES.push(ENV.count);
+pub fn push_scope(pcx: inout Ctx<Comp>) {
+    pcx.check_scopes.push(pcx.env.count);
 }
 
-pub fn pop_scope() {
-    ENV.count = SCOPES.pop();
+pub fn pop_scope(pcx: inout Ctx<Comp>) {
+    pcx.env.count = pcx.check_scopes.pop();
 }
 
-pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
+pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        LOCALS = grow(LOCALS, LOCAL_COUNT, &LOCAL_CAP);
-        let id = LOCAL_COUNT;
-        LOCALS[id] = Local {
+        pcx.locals = grow(pcx.locals, pcx.local_count, &pcx.local_cap);
+        let id = pcx.local_count;
+        pcx.locals[id] = Local {
             name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0,
             // (0.17: a reference is a borrow)
             borrow: ty > 0 && is_ref(ty),
@@ -501,24 +481,24 @@ pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
             access: false,
             is_sink: false,
         };
-        LOCAL_COUNT += 1;
+        pcx.local_count += 1;
         // (0.17: the own pass's record, front/own/fast.vl)
-        crate::front::own::fast::note_type(ty);
-        ENV.push(id);
+        crate::front::own::fast::note_type(ty, &pcx);
+        pcx.env.push(id);
         id
     }
 }
 
 // The innermost local named `name`, or -1.
-pub fn lookup_local(name: i64) -> Option<i64> {
+pub fn lookup_local(name: i64, pcx: Ctx<Comp>) -> Option<i64> {
     unsafe {
-        if CONST_CONTEXT {
+        if pcx.const_context {
             return Option::None;
         }
-        var i = ENV.count - 1;
+        var i = pcx.env.count - 1;
         while i >= 0 {
-            let id = ENV.data[i];
-            if LOCALS[id].name == name {
+            let id = pcx.env.data[i];
+            if pcx.locals[id].name == name {
                 return Option::Some(id);
             }
             i -= 1;
@@ -529,7 +509,7 @@ pub fn lookup_local(name: i64) -> Option<i64> {
 
 // ---- Declarations ----
 
-pub fn check_program(program: i64) {
+pub fn check_program(program: i64, pcx: inout Ctx<Comp>, wgx: inout WgslCx<Arena>) {
     var fcx = features_cx_new();
     var kcx = contracts_cx_new();
     var wcx = embed_cx_new();
@@ -537,115 +517,116 @@ pub fn check_program(program: i64) {
     var thcx = threads_cx_new();
     var pbody = body_new();
     unsafe {
-        PROGRAM = program;
-        SELF_TYPE_SYM = intern_c(c"Self");
-        SELF_SYM = intern_c(c"self");
-        init_modules();
-        init_traits();
+        pcx.program = program;
+        pcx.self_type_sym = intern_c(c"Self");
+        pcx.self_sym = intern_c(c"self");
+        init_modules(&pcx);
+        init_traits(&pcx);
         // The declarations, one phase after the other (see collect_phase),
         // then every function body, whatever errors the declarations had
         // (0.10: what failed in them is the error type, or left out).
         // (0.15: `#[derive(...)]`, impls added to the program; std's
         // functions lazy)
         // (0.26.0: `embed wgsl K { .. }`: its struct and static, front/embed)
-        crate::front::embed::wgsl::expand_embeds(&wcx);
-        expand_derives();
+        crate::front::embed::wgsl::expand_embeds(&wcx, &pcx, &wgx);
+        expand_derives(&pcx);
         // (0.18: clauses made into functions, front/contracts/expand.vl)
         // (0.19: #[multiversion]'s versions and dispatchers)
-        crate::front::features::multiversion::expand_multiversion(&fcx);
-        crate::front::contracts::expand::expand_contracts(&kcx);
-        lazy_std(program);
+        crate::front::features::multiversion::expand_multiversion(&fcx, &pcx);
+        crate::front::contracts::expand::expand_contracts(&kcx, &pcx);
+        lazy_std(program, &pcx);
         for phase in 0..PHASE_COUNT {
-            collect_phase(phase);
+            collect_phase(phase, &pcx);
         }
         // (0.15: the fields of a derived impl have its trait)
-        check_derives();
+        check_derives(&pcx);
         // (0.15: `fn main() -> Result<(), E>`)
         // (0.16: `fn main(gpa: Gpa)`)
-        main_gpa();
-        main_result_wrapper();
+        main_gpa(&pcx);
+        main_result_wrapper(&pcx);
         // (0.26.3: allocation as a capability, check/alloc_rules)
-        crate::front::check::alloc_rules::check_alloc_rules();
-        for i in 0..NODES[program].count {
-            let item = child(program, i);
+        crate::front::check::alloc_rules::check_alloc_rules(&pcx);
+        for i in 0..pcx.nodes[program].count {
+            let item = child(program, i, pcx);
             // (x is 0 for a function left out by its declaration's error)
             // (0.14: a lazy default is checked when first used: ensure_checked)
-            if NODES[item].kind == Fn && NODES[item].x != 0 && FNS[NODES[item].x - 1].generic == 0
-                && (NODES[item].p & FN_LAZY) == 0 {
-                check_function_recovering(item);
+            if pcx.nodes[item].kind == Fn && pcx.nodes[item].x != 0
+                && pcx.fns[pcx.nodes[item].x - 1].generic == 0
+                && (pcx.nodes[item].p & FN_LAZY) == 0 {
+                check_function_recovering(item, &pcx);
             }
         }
         // The instances, as they are made: an instance may make more.
         var q = 0;
-        while q < INST_QUEUE.count {
-            check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+        while q < pcx.inst_queue.count {
+            check_function_recovering(pcx.fns[pcx.inst_queue.data[q]].node, &pcx);
             q += 1;
         }
         // (0.17: std from its files, to be edited: its generic functions too)
-        if crate::front::stdtree::STD_TREE != 0 as *u8 {
-            check_std_generics(program);
-            while q < INST_QUEUE.count {
-                check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+        if pcx.std_tree != 0 as *u8 {
+            check_std_generics(program, &pcx);
+            while q < pcx.inst_queue.count {
+                check_function_recovering(pcx.fns[pcx.inst_queue.data[q]].node, &pcx);
                 q += 1;
             }
         }
-        if QUERY {
-            check_unchecked(program);
+        if pcx.query {
+            check_unchecked(program, &pcx);
         }
         // (0.26.3: `fix --only buf` reads the Bufs' writes: every body
         // checked, std's str still str, a program with errors too)
-        if crate::tools::fix::buf::RECORD {
-            crate::tools::fix::buf::collect();
+        if pcx.record {
+            crate::tools::fix::buf::collect(&pcx);
         }
         // (0.26.0: the places IR, every checked body: places/; before the
         // effects, which see the own pass's drops as before)
-        crate::places::run_places(&pbody);
+        crate::places::run_places(&pbody, &pcx);
         // (0.16: the statics that call constant constructors)
-        check_static_calls();
+        check_static_calls(&pcx);
         // (0.8: `*` imports and plain header imports, once the names used
         // through them are known)
-        report_legacy_imports(true);
+        report_legacy_imports(true, &pcx);
         // (0.16: the effects of every function, then the declared ones)
         // (none at -O0 when nothing reads them: EFFECTS_WANTED)
-        let threads = crate::front::threads::uses_threads(&thcx);
-        if EFFECTS_WANTED || effects_declared() || threads {
-            infer_effects();
-            check_effects();
+        let threads = crate::front::threads::uses_threads(&thcx, pcx);
+        if pcx.effects_wanted || effects_declared(&pcx) || threads {
+            infer_effects(&pcx);
+            check_effects(&pcx);
         }
         // (0.25: no view in a channel, a Mutex or an atomic)
-        crate::front::threads::check_sync_items(&thcx);
+        crate::front::threads::check_sync_items(&thcx, &pcx);
         // (0.21: what crosses threads, front/threads)
         if threads {
-            crate::front::threads::check_threads(&thcx);
+            crate::front::threads::check_threads(&thcx, &pcx);
         }
         // (0.19: target features, when the program names std::arch)
-        crate::front::features::check_features(&fcx);
+        crate::front::features::check_features(&fcx, &pcx);
         // (0.18: the clauses, front/contracts; phase 0 reads them only)
-        check_contracts();
+        check_contracts(&pcx);
         // (0.18 with 0.17: a distinct type over a Drop type, known now)
-        crate::front::check::distinct::check_distinct_kinds();
+        crate::front::check::distinct::check_distinct_kinds(&pcx);
         // (0.26.2: std::gpu's calls against the blocks, front/embed/gpu_lint)
-        crate::front::embed::gpu_lint::gpu_lint(&wcx);
-        exit_if_errors();
+        crate::front::embed::gpu_lint::gpu_lint(&wcx, &pcx);
+        exit_if_errors(&pcx);
         // (0.20: std's `str` becomes `[u8]`, a view the own pass checks)
-        crate::front::check::distinct::erase_view_distincts();
+        crate::front::check::distinct::erase_view_distincts(&pcx);
         // (0.17: value semantics, front/own; --values)
-        check_own(&ocx);
+        check_own(&ocx, &pcx);
         // (0.26.0: the places IR's move-out backstop, and --places-diff)
-        crate::places::after_own();
-        exit_if_errors();
+        crate::places::after_own(&pcx);
+        exit_if_errors(&pcx);
         // (0.26.3: the uses of #[deprecated] items, warnings)
-        crate::front::check::deprecated::report_deprecated_uses();
+        crate::front::check::deprecated::report_deprecated_uses(&pcx);
         // (0.25.2: the imports nothing names, a warning, use.unused; after
         // the checks, which --deny-warnings would stop)
-        crate::tools::fix::report_unused_imports();
-        exit_if_errors();
+        crate::tools::fix::report_unused_imports(&pcx);
+        exit_if_errors(&pcx);
         // (0.18: distinct types become their underlying types for the code
         // generators; tools keep them)
-        if !QUERY {
-            erase_program_types();
+        if !pcx.query {
+            erase_program_types(&pcx);
         }
-        finish_program(program);
+        finish_program(program, &pcx);
     }
 }
 
@@ -653,146 +634,142 @@ const PHASE_COUNT: i64 = 15;
 
 // One phase of the declarations. Each item recovers from its errors on
 // its own (see attempt); an error none of them catches ends the checking.
-fn collect_phase(phase: i64) {
-    let depth = RECOVER_DEPTH;
-    let state = save_check_state();
-    if unsafe { _setjmp(recover_enter()) == 0 } {
+fn collect_phase(phase: i64, pcx: inout Ctx<Comp>) {
+    let depth = pcx.recover_depth;
+    let state = save_check_state(pcx);
+    if unsafe { _setjmp(recover_enter(&pcx)) == 0 } {
         match phase {
-            0 => collect_names(),
-            1 => collect_uses(),
-            2 => collect_const_types(),
-            3 => collect_structs(),
-            4 => collect_enums(),
-            5 => resolve_all_uses(),
-            6 => collect_aliases(),
-            7 => check_struct_cycles(),
-            8 => collect_impls(),
-            9 => collect_methods(),
-            10 => collect_functions(),
-            11 => check_impl_signatures(),
-            12 => collect_statics(),
-            13 => evaluate_consts(),
-            _ => check_later_bounds(),
+            0 => collect_names(&pcx),
+            1 => collect_uses(&pcx),
+            2 => collect_const_types(&pcx),
+            3 => collect_structs(&pcx),
+            4 => collect_enums(&pcx),
+            5 => resolve_all_uses(&pcx),
+            6 => collect_aliases(&pcx),
+            7 => check_struct_cycles(&pcx),
+            8 => collect_impls(&pcx),
+            9 => collect_methods(&pcx),
+            10 => collect_functions(&pcx),
+            11 => check_impl_signatures(&pcx),
+            12 => collect_statics(&pcx),
+            13 => evaluate_consts(&pcx),
+            _ => check_later_bounds(&pcx),
         }
     } else {
         // Later phases would only report what follows from this error.
-        restore_check_state(state);
-        report_legacy_imports(false);
-        exit_if_errors();
+        restore_check_state(state, &pcx);
+        report_legacy_imports(false, &pcx);
+        exit_if_errors(&pcx);
     }
-    recover_leave(depth);
+    recover_leave(depth, &pcx);
 }
 
-fn check_function_recovering(item: i64) {
+fn check_function_recovering(item: i64, pcx: inout Ctx<Comp>) {
     // (not a function whose body had a syntax error, but in
     // check_unchecked, or whose declaration failed)
-    let p = NODES[item].p;
+    let p = pcx.nodes[item].p;
     // (0.19: nor a declaration of std::arch's, which has no body)
-    if (p & FN_SIG_FAILED) != 0 || ((p & FN_BODY_FAILED) != 0 && !CHECK_UNCHECKED)
-        || ((p & FN_INTRINSIC) != 0 && (NODES[item].c) == 0) {
+    if (p & FN_SIG_FAILED) != 0 || ((p & FN_BODY_FAILED) != 0 && !pcx.check_unchecked)
+        || ((p & FN_INTRINSIC) != 0 && (pcx.nodes[item].c) == 0) {
         return;
     }
-    let depth = RECOVER_DEPTH;
-    let state = save_check_state();
-    let errors = error_count();
-    if unsafe { _setjmp(recover_enter()) == 0 } {
-        check_function(item);
+    let depth = pcx.recover_depth;
+    let state = save_check_state(pcx);
+    let errors = error_count(pcx);
+    if unsafe { _setjmp(recover_enter(&pcx)) == 0 } {
+        check_function(item, &pcx);
     } else {
-        restore_check_state(state);
+        restore_check_state(state, &pcx);
     }
     // (0.16: its effects are unknown)
-    if error_count() != errors {
-        note_body_failed(NODES[item].x - 1);
+    if error_count(pcx) != errors {
+        note_body_failed(pcx.nodes[item].x - 1, &pcx);
     }
-    recover_leave(depth);
+    recover_leave(depth, &pcx);
 }
 
 // (0.26.1) The instances queued from INST_QUEUE[from] on checked, as
 // check_program checks them (and those they make): for the places IR's
 // drop shims, which make the `Drop::drop` instances they call
 // (places/shim.vl: drop_fn).
-pub fn check_queued_instances(from: i64) {
+pub fn check_queued_instances(from: i64, pcx: inout Ctx<Comp>) {
     var q = from;
-    while q < INST_QUEUE.count {
+    while q < pcx.inst_queue.count {
         // UNSAFE: FNS is the checker's raw table of functions.
         // SAFETY: INST_QUEUE holds functions the checker made (below FN_COUNT).
-        let item = unsafe { FNS[INST_QUEUE.get(q)].node };
-        check_function_recovering(item);
+        let item = unsafe { pcx.fns[pcx.inst_queue.get(q)].node };
+        check_function_recovering(item, &pcx);
         q += 1;
     }
 }
-
-// Set while check_unchecked runs: a body with a syntax error is checked
-// (as far as it was parsed), and the error type meets every bound.
-pub static var CHECK_UNCHECKED: bool = false;
 
 // For a query (0.13): what no compilation checks, checked as far as it
 // goes for its references, and what it finds wrong forgotten: a function
 // whose body has a syntax error (what was parsed of it), and a generic
 // function never instantiated (an instance whose type arguments are the
 // error type). The instances made for them are not the program's.
-fn check_unchecked(program: i64) {
+fn check_unchecked(program: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let mark = errors_mark();
-        let queued = INST_QUEUE.count;
-        let closures = CLOSURE_FNS.count;
-        CHECK_UNCHECKED = true;
-        let fns = FN_COUNT;
+        let mark = errors_mark(pcx);
+        let queued = pcx.inst_queue.count;
+        let closures = pcx.closure_fns.count;
+        pcx.check_unchecked = true;
+        let fns = pcx.fn_count;
         // (0.25) The templates with an instance, marked in one pass: each
         // generic function looked through every function for one.
         let instantiated = alloc_zeroed(fns);
         for g in 0..fns {
-            let t = FNS[g].tmpl - 1;
+            let t = pcx.fns[g].tmpl - 1;
             if t >= 0 && t < fns {
                 instantiated[t] = 1;
             }
         }
-        for i in 0..NODES[program].count {
-            let item = child(program, i);
-            if NODES[item].kind != Fn || NODES[item].x == 0
-                || (NODES[item].p & FN_SIG_FAILED) != 0 {
+        for i in 0..pcx.nodes[program].count {
+            let item = child(program, i, pcx);
+            if pcx.nodes[item].kind != Fn || pcx.nodes[item].x == 0
+                || (pcx.nodes[item].p & FN_SIG_FAILED) != 0 {
                 continue;
             }
-            let f = NODES[item].x - 1;
-            if FNS[f].generic == 0 {
+            let f = pcx.nodes[item].x - 1;
+            if pcx.fns[f].generic == 0 {
                 // (0.14: a lazy default no one uses, for its references)
-                if (NODES[item].p & FN_LAZY) != 0 {
-                    ensure_checked(f, item);
+                if (pcx.nodes[item].p & FN_LAZY) != 0 {
+                    ensure_checked(f, item, &pcx);
                 }
-                if (NODES[item].p & FN_BODY_FAILED) != 0 {
-                    check_function_recovering(item);
+                if (pcx.nodes[item].p & FN_BODY_FAILED) != 0 {
+                    check_function_recovering(item, &pcx);
                 }
                 continue;
             }
-            if FNS[f].tmpl != 0 {
+            if pcx.fns[f].tmpl != 0 {
                 continue;
             }
             if f < fns && instantiated[f] != 0 {
                 continue;
             }
-            let depth = RECOVER_DEPTH;
-            let state = save_check_state();
-            if _setjmp(recover_enter()) == 0 {
+            let depth = pcx.recover_depth;
+            let state = save_check_state(pcx);
+            if _setjmp(recover_enter(&pcx)) == 0 {
                 let m = TSCRATCH.count;
-                for _ in 0..FNS[f].generic {
-                    TSCRATCH.push(TY_ERROR);
+                for _ in 0..pcx.fns[f].generic {
+                    TSCRATCH.push(pcx.ty_error);
                 }
-                fn_instance(f, m, item);
+                fn_instance(f, m, item, &pcx);
             } else {
-                restore_check_state(state);
+                restore_check_state(state, &pcx);
             }
-            recover_leave(depth);
+            recover_leave(depth, &pcx);
         }
         free(instantiated);
         var q = queued;
-        while q < INST_QUEUE.count {
-            check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+        while q < pcx.inst_queue.count {
+            check_function_recovering(pcx.fns[pcx.inst_queue.data[q]].node, &pcx);
             q += 1;
         }
-        CHECK_UNCHECKED = false;
-        INST_QUEUE.count = queued;
-        CLOSURE_FNS.count = closures;
-        errors_forget(mark);
+        pcx.check_unchecked = false;
+        pcx.inst_queue.count = queued;
+        pcx.closure_fns.count = closures;
+        errors_forget(mark, &pcx);
     }
 }
 
@@ -804,43 +781,43 @@ fn check_unchecked(program: i64) {
 // checked only where a program uses it, and so is a trait's default method
 // copied into an impl (lazy: `sum` of an iterator of pairs). Its errors are kept: the edit's
 // check reports those it added.
-fn check_std_generics(program: i64) {
+fn check_std_generics(program: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let gpa = crate::front::effects::infer::std_struct_type(c"Gpa");
-        let fns = FN_COUNT;
-        for i in 0..NODES[program].count {
-            let item = child(program, i);
-            if NODES[item].kind != Fn || NODES[item].x == 0
-                || (NODES[item].p & (FN_SIG_FAILED | FN_LAZY | FN_DEFAULT_COPY)) != 0
-                || !within_std(module_of(item)) {
+        let gpa = crate::front::effects::infer::std_struct_type(c"Gpa", &pcx);
+        let fns = pcx.fn_count;
+        for i in 0..pcx.nodes[program].count {
+            let item = child(program, i, pcx);
+            if pcx.nodes[item].kind != Fn || pcx.nodes[item].x == 0
+                || (pcx.nodes[item].p & (FN_SIG_FAILED | FN_LAZY | FN_DEFAULT_COPY)) != 0
+                || !within_std(module_of(item, &pcx), pcx) {
                 continue;
             }
-            let f = NODES[item].x - 1;
-            if FNS[f].generic == 0 || FNS[f].tmpl != 0
-                || (0..fns).any(|g| FNS[g].tmpl == f + 1) {
+            let f = pcx.nodes[item].x - 1;
+            if pcx.fns[f].generic == 0 || pcx.fns[f].tmpl != 0
+                || (0..fns).any(|g| pcx.fns[g].tmpl == f + 1) {
                 continue;
             }
-            let params = NODES[item].g;
+            let params = pcx.nodes[item].g;
             let m = TSCRATCH.count;
-            for k in 0..FNS[f].generic {
-                let t = simple_targ(child(params, k), gpa);
+            for k in 0..pcx.fns[f].generic {
+                let t = simple_targ(child(params, k, pcx), gpa, &pcx);
                 if t == 0 {
                     break;
                 }
                 TSCRATCH.push(t);
             }
-            if TSCRATCH.count - m != FNS[f].generic {
+            if TSCRATCH.count - m != pcx.fns[f].generic {
                 TSCRATCH.count = m;
                 continue;
             }
-            let depth = RECOVER_DEPTH;
-            let state = save_check_state();
-            if _setjmp(recover_enter()) == 0 {
-                fn_instance(f, m, item);
+            let depth = pcx.recover_depth;
+            let state = save_check_state(pcx);
+            if _setjmp(recover_enter(&pcx)) == 0 {
+                fn_instance(f, m, item, &pcx);
             } else {
-                restore_check_state(state);
+                restore_check_state(state, &pcx);
             }
-            recover_leave(depth);
+            recover_leave(depth, &pcx);
         }
     }
 }
@@ -848,8 +825,8 @@ fn check_std_generics(program: i64) {
 // A type for type parameter p (check_std_generics): i64, or gpa, the one
 // that satisfies its bounds; 0 when neither does or a bound is not a
 // plain trait.
-fn simple_targ(p: i64, gpa: i64) -> i64 {
-    let bounds = NODES[p].h;
+fn simple_targ(p: i64, gpa: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let bounds = pcx.nodes[p].h;
     if bounds == 0 {
         return TY_I64;
     }
@@ -859,16 +836,16 @@ fn simple_targ(p: i64, gpa: i64) -> i64 {
             continue;
         }
         var ok = true;
-        for i in 0..NODES[bounds].count {
-            let b = child(bounds, i);
-            if NODES[b].kind == crate::front::ast::NodeKind::EffectSet {
+        for i in 0..pcx.nodes[bounds].count {
+            let b = child(bounds, i, pcx);
+            if pcx.nodes[b].kind == crate::front::ast::NodeKind::EffectSet {
                 continue;
             }
-            if NODES[b].kind == crate::front::ast::NodeKind::TyFn || NODES[b].h != 0
-                || NODES[b].g != 0 {
+            if pcx.nodes[b].kind == crate::front::ast::NodeKind::TyFn || pcx.nodes[b].h != 0
+                || pcx.nodes[b].g != 0 {
                 return 0;
             }
-            if !implements(bound_trait(b), t) {
+            if !implements(bound_trait(b, &pcx), t, &pcx) {
                 ok = false;
                 break;
             }
@@ -888,39 +865,42 @@ struct CheckState {
     unsafe_depth: i64, wrap: i64, loop_base: i64, cur_fn: i64, closures: i64,
 }
 
-fn save_check_state() -> CheckState {
+fn save_check_state(pcx: Ctx<Comp>) -> CheckState {
     CheckState {
-        env: ENV.count, scopes: SCOPES.count, loops: LOOP_STACK.count, module: CUR_MOD,
-        self_ty: SELF_TYPE, tp_base: TP_BASE, tp_count: TP_NAMES.count, inst: CUR_INST,
-        ret: RETURN_TYPE, tscratch: TSCRATCH.count, scratch: SCRATCH.count,
-        const_context: CONST_CONTEXT, unsafe_depth: UNSAFE_DEPTH,
-        wrap: WRAP_NODE, loop_base: LOOP_BASE, cur_fn: CUR_FN, closures: CLOSURE_STACK.count,
+        env: pcx.env.count, scopes: pcx.check_scopes.count, loops: pcx.loop_stack.count,
+        module: pcx.cur_mod,
+        self_ty: pcx.self_type, tp_base: pcx.tp_base, tp_count: pcx.tp_names.count,
+        inst: pcx.cur_inst,
+        ret: pcx.return_type, tscratch: TSCRATCH.count, scratch: pcx.scratch.count,
+        const_context: pcx.const_context, unsafe_depth: pcx.unsafe_depth,
+        wrap: pcx.wrap_node, loop_base: pcx.loop_base, cur_fn: pcx.cur_fn,
+        closures: pcx.closure_stack.count,
     }
 }
 
-fn restore_check_state(s: CheckState) {
-    ENV.count = s.env;
-    SCOPES.count = s.scopes;
-    LOOP_STACK.count = s.loops;
-    CUR_MOD = s.module;
-    SELF_TYPE = s.self_ty;
-    TP_BASE = s.tp_base;
-    TP_NAMES.count = s.tp_count;
-    TP_TYPES.count = s.tp_count;
-    CUR_INST = s.inst;
-    RETURN_TYPE = s.ret;
+fn restore_check_state(s: CheckState, pcx: inout Ctx<Comp>) {
+    pcx.env.count = s.env;
+    pcx.check_scopes.count = s.scopes;
+    pcx.loop_stack.count = s.loops;
+    pcx.cur_mod = s.module;
+    pcx.self_type = s.self_ty;
+    pcx.tp_base = s.tp_base;
+    pcx.tp_names.count = s.tp_count;
+    pcx.tp_types.count = s.tp_count;
+    pcx.cur_inst = s.inst;
+    pcx.return_type = s.ret;
     TSCRATCH.count = s.tscratch;
-    SCRATCH.count = s.scratch;
-    CONST_CONTEXT = s.const_context;
-    UNSAFE_DEPTH = s.unsafe_depth;
-    WRAP_NODE = s.wrap;
-    LOOP_BASE = s.loop_base;
-    CUR_FN = s.cur_fn;
-    CLOSURE_STACK.count = s.closures;
-    OR_MODE = false;
-    SELF_BOUND_POS = -1;
-    UNIFY_SELF = 0;
-    UNIFY_SELF_TY = 0;
+    pcx.scratch.count = s.scratch;
+    pcx.const_context = s.const_context;
+    pcx.unsafe_depth = s.unsafe_depth;
+    pcx.wrap_node = s.wrap;
+    pcx.loop_base = s.loop_base;
+    pcx.cur_fn = s.cur_fn;
+    pcx.closure_stack.count = s.closures;
+    pcx.or_mode = false;
+    pcx.self_bound_pos = -1;
+    pcx.unify_self = 0;
+    pcx.unify_self_ty = 0;
 }
 
 // ---- Recovery (0.10) ----
@@ -936,33 +916,30 @@ fn restore_check_state(s: CheckState) {
 // What `attempt` does.
 pub enum Try { Name, Type, Method, Static, Const, Use, Impl, Bound, Discr, StaticCall }
 
-// The result of the attempt that went through.
-pub static var TRY_RESULT: i64 = 0;
-
 // Does `what` for `arg` with a recovery point: whether it went through
 // (an error was recorded otherwise, and the checker's state is as it was).
-pub fn attempt(what: Try, arg: i64) -> bool {
-    let depth = RECOVER_DEPTH;
-    let state = save_check_state();
+pub fn attempt(what: Try, arg: i64, pcx: inout Ctx<Comp>) -> bool {
+    let depth = pcx.recover_depth;
+    let state = save_check_state(pcx);
     var ok = true;
-    if unsafe { _setjmp(recover_enter()) == 0 } {
+    if unsafe { _setjmp(recover_enter(&pcx)) == 0 } {
         match what {
-            Try::Name => collect_name(arg),
-            Try::Type => TRY_RESULT = resolve_type(arg),
-            Try::Method => collect_method(arg),
-            Try::Static => check_static(arg),
-            Try::Const => const_value_of(arg),
-            Try::Use => resolve_use_of(arg),
-            Try::Impl => collect_impl(arg),
-            Try::Bound => TRY_RESULT = trait_named(arg),
-            Try::Discr => TRY_RESULT = eval_discriminant(arg),
-            Try::StaticCall => static_call_value(arg),
+            Try::Name => collect_name(arg, &pcx),
+            Try::Type => pcx.try_result = resolve_type(arg, &pcx),
+            Try::Method => collect_method(arg, &pcx),
+            Try::Static => check_static(arg, &pcx),
+            Try::Const => const_value_of(arg, &pcx),
+            Try::Use => resolve_use_of(arg, &pcx),
+            Try::Impl => collect_impl(arg, &pcx),
+            Try::Bound => pcx.try_result = trait_named(arg, &pcx),
+            Try::Discr => pcx.try_result = eval_discriminant(arg, &pcx),
+            Try::StaticCall => static_call_value(arg, &pcx),
         }
     } else {
-        restore_check_state(state);
+        restore_check_state(state, &pcx);
         ok = false;
     }
-    recover_leave(depth);
+    recover_leave(depth, &pcx);
     ok
 }
 
@@ -970,46 +947,46 @@ pub fn attempt(what: Try, arg: i64) -> bool {
 // error in it, the error type, so that what depends on it (an if's
 // branches, a loop's body, a match's arms) is checked too, its errors
 // reported in the same pass.
-pub fn check_recovering(e: i64, expected: i64) -> i64 {
-    let depth = RECOVER_DEPTH;
-    let state = save_check_state();
-    var ty = TY_ERROR;
-    if unsafe { _setjmp(recover_enter()) == 0 } {
-        ty = check_wrapped(e, expected);
+pub fn check_recovering(e: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let depth = pcx.recover_depth;
+    let state = save_check_state(pcx);
+    var ty = pcx.ty_error;
+    if unsafe { _setjmp(recover_enter(&pcx)) == 0 } {
+        ty = check_wrapped(e, expected, &pcx);
     } else {
-        restore_check_state(state);
+        restore_check_state(state, &pcx);
     }
-    recover_leave(depth);
+    recover_leave(depth, &pcx);
     ty
 }
 
 // The type node n names; the error type (an error recorded) when it
 // names none.
-pub fn resolve_type_or_error(n: i64) -> i64 {
-    if attempt(Try::Type, n) { TRY_RESULT } else { TY_ERROR }
+pub fn resolve_type_or_error(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    if attempt(Try::Type, n, &pcx) { pcx.try_result } else { pcx.ty_error }
 }
 
 // Whether type t is or holds the error type (a type that failed).
-pub fn has_error_type(t: i64) -> bool {
+pub fn has_error_type(t: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if t == TY_ERROR {
+        if t == pcx.ty_error {
             return true;
         }
         let kind = TYPES[t].kind;
         if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
-            return has_error_type(TYPES[t].a);
+            return has_error_type(TYPES[t].a, pcx);
         }
-        if kind == TyKind::Distinct && has_error_type(TYPES[t].a) {
+        if kind == TyKind::Distinct && has_error_type(TYPES[t].a, pcx) {
             return true;
         }
-        if kind == TyKind::Fn && has_error_type(TYPES[t].a) {
+        if kind == TyKind::Fn && has_error_type(TYPES[t].a, pcx) {
             return true;
         }
         // (0.14: `Option<{error}>`, from an associated type an impl lacks)
-        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+        if kind == TyKind::Struct && pcx.structs[TYPES[t].a].tmpl != 0 {
             let s = TYPES[t].a;
-            for i in 0..STRUCTS[s].targ_count {
-                if has_error_type(TLISTS.data[STRUCTS[s].targs + i]) {
+            for i in 0..pcx.structs[s].targ_count {
+                if has_error_type(TLISTS.data[pcx.structs[s].targs + i], pcx) {
                     return true;
                 }
             }
@@ -1017,14 +994,14 @@ pub fn has_error_type(t: i64) -> bool {
         if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
             let e = TYPES[t].a;
             for i in 0..ENUMS[e].targ_count {
-                if has_error_type(TLISTS.data[ENUMS[e].targs + i]) {
+                if has_error_type(TLISTS.data[ENUMS[e].targs + i], pcx) {
                     return true;
                 }
             }
         }
         if kind == TyKind::Tuple || kind == TyKind::Fn || kind == TyKind::Distinct {
             for i in 0..TYPES[t].count {
-                if has_error_type(type_elem(t, i)) {
+                if has_error_type(type_elem(t, i), pcx) {
                     return true;
                 }
             }
@@ -1035,59 +1012,59 @@ pub fn has_error_type(t: i64) -> bool {
 
 // After an error in statement `stmt`: the names its `let` binds stand for
 // values of the error type, so that their uses report nothing more.
-fn poison_statement(stmt: i64) {
-    if NODES[stmt].kind == Let {
-        poison_pattern(NODES[stmt].a);
+fn poison_statement(stmt: i64, pcx: inout Ctx<Comp>) {
+    if pcx.nodes[stmt].kind == Let {
+        poison_pattern(pcx.nodes[stmt].a, &pcx);
     }
 }
 
-pub fn poison_pattern(p: i64) {
+pub fn poison_pattern(p: i64, pcx: inout Ctx<Comp>) {
     if p == 0 {
         return;
     }
-    if NODES[p].kind == PatBind {
-        NODES[p].x = define_local(NODES[p].a, TY_ERROR, true, false);
+    if pcx.nodes[p].kind == PatBind {
+        pcx.nodes[p].x = define_local(pcx.nodes[p].a, pcx.ty_error, true, false, &pcx);
         return;
     }
-    if NODES[p].kind == NodeKind::FieldInit {
+    if pcx.nodes[p].kind == NodeKind::FieldInit {
         // (0.17) a field of `E::V { a, b: q }`: its pattern
-        poison_pattern(NODES[p].b);
+        poison_pattern(pcx.nodes[p].b, &pcx);
         return;
     }
-    for i in 0..NODES[p].count {
-        poison_pattern(child(p, i));
+    for i in 0..pcx.nodes[p].count {
+        poison_pattern(child(p, i, pcx), &pcx);
     }
 }
 
 // The program's list, for the code generators: its items without the
 // generic templates (0.14: and the lazy defaults never used), then the
 // instances of generic functions, then the closures' functions.
-fn finish_program(program: i64) {
+fn finish_program(program: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let mark = list_begin();
-        for i in 0..NODES[program].count {
-            let item = child(program, i);
-            let kind = NODES[item].kind;
-            if (kind == Fn || kind == Struct || kind == Enum) && NODES[item].g != 0 {
+        let mark = list_begin(pcx);
+        for i in 0..pcx.nodes[program].count {
+            let item = child(program, i, pcx);
+            let kind = pcx.nodes[item].kind;
+            if (kind == Fn || kind == Struct || kind == Enum) && pcx.nodes[item].g != 0 {
                 continue;
             }
             // (0.14: a lazy default never used)
-            if kind == Fn && (NODES[item].p & FN_LAZY) != 0 {
+            if kind == Fn && (pcx.nodes[item].p & FN_LAZY) != 0 {
                 continue;
             }
             // (0.19: std::arch's declarations without a body)
-            if kind == Fn && (NODES[item].p & FN_INTRINSIC) != 0 && NODES[item].c == 0 {
+            if kind == Fn && (pcx.nodes[item].p & FN_INTRINSIC) != 0 && pcx.nodes[item].c == 0 {
                 continue;
             }
-            list_push(item);
+            list_push(item, &pcx);
         }
-        for q in 0..INST_QUEUE.count {
-            list_push(FNS[INST_QUEUE.data[q]].node);
+        for q in 0..pcx.inst_queue.count {
+            list_push(pcx.fns[pcx.inst_queue.data[q]].node, &pcx);
         }
         // (0.14: then the closures' functions)
-        for i in 0..CLOSURE_FNS.count {
-            list_push(CLOSURE_FNS.data[i]);
+        for i in 0..pcx.closure_fns.count {
+            list_push(pcx.closure_fns.data[i], &pcx);
         }
-        list_end(program, mark);
+        list_end(program, mark, &pcx);
     }
 }

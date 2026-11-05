@@ -22,6 +22,8 @@
 // instructions that go outnumber the vector ones it costs.
 
 use crate::base::{IntVec, alloc_array, free, memcpy};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::X86;
 use crate::front::types::{
     TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, is_float,
@@ -36,9 +38,6 @@ use crate::middle::ir::{
 use crate::middle::ir::Op::{
     Add, And, Div, Load, Mul, Neg, Or, Store, Sub, VBin, VIns, VNeg, VSplat, Xor,
 };
-
-// --no-slp turns it off (to compare).
-pub static var SLP: bool = true;
 
 const SLP_MAX_STORES: i64 = 64;
 const SLP_MAX_DEPTH: i64 = 8;
@@ -65,7 +64,7 @@ fn some_lane_goes(cx: inout FnCtx, n: i64) -> bool {
 // The vector instructions the tree from node n costs; a load or an
 // operation whose scalars all stay (used elsewhere) becomes a gather of
 // them when that is cheaper.
-fn tree_cost(cx: inout FnCtx, n: i64) -> i64 {
+fn tree_cost(cx: inout FnCtx, n: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.n_seen.data[n] != 0 {
             return 0;
@@ -73,13 +72,13 @@ fn tree_cost(cx: inout FnCtx, n: i64) -> i64 {
         cx.n_seen.data[n] = 1;
         let kind = cx.n_kind.data[n];
         if kind != K_OP && kind != K_LOAD {
-            return node_cost(&cx, n);
+            return node_cost(&cx, n, pcx);
         }
-        var cost = node_cost(&cx, n);
+        var cost = node_cost(&cx, n, pcx);
         if kind == K_OP {
-            cost += tree_cost(&cx, cx.n_a.data[n]);
+            cost += tree_cost(&cx, cx.n_a.data[n], pcx);
             if cx.n_b.data[n] >= 0 {
-                cost += tree_cost(&cx, cx.n_b.data[n]);
+                cost += tree_cost(&cx, cx.n_b.data[n], pcx);
             }
         }
         if cost > cx.g_vf && !some_lane_goes(&cx, n) {
@@ -138,7 +137,7 @@ fn in_block(cx: inout FnCtx, v: i64) -> bool {
 }
 
 // The node for lanes `lanes` (VF values); -1 when the tree grows too big.
-fn build(cx: inout FnCtx, lanes: *i64, depth: i64) -> i64 {
+fn build(cx: inout FnCtx, lanes: *i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let vf = cx.g_vf;
         // (The same lanes again: the same node.)
@@ -196,7 +195,7 @@ fn build(cx: inout FnCtx, lanes: *i64, depth: i64) -> i64 {
             return n;
         }
         if op == Load {
-            let size = type_size(cx.g_elem);
+            let size = type_size(cx.g_elem, pcx);
             var off0 = cx.insts[x].imm;
             let base = ir_val(&cx, address_base(&cx, ir_val(&cx, cx.insts[x].a), &off0));
             for k in 1..vf {
@@ -219,7 +218,7 @@ fn build(cx: inout FnCtx, lanes: *i64, depth: i64) -> i64 {
         for k in 0..vf {
             sub[k] = ir_val(&cx, cx.insts[lanes[k]].a);
         }
-        let a = build(&cx, &sub as *i64, depth + 1);
+        let a = build(&cx, &sub as *i64, depth + 1, pcx);
         if a < 0 {
             return -1;
         }
@@ -228,7 +227,7 @@ fn build(cx: inout FnCtx, lanes: *i64, depth: i64) -> i64 {
             for k in 0..vf {
                 sub[k] = ir_val(&cx, cx.insts[lanes[k]].b);
             }
-            b = build(&cx, &sub as *i64, depth + 1);
+            b = build(&cx, &sub as *i64, depth + 1, pcx);
             if b < 0 {
                 return -1;
             }
@@ -242,14 +241,14 @@ fn build(cx: inout FnCtx, lanes: *i64, depth: i64) -> i64 {
 
 // The vector instructions node n costs (an integer multiplication done
 // lane by lane: SSE2 has 16-bit lanes only, NEON no 64-bit ones).
-fn node_cost(cx: inout FnCtx, n: i64) -> i64 {
+fn node_cost(cx: inout FnCtx, n: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let kind = cx.n_kind.data[n];
         if kind == K_GATHER {
             return cx.g_vf;
         }
         if kind == K_OP && cx.insts[lane(&cx, n, 0)].op == Mul && !is_float(cx.g_elem) {
-            let size = type_size(cx.g_elem);
+            let size = type_size(cx.g_elem, pcx);
             let lanewise = if X86 { size != 2 } else { size == 8 };
             if lanewise {
                 return 3 * cx.g_vf;
@@ -332,7 +331,7 @@ fn scalars_removed(cx: inout FnCtx) -> i64 {
 
 // The memory an instruction accesses: base, offset, size (for a load or a
 // store); false for other instructions.
-fn access(cx: inout FnCtx, v: i64, base: inout i64, off: inout i64, size: inout i64) -> bool {
+fn access(cx: inout FnCtx, v: i64, base: inout i64, off: inout i64, size: inout i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let op = cx.insts[v].op;
         if op != Load && op != Store {
@@ -341,21 +340,21 @@ fn access(cx: inout FnCtx, v: i64, base: inout i64, off: inout i64, size: inout 
         var o = cx.insts[v].imm;
         base = ir_val(&cx, address_base(&cx, ir_val(&cx, cx.insts[v].a), &o));
         off = o;
-        size = type_size(if op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 });
+        size = type_size(if op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 }, pcx);
         true
     }
 }
 
-fn overlap(cx: inout FnCtx, v: i64, w: i64) -> bool {
+fn overlap(cx: inout FnCtx, v: i64, w: i64, pcx: Ctx<Comp>) -> bool {
     var b1 = 0;
     var o1 = 0;
     var s1 = 0;
     var b2 = 0;
     var o2 = 0;
     var s2 = 0;
-    access(&cx, v, &b1, &o1, &s1);
-    access(&cx, w, &b2, &o2, &s2);
-    may_alias(&cx, b1, o1, s1, b2, o2, s2)
+    access(&cx, v, &b1, &o1, &s1, pcx);
+    access(&cx, w, &b2, &o2, &s2, pcx);
+    may_alias(&cx, b1, o1, s1, b2, o2, s2, pcx)
 }
 
 fn in_group(cx: inout FnCtx, v: i64) -> bool {
@@ -382,7 +381,7 @@ fn in_tree_load(cx: inout FnCtx, v: i64) -> bool {
 
 // Whether moving the tree's loads and the group's stores down to the last
 // store `last` keeps every access's value (see the top).
-fn memory_allows(cx: inout FnCtx, last: i64) -> bool {
+fn memory_allows(cx: inout FnCtx, last: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let p = pos_of(&cx, last);
         // (From the first access moved.)
@@ -416,7 +415,7 @@ fn memory_allows(cx: inout FnCtx, last: i64) -> bool {
                     // A moved store against an access after it (the tree's
                     // loads: below).
                     let s = cx.g_stores[k];
-                    if pos_of(&cx, s) < q && !group && !tree && overlap(&cx, s, x) {
+                    if pos_of(&cx, s) < q && !group && !tree && overlap(&cx, s, x, pcx) {
                         return false;
                     }
                 }
@@ -428,10 +427,10 @@ fn memory_allows(cx: inout FnCtx, last: i64) -> bool {
                         let l = lane(&cx, n, k);
                         // A moved load against a store after it, and against a
                         // store of the group before it (whose value it read).
-                        if op == Store && !group && pos_of(&cx, l) < q && overlap(&cx, x, l) {
+                        if op == Store && !group && pos_of(&cx, l) < q && overlap(&cx, x, l, pcx) {
                             return false;
                         }
-                        if group && q < pos_of(&cx, l) && overlap(&cx, x, l) {
+                        if group && q < pos_of(&cx, l) && overlap(&cx, x, l, pcx) {
                             return false;
                         }
                     }
@@ -446,7 +445,7 @@ fn memory_allows(cx: inout FnCtx, last: i64) -> bool {
 }
 
 // The vector of node n, made before instruction `at`.
-fn emit_node(cx: inout FnCtx, n: i64, at: i64) -> i64 {
+fn emit_node(cx: inout FnCtx, n: i64, at: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         if cx.n_value.data[n] != 0 {
             return cx.n_value.data[n];
@@ -456,26 +455,26 @@ fn emit_node(cx: inout FnCtx, n: i64, at: i64) -> i64 {
         let x = lane(&cx, n, 0);
         var v = 0;
         if kind == K_SPLAT {
-            v = ir_make(&cx, VSplat, vt, x, 0, 0);
+            v = ir_make(&cx, VSplat, vt, x, 0, 0, pcx);
             ir_insert_before(&cx, at, v);
         } else if kind == K_LOAD {
-            v = ir_make(&cx, Load, vt, ir_val(&cx, cx.insts[x].a), 0, cx.insts[x].imm);
+            v = ir_make(&cx, Load, vt, ir_val(&cx, cx.insts[x].a), 0, cx.insts[x].imm, pcx);
             ir_insert_before(&cx, at, v);
         } else if kind == K_OP {
-            let a = emit_node(&cx, cx.n_a.data[n], at);
+            let a = emit_node(&cx, cx.n_a.data[n], at, pcx);
             let op = cx.insts[x].op;
             if op == Neg {
-                v = ir_make(&cx, VNeg, vt, a, 0, 0);
+                v = ir_make(&cx, VNeg, vt, a, 0, 0, pcx);
             } else {
-                let b = emit_node(&cx, cx.n_b.data[n], at);
-                v = ir_make(&cx, VBin, vt, a, b, op as i64);
+                let b = emit_node(&cx, cx.n_b.data[n], at, pcx);
+                v = ir_make(&cx, VBin, vt, a, b, op as i64, pcx);
             }
             ir_insert_before(&cx, at, v);
         } else {
-            v = ir_make(&cx, VSplat, vt, x, 0, 0);
+            v = ir_make(&cx, VSplat, vt, x, 0, 0, pcx);
             ir_insert_before(&cx, at, v);
             for k in 1..cx.g_vf {
-                let w = ir_make(&cx, VIns, vt, v, lane(&cx, n, k), k);
+                let w = ir_make(&cx, VIns, vt, v, lane(&cx, n, k), k, pcx);
                 ir_insert_before(&cx, at, w);
                 v = w;
             }
@@ -487,7 +486,7 @@ fn emit_node(cx: inout FnCtx, n: i64, at: i64) -> i64 {
 
 // Tries the group G_STORES (lanes in order of offset); whether it was
 // vectorized.
-fn try_group(cx: inout FnCtx) -> bool {
+fn try_group(cx: inout FnCtx, pcx: Ctx<Comp>) -> bool {
     unsafe {
         cx.n_lanes.count = 0;
         cx.n_kind.count = 0;
@@ -502,7 +501,7 @@ fn try_group(cx: inout FnCtx) -> bool {
                 last = cx.g_stores[k];
             }
         }
-        let root = build(&cx, &values as *i64, 0);
+        let root = build(&cx, &values as *i64, 0, pcx);
         if root < 0 || cx.n_kind.data[root] == K_GATHER {
             return false;
         }
@@ -511,15 +510,15 @@ fn try_group(cx: inout FnCtx) -> bool {
         for _ in 0..cx.n_kind.count {
             cx.n_seen.push(0);
         }
-        let cost = 1 + tree_cost(&cx, root);
+        let cost = 1 + tree_cost(&cx, root, pcx);
         // (The loads that stay in the tree: N_SEEN 2.)
         reach(&cx, root);
-        if removed <= cost || !memory_allows(&cx, last) {
+        if removed <= cost || !memory_allows(&cx, last, pcx) {
             return false;
         }
-        let v = emit_node(&cx, root, last);
+        let v = emit_node(&cx, root, last, pcx);
         let s = ir_make(&cx, Store, 0, ir_val(&cx, cx.insts[cx.g_stores[0]].a), v,
-            cx.insts[cx.g_stores[0]].imm);
+            cx.insts[cx.g_stores[0]].imm, pcx);
         cx.insts[s].imm2 = cx.g_vt;
         ir_insert_before(&cx, last, s);
         for k in 0..cx.g_vf {
@@ -530,7 +529,7 @@ fn try_group(cx: inout FnCtx) -> bool {
 }
 
 // Looks for groups in block b; whether any was vectorized.
-fn slp_block(cx: inout FnCtx, b: i64) -> bool {
+fn slp_block(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         grow_tables(&cx);
         cx.slp_stamp += 1;
@@ -561,12 +560,12 @@ fn slp_block(cx: inout FnCtx, b: i64) -> bool {
                 continue;
             }
             let ty = cx.insts[st].imm2;
-            let size = type_size(ty);
+            let size = type_size(ty, pcx);
             let vf = 16 / size;
             var off0 = 0;
             var b0 = 0;
             var s0 = 0;
-            access(&cx, st, &b0, &off0, &s0);
+            access(&cx, st, &b0, &off0, &s0, pcx);
             // The other lanes, at off0 + k * size.
             var found = 1;
             cx.g_stores[0] = st;
@@ -580,7 +579,7 @@ fn slp_block(cx: inout FnCtx, b: i64) -> bool {
                     var bw = 0;
                     var ow = 0;
                     var sw = 0;
-                    access(&cx, w, &bw, &ow, &sw);
+                    access(&cx, w, &bw, &ow, &sw, pcx);
                     if bw == b0 && ow == off0 + k * size {
                         lane_store = w;
                     }
@@ -596,11 +595,11 @@ fn slp_block(cx: inout FnCtx, b: i64) -> bool {
             }
             cx.g_vf = vf;
             cx.g_elem = ty;
-            cx.g_vt = vector_type(lane_type(ty), vf);
+            cx.g_vt = vector_type(lane_type(ty), vf, pcx);
             if cx.g_vt == 0 {
                 continue;
             }
-            if try_group(&cx) {
+            if try_group(&cx, pcx) {
                 changed = true;
                 // (Positions: the new instructions have none, which the
                 // later groups' checks treat as outside; renumber.)
@@ -686,7 +685,7 @@ fn count_uses(cx: inout FnCtx, fi: i64) {
 
 // Whether block b has two stores of one lane type, one base and adjacent
 // offsets (a cheap first look).
-fn has_candidates(cx: inout FnCtx, b: i64) -> bool {
+fn has_candidates(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var seen: [i64; 48] = [0; 48];
         var n = 0;
@@ -696,7 +695,7 @@ fn has_candidates(cx: inout FnCtx, b: i64) -> bool {
                 let ty = cx.insts[v].imm2;
                 var off = cx.insts[v].imm;
                 let base = ir_val(&cx, address_base(&cx, ir_val(&cx, cx.insts[v].a), &off));
-                let size = type_size(ty);
+                let size = type_size(ty, pcx);
                 for k in 0..n {
                     if seen[3 * k] == base && seen[3 * k + 2] == ty
                         && (seen[3 * k + 1] == off + size || seen[3 * k + 1] + size == off) {
@@ -715,16 +714,16 @@ fn has_candidates(cx: inout FnCtx, b: i64) -> bool {
 }
 
 // Vectorizes the store groups of fi; returns whether any was.
-pub fn slp_vectorize(cx: inout FnCtx, fi: i64) -> bool {
+pub fn slp_vectorize(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        if !SLP {
+        if !pcx.slp {
             return false;
         }
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         var any = false;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed == 0 && has_candidates(&cx, b) {
+            if cx.blocks[b].removed == 0 && has_candidates(&cx, b, pcx) {
                 any = true;
             }
         }
@@ -736,7 +735,7 @@ pub fn slp_vectorize(cx: inout FnCtx, fi: i64) -> bool {
         var changed = false;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
-            if cx.blocks[b].removed == 0 && has_candidates(&cx, b) && slp_block(&cx, b) {
+            if cx.blocks[b].removed == 0 && has_candidates(&cx, b, pcx) && slp_block(&cx, b, pcx) {
                 changed = true;
                 count_uses(&cx, fi);
             }

@@ -14,37 +14,25 @@
 // block's module, its parts depth-first, each once, then itself.
 
 use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, intern_c, sym_text};
-use crate::base::diag::{ERR_KIND, buf_file_line, err_begin, err_end_soft, err_fmt, err_help};
-use crate::front::ast::{NODES, NodeKind, REPR_WGSL, child};
-use crate::front::check::PROGRAM;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{buf_file_line, err_begin, err_end_soft, err_fmt, err_help};
+use crate::front::ast::{NodeKind, REPR_WGSL, child};
 use crate::front::embed::ctx::EmbedCx;
 use crate::front::embed::made::{add_made, check_repr_structs, const_ok, is_bad_struct};
-use crate::front::modules::{MODULES, child_module, is_within, module_of};
+use crate::front::modules::{child_module, is_within, module_of};
 use crate::front::parser::items::ITEM_PUBLIC;
-
-// The program's `embed wgsl` blocks (their Embed nodes), in order.
-pub static var BLOCKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// For each block: the first of its `with` entries (WITH_), their count,
-// and whether it is a part (1).
-static var WITH_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var WITH_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var IS_PART: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// The `with` entries: the block named (its index in BLOCKS, or -1: none,
-// or after an error), the const or `#[repr(wgsl)]` struct named (its node;
-// 0: none) and the path's node.
-static var WITH_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var WITH_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The program's blocks into BLOCKS, their `with` lists resolved, the parts
 // marked, a cycle broken (embed.cycle).
-pub fn resolve_parts(wcx: inout EmbedCx) {
-    BLOCKS.count = 0;
-    WITH_FIRST.count = 0;
-    WITH_COUNT.count = 0;
-    IS_PART.count = 0;
-    WITH_BLOCK.count = 0;
+pub fn resolve_parts(wcx: inout EmbedCx, pcx: inout Ctx<Comp>) {
+    pcx.blocks.count = 0;
+    pcx.with_first.count = 0;
+    pcx.with_count.count = 0;
+    pcx.is_part.count = 0;
+    pcx.with_block.count = 0;
     wcx.with_item.count = 0;
-    WITH_PATH.count = 0;
+    pcx.with_path.count = 0;
     if wcx.sym_wgsl == 0 {
         wcx.sym_wgsl = intern_c(c"wgsl");
         wcx.sym_crate = intern_c(c"crate");
@@ -53,72 +41,73 @@ pub fn resolve_parts(wcx: inout EmbedCx) {
     }
     var any_with = false;
     var any_repr = false;
-    for i in 0..NODES[PROGRAM].count {
-        let item = child(PROGRAM, i);
-        if NODES[item].kind == NodeKind::Embed && NODES[item].b == wcx.sym_wgsl {
-            BLOCKS.push(item);
-            IS_PART.push(0);
-            any_with = any_with || NODES[item].count > 0;
-        } else if NODES[item].kind == NodeKind::Struct && (NODES[item].c & REPR_WGSL) != 0 {
+    for i in 0..pcx.nodes[pcx.program].count {
+        let item = child(pcx.program, i, pcx);
+        if pcx.nodes[item].kind == NodeKind::Embed && pcx.nodes[item].b == wcx.sym_wgsl {
+            pcx.blocks.push(item);
+            pcx.is_part.push(0);
+            any_with = any_with || pcx.nodes[item].count > 0;
+        } else if pcx.nodes[item].kind == NodeKind::Struct && (pcx.nodes[item].c & REPR_WGSL) != 0 {
             any_repr = true;
         }
     }
     if any_repr {
-        check_repr_structs(&wcx);
+        check_repr_structs(&wcx, &pcx);
     }
     if !any_with {
-        for b in 0..BLOCKS.count {
-            WITH_FIRST.push(0);
-            WITH_COUNT.push(0);
+        for b in 0..pcx.blocks.count {
+            pcx.with_first.push(0);
+            pcx.with_count.push(0);
         }
         return;
     }
-    for b in 0..BLOCKS.count {
-        let e = BLOCKS.get(b);
-        WITH_FIRST.push(WITH_BLOCK.count);
-        WITH_COUNT.push(NODES[e].count);
-        for k in 0..NODES[e].count {
-            let path = child(e, k);
-            let item = resolve_with(e, path, wcx);
-            let named = if item >= 0 && NODES[item].kind == NodeKind::Embed { block_of(item) }
+    for b in 0..pcx.blocks.count {
+        let e = pcx.blocks.get(b);
+        pcx.with_first.push(pcx.with_block.count);
+        pcx.with_count.push(pcx.nodes[e].count);
+        for k in 0..pcx.nodes[e].count {
+            let path = child(e, k, pcx);
+            let item = resolve_with(e, path, wcx, &pcx);
+            let named = if item >= 0
+                && pcx.nodes[item].kind == NodeKind::Embed { block_of(item, pcx) }
                 else { -1 };
-            WITH_BLOCK.push(named);
+            pcx.with_block.push(named);
             wcx.with_item.push(if named < 0 && item >= 0 { item } else { 0 });
-            WITH_PATH.push(path);
+            pcx.with_path.push(path);
             if named >= 0 {
-                IS_PART.set(named, 1);
+                pcx.is_part.set(named, 1);
             }
         }
     }
     // the cycles, each reported once and broken where it closes
     var state = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for b in 0..BLOCKS.count {
+    for b in 0..pcx.blocks.count {
         state.push(0);
     }
     var stack = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for b in 0..BLOCKS.count {
+    for b in 0..pcx.blocks.count {
         if state.get(b) == 0 {
-            find_cycles(b, &state, &stack);
+            find_cycles(b, &state, &stack, &pcx);
         }
     }
 }
 
 // The depth-first walk from block b: state 1 while its parts are walked,
 // 2 after; a `with` entry that reaches a block in state 1 closes a cycle.
-fn find_cycles(b: i64, state: inout IntVec, stack: inout IntVec) {
+fn find_cycles(b: i64, state: inout IntVec, stack: inout IntVec, pcx: inout Ctx<Comp>) {
     state.set(b, 1);
     stack.push(b);
-    let first = WITH_FIRST.get(b);
-    for k in first..first + WITH_COUNT.get(b) {
-        let p = WITH_BLOCK.get(k);
+    let first = pcx.with_first.get(b);
+    for k in first..first + pcx.with_count.get(b) {
+        let p = pcx.with_block.get(k);
         if p < 0 {
             continue;
         }
         if state.get(p) == 1 {
-            cycle_error(k, p, stack);
-            WITH_BLOCK.set(k, -1);
+            cycle_error(k, p, stack, &pcx);
+            pcx.with_block.set(k, -1);
         } else if state.get(p) == 0 {
-            find_cycles(p, &state, &stack);
+            find_cycles(p, &state, &stack, &pcx);
         }
     }
     stack.count -= 1;
@@ -127,10 +116,10 @@ fn find_cycles(b: i64, state: inout IntVec, stack: inout IntVec) {
 
 // embed.cycle at `with` entry k, which names block p, a block of the walk
 // (stack) that has not come back yet.
-fn cycle_error(k: i64, p: i64, stack: IntVec) {
+fn cycle_error(k: i64, p: i64, stack: IntVec, pcx: inout Ctx<Comp>) {
     let m = buf_new();
     buf_bytes(m, "the parts of '");
-    buf_bytes(m, sym_text(NODES[BLOCKS.get(p)].a));
+    buf_bytes(m, sym_text(pcx.nodes[pcx.blocks.get(p)].a));
     buf_bytes(m, "' include it again: ");
     var from = 0;
     for i in 0..stack.count {
@@ -139,68 +128,68 @@ fn cycle_error(k: i64, p: i64, stack: IntVec) {
         }
     }
     for i in from..stack.count {
-        buf_bytes(m, sym_text(NODES[BLOCKS.get(stack.get(i))].a));
+        buf_bytes(m, sym_text(pcx.nodes[pcx.blocks.get(stack.get(i))].a));
         buf_bytes(m, " with ");
     }
-    buf_bytes(m, sym_text(NODES[BLOCKS.get(p)].a));
-    let saved = ERR_KIND;
-    ERR_KIND = c"embed.cycle";
-    err_begin(NODES[WITH_PATH.get(k)].start);
-    err_fmt(buf_slice(m));
-    err_help(c"a module's text is its parts' texts, then its own: a part cannot include the block that includes it; move what both need into a part of its own");
-    err_end_soft();
-    ERR_KIND = saved;
+    buf_bytes(m, sym_text(pcx.nodes[pcx.blocks.get(p)].a));
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"embed.cycle";
+    err_begin(pcx.nodes[pcx.with_path.get(k)].start, &pcx);
+    err_fmt(buf_slice(m), pcx);
+    err_help(c"a module's text is its parts' texts, then its own: a part cannot include the block that includes it; move what both need into a part of its own", pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // The item `path` (a TyName) names from block e's module: an Embed node,
 // a Const or a `#[repr(wgsl)]` Struct (made.vl writes their WGSL), or -1
 // after embed.with.
-fn resolve_with(e: i64, path: i64, wcx: EmbedCx) -> i64 {
-    let from = module_of(e);
-    let m = path_module(from, path, true, wcx);
+fn resolve_with(e: i64, path: i64, wcx: EmbedCx, pcx: inout Ctx<Comp>) -> i64 {
+    let from = module_of(e, &pcx);
+    let m = path_module(from, path, true, wcx, &pcx);
     if m < 0 {
         return -1;
     }
-    let name = NODES[path].a;
-    let item = item_named(m, name, wcx);
+    let name = pcx.nodes[path].a;
+    let item = item_named(m, name, wcx, &pcx);
     if item < 0 {
-        with_error(path, NODES[path].start, format_args("no `embed wgsl` block, const or #[repr(wgsl)] struct '{}' in this module", sym_text(name)), "`with` names an item by its path from this block's module (`with shaders::COMMON`); a `use` does not bring one in");
+        with_error(path, pcx.nodes[path].start, format_args("no `embed wgsl` block, const or #[repr(wgsl)] struct '{}' in this module", sym_text(name)), "`with` names an item by its path from this block's module (`with shaders::COMMON`); a `use` does not bring one in", &pcx);
         return -1;
     }
-    let k = NODES[item].kind;
+    let k = pcx.nodes[item].kind;
     if k != NodeKind::Embed && k != NodeKind::Const && k != NodeKind::Struct {
-        with_error(path, NODES[path].start,
+        with_error(path, pcx.nodes[path].start,
             format_args("'{}' is {}, not an `embed wgsl` block, a const or a #[repr(wgsl)] struct",
                 sym_text(name), item_kind_text(k)),
-            "`with` names embedded blocks, whose text comes before this block's own, and the consts and #[repr(wgsl)] structs whose WGSL the compiler writes");
+            "`with` names embedded blocks, whose text comes before this block's own, and the consts and #[repr(wgsl)] structs whose WGSL the compiler writes", &pcx);
         return -1;
     }
-    if k == NodeKind::Struct && (NODES[item].c & REPR_WGSL) == 0 {
-        with_error(path, NODES[path].start,
+    if k == NodeKind::Struct && (pcx.nodes[item].c & REPR_WGSL) == 0 {
+        with_error(path, pcx.nodes[path].start,
             format_args("the struct '{}' is no #[repr(wgsl)] struct: its layout is not WGSL's",
                 sym_text(name)),
-            "put #[repr(wgsl)] on it: its fields are then laid out as WGSL's, and the block gets its WGSL `struct`");
+            "put #[repr(wgsl)] on it: its fields are then laid out as WGSL's, and the block gets its WGSL `struct`", &pcx);
         return -1;
     }
-    if (NODES[item].p & ITEM_PUBLIC) == 0 && !is_within(from, m) {
-        with_error(path, NODES[path].start,
+    if (pcx.nodes[item].p & ITEM_PUBLIC) == 0 && !is_within(from, m, pcx) {
+        with_error(path, pcx.nodes[path].start,
             format_args("'{}' is private to its module", sym_text(name)),
-            "an item named from another module is `pub`");
+            "an item named from another module is `pub`", &pcx);
         return -1;
     }
-    if k == NodeKind::Struct && !is_within(from, m) {
-        for i in 0..NODES[item].count {
-            let f = child(item, i);
-            if (NODES[f].p & ITEM_PUBLIC) == 0 {
-                with_error(path, NODES[path].start,
+    if k == NodeKind::Struct && !is_within(from, m, pcx) {
+        for i in 0..pcx.nodes[item].count {
+            let f = child(item, i, pcx);
+            if (pcx.nodes[f].p & ITEM_PUBLIC) == 0 {
+                with_error(path, pcx.nodes[path].start,
                     format_args("the field '{}.{}' is private to its module",
-                        sym_text(NODES[item].a), sym_text(NODES[f].a)),
-                    "the WGSL struct a block is given has every field: a struct named from another module has `pub` fields");
+                        sym_text(pcx.nodes[item].a), sym_text(pcx.nodes[f].a)),
+                    "the WGSL struct a block is given has every field: a struct named from another module has `pub` fields", &pcx);
                 return -1;
             }
         }
     }
-    if k == NodeKind::Const && !const_ok(item, path) {
+    if k == NodeKind::Const && !const_ok(item, path, &pcx) {
         return -1;
     }
     item
@@ -209,22 +198,21 @@ fn resolve_with(e: i64, path: i64, wcx: EmbedCx) -> i64 {
 // The module `path`'s segments before its name lead to from module
 // `from` (`a::b::X`: a::b; `crate::`, `super::`, `self::`), or -1 (after
 // embed.with when `report`).
-pub fn path_module(from: i64, path: i64, report: bool, wcx: EmbedCx) -> i64 {
+pub fn path_module(from: i64, path: i64, report: bool, wcx: EmbedCx, pcx: inout Ctx<Comp>) -> i64 {
     var m = from;
-    for k in 0..NODES[path].count {
-        let seg = child(path, k);
-        let s = NODES[seg].a;
+    for k in 0..pcx.nodes[path].count {
+        let seg = child(path, k, pcx);
+        let s = pcx.nodes[seg].a;
         if s == wcx.sym_crate {
             m = 0;
         } else if s == wcx.sym_super {
-            m = module_parent(m);
+            m = module_parent(m, pcx);
         } else if s != wcx.sym_self {
-            m = child_module(m, s);
+            m = child_module(m, s, pcx);
         }
         if m < 0 {
             if report {
-                with_error(path, NODES[seg].start, format_args("no module '{}' here", sym_text(s)),
-                    "a `with` path starts at the block's module (`shaders::COMMON`), or at `crate::` or `super::`");
+                with_error(path, pcx.nodes[seg].start, format_args("no module '{}' here", sym_text(s)), "a `with` path starts at the block's module (`shaders::COMMON`), or at `crate::` or `super::`", &pcx);
             }
             return -1;
         }
@@ -234,15 +222,16 @@ pub fn path_module(from: i64, path: i64, report: bool, wcx: EmbedCx) -> i64 {
 
 // The item named `name` in module m: the first block, const or struct of
 // that name, else the first other item, else -1.
-pub fn item_named(m: i64, name: i64, wcx: EmbedCx) -> i64 {
+pub fn item_named(m: i64, name: i64, wcx: EmbedCx, pcx: inout Ctx<Comp>) -> i64 {
     var other = -1;
-    for i in 0..NODES[PROGRAM].count {
-        let item = child(PROGRAM, i);
-        if NODES[item].a != name || !is_named_item(NODES[item].kind) || module_of(item) != m {
+    for i in 0..pcx.nodes[pcx.program].count {
+        let item = child(pcx.program, i, pcx);
+        if pcx.nodes[item].a != name || !is_named_item(pcx.nodes[item].kind)
+            || module_of(item, &pcx) != m {
             continue;
         }
-        let k = NODES[item].kind;
-        if (k == NodeKind::Embed && NODES[item].b == wcx.sym_wgsl) || k == NodeKind::Const
+        let k = pcx.nodes[item].kind;
+        if (k == NodeKind::Embed && pcx.nodes[item].b == wcx.sym_wgsl) || k == NodeKind::Const
             || k == NodeKind::Struct {
             return item;
         }
@@ -266,33 +255,34 @@ fn item_kind_text(k: NodeKind) -> [u8] {
 }
 
 // embed.with at pos, of the `with` entry `path`.
-fn with_error<T: std::Display>(path: i64, pos: i64, message: sink T, help: [u8]) {
-    let saved = ERR_KIND;
-    ERR_KIND = c"embed.with";
-    err_begin(if pos >= 0 { pos } else { NODES[path].start });
-    err_fmt(message);
+fn with_error<T: std::Display>(path: i64, pos: i64, message: sink T, help: [u8],
+    pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"embed.with";
+    err_begin(if pos >= 0 { pos } else { pcx.nodes[path].start }, &pcx);
+    err_fmt(message, pcx);
     let h = buf_new();
     buf_bytes(h, help);
     crate::base::buf_byte(h, 0);
-    err_help(buf_slice(h).ptr);
-    err_end_soft();
-    ERR_KIND = saved;
+    err_help(buf_slice(h).ptr, pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 // The parent of module m (-1: the root has none).
-fn module_parent(m: i64) -> i64 {
+fn module_parent(m: i64, pcx: Ctx<Comp>) -> i64 {
     // UNSAFE: MODULES is the module table, a raw pointer the module loader
     // grows (front::modules).
     // SAFETY: m is a module of the program (module_of, child_module or a
     // parent read here gave it, each < MODULE_COUNT), and the table is no
     // longer grown once the modules are loaded, before expand_embeds.
-    unsafe { MODULES[m].parent }
+    unsafe { pcx.modules[m].parent }
 }
 
 // Block b's index in BLOCKS for Embed node e, or -1.
-pub fn block_of(e: i64) -> i64 {
-    for b in 0..BLOCKS.count {
-        if BLOCKS.get(b) == e {
+pub fn block_of(e: i64, pcx: Ctx<Comp>) -> i64 {
+    for b in 0..pcx.blocks.count {
+        if pcx.blocks.get(b) == e {
             return b;
         }
     }
@@ -300,28 +290,28 @@ pub fn block_of(e: i64) -> i64 {
 }
 
 // Whether block b is a part (named in some `with`).
-pub fn is_part(b: i64) -> bool {
-    b >= 0 && b < IS_PART.count && IS_PART.get(b) != 0
+pub fn is_part(b: i64, pcx: Ctx<Comp>) -> bool {
+    b >= 0 && b < pcx.is_part.count && pcx.is_part.get(b) != 0
 }
 
 // Block b's module: its parts depth-first, each once, then b, into out
 // (indexes of BLOCKS).
-pub fn module_order(b: i64, out: inout IntVec) {
+pub fn module_order(b: i64, out: inout IntVec, pcx: Ctx<Comp>) {
     out.count = 0;
-    add_in_order(b, &out);
+    add_in_order(b, &out, pcx);
 }
 
-fn add_in_order(b: i64, out: inout IntVec) {
+fn add_in_order(b: i64, out: inout IntVec, pcx: Ctx<Comp>) {
     for i in 0..out.count {
         if out.get(i) == b {
             return;
         }
     }
-    let first = WITH_FIRST.get(b);
-    for k in first..first + WITH_COUNT.get(b) {
-        let p = WITH_BLOCK.get(k);
+    let first = pcx.with_first.get(b);
+    for k in first..first + pcx.with_count.get(b) {
+        let p = pcx.with_block.get(k);
         if p >= 0 {
-            add_in_order(p, &out);
+            add_in_order(p, &out, pcx);
         }
     }
     out.push(b);
@@ -331,16 +321,16 @@ fn add_in_order(b: i64, out: inout IntVec) {
 // any of its blocks' `with`), the structs' nested structs first, each
 // once, into out; `order` is its module_order. False when one is a
 // struct gpu.repr refused (the module is then not checked).
-pub fn module_items(order: IntVec, out: inout IntVec, wcx: EmbedCx) -> bool {
+pub fn module_items(order: IntVec, out: inout IntVec, wcx: EmbedCx, pcx: inout Ctx<Comp>) -> bool {
     out.count = 0;
     var ok = true;
     for i in 0..order.count {
         let b = order.get(i);
-        let first = WITH_FIRST.get(b);
-        for k in first..first + WITH_COUNT.get(b) {
+        let first = pcx.with_first.get(b);
+        for k in first..first + pcx.with_count.get(b) {
             let item = wcx.with_item.get(k);
             if item > 0 {
-                add_made(item, &out, wcx);
+                add_made(item, &out, wcx, &pcx);
             }
         }
     }
@@ -355,21 +345,21 @@ pub fn module_items(order: IntVec, out: inout IntVec, wcx: EmbedCx) -> bool {
 // (embed.part_use) The blocks that include part b directly or through
 // other parts and are no parts themselves, into out; the position of the
 // first `with` entry that names b.
-pub fn users_of(b: i64, out: inout IntVec) -> i64 {
+pub fn users_of(b: i64, out: inout IntVec, pcx: Ctx<Comp>) -> i64 {
     out.count = 0;
     var at = -1;
     var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-    for u in 0..BLOCKS.count {
-        let first = WITH_FIRST.get(u);
-        for k in first..first + WITH_COUNT.get(u) {
-            if WITH_BLOCK.get(k) == b && at < 0 {
-                at = NODES[WITH_PATH.get(k)].start;
+    for u in 0..pcx.blocks.count {
+        let first = pcx.with_first.get(u);
+        for k in first..first + pcx.with_count.get(u) {
+            if pcx.with_block.get(k) == b && at < 0 {
+                at = pcx.nodes[pcx.with_path.get(k)].start;
             }
         }
-        if is_part(u) || u == b {
+        if is_part(u, pcx) || u == b {
             continue;
         }
-        module_order(u, &order);
+        module_order(u, &order, pcx);
         for i in 0..order.count {
             if order.get(i) == b {
                 out.push(u);
@@ -380,8 +370,8 @@ pub fn users_of(b: i64, out: inout IntVec) -> i64 {
 }
 
 // `FILE:LINE` of pos, a new buffer's text.
-pub fn file_line_text(pos: i64) -> [u8] {
+pub fn file_line_text(pos: i64, pcx: inout Ctx<Comp>) -> [u8] {
     let b = buf_new();
-    buf_file_line(b, pos);
+    buf_file_line(b, pos, &pcx);
     buf_slice(b)
 }

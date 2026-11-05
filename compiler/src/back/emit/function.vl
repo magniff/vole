@@ -15,22 +15,23 @@ use crate::back::emit::machine::{
     spill_offset, t_arg_location, xl_from_c, xl_is_stack, xl_offset,
 };
 use crate::back::emit::operands::{PM_ADDR, PM_LOC, PM_STACK, pm_add, pm_resolve, result_done};
-use crate::back::emit::stats::{STATS, ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
+use crate::back::emit::stats::{ST_FRAME, ST_FRAMES, ST_SAVES, st_function_done};
 use crate::back::isel::select_function;
 use crate::back::layout::layout_emission;
 use crate::back::mc_arm64::{ma_frame_link, ma_frame_unlink};
 use crate::back::mc_arm64::ops::ma_pair;
 use crate::back::mc_x86_64::{mx_frame_link, mx_frame_unlink};
-use crate::back::regalloc::{LOC_NONE, VERIFY_REGALLOC, allocate_registers};
+use crate::back::regalloc::{LOC_NONE, allocate_registers};
 use crate::back::regalloc::check::check_allocation;
 use crate::back::regalloc::locations::{mark_frame_blocks, tloc, vloc};
 use crate::back::regalloc::prepare::{count_uses, is_emitted, tracked};
 use crate::base::{BUFS, IntVec, buf_bytes, buf_clear, buf_slice, die, free, memcmp, strlen};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::X86;
 use crate::base::timer::{T_CODEGEN, T_ISEL, T_SCALAR, timer_add, timer_now};
-use crate::front::ast::NODES;
 use crate::front::types::{
-    FNS, TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
+    TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
     is_vector, is_void, max_i64, scalar_type, type_align, type_size,
 };
 use crate::gen0::arm64::{a64_align_down, a64_epilogue, a64_frame_reserve};
@@ -40,19 +41,18 @@ use crate::gen0::target::{
 };
 use crate::gen0::x86_64::{x64_epilogue, x64_frame_reserve, x64_imm};
 use crate::middle::ctx::FnCtx;
-use crate::middle::inline::{FN_LIVE, leaf_dropped, leaf_kept};
+use crate::middle::inline::{leaf_dropped, leaf_kept};
 use crate::middle::ir::{
-    IRFUNCS, IRFUNC_COUNT, Term, VARIADIC_PIECE, ir_enter, ir_free_func, ir_operand,
-    ir_operand_count,
+    IRFUNCS, Term, VARIADIC_PIECE, ir_enter, ir_free_func, ir_operand, ir_operand_count,
 };
 use crate::middle::ir::Op::{CallC, Param, Phi, Slot};
 use crate::middle::ir::cfg::{succ, succ_count};
-use crate::middle::opt::{OPT_LEVEL, PER_FUNCTION, deferred_loops, optimize_function, slp_function};
+use crate::middle::opt::{deferred_loops, optimize_function, slp_function};
 use crate::middle::parallel::{P_DEFERRED, P_EMIT, P_SLP, emit_functions, parallel_end};
 
 // ---- Functions ----
 
-fn layout_frame(cx: inout FnCtx, fi: i64) {
+fn layout_frame(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
         cx.frame_out = 0;
         cx.frame_align = 16;
@@ -74,14 +74,14 @@ fn layout_frame(cx: inout FnCtx, fi: i64) {
                     cx.uses_slots = true;
                 }
                 if cx.insts[v].op.is_call() {
-                    let size = call_stack_size(&cx, v);
+                    let size = call_stack_size(&cx, v, pcx);
                     if size > cx.frame_out {
                         cx.frame_out = size;
                     }
                     if cx.insts[v].op != CallC {
-                        for k in 0..callee_param_count(&cx, v) {
+                        for k in 0..callee_param_count(&cx, v, pcx) {
                             cx.frame_align = max_i64(cx.frame_align,
-                                type_align(callee_param(&cx, v, k)));
+                                type_align(callee_param(&cx, v, k, pcx), pcx));
                         }
                     }
                     // Aggregates passed to `...` (their first piece carries the
@@ -89,7 +89,7 @@ fn layout_frame(cx: inout FnCtx, fi: i64) {
                     for k in 0..cx.insts[v].nargs {
                         let declared = cx.argty.data[cx.insts[v].args + k];
                         if declared < 0 && declared != VARIADIC_PIECE {
-                            cx.frame_align = max_i64(cx.frame_align, type_align(0 - declared));
+                            cx.frame_align = max_i64(cx.frame_align, type_align(0 - declared, pcx));
                         }
                     }
                 }
@@ -119,7 +119,7 @@ fn layout_frame(cx: inout FnCtx, fi: i64) {
 
 // Saves (or restores) the callee-saved registers used: on AArch64 two at
 // a time (stp, ldp) when they are of one kind.
-fn save_callee_saved(cx: inout FnCtx, restore: bool) {
+fn save_callee_saved(cx: inout FnCtx, restore: bool, pcx: Ctx<Comp>) {
     var offset = cx.save_base;
     var pending = -1;
     for r in 0..64 {
@@ -127,82 +127,82 @@ fn save_callee_saved(cx: inout FnCtx, restore: bool) {
             continue;
         }
         if !X86 && pending >= 0 && (pending >= 32) == (r >= 32) && offset - 8 <= 504 {
-            ma_pair(&cx, restore, pending, r, offset - 8);
+            ma_pair(&cx, restore, pending, r, offset - 8, pcx);
             pending = -1;
         } else {
             if pending >= 0 {
-                save_one(&cx, restore, pending, offset - 8);
+                save_one(&cx, restore, pending, offset - 8, pcx);
             }
             pending = r;
         }
         offset += 8;
     }
     if pending >= 0 {
-        save_one(&cx, restore, pending, offset - 8);
+        save_one(&cx, restore, pending, offset - 8, pcx);
     }
 }
 
-fn save_one(cx: inout FnCtx, restore: bool, r: i64, offset: i64) {
+fn save_one(cx: inout FnCtx, restore: bool, r: i64, offset: i64, pcx: Ctx<Comp>) {
     let ty = if r >= 32 { TY_F64 } else { TY_U64 };
     if restore {
-        m_load(&cx, ty, r, reg_sp(), offset);
+        m_load(&cx, ty, r, reg_sp(), offset, pcx);
     } else {
-        m_store(&cx, ty, r, reg_sp(), offset);
+        m_store(&cx, ty, r, reg_sp(), offset, pcx);
     }
 }
 
 // The location of each parameter of function `f` (by its convention): of
 // parameter i at locations[i], or of its pieces at pieces[4 * i + k] (see
 // abi.vl).
-pub fn param_locations(cx: inout FnCtx, f: i64, locations: *i64, pieces: *i64) {
+pub fn param_locations(cx: inout FnCtx, f: i64, locations: *i64, pieces: *i64, pcx: Ctx<Comp>) {
     unsafe {
-        let c = fn_uses_c(f);
-        let ret = FNS[f].ret;
-        let first = if c { first_int_arg(&cx, ret) }
-            else if conv_returns_through_pointer(&cx, false, ret) { 1 } else { 0 };
+        let c = fn_uses_c(f, pcx);
+        let ret = pcx.fns[f].ret;
+        let first = if c { first_int_arg(&cx, ret, pcx) }
+            else if conv_returns_through_pointer(&cx, false, ret, pcx) { 1 } else { 0 };
         var state: [i64; 3] = [first, 0, 0];
-        for i in 0..FNS[f].param_count {
-            let ty = fn_param(f, i);
+        for i in 0..pcx.fns[f].param_count {
+            let ty = fn_param(f, i, pcx);
             if is_void(ty) {
                 continue;
             }
-            let kind = conv_classify(&cx, c, ty);
+            let kind = conv_classify(&cx, c, ty, pcx);
             if !c {
                 if kind == AbiClass::Pieces {
                     for k in 0..cx.abi_piece_count {
-                        pieces[4 * i + k] = t_arg_location(cx.abi_piece_ty[k], &state as *i64);
+                        pieces[4 * i + k] = t_arg_location(cx.abi_piece_ty[k], &state as *i64, pcx);
                     }
                 } else {
                     locations[i] = t_arg_location(if kind == AbiClass::Ref { TY_U64 }
-                        else { scalar_type(ty) }, &state as *i64);
+                        else { scalar_type(ty) }, &state as *i64, pcx);
                 }
                 continue;
             }
             if kind == AbiClass::Pieces {
-                abi_piece_locations(&cx, ty, &state as *i64, &pieces[4 * i]);
+                abi_piece_locations(&cx, ty, &state as *i64, &pieces[4 * i], pcx);
                 for k in 0..cx.abi_piece_count {
                     pieces[4 * i + k] = xl_from_c(pieces[4 * i + k]);
                 }
             } else if kind == AbiClass::Stack {
-                locations[i] = xl_from_c(abi_stack_location(ty, &state as *i64));
+                locations[i] = xl_from_c(abi_stack_location(ty, &state as *i64, pcx));
             } else {
                 locations[i] = xl_from_c(arg_location(if kind == AbiClass::Ref { TY_U64 }
-                    else { scalar_type(ty) }, &state as *i64));
+                    else { scalar_type(ty) }, &state as *i64, pcx));
             }
         }
     }
 }
 
 // Moves the parameters from where the caller put them to their locations.
-fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
+fn emit_entry_moves(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
         let f = IRFUNCS[fi].f;
         var locations: [i64; 64] = [0; 64];
         var pieces: [i64; 256] = [0; 256];
-        if FNS[f].param_count > 64 {
+        if pcx.fns[f].param_count > 64 {
             die(c"too many parameters (at most 64 are supported)");
         }
-        param_locations(&cx, f, &locations as *i64, &pieces as *i64);
+        param_locations(&cx, f, &locations as *i64, &pieces as *i64, pcx);
         let entry = IRFUNCS[fi].entry;
         var v = cx.blocks[entry].first;
         while v != 0 {
@@ -212,7 +212,7 @@ fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
                 let index = cx.insts[v].imm;
                 let piece = cx.insts[v].imm2;
                 if index < 0 {
-                    pm_add(&cx, loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f)), TY_U64, 0, v);
+                    pm_add(&cx, loc, PM_LOC, conv_result_ptr_reg(fn_uses_c(f, pcx)), TY_U64, 0, v);
                 } else {
                     let location = if piece > 0 { pieces[4 * index + piece - 1] }
                         else { locations[index] };
@@ -220,7 +220,7 @@ fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
                     if piece < 0 {
                         pm_add(&cx, loc, PM_ADDR, 16 + xl_offset(location), TY_U64, 0, v);
                     } else if xl_is_stack(location) {
-                        let param_ty = fn_param(f, index);
+                        let param_ty = fn_param(f, index, pcx);
                         let load_ty = if is_compound(param_ty) && piece == 0 { TY_U64 } else { ty };
                         pm_add(&cx, loc, PM_STACK, 16 + xl_offset(location), load_ty, 0, v);
                     } else {
@@ -230,7 +230,7 @@ fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
             }
             v = cx.insts[v].next;
         }
-        pm_resolve(&cx);
+        pm_resolve(&cx, pcx);
         // Narrow integers from C callers may carry garbage above their width;
         // parameters that go to the stack are stored there.
         v = cx.blocks[entry].first;
@@ -245,12 +245,12 @@ fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
                     if narrow {
                         m_normalize(&cx, loc, if ty == TY_BOOL { TY_U8 } else { ty });
                     }
-                    result_done(&cx, v, loc);
+                    result_done(&cx, v, loc, pcx);
                 } else if narrow {
                     let r = reg_move_temp(float: false);
-                    m_load(&cx, TY_U64, r, reg_sp(), spill_offset(&cx, loc));
+                    m_load(&cx, TY_U64, r, reg_sp(), spill_offset(&cx, loc), pcx);
                     m_normalize(&cx, r, if ty == TY_BOOL { TY_U8 } else { ty });
-                    m_store(&cx, TY_U64, r, reg_sp(), spill_offset(&cx, loc));
+                    m_store(&cx, TY_U64, r, reg_sp(), spill_offset(&cx, loc), pcx);
                 }
             }
             v = cx.insts[v].next;
@@ -258,20 +258,20 @@ fn emit_entry_moves(cx: inout FnCtx, fi: i64) {
     }
 }
 
-pub fn gen_ir_function(cx: inout FnCtx, fi: i64) {
+pub fn gen_ir_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         let f = IRFUNCS[fi].f;
-        allocate_registers(&cx, fi);
-        if VERIFY_REGALLOC {
-            check_allocation(&cx, fi);
+        allocate_registers(&cx, fi, pcx);
+        if pcx.verify_regalloc {
+            check_allocation(&cx, fi, pcx);
         }
-        layout_frame(&cx, fi);
-        cx.ymm_used = X86 && holds_ymm(&cx, fi);
-        shrink_wrap(&cx, fi);
+        layout_frame(&cx, fi, pcx);
+        cx.ymm_used = X86 && holds_ymm(&cx, fi, pcx);
+        shrink_wrap(&cx, fi, pcx);
         cx.short_branches = function_size(&cx, fi) <= 800;
         find_trivial_jumps(&cx);
-        layout_emission(&cx);
+        layout_emission(&cx, pcx);
         buf_clear(cx.code);
         // The peepholes' memory of what was just emitted belongs to the code of
         // the function before (whose length the new one's may match).
@@ -288,34 +288,35 @@ pub fn gen_ir_function(cx: inout FnCtx, fi: i64) {
         cx.has_frame = cx.save >= 0;
         cx.last_loc = 0;
         let item = IRFUNCS[fi].item;
-        dbg_function_begin(&cx, f, fn_symbol_prefix(f),
-            if item > 0 { NODES[item].start } else { -1 });
-        ir_function_start(&cx, fn_symbol_prefix(f), FNS[f].name, fn_is_global(f), cx.save == 0);
+        dbg_function_begin(&cx, f, fn_symbol_prefix(f, pcx),
+            if item > 0 { pcx.nodes[item].start } else { -1 }, pcx);
+        ir_function_start(&cx, fn_symbol_prefix(f, pcx), pcx.fns[f].name, fn_is_global(f, pcx),
+            cx.save == 0);
         cx.cur_in_frame = cx.save == 0;
         if cx.save == 0 {
-            emit_frame_setup(&cx);
+            emit_frame_setup(&cx, pcx);
         }
-        emit_entry_moves(&cx, fi);
+        emit_entry_moves(&cx, fi, pcx);
         for j in 0..cx.emit.count {
-            emit_ir_block(&cx, cx.emit.data[j], j);
+            emit_ir_block(&cx, cx.emit.data[j], j, pcx);
         }
         // The epilogue, when a block jumps to it or the last one falls into it
         // (blocks in the frame's region only).
         if cx.epilogue_used || cx.fell_into_epilogue {
             cx.cur_in_frame = true;
             emit_label(&cx, cx.epilogue_label);
-            emit_ir_epilogue(&cx);
+            emit_ir_epilogue(&cx, pcx);
         }
-        if STATS > 0 {
+        if pcx.stats > 0 {
             if cx.has_frame {
                 cx.st_fn[ST_FRAMES] = 1;
                 cx.st_fn[ST_FRAME] = cx.frame_total + 16;
             }
             cx.st_fn[ST_SAVES] += cx.callee_used[0..64].iter().filter(|u| u != 0).count() as i64;
-            st_function_done(&cx, fi);
+            st_function_done(&cx, fi, pcx);
         }
         buf_bytes(cx.asm, buf_slice(cx.code));
-        dbg_function_end(&cx);
+        dbg_function_end(&cx, pcx);
     }
 }
 
@@ -325,13 +326,13 @@ pub fn gen_ir_function(cx: inout FnCtx, fi: i64) {
 // only where every path ran one that wrote a ymm register (a must
 // analysis over the blocks); elsewhere the upper halves stay as they are,
 // which costs a transition at worst, never an instruction the CPU lacks.
-fn holds_ymm(cx: inout FnCtx, fi: i64) -> bool {
+fn holds_ymm(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let n = cx.order.count;
         var defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var any = false;
         for k in 0..n {
-            let d = if block_writes_ymm(&cx, cx.order.data[k], 0) { 1 } else { 0 };
+            let d = if block_writes_ymm(&cx, cx.order.data[k], 0, pcx) { 1 } else { 0 };
             defs.push(d);
             any = any || d != 0;
         }
@@ -375,12 +376,12 @@ fn holds_ymm(cx: inout FnCtx, fi: i64) -> bool {
 
 // Whether block b writes a ymm register before instruction `before` (0:
 // anywhere in it).
-fn block_writes_ymm(cx: inout FnCtx, b: i64, before: i64) -> bool {
+fn block_writes_ymm(cx: inout FnCtx, b: i64, before: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var v = cx.blocks[b].first;
         while v != 0 && v != before {
             let ty = cx.insts[v].ty;
-            if ty != 0 && is_vector(ty) && type_size(ty) == 32 {
+            if ty != 0 && is_vector(ty) && type_size(ty, pcx) == 32 {
                 return true;
             }
             v = cx.insts[v].next;
@@ -391,14 +392,15 @@ fn block_writes_ymm(cx: inout FnCtx, b: i64, before: i64) -> bool {
 
 // (0.19) Whether AVX is proven at instruction v (holds_ymm): a vzeroupper
 // may go there.
-pub fn ymm_proven_at(cx: inout FnCtx, v: i64) -> bool {
+pub fn ymm_proven_at(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if !cx.ymm_used {
             return false;
         }
         let b = cx.insts[v].block;
         let k = cx.blocks[b].order;
-        (k >= 0 && k < cx.ymm_in.count && cx.ymm_in.data[k] != 0) || block_writes_ymm(&cx, b, v)
+        (k >= 0 && k < cx.ymm_in.count && cx.ymm_in.data[k] != 0)
+            || block_writes_ymm(&cx, b, v, pcx)
     }
 }
 
@@ -411,64 +413,64 @@ pub fn ymm_proven_at(cx: inout FnCtx, v: i64) -> bool {
 // its IR as the middle end left it, not as instruction selection makes it.
 // (0.18.1) Each function is a task (emit_task) with a text of its own,
 // joined in this order (middle::parallel).
-pub fn emit_ir_functions(cx: inout FnCtx) {
+pub fn emit_ir_functions(cx: inout FnCtx, pcx: inout Ctx<Comp>) {
     unsafe {
         var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for fi in 0..IRFUNC_COUNT {
-            if !leaf_kept(fi) {
+        for fi in 0..pcx.irfunc_count {
+            if !leaf_kept(fi, pcx) {
                 order.push(fi);
             }
         }
         let split = order.count;
-        for fi in 0..IRFUNC_COUNT {
-            if leaf_kept(fi) {
+        for fi in 0..pcx.irfunc_count {
+            if leaf_kept(fi, pcx) {
                 order.push(fi);
             }
         }
-        emit_functions(&cx, order, split);
+        emit_functions(&cx, order, split, &pcx);
         free(order.data as *u8);
-        parallel_end();
+        parallel_end(&pcx);
     }
 }
 
 // One function of emit_ir_functions, in a task's context: -O2's waiting
 // loop passes and SLP, -O1's pipeline, then its code into cx's text, its
 // labels numbered from 1 (the join renumbers them); then its IR freed.
-pub fn emit_task(cx: inout FnCtx, fi: i64, rank: i64) {
+pub fn emit_task(cx: inout FnCtx, fi: i64, rank: i64, pcx: Ctx<Comp>) {
     unsafe {
-        if OPT_LEVEL >= 2 {
+        if pcx.opt_level >= 2 {
             cx.task_phase = P_DEFERRED;
             cx.task_rank = fi;
-            deferred_loops(&cx, fi);
+            deferred_loops(&cx, fi, pcx);
             cx.task_phase = P_SLP;
-            slp_function(&cx, fi);
+            slp_function(&cx, fi, pcx);
         }
         cx.task_phase = P_EMIT;
         cx.task_rank = rank;
         cx.label_count = 0;
         cx.local_labels = true;
-        if FN_LIVE[fi] != 0 && !leaf_dropped(fi) {
-            if PER_FUNCTION {
-                let t = timer_now();
-                optimize_function(&cx, fi);
-                timer_add(T_SCALAR, t);
+        if pcx.fn_live[fi] != 0 && !leaf_dropped(fi, pcx) {
+            if pcx.per_function {
+                let t = timer_now(pcx);
+                optimize_function(&cx, fi, pcx);
+                timer_add(T_SCALAR, t, pcx);
             }
-            let t = timer_now();
-            select_function(&cx, fi);
-            timer_add(T_ISEL, t);
-            let t2 = timer_now();
-            count_uses(&cx, fi);
-            gen_ir_function(&cx, fi);
-            timer_add(T_CODEGEN, t2);
+            let t = timer_now(pcx);
+            select_function(&cx, fi, pcx);
+            timer_add(T_ISEL, t, pcx);
+            let t2 = timer_now(pcx);
+            count_uses(&cx, fi, pcx);
+            gen_ir_function(&cx, fi, pcx);
+            timer_add(T_CODEGEN, t2, pcx);
         }
         cx.local_labels = false;
-        ir_free_func(&cx, fi);
+        ir_free_func(&cx, fi, pcx);
     }
 }
 
 // (-g) The `.loc` of instruction v, when it starts another statement. The
 // peepholes that look at what was just emitted see through it.
-pub fn emit_loc(cx: inout FnCtx, v: i64) {
+pub fn emit_loc(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) {
     unsafe {
         let loc = cx.inst_loc.data[v];
         if loc == 0 || loc == cx.last_loc {
@@ -476,7 +478,7 @@ pub fn emit_loc(cx: inout FnCtx, v: i64) {
         }
         cx.last_loc = loc;
         let before = BUFS[cx.code].len;
-        dbg_loc(cx.code, loc - 1);
+        dbg_loc(cx.code, loc - 1, pcx);
         let after = BUFS[cx.code].len;
         if cx.last_mov_end == before {
             cx.last_mov_end = after;
@@ -490,7 +492,7 @@ pub fn emit_loc(cx: inout FnCtx, v: i64) {
     }
 }
 
-fn emit_ir_epilogue(cx: inout FnCtx) {
+fn emit_ir_epilogue(cx: inout FnCtx, pcx: Ctx<Comp>) {
     if cx.ymm_used && cx.ymm_ret {
         // (0.19: no dirty upper ymm state leaves the function)
         ins(&cx, c"vzeroupper");
@@ -499,7 +501,7 @@ fn emit_ir_epilogue(cx: inout FnCtx) {
         ins(&cx, c"ret");
         return;
     }
-    save_callee_saved(&cx, restore: true);
+    save_callee_saved(&cx, restore: true, pcx: pcx);
     if !cx.has_frame {
         ins(&cx, c"ret");
     } else if X86 {
@@ -511,7 +513,7 @@ fn emit_ir_epilogue(cx: inout FnCtx) {
 
 // A return from a block that is not the last: the epilogue itself when it
 // is short (at most 4 registers to restore), else a jump to it.
-pub fn emit_return(cx: inout FnCtx) {
+pub fn emit_return(cx: inout FnCtx, pcx: Ctx<Comp>) {
     if !cx.cur_in_frame {
         if cx.ymm_used && cx.ymm_ret {
             ins(&cx, c"vzeroupper");
@@ -521,7 +523,7 @@ pub fn emit_return(cx: inout FnCtx) {
     }
     let saved = cx.callee_used[0..64].iter().filter(|u| u != 0).count();
     if saved <= 4 {
-        emit_ir_epilogue(&cx);
+        emit_ir_epilogue(&cx, pcx);
     } else {
         cx.epilogue_used = true;
         m_jump(&cx, cx.epilogue_label);
@@ -545,15 +547,15 @@ fn function_size(cx: inout FnCtx, fi: i64) -> i64 {
 
 // Whether function fi has parameters on the stack (read from the frame
 // pointer: the frame is then set up at its entry).
-fn has_stack_params(cx: inout FnCtx, fi: i64) -> bool {
+fn has_stack_params(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let f = IRFUNCS[fi].f;
         var locations: [i64; 64] = [0; 64];
         var pieces: [i64; 256] = [0; 256];
-        if FNS[f].param_count > 64 {
+        if pcx.fns[f].param_count > 64 {
             return true;
         }
-        param_locations(&cx, f, &locations as *i64, &pieces as *i64);
+        param_locations(&cx, f, &locations as *i64, &pieces as *i64, pcx);
         var v = cx.blocks[IRFUNCS[fi].entry].first;
         while v != 0 {
             if cx.insts[v].op == Param && cx.insts[v].imm >= 0 {
@@ -573,11 +575,11 @@ fn has_stack_params(cx: inout FnCtx, fi: i64) -> bool {
 
 // Whether block b ends in a call that does not return, passing nothing
 // on the stack (its frame can be its own).
-pub fn is_noreturn_call_block(cx: inout FnCtx, b: i64) -> bool {
+pub fn is_noreturn_call_block(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let v = cx.blocks[b].last;
         cx.blocks[b].term == Term::Unreach && v != 0 && cx.insts[v].op.is_call()
-            && call_stack_size(&cx, v) == 0
+            && call_stack_size(&cx, v, pcx) == 0
     }
 }
 
@@ -666,12 +668,12 @@ fn sw_valid(cx: inout FnCtx, s: i64) -> bool {
 
 // Tears the frame down (on a jump out of its region): restores the
 // callee-saved registers, sp, the frame pointer and the return address.
-pub fn emit_frame_teardown(cx: inout FnCtx) {
-    save_callee_saved(&cx, restore: true);
+pub fn emit_frame_teardown(cx: inout FnCtx, pcx: Ctx<Comp>) {
+    save_callee_saved(&cx, restore: true, pcx: pcx);
     if X86 { mx_frame_unlink(&cx); } else { ma_frame_unlink(&cx); }
 }
 
-fn shrink_wrap(cx: inout FnCtx, fi: i64) {
+fn shrink_wrap(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
         let n = cx.order.count;
         var need = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -684,7 +686,7 @@ fn shrink_wrap(cx: inout FnCtx, fi: i64) {
             while v != 0 {
                 let op = cx.insts[v].op;
                 if op.is_call() && is_emitted(&cx, v)
-                    && !(v == cx.blocks[b].last && is_noreturn_call_block(&cx, b)) {
+                    && !(v == cx.blocks[b].last && is_noreturn_call_block(&cx, b, pcx)) {
                     need.data[k] = 1;
                 }
                 if op == Slot && is_emitted(&cx, v) {
@@ -713,7 +715,7 @@ fn shrink_wrap(cx: inout FnCtx, fi: i64) {
         }
         mark_frame_blocks(&cx, &*need.data);
         var any = (0..n).any(|k| need.data[k] != 0);
-        if cx.returns_twice || cx.frame_align > 16 || has_stack_params(&cx, fi)
+        if cx.returns_twice || cx.frame_align > 16 || has_stack_params(&cx, fi, pcx)
             || (cx.frame_total > 0 && !any) {
             need.data[0] = 1;
             any = true;
@@ -752,7 +754,7 @@ pub fn emit_frame_link(cx: inout FnCtx) {
 
 // Reserves the frame's area, realigns it, saves the callee-saved
 // registers.
-pub fn emit_frame_setup(cx: inout FnCtx) {
+pub fn emit_frame_setup(cx: inout FnCtx, pcx: Ctx<Comp>) {
     if cx.frame_total > 0 {
         if X86 { x64_frame_reserve(&cx, cx.frame_total); }
         else { a64_frame_reserve(&cx, cx.frame_total); }
@@ -768,7 +770,7 @@ pub fn emit_frame_setup(cx: inout FnCtx) {
             }
         }
     }
-    save_callee_saved(&cx, restore: false);
+    save_callee_saved(&cx, restore: false, pcx: pcx);
 }
 
 // The function's label (as the shared emit_function_start writes it), and
