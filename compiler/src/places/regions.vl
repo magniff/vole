@@ -1,0 +1,126 @@
+// (0.27.0) The rust edition's region variables (docs/design/places-ir.md,
+// "Regions, the side tables"). A body of a rust-edition function gets, in
+// pbody.regions, a variable for each borrow (RO_LOAN: its statement), for
+// each reference in a parameter's type (RO_UNIVERSAL: the parameter's
+// local) and in another local's (RO_LOCAL: the local), and for each call
+// whose result holds a reference (RO_CALL: its statement, the callee's
+// regions instantiated there). A borrow's region word (PStmt.e of an
+// RV_REF or RV_SLICE) names its variable, counted from 1 (0: none). Two
+// words a variable: its origin and what it is of. 0.27.0 fills the table
+// and checks nothing (borrowck.unchecked, from run_places); 0.27.1's NLL
+// solves it.
+
+use crate::base::{buf_new, buf_slice, buf_str, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, type_elem};
+use crate::places::ir::{BK_RAW, Body, LF_PARAM, RV_REF, RV_SLICE, SK_ASSIGN, SK_CALL};
+
+pub const RO_LOAN: i64 = 1;
+pub const RO_LOCAL: i64 = 2;
+pub const RO_UNIVERSAL: i64 = 3;
+pub const RO_CALL: i64 = 4;
+
+// Whether function f is the rust edition's (its node in a file read so).
+pub fn rust_fn(f: i64, pcx: inout Ctx<Comp>) -> bool {
+    let node = crate::places::front::fn_node(f, pcx);
+    node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx)
+}
+
+// (0.27.0) borrowck.unchecked at function f, built: its borrows are not
+// checked (0.27.1's NLL checks them). Once a function: its instances share
+// its position.
+pub fn unchecked_warning(f: i64, pcx: inout Ctx<Comp>) {
+    let node = crate::places::front::fn_node(f, pcx);
+    let m = buf_new();
+    buf_str(m, c"the borrows of '");
+    crate::base::buf_bytes(m, sym_text(pcx.nodes[node].a, pcx));
+    buf_str(m, c"' are not checked in 0.27.0: the rust edition's borrow checker comes in 0.27.1");
+    crate::base::diag::report_warning(pcx.nodes[node].start, 0, c"borrowck.unchecked",
+        buf_slice(m).ptr,
+        c"its regions are built (`volec check --emit-places` shows them); `--allow=borrowck.unchecked` hides this warning",
+        &pcx);
+}
+
+// The body held, a rust-edition function's: its region variables made.
+pub fn assign_regions(pbody: inout Body<Comp>, pcx: Ctx<Comp>) {
+    pbody.regions.clear();
+    for l in 0..pbody.locals.len() as i64 {
+        let origin = if (pbody.locals[l].flags & LF_PARAM) != 0 { RO_UNIVERSAL } else { RO_LOCAL };
+        for _ in 0..references_in(pbody.locals[l].ty, 0, pcx) {
+            pbody.regions.push(origin);
+            pbody.regions.push(l);
+        }
+    }
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        if st.kind == SK_ASSIGN && (st.c == RV_REF && st.d != BK_RAW || st.c == RV_SLICE) {
+            pbody.regions.push(RO_LOAN);
+            pbody.regions.push(s);
+            pbody.stmts[s].e = region_count(pbody);
+        } else if st.kind == SK_CALL && st.a >= 0 && st.a < pbody.locals.len() as i64
+            && references_in(pbody.locals[st.a].ty, 0, pcx) > 0 {
+            pbody.regions.push(RO_CALL);
+            pbody.regions.push(s);
+        }
+    }
+}
+
+// The number of region variables of the body held.
+pub fn region_count(pbody: Body<Comp>) -> i64 {
+    pbody.regions.len() as i64 / 2
+}
+
+// The text of region variable r's origin (counted from 1).
+pub fn origin_text(r: i64, pbody: Body<Comp>) -> *u8 {
+    let o = pbody.regions[2 * (r - 1)];
+    if o == RO_LOAN { c"loan" } else if o == RO_LOCAL { c"local" }
+    else if o == RO_UNIVERSAL { c"universal" } else { c"call" }
+}
+
+// What region variable r is of: a statement (a loan, a call) or a local.
+pub fn region_of(r: i64, pbody: Body<Comp>) -> i64 {
+    pbody.regions[2 * (r - 1) + 1]
+}
+
+// Whether region variable r is of a local (else of a statement).
+pub fn of_local(r: i64, pbody: Body<Comp>) -> bool {
+    let o = pbody.regions[2 * (r - 1)];
+    o == RO_LOCAL || o == RO_UNIVERSAL
+}
+
+// The references (a region each) in type t: `&T`, `&mut T`, a slice or a
+// str (a view), and those in what they point to, in a tuple's elements, in
+// an array's element; a struct's or an enum's regions are its parameters'
+// (0.27.1, with variance): not counted here.
+fn references_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+    if t <= 0 || depth > 8 {
+        return 0;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        let b = pcx.types[t].b;
+        if b != REF_SHARED && b != REF_MUT {
+            return 0;
+        }
+        return 1 + references_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    if k == TyKind::Slice {
+        return 1 + references_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    if k == TyKind::Array {
+        return references_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    if k == TyKind::Tuple {
+        var n = 0;
+        for i in 0..pcx.types[t].count {
+            n += references_in(type_elem(t, i, pcx), depth + 1, pcx);
+        }
+        return n;
+    }
+    if k == TyKind::Distinct {
+        // (`str`, a view of bytes)
+        return references_in(pcx.types[t].a, depth + 1, pcx);
+    }
+    0
+}

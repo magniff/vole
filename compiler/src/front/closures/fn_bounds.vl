@@ -4,7 +4,7 @@
 
 use std::Option;
 
-use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice};
+use crate::base::{SRC, buf_bytes, buf_new, buf_slice, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{
@@ -17,7 +17,7 @@ use crate::front::closures::{check_closure_sig, closure_of_type};
 use crate::front::generics::env_leave;
 use crate::front::generics::instantiate::{mentions_unbound, tparam_index, unify};
 use crate::front::modules::module_of;
-use crate::front::types::{TSCRATCH, TYPES, TyKind, err_type, make_type, type_elem};
+use crate::front::types::{TyKind, err_type, make_type, type_elem};
 
 // Type node n resolved, or 0 when it names nothing here (no error).
 fn resolve_quietly(n: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -35,29 +35,29 @@ fn bound_sig(bound: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let saved = pcx.cur_mod;
         pcx.cur_mod = module_of(bound, &pcx);
-        let mark = TSCRATCH.count;
+        let mark = pcx.tscratch.count;
         var known = true;
         for i in 0..pcx.nodes[bound].count {
             // (0.20: `Fn(let T)`, a let parameter: front/conv)
             let t = crate::front::conv::fn_type_param(child(bound, i, pcx),
                 resolve_quietly(child(bound, i, pcx), &pcx), &pcx);
             known = known && t != 0;
-            TSCRATCH.push(t);
+            pcx.tscratch.push(t);
         }
         let ret = resolve_quietly(pcx.nodes[bound].a, &pcx);
         pcx.cur_mod = saved;
         if !known || ret == 0 {
-            TSCRATCH.count = mark;
+            pcx.tscratch.count = mark;
             return 0;
         }
         // (0.24: as a function's, conv::let_by_ref; not a `sink T`)
         for i in 0..pcx.nodes[bound].count {
             if (pcx.nodes[child(bound, i, pcx)].p & crate::front::ast::CONV_SINK) == 0 {
-                TSCRATCH.data[mark + i] = crate::front::conv::let_by_ref(0, TSCRATCH.data[mark + i],
-                    ret, &pcx);
+                pcx.tscratch.data[mark + i] = crate::front::conv::let_by_ref(0,
+                    pcx.tscratch.data[mark + i], ret, &pcx);
             }
         }
-        make_type(TyKind::Fn, ret, 0, mark)
+        make_type(TyKind::Fn, ret, 0, mark, &pcx)
     }
 }
 
@@ -68,7 +68,7 @@ fn callable_sig(t: i64, pcx: Ctx<Comp>) -> i64 {
     if c != 0 {
         return pcx.closures[c - 1].sig;
     }
-    if t > 0 && TYPES[t].kind == TyKind::Fn && TYPES[t].b == 0 {
+    if t > 0 && pcx.types[t].kind == TyKind::Fn && pcx.types[t].b == 0 {
         return t;
     }
     0
@@ -81,7 +81,7 @@ pub fn fn_bound_satisfied(bound: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
         return true;
     }
     let sig = callable_sig(t, pcx);
-    if sig == 0 || TYPES[sig].count != pcx.nodes[bound].count {
+    if sig == 0 || pcx.types[sig].count != pcx.nodes[bound].count {
         return false;
     }
     let c = closure_of_type(t, pcx);
@@ -89,30 +89,31 @@ pub fn fn_bound_satisfied(bound: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
         return false;
     }
     let wanted = bound_sig(bound, &pcx);
-    wanted == 0 || wanted == sig || legacy_sig(wanted, sig)
+    wanted == 0 || wanted == sig || legacy_sig(wanted, sig, pcx)
 }
 
 // (0.17) Whether a parameter written `*T` (a safe function's borrow, the
 // legacy `&mut T`) fits where `&T` or `&mut T` is wanted: a function or
 // closure with `*T` parameters satisfies `F: FnMut(&T, &T) -> i64`, the
 // reference converting to the pointer.
-pub fn legacy_ref_param(wanted: i64, t: i64) -> bool {
-    wanted > 0 && t > 0 && TYPES[wanted].kind == TyKind::Ptr && TYPES[t].kind == TyKind::Ptr
-        && TYPES[t].b == 0 && TYPES[wanted].b != 0 && TYPES[wanted].a == TYPES[t].a
+pub fn legacy_ref_param(wanted: i64, t: i64, pcx: Ctx<Comp>) -> bool {
+    wanted > 0 && t > 0 && pcx.types[wanted].kind == TyKind::Ptr && pcx.types[t].kind == TyKind::Ptr
+        && pcx.types[t].b == 0 && pcx.types[wanted].b != 0 && pcx.types[wanted].a == pcx.types[t].a
 }
 
 // Whether fn type sig is wanted's, a `*T` parameter where wanted has a
 // reference (legacy_ref_param).
-fn legacy_sig(wanted: i64, sig: i64) -> bool {
-    if TYPES[wanted].kind != TyKind::Fn || TYPES[sig].kind != TyKind::Fn
-        || TYPES[wanted].count != TYPES[sig].count || TYPES[wanted].a != TYPES[sig].a
-        || TYPES[wanted].b != TYPES[sig].b {
+fn legacy_sig(wanted: i64, sig: i64, pcx: Ctx<Comp>) -> bool {
+    if pcx.types[wanted].kind != TyKind::Fn || pcx.types[sig].kind != TyKind::Fn
+        || pcx.types[wanted].count != pcx.types[sig].count
+        || pcx.types[wanted].a != pcx.types[sig].a
+        || pcx.types[wanted].b != pcx.types[sig].b {
         return false;
     }
-    for i in 0..TYPES[sig].count {
-        let w = type_elem(wanted, i);
-        let s = type_elem(sig, i);
-        if w != s && !legacy_ref_param(w, s) {
+    for i in 0..pcx.types[sig].count {
+        let w = type_elem(wanted, i, pcx);
+        let s = type_elem(sig, i, pcx);
+        if w != s && !legacy_ref_param(w, s, pcx) {
             return false;
         }
     }
@@ -122,60 +123,58 @@ fn legacy_sig(wanted: i64, sig: i64) -> bool {
 // The error for a type t that does not satisfy bound `bound` of
 // parameter `param` (a name) of generic item `what`, at pos.
 pub fn fn_bound_error(bound: i64, t: i64, param: i64, what: i64, pos: i64, pcx: inout Ctx<Comp>) -> ! {
-    unsafe {
-        let c = closure_of_type(t, pcx);
-        let sig = callable_sig(t, pcx);
-        let wanted = bound_sig(bound, &pcx);
-        err_begin(pos, &pcx);
-        if c != 0 && pcx.nodes[bound].d == 2 && pcx.closures[c - 1].writes
-            && (wanted == 0 || wanted == sig) {
-            err_str(c"the closure changes '", pcx);
-            err_sym(pcx.locals[pcx.closures[c - 1].write_local].name, pcx);
-            err_str(c"', so it is not 'Fn' as the bound of '", pcx);
-            err_sym(param, pcx);
-            err_str(c"' of '", pcx);
-            err_sym(what, pcx);
-            err_str(c"' asks", pcx);
-            err_help(c"make the bound 'FnMut(...)', or do not change captured variables in the closure (an assignment, an inout method, a `&` argument)", pcx);
-            err_end(&pcx);
-        }
-        err_str(c"the type '", pcx);
-        err_type(t, pcx);
-        err_str(c"' does not satisfy the bound '", pcx);
+    let c = closure_of_type(t, pcx);
+    let sig = callable_sig(t, pcx);
+    let wanted = bound_sig(bound, &pcx);
+    err_begin(pos, &pcx);
+    if c != 0 && pcx.nodes[bound].d == 2 && pcx.closures[c - 1].writes
+        && (wanted == 0 || wanted == sig) {
+        err_str(c"the closure changes '", pcx);
+        err_sym(pcx.locals[pcx.closures[c - 1].write_local].name, pcx);
+        err_str(c"', so it is not 'Fn' as the bound of '", pcx);
         err_sym(param, pcx);
-        err_str(if pcx.nodes[bound].d == 2 { c": Fn" } else { c": FnMut" }, pcx);
-        if wanted != 0 {
-            err_str(c"(", pcx);
-            for i in 0..TYPES[wanted].count {
-                if i > 0 {
-                    err_str(c", ", pcx);
-                }
-                err_type(type_elem(wanted, i), pcx);
-            }
-            err_str(c") -> ", pcx);
-            err_type(TYPES[wanted].a, pcx);
-        } else {
-            err_str(c"(...)", pcx);
-        }
         err_str(c"' of '", pcx);
         err_sym(what, pcx);
-        err_str(c"'", pcx);
-        if sig == 0 {
-            err_help(c"pass a closure or a function", pcx);
-        }
-        err_end(&pcx)
+        err_str(c"' asks", pcx);
+        err_help(c"make the bound 'FnMut(...)', or do not change captured variables in the closure (an assignment, an inout method, a `&` argument)", pcx);
+        err_end(&pcx);
     }
+    err_str(c"the type '", pcx);
+    err_type(t, pcx);
+    err_str(c"' does not satisfy the bound '", pcx);
+    err_sym(param, pcx);
+    err_str(if pcx.nodes[bound].d == 2 { c": Fn" } else { c": FnMut" }, pcx);
+    if wanted != 0 {
+        err_str(c"(", pcx);
+        for i in 0..pcx.types[wanted].count {
+            if i > 0 {
+                err_str(c", ", pcx);
+            }
+            err_type(type_elem(wanted, i, pcx), pcx);
+        }
+        err_str(c") -> ", pcx);
+        err_type(pcx.types[wanted].a, pcx);
+    } else {
+        err_str(c"(...)", pcx);
+    }
+    err_str(c"' of '", pcx);
+    err_sym(what, pcx);
+    err_str(c"'", pcx);
+    if sig == 0 {
+        err_help(c"pass a closure or a function", pcx);
+    }
+    err_end(&pcx)
 }
 
 // (0.25.4) Whether types a and b are one type taken two ways: a value, a
 // let or an inout access of it (`R`, `let R`, `inout R`).
 pub fn same_but_convention(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
     a > 0 && b > 0 && a != pcx.ty_error && b != pcx.ty_error && a != b
-        && view_base(a) == view_base(b)
+        && view_base(a, pcx) == view_base(b, pcx)
 }
 
-fn view_base(t: i64) -> i64 {
-    if TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 { TYPES[t].a } else { t }
+fn view_base(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b != 0 { pcx.types[t].a } else { t }
 }
 
 // (0.25.4) Where type node tn's text starts with its convention word
@@ -204,15 +203,15 @@ pub fn closure_param_conv_error(bound: i64, name: i64, param: i64, i: i64, wante
     pcx: inout Ctx<Comp>) -> ! {
     let bp = child(bound, i, pcx);
     let by_sink = (pcx.nodes[bp].p & crate::front::ast::CONV_SINK) != 0;
-    let by_inout = TYPES[wanted].kind == TyKind::Ptr
-        && TYPES[wanted].b == crate::front::types::REF_MUT;
+    let by_inout = pcx.types[wanted].kind == TyKind::Ptr
+        && pcx.types[wanted].b == crate::front::types::REF_MUT;
     let fix = buf_new();
     if by_sink {
         buf_bytes(fix, "sink ");
     } else if by_inout {
         buf_bytes(fix, "inout ");
     }
-    crate::front::types::buf_type(fix, view_base(wanted), pcx);
+    crate::front::types::buf_type(fix, view_base(wanted, pcx), pcx);
     let gives = buf_new();
     if !by_sink && !by_inout {
         buf_bytes(gives, "let ");
@@ -231,7 +230,7 @@ pub fn closure_param_conv_error(bound: i64, name: i64, param: i64, i: i64, wante
     let kind: [u8] = if pcx.nodes[bound].d == 2 { "Fn" } else { "FnMut" };
     err_begin(from, &pcx);
     err_fmt(
-        format_args("the closure does not satisfy the bound '{}: {kind}({})': its parameter '{}' is '{}', the bound gives '{}'", SYMS[name].text, buf_slice(given), SYMS[pcx.nodes[param].a].text, SRC[from..pcx.nodes[tn].end], buf_slice(gives)), pcx);
+        format_args("the closure does not satisfy the bound '{}: {kind}({})': its parameter '{}' is '{}', the bound gives '{}'", sym_text(name, pcx), buf_slice(given), sym_text(pcx.nodes[param].a, pcx), SRC[from..pcx.nodes[tn].end], buf_slice(gives)), pcx);
     err_help(c"a closure takes each parameter the way its bound gives it (let, inout or sink): write it so, or change the bound", pcx);
     err_fix(from, pcx.nodes[tn].end, buf_slice(fix), &pcx);
     err_end(&pcx)
@@ -274,7 +273,7 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
             }
         }
         let count = pcx.nodes[arg].count;
-        let mark = TSCRATCH.count;
+        let mark = pcx.tscratch.count;
         var ret = 0;
         if fnb != 0 && pcx.nodes[fnb].count != count {
             err_begin(pcx.nodes[arg].start, &pcx);
@@ -314,8 +313,9 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
             };
             for i in 0..count {
                 let q = child(fnb, i, pcx);
-                TSCRATCH.push(if mentions_unbound(params, bound, q, pcx) { 0 }
-                    else { crate::front::conv::fn_type_param(q, resolve_quietly(q, &pcx), &pcx) });
+                let pcx_arg = if mentions_unbound(params, bound, q, pcx) { 0 }
+                    else { crate::front::conv::fn_type_param(q, resolve_quietly(q, &pcx), &pcx) };
+                pcx.tscratch.push(pcx_arg);
             }
             if !mentions_unbound(params, bound, pcx.nodes[fnb].a, pcx) {
                 ret = resolve_quietly(pcx.nodes[fnb].a, &pcx);
@@ -325,7 +325,7 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
             pcx.self_type = saved_self;
         } else {
             for _ in 0..count {
-                TSCRATCH.push(0);
+                pcx.tscratch.push(0);
             }
         }
         pcx.closure_bound = fnb;
@@ -348,13 +348,13 @@ pub fn infer_closure_arg(params: i64, bound: *i64, tmod: i64, arg: i64, p: i64,
 
 // What the types of Fn bound `fnb` name, bound from fn type `sig`.
 fn unify_bound(params: i64, bound: *i64, tmod: i64, fnb: i64, sig: i64, pcx: inout Ctx<Comp>) {
-    if TYPES[sig].count != pcx.nodes[fnb].count {
+    if pcx.types[sig].count != pcx.nodes[fnb].count {
         return;
     }
     for i in 0..pcx.nodes[fnb].count {
-        unify(params, bound, tmod, child(fnb, i, pcx), type_elem(sig, i), &pcx);
+        unify(params, bound, tmod, child(fnb, i, pcx), type_elem(sig, i, pcx), &pcx);
     }
-    unify(params, bound, tmod, pcx.nodes[fnb].a, TYPES[sig].a, &pcx);
+    unify(params, bound, tmod, pcx.nodes[fnb].a, pcx.types[sig].a, &pcx);
 }
 
 // After the arguments (infer_from): type parameter k, bound to a closure

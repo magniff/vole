@@ -47,7 +47,7 @@ use crate::front::modules::lookup::{
 use crate::front::own::drops::arm_drops;
 use crate::front::patterns::usefulness::check_arms;
 use crate::front::types::{
-    ENUMS, REF_MUT, REF_SHARED, TYPES, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, buf_type, enum_type,
+    ENUMS, REF_MUT, REF_SHARED, TY_BOOL, TY_NEVER, TY_UNIT, TyKind, buf_type, enum_type,
     enum_variant, err_type, find_variant, is_fieldless_enum, is_float, is_integer, is_ref,
     item_node_of, ref_to, type_elem, variant_field,
 };
@@ -73,7 +73,7 @@ fn names_value(p: i64, pcx: inout Ctx<Comp>) -> bool {
 // what it points to (Rust's default binding modes): any pattern but a
 // binding or `_`, against `&T` or `&mut T` of a T that is no reference.
 fn derefs(p: i64, ty: i64, pcx: inout Ctx<Comp>) -> bool {
-    if !is_ref(ty) || is_ref(TYPES[ty].a) {
+    if !is_ref(ty, pcx) || is_ref(pcx.types[ty].a, pcx) {
         return false;
     }
     let k = pcx.nodes[p].kind;
@@ -84,8 +84,8 @@ fn derefs(p: i64, ty: i64, pcx: inout Ctx<Comp>) -> bool {
 // ty, matches: the referent of a reference it matches through
 // (PAT_DEREF), else 0.
 pub fn pattern_referent(p: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
-    if (pcx.nodes[p].p & PAT_DEREF) != 0 && is_ref(ty) {
-        return TYPES[ty].a;
+    if (pcx.nodes[p].p & PAT_DEREF) != 0 && is_ref(ty, pcx) {
+        return pcx.types[ty].a;
     }
     0
 }
@@ -106,14 +106,28 @@ pub fn check_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
 
 fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
     unsafe {
+        if (pcx.nodes[p].p & crate::front::ast::PAT_AMP) != 0 {
+            // (0.27.0: `&p`; against a value, MVS std's copies, p itself)
+            pcx.nodes[p].p &= ~crate::front::ast::PAT_AMP;
+            let saved = pcx.bind_ref;
+            pcx.bind_ref = 0;
+            let through = is_ref(ty, pcx);
+            check_pat(p, if through { pcx.types[ty].a } else { ty }, &pcx);
+            pcx.bind_ref = saved;
+            pcx.nodes[p].p |= crate::front::ast::PAT_AMP;
+            if through {
+                pcx.nodes[p].p |= PAT_DEREF;
+            }
+            return;
+        }
         if derefs(p, ty, &pcx) {
             // (0.18.1) a pattern on a reference matches what it points to;
             // its bindings are references into it, `&mut` only under
             // `&mut` all the way down (lowering: PAT_DEREF, PAT_REF)
             let saved = pcx.bind_ref;
-            pcx.bind_ref = if saved == REF_SHARED || TYPES[ty].b == REF_SHARED { REF_SHARED }
+            pcx.bind_ref = if saved == REF_SHARED || pcx.types[ty].b == REF_SHARED { REF_SHARED }
                 else { REF_MUT };
-            check_pat(p, TYPES[ty].a, &pcx);
+            check_pat(p, pcx.types[ty].a, &pcx);
             pcx.bind_ref = saved;
             pcx.nodes[p].p |= PAT_DEREF;
             return;
@@ -123,8 +137,8 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
         let kind = pcx.nodes[p].kind;
         // (0.18: a literal pattern of a distinct type matches its
         // underlying type's values)
-        if (kind == PatLit || kind == PatRange) && is_distinct_type(ty) {
-            check_pat(p, strip_distinct(ty), &pcx);
+        if (kind == PatLit || kind == PatRange) && is_distinct_type(ty, pcx) {
+            check_pat(p, strip_distinct(ty, pcx), &pcx);
             return;
         }
         pcx.nodes[p].ty = ty;
@@ -163,7 +177,7 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
         }
         if kind == PatRange && (pcx.nodes[pcx.nodes[p].a].kind == PatVariant
             || pcx.nodes[pcx.nodes[p].b].kind == PatVariant) {
-            if TYPES[ty].kind != TyKind::Enum {
+            if pcx.types[ty].kind != TyKind::Enum {
                 // (0.17) `i8::MIN..=-1`, `0..=i64::MAX`: constants' paths
                 pcx.nodes[p].a = pattern_path(pcx.nodes[p].a, &pcx);
                 pcx.nodes[p].b = pattern_path(pcx.nodes[p].b, &pcx);
@@ -179,18 +193,18 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
         }
         if kind == PatBind && pcx.nodes[p].b == 0 && scope_const(pcx.nodes[p].a, &pcx) != 0
             && lookup_local(pcx.nodes[p].a, pcx).is_none()
-            && is_fieldless_enum(pcx.consts[scope_const(pcx.nodes[p].a, &pcx) - 1].ty) {
+            && is_fieldless_enum(const_type(scope_const(pcx.nodes[p].a, &pcx), pcx), pcx) {
             // A constant of a fieldless enum: its variant's pattern.
             note_pattern_pos(pcx.nodes[p].start, &pcx);
             lookup_commit(pcx.nodes[p].a, pcx.nodes[p].start, &pcx);
             let c = scope_const(pcx.nodes[p].a, &pcx) - 1;
-            let e = TYPES[pcx.consts[c].ty].a;
+            let e = pcx.types[pcx.consts[c].ty].a;
             let value = const_value(c, &pcx);
             for i in 0..ENUMS[e].variant_count {
                 let v = enum_variant(e, i);
                 if wrap_int(pcx.variants[v].discr, ENUMS[e].tag) == value {
                     pcx.nodes[p].kind = PatVariant;
-                    pcx.nodes[p].y = enum_type(e);
+                    pcx.nodes[p].y = enum_type(e, &pcx);
                     pcx.nodes[p].b = pcx.variants[v].name;
                     pcx.nodes[p].c = 0;
                 }
@@ -212,16 +226,18 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
                 return;
             }
             var bty = ty;
+            // (0.27.0: `ref x`, `ref mut x`, the rust edition's: c is the mode)
+            let mode = if pcx.nodes[p].c != 0 { pcx.nodes[p].c } else { pcx.bind_ref };
             // (a slice is a view already: a copy, as `&[T]` is `[T]`)
-            if pcx.bind_ref != 0 && !(TYPES[ty].kind == TyKind::Slice && TYPES[ty].b == 0) {
+            if mode != 0 && !(pcx.types[ty].kind == TyKind::Slice && pcx.types[ty].b == 0) {
                 if pcx.nodes[p].b != 0 {
                     err_begin(pcx.nodes[p].start, &pcx);
                     err_fmt(
-                        format_args("'var {}' in a pattern through an access: its bindings are accesses into the value", sym_text(name)), pcx);
+                        format_args("'var {}' in a pattern through an access: its bindings are accesses into the value", sym_text(name, pcx)), pcx);
                     err_help(c"drop the 'var' (matched through an inout access, 'x = v' changes the field), or match a copy: 'match e.clone()'", pcx);
                     err_end(&pcx);
                 }
-                bty = ref_to(ty, pcx.bind_ref);
+                bty = ref_to(ty, mode, &pcx);
                 pcx.nodes[p].p |= PAT_REF;
                 pcx.nodes[p].ty = bty;
             }
@@ -239,7 +255,7 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
             // (0.20) a binding into a value matched through an access (`match
             // &x`, `match e` of an access) is an access too, in a 0.20 file:
             // used as the value it designates (conventions.md §5.3)
-            if (pcx.nodes[p].p & crate::front::ast::PAT_REF) != 0 && bty > 0 && is_ref(bty)
+            if (pcx.nodes[p].p & crate::front::ast::PAT_REF) != 0 && bty > 0 && is_ref(bty, pcx)
                 && crate::front::conv::strict_at(pcx.nodes[p].start, &pcx) {
                 pcx.locals[pcx.nodes[p].x].access = true;
             }
@@ -270,7 +286,7 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
                 if ty == TY_UNIT && count == 0 {
                     return;
                 }
-                if TYPES[ty].kind != TyKind::Tuple || TYPES[ty].count != count {
+                if pcx.types[ty].kind != TyKind::Tuple || pcx.types[ty].count != count {
                     err_begin(pcx.nodes[p].start, &pcx);
                     err_fmt(
                         format_args(
@@ -280,7 +296,7 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
                     err_end(&pcx);
                 }
                 for i in 0..count {
-                    check_pat(child(p, i, pcx), type_elem(ty, i), &pcx);
+                    check_pat(child(p, i, pcx), type_elem(ty, i, pcx), &pcx);
                 }
             }
             PatLit => {
@@ -307,41 +323,46 @@ fn check_pat(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.0) The type of constant c + 1 (scope_const's answer), read apart
+// from the call that finds it (refactor table: a call in an index of a
+// table it may grow).
+fn const_type(c1: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.consts[c1 - 1].ty
+}
+
 // `E::A..=E::C` (0.4): the variants from A to C in declaration order, as
 // an or-pattern.
 fn variant_range(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
-    unsafe {
-        let lo = pcx.nodes[p].a;
-        let hi = pcx.nodes[p].b;
-        let t = pattern_enum_type(lo, ty, &pcx);
-        if TYPES[t].kind != TyKind::Enum || pattern_enum_type(hi, ty, &pcx) != t {
-            type_error(p, c"a variant range needs two variants of the same enum", &pcx);
-        }
-        let e = TYPES[t].a;
-        let first = find_variant(e, pcx.nodes[lo].b, pcx);
-        let last = find_variant(e, pcx.nodes[hi].b, pcx);
-        if first < 0 || last < 0 {
-            type_error(p, c"unknown variant in a variant range", &pcx);
-        }
-        if last < first {
-            type_error(p,
-                c"the variant range is empty (its first variant is declared after its last)", &pcx);
-        }
-        let mark = list_begin(pcx);
-        for v in first..last + 1 {
-            if pcx.variants[v].field_count > 0 {
-                name_error(pcx.nodes[p].start, c"variant ranges are for variants without fields; '",
-                    pcx.variants[v].name, c"' has fields", &pcx);
-            }
-            let alt = new_node(PatVariant, pcx.nodes[p].start, pcx.nodes[p].end, &pcx);
-            pcx.nodes[alt].y = t;
-            pcx.nodes[alt].b = pcx.variants[v].name;
-            list_push(alt, &pcx);
-        }
-        list_end(p, mark, &pcx);
-        pcx.nodes[p].kind = PatOr;
-        check_pat(p, ty, &pcx);
+    let lo = pcx.nodes[p].a;
+    let hi = pcx.nodes[p].b;
+    let t = pattern_enum_type(lo, ty, &pcx);
+    if pcx.types[t].kind != TyKind::Enum || pattern_enum_type(hi, ty, &pcx) != t {
+        type_error(p, c"a variant range needs two variants of the same enum", &pcx);
     }
+    let e = pcx.types[t].a;
+    let first = find_variant(e, pcx.nodes[lo].b, pcx);
+    let last = find_variant(e, pcx.nodes[hi].b, pcx);
+    if first < 0 || last < 0 {
+        type_error(p, c"unknown variant in a variant range", &pcx);
+    }
+    if last < first {
+        type_error(p,
+            c"the variant range is empty (its first variant is declared after its last)", &pcx);
+    }
+    let mark = list_begin(pcx);
+    for v in first..last + 1 {
+        if pcx.variants[v].field_count > 0 {
+            name_error(pcx.nodes[p].start, c"variant ranges are for variants without fields; '",
+                pcx.variants[v].name, c"' has fields", &pcx);
+        }
+        let alt = new_node(PatVariant, pcx.nodes[p].start, pcx.nodes[p].end, &pcx);
+        pcx.nodes[alt].y = t;
+        pcx.nodes[alt].b = pcx.variants[v].name;
+        list_push(alt, &pcx);
+    }
+    list_end(p, mark, &pcx);
+    pcx.nodes[p].kind = PatOr;
+    check_pat(p, ty, &pcx);
 }
 
 // (0.17) A bound of a range pattern parsed as a variant (`i8::MIN` in
@@ -422,8 +443,8 @@ fn pattern_enum_type(p: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
             err_begin(pcx.nodes[p].start, &pcx);
             err_str(c"expected '", pcx);
             err_type(ty, pcx);
-            err_fmt(format_args("', got a pattern of '{}'", sym_text(name)), pcx);
-            crate::front::check::names::pattern_enum_help(ty, sym_text(name), pcx);
+            err_fmt(format_args("', got a pattern of '{}'", sym_text(name, pcx)), pcx);
+            crate::front::check::names::pattern_enum_help(ty, sym_text(name, pcx), pcx);
             err_end(&pcx);
         }
         resolve_key(key, name, pcx.nodes[p].start, &pcx)
@@ -433,7 +454,7 @@ fn pattern_enum_type(p: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
 fn check_variant_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         let t = pattern_enum_type(p, ty, &pcx);
-        if TYPES[t].kind != TyKind::Enum {
+        if pcx.types[t].kind != TyKind::Enum {
             err_begin(pcx.nodes[p].start, &pcx);
             err_str(c"'", pcx);
             err_type(t, pcx);
@@ -443,18 +464,18 @@ fn check_variant_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
         if t != ty {
             mismatch_error(p, ty, t, &pcx);
         }
-        let v = find_variant(TYPES[t].a, pcx.nodes[p].b, pcx);
+        let v = find_variant(pcx.types[t].a, pcx.nodes[p].b, pcx);
         if v < 0 {
             err_begin(pcx.nodes[p].start, &pcx);
-            err_fmt(format_args("no variant '{}' in enum '", sym_text(pcx.nodes[p].b)), pcx);
+            err_fmt(format_args("no variant '{}' in enum '", sym_text(pcx.nodes[p].b, pcx)), pcx);
             err_type(t, pcx);
             err_str(c"'", pcx);
             // (0.25.2.1: the nearest variants, `Left`: 'ArrowLeft')
             pcx.near_all.count = 0;
             pcx.near_collect = true;
             var near = near_to(pcx.nodes[p].b);
-            for i in 0..ENUMS[TYPES[t].a].variant_count {
-                near.offer(pcx.variants[enum_variant(TYPES[t].a, i)].name, &pcx);
+            for i in 0..ENUMS[pcx.types[t].a].variant_count {
+                near.offer(pcx.variants[enum_variant(pcx.types[t].a, i)].name, &pcx);
             }
             pcx.near_collect = false;
             near.help(&pcx);
@@ -474,12 +495,12 @@ fn check_variant_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
             err_begin(pcx.nodes[p].start, &pcx);
             err_str(c"variant '", pcx);
             err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b)), pcx);
+            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b, pcx)), pcx);
             err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
             err_help(c"match them by name, or leave them out with '..'", pcx);
             let b = buf_new();
             buf_type(b, t, pcx);
-            buf_fmt(b, format_args("::{} {{ .. }}", sym_text(pcx.nodes[p].b)));
+            buf_fmt(b, format_args("::{} {{ .. }}", sym_text(pcx.nodes[p].b, pcx)));
             err_try_fmt(buf_slice(b), pcx);
             err_end(&pcx);
         }
@@ -487,11 +508,11 @@ fn check_variant_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
             err_begin(pcx.nodes[p].start, &pcx);
             err_str(c"variant '", pcx);
             err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b)), pcx);
+            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b, pcx)), pcx);
             err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
             err_help(c"match them: '", pcx);
             buf_type(pcx.err_help, t, pcx);
-            err_help_fmt(format_args("::{}(_", sym_text(pcx.nodes[p].b)), pcx);
+            err_help_fmt(format_args("::{}(_", sym_text(pcx.nodes[p].b, pcx)), pcx);
             for _ in 1..count {
                 err_help(c", _", pcx);
             }
@@ -502,7 +523,7 @@ fn check_variant_pattern(p: i64, ty: i64, pcx: inout Ctx<Comp>) {
             err_begin(pcx.nodes[p].start, &pcx);
             err_str(c"variant '", pcx);
             err_type(t, pcx);
-            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b)), pcx);
+            err_fmt(format_args("::{}' has {count}", sym_text(pcx.nodes[p].b, pcx)), pcx);
             err_str(if count == 1 { c" field" } else { c" fields" }, pcx);
             err_fmt(format_args(", the pattern has {}", pcx.nodes[p].count), pcx);
             err_end(&pcx);
@@ -554,7 +575,7 @@ fn or_rebind(p: i64, name: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
             if pcx.locals[id].name == name {
                 if pcx.locals[id].ty != ty {
                     err_begin(pcx.nodes[p].start, &pcx);
-                    err_fmt(format_args("variable '{}' has type '", sym_text(name)), pcx);
+                    err_fmt(format_args("variable '{}' has type '", sym_text(name, pcx)), pcx);
                     err_type(pcx.locals[id].ty, pcx);
                     err_str(c"' in one alternative and '", pcx);
                     err_type(ty, pcx);
@@ -667,141 +688,139 @@ pub fn check_irrefutable(p: i64, what: *u8, pcx: inout Ctx<Comp>) {
 
 // `match`; `expected` (0 for none) is the type of the arms.
 pub fn check_match(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
-    unsafe {
-        let scrutinee = pcx.nodes[n].a;
-        // (0.20, conventions.md §5.3) `match e` of an access matches through
-        // it, as 0.19's `match r` of a reference did: its bindings are
-        // accesses into the value (default binding modes), not copies
-        if pcx.nodes[scrutinee].kind == NodeKind::Ident
-            && (pcx.nodes[scrutinee].p & crate::front::ast::CONV_NEW) == 0
-            && crate::front::conv::strict_at(pcx.nodes[scrutinee].start, &pcx) {
-            match lookup_local(pcx.nodes[scrutinee].a, pcx) {
-                Option::Some(l) => {
-                    if pcx.locals[l].access && is_ref(pcx.locals[l].ty) {
-                        pcx.nodes[scrutinee].p |= crate::front::ast::CONV_NEW;
-                    }
-                }
-                Option::None => {}
-            }
-        }
-        var st = check_recovering(scrutinee, 0, &pcx);
-        // (0.20, D13 for a match: `match q.conds[i]` of an owned value the
-        // function cannot take, an element or a part through an access,
-        // matches it through a borrow, as `let x = part` does: its
-        // bindings are accesses into it)
-        if st > 0 && st != pcx.ty_error
-            && crate::front::conv::strict_at(pcx.nodes[scrutinee].start, &pcx)
-            && !crate::front::conv::copyable(st, &pcx)
-            && crate::front::conv::borrowed_place(scrutinee, pcx) {
-            let inner = new_node(NodeKind::None, pcx.nodes[scrutinee].start,
-                pcx.nodes[scrutinee].end, &pcx);
-            pcx.nodes[inner] = pcx.nodes[scrutinee];
-            pcx.nodes[inner].p |= NODE_CHECKED;
-            pcx.nodes[inner].ty = st;
-            pcx.nodes[scrutinee].kind = NodeKind::Unary;
-            pcx.nodes[scrutinee].op = Tok::Amp;
-            pcx.nodes[scrutinee].a = 0;
-            pcx.nodes[scrutinee].b = inner;
-            pcx.nodes[scrutinee].count = 0;
-            pcx.nodes[scrutinee].list = 0;
-            pcx.nodes[scrutinee].p = 0;
-            pcx.nodes[scrutinee].ty = 0;
-            st = check_recovering(scrutinee, 0, &pcx);
-        }
-        var result = expected;
-        var all_never = true;
-        // `if let` without `else` (0.6): of type `()`, like an `if`.
-        let no_else = pcx.nodes[n].count == 2 && (pcx.nodes[child(n, 1, pcx)].p & ARM_NO_ELSE) != 0;
-        if no_else && expected != 0 && expected != TY_UNIT {
-            err_begin(pcx.nodes[n].start, &pcx);
-            err_str(c"'if let' without else must have type '()', expected '", pcx);
-            err_type(expected, pcx);
-            err_str(c"'", pcx);
-            err_end(&pcx);
-        }
-        // (0.14) without an expected type, an arm whose value is an
-        // unsuffixed literal (0.25.4: or an array of them, is_context_value)
-        // takes the type of the first other arm: checked after it (a
-        // literal needs none of the pattern's bindings)
-        let later = expected == 0 && !no_else
-            && (0..pcx.nodes[n].count).any(|i| !is_context_value(pcx.nodes[child(n, i, pcx)].c,
-                pcx));
-        var typed_at = pcx.nodes[n].count;
-        for i in 0..pcx.nodes[n].count {
-            let arm = child(n, i, pcx);
-            push_scope(&pcx);
-            let locals = pcx.local_count;
-            if st == pcx.ty_error {
-                // (after an error in the scrutinee: bindings of the error type)
-                poison_pattern(pcx.nodes[arm].a, &pcx);
-            } else {
-                check_pattern(pcx.nodes[arm].a, st, &pcx);
-                // (0.17, T1: its bindings' drops, or they borrow:
-                // front/own/drops)
-                arm_drops(n, arm, &pcx);
-            }
-            if pcx.nodes[arm].b != 0 {
-                check_expr(pcx.nodes[arm].b, TY_BOOL, &pcx);
-            }
-            let body = pcx.nodes[arm].c;
-            var t = 0;
-            if (pcx.nodes[arm].p & ARM_LET_ELSE) != 0 {
-                // (0.18.1) `let ... else { .. }`: the block leaves
-                t = check_wrapped(body, 0, &pcx);
-                if t != TY_NEVER && t != pcx.ty_error {
-                    err_begin(pcx.nodes[body].start, &pcx);
-                    err_str(c"the 'else' block of a 'let ... else' must not end normally", pcx);
-                    err_help(c"end it with 'return', 'break', 'continue' or a call that never returns ('panic(..)')", pcx);
-                    err_end(&pcx);
-                }
-            } else if no_else && i == 0 {
-                t = check_wrapped(body, 0, &pcx);
-                if t != TY_UNIT && t != TY_NEVER {
-                    type_error_got(n, c"'if let' without else must have type '()'", t, &pcx);
-                }
-                result = TY_UNIT;
-            }
-            else if result != 0 && expected == 0 && is_integer(result)
-                && !takes_context(body, &pcx) {
-                // (0.15: two integer types join to the wider one)
-                t = join_arm(n, i, body, result, later, &pcx);
-                if t != TY_NEVER {
-                    result = t;
-                }
-            } else if result != 0 {
-                t = check_wrapped(body, result, &pcx);
-            } else if later && is_context_value(body, pcx) {
-                t = pcx.ty_error;
-            } else {
-                t = check_wrapped(body, 0, &pcx);
-                if t != TY_NEVER {
-                    result = t;
-                    typed_at = i;
+    let scrutinee = pcx.nodes[n].a;
+    // (0.20, conventions.md §5.3) `match e` of an access matches through
+    // it, as 0.19's `match r` of a reference did: its bindings are
+    // accesses into the value (default binding modes), not copies
+    if pcx.nodes[scrutinee].kind == NodeKind::Ident
+        && (pcx.nodes[scrutinee].p & crate::front::ast::CONV_NEW) == 0
+        && crate::front::conv::strict_at(pcx.nodes[scrutinee].start, &pcx) {
+        match lookup_local(pcx.nodes[scrutinee].a, pcx) {
+            Option::Some(l) => {
+                if pcx.locals[l].access && is_ref(pcx.locals[l].ty, pcx) {
+                    pcx.nodes[scrutinee].p |= crate::front::ast::CONV_NEW;
                 }
             }
-            if t != TY_NEVER {
-                all_never = false;
-            }
-            check_scope_exit(t, locals, pcx.nodes[body].start, &pcx);
-            pop_scope(&pcx);
+            Option::None => {}
         }
-        if later {
-            for i in 0..typed_at {
-                let body = pcx.nodes[child(n, i, pcx)].c;
-                if is_context_value(body, pcx) {
-                    let t = check_wrapped(body, result, &pcx);
-                    if result == 0 {
-                        result = t;
-                    }
-                }
-            }
-        }
-        if st != TY_NEVER && st != pcx.ty_error {
-            check_arms(n, st, &pcx);
-        }
-        if all_never || result == 0 {
-            return TY_NEVER;
-        }
-        result
     }
+    var st = check_recovering(scrutinee, 0, &pcx);
+    // (0.20, D13 for a match: `match q.conds[i]` of an owned value the
+    // function cannot take, an element or a part through an access,
+    // matches it through a borrow, as `let x = part` does: its
+    // bindings are accesses into it)
+    if st > 0 && st != pcx.ty_error
+        && crate::front::conv::strict_at(pcx.nodes[scrutinee].start, &pcx)
+        && !crate::front::conv::copyable(st, &pcx)
+        && crate::front::conv::borrowed_place(scrutinee, pcx) {
+        let inner = new_node(NodeKind::None, pcx.nodes[scrutinee].start,
+            pcx.nodes[scrutinee].end, &pcx);
+        pcx.nodes[inner] = pcx.nodes[scrutinee];
+        pcx.nodes[inner].p |= NODE_CHECKED;
+        pcx.nodes[inner].ty = st;
+        pcx.nodes[scrutinee].kind = NodeKind::Unary;
+        pcx.nodes[scrutinee].op = Tok::Amp;
+        pcx.nodes[scrutinee].a = 0;
+        pcx.nodes[scrutinee].b = inner;
+        pcx.nodes[scrutinee].count = 0;
+        pcx.nodes[scrutinee].list = 0;
+        pcx.nodes[scrutinee].p = 0;
+        pcx.nodes[scrutinee].ty = 0;
+        st = check_recovering(scrutinee, 0, &pcx);
+    }
+    var result = expected;
+    var all_never = true;
+    // `if let` without `else` (0.6): of type `()`, like an `if`.
+    let no_else = pcx.nodes[n].count == 2 && (pcx.nodes[child(n, 1, pcx)].p & ARM_NO_ELSE) != 0;
+    if no_else && expected != 0 && expected != TY_UNIT {
+        err_begin(pcx.nodes[n].start, &pcx);
+        err_str(c"'if let' without else must have type '()', expected '", pcx);
+        err_type(expected, pcx);
+        err_str(c"'", pcx);
+        err_end(&pcx);
+    }
+    // (0.14) without an expected type, an arm whose value is an
+    // unsuffixed literal (0.25.4: or an array of them, is_context_value)
+    // takes the type of the first other arm: checked after it (a
+    // literal needs none of the pattern's bindings)
+    let later = expected == 0 && !no_else
+        && (0..pcx.nodes[n].count).any(|i| !is_context_value(pcx.nodes[child(n, i, pcx)].c,
+            pcx));
+    var typed_at = pcx.nodes[n].count;
+    for i in 0..pcx.nodes[n].count {
+        let arm = child(n, i, pcx);
+        push_scope(&pcx);
+        let locals = pcx.locals.len() as i64;
+        if st == pcx.ty_error {
+            // (after an error in the scrutinee: bindings of the error type)
+            poison_pattern(pcx.nodes[arm].a, &pcx);
+        } else {
+            check_pattern(pcx.nodes[arm].a, st, &pcx);
+            // (0.17, T1: its bindings' drops, or they borrow:
+            // front/own/drops)
+            arm_drops(n, arm, &pcx);
+        }
+        if pcx.nodes[arm].b != 0 {
+            check_expr(pcx.nodes[arm].b, TY_BOOL, &pcx);
+        }
+        let body = pcx.nodes[arm].c;
+        var t = 0;
+        if (pcx.nodes[arm].p & ARM_LET_ELSE) != 0 {
+            // (0.18.1) `let ... else { .. }`: the block leaves
+            t = check_wrapped(body, 0, &pcx);
+            if t != TY_NEVER && t != pcx.ty_error {
+                err_begin(pcx.nodes[body].start, &pcx);
+                err_str(c"the 'else' block of a 'let ... else' must not end normally", pcx);
+                err_help(c"end it with 'return', 'break', 'continue' or a call that never returns ('panic(..)')", pcx);
+                err_end(&pcx);
+            }
+        } else if no_else && i == 0 {
+            t = check_wrapped(body, 0, &pcx);
+            if t != TY_UNIT && t != TY_NEVER {
+                type_error_got(n, c"'if let' without else must have type '()'", t, &pcx);
+            }
+            result = TY_UNIT;
+        }
+        else if result != 0 && expected == 0 && is_integer(result)
+            && !takes_context(body, &pcx) {
+            // (0.15: two integer types join to the wider one)
+            t = join_arm(n, i, body, result, later, &pcx);
+            if t != TY_NEVER {
+                result = t;
+            }
+        } else if result != 0 {
+            t = check_wrapped(body, result, &pcx);
+        } else if later && is_context_value(body, pcx) {
+            t = pcx.ty_error;
+        } else {
+            t = check_wrapped(body, 0, &pcx);
+            if t != TY_NEVER {
+                result = t;
+                typed_at = i;
+            }
+        }
+        if t != TY_NEVER {
+            all_never = false;
+        }
+        check_scope_exit(t, locals, pcx.nodes[body].start, &pcx);
+        pop_scope(&pcx);
+    }
+    if later {
+        for i in 0..typed_at {
+            let body = pcx.nodes[child(n, i, pcx)].c;
+            if is_context_value(body, pcx) {
+                let t = check_wrapped(body, result, &pcx);
+                if result == 0 {
+                    result = t;
+                }
+            }
+        }
+    }
+    if st != TY_NEVER && st != pcx.ty_error {
+        check_arms(n, st, &pcx);
+    }
+    if all_never || result == 0 {
+        return TY_NEVER;
+    }
+    result
 }

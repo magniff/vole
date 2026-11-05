@@ -15,7 +15,8 @@
 # language:
 #
 #   ```vole   vole code (```tach too, its name before 0.24), compiled
-#             with --deny-warnings: a program when
+#             with --deny-warnings (0.27.0: but borrowck.unchecked, the
+#             rust edition's warning on every function): a program when
 #             it has a line starting `fn main(`; else items, when every
 #             line at column 0 starts an item (fn, struct, impl, use...),
 #             compiled with an empty main; else statements, compiled as
@@ -185,7 +186,7 @@ check_block() {
     d=$1
     name=$(cat "$d/name")
     if [ -f "$d/err" ]; then
-        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
+        "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -211,7 +212,7 @@ check_block() {
         if [ "$HOST" = Darwin-arm64 ]; then
             link="-l objc"
         else
-            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
+            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
                 echo "pass $name" >"$d/result"
             else
                 { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -219,7 +220,7 @@ check_block() {
             return
         fi
     fi
-    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -412,7 +413,8 @@ fi
 # 0.18.1: 21000, its first page longer and no longer read by default,
 # the heaps' section, Vec's sort_by_key, retain, contains, first; 0.25:
 # 21500, std::min, max, clamp, abs and `(a..=b).rev()`; 0.26.2: 22000,
-# TryFrom and its impls, usize's and isize's);
+# TryFrom and its impls, usize's and isize's; 0.27.0: 22400, Deref,
+# DerefMut, Index and IndexMut, for the rust edition);
 # std#every-item is not in it. (0.18.1) `guide std` alone is its first
 # page: the most used names and where the rest is (std#the-api), 4500
 # bytes at most (the 0.18 eval's agents read all 18k of it before
@@ -420,7 +422,7 @@ fi
 "$COMPILER" guide std >"$WORK/std-page.md" 2>&1
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
 page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
-if [ "$size" -le 22000 ] && [ "$page" -le 4500 ] \
+if [ "$size" -le 22400 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
     && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
@@ -435,7 +437,7 @@ if [ "$size" -le 22000 ] && [ "$page" -le 4500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "volec guide std --whole is $size bytes (22000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+    result FAIL guide-std-index "volec guide std --whole is $size bytes (22400 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # (0.25.2) The GPU words agents searched for find guide gpu first: its

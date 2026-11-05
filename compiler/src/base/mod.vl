@@ -48,21 +48,21 @@ pub const STDERR: i32 = 2;
 
 // Makes room for one more element in an array of `count` elements of T
 // with capacity `*cap`; returns the (possibly moved) data.
-pub fn grow<T>(data: *T, count: i64, cap: *i64) -> *T {
+pub fn grow<T>(data: *T, count: i64, cap: inout i64) -> *T {
     unsafe {
-        if count < *cap {
+        if count < cap {
             return data;
         }
         if stress_grow() {
-            let old = *cap;
-            *cap = stress_cap(old, count + 1);
-            return moved_block(data as *u8, old * size_of(T), *cap * size_of(T)) as *T;
+            let old = cap;
+            cap = stress_cap(old, count + 1);
+            return moved_block(data as *u8, old * size_of(T), cap * size_of(T)) as *T;
         }
-        var new_cap = *cap * 2;
+        var new_cap = cap * 2;
         if new_cap < 64 {
             new_cap = 64;
         }
-        *cap = new_cap;
+        cap = new_cap;
         let grown = realloc(data as *u8, (new_cap * size_of(T)) as u64);
         if grown == 0 as *u8 {
             die(c"out of memory");
@@ -493,21 +493,24 @@ pub fn die2(message: *u8, detail: *u8) -> ! {
 
 // ---- Symbols ----
 
-// Every identifier is interned once; a symbol is its index in SYMS.
-// `text` is NUL-terminated (text.ptr is a C string).
-struct Sym { pub text: [u8], pub hash: u64 }
+// Every identifier is interned once; a symbol is its index in the
+// context's syms (0.27.0; the static SYMS before). Its text is
+// ptr[0..len], NUL-terminated (ptr is a C string): a raw pointer and a
+// length, not a `[u8]`, so that a Sym views nothing and the compilation
+// context can hold the symbols (sym_text makes the slice).
+pub struct Sym { pub ptr: *u8, pub len: i64, pub hash: u64 }
 
-pub static var SYMS: Vec<Sym, Comp> = Vec::new_in(Comp {});
-// Open addressing: symbol + 1 per slot, 0 when empty.
-static var SYM_TABLE: *i64 = 0 as *i64;
-static var SYM_TABLE_SIZE: i64 = 0;
 // (0.26.3) True while middle::parallel's tasks run (set by
 // middle::threads around a phase, on one thread or many): a task may look
-// a symbol up but not make one, since the other threads read SYMS and
-// SYM_TABLE meanwhile (a push or a rehash under them is a data race).
-// intern dies instead; a symbol a task needs is made first (parallel's
-// prepare_tasks). Written by the main thread only, before a phase hands
-// its tasks over and after all are done (ordered by the pool's mutex).
+// a symbol up but not make one, since the other threads read the
+// context's syms and sym_table meanwhile (a push or a rehash under them
+// is a data race). (0.27.0) A task cannot call intern: it takes the
+// context inout, and a task is lent it let (find_sym is the lookup); a
+// symbol a task needs is made first (parallel's prepare_tasks). This
+// stays for the main thread while a phase's tasks run (pool_run_joined's
+// join_task): intern dies instead. Written by the main thread only,
+// before a phase hands its tasks over and after all are done (ordered by
+// the pool's mutex).
 pub static var SYMS_FROZEN: bool = false;
 
 fn hash_bytes(bytes: [u8]) -> u64 {
@@ -519,44 +522,44 @@ fn hash_bytes(bytes: [u8]) -> u64 {
     h
 }
 
-fn sym_table_insert(sym: i64) {
+fn sym_table_insert(sym: i64, pcx: inout Ctx<Comp>) {
     unsafe {
-        let mask = (SYM_TABLE_SIZE - 1) as u64;
-        var slot = SYMS[sym].hash & mask;
-        while SYM_TABLE[slot] != 0 {
+        let mask = (pcx.sym_table_size - 1) as u64;
+        var slot = pcx.syms[sym].hash & mask;
+        while pcx.sym_table[slot] != 0 {
             slot = (slot + 1) & mask;
         }
-        SYM_TABLE[slot] = sym + 1;
+        pcx.sym_table[slot] = sym + 1;
     }
 }
 
-fn sym_table_rehash() {
-    var new_size = SYM_TABLE_SIZE * 2;
+fn sym_table_rehash(pcx: inout Ctx<Comp>) {
+    var new_size = pcx.sym_table_size * 2;
     if new_size < 1024 {
         new_size = 1024;
     }
-    unsafe { free(SYM_TABLE as *u8); }
-    SYM_TABLE = alloc_array::<i64>(new_size);
-    SYM_TABLE_SIZE = new_size;
-    for sym in 0..SYMS.len() as i64 {
-        sym_table_insert(sym);
+    unsafe { free(pcx.sym_table as *u8); }
+    pcx.sym_table = alloc_array::<i64>(new_size);
+    pcx.sym_table_size = new_size;
+    for sym in 0..pcx.syms.len() as i64 {
+        sym_table_insert(sym, &pcx);
     }
 }
 
 // The symbol with these bytes, or -1 (none is made).
-pub fn find_sym(bytes: [u8]) -> i64 {
+pub fn find_sym(bytes: [u8], pcx: Ctx<Comp>) -> i64 {
     unsafe {
-        if SYM_TABLE_SIZE == 0 {
+        if pcx.sym_table_size == 0 {
             return -1;
         }
         let n = bytes.len;
         let hash = hash_bytes(bytes);
-        let mask = (SYM_TABLE_SIZE - 1) as u64;
+        let mask = (pcx.sym_table_size - 1) as u64;
         var slot = hash & mask;
-        while SYM_TABLE[slot] != 0 {
-            let sym = SYM_TABLE[slot] - 1;
-            if SYMS[sym].hash == hash && SYMS[sym].text.len == n
-                && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+        while pcx.sym_table[slot] != 0 {
+            let sym = pcx.sym_table[slot] - 1;
+            if pcx.syms[sym].hash == hash && sym_text(sym, pcx).len == n
+                && memcmp(sym_text(sym, pcx).ptr, bytes.ptr, n as u64) == 0 {
                 return sym;
             }
             slot = (slot + 1) & mask;
@@ -565,20 +568,20 @@ pub fn find_sym(bytes: [u8]) -> i64 {
     }
 }
 
-pub fn intern(bytes: [u8]) -> i64 {
+pub fn intern(bytes: [u8], pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let n = bytes.len as i64;
         // (frozen: no rehash, the table has room for the lookup)
-        if !SYMS_FROZEN && (SYMS.len() as i64 + 1) * 2 > SYM_TABLE_SIZE {
-            sym_table_rehash();
+        if !SYMS_FROZEN && (pcx.syms.len() as i64 + 1) * 2 > pcx.sym_table_size {
+            sym_table_rehash(&pcx);
         }
         let hash = hash_bytes(bytes);
-        let mask = (SYM_TABLE_SIZE - 1) as u64;
+        let mask = (pcx.sym_table_size - 1) as u64;
         var slot = hash & mask;
-        while SYM_TABLE[slot] != 0 {
-            let sym = SYM_TABLE[slot] - 1;
-            if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
-                && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+        while pcx.sym_table[slot] != 0 {
+            let sym = pcx.sym_table[slot] - 1;
+            if pcx.syms[sym].hash == hash && sym_text(sym, pcx).len as i64 == n
+                && memcmp(sym_text(sym, pcx).ptr, bytes.ptr, n as u64) == 0 {
                 return sym;
             }
             slot = (slot + 1) & mask;
@@ -596,14 +599,14 @@ pub fn intern(bytes: [u8]) -> i64 {
             write(STDERR, line, (h + n + r) as u64);
             exit(1);
         }
-        let sym = SYMS.len() as i64;
+        let sym = pcx.syms.len() as i64;
         // Symbols keep their own NUL-terminated copy, usable as a C string.
         let copy = alloc_zeroed(n + 1);
         memcpy(copy, bytes.ptr, n as u64);
-        SYMS.push(Sym { text: copy[0..n], hash });
-        SYM_TABLE[slot] = sym + 1;
-        if SYMS.len() as i64 > SYM_TABLES_CAP && SYM_TABLES.count > 0 {
-            grow_sym_tables();
+        pcx.syms.push(Sym { ptr: copy, len: n, hash });
+        pcx.sym_table[slot] = sym + 1;
+        if pcx.syms.len() as i64 > pcx.sym_tables_cap && pcx.sym_tables.count > 0 {
+            grow_sym_tables(&pcx);
         }
         sym
     }
@@ -612,50 +615,44 @@ pub fn intern(bytes: [u8]) -> i64 {
 // Appends a symbol the table does not hold yet, with its hash (the tools'
 // cache, 0.13: the symbols of a program in their order, so that each
 // gets its number back). `text` is NUL-terminated and stays.
-pub fn restore_sym(text: [u8], hash: u64) -> i64 {
-    if (SYMS.len() as i64 + 1) * 2 > SYM_TABLE_SIZE {
-        sym_table_rehash();
+pub fn restore_sym(text: [u8], hash: u64, pcx: inout Ctx<Comp>) -> i64 {
+    if (pcx.syms.len() as i64 + 1) * 2 > pcx.sym_table_size {
+        sym_table_rehash(&pcx);
     }
-    let sym = SYMS.len() as i64;
-    SYMS.push(Sym { text, hash });
-    sym_table_insert(sym);
+    let sym = pcx.syms.len() as i64;
+    pcx.syms.push(Sym { ptr: text.ptr, len: text.len as i64, hash });
+    sym_table_insert(sym, &pcx);
     sym
 }
 
 // The hash of symbol sym.
-pub fn sym_hash(sym: i64) -> u64 {
-    SYMS[sym].hash
+pub fn sym_hash(sym: i64, pcx: Ctx<Comp>) -> u64 {
+    pcx.syms[sym].hash
 }
-
-// Tables indexed by symbol (see sym_table): their addresses, and their
-// capacity, which grows with the symbols (names made after the tables,
-// such as the keys of module items and the names of generic instances).
-static var SYM_TABLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-static var SYM_TABLES_CAP: i64 = 0;
 
 // A zeroed table indexed by symbol, stored in `*slot` and kept as large
 // as the symbol table.
-pub fn sym_table(slot: **i64) {
-    if SYM_TABLES_CAP < SYMS.len() as i64 + 1 {
-        if SYM_TABLES.count > 0 {
-            grow_sym_tables();
+pub fn sym_table(slot: **i64, pcx: inout Ctx<Comp>) {
+    if pcx.sym_tables_cap < pcx.syms.len() as i64 + 1 {
+        if pcx.sym_tables.count > 0 {
+            grow_sym_tables(&pcx);
         } else {
-            SYM_TABLES_CAP = (SYMS.len() as i64 + 1) * 2;
+            pcx.sym_tables_cap = (pcx.syms.len() as i64 + 1) * 2;
         }
     }
-    unsafe { *slot = alloc_array::<i64>(SYM_TABLES_CAP); }
-    SYM_TABLES.push(slot as i64);
+    unsafe { *slot = alloc_array::<i64>(pcx.sym_tables_cap); }
+    pcx.sym_tables.push(slot as i64);
 }
 
-fn grow_sym_tables() {
+fn grow_sym_tables(pcx: inout Ctx<Comp>) {
     unsafe {
-        let old = SYM_TABLES_CAP;
+        let old = pcx.sym_tables_cap;
         var cap = old * 2;
-        while cap < SYMS.len() as i64 + 1 {
+        while cap < pcx.syms.len() as i64 + 1 {
             cap *= 2;
         }
-        for i in 0..SYM_TABLES.count {
-            let slot = SYM_TABLES.data[i] as **i64;
+        for i in 0..pcx.sym_tables.count {
+            let slot = pcx.sym_tables.data[i] as **i64;
             let table = alloc_array::<i64>(cap);
             memcpy(table as *u8, *slot as *u8, (old * 8) as u64);
             if stress_grow() {
@@ -665,22 +662,28 @@ fn grow_sym_tables() {
             }
             *slot = table;
         }
-        SYM_TABLES_CAP = cap;
+        pcx.sym_tables_cap = cap;
     }
 }
 
-pub fn intern_c(s: *u8) -> i64 {
-    unsafe { intern(s[0..strlen(s) as i64]) }
+pub fn intern_c(s: *u8, pcx: inout Ctx<Comp>) -> i64 {
+    unsafe { intern(s[0..strlen(s) as i64], &pcx) }
 }
 
 // The symbol's name as a C string.
-pub fn sym_name(sym: i64) -> *u8 {
-    SYMS[sym].text.ptr
+pub fn sym_name(sym: i64, pcx: Ctx<Comp>) -> *u8 {
+    sym_text(sym, pcx).ptr
 }
 
-// The symbol's name: `{sym_text(s)}` in an f-string.
-pub fn sym_text(sym: i64) -> [u8] {
-    SYMS[sym].text
+// The symbol's name: `{sym_text(s)}` in an f-string. (0.27.0) A symbol
+// keeps it as a raw pointer and a length, which views nothing, so that
+// the compilation context can hold the symbols; the slice is made here.
+pub fn sym_text(sym: i64, pcx: Ctx<Comp>) -> [u8] {
+    // UNSAFE: a Sym's text is a raw pointer and a length (a Sym holds no
+    // view), made into a slice here.
+    // SAFETY: intern and restore_sym keep ptr[0..len] (a NUL after it) for
+    // the life of the process: no symbol's text is freed or changed.
+    unsafe { pcx.syms[sym].ptr[0..pcx.syms[sym].len] }
 }
 
 // ---- Source files ----
@@ -1004,19 +1007,18 @@ extern "C" {
 
 // (0.21) The environment variables the compiler reads, VOLE_ + these
 // (tests/run.sh checks that every VOLE_ name in compiler/src is here).
-const ENV_NAMES: [*u8; 25] = [
+const ENV_NAMES: [*u8; 26] = [
     c"CACHE", c"CACHE_CHECK", c"CACHE_LIMIT", c"CACHE_STATS", c"CACHE_SYNC", c"CACHE_TRACE",
-    c"CACHE_WHY", c"CC", c"CODE_CACHE", c"COUNTERS", c"FRESH_CONTEXTS", c"LINKER", c"LINK_CACHE",
-    c"LOWER", c"LSP_TIME", c"OK", c"OVF_CENSUS", c"OWN_STD",
-    c"PHASE_TIMES", c"PLANT_MISCOMPILE", c"QUERY_FULL",
-    c"QUERY_STD", c"ROOT", c"STRESS_GROW", c"SYNTAX"];
+    c"CACHE_WHY", c"CC", c"CODE_CACHE", c"COUNTERS", c"EDITION", c"FRESH_CONTEXTS", c"LINKER",
+    c"LINK_CACHE", c"LOWER", c"LSP_TIME", c"OK", c"OVF_CENSUS", c"OWN_STD", c"PHASE_TIMES",
+    c"PLANT_MISCOMPILE", c"QUERY_FULL", c"QUERY_STD", c"ROOT", c"STRESS_GROW", c"SYNTAX"];
 
 // (0.21, for 0.24's name) At start (main): each VOLE_X in the environment
 // is copied to VOLE_X, so that it is read as that one, and wins over it;
 // the children inherit both.
 pub fn env_aliases() {
     unsafe {
-        for k in 0..25 {
+        for k in 0..26 {
             let n = ENV_NAMES[k];
             let vole = buf_new();
             buf_str(vole, c"VOLE_");

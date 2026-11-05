@@ -1,0 +1,427 @@
+// EDITION: rust
+// std::fmt: Display, Debug, Formatter<'a>, fmt::Write, and the print
+// functions. Rust's shape (`fn fmt(&self, f: &mut Formatter<'_>) ->
+// fmt::Result`), with two differences that come from having no `dyn`
+// (plan §3): a Formatter is one concrete type over an erased sink (a data
+// pointer and a write function, as AnyAlloc erases an allocator), not a
+// `&mut dyn Write`, so a Debug impl is compiled once, not once per sink;
+// and the builders' `field` and `entry` are generic over the value's type
+// instead of taking a `&dyn Debug`. There are no macros: a format literal
+// at a `T: Display` parameter (`println("{x} {y:>5}")`, `format_in("{n}",
+// a)`) is checked by the compiler and made a value that displays it
+// (`edition.later: format_fns`); `write(w, "..")` and `writeln` are the
+// compiler's for `w.write_fmt("..")`, fmt::Write's or io::Write's.
+
+use crate::alloc::Allocator;
+use crate::iter::IntoIterator;
+use crate::marker::PhantomData;
+use crate::option::Option;
+use crate::string::String;
+
+// What fmt returns: Err when the sink failed (a closed pipe), not when
+// the value cannot be shown.
+pub type Result = crate::result::Result<(), Error>;
+
+// A sink's failure. It carries nothing: the sink knows why.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct Error;
+
+// How a value shows to a user: `{x}`.
+// std2: changed: fmt(&self, &mut Formatter) -> Result (MVS: fmt(self, inout Fmt))
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64, bool)]
+pub trait Display {
+    // std2: changed: takes &self and a Formatter, returns a Result
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// How a value shows to a programmer: `{x:?}`, `{x:#?}` (pretty).
+// std2: changed: fmt(&self, &mut Formatter) -> Result (MVS: fmt_debug(self, inout Fmt))
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64, bool)]
+pub trait Debug {
+    // mvs: Debug::fmt_debug
+    // std2: renamed
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:x}`: lower-case hexadecimal (integers' impls built in, as each of
+// these traits'; bodies in 0.27.2).
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait LowerHex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:X}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait UpperHex {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:o}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait Octal {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:b}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize)]
+pub trait Binary {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:e}`: floats in scientific notation.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64)]
+pub trait LowerExp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{x:E}`.
+#[builtin_impls(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64)]
+pub trait UpperExp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// `{p:p}`: a pointer's address.
+pub trait Pointer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+}
+
+// A sink of text: what `write(w, "..")` writes into when w is a String
+// (or any type that implements it). Never fails for a String.
+pub trait Write {
+    fn write_str(&mut self, s: &str) -> Result;
+
+    fn write_char(&mut self, c: char) -> Result {
+        self.write_str(c.encode_utf8(&mut [0u8; 4]))
+    }
+
+    // x written as its Display shows it (a format literal: the compiler's
+    // `write(w, "..")`).
+    fn write_fmt<T: Display>(&mut self, x: T) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// A reference displays and debugs as what it refers to.
+impl<T: Display + ?Sized> Display for &T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Display::fmt(&**self, f)
+    }
+}
+
+impl<T: Debug + ?Sized> Debug for &T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: Display + ?Sized> Display for &mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Display::fmt(&**self, f)
+    }
+}
+
+impl<T: Debug + ?Sized> Debug for &mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Debug::fmt(&**self, f)
+    }
+}
+
+impl Debug for () {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.pad("()")
+    }
+}
+
+// Where a padded value sits in its width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Alignment {
+    Left,
+    Right,
+    Center,
+}
+
+// What a value is written into, with its hole's spec ({:>8.3}): the sink
+// erased (no dyn), the width, precision, fill, alignment and flags.
+// Its fill is a char (`edition.later: char`).
+// mvs: Fmt
+// std2: renamed
+// later: char
+pub struct Formatter<'a> {
+    out: *mut u8,
+    write: fn(*mut u8, &str) -> Result,
+    width: Option<usize>,
+    precision: Option<usize>,
+    fill: char,
+    align: Option<Alignment>,
+    flags: u32,
+    marker: PhantomData<&'a mut ()>,
+}
+
+impl<'a> Formatter<'a> {
+    // A Formatter over any fmt::Write, with an empty spec (what
+    // `write(w, ..)` makes).
+    pub fn new<W: Write>(w: &'a mut W) -> Formatter<'a> {
+        crate::panic::todo()
+    }
+
+    // s, as it is (no padding).
+    // mvs: Fmt::str
+    // std2: renamed
+    pub fn write_str(&mut self, s: &str) -> Result {
+        (self.write)(self.out, s)
+    }
+
+    // mvs: Fmt::byte
+    // std2: renamed
+    pub fn write_char(&mut self, c: char) -> Result {
+        self.write_str(c.encode_utf8(&mut [0u8; 4]))
+    }
+
+    // x as its Display shows it (a format literal inside a Display impl:
+    // `write(f, "({x}, {y})")`).
+    // mvs: Fmt::write, Fmt::display, Fmt::debug
+    // std2: renamed
+    pub fn write_fmt<T: Display>(&mut self, x: T) -> Result {
+        x.fmt(self)
+    }
+
+    // s padded to the width with the fill, as the alignment says (Left by
+    // default), and cut to the precision: what str's Display does.
+    pub fn pad(&mut self, s: &str) -> Result {
+        crate::panic::todo()
+    }
+
+    // An integer's digits, padded: the sign, `#`'s prefix, `0`'s zeros.
+    pub fn pad_integral(&mut self, is_nonnegative: bool, prefix: &str, digits: &str) -> Result {
+        crate::panic::todo()
+    }
+
+    // The hole's width ({:8}), its precision ({:.3}), its fill ({:*^8}),
+    // its alignment, its flags.
+    pub fn width(&self) -> Option<usize> {
+        self.width
+    }
+
+    pub fn precision(&self) -> Option<usize> {
+        self.precision
+    }
+
+    pub fn fill(&self) -> char {
+        self.fill
+    }
+
+    pub fn align(&self) -> Option<Alignment> {
+        self.align
+    }
+
+    // `#`: Debug's pretty form, `0x` for hex.
+    pub fn alternate(&self) -> bool {
+        self.flags & 4 != 0
+    }
+
+    // `+`.
+    pub fn sign_plus(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    // `-`.
+    pub fn sign_minus(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    // `0`.
+    pub fn sign_aware_zero_pad(&self) -> bool {
+        self.flags & 8 != 0
+    }
+
+    // `Name { a: 1, b: 2 }`, field by field.
+    pub fn debug_struct<'b>(&'b mut self, name: &str) -> DebugStruct<'b, 'a> {
+        crate::panic::todo()
+    }
+
+    // `Name(1, 2)`.
+    pub fn debug_tuple<'b>(&'b mut self, name: &str) -> DebugTuple<'b, 'a> {
+        crate::panic::todo()
+    }
+
+    // `[1, 2]`.
+    // mvs: debug_list, Fmt::debug_slice
+    // std2: changed: a builder (MVS: debug_list(f, s) of a slice)
+    pub fn debug_list<'b>(&'b mut self) -> DebugList<'b, 'a> {
+        crate::panic::todo()
+    }
+
+    // `{1, 2}`.
+    pub fn debug_set<'b>(&'b mut self) -> DebugSet<'b, 'a> {
+        crate::panic::todo()
+    }
+
+    // `{k: v, ...}`.
+    pub fn debug_map<'b>(&'b mut self) -> DebugMap<'b, 'a> {
+        crate::panic::todo()
+    }
+}
+
+// Formatter::debug_struct's builder.
+pub struct DebugStruct<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_fields: bool,
+}
+
+impl<'a, 'b> DebugStruct<'a, 'b> {
+    pub fn field<T: Debug + ?Sized>(&mut self, name: &str, value: &T) -> &mut DebugStruct<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    // `Name { a: 1, .. }`.
+    pub fn finish_non_exhaustive(&mut self) -> Result {
+        crate::panic::todo()
+    }
+
+    pub fn finish(&mut self) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// Formatter::debug_tuple's builder.
+pub struct DebugTuple<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    fields: usize,
+}
+
+impl<'a, 'b> DebugTuple<'a, 'b> {
+    pub fn field<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugTuple<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn finish(&mut self) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// Formatter::debug_list's builder.
+pub struct DebugList<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
+}
+
+impl<'a, 'b> DebugList<'a, 'b> {
+    pub fn entry<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugList<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn entries<D: Debug, I: IntoIterator<Item = D>>(&mut self, entries: I) -> &mut DebugList<'a,
+        'b> {
+        for e in entries {
+            self.entry(&e);
+        }
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// Formatter::debug_set's builder.
+pub struct DebugSet<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
+}
+
+impl<'a, 'b> DebugSet<'a, 'b> {
+    pub fn entry<T: Debug + ?Sized>(&mut self, value: &T) -> &mut DebugSet<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn entries<D: Debug, I: IntoIterator<Item = D>>(&mut self, entries: I) -> &mut DebugSet<'a,
+        'b> {
+        for e in entries {
+            self.entry(&e);
+        }
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// Formatter::debug_map's builder.
+pub struct DebugMap<'a, 'b> {
+    fmt: &'a mut Formatter<'b>,
+    result: Result,
+    has_entries: bool,
+}
+
+impl<'a, 'b> DebugMap<'a, 'b> {
+    pub fn entry<K: Debug + ?Sized,
+        V: Debug + ?Sized>(&mut self, key: &K, value: &V) -> &mut DebugMap<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn key<K: Debug + ?Sized>(&mut self, key: &K) -> &mut DebugMap<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn value<V: Debug + ?Sized>(&mut self, value: &V) -> &mut DebugMap<'a, 'b> {
+        crate::panic::todo()
+    }
+
+    pub fn entries<K: Debug, V: Debug,
+        I: IntoIterator<Item = (K, V)>>(&mut self, entries: I) -> &mut DebugMap<'a, 'b> {
+        for (k, v) in entries {
+            self.entry(&k, &v);
+        }
+        self
+    }
+
+    pub fn finish(&mut self) -> Result {
+        crate::panic::todo()
+    }
+}
+
+// ---- The print functions (Rust's macros) ----
+
+// x on stdout (`print("{x}")`); stdout is line-buffered when a terminal.
+// later: format_fns
+pub fn print<T: Display>(x: T) {
+    crate::panic::todo()
+}
+
+// x and a newline on stdout.
+// later: format_fns
+pub fn println<T: Display>(x: T) {
+    crate::panic::todo()
+}
+
+// x on stderr.
+// later: format_fns
+pub fn eprint<T: Display>(x: T) {
+    crate::panic::todo()
+}
+
+// later: format_fns
+pub fn eprintln<T: Display>(x: T) {
+    crate::panic::todo()
+}
+
+// x as a String on a (Rust's `format!`, allocator last: plan §2).
+// std2: changed: takes x by value and the allocator
+// later: format_fns
+pub fn format_in<T: Display, A: Allocator>(x: T, a: A) -> String<A> {
+    let mut s = String::new_in(a);
+    let _ = s.write_fmt(x);
+    s
+}
+
+// A format literal as a value (`format_args("{a}-{b}").to_string_in(gpa)`):
+// the literal's Display value, passed through.
+// later: format_fns
+pub fn format_args<T: Display>(x: T) -> T {
+    x
+}
