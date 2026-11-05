@@ -151,7 +151,8 @@ The rust edition's front (ed270):
   `?Sized`; a trait's defaulted parameter left out of an impl header
   (`impl PartialEq for P`); `union` a name but before a name; `&f(x)` of
   a value a temporary of its statement, as Rust's (of the block for `let
-  r = &f(x);`): a second one in a statement no longer an error.
+  r = &f(x);`): a second one in a statement no longer an error; a trait's
+  `&Self` in an impl for str or a slice is the view (`other: &str`).
 - The edition runs on MVS's std in 0.27.0, and two places differ from
   Rust's std, each its own error: `edition.std_copy` (`*x` of a getter's
   copy) and `edition.std_by_value` (`&x` where std takes the value).
@@ -161,7 +162,7 @@ The rust edition's front (ed270):
   blanket impls and impls on an instance, `#[array_builtin(N)]`, `let
   x;`, a write through `*const T`, qualified paths `<T as Tr>::X`, auto
   traits `Send` and `Sync`, `#[builtin_impls(..)]`, ...); the item it is
-  in is left out. std2 checked (`--max-errors=0`): 254 edition.later, 126
+  in is left out. std2 checked (`--max-errors=0`): 254 edition.later, 98
   plain errors left, of which 61 are two traits' methods of one name on a
   type (`fmt` of Display and Debug: method_name_clash, 0.27.2).
 - Fixed for MVS too: a method's `where` on its impl's parameter bounded
