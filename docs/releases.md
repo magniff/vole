@@ -112,9 +112,34 @@ The front (front272):
   bool { !self.eq(o) }`, copied into each impl with the trait's
   arguments substituted; two traits' methods of one name on one type
   (F9.1); `Tr::m(x, args)` as the method call `x.m(args)` (F8.2).
+- Coherence (F4.2, F9.3, F14.1): two impls of one trait whose headers
+  unify and whose bounds can both hold are `error trait.overlap`; a
+  method call that two traits' methods answer, with no inherent one,
+  is `error method.ambiguous` with a `Tr::m(&x)` per trait; an impl
+  parameter nothing fixes is `error trait.unconstrained`; a generic
+  impl's supertraits and associated types' bounds are checked with its
+  parameters as declared.
+- Types (F1, F3, F5, F7): `char`, a Unicode scalar (`'é' as u32`, `u8
+  as char`, `impl char { const MAX }`; other casts are `error
+  type.cast`); tuple structs `struct P(i64, i64)` with `p.0` and the
+  constructor `P(1, 2)`; unit structs `struct U;` as values;
+  `Self(..)` and `Self` in an impl; several inherent impls of one type
+  (`error impl.duplicate` on a clash).
+- Patterns (F27): `let S { a, b: q, ref c, .. } = s;`, `S(x, y)`,
+  `Self { .. }` and a unit struct's name, in `let` and `match`, checked
+  for exhaustiveness field by field; a struct pattern on a place moves
+  only what it binds.
+- The primitives' impls (F15): `#[builtin_impls(i64, ..)]` on a std2
+  trait makes its impls for the listed primitives.
+- Smaller (F6.2, F8, F18, F19, F21, F23, F26): `<T as Tr>::A` in type
+  position; the probe's `&` and `&mut` steps (`s.tag()` finding `impl
+  Tag for &S`); a generic call's parameter bound from the expected type,
+  else `error type.infer`; `_` in a turbofish; `use a::{self}`; `unsafe
+  fn` types; `size_of::<T>()`; `b'x'` byte literals; `!x` bitwise on an
+  integer; `[T]` and `str` by value are `error type.unsized`.
 - Corpus: `tests/run/rust_f_*`, one case per rule, positive and
-  negative. std2's root check: edition.later 254 -> 123 on the tree's
-  std2.
+  negative. std2's root check: edition.later 254 -> 123 after the traits,
+  -> 7 after the types (5 of them `auto_trait`).
 
 Closures in full (clos272):
 

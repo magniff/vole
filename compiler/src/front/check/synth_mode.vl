@@ -24,7 +24,9 @@ use crate::front::ast::NodeKind::{
     PatLit, Path, Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
-use crate::front::check::{Res, is_std_named, lookup_local, type_error, type_error_got};
+use crate::front::check::{
+    Res, has_error_type, is_std_named, lookup_local, type_error, type_error_got,
+};
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
@@ -96,7 +98,9 @@ fn synth_expr_inner(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             }
             if pcx.nodes[n].kind == Int { TY_I64 } else { TY_F64 }
         }
-        Char => TY_U8,
+        // RULE: F1.2 (0.27.2: a rust-edition character literal is a `char`,
+        // b == 1; a byte literal, 2, and MVS's are u8)
+        Char => if pcx.nodes[n].b == 1 && pcx.char_type != 0 { pcx.char_type } else { TY_U8 },
         Bool => TY_BOOL,
         Unit => TY_UNIT,
         Str => pcx.ty_string,
@@ -228,6 +232,26 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         && is_pointer(raw_to, pcx)
         && pcx.types[raw_to].b == 0 {
         pcx.raw_addrs.push(operand);
+    }
+    // RULE: F1.3 (the rust edition's `char`: only `u8 as char`; a char
+    // casts to the integers)
+    if pcx.char_type != 0 && from_ty != to_ty
+        && (to_ty == pcx.char_type && from_ty != TY_U8 && !has_error_type(from_ty, pcx)
+            || from_ty == pcx.char_type && !is_integer(to_ty)) {
+        let saved_kind = pcx.err_kind;
+        pcx.err_kind = c"type.cast";
+        err_begin(pcx.nodes[operand].start, &pcx);
+        err_str(c"cannot cast '", pcx);
+        err_type(from_ty, pcx);
+        err_str(c"' to '", pcx);
+        err_type(to_ty, pcx);
+        err_str(c"'", pcx);
+        if to_ty == pcx.char_type {
+            err_help(c"only a u8 casts to char: a u32 is checked, `char::from_u32(x)`, as not every u32 is a char", pcx);
+        }
+        err_end_soft(&pcx);
+        pcx.err_kind = saved_kind;
+        return to_ty;
     }
     // (0.18: a distinct type converts as its underlying type does, and
     // to and from that type for free: the cast is its operand)
@@ -689,6 +713,20 @@ pub fn help_near_field(s: i64, name: i64, pcx: inout Ctx<Comp>) {
 fn synth_tuple_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     var base_ty = synth_expr(pcx.nodes[n].a, &pcx);
     let index = pcx.nodes[n].b;
+    // RULE: F7.1 (the rust edition: `s.0` of a tuple struct, or through a
+    // reference to one, is its field `0`)
+    var inner = base_ty;
+    while pcx.types[inner].kind == TyKind::Ptr {
+        inner = pcx.types[inner].a;
+    }
+    if pcx.types[inner].kind == TyKind::Struct && crate::front::check::rust::rust_node(n, &pcx) {
+        pcx.nodes[pcx.nodes[n].a].p |= NODE_CHECKED;
+        let name = buf_new();
+        buf_fmt(name, format_args("{index}"));
+        pcx.nodes[n].kind = NodeKind::FieldAccess;
+        pcx.nodes[n].b = intern(buf_slice(name), &pcx);
+        return synth_field(n, &pcx);
+    }
     if pcx.types[base_ty].kind == TyKind::Ptr
         && pcx.types[pcx.types[base_ty].a].kind == TyKind::Tuple {
         // (0.17) through a pointer to a tuple, as a field through a
@@ -862,6 +900,11 @@ fn synth_binary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     }
     // (0.18: two values of a distinct type: its underlying type's
     // operator)
+    // RULE: F1.4 (a `char` compares; it has no arithmetic)
+    if ty == pcx.char_type && pcx.char_type != 0 && !(op == Tok::EqEq || op == Tok::BangEq
+        || op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq) {
+        type_error_got(n, c"a char has no arithmetic (cast it, `c as u32`)", ty, &pcx);
+    }
     if is_distinct_type(ty, pcx) {
         return distinct_binary(n, op, ty, &pcx);
     }
@@ -1060,6 +1103,26 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             type_error_got(n, c"unary '-' requires numeric type", ty, &pcx);
         }
         return ty;
+    }
+    if op == Tok::Bang && crate::front::check::rust::rust_node(n, &pcx) {
+        // (0.27.2) `!a`: logical on a bool, bitwise on an integer, else
+        // Not::not (MVS's `~` is not the rust edition's). RULE: F26.1
+        let ty = synth_expr(operand, &pcx);
+        if ty == TY_BOOL || ty == pcx.ty_error {
+            return TY_BOOL;
+        }
+        if is_integer(strip_distinct(ty, pcx)) && ty != pcx.char_type {
+            pcx.nodes[n].op = Tok::Tilde;
+            return ty;
+        }
+        let not = std_trait(c"Not", &pcx);
+        if not >= 0 && has_impl(not, ty, &pcx) {
+            return crate::front::traits::unary_call(n, ty, c"not", &pcx);
+        }
+        type_error_got(n,
+            c"cannot apply unary operator '!': it needs a bool, an integer or an impl of Not", ty,
+            &pcx);
+        return TY_BOOL;
     }
     if op == Tok::Bang {
         check_expr(operand, TY_BOOL, &pcx);
@@ -1373,6 +1436,12 @@ fn reached_through_raw(e: i64, pcx: Ctx<Comp>) -> bool {
 // static may have their names (0.5; in 0.4 a function of the same name
 // replaced them).
 pub fn fold_layout_query(n: i64, pcx: inout Ctx<Comp>) {
+    // RULE: F19.4 (the rust edition: `size_of::<T>()`, `align_of::<T>()`,
+    // also `mem::size_of::<T>()`: the constant, per instance)
+    if pcx.nodes[n].kind == Call && pcx.nodes[n].count == 0 && pcx.edition != 0 {
+        rust_layout_query(n, &pcx);
+        return;
+    }
     if pcx.nodes[n].kind != Call || pcx.nodes[n].count != 1 {
         return;
     }
@@ -1389,6 +1458,38 @@ pub fn fold_layout_query(n: i64, pcx: inout Ctx<Comp>) {
         return;
     }
     let t = resolve_type(expr_as_type(child(n, 0, pcx), &pcx), &pcx);
+    let value = if is_size { type_size(t, pcx) } else { type_align(t, pcx) };
+    pcx.nodes[n].kind = Int;
+    pcx.nodes[n].a = value;
+    pcx.nodes[n].b = SUF_NONE;
+    pcx.nodes[n].count = 0;
+}
+
+// (0.27.2) `size_of::<T>()` of the rust edition (call n, no arguments):
+// the callee `size_of` or `align_of`, or a path ending in one, with one
+// type argument; n becomes the constant, typed like an integer literal.
+// RULE: F19.4
+fn rust_layout_query(n: i64, pcx: inout Ctx<Comp>) {
+    let callee = pcx.nodes[n].a;
+    let kind = pcx.nodes[callee].kind;
+    var name = 0;
+    var targs = 0;
+    if kind == Ident && (pcx.nodes[callee].p & NODE_RESOLVED) == 0 {
+        name = pcx.nodes[callee].a;
+        targs = pcx.nodes[callee].g;
+    } else if kind == Path {
+        name = pcx.nodes[callee].b;
+        targs = pcx.nodes[callee].h;
+    }
+    let is_size = name == intern_c(c"size_of", &pcx);
+    if !is_size && name != intern_c(c"align_of", &pcx) || targs == 0
+        || pcx.nodes[targs].count != 1 || !crate::front::check::rust::rust_node(n, &pcx) {
+        return;
+    }
+    if kind == Ident && lookup_local(name, pcx).is_some() {
+        return;
+    }
+    let t = resolve_type(child(targs, 0, pcx), &pcx);
     let value = if is_size { type_size(t, pcx) } else { type_align(t, pcx) };
     pcx.nodes[n].kind = Int;
     pcx.nodes[n].a = value;

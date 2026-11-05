@@ -1,0 +1,472 @@
+// (0.27.2) `#[builtin_impls(P, ..)]` on a trait of the rust edition
+// (std2's): the impls of the trait for the primitives listed, made by the
+// compiler as if written (docs/design/front-rust.md F15.1). Each is
+// rust-edition text in the trait's shape, its body the machine operation
+// (`self + rhs`, `*self == *other`, a copy, a zero, the digits of a
+// number into the Formatter), parsed as one source `<builtin>` and given
+// the attribute's span: the impls are the trait's module's, read in the
+// rust edition, and an error in them points at the attribute. They are
+// keyed and overlap-checked as written ones (F4.2). A body the compiler
+// cannot write yet (a float's digits, a float's or a bool's FromStr) is
+// std2's placeholder `crate::panic::todo()`, which F16.3 replaces.
+// Parsed after the modules are loaded, before collect_names, as the
+// derives' (front/derive).
+
+use crate::base::{
+    BUFS, SRC, _setjmp, add_source, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, sym_text,
+};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, recover_enter, recover_leave};
+use crate::front::ast::{FN_DERIVED, NodeKind, child, list_begin, list_end, list_push};
+use crate::front::lexer::lex_range;
+use crate::front::parser::parse_items_fragment;
+
+// Text `t` into out with "`1".."`4" replaced by a1..a4.
+fn emit(out: i64, t: [u8], a1: [u8], a2: [u8], a3: [u8], a4: [u8]) {
+    var i = 0;
+    while i < t.len() as i64 {
+        let c = t[i];
+        if c == '`' && i + 1 < t.len() as i64 {
+            let k = t[i + 1];
+            if k == '1' {
+                buf_bytes(out, a1);
+            } else if k == '2' {
+                buf_bytes(out, a2);
+            } else if k == '3' {
+                buf_bytes(out, a3);
+            } else {
+                buf_bytes(out, a4);
+            }
+            i += 2;
+            continue;
+        }
+        buf_byte(out, c);
+        i += 1;
+    }
+}
+
+// The primitive's class: 1 a signed integer, 2 an unsigned one, 3 a
+// float, 4 bool, 0 another name.
+fn prim_class(p: [u8]) -> i64 {
+    if p == "i8" || p == "i16" || p == "i32" || p == "i64" || p == "isize" {
+        return 1;
+    }
+    if p == "u8" || p == "u16" || p == "u32" || p == "u64" || p == "usize" {
+        return 2;
+    }
+    if p == "f32" || p == "f64" {
+        return 3;
+    }
+    if p == "bool" { 4 } else { 0 }
+}
+
+// An integer's width in bits.
+fn prim_bits(p: [u8]) -> i64 {
+    if p == "i8" || p == "u8" {
+        8
+    } else if p == "i16" || p == "u16" {
+        16
+    } else if p == "i32" || p == "u32" {
+        32
+    } else {
+        64
+    }
+}
+
+// The unsigned integer of a signed one's width.
+fn unsigned_twin(p: [u8]) -> [u8] {
+    if p == "i8" {
+        "u8"
+    } else if p == "i16" {
+        "u16"
+    } else if p == "i32" {
+        "u32"
+    } else if p == "i64" {
+        "u64"
+    } else if p == "isize" {
+        "usize"
+    } else {
+        p
+    }
+}
+
+// 2^bits - 1 as a u64 expression (no step overflows).
+fn ones_text(out: i64, bits: i64) {
+    if bits >= 64 {
+        buf_bytes(out, "((1u64 << 63) + ((1u64 << 63) - 1))");
+    } else {
+        buf_fmt(out, format_args("((1u64 << {bits}) - 1)"));
+    }
+}
+
+const BIN_OPS: [[u8]; 10] = ["Add", "Sub", "Mul", "Div", "Rem", "BitAnd", "BitOr", "BitXor", "Shl",
+    "Shr"];
+const BIN_METHODS: [[u8]; 10] = ["add", "sub", "mul", "div", "rem", "bitand", "bitor", "bitxor",
+    "shl", "shr"];
+const BIN_SIGNS: [[u8]; 10] = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"];
+const BOOL_SIGNS: [[u8]; 10] = ["+", "-", "*", "/", "%", "&&", "||", "!=", "<<", ">>"];
+
+// The index of an operator trait (`Add`, or `AddAssign` when assign), or -1.
+fn op_index(name: [u8], assign: bool) -> i64 {
+    for i in 0..10 {
+        let op = BIN_OPS[i];
+        if !assign && name == op {
+            return i;
+        }
+        if assign && name.len() == op.len() + 6 && name[0..op.len()] == op
+            && name[op.len()..name.len()] == "Assign" {
+            return i;
+        }
+    }
+    -1
+}
+
+// The impl of trait `t` for primitive `p` into out; false when the
+// compiler has no builtin impl of the trait.
+fn write_impl(out: i64, t: [u8], p: [u8]) -> bool {
+    let class = prim_class(p);
+    let zero = if class == 3 { "0.0" } else if class == 4 { "false" } else { "0" };
+    let one = if class == 3 { "1.0" } else { "1" };
+    let a = if class == 4 { "(*self as u8)" } else { "*self" };
+    let b = if class == 4 { "(*other as u8)" } else { "*other" };
+    if t == "Copy" || t == "Eq" {
+        emit(out, "impl `1 for `2 {}\n", t, p, "", "");
+        return true;
+    }
+    if t == "Clone" {
+        emit(out, "impl Clone for `1 {\n    fn clone(&self) -> `1 {\n        *self\n    }\n}\n", p,
+            "", "", "");
+        return true;
+    }
+    if t == "Default" {
+        emit(out, "impl Default for `1 {\n    fn default() -> `1 {\n        `2\n    }\n}\n", p,
+            zero, "", "");
+        return true;
+    }
+    if t == "PartialEq" {
+        emit(out, "impl PartialEq for `1 {\n    fn eq(&self, other: &`1) -> bool {\n        \
+            *self == *other\n    }\n}\n", p, "", "", "");
+        return true;
+    }
+    if t == "PartialOrd" || t == "Ord" {
+        let o = "crate::cmp::Ordering";
+        if t == "Ord" {
+            emit(out, "impl Ord for `1 {\n    fn cmp(&self, other: &`1) -> `4 {\n        \
+                if `2 < `3 { `4::Less } else if `2 > `3 { `4::Greater } else { `4::Equal }\n    \
+                }\n}\n", p, a, b, o);
+            return true;
+        }
+        emit(out, "impl PartialOrd for `1 {\n    fn partial_cmp(&self, other: &`1) -> \
+            crate::option::Option<`4> {\n        if `2 < `3 {\n            \
+            crate::option::Option::Some(`4::Less)\n        } else if `2 > `3 {\n            \
+            crate::option::Option::Some(`4::Greater)\n        } else if `2 == `3 {\n            \
+            crate::option::Option::Some(`4::Equal)\n        } else {\n            \
+            crate::option::Option::None\n        }\n    }\n}\n", p, a, b, o);
+        return true;
+    }
+    if t == "Hash" {
+        let w = if class == 4 { "u8" } else { p };
+        emit(out, "impl Hash for `1 {\n    fn hash<H: crate::hash::Hasher>(&self, state: &mut H) \
+            {\n        state.write_`2(`3);\n    }\n}\n", p, w,
+            if class == 4 { "*self as u8" } else { "*self" }, "");
+        return true;
+    }
+    let bin = op_index(t, false);
+    if bin >= 0 {
+        let sign = if class == 4 { BOOL_SIGNS[bin] } else { BIN_SIGNS[bin] };
+        emit(out, "impl `1 for `2 {\n    type Output = `2;\n    fn `3(self, rhs: `2) -> `2 {\n        \
+            self ", t, p, BIN_METHODS[bin], "");
+        emit(out, "`1 rhs\n    }\n}\n", sign, "", "", "");
+        return true;
+    }
+    let asg = op_index(t, true);
+    if asg >= 0 {
+        let sign = if class == 4 { BOOL_SIGNS[asg] } else { BIN_SIGNS[asg] };
+        emit(out,
+            "impl `1 for `2 {\n    fn `3_assign(&mut self, rhs: `2) {\n        *self = *self ", t,
+            p, BIN_METHODS[asg], "");
+        emit(out, "`1 rhs;\n    }\n}\n", sign, "", "", "");
+        return true;
+    }
+    if t == "Neg" {
+        emit(out, "impl Neg for `1 {\n    type Output = `1;\n    fn neg(self) -> `1 {\n        \
+            -self\n    }\n}\n", p, "", "", "");
+        return true;
+    }
+    if t == "Not" {
+        // (`!` on an integer is not bitwise in vole: a xor with all ones)
+        let body = if class == 4 { "!self" } else { "self ^ (-1i64 as `1)" };
+        emit(out, "impl Not for `1 {\n    type Output = `1;\n    fn not(self) -> `1 {\n        ", p,
+            "", "", "");
+        emit(out, body, p, "", "", "");
+        buf_bytes(out, "\n    }\n}\n");
+        return true;
+    }
+    if t == "Sum" || t == "Product" {
+        let m = if t == "Sum" { "sum" } else { "product" };
+        emit(out, "impl `1 for `2 {\n    fn `3<I: crate::iter::Iterator<Item = `2>>(iter: I) -> `2 \
+            {\n        let mut it = iter;\n        let mut acc: `2 = ", t, p, m, "");
+        emit(out, "`1;\n        while let crate::option::Option::Some(x) = it.next() {\n            \
+            acc = acc `2 x;\n        }\n        acc\n    }\n}\n",
+            if t == "Sum" { zero } else { one }, if t == "Sum" { "+" } else { "*" }, "", "");
+        return true;
+    }
+    if t == "Step" {
+        write_step(out, p);
+        return true;
+    }
+    if t == "FromStr" {
+        write_from_str(out, p);
+        return true;
+    }
+    if t == "Display" || t == "Debug" || t == "LowerHex" || t == "UpperHex" || t == "Octal"
+        || t == "Binary" || t == "LowerExp" || t == "UpperExp" {
+        write_fmt(out, t, p);
+        return true;
+    }
+    false
+}
+
+// A u64 that orders as the integer x of type p does: the integer itself
+// for an unsigned one, its bits with the sign flipped for a signed one.
+fn key_text(out: i64, x: [u8], p: [u8]) {
+    if prim_class(p) == 1 {
+        emit(out, "((`1 as i64 as u64) ^ (1u64 << 63))", x, "", "", "");
+    } else {
+        emit(out, "(`1 as u64)", x, "", "", "");
+    }
+}
+
+fn write_step(out: i64, p: [u8]) {
+    let signed = prim_class(p) == 1;
+    let bits = prim_bits(p);
+    emit(out, "impl Step for `1 {\n    fn steps_between(start: &`1, end: &`1) -> (usize, \
+        crate::option::Option<usize>) {\n        if *start <= *end {\n            let d = (", p,
+        "", "", "");
+    key_text(out, "*end", p);
+    buf_bytes(out, " - ");
+    key_text(out, "*start", p);
+    emit(out, ") as usize;\n            (d, crate::option::Option::Some(d))\n        } else {\n            \
+        (0, crate::option::Option::None)\n        }\n    }\n    fn forward_checked(start: `1, \
+        count: usize) -> crate::option::Option<`1> {\n        let k = ", p, "", "", "");
+    key_text(out, "start", p);
+    buf_bytes(out, ";\n        let max: u64 = ");
+    if signed {
+        buf_fmt(out, format_args("((1u64 << 63) + ((1u64 << {}) - 1))", bits - 1));
+    } else {
+        ones_text(out, bits);
+    }
+    buf_bytes(out, ";\n        if count as u64 > max - k {\n            crate::option::Option::None\n        \
+        } else {\n            crate::option::Option::Some(");
+    unkey_text(out, "k + count as u64", p);
+    emit(out, ")\n        }\n    }\n    fn backward_checked(start: `1, count: usize) -> \
+        crate::option::Option<`1> {\n        let k = ", p, "", "", "");
+    key_text(out, "start", p);
+    buf_bytes(out, ";\n        let min: u64 = ");
+    if signed {
+        buf_fmt(out, format_args("((1u64 << 63) - (1u64 << {}))", bits - 1));
+    } else {
+        buf_bytes(out, "0");
+    }
+    buf_bytes(out, ";\n        if count as u64 > k - min {\n            crate::option::Option::None\n        \
+        } else {\n            crate::option::Option::Some(");
+    unkey_text(out, "k - count as u64", p);
+    buf_bytes(out, ")\n        }\n    }\n}\n");
+}
+
+// The integer of type p whose key (key_text) is the u64 expression k.
+fn unkey_text(out: i64, k: [u8], p: [u8]) {
+    if prim_class(p) == 1 {
+        emit(out, "(((`1) ^ (1u64 << 63)) as i64 as `2)", k, p, "", "");
+    } else {
+        emit(out, "((`1) as `2)", k, p, "", "");
+    }
+}
+
+fn write_from_str(out: i64, p: [u8]) {
+    let class = prim_class(p);
+    if class == 3 || class == 4 {
+        let err = if class == 3 { "crate::str::ParseFloatError" }
+            else { "crate::str::ParseBoolError" };
+        emit(out, "impl FromStr for `1 {\n    type Err = `2;\n    fn from_str(s: &str) -> \
+            crate::result::Result<`1, `2> {\n        crate::panic::todo()\n    }\n}\n", p, err, "",
+            "");
+        return;
+    }
+    let bits = prim_bits(p);
+    emit(out, "impl FromStr for `1 {\n    type Err = crate::str::ParseIntError;\n    fn from_str(s: \
+        &str) -> crate::result::Result<`1, crate::str::ParseIntError> {\n        let b = \
+        s.as_bytes();\n        let n = b.len();\n        if n == 0 {\n            return \
+        crate::result::Result::Err(crate::str::ParseIntError { kind: \
+        crate::str::IntErrorKind::Empty });\n        }\n        let mut i: usize = 0;\n        let \
+        mut neg = false;\n        if b[0] == 43 || b[0] == 45 {\n            neg = b[0] == 45;\n            \
+        i = 1;\n        }\n", p, "", "", "");
+    let unsigned_neg = if class == 2 { " || neg" } else { "" };
+    emit(out, "        if i == n`1 {\n            return crate::result::Result::Err(\
+        crate::str::ParseIntError { kind: crate::str::IntErrorKind::InvalidDigit });\n        }\n        \
+        let lim: u64 = if neg { ", unsigned_neg, "", "", "");
+    if class == 1 {
+        buf_fmt(out, format_args("(1u64 << {})", bits - 1));
+        buf_fmt(out, format_args(" }} else {{ ((1u64 << {}) - 1) }};\n", bits - 1));
+    } else {
+        buf_bytes(out, "0 } else { ");
+        ones_text(out, bits);
+        buf_bytes(out, " };\n");
+    }
+    buf_bytes(out, "        let mut v: u64 = 0;\n        while i < n {\n            let c = b[i];\n            \
+        if c < 48 || c > 57 {\n                return crate::result::Result::Err(\
+        crate::str::ParseIntError { kind: crate::str::IntErrorKind::InvalidDigit });\n            }\n            \
+        let d = (c - 48) as u64;\n            if v > (lim - d) / 10 {\n                return \
+        crate::result::Result::Err(crate::str::ParseIntError { kind: if neg { \
+        crate::str::IntErrorKind::NegOverflow } else { crate::str::IntErrorKind::PosOverflow } \
+        });\n            }\n            v = v * 10 + d;\n            i += 1;\n        }\n        ");
+    if class == 1 {
+        buf_bytes(out, "if neg && v != 0 {\n            crate::result::Result::Ok(((v ^ ");
+        ones_text(out, 64);
+        emit(out, ") + 1) as i64 as `1)\n        } else {\n            crate::result::Result::Ok(v as \
+            i64 as `1)\n        }\n    }\n}\n", p, "", "", "");
+    } else {
+        emit(out, "crate::result::Result::Ok(v as `1)\n    }\n}\n", p, "", "", "");
+    }
+}
+
+fn write_fmt(out: i64, t: [u8], p: [u8]) {
+    let class = prim_class(p);
+    emit(out, "impl `1 for `2 {\n    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> \
+        crate::fmt::Result {\n        ", t, p, "", "");
+    if class == 4 {
+        buf_bytes(out, "f.pad(if *self { \"true\" } else { \"false\" })\n    }\n}\n");
+        return;
+    }
+    if class == 3 || t == "LowerExp" || t == "UpperExp" {
+        // (a float's digits, an exponent form: F16.3's, not written yet)
+        buf_bytes(out, "crate::panic::todo()\n    }\n}\n");
+        return;
+    }
+    let decimal = t == "Display" || t == "Debug";
+    let radix = if decimal { "10" } else if t == "Octal" { "8" } else if t == "Binary" { "2" }
+        else { "16" };
+    let letters = if t == "UpperHex" { "55" } else { "87" };
+    let prefix = if decimal { "" } else if t == "Octal" { "0o" } else if t == "Binary" { "0b" }
+        else { "0x" };
+    if decimal && class == 1 {
+        buf_bytes(out,
+            "let neg = *self < 0;\n        let mut v: u64 = if neg { ((*self as i64 as u64) ^ ");
+        ones_text(out, 64);
+        buf_bytes(out, ") + 1 } else { *self as u64 };\n");
+    } else {
+        // (a radix shows a signed integer's two's complement, as Rust's)
+        emit(out, "let neg = false;\n        let mut v: u64 = *self as `1 as u64;\n",
+            unsigned_twin(p), "", "", "");
+    }
+    emit(out, "        let mut buf = [0u8; 72];\n        let mut i: usize = 72;\n        loop {\n            \
+        i -= 1;\n            let d = (v % `1) as u8;\n            buf[i] = if d < 10 { 48 + d } else \
+        { `2 + d };\n            v = v / `1;\n            if v == 0 {\n                break;\n            \
+        }\n        }\n        f.pad_integral(!neg, \"`3\", unsafe { \
+        crate::str::from_utf8_unchecked(&buf[i..]) })\n    }\n}\n", radix, letters, prefix, "");
+}
+
+// The impls of the recorded traits' lists (pcx.builtin_traits), parsed and
+// appended to the program. RULE: F15.1
+pub fn expand_builtin_impls(pcx: inout Ctx<Comp>) {
+    let n = pcx.builtin_traits.count / 4;
+    if n == 0 {
+        return;
+    }
+    let out = buf_new();
+    for r in 0..n {
+        let item = pcx.builtin_traits.get(4 * r);
+        let start = pcx.builtin_traits.get(4 * r + 1);
+        let end = pcx.builtin_traits.get(4 * r + 2);
+        pcx.builtin_traits.set(4 * r + 3, buf_slice(out).len() as i64);
+        if item == 0 {
+            continue;
+        }
+        let t = sym_text(pcx.nodes[item].a, pcx);
+        // The names between the attribute's parentheses.
+        let text = SRC[start..end];
+        var i = 0;
+        while i < text.len() as i64 && text[i] != '(' {
+            i += 1;
+        }
+        i += 1;
+        while i < text.len() as i64 && text[i] != ')' {
+            while i < text.len() as i64 && (text[i] == ' ' || text[i] == ',' || text[i] == '\n') {
+                i += 1;
+            }
+            let from = i;
+            while i < text.len() as i64 && text[i] != ',' && text[i] != ')' && text[i] != ' '
+                && text[i] != '\n' {
+                i += 1;
+            }
+            if i == from {
+                continue;
+            }
+            let p = text[from..i];
+            if prim_class(p) == 0 || !write_impl(out, t, p) {
+                let saved = pcx.err_kind;
+                pcx.err_kind = c"attr.builtin";
+                err_begin(start, &pcx);
+                err_fmt(format_args("no builtin impl of '{}' for '{}'", t, p), pcx);
+                err_help(c"the compiler makes the impls of std's operator, comparison, copy, default, hash, iteration and formatting traits for the numbers and bool: write this one as an impl", pcx);
+                err_end_soft(&pcx);
+                pcx.err_kind = saved;
+            }
+        }
+    }
+    if buf_slice(out).len() == 0 {
+        return;
+    }
+    parse_builtin(out, &pcx);
+}
+
+// Parses the made text as a source `<builtin>`, gives each node the span
+// of its trait's attribute, flags it FN_DERIVED (made, not written: the
+// tools do not edit it) and appends the impls to the program.
+fn parse_builtin(out: i64, pcx: inout Ctx<Comp>) {
+    // UNSAFE: the recovery point is setjmp's (parse_derived's), and BUFS a
+    // raw table.
+    // SAFETY: recover_enter/recover_leave bracket the parse on this frame;
+    // out is a live buffer index.
+    unsafe {
+        let base = add_source(c"<builtin>", out, &pcx);
+        let first = pcx.toks.len() as i64;
+        let node_mark = pcx.nodes.len() as i64;
+        let mark = list_begin(pcx);
+        let depth = pcx.recover_depth;
+        if _setjmp(recover_enter(&pcx)) == 0 {
+            lex_range(base, base + BUFS[out].len, last: true, pcx: &pcx);
+            parse_items_fragment(first, &pcx);
+        } else {
+            // (a syntax error in the made text: a compiler bug, reported)
+            pcx.scratch.count = mark;
+        }
+        recover_leave(depth, &pcx);
+        let n = pcx.builtin_traits.count / 4;
+        for k in node_mark..pcx.nodes.len() as i64 {
+            let off = pcx.nodes[k].start - base;
+            var r = 0;
+            for j in 0..n {
+                if pcx.builtin_traits.get(4 * j + 3) <= off {
+                    r = j;
+                }
+            }
+            pcx.nodes[k].start = pcx.builtin_traits.get(4 * r + 1);
+            pcx.nodes[k].end = pcx.builtin_traits.get(4 * r + 2);
+            if pcx.nodes[k].kind == NodeKind::Fn || pcx.nodes[k].kind == NodeKind::Impl {
+                pcx.nodes[k].p |= FN_DERIVED;
+            }
+        }
+        let count = pcx.scratch.count - mark;
+        let all = list_begin(pcx);
+        for i in 0..pcx.nodes[pcx.program].count {
+            list_push(child(pcx.program, i, pcx), &pcx);
+        }
+        for i in 0..count {
+            list_push(pcx.scratch.get(mark + i), &pcx);
+        }
+        list_end(pcx.program, all, &pcx);
+        pcx.scratch.count = mark;
+    }
+}

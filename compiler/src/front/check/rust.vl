@@ -7,13 +7,14 @@
 // where it is written). Each rewrites the node in place, as the checker's
 // other desugarings do, and the caller checks it again.
 
-use crate::base::intern_c;
+use crate::base::{SRC, cstr, intern_c};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, err_try_fmt};
 use crate::front::ast::{NodeKind, list_begin, list_end, list_push, new_node};
 use crate::front::check::calls::method_of;
 use crate::front::lexer::Tok;
-use crate::front::types::{REF_MUT, TyKind, fn_param};
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param, ref_to};
 
 // Whether node n is read in the rust edition.
 pub fn rust_node(n: i64, pcx: inout Ctx<Comp>) -> bool {
@@ -119,6 +120,68 @@ pub fn deref_receiver(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     pcx.nodes[u].b = call;
     pcx.nodes[n].a = u;
     true
+}
+
+// RULE: F6.2 (the probe's `&` and `&mut` steps) A method `name` that the
+// receiver's type t does not have, at method call n, which `&t` or
+// `&mut t` has (`impl Tr for &S` with `fn m(self)`): the receiver
+// becomes `&e` (`&mut e`); true when rewritten.
+pub fn autoref_receiver(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    if t <= 0 || pcx.types[t].kind == TyKind::Ptr {
+        return false;
+    }
+    for mode in [REF_SHARED, REF_MUT] {
+        if method_of(ref_to(t, mode, &pcx), name, pcx) >= 0 {
+            let e = pcx.nodes[n].a;
+            let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+            pcx.nodes[u].op = Tok::Amp;
+            pcx.nodes[u].b = e;
+            if mode == REF_MUT {
+                pcx.nodes[u].p |= crate::front::ast::NODE_REF_MUT;
+            }
+            pcx.nodes[n].a = u;
+            return true;
+        }
+    }
+    false
+}
+
+// RULE: F21.2 (Z9's type side) A value of an unsized type, `[T]` or
+// `str` written bare (not behind `&`, `*const`, `*mut` or as a generic
+// argument), at type node t of a rust-edition position where a value
+// goes (`what`: a parameter, a result, a field, a `let`), also as a
+// tuple's or an array's element: error type.unsized (rustc E0277).
+pub fn check_sized(t: i64, what: *u8, pcx: inout Ctx<Comp>) {
+    if t == 0 || !crate::front::rust::rust_at(pcx.nodes[t].start, &pcx) {
+        return;
+    }
+    let k = pcx.nodes[t].kind;
+    if k == NodeKind::TyTuple {
+        for i in 0..pcx.nodes[t].count {
+            check_sized(crate::front::ast::child(t, i, pcx), c"a tuple's element", &pcx);
+        }
+        return;
+    }
+    if k == NodeKind::TyArray {
+        check_sized(pcx.nodes[t].a, c"an array's element", &pcx);
+        return;
+    }
+    // (as written: a generated item's nodes, spanning its attribute, are not)
+    let written = SRC[pcx.nodes[t].start..pcx.nodes[t].end];
+    let slice = k == NodeKind::TySlice && written.len() > 0 && written[0] == '[';
+    let text = k == NodeKind::TyName && written == "str";
+    if !slice && !text {
+        return;
+    }
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"type.unsized";
+    err_begin(pcx.nodes[t].start, &pcx);
+    err_fmt(format_args("the size of '{written}' cannot be known: {} holds its value",
+        cstr(what)), pcx);
+    err_help(c"a slice or a str is used behind a reference or a pointer", pcx);
+    err_try_fmt(format_args("&{written}"), pcx);
+    err_end_soft(&pcx);
+    pcx.err_kind = saved_kind;
 }
 
 // The number of parameters of function f (0 <= f < the table's length).
@@ -271,4 +334,99 @@ pub fn std_by_value_error(n: i64, t: i64, pcx: inout Ctx<Comp>) -> ! {
     crate::base::diag::err_end_soft(&pcx);
     pcx.err_kind = saved;
     crate::base::diag::err_jump(&pcx)
+}
+
+// ---- Tuple structs and unit structs (0.27.2) ----
+
+// The key tuple_struct_call and unit_struct_value read as `Self`.
+pub const SELF_KEY: i64 = -2;
+
+// The struct node of `Self` in an impl whose self type is a struct, or 0.
+// RULE: F5.4
+pub fn self_struct_node(pcx: Ctx<Comp>) -> i64 {
+    let t = pcx.self_type;
+    if t <= 0 || pcx.types[t].kind != TyKind::Struct {
+        return 0;
+    }
+    pcx.structs[pcx.types[t].a].node
+}
+
+// The struct node the item key names (SELF_KEY: `Self`'s), or 0.
+pub fn struct_node_of_key(key: i64, pcx: Ctx<Comp>) -> i64 {
+    if key == SELF_KEY {
+        return self_struct_node(pcx);
+    }
+    if key < 0 {
+        return 0;
+    }
+    // UNSAFE: SYM_STRUCT is a raw table indexed by item key (base/ctx.vl),
+    // as every reader of it.
+    // SAFETY: key is an item key (type_name_key's, >= 0), within the table
+    // sym_table sized for every symbol.
+    let s = unsafe { pcx.sym_struct[key] };
+    if s == 0 { 0 } else { pcx.structs[s - 1].node }
+}
+
+// Whether struct node s is a tuple struct (its fields named 0, 1, ..).
+pub fn is_tuple_struct(s: i64, pcx: inout Ctx<Comp>) -> bool {
+    s != 0 && pcx.nodes[s].count > 0
+        && pcx.nodes[crate::front::ast::child(s, 0, pcx)].a == intern_c(c"0", &pcx)
+}
+
+// Node n becomes the literal `name { 0: e0, 1: e1, .. }` of its
+// expressions SCRATCH[mark..] (popped), with type arguments g.
+fn become_struct_lit(n: i64, name: i64, g: i64, mark: i64, pcx: inout Ctx<Comp>) {
+    let count = pcx.scratch.count - mark;
+    let inits = list_begin(pcx);
+    for k in 0..count {
+        let e = pcx.scratch.get(mark + k);
+        let init = new_node(NodeKind::FieldInit, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+        let field = crate::base::buf_new();
+        crate::base::buf_fmt(field, format_args("{k}"));
+        pcx.nodes[init].a = crate::base::intern(crate::base::buf_slice(field), &pcx);
+        pcx.nodes[init].b = e;
+        list_push(init, &pcx);
+    }
+    // (the inits after the expressions in SCRATCH: moved down over them)
+    for k in 0..count {
+        pcx.scratch.set(mark + k, pcx.scratch.get(inits + k));
+    }
+    pcx.scratch.count = mark + count;
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    pcx.nodes[n] = pcx.nodes[0];
+    pcx.nodes[n].kind = NodeKind::StructLit;
+    pcx.nodes[n].start = start;
+    pcx.nodes[n].end = end;
+    pcx.nodes[n].a = name;
+    pcx.nodes[n].g = g;
+    list_end(n, mark, &pcx);
+}
+
+// `S(a, b)` of the rust edition, S a tuple struct (callee an Ident naming
+// it): call n becomes the literal `S { 0: a, 1: b }`; true. RULE: F7.2
+pub fn tuple_struct_call(n: i64, key: i64, pcx: inout Ctx<Comp>) -> bool {
+    let s = struct_node_of_key(key, pcx);
+    if !is_tuple_struct(s, &pcx) || !rust_node(n, &pcx) {
+        return false;
+    }
+    let callee = pcx.nodes[n].a;
+    let mark = list_begin(pcx);
+    for k in 0..pcx.nodes[n].count {
+        list_push(crate::front::ast::child(n, k, pcx), &pcx);
+    }
+    become_struct_lit(n, pcx.nodes[callee].a, pcx.nodes[callee].g, mark, &pcx);
+    true
+}
+
+// `U` of the rust edition, U a struct with no fields (Ident n): n becomes
+// the literal `U {}`; true. RULE: F7.3
+pub fn unit_struct_value(n: i64, key: i64, pcx: inout Ctx<Comp>) -> bool {
+    let s = struct_node_of_key(key, pcx);
+    if s == 0 || pcx.nodes[s].count != 0 || !rust_node(n, &pcx) {
+        return false;
+    }
+    let mark = list_begin(pcx);
+    become_struct_lit(n, pcx.nodes[n].a, pcx.nodes[n].g, mark, &pcx);
+    true
 }
