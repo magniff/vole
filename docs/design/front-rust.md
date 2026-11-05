@@ -102,11 +102,18 @@ through `Deref::deref` (F6.2), stopped when no deref applies, plus, if
 in order, the *probe steps* are `τᵢ` by value, then `&τᵢ`, then
 `&mut τᵢ`. At a step with receiver type `ρ`, the *candidates* are the
 methods named `m` whose declared receiver type (the `self` parameter's,
-`Self := τᵢ`) is `ρ`, taken from (i) the inherent impls whose header
-applies to `τᵢ` (F5), then, only if (i) is empty, (ii) the traits *in
-scope* (F9.2) with an impl applying to `τᵢ` or a bound of `Γ` entailing
-them. The first step with a non-empty candidate set decides; its size
-must be one (F9.3). Rust's reference "Method call expressions".
+with `Self` the impl's self type `σ`: `σ` for `self`, `&σ` for `&self`,
+`&mut σ` for `&mut self`) is `ρ`, whatever `σ` is: an impl for `S`
+offers its `&self` methods at the step `ρ = &S`, an impl for `&S` its
+`self` methods there and its `&self` methods at `ρ = &&S`. They are
+taken from (i) the inherent impls whose header applies to `σ` (F5),
+then, only if (i) is empty, (ii) the traits *in scope* (F9.2) with an
+impl applying to `σ` or a bound of `Γ` entailing them. The first step
+with a non-empty candidate set decides; its size must be one (F9.3,
+`error method.ambiguous`, rustc E0034). The methods "of type `τᵢ`" are
+not the rule: a receiver `r: &S` finds `S::m(&self)` at its first step,
+`&S` by value, before `impl Tr for &S`'s `m(&self)` (receiver `&&S`, the
+`&` step). Rust's reference "Method call expressions".
 *Anchor:* `front/check/calls/mod.vl: method_of`, `front/check/rust.vl:
 deref_receiver` (today: inherent and impl methods of `τ₀`'s template,
 then one `Deref`).
@@ -483,19 +490,33 @@ mutability (`&'a T` never applies to `&'b mut U`; `'a` is positional,
 F5.2). *Anchor:* `later_impl` (today `edition.later: impl_for_ref`),
 `ImplInfo.ty`.
 
-**F6.2 (the probe).** F0.5's order, in full: for receiver type `τ₀`,
-each candidate `τᵢ` of the autoderef chain, each of (by value, `&`,
-`&mut`), inherent then in-scope trait methods. Consequences that are
-corpus cases: `v.iter()` on `v: Vec<T, A>` finds `<[T]>::iter` at
-`τ₁ = [T]` through `Deref` (by `&`); `s.len()` on `s: &&str` finds
-`str::len` at `τ₂`; `x.clone()` on `x: &T` with `T: Clone` finds
-`<T as Clone>::clone` at `τ₁ = T` by `&` (not `<&T as Clone>::clone`,
-which is `τ₀` by `&&T`: later in the order); `r.into_iter()` on `r: &Vec<T>`
-finds the `&'a Vec<T>` impl at `τ₀` by value before `Vec`'s at `τ₁`;
-`it.next()` on a `&mut I` with `I: Iterator` finds `I::next` at `τ₁`
-by `&mut`. A receiver of unsized type (`τᵢ = [T]`) is probed by `&`
-and `&mut` only (F21.2). *Anchor:* `method_of`, `deref_receiver`
-(today: one Deref step, no reference-self candidates).
+**F6.2 (the probe).** F0.5's order, in full, which is rustc's: for
+receiver type `τ₀`, each candidate `τᵢ` of the autoderef chain, each of
+the receiver types `τᵢ`, `&τᵢ`, `&mut τᵢ` in that order, and at each the
+methods whose *receiver type* is that type (not the methods of the
+type `τᵢ`), inherent then in-scope trait methods; two trait methods at
+one step are `error method.ambiguous` (rustc E0034). A result that
+differs from rustc's silently is a bug: where the front cannot tell the
+step it keeps its order and the corpus names it. Consequences that are
+corpus cases (each checked with rustc): with `impl S { fn tag(&self) }`
+and `impl Tag for &S { fn tag(&self) }`, `r.tag()` on `r: &S` is S's
+(receiver `&S` = `τ₀` by value) and `rr.tag()` on `rr: &&S` the impl's
+(receiver `&&S` = `τ₀` by value, S's only at `τ₁`); `s.c()` on `s: S`
+with `fn c(&mut self)` on S and `impl C for &S { fn c(self) }` is the
+impl's (`&S`, the `&` step, before `&mut S`); `m.e()` on `m: &mut S`
+with `fn e(&self)` on S and `impl E for &mut S { fn e(self) }` is the
+impl's (`τ₀` by value); `v.iter()` on `v: Vec<T, A>` finds
+`<[T]>::iter` at `τ₁ = [T]` through `Deref` (by `&`); `s.len()` on `s:
+&&str` finds `str::len` (receiver `&str`) at `τ₁` by value; `x.clone()`
+on `x: &T` with `T: Clone` finds `<T as Clone>::clone` (receiver `&T`)
+at `τ₀` by value, before `<&T as Clone>::clone` (receiver `&&T`, the `&`
+step); `r.into_iter()` on `r: &Vec<T>` finds the `&'a Vec<T>` impl at
+`τ₀` by value before `Vec`'s at `τ₁`; `it.next()` on a `&mut I` with
+`I: Iterator` finds `I::next` (receiver `&mut I`) at `τ₀` by value. A
+receiver of unsized type (`τᵢ = [T]`) is probed by `&` and `&mut` only
+(F21.2). *Anchor:* `method_of`, `front/check/rust.vl: probe_step,
+probe_first, autoref_first` (the steps through references; a `Deref`
+target or a view is ordered as before), `deref_receiver`.
 
 **F6.3 (autoref writes the receiver).** The probe's result rewrites the
 receiver expression to the adjusted form (`(&*recv).m(..)`,
