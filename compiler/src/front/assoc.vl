@@ -15,12 +15,10 @@ use crate::base::{intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{err_begin, err_end, err_end_soft, err_fmt, err_help_fmt, err_str};
-use crate::front::ast::{FN_LAZY, NodeKind, child};
+use crate::front::ast::{FN_LAZY, NODE_ASSOC_CONST, NodeKind, child};
 use crate::front::check::{has_error_type, resolve_type_or_error};
 use crate::front::closures::{closure_of_type, closure_sig};
-use crate::front::generics::{
-    TPL_NONE, env_enter, env_leave, env_lookup, instance_of, instance_targs,
-};
+use crate::front::generics::{env_enter, env_leave, env_lookup};
 use crate::front::generics::instantiate::unify;
 use crate::front::modules::{is_within, module_of, within_std};
 use crate::front::traits::{bound_trait, implements};
@@ -88,6 +86,10 @@ pub fn collect_impl_assoc(i: i64, pcx: inout Ctx<Comp>) {
     if declared != 0 {
         for k in 0..pcx.nodes[declared].count {
             let d = child(declared, k, pcx);
+            // (0.27.2: a constant with a default need not be defined, F3.1)
+            if (pcx.nodes[d].p & NODE_ASSOC_CONST) != 0 && pcx.nodes[d].c != 0 {
+                continue;
+            }
             if assoc_in(holder, pcx.nodes[d].a, pcx) == 0 {
                 err_begin(pcx.nodes[node].start, &pcx);
                 err_fmt(format_args("the impl of trait '{}' is missing 'type ",
@@ -102,38 +104,62 @@ pub fn collect_impl_assoc(i: i64, pcx: inout Ctx<Comp>) {
 }
 
 // Whether impl i is for type t.
-fn impl_covers(i: i64, t: i64, pcx: Ctx<Comp>) -> bool {
-    (pcx.traits_impls[i].ty != 0 && pcx.traits_impls[i].ty == t)
-        || (pcx.traits_impls[i].tpl != TPL_NONE && instance_of(t, pcx.traits_impls[i].tpl, pcx))
+fn impl_covers(i: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    // RULE: F0.3 (0.27.2: with the impl's bounds, so that a blanket impl
+    // whose bound fails does not give its associated types)
+    crate::front::traits::impl_applies(i, t, &pcx) >= 0
 }
 
 // The AssocType node `name` of the impl of trait tr (of any trait when tr
-// < 0) for type t, or 0; the impl in FOUND_IMPL.
+// < 0) for type t, or 0; the impl in FOUND_IMPL. (0.27.2) Inside an
+// impl, `Self::A` is that impl's own (pcx.self_impl, F5.4, F13.2); among
+// the impls of one generic trait, the one with the arguments the
+// declaration is read with (trait_args_agree, F13.1); a blanket impl's
+// definition yields to a direct impl's (F11.4), so `Chars::Item` is
+// Iterator's, not the blanket `IntoIterator for I`'s copy of it.
 fn find_assoc(tr: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
     var found = 0;
     pcx.found_impl = -1;
     pcx.found_other = -1;
+    // (every preference below is the rust edition's: an MVS program's
+    // diagnostics keep their order)
+    let rust = pcx.edition != 0;
+    let own = if rust { pcx.self_impl } else { -1 };
+    if own >= 0 && (tr < 0 || pcx.traits_impls[own].tr == tr) {
+        let c = assoc_in(pcx.nodes[pcx.traits_impls[own].node].c, name, pcx);
+        if c != 0 && (pcx.traits_impls[own].ty == t || impl_covers(own, t, &pcx)) {
+            pcx.found_impl = own;
+            return c;
+        }
+    }
     for i in 0..pcx.traits_impls.len() as i64 {
         if tr >= 0 && pcx.traits_impls[i].tr != tr {
             continue;
         }
         let c = assoc_in(pcx.nodes[pcx.traits_impls[i].node].c, name, pcx);
-        if c == 0 || !impl_covers(i, t, pcx) {
+        if c == 0 || (pcx.nodes[c].p & NODE_ASSOC_CONST) != 0 || !impl_covers(i, t, &pcx)
+            || rust && !crate::front::traits::trait_args_agree(i, t, &pcx) {
             continue;
         }
         if found == 0 {
             found = c;
             pcx.found_impl = i;
         }
-        else if pcx.traits_impls[i].tr != pcx.traits_impls[pcx.found_impl].tr
-            && pcx.found_other < 0 {
-            pcx.found_other = i;
+        else if pcx.traits_impls[i].tr != pcx.traits_impls[pcx.found_impl].tr {
+            let blanket = rust && crate::front::traits::blanket_impl(i, pcx);
+            if rust && crate::front::traits::blanket_impl(pcx.found_impl, pcx) && !blanket {
+                found = c;
+                pcx.found_impl = i;
+                pcx.found_other = -1;
+            } else if !blanket && pcx.found_other < 0 {
+                pcx.found_other = i;
+            }
         }
     }
     found
 }
 
-const MAX_ASSOC_DEPTH: i64 = 32;
+pub const MAX_ASSOC_DEPTH: i64 = 32;
 
 // The type definition c (an AssocType node) of impl i gives type t.
 fn assoc_value(i: i64, c: i64, t: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -153,17 +179,21 @@ fn assoc_value(i: i64, c: i64, t: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
     pcx.assoc_depth += 1;
     let saved_mod = pcx.cur_mod;
     let saved_self = pcx.self_type;
+    let saved_impl = pcx.self_impl;
     pcx.cur_mod = pcx.traits_impls[i].module;
     pcx.self_type = t;
+    pcx.self_impl = i;
     // (a non-generic impl sees no type parameter: an empty frame)
     let saved = if generic {
-        env_enter(params, instance_targs(t, &pcx), pcx.nodes[params].count, &pcx)
+        env_enter(params, crate::front::traits::impl_bindings(i, t, &pcx),
+            pcx.nodes[params].count, &pcx)
     }
         else { env_enter(0, 0, 0, &pcx) };
     let ty = resolve_type_or_error(pcx.nodes[c].b, &pcx);
     env_leave(saved, &pcx);
     pcx.cur_mod = saved_mod;
     pcx.self_type = saved_self;
+    pcx.self_impl = saved_impl;
     pcx.assoc_depth -= 1;
     if !generic {
         pcx.nodes[c].ty = ty;
@@ -171,11 +201,65 @@ fn assoc_value(i: i64, c: i64, t: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
     ty
 }
 
+// (0.27.2) Path n is `t::name` with `name` an associated constant of t
+// (defined in an impl for t, else a trait's default): n becomes a copy
+// of the constant's value expression, checked against its type in the
+// impl's scope (Self = t, the impl's parameters bound); its type. -1
+// when t has no such constant. RULE: F3.2
+pub fn assoc_const_value(n: i64, t: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var c = 0;
+    var i = -1;
+    for k in 0..pcx.traits_impls.len() as i64 {
+        let own = assoc_in(pcx.nodes[pcx.traits_impls[k].node].c, name, pcx);
+        let decl = assoc_in(pcx.nodes[pcx.traits[pcx.traits_impls[k].tr].node].b, name, pcx);
+        let d = if own != 0 { own } else { decl };
+        if d == 0 || (pcx.nodes[d].p & NODE_ASSOC_CONST) == 0 || pcx.nodes[d].c == 0
+            || !impl_covers(k, t, &pcx) {
+            continue;
+        }
+        c = d;
+        i = k;
+    }
+    if c == 0 {
+        return -1;
+    }
+    let node = pcx.traits_impls[i].node;
+    let params = pcx.nodes[node].g;
+    let generic = params != 0 && pcx.nodes[params].count > 0;
+    let saved_mod = pcx.cur_mod;
+    let saved_self = pcx.self_type;
+    let saved_impl = pcx.self_impl;
+    pcx.cur_mod = module_of(c, &pcx);
+    pcx.self_type = t;
+    pcx.self_impl = i;
+    let saved = if generic {
+        env_enter(params, crate::front::traits::impl_bindings(i, t, &pcx),
+            pcx.nodes[params].count, &pcx)
+    } else { env_enter(0, 0, 0, &pcx) };
+    let ty = resolve_type_or_error(pcx.nodes[c].b, &pcx);
+    let e = crate::front::generics::instantiate::clone_node(pcx.nodes[c].c, &pcx);
+    crate::front::check::check_mode::check_expr(e, ty, &pcx);
+    env_leave(saved, &pcx);
+    pcx.cur_mod = saved_mod;
+    pcx.self_type = saved_self;
+    pcx.self_impl = saved_impl;
+    // (n becomes `{ e }`, as convert::become_value makes a call its value)
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    pcx.nodes[n] = pcx.nodes[0];
+    pcx.nodes[n].kind = NodeKind::Block;
+    pcx.nodes[n].start = start;
+    pcx.nodes[n].end = end;
+    pcx.nodes[n].a = e;
+    pcx.nodes[n].ty = ty;
+    ty
+}
+
 // Whether some impl for t is of a trait declaring `name` (which then
 // lacks it: an error reported with the impl).
-fn declared_for(t: i64, name: i64, pcx: Ctx<Comp>) -> bool {
+fn declared_for(t: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
     for i in 0..pcx.traits_impls.len() as i64 {
-        if impl_covers(i, t, pcx)
+        if impl_covers(i, t, &pcx)
             && assoc_in(pcx.nodes[pcx.traits[pcx.traits_impls[i].tr].node].b, name, pcx) != 0 {
             return true;
         }
@@ -202,7 +286,7 @@ pub fn projection(t: i64, name: i64, pos: i64, pcx: inout Ctx<Comp>) -> i64 {
     }
     let c = find_assoc(-1, t, name, &pcx);
     if c == 0 {
-        if declared_for(t, name, pcx) {
+        if declared_for(t, name, &pcx) {
             return pcx.ty_error;
         }
         err_begin(pos, &pcx);
