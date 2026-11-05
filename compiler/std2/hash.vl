@@ -38,20 +38,27 @@ pub trait Hasher {
     fn write(&mut self, bytes: &[u8]);
 
     fn write_u8(&mut self, i: u8) {
-        self.write(&[i])
+        let b: [u8; 1] = [i];
+        self.write(&b[..])
     }
 
+    // Its 2 bytes, little-endian (Rust's: native-endian, the same on
+    // every target of vole).
     fn write_u16(&mut self, i: u16) {
-        self.write_u64(i as u64)
+        let b: [u8; 2] = [i as u8, (i >> 8) as u8];
+        self.write(&b[..])
     }
 
+    // Its 4 bytes, little-endian.
     fn write_u32(&mut self, i: u32) {
-        self.write_u64(i as u64)
+        let b: [u8; 4] = [i as u8, (i >> 8) as u8, (i >> 16) as u8, (i >> 24) as u8];
+        self.write(&b[..])
     }
 
     // Its 8 bytes, little-endian.
     fn write_u64(&mut self, i: u64) {
-        crate::panic::todo()
+        let b = le_bytes(i);
+        self.write(&b[..])
     }
 
     fn write_usize(&mut self, i: usize) {
@@ -114,27 +121,85 @@ impl<H: Default + Hasher> BuildHasher for BuildHasherDefault<H> {
 
 impl<H> Default for BuildHasherDefault<H> {
     fn default() -> BuildHasherDefault<H> {
-        BuildHasherDefault { marker: PhantomData }
+        BuildHasherDefault { marker: PhantomData {} }
     }
 }
 
+// x's 8 bytes, little-endian.
+fn le_bytes(x: u64) -> [u8; 8] {
+    [
+        x as u8,
+        (x >> 8) as u8,
+        (x >> 16) as u8,
+        (x >> 24) as u8,
+        (x >> 32) as u8,
+        (x >> 40) as u8,
+        (x >> 48) as u8,
+        (x >> 56) as u8,
+    ]
+}
+
+// The n bytes at b[i..i + n] (n <= 8) as a u64, little-endian.
+fn read_le(b: &[u8], i: usize, n: usize) -> u64 {
+    let mut x: u64 = 0;
+    let mut k: usize = 0;
+    while k < n {
+        x |= (b[i + k] as u64) << (8 * k) as u64;
+        k += 1;
+    }
+    x
+}
+
+// The high 64 bits of the 128-bit product a * b (vole has no u128): four
+// 32-bit products, none of which overflows.
+fn mul_hi(a: u64, b: u64) -> u64 {
+    let m: u64 = 0xffffffff;
+    let (a0, a1) = (a & m, a >> 32);
+    let (b0, b1) = (b & m, b >> 32);
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let mid = (p00 >> 32) + (p01 & m) + (p10 & m);
+    p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+}
+
+// foldhash's folded multiply: the low and high halves of a * b, xor'ed.
+fn fold_mul(a: u64, b: u64) -> u64 {
+    a.wrapping_mul(b) ^ mul_hi(a, b)
+}
+
+fn rotate_right(x: u64, r: usize) -> u64 {
+    let k = (r & 63) as u64;
+    (x >> k) | (x << ((64 - k) & 63))
+}
+
+fn rotate_left(x: u64, r: u64) -> u64 {
+    (x << r) | (x >> (64 - r))
+}
+
+// foldhash's constants (hexadecimal digits of pi).
+const FOLD_ARBITRARY3: u64 = 0x082efa98ec4e6c89;
+const FOLD_ARBITRARY5: u64 = 0xbe5466cf34e90c6c;
+
 // foldhash with fixed seeds: HashMap's and HashSet's default S. The same
-// order in every run and on every target.
+// order in every run and on every target. Bit for bit the foldhash
+// crate's (0.2) fast FixedState.
 #[derive(Clone, Copy, Debug)]
 pub struct FixedState {
     seed: u64,
 }
 
 impl FixedState {
-    // The fixed seed.
+    // The fixed seed: foldhash's FixedState::default().
     pub fn new() -> FixedState {
-        FixedState { seed: 0 }
+        FixedState { seed: FOLD_ARBITRARY3 }
     }
 
     // A seed of the program's choosing (a per-process secret against
-    // HashDoS, or a test's).
+    // HashDoS, or a test's): foldhash's FixedState::with_seed.
     pub fn with_seed(seed: u64) -> FixedState {
-        FixedState { seed: seed }
+        FixedState { seed: seed ^ FOLD_ARBITRARY3 }
     }
 }
 
@@ -143,7 +208,7 @@ impl BuildHasher for FixedState {
     type Hasher = FoldHasher;
 
     fn build_hasher(&self) -> FoldHasher {
-        crate::panic::todo()
+        FoldHasher::with_seeds(self.seed, FoldSeeds::fixed())
     }
 }
 
@@ -153,16 +218,41 @@ impl Default for FixedState {
     }
 }
 
-// foldhash seeded from the OS once per process: not deterministic, so
+// UNSAFE: the OS's random bytes, for RandomState's seeds.
+// SAFETY: getentropy fills the len (at most 256) bytes at buf, and returns
+// 0, or -1 with nothing promised of them. Its one caller passes an
+// array's pointer and length.
+extern "C" {
+    #[link_name = "getentropy"]
+    fn c_getentropy(buf: *mut u8, len: usize) -> i32;
+}
+
+// 8 random bytes from the OS, as a u64.
+fn entropy() -> u64 {
+    let mut b: [u8; 8] = [0; 8];
+    // UNSAFE: the OS's getentropy.
+    // SAFETY: b is a local array of 8 writable bytes, borrowed for the
+    // call; 8 is within getentropy's 256.
+    let r = unsafe { c_getentropy(b.as_mut_ptr(), 8) };
+    if r != 0 {
+        let msg: &str = "hash: the system gives no random bytes";
+        crate::panic::panic(msg);
+    }
+    read_le(&b[..], 0, 8)
+}
+
+// foldhash seeded from the OS when it is made: not deterministic, so
 // never a default (decision 2).
 #[derive(Clone, Copy, Debug)]
 pub struct RandomState {
     seed: u64,
+    seeds: FoldSeeds,
 }
 
 impl RandomState {
     pub fn new() -> RandomState {
-        crate::panic::todo()
+        let seed = entropy();
+        RandomState { seed: seed, seeds: FoldSeeds::from_u64(entropy()) }
     }
 }
 
@@ -171,12 +261,13 @@ impl BuildHasher for RandomState {
     type Hasher = FoldHasher;
 
     fn build_hasher(&self) -> FoldHasher {
-        crate::panic::todo()
+        FoldHasher::with_seeds(self.seed, self.seeds)
     }
 }
 
-// SipHash-1-3 with fixed keys (Rust's DefaultHasher's function), for
-// tables that take untrusted keys and want a keyed hash.
+// SipHash-1-3 with fixed keys (Rust's DefaultHasher's function, which is
+// SipHashState::with_keys(0, 0)), for tables that take untrusted keys
+// and want a keyed hash.
 #[derive(Clone, Copy, Debug)]
 pub struct SipHashState {
     k0: u64,
@@ -202,7 +293,12 @@ impl BuildHasher for SipHashState {
     }
 }
 
-// foldhash (Orson Peters'), the default hasher's function.
+// foldhash (Orson Peters'), the default hasher's function: the foldhash
+// crate's (0.2) fast FoldHasher, bit for bit. An integer costs one
+// multiply at finish; integers written in a row share it, 128 bits at a
+// time (the sponge). Bytes are read 8 at a time, 16 to a multiply, with
+// overlapping reads at the ends, after a rotation of the state by their
+// length.
 #[derive(Clone, Debug)]
 pub struct FoldHasher {
     accumulator: u64,
@@ -213,25 +309,163 @@ pub struct FoldHasher {
     seeds: FoldSeeds,
 }
 
-// The seeds foldhash mixes with.
+// The six seeds foldhash mixes with (its SharedSeed).
 #[derive(Clone, Copy, Debug)]
 pub struct FoldSeeds {
-    seeds: [u64; 4],
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+    s4: u64,
+    s5: u64,
 }
 
 impl FoldSeeds {
+    // foldhash's fixed seeds.
     pub fn fixed() -> FoldSeeds {
-        crate::panic::todo()
+        FoldSeeds {
+            s0: 0xc0ac29b7c97c50dd,
+            s1: 0x3f84d5b5b5470917,
+            s2: 0x9216d5d98979fb1b,
+            s3: 0xd1310ba698dfb5ac,
+            s4: 0x2ffd72dbd01adfb7,
+            s5: 0xb8e1afed6a267e96,
+        }
     }
 
+    // The seeds made from one u64 (foldhash's SharedSeed::from_u64).
     pub fn from_u64(seed: u64) -> FoldSeeds {
-        crate::panic::todo()
+        let a = fold_mix3(seed);
+        let b = fold_mix3(a);
+        let c = fold_mix3(b);
+        let d = fold_mix3(c);
+        let e = fold_mix3(d);
+        let f = fold_mix3(e);
+        // zeros are the multiply's weak point: some bits forced on
+        let ones: u64 = 0x8000000080000001;
+        FoldSeeds {
+            s0: a | ones,
+            s1: b | ones,
+            s2: c | ones,
+            s3: d | ones,
+            s4: e | ones,
+            s5: f | ones,
+        }
     }
 }
 
+fn fold_mix3(x: u64) -> u64 {
+    fold_mul(fold_mul(fold_mul(x, FOLD_ARBITRARY5), FOLD_ARBITRARY5), FOLD_ARBITRARY5)
+}
+
+// foldhash's hash of 0 to 16 bytes into the accumulator.
+fn fold_bytes_short(b: &[u8], acc: u64, s1: u64) -> u64 {
+    let n = b.len();
+    let mut x = acc;
+    let mut y = s1;
+    if n >= 8 {
+        x ^= read_le(b, 0, 8);
+        y ^= read_le(b, n - 8, 8);
+    } else if n >= 4 {
+        x ^= read_le(b, 0, 4);
+        y ^= read_le(b, n - 4, 4);
+    } else if n > 0 {
+        x ^= b[0] as u64;
+        y ^= ((b[n - 1] as u64) << 8) | b[n / 2] as u64;
+    }
+    fold_mul(x, y)
+}
+
+// foldhash's hash of more than 16 bytes into the accumulator.
+fn fold_bytes_long(bytes: &[u8], acc: u64, seeds: FoldSeeds) -> u64 {
+    let k = seeds.s0;
+    // what is left is bytes[at..]: n bytes from at (a reslice `v = &v[96..]`
+    // would do, once the borrow checker takes it)
+    let mut at: usize = 0;
+    let mut n = bytes.len();
+    let v = bytes;
+    let mut s0 = acc;
+    let mut s1 = acc.wrapping_add(seeds.s1);
+    if n > 128 {
+        let mut s2 = acc.wrapping_add(seeds.s2);
+        let mut s3 = acc.wrapping_add(seeds.s3);
+        if n > 256 {
+            let mut s4 = acc.wrapping_add(seeds.s4);
+            let mut s5 = acc.wrapping_add(seeds.s5);
+            loop {
+                s0 = fold_mul(read_le(v, at, 8) ^ s0, read_le(v, at + 48, 8) ^ k);
+                s1 = fold_mul(read_le(v, at + 8, 8) ^ s1, read_le(v, at + 56, 8) ^ k);
+                s2 = fold_mul(read_le(v, at + 16, 8) ^ s2, read_le(v, at + 64, 8) ^ k);
+                s3 = fold_mul(read_le(v, at + 24, 8) ^ s3, read_le(v, at + 72, 8) ^ k);
+                s4 = fold_mul(read_le(v, at + 32, 8) ^ s4, read_le(v, at + 80, 8) ^ k);
+                s5 = fold_mul(read_le(v, at + 40, 8) ^ s5, read_le(v, at + 88, 8) ^ k);
+                at += 96;
+                n -= 96;
+                if n <= 256 {
+                    break;
+                }
+            }
+            s0 ^= s4;
+            s1 ^= s5;
+        }
+        loop {
+            s0 = fold_mul(read_le(v, at, 8) ^ s0, read_le(v, at + 32, 8) ^ k);
+            s1 = fold_mul(read_le(v, at + 8, 8) ^ s1, read_le(v, at + 40, 8) ^ k);
+            s2 = fold_mul(read_le(v, at + 16, 8) ^ s2, read_le(v, at + 48, 8) ^ k);
+            s3 = fold_mul(read_le(v, at + 24, 8) ^ s3, read_le(v, at + 56, 8) ^ k);
+            at += 64;
+            n -= 64;
+            if n <= 128 {
+                break;
+            }
+        }
+        s0 ^= s2;
+        s1 ^= s3;
+    }
+    let e = at + n;
+    s0 = fold_mul(read_le(v, at, 8) ^ s0, read_le(v, e - 16, 8) ^ k);
+    s1 = fold_mul(read_le(v, at + 8, 8) ^ s1, read_le(v, e - 8, 8) ^ k);
+    if n >= 32 {
+        s0 = fold_mul(read_le(v, at + 16, 8) ^ s0, read_le(v, e - 32, 8) ^ k);
+        s1 = fold_mul(read_le(v, at + 24, 8) ^ s1, read_le(v, e - 24, 8) ^ k);
+        if n >= 64 {
+            s0 = fold_mul(read_le(v, at + 32, 8) ^ s0, read_le(v, e - 48, 8) ^ k);
+            s1 = fold_mul(read_le(v, at + 40, 8) ^ s1, read_le(v, e - 40, 8) ^ k);
+            if n >= 96 {
+                s0 = fold_mul(read_le(v, at + 48, 8) ^ s0, read_le(v, e - 64, 8) ^ k);
+                s1 = fold_mul(read_le(v, at + 56, 8) ^ s1, read_le(v, e - 56, 8) ^ k);
+            }
+        }
+    }
+    s0 ^ s1
+}
+
 impl FoldHasher {
+    // A hasher with the per-hasher seed and the shared seeds.
     pub fn with_seeds(seed: u64, seeds: FoldSeeds) -> FoldHasher {
-        crate::panic::todo()
+        FoldHasher { accumulator: seed, sponge_lo: 0, sponge_hi: 0, sponge_len: 0, seeds: seeds }
+    }
+
+    // bits bits of x into the sponge, multiplied in when it is full.
+    fn write_num(&mut self, x: u64, bits: usize) {
+        let len = self.sponge_len as usize;
+        if len + bits > 128 {
+            self.accumulator =
+                fold_mul(self.sponge_lo ^ self.accumulator, self.sponge_hi ^ self.seeds.s0);
+            self.sponge_lo = x;
+            self.sponge_hi = 0;
+            self.sponge_len = bits as u8;
+        } else {
+            if len < 64 {
+                self.sponge_lo |= x << len as u64;
+                if len > 0 && len + bits > 64 {
+                    self.sponge_hi |= x >> (64 - len) as u64;
+                }
+            } else {
+                self.sponge_hi |= x << (len - 64) as u64;
+            }
+            self.sponge_len = (len + bits) as u8;
+        }
     }
 }
 
@@ -239,41 +473,136 @@ impl FoldHasher {
 // std2: changed: the Hasher trait's methods (MVS: inherent)
 impl Hasher for FoldHasher {
     fn finish(&self) -> u64 {
-        crate::panic::todo()
+        if self.sponge_len > 0 {
+            fold_mul(self.sponge_lo ^ self.accumulator, self.sponge_hi ^ self.seeds.s0)
+        } else {
+            self.accumulator
+        }
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        crate::panic::todo()
+        let acc = rotate_right(self.accumulator, bytes.len());
+        if bytes.len() <= 16 {
+            self.accumulator = fold_bytes_short(bytes, acc, self.seeds.s1);
+        } else {
+            self.accumulator = fold_bytes_long(bytes, acc, self.seeds);
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write_num(i as u64, 8);
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.write_num(i as u64, 16);
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_num(i as u64, 32);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.write_num(i, 64);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.write_num(i as u64, 64);
     }
 }
 
-// SipHash-1-3.
+// SipHash-1-3 (Aumasson and Bernstein): Rust's DefaultHasher's function,
+// bit for bit. Bytes and integers are one stream: writing a u64 is
+// writing its 8 bytes, little-endian (the Hasher defaults).
 #[derive(Clone, Debug)]
 pub struct SipHasher13 {
     v0: u64,
     v1: u64,
     v2: u64,
     v3: u64,
+    // the bytes after the last full 8, little-endian, and their count
     tail: u64,
     ntail: usize,
+    // all the bytes written
     length: usize,
 }
 
 impl SipHasher13 {
     pub fn new_with_keys(k0: u64, k1: u64) -> SipHasher13 {
-        crate::panic::todo()
+        SipHasher13 {
+            v0: k0 ^ 0x736f6d6570736575,
+            v1: k1 ^ 0x646f72616e646f6d,
+            v2: k0 ^ 0x6c7967656e657261,
+            v3: k1 ^ 0x7465646279746573,
+            tail: 0,
+            ntail: 0,
+            length: 0,
+        }
+    }
+
+    // One SipRound.
+    fn round(&mut self) {
+        self.v0 = self.v0.wrapping_add(self.v1);
+        self.v1 = rotate_left(self.v1, 13);
+        self.v1 ^= self.v0;
+        self.v0 = rotate_left(self.v0, 32);
+        self.v2 = self.v2.wrapping_add(self.v3);
+        self.v3 = rotate_left(self.v3, 16);
+        self.v3 ^= self.v2;
+        self.v0 = self.v0.wrapping_add(self.v3);
+        self.v3 = rotate_left(self.v3, 21);
+        self.v3 ^= self.v0;
+        self.v2 = self.v2.wrapping_add(self.v1);
+        self.v1 = rotate_left(self.v1, 17);
+        self.v1 ^= self.v2;
+        self.v2 = rotate_left(self.v2, 32);
+    }
+
+    // The message word m, compressed in (one round: SipHash-1-3).
+    fn compress(&mut self, m: u64) {
+        self.v3 ^= m;
+        self.round();
+        self.v0 ^= m;
     }
 }
 
 // mvs: SipHasher13::write, SipHasher13::finish, SipHasher13::write_u8, SipHasher13::write_u16, SipHasher13::write_u32, SipHasher13::write_u64, SipHasher13::write_i64
 // std2: changed: the Hasher trait's methods (MVS: inherent)
 impl Hasher for SipHasher13 {
+    // The hash of what was written (the hasher is unchanged).
     fn finish(&self) -> u64 {
-        crate::panic::todo()
+        let mut s = self.clone();
+        let b = (((self.length as u64) & 0xff) << 56) | self.tail;
+        s.compress(b);
+        s.v2 ^= 0xff;
+        s.round();
+        s.round();
+        s.round();
+        s.v0 ^ s.v1 ^ s.v2 ^ s.v3
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        crate::panic::todo()
+        let n = bytes.len();
+        self.length += n;
+        let mut i: usize = 0;
+        if self.ntail != 0 {
+            let needed = 8 - self.ntail;
+            let take = if n < needed { n } else { needed };
+            self.tail |= read_le(bytes, 0, take) << (8 * self.ntail) as u64;
+            if n < needed {
+                self.ntail += n;
+                return;
+            }
+            let t = self.tail;
+            self.compress(t);
+            self.ntail = 0;
+            i = needed;
+        }
+        while n - i >= 8 {
+            self.compress(read_le(bytes, i, 8));
+            i += 8;
+        }
+        self.tail = read_le(bytes, i, n - i);
+        self.ntail = n - i;
     }
 }
 
