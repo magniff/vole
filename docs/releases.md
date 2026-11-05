@@ -169,6 +169,13 @@ Closures in full (clos272):
   &'a i64, y: &'a i64)` called as a `fn(&mut &i64, &i64)` value no longer
   stores a `y` that dies first into `*x` unseen; the erased type's
   lifetimes are one region there, stricter than rustc (L13).
+- `Send` and `Sync` are the rust edition's (borrowck.md AT1-AT3):
+  compiler-known auto traits decided by a type's parts, Rust's rules
+  (`&T` by `T: Sync`, raw pointers neither, `Cell` never Sync, a
+  closure by its captures, `fn` pointers both); `unsafe impl Send for
+  X {}` and the new `impl !Send for X {}` vouch for a type; a bound `T:
+  Send` that fails is `sync.not_send` (`sync.not_sync`), naming the
+  chain to the part that fails. 0.27.1 reported `edition.later`.
 - `--print-effects` leaves out the drop shims, which it printed as
   `(unknown)` (K-I7: nothing targets them, so nothing was masked).
 

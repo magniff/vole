@@ -1905,8 +1905,11 @@ loan's place as D1.4 says until Z9.5 replaces it.
 
 **AT1 (`Send`, `Sync`, compiler-known).** `Send` and `Sync` are traits
 whose impls the compiler decides (std2's `marker.vl` declares neither;
-they need no `use`, Z2). `τ: Send` and `τ: Sync` are decided
-structurally by `front/threads.vl` with Rust's rules:
+they need no `use`, Z2; `front/auto_traits.vl` makes each on its first
+use, an `unsafe` trait with no items, which a program's own trait of
+that name shadows). `τ: Send` and `τ: Sync` are decided structurally by
+`front/auto_traits.vl` with Rust's rules (a type recursive through a
+reference holds coinductively, as rustc's):
 - numbers, `bool`, `char`, `()`, `str`, fieldless enums, `fn` types:
   both;
 - `[T; n]`, `[T]`, tuples, and a struct or enum with no vouch (AT2):
@@ -1916,7 +1919,7 @@ structurally by `front/threads.vl` with Rust's rules:
   `Sync ⇔ T: Sync`; raw pointers: neither;
 - a closure `C`: by its environment's fields, so per capture: a `ref`
   capture needs `τₖ: Sync`, a `mut` or `val` capture `τₖ: Send` (for
-  `Send`); `X_C` adds nothing.
+  `Send`); every capture `τₖ: Sync` (for `Sync`); `X_C` adds nothing.
 std2's own types follow from these and from std2's vouches (AT2):
 `UnsafeCell<T>` and `Cell<T>` are `Send` iff `T: Send` and never
 `Sync`; the containers by their type and allocator arguments; `&'a
@@ -1924,7 +1927,13 @@ Arena<P>` is not `Sync`. std2 has no `sync` module in 0.27.2 (front-rust.md
 Z3.1: its atomics are private `thread` functions lowered by key, and
 `std::sync` is 0.27.3's); when it lands, its vouches are Rust's:
 `Mutex<T>` `Send` and `Sync` iff `T: Send`, `MutexGuard<'a, T>` never
-`Send`, the atomic types both. No AT rule reads a compiler-known item
+`Send`, the atomic types both. *Until the switch (0.27.2's Z1-Z6)* the
+edition's std is MVS's, whose containers and sync types are decided by
+`threads.vl`'s names as a bridge (`vouched_container`'s by their type
+arguments, `Mutex` by its `T: Send`, `Atomic`, `RawLock`, `JoinHandle`
+both), and the names reach std2's types of those names too; std2's own
+vouches (`unsafe impl<T: Send, A: Send> Send for Vec<T, A> {}`, ...)
+replace the bridge with it. No AT rule reads a compiler-known item
 (Z3.1's keys): `Send`, `Sync` and `Fn*` are the compiler's own names
 (Z2), and AT6 works by std2's signatures.
 `threads.vl`'s name list (`vouched_container`) and 0.21's view
@@ -1943,7 +1952,8 @@ trait is an error. Any vouch of a trait for `X` replaces AT1's
 structural rule for every instance of `X`: `X<τ..>: Send` iff some
 positive vouch applies to it (F4's applicability: its header unifies
 and its `where` bounds hold). A positive and a negative vouch that
-overlap are `trait.overlap` (F4). Stable rustc has no negative impls,
+overlap are `trait.overlap` (F4; 0.27.2: the coherence check's
+"conflicting impls", one impl per trait and type). Stable rustc has no negative impls,
 so a case using one is `// RUSTC: none` for the twin.
 
 **AT3 (bounds).** `T: Send` and `T: Sync`, in a parameter list or a
@@ -1951,7 +1961,13 @@ so a case using one is `// RUSTC: none` for the twin.
 argument `τ`; for a closure argument, per capture as AT1 says. A
 failure is `error sync.not_send` / `sync.not_sync` (rustc E0277) at the
 instantiating call, with the chain to the failing part (`threads.vl`'s
-reason: the type, the field, the part).
+reason: the type, the field, the part). The check is `check_bound`
+(`front/auto_traits.vl`), called by `traits.vl`'s `check_bounds`; the
+chain is each step outermost first (`its field 'inner', 'Inner', is
+not Send; ...`), ending at the leaf: a raw pointer, an `UnsafeCell`
+(never Sync), a negative vouch or a positive one whose bounds fail. The
+rustc twin maps E0277's "cannot be sent / shared between threads" to
+both codes. Cases `rust_b_auto_*`.
 
 **AT4, AT5** (leakage through an opaque type; the opaque instance's
 `Ω: Send`) are 0.27.2.1's, with §21–§22.
