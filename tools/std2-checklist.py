@@ -18,6 +18,9 @@ per feature, how many items wait for it.
 The check is compiler/std2/typecheck.txt (TYPECHECK below): an error's
 item is the one whose lines hold it (an inherent impl's header: each of
 its members).
+A trait marked `#[builtin_impls(TYPES)]` (its impls for the primitive
+types, the compiler's) gets a line of its own for them, `impl Trait for
+primitives`, waiting for primitive_builtin.
 
 What feeds it, in an item's comment (and an impl's or trait's, for all its
 items):
@@ -222,6 +225,7 @@ def read_file(path, module, rel):
     marks = []
     comment = []
     derive = False
+    builtin = None  # (line, types) of a `#[builtin_impls(..)]` before a trait
     block = None  # dict(kind=trait|impl|traitimpl, owner, trait, later, ...)
     order = 0
     for i, line in enumerate(lines):
@@ -231,6 +235,9 @@ def read_file(path, module, rel):
         if line.strip().startswith("#["):
             if line.strip().startswith("#[derive("):
                 derive = True
+            m = re.match(r"#\[builtin_impls\((.*)\)\]\s*$", line.strip())
+            if m:
+                builtin = (i + 1, m.group(1).strip())
             continue
         if block is not None and line.startswith("}"):
             block = None
@@ -273,6 +280,14 @@ def read_file(path, module, rel):
                                   later=sorted(set(bl + auto_later(sig, False, kind))), mvs=bm, status=bs, why=bw,
                                   order=order, file=rel, line=i + 1))
                 marks.append((i + 1, items[-1]))
+                if kind == "trait" and builtin:
+                    # the trait's impls for the primitive types: one line, the compiler's
+                    order += 1
+                    items.append(dict(module=module, owner=None, name=f"impl {name} for primitives", kind="impl",
+                                      sig=f"impl {name} for each of {builtin[1]}", later=[], forced=["primitive_builtin"],
+                                      mvs=[], status="new", why="", order=order, file=rel, line=builtin[0]))
+                    marks.append((builtin[0], items[-1]))
+                builtin = None
                 if kind == "trait" and not line.rstrip().endswith("}"):
                     block = dict(kind="trait", owner=name, trait=None, later=bl)
                 comment = []
@@ -310,6 +325,7 @@ TYPECHECK = os.path.join(TREE, "typecheck.txt")
 # A plain error (not edition.later) -> the front gap it shows, a features.tsv
 # name: the first pattern that matches "FILE: error[KIND] MESSAGE" wins.
 GAPS = [
+    (r"unknown attribute 'builtin_impls'", "primitive_builtin"),
     (r"^<std>.*duplicate method", "std2_root"),
     (r"edition\.std_by_value", "std2_root"),
     (r"duplicate method", "method_name_clash"),
@@ -421,10 +437,11 @@ def errors_to_items(errs, items):
                 lines_of[err["file"]] = open(os.path.join(TREE, err["file"])).read().split("\n")
             fl = lines_of[err["file"]]
             ln = err["line"]
-            while ln <= len(fl) and fl[ln - 1].strip().startswith("#["):
+            while ln <= len(fl) and fl[ln - 1].strip().startswith("#[") \
+                    and not fl[ln - 1].strip().startswith("#[builtin_impls("):
                 ln += 1
             last = None
-            for at, what in MARKS[err["file"]]:
+            for at, what in sorted(MARKS[err["file"]], key=lambda m: m[0]):
                 if at > ln:
                     break
                 last = what
@@ -580,10 +597,11 @@ def main():
         name = (f"{own}::" if own else "") + it["name"]
         test = "std2_" + re.sub(r"[^A-Za-z0-9]+", "_", it["module"][len("std"):].strip(":") + "_" + name).strip("_")
         got = by.get(id(it), [])
-        real = sorted({g for _, g in got})
-        if not got:
+        forced = it.get("forced", [])
+        real = sorted({g for _, g in got} | set(forced))
+        if not got and not forced:
             state = "ok"
-        elif all(e["kind"] == "edition.later" for e, _ in got):
+        elif all(e["kind"] == "edition.later" or g in forced for e, g in got):
             state = "later"
         else:
             state = "error"

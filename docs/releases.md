@@ -106,19 +106,22 @@ The rust edition's std, its API as a spec tree (std270):
   with elided regions (no `for<>`); and the allocators: Allocator in
   Rust's shape with `FREES`, Gpa, Arena<P> with a safe `reset(&mut
   self)`, ArenaScope, TypedArena<T, P>, FixedBuf<'b>, AnyAlloc<'a>.
+- A trait's impls for the primitive types are the compiler's, as MVS's
+  are: `#[builtin_impls(i8, ..., bool)]` on the trait (42 traits), as
+  `#[array_builtin(N)]` is for arrays; both wait for 0.27.2.
 - `compiler/std2/checklist.tsv` (tools/std2-checklist.py) lists every item
-  against MVS's std: 1,376 items, of which 297 kept, 15 renamed, 162
-  changed and 902 new, and 70 MVS items gone, each with its replacement;
+  against MVS's std: 1,414 items, of which 297 kept, 15 renamed, 162
+  changed and 940 new, and 70 MVS items gone, each with its replacement;
   every MVS item of the modules in scope is accounted for. Each item says
-  what the real check makes of it (`typecheck.txt`, the front's 440
-  errors on the tree, mapped to their items): 1,012 typecheck, 142 have
-  only `edition.later` errors and 222 a plain one. It names the features
+  what the real check makes of it (`typecheck.txt`, the front's 480
+  errors on the tree, mapped to their items): 1,010 typecheck, 184 have
+  only `edition.later` errors and 220 a plain one. It names the features
   it waits for, the `edition.later` codes (where_bound, char, FnOnce,
-  supertraits, impls for references, ...: 0.27.2) and, for a plain error,
-  the front gap it shows (an impl parameter fixed only by the trait, std2
-  checked beside MVS's std, a trait parameter's default in an impl
-  header, ...: in `features.tsv`, no release yet), and the gate-1 test
-  that will cover it.
+  supertraits, impls for references, the primitives' impls, ...:
+  0.27.2) and, for a plain error, the front gap it shows (an impl
+  parameter fixed only by the trait, std2 checked beside MVS's std, a
+  trait parameter's default in an impl header, ...: in `features.tsv`,
+  no release yet), and the gate-1 test that will cover it.
 - `compiler/std2/rewrite.tsv` is the std part of `fix --edition rust`'s
   table (0.27.3): 248 rows for 233 MVS items, each call, type name or
   impl shape that changes, chosen by type (`v.get(i)` is `v[i]` for a
