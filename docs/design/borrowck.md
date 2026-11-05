@@ -409,6 +409,13 @@ with `v = var(T_src, i)` the variance of that slot in the type (D5.4):
 = *`: none. When the arguments are places, their slots are
 `regions(P)`.
 
+*(0.27.2) A `let` type annotation* (`let r: &'static T = e;`, rustc's
+user type annotation): the annotation is walked against the local's
+type (D4.2's parallel walk) and each slot whose region it names
+outlives it (`'r : 'static`, `'r : 'a` for a named `'a` of the
+function); an elided region adds nothing. With the assignment's `sub`,
+the initializer's regions outlive the annotation's.
+
 **D3.6 (constraints per statement and terminator).** One pass over
 `P_STMTS` in RPO after elaboration (so `DS_*` decisions and flags
 exist). Types are read by `full_place_type` and the slot layout, never
@@ -1005,6 +1012,24 @@ outside the holes named below.
 - R6 `fn` pointer types carry no late-bound regions (D3.3). Reason: no
   `for<'a>` until 0.29; a `fn(&T) -> &U` value's call uses E1-E2 at the
   call.
+  *(0.27.2) D20.5 is not enforced:* a `fn` value is accepted for an
+  `Fn*` bound whatever its lifetimes, early-bound included, where L9
+  says `closure.sig`. In the instance the value's type is the erased
+  `fn` type (no slots), so nothing of the fn's own signature reaches the
+  bound's body. *The call (0.27.2):* a call through a `fn` value (`constraints.vl`
+  `indirect_call`) is E1-E2 over its erased type: every region of an
+  argument outlives every region of the result (E2's one input region;
+  with several, each of them, stricter than a signature naming one).
+  0.27.1 made no constraint there, so a result could outlive its
+  argument; cases `rust_b_err_fn_value_result`, `rust_b_ok_fn_value_result`.
+  *Still open:* a flow between two arguments through a `fn` value (`fn
+  store<'a>(x: &mut &'a T, y: &'a T)` used as `fn(&mut &T, &T)`): the
+  erased type drops the `'a` that ties them and E1 gives each its own
+  region, so the store is not seen at the caller (rustc rejects the
+  coercion as not general enough). No other statement drops its
+  constraints: an intrinsic has no reference result, and a call of a
+  generic parameter's method or of a closure is a direct call in the
+  instance.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` are
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` may coexist on an
   array and through a `&mut [T]`; rustc rejects both (only slice
