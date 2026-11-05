@@ -13,14 +13,16 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym, err_try_fmt};
 use crate::front::assoc::{infer_from_assoc, is_projection_node};
-use crate::front::ast::{NODE_REF, NodeKind, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{
+    NODE_REF, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
 use crate::front::ast::NodeKind::{
     Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, Defer, EnumPanic, ExprStmt,
     FieldAccess, FieldInit, Fn, For, If, Index, Let, Loop, Match, MethodCall, Param, PatLit,
     PatRange, Range, Repeat, Return, TupleField, TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple,
     Unary, While,
 };
-use crate::front::check::Res;
+use crate::front::check::{Res, has_error_type};
 use crate::front::check::args::is_default_arg;
 use crate::front::check::collect::{add_fn, template_of_type_node};
 use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
@@ -37,7 +39,8 @@ use crate::front::generics::{
 use crate::front::modules::module_of;
 use crate::front::traits::check_bounds;
 use crate::front::types::{
-    ENUMS, TY_NEVER, TyKind, buf_type, decay_ref, err_type, is_integer, is_mut_slice, type_elem,
+    ENUMS, REF_MUT, REF_SHARED, TY_NEVER, TY_UNIT, TyKind, buf_type, decay_ref, err_type,
+    is_integer, is_mut_slice, type_elem,
 };
 
 // ---- Inference ----
@@ -266,6 +269,122 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inout Ctx
             return ok;
         }
         true
+    }
+}
+
+// (0.27.2) Whether the type pattern p (a type node of an impl's header,
+// whose parameters `params` are being bound: bound[i] the type of
+// parameter i, 0 while unknown) matches type t exactly: a parameter
+// binds to t (or must equal what it was bound to), a template must be
+// t's template with its arguments matched, a reference, slice, array,
+// tuple or fn type must be t's kind with its parts matched, any other
+// name must resolve (in module tmod) to t. A projection (`I::Item`) is
+// left for the bounds (F14.1). Unlike `unify`, which is lenient, a
+// mismatch is false. RULE: F0.3
+pub fn match_type(params: i64, bound: *i64, tmod: i64, p: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
+    // UNSAFE: `bound` is a raw array (the caller's alloc_array), and TLISTS a
+    // raw table, as unify's are.
+    // SAFETY: bound has one slot per parameter of `params` (tparam_index
+    // bounds k); a TLISTS range read is the instance's own arguments.
+    unsafe {
+        if p == 0 || t == 0 || has_error_type(t, pcx) {
+            return true;
+        }
+        let kind = pcx.nodes[p].kind;
+        let tk = pcx.types[t].kind;
+        if kind == TyName {
+            if is_projection_node(p, pcx) {
+                return true;
+            }
+            if pcx.nodes[p].count == 0 && pcx.nodes[p].g == 0 {
+                match tparam_index(params, pcx.nodes[p].a, pcx) {
+                    Option::Some(k) => {
+                        if bound[k] == 0 {
+                            bound[k] = t;
+                            return true;
+                        }
+                        return bound[k] == t;
+                    }
+                    Option::None => {}
+                }
+            }
+            let saved = pcx.cur_mod;
+            pcx.cur_mod = tmod;
+            let g = pcx.nodes[p].g;
+            if g == 0 {
+                let r = resolve_type(p, &pcx);
+                pcx.cur_mod = saved;
+                return r == t;
+            }
+            let tpl = template_of_type_node(p, &pcx);
+            pcx.cur_mod = saved;
+            if tpl == TPL_NONE || !instance_of(t, tpl, pcx) {
+                return false;
+            }
+            let targs = instance_targs(t, &pcx);
+            for i in 0..pcx.nodes[g].count {
+                if !match_type(params, bound, tmod, child(g, i, pcx), pcx.tlists.data[targs + i],
+                    &pcx) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if kind == TyPtr {
+            let is_ref = (pcx.nodes[p].p & NODE_REF) != 0;
+            let is_mut = (pcx.nodes[p].p & NODE_REF_MUT) != 0;
+            // (the rust edition's `&[T]` and `&str` are views until Z9: a
+            // `&T` header matches T to the view, as resolve_type reads it)
+            if is_ref && !is_mut && tk == TyKind::Slice && pcx.types[t].b == 0 {
+                return match_type(params, bound, tmod, pcx.nodes[p].a, t, &pcx);
+            }
+            if is_mut && is_mut_slice(t, pcx) {
+                return match_type(params, bound, tmod, pcx.nodes[p].a, decay_ref(t, &pcx), &pcx);
+            }
+            if tk != TyKind::Ptr {
+                return false;
+            }
+            let want = if is_mut { REF_MUT } else if is_ref { REF_SHARED } else { 0 };
+            if pcx.types[t].b != want {
+                return false;
+            }
+            return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[t].a, &pcx);
+        }
+        if kind == TySlice {
+            if tk != TyKind::Slice
+                || ((pcx.nodes[p].p & NODE_REF_MUT) != 0) != is_mut_slice(t, pcx) {
+                return false;
+            }
+            return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[t].a, &pcx);
+        }
+        if kind == TyArray {
+            if tk != TyKind::Array {
+                return false;
+            }
+            return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[t].a, &pcx);
+        }
+        if kind == TyTuple || kind == TyFn {
+            if !(kind == TyTuple && tk == TyKind::Tuple || kind == TyFn && tk == TyKind::Fn)
+                || pcx.nodes[p].count != pcx.types[t].count {
+                return false;
+            }
+            for i in 0..pcx.nodes[p].count {
+                if !match_type(params, bound, tmod, child(p, i, pcx), type_elem(t, i, pcx), &pcx) {
+                    return false;
+                }
+            }
+            if kind == TyFn {
+                return match_type(params, bound, tmod, pcx.nodes[p].a, pcx.types[t].a, &pcx);
+            }
+            return true;
+        }
+        if kind == NodeKind::TyUnit {
+            return t == TY_UNIT;
+        }
+        if kind == NodeKind::TyNever {
+            return t == TY_NEVER;
+        }
+        false
     }
 }
 
@@ -666,6 +785,7 @@ pub fn fn_instance(tf: i64, mark: i64, origin: i64, pcx: inout Ctx<Comp>) -> i64
         let saved_pos = pcx.self_bound_pos;
         pcx.self_bound_pos = pcx.nodes[origin].start;
         pcx.self_type = resolve_type(pcx.nodes[template].h, &pcx);
+        pcx.self_impl = crate::front::traits::impl_of_fn(tf, pcx);
         pcx.self_bound_pos = saved_pos;
         pcx.cur_mod = pcx.fns[f].module;
     } else {
