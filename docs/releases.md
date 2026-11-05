@@ -131,6 +131,35 @@ The rust edition's std, its API as a spec tree (std270):
   front/stdsrc_rust.vl (std2_source and its index), for 0.27.2; run now
   it would add about 0.26 MB to the binary. MVS's stdsrc.vl is unchanged.
 
+The compiler's last exempt statics, Ctx's raw tables and its task contexts (left270):
+
+- SYMS and TYPES (the symbols, their hash tables, the types, their lists
+  and hash) are fields of `base::ctx::Ctx`. Each is read through a lookup
+  that writes nothing: find_type, a symbol's find_sym, layouts made on the
+  main thread by `lay_out_types` before code generation, the halves of
+  256-bit vectors, and the runtime's symbols made in prepare_tasks. The
+  tasks only read them. A symbol's text is a pointer and a length, read by
+  `base::sym_text`. The alloc exemption (`is_exempt_static`) is deleted:
+  no static is exempt. The compiler's statics went from 188 to 177.
+- `volec refactor table Ctx.x` takes a struct's field `x: *T`, with its
+  count and capacity fields, to `Vec<T, A>`, A being the struct's last
+  type parameter (tests/refactor/table270.t). Ctx's structs, fns, statics,
+  variants, modules, locals, relocs and consts are Vecs, and `fix --only
+  unneeded-unsafe` took away the 267 unsafe blocks their indexing needed.
+  The compiler's unjustified unsafe sites went from 3,054 to 2,788.
+- `fix --only rawptr` takes a call into a let before its statement when
+  it is nested in the arguments of another call given the same local
+  (`ir_make(cx, ir_val(cx, ..))`, where both inout would be own.conflict).
+  It does the same for an argument nesting such calls, an if's condition,
+  an operator's operands (the left of `&&` and `||`) and a place's index.
+  A run that takes some says so and decides no parameter; the next run
+  decides them. rawptr-list names the call that keeps a parameter raw
+  (`at FILE:LINE`) (tests/refactor/rawptr0270.t). Run over compiler/src,
+  it made 121 task contexts `inout FnCtx`: `cx: *FnCtx` went from 143 to
+  24. The 17 left for nested-call (ir_val, ir_arg and ir_operand among
+  them) are called on the right of `&&` or `||`, or beside a borrowed part
+  of the context. Unjustified unsafe went from 2,788 to 2,776.
+
 ### What's new in 0.26.5
 
 The compiler's statics in context structs, the rest: 1,234 statics to 188, the tables code generation's threads read included, and the alloc exemption down to two statics. Built and tested on aarch64-macos only.
