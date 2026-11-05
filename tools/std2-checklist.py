@@ -144,6 +144,7 @@ def markers(comment):
 
 
 def auto_later(sig, in_trait, kind):
+    """in_trait: an item of a trait or impl block (an assoc const or type)."""
     t = []
     if re.search(r"\bchar\b", sig):
         t.append("char")
@@ -227,6 +228,7 @@ def read_file(path, module, rel):
                 bl, bm, bs, bw = markers(comment)
                 if owner_text.startswith("&"):
                     bl.append("impl_for_ref")
+                bl += auto_later(header, False, "impl")
                 block = dict(kind="traitimpl" if trait else "impl", owner=owner, trait=trait, later=bl)
                 if trait:
                     order += 1
@@ -261,7 +263,7 @@ def read_file(path, module, rel):
                 order += 1
                 items.append(dict(module=module, owner=block["owner"], name=name, kind=kind, sig=sig,
                                   later=sorted(set(bl + block["later"] +
-                                                   auto_later(sig, block["kind"] == "trait", kind))),
+                                                   auto_later(sig, True, kind))),
                                   mvs=bm, status=bs, why=bw, order=order, file=rel, line=i + 1))
         comment = []
         derive = False
@@ -402,10 +404,19 @@ def main():
         if len(g) < 3:
             die(f"gone.tsv: a line needs MODULE, MVS item and replacement: {g}")
         k = key_of(g[1])
-        if k not in mvs:
+        if k[1] == "*":
+            # Owner::* : the type and every item of it that no std2 item names
+            keys = sorted(x for x in mvs if x[0] == k[0] and x not in used) + \
+                ([(None, k[0])] if (None, k[0]) in mvs and (None, k[0]) not in used else [])
+            if not keys:
+                die(f"gone.tsv: {g[1]} names no MVS item")
+        elif k not in mvs:
             die(f"gone.tsv: {g[1]} is no MVS item")
-        used.add(k)
-        rows.append([g[0], "-", "-", "gone", g[1], "", "", "", g[2], ""])
+        else:
+            keys = [k]
+        for k in keys:
+            used.add(k)
+            rows.append([g[0], "-", "-", "gone", (f"{k[0]}::" if k[0] else "") + k[1], "", "", "", g[2], ""])
     # completeness: in-scope MVS items no line accounts for
     missing = sorted(f"{o + '::' if o else ''}{n} ({m})" for (o, n), (m, k) in mvs.items()
                      if (o in SCOPE_OWNERS or (o is None and m in SCOPE_MODULES and k == "fn"))
