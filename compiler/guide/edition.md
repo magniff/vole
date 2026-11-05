@@ -22,7 +22,8 @@ before; the edition is per program, from its root file.
   std::ops::{Deref, Index}`): `*w`, `w.f`, `w.m()`, `g[i]`;
 - `&impl Trait` and `impl Trait` arguments, `#[derive(Clone, Copy,
   PartialEq, ...)]` (Copy is what a plain type is already);
-- `*const T` and `*mut T`, quoted labels `'outer:`.
+- `*const T` and `*mut T`, quoted labels `'outer:`; MVS's `var`, `inout`,
+  `sink` and `defer` are names.
 
 ```vole
 // EDITION: rust
@@ -90,7 +91,7 @@ program is checked. `volec explain edition.later`.
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`), `deferred_init` (`let x;`) | 0.27.1 |
-| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `array_builtin` | 0.27.2 |
+| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin` | 0.27.2 |
 
 ```vole
 // EDITION: rust
