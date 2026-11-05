@@ -39,6 +39,11 @@
 
 set -u
 LC_ALL=C
+# (0.27.2) The rust edition's examples are written against MVS's std
+# until they migrate to std2 (front-rust.md Z1): read with it, as the
+# cases marked `// ENV: VOLE_STD2=0` are. Gone by the release.
+VOLE_STD2=0
+export VOLE_STD2
 export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
