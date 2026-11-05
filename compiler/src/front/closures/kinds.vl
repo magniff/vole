@@ -1,0 +1,285 @@
+// (0.27.2) The kinds of the rust edition's closures (docs/design/borrowck.md
+// §19), decided before any body is built for the code generators or the
+// borrow checker (places::run_places):
+// - D19.2: a capture the body moves (an `OK_MOVE` of the captured place, or
+//   of a part of it reached with no deref) is by value, even when the
+//   closure is not `move`: the front captured it by `&`, which is undone
+//   here (its env field, its uses, its value in the env literal);
+// - D19.3: the kind is the expected bound's (check_closure_sig), or else
+//   `FnOnce` when a by-value capture is moved, `FnMut` when a capture is
+//   written, `Fn`;
+// - D19.4: the env parameter is `&Env` (Fn), `&mut Env` (FnMut) or `Env`
+//   (FnOnce);
+// - D19.6: a closure that is `FnOnce` checked against an `Fn`/`FnMut` bound
+//   with no expectation is `closure.kind` (rustc E0525).
+// The body read is the one the builder makes with the front's modes (the
+// definition's β°), built once here and dropped.
+
+use crate::base::{buf_new, buf_slice, buf_str, sym_text};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::report_error_once;
+use crate::front::ast::NodeKind;
+use crate::front::types::{FIELDS, REF_MUT, REF_SHARED, TyKind, ref_to};
+use crate::places::front::fn_node;
+use crate::places::ir::{
+    BK_MUT, BK_MUT2, Body, OK_MOVE, PJ_DEREF, PJ_FIELD, RV_REF, SK_ASSERT, SK_ASSIGN, SK_CALL,
+    SK_INTRINSIC, TK_SWITCH, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent, proj_val,
+};
+
+pub const KIND_FN: i64 = 2;
+pub const KIND_FN_MUT: i64 = 3;
+pub const KIND_FN_ONCE: i64 = 4;
+
+// What the body does to a capture (a bit set per capture).
+const DID_MOVE: i64 = 1;
+const DID_WRITE: i64 = 2;
+
+// RULE: D19.2, D19.3, D19.4, D19.6 Every rust-edition closure's kind, its
+// moved captures by value, its env parameter's type.
+pub fn infer_kinds(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    for id in 0..pcx.closures.len() as i64 {
+        let n = pcx.closures[id].node;
+        if pcx.closures[id].kind != 0 || pcx.closures[id].env_struct < 0
+            || !crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+            continue;
+        }
+        infer_kind(id, &pbody, &pcx);
+    }
+}
+
+fn infer_kind(id: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let count = pcx.closures[id].capture_count;
+    let expected = pcx.closures[id].expected;
+    if count == 0 {
+        // (no env parameter: what it is called by is all it is)
+        pcx.closures[id].kind = if expected != 0 { expected } else { KIND_FN };
+        return;
+    }
+    let did = scan_body(id, &pbody, &pcx);
+    var moves = false;
+    var writes = pcx.closures[id].writes;
+    for k in 0..count {
+        let d = did[k];
+        if (d & DID_MOVE) != 0 {
+            if mode_of(id, k, pcx) != 0 {
+                by_value(id, k, &pcx);
+            }
+            moves = true;
+        }
+        if (d & DID_WRITE) != 0 || mode_of(id, k, pcx) == 2 {
+            writes = true;
+        }
+    }
+    let inferred = if moves { KIND_FN_ONCE } else if writes { KIND_FN_MUT } else { KIND_FN };
+    let kind = if expected != 0 { expected } else { inferred };
+    pcx.closures[id].kind = kind;
+    if expected == 0 && kind == KIND_FN_ONCE && pcx.closures[id].bound_kind != 0 {
+        kind_error(id, did, &pcx);
+    }
+    set_env_type(id, kind, &pcx);
+}
+
+// The capture mode of capture k: 0 by value, 1 by `&`, 2 by `&mut`.
+fn mode_of(id: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.capture_list.get(pcx.closures[id].captures + 2 * k + 1)
+}
+
+// RULE: D19.2 What the closure's body, built with the front's modes, does to
+// each capture: moves it (or a part of it, with no deref), writes it.
+fn scan_body(id: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) -> Vec<i64, Comp> {
+    let count = pcx.closures[id].capture_count;
+    var did = Vec::<i64, Comp>::new_in(Comp {});
+    for _ in 0..count {
+        did.push(0);
+    }
+    let f = pcx.closures[id].f;
+    let saved_rust = pcx.rust_body;
+    let saved_storage = pcx.all_storage;
+    pcx.all_storage = true;
+    pcx.rust_body = crate::places::regions::rust_operands(f, &pcx);
+    let built = crate::places::build::build_body(f, fn_node(f, pcx), &pbody, &pcx);
+    pcx.rust_body = saved_rust;
+    pcx.all_storage = saved_storage;
+    if !built {
+        return did;
+    }
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        let k = st.kind;
+        if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == SK_ASSERT || k == TK_SWITCH {
+            for i in 0..st.nops {
+                if op_kind(st.ops, i, pbody) == OK_MOVE {
+                    let c = capture_at(id, op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), false,
+                        pbody, &pcx);
+                    if c >= 0 {
+                        did[c] = did[c] | DID_MOVE;
+                    }
+                }
+            }
+        }
+        if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 {
+            let c = capture_at(id, st.a, st.b, true, pbody, &pcx);
+            if c >= 0 {
+                did[c] = did[c] | DID_WRITE;
+            }
+        }
+        if k == SK_ASSIGN && st.c == RV_REF && (st.d == BK_MUT || st.d == BK_MUT2) && st.nops > 0 {
+            let c = capture_at(id, op_a(st.ops, 0, pbody), op_b(st.ops, 0, pbody), true, pbody,
+                &pcx);
+            if c >= 0 {
+                did[c] = did[c] | DID_WRITE;
+            }
+        }
+    }
+    did
+}
+
+// The capture whose captured variable place (l, p) is in, or -1: `_1` the
+// env, `(*_1).k` then, for a capture by `&`/`&mut`, its deref; beyond it
+// no deref (a move), or no deref of a shared or raw pointer (a write).
+fn capture_at(id: i64, l: i64, p: i64, write: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    if l != 1 || p == 0 {
+        return -1;
+    }
+    // (the projections, root first)
+    var steps = Vec::<i64, Comp>::new_in(Comp {});
+    var q = p;
+    while q != 0 {
+        steps.push(q);
+        q = proj_parent(q, pbody);
+    }
+    let n = steps.len() as i64;
+    if n < 2 || proj_kind(steps[n - 1], pbody) != PJ_DEREF
+        || proj_kind(steps[n - 2], pbody) != PJ_FIELD {
+        return -1;
+    }
+    let k = proj_val(steps[n - 2], pbody);
+    if k < 0 || k >= pcx.closures[id].capture_count {
+        return -1;
+    }
+    var i = n - 3;
+    let fi = pcx.structs[pcx.closures[id].env_struct].fields + k;
+    // UNSAFE: FIELDS is the front's global field table, a raw array (front::types)
+    // SAFETY: fi is capture k's field of the env struct, k < capture_count, which
+    // finish_closure made: in bounds and initialized
+    var t = unsafe { FIELDS[fi].ty };
+    if mode_of(id, k, pcx) != 0 {
+        if i < 0 || proj_kind(steps[i], pbody) != PJ_DEREF {
+            return -1;
+        }
+        t = pcx.types[t].a;
+        i -= 1;
+    }
+    while i >= 0 {
+        let pk = proj_kind(steps[i], pbody);
+        if pk == PJ_DEREF {
+            if !write {
+                return -1;
+            }
+            let tu = crate::places::ir::undistinct(t, pcx);
+            if tu <= 0 || pcx.types[tu].kind != TyKind::Ptr || pcx.types[tu].b != REF_MUT {
+                return -1;
+            }
+        }
+        t = crate::places::ir::step_type(t, pk, proj_val(steps[i], pbody), &pcx);
+        i -= 1;
+    }
+    let _ = local_ty(l, pbody);
+    k
+}
+
+// RULE: D19.2 Capture k of closure id, captured by `&`, is moved by its body:
+// by value instead, its env field, its uses and its env literal's value.
+fn by_value(id: i64, k: i64, pcx: inout Ctx<Comp>) {
+    let local = pcx.capture_list.get(pcx.closures[id].captures + 2 * k);
+    let local_type = pcx.locals[local].ty;
+    let at = pcx.closures[id].captures + 2 * k + 1;
+    pcx.capture_list.set(at, 0);
+    let s = pcx.closures[id].env_struct;
+    let field = pcx.structs[s].fields + k;
+    // UNSAFE: FIELDS is the front's global field table, a raw array (front::types)
+    // SAFETY: field indexes the env struct's own fields, made by finish_closure
+    // below field_count, so it is in bounds and initialized; nothing holds it
+    unsafe {
+        FIELDS[field].ty = local_type;
+    }
+    // (its uses: `*(*env).x` becomes `(*env).x`)
+    for u in 0..pcx.closures[id].use_count {
+        let node = pcx.capture_list.get(pcx.closures[id].use_at + 2 * u);
+        if pcx.capture_list.get(pcx.closures[id].use_at + 2 * u + 1) != local
+            || pcx.nodes[node].kind != NodeKind::Unary {
+            continue;
+        }
+        let field = pcx.nodes[node].b;
+        pcx.nodes[node].kind = NodeKind::FieldAccess;
+        pcx.nodes[node].op = pcx.nodes[field].op;
+        pcx.nodes[node].a = pcx.nodes[field].a;
+        pcx.nodes[node].b = pcx.nodes[field].b;
+        pcx.nodes[node].x = pcx.nodes[field].x;
+        pcx.nodes[node].y = pcx.nodes[field].y;
+    }
+    // (the env literal's value: `&x` becomes `x`)
+    let lit = pcx.nodes[pcx.closures[id].node].y;
+    for j in 0..pcx.nodes[lit].count {
+        let init = crate::front::ast::child(lit, j, pcx);
+        let value = pcx.nodes[init].b;
+        if pcx.nodes[init].x == k && pcx.nodes[value].kind == NodeKind::Unary {
+            pcx.nodes[init].b = pcx.nodes[value].b;
+            pcx.nodes[init].ty = local_type;
+        }
+    }
+}
+
+// RULE: D19.4 The env parameter's type by the kind, in the closure's
+// function and at every use of the env in its body.
+fn set_env_type(id: i64, kind: i64, pcx: inout Ctx<Comp>) {
+    let env = pcx.closures[id].mark;
+    let c = pcx.closures[id].ty;
+    let env_ty = if kind == KIND_FN { ref_to(c, REF_SHARED, &pcx) }
+        else if kind == KIND_FN_MUT { ref_to(c, REF_MUT, &pcx) } else { c };
+    pcx.locals[env].ty = env_ty;
+    let f = pcx.closures[id].f;
+    pcx.tlists.set(pcx.fns[f].params, env_ty);
+    for u in 0..pcx.closures[id].use_count {
+        let node = pcx.capture_list.get(pcx.closures[id].use_at + 2 * u);
+        // (`(*env).x`, or `*(*env).x`: the field access under the deref)
+        let field = if pcx.nodes[node].kind == NodeKind::Unary { pcx.nodes[node].b } else { node };
+        let base = pcx.nodes[field].a;
+        if pcx.nodes[field].kind != NodeKind::FieldAccess || base <= 0 {
+            continue;
+        }
+        pcx.nodes[base].ty = env_ty;
+        if kind == KIND_FN_ONCE {
+            pcx.nodes[field].y = 0;
+        }
+    }
+}
+
+// RULE: D19.6 A closure that moves a capture, checked against an `Fn` or
+// `FnMut` bound with no expectation: closure.kind (rustc E0525).
+fn kind_error(id: i64, did: Vec<i64, Comp>, pcx: inout Ctx<Comp>) {
+    var moved = -1;
+    for k in 0..pcx.closures[id].capture_count {
+        if moved < 0 && (did[k] & DID_MOVE) != 0 {
+            moved = pcx.capture_list.get(pcx.closures[id].captures + 2 * k);
+        }
+    }
+    let m = buf_new();
+    buf_str(m, c"this closure moves '");
+    if moved >= 0 {
+        crate::base::buf_bytes(m, sym_text(pcx.locals[moved].name, pcx));
+    }
+    buf_str(m, if pcx.closures[id].bound_kind == KIND_FN {
+        c"' out of its environment, so it is `FnOnce`, not `Fn` as its bound asks"
+    } else {
+        c"' out of its environment, so it is `FnOnce`, not `FnMut` as its bound asks"
+    });
+    let help = if pcx.closures[id].bound_kind == KIND_FN {
+        c"make the bound `FnOnce`, or move a `.clone()` of the value into the closure"
+    } else {
+        c"make the bound `FnOnce`, or move a `.clone()` of the value into the closure"
+    };
+    report_error_once(pcx.nodes[pcx.closures[id].node].start, 0, c"closure.kind",
+        buf_slice(m).ptr, help, "", &pcx);
+}
