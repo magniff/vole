@@ -84,6 +84,14 @@ pub struct ImplInfo {
     pub node: i64, pub tr: i64, pub ty: i64, pub tpl: i64, pub module: i64, pub targs: i64,
 }
 
+// (0.27.2) A `where` predicate of the rust edition whose subject is not a
+// type parameter (`where Self: DoubleEndedIterator`, `where I::Item:
+// Clone`): on item `owner` (a Fn node; 0: an impl's, not checked yet),
+// its subject type node and its bounds (a Generics holder of bound
+// nodes). Checked where the item is used (traits::where_preds_hold).
+// RULE: F10.1
+pub struct WherePred { pub owner: i64, pub subject: i64, pub bounds: i64 }
+
 pub fn init_traits(pcx: inout Ctx<Comp>) {
     sym_table(&pcx.sym_trait, &pcx);
 }
@@ -199,6 +207,105 @@ pub fn trait_fn(tr: i64, name: i64, pcx: Ctx<Comp>) -> i64 {
 
 pub fn trait_declares(tr: i64, name: i64, pcx: Ctx<Comp>) -> bool {
     tr < 0 || trait_fn(tr, name, pcx) != 0
+}
+
+// (0.27.2) The supertraits of trait tr: a Generics holder of bound nodes
+// (parser::rust::parse_item_bounds), or 0. RULE: F2.1
+pub fn trait_supers(tr: i64, pcx: Ctx<Comp>) -> i64 {
+    pcx.nodes[pcx.traits[tr].node].h
+}
+
+// (0.27.2) Whether trait tr or one of its supertraits, to any depth
+// (bounded by MAX_ASSOC_DEPTH), declares function `name`. RULE: F2.2
+pub fn trait_declares_closure(tr: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    if trait_declares(tr, name, pcx) {
+        return true;
+    }
+    let supers = trait_supers(tr, pcx);
+    if supers == 0 || pcx.assoc_depth >= crate::front::assoc::MAX_ASSOC_DEPTH {
+        return false;
+    }
+    pcx.assoc_depth += 1;
+    var found = false;
+    for i in 0..pcx.nodes[supers].count {
+        let s = bound_trait(child(supers, i, pcx), &pcx);
+        if s >= 0 && trait_declares_closure(s, name, &pcx) {
+            found = true;
+        }
+    }
+    pcx.assoc_depth -= 1;
+    found
+}
+
+// (0.27.2) Whether the `where` predicates of item (a Fn node) hold for
+// the self type `self_ty` (`Self` in the subjects; the type parameters
+// in scope are the env's): each subject resolved, each of its bounds
+// checked as a parameter's is. When `report`, a failing one is `error
+// trait.unmet` at pos, soft. RULE: F10.2, F21.3
+pub fn where_preds_hold(item: i64, self_ty: i64, pos: i64, report: bool,
+    pcx: inout Ctx<Comp>) -> bool {
+    var ok = true;
+    for k in 0..pcx.where_preds.len() as i64 {
+        if pcx.where_preds[k].owner != item {
+            continue;
+        }
+        let subject = pcx.where_preds[k].subject;
+        let bounds = pcx.where_preds[k].bounds;
+        let saved_self = pcx.self_type;
+        let saved_mod = pcx.cur_mod;
+        pcx.self_type = self_ty;
+        pcx.cur_mod = module_of(subject, &pcx);
+        let t = resolve_type_or_error(subject, &pcx);
+        pcx.self_type = saved_self;
+        pcx.cur_mod = saved_mod;
+        if has_error_type(t, pcx) {
+            continue;
+        }
+        for i in 0..pcx.nodes[bounds].count {
+            let b = child(bounds, i, pcx);
+            let tr = bound_trait(b, &pcx);
+            var holds = if pcx.nodes[b].kind == NodeKind::TyFn { fn_bound_satisfied(b, t, &pcx) }
+                else if pcx.nodes[b].g != 0 {
+                    crate::front::convert::implements_with(tr, t, bound_args(b, &pcx), &pcx)
+                }
+                else { implements(tr, t, &pcx) };
+            if holds && pcx.nodes[b].h != 0 && !assoc_constraints_hold(b, t, &pcx) {
+                holds = false;
+            }
+            if holds {
+                continue;
+            }
+            ok = false;
+            if report {
+                let saved_kind = pcx.err_kind;
+                pcx.err_kind = c"trait.unmet";
+                err_begin(pos, &pcx);
+                err_fmt(format_args("the bound '{}: {}' of '{}' is not met: '",
+                    SRC[pcx.nodes[subject].start..pcx.nodes[subject].end],
+                    SRC[pcx.nodes[b].start..pcx.nodes[b].end],
+                    sym_text(pcx.nodes[item].a, pcx)), pcx);
+                err_type(t, pcx);
+                err_str(c"' does not implement it", pcx);
+                err_end_soft(&pcx);
+                pcx.err_kind = saved_kind;
+            }
+        }
+    }
+    ok
+}
+
+// (0.27.2) The `where` predicates of item `from` (a trait function's
+// declaration) are item `to`'s too (its default body copied into an
+// impl, collect_impl). RULE: F10.1
+pub fn copy_where_preds(from: i64, to: i64, pcx: inout Ctx<Comp>) {
+    let n = pcx.where_preds.len() as i64;
+    for k in 0..n {
+        if pcx.where_preds[k].owner == from {
+            let subject = pcx.where_preds[k].subject;
+            let bounds = pcx.where_preds[k].bounds;
+            pcx.where_preds.push(WherePred { owner: to, subject: subject, bounds: bounds });
+        }
+    }
 }
 
 // `impl<A> Tr for T<A>`: the impl's parameters, then f's own.
@@ -454,6 +561,7 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
         if generic_default {
             subst_trait_args(f, pcx.traits[tr].params, pcx.nodes[pcx.nodes[node].a].g, &pcx);
         }
+        copy_where_preds(decl, f, &pcx);
         pcx.nodes[f].d = if pcx.nodes[pcx.nodes[node].b].kind
             == NodeKind::TyName { pcx.nodes[pcx.nodes[node].b].a }
             else { intern_c(c"_", &pcx) };
@@ -480,6 +588,41 @@ pub fn collect_impl(node: i64, pcx: inout Ctx<Comp>) {
 // impl has its trait's signature, with Self the impl's type.
 pub fn check_impl_signatures(pcx: inout Ctx<Comp>) {
     unsafe {
+        // RULE: F2.3 (an impl of a trait with supertraits: the type
+        // implements each; a generic impl's are checked per instance, not
+        // yet)
+        for i in 0..pcx.traits_impls.len() as i64 {
+            let ty = pcx.traits_impls[i].ty;
+            let tr = pcx.traits_impls[i].tr;
+            let supers = trait_supers(tr, pcx);
+            if ty == 0 || supers == 0 {
+                continue;
+            }
+            // (`PartialEq<Self>`: Self is the impl's type)
+            let saved_self = pcx.self_type;
+            pcx.self_type = ty;
+            for k in 0..pcx.nodes[supers].count {
+                let b = child(supers, k, pcx);
+                let s = bound_trait(b, &pcx);
+                let holds = if pcx.nodes[b].g != 0 {
+                    crate::front::convert::implements_with(s, ty, bound_args(b, &pcx), &pcx)
+                } else { implements(s, ty, &pcx) };
+                if !holds {
+                    let saved_kind = pcx.err_kind;
+                    pcx.err_kind = c"trait.unmet";
+                    err_begin(pcx.nodes[pcx.traits_impls[i].node].start, &pcx);
+                    err_fmt(format_args("'{}' requires '", sym_text(pcx.traits[tr].name, pcx)),
+                        pcx);
+                    err_type(ty, pcx);
+                    err_fmt(format_args(": {}', which is not implemented",
+                        SRC[pcx.nodes[b].start..pcx.nodes[b].end]), pcx);
+                    err_help(c"implement the supertrait for the type first", pcx);
+                    err_end_soft(&pcx);
+                    pcx.err_kind = saved_kind;
+                }
+            }
+            pcx.self_type = saved_self;
+        }
         for f in 0..pcx.fns.len() as i64 {
             let i = impl_of_fn(f, pcx);
             if i < 0 || pcx.fns[f].generic > 0 || pcx.fns[f].tmpl != 0
@@ -1085,7 +1228,8 @@ pub fn bounded_param_of_type(n: i64, pcx: Ctx<Comp>) -> i64 {
 pub fn require_in_bounds(p: i64, name: i64, pos: i64, pcx: inout Ctx<Comp>) {
     let bounds = pcx.nodes[p].h;
     for i in 0..pcx.nodes[bounds].count {
-        if trait_declares(bound_trait(child(bounds, i, pcx), &pcx), name, pcx) {
+        // RULE: F2.2 (a bound's supertraits' functions too)
+        if trait_declares_closure(bound_trait(child(bounds, i, pcx), &pcx), name, &pcx) {
             return;
         }
     }

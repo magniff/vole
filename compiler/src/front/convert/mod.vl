@@ -15,7 +15,7 @@
 mod try_main;
 
 use crate::base::{
-    alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern, intern_c, sym_text,
+    alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, free, intern, intern_c, sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -34,8 +34,8 @@ use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsafe_through};
 use crate::front::check::widen::widens;
 use crate::front::generics::{
-    TPL_NONE, check_call_arg, env_enter, env_leave, hint_for, instance_of, mark_synthed,
-    template_name,
+    TPL_NONE, TPL_PATTERN, check_call_arg, env_enter, env_leave, hint_for, instance_of,
+    mark_synthed, template_name,
 };
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_NONE, Tok};
@@ -293,6 +293,58 @@ pub fn impl_targs(i: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
     r
 }
 
+// (0.27.2) impl_targs for a pattern impl whose header leaves a parameter
+// unbound (`impl<T> SliceIndex<[T]> for usize`): the parameters are
+// completed from the arguments of call n (types tys[..], 0 for a
+// literal; `skip` 1 for a method call) against the declared parameter
+// types of the impl's function f, then the trait arguments resolved; -1
+// when a parameter stays unbound. RULE: F14.1
+pub fn complete_impl_targs(i: i64, f: i64, n: i64, tys: *i64, skip: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
+    // UNSAFE: alloc_array/free for the bindings and the TLISTS reads, as
+    // instantiate_call's.
+    // SAFETY: bound has `count` slots, read and written for k < count; tys
+    // has one slot per argument of n (the caller's).
+    unsafe {
+        let node = pcx.traits_impls[i].node;
+        let params = pcx.nodes[node].g;
+        if pcx.traits_impls[i].tpl != TPL_PATTERN {
+            return -1;
+        }
+        let count = pcx.nodes[params].count;
+        let b = crate::front::traits::impl_bindings(i, pcx.self_type, &pcx);
+        let bound = alloc_array::<i64>(count);
+        for k in 0..count {
+            bound[k] = if b >= 0 { pcx.tlists.data[b + k] } else { 0 };
+        }
+        let item = pcx.fns[f].node;
+        let tmod = pcx.fns[f].module;
+        for k in 0..pcx.nodes[n].count {
+            if k + skip < pcx.nodes[item].count && tys[k] != 0 {
+                crate::front::generics::instantiate::unify(params, bound, tmod,
+                    pcx.nodes[child(item, k + skip, pcx)].b, tys[k], &pcx);
+            }
+        }
+        var complete = true;
+        let mark = pcx.tscratch.count;
+        for k in 0..count {
+            if bound[k] == 0 {
+                complete = false;
+            }
+            pcx.tscratch.push(bound[k]);
+        }
+        free(bound as *u8);
+        let targs = crate::front::generics::take_targs(mark, &pcx);
+        if !complete {
+            return -1;
+        }
+        let saved = env_enter(params, targs, count, &pcx);
+        let r = resolve_args(pcx.nodes[pcx.nodes[node].a].g, pcx.traits_impls[i].module, &pcx);
+        env_leave(saved, &pcx);
+        r
+    }
+}
+
 // The trait arguments of bound b (a TyName with type arguments, `From<U>`)
 // resolved in its module (with the parameters in scope that are bound
 // now): a TLISTS index.
@@ -383,6 +435,18 @@ fn impl_fn(i: i64, member: i64, pcx: Ctx<Comp>) -> i64 {
             return pcx.nodes[f].x - 1;
         }
     }
+    // (0.27.2: a generic trait's default copied into the impl, F12.1:
+    // collect_impl's impl_extra, not in the impl node's list)
+    for k in 0..pcx.impl_extra.count {
+        // UNSAFE: IMPL_EXTRA is a raw IntVec (base/comp.vl), as every table.
+        // SAFETY: k < count, the vector's own length.
+        let f = unsafe { pcx.impl_extra.data[k] };
+        if pcx.nodes[f].a == member && pcx.nodes[f].x != 0
+            && (pcx.nodes[f].p & FN_SIG_FAILED) == 0
+            && crate::front::traits::impl_of_fn(pcx.nodes[f].x - 1, pcx) == i {
+            return pcx.nodes[f].x - 1;
+        }
+    }
     -1
 }
 
@@ -442,7 +506,14 @@ fn takes(c: i64, n: i64, t: i64, tys: *i64, kinds: *i64, skip: i64, pcx: inout C
         if pcx.nodes[decl].count - skip != count {
             return false;
         }
-        let targs = impl_targs(i, t, &pcx);
+        var targs = impl_targs(i, t, &pcx);
+        if targs < 0 {
+            // RULE: F14.1 (a pattern impl's parameter fixed by the arguments)
+            let saved_self = pcx.self_type;
+            pcx.self_type = t;
+            targs = complete_impl_targs(i, pcx.cands.data[c + 1], n, tys, skip, &pcx);
+            pcx.self_type = saved_self;
+        }
         if targs < 0 {
             return false;
         }
