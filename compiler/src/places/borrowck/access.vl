@@ -13,7 +13,7 @@ use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::front::types::TyKind;
 use crate::places::borrowck::{Bck, LOAN_WORDS, MODE_MUT, MODE_RAW, MODE_SHARED, bit_on};
-use crate::places::borrowck::constraints::{is_mut_ref, mode_of};
+use crate::places::borrowck::constraints::mode_of;
 use crate::places::borrowck::diag::report;
 use crate::places::cfg::{pred, pred_count};
 use crate::places::ir::{
@@ -148,6 +148,7 @@ pub fn check(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
     }
     let nw = bck.nw_n;
     bck.reported.clear();
+    bck.bad_moves.clear();
     activations(&bck, pbody);
     constant_indexes(&bck, pbody);
     let nb = block_count(pbody);
@@ -376,13 +377,7 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
             let l = op_a(st.ops, i, pbody);
             let p = op_b(st.ops, i, pbody);
             if ok == OK_COPY {
-                if (k == SK_CALL || k == SK_ASSIGN && st.c == RV_USE)
-                    && is_mut_ref(crate::places::ir::full_place_type(l, p, pbody, &pcx), pcx) {
-                    // RULE: D3.6 (the reborrow reading: a write-borrow of `*Q`)
-                    access(true, A_WB, -1, l, p, 1, loc, &bck, pbody, &pcx);
-                } else {
-                    access(true, A_RC, -1, l, p, 0, loc, &bck, pbody, &pcx);
-                }
+                access(true, A_RC, -1, l, p, 0, loc, &bck, pbody, &pcx);
             } else {
                 access(true, A_WM, -1, l, p, 0, loc, &bck, pbody, &pcx);
             }
@@ -413,6 +408,7 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
                 if bk == BK_SHARED {
                     access(true, A_RB, -1, l, p, 0, loc, &bck, pbody, &pcx);
                 } else if bk == BK_MUT {
+                    shared_write(loc, l, p, &bck, pbody, &pcx);
                     access(true, A_WB, -1, l, p, 0, loc, &bck, pbody, &pcx);
                 } else if bk == BK_MUT2 {
                     access(true, A_RESERVE, -1, l, p, 0, loc, &bck, pbody, &pcx);
@@ -429,6 +425,7 @@ fn accesses(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Co
             }
         }
         if k != SK_ASSERT && k != TK_SWITCH && st.a >= 0 {
+            shared_write(loc, st.a, st.b, &bck, pbody, &pcx);
             access(false, A_WA, -1, st.a, st.b, 0, loc, &bck, pbody, &pcx);
         }
     } else if k == SK_DROP {
@@ -516,8 +513,46 @@ fn access(deep: bool, kind: i64, target: i64, l: i64, p: i64, deref: i64, loc: i
             // RULE: D6.2.2
             code = if escapes(j, &bck, pbody, &pcx) { C_RETURN_LOCAL } else { C_DROPPED_BORROWED };
         }
+        if code == C_MOVE_BORROWED {
+            bck.bad_moves.push(loc);
+        }
         report(code, kind, loc, j, l, p, deref, &bck, pbody, &pcx);
     }
+}
+
+// RULE: D2.6, L6 (a write through a shared reference: a guard's `ref mut`
+// binding, which the guard sees as `&T`; elsewhere the front rejects it)
+fn shared_write(loc: i64, l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    if p == 0 {
+        return;
+    }
+    crate::places::borrowck::constraints::walk_place(l, p, &bck, pbody, &pcx);
+    if bck.steps.len() < 2 {
+        return;
+    }
+    // (the guard's binding keeps its `&mut` type but is initialized by a
+    // shared borrow: a holder of shared references only)
+    if bck.steps[1] == MODE_SHARED || shared_holder(l, pbody) {
+        crate::places::borrowck::diag::report_shared_write(loc, l, p, &bck, pbody, &pcx);
+    }
+}
+
+// Whether every initialization of local l is a shared borrow (and there
+// is one).
+fn shared_holder(l: i64, pbody: Body<Comp>) -> bool {
+    var any = false;
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        if (st.kind == SK_ASSIGN || st.kind == SK_CALL || st.kind == SK_INTRINSIC) && st.a == l
+            && st.b == 0 {
+            if st.kind != SK_ASSIGN || st.c != RV_REF || st.d != BK_SHARED {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
 }
 
 // Whether D6.2.2 applies to loan j: its place is frame-owned (D1.6) and

@@ -404,17 +404,12 @@ with `v = var(T_src, i)` the variance of that slot in the type (D5.4):
 exist). Types are read by `full_place_type` and the slot layout, never
 re-inferred.
 - `SK_ASSIGN (a,b) = RV_USE op`, `op = copy Q` or `move Q`: `sub(type(Q)
-  ≤ type((a,b)))` over the places' regions. **Reborrow reading (the
-  stopgap for Q4):** if `type(Q)` is `&mut T`, `op = copy` and `Q` is
-  the whole reference value, the statement is read as `(a,b) = &'new
-  mut (*Q)`: a fresh loan of `*Q` (D2.1, with the accesses of D2.2 and
-  the supporting-prefix constraint `'q : 'new` for `Q`'s own slot
-  `'q`), and `sub(&'new mut T ≤ type((a,b)))`. Verified: the only such
-  copies at v0.27.0 are call arguments (`call f(copy _1)`). *IR change
-  (ir271 M2):* the builder emits `_t = &'new mut (*Q)` there; after it,
-  a `copy` of a whole `&mut` place is a verifier error
-  (`--verify-places`: "copy of an exclusive reference") and the reading
-  is retired.
+  ≤ type((a,b)))` over the places' regions. A `copy` of a whole `&mut`
+  place does not occur: the builder emits the reborrow `_t = &'new mut2
+  (*Q)` (or `&(*Q)`) for a `&mut` passed on (ir271 M2, Q4), an ordinary
+  `RV_REF` with the supporting-prefix constraint `'q : 'new` below, and
+  the verifier (`--verify-places`, I7) rejects such a `copy`. (M1's
+  reading of it as that reborrow was the stopgap until then; retired.)
 - `SK_ASSIGN (a,b) = RV_REF P` (`e = 'ℓ`, `d ≠ BK_RAW`): loan `ℓ`
   created; `sub(&'ℓ [mut] type(P) ≤ type((a,b)))` (a `BK_FAKE` loan:
   `type((a,b))` is `&type(P)`); **the supporting-prefix rule:** for
@@ -1138,8 +1133,10 @@ messages point at AST nodes because `fix` edits by node (0.27.3).
 One error per `(loan, access place, code)` in a body (a loop reports
 one conflict, not one per iteration path); one `borrowck.outlives` per
 `('a, 'v)` pair; one `return_local` per loan; one `use_moved` per
-`(path, use statement)`; the per-instance dedupe of D4.4(b). A body's
-errors are reported in location order.
+path (its first use in location order, as the own pass reports once
+per local), none for a use after a move reported `move_borrowed`; the
+per-instance dedupe of D4.4(b). A body's errors are reported in
+location order.
 
 ## 15. Timing and the budget
 
