@@ -498,25 +498,7 @@ pub fn bare_allocator_only(tpl: i64, pcx: inout Ctx<Comp>) -> bool {
     true
 }
 
-// ---- The exemption (0.26.3; 0.26.4's statics work (f) deletes it) ----
-
-// ALLOC_EXEMPT: compiler/src's tables are statics holding `Vec<T, Comp>`
-// (base::comp), and its WGSL checks' arena a static (front::embed::wgsl),
-// until 0.26.4's statics work (f) moves them into context structs passed
-// down. For these alone: a static may hold Comp, a struct may hold Comp
-// without naming it in its parameters, and the static
-// front::embed::wgsl::WGSL_ARENA may hold its Arena. Its uses: `volec
-// query refs base::comp::Comp --count`, `query refs WGSL_ARENA`. (0.26.4:
-// Comp's impl is `unsafe impl`, no longer exempt.) (f) deletes the table:
-// the tables' Vec<T, Comp> move into the compilation's context, and the
-// WGSL checks' arena (or main's Gpa it is made from) comes to
-// check_block through it: main to compile_program and to the tools'
-// load_program and run_check, then check_program, expand_embeds and
-// make_items.
-const EXEMPT_MODULE: [u8] = "base::comp";
-const EXEMPT_TYPE: [u8] = "Comp";
-const EXEMPT_STATIC_MODULE: [u8] = "front::embed::wgsl";
-const EXEMPT_STATIC: [u8] = "WGSL_ARENA";
+// ---- The exemption (0.26.3; two statics from 0.26.5, none from 0.27) ----
 
 // Whether module m's path is `path` (outside std).
 fn module_is(m: i64, path: [u8], pcx: Ctx<Comp>) -> bool {
@@ -525,28 +507,27 @@ fn module_is(m: i64, path: [u8], pcx: Ctx<Comp>) -> bool {
     unsafe { m > 0 && !within_std(m, pcx) && SYMS[pcx.modules[m].key].text == path }
 }
 
-// Whether type t is an allocator of the exemption (base::comp::Comp).
-pub fn is_exempt_allocator(t: i64, pcx: Ctx<Comp>) -> bool {
-    if t <= 0 || TYPES[t].kind != TyKind::Struct {
-        return false;
-    }
-    // UNSAFE: STRUCTS is the checker's raw table of structs.
-    // SAFETY: a struct type's TYPES[t].a is a struct id.
-    unsafe {
-        let s = TYPES[t].a;
-        SYMS[pcx.structs[s].name].text == EXEMPT_TYPE
-            && module_is(pcx.structs[s].module, EXEMPT_MODULE, pcx)
-    }
-}
-
-// Whether static s is the exemption's (front::embed::wgsl::WGSL_ARENA).
+// ALLOC_EXEMPT (0.26.3; 0.26.5 narrowed to two statics): base::SYMS, the
+// symbols, and front::types::TYPES, the types, may hold `Vec<T, Comp>`
+// (base::comp). Every other table of compiler/src is a field of the
+// compilation context (base::ctx::Ctx) or a task's (middle::ctx::FnCtx).
+// These two stay statics because code generation's tasks, which are lent
+// the context let, reach code that adds to them: intern (a symbol) and
+// make_type (a type, compute_layout's), which in fact run before the
+// tasks start (SYMS_FROZEN; prepare_layouts) but would take the context
+// inout. Moving them needs each split into the read-only lookup the tasks
+// use and the writing intern/make_type the front end calls: 0.27, where
+// the thread bridge meets references. `volec query refs base::SYMS
+// --count`, `query refs front::types::TYPES --count`.
 fn is_exempt_static(s: i64, pcx: inout Ctx<Comp>) -> bool {
     // UNSAFE: STATICS and NODES are the checker's raw tables.
     // SAFETY: s < STATIC_COUNT; its node a Static item.
     unsafe {
         let node = pcx.statics[s].node;
-        static_name(node, pcx) == EXEMPT_STATIC
-            && module_is(module_of(node, &pcx), EXEMPT_STATIC_MODULE, pcx)
+        let name = static_name(node, pcx);
+        let m = module_of(node, &pcx);
+        name == "SYMS" && module_is(m, "base", pcx)
+            || name == "TYPES" && module_is(m, "front::types", pcx)
     }
 }
 
@@ -618,35 +599,26 @@ pub fn check_impl_safety(node: i64, tr: i64, ty: i64, pcx: inout Ctx<Comp>) {
 // everything (fields, enum payloads, tuples, arrays, slices, pointers and
 // references, closure environments), not through a function type.
 pub fn is_alloc_free(t: i64, pcx: inout Ctx<Comp>) -> bool {
-    alloc_part(t, false, &pcx) == 0
+    alloc_part(t, &pcx) == 0
 }
 
-// The allocator type that t holds, the first found, 0: none; with
-// `exempt`, the exemption's allocators are not counted.
-pub fn alloc_part(t: i64, exempt: bool, pcx: inout Ctx<Comp>) -> i64 {
+// The allocator type that t holds, the first found, 0: none.
+pub fn alloc_part(t: i64, pcx: inout Ctx<Comp>) -> i64 {
     if t <= 0 || t == pcx.ty_error || allocator_trait(&pcx) < 0 {
         return 0;
     }
-    let known = if exempt { pcx.kept_memo.get(t + 1) } else { pcx.alloc_memo.get(t + 1) };
+    let known = pcx.alloc_memo.get(t + 1);
     if known != 0 {
         return known - 1;
     }
     // (a type reached again while it is decided: none there)
-    if exempt {
-        pcx.kept_memo.put(t + 1, 1);
-    } else {
-        pcx.alloc_memo.put(t + 1, 1);
-    }
-    let r = alloc_of(t, exempt, &pcx);
-    if exempt {
-        pcx.kept_memo.put(t + 1, r + 1);
-    } else {
-        pcx.alloc_memo.put(t + 1, r + 1);
-    }
+    pcx.alloc_memo.put(t + 1, 1);
+    let r = alloc_of(t, &pcx);
+    pcx.alloc_memo.put(t + 1, r + 1);
     r
 }
 
-fn alloc_of(t: i64, exempt: bool, pcx: inout Ctx<Comp>) -> i64 {
+fn alloc_of(t: i64, pcx: inout Ctx<Comp>) -> i64 {
     // UNSAFE: STRUCTS, ENUMS and VARIANTS are the checker's raw tables.
     // SAFETY: t > 0 is a type id; a struct type's TYPES[t].a is a struct id,
     // an enum type's an enum id, whose variants and fields are in range.
@@ -654,14 +626,11 @@ fn alloc_of(t: i64, exempt: bool, pcx: inout Ctx<Comp>) -> i64 {
         let kind = TYPES[t].kind;
         if kind == TyKind::Struct {
             if is_allocator_type(t, &pcx) {
-                if !(exempt && is_exempt_allocator(t, pcx)) {
-                    return t;
-                }
-                return 0;
+                return t;
             }
             let s = TYPES[t].a;
             for i in 0..pcx.structs[s].field_count {
-                let r = alloc_part((*struct_field(s, i, pcx)).ty, exempt, &pcx);
+                let r = alloc_part((*struct_field(s, i, pcx)).ty, &pcx);
                 if r != 0 {
                     return r;
                 }
@@ -670,7 +639,7 @@ fn alloc_of(t: i64, exempt: bool, pcx: inout Ctx<Comp>) -> i64 {
         }
         if kind == TyKind::Tuple {
             for i in 0..TYPES[t].count {
-                let r = alloc_part(type_elem(t, i), exempt, &pcx);
+                let r = alloc_part(type_elem(t, i), &pcx);
                 if r != 0 {
                     return r;
                 }
@@ -679,14 +648,14 @@ fn alloc_of(t: i64, exempt: bool, pcx: inout Ctx<Comp>) -> i64 {
         }
         if kind == TyKind::Array || kind == TyKind::Distinct || kind == TyKind::Ptr
             || kind == TyKind::Slice {
-            return alloc_part(TYPES[t].a, exempt, &pcx);
+            return alloc_part(TYPES[t].a, &pcx);
         }
         if kind == TyKind::Enum {
             let e = TYPES[t].a;
             for i in 0..ENUMS[e].variant_count {
                 let v = enum_variant(e, i);
                 for k in 0..pcx.variants[v].field_count {
-                    let r = alloc_part(variant_field(v, k, pcx), exempt, &pcx);
+                    let r = alloc_part(variant_field(v, k, pcx), &pcx);
                     if r != 0 {
                         return r;
                     }
@@ -712,7 +681,7 @@ fn check_alloc_statics(pcx: inout Ctx<Comp>) {
                 || is_exempt_static(s, &pcx) {
                 continue;
             }
-            let part = alloc_part(t, true, &pcx);
+            let part = alloc_part(t, &pcx);
             if part == 0 {
                 continue;
             }
@@ -833,8 +802,7 @@ fn mentions_param(n: i64, g: i64, pcx: Ctx<Comp>) -> bool {
 // The allocator type that field type node n (of an item with type
 // parameters g, in module) holds without naming it through g; 0: none.
 // A part written with g's parameters is theirs (`Vec<T, A>`, `&'a
-// Arena<P>`); a part without is resolved and looked through (AllocFree,
-// the exemption left out).
+// Arena<P>`); a part without is resolved and looked through (AllocFree).
 fn field_allocator(n: i64, g: i64, module: i64, pcx: inout Ctx<Comp>) -> i64 {
     // UNSAFE: NODES is the checker's raw table of nodes.
     // SAFETY: n is a type node (or 0); g a Generics node (or 0).
@@ -848,7 +816,7 @@ fn field_allocator(n: i64, g: i64, module: i64, pcx: inout Ctx<Comp>) -> i64 {
         }
         if !mentions_param(n, g, pcx) {
             let t = resolve_quietly(n, module, &pcx);
-            return alloc_part(t, true, &pcx);
+            return alloc_part(t, &pcx);
         }
         if kind == NodeKind::TyName {
             let args = pcx.nodes[n].g;
