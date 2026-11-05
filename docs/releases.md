@@ -82,6 +82,49 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.1
 
+The rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md).
+
+The borrow checker's corpus and its rustc twin (corpus271):
+
+- `tests/run/rust_b_ok_*.vl` and `tests/run/rust_b_err_*.vl`: 76
+  programs the checker accepts and 113 it rejects, written from the
+  spec's rule ids (each case's `// RULE: Dn.m`): the conflict table cell
+  by cell, kills and reassigned references, reborrows through `&`,
+  `&mut` and raw pointers, two-phase borrows, returns and elision,
+  structs with lifetimes and variance, dropck and the container table,
+  moves, closures' captures, MVS std's bridge, calls with the callee's
+  regions, views, match guards' fake borrows, statics and contracts. A
+  rejected case names the code, its position and the error count; until
+  the checker's milestone that reports it lands, it is `XFAIL` with the
+  milestone named.
+- `tools/borrowck-twin.sh CASE...`: rustc as the oracle of accept and
+  reject. Each case, its directives blanked and `println(` spelled
+  `println!(`, is compiled by rustc; its verdict and its first error's
+  code (mapped by the spec's table of codes) must be the case's, unless
+  the case names the divergence's class (`// RUSTC: accepts|rejects
+  CLASS`, from the spec's R1-R10 and L1-L8) or is outside the common
+  subset (`// RUSTC: none`: MVS std's `Vec` takes an allocator,
+  contracts are not Rust). The gate's `borrowck-twin` row runs it on
+  every `rust_b_` case (a SKIP without rustc).
+- `tests/borrowck-try/`: a case per code with a `try:` line, run by the
+  own pass's try-test runner (`tests/own-try/run.sh -d DIR`, `// CODE:`).
+- `tools/borrowck-budget.sh`: the `borrowck` pass's time over the rust
+  corpus against typeck's, and their ratio (at most 0.25);
+  `tests/compile_cost.sh`'s fourth row, `rust`, the check of the
+  corpus's biggest case against the previous release (at most 1.5x).
+- `rust_b_err_alias_params`: the program 0.27.0 miscompiled at -O2 (two
+  `&mut` of one place to one call, and `&v, &mut v`: the parameters'
+  alias facts taken for a body nobody checked), now `mut_twice` and
+  `conflict`; `tests/same_output.sh`: every running `rust_t_`/`rust_b_ok_`
+  case prints the same at -O0, at -O2 and at -O2 with `--no-noalias`.
+- `rust_t_contract_*`: contracts in the rust edition, one case per rule
+  of the contracts design's C3, C5 and C7.1 (a clause reads `&mut`
+  parameters as `&`, `old(e)` only of a `Copy` value without regions, an
+  impl's added `requires` checked per instance).
+- `tools/checks-survey.sh`: `--print-checks` over bench/ and the
+  examples at -O2, the checks left and removed (by ranges or otherwise),
+  in user code and in std, by kind: the first survey since 0.18.1's.
+
 The places IR carries what the borrow checker reads (ir271):
 
 - Region slots for every type (docs/design/borrowck.md D3.3): a
