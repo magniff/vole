@@ -651,7 +651,12 @@ project's rule: every error of a compilation), deduped by §14.3.
    `end('v)` and names that location too.
 2. **A loan outliving its frame** (`borrowck.return_local`; E0515,
    E0597): D6.2.2 *applies* to loan `ℓ` of `P` iff `frame_owned(P)`
-   (D1.6) and `end('u) ∈ val('ℓ)` for some `'u ∈ U`. It is not a
+   (D1.6), `end('u) ∈ val('ℓ)` for some `'u ∈ U`, and the body's
+   result type has a slot (0.27.2: a body whose result holds no
+   reference returns none, so the conflict keeps its own code,
+   `borrowck.dropped_borrowed`, rustc's E0597: a closure's `'static`
+   requirement in `main`, D19.10, or a loan stored through `&mut &'a T`).
+   It is not a
    separate error: it selects the code of the `(WD, ℓ)` conflict of
    D2.5 that meets `ℓ` on an exit path (the explicit `StorageDead` or
    `drop` of `root(P)`, or the implicit exit access of a parameter: a
@@ -986,7 +991,11 @@ outside the holes named below.
   implied bounds of the signature's types, which the key captures (the
   variance of `S<τ>` is `S`'s, independent of `τ`; move paths depend on
   glue, which the key's drop bit captures), so solving one instance per
-  key is complete for the instances that exist.
+  key is complete for the instances that exist. (0.27.2) The same
+  class: a call of an `Fn` closure through an `FnMut`-bound parameter
+  borrows it shared in the instance (D19.5's implementation note), and
+  a `Copy` closure called twice through an `FnOnce`-bound parameter is
+  copied (the template's `F` is not `Copy`: rustc's E0382).
 - R4 Closure bodies through a raw env (D10.4) and closure parameters
   not late-bound (D10.5). Reason: deferred to 0.27.2 with `Fn*`.
   *Closed in 0.27.2* (D19.4, D19.10, D20.3).
@@ -1548,7 +1557,13 @@ parameter slots. A call with `κ = FnMut` through `p: &C` is the front's
 "cannot borrow as mutable" (E0596); with `κ = FnOnce` through a
 reference, `move (*p)` is M3 (E0507) unless `C: Copy`. *IR at v0.27.1:*
 the direct call's `&'e c` / `&'e mut2 c` exists (D10.3); the adapters
-of the table and `move Q` are clos272 M1's.
+of the table and `move Q` are clos272 M1's. *Implementation (0.27.2):*
+`κ` is read from the template's declaration of a parameter (`f: F`,
+`F: Fn*`); the `FnOnce` row is built (`_t = move Q`, the env a borrow of
+`_t`, `_t` dropped with the call's statement); the `FnMut`-over-`Fn`
+row's `&mut2 Q` is not, so such a call borrows `Q` shared: the
+difference is a conflict or a missing `mut` in a template rustc
+rejects, which is R3's class (the template is not checked, D4.4(d)).
 
 **D19.6 (bound satisfaction).** `C: Fn` iff `kind(C) = Fn`; `C: FnMut`
 iff `kind(C) ∈ {Fn, FnMut}`; `C: FnOnce` always; a `fn` item or a `fn`
@@ -1599,7 +1614,9 @@ decided by where `'a` and `'v` are:
    closure"), naming the parameter and the capture; `'v ∈ X_C` (a
    parameter returned where the result is external): rustc's "lifetime
    may not live long enough" (no code); `'a = 'e`: rustc's "captured
-   variable cannot escape `FnMut` closure body" (no code).
+   variable cannot escape `FnMut` closure body" (no code). One error per
+   local universal: the one naming a capture, else the signature, else
+   another (rustc reports the first escape of a parameter).
 2. `'a ∈ E_β`: no error in `β`; the *requirements* `'a ⊒ 'z` for every
    `'z ∈ ub('v)` are recorded, with `ub('v) = {'v}` for `'v ∈ E_β` and
    else the `⊒`-minimal elements of `{'z ∈ E_β | 'z ⊒ 'v}` (never
@@ -1616,8 +1633,10 @@ decided by where `'a` and `'v` are:
    D6.2.1 in `b`, and propagated again when `b` is a closure body.
 4. `Req(C)` is part of `C`'s declared bounds for D4.5 (as `Scope<'scope,
    'env: 'scope>`'s are): a body that has a value of type `C` as a
-   parameter (an instance with `F = C`) assumes them, and D19.5's call
-   rule includes them in the callee's order.
+   parameter (an instance with `F = C`) assumes them, with `C`'s implied
+   bounds (D4.5: a capture field `&'cₖ τₖ` gives `'t ⊒ 'cₖ` over the
+   universals of `F`'s substitution), and D19.5's call rule includes
+   them in the callee's order.
 
 *Soundness.* No position of `slots(Env(C))` is contravariant (a `fn`
 type has no slot, R6); `X_C`'s have `fn` variance. Every later value
@@ -1682,6 +1701,17 @@ closure.sig` (rustc E0631). Each region position of the signature is:
   and not given by a bound (inferred), and every elided region of a
   written result annotation (`-> &T`). These are regions of the
   enclosing body, carried by `C` (D19.1), not fresh per call.
+
+*Implementation (0.27.2).* A named lifetime in a closure's annotation is
+an `X_C` position (external, as the spec's), carried by `C` rather than
+bound to the enclosing item's universal: `N_outer` is empty, which is
+the same verdict for every requirement through `X_C` and only loses the
+enclosing item's `'b: 'a` inside `β` (stricter). A bound whose result
+region E2 cannot resolve (no single input region) leaves that result
+region external instead of D20.1's `borrowck.elision` at the bound.
+D20.5's `closure.sig` for a `fn` value with an early-bound lifetime is
+not made: a `fn` value's calls carry no regions (R6), so the value is
+accepted for the bound.
 
 There is no elision rule inside a closure's own signature: an elided
 result region never links to a parameter's (rustc's rule). So `|p:
