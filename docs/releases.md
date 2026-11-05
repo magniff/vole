@@ -164,7 +164,11 @@ Closures in full (clos272):
   `borrowck.dropped_borrowed` (rustc E0597); 0.27.1 accepted it.
 - A call through a `fn` value ties its result to its arguments (E1-E2
   over the `fn` type): 0.27.1 made no constraint there, so a result
-  could outlive what it borrowed (R6).
+  could outlive what it borrowed (R6). Its arguments are tied to each
+  other too, and to the result, under a `&mut`: `fn store<'a>(x: &mut
+  &'a i64, y: &'a i64)` called as a `fn(&mut &i64, &i64)` value no longer
+  stores a `y` that dies first into `*x` unseen; the erased type's
+  lifetimes are one region there, stricter than rustc (L13).
 - `--print-effects` leaves out the drop shims, which it printed as
   `(unknown)` (K-I7: nothing targets them, so nothing was masked).
 

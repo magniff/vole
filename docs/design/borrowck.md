@@ -468,7 +468,8 @@ re-inferred.
   parameter types' and result's regions elided by D4.2 with the inputs
   late-bound, D10.5), and `ops[0]` is the env, read as D10.3 says
   (0.27.2: D19.5 and D20.3 replace this sentence). A callee value of a `fn`
-  pointer type: `Σ` by E1-E2 at the call (R6).
+  pointer type: `Σ` by E1-E2 at the call, its lifetimes one region
+  (R6, L13).
 - `SK_INTRINSIC`: as a call with the builtin's signature (no regions at
   0.27.1).
 - `SK_DROP drop(P)` (decision `≠ DS_REMOVED`): the drop-liveness facts
@@ -1016,20 +1017,27 @@ outside the holes named below.
   `Fn*` bound whatever its lifetimes, early-bound included, where L9
   says `closure.sig`. In the instance the value's type is the erased
   `fn` type (no slots), so nothing of the fn's own signature reaches the
-  bound's body. *The call (0.27.2):* a call through a `fn` value (`constraints.vl`
-  `indirect_call`) is E1-E2 over its erased type: every region of an
-  argument outlives every region of the result (E2's one input region;
-  with several, each of them, stricter than a signature naming one).
-  0.27.1 made no constraint there, so a result could outlive its
-  argument; cases `rust_b_err_fn_value_result`, `rust_b_ok_fn_value_result`.
-  *Still open:* a flow between two arguments through a `fn` value (`fn
-  store<'a>(x: &mut &'a T, y: &'a T)` used as `fn(&mut &T, &T)`): the
-  erased type drops the `'a` that ties them and E1 gives each its own
-  region, so the store is not seen at the caller (rustc rejects the
-  coercion as not general enough). No other statement drops its
-  constraints: an intrinsic has no reference result, and a call of a
-  generic parameter's method or of a closure is a direct call in the
-  instance.
+  bound's body.
+  *The call (0.27.2):* a call through a `fn` value (`constraints.vl`
+  `indirect_call`) is E1-E2 over its erased type, with the type's
+  lifetimes read as one region: every region of an argument outlives
+  every region of the result (E2's one input region; with several, each
+  of them, stricter than a signature naming one), and every region of an
+  argument or of the result is equal to every region in an invariant
+  position (under a `&mut`) of another of them, since the callee may
+  store one through the other (`fn store<'a>(x: &mut &'a T, y: &'a T)`
+  used as `fn(&mut &T, &T)`: the erased type drops the `'a` that ties
+  them; rustc rejects the coercion as not general enough, and here the
+  store is seen at the caller). The equalities are stricter than rustc
+  (L13). 0.27.1 made no constraint at such a call; cases
+  `rust_b_err_fn_value_result`, `rust_b_ok_fn_value_result`,
+  `rust_b_err_fn_value_arg_flow` (and `_coerced`, the coercion),
+  `rust_b_ok_fn_value_arg_flow`, `rust_b_err_fn_value_result_mut`. No
+  statement drops its constraints any more: an intrinsic has no
+  reference result, and a call of a generic parameter's method or of a
+  closure is a direct call in the instance. *What remains of R6* is
+  D20.5's identity of `fn` items above: the value's own signature is not
+  compared with the bound's.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` are
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` may coexist on an
   array and through a `&mut [T]`; rustc rejects both (only slice
@@ -1092,6 +1100,15 @@ outside the holes named below.
   matches up to a renaming of bound regions; rustc also instantiates a
   `for<'x>` value at an early-bound `'a`. Reason: no `for<>` until 0.29.
   (L10–L12 are reserved for 0.27.2.1's §21–§22.)
+- L13 (0.27.2) A call through a `fn` value reads the erased type's
+  lifetimes as one region (R6): every region of an argument or of the
+  result is equal to every region under a `&mut` of another, whether the
+  callee stores through it or not. rustc keeps the elided regions of
+  `fn(&mut &T, &T)` apart and accepts a `y` that dies before `*x` is
+  read when the callee does not store it. Sound (the callee's real
+  signature relates at most these regions); ends with `for<'a>` `fn`
+  types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
+  (`// RUSTC: accepts L13`).
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
