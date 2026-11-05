@@ -328,9 +328,9 @@ GAPS = [
     (r"unknown attribute 'builtin_impls'", "primitive_builtin"),
     (r"^<std>.*duplicate method", "std2_root"),
     (r"edition\.std_by_value", "std2_root"),
+    # `[u8]::cmp` found in MVS's std (its Ord gives an i64): std2's needs u8: Ord, a builtin impl
+    (r"^str\.vl:.*expected 'Ordering', got 'i64'", "std2_root"),
     (r"duplicate method", "method_name_clash"),
-    (r"^str\.vl:.*'(eq|partial_cmp|cmp)' does not have the signature trait '(PartialEq|PartialOrd|Ord)'",
-     "str_self_ref"),
     (r"does not have the signature trait", "generic_trait_multi_impl"),
     (r"no method '(get|get_mut|index|index_mut)' on type 'Range", "generic_trait_multi_impl"),
     (r"a function of a generic trait has no default body", "generic_trait_default"),
