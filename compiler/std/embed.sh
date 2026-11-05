@@ -39,8 +39,10 @@
 # (0.27.0) --edition rust: the rust edition's std instead, compiler/std2
 # (its root std2/std.vl and its modules, found as above), written to
 # compiler/src/front/stdsrc_rust.vl as std2_source, std2_index, std2_files
-# and std2_line_marks; it has no Gpa, check-alloc or system tail yet. Not
-# built into the compiler before 0.27.2: run it for the size it would add.
+# and std2_line_marks; it has no Gpa, check-alloc or system tail yet.
+# (0.27.2) Built into the compiler: a rust-edition program reads it with
+# VOLE_STD2=1 until the switch makes it the edition's std (front/modules:
+# load_std2); the commit hook remakes it when compiler/std2 changes.
 set -eu
 cd "$(dirname "$0")/../.."
 edition=mvs
