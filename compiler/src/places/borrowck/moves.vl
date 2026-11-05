@@ -40,6 +40,7 @@ pub fn check(bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>
     }
     dataflow(pbody, &pcx);
     bck.reported.clear();
+    assign_twice(&bck, pbody, &pcx);
     for i in 0..pbody.rpo.len() as i64 {
         let b = pbody.rpo[i];
         for w in 0..3 * pcx.nw {
@@ -178,6 +179,96 @@ fn through_raw(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool 
         t = step_type(t, kind, proj_val(q, pbody), &pcx);
     }
     false
+}
+
+// RULE: M7 (a whole non-`mut` user local is assigned once on every
+// path: a forward dataflow of the locals maybe assigned, reset at the
+// local's StorageLive; a second assignment is borrowck.assign_twice)
+fn assign_twice(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nw = bck.nw_l;
+    let nb = crate::places::ir::block_count(pbody);
+    bck.bin.clear();
+    bck.bout.clear();
+    bck.tmp.clear();
+    for _ in 0..nb * nw {
+        bck.bin.push(0);
+        bck.bout.push(0);
+    }
+    for _ in 0..nw {
+        bck.tmp.push(0);
+    }
+    var changed = true;
+    var checking = false;
+    while changed || !checking {
+        if !changed {
+            checking = true;
+        }
+        changed = false;
+        for i in 0..pbody.rpo.len() as i64 {
+            let b = pbody.rpo[i];
+            for w in 0..nw {
+                bck.tmp[w] = 0;
+            }
+            for j in 0..crate::places::cfg::pred_count(b, pbody) {
+                let pb = crate::places::cfg::pred(b, j, pbody);
+                for w in 0..nw {
+                    bck.tmp[w] = bck.tmp[w] | bck.bout[pb * nw + w];
+                }
+            }
+            let start = block_start(b, pbody);
+            for loc in start..block_term(b, pbody) + 1 {
+                let st = pbody.stmts[loc];
+                let k = st.kind;
+                if k == crate::places::ir::SK_LIVE {
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] & ~(1 << (st.a & 63));
+                } else if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a > 0
+                    && st.b == 0 && reassignable_once(st.a, pbody) {
+                    if checking && (bck.tmp[st.a >> 6] >> (st.a & 63)) & 1 != 0 {
+                        report_assign_twice(loc, st.a, &bck, pbody, &pcx);
+                    }
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] | (1 << (st.a & 63));
+                }
+            }
+            for w in 0..nw {
+                if bck.bout[b * nw + w] != bck.tmp[w] {
+                    bck.bout[b * nw + w] = bck.tmp[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// A user's local declared without `mut`: assigned once (a deferred `let`).
+fn reassignable_once(l: i64, pbody: Body<Comp>) -> bool {
+    let f = pbody.locals[l].flags;
+    (f & crate::places::ir::LF_USER) != 0 && (f & crate::places::ir::LF_MUT) == 0
+        && (f & LF_BORROWED) == 0
+}
+
+fn report_assign_twice(loc: i64, l: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == -2 && bck.reported[i + 1] == loc && bck.reported[i + 3] == l {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(-2);
+    bck.reported.push(loc);
+    bck.reported.push(0);
+    bck.reported.push(l);
+    var node = pbody.stmts[loc].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_str(m, c"cannot assign twice to '");
+    crate::places::borrowck::diag::buf_place(m, l, 0, 0, pbody, pcx);
+    buf_str(m, c"', which is not `mut`: it may be assigned already on this path");
+    report_error_tries(pcx.nodes[node].start, 4000 + l, c"borrowck.assign_twice", buf_slice(m).ptr,
+        c"declare it `let mut`, or assign it once on each path", "", false, &pcx);
 }
 
 // The nearest ancestor of place (l, p) that has a path (-1: none).

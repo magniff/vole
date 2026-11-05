@@ -102,7 +102,7 @@ a moved value is not used again (a field moved, the whole is partly
 moved; in a loop, "in a previous iteration"); a value cannot be moved
 out of a reference, an index or a `static`; a value with `impl Drop`
 keeps what it references alive until its drop, the std containers
-(`Vec`, `String`, `HashMap`, ...) only their elements'. The sixteen
+(`Vec`, `String`, `HashMap`, ...) only their elements'. The seventeen
 codes are `volec explain --list`'s `borrowck.*` entries (`mut_twice`,
 `conflict`, `return_local`, `outlives`, `use_moved`, `move_out`, ...),
 each with its rustc code; `volec check --emit-places=regions` prints

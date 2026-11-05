@@ -111,7 +111,7 @@ The borrow checker (bc271):
   the container table, the per-instance dedupe, the verdict per body
   that gates the optimizer's parameter alias facts and the code cache's
   key; `volec check --emit-places=regions`, the `borrowck` row of
-  `--time-passes`; 17 codes with `explain`.
+  `--time-passes`; 18 codes with `explain`.
 - The own pass's move findings and `own.drop_view` are off for a
   rust-edition position: the IR reports them. A rust-edition body gets
   the optimizer's reference-parameter facts only with a clean verdict

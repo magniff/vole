@@ -769,6 +769,14 @@ unless named, at the access's statement.
   (`MaybeUninit` at the loop head by the back edge); the message adds
   "in a previous iteration of the loop" when the move's location is
   reachable from the use's.
+- (M7) An assignment (`WA`) to a whole local `L` (`(L, 0)`) that is
+  not `mut` (no `LF_MUT`) requires `¬MaybeInit(path(L), 2·loc)`: a
+  deferred `let x;` / `let x: T;` is assigned once on every path
+  (`borrowck.assign_twice`, rustc E0384 "cannot assign twice to
+  immutable variable"); an assignment inside a loop fails it by the
+  back edge, one on each branch of an `if` passes. The plain `let x =
+  1; x = 2;` is the front's ("cannot assign to immutable variable"), so
+  only a deferred local reaches this rule.
 - (M6) A move of a `Copy`-typed place is a copy: the builder emits
   `OK_COPY`, so no rule applies.
 
@@ -1104,13 +1112,15 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.unused_param` | D5.3 (ir271) | E0392 | adds a `PhantomData<&'a ()>` field |
 | `borrowck.use_moved` | M1, M5 | E0382 | `.clone()` when `Clone` (as `own.moved`'s) |
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
+| `borrowck.assign_twice` | M7 | E0384 | `let mut x;` on the deferred declaration |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
 | `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |
 | `borrowck.static_mut_ref` | D6.2.5 (ir271) | the `static_mut_refs` lint (no E-code in 1.98) | `&raw mut S` |
 | `borrowck.unchecked` (warning) | D10.4 only | — | kept from 0.27.0; the message names the closure |
 
-Seventeen codes. The rustc column is the twin's map
+Eighteen codes (`assign_twice` from M3's rest, with ir271's deferred
+`let`). The rustc column is the twin's map
 (`tools/borrowck-twin.sh`): a rejecting case's first `error[E0xxx]` must
 map to the case's expected code, or the case carries `// RUSTC:`.
 
