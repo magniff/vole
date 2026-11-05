@@ -175,6 +175,17 @@ The places IR carries what the borrow checker reads (ir271):
   asserts and contract conjuncts, printed `; L1:`.
 - `Vec<&i64, Gpa>` keeps its element a reference, and `volec test` lends
   a contract's `&T` and `&mut T` parameters a generated value.
+- Contracts in the rust edition: a clause reads its parameters shared
+  (C3: a `&mut T` or `&mut [T]` is `&T` in a `requires` and an
+  `ensures`, so a write through it is refused); `old(e)` takes a Copy
+  value with no reference and no raw pointer (C5), and contract.old is
+  reported before the borrow checker runs; a clause that moves a
+  parameter or `result` is `error contract.move` (C3.2).
+- A closure captures what it reads by `&`, an immutable variable too
+  (Rust's rule, D10.2); a `move` closure copies or moves.
+- Deferred initialization: `let x: T;` and `let x;` (typed by its first
+  assignment), assigned without `mut`; one never assigned is an error
+  (rustc E0282).
 
 ### What's new in 0.27.0
 
