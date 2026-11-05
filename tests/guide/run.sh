@@ -15,7 +15,8 @@
 # language:
 #
 #   ```vole   vole code (```tach too, its name before 0.24), compiled
-#             with --deny-warnings: a program when
+#             with --deny-warnings (0.27.0: but borrowck.unchecked, the
+#             rust edition's warning on every function): a program when
 #             it has a line starting `fn main(`; else items, when every
 #             line at column 0 starts an item (fn, struct, impl, use...),
 #             compiled with an empty main; else statements, compiled as
@@ -185,7 +186,7 @@ check_block() {
     d=$1
     name=$(cat "$d/name")
     if [ -f "$d/err" ]; then
-        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
+        "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -211,7 +212,7 @@ check_block() {
         if [ "$HOST" = Darwin-arm64 ]; then
             link="-l objc"
         else
-            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
+            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
                 echo "pass $name" >"$d/result"
             else
                 { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -219,7 +220,7 @@ check_block() {
             return
         fi
     fi
-    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --allow=borrowck.unchecked --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
