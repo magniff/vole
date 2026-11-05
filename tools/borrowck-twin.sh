@@ -74,7 +74,7 @@ map_code() {
         E0505) echo move_borrowed ;;
         E0597|E0713|E0716) echo dropped_borrowed ;;
         E0515) echo return_local ;;
-        E0621|E0623|lifetime) echo outlives ;;
+        E0621|E0623|E0521|lifetime|captured) echo outlives ;;  # (0.27.2: E0521, D20.3; "captured variable cannot escape", D19.10)
         E0106) echo elision ;;
         E0392) echo unused_param ;;
         E0382) echo use_moved ;;
@@ -124,6 +124,7 @@ for case_ in "$@"; do
         got=reject
         first=$(awk '/^error\[E[0-9]+\]/ { print substr($0, 7, 5); exit }
             /^error: lifetime may not live long enough/ { print "lifetime"; exit }
+            /^error: captured variable cannot escape/ { print "captured"; exit }
             /^error: creating a (shared|mutable) reference to mutable static/ { print "static_mut"; exit }
             /^error: / && !/^error: aborting/ { print "other"; exit }' "$WORK/out")
         gotcode=$(map_code "$first")

@@ -102,6 +102,30 @@ Closures in full (clos272):
 - Reslicing a slice local, `v = &v[a..]`, is accepted (rustc accepts):
   the slice's loan is of what `v` points to, which the assignment kills
   (D1.4, Z9.5).
+- Late-bound regions on the closure's side (§20, D19.10): a closure's
+  type carries the regions of its signature that come from outside it
+  (`X_C`), and what its body stores into or returns from its captures
+  is checked where the closure is made (its requirements, rustc's
+  closure region requirements). So `|| x` and `|| { h.p = r; }` are
+  accepted and keep what they borrow borrowed (0.27.1: false
+  `borrowck.elision`, `borrowck.outlives`), and `f()`'s result keeps
+  the loan its closure's capture holds.
+- A closure's `&` parameter is the call's (a bound region, D20.3):
+  storing it into a capture is `borrowck.outlives` with rustc E0521's
+  words ("borrowed data escapes outside of closure"), returning it from
+  `|p: &i64| p` too (0.27.1 accepted it); the bound `Fn(&T) -> &T`
+  makes `|p| p` the identity. A parameter written with another type
+  than the bound's is `closure.sig` (rustc E0631). A reference into an
+  `FnMut` closure's environment cannot escape a call.
+- 0.14's escape check is off in the rust edition (D19.8): a closure
+  leaving the scope of what it borrows is the borrow checker's
+  `borrowck.dropped_borrowed`, and a `move` closure of owned values
+  leaves freely. `borrowck.unchecked` is retired, and the test runner no
+  longer passes `--allow=borrowck.unchecked`.
+- An `Fn`/`FnMut` closure called through an `FnOnce`-bound parameter is
+  moved by the call and dropped after it (D19.5). `borrowck.outlives`
+  names its two lifetimes in the right order ("'b must outlive 'a").
+- 42 `rust_b_clos_` cases, all agreeing with rustc but one marked R3.
 
 ### What's new in 0.27.1
 
