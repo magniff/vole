@@ -1,0 +1,401 @@
+// `for` over slices, arrays, iterators and ranges as values (0.14;
+// docs/design/closures-iterators.md): `for p in e` where e is not a range
+// literal goes through check_for_iter; `a..b` and `a..=b` outside `for`
+// and slicing are std's Range and RangeInclusive (range_value).
+//
+// `for p in e body` becomes a block whose first statement binds e's value
+// to `__for_seq`, then a loop over it by e's type:
+//
+//   slice, array          for __for_index in 0..len { let p = __for_seq[__for_index]; body }
+//   *slice, *array        for p in *__for_seq body
+//   std's Vec, SliceIter  for p in __for_seq.as_slice() body
+//   std's Range           for p in __for_seq.start..__for_seq.end body
+//   std's RangeInclusive  if !__for_seq.done { for p in __for_seq.start..=__for_seq.end body }
+//   an Iterator           label: loop { match __for_seq.next() { std::Option::Some(p) => body, _ => break } }
+//   a type with `iter`    for p in __for_seq.iter() body
+//
+// (`*T` for a struct or enum T: the same, through the pointer.) e is
+// checked once, by the caller; the `let` is checked here, so that the
+// rest, made of new nodes, is the only part checked after it. The
+// counted forms stay counted loops, with no `next` call. `iter` is found
+// by name (Vec, HashMap, user types); `next` only through Iterator.
+
+use crate::base::intern_c;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{err_begin, err_end, err_help, err_str};
+use crate::front::ast::{ARM_SYNTHETIC, NODE_IN_BOUNDS, list_begin, list_end, list_push, new_node};
+use crate::front::ast::NodeKind::{
+    Arm, Block, Bool, Break, ExprStmt, FieldAccess, FieldInit, For, Ident, If, Index, Int, Let,
+    Loop, Match, MethodCall, PatBind, PatVariant, PatWild, Path, Range, StructLit, Unary,
+};
+use crate::front::check::{pop_scope, push_scope, type_error};
+use crate::front::check::calls::method_of;
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::unsafety::is_borrow;
+use crate::front::lexer::{SUF_I64, SUF_USIZE, Tok};
+use crate::front::modules::within_std;
+use crate::front::own::drops::{after_stmt, block_begin};
+use crate::front::patterns::check_pattern;
+use crate::front::traits::{implements, std_trait};
+use crate::front::types::{TY_UNIT, TyKind, buf_type, err_type, is_pointer};
+
+// On a `for` made by the `iter` form: its sequence is the result of
+// `iter()`, which must not need another `iter()`.
+const FOR_VIA_ITER: i64 = 1 << 29;
+
+// `for` loop n whose sequence (NODES[n].c) is checked (its type is set)
+// and is not a range literal: the loop, rewritten in place as above. Its
+// type.
+pub fn check_for_iter(n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    var seq = pcx.nodes[n].c;
+    var seq_ty = pcx.nodes[seq].ty;
+    if seq_ty > 0 && pcx.types[seq_ty].kind == TyKind::Array
+        && !crate::front::cells::is_freeze(seq_ty, pcx)
+        && crate::front::check::assign::is_place(seq, pcx) {
+        // (0.26.1) an array place that is not Freeze is iterated as a
+        // view of it, `for p in a[0..N]`: a copy of it would be other
+        // cells (front/cells.vl)
+        let lo = new_node(Int, pcx.nodes[seq].start, pcx.nodes[seq].end, &pcx);
+        pcx.nodes[lo].b = SUF_I64;
+        let hi = new_node(Int, pcx.nodes[seq].start, pcx.nodes[seq].end, &pcx);
+        pcx.nodes[hi].a = pcx.types[seq_ty].b;
+        pcx.nodes[hi].b = SUF_I64;
+        let range = new_node(Range, pcx.nodes[seq].start, pcx.nodes[seq].end, &pcx);
+        pcx.nodes[range].a = lo;
+        pcx.nodes[range].b = hi;
+        let view = new_node(Index, pcx.nodes[seq].start, pcx.nodes[seq].end, &pcx);
+        pcx.nodes[view].a = seq;
+        pcx.nodes[view].b = range;
+        pcx.nodes[view].p |= NODE_IN_BOUNDS;
+        synth_expr(view, &pcx);
+        pcx.nodes[n].c = view;
+        seq = view;
+        seq_ty = pcx.nodes[view].ty;
+    }
+    var t = seq_ty;
+    let through = is_pointer(t, pcx) && pcx.types[t].a != 0
+        && is_iterable_kind(pcx.types[pcx.types[t].a].kind);
+    if through {
+        t = pcx.types[t].a;
+    }
+    let kind = pcx.types[t].kind;
+    let std_name = std_struct_name(t, pcx);
+    let iterator = std_trait(c"Iterator", &pcx);
+    let is_iterator = seq_ty != pcx.ty_error && iterator >= 0 && implements(iterator, t, &pcx);
+    let iter_f = if seq_ty == pcx.ty_error { -1 }
+        else { method_of(t, intern_c(c"iter", &pcx), pcx) };
+    let is_slice = kind == TyKind::Slice || kind == TyKind::Array;
+    let counted = std_name == intern_c(c"Vec", &pcx) || std_name == intern_c(c"SliceIter", &pcx)
+        || std_name == intern_c(c"Range", &pcx)
+        || std_name == intern_c(c"RangeInclusive", &pcx);
+    if seq_ty == pcx.ty_error || !is_slice && !counted && !is_iterator
+        && (iter_f < 0 || (pcx.nodes[n].p & FOR_VIA_ITER) != 0) {
+        not_iterable(n, seq, seq_ty, t, &pcx);
+    }
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let seq_sym = intern_c(c"__for_seq", &pcx);
+    // let __for_seq = e;   (`mut` for `next`)
+    let bind = new_node(PatBind, start, end, &pcx);
+    pcx.nodes[bind].a = seq_sym;
+    let by_next = !is_slice && !counted && is_iterator;
+    pcx.nodes[bind].b = (by_next && !through) as i64;
+    let let_stmt = new_node(Let, start, end, &pcx);
+    pcx.nodes[let_stmt].a = bind;
+    pcx.nodes[let_stmt].c = seq;
+    // The loop over it.
+    let pattern = pcx.nodes[n].b;
+    let body = pcx.nodes[n].d;
+    var rest = 0;
+    if is_slice && !through {
+        rest = index_loop(n, seq_ty, &pcx);
+    } else if is_slice {
+        rest = for_copy(n, pattern, deref(ident(seq_sym, n, &pcx), &pcx), body, &pcx);
+    } else if std_name == intern_c(c"Vec", &pcx) || std_name == intern_c(c"SliceIter", &pcx) {
+        rest = for_copy(n, pattern,
+            method_call(ident(seq_sym, n, &pcx), intern_c(c"as_slice", &pcx), &pcx), body,
+            &pcx);
+    }
+    else if std_name == intern_c(c"Range", &pcx)
+        || std_name == intern_c(c"RangeInclusive", &pcx) {
+        let range = new_node(Range, start, end, &pcx);
+        pcx.nodes[range].a = field(ident(seq_sym, n, &pcx), intern_c(c"start", &pcx), &pcx);
+        pcx.nodes[range].b = field(ident(seq_sym, n, &pcx), intern_c(c"end", &pcx), &pcx);
+        let inclusive = std_name == intern_c(c"RangeInclusive", &pcx);
+        pcx.nodes[range].c = inclusive as i64;
+        rest = for_copy(n, pattern, range, body, &pcx);
+        if inclusive {
+            // (exhausted by `next`: no more items)
+            let not_done = new_node(Unary, start, end, &pcx);
+            pcx.nodes[not_done].op = Tok::Bang;
+            pcx.nodes[not_done].b = field(ident(seq_sym, n, &pcx), intern_c(c"done", &pcx),
+                &pcx);
+            let then = block_of(rest, n, &pcx);
+            rest = new_node(If, start, end, &pcx);
+            pcx.nodes[rest].a = not_done;
+            pcx.nodes[rest].b = then;
+        }
+    } else if is_iterator {
+        rest = next_loop(n, ident(seq_sym, n, &pcx), &pcx);
+    } else {
+        rest = for_copy(n, pattern,
+            method_call(ident(seq_sym, n, &pcx), intern_c(c"iter", &pcx), &pcx), body, &pcx);
+        pcx.nodes[rest].p |= FOR_VIA_ITER;
+    }
+    let rest_stmt = new_node(ExprStmt, start, end, &pcx);
+    pcx.nodes[rest_stmt].a = rest;
+    pcx.nodes[rest_stmt].b = 1;
+    // The block, in the loop's place, checked: the `let` by hand (e is
+    // checked), then the rest.
+    let outer = new_node(Block, start, end, &pcx);
+    let mark = list_begin(pcx);
+    list_push(let_stmt, &pcx);
+    list_push(rest_stmt, &pcx);
+    list_end(outer, mark, &pcx);
+    pcx.nodes[n] = pcx.nodes[outer];
+    push_scope(&pcx);
+    // (0.25: as check_block does, the temporaries of the `let`; a
+    // sequence that is not a place, `for x in make()`, `for x in
+    // v.take()`, an owning iterator, is __for_seq's, which the places
+    // IR drops at the loop's end, on every exit; a place, `for x in v`,
+    // is borrowed)
+    let drops = block_begin(n, &pcx);
+    check_pattern(bind, seq_ty, &pcx);
+    if through && is_borrow(seq, pcx) {
+        // (`for x in &v`: a borrow, as `&v` passed directly is)
+        pcx.locals[pcx.nodes[bind].x].borrow = true;
+    }
+    after_stmt(drops, let_stmt, &pcx);
+    synth_expr(rest, &pcx);
+    pop_scope(&pcx);
+    pcx.nodes[n].ty = TY_UNIT;
+    TY_UNIT
+}
+
+// Whether a pointer to a type of this kind is iterated through.
+fn is_iterable_kind(kind: TyKind) -> bool {
+    kind == TyKind::Struct || kind == TyKind::Enum || kind == TyKind::Slice
+        || kind == TyKind::Array
+}
+
+// The name of std's generic struct that t is an instance of (Vec,
+// Range, ...), or 0.
+fn std_struct_name(t: i64, pcx: Ctx<Comp>) -> i64 {
+    if pcx.std_module < 0 || pcx.types[t].kind != TyKind::Struct {
+        return 0;
+    }
+    let s = pcx.types[t].a;
+    if pcx.structs[s].tmpl == 0 {
+        return 0;
+    }
+    let tmpl = pcx.structs[s].tmpl - 1;
+    if !within_std(pcx.structs[tmpl].module, pcx) {
+        return 0;
+    }
+    pcx.structs[tmpl].name
+}
+
+// (t: the type iterated, seq's or the one it points to)
+fn not_iterable(n: i64, seq: i64, seq_ty: i64, t: i64, pcx: inout Ctx<Comp>) -> ! {
+    err_begin(pcx.nodes[seq].start, &pcx);
+    err_str(c"'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got '", pcx);
+    err_type(seq_ty, pcx);
+    err_str(c"'", pcx);
+    if (pcx.nodes[n].p & FOR_VIA_ITER) != 0 {
+        err_help(c"its 'iter()' gives a value that is not an Iterator", pcx);
+    } else if pcx.types[t].kind == TyKind::Struct || pcx.types[t].kind == TyKind::Enum {
+        if method_of(t, intern_c(c"next", &pcx), pcx) >= 0 {
+            err_help(
+                c"it has a 'next' method but does not implement Iterator: write 'impl Iterator for ", pcx);
+        } else {
+            err_help(c"implement Iterator for it: 'impl Iterator for ", pcx);
+        }
+        buf_type(pcx.err_help, t, pcx);
+        err_help(c" { type Item = ...; fn next(self: *Self) -> Option<Self::Item> { ... } }', or give it an 'iter' method that returns an iterator", pcx);
+    }
+    err_end(&pcx)
+}
+
+// for __for_index in 0..len { let p = __for_seq[__for_index]; body }, for
+// `for` loop n over a slice or an array of type t, bound to __for_seq.
+fn index_loop(n: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let seq_sym = intern_c(c"__for_seq", &pcx);
+    let index_sym = intern_c(c"__for_index", &pcx);
+    let zero = new_node(Int, start, end, &pcx);
+    pcx.nodes[zero].b = SUF_USIZE;
+    let len = if pcx.types[t].kind == TyKind::Slice {
+        field(ident(seq_sym, n, &pcx), intern_c(c"len", &pcx), &pcx)
+    } else {
+        let count = new_node(Int, start, end, &pcx);
+        pcx.nodes[count].a = pcx.types[t].b;
+        pcx.nodes[count].b = SUF_USIZE;
+        count
+    };
+    let range = new_node(Range, start, end, &pcx);
+    pcx.nodes[range].a = zero;
+    pcx.nodes[range].b = len;
+    // let p = __for_seq[__for_index];
+    let elem = new_node(Index, start, end, &pcx);
+    pcx.nodes[elem].a = ident(seq_sym, n, &pcx);
+    pcx.nodes[elem].b = ident(index_sym, n, &pcx);
+    // (0.16: no panic, for the effects)
+    pcx.nodes[elem].p |= NODE_IN_BOUNDS;
+    let elem_let = new_node(Let, start, end, &pcx);
+    pcx.nodes[elem_let].a = pcx.nodes[n].b;
+    pcx.nodes[elem_let].c = elem;
+    let body = new_node(Block, start, end, &pcx);
+    let mark = list_begin(pcx);
+    list_push(elem_let, &pcx);
+    let old_body = new_node(ExprStmt, start, end, &pcx);
+    pcx.nodes[old_body].a = pcx.nodes[n].d;
+    list_push(old_body, &pcx);
+    list_end(body, mark, &pcx);
+    let index_bind = new_node(PatBind, start, end, &pcx);
+    pcx.nodes[index_bind].a = index_sym;
+    for_copy(n, index_bind, range, body, &pcx)
+}
+
+// label: loop { match it.next() { std::Option::Some(p) => body, _ => break } }
+// for `for` loop n (its label, pattern and body).
+fn next_loop(n: i64, it: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let m = new_node(Match, start, end, &pcx);
+    pcx.nodes[m].a = method_call(it, intern_c(c"next", &pcx), &pcx);
+    let some = new_node(PatVariant, start, end, &pcx);
+    let std_seg = ident(intern_c(c"std", &pcx), n, &pcx);
+    let prefix = new_node(Path, start, end, &pcx);
+    let pmark = list_begin(pcx);
+    list_push(std_seg, &pcx);
+    list_end(prefix, pmark, &pcx);
+    pcx.nodes[some].h = prefix;
+    pcx.nodes[some].a = intern_c(c"Option", &pcx);
+    pcx.nodes[some].b = intern_c(c"Some", &pcx);
+    pcx.nodes[some].c = 1;
+    let smark = list_begin(pcx);
+    list_push(pcx.nodes[n].b, &pcx);
+    list_end(some, smark, &pcx);
+    let some_arm = new_node(Arm, start, end, &pcx);
+    pcx.nodes[some_arm].a = some;
+    pcx.nodes[some_arm].c = pcx.nodes[n].d;
+    let brk = new_node(Break, end, end, &pcx);
+    let wild = new_node(PatWild, end, end, &pcx);
+    let none_arm = new_node(Arm, end, end, &pcx);
+    pcx.nodes[none_arm].a = wild;
+    pcx.nodes[none_arm].c = brk;
+    pcx.nodes[none_arm].p = ARM_SYNTHETIC;
+    let amark = list_begin(pcx);
+    list_push(some_arm, &pcx);
+    list_push(none_arm, &pcx);
+    list_end(m, amark, &pcx);
+    let lp = new_node(Loop, start, end, &pcx);
+    pcx.nodes[lp].a = pcx.nodes[n].a;
+    pcx.nodes[lp].b = block_of_tail(m, n, &pcx);
+    lp
+}
+
+// A copy of `for` loop n (its label) as `for pattern in seq body`.
+fn for_copy(n: i64, pattern: i64, seq: i64, body: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let f = new_node(For, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    pcx.nodes[f] = pcx.nodes[n];
+    pcx.nodes[f].b = pattern;
+    pcx.nodes[f].c = seq;
+    pcx.nodes[f].d = body;
+    pcx.nodes[f].p = pcx.nodes[n].p & ~FOR_VIA_ITER;
+    pcx.nodes[f].ty = 0;
+    f
+}
+
+fn ident(sym: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let id = new_node(Ident, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    pcx.nodes[id].a = sym;
+    id
+}
+
+fn field(obj: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let f = new_node(FieldAccess, pcx.nodes[obj].start, pcx.nodes[obj].end, &pcx);
+    pcx.nodes[f].a = obj;
+    pcx.nodes[f].b = name;
+    f
+}
+
+fn deref(e: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let u = new_node(Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+    pcx.nodes[u].op = Tok::Star;
+    pcx.nodes[u].b = e;
+    u
+}
+
+// `receiver.name()`.
+fn method_call(receiver: i64, name: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let c = new_node(MethodCall, pcx.nodes[receiver].start, pcx.nodes[receiver].end, &pcx);
+    pcx.nodes[c].a = receiver;
+    pcx.nodes[c].b = name;
+    let mark = list_begin(pcx);
+    list_end(c, mark, &pcx);
+    c
+}
+
+// `{ e }` (e: a statement-like expression, for loop n's position).
+fn block_of(e: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let stmt = new_node(ExprStmt, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    pcx.nodes[stmt].a = e;
+    pcx.nodes[stmt].b = 1;
+    let b = new_node(Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    let mark = list_begin(pcx);
+    list_push(stmt, &pcx);
+    list_end(b, mark, &pcx);
+    b
+}
+
+// `{ e }` with e as the tail.
+fn block_of_tail(e: i64, n: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let b = new_node(Block, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
+    let mark = list_begin(pcx);
+    list_end(b, mark, &pcx);
+    pcx.nodes[b].a = e;
+    b
+}
+
+// Range n (`a..b`, `a..=b`) as a value (`expected`: 0 in synth mode): the
+// struct literal `std::Range { start: a, end: b }` (`std::RangeInclusive
+// { start: a, end: b, done: false }`) in its place. Its type.
+pub fn range_value(n: i64, expected: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let inclusive = pcx.nodes[n].c != 0;
+    if pcx.nodes[n].a == 0 || pcx.nodes[n].b == 0 {
+        type_error(n, c"a range used as a value needs both ends: 'a..b'", &pcx);
+    }
+    if pcx.std_module < 0 {
+        type_error(n, c"a range used as a value is std's Range, and std is not loaded: write 'std::Range { start: a, end: b }'", &pcx);
+    }
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let lit = new_node(StructLit, start, end, &pcx);
+    pcx.nodes[lit].a = intern_c(if inclusive { c"RangeInclusive" } else { c"Range" }, &pcx);
+    let prefix = new_node(Path, start, end, &pcx);
+    let pmark = list_begin(pcx);
+    list_push(ident(intern_c(c"std", &pcx), n, &pcx), &pcx);
+    list_end(prefix, pmark, &pcx);
+    pcx.nodes[lit].h = prefix;
+    let mark = list_begin(pcx);
+    list_push(field_init(intern_c(c"start", &pcx), pcx.nodes[n].a, &pcx), &pcx);
+    list_push(field_init(intern_c(c"end", &pcx), pcx.nodes[n].b, &pcx), &pcx);
+    if inclusive {
+        let no = new_node(Bool, end, end, &pcx);
+        list_push(field_init(intern_c(c"done", &pcx), no, &pcx), &pcx);
+    }
+    list_end(lit, mark, &pcx);
+    pcx.nodes[n] = pcx.nodes[lit];
+    if expected != 0 { check_expr(n, expected, &pcx) } else { synth_expr(n, &pcx) }
+}
+
+fn field_init(name: i64, value: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let f = new_node(FieldInit, pcx.nodes[value].start, pcx.nodes[value].end, &pcx);
+    pcx.nodes[f].a = name;
+    pcx.nodes[f].b = value;
+    f
+}
