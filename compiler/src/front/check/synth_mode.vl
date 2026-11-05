@@ -5,8 +5,8 @@
 // (`size_of`, `align_of`) folded to constants.
 
 use crate::base::{
-    SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, buf_uint, intern,
-    intern_c,
+    SRC, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, buf_uint, intern, intern_c,
+    sym_text,
 };
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
@@ -61,9 +61,9 @@ use crate::front::modules::within_std;
 use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
-    ENUMS, REF_MUT, REF_SHARED, TSCRATCH, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64,
-    TY_I8, TY_ISIZE, TY_NEVER, TY_U16, TY_U32, TY_U64, TY_U8, TY_UNIT, TY_USIZE, TyKind, array_of,
-    buf_type, enum_variant, err_type, find_field, find_method, int_bits, int_max, is_compound,
+    ENUMS, REF_MUT, REF_SHARED, TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_ISIZE,
+    TY_NEVER, TY_U16, TY_U32, TY_U64, TY_U8, TY_UNIT, TY_USIZE, TyKind, array_of, buf_type,
+    enum_variant, err_type, find_field, find_method, int_bits, int_max, is_compound,
     is_fieldless_enum, is_integer, is_numeric, is_opaque_vector, is_pointer, is_ref, is_signed,
     is_vector, make_type, mut_slice_of, primitive_name, ptr_to, ref_to, slice_of, struct_field,
     type_align, type_elem, type_size,
@@ -118,17 +118,17 @@ fn synth_expr_inner(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         FieldAccess => synth_field(n, &pcx),
         TupleField => synth_tuple_field(n, &pcx),
         Tuple => {
-            let mark = TSCRATCH.count;
+            let mark = pcx.tscratch.count;
             for i in 0..pcx.nodes[n].count {
                 let elem = synth_expr(child(n, i, pcx), &pcx);
-                TSCRATCH.push(elem);
+                pcx.tscratch.push(elem);
             }
-            make_type(TyKind::Tuple, 0, 0, mark)
+            make_type(TyKind::Tuple, 0, 0, mark, &pcx)
         }
         Array => synth_array(n, &pcx),
         Repeat => {
             let elem = synth_expr(pcx.nodes[n].a, &pcx);
-            array_of(elem, eval_array_len(pcx.nodes[n].b, &pcx))
+            array_of(elem, eval_array_len(pcx.nodes[n].b, &pcx), &pcx)
         }
         StructLit => {
             // (0.17: `E::V { a: x }`, a struct-like variant's literal)
@@ -207,13 +207,13 @@ fn suffixed_literal(n: i64, negated: bool, pcx: inout Ctx<Comp>) -> i64 {
     ty
 }
 
-fn is_valid_cast(from: i64, to: i64) -> bool {
-    if is_fieldless_enum(from) && is_integer(to) { return true; }
-    if is_integer(from) && is_fieldless_enum(to) { return true; }
+fn is_valid_cast(from: i64, to: i64, pcx: Ctx<Comp>) -> bool {
+    if is_fieldless_enum(from, pcx) && is_integer(to) { return true; }
+    if is_integer(from) && is_fieldless_enum(to, pcx) { return true; }
     if is_numeric(from) && is_numeric(to) { return true; }
-    if is_pointer(from) && is_pointer(to) { return true; }
-    if is_integer(from) && is_pointer(to) { return true; }
-    if is_pointer(from) && is_integer(to) { return true; }
+    if is_pointer(from, pcx) && is_pointer(to, pcx) { return true; }
+    if is_integer(from) && is_pointer(to, pcx) { return true; }
+    if is_pointer(from, pcx) && is_integer(to) { return true; }
     if from == TY_BOOL && is_integer(to) { return true; }
     from == TY_NEVER
 }
@@ -223,18 +223,20 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     let from_ty = synth_expr(operand, &pcx);
     let to_ty = resolve_type(pcx.nodes[n].b, &pcx);
     // (0.25) `&x as *T`: an address, not an inout access
-    let raw_to = strip_distinct(to_ty);
-    if pcx.nodes[operand].kind == Unary && pcx.nodes[operand].op == Tok::Amp && is_pointer(raw_to)
-        && TYPES[raw_to].b == 0 {
+    let raw_to = strip_distinct(to_ty, pcx);
+    if pcx.nodes[operand].kind == Unary && pcx.nodes[operand].op == Tok::Amp
+        && is_pointer(raw_to, pcx)
+        && pcx.types[raw_to].b == 0 {
         pcx.raw_addrs.push(operand);
     }
     // (0.18: a distinct type converts as its underlying type does, and
     // to and from that type for free: the cast is its operand)
-    let from = strip_distinct(from_ty);
-    let to = strip_distinct(to_ty);
+    let from = strip_distinct(from_ty, pcx);
+    let to = strip_distinct(to_ty, pcx);
     if (from != from_ty || to != to_ty) && from == to {
         // (std::NonNull from a raw pointer: checked)
-        if is_distinct_type(to_ty) && is_niche_alias(TYPES[to_ty].b, pcx) && from == from_ty {
+        if is_distinct_type(to_ty, pcx) && is_niche_alias(pcx.types[to_ty].b, pcx)
+            && from == from_ty {
             return nonnull_cast(n, operand, to_ty, &pcx);
         }
         // (0.20) bytes become std's `str` only checked, outside std
@@ -244,7 +246,7 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[n] = pcx.nodes[operand];
         return to_ty;
     }
-    if !is_valid_cast(from, to) {
+    if !is_valid_cast(from, to, pcx) {
         err_begin(pcx.nodes[operand].start, &pcx);
         err_str(c"cannot cast '", pcx);
         err_type(from_ty, pcx);
@@ -253,10 +255,10 @@ fn synth_cast(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         err_str(c"'", pcx);
         err_end(&pcx);
     }
-    if is_integer(from) && is_fieldless_enum(to) && to == to_ty {
+    if is_integer(from) && is_fieldless_enum(to, pcx) && to == to_ty {
         return enum_cast(n, operand, from, to, &pcx);
     }
-    if is_integer(from) && is_pointer(to)
+    if is_integer(from) && is_pointer(to, pcx)
         && !(pcx.nodes[operand].kind == Int && pcx.nodes[operand].a == 0) {
         unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe", &pcx);
     }
@@ -283,7 +285,7 @@ fn bytes_as_str_error(n: i64, operand: i64, pcx: inout Ctx<Comp>) {
 // (the discriminants the operand's type can hold).
 fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
-        let e = TYPES[to].a;
+        let e = pcx.types[to].a;
         let start = pcx.nodes[n].start;
         let end = pcx.nodes[n].end;
         let m = new_node(Match, start, end, &pcx);
@@ -319,7 +321,7 @@ fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: inout Ctx<Comp>) -> 
             pcx.nodes[arm].c = body;
             list_push(arm, &pcx);
         }
-        let name = intern_c(c"__invalid_value");
+        let name = intern_c(c"__invalid_value", &pcx);
         let bind = new_node(PatBind, start, end, &pcx);
         pcx.nodes[bind].a = name;
         let value = new_node(Ident, start, end, &pcx);
@@ -340,7 +342,7 @@ fn enum_cast(n: i64, operand: i64, from: i64, to: i64, pcx: inout Ctx<Comp>) -> 
 // `T` as a type node: for casts the checker adds.
 fn type_name_node(t: i64, at: i64, pcx: inout Ctx<Comp>) -> i64 {
     let node = new_node(TyName, pcx.nodes[at].start, pcx.nodes[at].end, &pcx);
-    pcx.nodes[node].a = intern_c(primitive_name(t));
+    pcx.nodes[node].a = intern_c(primitive_name(t), &pcx);
     node
 }
 
@@ -353,14 +355,14 @@ fn cast_node(e: i64, t: i64, pcx: inout Ctx<Comp>) -> i64 {
 
 // The method `v[i]` (index node n) on a Vec or a Buf calls: as_mut_slice
 // on MUT_PLACE's path, else as_slice.
-fn slice_method(n: i64, pcx: Ctx<Comp>) -> i64 {
+fn slice_method(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     var p = pcx.mut_place;
     for _ in 0..1000 {
         if p == 0 {
             break;
         }
         if p == n {
-            return intern_c(c"as_mut_slice");
+            return intern_c(c"as_mut_slice", &pcx);
         }
         let k = pcx.nodes[p].kind;
         if k != Index && k != FieldAccess && k != TupleField {
@@ -368,13 +370,13 @@ fn slice_method(n: i64, pcx: Ctx<Comp>) -> i64 {
         }
         p = pcx.nodes[p].a;
     }
-    intern_c(c"as_slice")
+    intern_c(c"as_slice", &pcx)
 }
 
 fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     var base = pcx.nodes[n].a;
     var base_ty = synth_expr(base, &pcx);
-    var base_kind = TYPES[base_ty].kind;
+    var base_kind = pcx.types[base_ty].kind;
     if base_kind == TyKind::Struct && indexes_as_slice(base_ty, pcx) {
         // (0.17) `v[i]` (`v[a..b]`) on a Vec or a Buf is
         // `v.as_slice()[i]`: checked, and a place to assign, through
@@ -382,29 +384,29 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         pcx.nodes[base].p |= NODE_CHECKED;
         let call = new_node(NodeKind::MethodCall, pcx.nodes[base].start, pcx.nodes[base].end, &pcx);
         pcx.nodes[call].a = base;
-        pcx.nodes[call].b = slice_method(n, pcx);
+        pcx.nodes[call].b = slice_method(n, &pcx);
         let mark = list_begin(pcx);
         list_end(call, mark, &pcx);
         pcx.nodes[n].a = call;
         base = call;
         base_ty = synth_expr(call, &pcx);
-        base_kind = TYPES[base_ty].kind;
+        base_kind = pcx.types[base_ty].kind;
     }
     let index = pcx.nodes[n].b;
     // (0.17) through a pointer to a Vec, a Buf or a slice: the one it
     // points to, checked; through a raw pointer, unsafe
     // (decided 2026-10-16) unless it points, as written, to a type
     // parameter (`p: *T`): arithmetic then, whatever T is
-    if base_kind == TyKind::Ptr && indexes_through(TYPES[base_ty].a, pcx)
-        && !pointee_is_param(base, pcx) {
-        let pointee = TYPES[base_ty].a;
+    if base_kind == TyKind::Ptr && indexes_through(pcx.types[base_ty].a, pcx)
+        && !pointee_is_param(base, &pcx) {
+        let pointee = pcx.types[base_ty].a;
         let raw = !is_borrow(base, pcx);
         if raw {
             unsafe_view_index(n, base, index, pointee, pcx.nodes[index].kind == Range, &pcx);
             // (reported: the method called through p below is not)
             pcx.unsafe_depth += 1;
         }
-        if TYPES[pointee].kind == TyKind::Slice {
+        if pcx.types[pointee].kind == TyKind::Slice {
             // a borrow: `p[i]` is `(*p)[i]`
             let deref = synthetic_unary(Tok::Star, base, pointee, &pcx);
             pcx.nodes[n].a = deref;
@@ -417,14 +419,14 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             let call = new_node(NodeKind::MethodCall, pcx.nodes[base].start, pcx.nodes[base].end,
                 &pcx);
             pcx.nodes[call].a = base;
-            pcx.nodes[call].b = slice_method(n, pcx);
+            pcx.nodes[call].b = slice_method(n, &pcx);
             let mark = list_begin(pcx);
             list_end(call, mark, &pcx);
             pcx.nodes[base].p |= NODE_CHECKED;
             pcx.nodes[n].a = call;
             base = call;
             base_ty = synth_expr(call, &pcx);
-            base_kind = TYPES[base_ty].kind;
+            base_kind = pcx.types[base_ty].kind;
         }
         if raw {
             pcx.unsafe_depth -= 1;
@@ -433,9 +435,9 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     // (0.20) std's `str`: indexed as its bytes' slice (`s[i]` a u8), and
     // a range of it is a `str` (`s[1..]`)
     var text = 0;
-    if is_view_distinct(base_ty) {
+    if is_view_distinct(base_ty, pcx) {
         text = base_ty;
-        base_ty = TYPES[base_ty].a;
+        base_ty = pcx.types[base_ty].a;
         base_kind = TyKind::Slice;
     }
     if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
@@ -469,7 +471,7 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             unsafe_op(n, U_SLICE, c"slicing a raw pointer is unsafe", &pcx);
         } else if pcx.nodes[index].kind == Int && pcx.nodes[index].a == 0 {
             // (0.17) `p[0]`, meant as `*p`
-            unsafe_index_zero(n, base, TYPES[base_ty].a, &pcx);
+            unsafe_index_zero(n, base, pcx.types[base_ty].a, &pcx);
         } else {
             unsafe_op(n, U_INDEX, c"indexing a raw pointer is unsafe", &pcx);
         }
@@ -488,17 +490,17 @@ fn synth_index(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         if text != 0 {
             return text;
         }
-        return slice_of(TYPES[base_ty].a);
+        return slice_of(pcx.types[base_ty].a, &pcx);
     }
     check_index_type(index, &pcx);
-    TYPES[base_ty].a
+    pcx.types[base_ty].a
 }
 
 // (0.17) Whether a value of type t (a struct) is indexed through its
 // slice: std's Vec and Buf.
 fn indexes_as_slice(t: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        pcx.std_module >= 0 && within_std(pcx.structs[TYPES[t].a].module, pcx)
+        pcx.std_module >= 0 && within_std(pcx.structs[pcx.types[t].a].module, pcx)
             && (is_std_named(t, c"Vec", pcx) || is_std_named(t, c"Buf", pcx))
     }
 }
@@ -506,8 +508,8 @@ fn indexes_as_slice(t: i64, pcx: Ctx<Comp>) -> bool {
 // (0.17) Whether `p[i]` on a pointer of type *t indexes the pointee (a
 // Vec, a Buf or a slice), not memory from p.
 fn indexes_through(t: i64, pcx: Ctx<Comp>) -> bool {
-    TYPES[t].kind == TyKind::Slice
-        || (TYPES[t].kind == TyKind::Struct && indexes_as_slice(t, pcx))
+    pcx.types[t].kind == TyKind::Slice
+        || (pcx.types[t].kind == TyKind::Struct && indexes_as_slice(t, pcx))
 }
 
 // The index of `a[i]` (or an end of `a[i..j]`): an integer, or (0.18.1) a
@@ -515,7 +517,7 @@ fn indexes_through(t: i64, pcx: Ctx<Comp>) -> bool {
 // `a` is `&i64`; `*a` written for it).
 fn check_index_type(index: i64, pcx: inout Ctx<Comp>) {
     let index_ty = synth_expr(index, &pcx);
-    if is_ref(index_ty) && is_integer(TYPES[index_ty].a) {
+    if is_ref(index_ty, pcx) && is_integer(pcx.types[index_ty].a) {
         let inner = new_node(NodeKind::Ident, pcx.nodes[index].start, pcx.nodes[index].end, &pcx);
         pcx.nodes[inner] = pcx.nodes[index];
         pcx.nodes[index].kind = Unary;
@@ -527,7 +529,7 @@ fn check_index_type(index: i64, pcx: inout Ctx<Comp>) {
         pcx.nodes[index].res = Res::None;
         pcx.nodes[index].x = 0;
         pcx.nodes[index].y = 0;
-        pcx.nodes[index].ty = TYPES[index_ty].a;
+        pcx.nodes[index].ty = pcx.types[index_ty].a;
         return;
     }
     if !is_integer(index_ty) {
@@ -546,16 +548,16 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         var base_ty = synth_expr(pcx.nodes[n].a, &pcx);
         let name = pcx.nodes[n].b;
         pcx.nodes[n].y = 0;
-        if TYPES[base_ty].kind == TyKind::Slice {
+        if pcx.types[base_ty].kind == TyKind::Slice {
             pcx.nodes[n].y = 2;
-            if name == intern_c(c"len") {
+            if name == intern_c(c"len", &pcx) {
                 // usize (0.26.2, as Rust; i64 from 0.4, u64 before)
                 pcx.nodes[n].x = 1;
                 return TY_USIZE;
             }
-            if name == intern_c(c"ptr") {
+            if name == intern_c(c"ptr", &pcx) {
                 pcx.nodes[n].x = 0;
-                return ptr_to(TYPES[base_ty].a);
+                return ptr_to(pcx.types[base_ty].a, &pcx);
             }
             err_begin(pcx.nodes[n].start, &pcx);
             err_str(c"slices have the fields 'ptr' and 'len', not '", pcx);
@@ -567,7 +569,7 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         // none) reads as `v.len()`, and `a.len` on an array place as
         // `a.len()`: both spellings are the length. A write (`v.len = n`,
         // `&v.len`) stays the sealed field's error.
-        if name == intern_c(c"len") && (pcx.nodes[n].p & NODE_NO_READ) == 0
+        if name == intern_c(c"len", &pcx) && (pcx.nodes[n].p & NODE_NO_READ) == 0
             && len_is_method(n, base_ty, &pcx) {
             pcx.nodes[pcx.nodes[n].a].p |= NODE_CHECKED;
             pcx.nodes[n].kind = MethodCall;
@@ -576,16 +578,17 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             pcx.nodes[n].count = 0;
             return synth_method(n, &pcx);
         }
-        if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Struct {
+        if pcx.types[base_ty].kind == TyKind::Ptr
+            && pcx.types[pcx.types[base_ty].a].kind == TyKind::Struct {
             pcx.nodes[n].y = 1;
-            base_ty = TYPES[base_ty].a;
+            base_ty = pcx.types[base_ty].a;
             if !is_borrow(pcx.nodes[n].a, pcx) {
                 pcx.nodes[n].p |= NODE_RAW;
                 unsafe_through(n, pcx.nodes[n].a, U_FIELD,
                     c"access to a field through a raw pointer is unsafe", &pcx);
             }
         }
-        if TYPES[base_ty].kind != TyKind::Struct {
+        if pcx.types[base_ty].kind != TyKind::Struct {
             err_begin(pcx.nodes[n].start, &pcx);
             err_str(c"cannot access field '", pcx);
             err_sym(name, pcx);
@@ -595,7 +598,7 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             enum_field_help(base_ty, name, pcx.nodes[n].a, pcx);
             err_end(&pcx);
         }
-        let s = TYPES[base_ty].a;
+        let s = pcx.types[base_ty].a;
         let field = find_field(s, name, pcx);
         // (0.26.0: an `embed wgsl` block's entry point, gpu.entry)
         if field < 0 && crate::front::embed::wgsl::entry_error(n, pcx.structs[s].node, name, &pcx) {
@@ -628,7 +631,7 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             unsafe_op(n, U_UNION, c"reading a field of a union is unsafe", &pcx);
         }
         let fty = (*struct_field(s, field, pcx)).ty;
-        if (pcx.nodes[n].p & CONV_NEW) == 0 && is_ref(fty)
+        if (pcx.nodes[n].p & CONV_NEW) == 0 && is_ref(fty, pcx)
             && crate::front::conv::field_is_access(s, field, pcx) {
             // (0.20) an access field: `p.q` is `*p.q`, the value it designates
             let inner = new_node(NodeKind::None, pcx.nodes[n].start, pcx.nodes[n].end, &pcx);
@@ -651,14 +654,14 @@ fn synth_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
 // (0.17) Whether `x.len` (node n, x of type t) is read as `x.len()`: an
 // array place, or std's Vec, Buf, HashMap (or a pointer to one).
 fn len_is_method(n: i64, t: i64, pcx: inout Ctx<Comp>) -> bool {
-    if TYPES[t].kind == TyKind::Array {
+    if pcx.types[t].kind == TyKind::Array {
         return is_plain_place(pcx.nodes[n].a, pcx);
     }
     var st = t;
-    if TYPES[st].kind == TyKind::Ptr {
-        st = TYPES[st].a;
+    if pcx.types[st].kind == TyKind::Ptr {
+        st = pcx.types[st].a;
     }
-    TYPES[st].kind == TyKind::Struct && len_reads_as_method(n, TYPES[st].a, &pcx)
+    pcx.types[st].kind == TyKind::Struct && len_reads_as_method(n, pcx.types[st].a, &pcx)
 }
 
 // The help of an unknown field `name` of struct s: the nearest field.
@@ -675,11 +678,12 @@ pub fn help_near_field(s: i64, name: i64, pcx: inout Ctx<Comp>) {
 fn synth_tuple_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     var base_ty = synth_expr(pcx.nodes[n].a, &pcx);
     let index = pcx.nodes[n].b;
-    if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Tuple {
+    if pcx.types[base_ty].kind == TyKind::Ptr
+        && pcx.types[pcx.types[base_ty].a].kind == TyKind::Tuple {
         // (0.17) through a pointer to a tuple, as a field through a
         // pointer to a struct: `p.0` is `(*p).0`
         let base = pcx.nodes[n].a;
-        base_ty = TYPES[base_ty].a;
+        base_ty = pcx.types[base_ty].a;
         let deref = synthetic_unary(Tok::Star, base, base_ty, &pcx);
         if !is_borrow(base, pcx) {
             pcx.nodes[deref].p |= NODE_RAW;
@@ -688,23 +692,23 @@ fn synth_tuple_field(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         }
         pcx.nodes[n].a = deref;
     }
-    if TYPES[base_ty].kind != TyKind::Tuple {
+    if pcx.types[base_ty].kind != TyKind::Tuple {
         err_begin(pcx.nodes[n].start, &pcx);
         err_str(c"cannot use tuple index on type '", pcx);
         err_type(base_ty, pcx);
         err_str(c"'", pcx);
         err_end(&pcx);
     }
-    if index >= TYPES[base_ty].count {
+    if index >= pcx.types[base_ty].count {
         err_begin(pcx.nodes[n].start, &pcx);
         err_str(c"tuple index ", pcx);
         err_int(index, pcx);
         err_str(c" out of range for tuple with ", pcx);
-        err_int(TYPES[base_ty].count, pcx);
+        err_int(pcx.types[base_ty].count, pcx);
         err_str(c" elements", pcx);
         err_end(&pcx);
     }
-    type_elem(base_ty, index)
+    type_elem(base_ty, index, pcx)
 }
 
 fn synth_array(n: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -728,7 +732,7 @@ fn synth_array(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             check_expr(child(n, i, pcx), elem, &pcx);
         }
     }
-    array_of(elem, count)
+    array_of(elem, count, &pcx)
 }
 
 // ---- Operators ----
@@ -800,10 +804,10 @@ fn synth_operands(lhs: i64, rhs: i64, pcx: inout Ctx<Comp>) -> i64 {
 // number or a bool, `*e` in its place; T, or ty.
 pub fn read_through(e: i64, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     let b = pcx.binary_node;
-    if !is_ref(ty) || b <= 0 || !(is_numeric(TYPES[ty].a) || TYPES[ty].a == TY_BOOL) {
+    if !is_ref(ty, pcx) || b <= 0 || !(is_numeric(pcx.types[ty].a) || pcx.types[ty].a == TY_BOOL) {
         return ty;
     }
-    let t = TYPES[ty].a;
+    let t = pcx.types[ty].a;
     let u = synthetic_unary(Tok::Star, e, t, &pcx);
     if pcx.nodes[b].b == e {
         pcx.nodes[b].b = u;
@@ -823,10 +827,10 @@ fn synth_binary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         let value_ty = synth_expr(lhs, &pcx);
         let amount_ty = synth_expr(rhs, &pcx);
         // (0.18: a distinct type over an integer shifts as it does)
-        if !is_integer(strip_distinct(value_ty)) {
+        if !is_integer(strip_distinct(value_ty, pcx)) {
             type_error_got(n, c"shift operator requires integer type", value_ty, &pcx);
         }
-        if !is_integer(strip_distinct(amount_ty)) {
+        if !is_integer(strip_distinct(amount_ty, pcx)) {
             type_error_got(n, c"shift amount must be integer", amount_ty, &pcx);
         }
         return value_ty;
@@ -835,19 +839,19 @@ fn synth_binary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     pcx.binary_node = n;
     var ty = synth_operands(lhs, rhs, &pcx);
     pcx.binary_node = saved;
-    if is_ref(ty) && is_ref(pcx.nodes[lhs].ty) && is_ref(pcx.nodes[rhs].ty)
+    if is_ref(ty, pcx) && is_ref(pcx.nodes[lhs].ty, pcx) && is_ref(pcx.nodes[rhs].ty, pcx)
         && (op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt
             || op == Tok::LtEq || op == Tok::GtEq) {
         // (0.17: a comparison of two references compares what they
         // point to, by T's Eq and Ord, as Rust's; raw `*T` pointers
         // compare as addresses)
-        ty = TYPES[ty].a;
+        ty = pcx.types[ty].a;
         pcx.nodes[n].b = synthetic_unary(Tok::Star, lhs, ty, &pcx);
         pcx.nodes[n].c = synthetic_unary(Tok::Star, rhs, ty, &pcx);
     }
     // (0.18: two values of a distinct type: its underlying type's
     // operator)
-    if is_distinct_type(ty) {
+    if is_distinct_type(ty, pcx) {
         return distinct_binary(n, op, ty, &pcx);
     }
     binary_result(n, op, ty, &pcx)
@@ -859,7 +863,7 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let lhs = pcx.nodes[n].b;
         let rhs = pcx.nodes[n].c;
-        if is_vector(ty) {
+        if is_vector(ty, pcx) {
             return vector_binary(n, op, ty, &pcx);
         }
         // (0.9: an operator trait's impl for the type)
@@ -874,10 +878,10 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
             return ty;
         }
         if (op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq)
-            && is_fieldless_enum(ty) {
+            && is_fieldless_enum(ty, pcx) {
             // 0.4: fieldless enums are ordered by declaration, which must be
             // the order of their discriminants; compared as their tags.
-            let e = TYPES[ty].a;
+            let e = pcx.types[ty].a;
             for i in 1..ENUMS[e].variant_count {
                 if pcx.variants[enum_variant(e, i)].discr
                     <= pcx.variants[enum_variant(e, i - 1)].discr {
@@ -895,7 +899,7 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
             return TY_BOOL;
         }
         if op == Tok::Lt || op == Tok::Gt || op == Tok::LtEq || op == Tok::GtEq {
-            if !(is_numeric(ty) || is_pointer(ty)) {
+            if !(is_numeric(ty) || is_pointer(ty, pcx)) {
                 type_error_got(n, c"comparison requires numeric type", ty, &pcx);
             }
             unsigned_compare(n, op, ty, &pcx);
@@ -918,7 +922,7 @@ pub fn binary_result(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> i64 {
                 err_str(c"', which has no ==", pcx);
                 err_end(&pcx);
             }
-            if is_compound(ty) {
+            if is_compound(ty, pcx) {
                 structural_eq(n, ty, &pcx);
             }
             return TY_BOOL;
@@ -971,7 +975,7 @@ fn unsigned_compare(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) {
 // and the fix.
 fn arithmetic_error(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> ! {
     let (bin, lhs, rhs) = (pcx.nodes[n], pcx.nodes[pcx.nodes[n].b], pcx.nodes[pcx.nodes[n].c]);
-    let k = TYPES[ty].kind;
+    let k = pcx.types[ty].kind;
     let (lt, rt) = (SRC[lhs.start..lhs.end], SRC[rhs.start..rhs.end]);
     err_begin(bin.start, &pcx);
     err_str(c"arithmetic operator requires numeric type, got '", pcx);
@@ -992,7 +996,7 @@ fn arithmetic_error(n: i64, op: Tok, ty: i64, pcx: inout Ctx<Comp>) -> ! {
     var first: [u8] = "";
     if k == TyKind::Struct || k == TyKind::Enum {
         for m in names {
-            if crate::front::check::calls::method_of(ty, intern(m), pcx) >= 0 {
+            if crate::front::check::calls::method_of(ty, intern(m, &pcx), pcx) >= 0 {
                 if first.len == 0 {
                     first = m;
                 } else {
@@ -1036,7 +1040,8 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         }
         // (0.18: a distinct type over a number negates as it does)
         // (0.19: Intel's opaque vectors have no operators)
-        if !is_numeric(strip_distinct(ty)) && (!is_vector(ty) || is_opaque_vector(ty)) {
+        if !is_numeric(strip_distinct(ty, pcx))
+            && (!is_vector(ty, pcx) || is_opaque_vector(ty, pcx)) {
             let neg = std_trait(c"Neg", &pcx);
             if neg >= 0 && has_impl(neg, ty, &pcx) {
                 return negation_call(n, ty, &pcx);
@@ -1051,7 +1056,7 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     }
     if op == Tok::Tilde {
         let ty = synth_expr(operand, &pcx);
-        if !is_integer(strip_distinct(ty)) {
+        if !is_integer(strip_distinct(ty, pcx)) {
             type_error_got(n, c"bitwise NOT requires integer type", ty, &pcx);
         }
         return ty;
@@ -1063,11 +1068,11 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
         let ty = synth_expr(operand, &pcx);
         // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
         // value is called as it is)
-        if TYPES[ty].kind == TyKind::Fn {
+        if pcx.types[ty].kind == TyKind::Fn {
             fn_value_error(n, operand, c"deref", &pcx);
             return ty;
         }
-        if !is_pointer(ty) {
+        if !is_pointer(ty, pcx) {
             err_begin(pcx.nodes[n].start, &pcx);
             err_str(c"cannot deref non-pointer type '", pcx);
             err_type(ty, pcx);
@@ -1078,8 +1083,8 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
                     SRC[
                         pcx.files[crate::front::modules::file_of_pos(pcx.nodes[n].start, pcx)].start..pcx.nodes[
                             n].start],
-                    SYMS[pcx.nodes[operand].a].text) {
-                let t = SYMS[pcx.nodes[operand].a].text;
+                    sym_text(pcx.nodes[operand].a, pcx)) {
+                let t = sym_text(pcx.nodes[operand].a, pcx);
                 err_help_fmt(
                     format_args("'{t}' is a `for` loop's variable, the element's value already: write `{t}`, not `*{t}`"), pcx);
                 err_try_fmt(format_args("{t}"), pcx);
@@ -1090,7 +1095,7 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             pcx.nodes[n].p |= NODE_RAW;
             unsafe_through(n, operand, U_DEREF, c"dereference of a raw pointer is unsafe", &pcx);
         }
-        return TYPES[ty].a;
+        return pcx.types[ty].a;
     }
     // Tok::Amp: taking an address reads nothing (a union's field too).
     mark_no_read(operand, &pcx);
@@ -1105,7 +1110,7 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     if mutable && (pcx.nodes[operand].p & NODE_TEMP) == 0 && is_place(operand, pcx) {
         crate::front::check::assign::defer_inout_place(operand, n, &pcx);
     } else if mutable && (pcx.nodes[operand].p & NODE_TEMP) != 0
-        && TYPES[ty].kind != TyKind::Slice && TYPES[ty].kind != TyKind::Fn
+        && pcx.types[ty].kind != TyKind::Slice && pcx.types[ty].kind != TyKind::Fn
         && crate::front::conv::strict_at(pcx.nodes[n].start, &pcx) {
         // (0.25) `&make()` given an inout parameter: conv.place, when
         // the function ends and the `&` is known to be inout
@@ -1115,16 +1120,16 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     // `&` of it was before: a slice is its own view, a function's
     // name its pointer
     let temp = (pcx.nodes[operand].p & NODE_TEMP) != 0
-        && (TYPES[ty].kind == TyKind::Slice || TYPES[ty].kind == TyKind::Fn);
+        && (pcx.types[ty].kind == TyKind::Slice || pcx.types[ty].kind == TyKind::Fn);
     if !is_place(operand, pcx) || temp {
-        if TYPES[ty].kind == TyKind::Slice {
+        if pcx.types[ty].kind == TyKind::Slice {
             // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
             // view; `&mut` makes it the exclusive `&mut [T]`
             let flags = pcx.nodes[n].p;
             // (0.25) `&a[..]` of an array: an inout access of a
             let sb = if pcx.nodes[operand].kind == Index { pcx.nodes[pcx.nodes[operand].a].ty }
                 else { 0 };
-            if mutable && sb > 0 && TYPES[sb].kind == TyKind::Array && !temp {
+            if mutable && sb > 0 && pcx.types[sb].kind == TyKind::Array && !temp {
                 crate::front::check::assign::defer_inout_place(pcx.nodes[operand].a, n, &pcx);
             }
             // (0.20: the `&`, for `fix --only conventions`)
@@ -1132,11 +1137,11 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
             pcx.slice_amps.push(pcx.nodes[operand].start);
             pcx.nodes[n] = pcx.nodes[operand];
             pcx.nodes[n].p |= flags & NODE_REF_MUT;
-            return if mutable { mut_slice_of(TYPES[ty].a) } else { ty };
+            return if mutable { mut_slice_of(pcx.types[ty].a, &pcx) } else { ty };
         }
         // (0.17, issue #1: `&factorial`: a function's name is its
         // pointer already)
-        if TYPES[ty].kind == TyKind::Fn {
+        if pcx.types[ty].kind == TyKind::Fn {
             fn_value_error(n, operand, c"address", &pcx);
             return ty;
         }
@@ -1148,9 +1153,9 @@ fn synth_unary(n: i64, pcx: inout Ctx<Comp>) -> i64 {
     // one a reference.
     if reached_through_raw(operand, pcx)
         && !(pcx.nodes[operand].kind == Unary && pcx.nodes[operand].op == Tok::Star) {
-        return ptr_to(ty);
+        return ptr_to(ty, &pcx);
     }
-    ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
+    ref_to(ty, if mutable { REF_MUT } else { REF_SHARED }, &pcx)
 }
 
 // (0.25.2.2) Whether the name `t`, used at the end of `text` (its file's
@@ -1351,8 +1356,8 @@ pub fn fold_layout_query(n: i64, pcx: inout Ctx<Comp>) {
         return;
     }
     let name = pcx.nodes[callee].a;
-    let is_size = name == intern_c(c"size_of");
-    if !is_size && name != intern_c(c"align_of") {
+    let is_size = name == intern_c(c"size_of", &pcx);
+    if !is_size && name != intern_c(c"align_of", &pcx) {
         return;
     }
     if lookup_local(name, pcx).is_some() {
