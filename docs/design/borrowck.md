@@ -468,7 +468,8 @@ re-inferred.
   parameter types' and result's regions elided by D4.2 with the inputs
   late-bound, D10.5), and `ops[0]` is the env, read as D10.3 says
   (0.27.2: D19.5 and D20.3 replace this sentence). A callee value of a `fn`
-  pointer type: `Σ` by E1-E2 at the call (R6).
+  pointer type: `Σ` by E1-E2 at the call, its lifetimes one region
+  (R6, L13).
 - `SK_INTRINSIC`: as a call with the builtin's signature (no regions at
   0.27.1).
 - `SK_DROP drop(P)` (decision `≠ DS_REMOVED`): the drop-liveness facts
@@ -1016,20 +1017,27 @@ outside the holes named below.
   `Fn*` bound whatever its lifetimes, early-bound included, where L9
   says `closure.sig`. In the instance the value's type is the erased
   `fn` type (no slots), so nothing of the fn's own signature reaches the
-  bound's body. *The call (0.27.2):* a call through a `fn` value (`constraints.vl`
-  `indirect_call`) is E1-E2 over its erased type: every region of an
-  argument outlives every region of the result (E2's one input region;
-  with several, each of them, stricter than a signature naming one).
-  0.27.1 made no constraint there, so a result could outlive its
-  argument; cases `rust_b_err_fn_value_result`, `rust_b_ok_fn_value_result`.
-  *Still open:* a flow between two arguments through a `fn` value (`fn
-  store<'a>(x: &mut &'a T, y: &'a T)` used as `fn(&mut &T, &T)`): the
-  erased type drops the `'a` that ties them and E1 gives each its own
-  region, so the store is not seen at the caller (rustc rejects the
-  coercion as not general enough). No other statement drops its
-  constraints: an intrinsic has no reference result, and a call of a
-  generic parameter's method or of a closure is a direct call in the
-  instance.
+  bound's body.
+  *The call (0.27.2):* a call through a `fn` value (`constraints.vl`
+  `indirect_call`) is E1-E2 over its erased type, with the type's
+  lifetimes read as one region: every region of an argument outlives
+  every region of the result (E2's one input region; with several, each
+  of them, stricter than a signature naming one), and every region of an
+  argument or of the result is equal to every region in an invariant
+  position (under a `&mut`) of another of them, since the callee may
+  store one through the other (`fn store<'a>(x: &mut &'a T, y: &'a T)`
+  used as `fn(&mut &T, &T)`: the erased type drops the `'a` that ties
+  them; rustc rejects the coercion as not general enough, and here the
+  store is seen at the caller). The equalities are stricter than rustc
+  (L13). 0.27.1 made no constraint at such a call; cases
+  `rust_b_err_fn_value_result`, `rust_b_ok_fn_value_result`,
+  `rust_b_err_fn_value_arg_flow` (and `_coerced`, the coercion),
+  `rust_b_ok_fn_value_arg_flow`, `rust_b_err_fn_value_result_mut`. No
+  statement drops its constraints any more: an intrinsic has no
+  reference result, and a call of a generic parameter's method or of a
+  closure is a direct call in the instance. *What remains of R6* is
+  D20.5's identity of `fn` items above: the value's own signature is not
+  compared with the bound's.
 - R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` are
   disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` may coexist on an
   array and through a `&mut [T]`; rustc rejects both (only slice
@@ -1092,6 +1100,15 @@ outside the holes named below.
   matches up to a renaming of bound regions; rustc also instantiates a
   `for<'x>` value at an early-bound `'a`. Reason: no `for<>` until 0.29.
   (L10–L12 are reserved for 0.27.2.1's §21–§22.)
+- L13 (0.27.2) A call through a `fn` value reads the erased type's
+  lifetimes as one region (R6): every region of an argument or of the
+  result is equal to every region under a `&mut` of another, whether the
+  callee stores through it or not. rustc keeps the elided regions of
+  `fn(&mut &T, &T)` apart and accepts a `y` that dies before `*x` is
+  read when the callee does not store it. Sound (the callee's real
+  signature relates at most these regions); ends with `for<'a>` `fn`
+  types (0.29). Case `rust_b_err_fn_value_arg_flow_strict`
+  (`// RUSTC: accepts L13`).
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
@@ -1888,8 +1905,11 @@ loan's place as D1.4 says until Z9.5 replaces it.
 
 **AT1 (`Send`, `Sync`, compiler-known).** `Send` and `Sync` are traits
 whose impls the compiler decides (std2's `marker.vl` declares neither;
-they need no `use`, Z2). `τ: Send` and `τ: Sync` are decided
-structurally by `front/threads.vl` with Rust's rules:
+they need no `use`, Z2; `front/auto_traits.vl` makes each on its first
+use, an `unsafe` trait with no items, which a program's own trait of
+that name shadows). `τ: Send` and `τ: Sync` are decided structurally by
+`front/auto_traits.vl` with Rust's rules (a type recursive through a
+reference holds coinductively, as rustc's):
 - numbers, `bool`, `char`, `()`, `str`, fieldless enums, `fn` types:
   both;
 - `[T; n]`, `[T]`, tuples, and a struct or enum with no vouch (AT2):
@@ -1899,7 +1919,7 @@ structurally by `front/threads.vl` with Rust's rules:
   `Sync ⇔ T: Sync`; raw pointers: neither;
 - a closure `C`: by its environment's fields, so per capture: a `ref`
   capture needs `τₖ: Sync`, a `mut` or `val` capture `τₖ: Send` (for
-  `Send`); `X_C` adds nothing.
+  `Send`); every capture `τₖ: Sync` (for `Sync`); `X_C` adds nothing.
 std2's own types follow from these and from std2's vouches (AT2):
 `UnsafeCell<T>` and `Cell<T>` are `Send` iff `T: Send` and never
 `Sync`; the containers by their type and allocator arguments; `&'a
@@ -1907,7 +1927,13 @@ Arena<P>` is not `Sync`. std2 has no `sync` module in 0.27.2 (front-rust.md
 Z3.1: its atomics are private `thread` functions lowered by key, and
 `std::sync` is 0.27.3's); when it lands, its vouches are Rust's:
 `Mutex<T>` `Send` and `Sync` iff `T: Send`, `MutexGuard<'a, T>` never
-`Send`, the atomic types both. No AT rule reads a compiler-known item
+`Send`, the atomic types both. *Until the switch (0.27.2's Z1-Z6)* the
+edition's std is MVS's, whose containers and sync types are decided by
+`threads.vl`'s names as a bridge (`vouched_container`'s by their type
+arguments, `Mutex` by its `T: Send`, `Atomic`, `RawLock`, `JoinHandle`
+both), and the names reach std2's types of those names too; std2's own
+vouches (`unsafe impl<T: Send, A: Send> Send for Vec<T, A> {}`, ...)
+replace the bridge with it. No AT rule reads a compiler-known item
 (Z3.1's keys): `Send`, `Sync` and `Fn*` are the compiler's own names
 (Z2), and AT6 works by std2's signatures.
 `threads.vl`'s name list (`vouched_container`) and 0.21's view
@@ -1926,7 +1952,8 @@ trait is an error. Any vouch of a trait for `X` replaces AT1's
 structural rule for every instance of `X`: `X<τ..>: Send` iff some
 positive vouch applies to it (F4's applicability: its header unifies
 and its `where` bounds hold). A positive and a negative vouch that
-overlap are `trait.overlap` (F4). Stable rustc has no negative impls,
+overlap are `trait.overlap` (F4; 0.27.2: the coherence check's
+"conflicting impls", one impl per trait and type). Stable rustc has no negative impls,
 so a case using one is `// RUSTC: none` for the twin.
 
 **AT3 (bounds).** `T: Send` and `T: Sync`, in a parameter list or a
@@ -1934,7 +1961,13 @@ so a case using one is `// RUSTC: none` for the twin.
 argument `τ`; for a closure argument, per capture as AT1 says. A
 failure is `error sync.not_send` / `sync.not_sync` (rustc E0277) at the
 instantiating call, with the chain to the failing part (`threads.vl`'s
-reason: the type, the field, the part).
+reason: the type, the field, the part). The check is `check_bound`
+(`front/auto_traits.vl`), called by `traits.vl`'s `check_bounds`; the
+chain is each step outermost first (`its field 'inner', 'Inner', is
+not Send; ...`), ending at the leaf: a raw pointer, an `UnsafeCell`
+(never Sync), a negative vouch or a positive one whose bounds fail. The
+rustc twin maps E0277's "cannot be sent / shared between threads" to
+both codes. Cases `rust_b_auto_*`.
 
 **AT4, AT5** (leakage through an opaque type; the opaque instance's
 `Ω: Send`) are 0.27.2.1's, with §21–§22.

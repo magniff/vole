@@ -34,7 +34,7 @@
 # so, with a class of docs/design/borrowck.md's divergences:
 #   // RUSTC: accepts CLASS why    (the case is rejected, rustc accepts it)
 #   // RUSTC: rejects CLASS why    (the case is accepted, rustc rejects it)
-# CLASS one of R1-R10 (vole more permissive, or R8's Box) and L1-L6 (vole
+# CLASS one of R1-R19 (vole more permissive, or R8's Box) and L1-L19 (vole
 # stricter).
 #   // RUSTC: none why              (outside the common subset: not run)
 # A marked divergence where rustc agrees with the case is a mismatch too
@@ -92,6 +92,7 @@ map_code() {
         E0509) echo move_from_drop ;;
         E0525) echo closure.kind ;;  # (0.27.2, D19.6: the front's code)
         E0631) echo closure.sig ;;
+        auto) echo sync.auto ;;  # (0.27.2, AT3: E0277's Send and Sync, sync.not_send and sync.not_sync)
         E0510|E0594|E0596) echo guard_write ;;  # (E0594: in a guard, a `ref mut` binding is read-only)
         E0796|static_mut) echo static_mut_ref ;;
         *) echo "?$1" ;;
@@ -105,7 +106,7 @@ for case_ in "$@"; do
     name=$(basename "$case_" .vl)
     [ -f "$case_" ] || { echo "FAIL $name: no such file $case_"; FAILN=$((FAILN + 1)); continue; }
     # the expectation and the marker
-    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else if (match($0, /closure\.[a-z_0-9]+/)) { print substr($0, RSTART, RLENGTH); found = 1; exit } else other = 1 }
+    want=$(awk '/^[ \t]*\/\/ ERROR:/ { if (match($0, /sync\.not_s(end|ync)/)) { print "sync.auto"; found = 1; exit } else if (match($0, /borrowck\.[a-z_0-9]+/)) { print substr($0, RSTART + 9, RLENGTH - 9); found = 1; exit } else if (match($0, /closure\.[a-z_0-9]+/)) { print substr($0, RSTART, RLENGTH); found = 1; exit } else other = 1 }
         END { if (!found && other) print "?other" }' "$case_")
     mark=$(awk '/^[ \t]*\/\/ RUSTC:/ { sub(/^[ \t]*\/\/ RUSTC:[ \t]*/, ""); print; exit }' "$case_")
     mverb=$(echo "$mark" | awk '{ print $1 }')
@@ -117,8 +118,8 @@ for case_ in "$@"; do
     fi
     if [ -n "$mark" ]; then
         case "$mverb $mclass" in
-            "accepts "[LR][1-9]|"rejects "[LR][1-9]|"accepts R10"|"rejects R10") ;;
-            *) echo "FAIL $name: bad marker '// RUSTC: $mark' (accepts|rejects R1-R10|L1-L6, or none)"
+            "accepts "[LR][1-9]|"rejects "[LR][1-9]|"accepts "[LR]1[0-9]|"rejects "[LR]1[0-9]) ;;
+            *) echo "FAIL $name: bad marker '// RUSTC: $mark' (accepts|rejects R1-R19|L1-L19, or none)"
                FAILN=$((FAILN + 1)); continue ;;
         esac
     fi
@@ -140,7 +141,8 @@ for case_ in "$@"; do
         got=accept first= gotcode=
     else
         got=reject
-        first=$(awk '/^error\[E[0-9]+\]/ { print substr($0, 7, 5); exit }
+        first=$(awk '/^error\[E0277\]: .* between threads safely/ { print "auto"; exit }
+            /^error\[E[0-9]+\]/ { print substr($0, 7, 5); exit }
             /^error: lifetime may not live long enough/ { print "lifetime"; exit }
             /^error: captured variable cannot escape/ { print "captured"; exit }
             /^error: creating a (shared|mutable) reference to mutable static/ { print "static_mut"; exit }
