@@ -5,11 +5,19 @@ through `volec query items std`).
 
 A line per item: its module, its name (Owner::name for a method), its
 kind, its status (kept, renamed, changed or new; gone for the MVS items
-compiler/std2/gone.tsv lists), the MVS item it comes from, the features
-it waits for (`edition.later` names), the release they give it, the
+compiler/std2/gone.tsv lists), the MVS item it comes from, what the real
+check says of it (ok: no error; later: only `edition.later` errors; error:
+a plain one), the features it waits for from that check (the
+`edition.later` names, and for a plain error the front gap it shows,
+GAPS below), the release they give it (`-`: a gap no release has taken),
+the features its markers predicted that the check did not report, the
 gate-1 test that will cover it, and its signature. Then the counts: per
-module, kept, renamed, changed, new and gone; per later feature, how many
-items wait for it.
+module, kept, renamed, changed, new and gone; how many items typecheck;
+per feature, how many items wait for it.
+
+The check is compiler/std2/typecheck.txt (TYPECHECK below): an error's
+item is the one whose lines hold it (an inherent impl's header: each of
+its members).
 
 What feeds it, in an item's comment (and an impl's or trait's, for all its
 items):
@@ -26,7 +34,8 @@ bound on an assoc type). An in-scope MVS item that no line accounts for is
 reported, so the diff stays complete. It also checks compiler/std2/rewrite.tsv
 (the translator's std table): each row names an MVS item, in four columns.
 
-usage: tools/std2-checklist.py [--volec PATH] [--check]
+usage: tools/std2-checklist.py [--volec PATH] [--errors FILE] [--check]
+  --errors FILE: rewrite typecheck.txt from FILE, a check's output
   --check: exit 1 when checklist.tsv is not what the tree makes
 """
 import os
@@ -157,7 +166,7 @@ def auto_later(sig, in_trait, kind):
         t.append("qualified_path")
     if kind == "const" and in_trait:
         t.append("assoc_const")
-    if kind == "type" and in_trait and re.match(r"\s*type\s+\w+\s*:(?!\s*\?Sized\s*(;|$))", sig):
+    if kind == "type" and in_trait and re.match(r"\s*type\s+\w+\s*:(?!\s*\?\s*Sized\s*(;|$))", sig):
         t.append("assoc_bounds")
     return t
 
@@ -186,6 +195,9 @@ TOP_ITEM = re.compile(r"^pub\s+(?:unsafe\s+)?(fn|struct|enum|trait|type|const|st
 IN_IMPL = re.compile(r"^    pub\s+(?:const\s+)?(?:unsafe\s+)?(fn|const|type)\s+(\w+)")
 IN_TRAIT = re.compile(r"^    (?:unsafe\s+)?(fn|type|const)\s+(\w+)")
 BLOCK_OPEN = re.compile(r"^(pub\s+)?(unsafe\s+)?(impl\b|trait\b)")
+PRIVATE_ITEM = re.compile(r"^(?:unsafe\s+)?(?:fn|struct|enum|union|const|static|type|mod)\s")
+PRIVATE_MEMBER = re.compile(r"^    (?:unsafe\s+)?(?:const\s+)?fn\s")
+MARKS = {}  # file (relative to compiler/std2) -> its marks
 
 
 def signature(lines, i):
@@ -205,6 +217,9 @@ def read_file(path, module, rel):
     with open(path) as fh:
         lines = fh.read().split("\n")
     items = []
+    # marks: (line, what) in order, what = an item, ("header", members) of an
+    # inherent impl, "private" (an item the checklist does not list) or "end"
+    marks = []
     comment = []
     derive = False
     block = None  # dict(kind=trait|impl|traitimpl, owner, trait, later, ...)
@@ -219,6 +234,7 @@ def read_file(path, module, rel):
             continue
         if block is not None and line.startswith("}"):
             block = None
+            marks.append((i + 1.5, "end"))
             comment = []
             continue
         if block is None:
@@ -230,15 +246,20 @@ def read_file(path, module, rel):
                 if owner_text.startswith("&"):
                     bl.append("impl_for_ref")
                 bl += auto_later(header, False, "impl")
-                block = dict(kind="traitimpl" if trait else "impl", owner=owner, trait=trait, later=bl)
+                block = dict(kind="traitimpl" if trait else "impl", owner=owner, trait=trait, later=bl,
+                             members=[], sig=header)
                 if trait:
                     order += 1
                     items.append(dict(module=module, owner=owner, name=f"impl {trait}", kind="impl", sig=header,
                                       later=sorted(set(bl + auto_later(header, False, "impl"))), mvs=bm,
                                       status=bs, why=bw, order=order, file=rel, line=i + 1))
+                    marks.append((i + 1, items[-1]))
+                else:
+                    marks.append((i + 1, ("header", block)))
                 comment = []
                 if line.rstrip().endswith("}"):
                     block = None
+                    marks.append((i + 1.5, "end"))
                 continue
             m = TOP_ITEM.match(line)
             if m:
@@ -251,12 +272,17 @@ def read_file(path, module, rel):
                 items.append(dict(module=module, owner=None, name=name, kind=kind, sig=sig,
                                   later=sorted(set(bl + auto_later(sig, False, kind))), mvs=bm, status=bs, why=bw,
                                   order=order, file=rel, line=i + 1))
+                marks.append((i + 1, items[-1]))
                 if kind == "trait" and not line.rstrip().endswith("}"):
                     block = dict(kind="trait", owner=name, trait=None, later=bl)
                 comment = []
                 continue
+            if PRIVATE_ITEM.match(line):
+                marks.append((i + 1, "private"))
         elif block["kind"] in ("impl", "trait"):
             m = (IN_IMPL if block["kind"] == "impl" else IN_TRAIT).match(line)
+            if not m and block["kind"] == "impl" and PRIVATE_MEMBER.match(line):
+                marks.append((i + 1, "private"))
             if m:
                 kind, name = m.group(1), m.group(2)
                 sig = signature(lines, i)
@@ -266,9 +292,153 @@ def read_file(path, module, rel):
                                   later=sorted(set(bl + block["later"] +
                                                    auto_later(sig, True, kind))),
                                   mvs=bm, status=bs, why=bw, order=order, file=rel, line=i + 1))
+                marks.append((i + 1, items[-1]))
+                if block["kind"] == "impl":
+                    block["members"].append(items[-1])
         comment = []
         derive = False
+    MARKS[rel] = marks
     return items
+
+# compiler/std2/typecheck.txt: the front's errors on the tree, one a line
+# (`FILE:L:C: error[KIND] MESSAGE`, its `try:` lines dropped), from
+# `volec check --edition rust compiler/std2/std.vl` by a build without
+# the 50-error cap (base/diag.vl's MAX_ERRORS); `--errors FILE` reads such
+# a run's output and rewrites it.
+TYPECHECK = os.path.join(TREE, "typecheck.txt")
+
+# A plain error (not edition.later) -> the front gap it shows, a features.tsv
+# name: the first pattern that matches "FILE: error[KIND] MESSAGE" wins.
+GAPS = [
+    (r"^<std>.*duplicate method", "std2_root"),
+    (r"edition\.std_by_value", "std2_root"),
+    (r"duplicate method", "method_name_clash"),
+    (r"does not have the signature trait", "generic_trait_multi_impl"),
+    (r"takes 1 type argument, got 0", "default_type_param"),
+    (r"a function of a generic trait has no default body", "generic_trait_default"),
+    (r"impl for unknown type 'char'|^char\.vl:.*cannot infer type parameter 'T' of 'Option'", "char"),
+    (r"impl for unknown type 'AnyAlloc'|expected type, got 'unsafe'", "unsafe_fn_ptr"),
+    (r"'(Send|Sync)' is not a trait in scope", "auto_trait"),
+    (r"required by the bound 'M: Display' of 'panic::panic'", "impl_for_ref"),
+    (r"is not implemented for .*required by the bound", "method_where"),
+    (r"no method '(copied|cloned)' on type 'Option<", "impl_on_instance"),
+    (r"cannot derive 'Default'", "rust_derives"),
+    (r"of type '\[\w+; \d+\]' has no", "array_builtin"),
+    (r"is a builtin \(size_of", "size_of_name"),
+    (r"slicing a (raw )?pointer|expected 'str', got '\[str\]'", "str_slice_self"),
+    (r"is a type, not a value", "unit_struct_value"),
+    (r"conflicting impls of trait 'IntoIterator'", "impl_for_ref"),
+    (r"unresolved import 'adapters::Flatten'|got '<<'|expected type, got '<'", "qualified_path"),
+    (r"unresolved import '[\w:]*::self'", "use_self"),
+    (r"expected type, got ''", "ref_ref_token"),
+    (r"got 'union'", "union_ident"),
+]
+LATER = re.compile(r"\((\w+)\) comes with the rust edition in")
+
+
+def impl_params(sig):
+    """The type parameters of `impl<..>` (lifetimes left out)."""
+    h = re.sub(r"^(pub\s+)?(unsafe\s+)?impl", "", sig).strip()
+    if not h.startswith("<"):
+        return set()
+    inner = h[1:skip_angle(h, 0) - 1]
+    return {re.match(r"\s*(\w+)", a).group(1) for a in split_top(inner)
+            if re.match(r"\s*[A-Za-z_]", a)}
+
+
+def generic_impl_gap(sig):
+    """Which gap a `generic impl ...` error on this impl header shows."""
+    trait, _, self_text = parse_impl_header(sig)
+    params = impl_params(sig)
+    if self_text.startswith("&"):
+        return "impl_for_ref"
+    if self_text.strip() in params:
+        return "blanket_impl"
+    if trait is None:
+        return "impl_on_instance"
+    m = re.match(r"[\w:]+\s*<(.*)>$", self_text.strip())
+    args = [re.sub(r"'\w+", "", a).strip() for a in split_top(m.group(1))] if m else []
+    args = [a for a in args if a]
+    if any(a not in params for a in args) or len(set(args)) != len(args):
+        return "impl_on_instance"
+    return "impl_param_in_trait"
+
+
+def classify(err, item):
+    msg = err["text"]
+    if err["kind"] == "edition.later":
+        m = LATER.search(msg)
+        return m.group(1) if m else "later_unknown"
+    if re.search(r"a generic impl (block )?(is|for slices)", msg):
+        sig = item["sig"] if item.get("kind") == "impl" else item.get("block_sig", "")
+        return generic_impl_gap(sig) if sig else "impl_param_in_trait"
+    for pat, gap in GAPS:
+        if re.search(pat, msg):
+            return gap
+    return "unclassified"
+
+
+def read_errors(raw=None):
+    """[{file, line, kind, text}] of typecheck.txt (rewritten from raw first)."""
+    if raw is not None:
+        out = []
+        for line in open(raw):
+            if not re.match(r"[^ ]+:\d+:\d+: error\[", line):
+                continue
+            line = re.sub(r" \| try: .*$", "", line.rstrip("\n"))
+            line = line.replace("compiler/std2/", "", 1) if line.startswith("compiler/std2/") else line
+            out.append(line)
+        with open(TYPECHECK, "w") as fh:
+            fh.write("# The front's errors on compiler/std2 (tools/std2-checklist.py's header): "
+                     f"{len(out)}.\n" + "".join(l + "\n" for l in out))
+    if not os.path.exists(TYPECHECK):
+        return None
+    errs = []
+    for line in open(TYPECHECK):
+        m = re.match(r"([^ ]+):(\d+):(\d+): error\[([^\]]+)\] (.*)$", line.rstrip("\n"))
+        if m:
+            errs.append(dict(file=m.group(1), line=int(m.group(2)), kind=m.group(4),
+                             text=f"{m.group(1)}: error[{m.group(4)}] {m.group(5)}"))
+    return errs
+
+
+def errors_to_items(errs, items):
+    """Each error's items: the one whose lines hold it (an inherent impl's
+    header: each of its members; `<std>`'s duplicate method: std2's item of
+    that owner and name). Returns {id(item): [(error, gap)]} and the errors
+    no item takes."""
+    by = {}
+    loose = []
+    lines_of = {}
+    for err in errs:
+        targets = []
+        if err["file"] == "<std>":
+            m = re.search(r"duplicate method '(\w+)' for type '([^']+)'", err["text"])
+            if m:
+                targets = [it for it in items if it["owner"] == m.group(2) and it["name"] == m.group(1)]
+        elif err["file"] in MARKS:
+            if err["file"] not in lines_of:
+                lines_of[err["file"]] = open(os.path.join(TREE, err["file"])).read().split("\n")
+            fl = lines_of[err["file"]]
+            ln = err["line"]
+            while ln <= len(fl) and fl[ln - 1].strip().startswith("#["):
+                ln += 1
+            last = None
+            for at, what in MARKS[err["file"]]:
+                if at > ln:
+                    break
+                last = what
+            if isinstance(last, dict):
+                targets = [last]
+            elif isinstance(last, tuple):
+                targets = list(last[1]["members"])
+                for it in targets:
+                    it["block_sig"] = last[1]["sig"]
+        if not targets:
+            loose.append(err)
+        for it in targets:
+            by.setdefault(id(it), []).append((err, classify(err, it)))
+    return by, loose
 
 
 def mvs_items(volec, wanted_traits):
@@ -348,11 +518,15 @@ def key_of(path):
 
 
 def release_of(later, feats):
+    """The latest release of later's features; `-` when one is a front gap
+    no release has taken yet."""
     rel = "0.27.0"
     for t in later:
         r = feats.get(t)
         if r is None:
             die(f"later feature '{t}' is not in compiler/std2/features.tsv")
+        if r == "-":
+            return "-"
         if tuple(int(x) for x in r.split(".")) > tuple(int(x) for x in rel.split(".")):
             rel = r
     return rel
@@ -362,16 +536,23 @@ def main():
     args = sys.argv[1:]
     volec = os.path.join(TOP, "target", "tools", "volec")
     check = False
+    raw = None
     while args:
         a = args.pop(0)
         if a == "--volec":
             volec = args.pop(0)
+        elif a == "--errors":
+            raw = args.pop(0)
         elif a == "--check":
             check = True
         else:
             die(f"unknown argument {a}")
     feats = {r[0]: r[1] for r in read_tsv("features.tsv")}
     items = read_tree()
+    errs = read_errors(raw)
+    if errs is None:
+        die("compiler/std2/typecheck.txt is missing: --errors FILE (the header says how to make one)")
+    by, loose = errors_to_items(errs, items)
     mvs = mvs_items(volec, SCOPE_OWNERS | {it["name"] for it in items if it["kind"] == "trait"})
     used = set()
     rows = []
@@ -398,8 +579,17 @@ def main():
             status = status or "new"
         name = (f"{own}::" if own else "") + it["name"]
         test = "std2_" + re.sub(r"[^A-Za-z0-9]+", "_", it["module"][len("std"):].strip(":") + "_" + name).strip("_")
-        rows.append([it["module"], name, it["kind"], status, src, ",".join(it["later"]),
-                     release_of(it["later"], feats), test.lower(), it["why"], it["sig"]])
+        got = by.get(id(it), [])
+        real = sorted({g for _, g in got})
+        if not got:
+            state = "ok"
+        elif all(e["kind"] == "edition.later" for e, _ in got):
+            state = "later"
+        else:
+            state = "error"
+        predicted = [t for t in it["later"] if t not in real]
+        rows.append([it["module"], name, it["kind"], status, src, state, ",".join(real),
+                     release_of(real, feats), ",".join(predicted), test.lower(), it["why"], it["sig"]])
     gone = read_tsv("gone.tsv")
     for g in gone:
         if len(g) < 3:
@@ -417,7 +607,7 @@ def main():
             keys = [k]
         for k in keys:
             used.add(k)
-            rows.append([g[0], "-", "-", "gone", (f"{k[0]}::" if k[0] else "") + k[1], "", "", "", g[2], ""])
+            rows.append([g[0], "-", "-", "gone", (f"{k[0]}::" if k[0] else "") + k[1], "", "", "", "", "", g[2], ""])
     # rewrite.tsv: every row's MVS item exists, and its four columns
     rewrites = [r for r in read_tsv("rewrite.tsv") if r[0] != "mvs"]
     for r in rewrites:
@@ -429,7 +619,8 @@ def main():
     missing = sorted(f"{o + '::' if o else ''}{n} ({m})" for (o, n), (m, k) in mvs.items()
                      if (o in SCOPE_OWNERS or (o is None and m in SCOPE_MODULES and k == "fn"))
                      and (o, n) not in used and not n.startswith("__"))
-    head = ["module", "item", "kind", "status", "mvs", "later", "release", "test", "note", "signature"]
+    head = ["module", "item", "kind", "status", "mvs", "check", "later", "release", "predicted", "test", "note",
+            "signature"]
     text = "# Generated by tools/std2-checklist.py from compiler/std2 (do not edit): see its header.\n"
     text += "\t".join(head) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
     if check:
@@ -454,13 +645,21 @@ def main():
           f"   ({len(items)} std2 items)")
     per = {}
     for r in rows:
-        for t in filter(None, r[5].split(",")):
+        for t in filter(None, r[6].split(",")):
             per[t] = per.get(t, 0) + 1
     print(f"rewrite.tsv: {len(rewrites)} rows, for {len({r[0] for r in rewrites})} MVS items")
-    later = sum(1 for r in rows if r[5])
-    print(f"items with no later feature (0.27.0's typeck): {len(items) - later}; waiting: {later}")
+    st = {k: sum(1 for r in rows if r[5] == k) for k in ("ok", "later", "error")}
+    unsched = sum(1 for r in rows if r[5] == "error" and r[7] == "-")
+    kinds = {}
+    for e in errs:
+        kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+    print(f"typecheck.txt: {len(errs)} errors (" + ", ".join(f"{kinds[k]} {k}" for k in sorted(kinds)) + ")")
+    print(f"items that typecheck: {st['ok']} of {len(items)}; only edition.later: {st['later']}; "
+          f"a plain error: {st['error']} ({unsched} of them a gap no release has taken)")
     for t in sorted(per, key=lambda t: (-per[t], t)):
-        print(f"  edition.later: {t} ({feats[t]}): {per[t]}")
+        print(f"  {t} ({feats[t] if feats[t] != '-' else 'a gap, not scheduled'}): {per[t]}")
+    if loose:
+        print(f"errors no item takes ({len(loose)}): " + "; ".join(f"{e['file']}:{e['line']}" for e in loose))
     if missing:
         print(f"unaccounted MVS items in scope ({len(missing)}): " + ", ".join(missing), file=sys.stderr)
     return 0
