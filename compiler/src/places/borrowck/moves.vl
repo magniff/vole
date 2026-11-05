@@ -1,0 +1,454 @@
+// (0.27.1) Moves and initialization on the places IR (docs/design/borrowck.md
+// section 8): elaboration's move paths and its maybe-initialized and
+// maybe-uninitialized dataflows (places/elab.vl), run again on the
+// elaborated body (its flags and opened drops in place), then each
+// statement's reads, moves, borrows and projected assignments checked
+// against the sets at its point: a use of a path some part of which may
+// be uninitialized is borrowck.use_moved (M1, in a loop M5), an
+// assignment to a part whose prefix may be uninitialized use_moved or
+// assign_moved_part (M2), a move of a place that has no path move_out
+// (M3: through a pointer, an index, a static, a borrowed copy) or
+// move_from_drop (M4: a part of a value with `impl Drop`).
+
+use crate::base::{buf_new, buf_slice, buf_str};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::diag::{buf_position, report_error_tries};
+use crate::front::types::TyKind;
+use crate::places::borrowck::Bck;
+use crate::places::elab::{
+    bit_get, collect_paths, dataflow, path_count, path_of, some_in_tree, transfer,
+};
+use crate::places::ir::{
+    Body, LF_BORROWED, LF_STATIC, OK_COPY, OK_MOVE, OK_PLACE, PJ_DEREF, PJ_INDEX, PJ_UNION,
+    RV_DISCR, RV_LEN, SK_ASSIGN, SK_CALL, SK_INTRINSIC, SK_MENTION, TK_SWITCH, block_len,
+    block_start, block_term, has_flag, local_ty, op_a, op_b, op_kind, proj_kind, proj_parent,
+    proj_val, step_type, succ, succ_count, undistinct,
+};
+
+const M_USE_MOVED: i64 = 1;
+const M_ASSIGN_PART: i64 = 2;
+const M_MOVE_OUT: i64 = 3;
+const M_MOVE_FROM_DROP: i64 = 4;
+
+// RULE: D8.2
+pub fn check(bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    collect_paths(&pbody, &pcx);
+    pcx.nw = (path_count(pcx) + 63) / 64;
+    if pcx.nw == 0 {
+        pcx.nw = 1;
+    }
+    dataflow(pbody, &pcx);
+    bck.reported.clear();
+    assign_twice(&bck, pbody, &pcx);
+    for i in 0..pbody.rpo.len() as i64 {
+        let b = pbody.rpo[i];
+        for w in 0..3 * pcx.nw {
+            pcx.cur[w] = pcx.in_[b * 3 * pcx.nw + w];
+        }
+        let start = block_start(b, pbody);
+        for s in start..start + block_len(b, pbody) {
+            uses(s, &bck, pbody, &pcx);
+            transfer(pbody.stmts[s], pbody, &pcx);
+        }
+        uses(block_term(b, pbody), &bck, pbody, &pcx);
+    }
+}
+
+// The statement's reads and writes against the sets at its point.
+// RULE: D8.3
+fn uses(s: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let st = pbody.stmts[s];
+    let k = st.kind;
+    if k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC || k == TK_SWITCH
+        || k == crate::places::ir::SK_ASSERT {
+        for i in 0..st.nops {
+            let ok = op_kind(st.ops, i, pbody);
+            if ok != OK_COPY && ok != OK_MOVE && ok != OK_PLACE {
+                continue;
+            }
+            let l = op_a(st.ops, i, pbody);
+            let p = op_b(st.ops, i, pbody);
+            // (M1: a read, a borrow or a move of a path requires it
+            // initialized, every part of it)
+            let q = path_of(l, p, false, pbody, &pcx);
+            // (a length's or a discriminant's read is shallow, D2.2; a
+            // discriminant's of a local whose drop elaboration opened is
+            // not checked at all: the opened drop reads the tag of the
+            // partially moved enum)
+            if k == SK_ASSIGN && st.c == RV_DISCR && opened_drop(l, pbody) {
+                continue;
+            }
+            let shallow = k == SK_ASSIGN && (st.c == RV_LEN || st.c == RV_DISCR);
+            if q >= 0 {
+                if shallow && bit_get(1, q, pcx) || !shallow && some_in_tree(1, q, pcx) {
+                    report(M_USE_MOVED, s, l, p, q, &bck, pbody, &pcx);
+                }
+            } else if through_raw(l, p, pbody, &pcx) {
+                // RULE: R1 (through a raw pointer, a closure's env included:
+                // unsafe's, D10.4)
+            } else {
+                let base = base_path(l, p, pbody, &pcx);
+                if base >= 0 && bit_get(1, base, pcx) {
+                    report(M_USE_MOVED, s, l, p, base, &bck, pbody, &pcx);
+                } else if ok == OK_MOVE && for_seq(l, pbody, pcx) {
+                    // (a `for` over an owned sequence moves each element out of
+                    // the lowering's own temporary, once: not the user's move)
+                } else if ok == OK_MOVE {
+                    // RULE: M3, M4
+                    report(if pointer_or_borrowed(l, p, pbody) { M_MOVE_OUT }
+                        else { M_MOVE_FROM_DROP },
+                        s, l, p, -1, &bck, pbody, &pcx);
+                }
+            }
+        }
+        if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a >= 0 && st.b != 0 {
+            // RULE: M2 (every strict prefix of the assigned place)
+            var p = proj_parent(st.b, pbody);
+            var done = false;
+            while !done {
+                let q = path_of(st.a, p, false, pbody, &pcx);
+                if q >= 0 && bit_get(1, q, pcx) {
+                    report(if moved_somewhere(st.a, q, pbody, &pcx) { M_USE_MOVED }
+                        else { M_ASSIGN_PART },
+                        s, st.a, p, q, &bck, pbody, &pcx);
+                    done = true;
+                }
+                if p == 0 {
+                    done = true;
+                } else {
+                    p = proj_parent(p, pbody);
+                }
+            }
+        }
+    } else if k == SK_MENTION {
+        let q = path_of(st.a, st.b, false, pbody, &pcx);
+        if q >= 0 && some_in_tree(1, q, pcx) {
+            report(M_USE_MOVED, s, st.a, st.b, q, &bck, pbody, &pcx);
+        }
+    }
+}
+
+// Whether a drop of local l was opened by elaboration (DS_OPEN).
+fn opened_drop(l: i64, pbody: Body<Comp>) -> bool {
+    for s in 0..pbody.stmts.len() as i64 {
+        let st = pbody.stmts[s];
+        if st.kind == crate::places::ir::SK_DROP && st.a == l
+            && st.c == crate::places::ir::DS_OPEN {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether local l is a `for` lowering's sequence temporary (`__for_seq`).
+fn for_seq(l: i64, pbody: Body<Comp>, pcx: Ctx<Comp>) -> bool {
+    let lc = pbody.locals[l];
+    if lc.src < 0 {
+        return false;
+    }
+    // UNSAFE: LOCALS is the checker's raw table of locals.
+    // SAFETY: lc.src is a local the checker defined (a body's src), below
+    // LOCAL_COUNT.
+    let name = unsafe { pcx.locals[lc.src].name };
+    crate::base::sym_text(name, pcx) == "__for_seq"
+}
+
+// Whether place (l, p) passes a deref of a raw pointer.
+fn through_raw(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    var n = 0;
+    var q = p;
+    while q > 0 {
+        n += 1;
+        q = proj_parent(q, pbody);
+    }
+    var t = local_ty(l, pbody);
+    for d in 0..n {
+        // (the projection at depth d from the root)
+        q = p;
+        for _ in 0..n - 1 - d {
+            q = proj_parent(q, pbody);
+        }
+        let kind = proj_kind(q, pbody);
+        if kind == PJ_DEREF {
+            let tu = undistinct(t, pcx);
+            if tu > 0 && pcx.types[tu].kind == TyKind::Ptr && pcx.types[tu].b == 0 {
+                return true;
+            }
+        }
+        t = step_type(t, kind, proj_val(q, pbody), &pcx);
+    }
+    false
+}
+
+// RULE: M7 (a whole non-`mut` user local is assigned once on every
+// path: a forward dataflow of the locals maybe assigned, reset at the
+// local's StorageLive; a second assignment is borrowck.assign_twice)
+fn assign_twice(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let nw = bck.nw_l;
+    let nb = crate::places::ir::block_count(pbody);
+    bck.bin.clear();
+    bck.bout.clear();
+    bck.tmp.clear();
+    for _ in 0..nb * nw {
+        bck.bin.push(0);
+        bck.bout.push(0);
+    }
+    for _ in 0..nw {
+        bck.tmp.push(0);
+    }
+    var changed = true;
+    var checking = false;
+    while changed || !checking {
+        if !changed {
+            checking = true;
+        }
+        changed = false;
+        for i in 0..pbody.rpo.len() as i64 {
+            let b = pbody.rpo[i];
+            for w in 0..nw {
+                bck.tmp[w] = 0;
+            }
+            for j in 0..crate::places::cfg::pred_count(b, pbody) {
+                let pb = crate::places::cfg::pred(b, j, pbody);
+                for w in 0..nw {
+                    bck.tmp[w] = bck.tmp[w] | bck.bout[pb * nw + w];
+                }
+            }
+            let start = block_start(b, pbody);
+            for loc in start..block_term(b, pbody) + 1 {
+                let st = pbody.stmts[loc];
+                let k = st.kind;
+                if k == crate::places::ir::SK_LIVE {
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] & ~(1 << (st.a & 63));
+                } else if (k == SK_ASSIGN || k == SK_CALL || k == SK_INTRINSIC) && st.a > 0
+                    && st.b == 0 && reassignable_once(st.a, pbody) {
+                    if checking && (bck.tmp[st.a >> 6] >> (st.a & 63)) & 1 != 0 {
+                        report_assign_twice(loc, st.a, &bck, pbody, &pcx);
+                    }
+                    bck.tmp[st.a >> 6] = bck.tmp[st.a >> 6] | (1 << (st.a & 63));
+                }
+            }
+            for w in 0..nw {
+                if bck.bout[b * nw + w] != bck.tmp[w] {
+                    bck.bout[b * nw + w] = bck.tmp[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// A user's local declared without `mut`: assigned once (a deferred `let`).
+fn reassignable_once(l: i64, pbody: Body<Comp>) -> bool {
+    let f = pbody.locals[l].flags;
+    (f & crate::places::ir::LF_USER) != 0 && (f & crate::places::ir::LF_MUT) == 0
+        && (f & LF_BORROWED) == 0
+}
+
+fn report_assign_twice(loc: i64, l: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == -2 && bck.reported[i + 1] == loc && bck.reported[i + 3] == l {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(-2);
+    bck.reported.push(loc);
+    bck.reported.push(0);
+    bck.reported.push(l);
+    var node = pbody.stmts[loc].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let m = buf_new();
+    buf_str(m, c"cannot assign twice to '");
+    crate::places::borrowck::diag::buf_place(m, l, 0, 0, pbody, pcx);
+    buf_str(m, c"', which is not `mut`: it may be assigned already on this path");
+    report_error_tries(pcx.nodes[node].start, 4000 + l, c"borrowck.assign_twice", buf_slice(m).ptr,
+        c"declare it `let mut`, or assign it once on each path", "", false, &pcx);
+}
+
+// The nearest ancestor of place (l, p) that has a path (-1: none).
+fn base_path(l: i64, p: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    var q = p;
+    while q > 0 {
+        q = proj_parent(q, pbody);
+        let m = path_of(l, q, false, pbody, &pcx);
+        if m >= 0 {
+            return m;
+        }
+    }
+    -1
+}
+
+// Whether place (l, p) has no path because it is reached through a
+// pointer, an index or a union, or rooted at a static or a borrowed copy
+// (M3), rather than being a part of a value dropped whole (M4).
+fn pointer_or_borrowed(l: i64, p: i64, pbody: Body<Comp>) -> bool {
+    if has_flag(l, LF_STATIC, pbody) || has_flag(l, LF_BORROWED, pbody) {
+        return true;
+    }
+    var q = p;
+    while q > 0 {
+        let k = proj_kind(q, pbody);
+        if k == PJ_DEREF || k == PJ_INDEX || k == PJ_UNION {
+            return true;
+        }
+        q = proj_parent(q, pbody);
+    }
+    false
+}
+
+// Whether some statement moves path q of local l, or a path at or under
+// it (then an uninitialized q was moved, not left uninitialized).
+fn moved_somewhere(l: i64, q: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    move_of(l, q, -1, pbody, &pcx) >= 0
+}
+
+// A statement that moves path q of local l (or a path under it), other
+// than `not`; -1 when none.
+fn move_of(l: i64, q: i64, not: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> i64 {
+    for s in 0..pbody.stmts.len() as i64 {
+        if s == not {
+            continue;
+        }
+        let st = pbody.stmts[s];
+        for i in 0..st.nops {
+            if op_kind(st.ops, i, pbody) == OK_MOVE && op_a(st.ops, i, pbody) == l {
+                var m = path_of(l, op_b(st.ops, i, pbody), false, pbody, &pcx);
+                while m >= 0 {
+                    if m == q {
+                        return s;
+                    }
+                    m = pcx.mp_parent[m];
+                }
+            }
+        }
+    }
+    -1
+}
+
+// Whether block `to` is reachable from block `from` (a loop: the move
+// after the use in the text, before it in an iteration).
+fn reaches(from: i64, to: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) -> bool {
+    let nb = crate::places::ir::block_count(pbody);
+    bck.tmp.clear();
+    bck.queue.clear();
+    for _ in 0..nb {
+        bck.tmp.push(0);
+    }
+    bck.queue.push(from);
+    bck.tmp[from] = 1;
+    var head = 0;
+    while head < bck.queue.len() as i64 {
+        let b = bck.queue[head];
+        head += 1;
+        for i in 0..succ_count(b, pbody) {
+            let sb = succ(b, i, pbody);
+            if sb == to {
+                return true;
+            }
+            if bck.tmp[sb] == 0 {
+                bck.tmp[sb] = 1;
+                bck.queue.push(sb);
+            }
+        }
+    }
+    false
+}
+
+// RULE: section 14.2, 14.3 (one error per path and use)
+fn report(what: i64, s: i64, l: i64, p: i64, q: i64, bck: inout Bck<Comp>, pbody: Body<Comp>,
+    pcx: inout Ctx<Comp>) {
+    // (section 14.3: a use after a move once per path, the first use)
+    var i = 0;
+    while i < bck.reported.len() as i64 {
+        if bck.reported[i] == q && (bck.reported[i + 1] == s || what == M_USE_MOVED && q >= 0)
+            && bck.reported[i + 2] == what && bck.reported[i + 3] == l {
+            return;
+        }
+        i += 4;
+    }
+    bck.reported.push(q);
+    bck.reported.push(s);
+    bck.reported.push(what);
+    bck.reported.push(l);
+    var node = pbody.stmts[s].node;
+    if node == 0 {
+        node = pbody.node;
+    }
+    let pos = pcx.nodes[node].start;
+    let m = buf_new();
+    var tried = -1;
+    var code = c"borrowck.use_moved";
+    var help = c"use it before the move, pass a clone where it moves, or take it by reference";
+    if what == M_USE_MOVED {
+        buf_str(m, c"'");
+        crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+        buf_str(m, c"' is used here after it moved");
+        // (the move: another statement's, or this one's in a loop)
+        var mv = move_of(l, q, s, pbody, &pcx);
+        if mv < 0 {
+            mv = move_of(l, q, -1, pbody, &pcx);
+        }
+        tried = mv;
+        if mv >= 0 {
+            // (a move already reported move_borrowed: its use after is noise)
+            for i in 0..bck.bad_moves.len() as i64 {
+                if bck.bad_moves[i] == mv {
+                    return;
+                }
+            }
+            let mnode = pbody.stmts[mv].node;
+            if mnode != 0 && mv != s {
+                buf_str(m, c" (moved at ");
+                buf_position(m, pcx.nodes[mnode].start, &pcx);
+                buf_str(m, c")");
+            }
+            // RULE: M5
+            let ub = crate::places::borrowck::loc_block(s, pbody);
+            let mb = crate::places::borrowck::loc_block(mv, pbody);
+            if ub >= 0 && mb >= 0 && (mv >= s || ub == mb) && reaches(ub, mb, &bck, pbody) {
+                buf_str(m, c", in a previous iteration of the loop");
+            }
+        }
+    } else if what == M_ASSIGN_PART {
+        code = c"borrowck.assign_moved_part";
+        buf_str(m, c"'");
+        crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+        buf_str(m, c"' is partially assigned: it is not initialized");
+        help = c"initialize the whole value first, then its fields";
+    } else if what == M_MOVE_OUT {
+        code = c"borrowck.move_out";
+        buf_str(m, c"cannot move out of '");
+        crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+        buf_str(m, if has_flag(l, LF_STATIC, pbody) { c"', a static" }
+            else if has_flag(l, LF_BORROWED, pbody) { c"', a borrowed copy" }
+            else { c"', which is reached through a reference or an index" });
+        help = c"clone it, borrow it (`&`), or take it out (`mem::take`, `Option::take`, `swap_remove`)";
+    } else {
+        code = c"borrowck.move_from_drop";
+        buf_str(m, c"cannot move '");
+        crate::places::borrowck::diag::buf_place(m, l, p, 0, pbody, pcx);
+        buf_str(m, c"' out of a value whose type has `impl Drop`");
+        help = c"take it out with `mem::take` or `Option::take`, or clone it";
+    }
+    // RULE: section 14.1 (the try: `.clone()` where the value moves)
+    var tr = -1;
+    if what == M_USE_MOVED && tried >= 0 {
+        tr = crate::places::borrowck::diag::try_wrap(pbody.stmts[tried].node, c"", c".clone()",
+            pcx);
+    } else if what == M_MOVE_OUT && pbody.stmts[s].node > 0 {
+        let n = pbody.stmts[s].node;
+        // UNSAFE: SRC is the lexer's raw text.
+        // SAFETY: a node's start is a position in a file the lexer read.
+        let star = unsafe { crate::base::SRC[pcx.nodes[n].start] } == '*';
+        tr = crate::places::borrowck::diag::try_wrap(n, if star { c"(" } else { c"" },
+            if star { c").clone()" } else { c".clone()" }, pcx);
+    }
+    report_error_tries(pos, 2000 + what * 4096 + (q + 1), code, buf_slice(m).ptr, help,
+        if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
+}

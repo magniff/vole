@@ -79,6 +79,7 @@ map_code() {
         E0392) echo unused_param ;;
         E0382) echo use_moved ;;
         E0381) echo assign_moved_part ;;
+        E0384) echo assign_twice ;;
         E0507|E0508) echo move_out ;;
         E0509) echo move_from_drop ;;
         E0510|E0594|E0596) echo guard_write ;;  # (E0594: in a guard, a `ref mut` binding is read-only)
