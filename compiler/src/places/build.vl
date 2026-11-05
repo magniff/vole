@@ -1102,7 +1102,14 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout
             i = crate::front::ast::field_order(e, j, pcx);
             value = child(e, i, pcx);
         }
-        if pcx.agg_borrow {
+        let capture = k == NodeKind::StructLit && pcx.rust_body && struct_closure(ty, pcx)
+            && (pcx.nodes[value].kind == NodeKind::Unary && pcx.nodes[value].op == Tok::Amp
+                && is_place_expr(pcx.nodes[value].b, pcx)
+                || pcx.nodes[value].kind == NodeKind::Block && own_temp_block(value, pcx)
+                && own_temp_addr(value, pcx));
+        if capture {
+            capture_loan(value, &pbody, &pcx);
+        } else if pcx.agg_borrow {
             // (only this literal's parts: not those of what they contain)
             pcx.agg_borrow = false;
             operand(value, true, &pbody, &pcx);
@@ -1139,6 +1146,30 @@ fn lower_aggregate(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout
         info = pcx.nodes[e].a;
     }
     emit(SK_ASSIGN, dl, dp, RV_AGG, ak, info, at, slots, e, &pbody);
+}
+
+// RULE: D10.2 A rust-edition closure's by-reference capture `&x` (`&mut
+// x` when the closure writes x), value: a loan into a temporary, `_t =
+// &'c x`, moved into the closure (its field a raw pointer; the
+// temporary's type `&T`, whose slot the loan's region flows into).
+fn capture_loan(value: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    // (or the own pass's statement temporary standing for it, its tail the
+    // `&`)
+    let temp = pcx.nodes[value].kind == NodeKind::Block;
+    let amp = if temp { pcx.nodes[value].a } else { value };
+    if temp {
+        own_temp_place(value, &pbody, &pcx);
+    } else {
+        as_place(pcx.nodes[value].b, &pbody, &pcx);
+    }
+    let l = pcx.pl_l;
+    let p = pcx.pl_p;
+    let excl = (pcx.nodes[amp].p & NODE_REF_MUT) != 0;
+    let pointee = pcx.nodes[pcx.nodes[amp].b].ty;
+    let t = new_temp(ref_to(pointee, if excl { REF_MUT } else { REF_SHARED }, &pcx), value, false,
+        &pbody, &pcx);
+    emit_ref(t, 0, l, p, if excl { BK_MUT } else { BK_SHARED }, value, &pbody, &pcx);
+    set_op(OK_MOVE, t, 0, &pcx);
 }
 
 // `a[lo..hi]`: the base (a place, or a pointer's value), the bounds, then
@@ -1369,7 +1400,18 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
         let pl = pcx.pl_l;
         let pp = pcx.pl_p;
         var kind = BK_SHARED;
-        if c_callee || mode == P_RAW || at_ty > 0 && pcx.types[at_ty].kind == TyKind::Ptr
+        // (0.27.1) a rust-edition call of a closure value: its env is a
+        // reborrow of the closure, `&'e c` (Fn) or `&'e mut2 c` (FnMut, a
+        // receiver), into a temporary of that reference type (D10.3)
+        let env = pcx.rust_body && i == 0 && !c_callee && at_ty > 0
+            && pcx.types[at_ty].kind == TyKind::Ptr && pcx.types[at_ty].b == 0
+            && struct_closure(pcx.types[at_ty].a, pcx);
+        var t_ty = at_ty;
+        if env {
+            let fnmut = crate::places::regions::closure_writes(pcx.types[at_ty].a, pcx);
+            kind = if fnmut { BK_MUT2 } else { BK_SHARED };
+            t_ty = ref_to(pcx.types[at_ty].a, if fnmut { REF_MUT } else { REF_SHARED }, &pcx);
+        } else if c_callee || mode == P_RAW || at_ty > 0 && pcx.types[at_ty].kind == TyKind::Ptr
             && pcx.types[at_ty].b == 0 {
             // (0.27.1: `&mut x` given as a `*mut T`, the rust edition's, D2.2)
             kind = if pcx.edition != 0
@@ -1380,7 +1422,7 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
             let receiver = i == 0 && pcx.nodes[arg].start == pcx.nodes[operand_e].start;
             kind = if receiver { BK_MUT2 } else { BK_MUT };
         }
-        let t = new_temp(at_ty, arg, false, &pbody, &pcx);
+        let t = new_temp(t_ty, arg, false, &pbody, &pcx);
         emit_ref(t, 0, pl, pp, kind, arg, &pbody, &pcx);
         set_op(OK_MOVE, t, 0, &pcx);
         return;

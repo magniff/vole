@@ -413,7 +413,10 @@ fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
     if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
         let s = pcx.types[t].a;
         for i in 0..struct_field_count(s, pcx) {
-            if !copy_in(struct_field_ty(s, i, pcx), depth + 1, &pcx) {
+            // (a by-`&mut` capture is not Copy, though its field is a raw
+            // pointer)
+            if capture_mode(s, i, pcx) == 2
+                || !copy_in(struct_field_ty(s, i, pcx), depth + 1, &pcx) {
                 return false;
             }
         }
@@ -471,7 +474,7 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         let s = pcx.types[t].a;
         var n = 0;
         for i in 0..struct_field_count(s, pcx) {
-            n += slots_in(struct_field_ty(s, i, pcx), depth + 1, pcx);
+            n += capture_slots(s, i, depth, pcx);
         }
         return n;
     }
@@ -483,6 +486,60 @@ fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
         return n;
     }
     0
+}
+
+// RULE: D10.2 Capture i of closure struct s: 0 by value, 1 by `&`, 2 by
+// `&mut` (front::closures' capture list); a field after the captures (a
+// drop flag): 0.
+pub fn capture_mode(s: i64, i: i64, pcx: Ctx<Comp>) -> i64 {
+    let c = pcx.structs[s].closure - 1;
+    if c < 0 || i >= pcx.closures[c].capture_count {
+        return 0;
+    }
+    pcx.capture_list.get(pcx.closures[c].captures + 2 * i + 1)
+}
+
+// The slots field i of closure struct s holds (D3.3, D10.2): a
+// by-reference capture's field is a raw pointer, which holds its loan's
+// slot and its pointee's (`&'c T`'s), another field its type's.
+fn capture_slots(s: i64, i: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
+    let ft = struct_field_ty(s, i, pcx);
+    if capture_ref(s, i, pcx) {
+        return 1 + slots_in(pcx.types[ft].a, depth + 1, pcx);
+    }
+    slots_in(ft, depth + 1, pcx)
+}
+
+// Whether field i of closure struct s is a by-reference capture (its raw
+// pointer holds a loan's slot).
+fn capture_ref(s: i64, i: i64, pcx: Ctx<Comp>) -> bool {
+    let ft = struct_field_ty(s, i, pcx);
+    capture_mode(s, i, pcx) > 0 && ft > 0 && pcx.types[ft].kind == TyKind::Ptr
+}
+
+// RULE: D10.2 Where field k's slots begin among those of closure type t:
+// the aggregate's operand k (`&'c x` for a by-reference capture, its loan
+// slot first) fills the closure's slots from there.
+pub fn capture_offset(t: i64, k: i64, pcx: Ctx<Comp>) -> i64 {
+    let s = pcx.types[t].a;
+    var off = 0;
+    for i in 0..k {
+        off += capture_slots(s, i, 0, pcx);
+    }
+    off
+}
+
+// RULE: D10.3 Whether closure type t is `FnMut`: it writes a capture (or
+// takes a `&mut` of one), a by-`&mut` capture; else `Fn` (`FnOnce` is
+// 0.27.2's).
+pub fn closure_writes(t: i64, pcx: Ctx<Comp>) -> bool {
+    let s = pcx.types[t].a;
+    for i in 0..struct_field_count(s, pcx) {
+        if capture_mode(s, i, pcx) == 2 {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_ref_kind(b: i64) -> bool {
@@ -657,6 +714,14 @@ fn bind_walk(n0: i64, t: i64, tps: i64, self_node: i64, up: i64, out: inout Vec<
     if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
         let s = pcx.types[t].a;
         for i in 0..struct_field_count(s, pcx) {
+            if capture_ref(s, i, pcx) {
+                // (a by-reference capture: its loan's slot, elided, D10.2)
+                let me = out.len() as i64 / 4;
+                push_lifetime(0, up, &out, pcx);
+                bind_walk(0, pcx.types[struct_field_ty(s, i, pcx)].a, tps, self_node, me, &out,
+                    depth + 1, pcx);
+                continue;
+            }
             bind_walk(0, struct_field_ty(s, i, pcx), tps, self_node, up, &out, depth + 1, pcx);
         }
         return;
@@ -998,9 +1063,13 @@ pub fn field_map(t0: i64, k: i64, v: i64, out: inout Vec<i64, Comp>, pcx: Ctx<Co
         for i in 0..count {
             let ft = if tk == TyKind::Tuple { type_elem(t, i, pcx) }
                 else { struct_field_ty(pcx.types[t].a, i, pcx) };
-            let n = slot_count(ft, pcx);
+            // (a by-reference capture: its loan's slot first, which the
+            // field's raw pointer type does not hold, D10.2)
+            let n = if tk == TyKind::Tuple { slot_count(ft, pcx) }
+                else { capture_slots(pcx.types[t].a, i, 0, pcx) };
+            let skip = n - slot_count(ft, pcx);
             if i == k {
-                for j in 0..n {
+                for j in skip..n {
                     out.push(off + j);
                 }
             }
@@ -1159,6 +1228,14 @@ fn slot_variances_in(t: i64, c: i64, depth: i64, out: inout Vec<i64, Comp>, pcx:
     if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
         let s = pcx.types[t].a;
         for i in 0..struct_field_count(s, pcx) {
+            if capture_ref(s, i, pcx) {
+                // (a by-reference capture: `&'c T` or `&'c mut T`, D10.2)
+                out.push(c);
+                let inner = if capture_mode(s, i, pcx) == 2 { xform(c, V_INV) } else { c };
+                slot_variances_in(pcx.types[struct_field_ty(s, i, pcx)].a, inner, depth + 1, &out,
+                    pcx);
+                continue;
+            }
             slot_variances_in(struct_field_ty(s, i, pcx), c, depth + 1, &out, pcx);
         }
         return;
