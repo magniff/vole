@@ -7,13 +7,13 @@
 // reference to anything the key Borrows (`m.get("x")` on String keys).
 // The K: Hash + Eq bound is on the impls, not the struct, as Rust's.
 
-use crate::alloc::{Allocator, TryReserveError};
+use crate::alloc::{Allocator, Layout, TryReserveError};
 use crate::borrow::Borrow;
 use crate::clone::Clone;
 use crate::cmp::{Eq, PartialEq};
 use crate::default::{Default, DefaultIn};
 use crate::fmt::{Debug, Formatter};
-use crate::hash::{BuildHasher, FixedState, Hash};
+use crate::hash::{BuildHasher, FixedState, Hash, Hasher};
 use crate::iter::{ExactSizeIterator, Extend, FromIteratorIn, IntoIterator, Iterator};
 use crate::marker::PhantomData;
 use crate::ops::Index;
@@ -27,14 +27,249 @@ pub struct HashMap<K, V, A: Allocator, S = FixedState> {
     hasher: S,
 }
 
-// The table itself: buckets and their control bytes (internal).
+// The table itself (internal): cap slots of T and a control byte for
+// each, both from alloc; cap is 0 (nothing allocated) or a power of two
+// of at least 8. A control byte is EMPTY, DELETED (a tombstone: a probe
+// goes on past it) or a full slot's h2, the hash's top 7 bits. Probing is
+// linear from the hash's low bits, and at most 7/8 of the slots are used
+// (growth_left counts what is left), so a probe always meets an EMPTY.
 struct RawTable<T, A: Allocator> {
     ctrl: crate::ptr::NonNull<u8>,
-    bucket_mask: usize,
+    data: crate::ptr::NonNull<T>,
+    cap: usize,
     items: usize,
     growth_left: usize,
     alloc: A,
     marker: PhantomData<T>,
+}
+
+const EMPTY: u8 = 255;
+const DELETED: u8 = 128;
+
+// A hash's control byte (its top 7 bits) and its first slot.
+fn h2(hash: u64) -> u8 {
+    (hash >> 57) as u8
+}
+
+// The slots a table needs for n entries (0 for none).
+fn buckets_for(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut cap: usize = 8;
+    while cap / 8 * 7 < n {
+        cap *= 2;
+    }
+    cap
+}
+
+impl<T, A: Allocator> RawTable<T, A> {
+    fn new_in(a: A) -> RawTable<T, A> {
+        RawTable {
+            ctrl: crate::ptr::NonNull::dangling(),
+            data: crate::ptr::NonNull::dangling(),
+            cap: 0,
+            items: 0,
+            growth_left: 0,
+            alloc: a,
+            marker: PhantomData,
+        }
+    }
+
+    // A control array (every byte EMPTY) and a slot array of cap from the
+    // allocator; panics when it has no room.
+    fn allocate_arrays(&self, cap: usize) -> (crate::ptr::NonNull<u8>, crate::ptr::NonNull<T>) {
+        let ctrl_layout = match Layout::array::<u8>(cap) {
+            Result::Ok(l) => l,
+            Result::Err(_) => {
+                let msg: &str = "HashMap: capacity overflow";
+                crate::panic::panic(msg)
+            }
+        };
+        let data_layout = match Layout::array::<T>(cap) {
+            Result::Ok(l) => l,
+            Result::Err(_) => {
+                let msg: &str = "HashMap: capacity overflow";
+                crate::panic::panic(msg)
+            }
+        };
+        let ctrl = match self.alloc.allocate(ctrl_layout) {
+            Result::Ok(p) => p,
+            Result::Err(_) => {
+                let msg: &str = "HashMap: out of memory";
+                crate::panic::panic(msg)
+            }
+        };
+        let data = match self.alloc.allocate(data_layout) {
+            Result::Ok(p) => p.cast::<T>(),
+            Result::Err(_) => {
+                let msg: &str = "HashMap: out of memory";
+                crate::panic::panic(msg)
+            }
+        };
+        let c = ctrl.as_ptr();
+        let mut i: usize = 0;
+        while i < cap {
+            // UNSAFE: the new control array is written through its pointer.
+            // SAFETY: i < cap, the array's length, and it is ours alone.
+            unsafe {
+                c[i] = EMPTY;
+            }
+            i += 1;
+        }
+        (ctrl, data)
+    }
+
+    // Gives the arrays back (their entries were moved out or dropped).
+    fn free_arrays(&mut self) {
+        let ctrl = crate::mem::replace(&mut self.ctrl, crate::ptr::NonNull::dangling());
+        let data = crate::mem::replace(&mut self.data, crate::ptr::NonNull::dangling());
+        let cap = crate::mem::replace(&mut self.cap, 0);
+        self.items = 0;
+        self.growth_left = 0;
+        self.free_raw(ctrl, data, cap);
+    }
+
+    // Gives back arrays of cap that allocate_arrays made (none when cap is 0).
+    fn free_raw(&self, ctrl: crate::ptr::NonNull<u8>, data: crate::ptr::NonNull<T>, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        // UNSAFE: the blocks go back to the allocator they came from.
+        // SAFETY: cap > 0, so ctrl and data are blocks alloc gave for these
+        // layouts (allocate_arrays); the caller uses them no more.
+        unsafe {
+            match Layout::array::<u8>(cap) {
+                Result::Ok(l) => self.alloc.deallocate(ctrl, l),
+                Result::Err(_) => {}
+            }
+            match Layout::array::<T>(cap) {
+                Result::Ok(l) => self.alloc.deallocate(data.cast::<u8>(), l),
+                Result::Err(_) => {}
+            }
+        }
+    }
+
+    // Slot i's control byte (i < cap).
+    fn ctrl_at(&self, i: usize) -> u8 {
+        let c = self.ctrl.as_ptr();
+        // UNSAFE: a read of the control array.
+        // SAFETY: callers pass i < cap, the array's length, and every byte
+        // of it was written (allocate_arrays).
+        unsafe { c[i] }
+    }
+
+    fn set_ctrl(&mut self, i: usize, b: u8) {
+        let c = self.ctrl.as_ptr();
+        // UNSAFE: a write of the control array.
+        // SAFETY: callers pass i < cap; &mut self, so nothing else reads it.
+        unsafe {
+            c[i] = b;
+        }
+    }
+
+    fn is_full(&self, i: usize) -> bool {
+        self.ctrl_at(i) < DELETED
+    }
+
+    // Slot i's entry (full).
+    fn slot(&self, i: usize) -> &T {
+        let d = self.data.as_ptr();
+        // UNSAFE: a reference made from the slot array's pointer.
+        // SAFETY: callers pass a full slot i < cap, so it holds an
+        // initialized T; the reference lives as long as &self.
+        unsafe { &*(&d[i]) }
+    }
+
+    fn slot_mut(&mut self, i: usize) -> &mut T {
+        let d = self.data.as_ptr();
+        // UNSAFE: a &mut made from the slot array's pointer.
+        // SAFETY: callers pass a full slot i < cap; &mut self makes it the
+        // only reference.
+        unsafe { &mut *(&mut d[i]) }
+    }
+
+    // The first slot from hash's that is EMPTY or DELETED (cap > 0).
+    fn find_insert_slot(&self, hash: u64) -> usize {
+        let mask = self.cap - 1;
+        let mut i = (hash as usize) & mask;
+        while self.is_full(i) {
+            i = (i + 1) & mask;
+        }
+        i
+    }
+
+    // Puts x in slot i (found by find_insert_slot for hash).
+    fn put(&mut self, i: usize, hash: u64, x: T) {
+        if self.ctrl_at(i) == EMPTY {
+            self.growth_left -= 1;
+        }
+        self.set_ctrl(i, h2(hash));
+        let d = self.data.as_ptr();
+        // UNSAFE: a write into the slot array.
+        // SAFETY: i < cap and slot i is not full, so nothing is overwritten
+        // that would need a drop.
+        unsafe {
+            crate::ptr::write(&mut d[i] as *mut T, x);
+        }
+        self.items += 1;
+    }
+
+    // Moves slot i's entry out, leaving a tombstone (full slot i).
+    fn take(&mut self, i: usize) -> T {
+        // An EMPTY after it ends every probe that would pass, so slot i
+        // can be EMPTY again (its room comes back).
+        let next = (i + 1) & (self.cap - 1);
+        if self.ctrl_at(next) == EMPTY {
+            self.set_ctrl(i, EMPTY);
+            self.growth_left += 1;
+        } else {
+            self.set_ctrl(i, DELETED);
+        }
+        self.items -= 1;
+        let d = self.data.as_ptr();
+        // UNSAFE: a move out of the slot array.
+        // SAFETY: slot i was full, and its control byte now says it is not,
+        // so the T is read once and never dropped in place.
+        unsafe { crate::ptr::read(&d[i] as *const T) }
+    }
+
+    // The next full slot at or after i; cap when there is none.
+    fn next_full(&self, i: usize) -> usize {
+        let mut j = i;
+        while j < self.cap && !self.is_full(j) {
+            j += 1;
+        }
+        j
+    }
+
+    // Drops every entry; the arrays stay.
+    fn clear(&mut self) {
+        let mut i: usize = 0;
+        while i < self.cap {
+            if self.is_full(i) {
+                let x = self.take(i);
+                crate::mem::drop(x);
+            }
+            i += 1;
+        }
+        let mut j: usize = 0;
+        while j < self.cap {
+            self.set_ctrl(j, EMPTY);
+            j += 1;
+        }
+        self.items = 0;
+        self.growth_left = self.cap / 8 * 7;
+    }
+}
+
+// A table drops what is left in it and frees its arrays (a map's, an
+// IntoIter's).
+impl<T, A: Allocator> crate::ops::Drop for RawTable<T, A> {
+    fn drop(&mut self) {
+        self.clear();
+        self.free_arrays();
+    }
 }
 
 impl<K, V, A: Allocator> HashMap<K, V, A, FixedState> {
@@ -53,11 +288,20 @@ impl<K, V, A: Allocator> HashMap<K, V, A, FixedState> {
 impl<K, V, A: Allocator, S> HashMap<K, V, A, S> {
     // An empty map on a, hashed by hasher (a seeded FixedState, a RandomState).
     pub fn with_hasher_in(hasher: S, a: A) -> HashMap<K, V, A, S> {
-        crate::panic::todo()
+        HashMap { table: RawTable::new_in(a), hasher: hasher }
     }
 
     pub fn with_capacity_and_hasher_in(n: usize, hasher: S, a: A) -> HashMap<K, V, A, S> {
-        crate::panic::todo()
+        let mut table = RawTable::new_in(a);
+        let cap = buckets_for(n);
+        if cap > 0 {
+            let (ctrl, data) = table.allocate_arrays(cap);
+            table.ctrl = ctrl;
+            table.data = data;
+            table.cap = cap;
+            table.growth_left = cap / 8 * 7;
+        }
+        HashMap { table: table, hasher: hasher }
     }
 
     pub fn len(&self) -> usize {
@@ -70,7 +314,7 @@ impl<K, V, A: Allocator, S> HashMap<K, V, A, S> {
 
     // How many entries fit before it grows.
     pub fn capacity(&self) -> usize {
-        crate::panic::todo()
+        self.table.items + self.table.growth_left
     }
 
     pub fn hasher(&self) -> &S {
@@ -85,12 +329,24 @@ impl<K, V, A: Allocator, S> HashMap<K, V, A, S> {
     // Its entries, (&K, &V), in table order (the same in every run).
     // std2: changed: yields (&K, &V) (MVS: copies)
     pub fn iter(&self) -> Iter<'_, K, V> {
-        crate::panic::todo()
+        Iter {
+            ctrl: self.table.ctrl.as_ptr() as *const u8,
+            data: self.table.data.as_ptr() as *const (K, V),
+            at: 0,
+            left: self.table.items,
+            marker: PhantomData,
+        }
     }
 
     // Its entries, (&K, &mut V).
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
-        crate::panic::todo()
+        IterMut {
+            ctrl: self.table.ctrl.as_ptr() as *const u8,
+            data: self.table.data.as_ptr(),
+            at: 0,
+            left: self.table.items,
+            marker: PhantomData,
+        }
     }
 
     // std2: changed: yields &K
@@ -118,17 +374,31 @@ impl<K, V, A: Allocator, S> HashMap<K, V, A, S> {
 
     // Every entry, removed and yielded by the iterator.
     pub fn drain(&mut self) -> Drain<'_, K, V, A> {
-        crate::panic::todo()
+        Drain { table: &mut self.table as *mut RawTable<(K, V), A>, at: 0, marker: PhantomData }
     }
 
     // Keeps the entries f says true of.
     pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, f: F) {
-        crate::panic::todo()
+        let mut f = f;
+        let mut i: usize = 0;
+        while i < self.table.cap {
+            if self.table.is_full(i) {
+                let keep = {
+                    let e = self.table.slot_mut(i);
+                    f(&e.0, &mut e.1)
+                };
+                if !keep {
+                    let gone = self.table.take(i);
+                    crate::mem::drop(gone);
+                }
+            }
+            i += 1;
+        }
     }
 
     // Removes every entry; the capacity stays.
     pub fn clear(&mut self) {
-        crate::panic::todo()
+        self.table.clear()
     }
 
     // Moves the map out, leaving an empty one on clones of its allocator
@@ -144,18 +414,96 @@ impl<K, V, A: Allocator, S> HashMap<K, V, A, S> {
 }
 
 impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
+    // q's hash by the map's hasher.
+    fn hash_of<Q: ?Sized + Hash>(&self, q: &Q) -> u64 {
+        let mut h = self.hasher.build_hasher();
+        q.hash(&mut h);
+        h.finish()
+    }
+
+    // The full slot whose key equals k.
+    fn find<Q: ?Sized + Hash + Eq>(&self, k: &Q) -> Option<usize>
+        where
+            K: Borrow<Q>,
+    {
+        if self.table.cap == 0 {
+            return Option::None;
+        }
+        let hash = self.hash_of(k);
+        let tag = h2(hash);
+        let mask = self.table.cap - 1;
+        let mut i = (hash as usize) & mask;
+        loop {
+            let c = self.table.ctrl_at(i);
+            if c == EMPTY {
+                return Option::None;
+            }
+            if c == tag {
+                let stored: &Q = self.table.slot(i).0.borrow();
+                if *stored == *k {
+                    return Option::Some(i);
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    // A new table of room for want entries, every entry moved over
+    // (tombstones dropped).
+    fn resize(&mut self, want: usize) {
+        let new_cap = buckets_for(want);
+        let (ctrl, data) = self.table.allocate_arrays(new_cap);
+        let old_ctrl = crate::mem::replace(&mut self.table.ctrl, ctrl);
+        let old_data = crate::mem::replace(&mut self.table.data, data);
+        let old_cap = crate::mem::replace(&mut self.table.cap, new_cap);
+        self.table.items = 0;
+        self.table.growth_left = new_cap / 8 * 7;
+        let oc = old_ctrl.as_ptr();
+        let od = old_data.as_ptr();
+        let mut i: usize = 0;
+        while i < old_cap {
+            // UNSAFE: the old arrays read through their pointers.
+            // SAFETY: i < old_cap, their length; a full slot holds an
+            // initialized entry, read once (the arrays are freed after,
+            // nothing dropped in them).
+            if unsafe { oc[i] } < DELETED {
+                // UNSAFE: the full slot's entry moved out of the old array.
+                // SAFETY: as above: i < old_cap and the slot is full; it is read once.
+                let e = unsafe { crate::ptr::read(&od[i] as *const (K, V)) };
+                let hash = self.hash_of(&e.0);
+                let j = self.table.find_insert_slot(hash);
+                self.table.put(j, hash, e);
+            }
+            i += 1;
+        }
+        self.table.free_raw(old_ctrl, old_data, old_cap);
+    }
+
     // Room for n more entries.
     // std2: changed: n more (MVS: n in all)
     pub fn reserve(&mut self, n: usize) {
-        crate::panic::todo()
+        if n > self.table.growth_left {
+            self.resize(self.table.items + n);
+        }
     }
 
     pub fn try_reserve(&mut self, n: usize) -> Result<(), TryReserveError> {
-        crate::panic::todo()
+        if n > usize::MAX / 2 - self.table.items {
+            return Result::Err(TryReserveError::CapacityOverflow);
+        }
+        self.reserve(n);
+        Result::Ok(())
     }
 
     pub fn shrink_to_fit(&mut self) {
-        crate::panic::todo()
+        let items = self.table.items;
+        if buckets_for(items) < self.table.cap {
+            if items == 0 {
+                self.table.free_arrays();
+            } else {
+                self.resize(items);
+            }
+        }
     }
 
     // The value for k.
@@ -164,7 +512,10 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
         where
             K: Borrow<Q>,
     {
-        crate::panic::todo()
+        match self.find(k) {
+            Option::Some(i) => Option::Some(&self.table.slot(i).1),
+            Option::None => Option::None,
+        }
     }
 
     // The value for k, mutable.
@@ -173,7 +524,10 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
         where
             K: Borrow<Q>,
     {
-        crate::panic::todo()
+        match self.find(k) {
+            Option::Some(i) => Option::Some(&mut self.table.slot_mut(i).1),
+            Option::None => Option::None,
+        }
     }
 
     // The stored key and its value.
@@ -181,7 +535,13 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
         where
             K: Borrow<Q>,
     {
-        crate::panic::todo()
+        match self.find(k) {
+            Option::Some(i) => {
+                let e = self.table.slot(i);
+                Option::Some((&e.0, &e.1))
+            }
+            Option::None => Option::None,
+        }
     }
 
     // mvs: HashMap::contains_key, HashMap::contains
@@ -195,7 +555,16 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
 
     // Stores v for k; the old value, if there was one.
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        crate::panic::todo()
+        if let Option::Some(i) = self.find(&k) {
+            return Option::Some(crate::mem::replace(&mut self.table.slot_mut(i).1, v));
+        }
+        let hash = self.hash_of(&k);
+        if self.table.growth_left == 0 {
+            self.resize(self.table.items + 1);
+        }
+        let i = self.table.find_insert_slot(hash);
+        self.table.put(i, hash, (k, v));
+        Option::None
     }
 
     // Removes k's entry; its value.
@@ -212,14 +581,26 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
         where
             K: Borrow<Q>,
     {
-        crate::panic::todo()
+        match self.find(k) {
+            Option::Some(i) => Option::Some(self.table.take(i)),
+            Option::None => Option::None,
+        }
     }
 
     // k's place in the map, there or not: `*m.entry(k).or_insert(0) += 1`.
     // mvs: HashMap::get_or_insert
     // std2: changed: Entry replaces get_or_insert (`entry(k).or_insert(v)`)
     pub fn entry(&mut self, k: K) -> Entry<'_, K, V, A, S> {
-        crate::panic::todo()
+        // Room for one more first, as Rust's: a VacantEntry inserts with no
+        // hasher at hand.
+        self.reserve(1);
+        match self.find(&k) {
+            Option::Some(i) => Entry::Occupied(OccupiedEntry { map: self, bucket: i }),
+            Option::None => {
+                let hash = self.hash_of(&k);
+                Entry::Vacant(VacantEntry { map: self, key: k, hash: hash })
+            }
+        }
     }
 
     // A copy on another allocator, with a clone of the hasher.
@@ -229,13 +610,18 @@ impl<K: Hash + Eq, V, A: Allocator, S: BuildHasher> HashMap<K, V, A, S> {
             V: Clone,
             S: Clone,
     {
-        crate::panic::todo()
+        let mut m = HashMap::with_capacity_and_hasher_in(self.len(), self.hasher.clone(), b);
+        for (k, v) in self.iter() {
+            m.insert(k.clone(), v.clone());
+        }
+        m
     }
 }
 
 impl<K, V, A: Allocator, S> crate::ops::Drop for HashMap<K, V, A, S> {
     fn drop(&mut self) {
-        crate::panic::todo()
+        self.table.clear();
+        self.table.free_arrays();
     }
 }
 
@@ -323,7 +709,20 @@ impl<K, V, A: Allocator, S> IntoIterator for HashMap<K, V, A, S> {
     type IntoIter = IntoIter<K, V, A>;
 
     fn into_iter(self) -> IntoIter<K, V, A> {
-        crate::panic::todo()
+        // HashMap has a Drop, so its table is moved out by hand: read, and
+        // the map forgotten once its hasher is dropped.
+        let me = self;
+        // UNSAFE: the table and the hasher are moved out of a value whose type
+        // implements Drop (Rust's E0509 forbids the plain move).
+        // SAFETY: each field is read once and me is forgotten right after, so
+        // neither is dropped twice and the table's arrays have one owner.
+        let table = unsafe { crate::ptr::read(&me.table as *const RawTable<(K, V), A>) };
+        // UNSAFE: the hasher moved out, as the table above.
+        // SAFETY: read once; me is forgotten right after.
+        let hasher = unsafe { crate::ptr::read(&me.hasher as *const S) };
+        crate::mem::forget(me);
+        crate::mem::drop(hasher);
+        IntoIter { table: table, at: 0 }
     }
 }
 
@@ -424,20 +823,22 @@ pub struct OccupiedEntry<'a, K, V, A: Allocator, S> {
 
 impl<'a, K, V, A: Allocator, S> OccupiedEntry<'a, K, V, A, S> {
     pub fn key(&self) -> &K {
-        crate::panic::todo()
+        &self.map.table.slot(self.bucket).0
     }
 
     pub fn get(&self) -> &V {
-        crate::panic::todo()
+        &self.map.table.slot(self.bucket).1
     }
 
     pub fn get_mut(&mut self) -> &mut V {
-        crate::panic::todo()
+        &mut self.map.table.slot_mut(self.bucket).1
     }
 
     // The value, as long as the map's borrow.
     pub fn into_mut(self) -> &'a mut V {
-        crate::panic::todo()
+        let bucket = self.bucket;
+        let map = self.map;
+        &mut map.table.slot_mut(bucket).1
     }
 
     // Stores v; the old value.
@@ -451,7 +852,7 @@ impl<'a, K, V, A: Allocator, S> OccupiedEntry<'a, K, V, A, S> {
     }
 
     pub fn remove_entry(self) -> (K, V) {
-        crate::panic::todo()
+        self.map.table.take(self.bucket)
     }
 }
 
@@ -473,7 +874,13 @@ impl<'a, K, V, A: Allocator, S> VacantEntry<'a, K, V, A, S> {
 
     // Stores v under the key; a &mut to it, as long as the map's borrow.
     pub fn insert(self, v: V) -> &'a mut V {
-        crate::panic::todo()
+        let hash = self.hash;
+        let key = self.key;
+        let map = self.map;
+        // entry() reserved the room, so growth_left > 0 here.
+        let i = map.table.find_insert_slot(hash);
+        map.table.put(i, hash, (key, v));
+        &mut map.table.slot_mut(i).1
     }
 
     // The map's allocator (or_default's).
@@ -490,13 +897,14 @@ impl<'a, K, V, A: Allocator, S> VacantEntry<'a, K, V, A, S> {
 pub struct Iter<'a, K, V> {
     ctrl: *const u8,
     data: *const (K, V),
+    at: usize,
     left: usize,
     marker: PhantomData<&'a (K, V)>,
 }
 
 impl<'a, K, V> Clone for Iter<'a, K, V> {
     fn clone(&self) -> Iter<'a, K, V> {
-        Iter { ctrl: self.ctrl, data: self.data, left: self.left, marker: PhantomData }
+        Iter { ctrl: self.ctrl, data: self.data, at: self.at, left: self.left, marker: PhantomData }
     }
 }
 
@@ -504,7 +912,24 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
-        crate::panic::todo()
+        while self.left > 0 {
+            let i = self.at;
+            self.at += 1;
+            let c = self.ctrl;
+            let d = self.data;
+            // UNSAFE: the table's arrays read through the iterator's pointers.
+            // SAFETY: left > 0, so a full slot is at or after at, within the
+            // table's cap; the iterator borrows the map for 'a, so the entry
+            // stays where it is.
+            if unsafe { c[i] } < DELETED {
+                self.left -= 1;
+                // UNSAFE: the full slot's entry lent for 'a.
+                // SAFETY: as above: in bounds, full, and the map is borrowed for 'a.
+                let e: &'a (K, V) = unsafe { &*(&d[i]) };
+                return Option::Some((&e.0, &e.1));
+            }
+        }
+        Option::None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -518,6 +943,7 @@ impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {}
 pub struct IterMut<'a, K, V> {
     ctrl: *const u8,
     data: *mut (K, V),
+    at: usize,
     left: usize,
     marker: PhantomData<&'a mut (K, V)>,
 }
@@ -526,7 +952,24 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
 
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
-        crate::panic::todo()
+        while self.left > 0 {
+            let i = self.at;
+            self.at += 1;
+            let c = self.ctrl;
+            let d = self.data;
+            // UNSAFE: the table's arrays read through the iterator's pointers.
+            // SAFETY: left > 0, so a full slot is at or after at, within the
+            // table's cap; the map is borrowed mutably for 'a and each slot is
+            // given out once (at only grows), so the &mut V's do not alias.
+            if unsafe { c[i] } < DELETED {
+                self.left -= 1;
+                // UNSAFE: the full slot's entry lent mutably for 'a.
+                // SAFETY: as above: in bounds, full, each slot given out once.
+                let e: &'a mut (K, V) = unsafe { &mut *(&mut d[i]) };
+                return Option::Some((&e.0, &mut e.1));
+            }
+        }
+        Option::None
     }
 }
 
@@ -587,7 +1030,12 @@ impl<K, V, A: Allocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<(K, V)> {
-        crate::panic::todo()
+        let i = self.table.next_full(self.at);
+        if i >= self.table.cap {
+            return Option::None;
+        }
+        self.at = i + 1;
+        Option::Some(self.table.take(i))
     }
 }
 
@@ -630,12 +1078,24 @@ impl<'a, K, V, A: Allocator> Iterator for Drain<'a, K, V, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<(K, V)> {
-        crate::panic::todo()
+        // UNSAFE: the table reached through the pointer drain took.
+        // SAFETY: the Drain borrows the map mutably for 'a, so the table is
+        // valid and nothing else uses it.
+        let t = unsafe { &mut *self.table };
+        let i = t.next_full(self.at);
+        if i >= t.cap {
+            return Option::None;
+        }
+        self.at = i + 1;
+        Option::Some(t.take(i))
     }
 }
 
 impl<'a, K, V, A: Allocator> crate::ops::Drop for Drain<'a, K, V, A> {
     fn drop(&mut self) {
-        crate::panic::todo()
+        // UNSAFE: the table reached through the pointer drain took.
+        // SAFETY: as in next: the map is borrowed mutably for 'a.
+        let t = unsafe { &mut *self.table };
+        t.clear();
     }
 }
