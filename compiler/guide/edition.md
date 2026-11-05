@@ -88,13 +88,13 @@ for a plain T); a `&x` given to one is lent, as Rust's `v.contains(&3)`.
 error whose `try:` is Rust's spelling (`*r`, `&x`). MVS std's
 parameters keep 0.19's meanings until 0.27.2's std.
 
-## The borrow checker (0.27.1)
+## NLL, the regions solved (0.27.1)
 
-Every rust-edition function is borrow-checked on the places IR, as
-rustc's NLL checks it (docs/design/borrowck.md is the rule book; each
+Every rust-edition function's regions are solved on the places IR, as
+rustc's NLL does (docs/design/borrowck.md is the rule book; each
 message's code names its rule): a reference lives as long as its region
-is used; a place is not written, moved, dropped or borrowed mutably
-while a borrow of it is live, nor read while a mutable borrow is; a
+is used; a place is not written, moved, dropped or lent exclusively
+while a loan of it is live, nor read while an exclusive loan is; a
 receiver's `&mut` is two-phase (`v.push(v.len())` is fine); a
 reference to a local does not leave its function; a signature's
 lifetimes are what the body must respect (`'a: 'b`, elision as Rust's);
@@ -102,14 +102,11 @@ a moved value is not used again (a field moved, the whole is partly
 moved; in a loop, "in a previous iteration"); a value cannot be moved
 out of a reference, an index or a `static`; a value with `impl Drop`
 keeps what it references alive until its drop, the std containers
-(`Vec`, `String`, `HashMap`, ...) only their elements'. The codes:
-`borrowck.mut_twice`, `conflict`, `use_borrowed`, `assign_borrowed`,
-`move_borrowed`, `dropped_borrowed`, `return_local`, `outlives`,
-`elision`, `unused_param`, `use_moved`, `assign_moved_part`,
-`move_out`, `move_from_drop`, `guard_write`, `static_mut_ref`
-(`volec explain borrowck.X` for each, with its rustc code). `volec
-check --emit-places=regions` prints each body's liveness, constraints,
-region values and loans.
+(`Vec`, `String`, `HashMap`, ...) only their elements'. The sixteen
+codes are `volec explain --list`'s `borrowck.*` entries (`mut_twice`,
+`conflict`, `return_local`, `outlives`, `use_moved`, `move_out`, ...),
+each with its rustc code; `volec check --emit-places=regions` prints
+each body's liveness, constraints, region values and loans.
 
 What is not checked in 0.27.1 (each a named divergence in the rule
 book): the inside of a closure body reaches its captures through a raw
