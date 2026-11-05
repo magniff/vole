@@ -51,6 +51,17 @@ projection b)`; `bbK[i]` names location `i` of block `K` as
   signature (§12) only if indexing a view is read as a deref through
   the view's region: D1.4 says so. **R9 is closed by D1.4, with no
   builder change.**
+- **A miscompile in v0.27.0 (the contracts/effects design pass).** The
+  optimizer's reference-parameter facts (`gvn::params_disjoint`,
+  `gvn::param_frozen`, vecfacts' frozen header) were gated by
+  `noalias_active ≡ own_mode == MODE_ERROR && !noalias_off`, true for
+  every program (the own mode defaults to the error mode), so they fired
+  on rust-edition bodies nothing had checked: `f(&mut x, &mut x)` with
+  `*a = 1; *b = 2; *a` and `g(&v, &mut v)` pushing through `w` and
+  reading `v.len()` twice printed `f: 2`, `g: 1` at -O0 and `f: 1`, `g:
+  0` at -O2 (`-O2 --no-noalias`: `f: 2`, `g: 1`). Fixed in 0.27.1 by
+  D17.7's gate (`rust_b_alias_params_O`); the program is
+  `rust_b_err_alias_params` (`mut_twice`, `conflict`) once M2 lands.
 
 ### 0.2 Decisions
 
@@ -571,8 +582,11 @@ bivariant). `xform(+, v) = v`; `xform(−, +) = −`, `xform(−, −) = +`,
 
 **D5.2 (constructors).** `&'a T`: `'a: +`, `T: +`. `&'a mut T`: `'a:
 +`, `T: o`. A shared view `[T]`, `str`: `'v: +`, `T: +`; a mutable view
-`inout [T]`: `'v: +`, `T: o`. `*const T`: `T: +`; `*mut T`: `T: o`
-(the one `*T` of v0.27.0: `o`). `[T; n]`, tuples: `+`. `fn(A₁..) ->
+`inout [T]`: `'v: +`, `T: o`. MVS std's one `*T` (v0.27.0, and MVS
+through 0.27): `T: +`, an owning pointer as `NonNull`/`Unique`, so
+`Vec<T>` and `Option<T>` are covariant; in the rust edition, once raw
+mutability is distinct (ir271 M2), `*const T`: `T: +` and `*mut T`:
+`T: o`. `[T; n]`, tuples: `+`. `fn(A₁..) ->
 R`: `Aᵢ: −`, `R: +`. `Cell<T>`, `UnsafeCell<T>`: `T: o`.
 `PhantomData<T>`: as `T`. A closure type: each capture field as D3.3
 spells it (`&'c T`: `'c: +`, `T: +`; `&'c mut T`: `'c: +`, `T: o`; by
@@ -1044,6 +1058,15 @@ call).
 | 11 | `borrowck.static_mut_ref` at the front | D6.2.5 | ir271 M2 |
 | 12 | `T_BORROWCK = 25`, `T_COUNT = 26` in `base/timer.vl` | §15 | bc271 M1 |
 | 13 | `--verify-places`: every non-parameter local has a `StorageDead` on every exit path (D6.2.2's premise); "copy of an exclusive reference" after row 9 | D6.2.2, D3.6 | bc271 M2 |
+| 14 | `AS_DISCHARGED`: a decision field on `SK_ASSERT` and the contract conjunct's switch (`AS_UNDECIDED=0, AS_KEPT=1, AS_DISCHARGED=2, AS_REFUTED=3`), printed as `; L1: ..` (empty), reserved for the Level 1 verdicts of the contracts design | §17 | ir271 M1 (reserved) |
+| 15 | `f$checked`: what an `OK_FN f` of a contracted function names (the checking entry `fn f$checked(<params>) -> R { f$pre(SITE_INDIRECT, <params>); f(<params>) }`); D17.6's exception (a) applies to it when it is the exported symbol | D17.6 | ir272 (named now) |
+| 16 | `where 'a: 'b` bounds read into the universals' order (D4.5) | D4.5 | ir271 M2 |
+
+ir271 M1's findings, recorded: `&&'a str` collapses to the view (a
+known front gap, with a corpus case); an instance's `Fn` node is a clone
+with `g = 0`, so the signature walk (`sig_of`) reads the template's
+node; the region rows are four words and `RO_CALL` has one row per
+callee region with the call's base in its `PStmt.e`.
 
 Not needed: `TK_FALSE_EDGE` (verified), an unwind edge (panics exit).
 
@@ -1142,7 +1165,11 @@ locations 3 to 7, `bb0[3+..7]` from the mid point of 3 to the start
 point of 7. An empty set prints `-`. An `end` bit prints by its
 universal's region (`end('r3)`; ir271 M1's named form `end('a)`,
 `'_1` for an elided one, `'static`). The format is extensible with a
-`reach` section for 0.27.4.
+`reach` section for 0.27.4, and with the contracts design's `fact` and
+`verdict` lines (reserved; `check --emit-facts` prints them in this
+style: `fact bb0[3+]: _2 < _5  (switch bb0[2], checked)`, `verdict site
+14/0: discharged (chained: _2 < _5, _5 <= _7)`), and a per-body
+`verdict: clean|errors|deferred` line (D17.7) once M3 prints it.
 
 ## 17. Contracts in the rust edition
 
@@ -1216,7 +1243,71 @@ generator for '&i64' (a pointer)"); MVS's `let T` of a compound type
 has one. Until the generator reads `&T`/`&mut T` as `let`/`inout` in
 the rust edition, D17.3's cases cannot be written; corpus271 writes
 D17.1 and D17.2 on by-value parameters and D17.3 marked XFAIL on the
-front.
+front. (The contracts/effects design takes it as ir271's fix, R1.)
+
+The contracts/effects design adds four rules (its C3, C5, A4.1, O3.4;
+the front's part is ir271's):
+
+**D17.4 (a clause's shared context).** A clause is type-checked as the
+body of its companion under the signature transformation `shared(τ)`:
+`shared(&mut T) = &T`, `shared(&'a mut T) = &'a T`, `shared(T) = T`
+otherwise. `f$pre`'s parameters are `shared(params(f))`; the wrapper's
+`ensures` sees `params(f)` as `shared(..)` too (its locals rebound as
+`&T` views, `let p: &T = &*p_mut`). So a clause cannot write through a
+parameter by typing (a write through a `&T` of a non-`Freeze` `T` is
+purity's, `interior`); D17.3's "the check's read of `*_v` meets nothing"
+is then by construction. A by-value non-`Copy` parameter is read in
+place in `f$pre` (a `BORROWED` bit copy): a `move` of it in a clause is
+`error contract.move`; `result` in an `ensures` of `-> R` is a
+read-only place of type `R`, a `move` of it `contract.move`; for `R =
+&'a mut T`, `*result` may be read, and a read of `*self` (any place
+`result`'s loan borrows) in that clause is `borrowck.use_borrowed` by
+D2.5 (the wrapper's `result` holds the `M` loan through `'self : 'new :
+'ret`, in scope until the return), with a contract-specific help
+("`self` is borrowed by `result`; state the promise on `*result` or on
+`old(..)`"). In MVS `shared` is the identity.
+
+**D17.5 (`old(e)`, restricted).** `old(e)` is accepted iff `type(e)` is
+`Copy`, `slots(type(e)) = []` (no reference, no view: D3.3) and
+`type(e)` holds no raw pointer; else `error contract.old` (no
+`.clone()` try in the rust edition: a clone allocates). So `old(r)` for
+`r: &mut T` is rejected, `old(*r)` for a `Copy` `*r` accepted, `old(&x)`
+rejected; D17.2's loan and move cases are unreachable by construction,
+and `?oldN` is an ordinary `LF_TEMP` local read by `OK_COPY`.
+
+**D17.6 (two `&mut` parameters are disjoint: the axiom and its
+premise).** In a body `b`, parameters `p: &mut T` and `q: &mut U` have
+`Overlap(*p.π, *q.ρ) = false` for all `π, ρ`, and `p: &mut T` is
+disjoint from every `r: &V` parameter, **provided every caller of `b`
+established it**: a rust-edition caller accepted by this checker (at
+the call the two `M` loans, or the `M` and the `S` loan, are both in
+scope, and D2.5 rejects the second's creation or activation when the
+places overlap), or `unsafe` code whose SAFETY comment owns it. The
+optimizer's `params_disjoint` and `param_frozen` are this axiom.
+Exceptions, where it is off for `b`'s parameters: (a) `b` is an `extern
+"C"` definition, `main`, or a function whose address is taken as an
+`extern "C" fn` value (a C caller may pass aliasing pointers), and
+`f$checked` when it is the exported symbol; (b) 0.27.x only: `b` is
+reachable as a callback from an MVS std body through §12's bridge (its
+address taken into a `fn` value or a closure passed to an MVS std item:
+`sort_by`, `retain`, `for_each`) — nothing in MVS std's body is solved,
+so MVS std is trusted like unsafe code, and a rust body it calls gets no
+axiom in 0.27.1; closed in 0.27.2 with std2; (c) a D10.4-deferred
+closure body: its parameters are fine (its callers are checked) but its
+captured places are reached through the raw env and get no axiom,
+which D17.7's `deferred` verdict covers.
+
+**D17.7 (the optimizer's gate).** `noalias_active(f)` is per body: for
+a rust-edition body it is `borrowck_clean(f) ∧ !noalias_off`, where
+`borrowck_clean(f)` holds iff the solve ran on `f` with no `borrowck.*`
+error and `f` is not a D10.4-deferred body (its `borrowck.unchecked`
+counts as not clean: the facts are off for that body only); for an MVS
+body it stays `own_mode == MODE_ERROR ∧ !noalias_off` until 0.28. The
+readers are `gvn::has_ref_facts`, `params_disjoint`, `param_frozen` and
+vecfacts' frozen header (`vec_apart`). **0.27.1's stopgap (shipped
+with M1's fix, `rust_fn(f) ⇒ false`)** is replaced in M3 by the verdict,
+which the code cache's key for the body includes (`clean`, `errors`,
+`deferred`: §16's `verdict` line).
 
 ## 18. Implementation notes (non-normative)
 
