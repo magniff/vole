@@ -12,7 +12,7 @@ use crate::front::ast::{
     CALL_FIELDS, FN_INTRINSIC, NodeKind, VK_NEW, child, list_begin, list_end, list_push,
 };
 use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
-use crate::front::check::{Res, lookup_local, name_error};
+use crate::front::check::{Res, has_error_type, lookup_local, name_error};
 use crate::front::check::arch::{check_intrinsic_call, check_raw_form};
 use crate::front::check::args::{arity_help, normalize_args};
 use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
@@ -547,6 +547,64 @@ fn bind_impl_params(f: i64, t: i64, pcx: inout Ctx<Comp>) {
     }
 }
 
+// (0.27.2) The trait a path callee names (`Tr::f`, `a::b::Tr::f`), its
+// index + 1, or 0: neither a local nor a primitive, an item that is a
+// trait. RULE: F8.2
+fn trait_path_key(callee: i64, pcx: inout Ctx<Comp>) -> i64 {
+    let segments = pcx.nodes[callee].count;
+    var key = -1;
+    if segments == 0 {
+        if env_lookup(pcx.nodes[callee].a, pcx) != 0
+            || is_primitive_name(pcx.nodes[callee].a, pcx) {
+            return 0;
+        }
+        key = type_name_key(callee, &pcx);
+    } else {
+        // (`a::b::Tr::m`: Tr in the module of the parts before it)
+        let m = path_module(callee, segments - 2, &pcx);
+        let b = lookup_name(m, pcx.nodes[callee].a, pcx.cur_mod, &pcx);
+        if binding_kind(b) == B_ITEM {
+            key = binding_value(b);
+        }
+    }
+    if key < 0 {
+        return 0;
+    }
+    // UNSAFE: sym_trait is a raw table indexed by item key (sym_table)
+    // SAFETY: key is an item's key from type_name_key or lookup_name, so
+    // within the table, which has a slot for every key
+    unsafe { pcx.sym_trait[key] }
+}
+
+// Whether sym names a primitive type.
+fn is_primitive_name(sym: i64, pcx: Ctx<Comp>) -> bool {
+    // UNSAFE: sym_primitive is a raw table indexed by symbol (sym_table)
+    // SAFETY: sym is an interned symbol, and the table has a slot for each
+    unsafe { pcx.sym_primitive[sym] != 0 }
+}
+
+// (0.27.2) `Tr::f(args)` where a `T` is expected, f an associated function
+// of trait Tr without a receiver (`Default::default()`, `From::from(x)`):
+// Self is the expected type, as `<T as Tr>::f(args)`; call n's callee
+// then names it (y, the type path_target reads). RULE: F8.2
+pub fn trait_assoc_self(n: i64, expected: i64, pcx: inout Ctx<Comp>) {
+    let callee = pcx.nodes[n].a;
+    if callee <= 0 || pcx.nodes[callee].kind != NodeKind::Path || pcx.nodes[callee].y != 0
+        || pcx.nodes[callee].b == 0 || expected <= 0 || has_error_type(expected, pcx)
+        || pcx.types[expected].kind == TyKind::None {
+        return;
+    }
+    let tr = trait_path_key(callee, &pcx);
+    if tr == 0 {
+        return;
+    }
+    let f = crate::front::traits::trait_fn(tr - 1, pcx.nodes[callee].b, pcx);
+    if f == 0 || pcx.nodes[f].count > 0 && pcx.nodes[child(f, 0, pcx)].a == pcx.self_sym {
+        return;
+    }
+    pcx.nodes[callee].y = expected;
+}
+
 // `T::m(args)`: a variant with fields, or a call of an associated function
 // (or of a method, with the receiver passed explicitly).
 fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
@@ -558,13 +616,13 @@ fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
             return vector_assoc_call(n, callee, pcx.sym_primitive[pcx.nodes[callee].a], &pcx);
         }
         // RULE: F8.2 (0.27.2: `Tr::m(x, args)`, a trait's method with its
-        // receiver explicit, is `x.m(args)`, probed as a method call is)
-        if pcx.nodes[callee].count == 0 && pcx.nodes[callee].y == 0 && pcx.nodes[n].count > 0
-            && env_lookup(pcx.nodes[callee].a, pcx) == 0
-            && pcx.sym_primitive[pcx.nodes[callee].a] == 0
+        // receiver explicit, is `x.m(args)`, probed as a method call is;
+        // 0.27.2 M3: by its path too, `std::clone::Clone::clone(x)`, as
+        // the derives write it, F17.1)
+        if pcx.nodes[callee].y == 0 && pcx.nodes[n].count > 0
             && crate::front::check::rust::rust_node(n, &pcx) {
-            let key = type_name_key(callee, &pcx);
-            if key >= 0 && pcx.sym_trait[key] != 0 {
+            let tr = trait_path_key(callee, &pcx);
+            if tr != 0 {
                 let first = child(n, 0, pcx);
                 let mark = list_begin(pcx);
                 for k in 1..pcx.nodes[n].count {
@@ -576,7 +634,7 @@ fn synth_path_call(n: i64, callee: i64, pcx: inout Ctx<Comp>) -> i64 {
                 pcx.nodes[n].b = pcx.nodes[callee].b;
                 pcx.nodes[n].g = pcx.nodes[callee].h;
                 pcx.via_node = n;
-                pcx.via_trait = pcx.sym_trait[key] - 1;
+                pcx.via_trait = tr - 1;
                 return synth_expr(n, &pcx);
             }
         }
