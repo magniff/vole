@@ -3,7 +3,7 @@
 // access's statement node, naming the loan's position; the codes'
 // `explain` rows are tools/explain/borrowck_table.vl.
 
-use crate::base::{buf_new, buf_slice, buf_str, sym_text};
+use crate::base::{SRC, buf_new, buf_slice, buf_str, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
 use crate::base::diag::{buf_position, report_error_tries};
@@ -40,6 +40,107 @@ pub fn report_shared_write(loc: i64, l: i64, p: i64, bck: inout Bck<Comp>, pbody
     buf_str(m, c"' in a match guard: a `ref mut` binding is shared there");
     report_error_tries(pcx.nodes[node].start, 1000 + C_GUARD_WRITE, c"borrowck.guard_write",
         buf_slice(m).ptr, c"write it in the arm, after the match has decided", "", false, &pcx);
+}
+
+// A `try:` line that rewrites node n's text t as `pre t post` on its line
+// (as the own pass's: `volec edit patch FILE:LINE --old 'LINE' --new 'LINE'`,
+// the line without its indentation); the command in a buffer, or -1 for a
+// node over several lines or in std.
+pub fn try_wrap(n: i64, pre: *u8, post: *u8, pcx: Ctx<Comp>) -> i64 {
+    if n <= 0 {
+        return -1;
+    }
+    let start = pcx.nodes[n].start;
+    let end = pcx.nodes[n].end;
+    let f = src_file(start, pcx);
+    // UNSAFE: FILES' paths and SRC are the lexer's raw text.
+    // SAFETY: f is a file index below FILES' count; every position read is
+    // within the file's [start, end), which the lexer filled.
+    unsafe {
+        let path = pcx.files[f].path;
+        if path[0] == '<' || end <= start {
+            return -1;
+        }
+        var ls = start;
+        while ls > pcx.files[f].start && SRC[ls - 1] != '\n' {
+            ls -= 1;
+        }
+        while ls < start && (SRC[ls] == ' ' || SRC[ls] == '\t') {
+            ls += 1;
+        }
+        var le = start;
+        while le < pcx.files[f].end && SRC[le] != '\n' {
+            le += 1;
+        }
+        if end > le {
+            return -1;
+        }
+        while le > end && (SRC[le - 1] == ' ' || SRC[le - 1] == '\t') {
+            le -= 1;
+        }
+        let args = buf_new();
+        buf_str(args, c"edit patch ");
+        buf_str(args, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        crate::base::buf_byte(args, ':');
+        crate::base::buf_int(args, src_line(start, pcx));
+        buf_str(args, c" --old ");
+        quoted(args, ls, le, -1, -1, c"", c"");
+        buf_str(args, c" --new ");
+        quoted(args, ls, le, start, end, pre, post);
+        let out = buf_new();
+        crate::base::diag::buf_tool_command(out, buf_slice(args), false, pcx);
+        out
+    }
+}
+
+// SRC[from..to) single-quoted for a shell, `pre` put at `at` and `post` at
+// `end` (-1: none).
+fn quoted(out: i64, from: i64, to: i64, at: i64, end: i64, pre: *u8, post: *u8) {
+    crate::base::buf_byte(out, '\'');
+    var i = from;
+    while i <= to {
+        if i == at {
+            buf_str(out, pre);
+        }
+        if i == end && at >= 0 {
+            buf_str(out, post);
+        }
+        if i < to {
+            // UNSAFE: SRC is the lexer's raw text.
+            // SAFETY: i is within a line of a file the lexer read.
+            let c = unsafe { SRC[i] };
+            if c == '\'' {
+                buf_str(out, c"'\\''");
+            } else {
+                crate::base::buf_byte(out, c);
+            }
+        }
+        i += 1;
+    }
+    crate::base::buf_byte(out, '\'');
+}
+
+// The file of position pos (an index in FILES), and its line from 1.
+fn src_file(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    var f = 0;
+    while f + 1 < pcx.files.len() as i64 && pos >= pcx.files[f + 1].start {
+        f += 1;
+    }
+    f
+}
+
+pub fn src_line(pos: i64, pcx: Ctx<Comp>) -> i64 {
+    var line = 1;
+    var i = pcx.files[src_file(pos, pcx)].start;
+    while i < pos {
+        // UNSAFE: SRC is the lexer's raw text.
+        // SAFETY: i is below pos, a position in a file the lexer read.
+        if unsafe { SRC[i] } == '\n' {
+            line += 1;
+        }
+        i += 1;
+    }
+    line
 }
 
 // The code's name.
@@ -160,8 +261,22 @@ pub fn report(code: i64, kind: i64, loc: i64, j: i64, l: i64, p: i64, deref: i64
     } else {
         c"write it in the arm, after the match has decided"
     };
-    report_error_tries(pos, 1000 + j * 16 + code, code_name(code), buf_slice(m).ptr, help, "",
-        false, &pcx);
+    // RULE: C3.3 (the wrapper's `result` holds the loan until the return:
+    // the contract's help, places::result_borrow_help's words)
+    if (code == C_USE_BORROWED || code == C_CONFLICT) && pbody.fn_ >= 0
+        && crate::places::has_ensures(pbody.fn_, pcx) {
+        let h = buf_new();
+        buf_str(h, c"'");
+        buf_place(h, l, 0, 0, pbody, pcx);
+        buf_str(h, c"' is borrowed by 'result'; state the promise on '*result' or on 'old(..)'");
+        report_error_tries(pos, 1000 + j * 16 + code, code_name(code), buf_slice(m).ptr,
+            buf_slice(h).ptr, "", false, &pcx);
+        return;
+    }
+    // RULE: section 14.1 (move_borrowed's try: `.clone()` where it moves)
+    let tr = if code == C_MOVE_BORROWED { try_wrap(st.node, c"", c".clone()", pcx) } else { -1 };
+    report_error_tries(pos, 1000 + j * 16 + code, code_name(code), buf_slice(m).ptr, help,
+        if tr >= 0 { buf_slice(tr) } else { "" }, false, &pcx);
 }
 
 // The place as the user names it: the root's source name when it has one
