@@ -149,15 +149,17 @@ D7.3); its *kind* for code selection is `shared` (`BK_SHARED`), `mut`
 (`BK_MUT`, `BK_MUT2` in either phase) or `fake` (`BK_FAKE`).
 
 **D2.2 (accesses).** An access is `(depth, kind, Q)` with `depth ∈
-{Shallow, Deep}` and `kind ∈ {Read, Reserve, Activate ℓ', WB, WA, WM,
-WD}` (`WB`: write by a mutable borrow; `WA`: by an assignment; `WM`: by
-a move; `WD`: by a drop or a storage end). Each location performs:
-- an operand `OK_COPY Q`: `(Deep, Read, Q)`; `OK_MOVE Q`: `(Deep, WM,
+{Shallow, Deep}` and `kind ∈ {RC, RB, Reserve, Activate ℓ', WB, WA,
+WM, WD}` (`RC`: a read by a copy or a use; `RB`: a read by a shared
+borrow; `WB`: a write by a mutable borrow; `WA`: by an assignment;
+`WM`: by a move; `WD`: by a drop or a storage end). `Read` means `RC` or
+`RB`. Each location performs:
+- an operand `OK_COPY Q`: `(Deep, RC, Q)`; `OK_MOVE Q`: `(Deep, WM,
   Q)`; a constant operand: none — in every statement kind that has
   operands (`SK_ASSIGN`, `SK_CALL`, `SK_INTRINSIC`, `SK_ASSERT`) and in
   `TK_SWITCH`;
 - the rvalue of `SK_ASSIGN (a,b) = rv`: `RV_REF P` with `BK_SHARED`:
-  `(Deep, Read, P)`; `BK_MUT`: `(Deep, WB, P)`; `BK_MUT2`: `(Deep,
+  `(Deep, RB, P)`; `BK_MUT`: `(Deep, WB, P)`; `BK_MUT2`: `(Deep,
   Reserve, P)` at its creation and `(Deep, Activate ℓ, P)` at its
   activation location (D7.1); `BK_FAKE`: none (D2.6); `BK_RAW` of a
   `*const T`: `(Deep, Read, P)`, of a `*mut T`: `(Deep, WB, P)` (*IR
@@ -217,11 +219,17 @@ a deref at depth `Shallow` → no conflict; (4) kills every in-scope loan
 of `*x…` (the old reborrows, now unreachable); (5) the new loan survives
 (gen after kill, as rustc's `statement_effect`), and `sub(&'new mut T ≤
 &'x mut T)` gives `'new : 'x`, so `val('new) = val('x)`. `r = &a; r =
-&b;`: the second assignment writes `r`; `ℓ₁` is of `a` (not rooted at
-`r`), so it is not killed; `'ℓ₁ : 'r` and `r` live afterwards keep `ℓ₁`
-in scope, so `a = 5` after it is `borrowck.assign_borrowed` — as
-rustc's NLL (one region per local, not per assignment); the fix is
-shadowing (`let r = &b;`), which the `try:` says.
+&b; a = 5; use(r)`: the second assignment writes `r` but does not kill
+`ℓ₁` (of `a`, not reached through `r`); `ℓ₁` leaves scope anyway, by
+D2.4's path rule: `r` is dead at the point after `r = &a` (its next
+access is the write), so that point is not in `val('r)` nor in
+`val('ℓ₁)`, and the path from `ℓ₁`'s creation to `a = 5` is cut there.
+Accepted, as rustc. `ℓ₁` survives only on a path where the first value
+of `r` may still be read: `r = &a; if c { r = &b; } a = 5; use(r)`, or
+a loop that reads `r` before reassigning it — then `a = 5` is
+`borrowck.assign_borrowed` (one region per local, not per assignment:
+as rustc's NLL), and the fix is shadowing (`let r = &b;`), which the
+`try:` says when the loan's holder is reassigned.
 
 **D2.5 (conflicts).** For an access `(depth, kind, Q)` at point `p` and
 a loan `ℓ = (bk, P, 'ℓ, loc₀) ∈ scope(p)` that is not the access's own
@@ -239,15 +247,16 @@ loan (the one step (2) excludes) nor the `ℓ'` of an `Activate ℓ'`:
    field) → *overlap* at any depth (a write to `Q` overwrites `P`).
 3. `r ∈ {Equal, PrefixOf}` → *overlap*.
 4. For a `fake` loan (D2.6) *overlap* is *shallow*: it holds only when
-   `kind ∈ {WA, WM, WB, WD}` and `r = Equal`, or `r = Extends` (`Q` a
+   `kind ∈ {WA, WB, WD}` and `r = Equal`, or `r = Extends` (`Q` a
    strict prefix of `P`) with no deref-like projection between `Q` and
-   `P`; a write to a sub-place of `P` (`r = PrefixOf`), a read or a
+   `P`; a write to a sub-place of `P` (`r = PrefixOf`), a move (`WM`: a
+   later arm's test of a moved scrutinee is M1's, §8), a read or a
    borrow never conflicts with it (R10).
 5. On *overlap*, by the access kind and the loan's class (D2.1):
 
 | access | `S` | `M` |
 |---|---|---|
-| `Read` | ok | conflict |
+| `RC`, `RB` | ok | conflict |
 | `Reserve` | ok | conflict |
 | `Activate ℓ'` | conflict unless `ℓ' = ℓ` | conflict |
 | `WB`, `WA`, `WM`, `WD` | conflict | conflict |
@@ -257,14 +266,19 @@ loan (the one step (2) excludes) nor the `ℓ'` of an `Activate ℓ'`:
 
 | access | loan kind | code | rustc |
 |---|---|---|---|
-| `Read` | `mut` | `borrowck.use_borrowed` | E0503 |
+| `RC` | `mut` | `borrowck.use_borrowed` | E0503 |
+| `RB` | `mut` | `borrowck.conflict` | E0502 |
 | `Reserve` | `mut` | `borrowck.mut_twice` | E0499 |
 | `Activate`, `WB` | `mut` | `borrowck.mut_twice` | E0499 |
 | `Activate`, `WB` | `shared` | `borrowck.conflict` | E0502 |
 | `WA` | `shared`, `mut` | `borrowck.assign_borrowed` | E0506 |
 | `WM` | `shared`, `mut` | `borrowck.move_borrowed` | E0505 |
-| `WD` | `shared`, `mut` | `borrowck.dropped_borrowed`, or `borrowck.return_local` when D6.2.2 applies to `ℓ` | E0597/E0713, E0515 |
-| `WA`, `WM`, `WB`, `WD` | `fake` | `borrowck.guard_write` | E0510 |
+| `WD` | `shared`, `mut` | `borrowck.dropped_borrowed`, or `borrowck.return_local` when D6.2.2 applies to `ℓ` | E0597/E0713/E0716, E0515 |
+| `WA`, `WB`, `WD` | `fake` | `borrowck.guard_write` | E0510 |
+
+`RB` covers an explicit `&x`, a `&self` autoref and a shared capture
+(D10.2): rustc's E0502 for a shared borrow of a mutably borrowed place;
+`RC` is a copy or a use of its value, E0503.
 
 The loan's kind, not its class, selects the code: an `Activate` or `WB`
 meeting a reserved `BK_MUT2` loan (class `S`, kind `mut`) is
@@ -717,8 +731,11 @@ unless named, at the access's statement.
   path (through `*`, an index, a union), it requires `DefInit` of
   `base(Q)`; with no base, no check.
 - (M2) `SK_ASSIGN`/`SK_CALL`/`SK_INTRINSIC` with destination `Q =
-  L.π`, `π ≠ ∅`: requires `DefInit` of every strict-prefix path of `Q`
-  (`borrowck.assign_moved_part`, E0381 "partially assigned"); then
+  L.π`, `π ≠ ∅`: requires `DefInit` of every strict-prefix path of `Q`;
+  a prefix that was initialized and then moved (`MaybeUninit` by a move,
+  `let q = p; p.a = 1;`) is `borrowck.use_moved` (E0382), a prefix never
+  initialized on some path (`let p: P; p.a = 1;`) is
+  `borrowck.assign_moved_part` (E0381 "partially assigned"); then
   initializes. `Q = (L, 0)`: no requirement (reinitialization), and it
   kills `L`'s loans through a deref (D2.3).
 - (M3) An `OK_MOVE Q` whose path does not exist because `Q` goes
@@ -744,7 +761,12 @@ fire: §0.1), so no body gets both. The own pass's view findings
 v0.27.0 (`ocx.quiet`): **M3 task:** unmute them for rust bodies on the
 corpus; if they agree with borrowck or only add true positives, keep
 them (Q2(b) as intended); if they add false positives, leave them muted
-and count the hole (R2). R2 closes in 0.27.2 with std2 (every type
+and count the hole (R2). Also M3's: `own.drop_view` (an `impl Drop` on
+a type holding a reference, MVS's rule) is suppressed for rust-edition
+types, where dropck (§9) is the rule: `let x = 1; let d = D { r: &x };`
+with `impl Drop for D` is accepted when `x` outlives `d`'s drop and
+`borrowck.dropped_borrowed` when it does not. R2 closes in 0.27.2 with
+std2 (every type
 declares its regions; the own pass is off for the rust edition).
 
 ## 9. Drops and dropck (S9)
@@ -789,8 +811,8 @@ in 0.27.1.
 ## 10. Closures (S10)
 
 **D10.1 (captures as places).** A closure captures whole variables only
-(disjoint-field capture is 0.29's): capture `k` is the place `(xₖ, 0)`
-of the enclosing body.
+(disjoint-field capture is 0.29's; L7): capture `k` is the place `(xₖ,
+0)` of the enclosing body.
 
 **D10.2 (the capture mode; Q5).** For a rust-edition closure, capture
 `k` is *by value* if the closure is `move`, or if the body moves `xₖ`
@@ -927,32 +949,44 @@ outside the holes named below.
 - R6 `fn` pointer types carry no late-bound regions (D3.3). Reason: no
   `for<'a>` until 0.29; a `fn(&T) -> &U` value's call uses E1-E2 at the
   call.
-- R7 Index projections `P[i]` vs `P[j]` conflict (as rustc) but `P[k]`
-  vs `P[k']` constants are disjoint (as rustc): not a divergence in
-  effect, named so the twin can mark it.
+- R7 Constant index projections `P[k]` vs `P[k']` with `k ≠ k'` are
+  disjoint (D1.5), so `&mut a[0]` and `&mut a[1]` may coexist on an
+  array and through a `&mut [T]`; rustc rejects both (only slice
+  patterns are disjoint there). Sound, since the elements do not
+  overlap, and more permissive. `P[i]` vs `P[j]` by locals may alias,
+  as rustc.
 - R8 Moving out of `*b` for a `Box` is `borrowck.move_out` (M3): no
   `DerefMove` (rustc allows it for `Box` only). A strictness in effect;
   listed with R-ids as the delta named it.
 - R9 `&v[i]` on an MVS `Vec`: closed by D1.4 (§0.1); kept as a name so
   a case that pins the shape can cite it.
-- R10 Fake borrows (D2.6) conflict only with writes (as rustc).
+- R10 Fake borrows (D2.6) conflict only with `WA`, `WB` and `WD` (as
+  rustc); a move of the scrutinee in a guard is the move dataflow's
+  (M1 at the next arm's test).
 
 **Deliberate strictness (less than rustc).**
 - L1 Dropck without `may_dangle` for user `impl Drop` types (as rustc
   on stable); std containers through the table (§9).
 - L2 No rvalue static promotion: `let r: &'static i64 = &3;` is a
   temporary of its statement here (vole's temporaries, places-ir.md
-  §3.7) → rejected; rustc promotes. Q7: 0.27.3.
+  §3.7) → `borrowck.dropped_borrowed` at the temporary's `StorageDead`
+  (rustc's E0716 for a temporary); rustc promotes. Q7: 0.27.3.
 - L3 Temporaries' scopes are vole's (the statement; the block for `let
   r = &f(x)`), not Rust 2024's tail-expression rule: a difference only
   in `match`/block tail temporaries.
 - L4 NLL only: problem case 3 (a conditional return of a borrow) is
   rejected as rustc's NLL does; the location-sensitive solve is
   0.27.4's. Also rustc's NLL limitations shared on purpose: one region
-  per local (D2.4a's `r = &a; r = &b` example).
+  per local, so a reassigned reference whose first loan survives on
+  some path keeps that loan (D2.4a's conditional and loop examples; a
+  plain `r = &a; r = &b` is accepted).
 - L5 Opaque (`impl Trait`) regions invariant (0.27.2).
 - L6 A guard's `ref mut` binding is read-only in the guard (as rustc:
-  E0596 in guards; here `borrowck.guard_write`).
+  E0594 in guards; here `borrowck.guard_write`).
+- L7 A closure captures whole variables (D10.1, Rust 2018's rule):
+  `move || nn.v` captures `nn`, not the field, so a use of `nn.w` while
+  the closure is live conflicts; Rust 2021's disjoint-field capture is
+  0.29's.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
@@ -1019,9 +1053,9 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | code | fires (rule) | rustc | `try:` |
 |---|---|---|---|
 | `borrowck.mut_twice` | D2.5: `Reserve`/`Activate`/`WB` vs a `mut` loan | E0499 | none mechanical; the help names both borrows |
-| `borrowck.conflict` | D2.5: `Activate`/`WB` vs a `shared` loan | E0502 | `let n = v.len(); v.push(n)` when the shared loan is an argument of the same call (the own pass's `for_push`-style try, reused) |
-| `borrowck.use_borrowed` | D2.5: `Read` vs a `mut` loan | E0503 | none |
-| `borrowck.assign_borrowed` | D2.5: `WA` vs any loan | E0506 | shadowing (`let r = &b;`) when the assigned place is the loan's holder in D2.4a's `r = &a; r = &b` shape; else none |
+| `borrowck.conflict` | D2.5: `Activate`/`WB` vs a `shared` loan; `RB` vs a `mut` loan | E0502 | `let n = v.len(); v.push(n)` when the shared loan is an argument of the same call (the own pass's `for_push`-style try, reused) |
+| `borrowck.use_borrowed` | D2.5: `RC` vs a `mut` loan | E0503 | none |
+| `borrowck.assign_borrowed` | D2.5: `WA` vs any loan | E0506 | shadowing (`let r = &b;`) when the loan's holder is reassigned on the path that keeps the loan in scope (D2.4a's conditional and loop shapes); else none |
 | `borrowck.move_borrowed` | D2.5: `WM` vs any loan | E0505 | `.clone()` when `T: Clone` (as `own.moved`'s) |
 | `borrowck.dropped_borrowed` | D2.5: `WD` vs a loan; D9.2 | E0597, E0713 | "declare `x` before `v`" when both are locals of one block (the reorder is mechanical: `fix` moves the `let`) |
 | `borrowck.return_local` | D6.2.2 | E0515 | none; the help suggests returning an owned value |
@@ -1032,8 +1066,8 @@ where a `try:` is named, a case in `tests/borrowck-try/NAME/main.vl`
 | `borrowck.assign_moved_part` | M2 | E0381 | none |
 | `borrowck.move_out` | M3 | E0507, E0508 | `.clone()`, or `&` the place (as `own.move_out`'s) |
 | `borrowck.move_from_drop` | M4 | E0509 | none; the help names `mem::take`/`Option::take` |
-| `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0596 | none; the help says to write after the match |
-| `borrowck.static_mut_ref` | D6.2.5 (ir271) | E0796 | `&raw mut S` |
+| `borrowck.guard_write` | D2.5 vs a `fake` loan; L6 | E0510, E0594 | none; the help says to write after the match |
+| `borrowck.static_mut_ref` | D6.2.5 (ir271) | the `static_mut_refs` lint (no E-code in 1.98) | `&raw mut S` |
 | `borrowck.unchecked` (warning) | D10.4 only | — | kept from 0.27.0; the message names the closure |
 
 Seventeen codes. The rustc column is the twin's map
