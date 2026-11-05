@@ -1,0 +1,443 @@
+// (0.27.1) Constraint generation (docs/design/borrowck.md D3.3-D3.6): one
+// pass over the statements after elaboration, each emitting outlives
+// edges `'a : 'b` (mod.vl edge) between the slots of the places it moves
+// a reference between, by variance (D3.5), and the supporting-prefix
+// constraints of a borrow (D3.6). The slot layout is regions.vl's of
+// v0.27.0 (slots_of mirrors references_in): a reference, a view, a
+// tuple's elements, an array's element; a struct's, an enum's and a
+// closure's regions are ir271 M1's, and this file's walks say where they
+// enter. A call's regions are its one RO_CALL variable (ir271 M1 makes
+// them one per callee region): until then every argument slot outlives
+// it and it outlives every result slot. `TK_RETURN`'s constraint waits
+// for the signature's universals (ir271 M1).
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, type_elem};
+use crate::places::borrowck::{
+    Bck, MODE_MUT, MODE_RAW, MODE_SHARED, RO_REBORROW, VAR_BI, VAR_CO, VAR_CONTRA, VAR_IN, edge,
+    new_region,
+};
+use crate::places::ir::{
+    AK_ARRAY, AK_TUPLE, BK_RAW, BK_SHARED, Body, OK_COPY, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX,
+    PJ_UNION, PJ_VARIANT, RV_AGG, RV_CAST, RV_REF, RV_REPEAT, RV_SLICE, RV_USE, SK_ASSIGN, SK_CALL,
+    SK_INTRINSIC, local_ty, op_a, op_b, op_is_place, op_kind, proj_kind, proj_parent, proj_val,
+    step_type, undistinct,
+};
+
+// RULE: D3.6
+pub fn generate(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    for loc in 0..bck.nloc {
+        let st = pbody.stmts[loc];
+        if st.kind == SK_ASSIGN {
+            assign(loc, &bck, pbody, &pcx);
+        } else if st.kind == SK_CALL || st.kind == SK_INTRINSIC {
+            call(loc, &bck, pbody, &pcx);
+        }
+    }
+}
+
+// The slots of type t (D3.3), as regions.vl's references_in counts them
+// at v0.27.0: a reference, a view (`[T]`, `str`), and those in what they
+// point to, in a tuple's elements, in an array's element.
+pub fn slots_of(t0: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = undistinct(t0, pcx);
+    if t <= 0 {
+        return 0;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        let b = pcx.types[t].b;
+        if b != REF_SHARED && b != REF_MUT {
+            return 0;
+        }
+        return 1 + slots_of(pcx.types[t].a, pcx);
+    }
+    if k == TyKind::Slice {
+        return 1 + slots_of(pcx.types[t].a, pcx);
+    }
+    if k == TyKind::Array {
+        return slots_of(pcx.types[t].a, pcx);
+    }
+    if k == TyKind::Tuple {
+        var n = 0;
+        for i in 0..pcx.types[t].count {
+            n += slots_of(type_elem(t, i, pcx), pcx);
+        }
+        return n;
+    }
+    0
+}
+
+// The variances of t's slots (D5.2, D5.4), pushed to vscratch in slot
+// order, each under context c (xform, D5.1).
+fn vars_of(t0: i64, c: i64, bck: inout Bck<Comp>, pcx: Ctx<Comp>) {
+    let t = undistinct(t0, pcx);
+    if t <= 0 {
+        return;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr {
+        let b = pcx.types[t].b;
+        if b != REF_SHARED && b != REF_MUT {
+            return;
+        }
+        bck.vscratch.push(c);
+        vars_of(pcx.types[t].a, if b == REF_MUT { xform(c, VAR_IN) } else { c }, &bck, pcx);
+    } else if k == TyKind::Slice {
+        bck.vscratch.push(c);
+        vars_of(pcx.types[t].a, if pcx.types[t].b == REF_MUT { xform(c, VAR_IN) } else { c }, &bck,
+            pcx);
+    } else if k == TyKind::Array {
+        vars_of(pcx.types[t].a, c, &bck, pcx);
+    } else if k == TyKind::Tuple {
+        for i in 0..pcx.types[t].count {
+            vars_of(type_elem(t, i, pcx), c, &bck, pcx);
+        }
+    }
+}
+
+// RULE: D5.1
+fn xform(c: i64, w: i64) -> i64 {
+    if c == VAR_CO {
+        return w;
+    }
+    if c == VAR_BI || w == VAR_BI {
+        return VAR_BI;
+    }
+    if c == VAR_IN {
+        return VAR_IN;
+    }
+    // contravariant: flipped
+    if w == VAR_CO { VAR_CONTRA } else if w == VAR_CONTRA { VAR_CO } else { VAR_IN }
+}
+
+// The projection list p, root-first, in pscratch.
+fn proj_list(p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>) {
+    bck.pscratch.clear();
+    var q = p;
+    while q > 0 {
+        bck.pscratch.push(q);
+        q = proj_parent(q, pbody);
+    }
+    // (leaf-first pushed: reversed in place)
+    let n = bck.pscratch.len() as i64;
+    for i in 0..n / 2 {
+        let a = bck.pscratch[i];
+        bck.pscratch[i] = bck.pscratch[n - 1 - i];
+        bck.pscratch[n - 1 - i] = a;
+    }
+}
+
+// The pointee mode of a deref-like step on a place of type t (D1.2).
+fn mode_of(t0: i64, pcx: Ctx<Comp>) -> i64 {
+    let t = undistinct(t0, pcx);
+    if t <= 0 {
+        return MODE_RAW;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr || k == TyKind::Slice {
+        let b = pcx.types[t].b;
+        if b == REF_MUT {
+            return MODE_MUT;
+        }
+        if b == REF_SHARED || k == TyKind::Slice {
+            return MODE_SHARED;
+        }
+    }
+    MODE_RAW
+}
+
+// The place (l, p) walked root-first (D3.3's place regions, D1.2's
+// deref-like steps): w_first and w_count its slot range in l's
+// variables, w_type its type; steps the deref-like steps passed (region,
+// mode; a raw step's region 0), and supports the supporting prefixes'
+// regions (D1.3: through the mutable steps, up to and including the
+// last shared one, none through a raw one). A step the layout has no
+// slots for (a struct's field, a variant, a union, a raw pointer) ends
+// the range: count 0.
+// RULE: D1.2, D1.3, D3.3
+pub fn walk_place(l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    proj_list(p, &bck, pbody);
+    bck.steps.clear();
+    bck.supports.clear();
+    var t = local_ty(l, pbody);
+    var off = 0;
+    var dead = false;
+    let n = bck.pscratch.len() as i64;
+    for i in 0..n {
+        let q = bck.pscratch[i];
+        let k = proj_kind(q, pbody);
+        let v = proj_val(q, pbody);
+        let tu = undistinct(t, pcx);
+        let tk = if tu > 0 { pcx.types[tu].kind } else { TyKind::None };
+        if k == PJ_DEREF {
+            let m = mode_of(t, pcx);
+            if m == MODE_RAW || dead {
+                bck.steps.push(0);
+                bck.steps.push(MODE_RAW);
+                dead = true;
+            } else {
+                bck.steps.push(bck.first[l] + off);
+                bck.steps.push(m);
+                off += 1;
+            }
+        } else if k == PJ_INDEX || k == PJ_CONST {
+            if tk == TyKind::Slice && !dead {
+                // (D1.4: a deref through the view's slot)
+                bck.steps.push(bck.first[l] + off);
+                bck.steps.push(mode_of(t, pcx));
+                off += 1;
+            } else if tk == TyKind::Array {
+                // (the element's slots are the array's)
+            } else {
+                bck.steps.push(0);
+                bck.steps.push(MODE_RAW);
+                dead = true;
+            }
+        } else if k == PJ_FIELD {
+            if tk == TyKind::Tuple && !dead {
+                for j in 0..v {
+                    off += slots_of(type_elem(tu, j, pcx), pcx);
+                }
+            } else {
+                // (a struct's field, a slice's part: ir271 M1's slots)
+                dead = true;
+            }
+        } else if k == PJ_VARIANT || k == PJ_UNION {
+            dead = true;
+        }
+        t = step_type(t, k, v, &pcx);
+        if t <= 0 {
+            dead = true;
+        }
+    }
+    bck.w_first = bck.first[l] + off;
+    bck.w_count = if dead || bck.first[l] == 0 { 0 } else { slots_of(t, pcx) };
+    bck.w_type = t;
+    // The supporting prefixes: from the leaf back, through MODE_MUT,
+    // stopping at the first MODE_SHARED (included) or MODE_RAW (not).
+    var i = bck.steps.len() as i64 - 2;
+    while i >= 0 {
+        let r = bck.steps[i];
+        let m = bck.steps[i + 1];
+        if m == MODE_RAW {
+            break;
+        }
+        bck.supports.push(r);
+        if m == MODE_SHARED {
+            break;
+        }
+        i -= 2;
+    }
+}
+
+// Whether place (l, p) has a deref-like projection (D1.2).
+pub fn deref_like_in(l: i64, p: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) -> bool {
+    walk_place(l, p, &bck, pbody, &pcx);
+    bck.steps.len() > 0
+}
+
+// sub(src ≤ dst) over n slots (D3.5): src's slots from s_first, dst's
+// from d_first, with the variances of src's type t under context c.
+fn sub_range(s_first: i64, d_first: i64, n: i64, t: i64, c: i64, loc: i64, bck: inout Bck<Comp>,
+    pcx: Ctx<Comp>) {
+    bck.vscratch.clear();
+    vars_of(t, c, &bck, pcx);
+    for i in 0..n {
+        let v = if i < bck.vscratch.len() as i64 { bck.vscratch[i] } else { VAR_CO };
+        if v == VAR_CO || v == VAR_IN {
+            edge(s_first + i, d_first + i, loc, &bck);
+        }
+        if v == VAR_CONTRA || v == VAR_IN {
+            edge(d_first + i, s_first + i, loc, &bck);
+        }
+    }
+}
+
+fn min(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+// Whether the place is a whole exclusive reference (D3.6's reborrow
+// reading applies to a `copy` of it).
+fn is_mut_ref(t0: i64, pcx: Ctx<Comp>) -> bool {
+    let t = undistinct(t0, pcx);
+    t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == REF_MUT
+}
+
+// The reborrow `&'new mut (*Q)` read into a `copy Q` of a `&mut` Q at
+// loc (D3.6): a fresh region with `'q : 'new` and Q's supporting
+// prefixes; walk_place(Q) has run. Returns 'new.
+// RULE: D3.6
+fn reborrow(loc: i64, bck: inout Bck<Comp>) -> i64 {
+    let r = new_region(RO_REBORROW, loc, &bck);
+    edge(bck.w_first, r, loc, &bck);
+    for i in 0..bck.supports.len() as i64 {
+        edge(bck.supports[i], r, loc, &bck);
+    }
+    r
+}
+
+fn assign(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let st = pbody.stmts[loc];
+    let rv = st.c;
+    if rv == RV_REF {
+        if st.d == BK_RAW {
+            // RULE: R1 (no loan, no constraint)
+            return;
+        }
+        let r = st.e;
+        let l = op_a(st.ops, 0, pbody);
+        let p = op_b(st.ops, 0, pbody);
+        bck.loans.push(loc);
+        bck.loans.push(r);
+        bck.loans.push(st.d);
+        bck.loans.push(l);
+        bck.loans.push(p);
+        walk_place(l, p, &bck, pbody, &pcx);
+        let p_first = bck.w_first;
+        let p_count = bck.w_count;
+        let p_type = bck.w_type;
+        // RULE: D3.6 (the supporting-prefix rule)
+        for i in 0..bck.supports.len() as i64 {
+            edge(bck.supports[i], r, loc, &bck);
+        }
+        walk_place(st.a, st.b, &bck, pbody, &pcx);
+        if bck.w_count >= 1 {
+            edge(r, bck.w_first, loc, &bck);
+            sub_range(p_first, bck.w_first + 1, min(p_count, bck.w_count - 1), p_type,
+                if st.d == BK_SHARED { VAR_CO } else { VAR_IN }, loc, &bck, pcx);
+        }
+        return;
+    }
+    if rv == RV_SLICE {
+        // (as a borrow of the base's elements, D1.4's view step included)
+        let r = st.e;
+        let l = op_a(st.ops, 0, pbody);
+        let p = op_b(st.ops, 0, pbody);
+        walk_place(l, p, &bck, pbody, &pcx);
+        let bt = undistinct(bck.w_type, pcx);
+        var e_first = bck.w_first;
+        var e_count = bck.w_count;
+        var e_type = 0;
+        if bt > 0 && pcx.types[bt].kind == TyKind::Slice && e_count > 0 {
+            bck.supports.push(e_first);
+            e_first += 1;
+            e_count -= 1;
+            e_type = pcx.types[bt].a;
+        } else if bt > 0 && pcx.types[bt].kind == TyKind::Array {
+            e_type = pcx.types[bt].a;
+        } else {
+            e_count = 0;
+        }
+        bck.loans.push(loc);
+        bck.loans.push(r);
+        bck.loans.push(BK_SHARED);
+        bck.loans.push(l);
+        bck.loans.push(p);
+        for i in 0..bck.supports.len() as i64 {
+            edge(bck.supports[i], r, loc, &bck);
+        }
+        walk_place(st.a, st.b, &bck, pbody, &pcx);
+        if bck.w_count >= 1 {
+            edge(r, bck.w_first, loc, &bck);
+            let dt = undistinct(bck.w_type, pcx);
+            let c = if dt > 0 && pcx.types[dt].b == REF_MUT { VAR_IN } else { VAR_CO };
+            sub_range(e_first, bck.w_first + 1, min(e_count, bck.w_count - 1), e_type, c, loc, &bck,
+                pcx);
+        }
+        return;
+    }
+    if rv == RV_USE || rv == RV_CAST || rv == RV_REPEAT {
+        if !op_is_place(op_kind(st.ops, 0, pbody)) {
+            return;
+        }
+        let l = op_a(st.ops, 0, pbody);
+        let p = op_b(st.ops, 0, pbody);
+        walk_place(l, p, &bck, pbody, &pcx);
+        let s_first = bck.w_first;
+        let s_count = bck.w_count;
+        let s_type = bck.w_type;
+        if rv == RV_USE && op_kind(st.ops, 0, pbody) == OK_COPY && is_mut_ref(s_type, pcx) {
+            // RULE: D3.6 (the reborrow reading, the stopgap for Q4)
+            let r = reborrow(loc, &bck);
+            walk_place(st.a, st.b, &bck, pbody, &pcx);
+            if bck.w_count >= 1 {
+                edge(r, bck.w_first, loc, &bck);
+                sub_range(s_first + 1, bck.w_first + 1, min(s_count - 1, bck.w_count - 1),
+                    pcx.types[undistinct(s_type, pcx)].a, VAR_IN, loc, &bck, pcx);
+            }
+            return;
+        }
+        if rv == RV_CAST {
+            // (a reference cast to a reference keeps its regions; to a raw
+            // pointer: none, R1)
+            let dt = undistinct(st.d, pcx);
+            if dt <= 0 || pcx.types[dt].kind != TyKind::Ptr || pcx.types[dt].b == 0 {
+                return;
+            }
+        }
+        walk_place(st.a, st.b, &bck, pbody, &pcx);
+        sub_range(s_first, bck.w_first, min(s_count, bck.w_count), s_type, VAR_CO, loc, &bck, pcx);
+        return;
+    }
+    if rv == RV_AGG {
+        if st.d != AK_TUPLE && st.d != AK_ARRAY {
+            // (a struct, a variant, a closure: their slots are ir271 M1's)
+            return;
+        }
+        walk_place(st.a, st.b, &bck, pbody, &pcx);
+        let d_first = bck.w_first;
+        let d_count = bck.w_count;
+        let d_type = undistinct(bck.w_type, pcx);
+        if d_count == 0 || d_type <= 0 {
+            return;
+        }
+        var off = 0;
+        for i in 0..st.nops {
+            let et = if st.d == AK_TUPLE { type_elem(d_type, i, pcx) } else { pcx.types[d_type].a };
+            if op_is_place(op_kind(st.ops, i, pbody)) {
+                walk_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), &bck, pbody, &pcx);
+                sub_range(bck.w_first, d_first + off, min(bck.w_count, d_count - off), bck.w_type,
+                    VAR_CO, loc, &bck, pcx);
+            }
+            if st.d == AK_TUPLE {
+                off += slots_of(et, pcx);
+            }
+        }
+    }
+}
+
+// RULE: D3.6 (a call: M1's stopgap, every argument slot outlives the
+// call's region, which outlives every result slot)
+fn call(loc: i64, bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let st = pbody.stmts[loc];
+    let c = bck.call_region[loc];
+    for i in 0..st.nops {
+        if !op_is_place(op_kind(st.ops, i, pbody)) {
+            continue;
+        }
+        walk_place(op_a(st.ops, i, pbody), op_b(st.ops, i, pbody), &bck, pbody, &pcx);
+        let a_first = bck.w_first;
+        let a_count = bck.w_count;
+        if op_kind(st.ops, i, pbody) == OK_COPY && is_mut_ref(bck.w_type, pcx) && a_count >= 1 {
+            // (a `&mut` passed on: reborrowed for the call, D3.6)
+            let r = reborrow(loc, &bck);
+            edge(r, c, loc, &bck);
+            for j in 1..a_count {
+                edge(a_first + j, c, loc, &bck);
+            }
+            continue;
+        }
+        for j in 0..a_count {
+            edge(a_first + j, c, loc, &bck);
+        }
+    }
+    if st.a >= 0 {
+        walk_place(st.a, st.b, &bck, pbody, &pcx);
+        for j in 0..bck.w_count {
+            edge(c, bck.w_first + j, loc, &bck);
+        }
+    }
+}
