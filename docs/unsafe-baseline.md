@@ -6,7 +6,7 @@ of the compiler and of std, made by `tests/unsafe_audit.sh -u` from
     volec query unsafe --summary --no-std     # compiler/src (the tree's root)
     volec query unsafe --summary std          # std
 
-on Darwin arm64, 0a003326. The gate's unsafe-audit row
+on Darwin arm64, 19920a23. The gate's unsafe-audit row
 (bootstrap/gate.sh, tests/unsafe_audit.sh) fails when either count of
 unjustified sites (without `// UNSAFE:` and `// SAFETY:` right above them,
 AGENTS.md) rises above its line below; a lower count asks for this file
@@ -14,28 +14,28 @@ to be made again. The classes and the comments' rule: `volec query unsafe
 --help`, docs/query.md; `unneeded`: unsafe blocks with nothing unsafe
 inside (statics are safe), removable as they are.
 
-baseline compiler/src unjustified: 2776
+baseline compiler/src unjustified: 2775
 baseline std unjustified: 0
 
 ## compiler/src
 
 ```
-sites: 3105 (3055 blocks, 8 unsafe fns, 42 extern blocks); unjustified: 2776; unneeded: 167
+sites: 3111 (3060 blocks, 8 unsafe fns, 43 extern blocks); unjustified: 2775; unneeded: 170
 
 class	sites	unjustified
-raw-pointer	2130	2020
-ffi	313	291
+raw-pointer	2129	2019
+ffi	316	291
 static-mut	235	219
-other	176	8
+other	179	8
 alloc	135	130
-transmute/cast	116	108
+transmute/cast	117	108
 
 module	sites	unjustified
-crate::tools	848	757
-crate::front	816	715
+crate::tools	847	756
+crate::front	822	715
 crate::middle	688	625
 crate::back	524	514
-crate::base	97	82
+crate::base	98	82
 crate::arch	47	47
 crate::gen0	40	24
 crate::places	31	0
@@ -53,7 +53,7 @@ compiler/src/middle/inline.vl	36	36
 compiler/src/front/own/views.vl	35	35
 compiler/src/middle/loops.vl	33	33
 compiler/src/back/objfile/mod.vl	32	32
-compiler/src/base/diag.vl	31	28
+compiler/src/base/diag.vl	32	28
 compiler/src/middle/ir/mod.vl	30	30
 compiler/src/back/regalloc/intervals.vl	29	29
 compiler/src/back/objfile/output.vl	27	26
@@ -64,12 +64,12 @@ compiler/src/front/types.vl	26	22
 compiler/src/front/own/fast.vl	25	19
 compiler/src/tools/proc.vl	24	19
 compiler/src/tools/query/cache.vl	24	23
-(334 more; --all lists every one)
+(336 more; --all lists every one)
 
 justification	sites	unjustified
-missing both	2776	2776
-justified	329	0
-try: /Users/magniff/workspace/vole/.claude/worktrees/left270b/target/volec fix --only unneeded-unsafe
+missing both	2775	2775
+justified	336	0
+try: /Users/magniff/workspace/vole/.claude/worktrees/left270/target/volec fix --only unneeded-unsafe
 ```
 
 ## std
@@ -132,5 +132,5 @@ compiler/std/window/objc.vl	13	0
 
 justification	sites	unjustified
 justified	913	0
-try: /Users/magniff/workspace/vole/.claude/worktrees/left270b/target/volec fix --only unneeded-unsafe
+try: /Users/magniff/workspace/vole/.claude/worktrees/left270/target/volec fix --only unneeded-unsafe
 ```
