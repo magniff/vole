@@ -139,6 +139,18 @@ The statics into context structs, phases 4-6 (statics265):
   fields as it does statics, `base::ctx::Ctx.FIELD` in its lists. A let
   `Ctx` is lent by address, never copied. Statics in compiler/src: 294 to
   190 (16 constants, 1 C-facing).
+- Phase 6, the alloc exemption narrowed: no struct of compiler/src holds
+  `Comp` unnamed and no static holds an allocator, but for `base::SYMS`
+  and `front::types::TYPES`, the two the exemption still names
+  (front/check/alloc_rules.vl, each with its reason: code generation's
+  tasks reach `intern` and `make_type`, which add to them, so they wait
+  for 0.27's split of a read-only lookup from the writing code). The
+  WGSL checks' arena is `WgslCx<Arena>`, made by main and passed to
+  `check_block` as `wgx` (`tools/statics/wgsl-ctx.group`, 71 functions);
+  `buf_fmt` and the tasks' `cx_fmt` format into a String of their own,
+  so `FMT_SCRATCH` and `FnCtx.fmt` are gone; the format checker's
+  `Parsed` is `Parsed<A>`. Statics in compiler/src: 190 to 188;
+  unjustified unsafe 3,063 to 3,057.
 
 ### What's new in 0.26.4
 

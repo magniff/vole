@@ -76,3 +76,21 @@ each with a case in tests/refactor/statics0265.t. P4: 772 statics into
 9. [tool] tests/threads_writes.sh matches by name: a field's line `pcx.f`
    matches a method or `&` of another place's field of the same name on
    that line too (over-reports, never misses).
+10. [tool] `fix --only statics` takes a method call on a static as a
+   write (`WGSL_ARENA.scope(..)`, scope takes `self` let): the arena's
+   context went inout to 71 functions where let would do.
+11. [lang] A struct holding an allocator must name it in its parameters,
+   so the compilation context cannot hold the WGSL arena (or main's Gpa)
+   without a second parameter on every `Ctx<Comp>`: the arena got its
+   own context, threaded beside `pcx`.
+12. [tool] rawptr's nested-call parameters after P6: 142, every one a
+   task's `cx: *FnCtx` in middle and back (`ir_make(cx, ir_val(cx, ..))`),
+   none the compilation context, so passing `pcx` down changed none, and
+   `fix --only rawptr` finds nothing to do. Making them inout needs the
+   inner call taken into a let at each nesting call (as `fix --only
+   statics` hoists a receiver's argument): a hoist in `fix --only rawptr`.
+13. [tool] `refactor table` makes a static `Vec<T, Comp>`, which the
+   narrowed exemption refuses (tests/refactor/table254.t records the
+   refusal): it needs to take a context's field (`pcx.x: *T` with
+   `pcx.x_count`), where every raw table of compiler/src is now, to
+   remove the unsafe their indexing needs.

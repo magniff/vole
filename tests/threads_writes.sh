@@ -124,14 +124,12 @@ base::timer::T_TOTALS	--time-passes, which runs on one thread (timer_add writes 
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)
 base::BUF_CAP	buf_new, below
 base::BUF_COUNT	buf_new: the printers of --stats, --print-regalloc, --print-after-all, --verify-* (one thread), and internal errors, which exit
-base::FMT_SCRATCH	buf_fmt: the same, and -g (tasks format with cx_fmt)
 base::diag::ERR_POISONED	the IR printers (one thread)'
 
 # The join's writes that task code touches: static <TAB> why it is no race
 JOINED='base::BUFS	the join writes the program'"'"'s buffers'"'"' entries, a task its context'"'"'s
 middle::parallel::FN_CONSTS	the join numbers the joined function'"'"'s constants, which no running task reads
 middle::parallel::FN_TEXT	the join takes the joined function'"'"'s text, its task done
-base::FMT_SCRATCH	asm_error (an internal error, which exits) and -g (one thread)
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
 base::SYMS	the -g directives (dwarf_file: one thread)
@@ -145,7 +143,6 @@ base::timer::T_TOTALS	--time-passes, which runs on one thread'
 ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file (-g, which does not stream: no thread)
 base::BUF_CAP	the same
 base::BUF_COUNT	the same
-base::FMT_SCRATCH	the same
 base::SYMS	dwarf_file (-g: no thread)
 base::SYM_TABLE	the same
 base::SYM_TABLES	the same
@@ -220,7 +217,6 @@ base::BUF_CAP	own: buf_new on internal errors and printers
 base::BUF_COUNT	own: the same
 base::CWD	off: -g (out_path)
 base::ctx::Ctx.files	off: -g (dbg_loc, out_path)
-base::FMT_SCRATCH	off: printers and -g
 base::OUT_PATHS	off: -g
 base::ROOT_DIR	off: -g
 base::ROOT_LEX	off: -g
