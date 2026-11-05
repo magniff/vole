@@ -238,10 +238,11 @@ loan (the one step (2) excludes) nor the `ℓ'` of an `Activate ℓ'`:
    field, a constant or variable index on an array, a variant, a union
    field) → *overlap* at any depth (a write to `Q` overwrites `P`).
 3. `r ∈ {Equal, PrefixOf}` → *overlap*.
-4. For a `fake` loan (D2.6), *overlap* is narrowed: it holds only when
-   `kind ∈ {WA, WM, WB, WD}` and the projections between `Q` and `P`
-   (either way) contain no deref-like projection; otherwise no
-   conflict (R10).
+4. For a `fake` loan (D2.6) *overlap* is *shallow*: it holds only when
+   `kind ∈ {WA, WM, WB, WD}` and `r = Equal`, or `r = Extends` (`Q` a
+   strict prefix of `P`) with no deref-like projection between `Q` and
+   `P`; a write to a sub-place of `P` (`r = PrefixOf`), a read or a
+   borrow never conflicts with it (R10).
 5. On *overlap*, by the access kind and the loan's class (D2.1):
 
 | access | `S` | `M` |
@@ -283,8 +284,13 @@ the builder emits `_t = &'f fake S` (`RV_REF` with `d = BK_FAKE = 5`)
 for the scrutinee place `S` and for every place a pattern tests (the
 `discriminant P` places and the constant-compared places), and a
 `mention _t` at the entry of every arm body; `_t` is `StorageDead`
-after the match. A fake loan has class `S`, kind `fake`, the narrowed
-overlap of D2.5 step 4; it never conflicts with a read or a borrow. The
+after the match. A fake loan has class `S`, kind `fake` and the shallow
+overlap of D2.5 step 4: it conflicts only with a write to its own place
+or to a prefix of it with no deref-like step between, never with a
+write to a sub-place, a read or a borrow. So `match x { (a, _) if {
+x.1 = 5; true } => .. }` is accepted (only `x` is faked: no pattern
+tests `x.1`) and `match x { (1, _) if { x.0 = 2; true } => .. }` is
+rejected (`x.0` is tested, so it has a fake of its own), as rustc. The
 `mention` keeps `'f` live through every guard (D3.7); the loan leaves
 scope after the arm body's entry (`_t` is no longer live; the arm's
 bindings are made after it). Guard bindings: a by-value binding stays a
@@ -292,9 +298,7 @@ borrowed copy (reads only); a `ref mut y` binding is given to the guard
 as `&T` (a shared reborrow), so a write through it in the guard is a
 `WB`/`WA` through a shared reference and is `borrowck.guard_write` (L6;
 *inferred*: no corpus case has `ref mut` with a guard; ir271 confirms
-`bind_pattern(.., true)`'s shape for it). The scrutinee's own fake loan
-makes a guard's write to an untested sub-place of `S` a conflict too
-(L7).
+`bind_pattern(.., true)`'s shape for it).
 
 ## 3. Regions (S3)
 
@@ -616,10 +620,19 @@ project's rule: every error of a compilation), deduped by §14.3.
    `drop` of `root(P)`, or the implicit exit access of a parameter: a
    by-value parameter returned by reference is caught only by that
    rule). Such a conflict exists whenever D6.2.2 applies and `ℓ` is not
-   killed: `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u) ⊇ Pts`, so `ℓ` is in
-   scope at every point reachable from its creation, including the
-   `WD` of its root; if it is killed on a path, the reference was
-   overwritten there and nothing escapes on that path. A loan that is
+   killed, by the lemma: **(premise) every frame-owned root has a `WD`
+   access on every exit path** — an explicit `StorageDead` or `drop`
+   for every non-parameter local (the builder's `all_storage`, verified
+   on `return` inside `for`, on `?`'s `None` path and on the normal
+   path) and the implicit exit access of D2.2 for a parameter — and
+   `'ℓ : .. : 'u` gives `val('ℓ) ⊇ val('u) ⊇ Pts`, so `ℓ` is in scope
+   at every point reachable from its creation, including that `WD`; if
+   `ℓ` is killed on a path, the reference was overwritten there and
+   nothing escapes on that path. The premise is a checked invariant:
+   `--verify-places` on a rust-edition body reports a non-parameter
+   local (other than `_0`) with a path from its `StorageLive` to a
+   `return` that has no `StorageDead` of it (bc271 M2 adds the check;
+   its count on the corpus is 0). A loan that is
    not frame-owned (`&*x`, `&x.f`, `&s[i]` through `x: &'a T`, `s:
    &'a [T]`) carries `'a : 'ℓ` (supporting prefix), so `fn f(x: &T) ->
    &T { &*x }` yields `'a : 'ℓ : '0 : 'ret = 'a`: no `end` beyond
@@ -940,10 +953,6 @@ outside the holes named below.
 - L5 Opaque (`impl Trait`) regions invariant (0.27.2).
 - L6 A guard's `ref mut` binding is read-only in the guard (as rustc:
   E0596 in guards; here `borrowck.guard_write`).
-- L7 A guard's write to a sub-place of the scrutinee that no pattern
-  tests conflicts with the scrutinee's fake loan (D2.6); rustc fakes
-  only tested places and their prefixes, so it accepts `match x { (a,
-  _) if { x.1 = 2; true } => .. }`.
 
 ## 12. The MVS std boundary (S12, 0.27.1 only)
 
@@ -994,6 +1003,7 @@ call).
 | 10 | `BK_FAKE = 5`, the guard's fake loans and mentions; `ref mut` guard bindings as `&T` | D2.6 | ir271 M2 |
 | 11 | `borrowck.static_mut_ref` at the front | D6.2.5 | ir271 M2 |
 | 12 | `T_BORROWCK = 25`, `T_COUNT = 26` in `base/timer.vl` | §15 | bc271 M1 |
+| 13 | `--verify-places`: every non-parameter local has a `StorageDead` on every exit path (D6.2.2's premise); "copy of an exclusive reference" after row 9 | D6.2.2, D3.6 | bc271 M2 |
 
 Not needed: `TK_FALSE_EDGE` (verified), an unwind edge (panics exit).
 
@@ -1086,7 +1096,81 @@ mid point alone. Universals print as `'a`, `'_1` (elided, by
 parameter), `'static`; `end('a)` as written. The format is extensible
 with a `reach` section for 0.27.4.
 
-## 17. Implementation notes (non-normative)
+## 17. Contracts in the rust edition
+
+`requires`/`ensures` compile and run in the rust edition; the
+expansion (`front/contracts/expand.vl`: `expand_contracts`, `make_pre`,
+`make_body`, `replace_olds`; `front/contracts/desugar.vl`:
+`desugar_call`) happens on the AST before the names are collected, so
+the clauses reach the places IR as ordinary statements of ordinary
+bodies. Verified shapes (v0.27.0, `--emit-places` on a rust-edition
+file):
+
+- `requires` becomes a companion `fn f$pre(?site: i64, <params>) {
+  check }` whose body is `_3 = copy _2 >= const 0; switch` and, on
+  failure, `intrinsic contract_check(..)` then `unreachable`. It is
+  called at every call site before the call, on bit copies of the
+  arguments: `_6 = copy _2; _4 = call take$pre(const 2, copy _6); _5 =
+  call take(move _2)` (the `requires_call` block `{ let ?a0 = arg; .. }`
+  is transparent, places-ir.md §3.7).
+- `ensures` moves `f`'s body to `fn f$body(<params>)` and makes `f`'s
+  body `{ let ?oldN = e; ..; let result = f$body(<params>); check;
+  result }`: `_2 = copy _1` (the `old(x)`), `_3 = call half$body(copy
+  _1)`, `_4 = copy _3 <= copy _2`, `switch`, `_0 = copy _3` or
+  `contract_check` then `unreachable`.
+
+**D17.1 (the rules apply as they are).** `f$pre`, `f` (the wrapper) and
+`f$body` are three bodies, each checked by §1-§12 with no special case.
+A clause's accesses are those of its statements: `Read` (`OK_COPY`) of
+the places the condition names, at the points of the check's
+statements — in `f$pre` at the start of its body, in the wrapper after
+the `f$body` call and before the return; the `contract_check`
+intrinsic reads its operands; a clause that borrows (`v.len()`:
+`&'r _1` then a call) makes a loan like body code. At a call site the
+`f$pre` call reads each argument place before the call moves or
+reborrows it: a `copy` of a `&mut` argument for `f$pre` is D3.6's
+reborrow, ending at the `f$pre` call (its parameter's region is a call
+region related only through that argument); a by-value argument is a
+bit copy into a borrowed temporary for `f$pre` (reads only) and then
+moved by the call, so no M1 fact arises from the copy.
+
+**D17.2 (`old(e)`).** `old(e)` is `let ?oldN = e;` at the wrapper's
+entry, before the `f$body` call: `e` is evaluated as any initializer
+(a copy of a `Copy` value, a move of a non-`Copy` one, a loan if it
+borrows), and its value is held in `?oldN` across the body call until
+the check. So `old(x)` of a scalar is a copy and creates no loan;
+`old(v)` of a non-`Copy` `v` moves `v` before `f$body(move v)` and is
+`borrowck.use_moved` (M1); `old(&x)` or `old(v.as_slice())` is a loan
+whose region reaches the check, so it is in scope at the `f$body` call
+and conflicts with a `move` of the place (`WM`, `move_borrowed`) or
+with the implicit `&mut` reborrow of it (`WB` vs a `shared` loan,
+`conflict`): the right verdict, since the promise would compare a
+stale referent. A clause with a `Copy` `old(e)` is what the rules
+accept with no loan involved.
+
+**D17.3 (`ensures` on a `&mut` parameter's referent).** For `v: &mut
+T` the wrapper passes `copy _v` to `f$body`, read as the reborrow
+`&'new mut (*_v)` (D3.6) with `'v : 'new`; `'new` is live only to the
+call (the temporary is not used after it), so after `f$body` returns no
+loan of `*_v` is in scope and the check's `Read` of `*_v` (`*v ==
+old(*v) + *n`) meets nothing; `old(*v)` reads `*_v` at entry before
+the reborrow. So an `ensures` may say anything readable about `*v` at
+exit, and a clause may hold a reference into `*v` across the body only
+by the same loan rules (D17.2). The companion bodies share the
+template's universals and dedupe key (D4.4): an error in a clause is
+reported at the clause's position in the template.
+
+**Finding (front, outside this spec).** A rust-edition function with a
+clause and a `&T`/`&mut T` parameter does not check today: contracts
+generate a property test for every contracted function and the
+generator has no case for a pointer type (`error test.generate`, "no
+generator for '&i64' (a pointer)"); MVS's `let T` of a compound type
+has one. Until the generator reads `&T`/`&mut T` as `let`/`inout` in
+the rust edition, D17.3's cases cannot be written; corpus271 writes
+D17.1 and D17.2 on by-value parameters and D17.3 marked XFAIL on the
+front.
+
+## 18. Implementation notes (non-normative)
 
 `compiler/src/places/borrowck/`: `mod.vl` (the driver: per body, gated
 by `rust_fn`, the dedupe key, the timer), `liveness.vl` (D3.7, bitsets
