@@ -161,6 +161,13 @@ The front's side stream (front272b):
   `S` (rustc E0599); an inherent constant of a generic impl (`impl<T>
   W<T> { const N: .. }`) is read, `W::<i64>::N` and `Self::N`, its
   type and value with the impl's parameters bound.
+- The method probe is rustc's (F0.5, F6.2): at each autoderef step the
+  receiver by value, then `&`, then `&mut`, and at each the methods whose
+  receiver type is that type, inherent first. So `r.tag()` on `r: &S`
+  is `S::tag(&self)`, not an `impl Tag for &S`'s `tag(&self)` (0.27.2's
+  earlier answer), `s.c()` takes an `&S` impl's `c(self)` before S's
+  `c(&mut self)`, and two traits' methods at one step are `error
+  method.ambiguous` (rustc E0034).
 
 Closures in full (clos272):
 
