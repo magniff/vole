@@ -152,6 +152,29 @@ The places IR carries what the borrow checker reads (ir271):
 - R5 closed: a reference given where its value goes, or a place where a
   reference goes, to a rust-edition function or a `let`'s written type
   is `error edition.lenient` with Rust's spelling as its `try:`.
+- Operands follow Rust's Copy rule (D8.3): a value moves unless its
+  type is Copy (scalars, `&T`, raw pointers, shared views, arrays and
+  tuples of Copy, a `#[derive(Copy)]` or `impl Copy` type), glue or
+  not; `let s = *r;` and `let s = v[0];` of a type not Copy move that
+  place (the checker's `move_out`); a place moved into a call is a
+  statement of its own at the argument. A derive's code keeps MVS's
+  rules.
+- A `&mut` given to a call is reborrowed (D3.6): `&mut2 (*r)` for a
+  `&mut` parameter, `&(*r)` for a `&T` one; `--verify-places` refuses a
+  copy of a whole `&mut` (I7).
+- A match with a guard fake-borrows its scrutinee and every place its
+  patterns test (`&'r fake`, D2.6), mentioned at each arm; a `ref mut`
+  binding is a shared borrow in the guard.
+- A closure's by-reference captures are loans, `&'c x` and `&'c mut x`,
+  held in the closure's type (D10.2); a call of a closure value
+  reborrows it, `&'e` or `&'e mut2` for one that writes a capture
+  (D10.3).
+- `&raw mut` loans (`BK_RAW_MUT`) for a `&mut x` given as a `*mut T`;
+  `where 'a: 'b` predicates; `error borrowck.static_mut_ref` for a
+  reference to a `static mut` (D6.2.5); a check's decision slot on
+  asserts and contract conjuncts, printed `; L1:`.
+- `Vec<&i64, Gpa>` keeps its element a reference, and `volec test` lends
+  a contract's `&T` and `&mut T` parameters a generated value.
 
 ### What's new in 0.27.0
 
