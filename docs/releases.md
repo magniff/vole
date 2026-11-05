@@ -144,7 +144,11 @@ The rust edition's front (ed270):
   (std::ops) on a program's types; `for` over `&v`, `&mut v` or a slice
   yields `&T` (`&mut T`), over a Vec or an array the values; patterns
   `&x`, `&(a, b)`, `&Some(k)`, `ref` and `ref mut`, match ergonomics;
-  `#[derive(Clone, Copy, PartialEq, ...)]`; `where Self: Sized`.
+  `#[derive(Clone, Copy, PartialEq, ...)]`; `where Self: Sized`,
+  `?Sized`; a trait's defaulted parameter left out of an impl header
+  (`impl PartialEq for P`); `union` a name but before a name; `&f(x)` of
+  a value a temporary of its statement, as Rust's (of the block for `let
+  r = &f(x);`): a second one in a statement no longer an error.
 - The edition runs on MVS's std in 0.27.0, and two places differ from
   Rust's std, each its own error: `edition.std_copy` (`*x` of a getter's
   copy) and `edition.std_by_value` (`&x` where std takes the value).
@@ -152,8 +156,14 @@ The rust edition's front (ed270):
   soft error naming the feature and its release (char, FnOnce, `impl
   Trait` returns, tuple structs, supertraits, associated constants,
   blanket impls and impls on an instance, `#[array_builtin(N)]`, `let
-  x;`, a write through `*const T`, ...); the item it is in is left out.
-  std2 checked: 289 edition.later, 155 plain errors left.
+  x;`, a write through `*const T`, qualified paths `<T as Tr>::X`, auto
+  traits `Send` and `Sync`, `#[builtin_impls(..)]`, ...); the item it is
+  in is left out. std2 checked (`--max-errors=0`): 212 edition.later, 126
+  plain errors left, of which 61 are two traits' methods of one name on a
+  type (`fmt` of Display and Debug: method_name_clash, 0.27.2).
+- Fixed for MVS too: a method's `where` on its impl's parameter bounded
+  every method of the block (`get` needed `reset`'s `T: Zero`); two
+  conflicting impls on a slice named a random symbol for the type.
 - Regions: each rust-edition function's places body gets its region
   variables (a loan per borrow, one per reference in a parameter's or a
   local's type, one per call whose result holds one; `check
@@ -161,7 +171,8 @@ The rust edition's front (ed270):
   body is built at check. Nothing is solved yet: one warning a function,
   `borrowck.unchecked`; 0.27.1's NLL solves them.
 - `--allow=CODE` (repeatable; a family, `--allow=borrowck`) leaves a
-  warning out, as rustc's `-A`; `--edition rust`. `volec guide edition`,
+  warning out, as rustc's `-A`; `--max-errors=N` (0: every error);
+  `--edition rust`. `volec guide edition`,
   and `volec explain` for the four codes.
 
 ### What's new in 0.26.5

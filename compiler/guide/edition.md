@@ -22,9 +22,13 @@ before; the edition is per program, from its root file.
   std::ops::{Deref, Index}`): `*w`, `w.f`, `w.m()`, `g[i]`;
 - `&impl Trait` and `impl Trait` arguments, `#[derive(Clone, Copy,
   PartialEq, ...)]` (Copy is what a plain type is already);
-- `where Self: Sized` (it says nothing); `*const T` and `*mut T`;
-  quoted labels `'outer:`; MVS's `var`, `inout`, `sink` and `defer` are
-  names.
+- `where Self: Sized` and `?Sized` (they say nothing); `*const T` and
+  `*mut T`; quoted labels `'outer:`; a trait's defaulted parameter
+  (`trait PartialEq<Rhs = Self>`, `impl PartialEq for P`); MVS's `var`,
+  `inout`, `sink` and `defer` are names, and so is `union` but before a
+  name;
+- `&f(x)` of a value: a temporary of its statement, dropped at its end
+  (of the block for `let r = &f(x);`).
 
 ```vole
 // EDITION: rust
@@ -104,7 +108,7 @@ out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`), `deferred_init` (`let x;`) | 0.27.1 |
-| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference` | 0.27.2 |
+| `char`, `fn_once`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference`, `qualified_path` (`<T as Tr>::X`), `auto_trait` (`Send`, `Sync`), `primitive_builtin` (`#[builtin_impls(..)]`) | 0.27.2 |
 
 ```vole
 // EDITION: rust
@@ -126,3 +130,4 @@ error[edition.later] 'FnOnce' (fn_once) comes with the rust edition in 0.27.2
 - `--edition rust` (`--edition=rust`): the edition without the line.
 - `--allow=CODE` (repeatable; a family: `--allow=borrowck`): a warning
   not reported, as rustc's `-A`.
+- `--max-errors=N`: stop after N errors, not 50 (0: every error).
