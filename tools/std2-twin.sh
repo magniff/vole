@@ -22,7 +22,8 @@
 #   (ToStringIn, DefaultIn, FromIteratorIn) dropped.
 # Then `rustc --edition 2021 -A warnings` builds it and it runs: its stdout
 # lines must be the EXPECT lines, its exit code the EXIT line's (default 0;
-# a Rust panic is 101, as std2's).
+# a Rust panic is 101, as std2's); its stdin is the STDIN lines, as the
+# runner gives them.
 #
 # Each case is one of:
 #   agree     rustc builds it and the output and exit code are the case's
@@ -80,7 +81,8 @@ DROP_USES = ("ToStringIn", "DefaultIn", "FromIteratorIn", "ToOwnedIn", "CollectI
 VOLE_ONLY = [r"\bGpa\b", r"\bgpa\b", r"\bArena\b", r"\bAnyAlloc\b", r"\bFixedBuf\b",
              r"Formatter::new\b", r"\ballocator\(\)", r"\blive_blocks\b", r"\bcheck_leaks\b",
              r"\bFixedState\b", r"\bFoldHasher\b", r"\b\w+_in\(", r"#\[array_builtin",
-             r"\bToStringIn\b", r"\bDefaultIn\b", r"\bFromIteratorIn\b"]
+             r"\bToStringIn\b", r"\bDefaultIn\b", r"\bFromIteratorIn\b",
+             r"\bTypedArena\b", r"\bArenaScope\b", r"\barena_scope\b"]
 
 
 def scan_args(s, i):
@@ -170,7 +172,11 @@ def translate(src):
     s = re.sub(r"fn main\(gpa: Gpa\)", "fn main()", s)
     s = re.sub(r",\s*Gpa>", ">", s)
     s = re.sub(r"<Gpa>", "", s)
-    s = inverse_in(s)
+    while True:
+        t = inverse_in(s)  # nested calls: the outer one first, then the inner
+        if t == s:
+            break
+        s = t
     s = re.sub(r"\bDefaultIn::default\(\)", "Default::default()", s)
     # std2's fixed-seed hasher: Rust's (the cases compare hashes, not values)
     s = re.sub(r"\bFixedState::new\(\)", "std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()", s)
@@ -179,7 +185,7 @@ def translate(src):
 
 
 def directives(src):
-    exp, exitc, none = [], 0, None
+    exp, exitc, none, stdin = [], 0, None, []
     for line in src.split("\n"):
         m = re.match(r"// EXPECT: ?(.*)$", line)
         if m:
@@ -187,16 +193,19 @@ def directives(src):
         m = re.match(r"// EXIT: (\d+)", line)
         if m:
             exitc = int(m.group(1))
+        m = re.match(r"// STDIN: ?(.*)$", line)
+        if m:
+            stdin.append(m.group(1))
         m = re.match(r"// RUSTC: none(.*)$", line)
         if m:
             none = m.group(1).strip() or "(no reason)"
-    return exp, exitc, none
+    return exp, exitc, none, "\n".join(stdin)
 
 
 def run(path):
     name = os.path.basename(path)[:-3]
     src = open(path).read()
-    exp, exitc, none = directives(src)
+    exp, exitc, none, stdin = directives(src)
     if none:
         return name, "outside", "RUSTC: none " + none
     rs = translate(src)
@@ -214,7 +223,7 @@ def run(path):
         first = next((l for l in r.stderr.split("\n") if l.startswith("error")), "error")
         return name, "outside", "rustc rejects: " + first[:160]
     try:
-        p = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        p = subprocess.run([exe], input=stdin, capture_output=True, text=True, timeout=20)
     except subprocess.TimeoutExpired:
         return name, "differ", "no exit after 20 s"
     got = p.stdout.split("\n")
