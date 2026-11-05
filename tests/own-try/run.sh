@@ -3,14 +3,15 @@
 # docs/design/value-semantics.md §2.9: "The try: lines are tested"). POSIX
 # sh and awk only.
 #
-# usage: tests/own-try/run.sh [-c COMPILER] [FILTER]
+# usage: tests/own-try/run.sh [-c COMPILER] [-d DIR] [FILTER]
 #
 # Each tests/own-try/NAME/ is a program (main.vl, and its other files);
-# directives in `//` comments of main.vl:
+# (0.27.1) -d DIR runs DIR/NAME/ instead (tests/borrowck-try/run.sh: the
+# borrow checker's); directives in `//` comments of main.vl:
 #   // OWN: CODE     `check --values=error` reports CODE first (own.moved,
 #                    own.conflict, ...; `type error` too); `none`: the
 #                    program checks clean (an agent's pattern that must not
-#                    be rejected)
+#                    be rejected); (0.27.1) `// CODE: CODE` the same
 #   // TRY: text     one of the first diagnostic's try: lines contains text
 #                    (§2.9's exact commands), one directive per line
 #   // XFAIL: why    the checker task that reports CODE has not landed:
@@ -36,7 +37,8 @@ FILTER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) [ $# -ge 2 ] || exit 2; COMPILER=$2; shift 2 ;;
-        -*) echo "usage: tests/own-try/run.sh [-c COMPILER] [FILTER]" >&2; exit 2 ;;
+        -d) [ $# -ge 2 ] || exit 2; HERE=$(cd "$2" && pwd) || exit 2; shift 2 ;;
+        -*) echo "usage: tests/own-try/run.sh [-c COMPILER] [-d DIR] [FILTER]" >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -87,7 +89,7 @@ for dir in "$HERE"/*/; do
     case "$name" in *"$FILTER"*) ;; *) continue ;; esac
     main="$dir/main.vl"
     [ -f "$main" ] || continue
-    code=$(directive OWN "$main" | head -n 1)
+    code=$( (directive OWN "$main"; directive CODE "$main") | head -n 1)
     xfail=$(directive XFAIL "$main" | head -n 1)
     why=""
     rm -rf "$WORK/case"
