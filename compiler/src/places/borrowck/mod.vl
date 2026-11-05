@@ -1,0 +1,285 @@
+// (0.27.1) The rust edition's borrow checker: NLL on the places IR, the
+// semantics of docs/design/borrowck.md (every rule cited as `RULE: Dn.m`).
+// Per rust-edition body, after elaboration and regions.vl's tables:
+// liveness (liveness.vl, D3.7), the constraints (constraints.vl, D3.6),
+// the solve (solve.vl, D6.1), and the regions dump (dump.vl, section 16:
+// `check --emit-places=regions`). M1 reports no errors: the accesses
+// (D2.5), moves (S8) and dropck (S9) are M2 and M3.
+//
+// The state is one Bck, made once per run (run_places) and reused per
+// body: the sets are bitsets of i64 words (a local set nw_l words, a
+// point set nw_p words: the body's points, D3.1, then one `end` bit per
+// universal). Region variables are counted from 1 as regions.vl counts
+// them; the table's rows come first, then the reborrows the reading rule
+// of D3.6 makes (origin RO_REBORROW, of the statement).
+
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
+use crate::base::timer::{T_BORROWCK, T_PLACES_BUILD, timer_now, timer_sub};
+use crate::places::ir::{Body, LF_PARAM, SK_CALL};
+use crate::places::regions::{
+    RO_CALL, RO_LOCAL, RO_UNIVERSAL, region_count, region_origin, region_word, slot_var,
+    slots_bound,
+};
+
+pub mod liveness;
+pub mod constraints;
+pub mod solve;
+pub mod dump;
+
+// The origin of a region variable the checker adds: an implicit reborrow
+// (D3.6's reading of `copy Q` for a `&mut` Q), of the statement.
+pub const RO_REBORROW: i64 = 5;
+
+// A slot's variance in its type (D5.1): bivariant, co-, contra-, invariant.
+pub const VAR_BI: i64 = 0;
+pub const VAR_CO: i64 = 1;
+pub const VAR_CONTRA: i64 = 2;
+pub const VAR_IN: i64 = 3;
+
+// A deref-like projection's pointee mode (D1.2).
+pub const MODE_SHARED: i64 = 1;
+pub const MODE_MUT: i64 = 2;
+pub const MODE_RAW: i64 = 3;
+
+pub struct Bck<A: Allocator> {
+    // The body's sizes: locations, points (2 a location), locals, the
+    // table's regions, the regions with the reborrows, universals.
+    pub nloc: i64,
+    pub npts: i64,
+    pub nlocal: i64,
+    pub nbase: i64,
+    pub nreg: i64,
+    pub nuniv: i64,
+    pub nw_l: i64,
+    pub nw_p: i64,
+    // Per local: its first region variable (0: no slot) and its slots.
+    pub first: Vec<i64, A>,
+    pub nslots: Vec<i64, A>,
+    // Per region (index r - 1): its origin, what it is of, its universal
+    // index (-1: not a universal).
+    pub origin: Vec<i64, A>,
+    pub of: Vec<i64, A>,
+    pub univ: Vec<i64, A>,
+    // Per location: its call region (0: none).
+    pub call_region: Vec<i64, A>,
+    // Liveness (D3.7): per location its use, def and drop-use sets of
+    // locals; per point the use-live and drop-live locals; per block the
+    // dataflow's in and out sets, for both flows.
+    pub uses: Vec<i64, A>,
+    pub defs: Vec<i64, A>,
+    pub drops: Vec<i64, A>,
+    pub live: Vec<i64, A>,
+    pub dlive: Vec<i64, A>,
+    pub bin: Vec<i64, A>,
+    pub bout: Vec<i64, A>,
+    pub tmp: Vec<i64, A>,
+    // Per region: whether a drop of its local requires it live (D9.1).
+    pub dropck: Vec<i64, A>,
+    // The constraints (D3.4): triples (sup, sub, loc), `'sup : 'sub` made
+    // at loc; then as adjacency sub -> sups (adj_at, adj).
+    pub edges: Vec<i64, A>,
+    pub adj_at: Vec<i64, A>,
+    pub adj: Vec<i64, A>,
+    // The solution (D6.1): per region nw_p words.
+    pub val: Vec<i64, A>,
+    pub queue: Vec<i64, A>,
+    pub inq: Vec<i64, A>,
+    // The loans (D2.1): five words each, the statement, the region, the
+    // kind (BK_*), the place's local and projection.
+    pub loans: Vec<i64, A>,
+    // A place walk's results (constraints.vl walk_place): the projection
+    // list root-first, the slot range reached, the type there, and the
+    // deref-like steps passed (a region and a mode each, root-first), then
+    // the supporting prefixes' regions (D1.3) made of them.
+    pub pscratch: Vec<i64, A>,
+    pub vscratch: Vec<i64, A>,
+    pub steps: Vec<i64, A>,
+    pub supports: Vec<i64, A>,
+    pub w_first: i64,
+    pub w_count: i64,
+    pub w_type: i64,
+    // The run's counts, for `solved: N bodies, M reused (key)`.
+    pub bodies: i64,
+    pub reused: i64,
+}
+
+static var EMIT_REGIONS: bool = false;
+
+// `--emit-places=regions`: the dump of section 16 after each body.
+pub fn set_emit_regions(on: bool) {
+    EMIT_REGIONS = on;
+}
+
+pub fn emit_regions() -> bool {
+    EMIT_REGIONS
+}
+
+pub fn state_new() -> Bck<Comp> {
+    Bck {
+        nloc: 0, npts: 0, nlocal: 0, nbase: 0, nreg: 0, nuniv: 0, nw_l: 1, nw_p: 1,
+        first: Vec::new_in(Comp {}),
+        nslots: Vec::new_in(Comp {}),
+        origin: Vec::new_in(Comp {}),
+        of: Vec::new_in(Comp {}),
+        univ: Vec::new_in(Comp {}),
+        call_region: Vec::new_in(Comp {}),
+        uses: Vec::new_in(Comp {}),
+        defs: Vec::new_in(Comp {}),
+        drops: Vec::new_in(Comp {}),
+        live: Vec::new_in(Comp {}),
+        dlive: Vec::new_in(Comp {}),
+        bin: Vec::new_in(Comp {}),
+        bout: Vec::new_in(Comp {}),
+        tmp: Vec::new_in(Comp {}),
+        dropck: Vec::new_in(Comp {}),
+        edges: Vec::new_in(Comp {}),
+        adj_at: Vec::new_in(Comp {}),
+        adj: Vec::new_in(Comp {}),
+        val: Vec::new_in(Comp {}),
+        queue: Vec::new_in(Comp {}),
+        inq: Vec::new_in(Comp {}),
+        loans: Vec::new_in(Comp {}),
+        pscratch: Vec::new_in(Comp {}),
+        vscratch: Vec::new_in(Comp {}),
+        steps: Vec::new_in(Comp {}),
+        supports: Vec::new_in(Comp {}),
+        w_first: 0, w_count: 0, w_type: 0,
+        bodies: 0, reused: 0,
+    }
+}
+
+// The body held, a rust-edition function's with its regions assigned:
+// its liveness, constraints and solution computed (M1: no error yet).
+// Timed apart from the places build, as `borrowck`.
+pub fn check_body(f: i64, bck: inout Bck<Comp>, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
+    let t = timer_now(pcx);
+    // (the graph: elaboration's fast path leaves the last body's)
+    crate::places::cfg::compute_preds(&pbody);
+    crate::places::cfg::compute_rpo(&pbody);
+    begin_body(&bck, pbody, pcx);
+    crate::places::borrowck::liveness::compute(&bck, pbody, &pcx);
+    crate::places::borrowck::constraints::generate(&bck, pbody, &pcx);
+    crate::places::borrowck::solve::solve(&bck, pbody, &pcx);
+    bck.bodies += 1;
+    timer_sub(T_PLACES_BUILD, T_BORROWCK, t, pcx);
+    let _ = f;
+}
+
+// The sizes and the region tables of the body held, from regions.vl's
+// rows: a local's slots are consecutive rows (RO_LOCAL or RO_UNIVERSAL,
+// pushed in local order), a call's region is of its statement.
+fn begin_body(bck: inout Bck<Comp>, pbody: Body<Comp>, pcx: Ctx<Comp>) {
+    bck.nloc = pbody.stmts.len() as i64;
+    bck.npts = 2 * bck.nloc;
+    bck.nlocal = pbody.locals.len() as i64;
+    bck.nbase = region_count(pbody);
+    bck.nreg = bck.nbase;
+    bck.nw_l = (bck.nlocal + 63) / 64;
+    if bck.nw_l < 1 {
+        bck.nw_l = 1;
+    }
+    bck.first.clear();
+    bck.nslots.clear();
+    for _ in 0..bck.nlocal {
+        bck.first.push(0);
+        bck.nslots.push(0);
+    }
+    bck.origin.clear();
+    bck.of.clear();
+    bck.univ.clear();
+    bck.call_region.clear();
+    for _ in 0..bck.nloc {
+        bck.call_region.push(0);
+    }
+    bck.nuniv = 0;
+    for r in 1..bck.nbase + 1 {
+        let o = region_origin(r, pbody);
+        let of = region_word(r, 0, pbody);
+        bck.origin.push(o);
+        bck.of.push(if o == RO_UNIVERSAL { -1 } else { of });
+        if o == RO_UNIVERSAL {
+            bck.univ.push(bck.nuniv);
+            bck.nuniv += 1;
+        } else {
+            bck.univ.push(-1);
+        }
+        if o == RO_CALL && of >= 0 && of < bck.nloc && bck.call_region[of] == 0 {
+            // (ir271 M1: n call regions a call; the first stands for them here)
+            bck.call_region[of] = r;
+        }
+    }
+    // (ir271 M1: a local's slots are regions.vl's slot_var; a parameter's
+    // are its signature's universals, shared and not consecutive: the
+    // contiguous range this checker walks is made of variables of its
+    // own, each equal to the universal it is bound to)
+    bck.loans.clear();
+    bck.edges.clear();
+    for l in 0..bck.nlocal {
+        let n = slots_bound(l, pbody);
+        if n == 0 {
+            continue;
+        }
+        var contiguous = true;
+        for i in 0..n {
+            let v = slot_var(l, i, pbody);
+            if v <= 0 || v != slot_var(l, 0, pbody) + i {
+                contiguous = false;
+            }
+        }
+        if contiguous {
+            bck.first[l] = slot_var(l, 0, pbody);
+        } else {
+            for i in 0..n {
+                let r = new_region(RO_LOCAL, l, &bck);
+                if i == 0 {
+                    bck.first[l] = r;
+                }
+                let u = slot_var(l, i, pbody);
+                edge(r, u, 0, &bck);
+                edge(u, r, 0, &bck);
+            }
+        }
+        bck.nslots[l] = n;
+    }
+    let _ = pcx;
+    let _ = LF_PARAM;
+    let _ = SK_CALL;
+}
+
+// A region variable the checker adds (RO_REBORROW of statement s): its
+// number.
+pub fn new_region(origin: i64, s: i64, bck: inout Bck<Comp>) -> i64 {
+    bck.origin.push(origin);
+    bck.of.push(s);
+    bck.univ.push(-1);
+    bck.nreg += 1;
+    bck.nreg
+}
+
+// Whether bit i is on in the set at words [base..] of v.
+pub fn bit_on(v: Vec<i64, Comp>, base: i64, i: i64) -> bool {
+    (v[base + (i >> 6)] >> (i & 63)) & 1 != 0
+}
+
+// A constraint `'sup : 'sub` (D3.4) made at location loc.
+pub fn edge(sup: i64, sub: i64, loc: i64, bck: inout Bck<Comp>) {
+    if sup <= 0 || sub <= 0 || sup == sub {
+        return;
+    }
+    bck.edges.push(sup);
+    bck.edges.push(sub);
+    bck.edges.push(loc);
+}
+
+// The block of location loc and its index in it, as `bbK[i]` prints
+// (the terminator is the slot after the block's statements).
+pub fn loc_block(loc: i64, pbody: Body<Comp>) -> i64 {
+    for b in 0..crate::places::ir::block_count(pbody) {
+        let start = crate::places::ir::block_start(b, pbody);
+        if start >= 0 && loc >= start && loc <= start + crate::places::ir::block_len(b, pbody) {
+            return b;
+        }
+    }
+    -1
+}

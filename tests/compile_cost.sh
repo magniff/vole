@@ -1,13 +1,17 @@
 #!/bin/sh
 # The gate's compile-cost row (0.21.1, after 0.20's std made a hello
 # world 5.5 times dearer to build unnoticed): the instructions retired by
-# three compilations, with this compiler and the previous release's,
+# four compilations, with this compiler and the previous release's,
 # each the fewest of a few runs, and their ratios:
 #
 #   hello   a hello world built (an object: no linker), at most 1.5x
 #   std     tests/cost/std_heavy.vl built (most of std read), at most 1.5x
 #   check   `volec check` of compiler/src (a copy without compiler/std,
 #           so that both read their own std; no tools' cache), at most 1.15x
+#   rust    (0.27.1) `volec check` of the rust edition's corpus's biggest
+#           case, tests/run/rust_t_iter_for_sources.vl (the borrow
+#           checker's whole cost on it, against 0.27.0's unchecked
+#           regions), at most 1.5x
 #
 # Instructions, not time: they hardly move with the machine's load. They
 # are read from /usr/bin/time -l (macOS); a host without it skips (77).
@@ -42,6 +46,7 @@ W=$(mktemp -d "${TMPDIR:-/tmp}/vole-cost.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
 cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
+cp "$ROOT/tests/run/rust_t_iter_for_sources.vl" "$W/rust_heavy.vl"
 mkdir -p "$W/src"
 cp -R "$ROOT/compiler/src/." "$W/src/"
 VOLE_CACHE=off
@@ -82,8 +87,9 @@ echo "compile cost against $P:"
 measure hello 1.5 hello.vl -c -o hello.o
 measure std 1.5 std_heavy.vl -c -o std_heavy.o
 measure check 1.15 check src/main.vl
+measure rust 1.5 check --allow=borrowck.unchecked rust_heavy.vl
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
     exit 1
 fi
-echo "compile-cost: hello, std and check within the bounds"
+echo "compile-cost: hello, std, check and rust within the bounds"
