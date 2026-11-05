@@ -125,6 +125,34 @@ The borrow checker's corpus and its rustc twin (corpus271):
   examples at -O2, the checks left and removed (by ranges or otherwise),
   in user code and in std, by kind: the first survey since 0.18.1's.
 
+The places IR carries what the borrow checker reads (ir271):
+
+- Region slots for every type (docs/design/borrowck.md D3.3): a
+  struct's and an enum's declared lifetimes and its type arguments', a
+  closure's captures', a raw pointer's pointee's; each local gets a
+  variable per slot, a parameter's are its signature's universals.
+  `--verify-places` checks that every local and every place the body
+  names has as many regions as its type has slots.
+- Signatures read with their lifetimes (D4.1, D4.2): one universal per
+  named lifetime (the impl's and the function's), `'static`, one per
+  elided input region, one per slot of a type parameter's substitution
+  shared by its occurrences; the elision rules E1-E3, and `error
+  borrowck.elision` (E4, rustc E0106) at the signature; declared
+  `'b: 'a` and the implied bounds of `&'a T`.
+- A call gets one region per region of its callee's signature, its
+  first in the call's region word (D3.2).
+- The variance of every struct's and enum's parameters (D5.3), and
+  `error borrowck.unused_param` for one no field uses (rustc E0392).
+- The regions dump of `--emit-places` in the format of borrowck.md §16:
+  `region 'r2: universal 'a (_1.0, return.0)`, `local _3.1`, `call
+  bb0[12].1`, `bound 'r3: 'r2`, and a `variance S: 'a +, T o` line per
+  rust-edition type.
+- `&&'a T` and `&&mut T` parse (the lexer's `&&`), and `&'a str` keeps
+  its lifetime.
+- R5 closed: a reference given where its value goes, or a place where a
+  reference goes, to a rust-edition function or a `let`'s written type
+  is `error edition.lenient` with Rust's spelling as its `try:`.
+
 ### What's new in 0.27.0
 
 The rust edition begins: `// EDITION: rust` (or `--edition rust`) compiles a program with Rust's references, `let mut`, `Deref`/`Index`, reference patterns and lifetimes, on today's std, without a borrow checker yet (`warning borrowck.unchecked`; NLL is 0.27.1). The new std's API is written in full as `compiler/std2`, the std rust-edition programs get in 0.27.2. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
