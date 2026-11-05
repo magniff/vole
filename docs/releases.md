@@ -78,11 +78,12 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.26.4 | `v0.26.4` | 0.26.3 | aarch64-macos | the compiler on Rust's overflow checks (its wrap sites `wrapping_*`, the bootstrap with the checks on); its raw-pointer parameters decided (`fix --only rawptr`: 1,416 of 2,583 `inout`); its statics in context structs, phases 1-3 (`fix --only statics`: the places IR's body, the tools' `Tcx`, front's pass contexts; 2,138 statics to 1,234); `Comp` an `unsafe impl Allocator` |
 | 0.26.5 | `v0.26.5` | 0.26.4 | aarch64-macos | the compiler's statics in context structs, phases 4-6 (`base::ctx::Ctx<Comp>` passed as `pcx`, the tables code generation's tasks read through a let view per task, `WgslCx<Arena>`; 1,234 statics to 188); `fix --only statics` doing the by-hand steps and `--prune`; the alloc exemption down to `SYMS` and `TYPES` |
 | 0.27.0 | `v0.27.0` | 0.26.5 | aarch64-macos | the rust edition begins (`// EDITION: rust`: references, `Deref`/`Index`, reference patterns, lifetimes and regions in side tables, `borrowck.unchecked`; 56 hand-translated cases); `compiler/std2`, the new std's API (1,414 items, 1,070 typechecking) and the translator's std rewrite table; SYMS/TYPES read-only in tasks and the alloc exemption deleted; Ctx's tables `Vec`s (unjustified unsafe 3,057 to 2,775) |
+| 0.27.1 | `v0.27.1` | 0.27.0 | aarch64-macos | the rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md), 18 `borrowck.*` codes with `explain`, 193 programs checked against rustc; Rust's `Copy` rule, reborrows, captures as loans, deferred `let`; contracts typed by the shared rule; 0.27.0's -O2 aliasing miscompile fixed; docs/design/contracts-effects.md |
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.1
 
-The rust edition's borrow checker: NLL on the places IR (docs/design/borrowck.md).
+The rust edition's borrows are checked: NLL on the places IR, as rustc's, with the semantics written down as rules (docs/design/borrowck.md) and checked against rustc on 193 programs (0 disagreements but the named ones). A rust-edition program now gets Rust's errors for conflicting borrows, references that outlive what they borrow, use after a move, assignment twice and drop order, each with `explain`; closure bodies' inner borrows wait for 0.27.2 (`borrowck.unchecked` names them). Rust's `Copy` rule, reborrows, captures as loans and deferred `let x;` come with it. It fixes 0.27.0's -O2 miscompile of aliasing references in unchecked rust-edition code. MVS programs compile exactly as before. Built and tested on aarch64-macos only.
 
 The borrow checker (bc271):
 
