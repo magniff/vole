@@ -317,9 +317,9 @@ def read_file(path, module, rel):
 
 # compiler/std2/typecheck.txt: the front's errors on the tree, one a line
 # (`FILE:L:C: error[KIND] MESSAGE`, its `try:` lines dropped), from
-# `volec check --edition rust compiler/std2/std.vl` by a build without
-# the 50-error cap (base/diag.vl's MAX_ERRORS); `--errors FILE` reads such
-# a run's output and rewrites it.
+# `volec check --edition rust --max-errors=0 compiler/std2/std.vl` (every
+# error, not the first 50); `--errors FILE` reads such a run's output and
+# rewrites it.
 TYPECHECK = os.path.join(TREE, "typecheck.txt")
 
 # A plain error (not edition.later) -> the front gap it shows, a features.tsv
@@ -329,25 +329,25 @@ GAPS = [
     (r"^<std>.*duplicate method", "std2_root"),
     (r"edition\.std_by_value", "std2_root"),
     (r"duplicate method", "method_name_clash"),
+    (r"^str\.vl:.*'(eq|partial_cmp|cmp)' does not have the signature trait '(PartialEq|PartialOrd|Ord)'",
+     "str_self_ref"),
     (r"does not have the signature trait", "generic_trait_multi_impl"),
-    (r"takes 1 type argument, got 0", "default_type_param"),
+    (r"no method '(get|get_mut|index|index_mut)' on type 'Range", "generic_trait_multi_impl"),
     (r"a function of a generic trait has no default body", "generic_trait_default"),
     (r"impl for unknown type 'char'|^char\.vl:.*cannot infer type parameter 'T' of 'Option'", "char"),
     (r"impl for unknown type 'AnyAlloc'|expected type, got 'unsafe'", "unsafe_fn_ptr"),
     (r"'(Send|Sync)' is not a trait in scope", "auto_trait"),
     (r"required by the bound 'M: Display' of 'panic::panic'", "impl_for_ref"),
-    (r"is not implemented for .*required by the bound", "method_where"),
     (r"no method '(copied|cloned)' on type 'Option<", "impl_on_instance"),
     (r"cannot derive 'Default'", "rust_derives"),
     (r"of type '\[\w+; \d+\]' has no", "array_builtin"),
     (r"is a builtin \(size_of", "size_of_name"),
     (r"slicing a (raw )?pointer|expected 'str', got '\[str\]'", "str_slice_self"),
-    (r"is a type, not a value", "unit_struct_value"),
+    (r"is a type, not a value", "unit_struct"),
     (r"conflicting impls of trait 'IntoIterator'", "impl_for_ref"),
     (r"unresolved import 'adapters::Flatten'|got '<<'|expected type, got '<'", "qualified_path"),
     (r"unresolved import '[\w:]*::self'", "use_self"),
     (r"expected type, got ''", "ref_ref_token"),
-    (r"got 'union'", "union_ident"),
 ]
 LATER = re.compile(r"\((\w+)\) comes with the rust edition in")
 
@@ -399,6 +399,10 @@ def read_errors(raw=None):
     if raw is not None:
         out = []
         for line in open(raw):
+            # an error whose quoted source spans lines: `error[K] MSG | --> FILE:L:C | ...`
+            m = re.match(r"(error\[[^\]]+\] .*?) \| --> ([^ ]+:\d+:\d+)(.*)$", line)
+            if m:
+                line = f"{m.group(2)}: {m.group(1)}{m.group(3)}"
             if not re.match(r"[^ ]+:\d+:\d+: error\[", line):
                 continue
             line = re.sub(r" \| try: .*$", "", line.rstrip("\n"))
@@ -668,12 +672,14 @@ def main():
     print(f"rewrite.tsv: {len(rewrites)} rows, for {len({r[0] for r in rewrites})} MVS items")
     st = {k: sum(1 for r in rows if r[5] == k) for k in ("ok", "later", "error")}
     unsched = sum(1 for r in rows if r[5] == "error" and r[7] == "-")
+    root = sum(1 for r in rows if r[5] == "error" and r[6] == "std2_root")
     kinds = {}
     for e in errs:
         kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
     print(f"typecheck.txt: {len(errs)} errors (" + ", ".join(f"{kinds[k]} {k}" for k in sorted(kinds)) + ")")
     print(f"items that typecheck: {st['ok']} of {len(items)}; only edition.later: {st['later']}; "
-          f"a plain error: {st['error']} ({unsched} of them a gap no release has taken)")
+          f"a plain error: {st['error']} ({unsched} of them a gap no release has taken; "
+          f"{root} only std2_root's, MVS's std loaded beside std2)")
     for t in sorted(per, key=lambda t: (-per[t], t)):
         print(f"  {t} ({feats[t] if feats[t] != '-' else 'a gap, not scheduled'}): {per[t]}")
     if loose:
