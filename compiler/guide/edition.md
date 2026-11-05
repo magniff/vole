@@ -108,12 +108,13 @@ codes are `volec explain --list`'s `borrowck.*` entries (`mut_twice`,
 each with its rustc code; `volec check --emit-places=regions` prints
 each body's liveness, constraints, region values and loans.
 
-What is not checked in 0.27.1 (each a named divergence in the rule
-book): the inside of a closure body reaches its captures through a raw
-environment (`warning borrowck.unchecked` names the closure;
-`--allow=borrowck.unchecked` leaves it out); MVS std's types holding
-hidden views; a `&raw` pointer's uses (unsafe's); rvalue promotion
-(`&5` is a temporary, not `'static`).
+What is not checked (each a named divergence in the rule book): MVS
+std's types holding hidden views; a `&raw` pointer's uses (unsafe's);
+rvalue promotion (`&5` is a temporary, not `'static`). Since 0.27.2 a
+closure body is checked like any other (its environment is `&Env`,
+`&mut Env` or `Env` by its kind, and what it stores or returns from
+its captures is checked where the closure is made), so 0.27.1's
+`warning borrowck.unchecked` is gone.
 
 ## What comes later: edition.later
 
