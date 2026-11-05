@@ -2,7 +2,7 @@
 
 ## Verdict
 
-Steps 1 to 3 done; step 4 analysed, not done.
+Steps 1 to 4 done; base::SRC is left for 0.27.x, with a design.
 
 1. SYMS and TYPES split into a read-only lookup (the tasks') and a
    writing path (the main thread's), moved into `Ctx`, and the alloc
@@ -14,7 +14,8 @@ Steps 1 to 3 done; step 4 analysed, not done.
    compiler/src, it took 715 calls into lets and made 121 task contexts
    `inout FnCtx`. `cx: *FnCtx` parameters went from 143 to 24, and
    unjustified unsafe from 2788 to 2776.
-4. The 8 view statics: see "Step 4" below.
+4. Seven of the 8 view statics are gone (Tcx fields, a parameter); base::SRC
+   stays, designed below. Statics 177 to 170.
 
 ## What worked
 
@@ -84,25 +85,64 @@ Steps 1 to 3 done; step 4 analysed, not done.
 
 ## Step 4: the 8 view statics
 
-Read from the code, not tried:
+Seven are gone; base::SRC stays (below).
 
-- tools::fmt::pieces::FT (18 uses), tools::lsp::complete::TX (24) and
-  PREFIX (a slice of TX, 4), tools::textual::places::LINES_TEXT (3).
-  Each is a view of a text parameter laundered through `text.ptr` into
-  the static. They can go now, as a parameter or a small view context
-  made where the text lives and passed down. They cannot be Tcx's
-  fields: Tcx outlives the text (own.escape).
-- tools::fmt::pieces::BAD_MESSAGE (14), tools::reduce::program::WANT (3)
-  and tools::refactor_shape::table::X_TEXT (3). These hold literals, a
-  Buf's bytes (buf_slice) or a symbol's text (sym_text). They can be
-  Tcx fields now. X_TEXT can also just be `sym_text(tcx.x_sym)` where it
-  is used.
-- base::SRC (1335 uses) is a view of the source buffer, taken again
-  after every add_source (the buffer grows while views of it are used).
-  A field holding a view needs the text never to move. Options: an
-  append-only store whose earlier bytes stay put, or a pointer and
-  length read through an unsafe accessor as Sym's text is (base::
-  sym_text). As an owned `Vec<u8, Comp>` field of Ctx, index reads work
-  now, but a slice of it passed beside an inout `pcx` is own.conflict.
-  0.27's references do not change that: a `&[u8]` held by the context
-  is still a borrow of what grows.
+- tools::reduce::program::WANT and tools::fmt::pieces::BAD_MESSAGE are
+  Tcx fields: `reduce_want` and `bad_message`, each a Buf (an owned copy)
+  read through buf_slice. `set_bad_message` and `bad_message` are the
+  accessors.
+- tools::refactor_shape::table::X_TEXT is gone: put_x reads
+  `sym_text(tcx.x_sym)`, the Tcx field it was made from.
+- tools::fmt::pieces::FT and tools::lsp::complete::TX are Tcx fields,
+  `fmt_text` and `complete_text`, each a `Vec<u8, A>` copy of the text
+  made by read_pieces and read_text. The pieces and tokens are offsets in
+  that copy. fmt's save and restore of FT around a nested format is a
+  clone. The completion lexers take the request's text as a parameter.
+  Five places hand a token beside `&tcx` and now pass a copy
+  (`to_vec_in`).
+- tools::lsp::complete::PREFIX is two offsets in Tcx, `prefix_start` and
+  `prefix_end`, read by match_rank.
+- tools::textual::places::LINES_TEXT is a parameter: match_in and
+  in_line_comment are given the text, which their two callers hold.
+
+Tcx cannot hold a view, which is why FT and TX are copies, not views. I
+tried `[u8]` fields and got own.escape in tools::patch::run_patch: the
+whole of Tcx becomes a view of what it holds. Passing the text as a
+parameter would have reached 108 functions for FT and 63 for TX
+(`statics-list` with a probe group). A copy per format or completion
+request is cheap, and the checker now checks the uses: the
+`text.ptr`-laundered views are gone.
+
+## 0.27.x item: base::SRC
+
+base::SRC is a view of the source buffer (`pcx.src_buf`, a Buf). It has
+1,335 uses: 856 in tools, 454 in front, 19 in base, 3 in middle, 2 in
+back and 1 in places. About 1,190 are index or slice forms, about 252 of
+them slices. load_sources, add_source and restore_sources take it again
+after each append, because the buffer grows (moves) while views of it
+are in use. A field cannot hold a view of what grows, under MVS or
+under 0.27's references alike. Two designs:
+
+1. **An append-only source store that never moves written bytes.** The
+   texts live in fixed chunks (a new file goes into a new chunk, or a
+   fresh one when it does not fit; a file never spans two chunks). A
+   position stays a single i64 (chunk base + offset), and `src(pos, len)`
+   returns a view that stays valid for the whole compilation. Ctx owns
+   the store as a field, `pcx.src: SrcStore<A>`. Reads become
+   `pcx.src.byte(k)` and `pcx.src.text(a, b)`. The views come from
+   memory that is never freed or moved before the compilation ends,
+   which is what the store itself guarantees (one unsafe site, in the
+   store). The lexer's hot loops keep their pointer into one chunk.
+2. **A pointer and length behind an accessor, as Sym's text is**
+   (base::sym_text, step 1). `pcx.src_ptr`, `pcx.src_len` and `fn
+   src(pcx) -> [u8]` in one `unsafe { ptr[0..len] }`, with the same
+   argument as today's static: nothing reads a view of SRC across an
+   append. This is mechanical, `rewrite 'SRC' 'src(pcx)'` plus `fix
+   --only statics --group` for the functions without pcx. But it keeps
+   the soundness argument informal: a view taken before an add_source
+   and used after it dangles, and nothing checks that.
+
+(1) is the one that makes the uses checked; (2) only removes the static.
+Either way, about 252 slices are passed beside `&pcx` in some calls and
+need the hoist or a copy where the checker objects. The count of those
+calls is the first thing to measure.

@@ -206,6 +206,14 @@ The compiler's last exempt statics, Ctx's raw tables and its task contexts (left
   24. The 17 left for nested-call (ir_val, ir_arg and ir_operand among
   them) are called on the right of `&&` or `||`, or beside a borrowed part
   of the context. Unjustified unsafe went from 2,788 to 2,776.
+- Seven of the tools' eight view statics are gone (statics 177 to 170).
+  fmt's text and the completion's text are owned copies in `Tcx`
+  (`fmt_text`, `complete_text`), so their pieces' and tokens' views are
+  checked; fmt's failure message and reduce's first failure are Bufs in
+  Tcx; the completion prefix is two offsets; the text a rewrite reads by
+  lines is a parameter. Before, each was a parameter's view laundered
+  into a static through its pointer. base::SRC stays: it views a buffer
+  that grows (feedbacks/left270.md has a design for 0.27.x).
 
 ### What's new in 0.26.5
 
