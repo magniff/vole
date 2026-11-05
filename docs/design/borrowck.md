@@ -986,6 +986,11 @@ outside the holes named below.
 - R10 Fake borrows (D2.6) conflict only with `WA`, `WB` and `WD` (as
   rustc); a move of the scrutinee in a guard is not theirs: it is the
   move dataflow's at the next arm's test, which is L8.
+- R11 An MVS std type is `Copy` in the rust edition when it has no drop
+  glue and `Copy` type arguments (`places::regions::rust_copy`), so
+  `Range<i64>` is `Copy` here and a range used twice is a copy, not a
+  use after a move as in rustc. Reason: MVS std declares no `Copy`;
+  ends in 0.27.2 with std2's types.
 
 **Deliberate strictness (less than rustc).**
 - L1 Dropck without `may_dangle` for user `impl Drop` types (as rustc
