@@ -2852,3 +2852,25 @@ the cache), unsafe-audit 3217 unjustified (baseline 3217, from 3329)
 and 0 in std, chain-diverse, chain-fresh 38 releases. compile-cost
 against v0.26.3: a hello world 0.99x, std 1.00x, check of the compiler
 0.88x. The compiler is the first built without `--overflow-checks=off`.
+
+### 0.26.5
+
+The release gate (`gate.sh --release --no-linux`), macOS only. The
+first run failed chain-diverse (B1, the compiler built at -O0 by 0.26.4,
+crashed in the own pass building B2) and compiler-memcheck (12 of 727,
+the own pass's tests): the statics tool had rewritten a lent element
+`&COL_STORED[0]` into a one-element local whose callee writes two, so
+the second write landed on the stack; harmless at -O2, a corrupted
+context at -O0. Fixed at its cause (the tool keeps the static whole and
+the index in the argument; a transcript reproduces it) and the gate run
+again (88:39 wall, under a load average above 100): every row passed
+but four that ran into time limits (two suite cases, a hook test and
+cachediff's testcmd), each passing alone; on an idle machine the suite
+rows and cachediff passed through the gate. The suite 4686 at -O0, -O1
+and -O2 (69 XFAIL; SKIPPED: no spirv-val), threads 8875, incremental 172
+series, objcheck 5848 (and 256 for x86_64-macos), compiler-memcheck 727,
+examples-checkalloc 183, every fuzz and ABI row (fuzz-sem 300 programs),
+stress-grow, cachediff 1461 lines (425 from the cache), unsafe-audit
+3057 unjustified (baseline 3057, from 3217) and 0 in std, chain-diverse,
+chain-fresh 39 releases. compile-cost against v0.26.4: a hello world
+1.00x, std 1.01x, check of the compiler 0.95x.
