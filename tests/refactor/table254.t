@@ -1,6 +1,11 @@
 ## 0.25.4: `volec refactor table X` (tests/refactor/table254/): a table
 ## kept as a raw pointer, a count and a capacity becomes a Vec<T, Comp>;
 ## every use is placed, or the refactor is refused and changes nothing.
+## (0.26.5) A static may not hold Comp any more (the alloc exemption names
+## two of the compiler's own statics only, base::SYMS and
+## front::types::TYPES): each rewrite's dry run shows its diff, and the
+## rewrite is refused (alloc.static) and changes nothing. A table in a
+## context's field is the next form the refactor takes.
 % "$COMPILER" main.vl -o a >/dev/null 2>&1 && ./a
 4 10 36 40
 2 8 23
@@ -84,7 +89,10 @@ $ refactor table ITEMS --dry-run
 @@ -9 +9 @@
 -    s + crate::items::ITEM_COUNT * 100 + unsafe { crate::items::ITEMS[0].v }
 +    s + crate::items::ITEMS.len() as i64 * 100 + unsafe { crate::items::ITEMS[0].v }
+items.vl:10:5: error[alloc.static] the static 'ITEMS' holds an allocator, 'Comp' (in its type 'Vec<Item, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited: crate::items::ITEMS]
 note edit.imports: added the imports the new text needs (fix --only imports)
+warning edit.breaks: 1 new error (dry run); the error: items.vl:10:5: the static 'ITEMS' holds an allocator, 'Comp' (in its type 'Vec<Item, Comp>'): a static's type may not hold one
+[exit 1]
 ## The increment before the store (at a local set before it): reads
 ## between them one more.
 $ refactor table MARKS --dry-run
@@ -117,7 +125,10 @@ $ refactor table MARKS --dry-run
 @@ -25 +22 @@
 -    unsafe { MARKS[MARK_COUNT - 1].at }
 +    unsafe { MARKS[MARKS.len() as i64 - 1].at }
+marks.vl:10:5: error[alloc.static] the static 'MARKS' holds an allocator, 'Comp' (in its type 'Vec<Mark, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited: crate::marks::MARKS]
 note edit.imports: added the imports the new text needs (fix --only imports)
+warning edit.breaks: 1 new error (dry run); the error: marks.vl:10:5: the static 'MARKS' holds an allocator, 'Comp' (in its type 'Vec<Mark, Comp>'): a static's type may not hold one
+[exit 1]
 ## A grow in `if TOK_COUNT >= TOK_CAP { ... }`: the `if` goes with it;
 ## `TOKS = reserve(TOKS, &TOK_CAP, n)` (room for n in all) is a Vec's
 ## reserve of what is missing.
@@ -165,7 +176,10 @@ $ refactor table TOKS --dry-run
 -    TOK_COUNT = mark;
 +    let added = TOKS.len() as i64 - mark;
 +    TOKS.truncate(mark as usize);
+tokens.vl:5:5: error[alloc.static] the static 'TOKS' holds an allocator, 'Comp' (in its type 'Vec<i64, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited]
 note edit.imports: added the imports the new text needs (fix --only imports)
+warning edit.breaks: 1 new error (dry run); the error: tokens.vl:5:5: the static 'TOKS' holds an allocator, 'Comp' (in its type 'Vec<i64, Comp>'): a static's type may not hold one
+[exit 1]
 ## Refused, each use listed: a pointer into the table, the table passed
 ## and assigned, the capacity read, the count written, a call between the
 ## store and its increment that reads the count, (0.25.5) a call in an
@@ -210,22 +224,25 @@ try: volec query def Item
 [exit 1]
 ## The rewrites, written: the program prints what it printed.
 $ refactor table ITEMS
-made crate::items::ITEMS a Vec<Item, Comp>: 2 pushes, 10 len()s, 1 clear(), 2 truncate()s	4 files	+21 -24 lines
+items.vl:10:5: error[alloc.static] the static 'ITEMS' holds an allocator, 'Comp' (in its type 'Vec<Item, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited: crate::items::ITEMS]
 note edit.imports: added the imports the new text needs (fix --only imports)
-note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
-try: volec fix --only unneeded-unsafe
+error edit.breaks: 1 new error; nothing written; the error: items.vl:10:5: the static 'ITEMS' holds an allocator, 'Comp' (in its type 'Vec<Item, Comp>'): a static's type may not hold one
+try: volec refactor table ITEMS --no-check
+[exit 1]
 $ refactor table MARKS
-made crate::marks::MARKS a Vec<Mark, Comp>: 1 push, 6 len()s	2 files	+8 -11 lines
+marks.vl:10:5: error[alloc.static] the static 'MARKS' holds an allocator, 'Comp' (in its type 'Vec<Mark, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited: crate::marks::MARKS]
 note edit.imports: added the imports the new text needs (fix --only imports)
-note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
-try: volec fix --only unneeded-unsafe
+error edit.breaks: 1 new error; nothing written; the error: marks.vl:10:5: the static 'MARKS' holds an allocator, 'Comp' (in its type 'Vec<Mark, Comp>'): a static's type may not hold one
+try: volec refactor table MARKS --no-check
+[exit 1]
 $ refactor table TOKS
-made crate::tokens::TOKS a Vec<i64, Comp>: 1 push, 4 len()s, 1 truncate(), 1 reserve()	2 files	+11 -16 lines
+tokens.vl:5:5: error[alloc.static] the static 'TOKS' holds an allocator, 'Comp' (in its type 'Vec<i64, Comp>'): a static's type may not hold one | help: any function could allocate through it with nothing in its signature saying so: keep the value in main and pass it down (or what it allocates, as a slice)  [edited]
 note edit.imports: added the imports the new text needs (fix --only imports)
-note refactor.table-unsafe: the unsafe blocks around its indexing may be unneeded now
-try: volec fix --only unneeded-unsafe
+error edit.breaks: 1 new error; nothing written; the error: tokens.vl:5:5: the static 'TOKS' holds an allocator, 'Comp' (in its type 'Vec<i64, Comp>'): a static's type may not hold one
+try: volec refactor table TOKS --no-check
+[exit 1]
 $ fix --only unneeded-unsafe
-fixed 10 unneeded unsafe blocks	4 files	+16 -24 lines
+note fix.none: nothing to fix
 % "$COMPILER" main.vl -o b >/dev/null 2>&1 && ./b
 4 10 36 40
 2 8 23
@@ -233,5 +250,5 @@ fixed 10 unneeded unsafe blocks	4 files	+16 -24 lines
 5 100
 3 7
 $ check
-base/mod.vl:4:5: warning[unsafe.unjustified] 12 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root main.vl
+base/mod.vl:4:5: warning[unsafe.unjustified] 22 unsafe sites lack `// UNSAFE:` and `// SAFETY:` comments (the first here) | help: each unsafe site says right above it why it cannot be safe and why it is sound; the try: line lists them | try: volec query unsafe --no-std --unjustified --root main.vl
 ok: 0 errors, 1 warning in main.vl

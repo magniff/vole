@@ -83,3 +83,14 @@ each with a case in tests/refactor/statics0265.t. P4: 772 statics into
    so the compilation context cannot hold the WGSL arena (or main's Gpa)
    without a second parameter on every `Ctx<Comp>`: the arena got its
    own context, threaded beside `pcx`.
+12. [tool] rawptr's nested-call parameters after P6: 142, every one a
+   task's `cx: *FnCtx` in middle and back (`ir_make(cx, ir_val(cx, ..))`),
+   none the compilation context, so passing `pcx` down changed none, and
+   `fix --only rawptr` finds nothing to do. Making them inout needs the
+   inner call taken into a let at each nesting call (as `fix --only
+   statics` hoists a receiver's argument): a hoist in `fix --only rawptr`.
+13. [tool] `refactor table` makes a static `Vec<T, Comp>`, which the
+   narrowed exemption refuses (tests/refactor/table254.t records the
+   refusal): it needs to take a context's field (`pcx.x: *T` with
+   `pcx.x_count`), where every raw table of compiler/src is now, to
+   remove the unsafe their indexing needs.
