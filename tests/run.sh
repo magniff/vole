@@ -917,6 +917,10 @@ run_case() {
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
+# (0.27.2) And std2's, the rust edition's (embed.sh --edition rust).
+if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" --edition rust -c; then
+    exit 1
+fi
 # (0.21.1) std's core, the sections every program reads, stays small.
 if [ -x "$ROOT/tests/std/core_sections.sh" ] && ! "$ROOT/tests/std/core_sections.sh" >/dev/null; then
     exit 1
