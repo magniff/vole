@@ -7,14 +7,16 @@
 // where it is written). Each rewrites the node in place, as the checker's
 // other desugarings do, and the caller checks it again.
 
-use crate::base::{SRC, cstr, intern_c};
+use crate::base::{SRC, cstr, intern_c, sym_text};
 use crate::base::comp::Comp;
 use crate::base::ctx::Ctx;
-use crate::base::diag::{err_begin, err_end_soft, err_fmt, err_help, err_try_fmt};
+use crate::base::diag::{
+    err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
+};
 use crate::front::ast::{NodeKind, list_begin, list_end, list_push, new_node};
 use crate::front::check::calls::method_of;
 use crate::front::lexer::Tok;
-use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param, ref_to};
+use crate::front::types::{REF_MUT, REF_SHARED, TyKind, err_type, fn_param, ref_to};
 
 // Whether node n is read in the rust edition.
 pub fn rust_node(n: i64, pcx: inout Ctx<Comp>) -> bool {
@@ -158,6 +160,98 @@ fn self_behind(f: i64, r: i64, pcx: Ctx<Comp>) -> bool {
     }
     let p = fn_param(f, 0, pcx);
     p > 0 && pcx.types[p].kind == TyKind::Ptr && pcx.types[p].a == r
+}
+
+// RULE: F6.2 The step of rustc's method probe at which method f of type x
+// is found for a receiver of type t0: with τ₀ = t0 and τₖ₊₁ the referent
+// of τₖ, 3k when f's receiver type (its `self` parameter's: x, `&x` or
+// `&mut x`) is τₖ, 3k + 1 when it is `&τₖ`, 3k + 2 when `&mut τₖ`. -1 when
+// it is none of them through references (a `Deref` target, a view: the
+// probe's other steps, which decide nothing here).
+pub fn probe_step(f: i64, x: i64, t0: i64, pcx: Ctx<Comp>) -> i64 {
+    if f < 0 || x <= 0 || pcx.fns[f].param_count == 0 {
+        return -1;
+    }
+    let p = fn_param(f, 0, pcx);
+    if !(p == x || crate::front::types::is_ref(p, pcx) && pcx.types[p].a == x) {
+        return -1;
+    }
+    var tau = t0;
+    for k in 0..MAX_PROBE_DEREFS {
+        if p == tau {
+            return 3 * k;
+        }
+        if crate::front::types::is_ref(p, pcx) && pcx.types[p].a == tau {
+            return 3 * k + if pcx.types[p].b == REF_MUT { 2 } else { 1 };
+        }
+        if !crate::front::types::is_ref(tau, pcx) {
+            return -1;
+        }
+        tau = pcx.types[tau].a;
+    }
+    -1
+}
+
+// The references probe_step reads through.
+const MAX_PROBE_DEREFS: i64 = 16;
+
+// RULE: F6.2 Of method a of type xa and method b of type xb (both named
+// `name`, for call n whose receiver has type t0), the one rustc's probe
+// finds first: the earlier step (probe_step), and at one step the
+// inherent one; two trait methods at one step are error method.ambiguous
+// (rustc E0034), and a is kept. -1 when either step is unknown: the
+// caller's order stands.
+pub fn probe_first(n: i64, a: i64, xa: i64, b: i64, xb: i64, t0: i64, name: i64,
+    pcx: inout Ctx<Comp>) -> i64 {
+    let sa = probe_step(a, xa, t0, pcx);
+    let sb = probe_step(b, xb, t0, pcx);
+    if sa < 0 || sb < 0 {
+        return -1;
+    }
+    if sa != sb {
+        return if sa < sb { a } else { b };
+    }
+    let a_inherent = crate::front::traits::impl_of_fn(a, pcx) < 0;
+    let b_inherent = crate::front::traits::impl_of_fn(b, pcx) < 0;
+    if a_inherent != b_inherent {
+        return if a_inherent { a } else { b };
+    }
+    let saved_kind = pcx.err_kind;
+    pcx.err_kind = c"method.ambiguous";
+    err_begin(pcx.nodes[n].start, &pcx);
+    let ta = pcx.traits[pcx.traits_impls[crate::front::traits::impl_of_fn(a, pcx)].tr].name;
+    let tb = pcx.traits[pcx.traits_impls[crate::front::traits::impl_of_fn(b, pcx)].tr].name;
+    err_fmt(format_args("multiple applicable items: '{}' of trait '{}' and of trait '{}' take \
+        one receiver type", sym_text(name, pcx), sym_text(ta, pcx), sym_text(tb, pcx)), pcx);
+    err_help_fmt(format_args("call it through its trait to say which: `{}::{}(..)` or `{}::{}(..)`",
+        sym_text(ta, pcx), sym_text(name, pcx), sym_text(tb, pcx), sym_text(name, pcx)), pcx);
+    err_end(&pcx);
+    pcx.err_kind = saved_kind;
+    a
+}
+
+// RULE: F6.2 Method f0 of type t, for call n whose receiver (of type
+// t0) is a t by value: when a by-value method of `&t` or `&mut t` comes
+// before it in rustc's probe (`s.c()` with `fn c(&mut self)` on S and
+// `impl C for &S { fn c(self) }`: the `&S` step is earlier), the receiver
+// becomes `&e` (`&mut e`); true when rewritten.
+pub fn autoref_first(n: i64, f0: i64, t: i64, t0: i64, name: i64, pcx: inout Ctx<Comp>) -> bool {
+    for mode in [REF_SHARED, REF_MUT] {
+        let r = ref_to(t, mode, &pcx);
+        let g = method_of(r, name, pcx);
+        if g >= 0 && !self_behind(g, r, pcx) && probe_first(n, f0, t, g, r, t0, name, &pcx) == g {
+            let e = pcx.nodes[n].a;
+            let u = new_node(NodeKind::Unary, pcx.nodes[e].start, pcx.nodes[e].end, &pcx);
+            pcx.nodes[u].op = Tok::Amp;
+            pcx.nodes[u].b = e;
+            if mode == REF_MUT {
+                pcx.nodes[u].p |= crate::front::ast::NODE_REF_MUT;
+            }
+            pcx.nodes[n].a = u;
+            return true;
+        }
+    }
+    false
 }
 
 // RULE: F21.2 (Z9's type side) A value of an unsized type, `[T]` or
