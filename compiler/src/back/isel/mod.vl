@@ -87,55 +87,55 @@ mod divisions;
 mod tiling;
 pub mod arch;
 
-use crate::arch::ARCH_USED;
 use crate::back::isel::arch::expand_cpu_features;
 use crate::back::isel::branches::{form_selects, lower_sels, thread_phi_branches};
 use crate::back::isel::divisions::lower_divisions;
 use crate::back::isel::tiling::isel_function;
 use crate::back::regalloc::prepare::layout_blocks;
 use crate::base::{alloc_array, free};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::base::target::X86;
 use crate::front::types::{TY_F64, is_float, is_vector, type_size};
 use crate::middle::ctx::FnCtx;
-use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::{
-    IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter, ir_insert_before, ir_operand,
-    ir_operand_count, ir_unlink,
+    IRFUNCS, Op, Term, ir_append, ir_enter, ir_insert_before, ir_operand, ir_operand_count,
+    ir_unlink,
 };
 use crate::middle::ir::Op::{Cmp, Const, Copy, Load, LoadX, Param, Store, StoreX, Test};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::opt::{eliminate_dead_code, resolve_all};
 
-pub fn select_instructions(cx: inout FnCtx) {
+pub fn select_instructions(cx: inout FnCtx, pcx: Ctx<Comp>) {
     unsafe {
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
-                select_function(&cx, fi);
+        for fi in 0..pcx.irfunc_count {
+            if pcx.fn_live[fi] != 0 {
+                select_function(&cx, fi, pcx);
             }
         }
     }
 }
 
 // Instruction selection for function fi.
-pub fn select_function(cx: inout FnCtx, fi: i64) {
-    ir_enter(&cx, fi);
-    if lower_sels(&cx, fi) {
+pub fn select_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
+    ir_enter(&cx, fi, pcx);
+    if lower_sels(&cx, fi, pcx) {
         resolve_all(&cx, fi);
-        eliminate_dead_code(&cx, fi);
+        eliminate_dead_code(&cx, fi, pcx);
     }
-    let threaded = thread_phi_branches(&cx, fi);
-    if form_selects(&cx, fi) || threaded {
-        eliminate_dead_code(&cx, fi);
+    let threaded = thread_phi_branches(&cx, fi, pcx);
+    if form_selects(&cx, fi, pcx) || threaded {
+        eliminate_dead_code(&cx, fi, pcx);
     }
     // (0.19: std::arch's run-time feature tests)
-    if ARCH_USED {
-        expand_cpu_features(&cx, fi);
+    if pcx.arch_used {
+        expand_cpu_features(&cx, fi, pcx);
     }
-    lower_divisions(&cx, fi);
-    isel_function(&cx, fi);
-    eliminate_dead_code(&cx, fi);
-    schedule_function(&cx, fi);
-    verify_func(&cx, fi, c"instruction selection");
+    lower_divisions(&cx, fi, pcx);
+    isel_function(&cx, fi, pcx);
+    eliminate_dead_code(&cx, fi, pcx);
+    schedule_function(&cx, fi, pcx);
+    verify_func(&cx, fi, c"instruction selection", pcx);
 }
 
 // ---- Use counts ----
@@ -241,7 +241,7 @@ fn isel_set_operands(cx: inout FnCtx, v: i64, a: i64, b: i64, c: i64) {
 
 // ---- Scheduling ----
 
-fn schedule_function(cx: inout FnCtx, fi: i64) {
+fn schedule_function(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) {
     unsafe {
         isel_count_uses(&cx, fi);
         let entry = IRFUNCS[fi].entry;
@@ -267,7 +267,7 @@ fn schedule_function(cx: inout FnCtx, fi: i64) {
                 ir_append(&cx, b, c);
             }
             if !X86 {
-                pair_accesses(&cx, b);
+                pair_accesses(&cx, b, pcx);
             }
             if b == entry || cx.ldepth.data[cx.blocks[b].order] == 0 {
                 continue;
@@ -292,12 +292,12 @@ fn schedule_function(cx: inout FnCtx, fi: i64) {
 
 // (0.15) The size of an access ldp or stp can pair (a 64-bit integer or
 // float, a vector), or 0.
-fn pair_size(cx: inout FnCtx, v: i64) -> i64 {
+fn pair_size(cx: inout FnCtx, v: i64, pcx: Ctx<Comp>) -> i64 {
     unsafe {
         let ty = if cx.insts[v].op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
         if is_vector(ty) {
             16
-        } else if type_size(ty) == 8 && (!is_float(ty) || ty == TY_F64) {
+        } else if type_size(ty, pcx) == 8 && (!is_float(ty) || ty == TY_F64) {
             8
         } else {
             0
@@ -308,10 +308,10 @@ fn pair_size(cx: inout FnCtx, v: i64) -> i64 {
 // (0.25.5) Whether loads of types a and b can pair: the same type, or two
 // 64-bit integers whatever their signedness (a Vec's ptr, a u64, and its
 // len, an i64, read side by side for each `v[i]`).
-fn pair_types(a: i64, b: i64) -> bool {
+fn pair_types(a: i64, b: i64, pcx: Ctx<Comp>) -> bool {
     a == b
-        || (!is_float(a) && !is_vector(a) && !is_float(b) && !is_vector(b) && type_size(a) == 8
-            && type_size(b) == 8)
+        || (!is_float(a) && !is_vector(a) && !is_float(b) && !is_vector(b) && type_size(a, pcx) == 8
+            && type_size(b, pcx) == 8)
 }
 
 // (0.15, AArch64) Loads (stores) of one base at offsets one access apart
@@ -319,23 +319,24 @@ fn pair_types(a: i64, b: i64) -> bool {
 // one ldp (stp): a load moves up to the other, past no store or call; a
 // store moves down to the other, past no memory access or call. Unrolled
 // copies of a loop body load a[k], b[k], then a[k + 1], b[k + 1].
-fn pair_accesses(cx: inout FnCtx, b: i64) {
+fn pair_accesses(cx: inout FnCtx, b: i64, pcx: Ctx<Comp>) {
     unsafe {
         var w = cx.blocks[b].first;
         while w != 0 {
             let next = cx.insts[w].next;
             let op = cx.insts[w].op;
-            let size = if op == Load || op == Store { pair_size(&cx, w) } else { 0 };
+            let size = if op == Load || op == Store { pair_size(&cx, w, pcx) } else { 0 };
             if size != 0 && (op == Store || cx.isel_uses[w] > 0) {
                 var v = cx.insts[w].prev;
                 var steps = 0;
                 while v != 0 && steps < 16 {
                     let vop = cx.insts[v].op;
-                    if vop == op && cx.insts[v].a == cx.insts[w].a && pair_size(&cx, v) == size
+                    if vop == op && cx.insts[v].a == cx.insts[w].a && pair_size(&cx, v, pcx) == size
                         && (cx.insts[v].imm + size == cx.insts[w].imm
                             || cx.insts[w].imm + size == cx.insts[v].imm)
                         && (op == Store
-                            || (cx.isel_uses[v] > 0 && pair_types(cx.insts[v].ty, cx.insts[w].ty)))
+                            || (cx.isel_uses[v] > 0
+                                && pair_types(cx.insts[v].ty, cx.insts[w].ty, pcx)))
                         && (op == Load || cx.insts[v].imm2 == cx.insts[w].imm2) {
                         if op == Load {
                             ir_unlink(&cx, w);

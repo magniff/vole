@@ -15,6 +15,8 @@
 // value at the exit is an expression computed in the preheader.
 
 use crate::base::{IntVec, free};
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::consteval::wrap_int;
 use crate::front::types::{TY_I64, TY_U64, int_bits, is_integer, is_signed};
 use crate::middle::ctx::FnCtx;
@@ -357,7 +359,7 @@ fn entry_implies(cx: inout FnCtx, l: i64, a: i64, b: i64, cond: Cond, signed: bo
 // Replaces the exit values of induction variables of counted loop l (the
 // operands of the exit block's phis) by expressions computed in the
 // preheader. Returns whether any was.
-fn replace_exit_values(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
+fn replace_exit_values(cx: inout FnCtx, fi: i64, l: i64, exit: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var iv = 0;
         var step = 0;
@@ -366,7 +368,7 @@ fn replace_exit_values(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
         if !counted_loop(&cx, l, &iv, &step, &n, &ne) {
             return false;
         }
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         let pre = loop_preheader(&cx, l);
         let h = loop_header(&cx, l);
         let ty = cx.insts[iv].ty;
@@ -405,25 +407,26 @@ fn replace_exit_values(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
             if p == iv && is_next {
                 value = n;
                 if cx.insts[n].ty != ty {
-                    value = append_inst(&cx, pre, Conv, ty, n, 0);
+                    value = append_inst(&cx, pre, Conv, ty, n, 0, pcx);
                     cx.insts[value].imm2 = cx.insts[n].ty;
                 }
             } else {
                 if trips == 0 {
                     trips = append_inst(&cx, pre, Sub, ty, if step == 1 { n } else { start },
-                        if step == 1 { start } else { n });
+                        if step == 1 { start } else { n }, pcx);
                 }
                 var count = trips;
                 if ty2 != ty {
-                    count = append_inst(&cx, pre, Conv, ty2, trips, 0);
+                    count = append_inst(&cx, pre, Conv, ty2, trips, 0, pcx);
                     cx.insts[count].imm2 = ty;
                 }
                 if !is_next {
-                    count = append_inst(&cx, pre, Sub, ty2, count, append_const(&cx, pre, 1, ty2));
+                    count = append_inst(&cx, pre, Sub, ty2, count,
+                        append_const(&cx, pre, 1, ty2, pcx), pcx);
                 }
                 let scaled = append_inst(&cx, pre, Mul, ty2, count,
-                    append_const(&cx, pre, c2, ty2));
-                value = append_inst(&cx, pre, Add, ty2, iv_start(&cx, l, p), scaled);
+                    append_const(&cx, pre, c2, ty2, pcx), pcx);
+                value = append_inst(&cx, pre, Add, ty2, iv_start(&cx, l, p), scaled, pcx);
             }
             set_exit_operand(&cx, exit, w, value);
             changed = true;
@@ -445,16 +448,16 @@ fn set_exit_operand(cx: inout FnCtx, exit: i64, w: i64, v: i64) {
     }
 }
 
-pub fn append_inst(cx: sink *FnCtx, b: i64, op: Op, ty: i64, a: i64, x: i64) -> i64 {
-    let v = ir_make(cx, op, ty, a, x, 0);
+pub fn append_inst(cx: sink *FnCtx, b: i64, op: Op, ty: i64, a: i64, x: i64, pcx: Ctx<Comp>) -> i64 {
+    let v = ir_make(cx, op, ty, a, x, 0, pcx);
     // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
     // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
     ir_append(unsafe { &*cx }, b, v);
     v
 }
 
-pub fn append_const(cx: sink *FnCtx, b: i64, value: i64, ty: i64) -> i64 {
-    let v = ir_make(cx, Const, ty, 0, 0, wrap_int(value, ty));
+pub fn append_const(cx: sink *FnCtx, b: i64, value: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
+    let v = ir_make(cx, Const, ty, 0, 0, wrap_int(value, ty), pcx);
     // UNSAFE: a raw pointer given to an inout parameter (fix --only rawptr).
     // SAFETY: it points to one live value for the whole call, as the raw parameter took it.
     ir_append(unsafe { &*cx }, b, v);
@@ -473,7 +476,7 @@ fn loop_is_finite(cx: inout FnCtx, l: i64) -> bool {
 
 // Removes loop l (innermost, exit at the latch to `exit`) when it is
 // finite, has no side effects and none of its values is used after it.
-fn delete_dead_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
+fn delete_dead_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         if !is_innermost(&cx, l) {
             return false;
@@ -481,7 +484,7 @@ fn delete_dead_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
         for i in 0..loop_size(&cx, l) {
             var v = cx.blocks[loop_block(&cx, l, i)].first;
             while v != 0 {
-                if has_effect(&cx, v) {
+                if has_effect(&cx, v, pcx) {
                     return false;
                 }
                 v = cx.insts[v].next;
@@ -520,9 +523,9 @@ fn delete_dead_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
 // which divides trips. All copies are made from the untouched loop first,
 // then chained: each copy's header phis become the previous copy's values
 // for the next iteration, each latch but the last jumps to the next copy.
-fn unroll_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64, trips: i64, factor: i64) {
+fn unroll_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64, trips: i64, factor: i64, pcx: Ctx<Comp>) {
     unsafe {
-        ir_enter(&cx, fi);
+        ir_enter(&cx, fi, pcx);
         let h = loop_header(&cx, l);
         let latch = loop_latch(&cx, l);
         let latch_index = pred_index(&cx, h, latch);
@@ -562,7 +565,7 @@ fn unroll_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64, trips: i64, factor: 
             outv.push(ir_val(&cx, ir_arg(&cx, exits.data[i], 0)));
         }
         for _ in 1..factor {
-            clone_region(&cx, fi, &region, stamp);
+            clone_region(&cx, fi, &region, stamp, pcx);
             hdr.push(cx.blocks[h].aux);
             lat.push(cx.blocks[latch].aux);
             for i in 0..np {
@@ -620,27 +623,27 @@ fn unroll_loop(cx: inout FnCtx, fi: i64, l: i64, exit: i64, trips: i64, factor: 
         free(next.data as *u8);
         free(outv.data as *u8);
         resolve_all(&cx, fi);
-        remove_trivial_phis(&cx, fi);
+        remove_trivial_phis(&cx, fi, pcx);
     }
 }
 
 // The trip count of loop l (in LCSSA form) when transform_loops would
 // unroll it fully: its only exit the latch's, a constant number of trips,
 // small enough; else 0.
-pub fn full_unroll_trips(cx: inout FnCtx, l: i64) -> i64 {
+pub fn full_unroll_trips(cx: inout FnCtx, l: i64, pcx: Ctx<Comp>) -> i64 {
     if latch_exit(&cx, l) == 0 {
         return 0;
     }
     let trips = constant_trip_count(&cx, l, UNROLL_FULL_TRIPS);
     if trips < 1 || trips * loop_inst_count(&cx, l) > UNROLL_FULL_SIZE
-        || (is_cold_block(&cx, loop_header(&cx, l)) && trips > 1) {
+        || (is_cold_block(&cx, loop_header(&cx, l), pcx) && trips > 1) {
         return 0;
     }
     trips
 }
 
 // Unrolls loop l when its trip count allows; returns whether it did.
-fn try_unroll(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
+fn try_unroll(cx: inout FnCtx, fi: i64, l: i64, exit: i64, pcx: Ctx<Comp>) -> bool {
     let size = loop_inst_count(&cx, l);
     let trips = constant_trip_count(&cx, l, SIM_MAX_TRIPS);
     if trips < 1 {
@@ -649,10 +652,10 @@ fn try_unroll(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
     // (0.10: with a profile, a loop that never ran stays as it is, and a
     // hot one may grow twice as much)
     let h = loop_header(&cx, l);
-    if is_cold_block(&cx, h) && trips > 1 {
+    if is_cold_block(&cx, h, pcx) && trips > 1 {
         return false;
     }
-    let partial = if is_hot_count(unsafe { cx.blocks[h].count }) { 2 * UNROLL_PARTIAL_SIZE }
+    let partial = if is_hot_count(unsafe { cx.blocks[h].count }, pcx) { 2 * UNROLL_PARTIAL_SIZE }
         else { UNROLL_PARTIAL_SIZE };
     var factor = 0;
     if trips <= UNROLL_FULL_TRIPS && trips * size <= UNROLL_FULL_SIZE {
@@ -667,7 +670,7 @@ fn try_unroll(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
     }
     // (0.10: a loop the vectorizer takes, when it runs a vector iteration;
     // 0.11: against the loop fully unrolled when it would be)
-    let lanes = vectorizable_lanes(&cx, l, if factor == trips { trips } else { 0 });
+    let lanes = vectorizable_lanes(&cx, l, if factor == trips { trips } else { 0 }, pcx);
     if lanes > 0 && trips >= lanes {
         return false;
     }
@@ -683,24 +686,24 @@ fn try_unroll(cx: inout FnCtx, fi: i64, l: i64, exit: i64) -> bool {
         }
         remove_pred(&cx, h, latch);
         resolve_all(&cx, fi);
-        remove_trivial_phis(&cx, fi);
+        remove_trivial_phis(&cx, fi, pcx);
         return true;
     }
-    form_lcssa(&cx, fi, l);
+    form_lcssa(&cx, fi, l, pcx);
     resolve_all(&cx, fi);
-    unroll_loop(&cx, fi, l, exit, trips, factor);
+    unroll_loop(&cx, fi, l, exit, trips, factor, pcx);
     true
 }
 
 // Exit values, dead loops and unrolling over the loops of fi, innermost
 // first. Returns whether anything changed.
-pub fn transform_loops(cx: inout FnCtx, fi: i64) -> bool {
+pub fn transform_loops(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         var changed = false;
         // Each loop is unrolled at most once: its header is remembered.
         var done = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for _ in 0..200 {
-            canonicalize_loops(&cx, fi);
+            canonicalize_loops(&cx, fi, pcx);
             var did = false;
             // Deepest loops first.
             var best_depth = 0;
@@ -730,10 +733,10 @@ pub fn transform_loops(cx: inout FnCtx, fi: i64) -> bool {
                         continue;
                     }
                     done.push(h);
-                    form_lcssa(&cx, fi, l);
+                    form_lcssa(&cx, fi, l, pcx);
                     resolve_all(&cx, fi);
-                    let replaced = replace_exit_values(&cx, fi, l, exit);
-                    if delete_dead_loop(&cx, fi, l, exit) || try_unroll(&cx, fi, l, exit)
+                    let replaced = replace_exit_values(&cx, fi, l, exit, pcx);
+                    if delete_dead_loop(&cx, fi, l, exit, pcx) || try_unroll(&cx, fi, l, exit, pcx)
                         || replaced {
                         did = true;
                         break;
@@ -746,8 +749,8 @@ pub fn transform_loops(cx: inout FnCtx, fi: i64) -> bool {
             }
             changed = true;
             resolve_all(&cx, fi);
-            remove_trivial_phis(&cx, fi);
-            verify_func(&cx, fi, c"loop transformations");
+            remove_trivial_phis(&cx, fi, pcx);
+            verify_func(&cx, fi, c"loop transformations", pcx);
         }
         free(done.data as *u8);
         changed

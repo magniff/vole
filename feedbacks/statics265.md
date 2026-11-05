@@ -22,6 +22,12 @@ each with a case in tests/refactor/statics0265.t. P4: 772 statics into
 - A trial build's fixpoint before touching the branch: 3,441 functions
   changed and the fixpoint held on the first real run.
 
+- P5b's view as a group line (`view middle::threads::take_tasks EXPR`)
+  and `--prune crate`: 253 statics the tasks touch pruned to the 105 no
+  task's code writes in one run, and the trial's fixpoint held first time;
+  tests/threads_writes.sh then needed only its lists renamed
+  (`base::ctx::Ctx.FIELD`) to cover the fields.
+
 ## What cost time, ranked
 
 1. Imports. `use defs::{X}` (relative to its module), a `pub use` that
@@ -55,3 +61,18 @@ each with a case in tests/refactor/statics0265.t. P4: 772 statics into
 5. [tool] tests/refactor/run.sh's self_explain greps the source for
    `ERR_KIND = c"..."`: a static's name in a test's grep breaks when the
    static moves (now `(ERR_KIND|err_kind)`).
+6. [tool] P5b: a re-exported static named in a `use` beside others
+   (`use crate::front::check::{FNS, lookup_local}`, FNS front::types'
+   through check's `pub use`) is left in the `use` when the re-export goes:
+   one unresolved import, by hand.
+7. [tool] A receiver already a field of the context (`pcx.scratch.push(
+   eq_binary(.., &pcx))`) given an argument that now lends the context:
+   own.conflict, three hoisted by hand; and an inout field argument beside
+   the context let (`conjuncts(c, &pcx.conjs, pcx)`): one, taken out and
+   put back by hand.
+8. [tool] A view's prune followed one inout callee per round and stopped
+   where the write was not an assignment (`note(&HITS)`): fixed in
+   0.26.5 (every function below the view, one round).
+9. [tool] tests/threads_writes.sh matches by name: a field's line `pcx.f`
+   matches a method or `&` of another place's field of the same name on
+   that line too (over-reports, never misses).

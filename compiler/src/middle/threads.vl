@@ -51,6 +51,12 @@ const STACK_SIZE: i64 = 64 * 1024 * 1024;
 
 // Each thread's context, by index (0: the main thread's tasks').
 pub static var POOL_CTX: **FnCtx = 0 as **FnCtx;
+// (0.26.5) The compilation context the pool's tasks read, as C's void *
+// (a static holds no pointer to a type with an allocator): run_pooled
+// lends it to a task let (a view, tools/statics/p5b-ctx.group). pool_run
+// and pool_run_joined set it to their own context before the tasks start
+// and clear it after the last is done; 0 otherwise.
+static var POOL_PCX: *u8 = 0 as *u8;
 
 static var MUTEX: *u8 = 0 as *u8;
 // Broadcast when tasks become ready, when a phase ends and at the stop.
@@ -123,13 +129,17 @@ pub fn pool_stop(pcx: inout Ctx<Comp>) {
 pub fn pool_run(kind: i64, tasks: IntVec, pcx: Ctx<Comp>) {
     unsafe {
         SYMS_FROZEN = true;
+        // (the tasks' view of the context, run_pooled's: cleared below,
+        // when they are all done)
+        POOL_PCX = &pcx as *Ctx<Comp> as *u8;
         if pcx.pool_threads == 1 {
             var i = tasks.count;
             while i > 0 {
                 i -= 1;
-                run_task(POOL_CTX[0], kind, tasks.data[i]);
+                run_task(POOL_CTX[0], kind, tasks.data[i], pcx);
             }
             SYMS_FROZEN = false;
+            POOL_PCX = 0 as *u8;
             return;
         }
         pthread_mutex_lock(MUTEX);
@@ -143,6 +153,7 @@ pub fn pool_run(kind: i64, tasks: IntVec, pcx: Ctx<Comp>) {
         take_tasks(0);
         pthread_mutex_unlock(MUTEX);
         SYMS_FROZEN = false;
+        POOL_PCX = 0 as *u8;
     }
 }
 
@@ -157,6 +168,9 @@ pub fn pool_run(kind: i64, tasks: IntVec, pcx: Ctx<Comp>) {
 pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         SYMS_FROZEN = true;
+        // (the tasks' view of the context, run_pooled's: cleared below,
+        // when they are all done)
+        POOL_PCX = &pcx as *Ctx<Comp> as *u8;
         pthread_mutex_lock(MUTEX);
         PHASE_KIND = kind;
         READY.count = 0;
@@ -180,7 +194,7 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: inou
             } else if READY.count > 0 {
                 let task = READY.pop();
                 pthread_mutex_unlock(MUTEX);
-                run_task(POOL_CTX[0], kind, task);
+                run_task(POOL_CTX[0], kind, task, pcx);
                 pthread_mutex_lock(MUTEX);
                 REMAINING -= 1;
                 JOINED[task] = true;
@@ -198,7 +212,7 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: inou
             }
             let task = READY.pop();
             pthread_mutex_unlock(MUTEX);
-            run_task(POOL_CTX[0], kind, task);
+            run_task(POOL_CTX[0], kind, task, pcx);
             pthread_mutex_lock(MUTEX);
             REMAINING -= 1;
             JOINED[task] = true;
@@ -212,7 +226,28 @@ pub fn pool_run_joined(kind: i64, tasks: IntVec, first: i64, end: i64, pcx: inou
         JOINED = 0 as *bool;
         pthread_mutex_unlock(MUTEX);
         SYMS_FROZEN = false;
+        POOL_PCX = 0 as *u8;
         next
+    }
+}
+
+// Task `task` of a phase of kind `kind`, on the pool's thread context
+// cx, given the pool's view of the compilation context.
+fn run_pooled(cx: *FnCtx, kind: i64, task: i64) {
+    // UNSAFE: a worker thread has no parameter to be lent the compilation
+    // context through: pthread_create passes only a void *, and the pool's
+    // threads outlive one phase, so the context of the phase that runs is
+    // reached through POOL_PCX.
+    // SAFETY: POOL_PCX is set while a phase's tasks run, to the context of
+    // the pool_run or pool_run_joined that started them, which waits for
+    // all of them before it clears it and returns: it points to a live
+    // Ctx<Comp>. The task takes it let and writes nothing through it; the
+    // main thread does not change it while the tasks run either: pool_run
+    // holds it let, and pool_run_joined changes it only in join_task, whose
+    // writes are of fields no running task touches (tests/threads_writes.sh,
+    // JOINED). So no task reads a field while it changes.
+    unsafe {
+        run_task(cx, kind, task, *(POOL_PCX as *Ctx<Comp>));
     }
 }
 
@@ -232,7 +267,7 @@ fn take_tasks(index: i64) {
             let task = READY.pop();
             let kind = PHASE_KIND;
             pthread_mutex_unlock(MUTEX);
-            run_task(cx, kind, task);
+            run_pooled(cx, kind, task);
             pthread_mutex_lock(MUTEX);
             REMAINING -= 1;
             if JOINED != 0 as *bool {

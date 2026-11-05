@@ -10,6 +10,8 @@
 
 use crate::back::abi::fn_uses_c;
 use crate::base::IntVec;
+use crate::base::comp::Comp;
+use crate::base::ctx::Ctx;
 use crate::front::types::{TY_U64, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{address_base, copy_dst, copy_src, find_escaping_slots, is_copy, root_of};
@@ -20,32 +22,23 @@ use crate::middle::ir::{
 use crate::middle::loops::{analyze_loops, innermost_loop};
 use crate::middle::opt::{dominates, resolve_all};
 
-// (0.17) The copies that are moves (COPY_MOVE): `let w = v` of an owned
-// local under --values=error, (function, instruction) pairs, noted by the
-// lowering (lower_let). The own pass guarantees v is not read again before
-// it is initialized again, and a move in a loop needs v initialized again
-// before the next one: with every other use of v before the copy (as
-// elidable requires), v is written whole in each iteration before it is
-// moved, so such a copy is elided in a loop too.
-static var MOVE_COPIES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-
 // Notes the copies the lowering made since instruction `first` of the
 // current function as moves.
-pub fn note_move_copies(cx: inout FnCtx, first: i64) {
+pub fn note_move_copies(cx: inout FnCtx, first: i64, pcx: inout Ctx<Comp>) {
     unsafe {
         for v in first..cx.inst_count {
             if cx.insts[v].block != 0 && is_copy(&cx, v) {
-                MOVE_COPIES.push(cx.irf);
-                MOVE_COPIES.push(v);
+                pcx.move_copies.push(cx.irf);
+                pcx.move_copies.push(v);
             }
         }
     }
 }
 
-fn is_move_copy(fi: i64, c: i64) -> bool {
+fn is_move_copy(fi: i64, c: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        for i in 0..MOVE_COPIES.count / 2 {
-            if MOVE_COPIES.data[2 * i] == fi && MOVE_COPIES.data[2 * i + 1] == c {
+        for i in 0..pcx.move_copies.count / 2 {
+            if pcx.move_copies.data[2 * i] == fi && pcx.move_copies.data[2 * i + 1] == c {
                 return true;
             }
         }
@@ -55,8 +48,8 @@ fn is_move_copy(fi: i64, c: i64) -> bool {
 
 // (0.18.1, back::codecache) The copies noted as moves: (IR function,
 // instruction) pairs.
-pub fn move_copies() -> *IntVec {
-    &MOVE_COPIES
+pub fn move_copies(pcx: inout Ctx<Comp>) -> *IntVec {
+    &pcx.move_copies
 }
 
 // The slot that address v is the start of (a SLOT instruction), or -1.
@@ -96,7 +89,7 @@ fn before(cx: inout FnCtx, u: i64, v: i64) -> bool {
 // Whether instruction u accesses no byte of slot d in [lo, hi): a load,
 // store or copy at constant offsets elsewhere (an address computation is
 // not an access: its own uses are).
-fn misses(cx: inout FnCtx, u: i64, d: i64, lo: i64, hi: i64) -> bool {
+fn misses(cx: inout FnCtx, u: i64, d: i64, lo: i64, hi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let op = cx.insts[u].op;
         if op == Op::Add {
@@ -106,10 +99,10 @@ fn misses(cx: inout FnCtx, u: i64, d: i64, lo: i64, hi: i64) -> bool {
         var size = 0;
         if op == Op::Load {
             addrs = 1;
-            size = type_size(cx.insts[u].ty);
+            size = type_size(cx.insts[u].ty, pcx);
         } else if op == Op::Store {
             addrs = 1;
-            size = type_size(cx.insts[u].imm2);
+            size = type_size(cx.insts[u].imm2, pcx);
         } else if is_copy(&cx, u) {
             addrs = 2;
             size = copy_size(&cx, u);
@@ -141,7 +134,7 @@ fn misses(cx: inout FnCtx, u: i64, d: i64, lo: i64, hi: i64) -> bool {
 // Whether copy c of slot s to slot d at `offset` can be elided: every
 // other use of s comes before it, every use of d's part after it (or
 // before, elsewhere in d).
-fn elidable(cx: inout FnCtx, c: i64, s: i64, d: i64, offset: i64) -> bool {
+fn elidable(cx: inout FnCtx, c: i64, s: i64, d: i64, offset: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let n = cx.slots[s].size;
         for k in 0..cx.copies_uses.count / 2 {
@@ -154,7 +147,7 @@ fn elidable(cx: inout FnCtx, c: i64, s: i64, d: i64, offset: i64) -> bool {
                 return false;
             }
             if slot == d && !before(&cx, c, u)
-                && !(before(&cx, u, c) && misses(&cx, u, d, offset, offset + n)) {
+                && !(before(&cx, u, c) && misses(&cx, u, d, offset, offset + n, pcx)) {
                 return false;
             }
         }
@@ -164,7 +157,7 @@ fn elidable(cx: inout FnCtx, c: i64, s: i64, d: i64, offset: i64) -> bool {
 
 // Slot s becomes the part of slot d at `offset`: its SLOT instructions
 // compute that address.
-fn place_slot(cx: inout FnCtx, fi: i64, s: i64, d: i64, offset: i64) {
+fn place_slot(cx: inout FnCtx, fi: i64, s: i64, d: i64, offset: i64, pcx: Ctx<Comp>) {
     unsafe {
         for j in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[j];
@@ -177,8 +170,8 @@ fn place_slot(cx: inout FnCtx, fi: i64, s: i64, d: i64, offset: i64) {
                     if offset == 0 {
                         cx.insts[v].imm = d;
                     } else {
-                        let base = ir_make(&cx, Op::Slot, TY_U64, 0, 0, d);
-                        let k = ir_make(&cx, Op::Const, TY_U64, 0, 0, offset);
+                        let base = ir_make(&cx, Op::Slot, TY_U64, 0, 0, d, pcx);
+                        let k = ir_make(&cx, Op::Const, TY_U64, 0, 0, offset, pcx);
                         ir_insert_before(&cx, v, base);
                         ir_insert_before(&cx, v, k);
                         cx.insts[base].aux = cx.insts[v].aux;
@@ -212,11 +205,11 @@ fn place_slot(cx: inout FnCtx, fi: i64, s: i64, d: i64, offset: i64) {
 // INLINE_COPY_MAX bytes): smaller locals are scalar replacement's, which
 // the result's memory would stop. A copy must end its block, which returns,
 // so that nothing reads or writes s after it (a defer after the copy).
-fn elide_result_copy(cx: inout FnCtx, fi: i64) -> bool {
+fn elide_result_copy(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
         let f = IRFUNCS[fi].f;
         let result = IRFUNCS[fi].result_ptr;
-        if result == 0 || f < 0 || fn_uses_c(f) {
+        if result == 0 || f < 0 || fn_uses_c(f, pcx) {
             return false;
         }
         let r = ir_val(&cx, result);
@@ -280,10 +273,10 @@ fn elide_result_copy(cx: inout FnCtx, fi: i64) -> bool {
 }
 
 // Elides the copies of function fi that can be. Returns whether any was.
-pub fn elide_copies(cx: inout FnCtx, fi: i64) -> bool {
+pub fn elide_copies(cx: inout FnCtx, fi: i64, pcx: Ctx<Comp>) -> bool {
     unsafe {
-        ir_enter(&cx, fi);
-        let nrvo = elide_result_copy(&cx, fi);
+        ir_enter(&cx, fi, pcx);
+        let nrvo = elide_result_copy(&cx, fi, pcx);
         cx.candidates.count = 0;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
@@ -346,11 +339,11 @@ pub fn elide_copies(cx: inout FnCtx, fi: i64) -> bool {
             let b = cx.insts[c].block;
             if d < 0 || s < 0 || d == s || cx.slots[d].escapes != 0 || cx.slots[s].escapes != 0
                 || offset % cx.slots[s].align != 0 || cx.blocks[b].order < 0
-                || innermost_loop(&cx, b) >= 0 && !is_move_copy(fi, c)
-                || !elidable(&cx, c, s, d, offset) {
+                || innermost_loop(&cx, b) >= 0 && !is_move_copy(fi, c, pcx)
+                || !elidable(&cx, c, s, d, offset, pcx) {
                 continue;
             }
-            place_slot(&cx, fi, s, d, offset);
+            place_slot(&cx, fi, s, d, offset, pcx);
             ir_unlink(&cx, c);
             changed = true;
         }

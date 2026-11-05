@@ -110,6 +110,35 @@ The statics into context structs, phases 4-6 (statics265):
   compiler/src: 1,234 to 451; unjustified unsafe 3,217 to 3,063. `check`
   of compiler/src: 1.03x 0.26.4's; with one compiler, checking the source
   itself costs 11% more (the own pass +29%, over the `&pcx` arguments).
+- The own pass asked whether a context type holds an inout access at
+  every use, walking its hundreds of fields each time; it keeps the answer
+  per type now (`Ctx.inout_memo`, `OwnCx.holds_memo`), and checking
+  compiler/src costs 6.7% fewer instructions.
+- Phase 5a: the 153 statics of middle, back, gen0 and arch that no code
+  generation task reaches joined `pcx` (`tools/statics/p5a-ctx.group`);
+  the tool gave the functions that had `pcx` already the new fields in
+  place. front::cpp::eval's three statics went into the C import's
+  `CImportCx`. Statics in compiler/src: 450 to 294.
+- `fix --only statics` takes `view PATH EXPR` lines: a function that gives
+  its calls the context as EXPR, let (a thread's task loop, which reaches
+  it through a pointer). A view whose callees change the context is
+  refused (refused-view), and `--prune` leaves out, in one round, what
+  each of them writes.
+- Phase 5b, the tasks' view: code generation's tasks are lent the
+  context let. `middle::threads::run_pooled` gives a task
+  `*(POOL_PCX as *Ctx<Comp>)`, the context of the `pool_run` or
+  `pool_run_joined` that started the phase, set before the tasks start
+  and cleared after the last is done; its `UNSAFE:`/`SAFETY:` comments
+  say why no task reads a field while it changes (the main thread changes
+  the context only in `join_task`, whose writes `tests/threads_writes.sh`
+  checks). 105 tables the tasks read (the AST, functions, structs,
+  modules, files, the IR's tables, the inliner's and the code cache's) are
+  fields now (`tools/statics/p5b-ctx.group`, pruned from 253: what a
+  task's code may write stays static, each with its reason in
+  threads_writes.sh). `tests/threads_writes.sh` checks the context's
+  fields as it does statics, `base::ctx::Ctx.FIELD` in its lists. A let
+  `Ctx` is lent by address, never copied. Statics in compiler/src: 294 to
+  190 (16 constants, 1 C-facing).
 
 ### What's new in 0.26.4
 
