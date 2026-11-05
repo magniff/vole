@@ -141,6 +141,27 @@ The front (front272):
   negative. std2's root check: edition.later 254 -> 123 after the traits,
   -> 7 after the types (5 of them `auto_trait`).
 
+The front's side stream (front272b):
+
+- `unsafe fn` types carry their unsafety (F19.3): in the rust edition an
+  `unsafe fn` (or a C function) named as a value has the type `unsafe
+  fn(..)` without `unsafe` around it, a call through one outside an
+  `unsafe` block is `error unsafe` (rustc E0133), and a safe fn coerces
+  to the unsafe type, not the reverse (E0308). The fn type's ABI bit is
+  as before.
+- Arrays as a template over their length (F15.3): `#[array_builtin(N)]`
+  on an impl, a function or a method makes it an item over `[T; N]`,
+  instantiated for each length the program uses (`impl<T: Clone>
+  Clone for [T; N]`, `Vec::from_in([1, 2, 3], gpa)`), with N a `usize`
+  constant inside it; std2's root check has no `edition.later` left.
+- M2's gaps: a character literal is no longer accepted where a `u32`
+  goes (`error distinct.mix`, rustc E0308; `'a' as u32` converts, and
+  a `char` pattern still matches by scalar); the probe's autoref is one
+  `&`, so a `&self` method of an `impl Tr for &S` is not found on an
+  `S` (rustc E0599); an inherent constant of a generic impl (`impl<T>
+  W<T> { const N: .. }`) is read, `W::<i64>::N` and `Self::N`, its
+  type and value with the impl's parameters bound.
+
 Closures in full (clos272):
 
 - A rust-edition closure has a kind, `Fn`, `FnMut` or `FnOnce`
