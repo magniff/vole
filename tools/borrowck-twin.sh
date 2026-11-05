@@ -3,10 +3,16 @@
 # compiled by rustc too, and rustc's verdict (accept or reject) must be the
 # case's. Verdicts only, not messages.
 #
-# usage: tools/borrowck-twin.sh [-v] [-r RUSTC] CASE...
+# usage: tools/borrowck-twin.sh [-v] [-r RUSTC] [--std2] CASE...
 #
 #   -v        print every case's line (default: only mismatches and the
 #             summary)
+#   --std2    (0.27.2) cases spelled on std2: the capability's textual
+#             inverse first (plan-0272 §4): `fn main(gpa: Gpa)` ->
+#             `fn main()`, `, Gpa>` and `<Gpa>` dropped, `X_in(.., gpa)`
+#             and `X_in(gpa)` -> `X(..)`, `format_in(A, ` -> `format!(`,
+#             std2-only imports (`ToStringIn`, `DefaultIn`, `CloneIn`,
+#             `CollectIn`, `FromIteratorIn`) dropped
 #   -r RUSTC  the rustc to run (default: rustc on PATH, else
 #             ~/.cargo/bin/rustc); none found: exit 77 (a gate SKIP)
 #
@@ -40,10 +46,12 @@
 
 VERBOSE=0
 RUSTC=
+STD2=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v) VERBOSE=1 ;;
         -r) RUSTC=$2; shift ;;
+        --std2) STD2=1 ;;
         -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --) shift; break ;;
         -*) echo "borrowck-twin: unknown option $1" >&2; exit 2 ;;
@@ -116,10 +124,20 @@ for case_ in "$@"; do
     fi
     rs="$WORK/$name.rs"
     awk '{ if ($0 ~ /^[ \t]*\/\/ [A-Z][A-Z0-9-]*(\([^)]*\))?:/) print ""; else print }' "$case_" \
-        | sed -E 's/(^|[^A-Za-z0-9_!])println\(/\1println!(/g' >"$rs"
+        | sed -E 's/(^|[^A-Za-z0-9_!])println\(/\1println!(/g' >"$rs.0"
+    if [ $STD2 -eq 1 ]; then
+        # (the capability's inverse, --std2)
+        sed -E -e 's/fn main\(gpa: Gpa\)/fn main()/' -e 's/, Gpa>/>/g' -e 's/<Gpa>//g' \
+            -e 's/format_in\([a-z_]+, /format!(/g' \
+            -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(gpa\)/\1()/g' \
+            -e 's/([A-Za-z_][A-Za-z0-9_]*)_in\(([^()]*), gpa\)/\1(\2)/g' \
+            -e '/^use .*(ToStringIn|DefaultIn|CloneIn|CollectIn|FromIteratorIn)/d' "$rs.0" >"$rs"
+    else
+        mv "$rs.0" "$rs"
+    fi
     if "$RUSTC" --edition 2021 --crate-type bin -C panic=abort -A warnings -D static-mut-refs \
         --emit=metadata -o "$WORK/out.rmeta" "$rs" >"$WORK/out" 2>&1; then
-        got=accept
+        got=accept first= gotcode=
     else
         got=reject
         first=$(awk '/^error\[E[0-9]+\]/ { print substr($0, 7, 5); exit }
