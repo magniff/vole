@@ -94,3 +94,10 @@ each with a case in tests/refactor/statics0265.t. P4: 772 statics into
    refusal): it needs to take a context's field (`pcx.x: *T` with
    `pcx.x_count`), where every raw table of compiler/src is now, to
    remove the unsafe their indexing needs.
+14. [tool] (fixed in 0.26.5, found by the gate's -O0 chain) A static lent
+   beside the context as an element's address (`add_roots(.., &COL_STORED[0],
+   .., &pcx)`, a `*i64` the callee indexes [0] and [1]) was taken into a
+   one-element local in P4: the callee's m[1] wrote past it, on the stack
+   (a -O0 B1 crashed in root_param; -O2 hid it). The tool now takes the
+   whole static (`var pcx_x = pcx.x; f(&pcx_x[0], &pcx)`); col_stored
+   fixed by hand the same way.
