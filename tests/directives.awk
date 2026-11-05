@@ -46,12 +46,17 @@
     else if (key == "REQUIRES") requires = requires " " value
     else if (key == "CROSS") cross = value
     else if (key == "TIMEOUT") tmult = value + 0
+    # (0.27.0: a rust-edition case, whose functions warn borrowck.unchecked)
+    else if (key == "EDITION") edition = 1
     # (0.19: every ASM line, for the CROSS target's)
     if (substr(key, 1, 4) == "ASM(" || substr(key, 1, 8) == "ASM-NOT(") {
         allkey[nall] = key; allval[nall] = value; nall++
     }
 }
 END {
+    # (0.27.0) a rust-edition case is compiled without borrowck.unchecked
+    # (every function's, until 0.27.1), but for one that expects it
+    if ((edition || flags ~ /--edition/) && warnings !~ /borrowck/) flags = flags " --allow=borrowck.unchecked"
     printf "%s", args > (dir "/args")
     printf "%s", stdin > (dir "/stdin")
     printf "%s", envs > (dir "/env")
