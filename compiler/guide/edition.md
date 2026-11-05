@@ -118,7 +118,7 @@ its captures is checked where the closure is made), so 0.27.1's
 
 ## What comes later: edition.later
 
-What the edition reads but 0.27.0 does not have is one soft error,
+What the edition reads but does not have yet is one soft error,
 `edition.later`, naming the feature and its release; the rest of the
 program is checked, and an impl or a function the feature is in is left
 out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
@@ -128,7 +128,7 @@ out (`#[array_builtin(N)]`, a blanket impl, an impl on an instance).
 | feature | release |
 |---|---|
 | `const_ptr_write` (a write through `*const T`) | 0.27.1 |
-| `char`, `impl_trait_return`, `where_bound`, `tuple_struct`, `supertrait`, `assoc_bounds`, `impl_for_ref`, `assoc_const`, `array_builtin`, `blanket_impl`, `impl_on_instance`, `return_inference`, `qualified_path` (`<T as Tr>::X`), `auto_trait` (`Send`, `Sync`), `primitive_builtin` (`#[builtin_impls(..)]`) | 0.27.2 |
+| `impl_trait_return`, `where_bound` (a bound on a type that is not a parameter), `array_builtin`, `qualified_path` (a longer path than `<T as Tr>::X`), `auto_trait` (`Send`, `Sync`) | 0.27.2 |
 
 ```vole
 // EDITION: rust
