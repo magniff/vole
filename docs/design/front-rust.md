@@ -642,7 +642,11 @@ supplies as F21.4 does (the written body is not checked): `wrapping_
 `floor`, `ceil`, `round`, `trunc`, `powi`, `powf`, `is_nan`, `is_finite`,
 `to_bits`, `from_bits`, and the consts `MIN`, `MAX`, `BITS`, `EPSILON`,
 `INFINITY`, `NAN` (F3.1's inherent consts). A method of such an impl
-not in the list is an ordinary method. The list is Z3.1's key
+whose name is not in the list and whose body is a placeholder (a bare
+`todo()`, or a body the "built in" comment marks) is `error
+attr.builtin` ("no intrinsic named .."); a method with a real body is
+an ordinary method, and a listed name with a real body is the
+intrinsic still (the body is not checked). The list is Z3.1's key
 `prim_intrinsics` and the gate counts it. *Anchor:* `front/traits.vl:
 intrinsic`, `front/derive/intrinsic.vl`, `arch/mod.vl: intrinsic`.
 
@@ -732,9 +736,15 @@ char`). *Anchor:* `infer_from` (today: arguments and one hint),
 infer_param_error`.
 
 **F18.2 (no expected type).** `let x = Vec::new_in(a);` with `T` fixed
-by a later `x.push(1)` is **not** inferred (vole has no deferred
-unification variables; FL1): `type.infer` with `try: let x: Vec<i64,
-_>` or the turbofish. std2 and the corpus annotate.
+by a later `x.push(1)` is **not** inferred in 0.27.2 (vole has no
+deferred unification variables; FL1, `edition.later: deferred_infer
+(0.27.4)`, with the compiler's own move to the edition, where it will
+matter; the translator of 0.27.3 writes the annotation from MVS's known
+types). The error is `type.infer` at the `let`; its `try:` gives the
+annotation the first later use determines when the checker can see one
+(`try: let x: Vec<i64, Gpa> = Vec::new_in(a)`: the first method call,
+assignment or argument of `x` in the body whose parameter type binds
+`T`), else the turbofish. std2 and the corpus annotate.
 
 **F18.3 (integer and float literals).** An unsuffixed integer literal
 has no type of its own: it takes the type of the context it unifies
@@ -888,9 +898,13 @@ marks `panic`, `unreachable`, `todo`, `unimplemented`, `assert*`,
 `panic_str`; the program may mark its own. The positions are what
 MVS's `panic_str` receives today (`format.vl: panic_call`); `EXIT: 101`
 output names them. The attribute is read in the rust edition only.
-*Anchor:* `front/parser/items/attrs.vl`, `front/check/format.vl:
-panic_call`, `front/check/calls/paths.vl: call_function` (the hidden
-argument).
+**ABI note:** a tracked function's calling convention differs from its
+signature's by the hidden argument; none is `extern "C"` or exported to
+C (`#[track_caller]` on an `extern` function or a `#[no_mangle]` item is
+`error attr.builtin`), and a `fn` pointer to a tracked function is the
+pointer to a shim that passes the pointer-taking site. *Anchor:*
+`front/parser/items/attrs.vl`, `front/check/format.vl: panic_call`,
+`front/check/calls/paths.vl: call_function` (the hidden argument).
 
 ## 4. Format and derives
 
@@ -1206,9 +1220,11 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
   T`, `impl str` in a program, which rustc reserves to core (E0390).
 
 **Strict (vole rejects what rustc accepts).**
-- **FL1 (no deferred inference).** F18.2: a parameter fixed only by a
-  later statement is `type.infer`; rustc's unification variables infer
-  it.
+- **FL1 (no deferred inference; later, 0.27.4).** F18.2: a parameter
+  fixed only by a later statement is `type.infer` (its `try:` the
+  annotation the first use determines); rustc's unification variables
+  infer it. Deferred inference comes with 0.27.4, when the compiler's
+  own source moves to the edition.
 - **FL2 (overlap by satisfiability, strict when undecidable).** F4.2
   errs on the side of `trait.overlap` where rustc's coherence (with
   negative reasoning on fundamental types and the orphan rule) would

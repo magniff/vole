@@ -14,8 +14,8 @@ use crate::base::diag::{
     err_int, err_str, err_sym, err_try_tool, error_at, error_at_soft,
 };
 use crate::front::ast::{
-    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NodeKind, REPR_C,
-    REPR_INT, child,
+    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_SIG_FAILED, FN_UNSAFE, NODE_REF_MUT,
+    NodeKind, REPR_C, REPR_INT, child,
 };
 use crate::front::ast::NodeKind::{
     CStr, Const, Enum, ExternFn, Fn, Impl, Mod, Static, Str, Struct, Trait, TyArray, TyName,
@@ -32,7 +32,7 @@ use crate::front::contracts::is_distinct;
 use crate::front::convert::{generic_trait_impl, impl_fn_symbol};
 use crate::front::distinct::is_view_distinct;
 use crate::front::generics::{
-    TPL_DISTINCT, TPL_NONE, TPL_SLICE, env_lookup, template_name, template_of_key,
+    TPL_DISTINCT, TPL_NONE, TPL_PATTERN, TPL_SLICE, env_lookup, template_name, template_of_key,
 };
 use crate::front::modules::{child_module, file_of_pos, item_symbol, join_sym, module_of, qualify};
 use crate::front::parser::items::ITEM_PUBLIC;
@@ -593,6 +593,22 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
         // From<i64> for T`, has no name in the type: generic_trait_call
         // finds it; its symbol is its impl's)
         let gt = generic_trait_impl(impl_of_fn(f, pcx), pcx);
+        if tpl == TPL_PATTERN {
+            // RULE: F5.1, F4.1 (a pattern impl's method: pattern_method_of
+            // finds it by its header; its symbol is its header's node)
+            let out = buf_new();
+            buf_fmt(out, format_args("P{self_node}"));
+            pcx.fns[f].name = method_symbol(intern(buf_slice(out), &pcx), name, &pcx);
+            let shown = buf_new();
+            buf_bytes(shown, SRC[pcx.nodes[self_node].start..pcx.nodes[self_node].end]);
+            pcx.fns[f].display = join_sym(intern(buf_slice(shown), &pcx), c"::", name, &pcx);
+            if gt >= 0 {
+                pcx.fns[f].name = impl_fn_symbol(pcx.fns[f].name, gt, &pcx);
+                return;
+            }
+            pcx.gmethods.push(MethodInfo { ty: TPL_PATTERN, name: name, f: f });
+            return;
+        }
         if tpl != TPL_NONE && gt >= 0 {
             let base = if tpl == TPL_SLICE { intern_c(c"TS", &pcx) }
                 else if tpl >= TPL_DISTINCT { distinct_tpl_symbol(tpl, &pcx) }
@@ -634,14 +650,22 @@ pub fn collect_method(f: i64, pcx: inout Ctx<Comp>) {
         let t = resolve_type(self_node, &pcx);
         let kind = pcx.types[t].kind;
         if kind != TyKind::Struct && kind != TyKind::Enum && kind != TyKind::Distinct
-            && impl_of_fn(f, pcx) < 0 {
+            && impl_of_fn(f, pcx) < 0
+            && !crate::front::rust::rust_at(pcx.nodes[item].start, &pcx) {
             err_begin(pcx.nodes[item].start, &pcx);
             err_str(c"impl blocks are only allowed for structs and enums, not '", pcx);
             err_type(t, pcx);
             err_str(c"'", pcx);
             err_end(&pcx);
         }
-        if find_method(t, name, pcx) >= 0 && gt < 0 {
+        let first_f = find_method(t, name, pcx);
+        // RULE: F9.1 (0.27.2: two traits' methods of one name, or a trait's
+        // and an inherent one, on one type: find_method prefers the inherent
+        // one, the call site chooses among the traits')
+        let clash_ok = first_f >= 0 && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx)
+            && (impl_of_fn(f, pcx) >= 0 || impl_of_fn(first_f, pcx) >= 0)
+            && impl_of_fn(f, pcx) != impl_of_fn(first_f, pcx);
+        if first_f >= 0 && gt < 0 && !clash_ok {
             err_begin(pcx.nodes[item].start, &pcx);
             err_str(c"duplicate method '", pcx);
             err_sym(name, pcx);
@@ -712,12 +736,16 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
     unsafe {
         let self_node = pcx.nodes[item].h;
         let tpl = template_of_type_node(self_node, &pcx);
-        if tpl == TPL_NONE {
-            // (0.14: `impl<T> [T]`)
-            return slice_template(self_node, pcx.nodes[item].g, &pcx);
-        }
         let params = pcx.nodes[item].g;
         let impl_count = if params == 0 { 0 } else { pcx.nodes[params].a };
+        // RULE: F5.1 (0.27.2: the rust edition's impl on any other header is
+        // a pattern impl: `impl<'a, T> Option<&'a T>`, `impl<T> *const T`)
+        let pattern = impl_count > 0 && crate::front::rust::rust_at(pcx.nodes[item].start, &pcx);
+        if tpl == TPL_NONE {
+            // (0.14: `impl<T> [T]`)
+            let s = slice_template(self_node, params, &pcx);
+            return if s == TPL_NONE && pattern { TPL_PATTERN } else { s };
+        }
         if impl_count == 0 {
             // `impl Vec<i64>`: methods of one instance.
             return TPL_NONE;
@@ -729,6 +757,9 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
         if g != 0 && pcx.nodes[g].count < full && pcx.nodes[g].count == impl_count {
             impl_args_error(item, self_node, tpl, params, &pcx);
         }
+        if pattern && (g == 0 || pcx.nodes[g].count != impl_count) {
+            return TPL_PATTERN;
+        }
         if g == 0 || pcx.nodes[g].count != impl_count {
             error_at(pcx.nodes[self_node].start, c"a generic impl block is for its type with its parameters as arguments: 'impl<T> Vec<T>'", &pcx);
         }
@@ -737,6 +768,9 @@ fn impl_template(item: i64, pcx: inout Ctx<Comp>) -> i64 {
             if pcx.nodes[arg].kind != TyName
                 || pcx.nodes[arg].a != pcx.nodes[child(params, i, pcx)].a
                 || pcx.nodes[arg].g != 0 {
+                if pattern {
+                    return TPL_PATTERN;
+                }
                 error_at(pcx.nodes[arg].start, c"a generic impl block is for its type with its parameters as arguments, in order: 'impl<T> Vec<T>'", &pcx);
             }
         }
@@ -802,10 +836,21 @@ pub fn slice_template(n: i64, params: i64, pcx: inout Ctx<Comp>) -> i64 {
         return TPL_NONE;
     }
     let elem = pcx.nodes[n].a;
+    // (0.27.2: the rust edition's `impl<'a, T> Tr for &'a mut [T]` is a
+    // pattern impl, apart from `&'a [T]`'s, F6.1)
+    if (pcx.nodes[n].p & NODE_REF_MUT) != 0
+        && crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+        return TPL_NONE;
+    }
     let impl_count = if pcx.nodes[params].a != 0 { pcx.nodes[params].a }
         else { pcx.nodes[params].count };
     if impl_count != 1 || pcx.nodes[elem].kind != TyName || pcx.nodes[elem].count != 0
         || pcx.nodes[elem].g != 0 || pcx.nodes[elem].a != pcx.nodes[child(params, 0, pcx)].a {
+        // (0.27.2: the rust edition's `impl<T, I> Index<I> for [T]` is a
+        // pattern impl, F4.1)
+        if crate::front::rust::rust_at(pcx.nodes[n].start, &pcx) {
+            return TPL_NONE;
+        }
         error_at(pcx.nodes[n].start,
             c"a generic impl for slices is for '[T]', T its only parameter: 'impl<T> [T]'", &pcx);
     }

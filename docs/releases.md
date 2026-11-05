@@ -83,6 +83,39 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
 
 ### What's new in 0.27.2
 
+The rust edition gets std2 as its std, the front's gaps filled and closures in full; the front's rules are docs/design/front-rust.md.
+
+The front (front272):
+
+- `docs/design/front-rust.md`: the typing rules of the rust edition's
+  front end with stable ids (F0.1 .. F32.1, Z1 .. Z9's front side, the
+  bound-only rule D22.3), each anchored to the front item it changes;
+  the codes with their rustc twins; the divergences from rustc (FR1 ..
+  FR3, FL1 .. FL8); a map from every gap std2's bodies hit to its rule.
+- Pattern impls (F4.1, F5.1, F6.1, F13.1, F14.1): an impl whose header
+  is any type pattern, a blanket `impl<T: Tr> U for T`, one on an
+  instance `impl<'a, T> Option<&'a T>`, for a reference `impl<'a, T>
+  IntoIterator for &'a mut [T]`, or with a parameter only the trait's
+  arguments fix `impl<T> SliceIndex<[T]> for usize`, is matched by a
+  strict unifier that binds its parameters; its methods are found for
+  the receiver's own type first, as Rust's probe does; `Self::A` inside
+  an impl is that impl's own associated type, and a blanket impl's
+  definition yields to a direct impl's.
+- Supertraits (F2): `trait A: B + C`; a `T: A` bound gives T the
+  supertraits' functions; an impl of A is checked to implement them
+  (`error trait.unmet`).
+- `where` predicates on any subject (F10, F21.3): `where Self:
+  DoubleEndedIterator` on a trait method, `where I::Item: Clone` on a
+  function, checked with the instance's parameters, or at the call for
+  a method of one type, which is not the type's when they fail.
+- A generic trait's default bodies (F12): `fn ne(&self, o: &Rhs) ->
+  bool { !self.eq(o) }`, copied into each impl with the trait's
+  arguments substituted; two traits' methods of one name on one type
+  (F9.1); `Tr::m(x, args)` as the method call `x.m(args)` (F8.2).
+- Corpus: `tests/run/rust_f_*`, one case per rule, positive and
+  negative. std2's root check: edition.later 254 -> 123 on the tree's
+  std2.
+
 Closures in full (clos272):
 
 - A rust-edition closure has a kind, `Fn`, `FnMut` or `FnOnce`
