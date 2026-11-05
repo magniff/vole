@@ -25,8 +25,8 @@ use crate::front::parser::rust::lifetimes_of;
 use crate::front::types::{REF_MUT, REF_SHARED, TyKind, fn_param, type_elem, variant_field};
 use crate::places::front::{enum_info, fn_node, fn_param_count, fn_ret, tlist_at};
 use crate::places::ir::{
-    BK_RAW, Body, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_REF, RV_SLICE,
-    SK_ASSIGN, SK_CALL, block_count, block_len, block_start, full_place_type, op_a, op_b,
+    BK_RAW, BK_RAW_MUT, Body, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, RV_REF,
+    RV_SLICE, SK_ASSIGN, SK_CALL, block_count, block_len, block_start, full_place_type, op_a, op_b,
     op_is_place, op_kind, struct_field_count, struct_field_ty,
 };
 
@@ -135,7 +135,8 @@ pub fn assign_regions(pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
     var csig = sig_new();
     for s in 0..pbody.stmts.len() as i64 {
         let st = pbody.stmts[s];
-        if st.kind == SK_ASSIGN && (st.c == RV_REF && st.d != BK_RAW || st.c == RV_SLICE) {
+        if st.kind == SK_ASSIGN
+            && (st.c == RV_REF && st.d != BK_RAW && st.d != BK_RAW_MUT || st.c == RV_SLICE) {
             push_row(RO_LOAN, s, 0, 0, &pbody);
             pbody.stmts[s].e = region_count(pbody);
         } else if st.kind == SK_CALL && st.c >= 0 {
@@ -369,6 +370,70 @@ fn verify_place(l: i64, p: i64, out: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp
 // (as its env's fields; by-reference captures are raw until M2: D10.2).
 pub fn slot_count(t: i64, pcx: Ctx<Comp>) -> i64 {
     slots_in(t, 0, pcx)
+}
+
+// RULE: D8.3 Whether a value of type t is copied, not moved, by a
+// rust-edition operand (Rust's Copy): a scalar, a fn, `&T`, a raw
+// pointer, a shared view; an array or a tuple of Copy; a closure whose
+// captures are; a rust-edition struct or enum with `#[derive(Copy)]`
+// (its type arguments Copy) or an `impl Copy`; another one (std's) when
+// it has no drop glue and its type arguments are Copy.
+pub fn rust_copy(t: i64, pcx: inout Ctx<Comp>) -> bool {
+    copy_in(t, 0, &pcx)
+}
+
+fn copy_in(t: i64, depth: i64, pcx: inout Ctx<Comp>) -> bool {
+    if t <= 0 || depth > 16 {
+        return true;
+    }
+    let k = pcx.types[t].kind;
+    if k == TyKind::Ptr || k == TyKind::Slice {
+        return pcx.types[t].b != REF_MUT;
+    }
+    if k == TyKind::Array || k == TyKind::Distinct {
+        return copy_in(pcx.types[t].a, depth + 1, &pcx);
+    }
+    if k == TyKind::Tuple {
+        for i in 0..pcx.types[t].count {
+            if !copy_in(type_elem(t, i, pcx), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k == TyKind::Struct && pcx.structs[pcx.types[t].a].closure != 0 {
+        let s = pcx.types[t].a;
+        for i in 0..struct_field_count(s, pcx) {
+            if !copy_in(struct_field_ty(s, i, pcx), depth + 1, &pcx) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if k != TyKind::Struct && k != TyKind::Enum {
+        return true;
+    }
+    let node = adt_node(t, pcx);
+    var derived = false;
+    if node > 0 && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        for i in 0..pcx.rust_copy.count {
+            derived = derived || pcx.rust_copy.get(i) == node;
+        }
+        if !derived {
+            // (an `impl Copy`, its own bounds checked by has_impl)
+            let copy = crate::front::traits::std_trait(c"Copy", &pcx);
+            return copy >= 0 && crate::front::traits::has_impl(copy, t, &pcx);
+        }
+    } else if crate::places::front::type_glue(t, &pcx) {
+        return false;
+    }
+    // (a derive's `T: Copy` bounds; std's own types' arguments)
+    for i in 0..adt_targ_count(t, pcx) {
+        if !copy_in(adt_targ(t, i, pcx), depth + 1, &pcx) {
+            return false;
+        }
+    }
+    true
 }
 
 fn slots_in(t: i64, depth: i64, pcx: Ctx<Comp>) -> i64 {
@@ -687,7 +752,8 @@ pub fn sig_of(f: i64, sig: inout Sig<Comp>, pcx: inout Ctx<Comp>) {
     }
     // (the declared lifetimes, the impl's then the function's, in order;
     // their bounds `'b: 'a` declared)
-    let holders = [lifetimes_of(-node, pcx), lifetimes_of(node, pcx)];
+    let holders = [lifetimes_of(-node, pcx), lifetimes_of(node, pcx),
+        lifetimes_of(crate::front::parser::rust::where_key(node), pcx)];
     for h in holders {
         if h > 0 {
             for i in 0..pcx.nodes[h].count {

@@ -56,18 +56,19 @@ use crate::places::front::{
     static_ty, struct_field_name, type_glue, variant_discr,
 };
 use crate::places::ir::{
-    AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, BK_MUT, BK_MUT2, BK_RAW,
-    BK_SHARED, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GE, BO_GT, BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR,
-    BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, Body, DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC,
-    IK_VECTOR, LF_BORROWED, LF_MUT, LF_PARAM, LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST,
-    OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT, OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST,
-    PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION, PJ_VARIANT, PStmt, RV_AGG, RV_BINARY, RV_CAST,
-    RV_CHECKED, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT, RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT,
-    SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC, SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN,
-    TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT, block_count, block_len, block_start,
-    body_begin, emit, enter_block, has_flag, is_union_type, local_count, new_block, new_local, op_a,
-    op_b, op_kind, ops_mark, proj, proj_kind, proj_parent, proj_val, push_op, reachable,
-    struct_closure, terminate, undistinct,
+    AK_ARRAY, AK_BOUNDS, AK_CLOSURE, AK_STRUCT, AK_TUPLE, AK_VARIANT, AS_CONJUNCT, AS_UNDECIDED,
+    BK_FAKE, BK_MUT, BK_MUT2, BK_RAW, BK_RAW_MUT, BK_SHARED, BO_ADD, BO_AND, BO_DIV, BO_EQ, BO_GE,
+    BO_GT, BO_LE, BO_LT, BO_MUL, BO_NE, BO_OR, BO_REM, BO_SHL, BO_SHR, BO_SUB, BO_XOR, Body,
+    DS_UNDECIDED, IK_ARCH, IK_CONTRACT, IK_PANIC, IK_VECTOR, LF_BORROWED, LF_MUT, LF_PARAM,
+    LF_RETURN, LF_STATIC, LF_TEMP, LF_USER, OK_CONST, OK_COPY, OK_CSTR, OK_FLOAT, OK_FN, OK_INT,
+    OK_MOVE, OK_PLACE, OK_STR, OK_UNIT, PJ_CONST, PJ_DEREF, PJ_FIELD, PJ_INDEX, PJ_UNION,
+    PJ_VARIANT, PStmt, RV_AGG, RV_BINARY, RV_CAST, RV_CHECKED, RV_DISCR, RV_LEN, RV_REF, RV_REPEAT,
+    RV_SLICE, RV_UNARY, RV_USE, SK_ASSERT, SK_ASSIGN, SK_CALL, SK_DEAD, SK_DROP, SK_INTRINSIC,
+    SK_LIVE, SK_MENTION, TK_GOTO, TK_RETURN, TK_SWITCH, TK_UNREACHABLE, UO_BITNOT, UO_NEG, UO_NOT,
+    block_count, block_len, block_start, block_term, body_begin, emit, enter_block, has_flag,
+    is_union_type, local_count, new_block, new_local, op_a, op_b, op_kind, ops_mark, proj,
+    proj_indirect, proj_kind, proj_parent, proj_val, push_op, reachable, struct_closure, terminate,
+    undistinct,
 };
 
 // ---- State ----
@@ -425,11 +426,20 @@ fn ops_add(at: i64, n: i64, pbody: inout Body<Comp>, pcx: Ctx<Comp>) -> i64 {
 // needs drop when `moving`, but out of a borrowed copy (a copy of a
 // borrowed copy is one too), else a copy.
 fn place_operand(l: i64, p: i64, ty: i64, moving: bool, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
-    if moving && ty > 0 && type_glue(ty, &pcx) && !has_flag(l, LF_BORROWED, pbody) {
+    // (0.27.1: in the rust edition a value moves unless its type is Copy,
+    // glue or not, D8.3)
+    let moves = if pcx.rust_body { !crate::places::regions::rust_copy(ty, &pcx) }
+        else { type_glue(ty, &pcx) };
+    // (and in the rust edition out of a borrowed copy's referent or element
+    // too: the borrow checker's move_out, which reports what the backstop
+    // does here)
+    let rust_out = pcx.rust_body && proj_indirect(p, pbody);
+    if moving && ty > 0 && moves && (!has_flag(l, LF_BORROWED, pbody) || rust_out) {
         set_op(OK_MOVE, l, p, &pcx);
         // (a move the backstop looks at: through a projection, or out of
         // a static; a whole local's never is one)
-        pcx.moves_suspect = pcx.moves_suspect || p != 0 || has_flag(l, LF_STATIC, pbody);
+        pcx.moves_suspect = pcx.moves_suspect
+            || !pcx.rust_body && (p != 0 || has_flag(l, LF_STATIC, pbody));
     } else {
         set_op(OK_COPY, l, p, &pcx);
     }
@@ -720,7 +730,10 @@ fn own_temp_place(b: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
 fn ref_kind(e: i64, ty: i64, pcx: Ctx<Comp>) -> i64 {
     let t = undistinct(ty, pcx);
     if t > 0 && pcx.types[t].kind == TyKind::Ptr && pcx.types[t].b == 0 {
-        return BK_RAW;
+        // (0.27.1: the rust edition's `&mut x` where a `*mut T` goes,
+        // D2.2)
+        return if pcx.edition != 0 && (pcx.nodes[e].p & NODE_REF_MUT) != 0 { BK_RAW_MUT }
+            else { BK_RAW };
     }
     if (pcx.nodes[e].p & NODE_REF_MUT) != 0 || t > 0 && pcx.types[t].kind == TyKind::Ptr
         && pcx.types[t].b == REF_MUT {
@@ -925,10 +938,33 @@ fn lower_unary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx
 
 fn emit_ref(dl: i64, dp: i64, l: i64, p: i64, kind: i64, node: i64, pbody: inout Body<Comp>,
     pcx: inout Ctx<Comp>) {
+    if kind != BK_RAW && kind != BK_RAW_MUT && kind != BK_FAKE && l >= 0
+        && has_flag(l, LF_STATIC, pbody) && pcx.edition != 0 && node > 0
+        && crate::places::front::static_mutable(pbody.locals[l].src, pcx)
+        && crate::front::rust::rust_at(pcx.nodes[node].start, &pcx) {
+        static_mut_ref_error(l, node, pbody, &pcx);
+    }
     let at = ops_mark(pbody);
     set_op(OK_PLACE, l, p, &pcx);
     push_now(&pbody, pcx);
     emit(SK_ASSIGN, dl, dp, RV_REF, kind, 0, at, 1, node, &pbody);
+}
+
+// (0.27.1, docs/design/borrowck.md D6.2.5) error borrowck.static_mut_ref:
+// a reference (`&S`, `&mut S`, or of a part) to a `static mut` S, in or
+// out of `unsafe` (Rust 2024's rule): only its raw address is taken.
+// RULE: D6.2.5
+fn static_mut_ref_error(l: i64, node: i64, pbody: Body<Comp>, pcx: inout Ctx<Comp>) {
+    let saved = pcx.err_kind;
+    pcx.err_kind = c"borrowck.static_mut_ref";
+    crate::base::diag::err_begin(pcx.nodes[node].start, &pcx);
+    crate::base::diag::err_fmt(
+        format_args("a reference to the `static mut` '{}': only its raw address may be taken",
+            sym_text(pbody.locals[l].src, pcx)),
+        pcx);
+    crate::base::diag::err_help(c"take a raw pointer where you need it: `let p: *mut T = &mut S;` and read or write through it in `unsafe` (Rust 2024, rustc's static_mut_refs; `&raw mut S` comes later)", pcx);
+    crate::base::diag::err_end_soft(&pcx);
+    pcx.err_kind = saved;
 }
 
 fn lower_binary(e: i64, dl: i64, dp: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
@@ -1248,7 +1284,14 @@ fn lower_contract(n: i64, pbody: inout Body<Comp>, pcx: inout Ctx<Comp>) {
         let fail = new_block(&pbody);
         let at = ops_mark(pbody);
         push_now(&pbody, pcx);
+        let b = pbody.cur_block;
         switch_bool(at, fail, pass, conj, &pbody);
+        // (0.27.1: its decision, AS_UNDECIDED, reserved for 0.27.4)
+        if b >= 0 {
+            let term = block_term(b, pbody);
+            pbody.stmts[term].d = AS_CONJUNCT;
+            pbody.stmts[term].e = AS_UNDECIDED;
+        }
         enter_block(fail, &pbody);
         contract_failure(n, conj, &pbody, &pcx);
         enter_block(pass, &pbody);
@@ -1328,7 +1371,11 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
         var kind = BK_SHARED;
         if c_callee || mode == P_RAW || at_ty > 0 && pcx.types[at_ty].kind == TyKind::Ptr
             && pcx.types[at_ty].b == 0 {
-            kind = BK_RAW;
+            // (0.27.1: `&mut x` given as a `*mut T`, the rust edition's, D2.2)
+            kind = if pcx.edition != 0
+                && (mode == P_MUT || (pcx.nodes[arg].p & NODE_REF_MUT) != 0) {
+                BK_RAW_MUT
+            } else { BK_RAW };
         } else if mode == P_MUT || (pcx.nodes[arg].p & NODE_REF_MUT) != 0 {
             let receiver = i == 0 && pcx.nodes[arg].start == pcx.nodes[operand_e].start;
             kind = if receiver { BK_MUT2 } else { BK_MUT };
@@ -1342,6 +1389,14 @@ fn lower_arg(i: i64, arg: i64, mode: i64, c_callee: bool, pbody: inout Body<Comp
     // only reads it: a raw or C parameter, a view)
     let moving = mode == P_VALUE && !c_callee;
     arg_operand(arg, moving, &pbody, &pcx);
+    if pcx.rust_body && pcx.opk == OK_MOVE && is_place_expr(arg, pcx) {
+        // (0.27.1: a place moved into the call gets its own statement at
+        // the argument, `_t = move v`, as rustc's MIR: the borrow
+        // checker's errors name the argument, not the call)
+        let t = new_temp(pcx.nodes[arg].ty, arg, false, &pbody, &pcx);
+        emit_use(t, 0, arg, &pbody, pcx);
+        set_op(OK_MOVE, t, 0, &pcx);
+    }
 }
 
 // ---- Assignment ----
@@ -2090,7 +2145,10 @@ fn bind_one(pat: i64, l: i64, p: i64, ty: i64, guard: bool, pbody: inout Body<Co
             else { BK_SHARED };
         emit_ref(ir, 0, l, p, kind, pat, &pbody, &pcx);
     } else {
-        place_operand(l, p, ty, !borrowed, pbody, &pcx);
+        // (0.27.1: a rust-edition read of a referent or an element that is
+        // not Copy moves it, the borrow checker's move_out, D8.3)
+        let moving = !borrowed || pcx.rust_body && proj_indirect(p, pbody);
+        place_operand(l, p, ty, moving, pbody, &pcx);
         emit_use(ir, 0, pat, &pbody, pcx);
     }
     if first && !has_flag(ir, LF_BORROWED, pbody) && needs_drop(pbody.locals[ir].ty, &pcx) {
