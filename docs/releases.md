@@ -149,6 +149,11 @@ The front's side stream (front272b):
   `unsafe` block is `error unsafe` (rustc E0133), and a safe fn coerces
   to the unsafe type, not the reverse (E0308). The fn type's ABI bit is
   as before.
+- Arrays as a template over their length (F15.3): `#[array_builtin(N)]`
+  on an impl, a function or a method makes it an item over `[T; N]`,
+  instantiated for each length the program uses (`impl<T: Clone>
+  Clone for [T; N]`, `Vec::from_in([1, 2, 3], gpa)`), with N a `usize`
+  constant inside it; std2's root check has no `edition.later` left.
 
 Closures in full (clos272):
 

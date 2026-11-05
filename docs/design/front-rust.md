@@ -1248,6 +1248,14 @@ Rustc is the oracle elsewhere: a disagreement not listed here is a bug.
 - **FL8 (derive bounds).** F17.1 bounds every parameter by the derived
   trait, as rustc; no divergence — listed so a case that expects
   rustc's bound on a `PhantomData<T>` field names the rule.
+- **FL9 (a C function pointer's call is unsafe).** F19.3: a call through
+  a safe `extern "C" fn(..)` pointer needs `unsafe`, as in MVS (the
+  pointer may come from C; the fn type's ABI bit keeps its meaning);
+  rustc calls one safely. Case `rust_f_f19_c_ptr_err`.
+- **FL10 (no closure-to-`unsafe fn` coercion yet).** F19.3: a closure
+  that captures nothing coerces to a `fn(..)` type, not to an `unsafe
+  fn(..)` type; rustc coerces it to either. Case
+  `rust_f_f19_closure_err` (the closures' side, clos272).
 
 ## 10. The gap map
 
