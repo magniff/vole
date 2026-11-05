@@ -2886,3 +2886,22 @@ programs), stress-grow, cachediff 1471 lines (425 from the cache),
 unsafe-audit 2775 unjustified (baseline 2775, from 3057) and 0 in std,
 chain-diverse, chain-fresh 40 releases. compile-cost against v0.26.5: a
 hello world 1.00x, std 0.99x, check of the compiler 1.01x.
+
+### 0.27.1
+
+The release gate (`gate.sh --release --no-linux`), macOS only (65:17
+wall). Every row passed but chain-fresh, which failed because the
+release branch lacked 0.27.0's chain-hashes line (recorded on main
+after 0.27.0's merge); with main merged in, chain-fresh passed alone:
+41 releases rebuilt from the seed. The suite 4961 at -O0, -O1 and -O2
+(98 XFAIL; SKIPPED: no spirv-val), threads 9736, incremental 172
+series, objcheck 6484 (and 256 for x86_64-macos), compiler-memcheck
+727, examples-checkalloc 183, every fuzz and ABI row (fuzz-sem 300
+programs), stress-grow, cachediff 1472 lines (425 from the cache),
+borrowck-twin 193 cases (171 agree, 6 named divergences, 16 outside
+the subset, 0 mismatches), unsafe-audit 2775 unjustified (baseline
+2775) and 0 in std, chain-diverse. compile-cost against v0.27.0: a
+hello world 1.01x, std 1.00x, check of the compiler 1.00x, the rust
+row 1.04x. The borrow checker's budget: 0.013 of typeck on the rust
+corpus. An earlier quick gate failed threads and cachediff on a full
+disk; both passed once space was freed.
