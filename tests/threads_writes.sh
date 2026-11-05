@@ -62,13 +62,6 @@ back::codecache::SCALAR_REC	the task'"'"'s own function'"'"'s entry (its cleanup
 back::codecache::pack::NEW	the task'"'"'s own slot, read when the pack is written
 back::codecache::pack::USED	the entry of the task'"'"'s own key (a key is one task'"'"'s), read when the pack is written
 base::ctx::Ctx.pack	read only: an entry'"'"'s body is read through its address
-middle::gvn::MEMCPY_SYM	made by prepare_tasks; the lazy branch never runs in a task
-middle::ipo::MALLOC_SYM	made by prepare_tasks
-middle::ipo::CALLOC_SYM	made by prepare_tasks
-middle::ipo::FREE_SYM	made by prepare_tasks
-gen0::target::RT_PANIC_SYM	made by prepare_tasks
-gen0::target::RT_NOTE_SYM	made by prepare_tasks
-front::effects::builtin::TABLE	filled by prepare_tasks (c_class)
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 middle::egraph::P_KIND	the rules, parsed by prepare_tasks (init_rules)
 middle::egraph::P_OP	the rules
@@ -87,21 +80,9 @@ middle::egraph::PVARS	the rules
 middle::egraph::R_VARS_NOW	the rules
 middle::egraph::R_BY_OP	the rules
 middle::egraph::R_BY_OP_START	the rules
-base::SYMS	interned by the lazy branches above only (prepare_tasks)
-base::SYM_TABLE	the same
-base::SYM_TABLE_SIZE	the same
-base::SYM_TABLES_CAP	the same
-front::types::TYPES	compute_layout: every layout is made before a phase (prepare_layouts)
-front::types::ENUMS	compute_layout, the same
-front::types::FIELDS	compute_layout (the fields'"'"' offsets), the same
+front::types::FIELDS	struct_field: a field'"'"'s address, read through in a task (the offsets are compute_layout'"'"'s, the main thread'"'"'s)
 front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::cells::FREEZE_MEMO	interior_part: every type'"'"'s Freeze fact is made before a phase (prepare_layouts), so a task only reads it (GVN'"'"'s param_class_of)
-front::cells::SYM_UNSAFE_CELL	is_unsafe_cell_struct: set by the first struct prepare_layouts decides, the same
-front::types::TLISTS	make_type, the same
-front::types::TSCRATCH	make_type, the same
-front::types::TYPE_HASH	make_type, the same
-front::types::TYPE_HASH_SIZE	make_type, the same
-front::types::TYPE_HASH_USED	make_type, the same
 front::lexer::STRS	add_const_data: only on const_data'"'"'s serial branch (task_phase 0)
 front::lexer::STR_COUNT	the same
 gen0::target::STR_ALIGN	the same
@@ -132,10 +113,6 @@ middle::parallel::FN_CONSTS	the join numbers the joined function'"'"'s constants
 middle::parallel::FN_TEXT	the join takes the joined function'"'"'s text, its task done
 base::BUF_COUNT	asm_error, which exits
 base::BUF_CAP	asm_error, which exits
-base::SYMS	the -g directives (dwarf_file: one thread)
-base::SYM_TABLE	the same
-base::SYM_TABLE_SIZE	the same
-base::SYM_TABLES_CAP	the same
 base::STRESS_GROW	read by prepare_tasks (stress_grow)
 base::timer::T_TOTALS	--time-passes, which runs on one thread'
 
@@ -143,11 +120,6 @@ base::timer::T_TOTALS	--time-passes, which runs on one thread'
 ASSEMBLER='base::BUFS	asm_error (an internal error, which exits) and dwarf_file (-g, which does not stream: no thread)
 base::BUF_CAP	the same
 base::BUF_COUNT	the same
-base::SYMS	dwarf_file (-g: no thread)
-base::SYM_TABLE	the same
-base::SYM_TABLES	the same
-base::SYM_TABLES_CAP	the same
-base::SYM_TABLE_SIZE	the same
 base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow)'
 
 # Every static task code reads or writes: static <TAB> how the code cache
@@ -224,11 +196,9 @@ base::ROOT_LEX_ABS	off: -g
 base::SRC	off: -g
 base::STDOUT_CAPTURE	own: messages
 base::STRESS_GROW	key: options_hash (stress_grow)
-base::SYMS	IR: a symbol by its text
-base::SYM_TABLE	IR: the same
-base::SYM_TABLES	IR: the same
-base::SYM_TABLES_CAP	IR: the same
-base::SYM_TABLE_SIZE	IR: the same
+base::ctx::Ctx.syms	IR: a symbol by its text
+base::ctx::Ctx.sym_table	IR: the same
+base::ctx::Ctx.sym_table_size	IR: the same
 base::diag::ERR_POISONED	off: the IR printers
 base::json::DIAG_JSON	own: messages
 base::ctx::Ctx.apple_a64	key: options_hash
@@ -260,12 +230,10 @@ base::ctx::Ctx.fn_count	IR: the same
 base::ctx::Ctx.statics	IR: a static by static_canon
 base::ctx::Ctx.structs	key: types_hash
 base::ctx::Ctx.sym_static	IR: the same
-front::types::TLISTS	key: types_hash
-front::types::TSCRATCH	key: types_hash (no type is made in a task)
-front::types::TYPES	key: types_hash
-front::types::TYPE_HASH	key: types_hash
-front::types::TYPE_HASH_SIZE	key: types_hash
-front::types::TYPE_HASH_USED	key: types_hash
+base::ctx::Ctx.tlists	key: types_hash
+base::ctx::Ctx.types	key: types_hash
+base::ctx::Ctx.type_hash	key: types_hash
+base::ctx::Ctx.type_hash_size	key: types_hash
 base::ctx::Ctx.ty_error	key: types_hash (a fixed id)
 base::ctx::Ctx.ty_v16i8	key: types_hash (a fixed id)
 base::ctx::Ctx.ty_v2f64	key: types_hash (a fixed id)
