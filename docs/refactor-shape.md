@@ -184,6 +184,16 @@ indexing needed; `fix --only unneeded-justified` (0.25.5) also takes the
 ones whose `// UNSAFE:` and `// SAFETY:` comments named the table, with
 those comments. `--dry-run` prints the diff, or the refusals.
 
+(0.27.0) X may be a struct's field: `refactor table Ctx.items` takes
+`items: *T` with `item_count` (the singular's, or `items_count`) and
+`item_cap` beside it in the same struct, as the compilation context
+(base::ctx::Ctx) keeps its tables. The field becomes `items: Vec<T, A>`
+(A the struct's last type parameter, `--alloc`'s when it has none), its
+value in each literal of the struct `Vec::new_in(Comp {})`; the count's
+and the capacity's fields go, with the comment lines right above them and
+their initializers, and every use is placed as a static's, its base kept
+(`cx.item_count` is `cx.items.len() as i64`). tests/refactor/table270.t.
+
 ## refactor variant
 
 - `--add 'X(T, ...)'`: the variant after the last. A `match` on the enum

@@ -207,8 +207,7 @@ base::target::X86	key: options_hash
 base::ctx::Ctx.time_passes	off: --time-passes
 base::timer::T_TOTALS	off: --time-passes
 base::ctx::Ctx.nodes	IR: a closure'"'"'s mark (fn_canon), a distinct type'"'"'s name (types_hash); -g
-base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s
-base::ctx::Ctx.local_count	own: the same; a variable'"'"'s number is never output
+base::ctx::Ctx.locals	own: a task makes variables above LOCAL_COUNT (ssa::new_synth_var), never reads a local'"'"'s (locals.len(): the same)
 base::ctx::Ctx.any_distinct	key: options_hash
 front::distinct::NICHE	key: types_hash (enum_niche)
 base::ctx::Ctx.niche_aliases	key: types_hash
@@ -226,7 +225,6 @@ base::ctx::Ctx.own_mode	key: options_hash
 front::types::ENUMS	key: types_hash
 front::types::FIELDS	key: types_hash
 base::ctx::Ctx.fns	IR: a function by fn_canon
-base::ctx::Ctx.fn_count	IR: the same
 base::ctx::Ctx.statics	IR: a static by static_canon
 base::ctx::Ctx.structs	key: types_hash
 base::ctx::Ctx.sym_static	IR: the same

@@ -219,7 +219,7 @@ error refactor.table-count: crate::items::ITEMS has no count static (NOPE not fo
 try: volec refactor table crate::items::ITEMS --count NAME --dry-run
 [exit 1]
 $ refactor table Item
-error refactor.kind: crate::items::Item is a struct, not a static
+error refactor.kind: crate::items::Item is a struct, not a static or field
 try: volec query def Item
 [exit 1]
 ## The rewrites, written: the program prints what it printed.
